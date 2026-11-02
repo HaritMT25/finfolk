@@ -1143,17 +1143,38 @@
     if (why) showNote(why);
     updateLocks();
   }
-  /* the inline question, in the start bar (the setup sheet opens for it) */
+  /* a setting's value as the sheet says it (on / off, an option's name, a number) */
+  function n01(v) { return v === true ? 1 : v === false ? 0 : v; }
+  function valText(k, v) {
+    var opt = KEYS[k][1] || {};
+    if (typeof KEYS[k][0] === "boolean" || opt.bit) return n01(v) ? "on" : "off";
+    return opt.options && opt.options[v] !== undefined ? opt.options[v] : String(v);
+  }
+  /* the inline question, in the start bar (the setup sheet opens for it).
+   * What it says of the live tweaks is read from the world this start
+   * makes (the plan's recipe): a tweak the new world has too carries over;
+   * one a scenario or a file (or a value typed for the next world) sets
+   * otherwise is said so, with what it sets; Replay drops them all. */
   function askStart(plan) {
     asking = { plan: plan, key: planKey(plan) };
     var turbo = turboState !== "live", replaying = plan.op === "replay", age = runAge(), lose = [], tw = liveTweaks();
     if (age >= 300) lose.push(fmtTime(age) + " of evolution");
     if (usedTurbo || turbo) lose.push("what Turbo ran");
-    var one = tw.length === 1, tweaks = tw.map(function (k) { return (LABELS[k] || k) + " " + shown(cfgVal(k)); }).join(", ");
+    var b = replaying ? null : plan.build(), kept = [], other = [];
+    tw.forEach(function (k) {
+      if (replaying) return;
+      var next = Object.prototype.hasOwnProperty.call(b.cfg, k) ? b.cfg[k] : KEYS[k][0];
+      (n01(next) === n01(cfgVal(k)) ? kept : other).push([k, next]);
+    });
+    var mine = function (l) { return l.map(function (k) { return (LABELS[k] || k) + " " + valText(k, cfgVal(k)); }).join(", "); };
+    var keys = function (l) { return l.map(function (e) { return e[0]; }); }, s = function (n) { return n === 1 ? "" : "s"; };
+    var who = draft ? draft.title.charAt(0).toUpperCase() + draft.title.slice(1) : "The new world's setup";
     showAsk((replaying ? "Replay starts this world again from its seed" : turbo ? "This stops Turbo and replaces your run" : "This replaces your run") +
       (lose.length ? ", and " + lose.join(" and ") + " with it" : "") + "." +
-      (tw.length ? " Your live tweak" + (one ? "" : "s") + " (" + tweaks + ") " + (replaying ? (one ? "is" : "are") + " dropped." :
-                   (one ? "carries" : "carry") + " over to the new world.") : "") +
+      (replaying && tw.length ? " Your live tweak" + s(tw.length) + " (" + mine(tw) + ") " + (tw.length === 1 ? "is" : "are") + " dropped." : "") +
+      (kept.length ? " Your live tweak" + s(kept.length) + " (" + mine(keys(kept)) + ") " + (kept.length === 1 ? "carries" : "carry") + " over to the new world." : "") +
+      (other.length ? " " + who + " sets " + other.map(function (e) { return (LABELS[e[0]] || e[0]) + " " + valText(e[0], e[1]); }).join(", ") +
+                      " instead of your live tweak" + s(other.length) + " (" + mine(keys(other)) + ")." : "") +
       (replaying && waitingNow() ? " What waits for the next start stays waiting." : ""),
       replaying ? "Replay" : turbo ? "Stop Turbo & start" : "Replace it", "Keep it");
   }

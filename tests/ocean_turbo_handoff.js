@@ -3244,6 +3244,42 @@ async function pageReplayStaleRead() {
     ok(p.uncaught.length === 0, 'no exception escaped the page\'s handlers' + (p.uncaught.length ? ' (' + p.uncaught[0] + ')' : ''));
 }
 
+/* Finding 6: the question promised "your live tweak carries over" for every
+ * start but Replay; a scenario or a file is a whole recipe, and Standard
+ * puts Slowest speed back to 30. Now it reads the new world's recipe: a
+ * tweak it has too carries over, one it sets otherwise is said so. */
+async function pageAskTarget() {
+    section('Review of #39, finding 6: the question says which live tweaks the new world keeps, and what a scenario, a file or a typed value sets instead');
+    const p = await bootPage(PAGE_Q);
+    const msg = () => p.el('startaskmsg').textContent;
+    p.edit('minSpeed', 40);
+    p.click('advreset');
+    p.click('restart');
+    const m1 = msg();
+    p.click('startconfirm');
+    ok(!/carr/.test(m1) && /Standard sets Slowest speed 30 instead of your live tweak \(Slowest speed 40\)/.test(m1) && p.T.getVal('minSpeed') === 30 && !('minSpeed' in p.T.runCfg),
+       'Slowest speed 40 live, Standard picked, Start: "' + m1 + '"; the new world has 30');
+    p.edit('minSpeed', 40); p.edit('maxPopulation', 350);
+    p.click('huntersbtn');
+    p.click('restart');
+    const m2 = msg();
+    p.click('startcancel');
+    ok(/Your live tweak \(Population cap 350\) carries over/.test(m2) && /Hunters sets Slowest speed 0 instead of your live tweak \(Slowest speed 40\)/.test(m2),
+       'Slowest speed 40 and Population cap 350 live, Hunters picked (its cap 350, its slowest speed 0): "' + m2 + '"');
+    p.click('startdiscard');
+    p.click('restart');
+    const m3 = msg();
+    p.click('startcancel');
+    p.edit('foodEnergy', 7); p.edit('foodEnergy', -1);
+    p.click('restart');
+    const m4 = msg();
+    p.click('startconfirm');
+    ok(/Your live tweaks \(Slowest speed 40, Population cap 350\) carry over/.test(m3) &&
+       /The new world's setup sets Energy per food -1 instead of your live tweak \(Energy per food 7\)/.test(m4) && p.T.initArgs.cfg.foodEnergy === -1,
+       'nothing staged: both carry over ("' + m3 + '"); Energy per food 7 live, then -1 typed for the next world: "' + m4 + '"');
+    ok(p.uncaught.length === 0, 'no exception escaped the page\'s handlers' + (p.uncaught.length ? ' (' + p.uncaught[0] + ')' : ''));
+}
+
 /* Every section, in order; `node tests/ocean_turbo_handoff.js NAME...` runs only those. */
 const SECTIONS = {
     repeatedKeys, liveLedger, growthPage, randomize, imports,
@@ -3261,7 +3297,7 @@ const SECTIONS = {
     pageColourBench, pageLayers, pageResize, pageKeys, pageStartupFailures, pageTourEscape, pageWholeFields,
     pageTurboFraction, pageCardNumbers, pageMixedRecovery, pageEscOwner, pageTabKeys, pageIntegralFloats,
     pageTurboMode, pageStartDoor, pageFollowBack, pageDraft, pageScenarios,
-    pageCancelQueued, pageQueuedFile, pageNextBehindLive, pageEditedFile, pageReplayStaleRead
+    pageCancelQueued, pageQueuedFile, pageNextBehindLive, pageEditedFile, pageReplayStaleRead, pageAskTarget
 };
 const unhandled = [];
 process.on('unhandledRejection', (e) => { unhandled.push(e); });
