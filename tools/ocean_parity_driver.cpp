@@ -163,6 +163,7 @@ struct Coverage {
     long long eyeLit = 0;            // fish (captured) whose last step had an eye input != 0
     long long labeledLit = 0;        // fish (captured) in eye-only mode with a labeled input != 0 (must stay 0)
     long long steerOwnSteps = 0;     // fish-steps that pushed STEER_X / STEER_Y in their own frame
+    long long labelOwnSteps = 0;     // fish-steps sensed with own-frame labels (labelFrame 1, labels on)
     long long agesKept = 0;          // steps that began with foodLife off and a food age kept != 0
     // Steps whose spawn refilled places that food expiring in the same step
     // freed: the step began with S items, k expired, and S + spawned went past
@@ -197,6 +198,7 @@ struct Coverage {
         if (w.ocfg.eyeOnly) eyeOnlySteps += n;
         if (w.ocfg.walls) wallSteps += n;
         if (w.ocfg.steerFrame == 1 && !w.cfg.triangularMotion) steerOwnSteps += n;
+        if (w.ocfg.labelFrame == 1 && !w.ocfg.eyeOnly) labelOwnSteps += n;
         if (!(w.ocfg.foodLife > 0.0f))
             for (const OceanFood& f : w.food)
                 if (f.age != 0.0f) { ++agesKept; break; }
@@ -266,7 +268,7 @@ struct Coverage {
             {"predGenMax", predGenMax}, {"predTraitVaried", predTraitVaried},
             {"eyeSteps", eyeSteps}, {"eyeOnlySteps", eyeOnlySteps}, {"eyeCodeMask", eyeCodeMask},
             {"eyeE1Steps", eyeE1Steps}, {"eyeLit", eyeLit}, {"labeledLit", labeledLit},
-            {"steerOwnSteps", steerOwnSteps}, {"foodExpired", w.totalFoodExpired},
+            {"steerOwnSteps", steerOwnSteps}, {"labelOwnSteps", labelOwnSteps}, {"foodExpired", w.totalFoodExpired},
             {"agesKept", agesKept}, {"foodCapFreed", foodCapFreed},
             {"nonFiniteRemoved", w.totalNonFiniteRemoved},
             {"wallSteps", wallSteps}, {"wallTouch", wallTouch}, {"predWallTouch", predWallTouch},
@@ -286,7 +288,7 @@ struct Coverage {
     // nonFiniteRemoved is 0 in every passing case).
     static bool quietWhenZero(const std::string& k) {
         static const char* const kQuietWhenZero[] = {"eyeSteps", "eyeOnlySteps", "eyeCodeMask", "eyeE1Steps",
-                                                     "eyeLit", "labeledLit", "steerOwnSteps", "foodExpired",
+                                                     "eyeLit", "labeledLit", "steerOwnSteps", "labelOwnSteps", "foodExpired",
                                                      "agesKept", "foodCapFreed", "nonFiniteRemoved", "appFounders",
                                                      "appOffspring", "appMean", "appCopyA", "appCopyB", "appNovel",
                                                      "appShapeMean", "appShapeCopyA", "appShapeCopyB", "appShapeNovel",

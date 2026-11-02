@@ -1,0 +1,52 @@
+{
+  "walls": false,
+  "toroidal": false,
+  "appearance": 0,
+  "bodyModel": false,
+  "triangularMotion": false,
+
+  "minPopulation": 50,
+  "maxPopulation": 0,
+
+  "perceptionRadius": 100,
+  "interactRadius": 36,
+  "pickupRadius": 24,
+
+  "foodSpawnBase": 1,
+  "foodSpawnAmp": 0,
+  "foodEnergy": 15,
+  "targetFood": 800,
+  "foodLife": 12,
+  "foodPatches": 0,
+  "foodDepthMode": 0,
+  "foodDrift": false,
+
+  "currentStrength": 0,
+  "waveSpeed": 0,
+  "deepCurrent": false,
+  "lightEnabled": false,
+  "cHold": 0,
+  "cPress": 0,
+  "sizeDrift": false,
+  "sizeFight": false,
+  "mouthGate": false,
+
+  "metabolicRate": 1.5,
+  "maxAge": 120,
+  "geneCost": 0,
+  "moveCost": 0,
+
+  "predatorCount": 4,
+  "predatorSpeed": 110,
+  "predatorPerception": 150,
+  "predatorCaptureRadius": 14,
+  "predatorEconomy": true,
+  "predatorCooldown": 3,
+  "predatorMetabolism": 2,
+  "predatorMoveCost": 0,
+  "predatorMeal": 10,
+  "predatorReproEnergy": 60,
+  "predatorMaxPopulation": 6,
+  "predatorMinPopulation": 2,
+  "predatorInheritance": true
+}

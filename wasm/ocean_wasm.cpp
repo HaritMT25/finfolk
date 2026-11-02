@@ -482,8 +482,8 @@ EVO_EXPORT int oc_set_param(const char* name, double value) {
         // E1 (bool keys take 0 / 1)
         "waveSpeed", "waveBand", "waveGravity", "deepCurrent", "lightEnabled", "L0", "kWater",
         "depthCostScaled", "sizeDrift", "sizeFight", "mouthGate", "kMouth",
-        // the eye build's eye / eyeOnly / eyeCode, the steering frame, the food lifetime
-        "eye", "eyeOnly", "eyeCode", "steerFrame", "foodLife",
+        // the eye build's eye / eyeOnly / eyeCode, the steering frame, the food lifetime, the label frame
+        "eye", "eyeOnly", "eyeCode", "steerFrame", "foodLife", "labelFrame",
         // the appearance genome (cosmetic): the master key (init only, see below) and its knobs
         "appearance", "patternMutation", "patternPhaseMutation", "patternNovelProbability",
         "morphologyMutation", "morphologyNovelProbability",

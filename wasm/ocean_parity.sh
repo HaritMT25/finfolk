@@ -263,6 +263,11 @@ add steer_own_live_s21 '21 3000 --cfg {"predatorCount":3} --set steerFrame=1@700
                   "steerFrame switched on / off / on mid-run (oc_set_param)"
 add steer_own_tri_s9 '9 3000 --cfg {"triangularMotion":true,"bodyModel":true,"reproMaxDistance":16,"reproSoftWidth":5,"pitchMax":1.2,"steerFrame":1} --expect steerOwnSteps=0' \
                   "triangular motion ignores steerFrame (fish as x_tri_body_s9's)"
+# own-frame labels (OceanConfig::labelFrame, the ALIFE 2027 A1 arm; labelOwnSteps printed only when non-zero)
+add label_own_capture_s17 '17 3000 --capture --cfg {"labelFrame":1,"steerFrame":1,"predatorCount":2,"currentStrength":50} --expect labelOwnSteps>0 --expect steerOwnSteps>0' \
+                  "own-frame labels + own-frame steering, every fish's sensor + action bits hashed"
+add label_own_live_s21 '21 3000 --cfg {"predatorCount":3,"steerFrame":1} --set labelFrame=1@600 --set labelFrame=0@1500 --set labelFrame=1@2200 --expect labelOwnSteps>0' \
+                  "labelFrame switched on / off / on mid-run (oc_set_param)"
 SV='"foodSpawnBase":1,"foodSpawnAmp":0,"foodEnergy":15,"targetFood":800'
 add life_s1       "1 3000 --cfg {\"foodLife\":8,$SV} --expect foodExpired>0" "foodLife 8, sparse valuable food (1 item/step x 15)"
 add life_rich_toro_s7 "7 3000 --cfg {$RICH,\"toroidal\":true,\"foodDepthMode\":1,\"foodLife\":5} --expect foodExpired>0" \
@@ -370,6 +375,10 @@ add eye_cloak_fish_only_steer_l12_s3 "3 5000 --cfg {$L12,\"eye\":1,\"eyeOnly\":1
                   "eye-only (no neighbour query) + own frame, the ablation's world (L12)"
 add eye_cloak_food_only_steer_l12_s3 "3 5000 --cfg {$L12,\"eye\":1,\"eyeOnly\":1,\"steerFrame\":1,\"eyeCode\":16} --expect eyeCodeMask=16 --expect eyeOnlySteps>0 --expect steerOwnSteps>0 --expect foodExpired>0" \
                   "eye-only (no food query) + own frame, the ablation's world (L12)"
+add eye_a1_l12_s3 "3 5000 --capture --cfg {$L12,\"steerFrame\":1,\"labelFrame\":1} --expect labelOwnSteps>0 --expect steerOwnSteps>0 --expect eyeSteps=0 --expect foodExpired>0" \
+                  "ALIFE 2027 arm A1 in the eye build: labels in the steering frame, eye off, the paper's world (L12)"
+add eye_a1_eye_rich_s5 "5 3000 --cfg {$RICH,\"eye\":1,\"steerFrame\":1,\"labelFrame\":1} --expect labelOwnSteps>0 --expect eyeSteps>0" \
+                  "own-frame labels beside the eye + rich (predators, topological 7)"
 add eye_cloak_both_only_capture_s17 '17 3000 --capture --cfg {"eye":1,"eyeOnly":1,"eyeCode":24,"predatorCount":4,"currentStrength":50} --expect eyeCodeMask=24 --expect eyeLit>0 --expect labeledLit=0' \
                   "only predators seen (eyeCode 24), eye-only, every sensor bit hashed"
 add eye_cloak_live_s21 '21 3000 --cfg {"predatorCount":3,"eye":1} --set eyeCode=8@500 --set eyeCode=16@1000 --set eyeOnly=1@1500 --set eyeCode=28@2000 --set eyeCode=0@2500 --expect eyeCodeMask=28 --expect eyeOnlySteps>0' \
