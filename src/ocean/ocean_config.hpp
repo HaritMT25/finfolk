@@ -140,6 +140,19 @@ struct OceanConfig {
     // spread evenly over [0, foodLife) so it does not all vanish at once. No
     // draws.
     float foodLife        = 0.0f;
+    // The frame the LABELED direction senses report in (the ALIFE 2027
+    // protocol's A1 arm: labels matched to the steering frame):
+    // 0 = world x / y (every run before this key; the default);
+    // 1 = the fish's own frame, steerFrame 1's convention (x = right, y = ahead
+    //     of the horizontal heading): NEAREST_FOOD_DX / DY (the unit vector's
+    //     horizontal part, projected), AVG_NEIGHBOR_DX / DY (the mean offset
+    //     projected BEFORE its tanh) and AVG_NEIGHBOR_HEADING_X / Y (the mean
+    //     neighbour velocity, projected). The vertical parts (..._DZ) and every
+    //     scalar are unchanged; the senses already in the body frame
+    //     (PREDATOR_FWD / LR, POPULATION_FWD / LR, GENETIC_SIM_FWD, ...) are not
+    //     rotated again; proprioception (OWN_VEL_*, LAST_MOVE_DIR_*) stays world
+    //     x / y. No draws. Valid 0..1 in both builds.
+    int   labelFrame      = 0;
 
     // ---- the appearance genome (src/ocean/appearance_model.hpp): COSMETIC ----
     // Every fish carries 63 appearance floats (31 skin-pattern genes + 2
@@ -177,6 +190,10 @@ struct OceanConfig {
     float sideWallBand     = 80.0f;   // soft-turn band per side face, units ([0, 1e5]; 0 = contact only)
     float sideWallTurnRate = 6.0f;    // rad/s at full band depth ([0, 1000]; 0 = contact only)
 };
+
+// OceanConfig::labelFrame exists (tools test for it: an engine without the key
+// must refuse a label-frame arm rather than run it as A0).
+#define EVO_HAS_LABEL_FRAME 1
 
 // Does this build have the compound eye's sensors?
 #ifdef EVO_OCEAN_EYE
@@ -272,6 +289,7 @@ inline bool readOceanConfig(const jsonm::Value& o, OceanConfig& c, std::string* 
     readInt("eyeCode", c.eyeCode);
     readInt("steerFrame", c.steerFrame);
     c.foodLife    = o.floatOr("foodLife", c.foodLife);
+    readInt("labelFrame", c.labelFrame);
     readInt("appearance", c.appearance);
     c.patternMutation            = o.floatOr("patternMutation", c.patternMutation);
     c.patternPhaseMutation       = o.floatOr("patternPhaseMutation", c.patternPhaseMutation);
@@ -338,7 +356,8 @@ inline bool isSimConfigIntKey(const std::string& k) {
 // {"eye":0.5} or {"eyeCode":1e300} is refused with that message, not stored.
 // (foodDepthMode keeps its own 0 / 1 / -1 read; its ranges, and these keys',
 // are oceanConfigError's.)
-inline constexpr const char* kOceanIntKeys[] = {"foodDepthMode", "eye", "eyeOnly", "eyeCode", "steerFrame", "appearance"};
+inline constexpr const char* kOceanIntKeys[] = {"foodDepthMode", "eye", "eyeOnly", "eyeCode", "steerFrame", "appearance",
+                                                "labelFrame"};
 inline bool isOceanIntKey(const std::string& k) {
     for (const char* i : kOceanIntKeys) if (k == i) return true;
     return false;
@@ -492,6 +511,7 @@ inline std::string oceanConfigError(const OceanConfig& c) {
                                           " 8 the eye ignores fish, 16 the eye ignores food)")
                             : std::string("eyeCode") + noEye;
     if (c.steerFrame != 0 && c.steerFrame != 1) return "steerFrame must be 0 or 1";
+    if (c.labelFrame != 0 && c.labelFrame != 1) return "labelFrame must be 0 or 1";
     if (const std::string a = oceanAppearanceConfigError(c); !a.empty()) return a;
     return "";
 }

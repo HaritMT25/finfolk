@@ -53,3 +53,6 @@ the change that moved them. Each rewrite is logged below (newest last).
 2026-10-30T09:01Z  engine 7937f24 + 3 uncommitted engine path(s)  format=4  g++ 13 / 6.0.4 (fe5be6afdff43ad58860d821fcc8572a23f92d19)
   reason: glass walls, the Codex review of 06bd364: midpoint food transport always (the forward step spiralled food out of eddies), substeps to an eighth of the flow's length scale, the 16-substep budget's lagging fallback; walls OFF untouched
   wrote: walls_e1_s42 walls_e1_long walls_rich_s5 walls_gyre_s13 walls_patch_s11 walls_size_s9 walls_capture_s17 walls_live_s21 walls_x_band0_s3 walls_x_shallow_s4 walls_x_small_s6 walls_bigtank_s9 eye_walls_e1_capture_s17
+2026-11-01T19:51Z  engine aeff6a8 + 3 uncommitted engine path(s)  format=4  g++ 13 / 6.0.4 (fe5be6afdff43ad58860d821fcc8572a23f92d19)
+  reason: new cases only: OceanConfig::labelFrame (own-frame labels, the ALIFE 2027 A1 arm), default off; every existing baseline unchanged
+  wrote: label_own_capture_s17 label_own_live_s21 eye_a1_l12_s3 eye_a1_eye_rich_s5

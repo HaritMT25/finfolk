@@ -1,0 +1,144 @@
+{
+  "schema": "finfolk.alife2027.protocol/2",
+  "study": "Finfolk ALIFE 2027: Replaying the Sensorimotor Tape",
+  "protocol_document": "experiment_protocol_v2_codex.md (2026-11-01)",
+  "status": "draft: decisions adopted 2026-11-01, frozen after the excluded engineering pilot",
+  "decisions": {
+    "date": "2026-11-01",
+    "record": "ALIFE2027_PLAN.md, Decisions (the author delegated them)",
+    "adopted": [
+      "fixed sequence: C1-D1 late clearance -> C1-D1 early population AUC -> C1-A1 binary no-rescue NI, one-sided .025 each",
+      "NI margin 15 percentage points on binary no-rescue, against A1; no clearance margin",
+      "9 arms x 128 seeds, fixed budget; NI power uncertain and reported as such",
+      "floors kept for the core study",
+      "sparse bulk observation + dense every-step chains on predetermined seeds",
+      "registered extensions (Gemini q24): minPopulation=0 companion for C1 and D1 on 32 seeds; sweep-stratified branch reporting (food_h > 0.5 at the checkpoint); mating-funnel counters"
+    ]
+  },
+  "common_config": "common_l12.json",
+  "arms": "arms.csv",
+  "seeds": {
+    "development": "development_seeds.txt",
+    "engineering": "engineering_seeds.txt",
+    "main": "main_seeds.txt",
+    "generation": {
+      "algorithm": "pcg32-xsh-rr-reference",
+      "initstate": 20261101,
+      "initseq": 54,
+      "count": 128,
+      "exclude_files": ["development", "engineering"],
+      "exclude_ranges": [[1001, 1064], [9001, 9999]],
+      "reject_duplicates": true,
+      "preserve_generation_order": true,
+      "note": "the same generator and state as the v1 brief's published 1,024-seed list: the first 128 IDs are that list's first 128"
+    }
+  },
+  "world": {"width": 1920, "height": 1080, "depth": 240, "founders": 300},
+  "run": {
+    "steps": 100000,
+    "dt": 0.016,
+    "dt_storage": "float32",
+    "csv_every": 10000,
+    "behavioural_assay": "terminal, every run",
+    "fingerprints": {"format": 4, "bulk": "sparse", "every": 10000, "dense_subset": "verification"},
+    "diagnostics": "every run",
+    "nonfinite_policy": "technical_failure"
+  },
+  "build": {
+    "single_threaded": true,
+    "required_num_senses": 64,
+    "required_defines": ["EVO_WORLD_OCEAN", "EVO_OCEAN_EYE"],
+    "flags": ["-O3", "-std=c++20", "-ffp-contract=off"]
+  },
+  "subsets": {
+    "verification": {"arms": ["C1", "D1", "A1"], "seeds_first": 2, "fingerprints": "dense"},
+    "branches": {"arms": ["C1", "D1"], "seeds_first": 64},
+    "encounters": {"arms": ["C1", "C1nf", "C1nd", "C1po", "D1"], "seeds_first": 32, "until": 30000, "every": 1000},
+    "wiring_history": [
+      {"arms": ["C1", "C0", "C1nf", "C1nd", "C1po"], "seeds_first": 64, "every": 5000, "paths": true},
+      {"arms": ["A0", "A1", "D0", "D1"], "seeds_first": 16, "every": 5000, "paths": true}
+    ],
+    "wiring_terminal": {"arms": "all", "paths": false}
+  },
+  "branches": {
+    "checkpoints": [20000, 100000],
+    "steps": 2000,
+    "fp_every": 250,
+    "early_steps": 250,
+    "continuations": {
+      "C1": "sham:;blind:eye=0;foodcloak:eyeCode=16;fishcloak:eyeCode=8;frameswap:steerFrame=0",
+      "D1": "sham:;eyeon:eye=1"
+    },
+    "behav_at": [20000],
+    "sweep_strata": {"metric": "food_h evolved minus random at the checkpoint", "threshold": 0.5, "role": "descriptive, beside the all-history estimate"},
+    "required_checks": ["parent_restored", "sham_identity_at_20000", "food_identity", "branch_order_independence (pilot)"]
+  },
+  "endpoints": {
+    "L": {"definition": "mean clearance_norm of the CSV rows ending 90000 and 100000", "rows": [90000, 100000]},
+    "A": {"definition": "diag auc_pop at step 30000 / (founders x 30000): post-floor population summed over steps 1..30000", "through": 30000},
+    "Y": {"definition": "1 if totalReseeds == 0 at step 100000 (injected founders, not births)"},
+    "births_30k": {"definition": "cumulative births at step 30000"},
+    "secondary_descriptive": ["min_pop", "min_pop_30k", "min_pop_pre_floor", "first_reseed_step", "rescue_free_time", "reseeds", "reseed_steps", "births_10k", "births_20k", "late_pop", "deaths", "food", "tracking"]
+  },
+  "primary": {
+    "alpha_each": 0.025,
+    "sequence": [
+      {"id": "H1", "contrast": ["C1", "D1"], "endpoint": "L", "test": "paired_t_one_sided", "null_difference": 0},
+      {"id": "H2", "contrast": ["C1", "D1"], "endpoint": "A", "test": "paired_t_one_sided", "null_difference": 0},
+      {"id": "H3", "contrast": ["C1", "A1"], "endpoint": "Y", "test": "exact_unconditional_paired_ni",
+       "margin_fraction": [3, 20], "ordering": "score",
+       "ordering_note": "tables ranked by Tango's score statistic under delta0 = -margin (inclusive, ties within 1e-9); the p-value is the exact certified supremum over the nuisance, not the score's normal approximation; the v1 brief's difference ordering is reported as a sensitivity (it rejects at n = 128 only when b - c >= 4)",
+       "least_favourable_null": "boundary delta = -margin, valid because every region used is checked closed under (u, v) -> (u + 1, v - 1)",
+       "nuisance_maximization": "exact_rational_bernstein_subdivision", "probability_bound_gap": 1e-10}
+    ],
+    "gating": "fixed sequence: a later test is formal only if every earlier one rejects; estimates and intervals are always published",
+    "sensitivity": "whole-seed bootstrap intervals and leave-one-seed-out influence for H1 and H2"
+  },
+  "secondary": {
+    "test": "two_sided_one_sample_t_on_seed_contrasts",
+    "alpha_two_sided": 0.025,
+    "adjustment": "holm",
+    "constant_contrast_policy": "p_one_and_degeneracy_flag",
+    "contrasts": [
+      {"id": "S1", "name": "C/D steering interaction, late clearance", "endpoint": "L", "weights": {"C1": 1, "D1": -1, "C0": -1, "D0": 1}},
+      {"id": "S2", "name": "food visibility, late clearance", "endpoint": "L", "weights": {"C1": 0.5, "C1nf": 0.5, "C1nd": -0.5, "C1po": -0.5}},
+      {"id": "S3", "name": "fish visibility, births through 30k", "endpoint": "births_30k", "weights": {"C1": 0.5, "C1nd": 0.5, "C1nf": -0.5, "C1po": -0.5}},
+      {"id": "S4", "name": "food x fish interaction, late clearance", "endpoint": "L", "weights": {"C1": 1, "C1nf": -1, "C1nd": -1, "C1po": 1}},
+      {"id": "S5", "name": "late C1 full-eye knockout (sham - blind)", "branch": {"source": "C1", "checkpoint": 100000, "a": "sham", "b": "blind", "metric": "clearance"}},
+      {"id": "S6", "name": "late C1 food cloak (sham - foodcloak)", "branch": {"source": "C1", "checkpoint": 100000, "a": "sham", "b": "foodcloak", "metric": "clearance"}},
+      {"id": "S7", "name": "early C1 fish cloak vs food cloak, branch births", "branch": {"source": "C1", "checkpoint": 20000, "a": "fishcloak", "b": "foodcloak", "metric": "births"}},
+      {"id": "S8", "name": "late C1 frame swap (sham - frameswap)", "branch": {"source": "C1", "checkpoint": 100000, "a": "sham", "b": "frameswap", "metric": "clearance"}},
+      {"id": "S9", "name": "late D1 eye on (eyeon - sham)", "branch": {"source": "D1", "checkpoint": 100000, "a": "eyeon", "b": "sham", "metric": "clearance"}}
+    ]
+  },
+  "pairing_efficiency": {"pairs": [["C1", "D1"], ["C1", "A1"], ["C1", "C0"], ["D1", "D0"], ["C1", "A0"], ["C1", "C1nf"], ["C1", "C1nd"], ["C1", "C1po"]], "endpoints": ["L", "A"]},
+  "extensions": [
+    {"id": "np_companion", "registered": true, "core": false,
+     "arms": ["C1", "D1"], "label_suffix": "np", "seeds_first": 32,
+     "config_overrides": {"minPopulation": 0},
+     "analysis": "descriptive: C1np vs D1np paired, and each against its core arm on the same seed (rescue effect); extinction = population 0 at any step"}
+  ],
+  "bootstrap": {
+    "unit": "whole_seed_vector",
+    "replicates": 20000,
+    "algorithm": "pcg32-xsh-rr-reference",
+    "initstate": 20261102,
+    "initseq": 55,
+    "bounded_draw": "rejection_then_modulo",
+    "interval": "percentile",
+    "confidence": 0.95,
+    "quantile_interpolation": "linear",
+    "degeneracy_policy": "report_undefined_and_infinite_mass_label_finite_only_intervals_conditional"
+  },
+  "operations": {
+    "max_workers": 4,
+    "nice": 19,
+    "memory_pause_below_bytes": 2147483648,
+    "memory_resume_at_bytes": 3221225472,
+    "stop_file": "STOP",
+    "stop_behavior": "stop_admission_drain_active_exit_75",
+    "resume": "validated_complete_jobs_skipped_interrupted_jobs_rerun_from_initialization"
+  },
+  "illustration": {"arm": "C1", "seeds_first": 64, "metric": "L", "selection": "lower_median", "tie_break": "published_seed_index"},
+  "stopping": {"fixed_final_analysis": true, "ecological_early_stopping": false, "replace_unfavorable_seeds": false}
+}

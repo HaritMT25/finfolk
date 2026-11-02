@@ -1,0 +1,10 @@
+arm,driver_arm,eye,eyeOnly,steerFrame,labelFrame,eyeCode,seeds,role
+C1,C1,1,1,1,0,0,128,principal
+D1,D1,0,1,1,0,0,128,principal
+A1,A1,0,0,1,1,0,128,principal
+A0,A0,0,0,0,0,0,128,support
+C0,C0,1,1,0,0,0,128,support
+D0,D0,0,1,0,0,0,128,support
+C1nf,C1,1,1,1,0,8,128,support
+C1nd,C1,1,1,1,0,16,128,support
+C1po,C1,1,1,1,0,24,128,support
