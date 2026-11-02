@@ -16,7 +16,9 @@
 #   6. the runner's memory gate: cgroup v2 limits up the tree, fail closed on
 #      malformed / unreadable readings (the runner exits 2, admits nothing);
 #   7. a registered 3x3 matrix: analyze.py --plan gives formal rows bound to
-#      the plan hash; with one registered cell missing, descriptive only.
+#      the plan hash, CSVs at round-trip precision; cells duplicated across
+#      roots, a registered cell missing, or an UNREGISTERED cell with the
+#      missing cell's labels: descriptive only.
 set -u
 BIN=${1:?usage: invasion_tooling.sh EVO_BOIDS WORKDIR}
 W=${2:?usage: invasion_tooling.sh EVO_BOIDS WORKDIR}
@@ -159,6 +161,17 @@ for r in rows:
 runs = list(csv.DictReader(open("an3/runs.csv")))
 assert sum(1 for x in runs if x["s"] and sig(x["s"]) > 6) > 0.9 * len(runs), "runs.csv scores rounded"
 PY
+# the same finished cells in two roots: nothing says which copy is right, so neither is used
+cp -r root3 root3dup
+$PY "$T/analyze.py" --root root3 --root root3dup --out an3d --plan plan3.jsonl --windows 0.25 --no-power --sims 50 \
+    > an3d.log 2>&1 || fail "analyze.py (duplicate roots): $(tail -5 an3d.log)"
+$PY - <<'PY' || fail "cells duplicated across roots must not give formal decisions"
+import csv, json, os
+inp = json.load(open("an3d/inputs.json"))
+assert not inp["complete"] and len(inp["identity_problems"]) >= 27, len(inp["identity_problems"])
+rows = list(csv.DictReader(open("an3d/matrix.csv"))) if os.path.exists("an3d/matrix.csv") else []
+assert not any(r["status"] == "formal" for r in rows), rows
+PY
 rm root3/cells/off_f100_A_B_r01/done.json
 $PY "$T/analyze.py" --root root3 --out an3b --plan plan3.jsonl --windows 0.25 --no-power --sims 50 > an3b.log 2>&1 \
     || fail "analyze.py (incomplete): $(tail -5 an3b.log)"
@@ -171,4 +184,29 @@ assert rows, "the available 2-replicate block should still be reported (descript
 for r in rows:
     assert r["status"].startswith("descriptive") and r["p_lof"] == "" and r["floor95"] == "" and r["k"] == "2", r
 PY
+# an UNREGISTERED finished cell carrying the missing cell's labels (same condition, fraction, pair
+# and replicate; other seeds) must not stand in for it
+$PY - <<'PY' || fail "building the substitute cell"
+import json, os, shutil
+src, dst = "root3/cells/off_f100_A_B_r00", "root3/cells/off_f100_A_B_r01x"
+shutil.copytree(src, dst)
+for f in ("cell.json", "done.json"):
+    p = os.path.join(dst, f)
+    d = json.load(open(p))
+    c = d["cell"] if f == "done.json" else d
+    c.update(id="off_f100_A_B_r01x", replicate=1, slot_seed=c["slot_seed"] + 1)
+    json.dump(d, open(p, "w"))
+PY
+$PY "$T/analyze.py" --root root3 --out an3c --plan plan3.jsonl --windows 0.25 --no-power --sims 50 > an3c.log 2>&1 \
+    || fail "analyze.py (substitute): $(tail -5 an3c.log)"
+$PY - <<'PY' || fail "an unregistered cell filled a registered position"
+import csv, json
+inp = json.load(open("an3c/inputs.json"))
+assert any(u.split("/")[-1] == "off_f100_A_B_r01x" for u in inp["unregistered_finished"]), inp["unregistered_finished"]
+assert not inp["complete"] and inp["registered_missing"] == ["off_f100_A_B_r01"], inp["registered_missing"]
+rows = list(csv.DictReader(open("an3c/matrix.csv")))
+assert rows and all(r["status"].startswith("descriptive") and r["k"] == "2" for r in rows), rows
+assert not any(x["id"] == "off_f100_A_B_r01x" for x in csv.DictReader(open("an3c/runs.csv"))), "unregistered cell in runs.csv"
+PY
+rm -rf root3/cells/off_f100_A_B_r01x
 echo "invasion_tooling: ok"

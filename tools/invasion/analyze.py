@@ -102,11 +102,34 @@ def sha256(path):
     return h.hexdigest()
 
 
+def position(c):
+    """The semantic position of a cell spec in the analysis: two cells at one position would
+    overwrite each other in every table, so a position must be unique."""
+    inv = c["resident_name"] if c["mode"] == "sham" else c["invader_name"]
+    return (c["condition"], c["fraction"], c["mode"], inv, c["resident_name"], c["replicate"])
+
+
+def plan_problems(plan):
+    """Registered cells that share one semantic position (ambiguous by construction)."""
+    seen = {}
+    for cid, c in plan.items():
+        seen.setdefault(position(c), []).append(cid)
+    return {cid for ids in seen.values() if len(ids) > 1 for cid in ids}
+
+
 def load(roots, plan=None):
-    """Finished cells, each checked against its root and (with a plan) the registered spec:
-    done.json's cell == the plan entry, its binary == the root's pinned binary, its score.json
-    hash == the one done.json recorded. -> (records, provenance problems)."""
-    recs, problems = [], []
+    """Finished cells that may enter the analysis, and why the others may not.
+
+    Each candidate is checked against its root and (with a plan) the registered spec: done.json's
+    cell == the plan entry, its binary == the root's pinned binary, its score.json hash == the one
+    done.json recorded. With a plan, ONLY registered cells are used, for every table (the
+    generation clock and the costs included): an unregistered finished cell is listed and
+    skipped, never allowed to stand in for a missing registered one. A cell id finished in more
+    than one root, and two cells at one semantic position (condition, fraction, mode, invader,
+    resident, replicate), are identity problems: all their copies are excluded, since nothing says
+    which one is right. -> (records, provenance problems, unregistered ids)."""
+    recs, problems, unregistered = [], [], []
+    cands = []
     for root in roots:
         cdir = os.path.join(root, "cells")
         pinned_bin = open(os.path.join(root, "bin", "evo_boids.sha256")).read().split()[0]
@@ -114,38 +137,60 @@ def load(roots, plan=None):
             d = os.path.join(cdir, cid)
             if ".attempt" in cid or not os.path.exists(os.path.join(d, "done.json")):
                 continue
-            done = json.load(open(os.path.join(d, "done.json")))
-            c = done["cell"]
-            bad = []
-            if c.get("id") != cid:
-                bad.append("cell id differs from its directory")
-            if done.get("binary_sha256") != pinned_bin:
-                bad.append("binary differs from the root's pinned binary")
-            if sha256(os.path.join(d, "score.json")) != done["outputs"].get("score.json"):
-                bad.append("score.json does not match done.json")
-            if plan is not None and cid in plan and plan[cid] != c:
-                bad.append("done.json cell spec differs from the plan entry")
-            if bad:
-                problems.append(f"{root}/{cid}: " + "; ".join(bad))
-                continue
-            sc = json.load(open(os.path.join(d, "score.json")))
-            iv = []   # (population, steps/s) per logged interval, for the speed fit
-            with open(os.path.join(d, "run.csv")) as f:
-                for row in csv.DictReader(f):
-                    iv.append((int(row["population"]), float(row["steps_per_sec"])))
-            recs.append({
-                "id": cid, "root": root, "j": c["resident_name"], "i": c["invader_name"], "mode": c["mode"],
-                "frac": c["fraction"], "cond": c["condition"], "rep": c["replicate"], "steps": c["steps"],
-                "n0": sc["n0"], "m": sc["m"], "f0": sc["start_fraction"], "turnover": sc["turnover_steps"],
-                "points": sc["points"], "wall": done["timing"]["engine_wall_s"],
-                "user": done["timing"]["engine_user_s"], "build_s": done["timing"]["build_s"],
-                "score_s": done["timing"]["score_s"], "pop_mean": done["population"]["mean"],
-                "pop_min": done["population"]["min"], "pop_max": done["population"]["max"],
-                "maxrss_kb": done["timing"]["engine_maxrss_kb"], "intervals": iv,
-                "binary_sha256": done.get("binary_sha256"), "tools_sha256": done.get("tools_sha256"),
-                "registered": plan is None or cid in plan,
-            })
-    return recs, problems
+            cands.append((root, cid, d, pinned_bin))
+    count = {}
+    for _, cid, _, _ in cands:
+        count[cid] = count.get(cid, 0) + 1
+    ambiguous_plan = plan_problems(plan) if plan is not None else set()
+    by_pos = {}
+    for root, cid, d, pinned_bin in cands:
+        done = json.load(open(os.path.join(d, "done.json")))
+        c = done["cell"]
+        if plan is not None and cid not in plan:
+            unregistered.append(f"{root}/{cid}")
+            continue
+        bad = []
+        if count[cid] > 1:
+            bad.append(f"cell id finished in {count[cid]} roots")
+        if cid in ambiguous_plan:
+            bad.append("the plan registers another cell at the same position")
+        if c.get("id") != cid:
+            bad.append("cell id differs from its directory")
+        if done.get("binary_sha256") != pinned_bin:
+            bad.append("binary differs from the root's pinned binary")
+        if sha256(os.path.join(d, "score.json")) != done["outputs"].get("score.json"):
+            bad.append("score.json does not match done.json")
+        if plan is not None and plan[cid] != c:
+            bad.append("done.json cell spec differs from the plan entry")
+        if bad:
+            problems.append(f"{root}/{cid}: " + "; ".join(bad))
+            continue
+        by_pos.setdefault(position(c), []).append((root, cid, d, done))
+    for pos, group in sorted(by_pos.items(), key=lambda kv: str(kv[0])):
+        if len(group) > 1:
+            ids = ", ".join(f"{root}/{cid}" for root, cid, _, _ in group)
+            problems.append(f"{len(group)} cells at one position {pos}: {ids} (all excluded)")
+            continue
+        root, cid, d, done = group[0]
+        c = done["cell"]
+        sc = json.load(open(os.path.join(d, "score.json")))
+        iv = []   # (population, steps/s) per logged interval, for the speed fit
+        with open(os.path.join(d, "run.csv")) as f:
+            for row in csv.DictReader(f):
+                iv.append((int(row["population"]), float(row["steps_per_sec"])))
+        recs.append({
+            "id": cid, "root": root, "j": c["resident_name"], "i": c["invader_name"], "mode": c["mode"],
+            "frac": c["fraction"], "cond": c["condition"], "rep": c["replicate"], "steps": c["steps"],
+            "n0": sc["n0"], "m": sc["m"], "f0": sc["start_fraction"], "turnover": sc["turnover_steps"],
+            "points": sc["points"], "wall": done["timing"]["engine_wall_s"],
+            "user": done["timing"]["engine_user_s"], "build_s": done["timing"]["build_s"],
+            "score_s": done["timing"]["score_s"], "pop_mean": done["population"]["mean"],
+            "pop_min": done["population"]["min"], "pop_max": done["population"]["max"],
+            "maxrss_kb": done["timing"]["engine_maxrss_kb"], "intervals": iv,
+            "binary_sha256": done.get("binary_sha256"), "tools_sha256": done.get("tools_sha256"),
+            "registered": plan is not None,
+        })
+    return recs, problems, unregistered
 
 
 def gen_length(recs, definition="pop"):
@@ -366,7 +411,10 @@ def matrices(rows, meta=None, zmin=2.0, sims=1000, registry=None):
         cell = {}
         for x in rows:
             if (x["cond"], x["frac"], x["G"]) == (cond, frac, G) and x["mode"] in ("invade", "sham") and x["s"] is not None:
-                cell.setdefault((x["i"], x["j"]), {})[x["rep"]] = x["s"]
+                reps_ij = cell.setdefault((x["i"], x["j"]), {})
+                if x["rep"] in reps_ij:   # load() excludes duplicate positions; never overwrite silently
+                    raise ValueError(f"two results for {x['i']}->{x['j']} replicate {x['rep']} ({cond}, {frac}, {G})")
+                reps_ij[x["rep"]] = x["s"]
         # The block and its replicates come from the REGISTERED design (the plan), never from which
         # runs happen to be finished: formal only when every registered cell of the registered
         # block, on the registered replicates, is present. Anything else is descriptive (the
@@ -500,7 +548,7 @@ def main(argv=None):
             if ln.strip():
                 c = json.loads(ln)
                 plan[c["id"]] = c
-    recs, problems = load(a.root, plan)
+    recs, problems, unregistered = load(a.root, plan)
     registry = registry_from_plan(plan) if plan is not None else None
     here = os.path.dirname(os.path.abspath(__file__))
     prov = {
@@ -518,8 +566,10 @@ def main(argv=None):
     }
     if plan is not None:
         have = {r["id"] for r in recs}
+        # registered cells with no usable result (unfinished, or excluded by an identity problem)
         prov["registered_missing"] = sorted(set(plan) - have)
-        prov["unregistered_finished"] = sorted(have - set(plan))
+        # finished but not registered: listed, and excluded from EVERY table
+        prov["unregistered_finished"] = sorted(unregistered)
     prov["complete"] = plan is not None and not prov["registered_missing"] and not problems
     invlib_json = json.dumps(prov, indent=1, sort_keys=True, default=str)
     with open(os.path.join(a.out, "inputs.json"), "w") as f:
@@ -538,8 +588,9 @@ def main(argv=None):
     md = []
     md.append(f"# Invasion pilot analysis\n\n{len(recs)} finished runs from {', '.join(a.root)}.\n")
     md.append("Inputs (also in inputs.json): plan " + (f"`{a.plan}` sha256 `{prov['plan']['sha256'][:16]}` "
-              f"({prov['plan']['cells']} registered cells, {len(prov['registered_missing'])} missing, "
-              f"{len(prov['unregistered_finished'])} finished but unregistered)" if plan is not None else "NONE (descriptive only)") +
+              f"({prov['plan']['cells']} registered cells, {len(prov['registered_missing'])} missing or excluded, "
+              f"{len(prov['unregistered_finished'])} finished but unregistered: excluded from every table)"
+              if plan is not None else "NONE (descriptive only)") +
               f"; analysis code analyze.py `{prov['analysis_code']['analyze.py'][:16]}`, hodge.py "
               f"`{prov['analysis_code']['hodge.py'][:16]}`; engine binaries {[b[:16] for b in prov['binaries']]}; "
               f"{len(prov['tools'])} pinned tool set(s), {prov['cells_without_tool_hashes']} cells from before tool pinning; "
@@ -669,7 +720,7 @@ def main(argv=None):
     c, pts = speed_fit(recs)
     srows = [{"pop_mean": p, "sec_per_step": t} for p, t in pts]
     write_csv(os.path.join(a.out, "speed.csv"), srows, ["pop_mean", "sec_per_step"])
-    overhead = mean([r["build_s"] + r["score_s"] for r in recs]) + 0.15   # + interpreter start
+    overhead = (mean([r["build_s"] + r["score_s"] for r in recs]) + 0.15) if recs else None   # + interpreter start
     md.append("\n## Engine speed (serial build, 4 concurrent workers at nice 19)\n")
     if c:
         md.append(f"seconds/step = {c[0]:.3e} + {c[1]:.3e} pop + {c[2]:.3e} pop^2 (fit over {len(pts)} logged "
