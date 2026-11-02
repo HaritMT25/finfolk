@@ -51,7 +51,12 @@ Rules:
     admits nothing; if it stays unreadable with no cell running the runner
     exits 2. (These are the WSL / Linux readings, not the Windows host's.)
     Test hooks: INVASION_MEMINFO, INVASION_PROC_CGROUP, INVASION_CGROUP_ROOT;
-  * SIGINT/SIGTERM: the running engines are terminated; exit 130.
+  * SIGINT/SIGTERM (to the runner alone or its group): every cell worker leads
+    its own process group, which its engine joins; the runner signals each
+    group, reaps the worker and waits until the group is empty (SIGKILL after
+    20 s), and a worker signalled on its own forwards to its engine and waits
+    for it. Children also get PR_SET_PDEATHSIG. No engine outlives the
+    runner's lock; exit 130.
 """
 from __future__ import annotations
 
@@ -80,6 +85,45 @@ SPEC_KEYS = ("id", "resident", "invader", "mode", "fraction", "state", "conditio
 
 def now():
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def die_with_parent():
+    """preexec_fn: SIGTERM this child if its parent dies, even by SIGKILL (Linux prctl
+    PR_SET_PDEATHSIG; best effort elsewhere). Backs up the explicit forwarding below."""
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, signal.SIGTERM, 0, 0, 0)
+    except (OSError, AttributeError):
+        pass
+
+
+def stop_group(pgid, log=None, grace=20.0):
+    """SIGTERM every process in group pgid, then wait until the group is empty (SIGKILL after
+    `grace` seconds). The caller reaps its own direct child separately."""
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    t0 = time.time()
+    killed = False
+    while True:
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return
+        if time.time() - t0 > grace and not killed:
+            if log:
+                log(f"process group {pgid} still alive after {grace:.0f} s: SIGKILL")
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except ProcessLookupError:
+                return
+            killed = True
+        elif killed and time.time() - t0 > grace + 5:
+            if log:   # only unreaped zombies can be left (an init that does not reap orphans)
+                log(f"process group {pgid} still listed 5 s after SIGKILL (zombies?)")
+            return
+        time.sleep(0.05)
 
 
 def _cgroup_headroom_mb():
@@ -200,9 +244,28 @@ def run_cell(root, cell_id):
     if c["checkpoint_every"]:
         cmd += ["--checkpoint-every", str(c["checkpoint_every"])]
     t1 = time.time()
+    engine = []
+
+    def forward(signum, frame):
+        # The runner stops a cell by signalling the cell's process group (this worker and its
+        # engine); a signal sent to the worker alone is forwarded here, and the worker does not
+        # exit before its engine has, so no engine outlives the runner's lock.
+        for q in engine:
+            if q.poll() is None:
+                q.terminate()
+                try:
+                    q.wait(timeout=20)
+                except subprocess.TimeoutExpired:
+                    q.kill()
+                    q.wait()
+        os._exit(128 + signum)
+    for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(s, forward)
     with open(os.path.join(d, "stdout.log"), "w") as so, open(os.path.join(d, "stderr.log"), "w") as se:
-        p = subprocess.Popen(cmd, cwd=d, stdout=so, stderr=se, stdin=subprocess.DEVNULL)
+        p = subprocess.Popen(cmd, cwd=d, stdout=so, stderr=se, stdin=subprocess.DEVNULL, preexec_fn=die_with_parent)
+        engine.append(p)
         _, status, ru = os.wait4(p.pid, 0)
+    p.returncode = os.waitstatus_to_exitcode(status)   # reaped by wait4: keep poll() from asking again
     wall = time.time() - t1
     rc = os.waitstatus_to_exitcode(status)
     if rc != 0:
@@ -393,14 +456,18 @@ def main(argv=None):
     attempts = open(os.path.join(root, "attempts.tsv"), "a")
 
     def terminate(signum, frame):
+        # every cell worker leads its own process group (start_new_session), which its engine
+        # joins: signal the whole group, reap the worker, and wait until the group is empty, so
+        # no engine keeps writing after the lock is released
         for p, _, _ in running.values():
             try:
-                p.terminate()
-            except OSError:
+                os.killpg(p.pid, signal.SIGTERM)
+            except ProcessLookupError:
                 pass
         for p, _, _ in running.values():
             p.wait()
-        log(f"signal {signum}: terminated {len(running)} running cells")
+            stop_group(p.pid, log)
+        log(f"signal {signum}: terminated {len(running)} running cells and their engines")
         sys.exit(130)
     signal.signal(signal.SIGINT, terminate)
     signal.signal(signal.SIGTERM, terminate)
@@ -463,7 +530,7 @@ def main(argv=None):
             err = open(os.path.join(d, "cell.stderr.log"), "w")
             p = subprocess.Popen([sys.executable, "-I", cell_runner, "--root", root,
                                   "--_cell", spec["id"]], stdout=err, stderr=subprocess.STDOUT,
-                                 stdin=subprocess.DEVNULL)
+                                 stdin=subprocess.DEVNULL, start_new_session=True, preexec_fn=die_with_parent)
             running[p.pid] = (p, spec["id"], time.time())
         if not admit and not running:
             break

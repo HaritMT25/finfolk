@@ -25,11 +25,13 @@ from __future__ import annotations
 import argparse
 import datetime
 import os
+import signal
 import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import invlib  # noqa: E402
+import run  # noqa: E402  (die_with_parent)
 
 
 def main(argv=None):
@@ -68,12 +70,27 @@ def main(argv=None):
             cmd += ["--checkpoint-every", str(a.checkpoint_every)]
         jobs.append({"sister": s, "reseed": r, "stem": stem, "cmd": cmd})
     running, pending, failed = [], list(jobs), []
+
+    def terminate(signum, frame):   # no sister engine outlives fork.py
+        for p, _ in running:
+            if p.poll() is None:
+                p.terminate()
+        for p, _ in running:
+            try:
+                p.wait(timeout=20)
+            except subprocess.TimeoutExpired:
+                p.kill()
+                p.wait()
+        print(f"fork: signal {signum}: stopped {len(running)} running sisters", file=sys.stderr)
+        sys.exit(130)
+    for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(s, terminate)
     while pending or running:
         while pending and len(running) < a.workers:
             j = pending.pop(0)
             log = open(j["stem"] + ".log", "w")
             running.append((subprocess.Popen(j["cmd"], stdout=log, stderr=subprocess.STDOUT,
-                                             stdin=subprocess.DEVNULL), j))
+                                             stdin=subprocess.DEVNULL, preexec_fn=run.die_with_parent), j))
         p, j = running.pop(0)
         rc = p.wait()
         j["exit"] = rc

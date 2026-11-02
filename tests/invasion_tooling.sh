@@ -21,7 +21,8 @@
 #      missing cell's labels: descriptive only; inputs.json binds cells.csv;
 #   8. snapshot identity: plan.py registers file contents; a changed snapshot
 #      is refused before the batch and before each build; a name read as two
-#      files across batch attempts is excluded from the analysis.
+#      files across batch attempts is excluded from the analysis;
+#   9. SIGTERM to the runner alone leaves no engine running.
 set -u
 BIN=${1:?usage: invasion_tooling.sh EVO_BOIDS WORKDIR}
 W=${2:?usage: invasion_tooling.sh EVO_BOIDS WORKDIR}
@@ -294,4 +295,23 @@ assert "C" not in inp["snapshots"] and not inp["complete"]
 rows = list(csv.DictReader(open("an8/matrix.csv"))) if os.path.exists("an8/matrix.csv") else []
 assert not any(r["status"] == "formal" for r in rows), rows
 PY
+
+# 9. SIGTERM to the runner process alone (not its group) stops every engine it started
+cat > design9.json <<EOF
+{"name": "t9", "snapshots": {"A": "$W/A.json", "B": "$W/B.json"}, "conditions": {"off": 0}, "fractions": [0.1],
+ "replicates": 1, "steps": 400000, "checkpoint_every": 0, "log_every": 1000, "pairs": [["B", "A"]]}
+EOF
+$PY "$T/plan.py" design9.json > plan9.jsonl || fail "plan.py (design9)"
+engines() { pgrep -f "$W/root9/bin/evo_boids" | wc -l; }
+$PY "$T/run.py" --plan plan9.jsonl --root root9 --binary "$BIN" --workers 2 > run9.log 2>&1 &
+rp=$!
+for _ in $(seq 1 150); do [ "$(engines)" -ge 2 ] && break; sleep 0.1; done
+[ "$(engines)" -ge 2 ] || { kill -TERM $rp; fail "the runner did not start 2 engines: $(tail -3 run9.log)"; }
+kill -TERM $rp
+wait $rp
+rc=$?
+left=$(engines)
+pkill -KILL -f "$W/root9/bin/evo_boids" 2> /dev/null   # (this test's own engines, if the check fails)
+[ "$left" = 0 ] || fail "SIGTERM to the runner left $left engine(s) running"
+[ "$rc" = 130 ] || fail "the signalled runner exited $rc, expected 130"
 echo "invasion_tooling: ok"
