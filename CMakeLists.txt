@@ -116,6 +116,24 @@ add_executable(predator_smoke tests/predator_smoke.cpp)
 target_link_libraries(predator_smoke PRIVATE evo_core)
 add_test(NAME predator_smoke COMMAND predator_smoke)
 
+# reseed_after_load — the app's --reseed-after-load flag, end to end through the
+# real binary (exact resume without it; same S = same bytes; different S
+# diverge). Needs the app (SFML) and the serial build, the only one in which a
+# resume is bit-exact.
+if(SFML_FOUND AND EVO_NO_OPENMP AND NOT EVO_POOL_THREADS)
+    add_test(NAME reseed_after_load
+             COMMAND bash ${CMAKE_SOURCE_DIR}/tests/reseed_after_load.sh
+                     $<TARGET_FILE:evo_boids> ${CMAKE_CURRENT_BINARY_DIR}/reseed_after_load_work)
+    # invasion_tooling — tools/invasion (arena, score, run, hodge) against the
+    # real engine; pins the child-id derivation the invasion scores rely on.
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME invasion_tooling
+                 COMMAND bash ${CMAKE_SOURCE_DIR}/tests/invasion_tooling.sh
+                         $<TARGET_FILE:evo_boids> ${CMAKE_CURRENT_BINARY_DIR}/invasion_tooling_work)
+    endif()
+endif()
+
 # ------------------------------------------------------------------
 # core_bench — single-binary throughput benchmark for World::update.
 # Core-only (no SFML). Build Release and run e.g. `./core_bench 2000`.

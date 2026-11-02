@@ -150,6 +150,11 @@ void printUsage(const char* prog) {
         "  --load-checkpoint FILE    resume from FILE instead of starting fresh. In a serial\n"
         "                            build the continuation is bit-for-bit identical. Edit the\n"
         "                            'config' block in the file to change settings mid-run.\n"
+        "  --reseed-after-load S     [needs --load-checkpoint] after the load, seed the rng\n"
+        "                            with S instead of continuing the checkpoint's saved rng\n"
+        "                            stream, so replicate continuations of ONE checkpoint differ\n"
+        "                            (--seed is ignored on resume). Same S => the same run, bit\n"
+        "                            for bit, in a serial build. Off by default (exact resume)\n"
         "  --checkpoint-every N      also write <name>.<frame>.json every N steps\n"
         "  (In the live window: LEFT-CLICK a fish to watch its neural net fire in a top-right panel.)\n\n"
         "Log to CSV and then watch the result (omit --no-render):\n"
@@ -180,6 +185,12 @@ int main(int argc, char** argv) {
     std::string loadCheckpoint;    // --load-checkpoint FILE (resume)
     int         checkpointEvery = 0;   // --checkpoint-every N (0 = off)
     std::string checkpointBase;        // prefix for the periodic files
+    // --reseed-after-load S: CLI-only on purpose. It is not world state (the
+    // checkpoint written at the end records the rng state it produced, so that
+    // file still resumes exactly) and it is not a SimConfig field, so nothing
+    // the engine or the wasm module sees changes.
+    bool        haveReseedAfterLoad = false;
+    unsigned    reseedAfterLoad     = 0;
 
     int       initialPopulation = 300;  // starting creature count
     SimConfig cfg;                       // all other tunable parameters
@@ -226,6 +237,10 @@ int main(int argc, char** argv) {
         else if (arg == "--interact-radius")  cfg.interactRadius    = std::atof(next("--interact-radius"));
         else if (arg == "--save-checkpoint")  saveCheckpoint        = next("--save-checkpoint");
         else if (arg == "--load-checkpoint")  loadCheckpoint        = next("--load-checkpoint");
+        else if (arg == "--reseed-after-load") {
+            reseedAfterLoad = static_cast<unsigned>(std::strtoul(next("--reseed-after-load"), nullptr, 10));
+            haveReseedAfterLoad = true;
+        }
         else if (arg == "--checkpoint-every") checkpointEvery       = std::atoi(next("--checkpoint-every"));
         else if (arg == "--max-neighbors")    cfg.maxNeighbors      = std::atoi(next("--max-neighbors"));
         else if (arg == "--topological")      cfg.maxNeighbors      = 7;
@@ -296,6 +311,13 @@ int main(int argc, char** argv) {
     }
 
     if (haveSeed) rng.seed(seed);
+
+    // Reseeding only means something on top of a loaded rng state; without a
+    // checkpoint it would silently be a second --seed. Refuse instead.
+    if (haveReseedAfterLoad && loadCheckpoint.empty()) {
+        std::cerr << "Error: --reseed-after-load needs --load-checkpoint (use --seed for a fresh run).\n";
+        return 1;
+    }
 
     // A named run logs to runs/<name>.csv unless an explicit --csv path is given.
     if (csvPath.empty() && !runName.empty()) {
@@ -384,7 +406,10 @@ int main(int argc, char** argv) {
         // strip a trailing .json so the periodic files read name.<frame>.json
         if (checkpointBase.size() > 5 && checkpointBase.compare(checkpointBase.size() - 5, 5, ".json") == 0)
             checkpointBase.resize(checkpointBase.size() - 5);
-        std::filesystem::create_directories(std::filesystem::path(checkpointBase).parent_path());
+        // A bare file name (--save-checkpoint end.json) has no parent, and
+        // create_directories("") throws: guard it like --save-checkpoint below.
+        const auto cpParent = std::filesystem::path(checkpointBase).parent_path();
+        if (!cpParent.empty()) std::filesystem::create_directories(cpParent);
     }
     if (!saveCheckpoint.empty()) {
         const auto parent = std::filesystem::path(saveCheckpoint).parent_path();
@@ -416,6 +441,14 @@ int main(int argc, char** argv) {
                   << " at frame " << world.frame
                   << " (" << world.creatures.size() << " creatures, "
                   << world.predators.size() << " predators)\n";
+        // AFTER the load: deserialize() restores the saved rng state last, so
+        // seeding any earlier would be overwritten. Everything else in the
+        // world is exactly the checkpoint's; only the random stream from here
+        // on is S's, which is what makes replicate forks of one state differ.
+        if (haveReseedAfterLoad) {
+            rng.seed(reseedAfterLoad);
+            std::cout << "Reseeded the rng after the load: " << reseedAfterLoad << "\n";
+        }
 #ifndef EVO_DETERMINISTIC
         std::cerr << "Note: this is a multi-threaded build, so the resumed run will NOT reproduce\n"
                   << "      the original bit-for-bit. Build -DEVO_NO_OPENMP=ON for that.\n";
@@ -458,8 +491,11 @@ int main(int argc, char** argv) {
                 m << "evo_boids " << EVO_VERSION
                   << " (built " << __DATE__ << " " << __TIME__ << ")\n";
                 if (!runName.empty()) m << "run: " << runName << "\n";
-                m << "seed: " << (haveSeed ? std::to_string(seed) : std::string("random")) << "\n"
-                  << "steps: " << headlessSteps << "   log_every: " << logEvery << "\n"
+                m << "seed: " << (haveSeed ? std::to_string(seed) : std::string("random")) << "\n";
+                // Only when used, so every existing sidecar reads as before.
+                if (haveReseedAfterLoad)
+                    m << "reseed_after_load: " << reseedAfterLoad << "\n";
+                m << "steps: " << headlessSteps << "   log_every: " << logEvery << "\n"
                   << "population: " << initialPopulation << "\n"
                   << world.cfg.dump() << "\n";
             }

@@ -1,0 +1,268 @@
+#!/usr/bin/env python3
+"""score.py: invader founder-pedigree score of one arena run, with the child-id derivation checked.
+
+    score.py --arena ARENA.json --manifest ARENA.manifest.json --births RUN.births.csv
+             --checkpoint END.json [--checkpoint MID.json ...] [--out SCORE.json]
+
+The engine's birth log (--repro-log) records each pairing's parents but not the
+child's id. On an arena resume no id is handed out except to newborns
+(minPopulation 0 => no reseed; markFounder runs only at init and in the reseed,
+world.hpp), newborns are numbered in the order their births are logged
+(world.hpp: `baby.id = nextId_++` over the newborns vector, which is filled in
+recordPairing order), and logBirth gives every birth one ordinal, decimated or
+not (world_common.hpp). So
+
+    child id = start nextId + (index - start totalBirthsLogged).
+
+That is CHECKED, not assumed, on every run; any failure exits 1 with the reason:
+  * the log is complete: decimation stride 1, kept == seen - start ordinal, the
+    indices are exactly start..seen-1 in order, frames non-decreasing and after
+    the start frame;
+  * the arena's config really has minPopulation 0;
+  * every parent is a start id or an EARLIER derived id, and the lineages the
+    log records for it are the parents' own (derived) mother lines;
+  * for every checkpoint C: the births with frame <= C.frame are exactly
+    C.nextId - start nextId (max derived id == C.nextId - 1), the engine's own
+    totalBirths agrees, its ids are unique, and every live id is a start id or a
+    derived id; the last checkpoint is the end of the log;
+  * parent -> child correspondence, not just counts: every live derived child
+    carries the mother line (lineageId, kernel::inheritFromPair: parent1's) of
+    the birth its id was derived from; and when the arena has mutation off
+    (mutationMultiplier 0, a test arena), every child seen at a checkpoint has a
+    genome that is a crossover of ITS logged parents. A newborn order permuted
+    before ids are assigned fails these even when every count agrees.
+
+Founder pedigree contribution: marked (invader) founders 1, every other start
+fish 0, a child the mean of its parents. Score at C: mean live contribution -
+start fraction (m/n). This is an exact PEDIGREE index (Lacy 1989's founder
+representation), not realized genomic ancestry: Finfolk's crossover takes the
+child's genome length from one parent and each slot from one parent
+(genome.hpp), so a one-gene invader crossed with a three-gene resident passes
+on an expected 1/3 of the genes before mutation where the index assigns 1/2.
+A live fish with 0 < contribution < 1 has a MIXED PEDIGREE (n_mixed_pedigree);
+that is not genomic heterozygosity, and endpoint counts of mixed-pedigree fish
+or mating classes are not a hybrid-versus-pure fitness comparison.
+Generation turnover: the steps until cumulative births reach k * n_start
+(k = 1, 2, ...), the first being "one generation".
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import invlib  # noqa: E402
+
+SCHEMA = "finfolk.invasion.score/1"
+
+
+class DerivationError(Exception):
+    pass
+
+
+def need(cond, msg):
+    if not cond:
+        raise DerivationError(msg)
+
+
+def read_births(path):
+    seen = kept = stride = None
+    rows = []
+    with open(path) as f:
+        header = None
+        for ln in f:
+            if ln.startswith("#"):
+                m = re.search(r"events seen:\s*(\d+)\s+kept:\s*(\d+)\s+decimation stride:\s*(\d+)", ln)
+                if m:
+                    seen, kept, stride = (int(x) for x in m.groups())
+                continue
+            if header is None:
+                header = ln.strip().split(",")
+                need(header == ["index", "frame", "parent1", "parent2", "lineage1", "lineage2"],
+                     f"unexpected births.csv header {header}")
+                continue
+            p = ln.strip().split(",")
+            if len(p) != 6:
+                continue
+            rows.append((int(p[0]), int(p[1]), int(p[2]), int(p[3]), int(p[4]), int(p[5])))
+    need(seen is not None, f"{path}: no 'events seen / kept / stride' comment line")
+    return seen, kept, stride, rows
+
+
+def creature_table(cp):
+    """id -> (lineageId, genome as a tuple of (wiring, weight) pairs) for the live creatures."""
+    cs = cp["creatures"]
+    out, gi = {}, 0
+    for k in range(int(cs["count"])):
+        L = int(cs["genomeLengths"][k])
+        g = cs["genes"][gi:gi + 2 * L]
+        gi += 2 * L
+        if int(cs["alive"][k]):
+            out[int(cs["id"][k])] = (int(cs["lineageId"][k]), tuple(zip(g[0::2], g[1::2])))
+    return out
+
+
+def is_crossover(child, p1, p2):
+    """World::makeChild -> kernel::inheritGenome with no mutation: the length is one parent's,
+    and slot i holds parent1[i] or parent2[i] (the one that has a slot i, when only one does)."""
+    if len(child) not in (len(p1), len(p2)):
+        return False
+    for i, g in enumerate(child):
+        opts = [p[i] for p in (p1, p2) if i < len(p)]
+        if g not in opts:
+            return False
+    return True
+
+
+def score(arena_path, manifest_path, births_path, checkpoint_paths):
+    man = json.load(open(manifest_path))
+    A = invlib.load_checkpoint(arena_path)
+    need(invlib.sha256_file(arena_path) == man["output"]["sha256"], "arena file does not match its manifest")
+    need(int(A["config"]["minPopulation"]) == 0, "arena config minPopulation is not 0 (reseeds would mint ids)")
+    start_next = int(A["world"]["nextId"])
+    start_ord = int(A["counters"]["totalBirthsLogged"])
+    start_frame = int(A["world"]["frame"])
+    start_births = int(A["counters"]["totalBirths"])
+    start_ids = invlib.live_ids(A)
+    n0 = len(start_ids)
+    start_set = set(start_ids)
+    marked = set(int(x) for x in man["marked_ids"])
+    need(marked <= set(start_ids), "manifest marks ids that are not in the arena")
+    frac0 = len(marked) / n0
+    anc = {i: (1.0 if i in marked else 0.0) for i in start_ids}
+    start_tab = creature_table(A)
+    lin = {i: start_tab[i][0] for i in start_ids}   # maternal line: child = parent1's (kernel.hpp)
+    genomes = {i: start_tab[i][1] for i in start_ids}
+    check_genomes = float(A["config"].get("mutationMultiplier", 1.0)) == 0.0
+
+    seen, kept, stride, rows = read_births(births_path)
+    need(stride == 1, f"birth log decimated (stride {stride}): raise --repro-log-max")
+    need(kept == len(rows), f"births.csv says kept {kept}, has {len(rows)} rows")
+    need(kept == seen - start_ord, f"kept {kept} != seen {seen} - start ordinal {start_ord}")
+    prev_frame = start_frame
+    born = []   # (frame, child id, mating class)
+    parents = {}
+    for k, (idx, frame, p1, p2, l1, l2) in enumerate(rows):
+        need(idx == start_ord + k, f"birth row {k}: index {idx}, expected {start_ord + k}")
+        need(frame > start_frame and frame >= prev_frame, f"birth {idx}: frame {frame} out of order")
+        prev_frame = frame
+        need(p1 in anc and p2 in anc, f"birth {idx}: parent {p1 if p1 not in anc else p2} is neither a start id nor an earlier child")
+        # the logged lineages are the parents' own (derived) lines: the log's parent ids and the
+        # derived child ids describe the same creatures
+        need(l1 == lin[p1] and l2 == lin[p2],
+             f"birth {idx}: logged lineages {l1}, {l2} != the parents' derived lines {lin[p1]}, {lin[p2]}")
+        cid = start_next + (idx - start_ord)
+        need(cid not in anc, f"birth {idx}: derived id {cid} collides")
+        anc[cid] = 0.5 * (anc[p1] + anc[p2])
+        lin[cid] = lin[p1]
+        parents[cid] = (p1, p2)
+        # mating class by parental pedigree: 2 = both parents carry invader pedigree, 1 = one does, 0 = neither
+        born.append((frame, cid, (anc[p1] > 0) + (anc[p2] > 0)))
+
+    # generation turnover: steps until cumulative births reach k * n0
+    turnover = []
+    for k in range(1, len(born) // n0 + 1):
+        turnover.append(born[k * n0 - 1][0] - start_frame)
+
+    results = []
+    cps = []
+    for path in checkpoint_paths:
+        C = invlib.load_checkpoint(path)
+        cps.append((int(C["world"]["frame"]), path, C))
+    cps.sort(key=lambda t: t[0])
+    need(cps, "no checkpoint given")
+    for frame, path, C in cps:
+        need(frame > start_frame, f"{path}: frame {frame} is not after the arena's {start_frame}")
+        nb = sum(1 for f, _, _ in born if f <= frame)
+        cnext = int(C["world"]["nextId"])
+        need(cnext - start_next == nb, f"{path}: nextId {cnext} - start {start_next} != births up to frame {frame} ({nb})")
+        if nb:
+            need(born[nb - 1][1] == cnext - 1, f"{path}: max derived id {born[nb - 1][1]} != nextId - 1 ({cnext - 1})")
+        need(int(C["counters"]["totalBirths"]) - start_births == nb, f"{path}: engine totalBirths disagrees with the log")
+        ids = invlib.live_ids(C)
+        need(len(ids) == int(C["creatures"]["count"]), f"{path}: has dead creatures")
+        need(len(set(ids)) == len(ids), f"{path}: duplicate ids")
+        valid = start_set | {b[1] for b in born[:nb]}
+        bad = [i for i in ids if i not in valid]
+        need(not bad, f"{path}: live ids neither start nor derived: {bad[:5]}")
+        # parent -> child correspondence, per live child: the lineage the engine gave the
+        # creature with derived id X is the mother line of the birth X was derived from
+        tab = creature_table(C)
+        wrong = [i for i in ids if i not in start_set and tab[i][0] != lin[i]]
+        need(not wrong, f"{path}: derived children carry another birth's mother line: {wrong[:5]}")
+        if check_genomes:
+            for i in ids:
+                if i not in start_set:
+                    need(genomes.setdefault(i, tab[i][1]) == tab[i][1], f"{path}: child {i} changed genome")
+        a = [anc[i] for i in ids]
+        n = len(a)
+        mean = sum(a) / n if n else None
+        results.append({
+            "checkpoint": os.path.basename(path), "frame": frame, "steps": frame - start_frame,
+            "births": nb, "generations": nb / n0, "n": n,
+            "mean_pedigree_contribution": mean, "score": (mean - frac0) if n else None,
+            "n_any_invader": sum(1 for x in a if x > 0), "n_pure_invader": sum(1 for x in a if x == 1.0),
+            "n_mixed_pedigree": sum(1 for x in a if 0 < x < 1),
+            "births_by_class": [sum(1 for b in born[:nb] if b[2] == c) for c in (0, 1, 2)],
+            "n_founders_alive": sum(1 for i in ids if i in start_set),
+            "extinct": n == 0, "invader_lost": n > 0 and all(x == 0 for x in a),
+            "predators": int(C["predators"]["count"]),
+        })
+    last_frame = cps[-1][0]
+    need(all(b[0] <= last_frame for b in born), "births logged after the last checkpoint (it is not the run's end)")
+    need(seen == int(cps[-1][2]["counters"]["totalBirthsLogged"]), "end checkpoint's totalBirthsLogged != births seen")
+    # With mutation off (mutationMultiplier 0: a test arena) every child's genome is a crossover
+    # of ITS logged parents: a direct check of each derived id against its birth record wherever
+    # the child and both parents were seen (founders, or children alive at a checkpoint).
+    crossed = None
+    if check_genomes:
+        crossed = 0
+        for cid, (p1, p2) in parents.items():
+            if cid in genomes and p1 in genomes and p2 in genomes:
+                need(is_crossover(genomes[cid], genomes[p1], genomes[p2]),
+                     f"child {cid}: genome is not a crossover of its logged parents {p1}, {p2}")
+                crossed += 1
+
+    return {
+        "schema": SCHEMA,
+        # what "score" measures (see the module doc): a pedigree index, not genomic ancestry
+        "measure": "founder_pedigree_contribution",
+        "arena_sha256": man["output"]["sha256"], "births_sha256": invlib.sha256_file(births_path),
+        "mode": man["mode"], "m": len(marked), "n0": n0, "start_fraction": frac0,
+        "start_frame": start_frame, "start_nextId": start_next, "start_ordinal": start_ord,
+        "births": len(born), "turnover_steps": turnover,
+        "derivation": {"ok": True, "checked_births": len(born), "checked_checkpoints": len(cps),
+                       "max_derived_id": born[-1][1] if born else None,
+                       "end_nextId": int(cps[-1][2]["world"]["nextId"]),
+                       "lineage_checked_children": len({i for _, _, C in cps for i in invlib.live_ids(C)} - start_set),
+                       "crossover_checked_children": crossed},
+        "points": results,
+    }
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--arena", required=True)
+    ap.add_argument("--manifest", required=True)
+    ap.add_argument("--births", required=True)
+    ap.add_argument("--checkpoint", action="append", required=True)
+    ap.add_argument("--out")
+    a = ap.parse_args(argv)
+    try:
+        res = score(a.arena, a.manifest, a.births, a.checkpoint)
+    except DerivationError as e:
+        print(f"score.py: DERIVATION CHECK FAILED: {e}", file=sys.stderr)
+        return 1
+    if a.out:
+        invlib.write_json_atomic(a.out, res)
+    last = res["points"][-1]
+    print(f"score: births={res['births']} gen1={res['turnover_steps'][:1]} end n={last['n']} "
+          f"score={last['score']} (derivation ok over {res['births']} births, {len(res['points'])} checkpoints)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
