@@ -527,8 +527,9 @@ def main(argv=None):
     overhead = mean([r["build_s"] + r["score_s"] for r in recs]) + 0.15   # + interpreter start
     md.append("\n## Engine speed (serial build, 4 concurrent workers at nice 19)\n")
     if c:
-        md.append(f"seconds/step = {c[0]:.3e} + {c[1]:.3e} pop + {c[2]:.3e} pop^2 (fit over {len(pts)} runs; "
-                  f"mean population over each run). Per-cell overhead (arena build + scoring) ~{overhead:.1f} s.\n")
+        md.append(f"seconds/step = {c[0]:.3e} + {c[1]:.3e} pop + {c[2]:.3e} pop^2 (fit over {len(pts)} logged "
+                  f"1,000-step intervals of {len(recs)} runs: population at the interval's end vs its steps/s). "
+                  f"Per-cell overhead (arena build + scoring) ~{overhead:.1f} s.\n")
         md.append("| mean population | steps/s |\n|---|---|")
         for pop in (200, 300, 400, 500, 600, 700, 900):
             t = c[0] + c[1] * pop + c[2] * pop * pop
@@ -587,9 +588,34 @@ def main(argv=None):
                         md.append(f"| {cond} | {frac} | {G} | {src} | {N} | {k} | {rms:.4f} (x{mult}) | {ns:.4f} | {f95:.3f} | "
                                   f"{row['p0.1']:.2f} | {row['p0.2']:.2f} | {row['p0.3']:.2f} | {row['p0.5']:.2f} | "
                                   f"{row['obs03']:.3f} | {row['deb03']:.3f} |")
+        # Assumption-light companion: the smallest cyclic component the lack-of-fit test detects with
+        # 80% power at alpha 0.05, whatever the ladder looks like (the ladder does not enter the curl).
+        md.append("\nMinimum detectable cycle (chi2 lack of fit, alpha 0.05, power 0.8; normal approximation to the "
+                  "noncentral chi2): RMS of the curl per pair, against the per-cell noise of that row.\n")
+        md.append("| condition | fraction | window | N | k | noise/cell | min detectable curl RMS per pair |\n|---|---|---|---|---|---|---|")
+        seen = set()
+        for row in pw_rows:
+            key = (row["cond"], row["frac"], row["G"], row["N"], row["k"])
+            if key in seen or row["mult"] != 1.0:
+                continue
+            seen.add(key)
+            N = row["N"]
+            df = (N - 1) * (N - 2) // 2
+            crit = df + 1.6449 * math.sqrt(2 * df)
+            lo, hi = 0.0, 50.0 * df
+            for _ in range(100):   # solve df + lam - 0.8416 sqrt(2 (df + 2 lam)) = crit
+                lam = 0.5 * (lo + hi)
+                if df + lam - 0.8416 * math.sqrt(2 * (df + 2 * lam)) < crit:
+                    lo = lam
+                else:
+                    hi = lam
+            P = N * (N - 1) / 2
+            row["min_curl_rms"] = math.sqrt(lam * row["noise"] ** 2 / P)
+            md.append(f"| {row['cond']} | {row['frac']} | {row['G']} | {N} | {row['k']} | {row['noise']:.4f} | "
+                      f"{row['min_curl_rms']:.4f} |")
         write_csv(os.path.join(a.out, "power.csv"), pw_rows,
                   ["cond", "frac", "G", "source", "N", "k", "rms", "mult", "noise", "floor95", "p0.1", "p0.2", "p0.3",
-                   "p0.5", "obs03", "deb03"])
+                   "p0.5", "obs03", "deb03", "min_curl_rms"])
 
     # --- cost
     if c:
@@ -609,7 +635,7 @@ def main(argv=None):
                             ch = runs * sec / 3600
                             cost.append({"G": G, "pop": pop, "sec_per_cell": sec, "N": N, "k": k, "fractions": nf,
                                          "runs": runs, "core_h": ch, "wall_h_4": ch / 4})
-                            if pop == 500 and nf in (1, 2) and k in (5, 10, 20):
+                            if pop == 500 and k in (5, 10):
                                 md.append(f"| {G} | {pop} | {sec:.0f} | {N} | {k} | {nf} | {runs} | {ch:.0f} | {ch / 4:.0f} |")
         write_csv(os.path.join(a.out, "cost.csv"), cost,
                   ["G", "pop", "sec_per_cell", "N", "k", "fractions", "runs", "core_h", "wall_h_4"])
