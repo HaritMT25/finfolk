@@ -330,7 +330,7 @@
     stepOnce = false; summary = null; usedTurbo = false; turboReturn = null;
     if (plan.op !== "replay") { draft = null; draftGen++; projectForm(); }   /* a start consumes the draft */
     else if (keep) { projectForm(); keep.forEach(function (e) { setRaw(e[0], e[1]); }); updateNeeds(); updateTabDots(); }
-    if (plan.imported) warnOdd(plan.imported);
+    if (plan.imported && a) warnOdd(a.cfg);   /* (a setup from outside the sheet: what it ran) */
     if (plan.url) writeUrl();
     hideAsk();
     renderStartBar();
@@ -1335,8 +1335,9 @@
     if (n) askReplace("The setup file", n, stage); else stage();
   }
   /* What Start starts: a staged file as it is (with a new seed for Start
-   * fresh) while its fields are untouched, else the sheet (seed: Start
-   * fresh's, drawn once per request). */
+   * fresh) while its fields are untouched; edited, the file with the edited
+   * fields only (editedFile); else the sheet (seed: Start fresh's, drawn
+   * once per request). */
   function startPlan(seed) {
     var plan;
     if (draft && draft.plan && !pendingDiff().length) {
@@ -1347,9 +1348,38 @@
       plan.done = function () { showNote("Setup loaded: seed " + initArgs.seed + ", " + W + " × " + H + ", replaying from its start."); };
       return plan;
     }
-    plan = formPlan(draft ? draft.kind : "start", seed);
-    if (draft && draft.kind === "file") plan.done = function () { showNote("Setup loaded (edited): seed " + initArgs.seed + ", " + W + " × " + H + "."); };
-    return plan;
+    if (draft && draft.plan) {
+      plan = editedFile(draft.plan, seed === undefined ? null : seed, draft.seed);
+      plan.failed = "That setup was refused: ";
+      plan.done = function () { showNote("Setup loaded (edited): seed " + initArgs.seed + ", " + W + " × " + H + "."); };
+      return plan;
+    }
+    return formPlan(draft ? draft.kind : "start", seed);
+  }
+  /* A staged setup file with some fields edited: the file's own recipe
+   * (fp.build: its values as written, a repeated key's later occurrences,
+   * the keys the sheet has no field for) with only the edited fields
+   * (pendingDiff against the file as staged) replaced by the sheet's. An
+   * untouched value the sheet can't hold (2 for a switch, 1e400) or a later
+   * occurrence of an untouched key still reaches oc_init, which checks it,
+   * as it does when the file starts untouched; an edited key's value (and
+   * its later occurrences: replaced) is the sheet's, checked as the sheet's
+   * are (sizeProblem). seed: Start fresh's (null: the sheet's if edited,
+   * else the file's, fileSeed). */
+  function editedFile(fp, seed, fileSeed) {
+    function resolve() {
+      var b = fp.build(), on = {}, mine = {}, cfg = Object.assign({}, b.cfg);
+      pendingDiff().forEach(function (k) { on[k] = true; });
+      var arg = function (k, v) { return on[k] ? argVal(k) : v; };
+      Object.keys(on).forEach(function (k) { if (!ARGS[k]) mine[k] = cfg[k] = getVal(k); });
+      Object.keys(extraCfg).forEach(function (k) { if (!(k in cfg)) cfg[k] = extraCfg[k]; });   /* (a key the E1 water added without a field) */
+      return { seed: seed !== null ? seed : arg("seed", fileSeed), population: arg("population", b.population), depth: arg("depth", b.depth),
+               width: arg("width", b.size[0]), height: arg("height", b.size[1]), cfg: cfg, mine: mine,
+               repeats: (b.repeats || []).filter(function (r) { return !on[r.key]; }) };
+    }
+    return { source: fp.source, op: "init", url: true, imported: true,
+             check: function () { var r = resolve(); return sizeProblem({ seed: r.seed, population: r.population, depth: r.depth, width: r.width, height: r.height, cfg: r.mine }); },
+             build: function () { var r = resolve(); return { seed: r.seed, population: r.population, depth: r.depth, size: [r.width, r.height], cfg: r.cfg, repeats: r.repeats }; } };
   }
 
   /* ---------------- per-frame data ---------------- */

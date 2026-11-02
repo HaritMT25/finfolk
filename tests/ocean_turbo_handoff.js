@@ -3153,6 +3153,59 @@ async function pageNextBehindLive() {
     ok(p.uncaught.length === 0, 'no exception escaped the page\'s handlers' + (p.uncaught.length ? ' (' + p.uncaught[0] + ')' : ''));
 }
 
+/* Finding 4: a staged setup file started untouched hands oc_init its own
+ * values (a repeated key's later occurrences, values the sheet can't hold);
+ * one unrelated field edited, Start built the world from the sheet instead,
+ * which dropped those: {"maxPopulation":300,"maxPopulation":1e400} ran with
+ * a cap of 300, a switch written 2 ran as off. Now an edited file is the
+ * file with the edited fields only: the untouched values still reach
+ * oc_init (and are refused), the keys without a field stay, an edited key's
+ * later occurrences are replaced with it. */
+async function pageEditedFile() {
+    section('Review of #39, finding 4: a staged file with an unrelated field edited still hands oc_init its untouched values (repeats, overflow, unrepresentable)');
+    const p = await bootPage(PAGE_Q7);
+    const c = startCounter(p);
+    const file = (cfg) => '{"format":"evo_ocean_setup","seed":11,"population":20,"depth":240,"width":1920,"height":1080,"config":' + cfg + '}';
+    const direct = await mk(1, {}, 300, 300, 0);
+    const bad = [];
+    for (const doc of ['{"maxPopulation":300,"maxPopulation":1e400}', '{"maxPopulation":1e400,"maxPopulation":300}', '{"appearance":3,"appearance":1e400}',
+                       '{"lightEnabled":true,"lightEnabled":1e400}', '{"bodyModel":2}', '{"toroidal":true,"toroidal":1}', '{"maxPopulation":300,"maxPopulation":0.5}']) {
+        if (directInit(direct, doc).ok) { bad.push(doc + ': oc_init accepts it (the fixture says refused)'); continue; }
+        p.click('startdiscard');
+        await stageFile(p, file(doc));
+        p.edit('population', 13);   /* an unrelated field */
+        const a = c(), world0 = p.world(), print0 = fingerprint(p.M);
+        p.el('err').textContent = '';
+        p.start();
+        const d = delta(a, c());
+        if (d.epoch !== 0 || p.world() !== world0 || fingerprint(p.M) !== print0 || !/That setup was refused/.test(p.msg()))
+            bad.push(doc + ': ' + JSON.stringify(d) + ' "' + p.msg().slice(0, 80) + '"' + (d.epoch ? ' (ran with cap ' + p.T.runCfg.maxPopulation + ')' : ''));
+        else if (!(p.T.draft && p.T.draft.kind === 'file' && p.T.getVal('population') === 13)) bad.push(doc + ': the edited file did not stay staged');
+    }
+    ok(!bad.length, 'seven files oc_init refuses (a later 1e400, a first 1e400, an Ocean int and switch overflowing, a switch as 2, a SimConfig switch as 1, a later 0.5), ' +
+       'each with only Starting fish edited: refused, the run unchanged, the edited file still staged' + (bad.length ? ' — ' + bad.join('; ') : ''));
+    {   /* accepted: the edit and the file's own keys (one without a field) */
+        p.click('startdiscard');
+        await stageFile(p, file('{"foodEnergy":6,"zzzUnknown":1,"maxPopulation":300,"maxPopulation":400}'));
+        p.edit('population', 13);
+        p.start();
+        const i = p.T.initArgs;
+        ok(i.seed === 11 && i.population === 13 && i.cfg.foodEnergy === 6 && i.cfg.zzzUnknown === 1 && i.cfg.maxPopulation === 300 && !p.T.draft &&
+           /\(edited\)/.test(p.msg()) && /"maxPopulation":400/.test(p.inits[p.inits.length - 1]),
+           'a file oc_init takes, Starting fish edited: seed 11, 13 fish, foodEnergy 6, the key without a field (zzzUnknown) and the later maxPopulation ' +
+           'still sent (oc_init ran ' + p.inits[p.inits.length - 1] + ')');
+    }
+    {   /* an edited key's own later occurrences go with the edit */
+        p.click('startdiscard');
+        await stageFile(p, file('{"maxPopulation":300,"maxPopulation":1e400}'));
+        p.edit('maxPopulation', 400);
+        p.start();
+        ok(p.T.initArgs.seed === 11 && p.T.initArgs.cfg.maxPopulation === 400 && !/1e400/.test(p.inits[p.inits.length - 1]),
+           'the repeated key itself edited (400): the edit replaces it and its later occurrence; the world runs with cap ' + p.T.initArgs.cfg.maxPopulation);
+    }
+    ok(p.uncaught.length === 0, 'no exception escaped the page\'s handlers' + (p.uncaught.length ? ' (' + p.uncaught[0] + ')' : ''));
+}
+
 /* Every section, in order; `node tests/ocean_turbo_handoff.js NAME...` runs only those. */
 const SECTIONS = {
     repeatedKeys, liveLedger, growthPage, randomize, imports,
@@ -3170,7 +3223,7 @@ const SECTIONS = {
     pageColourBench, pageLayers, pageResize, pageKeys, pageStartupFailures, pageTourEscape, pageWholeFields,
     pageTurboFraction, pageCardNumbers, pageMixedRecovery, pageEscOwner, pageTabKeys, pageIntegralFloats,
     pageTurboMode, pageStartDoor, pageFollowBack, pageDraft, pageScenarios,
-    pageCancelQueued, pageQueuedFile, pageNextBehindLive
+    pageCancelQueued, pageQueuedFile, pageNextBehindLive, pageEditedFile
 };
 const unhandled = [];
 process.on('unhandledRejection', (e) => { unhandled.push(e); });
