@@ -1019,7 +1019,7 @@
     fill();
     updateNeeds(); updateTabDots();
     d.base = snapForm();
-    draft = d; draftGen++;
+    draft = d; d.gen = ++draftGen;
     hideAsk();
     renderStartBar();
   }
@@ -1061,7 +1061,16 @@
     showNote("Stop Turbo first.");
     return true;
   }
-  function planKey(plan) { return plan.op === "replay" ? "replay " + (initArgs ? initArgs.seed : "") : JSON.stringify(plan.build()); }
+  /* The plan asked about, and the sheet it came from: an asked or queued
+   * start is that one only while both stay the same. A staged file's plan
+   * is its own recipe and does not read the sheet, so the sheet itself is
+   * in the key: an edit, Discard, another card or file, Fit, the E1 water
+   * made meanwhile is a change (the run carries on, and says so; the draft
+   * stays). Replay keeps what waits, so only its world counts. */
+  function sheetKey() {
+    return JSON.stringify([draft ? draft.gen : 0, Object.keys(KEYS).map(function (k) { return el("o_" + k) ? rawOf(k) : null; }), extraCfg]);
+  }
+  function planKey(plan) { return plan.op === "replay" ? "replay " + (initArgs ? initArgs.seed : "") : JSON.stringify(plan.build()) + " " + sheetKey(); }
   function runAge() {
     var f = turboState !== "live" && turboStats ? turboStats.frame : (lastS ? (fresh(lastS).stats[1] || 0) : 0);
     return f * DT;
@@ -1109,7 +1118,8 @@
   /* Turbo handed the world back with a start waiting: the same plan, or none */
   function finishPendingStart(ps) {
     if (planKey(ps.plan) !== ps.key) {
-      showError("The setup changed while Turbo stopped (an edit was refused or made meanwhile), so the new world did not start: your run carries on. Check it and start again.");
+      showError("The setup changed while Turbo stopped (an edit was refused, or the next world was edited, discarded or replaced meanwhile), " +
+                "so the new world did not start: your run carries on. Check it and start again.");
       return false;
     }
     dropWorker();   /* a clean slate: the next Turbo gets a fresh worker */

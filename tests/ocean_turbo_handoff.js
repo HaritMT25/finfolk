@@ -3021,6 +3021,76 @@ async function pageCancelQueued() {
     ok(p.uncaught.length === 0, 'no exception escaped the page\'s handlers' + (p.uncaught.length ? ' (' + p.uncaught[0] + ')' : ''));
 }
 
+/* a setup file staged through the page's own file input (read at once) */
+async function stageFile(p, text) {
+    const g = p.T.draftGen;
+    p.loadFile({ name: 's.json', text: () => Promise.resolve(text) });
+    await until(() => p.T.draftGen !== g || p.T.asking, 'the file staged');
+}
+/* Finding 1: a staged, untouched setup file's plan is its own recipe (it
+ * reads no field), so a start queued for Turbo's hand-back (or asked about)
+ * kept starting the file after the sheet changed meanwhile, and the start
+ * then cleared the draft: a population typed, another card picked, Discard,
+ * Fit, all lost. Now the sheet is part of what was asked about: the queued
+ * start does not happen (Turbo's Stop completes as an ordinary Stop, said
+ * so) and the changed draft stays. */
+async function pageQueuedFile() {
+    section('Review of #39, finding 1: a queued or asked start of a staged file does not survive a change of the sheet (edit, another card, Discard, Fit)');
+    const p = await bootPage(PAGE_Q);
+    const c = startCounter(p);
+    /* [what, while: 'starting' | 'stopping', the change] */
+    const cases = [
+        ['50 fish typed', 'starting', () => p.edit('population', 50), () => p.T.draft && p.T.draft.kind === 'file' && p.T.getVal('population') === 50],
+        ['Hunters picked', 'stopping', () => p.click('huntersbtn'), () => p.T.draft && p.T.draft.id === 'hunters'],
+        ['Discard', 'stopping', () => p.click('startdiscard'), () => !p.T.draft],
+        ['the E1 water added', 'starting', () => p.click('e1add'), () => p.T.draft && p.T.draft.kind === 'file' && p.T.getVal('lightEnabled') === true]
+    ];
+    for (const [what, when, change, kept] of cases) {
+        const sh = await turboHeld(p, when === 'starting');
+        await stageFile(p, SETUP99);
+        if (when === 'stopping') sh.pause();
+        const a = c(), seed0 = p.T.initArgs.seed;
+        p.click('restart'); const ask = asked(p); p.click('startconfirm');
+        if (when === 'stopping') await until(() => sh.queued(isType('memory')), 'the memory');
+        const queued = !!p.T.pendingStart && p.T.turboState === (when === 'starting' ? 'entering' : 'exiting');
+        change();
+        sh.resume();
+        await until(() => p.T.turboState === 'live' && !p.T.pendingStart, 'the hand-back');
+        const d = delta(a, c());
+        ok(ask && queued && d.inits === 0 && d.epoch === 0 && p.T.initArgs.seed === seed0 && /setup changed/.test(p.msg()) && kept(),
+           (when === 'starting' ? 'Starting' : 'Stopping') + ' Turbo, the staged file\'s start queued, then ' + what + ': Turbo stops as by Stop, the file does not start, ' +
+           'the sheet keeps the change (' + JSON.stringify(d) + '; "' + p.msg().slice(0, 70) + '…")');
+        p.click('startdiscard');
+    }
+    {   /* asked (a live tweak), then Fit: Replace it starts nothing */
+        const q = await bootPage(PAGE_Q);
+        const cq = startCounter(q), a = cq();
+        q.edit('minSpeed', 40);
+        await stageFile(q, SETUP99);
+        q.click('restart');
+        const ask = asked(q);
+        q.ctx.innerWidth = 800; q.ctx.innerHeight = 1200; q.click('fitbtn'); q.ctx.innerWidth = 1920; q.ctx.innerHeight = 1080;
+        q.click('startconfirm');
+        const d = delta(a, cq());
+        ok(ask && d.inits === 0 && q.T.draft && q.T.draft.kind === 'file' && q.T.getVal('width') === 1080 && /setup changed/.test(q.msg()),
+           'a staged file asked about (a live tweak), then Fit to this screen: Replace it starts nothing, the fitted size stays staged ("' + q.msg() + '")');
+        ok(q.uncaught.length === 0, 'no exception escaped the page\'s handlers (the Fit case)' + (q.uncaught.length ? ' (' + q.uncaught[0] + ')' : ''));
+    }
+    {   /* the control: nothing changed meanwhile, the file starts (Stopping Turbo) */
+        const sh = await turboHeld(p, false);
+        await stageFile(p, SETUP99);
+        sh.pause();
+        const a = c();
+        p.click('restart'); p.click('startconfirm');
+        sh.resume();
+        await until(() => p.T.turboState === 'live' && !p.T.pendingStart, 'the start');
+        const d = delta(a, c());
+        ok(d.inits === 1 && d.epoch === 1 && p.T.initArgs.seed === 99 && p.T.W === 800 && !p.T.draft,
+           'the control: the file\'s start queued and nothing changed meanwhile: Turbo hands back, then the file\'s world starts once (seed 99, 800 wide)');
+    }
+    ok(p.uncaught.length === 0, 'no exception escaped the page\'s handlers' + (p.uncaught.length ? ' (' + p.uncaught[0] + ')' : ''));
+}
+
 /* Every section, in order; `node tests/ocean_turbo_handoff.js NAME...` runs only those. */
 const SECTIONS = {
     repeatedKeys, liveLedger, growthPage, randomize, imports,
@@ -3038,7 +3108,7 @@ const SECTIONS = {
     pageColourBench, pageLayers, pageResize, pageKeys, pageStartupFailures, pageTourEscape, pageWholeFields,
     pageTurboFraction, pageCardNumbers, pageMixedRecovery, pageEscOwner, pageTabKeys, pageIntegralFloats,
     pageTurboMode, pageStartDoor, pageFollowBack, pageDraft, pageScenarios,
-    pageCancelQueued
+    pageCancelQueued, pageQueuedFile
 };
 const unhandled = [];
 process.on('unhandledRejection', (e) => { unhandled.push(e); });
