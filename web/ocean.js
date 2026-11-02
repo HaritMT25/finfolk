@@ -522,7 +522,7 @@
     if (typeof def === "boolean" || opt.bit) input.checked = v === true || v === 1;
     else input.value = String(v);
   }
-  function resetForm() { Object.keys(KEYS).forEach(function (k) { setVal(k, KEYS[k][0]); }); extraCfg = {}; clearFieldNotes(); }
+  function resetForm() { Object.keys(KEYS).forEach(function (k) { setVal(k, KEYS[k][0]); }); extraCfg = {}; nextOnly = {}; clearFieldNotes(); }
   /* a flat cfg object into the sheet: known keys into their fields, the rest kept aside */
   function cfgToForm(cfg) {
     Object.keys(cfg || {}).forEach(function (k) {
@@ -578,6 +578,14 @@
    * in flight (sent to the worker, not answered), acknowledged; in the order
    * they were made (web/ocean_handoff.js ledger, which the tests run) */
   var live = HO ? HO.ledger() : null;
+  /* A live setting's value typed for the next world only (below 0: a
+   * running world can't take it) is no ledger entry, and may be newer than
+   * an edit of the key still on its way: that edit's answer (acknowledged or
+   * refused) changes the running world's bookkeeping, never this field, and
+   * the value counts as waiting meanwhile. Kept as typed; it holds while the
+   * field still shows it (a newer edit, Discard or a start ends it). */
+  var nextOnly = {};
+  function nextOnlyNow(key) { return Object.prototype.hasOwnProperty.call(nextOnly, key) && !!el("o_" + key) && rawOf(key) === nextOnly[key]; }
   function numOf(key, v) { return typeof v === "boolean" ? (v ? 1 : 0) : v; }
   function valOf(key, num) { return typeof KEYS[key][0] === "boolean" ? num === 1 : num; }
   function shown(v) { return typeof v === "boolean" ? (v ? "on" : "off") : String(v); }
@@ -597,10 +605,12 @@
   /* push one live knob into the running world (or the Turbo worker's) */
   function applyLive(key) {
     if (!M || draft) return;   /* a staged scenario's or file's settings are the next world's, live ones too */
+    delete nextOnly[key];
     var num = numOf(key, getVal(key));
     if (wholeKey(key) && !Number.isInteger(num)) { refuse(key, "it must be a whole number"); return; }   /* 300.5: never run as 301 */
     if (num < 0) {
       if (CFG.NEG_ON_RESTART[key]) {
+        nextOnly[key] = rawOf(key);
         fieldNote(key, "Applies at the next start: a running world takes only 0 or more.");
         renderStartBar();
         showNote((LABELS[key] || key) + " " + num + " waits for the next start (a running world takes only 0 or more).");
@@ -643,8 +653,8 @@
      * the world, what the worker acknowledged (this page's copy is the world
      * as Turbo took it; the hand-back reads the module again) */
     if (key === "lightEnabled" || key === "L0" || key === "kWater") { if (turboState === "live") readLight(); else lightFromCfg(); }
-    var input = el("o_" + key);   /* (a staged recipe's field is the next world's: left alone) */
-    if (input && !draft && document.activeElement !== input && !(live && live.pending(key, seq)) && getVal(key) !== v) {
+    var input = el("o_" + key);   /* (a staged recipe's field, or a newer value for the next world only: left alone) */
+    if (input && !draft && !nextOnlyNow(key) && document.activeElement !== input && !(live && live.pending(key, seq)) && getVal(key) !== v) {
       setVal(key, v); updateNeeds(); updateTabDots();
     }
     renderStartBar();
@@ -655,18 +665,18 @@
    * the worker), else to what the world runs with (keep: a newer edit of it
    * follows, so the field stays) */
   function refuse(key, why, keep) {
-    var back = null, p = null;
+    var back = null, p = null, next = nextOnlyNow(key);
     if (!keep) {
       p = live ? live.latest(key) : null;
       back = p ? valOf(key, p.num) : cfgVal(key);
-      if (!draft) {   /* a staged recipe's field is the next world's: left alone */
+      if (!draft && !next) {   /* a staged recipe's field, or a newer value for the next world: left alone */
         setVal(key, back);
         fieldNote(key, p && p.from === "held" ? heldNote() : "");
         updateNeeds(); updateTabDots();
       }
       renderStartBar();
     }
-    showError((LABELS[key] || key) + ": " + why + (keep ? "" : draft ? " (the running world keeps " + shown(back) + ")" :
+    showError((LABELS[key] || key) + ": " + why + (keep ? "" : draft || next ? " (the running world keeps " + shown(back) + ")" :
               " (back to " + shown(back) + (p ? ", on its way" : "") + ")"));
   }
   /* Edits in the order they were made (ledger entries): to the worker while
@@ -677,7 +687,7 @@
   function replayEdits(list, quiet) {
     var out = { applied: [], refused: [] };
     list.forEach(function (e, i) {
-      fieldNote(e.key, "");
+      if (!nextOnlyNow(e.key)) fieldNote(e.key, "");   /* (a newer value for the next world keeps its note) */
       var later = list.some(function (f, j) { return j > i && f.key === e.key; });
       var r = sendLive(e.key, e.num, quiet, later, e.seq);
       if (r === true) out.applied.push(e);
@@ -929,7 +939,7 @@
       if (!el("o_" + k)) return;
       var a = formNum(k);
       if (draft) { if (differs(k, a, draft.base[k])) out.push(k); return; }
-      if (LIVE[k] && live && live.pending(k)) return;
+      if (LIVE[k] && live && live.pending(k) && !nextOnlyNow(k)) return;   /* (on its way: its own note; a newer next-world value waits) */
       if (differs(k, a, runningVal(k))) out.push(k);
     });
     return out;

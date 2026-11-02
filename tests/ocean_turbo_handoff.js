@@ -3091,6 +3091,68 @@ async function pageQueuedFile() {
     ok(p.uncaught.length === 0, 'no exception escaped the page\'s handlers' + (p.uncaught.length ? ' (' + p.uncaught[0] + ')' : ''));
 }
 
+/* Finding 3: a live setting's newer value for the next world only (kBuoy
+ * below 0) is no ledger entry, so an older edit of the key still on its way
+ * hid it from what waits, and that edit's answer wrote over it: the
+ * acknowledgement put 0.5 back in the field, a refusal the running value.
+ * Now the answer changes the running world's bookkeeping only; the newer
+ * value stays in the field with its note, counts as waiting, and the next
+ * world gets it. While Turbo runs (in flight) and while it starts (held). */
+async function pageNextBehindLive() {
+    section('Review of #39, finding 3: a newer next-world value (kBuoy below 0) behind an older live edit of the key is not lost to that edit\'s answer');
+    const waiting = (p) => p.el('waitingcount').hidden ? 0 : parseInt(p.el('waitingcount').textContent, 10);
+    const answer = (sh, key, n0) => until(() => sh.delivered.slice(n0).some(m => m.type === 'set' && m.key === key), key + '\'s answer');
+    const { p, sh } = await pageInTurbo();
+    {   /* acknowledged */
+        sh.pause();
+        const n0 = sh.delivered.length;
+        p.edit('kBuoy', 0.5);
+        p.edit('kBuoy', -0.5);
+        const w1 = waiting(p), note1 = p.note('kBuoy');
+        sh.resume();
+        await answer(sh, 'kBuoy', n0);
+        ok(w1 === 1 && /next start/.test(note1) && p.el('o_kBuoy').value === '-0.5' && p.T.runCfg.kBuoy === 0.5 && waiting(p) === 1 &&
+           /next start/.test(p.note('kBuoy')) && p.T.pendingDiff().includes('kBuoy'),
+           'in Turbo, kBuoy 0.5 sent, then -0.5 for the next world: it waits at once (' + w1 + ' waiting, "' + note1 + '"); 0.5\'s acknowledgement ' +
+           'sets the running world (runCfg ' + p.T.runCfg.kBuoy + ') and leaves the field at ' + p.el('o_kBuoy').value + ', still waiting (' + waiting(p) + ')');
+    }
+    {   /* refused */
+        sh.pause();
+        const n0 = sh.delivered.length;
+        p.edit('kBuoy', 2000);   /* outside [-1000, 1000]: the worker refuses it */
+        p.edit('kBuoy', -0.7);
+        sh.resume();
+        await answer(sh, 'kBuoy', n0);
+        const refused = sh.delivered.slice(n0).some(m => m.type === 'set' && m.key === 'kBuoy' && !m.ok);
+        ok(refused && p.el('o_kBuoy').value === '-0.7' && p.T.runCfg.kBuoy === 0.5 && waiting(p) === 1 && /keeps 0.5/.test(p.msg()),
+           'kBuoy 2000 sent, then -0.7 for the next world: the worker\'s refusal of 2000 leaves the field at ' + p.el('o_kBuoy').value +
+           ' ("' + p.msg() + '")');
+    }
+    {   /* the next world gets it */
+        p.click('turboexit');
+        await until(() => p.T.turboState === 'live', 'the hand-back');
+        const kept = p.el('o_kBuoy').value === '-0.7' && waiting(p) === 1;
+        p.start();
+        ok(kept && p.T.initArgs.cfg.kBuoy === -0.7 && p.T.runCfg.kBuoy === -0.7,
+           'after the hand-back -0.7 still waits; Start: the new world has kBuoy ' + p.T.initArgs.cfg.kBuoy);
+    }
+    {   /* held while Turbo starts, then flushed and acknowledged */
+        const q = await bootPage(PAGE_Q);
+        const sq = await turboHeld(q, true);
+        q.edit('kBuoy', 0.5);
+        q.edit('kBuoy', -0.5);
+        const w1 = waiting(q);
+        const n0 = sq.delivered.length;
+        sq.resume();
+        await answer(sq, 'kBuoy', n0);
+        ok(w1 === 1 && q.el('o_kBuoy').value === '-0.5' && q.T.runCfg.kBuoy === 0.5 && waiting(q) === 1 && /next start/.test(q.note('kBuoy')),
+           'Starting Turbo: kBuoy 0.5 held, then -0.5 for the next world: 0.5 is applied when Turbo has started and acknowledged (runCfg ' +
+           q.T.runCfg.kBuoy + '); the field keeps ' + q.el('o_kBuoy').value + ' and its note ("' + q.note('kBuoy') + '")');
+        ok(q.uncaught.length === 0, 'no exception escaped the page\'s handlers (held)' + (q.uncaught.length ? ' (' + q.uncaught[0] + ')' : ''));
+    }
+    ok(p.uncaught.length === 0, 'no exception escaped the page\'s handlers' + (p.uncaught.length ? ' (' + p.uncaught[0] + ')' : ''));
+}
+
 /* Every section, in order; `node tests/ocean_turbo_handoff.js NAME...` runs only those. */
 const SECTIONS = {
     repeatedKeys, liveLedger, growthPage, randomize, imports,
@@ -3108,7 +3170,7 @@ const SECTIONS = {
     pageColourBench, pageLayers, pageResize, pageKeys, pageStartupFailures, pageTourEscape, pageWholeFields,
     pageTurboFraction, pageCardNumbers, pageMixedRecovery, pageEscOwner, pageTabKeys, pageIntegralFloats,
     pageTurboMode, pageStartDoor, pageFollowBack, pageDraft, pageScenarios,
-    pageCancelQueued, pageQueuedFile
+    pageCancelQueued, pageQueuedFile, pageNextBehindLive
 };
 const unhandled = [];
 process.on('unhandledRejection', (e) => { unhandled.push(e); });
