@@ -144,7 +144,7 @@ EOF
 $PY "$T/plan.py" design3.json > plan3.jsonl || fail "plan.py (matrix)"
 [ "$(wc -l < plan3.jsonl)" = 27 ] || fail "plan.py: a 3x3 matrix x 3 replicates is 27 cells"
 $PY "$T/run.py" --plan plan3.jsonl --root root3 --binary "$BIN" --workers 2 > run3.log 2>&1 || fail "run.py (matrix): $(tail -3 run3.log)"
-$PY "$T/analyze.py" --root root3 --out an3 --plan plan3.jsonl --windows 0.25 --no-power --sims 50 > an3.log 2>&1 \
+$PY "$T/analyze.py" --root root3 --out an3 --plan plan3.jsonl --windows 0.25 --max-window-error 0.6 --no-power --sims 50 > an3.log 2>&1 \
     || fail "analyze.py: $(tail -5 an3.log)"
 $PY - <<'PY' || fail "analysis of the complete registered matrix"
 import csv, json
@@ -164,9 +164,25 @@ for r in rows:
 runs = list(csv.DictReader(open("an3/runs.csv")))
 assert sum(1 for x in runs if x["s"] and sig(x["s"]) > 6) > 0.9 * len(runs), "runs.csv scores rounded"
 PY
+# a window the runs never reached is not read at their final checkpoint: no score, no formal row
+$PY "$T/analyze.py" --root root3 --out an3w --plan plan3.jsonl --windows 50 --no-power --sims 50 > an3w.log 2>&1 \
+    || fail "analyze.py (window beyond the horizon): $(tail -5 an3w.log)"
+$PY - "$T" <<'PY' || fail "a requested window must not silently become an earlier or final checkpoint"
+import csv, os, sys
+runs = list(csv.DictReader(open("an3w/runs.csv")))
+assert runs and all(r["missed"] == "True" and r["s"] == "" and r["steps_at"] == "" for r in runs), runs[:2]
+rows = list(csv.DictReader(open("an3w/matrix.csv"))) if os.path.exists("an3w/matrix.csv") else []
+assert not any(r["status"] == "formal" for r in rows), rows
+sys.path.insert(0, sys.argv[1]); import run
+# the runner's schedule check: every periodic checkpoint must be there (the engine only warns)
+files = ["end.json", "end.1300.json", "end.1600.json", "end.1900.json", "arena.json"]
+assert run.check_schedule(files, 1000, 900, 300) == [], run.check_schedule(files, 1000, 900, 300)
+assert run.check_schedule([f for f in files if f != "end.1600.json"], 1000, 900, 300) == [1600]
+assert run.check_schedule(["end.json"], 1000, 900, 0) == []
+PY
 # the same finished cells in two roots: nothing says which copy is right, so neither is used
 cp -r root3 root3dup
-$PY "$T/analyze.py" --root root3 --root root3dup --out an3d --plan plan3.jsonl --windows 0.25 --no-power --sims 50 \
+$PY "$T/analyze.py" --root root3 --root root3dup --out an3d --plan plan3.jsonl --windows 0.25 --max-window-error 0.6 --no-power --sims 50 \
     > an3d.log 2>&1 || fail "analyze.py (duplicate roots): $(tail -5 an3d.log)"
 $PY - <<'PY' || fail "cells duplicated across roots must not give formal decisions"
 import csv, json, os
@@ -176,7 +192,7 @@ rows = list(csv.DictReader(open("an3d/matrix.csv"))) if os.path.exists("an3d/mat
 assert not any(r["status"] == "formal" for r in rows), rows
 PY
 rm root3/cells/off_f100_A_B_r01/done.json
-$PY "$T/analyze.py" --root root3 --out an3b --plan plan3.jsonl --windows 0.25 --no-power --sims 50 > an3b.log 2>&1 \
+$PY "$T/analyze.py" --root root3 --out an3b --plan plan3.jsonl --windows 0.25 --max-window-error 0.6 --no-power --sims 50 > an3b.log 2>&1 \
     || fail "analyze.py (incomplete): $(tail -5 an3b.log)"
 $PY - <<'PY' || fail "an incomplete registered matrix must be descriptive"
 import csv, json
@@ -200,7 +216,7 @@ for f in ("cell.json", "done.json"):
     c.update(id="off_f100_A_B_r01x", replicate=1, slot_seed=c["slot_seed"] + 1)
     json.dump(d, open(p, "w"))
 PY
-$PY "$T/analyze.py" --root root3 --out an3c --plan plan3.jsonl --windows 0.25 --no-power --sims 50 > an3c.log 2>&1 \
+$PY "$T/analyze.py" --root root3 --out an3c --plan plan3.jsonl --windows 0.25 --max-window-error 0.6 --no-power --sims 50 > an3c.log 2>&1 \
     || fail "analyze.py (substitute): $(tail -5 an3c.log)"
 $PY - <<'PY' || fail "an unregistered cell filled a registered position"
 import csv, json
@@ -268,7 +284,7 @@ head -9 plan8p.jsonl > plan8p_a.jsonl   # batch 1: replicate 0
 $PY "$T/run.py" --plan plan8p_a.jsonl --root root8p --binary "$BIN" --workers 2 > run8a.log 2>&1 || fail "run.py batch 1"
 cp A.json Cs.json   # C overwritten between the batch attempts
 $PY "$T/run.py" --plan plan8p.jsonl --root root8p --binary "$BIN" --workers 2 > run8b.log 2>&1 || fail "run.py batch 2"
-$PY "$T/analyze.py" --root root8p --out an8 --plan plan8p.jsonl --windows 0.25 --no-power --sims 50 > an8.log 2>&1 \
+$PY "$T/analyze.py" --root root8p --out an8 --plan plan8p.jsonl --windows 0.25 --max-window-error 0.6 --no-power --sims 50 > an8.log 2>&1 \
     || fail "analyze.py (two-batch): $(tail -5 an8.log)"
 $PY - <<'PY' || fail "a snapshot name read as two files must be excluded"
 import csv, json, os

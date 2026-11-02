@@ -25,7 +25,11 @@ without --plan, or with registered cells missing, matrices are descriptive.
                births reach k x the start population, from the sham runs
   runs.csv     one row per run and window: the score at the scored checkpoint
                nearest W = G x generation length of the RESIDENT (the same W for
-               i->j and its sham j->j)
+               i->j and its sham j->j), with W, the steps actually read and the
+               relative error; no score ("missed") when no checkpoint lies within
+               --max-window-error x W (a run that ended early is never read at its
+               final checkpoint instead), and a registered cell with a missed
+               window makes its matrix descriptive
   groups.csv   per (condition, fraction, window, resident, invader, mode): mean,
                SD, SE of s over replicates; invader-lost and extinction counts
   paired.csv   per invade cell: s~ = mean_r [s(i->j, r) - s(j->j, r)] with the
@@ -259,14 +263,18 @@ def gen_length(recs, definition="pop"):
     return out
 
 
-def pick(r, W):
-    """The scored point nearest W steps (None if the run never got there)."""
+def pick(r, W, tol):
+    """The scored checkpoint nearest W steps, or None when no checkpoint lies within tol x W of
+    it: the run ended before the window (or its checkpoints are too sparse there). A requested
+    window is never silently read at an earlier or the final checkpoint."""
     pts = r["points"]
     best = min(pts, key=lambda p: abs(p["steps"] - W))
-    return best
+    return best if abs(best["steps"] - W) <= tol * W else None
 
 
-def run_rows(recs, gens, windows):
+def run_rows(recs, gens, windows, tol):
+    """One row per run and window: requested W, the checkpoint actually read (steps_at) and its
+    relative timing error; s is None (window missed) when no checkpoint is within tol."""
     rows = []
     for r in recs:
         g = gens.get((r["j"], r["cond"]))
@@ -274,9 +282,14 @@ def run_rows(recs, gens, windows):
             continue
         for G in windows:
             W = G * g["g"]
-            p = pick(r, W)
-            rows.append({**{k: r[k] for k in ("id", "j", "i", "mode", "frac", "cond", "rep", "n0", "m")},
-                         "G": G, "W": round(W), "steps_at": p["steps"], "over": W > r["points"][-1]["steps"] + 1000,
+            p = pick(r, W, tol)
+            base = {**{k: r[k] for k in ("id", "j", "i", "mode", "frac", "cond", "rep", "n0", "m")},
+                    "G": G, "W": W, "last_steps": r["points"][-1]["steps"]}
+            if p is None:
+                rows.append({**base, "steps_at": None, "rel_err": None, "missed": True, "s": None, "n": None,
+                             "births": None, "gens": None, "invader_lost": None, "extinct": None})
+                continue
+            rows.append({**base, "steps_at": p["steps"], "rel_err": (p["steps"] - W) / W, "missed": False,
                          "s": p["score"], "n": p["n"], "births": p["births"], "gens": p["generations"],
                          "invader_lost": p["invader_lost"], "extinct": p["extinct"]})
     return rows
@@ -292,7 +305,8 @@ def groups(rows):
         out.append({"cond": cond, "frac": frac, "G": G, "j": j, "i": i, "mode": mode, "k": len(s),
                     "mean": mean(s), "sd": sd(s), "se": (sd(s) / math.sqrt(len(s))) if len(s) > 1 else None,
                     "lost": sum(1 for x in xs if x["invader_lost"]), "extinct": sum(1 for x in xs if x["extinct"]),
-                    "W": xs[0]["W"], "n_end": mean([x["n"] for x in xs]), "over": any(x["over"] for x in xs)})
+                    "W": xs[0]["W"], "n_end": mean([x["n"] for x in xs if x["n"] is not None]),
+                    "missed": sum(1 for x in xs if x["missed"])})
     return out
 
 
@@ -443,6 +457,8 @@ def matrices(rows, meta=None, zmin=2.0, sims=1000, registry=None):
     keys = sorted({(x["cond"], x["frac"], x["G"]) for x in rows})
     for cond, frac, G in keys:
         cell = {}
+        missed = {(x["i"], x["j"], x["rep"]) for x in rows
+                  if (x["cond"], x["frac"], x["G"]) == (cond, frac, G) and x["missed"]}
         for x in rows:
             if (x["cond"], x["frac"], x["G"]) == (cond, frac, G) and x["mode"] in ("invade", "sham") and x["s"] is not None:
                 reps_ij = cell.setdefault((x["i"], x["j"]), {})
@@ -464,8 +480,10 @@ def matrices(rows, meta=None, zmin=2.0, sims=1000, registry=None):
                 if not miss and len(R) >= 2:
                     status, names, reps = "formal", rnames, R
                 else:
+                    nwin = sum(1 for t in miss if t in missed)
                     status = (f"descriptive: {len(miss)} of {len(rnames) ** 2 * len(R)} registered cells "
-                              f"of the {len(rnames)}-block missing")
+                              f"of the {len(rnames)}-block missing"
+                              + (f" ({nwin} with no checkpoint within the window tolerance)" if nwin else ""))
             else:
                 status = "descriptive: no complete matrix registered"
         else:
@@ -565,6 +583,9 @@ def main(argv=None):
     ap.add_argument("--sims", type=int, default=1000)
     ap.add_argument("--power-sims", type=int, default=400)
     ap.add_argument("--no-power", action="store_true")
+    ap.add_argument("--max-window-error", type=float, default=0.10,
+                    help="largest relative distance between a requested window and the checkpoint read for it "
+                         "(default 0.10); a run with no checkpoint that close has no score for that window")
     ap.add_argument("--gen-def", default="pop", choices=["pop", "n0"],
                     help="window clock: turnover of the mean population (default) or of the start population")
     ap.add_argument("--power-cond", default=None, help="condition whose noise drives the power table (default all)")
@@ -622,7 +643,7 @@ def main(argv=None):
     ident = {"plan_sha256": prov["plan"]["sha256"] if prov["plan"] else "",
              "analysis_sha256": prov["analysis_code"]["analyze.py"]}
     gens = gen_length(recs, a.gen_def)
-    rows = run_rows(recs, gens, windows)
+    rows = run_rows(recs, gens, windows, a.max_window_error)
     grp = groups(rows)
     prs = paired(rows)
     pt = pair_table(prs)
@@ -657,10 +678,20 @@ def main(argv=None):
                   f"{fmt(g['g_n0'], 0)} | {fmt(g['g_n0_sd'], 0)} | {fmt(g['gen1'], 0)} | {fmt(g['gen1_sd'], 0)} | {g['runs']} |")
 
     write_csv(os.path.join(a.out, "runs.csv"), rows,
-              ["id", "j", "i", "mode", "frac", "cond", "rep", "n0", "m", "G", "W", "steps_at", "over", "s", "n",
-               "births", "gens", "invader_lost", "extinct"])
+              ["id", "j", "i", "mode", "frac", "cond", "rep", "n0", "m", "G", "W", "steps_at", "rel_err", "missed",
+               "last_steps", "s", "n", "births", "gens", "invader_lost", "extinct"])
     write_csv(os.path.join(a.out, "groups.csv"), grp,
-              ["cond", "frac", "G", "j", "i", "mode", "k", "mean", "sd", "se", "lost", "extinct", "W", "n_end", "over"])
+              ["cond", "frac", "G", "j", "i", "mode", "k", "mean", "sd", "se", "lost", "extinct", "W", "n_end",
+               "missed"])
+    md.append(f"\n## Window reads (requested W vs the checkpoint read; tolerance {a.max_window_error:.0%} of W)\n")
+    md.append("| window (gens) | runs | requested W (steps) | max abs relative error | mean | missed (no checkpoint within tolerance) |\n|---|---|---|---|---|---|")
+    for G in windows:
+        xs = [x for x in rows if x["G"] == G]
+        if not xs:
+            continue
+        errs = [abs(x["rel_err"]) for x in xs if x["rel_err"] is not None]
+        md.append(f"| {G} | {len(xs)} | {min(x['W'] for x in xs):.0f}-{max(x['W'] for x in xs):.0f} | "
+                  f"{fmt(max(errs) if errs else None, 3)} | {fmt(mean(errs), 3)} | {sum(1 for x in xs if x['missed'])} |")
     write_csv(os.path.join(a.out, "paired.csv"), prs,
               ["cond", "frac", "G", "j", "i", "k", "s_inv", "s_sham", "st", "sd_d", "se_paired", "se_unpaired",
                "sd_inv", "sd_sham", "gain", "corr", "z"])

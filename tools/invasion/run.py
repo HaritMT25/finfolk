@@ -36,6 +36,10 @@ Rules:
   * resume: a cell with done.json has its outputs re-hashed and is skipped (a
     corrupt finished cell is an error); a cell without one is rerun from
     scratch, the earlier attempt moved to DIR/cells/<id>.attempt<N>/;
+  * the checkpoint schedule is verified: every periodic checkpoint the cell's
+    checkpoint_every implies must exist (the engine only warns when a
+    periodic write fails) and end.json must be the cell's last step; a gap
+    fails the cell (exit 6) instead of moving a window's read;
   * a failed cell (engine exit, scorer check, missing output) stops admission;
     running cells finish; exit 1;
   * DIR/STOP: stop admitting, let running cells finish, exit 75 (remove the
@@ -205,6 +209,11 @@ def run_cell(root, cell_id):
         print(f"engine exit {rc}", file=sys.stderr)
         return 3
     start_frame = man["start"]["frame"]
+    gap = check_schedule(os.listdir(d), start_frame, c["steps"], c["checkpoint_every"])
+    if gap:
+        print(f"CHECKPOINT SCHEDULE INCOMPLETE: no periodic checkpoint at frames {gap[:5]}"
+              f"{' ...' if len(gap) > 5 else ''} ({len(gap)} missing)", file=sys.stderr)
+        return 6
     mids = sorted((f for f in os.listdir(d) if f.startswith("end.") and f.endswith(".json") and f != "end.json"),
                   key=lambda f: int(f.split(".")[1]))
     # the periodic checkpoint at the last step duplicates end.json
@@ -216,6 +225,9 @@ def run_cell(root, cell_id):
     except score_mod.DerivationError as e:
         print(f"DERIVATION CHECK FAILED: {e}", file=sys.stderr)
         return 4
+    if res["points"][-1]["steps"] != c["steps"]:   # end.json is the run's end, not an earlier state
+        print(f"END CHECKPOINT at {res['points'][-1]['steps']} steps, the cell asked for {c['steps']}", file=sys.stderr)
+        return 6
     invlib.write_json_atomic(os.path.join(d, "score.json"), res)
     t_score = time.time() - t2
     # run.csv: population and speed over the window
@@ -246,6 +258,21 @@ def run_cell(root, cell_id):
     }
     invlib.write_json_atomic(os.path.join(d, "done.json"), done)
     return 0
+
+
+def check_schedule(files, start_frame, steps, every):
+    """The periodic checkpoints a run with --checkpoint-every `every` must have left: one at every
+    start_frame + m x every (m = 1 .. steps // every; the last may coincide with the end). The
+    engine reports a failed periodic write on stderr and carries on, and the scorer reads
+    whichever checkpoints exist, so a gap would silently move a window's read. -> missing frames."""
+    if not every:
+        return []
+    have = set()
+    for f in files:
+        p = f.split(".")
+        if len(p) == 3 and p[0] == "end" and p[2] == "json" and p[1].isdigit():
+            have.add(int(p[1]))
+    return [start_frame + m * every for m in range(1, steps // every + 1) if start_frame + m * every not in have]
 
 
 def verify_done(d):
