@@ -251,6 +251,7 @@ async function partCorrectness() {
     const a2 = at();
     const stored = localStorage.getItem("evo_boids.colourBy");
     document.getElementById("restart").click();
+    if (!document.getElementById("startask").hidden) document.getElementById("startconfirm").click();   /* (asked: a run with something to lose) */
     await B.frames(5);
     const q = new URLSearchParams(location.search);
     return { a0, a1, a2, stored, link: { renderBench: q.get("renderBench"), perf: q.get("perf"), seed: q.get("seed") } };
@@ -490,7 +491,11 @@ async function partIframe() {
     out.following = EvoOcean.state().following;
     out.texFollow = await EvoOcean.scene.appearanceTextureParity();
     const e0 = EvoOcean.state().worldEpoch;
-    document.getElementById("restart").click(); await wait(1200);
+    /* Start (the start bar's): it asks first when the run has something to lose (UI-3), answered here */
+    const asked = () => !document.getElementById("startask").hidden;
+    document.getElementById("restart").click();
+    if (asked()) document.getElementById("startconfirm").click();
+    await wait(1200);
     out.epochAfterRestart = [e0, EvoOcean.state().worldEpoch];
     EvoApp.startTurbo();
     const t0 = Date.now();
@@ -504,6 +509,17 @@ async function partIframe() {
     out.back = EvoOcean.state().turbo; out.epochAcrossTurbo = [e1, EvoOcean.state().worldEpoch];
     out.texAfterTurbo = await EvoOcean.scene.appearanceTextureParity();
     out.frame = EvoOcean.state().frame;
+    /* Stop Turbo & start (UI-4): Turbo used, so Start asks; the answer hands the world back, then exactly one new world */
+    const e2 = EvoOcean.state().worldEpoch, t1 = Date.now();
+    EvoApp.startTurbo();
+    while (EvoOcean.state().turbo !== "turbo" && Date.now() - t1 < 20000) await wait(100);
+    await wait(800);
+    document.getElementById("restart").click(); await wait(200);
+    out.replaceAsked = asked();
+    document.getElementById("startconfirm").click();
+    while ((EvoOcean.state().turbo !== "live" || EvoOcean.state().worldEpoch === e2) && Date.now() - t1 < 40000) await wait(100);
+    await wait(600);
+    out.replace = { epoch: [e2, EvoOcean.state().worldEpoch], turbo: EvoOcean.state().turbo, frame: EvoOcean.state().frame };
     return out;
   });
   r.parentCoi = await L.page.evaluate(() => self.crossOriginIsolated);
@@ -517,6 +533,8 @@ async function partIframe() {
         r.colour === "appearance" && r.following && r.epochAfterRestart[1] === r.epochAfterRestart[0] + 1 && r.turbo === "turbo" && r.back === "live" &&
         r.epochAcrossTurbo[0] === r.epochAcrossTurbo[1], report.parts.iframe);
   check("live texture check in the embed, following and after Turbo", r.texFollow.ok && r.texAfterTurbo.ok, { a: brief(r.texFollow), b: brief(r.texAfterTurbo) });
+  check("Stop Turbo & start in the embed: asked first (Turbo used), then exactly one new world, live",
+        r.replaceAsked === true && r.replace.turbo === "live" && r.replace.epoch[1] === r.replace.epoch[0] + 1, r.replace);
   check("no console / page / network errors", L.errors.length === 0, L.errors.slice(0, 5));
   await L.ctx.close();
 }

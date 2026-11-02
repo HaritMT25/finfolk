@@ -230,7 +230,10 @@
   function tick() {
     var s = steps[idx];
     /* Turbo started some other way (its own button): the card has done its job */
-    if (s.intro) { var tb = q("#turbo"); if (tb && !tb.hidden) { endIntro(false, true); return; } }
+    if (s.intro) {
+      var tb = q("#turbo"), on = app().turboActive ? app().turboActive() : !!tb && !tb.hidden;   /* the Ocean asks its page; Classic shows #turbo */
+      if (on) { endIntro(false, true); return; }
+    }
     /* a settings step whose settings got closed: nothing to point at until they reopen */
     var r = s.target && !(s.drawer && !drawerOpen()) ? s.target() : null;
     if (r && !(r.width > 0 && r.height > 0)) r = null;
