@@ -1777,8 +1777,10 @@ async function pageSizeFields() {
        '1080.25, 12.5 fish, seed 1.5 / -1 / 2^32, an empty width, depth 9.5): no oc_init, the field as typed' + (bad.length ? ' — ' + bad.join('; ') : ''));
     p.edit('width', '3840'); p.edit('depth', '237.5');
     p.click('restart');
-    ok(p.T.W === 3840 && p.T.D === 237.5 && /[?&]w=3840/.test(p.loc.href) && p.T.initArgs.depth === 237.5,
-       'whole numbers in range run as shown: width 3840, depth 237.5 (a depth need not be whole) (' + p.T.W + ' x ' + p.T.H + ' x ' + p.T.D + ')');
+    const askedFirst = asked(p);   /* (edits wait: the approved rule asks first, review of #39 finding 8) */
+    if (askedFirst) p.click('startconfirm');
+    ok(askedFirst && p.T.W === 3840 && p.T.D === 237.5 && /[?&]w=3840/.test(p.loc.href) && p.T.initArgs.depth === 237.5,
+       'whole numbers in range run as shown (asked first: they wait): width 3840, depth 237.5 (a depth need not be whole) (' + p.T.W + ' x ' + p.T.H + ' x ' + p.T.D + ')');
     ok(p.uncaught.length === 0, 'no exception escaped the page\'s handlers');
 }
 
@@ -2431,20 +2433,22 @@ async function pageStartDoor() {
         ['Hunters, then the bar\'s Start', () => { p.click('huntersbtn'); p.click('restart'); }, 'init'],
         ['Currents & patches, then its Start', () => { p.click('currentsbtn'); p.click('scenario-start'); }, 'init'],
         ['Standard, then its Start', () => { p.click('advreset'); p.click('scenario-start'); }, 'init'],
-        ['Fit the world to this screen, then Start', () => { p.ctx.innerWidth = 800; p.ctx.innerHeight = 1200; p.click('fitbtn'); p.ctx.innerWidth = 1920; p.ctx.innerHeight = 1080; p.click('restart'); }, 'init'],
+        ['Fit the world to this screen, then Start (asked: its size waits)', () => { p.ctx.innerWidth = 800; p.ctx.innerHeight = 1200; p.click('fitbtn'); p.ctx.innerWidth = 1920; p.ctx.innerHeight = 1080; p.click('restart'); }, 'init', true],
         ['Load setup, then Start', () => p.loadSetup(v1), 'init'],
         ['the link\'s import (start-up, benchmark)', () => p.T.importWorld(7, 12, 240, { walls: true }, undefined, [], [1920, 1080]), 'init'],
         ['Big tank, then its Start', () => { p.click('bigbtn'); p.click('scenario-start'); }, 'init']
     ];
     const bad = [];
-    for (const [what, act, kind] of ways) {
+    for (const [what, act, kind, asks] of ways) {
         const a = c();
         await act();
+        const q = asked(p);   /* (edits waiting ask first: review of #39, finding 8) */
+        if (q) p.click('startconfirm');
         const d = delta(a, c());
-        if (d.epoch !== 1 || d.inits !== (kind === 'init' ? 1 : 0) || d.resets !== (kind === 'reset' ? 1 : 0) || asked(p))
-            bad.push(what + ' ' + JSON.stringify(d) + ' "' + p.msg() + '"');
+        if (d.epoch !== 1 || d.inits !== (kind === 'init' ? 1 : 0) || d.resets !== (kind === 'reset' ? 1 : 0) || q !== !!asks || asked(p))
+            bad.push(what + ' ' + JSON.stringify(d) + (q !== !!asks ? (q ? ' asked' : ' not asked') : '') + ' "' + p.msg() + '"');
     }
-    ok(!bad.length, 'each start moves the epoch once, through one oc_init (Replay: oc_reset), with nothing to ask on a fresh run: ' +
+    ok(!bad.length, 'each start moves the epoch once, through one oc_init (Replay: oc_reset), with nothing to ask on a fresh run but an edit waiting: ' +
        ways.map(w => w[0]).join(', ') + (bad.length ? ' — ' + bad.join('; ') : ''));
     {   /* a live tweak: asked, Keep it, an edit meanwhile, then Replace it (the tweak carries over) */
         const q = await bootPage(PAGE_Q7), cq = startCounter(q), a = cq();
@@ -3280,6 +3284,52 @@ async function pageAskTarget() {
     ok(p.uncaught.length === 0, 'no exception escaped the page\'s handlers' + (p.uncaught.length ? ' (' + p.uncaught[0] + ')' : ''));
 }
 
+/* Finding 8: the approved rule asks before a start when the run has
+ * something to lose: five minutes, Turbo, live tweaks, or edits waiting.
+ * The last was left out. Now a young run with an edit waiting (a field, Fit,
+ * a staged card changed, or a card staged over edits that waited) asks;
+ * a card or file picked on an untouched sheet still starts at once. */
+async function pagePendingAsk() {
+    section('Review of #39, finding 8: edits waiting are a reason to ask (the approved rule); a card picked on an untouched sheet is not');
+    const p = await bootPage(PAGE_Q7);
+    const c = startCounter(p), msg = () => p.el('startaskmsg').textContent;
+    const fit = () => { p.ctx.innerWidth = 800; p.ctx.innerHeight = 1200; p.click('fitbtn'); p.ctx.innerWidth = 1920; p.ctx.innerHeight = 1080; };
+    /* [what, make the edits, how to start, starts at once?, the question says] */
+    const cases = [
+        ['50 fish typed, then Start', () => p.edit('population', 50), () => p.click('restart'), false, /It starts with what waits: Starting fish 50/],
+        ['Fit to this screen, then Start', fit, () => p.click('restart'), false, /Tank width 1080/],
+        ['Big tank over 51 fish typed (Replace), then its Start', () => { p.edit('population', 51); p.click('bigbtn'); p.click('startconfirm'); },
+         () => p.click('scenario-start'), false, /It starts Big tank\./],
+        ['Hunters with its fish changed to 9, then the bar\'s Start', () => { p.click('huntersbtn'); p.edit('population', 9); },
+         () => p.click('restart'), false, /It starts Hunters as you changed it \(Starting fish 9\)/],
+        ['an edit waiting, then R', () => p.edit('foodEnergy', -2), () => p.key('r'), false, /It starts with what waits: Energy per food -2/],
+        ['an edit waiting, then Shift+R (Replay keeps it)', () => p.edit('population', 40), () => p.key('R', { shift: true }), false, /stays waiting/],
+        ['nothing waiting, Hunters picked, then its Start', () => p.click('huntersbtn'), () => p.click('scenario-start'), true, null],
+        ['nothing waiting, a setup file staged, then Start', null, () => p.click('restart'), true, null],
+        ['nothing waiting, Start', () => {}, () => p.click('restart'), true, null]
+    ];
+    const bad = [], said = [];
+    for (const [what, make, go, atOnce, says] of cases) {
+        if (p.T.draft || p.T.pendingDiff().length) p.click('startdiscard');
+        if (make) make(); else await stageFile(p, '{"format":"evo_ocean_setup","seed":11,"population":20,"depth":240,"width":1920,"height":1080,"config":{}}');
+        const a = c();
+        go();
+        const q = asked(p), m = q ? msg() : '', d1 = delta(a, c());
+        if (q) { if (p.T.asking.replace) bad.push(what + ': asked Replace / Keep editing'); p.click('startconfirm'); }
+        const d2 = delta(a, c());
+        if (atOnce ? q || d1.epoch !== 1 : !q || d1.epoch !== 0 || d2.epoch !== 1 || (says && !says.test(m))) bad.push(what + ': ' + (q ? 'asked "' + m + '"' : 'not asked') + ' ' + JSON.stringify(d2));
+        else said.push(what + (q ? ': "' + m + '"' : ': at once'));
+    }
+    ok(!bad.length, 'on a young run (no Turbo, no live tweak): ' + said.join('; ') + (bad.length ? ' — ' + bad.join('; ') : ''));
+    {   /* Keep it keeps the edit waiting; the run goes on */
+        p.edit('population', 33);
+        const a = c();
+        p.click('restart'); p.click('startcancel');
+        ok(delta(a, c()).epoch === 0 && p.T.getVal('population') === 33 && p.T.pendingDiff().includes('population'), 'Keep it: no start, 33 fish still waiting');
+    }
+    ok(p.uncaught.length === 0, 'no exception escaped the page\'s handlers' + (p.uncaught.length ? ' (' + p.uncaught[0] + ')' : ''));
+}
+
 /* Every section, in order; `node tests/ocean_turbo_handoff.js NAME...` runs only those. */
 const SECTIONS = {
     repeatedKeys, liveLedger, growthPage, randomize, imports,
@@ -3297,7 +3347,7 @@ const SECTIONS = {
     pageColourBench, pageLayers, pageResize, pageKeys, pageStartupFailures, pageTourEscape, pageWholeFields,
     pageTurboFraction, pageCardNumbers, pageMixedRecovery, pageEscOwner, pageTabKeys, pageIntegralFloats,
     pageTurboMode, pageStartDoor, pageFollowBack, pageDraft, pageScenarios,
-    pageCancelQueued, pageQueuedFile, pageNextBehindLive, pageEditedFile, pageReplayStaleRead, pageAskTarget
+    pageCancelQueued, pageQueuedFile, pageNextBehindLive, pageEditedFile, pageReplayStaleRead, pageAskTarget, pagePendingAsk
 };
 const unhandled = [];
 process.on('unhandledRejection', (e) => { unhandled.push(e); });

@@ -1025,6 +1025,7 @@
   /* a scenario or a setup file into the sheet, as the next world (fill:
    * puts its recipe in the fields; the edits waiting before are replaced) */
   function stageDraft(d, fill) {
+    d.hadEdits = pendingDiff().length > 0 || !!(draft && draft.hadEdits);   /* (it replaces edits that waited: Start asks) */
     draft = null;
     resetForm();
     fill();
@@ -1055,8 +1056,9 @@
 
   /* ---- the visitor's starts: requestStart, its inline question ----
    * Ask first when the run has something to lose (the approved rule): five
-   * simulated minutes or more, Turbo used (or running), or live tweaks
-   * accepted since it started. During Turbo the start waits for the
+   * simulated minutes or more, Turbo used (or running), live tweaks
+   * accepted since it started, or edits waiting for the next start
+   * (editsWaiting). During Turbo the start waits for the
    * ordinary hand-back (pendingStart): the progressed world comes back and
    * every edit on its way is settled, then the plan is built again and must
    * be the one that was asked about (a refused edit or a change made
@@ -1098,11 +1100,18 @@
     });
     return out;
   }
+  /* Edits waiting for the next start (the approved rule's fourth reason to
+   * ask): a field changed (Fit and the E1 water too), a staged recipe
+   * modified, or a recipe staged over edits that waited (draft.hadEdits,
+   * remembered when it was staged: a card picked on an untouched sheet adds
+   * no question by itself) */
+  function editsWaiting() { return pendingDiff().length > 0 || !!(draft && draft.hadEdits); }
   function loseReasons() {
     var r = [], age = runAge(), tw = liveTweaks();
     if (age >= 300) r.push(fmtTime(age) + " of evolution");
     if (usedTurbo || turboState !== "live") r.push("Turbo's progress");
     if (tw.length) r.push(tw.length === 1 ? "a live tweak (" + (LABELS[tw[0]] || tw[0]) + ")" : tw.length + " live tweaks");
+    if (editsWaiting()) r.push("edits waiting");
     return r;
   }
   /* "started", "asked", "waiting" (for Turbo's hand-back) or "refused" */
@@ -1169,8 +1178,12 @@
     var mine = function (l) { return l.map(function (k) { return (LABELS[k] || k) + " " + valText(k, cfgVal(k)); }).join(", "); };
     var keys = function (l) { return l.map(function (e) { return e[0]; }); }, s = function (n) { return n === 1 ? "" : "s"; };
     var who = draft ? draft.title.charAt(0).toUpperCase() + draft.title.slice(1) : "The new world's setup";
+    /* what waits, which this start applies (Replay: keeps) */
+    var diff = pendingDiff(), list = diff.slice(0, 3).map(fieldText).join(", ") + (diff.length > 3 ? " and " + (diff.length - 3) + " more" : "");
+    var edits = replaying || !editsWaiting() ? "" : draft ? " It starts " + draft.title + (diff.length ? " as you changed it (" + list + ")" : "") + "." :
+                " It starts with what waits: " + list + ".";
     showAsk((replaying ? "Replay starts this world again from its seed" : turbo ? "This stops Turbo and replaces your run" : "This replaces your run") +
-      (lose.length ? ", and " + lose.join(" and ") + " with it" : "") + "." +
+      (lose.length ? ", and " + lose.join(" and ") + " with it" : "") + "." + edits +
       (replaying && tw.length ? " Your live tweak" + s(tw.length) + " (" + mine(tw) + ") " + (tw.length === 1 ? "is" : "are") + " dropped." : "") +
       (kept.length ? " Your live tweak" + s(kept.length) + " (" + mine(keys(kept)) + ") " + (kept.length === 1 ? "carries" : "carry") + " over to the new world." : "") +
       (other.length ? " " + who + " sets " + other.map(function (e) { return (LABELS[e[0]] || e[0]) + " " + valText(e[0], e[1]); }).join(", ") +
