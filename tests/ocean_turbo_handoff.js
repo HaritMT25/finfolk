@@ -3206,6 +3206,44 @@ async function pageEditedFile() {
     ok(p.uncaught.length === 0, 'no exception escaped the page\'s handlers' + (p.uncaught.length ? ' (' + p.uncaught[0] + ')' : ''));
 }
 
+/* Finding 7: a successful start makes an older setup-file read stale (it
+ * must not stage over the world started since), but Replay moved the epoch
+ * and not the read's generation, so a read begun before it staged the file
+ * after it. Now Replay ends older reads too, and keeps what was staged. */
+async function pageReplayStaleRead() {
+    section('Review of #39, finding 7: Replay makes an older setup-file read stale, and keeps what is staged');
+    const p = await bootPage(PAGE_Q);
+    const c = startCounter(p);
+    {   /* nothing staged: Shift+R, then the read finishes */
+        const f = deferredFile(SETUP99), a = c();
+        p.loadFile(f.file);
+        p.key('R', { shift: true });
+        const d = delta(a, c());
+        f.resolve(); for (let i = 0; i < 4; i++) await tick();
+        ok(d.resets === 1 && d.epoch === 1 && !p.T.draft && p.el('o_seed').value === '4242' && !/Ready/.test(p.msg()),
+           'a read begun, then Shift+R (Replay, ' + JSON.stringify(d) + '), then the read finishes: nothing staged, the sheet still the replayed world (seed ' + p.el('o_seed').value + ')');
+    }
+    {   /* Hunters staged: the Replay button, then the read finishes */
+        p.click('huntersbtn');
+        const f = deferredFile(SETUP99), a = c();
+        p.loadFile(f.file);
+        p.click('replay');
+        if (p.T.asking) p.click('startconfirm');
+        const d = delta(a, c());
+        f.resolve(); for (let i = 0; i < 4; i++) await tick();
+        ok(d.resets === 1 && p.T.draft && p.T.draft.id === 'hunters' && p.T.getVal('predatorCount') === 4,
+           'Hunters staged, a read begun, then Replay (' + JSON.stringify(d) + '), then the read finishes: Hunters still staged, the file not');
+    }
+    {   /* the control: a read with nothing in between stages */
+        p.click('startdiscard');
+        const f = deferredFile(SETUP99);
+        p.loadFile(f.file);
+        f.resolve(); for (let i = 0; i < 4; i++) await tick();
+        ok(p.T.draft && p.T.draft.kind === 'file' && p.el('o_seed').value === '99', 'the control: a read with nothing in between stages the file (seed 99)');
+    }
+    ok(p.uncaught.length === 0, 'no exception escaped the page\'s handlers' + (p.uncaught.length ? ' (' + p.uncaught[0] + ')' : ''));
+}
+
 /* Every section, in order; `node tests/ocean_turbo_handoff.js NAME...` runs only those. */
 const SECTIONS = {
     repeatedKeys, liveLedger, growthPage, randomize, imports,
@@ -3223,7 +3261,7 @@ const SECTIONS = {
     pageColourBench, pageLayers, pageResize, pageKeys, pageStartupFailures, pageTourEscape, pageWholeFields,
     pageTurboFraction, pageCardNumbers, pageMixedRecovery, pageEscOwner, pageTabKeys, pageIntegralFloats,
     pageTurboMode, pageStartDoor, pageFollowBack, pageDraft, pageScenarios,
-    pageCancelQueued, pageQueuedFile, pageNextBehindLive, pageEditedFile
+    pageCancelQueued, pageQueuedFile, pageNextBehindLive, pageEditedFile, pageReplayStaleRead
 };
 const unhandled = [];
 process.on('unhandledRejection', (e) => { unhandled.push(e); });

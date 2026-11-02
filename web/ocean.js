@@ -328,8 +328,9 @@
     clearFieldNotes();
     afterNewWorld();
     stepOnce = false; summary = null; usedTurbo = false; turboReturn = null;
-    if (plan.op !== "replay") { draft = null; draftGen++; projectForm(); }   /* a start consumes the draft */
+    if (plan.op !== "replay") { draft = null; projectForm(); }   /* a start consumes the draft */
     else if (keep) { projectForm(); keep.forEach(function (e) { setRaw(e[0], e[1]); }); updateNeeds(); updateTabDots(); }
+    draftGen++;   /* every new world, Replay too (which keeps the draft): a setup file read from before it is stale */
     if (plan.imported && a) warnOdd(a.cfg);   /* (a setup from outside the sheet: what it ran) */
     if (plan.url) writeUrl();
     hideAsk();
