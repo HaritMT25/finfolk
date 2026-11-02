@@ -2957,6 +2957,70 @@ async function pageScenarios() {
     }
 }
 
+/* ---- Codex's review of PR #39 (round 1): one section per finding ---- */
+
+/* the page live (Turbo stopped, nothing queued) */
+async function toLive(p) {
+    if (p.T.turboWorker) p.worker().resume();
+    if (p.T.turboState === 'turbo') p.click('turboexit');
+    await until(() => p.T.turboState === 'live' && !p.T.pendingStart, 'the page live');
+}
+/* the page with Turbo starting, its first stats held (starting), or running: its worker */
+async function turboHeld(p, starting) {
+    await toLive(p);
+    if (p.T.turboWorker) p.worker().pause(); else p.hooks.onWorker = (sh) => { p.hooks.onWorker = null; sh.pause(); };
+    p.click('turbobtn');
+    const sh = p.worker();
+    if (starting) { await until(() => sh.queued(isType('stats')), 'the first stats'); return sh; }
+    sh.resume();
+    await until(() => p.T.turboState === 'turbo', 'Turbo');
+    return sh;
+}
+
+/* Finding 2: T took its "Turbo is starting / stopping: a moment" branch, so a
+ * confirmed Stop Turbo & start stayed armed and replaced the run. T, Space
+ * and each Cancel (the strip's, the Setup bar's, the charts bar's), while
+ * Turbo starts and while it stops: the new world is cancelled; Turbo carries
+ * on (starting) or hands the run back as by Stop (stopping). */
+async function pageCancelQueued() {
+    section('Review of #39, finding 2: T, Space and every Cancel cancel a queued Stop Turbo & start, while Turbo starts and while it stops');
+    const p = await bootPage(PAGE_Q);
+    const c = startCounter(p);
+    const ways = [['T', () => p.key('t')], ['Space', () => p.key(' ')], ['the strip\'s Cancel', () => p.click('turboexit')],
+                  ['the Setup bar\'s Cancel', () => p.click('setup-turbo-stop')], ['the charts bar\'s Cancel', () => p.click('dash-turbo-stop')]];
+    for (const [what, act] of ways) {
+        {   /* Starting Turbo */
+            const sh = await turboHeld(p, true), a = c();
+            p.click('restart'); const ask = asked(p); p.click('startconfirm');
+            const queued = !!p.T.pendingStart && p.T.turboState === 'entering';
+            act();
+            const gone = !p.T.pendingStart, n0 = sh.delivered.length;
+            sh.resume();
+            /* Turbo running on, or (the start not cancelled) the new world */
+            await until(() => (p.T.turboState === 'turbo' && sh.delivered.slice(n0).filter(isType('stats')).length >= 3) ||
+                              (p.T.turboState === 'live' && !p.T.pendingStart), 'Turbo to run on, or the start');
+            const d = delta(a, c());
+            ok(ask && queued && gone && p.T.turboState === 'turbo' && d.inits === 0 && d.epoch === 0,
+               'Starting Turbo, Stop Turbo & start queued, then ' + what + ': the new world is cancelled, Turbo runs on (' + p.T.turboState + ', ' + JSON.stringify(d) + ')');
+        }
+        {   /* Stopping Turbo */
+            const sh = await turboHeld(p, false), a = c(), f0 = frame(p.M);
+            sh.pause();
+            p.click('restart'); const ask = asked(p); p.click('startconfirm');
+            await until(() => sh.queued(isType('memory')), 'the memory');
+            const queued = !!p.T.pendingStart && p.T.turboState === 'exiting';
+            act();
+            const gone = !p.T.pendingStart;
+            sh.resume();
+            await until(() => p.T.turboState === 'live', 'the hand-back');
+            const d = delta(a, c());
+            ok(ask && queued && gone && d.inits === 0 && d.epoch === 0 && frame(p.M) > f0 && !p.T.paused,
+               'Stopping Turbo, Stop Turbo & start queued, then ' + what + ': no new world, the run handed back as by Stop (frame ' + f0 + ' -> ' + frame(p.M) + ', ' + JSON.stringify(d) + ')');
+        }
+    }
+    ok(p.uncaught.length === 0, 'no exception escaped the page\'s handlers' + (p.uncaught.length ? ' (' + p.uncaught[0] + ')' : ''));
+}
+
 /* Every section, in order; `node tests/ocean_turbo_handoff.js NAME...` runs only those. */
 const SECTIONS = {
     repeatedKeys, liveLedger, growthPage, randomize, imports,
@@ -2973,7 +3037,8 @@ const SECTIONS = {
     pageWallsOverride, pageFreshVisit, pageSizeFields, pageRoundTrip,
     pageColourBench, pageLayers, pageResize, pageKeys, pageStartupFailures, pageTourEscape, pageWholeFields,
     pageTurboFraction, pageCardNumbers, pageMixedRecovery, pageEscOwner, pageTabKeys, pageIntegralFloats,
-    pageTurboMode, pageStartDoor, pageFollowBack, pageDraft, pageScenarios
+    pageTurboMode, pageStartDoor, pageFollowBack, pageDraft, pageScenarios,
+    pageCancelQueued
 };
 const unhandled = [];
 process.on('unhandledRejection', (e) => { unhandled.push(e); });

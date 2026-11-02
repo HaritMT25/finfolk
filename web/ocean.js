@@ -2118,9 +2118,12 @@
     g.strokeStyle = "#ef8a5a"; g.lineWidth = 1.5; g.lineJoin = "round";
     g.stroke();
   }
-  /* T, the Turbo button, the coach mark's Try Turbo: on, or off */
+  /* T, the Turbo button, the coach mark's Try Turbo: on, or off. With a new
+   * world waiting for Turbo (Stop Turbo & start, while it starts or stops),
+   * T cancels that start, as Stop, Space and the bars' Cancel do */
   function toggleTurbo() {
-    if (turboState === "live") enterTurbo();
+    if (pendingStart) stopTurbo();
+    else if (turboState === "live") enterTurbo();
     else if (turboState === "turbo") stopTurbo();
     else turboWait();
   }
