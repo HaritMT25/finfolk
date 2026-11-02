@@ -124,6 +124,14 @@ if(SFML_FOUND AND EVO_NO_OPENMP AND NOT EVO_POOL_THREADS)
     add_test(NAME reseed_after_load
              COMMAND bash ${CMAKE_SOURCE_DIR}/tests/reseed_after_load.sh
                      $<TARGET_FILE:evo_boids> ${CMAKE_CURRENT_BINARY_DIR}/reseed_after_load_work)
+    # invasion_tooling — tools/invasion (arena, score, run, hodge) against the
+    # real engine; pins the child-id derivation the invasion scores rely on.
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME invasion_tooling
+                 COMMAND bash ${CMAKE_SOURCE_DIR}/tests/invasion_tooling.sh
+                         $<TARGET_FILE:evo_boids> ${CMAKE_CURRENT_BINARY_DIR}/invasion_tooling_work)
+    endif()
 endif()
 
 # ------------------------------------------------------------------

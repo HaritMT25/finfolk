@@ -22,6 +22,12 @@ Rules:
   * one runner per DIR (flock DIR/.runner.lock);
   * the binary is pinned: copied to DIR/bin/evo_boids on first use, its SHA-256
     checked before every launch; a different binary for the same DIR is refused;
+  * so are the tools: on first use tools/invasion/*.py are copied to DIR/tools/
+    and every cell runs from that copy, so editing the sources while a runner
+    is going cannot reach a running cell (it once did: a cell imported a
+    half-edited score.py). A later start with different sources keeps the
+    pinned copy and says so; --update-tools replaces it (finished cells keep
+    the tool hashes they ran with in done.json);
   * resume: a cell with done.json has its outputs re-hashed and is skipped (a
     corrupt finished cell is an error); a cell without one is rerun from
     scratch, the earlier attempt moved to DIR/cells/<id>.attempt<N>/;
@@ -52,6 +58,7 @@ sys.path.insert(0, HERE)
 import invlib  # noqa: E402
 
 SCHEMA = "finfolk.invasion.cell/1"
+TOOL_FILES = ("invlib.py", "arena.py", "score.py", "run.py")
 SPEC_KEYS = ("id", "resident", "invader", "mode", "fraction", "state", "condition", "predators",
              "replicate", "slot_seed", "donor_seed", "pred_seed", "reseed", "steps",
              "checkpoint_every", "log_every", "keep_intermediate")
@@ -154,6 +161,7 @@ def run_cell(root, cell_id):
     done = {
         "schema": SCHEMA, "finished_utc": now(), "cell": c,
         "binary_sha256": want,
+        "tools_sha256": {f: invlib.sha256_file(os.path.join(HERE, f)) for f in TOOL_FILES},
         "command": cmd,
         "timing": {"build_s": round(t_build, 3), "engine_wall_s": round(wall, 3),
                    "engine_user_s": round(ru.ru_utime, 3), "engine_sys_s": round(ru.ru_stime, 3),
@@ -186,6 +194,8 @@ def main(argv=None):
     ap.add_argument("--status", action="store_true")
     ap.add_argument("--quick-resume", action="store_true",
                     help="skip re-hashing finished cells' outputs (existence only)")
+    ap.add_argument("--update-tools", action="store_true",
+                    help="replace DIR/tools with the current tools/invasion sources")
     a = ap.parse_args(argv)
     root = os.path.abspath(a.root)
 
@@ -232,6 +242,22 @@ def main(argv=None):
     if invlib.sha256_file(pinned) != have:
         print("the pinned binary no longer matches its hash", file=sys.stderr)
         return 2
+
+    # pin the tools (see the header)
+    tdir = os.path.join(root, "tools")
+    src = {f: invlib.sha256_file(os.path.join(HERE, f)) for f in TOOL_FILES}
+    if os.path.abspath(HERE) != os.path.abspath(tdir):
+        if not os.path.isdir(tdir) or a.update_tools:
+            os.makedirs(tdir, exist_ok=True)
+            for f in TOOL_FILES:
+                shutil.copy2(os.path.join(HERE, f), os.path.join(tdir, f))
+            log(f"tools pinned in {tdir}: " + " ".join(f"{f}={h[:10]}" for f, h in src.items()))
+        else:
+            pin = {f: invlib.sha256_file(os.path.join(tdir, f)) for f in TOOL_FILES}
+            if pin != src:
+                log(f"note: tools/invasion differs from the pinned {tdir}; running the pinned copy "
+                    f"(--update-tools to replace it)")
+    cell_runner = os.path.join(tdir, "run.py")
 
     cells = load_plan(a.plan)
     todo = []
@@ -312,7 +338,7 @@ def main(argv=None):
             os.makedirs(d)
             invlib.write_json_atomic(os.path.join(d, "cell.json"), spec)
             err = open(os.path.join(d, "cell.stderr.log"), "w")
-            p = subprocess.Popen([sys.executable, "-I", os.path.abspath(__file__), "--root", root,
+            p = subprocess.Popen([sys.executable, "-I", cell_runner, "--root", root,
                                   "--_cell", spec["id"]], stdout=err, stderr=subprocess.STDOUT,
                                  stdin=subprocess.DEVNULL)
             running[p.pid] = (p, spec["id"], time.time())
