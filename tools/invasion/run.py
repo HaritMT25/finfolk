@@ -28,6 +28,11 @@ Rules:
     half-edited score.py). A later start with different sources keeps the
     pinned copy and says so; --update-tools replaces it (finished cells keep
     the tool hashes they ran with in done.json);
+  * so are the snapshots: plan.py registers each source file's SHA-256 in the
+    cell (resident_sha256 / invader_sha256). Every registered file is checked
+    before anything is admitted (a mismatch refuses the batch, exit 2) and
+    again before every build (a mismatch fails the cell, exit 5), so a
+    snapshot overwritten between or during batch attempts never mixes in;
   * resume: a cell with done.json has its outputs re-hashed and is skipped (a
     corrupt finished cell is an error); a cell without one is rerun from
     scratch, the earlier attempt moved to DIR/cells/<id>.attempt<N>/;
@@ -120,6 +125,22 @@ def mem_headroom_mb():
     return avail if cg is None else min(avail, cg)
 
 
+def snapshot_problems(c, cache=None):
+    """Registered snapshot files whose content no longer matches the plan (plan.py records
+    resident_sha256 / invader_sha256; a plan without them registers paths only)."""
+    bad = []
+    cache = {} if cache is None else cache
+    for role in ("resident", "invader"):
+        want = c.get(f"{role}_sha256")
+        if want and c.get(role):
+            if c[role] not in cache:
+                cache[c[role]] = invlib.sha256_file(c[role]) if os.path.exists(c[role]) else "missing"
+            have = cache[c[role]]
+            if have != want:
+                bad.append(f"{role} {c[role]}: sha256 {have[:12]} != registered {want[:12]}")
+    return bad
+
+
 def load_plan(path):
     cells = []
     with open(path) as f:
@@ -149,9 +170,19 @@ def run_cell(root, cell_id):
     if invlib.sha256_file(exe) != want:
         print("pinned binary changed", file=sys.stderr)
         return 2
+    bad = snapshot_problems(c)   # before every build: a snapshot overwritten mid-batch never mixes in
+    if bad:
+        print("SNAPSHOT CHANGED since planning: " + "; ".join(bad), file=sys.stderr)
+        return 5
     t0 = time.time()
     cp, man = arena_mod.build(c["resident"], c["invader"], c["mode"], c["fraction"], c["state"],
                               c["predators"], c["slot_seed"], c["donor_seed"], c["pred_seed"], exe)
+    for role in ("resident", "invader"):   # ... and the arena read the registered content
+        reg = c.get(f"{role}_sha256")
+        if reg and man.get(role) and man[role]["sha256"] != reg:
+            print(f"SNAPSHOT CHANGED during the build: {role} {man[role]['sha256'][:12]} != {reg[:12]}",
+                  file=sys.stderr)
+            return 5
     ap = os.path.join(d, "arena.json")
     invlib.write_atomic(ap, invlib.dumps_checkpoint(cp))
     man["output"] = {"path": ap, "sha256": invlib.sha256_file(ap)}
@@ -301,6 +332,13 @@ def main(argv=None):
     cell_runner = os.path.join(tdir, "run.py")
 
     cells = load_plan(a.plan)
+    hashed, changed = {}, []
+    for c in cells:   # every registered snapshot (each file hashed once) before anything is admitted
+        changed += snapshot_problems(c, hashed)
+    if changed:
+        print("snapshots changed since planning (re-plan, or restore them): " + "; ".join(sorted(set(changed))),
+              file=sys.stderr)
+        return 2
     todo = []
     for c in cells:
         d = os.path.join(root, "cells", c["id"])

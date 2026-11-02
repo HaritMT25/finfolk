@@ -18,7 +18,10 @@
 #   7. a registered 3x3 matrix: analyze.py --plan gives formal rows bound to
 #      the plan hash, CSVs at round-trip precision; cells duplicated across
 #      roots, a registered cell missing, or an UNREGISTERED cell with the
-#      missing cell's labels: descriptive only.
+#      missing cell's labels: descriptive only; inputs.json binds cells.csv;
+#   8. snapshot identity: plan.py registers file contents; a changed snapshot
+#      is refused before the batch and before each build; a name read as two
+#      files across batch attempts is excluded from the analysis.
 set -u
 BIN=${1:?usage: invasion_tooling.sh EVO_BOIDS WORKDIR}
 W=${2:?usage: invasion_tooling.sh EVO_BOIDS WORKDIR}
@@ -209,4 +212,70 @@ assert rows and all(r["status"].startswith("descriptive") and r["k"] == "2" for 
 assert not any(x["id"] == "off_f100_A_B_r01x" for x in csv.DictReader(open("an3c/runs.csv"))), "unregistered cell in runs.csv"
 PY
 rm -rf root3/cells/off_f100_A_B_r01x
+$PY - <<'PY' || fail "inputs.json must bind the report to the cell results it used"
+import csv, hashlib, json
+inp = json.load(open("an3/inputs.json"))
+h = hashlib.sha256(open("an3/cells.csv", "rb").read()).hexdigest()
+assert inp["cells_csv"]["sha256"] == h and inp["cells_csv"]["cells"] == 27, inp["cells_csv"]
+cells = list(csv.DictReader(open("an3/cells.csv")))
+assert len(cells) == 27 and all(len(c["done_sha256"]) == 64 for c in cells)
+assert sorted(inp["snapshots"]) == ["A", "B", "C"], inp["snapshots"]
+PY
+
+# 8. snapshot identity: registered by content. A snapshot overwritten after planning is refused
+#    by the runner (before the batch and before each build); with a plan that registered paths
+#    only, the analysis sees one name read as two files and excludes it.
+cp A.json As.json; cp B.json Bs.json; cp C.json Cs.json
+cat > design8.json <<EOF
+{"name": "t8", "snapshots": {"A": "$W/As.json", "B": "$W/Bs.json", "C": "$W/Cs.json"}, "conditions": {"off": 0},
+ "fractions": [0.1], "replicates": 2, "steps": 600, "checkpoint_every": 300, "log_every": 300,
+ "matrix": ["A", "B", "C"]}
+EOF
+$PY "$T/plan.py" design8.json > plan8.jsonl || fail "plan.py (design8)"
+$PY - <<'PY' || fail "plan.py must register the snapshot contents"
+import hashlib, json
+h = lambda p: hashlib.sha256(open(p, "rb").read()).hexdigest()
+for c in (json.loads(l) for l in open("plan8.jsonl")):
+    assert c["resident_sha256"] == h(c["resident"]), c["id"]
+    assert (c["invader_sha256"] == h(c["invader"])) if c["mode"] == "invade" else c["invader_sha256"] is None, c["id"]
+PY
+cp A.json Cs.json   # C overwritten after planning
+$PY "$T/run.py" --plan plan8.jsonl --root root8 --binary "$BIN" --workers 2 > run8.log 2>&1
+rc=$?
+[ "$rc" = 2 ] && grep -q "snapshots changed since planning" run8.log || fail "run.py ran a plan whose snapshot changed (exit $rc)"
+ls root8/cells/*/done.json > /dev/null 2>&1 && fail "run.py admitted a cell from a changed snapshot"
+mkdir -p root/cells/snapcheck   # the per-build check (a snapshot overwritten mid-batch)
+$PY - <<'PY' || fail "writing the snapcheck cell"
+import json
+c = [json.loads(l) for l in open("plan8.jsonl") if json.loads(l)["resident_name"] == "C"][0]
+c["id"] = "snapcheck"
+json.dump(c, open("root/cells/snapcheck/cell.json", "w"))
+PY
+$PY "$T/run.py" --root "$W/root" --_cell snapcheck > snapcheck.log 2>&1
+rc=$?
+[ "$rc" = 5 ] || fail "run_cell built an arena from a changed snapshot (exit $rc)"
+rm -rf root/cells/snapcheck
+cp C.json Cs.json
+$PY - <<'PY' || fail "writing the path-only plan"
+import json
+with open("plan8p.jsonl", "w") as f:
+    for ln in open("plan8.jsonl"):
+        c = json.loads(ln)
+        del c["resident_sha256"], c["invader_sha256"]
+        f.write(json.dumps(c, sort_keys=True) + "\n")
+PY
+head -9 plan8p.jsonl > plan8p_a.jsonl   # batch 1: replicate 0
+$PY "$T/run.py" --plan plan8p_a.jsonl --root root8p --binary "$BIN" --workers 2 > run8a.log 2>&1 || fail "run.py batch 1"
+cp A.json Cs.json   # C overwritten between the batch attempts
+$PY "$T/run.py" --plan plan8p.jsonl --root root8p --binary "$BIN" --workers 2 > run8b.log 2>&1 || fail "run.py batch 2"
+$PY "$T/analyze.py" --root root8p --out an8 --plan plan8p.jsonl --windows 0.25 --no-power --sims 50 > an8.log 2>&1 \
+    || fail "analyze.py (two-batch): $(tail -5 an8.log)"
+$PY - <<'PY' || fail "a snapshot name read as two files must be excluded"
+import csv, json, os
+inp = json.load(open("an8/inputs.json"))
+assert any(p.startswith("snapshot C was read as 2 different files") for p in inp["identity_problems"]), inp["identity_problems"]
+assert "C" not in inp["snapshots"] and not inp["complete"]
+rows = list(csv.DictReader(open("an8/matrix.csv"))) if os.path.exists("an8/matrix.csv") else []
+assert not any(r["status"] == "formal" for r in rows), rows
+PY
 echo "invasion_tooling: ok"

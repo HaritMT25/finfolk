@@ -6,16 +6,21 @@
 
 Reads every finished cell (DIR/cells/<id>/done.json + score.json), checks its
 identity (cell spec == the registered plan entry, binary == the root's pinned
-binary, score.json == the hash done.json recorded), and writes CSV tables plus
+binary, score.json / arena.manifest.json / run.csv == the hashes done.json
+recorded, the snapshot files the arena read == the registered ones, ONE file
+content per snapshot name across all cells), and writes CSV tables plus
 summary.md and inputs.json to OUTDIR. inputs.json binds the report to its
 inputs: the plan's and the meta file's SHA-256, the analysis code's, the
-engine binaries and pinned tool sets the cells ran with, the registered cells
-still missing, and every identity problem; the CSVs carry the plan and
-analysis hashes. Only a COMPLETE registered matrix (the largest name set whose
+engine binaries and pinned tool sets the cells ran with, the snapshot
+identities, cells.csv (every cell result used, by content hash), the
+registered cells still missing, and every identity problem; the CSVs carry
+the plan and analysis hashes. Only a COMPLETE registered matrix (the largest name set whose
 every ordered pair and sham is registered, on the replicates registered for
 all of them, every one finished) gets formal decisions (floor, p_mc, p_lof);
 without --plan, or with registered cells missing, matrices are descriptive.
 
+  cells.csv    every cell result the tables use: root, id, done.json / score.json /
+               manifest / run.csv SHA-256, and the snapshot files it read
   gen.csv      generation length per (snapshot, condition): steps until the
                births reach k x the start population, from the sham runs
   runs.csv     one row per run and window: the score at the scored checkpoint
@@ -158,21 +163,50 @@ def load(roots, plan=None):
             bad.append("cell id differs from its directory")
         if done.get("binary_sha256") != pinned_bin:
             bad.append("binary differs from the root's pinned binary")
-        if sha256(os.path.join(d, "score.json")) != done["outputs"].get("score.json"):
-            bad.append("score.json does not match done.json")
+        hashes = {"done.json": sha256(os.path.join(d, "done.json"))}
+        for f in ("score.json", "arena.manifest.json", "run.csv"):   # every file the tables read
+            hashes[f] = sha256(os.path.join(d, f)) if os.path.exists(os.path.join(d, f)) else "missing"
+            if hashes[f] != done["outputs"].get(f):
+                bad.append(f"{f} does not match done.json")
+        ident = {}
+        if not bad:
+            man = json.load(open(os.path.join(d, "arena.manifest.json")))
+            ident[c["resident_name"]] = man["resident"]["sha256"]
+            if c["mode"] == "invade":
+                ident[c["invader_name"]] = man["invader"]["sha256"]
+            for role in ("resident", "invader"):   # plans from plan.py register the content too
+                want = c.get(f"{role}_sha256")
+                if want and ident.get(c[f"{role}_name"]) != want:
+                    bad.append(f"the arena read a {role} file other than the registered one")
         if plan is not None and plan[cid] != c:
             bad.append("done.json cell spec differs from the plan entry")
         if bad:
             problems.append(f"{root}/{cid}: " + "; ".join(bad))
             continue
-        by_pos.setdefault(position(c), []).append((root, cid, d, done))
+        by_pos.setdefault(position(c), []).append((root, cid, d, done, hashes, ident))
+    # one source identity per item: the cells that read one snapshot name must all have read the
+    # same file content, or the name covers two populations (a snapshot overwritten between batch
+    # attempts) and none of its cells can be trusted
+    seen = {}
+    for group in by_pos.values():
+        for _, cid, _, _, _, ident in group:
+            for nm, h in ident.items():
+                seen.setdefault(nm, {}).setdefault(h, []).append(cid)
+    split = {nm for nm, hs in seen.items() if len(hs) > 1}
+    for nm in sorted(split):
+        problems.append(f"snapshot {nm} was read as {len(seen[nm])} different files ("
+                        + ", ".join(f"{h[:12]} by {len(ids)} cells" for h, ids in sorted(seen[nm].items()))
+                        + "): every cell using it is excluded")
+    snapshots = {nm: next(iter(hs)) for nm, hs in sorted(seen.items()) if nm not in split}
     for pos, group in sorted(by_pos.items(), key=lambda kv: str(kv[0])):
         if len(group) > 1:
-            ids = ", ".join(f"{root}/{cid}" for root, cid, _, _ in group)
+            ids = ", ".join(f"{g[0]}/{g[1]}" for g in group)
             problems.append(f"{len(group)} cells at one position {pos}: {ids} (all excluded)")
             continue
-        root, cid, d, done = group[0]
+        root, cid, d, done, hashes, ident = group[0]
         c = done["cell"]
+        if split & set(ident):
+            continue
         sc = json.load(open(os.path.join(d, "score.json")))
         iv = []   # (population, steps/s) per logged interval, for the speed fit
         with open(os.path.join(d, "run.csv")) as f:
@@ -188,9 +222,9 @@ def load(roots, plan=None):
             "pop_min": done["population"]["min"], "pop_max": done["population"]["max"],
             "maxrss_kb": done["timing"]["engine_maxrss_kb"], "intervals": iv,
             "binary_sha256": done.get("binary_sha256"), "tools_sha256": done.get("tools_sha256"),
-            "registered": plan is not None,
+            "registered": plan is not None, "hashes": hashes, "sources": ident,
         })
-    return recs, problems, unregistered
+    return recs, problems, unregistered, snapshots
 
 
 def gen_length(recs, definition="pop"):
@@ -548,8 +582,16 @@ def main(argv=None):
             if ln.strip():
                 c = json.loads(ln)
                 plan[c["id"]] = c
-    recs, problems, unregistered = load(a.root, plan)
+    recs, problems, unregistered, snapshots = load(a.root, plan)
     registry = registry_from_plan(plan) if plan is not None else None
+    # cells.csv: exactly which results (by content hash) every table below was computed from,
+    # including the generation clock and the speed / cost fits; inputs.json carries its hash
+    crows = [{"root": os.path.abspath(r["root"]), "id": r["id"], "done_sha256": r["hashes"]["done.json"],
+              "score_sha256": r["hashes"]["score.json"], "manifest_sha256": r["hashes"]["arena.manifest.json"],
+              "run_csv_sha256": r["hashes"]["run.csv"],
+              "sources": " ".join(f"{nm}={h}" for nm, h in sorted(r["sources"].items()))} for r in recs]
+    write_csv(os.path.join(a.out, "cells.csv"), crows,
+              ["root", "id", "done_sha256", "score_sha256", "manifest_sha256", "run_csv_sha256", "sources"])
     here = os.path.dirname(os.path.abspath(__file__))
     prov = {
         "schema": "finfolk.invasion.analysis/1",
@@ -560,6 +602,9 @@ def main(argv=None):
         "binaries": sorted({r["binary_sha256"] for r in recs}),
         "tools": sorted({json.dumps(r["tools_sha256"], sort_keys=True) for r in recs if r["tools_sha256"]}),
         "cells_without_tool_hashes": sum(1 for r in recs if not r["tools_sha256"]),
+        "cells_csv": {"path": os.path.abspath(os.path.join(a.out, "cells.csv")),
+                      "sha256": sha256(os.path.join(a.out, "cells.csv")), "cells": len(recs)},
+        "snapshots": snapshots,
         "args": vars(a),
         "finished": len(recs),
         "identity_problems": problems,

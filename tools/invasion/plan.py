@@ -22,6 +22,13 @@ DESIGN.json:
     "selfs": ["A", ...]                           # extra mark-in-place cells
   }
 
+Snapshots are registered by path AND content: every cell carries the SHA-256
+of its resident (and invader) file as it was at planning time
+(resident_sha256 / invader_sha256). run.py refuses to build an arena from a
+file whose content changed since, and analyze.py checks that every cell of
+one item read the same file, so a snapshot overwritten between batch attempts
+cannot mix two populations under one name.
+
 Seeds are derived (SHA-256 of their parts) so that the arena of i -> j,
 replicate r, and the sham j -> j, replicate r, share the SLOT seed (same
 replaced fish), the PREDATOR seed and the engine RESEED: only the donors
@@ -76,6 +83,11 @@ def expand(design):
         cells_ij.add((j, j, "sham"))
     for j in design.get("selfs", []):
         cells_ij.add((j, j, "self"))
+    used = {n for i, j, mode in cells_ij for n in ((i, j) if mode == "invade" else (j,))}
+    for n in used:
+        if n not in snaps:
+            raise SystemExit(f"unknown snapshot {n}")
+    digest = {n: invlib.sha256_file(snaps[n]) for n in sorted(used)}
     out = []
     order = {"sham": 0, "self": 1, "invade": 2}
     for frac in design["fractions"]:
@@ -88,8 +100,9 @@ def expand(design):
                     cid = f"{cname}_{fr_tag(frac)}_{j}_{'sham' if mode == 'sham' else ('self' if mode == 'self' else i)}_r{r:02d}"
                     out.append({
                         "id": cid, "design": design.get("name", ""),
-                        "resident": snaps[j], "resident_name": j,
+                        "resident": snaps[j], "resident_name": j, "resident_sha256": digest[j],
                         "invader": snaps[i] if mode == "invade" else None,
+                        "invader_sha256": digest[i] if mode == "invade" else None,
                         "invader_name": i, "mode": mode, "fraction": frac, "state": state,
                         "condition": cname, "predators": int(K), "replicate": r,
                         "slot_seed": invlib.derive_seed("slot", j, fr_tag(frac), r),
