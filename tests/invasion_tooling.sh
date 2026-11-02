@@ -22,7 +22,10 @@
 #   8. snapshot identity: plan.py registers file contents; a changed snapshot
 #      is refused before the batch and before each build; a name read as two
 #      files across batch attempts is excluded from the analysis;
-#   9. SIGTERM to the runner alone leaves no engine running.
+#   9. SIGTERM to the runner alone leaves no engine running;
+#  10. parent -> child correspondence: with distinct mother lines and mutation
+#      off, every child's lineage and genome match its derived birth record,
+#      and a log with two same-frame births swapped is refused.
 set -u
 BIN=${1:?usage: invasion_tooling.sh EVO_BOIDS WORKDIR}
 W=${2:?usage: invasion_tooling.sh EVO_BOIDS WORKDIR}
@@ -314,4 +317,46 @@ left=$(engines)
 pkill -KILL -f "$W/root9/bin/evo_boids" 2> /dev/null   # (this test's own engines, if the check fails)
 [ "$left" = 0 ] || fail "SIGTERM to the runner left $left engine(s) running"
 [ "$rc" = 130 ] || fail "the signalled runner exited $rc, expected 130"
+
+# 10. parent -> child correspondence, directly: an arena where every fish has its own mother line
+#     and mutation is off, so each child's lineage and genome identify the birth it came from
+$PY - "$T" <<'PY' || fail "building the correspondence arena"
+import json, sys
+sys.path.insert(0, sys.argv[1]); import invlib
+cp = invlib.load_checkpoint("inv.json")
+cs = cp["creatures"]
+cs["lineageId"] = [10 ** 9 + k for k in range(int(cs["count"]))]   # distinct; never == an id
+cp["config"]["mutationMultiplier"] = 0.0
+invlib.write_atomic("cor.json", invlib.dumps_checkpoint(cp))
+m = json.load(open("inv.manifest.json")); m["output"]["sha256"] = invlib.sha256_file("cor.json")
+json.dump(m, open("cor.manifest.json", "w"))
+PY
+eng --load-checkpoint cor.json --reseed-after-load 4 --headless 1500 --csv cor.csv --repro-log \
+    --repro-log-max 100000000 --save-checkpoint cor.end.json --checkpoint-every 100
+cps=""; for f in cor.end.*.json; do cps="$cps --checkpoint $f"; done
+$PY "$T/score.py" --arena cor.json --manifest cor.manifest.json --births cor.births.csv $cps \
+    --checkpoint cor.end.json --out cor.score.json > /dev/null || fail "score.py (correspondence arena)"
+$PY - <<'PY' || fail "the correspondence checks did not run"
+import json
+d = json.load(open("cor.score.json"))["derivation"]
+assert d["crossover_checked_children"] >= 20 and d["lineage_checked_children"] >= 20, d
+PY
+# swap the parents of two births in one frame (as if the newborns were permuted before their ids
+# were assigned): counts, frames, ids and parent availability all still agree
+$PY - <<'PY' || fail "building the permuted log"
+lines = open("cor.births.csv").read().split("\n")
+rows = [(k, ln.split(",")) for k, ln in enumerate(lines) if ln and not ln.startswith("#") and not ln.startswith("index")]
+for (a, x), (b, y) in zip(rows, rows[1:]):
+    if x[1] == y[1] and x[4] != y[4]:
+        x[2:6], y[2:6] = y[2:6], x[2:6]
+        lines[a], lines[b] = ",".join(x), ",".join(y)
+        break
+else:
+    raise SystemExit("no frame with two births of different mother lines")
+open("cor.perm.births.csv", "w").write("\n".join(lines))
+PY
+if $PY "$T/score.py" --arena cor.json --manifest cor.manifest.json --births cor.perm.births.csv $cps \
+       --checkpoint cor.end.json > cor.perm.log 2>&1; then
+    fail "a log whose births were permuted within a frame was accepted"
+fi
 echo "invasion_tooling: ok"
