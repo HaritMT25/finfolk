@@ -133,6 +133,99 @@ def debiased_share(A, noise_var, W=None):
     return num / den if den > 0 else float("nan")
 
 
+# --------------------------------------------------------- two-way model
+def twoway(M, iters=500, tol=1e-15):
+    """Additive fit of the off-diagonal cells: M_ij = mu + a_i + b_j + gamma_ij (sum a = sum b = 0),
+    least squares over the observed cells (backfitting). -> (mu, a, b, gamma).
+
+    The main effects are pure ladder: A_ij = M_ij - M_ji = (a_i - b_i) - (a_j - b_j) + (gamma_ij - gamma_ji),
+    and on a complete matrix gamma's rows and columns sum to 0, so gamma - gamma^T has zero row sums: it is
+    pure curl, and the cyclic part of A is exactly the antisymmetric part of gamma. Any column constant (the
+    self-invasion baseline s(j->j)) is absorbed into b_j, so fitting s or s~ gives the same gamma.
+    The symmetric part of gamma, (gamma_ij + gamma_ji)/2, is coexistence (> 0) vs priority (< 0) beyond what
+    the invader's and the resident's general strengths predict."""
+    n = len(M)
+    cells = [(i, j) for i in range(n) for j in range(n) if i != j and M[i][j] is not None]
+    mu = sum(M[i][j] for i, j in cells) / len(cells)
+    a = [0.0] * n
+    b = [0.0] * n
+    rows = [[j for j in range(n) if j != i and M[i][j] is not None] for i in range(n)]
+    cols = [[i for i in range(n) if i != j and M[i][j] is not None] for j in range(n)]
+    for _ in range(iters):
+        old = a + b
+        a = [sum(M[i][j] - mu - b[j] for j in rows[i]) / len(rows[i]) if rows[i] else 0.0 for i in range(n)]
+        ma = sum(a) / n
+        a = [x - ma for x in a]
+        b = [sum(M[i][j] - mu - a[i] for i in cols[j]) / len(cols[j]) if cols[j] else 0.0 for j in range(n)]
+        mb = sum(b) / n
+        b = [x - mb for x in b]
+        mu = sum(M[i][j] - a[i] - b[j] for i, j in cells) / len(cells)
+        if max(abs(x - y) for x, y in zip(old, a + b)) < tol:
+            break
+    g = [[None] * n for _ in range(n)]
+    for i, j in cells:
+        g[i][j] = M[i][j] - mu - a[i] - b[j]
+    return mu, a, b, g
+
+
+# ------------------------------------------------------------- tests, triads
+def _gammainc_upper(s, x):
+    """Regularized upper incomplete gamma Q(s, x) (Numerical Recipes gser / gcf)."""
+    if x <= 0:
+        return 1.0
+    lg = math.lgamma(s)
+    if x < s + 1:
+        ap, tot, d = s, 1.0 / s, 1.0 / s
+        for _ in range(10000):
+            ap += 1
+            d *= x / ap
+            tot += d
+            if abs(d) < abs(tot) * 1e-15:
+                break
+        return 1.0 - tot * math.exp(-x + s * math.log(x) - lg)
+    b = x + 1 - s
+    c = 1 / 1e-300
+    d = 1 / b
+    h = d
+    for i in range(1, 10000):
+        an = -i * (i - s)
+        b += 2
+        d = an * d + b
+        d = 1e-300 if abs(d) < 1e-300 else d
+        c = b + an / c
+        c = 1e-300 if abs(c) < 1e-300 else c
+        d = 1 / d
+        de = d * c
+        h *= de
+        if abs(de - 1) < 1e-15:
+            break
+    return math.exp(-x + s * math.log(x) - lg) * h
+
+
+def chi2_sf(x, df):
+    return _gammainc_upper(df / 2.0, x / 2.0)
+
+
+def circular_triads(A, Z=None, zmin=None):
+    """Directed 3-cycles of the tournament sign(A) (Kendall & Babington Smith): returns
+    (cyclic triads, all triads, expected under random orientation = all/4). With Z (|z| per pair) and
+    zmin, a second count keeps only triads whose three edges all have |z| >= zmin."""
+    n = len(A)
+    cyc = sig = tri = 0
+    for i in range(n):
+        for j in range(i + 1, n):
+            for k in range(j + 1, n):
+                e = (A[i][j], A[j][k], A[k][i])
+                if None in e:
+                    continue
+                tri += 1
+                if (e[0] > 0 and e[1] > 0 and e[2] > 0) or (e[0] < 0 and e[1] < 0 and e[2] < 0):
+                    cyc += 1
+                    if Z is not None and zmin is not None and min(Z[i][j], Z[j][k], Z[k][i]) >= zmin:
+                        sig += 1
+    return {"cyclic": cyc, "triads": tri, "expected_random": tri / 4.0, "cyclic_significant": sig}
+
+
 # ------------------------------------------------------------------ mElo2k
 def melo2k(curl, k=1, iters=500, seed=1):
     """Leading k Schur pairs of a complete skew-symmetric matrix (None -> 0).
@@ -287,6 +380,26 @@ def selftest():
     (sig, uu, bb), = melo2k(R, 1)
     err = max(abs(R[i][j] - sig * (uu[i] * bb[j] - bb[i] * uu[j])) for i in range(9) for j in range(9) if i != j)
     assert err < 1e-8, err
+    # two-way model: additive + column baseline -> gamma = 0; the cyclic part of A is gamma's antisymmetric part
+    n = 7
+    mu0, a0 = 0.3, [rnd.gauss(0, 1) for _ in range(n)]
+    b0 = [rnd.gauss(0, 1) for _ in range(n)]
+    Cc = _random_curl(n, rnd)
+    M = [[(mu0 + a0[i] + b0[j] + 0.5 * Cc[i][j]) if i != j else None for j in range(n)] for i in range(n)]
+    mu, a, b, g = twoway(M)
+    A = [[(M[i][j] - M[j][i]) if i != j else None for j in range(n)] for i in range(n)]
+    curl = split(A)["curl"]
+    err = max(abs((g[i][j] - g[j][i]) - curl[i][j]) for i in range(n) for j in range(n) if i != j)
+    assert err < 1e-9, err
+    Madd = [[(mu0 + a0[i] + b0[j]) if i != j else None for j in range(n)] for i in range(n)]
+    assert max(abs(x) for row in twoway(Madd)[3] for x in row if x is not None) < 1e-9
+    # chi-square survival: known values
+    assert abs(chi2_sf(3.841458820694124, 1) - 0.05) < 1e-9
+    assert abs(chi2_sf(18.307038053275146, 10) - 0.05) < 1e-9
+    assert abs(chi2_sf(2.0, 4) - math.exp(-1) * 2) < 1e-12
+    # circular triads: RPS has one; a ladder has none
+    assert circular_triads(rps)["cyclic"] == 1
+    assert circular_triads(_ladder(6, rnd))["cyclic"] == 0
     print("hodge selftest: ok")
 
 

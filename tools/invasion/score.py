@@ -99,7 +99,7 @@ def score(arena_path, manifest_path, births_path, checkpoint_paths):
     need(kept == len(rows), f"births.csv says kept {kept}, has {len(rows)} rows")
     need(kept == seen - start_ord, f"kept {kept} != seen {seen} - start ordinal {start_ord}")
     prev_frame = start_frame
-    born = []   # (frame, child id)
+    born = []   # (frame, child id, mating class)
     for k, (idx, frame, p1, p2) in enumerate(rows):
         need(idx == start_ord + k, f"birth row {k}: index {idx}, expected {start_ord + k}")
         need(frame > start_frame and frame >= prev_frame, f"birth {idx}: frame {frame} out of order")
@@ -108,7 +108,8 @@ def score(arena_path, manifest_path, births_path, checkpoint_paths):
         cid = start_next + (idx - start_ord)
         need(cid not in anc, f"birth {idx}: derived id {cid} collides")
         anc[cid] = 0.5 * (anc[p1] + anc[p2])
-        born.append((frame, cid))
+        # mating class by parental ancestry: 2 = both carry invader ancestry, 1 = one does, 0 = neither
+        born.append((frame, cid, (anc[p1] > 0) + (anc[p2] > 0)))
 
     # generation turnover: steps until cumulative births reach k * n0
     turnover = []
@@ -124,7 +125,7 @@ def score(arena_path, manifest_path, births_path, checkpoint_paths):
     need(cps, "no checkpoint given")
     for frame, path, C in cps:
         need(frame > start_frame, f"{path}: frame {frame} is not after the arena's {start_frame}")
-        nb = sum(1 for f, _ in born if f <= frame)
+        nb = sum(1 for f, _, _ in born if f <= frame)
         cnext = int(C["world"]["nextId"])
         need(cnext - start_next == nb, f"{path}: nextId {cnext} - start {start_next} != births up to frame {frame} ({nb})")
         if nb:
@@ -133,7 +134,7 @@ def score(arena_path, manifest_path, births_path, checkpoint_paths):
         ids = invlib.live_ids(C)
         need(len(ids) == int(C["creatures"]["count"]), f"{path}: has dead creatures")
         need(len(set(ids)) == len(ids), f"{path}: duplicate ids")
-        valid = start_set | {cid for f, cid in born[:nb]}
+        valid = start_set | {b[1] for b in born[:nb]}
         bad = [i for i in ids if i not in valid]
         need(not bad, f"{path}: live ids neither start nor derived: {bad[:5]}")
         a = [anc[i] for i in ids]
@@ -144,12 +145,14 @@ def score(arena_path, manifest_path, births_path, checkpoint_paths):
             "births": nb, "generations": nb / n0, "n": n,
             "mean_ancestry": mean, "score": (mean - frac0) if n else None,
             "n_any_invader": sum(1 for x in a if x > 0), "n_pure_invader": sum(1 for x in a if x == 1.0),
+            "n_hybrid": sum(1 for x in a if 0 < x < 1),
+            "births_by_class": [sum(1 for b in born[:nb] if b[2] == c) for c in (0, 1, 2)],
             "n_founders_alive": sum(1 for i in ids if i in start_set),
             "extinct": n == 0, "invader_lost": n > 0 and all(x == 0 for x in a),
             "predators": int(C["predators"]["count"]),
         })
     last_frame = cps[-1][0]
-    need(all(f <= last_frame for f, _ in born), "births logged after the last checkpoint (it is not the run's end)")
+    need(all(b[0] <= last_frame for b in born), "births logged after the last checkpoint (it is not the run's end)")
     need(seen == int(cps[-1][2]["counters"]["totalBirthsLogged"]), "end checkpoint's totalBirthsLogged != births seen")
 
     return {
