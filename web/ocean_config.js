@@ -471,12 +471,14 @@
         set.minPopulation = 20;
         set.predatorMaxPopulation = Math.round(range("predatorCapPerCooldown") * set.predatorCooldown);
         set.predatorMinPopulation = range("predatorFloor");
-        labels.push(set.predatorCount + " predators that must eat to breed (meal " + set.predatorMeal + "), kept between " +
-                    set.predatorMinPopulation + " and " + set.predatorMaxPopulation);
+        labels.push(function () {
+          return set.predatorCount + " predators that must eat to breed (meal " + set.predatorMeal + "), kept between " +
+                 set.predatorMinPopulation + " and " + set.predatorMaxPopulation;
+        });
       } else {
-        labels.push(set.predatorCount + " hunting predators");
+        labels.push(function () { return set.predatorCount + " hunting predators"; });
       }
-      labels.push("plenty of food, at most " + set.maxPopulation + " fish");
+      labels.push(function () { return "plenty of food, at most " + set.maxPopulation + " fish"; });
       population = Math.min(population, set.maxPopulation);
     } else {
       var e = rand();
@@ -507,7 +509,7 @@
         set.foodSpawnBase = range("foodSpawnBase");
         set.foodSpawnAmp = range("foodSpawnAmp");
         set.foodEnergy = range("foodEnergy");
-        labels.push("food " + set.targetFood + ", " + set.foodSpawnBase + "/step");
+        labels.push(function () { return "food " + set.targetFood + ", " + set.foodSpawnBase + "/step"; });
       }
     }
     /* the E1 physics preset, unless a strong current was drawn (the preset's
@@ -549,11 +551,72 @@
     if (set.toroidal && size) fitTorus(set, labels, Math.min(size[0], size[1]));
     if (size && size.length > 2)
       population = scaleToVolume(set, population, (size[0] * size[1] * size[2]) / (REFERENCE.width * REFERENCE.height * REFERENCE.depth), labels);
+    /* the labels with numbers that scaling changes are written from the final
+     * recipe (functions until now): "at most 375 fish" means the cap that runs */
+    labels = labels.map(function (l) { return typeof l === "function" ? l() : l; });
     return { population: population, set: set, labels: labels };
+  }
+
+  /* ---- Scenarios (UI-3): complete recipes the Setup's "Start from" stages ----
+   * Each is a whole world, never an overlay: what a recipe leaves out is
+   * Standard's (a new visitor's: the engine's defaults, glass walls, the
+   * screen's size), as Randomize always did. scenario(id, ctx) ->
+   * {title, summary, seed, population, depth, width, height, cfg};
+   * ctx: {seed, screen: [w, h], walls (the module has glass walls), e1 (the
+   * module's E1 preset, an object), rand, tank: {width, height, depth,
+   * walls, sideWallBand, sideWallTurnRate} (Surprise me keeps the tank as
+   * set)}. The summaries are written from the final recipe. Hunters and
+   * Currents & patches are fixed recipes from the ranges Randomize draws
+   * from (RANGES): UI presets, not new defaults or claims. BIG_TANK is used
+   * verbatim (wasm/ocean_parity.sh compares it). */
+  var HUNTERS = { predatorCount: 4, predatorCooldown: 4, targetFood: 6400, foodSpawnBase: 10, maxPopulation: 350, minSpeed: 0, moveCost: 0.00005 };
+  var CURRENTS = { currentStrength: 80, currentMode: 0, currentEddies: 5, currentCore: 150, currentDrift: 1, foodPatches: 6, foodPatchRadius: 120,
+                   foodDepthMode: 1, foodDepthSpread: 30, foodDrift: true, minSpeed: 0, moveCost: 0.00005 };
+  var SCENARIOS = [
+    { id: "standard", title: "Standard", blurb: "A new visitor's ocean: the default rules, glass walls, sized for this screen" },
+    { id: "bigtank", title: "Big tank", blurb: "Four times the volume and the fish, four times the food, the tuned water" },
+    { id: "e1", title: "Living water", blurb: "Waves, a deep current, light that fades with depth, depth costs (E1)" },
+    { id: "hunters", title: "Hunters", blurb: "Four predators hunt; plenty of food, a cap on the fish, swimming costs energy" },
+    { id: "currents", title: "Currents & patches", blurb: "Eddies carry six food patches, each at its own depth; swimming costs energy" },
+    { id: "surprise", title: "Surprise me", blurb: "A whole setup drawn from ranges that worked, for the tank as set" }
+  ];
+  function tankText(w, h, d) { return w + " × " + h + " × " + d; }
+  function scenario(id, ctx) {
+    var sw = ctx.screen, fresh = ctx.walls ? Object.assign({}, FRESH) : {};
+    var r = { id: id, seed: ctx.seed >>> 0, population: KEYS.population[0], depth: KEYS.depth[0], width: sw[0], height: sw[1], cfg: fresh, labels: [] };
+    var walls = function (cfg) { return cfg.walls === true ? "glass walls" : "wrapping sides"; };
+    if (id === "bigtank") {
+      var b = BIG_TANK;
+      r.width = b.width; r.height = b.height; r.depth = b.depth; r.population = b.population; r.cfg = Object.assign({}, b.cfg);
+      r.labels = ["four times the food", "births stop at " + b.cfg.maxPopulation, "the tuned water"];
+    } else if (id === "e1") {
+      if (!ctx.e1) return null;
+      Object.keys(ctx.e1).forEach(function (k) { r.cfg[k] = ctx.e1[k]; });
+      r.labels = ["waves, a deep current, light, depth costs"];
+    } else if (id === "hunters") {
+      Object.keys(HUNTERS).forEach(function (k) { r.cfg[k] = HUNTERS[k]; });
+      r.labels = [r.cfg.predatorCount + " hunting predators", "food " + r.cfg.targetFood + ", " + r.cfg.foodSpawnBase + "/step",
+                  "at most " + r.cfg.maxPopulation + " fish", "swimming costs energy"];
+    } else if (id === "currents") {
+      Object.keys(CURRENTS).forEach(function (k) { r.cfg[k] = CURRENTS[k]; });
+      r.labels = ["current " + r.cfg.currentStrength + " in " + r.cfg.currentEddies + " eddies", r.cfg.foodPatches + " drifting food patches, each at its own depth",
+                  "swimming costs energy"];
+    } else if (id === "surprise") {
+      var t = ctx.tank, pick = draw(ctx.rand, KEYS.population[0], ctx.e1, [t.width, t.height, t.depth, t.walls]);
+      r.width = t.width; r.height = t.height; r.depth = t.depth; r.population = pick.population;
+      r.cfg = { walls: !!t.walls, sideWallBand: t.sideWallBand, sideWallTurnRate: t.sideWallTurnRate };
+      Object.keys(pick.set).forEach(function (k) { r.cfg[k] = pick.set[k]; });
+      r.labels = pick.labels.length ? pick.labels : ["the default rules"];
+    } else if (id !== "standard") return null;
+    else r.labels = ["the default rules"];
+    var meta = SCENARIOS.filter(function (s) { return s.id === id; })[0];
+    r.title = meta.title;
+    r.summary = tankText(r.width, r.height, r.depth) + " · " + r.population + " fish · " + walls(r.cfg) + " · " + r.labels.join(" · ");
+    return r;
   }
 
   root.EvoOceanConfig = { KEYS: KEYS, LIVE: LIVE, NEG_ON_RESTART: NEG_ON_RESTART, TABS: TABS, LABELS: LABELS, HINTS: HINTS,
                           BTN_STEP: BTN_STEP, TIPS: TIPS, RANGES: RANGES, CHANCE: CHANCE, draw: draw,
                           FRESH: FRESH, BIG_TANK: BIG_TANK, SIZE_LIMITS: SIZE_LIMITS, REFERENCE: REFERENCE,
-                          scaleToVolume: scaleToVolume };
+                          scaleToVolume: scaleToVolume, SCENARIOS: SCENARIOS, scenario: scenario, HUNTERS: HUNTERS, CURRENTS: CURRENTS };
 })(typeof window !== "undefined" ? window : globalThis);

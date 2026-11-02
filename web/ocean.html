@@ -106,7 +106,11 @@
           stroke-linecap: round; stroke-linejoin: round; }
 
   /* ---------- the tank: the whole screen; the camera owns drag, pinch, twist ---------- */
-  #tank { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; background: var(--abyss); }
+  #tank { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; background: var(--abyss);
+          transition: filter 300ms var(--ease); }
+  /* Turbo: the picture waits (the world runs in the worker), dimmed and greyed so it can't pass for a hang;
+   * only the tank: every control stays as bright as ever */
+  body.turbo-on #tank { filter: saturate(0.3) brightness(0.6); }
   body::after {   /* the tank's edges fall into deep water, as in Classic's tank view */
     content: ""; position: fixed; inset: 0; pointer-events: none; z-index: 1;
     background: radial-gradient(ellipse 85% 80% at 50% 48%, transparent 58%, oklch(0.10 0.03 210 / 0.55));
@@ -207,6 +211,14 @@
     #worlds-alt { display: flex; }
   }
   #readout .sep { width: 1px; height: 16px; background: var(--line); }
+  /* the run's state: Live, Paused, Turbo (starting, running, stopping); a phone shows its dot only */
+  .runstate { display: inline-flex; align-items: center; gap: 5px; flex: none; height: 22px; padding: 0 8px; border-radius: 999px;
+              background: var(--surface-3); color: var(--ink-2); font-size: 12px; font-weight: 600; }
+  .runstate::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--plankton); }
+  .runstate[data-s="paused"]::before { background: var(--ink-3); border-radius: 1px; }
+  .runstate[data-s="entering"], .runstate[data-s="turbo"], .runstate[data-s="exiting"] { background: var(--ember-soft); color: var(--ember); }
+  .runstate[data-s="entering"]::before, .runstate[data-s="turbo"]::before, .runstate[data-s="exiting"]::before { background: var(--ember); }
+  @media (max-width: 479px) { .runstate { padding: 0 6px; } .runstate .rs-word { display: none; } }
   #readout .warn { color: var(--ember); }
   #readout .ro-depth { display: none; }
   #tools { display: flex; gap: 6px; padding: 0; border-radius: 999px; }
@@ -271,6 +283,23 @@
   #viewmenubtn .caret { width: 14px; height: 14px; transition: transform 200ms var(--ease); }
   #viewmenubtn[aria-expanded="true"] .caret { transform: rotate(180deg); }
   body.sheet-open #dock { transform: translateX(-50%) translateY(140%); opacity: 0; pointer-events: none; }
+  /* Turbo is a mode of the time group: pause, step, speed and Turbo give way to its strip (Stop, a
+   * population sparkline, its numbers); the watch group stays */
+  body.turbo-on #pausebtn, body.turbo-on #stepbtn, body.turbo-on #dock .speed, body.turbo-on #turbobtn { display: none; }
+  #turbo-strip { display: flex; align-items: center; gap: 8px; min-width: 0; padding-right: 4px; }
+  #turbo-strip[hidden] { display: none; }
+  #turboexit { width: auto; padding: 0 14px 0 10px; gap: 6px; border-radius: 999px; display: inline-flex; justify-content: center;
+               background: var(--ember-soft); color: var(--ember); font-size: 13px; font-weight: 650; }
+  #turboexit:hover { background: oklch(0.72 0.18 38 / 0.26); color: var(--ember); }
+  #turboexit:disabled { opacity: 0.7; }
+  #turboexit svg.i { width: 18px; height: 18px; }
+  #turbo-sparkline { width: 64px; height: 24px; flex: none; }
+  .ts-nums { display: flex; align-items: baseline; gap: 10px; font-size: 12px; color: var(--ink-3); white-space: nowrap; }
+  .ts-nums b { font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: 13px; color: var(--ink); font-weight: 600; }
+  @media (max-width: 759px) { .ts-nums .ts-steps { display: none; } }
+  /* short of room (a long run's counters), the numbers give way: they
+   * clip, and Stop (Cancel) and the sparkline (flex: none) never leave the dock */
+  .ts-nums { min-width: 0; overflow: hidden; }
 
   /* ---------- the keys: one line beside the dock for what is on screen now (a wide screen with a mouse); Help has them all ---------- */
   #keys {
@@ -522,10 +551,42 @@
   input.range { width: 9.5em; height: 28px; accent-color: var(--plankton); cursor: pointer; }
   .rangeval { font-size: 12px; color: var(--ink-2); font-variant-numeric: tabular-nums; }
 
-  .run-hero { margin-top: 14px; padding: 16px; border-radius: var(--r-md); background: var(--surface-2); border: 1px solid var(--line-soft); }
-  .run-hero .btn { width: 100%; min-height: 50px; font-size: 15px; }
-  .run-hero p { margin-top: 10px; font-size: 13px; color: var(--ink-3); }
+  /* Start from: scenario cards (a phone: a strip that scrolls sideways); the picked card gets the Start (and Reroll) */
+  #scenarios { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 8px; }
+  .scard { display: flex; flex-direction: column; gap: 8px; min-width: 0; padding: 0; border-radius: var(--r-md);
+           background: var(--surface-2); border: 1px solid var(--line-soft); transition: border-color 150ms var(--ease), background-color 150ms var(--ease); }
+  .scard.picked { border-color: var(--plankton); background: oklch(0.86 0.19 125 / 0.08); }
+  .spick { display: flex; flex-direction: column; align-items: flex-start; gap: 3px; width: 100%; min-height: 64px; padding: 10px 12px;
+           border: 0; border-radius: var(--r-md); background: none; text-align: left; }
+  .spick:hover { background: var(--surface-3); }
+  .spick b { font-size: 14px; font-weight: 650; color: var(--ink); }
+  .spick span { font-size: 12px; line-height: 1.35; color: var(--ink-3); }
+  #scenario-acts { display: flex; gap: 8px; padding: 0 10px 10px; }
+  #scenario-acts[hidden] { display: none; }
+  #scenario-acts .btn { flex: 1 1 auto; min-height: 44px; padding: 0 12px; white-space: nowrap; }
+  #scenario-acts svg.i { width: 18px; height: 18px; }
+  #rerollbtn[hidden] { display: none; }
+  @media (max-width: 599px) {
+    #scenarios { display: flex; overflow-x: auto; scroll-snap-type: x proximity; scroll-padding-inline: 18px; scrollbar-width: none; margin: 8px -18px 0; padding: 0 18px 4px; }
+    #scenarios::-webkit-scrollbar { display: none; }
+    .scard { flex: 0 0 min(64vw, 220px); scroll-snap-align: start; }
+  }
   #randnote { margin-top: 10px; font-size: 13px; color: var(--plankton); line-height: 1.5; }
+  /* the start bar's split button and its menu (same fish / new fish) */
+  .startsplit { display: inline-flex; flex: 0 1 auto; min-width: 0; position: relative; }   /* (the label shortens with … before it overflows) */
+  .startsplit #restart { border-top-right-radius: 0; border-bottom-right-radius: 0; }
+  #startmenubtn { min-width: 44px; padding: 0 10px; border-left-width: 0; border-top-left-radius: 0; border-bottom-left-radius: 0; }
+  #startmenubtn svg.i { width: 18px; height: 18px; transform: rotate(180deg); transition: transform 200ms var(--ease); }   /* down: the menu opens below */
+  #startmenubtn[aria-expanded="true"] svg.i { transform: none; }
+  #restart.pending + #startmenubtn { background: var(--plankton); color: var(--plankton-ink); border-color: transparent; box-shadow: inset 1px 0 0 oklch(0.22 0.06 130 / 0.35); }
+  #startmenu { flex: 1 1 100%; display: flex; flex-direction: column; gap: 4px; padding: 6px; border-radius: var(--r-md);
+               background: var(--surface-2); border: 1px solid var(--line-soft); }
+  #startmenu[hidden] { display: none; }
+  #startmenu button { display: flex; flex-direction: column; align-items: flex-start; gap: 1px; min-height: 48px; padding: 6px 12px;
+                      border: 0; border-radius: var(--r-sm); background: none; text-align: left; }
+  #startmenu button:hover { background: var(--surface-3); }
+  #startmenu b { font-size: 14px; font-weight: 600; color: var(--ink); }
+  #startmenu small { font-size: 12px; color: var(--ink-3); }
   #randnote:empty { display: none; }
   .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 10px; }
   .panel .hint { margin-top: 8px; font-size: 12px; color: var(--ink-3); line-height: 1.45; }
@@ -542,47 +603,75 @@
     border-top: 1px solid var(--line-soft);
     background: var(--surface);
   }
-  #restart { flex: none; min-width: 120px; }
+  #applybar { flex-wrap: wrap; }
+  #startask { flex: 1 1 100%; display: flex; flex-wrap: wrap; align-items: center; gap: 8px 10px; }
+  #startask[hidden] { display: none; }
+  #startaskmsg { flex: 1 1 100%; font-size: 13px; line-height: 1.4; color: var(--ink); }
+  #startask .btn { min-height: 44px; }
+  #applybar.asking #startrow, #applybar.asking #startsummary { display: none; }   /* the question takes the start row's place (a 320 px phone has room for one) */
+  #applybar { gap: 6px 12px; padding-top: 10px; }
+  #startsummary { flex: 1 1 100%; font-size: 13px; line-height: 1.4; color: var(--ink-2); }
+  #startsummary b { color: var(--ink); font-weight: 650; }
+  #startsummary .seedtag { color: var(--ink-3); font-family: var(--mono); font-size: 12px; }
+  #startrow { flex: 1 1 100%; display: flex; align-items: center; justify-content: flex-end; gap: 8px; }
+  #startdiscard[hidden] { display: none; }
+  #restart { flex: 0 1 auto; min-width: 120px; }
+  #restart span { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 16em; }
   #restart.pending { background: var(--plankton); color: var(--plankton-ink); border-color: transparent; }
-  #err { flex: 1; min-width: 0; font-size: 13px; line-height: 1.35; color: var(--ink-3); }
+  #err { flex: 1 1 100%; min-width: 0; font-size: 13px; line-height: 1.35; color: var(--ink-3); }
+  #err:empty { display: none; }
   #err.error { color: var(--ember); }
+  /* a staged scenario or file: its live settings belong to the next world, so they wear no "live" tag */
+  #drawer.staging .livetag { display: none; }
+  /* the readout: edits waiting for the next start */
+  #waitingcount { flex: none; height: 22px; padding: 0 8px; border-radius: 999px; background: var(--beam-soft); color: var(--beam);
+                  font-size: 12px; font-weight: 600; line-height: 22px; }
+  #waitingcount[hidden] { display: none; }
+  @media (max-width: 479px) { #waitingcount { padding: 0 6px; } #waitingcount .wc-word { display: none; } }
 
-  /* ---------- turbo (as web/index.html: dims the world, not the controls) ---------- */
-  #turbo {
-    position: fixed; inset: 0; z-index: var(--z-turbo);
-    display: grid; place-items: center;
-    padding: calc(var(--top-h) + var(--safe-t)) 16px calc(var(--dock-h) + var(--dock-b) + 10px);
-    background: oklch(0.12 0.03 205 / 0.55);
-    pointer-events: none;
-    transition: right 300ms var(--ease);
+  /* ---------- Turbo's Stop where the dock is covered: a narrow screen's setup sheet, the charts ---------- */
+  .turbo-bar { display: flex; align-items: center; gap: 10px; padding: 6px 12px 6px 16px; font-size: 13px; color: var(--ember);
+               background: var(--ember-soft); border-bottom: 1px solid var(--line-soft); }
+  .turbo-bar[hidden] { display: none; }
+  .turbo-bar svg.i { width: 18px; height: 18px; }
+  .turbo-bar span { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .turbo-bar b { font-family: var(--mono); font-variant-numeric: tabular-nums; color: var(--ink); font-weight: 600; }
+  .turbo-bar .btn { flex: none; min-height: 40px; padding: 0 14px; color: var(--ember); border-color: oklch(0.72 0.18 38 / 0.5); }
+  @media (pointer: coarse) { .turbo-bar .btn { min-height: 44px; } }
+  @media (min-width: 960px) { #setup-turbo { display: none; } }   /* a wide screen's dock stays beside the panel */
+
+  /* ---------- a short sheet keeps room for its settings ----------
+   * A bottom sheet on a short screen (a 320 x 568 phone, the 890 x 453
+   * embed) holds its head, Turbo's bar, the tabs and the start bar: it
+   * takes more of the height, and the sheet's own bars get flatter, so at
+   * least a few settings show between them (the question included). */
+  @media (max-width: 959px) and (max-height: 700px) {
+    #drawer { height: min(80dvh, 680px); }
+    /* the summary in two lines (the whole of it in its title; the tabs and
+     * the card say the rest), and a note (never an error) only as its toast
+     * (#err stays the status a screen reader hears) */
+    #startsummary { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; }
+    #err:not(.error) { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
   }
-  #turbo[hidden] { display: none; }
-  #turbo .card { pointer-events: auto; width: min(400px, 100%); padding: 22px 22px 18px; border-radius: var(--r-lg); text-align: center; }
-  #turbo h2 { display: flex; align-items: center; justify-content: center; gap: 8px; font-size: 20px; font-weight: 650; color: var(--ember); }
-  #turbo p { margin-top: 6px; font-size: 14px; color: var(--ink-2); }
-  #turbostats { margin-top: 14px; display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; text-align: left; }
-  #turbostats div { padding: 10px 12px; border-radius: var(--r-sm); background: var(--surface-2); }
-  #turbostats span { display: block; font-size: 12px; color: var(--ink-3); }
-  #turbostats b { font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: 16px; font-weight: 600; }
-  #turbo .btn { margin-top: 16px; width: 100%; }
-  @media (max-height: 560px) {
-    #turbo .card { padding: 12px 14px; }
-    #turbo h2 { font-size: 16px; }
-    #turbomsg { display: none; }
-    #turbostats { margin-top: 8px; grid-template-columns: repeat(4, 1fr); gap: 6px; }
-    #turbostats div { padding: 6px 8px; }
-    #turbostats b { font-size: 14px; }
-    #turbo .btn { margin-top: 10px; min-height: 40px; }
+  /* a 320-379 px phone: Discard and Start (with its menu) side by side */
+  @media (max-width: 379px) {
+    #startdiscard { padding: 0 10px; }
+    #restart svg.i { display: none; }
   }
-  @media (max-width: 959px) and (min-height: 760px) {
-    body.sheet-open #turbo { padding-bottom: calc(min(70dvh, 680px) + 8px); }
-    body.sheet-open #turbo .card { padding: 12px 14px; }
-    body.sheet-open #turbo h2 { font-size: 16px; }
-    body.sheet-open #turbomsg { display: none; }
-    body.sheet-open #turbostats { margin-top: 8px; grid-template-columns: repeat(4, 1fr); gap: 6px; }
-    body.sheet-open #turbostats div { padding: 6px 8px; }
-    body.sheet-open #turbostats b { font-size: 14px; }
-    body.sheet-open #turbo .btn { margin-top: 10px; min-height: 40px; }
+  /* a sheet as wide as a tablet's: the question beside its answers, the
+   * summary beside Start (one row each, not two) */
+  @media (min-width: 600px) and (max-width: 959px) {
+    #startaskmsg { flex: 1 1 240px; }
+    #startsummary { flex: 1 1 240px; }
+    #startrow { flex: 0 0 auto; }
+  }
+  @media (max-width: 959px) and (max-height: 560px) {
+    #setup-turbo { padding-top: 2px; padding-bottom: 2px; }
+  }
+  /* a mouse on a short screen: the head is the handle (it drags too), the grip goes */
+  @media (max-width: 959px) and (max-height: 560px) and (pointer: fine) {
+    .sheet-grip { display: none; }
+    .sheet-head { padding-top: 6px; }
   }
 
   /* ---------- loading ---------- */
@@ -726,7 +815,13 @@
     #dock > .icon-btn { width: 44px; flex: 0 1 auto; min-width: 34px; }
     #dock > #turbobtn { padding: 0; }   /* its word is hidden here */
     #viewpop { right: 10px; width: auto; }
+    /* Turbo's strip on a phone: Stop (its icon, 44 px), the sparkline, generation and rate (the fish are in the readout) */
+    #turboexit { width: 44px; padding: 0; }
+    #turboexit .ts-word, .ts-nums .ts-pop { display: none; }
+    #turbo-strip { gap: 6px; flex: 1 1 auto; }
+    .ts-nums { gap: 8px; }
   }
+  @media (max-width: 370px) { #turbo-sparkline { display: none; } }
   @media (max-width: 420px) {
     #dock { padding: 0 3px; }
     #dock .speed .icon-btn { width: 32px; }
@@ -758,14 +853,24 @@
     }
     .sheet-grip { display: none; }
     .sheet-head { padding-top: 14px; }
-    body.sheet-open #turbo { right: 406px; }
-    body.sheet-open #dock { transform: translateX(calc(-50% - 200px)); opacity: 1; pointer-events: auto; }
+    /* beside the panel: centred in the screen less its 400 px, and never wider than that */
+    body.sheet-open #dock { transform: translateX(calc(-50% - 200px)); opacity: 1; pointer-events: auto; max-width: calc(100vw - 420px); }
     body.sheet-open #fishcard { right: 416px; }
     body.sheet-open #tools { margin-right: 400px; }
     body.sheet-open #helppop { right: 410px; }
     body.sheet-open #toasts { transform: translateX(calc(-50% - 200px)); }
     #fishcard, #fishcard.flip { top: calc(76px + var(--safe-t)); bottom: auto; max-height: calc(100dvh - 180px); }
     #fishcard.expanded .fc-brain .inet { height: 340px; }
+  }
+  /* Turbo's strip beside the Setup panel: the room is the screen less the
+   * panel, so it drops what a narrow screen's drops as that room narrows:
+   * the steps below 800 px of room, then the fish (the readout has them)
+   * and View's word below 700, keeping Stop (or Cancel), the sparkline,
+   * steps/s and the generation, counters in the millions too */
+  @media (min-width: 960px) and (max-width: 1199px) { body.sheet-open .ts-nums .ts-steps { display: none; } }
+  @media (min-width: 960px) and (max-width: 1099px) {
+    body.sheet-open.turbo-on .ts-nums .ts-pop, body.sheet-open.turbo-on #viewmenubtn span, body.sheet-open.turbo-on #viewmenubtn .caret { display: none; }
+    body.sheet-open.turbo-on #viewmenubtn { width: 44px; padding: 0; justify-content: center; }
   }
   /* A short window (a landscape phone; an embed, such as the portfolio's
    * 890 x 453), as Classic's compact layout: the fish card, its brain open,
@@ -833,6 +938,7 @@
     <symbol id="i-light" viewBox="0 0 24 24"><path d="M8.5 3.5h7l-1.2 5.2 .9 1.8v9a1 1 0 0 1-1 1h-4.4a1 1 0 0 1-1-1v-9l.9-1.8-1.2-5.2Z"/><path d="M10.2 13.5h3.6"/><path d="M4.5 4.5 6 6M19.5 4.5 18 6M3 9.5h2M19 9.5h2"/></symbol>
     <symbol id="i-tank" viewBox="0 0 24 24"><path d="M3.5 9 8 6h12.5L16 9H3.5Z"/><path d="M3.5 9v8.5H16V9M16 17.5l4.5-3V6"/><path d="M6.5 13.5h6" opacity=".6"/></symbol>
     <symbol id="i-eye" viewBox="0 0 24 24"><path d="M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12Z"/><circle cx="12" cy="12" r="3"/></symbol>
+    <symbol id="i-stop" viewBox="0 0 24 24"><rect x="6.5" y="6.5" width="11" height="11" rx="2" fill="currentColor" stroke="none"/></symbol>
     <symbol id="i-step" viewBox="0 0 24 24"><path d="M6.5 5.5v13l9.5-6.5-9.5-6.5Z"/><path d="M18.5 5.5v13"/></symbol>
     <symbol id="i-out" viewBox="0 0 24 24"><path d="M10 5.5H6.5a1.5 1.5 0 0 0-1.5 1.5v10.5a1.5 1.5 0 0 0 1.5 1.5H17a1.5 1.5 0 0 0 1.5-1.5V14"/><path d="M13.5 4.5h6v6M19.5 4.5 11 13"/></symbol>
   </svg>
@@ -847,6 +953,8 @@
       <span>gen <b id="ro-gen" class="num">–</b></span>
       <span class="ro-depth">depth <b id="ro-depth" class="num">–</b></span>
       <span class="ro-rate"><b id="ro-fps" class="num">–</b> fps</span>
+      <span id="runstate" class="runstate" data-s="live" title="The world is running"><span class="rs-word">Live</span></span>
+      <span id="waitingcount" hidden></span>
     </button>
     <nav id="worlds" class="chip-surface" aria-label="world">
       <span class="seg w3" aria-current="page" title="3-D Ocean: fish that sense depth and steer in it (this page)">3-D<span class="long"> Ocean</span></span>
@@ -854,7 +962,7 @@
     </nav>
     <div id="tools" class="chip-surface">
       <button id="dashbtn" class="icon-btn" aria-label="dashboards: charts of this run" aria-expanded="false" title="Dashboards: charts of this run (G)"><svg class="i"><use href="#i-chart"/></svg></button>
-      <button id="menubtn" class="icon-btn" aria-label="settings" aria-expanded="false" aria-controls="drawer" title="Settings (O)"><svg class="i"><use href="#i-sliders"/></svg></button>
+      <button id="menubtn" class="icon-btn" aria-label="setup" aria-expanded="false" aria-controls="drawer" title="Setup (O): start a new world, change the rules"><svg class="i"><use href="#i-sliders"/></svg></button>
       <button id="helpbtn" class="icon-btn" aria-label="help and keys" aria-expanded="false" aria-controls="helppop" title="Help and keys (?)"><svg class="i"><use href="#i-help"/></svg></button>
     </div>
   </header>
@@ -866,7 +974,7 @@
     <div class="notes" id="statnotes"></div>
     <div id="worlds-alt"><a id="to2dmenu" class="btn" href="#to2d">2-D Classic<svg class="i out" aria-hidden="true"><use href="#i-out"/></svg></a><span>The original flat world, on its own page. This run stops.</span></div>
   </div>
-  <button id="fitbtn" class="btn chip-surface" hidden title="Starts this world again, sized for this screen: the same settings and seed"><svg class="i"><use href="#i-restart"/></svg>Fit the world to this screen</button>
+  <button id="fitbtn" class="btn chip-surface" hidden title="Sizes the next world for this screen (Setup: then Start)"><svg class="i"><use href="#i-restart"/></svg>Fit the world to this screen…</button>
   <div id="toasts" aria-live="polite"></div>
   <div id="keys" class="chip-surface" role="note" aria-label="keyboard shortcuts"></div>
   <div id="coach" class="chip-surface" role="status" hidden>
@@ -898,6 +1006,12 @@
   </section>
 
   <nav id="dock" class="chip-surface" aria-label="playback and view">
+    <!-- Turbo: the time group's place while the worker runs the world -->
+    <div id="turbo-strip" role="status" aria-label="Turbo" hidden>
+      <button id="turboexit" class="icon-btn" title="Stop Turbo (Space or T): watch again, exactly where Turbo got to" aria-label="stop Turbo"><svg class="i"><use href="#i-stop"/></svg><span class="ts-word">Stop</span></button>
+      <canvas id="turbo-sparkline" width="64" height="24" aria-hidden="true" title="fish, while Turbo runs"></canvas>
+      <span class="ts-nums"><span><b id="ts-rate">–</b> steps/s</span><span class="ts-steps"><b id="ts-steps">–</b> steps</span><span class="ts-pop"><b id="ts-pop">–</b> fish</span><span>gen <b id="ts-gen">–</b></span></span>
+    </div>
     <button id="pausebtn" class="icon-btn" title="Pause (Space)" aria-label="pause"><svg class="i"><use href="#i-pause"/></svg></button>
     <button id="stepbtn" class="icon-btn" hidden title="One step forward (.)" aria-label="one step forward"><svg class="i"><use href="#i-step"/></svg></button>
     <div class="speed" role="group" aria-label="speed">
@@ -950,68 +1064,74 @@
     <h3>Watch</h3>
     <span class="k"><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> fly (following: closer, circle)</span><span class="k"><kbd>Q</kbd><kbd>E</kbd> down / up</span><span class="k"><kbd>Shift</kbd> faster</span><span class="k"><kbd>F</kbd> follow a fish</span><span class="k"><kbd>L</kbd> flashlight</span><span class="k"><kbd>V</kbd> View menu</span><span class="k"><kbd>C</kbd> fit the tank</span><span class="k"><kbd>Esc</kbd> let go / close</span>
     <h3>Time</h3>
-    <span class="k"><kbd>Space</kbd> pause / play</span><span class="k"><kbd>.</kbd> one step (paused)</span><span class="k"><kbd>+</kbd><kbd>−</kbd> speed</span><span class="k"><kbd>T</kbd> Turbo on / off</span>
+    <span class="k"><kbd>Space</kbd> pause / play (in Turbo: stop it)</span><span class="k"><kbd>.</kbd> one step (paused)</span><span class="k"><kbd>+</kbd><kbd>−</kbd> speed</span><span class="k"><kbd>T</kbd> Turbo on / off</span>
     <h3>World</h3>
-    <span class="k"><kbd>R</kbd> start fresh: same rules, new fish</span><span class="k"><kbd>Shift</kbd><kbd>R</kbd> replay this world from its start</span><span class="k"><kbd>O</kbd> settings</span>
+    <span class="k"><kbd>R</kbd> start fresh: same rules, new fish</span><span class="k"><kbd>Shift</kbd><kbd>R</kbd> replay this world from its start (what waits stays)</span><span class="k"><kbd>O</kbd> setup</span>
     <h3>Look</h3>
     <span class="k"><kbd>I</kbd> live numbers</span><span class="k"><kbd>G</kbd> charts</span><span class="k"><kbd>?</kbd> this help</span>
     <div class="pop-acts"><button id="tourbtn" class="btn">Take the tour</button><button id="whatturbo" class="btn ghost">What is Turbo?</button></div>
   </div>
 
-  <aside id="drawer" role="dialog" aria-label="settings" aria-modal="false">
+  <aside id="drawer" role="dialog" aria-label="setup" aria-modal="false">
     <div class="sheet-grip" id="grip" aria-hidden="true"></div>
     <div class="sheet-head">
-      <h2>Settings</h2>
-      <button id="drawerclose" class="icon-btn" aria-label="close settings"><svg class="i"><use href="#i-close"/></svg></button>
+      <h2>Setup</h2>
+      <button id="drawerclose" class="icon-btn" aria-label="close setup"><svg class="i"><use href="#i-close"/></svg></button>
     </div>
-    <nav id="tabs" role="tablist" aria-label="settings sections"></nav>
+    <div id="setup-turbo" class="turbo-bar" role="status" hidden><svg class="i"><use href="#i-bolt"/></svg><span>Turbo is running: <b id="st-rate">–</b> steps/s</span><button id="setup-turbo-stop" class="btn">Stop Turbo</button></div>
+    <nav id="tabs" role="tablist" aria-label="setup sections"></nav>
     <div id="panels">
       <section class="panel" data-tab="run" id="panel-run">
-        <div class="run-hero">
-          <button id="randombig" class="btn primary"><svg class="i"><use href="#i-dice"/></svg>Randomize the world</button>
-          <p>Draws a whole setup from ranges that worked in experiments (predators, currents, the E1 physics, schooling rules) and restarts.</p>
-          <p id="randnote"></p>
+        <h3>Start from</h3>
+        <!-- a card stages its whole recipe in these tabs (the next world); its Start (or the start bar's) starts it -->
+        <div id="scenarios" role="group" aria-label="start from">
+          <div class="scard" data-s="standard"><button id="advreset" class="spick" type="button" aria-pressed="false"><b>Standard</b><span>A new visitor's ocean: the default rules, glass walls, sized for this screen</span></button></div>
+          <div class="scard" data-s="bigtank"><button id="bigbtn" class="spick" type="button" aria-pressed="false"><b>Big tank</b><span>Four times the volume and the fish, four times the food, the tuned water</span></button></div>
+          <div class="scard" data-s="e1"><button id="e1btn" class="spick" type="button" aria-pressed="false"><b>Living water</b><span>Waves, a deep current, light that fades with depth, depth costs (E1)</span></button></div>
+          <div class="scard" data-s="hunters"><button id="huntersbtn" class="spick" type="button" aria-pressed="false"><b>Hunters</b><span>Four predators hunt; plenty of food, a cap on the fish, swimming costs energy</span></button></div>
+          <div class="scard" data-s="currents"><button id="currentsbtn" class="spick" type="button" aria-pressed="false"><b>Currents &amp; patches</b><span>Eddies carry six food patches, each at its own depth</span></button></div>
+          <div class="scard" data-s="surprise"><button id="randombig" class="spick" type="button" aria-pressed="false"><b>Surprise me</b><span>A whole setup drawn from ranges that worked, for the tank as set</span></button></div>
+          <div class="scard" data-s="file"><button id="loadcp" class="spick" type="button" aria-pressed="false"><b>From a file…</b><span>A setup you saved: that world from its start</span></button></div>
         </div>
-        <h3>This world</h3>
-        <div class="row2">
-          <button id="newworld" class="btn" title="the same settings, a new seed (R)"><svg class="i"><use href="#i-restart"/></svg>New world</button>
-          <button id="replay" class="btn" title="this world again from its start (Shift+R)"><svg class="i"><use href="#i-replay"/></svg>Replay</button>
-        </div>
-        <p id="modeline"></p>
-        <p class="hint">The flashlight, water clarity, fish colours and Hold 60 fps are in <b>View</b>, beside the flashlight in the dock (key V).</p>
-        <h3>Save &amp; load</h3>
-        <div class="row2">
-          <button id="savecp" class="btn" title="the settings and seed, as a file"><svg class="i"><use href="#i-save"/></svg>Save setup</button>
-          <button id="loadcp" class="btn" title="a saved setup: restarts with it"><svg class="i"><use href="#i-load"/></svg>Load setup</button>
-        </div>
-        <p class="hint">A setup is the settings and the seed, so loading one replays that world from its start. The Ocean cannot save the fish themselves yet (Classic's Save world can). After a restart the page's address carries the setup too: bookmark or share it.</p>
+        <div id="scenario-acts" hidden><button id="scenario-start" class="btn primary" type="button"><svg class="i"><use href="#i-play"/></svg><span>Start</span></button><button id="rerollbtn" class="btn" type="button" hidden><svg class="i"><use href="#i-dice"/></svg>Reroll</button></div>
+        <p id="randnote"></p>
         <input id="cpfile" type="file" accept=".json" hidden>
-        <h3>Defaults</h3>
-        <button id="advreset" class="btn ghost" style="margin-top:8px">Reset every setting</button>
+        <h3>This run</h3>
+        <p id="modeline"></p>
+        <div class="row2">
+          <button id="replay" class="btn" title="this world again from its seed (Shift+R): what waits stays waiting, live tweaks are dropped"><svg class="i"><use href="#i-replay"/></svg>Replay from start</button>
+          <button id="savecp" class="btn" title="this world's seed and settings, as a file (during Turbo too)"><svg class="i"><use href="#i-save"/></svg>Save setup</button>
+        </div>
+        <p class="hint">A start begins a world from its seed: the Ocean can't save the fish themselves yet (Classic's Save world can). The page's address carries the setup of the world that runs: bookmark or share it.</p>
+        <p class="hint">The flashlight, water clarity, fish colours and Hold 60 fps are in <b>View</b>, beside the flashlight in the dock (key V).</p>
         <p id="credit">Finfolk © 2026 Harit Tarwani ·
           <a href="https://creativecommons.org/licenses/by-nc/4.0/" target="_blank" rel="noopener noreferrer">CC BY-NC 4.0</a></p>
       </section>
       <!-- the other panels are built by ocean.js (EvoOceanConfig.TABS) -->
     </div>
     <div id="applybar">
-      <button id="restart" class="btn"><svg class="i"><use href="#i-restart"/></svg><span>Restart</span></button>
+      <!-- asked before a start replaces a run with something to lose; it takes the start row's place -->
+      <div id="startask" role="group" aria-labelledby="startaskmsg" hidden>
+        <p id="startaskmsg"></p>
+        <button id="startconfirm" class="btn primary">Replace it</button>
+        <button id="startcancel" class="btn ghost">Keep it</button>
+      </div>
+      <!-- the start bar: what runs, or what the next start will be (the draft) -->
+      <p id="startsummary"></p>
+      <div id="startrow">
+        <button id="startdiscard" class="btn ghost" hidden title="Forget what waits for the next start (live tweaks stay: they already apply)">Discard</button>
+        <span class="startsplit">
+          <button id="restart" class="btn"><svg class="i"><use href="#i-restart"/></svg><span>Start again</span></button>
+          <button id="startmenubtn" class="btn" aria-haspopup="menu" aria-expanded="false" aria-controls="startmenu" aria-label="more ways to start" title="Same fish or new fish"><svg class="i"><use href="#i-chevron"/></svg></button>
+        </span>
+      </div>
+      <div id="startmenu" role="menu" aria-label="ways to start" hidden>
+        <button id="startsame" role="menuitem" type="button"><b>Start again (same fish)</b><small id="startsame-sub">the same seed</small></button>
+        <button id="newworld" role="menuitem" type="button" title="R"><b>Start fresh (new fish)</b><small>a new seed (R)</small></button>
+      </div>
       <span id="err" role="status"></span>
     </div>
   </aside>
-
-  <div id="turbo" hidden>
-    <div class="card chip-surface" role="status">
-      <h2><svg class="i"><use href="#i-bolt"/></svg>Turbo</h2>
-      <p id="turbomsg">Running headless in a background worker. Nothing is drawn, so it goes many times faster.</p>
-      <div id="turbostats">
-        <div><span>Steps / s</span><b id="ts-rate">–</b></div>
-        <div><span>Steps this run</span><b id="ts-steps">–</b></div>
-        <div><span>Fish</span><b id="ts-pop">–</b></div>
-        <div><span>Food</span><b id="ts-food">–</b></div>
-      </div>
-      <button id="turboexit" class="btn primary">Stop Turbo and watch</button>
-    </div>
-  </div>
 
   <div id="dash" role="dialog" aria-label="dashboards" hidden>
     <div class="dhead">
@@ -1022,6 +1142,7 @@
         <button id="dclose" class="icon-btn" aria-label="close the dashboards"><svg class="i"><use href="#i-close"/></svg></button>
       </div>
     </div>
+    <div id="dash-turbo" class="turbo-bar" role="status" hidden><svg class="i"><use href="#i-bolt"/></svg><span>Turbo is running: <b id="dt-rate">–</b> steps/s · these charts follow it</span><button id="dash-turbo-stop" class="btn">Stop Turbo</button></div>
     <p id="dnote"></p>
     <div id="dgrid"></div>
   </div>

@@ -6,22 +6,27 @@
  * the deep tank (web/ocean_scene.js). Around it, the Classic page's controls
  * (web/renderer.js), so the two pages are one product:
  *   - the top bar (live readout -> the stat panel with the depth histogram;
- *     📊 dashboards, web/ocean_dash.js; the settings; Help: every key, the
+ *     📊 dashboards, web/ocean_dash.js; Setup; Help: every key, the
  *     tour, "What is Turbo?") and the toasts
  *   - the dock: pause (one step while paused), speed (steps per frame),
  *     Turbo | the flashlight, View (the light while following, water clarity,
  *     fish colours, Hold 60 fps: drawing only), fit the tank. Nothing on it
- *     replaces the run: Randomize is in the settings' Run tab.
- *   - the settings sheet, built from web/ocean_config.js: every key the
- *     Ocean takes, "live" ones (oc_set_param) applying at once, the rest on
- *     Restart ("Restart to apply"); settings that do nothing with the others as
- *     they are are dimmed with the reason (NEEDS); the Run tab: Randomize, New
- *     world / Replay, save / load a setup
+ *     replaces the run.
+ *   - Setup, the sheet built from web/ocean_config.js: the next world (the
+ *     draft): every key the Ocean takes, "live" ones (oc_set_param) applying
+ *     at once to the running world too, the rest waiting for Start;
+ *     settings that do nothing with the others as they are are dimmed with
+ *     the reason (NEEDS); the Run tab: Start from (scenario cards, Surprise
+ *     me, a setup file), This run (Replay, Save setup); the start bar
+ *     (what runs or what waits, Discard, Start: the same fish or new ones).
+ *     One door: every world start is a plan for startWorld.
  *   - the fish card (click or tap a fish): oc_inspect's numbers and its live
  *     brain (oc_set_capture keeps its senses while a fish is selected)
  *   - Turbo: web/ocean_worker.js steps a copy of the module's memory at full
  *     speed; the copy comes back on Stop, so the run carries on exactly
  *     (web/ocean_handoff.js: the hand-off, shared with the worker)
+ *   - Turbo is a mode of the dock (updateLocks): its strip takes the time
+ *     group's place, with Stop (also Space and T), and the tank dims
  *   - the tour and the Turbo card (web/guide.js, steps below), from Help; a
  *     first visit opens on the tank, with one hint and later a Turbo coach mark
  * The flashlight (scene.setFlashlight) is drawing only: no engine call.
@@ -192,6 +197,11 @@
     LIGHT = { on: on, L0: on ? M._oc_light_l0() : 1, k: on ? M._oc_light_kwater() : 0 };
     if (scene) scene.setLight(LIGHT);
   }
+  function lightFromCfg() {
+    var on = !!cfgVal("lightEnabled");
+    LIGHT = { on: on, L0: on ? cfgVal("L0") : 1, k: on ? cfgVal("kWater") : 0 };
+    if (scene) scene.setLight(LIGHT);
+  }
   function readWorld() {
     W = M._oc_width(); H = M._oc_height(); D = M._oc_depth_max();
     statsLen = M._oc_stats_len();
@@ -237,20 +247,26 @@
     var f = screenWorld();
     el("fitbtn").hidden = !M || !(W === f[1] && H === f[0]);
   }
+  /* the size only, for the next world (staged in the sheet, which opens on
+   * it): Start starts it; the rest of the setup stays as it is */
   function fitToScreen() {
-    if (!M || guardTurbo()) return;
-    var w0 = el("o_width").value, h0 = el("o_height").value, f = screenWorld();   /* as typed, to put back */
+    if (!M) return;
+    var f = screenWorld();
     setVal("width", f[0]); setVal("height", f[1]);
-    if (!restart()) { setVal("width", w0); setVal("height", h0); }
+    updateNeeds(); updateTabDots(); renderStartBar();
+    setDrawer(true);
+    showNote("The tank's size for this screen, " + f[0] + " × " + f[1] + ", waits for the next start: Start applies it.");
   }
   /* the tank's sides: glass walls in the running world (oc_walls_enabled), and
    * whether this module knows them at all */
   function hasWalls() { return has("oc_walls_enabled"); }
   function wallsOn() { return hasWalls() && !!M._oc_walls_enabled(); }
   var worldReady = false, worldEpoch = 0;   /* epoch: a new world's (fish ids start over); Turbo keeps it */
-  /* repeats: the later occurrences of cfg's repeated keys (HO.parseFirst), so
+  /* oc_init, and the bookkeeping of what it took: startWorld's alone.
+   * repeats: the later occurrences of cfg's repeated keys (HO.parseFirst), so
    * oc_init checks each and takes the first, as it does for its own JSON.
-   * size: [width, height] (the sheet's, the link's, a setup's). */
+   * size: [width, height] (the sheet's, the link's, a setup's). A refusal
+   * changes nothing: oc_init checks everything before it replaces the world. */
   function initWorld(seed, population, depth, cfg, rawCfg, repeats, size) {
     if (cfg && (cfg.walls === true || cfg.walls === 1) && !hasWalls()) {   /* a stale module: it would ignore the key */
       pageError = "glass walls need a newer engine module (this one has no oc_walls_enabled: rebuild web/evo_ocean)";
@@ -267,9 +283,68 @@
     });
     initArgs = { seed: seed >>> 0, population: population, depth: depth, width: size[0], height: size[1], cfg: accepted };
     runCfg = Object.assign({}, accepted);
+    return true;
+  }
+
+  /* ---------------- one door to a new world ----------------
+   * Every world start is a plan, and only startWorld(plan) turns one into a
+   * world: Start and its menu, R / Shift+R, Replay, a scenario, a setup
+   * file, the link at start-up (importWorld), the benchmark (importWorld).
+   * A Turbo hand-back is not a start (the same world: no new epoch, the
+   * charts kept). startWorld runs only while this page owns the world, and
+   * at once, never from a frame: oc_init (or oc_reset for Replay), then the
+   * page's bookkeeping, once — the epoch, the charts, the selection, the
+   * sheet, the address. It answers {ok, why}; a refusal changes nothing.
+   * requestStart (below) is the visitor's way to it: it checks the plan,
+   * asks inline when the run has something to lose, and in Turbo stops it
+   * first (the ordinary hand-back), then starts.
+   * plan: {source, op: "init" | "replay", engine, build() -> {seed,
+   *   population, depth, size: [w, h], cfg, raw, repeats}, url (write the
+   *   address), check() -> "" or why not (before anything stops),
+   *   done(), the toast on success, failed: the refusal's opening}
+   * engine: the module the world runs in, "ocean" (this page's, the
+   * default); a plan may name another, which this page refuses until it
+   * can load one (the eye world will). */
+  var ENGINE = "ocean";
+  var usedTurbo = false;     /* Turbo ran this world (a reason to ask before replacing it) */
+  var turboReturn = null;    /* the fish to select / follow again after Turbo (restoreAfterTurbo) */
+  function startWorld(plan) {
+    if (!M) return { ok: false, why: "the engine is not loaded" };
+    if (turboState !== "live") return { ok: false, why: "Turbo owns the world" };
+    if ((plan.engine || ENGINE) !== ENGINE)
+      return { ok: false, why: "that world needs the " + plan.engine + " engine module, and this page runs the " + ENGINE + " one" };
+    var a = plan.op === "replay" ? null : plan.build();
+    /* Replay keeps what waits (a staged recipe: the whole sheet; else the
+     * fields that differ from this world, as typed), never the live tweaks
+     * it drops: those fields equal this world, so they go back with it */
+    var keep = plan.op === "replay" && !draft && initArgs ? pendingDiff().map(function (k) { return [k, rawOf(k)]; }) : null;
+    if (plan.op === "replay") {
+      if (!initArgs || !M._oc_reset()) return { ok: false, why: "oc_reset failed: " + lastError() };
+      runCfg = Object.assign({}, initArgs.cfg);
+    } else if (!initWorld(a.seed, a.population, a.depth, a.cfg, a.raw, a.repeats, a.size)) {
+      return { ok: false, why: lastError() };
+    }
+    /* committed: the page's bookkeeping, once */
     clearFieldNotes();
     afterNewWorld();
-    return true;
+    stepOnce = false; summary = null; usedTurbo = false; turboReturn = null;
+    if (plan.op !== "replay") { draft = null; projectForm(); }   /* a start consumes the draft */
+    else if (keep) { projectForm(); keep.forEach(function (e) { setRaw(e[0], e[1]); }); updateNeeds(); updateTabDots(); }
+    draftGen++;   /* every new world, Replay too (which keeps the draft): a setup file read from before it is stale */
+    if (plan.imported && a) warnOdd(a.cfg);   /* (a setup from outside the sheet: what it ran) */
+    if (plan.url) writeUrl();
+    hideAsk();
+    renderStartBar();
+    return { ok: true, why: "" };
+  }
+  /* the sheet shows the world that now runs: its seed, size and settings
+   * (initArgs; the keys it has no field for kept aside) */
+  function projectForm() {
+    resetForm();
+    setVal("seed", initArgs.seed); setVal("population", initArgs.population); setVal("depth", initArgs.depth);
+    setVal("width", W); setVal("height", H);
+    cfgToForm(initArgs.cfg);
+    updateNeeds(); updateTabDots();
   }
   /* A setup from outside the sheet (the link's, a setup file's), started as
    * it is: oc_init sees its values themselves, so a refusal says why, and
@@ -286,23 +361,28 @@
    * repeats: the later occurrences of a repeated key (HO.parseFirst; cfg
    * holds the first): they go on to oc_init, which checks each and runs the
    * first, as the sheet then shows. */
+  /* (startWorld's adapter for the start-up's link and the benchmark, which
+   * want its answer as "" or why; neither writes the address) */
   function importWorld(seed, population, depth, cfg, raw, repeats, size) {
+    var r = startWorld(importPlan("import", seed, population, depth, cfg, raw, repeats, size, false));
+    return r.ok ? "" : r.why;
+  }
+  function importPlan(source, seed, population, depth, cfg, raw, repeats, size, url) {
     var clean = {}, more = [];
     Object.keys(cfg || {}).forEach(function (k) { if (!ARGS[k]) clean[k] = cfg[k]; });
     (repeats || []).forEach(function (r) { if (!ARGS[r.key]) more.push(r); });
-    if (!initWorld(seed, population, depth, clean, raw, more, size)) return lastError();
-    resetForm();
-    setVal("seed", seed >>> 0); setVal("population", population); setVal("depth", depth);
-    setVal("width", W); setVal("height", H);
-    cfgToForm(clean);
-    updateNeeds(); updateTabDots(); setPending(false);
+    return { source: source, op: "init", url: url, imported: clean,
+             build: function () { return { seed: seed, population: population, depth: depth, cfg: clean, raw: raw, repeats: more, size: size }; } };
+  }
+  /* the sheet can't hold every value a setup may have (an on / off key as 2):
+   * said in the console, the world runs what the setup says */
+  function warnOdd(clean) {
     var odd = Object.keys(clean).filter(function (k) {
       if (!KEYS[k]) return false;
       var a = getVal(k), b = clean[k], bool = typeof KEYS[k][0] === "boolean" || (KEYS[k][1] || {}).bit;
       return bool ? !!a !== !!b : a !== b;
     });
     if (odd.length) console.warn("ocean: the sheet shows " + odd.join(", ") + " differently from the setup it runs");
-    return "";
   }
   /* a new world (oc_init or oc_reset), or one handed back by Turbo */
   function afterNewWorld(fromTurbo) {
@@ -443,7 +523,7 @@
     if (typeof def === "boolean" || opt.bit) input.checked = v === true || v === 1;
     else input.value = String(v);
   }
-  function resetForm() { Object.keys(KEYS).forEach(function (k) { setVal(k, KEYS[k][0]); }); extraCfg = {}; clearFieldNotes(); }
+  function resetForm() { Object.keys(KEYS).forEach(function (k) { setVal(k, KEYS[k][0]); }); extraCfg = {}; nextOnly = {}; clearFieldNotes(); }
   /* a flat cfg object into the sheet: known keys into their fields, the rest kept aside */
   function cfgToForm(cfg) {
     Object.keys(cfg || {}).forEach(function (k) {
@@ -499,6 +579,14 @@
    * in flight (sent to the worker, not answered), acknowledged; in the order
    * they were made (web/ocean_handoff.js ledger, which the tests run) */
   var live = HO ? HO.ledger() : null;
+  /* A live setting's value typed for the next world only (below 0: a
+   * running world can't take it) is no ledger entry, and may be newer than
+   * an edit of the key still on its way: that edit's answer (acknowledged or
+   * refused) changes the running world's bookkeeping, never this field, and
+   * the value counts as waiting meanwhile. Kept as typed; it holds while the
+   * field still shows it (a newer edit, Discard or a start ends it). */
+  var nextOnly = {};
+  function nextOnlyNow(key) { return Object.prototype.hasOwnProperty.call(nextOnly, key) && !!el("o_" + key) && rawOf(key) === nextOnly[key]; }
   function numOf(key, v) { return typeof v === "boolean" ? (v ? 1 : 0) : v; }
   function valOf(key, num) { return typeof KEYS[key][0] === "boolean" ? num === 1 : num; }
   function shown(v) { return typeof v === "boolean" ? (v ? "on" : "off") : String(v); }
@@ -517,14 +605,16 @@
   }
   /* push one live knob into the running world (or the Turbo worker's) */
   function applyLive(key) {
-    if (!M) return;
+    if (!M || draft) return;   /* a staged scenario's or file's settings are the next world's, live ones too */
+    delete nextOnly[key];
     var num = numOf(key, getVal(key));
     if (wholeKey(key) && !Number.isInteger(num)) { refuse(key, "it must be a whole number"); return; }   /* 300.5: never run as 301 */
     if (num < 0) {
       if (CFG.NEG_ON_RESTART[key]) {
-        fieldNote(key, "Applies on Restart: a running world takes only 0 or more.");
-        setPending(true);
-        showNote((LABELS[key] || key) + " " + num + " applies on Restart (a running world takes only 0 or more).");
+        nextOnly[key] = rawOf(key);
+        fieldNote(key, "Applies at the next start: a running world takes only 0 or more.");
+        renderStartBar();
+        showNote((LABELS[key] || key) + " " + num + " waits for the next start (a running world takes only 0 or more).");
       } else refuse(key, "it must be 0 or more");
       return;
     }
@@ -560,11 +650,15 @@
    * have set it back), unless the visitor is in it. */
   function liveApplied(key, v, quiet, seq) {
     if (v === KEYS[key][0]) delete runCfg[key]; else runCfg[key] = v;
-    if (key === "lightEnabled" || key === "L0" || key === "kWater") readLight();
-    var input = el("o_" + key);
-    if (input && document.activeElement !== input && !(live && live.pending(key, seq)) && getVal(key) !== v) {
+    /* the light the picture is drawn in: this module's, or while Turbo owns
+     * the world, what the worker acknowledged (this page's copy is the world
+     * as Turbo took it; the hand-back reads the module again) */
+    if (key === "lightEnabled" || key === "L0" || key === "kWater") { if (turboState === "live") readLight(); else lightFromCfg(); }
+    var input = el("o_" + key);   /* (a staged recipe's field, or a newer value for the next world only: left alone) */
+    if (input && !draft && !nextOnlyNow(key) && document.activeElement !== input && !(live && live.pending(key, seq)) && getVal(key) !== v) {
       setVal(key, v); updateNeeds(); updateTabDots();
     }
+    renderStartBar();
     if (!quiet) showNote((LABELS[key] || key) + " is now " + shown(v) + " (live)");
   }
   /* a refused live value: the field goes back to the newest edit of it still
@@ -572,15 +666,19 @@
    * the worker), else to what the world runs with (keep: a newer edit of it
    * follows, so the field stays) */
   function refuse(key, why, keep) {
-    var back = null, p = null;
+    var back = null, p = null, next = nextOnlyNow(key);
     if (!keep) {
       p = live ? live.latest(key) : null;
       back = p ? valOf(key, p.num) : cfgVal(key);
-      setVal(key, back);
-      fieldNote(key, p && p.from === "held" ? heldNote() : "");
-      updateNeeds(); updateTabDots();
+      if (!draft && !next) {   /* a staged recipe's field, or a newer value for the next world: left alone */
+        setVal(key, back);
+        fieldNote(key, p && p.from === "held" ? heldNote() : "");
+        updateNeeds(); updateTabDots();
+      }
+      renderStartBar();
     }
-    showError((LABELS[key] || key) + ": " + why + (keep ? "" : " (back to " + shown(back) + (p ? ", on its way" : "") + ")"));
+    showError((LABELS[key] || key) + ": " + why + (keep ? "" : draft || next ? " (the running world keeps " + shown(back) + ")" :
+              " (back to " + shown(back) + (p ? ", on its way" : "") + ")"));
   }
   /* Edits in the order they were made (ledger entries): to the worker while
    * Turbo owns the world, else to this one. A refused edit keeps its field
@@ -590,7 +688,7 @@
   function replayEdits(list, quiet) {
     var out = { applied: [], refused: [] };
     list.forEach(function (e, i) {
-      fieldNote(e.key, "");
+      if (!nextOnlyNow(e.key)) fieldNote(e.key, "");   /* (a newer value for the next world keeps its note) */
       var later = list.some(function (f, j) { return j > i && f.key === e.key; });
       var r = sendLive(e.key, e.num, quiet, later, e.seq);
       if (r === true) out.applied.push(e);
@@ -619,7 +717,6 @@
       panel.dataset.tab = tab.id;
       panel.setAttribute("role", "tabpanel");
       if (tab.id === "ocean") panel.appendChild(presetBox());
-      if (tab.id === "world") panel.appendChild(bigTankBox());
       tab.groups.forEach(function (g) {
         var h = document.createElement("h3");
         h.textContent = g[0];
@@ -632,48 +729,67 @@
     var saved = store("evo_boids.ocean.tab");
     setSheetTab(saved && el("panel-" + saved) ? saved : "run");
   }
-  /* the Water (E1) tab's "Tuned E1 preset": its keys into the sheet */
+  /* the Water (E1) tab: the tuned E1 water added to what the tabs hold (the
+   * next world; the rest kept). The whole Living water world is a scenario
+   * in Run › Start from. */
   function presetBox() {
     var box = document.createElement("div");
     box.className = "preset";
-    box.innerHTML = "<button type='button' class='btn' id='e1btn'><svg class='i'><use href='#i-restart'/></svg>Use the tuned E1 preset</button>" +
-      "<p>The E1 physics as tuned: surface waves, a gentle deep current with food drifting in it, light that fades with depth, and depth costs scaled to each fish's metabolism. Puts its settings in the tabs; Restart applies them.</p>";
-    box.querySelector("#e1btn").addEventListener("click", function () {
+    box.innerHTML = "<button type='button' class='btn' id='e1add'><svg class='i'><use href='#i-plus'/></svg>Add the tuned E1 water</button>" +
+      "<p>Surface waves, a gentle deep current with food drifting in it, light that fades with depth, and depth costs scaled to each fish's " +
+      "metabolism, put into these tabs on top of the rest (predators, food, ... stay). They wait for the next start. The whole " +
+      "<b>Living water</b> world is in Run › Start from.</p>";
+    box.querySelector("#e1add").addEventListener("click", function () {
       var p = e1Preset();
       if (!p) { showError("this module has no E1 preset (oc_e1_preset)"); return; }
       cfgToForm(p);
-      updateNeeds(); updateTabDots(); setPending(true);
-      showNote("The E1 preset is in the settings. Restart to apply.");
+      updateNeeds(); updateTabDots(); renderStartBar();
+      showNote("The E1 water is in the tabs: it waits for the next start.");
       this.blur();
     });
     return box;
   }
-  /* the World tab's "Big tank": a whole recipe for a tank four times the
-   * standard volume (EvoOceanConfig.BIG_TANK: 3840 x 2160 x 240, 2000 fish,
-   * glass walls, four times the food, a 2000-fish cap), started at once.
-   * Editing the size by hand changes only the size; this (and Randomize)
-   * are the actions that rebalance the whole world. */
-  function bigTankBox() {
-    var b = CFG.BIG_TANK, box = document.createElement("div");
-    box.className = "preset";
-    box.innerHTML = "<button type='button' class='btn' id='bigbtn'><svg class='i'><use href='#i-restart'/></svg>Start the Big tank</button>" +
-      "<p>A glass tank four times the standard volume (" + b.width + " × " + b.height + " × " + b.depth + "), with " + b.population +
-      " fish, four times the food and the tuned water (waves, a gentle deep current, light, depth costs). Births stop at " +
-      b.cfg.maxPopulation + " fish. It starts a new world at once (this seed).</p>";
-    box.querySelector("#bigbtn").addEventListener("click", function () { startBigTank(); this.blur(); });
-    return box;
+
+  /* ---- Start from: scenarios (EvoOceanConfig.SCENARIOS) and a file ----
+   * A card stages its whole recipe as the next world (stageDraft): the tabs
+   * show it, and it starts only when its Start (or the start bar's) is
+   * pressed: two presses in one place. Surprise me draws again with Reroll.
+   * Picking one over edits that wait asks first (Replace / Keep editing). */
+  var CARD_IDS = { standard: "advreset", bigtank: "bigbtn", e1: "e1btn", hunters: "huntersbtn", currents: "currentsbtn", surprise: "randombig", file: "loadcp" };
+  function newSeed() { return (Math.random() * 0x100000000) >>> 0; }
+  /* the seed the sheet shows (a scenario keeps it; Surprise me draws its own) */
+  function shownSeed() { var s = formNum("seed"); return wholeIn(s, [0, 4294967295]) ? s : initArgs ? initArgs.seed : KEYS.seed[0]; }
+  function scenarioOf(id) {
+    var t = { width: formNum("width"), height: formNum("height"), depth: formNum("depth"), walls: !!getVal("walls"),
+              sideWallBand: getVal("sideWallBand"), sideWallTurnRate: getVal("sideWallTurnRate") };
+    if (!(t.width > 0) || !(t.height > 0) || !(t.depth > 0)) { t.width = W; t.height = H; t.depth = D; }
+    return CFG.scenario(id, { seed: id === "surprise" ? newSeed() : shownSeed(), screen: screenWorld(), walls: hasWalls(), e1: e1Preset(),
+                              rand: Math.random, tank: t });
   }
-  function startBigTank() {
-    if (!M || guardTurbo()) return;
-    if (!hasWalls()) { showError("The Big tank needs glass walls: this engine module has none (rebuild web/evo_ocean)."); return; }
-    var b = CFG.BIG_TANK, seed = getVal("seed");
-    resetForm();
-    setVal("seed", seed);
-    setVal("width", b.width); setVal("height", b.height); setVal("depth", b.depth); setVal("population", b.population);
-    cfgToForm(b.cfg);
-    updateNeeds(); updateTabDots();
-    if (restart()) toast("The Big tank: " + b.width + " × " + b.height + " × " + b.depth + ", " + b.population + " fish, glass walls.");
+  /* what a new draft would replace: edits waiting, or a staged recipe's own edits */
+  function atRisk() { return pendingDiff().length; }
+  function pickScenario(id) {
+    if (!M) return;
+    if (id === "bigtank" && !hasWalls()) { showError("The Big tank needs glass walls: this engine module has none (rebuild web/evo_ocean)."); return; }
+    if (id === "e1" && !e1Preset()) { showError("this module has no E1 preset (oc_e1_preset)"); return; }
+    var n = atRisk(), title = (CFG.SCENARIOS.filter(function (s) { return s.id === id; })[0] || {}).title;
+    if (draft && draft.id === id && id !== "surprise") { showNote(title + " is ready: its Start (or the start bar's) starts it."); return; }
+    if (n) { askReplace(title, n, function () { stageScenario(id); }); return; }
+    stageScenario(id);
   }
+  function stageScenario(id) {
+    var r = scenarioOf(id);
+    if (!r) { showError("That scenario is not available here."); return; }
+    stageDraft({ kind: "scenario", id: id, title: r.title, summary: r.summary, seed: r.seed }, function () {
+      setVal("seed", r.seed); setVal("population", r.population); setVal("depth", r.depth); setVal("width", r.width); setVal("height", r.height);
+      cfgToForm(r.cfg);
+    });
+    el("randnote").textContent = id === "surprise" ? "Picked: " + r.summary + ". Reroll draws again; every setting is in the tabs." : "";
+    clearError();
+    showNote(r.title + " is ready: Start starts it" + (turboState !== "live" ? " (and stops Turbo)." : "."));
+  }
+  /* a staged card's Start: the start bar's own dispatcher */
+  function startStaged() { restart(); }
   function setSheetTab(id) {
     currentTab = id;
     CFG.TABS.forEach(function (tab) {
@@ -711,52 +827,64 @@
     });
   }
   /* Settings that do nothing with the others as they are: dimmed, with the
-   * reason under their name. Each rule: [keys, () => "" (fine) or the reason]. */
-  function hasCurrent() { return getVal("currentStrength") > 0; }
-  function hasPredators() { return getVal("predatorCount") > 0; }
+   * reason under their name. Each rule: [keys, () => "" (fine) or the reason],
+   * reading the settings through nv: the sheet's (the next world), or the
+   * running world's. A live setting with nothing staged acts on the running
+   * world now and on the next one later, so it dims only when it does
+   * nothing in either (predators 0 typed for the next world leaves the
+   * three hunting now tunable). */
+  var nvRunning = false;
+  function nv(k) { return nvRunning ? runningVal(k) : getVal(k); }
+  function hasCurrent() { return nv("currentStrength") > 0; }
+  function hasPredators() { return nv("predatorCount") > 0; }
   var NEEDS = [
     [["walls"], function () { return M && !hasWalls() ? "needs a newer engine module (this one has no glass walls)" : ""; }],
-    [["sideWallBand", "sideWallTurnRate"], function () { return getVal("walls") ? "" : "needs glass walls on"; }],
-    [["toroidal"], function () { return getVal("walls") ? "off with glass walls: a walled tank has no seam to sense across" : ""; }],
-    [["foodPatchRadius", "foodDepthMode"], function () { return getVal("foodPatches") > 0 ? "" : "needs food patches above 0"; }],
-    [["foodDepthSpread"], function () { return getVal("foodPatches") > 0 && getVal("foodDepthMode") === 1 ? "" : "needs food patches, each at its own depth"; }],
+    [["sideWallBand", "sideWallTurnRate"], function () { return nv("walls") ? "" : "needs glass walls on"; }],
+    [["toroidal"], function () { return nv("walls") ? "off with glass walls: a walled tank has no seam to sense across" : ""; }],
+    [["foodPatchRadius", "foodDepthMode"], function () { return nv("foodPatches") > 0 ? "" : "needs food patches above 0"; }],
+    [["foodDepthSpread"], function () { return nv("foodPatches") > 0 && nv("foodDepthMode") === 1 ? "" : "needs food patches, each at its own depth"; }],
     [["foodDrift", "currentMode", "currentDrift", "deepCurrent"], function () { return hasCurrent() ? "" : "needs a current (strength above 0)"; }],
-    [["currentEddies", "currentCore"], function () { return hasCurrent() && getVal("currentMode") === 0 ? "" : "needs a current in the eddies shape"; }],
+    [["currentEddies", "currentCore"], function () { return hasCurrent() && nv("currentMode") === 0 ? "" : "needs a current in the eddies shape"; }],
     [["predatorEconomy", "predatorSpeed", "predatorPerception", "predatorCaptureRadius", "predatorCooldown"],
       function () { return hasPredators() ? "" : "needs predators above 0"; }],
     [["predatorMeal", "predatorMetabolism", "predatorReproEnergy", "predatorMaxAge", "predatorMinPopulation",
       "predatorMaxPopulation", "predatorInheritance"],
-      function () { return hasPredators() && getVal("predatorEconomy") ? "" : "needs predators, with their economy on"; }],
+      function () { return hasPredators() && nv("predatorEconomy") ? "" : "needs predators, with their economy on"; }],
     [["predatorTraitMutation"], function () {
-      return hasPredators() && getVal("predatorEconomy") && getVal("predatorInheritance") ? "" : "needs hunters inherit traits on"; }],
-    [["maxTurnRate"], function () { return getVal("triangularMotion") ? "" : "needs fast-swims-straight on"; }],
-    [["steerFrame"], function () { return getVal("triangularMotion") ? "no effect with fast-swims-straight on: it turns by steer x already" : ""; }],
-    [["reproSoftWidth", "reproGracePeriod"], function () { return getVal("reproMaxDistance") >= 0 ? "" : "needs a breeding distance limit of 0 or more"; }],
-    [["bodyMutation", "sizeFight"], function () { return getVal("bodyModel") ? "" : "needs evolving bodies on (without them every fish is size 1)"; }],
+      return hasPredators() && nv("predatorEconomy") && nv("predatorInheritance") ? "" : "needs hunters inherit traits on"; }],
+    [["maxTurnRate"], function () { return nv("triangularMotion") ? "" : "needs fast-swims-straight on"; }],
+    [["steerFrame"], function () { return nv("triangularMotion") ? "no effect with fast-swims-straight on: it turns by steer x already" : ""; }],
+    [["reproSoftWidth", "reproGracePeriod"], function () { return nv("reproMaxDistance") >= 0 ? "" : "needs a breeding distance limit of 0 or more"; }],
+    [["bodyMutation", "sizeFight"], function () { return nv("bodyModel") ? "" : "needs evolving bodies on (without them every fish is size 1)"; }],
     [["sizeDrift"], function () {
-      if (!getVal("bodyModel")) return "needs evolving bodies on (without them every fish is size 1)";
-      return hasCurrent() || getVal("waveSpeed") > 0 ? "" : "needs a current or waves to drift in";
+      if (!nv("bodyModel")) return "needs evolving bodies on (without them every fish is size 1)";
+      return hasCurrent() || nv("waveSpeed") > 0 ? "" : "needs a current or waves to drift in";
     }],
-    [["kMouth"], function () { return getVal("mouthGate") ? "" : "needs the mouth gate on"; }],
-    [["waveBand", "waveGravity"], function () { return getVal("waveSpeed") > 0 ? "" : "needs waves (strength above 0)"; }],
-    [["L0", "kWater"], function () { return getVal("lightEnabled") ? "" : "needs the light field on"; }],
-    [["depthCostScaled"], function () { return getVal("cHold") > 0 || getVal("cPress") > 0 ? "" : "needs a depth cost above 0"; }],
+    [["kMouth"], function () { return nv("mouthGate") ? "" : "needs the mouth gate on"; }],
+    [["waveBand", "waveGravity"], function () { return nv("waveSpeed") > 0 ? "" : "needs waves (strength above 0)"; }],
+    [["L0", "kWater"], function () { return nv("lightEnabled") ? "" : "needs the light field on"; }],
+    [["depthCostScaled"], function () { return nv("cHold") > 0 || nv("cPress") > 0 ? "" : "needs a depth cost above 0"; }],
     [["eye", "eyeOnly"], function () { return HAS_EYE ? "" : "needs the eye build of the module; this page runs the plain Ocean build"; }],
     [["eyeCode"], function () {
       if (!HAS_EYE) return "needs the eye build of the module; this page runs the plain Ocean build";
-      return getVal("eye") ? "" : "needs the compound eye on";
+      return nv("eye") ? "" : "needs the compound eye on";
     }]
   ];
   function updateNeeds() {
     NEEDS.forEach(function (rule) {
-      var why = rule[1]();
+      var why = rule[1](), whyNow = "";
+      if (why && !draft && initArgs && rule[0].some(function (k) { return LIVE[k]; })) {
+        nvRunning = true;
+        try { whyNow = rule[1](); } finally { nvRunning = false; }
+      }
       rule[0].forEach(function (k) {
         var row = el("f_" + k);
         if (!row) return;
         var hint = row.querySelector(".needs");
         if (!hint) { hint = document.createElement("span"); hint.className = "needs"; row.appendChild(hint); }
-        row.classList.toggle("inert", !!why);
-        hint.textContent = why;
+        var inert = !!why && !(LIVE[k] && !draft && initArgs && !whyNow);
+        row.classList.toggle("inert", inert);
+        hint.textContent = inert ? why : why ? why.replace(/^needs/, "the next world needs") + "; it still acts on this one" : "";
       });
     });
     /* glass walls and wrap-around senses exclude each other (the engine
@@ -765,79 +893,374 @@
     if (tor) tor.disabled = !!getVal("walls");
     if (wl) wl.disabled = !!M && !hasWalls();
   }
-  function setPending(on) {
-    var b = el("restart");
-    b.classList.toggle("pending", on);
-    b.querySelector("span").textContent = on ? "Restart to apply" : "Restart";
+  /* ---- the draft: the next world (UI-3) ----
+   * The sheet is the next world's setup. With nothing staged (draft null)
+   * it is this world plus the edits waiting for the next start: live
+   * settings apply at once (they are this world's too), the others wait. A
+   * staged scenario or setup file (draft {kind, id, title, summary, base,
+   * plan}) fills the whole sheet with its recipe: every edit of it, a live
+   * setting's too, is the next world's, and nothing reaches the running one
+   * (the "live" tags hide). What waits is derived from values, never
+   * remembered (pendingDiff): a field changed back waits no more. Discard
+   * drops what waits, never an accepted live tweak; a start consumes it;
+   * Replay keeps it (and drops the live tweaks). draftGen moves with every
+   * stage, discard and start: a file read from before is stale. */
+  var draft = null, draftGen = 0;
+  /* a field as typed: on / off, 0 / 1, an option's index, or a number (NaN: none) */
+  function formNum(k) {
+    var def = KEYS[k][0], opt = KEYS[k][1] || {}, input = el("o_" + k);
+    if (typeof def === "boolean") return input.checked;
+    if (opt.bit) return input.checked ? 1 : 0;
+    if (opt.options) return parseInt(input.value, 10);
+    var s = String(input.value).trim();
+    return s === "" ? NaN : Number(s);
   }
+  /* what the running world has for a field (the accepted live changes in it) */
+  function runningVal(k) {
+    if (k === "seed") return initArgs ? initArgs.seed : KEYS.seed[0];
+    if (k === "population") return initArgs ? initArgs.population : KEYS.population[0];
+    if (k === "depth") return initArgs ? initArgs.depth : KEYS.depth[0];
+    if (k === "width") return W;
+    if (k === "height") return H;
+    var v = cfgVal(k), def = KEYS[k][0], opt = KEYS[k][1] || {};
+    if (typeof def === "boolean") return v === true || v === 1;
+    if (opt.bit) return v === true || v === 1 ? 1 : 0;
+    return v;
+  }
+  /* NaN (an empty or unreadable field) differs from every number, not from
+   * itself: a file's value the sheet can't show (an option 1e400) is not an edit */
+  function differs(k, a, b) { return typeof KEYS[k][0] === "boolean" ? !!a !== !!b : !(a === b || (a !== a && b !== b)); }
+  function snapForm() { var o = {}; Object.keys(KEYS).forEach(function (k) { if (el("o_" + k)) o[k] = formNum(k); }); return o; }
+  /* the fields whose next value is not what runs now (nothing staged; an
+   * edit on its way to the world has its own note), or not the staged
+   * recipe's (a draft: "modified") */
+  function pendingDiff() {
+    var out = [];
+    Object.keys(KEYS).forEach(function (k) {
+      if (!el("o_" + k)) return;
+      var a = formNum(k);
+      if (draft) { if (differs(k, a, draft.base[k])) out.push(k); return; }
+      if (LIVE[k] && live && live.pending(k) && !nextOnlyNow(k)) return;   /* (on its way: its own note; a newer next-world value waits) */
+      if (differs(k, a, runningVal(k))) out.push(k);
+    });
+    return out;
+  }
+  function waitingNow() { return !!draft || pendingDiff().length > 0; }
+  /* a field's raw content (Replay keeps what was typed, even a half-typed number) */
+  function rawOf(k) { var i = el("o_" + k); return i.type === "checkbox" ? i.checked : i.value; }
+  function setRaw(k, v) { var i = el("o_" + k); if (i.type === "checkbox") i.checked = !!v; else i.value = v; }
+  function escHtml(s) { return String(s).replace(/[&<>"]/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]; }); }
+  function fieldText(k) {
+    var v = formNum(k), opt = KEYS[k][1] || {};
+    var shownV = typeof v === "boolean" ? (v ? "on" : "off") : opt.bit ? (v ? "on" : "off") : opt.options ? opt.options[v] : v === v ? String(v) : el("o_" + k).value || "(empty)";
+    return (LABELS[k] || k) + " " + shownV;
+  }
+  function runSummary() {
+    if (!initArgs) return "";
+    var tw = liveTweaks().length;
+    return "seed " + initArgs.seed + " · " + W + " × " + H + " × " + D + " · " + initArgs.population + " fish · " +
+           (WALLS ? "glass walls" : "wrapping sides") + (tw ? " · " + tw + " live tweak" + (tw > 1 ? "s" : "") : "");
+  }
+  /* the start bar (and the readout's count): what runs, or what the next start is */
+  function renderStartBar() {
+    var diff = pendingDiff(), n = diff.length, turbo = turboState !== "live";
+    var b = el("restart");
+    b.querySelector("span").textContent = pendingStart ? "Stopping Turbo…" : turbo ? "Stop Turbo & start" :
+      draft ? "Start " + draft.title : n ? "Start with " + (n === 1 ? "the change" : "the " + n + " changes") : "Start again";
+    b.classList.toggle("pending", !!draft || n > 0 || turbo);
+    el("startdiscard").hidden = !(draft || n);
+    drawerEl.classList.toggle("staging", !!draft);
+    setHtml("startsummary", draft
+      ? "<b>Next world: " + escHtml(draft.title) + "</b> · " + escHtml(draft.summary) + (n ? " · modified (" + n + ")" : "") +
+        ". Starting it replaces this run."
+      : n ? "<b>Waiting for the next start:</b> " + diff.slice(0, 3).map(function (k) { return escHtml(fieldText(k)); }).join(" · ") +
+            (n > 3 ? " · and " + (n - 3) + " more" : "")
+      : "<b>Running</b> · " + escHtml(runSummary()));
+    el("startsummary").title = el("startsummary").textContent;   /* (a short screen shows two lines of it) */
+    var wc = el("waitingcount"), count = draft ? 1 + n : n;
+    wc.hidden = !count;
+    setHtml("waitingcount", count + "<span class='wc-word'> waiting</span>");
+    wc.title = draft ? draft.title + " is ready for the next start (Setup)" : count + " edit" + (count > 1 ? "s" : "") + " waiting for the next start (Setup)";
+    setTxt("startsame-sub", "seed " + shownSeed() + (draft ? ", " + draft.title : n ? ", with what waits" : ""));
+    markCards();
+  }
+  /* the picked card wears its Start (and Surprise me its Reroll): the same start as the bar's */
+  var cardShown = null;   /* the card last brought into view (a new pick scrolls to it, a Reroll doesn't) */
+  function markCards() {
+    var pickedId = draft ? (draft.kind === "file" ? "file" : draft.id) : null, acts = el("scenario-acts");
+    Object.keys(CARD_IDS).forEach(function (id) {
+      var b = el(CARD_IDS[id]), on = id === pickedId;
+      b.setAttribute("aria-pressed", on ? "true" : "false");
+      if (b.parentNode && b.parentNode.classList) b.parentNode.classList.toggle("picked", on);
+      if (on && b.parentNode && acts.parentNode !== b.parentNode) b.parentNode.appendChild(acts);
+    });
+    acts.hidden = !pickedId;
+    el("rerollbtn").hidden = pickedId !== "surprise";
+    var lab = el("scenario-start").querySelector("span");
+    if (lab) lab.textContent = turboState !== "live" ? "Stop & start" : "Start";
+    el("scenario-start").title = turboState !== "live" ? "Stops Turbo, then starts this world (asked first)" : "Starts this world";
+    /* a phone's strip scrolls sideways: the picked card comes into view with
+     * its Start, at a place the strip snaps to (its start), so it stays there */
+    var card = pickedId ? el(CARD_IDS[pickedId]).parentNode : null;
+    if (!card) cardShown = null;
+    else if (pickedId !== cardShown && drawerEl.classList.contains("open") && card.scrollIntoView) {   /* (a closed sheet: nothing to scroll) */
+      cardShown = pickedId;
+      try { card.scrollIntoView({ block: "nearest", inline: "start" }); } catch (e) { /* old */ }
+    }
+  }
+  /* the sheet back to the running world: its seed and size, its settings
+   * with the live tweaks it accepted; an edit still on its way keeps its
+   * field (and note) */
+  function projectRunning() {
+    resetForm();
+    if (initArgs) { setVal("seed", initArgs.seed); setVal("population", initArgs.population); setVal("depth", initArgs.depth); }
+    setVal("width", W); setVal("height", H);
+    cfgToForm(runCfg);
+    if (live) Object.keys(LIVE).forEach(function (k) {
+      var p = live.latest(k);
+      if (p) { setVal(k, valOf(k, p.num)); if (p.from === "held") fieldNote(k, heldNote()); }
+    });
+    updateNeeds(); updateTabDots();
+  }
+  /* a scenario or a setup file into the sheet, as the next world (fill:
+   * puts its recipe in the fields; the edits waiting before are replaced) */
+  function stageDraft(d, fill) {
+    d.hadEdits = pendingDiff().length > 0 || !!(draft && draft.hadEdits);   /* (it replaces edits that waited: Start asks) */
+    draft = null;
+    resetForm();
+    fill();
+    updateNeeds(); updateTabDots();
+    d.base = snapForm();
+    draft = d; d.gen = ++draftGen;
+    hideAsk();
+    renderStartBar();
+  }
+  function discardDraft() {
+    var had = waitingNow();
+    draft = null; draftGen++;
+    projectRunning();
+    hideAsk();
+    renderStartBar();
+    showNote(had ? "Discarded what was waiting. Live tweaks stay: they already apply." : "Nothing was waiting.");
+  }
+  function setPending() { renderStartBar(); }
+  function paintStart() { renderStartBar(); }
   function onEdit(e) {
     var t = e.target;
+    if (asking) { hideAsk(); showNote("The setup changed: start again to review it."); }   /* never a start other than the one asked about */
     if (t && t.id === "o_walls" && t.checked) setVal("toroidal", false);   /* walls need toroidal off */
     updateNeeds();
     updateTabDots();
-    if (!t || !t.id || t.id.indexOf("o_") !== 0 || LIVE[t.id.slice(2)]) return;   /* live ones apply by themselves */
-    setPending(true);
+    renderStartBar();
   }
 
-  /* ---- restart, new world, replay, randomize, setups ---- */
+  /* ---- the visitor's starts: requestStart, its inline question ----
+   * Ask first when the run has something to lose (the approved rule): five
+   * simulated minutes or more, Turbo used (or running), live tweaks
+   * accepted since it started, or edits waiting for the next start
+   * (editsWaiting). During Turbo the start waits for the
+   * ordinary hand-back (pendingStart): the progressed world comes back and
+   * every edit on its way is settled, then the plan is built again and must
+   * be the one that was asked about (a refused edit or a change made
+   * meanwhile cancels it: the run carries on, and says so); then the old
+   * worker goes and startWorld runs, in the hand-back's message, never in a
+   * frame. A world the engine refuses then leaves the run going (Live).
+   * Stop (or the question's Cancel) meanwhile cancels the start, not the
+   * hand-back. A worker that fails meanwhile cancels it too. */
+  var pendingStart = null;   /* {plan, key}: waiting for Turbo's hand-back */
+  var asking = null;         /* {plan, key}: the inline question is showing */
   function guardTurbo() {
     if (turboState === "live") return false;
     showNote("Stop Turbo first.");
     return true;
   }
-  function restart() {
-    if (!M || guardTurbo()) return false;
+  /* The plan asked about, and the sheet it came from: an asked or queued
+   * start is that one only while both stay the same. A staged file's plan
+   * is its own recipe and does not read the sheet, so the sheet itself is
+   * in the key: an edit, Discard, another card or file, Fit, the E1 water
+   * made meanwhile is a change (the run carries on, and says so; the draft
+   * stays). Replay keeps what waits, so only its world counts. */
+  function sheetKey() {
+    return JSON.stringify([draft ? draft.gen : 0, Object.keys(KEYS).map(function (k) { return el("o_" + k) ? rawOf(k) : null; }), extraCfg]);
+  }
+  function planKey(plan) { return plan.op === "replay" ? "replay " + (initArgs ? initArgs.seed : "") : JSON.stringify(plan.build()) + " " + sheetKey(); }
+  function runAge() {
+    var f = turboState !== "live" && turboStats ? turboStats.frame : (lastS ? (fresh(lastS).stats[1] || 0) : 0);
+    return f * DT;
+  }
+  /* the live settings changed since this world started (accepted ones) */
+  function liveTweaks() {
+    if (!initArgs) return [];
+    var seen = {}, out = [];
+    Object.keys(runCfg).concat(Object.keys(initArgs.cfg)).forEach(function (k) {
+      if (seen[k] || !LIVE[k]) return;
+      seen[k] = true;
+      var a = k in runCfg ? runCfg[k] : KEYS[k][0], b = k in initArgs.cfg ? initArgs.cfg[k] : KEYS[k][0];
+      if (a !== b) out.push(k);
+    });
+    return out;
+  }
+  /* Edits waiting for the next start (the approved rule's fourth reason to
+   * ask): a field changed (Fit and the E1 water too), a staged recipe
+   * modified, or a recipe staged over edits that waited (draft.hadEdits,
+   * remembered when it was staged: a card picked on an untouched sheet adds
+   * no question by itself) */
+  function editsWaiting() { return pendingDiff().length > 0 || !!(draft && draft.hadEdits); }
+  function loseReasons() {
+    var r = [], age = runAge(), tw = liveTweaks();
+    if (age >= 300) r.push(fmtTime(age) + " of evolution");
+    if (usedTurbo || turboState !== "live") r.push("Turbo's progress");
+    if (tw.length) r.push(tw.length === 1 ? "a live tweak (" + (LABELS[tw[0]] || tw[0]) + ")" : tw.length + " live tweaks");
+    if (editsWaiting()) r.push("edits waiting");
+    return r;
+  }
+  /* "started", "asked", "waiting" (for Turbo's hand-back) or "refused" */
+  function requestStart(plan, confirmed) {
+    if (!M) return "refused";
+    var why = plan.check ? plan.check() : "";
+    if (why) { showError("Couldn't start that world: " + why + "."); return "refused"; }
+    if (pendingStart) { showNote("A new world is already waiting for Turbo to stop."); return "waiting"; }
+    if (loseReasons().length && !confirmed) { askStart(plan); return "asked"; }
     clearError();
-    var f = readForm(), why = sizeProblem(f);
-    if (why) { showError("Couldn't start that world: " + why + "."); return false; }
-    if (!initWorld(f.seed, f.population, f.depth, f.cfg, undefined, undefined, [f.width, f.height])) {
-      showError("Couldn't start that world: " + lastError());
-      return false;
-    }
-    setPending(false);
-    el("randnote").textContent = "";
-    writeUrl();
+    if (turboState === "live") return commitStart(plan) ? "started" : "refused";
+    pendingStart = { plan: plan, key: planKey(plan) };
+    if (turboState === "turbo") exitTurbo();   /* entering: its first stats stop it; exiting: on its way */
+    updateLocks();
+    showNote("Stopping Turbo, then starting the new world.");
+    return "waiting";
+  }
+  function commitStart(plan) {
+    var r = startWorld(plan);
+    if (!r.ok) { showError((plan.failed || "Couldn't start that world: ") + r.why); return false; }
+    if (plan.done) plan.done();
     return true;
   }
+  /* Turbo handed the world back with a start waiting: the same plan, or none */
+  function finishPendingStart(ps) {
+    if (planKey(ps.plan) !== ps.key) {
+      showError("The setup changed while Turbo stopped (an edit was refused, or the next world was edited, discarded or replaced meanwhile), " +
+                "so the new world did not start: your run carries on. Check it and start again.");
+      return false;
+    }
+    dropWorker();   /* a clean slate: the next Turbo gets a fresh worker */
+    ps.plan.failed = "Turbo stopped and your run carries on, but that world was refused: ";
+    return commitStart(ps.plan);
+  }
+  function cancelPendingStart(why) {
+    if (!pendingStart) return;
+    pendingStart = null;
+    if (why) showNote(why);
+    updateLocks();
+  }
+  /* a setting's value as the sheet says it (on / off, an option's name, a number) */
+  function n01(v) { return v === true ? 1 : v === false ? 0 : v; }
+  function valText(k, v) {
+    var opt = KEYS[k][1] || {};
+    if (typeof KEYS[k][0] === "boolean" || opt.bit) return n01(v) ? "on" : "off";
+    return opt.options && opt.options[v] !== undefined ? opt.options[v] : String(v);
+  }
+  /* the inline question, in the start bar (the setup sheet opens for it).
+   * What it says of the live tweaks is read from the world this start
+   * makes (the plan's recipe): a tweak the new world has too carries over;
+   * one a scenario or a file (or a value typed for the next world) sets
+   * otherwise is said so, with what it sets; Replay drops them all. */
+  function askStart(plan) {
+    asking = { plan: plan, key: planKey(plan) };
+    var turbo = turboState !== "live", replaying = plan.op === "replay", age = runAge(), lose = [], tw = liveTweaks();
+    if (age >= 300) lose.push(fmtTime(age) + " of evolution");
+    if (usedTurbo || turbo) lose.push("what Turbo ran");
+    var b = replaying ? null : plan.build(), kept = [], other = [];
+    tw.forEach(function (k) {
+      if (replaying) return;
+      var next = Object.prototype.hasOwnProperty.call(b.cfg, k) ? b.cfg[k] : KEYS[k][0];
+      (n01(next) === n01(cfgVal(k)) ? kept : other).push([k, next]);
+    });
+    var mine = function (l) { return l.map(function (k) { return (LABELS[k] || k) + " " + valText(k, cfgVal(k)); }).join(", "); };
+    var keys = function (l) { return l.map(function (e) { return e[0]; }); }, s = function (n) { return n === 1 ? "" : "s"; };
+    var who = draft ? draft.title.charAt(0).toUpperCase() + draft.title.slice(1) : "The new world's setup";
+    /* what waits, which this start applies (Replay: keeps) */
+    var diff = pendingDiff(), list = diff.slice(0, 3).map(fieldText).join(", ") + (diff.length > 3 ? " and " + (diff.length - 3) + " more" : "");
+    var edits = replaying || !editsWaiting() ? "" : draft ? " It starts " + draft.title + (diff.length ? " as you changed it (" + list + ")" : "") + "." :
+                " It starts with what waits: " + list + ".";
+    showAsk((replaying ? "Replay starts this world again from its seed" : turbo ? "This stops Turbo and replaces your run" : "This replaces your run") +
+      (lose.length ? ", and " + lose.join(" and ") + " with it" : "") + "." + edits +
+      (replaying && tw.length ? " Your live tweak" + s(tw.length) + " (" + mine(tw) + ") " + (tw.length === 1 ? "is" : "are") + " dropped." : "") +
+      (kept.length ? " Your live tweak" + s(kept.length) + " (" + mine(keys(kept)) + ") " + (kept.length === 1 ? "carries" : "carry") + " over to the new world." : "") +
+      (other.length ? " " + who + " sets " + other.map(function (e) { return (LABELS[e[0]] || e[0]) + " " + valText(e[0], e[1]); }).join(", ") +
+                      " instead of your live tweak" + s(other.length) + " (" + mine(keys(other)) + ")." : "") +
+      (replaying && waitingNow() ? " What waits for the next start stays waiting." : ""),
+      replaying ? "Replay" : turbo ? "Stop Turbo & start" : "Replace it", "Keep it");
+  }
+  /* a scenario or a file over edits that wait: asked in the same place */
+  function askReplace(title, n, fn) {
+    asking = { replace: fn };
+    showAsk(title + " replaces " + (n === 1 ? "the change" : "the " + n + " changes") + " waiting for the next start.", "Replace", "Keep editing");
+  }
+  function showAsk(msg, yes, no) {
+    if (errEl.className !== "error") clearError();   /* a note under the question would only repeat it */
+    el("startaskmsg").textContent = msg;
+    el("startconfirm").textContent = yes;
+    el("startcancel").textContent = no;
+    el("startask").hidden = false;
+    el("applybar").classList.add("asking");
+    setStartMenu(false);
+    if (!drawerEl.classList.contains("open")) setDrawer(true);
+  }
+  function hideAsk() {
+    asking = null;
+    el("startask").hidden = true;
+    el("applybar").classList.remove("asking");
+  }
+  function confirmAsk() {
+    var a = asking;
+    hideAsk();
+    if (!a) return;
+    if (a.replace) { a.replace(); return; }
+    if (planKey(a.plan) !== a.key) { showNote("The setup changed: start again to review it."); return; }
+    requestStart(a.plan, true);
+  }
+  function cancelAsk() {
+    var a = asking;
+    hideAsk();
+    showNote(a && a.replace ? "Kept your changes." : "Kept your run.");
+    if (a && a.opener) a.opener.focus();   /* a question the keyboard opened: the focus back where it was (askBtn) */
+  }
+  /* the start bar's menu: Start again (same fish), Start fresh (new fish) */
+  function setStartMenu(open) {
+    var m = el("startmenu");
+    if (!m) return;
+    m.hidden = !open;
+    el("startmenubtn").setAttribute("aria-expanded", open ? "true" : "false");
+  }
+  function startMenuOpen() { var m = el("startmenu"); return !!m && !m.hidden; }
+  /* a plan from the sheet: its seed (or a new one, drawn once per request),
+   * size and settings as typed, checked before anything stops */
+  function formPlan(source, seed) {
+    function f() { var x = readForm(); if (seed !== undefined) x.seed = seed; return x; }
+    return { source: source, op: "init", url: true,
+             check: function () { return sizeProblem(f()); },
+             build: function () { var x = f(); return { seed: x.seed, population: x.population, depth: x.depth, size: [x.width, x.height], cfg: x.cfg }; } };
+  }
+  function restart(done) {
+    var plan = startPlan(), d0 = plan.done, picked = !!draft && draft.id === "surprise";
+    plan.done = function () {
+      if (picked) el("randnote").textContent = el("randnote").textContent.replace(/ Reroll draws again;.*$/, " It runs now; every setting is in the tabs.");
+      else el("randnote").textContent = "";
+      if (d0) d0();
+      if (done) done();
+    };
+    return requestStart(plan);
+  }
   function newWorld() {
-    if (!M || guardTurbo()) return;
-    setVal("seed", (Math.random() * 0x100000000) >>> 0);
-    if (restart()) toast("A new world, seed " + getVal("seed") + ".");
+    var plan = startPlan((Math.random() * 0x100000000) >>> 0), d0 = plan.done;
+    plan.done = function () { el("randnote").textContent = ""; if (d0) d0(); toast("A new world, seed " + initArgs.seed + "."); };
+    requestStart(plan);
   }
   /* this world again from its start: oc_reset (the last init's seed and
    * config; live changes since are dropped), and the sheet back to them */
   function replay() {
-    if (!M || guardTurbo() || !initArgs) return;
-    if (!M._oc_reset()) { showError("oc_reset failed: " + lastError()); return; }
-    clearError();   /* e.g. a refused restart's message: the sheet goes back to this world */
-    resetForm();
-    setVal("seed", initArgs.seed); setVal("population", initArgs.population); setVal("depth", initArgs.depth);
-    setVal("width", initArgs.width); setVal("height", initArgs.height);
-    cfgToForm(initArgs.cfg);
-    runCfg = Object.assign({}, initArgs.cfg);
-    updateNeeds(); updateTabDots(); setPending(false);
-    afterNewWorld();
-    toast("Replaying seed " + initArgs.seed + " from its start.");
-  }
-  /* Randomize keeps the tank as it is set (its size, depth and sides) and
-   * draws a recipe for it: drawn for the standard tank, scaled once to this
-   * volume (EvoOceanConfig.draw); with glass walls it never wraps */
-  function randomize() {
-    if (!M || guardTurbo()) return;
-    var keep = { width: getVal("width"), height: getVal("height"), depth: getVal("depth"), walls: getVal("walls"),
-                 sideWallBand: getVal("sideWallBand"), sideWallTurnRate: getVal("sideWallTurnRate") };
-    var pick = CFG.draw(Math.random, KEYS.population[0], e1Preset(), [keep.width, keep.height, keep.depth, keep.walls]);
-    resetForm();
-    Object.keys(keep).forEach(function (k) { setVal(k, keep[k]); });
-    Object.keys(pick.set).forEach(function (k) { setVal(k, pick.set[k]); });
-    setVal("population", pick.population);
-    setVal("seed", (Math.random() * 0x100000000) >>> 0);
-    updateNeeds(); updateTabDots();
-    if (restart()) {
-      var what = pick.population + " fish" + (pick.labels.length ? " · " + pick.labels.join(" · ") : " · the default world");
-      el("randnote").textContent = "Picked: " + what + ". Every setting is in the tabs above.";
-      toast("New world: " + what);
-    }
+    if (!initArgs) return;
+    requestStart({ source: "replay", op: "replay", done: function () { clearError(); toast("Replaying seed " + initArgs.seed + " from its start."); } });
   }
   /* a Restart writes the setup into the address, so a reload or a shared
    * link is this world: its size too, on a screen of any shape */
@@ -860,8 +1283,9 @@
     } catch (e) { /* file:// or a sandboxed frame */ }
   }
   /* Save setup: the running world's — its seed, size and settings, with the
-   * live changes that applied since it started. Edits still waiting for a
-   * Restart are not in it (they are not the running world's), and it says so. */
+   * live changes that applied since it started (in Turbo: those the worker
+   * acknowledged). Edits still waiting for a start, or on their way to the
+   * world, are not in it (they are not the running world's), and it says so. */
   /* Version 2 (glass walls): `walls` is its own field, always written; a
    * version-1 file (before walls existed) loads as a wrapping world. */
   var SETUP_VERSION = 2;
@@ -876,17 +1300,17 @@
     a.href = url; a.download = "evo_ocean_setup_seed" + initArgs.seed + ".json";
     document.body.appendChild(a); a.click(); a.remove();
     URL.revokeObjectURL(url);
-    var waiting = el("restart").classList.contains("pending");
+    /* during Turbo too: runCfg is what the world accepted (the worker's acknowledgements) */
+    var onWay = Object.keys(live.held()).concat(live.inflight().map(function (e) { return e[0]; }));
     toast("Saved this world's setup (seed " + initArgs.seed + ")" +
-          (waiting ? ". Edits waiting for a Restart are not in it: Restart first to include them." : "."));
+          (waitingNow() ? ". What waits for the next start is not in it: start first to include it." : ".") +
+          (onWay.length ? " Not in it yet: " + onWay.map(function (k) { return LABELS[k] || k; }).join(", ") + ", still on the way to the world." : ""));
   }
   /* Load setup: that world from its start, at its size, exactly as saved
    * (importWorld: a value the engine refuses is reported, and nothing
    * changes). A setup without a size takes this screen's. */
-  function loadSetup(text) {
-    /* the read is asynchronous: who owns the world is asked again now (the
-     * file input's check, before the read, stays: it starts no read for nothing) */
-    if (!M || guardTurbo()) return;
+  function loadSetup(text, name) {
+    if (!M) return;
     var s, pf;
     try { pf = HO.parseFirst(text); s = pf.value; } catch (e) { showError("That file is not JSON: " + e.message); return; }
     /* a repeated key, as for ?cfg=: the first occurrence counts, every one is
@@ -926,14 +1350,72 @@
     var config = Object.assign({}, s.config);
     if (version !== 1) config.walls = walls;
     clearError();
-    var why = importWorld(seed, pop, depth, config, undefined, cfgRepeats, [w, h]);
-    if (why) {
-      showError("That setup was refused: " + why);
-      return;
+    /* staged, never started here (and never while Turbo runs: the next world
+     * waits in the sheet, the running one goes on); Start starts it, as it
+     * is (importPlan: oc_init sees the file's own values, repeats and keys
+     * the sheet has no field for), unless the sheet is edited first */
+    var plan = importPlan("file", seed, pop, depth, config, undefined, cfgRepeats, [w, h], true);
+    var title = "the setup file" + (name ? " " + name : "");
+    function stage() {
+      stageDraft({ kind: "file", id: "file", title: "the setup file", plan: plan, seed: seed >>> 0,
+                   summary: (name ? name + ": " : "") + "seed " + (seed >>> 0) + " · " + w + " × " + h + " × " + depth + " · " + pop + " fish" +
+                            (config.walls === true || config.walls === 1 ? " · glass walls" : config.walls === false || config.walls === 0 ? " · wrapping sides" : "") },
+        function () {
+          setVal("seed", seed >>> 0); setVal("population", pop); setVal("depth", depth); setVal("width", w); setVal("height", h);
+          cfgToForm(plan.imported);
+        });
+      el("randnote").textContent = "";
+      showNote("Ready: " + title + ". Start replaces this run with it, from its start.");
     }
-    el("randnote").textContent = "";
-    writeUrl();
-    showNote("Setup loaded: seed " + (seed >>> 0) + ", " + W + " × " + H + ", replaying from its start.");
+    var n = pendingDiff().length;
+    if (n) askReplace("The setup file", n, stage); else stage();
+  }
+  /* What Start starts: a staged file as it is (with a new seed for Start
+   * fresh) while its fields are untouched; edited, the file with the edited
+   * fields only (editedFile); else the sheet (seed: Start fresh's, drawn
+   * once per request). */
+  function startPlan(seed) {
+    var plan;
+    if (draft && draft.plan && !pendingDiff().length) {
+      var fp = draft.plan, s0 = seed === undefined ? draft.seed : seed;
+      plan = { source: fp.source, op: "init", url: true, imported: fp.imported,
+               build: function () { var b = fp.build(); b.seed = s0; return b; } };
+      plan.failed = "That setup was refused: ";
+      plan.done = function () { showNote("Setup loaded: seed " + initArgs.seed + ", " + W + " × " + H + ", replaying from its start."); };
+      return plan;
+    }
+    if (draft && draft.plan) {
+      plan = editedFile(draft.plan, seed === undefined ? null : seed, draft.seed);
+      plan.failed = "That setup was refused: ";
+      plan.done = function () { showNote("Setup loaded (edited): seed " + initArgs.seed + ", " + W + " × " + H + "."); };
+      return plan;
+    }
+    return formPlan(draft ? draft.kind : "start", seed);
+  }
+  /* A staged setup file with some fields edited: the file's own recipe
+   * (fp.build: its values as written, a repeated key's later occurrences,
+   * the keys the sheet has no field for) with only the edited fields
+   * (pendingDiff against the file as staged) replaced by the sheet's. An
+   * untouched value the sheet can't hold (2 for a switch, 1e400) or a later
+   * occurrence of an untouched key still reaches oc_init, which checks it,
+   * as it does when the file starts untouched; an edited key's value (and
+   * its later occurrences: replaced) is the sheet's, checked as the sheet's
+   * are (sizeProblem). seed: Start fresh's (null: the sheet's if edited,
+   * else the file's, fileSeed). */
+  function editedFile(fp, seed, fileSeed) {
+    function resolve() {
+      var b = fp.build(), on = {}, mine = {}, cfg = Object.assign({}, b.cfg);
+      pendingDiff().forEach(function (k) { on[k] = true; });
+      var arg = function (k, v) { return on[k] ? argVal(k) : v; };
+      Object.keys(on).forEach(function (k) { if (!ARGS[k]) mine[k] = cfg[k] = getVal(k); });
+      Object.keys(extraCfg).forEach(function (k) { if (!(k in cfg)) cfg[k] = extraCfg[k]; });   /* (a key the E1 water added without a field) */
+      return { seed: seed !== null ? seed : arg("seed", fileSeed), population: arg("population", b.population), depth: arg("depth", b.depth),
+               width: arg("width", b.size[0]), height: arg("height", b.size[1]), cfg: cfg, mine: mine,
+               repeats: (b.repeats || []).filter(function (r) { return !on[r.key]; }) };
+    }
+    return { source: fp.source, op: "init", url: true, imported: true,
+             check: function () { var r = resolve(); return sizeProblem({ seed: r.seed, population: r.population, depth: r.depth, width: r.width, height: r.height, cfg: r.mine }); },
+             build: function () { var r = resolve(); return { seed: r.seed, population: r.population, depth: r.depth, size: [r.width, r.height], cfg: r.cfg, repeats: r.repeats }; } };
   }
 
   /* ---------------- per-frame data ---------------- */
@@ -1037,6 +1519,7 @@
     b.setAttribute("aria-label", paused ? "play" : "pause");
     b.title = (paused ? "Play" : "Pause") + " (Space)";
     el("stepbtn").hidden = !paused;   /* one step: only while paused */
+    paintRunState();
     dirtyHud = true;
   }
   function changeSpeed(d) {
@@ -1076,8 +1559,9 @@
   }
   /* F: follow the selected fish; again (or with none): a random one */
   function follow() {
+    if (turboState !== "live") { turboPictureHint(); return; }
     var s = fresh(lastS);
-    if (!s || !s.n || turboState !== "live") return;
+    if (!s || !s.n) return;
     var idx = !scene.following() ? indexOfId(s, selectedId) : -1;
     if (idx < 0) idx = randomFish(s, selectedId);
     select(s.ids[idx]);
@@ -1109,7 +1593,7 @@
     var k = function (keys, what) { return "<span class='k'><kbd>" + keys.join("</kbd><kbd>") + "</kbd> " + what + "</span>"; };
     var live = turboState === "live", parts;
     if (live && scene && scene.following()) parts = [k(["W", "S"], "closer / farther"), k(["A", "D"], "circle"), k(["Esc"], "let go")];
-    else parts = [k(["W", "A", "S", "D"], "fly"), live ? k(["F"], "follow a fish") : k(["T"], "stop Turbo")];
+    else parts = [k(["W", "A", "S", "D"], "fly"), live ? k(["F"], "follow a fish") : k(["Space"], "stop Turbo")];
     if (live && paused) parts.push(k(["."], "one step"));
     parts.push(k(["?"], "all keys"));
     setHtml("keys", parts.join(""));
@@ -1611,7 +2095,7 @@
   /* ---------------- TURBO (web/ocean_worker.js) ----------------
    * live -> entering -> turbo -> exiting -> live. The worker gets a copy of
    * this module's memory and hands its own back on Stop; meanwhile this page
-   * keeps drawing the frozen world under the Turbo card, live settings go
+   * keeps drawing the frozen world, dimmed (updateLocks), live settings go
    * to the worker, and the readout and dashboards show the worker's world
    * (its stats messages, its samples, the wiring it is asked for). */
   var turboState = "live", turboWorker = null, turboStats = null;
@@ -1636,35 +2120,136 @@
     }
     return null;   /* nothing new yet: the panel keeps what it shows */
   }
+  /* The page's mode, drawn from who owns the world (UI-4): Live or Paused
+   * (the page), or Turbo, starting, running or stopping (the worker). Turbo
+   * is a mode of the dock's time group: pause, step, speed and the Turbo
+   * button give way to its strip (Stop, a sparkline of the fish, its
+   * numbers); the watch group, the View menu, the camera and the charts keep
+   * working on the waiting picture, which is dimmed (body.turbo-on, the tank
+   * only). Where the dock is covered (a narrow screen's setup sheet, the
+   * charts) a bar there has the same Stop. The run's state shows in the
+   * readout (#runstate). (The name is the old one: it locked the controls.) */
+  var RUNSTATE = { live: ["Live", "The world is running"], paused: ["Paused", "Paused: Space or ▶ runs it"],
+                   entering: ["Starting Turbo", "Turbo is taking the world"], turbo: ["Turbo", "Turbo is running the world without drawing it"],
+                   exiting: ["Stopping Turbo", "Turbo is handing the world back"] };
+  function runState() { return turboState === "live" ? (paused ? "paused" : "live") : turboState; }
+  function paintRunState() {
+    var s = runState(), r = el("runstate");
+    if (!r || r.dataset.s === s) return;
+    r.dataset.s = s;
+    r.title = RUNSTATE[s][1];
+    var w = r.querySelector(".rs-word");
+    if (w) w.textContent = RUNSTATE[s][0];
+  }
+  /* what waits for Turbo to stop (every start goes through requestStart, which stops it first; Save reads what was accepted) */
+  var LOCK_IDS = [];
   function updateLocks() {
-    var tb = el("turbobtn"), on = turboState === "turbo" || turboState === "exiting";
+    var s = turboState, on = s !== "live";
+    document.body.classList.toggle("turbo-on", on);
+    var tb = el("turbobtn");
     tb.setAttribute("aria-pressed", on ? "true" : "false");
-    tb.disabled = turboState === "entering" || turboState === "exiting";
-    var locked = turboState !== "live";
-    ["restart", "savecp", "loadcp", "pausebtn", "slower", "faster", "stepbtn", "randombig", "newworld", "replay"].forEach(function (id) {
-      el(id).classList.toggle("locked", locked);
+    tb.disabled = s === "entering" || s === "exiting";
+    LOCK_IDS.forEach(function (id) { var b = el(id); if (b) b.classList.toggle("locked", on); });
+    el("turbo-strip").hidden = !on;
+    el("setup-turbo").hidden = !on;
+    el("dash-turbo").hidden = !on;
+    /* Stop; with a new world waiting for the hand-back, Cancel (that start, not the hand-back) */
+    var can = s === "turbo" || (on && !!pendingStart);
+    var word = pendingStart ? "Cancel" : s === "entering" ? "Starting…" : s === "exiting" ? "Stopping…" : "Stop";
+    var stop = el("turboexit");
+    stop.disabled = !can;
+    stop.setAttribute("aria-label", pendingStart ? "cancel the new world" : s === "turbo" ? "stop Turbo" : word.toLowerCase());
+    var sw = stop.querySelector(".ts-word");
+    if (sw) sw.textContent = word;
+    ["setup-turbo-stop", "dash-turbo-stop"].forEach(function (id) {
+      var b = el(id);
+      b.disabled = !can;
+      b.textContent = pendingStart ? "Cancel the new world" : s === "turbo" ? "Stop Turbo" : s === "entering" ? "Starting…" : "Stopping…";
     });
-    el("turbo").hidden = turboState === "live";
-    el("turboexit").disabled = turboState !== "turbo";
-    el("turboexit").textContent = turboState === "exiting" ? "Syncing back…" : turboState === "entering" ? "Starting…" : "Stop Turbo and watch";
-    if (turboState !== "live") paintTurbo();
+    paintRunState();
+    paintStart();
+    if (on) paintTurbo();
+    updateKeysLegend();
     dirtyHud = true;
   }
+  /* the strip's numbers (and the bars'), from the worker's latest stats */
+  var SPARK_N = 90, spark = [];
   function paintTurbo() {
-    var t = turboStats;
-    el("ts-rate").textContent = t ? Math.round(t.stepsPerSec).toLocaleString() : "–";
-    el("ts-steps").textContent = t ? t.totalSteps.toLocaleString() : "–";
-    el("ts-pop").textContent = t ? Math.round(t.pop).toLocaleString() : "–";
-    el("ts-food").textContent = t ? Math.round(t.food).toLocaleString() : "–";
+    var t = turboStats, rate = t ? Math.round(t.stepsPerSec).toLocaleString("en-US") : "–";
+    setTxt("ts-rate", rate); setTxt("st-rate", rate); setTxt("dt-rate", rate);
+    setTxt("ts-steps", t ? t.totalSteps.toLocaleString("en-US") : "–");
+    setTxt("ts-pop", t ? Math.round(t.pop).toLocaleString("en-US") : "–");
+    setTxt("ts-gen", t && t.su ? String(Math.round(t.su[13])) : "–");
+    drawSpark();
+  }
+  /* a bounded sparkline of the fish, from the stats Turbo sends anyway (no
+   * extra steps, no extra messages) */
+  function drawSpark() {
+    var c = el("turbo-sparkline"), g = c && c.getContext ? c.getContext("2d") : null;
+    if (!g) return;
+    var dpr = window.devicePixelRatio || 1, w = 64, h = 24;
+    if (c.width !== w * dpr) { c.width = w * dpr; c.height = h * dpr; }
+    g.setTransform(dpr, 0, 0, dpr, 0, 0);
+    g.clearRect(0, 0, w, h);
+    if (spark.length < 2) return;
+    var lo = Infinity, hi = -Infinity;
+    spark.forEach(function (v) { lo = Math.min(lo, v); hi = Math.max(hi, v); });
+    if (hi - lo < 2) { hi += 1; lo -= 1; }
+    g.beginPath();
+    var n = spark.length, step = (w - 2) / (Math.max(n, 16) - 1);   /* the newest on the right; a short run spreads over a quarter or more */
+    spark.forEach(function (v, i) {
+      var x = w - 1 - (n - 1 - i) * step, y = h - 2 - (v - lo) / (hi - lo) * (h - 4);
+      if (i) g.lineTo(x, y); else g.moveTo(x, y);
+    });
+    g.strokeStyle = "#ef8a5a"; g.lineWidth = 1.5; g.lineJoin = "round";
+    g.stroke();
+  }
+  /* T, the Turbo button, the coach mark's Try Turbo: on, or off. With a new
+   * world waiting for Turbo (Stop Turbo & start, while it starts or stops),
+   * T cancels that start, as Stop, Space and the bars' Cancel do */
+  function toggleTurbo() {
+    if (pendingStart) stopTurbo();
+    else if (turboState === "live") enterTurbo();
+    else if (turboState === "turbo") stopTurbo();
+    else turboWait();
+  }
+  /* Stop Turbo (the strip's ■, the bars', Space, T): the ordinary hand-back.
+   * With a new world waiting for it (Stop Turbo & start), Stop cancels that
+   * start, not the hand-back: the run comes back as after any Stop. */
+  function stopTurbo() {
+    if (pendingStart) {
+      cancelPendingStart("The new world is cancelled: " + (turboState === "entering" ? "Turbo carries on." : "Turbo hands your run back as usual."));
+      return;
+    }
+    if (turboState === "turbo") exitTurbo();
+    else if (turboState !== "live") turboWait();
+  }
+  function turboWait() { showNote(turboState === "entering" ? "Turbo is starting: a moment." : "Turbo is handing the world back: a moment."); }
+  /* a tap on the waiting picture, or F, while Turbo runs: never silently ignored */
+  var turboHintT = -Infinity;
+  function turboPictureHint() {
+    var now = performance.now();
+    if (now - turboHintT < 2500) return;
+    turboHintT = now;
+    toast("The picture waits while Turbo runs. Stop Turbo (Space) to pick or follow a fish.");
   }
   var turboEntryCfg = null;   /* runCfg when Turbo took the world */
   var turboEntryPaused = false;   /* and whether it was paused then: a start that fails leaves it so */
   function onTurboMessage(e) {
+    /* only the worker this page runs now: a dropped one's late messages (it
+     * was detached and terminated: dropWorker) never reach the world */
+    if (this !== turboWorker) return;
     var msg = e.data || {};
     if (msg.type === "stats") {
       turboStats = msg;
       if (msg.st && msg.su) turboView = { st: msg.st, su: msg.su };
-      if (turboState === "entering") { turboState = "turbo"; updateLocks(); flushHeld(); }
+      spark.push(msg.pop);
+      if (spark.length > SPARK_N) spark.shift();
+      if (turboState === "entering") {
+        turboState = "turbo"; usedTurbo = true;
+        updateLocks(); flushHeld();
+        if (pendingStart) exitTurbo();   /* Stop Turbo & start, asked while it was starting */
+      }
       paintTurbo();
     } else if (msg.type === "wiring") {
       wireAsked = false;   /* answered: the next one may be asked */
@@ -1685,16 +2270,25 @@
       if (turboState !== "exiting") return;
       try { takeMemory(msg.mem); }
       catch (err) {
-        /* the worker still has the world: it carries on, nothing is lost */
+        /* the worker still has the world: it carries on, nothing is lost (a start waiting for it is cancelled) */
+        var hadStart = !!pendingStart;
+        pendingStart = null;
         turboWorker.postMessage({ cmd: "resume" });
         turboState = "turbo";
         updateLocks();
-        showError("Turbo could not hand the world back (" + (err.message || err) + "), so it keeps running. Stop it again to retry.");
+        showError("Turbo could not hand the world back (" + (err.message || err) + "), so it keeps running" +
+                  (hadStart ? " and the new world did not start" : "") + ". Stop it again to retry.");
         flushHeld();
         return;
       }
-      turboBack();
-      showNote("Turbo ran " + (msg.totalSteps || 0).toLocaleString() + " steps.");
+      var ps = pendingStart;
+      pendingStart = null;
+      /* a new world follows: the fish is picked up again only if it doesn't
+       * start (the run carries on), in this message, before any frame steps
+       * the world handed back */
+      turboBack(false, false, false, !!ps);
+      if (ps && !finishPendingStart(ps)) restoreAfterTurbo();
+      if (!ps) showNote("Turbo ran " + (msg.totalSteps || 0).toLocaleString() + " steps.");
     } else if (msg.type === "error") {
       turboFailed("Turbo stopped: " + (msg.message || "unknown error"), msg.mem);
     }
@@ -1706,7 +2300,7 @@
    * After a session the world runs on (Stop Turbo and watch); a start that
    * failed (startFailed: the worker never answered) leaves the playback as
    * it was, a paused world paused. */
-  function turboBack(quiet, lost, startFailed) {
+  function turboBack(quiet, lost, startFailed, holdReturn) {
     turboState = "live";
     turboView = null; turboWire = null; wireAsked = false;
     summary = null;   /* the readout's summary: this world's again, at the next refresh */
@@ -1715,7 +2309,9 @@
     sampleBucket = Math.floor(M._oc_stats ? frameNow() / (dash() ? dash().every() : 60) : -1);
     setPaused(startFailed ? turboEntryPaused : false);
     updateLocks();
-    return replayEdits(plan, quiet);
+    var res = replayEdits(plan, quiet);
+    if (!holdReturn) restoreAfterTurbo();   /* (held: Stop Turbo & start decides first) */
+    return res;
   }
   /* The worker stopped on an error, or died. With its memory (the world was
    * whole), the run goes on from where Turbo got it, as after a Stop.
@@ -1727,6 +2323,7 @@
     var was = turboState;
     dropWorker();
     if (was === "live") return;
+    if (pendingStart) { pendingStart = null; why = "The new world did not start. " + why; }   /* the recovered run is the visitor's to replace */
     var back = false;
     if (mem && was !== "entering") {
       try { takeMemory(mem); back = true; } catch (err) { why += "; the world it had could not come back (" + (err.message || err) + ")"; }
@@ -1746,6 +2343,60 @@
               (again.length ? ", with " + again.join(", ") + " applied again." : ".")) +
               (refused.length ? " Refused: " + refused.join("; ") + "." : ""));
   }
+  /* The fish the visitor had picked (and followed) when Turbo took the world:
+   * its id, family line, place and whether it was followed, in this world
+   * (epoch). The picture can't show it during Turbo; the hand-back (or a
+   * recovery) picks it up again: the same fish if it lives, else the nearest
+   * of its family line (world distance, across the wrap without walls; the
+   * lower id on a tie), else none, said so. Following resumes only if it was
+   * on and not let go meanwhile (C, the fit button: no follow; Esc: nothing).
+   * Never across a new world. The flashlight preference is never written:
+   * the follow's own rule turns the lamp on and puts it back. */
+  function returnPoint() {
+    if (selectedId === null) return null;
+    var s = fresh(lastS), idx = indexOfId(s, selectedId);
+    var r = { id: selectedId, follow: !!(scene && scene.following()), epoch: worldEpoch, family: null, x: 0, y: 0, d: 0 };
+    if (idx >= 0) {
+      r.x = s.segs[12 * idx]; r.y = s.segs[12 * idx + 1]; r.d = s.depth[idx];   /* read before oc_inspect, which may grow the memory */
+      var f = inspect(idx);
+      if (f) r.family = Math.round(f.info[7]);
+    }
+    return r;
+  }
+  function restoreAfterTurbo() {
+    var r = turboReturn;
+    turboReturn = null;
+    if (!r || r.epoch !== worldEpoch || !M || turboState !== "live") return;
+    var s = fresh(lastS), idx = indexOfId(s, r.id), id = r.id;
+    if (idx < 0) { id = nearestOfFamily(s, r); }
+    if (id === null) {
+      toast("Fish #" + r.id + " did not survive Turbo, nor did any of its family line" + (r.follow ? ": nothing to follow." : "."));
+      return;
+    }
+    select(id, true);
+    if (r.follow && scene) { wantFollow = true; scene.setFollow(true); }
+    if (id !== r.id) toast("Fish #" + r.id + " died during Turbo: " + (r.follow ? "following" : "showing") + " #" + id + ", the nearest of its family line.");
+  }
+  /* the nearest living member of r's family line, by id (one oc_inspect per fish: the ids and places copied first) */
+  function nearestOfFamily(s, r) {
+    if (r.family === null || !s || !s.n || !has("oc_inspect")) return null;
+    var n = s.n, ids = Array.prototype.slice.call(s.ids, 0, n), xs = [], ys = [], ds = [], i;
+    for (i = 0; i < n; i++) { xs.push(s.segs[12 * i]); ys.push(s.segs[12 * i + 1]); ds.push(s.depth[i]); }
+    var best = null, bd = Infinity;
+    for (i = 0; i < n; i++) {
+      if (!M._oc_inspect(i)) continue;
+      var info = HO.f64(M, M._oc_inspect_info(), M._oc_inspect_len());   /* a fresh view: oc_inspect allocates */
+      if (Math.round(info[7]) !== r.family) continue;
+      var dx = xs[i] - r.x, dy = ys[i] - r.y, dz = ds[i] - r.d;
+      if (!WALLS) {
+        if (dx > W / 2) dx -= W; else if (dx < -W / 2) dx += W;
+        if (dy > H / 2) dy -= H; else if (dy < -H / 2) dy += H;
+      }
+      var d2 = dx * dx + dy * dy + dz * dz;
+      if (d2 < bd || (d2 === bd && ids[i] < best)) { bd = d2; best = ids[i]; }
+    }
+    return best;
+  }
   function dropWorker() {
     if (!turboWorker) return;
     turboWorker.onmessage = null;
@@ -1760,13 +2411,15 @@
    * worker always gets a copy: this page's memory stays the fallback. */
   function enterTurbo() {
     if (turboState !== "live" || !M || MOCK) { if (MOCK) showNote("Turbo needs the real engine."); return; }
+    store(COACH_KEY, "1"); hideCoach();   /* found it: no coach mark */
     try {
       turboState = "entering";
-      turboStats = null;
+      turboStats = null; spark = [];
       turboView = null; turboWire = null; wireAsked = false;
       turboEntryCfg = Object.assign({}, runCfg);
       turboEntryPaused = paused;
       live.start();
+      turboReturn = returnPoint();   /* the fish to pick up again after Turbo, before the picture lets it go */
       select(null);
       unfollow();
       updateLocks();
@@ -1912,10 +2565,12 @@
          * and nothing behind them closes with it; else the popover (back to its
          * opener), the settings, the live numbers, or the fish */
         if (openPop) { if (!escHandledElsewhere) closePop(true); return; }
+        if (!escHandledElsewhere && startMenuOpen()) { setStartMenu(false); el("startmenubtn").focus(); return; }   /* the start menu first, then the sheet */
         if (!escHandledElsewhere) {
           if (drawerEl.classList.contains("open")) setDrawer(false);
           else if (statOpen) setStatPanel(false);
-          else if (scene.following()) unfollow(); else select(null);
+          else if (scene.following()) unfollow();
+          else { select(null); if (turboReturn) { turboReturn = null; showNote("Let go: no fish to pick up after Turbo."); } }
         }
         if (document.activeElement && document.activeElement.blur) document.activeElement.blur();
         return;
@@ -1940,27 +2595,38 @@
        * popover, and back to the button when it closes */
       if (k === "?") { togglePop("help", el(POPS.help[1]), true); return; }
       if (lk === "v") { togglePop("view", el(POPS.view[1]), true); return; }
-      if (lk === "t") { el("turbobtn").click(); return; }
+      if (lk === "t") { toggleTurbo(); return; }
       if (lk === "g") { setPop(null); el("dashbtn").click(); return; }
       if (lk === "o") { setPop(null); setDrawer(!drawerEl.classList.contains("open")); return; }
       if (lk === "i") { setPop(null); setStatPanel(!statOpen); return; }
       /* the view: always */
-      if (lk === "c") { wantFollow = false; scene.resetView(true); return; }
+      if (lk === "c") { wantFollow = false; scene.resetView(true); if (turboReturn) turboReturn.follow = false; return; }
       if (lk === "l") { toggleLight(); return; }
       if (lk === "f") { follow(); return; }
-      /* the world: not while Turbo owns it */
+      /* Turbo: Space stops it (as T does); the speed and the step are Turbo's
+       * own while it runs, and say so */
       if (turboState !== "live") {
-        if (k === " " || k === "ArrowUp" || k === "ArrowDown" || k === "+" || k === "=" || k === "-" || lk === "r" || k === ".") {
-          showNote("Stop Turbo first."); e.preventDefault();
-        }
+        if (k === " " || k === "Spacebar") { if (!e.repeat) stopTurbo(); e.preventDefault(); }
+        else if (k === "ArrowUp" || k === "ArrowDown" || k === "+" || k === "=" || k === "-" || k === "_" || k === ".") {
+          showNote("Turbo runs as fast as it can: stop it (Space) to set the speed or step."); e.preventDefault();
+        } else if (lk === "r") startKey(e);   /* Stop Turbo & start, asked first (Turbo used) */
         return;
       }
       if (k === " " || k === "Spacebar") { setPaused(!paused); e.preventDefault(); }
       else if (k === "+" || k === "=" || k === "ArrowUp") { changeSpeed(1); e.preventDefault(); }
       else if (k === "-" || k === "_" || k === "ArrowDown") { changeSpeed(-1); e.preventDefault(); }
-      else if (lk === "r") { if (e.shiftKey) replay(); else newWorld(); }
+      else if (lk === "r") startKey(e);
       else if (k === "." && paused) stepOnce = true;
     });
+    /* R a new world, Shift+R Replay: the same door as Start (the question in
+     * the setup sheet when the run has something to lose, its confirm button
+     * focused); a held key starts nothing twice, nor does R again while asked */
+    function startKey(e) {
+      if (e.repeat) return;
+      if (asking) { el("startconfirm").focus(); return; }
+      if (e.shiftKey) replay(); else newWorld();
+      if (asking) el("startconfirm").focus();
+    }
     /* a short tap or click selects the fish nearest it on screen; empty water
      * lets go. A drag, pinch or long press belongs to the camera. */
     var tap = null;
@@ -1973,7 +2639,8 @@
       var moved = Math.hypot(e.clientX - tap.x, e.clientY - tap.y), held = performance.now() - tap.t;
       tap = null;
       var s = fresh(lastS);
-      if (moved > 8 || held > 600 || !s || turboState !== "live") return;
+      if (moved > 8 || held > 600 || !s) return;
+      if (turboState !== "live") { turboPictureHint(); return; }
       var best = scene.pick(s, e.clientX, e.clientY, e.pointerType === "mouse" ? 18 : 30);
       if (best < 0 && scene.following()) return;   /* a stray tap doesn't drop a follow */
       if (best >= 0 && scene.following() && s.ids[best] !== selectedId) unfollow();
@@ -2013,7 +2680,7 @@
     drawerEl.classList.toggle("open", open);
     document.body.classList.toggle("sheet-open", open);
     menuBtn.setAttribute("aria-expanded", open ? "true" : "false");
-    if (!open) hideTip();
+    if (!open) { hideTip(); setStartMenu(false); if (asking) hideAsk(); }   /* a question no one can see is no question: closing the sheet keeps the run */
     if (open) { setStatPanel(false); setPop(null); hideCoach(); }
     if (scene) { updateInsets(); setTimeout(updateInsets, 320); }
   }
@@ -2114,22 +2781,45 @@
 
   /* ---- buttons ---- */
   function btn(id, fn) { el(id).addEventListener("click", function () { fn(); this.blur(); }); }
+  /* A button that may open the start bar's question (Start, its menu's two,
+   * a card, its Start, Reroll, Replay). Pressed from the keyboard (its focus
+   * ring showing, or a click no pointer made: Enter / Space give detail 0),
+   * the focus goes to the question's answer, as R's does, and comes back to
+   * the button (back: the menu's own button for its items) when the
+   * question is answered Keep; a pointer's press blurs it, as btn's. */
+  function askBtn(id, fn, back) {
+    el(id).addEventListener("click", function (e) {
+      var kb = this.matches(":focus-visible") || (!!e && e.detail === 0);
+      fn();
+      if (kb && asking) { asking.opener = back ? el(back) : this; el("startconfirm").focus(); }
+      else this.blur();
+    });
+  }
   buildSettings();
   panelsEl.addEventListener("input", onEdit);
   panelsEl.addEventListener("change", onEdit);
-  btn("restart", restart);
+  askBtn("restart", restart);
   btn("pausebtn", function () { if (guardTurbo()) return; setPaused(!paused); });
   btn("slower", function () { if (guardTurbo()) return; changeSpeed(-1); });
   btn("faster", function () { if (guardTurbo()) return; changeSpeed(1); });
-  btn("turbobtn", function () { if (turboState === "live") enterTurbo(); else if (turboState === "turbo") exitTurbo(); });
-  btn("turboexit", exitTurbo);
-  el("turbobtn").addEventListener("click", function () { store(COACH_KEY, "1"); hideCoach(); });   /* found it: no coach mark */
-  btn("coachgo", function () { hideCoach(); el("turbobtn").click(); });
+  btn("turbobtn", toggleTurbo);
+  /* Stop: the dock's strip, and the bars where the dock is covered (a narrow setup sheet, the charts) */
+  ["turboexit", "setup-turbo-stop", "dash-turbo-stop"].forEach(function (id) { btn(id, stopTurbo); });
+  btn("coachgo", function () { hideCoach(); toggleTurbo(); });
   btn("coachx", hideCoach);
   btn("stepbtn", function () { if (guardTurbo()) return; if (paused) stepOnce = true; });
-  btn("randombig", randomize);
-  btn("newworld", newWorld);
-  btn("replay", replay);
+  /* Start from: each card stages (pickScenario); the picked one's Start starts it */
+  Object.keys(CARD_IDS).forEach(function (id) { if (id !== "file") askBtn(CARD_IDS[id], function () { pickScenario(id); }); });
+  askBtn("scenario-start", startStaged);
+  askBtn("rerollbtn", function () { pickScenario("surprise"); });
+  /* the start bar: Start (the same fish: this seed), and its menu */
+  btn("startmenubtn", function () { setStartMenu(!startMenuOpen()); });
+  askBtn("startsame", function () { setStartMenu(false); restart(); }, "startmenubtn");
+  askBtn("newworld", function () { setStartMenu(false); newWorld(); }, "startmenubtn");
+  document.addEventListener("pointerdown", function (e) {
+    if (startMenuOpen() && !(e.target.closest && e.target.closest("#startmenu, #startmenubtn"))) setStartMenu(false);
+  });
+  askBtn("replay", replay);
   btn("lightbtn", toggleLight);
   ["view", "help"].forEach(function (n) {   /* the triggers; × closes (pointerBlur, setPop: the focus) */
     el(POPS[n][1]).addEventListener("click", function () {
@@ -2147,7 +2837,7 @@
     updateLight();
     pointerBlur(this);
   });
-  btn("viewbtn", function () { if (scene) { wantFollow = false; scene.resetView(true); } });
+  btn("viewbtn", function () { if (scene) { wantFollow = false; scene.resetView(true); if (turboReturn) turboReturn.follow = false; } });
   btn("fitbtn", fitToScreen);
   btn("followbtn", function () {
     if (!scene) return;
@@ -2162,19 +2852,25 @@
     el("iexpand").title = cardExpanded ? "Hide its brain" : "Show its brain";
     cardCache.sense = null;
   });
-  btn("advreset", function () {
-    resetForm();
-    setPending(true); updateNeeds(); updateTabDots();
-    showNote("Every setting is back to its default. Restart to apply.");
-  });
-  btn("savecp", function () { if (guardTurbo()) return; saveSetup(); });
-  btn("loadcp", function () { if (guardTurbo()) return; el("cpfile").click(); });
+  btn("savecp", saveSetup);   /* in Turbo too: the accepted setup */
+  btn("startconfirm", confirmAsk);
+  btn("startcancel", cancelAsk);
+  btn("loadcp", function () { el("cpfile").click(); });
+  /* the read is asynchronous: its answer stages the file only if nothing
+   * newer came meanwhile (another file, a scenario, Discard, a start), and
+   * whoever owns the world then (staging changes no world) */
+  var fileReq = 0;
   el("cpfile").addEventListener("change", function () {
     var file = this.files && this.files[0];
     this.value = "";
-    if (!file || !M || guardTurbo()) return;
-    file.text().then(loadSetup, function (err) { showError("Couldn't read that file: " + err); });
+    if (!file || !M) return;
+    var my = ++fileReq, gen = draftGen;
+    file.text().then(function (text) {
+      if (my !== fileReq || gen !== draftGen) return;   /* stale: something newer is in the sheet */
+      loadSetup(text, file.name);
+    }, function (err) { if (my === fileReq) showError("Couldn't read that file: " + err); });
   });
+  btn("startdiscard", discardDraft);
   el("governor").addEventListener("change", function () {
     governorOn = this.checked;
     if (!governorOn) restoreDetail();
@@ -2228,7 +2924,7 @@
     setColourMode(b.dataset.c);
     pointerBlur(b);
   });
-  el("colourwhy").addEventListener("click", function (e) {   /* "Settings › Life › Appearance genes" */
+  el("colourwhy").addEventListener("click", function (e) {   /* "Setup › Life › Appearance genes" */
     if (!e.target.closest("#colourfix")) return;
     setPop(null); setDrawer(true); setSheetTab("life");
     var row = el("f_appearance");
@@ -2285,7 +2981,7 @@
     el("colourwhy").classList.toggle("why", noApp);
     setHtml("colourwhy", noApp
       ? (HAS_APP ? "Appearance genes are off in this world, so the fish show family colours. To turn them on: " +
-                   "<button type='button' class='linkbtn' id='colourfix'>Settings › Life › Appearance genes</button>, then Restart."
+                   "<button type='button' class='linkbtn' id='colourfix'>Setup › Life › Appearance genes</button>, then Start."
                  : "This engine build has no appearance genes, so the fish show family colours.")
       : colourMode === "appearance" ? "Each fish wears the skin pattern and body shape it inherited."
       : colourMode === "brain" ? "Fish with similar brains get similar colours."
@@ -2293,6 +2989,8 @@
   }
   setPaused(BENCH);
   changeSpeed(0);
+  updateLocks();   /* the mode the page starts in: Live (or Paused), no Turbo strip */
+  setStartMenu(false); hideAsk();   /* the start bar's menu and question closed */
 
   /* ---------------- the tour (web/guide.js reads this) ---------------- */
   var guideFish = null;
@@ -2354,7 +3052,7 @@
           body: function () {
             return "<kbd>W</kbd> <kbd>A</kbd> <kbd>S</kbd> <kbd>D</kbd> fly · <kbd>Space</kbd> pause · <kbd>T</kbd> " +
                    "Turbo · <kbd>F</kbd> follow · <kbd>L</kbd> flashlight · <kbd>V</kbd> view · <kbd>G</kbd> charts · " +
-                   "<kbd>O</kbd> settings · <kbd>?</kbd> help, with every key. Try one now; the tour waits. " +
+                   "<kbd>O</kbd> setup · <kbd>?</kbd> help, with every key. Try one now; the tour waits. " +
                    "(<kbd>Esc</kbd> closes things, and this tour.)";
           } },
         { drawer: false, title: "Playback",
@@ -2371,22 +3069,21 @@
             return "Charts of this run as it happens: population, where in the depth the fish live and the depth they " +
                    "float at, family lines, bodies, and which senses their brains use. Recorded on your device only.";
           } },
-        { drawer: false, title: "Settings",
+        { drawer: false, title: "Setup",
           target: function () { return h.rectOf("#menubtn"); },
-          body: function () { return "New worlds, every rule of this one, and saving and loading setups (O)."; } },
-        { drawer: true, tab: "run", scroll: ".run-hero", place: h.drawerSides, title: "Randomize",
-          target: function () { return h.rectOf(".run-hero"); },
+          body: function () { return "New worlds, every rule of this one, and saving setups (O). Nothing in it replaces your run until you press <b>Start</b>."; } },
+        { drawer: true, tab: "run", scroll: "#scenarios", place: h.drawerSides, title: "Start from",
+          target: function () { return h.rectOf("#scenarios"); },
           body: function () {
-            return "The quickest way to explore. It draws a setup from ranges that worked in experiments (predators, " +
-                   "currents, the E1 physics), restarts, and lists what it picked.";
+            return "Pick a world: Big tank, Living water, Hunters, Currents & patches, or <b>Surprise me</b>, which draws a " +
+                   "setup from ranges that worked in experiments. The card fills the tabs with it; its <b>Start</b> starts it.";
           } },
         { drawer: true, tab: "depth", scroll: "#f_kBuoy", place: h.drawerSides, title: "Your own settings",
           target: function () { return h.rectOf("#f_kBuoy"); },
           body: function () {
-            return "Change anything by hand: the depth physics here, waves, light, currents and the tuned E1 preset " +
-                   "under Water (E1). " +
-                   (h.touch() ? "Tap" : "Hover over") + " a setting's name to see what it does. Changes apply on " +
-                   "<b>Restart</b>; settings marked <i>live</i> apply at once.";
+            return "Change anything by hand: the depth physics here, waves, light and currents under Water (E1). " +
+                   (h.touch() ? "Tap" : "Hover over") + " a setting's name to see what it does. Changes wait for " +
+                   "<b>Start</b>, at the bottom; settings marked <i>live</i> apply at once.";
           } },
         { last: true, drawer: false, title: "You're set",
           body: function () { return "Take this tour again any time from <b>Help</b> (?), with every key. Enjoy!"; } }
@@ -2411,6 +3108,8 @@
     colourByBrain: function () { return colourBrain; },
     colourMode: function () { return colourMode; },
     startTurbo: function () { if (M && turboState === "live") enterTurbo(); },
+    /* the Turbo card's tour step (web/guide.js) asks this; Classic's page has its #turbo card instead */
+    turboActive: function () { return turboState !== "live"; },
     setDrawer: setDrawer,
     setSheetTab: setSheetTab,
     inspectSomeFish: function () {
