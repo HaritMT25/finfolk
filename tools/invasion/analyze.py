@@ -769,6 +769,7 @@ def matrices(rows, meta=None, zmin=2.0, sims=9999, registry=None, kind="wild", s
                 # the cross-regime pairs alone: a bipartite graph, no triangle, so its whole cyclic
                 # residual is harmonic (cycles of length >= 4 through both regimes)
                 sg = subgraph_summary(z, lambda p_, q_: regs[p_] != regs[q_])
+            if len(set(regs)) == 2 and sg["q_cycle"] > 0:   # (a tree has no cycle space to report)
                 sub.append({"cond": cond, "frac": frac, "G": G, "status": status,
                             "group": "cross-regime pairs (bipartite, incomplete)", "names": " ".join(names), "n": n,
                             "k": k, "cyclic_share": sg["cyclic_share"], "noise_corrected": sg["noise_corrected"],
