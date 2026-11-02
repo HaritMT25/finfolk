@@ -1,11 +1,20 @@
 #!/usr/bin/env python3
 """analyze.py: invasion-matrix analysis and the Phase 0 pilot report (stdlib only).
 
-    analyze.py --root DIR [--root DIR2 ...] --out OUTDIR [--windows 2.5,5,10]
-               [--sims 1000] [--power-sims 400] [--no-power]
+    analyze.py --root DIR [--root DIR2 ...] --out OUTDIR --plan PLAN.jsonl [--meta META.json]
+               [--windows 2.5,5,10] [--sims 1000] [--power-sims 400] [--no-power]
 
-Reads every finished cell (DIR/cells/<id>/done.json + score.json) and writes
-CSV tables plus summary.md to OUTDIR:
+Reads every finished cell (DIR/cells/<id>/done.json + score.json), checks its
+identity (cell spec == the registered plan entry, binary == the root's pinned
+binary, score.json == the hash done.json recorded), and writes CSV tables plus
+summary.md and inputs.json to OUTDIR. inputs.json binds the report to its
+inputs: the plan's and the meta file's SHA-256, the analysis code's, the
+engine binaries and pinned tool sets the cells ran with, the registered cells
+still missing, and every identity problem; the CSVs carry the plan and
+analysis hashes. Only a COMPLETE registered matrix (the largest name set whose
+every ordered pair and sham is registered, on the replicates registered for
+all of them, every one finished) gets formal decisions (floor, p_mc, p_lof);
+without --plan, or with registered cells missing, matrices are descriptive.
 
   gen.csv      generation length per (snapshot, condition): steps until the
                births reach k x the start population, from the sham runs
@@ -66,17 +75,42 @@ def write_csv(path, rows, cols):
             w.writerow([fmt(r.get(c)) if isinstance(r.get(c), float) else r.get(c, "") for c in cols])
 
 
-def load(roots):
-    recs = []
+def sha256(path):
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def load(roots, plan=None):
+    """Finished cells, each checked against its root and (with a plan) the registered spec:
+    done.json's cell == the plan entry, its binary == the root's pinned binary, its score.json
+    hash == the one done.json recorded. -> (records, provenance problems)."""
+    recs, problems = [], []
     for root in roots:
         cdir = os.path.join(root, "cells")
+        pinned_bin = open(os.path.join(root, "bin", "evo_boids.sha256")).read().split()[0]
         for cid in sorted(os.listdir(cdir)):
             d = os.path.join(cdir, cid)
             if ".attempt" in cid or not os.path.exists(os.path.join(d, "done.json")):
                 continue
             done = json.load(open(os.path.join(d, "done.json")))
-            sc = json.load(open(os.path.join(d, "score.json")))
             c = done["cell"]
+            bad = []
+            if c.get("id") != cid:
+                bad.append("cell id differs from its directory")
+            if done.get("binary_sha256") != pinned_bin:
+                bad.append("binary differs from the root's pinned binary")
+            if sha256(os.path.join(d, "score.json")) != done["outputs"].get("score.json"):
+                bad.append("score.json does not match done.json")
+            if plan is not None and cid in plan and plan[cid] != c:
+                bad.append("done.json cell spec differs from the plan entry")
+            if bad:
+                problems.append(f"{root}/{cid}: " + "; ".join(bad))
+                continue
+            sc = json.load(open(os.path.join(d, "score.json")))
             iv = []   # (population, steps/s) per logged interval, for the speed fit
             with open(os.path.join(d, "run.csv")) as f:
                 for row in csv.DictReader(f):
@@ -90,8 +124,10 @@ def load(roots):
                 "score_s": done["timing"]["score_s"], "pop_mean": done["population"]["mean"],
                 "pop_min": done["population"]["min"], "pop_max": done["population"]["max"],
                 "maxrss_kb": done["timing"]["engine_maxrss_kb"], "intervals": iv,
+                "binary_sha256": done.get("binary_sha256"), "tools_sha256": done.get("tools_sha256"),
+                "registered": plan is None or cid in plan,
             })
-    return recs
+    return recs, problems
 
 
 def gen_length(recs, definition="pop"):
@@ -105,21 +141,24 @@ def gen_length(recs, definition="pop"):
     snapshot's phase; g_pop does not. `definition` picks the window clock ('g')."""
     acc = {}
     for r in recs:
-        if r["mode"] != "sham" or not r["turnover"]:
+        if r["mode"] != "sham":
             continue
-        K = min(10, len(r["turnover"]))
+        t = r["turnover"]
+        K = min(10, len(t))
         last = r["points"][-1]
         gpop = last["steps"] * r["pop_mean"] / last["births"] if last["births"] else None
-        acc.setdefault((r["j"], r["cond"]), []).append((r["turnover"][K - 1] / K, r["turnover"][0], K, gpop, r["n0"],
-                                                         r["pop_mean"]))
+        acc.setdefault((r["j"], r["cond"]), []).append((t[K - 1] / K if K else None, t[0] if t else None, K, gpop,
+                                                         r["n0"], r["pop_mean"]))
     out = {}
     for k, v in acc.items():
-        o = {"g_n0": mean([x[0] for x in v]), "g_n0_sd": sd([x[0] for x in v]), "gen1": mean([x[1] for x in v]),
-             "gen1_sd": sd([x[1] for x in v]), "k_min": min(x[2] for x in v), "runs": len(v),
-             "g_pop": mean([x[3] for x in v if x[3]]), "g_pop_sd": sd([x[3] for x in v if x[3]]),
-             "n0": v[0][4], "pop_mean": mean([x[5] for x in v])}
+        def col(i):
+            return [x[i] for x in v if x[i] is not None]
+        o = {"g_n0": mean(col(0)), "g_n0_sd": sd(col(0)), "gen1": mean(col(1)), "gen1_sd": sd(col(1)),
+             "k_min": min(x[2] for x in v), "runs": len(v), "g_pop": mean(col(3)), "g_pop_sd": sd(col(3)),
+             "n0": v[0][4], "pop_mean": mean(col(5))}
         o["g"] = o["g_pop"] if definition == "pop" else o["g_n0"]
-        out[k] = o
+        if o["g"] is not None:
+            out[k] = o
     return out
 
 
@@ -258,7 +297,34 @@ def category(ma, mb):
     return "cross-regime"
 
 
-def matrices(rows, meta=None, zmin=2.0, sims=1000):
+def registry_from_plan(plan):
+    """(condition, fraction) -> {(invader, resident, mode): {replicates}} for invade and sham cells."""
+    reg = {}
+    for c in plan.values():
+        if c["mode"] not in ("invade", "sham"):
+            continue
+        inv = c["invader_name"] if c["mode"] == "invade" else c["resident_name"]
+        reg.setdefault((c["condition"], c["fraction"]), {}).setdefault((inv, c["resident_name"], c["mode"]), set()).add(c["replicate"])
+    return reg
+
+
+def _largest_complete(names, has):
+    """Drop the name with the most missing ordered pairs / shams until every one is present."""
+    names = sorted(names)
+    while len(names) >= 3:
+        missing = {}
+        for a_ in names:
+            for b_ in names:
+                if not has(a_, b_):
+                    missing[a_] = missing.get(a_, 0) + 1
+                    missing[b_] = missing.get(b_, 0) + 1
+        if not missing:
+            break
+        names.remove(max(missing, key=lambda k_: (missing[k_], k_)))
+    return names
+
+
+def matrices(rows, meta=None, zmin=2.0, sims=1000, registry=None):
     """Complete blocks (every ordered pair + every sham, on common replicates): per condition,
     fraction and window, separately (pooling conditions can fake cycles).
 
@@ -283,22 +349,33 @@ def matrices(rows, meta=None, zmin=2.0, sims=1000):
         for x in rows:
             if (x["cond"], x["frac"], x["G"]) == (cond, frac, G) and x["mode"] in ("invade", "sham") and x["s"] is not None:
                 cell.setdefault((x["i"], x["j"]), {})[x["rep"]] = x["s"]
-        names = sorted({nm for ij in cell for nm in ij})
-        # the largest complete block: drop names until every ordered pair and every sham is present
-        while len(names) >= 3:
-            missing = {}
-            for a_ in names:
-                for b_ in names:
-                    if (a_, b_) not in cell:
-                        missing[a_] = missing.get(a_, 0) + 1
-                        missing[b_] = missing.get(b_, 0) + 1
-            if not missing:
-                break
-            names.remove(max(missing, key=lambda k_: (missing[k_], k_)))
+        # The block and its replicates come from the REGISTERED design (the plan), never from which
+        # runs happen to be finished: formal only when every registered cell of the registered
+        # block, on the registered replicates, is present. Anything else is descriptive (the
+        # largest complete sub-block of what is available, no floor / test decisions).
+        status, names, reps = None, None, None
+        reg = registry.get((cond, frac)) if registry is not None else None
+        if reg:
+            kind = lambda a_, b_: (a_, b_, "sham" if a_ == b_ else "invade")   # noqa: E731
+            rnames = _largest_complete({x for key in reg for x in key[:2]}, lambda a_, b_: kind(a_, b_) in reg)
+            if len(rnames) >= 3:
+                R = sorted(set.intersection(*[reg[kind(a_, b_)] for a_ in rnames for b_ in rnames]))
+                miss = [(a_, b_, r) for a_ in rnames for b_ in rnames for r in R if r not in cell.get((a_, b_), {})]
+                if not miss and len(R) >= 2:
+                    status, names, reps = "formal", rnames, R
+                else:
+                    status = (f"descriptive: {len(miss)} of {len(rnames) ** 2 * len(R)} registered cells "
+                              f"of the {len(rnames)}-block missing")
+            else:
+                status = "descriptive: no complete matrix registered"
+        else:
+            status = "descriptive: no plan given" if registry is None else "descriptive: nothing registered"
+        if status != "formal":
+            names = _largest_complete({nm for ij in cell for nm in ij}, lambda a_, b_: (a_, b_) in cell)
+            if len(names) < 3:
+                continue
+            reps = sorted(set.intersection(*[set(cell[(a_, b_)]) for a_ in names for b_ in names]))
         n = len(names)
-        if n < 3:
-            continue
-        reps = sorted(set.intersection(*[set(cell[(a_, b_)]) for a_ in names for b_ in names]))
         k = len(reps)
         if k < 2:
             continue
@@ -342,13 +419,17 @@ def matrices(rows, meta=None, zmin=2.0, sims=1000):
             Z[p][q] = Z[q][p] = abs(A[p][q]) / math.sqrt(varA[(p, q)]) if varA[(p, q)] > 0 else float("inf")
         tri = hodge.circular_triads(A, Z, zmin)
         mel = hodge.melo2k(sp["curl"], 1)
-        row = {"cond": cond, "frac": frac, "G": G, "n": n, "k": k, "names": " ".join(names),
+        if status != "formal":   # no decisions from a partial matrix
+            f95 = p_mc = p_lof = None
+        row = {"cond": cond, "frac": frac, "G": G, "status": status, "n": n, "k": k, "names": " ".join(names),
                "ratings": " ".join(f"{x:+.4f}" for x in sp["r"]),
                "invader_effect": " ".join(f"{x:+.4f}" for x in ea), "resident_effect": " ".join(f"{x:+.4f}" for x in eb),
                "cyclic_share": sp["cyclic_share"], "noise_corrected": corrected, "floor95": f95, "p_mc": p_mc,
                "chi2": X, "df": df, "p_lof": p_lof, "rms_A": math.sqrt(sp["norm2"] / P),
                "noise_A": math.sqrt(EnA / P), "noise_curl": math.sqrt(v_eff), "gamma_check": chk,
-               "mean_Sg": mean(list(Sg.values())), "frac_Sg_pos": sum(1 for v in Sg.values() if v > 0) / P,
+               # (the MEAN of S_gamma is 0 by construction: gamma's rows sum to 0; its spread is the signal)
+               "rms_Sg": math.sqrt(mean([v * v for v in Sg.values()])),
+               "frac_Sg_pos": sum(1 for v in Sg.values() if v > 0) / P,
                "n_Sg_sig_pos": sum(1 for pq in pairs if varSg[pq] > 0 and Sg[pq] / math.sqrt(varSg[pq]) >= zmin),
                "n_Sg_sig_neg": sum(1 for pq in pairs if varSg[pq] > 0 and Sg[pq] / math.sqrt(varSg[pq]) <= -zmin),
                "triads_cyclic": tri["cyclic"], "triads": tri["triads"], "triads_sig": tri["cyclic_significant"],
@@ -390,17 +471,65 @@ def main(argv=None):
     ap.add_argument("--power-cond", default=None, help="condition whose noise drives the power table (default all)")
     ap.add_argument("--power-windows", default="5,10", help="windows (gens) that get a power table")
     ap.add_argument("--meta", help="JSON {snapshot: {run, regime, family, time}} for pair relations / regimes")
+    ap.add_argument("--plan", help="the registered plan (JSONL): every cell is validated against it, and only a "
+                                   "complete registered matrix gets formal decisions")
     a = ap.parse_args(argv)
     os.makedirs(a.out, exist_ok=True)
     windows = [float(x) for x in a.windows.split(",")]
-    recs = load(a.root)
+    plan = None
+    if a.plan:
+        plan = {}
+        for ln in open(a.plan):
+            if ln.strip():
+                c = json.loads(ln)
+                plan[c["id"]] = c
+    recs, problems = load(a.root, plan)
+    registry = registry_from_plan(plan) if plan is not None else None
+    here = os.path.dirname(os.path.abspath(__file__))
+    prov = {
+        "schema": "finfolk.invasion.analysis/1",
+        "roots": [os.path.abspath(r) for r in a.root],
+        "plan": {"path": os.path.abspath(a.plan), "sha256": sha256(a.plan), "cells": len(plan)} if plan is not None else None,
+        "meta": {"path": os.path.abspath(a.meta), "sha256": sha256(a.meta)} if a.meta else None,
+        "analysis_code": {f: sha256(os.path.join(here, f)) for f in ("analyze.py", "hodge.py")},
+        "binaries": sorted({r["binary_sha256"] for r in recs}),
+        "tools": sorted({json.dumps(r["tools_sha256"], sort_keys=True) for r in recs if r["tools_sha256"]}),
+        "cells_without_tool_hashes": sum(1 for r in recs if not r["tools_sha256"]),
+        "args": vars(a),
+        "finished": len(recs),
+        "identity_problems": problems,
+    }
+    if plan is not None:
+        have = {r["id"] for r in recs}
+        prov["registered_missing"] = sorted(set(plan) - have)
+        prov["unregistered_finished"] = sorted(have - set(plan))
+    prov["complete"] = plan is not None and not prov["registered_missing"] and not problems
+    invlib_json = json.dumps(prov, indent=1, sort_keys=True, default=str)
+    with open(os.path.join(a.out, "inputs.json"), "w") as f:
+        f.write(invlib_json + "\n")
+    ident = {"plan_sha256": prov["plan"]["sha256"] if prov["plan"] else "",
+             "analysis_sha256": prov["analysis_code"]["analyze.py"]}
     gens = gen_length(recs, a.gen_def)
     rows = run_rows(recs, gens, windows)
     grp = groups(rows)
     prs = paired(rows)
     pt = pair_table(prs)
+    meta = json.load(open(a.meta)) if a.meta else None
+    for p in pt:
+        p["category"] = category(meta.get(p["a"]), meta.get(p["b"])) if meta else ""
+        p.update(ident)
     md = []
     md.append(f"# Invasion pilot analysis\n\n{len(recs)} finished runs from {', '.join(a.root)}.\n")
+    md.append("Inputs (also in inputs.json): plan " + (f"`{a.plan}` sha256 `{prov['plan']['sha256'][:16]}` "
+              f"({prov['plan']['cells']} registered cells, {len(prov['registered_missing'])} missing, "
+              f"{len(prov['unregistered_finished'])} finished but unregistered)" if plan is not None else "NONE (descriptive only)") +
+              f"; analysis code analyze.py `{prov['analysis_code']['analyze.py'][:16]}`, hodge.py "
+              f"`{prov['analysis_code']['hodge.py'][:16]}`; engine binaries {[b[:16] for b in prov['binaries']]}; "
+              f"{len(prov['tools'])} pinned tool set(s), {prov['cells_without_tool_hashes']} cells from before tool pinning; "
+              f"{len(problems)} identity problem(s).\n")
+    md.append(f"**Status: {'COMPLETE (formal decisions allowed on registered complete matrices)' if prov['complete'] else 'INCOMPLETE or unregistered: matrices without a complete registered set are descriptive only'}**\n")
+    for p in problems[:20]:
+        md.append(f"- identity problem: {p}")
 
     # --- generation length
     grow = [{"j": j, "cond": c, **v} for (j, c), v in sorted(gens.items())]
@@ -411,8 +540,8 @@ def main(argv=None):
               "(k <= 10); first gen = steps until births = start population.\n")
     md.append("| snapshot | condition | start pop | mean pop | g_pop | SD | g_n0 | SD | first gen | SD | runs |\n|---|---|---|---|---|---|---|---|---|---|---|")
     for g in grow:
-        md.append(f"| {g['j']} | {g['cond']} | {g['n0']} | {g['pop_mean']:.0f} | {g['g_pop']:.0f} | {fmt(g['g_pop_sd'], 0)} | "
-                  f"{g['g_n0']:.0f} | {fmt(g['g_n0_sd'], 0)} | {g['gen1']:.0f} | {fmt(g['gen1_sd'], 0)} | {g['runs']} |")
+        md.append(f"| {g['j']} | {g['cond']} | {g['n0']} | {fmt(g['pop_mean'], 0)} | {fmt(g['g_pop'], 0)} | {fmt(g['g_pop_sd'], 0)} | "
+                  f"{fmt(g['g_n0'], 0)} | {fmt(g['g_n0_sd'], 0)} | {fmt(g['gen1'], 0)} | {fmt(g['gen1_sd'], 0)} | {g['runs']} |")
 
     write_csv(os.path.join(a.out, "runs.csv"), rows,
               ["id", "j", "i", "mode", "frac", "cond", "rep", "n0", "m", "G", "W", "steps_at", "over", "s", "n",
@@ -422,9 +551,6 @@ def main(argv=None):
     write_csv(os.path.join(a.out, "paired.csv"), prs,
               ["cond", "frac", "G", "j", "i", "k", "s_inv", "s_sham", "st", "sd_d", "se_paired", "se_unpaired",
                "sd_inv", "sd_sham", "gain", "corr", "z"])
-    write_csv(os.path.join(a.out, "pairs.csv"), pt,
-              ["cond", "frac", "G", "a", "b", "st_a_into_b", "st_b_into_a", "A_ab", "S", "se_A", "se_S", "z_A", "z_S"])
-
     # --- per-cell noise: shams (and self) SD of s
     md.append("\n## Per-cell replicate SD of s (self-invasion j->j)\n")
     md.append("| condition | fraction | window (gens) | mode | k | mean s | pooled SD | min SD | max SD | lost/runs |\n|---|---|---|---|---|---|---|---|---|---|")
@@ -470,9 +596,9 @@ def main(argv=None):
                           f"{fmt(max(zs) if zs else None, 1)} |")
 
     md.append("\n## Effect sizes on real pairs (A = s~(a->b) - s~(b->a), S = mean of both)\n")
-    md.append("| condition | fraction | window | a | b | s~(a->b) | s~(b->a) | A | z_A | S | z_S |\n|---|---|---|---|---|---|---|---|---|---|---|")
+    md.append("| condition | fraction | window | a | b | relation | s~(a->b) | s~(b->a) | A | z_A | S | z_S |\n|---|---|---|---|---|---|---|---|---|---|---|---|")
     for p in pt:
-        md.append(f"| {p['cond']} | {p['frac']} | {p['G']} | {p['a']} | {p['b']} | {p['st_a_into_b']:+.4f} | {p['st_b_into_a']:+.4f} | "
+        md.append(f"| {p['cond']} | {p['frac']} | {p['G']} | {p['a']} | {p['b']} | {p['category']} | {p['st_a_into_b']:+.4f} | {p['st_b_into_a']:+.4f} | "
                   f"{p['A_ab']:+.4f} | {fmt(p['z_A'], 1)} | {p['S']:+.4f} | {fmt(p['z_S'], 1)} |")
     effect = {}
     for cond in sorted({p["cond"] for p in pt}):
@@ -489,17 +615,17 @@ def main(argv=None):
         md.append(f"| {cond} | {frac} | {G} | {e['pairs']} | {e['rms_obs']:.4f} | {e['rms_se']:.4f} | {e['rms_true']:.4f} |")
 
     # --- complete blocks (if any)
-    meta = json.load(open(a.meta)) if a.meta else None
-    if meta:
-        for p in pt:
-            p["category"] = category(meta.get(p["a"]), meta.get(p["b"]))
-        write_csv(os.path.join(a.out, "pairs.csv"), pt,
-                  ["cond", "frac", "G", "a", "b", "category", "st_a_into_b", "st_b_into_a", "A_ab", "S", "se_A", "se_S", "z_A", "z_S"])
-    mats, mdet = matrices(rows, meta, sims=a.sims)
+    write_csv(os.path.join(a.out, "pairs.csv"), pt,
+              ["cond", "frac", "G", "a", "b", "category", "st_a_into_b", "st_b_into_a", "A_ab", "S", "se_A", "se_S",
+               "z_A", "z_S", "plan_sha256", "analysis_sha256"])
+    mats, mdet = matrices(rows, meta, sims=a.sims, registry=registry)
+    for m in mats:
+        m.update(ident)
     if mats:
-        cols = ["cond", "frac", "G", "n", "k", "names", "ratings", "invader_effect", "resident_effect", "cyclic_share",
+        cols = ["cond", "frac", "G", "status", "plan_sha256", "analysis_sha256", "n", "k", "names", "ratings",
+                "invader_effect", "resident_effect", "cyclic_share",
                 "noise_corrected", "floor95", "p_mc", "chi2", "df", "p_lof", "rms_A", "noise_A", "noise_curl",
-                "gamma_check", "mean_Sg", "frac_Sg_pos", "n_Sg_sig_pos", "n_Sg_sig_neg", "triads_cyclic", "triads",
+                "gamma_check", "rms_Sg", "frac_Sg_pos", "n_Sg_sig_pos", "n_Sg_sig_neg", "triads_cyclic", "triads",
                 "triads_sig", "melo_sigma", "melo_xy", "regime_ratings", "by_category"]
         write_csv(os.path.join(a.out, "matrix.csv"), mats, cols)
         write_csv(os.path.join(a.out, "matrix_pairs.csv"), mdet,
@@ -509,11 +635,12 @@ def main(argv=None):
                   "energy; chi2 = lack of fit of a pure ladder (df = P - N + 1); floor95 / p_mc = Monte Carlo pure "
                   "ladders with this block's noise; S_gamma = symmetric part of the two-way interaction (> 0 "
                   "coexistence, < 0 priority); triads = directed 3-cycles of sign(A) (all / every edge |z| >= 2).\n")
-        md.append("| condition | fraction | window | N | k | RMS A | noise A | noise curl | cyclic share | noise-corrected | floor95 | p_mc | chi2 (df) | p_lof | mean S_gamma | S_gamma sig +/- | triads cyclic/all (sig) |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+        md.append("| condition | fraction | window | status | N | k | RMS A | noise A | noise curl | cyclic share | noise-corrected | floor95 | p_mc | chi2 (df) | p_lof | RMS S_gamma | S_gamma sig +/- | triads cyclic/all (sig) |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
         for m in mats:
-            md.append(f"| {m['cond']} | {m['frac']} | {m['G']} | {m['n']} | {m['k']} | {m['rms_A']:.4f} | {m['noise_A']:.4f} | "
-                      f"{m['noise_curl']:.4f} | {m['cyclic_share']:.3f} | {fmt(m['noise_corrected'], 3)} | {m['floor95']:.3f} | "
-                      f"{m['p_mc']:.3f} | {m['chi2']:.1f} ({m['df']}) | {m['p_lof']:.2g} | {m['mean_Sg']:+.4f} | "
+            pl = f"{m['p_lof']:.2g}" if m["p_lof"] is not None else "-"
+            md.append(f"| {m['cond']} | {m['frac']} | {m['G']} | {m['status']} | {m['n']} | {m['k']} | {m['rms_A']:.4f} | {m['noise_A']:.4f} | "
+                      f"{m['noise_curl']:.4f} | {m['cyclic_share']:.3f} | {fmt(m['noise_corrected'], 3)} | {fmt(m['floor95'], 3) or '-'} | "
+                      f"{fmt(m['p_mc'], 3) or '-'} | {m['chi2']:.1f} ({m['df']}) | {pl} | {m['rms_Sg']:.4f} | "
                       f"{m['n_Sg_sig_pos']}/{m['n_Sg_sig_neg']} | {m['triads_cyclic']}/{m['triads']} ({m['triads_sig']}) |")
         md.append("\n| condition | fraction | window | names | ladder ratings | by home regime | by pair relation |\n|---|---|---|---|---|---|---|")
         for m in mats:
@@ -577,7 +704,7 @@ def main(argv=None):
                         ns = sigma1 / math.sqrt(k)
                         _, f95 = hodge.simulate_floor(N, rms, ns, sims=a.sims, seed=11)
                         row = {"cond": cond, "frac": frac, "G": G, "N": N, "k": k, "rms": rms, "mult": mult,
-                               "noise": ns, "floor95": f95, "source": src}
+                               "noise": ns, "floor95": f95, "source": src, **ident}
                         for share in (0.1, 0.2, 0.3, 0.5):
                             r = hodge.simulate_power(N, rms, share, ns, f95, sims=a.power_sims, seed=13)
                             row[f"p{share}"] = r["power"]
@@ -615,7 +742,7 @@ def main(argv=None):
                       f"{row['min_curl_rms']:.4f} |")
         write_csv(os.path.join(a.out, "power.csv"), pw_rows,
                   ["cond", "frac", "G", "source", "N", "k", "rms", "mult", "noise", "floor95", "p0.1", "p0.2", "p0.3",
-                   "p0.5", "obs03", "deb03", "min_curl_rms"])
+                   "p0.5", "obs03", "deb03", "min_curl_rms", "plan_sha256", "analysis_sha256"])
 
     # --- cost
     if c:

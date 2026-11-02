@@ -35,8 +35,13 @@ Rules:
     running cells finish; exit 1;
   * DIR/STOP: stop admitting, let running cells finish, exit 75 (remove the
     file and start again to resume);
-  * no cell is admitted while MemAvailable < --mem-min-mb (default 1500; this
-    is the WSL/Linux reading, not the Windows host's);
+  * memory, fail closed: a cell is admitted only while min(MemAvailable, every
+    cgroup v2 memory.max - memory.current up the tree) >= --mem-min-mb
+    (default 1500) + the reserve for one more cell (the largest engine RSS
+    seen so far + 64 MB, at least 150 MB). An unreadable or malformed reading
+    admits nothing; if it stays unreadable with no cell running the runner
+    exits 2. (These are the WSL / Linux readings, not the Windows host's.)
+    Test hooks: INVASION_MEMINFO, INVASION_PROC_CGROUP, INVASION_CGROUP_ROOT;
   * SIGINT/SIGTERM: the running engines are terminated; exit 130.
 """
 from __future__ import annotations
@@ -68,15 +73,51 @@ def now():
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def mem_available_mb():
+def _cgroup_headroom_mb():
+    """Smallest (memory.max - memory.current) over this process's cgroup v2 and its ancestors, in MB;
+    None when no limit applies; raises ValueError / OSError on a malformed or unreadable reading."""
+    root = os.environ.get("INVASION_CGROUP_ROOT", "/sys/fs/cgroup")
+    rel = None
+    with open(os.environ.get("INVASION_PROC_CGROUP", "/proc/self/cgroup")) as f:
+        for ln in f:
+            if ln.startswith("0::"):
+                rel = ln.strip()[3:]
+    if rel is None:
+        return None                       # no unified hierarchy: no cgroup v2 limit to honour
+    best = None
+    d = os.path.normpath(os.path.join(root, rel.lstrip("/")))
+    while True:
+        mx_p = os.path.join(d, "memory.max")
+        if os.path.exists(mx_p):
+            mx = open(mx_p).read().strip()
+            if mx != "max":
+                cur = int(open(os.path.join(d, "memory.current")).read().strip())
+                h = (int(mx) - cur) // (1 << 20)
+                best = h if best is None else min(best, h)
+        if os.path.normpath(d) == os.path.normpath(root) or len(d) <= len(root):
+            break
+        d = os.path.dirname(d)
+    return best
+
+
+def mem_headroom_mb():
+    """Memory a new cell may use, in MB: min(MemAvailable, every applicable cgroup v2 headroom).
+    None when any reading is missing or malformed: the caller must then NOT start a cell (fail closed)."""
+    avail = None
     try:
-        with open("/proc/meminfo") as f:
+        with open(os.environ.get("INVASION_MEMINFO", "/proc/meminfo")) as f:
             for ln in f:
                 if ln.startswith("MemAvailable:"):
-                    return int(ln.split()[1]) // 1024
-    except OSError:
-        pass
-    return 1 << 30
+                    p = ln.split()
+                    if len(p) >= 2 and p[1].isdigit():
+                        avail = int(p[1]) // 1024
+                    break
+        if avail is None:
+            return None
+        cg = _cgroup_headroom_mb()
+    except (OSError, ValueError):
+        return None
+    return avail if cg is None else min(avail, cg)
 
 
 def load_plan(path):
@@ -301,6 +342,8 @@ def main(argv=None):
 
     queue = list(todo)
     n_done = 0
+    mem_bad = 0      # consecutive unreadable memory polls
+    rss_mb = 0       # largest engine RSS seen this session (the per-cell reserve)
     while queue or running:
         # reap
         for pid in list(running):
@@ -314,6 +357,11 @@ def main(argv=None):
             attempts.flush()
             if rc == 0 and os.path.exists(os.path.join(root, "cells", cid, "done.json")):
                 n_done += 1
+                try:
+                    kb = json.load(open(os.path.join(root, "cells", cid, "done.json")))["timing"]["engine_maxrss_kb"]
+                    rss_mb = max(rss_mb, kb // 1024)
+                except (OSError, ValueError, KeyError):
+                    pass
                 if n_done % 10 == 0 or not queue:
                     log(f"done {n_done}/{len(todo)} (last {cid}, {dt:.0f}s)")
             else:
@@ -326,7 +374,17 @@ def main(argv=None):
             log(f"STOP file: no new cells; waiting for {len(running)}")
         admit = stop_reason is None and not failed
         while admit and queue and len(running) < a.workers:
-            if mem_available_mb() < a.mem_min_mb:
+            head = mem_headroom_mb()
+            if head is None:
+                mem_bad += 1
+                if mem_bad == 1:
+                    log("memory reading unavailable or malformed: admitting nothing (fail closed)")
+                if not running and mem_bad >= 20:
+                    log("memory reading still unavailable with nothing running: exiting")
+                    return 2
+                break
+            mem_bad = 0
+            if head < a.mem_min_mb + max(150, rss_mb + 64):
                 break
             spec = queue.pop(0)
             d = os.path.join(root, "cells", spec["id"])
