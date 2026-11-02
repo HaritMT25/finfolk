@@ -42,4 +42,10 @@ cmp -s r1a_more.json r1a_more2.json || fail "a reseeded end checkpoint does not 
 if "$BIN" --no-render --headless 10 --reseed-after-load 3 > /dev/null 2>&1; then
     fail "--reseed-after-load without --load-checkpoint was accepted"
 fi
+
+# --checkpoint-every next to a bare --save-checkpoint file name (no directory)
+# used to throw from create_directories(""); the periodic files land beside it.
+run --headless 200 --load-checkpoint base.json --save-checkpoint bare.json --checkpoint-every 100
+[ -f bare.400.json ] && [ -f bare.500.json ] && [ -f bare.json ] || fail "--checkpoint-every with a bare file name"
+cmp -s bare.500.json bare.json || fail "the last periodic checkpoint differs from the end checkpoint"
 echo "reseed_after_load: ok"

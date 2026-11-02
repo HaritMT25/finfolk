@@ -406,7 +406,10 @@ int main(int argc, char** argv) {
         // strip a trailing .json so the periodic files read name.<frame>.json
         if (checkpointBase.size() > 5 && checkpointBase.compare(checkpointBase.size() - 5, 5, ".json") == 0)
             checkpointBase.resize(checkpointBase.size() - 5);
-        std::filesystem::create_directories(std::filesystem::path(checkpointBase).parent_path());
+        // A bare file name (--save-checkpoint end.json) has no parent, and
+        // create_directories("") throws: guard it like --save-checkpoint below.
+        const auto cpParent = std::filesystem::path(checkpointBase).parent_path();
+        if (!cpParent.empty()) std::filesystem::create_directories(cpParent);
     }
     if (!saveCheckpoint.empty()) {
         const auto parent = std::filesystem::path(saveCheckpoint).parent_path();
