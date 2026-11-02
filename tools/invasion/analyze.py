@@ -596,7 +596,7 @@ def _largest_complete(names, has):
     return names
 
 
-def matrices(rows, meta=None, zmin=2.0, sims=9999, registry=None, kind="wild", seed=5, dG=None):
+def matrices(rows, meta=None, zmin=2.0, sims=9999, registry=None, kind=infer.DEFAULT_KIND, seed=5, dG=None):
     """Complete blocks (every ordered pair + every sham, on common replicates): per condition,
     fraction and window, separately (pooling conditions can fake cycles).
 

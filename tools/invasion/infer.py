@@ -64,9 +64,12 @@ from __future__ import annotations
 import math
 import random
 
-# The bootstrap analyze.py uses unless told otherwise: the one calibrate.py's null simulations
-# found closest to nominal at the pilot's scale (see calibrate.py and invasion_pilot.md).
-DEFAULT_KIND = "wild"
+# The bootstrap analyze.py uses unless told otherwise. calibrate.py's null simulations at the
+# pilot's scale (N = 8, k = 6; six null worlds incl. the blocks' own resampled units; 1,000 datasets
+# each, B = 999) found the residual-unit bootstrap never above nominal (alpha 0.05: 0.004-0.035;
+# 0.0045: <= 0.002), while the wild (random-sign) one was closer to nominal at 0.05 (0.029-0.066)
+# but up to 2.4x liberal at 0.0045. Formal decisions need validity at small alpha: residual.
+DEFAULT_KIND = "residual"
 
 
 # ------------------------------------------------------------ block algebra
@@ -235,7 +238,7 @@ def _fast_stats(res, E, plan, kind):
             "tauA": sA * f, "tauC": sC * f, "tauS": sS * f}
 
 
-def bootstrap(zs, B=9999, seed=1, kind="wild", ladder=None):
+def bootstrap(zs, B=9999, seed=1, kind=DEFAULT_KIND, ladder=None):
     """Null draws for conditions zs (a list; units p, r aligned across conditions are drawn
     jointly). -> list of dicts F_C, F_S (joint over conditions), and for zs[0]: T_C0 (the
     unstudentized curl energy), eA (norm of the edge-noise vector), share (raw cyclic share of
@@ -318,7 +321,7 @@ def confidence_ball(A, N, r95):
     return (math.sin(max(0.0, phi - dl)) ** 2, math.sin(min(math.pi / 2, phi + dl)) ** 2), dC, False
 
 
-def infer(zs, B=9999, seed=1, kind="wild"):
+def infer(zs, B=9999, seed=1, kind=DEFAULT_KIND):
     """Formal inference for one condition (zs = [z]) or several conditions with aligned units.
     -> dict: per-condition statistics of zs[0] and the joint p-values."""
     st = [block_stats(z) for z in zs]
