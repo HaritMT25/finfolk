@@ -230,12 +230,14 @@ inline void reference(const OceanWorld& w, float out[NUM_SENSES]) {
     }
     if (labels) {
         if (count > 0) { avgDx /= count; avgDy /= count; avgDz /= count; avgHx /= count; avgHy /= count; }
+        // labelFrame 1 (A1): x = right, y = ahead; the offset projected before the tanh
+        const bool own = w.ocfg.labelFrame == 1;
         out[NEIGHBOR_COUNT] = tanhCountOver10(inRadius);
-        out[AVG_NEIGHBOR_DX] = evomath::tanhf(avgDx / R);
-        out[AVG_NEIGHBOR_DY] = evomath::tanhf(avgDy / R);
+        out[AVG_NEIGHBOR_DX] = evomath::tanhf((own ? avgDx * rht.x + avgDy * rht.y : avgDx) / R);
+        out[AVG_NEIGHBOR_DY] = evomath::tanhf((own ? avgDx * fwd.x + avgDy * fwd.y : avgDy) / R);
         out[AVG_NEIGHBOR_DZ] = evomath::tanhf(avgDz / R);
-        out[AVG_NEIGHBOR_HEADING_X] = avgHx;
-        out[AVG_NEIGHBOR_HEADING_Y] = avgHy;
+        out[AVG_NEIGHBOR_HEADING_X] = own ? avgHx * rht.x + avgHy * rht.y : avgHx;
+        out[AVG_NEIGHBOR_HEADING_Y] = own ? avgHx * fwd.x + avgHy * fwd.y : avgHy;
         out[NEAREST_NEIGHBOR_DIST] = nearestDist / R;
         out[POPULATION_DENSITY] = tanhCountOver15(inRadius);
         out[POPULATION_FWD] = tanhCountOver5(popFwd);
@@ -279,8 +281,9 @@ inline void reference(const OceanWorld& w, float out[NUM_SENSES]) {
         }
     }
     if (labels) {
-        out[NEAREST_FOOD_DX] = foodDx;
-        out[NEAREST_FOOD_DY] = foodDy;
+        const bool own = w.ocfg.labelFrame == 1;   // the unit vector's horizontal part, right / ahead
+        out[NEAREST_FOOD_DX] = own ? foodDx * rht.x + foodDy * rht.y : foodDx;
+        out[NEAREST_FOOD_DY] = own ? foodDx * fwd.x + foodDy * fwd.y : foodDy;
         out[NEAREST_FOOD_DZ] = foodDz;
         out[NEAREST_FOOD_DIST] = foodDist / R;
         out[FOOD_DENSITY] = tanhCountOver10(foodCount);
@@ -1187,9 +1190,10 @@ void testSenseEdges() {
 // (multiples of 10, exact R, the 3-4-5 triangle (60, 80), halves and eighths)
 // so equal distances, zero distances and points exactly on R are common; the
 // viewer sits anywhere, often on a world edge or (toroidal) next to the seam.
-void testSenseRef() {
+// labelFrame 1 ("sense_ref_a1"): the same 600 scenes with own-frame labels.
+void testSenseRef(int labelFrame = 0) {
     using namespace sense;
-    Test t("sense_ref");
+    Test t(labelFrame ? "sense_ref_a1" : "sense_ref");
     std::uint32_t s = 0x9e3779b9u;
     auto next = [&]() { s ^= s << 13; s ^= s >> 17; s ^= s << 5; return s; };
     auto pick = [&](int n) { return (int)(next() % (std::uint32_t)n); };
@@ -1219,6 +1223,7 @@ void testSenseRef() {
 #endif
         oc.mouthGate = gate;
         oc.kMouth = pick(2) ? 1.2f : 1.0f;
+        oc.labelFrame = labelFrame;
         OceanWorld w;
         initQuiet(w, 400 + sc, 240.0f, oc, /*capture*/ true, tor);
         w.cfg.maxNeighbors = topo;

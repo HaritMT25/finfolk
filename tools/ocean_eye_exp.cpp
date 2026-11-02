@@ -90,15 +90,50 @@
 // per run the final classes, the dominant class / feature / lineage, the
 // per-side behaviour, when the dominant class reached 25 / 50 % of the fish;
 // with --course the left / right / both wire fractions at every snapshot.
+//
+// The ALIFE 2027 instruments (experiments/alife2027/v2/, tools/alife2027/;
+// all opt-in: without these flags the run, its CSV and its stdout are what
+// they were; tools/ocean_eye_exp_support.hpp says what each one reads):
+//   --eye-code N / --label-frame N   arm settings installed after the common
+//            initialization, like --arm's (so every arm of a seed starts from
+//            the same world); --label-frame needs an engine with labelFrame
+//   --resolved PATH     the configuration used for initialization and the
+//            effective one after the arm, every field by name (+ float bits)
+//   --manifest PATH     what this process ran: argv, seed, arm, world, build
+//            capabilities (NUM_SENSES ...), both configs, the outcome
+//   --fp PATH [--fp-every K] [--fp-dense]   fingerprints at step 0 (after the
+//            arm), every K (default --every) and the last step; --fp-dense
+//            folds EVERY step's fingerprint into a chain (printed at the same
+//            steps) — the verification mode; sparse observes only the printed
+//            steps
+//   --diag PATH         per-step accumulators, a row at 0, every --every, last
+//   --encounters PATH [--encounters-until N] [--encounters-every K]   pairs
+//            within the interaction radius, the mating funnel, interactions,
+//            pairings, encounter durations (rows every K, through N)
+//   --branches SPEC --branch-at S1,S2 --branch-out PATH [--branch-steps K]
+//            [--branch-fp-every K] [--branch-early K] [--branch-order forward|reverse]
+//            the common-history suite: right after step S, each continuation of
+//            SPEC ("name:key=v,...;name2:;...") runs K steps on a copy of the
+//            world and the rng; the parent is checked unchanged and, where the
+//            run passes S + K, every sham (no change) continuation is checked
+//            against the uninterrupted run
+//   --behav-at S1,S2    the behavioural test at those steps too (PREFIX_behav_S.csv)
+//   --wiring-no-paths   the final wiring snapshot without its per-path rows
+// Exit status: 0 ok, 2 arguments, 3 an output could not be written, 4 config
+// refused, 5 non-finite state observed, 6 an instrument check failed (sham
+// identity, parent restoration, the food identity / expiry replay).
 #include <algorithm>
 #include <chrono>
+#include <cinttypes>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <string>
 #include <vector>
 #include "ocean_fingerprint.hpp"   // ofp::initWorld: the page's config path
+#include "ocean_eye_exp_support.hpp"   // the ALIFE 2027 instruments (alx::)
 
 #ifndef EVO_OCEAN_EYE
 #error "ocean_eye_exp needs the eye build: -DEVO_OCEAN_EYE"
@@ -454,7 +489,7 @@ void writeBehavRow(std::FILE* f, const char* arm, unsigned seed, const char* who
                  b.pos_one_bias / n, b.pos_fish_both / n);
 }
 
-void behaviouralTest(const OceanWorld& w, const char* arm, unsigned seed, const std::string& path) {
+bool behaviouralTest(const OceanWorld& w, const char* arm, unsigned seed, const std::string& path) {
     // A quiet eye-only world with the run's own motion settings. (Every scene
     // saves and restores the world's rng itself, and the random genomes have
     // their own stream: nothing below reads the world's rng.)
@@ -478,14 +513,16 @@ void behaviouralTest(const OceanWorld& w, const char* arm, unsigned seed, const 
         addBehav(rnd, idx);
     }
     std::FILE* out = std::fopen(path.c_str(), "w");
-    if (!out) { std::fprintf(stderr, "cannot write %s\n", path.c_str()); return; }
+    if (!out) { std::fprintf(stderr, "cannot write %s\n", path.c_str()); return false; }
     std::fprintf(out, "arm,seed,genomes,n,food_h,food_v,food_spd,pred_h,pred_v,pred_spd,react_food,react_pred,"
                       "frac_food_h,frac_food_v,frac_pred_v,frac_pred_spd,fish_h,fish_v,fish_spd,react_fish,frac_fish_h,"
                       "base_abs,base_x,food_r,food_l,fish_r,fish_l,frac_food_both,frac_food_one,frac_one_bias,"
                       "frac_fish_both\n");
     writeBehavRow(out, arm, seed, "evolved", evo);
     writeBehavRow(out, arm, seed, "random", rnd);
-    std::fclose(out);
+    const bool bad = std::ferror(out) != 0;
+    if (std::fclose(out) != 0 || bad) { std::fprintf(stderr, "error writing %s\n", path.c_str()); return false; }
+    return true;
 }
 
 // ---- the per-fish wiring dump (--dump-wiring PATH) ----------------------------
@@ -763,7 +800,14 @@ struct WiringDump {
         rnd.write(f, step, "random");
         std::fflush(f);
     }
-    void close() { if (f) std::fclose(f); f = nullptr; }
+    // false: a write failed somewhere in the dump (the file is incomplete)
+    bool close() {
+        if (!f) return true;
+        const bool bad = std::ferror(f) != 0;
+        const bool ok = std::fclose(f) == 0 && !bad;
+        f = nullptr;
+        return ok;
+    }
 };
 
 double median(std::vector<double> v) {
@@ -776,7 +820,55 @@ double median(std::vector<double> v) {
 }  // namespace
 
 #ifndef OCEAN_EYE_EXP_NO_MAIN   // tests/ocean_tests.cpp (eye build) includes this file without it
+namespace {
+
+// "20000,100000" -> {20000, 100000}; false on anything else
+bool parseStepList(const char* s, std::vector<long>& out) {
+    out.clear();
+    const char* p = s;
+    while (*p) {
+        char* end = nullptr;
+        const long v = std::strtol(p, &end, 10);
+        if (end == p || v < 0) return false;
+        out.push_back(v);
+        if (*end == ',') p = end + 1;
+        else if (*end == '\0') p = end;
+        else return false;
+    }
+    std::sort(out.begin(), out.end());
+    return !out.empty() && std::adjacent_find(out.begin(), out.end()) == out.end();
+}
+
+bool closeChecked(std::FILE*& f, const std::string& path) {
+    if (!f) return true;
+    const bool bad = std::ferror(f) != 0;
+    const bool ok = std::fclose(f) == 0 && !bad;
+    f = nullptr;
+    if (!ok) std::fprintf(stderr, "error writing %s\n", path.c_str());
+    return ok;
+}
+
+std::string compilerId() {
+#if defined(__clang__)
+    return std::string("clang ") + __clang_version__;
+#elif defined(__GNUC__)
+    return std::string("gcc ") + __VERSION__;
+#else
+    return "unknown";
+#endif
+}
+
+}  // namespace
+
 int main(int argc, char** argv) {
+    if (argc == 2 && !std::strcmp(argv[1], "--capabilities")) {   // the build's capabilities, for the build manifest
+        std::printf("{\"NUM_SENSES\":%d,\"NUM_ACTIONS\":%d,\"eye_build\":%s,\"label_frame\":%s,\"fingerprint_format\":%d,"
+                    "\"diag_format\":%d,\"branch_format\":%d,\"encounter_format\":%d,\"cplusplus\":%ld,\"compiler\":\"%s\"}\n",
+                    (int)NUM_SENSES, (int)NUM_ACTIONS, kOceanHasEye ? "true" : "false",
+                    alx::hasLabelFrame() ? "true" : "false", ofp::kFormatVersion, alx::kDiagFormat, alx::kBranchFormat,
+                    alx::kEncounterFormat, (long)__cplusplus, alx::jsonEscape(compilerId()).c_str());
+        return 0;
+    }
     unsigned seed = 1;
     long steps = 100000, every = 10000, evolve = 30000;
     int W = 1920, H = 1080, pop = 300, reps = 7, warm = 20, bsteps = 200;
@@ -785,6 +877,12 @@ int main(int argc, char** argv) {
     std::string out = "run", armArg = "A", evolveArm = "B", label, dumpPath;
     long wiringEvery = 0;
     bool behav = false, bench = false;
+    // the ALIFE 2027 instruments (opt-in; see the header)
+    int eyeCodeArg = -1, labelFrameArg = -1;
+    std::string resolvedPath, manifestPath, fpPath, diagPath, encPath, branchSpecText, branchOut, branchOrder = "forward";
+    long fpEvery = 0, encUntil = 30000, encEvery = 1000, branchSteps = 2000, branchFpEvery = 250, branchEarly = 250;
+    bool fpDense = false, wiringNoPaths = false;
+    std::vector<long> branchAt, behavAt;
     for (int i = 1; i < argc; ++i) {
         auto is = [&](const char* k) { return std::strcmp(argv[i], k) == 0 && i + 1 < argc; };
         if (is("--seed")) seed = (unsigned)std::strtoul(argv[++i], nullptr, 10);
@@ -807,8 +905,54 @@ int main(int argc, char** argv) {
         else if (is("--wiring-every")) wiringEvery = std::strtol(argv[++i], nullptr, 10);
         else if (!std::strcmp(argv[i], "--behav")) behav = true;
         else if (!std::strcmp(argv[i], "--bench")) bench = true;
+        // ALIFE 2027
+        else if (is("--eye-code")) eyeCodeArg = std::atoi(argv[++i]);
+        else if (is("--label-frame")) labelFrameArg = std::atoi(argv[++i]);
+        else if (is("--resolved")) resolvedPath = argv[++i];
+        else if (is("--manifest")) manifestPath = argv[++i];
+        else if (is("--fp")) fpPath = argv[++i];
+        else if (is("--fp-every")) fpEvery = std::strtol(argv[++i], nullptr, 10);
+        else if (!std::strcmp(argv[i], "--fp-dense")) fpDense = true;
+        else if (is("--diag")) diagPath = argv[++i];
+        else if (is("--encounters")) encPath = argv[++i];
+        else if (is("--encounters-until")) encUntil = std::strtol(argv[++i], nullptr, 10);
+        else if (is("--encounters-every")) encEvery = std::strtol(argv[++i], nullptr, 10);
+        else if (is("--branches")) branchSpecText = argv[++i];
+        else if (is("--branch-out")) branchOut = argv[++i];
+        else if (is("--branch-steps")) branchSteps = std::strtol(argv[++i], nullptr, 10);
+        else if (is("--branch-fp-every")) branchFpEvery = std::strtol(argv[++i], nullptr, 10);
+        else if (is("--branch-early")) branchEarly = std::strtol(argv[++i], nullptr, 10);
+        else if (is("--branch-order")) branchOrder = argv[++i];
+        else if (is("--branch-at")) {
+            if (!parseStepList(argv[++i], branchAt)) { std::fprintf(stderr, "bad --branch-at %s\n", argv[i]); return 2; }
+        }
+        else if (is("--behav-at")) {
+            if (!parseStepList(argv[++i], behavAt)) { std::fprintf(stderr, "bad --behav-at %s\n", argv[i]); return 2; }
+        }
+        else if (!std::strcmp(argv[i], "--wiring-no-paths")) wiringNoPaths = true;
         else { std::fprintf(stderr, "unknown or incomplete argument: %s\n", argv[i]); return 2; }
     }
+
+    // ALIFE 2027 argument checks (none apply to a legacy invocation)
+    const bool fpOn = !fpPath.empty(), diagOn = !diagPath.empty(), encOn = !encPath.empty();
+    const bool branchOn = !branchSpecText.empty() || !branchAt.empty() || !branchOut.empty();
+    std::vector<alx::BranchSpec> specs;
+    {
+        std::string e;
+        if (fpDense && !fpOn) e = "--fp-dense needs --fp";
+        else if (fpOn && fpEvery < 0) e = "--fp-every must be >= 0";
+        else if (encOn && (encUntil < 1 || encEvery < 1)) e = "--encounters-until / --encounters-every must be >= 1";
+        else if (branchOn && (branchSpecText.empty() || branchAt.empty() || branchOut.empty()))
+            e = "branching needs --branches, --branch-at and --branch-out";
+        else if (branchOn && !alx::parseBranchSpecs(branchSpecText, specs, e)) e = "--branches: " + e;
+        else if (branchOn && (branchSteps < 1 || branchFpEvery < 0 || branchEarly < 0)) e = "bad --branch-steps / --branch-fp-every / --branch-early";
+        else if (branchOn && branchOrder != "forward" && branchOrder != "reverse") e = "--branch-order is forward or reverse";
+        else if (branchOn && (branchAt.front() < 1 || branchAt.back() > steps)) e = "--branch-at steps must be in 1..--steps";
+        else if (!behavAt.empty() && (behavAt.front() < 1 || behavAt.back() > steps)) e = "--behav-at steps must be in 1..--steps";
+        else if (labelFrameArg > 0 && !alx::hasLabelFrame()) e = "--label-frame: this engine has no labelFrame";
+        if (!e.empty()) { std::fprintf(stderr, "%s\n", e.c_str()); return 2; }
+    }
+    if (fpOn && fpEvery == 0) fpEvery = every;
 
     OceanWorld w;
     std::string err;
@@ -816,6 +960,8 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "config refused: %s\n", err.c_str());
         return 4;
     }
+    const bool wantCfgJson = !resolvedPath.empty() || !manifestPath.empty();
+    const std::string initCfgJson = wantCfgJson ? alx::configJson(w.cfg, w.ocfg) : std::string();
 
     if (bench) {
         // Evolve under one arm, then time all four arms on that snapshot,
@@ -864,9 +1010,73 @@ int main(int argc, char** argv) {
     w.ocfg.eye = arm->eye;
     w.ocfg.eyeOnly = arm->eyeOnly;
     if (armArg.size() > 1) w.ocfg.steerFrame = armArg[1] - '0';   // "C1": steerFrame 1
+    if (eyeCodeArg >= 0) w.ocfg.eyeCode = eyeCodeArg;             // after the common initialization, like the arm
+    if (labelFrameArg > 0 || (labelFrameArg == 0 && alx::hasLabelFrame())) {   // 0 is the default: a no-op without the key
+        std::string e;
+        if (!alx::setArmKey(w.ocfg, "labelFrame", labelFrameArg, e)) { std::fprintf(stderr, "%s\n", e.c_str()); return 4; }
+    }
     if (!oceanConfigValid(w.ocfg)) { std::fprintf(stderr, "invalid ocean config\n"); return 4; }
+    if (encOn && !alx::EncounterDiag::supported(w)) { std::fprintf(stderr, "--encounters: toroidal worlds are not supported\n"); return 2; }
     const std::string armStr = label.empty() ? armArg.substr(0, 2) : label;
     const char* armName = armStr.c_str();
+    const std::string effCfgJson = wantCfgJson ? alx::configJson(w.cfg, w.ocfg) : std::string();
+    std::uint32_t dtBits;
+    std::memcpy(&dtBits, &kDt, 4);
+
+    if (!resolvedPath.empty()) {
+        std::FILE* rf = std::fopen(resolvedPath.c_str(), "w");
+        if (!rf) { std::fprintf(stderr, "cannot write %s\n", resolvedPath.c_str()); return 3; }
+        std::fprintf(rf,
+                     "{\"schema\":\"finfolk.alife2027.resolved/1\",\"seed\":%u,\"arm\":\"%s\",\"world\":{\"width\":%d,"
+                     "\"height\":%d,\"depth\":%.9g,\"founders\":%d},\"dt\":%.9g,\"dt_bits\":\"%08" PRIx32 "\",\"init\":%s,"
+                     "\"effective\":%s}\n",
+                     seed, alx::jsonEscape(armStr).c_str(), W, H, depth, pop, (double)kDt, dtBits, initCfgJson.c_str(),
+                     effCfgJson.c_str());
+        if (!closeChecked(rf, resolvedPath)) return 3;
+    }
+
+    // Fingerprints: step 0 is observed after the arm and before any instrument.
+    alx::FpObserver fpObs;
+    fpObs.dense = fpDense;
+    if (fpOn) {
+        fpObs.out = std::fopen(fpPath.c_str(), "w");
+        if (!fpObs.out) { std::fprintf(stderr, "cannot write %s\n", fpPath.c_str()); return 3; }
+        std::fprintf(fpObs.out, "# ocean_eye_exp fingerprints format=%d mode=%s every=%ld seed=%u arm=%s steps=%ld\n",
+                     ofp::kFormatVersion, fpDense ? "dense" : "sparse", fpEvery, seed, armName, steps);
+        fpObs.observe(w, 0, true);
+    }
+    alx::StepDiag diag;
+    std::FILE* diagF = nullptr;
+    if (diagOn) {
+        diagF = std::fopen(diagPath.c_str(), "w");
+        if (!diagF) { std::fprintf(stderr, "cannot write %s\n", diagPath.c_str()); return 3; }
+        std::fprintf(diagF, "# ocean_eye_exp diagnostics format=%d seed=%u arm=%s every=%ld\n%s\n", alx::kDiagFormat, seed,
+                     armName, every, alx::StepDiag::header());
+        diag.begin(w);
+        diag.row(diagF, w, 0);
+    }
+    alx::EncounterDiag enc;
+    std::FILE* encF = nullptr;
+    if (encOn) {
+        encF = std::fopen(encPath.c_str(), "w");
+        if (!encF) { std::fprintf(stderr, "cannot write %s\n", encPath.c_str()); return 3; }
+        std::fprintf(encF, "# ocean_eye_exp encounters format=%d seed=%u arm=%s until=%ld every=%ld interactRadius=%.9g\n%s\n",
+                     alx::kEncounterFormat, seed, armName, encUntil, encEvery, (double)w.cfg.interactRadius,
+                     alx::EncounterDiag::header());
+    }
+    std::FILE* branchF = nullptr;
+    std::FILE* branchFpF = nullptr;
+    const std::string branchFpPath = branchOut + ".fp.txt";
+    if (branchOn) {
+        branchF = std::fopen(branchOut.c_str(), "w");
+        branchFpF = branchF ? std::fopen(branchFpPath.c_str(), "w") : nullptr;
+        if (!branchF || !branchFpF) { std::fprintf(stderr, "cannot write %s(.fp.txt)\n", branchOut.c_str()); return 3; }
+        std::fprintf(branchF, "# ocean_eye_exp branches format=%d seed=%u arm=%s at=", alx::kBranchFormat, seed, armName);
+        for (std::size_t k = 0; k < branchAt.size(); ++k) std::fprintf(branchF, "%s%ld", k ? "," : "", branchAt[k]);
+        std::fprintf(branchF, " steps=%ld fp_every=%ld early=%ld order=%s mode=%s spec=%s\n%s\n", branchSteps, branchFpEvery,
+                     branchEarly, branchOrder.c_str(), fpDense ? "dense" : "sparse", branchSpecText.c_str(), alx::branchHeader());
+    }
+
     WiringDump dump;
     if (!dumpPath.empty() && !dump.open(dumpPath, w, armName, seed, cfgJson)) {
         std::fprintf(stderr, "cannot write %s\n", dumpPath.c_str());
@@ -888,6 +1098,13 @@ int main(int argc, char** argv) {
     std::printf("arm %s (eye %d, eyeOnly %d, steerFrame %d, eyeCode %d) seed %u steps %ld cfg %s\n", armName,
                 arm->eye, arm->eyeOnly, w.ocfg.steerFrame, w.ocfg.eyeCode, seed, steps, cfgJson ? cfgJson : "{}");
 
+    // Sham continuations, checked against the uninterrupted run where it passes them.
+    struct ShamCheck { long checkpoint; std::string branch; long compared = 0, mismatched = 0, expected = 0; };
+    std::vector<ShamCheck> shamChecks;
+    std::map<long, std::vector<std::pair<std::size_t, ofp::Fingerprint>>> shamExpect;   // step -> (check index, fp)
+    long parentChecks = 0, parentFailed = 0, branchInstrumentBad = 0, branchNonFinite = 0;
+    bool outputsOk = true;
+
     RandomGen wiringRng;
     wiringRng.seed(seed * 2654435761u + 11u);
     RandomGen clusterRng;   // the clustering null's positions (private)
@@ -901,7 +1118,30 @@ int main(int argc, char** argv) {
     const auto tRun = clk::now();
     for (long s = 1; s <= steps; ++s) {
         fishSteps += (double)w.creatures.size();
+        if (diagOn) diag.before(w, kDt);
+        const bool encNow = encOn && s <= encUntil;
+        if (encNow) enc.before(w);
         w.update(kDt);
+        if (fpOn) fpObs.observe(w, s, s % fpEvery == 0 || s == steps);
+        if (diagOn) {
+            diag.after(w, s);
+            if (s % every == 0 || s == steps) diag.row(diagF, w, s);
+        }
+        if (encNow) {
+            enc.after(w, s);
+            if (s % encEvery == 0 || s == encUntil || s == steps) { enc.row(encF, s); enc.resetInterval(); }
+        }
+        if (!shamExpect.empty()) {
+            const auto it = shamExpect.find(s);
+            if (it != shamExpect.end()) {
+                const ofp::Fingerprint here = (fpOn && fpObs.lastStep == s) ? fpObs.last : ofp::fingerprint(w);
+                for (const auto& e : it->second) {
+                    ++shamChecks[e.first].compared;
+                    if (!(e.second == here)) ++shamChecks[e.first].mismatched;
+                }
+                shamExpect.erase(it);
+            }
+        }
         sumPop += (double)w.creatures.size();
         sumFood += (double)w.food.size();
         sumPreds += (double)w.predators.size();
@@ -909,6 +1149,59 @@ int main(int argc, char** argv) {
             const auto t0 = clk::now();
             dump.snapshot(w, s, false);
             tInt += clk::now() - t0;   // not in the interval's step timing
+        }
+        if (!behavAt.empty() && std::binary_search(behavAt.begin(), behavAt.end(), s)) {
+            const auto t0 = clk::now();
+            if (!behaviouralTest(w, armName, seed, out + "_behav_" + std::to_string(s) + ".csv")) outputsOk = false;
+            tInt += clk::now() - t0;
+        }
+        if (branchOn && std::binary_search(branchAt.begin(), branchAt.end(), s)) {
+            const auto t0 = clk::now();
+            const ofp::Fingerprint before = ofp::fingerprint(w);
+            const RandomGen parentRng = rng;
+            std::vector<std::size_t> order(specs.size());
+            for (std::size_t k = 0; k < order.size(); ++k) order[k] = k;
+            if (branchOrder == "reverse") std::reverse(order.begin(), order.end());
+            std::vector<alx::BranchResult> res(specs.size());
+            for (std::size_t k : order) {
+                std::string e;
+                if (!alx::runContinuation(w, parentRng, specs[k], s, branchSteps, branchFpEvery, branchEarly, fpDense, kDt,
+                                          res[k], e)) {
+                    std::fprintf(stderr, "%s\n", e.c_str());
+                    return 2;
+                }
+            }
+            const ofp::Fingerprint after = ofp::fingerprint(w);
+            ++parentChecks;
+            const bool parentOk = before == after;
+            if (!parentOk) ++parentFailed;
+            for (std::size_t k = 0; k < specs.size(); ++k) {   // spec order, whatever the execution order
+                const alx::BranchResult& r = res[k];
+                alx::branchRow(branchF, seed, armName, r);
+                for (const auto& f : r.fps) {
+                    const std::string line = ofp::fingerprintLine("bfp", s + f.first, w, f.second);
+                    // fingerprintLine prints the PARENT's counts (w); keep only its hashes
+                    const std::size_t bar = line.find(" | ");
+                    std::fprintf(branchFpF, "bfp %ld %s +%lld %016" PRIx64 "%s\n", s, r.name.c_str(), f.first, f.second.all,
+                                 bar == std::string::npos ? "" : line.c_str() + bar);
+                }
+                branchInstrumentBad += r.identityBad + r.expiryBad;
+                branchNonFinite += r.nonFinite;
+                if (specs[k].changes.empty()) {   // a sham: the uninterrupted run must pass the same states
+                    ShamCheck sc;
+                    sc.checkpoint = s;
+                    sc.branch = r.name;
+                    shamChecks.push_back(sc);
+                    for (const auto& f : r.fps)
+                        if (f.first > 0 && s + f.first <= steps) {
+                            shamExpect[s + f.first].emplace_back(shamChecks.size() - 1, f.second);
+                            ++shamChecks.back().expected;
+                        }
+                }
+            }
+            std::fprintf(branchF, "# check parent_restored checkpoint=%ld %s\n", s, parentOk ? "ok" : "FAILED");
+            std::fflush(branchF);
+            tInt += clk::now() - t0;
         }
         if (s % every != 0 && s != steps) continue;
 
@@ -967,20 +1260,100 @@ int main(int argc, char** argv) {
         sumPop = sumFood = sumPreds = fishSteps = 0;
         tInt = clk::now();
     }
-    std::fclose(csv);
-    std::printf("run done in %.1f s\n", std::chrono::duration<double>(clk::now() - tRun).count());
+    if (!closeChecked(csv, out + ".csv")) outputsOk = false;
+    const double runSecs = std::chrono::duration<double>(clk::now() - tRun).count();
+    std::printf("run done in %.1f s\n", runSecs);
     if (!dumpPath.empty()) {
         const auto td = clk::now();
-        dump.snapshot(w, steps, true);
-        dump.close();
+        dump.snapshot(w, steps, !wiringNoPaths);
+        if (!dump.close()) { std::fprintf(stderr, "error writing %s\n", dumpPath.c_str()); outputsOk = false; }
         std::printf("wiring dump in %.1f s: %s\n", std::chrono::duration<double>(clk::now() - td).count(),
                     dumpPath.c_str());
     }
     if (behav) {
         const auto tb = clk::now();
-        behaviouralTest(w, armName, seed, out + "_behav.csv");
+        if (!behaviouralTest(w, armName, seed, out + "_behav.csv")) outputsOk = false;
         std::printf("behavioural test in %.1f s\n", std::chrono::duration<double>(clk::now() - tb).count());
     }
-    return 0;
+
+    // ---- the ALIFE 2027 instruments' verdicts ------------------------------------
+    long shamCompared = 0, shamMismatched = 0, shamUnchecked = 0;
+    if (branchOn) {
+        for (const ShamCheck& sc : shamChecks) {
+            const bool unchecked = sc.expected == 0;
+            shamCompared += sc.compared;
+            shamMismatched += sc.mismatched + (sc.expected - sc.compared);
+            shamUnchecked += unchecked;
+            std::fprintf(branchF, "# check sham_identity checkpoint=%ld branch=%s compared=%ld mismatched=%ld %s\n",
+                         sc.checkpoint, sc.branch.c_str(), sc.compared, sc.mismatched + (sc.expected - sc.compared),
+                         unchecked ? "unchecked (the run ends before the continuation does)"
+                                   : (sc.mismatched == 0 && sc.compared == sc.expected ? "ok" : "FAILED"));
+        }
+        std::fprintf(branchF, "# check food_identity bad=%ld %s\n", branchInstrumentBad, branchInstrumentBad ? "FAILED" : "ok");
+        if (!closeChecked(branchF, branchOut)) outputsOk = false;
+        if (!closeChecked(branchFpF, branchFpPath)) outputsOk = false;
+    }
+    if (encOn && !closeChecked(encF, encPath)) outputsOk = false;
+    if (diagOn && !closeChecked(diagF, diagPath)) outputsOk = false;
+    if (fpOn) {
+        std::fprintf(fpObs.out, "fp_summary observed=%lld nonfinite_max=%lld nonfinite_first=%lld mode=%s",
+                     fpObs.observed, fpObs.nonFiniteMax, fpObs.nonFiniteFirst, fpDense ? "dense" : "sparse");
+        if (fpDense) std::fprintf(fpObs.out, " chain=%016" PRIx64, fpObs.chain.value());
+        std::fputc('\n', fpObs.out);
+        if (!closeChecked(fpObs.out, fpPath)) outputsOk = false;
+    }
+    const bool nonFinite = fpObs.nonFiniteMax > 0 || branchNonFinite > 0;
+    const bool instrumentBad = diag.identityBad > 0 || diag.expiryBad > 0 || branchInstrumentBad > 0 || parentFailed > 0 ||
+                               shamMismatched > 0;
+    const int status = !outputsOk ? 3 : nonFinite ? 5 : instrumentBad ? 6 : 0;
+    if (!manifestPath.empty()) {
+        std::FILE* mf = std::fopen(manifestPath.c_str(), "w");
+        if (!mf) { std::fprintf(stderr, "cannot write %s\n", manifestPath.c_str()); return 3; }
+        std::fprintf(mf, "{\"schema\":\"finfolk.alife2027.run_info/1\",\"tool\":\"tools/ocean_eye_exp.cpp\",\"argv\":[");
+        for (int i = 0; i < argc; ++i) std::fprintf(mf, "%s\"%s\"", i ? "," : "", alx::jsonEscape(argv[i]).c_str());
+        std::fprintf(mf, "],\"seed\":%u,\"arm\":\"%s\",\"arm_letter\":\"%c\",\"arm_settings\":{\"eye\":%d,\"eyeOnly\":%d,"
+                         "\"steerFrame\":%d,\"eyeCode\":%d,\"labelFrame\":%d},",
+                     seed, alx::jsonEscape(armStr).c_str(), arm->name, w.ocfg.eye, w.ocfg.eyeOnly, w.ocfg.steerFrame,
+                     w.ocfg.eyeCode, alx::armKey(w.ocfg, "labelFrame"));
+        std::fprintf(mf, "\"world\":{\"width\":%d,\"height\":%d,\"depth\":%.9g,\"founders\":%d},\"steps\":%ld,\"every\":%ld,"
+                         "\"dt\":%.9g,\"dt_bits\":\"%08" PRIx32 "\",",
+                     W, H, depth, pop, steps, every, (double)kDt, dtBits);
+        std::fprintf(mf, "\"build\":{\"NUM_SENSES\":%d,\"NUM_ACTIONS\":%d,\"eye_build\":%s,\"label_frame\":%s,"
+                         "\"fingerprint_format\":%d,\"diag_format\":%d,\"branch_format\":%d,\"encounter_format\":%d,"
+                         "\"cplusplus\":%ld,\"compiler\":\"%s\",\"optimize\":%s,\"fast_math\":%s,\"pointer_bits\":%d},",
+                     (int)NUM_SENSES, (int)NUM_ACTIONS, kOceanHasEye ? "true" : "false", alx::hasLabelFrame() ? "true" : "false",
+                     ofp::kFormatVersion, alx::kDiagFormat, alx::kBranchFormat, alx::kEncounterFormat, (long)__cplusplus,
+                     alx::jsonEscape(compilerId()).c_str(),
+#ifdef __OPTIMIZE__
+                     "true",
+#else
+                     "false",
+#endif
+#ifdef __FAST_MATH__
+                     "true",
+#else
+                     "false",
+#endif
+                     (int)(8 * sizeof(void*)));
+        std::fprintf(mf, "\"instruments\":{\"fp\":%s,\"fp_mode\":\"%s\",\"fp_every\":%ld,\"diag\":%s,\"encounters\":%s,"
+                         "\"encounters_until\":%ld,\"branches\":%s,\"behav\":%s,\"wiring\":%s,\"wiring_every\":%ld},",
+                     fpOn ? "true" : "false", fpOn ? (fpDense ? "dense" : "sparse") : "none", fpOn ? fpEvery : 0L,
+                     diagOn ? "true" : "false", encOn ? "true" : "false", encOn ? encUntil : 0L, branchOn ? "true" : "false",
+                     behav ? "true" : "false", dumpPath.empty() ? "false" : "true", wiringEvery);
+        std::fprintf(mf, "\"result\":{\"status\":%d,\"final_step\":%ld,\"run_seconds\":%.3f,\"fp_observed\":%lld,"
+                         "\"nonfinite_max\":%lld,\"nonfinite_first\":%lld,\"food_identity_bad\":%lld,\"food_expiry_bad\":%lld,"
+                         "\"branch_parent_checks\":%ld,\"branch_parent_failed\":%ld,\"sham_compared\":%ld,"
+                         "\"sham_mismatched\":%ld,\"sham_unchecked\":%ld,\"branch_instrument_bad\":%ld,"
+                         "\"branch_nonfinite\":%ld,\"pop_final\":%zu,\"total_reseeds\":%lld},",
+                     status, steps, runSecs, fpObs.observed, fpObs.nonFiniteMax, fpObs.nonFiniteFirst, diag.identityBad,
+                     diag.expiryBad, parentChecks, parentFailed, shamCompared, shamMismatched, shamUnchecked,
+                     branchInstrumentBad, branchNonFinite, w.creatures.size(), w.totalReseeds);
+        std::fprintf(mf, "\"config_init\":%s,\"config_effective\":%s}\n", initCfgJson.c_str(), effCfgJson.c_str());
+        if (!closeChecked(mf, manifestPath)) return 3;
+    }
+    if (status == 5) std::fprintf(stderr, "non-finite state observed (max %lld, first at step %lld)\n", fpObs.nonFiniteMax, fpObs.nonFiniteFirst);
+    if (status == 6) std::fprintf(stderr, "instrument check failed: food identity %lld, expiry %lld, branch %ld, parent %ld, sham %ld\n",
+                                  diag.identityBad, diag.expiryBad, branchInstrumentBad, parentFailed, shamMismatched);
+    return status;
 }
 #endif  // OCEAN_EYE_EXP_NO_MAIN

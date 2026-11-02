@@ -54,7 +54,11 @@
 //                 eye mode: capture off == capture on, bit for bit
 //   capture_toggle  capture on -> off -> on: the same run; captured arrays
 //                 untouched while off
-//   food_scan     the food scans' item lists == their scalar definition, bit
+//   label_mask    the skip under own-frame labels (labelFrame 1, the A1 arm):
+//                 capture off == on, single-sensor and 2000-step runs
+//                 (tests/ocean_exp_tests.hpp; tests/label_mask_fault.sh plants
+//                 wrongly-masked components, each must fail it)
+//   food_scan    the food scans' item lists == their scalar definition, bit
 //                 for bit (the four in tests/ocean_speed_tests.hpp)
 //   food_life     foodLife: an item goes on the step its age reaches foodLife;
 //                 off, none do; the first stock's ages spread; draws unchanged;
@@ -4135,7 +4139,7 @@ void testVisionKeys() {
     Test t("vision_keys");
     int refused = 0, accepted = 0;
     auto tryInit = [&](const std::string& c) { return oc_init(1201, 1920, 1080, 240.0, 50, c.c_str()); };
-    for (const char* k : {"eye", "eyeOnly", "eyeCode", "steerFrame"}) {
+    for (const char* k : {"eye", "eyeOnly", "eyeCode", "steerFrame", "labelFrame"}) {
         for (const char* v : {"0.5", "1e300", "-1e300", "2147483648", "-2147483649", "1e999", "-0.25", "1.0000001"}) {
             const std::string c = std::string("{\"") + k + "\":" + v + "}";
             const int ok = tryInit(c);
@@ -4167,6 +4171,7 @@ void testVisionKeys() {
     const R rs[] = {
         {R"({"steerFrame":1})", true, true},      {R"({"steerFrame":1.0})", true, true},
         {R"({"steerFrame":2})", false, false},
+        {R"({"labelFrame":1})", true, true},      {R"({"labelFrame":2})", false, false},
         {R"({"eye":1})", true, false},            {R"({"eye":2})", false, false},
         {R"({"eyeOnly":1})", true, false},        {R"({"eyeOnly":2})", false, false},
         {R"({"eye":1,"eyeOnly":1,"eyeCode":7})", true, false},
@@ -4206,6 +4211,8 @@ void testVisionKeys() {
         const int sf = oc_set_param("steerFrame", 1.0), fl = oc_set_param("foodLife", 8.0);
         t.expect(sf == 1 && fl == 1 && g_world->ocfg.steerFrame == 1 && g_world->ocfg.foodLife == 8.0f,
                  "oc_set_param steerFrame 1 / foodLife 8 not stored: %s", oc_last_error());
+        const int lf = oc_set_param("labelFrame", 1.0), lfBad = oc_set_param("labelFrame", 2.0);
+        t.expect(lf == 1 && lfBad == 0 && g_world->ocfg.labelFrame == 1, "oc_set_param labelFrame 1 / 2: %d / %d", lf, lfBad);
         const int eye = oc_set_param("eye", 1.0);
         t.expect(eye == (kOceanHasEye ? 1 : 0), "oc_set_param(eye, 1) returned %d in the %s build", eye,
                  kOceanHasEye ? "eye" : "plain");
@@ -4803,6 +4810,7 @@ void testFlowLanes() {
 
 namespace ot {
 #include "ocean_walls_tests.hpp"   // the glass walls (uses this file's helpers)
+#include "ocean_exp_tests.hpp"     // the ALIFE 2027 instruments (eye build; uses this file's helpers)
 }  // namespace ot
 
 int main(int argc, char** argv) {
@@ -4812,6 +4820,17 @@ int main(int argc, char** argv) {
     (void)argc; (void)argv;
 #endif
     std::printf("ocean_tests: NUM_SENSES %d, NUM_ACTIONS %d\n", (int)NUM_SENSES, (int)NUM_ACTIONS);
+    // --only label_mask: that test alone (tests/label_mask_fault.sh runs it on
+    // copies of the engine with a planted fault, each of which must fail it)
+    if (argc > 2 && std::strcmp(argv[1], "--only") == 0) {
+        if (std::strcmp(argv[2], "label_mask") != 0) {
+            std::fprintf(stderr, "--only: label_mask is the one test it runs\n");
+            return 2;
+        }
+        ot::testLabelMask();
+        std::printf("OCEAN TESTS: %d passed, %d failed\n", ot::g_passed, ot::g_failed);
+        return ot::g_failed ? 1 : 0;
+    }
     ot::testBounds();
     ot::testBuoyancy();
     ot::testSteerZ();
@@ -4826,10 +4845,14 @@ int main(int argc, char** argv) {
     ot::testEyeCode();
     ot::testSenseEdges();   // tests/ocean_sense_tests.hpp: the scans' edges, pinned
     ot::testSenseRef();
+    ot::testSenseRef(1);   // the same scenes with own-frame labels (OceanConfig::labelFrame, the A1 arm)
+    ot::testLabelFrame();
+    ot::testLabelFrameNeutral();
     ot::testFoodGrid();
     ot::testSenseMask();   // tests/ocean_speed_tests.hpp: the dead-sensor skip's mask,
     ot::testSenseDce();    // and what the speed-ups must keep
     ot::testCaptureToggle();
+    ot::testLabelMask();   // tests/ocean_exp_tests.hpp: the skip under own-frame labels (labelFrame 1)
     ot::testFoodScan();
     ot::testFoodLife();
     ot::testRemovedNonFinite();
@@ -4882,6 +4905,9 @@ int main(int argc, char** argv) {
 #ifdef EVO_OCEAN_EYE
     ot::testEyeExpProbe();   // the eye experiment's own probes (tools/ocean_eye_exp.cpp)
     ot::testEyeExpWiring();
+    ot::testExpArmsShareInit();   // the ALIFE 2027 instruments: tests/ocean_exp_tests.hpp
+    ot::testExpObserversNeutral();
+    ot::testExpBranches();
 #endif
     // the appearance genome (cosmetic): tests/ocean_appearance_tests.hpp
     ot::testAppearanceGallery();

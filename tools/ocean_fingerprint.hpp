@@ -15,7 +15,8 @@
 // diverged first:
 //
 //   cfg   every SimConfig and every OceanConfig field, by bit pattern; the
-//         ocean-vision keys (eye, eyeOnly, eyeCode, steerFrame, foodLife) each
+//         ocean-vision keys (eye, eyeOnly, eyeCode, steerFrame, foodLife, and
+//         labelFrame since the ALIFE 2027 A1 arm) each
 //         as a tagged word only when it is not its default (0); the glass-wall
 //         keys as one tagged block only off their defaults (format 4 below)
 //   ctr   frame, world size, D, every WorldCommon counter, nextId_, the
@@ -209,7 +210,7 @@ constexpr std::size_t fieldCount() {
 #define OFP_FIELDS(T, N) \
     static_assert(detail::fieldCount<T>() == (N), #T " gained or lost a field: hash it in tools/ocean_fingerprint.hpp, then update this count")
 OFP_FIELDS(SimConfig, 71);
-OFP_FIELDS(OceanConfig, 36);
+OFP_FIELDS(OceanConfig, 37);
 OFP_FIELDS(appearance::Stats, 10);   // founders, offspring, pattern[4], morph[4]
 OFP_FIELDS(AgentCore, 16 + NUM_SENSES + NUM_ACTIONS + 1);   // 14 scalars + genome + nnet, the two arrays, colour
 OFP_FIELDS(Fish, 1 + 6 + Fish::BODY_LEN);                   // base, pos .. bodyBuoy, body[]
@@ -391,6 +392,7 @@ void visitOceanConfig(const OceanConfig& c, V& v) {
 template <class V>
 void visitOceanConfigVision(const OceanConfig& c, V& v) {
     OFP_I(eye); OFP_I(eyeOnly); OFP_I(eyeCode); OFP_I(steerFrame); OFP_F(foodLife);
+    OFP_I(labelFrame);   // tagged like the others: hashed only off its default 0
 }
 // The appearance keys (hashed in `app`, not `cfg`: cosmetic; see the top).
 template <class V>
