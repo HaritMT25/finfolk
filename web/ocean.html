@@ -297,6 +297,9 @@
   .ts-nums { display: flex; align-items: baseline; gap: 10px; font-size: 12px; color: var(--ink-3); white-space: nowrap; }
   .ts-nums b { font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: 13px; color: var(--ink); font-weight: 600; }
   @media (max-width: 759px) { .ts-nums .ts-steps { display: none; } }
+  /* short of room (a long run's counters), the numbers give way: they
+   * clip, and Stop (Cancel) and the sparkline (flex: none) never leave the dock */
+  .ts-nums { min-width: 0; overflow: hidden; }
 
   /* ---------- the keys: one line beside the dock for what is on screen now (a wide screen with a mouse); Help has them all ---------- */
   #keys {
@@ -850,13 +853,24 @@
     }
     .sheet-grip { display: none; }
     .sheet-head { padding-top: 14px; }
-    body.sheet-open #dock { transform: translateX(calc(-50% - 200px)); opacity: 1; pointer-events: auto; }
+    /* beside the panel: centred in the screen less its 400 px, and never wider than that */
+    body.sheet-open #dock { transform: translateX(calc(-50% - 200px)); opacity: 1; pointer-events: auto; max-width: calc(100vw - 420px); }
     body.sheet-open #fishcard { right: 416px; }
     body.sheet-open #tools { margin-right: 400px; }
     body.sheet-open #helppop { right: 410px; }
     body.sheet-open #toasts { transform: translateX(calc(-50% - 200px)); }
     #fishcard, #fishcard.flip { top: calc(76px + var(--safe-t)); bottom: auto; max-height: calc(100dvh - 180px); }
     #fishcard.expanded .fc-brain .inet { height: 340px; }
+  }
+  /* Turbo's strip beside the Setup panel: the room is the screen less the
+   * panel, so it drops what a narrow screen's drops as that room narrows:
+   * the steps below 800 px of room, then the fish (the readout has them)
+   * and View's word below 700, keeping Stop (or Cancel), the sparkline,
+   * steps/s and the generation, counters in the millions too */
+  @media (min-width: 960px) and (max-width: 1199px) { body.sheet-open .ts-nums .ts-steps { display: none; } }
+  @media (min-width: 960px) and (max-width: 1099px) {
+    body.sheet-open.turbo-on .ts-nums .ts-pop, body.sheet-open.turbo-on #viewmenubtn span, body.sheet-open.turbo-on #viewmenubtn .caret { display: none; }
+    body.sheet-open.turbo-on #viewmenubtn { width: 44px; padding: 0; justify-content: center; }
   }
   /* A short window (a landscape phone; an embed, such as the portfolio's
    * 890 x 453), as Classic's compact layout: the fish card, its brain open,
