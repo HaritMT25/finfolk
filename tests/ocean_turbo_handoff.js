@@ -3330,6 +3330,53 @@ async function pagePendingAsk() {
     ok(p.uncaught.length === 0, 'no exception escaped the page\'s handlers' + (p.uncaught.length ? ' (' + p.uncaught[0] + ')' : ''));
 }
 
+/* Finding 9: Start pressed from the keyboard when the question was needed:
+ * the start row hid (the question takes its place) and the button handler
+ * blurred it, so the keyboard's focus was lost (R had its own answer focus,
+ * buttons not). Now a keyboard press focuses the answer, Keep it brings the
+ * focus back to the button (the menu's items: to the menu's button); a
+ * pointer's press still leaves no focus behind. */
+async function pageKeyboardAsk() {
+    section('Review of #39, finding 9: a question opened from the keyboard has the focus on its answer, and Keep gives it back');
+    const p = await bootPage(PAGE_Q7);
+    p.edit('minSpeed', 40);   /* a live tweak: every start asks */
+    const c = startCounter(p), a = c();
+    /* [the button, what opens it, where Keep puts the focus] */
+    const ways = [['restart', () => {}, 'restart'], ['newworld', () => p.click('startmenubtn'), 'startmenubtn'],
+                  ['startsame', () => p.click('startmenubtn'), 'startmenubtn'], ['replay', () => {}, 'replay'],
+                  ['scenario-start', () => p.click('huntersbtn'), 'scenario-start']];
+    const bad = [], fine = [];
+    for (const [id, open, back] of ways) {
+        open();
+        p.tabTo(id); p.key('Enter');
+        const q = asked(p), f1 = focused(p);
+        p.tabTo('startcancel'); p.key('Enter');
+        const f2 = focused(p);
+        if (!q || f1 !== 'startconfirm' || f2 !== back || asked(p)) bad.push(id + ': asked ' + q + ', focus ' + f1 + ', after Keep ' + f2);
+        else fine.push(id + ' -> startconfirm -> ' + back);
+        if (p.T.draft) p.click('startdiscard');
+    }
+    {   /* a card over an edit that waits: Replace / Keep editing */
+        p.edit('population', 33);
+        p.tabTo('bigbtn'); p.key('Enter');
+        const q = !!(p.T.asking && p.T.asking.replace), f1 = focused(p);
+        p.tabTo('startcancel'); p.key('Enter');
+        const f2 = focused(p);
+        if (!q || f1 !== 'startconfirm' || f2 !== 'bigbtn') bad.push('bigbtn: asked ' + q + ', focus ' + f1 + ', after Keep editing ' + f2);
+        else fine.push('a card over an edit -> startconfirm -> bigbtn');
+        p.click('startdiscard');
+    }
+    ok(!bad.length && delta(a, c()).epoch === 0, 'from the keyboard: ' + fine.join('; ') + (bad.length ? ' — ' + bad.join('; ') : ''));
+    {   /* Enter on the answer starts once; a pointer's press: no focus left behind */
+        p.tabTo('restart'); p.key('Enter'); p.key('Enter');
+        const d = delta(a, c());
+        p.pointer(); p.click('restart');
+        ok(d.epoch === 1 && !asked(p) && focused(p) === null,
+           'Enter on Start, then Enter on the focused answer: one start; a pointer\'s press on Start (no tweak now): no focus left behind (' + focused(p) + ')');
+    }
+    ok(p.uncaught.length === 0, 'no exception escaped the page\'s handlers' + (p.uncaught.length ? ' (' + p.uncaught[0] + ')' : ''));
+}
+
 /* Every section, in order; `node tests/ocean_turbo_handoff.js NAME...` runs only those. */
 const SECTIONS = {
     repeatedKeys, liveLedger, growthPage, randomize, imports,
@@ -3347,7 +3394,8 @@ const SECTIONS = {
     pageColourBench, pageLayers, pageResize, pageKeys, pageStartupFailures, pageTourEscape, pageWholeFields,
     pageTurboFraction, pageCardNumbers, pageMixedRecovery, pageEscOwner, pageTabKeys, pageIntegralFloats,
     pageTurboMode, pageStartDoor, pageFollowBack, pageDraft, pageScenarios,
-    pageCancelQueued, pageQueuedFile, pageNextBehindLive, pageEditedFile, pageReplayStaleRead, pageAskTarget, pagePendingAsk
+    pageCancelQueued, pageQueuedFile, pageNextBehindLive, pageEditedFile, pageReplayStaleRead, pageAskTarget, pagePendingAsk,
+    pageKeyboardAsk
 };
 const unhandled = [];
 process.on('unhandledRejection', (e) => { unhandled.push(e); });

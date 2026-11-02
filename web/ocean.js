@@ -1223,6 +1223,7 @@
     var a = asking;
     hideAsk();
     showNote(a && a.replace ? "Kept your changes." : "Kept your run.");
+    if (a && a.opener) a.opener.focus();   /* a question the keyboard opened: the focus back where it was (askBtn) */
   }
   /* the start bar's menu: Start again (same fish), Start fresh (new fish) */
   function setStartMenu(open) {
@@ -2780,10 +2781,24 @@
 
   /* ---- buttons ---- */
   function btn(id, fn) { el(id).addEventListener("click", function () { fn(); this.blur(); }); }
+  /* A button that may open the start bar's question (Start, its menu's two,
+   * a card, its Start, Reroll, Replay). Pressed from the keyboard (its focus
+   * ring showing, or a click no pointer made: Enter / Space give detail 0),
+   * the focus goes to the question's answer, as R's does, and comes back to
+   * the button (back: the menu's own button for its items) when the
+   * question is answered Keep; a pointer's press blurs it, as btn's. */
+  function askBtn(id, fn, back) {
+    el(id).addEventListener("click", function (e) {
+      var kb = this.matches(":focus-visible") || (!!e && e.detail === 0);
+      fn();
+      if (kb && asking) { asking.opener = back ? el(back) : this; el("startconfirm").focus(); }
+      else this.blur();
+    });
+  }
   buildSettings();
   panelsEl.addEventListener("input", onEdit);
   panelsEl.addEventListener("change", onEdit);
-  btn("restart", restart);
+  askBtn("restart", restart);
   btn("pausebtn", function () { if (guardTurbo()) return; setPaused(!paused); });
   btn("slower", function () { if (guardTurbo()) return; changeSpeed(-1); });
   btn("faster", function () { if (guardTurbo()) return; changeSpeed(1); });
@@ -2794,17 +2809,17 @@
   btn("coachx", hideCoach);
   btn("stepbtn", function () { if (guardTurbo()) return; if (paused) stepOnce = true; });
   /* Start from: each card stages (pickScenario); the picked one's Start starts it */
-  Object.keys(CARD_IDS).forEach(function (id) { if (id !== "file") btn(CARD_IDS[id], function () { pickScenario(id); }); });
-  btn("scenario-start", startStaged);
-  btn("rerollbtn", function () { pickScenario("surprise"); });
+  Object.keys(CARD_IDS).forEach(function (id) { if (id !== "file") askBtn(CARD_IDS[id], function () { pickScenario(id); }); });
+  askBtn("scenario-start", startStaged);
+  askBtn("rerollbtn", function () { pickScenario("surprise"); });
   /* the start bar: Start (the same fish: this seed), and its menu */
   btn("startmenubtn", function () { setStartMenu(!startMenuOpen()); });
-  btn("startsame", function () { setStartMenu(false); restart(); });
-  btn("newworld", function () { setStartMenu(false); newWorld(); });
+  askBtn("startsame", function () { setStartMenu(false); restart(); }, "startmenubtn");
+  askBtn("newworld", function () { setStartMenu(false); newWorld(); }, "startmenubtn");
   document.addEventListener("pointerdown", function (e) {
     if (startMenuOpen() && !(e.target.closest && e.target.closest("#startmenu, #startmenubtn"))) setStartMenu(false);
   });
-  btn("replay", replay);
+  askBtn("replay", replay);
   btn("lightbtn", toggleLight);
   ["view", "help"].forEach(function (n) {   /* the triggers; × closes (pointerBlur, setPop: the focus) */
     el(POPS[n][1]).addEventListener("click", function () {
