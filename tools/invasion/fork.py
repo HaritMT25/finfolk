@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""fork.py: fork one checkpoint into K sister populations that evolve apart (heterosis control).
+"""fork.py: fork one checkpoint into K sister populations that evolve apart (same-age divergence control).
 
     fork.py --ancestor ANC.json --sisters K --steps N --out DIR --binary EVO_BOIDS
             [--name NAME] [--checkpoint-every M] [--workers W] [--seed-base S]
@@ -7,8 +7,12 @@
 Each sister is the ancestor's world continued with its own random stream:
     evo_boids --load-checkpoint ANC.json --reseed-after-load R_s --headless N ...
 so all K start from the SAME population (same genomes, same state) and diverge
-only through the rng from the first step: "diverged but not better" relatives
-whose invasion pair separates kinship from progress. The ancestor's config is
+only through the rng from the first step: same-age relatives (both can adapt,
+so they are not guaranteed "diverged but not better") whose invasion pair
+controls for chronological age and shared origin. They are not by themselves a
+hybrid-advantage test: that needs a direct comparison of between-line and
+within-line offspring under a common garden (stats spec section 10), which
+endpoint mixed-pedigree counts do not supply. The ancestor's config is
 kept as is (its home regime: predators, min-pop floor and every other dial), so a
 sister evolves exactly as its ancestor's run would have, on a different stream.
 

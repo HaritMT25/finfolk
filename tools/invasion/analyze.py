@@ -35,11 +35,21 @@ without --plan, or with registered cells missing, matrices are descriptive.
   paired.csv   per invade cell: s~ = mean_r [s(i->j, r) - s(j->j, r)] with the
                paired SD and the pairing gain G = (var_a + var_b) / var_(a-b)
   pairs.csv    both directions observed: A = s~(i->j) - s~(j->i),
-               S = (s~(i->j) + s~(j->i)) / 2, their SE and z
+               S = (s~(i->j) + s~(j->i)) / 2, their SE and z, and what the two
+               directed scores support by their own bounds (reciprocal gain /
+               reciprocal suppression / opposite directions / unresolved);
+               S > 0 alone is never read as mutual invasibility or coexistence.
+               s is the change in the invaders' founder PEDIGREE contribution
+               (score.py), not genomic ancestry
   matrix.csv   when a resident x invader block is complete: the Hodge split
-               (ratings, cyclic share, noise floor) per condition/fraction/window
+               (ratings, raw / noise-corrected cyclic share with its confidence
+               range, lack-of-fit and symmetric-interaction tests from infer.py)
+               per condition/fraction/window; matrix_joint.csv the omnibus over
+               the assay conditions
+  blocks.json  every block's units z[p][r][i] (input to calibrate.py, which
+               measures the null rejection rate and planted-cycle power of the
+               same tests)
   speed.csv    engine seconds per step against mean population (+ a fit)
-  power.csv    noise floor and planted-cycle recovery at the measured noise
   cost.csv     seconds per cell and core-hours for N x replicates x settings
 """
 from __future__ import annotations
@@ -49,10 +59,12 @@ import csv
 import json
 import math
 import os
+import random
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import hodge  # noqa: E402
+import infer  # noqa: E402
 
 
 def mean(xs):
@@ -361,6 +373,32 @@ def sham_vs_self(rows):
     return out
 
 
+# Both directed bounds at once: two one-sided 97.5% bounds hold jointly at >= 95% (Bonferroni over
+# the two directions of a pair; not adjusted across pairs: the column is descriptive).
+Z_RECIPROCAL = 1.959964
+
+
+def reciprocal(z_ab, z_ba, zc=Z_RECIPROCAL):
+    """What the two DIRECTED sham-corrected scores of a pair support (stats spec section 7). A
+    positive symmetric part S does not need both directions to gain, so S never decides this.
+      'reciprocal gain'        both directions' lower bounds > 0: excess founder-pedigree
+                               introgression both ways, relative to self-invasion. Not by itself
+                               coexistence (sexual mixing can do this; coexistence needs
+                               persistence of distinct types)
+      'reciprocal suppression' both upper bounds < 0: each resists the other's introgression
+      'opposite directions'    one bounded above 0, the other below
+      'unresolved'             at least one direction is not bounded away from 0"""
+    if z_ab is None or z_ba is None:
+        return "unresolved"
+    if z_ab >= zc and z_ba >= zc:
+        return "reciprocal gain"
+    if z_ab <= -zc and z_ba <= -zc:
+        return "reciprocal suppression"
+    if (z_ab >= zc and z_ba <= -zc) or (z_ab <= -zc and z_ba >= zc):
+        return "opposite directions"
+    return "unresolved"
+
+
 def pair_table(prs):
     by = {(p["cond"], p["frac"], p["G"], p["j"], p["i"]): p for p in prs}
     out = []
@@ -377,7 +415,8 @@ def pair_table(prs):
         out.append({"cond": cond, "frac": frac, "G": G, "a": i, "b": j,
                     "st_a_into_b": p["st"], "st_b_into_a": q["st"], "A_ab": A,
                     "S": S, "se_A": se_A, "se_S": 0.5 * se_A, "z_A": A / se_A if se_A > 0 else None,
-                    "z_S": S / (0.5 * se_A) if se_A > 0 else None})
+                    "z_S": S / (0.5 * se_A) if se_A > 0 else None,
+                    "z_a_into_b": p["z"], "z_b_into_a": q["z"], "reciprocal": reciprocal(p["z"], q["z"])})
     return out
 
 
@@ -396,7 +435,9 @@ def speed_fit(recs):
 
 
 def category(ma, mb):
-    """Pair relation from snapshot metadata {run, regime, family}: the similarity test's classes."""
+    """Pair relation from snapshot metadata {run, regime, family}, EXCLUSIVE classes in this order
+    of precedence: same-run, sisters, same-regime (different runs and families), cross-regime.
+    So 'same-regime' excludes same-run pairs; relation_groups adds the inclusive groups."""
     if not ma or not mb:
         return ""
     if ma.get("run") == mb.get("run"):
@@ -406,6 +447,126 @@ def category(ma, mb):
     if ma.get("regime") == mb.get("regime"):
         return "same-regime"
     return "cross-regime"
+
+
+def relation_groups(ma, mb):
+    """Every summary group a pair belongs to: its exclusive category, plus 'within-regime (all)'
+    for every pair whose two snapshots share a home regime (same-run and sister pairs included)."""
+    c = category(ma, mb)
+    if not c:
+        return []
+    return [c] + (["within-regime (all)"] if ma.get("regime") == mb.get("regime") else [])
+
+
+def unit_curl_noise(z):
+    """Per-edge noise variance of the curl of the edge MEANS, (Q V Q)_ee, from the units (the
+    diagonal of infer's tau_C): sum over units of (Q B_p d)_e^2 / (k (k - 1))."""
+    N, k = len(z), len(z[0])
+    m = infer.column_means(z)
+    P = N * (N - 1) // 2
+    out = [0.0] * P
+    for p in range(N):
+        for zr in z[p]:
+            d = [x - y for x, y in zip(zr, m[p])]
+            unit = [[0.0] * N for _ in range(N)]
+            unit[p] = d
+            c = infer.curl_vec(infer.antisym(unit), N)[0]
+            for e in range(P):
+                out[e] += c[e] * c[e]
+    return [x / (k * (k - 1)) for x in out]
+
+
+def subblock(z, idx):
+    """The units of the complete sub-block of items idx (positions in the block)."""
+    return [[[z[p][r][i] for i in idx] for r in range(len(z[p]))] for p in idx]
+
+
+def subgraph_summary(z, keep):
+    """The comparison graph of the edges (p, q) with keep(p, q), all items, unit weights (an
+    INCOMPLETE graph, e.g. the bipartite cross-regime pairs): gradient / local / harmonic energies
+    of the edge means (hodge.decompose) and their unit-estimated noise energies, so the cyclic
+    share can be noise-corrected. Descriptive (no test). -> dict."""
+    N, k = len(z), len(z[0])
+
+    def restrict(m):
+        A = infer.antisym(m)
+        M = [[None] * N for _ in range(N)]
+        e = 0
+        for p in range(N):
+            for q in range(p + 1, N):
+                if keep(p, q):
+                    M[p][q], M[q][p] = A[e], -A[e]
+                e += 1
+        return M
+    obs = hodge.decompose(restrict(infer.column_means(z)))
+    basis, _ = hodge.triangle_basis(N, obs["edges"])
+    m = infer.column_means(z)
+    tau = {"E_A": 0.0, "E_grad": 0.0, "E_local": 0.0, "E_harm": 0.0}
+    for p in range(N):
+        for zr in z[p]:
+            unit = [[0.0] * N for _ in range(N)]
+            unit[p] = [x - y for x, y in zip(zr, m[p])]
+            du = hodge.decompose(restrict(unit), basis)
+            for x in tau:
+                tau[x] += du[x]
+    tau = {x: v / (k * (k - 1)) for x, v in tau.items()}
+    cyc = obs["E_local"] + obs["E_harm"]
+    tcyc = tau["E_local"] + tau["E_harm"]
+    return {"edges": len(obs["edges"]), "q_cycle": obs["q_cycle"], "q_local": obs["q_local"],
+            "triangles": obs["triangles"], "cyclic_share": cyc / obs["E_A"] if obs["E_A"] > 0 else float("nan"),
+            "noise_corrected": (cyc - tcyc) / (obs["E_A"] - tau["E_A"]) if obs["E_A"] > tau["E_A"] else float("nan"),
+            "local_nc": obs["E_local"] - tau["E_local"], "harmonic_nc": obs["E_harm"] - tau["E_harm"],
+            "F_lof": cyc / tcyc if tcyc > 0 else float("nan"),
+            "dC": math.sqrt(max(0.0, cyc - tcyc) / len(obs["edges"]))}
+
+
+def genetic_dissimilarity(paths, samples=4000, seed=7):
+    """Sensor-relevant genetic dissimilarity between snapshots (stats spec section 9):
+    d_G(a, b) = 1 - mean genomeSimilarity over random fish pairs (u in a, v in b), with the
+    engine's genomeSimilarity (genome.hpp): the fraction of aligned slots whose source-type and
+    sink-type bits BOTH match (bits 15 and 7 of the checkpoint's packed wiring word,
+    checkpoint_io.hpp). It is not full gene identity. Also the within-snapshot value (a diversity
+    covariate). -> ({(a, b): d}, {a: d_within})."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import invlib
+    types = {}
+    for nm, path in sorted(paths.items()):
+        cs = invlib.load_checkpoint(path)["creatures"]
+        g, gi = [], 0
+        for k in range(int(cs["count"])):
+            L = int(cs["genomeLengths"][k])
+            w = cs["genes"][gi:gi + 2 * L:2]
+            gi += 2 * L
+            if int(cs["alive"][k]):
+                g.append([((int(x) >> 15) & 1) * 2 + ((int(x) >> 7) & 1) for x in w])
+        types[nm] = g
+    rnd = random.Random(seed)
+
+    def dis(ga, gb, same):
+        tot = 0.0
+        for _ in range(samples):
+            u = rnd.randrange(len(ga))
+            v = rnd.randrange(len(gb))
+            while same and v == u and len(gb) > 1:
+                v = rnd.randrange(len(gb))
+            x, y = ga[u], gb[v]
+            n = min(len(x), len(y))
+            tot += sum(1 for a_, b_ in zip(x, y) if a_ == b_) / n if n else 0.0
+        return 1.0 - tot / samples
+    names = sorted(types)
+    between = {(a_, b_): dis(types[a_], types[b_], False) for i, a_ in enumerate(names) for b_ in names[i + 1:]}
+    between.update({(b_, a_): v for (a_, b_), v in list(between.items())})
+    return between, {a_: dis(types[a_], types[a_], True) for a_ in names}
+
+
+def pearson(x, y):
+    n = len(x)
+    if n < 3:
+        return None
+    mx, my = sum(x) / n, sum(y) / n
+    sx = math.sqrt(sum((a_ - mx) ** 2 for a_ in x))
+    sy = math.sqrt(sum((b_ - my) ** 2 for b_ in y))
+    return sum((a_ - mx) * (b_ - my) for a_, b_ in zip(x, y)) / (sx * sy) if sx > 0 and sy > 0 else None
 
 
 def registry_from_plan(plan):
@@ -435,25 +596,35 @@ def _largest_complete(names, has):
     return names
 
 
-def matrices(rows, meta=None, zmin=2.0, sims=1000, registry=None):
+def matrices(rows, meta=None, zmin=2.0, sims=9999, registry=None, kind="wild", seed=5, dG=None):
     """Complete blocks (every ordered pair + every sham, on common replicates): per condition,
     fraction and window, separately (pooling conditions can fake cycles).
 
-    Per replicate r the paired matrix s~_r(i->j) = s_r(i->j) - s_r(j->j) gives A_r and its curl_r;
-    the headline uses the replicate means. Noise comes from the replicate spread of each cell
-    (var_r / k), taken separately for A and for its curl: with common random numbers (one slot
-    seed and reseed per resident and replicate) the noise shared within a column is pure gradient,
-    so it inflates ||A|| but never the curl.
-      cyclic share         ||curl||^2 / ||A||^2
-      noise-corrected      (||curl||^2 - E||noise curl||^2) / (||A||^2 - E||noise A||^2)
-      lack of fit          X = ||curl||^2 / v_eff ~ chi2(df = P - N + 1) under ladder + noise,
-                           v_eff = E||noise curl||^2 / df
-      floor95, p_mc        Monte Carlo: pure ladders of the noise-corrected RMS + iid noise of v_eff
+    Per replicate r the paired matrix s~_r(i->j) = s_r(i->j) - s_r(j->j); the headline uses the
+    replicate means. Inference is infer.py's (see there): the units are the (resident column,
+    replicate) blocks of common random numbers, so the noise model keeps each unit's joint,
+    heteroscedastic noise and assumes only that distinct units are independent.
+      cyclic share         ||curl||^2 / ||A||^2 (raw), and noise-corrected
+                           (||curl||^2 - tau_C) / (||A||^2 - tau_A), tau = the units' unbiased
+                           noise-energy estimates; share_ci95 / dC_ci95 from the bootstrap
+                           confidence ball for the edge noise
+      lack of fit          F_lof = ||curl||^2 / tau_C; p_lof = studentized unit bootstrap
+                           (`kind`, `sims` draws; tau re-estimated in every draw); p_lof_flip =
+                           exact replicate sign-flip (>= flip_min_p = 1/2^(k-1))
+      floor95, p_mc        descriptive: raw cyclic share of a pure ladder of the noise-corrected
+                           strength plus bootstrap noise
       two-way gamma        s~(i->j) = mu + a_i + b_j + gamma_ij; gamma - gamma^T == curl (checked);
-                           S_gamma = (gamma_ij + gamma_ji) / 2: coexistence (> 0) vs priority (< 0)
+                           S_gamma = (gamma_ij + gamma_ji) / 2, the symmetric interaction; F_sym /
+                           p_sym / p_sym_flip test it as a whole (df N(N-3)/2)
       triads               directed 3-cycles of sign(A), all and with every edge |z| >= zmin
-    -> (block rows, per-pair rows)."""
-    out, detail = [], []
+      by_category          DESCRIPTIVE per-pair means of the full-matrix decomposition by pair
+                           relation (exclusive classes + 'within-regime (all)'); zC = the
+                           noise-corrected cyclic energy of each edge
+      sub-blocks           the complete sub-blocks of one home regime / one snapshot time,
+                           decomposed on their own (their own ladder and noise)
+    -> (block rows, per-pair rows, blocks {(cond, frac, G): names, reps, units z, status},
+        joint rows, sub-block rows)."""
+    out, detail, blocks, sub = [], [], {}, []
     keys = sorted({(x["cond"], x["frac"], x["G"]) for x in rows})
     for cond, frac, G in keys:
         cell = {}
@@ -472,10 +643,10 @@ def matrices(rows, meta=None, zmin=2.0, sims=1000, registry=None):
         status, names, reps = None, None, None
         reg = registry.get((cond, frac)) if registry is not None else None
         if reg:
-            kind = lambda a_, b_: (a_, b_, "sham" if a_ == b_ else "invade")   # noqa: E731
-            rnames = _largest_complete({x for key in reg for x in key[:2]}, lambda a_, b_: kind(a_, b_) in reg)
+            rkind = lambda a_, b_: (a_, b_, "sham" if a_ == b_ else "invade")   # noqa: E731
+            rnames = _largest_complete({x for key in reg for x in key[:2]}, lambda a_, b_: rkind(a_, b_) in reg)
             if len(rnames) >= 3:
-                R = sorted(set.intersection(*[reg[kind(a_, b_)] for a_ in rnames for b_ in rnames]))
+                R = sorted(set.intersection(*[reg[rkind(a_, b_)] for a_ in rnames for b_ in rnames]))
                 miss = [(a_, b_, r) for a_ in rnames for b_ in rnames for r in R if r not in cell.get((a_, b_), {})]
                 if not miss and len(R) >= 2:
                     status, names, reps = "formal", rnames, R
@@ -515,17 +686,17 @@ def matrices(rows, meta=None, zmin=2.0, sims=1000, registry=None):
         pairs = [(p, q) for p in range(n) for q in range(p + 1, n)]
         P = len(pairs)
         df = P - n + 1
+        # per-edge replicate SEs: descriptive per-pair z (triads, matrix_pairs.csv)
         varA = {pq: sd([Ar[pq[0]][pq[1]] for Ar in A_r]) ** 2 / k for pq in pairs}
         varC = {pq: sd([Cr[pq[0]][pq[1]] for Cr in C_r]) ** 2 / k for pq in pairs}
-        EnA, EnC = sum(varA.values()), sum(varC.values())
-        curl2 = sp["cyclic_share"] * sp["norm2"]
-        corrected = (curl2 - EnC) / (sp["norm2"] - EnA) if sp["norm2"] > EnA else float("nan")
-        v_eff = EnC / df
-        X = curl2 / v_eff if v_eff > 0 else float("inf")
-        p_lof = hodge.chi2_sf(X, df)
-        rms_true = math.sqrt(max(1e-12, (sp["norm2"] - EnA) / P))
-        floors, f95 = hodge.simulate_floor(n, rms_true, math.sqrt(v_eff), sims=sims, seed=5)
-        p_mc = (1 + sum(1 for x in floors if x >= sp["cyclic_share"])) / (1 + len(floors))
+        # inference (infer.py): units z[p][r][i] = s_r(i -> p) - s_r(p -> p), one common-random-
+        # number unit per resident column p and replicate r; studentized unit bootstrap + exact
+        # replicate sign-flip; no chi-square, no isotropic noise
+        z = [[[cell[(names[i], names[p])][r] - cell[(names[p], names[p])][r] if i != p else 0.0
+               for i in range(n)] for r in reps] for p in range(n)]
+        blocks[(cond, frac, G)] = {"names": names, "reps": reps, "z": z, "status": status}
+        inf = infer.infer([z], B=sims, seed=seed, kind=kind)
+        assert abs(inf["T_A"] - sp["norm2"]) < 1e-9 * max(1.0, sp["norm2"])   # same A as hodge.split
         # two-way model on the replicate means, and per replicate for the S_gamma noise
         mu, ea, eb, g = hodge.twoway(Mbar)
         chk = max(abs((g[p][q] - g[q][p]) - sp["curl"][p][q]) for p, q in pairs)
@@ -537,13 +708,19 @@ def matrices(rows, meta=None, zmin=2.0, sims=1000, registry=None):
             Z[p][q] = Z[q][p] = abs(A[p][q]) / math.sqrt(varA[(p, q)]) if varA[(p, q)] > 0 else float("inf")
         tri = hodge.circular_triads(A, Z, zmin)
         mel = hodge.melo2k(sp["curl"], 1)
+        dec = {x: inf[x] for x in ("floor95", "p_mc", "p_lof", "p_lof_flip", "p_sym", "p_sym_flip", "p_lof_unstud")}
         if status != "formal":   # no decisions from a partial matrix
-            f95 = p_mc = p_lof = None
+            dec = {x: None for x in dec}
         row = {"cond": cond, "frac": frac, "G": G, "status": status, "n": n, "k": k, "names": " ".join(names),
                "ratings": list(sp["r"]), "invader_effect": list(ea), "resident_effect": list(eb),
-               "cyclic_share": sp["cyclic_share"], "noise_corrected": corrected, "floor95": f95, "p_mc": p_mc,
-               "chi2": X, "df": df, "p_lof": p_lof, "rms_A": math.sqrt(sp["norm2"] / P),
-               "noise_A": math.sqrt(EnA / P), "noise_curl": math.sqrt(v_eff), "gamma_check": chk,
+               "cyclic_share": sp["cyclic_share"], "noise_corrected": inf["share_nc"],
+               "share_ci95_lo": inf["share_ci95"][0], "share_ci95_hi": inf["share_ci95"][1],
+               "dC": inf["dC"], "dC_ci95_lo": inf["dC_ci95"][0], "dC_ci95_hi": inf["dC_ci95"][1],
+               "C_nc": inf["C_nc"], "G_nc": inf["G_nc"],
+               "F_lof": inf["F_C"], "df": df, "F_sym": inf["F_S"], "df_sym": n * (n - 3) // 2,
+               **dec, "flip_min_p": inf["flip_min_p"], "boot": f"{kind} x {sims}",
+               "rms_A": math.sqrt(sp["norm2"] / P),
+               "noise_A": math.sqrt(inf["tau_A"] / P), "noise_curl": math.sqrt(inf["tau_C"] / df), "gamma_check": chk,
                # (the MEAN of S_gamma is 0 by construction: gamma's rows sum to 0; its spread is the signal)
                "rms_Sg": math.sqrt(mean([v * v for v in Sg.values()])),
                "frac_Sg_pos": sum(1 for v in Sg.values() if v > 0) / P,
@@ -558,21 +735,72 @@ def matrices(rows, meta=None, zmin=2.0, sims=1000, registry=None):
             row["regime_ratings"] = " ".join(
                 f"{rg}:{mean([sp['r'][p] for p, nm in enumerate(names) if meta.get(nm, {}).get('regime', '') == rg])!r}"
                 for rg in regs)
+        # noise-corrected cyclic energy per edge (stats spec section 9): curl_e^2 - (Q V Q)_ee
+        cn = unit_curl_noise(z)
+        zC = {pq: sp["curl"][pq[0]][pq[1]] ** 2 - cn[e] for e, pq in enumerate(pairs)}
+        if meta:
+            # DESCRIPTIVE per-pair averages of the FULL-matrix decomposition by pair relation (a pair's
+            # residual depends on the whole matrix; this is not a decomposition within each group)
             cats = {}
             for p, q in pairs:
-                c = category(meta.get(names[p]), meta.get(names[q]))
-                cats.setdefault(c, []).append((abs(A[p][q]), abs(sp["curl"][p][q]), Sg[(p, q)]))
+                for c in relation_groups(meta.get(names[p]), meta.get(names[q])):
+                    cats.setdefault(c, []).append((abs(A[p][q]), abs(sp["curl"][p][q]), zC[(p, q)], Sg[(p, q)]))
             row["by_category"] = "; ".join(
-                f"{c}: n={len(v)} |A|={mean([x[0] for x in v]):.4f} |curl|={mean([x[1] for x in v]):.4f} "
-                f"S_gamma={mean([x[2] for x in v]):+.4f}" for c, v in sorted(cats.items()))
+                f"{c}: n={len(v)} mean|A|={mean([x[0] for x in v]):.4f} mean|curl residual|={mean([x[1] for x in v]):.4f} "
+                f"mean noise-corrected curl^2={mean([x[2] for x in v]):+.2e} mean S_gamma={mean([x[3] for x in v]):+.4f}"
+                for c, v in sorted(cats.items()))
+            # balanced sub-blocks decomposed ON THEIR OWN (complete graphs of the items sharing a home
+            # regime, or a snapshot time): their own ladder, cycle and noise; descriptive
+            for keyname in ("regime", "time"):
+                for val in sorted({str(meta.get(nm, {}).get(keyname)) for nm in names}):
+                    idx = [i for i, nm in enumerate(names) if str(meta.get(nm, {}).get(keyname)) == val]
+                    if len(idx) < 3 or len(idx) == n:
+                        continue
+                    si = infer.infer([subblock(z, idx)], B=sims, seed=seed, kind=kind)
+                    sub.append({"cond": cond, "frac": frac, "G": G, "status": status, "group": f"{keyname}={val}",
+                                "names": " ".join(names[i] for i in idx), "n": len(idx), "k": k,
+                                "cyclic_share": si["share_raw"], "noise_corrected": si["share_nc"],
+                                "share_ci95_lo": si["share_ci95"][0], "share_ci95_hi": si["share_ci95"][1],
+                                "dC": si["dC"], "F_lof": si["F_C"], "df": (len(idx) - 1) * (len(idx) - 2) // 2,
+                                "p_lof": si["p_lof"], "p_lof_flip": si["p_lof_flip"],
+                                "local_harmonic": "complete graph: all cyclic energy local"})
+            regs = [meta.get(nm, {}).get("regime") for nm in names]
+            if len(set(regs)) == 2:
+                # the cross-regime pairs alone: a bipartite graph, no triangle, so its whole cyclic
+                # residual is harmonic (cycles of length >= 4 through both regimes)
+                sg = subgraph_summary(z, lambda p_, q_: regs[p_] != regs[q_])
+                sub.append({"cond": cond, "frac": frac, "G": G, "status": status,
+                            "group": "cross-regime pairs (bipartite, incomplete)", "names": " ".join(names), "n": n,
+                            "k": k, "cyclic_share": sg["cyclic_share"], "noise_corrected": sg["noise_corrected"],
+                            "share_ci95_lo": None, "share_ci95_hi": None, "dC": sg["dC"], "F_lof": sg["F_lof"],
+                            "df": sg["q_cycle"], "p_lof": None, "p_lof_flip": None,
+                            "local_harmonic": f"{sg['edges']} edges, {sg['triangles']} triangles; noise-corrected "
+                                              f"local {sg['local_nc']:.3g}, harmonic {sg['harmonic_nc']:.3g}"})
+            if dG:
+                xs = [(dG[(names[p], names[q])], zC[(p, q)]) for p, q in pairs if (names[p], names[q]) in dG]
+                row["corr_zC_dG"] = pearson([x for x, _ in xs], [y for _, y in xs])
         out.append(row)
-        for p, q in pairs:
+        for e, (p, q) in enumerate(pairs):
             detail.append({"cond": cond, "frac": frac, "G": G, "a": names[p], "b": names[q],
                            "category": category((meta or {}).get(names[p]), (meta or {}).get(names[q])),
                            "A": A[p][q], "se_A": math.sqrt(varA[(p, q)]), "grad": sp["grad"][p][q],
                            "curl": sp["curl"][p][q], "se_curl": math.sqrt(varC[(p, q)]),
+                           "zC": zC[(p, q)], "dG": (dG or {}).get((names[p], names[q])),
                            "S_gamma": Sg[(p, q)], "se_S_gamma": math.sqrt(varSg[(p, q)])})
-    return out, detail
+    # Omnibus over the assay conditions of one (fraction, window): the same snapshots and
+    # replicates in every condition, and a unit (p, r) shares its slot and donor seeds across
+    # conditions, so units are resampled / sign-flipped JOINTLY (F = sum T_C / sum tau_C).
+    joint = []
+    for frac, G in sorted({(f_, g_) for _, f_, g_ in blocks}):
+        fb = sorted((c_, b) for (c_, f_, g_), b in blocks.items() if (f_, g_) == (frac, G) and b["status"] == "formal")
+        if len(fb) < 2 or any(b["names"] != fb[0][1]["names"] or b["reps"] != fb[0][1]["reps"] for _, b in fb):
+            continue
+        inf = infer.infer([b["z"] for _, b in fb], B=sims, seed=seed, kind=kind)
+        joint.append({"frac": frac, "G": G, "conditions": " ".join(c_ for c_, _ in fb), "n": inf["N"], "k": inf["k"],
+                      "F_lof": inf["F_C"], "p_lof": inf["p_lof"], "p_lof_flip": inf["p_lof_flip"],
+                      "F_sym": inf["F_S"], "p_sym": inf["p_sym"], "p_sym_flip": inf["p_sym_flip"],
+                      "flip_min_p": inf["flip_min_p"], "boot": f"{kind} x {sims}"})
+    return out, detail, blocks, joint, sub
 
 
 def main(argv=None):
@@ -580,17 +808,21 @@ def main(argv=None):
     ap.add_argument("--root", action="append", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--windows", default="2.5,5,10")
-    ap.add_argument("--sims", type=int, default=1000)
-    ap.add_argument("--power-sims", type=int, default=400)
-    ap.add_argument("--no-power", action="store_true")
+    ap.add_argument("--sims", type=int, default=9999, help="bootstrap draws per test (default 9999)")
+    ap.add_argument("--kind", default=infer.DEFAULT_KIND, choices=["wild", "residual"],
+                    help=f"unit bootstrap: random-sign (wild) or resampled residual units (default {infer.DEFAULT_KIND}, "
+                         "the one calibrate.py validated)")
+    ap.add_argument("--no-power", action="store_true",
+                    help="(kept for old command lines; null calibration and planted-cycle power are calibrate.py's, "
+                         "through the same tests)")
     ap.add_argument("--max-window-error", type=float, default=0.10,
                     help="largest relative distance between a requested window and the checkpoint read for it "
                          "(default 0.10); a run with no checkpoint that close has no score for that window")
     ap.add_argument("--gen-def", default="pop", choices=["pop", "n0"],
                     help="window clock: turnover of the mean population (default) or of the start population")
-    ap.add_argument("--power-cond", default=None, help="condition whose noise drives the power table (default all)")
-    ap.add_argument("--power-windows", default="5,10", help="windows (gens) that get a power table")
     ap.add_argument("--meta", help="JSON {snapshot: {run, regime, family, time}} for pair relations / regimes")
+    ap.add_argument("--no-genetic", action="store_true",
+                    help="skip the sensor-relevant genetic dissimilarity of the snapshots (needs --meta and --plan)")
     ap.add_argument("--plan", help="the registered plan (JSONL): every cell is validated against it, and only a "
                                    "complete registered matrix gets formal decisions")
     a = ap.parse_args(argv)
@@ -619,7 +851,7 @@ def main(argv=None):
         "roots": [os.path.abspath(r) for r in a.root],
         "plan": {"path": os.path.abspath(a.plan), "sha256": sha256(a.plan), "cells": len(plan)} if plan is not None else None,
         "meta": {"path": os.path.abspath(a.meta), "sha256": sha256(a.meta)} if a.meta else None,
-        "analysis_code": {f: sha256(os.path.join(here, f)) for f in ("analyze.py", "hodge.py")},
+        "analysis_code": {f: sha256(os.path.join(here, f)) for f in ("analyze.py", "hodge.py", "infer.py")},
         "binaries": sorted({r["binary_sha256"] for r in recs}),
         "tools": sorted({json.dumps(r["tools_sha256"], sort_keys=True) for r in recs if r["tools_sha256"]}),
         "cells_without_tool_hashes": sum(1 for r in recs if not r["tools_sha256"]),
@@ -637,9 +869,6 @@ def main(argv=None):
         # finished but not registered: listed, and excluded from EVERY table
         prov["unregistered_finished"] = sorted(unregistered)
     prov["complete"] = plan is not None and not prov["registered_missing"] and not problems
-    invlib_json = json.dumps(prov, indent=1, sort_keys=True, default=str)
-    with open(os.path.join(a.out, "inputs.json"), "w") as f:
-        f.write(invlib_json + "\n")
     ident = {"plan_sha256": prov["plan"]["sha256"] if prov["plan"] else "",
              "analysis_sha256": prov["analysis_code"]["analyze.py"]}
     gens = gen_length(recs, a.gen_def)
@@ -740,10 +969,16 @@ def main(argv=None):
                           f"{fmt(max(zs) if zs else None, 1)} |")
 
     md.append("\n## Effect sizes on real pairs (A = s~(a->b) - s~(b->a), S = mean of both)\n")
-    md.append("| condition | fraction | window | a | b | relation | s~(a->b) | s~(b->a) | A | z_A | S | z_S |\n|---|---|---|---|---|---|---|---|---|---|---|---|")
+    md.append("s~ = the change in the invaders' founder pedigree contribution minus the self-invasion baseline "
+              "(a pedigree index, not genomic ancestry). S > 0 does not mean both directions gain; 'directions' "
+              f"classifies the two directed s~ by their own bounds (both |z| >= {Z_RECIPROCAL:.2f}: two one-sided "
+              "97.5% bounds, jointly 95%; not adjusted across pairs). 'reciprocal gain' is excess pedigree "
+              "introgression both ways, not coexistence.\n")
+    md.append("| condition | fraction | window | a | b | relation | s~(a->b) (z) | s~(b->a) (z) | A | z_A | S | z_S | directions |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|")
     for p in pt:
-        md.append(f"| {p['cond']} | {p['frac']} | {p['G']} | {p['a']} | {p['b']} | {p['category']} | {p['st_a_into_b']:+.4f} | {p['st_b_into_a']:+.4f} | "
-                  f"{p['A_ab']:+.4f} | {fmt(p['z_A'], 1)} | {p['S']:+.4f} | {fmt(p['z_S'], 1)} |")
+        md.append(f"| {p['cond']} | {p['frac']} | {p['G']} | {p['a']} | {p['b']} | {p['category']} | {p['st_a_into_b']:+.4f} ({fmt(p['z_a_into_b'], 1)}) | "
+                  f"{p['st_b_into_a']:+.4f} ({fmt(p['z_b_into_a'], 1)}) | "
+                  f"{p['A_ab']:+.4f} | {fmt(p['z_A'], 1)} | {p['S']:+.4f} | {fmt(p['z_S'], 1)} | {p['reciprocal']} |")
     effect = {}
     for cond in sorted({p["cond"] for p in pt}):
         for frac in sorted({p["frac"] for p in pt}):
@@ -761,36 +996,108 @@ def main(argv=None):
     # --- complete blocks (if any)
     write_csv(os.path.join(a.out, "pairs.csv"), pt,
               ["cond", "frac", "G", "a", "b", "category", "st_a_into_b", "st_b_into_a", "A_ab", "S", "se_A", "se_S",
-               "z_A", "z_S", "plan_sha256", "analysis_sha256"])
-    mats, mdet = matrices(rows, meta, sims=a.sims, registry=registry)
-    for m in mats:
+               "z_A", "z_S", "z_a_into_b", "z_b_into_a", "reciprocal", "plan_sha256", "analysis_sha256"])
+    dG = None
+    if meta and plan is not None and not a.no_genetic:
+        paths = {}
+        for c in plan.values():
+            paths.setdefault(c["resident_name"], c["resident"])
+            if c["mode"] == "invade":
+                paths.setdefault(c["invader_name"], c["invader"])
+        paths = {nm: p_ for nm, p_ in paths.items() if nm in snapshots and os.path.exists(p_)
+                 and sha256(p_) == snapshots[nm]}   # only the very files the cells read
+        if len(paths) >= 2:
+            dG, dW = genetic_dissimilarity(paths)
+            prov["genetic_dissimilarity"] = {"snapshots": sorted(paths), "samples": 4000,
+                                             "within": dW}
+    mats, mdet, blocks, joint, subs = matrices(rows, meta, sims=a.sims, registry=registry, kind=a.kind, dG=dG)
+    for m in mats + joint + subs:
         m.update(ident)
+    # the units of every block (for calibrate.py: null rejection and power through the same tests)
+    with open(os.path.join(a.out, "blocks.json"), "w") as f:
+        json.dump({"schema": "finfolk.invasion.blocks/1", **ident,
+                   "blocks": [{"cond": c_, "frac": f_, "G": g_, **b} for (c_, f_, g_), b in sorted(blocks.items())]}, f)
     if mats:
         cols = ["cond", "frac", "G", "status", "plan_sha256", "analysis_sha256", "n", "k", "names", "ratings",
-                "invader_effect", "resident_effect", "cyclic_share",
-                "noise_corrected", "floor95", "p_mc", "chi2", "df", "p_lof", "rms_A", "noise_A", "noise_curl",
+                "invader_effect", "resident_effect", "cyclic_share", "noise_corrected", "share_ci95_lo",
+                "share_ci95_hi", "dC", "dC_ci95_lo", "dC_ci95_hi", "C_nc", "G_nc", "floor95", "p_mc",
+                "F_lof", "df", "p_lof", "p_lof_flip", "p_lof_unstud", "F_sym", "df_sym", "p_sym", "p_sym_flip",
+                "flip_min_p", "boot", "rms_A", "noise_A", "noise_curl",
                 "gamma_check", "rms_Sg", "frac_Sg_pos", "n_Sg_sig_pos", "n_Sg_sig_neg", "triads_cyclic", "triads",
-                "triads_sig", "melo_sigma", "melo_xy", "regime_ratings", "by_category"]
+                "triads_sig", "melo_sigma", "melo_xy", "regime_ratings", "by_category", "corr_zC_dG"]
         write_csv(os.path.join(a.out, "matrix.csv"), mats, cols)
         write_csv(os.path.join(a.out, "matrix_pairs.csv"), mdet,
-                  ["cond", "frac", "G", "a", "b", "category", "A", "se_A", "grad", "curl", "se_curl", "S_gamma", "se_S_gamma"])
+                  ["cond", "frac", "G", "a", "b", "category", "A", "se_A", "grad", "curl", "se_curl", "zC", "dG",
+                   "S_gamma", "se_S_gamma"])
+        if subs:
+            write_csv(os.path.join(a.out, "subblocks.csv"), subs,
+                      ["cond", "frac", "G", "status", "group", "names", "n", "k", "cyclic_share", "noise_corrected",
+                       "share_ci95_lo", "share_ci95_hi", "dC", "F_lof", "df", "p_lof", "p_lof_flip",
+                       "local_harmonic", "plan_sha256", "analysis_sha256"])
+        if joint:
+            write_csv(os.path.join(a.out, "matrix_joint.csv"), joint,
+                      ["frac", "G", "conditions", "n", "k", "F_lof", "p_lof", "p_lof_flip", "F_sym", "p_sym",
+                       "p_sym_flip", "flip_min_p", "boot", "plan_sha256", "analysis_sha256"])
         md.append("\n## Complete blocks: ladder / cycle split (each condition separately)\n")
-        md.append("cyclic share = ||curl||^2/||A||^2; noise-corrected = both norms minus their replicate-estimated noise "
-                  "energy; chi2 = lack of fit of a pure ladder (df = P - N + 1); floor95 / p_mc = Monte Carlo pure "
-                  "ladders with this block's noise; S_gamma = symmetric part of the two-way interaction (> 0 "
-                  "coexistence, < 0 priority); triads = directed 3-cycles of sign(A) (all / every edge |z| >= 2).\n")
-        md.append("| condition | fraction | window | status | N | k | RMS A | noise A | noise curl | cyclic share | noise-corrected | floor95 | p_mc | chi2 (df) | p_lof | RMS S_gamma | S_gamma sig +/- | triads cyclic/all (sig) |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+        md.append("cyclic share = ||curl||^2/||A||^2; noise-corrected = (||curl||^2 - tau_C) / (||A||^2 - tau_A) "
+                  "with tau the unbiased noise energies of the (resident, replicate) units, and its 95% range "
+                  "over the bootstrap confidence ball for the edge noise; d_C = noise-corrected RMS cyclic signal "
+                  "per pair. Lack of fit of a pure ladder: F = ||curl||^2 / tau_C (~1 under the null), p from the "
+                  f"studentized unit bootstrap ({a.kind}, {a.sims} draws; tau re-estimated in every draw) and the "
+                  "exact replicate sign-flip (smallest attainable p = 1/2^(k-1)); no chi-square. floor95 / p_mc: "
+                  "descriptive, raw share of a pure ladder of the noise-corrected strength plus bootstrap noise. "
+                  "Symmetric interaction (S_gamma, the symmetric part of the two-way gamma: a symmetric departure "
+                  "from the additive invader + resident prediction, not by itself mutual invasibility or "
+                  "coexistence): tested as a whole by F_sym / p_sym. triads = directed 3-cycles of sign(A) "
+                  "(all / every edge |z| >= 2).\n")
+        md.append("| condition | fraction | window | status | N | k | RMS A | noise A | noise curl | cyclic share | noise-corrected (95% range) | d_C (95%) | floor95 | F lof (df) | p boot | p sign-flip | F sym (df) | p sym boot / flip | S_gamma sig +/- | triads cyclic/all (sig) |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
         for m in mats:
-            pl = f"{m['p_lof']:.2g}" if m["p_lof"] is not None else "-"
             md.append(f"| {m['cond']} | {m['frac']} | {m['G']} | {m['status']} | {m['n']} | {m['k']} | {m['rms_A']:.4f} | {m['noise_A']:.4f} | "
-                      f"{m['noise_curl']:.4f} | {m['cyclic_share']:.3f} | {fmt(m['noise_corrected'], 3)} | {fmt(m['floor95'], 3) or '-'} | "
-                      f"{fmt(m['p_mc'], 3) or '-'} | {m['chi2']:.1f} ({m['df']}) | {pl} | {m['rms_Sg']:.4f} | "
+                      f"{m['noise_curl']:.4f} | {m['cyclic_share']:.3f} | {fmt(m['noise_corrected'], 3)} "
+                      f"({m['share_ci95_lo']:.3f}-{m['share_ci95_hi']:.3f}) | {m['dC']:.4f} ({m['dC_ci95_lo']:.4f}-{m['dC_ci95_hi']:.4f}) | "
+                      f"{fmt(m['floor95'], 3) or '-'} | {m['F_lof']:.2f} ({m['df']}) | {fmt(m['p_lof'], 4) or '-'} | "
+                      f"{fmt(m['p_lof_flip'], 4) or '-'} | {m['F_sym']:.2f} ({m['df_sym']}) | "
+                      f"{fmt(m['p_sym'], 4) or '-'} / {fmt(m['p_sym_flip'], 4) or '-'} | "
                       f"{m['n_Sg_sig_pos']}/{m['n_Sg_sig_neg']} | {m['triads_cyclic']}/{m['triads']} ({m['triads_sig']}) |")
-        md.append("\n| condition | fraction | window | names | ladder ratings | by home regime | by pair relation |\n|---|---|---|---|---|---|---|")
+        if joint:
+            md.append("\nOmnibus over the assay conditions (units resampled / flipped jointly: they share slot and donor "
+                      "seeds across conditions): F = sum ||curl||^2 / sum tau_C.\n")
+            md.append("| fraction | window | conditions | N | k | F lof | p boot | p sign-flip | F sym | p sym boot / flip |\n|---|---|---|---|---|---|---|---|---|---|")
+            for j_ in joint:
+                md.append(f"| {j_['frac']} | {j_['G']} | {j_['conditions']} | {j_['n']} | {j_['k']} | {j_['F_lof']:.2f} | "
+                          f"{fmt(j_['p_lof'], 4)} | {fmt(j_['p_lof_flip'], 4)} | {j_['F_sym']:.2f} | "
+                          f"{fmt(j_['p_sym'], 4)} / {fmt(j_['p_sym_flip'], 4)} |")
+        md.append("\nLadder ratings, and per-pair means of the FULL-matrix decomposition by pair relation. These "
+                  "are descriptive averages of residuals that depend on the whole matrix, not decompositions "
+                  "within each group. The relation classes are exclusive (same-run before sisters before "
+                  "same-regime), so 'same-regime' excludes same-run pairs; 'within-regime (all)' includes them. "
+                  "'noise-corrected curl^2' = curl_e^2 minus its unit-estimated noise variance.\n")
+        md.append("| condition | fraction | window | names | ladder ratings | by home regime | by pair relation | corr(noise-corrected curl^2, d_G) |\n|---|---|---|---|---|---|---|---|")
         for m in mats:
             regr = " ".join(f"{t.split(':')[0]}:{float(t.split(':')[1]):+.4f}" for t in m.get("regime_ratings", "").split())
             md.append(f"| {m['cond']} | {m['frac']} | {m['G']} | {m['names']} | {' '.join(f'{x:+.4f}' for x in m['ratings'])} | "
-                      f"{regr} | {m.get('by_category', '')} |")
+                      f"{regr} | {m.get('by_category', '')} | {fmt(m.get('corr_zC_dG'), 2)} |")
+        if subs:
+            md.append("\n### Balanced sub-blocks decomposed on their own (descriptive)\n")
+            md.append("Each row is the complete sub-matrix of the items sharing one home regime or one snapshot time, "
+                      "with its own ladder, cycle space ((n-1)(n-2)/2 dimensions) and unit noise. With two snapshots "
+                      "per run there is no within-run triangle, and the regime blocks mix same-run time pairs with "
+                      "cross-run pairs, so these are not the stats spec's matched within- vs between-run K3 "
+                      "comparison (which needs >= 3 time points per run); inference over evolutionary runs needs "
+                      "independent home runs per regime (a panel bootstrap), which two runs per regime cannot give.\n")
+            md.append("| condition | fraction | window | group | items | cyclic share | noise-corrected (95% range) | d_C | F lof (cycle dims) | p boot | p sign-flip | local / harmonic |\n|---|---|---|---|---|---|---|---|---|---|---|---|")
+            for s_ in subs:
+                ci = (f" ({s_['share_ci95_lo']:.3f}-{s_['share_ci95_hi']:.3f})" if s_["share_ci95_lo"] is not None else "")
+                md.append(f"| {s_['cond']} | {s_['frac']} | {s_['G']} | {s_['group']} | {s_['names']} | {s_['cyclic_share']:.3f} | "
+                          f"{fmt(s_['noise_corrected'], 3)}{ci} | {s_['dC']:.4f} | "
+                          f"{s_['F_lof']:.2f} ({s_['df']}) | {fmt(s_['p_lof'], 4) or '-'} | {fmt(s_['p_lof_flip'], 4) or '-'} | "
+                          f"{s_['local_harmonic']} |")
+        if dG:
+            md.append("\nSensor-relevant genetic dissimilarity d_G (1 - mean engine genomeSimilarity over 4,000 random "
+                      "fish pairs: aligned slots whose source- and sink-type bits match; not full gene identity), "
+                      "per pair in matrix_pairs.csv; within-snapshot values in inputs.json. The correlation above is "
+                      "descriptive: pairs share snapshots and the residuals are coupled by the projection, so it is "
+                      "not a test (the spec's distance slopes need a panel bootstrap over independent runs).\n")
 
     # --- speed
     c, pts = speed_fit(recs)
@@ -807,87 +1114,9 @@ def main(argv=None):
             t = c[0] + c[1] * pop + c[2] * pop * pop
             md.append(f"| {pop} | {1 / t:.0f} |")
 
-    # --- power
-    pw_rows = []
-    blocks = {(m["cond"], m["frac"], m["G"]): m for m in mats}
-    if not a.no_power and dnoise and effect:
-        md.append("\n## Noise floor and planted-cycle recovery (simulated at the measured noise)\n")
-        md.append("Noise per A cell for one replicate: from the complete block when there is one (the curl's own "
-                  "replicate noise, sqrt(v_eff x k): under common random numbers the column-shared noise is pure "
-                  "gradient and cannot fake cycles), else sqrt(2) x the pooled SD of s~ per replicate (conservative). "
-                  "With k replicates it is that / sqrt(k). True RMS of A = the noise-corrected RMS of the block "
-                  "(else of the pilot pairs), x0.5 / x1 / x2. Floor = 95th percentile of the cyclic share of pure "
-                  "ladders; power = P(planted share > floor); 'obs' and 'corrected' = mean observed and "
-                  "noise-corrected share at a planted 0.3.\n")
-        md.append("| condition | fraction | window | noise source | N | k | true RMS A | noise/cell | floor95 | share 0.1 | 0.2 | 0.3 | 0.5 | obs @0.3 | corrected @0.3 |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
-        pwin = [float(x) for x in a.power_windows.split(",")]
-        for key in sorted(dnoise):
-            cond, frac, G = key
-            if a.power_cond and cond != a.power_cond:
-                continue
-            if G not in pwin:
-                continue
-            if key not in effect:
-                continue
-            blk = blocks.get(key)
-            if blk:
-                sigma1 = blk["noise_curl"] * math.sqrt(blk["k"])
-                rms0 = math.sqrt(max(0.0, blk["rms_A"] ** 2 - blk["noise_A"] ** 2))
-                src = f"block N={blk['n']}"
-            else:
-                sigma1 = math.sqrt(2) * dnoise[key]
-                rms0 = effect[key]["rms_true"]
-                src = "pairs"
-            for mult in (0.5, 1.0, 2.0):
-                rms = rms0 * mult
-                if rms <= 0:
-                    continue
-                for N, ks in ((20, (3, 5, 10, 20)), (10, (10,)), (30, (10,))):
-                    for k in ks:
-                        if mult != 1.0 and (N != 20 or k not in (5, 10)):
-                            continue
-                        ns = sigma1 / math.sqrt(k)
-                        _, f95 = hodge.simulate_floor(N, rms, ns, sims=a.sims, seed=11)
-                        row = {"cond": cond, "frac": frac, "G": G, "N": N, "k": k, "rms": rms, "mult": mult,
-                               "noise": ns, "floor95": f95, "source": src, **ident}
-                        for share in (0.1, 0.2, 0.3, 0.5):
-                            r = hodge.simulate_power(N, rms, share, ns, f95, sims=a.power_sims, seed=13)
-                            row[f"p{share}"] = r["power"]
-                            if share == 0.3:
-                                row["obs03"] = r["mean_share"]
-                                row["deb03"] = r["mean_debiased"]
-                        pw_rows.append(row)
-                        md.append(f"| {cond} | {frac} | {G} | {src} | {N} | {k} | {rms:.4f} (x{mult}) | {ns:.4f} | {f95:.3f} | "
-                                  f"{row['p0.1']:.2f} | {row['p0.2']:.2f} | {row['p0.3']:.2f} | {row['p0.5']:.2f} | "
-                                  f"{row['obs03']:.3f} | {row['deb03']:.3f} |")
-        # Assumption-light companion: the smallest cyclic component the lack-of-fit test detects with
-        # 80% power at alpha 0.05, whatever the ladder looks like (the ladder does not enter the curl).
-        md.append("\nMinimum detectable cycle (chi2 lack of fit, alpha 0.05, power 0.8; normal approximation to the "
-                  "noncentral chi2): RMS of the curl per pair, against the per-cell noise of that row.\n")
-        md.append("| condition | fraction | window | N | k | noise/cell | min detectable curl RMS per pair |\n|---|---|---|---|---|---|---|")
-        seen = set()
-        for row in pw_rows:
-            key = (row["cond"], row["frac"], row["G"], row["N"], row["k"])
-            if key in seen or row["mult"] != 1.0:
-                continue
-            seen.add(key)
-            N = row["N"]
-            df = (N - 1) * (N - 2) // 2
-            crit = df + 1.6449 * math.sqrt(2 * df)
-            lo, hi = 0.0, 50.0 * df
-            for _ in range(100):   # solve df + lam - 0.8416 sqrt(2 (df + 2 lam)) = crit
-                lam = 0.5 * (lo + hi)
-                if df + lam - 0.8416 * math.sqrt(2 * (df + 2 * lam)) < crit:
-                    lo = lam
-                else:
-                    hi = lam
-            P = N * (N - 1) / 2
-            row["min_curl_rms"] = math.sqrt(lam * row["noise"] ** 2 / P)
-            md.append(f"| {row['cond']} | {row['frac']} | {row['G']} | {N} | {row['k']} | {row['noise']:.4f} | "
-                      f"{row['min_curl_rms']:.4f} |")
-        write_csv(os.path.join(a.out, "power.csv"), pw_rows,
-                  ["cond", "frac", "G", "source", "N", "k", "rms", "mult", "noise", "floor95", "p0.1", "p0.2", "p0.3",
-                   "p0.5", "obs03", "deb03", "min_curl_rms", "plan_sha256", "analysis_sha256"])
+    # --- power: no longer here. The old table planted cycles into iid isotropic noise and judged
+    # them against a chi-square / isotropic floor; calibrate.py now measures the null rejection
+    # rate and the planted-cycle power of the SAME tests as above, from blocks.json.
 
     # --- cost
     if c:
@@ -912,6 +1141,8 @@ def main(argv=None):
         write_csv(os.path.join(a.out, "cost.csv"), cost,
                   ["G", "pop", "sec_per_cell", "N", "k", "fractions", "runs", "core_h", "wall_h_4"])
 
+    with open(os.path.join(a.out, "inputs.json"), "w") as f:
+        f.write(json.dumps(prov, indent=1, sort_keys=True, default=str) + "\n")
     with open(os.path.join(a.out, "summary.md"), "w") as f:
         f.write("\n".join(md) + "\n")
     print("\n".join(md))

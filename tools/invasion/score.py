@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""score.py: invader-ancestry score of one arena run, with the child-id derivation checked.
+"""score.py: invader founder-pedigree score of one arena run, with the child-id derivation checked.
 
     score.py --arena ARENA.json --manifest ARENA.manifest.json --births RUN.births.csv
              --checkpoint END.json [--checkpoint MID.json ...] [--out SCORE.json]
@@ -32,8 +32,16 @@ That is CHECKED, not assumed, on every run; any failure exits 1 with the reason:
     genome that is a crossover of ITS logged parents. A newborn order permuted
     before ids are assigned fails these even when every count agrees.
 
-Ancestry: marked (invader) founders 1, every other start fish 0, a child the
-mean of its parents. Score at C: mean live ancestry - start fraction (m/n).
+Founder pedigree contribution: marked (invader) founders 1, every other start
+fish 0, a child the mean of its parents. Score at C: mean live contribution -
+start fraction (m/n). This is an exact PEDIGREE index (Lacy 1989's founder
+representation), not realized genomic ancestry: Finfolk's crossover takes the
+child's genome length from one parent and each slot from one parent
+(genome.hpp), so a one-gene invader crossed with a three-gene resident passes
+on an expected 1/3 of the genes before mutation where the index assigns 1/2.
+A live fish with 0 < contribution < 1 has a MIXED PEDIGREE (n_mixed_pedigree);
+that is not genomic heterozygosity, and endpoint counts of mixed-pedigree fish
+or mating classes are not a hybrid-versus-pure fitness comparison.
 Generation turnover: the steps until cumulative births reach k * n_start
 (k = 1, 2, ...), the first being "one generation".
 """
@@ -151,7 +159,7 @@ def score(arena_path, manifest_path, births_path, checkpoint_paths):
         anc[cid] = 0.5 * (anc[p1] + anc[p2])
         lin[cid] = lin[p1]
         parents[cid] = (p1, p2)
-        # mating class by parental ancestry: 2 = both carry invader ancestry, 1 = one does, 0 = neither
+        # mating class by parental pedigree: 2 = both parents carry invader pedigree, 1 = one does, 0 = neither
         born.append((frame, cid, (anc[p1] > 0) + (anc[p2] > 0)))
 
     # generation turnover: steps until cumulative births reach k * n0
@@ -195,9 +203,9 @@ def score(arena_path, manifest_path, births_path, checkpoint_paths):
         results.append({
             "checkpoint": os.path.basename(path), "frame": frame, "steps": frame - start_frame,
             "births": nb, "generations": nb / n0, "n": n,
-            "mean_ancestry": mean, "score": (mean - frac0) if n else None,
+            "mean_pedigree_contribution": mean, "score": (mean - frac0) if n else None,
             "n_any_invader": sum(1 for x in a if x > 0), "n_pure_invader": sum(1 for x in a if x == 1.0),
-            "n_hybrid": sum(1 for x in a if 0 < x < 1),
+            "n_mixed_pedigree": sum(1 for x in a if 0 < x < 1),
             "births_by_class": [sum(1 for b in born[:nb] if b[2] == c) for c in (0, 1, 2)],
             "n_founders_alive": sum(1 for i in ids if i in start_set),
             "extinct": n == 0, "invader_lost": n > 0 and all(x == 0 for x in a),
@@ -220,6 +228,8 @@ def score(arena_path, manifest_path, births_path, checkpoint_paths):
 
     return {
         "schema": SCHEMA,
+        # what "score" measures (see the module doc): a pedigree index, not genomic ancestry
+        "measure": "founder_pedigree_contribution",
         "arena_sha256": man["output"]["sha256"], "births_sha256": invlib.sha256_file(births_path),
         "mode": man["mode"], "m": len(marked), "n0": n0, "start_fraction": frac0,
         "start_frame": start_frame, "start_nextId": start_next, "start_ordinal": start_ord,

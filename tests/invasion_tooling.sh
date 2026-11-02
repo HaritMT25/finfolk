@@ -25,7 +25,14 @@
 #   9. SIGTERM to the runner alone leaves no engine running;
 #  10. parent -> child correspondence: with distinct mother lines and mutation
 #      off, every child's lineage and genome match its derived birth record,
-#      and a log with two same-frame births swapped is refused.
+#      and a log with two same-frame births swapped is refused;
+#  11. block comparisons: inclusive within-regime summary, regime / time
+#      sub-blocks decomposed on their own, the bipartite cross-regime graph's
+#      cyclic part harmonic (a planted 4-cycle found there, not in the blocks);
+#  12. null calibration under heteroscedastic noise: the bootstrap and
+#      sign-flip lack-of-fit tests keep their level (the old chi-square did not);
+#  13. interpretation: the score is a founder pedigree index; S > 0 with one
+#      direction losing is 'opposite directions', never a reciprocal claim.
 set -u
 BIN=${1:?usage: invasion_tooling.sh EVO_BOIDS WORKDIR}
 W=${2:?usage: invasion_tooling.sh EVO_BOIDS WORKDIR}
@@ -62,6 +69,8 @@ assert cp["predators"]["count"] == 2 and cp["config"]["predatorCount"] == 2
 assert cp["world"]["nextId"] == m["resident"]["nextId"] + m["m"]
 s = json.load(open("inv.score.json"))
 assert s["derivation"]["ok"] and s["derivation"]["checked_checkpoints"] == 3 and s["births"] > 0
+# the score says what it is: a founder pedigree index ("mixed pedigree", not "hybrid")
+assert s["measure"] == "founder_pedigree_contribution" and "n_mixed_pedigree" in s["points"][-1], s["points"][-1]
 assert s["derivation"]["max_derived_id"] == s["derivation"]["end_nextId"] - 1
 sh = json.load(open("sham.manifest.json"))
 assert [x["slot"] for x in sh["swapped"]] == [x["slot"] for x in m["swapped"]], "sham must reuse the slots"
@@ -359,4 +368,76 @@ if $PY "$T/score.py" --arena cor.json --manifest cor.manifest.json --births cor.
        --checkpoint cor.end.json > cor.perm.log 2>&1; then
     fail "a log whose births were permuted within a frame was accepted"
 fi
+
+# 11. block comparisons: relation summaries say what they are (inclusive within-regime group), and
+#     balanced sub-blocks are decomposed on their own; the cross-regime pairs form a bipartite graph
+#     whose cyclic part is all harmonic (a planted 4-cycle through both regimes is found there, and
+#     the within-regime sub-blocks, pure ladders, show none)
+$PY - "$T" <<'PY' || fail "sub-block / incomplete-graph decompositions"
+import random, sys
+sys.path.insert(0, sys.argv[1]); import analyze, infer
+rnd = random.Random(4)
+names = ["a1", "a2", "a3", "b1", "b2", "b3"]
+meta = {nm: {"run": "r" + nm[0] + ("12" if nm[1] in "12" else "3"), "regime": nm[0], "family": "f" + nm,
+             "time": 1 if nm[1] in "12" else 2} for nm in names}
+r = {nm: rnd.gauss(0, 0.05) for nm in names}
+cyc = {("a1", "b1"): 1, ("b1", "a2"): 1, ("a2", "b2"): 1, ("b2", "a1"): 1}   # a1 -> b1 -> a2 -> b2 -> a1
+amp = 0.02
+def Aij(i, j):
+    c = amp * cyc.get((i, j), 0) - amp * cyc.get((j, i), 0)
+    return r[i] - r[j] + c
+rows = []
+for j in names:
+    for i in names:
+        for rep in range(4):
+            mu = 0.0 if i == j else 0.5 * Aij(i, j)
+            rows.append({"cond": "off", "frac": 0.1, "G": 1.0, "mode": "sham" if i == j else "invade", "i": i, "j": j,
+                         "rep": rep, "s": mu + rnd.gauss(0, 1e-6), "missed": False})
+out, detail, blocks, joint, subs = analyze.matrices(rows, meta, sims=99, registry=None, kind="wild")
+assert "within-regime (all): n=6" in out[0]["by_category"], out[0]["by_category"]
+g = {s["group"]: s for s in subs}
+assert {"regime=a", "regime=b", "time=1", "cross-regime pairs (bipartite, incomplete)"} <= set(g), sorted(g)
+assert g["time=1"]["cyclic_share"] > 0.01   # the 4 time-1 items carry the planted cycle
+z = blocks[("off", 0.1, 1.0)]["z"]
+assert abs(g["regime=a"]["cyclic_share"] - infer.infer([analyze.subblock(z, [0, 1, 2])], B=19)["share_raw"]) < 1e-12
+assert g["regime=a"]["cyclic_share"] < 1e-6 and g["regime=b"]["cyclic_share"] < 1e-6, (g["regime=a"], g["regime=b"])
+sg = analyze.subgraph_summary(z, lambda p, q: names[p][0] != names[q][0])
+assert sg["triangles"] == 0 and abs(sg["local_nc"]) < 1e-12 and abs(sg["harmonic_nc"] / (4 * amp ** 2) - 1) < 1e-3, sg
+assert out[0]["cyclic_share"] > 0.01   # the full matrix sees the cycle too
+PY
+
+# 12. calibration: with heteroscedastic null noise (per-cell SDs 0.002-0.08, as in the pilot) the
+#     lack-of-fit tests keep their level; the superseded isotropic chi-square does not
+$PY - "$T" <<'PY' || fail "null calibration of the lack-of-fit test"
+import math, random, sys
+sys.path.insert(0, sys.argv[1]); import calibrate, infer
+rnd = random.Random(12)
+N, k, S = 6, 6, 300
+sds = [[0.0 if i == p else math.exp(rnd.uniform(math.log(0.002), math.log(0.08))) for i in range(N)] for p in range(N)]
+rej = {"boot": 0, "flip": 0, "chi2": 0, "sym": 0}
+for s in range(S):
+    z = [[[0.0 if i == p else sds[p][i] * rnd.gauss(0, 1) for i in range(N)] for _ in range(k)] for p in range(N)]
+    r = infer.infer([z], B=99, seed=s)
+    rej["boot"] += r["p_lof"] <= 0.05
+    rej["sym"] += r["p_sym"] <= 0.05
+    rej["flip"] += r["p_lof_flip"] <= 0.05
+    rej["chi2"] += calibrate.old_tests(z)[0] <= 0.05
+rate = {t: v / S for t, v in rej.items()}
+print("null rejection at alpha 0.05:", rate)
+assert rate["boot"] <= 0.09 and rate["sym"] <= 0.09 and rate["flip"] <= 0.06, rate
+assert rate["chi2"] >= 0.09, rate   # the old test's anti-conservatism (0.12 here), for the record
+PY
+
+# 13. interpretation: a positive symmetric part is not a reciprocal claim. The pilot's n102e / n102l
+#     pair (-0.035 one way, +0.133 the other, S = +0.049) is 'opposite directions'
+$PY - "$T" <<'PY' || fail "reciprocal classification"
+import sys
+sys.path.insert(0, sys.argv[1]); import analyze
+prs = [{"cond": "off", "frac": 0.05, "G": 5.0, "j": "n102l", "i": "n102e", "st": -0.0352, "se_paired": 0.009, "z": -3.9},
+       {"cond": "off", "frac": 0.05, "G": 5.0, "j": "n102e", "i": "n102l", "st": 0.1325, "se_paired": 0.010, "z": 13.2}]
+pt = analyze.pair_table(prs)
+assert len(pt) == 1 and pt[0]["S"] > 0 and pt[0]["reciprocal"] == "opposite directions", pt
+assert analyze.reciprocal(2.5, 3.0) == "reciprocal gain" and analyze.reciprocal(-2.5, -3.0) == "reciprocal suppression"
+assert analyze.reciprocal(2.5, 1.0) == "unresolved" and analyze.reciprocal(None, 3.0) == "unresolved"
+PY
 echo "invasion_tooling: ok"

@@ -3,10 +3,16 @@
 
 Matrices are lists of lists; a missing cell is None.
 
-    s~[i][j]   paired invasion score of i into j (s(i->j) - s(j->j))
+    s~[i][j]   paired invasion score of i into j (s(i->j) - s(j->j)): the change in the
+               invaders' founder pedigree contribution, relative to self-invasion
     A = s~ - s~^T          antisymmetric part: who beats whom
-    S = (s~ + s~^T) / 2    symmetric part: > 0 mutual invasibility (coexistence),
-                           < 0 priority effects (whoever is resident wins)
+    S = (s~ + s~^T) / 2    symmetric part: the pair's mean pedigree gain over both directions.
+                           S > 0 does NOT mean both directions gain (one direction can lose while
+                           the other gains more), so it is not mutual invasibility, and neither it
+                           nor the symmetric interaction of the two-way model below establishes
+                           coexistence; a reciprocal claim needs both directed scores bounded
+                           away from zero (analyze.py's 'reciprocal' column), and coexistence
+                           needs persistence evidence beyond these scores.
 
 Hodge (combinatorial Helmholtz) split of A on the comparison graph
 (Candogan et al. 2011; Balduzzi et al. 2018, "Re-evaluating evaluation"):
@@ -19,11 +25,14 @@ number is the cyclic share  ||curl||^2 / ||A||^2  over the observed pairs:
 Noise: with independent cell noise of variance v on each A_ij, E||noise||^2 =
 v * P (P observed pairs) of which v * (P - (N - 1)) lands in the curl (the
 cycle space has dimension P - N + 1 on a connected graph), so pure noise reads
-as cyclic share (P - N + 1) / P, about (N - 2) / N for a complete matrix. A
-measured share means nothing until it beats the noise floor (pure ladder +
-the measured noise, 95th percentile) -- simulate_floor -- and a "ladder"
-verdict means nothing until a planted cycle of realistic size is shown to be
-recovered -- simulate_power.
+as cyclic share (P - N + 1) / P, about (N - 2) / N for a complete matrix. That
+is an expected-energy allocation, not a distribution: real invasion noise is
+heteroscedastic (per-cell SDs differ ~50x in the pilot) and correlated within
+a common-random-number unit, so no single chi-square scale describes the curl
+energy. Noise correction, the lack-of-fit test, the noise floor and power are
+infer.py's (unit bootstrap / exact sign-flip) and calibrate.py's (null
+rejection and planted-cycle power by simulation through the same tests); the
+isotropic chi-square test and floor that used to live here are gone.
 
 mElo2k (Balduzzi et al. 2018): the curl's leading Schur pairs,
 curl ~ sum_k s_k (u_k b_k^T - b_k u_k^T), give each item a 2k-dimensional
@@ -98,7 +107,10 @@ def ratings(A, W=None):
 
 
 def split(A, W=None):
-    """-> dict(r, grad, curl, cyclic_share, ladder_share, P, norm2) over the observed pairs."""
+    """-> dict(r, grad, curl, cyclic_share, ladder_share, P, norm2) over the observed pairs.
+    'curl' is the whole cyclic residual A - grad r. On a complete graph that is all local
+    (triangle) curl; on an incomplete graph part of it can be harmonic (cycles around unobserved
+    edges): decompose() splits the two."""
     n = len(A)
     r = ratings(A, W)
     grad = [[None] * n for _ in range(n)]
@@ -122,15 +134,89 @@ def split(A, W=None):
             "ladder_share": ng / na if na > 0 else float("nan"), "P": P, "norm2": na}
 
 
-def debiased_share(A, noise_var, W=None):
-    """Cyclic share with the expected noise energy removed from both norms (unit weights,
-    connected graph): (||curl||^2 - v (P - N + 1)) / (||A||^2 - v P). Can leave [0, 1]."""
-    s = split(A, W)
+# ------------------------------------------- incomplete graphs: local / harmonic
+def edge_list(A):
     n = len(A)
-    P = s["P"]
-    num = s["cyclic_share"] * s["norm2"] - noise_var * (P - n + 1)
-    den = s["norm2"] - noise_var * P
-    return num / den if den > 0 else float("nan")
+    return [(i, j) for i in range(n) for j in range(i + 1, n) if A[i][j] is not None]
+
+
+def n_components(n, edges):
+    parent = list(range(n))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+    for i, j in edges:
+        parent[find(i)] = find(j)
+    return len({find(x) for x in range(n)})
+
+
+def _orthobasis(vectors, tol=1e-10):
+    """Orthonormal basis of span(vectors) (modified Gram-Schmidt, dependent vectors dropped)."""
+    basis = []
+    for v in vectors:
+        w = list(v)
+        for b in basis:
+            d = sum(x * y for x, y in zip(w, b))
+            w = [x - d * y for x, y in zip(w, b)]
+        nrm = math.sqrt(sum(x * x for x in w))
+        if nrm > tol * max(1.0, math.sqrt(sum(x * x for x in v))):
+            basis.append([x / nrm for x in w])
+    return basis
+
+
+def triangle_basis(n, edges):
+    """Orthonormal basis of the span of the observed triangles' circulations (i -> j -> k -> i:
+    +1 on (i, j) and (j, k), -1 on (i, k)), as edge vectors over `edges`."""
+    idx = {e: t for t, e in enumerate(edges)}
+    tri = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            if (i, j) not in idx:
+                continue
+            for k in range(j + 1, n):
+                if (j, k) in idx and (i, k) in idx:
+                    v = [0.0] * len(edges)
+                    v[idx[(i, j)]] = 1.0
+                    v[idx[(j, k)]] = 1.0
+                    v[idx[(i, k)]] = -1.0
+                    tri.append(v)
+    return _orthobasis(tri), len(tri)
+
+
+def decompose(A, basis=None):
+    """Gradient / local (triangle-curl) / harmonic split of A on its observed comparison graph,
+    unit weights (Jiang et al. 2011): A = grad r + local + harmonic, orthogonal. The cyclic residual
+    of an INCOMPLETE graph is local only as far as observed triangles span it; the rest is
+    harmonic (circulation around holes, e.g. every cycle of a bipartite graph). On a complete graph
+    the harmonic part is zero. Needs a connected graph. `basis` = triangle_basis(...) to reuse.
+    -> dict(edges, r, grad, local, harmonic (edge vectors), E_A, E_grad, E_local, E_harm, q_cycle,
+    q_local, triangles)."""
+    n = len(A)
+    edges = edge_list(A)
+    c = n_components(n, edges)
+    if c != 1:
+        raise ValueError(f"comparison graph has {c} components")
+    s = split(A)
+    x = [A[i][j] for i, j in edges]
+    grad = [s["grad"][i][j] for i, j in edges]
+    cyc = [a - g for a, g in zip(x, grad)]
+    ntri = None
+    if basis is None:
+        basis, ntri = triangle_basis(n, edges)
+    loc = [0.0] * len(edges)
+    for b in basis:
+        d = sum(u * v for u, v in zip(cyc, b))
+        loc = [u + d * v for u, v in zip(loc, b)]
+    harm = [u - v for u, v in zip(cyc, loc)]
+
+    def e2(v):
+        return sum(t * t for t in v)
+    return {"edges": edges, "r": s["r"], "grad": grad, "local": loc, "harmonic": harm,
+            "E_A": e2(x), "E_grad": e2(grad), "E_local": e2(loc), "E_harm": e2(harm),
+            "q_cycle": len(edges) - n + c, "q_local": len(basis), "triangles": ntri}
 
 
 # --------------------------------------------------------- two-way model
@@ -142,8 +228,10 @@ def twoway(M, iters=500, tol=1e-15):
     and on a complete matrix gamma's rows and columns sum to 0, so gamma - gamma^T has zero row sums: it is
     pure curl, and the cyclic part of A is exactly the antisymmetric part of gamma. Any column constant (the
     self-invasion baseline s(j->j)) is absorbed into b_j, so fitting s or s~ gives the same gamma.
-    The symmetric part of gamma, (gamma_ij + gamma_ji)/2, is coexistence (> 0) vs priority (< 0) beyond what
-    the invader's and the resident's general strengths predict."""
+    The symmetric part of gamma, (gamma_ij + gamma_ji)/2, is the symmetric interaction: a symmetric
+    departure of the pair's pedigree gain from what the invader's and the resident's general effects
+    predict (> 0 more, < 0 less). It is not mutual invasibility and not, by itself, coexistence or a
+    priority effect."""
     n = len(M)
     cells = [(i, j) for i in range(n) for j in range(n) if i != j and M[i][j] is not None]
     mu = sum(M[i][j] for i, j in cells) / len(cells)
@@ -203,7 +291,54 @@ def _gammainc_upper(s, x):
 
 
 def chi2_sf(x, df):
+    """Chi-square upper tail. Kept for calibrate.py's comparison with the superseded isotropic
+    lack-of-fit test; no decision in analyze.py uses it."""
     return _gammainc_upper(df / 2.0, x / 2.0)
+
+
+def _betacf(a, b, x):
+    """Continued fraction for the regularized incomplete beta (Numerical Recipes betacf)."""
+    qab, qap, qam = a + b, a + 1.0, a - 1.0
+    c, d = 1.0, 1.0 - qab * x / qap
+    d = 1.0 / (d if abs(d) > 1e-300 else 1e-300)
+    h = d
+    for m in range(1, 10000):
+        m2 = 2 * m
+        aa = m * (b - m) * x / ((qam + m2) * (a + m2))
+        d = 1.0 + aa * d
+        d = 1.0 / (d if abs(d) > 1e-300 else 1e-300)
+        c = 1.0 + aa / c
+        c = c if abs(c) > 1e-300 else 1e-300
+        h *= d * c
+        aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2))
+        d = 1.0 + aa * d
+        d = 1.0 / (d if abs(d) > 1e-300 else 1e-300)
+        c = 1.0 + aa / c
+        c = c if abs(c) > 1e-300 else 1e-300
+        de = d * c
+        h *= de
+        if abs(de - 1.0) < 1e-15:
+            break
+    return h
+
+
+def betainc(a, b, x):
+    """Regularized incomplete beta I_x(a, b)."""
+    if x <= 0:
+        return 0.0
+    if x >= 1:
+        return 1.0
+    lb = math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b) + a * math.log(x) + b * math.log(1 - x)
+    if x < (a + 1) / (a + b + 2):
+        return math.exp(lb) * _betacf(a, b, x) / a
+    return 1.0 - math.exp(lb) * _betacf(b, a, 1 - x) / b
+
+
+def f_sf(f, d1, d2):
+    """F(d1, d2) upper tail (comparison only, like chi2_sf)."""
+    if f <= 0:
+        return 1.0
+    return betainc(d2 / 2.0, d1 / 2.0, d2 / (d2 + d1 * f))
 
 
 def circular_triads(A, Z=None, zmin=None):
@@ -303,41 +438,6 @@ def observe(T, noise_sd, rnd):
     return A
 
 
-def percentile(xs, q):
-    xs = sorted(xs)
-    if not xs:
-        return float("nan")
-    k = (len(xs) - 1) * q
-    lo = int(math.floor(k))
-    hi = min(lo + 1, len(xs) - 1)
-    return xs[lo] + (xs[hi] - xs[lo]) * (k - lo)
-
-
-def simulate_floor(n, rms, noise_sd, sims=1000, seed=0):
-    """Cyclic shares of pure-ladder matrices (true RMS `rms`) observed with noise `noise_sd`
-    per A cell. -> (list of shares, 95th percentile)."""
-    rnd = random.Random(seed)
-    xs = [split(observe(planted(n, rms, 0.0, rnd), noise_sd, rnd))["cyclic_share"] for _ in range(sims)]
-    return xs, percentile(xs, 0.95)
-
-
-def simulate_power(n, rms, share, noise_sd, floor95, sims=500, seed=1):
-    """Planted cycle of cyclic share `share` (true RMS `rms`), observed with noise.
-    -> dict(power = P(observed share > floor95), mean observed share, mean debiased share)."""
-    rnd = random.Random(seed)
-    hit = 0
-    obs, deb = [], []
-    v = noise_sd * noise_sd
-    for _ in range(sims):
-        A = observe(planted(n, rms, share, rnd), noise_sd, rnd)
-        s = split(A)["cyclic_share"]
-        obs.append(s)
-        deb.append(debiased_share(A, v))
-        hit += s > floor95
-    return {"power": hit / sims, "mean_share": sum(obs) / sims, "mean_debiased": sum(deb) / sims,
-            "sd_share": math.sqrt(sum((x - sum(obs) / sims) ** 2 for x in obs) / max(1, sims - 1))}
-
-
 # -------------------------------------------------------------- self-test
 def selftest():
     rnd = random.Random(7)
@@ -397,6 +497,31 @@ def selftest():
     assert abs(chi2_sf(3.841458820694124, 1) - 0.05) < 1e-9
     assert abs(chi2_sf(18.307038053275146, 10) - 0.05) < 1e-9
     assert abs(chi2_sf(2.0, 4) - math.exp(-1) * 2) < 1e-12
+    # F survival: F(1, d2) = t^2 (P(|t_5| > 2.5706) = 0.05); F(2, d2) has a closed form
+    assert abs(f_sf(2.5705818366147395 ** 2, 1, 5) - 0.05) < 1e-9
+    assert abs(f_sf(3.0, 2, 10) - (1 + 2 * 3.0 / 10) ** -5) < 1e-12
+    # local / harmonic: a complete graph has no harmonic part; a 4-cycle (no triangle) is all harmonic;
+    # a triangle with a pendant edge is all local; energies add up
+    C7 = _random_curl(7, rnd)
+    d = decompose(C7)
+    assert d["E_harm"] < 1e-18 and abs(d["E_local"] - d["E_A"]) < 1e-9 and d["q_local"] == d["q_cycle"] == 15, d["q_local"]
+    sq = [[None] * 4 for _ in range(4)]
+    for i, j, v in ((0, 1, 1.0), (1, 2, 1.0), (2, 3, 1.0), (0, 3, -1.0)):
+        sq[i][j], sq[j][i] = v, -v
+    d = decompose(sq)
+    assert d["triangles"] == 0 and abs(d["E_harm"] - 4.0) < 1e-12 and d["E_local"] < 1e-18 and d["q_cycle"] == 1
+    tp = [[None] * 4 for _ in range(4)]
+    for i, j, v in ((0, 1, 1.0), (1, 2, 1.0), (0, 2, -1.0), (2, 3, 0.7)):
+        tp[i][j], tp[j][i] = v, -v
+    d = decompose(tp)
+    assert abs(d["E_local"] - 3.0) < 1e-12 and d["E_harm"] < 1e-18 and abs(d["E_grad"] - 0.49) < 1e-12
+    Lb = _ladder(6, rnd)   # a ladder with a bipartite K_{3,3} pattern of observed edges: no cycle at all
+    for i in range(6):
+        for j in range(6):
+            if (i < 3) == (j < 3):
+                Lb[i][j] = None
+    d = decompose(Lb)
+    assert d["E_local"] + d["E_harm"] < 1e-18 and d["q_cycle"] == 4
     # circular triads: RPS has one; a ladder has none
     assert circular_triads(rps)["cyclic"] == 1
     assert circular_triads(_ladder(6, rnd))["cyclic"] == 0
