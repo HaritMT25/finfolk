@@ -58,13 +58,31 @@ def sd(xs):
 
 
 def fmt(x, nd=4):
+    """Presentation formatting (Markdown only; the CSVs use csv_value)."""
     if x is None:
         return ""
     if isinstance(x, float):
         if math.isnan(x):
             return "nan"
+        if x != 0 and abs(x) < 10 ** -nd:
+            return f"{x:.2g}"
         return f"{x:.{nd}f}" if abs(x) < 1e4 else f"{x:.3g}"
     return str(x)
+
+
+def csv_value(x):
+    """Machine-readable cell: floats at round-trip precision (repr: the shortest string that
+    parses back to the same double, scientific notation where that is shorter), lists as
+    space-joined round-trip values. Rounding is for the Markdown tables only."""
+    if x is None:
+        return ""
+    if isinstance(x, bool):
+        return str(x)
+    if isinstance(x, float):
+        return "nan" if math.isnan(x) else repr(x)
+    if isinstance(x, (list, tuple)):
+        return " ".join(csv_value(v) for v in x)
+    return x
 
 
 def write_csv(path, rows, cols):
@@ -72,7 +90,7 @@ def write_csv(path, rows, cols):
         w = csv.writer(f)
         w.writerow(cols)
         for r in rows:
-            w.writerow([fmt(r.get(c)) if isinstance(r.get(c), float) else r.get(c, "") for c in cols])
+            w.writerow([csv_value(r.get(c)) for c in cols])
 
 
 def sha256(path):
@@ -422,8 +440,7 @@ def matrices(rows, meta=None, zmin=2.0, sims=1000, registry=None):
         if status != "formal":   # no decisions from a partial matrix
             f95 = p_mc = p_lof = None
         row = {"cond": cond, "frac": frac, "G": G, "status": status, "n": n, "k": k, "names": " ".join(names),
-               "ratings": " ".join(f"{x:+.4f}" for x in sp["r"]),
-               "invader_effect": " ".join(f"{x:+.4f}" for x in ea), "resident_effect": " ".join(f"{x:+.4f}" for x in eb),
+               "ratings": list(sp["r"]), "invader_effect": list(ea), "resident_effect": list(eb),
                "cyclic_share": sp["cyclic_share"], "noise_corrected": corrected, "floor95": f95, "p_mc": p_mc,
                "chi2": X, "df": df, "p_lof": p_lof, "rms_A": math.sqrt(sp["norm2"] / P),
                "noise_A": math.sqrt(EnA / P), "noise_curl": math.sqrt(v_eff), "gamma_check": chk,
@@ -434,12 +451,12 @@ def matrices(rows, meta=None, zmin=2.0, sims=1000, registry=None):
                "n_Sg_sig_neg": sum(1 for pq in pairs if varSg[pq] > 0 and Sg[pq] / math.sqrt(varSg[pq]) <= -zmin),
                "triads_cyclic": tri["cyclic"], "triads": tri["triads"], "triads_sig": tri["cyclic_significant"],
                "melo_sigma": mel[0][0] if mel else None,
-               "melo_xy": " ".join(f"{math.sqrt(mel[0][0]) * u:+.3f},{math.sqrt(mel[0][0]) * b:+.3f}"
-                                   for u, b in zip(mel[0][1], mel[0][2])) if mel else ""}
+               # mElo2k embedding, flattened u_0 b_0 u_1 b_1 ... (sqrt(sigma)-scaled)
+               "melo_xy": [math.sqrt(mel[0][0]) * v for u, b in zip(mel[0][1], mel[0][2]) for v in (u, b)] if mel else None}
         if meta:
             regs = sorted({meta.get(nm, {}).get("regime", "") for nm in names})
             row["regime_ratings"] = " ".join(
-                f"{rg}:{mean([sp['r'][p] for p, nm in enumerate(names) if meta.get(nm, {}).get('regime', '') == rg]):+.4f}"
+                f"{rg}:{mean([sp['r'][p] for p, nm in enumerate(names) if meta.get(nm, {}).get('regime', '') == rg])!r}"
                 for rg in regs)
             cats = {}
             for p, q in pairs:
@@ -644,8 +661,9 @@ def main(argv=None):
                       f"{m['n_Sg_sig_pos']}/{m['n_Sg_sig_neg']} | {m['triads_cyclic']}/{m['triads']} ({m['triads_sig']}) |")
         md.append("\n| condition | fraction | window | names | ladder ratings | by home regime | by pair relation |\n|---|---|---|---|---|---|---|")
         for m in mats:
-            md.append(f"| {m['cond']} | {m['frac']} | {m['G']} | {m['names']} | {m['ratings']} | {m.get('regime_ratings', '')} | "
-                      f"{m.get('by_category', '')} |")
+            regr = " ".join(f"{t.split(':')[0]}:{float(t.split(':')[1]):+.4f}" for t in m.get("regime_ratings", "").split())
+            md.append(f"| {m['cond']} | {m['frac']} | {m['G']} | {m['names']} | {' '.join(f'{x:+.4f}' for x in m['ratings'])} | "
+                      f"{regr} | {m.get('by_category', '')} |")
 
     # --- speed
     c, pts = speed_fit(recs)

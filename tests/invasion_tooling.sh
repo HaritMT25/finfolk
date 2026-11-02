@@ -149,6 +149,15 @@ rows = list(csv.DictReader(open("an3/matrix.csv")))
 assert rows and all(r["status"] == "formal" and r["n"] == "3" and r["k"] == "3" for r in rows), rows
 assert all(r["plan_sha256"] == inp["plan"]["sha256"] for r in rows)
 assert all(abs(float(r["gamma_check"])) < 1e-9 for r in rows)
+# the CSVs are machine-readable: floats at round-trip precision, not the Markdown's 4 decimals
+def sig(v):
+    return len(v.lstrip("+-").split("e")[0].replace(".", "").lstrip("0"))
+for r in rows:
+    for c in ("cyclic_share", "rms_A", "noise_A"):
+        assert sig(r[c]) > 6, (c, r[c])
+    assert all(sig(x) > 6 for x in r["ratings"].split()), r["ratings"]
+runs = list(csv.DictReader(open("an3/runs.csv")))
+assert sum(1 for x in runs if x["s"] and sig(x["s"]) > 6) > 0.9 * len(runs), "runs.csv scores rounded"
 PY
 rm root3/cells/off_f100_A_B_r01/done.json
 $PY "$T/analyze.py" --root root3 --out an3b --plan plan3.jsonl --windows 0.25 --no-power --sims 50 > an3b.log 2>&1 \
