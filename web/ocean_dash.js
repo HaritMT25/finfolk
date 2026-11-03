@@ -55,6 +55,14 @@
    * it opened at), until the next reset */
   var origin = "";
   function setOrigin(text) { origin = String(text || ""); version++; lastKey = ""; }
+  /* the history as it is, and that history back (a saved world that failed
+   * to open puts the run back: its charts too; web/ocean.js runNow / pageBack) */
+  function save() { return { rows: rows.slice(), every: every, origin: origin }; }
+  function restore(s) {
+    if (!s) return;
+    rows = s.rows.slice(); every = s.every; origin = s.origin; version++; wireCache = null; lastKey = "";
+    if (host && host.setRecEvery) host.setRecEvery(every);
+  }
   /* the run went back to an earlier frame (a Turbo run that was lost): the
    * samples after it, and the wiring the worker had, are of a future that
    * did not happen */
@@ -416,7 +424,7 @@
 
   window.EvoOceanDash = {
     attach: function (h) { host = h; if (h.setRecEvery) h.setRecEvery(every); },
-    push: push, ingest: ingest, reset: reset, rewind: rewind, origin: setOrigin,
+    push: push, ingest: ingest, reset: reset, rewind: rewind, origin: setOrigin, save: save, restore: restore,
     /* the charts' note as it reads now (the tests; the page shows it when open) */
     note: function () { var span = rows.length ? (frameOf(rows[rows.length - 1]) - frameOf(rows[0])) * DT : 0; return noteText(span); },
     every: function () { return every; }, famK: FAM_K,

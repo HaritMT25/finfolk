@@ -317,6 +317,12 @@
    *     settings three times), 8 levels deep and 20,000 values;
    *   the file at most its prefix, the biggest header and the biggest
    *     body: checked from its size, before a byte of it is read.
+   * Those are the format's. A page also has its device's (worldLimits'
+   * deviceBytes, web/ocean.js deviceBudget): a smaller image cap on a
+   * device with less memory, and a budget for everything an open holds at
+   * once (the run, Turbo's copy, the stored bytes, the test run's module,
+   * the undo), checked before the body is read; Save world writes nothing
+   * the same limits would refuse.
    * A setup file (JSON) is at most MAX_SETUP, 1 MiB (Save setup's are 1 to
    * 3 kB). */
   var MiB = 1048576;
@@ -330,10 +336,13 @@
   function mb(n) { return (n / MiB).toFixed(n < 10 * MiB ? 2 : 0) + " MB"; }
   /* the biggest gzip body of `stored` bytes this reads (raw: exactly them) */
   function maxBody(stored, kind) { return kind === "raw" ? stored : stored + Math.ceil(stored / 1000) + 4096; }
-  /* the limits a page opens world files under; engineBytes: its module's own maximum memory (wasmMemoryMax) */
-  function worldLimits(engineBytes) {
+  /* the limits a page opens (and saves) world files under; engineBytes: its
+   * module's own maximum memory (wasmMemoryMax); deviceBytes: what this
+   * device opens (web/ocean.js deviceBudget: less on a small one) */
+  function worldLimits(engineBytes, deviceBytes) {
     var engine = Number.isSafeInteger(engineBytes) && engineBytes > 0 ? engineBytes : 65536 * PAGE;
-    return { engine: engine, image: Math.min(engine, WORLD.MAX_IMAGE), header: WORLD.MAX_HEADER,
+    var format = Math.min(engine, WORLD.MAX_IMAGE), device = Number.isSafeInteger(deviceBytes) && deviceBytes > 0 ? deviceBytes : format;
+    return { engine: engine, format: format, device: device, image: Math.min(format, device), header: WORLD.MAX_HEADER,
              file: WORLD.PREFIX + WORLD.MAX_HEADER + maxBody(WORLD.MAX_IMAGE, "gzip") };
   }
   /* A wasm module's maximum memory in bytes, from its bytes (its memory
@@ -439,20 +448,25 @@
     return 4 * (i + 1);
   }
   /* a stream's chunks (CompressionStream / DecompressionStream), into fn(chunk);
-   * fn throwing (more than was asked for) cancels the stream: nothing more is
+   * fn throwing (more than was asked for), or cancelled() true (the read is
+   * superseded: a newer file, a start), cancels the stream: nothing more is
    * unpacked */
-  function through(stream, u8, fn) {
+  function through(stream, u8, fn, cancelled) {
     var w = stream.writable.getWriter(), r = stream.readable.getReader();
     w.write(u8).catch(noop);   /* (the reader reports it) */
     w.close().catch(noop);
     return (function pump() {
       return r.read().then(function (x) {
         if (x.done) return;
-        try { fn(x.value); } catch (e) { r.cancel(e).catch(noop); throw e; }
+        try {
+          if (cancelled && cancelled()) throw new Error(CANCELLED);
+          fn(x.value);
+        } catch (e) { r.cancel(e).catch(noop); throw e; }
         return pump();
       });
     })();
   }
+  var CANCELLED = "superseded: a newer file or start took its place";
   function canGzip() { return typeof root.CompressionStream === "function" && typeof root.DecompressionStream === "function"; }
 
   /* JSON in its one canonical form (the header's checksum is of this): object
@@ -530,7 +544,8 @@
     var bad = "That world file is damaged: its header does not describe a memory image.";
     if (!im || typeof im !== "object" || Array.isArray(im) || !whole(im.bytes) || !im.bytes || im.bytes % PAGE) return bad;
     if (im.bytes > L.engine) return "That saved world needs " + mb(im.bytes) + " of memory, more than this engine build can have (" + mb(L.engine) + ").";
-    if (im.bytes > L.image) return "That saved world needs " + mb(im.bytes) + " of memory, more than this page opens (" + mb(L.image) + " at most).";
+    if (im.bytes > L.format) return "That saved world needs " + mb(im.bytes) + " of memory, more than this page opens (" + mb(L.format) + " at most).";
+    if (im.bytes > L.image) return "That saved world needs " + mb(im.bytes) + " of memory, more than this device opens (" + mb(L.image) + " at most here).";
     if (!whole(im.stored) || im.stored > im.bytes || im.stored % 4 || (im.body !== "gzip" && im.body !== "raw") || !whole(im.bodyBytes) ||
         typeof im.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(im.sha256) || Object.keys(im).length !== 5) return bad;
     if (im.body === "raw" ? im.bodyBytes !== im.stored : im.bodyBytes > maxBody(im.stored, "gzip") || im.stored > WORLD.RATIO * im.bodyBytes + 4096)
@@ -579,14 +594,22 @@
       if (size > want) throw new Error("That world file is damaged: it has " + (size - want) + " bytes after its end.");
       return headerDigest(h).then(function (d) {
         if (d !== h.sha256) throw new Error("That world file is damaged: its header does not match its checksum.");
-        return { header: h, at: at, body: function () { return src.read(at, size).then(function (b) { return unpack(h, b); }); } };
+        /* body(cancelled, turn): cancelled() true stops the unpacking at its next chunk (a superseded
+         * read); turn(), a Promise to wait for once the body is read, before it is unpacked (the
+         * page's one-at-a-time) */
+        return { header: h, at: at, body: function (cancelled, turn) {
+          return src.read(at, size).then(function (b) {
+            return (turn ? turn() : Promise.resolve()).then(function () { return unpack(h, b, cancelled); });
+          });
+        } };
       });
     });
   }
   /* a body into the image's stored bytes, checked: {data, bytes} */
-  function unpack(h, body) {
+  function unpack(h, body, cancelled) {
     var im = h.image, filled;
     if (body.length !== im.bodyBytes) return Promise.reject(new Error("That world file is cut short: its body is " + body.length + " of " + im.bodyBytes + " bytes."));
+    if (cancelled && cancelled()) return Promise.reject(new Error(CANCELLED));
     if (im.body === "raw") filled = Promise.resolve(body);   /* the stored bytes themselves */
     else if (typeof root.DecompressionStream !== "function")
       return Promise.reject(new Error("This browser can't decompress a world file (it has no DecompressionStream: Chrome 80+, Firefox 113+, Safari 16.4+)."));
@@ -595,11 +618,12 @@
       filled = through(new root.DecompressionStream("gzip"), body, function (c) {
         if (at + c.length > im.stored) { over = true; throw new Error("longer"); }
         data.set(c, at); at += c.length;
-      }).then(function () {
+      }, cancelled).then(function () {
         if (at !== im.stored) throw new Error("That world file is cut short: its world unpacks to " + at + " of " + im.stored + " bytes.");
         return data;
       }, function (e) {
         if (over) throw new Error("That world file is damaged: its world is longer than its header says.");
+        if (e && e.message === CANCELLED) throw e;
         throw new Error("That world file is damaged or cut short: its compressed world does not unpack (" + (e && e.message || e) + ").");
       });
     }
@@ -780,7 +804,7 @@
               canGzip: canGzip, encodeWorld: encodeWorld, worldHeader: worldHeader, decodeWorld: decodeWorld, wholeImage: wholeImage,
               worldLimits: worldLimits, wasmMemoryMax: wasmMemoryMax, maxBody: maxBody, canon: canon, headerDigest: headerDigest, sealHeader: sealHeader,
               readWorld: readWorld, blobSource: blobSource, bytesSource: bytesSource, headerProblem: headerProblem,
-              worldNow: worldNow, worldExpect: worldExpect, worldMismatch: worldMismatch, probeWorld: probeWorld };
+              worldNow: worldNow, worldExpect: worldExpect, worldMismatch: worldMismatch, probeWorld: probeWorld, CANCELLED: CANCELLED };
   root.EvoOceanHandoff = api;
   if (typeof module === "object" && module && module.exports) module.exports = api;   /* node: the tests */
 })(typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : globalThis);
