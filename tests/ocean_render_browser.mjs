@@ -5,6 +5,7 @@
 //        [--dur 15000] [--warm 10000] [--rounds 2] [--headed]
 //        [--cameras whole,dense,follow] [--colours appearance,family,brain]   (perf; default whole, appearance)
 //        [--modes off,frame,spans,spansGpu] [--viewport 1920x1080[@1]]       (perf; the default: all four, 1920 x 1080 at DPR 1)
+//        (--modes spansGpuPlain,spansGpu: the swim polish off / on, A/B in one page: its own cost)
 //   --counts takes "big" too: the Big tank (EvoOceanConfig.BIG_TANK: its size, population and set-up)
 //   env: PLAYWRIGHT  the playwright module (default C:/Users/harit/gemini_bridge/node_modules/playwright)
 //        BRAVE_EXE   the browser (default C:/Program Files/BraveSoftware/Brave-Browser/Application/brave.exe)
@@ -549,11 +550,17 @@ const MODES = {
   off: { cpu: false, gpu: "off" },
   frame: { cpu: "frame", gpu: "off" },
   spans: { cpu: true, gpu: "off" },
-  spansGpu: { cpu: true, gpu: "frame", sampleEvery: 6 }
+  spansGpu: { cpu: true, gpu: "frame", sampleEvery: 6 },
+  /* spansGpu with the swim polish off (scene.setPolish(false)): with spansGpu in
+   * the same --modes, the polish's own cost, A/B in one page (one GPU, one heat) */
+  spansGpuPlain: { cpu: true, gpu: "frame", sampleEvery: 6, polish: false }
 };
 async function capture(page, mode, ms) {
   const m = MODES[mode];
   return page.evaluate(async ([m, ms, off]) => {
+    /* the swim polish as the mode asks (on unless it says off), where the scene has it */
+    if (EvoOcean.scene.setPolish) { EvoOcean.scene.setPolish(m.polish !== false); await EvoOcean.bench.frames(3); }
+    else if (m.polish === false) throw new Error("this page has no swim polish to turn off");
     /* rAF timestamps in every mode (a common, tiny cost); "off" leaves the profiler off */
     const rp = EvoOcean.bench.rafProbe(ms);
     const cap = off ? null : EvoOcean.bench.capture(Object.assign({ durationMs: ms }, m));
@@ -583,7 +590,7 @@ async function partPerf() {
         const order = round % 2 ? PERF_MODES.slice().reverse() : PERF_MODES;
         for (const mode of order) {
           const r = await capture(L.page, mode, DUR);
-          if (r.cap) { save(`frames_${key}_${mode}_${round}.csv`, r.cap.framesCsv); if (mode === "spansGpu") save(`gpu_${key}_${mode}_${round}.csv`, r.cap.gpuCsv); }
+          if (r.cap) { save(`frames_${key}_${mode}_${round}.csv`, r.cap.framesCsv); if (MODES[mode].gpu === "frame") save(`gpu_${key}_${mode}_${round}.csv`, r.cap.gpuCsv); }
           rows[mode].push({ raf: r.raf, summary: r.cap ? r.cap.summary : null });
           console.log(`  ${key} ${mode.padEnd(8)} r${round}: rAF fps ${r.raf.rafFps.toFixed(1)} p95 ${r.raf.raf.p95.toFixed(2)} ms` +
                       (r.cap ? `, frameCpu p50 ${r.cap.summary.spans.frameCpu.p50.toFixed(3)} p95 ${r.cap.summary.spans.frameCpu.p95.toFixed(3)} ms, fps ${r.cap.summary.fps.toFixed(1)}` : "") +
