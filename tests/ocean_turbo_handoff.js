@@ -3419,11 +3419,12 @@ function reheader(bytes, fn) {
     len.writeUInt32LE(hb.length, 0);
     return new Uint8Array(Buffer.concat([Buffer.from(HO.WORLD.MAGIC, 'latin1'), len, hb, Buffer.from(bytes.subarray(r.at))]));
 }
-/* a fresh module (a small memory, its own world) with the image of a world file in it */
+/* a fresh module (a small memory, its own world) with the image of a world file in it; grow: MiB more
+ * memory first, filled with junk past the image (as a module that ran a bigger world has it) */
 async function opened(bytes, grow) {
     const M = await mk(1, {}, 300, 300, 0);
-    if (grow) for (let i = 0; i < grow; i++) growMiB(M);
     const w = await HO.decodeWorld(bytes);
+    if (grow) { for (let i = 0; i < grow; i++) growMiB(M); new Uint8Array(HO.buffer(M)).fill(0xab, w.image.byteLength); }
     HO.take(M, w.image, 'the test');
     return { M, image: w.image, header: w.header };
 }
@@ -3469,7 +3470,7 @@ async function worldCodec() {
             A._oc_step(1); B.M._oc_step(1); C.M._oc_step(1);
         }
         ok(!diff && grownC && tail < 0 && frame(B.M) === f0 + 60,
-           'saved at frame ' + f0 + ' (a live minSpeed 40 in it), opened in a fresh module and in a ' + memMB(C.M) + ' MB one (past the image all zero): ' +
+           'saved at frame ' + f0 + ' (a live minSpeed 40 in it), opened in a fresh module and in a ' + memMB(C.M) + ' MB one (its junk past the image zeroed): ' +
            '60 steps bit-identical to the world never saved' + (diff ? ': ' + diff : ''));
     }
     {   /* memory growth: a world whose memory grew, opened in a fresh (16 MB) module, which grows to it */
@@ -3683,6 +3684,7 @@ async function pageWorldTurbo() {
         const s = await savedWorld(p), im = HO.worldHeader(s.bytes).header.image;
         const small = await bootPage(PAGE_Q7), big = await bootPage(PAGE_Q7);
         for (let i = 0; i < 40; i++) growMiB(big.M);
+        new Uint8Array(HO.buffer(big.M)).fill(0xab, im.bytes);   /* junk past the image, as a page that ran a bigger world has */
         big.raf(performance.now());
         await openWorld(small, s.bytes); await openWorld(big, s.bytes);
         const tail = zeroFrom(big.M, im.bytes);
@@ -3695,7 +3697,7 @@ async function pageWorldTurbo() {
         const c = { grewSaver: im.bytes > FRESH_MEM, smallToImage: HO.buffer(small.M).byteLength === im.bytes, bigBigger: HO.buffer(big.M).byteLength > im.bytes,
                     zeroTail: tail < 0, same: !diff };
         ok(all(c), 'saved after a Turbo round trip, its memory grown to ' + (im.bytes / MB) + ' MB: opened on a fresh page (grown to it, ' + memMB(small.M) + ' MB) and a ' +
-           memMB(big.M) + ' MB one (past the image zero): 40 steps bit-identical to the saver' + (diff ? ': ' + diff : '') + nots(c));
+           memMB(big.M) + ' MB one (its junk past the image zeroed): 40 steps bit-identical to the saver' + (diff ? ': ' + diff : '') + nots(c));
     }
     {   /* the Big tank, through the page */
         const b = await bootPage(PAGE_Q);

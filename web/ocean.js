@@ -1399,7 +1399,7 @@
     if (turboState === "turbo") {   /* the worker's copy, between two of its chunks: Turbo runs on */
       worldSave = { id: ++worldSaveSeq, waiting: true };
       turboWorker.postMessage({ cmd: "snapshot", id: worldSave.id });
-      showNote("Saving the world from Turbo (it keeps running)…");
+      errEl.textContent = "Saving the world from Turbo (it keeps running)…"; errEl.className = "";   /* (no toast: the saved one follows) */
       return;
     }
     var s = fresh(lastS);   /* this frame's numbers: no step since its sync, so the image's */
@@ -1470,7 +1470,7 @@
     try { r = HO.worldHeader(bytes); } catch (e) { showError(String(e.message || e)); return Promise.resolve(); }
     var h = r.header, bad = worldProblem(h);
     if (bad) { showError("That world file is damaged: " + bad + "."); return Promise.resolve(); }
-    showNote("Reading " + (name || "the saved world") + "…");
+    errEl.textContent = "Reading " + (name || "the saved world") + "…"; errEl.className = "";   /* (no toast: the answer follows at once) */
     return engineId().then(function (id) {
       if (stale()) { worldOvertaken(); return null; }
       var theirs = h.engine && h.engine.wasmSha256;
