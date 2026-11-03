@@ -777,7 +777,6 @@
   /* push one live knob into the running world (or the Turbo worker's) */
   function applyLive(key) {
     if (!M || draft) return;   /* a staged scenario's or file's settings are the next world's, live ones too */
-    if (engineState !== "ok") { refuse(key, engineBusyWhy()); return; }   /* restarting or stopped: nothing reaches it */
     delete nextOnly[key];
     var num = numOf(key, getVal(key));
     if (wholeKey(key) && !Number.isInteger(num)) { refuse(key, "it must be a whole number"); return; }   /* 300.5: never run as 301 */
@@ -2064,7 +2063,7 @@
     selectedId = id;
     if (id !== null) { everSelected = true; hideCoach(); }   /* its card opens where the coach mark sits */
     if (id !== null && id !== was && !handover) { cardNewer = true; cardHeld = false; }   /* its card, over the live numbers (updateCard) */
-    if ((was === null) !== (id === null) && M && engineState === "ok" && has("oc_set_capture")) M._oc_set_capture(id !== null ? 1 : 0);
+    if ((was === null) !== (id === null) && M && has("oc_set_capture")) M._oc_set_capture(id !== null ? 1 : 0);
     dirtyHud = true;
   }
   /* F: follow the selected fish; again (or with none): a random one */

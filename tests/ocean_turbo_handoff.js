@@ -3626,7 +3626,7 @@ async function openWorld(p, bytes, name) {
      * The page's own record that this read answered, when it has one (review of #44, round 2, finding 6: a
      * status can change twice between two polls, a rebuild's "The engine restarted" matching none of these) */
     await until(() => p.T.answered(id) !== null ? p.T.answered(id) : p.T.worldEpoch !== e0 || p.T.asking || /That|Couldn't|not opened/.test(p.msg()),
-                'the world file\'s answer', 120000);
+                'the world file\'s answer', 120000).catch((e) => { throw new Error(e.message + ' (the page says "' + p.msg() + '"; test runs ' + p.probes.length + ')'); });
     return p.msg();
 }
 /* the page's frame, its world stepped n (paused: the frame loop syncs, steps nothing) */
@@ -4419,10 +4419,11 @@ async function review2Budget() {
         p.hooks.onProbe = (sh) => { runs.push(sh); if (runs.length === 1) sh.pause(); else aliveAtSecond = runs[0].terminated === 0; };
         p.loadFile(new File([s.bytes], 'first.oceanworld'));
         await until(() => runs.length === 1 && runs[0].queue.length, 'the first test run, held');
-        const said = await openWorld(p, s.bytes, 'second.oceanworld');
+        const t0 = Date.now(), said = await openWorld(p, s.bytes, 'second.oceanworld'), took = Date.now() - t0;
         p.hooks.timer = null; p.hooks.onProbe = null;
-        ok(runs.length === 2 && aliveAtSecond === false && runs[0].terminated === 1 && /^Opened the saved world second\.oceanworld/.test(said) && !/first/.test(toastText(p)),
-           'a newer file while a test run is held: that run terminated before the newer one\'s starts (one at a time), the newer opened ("' + said.slice(0, 50) + '…")');
+        ok(runs.length === 2 && aliveAtSecond === false && runs[0].terminated === 1 && took < 10000 && /^Opened the saved world second\.oceanworld/.test(said) && !/first/.test(toastText(p)),
+           'a newer file while a test run is held: that run terminated (at the page\'s next look, not by the 20 s watchdog: ' + took + ' ms) before the newer one\'s starts ' +
+           '(one at a time), the newer opened ("' + said.slice(0, 50) + '…")');
     }
     {   /* the unpacking itself, superseded: cancelled at its next chunk, its stream cancelled */
         const proto = globalThis.ReadableStreamDefaultReader.prototype, cancel = proto.cancel;
@@ -4439,10 +4440,17 @@ async function review2Budget() {
         p.edit('minSpeed', 35);
         await openWorld(p, s.bytes, 'one.oceanworld');
         const first = p.T.asking && p.T.asking.plan;
-        await openWorld(p, s.bytes, 'two.oceanworld');
+        let release;
+        const gate = new Promise((r) => { release = r; }), g = gated(new File([s.bytes], 'two.oceanworld'), gate);
+        const id = p.T.fileReq + 1;
+        p.loadFile(g);
+        await until(() => g.reads.length >= 2, 'the newer file being read (its magic, then its header)');
+        const goneWhileRead = p.T.asking === null;
+        release();
+        await until(() => p.T.answered(id), 'its answer');
         const second = p.T.asking && p.T.asking.plan;
-        ok(first && second && first !== second && /two\.oceanworld/.test(p.el('startaskmsg').textContent),
-           'a question about one saved world, then another world file: the newer file\'s question replaces it');
+        ok(first && goneWhileRead && second && first !== second && /two\.oceanworld/.test(p.el('startaskmsg').textContent),
+           'a question about one saved world, then another world file: the question (and the image it held) goes as soon as the newer file is picked, before it is read; its own question follows');
     }
     void at;
 }
@@ -4501,6 +4509,37 @@ async function review2LateFailure() {
         ok(all(k), 'Stop Turbo & open, a late failure: the run Turbo handed back carries on with its charts (' + rows.length + ' samples, to frame ' + rows[rows.length - 1] + '), ' +
            'Turbo\'s history, the draft\'s generation, the epoch, and its followed fish (#' + id + ') picked up again, as after any Stop (#' + st.selectedId + ')' + nots(k));
     }
+    {   /* a real trap after Stop Turbo & open (the test run's answer forged): a new module, the run Turbo handed back in it, its fish picked up again */
+        const { h } = await aSavedWorld();
+        /* junk in its first MiB only (the static data, where the world's pointer lives: a trap), zeros after; a small stored part
+         * (in node a running Turbo worker shares the event loop: a big one unpacks slowly) */
+        const junk = await craftedFile(h, new Uint8Array(h.image.bytes).fill(0xab, 0, MB).buffer);
+        const p = await bootPage(PAGE_Q);
+        p.ctx.EvoOcean.select(1);
+        const id = p.T.selectedId;
+        p.click('turbobtn');
+        await until(() => p.T.turboState === 'turbo', 'Turbo');
+        const sh = p.worker();
+        await until(() => p.T.turboStats && p.T.turboStats.frame > 200, 'Turbo to run');
+        p.hooks.onProbe = (x) => { x.rewrite = (m) => m.type === 'probe' ? Object.assign({}, m, { ok: true, why: '', trap: false }) : m; };
+        await openWorld(p, junk, 'junk.oceanworld');
+        p.hooks.onProbe = null;
+        sh.pause();
+        p.click('startconfirm');
+        await until(() => sh.queued(isType('memory')), 'the hand-back');
+        const handed = sh.queue.find(isType('memory')), img = handed.mem.slice(0);
+        sh.resume();
+        await until(() => p.T.turboState === 'live' && !p.T.pendingStart && p.T.engineState === 'ok' && p.T.rebuilds === 1, 'the rebuild');
+        const st = p.ctx.EvoOcean.state(), ref = await mk(1, {}, 300, 300, 0);
+        HO.take(ref, img, 'the control');
+        ref._oc_set_capture(0);
+        const fishBack = st.selectedId !== null || /did not survive Turbo/.test(toastText(p));
+        if (st.selectedId !== null) ref._oc_set_capture(1);
+        const diff = sameFor(p.T.M, ref, 20);
+        const k = { rebuilt: p.T.M !== p.M, used: p.T.usedTurbo === true, fish: fishBack, same: !diff, uncaught: p.uncaught.length === 0 };
+        ok(all(k), 'Stop Turbo & open with a real trap once the image is in: a new module, the run Turbo handed back put into it (20 steps bit-identical to that hand-back), ' +
+           'Turbo\'s history kept, its picked fish (#' + id + ') picked up again (#' + st.selectedId + ')' + (diff ? ': ' + diff : '') + nots(k) + (p.uncaught.length ? ' ' + p.uncaught[0] : ''));
+    }
     {   /* a throw while the image is copied in (after writing): the run back too */
         const q = await bootPage(PAGE_Q7);
         runPage(q, 40);
@@ -4513,7 +4552,7 @@ async function review2LateFailure() {
 
 async function review2Fence() {
     section('Second review of #44, finding 3: a trap anywhere the page reads the engine (the sync, a fish card, the readout, the charts\' wiring) stops it once; nothing reaches it after');
-    const EXPORTS = ['_oc_step', '_oc_sync', '_oc_inspect', '_oc_summary', '_oc_wiring', '_oc_set_param', '_oc_set_capture', '_oc_set_colour_mode', '_oc_families'];
+    const EXPORTS = ['_oc_step', '_oc_sync', '_oc_inspect', '_oc_summary', '_oc_wiring', '_oc_set_param', '_oc_set_capture', '_oc_set_colour_mode', '_oc_families', '_oc_creature_count'];
     /* a page whose `name` traps from now on; calls: every listed export's calls counted */
     async function trapping(name, setup) {
         const p = await bootPage(PAGE_Q7);
@@ -4526,9 +4565,15 @@ async function review2Fence() {
         }
         return { p, calls };
     }
-    /* what a visitor does after: frames, a fish picked, a live setting, a colour, follow, Turbo, Save world, R, the charts' wiring */
+    /* what a visitor does after: frames, the console's state (the memory grown), a tap on the tank, a fish picked, a live setting,
+     * a colour, follow, Turbo, Save world, R, the charts' wiring */
     async function afterwards(p) {
         for (let i = 0; i < 3; i++) p.raf(performance.now() + 1000 * i);
+        growMiB(p.M);   /* (the views out of date: a fresh() would cut new ones, from the engine) */
+        p.ctx.EvoOcean.state();
+        const tap = (type) => { const e = new p.Ev(type, { bubbles: true }); Object.assign(e, { isPrimary: true, button: 0, clientX: 600, clientY: 400, pointerId: 7, pointerType: 'mouse' });
+                                p.el('tank').dispatchEvent(e); };
+        tap('pointerdown'); tap('pointerup');   /* a tap on empty water: it would let the picked fish go */
         p.ctx.EvoOcean.select(0);
         p.edit('minSpeed', 33);
         p.ctx.EvoOcean.set('minSpeed', 34);
