@@ -541,6 +541,20 @@ rnd = random.Random(16)
 rej = sum(infer.signflip([w.draw(rnd)]) <= 0.05 for _ in range(200)) / 200
 assert rej > 0.5, rej
 PY
+# the stats spec's omnibus design (2 independent groups x 2 assays), both tests and sign-flip only
+$PY "$T/calibrate.py" --blocks an3/blocks.json --key off/0.1/0.25 --out cal3o --sims 0 --omnibus 4:3:2:2 \
+    --omnibus-sims 4 --omnibus-B 19 --chunk 2 --workers 1 > cal3o.log 2>&1 || fail "calibrate.py --omnibus: $(tail -5 cal3o.log)"
+$PY "$T/calibrate.py" --blocks an3/blocks.json --key off/0.1/0.25 --out cal3f --sims 0 --omnibus 4:3:2:2 \
+    --omnibus-sims 4 --chunk 2 --omnibus-plants none --omnibus-tests flip --workers 1 > cal3f.log 2>&1 \
+    || fail "calibrate.py --omnibus-tests flip: $(tail -5 cal3f.log)"
+$PY - <<'PY' || fail "omnibus design rows"
+import csv
+o = list(csv.DictReader(open("cal3o/calib.csv")))
+f = list(csv.DictReader(open("cal3f/calib.csv")))
+assert {r["test"] for r in o} == {"omnibus boot residual", "omnibus sign-flip"} and any(r["effect"] != "null" for r in o)
+assert {r["test"] for r in f} == {"omnibus sign-flip"} and {r["effect"] for r in f} == {"null"}
+assert all((r["G"], r["C"]) == ("2", "2") for r in o + f)
+PY
 
 # 17. bounded-scale sensitivity: a transitive logistic ladder (no ordinal cycle) has raw-scale curl;
 #     the logistic node-additive model removes it, while a sign-reversing cycle on top survives

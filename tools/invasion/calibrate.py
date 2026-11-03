@@ -7,6 +7,7 @@ infer.py's (and bounded.py's) tests, by simulation.
                  [--worlds iso,hetero,pilotcov,empirical,skew,concentrated,skewfactor,mixture,rare1,bounded]
                  [--design 20:10,28:10] [--design-sims 500] [--design-B 499]
                  [--omnibus 12:10:2:2] [--omnibus-sims 2000] [--omnibus-B 999] [--omnibus-plants all|none]
+                 [--omnibus-tests both|flip] [--omnibus-worlds hetero-design,skew-design]
                  [--assay-corr R] [--bounded-null logistic] [--bnull-sims 300] [--bnull-B 199]
                  [--workers 4] [--seed 1]
 
@@ -371,19 +372,23 @@ def task_omnibus(args):
     B, kind = G["omnibus_B"], G["kinds"][0]
     plants = G["omni_plants"][(N, Gn, C)]
     c = Counter()
+    boot = G.get("omni_tests", "both") == "both"
     for _ in range(n):
         groups = omni_draw(worlds, rnd, G["rho"])
-        FC = boot_null(groups, B, rnd.randrange(1 << 30), kind)[0]
+        bs = rnd.randrange(1 << 30)   # (drawn either way: the datasets do not depend on --omnibus-tests)
+        FC = boot_null(groups, B, bs, kind)[0] if boot else None
 
         def stat(gs):
             st = [infer.block_stats(z) for zs in gs for z in zs]
             return infer._ratio(sum(s["TC"] for s in st), sum(s["tauC"] for s in st))
-        c.hit(f"omnibus boot {kind}", "null", p_from(FC, stat(groups)))
+        if boot:
+            c.hit(f"omnibus boot {kind}", "null", p_from(FC, stat(groups)))
         c.hit("omnibus sign-flip", "null", infer.signflip_groups(groups, "curl"))
         for label, spec in plants:
             gp = [[(infer.plant(z, *spec[(g, ci)]) if (g, ci) in spec else z) for ci, z in enumerate(zs)]
                   for g, zs in enumerate(groups)]
-            c.hit(f"omnibus boot {kind}", label, p_from(FC, stat(gp)))
+            if boot:
+                c.hit(f"omnibus boot {kind}", label, p_from(FC, stat(gp)))
             c.hit("omnibus sign-flip", label, infer.signflip_groups(gp, "curl"))
     return (key, "omnibus", wname, N, k, Gn, C), c.cnt, n
 
@@ -541,6 +546,8 @@ def main(argv=None):
     ap.add_argument("--omnibus-B", type=int, default=999)
     ap.add_argument("--omnibus-worlds", default="hetero-design,skew-design")
     ap.add_argument("--omnibus-plants", default="all", choices=["all", "none"])
+    ap.add_argument("--omnibus-tests", default="both", choices=["both", "flip"],
+                    help="'flip': the sign-flip only, no bootstrap (cheap: large null counts for that test)")
     ap.add_argument("--assay-corr", type=float, default=None)
     ap.add_argument("--bounded-null", default="", help="bounded models for the bounded-null check, e.g. logistic")
     ap.add_argument("--bnull-sims", type=int, default=300)
@@ -622,7 +629,8 @@ def main(argv=None):
             tasks.append(("bdesign", (a.key[0], model, N, k, min(10, a.bdesign_sims - c0), sd)))
     cfg = {"blocks": {k_: {"z": blocks[k_]["z"], "zq": blocks[k_].get("zq")} for k_ in a.key}, "kinds": kinds,
            "B": a.B, "design_B": a.design_B, "omnibus_B": a.omnibus_B, "bnull_B": a.bnull_B, "plants": plants,
-           "omni_plants": oplants, "seed": a.seed, "pilot_k": a.pilot_k, "rho": rho, "bdesign_B": a.bdesign_B}
+           "omni_plants": oplants, "seed": a.seed, "pilot_k": a.pilot_k, "rho": rho, "bdesign_B": a.bdesign_B,
+           "omni_tests": a.omnibus_tests}
     acc = {}
     with multiprocessing.Pool(a.workers, initializer=_init, initargs=(cfg,)) as pool:
         it = pool.imap_unordered(_dispatch, [(fn_name, args) for fn_name, args in tasks])
