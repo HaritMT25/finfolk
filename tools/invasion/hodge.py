@@ -341,6 +341,53 @@ def f_sf(f, d1, d2):
     return betainc(d2 / 2.0, d1 / 2.0, d2 / (d2 + d1 * f))
 
 
+def t_cdf(t, df):
+    """Student-t CDF with df degrees of freedom."""
+    if df <= 0:
+        raise ValueError(df)
+    tail = 0.5 * betainc(df / 2.0, 0.5, df / (df + t * t))
+    return 1.0 - tail if t >= 0 else tail
+
+
+def t_quantile(p, df):
+    """Student-t quantile (bisection on t_cdf); t_quantile(0.975, 5) = 2.5706, (0.975, 9) = 2.2622."""
+    if not 0.0 < p < 1.0:
+        raise ValueError(p)
+    if p < 0.5:
+        return -t_quantile(1.0 - p, df)
+    lo, hi = 0.0, 1.0
+    while t_cdf(hi, df) < p:
+        hi *= 2.0
+    for _ in range(200):
+        mid = 0.5 * (lo + hi)
+        if t_cdf(mid, df) < p:
+            lo = mid
+        else:
+            hi = mid
+    return 0.5 * (lo + hi)
+
+
+def beta_quantile(p, a, b):
+    """Quantile of Beta(a, b) by bisection on betainc (for Clopper-Pearson bounds)."""
+    lo, hi = 0.0, 1.0
+    for _ in range(200):
+        mid = 0.5 * (lo + hi)
+        if betainc(a, b, mid) < p:
+            lo = mid
+        else:
+            hi = mid
+    return 0.5 * (lo + hi)
+
+
+def clopper_pearson(x, n, conf=0.95):
+    """Exact two-sided binomial confidence interval for x successes in n trials -> (lo, hi).
+    Its lower end is the stats spec's 'binomial 95% lower confidence bound on power'."""
+    al = 1.0 - conf
+    lo = 0.0 if x == 0 else beta_quantile(al / 2, x, n - x + 1)
+    hi = 1.0 if x == n else beta_quantile(1 - al / 2, x + 1, n - x)
+    return lo, hi
+
+
 def circular_triads(A, Z=None, zmin=None):
     """Directed 3-cycles of the tournament sign(A) (Kendall & Babington Smith): returns
     (cyclic triads, all triads, expected under random orientation = all/4). With Z (|z| per pair) and
@@ -500,6 +547,13 @@ def selftest():
     # F survival: F(1, d2) = t^2 (P(|t_5| > 2.5706) = 0.05); F(2, d2) has a closed form
     assert abs(f_sf(2.5705818366147395 ** 2, 1, 5) - 0.05) < 1e-9
     assert abs(f_sf(3.0, 2, 10) - (1 + 2 * 3.0 / 10) ** -5) < 1e-12
+    # Student-t quantiles (NIST table: t_.975 = 2.571 at 5 df, 2.262 at 9) and Clopper-Pearson
+    assert abs(t_quantile(0.975, 5) - 2.5705818366147395) < 1e-9 and abs(t_quantile(0.975, 9) - 2.2621571627409915) < 1e-9
+    assert abs(t_quantile(0.025, 9) + 2.2621571627409915) < 1e-9 and abs(t_quantile(0.975, 1e6) - 1.959964) < 1e-5
+    lo, hi = clopper_pearson(0, 10)
+    assert lo == 0.0 and abs(hi - (1 - 0.025 ** 0.1)) < 1e-9
+    lo, hi = clopper_pearson(10, 10)
+    assert abs(lo - 0.025 ** 0.1) < 1e-9 and hi == 1.0
     # local / harmonic: a complete graph has no harmonic part; a 4-cycle (no triangle) is all harmonic;
     # a triangle with a pendant edge is all local; energies add up
     C7 = _random_curl(7, rnd)
