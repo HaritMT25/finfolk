@@ -363,12 +363,17 @@ def signflip_groups(groups, which="curl", mc=1 << 16, seed=3):
     or two groups (k <= 16 each), Monte Carlo over the per-group pattern lists otherwise.
     Exact under H0 only if every group's replicate residual vectors are independent and
     centrally symmetric. Resolution prod_g 1/2^(k_g - 1)."""
+    return flip_p_vectors([replicate_vectors(zs, which) for zs in groups], mc, seed)
+
+
+def flip_p_vectors(group_vecs, mc=1 << 16, seed=3):
+    """The grouped sign-flip p from per-group replicate vectors (group_vecs[g][r] = replicate r's
+    vector of group g, already concatenated over the group's aligned conditions)."""
     import bisect
     per = []
-    for zs in groups:
-        vecs = replicate_vectors(zs, which)
+    for vecs in group_vecs:
         if len(vecs) > 16:
-            raise ValueError("signflip_groups: k > 16 per group")
+            raise ValueError("signflip: k > 16 per group (enumeration); use fewer replicates")
         per.append(_flip_all(vecs))
     tobs = sum(t for _, t in per)
     tol = 1e-12 * max(1.0, abs(tobs))

@@ -137,13 +137,16 @@ class Model:
             x = min(max(eta, -40.0), 40.0)
             if nm == "aoceil":
                 e = math.exp(x)
-                base = 1.0 + lam * e
-                if lam > 1e-8:
-                    rr = math.log1p(lam * e) / lam                  # w = exp(-rr)
-                    drr = (e / base - rr) / lam                     # d rr / d lam
-                else:                                               # series at lam -> 0
-                    rr = e - 0.5 * lam * e * e
-                    drr = -0.5 * e * e + (2.0 / 3.0) * lam * e ** 3
+                t = lam * e
+                base = 1.0 + t
+                # rr = log(1 + lam e) / lam (w = exp(-rr)); the series in t = lam e is used only where
+                # t is small (review round 3: a series in lam alone diverges for lam e >= 1)
+                if t < 1e-4:
+                    rr = e * (1.0 - t / 2.0 + t * t / 3.0)
+                    drr = e * e * (-0.5 + 2.0 * t / 3.0 - 0.75 * t * t)   # d rr / d lam
+                else:
+                    rr = math.log1p(t) / lam
+                    drr = (e / base - rr) / lam
                 w = math.exp(-rr)
                 g = U * (1.0 - w)
                 d = U * e * w / base
@@ -346,7 +349,129 @@ def model_test(zq, model_name, B=1999, seed=1, kind=infer.DEFAULT_KIND, TA_pair=
             "dC_res": math.sqrt(max(0.0, RC_nc) / P),
             "T_S": st["TS"], "tau_S": st["tauS"], "R_S": RS, "F_res_S": F_res_S,
             "p_res_S": (1 + sum(1 for x in FS if x >= F_res_S)) / (B + 1), "R_S_null": nullS,
-            "R_S_nc": RS - nullS}
+            "R_S_nc": RS - nullS,
+            "p_res_flip": infer.flip_p_vectors([residual_replicate_vectors(zq, model_name, f)[0]])}
+
+
+# ------------------------------------------------------- the frozen co-primary (hypothesis 1b)
+# Review round 3: the logistic residual test as a co-primary needs ONE joint statistic over the
+# four primary matrices (two home regimes x two assays), four separate mean fits, paired resampling
+# (the assays of one regime share their units; regimes are independent) and a fixed multiplicity
+# family. Frozen here:
+#   H1b  "the four primary matrices are bounded logistic ladders": for every condition c, fit
+#        sigma(mu_c + a_ci + b_cj) to that matrix's endpoint means; project each replicate r's cell
+#        residuals d_cr = y_cr - fit_c off the model's tangent space at the fit (P_perp = I -
+#        J (J'J)^-1 J'), take their curl, v_cr = Q A(P_perp d_cr), and sign-flip whole replicates
+#        jointly over a regime's assays and independently across regimes:
+#        T = sum_g ||sum_r delta_r (v_gr concatenated over the group's conditions)||^2.
+#        At the least-squares fit P_perp leaves the residual of the means unchanged, so
+#        T(+1) = k^2 sum_c R_C,c. Under H0 the projected replicate vectors have mean ~0 (to first
+#        order in the noise); the test is exact only for independent, centrally symmetric v_cr and
+#        to first order in the fit (the fit is not redone per pattern) - its level is calibrated
+#        (calibrate.py --compound). The joint refitting bootstrap (residual_omnibus(B > 0): every
+#        draw refits all four models, paired plans) is reported beside it.
+#   Family: hypotheses 1-11 of the stats spec plus H1b = 12 tests, Holm; planning threshold
+#        ALPHA_FAMILY = 0.05 / 12.
+#   Claim rule: "a cyclic component beyond bounded (logistic) transitivity" needs BOTH H1 (raw
+#        grouped sign-flip omnibus) and H1b rejected by Holm over the 12-test family; for planning
+#        and calibration, both p <= 0.05/12 (sufficient for both under Holm, whatever the order).
+CO_PRIMARY_MODEL = "logistic"
+ALPHA_FAMILY = 0.05 / 12
+
+
+def _inverse(Mx):
+    n = len(Mx)
+    return [list(col) for col in zip(*[hodge.solve(Mx, [1.0 if a == b else 0.0 for a in range(n)]) for b in range(n)])]
+
+
+def residual_replicate_vectors(zq, model_name=CO_PRIMARY_MODEL, fitres=None):
+    """Per replicate r: Q A(P_perp (y_r - fit)), the curl of replicate r's cell residuals after
+    projecting off the fitted model's tangent space. -> (vectors, fit)."""
+    N, k = len(zq), len(zq[0])
+    m = infer.column_means(zq)
+    M = [[(m[j][i] if i != j else None) for j in range(N)] for i in range(N)]
+    f = fitres or fit(M, model_name)
+    model = Model(model_name, N)
+    cells = _cells(N)
+    g, J = model.eval(f["theta"], cells)
+    P = model.P
+    JtJ = [[sum(row[a] * row[b] for row in J) for b in range(P)] for a in range(P)]
+    for a in range(P):
+        JtJ[a][a] += 1e-12 * max(JtJ[a][a], 1e-30)
+    inv = _inverse(JtJ)
+    out = []
+    for r in range(k):
+        d = [zq[j][r][i] - gv for (i, j), gv in zip(cells, g)]
+        Jtd = [sum(row[a] * dv for row, dv in zip(J, d)) for a in range(P)]
+        co = [sum(inv[a][b] * Jtd[b] for b in range(P)) for a in range(P)]
+        mm = [[0.0] * N for _ in range(N)]
+        for (i, j), dv, row in zip(cells, d, J):
+            mm[j][i] = dv - sum(row[a] * co[a] for a in range(P))
+        out.append(infer.curl_vec(infer.antisym(mm), N)[0])
+    return out, f
+
+
+def residual_omnibus(groups, model_name=CO_PRIMARY_MODEL, B=0, seed=1, kind=infer.DEFAULT_KIND, fits=None):
+    """H1b over independent groups of aligned conditions (groups[g][c] = endpoint units zq).
+    -> dict: F_res_joint = sum R_C / sum tau_C, p_flip (the frozen decision), p_boot (joint
+    refitting bootstrap with paired plans, if B > 0), per-condition R_C / C_fit / T_C."""
+    fl = [[fit_matrix(zq, model_name) if fits is None else fits[g][c] for c, zq in enumerate(zs)]
+          for g, zs in enumerate(groups)]
+    gv = []
+    per = []
+    for g, zs in enumerate(groups):
+        vec_c = [residual_replicate_vectors(zq, model_name, fl[g][c])[0] for c, zq in enumerate(zs)]
+        k = len(vec_c[0])
+        gv.append([[x for vc in vec_c for x in vc[r]] for r in range(k)])
+        for c, zq in enumerate(zs):
+            st = infer.block_stats(zq)
+            M = _means(zq)
+            per.append({"group": g, "cond": c, "T_C": st["TC"], "tau_C": st["tauC"],
+                        "C_fit": energies(fl[g][c]["F"])[1], "R_C": energies(_sub(M, fl[g][c]["F"]))[1],
+                        "converged": fl[g][c]["converged"]})
+    F = infer._ratio(sum(x["R_C"] for x in per), sum(x["tau_C"] for x in per))
+    out = {"model": model_name, "groups": len(groups), "conditions": len(per), "F_res_joint": F,
+           "p_flip": infer.flip_p_vectors(gv), "per_condition": per, "B": B, "p_boot": None,
+           "flip_min_p": math.prod(1.0 / (1 << (len(zs[0][0]) - 1)) for zs in groups)}
+    if B > 0:
+        rnd = random.Random(seed)
+        shape = [(len(zs[0]), len(zs[0][0])) for zs in groups]
+        prep = []
+        for g, zs in enumerate(groups):
+            for c, zq in enumerate(zs):
+                res = infer.residual_units(zq)
+                N = len(zq)
+                prep.append((g, res, [[infer.unit_energies(u, N) for u in col] for col in res], fl[g][c],
+                             Model(model_name, N), _cells(N)))
+        ge = 0
+        for _ in range(B):
+            plans = [infer._draw_plan(rnd, kind, N_, k_) for N_, k_ in shape]
+            num = den = 0.0
+            for g, res, E, f, model, cells in prep:
+                sb = infer._fast_stats(res, E, plans[g], kind)
+                mb = sb["m"]
+                yb = [f["F"][i][j] + mb[j][i] for i, j in cells]
+                th, _, _ = lm(model, cells, yb, f["theta"])
+                gb, _ = model.eval(th, cells)
+                N = model.N
+                Mb = [[None] * N for _ in range(N)]
+                for (i, j), a_, b_ in zip(cells, yb, gb):
+                    Mb[i][j] = a_ - b_
+                num += energies(Mb)[1]
+                den += sb["tauC"]
+            ge += infer._ratio(num, den) >= F
+        out["p_boot"] = (1 + ge) / (B + 1)
+    return out
+
+
+def _means(zq):
+    N = len(zq)
+    m = infer.column_means(zq)
+    return [[(m[j][i] if i != j else None) for j in range(N)] for i in range(N)]
+
+
+def fit_matrix(zq, model_name=CO_PRIMARY_MODEL, th0=None):
+    return fit(_means(zq), model_name, th0)
 
 
 # ------------------------------------------------------------ self-test
@@ -403,6 +528,48 @@ def selftest():
     zc = units(Mc)
     tc = model_test(zc, "logistic", B=199, seed=2)
     assert tc["p_res"] <= 0.01 and tc["R_C_nc"] > 0, tc
+    # the frozen co-primary H1b: projected replicate vectors reproduce the residual cyclic energy
+    # (T(+1) = k^2 R_C), a pure bounded ladder is not flagged, a sign-reversing cycle is, and groups
+    # flip independently (floor 1/2^(k-1) per group)
+    N5, k5 = 5, 6
+    a5 = [rnd.gauss(0, 0.9) for _ in range(N5)]
+    b5 = [rnd.gauss(0, 0.6) for _ in range(N5)]
+
+    def units5(cyc):
+        Mx = [[sigmoid(-2.2 + a5[i] + b5[j]) if i != j else None for j in range(N5)] for i in range(N5)]
+        for (i, j) in ((0, 1), (1, 2), (2, 0)):
+            Mx[i][j] += cyc
+            Mx[j][i] -= cyc
+        return [[[Mx[i][p] + 0.004 * rnd.gauss(0, 1) if i != p else 0.0 for i in range(N5)] for _ in range(k5)]
+                for p in range(N5)]
+    zl = units5(0.0)
+    vecs, f5 = residual_replicate_vectors(zl)
+    tplus = sum(sum(v[e] for v in vecs) ** 2 for e in range(len(vecs[0])))
+    want = k5 * k5 * energies(_sub(_means(zl), f5["F"]))[1]   # (exact at the LS optimum; up to its tolerance)
+    assert abs(tplus - want) < 1e-6 * max(tplus, 1e-30), (tplus, want)
+    om = residual_omnibus([[zl, units5(0.0)], [units5(0.0)]])
+    assert om["p_flip"] > 0.01 and om["conditions"] == 3 and abs(om["flip_min_p"] - 1 / 32 ** 2) < 1e-15, om["p_flip"]
+    oc = residual_omnibus([[units5(0.08), units5(0.08)], [units5(0.08)]], B=19, seed=3)
+    assert oc["p_flip"] <= 1 / 32 ** 2 + 1e-12 and oc["p_boot"] == 1 / 20, (oc["p_flip"], oc["p_boot"])
+    # the Aranda-Ordaz link is finite and accurate at every lam >= 0, also where lam e^eta is large for
+    # tiny lam (review round 3: the old series overflowed at eta = 30, lam = 1e-10), and its Jacobian
+    # matches finite differences in the series, the exact and the cloglog regime
+    m3 = Model("aoceil", 3)
+    cells3 = _cells(3)
+    for eta, lam_ in ((30.0, 1e-10), (30.0, 0.0), (-3.0, 1e-12), (2.0, 0.7), (35.0, 1e-16), (-5.0, 4.0)):
+        th = [eta, 0.0, 0.0, 0.0, 0.0, math.sqrt(lam_), 0.3]
+        g, J = m3.eval(th, cells3)
+        assert all(0.0 <= v <= 1.0 for v in g), (eta, lam_, g)
+        exact = math.log1p(lam_ * math.exp(eta)) / lam_ if lam_ > 0 else math.exp(eta)
+        U = 1.0 / 1.09
+        assert abs(g[0] - U * (1.0 - math.exp(-exact))) < 1e-12, (eta, lam_)
+        for pk in (0, 5, 6):
+            hh = 1e-6 * max(1.0, abs(th[pk]))
+            tp, tm = list(th), list(th)
+            tp[pk] += hh
+            tm[pk] -= hh
+            num = (m3.eval(tp, cells3)[0][0] - m3.eval(tm, cells3)[0][0]) / (2 * hh)
+            assert abs(num - J[0][pk]) < 1e-5 * max(1.0, abs(num)), (eta, lam_, pk, num, J[0][pk])
     # transforms
     h, eps = transform("logit:0.001")
     assert eps == 0.001 and abs(h(0.0) - math.log(0.001 / 0.999)) < 1e-12 and h(0.5) == 0.0
