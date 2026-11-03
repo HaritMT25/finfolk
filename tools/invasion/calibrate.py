@@ -9,6 +9,8 @@ infer.py's (and bounded.py's) tests, by simulation.
                  [--omnibus 12:10:2:2] [--omnibus-sims 2000] [--omnibus-B 999] [--omnibus-plants all|none]
                  [--omnibus-tests both|flip] [--omnibus-worlds hetero-design,skew-design]
                  [--assay-corr R] [--bounded-null logistic] [--bnull-sims 300] [--bnull-B 199]
+                 [--bank BANK/blocks.json [--bank-k 10] [--bank-sims 10000] [--bank-outer M]]
+                 [--compound N:k:G [--compound-sims 2000] [--compound-variants all|null]]
                  [--workers 4] [--seed 1]
 
 Every simulated dataset goes through exactly analyze.py's procedure (infer.block_stats,
@@ -69,6 +71,20 @@ BOUNDED NULL (--bounded-null logistic): the block's endpoint means replaced by t
 bounded model (transitive, not additive), the block's own centred endpoint units as noise.
 Reports how often the raw-scale lack of fit rejects (it should: a bounded ladder has curl) and
 the null rejection rate of bounded.py's refitting residual test.
+
+ERROR BANK (--bank BLOCKS.json, an analysis of a high-replication bank: its primary_blocks):
+omnibus level / power with k units per column drawn WITH replacement from the bank's centred,
+variance-restored units (the same draw for a regime's assays, regimes independent); 'bank-gauss'
+draws Gaussian units with each column's joint cross-assay covariance; --bank-outer M resamples
+the bank itself (finite-bank uncertainty, reported separately).
+
+COMPOUND DECISION (--compound N:k:G): the frozen decision (H1, H1b, the claim = both rejected) in
+a transitive bounded world: logistic ladders sigma(mu + a_i + b_j), support-preserving
+zero-inflated Beta endpoints, cycles planted on the means (clipping counted). Without --bank the
+--key blocks are the conditions and each dataset draws N items (with replacement) from their
+fitted items and per-cell SDs from their cells; with --bank, each group / condition is the
+bank's own primary block: its own fitted ladder over its own items and its own cell SDs (key
+'bank' in calib.csv), so N:G must be the bank's.
 
 Outputs in OUTDIR: calib.csv (one row per key, scale, world, N, k, G, C, test, effect, alpha:
 rate, its Clopper-Pearson interval, n), calib.md, and manifest.json (review round 2, P3): the
@@ -532,16 +548,23 @@ def task_compound(args):
     TRANSITIVE bounded world: per group (home regime) N items drawn from the pilot's items, each
     assay's endpoint means the pilot block's fitted logistic ladder sigma(mu + a_i + b_j), cells'
     SDs drawn from that block's endpoint SDs, support-preserving zero-inflated Beta endpoints;
-    cycles planted on the MEANS (clipped to [0.002, 0.998]; clipped cells counted)."""
+    cycles planted on the MEANS (clipped to [0.002, 0.998]; clipped cells counted).
+    With an error bank (keys None): each group / condition is the bank's own primary block - its
+    fitted ladder over its own items (not resampled) and its cells' own SDs."""
     keys, N, k, Gn, n, variants, seed = args
     fits, pools = [], []
-    for key in keys:
-        zq = G["blocks"][key]["zq"]
-        fits.append(bounded.fit_matrix(zq)["params"])
-        sq = cell_sds(zq)
-        pools.append([sq[p][i] for p in range(len(zq)) for i in range(len(zq)) if i != p])
-    N0 = len(fits[0]["a"])
-    C = len(keys)
+    srcs = ([[(G["bank_zq"][g][c]) for c in range(len(G["bank_zq"][g]))] for g in range(len(G["bank_zq"]))]
+            if keys is None else [[G["blocks"][key]["zq"] for key in keys]] * Gn)
+    for g in range(Gn):
+        fg, pg = [], []
+        for zq in srcs[g]:
+            fg.append(bounded.fit_matrix(zq)["params"])
+            sq = cell_sds(zq)
+            pg.append(sq if keys is None else [sq[p][i] for p in range(len(zq)) for i in range(len(zq)) if i != p])
+        fits.append(fg)
+        pools.append(pg)
+    N0 = len(fits[0][0]["a"])
+    C = len(srcs[0])
     rnd = random.Random(seed)
     tmpl = [infer.cycle_template(N, "diffuse", seed=5 + g) for g in range(Gn)]
     P = N * (N - 1) // 2
@@ -550,16 +573,22 @@ def task_compound(args):
     if variants == "all":
         vlist += [(f"bounded ladder + d_C={d} in all conditions", d, "all") for d in (0.01, 0.02, 0.03)]
         vlist += [(f"bounded ladder + d_C={d} in one condition", d, "one") for d in (0.02, 0.03)]
+    if keys is None and N != N0:
+        raise ValueError("compound from a bank: N must be the bank's item count")
     for _ in range(n):
-        items = [[rnd.randrange(N0) for _ in range(N)] for _ in range(Gn)]
-        sds = [[[[rnd.choice(pools[ci]) if i != p else 0.0 for i in range(N)] for p in range(N)] for ci in range(C)]
-               for _ in range(Gn)]
+        if keys is None:   # the bank's own items and cells
+            items = [list(range(N)) for _ in range(Gn)]
+            sds = [[pools[g][ci] for ci in range(C)] for g in range(Gn)]
+        else:
+            items = [[rnd.randrange(N0) for _ in range(N)] for _ in range(Gn)]
+            sds = [[[[rnd.choice(pools[g][ci]) if i != p else 0.0 for i in range(N)] for p in range(N)] for ci in range(C)]
+                   for g in range(Gn)]
         for label, d, where in vlist:
             groups, clipped = [], 0
             for g in range(Gn):
                 zs = []
                 for ci in range(C):
-                    par = fits[ci]
+                    par = fits[g][ci]
                     t = items[g]
                     mean = [[bounded.sigmoid(par["mu"] + par["a"][t[i]] + par["b"][t[p]]) if i != p else 0.0
                              for i in range(N)] for p in range(N)]   # column layout [resident p][invader i]
@@ -587,7 +616,9 @@ def task_compound(args):
             c.hit("claim: H1 and H1b", label, max(p1, p1b))
             c.cover(f"feasible (no clipped mean): {label}", clipped == 0)
             c.cover(f"all four fits converged: {label}", all(x["converged"] for x in ro["per_condition"]))
-    return ("compound", "compound", "logistic ladder + zero-inflated Beta", N, k, Gn, C), c.cnt, n
+    world = ("logistic ladder + zero-inflated Beta" if keys is not None
+             else "the bank's own logistic ladders + zero-inflated Beta")
+    return ("compound" if keys is not None else "bank", "compound", world, N, k, Gn, C), c.cnt, n
 
 
 def task_bdesign(args):
@@ -739,7 +770,8 @@ def main(argv=None):
     ap.add_argument("--bank-outer", type=int, default=0, help="outer resamples of the bank (finite-bank uncertainty)")
     ap.add_argument("--bank-inner", type=int, default=500, help="datasets per outer resample")
     ap.add_argument("--compound", default="", help="N:k:G for the frozen decision (H1, H1b, claim) in a transitive "
-                    "bounded world; the --key blocks are the conditions (assays), their endpoint units the source")
+                    "bounded world; the --key blocks are the conditions (assays), their endpoint units the source; "
+                    "with --bank, the bank's own primary blocks (items, fits and cell SDs) are")
     ap.add_argument("--compound-sims", type=int, default=2000)
     ap.add_argument("--compound-variants", default="all", choices=["all", "null"])
     ap.add_argument("--workers", type=int, default=4)
@@ -840,17 +872,27 @@ def main(argv=None):
             for c0 in range(0, a.bank_inner, a.chunk):
                 sd += 1
                 tasks.append(("bank", ("bank", a.bank_k, min(a.chunk, a.bank_inner - c0), o, sd)))
+    bank_zq = None
     if a.compound:
         Nc, kc, Gc = (int(x) for x in a.compound.split(":"))
-        if any("zq" not in blocks[k_] for k_ in a.key):
-            raise SystemExit("--compound needs endpoint units (zq) for every --key block")
+        if bank is not None:   # the bank's own four primary blocks (groups x assays)
+            if any("zq" not in byk[(g_, c_)] for g_ in gnames for c_ in cnames):
+                raise SystemExit("--compound with --bank: the bank's primary blocks lack endpoint units (zq)")
+            bank_zq = [[byk[(g_, c_)]["zq"] for c_ in cnames] for g_ in gnames]
+            if Gc != len(gnames) or Nc != len(bank_zq[0][0]):
+                raise SystemExit(f"--compound with --bank: use {len(bank_zq[0][0])}:k:{len(gnames)}")
+            ckeys = None
+        else:
+            if any("zq" not in blocks[k_] for k_ in a.key):
+                raise SystemExit("--compound needs endpoint units (zq) for every --key block")
+            ckeys = list(a.key)
         for c0 in range(0, a.compound_sims, 10):
             sd += 1
-            tasks.append(("compound", (list(a.key), Nc, kc, Gc, min(10, a.compound_sims - c0), a.compound_variants, sd)))
+            tasks.append(("compound", (ckeys, Nc, kc, Gc, min(10, a.compound_sims - c0), a.compound_variants, sd)))
     cfg = {"blocks": {k_: {"z": blocks[k_]["z"], "zq": blocks[k_].get("zq")} for k_ in a.key}, "kinds": kinds,
            "B": a.B, "design_B": a.design_B, "omnibus_B": a.omnibus_B, "bnull_B": a.bnull_B, "plants": plants,
            "omni_plants": oplants, "seed": a.seed, "pilot_k": a.pilot_k, "rho": rho, "bdesign_B": a.bdesign_B,
-           "omni_tests": a.omnibus_tests, "bank": bank, "bank_plants": bank_plants}
+           "omni_tests": a.omnibus_tests, "bank": bank, "bank_plants": bank_plants, "bank_zq": bank_zq}
     acc = {}
     with multiprocessing.Pool(a.workers, initializer=_init, initargs=(cfg,)) as pool:
         it = pool.imap_unordered(_dispatch, [(fn_name, args) for fn_name, args in tasks])

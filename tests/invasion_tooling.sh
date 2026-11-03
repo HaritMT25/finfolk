@@ -51,7 +51,8 @@
 #  21. bank resampling WITH replacement (full noise energy); the bank omnibus mode;
 #  22. explicit home-regime primary blocks (two disjoint cores; a missing primary cell);
 #  23. exact fixed-step reads; formal only at registered windows;
-#  24. the co-primary decision: family threshold 0.05/12, H1 / H1b / claim calibration.
+#  24. the co-primary decision: family threshold 0.05/12, H1 / H1b / claim calibration (from the
+#      pilot blocks, and from an error bank's own primary blocks: their fits, items and cell SDs).
 set -u
 BIN=${1:?usage: invasion_tooling.sh EVO_BOIDS WORKDIR}
 W=${2:?usage: invasion_tooling.sh EVO_BOIDS WORKDIR}
@@ -796,6 +797,45 @@ assert any(abs(float(r["alpha"]) - 0.05 / 12) < 1e-12 for r in rows)
 assert {r["effect"] for r in rows if r["test"] == "claim: H1 and H1b"} >= {"bounded ladder",
         "bounded ladder + d_C=0.02 in all conditions", "bounded ladder + d_C=0.03 in one condition"}
 assert any(r["test"].startswith("feasible (no clipped mean)") for r in rows)
+PY
+# ... and from an error bank's own four primary blocks: each group / condition is the bank's own
+#     fitted ladder over its own items (not resampled) with its own cells' SDs
+$PY - <<'PY' || fail "a positive toy bank"
+import json
+b = json.load(open("bank21.json"))
+for pb in b["primary_blocks"]:
+    pb["zq"] = [[[0.0 if i == p else 0.05 + abs(x) for i, x in enumerate(u)] for u in col] for p, col in enumerate(pb["z"])]
+json.dump(b, open("bank24.json", "w"))
+PY
+$PY "$T/calibrate.py" --blocks an3/blocks.json --key off/0.1/0.25 --out cal24b --sims 0 --bank bank24.json --bank-sims 0 \
+    --compound 4:4:2 --compound-sims 2 --workers 1 > cal24b.log 2>&1 || fail "calibrate.py --compound --bank: $(tail -5 cal24b.log)"
+$PY - <<'PY' || fail "compound rows from the bank"
+import csv
+rows = [r for r in csv.DictReader(open("cal24b/calib.csv")) if r["scale"] == "compound"]
+assert {"H1 raw sign-flip omnibus", "claim: H1 and H1b"} <= {r["test"] for r in rows}, rows[:2]
+assert all(r["key"] == "bank" and r["world"].startswith("the bank's own") and (r["N"], r["G"], r["C"]) == ("4", "2", "2")
+           for r in rows), rows[:2]
+PY
+$PY "$T/calibrate.py" --blocks an3/blocks.json --key off/0.1/0.25 --out cal24c --sims 0 --bank bank24.json --bank-sims 0 \
+    --compound 5:4:2 --compound-sims 2 --workers 1 > cal24c.log 2>&1 && fail "--compound --bank accepted N != the bank's"
+grep -q "use 4:k:2" cal24c.log || fail "--compound --bank: no N:G hint ($(tail -2 cal24c.log))"
+$PY - "$T" <<'PY' || fail "the bank's compound world must use the bank's own fits, items and cell SDs"
+import json, sys
+sys.path.insert(0, sys.argv[1]); import bounded, calibrate
+pbs = {(p["group"], p["cond"]): p for p in json.load(open("bank24.json"))["primary_blocks"]}
+zq = [[pbs[(g, c)]["zq"] for c in ("off", "predA4")] for g in ("np", "p4")]
+calibrate.G.update({"bank_zq": zq})
+seen = []
+calibrate._zib = lambda rnd, mu, sd: seen.append((mu, sd)) or min(max(mu + 0.01 * rnd.random(), 0.0), 1.0)
+calibrate.task_compound((None, 4, 3, 2, 1, "null", 9))
+exp = []
+for g in range(2):
+    for c in range(2):
+        par, sds = bounded.fit_matrix(zq[g][c])["params"], calibrate.cell_sds(zq[g][c])
+        exp += [(min(max(bounded.sigmoid(par["mu"] + par["a"][i] + par["b"][p]), 0.002), 0.998), sds[p][i])
+                for p in range(4) for _r in range(3) for i in range(4) if i != p]
+assert len(seen) == len(exp) == 2 * 2 * 4 * 3 * 3, (len(seen), len(exp))
+assert all(abs(a - x) < 1e-12 and abs(b - y) < 1e-12 for (a, b), (x, y) in zip(seen, exp)), (seen[:3], exp[:3])
 PY
 
 # 19. self-tests of the inference and bounded-scale modules
