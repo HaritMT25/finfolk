@@ -708,14 +708,15 @@ for g in ("np", "p4"):
                     "reps": list(range(12)), "z": z, "zq": z, "status": "formal"})
 json.dump({"schema": "finfolk.invasion.blocks/2", "blocks": [], "primary_blocks": pbs}, open("bank21.json", "w"))
 PY
+# (a toy bank: not the registered specification, so --bank-exploratory; step 26 checks the registered path)
 $PY "$T/calibrate.py" --blocks an3/blocks.json --key off/0.1/0.25 --out cal21 --sims 0 --bank bank21.json --bank-k 6 \
-    --bank-sims 4 --bank-outer 2 --bank-inner 2 --chunk 2 --omnibus-B 19 --workers 1 > cal21.log 2>&1 \
+    --bank-sims 4 --bank-outer 2 --bank-inner 2 --chunk 2 --omnibus-B 19 --workers 1 --bank-exploratory > cal21.log 2>&1 \
     || fail "calibrate.py --bank: $(tail -5 cal21.log)"
 $PY - <<'PY' || fail "bank calibration rows"
 import csv, json
 rows = list(csv.DictReader(open("cal21/calib.csv")))
 assert {r["world"] for r in rows} == {"bank", "bank-gauss", "bank outer0", "bank outer1"}, {r["world"] for r in rows}
-assert all((r["G"], r["C"], r["k"]) == ("2", "2", "6") for r in rows)
+assert all((r["G"], r["C"], r["k"]) == ("2", "2", "6") and r["key"] == "bank (exploratory)" for r in rows)
 m = json.load(open("cal21/manifest.json"))
 assert m["bank"]["K"] == 12 and m["bank"]["groups"] == ["np", "p4"], m["bank"]
 PY
@@ -810,16 +811,17 @@ for pb in b["primary_blocks"]:
 json.dump(b, open("bank24.json", "w"))
 PY
 $PY "$T/calibrate.py" --blocks an3/blocks.json --key off/0.1/0.25 --out cal24b --sims 0 --bank bank24.json --bank-sims 0 \
-    --compound 4:4:2 --compound-sims 2 --workers 1 > cal24b.log 2>&1 || fail "calibrate.py --compound --bank: $(tail -5 cal24b.log)"
+    --compound 4:4:2 --compound-sims 2 --workers 1 --bank-exploratory > cal24b.log 2>&1 \
+    || fail "calibrate.py --compound --bank: $(tail -5 cal24b.log)"
 $PY - <<'PY' || fail "compound rows from the bank"
 import csv
 rows = [r for r in csv.DictReader(open("cal24b/calib.csv")) if r["scale"] == "compound"]
 assert {"H1 raw sign-flip omnibus", "claim: H1 and H1b"} <= {r["test"] for r in rows}, rows[:2]
-assert all(r["key"] == "bank" and r["world"].startswith("the bank's own") and (r["N"], r["G"], r["C"]) == ("4", "2", "2")
+assert all(r["key"] == "bank (exploratory)" and r["world"].startswith("the bank's own") and (r["N"], r["G"], r["C"]) == ("4", "2", "2")
            for r in rows), rows[:2]
 PY
 $PY "$T/calibrate.py" --blocks an3/blocks.json --key off/0.1/0.25 --out cal24c --sims 0 --bank bank24.json --bank-sims 0 \
-    --compound 5:4:2 --compound-sims 2 --workers 1 > cal24c.log 2>&1 && fail "--compound --bank accepted N != the bank's"
+    --compound 5:4:2 --compound-sims 2 --workers 1 --bank-exploratory > cal24c.log 2>&1 && fail "--compound --bank accepted N != the bank's"
 grep -q "use 4:k:2" cal24c.log || fail "--compound --bank: no N:G hint ($(tail -2 cal24c.log))"
 $PY - "$T" <<'PY' || fail "the bank's compound world must use the bank's own fits, items and cell SDs"
 import json, sys
@@ -834,7 +836,7 @@ exp = []
 for g in range(2):
     for c in range(2):
         par, sds = bounded.fit_matrix(zq[g][c])["params"], calibrate.cell_sds(zq[g][c])
-        exp += [(min(max(bounded.sigmoid(par["mu"] + par["a"][i] + par["b"][p]), 0.002), 0.998), sds[p][i])
+        exp += [(bounded.sigmoid(par["mu"] + par["a"][i] + par["b"][p]), sds[p][i])   # (review round 4: never clipped)
                 for p in range(4) for _r in range(3) for i in range(4) if i != p]
 assert len(seen) == len(exp) == 2 * 2 * 4 * 3 * 3, (len(seen), len(exp))
 assert all(abs(a - x) < 1e-12 and abs(b - y) < 1e-12 for (a, b), (x, y) in zip(seen, exp)), (seen[:3], exp[:3])
@@ -917,6 +919,155 @@ sys.path.insert(0, sys.argv[1]); import run
 assert run.disk_guards(["none"], "/x") == [] and run.disk_guards(["/a:5", "/b/c:7"], "/x") == [("/a", 5), ("/b/c", 7)]
 assert run.disk_guards(None, "/x") == ([("/", 10240), ("/mnt/c", 6000)] if os.path.ismount("/mnt/c") else [("/x", 1024)])
 assert run.disk_problem([("/", 0)]) is None and "below" in run.disk_problem([("/", 1 << 40)])
+PY
+
+# 26. review round 4, P2-4: an error bank is calibrated only if it is the registered bank: the frozen
+#     specification (assays, groups, items, K, formal blocks, the fixed-step horizon, aligned replicates,
+#     unique keys, shapes) and the plan it was analysed from; --bank-exploratory runs anything else,
+#     labelled exploratory
+cat > design26.json <<EOF
+{"name": "t26", "snapshots": {"np0": "$W/A.json", "np1": "$W/B.json", "np2": "$W/C.json", "np3": "$W/As.json",
+ "p40": "$W/Bs.json", "p41": "$W/Cs.json", "p42": "$W/A.json", "p43": "$W/B.json"},
+ "conditions": {"off": 0, "predA4": 4}, "fractions": [0.05], "replicates": 12, "steps": 13500, "checkpoint_every": 4500,
+ "log_every": 1000, "cores": [["np", ["np0", "np1", "np2", "np3"]], ["p4", ["p40", "p41", "p42", "p43"]]],
+ "pairs": [["np0", "p40"]], "both": true}
+EOF
+$PY "$T/plan.py" design26.json > plan26.jsonl || fail "plan.py (design26)"
+$PY - "$T" <<'PY' || fail "building the registered toy bank"
+import hashlib, json, math, random, sys
+sys.path.insert(0, sys.argv[1]); import bounded
+rnd = random.Random(26)
+sha = hashlib.sha256(open("plan26.jsonl", "rb").read()).hexdigest()
+pbs = []
+for g in ("np", "p4"):
+    names = [f"{g}{t}" for t in range(4)]
+    a = [rnd.gauss(0, 0.8) for _ in range(4)]
+    b = [rnd.gauss(0, 0.5) for _ in range(4)]
+    for c in ("off", "predA4"):
+        zq = [[[0.0 if i == p else min(1.0, max(0.0, bounded.sigmoid(-2.5 + a[i] + b[p]) + rnd.gauss(0, 0.01)))
+                for i in range(4)] for _ in range(12)] for p in range(4)]
+        z = [[[0.0 if i == p else u[i] - col[r][p] for i in range(4)] for r, u in enumerate(col)] for p, col in enumerate(zq)]
+        pbs.append({"cond": c, "frac": 0.05, "G": 13500.0, "group": g, "names": names, "reps": list(range(12)),
+                    "z": z, "zq": zq, "status": "formal"})
+good = {"schema": "finfolk.invasion.blocks/2", "plan_sha256": sha, "analysis_sha256": "x", "clock": "steps",
+        "blocks": [], "primary_blocks": pbs}
+json.dump(good, open("bank26.json", "w"))
+json.dump({"items": 4, "K": 12}, open("spec26.json", "w"))
+def variant(name, f):
+    b = json.loads(json.dumps(good)); f(b); json.dump(b, open(name, "w"))
+variant("bank26_offonly.json", lambda b: b.update(primary_blocks=[p for p in b["primary_blocks"] if p["cond"] == "off"]))
+variant("bank26_desc.json", lambda b: b["primary_blocks"][3].update(status="descriptive: 1 of 192 registered cells missing"))
+variant("bank26_misal.json", lambda b: b["primary_blocks"][1].update(reps=list(range(1, 13))))
+variant("bank26_dup.json", lambda b: b["primary_blocks"].append(dict(b["primary_blocks"][0])))
+variant("bank26_gens.json", lambda b: b.update(clock="gens"))
+variant("bank26_shape.json", lambda b: b["primary_blocks"][2]["zq"][1].pop())
+PY
+# the review's failure scenario: twelve-item blocks of both regimes but only the off assay, with the old
+# command line: accepted before, refused now (with the reason)
+$PY "$T/calibrate.py" --blocks an3/blocks.json --key off/0.1/0.25 --out cal26o --sims 0 --bank bank26_offonly.json \
+    --bank-sims 0 --compound 4:4:2 --compound-sims 2 --workers 1 > cal26o.log 2>&1
+[ $? = 2 ] && grep -q "assays \['off'\], the spec registers \['off', 'predA4'\]" cal26o.log \
+    || fail "an off-only bank was calibrated as the registered bank: $(tail -2 cal26o.log)"
+cal26() {   # out bank extra...: exit status of a registered-bank compound run
+    local out=$1 bank=$2; shift 2
+    $PY "$T/calibrate.py" --blocks an3/blocks.json --key off/0.1/0.25 --out "$out" --sims 0 --bank "$bank" \
+        --bank-plan plan26.jsonl --bank-spec spec26.json --bank-sims 0 --compound 4:4:2 --compound-sims 2 \
+        --compound-variants null --workers 1 "$@" > "$out.log" 2>&1
+}
+cal26 cal26g bank26.json || fail "the registered toy bank was refused: $(tail -4 cal26g.log)"
+for v in desc:status misal:"differ in items or replicates" dup:"duplicate (group, assay)" gens:"clock" \
+         shape:"replicates, expected 12" offonly:"no predA4 block"; do
+    nm=${v%%:*} why=${v#*:}
+    cal26 "cal26_$nm" "bank26_$nm.json"; rc=$?
+    [ $rc = 2 ] && grep -qF "$why" "cal26_$nm.log" || fail "bank variant $nm: exit $rc, expected a refusal naming '$why': $(tail -3 cal26_$nm.log)"
+done
+cp plan26.jsonl plan26_other.jsonl && echo "" >> plan26_other.jsonl   # another file: another hash
+$PY "$T/calibrate.py" --blocks an3/blocks.json --key off/0.1/0.25 --out cal26p --sims 0 --bank bank26.json \
+    --bank-plan plan26_other.jsonl --bank-spec spec26.json --bank-sims 0 --compound 4:4:2 --compound-sims 2 \
+    --compound-variants null --workers 1 > cal26p.log 2>&1
+[ $? = 2 ] && grep -q "the analysis bound plan" cal26p.log || fail "a bank checked against another plan was accepted"
+cal26 cal26x bank26_offonly.json --bank-exploratory || fail "--bank-exploratory refused: $(tail -3 cal26x.log)"
+$PY - "$T" <<'PY' || fail "registered vs exploratory bank rows / provenance"
+import csv, json, sys
+sys.path.insert(0, sys.argv[1]); import calibrate
+g = list(csv.DictReader(open("cal26g/calib.csv")))
+x = list(csv.DictReader(open("cal26x/calib.csv")))
+assert g and all(r["key"] == "bank" for r in g) and all(r["key"] == "bank (exploratory)" for r in x), (g[:1], x[:1])
+mg, mx = json.load(open("cal26g/manifest.json"))["bank"], json.load(open("cal26x/manifest.json"))["bank"]
+assert mg["problems"] == [] and mg["plan"]["sha256"] and mx["problems"] and "EXPLORATORY" in open("cal26x/calib.md").read()
+# the registered core membership: residents only (the secondary np0 <-> p40 pair adds nobody)
+cells = [json.loads(l) for l in open("plan26.jsonl")]
+assert any(c["mode"] == "invade" and {c["resident_name"], c["invader_name"]} == {"np0", "p40"} for c in cells)
+assert calibrate.plan_cores(cells) == {"np": ["np0", "np1", "np2", "np3"], "p4": ["p40", "p41", "p42", "p43"]}
+PY
+
+# 27. review round 4, P2-5: the compound world's null means are the declared logistic ladder EXACTLY (no
+#     clipping: a ladder with cells below 0.002 used to become another mean family), its endpoint law
+#     has exactly those means (and the requested SDs where feasible, capped ones flagged), and every
+#     alternative exports what it planted: clipping, d_add, the noiseless logistic-residual RMS d_res,
+#     with the feasible family solved to its d_res target
+$PY - "$T" <<'PY' || fail "exact null means / endpoint moments in the compound world"
+import json, math, random, sys
+sys.path.insert(0, sys.argv[1]); import bounded, calibrate
+# the review's example: logits (-9, -7; -7, -5) clipped at 0.002 have a logit rectangle contrast of 1.2126
+lg = lambda p: math.log(p / (1 - p))
+cl = [min(max(bounded.sigmoid(x), 0.002), 0.998) for x in (-9.0, -7.0, -7.0, -5.0)]
+assert abs((lg(cl[0]) - lg(cl[1]) - lg(cl[2]) + lg(cl[3])) - 1.2126) < 1e-3
+# a ladder far below the old clip: every endpoint draw's mean is the ladder's own mean
+rnd = random.Random(27)
+a, b = [-3.0, -1.0, 0.5, 1.5], [0.0, 1.0, -1.0, 2.0]
+pbs = {}
+for g in range(2):
+    for c in range(2):
+        pbs[(g, c)] = [[[0.0 if i == p else bounded.sigmoid(-6.0 + a[i] - b[p]) * (1 + 0.05 * rnd.gauss(0, 1))
+                         for i in range(4)] for _ in range(8)] for p in range(4)]
+zq = [[pbs[(g, c)] for c in range(2)] for g in range(2)]
+calibrate.G.update({"bank_zq": zq})
+seen = []
+calibrate._zib = lambda rnd_, mu, sd: seen.append(mu) or mu
+calibrate.task_compound((None, 4, 3, 2, 1, "null", 9))
+exp = []
+for g in range(2):
+    for c in range(2):
+        par = bounded.fit_matrix(zq[g][c])["params"]
+        exp += [bounded.sigmoid(par["mu"] + par["a"][i] + par["b"][p]) for p in range(4) for _r in range(3) for i in range(4) if i != p]
+assert min(exp) < 0.002, min(exp)                     # cells the old clip moved
+assert len(seen) == len(exp) and all(abs(x - y) <= 1e-15 * max(y, 1e-300) for x, y in zip(seen, exp)), \
+    [(x, y) for x, y in zip(seen, exp) if x != y][:3]
+PY
+$PY - "$T" <<'PY' || fail "the zero-inflated Beta's moments"
+import importlib, math, random, sys
+sys.path.insert(0, sys.argv[1]); import calibrate
+rnd = random.Random(271)
+n = 200000
+xs = [calibrate._zib(rnd, 2e-5, 2e-5) for _ in range(n)]   # a near-certain loser: the old law clipped mu to 1e-4
+m = sum(xs) / n
+assert abs(m - 2e-5) < 5 * 2e-5 / math.sqrt(n), m
+for mu, sd in ((2e-5, 2e-5), (0.01, 0.001), (0.02, 0.03), (0.3, 0.2), (0.7, 0.01), (0.5, 0.0)):
+    z = calibrate.zib_moments(mu, sd)
+    assert abs((1 - z["pz"]) * z["mb"] - mu) <= 1e-15 * mu and abs(z["sd"] - sd) <= 1e-9 * max(sd, 1e-12) and not z["capped"], (mu, sd, z)
+z = calibrate.zib_moments(0.3, 0.47)       # beyond the Bernoulli-type bound: capped, flagged, mean kept
+assert z["capped"] and z["sd"] < 0.47 and abs((1 - z["pz"]) * z["mb"] - 0.3) < 1e-15, z
+PY
+$PY "$T/calibrate.py" --blocks an3/blocks.json --key off/0.1/0.25 --out cal27 --sims 0 --bank bank26.json \
+    --bank-plan plan26.jsonl --bank-spec spec26.json --bank-sims 0 --compound 4:4:2 --compound-sims 2 --workers 1 \
+    > cal27.log 2>&1 || fail "calibrate.py --compound (all variants): $(tail -4 cal27.log)"
+$PY - "$T" <<'PY' || fail "the compound world's plant diagnostics"
+import csv, sys
+sys.path.insert(0, sys.argv[1]); import calibrate
+d = {(r["quantity"], r["effect"]): r for r in csv.DictReader(open("cal27/diag.csv"))}
+rows = {(r["test"], r["effect"], r["alpha"]): r for r in csv.DictReader(open("cal27/calib.csv"))}
+for t in (0.01, 0.02, 0.03):
+    lab = f"bounded ladder + feasible plant d_res={t} in all conditions"
+    r = d[("d_res: noiseless logistic-residual RMS per planted condition", lab)]
+    assert abs(float(r["min"]) - t) <= calibrate.PLANT_TOL * t and abs(float(r["max"]) - t) <= calibrate.PLANT_TOL * t, r
+    assert float(d[("clipped cells per planted condition", lab)]["max"]) == 0
+    assert rows[(f"plant at its target (feasible family: solved; refits converged): {lab}", "null", "0.95")]["x"] == "2"
+for t in (0.01, 0.02, 0.03):
+    lab = f"bounded ladder + d_C={t} in all conditions"
+    assert ("d_add: RMS added circulation per planted condition", lab) in d and ("d_res: noiseless logistic-residual RMS per planted condition", lab) in d
+assert float(d[("cells with a capped SD (share)", "bounded ladder")]["n"]) == 2
+assert ("H1b invalid (a logistic fit did not converge): bounded ladder", "null", "0.95") in rows
 PY
 
 # 19. self-tests of the inference and bounded-scale modules

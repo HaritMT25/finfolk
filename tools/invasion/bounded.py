@@ -184,9 +184,15 @@ class Model:
         return d
 
 
+GTOL = 1e-9   # stationarity at the iteration cap: max |J'r| <= GTOL x max(1, ||y||)
+
+
 def lm(model, cells, y, th0, iters=200, tol=1e-11):
     """Levenberg-Marquardt least squares; stops when an accepted step improves the SSE by less
-    than tol (relative). -> (theta, SSE, converged)."""
+    than tol (relative). -> (theta, SSE, converged). At the iteration cap the fit counts as
+    converged only if it is stationary, max |J'r| <= GTOL max(1, ||y||) (review round 4: such
+    fits are boundary infima - a fitted cell mean creeping to 0, an effect drifting to -inf, the
+    SSE flat to ~1e-9 relative; anything else is NOT converged and decides nothing)."""
     th = list(th0)
     g, J = model.eval(th, cells)
     r = [a - b for a, b in zip(y, g)]
@@ -233,7 +239,8 @@ def lm(model, cells, y, th0, iters=200, tol=1e-11):
             lam *= 10.0
             if lam > 1e6:
                 return th, S, True   # no descent along even a short gradient step: a (local) minimum
-    return th, S, False
+    grad = max(abs(sum(row[a_] * ri for row, ri in zip(J, r))) for a_ in range(P))
+    return th, S, grad <= GTOL * max(1.0, math.sqrt(sum(v * v for v in y)))
 
 
 def _cells(N):
@@ -339,18 +346,22 @@ def model_test(zq, model_name, B=1999, seed=1, kind=infer.DEFAULT_KIND, TA_pair=
     RC_nc = RC - nullC
     den = (TA_pair - tauA_pair) if TA_pair is not None else None
     P = N * (N - 1) // 2
+    # an unconverged fit decides nothing (review round 4): no p-value rests on it
+    ok_fit, ok_boot = bool(f["converged"]), bad == 0
     return {"model": model_name, "N": N, "k": k, "B": B, "kind": kind, "converged": f["converged"],
             "boot_not_converged": bad, "sse": f["sse"], "params": f["params"],
             "T_C": st["TC"], "tau_C": st["tauC"], "C_fit": C_fit, "R_A": RA, "R_C": RC,
-            "F_res": F_res, "p_res": (1 + sum(1 for x in FC if x >= F_res)) / (B + 1),
+            "F_res": F_res,
+            "p_res": (1 + sum(1 for x in FC if x >= F_res)) / (B + 1) if ok_fit and ok_boot else None,
             "R_C_null": nullC, "R_C_nc": RC_nc,
             "share_res_nc": RC_nc / den if den and den > 0 else float("nan"),
             "survival": RC_nc / (st["TC"] - st["tauC"]) if st["TC"] > st["tauC"] else float("nan"),
             "dC_res": math.sqrt(max(0.0, RC_nc) / P),
             "T_S": st["TS"], "tau_S": st["tauS"], "R_S": RS, "F_res_S": F_res_S,
-            "p_res_S": (1 + sum(1 for x in FS if x >= F_res_S)) / (B + 1), "R_S_null": nullS,
-            "R_S_nc": RS - nullS,
-            "p_res_flip": infer.flip_p_vectors([residual_replicate_vectors(zq, model_name, f)[0]])}
+            "p_res_S": (1 + sum(1 for x in FS if x >= F_res_S)) / (B + 1) if ok_fit and ok_boot else None,
+            "R_S_null": nullS, "R_S_nc": RS - nullS,
+            "p_res_flip": (infer.flip_p_vectors([residual_replicate_vectors(zq, model_name, f)[0]])
+                           if ok_fit else None)}
 
 
 # ------------------------------------------------------- the frozen co-primary (hypothesis 1b)
@@ -375,6 +386,11 @@ def model_test(zq, model_name, B=1999, seed=1, kind=infer.DEFAULT_KIND, TA_pair=
 #   Claim rule: "a cyclic component beyond bounded (logistic) transitivity" needs BOTH H1 (raw
 #        grouped sign-flip omnibus) and H1b rejected by Holm over the 12-test family; for planning
 #        and calibration, both p <= 0.05/12 (sufficient for both under Holm, whatever the order).
+#   Fit failures (review round 4): if any of the four logistic mean fits did not converge, H1b is
+#        INVALID: p_flip is None (the computed value is kept as p_flip_unconverged, a diagnostic),
+#        so neither H1b nor the claim can reject; calibration counts such a dataset as a
+#        non-rejection and keeps it in the denominator. Likewise the refitting bootstrap's p_boot is
+#        None if any of its refits did not converge (boot_not_converged counts them).
 CO_PRIMARY_MODEL = "logistic"
 ALPHA_FAMILY = 0.05 / 12
 
@@ -413,8 +429,10 @@ def residual_replicate_vectors(zq, model_name=CO_PRIMARY_MODEL, fitres=None):
 
 def residual_omnibus(groups, model_name=CO_PRIMARY_MODEL, B=0, seed=1, kind=infer.DEFAULT_KIND, fits=None):
     """H1b over independent groups of aligned conditions (groups[g][c] = endpoint units zq).
-    -> dict: F_res_joint = sum R_C / sum tau_C, p_flip (the frozen decision), p_boot (joint
-    refitting bootstrap with paired plans, if B > 0), per-condition R_C / C_fit / T_C."""
+    -> dict: F_res_joint = sum R_C / sum tau_C, p_flip (the frozen decision; None = INVALID when a
+    mean fit did not converge, see above), p_boot (joint refitting bootstrap with paired plans, if
+    B > 0; None if any refit did not converge), per-condition R_C / C_fit / T_C / converged, and
+    'valid' / 'invalid' / 'diagnostics'."""
     fl = [[fit_matrix(zq, model_name) if fits is None else fits[g][c] for c, zq in enumerate(zs)]
           for g, zs in enumerate(groups)]
     gv = []
@@ -428,10 +446,16 @@ def residual_omnibus(groups, model_name=CO_PRIMARY_MODEL, B=0, seed=1, kind=infe
             M = _means(zq)
             per.append({"group": g, "cond": c, "T_C": st["TC"], "tau_C": st["tauC"],
                         "C_fit": energies(fl[g][c]["F"])[1], "R_C": energies(_sub(M, fl[g][c]["F"]))[1],
-                        "converged": fl[g][c]["converged"]})
+                        "converged": bool(fl[g][c]["converged"]), "sse": fl[g][c]["sse"]})
     F = infer._ratio(sum(x["R_C"] for x in per), sum(x["tau_C"] for x in per))
+    bad = [f"{x['group']}/{x['cond']}" for x in per if not x["converged"]]
+    p_flip = infer.flip_p_vectors(gv)
     out = {"model": model_name, "groups": len(groups), "conditions": len(per), "F_res_joint": F,
-           "p_flip": infer.flip_p_vectors(gv), "per_condition": per, "B": B, "p_boot": None,
+           "p_flip": None if bad else p_flip, "p_flip_unconverged": p_flip if bad else None,
+           "valid": not bad, "invalid": (f"logistic mean fit(s) not converged: group/condition {' '.join(bad)}"
+                                         if bad else None),
+           "fits_converged": len(per) - len(bad), "per_condition": per, "B": B, "p_boot": None,
+           "boot_not_converged": 0,
            "flip_min_p": math.prod(1.0 / (1 << (len(zs[0][0]) - 1)) for zs in groups)}
     if B > 0:
         rnd = random.Random(seed)
@@ -443,15 +467,17 @@ def residual_omnibus(groups, model_name=CO_PRIMARY_MODEL, B=0, seed=1, kind=infe
                 N = len(zq)
                 prep.append((g, res, [[infer.unit_energies(u, N) for u in col] for col in res], fl[g][c],
                              Model(model_name, N), _cells(N)))
-        ge = 0
+        ge = nbad = 0
         for _ in range(B):
             plans = [infer._draw_plan(rnd, kind, N_, k_) for N_, k_ in shape]
             num = den = 0.0
+            ok_all = True
             for g, res, E, f, model, cells in prep:
                 sb = infer._fast_stats(res, E, plans[g], kind)
                 mb = sb["m"]
                 yb = [f["F"][i][j] + mb[j][i] for i, j in cells]
-                th, _, _ = lm(model, cells, yb, f["theta"])
+                th, _, ok = lm(model, cells, yb, f["theta"])
+                ok_all = ok_all and ok
                 gb, _ = model.eval(th, cells)
                 N = model.N
                 Mb = [[None] * N for _ in range(N)]
@@ -459,8 +485,12 @@ def residual_omnibus(groups, model_name=CO_PRIMARY_MODEL, B=0, seed=1, kind=infe
                     Mb[i][j] = a_ - b_
                 num += energies(Mb)[1]
                 den += sb["tauC"]
+            nbad += not ok_all
             ge += infer._ratio(num, den) >= F
-        out["p_boot"] = (1 + ge) / (B + 1)
+        out["boot_not_converged"] = nbad
+        # a draw whose refit did not converge has no valid statistic: the bootstrap p is then not
+        # reported (review round 4: never a rejection resting on an unfinished optimization)
+        out["p_boot"] = (1 + ge) / (B + 1) if nbad == 0 and out["valid"] else None
     return out
 
 
@@ -551,6 +581,13 @@ def selftest():
     assert om["p_flip"] > 0.01 and om["conditions"] == 3 and abs(om["flip_min_p"] - 1 / 32 ** 2) < 1e-15, om["p_flip"]
     oc = residual_omnibus([[units5(0.08), units5(0.08)], [units5(0.08)]], B=19, seed=3)
     assert oc["p_flip"] <= 1 / 32 ** 2 + 1e-12 and oc["p_boot"] == 1 / 20, (oc["p_flip"], oc["p_boot"])
+    assert oc["valid"] and oc["fits_converged"] == 3 and oc["boot_not_converged"] == 0, oc["invalid"]
+    # an unconverged mean fit makes H1b invalid (no p-value, the computed one kept as a diagnostic)
+    zc5 = units5(0.08)
+    fu = dict(fit_matrix(zc5), converged=False)
+    ou = residual_omnibus([[zc5]], fits=[[fu]], B=5)
+    assert ou["p_flip"] is None and ou["p_boot"] is None and not ou["valid"] and "not converged" in ou["invalid"]
+    assert ou["p_flip_unconverged"] is not None and ou["fits_converged"] == 0, ou
     # the Aranda-Ordaz link is finite and accurate at every lam >= 0, also where lam e^eta is large for
     # tiny lam (review round 3: the old series overflowed at eta = 30, lam = 1e-10), and its Jacobian
     # matches finite differences in the series, the exact and the cloglog regime

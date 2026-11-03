@@ -9,8 +9,9 @@ infer.py's (and bounded.py's) tests, by simulation.
                  [--omnibus 12:10:2:2] [--omnibus-sims 2000] [--omnibus-B 999] [--omnibus-plants all|none]
                  [--omnibus-tests both|flip] [--omnibus-worlds hetero-design,skew-design]
                  [--assay-corr R] [--bounded-null logistic] [--bnull-sims 300] [--bnull-B 199]
-                 [--bank BANK/blocks.json [--bank-k 10] [--bank-sims 10000] [--bank-outer M]]
-                 [--compound N:k:G [--compound-sims 2000] [--compound-variants all|null]]
+                 [--bank BANK/blocks.json --bank-plan PLAN.jsonl [--bank-spec SPEC.json] [--bank-exploratory]
+                  [--bank-k 10] [--bank-sims 10000] [--bank-outer M]]
+                 [--compound N:k:G [--compound-sims 2000] [--compound-variants all|null|nominal|target]]
                  [--workers 4] [--seed 1]
 
 Every simulated dataset goes through exactly analyze.py's procedure (infer.block_stats,
@@ -76,20 +77,29 @@ ERROR BANK (--bank BLOCKS.json, an analysis of a high-replication bank: its prim
 omnibus level / power with k units per column drawn WITH replacement from the bank's centred,
 variance-restored units (the same draw for a regime's assays, regimes independent); 'bank-gauss'
 draws Gaussian units with each column's joint cross-assay covariance; --bank-outer M resamples
-the bank itself (finite-bank uncertainty, reported separately).
+the bank itself (finite-bank uncertainty, reported separately). The bank must BE the registered
+one (review round 4): validate_bank checks it against the frozen BANK_SPEC (or --bank-spec) and
+its plan (--bank-plan): exact assays and groups (the plan's cores, items included), every block
+formal at the fixed-step horizon, replicates 0..K-1, aligned assays, unique keys, shapes; a bank
+that fails is refused (exit 2) unless --bank-exploratory (rows keyed 'bank (exploratory)').
 
 COMPOUND DECISION (--compound N:k:G): the frozen decision (H1, H1b, the claim = both rejected) in
 a transitive bounded world: logistic ladders sigma(mu + a_i + b_j), support-preserving
-zero-inflated Beta endpoints, cycles planted on the means (clipping counted). Without --bank the
---key blocks are the conditions and each dataset draws N items (with replacement) from their
-fitted items and per-cell SDs from their cells; with --bank, each group / condition is the
-bank's own primary block: its own fitted ladder over its own items and its own cell SDs (key
-'bank' in calib.csv), so N:G must be the bank's.
+zero-inflated Beta endpoints with the declared means exactly (zib_moments; infeasible SDs capped
+and counted), and two families of alternatives (review round 4): the old nominal plants on the
+probability scale (clipped; their achieved d_add / d_res and clipping in diag.csv) and feasible
+logit-scale plants solved to a noiseless logistic-residual RMS d_res (the gate's effect
+definition). A dataset whose H1b fit did not converge is a non-rejection, kept in the denominator.
+Without --bank the --key blocks are the conditions and each dataset draws N items (with
+replacement) from their fitted items and per-cell SDs from their cells; with --bank, each group /
+condition is the bank's own primary block: its own fitted ladder over its own items and its own
+cell SDs (key 'bank' in calib.csv), so N:G must be the bank's.
 
 Outputs in OUTDIR: calib.csv (one row per key, scale, world, N, k, G, C, test, effect, alpha:
-rate, its Clopper-Pearson interval, n), calib.md, and manifest.json (review round 2, P3): the
-SHA-256 of the blocks file and of every tool source, the full arguments and seeds, the Python
-version, and the SHA-256 of calib.csv / calib.md.
+rate, its Clopper-Pearson interval, n), diag.csv (compound diagnostics: n, mean, SD, min, max of
+each planted quantity), calib.md, and manifest.json (review round 2, P3): the SHA-256 of the
+blocks file and of every tool source, the full arguments and seeds, the Python version, the bank
+check, and the SHA-256 of the outputs.
 """
 from __future__ import annotations
 
@@ -321,8 +331,11 @@ def _init(cfg):
 class Counter:
     def __init__(self):
         self.cnt = {}
+        self.st = {}    # (quantity, effect) -> [n, sum, sum of squares, min, max]: diagnostics
 
     def hit(self, test, effect, p, alphas=ALPHAS):
+        """p None = no valid decision (e.g. an unconverged fit): counted as NOT rejected, and the
+        dataset stays in the denominator (review round 4)."""
         for a in alphas:
             k_ = (test, effect, a)
             self.cnt[k_] = self.cnt.get(k_, 0) + (1 if p is not None and p <= a + 1e-15 else 0)
@@ -330,6 +343,24 @@ class Counter:
     def cover(self, test, ok):
         k_ = (test, "null", 0.95)
         self.cnt[k_] = self.cnt.get(k_, 0) + (1 if ok else 0)
+
+    def stat(self, quantity, effect, x):
+        s = self.st.setdefault((quantity, effect), [0, 0.0, 0.0, math.inf, -math.inf])
+        s[0] += 1
+        s[1] += x
+        s[2] += x * x
+        s[3] = min(s[3], x)
+        s[4] = max(s[4], x)
+
+
+def merge_stats(into, st):
+    for k_, s in st.items():
+        t = into.setdefault(k_, [0, 0.0, 0.0, math.inf, -math.inf])
+        t[0] += s[0]
+        t[1] += s[1]
+        t[2] += s[2]
+        t[3] = min(t[3], s[3])
+        t[4] = max(t[4], s[4])
 
 
 def task_pilot(args):
@@ -442,6 +473,121 @@ def task_bnull(args):
     return (key, "bnull", f"{model} + empirical units", N, k, 1, 1), c.cnt, n
 
 
+# Review round 4, P2-4: an error bank is used only if it IS the registered bank. The frozen
+# specification of the confirmation design's bank (bank1: two home regimes x the two assays,
+# twelve items per regime, K = 50 replicates, the fixed-step horizon T = 13,500 at fraction 0.05);
+# --bank-spec FILE replaces it for another registered bank, --bank-plan PLAN.jsonl is the
+# registration it is checked against, and --bank-exploratory turns the refusals into warnings.
+BANK_SPEC = {"schema": "finfolk.invasion.bank-spec/1", "clock": "steps", "frac": 0.05, "G": 13500.0,
+             "assays": ["off", "predA4"], "groups": 2, "items": 12, "K": 50}
+BLOCKS_SCHEMA = "finfolk.invasion.blocks/2"
+
+
+def plan_cores(cells):
+    """Registered core membership {core: sorted items} of plan cells: an item belongs to the core
+    of the cells it is the RESIDENT of (plan.py tags a cell with its resident's core; every core
+    member has its own sham there), so a secondary cross-home cell adds nobody (review round 4)."""
+    out = {}
+    for c in cells:
+        if c.get("core"):
+            out.setdefault(c["core"], set()).add(c["resident_name"])
+    return {k_: sorted(v) for k_, v in out.items()}
+
+
+def _finite_shape(z, N, K, what):
+    """Problems of one unit array z[p][r][i]: N columns of K replicate vectors of N finite values,
+    zero on the diagonal."""
+    if not isinstance(z, list) or len(z) != N:
+        return [f"{what}: {len(z) if isinstance(z, list) else type(z).__name__} columns, expected {N}"]
+    for p, col in enumerate(z):
+        if not isinstance(col, list) or len(col) != K:
+            return [f"{what}: column {p} has {len(col) if isinstance(col, list) else '?'} replicates, expected {K}"]
+        for r, u in enumerate(col):
+            if not isinstance(u, list) or len(u) != N:
+                return [f"{what}: column {p} replicate {r} is not a vector of {N}"]
+            if u[p] != 0.0 or not all(isinstance(x, (int, float)) and math.isfinite(x) for x in u):
+                return [f"{what}: column {p} replicate {r}: non-finite value or nonzero diagonal"]
+    return []
+
+
+def validate_bank(bb, spec, plan_cells=None, plan_sha=None):
+    """Check an analysis' blocks.json against the frozen bank specification (and, given the plan,
+    against its registration): schema, the fixed-step clock, exactly the spec's assays and number
+    of groups at (frac, G), unique (group, assay) keys, every block formal, `items` items and
+    replicates 0..K-1 in every block, aligned items and replicates across a group's assays,
+    disjoint groups, the shapes / finiteness of z and zq; with a plan: its hash is the one the
+    analysis bound, the groups are its cores with exactly their items, the assays are its
+    conditions at frac, and every core cell registers replicates 0..K-1.
+    -> (groups, assays, {(group, assay): block}, problems)."""
+    probs = []
+    if bb.get("schema") != BLOCKS_SCHEMA:
+        probs.append(f"blocks schema {bb.get('schema')!r} is not {BLOCKS_SCHEMA!r}")
+    if bb.get("clock") != spec["clock"]:
+        probs.append(f"the bank was analysed on the {bb.get('clock')!r} clock; the spec registers {spec['clock']!r}")
+    pbs = [b for b in bb.get("primary_blocks", []) if b.get("frac") == spec["frac"] and float(b.get("G", -1)) == float(spec["G"])]
+    if not pbs:
+        probs.append(f"no primary blocks at fraction {spec['frac']} / window {spec['G']}")
+        return [], [], {}, probs
+    keys = [(b["group"], b["cond"]) for b in pbs]
+    dup = sorted({x for x in keys if keys.count(x) > 1})
+    if dup:
+        probs.append(f"duplicate (group, assay) blocks: {dup}")
+    byk = {(b["group"], b["cond"]): b for b in pbs}
+    gnames = sorted({g_ for g_, _ in keys})
+    cnames = sorted({c_ for _, c_ in keys})
+    if cnames != sorted(spec["assays"]):
+        probs.append(f"assays {cnames}, the spec registers {sorted(spec['assays'])}")
+    if len(gnames) != spec["groups"]:
+        probs.append(f"{len(gnames)} group(s) {gnames}, the spec registers {spec['groups']}")
+    K = spec["K"]
+    for g_ in gnames:
+        for c_ in spec["assays"]:
+            if (g_, c_) not in byk:
+                probs.append(f"group {g_}: no {c_} block")
+        bs = [byk[(g_, c_)] for c_ in cnames if (g_, c_) in byk]
+        for b in bs:
+            tag = f"{g_}/{b['cond']}"
+            if b.get("status") != "formal":
+                probs.append(f"{tag}: status {b.get('status')!r} (only a formal block is the registered one)")
+            if len(b.get("names", [])) != spec["items"]:
+                probs.append(f"{tag}: {len(b.get('names', []))} items, the spec registers {spec['items']}")
+            if list(b.get("reps", [])) != list(range(K)):
+                probs.append(f"{tag}: replicates {b.get('reps', [])[:3]}... ({len(b.get('reps', []))}), "
+                             f"the spec registers 0..{K - 1}")
+            for what in ("z", "zq"):
+                if what not in b:
+                    probs.append(f"{tag}: no {what} units")
+                else:
+                    probs += _finite_shape(b[what], len(b.get("names", [])), len(b.get("reps", [])), f"{tag} {what}")
+        if any(b["names"] != bs[0]["names"] or b["reps"] != bs[0]["reps"] for b in bs):
+            probs.append(f"group {g_}: its assays differ in items or replicates (units must align)")
+    seen = {}
+    for g_ in gnames:
+        for nm in byk.get((g_, cnames[0]), {}).get("names", []):
+            if nm in seen and seen[nm] != g_:
+                probs.append(f"item {nm} is in groups {seen[nm]} and {g_}")
+            seen[nm] = g_
+    if plan_cells is None:
+        probs.append("no --bank-plan: the bank's registration (cores, assays, replicates, plan hash) is unchecked")
+    else:
+        if plan_sha != bb.get("plan_sha256"):
+            probs.append(f"the analysis bound plan {str(bb.get('plan_sha256'))[:12]}, --bank-plan is {plan_sha[:12]}")
+        cores = plan_cores(plan_cells)
+        got = {g_: sorted(byk[(g_, cnames[0])]["names"]) for g_ in gnames if (g_, cnames[0]) in byk}
+        if cores != got:
+            probs.append(f"the groups / items are not the plan's registered cores ({sorted(cores)} vs {sorted(got)})")
+        conds = sorted({c["condition"] for c in plan_cells if c["fraction"] == spec["frac"]})
+        if conds != sorted(spec["assays"]):
+            probs.append(f"the plan registers conditions {conds} at {spec['frac']}, the spec {sorted(spec['assays'])}")
+        reps = {}
+        for c in plan_cells:
+            if c.get("core") and c["mode"] in ("invade", "sham") and c["fraction"] == spec["frac"]:
+                reps.setdefault((c["condition"], c["invader_name"], c["resident_name"]), set()).add(c["replicate"])
+        if any(v != set(range(K)) for v in reps.values()):
+            probs.append(f"the plan's core cells do not all register replicates 0..{K - 1}")
+    return gnames, cnames, byk, probs
+
+
 def _bank_groups(bank, outer_seed=None):
     """The bank's primary blocks as groups[g][c] of centred, variance-restored units (K per column).
     With outer_seed, first resample each column's K raw units with replacement (the same indices
@@ -524,22 +670,173 @@ def task_bank(args):
                 c.hit(f"omnibus boot {kind}", label, p_from(FC, stat(gp)))
             c.hit("omnibus sign-flip", label, infer.signflip_groups(gp, "curl"))
     C0 = len(groups0[0])
-    return ("bank", "bank", world + ("" if outer < 0 else f" outer{outer}"), N, k, len(groups0), C0), c.cnt, n
+    return (G.get("bank_label", "bank"), "bank", world + ("" if outer < 0 else f" outer{outer}"), N, k, len(groups0),
+            C0), c.cnt, n
+
+
+ZIB_PZ = 0.05        # exact-zero probability of a losing invader (mu < ZIB_LOSING), as in the pilot
+ZIB_LOSING = 0.03
+ZIB_VMAX = 0.9       # the Beta part's variance stays <= 0.9 mb (1 - mb) (phi >= 1/9: no degenerate U)
+
+
+def zib_moments(mu, sd):
+    """The zero-inflated Beta endpoint law for mean mu and SD sd (review round 4: the MEAN is exact,
+    never clipped, so a null world's declared means are the generator's means; the SD is exact
+    whenever it is feasible). X = 0 with probability pz, else Beta with mean mb = mu / (1 - pz) and
+    variance vb, so E X = mu and Var X = (1 - pz)(vb + mb^2) - mu^2.
+      pz   ZIB_PZ for a losing invader (mu < ZIB_LOSING: exact zeros), lowered to half of
+           sd^2 / (sd^2 + mu^2) where the zeros alone would exceed the requested variance;
+      vb   from the requested variance; feasible iff sd^2 < mu (1 - mu) (the Bernoulli bound,
+           whatever pz); kept <= ZIB_VMAX mb (1 - mb): a request beyond it is CAPPED (flagged,
+           its achieved SD returned).
+    A mean outside (0, 1) has only the point mass (flagged 'boundary').
+    -> {pz, mb, vb, sd (achieved), capped, boundary}."""
+    s2 = sd * sd
+    if not 0.0 < mu < 1.0:
+        return {"pz": 0.0, "mb": min(max(mu, 0.0), 1.0), "vb": 0.0, "sd": 0.0, "capped": sd > 0, "boundary": True}
+    pz = min(ZIB_PZ, 0.5 * s2 / (s2 + mu * mu)) if mu < ZIB_LOSING and s2 > 0 else 0.0
+    mb = mu / (1.0 - pz)
+    vb = (s2 + mu * mu) / (1.0 - pz) - mb * mb
+    vmax = ZIB_VMAX * mb * (1.0 - mb)
+    capped = vb > vmax
+    vb = min(max(vb, 0.0), vmax)
+    return {"pz": pz, "mb": mb, "vb": vb, "sd": math.sqrt(max(0.0, (1.0 - pz) * (vb + mb * mb) - mu * mu)),
+            "capped": capped, "boundary": False}
 
 
 def _zib(rnd, mu, sd):
-    """A support-preserving endpoint draw in [0, 1] with mean mu and SD ~sd: a zero-inflated Beta.
-    A losing invader (mu < 0.03) loses its whole pedigree with probability 0.05 (exact zeros, as in
-    the pilot); otherwise Beta(mu' phi, (1 - mu') phi) with phi from the target variance."""
-    mu = min(max(mu, 1e-4), 0.999)
-    pz = 0.05 if mu < 0.03 else 0.0
-    mb = mu / (1.0 - pz)
-    vb = (sd * sd + mu * mu) / (1.0 - pz) - mb * mb
-    vb = min(max(vb, 1e-8), 0.9 * mb * (1.0 - mb))
-    phi = mb * (1.0 - mb) / vb - 1.0
-    if pz and rnd.random() < pz:
+    """One support-preserving endpoint draw in [0, 1] with mean exactly mu (zib_moments)."""
+    m = zib_moments(mu, sd)
+    if m["pz"] and rnd.random() < m["pz"]:
         return 0.0
+    mb, vb = m["mb"], m["vb"]
+    if m["boundary"] or vb <= 1e-15 * mb * (1.0 - mb):
+        return mb
+    phi = mb * (1.0 - mb) / vb - 1.0
     return rnd.betavariate(mb * phi, (1.0 - mb) * phi)
+
+
+# ------------------------------------------------- planted alternatives in the compound world
+# Review round 4, P2-5: a nominal plant (+d v / 2 on the means of the probability scale) leaves
+# [0, 1] near the floor and was clipped, so its achieved effect was unmeasured. Every alternative
+# now reports what was planted: clipped cells and their magnitude, d_add = the RMS added
+# circulation per pair (||Q A(mean - null mean)|| / sqrt(P), after clipping), and d_res = the
+# NOISELESS residual RMS per pair after refitting the logistic model (||Q A(mean - logistic fit)|| /
+# sqrt(P)) - the cyclic signal beyond the logistic family that H1b tests. The gate's target is
+# defined on d_res: the 'feasible' plants put a divergence-free cycle on the LOGIT scale,
+# mean = sigmoid(eta + c v / 2 ...), inside (0, 1) for every c (no clipping), with c solved per
+# block so that d_res = the target exactly (relative tolerance PLANT_TOL).
+PLANT_CLIP = (0.002, 0.998)
+PLANT_TOL = 1e-4
+
+
+def _cols_to_M(mean):
+    """Column layout mean[p][i] (invader i into resident p) -> M[i][j] (diagonal None)."""
+    N = len(mean)
+    return [[(mean[j][i] if i != j else None) for j in range(N)] for i in range(N)]
+
+
+def _plant_cols(x, v, d):
+    """+d v_pq / 2 on p -> q (column q, entry p), -d v_pq / 2 on q -> p (as infer.plant)."""
+    N = len(x)
+    out = [row[:] for row in x]
+    e = 0
+    for p in range(N):
+        for q in range(p + 1, N):
+            h = 0.5 * d * v[e]
+            out[q][p] += h
+            out[p][q] -= h
+            e += 1
+    return out
+
+
+def _ladder(par, t, N):
+    """The fitted ladder over items t: (eta, mean) in column layout and its parameters in
+    bounded.Model's identifiable form (effects centred), so a refit can start exactly there."""
+    eta = [[(par["mu"] + par["a"][t[i]] + par["b"][t[p]]) if i != p else 0.0 for i in range(N)] for p in range(N)]
+    mean = [[bounded.sigmoid(eta[p][i]) if i != p else 0.0 for i in range(N)] for p in range(N)]
+    a = [par["a"][x] for x in t]
+    b = [par["b"][x] for x in t]
+    ma, mb = sum(a) / N, sum(b) / N
+    th = [par["mu"] + ma + mb] + [x - ma for x in a[:N - 1]] + [x - mb for x in b[:N - 1]]
+    return eta, mean, th
+
+
+def _curl_rms(M, F):
+    """sqrt(||Q A(M - F)||^2 / P): the RMS cyclic part per pair of M - F (M[i][j] layout)."""
+    N = len(M)
+    return math.sqrt(max(0.0, bounded.energies(bounded._sub(M, F))[1]) / (N * (N - 1) // 2))
+
+
+def plant_diagnostics(mean, mean0, th0):
+    """-> (d_add, d_res, refit converged, theta of the refit) of a noiseless planted mean."""
+    M, M0 = _cols_to_M(mean), _cols_to_M(mean0)
+    f = bounded.fit(M, "logistic", th0)
+    return _curl_rms(M, M0), _curl_rms(M, f["F"]), bool(f["converged"]), f["theta"]
+
+
+def nominal_plant(mean0, v, d):
+    """The old plant: +d v / 2 on the probability-scale means, clipped to PLANT_CLIP.
+    -> (mean, clipped cells, sum |clip|, max |clip|)."""
+    mean = _plant_cols(mean0, v, d)
+    n, tot, mx = 0, 0.0, 0.0
+    lo, hi = PLANT_CLIP
+    N = len(mean)
+    for p in range(N):
+        for i in range(N):
+            if i != p and not lo <= mean[p][i] <= hi:
+                x = min(max(mean[p][i], lo), hi)
+                n += 1
+                tot += abs(x - mean[p][i])
+                mx = max(mx, abs(x - mean[p][i]))
+                mean[p][i] = x
+    return mean, n, tot, mx
+
+
+def feasible_plant(eta, mean0, th0, v, target, iters=40):
+    """The logit-scale plant at noiseless residual RMS d_res = target (see above): Illinois
+    regula falsi on c, each step one logistic refit (warm-started). -> dict(mean, c, d_add, d_res,
+    converged (the refit), solved (|d_res - target| <= PLANT_TOL target), evals)."""
+    N = len(eta)
+    g = [bounded.sigmoid(eta[p][i]) * (1.0 - bounded.sigmoid(eta[p][i])) for p in range(N) for i in range(N) if i != p]
+    warm = [list(th0)]
+
+    def at(c):
+        e2 = _plant_cols(eta, v, c)
+        m = [[bounded.sigmoid(e2[p][i]) if i != p else 0.0 for i in range(N)] for p in range(N)]
+        d_add, d_res, ok, th = plant_diagnostics(m, mean0, warm[0])
+        warm[0] = th
+        return d_res - target, {"mean": m, "c": c, "d_add": d_add, "d_res": d_res, "converged": ok}
+    a, fa = 0.0, -target                        # d_res(0) = 0: the null ladder is a logistic one
+    b = target / max(sum(g) / len(g), 1e-6)     # first order: d_res ~ c x the mean slope sigma'(eta)
+    fb, best = at(b)
+    evals = 1
+    while fb < 0 and evals < iters:             # bracket (d_res saturates: a target can be out of reach)
+        a, fa = b, fb
+        b *= 2.0
+        fb, x = at(b)
+        evals += 1
+        best = x if abs(fb) < abs(best["d_res"] - target) else best
+    side = 0
+    while fb >= 0 > fa and abs(best["d_res"] - target) > PLANT_TOL * target and evals < iters:
+        c = b - fb * (b - a) / (fb - fa)         # Illinois regula falsi, bracket [a, b]
+        fc, x = at(c)
+        evals += 1
+        if abs(fc) < abs(best["d_res"] - target):
+            best = x
+        if fc >= 0:
+            b, fb = c, fc
+            if side == 1:
+                fa *= 0.5
+            side = 1
+        else:
+            a, fa = c, fc
+            if side == -1:
+                fb *= 0.5
+            side = -1
+    best["solved"] = abs(best["d_res"] - target) <= PLANT_TOL * target
+    best["evals"] = evals
+    return best
 
 
 def task_compound(args):
@@ -547,10 +844,14 @@ def task_compound(args):
     omnibus), H1b (bounded.residual_omnibus sign-flip) and the claim (both <= alpha), under a
     TRANSITIVE bounded world: per group (home regime) N items drawn from the pilot's items, each
     assay's endpoint means the pilot block's fitted logistic ladder sigma(mu + a_i + b_j), cells'
-    SDs drawn from that block's endpoint SDs, support-preserving zero-inflated Beta endpoints;
-    cycles planted on the MEANS (clipped to [0.002, 0.998]; clipped cells counted).
+    SDs drawn from that block's endpoint SDs, support-preserving zero-inflated Beta endpoints
+    (zib_moments: the means EXACT, the SDs exact where feasible, capped SDs counted).
     With an error bank (keys None): each group / condition is the bank's own primary block - its
-    fitted ladder over its own items (not resampled) and its cells' own SDs."""
+    fitted ladder over its own items (not resampled) and its cells' own SDs.
+    Review round 4: the null's means are the ladder itself (no clipping ever); alternatives are the
+    old nominal plants (probability scale, clipped, now measured: d_add, d_res, clipping) and the
+    feasible logit-scale plants at a registered d_res (see feasible_plant); a dataset whose H1b fit
+    did not converge counts as a non-rejection and stays in the denominator (its count reported)."""
     keys, N, k, Gn, n, variants, seed = args
     fits, pools = [], []
     srcs = ([[(G["bank_zq"][g][c]) for c in range(len(G["bank_zq"][g]))] for g in range(len(G["bank_zq"]))]
@@ -567,14 +868,13 @@ def task_compound(args):
     C = len(srcs[0])
     rnd = random.Random(seed)
     tmpl = [infer.cycle_template(N, "diffuse", seed=5 + g) for g in range(Gn)]
-    P = N * (N - 1) // 2
     c = Counter()
-    vlist = [("bounded ladder", 0.0, "all")]
-    if variants == "all":
-        vlist += [(f"bounded ladder + d_C={d} in all conditions", d, "all") for d in (0.01, 0.02, 0.03)]
-        vlist += [(f"bounded ladder + d_C={d} in one condition", d, "one") for d in (0.02, 0.03)]
+    vlist = compound_variants(variants)
     if keys is None and N != N0:
         raise ValueError("compound from a bank: N must be the bank's item count")
+    # with a bank the items (hence every noiseless mean and plant) are the same in every dataset:
+    # each plant is built once per worker
+    cache = G.setdefault("_plants", {}) if keys is None else None
     for _ in range(n):
         if keys is None:   # the bank's own items and cells
             items = [list(range(N)) for _ in range(Gn)]
@@ -583,42 +883,90 @@ def task_compound(args):
             items = [[rnd.randrange(N0) for _ in range(N)] for _ in range(Gn)]
             sds = [[[[rnd.choice(pools[g][ci]) if i != p else 0.0 for i in range(N)] for p in range(N)] for ci in range(C)]
                    for g in range(Gn)]
-        for label, d, where in vlist:
-            groups, clipped = [], 0
+        base = {(g, ci): _ladder(fits[g][ci], items[g], N) for g in range(Gn) for ci in range(C)}
+        plants = {} if cache is None else cache   # (family, d, g, ci) -> the planted mean and its diagnostics
+
+        def planted(fam, d, g, ci):
+            key_ = (fam, d, g, ci)
+            if key_ not in plants:
+                eta, mean0, th0 = base[(g, ci)]
+                if fam == "nominal":
+                    mean, ncl, tot, mx = nominal_plant(mean0, tmpl[g], d)
+                    d_add, d_res, ok, _ = plant_diagnostics(mean, mean0, th0)
+                    plants[key_] = {"mean": mean, "clipped": ncl, "clip_sum": tot, "clip_max": mx, "d_add": d_add,
+                                    "d_res": d_res, "converged": ok, "solved": True}
+                else:
+                    x = feasible_plant(eta, mean0, th0, tmpl[g], d)
+                    x.update(clipped=0, clip_sum=0.0, clip_max=0.0)
+                    plants[key_] = x
+            return plants[key_]
+        for label, fam, d, where in vlist:
+            groups = []
+            ncl = ncap = nbound = ncells = 0
+            clip_max, ratio_min, unsolved, refit_bad = 0.0, 1.0, 0, 0
             for g in range(Gn):
                 zs = []
                 for ci in range(C):
-                    par = fits[g][ci]
-                    t = items[g]
-                    mean = [[bounded.sigmoid(par["mu"] + par["a"][t[i]] + par["b"][t[p]]) if i != p else 0.0
-                             for i in range(N)] for p in range(N)]   # column layout [resident p][invader i]
+                    mean = base[(g, ci)][1]   # the null mean: exactly the ladder (never clipped)
                     if d and (where == "all" or (g, ci) == (0, 0)):
-                        e = 0
-                        for p_ in range(N):
-                            for q_ in range(p_ + 1, N):
-                                x = 0.5 * d * tmpl[g][e]
-                                mean[q_][p_] += x      # p_ -> q_
-                                mean[p_][q_] -= x      # q_ -> p_
-                                e += 1
+                        x = planted(fam, d, g, ci)
+                        mean = x["mean"]
+                        ncl += x["clipped"]
+                        clip_max = max(clip_max, x["clip_max"])
+                        unsolved += not x["solved"]
+                        refit_bad += not x["converged"]
+                        c.stat("d_add: RMS added circulation per planted condition", label, x["d_add"])
+                        c.stat("d_res: noiseless logistic-residual RMS per planted condition", label, x["d_res"])
+                        c.stat("clipped cells per planted condition", label, x["clipped"])
+                        c.stat("|clip| summed per planted condition", label, x["clip_sum"])
+                        if fam == "target":
+                            c.stat("logit plant scale c", label, x["c"])
+                            c.stat("refits to solve the plant", label, x["evals"])
                     for p in range(N):
                         for i in range(N):
-                            if i != p and not 0.002 <= mean[p][i] <= 0.998:
-                                clipped += 1
-                                mean[p][i] = min(max(mean[p][i], 0.002), 0.998)
+                            if i != p:
+                                m_ = zib_moments(mean[p][i], sds[g][ci][p][i])
+                                ncells += 1
+                                ncap += m_["capped"]
+                                nbound += m_["boundary"]
+                                if sds[g][ci][p][i] > 0:
+                                    ratio_min = min(ratio_min, m_["sd"] / sds[g][ci][p][i])
                     zs.append([[[_zib(rnd, mean[p][i], sds[g][ci][p][i]) if i != p else 0.0 for i in range(N)]
                                 for _ in range(k)] for p in range(N)])
                 groups.append(zs)
             p1 = infer.signflip_groups(groups, "curl")
             ro = bounded.residual_omnibus(groups)
-            p1b = ro["p_flip"]
+            p1b = ro["p_flip"]   # None: H1b invalid (a fit did not converge) -> no rejection, still counted
             c.hit("H1 raw sign-flip omnibus", label, p1)
             c.hit("H1b logistic residual sign-flip omnibus", label, p1b)
-            c.hit("claim: H1 and H1b", label, max(p1, p1b))
-            c.cover(f"feasible (no clipped mean): {label}", clipped == 0)
-            c.cover(f"all four fits converged: {label}", all(x["converged"] for x in ro["per_condition"]))
+            c.hit("claim: H1 and H1b", label, max(p1, p1b) if p1b is not None else None)
+            c.cover(f"H1b invalid (a logistic fit did not converge): {label}", not ro["valid"])
+            c.cover(f"all four fits converged: {label}", ro["valid"])
+            c.cover(f"feasible (no clipped mean): {label}", ncl == 0)
+            c.cover(f"feasible SDs (no capped cell, no boundary mean): {label}", ncap == 0 and nbound == 0)
+            if d:
+                c.cover(f"plant at its target (feasible family: solved; refits converged): {label}",
+                        unsolved == 0 and refit_bad == 0)
+            c.stat("cells with a capped SD (share)", label, ncap / ncells)
+            c.stat("achieved / requested SD, smallest cell", label, ratio_min)
+            c.stat("max |clip| over planted cells", label, clip_max)
     world = ("logistic ladder + zero-inflated Beta" if keys is not None
              else "the bank's own logistic ladders + zero-inflated Beta")
-    return ("compound" if keys is not None else "bank", "compound", world, N, k, Gn, C), c.cnt, n
+    return ((G.get("bank_label", "bank") if keys is None else "compound"), "compound", world, N, k, Gn, C), c.cnt, n, c.st
+
+
+def compound_variants(which):
+    """(label, family, d, where) of the compound world. 'nominal' = the old probability-scale plant
+    (clipped; d = its nominal d_C), 'target' = the feasible logit-scale plant at d_res = d."""
+    out = [("bounded ladder", None, 0.0, "all")]
+    if which in ("all", "nominal"):
+        out += [(f"bounded ladder + d_C={d} in all conditions", "nominal", d, "all") for d in (0.01, 0.02, 0.03)]
+        out += [(f"bounded ladder + d_C={d} in one condition", "nominal", d, "one") for d in (0.02, 0.03)]
+    if which in ("all", "target"):
+        out += [(f"bounded ladder + feasible plant d_res={d} in all conditions", "target", d, "all")
+                for d in (0.01, 0.02, 0.03)]
+        out += [(f"bounded ladder + feasible plant d_res={d} in one condition", "target", d, "one") for d in (0.02, 0.03)]
+    return out
 
 
 def task_bdesign(args):
@@ -762,8 +1110,14 @@ def main(argv=None):
     ap.add_argument("--bdesign-B", type=int, default=499)
     ap.add_argument("--bank", help="an error bank's analysis blocks.json (primary_blocks): omnibus calibration "
                     "by resampling its units WITH replacement, assays jointly, regimes independently")
-    ap.add_argument("--bank-frac", type=float, default=0.05)
-    ap.add_argument("--bank-G", type=float, default=13500.0)
+    ap.add_argument("--bank-spec", help="the registered bank specification (JSON, keys of calibrate.BANK_SPEC); "
+                    "default: the frozen confirmation bank (2 groups x off / predA4, 12 items, K = 50, T = 13500)")
+    ap.add_argument("--bank-plan", help="the bank's registered plan (JSONL): its hash, cores, conditions and "
+                    "replicates must be the bank's (required unless --bank-exploratory)")
+    ap.add_argument("--bank-exploratory", action="store_true",
+                    help="run a bank that fails the specification anyway, rows labelled 'bank (exploratory)'")
+    ap.add_argument("--bank-frac", type=float, default=None, help="(overrides the spec: exploratory only)")
+    ap.add_argument("--bank-G", type=float, default=None, help="(overrides the spec: exploratory only)")
     ap.add_argument("--bank-k", type=int, default=10)
     ap.add_argument("--bank-sims", type=int, default=10000)
     ap.add_argument("--bank-worlds", default="bank,bank-gauss")
@@ -773,7 +1127,9 @@ def main(argv=None):
                     "bounded world; the --key blocks are the conditions (assays), their endpoint units the source; "
                     "with --bank, the bank's own primary blocks (items, fits and cell SDs) are")
     ap.add_argument("--compound-sims", type=int, default=2000)
-    ap.add_argument("--compound-variants", default="all", choices=["all", "null"])
+    ap.add_argument("--compound-variants", default="all", choices=["all", "null", "nominal", "target"],
+                    help="'nominal': the null + the old clipped plants; 'target': the null + the feasible plants at "
+                         "d_res; 'all' both")
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--chunk", type=int, default=50)
     ap.add_argument("--seed", type=int, default=1)
@@ -845,25 +1201,41 @@ def main(argv=None):
         for c0 in range(0, a.bdesign_sims, 10):
             sd += 1
             tasks.append(("bdesign", (a.key[0], model, N, k, min(10, a.bdesign_sims - c0), sd)))
-    bank, bank_info, bank_plants = None, None, []
+    bank, bank_info, bank_plants, bank_label = None, None, [], "bank"
     if a.bank:
         bb = json.load(open(a.bank))
-        pbs = [b for b in bb.get("primary_blocks", []) if b["frac"] == a.bank_frac and float(b["G"]) == a.bank_G]
-        gnames = sorted({b["group"] for b in pbs})
-        cnames = sorted({b["cond"] for b in pbs})
-        byk = {(b["group"], b["cond"]): b for b in pbs}
+        spec = dict(BANK_SPEC)
+        if a.bank_spec:
+            spec.update(json.load(open(a.bank_spec)))
+        for opt, fld in ((a.bank_frac, "frac"), (a.bank_G, "G")):
+            if opt is not None and float(opt) != float(spec[fld]):
+                spec[fld] = opt   # an explicit override is a different specification: exploratory only
+                spec.setdefault("overridden", []).append(fld)
+        plan_cells = [json.loads(ln) for ln in open(a.bank_plan) if ln.strip()] if a.bank_plan else None
+        gnames, cnames, byk, bprobs = validate_bank(bb, spec, plan_cells, sha256(a.bank_plan) if a.bank_plan else None)
+        if spec.get("overridden"):
+            bprobs.append(f"--bank-frac / --bank-G override the frozen spec ({spec['overridden']})")
+        if bprobs:
+            msg = f"--bank {a.bank} is not the registered bank:\n  " + "\n  ".join(bprobs)
+            if not a.bank_exploratory:
+                print(msg + "\n(--bank-exploratory runs it anyway, labelled exploratory)", file=sys.stderr)
+                return 2
+            print("EXPLORATORY: " + msg, file=sys.stderr)
+            bank_label = "bank (exploratory)"
         bank = []
         for g_ in gnames:
-            bs_ = [byk[(g_, c_)] for c_ in cnames]
-            if any(b["names"] != bs_[0]["names"] or b["reps"] != bs_[0]["reps"] for b in bs_):
+            bs_ = [byk[(g_, c_)] for c_ in cnames if (g_, c_) in byk]
+            if any(b["names"] != bs_[0]["names"] or b["reps"] != bs_[0]["reps"] for b in bs_) or len(bs_) != len(cnames):
                 raise SystemExit(f"bank group {g_}: conditions differ in items or replicates (units must align)")
             bank.append([b["z"] for b in bs_])
         if not bank:
-            raise SystemExit(f"no primary blocks at {a.bank_frac} / {a.bank_G} in {a.bank}")
+            raise SystemExit(f"no primary blocks at {spec['frac']} / {spec['G']} in {a.bank}")
         Nb = len(bank[0][0])
         bank_plants = omni_plants(Nb, len(gnames), len(cnames)) if a.omnibus_plants == "all" else []
         bank_info = {"path": os.path.abspath(a.bank), "sha256": sha256(a.bank), "groups": gnames, "conditions": cnames,
-                     "N": Nb, "K": len(bank[0][0][0]), "status": {f"{b['group']}/{b['cond']}": b["status"] for b in pbs}}
+                     "N": Nb, "K": len(bank[0][0][0]), "spec": spec, "problems": bprobs, "label": bank_label,
+                     "plan": {"path": os.path.abspath(a.bank_plan), "sha256": sha256(a.bank_plan)} if a.bank_plan else None,
+                     "status": {f"{g_}/{c_}": b["status"] for (g_, c_), b in byk.items()}}
         for w in a.bank_worlds.split(","):
             for c0 in range(0, a.bank_sims, a.chunk):
                 sd += 1
@@ -892,33 +1264,62 @@ def main(argv=None):
     cfg = {"blocks": {k_: {"z": blocks[k_]["z"], "zq": blocks[k_].get("zq")} for k_ in a.key}, "kinds": kinds,
            "B": a.B, "design_B": a.design_B, "omnibus_B": a.omnibus_B, "bnull_B": a.bnull_B, "plants": plants,
            "omni_plants": oplants, "seed": a.seed, "pilot_k": a.pilot_k, "rho": rho, "bdesign_B": a.bdesign_B,
-           "omni_tests": a.omnibus_tests, "bank": bank, "bank_plants": bank_plants, "bank_zq": bank_zq}
+           "omni_tests": a.omnibus_tests, "bank": bank, "bank_plants": bank_plants, "bank_zq": bank_zq,
+           "bank_label": bank_label}
     acc = {}
     with multiprocessing.Pool(a.workers, initializer=_init, initargs=(cfg,)) as pool:
         it = pool.imap_unordered(_dispatch, [(fn_name, args) for fn_name, args in tasks])
-        for done, (gk, cnt, n) in enumerate(it, 1):
-            g = acc.setdefault(gk, [{}, 0])
+        for done, (gk, cnt, n, *st) in enumerate(it, 1):
+            g = acc.setdefault(gk, [{}, 0, {}])
             for t, v in cnt.items():
                 g[0][t] = g[0].get(t, 0) + v
             g[1] += n
+            if st:
+                merge_stats(g[2], st[0])
             if done % 20 == 0 or done == len(tasks):
                 print(f"{done}/{len(tasks)} chunks", flush=True)
-    rows = []
+    rows, drows = [], []
     Bs = {"pilot": a.B, "design": a.design_B, "omnibus": a.omnibus_B, "bnull": a.bnull_B, "bdesign": a.bdesign_B,
           "bank": a.omnibus_B, "compound": 0}
-    for (key, scale, w, N, k, Gn, C), (cnt, n) in sorted(acc.items()):
+    for (key, scale, w, N, k, Gn, C), (cnt, n, st) in sorted(acc.items()):
         for (test, effect, alpha), v in sorted(cnt.items()):
             rate = v / n
             lo, hi = hodge.clopper_pearson(v, n)
             rows.append({"key": key, "scale": scale, "world": w, "N": N, "k": k, "G": Gn, "C": C, "test": test,
                          "effect": effect, "alpha": alpha, "x": v, "n": n, "rate": rate, "cp_lo": lo, "cp_hi": hi,
                          "B": Bs[scale]})
+        for (q, effect), (m_, s1, s2, mn, mx) in sorted(st.items()):
+            mu_ = s1 / m_
+            drows.append({"key": key, "scale": scale, "world": w, "N": N, "k": k, "G": Gn, "C": C, "quantity": q,
+                          "effect": effect, "n": m_, "mean": mu_,
+                          "sd": math.sqrt(max(0.0, (s2 - m_ * mu_ * mu_) / (m_ - 1))) if m_ > 1 else 0.0,
+                          "min": mn, "max": mx})
+    if not drows and os.path.exists(os.path.join(a.out, "diag.csv")):
+        os.remove(os.path.join(a.out, "diag.csv"))   # (a stale one from an earlier run in OUTDIR)
+    if drows:   # the compound world's diagnostics: what each alternative planted, how feasible its moments were
+        with open(os.path.join(a.out, "diag.csv"), "w", newline="") as f:
+            w_ = csv.DictWriter(f, fieldnames=list(drows[0]))
+            w_.writeheader()
+            for r in drows:
+                w_.writerow({c: (repr(v) if isinstance(v, float) else v) for c, v in r.items()})
     with open(os.path.join(a.out, "calib.csv"), "w", newline="") as f:
         w_ = csv.DictWriter(f, fieldnames=list(rows[0]))
         w_.writeheader()
         for r in rows:
             w_.writerow({c: (repr(v) if isinstance(v, float) else v) for c, v in r.items()})
     md = report(a, bj, blocks, rows, plants, oplants, kinds, worlds, design, omni, rho)
+    if drows:
+        md.append("\n## Compound world diagnostics (diag.csv): what each variant planted, how feasible its moments were\n")
+        md.append("d_add = RMS added circulation per pair (after clipping); d_res = the noiseless residual RMS per pair "
+                  "after refitting the logistic model (the signal beyond the logistic family that H1b tests). "
+                  "'nominal' plants are the old probability-scale ones (clipped to [0.002, 0.998]); 'feasible plant "
+                  "d_res=x' plants a logit-scale cycle solved to d_res = x. Null means are never clipped.\n")
+        md.append("| world | N:k:G:C | quantity | effect | n | mean | min | max |\n|---|---|---|---|---|---|---|---|")
+        for r in drows:
+            md.append(f"| {r['world']} | {r['N']}:{r['k']}:{r['G']}:{r['C']} | {r['quantity']} | {r['effect']} | {r['n']} | "
+                      f"{r['mean']:.6g} | {r['min']:.6g} | {r['max']:.6g} |")
+    if bank_info and bank_info["problems"]:
+        md.append("\n**EXPLORATORY bank (not the registered specification):** " + "; ".join(bank_info["problems"]) + "\n")
     open(os.path.join(a.out, "calib.md"), "w").write("\n".join(md) + "\n")
     man = {"schema": "finfolk.invasion.calibration/1",
            "blocks": {"path": os.path.abspath(a.blocks), "sha256": blocks_sha,
@@ -929,7 +1330,8 @@ def main(argv=None):
            "primary": infer.PRIMARY, "args": vars(a), "seed": a.seed, "task_seeds": [t[1][-1] for t in tasks],
            "assay_corr": rho, "python": platform.python_version(), "wall_s": time.time() - t0, "bank": bank_info,
            "alpha_family": bounded.ALPHA_FAMILY,
-           "outputs": {f: sha256(os.path.join(a.out, f)) for f in ("calib.csv", "calib.md")}}
+           "outputs": {f: sha256(os.path.join(a.out, f)) for f in ("calib.csv", "calib.md", "diag.csv")
+                       if os.path.exists(os.path.join(a.out, f))}}
     with open(os.path.join(a.out, "manifest.json"), "w") as f:
         f.write(json.dumps(man, indent=1, sort_keys=True, default=str) + "\n")
     print("\n".join(md))
