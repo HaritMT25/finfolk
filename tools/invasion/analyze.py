@@ -303,7 +303,8 @@ def run_rows(recs, gens, windows, tol, clock="gens"):
 
     clock 'gens': a window G is G x the RESIDENT's generation length (g_pop of its shams), so the
     two directions of a pair run for different numbers of steps. clock 'steps' (the stats spec's
-    primary horizon): a window is one common fixed number of steps W = G for every run; the
+    primary horizon): a window is one common fixed number of steps W = G for every run, read only
+    at a checkpoint at exactly step W (tolerance 0, whatever --max-window-error says); the
     realized turnover g = births / start population at W is reported per run (column gens).
 
     Extinction (stats spec section 2): the live mean is undefined when no fish is left; the
@@ -316,7 +317,9 @@ def run_rows(recs, gens, windows, tol, clock="gens"):
             continue
         for G in windows:
             W = G * g["g"] if clock == "gens" else float(G)
-            p = pick(r, W, tol)
+            # a fixed-step window is read at exactly W or not at all (review round 3: the nearest
+            # checkpoint within 10% gave every registered schedule its own exposure)
+            p = pick(r, W, tol if clock == "gens" else 0.0)
             base = {**{k: r[k] for k in ("id", "j", "i", "mode", "frac", "cond", "rep", "n0", "m", "f0")},
                     "G": G, "W": W, "last_steps": r["points"][-1]["steps"]}
             if p is None:
@@ -644,7 +647,8 @@ def primary_p(d):
     return d.get("p_lof_flip") if infer.PRIMARY["test"] == "signflip" else d.get("p_lof")
 
 
-def matrices(rows, meta=None, zmin=2.0, sims=9999, registry=None, kind=infer.DEFAULT_KIND, seed=5, dG=None):
+def matrices(rows, meta=None, zmin=2.0, sims=9999, registry=None, kind=infer.DEFAULT_KIND, seed=5, dG=None,
+             cores=None, windows_registered=None):
     """Complete blocks (every ordered pair + every sham, on common replicates): per condition,
     fraction and window, separately (pooling conditions can fake cycles).
 
@@ -707,6 +711,12 @@ def matrices(rows, meta=None, zmin=2.0, sims=9999, registry=None, kind=infer.DEF
                 status = "descriptive: no complete matrix registered"
         else:
             status = "descriptive: no plan given" if registry is None else "descriptive: nothing registered"
+        if status == "formal" and cores and set(names) != {x for key in reg for x in key[:2]}:
+            # a plan of separate cores registers no pooled matrix: its largest complete clique is one
+            # core, which primary_blocks() analyses with the others (review round 3)
+            status = "descriptive: the plan registers separate cores (see the primary blocks)"
+        if status == "formal" and windows_registered is not None and G not in windows_registered:
+            status = "descriptive: window not in the horizon registration"
         if status != "formal":
             names = _largest_complete({nm for ij in cell for nm in ij}, lambda a_, b_: (a_, b_) in cell)
             if len(names) < 3:
@@ -859,15 +869,10 @@ def omnibus(blocks, registry, meta, sims, seed, kind):
     p-value (review round 2: a registered four-condition omnibus could silently become a
     three-condition test). Without a plan there is no registered set, so nothing is formal.
 
-    Two structures:
-      'pooled block x assays'  the full block of every condition; a unit (p, r) shares its slot
-                               and donor seeds across conditions, so units are resampled /
-                               sign-flipped JOINTLY: F = sum T_C / sum tau_C
-      'home-regime sub-blocks x assays (regimes independent)'
-                               the stats spec's primary structure: one matrix per home regime
-                               (both competitors from it) and assay. The regime sub-blocks share
-                               no unit (other residents, other seeds), so they are independent
-                               groups (infer.infer_groups), each with its assays joint."""
+    'pooled block x assays': the full block of every condition; a unit (p, r) shares its slot and
+    donor seeds across conditions, so units are resampled / sign-flipped JOINTLY: F = sum T_C /
+    sum tau_C. The stats spec's primary structure (one matrix per home regime x assay, regimes
+    independent) is primary_blocks(), built explicitly per regime."""
     joint = []
     for frac, G in sorted({(f_, g_) for _, f_, g_ in blocks}):
         have = {c_: b for (c_, f_, g_), b in blocks.items() if (f_, g_) == (frac, G)}
@@ -896,19 +901,168 @@ def omnibus(blocks, registry, meta, sims, seed, kind):
                       "F_lof": inf["F_C"], "p_lof": inf["p_lof"], "p_lof_flip": inf["p_lof_flip"],
                       "F_sym": inf["F_S"], "p_sym": inf["p_sym"], "p_sym_flip": inf["p_sym_flip"],
                       "flip_min_p": inf["flip_min_p"]})
-        regs = sorted(set.intersection(*[set(b.get("regime_blocks", {})) for _, b in fb])) if meta else []
-        if len(regs) >= 2:
-            groups = [[b["regime_blocks"][rg]["z"] for _, b in fb] for rg in regs]
-            ig = infer.infer_groups(groups, B=sims, seed=seed, kind=kind)
-            joint.append({**base, "structure": "home-regime sub-blocks x assays (regimes independent)",
-                          "groups": " | ".join(f"{rg}: {' '.join(fb[0][1]['regime_blocks'][rg]['names'])}" for rg in regs),
-                          "n": " ".join(str(x) for x in ig["N"]), "k": ig["k"][0],
-                          "F_lof": ig["F_C"], "p_lof": ig["p_lof"], "p_lof_flip": ig["p_lof_flip"],
-                          "F_sym": ig["F_S"], "p_sym": ig["p_sym"], "p_sym_flip": ig["p_sym_flip"],
-                          "flip_min_p": ig["flip_min_p"]})
+    # (the home-regime x assay omnibus is primary_blocks(): explicit per-regime matrices, review
+    # round 3, no longer sub-blocks of whichever pooled clique was complete)
     for j_ in joint:
         j_["p_primary"] = primary_p(j_)
     return joint
+
+
+def cores_from_plan(plan):
+    """{core: sorted items} from cells that carry a 'core' (plan.py "cores"), else None."""
+    cores = {}
+    for c in (plan or {}).values():
+        if c.get("core"):
+            cores.setdefault(c["core"], set()).add(c["resident_name"])
+            if c["mode"] == "invade":
+                cores[c["core"]].add(c["invader_name"])
+    return {k: sorted(v) for k, v in cores.items()} or None
+
+
+def primary_blocks(rows, meta, registry, cores, sims, seed=5, kind=infer.DEFAULT_KIND, windows_registered=None,
+                   bsims=0):
+    """The stats spec's primary matrices, built EXPLICITLY per home regime and condition (review
+    round 3: they used to be sub-blocks of the one largest complete pooled clique, so two disjoint
+    complete regime cores kept only one regime).
+
+    Groups: the plan's registered cores (plan.py "cores") when it has them; for a legacy plan, the
+    home regimes of --meta, each reduced to its largest complete registered clique WITHIN the
+    regime (eligibility never depends on cross-home cells). A registered core must be registered
+    as a complete matrix; a block is formal when every registered cell of it is finished on the
+    registered replicates and its window is registered (fixed steps: the horizon file).
+
+    Per (fraction, window) the primary omnibus needs every registered condition x every group
+    formal, with the same items and replicates across a group's conditions:
+      H1   the raw grouped omnibus (infer.infer_groups: regimes independent, assays joint);
+      H1b  the frozen co-primary, bounded.residual_omnibus: four separate logistic mean fits, the
+           grouped sign-flip of the projected residual replicate vectors (and, with bsims > 0, the
+           joint refitting bootstrap beside it);
+      claim "cyclic beyond bounded logistic transitivity" iff both p <= bounded.ALPHA_FAMILY
+           (= 0.05/12: hypotheses 1-11 + 1b, Holm; sufficient for both whatever their order).
+    A group with k > 16 replicates is exported only (the enumeration of sign patterns is limited
+    to 16; an error bank is resampled by calibrate.py, not tested). -> (rows, blocks, joint rows)."""
+    if cores:
+        groups, source = {g: list(v) for g, v in cores.items()}, "registered cores"
+    elif meta:
+        groups = {}
+        for nm, m_ in meta.items():
+            groups.setdefault(str(m_.get("regime")), []).append(nm)
+        source = "legacy plan: the largest complete registered clique within each home regime"
+    else:
+        return [], {}, []
+    rk = lambda a_, b_: (a_, b_, "sham" if a_ == b_ else "invade")   # noqa: E731
+    prows, pblocks = [], {}
+    keys = sorted({(x["cond"], x["frac"], x["G"]) for x in rows})
+    for cond, frac, G in keys:
+        cell = {}
+        for x in rows:
+            if (x["cond"], x["frac"], x["G"]) == (cond, frac, G) and x["mode"] in ("invade", "sham") and x["s"] is not None:
+                cell.setdefault((x["i"], x["j"]), {})[x["rep"]] = x
+        reg = registry.get((cond, frac)) if registry is not None else None
+        for gname in sorted(groups):
+            items = sorted(groups[gname])
+            status, names, reps = None, [], []
+            if not reg:
+                status = "descriptive: no plan given" if registry is None else "descriptive: nothing registered"
+            else:
+                inreg = [x for x in items if any(x in key[:2] for key in reg)]
+                if not inreg:
+                    continue
+                if cores:
+                    names = items
+                    if any(rk(a_, b_) not in reg for a_ in names for b_ in names):
+                        status = f"descriptive: core {gname} is not registered as a complete matrix"
+                else:
+                    names = _largest_complete(inreg, lambda a_, b_: rk(a_, b_) in reg)
+                if status is None:
+                    if len(names) < 3:
+                        status = "descriptive: fewer than 3 registered items"
+                    else:
+                        R = sorted(set.intersection(*[reg[rk(a_, b_)] for a_ in names for b_ in names]))
+                        miss = [(a_, b_, r) for a_ in names for b_ in names for r in R if r not in cell.get((a_, b_), {})]
+                        if not miss and len(R) >= 2:
+                            status, reps = "formal", R
+                        else:
+                            status = f"descriptive: {len(miss)} of {len(names) ** 2 * len(R)} registered cells missing"
+            if status == "formal" and windows_registered is not None and G not in windows_registered:
+                status = "descriptive: window not in the horizon registration"
+            if status != "formal":
+                avail = [x for x in items if any(x in ij for ij in cell)]
+                names = _largest_complete(avail, lambda a_, b_: (a_, b_) in cell)
+                reps = sorted(set.intersection(*[set(cell[(a_, b_)]) for a_ in names for b_ in names])) \
+                    if len(names) >= 3 else []
+            base = {"cond": cond, "frac": frac, "G": G, "group": gname, "source": source, "status": status,
+                    "n": len(names), "k": len(reps), "names": " ".join(names)}
+            if len(names) < 3 or len(reps) < 2:
+                prows.append(base)
+                continue
+            n = len(names)
+            z = [[[cell[(names[i], names[p])][r]["s"] - cell[(names[p], names[p])][r]["s"] if i != p else 0.0
+                   for i in range(n)] for r in reps] for p in range(n)]
+            zq = [[[cell[(names[i], names[p])][r]["s"] + cell[(names[i], names[p])][r]["f0"] if i != p else 0.0
+                    for i in range(n)] for r in reps] for p in range(n)]
+            formal = status == "formal"
+            row = dict(base)
+            fitres = None
+            if len(reps) <= 16:
+                inf = infer.infer([z], B=sims, seed=seed, kind=kind)
+                row.update({"cyclic_share": inf["share_raw"], "noise_corrected": inf["share_nc"],
+                            "share_ci95_lo": inf["share_ci95"][0], "share_ci95_hi": inf["share_ci95"][1],
+                            "dC": inf["dC"], "F_lof": inf["F_C"],
+                            "p_lof": inf["p_lof"] if formal else None, "p_lof_flip": inf["p_lof_flip"] if formal else None})
+                row["p_primary"] = primary_p(row)
+                if n * (n - 1) - bounded.Model(bounded.CO_PRIMARY_MODEL, n).P >= (n - 1) * (n - 2) // 2:
+                    vecs, fitres = bounded.residual_replicate_vectors(zq)
+                    R_C = bounded.energies(bounded._sub(bounded._means(zq), fitres["F"]))[1]
+                    row.update({"R_C_logistic": R_C, "F_res": infer._ratio(R_C, infer.block_stats(zq)["tauC"]),
+                                "p_res_flip": infer.flip_p_vectors([vecs]) if formal else None})
+            else:
+                row["note"] = "k > 16: exported (blocks.json), not tested"
+            pblocks[(cond, frac, G, gname)] = {"cond": cond, "frac": frac, "G": G, "group": gname, "names": names,
+                                               "reps": reps, "z": z, "zq": zq, "status": status, "fit": fitres}
+            prows.append(row)
+    pjoint = []
+    for frac, G in sorted({(k_[1], k_[2]) for k_ in pblocks}):
+        if registry is None:
+            conds = sorted({k_[0] for k_ in pblocks if (k_[1], k_[2]) == (frac, G)})
+            why = "descriptive: no plan given (no registered condition set)"
+        else:
+            conds = sorted({c_ for (c_, f_) in registry if f_ == frac})
+            why = None
+        gnames = sorted({k_[3] for k_ in pblocks if (k_[1], k_[2]) == (frac, G)} |
+                        (set(cores) if cores else set()))
+        miss = [f"{c_}/{g_}" for c_ in conds for g_ in gnames
+                if (c_, frac, G, g_) not in pblocks or pblocks[(c_, frac, G, g_)]["status"] != "formal"]
+        if why is None and miss:
+            why = f"descriptive: primary block(s) {' '.join(miss)} not formal"
+        if why is None and len(gnames) * len(conds) < 2:
+            why = "descriptive: fewer than two primary blocks"
+        if why is None:
+            for g_ in gnames:
+                bs = [pblocks[(c_, frac, G, g_)] for c_ in conds]
+                if any(b["names"] != bs[0]["names"] or b["reps"] != bs[0]["reps"] for b in bs):
+                    why = f"descriptive: group {g_}'s conditions differ in items or replicates"
+                elif len(bs[0]["reps"]) > 16:
+                    why = "export only: k > 16 (an error bank; calibrate.py resamples it)"
+        row = {"frac": frac, "G": G, "structure": "primary: home-regime x assay matrices (regimes independent)",
+               "groups": " | ".join(f"{g_}: {' '.join(pblocks[(conds[0], frac, G, g_)]['names']) if (conds and (conds[0], frac, G, g_) in pblocks) else '-'}" for g_ in gnames),
+               "conditions": " ".join(conds), "required": " ".join(f"{c_}/{g_}" for c_ in conds for g_ in gnames),
+               "status": why or "formal", "boot": f"{kind} x {sims}"}
+        if why is None:
+            gz = [[pblocks[(c_, frac, G, g_)]["z"] for c_ in conds] for g_ in gnames]
+            ig = infer.infer_groups(gz, B=sims, seed=seed, kind=kind)
+            gq = [[pblocks[(c_, frac, G, g_)]["zq"] for c_ in conds] for g_ in gnames]
+            fits = [[pblocks[(c_, frac, G, g_)]["fit"] for c_ in conds] for g_ in gnames]
+            ro = bounded.residual_omnibus(gq, B=bsims, seed=seed, kind=kind,
+                                          fits=fits if all(f_ for fs in fits for f_ in fs) else None)
+            row.update({"n": " ".join(str(x) for x in ig["N"]), "k": ig["k"][0], "F_lof": ig["F_C"],
+                        "p_lof": ig["p_lof"], "p_lof_flip": ig["p_lof_flip"], "flip_min_p": ig["flip_min_p"],
+                        "F_sym": ig["F_S"], "p_sym": ig["p_sym"], "p_sym_flip": ig["p_sym_flip"],
+                        "F_res_joint": ro["F_res_joint"], "p_res_flip": ro["p_flip"], "p_res_boot": ro["p_boot"]})
+            row["p_primary"] = primary_p(row)
+            row["claim_beyond_bounded"] = (row["p_primary"] <= bounded.ALPHA_FAMILY and ro["p_flip"] <= bounded.ALPHA_FAMILY)
+        pjoint.append(row)
+    return prows, pblocks, pjoint
 
 
 def _key_rows(rows, key):
@@ -1240,17 +1394,63 @@ def main(argv=None):
             dG, dW = genetic_dissimilarity(paths)
             prov["genetic_dissimilarity"] = {"snapshots": sorted(paths), "samples": 4000,
                                              "within": dW}
-    mats, mdet, blocks, joint, subs = matrices(rows, meta, sims=a.sims, registry=registry, kind=a.kind, dG=dG)
+    cores = cores_from_plan(plan)
+    # fixed steps: formal decisions only at the registered horizon (T and 2T of --horizon)
+    windows_registered = None
+    if a.clock == "steps":
+        windows_registered = {float(horizon["T"]), float(horizon["T2"])} if horizon else set()
+        prov["windows_registered"] = sorted(windows_registered)
+    mats, mdet, blocks, joint, subs = matrices(rows, meta, sims=a.sims, registry=registry, kind=a.kind, dG=dG,
+                                               cores=cores, windows_registered=windows_registered)
+    prows, pblocks, pjoint = primary_blocks(rows, meta, registry, cores, a.sims, kind=a.kind,
+                                            windows_registered=windows_registered, bsims=a.bounded_sims)
+    prov["cores"] = cores
     scales = [x for x in a.scales.split(",") if x]
     models = [x for x in a.bounded.split(",") if x]
     srows, mrows = scale_sensitivity(rows, blocks, scales, models, a.sims, a.bounded_sims, kind=a.kind) \
         if blocks and (scales or models) else ([], [])
-    for m in mats + joint + subs + srows + mrows:
+    for m in mats + joint + subs + srows + mrows + prows + pjoint:
         m.update(ident)
-    # the units of every block (for calibrate.py: null rejection and power through the same tests)
+    # the units of every block (for calibrate.py: null rejection and power through the same tests),
+    # and of every primary (home-regime x condition) block: the error bank's export
     with open(os.path.join(a.out, "blocks.json"), "w") as f:
-        json.dump({"schema": "finfolk.invasion.blocks/1", **ident, "clock": a.clock,
-                   "blocks": [{"cond": c_, "frac": f_, "G": g_, **b} for (c_, f_, g_), b in sorted(blocks.items())]}, f)
+        json.dump({"schema": "finfolk.invasion.blocks/2", **ident, "clock": a.clock,
+                   "blocks": [{"cond": c_, "frac": f_, "G": g_, **b} for (c_, f_, g_), b in sorted(blocks.items())],
+                   "primary_blocks": [{k_: v for k_, v in b.items() if k_ != "fit"}
+                                      for _, b in sorted(pblocks.items(), key=lambda kv: str(kv[0]))]}, f)
+    if prows:
+        write_csv(os.path.join(a.out, "primary.csv"), prows,
+                  ["cond", "frac", "G", "group", "source", "status", "n", "k", "names", "cyclic_share",
+                   "noise_corrected", "share_ci95_lo", "share_ci95_hi", "dC", "F_lof", "p_primary", "p_lof",
+                   "p_lof_flip", "R_C_logistic", "F_res", "p_res_flip", "note", "plan_sha256", "analysis_sha256"])
+    if pjoint:
+        write_csv(os.path.join(a.out, "primary_joint.csv"), pjoint,
+                  ["frac", "G", "structure", "status", "required", "conditions", "groups", "n", "k", "F_lof",
+                   "p_primary", "p_lof", "p_lof_flip", "flip_min_p", "F_sym", "p_sym", "p_sym_flip", "F_res_joint",
+                   "p_res_flip", "p_res_boot", "claim_beyond_bounded", "boot", "plan_sha256", "analysis_sha256"])
+    if prows or pjoint:
+        md.append("\n## Primary matrices: one per home regime x condition (stats spec), built explicitly\n")
+        md.append(f"Groups: {prows[0]['source'] if prows else ''}. A primary block is formal when every registered "
+                  "cell of it is finished on the registered replicates (and, with fixed steps, its window is the "
+                  "registered T or 2T, read exactly). The primary omnibus needs every registered condition x group "
+                  "formal: H1 = the raw grouped sign-flip omnibus (primary test; bootstrap beside it), H1b = the "
+                  "frozen co-primary (bounded.py: four separate logistic mean fits, grouped sign-flip of the "
+                  "projected residual replicate vectors; joint refitting bootstrap beside it). Claim 'cyclic beyond "
+                  f"bounded logistic transitivity' iff both p <= 0.05/12 = {bounded.ALPHA_FAMILY:.5f} (Holm family of "
+                  "12). Both sign-flips are exact only under joint central symmetry; H1b also only to first order in "
+                  "the fit; levels are calibrated by calibrate.py --compound.\n")
+        md.append("| condition | fraction | window | group | status | items | cyclic share | noise-corrected | d_C | F lof | p sign-flip | p boot | logistic residual F | p residual flip |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+        for r_ in prows:
+            md.append(f"| {r_['cond']} | {r_['frac']} | {r_['G']} | {r_['group']} | {r_['status'][:40]} | {r_['names']} | "
+                      f"{fmt(r_.get('cyclic_share'), 3)} | {fmt(r_.get('noise_corrected'), 3)} | {fmt(r_.get('dC'), 4)} | "
+                      f"{fmt(r_.get('F_lof'), 2)} | {fmt(r_.get('p_lof_flip'), 4)} | {fmt(r_.get('p_lof'), 4)} | "
+                      f"{fmt(r_.get('F_res'), 2)} | {fmt(r_.get('p_res_flip'), 4)} |")
+        md.append("\n| fraction | window | status | groups | H1: F lof | H1 p sign-flip (floor) | H1 p boot | H1b: F_res joint | H1b p sign-flip | H1b p boot | claim beyond bounded |\n|---|---|---|---|---|---|---|---|---|---|---|")
+        for j_ in pjoint:
+            md.append(f"| {j_['frac']} | {j_['G']} | {j_['status'][:60]} | {j_['groups']} | {fmt(j_.get('F_lof'), 2)} | "
+                      f"{fmt(j_.get('p_lof_flip'), 5)} ({fmt(j_.get('flip_min_p'), 5)}) | {fmt(j_.get('p_lof'), 4)} | "
+                      f"{fmt(j_.get('F_res_joint'), 2)} | {fmt(j_.get('p_res_flip'), 5)} | {fmt(j_.get('p_res_boot'), 4)} | "
+                      f"{j_.get('claim_beyond_bounded', '')} |")
     if mats:
         cols = ["cond", "frac", "G", "status", "plan_sha256", "analysis_sha256", "n", "k", "names", "ratings",
                 "invader_effect", "resident_effect", "cyclic_share", "noise_corrected", "share_ci95_lo",
