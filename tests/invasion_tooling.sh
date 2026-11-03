@@ -53,6 +53,8 @@
 #  23. exact fixed-step reads; formal only at registered windows;
 #  24. the co-primary decision: family threshold 0.05/12, H1 / H1b / claim calibration (from the
 #      pilot blocks, and from an error bank's own primary blocks: their fits, items and cell SDs).
+#  25. --prune: scored cells lose their checkpoints (hashes kept, births gzipped), analyses unchanged,
+#      byte-identical replay, a failed score check prunes nothing, the disk guard stops (fail closed).
 set -u
 BIN=${1:?usage: invasion_tooling.sh EVO_BOIDS WORKDIR}
 W=${2:?usage: invasion_tooling.sh EVO_BOIDS WORKDIR}
@@ -836,6 +838,85 @@ for g in range(2):
                 for p in range(4) for _r in range(3) for i in range(4) if i != p]
 assert len(seen) == len(exp) == 2 * 2 * 4 * 3 * 3, (len(seen), len(exp))
 assert all(abs(a - x) < 1e-12 and abs(b - y) < 1e-12 for (a, b), (x, y) in zip(seen, exp)), (seen[:3], exp[:3])
+PY
+
+# 25. pruning (the error bank's disk budget). A finished root is swept: every cell's arena, end and
+#     periodic checkpoints go after its score check, the birth log stays gzipped (lossless) and every
+#     deleted file's hash is recorded; the analysis of the pruned root equals the unpruned one's; a
+#     replay rebuilds a pruned cell byte for byte (and a wrong record is a mismatch); a cell whose
+#     score fails the check is left untouched; --prune runs prune new cells and leave no scratch
+#     files; the disk guard stops through the STOP path, failing closed
+cp -r root3dup root25 && cp -r root3dup root25c   # root3dup: step 7's complete 27-cell matrix, unpruned
+$PY "$T/run.py" --root root25 --prune-finished > p25.log 2>&1 || fail "run.py --prune-finished: $(tail -3 p25.log)"
+$PY - <<'PY' || fail "pruned cells: checkpoints gone, birth log gzipped losslessly, hashes recorded"
+import glob, gzip, hashlib, json, os
+cells = sorted(glob.glob("root25/cells/*/done.json"))
+assert len(cells) == 27, len(cells)
+for p in cells:
+    d, done = os.path.dirname(p), json.load(open(p))
+    pr, left = done["pruned"], set(os.listdir(d))
+    assert not any(f == "arena.json" or f.startswith("end.") or f == "run.births.csv" for f in left), left
+    assert {"score.json", "arena.manifest.json", "run.csv", "run.births.csv.gz", "cell.json"} <= left, left
+    assert pr["removed"]["arena.json"] == done["outputs"]["arena.json"] and pr["removed"]["end.json"] == done["outputs"]["end.json"]
+    assert len(pr["removed"]) == 3, pr["removed"]          # arena, end and the last step's duplicate of end.json
+    assert hashlib.sha256(gzip.open(os.path.join(d, "run.births.csv.gz")).read()).hexdigest() == done["outputs"]["run.births.csv"]
+    assert "--replay" in pr["replay"]
+PY
+$PY "$T/run.py" --root root25 --prune-finished > p25b.log 2>&1 && grep -q "0 finished cells pruned now, 27 already pruned" p25b.log \
+    || fail "a second sweep is not a no-op: $(tail -2 p25b.log)"
+$PY "$T/analyze.py" --root root25 --out an25 --plan plan3.jsonl --windows 0.25 --max-window-error 0.6 --no-power --sims 50 > an25.log 2>&1 \
+    || fail "analyze.py (pruned root): $(tail -5 an25.log)"
+cmp -s an3/matrix.csv an25/matrix.csv && cmp -s an3/runs.csv an25/runs.csv || fail "the pruned root analyses differently"
+$PY "$T/run.py" --root root25 --replay off_f100_B_A_r02 --out rp25 > rp25.log 2>&1 || fail "replay: $(tail -8 rp25.log)"
+grep -q "replay off_f100_B_A_r02: identical" rp25.log && cmp -s rp25/end.json root3dup/cells/off_f100_B_A_r02/end.json \
+    && cmp -s rp25/arena.json root3dup/cells/off_f100_B_A_r02/arena.json || fail "the replay is not byte-identical"
+$PY - <<'PY' || fail "tampering with a recorded hash"
+import json
+p = "root25/cells/off_f100_C_sham_r01/done.json"
+d = json.load(open(p)); d["outputs"]["end.json"] = "0" * 64; json.dump(d, open(p, "w"))
+PY
+$PY "$T/run.py" --root root25 --replay off_f100_C_sham_r01 --out rp25t > rp25t.log 2>&1
+[ $? = 8 ] && grep -q "DIFFERENT end.json" rp25t.log || fail "a replay against a wrong record did not report a mismatch"
+$PY "$T/run.py" --root root25 --replay off_f100_B_A_r02 --out rp25 > /dev/null 2>&1 && fail "replay into a non-empty --out"
+$PY - <<'PY' || fail "corrupting a score"
+import hashlib, json
+d = "root25c/cells/off_f100_A_B_r00"
+s = json.load(open(f"{d}/score.json")); s["derivation"]["ok"] = False
+open(f"{d}/score.json", "w").write(json.dumps(s, indent=1, sort_keys=True) + "\n")
+done = json.load(open(f"{d}/done.json"))
+done["outputs"]["score.json"] = hashlib.sha256(open(f"{d}/score.json", "rb").read()).hexdigest()
+json.dump(done, open(f"{d}/done.json", "w"))
+PY
+$PY "$T/run.py" --root root25c --prune-finished > p25c.log 2>&1
+[ $? = 1 ] && grep -q "NOT PRUNED off_f100_A_B_r00: score derivation not ok" p25c.log \
+    && [ -f root25c/cells/off_f100_A_B_r00/arena.json ] && [ -f root25c/cells/off_f100_A_B_r00/end.json ] \
+    && [ ! -f root25c/cells/off_f100_A_C_r00/arena.json ] || fail "a cell with a failed score check was pruned: $(tail -3 p25c.log)"
+$PY "$T/run.py" --plan plan.jsonl --root root25r --binary "$BIN" --workers 2 --prune > r25.log 2>&1 || fail "run.py --prune: $(tail -3 r25.log)"
+$PY "$T/run.py" --plan plan.jsonl --root root25r --binary "$BIN" --workers 2 --prune > r25b.log 2>&1
+grep -q "2 already done" r25b.log && grep -q "0 finished cells pruned now, 2 already pruned" r25b.log \
+    || fail "resume of pruned cells: $(tail -3 r25b.log)"
+$PY - <<'PY' || fail "cells pruned by the runner"
+import glob, json, os
+for p in glob.glob("root25r/cells/*/done.json"):
+    d, done = os.path.dirname(p), json.load(open(p))
+    assert "pruned" in done and done.get("tmp_files_left") == 0, done.keys()
+    assert not os.path.exists(f"{d}/tmp") and not os.path.exists(f"{d}/arena.json") and not os.path.exists(f"{d}/end.json"), os.listdir(d)
+assert len(glob.glob("root25r/cells/*/done.json")) == 2
+assert json.load(open("root25r/progress.json"))["prune"] is True
+PY
+$PY "$T/run.py" --plan plan.jsonl --root root25g --binary "$BIN" --workers 1 --disk-min "$W:999999999" > g25.log 2>&1
+[ $? = 75 ] && grep -q "disk guard" root25g/STOP && ! ls root25g/cells/*/done.json > /dev/null 2>&1 \
+    || fail "the disk guard did not stop the runner: $(tail -3 g25.log)"
+grep -q "stopped by the disk guard" root25g/progress.json || fail "progress.json lacks the disk guard's reason"
+rm -f root25g/STOP
+$PY "$T/run.py" --plan plan.jsonl --root root25g --binary "$BIN" --workers 1 --disk-min "$W/no_such_dir:1" > g25b.log 2>&1
+[ $? = 75 ] && grep -q "unreadable" root25g/STOP || fail "an unreadable disk reading did not fail closed"
+$PY - "$T" <<'PY' || fail "disk guard defaults"
+import os, sys
+sys.path.insert(0, sys.argv[1]); import run
+assert run.disk_guards(["none"], "/x") == [] and run.disk_guards(["/a:5", "/b/c:7"], "/x") == [("/a", 5), ("/b/c", 7)]
+assert run.disk_guards(None, "/x") == ([("/", 10240), ("/mnt/c", 6000)] if os.path.ismount("/mnt/c") else [("/x", 1024)])
+assert run.disk_problem([("/", 0)]) is None and "below" in run.disk_problem([("/", 1 << 40)])
 PY
 
 # 19. self-tests of the inference and bounded-scale modules
