@@ -55,6 +55,13 @@
  *     it), no seam unwrapping and no wrap jumps, the snow kept inside; off,
  *     the wrapping world as before. Any tank size: the camera's fit starts
  *     outside the box's bounding sphere and the far plane covers the depth
+ *   - the swim polish (POSE_GLSL, POLISH_FN; uPolish, on from detail 2): the
+ *     fish roll into their turns, the appearance fish's paired fins fold back
+ *     at speed (the renderer's estimate, fillApp), the tail's trailing edge
+ *     lags; on a fish big enough on screen to show it, thin fins let the
+ *     light through and glow against it, a wet highlight runs on the smooth
+ *     body, the genes' skin has a sheen at grazing angles, and backs near the
+ *     surface catch faint caustics. Display only, like everything here
  *
  * Big tanks: the sand, caustics and surface are world-unit procedural
  * patterns (no bitmap stretched over the area), so their grain and ripples
@@ -68,8 +75,9 @@
  *
  * Cost model: one instanced draw for all fish, one for their shadows, one each
  * for predators, food, currents and the floor. Per frame the CPU only packs
- * the spine points (20 floats per fish) into instance buffers; the bending,
- * shading and tail beat happen in the vertex/fragment shaders.
+ * the spine points (20 floats per fish) into instance buffers (and, for the
+ * appearance fish, a swimming-speed estimate: a merge by id, no allocation);
+ * the bending, shading, tail beat and swim pose happen in the shaders.
  *
  * World coordinates: sim (x right, y down, origin top-left) -> three
  * (X = x - W/2, Z = y - H/2, Y up = -depth).
@@ -361,20 +369,24 @@
    * seen against the light glows in its own colour (a view-dependent back
    * light, no texture). ns: the vertex stage's smooth normal (zero on fins:
    * the facet's) for a tight wet highlight, and in w its caustic light, kept
-   * to up-facing facets. k = (transmitted, caustic, highlight). */
+   * to up-facing facets. k = (transmitted, caustic, highlight). pw
+   * (polishAt): the polish's share at a point, by a fish's size on screen (a
+   * nominal 4.6-unit radius, in CSS px: none under 4 px, all from 9), so a far
+   * fish (most of a whole-tank view) keeps the old look and what it cost. */
   var POLISH_FN = [
-    "uniform float uPolish;",
+    "uniform float uPolish; uniform float uPxPerUnit;",
     "const vec3 P_SUN = vec3(1.0, 0.96, 0.86), P_WET = vec3(1.0, 0.98, 0.92), P_CAUS = vec3(0.70, 0.95, 0.84);",
+    "float polishAt(vec3 w) { return uPolish * smoothstep(4.0, 9.0, 4.6 * uPxPerUnit / max(length(cameraPosition - w), 1.0)); }",
     "float wrapDiff(float nl, float thin) { float w = 0.45 * thin; return max((nl + w) / (1.0 + w), 0.0); }",
-    "vec3 polishK(vec3 N, vec3 V, vec4 ns, float thin, float nl) {",
-    "  if (uPolish < 0.5) return vec3(0.0);",
+    "vec3 polishK(vec3 N, vec3 V, vec4 ns, float thin, float nl, float pw) {",
+    "  if (pw <= 0.0) return vec3(0.0);",
     "  vec3 Ns = ns.xyz; float l2 = dot(Ns, Ns);",
     "  Ns = l2 > 0.25 ? Ns * inversesqrt(l2) : N;",
     "  if (dot(Ns, V) < 0.0) Ns = N;",
     "  float s = clamp(dot(V, -normalize(uLight + 0.3 * N)), 0.0, 1.0); s *= s; s *= s;",
     "  float trans = thin * (0.40 * max(-nl, 0.0) + 0.60 * s);",
     "  float sp = pow(max(dot(Ns, normalize(uLight + V)), 0.0), 40.0) * 0.30 * (1.0 - 0.5 * thin);",
-    "  return vec3(trans, 1.0 * ns.w * max(N.y, 0.0), sp);",
+    "  return pw * vec3(trans, ns.w * max(N.y, 0.0), sp);",
     "}",
     "vec3 polishOn(vec3 b, vec3 k) { return b * (P_SUN * k.x + P_CAUS * k.y) + P_WET * k.z; }"
   ].join("\n");
@@ -401,11 +413,12 @@
     "  vec3 N = normalize(cross(dFdx(vWorld), dFdy(vWorld)));",
     "  vec3 V = normalize(cameraPosition - vWorld);",
     "  if (dot(N, V) < 0.0) N = -N;",
-    "  float thin = uPolish * (vPart > 0.5 && vPart < 1.5 ? 1.0 : 0.0);",   /* fins */
+    "  float pw = polishAt(vWorld);",
+    "  float thin = vPart > 0.5 && vPart < 1.5 ? 1.0 : 0.0;",   /* fins */
     "  float nl = dot(N, uLight);",
-    "  float diff = wrapDiff(nl, thin);",
+    "  float diff = wrapDiff(nl, pw * thin);",
     "  float rim = pow(1.0 - max(dot(N, V), 0.0), 3.0);",
-    "  vec3 pk = polishK(N, V, vNs, thin, nl);",
+    "  vec3 pk = polishK(N, V, vNs, thin, nl, pw);",
     "  vec3 b = baseOf(uBack);",
     "  vec3 col = lit(b, ambOf(N.y), diff, rim) + polishOn(b, pk);",
     "  float bk = beamOf(vWorld);",
@@ -601,10 +614,10 @@
        * grazing angles, a hue a little past the skin's own (vG0.x) that turns
        * with the angle, stronger on a pale unsaturated (silvery) skin, faint
        * on the fins */
-      "vec3 sheenOf(float ndv, float thin, float nl) {",
-      "  if (uPolish < 0.5) return vec3(0.0);",
+      "vec3 sheenOf(float ndv, float thin, float nl, float pw) {",
+      "  if (pw <= 0.0) return vec3(0.0);",
       "  float silver = (1.0 - vG0.y) * vG0.z, g = 1.0 - ndv; g *= g;",
-      "  return pHSV(pWrap01(vG0.x + 0.10 + 0.25 * g), 0.55, 1.0) * g * (0.12 + 0.30 * silver) * (1.0 - 0.6 * thin) * (0.55 + 0.45 * max(nl, 0.0));",
+      "  return pHSV(pWrap01(vG0.x + 0.10 + 0.25 * g), 0.55, 1.0) * (pw * g * (0.12 + 0.30 * silver) * (1.0 - 0.6 * thin) * (0.55 + 0.45 * max(nl, 0.0)));",
       "}",
       /* the family / brain colour (vPart.w = 0xRRGGBB) through FISH_FS's base
        * stage; oy = the legacy template's height in body radii */
@@ -636,12 +649,12 @@
       "  vec3 N = normalize(cross(dFdx(vWorld), dFdy(vWorld)));",
       "  vec3 V = normalize(cameraPosition - vWorld);",
       "  if (dot(N, V) < 0.0) N = -N;",
-      "  float thin = uPolish * thinOf(fin, u);",
+      "  float pw = polishAt(vWorld), thin = thinOf(fin, u);",
       "  float nl = dot(N, uLight);",
-      "  float diff = wrapDiff(nl, thin);",
+      "  float diff = wrapDiff(nl, pw * thin);",
       "  float rim = pow(1.0 - max(dot(N, V), 0.0), 3.0);",
-      "  vec3 pk = polishK(N, V, vNs, thin, nl);",
-      "  vec3 sheen = fin != 4 && uColourBy < 0.5 ? sheenOf(max(dot(N, V), 0.0), thin, nl) : vec3(0.0);",
+      "  vec3 pk = polishK(N, V, vNs, thin, nl, pw);",
+      "  vec3 sheen = fin != 4 && uColourBy < 0.5 ? sheenOf(max(dot(N, V), 0.0), thin, nl, pw) : vec3(0.0);",
       "  vec3 col = lit(base, ambOf(N.y), diff, rim) + polishOn(base, pk) + sheen;",
       "  float bk = beamOf(vWorld);",
       /* in the flashlight's clear light: the true colours, the same in any water (the skin never sees the water) */
@@ -1143,7 +1156,7 @@
     gl.uniform3fv(uni("uAmbLo"), W.ambLo[0]); gl.uniform3fv(uni("uAmbHi"), W.ambHi[0]); gl.uniform3fv(uni("uVivid"), W.vivid[0]);
     gl.uniform1f(uni("uBeamOn"), 0); gl.uniform3fv(uni("uBeamDir"), [0, -1, 0]); gl.uniform1f(uni("uBeamTan"), 0.2); gl.uniform1f(uni("uBeamReach"), 1000);
     gl.uniform1f(uni("uIntrinsic"), 0); gl.uniform3fv(uni("cameraPosition"), [0, 10, 0]);
-    gl.uniform1f(uni("uPolish"), 1);
+    gl.uniform1f(uni("uPolish"), 1); gl.uniform1f(uni("uPxPerUnit"), 1e4);   /* the polish whole (polishAt 1) */
     gl.viewport(0, 0, S, S);
     gl.disable(gl.DEPTH_TEST); gl.disable(gl.BLEND); gl.disable(gl.SCISSOR_TEST); gl.disable(gl.CULL_FACE); gl.colorMask(true, true, true, true);
     gl.bindBuffer(gl.PIXEL_PACK_BUFFER, pbo);
@@ -1777,7 +1790,10 @@
       /* the tank's sides: 1 = glass walls (setWorld), 0 = wrapping */
       uWalls: { value: 0 },
       /* the swim polish (POSE_GLSL, POLISH_FN): 1 from detail 2 up (setQuality), 0 below */
-      uPolish: { value: 1 }
+      uPolish: { value: 1 },
+      /* CSS px per world unit at distance 1 (render: the canvas height / (2 tan(fov / 2))):
+       * the barbels' minimum width, the polish's share by a fish's size on screen */
+      uPxPerUnit: { value: 500 }
     };
     function beamUniforms(u) {
       u.uBeamOn = common.uBeamOn; u.uBeamDir = common.uBeamDir;
@@ -1838,7 +1854,7 @@
       uHalf: common.uHalf, uTime: common.uTime, uFog: common.uFog, uFogDensity: common.uFogDensity,
       uLight: common.uLight, uWag: { value: reduced ? 0 : 1 }, uSelect: { value: v3(C.select) },
       uDepth: common.uDepth, uLightOn: common.uLightOn, uL0: common.uL0, uKWater: common.uKWater,
-      uWalls: common.uWalls, uPolish: common.uPolish
+      uWalls: common.uWalls, uPolish: common.uPolish, uPxPerUnit: common.uPxPerUnit
     });
     var fishMat = new THREE.ShaderMaterial({ vertexShader: FISH_VS, fragmentShader: FISH_FS,
                                              uniforms: fishUniforms, side: THREE.DoubleSide });
@@ -1927,7 +1943,7 @@
         uHalf: common.uHalf, uTime: common.uTime, uFog: common.uFog, uFogDensity: common.uFogDensity,
         uLight: common.uLight, uWag: fishUniforms.uWag, uSelect: fishUniforms.uSelect,
         uDepth: common.uDepth, uLightOn: common.uLightOn, uL0: common.uL0, uKWater: common.uKWater,
-        uIntrinsic: { value: 0 }, uPxPerUnit: { value: 500 }, uColourBy: { value: 0 },
+        uIntrinsic: { value: 0 }, uPxPerUnit: common.uPxPerUnit, uColourBy: { value: 0 },
         uGenes: { value: null }, uRingT: { value: new Float32Array(16) }, uRingN: { value: 0 }, uHalfRing: { value: 4 },
         uWalls: common.uWalls, uPolish: common.uPolish
       });
@@ -2528,8 +2544,6 @@
         if (R[ST * c + MO + 26] > 0.2) barbels = true;
       }
       profiler.endCpu(SP.appearanceRows, tg);
-      var tanHalf = Math.tan(camera.fov * Math.PI / 360);
-      appKind.mat.uniforms.uPxPerUnit.value = ch / (2 * tanHalf);
       appKind.mat.uniforms.uColourBy.value = appSkin ? 0 : 1;
       appKind.commit(n, barbels);
       if (profiler.active) {
@@ -2838,6 +2852,7 @@
       if (hoverIdx === sel) hoverIdx = -1;
       canvas.style.cursor = hoverIdx >= 0 ? "pointer" : "";
       pt = profiler.lap(SP.cameraPick, pt);
+      common.uPxPerUnit.value = ch / (2 * Math.tan(camera.fov * Math.PI / 360));
       fillFish(s, sel, hoverIdx);
       pt = profiler.lap(SP.fishPack, pt);
       fillPreds(s);
