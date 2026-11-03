@@ -44,7 +44,14 @@
 #      raw-scale curl that the bounded model removes; a planted cycle survives;
 #  18. the common fixed-step clock reads every run at the same step; horizon.py
 #      calibrates T on a cell selection; an extinct read scores s = -f0;
-#  19. infer.py and bounded.py self-tests (grouped omnibus, Gray-code flips).
+#  19. infer.py and bounded.py self-tests (grouped omnibus, Gray-code flips; the co-primary;
+#      the Aranda-Ordaz link at small lambda);
+#  Review round 3:
+#  20. the error-bank planner: cores, indexed seeds, seed-overlap refusal; the progress file;
+#  21. bank resampling WITH replacement (full noise energy); the bank omnibus mode;
+#  22. explicit home-regime primary blocks (two disjoint cores; a missing primary cell);
+#  23. exact fixed-step reads; formal only at registered windows;
+#  24. the co-primary decision: family threshold 0.05/12, H1 / H1b / claim calibration.
 set -u
 BIN=${1:?usage: invasion_tooling.sh EVO_BOIDS WORKDIR}
 W=${2:?usage: invasion_tooling.sh EVO_BOIDS WORKDIR}
@@ -507,9 +514,14 @@ rows2 = [x for x in rows if x["cond"] != "predB"]
 out, detail, blocks, joint, subs = analyze.matrices(rows2, meta, sims=49, registry={("off", 0.05): reg[("off", 0.05)],
                                                     ("predA", 0.05): reg[("predA", 0.05)]}, kind="residual")
 kinds = {j["structure"]: j for j in joint}
-assert set(kinds) == {"pooled block x assays", "home-regime sub-blocks x assays (regimes independent)"}, kinds
+assert set(kinds) == {"pooled block x assays"}, kinds
 assert all(j["status"] == "formal" and j["p_lof"] is not None for j in joint), joint
-assert kinds["home-regime sub-blocks x assays (regimes independent)"]["flip_min_p"] == 1 / 16
+# the home-regime x assay omnibus is now the explicit primary one (test 22)
+for r in rows2:
+    r["f0"] = 0.05
+pr, pb, pj = analyze.primary_blocks(rows2, meta, {("off", 0.05): reg[("off", 0.05)], ("predA", 0.05): reg[("predA", 0.05)]},
+                                    None, 49)
+assert len(pj) == 1 and pj[0]["status"] == "formal" and pj[0]["flip_min_p"] == 1 / 16, pj
 # without a plan nothing is formal
 out, detail, blocks, joint, subs = analyze.matrices(rows2, meta, sims=49, registry=None, kind="residual")
 assert all(j.get("p_lof") is None for j in joint) and all(s["p_lof"] is None for s in subs)
@@ -656,6 +668,134 @@ $PY - <<'PY' || fail "the runner's progress file"
 import json
 p = json.load(open("root3/progress.json"))
 assert p["total"] == 27 and p["state"] == "all done" and p["failed"] == [] and p["workers"] == 2, p
+PY
+
+# 21. review round 3, P1-1: generating k-unit datasets from a K-unit bank must give the means the
+#     bank's noise (iid draws, WITH replacement, variance restored); k of K without replacement
+#     keeps only (1 - k/K) of it (here 0.75) and is only a labelled diagnostic
+$PY - "$T" <<'PY' || fail "empirical bank resampling"
+import random, sys
+sys.path.insert(0, sys.argv[1]); import calibrate, infer
+rnd = random.Random(21)
+N, K, k = 4, 40, 10
+bank = [[[0.0 if i == p else rnd.gauss(0, 1) for i in range(N)] for _ in range(K)] for p in range(N)]
+res = infer.residual_units(bank)
+target = sum(sum(x * x for x in u) for col in res for u in col) / K / k   # sum over columns of tr(S_K) / k (S_K: n-1)
+def energy(world, n=4000):
+    w = calibrate.World(bank, world, k=k)
+    tot = 0.0
+    for _ in range(n):
+        z = w.draw(rnd)
+        tot += sum(sum(v * v for v in mp) for mp in infer.column_means(z))
+    return tot / n / target
+e_iid, e_wor = energy("empirical"), energy("empirical-wor")
+print("mean-noise energy / target: with replacement", round(e_iid, 3), "without", round(e_wor, 3))
+assert abs(e_iid - 1.0) < 0.05 and abs(e_wor - (1 - k / K)) < 0.05, (e_iid, e_wor)
+PY
+# the bank mode: omnibus draws from an error bank's primary blocks (assays joint, regimes independent)
+$PY - "$T" <<'PY' || fail "building the toy bank"
+import json, random, sys
+sys.path.insert(0, sys.argv[1])
+rnd = random.Random(211)
+pbs = []
+for g in ("np", "p4"):
+    for c in ("off", "predA4"):
+        z = [[[0.0 if i == p else rnd.gauss(0, 0.02) for i in range(4)] for _ in range(12)] for p in range(4)]
+        pbs.append({"cond": c, "frac": 0.05, "G": 13500.0, "group": g, "names": [f"{g}{t}" for t in range(4)],
+                    "reps": list(range(12)), "z": z, "zq": z, "status": "formal"})
+json.dump({"schema": "finfolk.invasion.blocks/2", "blocks": [], "primary_blocks": pbs}, open("bank21.json", "w"))
+PY
+$PY "$T/calibrate.py" --blocks an3/blocks.json --key off/0.1/0.25 --out cal21 --sims 0 --bank bank21.json --bank-k 6 \
+    --bank-sims 4 --bank-outer 2 --bank-inner 2 --chunk 2 --omnibus-B 19 --workers 1 > cal21.log 2>&1 \
+    || fail "calibrate.py --bank: $(tail -5 cal21.log)"
+$PY - <<'PY' || fail "bank calibration rows"
+import csv, json
+rows = list(csv.DictReader(open("cal21/calib.csv")))
+assert {r["world"] for r in rows} == {"bank", "bank-gauss", "bank outer0", "bank outer1"}, {r["world"] for r in rows}
+assert all((r["G"], r["C"], r["k"]) == ("2", "2", "6") for r in rows)
+m = json.load(open("cal21/manifest.json"))
+assert m["bank"]["K"] == 12 and m["bank"]["groups"] == ["np", "p4"], m["bank"]
+PY
+
+# 22. review round 3, P1-2: the primary matrices are built per home regime, explicitly. Two disjoint
+#     complete registered cores (no cross-home cell) give two formal primary blocks per assay and a
+#     formal four-block omnibus (the pooled clique kept one regime); one missing primary observation
+#     makes its block and the omnibus descriptive
+$PY - "$T" <<'PY' || fail "explicit home-regime primary blocks"
+import random, sys
+sys.path.insert(0, sys.argv[1]); import analyze
+rnd = random.Random(22)
+cores = {"x": ["x1", "x2", "x3"], "y": ["y1", "y2", "y3"]}
+reg, rows = {}, []
+for c in ("off", "predA"):
+    for core in cores.values():
+        for j in core:
+            for i in core:
+                mode = "sham" if i == j else "invade"
+                reg.setdefault((c, 0.05), {})[(i, j, mode)] = {0, 1, 2}
+                for r in range(3):
+                    rows.append({"cond": c, "frac": 0.05, "G": 13500.0, "mode": mode, "i": i, "j": j, "rep": r,
+                                 "s": (0.0 if i == j else 0.03 * (int(i[1]) - int(j[1]))) + rnd.gauss(0, 0.003),
+                                 "f0": 0.05, "missed": False})
+out, detail, blocks, joint, subs = analyze.matrices(rows, None, sims=49, registry=reg, cores=cores)
+assert all(m["status"].startswith("descriptive: the plan registers separate cores") for m in out), [m["status"] for m in out]
+pr, pb, pj = analyze.primary_blocks(rows, None, reg, cores, 49)
+assert sorted(k[3] for k in pb) == ["x", "x", "y", "y"] and all(b["status"] == "formal" for b in pb.values()), pb.keys()
+assert len(pj) == 1 and pj[0]["status"] == "formal" and pj[0]["required"] == "off/x off/y predA/x predA/y", pj
+assert pj[0]["p_lof_flip"] is not None and pj[0]["p_res_flip"] is not None and "claim_beyond_bounded" in pj[0]
+rows_m = [x for x in rows if not (x["cond"] == "predA" and (x["i"], x["j"], x["rep"]) == ("y1", "y2", 2))]
+pr, pb, pj = analyze.primary_blocks(rows_m, None, reg, cores, 49)
+assert pb[("predA", 0.05, 13500.0, "y")]["status"].startswith("descriptive") and pb[("off", 0.05, 13500.0, "y")]["status"] == "formal"
+assert pj[0]["status"].startswith("descriptive: primary block(s) predA/y") and pj[0].get("p_lof_flip") is None, pj
+# cross-home cells registered (and incomplete) do not block complete cores
+reg_x = {k: dict(v) for k, v in reg.items()}
+reg_x[("off", 0.05)][("x1", "y1", "invade")] = {0, 1, 2}
+pr, pb, pj = analyze.primary_blocks(rows, None, reg_x, cores, 49)
+assert pb[("off", 0.05, 13500.0, "x")]["status"] == "formal" and pj[0]["status"] == "formal"
+assert analyze.cores_from_plan({"c1": {"core": "x", "resident_name": "x1", "invader_name": "x2", "mode": "invade"}}) == {"x": ["x1", "x2"]}
+PY
+
+# 23. review round 3, P2-4: a fixed-step window is read at exactly that step (a 14,000-step checkpoint
+#     is not the 13,500-step window), and formal decisions need the window in the horizon registration
+$PY - "$T" <<'PY' || fail "exact fixed-step reads"
+import random, sys
+sys.path.insert(0, sys.argv[1]); import analyze
+rec = {"id": "x", "j": "A", "i": "B", "mode": "invade", "frac": 0.05, "cond": "off", "rep": 0, "n0": 100, "m": 5,
+       "f0": 0.05, "points": [{"steps": s, "score": 0.01, "extinct": False, "n": 90, "births": 100, "generations": 1.0,
+                              "invader_lost": False} for s in (12000, 14000)]}
+r = analyze.run_rows([rec], {}, [13500.0, 14000.0], 0.10, clock="steps")
+assert r[0]["missed"] and r[0]["s"] is None and not r[1]["missed"] and r[1]["steps_at"] == 14000, r
+rnd = random.Random(23)
+names = ["a", "b", "c"]
+rows = [{"cond": "off", "frac": 0.05, "G": 14000.0, "mode": "sham" if i == j else "invade", "i": i, "j": j, "rep": rep,
+         "s": rnd.gauss(0, 0.01), "f0": 0.05, "missed": False} for i in names for j in names for rep in range(3)]
+reg = {("off", 0.05): {(i, j, "sham" if i == j else "invade"): {0, 1, 2} for i in names for j in names}}
+out, *_ = analyze.matrices(rows, None, sims=19, registry=reg, windows_registered={13500.0, 27000.0})
+assert out[0]["status"] == "descriptive: window not in the horizon registration", out[0]["status"]
+out, *_ = analyze.matrices(rows, None, sims=19, registry=reg, windows_registered={14000.0, 28000.0})
+assert out[0]["status"] == "formal"
+PY
+
+# 24. review round 3, P2-3: the frozen co-primary and its decision. The family threshold is 0.05/12,
+#     the primary omnibus carries H1, H1b and the claim, and calibrate.py --compound evaluates H1, H1b
+#     and their conjunction in a transitive bounded world (support-preserving endpoints)
+$PY - "$T" <<'PY' || fail "co-primary constants"
+import sys
+sys.path.insert(0, sys.argv[1]); import bounded, calibrate
+assert abs(bounded.ALPHA_FAMILY - 0.05 / 12) < 1e-15 and bounded.ALPHA_FAMILY in calibrate.ALPHAS
+assert bounded.CO_PRIMARY_MODEL == "logistic"
+PY
+$PY "$T/calibrate.py" --blocks an3s/blocks.json --key off/0.1/0.25 --out cal24 --sims 0 --compound 4:4:2 \
+    --compound-sims 4 --workers 1 > cal24.log 2>&1 || fail "calibrate.py --compound: $(tail -5 cal24.log)"
+$PY - <<'PY' || fail "compound decision rows"
+import csv
+rows = list(csv.DictReader(open("cal24/calib.csv")))
+tests = {r["test"] for r in rows}
+assert {"H1 raw sign-flip omnibus", "H1b logistic residual sign-flip omnibus", "claim: H1 and H1b"} <= tests, tests
+assert any(abs(float(r["alpha"]) - 0.05 / 12) < 1e-12 for r in rows)
+assert {r["effect"] for r in rows if r["test"] == "claim: H1 and H1b"} >= {"bounded ladder",
+        "bounded ladder + d_C=0.02 in all conditions", "bounded ladder + d_C=0.03 in one condition"}
+assert any(r["test"].startswith("feasible (no clipped mean)") for r in rows)
 PY
 
 # 19. self-tests of the inference and bounded-scale modules
