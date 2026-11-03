@@ -623,6 +623,41 @@ r = analyze.run_rows([rec], {}, [300.0], 0.1, clock="steps")
 assert r[0]["s"] == -0.1 and r[0]["extinct"] and r[0]["gens"] == 0.4, r
 PY
 
+# 20. the error-bank planner (review round 3): separate home-regime cores, the registered indexed
+#     seed allocation (slot / donor / predator / engine-reseed formulas), the seed-overlap refusal,
+#     and the runner's progress file
+cat > design20.json <<EOF
+{"name": "t20", "snapshots": {"A": "$W/A.json", "B": "$W/B.json", "C": "$W/C.json", "D": "$W/As.json"},
+ "conditions": {"off": 0, "predA2": 2}, "fractions": [0.05], "replicates": 3, "steps": 600, "checkpoint_every": 300,
+ "log_every": 300, "cores": [["x", ["A", "B"]], ["y", ["C", "D"]]],
+ "seed_scheme": {"type": "indexed", "namespace": "t20", "slot_base": 1000000000, "donor_base": 1100000000,
+                 "pred_base": 1200000000, "reseed_base": 2000000000, "assays": ["off", "predA2"]}}
+EOF
+$PY "$T/plan.py" design20.json > plan20.jsonl || fail "plan.py (indexed cores)"
+$PY - <<'PY' || fail "indexed seed allocation"
+import json
+cells = [json.loads(l) for l in open("plan20.jsonl")]
+assert len(cells) == 2 * 4 * 2 * 3, len(cells)          # 2 cores x (2 pairs + 2 shams) x 2 assays x 3 reps
+assert not any({c["resident_name"], c["invader_name"]} in ({"A", "C"}, {"A", "D"}, {"B", "C"}, {"B", "D"}) for c in cells)
+idx = {"A": (0, 0), "B": (0, 1), "C": (1, 0), "D": (1, 1)}
+for c in cells:
+    h, j = idx[c["resident_name"]]
+    i = idx[c["invader_name"]][1]
+    u = 3 * (2 * h + j) + c["replicate"]
+    a = ["off", "predA2"].index(c["condition"])
+    assert c["slot_seed"] == 1000000000 + u and c["donor_seed"] == 1100000000 + 2 * u + i, c
+    assert c["reseed"] == 2000000000 + 2 * u + a and c["pred_seed"] == (1200000000 + u if a else None), c
+    assert c["seed_namespace"] == "t20" and c["core"] == ("x" if h == 0 else "y")
+PY
+$PY "$T/plan.py" design20.json --avoid plan20.jsonl > /dev/null 2> avoid20.log
+[ $? = 2 ] && grep -q "seed(s) also used" avoid20.log || fail "plan.py did not refuse seeds used by an archived plan"
+$PY "$T/plan.py" design20.json --avoid plan3.jsonl > /dev/null 2>&1 || fail "plan.py refused a disjoint archive"
+$PY - <<'PY' || fail "the runner's progress file"
+import json
+p = json.load(open("root3/progress.json"))
+assert p["total"] == 27 and p["state"] == "all done" and p["failed"] == [] and p["workers"] == 2, p
+PY
+
 # 19. self-tests of the inference and bounded-scale modules
 $PY "$T/infer.py" > /dev/null || fail "infer.py self-test"
 $PY "$T/bounded.py" > /dev/null || fail "bounded.py self-test"

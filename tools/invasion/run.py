@@ -476,6 +476,21 @@ def main(argv=None):
     n_done = 0
     mem_bad = 0      # consecutive unreadable memory polls
     rss_mb = 0       # largest engine RSS seen this session (the per-cell reserve)
+    t_start = time.time()
+    n_before = len(cells) - len(todo)
+
+    def progress(state="running"):
+        """DIR/progress.json: done / total, this session's rate and the projected finish."""
+        el = time.time() - t_start
+        rate = n_done / el * 3600 if el > 0 else 0.0
+        left = len(cells) - n_before - n_done
+        eta = (datetime.datetime.now() + datetime.timedelta(hours=left / rate)).isoformat(timespec="seconds") \
+            if rate > 0 and left > 0 else None
+        invlib.write_json_atomic(os.path.join(root, "progress.json"), {
+            "state": state, "updated": now(), "plan": os.path.abspath(a.plan), "total": len(cells),
+            "done": n_before + n_done, "failed": failed, "running": len(running), "queued": len(queue),
+            "workers": a.workers, "session_cells_per_hour": rate, "projected_finish": eta})
+    progress()
     while queue or running:
         # reap
         for pid in list(running):
@@ -500,6 +515,7 @@ def main(argv=None):
                 failed.append(cid)
                 err = open(os.path.join(root, "cells", cid, "cell.stderr.log")).read()[-400:]
                 log(f"FAILED {cid} (exit {rc}): {err.strip()}")
+            progress()
         # admission
         if os.path.exists(os.path.join(root, "STOP")) and stop_reason is None:
             stop_reason = "STOP"
@@ -537,11 +553,14 @@ def main(argv=None):
         time.sleep(0.5)
 
     if failed:
+        progress("stopped: failed cell(s)")
         log(f"stopped: {len(failed)} failed cell(s): {failed[:5]}")
         return 1
     if stop_reason:
+        progress("stopped by STOP file")
         log("stopped by STOP file")
         return 75
+    progress("all done")
     log(f"all {len(cells)} cells done")
     return 0
 
