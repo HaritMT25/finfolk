@@ -53,6 +53,12 @@
 #
 #   wasm/ocean_parity.sh              # everything (~8 min on 8 cores, both builds)
 #   JOBS=8 OCEAN_PARITY_DIR=/tmp/x wasm/ocean_parity.sh
+#                                     # (default: a fresh unique /tmp/ocean_parity.XXXXXX per run,
+#                                     # printed at the start, never deleted by this script, so two
+#                                     # runs (e.g. two worktrees) never clobber each other; an
+#                                     # explicit OCEAN_PARITY_DIR is reused and its old outputs cleared)
+#   BUILD_JOBS=2 wasm/ocean_parity.sh # bound on concurrent compiler jobs in the build phase
+#                                     # (default min(JOBS, 2): the 8 compiles peak at ~4-5 GB at once)
 #   ONLY=def_s1 wasm/ocean_parity.sh  # one case (a grep -E pattern on the name)
 #   NO_TESTS=1 wasm/ocean_parity.sh   # parity cases only
 #   NO_EYE=1 wasm/ocean_parity.sh     # the plain Ocean build only
@@ -137,9 +143,12 @@ cd "$(dirname "$0")/.."
 T0=$(date +%s)
 BASE=tests/ocean_baseline
 
-OUT=${OCEAN_PARITY_DIR:-/tmp/ocean_parity}
 JOBS=${JOBS:-4}
-mkdir -p "$OUT"
+BUILD_JOBS=${BUILD_JOBS:-$(( JOBS < 2 ? JOBS : 2 ))}
+[ "$BUILD_JOBS" -ge 1 ] 2>/dev/null || { echo "BUILD_JOBS must be a positive integer (got: $BUILD_JOBS)" >&2; exit 2; }
+if [ -n "${OCEAN_PARITY_DIR:-}" ]; then OUT=$OCEAN_PARITY_DIR; mkdir -p "$OUT"
+else OUT=$(mktemp -d /tmp/ocean_parity.XXXXXX) || exit 2; fi
+echo "== outputs in $OUT"
 rm -f "$OUT"/*.txt "$OUT"/*.log "$OUT"/*.rc
 if ! command -v em++ > /dev/null; then
     # shellcheck disable=SC1090
@@ -157,25 +166,37 @@ GPP_VER=$(g++ -dumpversion); EM_VER=$(em++ --version | head -1 | sed 's/.*) //')
 echo "== tree: $(git rev-parse --abbrev-ref HEAD 2>/dev/null) $(git rev-parse --short HEAD 2>/dev/null)," \
      "$(git status --porcelain 2>/dev/null | wc -l) changed/untracked path(s)"
 echo "== building (g++ $GPP_VER, $EM_VER)"
-build () {  # build LABEL CMD...
+TIMEV=(); [ -x /usr/bin/time ] && /usr/bin/time -v true > /dev/null 2>&1 && TIMEV=(/usr/bin/time -v)
+build () {  # build LABEL CMD...   (rc in build_LABEL.rc; peak RSS in build_LABEL.time when /usr/bin/time exists)
     local label=$1; shift
-    if "$@" > "$OUT/build_$label.log" 2>&1; then echo "   built $label"; else echo "   BUILD FAILED: $label"; cat "$OUT/build_$label.log"; return 1; fi
+    if [ ${#TIMEV[@]} -gt 0 ]; then "${TIMEV[@]}" -o "$OUT/build_$label.time" "$@" > "$OUT/build_$label.log" 2>&1
+    else "$@" > "$OUT/build_$label.log" 2>&1; fi
+    local rc=$?
+    echo $rc > "$OUT/build_$label.rc"
+    if [ $rc = 0 ]; then echo "   built $label"; else echo "   BUILD FAILED: $label"; cat "$OUT/build_$label.log"; return 1; fi
 }
+# at most BUILD_JOBS compiler jobs at a time (each can take ~0.5-1 GB)
+bgbuild () { while [ "$(jobs -rp | wc -l)" -ge "$BUILD_JOBS" ]; do wait -n; done; build "$@" & }
 VARIANTS="plain"; [ -z "${NO_EYE:-}" ] && VARIANTS="plain eye"
-PIDS=()
+echo "   (at most $BUILD_JOBS compiler job(s) at once)"
 for v in $VARIANTS; do
     # binaries: plain = opd_native / opd_wasm.js / ocean_tests_*; eye = *_eye
     if [ $v = eye ]; then F="$CXXFLAGS -DEVO_OCEAN_EYE"; S=_eye; else F="$CXXFLAGS"; S=; fi
-    build driver_native$S g++ $F tools/ocean_parity_driver.cpp -o "$OUT/opd_native$S" & PIDS+=($!)
-    build driver_wasm$S   em++ $F $EMFLAGS tools/ocean_parity_driver.cpp -o "$OUT/opd_wasm$S.js" & PIDS+=($!)
+    bgbuild driver_native$S g++ $F tools/ocean_parity_driver.cpp -o "$OUT/opd_native$S"
+    bgbuild driver_wasm$S   em++ $F $EMFLAGS tools/ocean_parity_driver.cpp -o "$OUT/opd_wasm$S.js"
     if [ -z "${NO_TESTS:-}" ]; then
-        build tests_native$S g++ $F tests/ocean_tests.cpp -o "$OUT/ocean_tests_native$S" & PIDS+=($!)
-        build tests_wasm$S   em++ $F $EMFLAGS tests/ocean_tests.cpp -o "$OUT/ocean_tests_wasm$S.js" & PIDS+=($!)
+        bgbuild tests_native$S g++ $F tests/ocean_tests.cpp -o "$OUT/ocean_tests_native$S"
+        bgbuild tests_wasm$S   em++ $F $EMFLAGS tests/ocean_tests.cpp -o "$OUT/ocean_tests_wasm$S.js"
     fi
 done
+wait
 BUILD_OK=1
-for p in "${PIDS[@]}"; do wait "$p" || BUILD_OK=0; done
+for r in "$OUT"/build_*.rc; do [ "$(cat "$r")" = 0 ] || BUILD_OK=0; done
 [ "$BUILD_OK" = 1 ] || { echo "== BUILD FAILED"; exit 1; }
+if [ ${#TIMEV[@]} -gt 0 ]; then   # largest single compile (KB -> MB); peak is at most BUILD_JOBS of these at once
+    PEAK_KB=$(grep -h "Maximum resident" "$OUT"/build_*.time 2>/dev/null | awk '{print $NF}' | sort -n | tail -1)
+    [ -n "$PEAK_KB" ] && echo "   largest single compile: $(( PEAK_KB / 1024 )) MB resident (peak <= $BUILD_JOBS x that)"
+fi
 sfx () { [[ $1 == eye_* ]] && echo _eye; }   # sfx CASE_NAME -> the build's binary suffix
 
 # ---- the case matrix ---------------------------------------------------------

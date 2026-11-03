@@ -10,8 +10,9 @@
 set -e
 cd "$(dirname "$0")/.."
 
-OUT=${PARITY_DIR:-/tmp/evo_parity}
-mkdir -p "$OUT"
+# Unique output dir per run (two worktrees can run parity at once); PARITY_DIR=/x reuses one.
+if [ -n "${PARITY_DIR:-}" ]; then OUT=$PARITY_DIR; mkdir -p "$OUT"; else OUT=$(mktemp -d /tmp/evo_parity.XXXXXX); fi
+echo "== outputs in $OUT"
 
 echo "== building parity drivers"
 g++ -O3 -std=c++20 -ffp-contract=off -I src wasm/parity_driver.cpp -o "$OUT/parity_native"
