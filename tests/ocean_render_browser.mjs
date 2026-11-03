@@ -4,6 +4,8 @@
 //        [--parts correctness,noperf,faults,timer,beam,iframe,perf] [--counts 500,1500,2500]
 //        [--dur 15000] [--warm 10000] [--rounds 2] [--headed]
 //        [--cameras whole,dense,follow] [--colours appearance,family,brain]   (perf; default whole, appearance)
+//        [--modes off,frame,spans,spansGpu] [--viewport 1920x1080[@1]]       (perf; the default: all four, 1920 x 1080 at DPR 1)
+//   --counts takes "big" too: the Big tank (EvoOceanConfig.BIG_TANK: its size, population and set-up)
 //   env: PLAYWRIGHT  the playwright module (default C:/Users/harit/gemini_bridge/node_modules/playwright)
 //        BRAVE_EXE   the browser (default C:/Program Files/BraveSoftware/Brave-Browser/Application/brave.exe)
 //
@@ -59,9 +61,12 @@ const BRAVE = process.env.BRAVE_EXE || "C:/Program Files/BraveSoftware/Brave-Bro
 const BASE = String(arg("base", "http://localhost:8152")).replace(/\/$/, "");
 const OUT = path.resolve(String(arg("out", path.join(os.tmpdir(), "ocean_render_" + Date.now()))));
 const PARTS = String(arg("parts", "correctness,noperf,faults,timer,beam,iframe,perf")).split(",");
-const COUNTS = String(arg("counts", "500,1500,2500")).split(",").map(Number);
+const COUNTS = String(arg("counts", "500,1500,2500")).split(",").map((x) => (x === "big" ? x : Number(x)));
 const DUR = Number(arg("dur", 15000)), WARM = Number(arg("warm", 10000)), ROUNDS = Number(arg("rounds", 2));
 const CAMERAS = String(arg("cameras", "whole")).split(","), COLOURS = String(arg("colours", "appearance")).split(",");
+const PERF_MODES = String(arg("modes", "off,frame,spans,spansGpu")).split(",");
+const VIEWPORT = (() => { const m = /^(\d+)x(\d+)(?:@([\d.]+))?$/.exec(String(arg("viewport", "1920x1080@1")));
+  if (!m) throw new Error("--viewport WxH[@dpr]"); return { width: +m[1], height: +m[2], dpr: m[3] ? +m[3] : 1 }; })();
 const HEADED = !!arg("headed", false);
 const CASES = JSON.parse(fs.readFileSync(path.join(ROOT, "tests/fixtures/ocean_render_cases.json"), "utf8"));
 const { chromium } = require(PW);
@@ -79,7 +84,7 @@ const LAUNCH_ARGS = ["--no-first-run", "--no-default-browser-check"];
 async function launch(label, opts = {}) {
   /* "": a temporary profile, made and removed by Playwright */
   const ctx = await chromium.launchPersistentContext("", {
-    executablePath: BRAVE, headless: !HEADED, viewport: opts.viewport || { width: 1920, height: 1080 }, deviceScaleFactor: 1,
+    executablePath: BRAVE, headless: !HEADED, viewport: opts.viewport || { width: 1920, height: 1080 }, deviceScaleFactor: opts.dpr || 1,
     reducedMotion: "no-preference", args: LAUNCH_ARGS
   });
   if (opts.init) await ctx.addInitScript(opts.init);
@@ -558,32 +563,37 @@ async function capture(page, mode, ms) {
 async function partPerf() {
   console.log("== performance (the machine is shared with a parallel build: compare interleaved modes, not absolutes)");
   report.parts.perf = { note: "Headless Brave; rAF-paced (vsync-like 60 Hz cap); another builder compiling in parallel. Modes interleaved A/B so drift cancels.",
-                        cells: {} };
+                        viewport: VIEWPORT, modes: PERF_MODES, cells: {} };
   for (const pop of COUNTS) {
-    const c = caseFor(pop);
-    const L = await launch("perf-" + pop);
+    let c = caseFor(pop === "big" ? 300 : pop);
+    const L = await launch("perf-" + pop, { viewport: { width: VIEWPORT.width, height: VIEWPORT.height }, dpr: VIEWPORT.dpr });
     await L.page.goto(benchUrl(c));
     await ready(L.page, true);
+    if (pop === "big") {   /* the page's own preset: its size, founders and set-up (appearance as the case's) */
+      const B = await L.page.evaluate(() => EvoOceanConfig.BIG_TANK);
+      c = caseFor(B.population, { world: [B.width, B.height, B.depth], config: Object.assign({}, CASES.benchmark.config, B.cfg) });
+    }
     for (const cam of CAMERAS) for (const colour of COLOURS) {
       const key = `${pop}_${cam}_${colour}`;
       const prep = await L.page.evaluate((cd) => EvoOcean.bench.prepare(cd), Object.assign({}, c, { camera: cam, colourMode: colour }));
-      save("manifest_" + key + ".json", JSON.stringify(await manifestOf(L.page, "perf-" + key, { browserVersion: L.browserVersion, case: prep }), null, 1));
+      save("manifest_" + key + ".json", JSON.stringify(await manifestOf(L.page, "perf-" + key, { browserVersion: L.browserVersion, case: prep, viewport: VIEWPORT }), null, 1));
       await L.page.evaluate((ms) => EvoOcean.bench.wait(ms), WARM);
-      const rows = { off: [], frame: [], spans: [], spansGpu: [] };
+      const rows = Object.fromEntries(PERF_MODES.map((m) => [m, []]));
       for (let round = 0; round < ROUNDS; round++) {
-        const order = round % 2 ? ["spansGpu", "spans", "frame", "off"] : ["off", "frame", "spans", "spansGpu"];
+        const order = round % 2 ? PERF_MODES.slice().reverse() : PERF_MODES;
         for (const mode of order) {
           const r = await capture(L.page, mode, DUR);
           if (r.cap) { save(`frames_${key}_${mode}_${round}.csv`, r.cap.framesCsv); if (mode === "spansGpu") save(`gpu_${key}_${mode}_${round}.csv`, r.cap.gpuCsv); }
           rows[mode].push({ raf: r.raf, summary: r.cap ? r.cap.summary : null });
           console.log(`  ${key} ${mode.padEnd(8)} r${round}: rAF fps ${r.raf.rafFps.toFixed(1)} p95 ${r.raf.raf.p95.toFixed(2)} ms` +
-                      (r.cap ? `, frameCpu p50 ${r.cap.summary.spans.frameCpu.p50.toFixed(3)} p95 ${r.cap.summary.spans.frameCpu.p95.toFixed(3)} ms, fps ${r.cap.summary.fps.toFixed(1)}` : ""));
+                      (r.cap ? `, frameCpu p50 ${r.cap.summary.spans.frameCpu.p50.toFixed(3)} p95 ${r.cap.summary.spans.frameCpu.p95.toFixed(3)} ms, fps ${r.cap.summary.fps.toFixed(1)}` : "") +
+                      (r.cap && r.cap.summary.gpu.labels.frame ? `, gpu frame p50 ${r.cap.summary.gpu.labels.frame.scopes.p50.toFixed(3)} p95 ${r.cap.summary.gpu.labels.frame.scopes.p95.toFixed(3)} ms` : ""));
         }
       }
       /* draw scopes apart from frame timing (never combined) */
       const dr = await L.page.evaluate((ms) => EvoOcean.bench.capture({ durationMs: ms, cpu: true, gpu: "draws", sampleEvery: 6 }), Math.min(DUR, 10000));
       save(`gpu_${key}_draws.csv`, dr.gpuCsv);
-      report.parts.perf.cells[key] = { fish: pop, camera: cam, colour, case: prep.camera, rows, draws: dr.summary.gpu };
+      report.parts.perf.cells[key] = { fish: prep.n, world: prep.world, camera: cam, colour, case: prep.camera, rows, draws: dr.summary.gpu };
     }
     /* live: one step a frame from tick 0 (the population is recorded every frame) */
     await L.page.evaluate((cd) => EvoOcean.bench.prepare(cd), Object.assign({}, c, { camera: "whole", colourMode: "appearance" }));
