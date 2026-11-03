@@ -154,6 +154,52 @@
   }
 
   /* ---------------- shaders ---------------- */
+  /* The swim polish (uPolish: 1 from detail 2 up, setQuality; 0 draws the
+   * fish exactly as before it). Vertex stage, from what the instance buffers
+   * already hold (after seg(), in both fish programs and their shadows):
+   *   turnOf()   how hard the fish turns: the sines of the angles between
+   *              its spine's first three links (0.65 / 0.35), + = turning
+   *              toward its +side
+   *   bankOf()   the roll into that turn, its back toward the turn's centre,
+   *              1.6 x the turn, at most 0.6 rad; rollTo() turns a point's
+   *              (side, up) offset from the spine by it, so the spine, the
+   *              head (trail, rings, picking) and the pitch are unchanged
+   *   causOf()   faint caustic light at a point: an analytic two-wave network
+   *              (no texture), per vertex, fading over the top ~50 units of
+   *              water; the fragment stage keeps it to up-facing facets
+   * The tail's trailing edge lags the peduncle (appWorld / fishWorld: a phase
+   * lag and a second harmonic over the caudal fin, with the tail beat, so
+   * reduced motion has none), and (appearance fish) the paired fins fold back
+   * along the flank at speed (finPose). */
+  var POSE_GLSL = [
+    "uniform float uPolish;",
+    "float turnOf() {",
+    "  vec2 d0 = seg(0) - seg(1), d1 = seg(1) - seg(2), d2 = seg(2) - seg(3);",
+    "  float t1 = (d1.x * d0.y - d1.y * d0.x) / max(length(d0) * length(d1), 1e-6);",
+    "  float t2 = (d2.x * d1.y - d2.y * d1.x) / max(length(d1) * length(d2), 1e-6);",
+    "  return 0.65 * t1 + 0.35 * t2;",
+    "}",
+    "float bankOf(float turn) { return uPolish * clamp(1.6 * turn, -0.6, 0.6); }",
+    "vec2 rollTo(vec2 a, float b) { float cb = cos(b), sb = sin(b); return vec2(a.x * cb + a.y * sb, a.y * cb - a.x * sb); }",
+    "float causOf(vec3 w) {",
+    "  float fade = uPolish * exp(-0.022 * max(-w.y, 0.0));",
+    "  if (fade < 0.02) return 0.0;",
+    "  vec2 p = w.xz * 0.10; float t = uTime * 0.45;",
+    "  float a = sin(p.x + 1.6 * sin(0.57 * p.y + t));",
+    "  float b = sin(1.17 * p.y + 1.4 * sin(0.69 * p.x - 0.8 * t) + 0.5 * t);",
+    "  float r = 1.0 - 0.5 * abs(a + b); r *= r;",
+    "  return fade * r * r;",
+    "}"
+  ].join("\n");
+  /* the tail beat's lateral offset at u (body lengths from the head), phase
+   * ph: the caudal fin's trailing edge lags (e: 0 at the peduncle .. 1 half a
+   * body behind it, 0 without the polish, where this is the old beat) */
+  var WAG_GLSL = [
+    "float wagAt(float u, float ph, float R) {",
+    "  float e = uPolish * clamp(2.0 * (u - 1.0), 0.0, 1.0);",
+    "  return (sin(ph - 0.9 * e) * (1.0 + 0.25 * e) + 0.14 * e * sin(2.0 * ph - 0.6)) * uWag * smoothstep(0.1, 1.3, u) * R * 0.3;",
+    "}"
+  ].join("\n");
   var FISH_CORE = [
     "attribute float part;",
     "attribute vec4 iA;", "attribute vec4 iB;", "attribute vec4 iC;",
@@ -183,7 +229,13 @@
     "  return 0.5 * ((2.0 * p1) + (-p0 + p2) * t + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2",
     "              + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3);",
     "}",
-    "vec3 fishWorld() {",
+    POSE_GLSL,
+    WAG_GLSL,
+    /* nW: the body's smooth outward normal (the ring's, about 1 : 0.84
+     * across; the nose tip's and tail cap's along the spine), rolled and
+     * placed with it; zero on fins and eyes (the fragment stage then uses
+     * the facet's) */
+    "vec3 fishPose(out vec3 nW) {",
     "  float u = position.x, R = iBody.x;",
     "  float s = clamp(u, -0.5, 1.6) * 5.0;",
     "  vec2 c = spine(s);",
@@ -191,24 +243,33 @@
     "  float fl = length(f);",
     "  f = fl > 1e-4 ? f / fl : vec2(1.0, 0.0);",
     "  vec2 side = vec2(-f.y, f.x);",
-    "  float wag = sin(uTime * 7.5 + iCol.w * 6.2831 - u * 4.5) * uWag * smoothstep(0.1, 1.3, u) * R * 0.3;",
-    "  vec2 p = c + side * (position.y * R + wag);",
+    "  float wag = wagAt(u, uTime * 7.5 + iCol.w * 6.2831 - u * 4.5, R);",
+    "  float bank = bankOf(turnOf());",
+    "  vec2 lu = rollTo(vec2(position.y * R + wag, position.z * R), bank);",
+    "  vec2 p = c + side * lu.x;",
     /* pitch: the head stays at the fish's depth and every point behind it
      * rises (sinking) or falls (rising) by its distance along the spine times
      * tan(pitch), so trail, rings and picking (all at the head) stay right and
      * the shadow follows the tilted body */
     "  float along = length(c - seg(0)) * (s < 0.0 ? -1.0 : 1.0);",
     "  float lift = along * clamp(iX.x, -1.2, 1.2);",
-    "  return inGlass(vec3(p.x - uHalf.x, iBody.y + position.z * R + lift, p.y - uHalf.y));",
-    "}"
+    "  vec2 q = vec2(position.y, 1.4 * position.z); float ql = length(q);",
+    "  vec3 nl = part > 0.5 ? vec3(0.0) : (ql > 1e-4 ? vec3(0.0, q / ql) : vec3(u < 0.4 ? -1.0 : 1.0, 0.0, 0.0));",
+    "  vec2 nr = rollTo(nl.yz, bank);",
+    "  nW = vec3(side.x * nr.x - f.x * nl.x, nr.y, side.y * nr.x - f.y * nl.x);",
+    "  return inGlass(vec3(p.x - uHalf.x, iBody.y + lu.y + lift, p.y - uHalf.y));",
+    "}",
+    "vec3 fishWorld() { vec3 n; return fishPose(n); }"
   ].join("\n");
 
   var FISH_VS = FISH_CORE + "\n" + [
     "varying vec3 vWorld; varying vec3 vCol; varying float vPart; varying float vOy;",
-    "varying float vSel; varying float vEmber;",
+    "varying float vSel; varying float vEmber; varying vec4 vNs;",
     "void main() {",
-    "  vec3 w = fishWorld();",
+    "  vec3 n;",
+    "  vec3 w = fishPose(n);",
     "  vWorld = w; vCol = iCol.rgb; vPart = part; vOy = position.z; vSel = iBody.z; vEmber = iBody.w;",
+    "  vNs = vec4(n, causOf(w));",
     "  gl_Position = projectionMatrix * viewMatrix * vec4(w, 1.0);",
     "}"
   ].join("\n");
@@ -292,14 +353,41 @@
     "}"
   ].join("\n");
 
+  /* The swim polish's light (uPolish; POSE_GLSL), added to lit()'s, on the
+   * murky and the flashlight's clear colour alike (polishOn(b, k): linear in
+   * the skin b). thin: 1 on fins, less on barbels and the peduncle, 0 on the
+   * body; with it the diffuse wraps a little past the terminator (the
+   * caller's), the sunlight on a fin's far side shows through it, and a fin
+   * seen against the light glows in its own colour (a view-dependent back
+   * light, no texture). ns: the vertex stage's smooth normal (zero on fins:
+   * the facet's) for a tight wet highlight, and in w its caustic light, kept
+   * to up-facing facets. k = (transmitted, caustic, highlight). */
+  var POLISH_FN = [
+    "uniform float uPolish;",
+    "const vec3 P_SUN = vec3(1.0, 0.96, 0.86), P_WET = vec3(1.0, 0.98, 0.92), P_CAUS = vec3(0.70, 0.95, 0.84);",
+    "float wrapDiff(float nl, float thin) { float w = 0.45 * thin; return max((nl + w) / (1.0 + w), 0.0); }",
+    "vec3 polishK(vec3 N, vec3 V, vec4 ns, float thin, float nl) {",
+    "  if (uPolish < 0.5) return vec3(0.0);",
+    "  vec3 Ns = ns.xyz; float l2 = dot(Ns, Ns);",
+    "  Ns = l2 > 0.25 ? Ns * inversesqrt(l2) : N;",
+    "  if (dot(Ns, V) < 0.0) Ns = N;",
+    "  float s = clamp(dot(V, -normalize(uLight + 0.3 * N)), 0.0, 1.0); s *= s; s *= s;",
+    "  float trans = thin * (0.40 * max(-nl, 0.0) + 0.60 * s);",
+    "  float sp = pow(max(dot(Ns, normalize(uLight + V)), 0.0), 40.0) * 0.30 * (1.0 - 0.5 * thin);",
+    "  return vec3(trans, 1.0 * ns.w * max(N.y, 0.0), sp);",
+    "}",
+    "vec3 polishOn(vec3 b, vec3 k) { return b * (P_SUN * k.x + P_CAUS * k.y) + P_WET * k.z; }"
+  ].join("\n");
+
   var FISH_FS = [
     "uniform vec3 uLight; uniform float uTime; uniform vec3 uSelect;",
     FOG_FN,
     DEPTH_FN,
     CLARITY_FN,
     BEAM_FN,
+    POLISH_FN,
     "varying vec3 vWorld; varying vec3 vCol; varying float vPart; varying float vOy;",
-    "varying float vSel; varying float vEmber;",
+    "varying float vSel; varying float vEmber; varying vec4 vNs;",
     "vec3 baseOf(float back) {",
     "  vec3 base = vCol;",
     "  float body = 1.0 - step(0.5, vPart);",
@@ -313,12 +401,17 @@
     "  vec3 N = normalize(cross(dFdx(vWorld), dFdy(vWorld)));",
     "  vec3 V = normalize(cameraPosition - vWorld);",
     "  if (dot(N, V) < 0.0) N = -N;",
-    "  float diff = max(dot(N, uLight), 0.0);",
+    "  float thin = uPolish * (vPart > 0.5 && vPart < 1.5 ? 1.0 : 0.0);",   /* fins */
+    "  float nl = dot(N, uLight);",
+    "  float diff = wrapDiff(nl, thin);",
     "  float rim = pow(1.0 - max(dot(N, V), 0.0), 3.0);",
-    "  vec3 col = lit(baseOf(uBack), ambOf(N.y), diff, rim);",
+    "  vec3 pk = polishK(N, V, vNs, thin, nl);",
+    "  vec3 b = baseOf(uBack);",
+    "  vec3 col = lit(b, ambOf(N.y), diff, rim) + polishOn(b, pk);",
     "  float bk = beamOf(vWorld);",
     /* in the flashlight's clear light: the true colours, the same in any water */
-    "  vec3 clear = bk > 0.0 ? lit(baseOf(BACK_TRUE), ambTrue(N.y), diff, rim) : col;",
+    "  vec3 clear = col;",
+    "  if (bk > 0.0) { vec3 bt = baseOf(BACK_TRUE); clear = lit(bt, ambTrue(N.y), diff, rim) + polishOn(bt, pk); }",
     "  col = underwaterAt(vivid(col), vWorld.y);",
     "  vec3 ember = vec3(1.0, 0.38, 0.16) * (0.8 + 0.2 * sin(uTime * 6.0));",
     "  vec3 add = vec3(0.0);",
@@ -386,12 +479,14 @@
   /* the pattern genes of the fetched slot -> the flat pattern varyings (the
    * fish's vertex shader and the texture-backed chart probe) */
   var DECODE_CALL = "patternDecode(GT[0], GT[1], GT[2], GT[3], GT[4], GT[5], GT[6], GT[7].xyz, vec2(GT[7].w, GT[8].x), iX.z);";
+  /* a float32 constant as a GLSL float literal (as ocean_appearance.js writes its own) */
+  function glslF(x) { var s = Math.fround(x).toPrecision(9); return s.indexOf(".") >= 0 || s.indexOf("e") >= 0 ? s : s + ".0"; }
   function appearanceShaders(EA) {
     var G = EA.GLSL;
     var CORE = [
       "attribute vec4 aT; attribute vec4 aPattern;",
       "attribute vec4 iA; attribute vec4 iB; attribute vec4 iC;",
-      "attribute vec4 iBody;",  /* radius, height, highlight, ember */
+      "attribute vec4 iBody;",  /* radius, height, highlight, swimming speed (the pose: / 150, smoothed; fillApp) */
       "attribute vec4 iX;",     /* pitch (vz), tail-beat phase, lambda, family / brain colour 0xRRGGBB */
       "uniform vec2 uHalf; uniform float uTime; uniform float uWag; uniform float uPxPerUnit;",
       "uniform float uWalls;",   /* glass walls: as FISH_CORE's inGlass (0 in the parity check: unset) */
@@ -413,10 +508,14 @@
       "  return 0.5 * ((2.0 * p1) + (-p0 + p2) * t + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2",
       "              + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3);",
       "}",
+      POSE_GLSL,
+      WAG_GLSL,
       /* fishWorld with the deformed rest point geo (body radii; x = lambda·u along
        * the spine): the extrapolation past the spine's ends is bounded, not
-       * clamped to the legacy template's [-.5, 1.6] (long fins and barbels) */
-      "vec3 appWorld(vec3 geo) {",
+       * clamped to the legacy template's [-.5, 1.6] (long fins and barbels);
+       * rolled by bank (bankOf); nl: the rest point's outward normal (x along
+       * the spine to the tail, y the side, z up; zero: none) -> nW, in the world */
+      "vec3 appPose(vec3 geo, vec3 nl, float bank, out vec3 nW) {",
       "  float R = iBody.x, u = geo.x / iX.z;",
       "  float s = clamp(u, -1.5, 3.0) * 5.0;",
       "  vec2 c = spine(s);",
@@ -424,14 +523,45 @@
       "  float fl = length(f);",
       "  f = fl > 1e-4 ? f / fl : vec2(1.0, 0.0);",
       "  vec2 side = vec2(-f.y, f.x);",
-      "  float wag = sin(uTime * 7.5 + iX.y * 6.2831 - u * 4.5) * uWag * smoothstep(0.1, 1.3, u) * R * 0.3;",
-      "  vec2 p = c + side * (geo.y * R + wag);",
+      "  float wag = wagAt(u, uTime * 7.5 + iX.y * 6.2831 - u * 4.5, R);",
+      "  vec2 lu = rollTo(vec2(geo.y * R + wag, geo.z * R), bank);",
+      "  vec2 p = c + side * lu.x;",
       "  float along = length(c - seg(0)) * (s < 0.0 ? -1.0 : 1.0);",
       "  float lift = along * clamp(iX.x, -1.2, 1.2);",
-      "  vec3 w = vec3(p.x - uHalf.x, iBody.y + geo.z * R + lift, p.y - uHalf.y);",
+      "  vec3 w = vec3(p.x - uHalf.x, iBody.y + lu.y + lift, p.y - uHalf.y);",
       "  if (uWalls > 0.5) { w.x = clamp(w.x, -uHalf.x, uHalf.x); w.z = clamp(w.z, -uHalf.y, uHalf.y); }",
+      "  vec2 nr = rollTo(nl.yz, bank);",
+      "  nW = vec3(side.x * nr.x - f.x * nl.x, nr.y, side.y * nr.x - f.y * nl.x);",
       "  return w;",
       "}",
+      /* the paired fins' pose (pectoral 3, pelvic 6: mBuild puts a fin point
+       * at root + w d): folded back along the flank by k (0 spread, 1 folded;
+       * the pelvics half as far), w d turned toward the tail at its length, the
+       * root unmoved; spread, they scull a little with the tail beat's clock */
+      "vec3 finPose(Morph M, vec3 geo, float k) {",
+      "  int fin = int(aPattern.x + 0.5);",
+      "  if (uPolish < 0.5 || (fin != 3 && fin != 6)) return geo;",
+      "  bool pec = fin == 3; float side = aPattern.z;",
+      "  float chord = pec ? 0.80 : 0.55, area = pec ? M.pA : M.vA, sweep = pec ? M.pSweep : M.vSweep;",
+      "  float dih = pec ? M.pDih : -0.25 * P_PI, kk = pec ? k : 0.5 * k;",
+      "  float w = area / (chord * " + glslF(EA.PHI_I) + ") * aT.y * 4.0 * aT.x * (1.0 - aT.x);",
+      "  vec3 d = vec3(sweep, side * cos(dih), sin(dih));",
+      "  float sc = 0.22 * uWag * (1.0 - kk) * sin(uTime * 4.2 + iX.y * 6.2831 + 1.3 * side);",
+      "  vec3 dS = vec3(sweep, side * cos(dih + sc), sin(dih + sc));",
+      "  vec3 dT = normalize(vec3(1.0, 0.22 * side, -0.18)) * length(d);",
+      "  return geo + w * (mix(dS, dT, kk) - d);",
+      "}",
+      /* the fold: with speed (iBody.w, / 150), less in a hard turn (the fins steer) */
+      "float tuckOf(float turn) { return uPolish * pS(0.40, 0.90, iBody.w) * (1.0 - pS(0.10, 0.35, abs(turn))); }",
+      /* the body's smooth outward normal at a rest point (an ellipse of its
+       * depth and width genes; the nose tip and the tail cap: along the spine);
+       * zero on the fins, eyes and barbels (the facet's is used) */
+      "vec3 restNormal(Morph M, vec3 geo) {",
+      "  if (int(aPattern.x + 0.5) != 0) return vec3(0.0);",
+      "  vec2 q = vec2(geo.y * M.depth * M.depth, geo.z * M.width * M.width); float ql = length(q);",
+      "  return ql > 1e-6 ? vec3(0.0, q / ql) : vec3(aT.x < 0.4 ? -1.0 : 1.0, 0.0, 0.0);",
+      "}",
+      "vec3 appWorld(vec3 geo, float bank) { vec3 n; return appPose(geo, vec3(0.0), bank, n); }",
       /* the barbels' screen-space minimum half-width (0.7 px), in body radii */
       "float minWidth() {",
       "  vec3 head = vec3(iA.x - uHalf.x, iBody.y, iA.y - uHalf.y);",
@@ -440,24 +570,42 @@
     ].join("\n");
     var vs = [
       CORE, G.VARY, G.DECODE,
-      "varying vec3 vWorld; varying vec4 vMatV; flat varying vec4 vPart;",
+      "varying vec3 vWorld; varying vec4 vMatV; flat varying vec4 vPart; varying vec4 vNs;",
       "void main() {",
       "  fetchGenes(appearanceSlot());",
       "  if (uColourBy < 0.5) " + DECODE_CALL,
       "  Morph M = mDecode(iX.z);",
       "  vec3 geo, mat; float mar;",
       "  mBuild(M, aT, aPattern, uTime, uWag, minWidth(), geo, mat, mar);",
-      "  vec3 w = appWorld(geo);",
+      /* the swim pose (POSE_GLSL): the paired fins' fold, the roll into the turn */
+      "  float turn = turnOf();",
+      "  geo = finPose(M, geo, tuckOf(turn));",
+      "  vec3 nW;",
+      "  vec3 w = appPose(geo, restNormal(M, geo), bankOf(turn), nW);",
       /* vPart: fin, side, highlight, the packed family / brain colour (the FS reads x, z, w) */
       "  vWorld = w; vMatV = vec4(mat, mar); vPart = vec4(aPattern.x, aPattern.z, iBody.z, iX.w);",
+      "  vNs = vec4(nW, causOf(w));",   /* the smooth normal (the wet highlight), the caustic light */
       "  gl_Position = projectionMatrix * viewMatrix * vec4(w, 1.0);",
       "}"
     ].join("\n");
     var fs = [
       "uniform vec3 uLight; uniform float uTime; uniform vec3 uSelect; uniform float uColourBy;",
-      FOG_FN, DEPTH_FN, CLARITY_FN, BEAM_FN,
+      FOG_FN, DEPTH_FN, CLARITY_FN, BEAM_FN, POLISH_FN,
       G.COMMON, G.VARY, G.SKIN,
-      "varying vec3 vWorld; varying vec4 vMatV; flat varying vec4 vPart;",
+      "varying vec3 vWorld; varying vec4 vMatV; flat varying vec4 vPart; varying vec4 vNs;",
+      /* the polish's thinness (POLISH_FN): the fins 1, the barbels .6, the
+       * peduncle a little, the body and eyes 0 */
+      "float thinOf(int fin, float u) { return fin == 0 ? 0.25 * pS(0.80, 1.0, u) : (fin == 7 ? 0.6 : (fin == 4 ? 0.0 : 1.0)); }",
+      /* the skin's sheen (the polish; the genes' skin only, so Family / Brain
+       * colours keep their hue): the structural colour of the scales at
+       * grazing angles, a hue a little past the skin's own (vG0.x) that turns
+       * with the angle, stronger on a pale unsaturated (silvery) skin, faint
+       * on the fins */
+      "vec3 sheenOf(float ndv, float thin, float nl) {",
+      "  if (uPolish < 0.5) return vec3(0.0);",
+      "  float silver = (1.0 - vG0.y) * vG0.z, g = 1.0 - ndv; g *= g;",
+      "  return pHSV(pWrap01(vG0.x + 0.10 + 0.25 * g), 0.55, 1.0) * g * (0.12 + 0.30 * silver) * (1.0 - 0.6 * thin) * (0.55 + 0.45 * max(nl, 0.0));",
+      "}",
       /* the family / brain colour (vPart.w = 0xRRGGBB) through FISH_FS's base
        * stage; oy = the legacy template's height in body radii */
       "vec3 colourBase(int fin, float oy, float back) {",
@@ -488,12 +636,20 @@
       "  vec3 N = normalize(cross(dFdx(vWorld), dFdy(vWorld)));",
       "  vec3 V = normalize(cameraPosition - vWorld);",
       "  if (dot(N, V) < 0.0) N = -N;",
-      "  float diff = max(dot(N, uLight), 0.0);",
+      "  float thin = uPolish * thinOf(fin, u);",
+      "  float nl = dot(N, uLight);",
+      "  float diff = wrapDiff(nl, thin);",
       "  float rim = pow(1.0 - max(dot(N, V), 0.0), 3.0);",
-      "  vec3 col = lit(base, ambOf(N.y), diff, rim);",
+      "  vec3 pk = polishK(N, V, vNs, thin, nl);",
+      "  vec3 sheen = fin != 4 && uColourBy < 0.5 ? sheenOf(max(dot(N, V), 0.0), thin, nl) : vec3(0.0);",
+      "  vec3 col = lit(base, ambOf(N.y), diff, rim) + polishOn(base, pk) + sheen;",
       "  float bk = beamOf(vWorld);",
       /* in the flashlight's clear light: the true colours, the same in any water (the skin never sees the water) */
-      "  vec3 clear = bk > 0.0 ? lit(uColourBy > 0.5 ? colourBase(fin, oyL, BACK_TRUE) : base, ambTrue(N.y), diff, rim) : col;",
+      "  vec3 clear = col;",
+      "  if (bk > 0.0) {",
+      "    vec3 bt = uColourBy > 0.5 ? colourBase(fin, oyL, BACK_TRUE) : base;",
+      "    clear = lit(bt, ambTrue(N.y), diff, rim) + polishOn(bt, pk) + sheen;",
+      "  }",
       "  col = underwaterAt(vivid(col), vWorld.y);",
       "  vec3 add = vec3(0.0);",
       "  float vSel = vPart.z;",
@@ -522,7 +678,8 @@
       "  Morph M = mDecode(iX.z);",
       "  vec3 geo, mat; float mar;",
       "  mBuild(M, aT, aPattern, uTime, uWag, minWidth(), geo, mat, mar);",
-      "  vec3 w = appWorld(geo);",
+      "  float turn = turnOf();",   /* the swim pose, as the fish's own */
+      "  vec3 w = appWorld(finPose(M, geo, tuckOf(turn)), bankOf(turn));",
       "  vec3 s = w - uLight * ((w.y - uFloorY) / uLight.y);",
       "  s.y = uFloorY + 0.8;",
       "  vWorld = s;",
@@ -742,7 +899,7 @@
       var a = c * 0.7, bend = 0.15 * Math.sin(c), px = 300 + (37 * c) % 1300, py = 200 + (53 * c) % 700, pts = [px, py];
       for (var k = 1; k < 6; k++) { px -= sp * Math.cos(a + bend * k); py -= sp * Math.sin(a + bend * k); pts.push(px, py); }
       inst.iA.set(pts.slice(0, 4), 4 * c); inst.iB.set(pts.slice(4, 8), 4 * c); inst.iC.set(pts.slice(8, 12), 4 * c);
-      inst.iBody.set([Rb, -20 - (3 * c) % 200, 0, 0], 4 * c);
+      inst.iBody.set([Rb, -20 - (3 * c) % 200, 0, Math.fround(1.2 * ((c * 0.29) % 1))], 4 * c);   /* w: a swimming speed (the fin fold) */
       inst.iX.set([0.3 * Math.sin(c * 1.3), (c * 0.618) % 1, lam, PATH_COLOURS[c % PATH_COLOURS.length]], 4 * c);
     }
     var tex = gl.createTexture();
@@ -757,6 +914,7 @@
     gl.uniform3fv(uni("cameraPosition"), U.cam); gl.uniform2fv(uni("uHalf"), U.half);
     gl.uniform1f(uni("uTime"), 0); gl.uniform1f(uni("uWag"), 0); gl.uniform1f(uni("uPxPerUnit"), U.px);
     gl.uniform1f(uni("uColourBy"), colourBy); gl.uniform1i(uni("uGenes"), 0);
+    gl.uniform1f(uni("uPolish"), 1);   /* the swim pose on: the roll and the fin fold, mirrored by appWorldCPU / finPoseCPU */
 
     var tpls = [["medium", EA.buildTemplate("medium")], ["coarse", EA.buildTemplate("coarse")], ["barbels", EA.buildBarbels("medium")]];
     var bufs = [], jobs = [];
@@ -864,7 +1022,10 @@
    * down: N = V = (0, 1, 0), no rim, no depth tint (uDepth 240, the light
    * field off), no fog, no flashlight, realistic water (CLARITY [0]: vivid
    * off), so lit skin is base x (1.28, 1.3632, 1.2512) and an eye
-   * (0.82, 0.83, 0.83). Recolour (uColourBy 1): Family's and Brain's packed
+   * (0.82, 0.83, 0.83); with the swim polish on (uPolish 1, POLISH_FN) the
+   * wet highlight's peak on top, 0.30 x (1 - thin / 2) x P_WET (a smooth
+   * normal straight up; nothing shows through, no sheen, no caustic light
+   * when the light is behind the camera). Recolour (uColourBy 1): Family's and Brain's packed
    * palettes, parts 0..7, heights v = 0, .5, 1 at u = .42 (profile height
    * .72), against recolourBase, an independent statement of the base stage;
    * appearance (uColourBy 0): body part 0 against EvoAppearance.flankAt.
@@ -875,6 +1036,8 @@
   var FRAG_TOL = 0.003;
   var FRAG_MUL = [0.36 + 0.92, 0.48 + 0.92 * 0.96, 0.46 + 0.92 * 0.86];   /* ambient straight up + full diffuse */
   var FRAG_EYE = [0.82, 0.83, 0.83];
+  /* the polish's wet highlight at its peak on part fin (POLISH_FN polishK, thinOf at u = .42) */
+  function fragWet(fin) { var t = fin === 0 ? 0 : (fin === 7 ? 0.6 : 1), k = 0.30 * (1 - 0.5 * t); return [k, k * 0.98, k * 0.92]; }
   var FRAG_PALETTES = { family: PATH_COLOURS, brain: [0xff0000, 0x00ff00, 0x0000ff, 0x808080, 0x3c9ae1] };
   var FRAG_MUT = {
     swapRB: ["vec3 base = vec3(r, g, c - 65536.0 * r - 256.0 * g) / 255.0;", "vec3 base = vec3(c - 65536.0 * r - 256.0 * g, g, r) / 255.0;"],
@@ -906,12 +1069,13 @@
       "attribute vec2 aXY;",
       "uniform vec4 uG[9]; uniform float uLam;",
       "uniform vec4 uMaterial; uniform float uFin; uniform float uPacked;",
-      "varying vec3 vWorld; varying vec4 vMatV; flat varying vec4 vPart;",
+      "varying vec3 vWorld; varying vec4 vMatV; flat varying vec4 vPart; varying vec4 vNs;",
       "void main() {",
       "  patternDecode(uG[0], uG[1], uG[2], uG[3], uG[4], uG[5], uG[6], uG[7].xyz, vec2(uG[7].w, uG[8].x), uLam);",
       "  vWorld = vec3(aXY.x, 0.0, aXY.y);",
       "  vMatV = uMaterial;",
       "  vPart = vec4(uFin, 1.0, 0.0, uPacked);",
+      "  vNs = vec4(0.0, 1.0, 0.0, 0.0);",   /* a smooth normal straight up, no caustic light */
       "  gl_Position = vec4(aXY, 0.0, 1.0);",
       "}"
     ].join("\n");
@@ -927,7 +1091,7 @@
       return [U0, Math.fround(v), 0, 1000];
     }
     function vOf(fin, m) { return fin === 0 || fin === 7 ? 0.5 * (1 - m[2] * Math.sin(m[1])) : m[1]; }
-    function lit(b) { return [b[0] * FRAG_MUL[0], b[1] * FRAG_MUL[1], b[2] * FRAG_MUL[2]]; }
+    function lit(b, fin) { var h = fragWet(fin); return [b[0] * FRAG_MUL[0] + h[0], b[1] * FRAG_MUL[1] + h[1], b[2] * FRAG_MUL[2] + h[2]]; }
     var skin = [0.13, 0.43, 0.71].map(function (hue) {
       var g = []; for (var j = 0; j < EA.STRIDE; j++) g.push(Math.fround(0.5));
       g[0] = Math.fround(hue); g[1] = Math.fround(0.7); g[2] = Math.fround(0.6);
@@ -938,7 +1102,7 @@
         for (var fin = 0; fin < 8; fin++) [0, 0.5, 1].forEach(function (v) {
           var m = material(fin, v);
           cases.push({ mode: "recolour", palette: pal, colourBy: 1, fin: fin, packed: rgb, row: skin[0], lam: 4, m: m,
-                       want: fin === 4 ? FRAG_EYE : lit(recolourBase(rgb, fin, vOf(fin, m))) });
+                       want: fin === 4 ? FRAG_EYE : lit(recolourBase(rgb, fin, vOf(fin, m)), fin) });
         });
       });
     });
@@ -946,7 +1110,7 @@
       [0, 0.5, 1].forEach(function (v) {
         var m = material(0, v), out = [0, 0, 0];
         EA.flankAt(EA.decode(row, 4), U0, vOf(0, m), out);
-        cases.push({ mode: "appearance", palette: "skin " + i, colourBy: 0, fin: 0, packed: PATH_COLOURS[i], row: row, lam: 4, m: m, want: lit(out) });
+        cases.push({ mode: "appearance", palette: "skin " + i, colourBy: 0, fin: 0, packed: PATH_COLOURS[i], row: row, lam: 4, m: m, want: lit(out, 0) });
       });
     });
 
@@ -979,6 +1143,7 @@
     gl.uniform3fv(uni("uAmbLo"), W.ambLo[0]); gl.uniform3fv(uni("uAmbHi"), W.ambHi[0]); gl.uniform3fv(uni("uVivid"), W.vivid[0]);
     gl.uniform1f(uni("uBeamOn"), 0); gl.uniform3fv(uni("uBeamDir"), [0, -1, 0]); gl.uniform1f(uni("uBeamTan"), 0.2); gl.uniform1f(uni("uBeamReach"), 1000);
     gl.uniform1f(uni("uIntrinsic"), 0); gl.uniform3fv(uni("cameraPosition"), [0, 10, 0]);
+    gl.uniform1f(uni("uPolish"), 1);
     gl.viewport(0, 0, S, S);
     gl.disable(gl.DEPTH_TEST); gl.disable(gl.BLEND); gl.disable(gl.SCISSOR_TEST); gl.disable(gl.CULL_FACE); gl.colorMask(true, true, true, true);
     gl.bindBuffer(gl.PIXEL_PACK_BUFFER, pbo);
@@ -1063,15 +1228,37 @@
       out[q] = 0.5 * ((2 * p1[q]) + (-p0[q] + p2[q]) * t + (2 * p0[q] - 5 * p1[q] + 4 * p2[q] - p3[q]) * t2 + (-p0[q] + 3 * p1[q] - 3 * p2[q] + p3[q]) * t3);
     return out;
   }
+  /* the swim pose (POSE_GLSL turnOf / bankOf, tuckOf, finPose) for instance c, uPolish 1, uWag 0 */
+  function turnCPU(inst, c) {
+    var p0 = instSeg(inst, c, 0), p1 = instSeg(inst, c, 1), p2 = instSeg(inst, c, 2), p3 = instSeg(inst, c, 3);
+    var d0 = [p0[0] - p1[0], p0[1] - p1[1]], d1 = [p1[0] - p2[0], p1[1] - p2[1]], d2 = [p2[0] - p3[0], p2[1] - p3[1]];
+    function sinT(a, b) { return (a[0] * b[1] - a[1] * b[0]) / Math.max(Math.hypot(a[0], a[1]) * Math.hypot(b[0], b[1]), 1e-6); }
+    return 0.65 * sinT(d1, d0) + 0.35 * sinT(d2, d1);
+  }
+  function smoothCPU(a, b, x) { var t = Math.max(0, Math.min(1, (x - a) / (b - a))); return t * t * (3 - 2 * t); }
+  function tuckCPU(inst, c, turn) { return smoothCPU(0.40, 0.90, inst.iBody[4 * c + 3]) * (1 - smoothCPU(0.10, 0.35, Math.abs(turn))); }
+  function finPoseCPU(EA, M, aT, pat, geo, k) {
+    var fin = Math.floor(pat[0] + 0.5);
+    if (fin !== 3 && fin !== 6) return geo;
+    var pec = fin === 3, side = pat[2];
+    var chord = pec ? 0.80 : 0.55, area = pec ? M.pA : M.vA, sweep = pec ? M.pSweep : M.vSweep;
+    var dih = pec ? M.pDih : -0.25 * Math.PI, kk = pec ? k : 0.5 * k;
+    var w = area / (chord * Math.fround(EA.PHI_I)) * aT[1] * 4 * aT[0] * (1 - aT[0]);
+    var d = [sweep, side * Math.cos(dih), Math.sin(dih)], L = Math.hypot(d[0], d[1], d[2]);
+    var t = [1, 0.22 * side, -0.18], tl = Math.hypot(t[0], t[1], t[2]);
+    return [0, 1, 2].map(function (i) { return geo[i] + w * (d[i] + (t[i] / tl * L - d[i]) * kk - d[i]); });
+  }
   function appWorldCPU(inst, c, geo, U) {
     var Rb = inst.iBody[4 * c], u = geo[0] / inst.iX[4 * c + 2];
     var s = Math.min(3, Math.max(-1.5, u)) * 5, cc = spineCPU(inst, c, s);
     var f1 = spineCPU(inst, c, s - 0.15), f2 = spineCPU(inst, c, s + 0.15), f = [f1[0] - f2[0], f1[1] - f2[1]], fl = Math.hypot(f[0], f[1]);
     f = fl > 1e-4 ? [f[0] / fl, f[1] / fl] : [1, 0];
-    var side = [-f[1], f[0]], p = [cc[0] + side[0] * geo[1] * Rb, cc[1] + side[1] * geo[1] * Rb];
+    var bank = Math.min(0.6, Math.max(-0.6, 1.6 * turnCPU(inst, c))), cb = Math.cos(bank), sb = Math.sin(bank);
+    var lat = geo[1] * Rb, up = geo[2] * Rb, lu = [lat * cb + up * sb, up * cb - lat * sb];   /* rollTo */
+    var side = [-f[1], f[0]], p = [cc[0] + side[0] * lu[0], cc[1] + side[1] * lu[0]];
     var s0 = instSeg(inst, c, 0), along = Math.hypot(cc[0] - s0[0], cc[1] - s0[1]) * (s < 0 ? -1 : 1);
     var lift = along * Math.min(1.2, Math.max(-1.2, inst.iX[4 * c]));
-    var w = [p[0] - U.half[0], inst.iBody[4 * c + 1] + geo[2] * Rb + lift, p[1] - U.half[1]];
+    var w = [p[0] - U.half[0], inst.iBody[4 * c + 1] + lu[1] + lift, p[1] - U.half[1]];
     if (U.walls) {   /* the shader's glass clamp (uWalls) */
       w[0] = Math.min(U.half[0], Math.max(-U.half[0], w[0]));
       w[2] = Math.min(U.half[1], Math.max(-U.half[1], w[2]));
@@ -1092,6 +1279,7 @@
     var c0 = only ? only[0] : 0, c1 = only ? only[1] : n;
     for (var c = c0; c < c1; c++) {
       var lam = Math.fround(lams[c]), M = EA.morphDecode(rows[c], lam), P = U.colourBy ? null : EA.patternVaryings(rows[c], lam), minW = minWidthCPU(inst, c, U);
+      var tuck = tuckCPU(inst, c, turnCPU(inst, c));
       for (var v = 0; v < V; v++) {
         var o = (c * V + v) * NC;
         var aT = [jb.tpl.pos[4 * v], jb.tpl.pos[4 * v + 1], jb.tpl.pos[4 * v + 2], jb.tpl.pos[4 * v + 3]];
@@ -1109,7 +1297,7 @@
           if (!r.nan++) r.worst = where + ": non-finite feedback component " + badComponent + " (" + (names ? names[badComponent] : "?") + ")";
           continue;
         }
-        var b = EA.morphBuild(M, rings, aT, pat, 0, 0, minW), w = appWorldCPU(inst, c, b.geo, U);
+        var b = EA.morphBuild(M, rings, aT, pat, 0, 0, minW), w = appWorldCPU(inst, c, finPoseCPU(EA, M, aT, pat, b.geo, tuck), U);
         var eW = Math.max(Math.abs(data[o] - w[0]), Math.abs(data[o + 1] - w[1]), Math.abs(data[o + 2] - w[2]));
         var eM = Math.max(Math.abs(data[o + 3] - b.mat[0]), Math.abs(data[o + 4] - b.mat[1]), Math.abs(data[o + 5] - b.mat[2]));
         var eR = Math.abs(Math.min(data[o + 6], 10) - Math.min(b.mar, 10));
@@ -1568,6 +1756,7 @@
     var FLOOR_Y = -(TD + 14);
     var reduced = !!opts.reducedMotion;
     var quality = opts.coarse ? 2 : 3;
+    var polishWant = true;   /* the swim polish (setPolish; polishUniform) */
     var insets = { top: 0, right: 0, bottom: 0, left: 0 };
     var cw = 1, ch = 1;
 
@@ -1586,7 +1775,9 @@
       uBeamOn: { value: 0 }, uBeamDir: { value: new THREE.Vector3(0, -1, 0) },
       uBeamTan: { value: 0.2 }, uBeamReach: { value: 1000 },
       /* the tank's sides: 1 = glass walls (setWorld), 0 = wrapping */
-      uWalls: { value: 0 }
+      uWalls: { value: 0 },
+      /* the swim polish (POSE_GLSL, POLISH_FN): 1 from detail 2 up (setQuality), 0 below */
+      uPolish: { value: 1 }
     };
     function beamUniforms(u) {
       u.uBeamOn = common.uBeamOn; u.uBeamDir = common.uBeamDir;
@@ -1647,7 +1838,7 @@
       uHalf: common.uHalf, uTime: common.uTime, uFog: common.uFog, uFogDensity: common.uFogDensity,
       uLight: common.uLight, uWag: { value: reduced ? 0 : 1 }, uSelect: { value: v3(C.select) },
       uDepth: common.uDepth, uLightOn: common.uLightOn, uL0: common.uL0, uKWater: common.uKWater,
-      uWalls: common.uWalls
+      uWalls: common.uWalls, uPolish: common.uPolish
     });
     var fishMat = new THREE.ShaderMaterial({ vertexShader: FISH_VS, fragmentShader: FISH_FS,
                                              uniforms: fishUniforms, side: THREE.DoubleSide });
@@ -1655,7 +1846,7 @@
       vertexShader: SHADOW_VS, fragmentShader: SHADOW_FS,
       uniforms: { uHalf: common.uHalf, uTime: common.uTime, uWag: fishUniforms.uWag, uLight: common.uLight,
                   uFloorY: common.uFloorY, uDepth: common.uDepth, uFog: common.uFog, uFogDensity: common.uFogDensity,
-                  uAlpha: { value: 0.40 }, uWalls: common.uWalls },
+                  uAlpha: { value: 0.40 }, uWalls: common.uWalls, uPolish: common.uPolish },
       transparent: true, depthWrite: true, depthFunc: THREE.LessDepth, side: THREE.DoubleSide
     });
 
@@ -1738,13 +1929,14 @@
         uDepth: common.uDepth, uLightOn: common.uLightOn, uL0: common.uL0, uKWater: common.uKWater,
         uIntrinsic: { value: 0 }, uPxPerUnit: { value: 500 }, uColourBy: { value: 0 },
         uGenes: { value: null }, uRingT: { value: new Float32Array(16) }, uRingN: { value: 0 }, uHalfRing: { value: 4 },
-        uWalls: common.uWalls
+        uWalls: common.uWalls, uPolish: common.uPolish
       });
       var mat = new THREE.ShaderMaterial({ vertexShader: sh.vs, fragmentShader: sh.fs, uniforms: U, side: THREE.DoubleSide });
       var shadowU = { uHalf: common.uHalf, uTime: common.uTime, uWag: fishUniforms.uWag, uLight: common.uLight,
                       uFloorY: common.uFloorY, uDepth: common.uDepth, uFog: common.uFog, uFogDensity: common.uFogDensity,
                       uAlpha: shadowMat.uniforms.uAlpha, uPxPerUnit: U.uPxPerUnit,
-                      uGenes: U.uGenes, uRingT: U.uRingT, uRingN: U.uRingN, uHalfRing: U.uHalfRing, uWalls: common.uWalls };
+                      uGenes: U.uGenes, uRingT: U.uRingT, uRingN: U.uRingN, uHalfRing: U.uHalfRing, uWalls: common.uWalls,
+                      uPolish: common.uPolish };
       var shMat = new THREE.ShaderMaterial({ vertexShader: sh.shadowVs, fragmentShader: SHADOW_FS, uniforms: shadowU,
                                              transparent: true, depthWrite: true, depthFunc: THREE.LessDepth, side: THREE.DoubleSide });
       var self = { cap: 0, n: 0, lod: "", attrs: null, geo: null, bgeo: null, mesh: null, bmesh: null, shadow: null,
@@ -2264,6 +2456,18 @@
       }
       return true;
     }
+    /* Each fish's swimming speed, for the swim pose (iBody.w: the paired
+     * fins' fold, finPose): its head's travel since the last drawn frame over
+     * the simulated time between them (ticks x SIM_DT), / 150 (the engine's
+     * default top speed), smoothed over ~0.3 simulated seconds; matched to the
+     * last frame's fish by id with a merge (both lists in the engine's order,
+     * ids rising; nothing allocated a frame), a fish not matched (born, or a
+     * new world) starting at a cruising 0.55. Paused it holds, so a still
+     * picture keeps its pose; a jump (a wrap, a Turbo run) keeps the old value.
+     * Display only: nothing here reaches the simulation. */
+    var SIM_DT = 0.016;   /* oc_step's fixed step (web/ocean.js DT) */
+    function swimBufs(cap) { return { n: 0, epoch: -1, tick: 0, ids: new Float64Array(cap), x: new Float32Array(cap), y: new Float32Array(cap), v: new Float32Array(cap) }; }
+    var swimA = swimBufs(2048), swimB = swimBufs(2048);
     function fillApp(s, selIdx, hovIdx) {
       var n = s.n, lod = quality >= 3 ? "medium" : "coarse";
       appKind.ensure(n, lod);
@@ -2273,6 +2477,11 @@
       var segs = s.segs, cols = s.colors, body = s.body, ids = s.ids, depth = s.depth, vz = s.vz;
       if (!heights || heights.length < n) heights = new Float32Array(Math.max(n, 2048));
       var xs = SX, ys = SY, barbels = false;
+      var SP0 = swimA, SP1 = swimB.ids.length >= n ? swimB : (swimB = swimBufs(Math.max(2048, 2 * n)));
+      var tick = s.stats ? s.stats[1] : 0, dT = SP0.epoch === s.worldEpoch ? tick - SP0.tick : 0, sj = 0;
+      if (SP0.epoch !== s.worldEpoch) SP0.n = 0;
+      var sa = dT > 0 && dT <= 30 ? 1 - Math.exp(-dT * SIM_DT / 0.3) : 0, sinv = sa > 0 ? 1 / (150 * dT * SIM_DT) : 0;
+      var sjump = (3.5 * dT + 5) * (3.5 * dT + 5);
       for (var c = 0; c < n; c++) {
         var b = 12 * c, px = segs[b], py = segs[b + 1], o = 4 * c;
         xs[0] = px; ys[0] = py;
@@ -2294,12 +2503,24 @@
         BODY[o] = 4.6 * bodyScale(size);
         BODY[o + 1] = hgt;
         BODY[o + 2] = c === selIdx ? 1 : (c === hovIdx ? 0.5 : 0);
-        BODY[o + 3] = 0;
+        /* the swimming speed (above): this fish in the last frame's list */
+        var sv = 0.55, hx = segs[b], hy = segs[b + 1];
+        while (sj < SP0.n && SP0.ids[sj] < id) sj++;
+        if (sj < SP0.n && SP0.ids[sj] === id) {
+          sv = SP0.v[sj];
+          var ex = hx - SP0.x[sj], ey = hy - SP0.y[sj], e2 = ex * ex + ey * ey;
+          if (sa > 0 && e2 < sjump) sv += (Math.min(1.5, Math.sqrt(e2) * sinv) - sv) * sa;
+          sj++;
+        }
+        SP1.ids[c] = id; SP1.x[c] = hx; SP1.y[c] = hy; SP1.v[c] = sv;
+        BODY[o + 3] = sv;
         var t = vz ? vz[c] : 0;
         X[o] = t === t ? t : 0; X[o + 1] = hash01(id);
         X[o + 2] = 20 * size * elong / BODY[o];   /* lambda: body length / radius */
         X[o + 3] = cols ? cols[3 * c] * 65536 + cols[3 * c + 1] * 256 + cols[3 * c + 2] : 0;   /* the family / brain colour */
       }
+      SP1.n = n; SP1.epoch = s.worldEpoch; SP1.tick = tick;
+      swimA = SP1; swimB = SP0;
       /* the genes, by draw index: 16 texels a fish, the 63 genes and one zero */
       var tg = profiler.beginCpu();
       for (c = 0; c < n; c++) {
@@ -3018,9 +3239,15 @@
       q = Math.max(1, Math.min(3, q | 0));
       if (q === quality) return false;
       quality = q;
+      polishUniform();
       resize();
       return true;
     }
+    /* the swim polish: on from detail 2 up (the lowest detail, where Hold
+     * 60 fps ends up on a slow device, draws the fish as before it); off
+     * altogether only for measurements (setPolish, the render benchmark's A/B;
+     * polishWant is set with quality, at the top) */
+    function polishUniform() { common.uPolish.value = polishWant && quality >= 2 ? 1 : 0; }
 
     /* The water's clarity, 0 (realistic: the water exactly as the preview
      * drew it) .. 1 (clear; the default), drawing only (CLARITY). Live: it
@@ -3152,6 +3379,9 @@
       /* one step down: fewer pixels, then no shadows. false at the floor */
       degrade: function () { return setQuality(quality - 1); },
       setReducedMotion: function (on) { reduced = !!on; fishUniforms.uWag.value = reduced ? 0 : 1; },
+      /* the swim polish (POSE_GLSL, POLISH_FN) on / off, for measurements; polish(): is it drawn */
+      setPolish: function (on) { polishWant = !!on; polishUniform(); },
+      polish: function () { return common.uPolish.value === 1; },
       /* the flashlight: clear light on the followed fish, or where the camera
        * looks (aimBeam). Viewer only: nothing here reaches the simulation. */
       /* the appearance genome (web/ocean_appearance.js): each fish is drawn in
