@@ -54,9 +54,10 @@
 #   wasm/ocean_parity.sh              # everything (~8 min on 8 cores, both builds)
 #   JOBS=8 OCEAN_PARITY_DIR=/tmp/x wasm/ocean_parity.sh
 #                                     # (default: a fresh unique /tmp/ocean_parity.XXXXXX per run,
-#                                     # printed at the start, never deleted by this script, so two
-#                                     # runs (e.g. two worktrees) never clobber each other; an
-#                                     # explicit OCEAN_PARITY_DIR is reused and its old outputs cleared)
+#                                     # printed at the start, so two runs (e.g. two worktrees) never
+#                                     # clobber each other. Removed when the run passes unless KEEP_OUT=1;
+#                                     # kept when it fails. An explicit OCEAN_PARITY_DIR is reused, its old
+#                                     # outputs cleared, and never removed. Do not share one between runs)
 #   BUILD_JOBS=2 wasm/ocean_parity.sh # bound on concurrent compiler jobs in the build phase
 #                                     # (default min(JOBS, 2): the 8 compiles peak at ~4-5 GB at once)
 #   ONLY=def_s1 wasm/ocean_parity.sh  # one case (a grep -E pattern on the name)
@@ -146,10 +147,17 @@ BASE=tests/ocean_baseline
 JOBS=${JOBS:-4}
 BUILD_JOBS=${BUILD_JOBS:-$(( JOBS < 2 ? JOBS : 2 ))}
 [ "$BUILD_JOBS" -ge 1 ] 2>/dev/null || { echo "BUILD_JOBS must be a positive integer (got: $BUILD_JOBS)" >&2; exit 2; }
-if [ -n "${OCEAN_PARITY_DIR:-}" ]; then OUT=$OCEAN_PARITY_DIR; mkdir -p "$OUT"
-else OUT=$(mktemp -d /tmp/ocean_parity.XXXXXX) || exit 2; fi
+CREATED=0
+if [ -n "${OCEAN_PARITY_DIR:-}" ]; then OUT=$OCEAN_PARITY_DIR; mkdir -p "$OUT" || exit 2
+else OUT=$(mktemp -d /tmp/ocean_parity.XXXXXX) || exit 2; CREATED=1; fi
 echo "== outputs in $OUT"
-rm -f "$OUT"/*.txt "$OUT"/*.log "$OUT"/*.rc
+# Retention: a directory THIS script created is removed when the run passes (exit 0), unless KEEP_OUT=1;
+# a failed or interrupted run keeps it for diagnosis (delete it by hand). An explicit OCEAN_PARITY_DIR is never removed.
+if [ "$CREATED" = 1 ] && [ -z "${KEEP_OUT:-}" ]; then
+    trap 'rc=$?; wait; if [ $rc = 0 ]; then rm -rf "$OUT"; else echo "== kept $OUT (run did not pass)" >&2; fi' EXIT
+fi
+# a reused dir: clear the previous run's results, measurements and binaries so nothing stale can stand in for this run's
+rm -f "$OUT"/*.txt "$OUT"/*.log "$OUT"/*.rc "$OUT"/*.time "$OUT"/opd_* "$OUT"/ocean_tests_* || { echo "cannot clear $OUT" >&2; exit 2; }
 if ! command -v em++ > /dev/null; then
     # shellcheck disable=SC1090
     source ~/emsdk/emsdk_env.sh > /dev/null 2>&1
@@ -176,7 +184,8 @@ build () {  # build LABEL CMD...   (rc in build_LABEL.rc; peak RSS in build_LABE
     if [ $rc = 0 ]; then echo "   built $label"; else echo "   BUILD FAILED: $label"; cat "$OUT/build_$label.log"; return 1; fi
 }
 # at most BUILD_JOBS compiler jobs at a time (each can take ~0.5-1 GB)
-bgbuild () { while [ "$(jobs -rp | wc -l)" -ge "$BUILD_JOBS" ]; do wait -n; done; build "$@" & }
+EXPECT=()   # every build label launched; each must leave a successful rc (checked below)
+bgbuild () { EXPECT+=("$1"); while [ "$(jobs -rp | wc -l)" -ge "$BUILD_JOBS" ]; do wait -n; done; build "$@" & }
 VARIANTS="plain"; [ -z "${NO_EYE:-}" ] && VARIANTS="plain eye"
 echo "   (at most $BUILD_JOBS compiler job(s) at once)"
 for v in $VARIANTS; do
@@ -191,11 +200,13 @@ for v in $VARIANTS; do
 done
 wait
 BUILD_OK=1
-for r in "$OUT"/build_*.rc; do [ "$(cat "$r")" = 0 ] || BUILD_OK=0; done
+for l in "${EXPECT[@]}"; do   # a build that never wrote its rc (killed wrapper) fails the run
+    [ -r "$OUT/build_$l.rc" ] && [ "$(cat "$OUT/build_$l.rc")" = 0 ] || { echo "   no successful result for build: $l"; BUILD_OK=0; }
+done
 [ "$BUILD_OK" = 1 ] || { echo "== BUILD FAILED"; exit 1; }
-if [ ${#TIMEV[@]} -gt 0 ]; then   # largest single compile (KB -> MB); peak is at most BUILD_JOBS of these at once
-    PEAK_KB=$(grep -h "Maximum resident" "$OUT"/build_*.time 2>/dev/null | awk '{print $NF}' | sort -n | tail -1)
-    [ -n "$PEAK_KB" ] && echo "   largest single compile: $(( PEAK_KB / 1024 )) MB resident (peak <= $BUILD_JOBS x that)"
+if [ ${#TIMEV[@]} -gt 0 ]; then   # largest recorded per-command RSS (KB -> MB), this invocation's builds only
+    PEAK_KB=$(for l in "${EXPECT[@]}"; do grep -h "Maximum resident" "$OUT/build_$l.time" 2>/dev/null; done | awk '{print $NF}' | sort -n | tail -1)
+    [ -n "$PEAK_KB" ] && echo "   largest recorded per-command RSS: $(( PEAK_KB / 1024 )) MB (indicative only: not a bound on total concurrent memory)"
 fi
 sfx () { [[ $1 == eye_* ]] && echo _eye; }   # sfx CASE_NAME -> the build's binary suffix
 
@@ -688,6 +699,9 @@ for i in "${!NAMES[@]}"; do
     if [ -n "${FAST:-}" ] && [[ " $(echo $FAST_CASES) " != *" ${NAMES[$i]} "* ]]; then continue; fi
     SEL+=("$i")
 done
+if [ ${#SEL[@]} -eq 0 ]; then
+    echo "== NO CASE SELECTED (ONLY=${ONLY:-} NO_EYE=${NO_EYE:-} FAST=${FAST:-}): a run that checks nothing is a failure" >&2; exit 2
+fi
 FAST_BAD=""
 if [ -n "${FAST:-}" ]; then   # every FAST_CASES name must be a case (a typo would silently shrink the subset)
     for c in $FAST_CASES; do

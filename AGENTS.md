@@ -48,14 +48,14 @@ the site is static three.js/JS in `web/` (no JS build step). Python tools run ex
 ## Build
 
 ```bash
-cmake --preset native-serial && cmake --build --preset native-serial -j   # build_serial/ (the bit-exact one)
-cmake --preset native && cmake --build --preset native -j                 # build/ (OpenMP)
+cmake --preset native-serial && cmake --build --preset native-serial --parallel 2   # build_serial/ (the bit-exact one)
+cmake --preset native && cmake --build --preset native --parallel 2                 # build/ (OpenMP)
 (cd build_serial && ctest --output-on-failure)                             # core_tests, predator_smoke, ...
 source ~/emsdk/emsdk_env.sh                                                # emsdk 6.0.4 matches CI
 bash wasm/build_ocean.sh        # -> web/evo_ocean.{js,wasm}
 bash wasm/build_wasm.sh         # -> web/evo_boids*.{js,wasm} (Classic, ST + MT)
 bash wasm/build_site.sh         # -> dist/ (SITE_DIR=/x to build elsewhere)
-python3 wasm/serve.py [ROOT] [PORT]   # local server with the production isolation headers (default port 8123, open /web/)
+python3 wasm/serve.py web 8123   # local server (production isolation headers) with web/ as its root; ROOT/PORT optional (default: repo root, 8123, so pages are under /web/)
 ```
 
 Presets: `native`, `native-serial`, `wasm-st`, `wasm-mt`. The window app needs SFML; without it CMake skips it.
@@ -65,16 +65,24 @@ Memory is tight on the maintainer's PC: use `JOBS`/`BUILD_JOBS`, `nice -n 19`, a
 
 - `FAST=1 JOBS=2 BUILD_JOBS=2 bash wasm/ocean_parity.sh`: CI's subset. Builds the plain and eye drivers
   native + wasm; every case must print identical fingerprints native == wasm == `tests/ocean_baseline/<case>.txt`,
-  plus config guards, appearance-off twins, unit checks native and under node. No `FAST` = the full matrix
-  (`ocean-full.yml`). `ONLY=<regex>`, `NO_TESTS=1`, `NO_EYE=1`, `APP_TWINS=all` narrow it; `--help` lists all.
-  Each run writes to its own `/tmp/ocean_parity.XXXXXX` (or `OCEAN_PARITY_DIR`), so concurrent runs do not collide;
-  `BUILD_JOBS` (default min(JOBS,2)) bounds concurrent compiles.
-- `wasm/parity.sh`: Classic native serial == wasm, byte-identical checkpoints (`PARITY_DIR` to choose the dir).
+  plus config guards, appearance-off twins (only a default subset of the selected cases), unit checks native and
+  under node. Without `FAST` it runs every case, but twins are still the default subset; the weekly `ocean-full.yml`
+  equivalent is `APP_TWINS=all bash wasm/ocean_parity.sh` (`APP_TWINS=all` EXPANDS twin coverage).
+  `ONLY=<regex>`, `NO_TESTS=1`, `NO_EYE=1` NARROW the run (guards/unit checks/cases are skipped): a narrowed run is
+  not evidence for the whole gate; an empty selection is an error. `--help` lists all knobs.
+  Each run writes to its own `/tmp/ocean_parity.XXXXXX` (printed at start), so concurrent runs do not collide; it is
+  removed when the run passes (`KEEP_OUT=1` keeps it) and kept when it fails (delete failed dirs by hand). An explicit
+  `OCEAN_PARITY_DIR` is cleared at start, never removed, and must not be shared by two runs.
+  `BUILD_JOBS` (default min(JOBS,2)) bounds concurrent compiler jobs per invocation (two runs = twice that);
+  the printed per-command RSS is indicative, not a memory ceiling. `wasm/parity.sh` and `wasm/bench.sh` follow the
+  same dir policy (`PARITY_DIR`, `BENCH_DIR`, `KEEP_OUT`).
+- `wasm/parity.sh`: Classic native serial == wasm, byte-identical FINAL checkpoints (not a per-step chain).
 - `ctest` (serial, OpenMP, thread-pool builds): `core_tests`, `predator_smoke`, plus `reseed_after_load`,
   `invasion_tooling` in the serial build with SFML.
-- `build_ocean.sh` / `build_wasm.sh` then `git diff --quiet -- web/...`: committed modules match their sources.
+- `build_ocean.sh` / `build_wasm.sh` then `git diff --quiet -- web/` (exit 0 = unchanged; CI also uses `git diff --quiet -- web/evo_ocean.js web/evo_ocean.wasm`
+  for the Ocean): the rebuilt committed modules match their sources. If `web/` shows changes, the modules were stale.
 - `node tests/ocean_turbo_handoff.js`: Turbo hand-off, exit 0 = pass.
-- `node tests/ocean_render_browser.mjs --base http://localhost:PORT` (headless Brave, Playwright; see its header):
+- `node tests/ocean_render_browser.mjs --base http://localhost:8123` (serve with `python3 wasm/serve.py web 8123`; it appends `/ocean.html`; headless Brave, Playwright; see its header):
   render and shader checks on the real page. Browser-only; not in CI. Cases in `tests/fixtures/ocean_render_cases.json`.
 - Classic sha pin: any `src/core` change changes the Classic wasm; the committed `web/evo_boids*.wasm` hashes are
   pinned by the maintainer (a change needs a rebuild and an explicit decision).
@@ -83,7 +91,9 @@ Memory is tight on the maintainer's PC: use `JOBS`/`BUILD_JOBS`, `nice -n 19`, a
 
 ## Determinism contract
 
-- Results are bit-exact: native serial == wasm == committed baselines, every step. Compile with
+- Ocean: native == wasm == committed baselines (`tests/ocean_baseline`), compared via the per-step chained fingerprints.
+  Classic: native SERIAL == wasm final checkpoints. OpenMP, thread-pool and threaded-wasm Classic runs are NOT
+  seed-reproducible and carry no such guarantee. Compile with
   `-ffp-contract=off` (no FMA); no `-ffast-math`; use `portable_math.hpp` / `ocean_math.hpp`, not libm
   transcendentals, in simulation code. Same draws in the same order: adding or reordering an RNG draw changes behaviour.
 - Never rebaseline (`ocean_parity.sh --rebaseline --overwrite --reason ...`) without the owner's explicit approval;
@@ -98,5 +108,6 @@ Memory is tight on the maintainer's PC: use `JOBS`/`BUILD_JOBS`, `nice -n 19`, a
 - Commit messages: short subject, explain why; end with the attribution trailer your tool gives you
   (e.g. `Co-Authored-By: ...`). PR bodies list changes, evidence and gates run.
 - Don't commit build output dirs (`build*/`, `dist/`) or `/tmp` scratch. Keep generated files generated.
-- Python tools (`tools/invasion`, `tools/alife2027`) run with `python3`; their end-to-end test is `tests/invasion_tooling.sh`.
+- Python tools run with `python3`. Tests: `tests/invasion_tooling.sh` (tools/invasion, via ctest in the serial SFML build);
+  `tests/alife2027/test_runner.sh` and `tests/alife2027/test_stats.py` (tools/alife2027, run directly).
 - Prefer small, scoped edits; don't touch baselines, `web/*.wasm` or plane headers by hand.
