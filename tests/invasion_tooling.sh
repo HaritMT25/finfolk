@@ -33,6 +33,18 @@
 #      sign-flip lack-of-fit tests keep their level (the old chi-square did not);
 #  13. interpretation: the score is a founder pedigree index; S > 0 with one
 #      direction losing is 'opposite directions', never a reciprocal claim.
+#  Review round 2:
+#  14. directional labels use Student-t bounds (k - 1 df), not 1.96;
+#  15. an incomplete block publishes no sub-block p-values, and an omnibus
+#      needs every REGISTERED condition formal (no silent shrinking);
+#  16. calibration assesses the analysis's own primary configuration and binds
+#      its inputs, code and outputs in manifest.json; the stress worlds exist
+#      and the rare-event world breaks the tests (the qualification);
+#  17. bounded-scale sensitivity: a transitive bounded (logistic) ladder makes
+#      raw-scale curl that the bounded model removes; a planted cycle survives;
+#  18. the common fixed-step clock reads every run at the same step; horizon.py
+#      calibrates T on a cell selection; an extinct read scores s = -f0;
+#  19. infer.py and bounded.py self-tests (grouped omnibus, Gray-code flips).
 set -u
 BIN=${1:?usage: invasion_tooling.sh EVO_BOIDS WORKDIR}
 W=${2:?usage: invasion_tooling.sh EVO_BOIDS WORKDIR}
@@ -440,4 +452,164 @@ assert len(pt) == 1 and pt[0]["S"] > 0 and pt[0]["reciprocal"] == "opposite dire
 assert analyze.reciprocal(2.5, 3.0) == "reciprocal gain" and analyze.reciprocal(-2.5, -3.0) == "reciprocal suppression"
 assert analyze.reciprocal(2.5, 1.0) == "unresolved" and analyze.reciprocal(None, 3.0) == "unresolved"
 PY
+
+# 14. directional bounds from k replicates are Student-t, not normal: the pilot's Stage-A
+#     n101e / p103e pair at 10 replicates (-2.175, +1.979) is not 'opposite directions'
+$PY - "$T" <<'PY' || fail "directional labels need t bounds"
+import sys
+sys.path.insert(0, sys.argv[1]); import analyze
+assert abs(analyze.direction_cutoff(6) - 2.5706) < 1e-3 and abs(analyze.direction_cutoff(10) - 2.2622) < 1e-3
+assert analyze.reciprocal(-2.175, 1.979, 10, 10) == "unresolved"
+assert analyze.reciprocal(-2.175, 1.979) == "opposite directions"   # (the large-k limit only)
+assert analyze.reciprocal(-2.6, 2.6, 6, 6) == "opposite directions" and analyze.reciprocal(-2.5, 2.6, 6, 6) == "unresolved"
+prs = [{"cond": "predA4", "frac": 0.05, "G": 10.0, "j": "p103e", "i": "n101e", "st": -0.02, "se_paired": 0.0092, "z": -2.175, "k": 10},
+       {"cond": "predA4", "frac": 0.05, "G": 10.0, "j": "n101e", "i": "p103e", "st": 0.02, "se_paired": 0.0101, "z": 1.979, "k": 10}]
+pt = analyze.pair_table(prs)
+assert pt[0]["reciprocal"] == "unresolved" and abs(pt[0]["cut_a_into_b"] - 2.2622) < 1e-3, pt
+PY
+
+# 15. a block with a registered cell missing publishes no sub-block p-value, and an omnibus
+#     over the registered conditions with one of them incomplete is descriptive (it used to
+#     shrink to the formal ones)
+$PY - "$T" <<'PY' || fail "sub-block / omnibus decision gates"
+import random, sys
+sys.path.insert(0, sys.argv[1]); import analyze
+rnd = random.Random(15)
+names = ["a1", "a2", "a3", "b1", "b2", "b3"]
+meta = {nm: {"run": "r" + nm, "regime": nm[0], "family": "f" + nm, "time": 1} for nm in names}
+conds, reps = ("off", "predA", "predB"), (0, 1, 2)
+rows, reg = [], {}
+for c in conds:
+    for j in names:
+        for i in names:
+            mode = "sham" if i == j else "invade"
+            reg.setdefault((c, 0.05), {})[(i, j, mode)] = set(reps)
+            for r in reps:
+                if c == "predB" and (i, j, r) == ("a1", "b2", 1):
+                    continue   # one registered cell never finished
+                rows.append({"cond": c, "frac": 0.05, "G": 5.0, "mode": mode, "i": i, "j": j, "rep": r,
+                             "s": (0.0 if i == j else 0.02 * (names.index(i) - names.index(j))) + rnd.gauss(0, 0.004),
+                             "missed": False})
+out, detail, blocks, joint, subs = analyze.matrices(rows, meta, sims=49, registry=reg, kind="residual")
+st = {m["cond"]: m["status"] for m in out}
+assert st["off"] == st["predA"] == "formal" and st["predB"].startswith("descriptive"), st
+for s in subs:
+    if s["cond"] == "predB":
+        assert s["p_lof"] is None and s["p_lof_flip"] is None and s["status"].startswith("descriptive"), s
+    elif s["group"].startswith("regime="):   # complete sub-blocks of a formal block are tested
+        assert s["p_lof"] is not None, s
+assert joint and all(j["status"].startswith("descriptive") and j.get("p_lof") is None and j.get("p_primary") is None
+                     for j in joint), joint
+assert all(j["required"] == "off predA predB" for j in joint), joint
+# with predB not registered, the two formal conditions are the registered set: formal, both structures
+reg2 = {k: v for k, v in reg.items()}
+rows2 = [x for x in rows if x["cond"] != "predB"]
+out, detail, blocks, joint, subs = analyze.matrices(rows2, meta, sims=49, registry={("off", 0.05): reg[("off", 0.05)],
+                                                    ("predA", 0.05): reg[("predA", 0.05)]}, kind="residual")
+kinds = {j["structure"]: j for j in joint}
+assert set(kinds) == {"pooled block x assays", "home-regime sub-blocks x assays (regimes independent)"}, kinds
+assert all(j["status"] == "formal" and j["p_lof"] is not None for j in joint), joint
+assert kinds["home-regime sub-blocks x assays (regimes independent)"]["flip_min_p"] == 1 / 16
+# without a plan nothing is formal
+out, detail, blocks, joint, subs = analyze.matrices(rows2, meta, sims=49, registry=None, kind="residual")
+assert all(j.get("p_lof") is None for j in joint) and all(s["p_lof"] is None for s in subs)
+PY
+
+# 16. calibration runs the analysis's own primary configuration, refuses another primary kind,
+#     binds blocks / code / outputs in manifest.json, and has the stress worlds; the rare-event
+#     world (review round 2's counterexample) breaks the sign-flip at k = 6 (the qualification)
+$PY "$T/calibrate.py" --blocks an3/blocks.json --key off/0.1/0.25 --out cal_bad --kinds wild > cal_bad.log 2>&1
+[ $? = 2 ] && grep -q "primary bootstrap kind" cal_bad.log || fail "calibrate.py accepted a primary kind other than the analysis's"
+$PY "$T/calibrate.py" --blocks an3/blocks.json --key off/0.1/0.25 --out cal3 --sims 10 --B 19 --chunk 5 --no-plants \
+    --worlds hetero,skewfactor,mixture,rare1 --workers 2 > cal3.log 2>&1 || fail "calibrate.py: $(tail -5 cal3.log)"
+$PY - "$T" <<'PY' || fail "calibration provenance / configuration"
+import csv, hashlib, json, math, random, sys
+sys.path.insert(0, sys.argv[1]); import calibrate, infer
+h = lambda p: hashlib.sha256(open(p, "rb").read()).hexdigest()
+m = json.load(open("cal3/manifest.json"))
+assert m["blocks"]["sha256"] == h("an3/blocks.json") and m["outputs"]["calib.csv"] == h("cal3/calib.csv")
+assert m["outputs"]["calib.md"] == h("cal3/calib.md") and m["primary"] == infer.PRIMARY
+for f in ("calibrate.py", "infer.py", "hodge.py", "bounded.py"):
+    assert m["code"][f] == h(f"{sys.argv[1]}/{f}"), f
+assert m["args"]["kinds"] == infer.PRIMARY["kind"] and m["task_seeds"], m["args"]
+rows = list(csv.DictReader(open("cal3/calib.csv")))
+assert {r["world"] for r in rows} == {"hetero", "skewfactor", "mixture", "rare1"}
+assert any(r["test"].startswith("ball coverage") for r in rows)
+# the rare-event counterexample: mean zero, bounded, yet the exact-looking test rejects most nulls
+w = calibrate.World([[[0.0 if i == p else rnd_ for i, rnd_ in enumerate((0.01,) * 6)] for _ in range(6)] for p in range(6)], "rare1")
+rnd = random.Random(16)
+rej = sum(infer.signflip([w.draw(rnd)]) <= 0.05 for _ in range(200)) / 200
+assert rej > 0.5, rej
+PY
+
+# 17. bounded-scale sensitivity: a transitive logistic ladder (no ordinal cycle) has raw-scale curl;
+#     the logistic node-additive model removes it, while a sign-reversing cycle on top survives
+$PY - "$T" <<'PY' || fail "bounded-scale sensitivity"
+import math, random, sys
+sys.path.insert(0, sys.argv[1]); import analyze, bounded
+rnd = random.Random(17)
+names = [f"x{t}" for t in range(6)]
+u = [0.0, 0.5, 1.0, 1.5, 2.0, 2.5]
+def rows_for(cycle):
+    rows = []
+    for jj, j in enumerate(names):
+        for ii, i in enumerate(names):
+            for r in range(4):
+                if i == j:
+                    q = 0.05 + rnd.gauss(0, 1e-5)
+                else:
+                    q = bounded.sigmoid(math.log(0.05 / 0.95) + u[ii] - u[jj])
+                    q += cycle.get((ii, jj), 0.0) - cycle.get((jj, ii), 0.0) + rnd.gauss(0, 1e-5)
+                rows.append({"cond": "off", "frac": 0.05, "G": 5.0, "mode": "sham" if i == j else "invade", "i": i,
+                             "j": j, "rep": r, "s": q - 0.05, "f0": 0.05, "missed": False})
+    return rows
+reg = None
+rows = rows_for({})
+out, detail, blocks, joint, subs = analyze.matrices(rows, None, sims=49, registry=reg, kind="residual")
+assert out[0]["triads_cyclic"] == 0 and out[0]["noise_corrected"] > 0.005, out[0]["noise_corrected"]
+srows, mrows = analyze.scale_sensitivity(rows, blocks, ["logit:0.001", "asin"], ["logistic", "strength"], 49, 49)
+ms = {m["model"]: m for m in mrows}
+for nm in ("logistic", "strength"):
+    assert ms[nm]["C_fit"] > 0.95 * ms[nm]["T_C"] and ms[nm]["share_res_nc"] < 0.02 * ms[nm]["share_nc_raw"], ms[nm]
+sc = {s["scale"]: s for s in srows}
+assert sc["logit:0.001"]["noise_corrected"] < 1e-3 and abs(sc["raw"]["cyclic_share"] - out[0]["cyclic_share"]) < 1e-12, sc
+rows = rows_for({(0, 1): 0.06, (1, 2): 0.06, (2, 0): 0.06})
+out, detail, blocks, joint, subs = analyze.matrices(rows, None, sims=49, registry=reg, kind="residual")
+srows, mrows = analyze.scale_sensitivity(rows, blocks, [], ["logistic"], 49, 49)
+assert mrows[0]["survival"] > 0.3 and mrows[0]["share_res_nc"] > 0.01, mrows[0]
+PY
+$PY "$T/analyze.py" --root root3 --out an3s --plan plan3.jsonl --windows 0.25 --max-window-error 0.6 --sims 50 \
+    --bounded-sims 20 > an3s.log 2>&1 || fail "analyze.py (bounded outputs): $(tail -5 an3s.log)"
+[ -s an3s/scale.csv ] && [ -s an3s/bounded.csv ] && grep -q "Bounded-scale sensitivity" an3s/summary.md \
+    || fail "analyze.py wrote no bounded-scale tables"
+
+# 18. common fixed-step clock: every run read at the same step (exactly, at a checkpoint); T from
+#     horizon.py on a selection of cells; an extinct read is the unconditional endpoint s = -f0
+$PY "$T/horizon.py" --root root3 --plan plan3.jsonl --select mode=sham --generations 0.25 --grid 300 --out hz3.json \
+    > hz3.log 2>&1 || fail "horizon.py: $(tail -3 hz3.log)"
+$PY "$T/analyze.py" --root root3 --out an3t --plan plan3.jsonl --clock steps --horizon hz3.json --sims 50 --scales "" \
+    --bounded "" > an3t.log 2>&1 || fail "analyze.py --clock steps: $(tail -5 an3t.log)"
+$PY - "$T" <<'PY' || fail "fixed-step clock / extinction"
+import csv, json, sys
+sys.path.insert(0, sys.argv[1]); import analyze
+hz = json.load(open("hz3.json"))
+assert hz["T"] % 300 == 0 and hz["T2"] == 2 * hz["T"] and hz["cells"] and all(c["id"].split("_")[3] == "sham" for c in hz["cells"]), hz
+runs = list(csv.DictReader(open("an3t/runs.csv")))
+Ws = {float(x["W"]) for x in runs}
+assert Ws == {float(hz["T"]), float(hz["T2"])} or Ws == {float(hz["T"])}, Ws
+for x in runs:
+    if x["missed"] == "False":
+        assert float(x["steps_at"]) == float(x["W"]) and float(x["rel_err"]) == 0.0, x
+inp = json.load(open("an3t/inputs.json"))
+assert inp["clock"] == "steps" and inp["horizon"]["T"] == hz["T"]
+rec = {"id": "x", "j": "A", "i": "B", "mode": "invade", "frac": 0.1, "cond": "off", "rep": 0, "n0": 100, "m": 10,
+       "f0": 0.1, "points": [{"steps": 300, "score": None, "extinct": True, "n": 0, "births": 40, "generations": 0.4,
+                              "invader_lost": False}]}
+r = analyze.run_rows([rec], {}, [300.0], 0.1, clock="steps")
+assert r[0]["s"] == -0.1 and r[0]["extinct"] and r[0]["gens"] == 0.4, r
+PY
+
+# 19. self-tests of the inference and bounded-scale modules
+$PY "$T/infer.py" > /dev/null || fail "infer.py self-test"
+$PY "$T/bounded.py" > /dev/null || fail "bounded.py self-test"
 echo "invasion_tooling: ok"
