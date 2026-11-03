@@ -26,6 +26,11 @@
  *                                     chunks; the page asks only while that
  *                                     panel shows, every 2 s at most, one
  *                                     question at a time
+ *   in : {cmd:'snapshot', id}      -> Save world while Turbo runs: a copy of
+ *                                     the world now, between chunks; Turbo
+ *                                     carries on
+ *   out: {type:'snapshot', id, mem: ArrayBuffer, frame, pop, food, pred,
+ *        totalSteps}, or {type:'snapshot', id, none: true} with no world here
  *   out: {type:'stats', frame, pop, food, pred, stepsPerSec, totalSteps, st, su}
  *        ~4x/s; st: oc_stats, su: oc_summary of the world now (the page's
  *        readout and stat panel show them while Turbo owns the world)
@@ -122,6 +127,17 @@ onmessage = function (e) {
   } else if (msg.cmd === "wiring") {
     if (!M || !owns) { postMessage({ type: "wiring", none: true }); return; }   /* no world here (yet, or any more) */
     try { postMessage(wiring()); } catch (err) { fail(err, "on the wiring"); }
+  } else if (msg.cmd === "snapshot") {
+    /* Save world while Turbo runs: a copy of the world as it is now, between
+     * two chunks (no step is part-way), and Turbo carries on. Every live
+     * setting sent before this question is in it (their answers go out
+     * first), none sent after. */
+    if (!M || !owns) { postMessage({ type: "snapshot", id: msg.id, none: true }); return; }
+    try {
+      var copy = heap().slice(0), f = frameNow();   /* the copy first, untouched by the sync that reads its frame (a sync never steps) */
+      postMessage({ type: "snapshot", id: msg.id, mem: copy, frame: f, pop: M._oc_creature_count(), food: M._oc_food_count(),
+                    pred: M._oc_predator_count(), totalSteps: totalSteps }, [copy]);
+    } catch (err) { fail(err, "on Save world"); }
   }
 };
 
