@@ -15,9 +15,15 @@ TS=${2:-"2 4 8"}
 REPS=${REPS:-3}
 WARM=${WARM:-300}
 MEASURE=${MEASURE:-1000}
-OUT=${BENCH_DIR:-/tmp/evo_bench}
 NODE=${EMSDK_NODE:-node}
-mkdir -p "$OUT"
+# a unique dir per run (two worktrees can bench at once, though timings need a quiet machine); BENCH_DIR reuses one.
+# Removed on success unless KEEP_OUT=1 (raw.txt is in it); kept on failure; an explicit BENCH_DIR is never removed.
+if [ -n "${BENCH_DIR:-}" ]; then OUT=$BENCH_DIR; mkdir -p "$OUT"
+else
+    OUT=$(mktemp -d /tmp/evo_bench.XXXXXX)
+    if [ -z "${KEEP_OUT:-}" ]; then trap 'rc=$?; if [ $rc = 0 ]; then rm -rf "$OUT"; else echo "== kept $OUT (run did not pass)" >&2; fi' EXIT; fi
+fi
+echo "== outputs in $OUT"
 
 CXX="-O3 -std=c++20 -ffp-contract=off -I src wasm/bench_fixed.cpp"
 echo "== building"
