@@ -309,6 +309,8 @@ const PAGE_SRC = (() => {
         '    getVal: getVal, importWorld: importWorld, wiringNow: wiringNow, frame: frame,\n' +
         '    get worldSave() { return typeof worldSave === "undefined" ? null : worldSave; }, get selectedId() { return selectedId; },\n' +
         '    get engineState() { return typeof engineState === "undefined" ? null : engineState; },\n' +
+        '    get filesRead() { return typeof filesRead === "undefined" ? null : filesRead; }, get fileReq() { return fileReq; },\n' +
+        '    answered: function (id) { return typeof fileAnswered === "undefined" ? null : fileAnswered.indexOf(id) >= 0; },\n' +
         '    get rebuilds() { return typeof rebuilds === "undefined" ? 0 : rebuilds; }, get pinned() { return typeof pinned === "undefined" ? null : pinned; },\n' +
         '    urlImport: function (P) {\n' + src.slice(a, b) + '    }\n  };';
     return src.slice(0, end) + access + src.slice(end);
@@ -567,7 +569,8 @@ async function bootPage(query, opts) {
     };
     const wasm = opts.nosimd ? Object.assign(Object.create(WebAssembly), { validate: () => false }) : WebAssembly;
     const ctx = {
-        document: doc, location: loc, navigator: { userAgent: 'node' },
+        /* opts.deviceMemory: navigator.deviceMemory (Chrome's GB; none: a browser that doesn't say) */
+        document: doc, location: loc, navigator: Object.assign({ userAgent: 'node' }, opts.deviceMemory ? { deviceMemory: opts.deviceMemory } : {}),
         history: { replaceState: (s, t, u) => setLoc(String(u)) },
         localStorage: { getItem: k => (storage.has(k) ? storage.get(k) : null), setItem: (k, v) => storage.set(k, String(v)), removeItem: k => storage.delete(k) },
         matchMedia,
@@ -592,9 +595,12 @@ async function bootPage(query, opts) {
             return Promise.resolve({ ok: true, status: 200, arrayBuffer: () => Promise.resolve(page.wasmBytes.slice(0)) });
         },
         console: { log: say('log'), info: say('info'), warn: say('warn'), error: say('error'), debug: say('debug') },
-        /* hooks.timer(ms): the delay a page's timer really gets (a test shortens a watchdog with it) */
-        setTimeout: (f, ms) => unref(setTimeout(f, page.hooks.timer ? page.hooks.timer(ms) : ms)), clearTimeout,
-        setInterval: (f, ms) => unref(setInterval(f, ms)), clearInterval,
+        /* hooks.timer(ms): the delay a page's timer really gets (a test shortens a watchdog with it); an
+         * exception in a timer is reported, as a browser's (page.uncaught), not node's crash */
+        setTimeout: (f, ms) => unref(setTimeout(() => { try { f(); } catch (e) { page.uncaught.push('timer: ' + String(e && e.stack || e)); } },
+                                                page.hooks.timer ? page.hooks.timer(ms) : ms)), clearTimeout,
+        setInterval: (f, ms) => unref(setInterval(() => { try { f(); } catch (e) { page.uncaught.push('timer: ' + String(e && e.stack || e)); } },
+                                                  page.hooks.timer ? page.hooks.timer(ms) : ms)), clearInterval,
         EVO_ASSETS: { ocean: 'evo_ocean.js', oceanWasm: 'evo_ocean.wasm', worker: 'ocean_worker.js', handoff: 'ocean_handoff.js', mock: 'ocean_mock.js' },
         /* a saved world's test run gets a worker of its own (web/ocean.js probeWorld: named "ocean-probe") */
         Worker: function (url, o) { return o && o.name === 'ocean-probe' ? page.newProbe() : page.newWorker(); }
@@ -3604,6 +3610,7 @@ async function worldCodec() {
 /* the page's Save world: its file's name and bytes */
 async function savedWorld(p) {
     const n = p.downloads.length;
+    p.el('err').textContent = '';   /* (an earlier refusal's text is not this save's answer) */
     p.click('saveworld');
     await until(() => p.downloads.length > n || /Couldn't save|not saved/.test(p.msg()), 'Save world\'s file', 120000);
     if (p.downloads.length === n) throw new Error('Save world: ' + p.msg());
@@ -3612,11 +3619,14 @@ async function savedWorld(p) {
 }
 /* From a file with a world file (a real File: its first bytes say what it is); the page's answer */
 async function openWorld(p, bytes, name) {
-    const e0 = p.T.worldEpoch;
+    const e0 = p.T.worldEpoch, id = p.T.fileReq + 1;
     p.el('err').textContent = '';
     p.loadFile(new File([bytes], name || 'saved.oceanworld'));
-    /* (a page in Turbo shares node's one event loop with its worker: the decompression waits behind its chunks) */
-    await until(() => p.T.worldEpoch !== e0 || p.T.asking || /That|Couldn't|not opened/.test(p.msg()), 'the world file\'s answer', 120000);
+    /* (a page in Turbo shares node's one event loop with its worker: the decompression waits behind its chunks)
+     * The page's own record that this read answered, when it has one (review of #44, round 2, finding 6: a
+     * status can change twice between two polls, a rebuild's "The engine restarted" matching none of these) */
+    await until(() => p.T.answered(id) !== null ? p.T.answered(id) : p.T.worldEpoch !== e0 || p.T.asking || /That|Couldn't|not opened/.test(p.msg()),
+                'the world file\'s answer', 120000);
     return p.msg();
 }
 /* the page's frame, its world stepped n (paused: the frame loop syncs, steps nothing) */
@@ -4341,6 +4351,309 @@ async function reviewTurboStates() {
     }
 }
 
+/* ---------------------------------------------------------------------
+ * Codex's second review of #44 (codex_reviews/2026-11-03_rereview2_pr44_world-file.md):
+ * a section per finding; each check fails with its fix taken out (the PR lists the planted runs).
+ * --------------------------------------------------------------------- */
+/* a sealed world file of a saved header h with a zero image of `bytes` (all of it stored but its last word: gzip
+ * makes it small): what a small file can ask a page to hold */
+async function zeroWorld(h, bytes) {
+    const img = new Uint8Array(bytes);
+    img[bytes - 1] = 1;   /* (a last word not zero: all of it is stored) */
+    return craftedFile(h, img.buffer);
+}
+/* a File whose reads are counted (start, end) */
+function countedFile(bytes, name) {
+    const f = new File([bytes], name), g = { name, size: f.size, reads: [] };
+    g.slice = (x, y) => { g.reads.push([x, y]); return f.slice(x, y); };
+    return g;
+}
+async function answerOf(p, file) {
+    const id = p.T.fileReq + 1;
+    p.el('err').textContent = '';
+    p.loadFile(file);
+    await until(() => p.T.answered(id), 'the file\'s answer', 120000);
+    return p.msg();
+}
+const bodyRead = (g, at) => g.reads.some(r => r[0] >= at);
+
+async function review2Budget() {
+    section('Second review of #44, finding 1: what an open holds at once, against this device\'s budget, before the body is read; one decode and test run at a time, a superseded one cancelled');
+    const { s, h, at } = await aSavedWorld();
+    const big = await zeroWorld(h, 64 * MB), bigAt = HO.worldHeader(big).at;
+    {   /* a small device (deviceMemory 0.5: a 64 MB image cap, a 192 MB budget): a page whose run uses 40 MB opens a 64 MB world
+         * only outside Turbo (in Turbo its worker's copy counts too); grown to 64 MB, not at all; each refusal before the body is read */
+        const p = await bootPage(PAGE_Q7, { deviceMemory: 0.5 });
+        while (HO.buffer(p.M).byteLength < 40 * MB) growMiB(p.M);
+        p.raf(performance.now());
+        p.click('turbobtn');
+        await until(() => p.T.turboState === 'turbo' && p.T.turboStats && p.T.turboStats.memBytes, 'Turbo');
+        const g1 = countedFile(big, 'big.oceanworld'), m1 = await answerOf(p, g1);
+        p.click('turboexit');
+        await until(() => p.T.turboState === 'live', 'the hand-back');
+        const g2 = countedFile(big, 'big.oceanworld'), m2 = await answerOf(p, g2);
+        while (HO.buffer(p.M).byteLength < 70 * MB) growMiB(p.M);
+        p.raf(performance.now());
+        const g3 = countedFile(big, 'big.oceanworld'), m3 = await answerOf(p, g3);
+        const c = { turbo: /would hold about [\d.]+ MB at once with your run and Turbo's copy of it, more than this page lets itself use on this device \(192\.0 MB\)/.test(m1) && /Stop Turbo first/.test(m1) && !bodyRead(g1, bigAt),
+                    live: /failed its test run \(it holds no world/.test(m2) && bodyRead(g2, bigAt),
+                    grown: /would hold about [\d.]+ MB at once with your run, more than this page lets itself use on this device \(192\.0 MB\)/.test(m3) && !bodyRead(g3, bigAt) };
+        ok(all(c), 'deviceMemory 0.5, a run of 40 MB, a sealed 64 MB zero world (' + sizeOf(big.length) + '): in Turbo refused unread ("' + m1.slice(0, 150) + '…"); ' +
+           'live, read and refused by its test run; the run grown to 70 MB, refused unread' + nots(c));
+    }
+    {   /* the device's image cap: deviceMemory 2 opens images up to 128 MB, 8 up to 512 MB; a browser that doesn't say: 256 MB (a desktop), 128 MB (a phone) */
+        const f = await resealed(big, (x) => { x.image.bytes = 200 * MB; });   /* (refused from its header: its body never read) */
+        const p2 = await bootPage(PAGE_Q7, { deviceMemory: 2 }), m2 = await answerOf(p2, countedFile(f, 'a.oceanworld'));
+        const pp = await bootPage(PAGE_Q7, { media: { '(pointer: coarse)': true } }), mp = await answerOf(pp, countedFile(f, 'a.oceanworld'));
+        const g = await resealed(big, (x) => { x.image.bytes = 300 * MB; });
+        const pd = await bootPage(PAGE_Q7), md = await answerOf(pd, countedFile(g, 'b.oceanworld'));
+        ok(/needs 200 MB of memory, more than this device opens \(128 MB at most here\)/.test(m2) && /more than this device opens \(128 MB at most here\)/.test(mp) &&
+           /needs 300 MB of memory, more than this device opens \(256 MB at most here\)/.test(md),
+           'the image cap by device: deviceMemory 2 refuses 200 MB ("' + m2 + '"), a phone that doesn\'t say too, a desktop that doesn\'t say refuses 300 MB');
+    }
+    {   /* superseded work: a test run held, a newer file meanwhile: the held one is terminated before the newer one's test run starts, and the newer opens */
+        const p = await bootPage(PAGE_Q7);
+        const runs = [];
+        let aliveAtSecond = null;
+        p.hooks.timer = (ms) => ms === 50 ? 1500 : ms;   /* (the page notices the superseded run slowly: one at a time must hold anyway) */
+        p.hooks.onProbe = (sh) => { runs.push(sh); if (runs.length === 1) sh.pause(); else aliveAtSecond = runs[0].terminated === 0; };
+        p.loadFile(new File([s.bytes], 'first.oceanworld'));
+        await until(() => runs.length === 1 && runs[0].queue.length, 'the first test run, held');
+        const said = await openWorld(p, s.bytes, 'second.oceanworld');
+        p.hooks.timer = null; p.hooks.onProbe = null;
+        ok(runs.length === 2 && aliveAtSecond === false && runs[0].terminated === 1 && /^Opened the saved world second\.oceanworld/.test(said) && !/first/.test(toastText(p)),
+           'a newer file while a test run is held: that run terminated before the newer one\'s starts (one at a time), the newer opened ("' + said.slice(0, 50) + '…")');
+    }
+    {   /* the unpacking itself, superseded: cancelled at its next chunk, its stream cancelled */
+        const proto = globalThis.ReadableStreamDefaultReader.prototype, cancel = proto.cancel;
+        let cancels = 0, why = '', chunks = 0;
+        proto.cancel = function () { cancels++; return cancel.apply(this, arguments); };
+        try {
+            const r = await HO.readWorld(HO.bytesSource(big));
+            why = await r.body(() => ++chunks > 2).then(() => '', (e) => String(e.message));
+        } finally { proto.cancel = cancel; }
+        ok(why === HO.CANCELLED && cancels === 1 && chunks === 3, 'a decode superseded mid-way: it stops at its next chunk (' + chunks + ' asked), its stream cancelled (' + cancels + ')');
+    }
+    {   /* a question about one saved world, then another file: the question (and its image) goes, the newer file answers */
+        const p = await bootPage(PAGE_Q7);
+        p.edit('minSpeed', 35);
+        await openWorld(p, s.bytes, 'one.oceanworld');
+        const first = p.T.asking && p.T.asking.plan;
+        await openWorld(p, s.bytes, 'two.oceanworld');
+        const second = p.T.asking && p.T.asking.plan;
+        ok(first && second && first !== second && /two\.oceanworld/.test(p.el('startaskmsg').textContent),
+           'a question about one saved world, then another world file: the newer file\'s question replaces it');
+    }
+    void at;
+}
+
+async function review2LateFailure() {
+    section('Second review of #44, finding 2: a failure late in an open (after the charts, Turbo\'s history and the draft\'s generation were reset) puts every one of them back');
+    const { s } = await aSavedWorld({ idx: 3, follow: true });   /* (its fish followed: the open follows it, the undo must stop that) */
+    const rowsOf = (p) => JSON.stringify(p.ctx.EvoOceanDash._rows().map(r => r.st[1]));
+    const lateFail = (p) => { const o = p.ctx.EvoOceanDash.origin; p.ctx.EvoOceanDash.origin = function () { p.ctx.EvoOceanDash.origin = o; throw new Error('injected: a late failure'); }; };
+    {   /* live: a run with chart history, Turbo used, a fish picked (not followed) */
+        const p = await bootPage(PAGE_Q);
+        for (let i = 0; i < 4; i++) runPage(p, 61);
+        p.click('turbobtn');
+        await until(() => p.T.turboState === 'turbo', 'Turbo');
+        await until(() => p.T.turboStats && p.T.turboStats.frame > frame(p.M) + 130, 'Turbo to run');
+        p.click('turboexit');
+        await until(() => p.T.turboState === 'live', 'the hand-back');
+        p.ctx.EvoOcean.select(2);
+        p.raf(performance.now());
+        const before = { rows: rowsOf(p), note: p.ctx.EvoOceanDash.note(), used: p.T.usedTurbo, gen: p.T.draftGen, epoch: p.T.worldEpoch, sel: p.T.selectedId,
+                         world: p.world(), print: fingerprint(p.M) };
+        const img = HO.buffer(p.M).slice(0);
+        await openWorld(p, s.bytes);
+        const wasAsked = asked(p);
+        lateFail(p);
+        p.click('startconfirm');
+        const ref = await mk(1, {}, 300, 300, 0);
+        HO.take(ref, img.slice(0), 'the control');
+        const diff = sameFor(p.M, ref, 30);
+        const k = { wasAsked, said: /injected: a late failure\. Your run carries on, as it was/.test(p.msg()), rows: rowsOf(p) === before.rows && JSON.parse(before.rows).length >= 4,
+                    note: p.ctx.EvoOceanDash.note() === before.note, usedTurbo: p.T.usedTurbo === true, gen: p.T.draftGen === before.gen, epoch: p.T.worldEpoch === before.epoch,
+                    sel: p.T.selectedId === before.sel, notFollowing: !p.ctx.EvoOcean.state().following, world: p.world() === before.world, same: !diff };
+        ok(all(k), 'live, a late failure (in the open\'s last step, after its fish was followed): the charts (' + JSON.parse(before.rows).length + ' samples) and their note, Turbo\'s history, ' +
+           'the draft\'s generation, the epoch, the picked fish, the follow (off again), the world: all as before; 30 steps bit-identical' + (diff ? ': ' + diff : '') + nots(k));
+    }
+    {   /* the confirmed Turbo path: Stop Turbo & open with chart history and a followed fish Turbo will pick up again */
+        const p = await bootPage(PAGE_Q);
+        for (let i = 0; i < 3; i++) runPage(p, 61);
+        p.ctx.EvoOcean.select(1); p.click('followbtn');
+        const id = p.T.selectedId;
+        p.click('turbobtn');
+        await until(() => p.T.turboState === 'turbo', 'Turbo');
+        await until(() => p.T.turboStats && p.T.turboStats.frame > 600, 'Turbo to run');
+        const gen = p.T.draftGen, epoch = p.T.worldEpoch;
+        await openWorld(p, s.bytes);
+        const wasAsked = asked(p) && p.el('startconfirm').textContent === 'Stop Turbo & open';
+        lateFail(p);
+        p.click('startconfirm');
+        await until(() => p.T.turboState === 'live' && !p.T.pendingStart, 'the hand-back and the open');
+        const rows = JSON.parse(rowsOf(p)), st = p.ctx.EvoOcean.state();
+        const k = { wasAsked, said: /injected: a late failure\. Your run carries on, as it was/.test(p.msg() + ' ' + toastText(p)), rows: rows.length >= 8 && rows[rows.length - 1] >= 600,
+                    note: /^Recorded on this device since the last restart/.test(p.ctx.EvoOceanDash.note()), usedTurbo: p.T.usedTurbo === true, gen: p.T.draftGen === gen,
+                    epoch: p.T.worldEpoch === epoch, frame: frame(p.M) >= 600,
+                    /* picked up again as after any Stop: itself or its nearest kin, followed; or, its line gone in the long Turbo, said so */
+                    fish: st.selectedId !== null ? st.following : /did not survive Turbo/.test(toastText(p)), seed: p.T.initArgs.seed === 4242 && frame(p.M) !== HO.worldHeader(s.bytes).header.frame };
+        ok(all(k), 'Stop Turbo & open, a late failure: the run Turbo handed back carries on with its charts (' + rows.length + ' samples, to frame ' + rows[rows.length - 1] + '), ' +
+           'Turbo\'s history, the draft\'s generation, the epoch, and its followed fish (#' + id + ') picked up again, as after any Stop (#' + st.selectedId + ')' + nots(k));
+    }
+    {   /* a throw while the image is copied in (after writing): the run back too */
+        const q = await bootPage(PAGE_Q7);
+        runPage(q, 40);
+        const r = runOf(q), H = q.ctx.EvoOceanHandoff, take = H.take;
+        H.take = function () { H.take = take; take.apply(this, arguments); throw new Error('injected: a copy that failed half-way'); };
+        const said = await openWorld(q, s.bytes);
+        ok(/injected: a copy that failed half-way\. Your run carries on, as it was/.test(said) && sameRun(q, r), 'a throw from the copy itself, after it wrote: the run back as it was ("' + said.slice(0, 90) + '…")');
+    }
+}
+
+async function review2Fence() {
+    section('Second review of #44, finding 3: a trap anywhere the page reads the engine (the sync, a fish card, the readout, the charts\' wiring) stops it once; nothing reaches it after');
+    const EXPORTS = ['_oc_step', '_oc_sync', '_oc_inspect', '_oc_summary', '_oc_wiring', '_oc_set_param', '_oc_set_capture', '_oc_set_colour_mode', '_oc_families'];
+    /* a page whose `name` traps from now on; calls: every listed export's calls counted */
+    async function trapping(name, setup) {
+        const p = await bootPage(PAGE_Q7);
+        if (setup) await setup(p);
+        const calls = {};
+        for (const f of EXPORTS) {
+            const real = p.M[f];
+            calls[f] = 0;
+            p.M[f] = function () { calls[f]++; if (f === name) throw new WebAssembly.RuntimeError('injected: a trap in ' + name); return real.apply(this, arguments); };
+        }
+        return { p, calls };
+    }
+    /* what a visitor does after: frames, a fish picked, a live setting, a colour, follow, Turbo, Save world, R, the charts' wiring */
+    async function afterwards(p) {
+        for (let i = 0; i < 3; i++) p.raf(performance.now() + 1000 * i);
+        p.ctx.EvoOcean.select(0);
+        p.edit('minSpeed', 33);
+        p.ctx.EvoOcean.set('minSpeed', 34);
+        const b = p.el('colourMode').children.find(c => c.dataset && c.dataset.c === 'brain');
+        if (b) b.click();
+        p.key('f'); p.key('t'); p.click('saveworld'); p.key('r');
+        p.ctx.EvoOceanDash.showTab('brains');
+        await new Promise(r => setTimeout(r, 700));
+        p.ctx.EvoOceanDash.close();
+    }
+    const ways = [
+        ['the frame\'s sync', '_oc_sync', null, (p) => p.raf(performance.now())],
+        ['a fish card\'s oc_inspect', '_oc_inspect', (p) => { p.ctx.EvoOcean.select(0); }, (p) => p.raf(performance.now())],
+        ['the readout\'s summary', '_oc_summary', null, (p) => p.raf(performance.now() + 5000)],
+        ['the charts\' wiring (their timer)', '_oc_wiring', null, async (p) => { p.ctx.EvoOceanDash.showTab('brains'); await new Promise(r => setTimeout(r, 700)); p.ctx.EvoOceanDash.close(); }]
+    ];
+    const bad = [], fine = [];
+    for (const [what, name, setup, trigger] of ways) {
+        const { p, calls } = await trapping(name, setup);
+        let threw = '';
+        try { await trigger(p); } catch (e) { threw = String(e); }
+        const down = p.T.engineState === 'down', said = p.msg(), at = Object.assign({}, calls);
+        try { await afterwards(p); } catch (e) { threw += ' / after: ' + String(e); }
+        const more = EXPORTS.filter(f => calls[f] !== at[f]).map(f => f + ' ' + (calls[f] - at[f]));
+        const once = calls[name] === 1;
+        if (threw || !down || !once || more.length || p.uncaught.length || !/The engine stopped \(injected: a trap in /.test(said) || p.T.runCfg.minSpeed === 33)
+            bad.push(what + ': ' + JSON.stringify({ threw, down, once: calls[name], more, uncaught: p.uncaught.slice(0, 1), said: said.slice(0, 80) }));
+        else fine.push(what);
+    }
+    ok(!bad.length, 'a trap in ' + fine.join(', ') + ': the engine stops once, said so; then frames, a fish picked, a live setting (refused), the console\'s set, a colour, F, T, ' +
+       'Save world, R and the charts\' timer reach no export, and nothing throws' + (bad.length ? ' — ' + bad.join('; ') : ''));
+}
+
+async function review2SaveLimits() {
+    section('Second review of #44, finding 4: Save world refuses, before copying, a world whose memory is more than a world file holds here');
+    const slices = (buf) => {   /* ArrayBuffer slices of buf (the module's memory) counted, until undone */
+        const proto = ArrayBuffer.prototype, real = proto.slice, n = { count: 0 };
+        proto.slice = function () { if (this === buf()) n.count++; return real.apply(this, arguments); };
+        n.undo = () => { proto.slice = real; };
+        return n;
+    };
+    {   /* live: a cap below this run's memory (as after a world that grew it: memory never shrinks), then back */
+        const p = await bootPage(PAGE_Q7), W = p.ctx.EvoOceanHandoff.WORLD, cap = W.MAX_IMAGE;
+        W.MAX_IMAGE = 8 * MB;
+        const n = slices(() => HO.buffer(p.M)), blobs = p.blobs.length;
+        p.click('saveworld');
+        await tick(); await tick();
+        n.undo();
+        const said = p.msg(), copied = n.count;
+        W.MAX_IMAGE = cap;
+        const again = await savedWorld(p);
+        ok(/Couldn't save the world: it uses 16\.3 MB of memory, more than a world file holds on this device \(8\.0 MB\), so it could not be opened again/.test(said) &&
+           copied === 0 && p.blobs.length === blobs + 1 && again.bytes.length > 0 && p.T.worldSave === null,
+           'a run whose memory is more than a world file holds here: refused before any copy ("' + said.slice(0, 120) + '…"); with the cap back, Save world writes the file');
+    }
+    {   /* in Turbo: the worker checks before its copy, Turbo runs on */
+        const { p, sh } = await pageInTurbo();
+        const W = p.ctx.EvoOceanHandoff.WORLD, cap = W.MAX_IMAGE;
+        W.MAX_IMAGE = 8 * MB;
+        const n = slices(() => sh.M.wasmMemory.buffer), f0 = p.T.turboStats.frame;
+        p.click('saveworld');
+        await until(() => !p.T.worldSave, 'the worker\'s answer');
+        n.undo();
+        const said = p.msg(), copied = n.count;
+        W.MAX_IMAGE = cap;
+        await until(() => p.T.turboStats.frame > f0 + 60, 'Turbo to run on');
+        const k = { said: /more than a world file holds on this device \(8\.0 MB\)/.test(said), notCopied: copied === 0, tooBig: sh.fromWorker.some(m => m.type === 'snapshot' && m.tooBig),
+                    running: p.T.turboState === 'turbo' && !sh.toWorker.some(m => m.cmd === 'stop') };
+        const again = await savedWorld(p);
+        ok(all(k) && again.bytes.length > 0, 'in Turbo: the worker refuses before its copy, Turbo runs on; with the cap back, Save world in Turbo writes the file' + nots(k));
+    }
+}
+
+async function review2SaveFailures() {
+    section('Second review of #44, finding 5: a failed save (the copy, the download, Turbo\'s copy) says so and can be retried; Turbo keeps its world');
+    const failOnce = (buf, err) => {   /* the next slice of buf throws */
+        const proto = ArrayBuffer.prototype, real = proto.slice;
+        proto.slice = function () { if (this === buf()) { proto.slice = real; throw err; } return real.apply(this, arguments); };
+        return () => { proto.slice = real; };
+    };
+    {   /* live: no room for the copy; then the download fails; each time Save world works again */
+        const p = await bootPage(PAGE_Q7);
+        const undo = failOnce(() => HO.buffer(p.M), new RangeError('injected: Array buffer allocation failed'));
+        p.click('saveworld');
+        undo();
+        const m1 = p.msg(), free1 = p.T.worldSave === null;
+        const URLc = p.ctx.URL, create = URLc.createObjectURL;
+        URLc.createObjectURL = function () { URLc.createObjectURL = create; throw new Error('injected: no download'); };
+        const n = p.downloads.length;
+        p.click('saveworld');
+        await until(() => !p.T.worldSave, 'the failed download');
+        URLc.createObjectURL = create;
+        const m2 = p.msg(), free2 = p.T.worldSave === null && p.downloads.length === n;
+        const again = await savedWorld(p);
+        ok(/Couldn't save the world: injected: Array buffer allocation failed\. Nothing was written/.test(m1) && free1 && /Couldn't save the world: injected: no download/.test(m2) && free2 &&
+           again.bytes.length > 0, 'no room for the copy ("' + m1.slice(0, 80) + '…"), then a download that fails ("' + m2.slice(0, 60) + '…"): each said, Save world free again; the third writes the file');
+    }
+    {   /* Turbo: no room for the worker's copy: said, Turbo runs on with its world (its steps kept), Save world works again */
+        const { p, sh } = await pageInTurbo();
+        const f0 = p.T.turboStats.frame;
+        const undo = failOnce(() => sh.M.wasmMemory.buffer, new RangeError('injected: Array buffer allocation failed'));
+        p.click('saveworld');
+        await until(() => !p.T.worldSave, 'the worker\'s answer');
+        undo();
+        const said = p.msg();
+        await until(() => p.T.turboStats.frame > f0 + 120, 'Turbo to run on');
+        const again = await savedWorld(p), h = HO.worldHeader(again.bytes).header;
+        p.click('turboexit');
+        await until(() => p.T.turboState === 'live', 'the hand-back');
+        const k = { said: /there was no room for a copy of the world \(injected: Array buffer allocation failed\)\. Turbo runs on with its world/.test(said),
+                    running: !sh.fromWorker.some(m => m.type === 'error'), saved: h.frame > f0, kept: frame(p.M) > h.frame && sh.terminated === 0 };
+        ok(all(k), 'in Turbo, no room for the worker\'s copy: said ("' + said.slice(0, 90) + '…"), Turbo runs on, a second Save world in Turbo works (frame ' + h.frame +
+           '), and Stop hands back its progress (frame ' + frame(p.M) + ')' + nots(k));
+    }
+}
+
+async function review2Canon() {
+    section('Second review of #44, the canonical form: fixed vectors (keys in UTF-16 order, numbers and strings as JSON.stringify writes them)');
+    const v = { b: [1, 1.5, -0, 1e21, 1e-7, 100], a: 'é 🐟"\\', 'é': true, A: null, _: { z: false, y: [] } };
+    const want = '{"A":null,"_":{"y":[],"z":false},"a":"é 🐟\\"\\\\","b":[1,1.5,0,1e+21,1e-7,100],"é":true}';
+    const d = await HO.headerDigest(v), node = crypto.createHash('sha256').update(Buffer.from('evo_ocean_world 1\n' + want, 'utf8')).digest('hex');
+    ok(HO.canon(v) === want && d === node, 'canon of keys A, _, a, b, é (UTF-16 order), -0, 1e21, 1e-7, U+2028, a surrogate pair, a quote and a backslash: "' + want +
+       '"; the header digest is node\'s sha-256 of "evo_ocean_world 1\\n" + it (' + d.slice(0, 12) + ')');
+}
+
 /* Every section, in order; `node tests/ocean_turbo_handoff.js NAME...` runs only those. */
 const SECTIONS = {
     repeatedKeys, liveLedger, growthPage, randomize, imports,
@@ -4361,7 +4674,8 @@ const SECTIONS = {
     pageCancelQueued, pageQueuedFile, pageNextBehindLive, pageEditedFile, pageReplayStaleRead, pageAskTarget, pagePendingAsk,
     pageKeyboardAsk,
     worldCodec, pageWorldFile, pageWorldTurbo, pageWorldRefusals,
-    reviewLimits, reviewHeader, reviewTransaction, reviewEngineId, reviewDraft, reviewCapture, reviewStaleRead, reviewTurboStates
+    reviewLimits, reviewHeader, reviewTransaction, reviewEngineId, reviewDraft, reviewCapture, reviewStaleRead, reviewTurboStates,
+    review2Budget, review2LateFailure, review2Fence, review2SaveLimits, review2SaveFailures, review2Canon
 };
 const unhandled = [];
 process.on('unhandledRejection', (e) => { unhandled.push(e); });
