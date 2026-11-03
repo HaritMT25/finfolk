@@ -46,9 +46,21 @@ without --plan, or with registered cells missing, matrices are descriptive.
                range, lack-of-fit and symmetric-interaction tests from infer.py)
                per condition/fraction/window; matrix_joint.csv the omnibus over
                the assay conditions
+               (only when every REGISTERED condition's block is formal), pooled
+               and as the spec's home-regime sub-blocks x assays (regimes
+               independent); sub-block p-values only under a formal parent
+  scale.csv    bounded-scale sensitivity: the same split and tests on
+               transformed endpoints (logit with a documented clip, asin)
+  bounded.csv  bounded node-additive (transitive, non-additive) models of the
+               expected endpoint, the curl they make and the cyclic energy left
+               after them, with a refitting bootstrap test (bounded.py)
   blocks.json  every block's units z[p][r][i] (input to calibrate.py, which
                measures the null rejection rate and planted-cycle power of the
                same tests)
+
+Windows: --clock gens (G generations of the resident's clock) or --clock steps
+(one common fixed step count for every run, the stats spec's primary horizon;
+T from horizon.py, calibrated on independent cells, and 2T).
   speed.csv    engine seconds per step against mean population (+ a fit)
   cost.csv     seconds per cell and core-hours for N x replicates x settings
 """
@@ -63,6 +75,7 @@ import random
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import bounded  # noqa: E402
 import hodge  # noqa: E402
 import infer  # noqa: E402
 
@@ -284,25 +297,37 @@ def pick(r, W, tol):
     return best if abs(best["steps"] - W) <= tol * W else None
 
 
-def run_rows(recs, gens, windows, tol):
+def run_rows(recs, gens, windows, tol, clock="gens"):
     """One row per run and window: requested W, the checkpoint actually read (steps_at) and its
-    relative timing error; s is None (window missed) when no checkpoint is within tol."""
+    relative timing error; s is None (window missed) when no checkpoint is within tol.
+
+    clock 'gens': a window G is G x the RESIDENT's generation length (g_pop of its shams), so the
+    two directions of a pair run for different numbers of steps. clock 'steps' (the stats spec's
+    primary horizon): a window is one common fixed number of steps W = G for every run; the
+    realized turnover g = births / start population at W is reported per run (column gens).
+
+    Extinction (stats spec section 2): the live mean is undefined when no fish is left; the
+    preregistered unconditional endpoint sets q = 0 there, so s = -f0 (and extinct = True). An
+    extinct assay is never dropped."""
     rows = []
     for r in recs:
         g = gens.get((r["j"], r["cond"]))
-        if not g:
+        if clock == "gens" and not g:
             continue
         for G in windows:
-            W = G * g["g"]
+            W = G * g["g"] if clock == "gens" else float(G)
             p = pick(r, W, tol)
-            base = {**{k: r[k] for k in ("id", "j", "i", "mode", "frac", "cond", "rep", "n0", "m")},
+            base = {**{k: r[k] for k in ("id", "j", "i", "mode", "frac", "cond", "rep", "n0", "m", "f0")},
                     "G": G, "W": W, "last_steps": r["points"][-1]["steps"]}
             if p is None:
                 rows.append({**base, "steps_at": None, "rel_err": None, "missed": True, "s": None, "n": None,
                              "births": None, "gens": None, "invader_lost": None, "extinct": None})
                 continue
+            s = p["score"]
+            if s is None and p["extinct"]:
+                s = -r["f0"]   # q_ext = 0: no living ancestry remains (an explicit convention)
             rows.append({**base, "steps_at": p["steps"], "rel_err": (p["steps"] - W) / W, "missed": False,
-                         "s": p["score"], "n": p["n"], "births": p["births"], "gens": p["generations"],
+                         "s": s, "n": p["n"], "births": p["births"], "gens": p["generations"],
                          "invader_lost": p["invader_lost"], "extinct": p["extinct"]})
     return rows
 
@@ -374,13 +399,28 @@ def sham_vs_self(rows):
 
 
 # Both directed bounds at once: two one-sided 97.5% bounds hold jointly at >= 95% (Bonferroni over
-# the two directions of a pair; not adjusted across pairs: the column is descriptive).
+# the two directions of a pair; not adjusted across pairs: the column is descriptive). Each
+# direction's statistic is a paired t with k - 1 degrees of freedom (its SD is estimated from k
+# replicates), so its bound uses the Student-t quantile, t_.975(k - 1): 2.571 at k = 6, 2.262 at
+# k = 10 (review round 2: the normal 1.96 does not give the claimed 95% at these k). The coverage
+# is exact for Gaussian paired differences and approximate otherwise. Z_RECIPROCAL is only the
+# large-k limit, used when k is unknown.
 Z_RECIPROCAL = 1.959964
+CONF_DIRECTION = 0.975
 
 
-def reciprocal(z_ab, z_ba, zc=Z_RECIPROCAL):
-    """What the two DIRECTED sham-corrected scores of a pair support (stats spec section 7). A
-    positive symmetric part S does not need both directions to gain, so S never decides this.
+def direction_cutoff(k):
+    """The one-sided 97.5% bound's cutoff for a paired t statistic from k replicates."""
+    if k is None or k < 2:
+        return Z_RECIPROCAL
+    return hodge.t_quantile(CONF_DIRECTION, k - 1)
+
+
+def reciprocal(z_ab, z_ba, k_ab=None, k_ba=None):
+    """What the two DIRECTED sham-corrected scores of a pair support (stats spec section 7), each
+    by its own one-sided 97.5% Student-t bound (k replicates -> t_.975(k - 1)); both bounds hold
+    jointly at >= 95% for Gaussian paired differences. A positive symmetric part S does not need
+    both directions to gain, so S never decides this.
       'reciprocal gain'        both directions' lower bounds > 0: excess founder-pedigree
                                introgression both ways, relative to self-invasion. Not by itself
                                coexistence (sexual mixing can do this; coexistence needs
@@ -390,11 +430,12 @@ def reciprocal(z_ab, z_ba, zc=Z_RECIPROCAL):
       'unresolved'             at least one direction is not bounded away from 0"""
     if z_ab is None or z_ba is None:
         return "unresolved"
-    if z_ab >= zc and z_ba >= zc:
+    ca, cb = direction_cutoff(k_ab), direction_cutoff(k_ba)
+    if z_ab >= ca and z_ba >= cb:
         return "reciprocal gain"
-    if z_ab <= -zc and z_ba <= -zc:
+    if z_ab <= -ca and z_ba <= -cb:
         return "reciprocal suppression"
-    if (z_ab >= zc and z_ba <= -zc) or (z_ab <= -zc and z_ba >= zc):
+    if (z_ab >= ca and z_ba <= -cb) or (z_ab <= -ca and z_ba >= cb):
         return "opposite directions"
     return "unresolved"
 
@@ -416,7 +457,9 @@ def pair_table(prs):
                     "st_a_into_b": p["st"], "st_b_into_a": q["st"], "A_ab": A,
                     "S": S, "se_A": se_A, "se_S": 0.5 * se_A, "z_A": A / se_A if se_A > 0 else None,
                     "z_S": S / (0.5 * se_A) if se_A > 0 else None,
-                    "z_a_into_b": p["z"], "z_b_into_a": q["z"], "reciprocal": reciprocal(p["z"], q["z"])})
+                    "z_a_into_b": p["z"], "z_b_into_a": q["z"], "k_a_into_b": p.get("k"), "k_b_into_a": q.get("k"),
+                    "cut_a_into_b": direction_cutoff(p.get("k")), "cut_b_into_a": direction_cutoff(q.get("k")),
+                    "reciprocal": reciprocal(p["z"], q["z"], p.get("k"), q.get("k"))})
     return out
 
 
@@ -596,6 +639,11 @@ def _largest_complete(names, has):
     return names
 
 
+def primary_p(d):
+    """The p-value of the frozen primary lack-of-fit test (infer.PRIMARY) from a row's fields."""
+    return d.get("p_lof_flip") if infer.PRIMARY["test"] == "signflip" else d.get("p_lof")
+
+
 def matrices(rows, meta=None, zmin=2.0, sims=9999, registry=None, kind=infer.DEFAULT_KIND, seed=5, dG=None):
     """Complete blocks (every ordered pair + every sham, on common replicates): per condition,
     fraction and window, separately (pooling conditions can fake cycles).
@@ -711,6 +759,7 @@ def matrices(rows, meta=None, zmin=2.0, sims=9999, registry=None, kind=infer.DEF
         dec = {x: inf[x] for x in ("floor95", "p_mc", "p_lof", "p_lof_flip", "p_sym", "p_sym_flip", "p_lof_unstud")}
         if status != "formal":   # no decisions from a partial matrix
             dec = {x: None for x in dec}
+        dec["p_primary"] = primary_p(dec)
         row = {"cond": cond, "frac": frac, "G": G, "status": status, "n": n, "k": k, "names": " ".join(names),
                "ratings": list(sp["r"]), "invader_effect": list(ea), "resident_effect": list(eb),
                "cyclic_share": sp["cyclic_share"], "noise_corrected": inf["share_nc"],
@@ -750,19 +799,28 @@ def matrices(rows, meta=None, zmin=2.0, sims=9999, registry=None, kind=infer.DEF
                 f"mean noise-corrected curl^2={mean([x[2] for x in v]):+.2e} mean S_gamma={mean([x[3] for x in v]):+.4f}"
                 for c, v in sorted(cats.items()))
             # balanced sub-blocks decomposed ON THEIR OWN (complete graphs of the items sharing a home
-            # regime, or a snapshot time): their own ladder, cycle and noise; descriptive
+            # regime, or a snapshot time): their own ladder, cycle and noise. Their p-values are
+            # published only when the parent block is formal (then the sub-block is complete on the
+            # registered replicates); a descriptive parent gives descriptive sub-blocks, no p
+            # (review round 2: they used to copy p-values unconditionally)
             for keyname in ("regime", "time"):
                 for val in sorted({str(meta.get(nm, {}).get(keyname)) for nm in names}):
                     idx = [i for i, nm in enumerate(names) if str(meta.get(nm, {}).get(keyname)) == val]
                     if len(idx) < 3 or len(idx) == n:
                         continue
-                    si = infer.infer([subblock(z, idx)], B=sims, seed=seed, kind=kind)
+                    zsub = subblock(z, idx)
+                    si = infer.infer([zsub], B=sims, seed=seed, kind=kind)
+                    formal = status == "formal"
+                    if keyname == "regime":
+                        blocks[(cond, frac, G)].setdefault("regime_blocks", {})[val] = {
+                            "names": [names[i] for i in idx], "z": zsub}
                     sub.append({"cond": cond, "frac": frac, "G": G, "status": status, "group": f"{keyname}={val}",
                                 "names": " ".join(names[i] for i in idx), "n": len(idx), "k": k,
                                 "cyclic_share": si["share_raw"], "noise_corrected": si["share_nc"],
                                 "share_ci95_lo": si["share_ci95"][0], "share_ci95_hi": si["share_ci95"][1],
                                 "dC": si["dC"], "F_lof": si["F_C"], "df": (len(idx) - 1) * (len(idx) - 2) // 2,
-                                "p_lof": si["p_lof"], "p_lof_flip": si["p_lof_flip"],
+                                "p_lof": si["p_lof"] if formal else None,
+                                "p_lof_flip": si["p_lof_flip"] if formal else None,
                                 "local_harmonic": "complete graph: all cyclic energy local"})
             regs = [meta.get(nm, {}).get("regime") for nm in names]
             if len(set(regs)) == 2:
@@ -788,27 +846,160 @@ def matrices(rows, meta=None, zmin=2.0, sims=9999, registry=None, kind=infer.DEF
                            "curl": sp["curl"][p][q], "se_curl": math.sqrt(varC[(p, q)]),
                            "zC": zC[(p, q)], "dG": (dG or {}).get((names[p], names[q])),
                            "S_gamma": Sg[(p, q)], "se_S_gamma": math.sqrt(varSg[(p, q)])})
-    # Omnibus over the assay conditions of one (fraction, window): the same snapshots and
-    # replicates in every condition, and a unit (p, r) shares its slot and donor seeds across
-    # conditions, so units are resampled / sign-flipped JOINTLY (F = sum T_C / sum tau_C).
+    joint = omnibus(blocks, registry, meta, sims, seed, kind)
+    return out, detail, blocks, joint, sub
+
+
+def omnibus(blocks, registry, meta, sims, seed, kind):
+    """Omnibus tests over the assay conditions of one (fraction, window).
+
+    The condition set is the REGISTERED one (every condition the plan registers at that
+    fraction), never whichever blocks happen to be formal: if any registered condition's block is
+    not formal, or the blocks differ in items or replicates, the row is descriptive and carries no
+    p-value (review round 2: a registered four-condition omnibus could silently become a
+    three-condition test). Without a plan there is no registered set, so nothing is formal.
+
+    Two structures:
+      'pooled block x assays'  the full block of every condition; a unit (p, r) shares its slot
+                               and donor seeds across conditions, so units are resampled /
+                               sign-flipped JOINTLY: F = sum T_C / sum tau_C
+      'home-regime sub-blocks x assays (regimes independent)'
+                               the stats spec's primary structure: one matrix per home regime
+                               (both competitors from it) and assay. The regime sub-blocks share
+                               no unit (other residents, other seeds), so they are independent
+                               groups (infer.infer_groups), each with its assays joint."""
     joint = []
     for frac, G in sorted({(f_, g_) for _, f_, g_ in blocks}):
-        fb = sorted((c_, b) for (c_, f_, g_), b in blocks.items() if (f_, g_) == (frac, G) and b["status"] == "formal")
-        if len(fb) < 2 or any(b["names"] != fb[0][1]["names"] or b["reps"] != fb[0][1]["reps"] for _, b in fb):
+        have = {c_: b for (c_, f_, g_), b in blocks.items() if (f_, g_) == (frac, G)}
+        if registry is None:
+            required, why = sorted(have), "descriptive: no plan given (no registered condition set)"
+        else:
+            required = sorted({c_ for (c_, f_) in registry if f_ == frac})
+            why = None
+        missing = [c_ for c_ in required if c_ not in have or have[c_]["status"] != "formal"]
+        if why is None and missing:
+            why = f"descriptive: registered condition(s) {' '.join(missing)} not formal"
+        fb = [(c_, have[c_]) for c_ in required if c_ in have]
+        if why is None and any(b["names"] != fb[0][1]["names"] or b["reps"] != fb[0][1]["reps"] for _, b in fb):
+            why = "descriptive: the conditions' blocks differ in items or replicates"
+        if len(fb) < 2:
+            continue
+        status = why or "formal"
+        base = {"frac": frac, "G": G, "status": status, "conditions": " ".join(c_ for c_, _ in fb),
+                "required": " ".join(required), "boot": f"{kind} x {sims}"}
+        if why is not None:   # report the configuration, decide nothing
+            joint.append({**base, "structure": "pooled block x assays", "n": len(fb[0][1]["names"]),
+                          "k": len(fb[0][1]["reps"])})
             continue
         inf = infer.infer([b["z"] for _, b in fb], B=sims, seed=seed, kind=kind)
-        joint.append({"frac": frac, "G": G, "conditions": " ".join(c_ for c_, _ in fb), "n": inf["N"], "k": inf["k"],
+        joint.append({**base, "structure": "pooled block x assays", "n": inf["N"], "k": inf["k"],
                       "F_lof": inf["F_C"], "p_lof": inf["p_lof"], "p_lof_flip": inf["p_lof_flip"],
                       "F_sym": inf["F_S"], "p_sym": inf["p_sym"], "p_sym_flip": inf["p_sym_flip"],
-                      "flip_min_p": inf["flip_min_p"], "boot": f"{kind} x {sims}"})
-    return out, detail, blocks, joint, sub
+                      "flip_min_p": inf["flip_min_p"]})
+        regs = sorted(set.intersection(*[set(b.get("regime_blocks", {})) for _, b in fb])) if meta else []
+        if len(regs) >= 2:
+            groups = [[b["regime_blocks"][rg]["z"] for _, b in fb] for rg in regs]
+            ig = infer.infer_groups(groups, B=sims, seed=seed, kind=kind)
+            joint.append({**base, "structure": "home-regime sub-blocks x assays (regimes independent)",
+                          "groups": " | ".join(f"{rg}: {' '.join(fb[0][1]['regime_blocks'][rg]['names'])}" for rg in regs),
+                          "n": " ".join(str(x) for x in ig["N"]), "k": ig["k"][0],
+                          "F_lof": ig["F_C"], "p_lof": ig["p_lof"], "p_lof_flip": ig["p_lof_flip"],
+                          "F_sym": ig["F_S"], "p_sym": ig["p_sym"], "p_sym_flip": ig["p_sym_flip"],
+                          "flip_min_p": ig["flip_min_p"]})
+    for j_ in joint:
+        j_["p_primary"] = primary_p(j_)
+    return joint
+
+
+def _key_rows(rows, key):
+    return [x for x in rows if (x["cond"], x["frac"], x["G"]) == key]
+
+
+def _units(rows, names, reps, endpoint=False):
+    """Units z[p][r][i] of the block names x reps from rows (one key): the sham-paired score
+    s(i -> p) - s(p -> p), or with endpoint=True the invade cells' endpoint q = s + f0 (no sham:
+    a column constant never reaches the cyclic part; the bounded models are fitted to q)."""
+    v = {}
+    for x in rows:
+        if x["mode"] in ("invade", "sham") and x["s"] is not None:
+            v[(x["i"], x["j"], x["rep"])] = x["s"] + (x["f0"] if endpoint else 0.0)
+    n = len(names)
+
+    def at(i, p, r):
+        if endpoint:
+            return v[(names[i], names[p], r)]
+        return v[(names[i], names[p], r)] - v[(names[p], names[p], r)]
+    return [[[at(i, p, r) if i != p else 0.0 for i in range(n)] for r in reps] for p in range(n)]
+
+
+def scale_sensitivity(rows, blocks, scales, models, sims, bsims, seed=5, kind=infer.DEFAULT_KIND):
+    """Bounded-scale sensitivity of every block (bounded.py): the same split and tests on
+    transformed endpoints (scale rows; 'raw' reproduces matrix.csv), and the lack of fit of
+    bounded node-additive (transitive, non-additive) models for the expected endpoint, with the
+    cyclic energy left after them (model rows). Decisions only for formal blocks.
+    -> (scale rows, model rows)."""
+    srows, mrows = [], []
+    for key, b in sorted(blocks.items(), key=lambda kv: str(kv[0])):
+        cond, frac, G = key
+        names, reps, status = b["names"], b["reps"], b["status"]
+        formal = status == "formal"
+        kr = [x for x in _key_rows(rows, key) if x["i"] in names and x["j"] in names and x["rep"] in reps]
+        st_raw = infer.block_stats(b["z"])
+        base = {"cond": cond, "frac": frac, "G": G, "status": status, "n": len(names), "k": len(reps)}
+        for spec in ["raw"] + list(scales):
+            if spec == "raw":
+                z, nclip = b["z"], 0
+            else:
+                tr, nclip = bounded.transform_rows(kr, spec)
+                z = _units(tr, names, reps)
+            inf = infer.infer([z], B=sims, seed=seed, kind=kind)
+            n = len(names)
+            A = infer.antisym(infer.column_means(z))
+            Am = [[None] * n for _ in range(n)]
+            e = 0
+            for p in range(n):
+                for q in range(p + 1, n):
+                    Am[p][q], Am[q][p] = A[e], -A[e]
+                    e += 1
+            tri = hodge.circular_triads(Am)
+            row = {**base, "scale": spec, "clipped": nclip, "endpoints": len(kr),
+                   "cyclic_share": inf["share_raw"], "noise_corrected": inf["share_nc"],
+                   "share_ci95_lo": inf["share_ci95"][0], "share_ci95_hi": inf["share_ci95"][1],
+                   "dC": inf["dC"], "dC_ci95_lo": inf["dC_ci95"][0], "dC_ci95_hi": inf["dC_ci95"][1],
+                   "F_lof": inf["F_C"], "F_sym": inf["F_S"], "triads_cyclic": tri["cyclic"], "triads": tri["triads"]}
+            for x in ("p_lof", "p_lof_flip", "p_sym", "p_sym_flip"):
+                row[x] = inf[x] if formal else None
+            row["p_primary"] = primary_p(row)
+            srows.append(row)
+        zq = _units(kr, names, reps, endpoint=True)
+        b["zq"] = zq   # (blocks.json: calibrate.py's bounded worlds need the endpoint units)
+        share_raw_nc = infer._ratio(st_raw["TC"] - st_raw["tauC"], st_raw["TA"] - st_raw["tauA"])
+        P = len(names) * (len(names) - 1) // 2
+        nn = len(names)
+        for mname in models:
+            if nn * (nn - 1) - bounded.Model(mname, nn).P < (nn - 1) * (nn - 2) // 2:
+                continue   # fewer residual dimensions than cycle dimensions: the model cannot be tested here
+            t = bounded.model_test(zq, mname, B=bsims, seed=seed, kind=kind, TA_pair=st_raw["TA"], tauA_pair=st_raw["tauA"])
+            mrows.append({**base, "model": mname, "B": bsims, "converged": t["converged"],
+                          "boot_not_converged": t["boot_not_converged"], "sse": t["sse"],
+                          "params": json.dumps(t["params"], sort_keys=True),
+                          "T_C": t["T_C"], "tau_C": t["tau_C"], "C_fit": t["C_fit"], "R_C": t["R_C"],
+                          "R_C_null": t["R_C_null"], "R_C_nc": t["R_C_nc"], "share_nc_raw": share_raw_nc,
+                          "share_res_nc": t["share_res_nc"], "survival": t["survival"],
+                          "dC_raw": math.sqrt(max(0.0, st_raw["TC"] - st_raw["tauC"]) / P), "dC_res": t["dC_res"],
+                          "F_res": t["F_res"], "p_res": t["p_res"] if formal else None,
+                          "T_S": t["T_S"], "tau_S": t["tau_S"], "R_S": t["R_S"], "R_S_nc": t["R_S_nc"],
+                          "F_res_S": t["F_res_S"], "p_res_S": t["p_res_S"] if formal else None})
+    return srows, mrows
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--root", action="append", required=True)
     ap.add_argument("--out", required=True)
-    ap.add_argument("--windows", default="2.5,5,10")
+    ap.add_argument("--windows", default=None,
+                    help="comma list: generations of the resident's clock (--clock gens, default 2.5,5,10) or "
+                         "steps (--clock steps; default T,2T from --horizon)")
     ap.add_argument("--sims", type=int, default=9999, help="bootstrap draws per test (default 9999)")
     ap.add_argument("--kind", default=infer.DEFAULT_KIND, choices=["wild", "residual"],
                     help=f"unit bootstrap: random-sign (wild) or resampled residual units (default {infer.DEFAULT_KIND}, "
@@ -821,6 +1012,18 @@ def main(argv=None):
                          "(default 0.10); a run with no checkpoint that close has no score for that window")
     ap.add_argument("--gen-def", default="pop", choices=["pop", "n0"],
                     help="window clock: turnover of the mean population (default) or of the start population")
+    ap.add_argument("--clock", default="gens", choices=["gens", "steps"],
+                    help="'gens' (default): a window is generations of the RESIDENT's clock; 'steps': a window is one "
+                         "common fixed number of steps for every run (the stats spec's primary horizon), realized "
+                         "turnover reported")
+    ap.add_argument("--horizon", help="horizon.json (horizon.py: T calibrated on independent cells); with --clock steps "
+                                      "and no --windows the windows are T and 2T; recorded in inputs.json")
+    ap.add_argument("--scales", default=",".join(bounded.DEFAULT_SCALES),
+                    help="endpoint transforms for the bounded-scale sensitivity (bounded.py), comma list; '' = none")
+    ap.add_argument("--bounded", default=",".join(bounded.MODELS),
+                    help="bounded node-additive models whose residual cyclic energy is reported; '' = none")
+    ap.add_argument("--bounded-sims", type=int, default=1999,
+                    help="parametric-residual bootstrap draws (each refits the model) for the bounded models")
     ap.add_argument("--meta", help="JSON {snapshot: {run, regime, family, time}} for pair relations / regimes")
     ap.add_argument("--no-genetic", action="store_true",
                     help="skip the sensor-relevant genetic dissimilarity of the snapshots (needs --meta and --plan)")
@@ -828,6 +1031,14 @@ def main(argv=None):
                                    "complete registered matrix gets formal decisions")
     a = ap.parse_args(argv)
     os.makedirs(a.out, exist_ok=True)
+    horizon = json.load(open(a.horizon)) if a.horizon else None
+    if a.windows is None:
+        if a.clock == "gens":
+            a.windows = "2.5,5,10"
+        elif horizon:
+            a.windows = f"{horizon['T']},{horizon['T2']}"
+        else:
+            ap.error("--clock steps needs --windows (in steps) or --horizon")
     windows = [float(x) for x in a.windows.split(",")]
     plan = None
     if a.plan:
@@ -852,7 +1063,10 @@ def main(argv=None):
         "roots": [os.path.abspath(r) for r in a.root],
         "plan": {"path": os.path.abspath(a.plan), "sha256": sha256(a.plan), "cells": len(plan)} if plan is not None else None,
         "meta": {"path": os.path.abspath(a.meta), "sha256": sha256(a.meta)} if a.meta else None,
-        "analysis_code": {f: sha256(os.path.join(here, f)) for f in ("analyze.py", "hodge.py", "infer.py")},
+        "analysis_code": {f: sha256(os.path.join(here, f)) for f in ("analyze.py", "hodge.py", "infer.py", "bounded.py")},
+        "primary": infer.PRIMARY,
+        "clock": a.clock,
+        "horizon": ({"path": os.path.abspath(a.horizon), "sha256": sha256(a.horizon), **horizon} if horizon else None),
         "binaries": sorted({r["binary_sha256"] for r in recs}),
         "tools": sorted({json.dumps(r["tools_sha256"], sort_keys=True) for r in recs if r["tools_sha256"]}),
         "cells_without_tool_hashes": sum(1 for r in recs if not r["tools_sha256"]),
@@ -873,7 +1087,7 @@ def main(argv=None):
     ident = {"plan_sha256": prov["plan"]["sha256"] if prov["plan"] else "",
              "analysis_sha256": prov["analysis_code"]["analyze.py"]}
     gens = gen_length(recs, a.gen_def)
-    rows = run_rows(recs, gens, windows, a.max_window_error)
+    rows = run_rows(recs, gens, windows, a.max_window_error, a.clock)
     grp = groups(rows)
     prs = paired(rows)
     pt = pair_table(prs)
@@ -908,20 +1122,32 @@ def main(argv=None):
                   f"{fmt(g['g_n0'], 0)} | {fmt(g['g_n0_sd'], 0)} | {fmt(g['gen1'], 0)} | {fmt(g['gen1_sd'], 0)} | {g['runs']} |")
 
     write_csv(os.path.join(a.out, "runs.csv"), rows,
-              ["id", "j", "i", "mode", "frac", "cond", "rep", "n0", "m", "G", "W", "steps_at", "rel_err", "missed",
+              ["id", "j", "i", "mode", "frac", "cond", "rep", "n0", "m", "f0", "G", "W", "steps_at", "rel_err", "missed",
                "last_steps", "s", "n", "births", "gens", "invader_lost", "extinct"])
     write_csv(os.path.join(a.out, "groups.csv"), grp,
               ["cond", "frac", "G", "j", "i", "mode", "k", "mean", "sd", "se", "lost", "extinct", "W", "n_end",
                "missed"])
+    unit = "gens of the resident's clock" if a.clock == "gens" else "steps, common to every run"
     md.append(f"\n## Window reads (requested W vs the checkpoint read; tolerance {a.max_window_error:.0%} of W)\n")
-    md.append("| window (gens) | runs | requested W (steps) | max abs relative error | mean | missed (no checkpoint within tolerance) |\n|---|---|---|---|---|---|")
+    if a.clock == "steps":
+        md.append("Common fixed-step horizon (stats spec section 1): every run is read at the same step count. "
+                  + (f"T = {horizon['T']} steps was calibrated on independent cells ({horizon.get('calibration', '')}); "
+                     f"2T = {horizon['T2']} is the long-horizon sensitivity. " if horizon else "")
+                  + "Realized turnover g = births / start population at the window.\n")
+    md.append(f"| window ({unit}) | runs | requested W (steps) | max abs relative error | mean | missed (no checkpoint within tolerance) | realized turnover g, shams: mean (min-max) | all runs: mean (min-max) |\n|---|---|---|---|---|---|---|---|")
     for G in windows:
         xs = [x for x in rows if x["G"] == G]
         if not xs:
             continue
         errs = [abs(x["rel_err"]) for x in xs if x["rel_err"] is not None]
-        md.append(f"| {G} | {len(xs)} | {min(x['W'] for x in xs):.0f}-{max(x['W'] for x in xs):.0f} | "
-                  f"{fmt(max(errs) if errs else None, 3)} | {fmt(mean(errs), 3)} | {sum(1 for x in xs if x['missed'])} |")
+        gs = [x["gens"] for x in xs if x["gens"] is not None and x["mode"] == "sham"]
+        ga = [x["gens"] for x in xs if x["gens"] is not None]
+        md.append(f"| {G:g} | {len(xs)} | {min(x['W'] for x in xs):.0f}-{max(x['W'] for x in xs):.0f} | "
+                  f"{fmt(max(errs) if errs else None, 3)} | {fmt(mean(errs), 3)} | {sum(1 for x in xs if x['missed'])} | "
+                  + (f"{mean(gs):.2f} ({min(gs):.2f}-{max(gs):.2f})" if gs else "") + " | "
+                  + (f"{mean(ga):.2f} ({min(ga):.2f}-{max(ga):.2f})" if ga else "") + " |")
+    nex = sum(1 for x in rows if x["extinct"])
+    md.append(f"\nExtinct reads: {nex} (scored by the preregistered unconditional endpoint q = 0, s = -f0; never dropped).\n")
     write_csv(os.path.join(a.out, "paired.csv"), prs,
               ["cond", "frac", "G", "j", "i", "k", "s_inv", "s_sham", "st", "sd_d", "se_paired", "se_unpaired",
                "sd_inv", "sd_sham", "gain", "corr", "z"])
@@ -972,9 +1198,11 @@ def main(argv=None):
     md.append("\n## Effect sizes on real pairs (A = s~(a->b) - s~(b->a), S = mean of both)\n")
     md.append("s~ = the change in the invaders' founder pedigree contribution minus the self-invasion baseline "
               "(a pedigree index, not genomic ancestry). S > 0 does not mean both directions gain; 'directions' "
-              f"classifies the two directed s~ by their own bounds (both |z| >= {Z_RECIPROCAL:.2f}: two one-sided "
-              "97.5% bounds, jointly 95%; not adjusted across pairs). 'reciprocal gain' is excess pedigree "
-              "introgression both ways, not coexistence.\n")
+              "classifies the two directed s~ by their own one-sided 97.5% Student-t bounds (paired t with k - 1 "
+              f"df: |t| >= t_.975(k-1), e.g. {direction_cutoff(6):.3f} at k = 6, {direction_cutoff(10):.3f} at "
+              "k = 10). Both bounds hold jointly at >= 95% if the paired differences are Gaussian (approximate "
+              "otherwise); not adjusted across pairs. 'reciprocal gain' is excess pedigree introgression both "
+              "ways, not coexistence.\n")
     md.append("| condition | fraction | window | a | b | relation | s~(a->b) (z) | s~(b->a) (z) | A | z_A | S | z_S | directions |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|")
     for p in pt:
         md.append(f"| {p['cond']} | {p['frac']} | {p['G']} | {p['a']} | {p['b']} | {p['category']} | {p['st_a_into_b']:+.4f} ({fmt(p['z_a_into_b'], 1)}) | "
@@ -997,7 +1225,8 @@ def main(argv=None):
     # --- complete blocks (if any)
     write_csv(os.path.join(a.out, "pairs.csv"), pt,
               ["cond", "frac", "G", "a", "b", "category", "st_a_into_b", "st_b_into_a", "A_ab", "S", "se_A", "se_S",
-               "z_A", "z_S", "z_a_into_b", "z_b_into_a", "reciprocal", "plan_sha256", "analysis_sha256"])
+               "z_A", "z_S", "z_a_into_b", "z_b_into_a", "k_a_into_b", "k_b_into_a", "cut_a_into_b", "cut_b_into_a",
+               "reciprocal", "plan_sha256", "analysis_sha256"])
     dG = None
     if meta and plan is not None and not a.no_genetic:
         paths = {}
@@ -1012,17 +1241,21 @@ def main(argv=None):
             prov["genetic_dissimilarity"] = {"snapshots": sorted(paths), "samples": 4000,
                                              "within": dW}
     mats, mdet, blocks, joint, subs = matrices(rows, meta, sims=a.sims, registry=registry, kind=a.kind, dG=dG)
-    for m in mats + joint + subs:
+    scales = [x for x in a.scales.split(",") if x]
+    models = [x for x in a.bounded.split(",") if x]
+    srows, mrows = scale_sensitivity(rows, blocks, scales, models, a.sims, a.bounded_sims, kind=a.kind) \
+        if blocks and (scales or models) else ([], [])
+    for m in mats + joint + subs + srows + mrows:
         m.update(ident)
     # the units of every block (for calibrate.py: null rejection and power through the same tests)
     with open(os.path.join(a.out, "blocks.json"), "w") as f:
-        json.dump({"schema": "finfolk.invasion.blocks/1", **ident,
+        json.dump({"schema": "finfolk.invasion.blocks/1", **ident, "clock": a.clock,
                    "blocks": [{"cond": c_, "frac": f_, "G": g_, **b} for (c_, f_, g_), b in sorted(blocks.items())]}, f)
     if mats:
         cols = ["cond", "frac", "G", "status", "plan_sha256", "analysis_sha256", "n", "k", "names", "ratings",
                 "invader_effect", "resident_effect", "cyclic_share", "noise_corrected", "share_ci95_lo",
                 "share_ci95_hi", "dC", "dC_ci95_lo", "dC_ci95_hi", "C_nc", "G_nc", "floor95", "p_mc",
-                "F_lof", "df", "p_lof", "p_lof_flip", "p_lof_unstud", "F_sym", "df_sym", "p_sym", "p_sym_flip",
+                "F_lof", "df", "p_primary", "p_lof", "p_lof_flip", "p_lof_unstud", "F_sym", "df_sym", "p_sym", "p_sym_flip",
                 "flip_min_p", "boot", "rms_A", "noise_A", "noise_curl",
                 "gamma_check", "rms_Sg", "frac_Sg_pos", "n_Sg_sig_pos", "n_Sg_sig_neg", "triads_cyclic", "triads",
                 "triads_sig", "melo_sigma", "melo_xy", "regime_ratings", "by_category", "corr_zC_dG"]
@@ -1037,20 +1270,27 @@ def main(argv=None):
                        "local_harmonic", "plan_sha256", "analysis_sha256"])
         if joint:
             write_csv(os.path.join(a.out, "matrix_joint.csv"), joint,
-                      ["frac", "G", "conditions", "n", "k", "F_lof", "p_lof", "p_lof_flip", "F_sym", "p_sym",
-                       "p_sym_flip", "flip_min_p", "boot", "plan_sha256", "analysis_sha256"])
+                      ["frac", "G", "structure", "status", "required", "conditions", "groups", "n", "k", "F_lof",
+                       "p_primary", "p_lof", "p_lof_flip", "F_sym", "p_sym", "p_sym_flip", "flip_min_p", "boot",
+                       "plan_sha256", "analysis_sha256"])
         md.append("\n## Complete blocks: ladder / cycle split (each condition separately)\n")
         md.append("cyclic share = ||curl||^2/||A||^2; noise-corrected = (||curl||^2 - tau_C) / (||A||^2 - tau_A) "
                   "with tau the unbiased noise energies of the (resident, replicate) units, and its 95% range "
-                  "over the bootstrap confidence ball for the edge noise; d_C = noise-corrected RMS cyclic signal "
-                  "per pair. Lack of fit of a pure ladder: F = ||curl||^2 / tau_C (~1 under the null), p from the "
-                  f"studentized unit bootstrap ({a.kind}, {a.sims} draws; tau re-estimated in every draw) and the "
-                  "exact replicate sign-flip (smallest attainable p = 1/2^(k-1)); no chi-square. floor95 / p_mc: "
+                  "over the bootstrap confidence ball for the edge noise (approximate: the ball's radius is a "
+                  "bootstrap percentile; calibrate.py measures its coverage); d_C = noise-corrected RMS cyclic "
+                  "signal per pair. Lack of fit of a pure ladder: F = ||curl||^2 / tau_C (~1 under the null). "
+                  f"p boot: studentized unit bootstrap ({a.kind}, {a.sims} draws; tau re-estimated in every draw), an "
+                  "APPROXIMATE (asymptotic) test whose level is known only in calibrate.py's simulated worlds; "
+                  "p sign-flip: replicate sign-flip, EXACT only if the replicate residual vectors are independent "
+                  "and centrally symmetric (smallest attainable p = 1/2^(k-1)). The frozen primary test is "
+                  f"'{infer.PRIMARY['test']}' (infer.PRIMARY). No chi-square. floor95 / p_mc: "
                   "descriptive, raw share of a pure ladder of the noise-corrected strength plus bootstrap noise. "
                   "Symmetric interaction (S_gamma, the symmetric part of the two-way gamma: a symmetric departure "
                   "from the additive invader + resident prediction, not by itself mutual invasibility or "
                   "coexistence): tested as a whole by F_sym / p_sym. triads = directed 3-cycles of sign(A) "
-                  "(all / every edge |z| >= 2).\n")
+                  "(all / every edge |z| >= 2). The raw-scale cyclic residual is additive-scale lack of fit; on "
+                  "a bounded score part of it can be a transitive bounded ladder (see the bounded-scale "
+                  "sensitivity below).\n")
         md.append("| condition | fraction | window | status | N | k | RMS A | noise A | noise curl | cyclic share | noise-corrected (95% range) | d_C (95%) | floor95 | F lof (df) | p boot | p sign-flip | F sym (df) | p sym boot / flip | S_gamma sig +/- | triads cyclic/all (sig) |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
         for m in mats:
             md.append(f"| {m['cond']} | {m['frac']} | {m['G']} | {m['status']} | {m['n']} | {m['k']} | {m['rms_A']:.4f} | {m['noise_A']:.4f} | "
@@ -1061,13 +1301,21 @@ def main(argv=None):
                       f"{fmt(m['p_sym'], 4) or '-'} / {fmt(m['p_sym_flip'], 4) or '-'} | "
                       f"{m['n_Sg_sig_pos']}/{m['n_Sg_sig_neg']} | {m['triads_cyclic']}/{m['triads']} ({m['triads_sig']}) |")
         if joint:
-            md.append("\nOmnibus over the assay conditions (units resampled / flipped jointly: they share slot and donor "
-                      "seeds across conditions): F = sum ||curl||^2 / sum tau_C.\n")
-            md.append("| fraction | window | conditions | N | k | F lof | p boot | p sign-flip | F sym | p sym boot / flip |\n|---|---|---|---|---|---|---|---|---|---|")
+            md.append("\nOmnibus over the assay conditions: F = sum ||curl||^2 / sum tau_C. The condition set is the "
+                      "registered one; a row is formal only if every registered condition's block is formal on the "
+                      "same items and replicates (otherwise descriptive, no p). 'pooled block x assays': units "
+                      "resampled / flipped jointly (they share slot and donor seeds across conditions). 'home-regime "
+                      "sub-blocks x assays': the stats spec's primary structure (both competitors from one home "
+                      "regime), regimes independent groups (flipped and drawn independently, sign-flip resolution "
+                      "1/2^(k-1) per group), assays joint within a group. The sign-flip is exact only under joint "
+                      "central symmetry of the replicate residual vectors.\n")
+            md.append("| fraction | window | structure | status | conditions | N | k | F lof | p boot | p sign-flip (min) | F sym | p sym boot / flip |\n|---|---|---|---|---|---|---|---|---|---|---|---|")
             for j_ in joint:
-                md.append(f"| {j_['frac']} | {j_['G']} | {j_['conditions']} | {j_['n']} | {j_['k']} | {j_['F_lof']:.2f} | "
-                          f"{fmt(j_['p_lof'], 4)} | {fmt(j_['p_lof_flip'], 4)} | {j_['F_sym']:.2f} | "
-                          f"{fmt(j_['p_sym'], 4)} / {fmt(j_['p_sym_flip'], 4)} |")
+                f2 = lambda x, nd=2: f"{x:.{nd}f}" if isinstance(x, float) else ""   # noqa: E731
+                md.append(f"| {j_['frac']} | {j_['G']} | {j_['structure']} | {j_['status']} | {j_['conditions']} | {j_['n']} | "
+                          f"{j_['k']} | {f2(j_.get('F_lof'))} | {fmt(j_.get('p_lof'), 4)} | "
+                          f"{fmt(j_.get('p_lof_flip'), 4)} ({fmt(j_.get('flip_min_p'), 4)}) | {f2(j_.get('F_sym'))} | "
+                          f"{fmt(j_.get('p_sym'), 4)} / {fmt(j_.get('p_sym_flip'), 4)} |")
         md.append("\nLadder ratings, and per-pair means of the FULL-matrix decomposition by pair relation. These "
                   "are descriptive averages of residuals that depend on the whole matrix, not decompositions "
                   "within each group. The relation classes are exclusive (same-run before sisters before "
@@ -1086,10 +1334,11 @@ def main(argv=None):
                       "cross-run pairs, so these are not the stats spec's matched within- vs between-run K3 "
                       "comparison (which needs >= 3 time points per run); inference over evolutionary runs needs "
                       "independent home runs per regime (a panel bootstrap), which two runs per regime cannot give.\n")
-            md.append("| condition | fraction | window | group | items | cyclic share | noise-corrected (95% range) | d_C | F lof (cycle dims) | p boot | p sign-flip | local / harmonic |\n|---|---|---|---|---|---|---|---|---|---|---|---|")
+            md.append("p-values only for sub-blocks of a formal block (status column).\n")
+            md.append("| condition | fraction | window | status | group | items | cyclic share | noise-corrected (95% range) | d_C | F lof (cycle dims) | p boot | p sign-flip | local / harmonic |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|")
             for s_ in subs:
                 ci = (f" ({s_['share_ci95_lo']:.3f}-{s_['share_ci95_hi']:.3f})" if s_["share_ci95_lo"] is not None else "")
-                md.append(f"| {s_['cond']} | {s_['frac']} | {s_['G']} | {s_['group']} | {s_['names']} | {s_['cyclic_share']:.3f} | "
+                md.append(f"| {s_['cond']} | {s_['frac']} | {s_['G']} | {s_['status']} | {s_['group']} | {s_['names']} | {s_['cyclic_share']:.3f} | "
                           f"{fmt(s_['noise_corrected'], 3)}{ci} | {s_['dC']:.4f} | "
                           f"{s_['F_lof']:.2f} ({s_['df']}) | {fmt(s_['p_lof'], 4) or '-'} | {fmt(s_['p_lof_flip'], 4) or '-'} | "
                           f"{s_['local_harmonic']} |")
@@ -1099,6 +1348,46 @@ def main(argv=None):
                       "per pair in matrix_pairs.csv; within-snapshot values in inputs.json. The correlation above is "
                       "descriptive: pairs share snapshots and the residuals are coupled by the projection, so it is "
                       "not a test (the spec's distance slopes need a panel bootstrap over independent runs).\n")
+
+    # --- bounded-scale sensitivity (bounded.py)
+    if srows:
+        write_csv(os.path.join(a.out, "scale.csv"), srows,
+                  ["cond", "frac", "G", "status", "scale", "clipped", "endpoints", "n", "k", "cyclic_share",
+                   "noise_corrected", "share_ci95_lo", "share_ci95_hi", "dC", "dC_ci95_lo", "dC_ci95_hi", "F_lof",
+                   "p_primary", "p_lof", "p_lof_flip", "F_sym", "p_sym", "p_sym_flip", "triads_cyclic", "triads",
+                   "plan_sha256", "analysis_sha256"])
+    if mrows:
+        write_csv(os.path.join(a.out, "bounded.csv"), mrows,
+                  ["cond", "frac", "G", "status", "model", "n", "k", "B", "converged", "boot_not_converged", "sse",
+                   "params", "T_C", "tau_C", "C_fit", "R_C", "R_C_null", "R_C_nc", "share_nc_raw", "share_res_nc",
+                   "survival", "dC_raw", "dC_res", "F_res", "p_res", "T_S", "tau_S", "R_S", "R_S_nc", "F_res_S",
+                   "p_res_S", "plan_sha256", "analysis_sha256"])
+    if srows or mrows:
+        md.append("\n## Bounded-scale sensitivity (is the cyclic residual a bounded ladder?)\n")
+        md.append("The score is bounded (q in [0, 1]; a losing invader cannot fall below s = -f0), and a transitive but "
+                  "non-additive bounded ladder makes Hodge residuals with no ordinal cycle (Bertrand, Czarnecki & Gidel "
+                  "2023). (1) Transformed endpoints: each replicate's endpoint q and start fraction f are transformed, "
+                  "s_h = h(q) - h(f), then the unchanged pipeline (logit clipped at EPS: exact zeros occur, so the "
+                  "clip matters; asin = arcsine-sqrt, no clip). Descriptive: no scale is uniquely right, and the tests "
+                  "test additivity on that scale. (2) Bounded node-additive models for the expected endpoint "
+                  "qbar_ij (logistic sigma(mu + a_i + b_j); aoceil = a free asymmetric link with a ceiling; strength "
+                  "= sigma(c + u_i - u_j)), each transitive by construction: C_fit = the curl the bounded ladder "
+                  "itself makes, R_C = the cyclic energy left after it, residual share = (R_C - its bootstrap noise) "
+                  "/ (T_A - tau_A) on the raw scale's signal, so it compares with the raw noise-corrected share; "
+                  "p_res = parametric-residual bootstrap with the model refitted in every draw (approximate).\n")
+        md.append("| condition | fraction | window | status | scale | clipped/endpoints | cyclic share | noise-corrected (95% range) | d_C | F lof | p boot | p sign-flip | F sym | triads cyclic |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+        for s_ in srows:
+            md.append(f"| {s_['cond']} | {s_['frac']} | {s_['G']} | {s_['status'][:11]} | {s_['scale']} | "
+                      f"{s_['clipped']}/{s_['endpoints']} | {s_['cyclic_share']:.3f} | {fmt(s_['noise_corrected'], 3)} "
+                      f"({s_['share_ci95_lo']:.3f}-{s_['share_ci95_hi']:.3f}) | {s_['dC']:.4f} | {s_['F_lof']:.2f} | "
+                      f"{fmt(s_['p_lof'], 4)} | {fmt(s_['p_lof_flip'], 4)} | {s_['F_sym']:.2f} | "
+                      f"{s_['triads_cyclic']}/{s_['triads']} |")
+        md.append("\n| condition | fraction | window | status | model | raw noise-corrected share | C_fit / T_C (curl made by the bounded ladder) | residual noise-corrected share | survival (of corrected cyclic energy) | d_C raw / residual | F_res | p_res | F_res sym | p_res sym |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+        for m_ in mrows:
+            md.append(f"| {m_['cond']} | {m_['frac']} | {m_['G']} | {m_['status'][:11]} | {m_['model']} | "
+                      f"{fmt(m_['share_nc_raw'], 3)} | {fmt(m_['C_fit'] / m_['T_C'] if m_['T_C'] > 0 else None, 3)} | "
+                      f"{fmt(m_['share_res_nc'], 3)} | {fmt(m_['survival'], 3)} | {m_['dC_raw']:.4f} / {m_['dC_res']:.4f} | "
+                      f"{m_['F_res']:.2f} | {fmt(m_['p_res'], 4)} | {m_['F_res_S']:.2f} | {fmt(m_['p_res_S'], 4)} |")
 
     # --- speed
     c, pts = speed_fit(recs)
