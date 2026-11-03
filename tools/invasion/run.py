@@ -18,7 +18,10 @@ cell runs in DIR/cells/<id>/:
                          the run is bit-exact from arena.json + reseed)
     score.json           score.py (child-id derivation checked)
     done.json            written atomically LAST, only after the process
-                         succeeded and the scorer's checks passed
+                         succeeded and the scorer's checks passed, and after
+                         every file it vouches for is fsync'd (the engine
+                         does not fsync; a crash once left durable done.json
+                         files over zero-length outputs)
 With --prune a finished cell keeps only cell.json, done.json, score.json,
 arena.manifest.json, run.csv, run.config.txt, stdout.log and
 run.births.csv.gz (see below): everything analyze.py and horizon.py read.
@@ -393,6 +396,11 @@ def run_cell(root, cell_id, prune=False):
         except (PruneError, OSError) as e:
             print(f"PRUNE CHECK FAILED (nothing deleted): {e}", file=sys.stderr)
             return 7
+    # done.json must not outlive the files it vouches for: the engine does not fsync its outputs
+    # (after the 2026-11-03 disk-full crash 8 finished cells had a durable done.json and score.json
+    # but zero-length end.json / run.births.csv / stdout.log). Flush what stays, then the directory.
+    gone = set(done["pruned"]["removed"]) | {BIRTHS} if prune else set()
+    fsync_files(d, [f for f in os.listdir(d) if f not in gone])
     invlib.write_json_atomic(os.path.join(d, "done.json"), done)
     if prune:
         try:
@@ -400,6 +408,23 @@ def run_cell(root, cell_id, prune=False):
         except (PruneError, OSError) as e:   # the cell is done; the next --prune start finishes the prune
             print(f"warning: prune incomplete ({e})", file=sys.stderr)
     return 0
+
+
+def fsync_files(d, names):
+    """fsync each regular file d/name, then d itself."""
+    for f in names:
+        p = os.path.join(d, f)
+        if os.path.isfile(p):
+            fd = os.open(p, os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+    fd = os.open(d, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 # ------------------------------------------------------------------- pruning
