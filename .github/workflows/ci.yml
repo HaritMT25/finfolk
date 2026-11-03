@@ -56,8 +56,8 @@ jobs:
 
   # The Ocean (3-D) world: its browser module rebuilt and compared with the
   # committed one; the page's Turbo hand-off against that module (two real
-  # instances, in node); then wasm/ocean_parity.sh on CI's FAST subset (43 of
-  # the 100 cases, about a quarter of their cost: one or more of every family,
+  # instances, in node); then wasm/ocean_parity.sh on CI's FAST subset (49 of
+  # the 124 cases: one or more of every family,
   # and the appearance twins of the selected ones) with every guard (the
   # page's validation of each case, the refused configs, the removed-non-finite
   # runs, the preset / int-key / bool-key / orphan checks) and the unit checks,
