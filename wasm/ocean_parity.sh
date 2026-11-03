@@ -63,8 +63,8 @@
 #   ONLY=def_s1 wasm/ocean_parity.sh  # one case (a grep -E pattern on the name)
 #   NO_TESTS=1 wasm/ocean_parity.sh   # parity cases only
 #   NO_EYE=1 wasm/ocean_parity.sh     # the plain Ocean build only
-#   FAST=1 wasm/ocean_parity.sh       # CI's subset (FAST_CASES below: 43 cases, about a
-#                                     # quarter of the cases' cost) with EVERY guard and both
+#   FAST=1 wasm/ocean_parity.sh       # CI's subset (FAST_CASES below: 49 of the 124 cases)
+#                                     # with EVERY guard and both
 #                                     # builds' unit checks; not with --rebaseline
 #
 # Two builds: the plain Ocean build (-DEVO_WORLD_OCEAN; every case not named
