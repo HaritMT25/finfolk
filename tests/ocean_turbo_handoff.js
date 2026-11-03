@@ -516,10 +516,14 @@ const unref = (t) => { if (t && t.unref) t.unref(); return t; };
  * after ocean.js, as ocean.html), nogl (no WebGL2: the scene can't be made),
  * nosimd (WebAssembly without SIMD), media {query: true} (matchMedia; every
  * other query false; page.setMedia changes one and tells its listeners). */
+/* every page booted (the runner stops their Turbo workers when their section ends: in node a worker shares the
+ * one event loop, and one left running slows every section after it) */
+const PAGES = [];
 async function bootPage(query, opts) {
     opts = opts || {};
     const page = { hooks: {}, workers: [], uncaught: [], logs: [], inits: [], sets: [], blobs: [], downloads: [], raf: null, focusVisible: false,
                    wasmBytes: WASM_BYTES };
+    PAGES.push(page);
     const { doc, Ev, fireOn } = makeDom(page);
     const loc = {};
     const setLoc = (u) => { const x = new URL(u); Object.assign(loc, { href: x.href, search: x.search, origin: x.origin, protocol: x.protocol, pathname: x.pathname }); };
@@ -3537,7 +3541,7 @@ async function worldCodec() {
 async function savedWorld(p) {
     const n = p.downloads.length;
     p.click('saveworld');
-    await until(() => p.downloads.length > n || /Couldn't save|not saved/.test(p.msg()), 'Save world\'s file');
+    await until(() => p.downloads.length > n || /Couldn't save|not saved/.test(p.msg()), 'Save world\'s file', 120000);
     if (p.downloads.length === n) throw new Error('Save world: ' + p.msg());
     const blob = p.blobs[p.blobs.length - 1];
     return { name: p.downloads[p.downloads.length - 1].name, bytes: new Uint8Array(await blob.arrayBuffer()) };
@@ -3547,7 +3551,8 @@ async function openWorld(p, bytes, name) {
     const e0 = p.T.worldEpoch;
     p.el('err').textContent = '';
     p.loadFile(new File([bytes], name || 'saved.oceanworld'));
-    await until(() => p.T.worldEpoch !== e0 || p.T.asking || /That|Couldn't|not opened/.test(p.msg()), 'the world file\'s answer');
+    /* (a page in Turbo shares node's one event loop with its worker: the decompression waits behind its chunks) */
+    await until(() => p.T.worldEpoch !== e0 || p.T.asking || /That|Couldn't|not opened/.test(p.msg()), 'the world file\'s answer', 120000);
     return p.msg();
 }
 /* the page's frame, its world stepped n (paused: the frame loop syncs, steps nothing) */
@@ -3640,6 +3645,14 @@ async function pageWorldTurbo() {
         const snap = sh.fromWorker.findIndex(m => m.type === 'snapshot'), before = sh.fromWorker.slice(0, snap).filter(m => m.type === 'set' && m.ok).map(m => [m.frame, m.key, m.value]);
         await until(() => p.T.turboStats && p.T.turboStats.frame > h.frame + 60, 'Turbo to run on');
         const ran = p.T.turboState === 'turbo' && !sh.toWorker.some(m => m.cmd === 'stop');
+        /* Turbo goes before its copy: the save is cancelled, said so; the next one works (and this page's worker is gone
+         * before another page opens the file: in node it would share that page's event loop) */
+        sh.pause();
+        p.click('saveworld');
+        sh.onerror({ message: 'injected: the worker died' });
+        await until(() => p.T.turboState === 'live', 'the recovery');
+        const t = toastText(p), none = p.T.worldSave === null, n2 = p.downloads.length;
+        const again = await savedWorld(p);
         const q = await bootPage(PAGE_Q7);
         await openWorld(q, bytes);
         const fq = frame(q.M), ref = await controlRun(img, before, h.frame), diff = sameFor(q.M, ref, 60);
@@ -3647,13 +3660,6 @@ async function pageWorldTurbo() {
                     laterAfter: !before.some(e => e[1] === 'minSpeed'), frame: fq === h.frame, same: !diff };
         ok(all(c), 'Save world in Turbo: the worker copied its world at frame ' + h.frame + ' and ran on (no Stop); the maxPopulation 200 it acknowledged is in the file, ' +
            'the minSpeed sent after is not; opened, 60 steps bit-identical to the page\'s image with the worker\'s edits replayed' + (diff ? ': ' + diff : '') + nots(c));
-        /* Turbo goes before its copy: the save is cancelled, said so; the next one works */
-        sh.pause();
-        p.click('saveworld');
-        sh.onerror({ message: 'injected: the worker died' });
-        await until(() => p.T.turboState === 'live', 'the recovery');
-        const t = toastText(p), none = p.T.worldSave === null, n2 = p.downloads.length;
-        const again = await savedWorld(p);
         ok(none && /The world was not saved: Turbo stopped before it could copy the world/.test(t) && p.downloads.length === n2 + 1 && again.bytes.length > 0,
            'the worker fails with Save world waiting for its copy: not saved, said so ("' + t.slice(0, 90) + '…"); the next Save world works');
         ok(p.uncaught.length === 0 && q.uncaught.length === 0, 'no exception escaped the page\'s handlers (Turbo save)');
@@ -3665,13 +3671,14 @@ async function pageWorldTurbo() {
         const { p, sh } = await pageInTurbo('?seed=7&pop=12&w=1920&h=1080&walls=1');
         const c = startCounter(p), a = c();
         await openWorld(p, s.bytes, s.name);
-        const ask = asked(p) && p.el('startconfirm').textContent === 'Stop Turbo & open' && /This stops Turbo and replaces your run, and what Turbo ran with it/.test(p.el('startaskmsg').textContent);
+        const ask = asked(p) && p.el('startconfirm').textContent === 'Stop Turbo & open' && /This stops Turbo and replaces your run, and (.* of evolution and )?what Turbo ran with it\. It opens the saved world/.test(p.el('startaskmsg').textContent);
         p.click('startconfirm');
         await until(() => p.T.turboState === 'live' && !p.T.pendingStart, 'the hand-back and the open');
-        const d = delta(a, c()), diff = sameFor(src.M, p.M, 40);
-        ok(ask && d.epoch === 1 && d.inits === 0 && d.resets === 0 && sh.terminated === 1 && p.T.initArgs.seed === 4242 && frame(src.M) === f + 40 && !diff,
-           'From a file in Turbo: asked "Stop Turbo & open"; the hand-back, then the saved world, one epoch (' + JSON.stringify(d) + '), the old worker terminated; ' +
-           '40 steps bit-identical to the page that saved it' + (diff ? ': ' + diff : ''));
+        const d = delta(a, c()), f1 = frame(p.M), diff = sameFor(src.M, p.M, 40);
+        const k = { ask, oneEpoch: d.epoch === 1 && d.inits === 0 && d.resets === 0, terminated: sh.terminated === 1, seed: p.T.initArgs.seed === 4242,
+                    frame: f1 === f, same: !diff };
+        ok(all(k), 'From a file in Turbo: asked "Stop Turbo & open"; the hand-back, then the saved world, one epoch (' + JSON.stringify(d) + '), the old worker terminated; ' +
+           '40 steps bit-identical to the page that saved it' + (diff ? ': ' + diff : '') + nots(k) + (k.frame ? '' : ' (frame ' + f1 + ', saved ' + f + ')'));
     }
     {   /* after a Turbo round trip; the saver's memory grown (the opener grows); the opener's bigger (the rest zeroed) */
         const p = await bootPage(PAGE_Q);
@@ -3825,6 +3832,7 @@ process.on('unhandledRejection', (e) => { unhandled.push(e); });
         if (only.length && !only.includes(name)) continue;
         /* a section that throws is one failed check, and the others still run */
         try { await SECTIONS[name](); } catch (e) { ok(false, name + ' threw: ' + String(e && e.stack || e).split('\n').slice(0, 3).join(' | ')); }
+        for (const p of PAGES.splice(0)) for (const sh of p.workers) if (!sh.terminated) sh.terminate();   /* its pages' Turbo stops with it */
     }
     ok(unhandled.length === 0, 'no unhandled promise rejection' + (unhandled.length ? ': ' + unhandled[0] : ''));
     console.log('\n' + (checks - failures) + ' / ' + checks + ' checks passed in ' + ((Date.now() - t0) / 1000).toFixed(1) + ' s');
