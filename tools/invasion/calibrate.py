@@ -18,15 +18,16 @@ analysis default (review round 2: this tool used to default to the wild bootstra
 rejection rate at alpha is the fraction with p <= alpha; every rate carries its Clopper-Pearson
 95% interval (the stats spec's binomial lower bound on power is its lower end).
 
-PILOT SCALE (N, k of the block; --pilot-k K subsamples K of the block's units, without
-replacement, in the 'empirical' world: the hook for a higher-replication real-engine null
-block, where K real units out of many give a far better-identified error distribution than
-six). Null worlds, built from the block (a pure ladder: neither the ladder nor any column
-constant changes the tests, so most worlds carry noise only):
+PILOT SCALE (N, k of the block; --pilot-k sets k). Null worlds, built from the block (a pure
+ladder: neither the ladder nor any column constant changes the tests, so most worlds carry
+noise only):
   iso          iid Gaussian, one SD for every cell (the old chi-square test's assumption)
   hetero       independent Gaussian with the block's own per-cell SDs (they differ ~50x)
   pilotcov     Gaussian with each column's sample covariance shrunk halfway to its diagonal
-  empirical    the block's own centred, variance-restored units, resampled (real shapes)
+  empirical    the block's own centred, variance-restored units, drawn WITH replacement (iid
+               from the empirical distribution, any k; review round 3: drawing k of K units
+               without replacement gave the means only (1 - k/K) of the noise)
+  empirical-wor  that without-replacement draw, kept as a labelled diagnostic only
   skew         per-cell SDs, independent centred exponential errors (skewness 2)
   concentrated per-cell SDs plus a strong Gaussian common factor within each unit (+-1 loadings):
                curl noise concentrated in few directions
@@ -94,7 +95,7 @@ import bounded  # noqa: E402
 import hodge  # noqa: E402
 import infer  # noqa: E402
 
-ALPHAS = (0.05, 0.01, 0.0045)
+ALPHAS = (0.05, 0.01, 0.0045, 0.05 / 12)   # 0.05/12: Holm's first step over hypotheses 1-11 + 1b
 D_GRID = (0.0025, 0.005, 0.01, 0.02)
 WORLDS = ("iso", "hetero", "pilotcov", "empirical", "skew", "concentrated", "skewfactor", "mixture", "rare1", "bounded")
 CODE = ("calibrate.py", "infer.py", "hodge.py", "bounded.py")
@@ -192,7 +193,12 @@ class World:
                         cv2 = (sq[p][i] / self.mu[p][i]) ** 2
                         x = (1.0 + cv2) / (1.0 + 1.0 / self.kM) - 1.0
                         self.ke[p][i] = 1.0 / x if x > 1e-9 else None   # None: no cell noise beyond the factor
-        if name == "empirical" and self.k < self.k0:
+        if name == "empirical-wor":
+            # DIAGNOSTIC only: k of the K centred units WITHOUT replacement and without the variance
+            # restoration. Its means carry only (1 - k/K) of the bank's noise (review round 3), so it
+            # is not an iid null calibration.
+            if self.k > self.k0:
+                raise ValueError("empirical-wor needs k <= the block's replicates")
             self.res = [[[x / math.sqrt(self.k0 / (self.k0 - 1.0)) for x in u] for u in col] for col in self.res]
 
     def draw(self, rnd):
@@ -200,7 +206,7 @@ class World:
         z = []
         for p in range(N):
             col = []
-            if nm == "empirical" and k < self.k0:   # subsample k real units without replacement
+            if nm == "empirical-wor":
                 picks = rnd.sample(range(self.k0), k)
             for r in range(k):
                 if nm == "iso":
@@ -236,7 +242,10 @@ class World:
                             e = rnd.gammavariate(ke, 1.0 / ke) if ke else 1.0
                             u[i] = self.mu[p][i] * M * e
                 elif nm == "empirical":
-                    u = list(self.res[p][picks[r]] if k < self.k0 else self.res[p][rnd.randrange(len(self.res[p]))])
+                    # iid draws from the centred, variance-restored units (WITH replacement, any k)
+                    u = list(self.res[p][rnd.randrange(len(self.res[p]))])
+                elif nm == "empirical-wor":
+                    u = list(self.res[p][picks[r]])
                 elif nm == "pilotcov":
                     idx, L = self.L[p]
                     g = [rnd.gauss(0, 1) for _ in idx]
@@ -417,6 +426,170 @@ def task_bnull(args):
     return (key, "bnull", f"{model} + empirical units", N, k, 1, 1), c.cnt, n
 
 
+def _bank_groups(bank, outer_seed=None):
+    """The bank's primary blocks as groups[g][c] of centred, variance-restored units (K per column).
+    With outer_seed, first resample each column's K raw units with replacement (the same indices
+    for every condition of a group: the assays' units are aligned), for finite-bank uncertainty."""
+    out = []
+    rnd = random.Random(outer_seed) if outer_seed is not None else None
+    for zs in bank:
+        N, K = len(zs[0]), len(zs[0][0])
+        if rnd is not None:
+            idx = [[rnd.randrange(K) for _ in range(K)] for _ in range(N)]
+            zs = [[[z[p][i] for i in idx[p]] for p in range(N)] for z in zs]
+        out.append([infer.residual_units(z) for z in zs])
+    return out
+
+
+def _bank_cov(res_g):
+    """Per column p of a group: the Cholesky factor of the joint covariance of the conditions'
+    unit residuals (vectors over invaders i != p, concatenated over conditions)."""
+    N, K = len(res_g[0]), len(res_g[0][0])
+    out = []
+    for p in range(N):
+        idx = [(c, i) for c in range(len(res_g)) for i in range(N) if i != p]
+        vecs = [[res_g[c][p][r][i] for c, i in idx] for r in range(K)]
+        S = [[sum(v[a] * v[b] for v in vecs) / K for b in range(len(idx))] for a in range(len(idx))]
+        out.append((idx, cholesky(S)))
+    return out
+
+
+def task_bank(args):
+    """Omnibus calibration from an error bank (review round 3): k units per column drawn WITH
+    replacement from the bank's centred, variance-restored units, the same draw for every assay of
+    a group (aligned units), independently across groups; world 'bank-gauss' draws Gaussian units
+    with each column's joint (cross-assay) covariance instead. outer >= 0: the draws come from an
+    outer resample of the bank (finite-bank uncertainty)."""
+    world, k, n, outer, seed = args
+    groups0 = _bank_groups(G["bank"], None if outer < 0 else G["seed"] * 7919 + outer)
+    covs = [_bank_cov(rg) for rg in groups0] if world == "bank-gauss" else None
+    rnd = random.Random(seed)
+    B, kind = G["omnibus_B"], G["kinds"][0]
+    N = len(groups0[0][0])
+    plants = G["bank_plants"]
+    c = Counter()
+    for _ in range(n):
+        groups = []
+        for g, rg in enumerate(groups0):
+            C = len(rg)
+            zs = [[None] * N for _ in range(C)]
+            for p in range(N):
+                if world == "bank":
+                    K = len(rg[0][p])
+                    pick = [rnd.randrange(K) for _ in range(k)]
+                    for ci in range(C):
+                        zs[ci][p] = [list(rg[ci][p][i]) for i in pick]
+                else:
+                    idx, L = covs[g][p]
+                    for ci in range(C):
+                        zs[ci][p] = []
+                    for _r in range(k):
+                        e = [rnd.gauss(0, 1) for _ in idx]
+                        v = [sum(L[a][t] * e[t] for t in range(a + 1)) for a in range(len(idx))]
+                        rows = [[0.0] * N for _ in range(C)]
+                        for (ci, i), x in zip(idx, v):
+                            rows[ci][i] = x
+                        for ci in range(C):
+                            zs[ci][p].append(rows[ci])
+            groups.append(zs)
+        bs = rnd.randrange(1 << 30)
+        FC = boot_null(groups, B, bs, kind)[0] if G.get("omni_tests", "both") == "both" else None
+
+        def stat(gs):
+            st = [infer.block_stats(z) for zs_ in gs for z in zs_]
+            return infer._ratio(sum(s["TC"] for s in st), sum(s["tauC"] for s in st))
+        if FC is not None:
+            c.hit(f"omnibus boot {kind}", "null", p_from(FC, stat(groups)))
+        c.hit("omnibus sign-flip", "null", infer.signflip_groups(groups, "curl"))
+        for label, spec in plants:
+            gp = [[(infer.plant(z, *spec[(g, ci)]) if (g, ci) in spec else z) for ci, z in enumerate(zs_)]
+                  for g, zs_ in enumerate(groups)]
+            if FC is not None:
+                c.hit(f"omnibus boot {kind}", label, p_from(FC, stat(gp)))
+            c.hit("omnibus sign-flip", label, infer.signflip_groups(gp, "curl"))
+    C0 = len(groups0[0])
+    return ("bank", "bank", world + ("" if outer < 0 else f" outer{outer}"), N, k, len(groups0), C0), c.cnt, n
+
+
+def _zib(rnd, mu, sd):
+    """A support-preserving endpoint draw in [0, 1] with mean mu and SD ~sd: a zero-inflated Beta.
+    A losing invader (mu < 0.03) loses its whole pedigree with probability 0.05 (exact zeros, as in
+    the pilot); otherwise Beta(mu' phi, (1 - mu') phi) with phi from the target variance."""
+    mu = min(max(mu, 1e-4), 0.999)
+    pz = 0.05 if mu < 0.03 else 0.0
+    mb = mu / (1.0 - pz)
+    vb = (sd * sd + mu * mu) / (1.0 - pz) - mb * mb
+    vb = min(max(vb, 1e-8), 0.9 * mb * (1.0 - mb))
+    phi = mb * (1.0 - mb) / vb - 1.0
+    if pz and rnd.random() < pz:
+        return 0.0
+    return rnd.betavariate(mb * phi, (1.0 - mb) * phi)
+
+
+def task_compound(args):
+    """The frozen confirmatory decision at design scale (review round 3): H1 (raw grouped sign-flip
+    omnibus), H1b (bounded.residual_omnibus sign-flip) and the claim (both <= alpha), under a
+    TRANSITIVE bounded world: per group (home regime) N items drawn from the pilot's items, each
+    assay's endpoint means the pilot block's fitted logistic ladder sigma(mu + a_i + b_j), cells'
+    SDs drawn from that block's endpoint SDs, support-preserving zero-inflated Beta endpoints;
+    cycles planted on the MEANS (clipped to [0.002, 0.998]; clipped cells counted)."""
+    keys, N, k, Gn, n, variants, seed = args
+    fits, pools = [], []
+    for key in keys:
+        zq = G["blocks"][key]["zq"]
+        fits.append(bounded.fit_matrix(zq)["params"])
+        sq = cell_sds(zq)
+        pools.append([sq[p][i] for p in range(len(zq)) for i in range(len(zq)) if i != p])
+    N0 = len(fits[0]["a"])
+    C = len(keys)
+    rnd = random.Random(seed)
+    tmpl = [infer.cycle_template(N, "diffuse", seed=5 + g) for g in range(Gn)]
+    P = N * (N - 1) // 2
+    c = Counter()
+    vlist = [("bounded ladder", 0.0, "all")]
+    if variants == "all":
+        vlist += [(f"bounded ladder + d_C={d} in all conditions", d, "all") for d in (0.01, 0.02, 0.03)]
+        vlist += [(f"bounded ladder + d_C={d} in one condition", d, "one") for d in (0.02, 0.03)]
+    for _ in range(n):
+        items = [[rnd.randrange(N0) for _ in range(N)] for _ in range(Gn)]
+        sds = [[[[rnd.choice(pools[ci]) if i != p else 0.0 for i in range(N)] for p in range(N)] for ci in range(C)]
+               for _ in range(Gn)]
+        for label, d, where in vlist:
+            groups, clipped = [], 0
+            for g in range(Gn):
+                zs = []
+                for ci in range(C):
+                    par = fits[ci]
+                    t = items[g]
+                    mean = [[bounded.sigmoid(par["mu"] + par["a"][t[i]] + par["b"][t[p]]) if i != p else 0.0
+                             for i in range(N)] for p in range(N)]   # column layout [resident p][invader i]
+                    if d and (where == "all" or (g, ci) == (0, 0)):
+                        e = 0
+                        for p_ in range(N):
+                            for q_ in range(p_ + 1, N):
+                                x = 0.5 * d * tmpl[g][e]
+                                mean[q_][p_] += x      # p_ -> q_
+                                mean[p_][q_] -= x      # q_ -> p_
+                                e += 1
+                    for p in range(N):
+                        for i in range(N):
+                            if i != p and not 0.002 <= mean[p][i] <= 0.998:
+                                clipped += 1
+                                mean[p][i] = min(max(mean[p][i], 0.002), 0.998)
+                    zs.append([[[_zib(rnd, mean[p][i], sds[g][ci][p][i]) if i != p else 0.0 for i in range(N)]
+                                for _ in range(k)] for p in range(N)])
+                groups.append(zs)
+            p1 = infer.signflip_groups(groups, "curl")
+            ro = bounded.residual_omnibus(groups)
+            p1b = ro["p_flip"]
+            c.hit("H1 raw sign-flip omnibus", label, p1)
+            c.hit("H1b logistic residual sign-flip omnibus", label, p1b)
+            c.hit("claim: H1 and H1b", label, max(p1, p1b))
+            c.cover(f"feasible (no clipped mean): {label}", clipped == 0)
+            c.cover(f"all four fits converged: {label}", all(x["converged"] for x in ro["per_condition"]))
+    return ("compound", "compound", "logistic ladder + zero-inflated Beta", N, k, Gn, C), c.cnt, n
+
+
 def task_bdesign(args):
     """Design scale for the bounded residual test: a transitive logistic ladder sigma(mu + a_i +
     b_j) with (a_i, b_i) drawn from the block's fitted items, per-cell SDs drawn from the block's
@@ -556,6 +729,19 @@ def main(argv=None):
                     "(model from --bounded-null, default logistic)")
     ap.add_argument("--bdesign-sims", type=int, default=200)
     ap.add_argument("--bdesign-B", type=int, default=499)
+    ap.add_argument("--bank", help="an error bank's analysis blocks.json (primary_blocks): omnibus calibration "
+                    "by resampling its units WITH replacement, assays jointly, regimes independently")
+    ap.add_argument("--bank-frac", type=float, default=0.05)
+    ap.add_argument("--bank-G", type=float, default=13500.0)
+    ap.add_argument("--bank-k", type=int, default=10)
+    ap.add_argument("--bank-sims", type=int, default=10000)
+    ap.add_argument("--bank-worlds", default="bank,bank-gauss")
+    ap.add_argument("--bank-outer", type=int, default=0, help="outer resamples of the bank (finite-bank uncertainty)")
+    ap.add_argument("--bank-inner", type=int, default=500, help="datasets per outer resample")
+    ap.add_argument("--compound", default="", help="N:k:G for the frozen decision (H1, H1b, claim) in a transitive "
+                    "bounded world; the --key blocks are the conditions (assays), their endpoint units the source")
+    ap.add_argument("--compound-sims", type=int, default=2000)
+    ap.add_argument("--compound-variants", default="all", choices=["all", "null"])
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--chunk", type=int, default=50)
     ap.add_argument("--seed", type=int, default=1)
@@ -627,10 +813,44 @@ def main(argv=None):
         for c0 in range(0, a.bdesign_sims, 10):
             sd += 1
             tasks.append(("bdesign", (a.key[0], model, N, k, min(10, a.bdesign_sims - c0), sd)))
+    bank, bank_info, bank_plants = None, None, []
+    if a.bank:
+        bb = json.load(open(a.bank))
+        pbs = [b for b in bb.get("primary_blocks", []) if b["frac"] == a.bank_frac and float(b["G"]) == a.bank_G]
+        gnames = sorted({b["group"] for b in pbs})
+        cnames = sorted({b["cond"] for b in pbs})
+        byk = {(b["group"], b["cond"]): b for b in pbs}
+        bank = []
+        for g_ in gnames:
+            bs_ = [byk[(g_, c_)] for c_ in cnames]
+            if any(b["names"] != bs_[0]["names"] or b["reps"] != bs_[0]["reps"] for b in bs_):
+                raise SystemExit(f"bank group {g_}: conditions differ in items or replicates (units must align)")
+            bank.append([b["z"] for b in bs_])
+        if not bank:
+            raise SystemExit(f"no primary blocks at {a.bank_frac} / {a.bank_G} in {a.bank}")
+        Nb = len(bank[0][0])
+        bank_plants = omni_plants(Nb, len(gnames), len(cnames)) if a.omnibus_plants == "all" else []
+        bank_info = {"path": os.path.abspath(a.bank), "sha256": sha256(a.bank), "groups": gnames, "conditions": cnames,
+                     "N": Nb, "K": len(bank[0][0][0]), "status": {f"{b['group']}/{b['cond']}": b["status"] for b in pbs}}
+        for w in a.bank_worlds.split(","):
+            for c0 in range(0, a.bank_sims, a.chunk):
+                sd += 1
+                tasks.append(("bank", (w, a.bank_k, min(a.chunk, a.bank_sims - c0), -1, sd)))
+        for o in range(a.bank_outer):
+            for c0 in range(0, a.bank_inner, a.chunk):
+                sd += 1
+                tasks.append(("bank", ("bank", a.bank_k, min(a.chunk, a.bank_inner - c0), o, sd)))
+    if a.compound:
+        Nc, kc, Gc = (int(x) for x in a.compound.split(":"))
+        if any("zq" not in blocks[k_] for k_ in a.key):
+            raise SystemExit("--compound needs endpoint units (zq) for every --key block")
+        for c0 in range(0, a.compound_sims, 10):
+            sd += 1
+            tasks.append(("compound", (list(a.key), Nc, kc, Gc, min(10, a.compound_sims - c0), a.compound_variants, sd)))
     cfg = {"blocks": {k_: {"z": blocks[k_]["z"], "zq": blocks[k_].get("zq")} for k_ in a.key}, "kinds": kinds,
            "B": a.B, "design_B": a.design_B, "omnibus_B": a.omnibus_B, "bnull_B": a.bnull_B, "plants": plants,
            "omni_plants": oplants, "seed": a.seed, "pilot_k": a.pilot_k, "rho": rho, "bdesign_B": a.bdesign_B,
-           "omni_tests": a.omnibus_tests}
+           "omni_tests": a.omnibus_tests, "bank": bank, "bank_plants": bank_plants}
     acc = {}
     with multiprocessing.Pool(a.workers, initializer=_init, initargs=(cfg,)) as pool:
         it = pool.imap_unordered(_dispatch, [(fn_name, args) for fn_name, args in tasks])
@@ -642,7 +862,8 @@ def main(argv=None):
             if done % 20 == 0 or done == len(tasks):
                 print(f"{done}/{len(tasks)} chunks", flush=True)
     rows = []
-    Bs = {"pilot": a.B, "design": a.design_B, "omnibus": a.omnibus_B, "bnull": a.bnull_B, "bdesign": a.bdesign_B}
+    Bs = {"pilot": a.B, "design": a.design_B, "omnibus": a.omnibus_B, "bnull": a.bnull_B, "bdesign": a.bdesign_B,
+          "bank": a.omnibus_B, "compound": 0}
     for (key, scale, w, N, k, Gn, C), (cnt, n) in sorted(acc.items()):
         for (test, effect, alpha), v in sorted(cnt.items()):
             rate = v / n
@@ -664,7 +885,8 @@ def main(argv=None):
                                for k_ in a.key}},
            "code": code,
            "primary": infer.PRIMARY, "args": vars(a), "seed": a.seed, "task_seeds": [t[1][-1] for t in tasks],
-           "assay_corr": rho, "python": platform.python_version(), "wall_s": time.time() - t0,
+           "assay_corr": rho, "python": platform.python_version(), "wall_s": time.time() - t0, "bank": bank_info,
+           "alpha_family": bounded.ALPHA_FAMILY,
            "outputs": {f: sha256(os.path.join(a.out, f)) for f in ("calib.csv", "calib.md")}}
     with open(os.path.join(a.out, "manifest.json"), "w") as f:
         f.write(json.dumps(man, indent=1, sort_keys=True, default=str) + "\n")
@@ -674,7 +896,8 @@ def main(argv=None):
 
 def _dispatch(x):
     fn_name, args = x
-    return {"pilot": task_pilot, "omnibus": task_omnibus, "bnull": task_bnull, "bdesign": task_bdesign}[fn_name](args)
+    return {"pilot": task_pilot, "omnibus": task_omnibus, "bnull": task_bnull, "bdesign": task_bdesign,
+            "bank": task_bank, "compound": task_compound}[fn_name](args)
 
 
 def _fmt_rate(r):
@@ -756,6 +979,33 @@ def report(a, bj, blocks, rows, plants, oplants, kinds, worlds, design, omni, rh
                             cells.append(_fmt_rate(s_[0]) if s_ else "-")
                     md.append(f"| {w} | {N}:{k}:{Gn}:{C} | {e} | " + " | ".join(cells) + " |")
             md.append(f"\nLargest planted directed shift at {N}:{k}:{Gn}:{C}: {max_shift(oplants[(N, Gn, C)]):.4f}.\n")
+    for scale, title in (("bank", "Error bank: omnibus level / power from the bank's units (with replacement; assays joint, "
+                                  "regimes independent; 'outerN' = an outer resample of the bank)"),
+                         ("compound", "The frozen decision: H1, H1b and the claim (both <= alpha) in a transitive bounded "
+                                      "world (logistic ladders, zero-inflated Beta endpoints)")):
+        sel = [r for r in rows if r["scale"] == scale]
+        if not sel:
+            continue
+        md.append(f"\n## {title}\n")
+        md.append(f"alpha_family = 0.05/12 = {bounded.ALPHA_FAMILY:.5f}. Rates [Clopper-Pearson 95%].\n")
+        md.append("| world | N:k:G:C | test | effect | a=0.05 | a=0.05/12 |\n|---|---|---|---|---|---|")
+        for (w, N, k, Gn, C, t, e) in sorted({(r["world"], r["N"], r["k"], r["G"], r["C"], r["test"], r["effect"]) for r in sel}):
+            rr = {r["alpha"]: r for r in sel if (r["world"], r["N"], r["k"], r["G"], r["C"], r["test"], r["effect"]) == (w, N, k, Gn, C, t, e)}
+            cells_ = [(_fmt_rate(rr[al]) if al in rr else "-") for al in (0.05, bounded.ALPHA_FAMILY)]
+            if 0.95 in rr:
+                cells_ = [_fmt_rate(rr[0.95]), "(share)"]
+            md.append(f"| {w} | {N}:{k}:{Gn}:{C} | {t} | {e} | " + " | ".join(cells_) + " |")
+        if scale == "bank":
+            outs = {}
+            for r in sel:
+                if "outer" in r["world"] and r["test"] == "omnibus sign-flip" and r["effect"] == "null" and r["alpha"] == 0.05:
+                    outs[r["world"]] = r["rate"]
+            if len(outs) >= 2:
+                v = list(outs.values())
+                mu_ = sum(v) / len(v)
+                md.append(f"\nFinite-bank uncertainty (sign-flip level at 0.05 over {len(v)} outer resamples of the bank): "
+                          f"mean {mu_:.4f}, SD {math.sqrt(sum((x - mu_) ** 2 for x in v) / (len(v) - 1)):.4f} "
+                          "(includes the inner binomial noise).\n")
     for scale, title in (("bnull", "Bounded null: a transitive bounded ladder (the block's fitted model) plus the block's own endpoint noise"),
                          ("bdesign", "Bounded design scale: a transitive logistic ladder of pilot strength, hetero noise, diffuse cycles on top")):
         bn = [r for r in rows if r["scale"] == scale]
