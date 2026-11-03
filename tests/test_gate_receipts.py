@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """Planted-fault suite for tools/gate_receipts.{sh,py}: temp git repos and fake tools only.
 No Emscripten, no simulation gate. Run: python3 -I tests/test_gate_receipts.py"""
-import json, os, shutil, signal, subprocess, tempfile, time, unittest
+import importlib.util, json, os, shutil, signal, stat, subprocess, tempfile, time, unittest
 
 TOOLS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools")
-GATE = ('echo "run ${0##*/} FAST=${FAST:-} JOBS=${JOBS:-} opts=${NODE_OPTIONS:-none}" >> "$HOME/count"\n'
+FAKE_EMCONFIG = ('#!/bin/sh\ncase "$1" in LLVM_ROOT) echo "$EMSDK/llvm";; BINARYEN_ROOT) echo "$EMSDK/binaryen";; '
+                 'NODE_JS) echo "[\'$EMSDK/node\']";; EMSCRIPTEN_ROOT) echo "$EMSDK/em";; *) exit 1;; esac\n')
+SDK_FILES = ["llvm/clang", "llvm/clang++", "llvm/wasm-ld", "llvm/llvm-ar", "llvm/llvm-nm", "binaryen/bin/wasm-opt", "node", "em/emscripten-version.txt", "em/emcc.py"]
+GATE = ('echo $PPID > "$HOME/ppid"\n'
+        'echo "run ${0##*/} FAST=${FAST:-} JOBS=${JOBS:-} KEEP_OUT=${KEEP_OUT:-} opts=${NODE_OPTIONS:-none} bashenv=${BASH_ENV:-none} ld=${LD_PRELOAD:-none}">> "$HOME/count"\n'
         '[ -f "$HOME/slow" ] && sleep "$(cat "$HOME/slow")"\n[ -f "$HOME/hook" ] && sh "$HOME/hook"\n'
         'echo end >> "$HOME/count"\n[ -f "$HOME/fail" ] && exit "$(cat "$HOME/fail")"\nexit 0\n')
 FAKE_NODE = '#!/bin/sh\ncase "$1" in -p) echo \'{"node":"fake"}\';; --version) echo v0;; *) exec sh "$@";; esac\n'
@@ -29,7 +33,8 @@ class Base(unittest.TestCase):
         self.store = os.path.join(self.home, "store")
         for d in (self.home, self.repo, self.bin, os.path.join(self.t, "emsdk")): os.makedirs(d)
         wr(os.path.join(self.t, "emsdk", ".emscripten"), "LLVM_ROOT='/x'\n")
-        for n, body in (("node", FAKE_NODE), ("g++", FAKE_CC), ("em++", FAKE_CC)): self.put(os.path.join(self.bin, n), body, True)
+        for f in SDK_FILES: self.put(os.path.join(self.t, "emsdk", f), "sdk " + f)
+        for n, body in (("node", FAKE_NODE), ("g++", FAKE_CC), ("em++", FAKE_CC), ("em-config", FAKE_EMCONFIG)): self.put(os.path.join(self.bin, n), body, True)
         self.env = dict(PATH=self.bin + ":/usr/bin:/bin", HOME=self.home, GATE_RECEIPTS_DIR=self.store, EMSDK=os.path.join(self.t, "emsdk"))
         files = {"tests/ocean_turbo_handoff.js": GATE, "wasm/parity.sh": GATE, "wasm/ocean_parity.sh": GATE, "web/evo_boids.wasm": "a",
                  "web/evo_boids_mt.wasm": "b", "web/ocean.js": "js", "tests/ocean_baseline/c.txt": "1", "tests/ocean_appearance_vectors.txt": "v",
@@ -51,7 +56,7 @@ class Base(unittest.TestCase):
         return subprocess.run(["git", *a], cwd=cwd or self.repo, env=e, check=True, capture_output=True, text=True).stdout.strip()
     def start(self, fn, gate, argv=(), cwd=None, **env):
         e = dict(self.env, **env)
-        cmd = 'source tools/gate_receipts.sh; gate_%s %s -- "$@"' % (fn, gate)
+        cmd = 'source "%s/tools/gate_receipts.sh"; gate_%s %s -- "$@"' % (self.repo, fn, gate)  # always sourced from the main repo
         return subprocess.Popen(["bash", "-c", cmd, "x", *argv], cwd=cwd or self.repo, env=e, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 text=True, start_new_session=True)
     def go(self, fn, gate, argv=(), **kw):
@@ -60,7 +65,8 @@ class Base(unittest.TestCase):
         return p.returncode, out, err
     def run_(self, gate, argv, **env): return self.go("run", gate, argv, **env)[0]
     def check(self, gate, argv=(), **env):
-        rc, out, _ = self.go("check", gate, argv, **env)
+        rc, out, err = self.go("check", gate, argv, **env)
+        if rc in (0, 1): self.assertTrue(out.strip(), "check must print a status object: " + err)  # a traceback is not a miss
         return rc, (json.loads(out) if out.strip() else {})
     def lines(self, prefix="run"):
         try: return [l for l in rd(os.path.join(self.home, "count")).splitlines() if l.startswith(prefix)]
@@ -127,9 +133,17 @@ class Receipts(Base):
         self.pass_once("ocean-fast", OCEAN, **fast); self.assertEqual(self.n(), 2)
         wr(os.path.join(self.t, "emsdk", ".emscripten"), "# changed\n", "a")
         self.pass_once("ocean-fast", OCEAN, **fast); self.assertEqual(self.n(), 3)
+        for i, rel in enumerate(("binaryen/bin/wasm-opt", "llvm/clang++", "node", "em/emcc.py"), 4):  # the tools Emscripten's config selects
+            wr(os.path.join(self.t, "emsdk", rel), "changed", "a"); self.pass_once("ocean-fast", OCEAN, **fast); self.assertEqual(self.n(), i)
+        self.put(os.path.join(self.bin, "sed"), "#!/bin/sh\nexec /usr/bin/sed \"$@\"\n", True)  # a shell helper earlier on PATH
+        self.pass_once("ocean-fast", OCEAN, **fast); self.assertEqual(self.n(), 8)
+        self.pass_once("ocean-fast", OCEAN, **fast, TMPDIR=self.t); self.assertEqual(self.n(), 9)  # every retained variable is keyed
+        os.remove(os.path.join(self.bin, "em-config"))  # SDK unverifiable: runs, but never reusable
+        for _ in range(2): self.pass_once("ocean-fast", OCEAN, **fast)
+        self.assertEqual((self.n(), self.check("ocean-fast", OCEAN, **fast)[1]["reason"]), (11, "nonreusable"))
         os.remove(os.path.join(self.bin, "em++"))
         self.assertEqual(self.run_("ocean-fast", OCEAN, **fast), 125); self.assertEqual(self.check("ocean-fast", OCEAN, **fast)[0], 2)
-        self.assertEqual(self.n(), 3)
+        self.assertEqual(self.n(), 11)
     def test_classic_sha_pin(self):
         cmd = ["sha256sum", "-c", self.pin]
         self.pass_once("classic-sha", cmd); self.assertEqual(self.check("classic-sha", cmd)[0], 0)
@@ -182,12 +196,17 @@ class Receipts(Base):
         def find(suffix): return os.path.join(runs(), [f for f in os.listdir(runs()) if f.endswith(suffix)][0])
         def truncate(p): wr(p, rd(p)[:20])
         def alter(k, v): d = json.loads(rd(find(".json"))); d[k] = v; wr(find(".json"), json.dumps(d))
-        cases = {"truncated key": lambda: truncate(keyfile()), "truncated run": lambda: truncate(find(".json")), "schema": lambda: alter("schema", 9),
-                 "wrong key": lambda: alter("key", "0" * 64), "missing log": lambda: os.remove(find(".stdout")),
-                 "altered log": lambda: wr(find(".stderr"), "x", "a")}
-        for name, act in cases.items():
+        def ref(k, v): d = json.loads(rd(keyfile())); d.pop(k) if v is None else d.__setitem__(k, v); wr(keyfile(), json.dumps(d))
+        def result(k, v): d = json.loads(rd(find(".json"))); d["result"][k] = v; wr(find(".json"), json.dumps(d))
+        cases = {"truncated key": (lambda: truncate(keyfile()), "malformed"), "truncated run": (lambda: truncate(find(".json")), "malformed"),
+                 "schema": (lambda: alter("schema", 9), "malformed"), "wrong key": (lambda: alter("key", "0" * 64), "malformed"),
+                 "missing log": (lambda: os.remove(find(".stdout")), "malformed"), "altered log": (lambda: wr(find(".stderr"), "x", "a"), "evidence"),
+                 "no state": (lambda: ref("state", None), "malformed"), "reusable string": (lambda: result("reusable", "false"), "malformed"),
+                 "complete truthy": (lambda: result("complete", 1), "malformed"), "wrong run id": (lambda: ref("run", "nope"), "malformed")}
+        for name, (act, reason) in cases.items():
             with self.subTest(name):
-                self.pass_once(GATE_FORCE="1"); act(); self.assertEqual(self.check("turbo", TURBO)[0], 1)
+                self.pass_once(GATE_FORCE="1"); act(); rc, st = self.check("turbo", TURBO)
+                self.assertEqual((rc, st["reason"]), (1, reason))
                 shutil.rmtree(self.store)
     def test_timestamps_do_not_matter(self):
         self.pass_once()
@@ -201,15 +220,65 @@ class Receipts(Base):
                 before = self.n(); self.pass_once(**env); self.assertEqual(self.n(), before + 1)
                 self.assertEqual(self.check("turbo", TURBO, **env)[0], 1)
     def test_child_environment_is_closed(self):
-        self.pass_once(NODE_OPTIONS="--inspect", BASH_ENV="/nonexistent")
-        self.assertTrue(self.lines()[0].endswith("opts=none"))
+        self.pass_once("ocean-fast", OCEAN, FAST="1", NODE_OPTIONS="--inspect", BASH_ENV="/nonexistent", LD_PRELOAD="/nonexistent")
+        self.assertTrue(self.lines()[0].endswith("opts=none bashenv=none ld=none"))
+    def test_keep_out_auto_reaches_the_gate(self):
+        self.pass_once("ocean-fast", OCEAN, FAST="1", KEEP_OUT="auto"); self.assertIn("KEEP_OUT=auto", self.lines()[0])
     def test_record_only_gates_never_skip(self):
-        ok = ["sh", "-c", 'echo run >> "$HOME/count"; echo \'{"ok":%s}\'']
-        self.assertEqual(self.run_("merged-smoke", [ok[0], ok[1], ok[2] % "false"]), 1)  # exit 0 but ok:false
+        def smoke(ok, base="u"): return ["sh", "-c", 'echo run >> "$HOME/count"; echo \'{"ok":%s,"base":"%s"}\'' % (ok, base), "sh", "u"]
+        self.assertEqual(self.run_("merged-smoke", smoke("false")), 1)  # exit 0 but ok:false
+        self.assertEqual(self.run_("merged-smoke", smoke("true", "other")), 1)  # it visited a different URL than the one passed
         self.assertEqual(self.run_("merged-smoke", ["sh", "-c", "echo not json"]), 1)
-        for _ in range(2): self.assertEqual(self.run_("merged-smoke", [ok[0], ok[1], ok[2] % "true"]), 0)
-        self.assertEqual(self.n(), 3); self.assertEqual(self.check("merged-smoke")[0], 1)  # the 2 passes both executed
+        for _ in range(2): self.assertEqual(self.run_("merged-smoke", smoke("true")), 0)
+        self.assertEqual(self.n(), 4); self.assertEqual(self.check("merged-smoke")[0], 1)  # the 2 passes both executed
         self.assertEqual(self.run_("browser", ["true"], BASE="http://x"), 0)
+    def test_lock_outlives_a_killed_coordinator(self):
+        wr(os.path.join(self.home, "slow"), "1.5"); e = dict(FAST="1", OCEAN_PARITY_DIR=self.t + "/o")
+        a = self.start("run", "ocean-fast", OCEAN, JOBS="1", **e)
+        while not self.lines(): time.sleep(0.05)
+        os.kill(int(rd(os.path.join(self.home, "ppid"))), signal.SIGKILL)  # only the coordinator; its gate keeps running
+        fin(a); b = self.start("run", "ocean-fast", OCEAN, JOBS="2", **e)  # same output dir, different key
+        self.assertEqual(fin(b), 0); time.sleep(0.2)
+        self.assertEqual([l.split()[0] for l in self.lines("")], ["run", "end", "run", "end"])  # B started only after A's gate ended
+    def test_inputs_are_refreshed_after_waiting_for_the_lock(self):
+        wt = os.path.join(self.t, "wt"); self.git("worktree", "add", "-q", "--detach", wt)
+        wr(os.path.join(self.home, "slow"), "1.5")
+        a = self.start("run", "turbo", TURBO); time.sleep(0.4)
+        b = self.start("run", "turbo", TURBO, cwd=wt); time.sleep(0.6)  # B is now blocked on A's key lock
+        wr(os.path.join(wt, "web/ocean.js"), "edited while waiting")
+        self.assertEqual(fin(a), 0); out, err = b.communicate()
+        self.assertEqual((b.returncode, "fresh" in err, self.n()), (0, False, 2))  # B re-checked, saw a dirty tree, and ran
+    def test_helper_comes_from_the_candidate_not_from_where_it_was_sourced(self):
+        wt = os.path.join(self.t, "wt"); self.git("worktree", "add", "-q", "-b", "b", wt)
+        py = os.path.join(wt, "tools/gate_receipts.py"); wr(py, rd(py).replace("SCHEMA, REPO_ID", 'sys.stderr.write("HELPER-B\\n")\nSCHEMA, REPO_ID', 1))
+        self.git("commit", "-qam", "other helper", cwd=wt)
+        rc, out, err = self.go("run", "turbo", TURBO, cwd=wt)  # sourced from self.repo, run in wt
+        self.assertEqual((rc, "HELPER-B" in err), (0, True))
+    def test_helper_bytes_are_keyed(self):
+        self.pass_once(); self.edit("tools/gate_receipts.py", rd(os.path.join(self.repo, "tools/gate_receipts.py")) + "# edit\n"); self.commit("helper")
+        self.pass_once(); self.assertEqual(self.n(), 2)
+    def test_case_collisions_and_aliases(self):
+        self.edit("web/OCEAN.js", "other"); self.git("add", "-A"); self.commit("collide")
+        self.assertEqual(self.check("turbo", TURBO)[1]["reason"], "dirty")
+        self.git("reset", "-q", "--hard", "HEAD~1"); os.symlink(self.t + "/o", self.t + "/alias"); wr(os.path.join(self.home, "slow"), "0.5")
+        ps = [self.start("run", "ocean-fast", OCEAN, FAST="1", JOBS=str(j), OCEAN_PARITY_DIR=d) for j, d in ((1, self.t + "/o"), (2, self.t + "/alias"))]
+        self.assertEqual([fin(p) for p in ps], [0, 0])
+        self.assertEqual([l.split()[0] for l in self.lines("")], ["run", "end", "run", "end"])  # same directory by identity, one at a time
+    def test_filesystem_support_and_durable_publication(self):
+        spec = importlib.util.spec_from_file_location("gate_receipts", os.path.join(TOOLS, "gate_receipts.py")); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+        info = ("1 0 8:1 / / rw - ext4 /dev/sda1 rw\n2 1 0:5 / /mnt/c rw - 9p drvfs rw\n3 1 0:6 / /mnt/my\\040disk rw - nfs4 srv:/x rw\n")
+        self.assertEqual([m.fstype(p, info) for p in ("/home/x", "/mnt/c/out", "/mnt/c", "/mnt/my disk/a", "/mnt/cc")], ["ext4", "9p", "9p", "nfs4", "ext4"])
+        self.assertIsNone(m.fstype("/x", "")); self.assertNotIn("9p", m.FS_OK)
+        synced, real = [], os.fsync
+        m.os.fsync = lambda fd: (synced.append(stat.S_ISDIR(os.fstat(fd).st_mode)), real(fd))[1]
+        self.addCleanup(setattr, m.os, "fsync", real)
+        os.environ["GATE_RECEIPTS_DIR"] = self.store; self.addCleanup(os.environ.pop, "GATE_RECEIPTS_DIR")
+        m.Store().write("keys/k.json", b"{}", True)
+        self.assertEqual(synced, [False, True])  # the file, then its directory
+    def test_storage_failure_follows_the_protocol(self):
+        wr(self.t + "/afile", "x"); bad = dict(GATE_RECEIPTS_DIR=self.t + "/afile/store")
+        self.assertEqual(self.run_("turbo", TURBO, **bad), 125); self.assertEqual(self.n(), 0)
+        rc, st = self.check("turbo", TURBO, **bad); self.assertEqual((rc, st["status"]), (2, "stale"))
     def test_sourcing_is_inert_and_syntax_ok(self):
         r = subprocess.run(["bash", "-c", "source tools/gate_receipts.sh"], cwd=self.repo, env=self.env, capture_output=True, text=True)
         self.assertEqual((r.returncode, r.stdout, r.stderr), (0, "", ""))
