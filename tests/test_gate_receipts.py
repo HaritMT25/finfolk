@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Planted-fault suite for tools/gate_receipts.{sh,py}: temp git repos and fake tools only.
 No Emscripten, no simulation gate. Run: python3 -I tests/test_gate_receipts.py"""
-import importlib.util, json, os, shutil, signal, stat, subprocess, tempfile, time, unittest
+import importlib.util, json, os, pwd, shutil, signal, stat, subprocess, tempfile, time, unittest
 
 TOOLS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools")
 FAKE_EMCONFIG = ('#!/bin/sh\ncase "$1" in LLVM_ROOT) echo "$EMSDK/llvm";; BINARYEN_ROOT) echo "$EMSDK/binaryen";; '
-                 'NODE_JS) echo "[\'$EMSDK/node\']";; EMSCRIPTEN_ROOT) echo "$EMSDK/em";; *) exit 1;; esac\n')
+                 'NODE_JS) echo "[\'$EMSDK/node\']";; EMSCRIPTEN_ROOT) echo "$EMSDK/em";; CLANG_ADD_VERSION|LLVM_ADD_VERSION) echo None;; '
+                 'COMPILER_WRAPPER) if [ -f "$EMSDK/wrapper" ]; then echo /usr/local/bin/ccache; else echo None; fi;; *) exit 1;; esac\n')
 SDK_FILES = ["llvm/clang", "llvm/clang++", "llvm/wasm-ld", "llvm/llvm-ar", "llvm/llvm-nm", "binaryen/bin/wasm-opt", "node", "em/emscripten-version.txt", "em/emcc.py"]
 GATE = ('echo $PPID > "$HOME/ppid"\n'
         'echo "run ${0##*/} FAST=${FAST:-} JOBS=${JOBS:-} KEEP_OUT=${KEEP_OUT:-} opts=${NODE_OPTIONS:-none} bashenv=${BASH_ENV:-none} ld=${LD_PRELOAD:-none}">> "$HOME/count"\n'
@@ -27,7 +28,7 @@ def rd(p):
 
 class Base(unittest.TestCase):
     def setUp(self):
-        self.t = os.path.realpath(tempfile.mkdtemp())
+        self.t = os.path.realpath(tempfile.mkdtemp(dir=pwd.getpwuid(os.getuid()).pw_dir))  # reuse is only allowed on the home filesystem
         self.addCleanup(shutil.rmtree, self.t, True)
         self.home, self.repo, self.bin = (os.path.join(self.t, d) for d in ("home", "repo", "bin"))
         self.store = os.path.join(self.home, "store")
@@ -202,7 +203,9 @@ class Receipts(Base):
                  "schema": (lambda: alter("schema", 9), "malformed"), "wrong key": (lambda: alter("key", "0" * 64), "malformed"),
                  "missing log": (lambda: os.remove(find(".stdout")), "malformed"), "altered log": (lambda: wr(find(".stderr"), "x", "a"), "evidence"),
                  "no state": (lambda: ref("state", None), "malformed"), "reusable string": (lambda: result("reusable", "false"), "malformed"),
-                 "complete truthy": (lambda: result("complete", 1), "malformed"), "wrong run id": (lambda: ref("run", "nope"), "malformed")}
+                 "complete truthy": (lambda: result("complete", 1), "malformed"), "wrong run id": (lambda: ref("run", "nope"), "malformed"),
+                 "tested null": (lambda: alter("tested", None), "malformed"), "schema true": (lambda: alter("schema", True), "malformed"),
+                 "bad duration": (lambda: alter("run", {"id": "x", "duration_ms": "1"}), "malformed")}
         for name, (act, reason) in cases.items():
             with self.subTest(name):
                 self.pass_once(GATE_FORCE="1"); act(); rc, st = self.check("turbo", TURBO)
@@ -265,16 +268,50 @@ class Receipts(Base):
         self.assertEqual([fin(p) for p in ps], [0, 0])
         self.assertEqual([l.split()[0] for l in self.lines("")], ["run", "end", "run", "end"])  # same directory by identity, one at a time
     def test_filesystem_support_and_durable_publication(self):
-        spec = importlib.util.spec_from_file_location("gate_receipts", os.path.join(TOOLS, "gate_receipts.py")); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
-        info = ("1 0 8:1 / / rw - ext4 /dev/sda1 rw\n2 1 0:5 / /mnt/c rw - 9p drvfs rw\n3 1 0:6 / /mnt/my\\040disk rw - nfs4 srv:/x rw\n")
-        self.assertEqual([m.fstype(p, info) for p in ("/home/x", "/mnt/c/out", "/mnt/c", "/mnt/my disk/a", "/mnt/cc")], ["ext4", "9p", "9p", "nfs4", "ext4"])
-        self.assertIsNone(m.fstype("/x", "")); self.assertNotIn("9p", m.FS_OK)
+        m = self.mod()
+        info = "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n2 1 0:5 / /mnt/a\\011b rw - 9p drvfs rw\n"  # matched by device id: no path escapes to decode
+        self.assertEqual([m.dev_fstype(os.makedev(*d), info) for d in ((8, 1), (0, 5), (0, 9))], ["ext4", "9p", None])
+        shm = "/dev/shm/gate_receipts_test_%d" % os.getpid(); self.addCleanup(shutil.rmtree, shm, True)  # not the home filesystem
+        self.assertEqual(self.check("turbo", TURBO, GATE_RECEIPTS_DIR=shm)[1]["reason"], "nonreusable")
+        self.pass_once(GATE_RECEIPTS_DIR=shm); self.pass_once(GATE_RECEIPTS_DIR=shm); self.assertEqual(self.n(), 2)  # runs, never reused
+        self.assertIsNotNone(m.fs_reason(["/proc"], "x")); self.assertIsNone(m.fs_reason([self.t], "x"))
         synced, real = [], os.fsync
         m.os.fsync = lambda fd: (synced.append(stat.S_ISDIR(os.fstat(fd).st_mode)), real(fd))[1]
         self.addCleanup(setattr, m.os, "fsync", real)
         os.environ["GATE_RECEIPTS_DIR"] = self.store; self.addCleanup(os.environ.pop, "GATE_RECEIPTS_DIR")
         m.Store().write("keys/k.json", b"{}", True)
         self.assertEqual(synced, [False, True])  # the file, then its directory
+    def mod(self):
+        spec = importlib.util.spec_from_file_location("gate_receipts", os.path.join(TOOLS, "gate_receipts.py")); m = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(m); return m
+    def test_configured_compiler_wrapper_makes_parity_record_only(self):
+        wr(os.path.join(self.t, "emsdk", "wrapper"), "x")
+        for _ in range(2): self.pass_once("ocean-fast", OCEAN, FAST="1")
+        self.assertEqual((self.n(), self.check("ocean-fast", OCEAN, FAST="1")[1]["reason"]), (2, "nonreusable"))
+    def test_helper_replaced_while_waiting_is_refused(self):
+        wt = os.path.join(self.t, "wt"); self.git("worktree", "add", "-q", "--detach", wt); wr(os.path.join(self.home, "slow"), "1.5")
+        a = self.start("run", "turbo", TURBO); time.sleep(0.4); b = self.start("run", "turbo", TURBO, cwd=wt); time.sleep(0.6)
+        py = os.path.join(wt, "tools/gate_receipts.py"); wr(py, rd(py) + "# new implementation\n"); self.git("commit", "-qam", "helper", cwd=wt)
+        self.assertEqual(fin(a), 0); self.assertEqual(fin(b), 125); self.assertEqual(self.n(), 1)  # clean new tree, but never the old code
+    def test_output_failures_are_never_reusable_and_never_hang(self):
+        wr(os.path.join(self.home, "hook"), "head -c 3000000 /dev/zero\n")
+        p = self.start("run", "turbo", TURBO); p.stdout.close()  # the consumer goes away
+        self.assertEqual(fin(p), 125); self.assertEqual(self.check("turbo", TURBO)[1]["reason"], "failed")
+        class Dead:  # evidence cannot be written
+            def path(self, *a): return "/dev/full"
+        code, clean = self.mod().execute(["sh", "-c", "echo hi; head -c 3000000 /dev/zero"], dict(os.environ), Dead(), "x", [])
+        self.assertEqual((code, clean), (0, False))
+    def test_cancellation_and_leftover_processes(self):
+        wr(os.path.join(self.home, "slow"), "30"); t0 = time.time()
+        a = self.start("run", "turbo", TURBO)
+        while not self.lines(): time.sleep(0.05)
+        os.kill(int(rd(os.path.join(self.home, "ppid"))), signal.SIGINT)  # Ctrl-C reaches the gate, not just the coordinator
+        self.assertNotEqual(fin(a), 0); self.assertEqual((self.lines("end"), self.check("turbo", TURBO)[1]["reason"]), ([], "failed")); self.assertLess(time.time() - t0, 20)
+        os.remove(os.path.join(self.home, "slow")); wr(os.path.join(self.home, "hook"), "sleep 60 >/dev/null 2>&1 &\n")  # a leftover background process
+        t0 = time.time(); self.pass_once(); self.pass_once(GATE_FORCE="1"); self.assertLess(time.time() - t0, 30)  # reaped: the key lock is free again
+    def test_unreadable_record_is_a_storage_error(self):
+        self.pass_once(); k = os.path.join(self.store, "keys"); f = os.path.join(k, os.listdir(k)[0]); os.chmod(f, 0)
+        rc, st = self.check("turbo", TURBO); self.assertEqual((rc, st["reason"]), (2, "error"))
     def test_storage_failure_follows_the_protocol(self):
         wr(self.t + "/afile", "x"); bad = dict(GATE_RECEIPTS_DIR=self.t + "/afile/store")
         self.assertEqual(self.run_("turbo", TURBO, **bad), 125); self.assertEqual(self.n(), 0)

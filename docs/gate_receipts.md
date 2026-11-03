@@ -27,9 +27,11 @@ argv, the closed child environment and gate knobs, tool identity (resolved path,
 probes), for parity profiles also the Emscripten config, the binaries that config selects (`em-config`: clang,
 wasm-ld, llvm-ar/nm, wasm-opt, node, the emscripten Python sources and version), the shell helpers the scripts call
 (`sed`, `grep`, `sort`, `xargs`, `/usr/bin/time`, ...) and the installed-package inventory, the Classic pin bytes and
-artifact hashes, the repository's filesystem type, OS/arch, and the helper's own bytes. The Emscripten
-sysroot/cache is not hashed: an emsdk install is treated as trusted and immutable, as the spec allows. The tested commit is recorded separately: a rebase or merge with an identical tree is a hit and keeps the
-original tested SHA.
+artifact hashes, OS/arch, and the bytes of the helper that is executing. The Emscripten sysroot/cache is not
+hashed: a versioned emsdk install is treated as trusted and immutable (custom `EM_CACHE` locations or hand-modified
+sysroots are outside that assumption). A config that sets `COMPILER_WRAPPER`, `CLANG_ADD_VERSION` or
+`LLVM_ADD_VERSION` is record-only. The tested commit is recorded separately: a rebase or merge with an identical
+tree is a hit and keeps the original tested SHA.
 
 | Profile | Exact requirement |
 |---|---|
@@ -51,15 +53,22 @@ The child runs with a closed environment, and every retained value is keyed: `PA
 `TMPDIR`, `EMSDK*`, `EM_CONFIG`, `EM_CACHE`, the profile's knobs, fixed `LC_ALL=C.UTF-8`, `TZ=UTC`; `BASH_ENV`,
 `NODE_OPTIONS`, `CPATH`, `LD_PRELOAD`, `EMCC_CFLAGS` etc. are dropped. Missing em++ is exit `125`. A run is
 record-only (executes, never reused) when anything unverifiable remains: Emscripten config or SDK tools that
-`em-config` cannot resolve, no package inventory, a bad pin, or an unsupported filesystem (repository, store or
-output dir must be ext4, tmpfs, xfs, btrfs or overlay, so 9p/DrvFs/NFS never give reuse), or case-colliding tracked paths.
+`em-config` cannot resolve, no package inventory, a bad pin, case-colliding tracked paths, or a filesystem other
+than the plain local ext4 one holding your home: the repository (every tracked directory, so nested mounts count),
+the store and the output dir must share the home device, which must be ext4, with no casefold directory. 9p/DrvFs/NFS,
+tmpfs and `/mnt/*` therefore never give reuse. A pass whose log could not be written or mirrored, whose output
+pipes outlived it, or that was cancelled (SIGINT/SIGTERM/SIGHUP are forwarded to the gate) is a failure (`125` if
+the gate itself passed), never reusable. Processes a gate leaves in its own process group are killed when it
+exits; a daemon that escapes with `setsid` and keeps the inherited lock descriptors would hold the lock until it
+exits, so gates must not start such servers (none of the registered scripts do).
 
 Reuse is refused (the command still runs, receipt marked non-reusable) unless the checkout is exactly its HEAD
 tree: no staged/unstaged edits, untracked files, symlinks, or ignored files other than `build*/`, `dist/`,
 `.vercel/`, `runs/` and two ignored local docs. Everything is collected again after every lock wait (a
 waiting caller never accepts a hit for inputs that changed meanwhile) and after the run; an edit reverted before
 the gate finishes cannot be detected. The helper that runs is always the candidate's own `tools/gate_receipts.py`
-(resolved per call, not from where the shell file was sourced), and its bytes are part of the key.
+(resolved per call, not from where the shell file was sourced); its bytes are hashed once at process start, and an
+invocation whose helper file changes underneath it exits `125` instead of adopting the new bytes.
 
 ## Store
 
@@ -67,7 +76,8 @@ the gate finishes cannot be detected. The helper that runs is always the candida
 (`running` or `done` + run id), `runs/<id>.json|.stdout|.stderr`. The key file is replaced atomically and set to
 `running` before execution, so a failed or killed run supersedes an older pass; lookup never searches backward.
 Files and their directories are fsynced; logs and run receipt are durable before the terminal key reference.
-Only an intact terminal success (key, schema, `done` state, field types, evidence hashes) is a hit. The gate
+Only an intact terminal success (integer schema, `done` state, every field `gate_check` prints, evidence hashes)
+is a hit; unreadable records are storage errors, not misses. The gate
 inherits the lock descriptors, so killing only the coordinator does not free the key or output-dir lock until the
 gate's processes exit (output dirs are identified by device and inode). Storage errors exit `125` (`gate_check`:
 `2` with a `reason: error` status). No TTL, GC or age-based lock reclamation.

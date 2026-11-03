@@ -5,11 +5,10 @@ Usage (via tools/gate_receipts.sh): gate_receipts.py run|check GATE [-- ARGV...]
 A receipt is fresh only when every member of its key matches (docs/gate_receipts.md).
 It is a trusted local optimisation, never an attestation: CI runs every gate itself.
 """
-import ast, fcntl, hashlib, json, os, platform, re, shutil, signal, stat, subprocess, sys, tempfile, threading, time, uuid
+import ast, fcntl, hashlib, json, os, platform, pwd, re, shutil, signal, stat, struct, subprocess, sys, tempfile, threading, time, uuid
 
 SCHEMA, REPO_ID = 1, "github.com/HaritMT25/finfolk"
 KEPT = ("PATH", "HOME", "USER", "LOGNAME", "TMPDIR", "EMSDK", "EMSDK_NODE", "EMSDK_PYTHON", "EM_CONFIG", "EM_CACHE")  # all keyed
-FS_OK = ("ext4", "tmpfs", "xfs", "btrfs", "overlay")  # local filesystems with the flock/rename/case semantics receipts rely on
 HELPERS = ("awk", "sed", "grep", "sort", "xargs", "mktemp", "cat", "head", "tail", "timeout", "nproc", "uname", "rm", "mkdir", "cp", "mv",
            "wc", "tr", "cut", "date", "find", "nice", "env", "ln", "tee", "basename", "dirname", "readlink", "realpath", "stat", "touch",
            "/usr/bin/time")  # shell helpers the parity scripts call: executable bytes are keyed (absent is recorded as absent)
@@ -50,6 +49,7 @@ def canon(o): return json.dumps(o, sort_keys=True, separators=(",", ":"), ensure
 def sha(b): return hashlib.sha256(b).hexdigest()
 def sha_file(p):
     with open(p, "rb") as f: return sha(f.read())
+HELPER_SHA = sha_file(__file__)  # the bytes this interpreter is executing; keyed, and a changed file is refused (see snapshot)
 
 def git(root, *a):
     r = subprocess.run(["git", *a], cwd=root, capture_output=True)
@@ -67,10 +67,11 @@ def repo_state(root):
         if m: p.append("untracked " + m.decode(errors="replace"))
     for m in git(root, "ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--directory").split(b"\0"):
         if m and not IGNORED_OK.match(m.decode(errors="replace")): p.append("ignored shadow " + m.decode(errors="replace"))
-    seen = {}
+    seen, st["dirs"] = {}, set()
     for e in git(root, "ls-files", "-z", "--stage").split(b"\0"):
         if not e: continue
         meta, path = e.decode(errors="surrogateescape").split("\t", 1)
+        st["dirs"].add(os.path.join(root, os.path.dirname(path)))
         if seen.setdefault(path.lower(), path) != path: p.append("case-colliding paths %s / %s" % (seen[path.lower()], path))
         mode, oid, stage = meta.split()
         full = os.path.join(root, path)
@@ -97,19 +98,31 @@ def tool_identity(tool, env, helper=False):
     real = os.path.realpath(path)
     return dict(path=path, real=real, sha256=sha_file(real), probes=out)
 
-def fstype(path, mountinfo=None):
-    try: text = mountinfo if mountinfo is not None else open("/proc/self/mountinfo").read()
+def dev_fstype(dev, text=None):
+    """Filesystem type of a device id, from mountinfo's major:minor column (no mount-path decoding, nested mounts included)."""
+    try:
+        if text is None:
+            with open("/proc/self/mountinfo") as f: text = f.read()
     except OSError: return None
-    path, best = os.path.realpath(path), ("", None)
     for line in text.splitlines():
         left, _, right = line.partition(" - ")
-        mp = left.split()[4].replace("\\040", " ")
-        if (path == mp or path.startswith(mp.rstrip("/") + "/")) and len(mp) >= len(best[0]) and right.split(): best = (mp, right.split()[0])
-    return best[1]
+        f = left.split()
+        if len(f) > 2 and f[2] == "%d:%d" % (os.major(dev), os.minor(dev)) and right.split(): return right.split()[0]
 
-def fs_reason(path, label):
-    t = fstype(path)
-    return None if t in FS_OK else "unsupported filesystem for %s: %s" % (label, t)
+def casefold(path):  # FS_IOC_GETFLAGS on a directory; FS_CASEFOLD_FL = 0x40000000
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try: return bool(struct.unpack("i", fcntl.ioctl(fd, 0x80086601, b"\0" * 8)[:4])[0] & 0x40000000)
+    finally: os.close(fd)
+
+def fs_reason(paths, label):
+    """Reuse only on the plain local ext4 filesystem holding the user's home (no casefold, no nested mounts); else record-only."""
+    try:
+        home = os.stat(pwd.getpwuid(os.getuid()).pw_dir).st_dev
+        if dev_fstype(home) != "ext4": return "the home filesystem is not ext4"
+        for q in paths:
+            while not os.path.exists(q): q = os.path.dirname(q)
+            if os.stat(q).st_dev != home or casefold(q): return "%s is not on the plain local ext4 home filesystem: %s" % (label, q)
+    except (OSError, KeyError) as e: return "cannot verify the filesystem of %s: %s" % (label, e)
 
 def host_identity(root):
     osr = {}
@@ -118,13 +131,16 @@ def host_identity(root):
             k, _, v = line.strip().partition("=")
             if k in ("ID", "VERSION_ID"): osr[k] = v.strip('"')
     except OSError: pass
-    return dict(machine=platform.machine(), system=platform.system(), os=osr, repo_fs=fstype(root))
+    return dict(machine=platform.machine(), system=platform.system(), os=osr)
 
 def sdk_identity(env):
     """The tools Emscripten's own configuration selects (via em-config), not whatever is on PATH."""
     cfg = shutil.which("em-config", path=env["PATH"])
     if not cfg: raise Identity("em-config not found")
     v, files = {}, {}
+    for k in ("COMPILER_WRAPPER", "CLANG_ADD_VERSION", "LLVM_ADD_VERSION"):  # execution overrides we cannot identify: unsupported
+        r = subprocess.run([cfg, k], env=env, capture_output=True, timeout=60)
+        if r.returncode or r.stdout.decode().strip() not in ("None", "", "False"): raise Identity("em-config %s is set or unreadable" % k)
     for k in ("EMSCRIPTEN_ROOT", "LLVM_ROOT", "BINARYEN_ROOT", "NODE_JS"):
         r = subprocess.run([cfg, k], env=env, capture_output=True, timeout=60)
         txt = r.stdout.decode().strip()
@@ -183,8 +199,7 @@ def prepare(gate, argv, root, parent):
     if d and knobs[d]: knobs[d] = os.path.realpath(knobs[d])
     elif d: knobs[d] = "auto"
     env.update({k: v for k, v in knobs.items() if v is not None and not (k == d and v == "auto")})
-    if d and knobs[d] != "auto": reasons.append(fs_reason(knobs[d], "output dir"))
-    reasons += [fs_reason(root, "repository"), fs_reason(Store.default_root(), "receipt store")]
+    reasons += [fs_reason([knobs[d]], "output dir") if d and knobs[d] != "auto" else None, fs_reason([Store.default_root()], "receipt store")]
     if prof.get("emsdk"):
         cfg = env.get("EM_CONFIG") or (os.path.join(env["EMSDK"], ".emscripten") if env.get("EMSDK") else "")
         if not shutil.which("em++", path=env["PATH"]): raise Identity("em++ not on PATH: source emsdk_env.sh first")
@@ -202,7 +217,7 @@ def prepare(gate, argv, root, parent):
         except Identity as e: reasons.append(str(e))
     tools = {t: tool_identity(t, env) for t in prof["tools"]}
     return prof, env, dict(
-        schema=SCHEMA, receipt_definition_digest=sha(canon([prof, sha_file(__file__)])), repository_id=REPO_ID, gate_name=gate,
+        schema=SCHEMA, receipt_definition_digest=sha(canon([prof, HELPER_SHA])), repository_id=REPO_ID, gate_name=gate,
         argv=argv, coverage_profile=gate, effective_child_environment=dict(env, knobs=knobs),
         toolchain_identity=tools, external_input_hashes=ext, host_identity=host_identity(root)), [r for r in reasons if r]
 
@@ -234,45 +249,71 @@ class Store:
         finally: os.close(dfd)
 
     def lookup(self, key):
-        """(reason, receipt): reason is 'hit' only for an intact terminal success with this exact key."""
+        """(reason, receipt): 'hit' only for an intact terminal success with this exact key. Read errors other than
+        a missing file are storage failures and propagate."""
         try:
-            ref = json.load(open(self.path("keys", key + ".json")))
+            with open(self.path("keys", key + ".json")) as f: ref = json.load(f)
         except FileNotFoundError: return "missing", None
-        except (OSError, ValueError): return "malformed", None
-        if not isinstance(ref, dict) or ref.get("schema") != SCHEMA or ref.get("key") != key: return "malformed", None
+        except ValueError: return "malformed", None
+        if not isinstance(ref, dict) or type(ref.get("schema")) is not int or ref["schema"] != SCHEMA or ref.get("key") != key: return "malformed", None
         if ref.get("state") == "running": return "running", None
         if ref.get("state") != "done" or not isinstance(ref.get("run"), str): return "malformed", None
         try:
-            rc = json.load(open(self.path("runs", "%s.json" % ref["run"])))
-            if rc["schema"] != SCHEMA or rc["key"] != key or sha(canon(rc["inputs"])) != key or rc["run"]["id"] != ref["run"]: return "malformed", None
-            res = rc["result"]
-            if res["complete"] is not True or type(res["exit_code"]) is not int or type(res["reusable"]) is not bool: return "malformed", None
+            with open(self.path("runs", "%s.json" % ref["run"])) as f: rc = json.load(f)
+            t, r, e, res = rc["tested"], rc["run"], rc["evidence"], rc["result"]
+            if not (type(rc["schema"]) is int and rc["schema"] == SCHEMA and rc["key"] == key and sha(canon(rc["inputs"])) == key
+                    and all(isinstance(t[k], str) for k in ("commit", "tree")) and type(r["duration_ms"]) is int and r["id"] == ref["run"]
+                    and e["stdout"] == "runs/%s.stdout" % ref["run"] and e["stderr"] == "runs/%s.stderr" % ref["run"]
+                    and all(isinstance(e[k], str) for k in ("stdout_sha256", "stderr_sha256"))
+                    and res["complete"] is True and type(res["exit_code"]) is int and type(res["reusable"]) is bool): return "malformed", None
             if res["exit_code"] != 0: return "failed", rc
             if not res["reusable"]: return "nonreusable", rc
-            for s in ("stdout", "stderr"):
-                if sha_file(self.path(rc["evidence"][s])) != rc["evidence"][s + "_sha256"]: return "evidence", rc
-        except (OSError, ValueError, KeyError, TypeError): return "malformed", None
+            for x in ("stdout", "stderr"):
+                if sha_file(self.path(e[x])) != e[x + "_sha256"]: return "evidence", rc
+        except (FileNotFoundError, ValueError, KeyError, TypeError): return "malformed", None
         return "hit", rc
 
 
 def execute(argv, env, store, run_id, fds):
-    """Run argv (holding the lock descriptors `fds`); output streams to the terminal and the evidence files."""
-    out = {s: open(store.path("runs", "%s.%s" % (run_id, s)), "wb") for s in ("stdout", "stderr")}
+    """Run argv holding the lock descriptors `fds`; returns (exit code, clean). Not clean: a log/mirror failure, a surviving
+    process holding the output pipes, or a cancellation. Pump failures never stop the draining, so the gate cannot block."""
+    out = {x: open(store.path("runs", "%s.%s" % (run_id, x)), "wb") for x in ("stdout", "stderr")}
     try: p = subprocess.Popen(argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True, pass_fds=fds)
     except OSError as e:
         out["stderr"].write(("cannot execute %s: %s\n" % (argv[0], e)).encode())
         for f in out.values(): f.close()
-        return 127
-    old = signal.signal(signal.SIGTERM, lambda *_: os.killpg(p.pid, signal.SIGTERM))
+        return 127, True
+    bad = []
+    def forward(sig, _):
+        bad.append("cancelled by signal %d" % sig)
+        try: os.killpg(p.pid, sig)
+        except ProcessLookupError: pass
+    old = {sig: signal.signal(sig, forward) for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
     def pump(src, log, sink):
-        for chunk in iter(lambda: src.read1(65536), b""):
-            log.write(chunk); sink.write(chunk); sink.flush()
-    ts = [threading.Thread(target=pump, args=(p.stdout, out["stdout"], sys.stdout.buffer)),
-          threading.Thread(target=pump, args=(p.stderr, out["stderr"], sys.stderr.buffer))]
-    [t.start() for t in ts]; rc = p.wait(); [t.join() for t in ts]
-    signal.signal(signal.SIGTERM, old)
-    for f in out.values(): f.flush(); os.fsync(f.fileno()); f.close()
-    return 128 - rc if rc < 0 else rc
+        live = True
+        try:
+            for chunk in iter(lambda: src.read1(65536), b""):
+                if live:
+                    try: log.write(chunk); sink.write(chunk); sink.flush()
+                    except (OSError, ValueError) as e: bad.append("output handling failed: %r" % e); live = False
+        except (OSError, ValueError) as e: bad.append("pipe read failed: %r" % e)
+    ts = [threading.Thread(target=pump, args=(p.stdout, out["stdout"], sys.stdout.buffer), daemon=True),
+          threading.Thread(target=pump, args=(p.stderr, out["stderr"], sys.stderr.buffer), daemon=True)]
+    [t.start() for t in ts]; rc = p.wait()
+    try: os.killpg(p.pid, signal.SIGKILL)  # reap whatever the gate left behind in its process group
+    except ProcessLookupError: pass
+    for t in ts:
+        t.join(30)
+        if t.is_alive(): bad.append("a detached process still holds the output pipes")
+    for sig, h in old.items(): signal.signal(sig, h)
+    for pipe in (p.stdout, p.stderr): pipe.close()
+    for f in out.values():
+        try: f.flush(); os.fsync(f.fileno())
+        except (OSError, ValueError) as e: bad.append("evidence flush failed: %r" % e)
+        try: f.close()
+        except (OSError, ValueError): pass
+    for m in bad: print("gate_receipts: " + m, file=sys.stderr)
+    return (128 - rc if rc < 0 else rc), not bad
 
 
 def smoke_ok(stdout, base):
@@ -294,8 +335,11 @@ def status(gate, key, rc, reason, cand):
 
 def snapshot(gate, rest, root):
     """Everything that decides freshness, collected at one moment (and again after every lock wait)."""
+    if sha_file(__file__) != HELPER_SHA: raise Identity("tools/gate_receipts.py changed while this invocation was running: rerun")
     prof, env, material, reasons = prepare(gate, rest, root, os.environ)
     cand = repo_state(root)
+    reasons.append(fs_reason([root, *cand["dirs"]], "repository"))
+    reasons[:] = [r for r in reasons if r]
     if cand["problems"]: reasons.append("dirty: " + "; ".join(cand["problems"][:3]))
     key = None
     if not reasons:
@@ -356,10 +400,11 @@ def main(argv):
     keyref = lambda state: canon(dict(schema=SCHEMA, key=key, state=state, run=run_id))
     if key: st.write("keys/%s.json" % key, keyref("running"), True)  # durably supersedes any earlier success
     started, t0 = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), time.monotonic()
-    code = execute(rest, env, st, run_id, fds)
+    code, clean = execute(rest, env, st, run_id, fds)
+    if not clean and code == 0: code = 125  # the gate passed but its evidence or lifecycle was not clean
     dur = int((time.monotonic() - t0) * 1000)
     if prof.get("json_ok") and code == 0 and not smoke_ok(open(st.path("runs", run_id + ".stdout"), "rb").read(), rest[-1]): code = 1
-    reusable = bool(key) and snapshot(gate, rest, root)["key"] == key  # the candidate must not have changed while the gate ran
+    reusable = bool(key) and clean and snapshot(gate, rest, root)["key"] == key  # the candidate must not have changed while the gate ran
     inputs = material if key else dict(gate_name=gate, argv=rest, observed={k: os.environ.get(k) for k in prof.get("observe", ())}, reasons=reasons)
     rec = dict(schema=SCHEMA, gate=gate, key=key, tested=dict(commit=cand["commit"], tree=cand["tree"], dirty=bool(cand["problems"]), worktree=root),
                inputs=inputs, run=dict(id=run_id, started_utc=started, finished_utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), duration_ms=dur),
