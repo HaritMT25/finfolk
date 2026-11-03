@@ -31,6 +31,13 @@
  *                                     carries on
  *   out: {type:'snapshot', id, mem: ArrayBuffer, frame, pop, food, pred,
  *        totalSteps}, or {type:'snapshot', id, none: true} with no world here
+ *   in : {cmd:'probe', id, js, wasm, handoff, data: Uint8Array, bytes, expect}
+ *        -> a saved world tried in this worker's module before the page
+ *           opens it (a worker made only for that: web/ocean.js probeWorld)
+ *   out: {type:'probe', id, ok, at, why, trap, data} (data: the image, back)
+ * The page hands every worker the module's wasm as the Blob URL of the
+ * bytes it pinned at start-up (web/ocean.js pinEngine): the same build the
+ * page runs and names in its world files, whatever the server has now.
  *   out: {type:'stats', frame, pop, food, pred, stepsPerSec, totalSteps, st, su}
  *        ~4x/s; st: oc_stats, su: oc_summary of the world now (the page's
  *        readout and stat panel show them while Turbo owns the world)
@@ -138,6 +145,28 @@ onmessage = function (e) {
       postMessage({ type: "snapshot", id: msg.id, mem: copy, frame: f, pop: M._oc_creature_count(), food: M._oc_food_count(),
                     pred: M._oc_predator_count(), totalSteps: totalSteps }, [copy]);
     } catch (err) { fail(err, "on Save world"); }
+  } else if (msg.cmd === "probe") {
+    /* A saved world tried before the page opens it, in this worker's own
+     * module (a worker made for it: it never runs Turbo, and the page
+     * terminates it after the answer, or when it takes too long): the image
+     * in, checked against its header, the page's calls, one step, checked
+     * again (web/ocean_handoff.js probeWorld). The image goes back with the
+     * answer (transferred both ways: no copy). A trap is an answer too. */
+    var answer = function (r) {
+      r.type = "probe"; r.id = msg.id; r.data = msg.data;
+      postMessage(r, msg.data && msg.data.buffer ? [msg.data.buffer] : []);
+    };
+    var q;
+    try { q = ensureModule(msg); } catch (err) { answer({ ok: false, why: "the engine did not load (" + err + ")" }); return; }
+    q.then(function () {
+      var r;
+      try { r = H.probeWorld(M, msg.data, msg.bytes, msg.expect); }
+      catch (err) {
+        r = { ok: false, trap: err instanceof WebAssembly.RuntimeError,
+              why: (err instanceof WebAssembly.RuntimeError ? "the engine stopped on it (" : "") + String(err && err.message || err) + (err instanceof WebAssembly.RuntimeError ? ")" : "") };
+      }
+      answer(r);
+    }, function (err) { answer({ ok: false, why: "the engine did not load (" + err + ")" }); });
   }
 };
 

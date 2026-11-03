@@ -16,9 +16,10 @@
  * shows: the page's own world's, or during Turbo the worker's (the page asks
  * the worker; null until it answers, and the panel keeps what it has).
  *
- * Page hooks: attach(host), push(row), ingest(rows), reset(), every(),
- * open() / close() / isOpen(). Charts redraw at most twice a second, only
- * while open. */
+ * Page hooks: attach(host), push(row), ingest(rows), reset(), origin(text)
+ * (a history that starts mid-run: a saved world opened), every(), open() /
+ * close() / isOpen(). Charts redraw at most twice a second, only while
+ * open. */
 (function () {
   var C = window.EvoCharts;
   if (!C) return;
@@ -46,9 +47,14 @@
   }
   function ingest(list) { (list || []).forEach(push); }
   function reset() {
-    rows = []; every = 60; version++; wireCache = null; lastKey = "";
+    rows = []; every = 60; version++; wireCache = null; lastKey = ""; origin = "";
     if (host && host.setRecEvery) host.setRecEvery(every);
   }
+  /* where this history starts, when not at a world's start: a saved world
+   * opened (its file carries no charts, so its history starts at the frame
+   * it opened at), until the next reset */
+  var origin = "";
+  function setOrigin(text) { origin = String(text || ""); version++; lastKey = ""; }
   /* the run went back to an earlier frame (a Turbo run that was lost): the
    * samples after it, and the wiring the worker had, are of a future that
    * did not happen */
@@ -339,7 +345,14 @@
       c.note.textContent = cd.note ? cd.note(data) : "";
     });
     var span = rows.length ? (frameOf(rows[rows.length - 1]) - frameOf(rows[0])) * DT : 0;
-    noteEl.textContent = rows.length
+    noteEl.textContent = noteText(span);
+  }
+  function noteText(span) {
+    if (origin) return rows.length
+      ? "A fresh history, recorded on this device since " + origin + " (a saved world carries no charts): " + C.fmtTime(span) +
+        " of simulated time, " + rows.length + " samples (one every " + +(every * DT).toFixed(2) + " s). Nothing is uploaded; Restart clears it."
+      : "A fresh history: a saved world carries no charts, so recording starts at " + origin + ". Nothing is uploaded; Restart clears it.";
+    return rows.length
       ? "Recorded on this device since the last restart: " + C.fmtTime(span) + " of simulated time, " + rows.length +
         " samples (one every " + +(every * DT).toFixed(2) + " s). Nothing is uploaded; Restart clears it."
       : "Recording starts with the world. Nothing is uploaded; Restart clears it.";
@@ -403,7 +416,9 @@
 
   window.EvoOceanDash = {
     attach: function (h) { host = h; if (h.setRecEvery) h.setRecEvery(every); },
-    push: push, ingest: ingest, reset: reset, rewind: rewind,
+    push: push, ingest: ingest, reset: reset, rewind: rewind, origin: setOrigin,
+    /* the charts' note as it reads now (the tests; the page shows it when open) */
+    note: function () { var span = rows.length ? (frameOf(rows[rows.length - 1]) - frameOf(rows[0])) * DT : 0; return noteText(span); },
     every: function () { return every; }, famK: FAM_K,
     open: open, close: close, isOpen: function () { return isOpen; },
     showTab: function (id) { if (isOpen) showTab(id); else { tab = id; open(); } },

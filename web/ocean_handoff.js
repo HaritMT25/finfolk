@@ -58,19 +58,24 @@
     return buffer(M).byteLength >= bytes;
   }
 
-  /* Put a whole memory image (an ArrayBuffer, page-sized) into M. Throws, with
-   * M's memory as it was (grown, perhaps, never overwritten), when it can't
-   * grow far enough; the caller still holds the image. */
-  function take(M, src, who) {
-    var need = src.byteLength, have = buffer(M).byteLength;
-    if (!need || need % PAGE) throw new Error("not a memory image: " + need + " bytes");
+  /* Put a whole memory image (an ArrayBuffer or a view, page-sized) into M.
+   * full: the image's length when src is only its first bytes (a world file
+   * stores the image without its zero tail): the rest of it is zeros. Throws,
+   * with M's memory as it was (grown, perhaps, never overwritten), when it
+   * can't grow far enough; the caller still holds the image. */
+  function take(M, src, who, full) {
+    var s = u8of(src), need = full === undefined ? s.length : full, have = buffer(M).byteLength;
+    if (!Number.isSafeInteger(need) || !need || need % PAGE || s.length > need)
+      throw new Error("not a memory image: " + s.length + (full === undefined ? "" : " of " + need) + " bytes");
     if (!growTo(M, need))
       throw new Error("could not grow " + (who || "the") + " memory to " + need + " bytes (it has " + buffer(M).byteLength + ")");
     var dst = new Uint8Array(buffer(M));
-    dst.set(new Uint8Array(src));
-    /* past the image: zero, as fresh pages are (pages this grew already are) */
-    if (have > need) dst.fill(0, need, have);
+    dst.set(s);
+    /* past the image's bytes: zero, as fresh pages are (pages this grew already are) */
+    if (have > s.length) dst.fill(0, s.length, have);
   }
+  /* bytes of an ArrayBuffer or a view, never copied (isView: a view from another realm too) */
+  function u8of(x) { return ArrayBuffer.isView(x) ? new Uint8Array(x.buffer, x.byteOffset, x.byteLength) : new Uint8Array(x); }
 
   /* a C string at ptr, read from the live buffer */
   function cString(M, ptr) {
@@ -269,24 +274,102 @@
    *    4 bytes   n, the header's length in bytes (little-endian)
    *    n bytes   the header: UTF-8 JSON, {format: "evo_ocean_world",
    *              version: 1, ..., image: {bytes, stored, sha256, body,
-   *              bodyBytes}} (the page writes the rest: web/ocean.js
-   *              worldHeader)
+   *              bodyBytes}, sha256} (the page writes the rest: web/ocean.js
+   *              worldHeader; headerProblem says what it must be)
    *    the rest  the body: the image's first `stored` bytes, gzip-compressed
    *              (CompressionStream; body "gzip") or as they are ("raw", a
    *              browser without it). The image is `bytes` long (whole wasm
    *              pages); past `stored` it is zeros (memory never written:
-   *              trimmed, not saved). sha256: of those `stored` bytes.
-   * decodeWorld checks every part of that before anything is put into a
-   * module: the magic, the version, the lengths (a file cut short, or with
-   * bytes after its end, is refused), the gzip stream (a damaged one throws)
-   * and the checksum. Which engine build may take the image is the page's
-   * question (header.engine): an image belongs to one build of the module. */
-  var WORLD = { MAGIC: "evo_ocean_world\n", FORMAT: "evo_ocean_world", VERSION: 1, EXT: ".oceanworld", MAX_HEADER: 1 << 22 };
+   *              trimmed, not saved).
+   * Two checksums, SHA-256 both: image.sha256 of the `stored` bytes, and the
+   * header's own sha256 of WORLD.DIGEST followed by the header itself in
+   * its canonical form (canon: JSON, object keys sorted, no spaces; its own
+   * sha256 left out), image record (and so the image's checksum) included.
+   * So no field of the header (a setting, the frame, the image's lengths)
+   * can change without the file being refused as damaged. They detect
+   * corruption; they don't say who wrote the file.
+   * readWorld checks the parts in the order they are read, each before
+   * anything bigger is read or allocated: the file's size, the magic, the
+   * header's length, the header (JSON, its shape, the image record and the
+   * limits below), the file's exact length, the header's checksum; then
+   * (body(), when the caller wants the world) the body, unpacked into
+   * exactly `stored` bytes (more is refused at once and the stream
+   * cancelled), and the image's checksum. Which engine build may take the
+   * image is the page's question (header.engine): an image belongs to one
+   * build of the module.
+   *
+   * The limits (worldLimits), every one checked before the bytes it
+   * bounds are read or allocated, every length a safe integer:
+   *   the image (image.bytes) at most the engine's own maximum memory (its
+   *     wasm memory section, wasmMemoryMax: 2 GiB in this build) and at
+   *     most MAX_IMAGE, 512 MiB, what a page opens: the largest world the
+   *     page can start (100,000 fish, the population limit) uses 185 MiB,
+   *     the Big tank 16 to 32 MiB; opening one holds the stored bytes, the
+   *     receiving module's memory and the run's own copy (startWorld's
+   *     undo) at once, about 1.5 GB at the cap, which a desktop browser
+   *     allows;
+   *   the stored bytes at most the image; a raw body exactly them, a gzip
+   *     body at most maxBody (zlib's deflate bound is 0.03 % over; this
+   *     allows 0.1 % and 4 kB) and at least 1/RATIO of them (deflate can't
+   *     unpack more than 1032 bytes from one: a small file can't ask for a
+   *     big image);
+   *   the header at most MAX_HEADER, 1 MiB (a header is 2 to 15 kB: the
+   *     settings three times), 8 levels deep and 20,000 values;
+   *   the file at most its prefix, the biggest header and the biggest
+   *     body: checked from its size, before a byte of it is read.
+   * A setup file (JSON) is at most MAX_SETUP, 1 MiB (Save setup's are 1 to
+   * 3 kB). */
+  var MiB = 1048576;
+  var WORLD = { MAGIC: "evo_ocean_world\n", FORMAT: "evo_ocean_world", VERSION: 1, EXT: ".oceanworld", PREFIX: 20,
+                MAX_HEADER: MiB, MAX_IMAGE: 512 * MiB, MAX_SETUP: MiB, MAX_DEPTH: 8, MAX_VALUES: 20000, RATIO: 1032,
+                DIGEST: "evo_ocean_world 1\n" };
   function ascii(s) { var b = new Uint8Array(s.length); for (var i = 0; i < s.length; i++) b[i] = s.charCodeAt(i) & 255; return b; }
   function utf8(s) { return enc ? enc.encode(s) : ascii(s); }
   function fromUtf8(u8) { if (dec) return dec.decode(u8); var s = ""; for (var i = 0; i < u8.length; i++) s += String.fromCharCode(u8[i]); return s; }
-  /* bytes of an ArrayBuffer or a view, never copied (isView: a view from another realm too) */
-  function u8of(x) { return ArrayBuffer.isView(x) ? new Uint8Array(x.buffer, x.byteOffset, x.byteLength) : new Uint8Array(x); }
+  function noop() { /* a rejection reported elsewhere */ }
+  function mb(n) { return (n / MiB).toFixed(n < 10 * MiB ? 2 : 0) + " MB"; }
+  /* the biggest gzip body of `stored` bytes this reads (raw: exactly them) */
+  function maxBody(stored, kind) { return kind === "raw" ? stored : stored + Math.ceil(stored / 1000) + 4096; }
+  /* the limits a page opens world files under; engineBytes: its module's own maximum memory (wasmMemoryMax) */
+  function worldLimits(engineBytes) {
+    var engine = Number.isSafeInteger(engineBytes) && engineBytes > 0 ? engineBytes : 65536 * PAGE;
+    return { engine: engine, image: Math.min(engine, WORLD.MAX_IMAGE), header: WORLD.MAX_HEADER,
+             file: WORLD.PREFIX + WORLD.MAX_HEADER + maxBody(WORLD.MAX_IMAGE, "gzip") };
+  }
+  /* A wasm module's maximum memory in bytes, from its bytes (its memory
+   * section, or an imported memory): 4 GiB when it declares none, null for
+   * bytes that aren't a wasm32 module with one memory this can read. */
+  function wasmMemoryMax(bytes) {
+    var u8 = u8of(bytes), at = { i: 8 };
+    function leb() {
+      var r = 0, mul = 1, b;
+      do { if (at.i >= u8.length || mul > 0x10000000) throw new Error("bad LEB128"); b = u8[at.i++]; r += (b & 127) * mul; mul *= 128; } while (b & 128);
+      return r;
+    }
+    /* limits: flags, the minimum, the maximum when flag 1 says there is one (flag 4: a 64-bit memory, not read) */
+    function limits() { var f = leb(); leb(); var max = f & 1 ? leb() : 65536; return (f & 4) ? null : max * PAGE; }
+    try {
+      if (u8.length < 8 || u8[0] !== 0 || u8[1] !== 0x61 || u8[2] !== 0x73 || u8[3] !== 0x6d) return null;
+      while (at.i < u8.length) {
+        var id = u8[at.i++], size = leb(), end = at.i + size;
+        if (id === 5) { if (leb() < 1) return null; return limits(); }
+        if (id === 2) {
+          for (var k = leb(), j = 0; j < k; j++) {
+            var len = leb(); at.i += len; len = leb(); at.i += len;   /* the module and field names (a length, then its bytes) */
+            var kind = u8[at.i++];
+            if (kind === 0) leb();
+            else if (kind === 1) { at.i++; limits(); }
+            else if (kind === 2) return limits();
+            else if (kind === 3) at.i += 2;
+            else if (kind === 4) { at.i++; leb(); }
+            else return null;
+          }
+        }
+        at.i = end;
+      }
+    } catch (e) { return null; }
+    return null;
+  }
   /* a file's first bytes are a world file's magic */
   function isWorldFile(head) {
     var h = u8of(head), m = WORLD.MAGIC;
@@ -355,24 +438,66 @@
     while (i >= 0 && w[i] === 0) i--;
     return 4 * (i + 1);
   }
-  /* a stream's chunks (CompressionStream / DecompressionStream), into fn(chunk) */
+  /* a stream's chunks (CompressionStream / DecompressionStream), into fn(chunk);
+   * fn throwing (more than was asked for) cancels the stream: nothing more is
+   * unpacked */
   function through(stream, u8, fn) {
     var w = stream.writable.getWriter(), r = stream.readable.getReader();
-    w.write(u8).catch(function () { /* the reader reports it */ });
-    w.close().catch(function () { /* the reader reports it */ });
+    w.write(u8).catch(noop);   /* (the reader reports it) */
+    w.close().catch(noop);
     return (function pump() {
-      return r.read().then(function (x) { if (x.done) return; fn(x.value); return pump(); });
+      return r.read().then(function (x) {
+        if (x.done) return;
+        try { fn(x.value); } catch (e) { r.cancel(e).catch(noop); throw e; }
+        return pump();
+      });
     })();
   }
   function canGzip() { return typeof root.CompressionStream === "function" && typeof root.DecompressionStream === "function"; }
+
+  /* JSON in its one canonical form (the header's checksum is of this): object
+   * keys sorted (UTF-16 code units), no spaces, numbers and strings as
+   * JSON.stringify writes them; a value JSON has no form for throws */
+  function canon(v) {
+    if (v === null) return "null";
+    if (typeof v === "boolean") return v ? "true" : "false";
+    if (typeof v === "number") { if (!isFinite(v)) throw new Error("a number JSON can't hold"); return JSON.stringify(v); }
+    if (typeof v === "string") return JSON.stringify(v);
+    if (Array.isArray(v)) return "[" + v.map(canon).join(",") + "]";
+    if (typeof v === "object") return "{" + Object.keys(v).sort().map(function (k) { return JSON.stringify(k) + ":" + canon(v[k]); }).join(",") + "}";
+    throw new Error("a value JSON can't hold");
+  }
+  /* the header's own checksum: of WORLD.DIGEST and its canonical form, its sha256 left out */
+  function headerDigest(h) {
+    var c = {};
+    Object.keys(h).forEach(function (k) { if (k !== "sha256") c[k] = h[k]; });
+    return sha256(utf8(WORLD.DIGEST + canon(c)));
+  }
+  /* h with its checksum (the tests and a file made by hand: the page writes it in encodeWorld) */
+  function sealHeader(h) {
+    var c = JSON.parse(JSON.stringify(h));
+    delete c.sha256;
+    return headerDigest(c).then(function (d) { c.sha256 = d; return c; });
+  }
+  /* a parsed header no deeper and no bigger than a world's (canon and the checks recurse into it) */
+  function shapeOk(h) {
+    var stack = [[h, 1]], values = 0;
+    while (stack.length) {
+      var e = stack.pop(), v = e[0];
+      if (++values > WORLD.MAX_VALUES || e[1] > WORLD.MAX_DEPTH) return false;
+      if (v && typeof v === "object") (Array.isArray(v) ? v : Object.keys(v).map(function (k) { return v[k]; })).forEach(function (x) { stack.push([x, e[1] + 1]); });
+    }
+    return true;
+  }
+
   /* A world file of `header` (a JSON object: the page's) and `image` (an
-   * ArrayBuffer: a whole memory image). opts.raw: no compression (as a
-   * browser without CompressionStream writes it). Answers {parts (for a
-   * Blob), header (with its image record), size}. */
+   * ArrayBuffer or a view: a whole memory image). opts.raw: no compression
+   * (as a browser without CompressionStream writes it). Answers {parts (for
+   * a Blob), header (with its image record and checksum), size}. */
   function encodeWorld(header, image, opts) {
-    var u8 = new Uint8Array(image);
+    var u8 = u8of(image);
     if (!u8.length || u8.length % PAGE) return Promise.reject(new Error("not a memory image: " + u8.length + " bytes"));
-    var stored = storedLength(image), body = u8.subarray(0, stored), gzip = !(opts && opts.raw) && typeof root.CompressionStream === "function";
+    var stored = storedLength(u8), body = u8.subarray(0, stored), gzip = !(opts && opts.raw) && typeof root.CompressionStream === "function";
     return sha256(body).then(function (sum) {
       if (!gzip) return [sum, [body]];
       var chunks = [];
@@ -381,11 +506,16 @@
       var bodyBytes = 0;
       r[1].forEach(function (c) { bodyBytes += c.length; });
       var h = JSON.parse(JSON.stringify(header));
+      delete h.sha256;
       h.image = { bytes: u8.length, stored: stored, sha256: r[0], body: gzip ? "gzip" : "raw", bodyBytes: bodyBytes };
-      var hb = utf8(JSON.stringify(h)), len = new Uint8Array(4);
-      new DataView(len.buffer).setUint32(0, hb.length, true);
-      var parts = [ascii(WORLD.MAGIC), len, hb].concat(r[1]);
-      return { parts: parts, header: h, size: WORLD.MAGIC.length + 4 + hb.length + bodyBytes };
+      return headerDigest(h).then(function (d) {
+        h.sha256 = d;
+        var hb = utf8(JSON.stringify(h)), len = new Uint8Array(4);
+        if (hb.length > WORLD.MAX_HEADER) throw new Error("its header would be " + hb.length + " bytes, more than a world file's " + WORLD.MAX_HEADER);
+        new DataView(len.buffer).setUint32(0, hb.length, true);
+        var parts = [ascii(WORLD.MAGIC), len, hb].concat(r[1]);
+        return { parts: parts, header: h, size: WORLD.PREFIX + hb.length + bodyBytes };
+      });
     });
   }
   /* why a file is not a world file this page reads, or "" (its first bytes) */
@@ -394,64 +524,263 @@
     if (s.charAt(0) === "{" && /"format"\s*:\s*"evo_ocean_setup"/.test(s)) return "That file is a setup (Save setup makes those), not a saved world.";
     return "That file is not a saved world (Save world makes those).";
   }
-  /* A world file's header, checked: {header, at (where its body starts)}.
-   * Throws an Error whose message says why it is not one this page reads.
-   * Only the header: decodeWorld checks the body. */
-  function worldHeader(file) {
-    var u8 = u8of(file), m = WORLD.MAGIC.length;
-    if (!isWorldFile(u8)) throw new Error(notAWorld(u8));
-    if (u8.length < m + 4) throw new Error("That world file is cut short: it ends inside its header.");
-    var n = new DataView(u8.buffer, u8.byteOffset + m, 4).getUint32(0, true);
-    if (n < 2 || n > WORLD.MAX_HEADER) throw new Error("That world file is damaged: its header length (" + n + " bytes) is not a header's.");
-    if (u8.length < m + 4 + n) throw new Error("That world file is cut short: it ends inside its header (" + u8.length + " of at least " + (m + 4 + n) + " bytes).");
+  /* the image record: "" or why not (its limits L: worldLimits) */
+  function imageProblem(im, L) {
+    var whole = function (v) { return Number.isSafeInteger(v) && v >= 0; };
+    var bad = "That world file is damaged: its header does not describe a memory image.";
+    if (!im || typeof im !== "object" || Array.isArray(im) || !whole(im.bytes) || !im.bytes || im.bytes % PAGE) return bad;
+    if (im.bytes > L.engine) return "That saved world needs " + mb(im.bytes) + " of memory, more than this engine build can have (" + mb(L.engine) + ").";
+    if (im.bytes > L.image) return "That saved world needs " + mb(im.bytes) + " of memory, more than this page opens (" + mb(L.image) + " at most).";
+    if (!whole(im.stored) || im.stored > im.bytes || im.stored % 4 || (im.body !== "gzip" && im.body !== "raw") || !whole(im.bodyBytes) ||
+        typeof im.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(im.sha256) || Object.keys(im).length !== 5) return bad;
+    if (im.body === "raw" ? im.bodyBytes !== im.stored : im.bodyBytes > maxBody(im.stored, "gzip") || im.stored > WORLD.RATIO * im.bodyBytes + 4096)
+      return "That world file is damaged: its body (" + im.bodyBytes + " bytes, " + im.body + ") can't hold the " + im.stored + " bytes its header says.";
+    return "";
+  }
+  /* the header's bytes, parsed and checked as a world file's (not its checksum: readWorld) */
+  function parseHeader(hb, L) {
     var h;
-    try { h = JSON.parse(fromUtf8(u8.subarray(m + 4, m + 4 + n))); } catch (e) { throw new Error("That world file is damaged: its header is not JSON (" + e.message + ")."); }
-    if (!h || typeof h !== "object" || h.format !== WORLD.FORMAT) throw new Error("That file is not a saved world (Save world makes those).");
+    try { h = JSON.parse(fromUtf8(hb)); } catch (e) { throw new Error("That world file is damaged: its header is not JSON (" + e.message + ")."); }
+    if (!h || typeof h !== "object" || Array.isArray(h) || h.format !== WORLD.FORMAT) throw new Error("That file is not a saved world (Save world makes those).");
     if (h.version !== WORLD.VERSION)
       throw new Error("That world file is version " + JSON.stringify(h.version) + "; this page reads version " + WORLD.VERSION + ".");
-    var im = h.image, whole = function (v) { return typeof v === "number" && Number.isInteger(v) && v >= 0; };
-    if (!im || typeof im !== "object" || !whole(im.bytes) || !im.bytes || im.bytes % PAGE || !whole(im.stored) || im.stored > im.bytes ||
-        im.stored % 4 || !whole(im.bodyBytes) || (im.body !== "gzip" && im.body !== "raw") || typeof im.sha256 !== "string" ||
-        !/^[0-9a-f]{64}$/.test(im.sha256) || (im.body === "raw" && im.bodyBytes !== im.stored))
-      throw new Error("That world file is damaged: its header does not describe a memory image.");
-    return { header: h, at: m + 4 + n };
+    if (!shapeOk(h)) throw new Error("That world file is damaged: its header is nested deeper or holds more than a world's.");
+    if (typeof h.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(h.sha256)) throw new Error("That world file is damaged: its header has no checksum.");
+    var why = imageProblem(h.image, L);
+    if (why) throw new Error(why);
+    return h;
   }
-  /* A world file, checked whole: {header, image (an ArrayBuffer, the whole
-   * memory image)}, or a rejected Promise whose Error says why not. */
-  function decodeWorld(file) {
-    var u8 = u8of(file), r;
-    try { r = worldHeader(u8); } catch (e) { return Promise.reject(e); }
-    var im = r.header.image, have = u8.length - r.at;
-    if (have < im.bodyBytes)
-      return Promise.reject(new Error("That world file is cut short: it has " + u8.length + " of its " + (r.at + im.bodyBytes) + " bytes (it was not saved or copied whole)."));
-    if (have > im.bodyBytes)
-      return Promise.reject(new Error("That world file is damaged: it has " + (have - im.bodyBytes) + " bytes after its end."));
-    var body = u8.subarray(r.at), image = new ArrayBuffer(im.bytes), dst = new Uint8Array(image), at = 0, over = false;
-    var filled;
-    if (im.body === "raw") { dst.set(body); filled = Promise.resolve(); at = body.length; }
+  /* sources readWorld reads from: a Blob (a File: only the parts asked for are read) or bytes */
+  function blobSource(b) {
+    return { size: b.size, read: function (a, z) { return b.slice(a, z).arrayBuffer().then(function (x) { return new Uint8Array(x); }); } };
+  }
+  function bytesSource(x) { var u8 = u8of(x); return { size: u8.length, read: function (a, z) { return Promise.resolve(u8.subarray(a, z)); } }; }
+  /* A world file, read part by part (src: blobSource / bytesSource; L:
+   * worldLimits): {header, at (where the body starts), body()}, the header
+   * checked whole (its checksum too) before the body is read; body()
+   * reads, unpacks and checks it: {data (the image's stored bytes), bytes
+   * (its full length)}. A rejection's Error says why the file isn't one. */
+  function readWorld(src, L) {
+    L = L || worldLimits();
+    var size = src.size, m = WORLD.MAGIC.length;
+    if (!Number.isSafeInteger(size) || size < 0) return Promise.reject(new Error("That file can't be read (its size is unknown)."));
+    if (size > L.file) return Promise.reject(new Error("That file is " + mb(size) + ", more than any saved world this page opens (" + mb(L.file) + ")."));
+    var first = Math.min(size, 4096), n = 0;
+    return src.read(0, first).then(function (head) {
+      if (!isWorldFile(head)) throw new Error(notAWorld(head));
+      if (size < WORLD.PREFIX) throw new Error("That world file is cut short: it ends inside its header.");
+      n = new DataView(head.buffer, head.byteOffset + m, 4).getUint32(0, true);
+      if (n < 2 || n > L.header) throw new Error("That world file is damaged: its header length (" + n + " bytes) is not a header's.");
+      if (size < WORLD.PREFIX + n) throw new Error("That world file is cut short: it ends inside its header (" + size + " of at least " + (WORLD.PREFIX + n) + " bytes).");
+      return WORLD.PREFIX + n <= head.length ? head.subarray(WORLD.PREFIX, WORLD.PREFIX + n) : src.read(WORLD.PREFIX, WORLD.PREFIX + n);
+    }).then(function (hb) {
+      var h = parseHeader(hb, L), at = WORLD.PREFIX + n, want = at + h.image.bodyBytes;
+      if (size < want) throw new Error("That world file is cut short: it has " + size + " of its " + want + " bytes (it was not saved or copied whole).");
+      if (size > want) throw new Error("That world file is damaged: it has " + (size - want) + " bytes after its end.");
+      return headerDigest(h).then(function (d) {
+        if (d !== h.sha256) throw new Error("That world file is damaged: its header does not match its checksum.");
+        return { header: h, at: at, body: function () { return src.read(at, size).then(function (b) { return unpack(h, b); }); } };
+      });
+    });
+  }
+  /* a body into the image's stored bytes, checked: {data, bytes} */
+  function unpack(h, body) {
+    var im = h.image, filled;
+    if (body.length !== im.bodyBytes) return Promise.reject(new Error("That world file is cut short: its body is " + body.length + " of " + im.bodyBytes + " bytes."));
+    if (im.body === "raw") filled = Promise.resolve(body);   /* the stored bytes themselves */
     else if (typeof root.DecompressionStream !== "function")
       return Promise.reject(new Error("This browser can't decompress a world file (it has no DecompressionStream: Chrome 80+, Firefox 113+, Safari 16.4+)."));
-    else filled = through(new root.DecompressionStream("gzip"), body, function (c) {
-      if (at + c.length > im.stored) { over = true; throw new Error("longer"); }
-      dst.set(c, at); at += c.length;
-    }).catch(function (e) {
-      if (over) throw new Error("That world file is damaged: its world is longer than its header says.");
-      throw new Error("That world file is damaged or cut short: its compressed world does not unpack (" + (e && e.message || e) + ").");
+    else {
+      var data = new Uint8Array(im.stored), at = 0, over = false;
+      filled = through(new root.DecompressionStream("gzip"), body, function (c) {
+        if (at + c.length > im.stored) { over = true; throw new Error("longer"); }
+        data.set(c, at); at += c.length;
+      }).then(function () {
+        if (at !== im.stored) throw new Error("That world file is cut short: its world unpacks to " + at + " of " + im.stored + " bytes.");
+        return data;
+      }, function (e) {
+        if (over) throw new Error("That world file is damaged: its world is longer than its header says.");
+        throw new Error("That world file is damaged or cut short: its compressed world does not unpack (" + (e && e.message || e) + ").");
+      });
+    }
+    return filled.then(function (d) {
+      return sha256(d).then(function (sum) {
+        if (sum !== im.sha256) throw new Error("That world file is damaged: its world does not match its checksum.");
+        return { data: d, bytes: im.bytes };
+      });
     });
-    return filled.then(function () {
-      if (at !== im.stored) throw new Error("That world file is cut short: its world unpacks to " + at + " of " + im.stored + " bytes.");
-      return sha256(dst.subarray(0, im.stored));
-    }).then(function (sum) {
-      if (sum !== im.sha256) throw new Error("That world file is damaged: its world does not match its checksum.");
-      return { header: r.header, image: image };
+  }
+  /* A world file's header, from its bytes (Uint8Array), without the
+   * checksum (readWorld checks that): {header, at}. Throws why not. */
+  function worldHeader(file, L) {
+    var u8 = u8of(file), m = WORLD.MAGIC.length;
+    if (!isWorldFile(u8)) throw new Error(notAWorld(u8));
+    if (u8.length < WORLD.PREFIX) throw new Error("That world file is cut short: it ends inside its header.");
+    var n = new DataView(u8.buffer, u8.byteOffset + m, 4).getUint32(0, true);
+    if (n < 2 || n > WORLD.MAX_HEADER || u8.length < WORLD.PREFIX + n) throw new Error("That world file is damaged or cut short: its header length is " + n + " bytes.");
+    return { header: parseHeader(u8.subarray(WORLD.PREFIX, WORLD.PREFIX + n), L || worldLimits()), at: WORLD.PREFIX + n };
+  }
+  /* A world file, checked whole (bytes): {header, data, bytes}, or a rejected Promise whose Error says why not */
+  function decodeWorld(file, L) {
+    return readWorld(bytesSource(file), L).then(function (r) {
+      return r.body().then(function (img) { return { header: r.header, data: img.data, bytes: img.bytes }; });
     });
+  }
+  /* the image whole (data, then zeros to `bytes`), as an ArrayBuffer (the tests compare it) */
+  function wholeImage(w) { var b = new Uint8Array(w.bytes); b.set(w.data); return b.buffer; }
+
+  /* ---- a saved world's header, checked against itself (web/ocean.js; the tests) ----
+   * Strict: every field a world file has, of its type and in its range, no
+   * other; the settings flat (a name, a number or an on / off value of the
+   * type the sheet's field has); only the live settings differ between the
+   * setup it started from (start.cfg) and its settings when saved (runCfg);
+   * its setup record is that start with those settings (Save setup's
+   * file). R: {keys: CFG.KEYS, live: CFG.LIVE, lim: CFG.SIZE_LIMITS,
+   * setupVersion}. "" or why not. */
+  var START_KEYS = ["seed", "population", "depth", "width", "height", "cfg"];
+  var TOP_KEYS = ["format", "version", "app", "saved", "engine", "frame", "fish", "food", "predators", "start", "runCfg", "setup", "picked", "image", "sha256"];
+  var SETUP_KEYS = ["format", "version", "seed", "population", "depth", "width", "height", "walls", "config"];
+  function headerProblem(h, R) {
+    var obj = function (o) { return !!o && typeof o === "object" && !Array.isArray(o); };
+    var whole = function (v, lo, hi) { return Number.isSafeInteger(v) && v >= lo && v <= hi; };
+    var fin = function (v) { return typeof v === "number" && isFinite(v); };
+    var only = function (o, keys) { return Object.keys(o).every(function (k) { return keys.indexOf(k) >= 0; }); };
+    var BIG = Number.MAX_SAFE_INTEGER, NAME = /^[A-Za-z_][A-Za-z0-9_]{0,63}$/, lim = R.lim, args = { seed: 1, population: 1, depth: 1, width: 1, height: 1 };
+    function settings(c, what) {
+      if (!obj(c)) return what + " are not a list of settings";
+      var ks = Object.keys(c);
+      if (ks.length > 512) return what + " are " + ks.length + " settings";
+      for (var i = 0; i < ks.length; i++) {
+        var k = ks[i], v = c[k], d = R.keys[k];
+        if (!NAME.test(k) || args[k]) return what + " have a setting named " + JSON.stringify(k.slice(0, 40));
+        if (d ? (typeof d[0] === "boolean" ? typeof v !== "boolean" : !fin(v)) : !(fin(v) || typeof v === "boolean"))
+          return what + " have " + k + " " + (typeof v === "string" ? "as text" : Array.isArray(v) ? "as a list" : obj(v) ? "as a record" : JSON.stringify(v));
+      }
+      return "";
+    }
+    if (!obj(h) || !only(h, TOP_KEYS)) return "its header has a field a world file has not";
+    if (h.app !== undefined && !(typeof h.app === "string" && h.app.length <= 200)) return "its header's app is not a name";
+    if (h.saved !== undefined && !(typeof h.saved === "string" && h.saved.length <= 64)) return "its header's time is not one";
+    var e = h.engine;
+    if (!obj(e) || !only(e, ["module", "wasmSha256", "eye"]) || e.module !== "evo_ocean" || typeof e.wasmSha256 !== "string" ||
+        !/^[0-9a-f]{64}$/.test(e.wasmSha256) || typeof e.eye !== "boolean") return "its engine record is not one";
+    if (!whole(h.frame, 0, BIG)) return "its frame (" + JSON.stringify(h.frame) + ") is not a whole number";
+    if (!whole(h.fish, 0, BIG) || !whole(h.food, 0, BIG) || !whole(h.predators, 0, BIG)) return "its counts of fish, food and predators are not whole numbers";
+    var s = h.start;
+    if (!obj(s) || !only(s, START_KEYS) || !whole(s.seed, 0, 4294967295) || !whole(s.population, lim.population[0], lim.population[1]) ||
+        !fin(s.depth) || s.depth < lim.depth[0] || s.depth > lim.depth[1] || !whole(s.width, lim.side[0], lim.side[1]) || !whole(s.height, lim.side[0], lim.side[1]))
+      return "its start (the setup it began from) is not one";
+    var why = settings(s.cfg, "its start's settings") || settings(h.runCfg, "its settings");
+    if (why) return why;
+    var all = Object.keys(s.cfg).concat(Object.keys(h.runCfg));
+    for (var i = 0; i < all.length; i++) {
+      var k = all[i];
+      if (!R.live[k] && s.cfg[k] !== h.runCfg[k]) return "its settings change " + k + ", which only a new start can";
+    }
+    var u = h.setup, wallsNow = h.runCfg.walls !== undefined ? h.runCfg.walls === true : !!(R.keys.walls && R.keys.walls[0]);
+    if (!obj(u) || !only(u, SETUP_KEYS) || u.format !== "evo_ocean_setup" || u.version !== R.setupVersion || u.seed !== s.seed ||
+        u.population !== s.population || u.depth !== s.depth || u.width !== s.width || u.height !== s.height || u.walls !== wallsNow || !obj(u.config))
+      return "its setup is not this world's";
+    var cfgNow = {};
+    Object.keys(h.runCfg).forEach(function (k) { if (k !== "walls") cfgNow[k] = h.runCfg[k]; });
+    if (canon(u.config) !== canon(cfgNow)) return "its setup's settings are not this world's";
+    var p = h.picked;
+    if (p !== null && !(obj(p) && only(p, ["id", "follow", "family", "x", "y", "d"]) && whole(p.id, 0, BIG) && typeof p.follow === "boolean" &&
+                        (p.family === undefined || p.family === null || fin(p.family)) &&
+                        ["x", "y", "d"].every(function (k) { return p[k] === undefined || fin(p[k]); })))
+      return "its picked fish is not one";
+    return "";
+  }
+
+  /* ---- a module's world, read and checked (the page after it opens a world; the probe) ----
+   * worldNow: oc_sync, then the world's numbers, every export's buffer
+   * inside the memory (aligned, its length the counts'), the frame a whole
+   * number, the ids and the fish's segments finite. Throws why not (a
+   * module whose image is not a world: a null world reads 0 × 0). */
+  function worldNow(M) {
+    M._oc_sync();
+    var len = buffer(M).byteLength;
+    var r = { w: M._oc_width(), h: M._oc_height(), d: M._oc_depth_max(), fish: M._oc_creature_count(), food: M._oc_food_count(),
+              pred: M._oc_predator_count(), walls: typeof M._oc_walls_enabled === "function" ? !!M._oc_walls_enabled() : false, frame: -1 };
+    var statsLen = M._oc_stats_len();
+    [["fish", r.fish], ["food", r.food], ["predators", r.pred], ["stats", statsLen]].forEach(function (c) {
+      if (!Number.isSafeInteger(c[1]) || c[1] < 0 || c[1] > len) throw new Error("its count of " + c[0] + " is " + c[1]);
+    });
+    if (!(r.w > 0 && r.h > 0 && r.d > 0 && isFinite(r.w) && isFinite(r.h) && isFinite(r.d))) throw new Error("it holds no world (its tank is " + r.w + " × " + r.h + " × " + r.d + ")");
+    function view(ptr, n, size, what) {
+      ptr = ptr >>> 0;
+      if (n && (!ptr || ptr % size || ptr + n * size > len)) throw new Error("its " + what + " lie outside its memory");
+    }
+    var n = r.fish, fc = r.food, pc = r.pred;
+    view(M._oc_stats(), statsLen, 8, "stats");
+    view(M._oc_creature_segments(), n * 12, 4, "fish");
+    view(M._oc_creature_depth(), n, 4, "fish depths");
+    if (typeof M._oc_creature_vz === "function") view(M._oc_creature_vz(), n, 4, "fish climbs");
+    view(M._oc_body_params(), n * 2, 4, "bodies");
+    view(M._oc_creature_colors(), n * 3, 1, "colours");
+    view(M._oc_creature_ids(), n, 8, "ids");
+    view(M._oc_food_xy(), fc * 2, 4, "food");
+    view(M._oc_food_depth(), fc, 4, "food depths");
+    view(M._oc_predator_data(), pc * 3, 4, "predators");
+    view(M._oc_predator_depth(), pc, 4, "predator depths");
+    if (typeof M._oc_creature_appearance === "function" && typeof M._oc_appearance_count === "function") {
+      var ac = M._oc_appearance_count();
+      if (!Number.isSafeInteger(ac) || ac < 0 || ac > len) throw new Error("its count of appearance rows is " + ac);
+      if (ac) view(M._oc_creature_appearance(), ac * M._oc_appearance_stride(), 4, "appearance rows");
+    }
+    var st = f64(M, M._oc_stats(), statsLen);
+    r.frame = st[1];
+    if (!Number.isSafeInteger(r.frame) || r.frame < 0) throw new Error("its frame is " + r.frame);
+    var ids = new Float64Array(buffer(M), M._oc_creature_ids() >>> 0, n), segs = new Float32Array(buffer(M), M._oc_creature_segments() >>> 0, n * 12), i;
+    for (i = 0; i < n; i++) if (!isFinite(ids[i])) throw new Error("a fish's id is " + ids[i]);
+    for (i = 0; i < 12 * n; i++) if (!isFinite(segs[i])) throw new Error("a fish's place is " + segs[i]);
+    return r;
+  }
+  /* what a world file's header says its world is (worldNow's terms) */
+  function worldExpect(h) {
+    return { w: h.setup.width, h: h.setup.height, d: h.start.depth, frame: h.frame, fish: h.fish, food: h.food, pred: h.predators,
+             walls: h.setup.walls, picked: !!h.picked };
+  }
+  /* "" or how a module's world (worldNow) differs from the one expected */
+  function worldMismatch(a, e) {
+    if (a.w !== e.w || a.h !== e.h || Math.fround(a.d) !== Math.fround(e.d))
+      return "its tank is " + a.w + " × " + a.h + " × " + a.d + ", not the " + e.w + " × " + e.h + " × " + e.d + " its header says";
+    if (a.frame !== e.frame) return "it is at frame " + a.frame + ", not the " + e.frame + " its header says";
+    if (a.fish !== e.fish || a.food !== e.food || a.pred !== e.pred)
+      return "it has " + a.fish + " fish, " + a.food + " food and " + a.pred + " predators, not the " + e.fish + ", " + e.food + " and " + e.pred + " its header says";
+    if (a.walls !== e.walls) return "its sides are " + (a.walls ? "glass walls" : "wrapping") + ", not as its header says";
+    return "";
+  }
+  /* A saved world tried in a module of its own (web/ocean_worker.js "probe":
+   * a worker made for it, terminated after): the image in, checked against
+   * its header (expect: worldExpect), the calls the page makes on a world
+   * it opens (the display switches, the readout's summary, the charts'
+   * family lines, a fish card), one step, checked again. {ok, at (its
+   * worldNow before the step), why}. A trap throws (the caller says so). */
+  function probeWorld(M, data, bytes, expect) {
+    take(M, data, "the test module's", bytes);
+    var a = worldNow(M), why = worldMismatch(a, expect);
+    if (why) return { ok: false, why: why };
+    if (typeof M._oc_set_colour_mode === "function") M._oc_set_colour_mode(1);
+    if (typeof M._oc_set_capture === "function") M._oc_set_capture(expect.picked ? 1 : 0);
+    if (typeof M._oc_summary === "function") f64(M, M._oc_summary(), M._oc_summary_len());
+    if (typeof M._oc_families === "function") { var k = M._oc_families(8); f64(M, M._oc_families_data(), 2 * k); }
+    if (a.fish && typeof M._oc_inspect === "function" && M._oc_inspect(0)) f64(M, M._oc_inspect_info(), M._oc_inspect_len());
+    M._oc_step(1);
+    var b = worldNow(M);
+    if (b.frame !== a.frame + 1) return { ok: false, why: "one step took it from frame " + a.frame + " to " + b.frame };
+    if (b.w !== a.w || b.h !== a.h || b.d !== a.d) return { ok: false, why: "one step changed its tank" };
+    return { ok: true, at: a };
   }
 
   var api = { PAGE: PAGE, buffer: buffer, growTo: growTo, take: take, cString: cString,
               withCString: withCString, f64: f64, f32: f32, row: row,
               ledger: ledger, parseFirst: parseFirst, cfgJson: cfgJson,
               WORLD: WORLD, isWorldFile: isWorldFile, sha256: sha256, sha256js: sha256js, storedLength: storedLength,
-              canGzip: canGzip, encodeWorld: encodeWorld, worldHeader: worldHeader, decodeWorld: decodeWorld };
+              canGzip: canGzip, encodeWorld: encodeWorld, worldHeader: worldHeader, decodeWorld: decodeWorld, wholeImage: wholeImage,
+              worldLimits: worldLimits, wasmMemoryMax: wasmMemoryMax, maxBody: maxBody, canon: canon, headerDigest: headerDigest, sealHeader: sealHeader,
+              readWorld: readWorld, blobSource: blobSource, bytesSource: bytesSource, headerProblem: headerProblem,
+              worldNow: worldNow, worldExpect: worldExpect, worldMismatch: worldMismatch, probeWorld: probeWorld };
   root.EvoOceanHandoff = api;
   if (typeof module === "object" && module && module.exports) module.exports = api;   /* node: the tests */
 })(typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : globalThis);
