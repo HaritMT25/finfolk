@@ -909,14 +909,52 @@ def omnibus(blocks, registry, meta, sims, seed, kind):
 
 
 def cores_from_plan(plan):
-    """{core: sorted items} from cells that carry a 'core' (plan.py "cores"), else None."""
+    """{core: sorted items} from cells that carry a 'core' (plan.py "cores"), else None.
+    plan.py tags a cell with its RESIDENT's core, and every core member is the resident of its own
+    core's cells (its sham at least), so the registered membership is the residents. A secondary
+    cross-home cell x1 -> y1 (core y) must not add its invader x1 to core y (review round 4: it did,
+    and then the primary analysis demanded cross-home cells and lost formal eligibility)."""
     cores = {}
     for c in (plan or {}).values():
         if c.get("core"):
             cores.setdefault(c["core"], set()).add(c["resident_name"])
-            if c["mode"] == "invade":
-                cores[c["core"]].add(c["invader_name"])
     return {k: sorted(v) for k, v in cores.items()} or None
+
+
+def primary_registration(registry, groups, cores):
+    """The registered primary structure, frozen from the registration BEFORE any result is read
+    (review round 4): for every registered (condition, fraction) and every group with a registered
+    item there, the registered block - a core's items (which must be registered as a complete
+    matrix), or for a legacy plan the largest complete registered clique within the home regime -
+    and its common registered replicates; 'why' says why a registration defines no complete
+    primary matrix (then that block can never be formal). -> (spec {(cond, frac): {group: {names,
+    reps, why}}}, required {frac: sorted groups}): a group registered at a fraction is required
+    in every registered condition there, whatever has finished."""
+    rk = lambda a_, b_: (a_, b_, "sham" if a_ == b_ else "invade")   # noqa: E731
+    spec, required = {}, {}
+    for (cond, frac), reg in sorted(registry.items(), key=lambda kv: (str(kv[0][0]), kv[0][1])):
+        for gname in sorted(groups):
+            items = sorted(groups[gname])
+            inreg = [x for x in items if any(x in key[:2] for key in reg)]
+            if not inreg:
+                continue
+            why, R = None, []
+            if cores:
+                names = items
+                if any(rk(a_, b_) not in reg for a_ in names for b_ in names):
+                    why = f"core {gname} is not registered as a complete matrix"
+            else:
+                names = _largest_complete(inreg, lambda a_, b_: rk(a_, b_) in reg)
+            if why is None:
+                if len(names) < 3:
+                    why = "fewer than 3 registered items"
+                else:
+                    R = sorted(set.intersection(*[reg[rk(a_, b_)] for a_ in names for b_ in names]))
+                    if len(R) < 2:
+                        why = "fewer than 2 common registered replicates"
+            spec.setdefault((cond, frac), {})[gname] = {"names": names, "reps": R, "why": why}
+            required.setdefault(frac, set()).add(gname)
+    return spec, {f: sorted(v) for f, v in required.items()}
 
 
 def primary_blocks(rows, meta, registry, cores, sims, seed=5, kind=infer.DEFAULT_KIND, windows_registered=None,
@@ -931,6 +969,8 @@ def primary_blocks(rows, meta, registry, cores, sims, seed=5, kind=infer.DEFAULT
     as a complete matrix; a block is formal when every registered cell of it is finished on the
     registered replicates and its window is registered (fixed steps: the horizon file).
 
+    The required group x condition set and each block's items and replicates are frozen from the
+    registration (primary_registration), never from which cells have finished (review round 4).
     Per (fraction, window) the primary omnibus needs every registered condition x every group
     formal, with the same items and replicates across a group's conditions:
       H1   the raw grouped omnibus (infer.infer_groups: regimes independent, assays joint);
@@ -938,7 +978,9 @@ def primary_blocks(rows, meta, registry, cores, sims, seed=5, kind=infer.DEFAULT
            grouped sign-flip of the projected residual replicate vectors (and, with bsims > 0, the
            joint refitting bootstrap beside it);
       claim "cyclic beyond bounded logistic transitivity" iff both p <= bounded.ALPHA_FAMILY
-           (= 0.05/12: hypotheses 1-11 + 1b, Holm; sufficient for both whatever their order).
+           (= 0.05/12: hypotheses 1-11 + 1b, Holm; sufficient for both whatever their order);
+           if a logistic fit did not converge, H1b and the claim are INVALID (claim None,
+           claim_status and h1b_diagnostics say why), never a rejection.
     A group with k > 16 replicates is exported only (the enumeration of sign patterns is limited
     to 16; an error bank is resampled by calibrate.py, not tested). -> (rows, blocks, joint rows)."""
     if cores:
@@ -950,10 +992,17 @@ def primary_blocks(rows, meta, registry, cores, sims, seed=5, kind=infer.DEFAULT
         source = "legacy plan: the largest complete registered clique within each home regime"
     else:
         return [], {}, []
-    rk = lambda a_, b_: (a_, b_, "sham" if a_ == b_ else "invade")   # noqa: E731
+    # the required groups and their blocks come from the registration alone (review round 4: they
+    # used to come from whichever blocks had results, so a legacy regime with no finished cell
+    # silently left a formal two-block omnibus)
+    spec, required = primary_registration(registry, groups, cores) if registry is not None else ({}, {})
     prows, pblocks = [], {}
-    keys = sorted({(x["cond"], x["frac"], x["G"]) for x in rows})
-    for cond, frac, G in keys:
+    keys = {(x["cond"], x["frac"], x["G"]) for x in rows}
+    seenG = {}
+    for _, f_, g_ in keys:
+        seenG.setdefault(f_, set()).add(g_)
+    keys |= {(c_, f_, g_) for (c_, f_) in spec for g_ in seenG.get(f_, ())}   # registered blocks without results too
+    for cond, frac, G in sorted(keys, key=lambda t: (str(t[0]), t[1], t[2])):
         cell = {}
         for x in rows:
             if (x["cond"], x["frac"], x["G"]) == (cond, frac, G) and x["mode"] in ("invade", "sham") and x["s"] is not None:
@@ -962,28 +1011,22 @@ def primary_blocks(rows, meta, registry, cores, sims, seed=5, kind=infer.DEFAULT
         for gname in sorted(groups):
             items = sorted(groups[gname])
             status, names, reps = None, [], []
+            sp = spec.get((cond, frac), {}).get(gname)
             if not reg:
                 status = "descriptive: no plan given" if registry is None else "descriptive: nothing registered"
+            elif sp is None:
+                if gname not in required.get(frac, ()):
+                    continue   # not a primary group at this fraction
+                status = f"descriptive: group {gname} has no registered item in {cond}"
+            elif sp["why"]:
+                status = f"descriptive: {sp['why']}"
             else:
-                inreg = [x for x in items if any(x in key[:2] for key in reg)]
-                if not inreg:
-                    continue
-                if cores:
-                    names = items
-                    if any(rk(a_, b_) not in reg for a_ in names for b_ in names):
-                        status = f"descriptive: core {gname} is not registered as a complete matrix"
+                names, R = sp["names"], sp["reps"]
+                miss = [(a_, b_, r) for a_ in names for b_ in names for r in R if r not in cell.get((a_, b_), {})]
+                if not miss:
+                    status, reps = "formal", R
                 else:
-                    names = _largest_complete(inreg, lambda a_, b_: rk(a_, b_) in reg)
-                if status is None:
-                    if len(names) < 3:
-                        status = "descriptive: fewer than 3 registered items"
-                    else:
-                        R = sorted(set.intersection(*[reg[rk(a_, b_)] for a_ in names for b_ in names]))
-                        miss = [(a_, b_, r) for a_ in names for b_ in names for r in R if r not in cell.get((a_, b_), {})]
-                        if not miss and len(R) >= 2:
-                            status, reps = "formal", R
-                        else:
-                            status = f"descriptive: {len(miss)} of {len(names) ** 2 * len(R)} registered cells missing"
+                    status = f"descriptive: {len(miss)} of {len(names) ** 2 * len(R)} registered cells missing"
             if status == "formal" and windows_registered is not None and G not in windows_registered:
                 status = "descriptive: window not in the horizon registration"
             if status != "formal":
@@ -1014,23 +1057,28 @@ def primary_blocks(rows, meta, registry, cores, sims, seed=5, kind=infer.DEFAULT
                 if n * (n - 1) - bounded.Model(bounded.CO_PRIMARY_MODEL, n).P >= (n - 1) * (n - 2) // 2:
                     vecs, fitres = bounded.residual_replicate_vectors(zq)
                     R_C = bounded.energies(bounded._sub(bounded._means(zq), fitres["F"]))[1]
+                    ok = bool(fitres["converged"])   # an unconverged fit decides nothing (review round 4)
                     row.update({"R_C_logistic": R_C, "F_res": infer._ratio(R_C, infer.block_stats(zq)["tauC"]),
-                                "p_res_flip": infer.flip_p_vectors([vecs]) if formal else None})
+                                "fit_converged": ok, "p_res_flip": infer.flip_p_vectors([vecs]) if formal and ok else None})
+                    if not ok:
+                        row["note"] = "logistic fit not converged: H1b descriptive"
             else:
                 row["note"] = "k > 16: exported (blocks.json), not tested"
             pblocks[(cond, frac, G, gname)] = {"cond": cond, "frac": frac, "G": G, "group": gname, "names": names,
                                                "reps": reps, "z": z, "zq": zq, "status": status, "fit": fitres}
             prows.append(row)
     pjoint = []
-    for frac, G in sorted({(k_[1], k_[2]) for k_ in pblocks}):
+    for frac, G in sorted({(k_[1], k_[2]) for k_ in keys}):
         if registry is None:
             conds = sorted({k_[0] for k_ in pblocks if (k_[1], k_[2]) == (frac, G)})
+            gnames = sorted({k_[3] for k_ in pblocks if (k_[1], k_[2]) == (frac, G)} | (set(cores) if cores else set()))
             why = "descriptive: no plan given (no registered condition set)"
         else:
             conds = sorted({c_ for (c_, f_) in registry if f_ == frac})
+            gnames = required.get(frac, [])   # frozen from the registration (review round 4)
             why = None
-        gnames = sorted({k_[3] for k_ in pblocks if (k_[1], k_[2]) == (frac, G)} |
-                        (set(cores) if cores else set()))
+        if not gnames or not conds:
+            continue
         miss = [f"{c_}/{g_}" for c_ in conds for g_ in gnames
                 if (c_, frac, G, g_) not in pblocks or pblocks[(c_, frac, G, g_)]["status"] != "formal"]
         if why is None and miss:
@@ -1058,9 +1106,20 @@ def primary_blocks(rows, meta, registry, cores, sims, seed=5, kind=infer.DEFAULT
             row.update({"n": " ".join(str(x) for x in ig["N"]), "k": ig["k"][0], "F_lof": ig["F_C"],
                         "p_lof": ig["p_lof"], "p_lof_flip": ig["p_lof_flip"], "flip_min_p": ig["flip_min_p"],
                         "F_sym": ig["F_S"], "p_sym": ig["p_sym"], "p_sym_flip": ig["p_sym_flip"],
-                        "F_res_joint": ro["F_res_joint"], "p_res_flip": ro["p_flip"], "p_res_boot": ro["p_boot"]})
+                        "F_res_joint": ro["F_res_joint"], "p_res_flip": ro["p_flip"], "p_res_boot": ro["p_boot"],
+                        "h1b_valid": ro["valid"],
+                        "h1b_diagnostics": (f"logistic fits converged {ro['fits_converged']}/{ro['conditions']}; "
+                                            f"bootstrap draws with an unconverged refit {ro['boot_not_converged']}/{bsims}"
+                                            + (f"; INVALID: {ro['invalid']} (descriptive p "
+                                               f"{ro['p_flip_unconverged']:.5g})" if not ro["valid"] else ""))})
             row["p_primary"] = primary_p(row)
-            row["claim_beyond_bounded"] = (row["p_primary"] <= bounded.ALPHA_FAMILY and ro["p_flip"] <= bounded.ALPHA_FAMILY)
+            if ro["p_flip"] is None or row["p_primary"] is None:
+                # review round 4: an unconverged fit gives no decision, never a formal rejection
+                row["claim_beyond_bounded"] = None
+                row["claim_status"] = f"invalid: {ro['invalid'] or 'H1 has no p-value'}"
+            else:
+                row["claim_beyond_bounded"] = (row["p_primary"] <= bounded.ALPHA_FAMILY and ro["p_flip"] <= bounded.ALPHA_FAMILY)
+                row["claim_status"] = "formal"
         pjoint.append(row)
     return prows, pblocks, pjoint
 
@@ -1405,6 +1464,15 @@ def main(argv=None):
     prows, pblocks, pjoint = primary_blocks(rows, meta, registry, cores, a.sims, kind=a.kind,
                                             windows_registered=windows_registered, bsims=a.bounded_sims)
     prov["cores"] = cores
+    if registry is not None and (cores or meta):
+        pgroups = {g_: list(v) for g_, v in cores.items()} if cores else {}
+        if not cores:
+            for nm, m_ in meta.items():
+                pgroups.setdefault(str(m_.get("regime")), []).append(nm)
+        pspec, preq = primary_registration(registry, pgroups, cores)
+        prov["primary_registration"] = {"required_groups": {str(f_): g_ for f_, g_ in preq.items()},
+                                        "blocks": {f"{c_}/{f_}/{g_}": v for (c_, f_), gs in pspec.items()
+                                                   for g_, v in gs.items()}}
     scales = [x for x in a.scales.split(",") if x]
     models = [x for x in a.bounded.split(",") if x]
     srows, mrows = scale_sensitivity(rows, blocks, scales, models, a.sims, a.bounded_sims, kind=a.kind) \
@@ -1422,12 +1490,14 @@ def main(argv=None):
         write_csv(os.path.join(a.out, "primary.csv"), prows,
                   ["cond", "frac", "G", "group", "source", "status", "n", "k", "names", "cyclic_share",
                    "noise_corrected", "share_ci95_lo", "share_ci95_hi", "dC", "F_lof", "p_primary", "p_lof",
-                   "p_lof_flip", "R_C_logistic", "F_res", "p_res_flip", "note", "plan_sha256", "analysis_sha256"])
+                   "p_lof_flip", "R_C_logistic", "F_res", "fit_converged", "p_res_flip", "note", "plan_sha256",
+                   "analysis_sha256"])
     if pjoint:
         write_csv(os.path.join(a.out, "primary_joint.csv"), pjoint,
                   ["frac", "G", "structure", "status", "required", "conditions", "groups", "n", "k", "F_lof",
                    "p_primary", "p_lof", "p_lof_flip", "flip_min_p", "F_sym", "p_sym", "p_sym_flip", "F_res_joint",
-                   "p_res_flip", "p_res_boot", "claim_beyond_bounded", "boot", "plan_sha256", "analysis_sha256"])
+                   "p_res_flip", "p_res_boot", "h1b_valid", "h1b_diagnostics", "claim_beyond_bounded", "claim_status",
+                   "boot", "plan_sha256", "analysis_sha256"])
     if prows or pjoint:
         md.append("\n## Primary matrices: one per home regime x condition (stats spec), built explicitly\n")
         md.append(f"Groups: {prows[0]['source'] if prows else ''}. A primary block is formal when every registered "
@@ -1450,7 +1520,11 @@ def main(argv=None):
             md.append(f"| {j_['frac']} | {j_['G']} | {j_['status'][:60]} | {j_['groups']} | {fmt(j_.get('F_lof'), 2)} | "
                       f"{fmt(j_.get('p_lof_flip'), 5)} ({fmt(j_.get('flip_min_p'), 5)}) | {fmt(j_.get('p_lof'), 4)} | "
                       f"{fmt(j_.get('F_res_joint'), 2)} | {fmt(j_.get('p_res_flip'), 5)} | {fmt(j_.get('p_res_boot'), 4)} | "
-                      f"{j_.get('claim_beyond_bounded', '')} |")
+                      f"{j_.get('claim_beyond_bounded', '')}"
+                      + (f" ({j_['claim_status']})" if j_.get("claim_status", "formal") != "formal" else "") + " |")
+        for j_ in pjoint:
+            if j_.get("h1b_diagnostics"):
+                md.append(f"\nH1b at fraction {j_['frac']}, window {j_['G']}: {j_['h1b_diagnostics']}.")
     if mats:
         cols = ["cond", "frac", "G", "status", "plan_sha256", "analysis_sha256", "n", "k", "names", "ratings",
                 "invader_effect", "resident_effect", "cyclic_share", "noise_corrected", "share_ci95_lo",

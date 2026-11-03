@@ -55,6 +55,15 @@
 #      pilot blocks, and from an error bank's own primary blocks: their fits, items and cell SDs).
 #  25. --prune: scored cells lose their checkpoints (hashes kept, births gzipped), analyses unchanged,
 #      byte-identical replay, a failed score check prunes nothing, the disk guard stops (fail closed).
+#  Review round 4:
+#  22. (+) the primary groups frozen from the registration: a legacy regime with no result, cores plus
+#      secondary cross-home pairs end to end;
+#  26. a bank is calibrated only if it is the registered one (spec + plan; --bank-exploratory otherwise);
+#  27. exact null means in the compound world, the endpoint law's moments, plant diagnostics, feasible plants;
+#  28. an unconverged fit decides nothing (analysis: invalid; calibration: a non-rejection, counted);
+#  29. replay prerequisites before pruning, the store, --update-tools keeping versions, revalidated
+#      interrupted prunes, the durable write order (traced);
+#  30. the disk guard's stop path with an unwritable disk; guaranteed cleanup of running cells.
 set -u
 BIN=${1:?usage: invasion_tooling.sh EVO_BOIDS WORKDIR}
 W=${2:?usage: invasion_tooling.sh EVO_BOIDS WORKDIR}
@@ -756,7 +765,49 @@ reg_x = {k: dict(v) for k, v in reg.items()}
 reg_x[("off", 0.05)][("x1", "y1", "invade")] = {0, 1, 2}
 pr, pb, pj = analyze.primary_blocks(rows, None, reg_x, cores, 49)
 assert pb[("off", 0.05, 13500.0, "x")]["status"] == "formal" and pj[0]["status"] == "formal"
-assert analyze.cores_from_plan({"c1": {"core": "x", "resident_name": "x1", "invader_name": "x2", "mode": "invade"}}) == {"x": ["x1", "x2"]}
+assert analyze.cores_from_plan({"c1": {"core": "x", "resident_name": "x1", "invader_name": "x2", "mode": "invade"},
+                                "c2": {"core": "x", "resident_name": "x2", "invader_name": "x2", "mode": "sham"}}) == {"x": ["x1", "x2"]}
+# review round 4, P1-1: the required groups are frozen from the registration. A legacy plan (one pooled
+# 6-item matrix, home regimes from --meta) whose regime y has no finished cell at all: the omnibus
+# must stay the registered four-block one (descriptive), not become a formal two-block test
+meta = {nm: {"regime": nm[0]} for nm in ("x1", "x2", "x3", "y1", "y2", "y3")}
+reg_l = {(c, 0.05): {(i, j, "sham" if i == j else "invade"): {0, 1, 2} for i in meta for j in meta} for c in ("off", "predA")}
+rows_x = [x for x in rows if x["i"][0] == "x" and x["j"][0] == "x"]
+pr, pb, pj = analyze.primary_blocks(rows_x, meta, reg_l, None, 49)
+assert len(pj) == 1 and pj[0]["required"] == "off/x off/y predA/x predA/y", pj
+assert pj[0]["status"].startswith("descriptive: primary block(s)") and "off/y" in pj[0]["status"] \
+    and "predA/y" in pj[0]["status"] and pj[0].get("p_lof_flip") is None and pj[0].get("claim_beyond_bounded") is None, pj
+assert {r["group"] for r in pr if r["cond"] == "off"} == {"x", "y"}, pr   # the empty regime is reported, not dropped
+pr, pb, pj = analyze.primary_blocks(rows, meta, reg_l, None, 49)        # both regimes finished: formal
+assert pj[0]["status"] == "formal", pj[0]["status"]
+PY
+# ... and end to end: a derived-seed plan with two cores plus secondary cross-home pairs (both directions)
+# keeps the cores' registered membership, so the primary analysis stays the four formal core blocks
+cat > design22.json <<EOF
+{"name": "t22", "snapshots": {"x1": "$W/A.json", "x2": "$W/B.json", "x3": "$W/C.json", "y1": "$W/As.json",
+ "y2": "$W/Bs.json", "y3": "$W/Cs.json"}, "conditions": {"off": 0, "predA": 2}, "fractions": [0.05], "replicates": 3,
+ "steps": 13500, "checkpoint_every": 4500, "log_every": 1000, "cores": [["x", ["x1", "x2", "x3"]], ["y", ["y1", "y2", "y3"]]],
+ "pairs": [["x1", "y1"], ["x2", "y2"]], "both": true}
+EOF
+$PY "$T/plan.py" design22.json > plan22.jsonl || fail "plan.py (cores + secondary cross-home pairs)"
+$PY - "$T" <<'PY' || fail "a plan's secondary cross-home pairs changed its registered cores"
+import json, random, sys
+sys.path.insert(0, sys.argv[1]); import analyze
+plan = {c["id"]: c for c in (json.loads(l) for l in open("plan22.jsonl"))}
+cross = [c for c in plan.values() if c["mode"] == "invade" and c["resident_name"][0] != c["invader_name"][0]]
+assert len(cross) == 4 * 2 * 3 and {c["core"] for c in cross} == {"x", "y"}, len(cross)   # tagged by the resident's core
+cores = analyze.cores_from_plan(plan)
+assert cores == {"x": ["x1", "x2", "x3"], "y": ["y1", "y2", "y3"]}, cores
+reg = analyze.registry_from_plan(plan)
+rnd = random.Random(222)
+rows = [{"cond": c["condition"], "frac": c["fraction"], "G": 13500.0, "mode": c["mode"],
+         "i": c["invader_name"] if c["mode"] == "invade" else c["resident_name"], "j": c["resident_name"], "rep": c["replicate"],
+         "s": (0.0 if c["mode"] == "sham" else 0.02 * (int(c["invader_name"][1]) - int(c["resident_name"][1]))) + rnd.gauss(0, 0.003),
+         "f0": 0.05, "missed": False} for c in plan.values()]
+pr, pb, pj = analyze.primary_blocks(rows, None, reg, cores, 49, windows_registered={13500.0, 27000.0})
+assert sorted(pb) == sorted((c, 0.05, 13500.0, g) for c in ("off", "predA") for g in ("x", "y")), sorted(pb)
+assert all(b["status"] == "formal" and b["names"] == cores[k[3]] for k, b in pb.items()), [(k, b["status"]) for k, b in pb.items()]
+assert len(pj) == 1 and pj[0]["status"] == "formal" and pj[0]["required"] == "off/x off/y predA/x predA/y", pj
 PY
 
 # 23. review round 3, P2-4: a fixed-step window is read at exactly that step (a 14,000-step checkpoint
@@ -1068,6 +1119,238 @@ for t in (0.01, 0.02, 0.03):
     assert ("d_add: RMS added circulation per planted condition", lab) in d and ("d_res: noiseless logistic-residual RMS per planted condition", lab) in d
 assert float(d[("cells with a capped SD (share)", "bounded ladder")]["n"]) == 2
 assert ("H1b invalid (a logistic fit did not converge): bounded ladder", "null", "0.95") in rows
+PY
+
+# 28. review round 4, P2-6: an unconverged fit decides nothing. With the optimizer cut to one iteration
+#     (an unfinished fit), the primary omnibus' H1b and claim are invalid - not a rejection - in the
+#     analysis, and calibration counts such datasets as non-rejections in the denominator
+$PY - "$T" <<'PY' || fail "an unconverged logistic fit produced a formal decision"
+import math, random, sys
+sys.path.insert(0, sys.argv[1]); import analyze, bounded
+rnd = random.Random(28)
+cores = {"x": ["x1", "x2", "x3", "x4"], "y": ["y1", "y2", "y3", "y4"]}
+cyc = {(0, 1): 0.05, (1, 2): 0.05, (2, 0): 0.05}
+reg, rows = {}, []
+for c in ("off", "predA"):
+    for core in cores.values():
+        for jj, j in enumerate(core):
+            for ii, i in enumerate(core):
+                mode = "sham" if i == j else "invade"
+                reg.setdefault((c, 0.05), {})[(i, j, mode)] = set(range(6))
+                for r in range(6):
+                    q = 0.05 if i == j else bounded.sigmoid(-2.0 + 0.6 * ii - 0.4 * jj) + cyc.get((ii, jj), 0.0) - cyc.get((jj, ii), 0.0)
+                    rows.append({"cond": c, "frac": 0.05, "G": 13500.0, "mode": mode, "i": i, "j": j, "rep": r,
+                                 "s": q - 0.05 + rnd.gauss(0, 0.003), "f0": 0.05, "missed": False})
+pr, pb, pj = analyze.primary_blocks(rows, None, reg, cores, 49, bsims=9)
+assert pj[0]["status"] == "formal" and pj[0]["claim_beyond_bounded"] is True and pj[0]["h1b_valid"], pj   # the data reject
+lm0 = bounded.lm
+bounded.lm = lambda model, cells, y, th0, iters=200, tol=1e-11: lm0(model, cells, y, th0, 1, tol)   # unfinished fits
+pr, pb, pj = analyze.primary_blocks(rows, None, reg, cores, 49, bsims=9)
+bounded.lm = lm0
+j = pj[0]
+assert j["status"] == "formal" and j["p_lof_flip"] is not None, j            # H1 needs no fit
+assert j["claim_beyond_bounded"] is None and j["p_res_flip"] is None and j["p_res_boot"] is None, j
+assert j["claim_status"].startswith("invalid: logistic mean fit(s) not converged") and "INVALID" in j["h1b_diagnostics"], j
+assert all(r.get("p_res_flip") is None and r.get("fit_converged") is False for r in pr if "F_res" in r), pr
+PY
+$PY - "$T" <<'PY' || fail "calibration must count an unconverged H1b as a non-rejection"
+import json, sys
+sys.path.insert(0, sys.argv[1]); import bounded, calibrate
+pbs = {(p["group"], p["cond"]): p for p in json.load(open("bank26.json"))["primary_blocks"]}
+calibrate.G.update({"bank_zq": [[pbs[(g, c)]["zq"] for c in ("off", "predA4")] for g in ("np", "p4")]})
+lm0 = bounded.lm
+bounded.lm = lambda model, cells, y, th0, iters=200, tol=1e-11: lm0(model, cells, y, th0, 1, tol)
+gk, cnt, n, *_ = calibrate.task_compound((None, 4, 6, 2, 3, "nominal", 28))
+labels = {e for (t, e, a) in cnt if t == "claim: H1 and H1b"}
+assert len(labels) == 6 and n == 3, (labels, n)
+for e in labels:
+    assert cnt[(f"H1b invalid (a logistic fit did not converge): {e}", "null", 0.95)] == n, e
+    assert all(cnt[("claim: H1 and H1b", e, a)] == 0 and cnt[("H1b logistic residual sign-flip omnibus", e, a)] == 0
+               for a in calibrate.ALPHAS), e
+PY
+
+# 29. review round 4, P1-2 / P2-3: pruning deletes nothing whose replay cannot be verified, and the
+#     prune sweep finalizes like a new cell. A cell whose registered snapshot is gone, or from before
+#     tool pinning, keeps its checkpoints; --update-tools keeps the replaced versions (a replay then
+#     rebuilds them from DIR/store), and refuses if a finished cell needs a version the store lacks;
+#     an interrupted prune is revalidated before it is finished; a cell pruned earlier whose replay
+#     can no longer be verified stops the sweep; and the order of the writes is the durable one
+for r in root29s root29l root29u root29r root29i root29f; do rm -rf $r; cp -r root3dup $r; done
+$PY - <<'PY' || fail "preparing the replay-provenance roots"
+import json
+def edit(root, cid, f):
+    for name in ("cell.json", "done.json"):
+        p = f"{root}/cells/{cid}/{name}"
+        d = json.load(open(p))
+        f(d["cell"] if name == "done.json" else d, d, name)
+        json.dump(d, open(p, "w"))
+# root29s: one cell's registered resident path is gone (same registered content hash)
+edit("root29s", "off_f100_A_B_r00", lambda c, d, n: c.update(resident=c["resident"].replace("/A.json", "/A_gone.json")))
+# root29l: one cell from before tool pinning (no tool hashes)
+p = "root29l/cells/off_f100_B_C_r01/done.json"
+d = json.load(open(p)); del d["tools_sha256"]; json.dump(d, open(p, "w"))
+PY
+$PY "$T/run.py" --root root29s --prune-finished > p29s.log 2>&1 || fail "--prune-finished (gone snapshot): $(tail -3 p29s.log)"
+grep -q "KEPT (checkpoints stay) off_f100_A_B_r00: replay provenance not established" p29s.log \
+    && [ -f root29s/cells/off_f100_A_B_r00/end.json ] && [ -f root29s/cells/off_f100_A_B_r00/arena.json ] \
+    && [ ! -f root29s/cells/off_f100_A_C_r00/end.json ] || fail "a cell whose snapshot is gone was pruned: $(tail -3 p29s.log)"
+$PY "$T/run.py" --root root29l --prune-finished > p29l.log 2>&1 || fail "--prune-finished (legacy cell): $(tail -3 p29l.log)"
+grep -q "KEPT (checkpoints stay) off_f100_B_C_r01: .*before tool pinning" p29l.log \
+    && [ -f root29l/cells/off_f100_B_C_r01/end.json ] || fail "a cell without tool hashes was pruned: $(tail -3 p29l.log)"
+$PY - <<'PY' || fail "the store keeps every version a pruned cell needs"
+import glob, hashlib, json, os
+st = {os.path.basename(p) for p in glob.glob("root29s/store/*")}
+done = json.load(open("root29s/cells/off_f100_A_C_r00/done.json"))
+man = json.load(open("root29s/cells/off_f100_A_C_r00/arena.manifest.json"))
+need = {done["tools_sha256"][f] for f in ("invlib.py", "arena.py", "score.py")} | {man["resident"]["sha256"], man["invader"]["sha256"]}
+assert need <= st, need - st
+for p in glob.glob("root29s/store/*"):
+    assert hashlib.sha256(open(p, "rb").read()).hexdigest() == os.path.basename(p) and not os.access(p, os.W_OK), p
+PY
+# --update-tools keeps the versions it replaces; the replay of a cell that ran them rebuilds them from the store
+rm -rf T29 && cp -r "$T" T29 && echo "# (a later score.py)" >> T29/score.py
+$PY "$T/run.py" --root root29u --prune-finished > p29u.log 2>&1 || fail "--prune-finished (root29u): $(tail -3 p29u.log)"
+$PY T29/run.py --plan plan3.jsonl --root root29u --binary "$BIN" --workers 1 --update-tools > u29.log 2>&1 \
+    || fail "--update-tools: $(tail -3 u29.log)"
+cmp -s T29/score.py root29u/tools/score.py || fail "--update-tools did not replace score.py"
+rm -rf rp29 && $PY "$T/run.py" --root root29u --replay off_f100_B_A_r02 --out rp29 > rp29.log 2>&1 \
+    || fail "replay of a cell whose score.py was updated since: $(tail -4 rp29.log)"
+grep -q "replay off_f100_B_A_r02: identical" rp29.log && grep -q '"tools_from": "the store' rp29/replay.json \
+    && cmp -s rp29/end.json root3dup/cells/off_f100_B_A_r02/end.json || fail "the replay from stored versions is not identical"
+$PY - <<'PY' || fail "preparing a cell that needs an unstored version"
+import json
+p = "root29r/cells/off_f100_C_A_r00/done.json"
+d = json.load(open(p)); d["tools_sha256"]["score.py"] = "e" * 64; json.dump(d, open(p, "w"))
+PY
+$PY T29/run.py --plan plan3.jsonl --root root29r --binary "$BIN" --workers 1 --update-tools > u29r.log 2>&1
+[ $? = 2 ] && grep -q "refused: finished cells need tool versions the store lacks" u29r.log && ! cmp -s T29/score.py root29r/tools/score.py \
+    || fail "--update-tools discarded a version a finished cell needs: $(tail -2 u29r.log)"
+# an interrupted prune (its record durable, a checkpoint still there) is revalidated: a score that no
+# longer passes its check keeps the checkpoint
+$PY "$T/run.py" --root root29i --prune-finished > p29i.log 2>&1 || fail "--prune-finished (root29i): $(tail -3 p29i.log)"
+cp root3dup/cells/off_f100_A_B_r00/arena.json root29i/cells/off_f100_A_B_r00/
+$PY - <<'PY' || fail "corrupting the interrupted cell's score"
+import hashlib, json
+d = "root29i/cells/off_f100_A_B_r00"
+s = json.load(open(f"{d}/score.json")); s["derivation"]["ok"] = False
+open(f"{d}/score.json", "w").write(json.dumps(s, indent=1, sort_keys=True) + "\n")
+done = json.load(open(f"{d}/done.json"))
+done["outputs"]["score.json"] = hashlib.sha256(open(f"{d}/score.json", "rb").read()).hexdigest()
+json.dump(done, open(f"{d}/done.json", "w"))
+PY
+$PY "$T/run.py" --root root29i --prune-finished > p29i2.log 2>&1
+[ $? = 1 ] && grep -q "NOT PRUNED off_f100_A_B_r00: score derivation not ok" p29i2.log && [ -f root29i/cells/off_f100_A_B_r00/arena.json ] \
+    || fail "an interrupted prune was finished without revalidating the cell: $(tail -2 p29i2.log)"
+# a cell pruned earlier whose replay can no longer be verified (it ran an arena.py version that is
+# neither stored nor pinned)
+$PY - <<'PY' || fail "breaking a pruned cell's provenance"
+import json
+p = "root29u/cells/off_f100_C_B_r01/done.json"
+d = json.load(open(p)); d["tools_sha256"]["arena.py"] = "a" * 64; json.dump(d, open(p, "w"))
+PY
+$PY "$T/run.py" --root root29u --prune-finished > p29u2.log 2>&1
+[ $? = 1 ] && grep -q "NOT PRUNED off_f100_C_B_r01: pruned earlier, and its replay can no longer be verified" p29u2.log \
+    || fail "a pruned cell that can no longer be replayed went unnoticed: $(tail -2 p29u2.log)"
+# the protocol, traced: the sweep and a new cell write and delete in the durable order (every kept file
+# and the gzip flushed, the directory synced, done.json's rename then the directory synced, the deletions,
+# the directory synced again); invlib.write_atomic syncs the directory after its rename
+rm -rf root29f/cells/off_f100_C_B_r02 && mkdir root29f/cells/off_f100_C_B_r02
+grep '"id": "off_f100_C_B_r02"' plan3.jsonl > root29f/cells/off_f100_C_B_r02/cell.json
+$PY - "$T" <<'PY' || fail "the finalization protocol (traced)"
+import json, os, sys
+sys.path.insert(0, sys.argv[1]); import invlib, run
+ev = []
+of, orp, orm = os.fsync, os.replace, os.remove
+def fs(fd):
+    ev.append(("fsync", os.readlink(f"/proc/self/fd/{fd}")))
+    return of(fd)
+def rp(a, b):
+    ev.append(("replace", os.path.abspath(b)))
+    return orp(a, b)
+def rm(p):
+    ev.append(("remove", os.path.abspath(p)))
+    return orm(p)
+os.fsync, os.replace, os.remove = fs, rp, rm
+root = os.path.abspath("root29f")
+def check(d, what):
+    e = [x for x in ev if x[1] == d or os.path.dirname(x[1]) == d]
+    pr = json.load(open(f"{d}/done.json"))["pruned"]
+    gone = {f"{d}/{f}" for f in list(pr["removed"]) + list(pr["compressed"])}
+    i_done = e.index(("replace", f"{d}/done.json"))
+    rms = [i for i, x in enumerate(e) if x[0] == "remove" and x[1] in gone]
+    assert len(rms) == len(gone) == 4 and min(rms) > i_done, (what, e)
+    for f in ("score.json", "run.csv", "arena.manifest.json", "run.births.csv.gz", "stdout.log"):
+        assert any(x == ("fsync", f"{d}/{f}") for x in e[:i_done]), (what, f, e)
+    assert ("fsync", d) in e[:i_done], (what, "the directory before done.json")
+    assert ("fsync", d) in e[i_done + 1:min(rms)], (what, "the directory after done.json's rename, before deleting")
+    assert e[-1] == ("fsync", d) and max(rms) < len(e) - 1, (what, "the directory after the deletions", e[-3:])
+run.prune_finished(root, lambda m: None)
+check(f"{root}/cells/off_f100_A_C_r00", "sweep")
+ev.clear()
+assert run.run_cell(root, "off_f100_C_B_r02", prune=True) == 0
+check(f"{root}/cells/off_f100_C_B_r02", "new cell")
+ev.clear()
+invlib.write_atomic(f"{root}/wa.txt", "x\n")
+i = ev.index(("replace", f"{root}/wa.txt"))
+assert ("fsync", root) in ev[i + 1:], ev
+PY
+
+# 30. review round 4, P3-7: the disk guard's clean stop works when the disk cannot be written: the
+#     guard fires while a cell is running and STOP / progress.json fail with ENOSPC - admission stops in
+#     memory, the running cell finishes, exit 75, no engine left; and whatever else breaks the runner's
+#     loop, its running workers and engines are terminated
+$PY - "$T" "$BIN" "$W" > t30a.log 2>&1 <<'PY' || fail "the disk guard's stop path with an unwritable disk: $(tail -3 t30a.log)"
+import errno, json, os, subprocess, sys
+sys.path.insert(0, sys.argv[1]); import invlib, run
+BIN, W = sys.argv[2], sys.argv[3]
+engines = lambda r: len(subprocess.run(["pgrep", "-f", f"{W}/{r}/bin/evo_boids"], capture_output=True, text=True).stdout.split())
+calls = [0]
+def dp(guards):
+    calls[0] += 1
+    return None if calls[0] == 1 else "test: / has 0 MB free, below the disk guard's 1 MB"
+wa0 = invlib.write_atomic
+def wa(path, text):
+    if calls[0] >= 2 and os.path.basename(path) in ("STOP", "progress.json"):
+        raise OSError(errno.ENOSPC, "No space left on device (test)")
+    return wa0(path, text)
+run.disk_problem, invlib.write_atomic = dp, wa
+try:
+    rc = run.main(["--plan", "plan.jsonl", "--root", "root30", "--binary", BIN, "--workers", "2", "--disk-min", "/:1"])
+except Exception as e:
+    rc = f"raised {e!r}"
+finally:
+    invlib.write_atomic = wa0
+left = engines("root30")
+subprocess.run(["pkill", "-KILL", "-f", f"{W}/root30/bin/evo_boids"])   # (this test's own engines, if it fails)
+done = [c for c in os.listdir("root30/cells") if os.path.exists(f"root30/cells/{c}/done.json")]
+log = open("root30/runner.log").read()
+assert rc == 75 and left == 0, (rc, left)
+assert len(done) == 1 and not os.path.exists("root30/STOP") and "could NOT write" in log, (done, log[-600:])
+assert "stopped by the disk guard" in log and calls[0] == 2, log[-400:]
+PY
+$PY - "$T" "$BIN" "$W" > t30b.log 2>&1 <<'PY' || fail "an unexpected error in the runner left its cells running: $(tail -3 t30b.log)"
+import os, subprocess, sys, time
+sys.path.insert(0, sys.argv[1]); import run
+BIN, W = sys.argv[2], sys.argv[3]
+engines = lambda r: len(subprocess.run(["pgrep", "-f", f"{W}/{r}/bin/evo_boids"], capture_output=True, text=True).stdout.split())
+calls = [0]
+def dp(guards):
+    calls[0] += 1
+    if calls[0] >= 2:
+        for _ in range(100):   # (wait until the admitted cell's engine runs)
+            if engines("root30b"):
+                break
+            time.sleep(0.05)
+        raise RuntimeError("test: the runner breaks")
+run.disk_problem = dp
+try:
+    rc = run.main(["--plan", "plan.jsonl", "--root", "root30b", "--binary", BIN, "--workers", "2", "--disk-min", "/:1"])
+except RuntimeError as e:
+    rc = f"raised {e}"
+left = engines("root30b")
+subprocess.run(["pkill", "-KILL", "-f", f"{W}/root30b/bin/evo_boids"])
+assert rc == "raised test: the runner breaks" and left == 0, (rc, left)
+assert "runner error" in open("root30b/runner.log").read()
 PY
 
 # 19. self-tests of the inference and bounded-scale modules

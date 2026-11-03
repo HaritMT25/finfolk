@@ -2,7 +2,7 @@
 """run.py: the invasion-matrix runner. Resumable, failure-propagating, bounded.
 
     run.py --plan PLAN.jsonl --root DIR --binary EVO_BOIDS [--workers N] [--mem-min-mb M]
-           [--prune] [--disk-min PATH:MB ...] [--quick-resume] [--update-tools]
+           [--prune] [--disk-min PATH:MB ...] [--quick-resume] [--update-tools | --update-runner]
     run.py --root DIR --status
     run.py --root DIR --prune-finished
     run.py --root DIR --replay CELL_ID --out EMPTY_DIR
@@ -17,11 +17,15 @@ cell runs in DIR/cells/<id>/:
                          and, unless the cell says keep_intermediate, deleted:
                          the run is bit-exact from arena.json + reseed)
     score.json           score.py (child-id derivation checked)
-    done.json            written atomically LAST, only after the process
-                         succeeded and the scorer's checks passed, and after
-                         every file it vouches for is fsync'd (the engine
-                         does not fsync; a crash once left durable done.json
-                         files over zero-length outputs)
+    done.json            written LAST, only after the process succeeded and the
+                         scorer's checks passed, by finalize(): every file it
+                         vouches for fsync'd, then the directory; done.json
+                         itself a temporary file fsync'd, renamed, and the
+                         directory fsync'd after the rename (the engine does
+                         not fsync; a crash once left durable done.json files
+                         over zero-length outputs); only then deletions, and
+                         the directory fsync'd again. The prune sweep uses the
+                         same protocol (review round 4)
 With --prune a finished cell keeps only cell.json, done.json, score.json,
 arena.manifest.json, run.csv, run.config.txt, stdout.log and
 run.births.csv.gz (see below): everything analyze.py and horizon.py read.
@@ -36,7 +40,10 @@ Rules:
     is going cannot reach a running cell (it once did: a cell imported a
     half-edited score.py). A later start with different sources keeps the
     pinned copy and says so; --update-tools replaces it (finished cells keep
-    the tool hashes they ran with in done.json);
+    the tool hashes they ran with in done.json), after putting the pinned
+    versions into DIR/store, and refuses if a finished cell needs a version
+    the store lacks; --update-runner replaces only run.py (the scoring tools
+    every cell ran with stay pinned);
   * so are the snapshots: plan.py registers each source file's SHA-256 in the
     cell (resident_sha256 / invader_sha256). Every registered file is checked
     before anything is admitted (a mismatch refuses the batch, exit 2) and
@@ -69,37 +76,49 @@ Rules:
   * --prune (an error bank: tens of thousands of cells, ~3.4 MB of checkpoints
     each): once a cell is scored and its checks passed (check_finished: every
     output matches its hash, the score reached the cell's last step with the
-    derivation checks passed, on these very arena and births files), its
-    arena.json, end.json and every end.<frame>.json are deleted and its birth
-    log is kept gzipped (run.births.csv.gz: level 9, mtime 0, lossless; zcat
-    gives the original bytes). Each deleted file is hashed against its record
-    first and its SHA-256 kept in done.json "pruned" (with the gzip's own hash,
-    verified by decompressing), so a replay is checked byte for byte. Order:
-    gzip + verify, done.json with the pruned record, then the deletions; a cell
-    stopped in between keeps extra files, which the next --prune start deletes.
-    At start --prune also prunes every finished cell not yet pruned (the same
-    checks first; a cell that fails them is left untouched and the runner exits
-    1) and strips failed attempts' checkpoints. --prune-finished runs only that
-    sweep. --prune overrides keep_intermediate. The pinned tools must support it
-    (--update-tools once);
+    derivation checks passed, on these very arena and births files) AND its
+    replay can be verified (replay_prereqs, review round 4: the pinned binary
+    is the cell's by hash; the scoring-tool versions it ran and the snapshots
+    its arena read are in DIR/store by content hash, copied there from the
+    pinned tools / registered paths while those still match), its arena.json,
+    end.json and every end.<frame>.json are deleted and its birth log is kept
+    gzipped (run.births.csv.gz: level 9, mtime 0, lossless; zcat gives the
+    original bytes). Each deleted file is hashed against its record first and
+    its SHA-256 kept in done.json "pruned" (with the gzip's own hash, verified
+    by decompressing), so a replay is checked byte for byte. Order (finalize):
+    gzip + verify, fsync what stays, done.json with the pruned record (durable),
+    then the deletions and a directory fsync; a cell stopped in between keeps
+    extra files, which the next --prune start deletes after revalidating the
+    cell. At start --prune also prunes every finished cell not yet pruned (the
+    same protocol; a cell that fails its checks is left untouched and the
+    runner exits 1; a cell whose replay provenance cannot be established, e.g.
+    from before tool pinning, keeps its checkpoints), checks that every cell
+    pruned earlier can still be replayed, and strips failed attempts'
+    checkpoints. --prune-finished runs only that sweep. --prune overrides
+    keep_intermediate. The pinned tools must support it (--update-runner once);
   * replay: a pruned cell's checkpoints come back exactly from the pinned
-    binary, the pinned tools, the registered snapshots and the cell's seeds:
+    binary, its tools, its snapshots and the cell's seeds:
         run.py --root DIR --replay CELL_ID --out EMPTY_DIR
     rebuilds arena.json, reruns the engine with the cell's recorded arguments,
     rescores, and compares arena.json, end.json, every periodic checkpoint,
     run.births.csv and score.json with the recorded SHA-256s (run.csv without
     its two timing columns, the manifest without its time stamp and paths);
     exit 0 only if every one matches (replay.json in EMPTY_DIR, which
-    keeps the replayed files). It needs DIR/bin/evo_boids, DIR/tools/{arena,
-    score,invlib}.py as the cell recorded them and the snapshot files at their
-    registered paths and hashes;
+    keeps the replayed files). It needs DIR/bin/evo_boids and the scoring
+    tools and snapshots the cell recorded: the pinned ones, or (if they have
+    been updated or moved since) their copies in DIR/store, rebuilt in
+    EMPTY_DIR/replay_tools;
   * disk guard, fail closed: before each cell every --disk-min PATH:MB must
     have MB free (statvfs f_bavail x f_frsize = df --output=avail). Default on
     WSL (/mnt/c mounted): / >= 10240 MB and /mnt/c >= 6000 MB (WSL's ext4.vhdx
     lives on the Windows drive, grows and never shrinks by itself); elsewhere
     DIR >= 1024 MB; 'none' disables it. Below a threshold, or with an
-    unreadable reading, the runner writes the reason into DIR/STOP and takes
-    the STOP path (no new cells, running cells finish, exit 75);
+    unreadable reading, the runner takes the STOP path (no new cells, running
+    cells finish, exit 75) and writes the reason into DIR/STOP. Admission stops
+    in memory first: a failed write (ENOSPC / EIO) of STOP, progress.json, the
+    logs or a new cell's directory does not break that path (review round 4),
+    and whatever else breaks the loop, the running cells' workers and engines
+    are terminated before the runner exits;
   * scratch files: each cell worker and its engine get TMPDIR (TMP, TEMP) = the
     cell's own tmp/, removed when the cell finishes (done.json counts what was
     left in it), so no cell leaves files under /tmp.
@@ -109,6 +128,7 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime
+import errno
 import fcntl
 import gzip
 import hashlib
@@ -387,27 +407,29 @@ def run_cell(root, cell_id, prune=False):
     if os.path.isdir(tmpd):
         done["tmp_files_left"] = sum(len(fs) for _, _, fs in os.walk(tmpd))
         shutil.rmtree(tmpd, ignore_errors=True)
-    if prune:
-        probs = check_finished(d, done)
-        try:
-            if probs:
-                raise PruneError("; ".join(probs))
-            done["pruned"] = prune_plan(d, done)
-        except (PruneError, OSError) as e:
-            print(f"PRUNE CHECK FAILED (nothing deleted): {e}", file=sys.stderr)
-            return 7
-    # done.json must not outlive the files it vouches for: the engine does not fsync its outputs
-    # (after the 2026-11-03 disk-full crash 8 finished cells had a durable done.json and score.json
-    # but zero-length end.json / run.births.csv / stdout.log). Flush what stays, then the directory.
-    gone = set(done["pruned"]["removed"]) | {BIRTHS} if prune else set()
-    fsync_files(d, [f for f in os.listdir(d) if f not in gone])
-    invlib.write_json_atomic(os.path.join(d, "done.json"), done)
-    if prune:
-        try:
-            prune_apply(d, done)
-        except (PruneError, OSError) as e:   # the cell is done; the next --prune start finishes the prune
-            print(f"warning: prune incomplete ({e})", file=sys.stderr)
+    try:
+        _, warn = finalize(root, d, done, prune)
+    except (PruneError, ProvenanceError, OSError) as e:
+        print(f"{'PRUNE CHECK FAILED' if prune else 'FINALIZE FAILED'} (nothing deleted, no done.json): {e}",
+              file=sys.stderr)
+        return 7
+    if warn:   # the cell is done; the next --prune start finishes its prune
+        print(f"warning: {warn}", file=sys.stderr)
     return 0
+
+
+# ------------------------------------------------------- durable finalization
+def fsync_dir(d):
+    """fsync a directory (its entries: a rename or unlink in it is durable after this). A
+    filesystem that cannot fsync a directory (EINVAL / ENOTSUP) is tolerated."""
+    fd = os.open(d, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    except OSError as e:
+        if e.errno not in (errno.EINVAL, errno.ENOTSUP, errno.EBADF):
+            raise
+    finally:
+        os.close(fd)
 
 
 def fsync_files(d, names):
@@ -420,11 +442,243 @@ def fsync_files(d, names):
                 os.fsync(fd)
             finally:
                 os.close(fd)
-    fd = os.open(d, os.O_RDONLY)
+    fsync_dir(d)
+
+
+def write_durable(path, obj):
+    """JSON (invlib.write_json_atomic's format) to a temporary file, fsync'd, renamed over path,
+    then the directory fsync'd AFTER the rename, so the new record is durable before anything it
+    describes is deleted (review round 4, P2-3). Self-contained: a pinned older invlib does not
+    change it."""
+    text = json.dumps(obj, indent=1, sort_keys=True, allow_nan=False) + "\n"
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+    fsync_dir(os.path.dirname(os.path.abspath(path)))
+
+
+def finalize(root, d, done, prune):
+    """THE finalization protocol of a finished cell, shared by a new cell (run_cell) and the sweep
+    (prune_finished) (review round 4, P2-3):
+      1. with prune: check_finished (the score is valid on these very files), replay_prereqs (a
+         replay can be verified: binary, tool versions and snapshots by content hash, see there),
+         then prune_plan (hash every checkpoint to go against its record, gzip the birth log
+         and verify it by decompressing; nothing deleted);
+      2. fsync every file that stays (the gzip included), then the directory (its entries);
+      3. done.json durably (write_durable: temporary file fsync'd, renamed, directory fsync'd);
+      4. with prune: the deletions (each file re-hashed against its record first), then the
+         directory fsync'd again.
+    A failed check raises before step 3 (PruneError, ProvenanceError for replay prerequisites):
+    nothing is deleted and no done.json is written. -> (bytes freed, warning or None): a failed
+    deletion after step 3 is only a warning (the next --prune start finishes it)."""
+    if prune:
+        probs = check_finished(d, done)
+        if probs:
+            raise PruneError("; ".join(probs))
+        probs = replay_prereqs(root, d, done)
+        if probs:
+            raise ProvenanceError("replay provenance not established: " + "; ".join(probs))
+        done["pruned"] = prune_plan(d, done)
+    gone = (set(done["pruned"]["removed"]) | set(done["pruned"].get("compressed") or {})) if prune else set()
+    fsync_files(d, [f for f in os.listdir(d) if f not in gone and not f.endswith(".tmp")])
+    write_durable(os.path.join(d, "done.json"), done)
+    if not prune:
+        return 0, None
     try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
+        freed = prune_apply(d, done)
+        fsync_dir(d)
+    except (PruneError, OSError) as e:
+        return 0, f"prune incomplete ({e})"
+    return freed, None
+
+
+def finish_prune(root, d, done):
+    """Complete an interrupted prune (done.json has its 'pruned' record but files it lists are
+    still there): REVALIDATE first (review round 4: this branch used to delete without
+    check_finished) - the score check, the record itself (every listed file still present matches
+    its hash, the gzip matches and decompresses to the recorded birth log) and the replay
+    prerequisites - then flush what stays (done.json included), delete, fsync the directory.
+    -> bytes freed; raises PruneError / ProvenanceError with nothing deleted."""
+    probs = check_finished(d, done) + check_prune_record(d, done)
+    if probs:
+        raise PruneError("; ".join(probs))
+    probs = replay_prereqs(root, d, done)
+    if probs:
+        raise ProvenanceError("replay provenance not established: " + "; ".join(probs))
+    gone = set(done["pruned"]["removed"]) | set(done["pruned"].get("compressed") or {})
+    fsync_files(d, [f for f in os.listdir(d) if f not in gone and not f.endswith(".tmp")])
+    freed = prune_apply(d, done)
+    fsync_dir(d)
+    return freed
+
+
+def prune_leftovers(d, done):
+    """Files a 'pruned' record lists for deletion that are still present."""
+    pr = done.get("pruned") or {}
+    return [f for f in list(pr.get("removed") or {}) + list(pr.get("compressed") or {}) if os.path.exists(os.path.join(d, f))]
+
+
+def check_prune_record(d, done):
+    """Problems of a 'pruned' record against the directory (see finish_prune)."""
+    pr = done.get("pruned") or {}
+    bad = []
+    if pr.get("schema") != PRUNE_SCHEMA:
+        bad.append(f"pruned record schema {pr.get('schema')!r}")
+    for f, h in (pr.get("removed") or {}).items():
+        p = os.path.join(d, f)
+        if os.path.exists(p) and invlib.sha256_file(p) != h:
+            bad.append(f"{f} is not the file the prune recorded")
+    for f, rec in (pr.get("compressed") or {}).items():
+        gz = os.path.join(d, rec.get("file", ""))
+        if not os.path.isfile(gz) or invlib.sha256_file(gz) != rec.get("sha256"):
+            bad.append(f"{rec.get('file')} missing or not the recorded gzip")
+        elif gunzip_sha256(gz) != (done.get("outputs") or {}).get(f):
+            bad.append(f"{rec.get('file')} does not decompress to the recorded {f}")
+    return bad
+
+
+# ------------------------------------------------- replay provenance (the store)
+# Review round 4, P1-2: before pruning deletes the last usable simulation state of a cell, a
+# verified replay must be possible. DIR/store/<sha256> keeps, by content hash, every scoring-tool
+# version (invlib / arena / score) and every snapshot a pruned cell read; --update-tools puts the
+# pinned versions there before replacing them and refuses if a finished cell needs a version the
+# store lacks; a replay whose cell ran other tools rebuilds that version set from the store, and
+# a snapshot missing or changed at its path is read from the store. The binary is pinned per root
+# (a different one is refused) and checked by hash.
+STORE = "store"
+REPLAY_TOOLS = "replay_tools"   # --replay OUT/replay_tools: a cell's stored scoring-tool versions + this run.py
+_STORE_OK = set()   # blobs verified by this process
+_BIN_SHA = {}
+
+
+class ProvenanceError(Exception):
+    """A finished cell whose replay could not be verified: it keeps its checkpoints."""
+
+
+def store_path(root, sha):
+    return os.path.join(root, STORE, sha)
+
+
+def store_has(root, sha):
+    """The store holds a blob with this content (hash-verified once per process)."""
+    if not sha:
+        return False
+    if (root, sha) in _STORE_OK:
+        return True
+    p = store_path(root, sha)
+    if os.path.isfile(p) and invlib.sha256_file(p) == sha:
+        _STORE_OK.add((root, sha))
+        return True
+    return False
+
+
+def store_put(root, src, want=None):
+    """Copy src into the store under its SHA-256: idempotent, atomic (a per-process temporary
+    file, fsync'd, verified, read-only, renamed; the store directory fsync'd), safe for
+    concurrent workers. want: the content src must have. -> the hash; raises ProvenanceError."""
+    sha = invlib.sha256_file(src)
+    if want is not None and sha != want:
+        raise ProvenanceError(f"{src} is {sha[:12]}, not the needed {want[:12]}")
+    if store_has(root, sha):
+        return sha
+    sd = os.path.join(root, STORE)
+    os.makedirs(sd, exist_ok=True)
+    tmp = f"{store_path(root, sha)}.tmp.{os.getpid()}"
+    shutil.copyfile(src, tmp)
+    with open(tmp, "rb") as f:
+        os.fsync(f.fileno())
+    if invlib.sha256_file(tmp) != sha:
+        os.remove(tmp)
+        raise ProvenanceError(f"{src} changed while it was copied into the store")
+    os.chmod(tmp, 0o444)
+    os.replace(tmp, store_path(root, sha))
+    fsync_dir(sd)
+    _STORE_OK.add((root, sha))
+    return sha
+
+
+def needed_versions_missing(root):
+    """Scoring-tool versions some finished cell under DIR/cells ran with that the store lacks
+    (a cell's replay rebuilds its version set from there). -> sorted ['file sha', ...]."""
+    cdir = os.path.join(root, "cells")
+    need = set()
+    for x in (os.listdir(cdir) if os.path.isdir(cdir) else []):
+        p = os.path.join(cdir, x, "done.json")
+        if ".attempt" in x or not os.path.isfile(p):
+            continue
+        try:
+            t = json.load(open(p)).get("tools_sha256") or {}
+        except ValueError:
+            continue
+        need |= {(f, t[f]) for f in SCORING_TOOLS if t.get(f)}
+    return sorted(f"{f} {h[:12]}" for f, h in need if not store_has(root, h))
+
+
+def _pinned_binary_sha(root):
+    if root not in _BIN_SHA:
+        p = os.path.join(root, "bin", "evo_boids")
+        _BIN_SHA[root] = invlib.sha256_file(p) if os.path.isfile(p) else None
+    return _BIN_SHA[root]
+
+
+def replay_prereqs(root, d, done, put=True):
+    """What a verified replay of this finished cell needs (review round 4, P1-2), checked before
+    anything of it is deleted: the pinned binary is the one the cell ran (done.json's hash); every
+    scoring tool the cell ran (done.json tools_sha256: a cell from before tool pinning has none)
+    is in the store by content hash, put there from the pinned tools if they still are that
+    version; every snapshot the arena read (its manifest's hash, which must be the plan's
+    registered one) is in the store, put there from its registered path if that file still has
+    that content; the engine command is recorded. -> problems, [] if a replay can be verified."""
+    probs = []
+    c = done.get("cell") or {}
+    bh = done.get("binary_sha256")
+    if not bh:
+        probs.append("done.json records no binary hash")
+    elif _pinned_binary_sha(root) != bh:
+        probs.append(f"the pinned binary is not the {bh[:12]} this cell ran")
+    if not isinstance(done.get("command"), list) or not done["command"]:
+        probs.append("done.json records no engine command")
+    tools = done.get("tools_sha256") or {}
+    want = []
+    for f in SCORING_TOOLS:
+        h = tools.get(f)
+        if not h:
+            probs.append(f"done.json records no {f} hash (a cell from before tool pinning)")
+        else:   # from the pinned copy, or the copy this process runs (a cell worker runs the pinned one)
+            want.append((f"{f} {h[:12]}", h, [os.path.join(root, "tools", f), os.path.join(HERE, f)]))
+    try:
+        man = json.load(open(os.path.join(d, "arena.manifest.json")))
+    except (OSError, ValueError) as e:
+        probs.append(f"arena.manifest.json unreadable ({e})")
+        man = {}
+    for role in ("resident", "invader"):
+        if not c.get(role):
+            continue
+        h, reg = (man.get(role) or {}).get("sha256"), c.get(f"{role}_sha256")
+        if not h:
+            probs.append(f"the arena manifest records no {role} snapshot hash")
+        elif reg and reg != h:
+            probs.append(f"the arena read {role} {h[:12]}, the plan registered {reg[:12]}")
+        else:
+            want.append((f"{role} snapshot {h[:12]} ({c[role]})", h, [c[role]]))
+    for what, h, srcs in want:
+        if store_has(root, h):
+            continue
+        ok = False
+        for s in srcs:
+            if put and os.path.isfile(s):
+                try:
+                    store_put(root, s, h)
+                    ok = True
+                    break
+                except (ProvenanceError, OSError):
+                    pass
+        if not ok:
+            probs.append(f"{what}: no copy of that version (stored, pinned or at its path)")
+    return probs
 
 
 # ------------------------------------------------------------------- pruning
@@ -577,12 +831,18 @@ def strip_attempt(d):
 
 
 def prune_finished(root, log):
-    """Prune every finished cell under DIR/cells not pruned yet (check_finished first), finish
-    interrupted prunes and strip failed attempts. -> [(cell, problems)]: those cells are untouched."""
+    """Prune every finished cell under DIR/cells not pruned yet, through finalize() (the protocol
+    new cells use: the score check, the replay prerequisites, flush, durable done.json, delete);
+    finish interrupted prunes after revalidating them (finish_prune); check that every cell pruned
+    earlier still has its replay prerequisites; strip failed attempts.
+    A cell whose replay provenance cannot be established (e.g. from before tool pinning) keeps its
+    checkpoints: listed, not an error. -> [(cell, problems)]: integrity problems (a cell that fails
+    its score check, a broken prune record, a pruned cell whose replay can no longer be verified);
+    those cells are left as they are and the caller should stop."""
     cdir = os.path.join(root, "cells")
     names = sorted(os.listdir(cdir)) if os.path.isdir(cdir) else []
-    n_new = n_old = n_att = freed = 0
-    bad = []
+    n_new = n_old = n_fin = n_att = freed = 0
+    bad, kept = [], []
     t0 = time.time()
     for k, x in enumerate(names, 1):
         d = os.path.join(cdir, x)
@@ -599,22 +859,27 @@ def prune_finished(root, log):
                 continue
             done = json.load(open(dp))
             if "pruned" in done:
-                freed += prune_apply(d, done)
-                n_old += 1
+                if prune_leftovers(d, done):
+                    freed += finish_prune(root, d, done)
+                    n_fin += 1
+                else:
+                    probs = replay_prereqs(root, d, done)
+                    if probs:
+                        bad.append((x, ["pruned earlier, and its replay can no longer be verified: " + "; ".join(probs)]))
+                    n_old += 1
                 continue
-            probs = check_finished(d, done)
-            if probs:
-                bad.append((x, probs))
-                continue
-            done["pruned"] = prune_plan(d, done)
-            invlib.write_json_atomic(dp, done)
-            freed += prune_apply(d, done)
+            freed += finalize(root, d, done, prune=True)[0]
             n_new += 1
+        except ProvenanceError as e:
+            kept.append((x, str(e)))
         except (PruneError, OSError, ValueError, KeyError) as e:
-            bad.append((x, [repr(e)]))
-    log(f"prune sweep: {n_new} finished cells pruned now, {n_old} already pruned, {n_att} failed attempts "
-        f"stripped, {freed / 1e6:.1f} MB freed, {len(bad)} cell(s) with problems (left untouched), "
+            bad.append((x, [str(e) if isinstance(e, PruneError) else repr(e)]))
+    log(f"prune sweep: {n_new} finished cells pruned now, {n_old} already pruned, {n_fin} interrupted prunes "
+        f"finished, {n_att} failed attempts stripped, {freed / 1e6:.1f} MB freed, {len(kept)} kept unpruned "
+        f"(replay provenance not established), {len(bad)} cell(s) with problems (left untouched), "
         f"{time.time() - t0:.0f} s")
+    for x, why in kept[:10]:
+        log(f"  KEPT (checkpoints stay) {x}: {why[:400]}")
     for x, probs in bad[:10]:
         log(f"  NOT PRUNED {x}: {'; '.join(probs)[:400]}")
     return bad
@@ -626,22 +891,37 @@ def replay_cell(root, cid, out):
     compare every recorded hash. -> 0 all identical, 8 a mismatch, 2 / 3-6 refusals / failures."""
     d = os.path.join(root, "cells", cid)
     done = json.load(open(os.path.join(d, "done.json")))
-    c = done["cell"]
+    c = dict(done["cell"])
     for f in SCORING_TOOLS:
-        if invlib.sha256_file(os.path.join(HERE, f)) != done["tools_sha256"].get(f):
+        if invlib.sha256_file(os.path.join(HERE, f)) != (done.get("tools_sha256") or {}).get(f):
             print(f"{os.path.join(HERE, f)} is not the {f} this cell ran with", file=sys.stderr)
             return 2
     exe = os.path.join(root, "bin", "evo_boids")
     if invlib.sha256_file(exe) != done["binary_sha256"]:
         print(f"{exe} is not the binary this cell ran with", file=sys.stderr)
         return 2
-    bad = snapshot_problems(c)
-    if bad:
-        print("SNAPSHOT CHANGED since planning: " + "; ".join(bad), file=sys.stderr)
-        return 5
+    # the snapshots: the very content the arena read (its manifest's hash); from the registered path
+    # if it still has it, else from the root's store (review round 4)
+    man0 = json.load(open(os.path.join(d, "arena.manifest.json")))
+    snap_from = {}
+    for role in ("resident", "invader"):
+        if not c.get(role):
+            continue
+        h = (man0.get(role) or {}).get("sha256") or c.get(f"{role}_sha256")
+        if c.get(f"{role}_sha256") and h != c[f"{role}_sha256"]:
+            print(f"the arena read {role} {h[:12]}, the plan registered {c[role + '_sha256'][:12]}", file=sys.stderr)
+            return 5
+        if os.path.isfile(c[role]) and invlib.sha256_file(c[role]) == h:
+            snap_from[role] = "registered path"
+        elif store_has(root, h):
+            c[role] = store_path(root, h)
+            snap_from[role] = "store"
+        else:
+            print(f"SNAPSHOT {role} {h[:12]} is neither at {c[role]} nor in {root}/{STORE}", file=sys.stderr)
+            return 5
     out = os.path.abspath(out)
     os.makedirs(out, exist_ok=True)
-    if os.listdir(out):
+    if [f for f in os.listdir(out) if f != REPLAY_TOOLS]:
         print(f"--out {out} must be an empty directory", file=sys.stderr)
         return 2
     os.nice(19 - os.nice(0))
@@ -668,6 +948,9 @@ def replay_cell(root, cid, out):
         m["output"] = {"sha256": m["output"]["sha256"]}
         if m.get("binary"):
             m["binary"] = {"sha256": m["binary"]["sha256"]}
+        for role in snap_from:   # a snapshot read from the store has the store's path (same content)
+            if snap_from[role] == "store" and isinstance(m.get(role), dict):
+                m[role] = {k_: v for k_, v in m[role].items() if k_ != "path"}
         return m
     checks["arena.manifest.json (but its time stamp, output and binary paths)"] = \
         man_key(os.path.join(out, "arena.manifest.json")) == man_key(os.path.join(d, "arena.manifest.json"))
@@ -680,7 +963,9 @@ def replay_cell(root, cid, out):
     invlib.write_json_atomic(os.path.join(out, "replay.json"), {
         "schema": "finfolk.invasion.replay/1", "utc": now(), "root": root, "cell": cid, "identical": ok,
         "checks": checks, "binary_sha256": done["binary_sha256"],
-        "tools_sha256": {f: done["tools_sha256"][f] for f in SCORING_TOOLS}})
+        "tools_sha256": {f: done["tools_sha256"][f] for f in SCORING_TOOLS},
+        "tools_from": "the store (a version set no longer pinned)" if os.path.basename(HERE) == REPLAY_TOOLS
+                      else "the pinned tools", "snapshots_from": snap_from})
     for k, v in checks.items():
         print(f"{'same     ' if v else 'DIFFERENT'} {k}")
     print(f"replay {cid}: {'identical' if ok else 'MISMATCH'} ({sum(checks.values())}/{len(checks)} checks) -> {out}")
@@ -772,7 +1057,11 @@ def main(argv=None):
     ap.add_argument("--quick-resume", action="store_true",
                     help="skip re-hashing finished cells' outputs (existence only)")
     ap.add_argument("--update-tools", action="store_true",
-                    help="replace DIR/tools with the current tools/invasion sources")
+                    help="replace DIR/tools with the current tools/invasion sources (the pinned versions go into "
+                         "DIR/store first; refused if a finished cell needs a version the store lacks)")
+    ap.add_argument("--update-runner", action="store_true",
+                    help="replace only the pinned run.py (the cell finalization and replay driver); the scoring "
+                         "tools (invlib, arena, score) every cell ran with stay pinned")
     ap.add_argument("--prune", action="store_true",
                     help="delete each scored cell's arena / end / periodic checkpoints (they replay exactly), "
                          "keep its birth log gzipped; at start, prune the finished cells not pruned yet")
@@ -794,13 +1083,35 @@ def main(argv=None):
     if a.replay:
         if not a.out:
             ap.error("--replay needs --out EMPTY_DIR")
-        pinned_run = os.path.join(root, "tools", "run.py")
-        if not os.path.exists(pinned_run) or "def replay_cell(" not in open(pinned_run).read():
-            print(f"the pinned tools in {root}/tools predate --replay (start the runner once with --update-tools)",
-                  file=sys.stderr)
+        out = os.path.abspath(a.out)
+        if os.path.isdir(out) and os.listdir(out):
+            print(f"--out {out} must be an empty directory", file=sys.stderr)
             return 2
-        return subprocess.call([sys.executable, "-I", pinned_run, "--root", root, "--_replay", a.replay,
-                                os.path.abspath(a.out)])
+        done = json.load(open(os.path.join(root, "cells", a.replay, "done.json")))
+        need = {f: (done.get("tools_sha256") or {}).get(f) for f in SCORING_TOOLS}
+        tdir = os.path.join(root, "tools")
+        pinned = {f: invlib.sha256_file(os.path.join(tdir, f)) if os.path.isfile(os.path.join(tdir, f)) else None
+                  for f in SCORING_TOOLS}
+        pinned_run = os.path.join(tdir, "run.py")
+        snaps_ok = all(os.path.isfile(done["cell"][r]) and invlib.sha256_file(done["cell"][r]) == done["cell"].get(f"{r}_sha256")
+                       for r in ("resident", "invader") if done["cell"].get(r) and done["cell"].get(f"{r}_sha256"))
+        if pinned == need and snaps_ok and os.path.exists(pinned_run) and "def replay_cell(" in open(pinned_run).read():
+            runner = pinned_run   # the pinned copy, as the cell ran
+        else:
+            # the cell ran scoring tools that are no longer pinned (--update-tools since), or a snapshot
+            # left its path: its version set comes back from the store by content hash (review round 4),
+            # with this run.py as the replay driver (the run.py version is not part of the check)
+            missing = [f"{f} {str(h)[:12]}" for f, h in need.items() if not store_has(root, h)]
+            if missing:
+                print(f"cannot replay {a.replay}: no stored copy of {', '.join(missing)}", file=sys.stderr)
+                return 2
+            rdir = os.path.join(out, REPLAY_TOOLS)
+            os.makedirs(rdir, exist_ok=True)
+            for f, h in need.items():
+                shutil.copyfile(store_path(root, h), os.path.join(rdir, f))
+            shutil.copyfile(os.path.abspath(__file__), os.path.join(rdir, "run.py"))
+            runner = os.path.join(rdir, "run.py")
+        return subprocess.call([sys.executable, "-I", runner, "--root", root, "--_replay", a.replay, out])
     if not a.prune_finished and not (a.plan and a.binary):
         ap.error("--plan and --binary are required to run")
     if not 1 <= a.workers <= 4:
@@ -817,12 +1128,17 @@ def main(argv=None):
     os.nice(19 - os.nice(0))   # everything below (and every child) at nice 19
 
     logf = open(os.path.join(root, "runner.log"), "a")
+    log_lost = [0]   # lines a failing write (a full disk: ENOSPC / EIO) could not record
 
     def log(msg):
+        # never raises: the clean-stop paths log, and they must work when the disk is full (review round 4)
         line = f"{now()} {msg}"
-        print(line, flush=True)
-        logf.write(line + "\n")
-        logf.flush()
+        for out in (sys.stdout, logf):
+            try:
+                out.write(line + "\n")
+                out.flush()
+            except (OSError, ValueError):
+                log_lost[0] += 1
 
     if a.prune_finished:
         return 1 if prune_finished(root, log) else 0
@@ -847,21 +1163,43 @@ def main(argv=None):
     tdir = os.path.join(root, "tools")
     src = {f: invlib.sha256_file(os.path.join(HERE, f)) for f in TOOL_FILES}
     if os.path.abspath(HERE) != os.path.abspath(tdir):
-        if not os.path.isdir(tdir) or a.update_tools:
+        fresh = not os.path.isdir(tdir)
+        if fresh or a.update_tools or a.update_runner:
+            files = TOOL_FILES if fresh or a.update_tools else ("run.py",)
+            if not fresh:
+                # review round 4, P1-2: an update must not discard a version a finished cell needs (its
+                # replay rebuilds that version set from the store): the pinned copies go into the store
+                # first, and every finished cell's scoring-tool versions must be there before anything
+                # is replaced
+                try:
+                    for f in TOOL_FILES:
+                        if os.path.isfile(os.path.join(tdir, f)):
+                            store_put(root, os.path.join(tdir, f))
+                    lost = needed_versions_missing(root)
+                except (OSError, ProvenanceError) as e:
+                    print(f"--update-tools: could not keep the pinned versions in {root}/{STORE} ({e}): "
+                          "nothing replaced", file=sys.stderr)
+                    return 2
+                if lost:
+                    print(f"--update-tools refused: finished cells need tool versions the store lacks: {lost[:5]}",
+                          file=sys.stderr)
+                    return 2
             os.makedirs(tdir, exist_ok=True)
-            for f in TOOL_FILES:
+            for f in files:
                 shutil.copy2(os.path.join(HERE, f), os.path.join(tdir, f))
-            log(f"tools pinned in {tdir}: " + " ".join(f"{f}={h[:10]}" for f, h in src.items()))
+            log(f"tools pinned in {tdir}: " + " ".join(f"{f}={src[f][:10]}" for f in files)
+                + ("" if fresh else f" (the previous versions kept in {root}/{STORE})"))
         else:
             pin = {f: invlib.sha256_file(os.path.join(tdir, f)) for f in TOOL_FILES}
             if pin != src:
                 log(f"note: tools/invasion differs from the pinned {tdir}; running the pinned copy "
-                    f"(--update-tools to replace it)")
+                    f"(--update-tools / --update-runner to replace it)")
     cell_runner = os.path.join(tdir, "run.py")
     if a.prune:
-        if "def prune_plan(" not in open(cell_runner).read():
-            print(f"--prune: the pinned {cell_runner} predates pruning (its cells would not prune); "
-                  "start once with --update-tools", file=sys.stderr)
+        if "def replay_prereqs(" not in open(cell_runner).read():
+            print(f"--prune: the pinned {cell_runner} predates the replay-provenance checks before pruning (review "
+                  "round 4; its cells would delete checkpoints unchecked); start once with --update-runner",
+                  file=sys.stderr)
             return 2
         log("pruning on: a scored cell's arena / end / periodic checkpoints are deleted (replay: run.py --root "
             f"{root} --replay CELL_ID --out EMPTY_DIR), its birth log kept as {BIRTHS_GZ}")
@@ -904,19 +1242,24 @@ def main(argv=None):
     stop_reason = None
     attempts = open(os.path.join(root, "attempts.tsv"), "a")
 
-    def terminate(signum, frame):
+    def kill_running(why):
         # every cell worker leads its own process group (start_new_session), which its engine
         # joins: signal the whole group, reap the worker, and wait until the group is empty, so
         # no engine keeps writing after the lock is released
-        for p, _, _ in running.values():
+        n = len(running)
+        for p, _, _ in list(running.values()):
             try:
                 os.killpg(p.pid, signal.SIGTERM)
             except ProcessLookupError:
                 pass
-        for p, _, _ in running.values():
+        for p, _, _ in list(running.values()):
             p.wait()
             stop_group(p.pid, log)
-        log(f"signal {signum}: terminated {len(running)} running cells and their engines")
+        running.clear()
+        log(f"{why}: terminated {n} running cells and their engines")
+
+    def terminate(signum, frame):
+        kill_running(f"signal {signum}")
         sys.exit(130)
     signal.signal(signal.SIGINT, terminate)
     signal.signal(signal.SIGTERM, terminate)
@@ -927,96 +1270,140 @@ def main(argv=None):
     rss_mb = 0       # largest engine RSS seen this session (the per-cell reserve)
     t_start = time.time()
     n_before = len(cells) - len(todo)
+    persist_failed = []   # progress / STOP writes that failed (a full disk): the state stays in memory
 
     def progress(state="running"):
-        """DIR/progress.json: done / total, this session's rate and the projected finish."""
+        """DIR/progress.json: done / total, this session's rate and the projected finish. Never raises
+        (review round 4: a full disk must not break the clean-stop path)."""
         el = time.time() - t_start
         rate = n_done / el * 3600 if el > 0 else 0.0
         left = len(cells) - n_before - n_done
         eta = (datetime.datetime.now() + datetime.timedelta(hours=left / rate)).isoformat(timespec="seconds") \
             if rate > 0 and left > 0 else None
-        invlib.write_json_atomic(os.path.join(root, "progress.json"), {
-            "state": state, "updated": now(), "plan": os.path.abspath(a.plan), "total": len(cells),
-            "done": n_before + n_done, "failed": failed, "running": len(running), "queued": len(queue),
-            "workers": a.workers, "session_cells_per_hour": rate, "projected_finish": eta,
-            "prune": a.prune, "stop_reason": stop_reason,
-            "disk_free_mb": {p: _free_or(p) for p, _ in guards}, "disk_min_mb": {p: mb for p, mb in guards}})
-    progress()
-    while queue or running:
-        # reap
-        for pid in list(running):
-            p, cid, t0 = running[pid]
-            rc = p.poll()
-            if rc is None:
-                continue
-            del running[pid]
-            dt = time.time() - t0
-            attempts.write(f"{now()}\t{cid}\t{rc}\t{dt:.1f}\n")
-            attempts.flush()
-            if rc == 0 and os.path.exists(os.path.join(root, "cells", cid, "done.json")):
-                n_done += 1
-                try:
-                    kb = json.load(open(os.path.join(root, "cells", cid, "done.json")))["timing"]["engine_maxrss_kb"]
-                    rss_mb = max(rss_mb, kb // 1024)
-                except (OSError, ValueError, KeyError):
-                    pass
-                if n_done % 10 == 0 or not queue:
-                    log(f"done {n_done}/{len(todo)} (last {cid}, {dt:.0f}s)")
-            else:
-                failed.append(cid)
-                err = open(os.path.join(root, "cells", cid, "cell.stderr.log")).read()[-400:]
-                log(f"FAILED {cid} (exit {rc}): {err.strip()}")
-            progress()
-        # admission
-        if os.path.exists(os.path.join(root, "STOP")) and stop_reason is None:
-            stop_reason = "STOP"
-            log(f"STOP file: no new cells; waiting for {len(running)}")
-        admit = stop_reason is None and not failed
-        while admit and queue and len(running) < a.workers:
-            why = disk_problem(guards)   # before each cell
-            if why:
-                stop_reason = f"disk guard: {why}"
-                invlib.write_atomic(os.path.join(root, "STOP"), f"{now()} {stop_reason}\n")
-                log(f"DISK GUARD: {why}; wrote the reason to {root}/STOP; no new cells; waiting for {len(running)}")
-                progress()
-                admit = False
-                break
-            head = mem_headroom_mb()
-            if head is None:
-                mem_bad += 1
-                if mem_bad == 1:
-                    log("memory reading unavailable or malformed: admitting nothing (fail closed)")
-                if not running and mem_bad >= 20:
-                    log("memory reading still unavailable with nothing running: exiting")
-                    return 2
-                break
-            mem_bad = 0
-            if head < a.mem_min_mb + max(150, rss_mb + 64):
-                break
-            spec = queue.pop(0)
-            d = os.path.join(root, "cells", spec["id"])
-            if os.path.exists(d):
-                k = 1
-                while os.path.exists(f"{d}.attempt{k}"):
-                    k += 1
-                os.rename(d, f"{d}.attempt{k}")
-                if a.prune:
-                    strip_attempt(f"{d}.attempt{k}")
-            os.makedirs(d)
-            invlib.write_json_atomic(os.path.join(d, "cell.json"), spec)
-            tmpd = os.path.join(d, "tmp")
-            os.makedirs(tmpd)
-            err = open(os.path.join(d, "cell.stderr.log"), "w")
-            p = subprocess.Popen([sys.executable, "-I", cell_runner, "--root", root, "--_cell", spec["id"]]
-                                 + (["--prune"] if a.prune else []), stdout=err, stderr=subprocess.STDOUT,
-                                 stdin=subprocess.DEVNULL, start_new_session=True, preexec_fn=die_with_parent,
-                                 env=dict(os.environ, TMPDIR=tmpd, TMP=tmpd, TEMP=tmpd))
-            err.close()
-            running[p.pid] = (p, spec["id"], time.time())
-        if not admit and not running:
-            break
-        time.sleep(0.5)
+        try:
+            invlib.write_json_atomic(os.path.join(root, "progress.json"), {
+                "state": state, "updated": now(), "plan": os.path.abspath(a.plan), "total": len(cells),
+                "done": n_before + n_done, "failed": failed, "running": len(running), "queued": len(queue),
+                "workers": a.workers, "session_cells_per_hour": rate, "projected_finish": eta,
+                "prune": a.prune, "stop_reason": stop_reason,
+                "disk_free_mb": {p: _free_or(p) for p, _ in guards}, "disk_min_mb": {p: mb for p, mb in guards}})
+        except OSError as e:
+            if not persist_failed:
+                log(f"warning: progress.json not written ({e}); carrying on (the state is in memory)")
+            persist_failed.append("progress.json")
 
+    def stop_admission(reason, persist=True):
+        """Stop admitting cells: in memory FIRST, so admission stops even if nothing can be written;
+        then (best effort) the reason into DIR/STOP; running cells finish; exit 75."""
+        nonlocal stop_reason
+        stop_reason = reason
+        if persist:
+            try:
+                invlib.write_atomic(os.path.join(root, "STOP"), f"{now()} {reason}\n")
+                where = f"wrote the reason to {root}/STOP"
+            except OSError as e:
+                persist_failed.append("STOP")
+                where = f"could NOT write {root}/STOP ({e}); stopping anyway"
+            log(f"{reason}; {where}; no new cells; waiting for {len(running)}")
+        progress()
+
+    progress()
+    try:
+        while queue or running:
+            # reap
+            for pid in list(running):
+                p, cid, t0 = running[pid]
+                rc = p.poll()
+                if rc is None:
+                    continue
+                del running[pid]
+                dt = time.time() - t0
+                try:
+                    attempts.write(f"{now()}\t{cid}\t{rc}\t{dt:.1f}\n")
+                    attempts.flush()
+                except OSError:
+                    persist_failed.append("attempts.tsv")
+                if rc == 0 and os.path.exists(os.path.join(root, "cells", cid, "done.json")):
+                    n_done += 1
+                    try:
+                        kb = json.load(open(os.path.join(root, "cells", cid, "done.json")))["timing"]["engine_maxrss_kb"]
+                        rss_mb = max(rss_mb, kb // 1024)
+                    except (OSError, ValueError, KeyError):
+                        pass
+                    if n_done % 10 == 0 or not queue:
+                        log(f"done {n_done}/{len(todo)} (last {cid}, {dt:.0f}s)")
+                else:
+                    failed.append(cid)
+                    try:
+                        err = open(os.path.join(root, "cells", cid, "cell.stderr.log")).read()[-400:]
+                    except OSError as e:
+                        err = f"(cell.stderr.log unreadable: {e})"
+                    log(f"FAILED {cid} (exit {rc}): {err.strip()}")
+                progress()
+            # admission
+            if os.path.exists(os.path.join(root, "STOP")) and stop_reason is None:
+                stop_admission("STOP", persist=False)
+                log(f"STOP file: no new cells; waiting for {len(running)}")
+            admit = stop_reason is None and not failed
+            while admit and queue and len(running) < a.workers:
+                why = disk_problem(guards)   # before each cell
+                if why:
+                    stop_admission(f"disk guard: {why}")
+                    admit = False
+                    break
+                head = mem_headroom_mb()
+                if head is None:
+                    mem_bad += 1
+                    if mem_bad == 1:
+                        log("memory reading unavailable or malformed: admitting nothing (fail closed)")
+                    if not running and mem_bad >= 20:
+                        log("memory reading still unavailable with nothing running: exiting")
+                        return 2
+                    break
+                mem_bad = 0
+                if head < a.mem_min_mb + max(150, rss_mb + 64):
+                    break
+                spec = queue.pop(0)
+                d = os.path.join(root, "cells", spec["id"])
+                try:
+                    if os.path.exists(d):
+                        k = 1
+                        while os.path.exists(f"{d}.attempt{k}"):
+                            k += 1
+                        os.rename(d, f"{d}.attempt{k}")
+                        if a.prune:
+                            strip_attempt(f"{d}.attempt{k}")
+                    os.makedirs(d)
+                    invlib.write_json_atomic(os.path.join(d, "cell.json"), spec)
+                    tmpd = os.path.join(d, "tmp")
+                    os.makedirs(tmpd)
+                    err = open(os.path.join(d, "cell.stderr.log"), "w")
+                except OSError as e:
+                    # a write failure while admitting (e.g. ENOSPC): the cell goes back to the queue (its
+                    # partial directory becomes an attempt on resume) and admission stops cleanly
+                    queue.insert(0, spec)
+                    stop_admission(f"admission failed: {e}")
+                    admit = False
+                    break
+                p = subprocess.Popen([sys.executable, "-I", cell_runner, "--root", root, "--_cell", spec["id"]]
+                                     + (["--prune"] if a.prune else []), stdout=err, stderr=subprocess.STDOUT,
+                                     stdin=subprocess.DEVNULL, start_new_session=True, preexec_fn=die_with_parent,
+                                     env=dict(os.environ, TMPDIR=tmpd, TMP=tmpd, TEMP=tmpd))
+                err.close()
+                running[p.pid] = (p, spec["id"], time.time())
+            if not admit and not running:
+                break
+            time.sleep(0.5)
+    except BaseException as e:
+        # guaranteed cleanup (review round 4): whatever breaks the loop, no cell worker or engine outlives
+        # the runner (terminate() has already done this for a signal)
+        if running and not isinstance(e, SystemExit):
+            kill_running(f"runner error {e!r}")
+        raise
+
+    if persist_failed:
+        log(f"note: {len(persist_failed)} state write(s) failed this session ({sorted(set(persist_failed))}); "
+            f"{log_lost[0]} log line(s) lost")
     if failed:
         progress("stopped: failed cell(s)")
         log(f"stopped: {len(failed)} failed cell(s): {failed[:5]}")
