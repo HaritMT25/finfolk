@@ -80,7 +80,9 @@ Rules:
     replay can be verified (replay_prereqs, review round 4: the pinned binary
     is the cell's by hash; the scoring-tool versions it ran and the snapshots
     its arena read are in DIR/store by content hash, copied there from the
-    pinned tools / registered paths while those still match), its arena.json,
+    pinned tools / registered paths while those still match; round 5: all of
+    them, the pinned binary and the directories holding them fsync'd before
+    any deletion, durability_barrier), its arena.json,
     end.json and every end.<frame>.json are deleted and its birth log is kept
     gzipped (run.births.csv.gz: level 9, mtime 0, lossless; zcat gives the
     original bytes). Each deleted file is hashed against its record first and
@@ -450,7 +452,10 @@ def write_durable(path, obj):
     then the directory fsync'd AFTER the rename, so the new record is durable before anything it
     describes is deleted (review round 4, P2-3). Self-contained: a pinned older invlib does not
     change it."""
-    text = json.dumps(obj, indent=1, sort_keys=True, allow_nan=False) + "\n"
+    write_durable_text(path, json.dumps(obj, indent=1, sort_keys=True, allow_nan=False) + "\n")
+
+
+def write_durable_text(path, text):
     tmp = path + ".tmp"
     with open(tmp, "w") as f:
         f.write(text)
@@ -458,6 +463,25 @@ def write_durable(path, obj):
         os.fsync(f.fileno())
     os.replace(tmp, path)
     fsync_dir(os.path.dirname(os.path.abspath(path)))
+
+
+def pin_binary(root, binary):
+    """Pin the engine binary as DIR/bin/evo_boids on first use, durably (review round 5: replays of
+    pruned cells depend on it): a temporary copy fsync'd and renamed, its sha256 record written
+    durably, then bin/ and the root fsync'd. An existing pin is left as it is. -> the binary's hash."""
+    bdir = os.path.join(root, "bin")
+    pinned = os.path.join(bdir, "evo_boids")
+    want = invlib.sha256_file(binary)
+    if not os.path.exists(pinned):
+        tmp = pinned + ".tmp"
+        shutil.copy2(binary, tmp)
+        with open(tmp, "rb") as f:
+            os.fsync(f.fileno())
+        os.replace(tmp, pinned)
+        write_durable_text(pinned + ".sha256", f"{want}  {os.path.abspath(binary)}\n")
+        fsync_dir(bdir)
+        fsync_dir(root)
+    return want
 
 
 def finalize(root, d, done, prune):
@@ -478,9 +502,10 @@ def finalize(root, d, done, prune):
         probs = check_finished(d, done)
         if probs:
             raise PruneError("; ".join(probs))
-        probs = replay_prereqs(root, d, done)
+        probs, deps = replay_deps(root, d, done)
         if probs:
             raise ProvenanceError("replay provenance not established: " + "; ".join(probs))
+        durability_barrier(root, deps)   # (review round 5) the replay inputs are durable before any deletion
         done["pruned"] = prune_plan(d, done)
     gone = (set(done["pruned"]["removed"]) | set(done["pruned"].get("compressed") or {})) if prune else set()
     fsync_files(d, [f for f in os.listdir(d) if f not in gone and not f.endswith(".tmp")])
@@ -505,9 +530,10 @@ def finish_prune(root, d, done):
     probs = check_finished(d, done) + check_prune_record(d, done)
     if probs:
         raise PruneError("; ".join(probs))
-    probs = replay_prereqs(root, d, done)
+    probs, deps = replay_deps(root, d, done)
     if probs:
         raise ProvenanceError("replay provenance not established: " + "; ".join(probs))
+    durability_barrier(root, deps)
     gone = set(done["pruned"]["removed"]) | set(done["pruned"].get("compressed") or {})
     fsync_files(d, [f for f in os.listdir(d) if f not in gone and not f.endswith(".tmp")])
     freed = prune_apply(d, done)
@@ -585,7 +611,9 @@ def store_put(root, src, want=None):
     if store_has(root, sha):
         return sha
     sd = os.path.join(root, STORE)
-    os.makedirs(sd, exist_ok=True)
+    if not os.path.isdir(sd):
+        os.makedirs(sd, exist_ok=True)
+        fsync_dir(root)   # the store directory's own entry (review round 5)
     tmp = f"{store_path(root, sha)}.tmp.{os.getpid()}"
     shutil.copyfile(src, tmp)
     with open(tmp, "rb") as f:
@@ -624,14 +652,58 @@ def _pinned_binary_sha(root):
     return _BIN_SHA[root]
 
 
+_SYNCED = set()   # (root, path or blob hash) made durable by this process (fsync: durable whoever wrote it)
+
+
+def _fsync_path(p):
+    if os.path.isdir(p):
+        fsync_dir(p)
+        return
+    fd = os.open(p, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def durability_barrier(root, blobs):
+    """Review round 5, P2-1: before a deletion is authorized, the WHOLE replay-dependency set is
+    durable, not only hash-verified: every needed store blob (its content: it may have been put
+    by another process, or found by a cache fast path), then the store directory (their entries),
+    the pinned binary and its sha256 record, bin/ (their entries), and the root (the entries of
+    store/ and bin/). Each path is synced once per process; a blob new to this process re-syncs
+    the store directory and the root."""
+    new = [h for h in blobs if (root, h) not in _SYNCED]
+    for h in new:
+        _fsync_path(store_path(root, h))
+        _SYNCED.add((root, h))
+    sd = os.path.join(root, STORE)
+    if new and os.path.isdir(sd):
+        fsync_dir(sd)
+    bdir = os.path.join(root, "bin")
+    for p in (os.path.join(bdir, "evo_boids"), os.path.join(bdir, "evo_boids.sha256"), bdir):
+        if (root, p) not in _SYNCED and os.path.exists(p):
+            _fsync_path(p)
+            _SYNCED.add((root, p))
+    if new or (root, root) not in _SYNCED:
+        fsync_dir(root)
+        _SYNCED.add((root, root))
+
+
 def replay_prereqs(root, d, done, put=True):
+    """replay_deps' problems only."""
+    return replay_deps(root, d, done, put)[0]
+
+
+def replay_deps(root, d, done, put=True):
     """What a verified replay of this finished cell needs (review round 4, P1-2), checked before
     anything of it is deleted: the pinned binary is the one the cell ran (done.json's hash); every
     scoring tool the cell ran (done.json tools_sha256: a cell from before tool pinning has none)
     is in the store by content hash, put there from the pinned tools if they still are that
     version; every snapshot the arena read (its manifest's hash, which must be the plan's
     registered one) is in the store, put there from its registered path if that file still has
-    that content; the engine command is recorded. -> problems, [] if a replay can be verified."""
+    that content; the engine command is recorded. -> (problems, [] if a replay can be verified;
+    the store blobs it needs, for durability_barrier)."""
     probs = []
     c = done.get("cell") or {}
     bh = done.get("binary_sha256")
@@ -678,7 +750,7 @@ def replay_prereqs(root, d, done, put=True):
                     pass
         if not ok:
             probs.append(f"{what}: no copy of that version (stored, pinned or at its path)")
-    return probs
+    return probs, [h for _, h, _ in want]
 
 
 # ------------------------------------------------------------------- pruning
@@ -964,8 +1036,8 @@ def replay_cell(root, cid, out):
         "schema": "finfolk.invasion.replay/1", "utc": now(), "root": root, "cell": cid, "identical": ok,
         "checks": checks, "binary_sha256": done["binary_sha256"],
         "tools_sha256": {f: done["tools_sha256"][f] for f in SCORING_TOOLS},
-        "tools_from": "the store (a version set no longer pinned)" if os.path.basename(HERE) == REPLAY_TOOLS
-                      else "the pinned tools", "snapshots_from": snap_from})
+        "tools_from": ("the store or the pinned copies (rebuilt in replay_tools, run by a store-capable driver)"
+                       if os.path.basename(HERE) == REPLAY_TOOLS else "the pinned tools"), "snapshots_from": snap_from})
     for k, v in checks.items():
         print(f"{'same     ' if v else 'DIFFERENT'} {k}")
     print(f"replay {cid}: {'identical' if ok else 'MISMATCH'} ({sum(checks.values())}/{len(checks)} checks) -> {out}")
@@ -1093,22 +1165,36 @@ def main(argv=None):
         pinned = {f: invlib.sha256_file(os.path.join(tdir, f)) if os.path.isfile(os.path.join(tdir, f)) else None
                   for f in SCORING_TOOLS}
         pinned_run = os.path.join(tdir, "run.py")
-        snaps_ok = all(os.path.isfile(done["cell"][r]) and invlib.sha256_file(done["cell"][r]) == done["cell"].get(f"{r}_sha256")
-                       for r in ("resident", "invader") if done["cell"].get(r) and done["cell"].get(f"{r}_sha256"))
+        # review round 5: every snapshot role is checked by the hash of what the arena read (its manifest),
+        # registered or not; a path-only legacy cell used to pass this vacuously and get an old pinned driver
+        # that cannot read the store
+        cell = done["cell"]
+        try:
+            man0 = json.load(open(os.path.join(root, "cells", a.replay, "arena.manifest.json")))
+        except (OSError, ValueError):
+            man0 = {}
+
+        def at_path(r):
+            h = (man0.get(r) or {}).get("sha256") or cell.get(f"{r}_sha256")
+            return bool(h) and os.path.isfile(cell[r]) and invlib.sha256_file(cell[r]) == h
+        snaps_ok = all(at_path(r) for r in ("resident", "invader") if cell.get(r))
         if pinned == need and snaps_ok and os.path.exists(pinned_run) and "def replay_cell(" in open(pinned_run).read():
-            runner = pinned_run   # the pinned copy, as the cell ran
+            runner = pinned_run   # the pinned copy, as the cell ran (nothing needs the store)
         else:
             # the cell ran scoring tools that are no longer pinned (--update-tools since), or a snapshot
-            # left its path: its version set comes back from the store by content hash (review round 4),
-            # with this run.py as the replay driver (the run.py version is not part of the check)
-            missing = [f"{f} {str(h)[:12]}" for f, h in need.items() if not store_has(root, h)]
+            # left its path: its version set comes back from the store (or the pinned copy, when that is
+            # the version) by content hash, with this run.py - store-capable - as the replay driver (the
+            # run.py version is not part of the check)
+            srcs = {f: (store_path(root, h) if store_has(root, h) else
+                        os.path.join(tdir, f) if h and pinned.get(f) == h else None) for f, h in need.items()}
+            missing = [f"{f} {str(need[f])[:12]}" for f, s in srcs.items() if s is None]
             if missing:
                 print(f"cannot replay {a.replay}: no stored copy of {', '.join(missing)}", file=sys.stderr)
                 return 2
             rdir = os.path.join(out, REPLAY_TOOLS)
             os.makedirs(rdir, exist_ok=True)
-            for f, h in need.items():
-                shutil.copyfile(store_path(root, h), os.path.join(rdir, f))
+            for f, s in srcs.items():
+                shutil.copyfile(s, os.path.join(rdir, f))
             shutil.copyfile(os.path.abspath(__file__), os.path.join(rdir, "run.py"))
             runner = os.path.join(rdir, "run.py")
         return subprocess.call([sys.executable, "-I", runner, "--root", root, "--_replay", a.replay, out])
@@ -1146,11 +1232,7 @@ def main(argv=None):
 
     # pin the binary
     pinned = os.path.join(root, "bin", "evo_boids")
-    want = invlib.sha256_file(a.binary)
-    if not os.path.exists(pinned):
-        shutil.copy2(a.binary, pinned)
-        with open(pinned + ".sha256", "w") as f:
-            f.write(f"{want}  {os.path.abspath(a.binary)}\n")
+    want = pin_binary(root, a.binary)
     have = open(pinned + ".sha256").read().split()[0]
     if have != want:
         print(f"{root} already runs another binary ({have[:12]}); this one is {want[:12]}", file=sys.stderr)

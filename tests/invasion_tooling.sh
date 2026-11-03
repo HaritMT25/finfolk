@@ -64,6 +64,12 @@
 #  29. replay prerequisites before pruning, the store, --update-tools keeping versions, revalidated
 #      interrupted prunes, the durable write order (traced);
 #  30. the disk guard's stop path with an unwritable disk; guaranteed cleanup of running cells.
+#  Review round 5:
+#  29. (+) the replay dependencies durable before any deletion (store blobs, store/, the binary, bin/, the
+#      root; a first pin of the binary), and --replay routed to a store-capable driver when a path-only
+#      legacy cell's snapshot has moved;
+#  31. the registered bank is the approved plan with its policies (state, predators); a failed plant
+#      construction or source fit is a counted power failure, never power at the target.
 set -u
 BIN=${1:?usage: invasion_tooling.sh EVO_BOIDS WORKDIR}
 W=${2:?usage: invasion_tooling.sh EVO_BOIDS WORKDIR}
@@ -1003,7 +1009,8 @@ for g in ("np", "p4"):
 good = {"schema": "finfolk.invasion.blocks/2", "plan_sha256": sha, "analysis_sha256": "x", "clock": "steps",
         "blocks": [], "primary_blocks": pbs}
 json.dump(good, open("bank26.json", "w"))
-json.dump({"items": 4, "K": 12}, open("spec26.json", "w"))
+json.dump({"items": 4, "K": 12, "plan_sha256": sha, "state": "slot", "predators": {"off": 0, "predA4": 4},
+           "steps": 13500}, open("spec26.json", "w"))
 def variant(name, f):
     b = json.loads(json.dumps(good)); f(b); json.dump(b, open(name, "w"))
 variant("bank26_offonly.json", lambda b: b.update(primary_blocks=[p for p in b["primary_blocks"] if p["cond"] == "off"]))
@@ -1159,7 +1166,16 @@ sys.path.insert(0, sys.argv[1]); import bounded, calibrate
 pbs = {(p["group"], p["cond"]): p for p in json.load(open("bank26.json"))["primary_blocks"]}
 calibrate.G.update({"bank_zq": [[pbs[(g, c)]["zq"] for c in ("off", "predA4")] for g in ("np", "p4")]})
 lm0 = bounded.lm
-bounded.lm = lambda model, cells, y, th0, iters=200, tol=1e-11: lm0(model, cells, y, th0, 1, tol)
+lm1 = lambda model, cells, y, th0, iters=200, tol=1e-11: lm0(model, cells, y, th0, 1, tol)
+sf0 = getattr(calibrate, "_source_fit", bounded.fit_matrix)
+def sf(zq):
+    bounded.lm = lm0
+    try:
+        return sf0(zq)
+    finally:
+        bounded.lm = lm1
+calibrate._source_fit = sf
+bounded.lm = lm1
 gk, cnt, n, *_ = calibrate.task_compound((None, 4, 6, 2, 3, "nominal", 28))
 labels = {e for (t, e, a) in cnt if t == "claim: H1 and H1b"}
 assert len(labels) == 6 and n == 3, (labels, n)
@@ -1253,10 +1269,13 @@ $PY "$T/run.py" --root root29u --prune-finished > p29u2.log 2>&1
     || fail "a pruned cell that can no longer be replayed went unnoticed: $(tail -2 p29u2.log)"
 # the protocol, traced: the sweep and a new cell write and delete in the durable order (every kept file
 # and the gzip flushed, the directory synced, done.json's rename then the directory synced, the deletions,
-# the directory synced again); invlib.write_atomic syncs the directory after its rename
+# the directory synced again); invlib.write_atomic syncs the directory after its rename. Review round 5:
+# beyond the cell directory, the whole replay-dependency set is durable before the first deletion (every
+# needed store blob, store/, the pinned binary, bin/ and the root), and a first pin of the binary is durable
 rm -rf root29f/cells/off_f100_C_B_r02 && mkdir root29f/cells/off_f100_C_B_r02
 grep '"id": "off_f100_C_B_r02"' plan3.jsonl > root29f/cells/off_f100_C_B_r02/cell.json
-$PY - "$T" <<'PY' || fail "the finalization protocol (traced)"
+: > empty29.jsonl
+$PY - "$T" "$BIN" <<'PY' > t29f.log 2>&1 || fail "the finalization protocol (traced): $(tail -3 t29f.log)"
 import json, os, sys
 sys.path.insert(0, sys.argv[1]); import invlib, run
 ev = []
@@ -1284,16 +1303,60 @@ def check(d, what):
     assert ("fsync", d) in e[:i_done], (what, "the directory before done.json")
     assert ("fsync", d) in e[i_done + 1:min(rms)], (what, "the directory after done.json's rename, before deleting")
     assert e[-1] == ("fsync", d) and max(rms) < len(e) - 1, (what, "the directory after the deletions", e[-3:])
+def deps(d, what):
+    pr = json.load(open(f"{d}/done.json"))
+    gone = {f"{d}/{f}" for f in list(pr["pruned"]["removed"]) + list(pr["pruned"]["compressed"])}
+    first = min(i for i, x in enumerate(ev) if x[0] == "remove" and x[1] in gone)
+    man = json.load(open(f"{d}/arena.manifest.json"))
+    blobs = [pr["tools_sha256"][f] for f in ("invlib.py", "arena.py", "score.py")] + \
+            [man[r]["sha256"] for r in ("resident", "invader") if man.get(r)]
+    need = [f"{root}/store/{h}" for h in blobs] + [f"{root}/store", f"{root}/bin/evo_boids", f"{root}/bin", root]
+    before = set(ev[:first])
+    miss = [p for p in need if ("fsync", p) not in before]
+    assert not miss, (what, "not durable before the first deletion:", miss)
 run.prune_finished(root, lambda m: None)
 check(f"{root}/cells/off_f100_A_C_r00", "sweep")
+deps(f"{root}/cells/off_f100_A_C_r00", "sweep")
 ev.clear()
+getattr(run, "_SYNCED", set()).clear()      # (a cell worker is a new process)
+getattr(run, "_STORE_OK", set()).clear()
 assert run.run_cell(root, "off_f100_C_B_r02", prune=True) == 0
 check(f"{root}/cells/off_f100_C_B_r02", "new cell")
+deps(f"{root}/cells/off_f100_C_B_r02", "new cell")
 ev.clear()
 invlib.write_atomic(f"{root}/wa.txt", "x\n")
 i = ev.index(("replace", f"{root}/wa.txt"))
 assert ("fsync", root) in ev[i + 1:], ev
+ev.clear()
+rp = os.path.abspath("root29p")
+assert run.main(["--plan", "empty29.jsonl", "--root", rp, "--binary", sys.argv[2], "--workers", "1", "--disk-min", "none"]) == 0
+fs_tmp = [i for i, x in enumerate(ev) if x == ("fsync", f"{rp}/bin/evo_boids.tmp")]
+i_rep = ev.index(("replace", f"{rp}/bin/evo_boids")) if ("replace", f"{rp}/bin/evo_boids") in ev else -1
+assert fs_tmp and i_rep > fs_tmp[0] and ("fsync", f"{rp}/bin") in ev[i_rep:] and ("fsync", rp) in ev[i_rep:], \
+    ("the first pin of the binary is not durable", [x for x in ev if "/bin" in x[1] or x[1] == rp][:12])
 PY
+# review round 5, P2-2: a public --replay must not choose an old pinned driver that cannot read the store.
+# A path-only legacy cell (no registered snapshot hashes) is pruned (its snapshot archived), its snapshot is
+# then moved away, and the pinned run.py is a pre-store driver (here a stub that would exit 99)
+rm -rf root29v && cp -r root3dup root29v && cp A.json A_moved29.json
+$PY - <<'PY' || fail "preparing the path-only legacy cell"
+import json
+for name in ("cell.json", "done.json"):
+    p = f"root29v/cells/off_f100_A_B_r01/{name}"
+    x = json.load(open(p))
+    c = x["cell"] if name == "done.json" else x
+    del c["resident_sha256"], c["invader_sha256"]
+    c["resident"] = c["resident"].replace("/A.json", "/A_moved29.json")
+    json.dump(x, open(p, "w"))
+PY
+$PY "$T/run.py" --root root29v --prune-finished > p29v.log 2>&1 || fail "--prune-finished (path-only cell): $(tail -3 p29v.log)"
+[ ! -f root29v/cells/off_f100_A_B_r01/end.json ] || fail "the path-only legacy cell was not pruned: $(tail -3 p29v.log)"
+rm -f A_moved29.json
+printf 'import sys\n\ndef replay_cell():\n    pass\n\nsys.exit(99)\n' > root29v/tools/run.py
+rm -rf rp29v && $PY "$T/run.py" --root root29v --replay off_f100_A_B_r01 --out rp29v > rp29v.log 2>&1
+rc=$?
+[ $rc = 0 ] && grep -q "replay off_f100_A_B_r01: identical" rp29v.log && grep -q '"resident": "store"' rp29v/replay.json \
+    || fail "a replay needing the store was routed to the old pinned driver (exit $rc): $(tail -2 rp29v.log)"
 
 # 30. review round 4, P3-7: the disk guard's clean stop works when the disk cannot be written: the
 #     guard fires while a cell is running and STOP / progress.json fail with ENOSPC - admission stops in
@@ -1351,6 +1414,83 @@ left = engines("root30b")
 subprocess.run(["pkill", "-KILL", "-f", f"{W}/root30b/bin/evo_boids"])
 assert rc == "raised test: the runner breaks" and left == 0, (rc, left)
 assert "runner error" in open("root30b/runner.log").read()
+PY
+
+# 31. review round 5, P2-3 / P2-4: a registered bank must be the APPROVED registration with its policies
+#     (an otherwise valid bank with state 'carry', with zero predators under the label predA4, or from an
+#     alternate plan consistent with its own export is refused); and a simulated alternative counts toward
+#     power at its target only if its world was built as registered (every source fit converged, every
+#     feasible plant solved with a converged noiseless refit) - a failed construction is a power failure,
+#     kept in the denominator and counted
+$PY - "$T" <<'PY' || fail "the frozen bank specification binds the approved plan and its policies"
+import sys
+sys.path.insert(0, sys.argv[1]); import calibrate
+s = calibrate.BANK_SPEC
+assert len(s["plan_sha256"]) == 64 and s["state"] == "slot" and s["predators"] == {"off": 0, "predA4": 4} and s["steps"] == 13500, s
+PY
+for nm in carry zero alt; do
+    $PY - "$nm" <<'PY' || fail "building the $nm registration"
+import sys
+nm = sys.argv[1]
+d = open("design26.json").read()
+old, new = {"carry": ('"fractions": [0.05],', '"fractions": [0.05], "state": "carry",'),
+            "zero": ('"predA4": 4}', '"predA4": 0}'),
+            "alt": ('"log_every": 1000', '"log_every": 500')}[nm]
+assert d.count(old) == 1, (nm, old)
+open(f"design26_{nm}.json", "w").write(d.replace(old, new))
+PY
+    $PY "$T/plan.py" design26_$nm.json > plan26_$nm.jsonl || fail "plan.py (design26_$nm)"
+    $PY - "$nm" <<'PY' || fail "binding the $nm bank to its own plan"
+import hashlib, json, sys
+nm = sys.argv[1]
+sha = hashlib.sha256(open(f"plan26_{nm}.jsonl", "rb").read()).hexdigest()
+b = json.load(open("bank26.json")); b["plan_sha256"] = sha; json.dump(b, open(f"bank26_{nm}.json", "w"))
+s = json.load(open("spec26.json"))
+if nm != "alt":
+    s["plan_sha256"] = sha   # approved = this plan: only the policy check can refuse it
+json.dump(s, open(f"spec26_{nm}.json", "w"))
+PY
+done
+for v in carry:"arena state policy" zero:"predator counts" alt:"is not the approved registration"; do
+    nm=${v%%:*} why=${v#*:}
+    $PY "$T/calibrate.py" --blocks an3/blocks.json --key off/0.1/0.25 --out cal31_$nm --sims 0 --bank bank26_$nm.json \
+        --bank-plan plan26_$nm.jsonl --bank-spec spec26_$nm.json --bank-sims 0 --compound 4:4:2 --compound-sims 2 \
+        --compound-variants null --workers 1 > cal31_$nm.log 2>&1
+    rc=$?
+    [ $rc = 2 ] && grep -qF "$why" cal31_$nm.log || fail "the $nm bank was accepted as the registered one (exit $rc): $(tail -2 cal31_$nm.log)"
+done
+$PY - "$T" <<'PY' || fail "a failed plant construction or source fit counted toward power"
+import json, sys
+sys.path.insert(0, sys.argv[1]); import bounded, calibrate
+pbs = {(p["group"], p["cond"]): p for p in json.load(open("bank26.json"))["primary_blocks"]}
+calibrate.G.update({"bank_zq": [[pbs[(g, c)]["zq"] for c in ("off", "predA4")] for g in ("np", "p4")]})
+lab = "bounded ladder + feasible plant d_res=0.05 in all conditions"
+calibrate.compound_variants = lambda which: [("bounded ladder", None, 0.0, "all"), (lab, "target", 0.05, "all")]
+A = calibrate.ALPHAS
+fp0, pd0, sf0 = calibrate.feasible_plant, calibrate.plant_diagnostics, getattr(calibrate, "_source_fit", None)
+def run(tag):
+    calibrate.G["_plants"] = {}
+    gk, cnt, n, *_ = calibrate.task_compound((None, 4, 6, 2, 4, "target", 31))
+    return cnt, n
+cnt, n = run("ok")                                   # the plant is detectable when it is built
+assert cnt[("claim: H1 and H1b", lab, 0.05)] >= 3, cnt[("claim: H1 and H1b", lab, 0.05)]
+fail_key = f"world not built as registered (source fit or plant failed; counted as a failure): {lab}"
+cases = {
+    "an unsolved plant (iteration limit)": lambda: setattr(calibrate, "feasible_plant", lambda *a, **k: fp0(*a, **dict(k, iters=1))),
+    "an unconverged noiseless refit": lambda: setattr(calibrate, "plant_diagnostics", lambda *a: pd0(*a)[:2] + (False,) + pd0(*a)[3:]),
+    "an unconverged source fit": lambda: setattr(calibrate, "_source_fit", lambda zq: dict(bounded.fit_matrix(zq), converged=False)),
+}
+for what, patch in cases.items():
+    calibrate.feasible_plant, calibrate.plant_diagnostics = fp0, pd0
+    if sf0 is not None:
+        calibrate._source_fit = sf0
+    patch()
+    cnt, n = run(what)
+    assert all(cnt[(t, lab, a)] == 0 for t in ("claim: H1 and H1b", "H1 raw sign-flip omnibus",
+                                               "H1b logistic residual sign-flip omnibus") for a in A), (what, cnt[("claim: H1 and H1b", lab, 0.05)])
+    assert cnt.get((fail_key, "null", 0.95)) == n == 4, (what, cnt.get((fail_key, "null", 0.95)))
+    if what == "an unconverged source fit":   # the whole world is invalid, null included
+        assert cnt[("world not built as registered (source fit or plant failed; counted as a failure): bounded ladder", "null", 0.95)] == n
 PY
 
 # 19. self-tests of the inference and bounded-scale modules

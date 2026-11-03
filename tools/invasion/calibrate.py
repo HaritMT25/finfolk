@@ -478,8 +478,13 @@ def task_bnull(args):
 # twelve items per regime, K = 50 replicates, the fixed-step horizon T = 13,500 at fraction 0.05);
 # --bank-spec FILE replaces it for another registered bank, --bank-plan PLAN.jsonl is the
 # registration it is checked against, and --bank-exploratory turns the refusals into warnings.
-BANK_SPEC = {"schema": "finfolk.invasion.bank-spec/1", "clock": "steps", "frac": 0.05, "G": 13500.0,
-             "assays": ["off", "predA4"], "groups": 2, "items": 12, "K": 50}
+# Review round 5: strict validation also binds the bank to its APPROVED original plan (plan_sha256 =
+# bank1/plan.jsonl as registered on 2026-11-02, so its items, snapshot hashes, seeds and policies), and checks
+# the arena state policy, every assay's predator count and the run length explicitly.
+BANK_SPEC = {"schema": "finfolk.invasion.bank-spec/2", "clock": "steps", "frac": 0.05, "G": 13500.0,
+             "assays": ["off", "predA4"], "groups": 2, "items": 12, "K": 50,
+             "state": "slot", "predators": {"off": 0, "predA4": 4}, "steps": 13500,
+             "plan_sha256": "1040e6736a864e7794f47baf7ad4d17b04ebb2ed4631fb6431bd3834f6a00e77"}
 BLOCKS_SCHEMA = "finfolk.invasion.blocks/2"
 
 
@@ -516,8 +521,10 @@ def validate_bank(bb, spec, plan_cells=None, plan_sha=None):
     of groups at (frac, G), unique (group, assay) keys, every block formal, `items` items and
     replicates 0..K-1 in every block, aligned items and replicates across a group's assays,
     disjoint groups, the shapes / finiteness of z and zq; with a plan: its hash is the one the
-    analysis bound, the groups are its cores with exactly their items, the assays are its
-    conditions at frac, and every core cell registers replicates 0..K-1.
+    analysis bound AND the spec's approved plan_sha256 (review round 5: so items, snapshot hashes,
+    seeds and policies are the registered ones), the groups are its cores with exactly their items,
+    the assays are its conditions at frac, every core cell registers replicates 0..K-1, and its
+    state policy, predator counts and run length are the spec's.
     -> (groups, assays, {(group, assay): block}, problems)."""
     probs = []
     if bb.get("schema") != BLOCKS_SCHEMA:
@@ -572,6 +579,20 @@ def validate_bank(bb, spec, plan_cells=None, plan_sha=None):
     else:
         if plan_sha != bb.get("plan_sha256"):
             probs.append(f"the analysis bound plan {str(bb.get('plan_sha256'))[:12]}, --bank-plan is {plan_sha[:12]}")
+        if not spec.get("plan_sha256"):
+            probs.append("the spec names no approved plan (plan_sha256): the registration itself is unbound")
+        elif plan_sha != spec["plan_sha256"]:
+            probs.append(f"--bank-plan {plan_sha[:12]} is not the approved registration {spec['plan_sha256'][:12]}")
+        core = [c for c in plan_cells if c.get("core") and c["fraction"] == spec["frac"]]
+        for fld, what in (("state", "arena state policy"), ("steps", "run length")):
+            bad = sorted({str(c.get(fld)) for c in core if fld in spec and c.get(fld) != spec[fld]})
+            if bad:
+                probs.append(f"the plan's {what} {bad} is not the spec's {spec[fld]!r}")
+        if "predators" in spec:
+            bad = sorted({(c["condition"], c.get("predators")) for c in core
+                          if c.get("predators") != spec["predators"].get(c["condition"])})
+            if bad:
+                probs.append(f"predator counts {bad[:4]} differ from the spec's {spec['predators']}")
         cores = plan_cores(plan_cells)
         got = {g_: sorted(byk[(g_, cnames[0])]["names"]) for g_ in gnames if (g_, cnames[0]) in byk}
         if cores != got:
@@ -856,10 +877,13 @@ def task_compound(args):
     fits, pools = [], []
     srcs = ([[(G["bank_zq"][g][c]) for c in range(len(G["bank_zq"][g]))] for g in range(len(G["bank_zq"]))]
             if keys is None else [[G["blocks"][key]["zq"] for key in keys]] * Gn)
+    src_ok = True   # review round 5: the source ladders are the registered fits only if every fit converged
     for g in range(Gn):
         fg, pg = [], []
         for zq in srcs[g]:
-            fg.append(bounded.fit_matrix(zq)["params"])
+            sf = _source_fit(zq)
+            src_ok = src_ok and bool(sf["converged"])
+            fg.append(sf["params"])
             sq = cell_sds(zq)
             pg.append(sq if keys is None else [sq[p][i] for p in range(len(zq)) for i in range(len(zq)) if i != p])
         fits.append(fg)
@@ -934,13 +958,24 @@ def task_compound(args):
                     zs.append([[[_zib(rnd, mean[p][i], sds[g][ci][p][i]) if i != p else 0.0 for i in range(N)]
                                 for _ in range(k)] for p in range(N)])
                 groups.append(zs)
-            p1 = infer.signflip_groups(groups, "curl")
-            ro = bounded.residual_omnibus(groups)
-            p1b = ro["p_flip"]   # None: H1b invalid (a fit did not converge) -> no rejection, still counted
+            # review round 5: a dataset is evidence about its label only if its world was built as
+            # registered - every source fit converged and, for a feasible plant, every planted block was
+            # solved to its target with a converged noiseless refit. Otherwise it is a FAILED dataset:
+            # no test is run, it stays in the denominator as a non-rejection (a power failure), counted.
+            built = src_ok and not (fam == "target" and (unsolved or refit_bad))
+            if built:
+                p1 = infer.signflip_groups(groups, "curl")
+                ro = bounded.residual_omnibus(groups)
+                p1b = ro["p_flip"]   # None: H1b invalid (a fit did not converge) -> no rejection, still counted
+            else:
+                p1 = p1b = None
+                ro = {"valid": False}
             c.hit("H1 raw sign-flip omnibus", label, p1)
             c.hit("H1b logistic residual sign-flip omnibus", label, p1b)
-            c.hit("claim: H1 and H1b", label, max(p1, p1b) if p1b is not None else None)
-            c.cover(f"H1b invalid (a logistic fit did not converge): {label}", not ro["valid"])
+            c.hit("claim: H1 and H1b", label, max(p1, p1b) if p1b is not None and p1 is not None else None)
+            c.cover(f"world not built as registered (source fit or plant failed; counted as a failure): {label}",
+                    not built)
+            c.cover(f"H1b invalid (a logistic fit did not converge): {label}", built and not ro["valid"])
             c.cover(f"all four fits converged: {label}", ro["valid"])
             c.cover(f"feasible (no clipped mean): {label}", ncl == 0)
             c.cover(f"feasible SDs (no capped cell, no boundary mean): {label}", ncap == 0 and nbound == 0)
@@ -953,6 +988,11 @@ def task_compound(args):
     world = ("logistic ladder + zero-inflated Beta" if keys is not None
              else "the bank's own logistic ladders + zero-inflated Beta")
     return ((G.get("bank_label", "bank") if keys is None else "compound"), "compound", world, N, k, Gn, C), c.cnt, n, c.st
+
+
+def _source_fit(zq):
+    """The logistic fit of a source block (pilot or bank) that defines a compound world's ladder."""
+    return bounded.fit_matrix(zq)
 
 
 def compound_variants(which):
