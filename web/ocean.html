@@ -589,6 +589,7 @@
   #startmenu small { font-size: 12px; color: var(--ink-3); }
   #randnote:empty { display: none; }
   .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 10px; }
+  .row2 .wide { grid-column: 1 / -1; }   /* This run: Replay on its own row, the two saves side by side */
   .panel .hint { margin-top: 8px; font-size: 12px; color: var(--ink-3); line-height: 1.45; }
   .panel .preset { margin-top: 14px; padding: 12px 14px; border-radius: var(--r-md); background: var(--surface-2); border: 1px solid var(--line-soft); }
   .panel .preset .btn { width: 100%; }
@@ -1091,18 +1092,20 @@
           <div class="scard" data-s="hunters"><button id="huntersbtn" class="spick" type="button" aria-pressed="false"><b>Hunters</b><span>Four predators hunt; plenty of food, a cap on the fish, swimming costs energy</span></button></div>
           <div class="scard" data-s="currents"><button id="currentsbtn" class="spick" type="button" aria-pressed="false"><b>Currents &amp; patches</b><span>Eddies carry six food patches, each at its own depth</span></button></div>
           <div class="scard" data-s="surprise"><button id="randombig" class="spick" type="button" aria-pressed="false"><b>Surprise me</b><span>A whole setup drawn from ranges that worked, for the tank as set</span></button></div>
-          <div class="scard" data-s="file"><button id="loadcp" class="spick" type="button" aria-pressed="false"><b>From a file…</b><span>A setup you saved: that world from its start</span></button></div>
+          <div class="scard" data-s="file"><button id="loadcp" class="spick" type="button" aria-pressed="false"><b>From a file…</b><span>A setup you saved (that world from its start) or a saved world (it carries on)</span></button></div>
         </div>
         <div id="scenario-acts" hidden><button id="scenario-start" class="btn primary" type="button"><svg class="i"><use href="#i-play"/></svg><span>Start</span></button><button id="rerollbtn" class="btn" type="button" hidden><svg class="i"><use href="#i-dice"/></svg>Reroll</button></div>
         <p id="randnote"></p>
-        <input id="cpfile" type="file" accept=".json" hidden>
+        <!-- no accept filter: a phone's picker greys out a file type it does not know (.oceanworld); the page tells the files apart itself -->
+        <input id="cpfile" type="file" hidden>
         <h3>This run</h3>
         <p id="modeline"></p>
         <div class="row2">
-          <button id="replay" class="btn" title="this world again from its seed (Shift+R): what waits stays waiting, live tweaks are dropped"><svg class="i"><use href="#i-replay"/></svg>Replay from start</button>
-          <button id="savecp" class="btn" title="this world's seed and settings, as a file (during Turbo too)"><svg class="i"><use href="#i-save"/></svg>Save setup</button>
+          <button id="replay" class="btn wide" title="this world again from its seed (Shift+R): what waits stays waiting, live tweaks are dropped"><svg class="i"><use href="#i-replay"/></svg>Replay from start</button>
+          <button id="savecp" class="btn" title="this world's seed and settings, as a file: it starts that world again from its start (during Turbo too)"><svg class="i"><use href="#i-save"/></svg>Save setup</button>
+          <button id="saveworld" class="btn" title="the world itself, every fish as it is now, as a file: From a file carries it on from here (during Turbo too: it keeps running)"><svg class="i"><use href="#i-save"/></svg>Save world</button>
         </div>
-        <p class="hint">A start begins a world from its seed: the Ocean can't save the fish themselves yet (Classic's Save world can). The page's address carries the setup of the world that runs: bookmark or share it.</p>
+        <p class="hint"><b>Save setup</b> keeps the recipe (seed and settings): it starts that world again from its beginning. <b>Save world</b> keeps the fish themselves: <b>From a file</b> opens it and it carries on exactly where it was saved, on this engine build (a later build can still use its setup). The page's address carries the setup of the world that runs: bookmark or share it.</p>
         <p class="hint">The flashlight, water clarity, fish colours and Hold 60 fps are in <b>View</b>, beside the flashlight in the dock (key V).</p>
         <p id="credit">Finfolk © 2026 Harit Tarwani ·
           <a href="https://creativecommons.org/licenses/by-nc/4.0/" target="_blank" rel="noopener noreferrer">CC BY-NC 4.0</a></p>
