@@ -138,7 +138,7 @@ function benchUrl(c, extra = {}, base = BASE) {
  * sin / cos. */
 const GATE_CHECK = async (label) => {
   const S = EvoOcean.scene;
-  await EvoOcean.bench.frames(3);
+  for (let k = 0; k < 3; k++) await new Promise((res) => requestAnimationFrame(res));   /* (no bench in a plain page) */
   const G = S.poseCamera(), st = S.polish(), n = EvoOcean.state().n, V = G.view, P = G.proj;
   const rect = document.getElementById("tank").getBoundingClientRect();
   const out = { label, n, maxErr: 0, worst: null, below: 0, mid: 0, above: 0, outside: 0, nonFinite: 0, badRoll: 0,
@@ -297,10 +297,11 @@ async function partCorrectness() {
   const gok = (g) => g.nonFinite === 0 && g.badRoll === 0 && g.maxErr <= 2e-3;
   check("size weights == the independent projection (|err| <= .002), finite, unit rolls within 0.6: whole, follow, inset, zoomed",
         [gw, gf, gi, gz].every(gok), [gw, gf, gi, gz].map((g) => ({ label: g.label, maxErr: g.maxErr, worst: g.worst, below: g.below, mid: g.mid, above: g.above, outside: g.outside, focal: g.focalCss, canvas: g.canvasCss })));
-  check("  the whole view: most fish under 4 px (the polish's light off), none at 9; close up: fish below 4, through the transition and above 9",
-        gw.below > 0.8 * gw.n && gw.above === 0 && gf.below > 0 && gf.mid > 0 && gf.above > 0, { whole: [gw.below, gw.mid, gw.above, gw.outside], follow: [gf.below, gf.mid, gf.above, gf.outside] });
-  check("  the panel's inset changes the projection (view offset) and the weights follow it; zooming out lowers them",
-        gi.focalCss > 0 && gz.state.meanWeight < gf.state.meanWeight, { focal: [gf.focalCss, gi.focalCss], mean: [gf.state.meanWeight, gi.state.meanWeight, gz.state.meanWeight] });
+  check("  the whole view: fish under 4 px (none of the polish) and in the 4 .. 9 ramp, none at 9; close up: in the ramp, above 9, and the rest outside the view (0)",
+        gw.below > 0 && gw.mid > 0 && gw.above === 0 && gf.mid > 0 && gf.above > 0 && gf.outside > 0,
+        { whole: [gw.below, gw.mid, gw.above, gw.outside], follow: [gf.below, gf.mid, gf.above, gf.outside] });
+  check("  the panel's inset changes the projection (view offset) and the weights follow it; zooming out brings fish into the view",
+        gi.focalCss !== gf.focalCss && gz.outside < gf.outside, { focal: [gf.focalCss, gi.focalCss], outside: [gf.outside, gi.outside, gz.outside], mean: [gf.state.meanWeight, gi.state.meanWeight, gz.state.meanWeight] });
   check("  ungated: every fish at full weight; off: the plain programs (no weights)",
         gu.state.gated === false && gu.state.full === gu.state.fish && gu.state.fish === 2500 && goff.on === false && goff.any === 0, { ungated: gu.state, off: goff });
   await L.page.evaluate((cd) => EvoOcean.bench.prepare(Object.assign({}, cd, { camera: "whole", colourMode: "appearance", settleMs: 300 })), c);
@@ -701,8 +702,9 @@ async function partGate() {
     check(label + ":   the drawing buffer is the canvas x min(DPR, 2) (detail 3), and the weights are in CSS px (the same focal length as CSS height x P[5] / 2)",
           all.every((g) => g.drawingBuffer[0] === Math.floor(Math.round(g.canvasCss[0]) * Math.min(g.dpr, 2)) && g.drawingBuffer[1] === Math.floor(Math.round(g.canvasCss[1]) * Math.min(g.dpr, 2))),
           all.map((g) => ({ canvas: g.canvasCss, buffer: g.drawingBuffer, dpr: g.dpr })));
-    check(label + ":   close up, fish below 4 px, through the transition and above 9", res.follow.below > 0 && res.follow.mid > 0 && res.follow.above > 0,
-          [res.follow.below, res.follow.mid, res.follow.above, res.follow.outside]);
+    check(label + ":   the whole view: under 4 px or outside, none at 9; close up, fish in the 4 .. 9 ramp and above 9, the rest outside the view",
+          res.whole.below > 0 && res.whole.above === 0 && res.follow.mid > 0 && res.follow.above > 0 && res.follow.outside > 0,
+          { whole: [res.whole.below, res.whole.mid, res.whole.above, res.whole.outside], follow: [res.follow.below, res.follow.mid, res.follow.above, res.follow.outside] });
     check(label + ": no console / page / network errors", L.errors.length === 0, L.errors.slice(0, 5));
     await L.ctx.close();
   }
@@ -713,8 +715,23 @@ async function partGate() {
  * polish off: one world per state, stepped to tick 180 (one stepToTick
  * sequence, so the predators' trails match), the clock frozen (animT 20), a
  * static camera, the flashlight's and the caustics' fades settled; the
- * canvas read back (RGBA8) right after the app's render. Then the polish on
- * (this site only): it must differ where a fish is close. */
+ * canvas read back (RGBA8) right after the app's render. This site twice:
+ * "fresh", the plain programs from the scene's creation (setPolish(false)
+ * before its first frame: the polished ones never draw), which must be main's
+ * image exactly; and "switched", the page as it opens (polished) switched
+ * to plain after its first frames, which may differ from main's by 1 / 255
+ * on a few pixels and no more (on this GPU, 24-30 px of one food particle's
+ * additive glow in the Family and Brain close-ups after the polished
+ * programs drew in Appearance colours; no fish pixel: the fish programs and
+ * inputs are main's). Then the polish on (switched): it must differ where a
+ * fish is close (the comparison can see it). */
+const PLAIN_FROM_START = () => {
+  Object.defineProperty(window, "EvoOceanScene", { configurable: true, get() { return undefined; }, set(v) {
+    const c = v.create;
+    v.create = function () { const sc = c.apply(this, arguments); if (sc && sc.setPolish) sc.setPolish(false); return sc; };
+    Object.defineProperty(window, "EvoOceanScene", { value: v, writable: true, configurable: true });
+  } });
+};
 const OFF_STATES = [
   { name: "appearance-whole", cfg: { appearance: 3, walls: true }, colour: "appearance", cam: "whole" },
   { name: "appearance-close-flashlight", cfg: { appearance: 3, walls: true }, colour: "appearance", cam: "close", beam: true },
@@ -726,11 +743,12 @@ const OFF_STATES = [
 async function partOffImage() {
   console.log("== the polish off draws main's image, pixel for pixel (main " + MAIN_BASE + ")");
   if (!MAIN_BASE) { check("offimage: --main-base given", false); return; }
-  const VP = { width: 1280, height: 720 }, got = { main: {}, cand: {} };
+  const VP = { width: 1280, height: 720 }, got = { main: {}, fresh: {}, switched: {} };
   report.parts.offimage = { viewport: VP, states: {} };
-  for (const site of ["main", "cand"]) {
+  for (const site of ["main", "fresh", "switched"]) {
     const base = site === "main" ? MAIN_BASE : BASE;
-    const L = await launch("offimage-" + site, { viewport: VP, init: AFTER_FRAME });
+    const init = site === "fresh" ? "(" + AFTER_FRAME.toString() + ")(); (" + PLAIN_FROM_START.toString() + ")();" : AFTER_FRAME;
+    const L = await launch("offimage-" + site, { viewport: VP, init });
     for (const st of OFF_STATES) {
       const c = caseFor(600, { config: Object.assign({}, st.cfg) });
       await L.page.goto(benchUrl(c, {}, base));
@@ -761,10 +779,10 @@ async function partOffImage() {
         await B.frames(4);
         const out = { n: EvoOcean.state().n, pc: EvoOcean.state().pc, tick: EvoOcean.state().frame, view: S.view(), size: [W, H],
                       polish: S.polish ? S.polish() : null, appearance: S.appearance(), off: await grab() };
-        if (cand) { S.setPolish(true); await B.wait(1500); await B.frames(4); out.polishOn = S.polish(); out.on = await grab(); }
+        if (cand === "switched") { S.setPolish(true); await B.wait(1500); await B.frames(4); out.polishOn = S.polish(); out.on = await grab(); }
         S.render = orig;
         return out;
-      }, [st, c, site === "cand"]);
+      }, [st, c, site === "main" ? false : site]);
       got[site][st.name] = r;
     }
     check("offimage " + site + ": no console / page / network errors", L.errors.length === 0, L.errors.slice(0, 5));
@@ -780,14 +798,17 @@ async function partOffImage() {
     }
     return { pixels: a.length / 4, differing: px, maxDiff: max, sha: [crypto.createHash("sha256").update(a).digest("hex").slice(0, 16), crypto.createHash("sha256").update(b).digest("hex").slice(0, 16)] };
   }
+  const same = (m, c) => m.tick === c.tick && m.n === c.n && JSON.stringify(m.view) === JSON.stringify(c.view) && c.polish && c.polish.on === false;
   for (const st of OFF_STATES) {
-    const m = got.main[st.name], c = got.cand[st.name];
-    const d0 = diff(m.off, c.off), d1 = diff(m.off, c.on);
+    const m = got.main[st.name], f = got.fresh[st.name], c = got.switched[st.name];
+    const d0 = diff(m.off, f.off), d1 = diff(m.off, c.off), d2 = diff(m.off, c.on);
     report.parts.offimage.states[st.name] = { main: { tick: m.tick, n: m.n, pc: m.pc, view: m.view, appearance: m.appearance },
-      cand: { tick: c.tick, n: c.n, pc: c.pc, view: c.view, polishOff: c.polish, polishOn: c.polishOn, appearance: c.appearance }, mainVsOff: d0, mainVsOn: d1 };
-    check("offimage " + st.name + ": the polish off == main, every RGBA8 pixel (same tick " + m.tick + ", " + m.n + " fish, " + m.pc + " predators, same camera)",
-          m.tick === c.tick && m.n === c.n && JSON.stringify(m.view) === JSON.stringify(c.view) && c.polish && c.polish.on === false && d0.differing === 0, d0);
-    if (st.cam === "close") check("offimage " + st.name + ":   and the polish on differs (the comparison can see it)", c.polishOn.on === true && d1.differing > 0, d1);
+      fresh: { tick: f.tick, n: f.n, polish: f.polish }, switched: { tick: c.tick, n: c.n, pc: c.pc, view: c.view, polishOff: c.polish, polishOn: c.polishOn, appearance: c.appearance },
+      mainVsFresh: d0, mainVsSwitched: d1, mainVsOn: d2 };
+    check("offimage " + st.name + ": the plain programs from the start == main, every RGBA8 pixel (tick " + m.tick + ", " + m.n + " fish, " + m.pc + " predators, same camera)",
+          same(m, f) && d0.differing === 0, d0);
+    check("offimage " + st.name + ":   switched off at run time: within 1 / 255, on under 0.01 % of the pixels", same(m, c) && d1.maxDiff <= 1 && d1.differing <= d1.pixels * 1e-4, d1);
+    if (st.cam === "close") check("offimage " + st.name + ":   and the polish on differs (the comparison can see it)", c.polishOn.on === true && d2.differing > 0, d2);
   }
 }
 
