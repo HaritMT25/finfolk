@@ -13,6 +13,7 @@ hook that keeps the sign.
 """
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -62,12 +63,23 @@ def dumps_checkpoint(cp):
 
 
 def write_atomic(path, text):
+    """Atomic and durable: a temporary file, fsync'd, renamed over path, and then the directory
+    fsync'd, because fsync of the file alone does not make the rename (the directory entry)
+    durable (review round 4). A filesystem that cannot fsync a directory is tolerated."""
     tmp = path + ".tmp"
     with open(tmp, "w") as f:
         f.write(text)
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, path)
+    fd = os.open(os.path.dirname(os.path.abspath(path)), os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    except OSError as e:
+        if e.errno not in (errno.EINVAL, errno.ENOTSUP, errno.EBADF):
+            raise
+    finally:
+        os.close(fd)
 
 
 def write_json_atomic(path, obj):

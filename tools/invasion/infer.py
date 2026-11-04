@@ -38,20 +38,32 @@ Statistics
     noise-corrected cyclic share   (T_C - tau_C) / (T_A - tau_A)  (ratio not unbiased;
                                    negative / unidentified values are kept)
 
-Null distributions (no chi-square, no isotropy):
-  * studentized unit bootstrap: draw k residual units per column (with
-    replacement, scaled by sqrt(k/(k-1)) to restore the variance; or, kind
-    'wild', each unit's residual times a random sign), recompute T AND tau from
-    the draw with the same functions as for the data, p = (1 + #{F* >= F}) /
-    (B + 1). The denominator is re-estimated in every draw, so the uncertainty
-    of the noise estimate is part of the null. Calibrated by simulation:
-    calibrate.py.
-  * exact replicate sign-flip: under the null E[QA_r] = 0 for every replicate
-    matrix A_r, and replicates are independent; if their noise is symmetric,
-    flipping whole replicates gives an exact test without any variance model.
-    Resolution: p >= 1/2^(k-1).
+Null distributions (no chi-square, no isotropy). Neither is exact in general;
+what each one assumes is part of every result it gives:
+  * studentized unit bootstrap (APPROXIMATE): draw k residual units per column
+    (with replacement, scaled by sqrt(k/(k-1)) to restore the variance; or,
+    kind 'wild', each unit's residual times a random sign), recompute T AND tau
+    from the draw with the same functions as for the data, p = (1 + #{F* >= F})
+    / (B + 1). The denominator is re-estimated in every draw, so the
+    uncertainty of the noise estimate is part of the null. This is an
+    asymptotic bootstrap approximation (Bickel & Freedman 1981): it assumes the
+    k units of a column are exchangeable draws that represent their
+    distribution. k = 6 or 10 units cannot represent a rare large component
+    (e.g. a factor that is -0.002 with probability 0.95 and +0.038 otherwise:
+    absent from all k units with probability 0.95^k), and then the test is
+    anti-conservative. Its level is known only where it was simulated
+    (calibrate.py's worlds, including such stress worlds); the Monte Carlo
+    p = 1/(B+1) for no exceedance is a resolution limit, not a tail bound.
+  * replicate sign-flip: under the null E[QA_r] = 0 for every replicate matrix
+    A_r, and replicates are independent. The test is EXACT only if the
+    replicate residual vectors are, in addition, CENTRALLY SYMMETRIC (jointly
+    over every condition of an omnibus); a zero mean is not enough (Hemerik &
+    Goeman). Resolution: p >= 1/2^(k-1) per group of aligned units.
   * several conditions (e.g. both assays) whose (p, r) units share seeds are
-    resampled / flipped JOINTLY: F_joint = sum T_C / sum tau_C.
+    resampled / flipped JOINTLY: F_joint = sum T_C / sum tau_C. Conditions
+    with no shared units (e.g. matrices of different home regimes: other
+    snapshots, other seeds) are independent GROUPS: infer_groups draws and
+    flips each group independently (sign-flip resolution prod_g 1/2^(k_g-1)).
 
 Descriptive companions from the same draws: the raw-share floor (95th
 percentile of the cyclic share of a pure ladder of the noise-corrected
@@ -66,10 +78,20 @@ import random
 
 # The bootstrap analyze.py uses unless told otherwise. calibrate.py's null simulations at the
 # pilot's scale (N = 8, k = 6; six null worlds incl. the blocks' own resampled units; 1,000 datasets
-# each, B = 999) found the residual-unit bootstrap never above nominal (alpha 0.05: 0.004-0.035;
-# 0.0045: <= 0.002), while the wild (random-sign) one was closer to nominal at 0.05 (0.029-0.066)
-# but up to 2.4x liberal at 0.0045. Formal decisions need validity at small alpha: residual.
+# each, B = 999) found the residual-unit bootstrap at or below nominal in THOSE worlds (alpha 0.05:
+# 0.004-0.035; 0.0045: <= 0.002), while the wild (random-sign) one was closer to nominal at 0.05
+# (0.029-0.066) but up to 2.4x liberal at 0.0045. That is evidence for these worlds, not a
+# finite-sample guarantee: a rare-event stress world breaks both tests (calibrate.py 'rare1').
 DEFAULT_KIND = "residual"
+
+# The frozen inference configuration. analyze.py and calibrate.py both read it, so a level or
+# power simulation assesses the procedure the analysis applies (review round 2, P1: calibration
+# used to default to the wild bootstrap while analysis used the residual one).
+#   test   the primary lack-of-fit decision: 'signflip' (grouped replicate sign-flip, exact under
+#          independent, centrally symmetric replicate residual vectors) or 'bootstrap'
+#   kind   the bootstrap kind (reported beside the primary test in every table)
+#   B      bootstrap draws for reported p-values
+PRIMARY = {"test": "signflip", "kind": DEFAULT_KIND, "B": 9999}
 
 
 # ------------------------------------------------------------ block algebra
@@ -235,7 +257,7 @@ def _fast_stats(res, E, plan, kind):
     TA, TC = energies(A, N)
     f = 1.0 / (k * (k - 1))
     return {"N": N, "k": k, "A": A, "TA": TA, "TC": TC, "TS": sym_energy(symm(means), N),
-            "tauA": sA * f, "tauC": sC * f, "tauS": sS * f}
+            "tauA": sA * f, "tauC": sC * f, "tauS": sS * f, "m": means}
 
 
 def bootstrap(zs, B=9999, seed=1, kind=DEFAULT_KIND, ladder=None):
@@ -243,15 +265,23 @@ def bootstrap(zs, B=9999, seed=1, kind=DEFAULT_KIND, ladder=None):
     jointly). -> list of dicts F_C, F_S (joint over conditions), and for zs[0]: T_C0 (the
     unstudentized curl energy), eA (norm of the edge-noise vector), share (raw cyclic share of
     the pure ladder `ladder`, an edge vector, plus the drawn noise; None without a ladder)."""
+    return bootstrap_groups([zs], B, seed, kind, ladder)
+
+
+def bootstrap_groups(groups, B=9999, seed=1, kind=DEFAULT_KIND, ladder=None):
+    """Null draws for independent groups of aligned conditions: within a group every condition
+    reuses one draw plan (their units share seeds); each group gets its own plan. One group is
+    exactly bootstrap() (same random stream). T_C0 / eA / share are of groups[0][0]."""
     rnd = random.Random(seed)
-    res = [residual_units(z) for z in zs]
-    E = [[[unit_energies(u, len(z)) for u in col] for col in rc] for rc, z in zip(res, zs)]
-    N, k = len(zs[0]), len(zs[0][0])
+    flat = [(g, z) for g, zs in enumerate(groups) for z in zs]
+    res = [residual_units(z) for _, z in flat]
+    E = [[[unit_energies(u, len(z)) for u in col] for col in rc] for rc, (_, z) in zip(res, flat)]
+    shape = [(len(zs[0]), len(zs[0][0])) for zs in groups]
     out = []
     LL = sum(x * x for x in ladder) if ladder else 0.0
     for _ in range(B):
-        plan = _draw_plan(rnd, kind, N, k)
-        st = [_fast_stats(res[c], E[c], plan, kind) for c in range(len(zs))]
+        plans = [_draw_plan(rnd, kind, N, k) for N, k in shape]
+        st = [_fast_stats(res[c], E[c], plans[g], kind) for c, (g, _) in enumerate(flat)]
         d = {"F_C": _ratio(sum(s["TC"] for s in st), sum(s["tauC"] for s in st)),
              "F_S": _ratio(sum(s["TS"] for s in st), sum(s["tauS"] for s in st)),
              "T_C0": st[0]["TC"], "eA": math.sqrt(st[0]["TA"]), "share": None}
@@ -304,6 +334,83 @@ def replicate_vectors(zs, which):
 
 def signflip(zs, which="curl"):
     return _flip_p(replicate_vectors(zs, which))
+
+
+def _flip_all(vecs):
+    """T(delta) for every one of the 2^(k-1) sign patterns (first sign fixed), and T(+1...).
+    Gray-code order: one sign changes per step, T and h_r = sum_s delta_s G_rs updated in O(k)."""
+    k = len(vecs)
+    G = [[sum(a * b for a, b in zip(vecs[r], vecs[s])) for s in range(k)] for r in range(k)]
+    sg = [1] * k
+    h = [sum(row) for row in G]
+    T = sum(h)
+    out = [T]
+    for i in range(1, 1 << (k - 1)):
+        t = 1 + ((i & -i).bit_length() - 1)   # the sign that changes (never the first)
+        st = sg[t]
+        T -= 4.0 * st * (h[t] - st * G[t][t])
+        for s in range(k):
+            h[s] -= 2.0 * st * G[s][t]
+        sg[t] = -st
+        out.append(T)
+    return out, out[0]
+
+
+def signflip_groups(groups, which="curl", mc=1 << 16, seed=3):
+    """Sign-flip p for independent groups of aligned conditions: whole replicates are flipped
+    jointly within a group and independently across groups; T = sum over groups of
+    ||sum_r delta_r u_r||^2 (the groups occupy disjoint coordinates). Exact enumeration for one
+    or two groups (k <= 16 each), Monte Carlo over the per-group pattern lists otherwise.
+    Exact under H0 only if every group's replicate residual vectors are independent and
+    centrally symmetric. Resolution prod_g 1/2^(k_g - 1)."""
+    return flip_p_vectors([replicate_vectors(zs, which) for zs in groups], mc, seed)
+
+
+def flip_p_vectors(group_vecs, mc=1 << 16, seed=3):
+    """The grouped sign-flip p from per-group replicate vectors (group_vecs[g][r] = replicate r's
+    vector of group g, already concatenated over the group's aligned conditions)."""
+    import bisect
+    per = []
+    for vecs in group_vecs:
+        if len(vecs) > 16:
+            raise ValueError("signflip: k > 16 per group (enumeration); use fewer replicates")
+        per.append(_flip_all(vecs))
+    tobs = sum(t for _, t in per)
+    tol = 1e-12 * max(1.0, abs(tobs))
+    if len(per) == 1:
+        Ts = per[0][0]
+        return sum(1 for t in Ts if t >= tobs - tol) / len(Ts)
+    if len(per) == 2:
+        T1, T2 = per[0][0], sorted(per[1][0])
+        n2 = len(T2)
+        ge = sum(n2 - bisect.bisect_left(T2, tobs - tol - t) for t in T1)
+        return ge / (len(T1) * n2)
+    rnd = random.Random(seed)
+    ge = sum(1 for _ in range(mc) if sum(Ts[rnd.randrange(len(Ts))] for Ts, _ in per) >= tobs - tol)
+    return (1 + ge) / (mc + 1)
+
+
+def infer_groups(groups, B=9999, seed=1, kind=DEFAULT_KIND):
+    """The omnibus over independent groups of aligned conditions (e.g. the stats spec's four
+    primary matrices: two home regimes = two independent groups, each with its two assay
+    conditions sharing units): F_C = sum T_C / sum tau_C over every condition, its
+    studentized bootstrap p (each group drawn independently) and the grouped sign-flip p."""
+    st = [block_stats(z) for zs in groups for z in zs]
+    F_C = _ratio(sum(s["TC"] for s in st), sum(s["tauC"] for s in st))
+    F_S = _ratio(sum(s["TS"] for s in st), sum(s["tauS"] for s in st))
+    boot = bootstrap_groups(groups, B, seed, kind)
+    sym = all(len(zs[0]) >= 4 for zs in groups)
+    mn = 1.0
+    for zs in groups:
+        mn /= 1 << (len(zs[0][0]) - 1)
+    return {"groups": len(groups), "conditions": len(st), "kind": kind, "B": B,
+            "N": [len(zs[0]) for zs in groups], "k": [len(zs[0][0]) for zs in groups],
+            "F_C": F_C, "F_S": F_S,
+            "p_lof": (1 + sum(1 for b in boot if b["F_C"] >= F_C)) / (B + 1),
+            "p_sym": (1 + sum(1 for b in boot if b["F_S"] >= F_S)) / (B + 1) if sym else None,
+            "p_lof_flip": signflip_groups(groups, "curl"),
+            "p_sym_flip": signflip_groups(groups, "sym") if sym else None,
+            "flip_min_p": mn}
 
 
 def confidence_ball(A, N, r95):
@@ -500,6 +607,29 @@ def selftest():
     assert abs(signflip([zz]) - 1 / 8) < 1e-12
     r = infer([zz], B=199, seed=3)
     assert r["p_lof"] == 1 / 200 and r["share_raw"] > 0.9, r
+    # the Gray-code enumeration gives every pattern's T (brute force)
+    vecs = [[rnd.gauss(0, 1) for _ in range(7)] for _ in range(6)]
+    brute = []
+    for mask in range(1 << 5):
+        sg = [1] + [(-1 if (mask >> b) & 1 else 1) for b in range(5)]
+        w = [sum(sg[r] * vecs[r][e] for r in range(6)) for e in range(7)]
+        brute.append(sum(x * x for x in w))
+    fast, t0 = _flip_all(vecs)
+    assert abs(t0 - brute[0]) < 1e-9 and all(abs(x - y) < 1e-9 for x, y in zip(sorted(fast), sorted(brute)))
+    # groups: one group is exactly the single-condition procedure; independent groups are flipped
+    # and drawn independently (sign-flip resolution 1/2^(k1-1) / 2^(k2-1))
+    assert signflip_groups([[zz]]) == signflip([zz])
+    b1, b2 = bootstrap([zz], B=20, seed=4), bootstrap_groups([[zz]], B=20, seed=4)
+    assert all(x["F_C"] == y["F_C"] and x["F_S"] == y["F_S"] for x, y in zip(b1, b2))
+    z2 = plant([[[rnd.gauss(0, 0.01) if i != p else 0.0 for i in range(5)] for _ in range(5)] for p in range(5)],
+               cycle_template(5, "diffuse", 3), 1.0)
+    assert abs(signflip_groups([[zz], [z2]]) - 1 / 128) < 1e-12, signflip_groups([[zz], [z2]])
+    assert signflip_groups([[zz], [z2], [zz]]) < 0.003
+    g = infer_groups([[zz], [z2]], B=99, seed=1)
+    assert g["flip_min_p"] == 1 / 128 and g["p_lof"] == 1 / 100 and g["conditions"] == 2, g
+    # a group without signal next to one with signal: the pooled statistic still sees it
+    zn = [[[rnd.gauss(0, 0.01) if i != p else 0.0 for i in range(5)] for _ in range(5)] for p in range(5)]
+    assert infer_groups([[zz], [zn]], B=99, seed=1)["p_lof"] <= 0.02
     print("infer selftest: ok")
 
 
