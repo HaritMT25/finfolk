@@ -17,8 +17,12 @@ run     (1) writes DIR/manifest.json BEFORE any computation (if DIR already has 
         manifest must equal it byte for byte, or the run is refused: exit 2); (2) DIR/run.json, the
         hashes of the bank inputs; (3) validates the bank against the registration (refused, exit 2,
         if it is not the registered bank); (4) runs every scheduled task (DIR/tasks/NNNNN.json, one
-        file per task, so an interrupted run resumes; results do not depend on the worker count);
-        (5) writes DIR/decision.json (machine-readable) and DIR/gate.md. Exit 0 = pass, 1 = fail.
+        file per task, bound to this run's inputs, so an interrupted run resumes; results do not depend
+        on the worker count); (5) writes DIR/cell_laws.json, DIR/decision.json (machine-readable),
+        DIR/gate.md and DIR/receipt.json, and prints the RECEIPT: one hash over the manifest, the run
+        record, every task record in schedule order and the decision. Record it in the approval record
+        right after the run; analyze.py --gate DIR --gate-receipt SHA requires it (verify_record checks
+        the whole chain against the evidence). Exit 0 = pass, 1 = fail.
 seeds   the confirmation assay seed manifest of section 2 (namespace confirm-v1, the indexed
         allocation, 5,760 trajectories) and the home seeds 430001-430012, checked for disjointness
         from every seed of the archived plans (--avoid) and the archived home seeds; exit 2 on a
@@ -45,11 +49,13 @@ Acceptance (pass only if all hold):
      (a = 0.05/12), counting an unavailable decision as a REJECTION (the gate screen);
   2. in every bounded world, the conjunction's two-sided 95% Clopper-Pearson lower bound >= 0.80 at
      the achieved four-condition target, counting an unavailable decision as a FAILURE;
-  3. validity: every source fit converged, every cell's law valid (exact moments), the target plant
-     solved in all four conditions with converged noiseless refits, every scheduled gate dataset
-     computed, and zero unavailable gate datasets.
-The 2a ceiling is a screening tolerance: it does not certify nominal a-level control. Diagnostics
-(placements, triangles, outer resamples, raw procedure rates) are reported, not gating.
+  3. validity: every source fit converged, every cell's law valid (exact moments), every prescribed
+     plant constructed with converged noiseless refits (the clipped null's included) - the target in
+     all four conditions and the four placements solved to tolerance, the four triangles refitted -,
+     every scheduled task (gate AND diagnostic) computed, and zero unavailable datasets anywhere.
+The 2a ceiling is a screening tolerance: it does not certify nominal a-level control. The diagnostics'
+rejection RATES (placements, triangles, outer resamples) and the raw procedure rates carry no
+threshold; their completion and construction are part of validity (criterion 3).
 A run with --counts or --bank-spec, or a bank that is not the registered one, is EXPLORATORY: its
 decision is computed the same way but marked formal = false, and analyze.py --gate refuses it.
 """
@@ -247,9 +253,36 @@ def write_atomic(path, text):
 TESTS = ("H1", "H1b", "claim")
 
 
-def task_problems(r, t, man_sha, run_sha):
-    """Why a task record may not be aggregated (review of #49, finding 6): its header must be the scheduled
-    task, it must carry this run's manifest AND run/input hashes, and its counters must be sane."""
+def task_problems(r, t, man_sha, run_sha, ref=None):
+    """Why a task record may not be aggregated (review of #49, finding 6; round 2): its header must be the
+    scheduled task, it must carry this run's manifest AND run/input hashes, its counters must be sane and
+    mutually consistent (a conjunction rejection is an H1 and an H1b rejection; the conjunction is unavailable
+    when either test is), and - with ref (cell_laws.json's reference) - a bounded world's record must be
+    built, problem-free, and carry exactly the reference source-fit reports and plants of its variant."""
+    probs = _task_problems(r, t, man_sha, run_sha)
+    if probs or t[1] in ("E", "G"):
+        if not probs and r.get("plants") is not None:
+            probs.append("an H1-only world with plants")
+        return probs
+    u = r["unavailable"]
+    for f in ("rej", "rej05"):
+        if r[f]["claim"] > min(r[f]["H1"], r[f]["H1b"]):
+            probs.append(f"{f}: more conjunction rejections than H1 or H1b rejections")
+    if not max(u["H1"], u["H1b"]) <= u["claim"] <= u["H1"] + u["H1b"]:
+        probs.append("unavailable conjunctions inconsistent with unavailable H1 / H1b")
+    if ref is not None:
+        if r.get("built") is not True:
+            probs.append("a world not built as registered")
+        if r.get("problems"):
+            probs.append("construction problems recorded")
+        if json.loads(json.dumps(r.get("fit_info"))) != json.loads(json.dumps(ref.get("fit_info"))):
+            probs.append("source-fit reports are not the reference ones")
+        if json.loads(json.dumps(r.get("plants"))) != json.loads(json.dumps((ref.get("plants") or {}).get(t[2]))):
+            probs.append("plants are not the reference plants of its variant")
+    return probs
+
+
+def _task_problems(r, t, man_sha, run_sha):
     if not isinstance(r, dict):
         return ["not a record"]
     probs = []
@@ -363,12 +396,15 @@ def _variant(variant):
                 d_add, d_res, ok, _ = calibrate.plant_diagnostics(mean, mean0, th0)
                 x = {"mean": mean, "c": d * math.sqrt(3.0 / P), "d_add": d_add, "d_res": d_res, "converged": ok,
                      "solved": ok, "evals": 1, "clipped": ncl, "clip_sum": tot, "clip_max": mx, "grid_m": None,
-                     "d_res_clip0": None}
+                     "d_res_clip0": None, "clip0_converged": None,
+                     "failure": None if ok else "the triangle's noiseless refit did not converge"}
             info = {k_: x.get(k_) for k_ in ("c", "d_add", "d_res", "converged", "solved", "evals", "clipped",
-                                             "clip_sum", "clip_max", "grid_m", "d_res_clip0")}
+                                             "clip_sum", "clip_max", "grid_m", "d_res_clip0", "clip0_converged",
+                                             "failure")}
             plants[f"{g}/{c}"] = info
             if not x["solved"]:
-                probs.append(f"plant {variant} {g}/{c} not solved (d_res {x['d_res']:.6g}, converged {x['converged']})")
+                probs.append(f"plant {variant} {g}/{c} not solved (d_res {x['d_res']:.6g}, converged {x['converged']}; "
+                             f"{x.get('failure')})")
             v = st["var"][(g, c)]
             lw = [[(calibrate.marginal_alt(mean0[p][i], v[p][i], x["mean"][p][i]) if i != p else None)
                    for i in range(N)] for p in range(N)]
@@ -497,11 +533,17 @@ def cell_laws(cfg):
 # ------------------------------------------------------------------- the parent side
 def load_bank(a, spec):
     """-> (bank_z, bank_zq, info, problems)."""
-    bb = json.load(open(a.bank))
-    plan_cells = [json.loads(ln) for ln in open(a.bank_plan) if ln.strip()]
     inp = a.bank_inputs or os.path.join(os.path.dirname(os.path.abspath(a.bank)), "inputs.json")
-    inputs = json.load(open(inp)) if os.path.exists(inp) else None
-    gnames, cnames, byk, probs = calibrate.validate_bank(bb, spec, plan_cells, sha256_file(a.bank_plan), inputs)
+    return load_bank_paths(a.bank, a.bank_plan, inp, spec)
+
+
+def load_bank_paths(bank, plan, inp, spec):
+    """The bank export, its plan and the analysis' inputs.json, validated (calibrate.validate_bank).
+    -> (bank_z, bank_zq, info {groups, assays, blocks / plan / inputs: path, sha256}, problems)."""
+    bb = json.load(open(bank))
+    plan_cells = [json.loads(ln) for ln in open(plan) if ln.strip()]
+    inputs = json.load(open(inp)) if inp and os.path.exists(inp) else None
+    gnames, cnames, byk, probs = calibrate.validate_bank(bb, spec, plan_cells, sha256_file(plan), inputs)
     bank_z, bank_zq = [], []
     for g_ in gnames:
         bs = [byk.get((g_, c_)) for c_ in spec["assays"]]
@@ -510,8 +552,8 @@ def load_bank(a, spec):
         bank_z.append([b["z"] for b in bs])
         bank_zq.append([b["zq"] for b in bs])
     info = {"groups": gnames, "assays": spec["assays"],
-            "blocks": {"path": os.path.abspath(a.bank), "sha256": sha256_file(a.bank)},
-            "plan": {"path": os.path.abspath(a.bank_plan), "sha256": sha256_file(a.bank_plan)},
+            "blocks": {"path": os.path.abspath(bank), "sha256": sha256_file(bank)},
+            "plan": {"path": os.path.abspath(plan), "sha256": sha256_file(plan)},
             "inputs": {"path": os.path.abspath(inp), "sha256": sha256_file(inp)} if inputs is not None else None}
     return bank_z, bank_zq, info, probs
 
@@ -601,13 +643,15 @@ def decide_gate(agg, counts, formal, bank_probs, ref_plants=None):
     if len(tgt) != GEOMETRY["G"] * GEOMETRY["C"] and agg[("L", "target")]["done"]:
         vprobs.append(f"target plants for {sorted(tgt)}, not all four conditions")
     for gc, x in sorted(tgt.items()):
-        if not (x["solved"] and abs(x["d_res"] - TARGET) <= calibrate.PLANT_TOL * TARGET):
-            vprobs.append(f"target plant {gc}: d_res {x['d_res']:.8g} not within {calibrate.PLANT_TOL} relative of {TARGET}")
+        if not (x["solved"] and x.get("clip0_converged") is True and abs(x["d_res"] - TARGET) <= calibrate.PLANT_TOL * TARGET):
+            vprobs.append(f"target plant {gc}: not constructed (d_res {x['d_res']:.8g}, clipped-null refit converged "
+                          f"{x.get('clip0_converged')}; {x.get('failure')})")
     for g, c in PLACEMENTS:
         a = agg.get(("L", f"place-g{g}c{c}"))
         x = ((a or {}).get("plants") or {}).get(f"{g}/{c}")
-        if a and a["done"] and not (x and x["solved"] and abs(x["d_res"] - DIAG_TARGET) <= calibrate.PLANT_TOL * DIAG_TARGET):
-            vprobs.append(f"placement plant {g}/{c} not constructed (d_res {x and x['d_res']})")
+        if a and a["done"] and not (x and x["solved"] and x.get("clip0_converged") is True
+                                    and abs(x["d_res"] - DIAG_TARGET) <= calibrate.PLANT_TOL * DIAG_TARGET):
+            vprobs.append(f"placement plant {g}/{c} not constructed (d_res {x and x['d_res']}; {x and x.get('failure')})")
         a = agg.get(("L", f"tri-g{g}c{c}"))
         x = ((a or {}).get("plants") or {}).get(f"{g}/{c}")
         if a and a["done"] and not (x and x["converged"]):
@@ -810,7 +854,8 @@ def cmd_run(a):
                 r = json.load(open(p_))
             except ValueError:
                 r = None
-            if not task_problems(r, t, man_sha, run_sha):   # (review of #49, finding 6: bound to THIS run's inputs)
+            # (review of #49: bound to THIS run's inputs and to the reference construction)
+            if not task_problems(r, t, man_sha, run_sha, {"fit_info": cl["fit_info"], "plants": cl["plants"]}):
                 results[t[0]] = r
             else:
                 stale += 1
@@ -830,40 +875,76 @@ def cmd_run(a):
                     print(f"{done}/{len(todo)} tasks, {el / 60:.1f} min, ETA {el / done * (len(todo) - done) / 60:.1f} min",
                           flush=True)
     agg = aggregate(results, sched)
-    formal = man["formal"] and not bprobs
-    crit, reasons = decide_gate(agg, counts_all, formal, bprobs, cl["plants"])
-    dec = {"schema": "finfolk.invasion.gate-decision/1",
-           "decision": "pass" if not reasons else "fail",
-           "formal": formal,
-           "exploratory_because": ([] if man["formal"] else ["counts or bank spec overridden"]) + bprobs,
-           "reasons": reasons, "criteria": crit,
-           "manifest_sha256": man_sha, "run_sha256": run_sha, "cell_laws_sha256": cl_sha, "tools": man["tools"],
-           "protocol_sha256": hashlib.sha256(canon(man["protocol"]).encode()).hexdigest(),
-           "source_fits": next((a_.get("fit_info") for a_ in agg.values() if a_.get("fit_info")), None),
-           "target_plants": agg[("L", "target")]["plants"],
-           "diagnostics": diagnostics(agg, counts_all),
-           "timing": timing(agg, sched, COUNTS),
-           "wall_seconds_this_session": time.time() - t0,
-           "finished_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
-    write_atomic(os.path.join(a.out, "decision.json"), canon(dec))
+    task_shas = [sha256_file(os.path.join(tdir, f"{t[0]:05d}.json")) for t in sched]
+    dec = build_decision(agg, man, man_sha, run_sha, cl_sha, cl, bprobs, task_shas)
+    dec.update(timing=timing(agg, sched, COUNTS), wall_seconds_this_session=time.time() - t0,
+               finished_utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+    dtext = canon(dec)
+    write_atomic(os.path.join(a.out, "decision.json"), dtext)
     md = report_md(dec)
     write_atomic(os.path.join(a.out, "gate.md"), "\n".join(md) + "\n")
+    # the receipt (review of #49, round 2): one hash over the manifest, the run record, every task record in
+    # schedule order and the decision; recorded OUTSIDE this directory (the approval record) right after the run,
+    # it is what analyze.py --gate-receipt checks - self-contained hashes alone cannot prove execution
+    rc = receipt(man_sha, run_sha, task_shas, hashlib.sha256(dtext.encode()).hexdigest())
+    write_atomic(os.path.join(a.out, "receipt.json"), canon(rc))
     print("\n".join(md))
+    print(f"RECEIPT {rc['receipt']}  (record it in the approval record; analyze.py --gate {a.out} --gate-receipt {rc['receipt']})")
     return 0 if dec["decision"] == "pass" else 1
 
 
-def verify_record(path, require_formal=True):
+def receipt(man_sha, run_sha, task_shas, dec_sha):
+    comp = {"manifest_sha256": man_sha, "run_sha256": run_sha, "task_files_sha256": list(task_shas),
+            "decision_sha256": dec_sha}
+    return {"schema": "finfolk.invasion.gate-receipt/1", "receipt": hashlib.sha256(canon(comp).encode()).hexdigest(),
+            "components": comp}
+
+
+DECISION_FIELDS = ("schema", "decision", "formal", "exploratory_because", "reasons", "criteria", "manifest_sha256",
+                   "run_sha256", "cell_laws_sha256", "tools", "protocol_sha256", "source_fits", "target_plants",
+                   "diagnostics", "task_records_sha256")
+
+
+def build_decision(agg, man, man_sha, run_sha, cl_sha, cl, bprobs, task_shas):
+    """The decision's reproducible fields (DECISION_FIELDS) from the aggregate and the evidence."""
+    formal = man["formal"] and not bprobs
+    crit, reasons = decide_gate(agg, man["protocol"]["counts"], formal, bprobs, cl["plants"])
+    return {"schema": "finfolk.invasion.gate-decision/1",
+            "decision": "pass" if not reasons else "fail",
+            "formal": formal,
+            "exploratory_because": ([] if man["formal"] else ["counts or bank spec overridden"]) + bprobs,
+            "reasons": reasons, "criteria": crit,
+            "manifest_sha256": man_sha, "run_sha256": run_sha, "cell_laws_sha256": cl_sha, "tools": man["tools"],
+            "protocol_sha256": hashlib.sha256(canon(man["protocol"]).encode()).hexdigest(),
+            "source_fits": next((a_.get("fit_info") for a_ in agg.values() if a_.get("fit_info")), None),
+            "target_plants": agg[("L", "target")]["plants"],
+            "diagnostics": diagnostics(agg, man["protocol"]["counts"]),
+            "task_records_sha256": hashlib.sha256(canon(list(task_shas)).encode()).hexdigest()}
+
+
+_REPLAY = {}
+
+
+def verify_record(path, require_formal=True, receipt_sha=None):
     """Verify a gate output directory as a complete, consistent decision / run / result chain (review of #49,
-    finding 2) - what analyze.py --gate needs before the headline claim. Checked:
+    findings 2 and round-2 finding 1) - what analyze.py --gate needs before the headline claim. Checked:
       decision.json   schema, 'pass', formal (unless require_formal is False: tests of exploratory runs);
       manifest.json   bound by hash, and byte-identical to the manifest THIS code regenerates: the frozen
                       protocol, the schedule and ALL six tool hashes (gate, calibrate, bounded, infer, hodge,
                       analyze) - a pass from other code is no pass;
-      run.json        bound by hash, bound to the manifest, the approved bank plan;
-      cell_laws.json  bound by hash and to the manifest / run;
-      tasks           every scheduled record present and valid (header, the manifest AND run hashes, counters);
-      the decision    re-aggregated from the records with the acceptance rule applied afresh: it must be 'pass'
-                      and its criteria must equal the recorded ones.
+      run.json        its complete schema; the bank export, plan and analysis inputs it binds re-read,
+                      re-hashed and RE-VALIDATED as the registered bank;
+      cell_laws.json  bound by hash, its content complete and exact (cell_law_problems), and equal to the
+                      construction the bank export REPLAYS to (source fits, laws, plants);
+      tasks           every scheduled record present and valid: header, the manifest AND run hashes, consistent
+                      counters, and for bounded worlds built, problem-free, with the replayed fit reports and
+                      plants;
+      the decision    regenerated from those records with the acceptance rule applied afresh: 'pass', and every
+                      reproducible field (criteria, reasons, diagnostics, plants, fits, the ordered task-file
+                      hashes ...) equal to the recorded one; gate.md is its report;
+      the receipt     the hash over (manifest, run record, ordered task files, decision) must equal receipt_sha,
+                      the hash recorded OUTSIDE the directory (the approval record) right after the run:
+                      self-contained hashes alone cannot prove that a run happened.
     Missing or inconsistent evidence is a problem. -> (summary, problems)."""
     d = path if os.path.isdir(path) else os.path.dirname(os.path.abspath(path))
     probs = []
@@ -908,40 +989,133 @@ def verify_record(path, require_formal=True):
                      + (f"; other tool sources: {tdiff}" if tdiff else "") + ")")
     if dec.get("run_sha256") != run_sha:
         probs.append("run.json is not the one the decision bound")
-    if run.get("manifest_sha256") != man_sha:
-        probs.append("run.json belongs to another manifest")
-    if ((run.get("bank") or {}).get("plan") or {}).get("sha256") != (prot.get("bank") or {}).get("plan_sha256"):
+    # run.json: the complete schema, and the bank export / plan / analysis inputs it binds RE-READ and
+    # RE-VALIDATED (review of #49, round 2: the bank problems come from this evidence, not from the decision)
+    spec = prot.get("bank") or {}
+    rb = run.get("bank") or {}
+    if run.get("schema") != "finfolk.invasion.gate-run/1" or run.get("manifest_sha256") != man_sha:
+        probs.append("run.json: not this manifest's run record")
+    if rb.get("assays") != spec.get("assays") or not isinstance(rb.get("groups"), list):
+        probs.append("run.json: the bank's groups / assays are missing")
+    files_ok = True
+    for f in ("blocks", "plan", "inputs"):
+        e = rb.get(f) or {}
+        if not (isinstance(e.get("path"), str) and isinstance(e.get("sha256"), str) and len(e["sha256"]) == 64):
+            probs.append(f"run.json: no {f} binding")
+            files_ok = False
+        elif not os.path.exists(e["path"]) or sha256_file(e["path"]) != e["sha256"]:
+            probs.append(f"run.json: the {f} file it binds is missing or changed ({e['path']})")
+            files_ok = False
+    if (rb.get("plan") or {}).get("sha256") != spec.get("plan_sha256"):
         probs.append("run.json: the bank plan is not the registered one")
-    ref = None
+    bank_probs, ref_cl = None, None
+    if files_ok:
+        bz, bzq, info, bank_probs = load_bank_paths(rb["blocks"]["path"], rb["plan"]["path"], rb["inputs"]["path"], spec)
+        if json.loads(json.dumps(info)) != json.loads(json.dumps(rb)):
+            probs.append("run.json: its bank record is not the one the export gives")
+        if require_formal and bank_probs:
+            probs.append(f"the bank is not the registered bank: {bank_probs[:2]}")
+        # the construction evidence REPLAYED from the export: cell laws, source fits, plants (deterministic, so
+        # memoized per export within a process)
+        ck = (rb["blocks"]["sha256"], rb["plan"]["sha256"], rb["inputs"]["sha256"], prot["geometry"]["k"])
+        if ck not in _REPLAY:
+            _REPLAY[ck] = cell_laws({"bank_z": bz, "bank_zq": bzq, "k": prot["geometry"]["k"]})
+        ref_cl = dict(_REPLAY[ck], manifest_sha256=man_sha, run_sha256=run_sha)
+    if cl is None:
+        pass
+    elif dec.get("cell_laws_sha256") != cl_sha or cl.get("manifest_sha256") != man_sha or cl.get("run_sha256") != run_sha:
+        probs.append("cell_laws.json is not bound to this decision / manifest / run")
+    elif ref_cl is not None and json.loads(canon(ref_cl)) != cl:
+        probs.append("cell_laws.json is not the construction the bank export replays to")
     if cl is not None:
-        if dec.get("cell_laws_sha256") != cl_sha or cl.get("manifest_sha256") != man_sha or cl.get("run_sha256") != run_sha:
-            probs.append("cell_laws.json is not bound to this decision / manifest / run")
-        ref = cl.get("plants")
+        probs += cell_law_problems(cl, prot)
+    ref = {"fit_info": (ref_cl or cl or {}).get("fit_info"), "plants": (ref_cl or cl or {}).get("plants")}
     sched = man.get("schedule") or []
-    results, bad = {}, []
+    results, bad, shas = {}, [], []
     for t in sched:
         p_ = os.path.join(d, "tasks", f"{t[0]:05d}.json")
         try:
             r = json.load(open(p_))
+            shas.append(sha256_file(p_))
         except (OSError, ValueError):
             bad.append(f"{t[0]:05d}: missing")
             continue
-        tp = task_problems(r, t, man_sha, run_sha)
+        tp = task_problems(r, t, man_sha, run_sha, ref)
         if tp:
             bad.append(f"{t[0]:05d}: {tp[0]}")
         else:
             results[t[0]] = r
     if bad:
         probs.append(f"{len(bad)} of {len(sched)} task record(s) missing or invalid ({bad[:3]})")
-    if sched and not bad:
-        bank_probs = [x for x in dec.get("exploratory_because", []) if x != "counts or bank spec overridden"]
-        crit, reasons = decide_gate(aggregate(results, sched), prot.get("counts"), dec.get("formal"), bank_probs, ref)
-        if reasons:
-            probs.append(f"re-aggregated, the acceptance rule FAILS: {reasons[:2]}")
-        if json.loads(json.dumps(crit)) != dec.get("criteria"):
-            probs.append("the recorded criteria differ from the re-aggregated ones")
+    if sched and not bad and bank_probs is not None:
+        # the decision regenerated from the evidence: every reproducible field must be the recorded one
+        regen = build_decision(aggregate(results, sched), man, man_sha, run_sha, cl_sha, ref_cl or cl, bank_probs, shas)
+        if regen["reasons"]:
+            probs.append(f"re-aggregated, the acceptance rule FAILS: {regen['reasons'][:2]}")
+        diff = [f for f in DECISION_FIELDS if json.loads(json.dumps(regen.get(f))) != dec.get(f)]
+        if diff:
+            probs.append(f"the recorded decision differs from the one the evidence regenerates in {diff}")
+        try:
+            if open(os.path.join(d, "gate.md")).read() != "\n".join(report_md(dec)) + "\n":
+                probs.append("gate.md is not the report of this decision")
+        except OSError:
+            probs.append("gate.md: missing")
+        rc = receipt(man_sha, run_sha, shas, dec_sha)["receipt"]
+        summ["receipt"] = rc
+        if receipt_sha is None:
+            probs.append("no external receipt given (analyze.py --gate-receipt: the hash recorded in the approval record)")
+        elif receipt_sha != rc:
+            probs.append("the receipt is not the one recorded outside this directory")
     summ["problems"] = len(probs)
     return summ, probs
+
+
+def cell_law_problems(cl, prot):
+    """cell_laws.json's own content: complete coverage (every null cell, every planted cell of every bounded
+    variant), valid laws whose achieved moments are the requested ones, alternatives keeping v / (mu (1 - mu)),
+    converged source fits, and no recorded problem."""
+    probs = []
+    if cl.get("schema") != "finfolk.invasion.gate-cell-laws/1":
+        probs.append("cell_laws.json: not a cell-law record")
+        return probs
+    geo = prot.get("geometry") or GEOMETRY
+    N, Gn, C = geo["N"], geo["G"], geo["C"]
+    if cl.get("problems"):
+        probs.append(f"cell_laws.json records problems: {cl['problems'][:2]}")
+    fi = cl.get("fit_info") or {}
+    if sorted(fi) != sorted(f"{g}/{c}" for g in range(Gn) for c in range(C)) or not all(x.get("converged") for x in fi.values()):
+        probs.append("cell_laws.json: the source fits are not all four, converged")
+    want = {"null": [(g, c) for g in range(Gn) for c in range(C)], "target": [(g, c) for g in range(Gn) for c in range(C)]}
+    for g, c in PLACEMENTS:
+        want[f"place-g{g}c{c}"] = [(g, c)]
+        want[f"tri-g{g}c{c}"] = [(g, c)]
+    got = {}
+    for r in cl.get("rows") or []:
+        got.setdefault((r.get("variant"), r.get("group"), r.get("cond")), []).append(r)
+    bad = []
+    for v, gcs in want.items():
+        for g, c in gcs:
+            rows = got.get((v, g, c), [])
+            if sorted((r["resident"], r["invader"]) for r in rows) != [(p, i) for p in range(N) for i in range(N) if i != p]:
+                bad.append(f"{v} {g}/{c}: {len(rows)} rows")
+                continue
+            for r in rows:
+                ok = r.get("valid") is True and r.get("mean_achieved") is not None and r.get("var_achieved") is not None
+                if ok:
+                    ok = abs(r["mean_achieved"] - r["mu"]) <= 1e-12 * max(r["mu"], 1e-300) and \
+                        abs(r["var_achieved"] - r["v_requested"]) <= max(1e-9 * r["v_requested"],
+                                                                         calibrate.MARGINAL_EDGE * r["mu"] * (1 - r["mu"]))
+                if ok and v == "null":
+                    ok = r["mu"] == r["mu_null"] and r["v_requested"] == r["v_bank"]
+                elif ok:
+                    w = r["v_bank"] / (r["mu_null"] * (1 - r["mu_null"])) * r["mu"] * (1 - r["mu"])
+                    ok = abs(r["v_requested"] - w) <= 1e-12 * max(w, 1e-300)
+                if not ok:
+                    bad.append(f"{v} {g}/{c} cell ({r['invader']} into {r['resident']})")
+                    break
+    if bad:
+        probs.append(f"cell_laws.json: incomplete or inexact laws ({bad[:3]})")
+    return probs
 
 
 def confirmation_plan_problems(cells, read_snapshots=True):
@@ -956,17 +1130,19 @@ def confirmation_plan_problems(cells, read_snapshots=True):
     snapshot - the home-production record is outside the repository. -> problems."""
     C = CONFIRM
     N, k, A = C["N"], C["k"], C["assays"]
-    probs, idx, core_h = [], {}, {}
+    probs = []
     core = [c for c in cells if c.get("core")]
     if not core:
         return ["no registered cores"]
-    if len({c["core"] for c in core}) != 2:
-        probs.append(f"{len({c['core'] for c in core})} core(s), the confirmation registers 2")
+    cores = sorted({c["core"] for c in core})
+    if len(cores) != 2:
+        probs.append(f"{len(cores)} core(s), the confirmation registers 2")
     want_pred = dict(zip(A, (0, 4)))
     bad = {}
 
     def note(what, c):
         bad.setdefault(what, c["id"] if "id" in c else "?")
+    # (1) per-cell registration fields
     for c in core:
         if c.get("seed_namespace") != C["namespace"]:
             note(f"seed namespace {c.get('seed_namespace')!r} is not {C['namespace']!r}", c)
@@ -981,37 +1157,54 @@ def confirmation_plan_problems(cells, read_snapshots=True):
                  f"T saved exactly", c)
         if c.get("replicate") not in range(k) or c.get("mode") not in ("invade", "sham"):
             note("replicate / mode outside the registration", c)
+    # (2) the indices the slot seeds imply, and BIJECTIONS (review of #49, round 2: aliases used to pass):
+    #     cores <-> h in {0, 1}, and each core's members <-> j in {0..11}
+    core_hs, item_js = {}, {}
+    for c in core:
         u = (c.get("slot_seed") or 0) - C["slot_base"]
         h, rem = divmod(u, k * N)
         j, r = divmod(rem, k)
         if not (0 <= u < 2 * k * N) or r != c.get("replicate"):
             note("slot seed outside the indexed allocation", c)
             continue
-        for key_, val in ((("core", c["core"]), h), (("j", c["resident_name"]), (c["core"], j))):
-            if idx.setdefault(key_, val) != val:
-                note("an item / core without one fixed index", c)
-        core_h.setdefault(h, c["core"])
-        a = A.index(c["condition"]) if c.get("condition") in A else 0
-        i_name = c["resident_name"] if c["mode"] == "sham" else c.get("invader_name")
-        i_val = idx.get(("j", i_name))
-        if c["mode"] == "sham":
-            i_val = (c["core"], j)
-        want = {"donor_seed": C["donor_base"] + N * u + (i_val[1] if i_val else -10 ** 9),
-                "pred_seed": C["pred_base"] + u if a == 1 else None, "reseed": C["reseed_base"] + len(A) * u + a}
-        for kk, vv in want.items():
-            if c.get(kk) != vv and not (kk == "donor_seed" and i_val is None):
-                note(f"{kk} not the indexed allocation", c)
-    # invaders seen before their own resident cells: a second pass for the donor seeds
-    for c in core:
-        if c.get("mode") == "invade" and ("j", c.get("invader_name")) in idx:
-            u = c["slot_seed"] - C["slot_base"]
-            if c.get("donor_seed") != C["donor_base"] + N * u + idx[("j", c["invader_name"])][1]:
-                note("donor_seed not the indexed allocation", c)
-    keys = {(c["core"], c["resident_name"], c.get("invader_name"), c["mode"], c["replicate"], c.get("condition")) for c in core}
-    for (cr, rn, inv, md, rep, cond) in list(keys):
-        for c2 in A:
-            if (cr, rn, inv, md, rep, c2) not in keys:
-                note(f"cell {rn} <- {inv} r{rep} lacks assay {c2}", {"id": f"{cr}/{rn}/{inv}/r{rep}"})
+        core_hs.setdefault(c["core"], set()).add(h)
+        item_js.setdefault((c["core"], c["resident_name"]), set()).add(j)
+    h_of = {cr: next(iter(hs)) for cr, hs in core_hs.items() if len(hs) == 1}
+    if any(len(hs) != 1 for hs in core_hs.values()) or sorted(h_of.values()) != list(range(2)) or len(h_of) != len(cores):
+        probs.append(f"cores and h are not a bijection onto {{0, 1}}: {dict((cr, sorted(hs)) for cr, hs in core_hs.items())}")
+    j_of = {}
+    for cr in cores:
+        mem = sorted(nm for (cr_, nm) in item_js if cr_ == cr)
+        js = {nm: item_js[(cr, nm)] for nm in mem}
+        if any(len(v) != 1 for v in js.values()) or sorted(next(iter(v)) for v in js.values()) != list(range(N)):
+            probs.append(f"core {cr}: its members and j are not a bijection onto 0..{N - 1} "
+                         f"({sorted((nm, sorted(v)) for nm, v in js.items())[:4]}...)")
+        for nm, v in js.items():
+            if len(v) == 1:
+                j_of[nm] = (cr, next(iter(v)))
+    # (3) the complete primary allocation against the ordered confirm-v1 seed manifest (gate.py seeds): every
+    #     manifest cell exactly once, with exactly its four seeds
+    if not probs and len(cores) == 2:
+        man = {(x["h"], x["assay"], x["j"], x["i"], x["r"]): x for x in confirm_seeds()}
+        seen = set()
+        for c in core:
+            inv = c["resident_name"] if c["mode"] == "sham" else c.get("invader_name")
+            if c["resident_name"] not in j_of or inv not in j_of:
+                note("a cell whose resident / invader has no registered index", c)
+                continue
+            key_ = (h_of[c["core"]], c.get("condition"), j_of[c["resident_name"]][1], j_of[inv][1], c.get("replicate"))
+            m_ = man.get(key_)
+            if m_ is None or (m_["mode"] != c["mode"]):
+                note("a cell outside the confirm-v1 manifest", c)
+                continue
+            if key_ in seen:
+                note("two cells at one manifest position (alias)", c)
+            seen.add(key_)
+            for kk in ("slot_seed", "donor_seed", "pred_seed", "reseed"):
+                if c.get(kk) != m_[kk]:
+                    note(f"{kk} not the confirm-v1 manifest's", c)
+        if len(seen) != len(man):
+            probs.append(f"{len(seen)} of the manifest's {len(man)} primary trajectories are registered")
     probs += [f"{w} (e.g. {cid})" for w, cid in bad.items()]
     members = {}
     for c in core:
@@ -1019,8 +1212,9 @@ def confirmation_plan_problems(cells, read_snapshots=True):
     for cr, m in members.items():
         if len(m) != N:
             probs.append(f"core {cr} has {len(m)} items, the confirmation registers {N}")
-    if read_snapshots:
-        for h, cr in sorted(core_h.items()):
+    if read_snapshots:   # EVERY core's snapshots, with its own h
+        for cr in cores:
+            h = h_of.get(cr)
             frames, preds = {}, set()
             for nm, (path, sha) in sorted(members.get(cr, {}).items()):
                 try:
@@ -1036,7 +1230,7 @@ def confirmation_plan_problems(cells, read_snapshots=True):
             want_f = {s: N // 2 for s in C["snapshot_steps"]}
             if frames != want_f:
                 probs.append(f"core {cr} (h = {h}): snapshot steps {frames}, the confirmation registers {want_f}")
-            if preds != {(0, 4)[h] if h in (0, 1) else None}:
+            if h not in (0, 1) or preds != {(0, 4)[h]}:
                 probs.append(f"core {cr} (h = {h}): home predator counts {sorted(map(str, preds))}, the confirmation "
                              f"registers {(0, 4)[h] if h in (0, 1) else '?'} (h = 0 predator-off homes first)")
     return probs

@@ -991,15 +991,17 @@ def primary_registration(registry, groups, cores, strict=None):
     return spec, {f: sorted(v) for f, v in required.items()}
 
 
-def verify_gate(path, require_formal=True):
+def verify_gate(path, require_formal=True, receipt=None):
     """The calibration gate record the headline claim needs (review round 5 item 1; review of #49, finding 2):
     path = the gate's output directory. gate.verify_record checks the complete chain - a formal 'pass'
     decision, the manifest by hash and byte-identical to the one this code regenerates (the frozen protocol,
     the schedule and all six tool hashes), run.json and cell_laws.json bound to it, every scheduled task
     record present, valid and bound to this run, and the decision re-aggregated with the acceptance rule
-    applied afresh. -> (summary dict, problems); any problem (missing evidence included) withholds the claim."""
+    applied afresh; and the run's receipt equal to `receipt`, the hash recorded outside the directory (the
+    approval record; review of #49, round 2). -> (summary dict, problems); any problem (missing evidence or
+    receipt included) withholds the claim."""
     import gate
-    return gate.verify_record(path, require_formal)
+    return gate.verify_record(path, require_formal, receipt)
 
 
 def primary_blocks(rows, meta, registry, cores, sims, seed=5, kind=infer.DEFAULT_KIND, windows_registered=None,
@@ -1331,6 +1333,8 @@ def main(argv=None):
                                    "cell) and claim_beyond_bounded is reported only with a verified PASSED formal gate, "
                                    "at T = 13,500 only. Without it the claim column is None (both_rejected is "
                                    "descriptive)")
+    ap.add_argument("--gate-receipt", help="the gate run's receipt (gate.py run prints it; the hash recorded in the "
+                                           "approval record right after the run): required for the headline claim")
     a = ap.parse_args(argv)
     os.makedirs(a.out, exist_ok=True)
     horizon = json.load(open(a.horizon)) if a.horizon else None
@@ -1553,7 +1557,7 @@ def main(argv=None):
     confirm = None
     if a.gate:
         import gate as gate_
-        gsum, gprobs = verify_gate(a.gate)
+        gsum, gprobs = verify_gate(a.gate, receipt=a.gate_receipt)
         if a.clock != "steps":
             gprobs.append("the confirmation protocol reads fixed steps (--clock steps)")
         # review of #49, finding 1: the plan itself must be the approved confirmation design (seeds, assays,
