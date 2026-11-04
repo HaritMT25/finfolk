@@ -3957,7 +3957,12 @@
       last: fenced(function () { return fresh(lastS); }), epoch: function () { return worldEpoch; }, initArgs: function () { return initArgs; },
       /* stepToTick's every step, fenced: none into a stopped or restarting engine (false), a trap stops it (false) (review of #44, round 5) */
       step: function (n) { return engineCall(function () { M._oc_step(n); M._oc_sync(); return true; }, false); },
-      importWorld: importWorld,
+      /* prepare's import of a case's world, fenced whole: "" or why not; none into a stopped or restarting engine, a trap
+       * stops it (said so) and answers why, so prepare rejects (review of #44, round 6) */
+      importWorld: function () {
+        var a = arguments;
+        return engineCall(function () { return importWorld.apply(null, a); }, engineBusyWhy());
+      },
       /* the page's own colour switch and state, and whether the charts are up (they suspend the tank) */
       setColourMode: setColourMode, colourMode: function () { return colourMode; },
       dashOpen: function () { return !!(dash() && dash().isOpen()); } });

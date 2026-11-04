@@ -507,7 +507,8 @@
    * hooks (from web/ocean.js): module, scene, profiler, page (EvoOcean), last()
    * (the current snapshot; none once the engine stopped), step(n) (oc_step,
    * oc_sync, fenced: false when it could not), epoch(), initArgs(), importWorld(...) (the page's
-   * own setup import: oc_init, the sheet, afterNewWorld), setPaused(on),
+   * own setup import: oc_init, the sheet, afterNewWorld; fenced: "" or why
+   * not, a stopped engine's too, and prepare rejects), setPaused(on),
    * setColourMode(mode) / colourMode() (the page's own colour switch, the View
    * menu's buttons' too, and the mode it is in), dashOpen() (the charts are up).
    *   prepare(case)   the world (through importWorld when it differs), paused,

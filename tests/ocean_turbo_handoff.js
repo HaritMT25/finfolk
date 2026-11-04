@@ -5035,6 +5035,35 @@ async function review5Bench() {
        '): the engine stops once, said once; stepToTick rejects; from the trap on nothing reaches the module' + nots(k));
 }
 
+/* Codex's sixth review of #44 (codex_reviews/2026-11-04_rereview6_pr44_world-file.md) */
+async function review6BenchImport() {
+    section('Sixth review of #44: the benchmark\'s prepare imports a case\'s world through the page\'s fenced hook; a first trap in its oc_init stops the engine once, prepare rejects, the next frame reads nothing');
+    const p = await bootPage('?renderBench=1&' + PAGE_Q7.slice(1), { perf: true });
+    const calls = {};
+    let at = null, settled = null;
+    for (const f of FENCE_EXPORTS) {
+        const real = p.M[f];
+        calls[f] = 0;
+        p.M[f] = function () {
+            calls[f]++;
+            if (f === '_oc_init') { if (!at) at = Object.assign({}, calls); throw new WebAssembly.RuntimeError('injected: a trap in _oc_init'); }
+            return real.apply(this, arguments);
+        };
+    }
+    try {   /* (another seed: prepare imports the case's world) */
+        p.ctx.EvoOcean.bench.prepare({ worldSeed: 99, population: 12, settleMs: 0 })
+            .then(() => { settled = 'resolved'; }, (e) => { settled = 'rejected: ' + String(e && e.message || e); });
+    } catch (e) { settled = 'threw: ' + String(e && e.message || e); }
+    for (let i = 0; i < 5 && settled === null; i++) await tick();
+    for (let i = 0; i < 3; i++) if (p.raf) p.raf(performance.now() + 1000 * i);   /* the next frames (paused: a sync and a snapshot, were the engine running) */
+    const more = at ? FENCE_EXPORTS.filter(f => calls[f] !== at[f]).map(f => f + ' ' + (calls[f] - at[f])) : ['no trap'];
+    const stops = p.logs.filter(l => /^ocean: The engine stopped \(injected: a trap in _oc_init\)/.test(l[1])).length;
+    const k = { rejected: /^rejected: the case's world was refused: the engine stopped/.test(settled || ''), down: p.T.engineState === 'down', once: calls._oc_init === 1,
+                said: stops === 1, none: !more.length, uncaught: p.uncaught.length === 0 };
+    ok(all(k), 'prepare with another seed, a first trap in its oc_init: the engine stops once, said once; prepare rejects ("' + String(settled).slice(0, 90) +
+       '"); nothing reaches the module after, the next frames\' sync included (' + more.join(', ') + ')' + nots(k));
+}
+
 /* Every section, in order; `node tests/ocean_turbo_handoff.js NAME...` runs only those. */
 const SECTIONS = {
     repeatedKeys, liveLedger, growthPage, randomize, imports,
@@ -5058,7 +5087,7 @@ const SECTIONS = {
     reviewLimits, reviewHeader, reviewTransaction, reviewEngineId, reviewDraft, reviewCapture, reviewStaleRead, reviewTurboStates,
     review2Budget, review2LateFailure, review2Fence, review2SaveLimits, review2SaveFailures, review2Canon,
     review3Worker, review3Reads, review3Fence, review3Save,
-    review4Fence, review4Reads, review5Bench
+    review4Fence, review4Reads, review5Bench, review6BenchImport
 };
 const unhandled = [];
 process.on('unhandledRejection', (e) => { unhandled.push(e); });
