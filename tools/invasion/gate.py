@@ -846,10 +846,16 @@ def cmd_run(a):
     cl_sha = hashlib.sha256(cl_text.encode()).hexdigest()
     results = {}
     tdir = os.path.join(a.out, "tasks")
-    stale = 0
+    stale = cached = 0
     for t in sched:
         p_ = os.path.join(tdir, f"{t[0]:05d}.json")
         if os.path.exists(p_):
+            if man["formal"]:
+                # review of #49, round 3: a FORMAL receipt is issued only over tasks computed by the run that issues
+                # it - a cached record's counters are assertions nobody can authenticate, so a formal resume is a
+                # recompute (a full formal run is ~1.5-2.5 h on 4 workers); exploratory runs may keep the cache
+                cached += 1
+                continue
             try:
                 r = json.load(open(p_))
             except ValueError:
@@ -860,6 +866,8 @@ def cmd_run(a):
             else:
                 stale += 1
     todo = [tuple(t) for t in sched if t[0] not in results]
+    if cached:
+        print(f"gate: formal run: {cached} cached task record(s) ignored; every task is computed by this run", flush=True)
     print(f"gate: {len(sched)} tasks, {len(results)} already done, {stale} stale record(s) recomputed, "
           f"{len(todo)} to run on {a.workers} worker(s)", flush=True)
     t0 = time.time()
@@ -886,17 +894,25 @@ def cmd_run(a):
     # the receipt (review of #49, round 2): one hash over the manifest, the run record, every task record in
     # schedule order and the decision; recorded OUTSIDE this directory (the approval record) right after the run,
     # it is what analyze.py --gate-receipt checks - self-contained hashes alone cannot prove execution
-    rc = receipt(man_sha, run_sha, task_shas, hashlib.sha256(dtext.encode()).hexdigest())
+    computed = len(todo)
+    rc = receipt(man_sha, run_sha, task_shas, hashlib.sha256(dtext.encode()).hexdigest(), man["formal"], computed)
     write_atomic(os.path.join(a.out, "receipt.json"), canon(rc))
     print("\n".join(md))
-    print(f"RECEIPT {rc['receipt']}  (record it in the approval record; analyze.py --gate {a.out} --gate-receipt {rc['receipt']})")
+    if man["formal"] and computed == len(sched):
+        print(f"RECEIPT {rc['receipt']}  (formal: all {computed} tasks computed by this run; record it in the approval "
+              f"record; analyze.py --gate {a.out} --gate-receipt {rc['receipt']})")
+    else:
+        print(f"receipt {rc['receipt']} (EXPLORATORY: {len(sched) - computed} of {len(sched)} task record(s) reused "
+              f"from the cache; not a formal receipt)")
     return 0 if dec["decision"] == "pass" else 1
 
 
-def receipt(man_sha, run_sha, task_shas, dec_sha):
+def receipt(man_sha, run_sha, task_shas, dec_sha, formal=False, computed=0):
+    """The run's receipt: a hash over the manifest, the run record, every task record in schedule order, the
+    decision, whether the run was formal and how many tasks THIS run computed (a formal receipt: all of them)."""
     comp = {"manifest_sha256": man_sha, "run_sha256": run_sha, "task_files_sha256": list(task_shas),
-            "decision_sha256": dec_sha}
-    return {"schema": "finfolk.invasion.gate-receipt/1", "receipt": hashlib.sha256(canon(comp).encode()).hexdigest(),
+            "decision_sha256": dec_sha, "formal": bool(formal), "tasks_computed_by_this_run": int(computed)}
+    return {"schema": "finfolk.invasion.gate-receipt/2", "receipt": hashlib.sha256(canon(comp).encode()).hexdigest(),
             "components": comp}
 
 
@@ -1060,8 +1076,21 @@ def verify_record(path, require_formal=True, receipt_sha=None):
                 probs.append("gate.md is not the report of this decision")
         except OSError:
             probs.append("gate.md: missing")
-        rc = receipt(man_sha, run_sha, shas, dec_sha)["receipt"]
+        try:
+            rj = json.load(open(os.path.join(d, "receipt.json")))
+            rcomp = rj.get("components") or {}
+        except (OSError, ValueError):
+            rj, rcomp = None, {}
+            probs.append("receipt.json: missing or unreadable")
+        computed = rcomp.get("tasks_computed_by_this_run")
+        rformal = rcomp.get("formal") is True
+        if require_formal and not (rformal and computed == len(sched)):
+            probs.append(f"not a formal receipt: the issuing run computed {computed} of {len(sched)} tasks "
+                         f"(a formal receipt covers only tasks computed by the run that issues it)")
+        rc = receipt(man_sha, run_sha, shas, dec_sha, rformal, computed if isinstance(computed, int) else -1)["receipt"]
         summ["receipt"] = rc
+        if rj is not None and rj.get("receipt") != rc:
+            probs.append("receipt.json is not the receipt of this evidence")
         if receipt_sha is None:
             probs.append("no external receipt given (analyze.py --gate-receipt: the hash recorded in the approval record)")
         elif receipt_sha != rc:
