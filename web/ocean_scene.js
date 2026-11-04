@@ -2140,18 +2140,20 @@
      * in the tank's [-W/2, W/2] x [-H/2, H/2], so a centre is within half a
      * chord of the box of the tank's sides and the fish's heights, and its
      * body sphere within a chord + 2 R: from the last frame's largest radius
-     * and chord (|dx| + |dy| >= the chord) and its heights, with 25 % to
-     * spare, the nearest any fish can be (8 corners) and the largest it can
-     * look. Unknown (a first frame, a new world): yes. */
+     * and chord (|dx| + |dy| >= the chord) and its heights, with room for a
+     * frame's change (5 % on the radius, 8 units of swimming on the rest),
+     * the nearest any fish can be (8 corners) and the largest it can look.
+     * Unknown (a first frame, a new world): yes. (A jump the margins miss, a
+     * Turbo return, costs at most one frame of a lit fish drawn plain.) */
     function mayLight(G, g) {
       if (!(g.rMax > 0)) { g.bound = Infinity; return true; }
       var V = G.view, dmin = Infinity;
       for (var i = 0; i < 8; i++) {
-        var x = i & 1 ? halfW : -halfW, y = i & 2 ? g.yMax : g.yMin, z = i & 4 ? halfH : -halfH;
+        var x = i & 1 ? halfW : -halfW, y = i & 2 ? g.yMax + 8 : g.yMin - 8, z = i & 4 ? halfH : -halfH;
         var d = -(V[2] * x + V[6] * y + V[10] * z + V[14]);
         if (d < dmin) dmin = d;
       }
-      g.bound = 1.25 * g.rMax * G.focal / Math.max(dmin - 1.25 * (g.cMax + 2 * g.rMax), G.near);
+      g.bound = 1.05 * g.rMax * G.focal / Math.max(dmin - (g.cMax + 2.1 * g.rMax + 8), G.near);
       return g.bound > 6;
     }
     /* The polished programs compiled ahead, off the frame: the first time a
