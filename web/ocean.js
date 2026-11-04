@@ -17,9 +17,10 @@
  *     at once to the running world too, the rest waiting for Start;
  *     settings that do nothing with the others as they are are dimmed with
  *     the reason (NEEDS); the Run tab: Start from (scenario cards, Surprise
- *     me, a setup file), This run (Replay, Save setup); the start bar
- *     (what runs or what waits, Discard, Start: the same fish or new ones).
- *     One door: every world start is a plan for startWorld.
+ *     me, a file: a setup, staged, or a saved world, opened), This run
+ *     (Replay, Save setup, Save world: the fish themselves, mid-run); the
+ *     start bar (what runs or what waits, Discard, Start: the same fish or
+ *     new ones). One door: every world start is a plan for startWorld.
  *   - the fish card (click or tap a fish): oc_inspect's numbers and its live
  *     brain (oc_set_capture keeps its senses while a fish is selected)
  *   - Turbo: web/ocean_worker.js steps a copy of the module's memory at full
@@ -149,8 +150,34 @@
     });
   }
   function abs(u) { return new URL(u, location.href).href; }
-  var moduleUrls = null;   /* {js, wasm}: the Turbo worker loads the same module */
+  var moduleUrls = null;   /* {js, wasm, handoff}: the Turbo worker (and a saved world's test run) load the same module */
   var noSimd = false;      /* Classic's modules need SIMD too: a start that fails for it offers no Classic */
+  /* The engine build this page runs, pinned at start-up: the bytes of
+   * evo_ocean.wasm fetched once, their sha-256 (the build's identity in a
+   * world file), the module's own maximum memory (its wasm memory section:
+   * a world file's limit) and a Blob URL of those very bytes, which is
+   * what the module, the Turbo worker and a saved world's test run
+   * instantiate (locateFile): so the build a world file names is the one
+   * that ran it, even when the server's file changes meanwhile (a local
+   * server without caching, a deploy while the page is open). */
+  var pinned = null;   /* {bytes, sha256, maxBytes, url} */
+  function pinEngine(url) {
+    if (typeof fetch !== "function") return Promise.reject(new Error("this browser can't fetch " + url));
+    return fetch(url, { credentials: "same-origin" }).then(function (r) {
+      if (!r.ok) throw new Error("could not load " + url + " (HTTP " + r.status + ")");
+      return r.arrayBuffer();
+    }).then(function (b) {
+      var bytes = new Uint8Array(b);
+      return HO.sha256(bytes).then(function (sum) {
+        return { bytes: bytes, sha256: sum, maxBytes: HO.wasmMemoryMax(bytes),
+                 url: URL.createObjectURL(new Blob([bytes], { type: "application/wasm" })) };
+      });
+    });
+  }
+  /* a module instance of the pinned build (a new one after a trap: rebuildEngine) */
+  function makeModule() {
+    return createEvoOcean({ locateFile: function (path) { return path.slice(-5) === ".wasm" ? moduleUrls.wasm : path; } });
+  }
   function loadModule() {
     if (!MOCK) {
       var simd = false;
@@ -162,9 +189,11 @@
     }
     var js = abs(MOCK ? A.mock : A.ocean), wasm = abs(A.oceanWasm);
     moduleUrls = { js: js, wasm: wasm, handoff: abs(A.handoff || "ocean_handoff.js") };
-    return loadScript(js).then(function () {
+    return Promise.all([MOCK ? null : pinEngine(wasm), loadScript(js)]).then(function (r) {
+      pinned = r[0];
+      if (pinned) moduleUrls.wasm = pinned.url;
       if (typeof createEvoOcean !== "function") throw new Error(js + " loaded but defines no createEvoOcean()");
-      return createEvoOcean({ locateFile: function (path) { return path.slice(-5) === ".wasm" ? wasm : path; } });
+      return makeModule();
     });
   }
 
@@ -183,11 +212,13 @@
     if (pageError) { var e = pageError; pageError = ""; return e; }
     return M._oc_last_error ? cString(M._oc_last_error()) : "(no oc_last_error)";
   }
-  /* Take a whole memory image of this same module (the Turbo hand-off): grown
-   * to its size by exactly the pages missing, copied in, the rest zeroed
-   * (web/ocean_handoff.js take(); web/ocean_worker.js says why this carries
-   * the run on exactly). Throws with this page's memory not overwritten. */
-  function takeMemory(src) { HO.take(M, src, "the page's"); }
+  /* Take a whole memory image of this same module (the Turbo hand-off; a
+   * saved world, startWorld's "open"): grown to its size by exactly the
+   * pages missing, copied in, the rest zeroed (web/ocean_handoff.js take();
+   * web/ocean_worker.js says why this carries the run on exactly). full:
+   * the image's length when src is its stored bytes only (a world file's,
+   * an open's undo). Throws with this page's memory not overwritten. */
+  function takeMemory(src, full) { HO.take(M, src, "the page's", full); }
 
   var W = 0, H = 0, D = 0, statsLen = 0, HAS_VZ = false, HAS_EYE = false, HAS_APP = false;
   var WALLS = false;   /* the running world has glass walls (oc_walls_enabled) */
@@ -207,9 +238,12 @@
     statsLen = M._oc_stats_len();
     readLight();
   }
+  /* the build's E1 preset (a copy each time), read from the engine once,
+   * never from a stopped one (a scenario card asks it) */
+  var e1Text = null;
   function e1Preset() {
-    if (!has("oc_e1_preset")) return null;
-    try { return JSON.parse(cString(M._oc_e1_preset())); } catch (e) { return null; }
+    if (e1Text === null && has("oc_e1_preset") && engineState === "ok") e1Text = cString(M._oc_e1_preset());
+    try { return e1Text === null ? null : JSON.parse(e1Text); } catch (e) { return null; }
   }
 
   /* ---------------- the world's settings ---------------- */
@@ -289,7 +323,8 @@
   /* ---------------- one door to a new world ----------------
    * Every world start is a plan, and only startWorld(plan) turns one into a
    * world: Start and its menu, R / Shift+R, Replay, a scenario, a setup
-   * file, the link at start-up (importWorld), the benchmark (importWorld).
+   * file, a saved world (From a file: op "open"), the link at start-up
+   * (importWorld), the benchmark (importWorld).
    * A Turbo hand-back is not a start (the same world: no new epoch, the
    * charts kept). startWorld runs only while this page owns the world, and
    * at once, never from a frame: oc_init (or oc_reset for Replay), then the
@@ -298,10 +333,25 @@
    * requestStart (below) is the visitor's way to it: it checks the plan,
    * asks inline when the run has something to lose, and in Turbo stops it
    * first (the ordinary hand-back), then starts.
-   * plan: {source, op: "init" | "replay", engine, build() -> {seed,
+   * plan: {source, op: "init" | "replay" | "open", engine, build() -> {seed,
    *   population, depth, size: [w, h], cfg, raw, repeats}, url (write the
    *   address), check() -> "" or why not (before anything stops),
    *   done(), the toast on success, failed: the refusal's opening}
+   * op "open": a saved world (Save world's file, checked whole, against this
+   * engine build and in a test run of its own before it gets here:
+   * openWorldFile): world {header, data, bytes, at (the test run's view of
+   * it), initArgs, runCfg, picked, name, token}; its memory image goes in
+   * (HO.take: grown, copied, the rest zeroed, as the Turbo hand-back)
+   * instead of an oc_init, and the page's bookkeeping is the file's
+   * (initArgs: the setup it started from, which Replay replays; runCfg: its
+   * settings when saved), prepared before the image goes in. A new world
+   * all the same: one epoch, the charts and the selection cleared. It is a
+   * transaction: the running world's memory is copied first (undo), and
+   * anything that throws once the image is in (the world read back and
+   * compared with the test run's, the bookkeeping, the open's done()) puts
+   * the run back as it was (restoreRun); a trap in the module (its stack
+   * and globals can't be trusted after one) makes a new module of the same
+   * build first (rebuildEngine), then puts the run back into it.
    * engine: the module the world runs in, "ocean" (this page's, the
    * default); a plan may name another, which this page refuses until it
    * can load one (the eye world will). */
@@ -310,10 +360,11 @@
   var turboReturn = null;    /* the fish to select / follow again after Turbo (restoreAfterTurbo) */
   function startWorld(plan) {
     if (!M) return { ok: false, why: "the engine is not loaded" };
+    if (engineState !== "ok") return { ok: false, why: engineBusyWhy() };
     if (turboState !== "live") return { ok: false, why: "Turbo owns the world" };
     if ((plan.engine || ENGINE) !== ENGINE)
       return { ok: false, why: "that world needs the " + plan.engine + " engine module, and this page runs the " + ENGINE + " one" };
-    var a = plan.op === "replay" ? null : plan.build();
+    var a = plan.op === "init" ? plan.build() : null, undo = null;
     /* Replay keeps what waits (a staged recipe: the whole sheet; else the
      * fields that differ from this world, as typed), never the live tweaks
      * it drops: those fields equal this world, so they go back with it */
@@ -321,21 +372,171 @@
     if (plan.op === "replay") {
       if (!initArgs || !M._oc_reset()) return { ok: false, why: "oc_reset failed: " + lastError() };
       runCfg = Object.assign({}, initArgs.cfg);
+    } else if (plan.op === "open") {
+      var w = plan.world;
+      if (!w.data) return { ok: false, why: "it was opened already (open its file again)" };
+      try { undo = runNow(); }   /* the run as it is, before anything is overwritten */
+      catch (err) { return { ok: false, why: "there is no room to keep your run while it opens (" + (err && err.message || err) + ")" }; }
+      try {
+        takeMemory(w.data, w.bytes);   /* (it throws before it overwrites anything when it can't grow; any throw: the run back) */
+        var why = HO.worldMismatch(HO.worldNow(M), HO.worldExpect(w.header));   /* the module's world: the test run's */
+        if (why) throw new Error(why);
+      } catch (err) { return restoreRun(undo, err); }
+      initArgs = w.initArgs; runCfg = Object.assign({}, w.runCfg);   /* (prepared when it was read) */
+      w.data = null;   /* in the module now */
     } else if (!initWorld(a.seed, a.population, a.depth, a.cfg, a.raw, a.repeats, a.size)) {
       return { ok: false, why: lastError() };
     }
     /* committed: the page's bookkeeping, once */
-    clearFieldNotes();
-    afterNewWorld();
-    stepOnce = false; summary = null; usedTurbo = false; turboReturn = null;
-    if (plan.op !== "replay") { draft = null; projectForm(); }   /* a start consumes the draft */
-    else if (keep) { projectForm(); keep.forEach(function (e) { setRaw(e[0], e[1]); }); updateNeeds(); updateTabDots(); }
-    draftGen++;   /* every new world, Replay too (which keeps the draft): a setup file read from before it is stale */
-    if (plan.imported && a) warnOdd(a.cfg);   /* (a setup from outside the sheet: what it ran) */
-    if (plan.url) writeUrl();
-    hideAsk();
+    try {
+      clearFieldNotes();
+      afterNewWorld();
+      stepOnce = false; summary = null; usedTurbo = false; turboReturn = null;
+      if (plan.op === "init") { draft = null; projectForm(); }   /* a start consumes the draft */
+      else if (plan.op === "open") { draft = null; projectRunning(); }   /* (its settings now: its live tweaks too) */
+      else if (keep) { projectForm(); keep.forEach(function (e) { setRaw(e[0], e[1]); }); updateNeeds(); updateTabDots(); }
+      draftGen++;   /* every new world, Replay too (which keeps the draft): a setup file read from before it is stale */
+      if (plan.imported && a) warnOdd(a.cfg);   /* (a setup from outside the sheet: what it ran) */
+      if (plan.url) writeUrl();
+      hideAsk();
+      renderStartBar();
+    } catch (err) {
+      if (!undo) throw err;
+      return restoreRun(undo, err);
+    }
+    return { ok: true, why: "", undo: undo };
+  }
+  /* ---- the open's undo: the run as it was, and putting it back ----
+   * runNow: the running world's memory (without its zero tail: a copy of
+   * what it uses) and the page's bookkeeping of it, before a saved world's
+   * image overwrites it. restoreRun(undo, err): the image failed once it
+   * was in (err): the run goes back, the memory and the page as they were
+   * (the epoch, the selection, the sheet, what waits); the answer is the
+   * open's refusal. A trap (WebAssembly.RuntimeError) leaves a module
+   * whose stack and globals can't be trusted, and a restore that throws
+   * leaves one that can't be used: either way rebuildEngine makes a new
+   * module of the same pinned build and puts the run into it. */
+  var engineState = "ok";   /* "ok", "restarting" (rebuildEngine), "down" (it stopped: engineStopped) */
+  function engineBusyWhy() {
+    return engineState === "restarting" ? "the engine is restarting with your run: a moment" : "the engine stopped: reload the page";
+  }
+  /* Everything the commit changes is in it (review of #44, round 2, finding
+   * 2): the memory, the world's bookkeeping, the epoch, the selection and
+   * the follow, the sheet and what waits (the draft, its generation), the
+   * charts' history (its rows, interval and origin), the sampling and the
+   * rates, Turbo's history (usedTurbo: a reason to ask) and the fish Turbo
+   * picks up again (turboReturn), the pause, the address. */
+  function runNow() {
+    var u8 = new Uint8Array(heap()), fields = {};
+    Object.keys(KEYS).forEach(function (k) { if (el("o_" + k)) fields[k] = rawOf(k); });
+    return { data: u8.slice(0, HO.storedLength(u8)), bytes: u8.length, initArgs: initArgs, runCfg: runCfg, epoch: worldEpoch,
+             selectedId: selectedId, wantFollow: wantFollow, following: !!(scene && scene.following()), draft: draft, draftGen: draftGen,
+             fields: fields, extraCfg: Object.assign({}, extraCfg), nextOnly: Object.assign({}, nextOnly), paused: paused, url: location.href,
+             dash: dash() && dash().save ? dash().save() : null, sampleBucket: sampleBucket, rates: rates.q.slice(),
+             usedTurbo: usedTurbo, turboReturn: turboReturn, stepOnce: stepOnce, summary: summary };
+  }
+  /* the page's side of a run put back (its memory is in the module again) */
+  function pageBack(u) {
+    initArgs = u.initArgs; runCfg = u.runCfg; worldEpoch = u.epoch; draft = u.draft; draftGen = u.draftGen;
+    selectedId = null; wantFollow = false;
+    afterNewWorld(true);   /* this world read again: no new epoch (the charts: below) */
+    if (u.dash && dash() && dash().restore) dash().restore(u.dash);
+    sampleBucket = u.sampleBucket; rates.q = u.rates.slice();
+    usedTurbo = u.usedTurbo; turboReturn = u.turboReturn; stepOnce = u.stepOnce; summary = u.summary;
+    Object.keys(u.fields).forEach(function (k) { setRaw(k, u.fields[k]); });
+    extraCfg = u.extraCfg; nextOnly = u.nextOnly;
+    updateNeeds(); updateTabDots();
+    /* the fish and the follow as they were, both ways (the open may have followed one) */
+    var back = u.selectedId !== null && indexOfId(fresh(lastS), u.selectedId) >= 0;
+    if (back) select(u.selectedId, true);
+    wantFollow = back && u.wantFollow;
+    if (scene && scene.following() !== (back && u.following)) scene.setFollow(back && u.following);
+    setPaused(u.paused);
+    try { if (location.href !== u.url) history.replaceState(null, "", u.url); } catch (e) { /* file:// or a sandboxed frame */ }
     renderStartBar();
-    return { ok: true, why: "" };
+  }
+  function restoreRun(u, err) {
+    var why = String(err && err.message || err);
+    if (!(err instanceof WebAssembly.RuntimeError)) {
+      try {
+        takeMemory(u.data, u.bytes);
+        pageBack(u);
+        return { ok: false, why: why + ". Your run carries on, as it was" };
+      } catch (err2) { why += "; putting your run back failed too (" + (err2 && err2.message || err2) + ")"; }
+    }
+    rebuildEngine(u);
+    return { ok: false, why: why + ". The engine stopped on it, so it is restarting with your run" };
+  }
+  /* a new module of the pinned build, the run u put into it (engineState
+   * "restarting" meanwhile: no frame steps, nothing starts) */
+  var rebuilds = 0;
+  function rebuildEngine(u) {
+    engineState = "restarting";
+    rebuilds++;
+    makeModule().then(function (m2) {
+      HO.take(m2, u.data, "the page's", u.bytes);
+      M = m2;
+      if (window.EvoOcean) EvoOcean.module = M;
+      engineState = "ok";
+      pageBack(u);
+      if (turboReturn) restoreAfterTurbo();   /* (Stop Turbo & open: the fish Turbo had, picked up again now the run is back) */
+      showNote("The engine restarted, and your run is back where it was.");
+    }).catch(function (e) {
+      engineState = "down";
+      showError("The engine could not restart (" + (e && e.message || e) + "). Reload the page to go on; Save setup still saves this world's setup.");
+    });
+  }
+  /* the engine trapped while the page used it: nothing more is stepped, read or started (a reload is the way on);
+   * said once per trap (an inner fence says it, then hands the trap to the operation's own) */
+  var stoppedBy = null;
+  function engineStopped(err) {
+    if (engineState === "down" && stoppedBy === err) return;
+    stoppedBy = err;
+    engineState = "down";
+    showError("The engine stopped (" + (err && err.message || err) + "), so this world can't go on. Reload the page to go on; Save setup still saves its setup.");
+  }
+  /* How deep the fences are now (the frame, an operation from outside, an
+   * engine call). A trap stops the engine at the innermost; it then goes on
+   * to the outermost, which ends the whole operation: nothing after it in
+   * the operation reaches the module (review of #44, round 4, finding 1:
+   * an inner fence that swallowed it let the operation call on, a live
+   * setting's refusal reading lastError, a recovery reading the frame). */
+  var fenceDepth = 0;
+  function trapped(err) {
+    if (!(err instanceof WebAssembly.RuntimeError)) return false;
+    engineStopped(err);
+    return fenceDepth === 1;   /* (the outermost: the operation ends here) */
+  }
+  /* An engine call outside the frame and the transaction: a control, the
+   * charts' timer, the console's handle. Nothing while the engine is
+   * restarting or down (fallback; said so once a while for a visitor's
+   * action: say); a trap in it stops the engine once (engineStopped)
+   * instead of throwing at every use; inside an operation, that operation
+   * ends with it. */
+  var busySaidT = -Infinity;
+  function engineCall(fn, fallback, say) {
+    if (!M || engineState !== "ok") {
+      if (say && M && performance.now() - busySaidT > 2000) { busySaidT = performance.now(); showNote(say + ": " + engineBusyWhy() + "."); }
+      return fallback;
+    }
+    fenceDepth++;
+    try { return fn(); }
+    catch (err) { if (trapped(err)) return fallback; throw err; }
+    finally { fenceDepth--; }
+  }
+  /* A whole operation from outside (a button, a key, a field, Turbo's
+   * messages, the console's handles), as one: a trap anywhere in it stops
+   * the engine once instead of escaping, and nothing after it in the
+   * operation runs (review of #44, round 3, finding 3). What it reaches
+   * while the engine is down is gated where it reaches it (select,
+   * startWorld, follow, the hand-back, ...). */
+  function fenced(fn) {
+    return function () {
+      fenceDepth++;
+      try { return fn.apply(this, arguments); }
+      catch (err) { if (trapped(err)) return undefined; throw err; }
+      finally { fenceDepth--; }
+    };
   }
   /* the sheet shows the world that now runs: its seed, size and settings
    * (initArgs; the keys it has no field for kept aside) */
@@ -384,7 +585,7 @@
     });
     if (odd.length) console.warn("ocean: the sheet shows " + odd.join(", ") + " differently from the setup it runs");
   }
-  /* a new world (oc_init or oc_reset), or one handed back by Turbo */
+  /* a new world (oc_init or oc_reset; a saved world opened), or one handed back by Turbo */
   function afterNewWorld(fromTurbo) {
     if (!fromTurbo) worldEpoch++;
     var w0 = W, h0 = H, d0 = D, g0 = WALLS;
@@ -393,13 +594,19 @@
     M._oc_sync();         /* the last snapshot's views are the old world's: */
     lastS = snapshot();   /* the new world's now, not at the next frame */
     if (scene && (W !== w0 || H !== h0 || D !== d0 || WALLS !== g0)) { scene.setWorld(W, H, D, { walls: WALLS }); labelHist(); }
+    /* a new world has nothing picked, BEFORE the capture is set from the
+     * selection (applyDisplaySwitches): it was set from the old one, and
+     * kept capturing senses with nothing selected (review of #44, finding 6;
+     * a saved world picks its fish again after this, which sets it again) */
+    if (!fromTurbo) {
+      selectedId = null; wantFollow = false;
+      if (scene && scene.following()) scene.setFollow(false);
+    }
     applyDisplaySwitches();
     updateModeline();     /* the world's appearance genes may differ */
     estPrev.n = 0;
     stepMs = 0;
     if (!fromTurbo) {
-      selectedId = null; wantFollow = false;
-      if (scene && scene.following()) scene.setFollow(false);
       if (window.EvoOceanDash) EvoOceanDash.reset();
       sampleBucket = -1;
       rates.reset();
@@ -499,7 +706,7 @@
       ctl.appendChild(makeStepper(input, key, opt.min, opt.max));
     }
     input.id = id;
-    if (LIVE[key]) input.addEventListener("change", function () { applyLive(key); });
+    if (LIVE[key]) input.addEventListener("change", fenced(function () { applyLive(key); }));
     row.appendChild(left);
     row.appendChild(ctl);
     attachTip(row, key);
@@ -640,7 +847,9 @@
       return null;
     }
     if (!has("oc_set_param")) return false;
-    var ok = withCString(key, function (p) { return M._oc_set_param(p, num); });
+    var ok = engineCall(function () { return withCString(key, function (p) { return M._oc_set_param(p, num); }); }, null);
+    if (ok === null) { refuse(key, engineBusyWhy(), keep); return false; }   /* (it trapped, or the engine is not there) */
+    /* (what follows, the light read back: inside the operation's fence, its field's change or Turbo's hand-back) */
     if (ok) liveApplied(key, valOf(key, num), quiet);
     else refuse(key, lastError(), keep);
     return !!ok;
@@ -739,14 +948,14 @@
       "<p>Surface waves, a gentle deep current with food drifting in it, light that fades with depth, and depth costs scaled to each fish's " +
       "metabolism, put into these tabs on top of the rest (predators, food, ... stay). They wait for the next start. The whole " +
       "<b>Living water</b> world is in Run › Start from.</p>";
-    box.querySelector("#e1add").addEventListener("click", function () {
+    box.querySelector("#e1add").addEventListener("click", fenced(function () {
       var p = e1Preset();
-      if (!p) { showError("this module has no E1 preset (oc_e1_preset)"); return; }
+      if (!p) { showError(engineState !== "ok" ? "The E1 water: " + engineBusyWhy() + "." : "this module has no E1 preset (oc_e1_preset)"); return; }
       cfgToForm(p);
       updateNeeds(); updateTabDots(); renderStartBar();
       showNote("The E1 water is in the tabs: it waits for the next start.");
       this.blur();
-    });
+    }));
     return box;
   }
 
@@ -1083,7 +1292,11 @@
   function sheetKey() {
     return JSON.stringify([draft ? draft.gen : 0, Object.keys(KEYS).map(function (k) { return el("o_" + k) ? rawOf(k) : null; }), extraCfg]);
   }
-  function planKey(plan) { return plan.op === "replay" ? "replay " + (initArgs ? initArgs.seed : "") : JSON.stringify(plan.build()) + " " + sheetKey(); }
+  function planKey(plan) {
+    if (plan.op === "replay") return "replay " + (initArgs ? initArgs.seed : "");
+    if (plan.op === "open") return "open " + plan.world.token + " " + sheetKey();   /* (the file as read; what waits, which it drops) */
+    return JSON.stringify(plan.build()) + " " + sheetKey();
+  }
   function runAge() {
     var f = turboState !== "live" && turboStats ? turboStats.frame : (lastS ? (fresh(lastS).stats[1] || 0) : 0);
     return f * DT;
@@ -1106,12 +1319,18 @@
    * remembered when it was staged: a card picked on an untouched sheet adds
    * no question by itself) */
   function editsWaiting() { return pendingDiff().length > 0 || !!(draft && draft.hadEdits); }
-  function loseReasons() {
+  /* What a start would lose. Opening a saved world drops every staged
+   * recipe, an untouched one too (a Surprise me drawn, Hunters, a setup
+   * file picked): it is not the world that opens, so it is something to
+   * lose (review of #44, finding 4). Starting a staged recipe needs no
+   * question for itself: it is what was picked. */
+  function loseReasons(plan) {
     var r = [], age = runAge(), tw = liveTweaks();
     if (age >= 300) r.push(fmtTime(age) + " of evolution");
     if (usedTurbo || turboState !== "live") r.push("Turbo's progress");
     if (tw.length) r.push(tw.length === 1 ? "a live tweak (" + (LABELS[tw[0]] || tw[0]) + ")" : tw.length + " live tweaks");
     if (editsWaiting()) r.push("edits waiting");
+    else if (draft && plan && plan.op === "open") r.push("the staged " + draft.title);
     return r;
   }
   /* "started", "asked", "waiting" (for Turbo's hand-back) or "refused" */
@@ -1120,7 +1339,8 @@
     var why = plan.check ? plan.check() : "";
     if (why) { showError("Couldn't start that world: " + why + "."); return "refused"; }
     if (pendingStart) { showNote("A new world is already waiting for Turbo to stop."); return "waiting"; }
-    if (loseReasons().length && !confirmed) { askStart(plan); return "asked"; }
+    if (engineState !== "ok") { showError("Couldn't start that world: " + engineBusyWhy() + "."); return "refused"; }
+    if (loseReasons(plan).length && !confirmed) { askStart(plan); return "asked"; }
     clearError();
     if (turboState === "live") return commitStart(plan) ? "started" : "refused";
     pendingStart = { plan: plan, key: planKey(plan) };
@@ -1132,7 +1352,10 @@
   function commitStart(plan) {
     var r = startWorld(plan);
     if (!r.ok) { showError((plan.failed || "Couldn't start that world: ") + r.why); return false; }
-    if (plan.done) plan.done();
+    if (plan.done && r.undo) {   /* an open's last step is part of it: its failure puts the run back too */
+      try { plan.done(); }
+      catch (err) { showError((plan.failed || "Couldn't start that world: ") + restoreRun(r.undo, err).why); return false; }
+    } else if (plan.done) plan.done();
     return true;
   }
   /* Turbo handed the world back with a start waiting: the same plan, or none */
@@ -1169,6 +1392,17 @@
     var turbo = turboState !== "live", replaying = plan.op === "replay", age = runAge(), lose = [], tw = liveTweaks();
     if (age >= 300) lose.push(fmtTime(age) + " of evolution");
     if (usedTurbo || turbo) lose.push("what Turbo ran");
+    if (plan.op === "open") {   /* a saved world: its own settings, nothing of this run's */
+      var dl = pendingDiff(), dlist = dl.slice(0, 3).map(fieldText).join(", ") + (dl.length > 3 ? " and " + (dl.length - 3) + " more" : "");
+      showAsk((turbo ? "This stops Turbo and replaces your run" : "This replaces your run") + (lose.length ? ", and " + lose.join(" and ") + " with it" : "") +
+        ". It opens " + worldText(plan.world) + "." +
+        /* every staged recipe, untouched too (finding 4), and every edit that waits: named, and dropped */
+        (draft || dl.length ? " What waits for the next start" + (draft ? " (" + draft.title + (dl.length ? ", changed: " + dlist : "") + ")" : " (" + dlist + ")") + " is dropped." : "") +
+        (tw.length ? " Your live tweak" + (tw.length === 1 ? "" : "s") + " (" + tw.map(function (k) { return (LABELS[k] || k) + " " + valText(k, cfgVal(k)); }).join(", ") + ") " +
+                     (tw.length === 1 ? "goes" : "go") + ": the saved world has its own settings." : ""),
+        turbo ? "Stop Turbo & open" : "Open it", "Keep it");
+      return;
+    }
     var b = replaying ? null : plan.build(), kept = [], other = [];
     tw.forEach(function (k) {
       if (replaying) return;
@@ -1222,7 +1456,7 @@
   function cancelAsk() {
     var a = asking;
     hideAsk();
-    showNote(a && a.replace ? "Kept your changes." : "Kept your run.");
+    showNote(a && a.noNote ? a.noNote : a && a.replace ? "Kept your changes." : "Kept your run.");
     if (a && a.opener) a.opener.focus();   /* a question the keyboard opened: the focus back where it was (askBtn) */
   }
   /* the start bar's menu: Start again (same fish), Start fresh (new fish) */
@@ -1289,28 +1523,358 @@
   /* Version 2 (glass walls): `walls` is its own field, always written; a
    * version-1 file (before walls existed) loads as a wrapping world. */
   var SETUP_VERSION = 2;
-  function saveSetup() {
-    if (!initArgs) return;
+  /* the running world's setup, as Save setup writes it (a world file carries one too) */
+  function setupNow() {
     var config = Object.assign({}, runCfg);
     delete config.walls;
-    var setup = { format: "evo_ocean_setup", version: SETUP_VERSION, seed: initArgs.seed, population: initArgs.population,
-                  depth: initArgs.depth, width: W, height: H, walls: WALLS, config: config };
-    var url = URL.createObjectURL(new Blob([JSON.stringify(setup, null, 2)], { type: "application/json" }));
+    return { format: "evo_ocean_setup", version: SETUP_VERSION, seed: initArgs.seed, population: initArgs.population,
+             depth: initArgs.depth, width: W, height: H, walls: WALLS, config: config };
+  }
+  function download(blob, name) {
+    var url = URL.createObjectURL(blob);
     var a = document.createElement("a");
-    a.href = url; a.download = "evo_ocean_setup_seed" + initArgs.seed + ".json";
+    a.href = url; a.download = name;
     document.body.appendChild(a); a.click(); a.remove();
-    URL.revokeObjectURL(url);
+    setTimeout(function () { URL.revokeObjectURL(url); }, 0);   /* (after the click has handed it over) */
+  }
+  /* the live edits not in a saved world or setup yet (held, or on their way to the worker) */
+  function onTheWay() { return Object.keys(live.held()).concat(live.inflight().map(function (e) { return e[0]; })); }
+  function saveSetup() {
+    if (!initArgs) return;
+    download(new Blob([JSON.stringify(setupNow(), null, 2)], { type: "application/json" }), "evo_ocean_setup_seed" + initArgs.seed + ".json");
     /* during Turbo too: runCfg is what the world accepted (the worker's acknowledgements) */
-    var onWay = Object.keys(live.held()).concat(live.inflight().map(function (e) { return e[0]; }));
+    var onWay = onTheWay();
     toast("Saved this world's setup (seed " + initArgs.seed + ")" +
           (waitingNow() ? ". What waits for the next start is not in it: start first to include it." : ".") +
           (onWay.length ? " Not in it yet: " + onWay.map(function (k) { return LABELS[k] || k; }).join(", ") + ", still on the way to the world." : ""));
+  }
+
+  /* ---- Save world, and a saved world opened (web/ocean_handoff.js: the file) ----
+   * Save world writes the running world itself — every fish, its brain and
+   * genes, the food, the predators, the rng, the frame — as the module's
+   * memory image (the one the Turbo hand-off moves) with a header: the
+   * engine build it ran on (the sha-256 of the evo_ocean.wasm this page
+   * pinned and runs: pinEngine), the setup it started from (initArgs: what
+   * Replay replays), its settings now (runCfg: the live tweaks accepted),
+   * its Save setup file, and the fish picked (and followed) then, with its
+   * family line and place. In Turbo the worker hands over a copy between
+   * chunks and runs on (no Stop, nothing lost): the settings are the ones
+   * it acknowledged before it copied, the fish the one picked when Save
+   * world was pressed. View preferences (colours, clarity, the flashlight,
+   * speed, pause) are the visitor's, never the world's, and stay out of it.
+   * From a file opens one (the same card as a setup file, which it tells
+   * apart by its first bytes), read part by part, each part checked before
+   * the next is read (HO.readWorld: the size, the header and its checksum,
+   * the lengths; HO.headerProblem: every field of it), against this engine
+   * build (another build can't take the image: its setup, from the checked
+   * header, is offered instead), the body unpacked and checked; then tried
+   * in a module of its own, in a worker (probeWorld: the image in, checked
+   * against its header, one step), so a file whose image is not a world
+   * this engine can run is refused with the run untouched; then through the
+   * one door (requestStart, op "open"): asked first when the run has
+   * something to lose (a staged recipe included), Stop Turbo & open during
+   * Turbo, one new epoch, a transaction (startWorld). Replay then replays
+   * its setup from its start, frame 0; the file opened again goes back to
+   * the saved moment. */
+  /* this page's engine build: the sha-256 of the bytes it pinned and runs */
+  function engineId() { return pinned ? Promise.resolve(pinned.sha256) : Promise.reject(new Error("this page runs no engine build of its own")); }
+  function shortId(id) { return String(id || "?").slice(0, 8); }
+  var RULES = { keys: KEYS, live: LIVE, lim: LIM, setupVersion: SETUP_VERSION };   /* a world file's header (HO.headerProblem) */
+  var worldSave = null;   /* a Save world under way: {id, picked}; with a worker: waiting for its copy */
+  var worldSaveSeq = 0;
+  /* the fish picked (and followed) now, for the file, with its family line
+   * and place (returnPoint's: what the open needs to pick its nearest
+   * kin, as Turbo's hand-back does, if it is gone); in Turbo the one Turbo
+   * will pick up again (its place when Turbo took the world) */
+  function pickedNow() {
+    var r = turboState !== "live" ? turboReturn : returnPoint();
+    return r ? { id: r.id, follow: !!r.follow, family: r.family, x: r.x, y: r.y, d: r.d } : null;
+  }
+  /* What this device opens (and so saves): a world file's image at most
+   * `image`, and an open holding at most `budget` at once (openNeeds), from
+   * navigator.deviceMemory (Chrome's: GB, reported up to 8) or, where the
+   * browser doesn't say (Firefox, Safari), the kind of device (a coarse
+   * pointer: a phone or a tablet, the smaller). The largest world the page
+   * can start uses 185 MiB; a phone's tab is closed well below 1 GB. */
+  function deviceBudget() {
+    var MiB = 1048576, nav = window.navigator, dm = nav && typeof nav.deviceMemory === "number" && nav.deviceMemory > 0 ? nav.deviceMemory : 0;
+    if (dm >= 8) return { budget: 1536 * MiB, image: 512 * MiB };
+    if (dm >= 4) return { budget: 768 * MiB, image: 256 * MiB };
+    if (dm >= 2) return { budget: 384 * MiB, image: 128 * MiB };
+    if (dm > 0) return { budget: 192 * MiB, image: 64 * MiB };
+    return coarseMQ.matches ? { budget: 384 * MiB, image: 128 * MiB } : { budget: 768 * MiB, image: 256 * MiB };
+  }
+  function worldLimitsHere() { return HO.worldLimits(pinned ? pinned.maxBytes : null, deviceBudget().image); }
+  /* a world whose memory is more than a world file holds here: never written (this page could not open it again) */
+  function tooBigToSave(bytes, lim) {
+    return "Couldn't save the world: it uses " + fmtMB(bytes) + " of memory, more than a world file holds on this device (" + fmtMB(lim.image) +
+           "), so it could not be opened again. Save setup keeps its recipe; a reload starts the engine small again (its memory never shrinks).";
+  }
+  /* Save world: the reader's limits first, before anything is copied (in
+   * Turbo the worker checks them before its copy); a failure anywhere (the
+   * copy, the encoding, the download) says so and leaves Save world free to
+   * press again (writeWorld; review of #44, round 2, findings 4 and 5) */
+  function saveWorld() {
+    if (!M || !initArgs) return;
+    if (MOCK) { showNote("Save world needs the real engine."); return; }
+    if (engineState !== "ok") { showNote("Save world: " + engineBusyWhy() + "."); return; }
+    if (worldSave) { showNote("Saving the world: a moment."); return; }
+    if (turboState === "entering" || turboState === "exiting") { turboWait(); return; }
+    var lim = worldLimitsHere();
+    if (turboState === "turbo") {   /* the worker's copy, between two of its chunks: Turbo runs on */
+      worldSave = { id: ++worldSaveSeq, waiting: true, picked: pickedNow(), lim: lim };   /* (the fish as now, not when the copy comes) */
+      turboWorker.postMessage({ cmd: "snapshot", id: worldSave.id, maxBytes: lim.image });
+      errEl.textContent = "Saving the world from Turbo (it keeps running)…"; errEl.className = "";   /* (no toast: the saved one follows) */
+      return;
+    }
+    if (heap().byteLength > lim.image) { showError(tooBigToSave(heap().byteLength, lim)); return; }
+    var my = worldSave = { id: ++worldSaveSeq, picked: null, lim: lim }, mem, s;
+    try {
+      my.picked = pickedNow();   /* (first: its card's oc_inspect may allocate; the copy is the world after it, as it runs on) */
+      s = fresh(lastS);   /* this frame's numbers: no step since its sync, so the image's */
+      /* again, right before the copy: the inspection may have grown the memory past the limit (review of #44, round 3, finding 4) */
+      if (heap().byteLength > lim.image) { worldSave = null; showError(tooBigToSave(heap().byteLength, lim)); return; }
+      mem = heap().slice(0);
+    } catch (err) {
+      if (worldSave === my) worldSave = null;
+      if (err instanceof WebAssembly.RuntimeError) { engineStopped(err); return; }
+      showError("Couldn't save the world: " + (err && err.message || err) + ". Nothing was written; Save world again to retry.");
+      return;
+    }
+    writeWorld(mem, { frame: s.stats[1], pop: s.n, food: s.fc, pred: s.pc }, my.picked);
+  }
+  /* the worker's answer to Save world: its copy; or none (it has no world any more), too big, or no room for the copy (Turbo runs on) */
+  function onSnapshot(msg) {
+    if (!worldSave || !worldSave.waiting || msg.id !== worldSave.id) return;
+    var my = worldSave;
+    my.waiting = false;
+    if (msg.tooBig) { worldSave = null; showError(tooBigToSave(msg.tooBig, my.lim)); return; }
+    if (msg.error) { worldSave = null; showError("Couldn't save the world: " + msg.error + ". Turbo runs on with its world; Save world again to retry."); return; }
+    if (msg.none || !msg.mem) { worldSave = null; showError("Couldn't save the world: Turbo had no world to copy. Try again."); return; }
+    writeWorld(msg.mem, msg, my.picked);
+  }
+  /* Turbo went (its worker failed or was dropped) with a Save world waiting for its copy */
+  function cancelSnapshot(why) {
+    if (!worldSave || !worldSave.waiting) return;
+    worldSave = null;
+    showError("The world was not saved: " + why + ". Save it again.");
+  }
+  function worldHeader(at, picked, id) {
+    return { format: HO.WORLD.FORMAT, version: HO.WORLD.VERSION, app: "Finfolk Ocean", saved: new Date().toISOString(),
+             engine: { module: "evo_ocean", wasmSha256: id, eye: HAS_EYE },
+             frame: at.frame, fish: at.pop, food: at.food, predators: at.pred,
+             start: JSON.parse(JSON.stringify(initArgs)), runCfg: Object.assign({}, runCfg), setup: setupNow(), picked: picked };
+  }
+  /* the file from its copy: a throw anywhere (the header, the encoding, the
+   * Blob, the download) is reported, and the save is over either way (this
+   * save's own: a newer one is never cleared). The copy itself is checked
+   * against the reader's limits first (the save's, my.lim), whoever made
+   * it, and encodeWorld checks them again: nothing this page could not open
+   * again is downloaded. */
+  function writeWorld(mem, at, picked) {
+    var my = worldSave, header = null, onWay = [], waiting = false, lim = my && my.lim || worldLimitsHere();
+    if (mem.byteLength > lim.image) { if (worldSave === my) worldSave = null; showError(tooBigToSave(mem.byteLength, lim)); return; }
+    Promise.resolve().then(function () {
+      onWay = onTheWay(); waiting = waitingNow();
+      return engineId();
+    }).then(function (id) {
+      header = worldHeader(at, picked, id);
+      /* the reader's rules for its own file: a world this page could not open again is not written */
+      var bad = HO.headerProblem(header, RULES);
+      if (bad) throw new Error("its record would not open again (" + bad + ")");
+      return HO.encodeWorld(header, mem, { limits: lim });
+    }).then(function (w) {
+      mem = null;
+      var name = "finfolk_seed" + header.start.seed + "_frame" + header.frame + HO.WORLD.EXT;
+      download(new Blob(w.parts, { type: "application/octet-stream" }), name);
+      toast("Saved the world at frame " + fmtInt(header.frame) + " (" + fmtInt(header.fish) + " fish) as " + name + ", " + fmtMB(w.size) +
+            ". From a file opens it again, carrying on from there (on this engine build, " + shortId(header.engine.wasmSha256) + ")." +
+            (waiting ? " What waits for the next start is not in it." : "") +
+            (onWay.length ? " Not in it: " + onWay.map(function (k) { return LABELS[k] || k; }).join(", ") + ", still on the way to the world." : ""));
+    }).catch(function (err) {
+      showError("Couldn't save the world: " + (err && err.message || err) + ". Save world again to retry.");
+    }).then(function () { if (worldSave === my) worldSave = null; });
+  }
+  function fmtMB(b) { return b >= 1048576 ? (b / 1048576).toFixed(1) + " MB" : Math.max(1, Math.round(b / 1024)) + " kB"; }
+  /* a saved world, as the question and the notes name it */
+  function worldText(w) {
+    var h = w.header;
+    return "the saved world " + (w.name ? w.name + " " : "") + "(seed " + h.start.seed + ", frame " + fmtInt(h.frame) + ", " + fmtInt(h.fish) + " fish, " +
+           h.start.width + " × " + h.start.height + ")";
+  }
+  /* A saved world tried before it opens (HO.probeWorld), in a module of the
+   * pinned build in a worker of its own (ocean_worker.js "probe"): the
+   * image goes there and back (transferred, img.data again after), the
+   * worker is terminated after its answer. A worker that doesn't answer in
+   * PROBE_MS (a world that loops or crawls) is terminated: refused; so is
+   * one whose read is superseded (cancelled(): a newer file, a start), at
+   * once, not when it answers. A Promise of {ok, at, why}. */
+  var PROBE_MS = 20000;
+  function probeWorld(img, header, cancelled) {
+    return new Promise(function (resolve) {
+      var w = null, done = false, timer = 0, watch = 0;
+      function finish(r) {
+        if (done) return;
+        done = true;
+        clearTimeout(timer); clearInterval(watch);
+        if (w) { w.onmessage = null; w.onerror = null; try { w.terminate(); } catch (e) { /* gone */ } }
+        resolve(r);
+      }
+      if (cancelled) watch = setInterval(function () { if (cancelled()) finish({ ok: false, cancelled: true, why: HO.CANCELLED }); }, 50);
+      try { w = new Worker(A.worker, { name: "ocean-probe" }); }
+      catch (err) { finish({ ok: false, why: "this page could not start a worker to try it in (" + (err && err.message || err) + ")" }); return; }
+      w.onmessage = function (e) {
+        var m = e.data || {};
+        if (m.type !== "probe") return;
+        if (m.data) img.data = m.data;
+        finish(m);
+      };
+      w.onerror = function (ev) {
+        if (ev && ev.preventDefault) ev.preventDefault();
+        finish({ ok: false, why: "its test run failed (" + (ev && ev.message || "the worker failed") + ")" });
+      };
+      timer = setTimeout(function () { finish({ ok: false, why: "its test run did not finish one step in " + PROBE_MS / 1000 + " s" }); }, PROBE_MS);
+      var data = img.data;
+      if (data.byteOffset || data.byteLength !== data.buffer.byteLength) data = data.slice();   /* (only its own bytes travel) */
+      img.data = null;
+      try {
+        w.postMessage({ cmd: "probe", id: 1, js: moduleUrls.js, wasm: moduleUrls.wasm, handoff: moduleUrls.handoff,
+                        data: data, bytes: img.bytes, expect: HO.worldExpect(header) }, [data.buffer]);
+      } catch (err) { finish({ ok: false, why: "its test run could not start (" + (err && err.message || err) + ")" }); }
+    });
+  }
+  /* What From a file does with a saved world (file: a Blob): read and
+   * checked part by part, tried, then opened through the door, or refused
+   * with the reason (another engine build: its setup offered instead).
+   * req.stale(): something newer came meanwhile (another file, a stage,
+   * Discard, a start): what this read finds is dropped, a refusal too
+   * (review of #44, finding 7: it would say so over the newer answer),
+   * and said so only while this is the latest file (req.latest()). opener:
+   * the card, when the keyboard pressed it (the question's focus). */
+  /* What opening a saved world holds at once, at its peak (bytes): the run's
+   * memory L, Turbo's copy of it T while a Turbo worker lives (it is
+   * terminated when it hands the world back), the stored bytes S, the
+   * gzip body B while it unpacks, a copy of S for its checksum (WebCrypto
+   * takes one), the test run's module F (the image's full length) with S
+   * in it, then the run's undo (at most L) beside the grown module and S;
+   * and an open already queued (its S). The largest of the three phases. */
+  function openNeeds(h) {
+    var im = h.image, L = heap().byteLength, F = im.bytes, S = im.stored, B = im.body === "gzip" ? im.bodyBytes : 0;
+    var T = turboWorker ? Math.max(L, turboStats && turboStats.memBytes || 0) : 0;
+    var q = pendingStart && pendingStart.plan.op === "open" && pendingStart.plan.world.data ? pendingStart.plan.world.data.byteLength : 0;
+    return q + Math.max(L + T + B + 2 * S, L + T + S + F, Math.max(L, F) + S + L);
+  }
+  /* One saved world read, unpacked and tried at a time (review of #44,
+   * round 2, finding 1; round 3, finding 2): a read takes its turn before
+   * any of its body is read (one waiting holds no body), is checked against
+   * the budget again when its turn comes (the run may have grown, or Turbo
+   * started, meanwhile), keeps the turn through its test run, and gives it
+   * back whatever happens; a superseded one stops at once (at its turn,
+   * its next part read, its unpacking's next chunk; its test run
+   * terminated), so a newer file waits a part, a chunk or a moment, never
+   * for an old file's work. */
+  var heavy = Promise.resolve();
+  function heavyTurn() {   /* a Promise of release() */
+    var release, mine = new Promise(function (r) { release = r; }), before = heavy;
+    heavy = before.then(function () { return mine; });
+    return before.then(function () { return release; });
+  }
+  var worldToken = 0;
+  function openWorldFile(file, name, req, opener) {
+    if (!pinned) { showError("Opening a saved world needs the engine this page runs (it has none of its own here)."); return Promise.resolve(); }
+    var header = null, dev = deviceBudget(), release = null;
+    errEl.textContent = "Reading " + (name || "the saved world") + "…"; errEl.className = "";   /* (no toast: the answer follows) */
+    return HO.readWorld(HO.blobSource(file), worldLimitsHere()).then(function (r) {
+      if (req.stale()) return null;
+      header = r.header;
+      var bad = HO.headerProblem(header, RULES);
+      if (bad) throw new Error("That world file is damaged: " + bad + ".");
+      if (header.engine.wasmSha256 !== pinned.sha256) { offerSetup(header, name, pinned.sha256, opener); return null; }
+      /* this device's budget, before the body is read (review of #44, round 2, finding 1), and again when its turn comes */
+      var need = openNeeds(header);
+      if (need > dev.budget) throw new Error(overBudget(header, need, dev));
+      return r.body(req.stale, function () {
+        return heavyTurn().then(function (rel) {
+          release = rel;
+          if (req.stale()) throw new Error(HO.CANCELLED);   /* (superseded while it waited: it ends here, nothing read or made; review of #44, round 4, finding 2) */
+          var now = openNeeds(header);
+          if (now > dev.budget) throw new Error(overBudget(header, now, dev));
+        });
+      });
+    }).then(function (img) {
+      if (!img || req.stale()) return null;
+      errEl.textContent = "Trying " + (name || "the saved world") + " in a test run…"; errEl.className = "";
+      return probeWorld(img, header, req.stale).then(function (rep) {
+        if (!rep.ok) throw new Error("That saved world failed its test run (" + rep.why + "), so it was not opened. Nothing changed.");
+        img.at = rep.at;
+        return img;
+      });
+    }).then(function (img) {
+      if (req.stale()) { worldOvertaken(req); return; }
+      if (!img) return;
+      var p = header.picked;
+      var world = { header: header, data: img.data, bytes: img.bytes, at: img.at, name: name || "", token: ++worldToken,
+                    initArgs: JSON.parse(JSON.stringify(header.start)), runCfg: JSON.parse(JSON.stringify(header.runCfg)),
+                    picked: p ? { id: p.id, follow: p.follow, family: p.family === undefined ? null : p.family, x: p.x || 0, y: p.y || 0, d: p.d || 0 } : null };
+      var plan = { source: "world", op: "open", url: true, world: world,
+                   failed: "That saved world couldn't open: ",
+                   done: function () { worldOpened(world); } };
+      clearError();
+      var how = fenced(requestStart)(plan);   /* (an operation of its own, after the read: fenced as a press is) */
+      if (how === "asked" && opener) { asking.opener = opener; el("startconfirm").focus(); }
+    }).catch(function (err) {
+      if (req.stale()) { worldOvertaken(req); return; }
+      showError(String(err && err.message || err));
+    }).then(function () { if (release) release(); });
+  }
+  function overBudget(h, need, dev) {
+    return "Opening that saved world (" + fmtMB(h.image.bytes) + " of memory) would hold about " + fmtMB(need) + " at once with your run" +
+           (turboWorker ? " and Turbo's copy of it" : "") + ", more than this page lets itself use on this device (" + fmtMB(dev.budget) +
+           "), so it was not read. " + (turboWorker ? "Stop Turbo first, or start a smaller world." : "Start a smaller world first (a reload starts the engine small).");
+  }
+  function worldOvertaken(req) {
+    if (req.latest()) showNote("The saved world was not opened: something newer started or was picked while it was read.");
+  }
+  /* Opened: the fish it had picked (and followed), as Turbo's hand-back
+   * picks it up again (restoreAfterTurbo's rule): itself, or, gone (it can
+   * be: a Save world during Turbo records the fish Turbo will pick up
+   * again, which may have died there before the copy), the nearest of its
+   * family line, or none; said so. The charts start a fresh history here. */
+  function worldOpened(world) {
+    var p = world.picked, said = "";
+    if (p) {
+      var s = fresh(lastS), id = indexOfId(s, p.id) >= 0 ? p.id : nearestOfFamily(s, p);
+      if (id === null) said = " Fish #" + p.id + ", " + (p.follow ? "followed" : "picked") + " when it was saved, is not in it (it died during Turbo before the save), " +
+                              "nor is any of its family line: nothing " + (p.follow ? "followed" : "picked") + ".";
+      else {
+        select(id);
+        if (p.follow && scene) { wantFollow = true; scene.setFollow(true); }
+        if (id !== p.id) said = " Fish #" + p.id + " is not in it (it died during Turbo before the save): " + (p.follow ? "following" : "showing") + " #" + id +
+                                ", the nearest of its family line.";
+      }
+    }
+    if (dash() && dash().origin) dash().origin("the saved world opened at frame " + fmtInt(world.header.frame));
+    showNote("Opened " + worldText(world) + ": it carries on from where it was saved (its charts start afresh). Replay starts its setup again from frame 0." + said);
+  }
+  /* a world from another engine build: its fish can't come here; its setup,
+   * from its header (whose checksum the read has checked; its image is not
+   * read), can (staged, as From a file stages one) */
+  function offerSetup(h, name, mine, opener) {
+    var theirs = h.engine && h.engine.wasmSha256;
+    showAsk("That world was saved by another engine build (" + shortId(theirs) + "; this page runs " + shortId(mine) + "), so its fish can't come back " +
+            "here. Its setup can: seed " + h.start.seed + ", " + h.start.width + " × " + h.start.height + ", " + fmtInt(h.start.population) +
+            " fish, from its start (frame 0), staged for Start (read from the file's header, which its checksum confirms).", "Use its setup", "Not now");
+    asking = { replace: function () { loadSetup(JSON.stringify(h.setup), (name ? name + ", " : "") + "its setup"); }, noNote: "The saved world was not opened." };
+    if (opener) { asking.opener = opener; el("startconfirm").focus(); }
   }
   /* Load setup: that world from its start, at its size, exactly as saved
    * (importWorld: a value the engine refuses is reported, and nothing
    * changes). A setup without a size takes this screen's. */
   function loadSetup(text, name) {
     if (!M) return;
+    if (String(text).slice(0, HO.WORLD.MAGIC.length) === HO.WORLD.MAGIC) {   /* (From a file tells them apart before this) */
+      showError("That file is a saved world (Save world makes those), not a setup."); return;
+    }
     var s, pf;
     try { pf = HO.parseFirst(text); s = pf.value; } catch (e) { showError("That file is not JSON: " + e.message); return; }
     /* a repeated key, as for ?cfg=: the first occurrence counts, every one is
@@ -1446,6 +2010,7 @@
    * rewrite them, and both cut a new snapshot), on the live memory */
   function fresh(s) {
     if (!s || s.buf === heap()) return s;   /* (the appearance rows: a view of this sync's too) */
+    if (engineState !== "ok") return s;   /* (restarting or stopped: the last views, never the engine) */
     var pt = PROF.beginCpu();
     var t = snapshot();
     PROF.endCpu(SP.snapshot, pt);
@@ -1554,19 +2119,23 @@
     selectedId = id;
     if (id !== null) { everSelected = true; hideCoach(); }   /* its card opens where the coach mark sits */
     if (id !== null && id !== was && !handover) { cardNewer = true; cardHeld = false; }   /* its card, over the live numbers (updateCard) */
-    if ((was === null) !== (id === null) && M && has("oc_set_capture")) M._oc_set_capture(id !== null ? 1 : 0);
+    /* the capture, only into a running engine (Close, Esc and the tour let go of a fish while it is stopped or
+     * restarting too: review of #44, round 3, finding 3; a restarted one gets it with its run, applyDisplaySwitches) */
+    if ((was === null) !== (id === null) && M && engineState === "ok" && has("oc_set_capture")) M._oc_set_capture(id !== null ? 1 : 0);
     dirtyHud = true;
   }
   /* F: follow the selected fish; again (or with none): a random one */
   function follow() {
     if (turboState !== "live") { turboPictureHint(); return; }
-    var s = fresh(lastS);
-    if (!s || !s.n) return;
-    var idx = !scene.following() ? indexOfId(s, selectedId) : -1;
-    if (idx < 0) idx = randomFish(s, selectedId);
-    select(s.ids[idx]);
-    wantFollow = true;
-    if (!scene.following()) scene.setFollow(true);
+    engineCall(function () {   /* (a stopped engine: says why; a trap: stops it once, from F, the console or the tour) */
+      var s = fresh(lastS);
+      if (!s || !s.n) return;
+      var idx = !scene.following() ? indexOfId(s, selectedId) : -1;
+      if (idx < 0) idx = randomFish(s, selectedId);
+      select(s.ids[idx]);
+      wantFollow = true;
+      if (!scene.following()) scene.setFollow(true);
+    }, undefined, "Following a fish");
   }
   function unfollow() {
     wantFollow = false;
@@ -2235,7 +2804,7 @@
   }
   var turboEntryCfg = null;   /* runCfg when Turbo took the world */
   var turboEntryPaused = false;   /* and whether it was paused then: a start that fails leaves it so */
-  function onTurboMessage(e) {
+  function onTurboMessage(e) {   /* (fenced whole where it is attached: the hand-back reads the world it puts in, then picks its fish again) */
     /* only the worker this page runs now: a dropped one's late messages (it
      * was detached and terminated: dropWorker) never reach the world */
     if (this !== turboWorker) return;
@@ -2253,12 +2822,14 @@
       paintTurbo();
     } else if (msg.type === "wiring") {
       wireAsked = false;   /* answered: the next one may be asked */
-      if (msg.none || turboState === "live") return;   /* no world there; or it is back here, the page's own the source */
+      if (msg.none || turboState === "live" || engineState !== "ok") return;   /* no world there; it is back here, the page's own the source; or no engine to name them */
       brainShape();   /* the names: this page's module is the same build */
       turboWire = { at: performance.now(), n: msg.n, senses: msg.senses, actions: msg.actions, path: msg.path, direct: msg.direct,
                     senseNames: sensorNames, actionNames: actionNames, frame: msg.frame, turbo: true };
     } else if (msg.type === "rec") {
       if (dash()) dash().ingest(msg.rows);
+    } else if (msg.type === "snapshot") {
+      onSnapshot(msg);   /* Save world's copy: every acknowledgement it holds came before it */
     } else if (msg.type === "set") {
       /* a refusal leaves the field alone when a newer edit of the key, in
        * flight or held for the hand-off, follows the one answered */
@@ -2268,8 +2839,10 @@
       else refuse(msg.key, msg.error, live.pending(msg.key, answered.seq));
     } else if (msg.type === "memory") {
       if (turboState !== "exiting") return;
-      try { takeMemory(msg.mem); }
-      catch (err) {
+      try {
+        if (engineState !== "ok") throw new Error(engineBusyWhy());   /* (the page's engine stopped meanwhile: nothing to put it into) */
+        takeMemory(msg.mem);
+      } catch (err) {
         /* the worker still has the world: it carries on, nothing is lost (a start waiting for it is cancelled) */
         var hadStart = !!pendingStart;
         pendingStart = null;
@@ -2277,10 +2850,14 @@
         turboState = "turbo";
         updateLocks();
         showError("Turbo could not hand the world back (" + (err.message || err) + "), so it keeps running" +
-                  (hadStart ? " and the new world did not start" : "") + ". Stop it again to retry.");
+                  (hadStart ? " and the new world did not start" : "") + (engineState === "ok" ? ". Stop it again to retry." : "."));
         flushHeld();
         return;
       }
+      /* the world is here: the worker, idle now, goes with its memory (a
+       * fresh one runs the next Turbo; review of #44, round 3, finding 1: a
+       * stopped worker kept its whole memory, which no open counted) */
+      dropWorker();
       var ps = pendingStart;
       pendingStart = null;
       /* a new world follows: the fish is picked up again only if it doesn't
@@ -2324,6 +2901,13 @@
     dropWorker();
     if (was === "live") return;
     if (pendingStart) { pendingStart = null; why = "The new world did not start. " + why; }   /* the recovered run is the visitor's to replace */
+    if (engineState !== "ok") {   /* the page's engine stopped (meanwhile, or as Turbo started): nothing to put a world into, nothing read */
+      turboState = "live"; turboView = null; turboWire = null; wireAsked = false;
+      live.back(true);
+      updateLocks();
+      showError(why + ". Its world can't come back here: " + engineBusyWhy() + ".");
+      return;
+    }
     var back = false;
     if (mem && was !== "entering") {
       try { takeMemory(mem); back = true; } catch (err) { why += "; the world it had could not come back (" + (err.message || err) + ")"; }
@@ -2364,6 +2948,7 @@
     return r;
   }
   function restoreAfterTurbo() {
+    if (engineState !== "ok") return;   /* (restarting: rebuildEngine picks it up when the run is back) */
     var r = turboReturn;
     turboReturn = null;
     if (!r || r.epoch !== worldEpoch || !M || turboState !== "live") return;
@@ -2398,6 +2983,7 @@
     return best;
   }
   function dropWorker() {
+    cancelSnapshot("Turbo stopped before it could copy the world");
     if (!turboWorker) return;
     turboWorker.onmessage = null;
     turboWorker.onerror = null;
@@ -2411,6 +2997,7 @@
    * worker always gets a copy: this page's memory stays the fallback. */
   function enterTurbo() {
     if (turboState !== "live" || !M || MOCK) { if (MOCK) showNote("Turbo needs the real engine."); return; }
+    if (engineState !== "ok") { showNote("Turbo: " + engineBusyWhy() + "."); return; }
     store(COACH_KEY, "1"); hideCoach();   /* found it: no coach mark */
     try {
       turboState = "entering";
@@ -2425,16 +3012,17 @@
       updateLocks();
       if (!turboWorker) {
         turboWorker = new Worker(A.worker);
-        turboWorker.onmessage = onTurboMessage;
-        turboWorker.onerror = function (ev) {
+        turboWorker.onmessage = fenced(onTurboMessage);
+        turboWorker.onerror = fenced(function (ev) {
           if (ev && ev.preventDefault) ev.preventDefault();
           turboFailed("The Turbo worker failed: " + (ev && ev.message || "could not load ocean_worker.js"), null);
-        };
+        });
       }
       var mem = heap().slice(0);
       turboWorker.postMessage({ cmd: "start", js: moduleUrls.js, wasm: moduleUrls.wasm, handoff: moduleUrls.handoff, mem: mem,
                                 recEvery: dash() ? dash().every() : 60, famK: dash() ? dash().famK : 8 }, [mem]);
     } catch (err) {
+      if (err instanceof WebAssembly.RuntimeError) engineStopped(err);   /* (a trap picking up its fish: the engine stops once, and Turbo goes without a read) */
       turboFailed("Turbo could not start: " + (err && err.message || err), null);
     }
   }
@@ -2463,8 +3051,20 @@
 
   /* ---------------- the loop ---------------- */
   var splashDone = false;
+  /* A trap anywhere in a frame (the step, the sync, the snapshot, the
+   * charts' sample, the fish card's oc_inspect, the readout's summary: a
+   * world that broke later than its test run's step, the limit of
+   * raw-memory imports) stops the engine once, said so, rather than
+   * throwing in every frame; nothing reads it after (engineState). */
   function frame(now) {
     requestAnimationFrame(frame);
+    if (engineState !== "ok") return;   /* restarting (a new module on its way) or stopped: nothing to step or read */
+    fenceDepth++;   /* (a fence too: an engine call inside it hands a trap on to it) */
+    try { frameBody(now); }
+    catch (err) { if (err instanceof WebAssembly.RuntimeError) { engineStopped(err); return; } throw err; }
+    finally { fenceDepth--; }
+  }
+  function frameBody(now) {
     PROF.beginFrame(now, worldEpoch, turboState, paused);   /* the raw rAF interval, before the clamp below */
     var dt = lastNow ? Math.min(0.1, (now - lastNow) / 1000) : 0;
     lastNow = now;
@@ -2559,7 +3159,7 @@
     window.addEventListener("blur", releaseMoveKeys);
     document.addEventListener("visibilitychange", function () { if (document.hidden) releaseMoveKeys(); });
     document.addEventListener("focusin", function (e) { if (typingIn(e.target)) releaseMoveKeys(); });
-    window.addEventListener("keydown", function (e) {
+    window.addEventListener("keydown", fenced(function (e) {   /* (each key fenced whole: Esc, F, R, T, ...) */
       if (e.key === "Escape") {
         /* the tour or the charts take this Esc themselves (escHandledElsewhere),
          * and nothing behind them closes with it; else the popover (back to its
@@ -2617,7 +3217,7 @@
       else if (k === "-" || k === "_" || k === "ArrowDown") { changeSpeed(-1); e.preventDefault(); }
       else if (lk === "r") startKey(e);
       else if (k === "." && paused) stepOnce = true;
-    });
+    }));
     /* R a new world, Shift+R Replay: the same door as Start (the question in
      * the setup sheet when the run has something to lose, its confirm button
      * focused); a held key starts nothing twice, nor does R again while asked */
@@ -2638,13 +3238,16 @@
       if (!tap || e.pointerId !== tap.id) return;
       var moved = Math.hypot(e.clientX - tap.x, e.clientY - tap.y), held = performance.now() - tap.t;
       tap = null;
-      var s = fresh(lastS);
-      if (moved > 8 || held > 600 || !s) return;
-      if (turboState !== "live") { turboPictureHint(); return; }
-      var best = scene.pick(s, e.clientX, e.clientY, e.pointerType === "mouse" ? 18 : 30);
-      if (best < 0 && scene.following()) return;   /* a stray tap doesn't drop a follow */
-      if (best >= 0 && scene.following() && s.ids[best] !== selectedId) unfollow();
-      select(best >= 0 ? s.ids[best] : null);
+      if (moved > 8 || held > 600) return;
+      engineCall(function () {
+        var s = fresh(lastS);
+        if (!s) return;
+        if (turboState !== "live") { turboPictureHint(); return; }
+        var best = scene.pick(s, e.clientX, e.clientY, e.pointerType === "mouse" ? 18 : 30);
+        if (best < 0 && scene.following()) return;   /* a stray tap doesn't drop a follow */
+        if (best >= 0 && scene.following() && s.ids[best] !== selectedId) unfollow();
+        select(best >= 0 ? s.ids[best] : null);
+      }, undefined, "Picking a fish");
     });
     var fitTimer = 0;
     window.addEventListener("resize", function () {
@@ -2780,7 +3383,8 @@
   });
 
   /* ---- buttons ---- */
-  function btn(id, fn) { el(id).addEventListener("click", function () { fn(); this.blur(); }); }
+  /* (each button's press fenced whole: Close, Follow, Replay, Start, Turbo, ...) */
+  function btn(id, fn) { el(id).addEventListener("click", fenced(function () { fn(); this.blur(); })); }
   /* A button that may open the start bar's question (Start, its menu's two,
    * a card, its Start, Reroll, Replay). Pressed from the keyboard (its focus
    * ring showing, or a click no pointer made: Enter / Space give detail 0),
@@ -2788,12 +3392,12 @@
    * the button (back: the menu's own button for its items) when the
    * question is answered Keep; a pointer's press blurs it, as btn's. */
   function askBtn(id, fn, back) {
-    el(id).addEventListener("click", function (e) {
+    el(id).addEventListener("click", fenced(function (e) {
       var kb = this.matches(":focus-visible") || (!!e && e.detail === 0);
       fn();
       if (kb && asking) { asking.opener = back ? el(back) : this; el("startconfirm").focus(); }
       else this.blur();
-    });
+    }));
   }
   buildSettings();
   panelsEl.addEventListener("input", onEdit);
@@ -2853,22 +3457,64 @@
     cardCache.sense = null;
   });
   btn("savecp", saveSetup);   /* in Turbo too: the accepted setup */
+  btn("saveworld", saveWorld);   /* in Turbo too: the worker's copy, Turbo runs on */
   btn("startconfirm", confirmAsk);
   btn("startcancel", cancelAsk);
-  btn("loadcp", function () { el("cpfile").click(); });
-  /* the read is asynchronous: its answer stages the file only if nothing
-   * newer came meanwhile (another file, a scenario, Discard, a start), and
-   * whoever owns the world then (staging changes no world) */
+  /* From a file: a setup (staged) or a saved world (opened through the
+   * door), told apart by the file's first bytes. Pressed from the keyboard,
+   * a question the file brings has the focus on its answer (askBtn's rule;
+   * the file dialog comes between, so it is remembered here) */
+  var fileOpener = null;
+  el("loadcp").addEventListener("click", function (e) {
+    fileOpener = this.matches(":focus-visible") || (!!e && e.detail === 0) ? this : null;
+    if (!fileOpener) this.blur();
+    el("cpfile").click();
+  });
+  /* the read is asynchronous: its answer stages the setup (or opens the
+   * world) only if nothing newer came meanwhile (another file, a scenario,
+   * Discard, a start), and whoever owns the world then (staging changes no
+   * world; a world opens through requestStart, which stops Turbo first) */
   var fileReq = 0;
+  function isWorldBlob(file) {
+    if (typeof file.slice !== "function") return Promise.resolve(false);   /* (a file that is only text) */
+    return file.slice(0, HO.WORLD.MAGIC.length).arrayBuffer().then(function (b) { return HO.isWorldFile(new Uint8Array(b)); });
+  }
+  /* the file picker has no type filter (a phone's greys out .oceanworld),
+   * so any file can come: a saved world is read part by part within its
+   * limits (openWorldFile); anything else must be a setup, at most
+   * HO.WORLD.MAX_SETUP, refused by its size before it is read */
+  var tooBigForSetup = function (n) {
+    return "That file is " + fmtMB(n) + ": not a saved world (Save world makes those), and too big to be a setup (Save setup's are a few kB).";
+  };
+  /* filesRead: how many From a file reads have answered, whatever the
+   * answer, and which (fileAnswered: their request numbers, the latest 32):
+   * the tests wait on them, not on a message */
+  var filesRead = 0, fileAnswered = [];
   el("cpfile").addEventListener("change", function () {
     var file = this.files && this.files[0];
     this.value = "";
     if (!file || !M) return;
-    var my = ++fileReq, gen = draftGen;
-    file.text().then(function (text) {
-      if (my !== fileReq || gen !== draftGen) return;   /* stale: something newer is in the sheet */
-      loadSetup(text, file.name);
-    }, function (err) { if (my === fileReq) showError("Couldn't read that file: " + err); });
+    var my = ++fileReq, gen = draftGen, opener = fileOpener;
+    fileOpener = null;
+    /* something newer is in the sheet (another file, a stage, Discard, a start); latest: no newer file */
+    var req = { stale: function () { return my !== fileReq || gen !== draftGen; }, latest: function () { return my === fileReq; } };
+    isWorldBlob(file).then(function (world) {
+      if (req.stale()) return;
+      if (world) {
+        if (MOCK) { showNote("Opening a saved world needs the real engine."); return; }
+        /* a question still open about another saved world: this file replaces it (and its image goes) */
+        if (asking && asking.plan && asking.plan.op === "open") hideAsk();
+        return openWorldFile(file, file.name, req, opener);
+      }
+      if (typeof file.size === "number" && file.size > HO.WORLD.MAX_SETUP) { showError(tooBigForSetup(file.size)); return; }
+      return file.text().then(function (text) {
+        if (req.stale()) return;
+        if (text.length > HO.WORLD.MAX_SETUP) { showError(tooBigForSetup(text.length)); return; }
+        loadSetup(text, file.name);
+        if (asking && asking.replace && opener) { asking.opener = opener; el("startconfirm").focus(); }   /* it replaces edits that wait: asked */
+      });
+    }).catch(function (err) { if (!req.stale()) showError("Couldn't read that file: " + (err && err.message || err)); })   /* (finding 7: never over a newer answer) */
+      .then(function () { filesRead++; fileAnswered.push(my); if (fileAnswered.length > 32) fileAnswered.shift(); });
   });
   btn("startdiscard", discardDraft);
   el("governor").addEventListener("change", function () {
@@ -2914,8 +3560,8 @@
     colourBrain = colourMode === "brain";
     if (!BENCH) store("evo_boids.colourBy", colourMode);   /* a benchmark's cases are not the visitor's choice */
     showColourMode();
-    if (M) applyDisplaySwitches();
-    updateModeline();
+    if (M) engineCall(applyDisplaySwitches);   /* (a stopped engine: the view's choice is kept; a restarted one gets it with its run) */
+    engineCall(updateModeline);
     return true;
   }
   el("colourMode").addEventListener("click", function (e) {
@@ -3071,12 +3717,16 @@
           } },
         { drawer: false, title: "Setup",
           target: function () { return h.rectOf("#menubtn"); },
-          body: function () { return "New worlds, every rule of this one, and saving setups (O). Nothing in it replaces your run until you press <b>Start</b>."; } },
+          body: function () {
+            return "New worlds, every rule of this one, and saving a setup or the whole world (O). Nothing in it replaces your run until you press " +
+                   "<b>Start</b>, or open a saved world (<b>From a file</b>; asked first when your run has something to lose).";
+          } },
         { drawer: true, tab: "run", scroll: "#scenarios", place: h.drawerSides, title: "Start from",
           target: function () { return h.rectOf("#scenarios"); },
           body: function () {
             return "Pick a world: Big tank, Living water, Hunters, Currents & patches, or <b>Surprise me</b>, which draws a " +
-                   "setup from ranges that worked in experiments. The card fills the tabs with it; its <b>Start</b> starts it.";
+                   "setup from ranges that worked in experiments. The card fills the tabs with it; its <b>Start</b> starts it. " +
+                   "<b>From a file</b> takes a saved setup the same way, or opens a saved world where it was saved.";
           } },
         { drawer: true, tab: "depth", scroll: "#f_kBuoy", place: h.drawerSides, title: "Your own settings",
           target: function () { return h.rectOf("#f_kBuoy"); },
@@ -3113,16 +3763,18 @@
     setDrawer: setDrawer,
     setSheetTab: setSheetTab,
     inspectSomeFish: function () {
-      var s = fresh(lastS);
-      if (!M || turboState !== "live" || !s || !s.n) return false;
-      if (selectedId !== null) return true;
-      var best = scene.pick(s, innerWidth * 0.4, innerHeight * 0.45, 4000);
-      if (best < 0) best = 0;
-      select(guideFish = s.ids[best]);
-      return true;
+      return engineCall(function () {
+        var s = fresh(lastS);
+        if (turboState !== "live" || !s || !s.n) return false;
+        if (selectedId !== null) return true;
+        var best = scene.pick(s, innerWidth * 0.4, innerHeight * 0.45, 4000);
+        if (best < 0) best = 0;
+        select(guideFish = s.ids[best]);
+        return true;
+      }, false);
     },
     releaseFish: function () {
-      if (guideFish !== null && selectedId === guideFish) select(null);
+      if (guideFish !== null && selectedId === guideFish) engineCall(function () { select(null); });
       guideFish = null;
     },
     inspectorRect: function () { return selectedId === null || cardEl.hidden ? null : cardEl.getBoundingClientRect(); }
@@ -3245,8 +3897,9 @@
     applyClarity();
     if (dash()) dash().attach({
       depth: function () { return D; },
-      familyColor: function (id) { return has("oc_family_color") ? M._oc_family_color(id) : 0x3b5957; },
-      wiring: wiringNow,
+      /* (the charts' timer: never into a stopped or restarting engine; a trap here stops it once) */
+      familyColor: function (id) { return engineCall(function () { return has("oc_family_color") ? M._oc_family_color(id) : 0x3b5957; }, 0x3b5957); },
+      wiring: function () { return turboState !== "live" ? wiringNow() : engineCall(wiringNow, null); },
       setDrawer: setDrawer,
       /* the charts cover the page: no popover left open under them, and the coach mark goes */
       onOpen: function () { setPop(null); hideCoach(); },
@@ -3254,32 +3907,36 @@
         if (turboWorker && (turboState === "entering" || turboState === "turbo")) turboWorker.postMessage({ cmd: "rec", every: every });
       }
     });
+    /* (the handles that read the world through fresh(), which cuts a new snapshot from the engine when
+     * the memory grew: each fenced whole, as select's and set's are; review of #44, round 4, finding 3) */
     window.EvoOcean = {
       module: M, scene: scene,
-      steepest: function (sinking) {
+      steepest: fenced(function (sinking) {
         var s = fresh(lastS), best = -1, bv = 0;
         if (!s || !s.vz) return null;
         for (var i = 0; i < s.n; i++) { var v = sinking ? s.vz[i] : Math.abs(s.vz[i]); if (v > bv) { bv = v; best = i; } }
         return best < 0 ? null : { idx: best, id: s.ids[best], vz: s.vz[best], x: s.segs[12 * best], y: s.segs[12 * best + 1],
                                    x1: s.segs[12 * best + 2], y1: s.segs[12 * best + 3], depth: s.depth[best] };
-      },
+      }),
       set: function (name, v) {
-        if (!has("oc_set_param")) return false;
-        var ok = withCString(String(name), function (p) { return M._oc_set_param(p, +v); });
-        if (!ok) console.warn("oc_set_param(" + name + "): " + lastError());
-        readLight();
-        return !!ok;
+        return engineCall(function () {
+          if (!has("oc_set_param")) return false;
+          var ok = withCString(String(name), function (p) { return M._oc_set_param(p, +v); });
+          if (!ok) console.warn("oc_set_param(" + name + "): " + lastError());
+          readLight();
+          return !!ok;
+        }, false);
       },
-      select: function (idx) { var s = fresh(lastS); if (s && idx >= 0 && idx < s.n) select(s.ids[idx]); },
+      select: function (idx) { engineCall(function () { var s = fresh(lastS); if (s && idx >= 0 && idx < s.n) select(s.ids[idx]); }); },
       /* index of the deepest fish right now (-1 with none) */
-      deepest: function () {
+      deepest: fenced(function () {
         var s = fresh(lastS), best = -1;
         if (s) for (var i = 0; i < s.n; i++) if (best < 0 || s.depth[i] > s.depth[best]) best = i;
         return best;
-      },
+      }),
       follow: follow,
       turbo: function () { return turboState; },
-      state: function () {
+      state: fenced(function () {
         var s = fresh(lastS);
         if (!s) return null;
         var lo = Infinity, hi = -Infinity;
@@ -3291,13 +3948,21 @@
                  turbo: turboState, colourMode: colourMode, colourBrain: colourBrain, frame: s.stats[1],
                  held: live.held(), inflight: live.inflight(), fixedSize: [URL_W, URL_H], walls: WALLS, hasWalls: hasWalls(),
                  stats: Array.prototype.slice.call(s.stats), depthMin: s.n ? lo : 0, depthMax: s.n ? hi : 0,
-                 dashRows: dash() ? dash()._rows().length : 0, worldEpoch: worldEpoch };
-      }
+                 dashRows: dash() ? dash()._rows().length : 0, worldEpoch: worldEpoch,
+                 engine: engineState, rebuilds: rebuilds, engineId: pinned ? pinned.sha256 : null };
+      })
     };
     if (PROF.enabled) EvoOcean.perf = PROF;   /* ?renderBench=1 / ?perf=1 (web/ocean_perf.js) */
     if (BENCH) EvoOcean.bench = PERF.bench({ module: M, scene: scene, profiler: PROF, page: EvoOcean, setPaused: setPaused,
-      last: function () { return fresh(lastS); }, epoch: function () { return worldEpoch; }, initArgs: function () { return initArgs; },
-      importWorld: importWorld,
+      last: fenced(function () { return fresh(lastS); }), epoch: function () { return worldEpoch; }, initArgs: function () { return initArgs; },
+      /* stepToTick's every step, fenced: none into a stopped or restarting engine (false), a trap stops it (false) (review of #44, round 5) */
+      step: function (n) { return engineCall(function () { M._oc_step(n); M._oc_sync(); return true; }, false); },
+      /* prepare's import of a case's world, fenced whole: "" or why not; none into a stopped or restarting engine, a trap
+       * stops it (said so) and answers why, so prepare rejects (review of #44, round 6) */
+      importWorld: function () {
+        var a = arguments;
+        return engineCall(function () { return importWorld.apply(null, a); }, engineBusyWhy());
+      },
       /* the page's own colour switch and state, and whether the charts are up (they suspend the tank) */
       setColourMode: setColourMode, colourMode: function () { return colourMode; },
       dashOpen: function () { return !!(dash() && dash().isOpen()); } });

@@ -19,6 +19,8 @@
  *   in : {cmd:'set', key, value}   -> oc_set_param (a live setting, mid-Turbo)
  *   in : {cmd:'rec', every}        -> the dashboards' sampling interval
  *   in : {cmd:'stop'}              -> finish the chunk, post the memory back
+ *                                     (the page, once it has it, terminates
+ *                                     this worker: its memory goes too)
  *   in : {cmd:'resume'}            -> the page could not take the memory
  *                                     back: carry on running this world
  *   in : {cmd:'wiring'}            -> the Brains dashboard's wiring of the
@@ -26,9 +28,25 @@
  *                                     chunks; the page asks only while that
  *                                     panel shows, every 2 s at most, one
  *                                     question at a time
- *   out: {type:'stats', frame, pop, food, pred, stepsPerSec, totalSteps, st, su}
+ *   in : {cmd:'snapshot', id, maxBytes} -> Save world while Turbo runs: a
+ *                                     copy of the world now, between chunks;
+ *                                     Turbo carries on
+ *   out: {type:'snapshot', id, mem: ArrayBuffer, frame, pop, food, pred,
+ *        totalSteps}, or {type:'snapshot', id, none: true} with no world here,
+ *        {.., tooBig: bytes} for a memory over maxBytes (nothing copied), or
+ *        {.., error} when there was no room for the copy: Turbo runs on either way
+ *   in : {cmd:'probe', id, js, wasm, handoff, data: Uint8Array, bytes, expect}
+ *        -> a saved world tried in this worker's module before the page
+ *           opens it (a worker made only for that: web/ocean.js probeWorld)
+ *   out: {type:'probe', id, ok, at, why, trap, data} (data: the image, back)
+ * The page hands every worker the module's wasm as the Blob URL of the
+ * bytes it pinned at start-up (web/ocean.js pinEngine): the same build the
+ * page runs and names in its world files, whatever the server has now.
+ *   out: {type:'stats', frame, pop, food, pred, stepsPerSec, totalSteps, st, su, memBytes}
  *        ~4x/s; st: oc_stats, su: oc_summary of the world now (the page's
- *        readout and stat panel show them while Turbo owns the world)
+ *        readout and stat panel show them while Turbo owns the world);
+ *        memBytes: this module's memory (what opening a saved world must
+ *        count while Turbo holds it)
  *   out: {type:'wiring', n, senses, actions, path, direct, frame}, or
  *        {type:'wiring', none: true} with no world here: every question is answered
  *   out: {type:'rec', rows}        -> dashboard samples (web/ocean_dash.js row())
@@ -122,6 +140,45 @@ onmessage = function (e) {
   } else if (msg.cmd === "wiring") {
     if (!M || !owns) { postMessage({ type: "wiring", none: true }); return; }   /* no world here (yet, or any more) */
     try { postMessage(wiring()); } catch (err) { fail(err, "on the wiring"); }
+  } else if (msg.cmd === "snapshot") {
+    /* Save world while Turbo runs: a copy of the world as it is now, between
+     * two chunks (no step is part-way), and Turbo carries on. Every live
+     * setting sent before this question is in it (their answers go out
+     * first), none sent after. */
+    if (!M || !owns) { postMessage({ type: "snapshot", id: msg.id, none: true }); return; }
+    /* a world bigger than a world file may be on this device: said so, nothing copied */
+    if (msg.maxBytes && heap().byteLength > msg.maxBytes) { postMessage({ type: "snapshot", id: msg.id, tooBig: heap().byteLength }); return; }
+    /* no room for the copy: said so, and Turbo carries on with its world (nothing of it is lost: only the copy failed) */
+    var copy;
+    try { copy = heap().slice(0); }
+    catch (err) { postMessage({ type: "snapshot", id: msg.id, error: "there was no room for a copy of the world (" + String(err && err.message || err) + ")" }); return; }
+    try {
+      var f = frameNow();   /* after the copy, which it leaves untouched (a sync never steps) */
+      postMessage({ type: "snapshot", id: msg.id, mem: copy, frame: f, pop: M._oc_creature_count(), food: M._oc_food_count(),
+                    pred: M._oc_predator_count(), totalSteps: totalSteps }, [copy]);
+    } catch (err) { fail(err, "on Save world"); }
+  } else if (msg.cmd === "probe") {
+    /* A saved world tried before the page opens it, in this worker's own
+     * module (a worker made for it: it never runs Turbo, and the page
+     * terminates it after the answer, or when it takes too long): the image
+     * in, checked against its header, the page's calls, one step, checked
+     * again (web/ocean_handoff.js probeWorld). The image goes back with the
+     * answer (transferred both ways: no copy). A trap is an answer too. */
+    var answer = function (r) {
+      r.type = "probe"; r.id = msg.id; r.data = msg.data;
+      postMessage(r, msg.data && msg.data.buffer ? [msg.data.buffer] : []);
+    };
+    var q;
+    try { q = ensureModule(msg); } catch (err) { answer({ ok: false, why: "the engine did not load (" + err + ")" }); return; }
+    q.then(function () {
+      var r;
+      try { r = H.probeWorld(M, msg.data, msg.bytes, msg.expect); }
+      catch (err) {
+        r = { ok: false, trap: err instanceof WebAssembly.RuntimeError,
+              why: (err instanceof WebAssembly.RuntimeError ? "the engine stopped on it (" : "") + String(err && err.message || err) + (err instanceof WebAssembly.RuntimeError ? ")" : "") };
+      }
+      answer(r);
+    }, function (err) { answer({ ok: false, why: "the engine did not load (" + err + ")" }); });
   }
 };
 
@@ -180,7 +237,7 @@ function postStats(now) {
   M._oc_sync();
   var st = H.f64(M, M._oc_stats(), statsLen()), su = H.f64(M, M._oc_summary(), M._oc_summary_len());
   postMessage({ type: "stats", frame: st[1], pop: M._oc_creature_count(), food: M._oc_food_count(),
-                pred: M._oc_predator_count(), stepsPerSec: Math.round(sps), totalSteps: totalSteps, st: st, su: su });
+                pred: M._oc_predator_count(), stepsPerSec: Math.round(sps), totalSteps: totalSteps, st: st, su: su, memBytes: heap().byteLength });
 }
 function finishStop() {
   running = false;
