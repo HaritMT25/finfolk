@@ -180,6 +180,15 @@ class Model:
             J.append(row)
         return preds, J
 
+    def etas(self, th, cells):
+        """The unclamped linear predictors eta over cells."""
+        N = self.N
+        if self.name == "strength":
+            c, u = th[0], self._expand(th[1:N])
+            return [c + u[i] - u[j] for i, j in cells]
+        mu, a, b = th[0], self._expand(th[1:N]), self._expand(th[N:2 * N - 1])
+        return [mu + a[i] + b[j] for i, j in cells]
+
     def describe(self, th):
         N = self.N
         if self.name == "strength":
@@ -193,7 +202,7 @@ class Model:
 GTOL = 1e-9   # stationarity at the iteration cap: max |J'r| <= GTOL x max(1, ||y||)
 STAT_TOL = 1e-4   # first-order stationarity at every non-exact exit (prereg gate, review round 5 item 4):
 STAT_ABS = 1e-12  # the Gauss-Newton step may not promise more than STAT_TOL SSE + STAT_ABS max(||y||^2, n)
-STAT_RIDGE = 1e-12   # the ridge of the COLUMN-SCALED normal matrix (unit diagonal) in the stationarity test
+RANK_TOL = 1e-13  # numerical rank of the pivoted QR (|R_kk| <= RANK_TOL |R_11|), and flat cells (row <= RANK_TOL max|J|)
 SAT_D = 1e-12     # (reported only) a cell whose Jacobian row is <= SAT_D everywhere is numerically saturated
 ETA_CLAMP = 40.0  # model.eval clamps eta to +-40 (beyond it the link is constant)
 LM_DIAG = 1e-18   # lm's absolute diagonal stabilizer: (J'J + lam diag(J'J) + LM_DIAG I) step = J'r
@@ -206,21 +215,23 @@ LM_DIAG = 1e-18   # lm's absolute diagonal stabilizer: (J'J + lam diag(J'J) + LM
 FIT_FREEZE = {
     "optimizer": ("Levenberg-Marquardt (bounded.lm): (J'J + lam diag(J'J) + 1e-18 I) step = J'r; lambda0 1e-3, /3 "
                   "(floor 1e-9) on an accepted step, x10 on a rejected one; exits: an exact fit (SSE <= 1e-26 "
-                  "||y||^2), a relative SSE improvement < tol, a step <= 1e-12 (1 + max|theta|), damping > 1e6, "
-                  "or the iteration cap"),
-    "iters": 200, "tol": 1e-11, "gtol": GTOL, "stat_tol": STAT_TOL, "stat_abs": STAT_ABS, "stat_ridge": STAT_RIDGE,
+                  "max(||y||^2, 1e-30)), a relative SSE improvement S - Sn <= tol max(S, 1e-30), a step <= 1e-12 "
+                  "(1 + max|theta|), damping > 1e6, or the iteration cap"),
+    "iters": 200, "tol": 1e-11, "gtol": GTOL, "stat_tol": STAT_TOL, "stat_abs": STAT_ABS, "rank_tol": RANK_TOL,
     "lm_diag": LM_DIAG, "eta_clamp": ETA_CLAMP,
     "init": "logistic: two-way additive fit of the logit:0.001-clipped means (bounded.initial); no restarts",
     "derivatives": "sigma'(x) = e^-|x| / (1 + e^-|x|)^2 (stable), evaluated at the clamped eta",
     "converged": ("an exact fit; otherwise the exit counts as converged only if, with allow = stat_tol SSE + "
-                  "stat_abs max(||y||^2, n) (n = cells): (1) the Gauss-Newton predicted decrease in COLUMN-SCALED "
-                  "form, g~'(J~'J~ + stat_ridge I)^-1 g~ with J~ = J D^-1/2, D = diag(J'J), g~ = D^-1/2 J'r, is <= "
-                  "allow - every parameter direction is assessed on its own scale, so a weak (nearly saturated) "
-                  "direction is not hidden by a global ridge; a vanished Jacobian predicts the whole SSE; (2) at the "
-                  "cap also max |J'r| <= gtol max(1, ||y||); a non-finite SSE, parameter or fitted value is never "
-                  "converged. A first-order test: a legitimate minimum keeps whatever residual it cannot remove "
-                  "locally (its score is zero), a stalled saturation (a large scaled score) does not pass, and a "
-                  "boundary infimum with negligible SSE passes"),
+                  "stat_abs max(||y||^2, n) (n = cells): (1) the EXACT linearized gain ||Q1'r||^2 (Householder QR "
+                  "of J with column pivoting, numerical rank at |R_kk| <= rank_tol |R_11|; any direction or "
+                  "combination of the tangent space, however weak but numerically resolvable, counts) is <= "
+                  "allow, OR the Gauss-Newton probe (theta + t d along the exact least-squares step d on the "
+                  "resolved columns, t = 1, 0.8, 0.8^2, ... for 220 points, never adopted) realizes no SSE "
+                  "decrease > allow; (2) the residual energy on numerically flat cells (|eta| >= eta_clamp, or "
+                  "every Jacobian entry of the row <= rank_tol max|J|: no first-order information) is <= allow; "
+                  "(3) at the cap also max |J'r| <= gtol max(1, ||y||); a non-finite SSE, parameter, fitted value "
+                  "or Jacobian entry is never converged. The classifier only marks fits; it changes no fitted "
+                  "value (no outcome-dependent rescue)"),
     "unavailable": "any required unconverged fit, non-finite result or failed projection makes H1b unavailable",
 }
 
@@ -231,6 +242,9 @@ class LMResult(tuple):
     grad = None
     stationarity = None
     saturated_sse = None
+    rank = None
+    flat_sse = None
+    probe_decrease = None
 
 
 def _normal(J, r, P):
@@ -250,44 +264,123 @@ def _normal(J, r, P):
     return JtJ, Jtr
 
 
-def stationarity(J, r, P):
-    """-> (the Gauss-Newton predicted decrease / r'r, max |J'r|), the decrease computed in COLUMN-SCALED form
-    (review of #49, round 2): with D = diag(J'J), J~ = J D^-1/2 has unit columns, g~ = D^-1/2 J'r, and the
-    predicted decrease is g~'(J~'J~ + STAT_RIDGE I)^-1 g~ - each parameter direction on its own scale, so a
-    weak direction (a nearly saturated item, derivatives ~1e-11) is not hidden by a ridge sized to the strong
-    ones. 0 at a least-squares stationary point; ~1 on a stalled saturation; a vanished Jacobian (every
-    column zero) explains nothing, and so predicts the whole SSE."""
-    JtJ, Jtr = _normal(J, r, P)
+def qr_gain(J, r, P, tol=None, step=False):
+    """The exact linearized gain ||Q1' r||^2 - the residual energy in the span of J's columns - by Householder
+    QR with column pivoting, the reflections applied to r as they are formed (review of #49, round 3: a
+    diagonal scaling plus a ridge still hid a weak COMBINATION of strong columns, a0 - a1). Numerical rank: the
+    factorization stops at the first pivot |R_kk| <= tol |R_11| (tol = RANK_TOL); those directions are
+    numerically zero and explain nothing. -> (gain, rank), or with step=True (gain, rank, the Gauss-Newton
+    step: the least-squares solution of J d = r on the resolved columns, 0 on the others)."""
+    from operator import mul
+    tol = RANK_TOL if tol is None else tol
+    cols = [[row[a_] for row in J] for a_ in range(P)]   # (each column trimmed to its rows j.. as j advances)
+    perm = list(range(P))
+    Rrows, qtr = [], []
+    v = list(r)
+    n2 = [sum(map(mul, c, c)) for c in cols]
+    gain, rank, r11 = 0.0, 0, 0.0
+    for j in range(P):
+        p = max(range(j, P), key=n2.__getitem__)
+        if p != j:
+            cols[j], cols[p] = cols[p], cols[j]
+            n2[j], n2[p] = n2[p], n2[j]
+            perm[j], perm[p] = perm[p], perm[j]
+            for row_ in Rrows:   # (the stored R entries follow the column swap)
+                row_[j], row_[p] = row_[p], row_[j]
+        c = cols[j]
+        alpha = math.sqrt(sum(map(mul, c, c)))   # (recomputed exactly, never from the downdated norm)
+        if j == 0:
+            r11 = alpha
+        if alpha == 0.0 or alpha <= tol * r11:
+            break
+        s = -alpha if c[0] > 0 else alpha
+        u = list(c)
+        u[0] -= s
+        un = sum(map(mul, u, u))
+        if un <= 0.0:
+            break
+        row = [0.0] * P
+        row[j] = s
+        for t in range(j + 1, P):
+            ct = cols[t]
+            f = 2.0 * sum(map(mul, u, ct)) / un
+            if f:
+                ct = [x - f * ui for x, ui in zip(ct, u)]
+            row[t] = ct[0]
+            old = n2[t]
+            n2[t] = old - ct[0] * ct[0]
+            ct = ct[1:]
+            if n2[t] < 1e-8 * old:   # cancellation in the downdate: recompute
+                n2[t] = sum(map(mul, ct, ct))
+            cols[t] = ct
+        f = 2.0 * sum(map(mul, u, v)) / un
+        v = [x - f * ui for x, ui in zip(v, u)]
+        gain += v[0] * v[0]
+        Rrows.append(row)
+        qtr.append(v[0])
+        v = v[1:]
+        rank += 1
+    if not step:
+        return gain, rank
+    z = [0.0] * P                          # back-substitution in the pivoted order, on the resolved block
+    for j in reversed(range(rank)):
+        z[j] = (qtr[j] - sum(Rrows[j][t] * z[t] for t in range(j + 1, rank))) / Rrows[j][j]
+    d = [0.0] * P
+    for j in range(rank):
+        d[perm[j]] = z[j]
+    return gain, rank, d
+
+
+PROBE_SHRINK = 0.8     # the probe's backtracking factor
+PROBE_STEPS = 220      # ... down to 0.8^219 ~ 6e-22 of the Gauss-Newton step
+
+
+def gn_probe(model, cells, y, th, J, r, S, enough=None):
+    """The largest SSE decrease found along the exact Gauss-Newton direction, at t = 1, 0.8, 0.8^2, ...
+    (PROBE_STEPS points; it stops once a decrease of `enough` is found). A probe only: the fit is never moved."""
+    _, _, d = qr_gain(J, r, model.P, step=True)
+    best = 0.0
+    t = 1.0
+    for _ in range(PROBE_STEPS):
+        g, _ = model.eval([a_ + t * b_ for a_, b_ in zip(th, d)], cells)
+        Sn = sum((p_ - q_) ** 2 for p_, q_ in zip(y, g))
+        if math.isfinite(Sn) and S - Sn > best:
+            best = S - Sn
+            if enough is not None and best >= enough:
+                break
+        t *= PROBE_SHRINK
+    return best
+
+
+def stationarity(J, r, P, clamped=None):
+    """-> (gain / r'r, max |J'r|, numerical rank, flat SSE): the exact linearized gain of qr_gain (0 at a
+    least-squares stationary point, ~1 on a stalled saturation, whatever the direction or combination), and
+    the residual energy on numerically FLAT cells - rows whose every Jacobian entry is <= RANK_TOL max |J|, or
+    cells whose linear predictor is at or beyond the clamp (`clamped`: the link is constant there, the
+    reported derivative is the clamp point's) - where no first-order information exists."""
     S = sum(x * x for x in r)
+    Jtr = [sum(row[a_] * ri for row, ri in zip(J, r)) for a_ in range(P)]
     grad = max(abs(x) for x in Jtr) if Jtr else 0.0
-    if not (math.isfinite(S) and math.isfinite(grad)):
-        return float("inf"), grad
+    if not (math.isfinite(S) and math.isfinite(grad)) or not all(math.isfinite(x) for row in J for x in row):
+        return float("inf"), grad, 0, float("inf")
+    rowmax = [max(abs(x) for x in row) for row in J]
+    big = max(rowmax) if rowmax else 0.0
+    clamped = clamped or [False] * len(r)
+    flat = sum(ri * ri for rm, ri, cl in zip(rowmax, r, clamped) if cl or rm <= RANK_TOL * big)
     if S <= 0.0:
-        return 0.0, grad
-    live = [a_ for a_ in range(P) if JtJ[a_][a_] > 0.0]
-    if not live:
-        return 1.0, grad   # a vanished Jacobian explains nothing: never 'stationary' with a residual left
-    sc = {a_: 1.0 / math.sqrt(JtJ[a_][a_]) for a_ in live}
-    Ms = [[JtJ[a_][b_] * sc[a_] * sc[b_] + (STAT_RIDGE if a_ == b_ else 0.0) for b_ in live] for a_ in live]
-    gs = [Jtr[a_] * sc[a_] for a_ in live]
-    if not all(math.isfinite(x) for row in Ms for x in row) or not all(math.isfinite(x) for x in gs):
-        return float("inf"), grad
-    try:
-        st = hodge.solve(Ms, gs)
-    except ValueError:
-        return 1.0, grad
-    return max(0.0, sum(a_ * b_ for a_, b_ in zip(st, gs)) / S), grad
+        return 0.0, grad, P, 0.0
+    gain, rank = qr_gain(J, r, P)
+    return gain / S, grad, rank, flat
 
 
 def lm(model, cells, y, th0, iters=200, tol=1e-11):
     """Levenberg-Marquardt least squares; stops when an accepted step improves the SSE by less
-    than tol (relative). -> LMResult (theta, SSE, converged) with .reason / .grad / .stationarity.
-    Converged (FIT_FREEZE): an exact fit, or any other exit at a first-order stationary point
-    (stationarity <= STAT_TOL; prereg gate: a saturated plateau - every fitted mean at 0 or 1, the
-    gradient tiny only because every derivative is - used to pass, review round 5); at the
-    iteration cap also max |J'r| <= GTOL max(1, ||y||) (review round 4: such fits are boundary
-    infima - a fitted cell mean creeping to 0, an effect drifting to -inf, the SSE flat to ~1e-9
-    relative; anything else is NOT converged and decides nothing)."""
+    than tol (relative). -> LMResult (theta, SSE, converged) with .reason / .grad / .stationarity /
+    .rank / .flat_sse / .probe_decrease. Converged (FIT_FREEZE["converged"]): an exact fit, or an exit
+    whose exact linearized gain (qr_gain) is within the allowance or is not realizable by the
+    Gauss-Newton probe, with no unresolved residual on flat cells; at the iteration cap also
+    max |J'r| <= GTOL max(1, ||y||). Anything else is NOT converged and decides nothing; the
+    classifier never changes the fitted values."""
     th = list(th0)
     g, J = model.eval(th, cells)
     r = [a - b for a, b in zip(y, g)]
@@ -297,16 +390,25 @@ def lm(model, cells, y, th0, iters=200, tol=1e-11):
     floor = 1e-26 * max(1e-30, sum(v * v for v in y))   # an exact fit: nothing left to improve
 
     def out(reason, cap=False):
-        st, grad = stationarity(J, r, P)
+        st, grad, rank, flat = stationarity(J, r, P, [abs(e) >= ETA_CLAMP for e in model.etas(th, cells)])
         finite = math.isfinite(S) and all(math.isfinite(t) for t in th) and all(math.isfinite(x) for x in r)
         yy = sum(v * v for v in y)
         allow = STAT_TOL * S + STAT_ABS * max(yy, float(len(y)))
         sat = sum(ri * ri for row, ri in zip(J, r) if max(abs(x) for x in row) <= SAT_D)   # (reported only)
-        ok = finite and (reason == "exact" or st * S <= allow)
+        probe = None
+        if finite and reason != "exact" and math.isfinite(st) and st * S > allow:
+            # the linearized gain promises more than allowed: is it REALIZABLE? Probe (never adopt) the exact
+            # Gauss-Newton direction with a fine backtracking search (review of #49, round 3: a stalled saturation
+            # - Codex's a0 = +25 / a1 = -25 - realizes it; a weak direction at a boundary infimum or a legitimate
+            # optimum does not, the exact GN step with a line search reaching nothing)
+            probe = gn_probe(model, cells, y, th, J, r, S, enough=allow)
+        ok = finite and (reason == "exact" or ((st * S <= allow or (probe is not None and probe < allow))
+                                               and flat <= allow))
         if cap:
             ok = ok and grad <= GTOL * max(1.0, math.sqrt(yy))
         res = LMResult((th, S, ok))
         res.reason, res.grad, res.stationarity, res.saturated_sse = reason, grad, st, sat
+        res.rank, res.flat_sse, res.probe_decrease = rank, flat, probe
         return res
     for _ in range(iters):
         if S <= floor:
@@ -380,7 +482,8 @@ def fit(M, model_name, th0=None):
     return {"model": model_name, "theta": th, "F": F, "sse": sse, "converged": bool(ok) and finite,
             "params": model.describe(th), "reason": getattr(res, "reason", None) if finite else "non-finite",
             "grad": getattr(res, "grad", None), "stationarity": getattr(res, "stationarity", None),
-            "saturated_sse": getattr(res, "saturated_sse", None)}
+            "saturated_sse": getattr(res, "saturated_sse", None), "rank": getattr(res, "rank", None),
+            "flat_sse": getattr(res, "flat_sse", None)}
 
 
 # ------------------------------------------------------------ energies
@@ -732,8 +835,11 @@ def selftest():
     om = residual_omnibus([[zl, units5(0.0)], [units5(0.0)]])
     assert om["p_flip"] > 0.01 and om["conditions"] == 3 and abs(om["flip_min_p"] - 1 / 32 ** 2) < 1e-15, om["p_flip"]
     oc = residual_omnibus([[units5(0.08), units5(0.08)], [units5(0.08)]], B=19, seed=3)
-    assert oc["p_flip"] <= 1 / 32 ** 2 + 1e-12 and oc["p_boot"] == 1 / 20, (oc["p_flip"], oc["p_boot"])
-    assert oc["valid"] and oc["fits_converged"] == 3 and oc["boot_not_converged"] == 0, oc["invalid"]
+    # (the bootstrap's pseudo-means here leave [0, 1]; some refits stall along a weak combination - the exact
+    # Gauss-Newton probe realizes a lower SSE - and are correctly unconverged, which withholds p_boot)
+    assert oc["p_flip"] <= 1 / 32 ** 2 + 1e-12 and (oc["p_boot"] == 1 / 20 or (oc["p_boot"] is None and
+                                                       oc["boot_not_converged"] > 0)), (oc["p_flip"], oc["p_boot"])
+    assert oc["valid"] and oc["fits_converged"] == 3, oc["invalid"]
     # an unconverged mean fit makes H1b invalid (no p-value, the computed one kept as a diagnostic)
     zc5 = units5(0.08)
     fu = dict(fit_matrix(zc5), converged=False)
