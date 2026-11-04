@@ -1115,11 +1115,11 @@ def _phi_tails(w):
 # Rare-event worlds (kappa = 0.8): for SELECTED coordinates U = Phi(W) becomes (1 - pi) U without the
 # column's shared Bernoulli(pi) event and 1 - pi + pi U with it (each marginal stays exactly uniform);
 # the event is shared across the column's selected coordinates and both assays. 'Reflect alternate
-# coordinates as 1 - U' is implemented as conjugation, U' = 1 - T(1 - U), on the odd invaders (the ones
-# the column factor loads with -1): the event sends even invaders to their top pi-quantile and odd ones
-# to their bottom pi-quantile, the column factor's own +-1 pattern is kept, and pi -> 0 recovers J8
-# exactly. Distributed: every column's invaders; concentrated: resident 0, invaders 1 and 2 (opposite
-# reflections). pi = 0.05 (R05) or 0.01 (R01).
+# coordinates as 1 - U' applies to the odd invaders (the ones the column factor loads with -1); its two
+# readings are behind RARE_REFLECTION / rare_transform (below): conjugation U' = 1 - T(1 - U) (keeps the
+# factor's +-1 pattern, pi -> 0 recovers J8) or the literal 1 - T(U). Either way the event sends even
+# invaders to their top pi-quantile and odd ones to their bottom one. Distributed: every column's
+# invaders; concentrated: resident 0, invaders 1 and 2 (opposite reflections). pi = 0.05 (R05) or 0.01 (R01).
 JOINT_WORLDS = {
     "J0": {"kappa": 0.0, "rare": None},
     "J8": {"kappa": 0.8, "rare": None},
@@ -1159,15 +1159,35 @@ def joint_column(rnd, margs, p, kappa, rare=None):
             w = (f if i % 2 == 0 else -f) + se * rnd.gauss(0.0, 1.0)
             lo, hi = _phi_tails(w)
             if ev is not None and rare_selected(rare["where"], p, i):
-                pi_ = rare["pi"]
-                if i % 2:
-                    lo, hi = hi, lo
-                lo, hi = ((1.0 - pi_ + pi_ * lo, pi_ * hi) if ev else ((1.0 - pi_) * lo, pi_ + (1.0 - pi_) * hi))
-                if i % 2:
-                    lo, hi = hi, lo
+                lo, hi = rare_transform(lo, hi, ev, rare["pi"], bool(i % 2))
             row[i] = quantile_marginal(margs[c][i], lo, hi)
         out.append(row)
     return out
+
+
+# The rare-event reflection (review of #49, ruling 3: the user chooses between the two readings, by a dated
+# amendment for the first). ONE switch:
+#   "conjugate"  U' = 1 - T(1 - U) on a reflected coordinate (the implementation so far; keeps the column
+#                factor's (-1)^i loading, pi -> 0 recovers J8);
+#   "literal"    U' = 1 - T(U), the draft's wording read literally (T applied, then the output reflected).
+# T(U) = (1 - pi) U without the event, 1 - pi + pi U with it. The gate manifest records the choice.
+RARE_REFLECTION = "conjugate"
+
+
+def rare_transform(lo, hi, event, pi_, reflected, rule=None):
+    """(U', 1 - U') of a selected coordinate from (U, 1 - U), each accurate in its own tail."""
+    def T(l_, h_):
+        return (1.0 - pi_ + pi_ * l_, pi_ * h_) if event else ((1.0 - pi_) * l_, pi_ + (1.0 - pi_) * h_)
+    if not reflected:
+        return T(lo, hi)
+    rule = rule or RARE_REFLECTION
+    if rule == "conjugate":
+        h_, l_ = T(hi, lo)          # T(1 - U), then reflected: 1 - T(1 - U)
+        return l_, h_
+    if rule == "literal":
+        l_, h_ = T(lo, hi)          # T(U), then reflected: 1 - T(U)
+        return h_, l_
+    raise ValueError(f"unknown rare-event reflection {rule!r}")
 
 
 # ------------------------------------------------- planted alternatives in the compound world
@@ -1858,8 +1878,10 @@ def main(argv=None):
         md.append("\n## Compound world diagnostics (diag.csv): what each variant planted, how feasible its moments were\n")
         md.append("d_add = RMS added circulation per pair (after clipping); d_res = the noiseless residual RMS per pair "
                   "after refitting the logistic model (the signal beyond the logistic family that H1b tests). "
-                  "'nominal' plants are the old probability-scale ones (clipped to [0.002, 0.998]); 'feasible plant "
-                  "d_res=x' plants a logit-scale cycle solved to d_res = x. Null means are never clipped.\n")
+                  "'nominal' plants are the old probability-scale ones at a nominal amplitude (clipped to [0.002, "
+                  "0.998]); 'feasible plant d_res=x' is the registered plant: the same probability-scale cycle, "
+                  "clipped, its amplitude c the first crossing of d_res >= x on the grid 0, 0.001, ..., 1 refined "
+                  "by bisection to 1e-4 relative. Null means are never clipped.\n")
         md.append("| world | N:k:G:C | quantity | effect | n | mean | min | max |\n|---|---|---|---|---|---|---|---|")
         for r in drows:
             md.append(f"| {r['world']} | {r['N']}:{r['k']}:{r['G']}:{r['C']} | {r['quantity']} | {r['effect']} | {r['n']} | "
