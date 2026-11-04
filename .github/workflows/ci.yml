@@ -29,6 +29,14 @@ jobs:
       - name: Test
         run: ctest --test-dir build --output-on-failure
 
+  # tools/gate_receipts.*: fault suite on temp repos and fake tools (no Emscripten, no gate reuse in CI).
+  receipts:
+    name: gate receipts (fault suite)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - run: python3 -I tests/test_gate_receipts.py
+
   wasm:
     name: wasm (build, freshness, parity)
     runs-on: ubuntu-24.04

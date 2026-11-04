@@ -89,6 +89,10 @@ Memory is tight on the maintainer's PC: use `JOBS`/`BUILD_JOBS`, `nice -n 19`, a
 - CI jobs: `native` (3 variants), `wasm` (build, freshness, `parity.sh`, `build_site.sh`), `ocean` (freshness,
   turbo hand-off, FAST parity, `app_live_s21` twin).
 
+- Gate receipts (`tools/gate_receipts.sh`, `docs/gate_receipts.md`): a local, never-CI speed-up that skips re-running a
+  gate whose whole tracked tree, command, environment and toolchain are unchanged. Receipts never replace a gate in CI,
+  and browser/deploy results are record-only.
+
 ## Determinism contract
 
 - Ocean: native == wasm == committed baselines (`tests/ocean_baseline`), compared via the per-step chained fingerprints.
