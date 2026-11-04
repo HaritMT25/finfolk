@@ -4373,6 +4373,14 @@ function countedFile(bytes, name) {
     g.slice = (x, y) => { g.reads.push([x, y]); return f.slice(x, y); };
     return g;
 }
+/* the page's Uint8Arrays of length n made from now on (a body's buffer: readParts'), counted; undo() puts the page's own
+ * constructor back and answers the count */
+function bodyBuffers(p, n) {
+    const Real = vm.runInContext('Uint8Array', p.ctx);
+    let made = 0;
+    p.ctx.Uint8Array = new Proxy(Real, { construct(t, a, nt) { if (a[0] === n) made++; return Reflect.construct(t, a, nt); } });
+    return { undo: () => { delete p.ctx.Uint8Array; return made; } };
+}
 async function answerOf(p, file) {
     const id = p.T.fileReq + 1;
     p.el('err').textContent = '';
@@ -4439,15 +4447,15 @@ async function review2Budget() {
            '(one at a time), the newer opened ("' + said.slice(0, 50) + '…")');
     }
     {   /* the unpacking itself, superseded: cancelled at its next chunk, its stream cancelled (cancelled() is asked before the
-         * body's one part is read and before the unpacking: twice; then at each chunk: the 2nd one is superseded) */
+         * body's buffer, before its one part is read and before the unpacking: 3 times; then at each chunk: the 2nd one is superseded) */
         const proto = globalThis.ReadableStreamDefaultReader.prototype, cancel = proto.cancel;
         let cancels = 0, why = '', chunks = 0;
         proto.cancel = function () { cancels++; return cancel.apply(this, arguments); };
         try {
             const r = await HO.readWorld(HO.bytesSource(big));
-            why = await r.body(() => ++chunks > 3).then(() => '', (e) => String(e.message));
+            why = await r.body(() => ++chunks > 4).then(() => '', (e) => String(e.message));
         } finally { proto.cancel = cancel; }
-        ok(why === HO.CANCELLED && cancels === 1 && chunks === 4, 'a decode superseded mid-way: it stops at its next chunk (' + chunks + ' asked), its stream cancelled (' + cancels + ')');
+        ok(why === HO.CANCELLED && cancels === 1 && chunks === 5, 'a decode superseded mid-way: it stops at its next chunk (' + chunks + ' asked), its stream cancelled (' + cancels + ')');
     }
     {   /* a question about one saved world, then another file: the question (and its image) goes, the newer file answers */
         const p = await bootPage(PAGE_Q7);
@@ -4567,7 +4575,7 @@ async function review2LateFailure() {
 /* The engine fence's tests (review of #44, round 2 finding 3; round 3 finding 3). FENCE_EXPORTS: the exports counted */
 const FENCE_EXPORTS = ['_oc_step', '_oc_sync', '_oc_inspect', '_oc_summary', '_oc_wiring', '_oc_set_param', '_oc_set_capture', '_oc_set_colour_mode', '_oc_families',
                        '_oc_creature_count', '_oc_reset', '_oc_init', '_oc_width', '_oc_light_enabled', '_oc_e1_preset', '_oc_last_error', '_oc_num_senses',
-                       '_oc_sensor_names'];
+                       '_oc_sensor_names', '_malloc', '_free'];
 /* a page whose `name` traps from now on (after setup); calls: every listed export's calls counted; trapAt: the counts when it
  * first trapped (what reached the engine after that, in the same operation too, is what the fence must stop) */
 async function fenceTrapping(name, setup, query) {
@@ -4621,9 +4629,10 @@ async function fenceWays(ways) {
         try { await fenceAfterwards(p); } catch (e) { threw += ' / after: ' + String(e); }
         const more = FENCE_EXPORTS.filter(f => calls[f] !== at[f]).map(f => f + ' ' + (calls[f] - at[f]));
         const once = calls[name] === 1, extra = check ? check(p) : '';
+        const stops = p.logs.filter(l => /^ocean: The engine stopped \(/.test(l[1])).length;   /* (said once: an inner fence and the operation's own are one stop) */
         if (threw || !down || !once || more.length || p.uncaught.length || !/[Tt]he engine stopped/.test(said) || !/injected: a trap in /.test(said) ||
-            p.T.runCfg.minSpeed === 33 || extra)
-            bad.push(what + ': ' + JSON.stringify({ threw, down, once: calls[name], more, uncaught: p.uncaught.slice(0, 1), said: said.slice(0, 100), extra }));
+            p.T.runCfg.minSpeed === 33 || stops !== 1 || extra)
+            bad.push(what + ': ' + JSON.stringify({ threw, down, once: calls[name], more, uncaught: p.uncaught.slice(0, 1), said: said.slice(0, 100), stops, extra }));
         else fine.push(what);
     }
     return [fine, bad];
@@ -4766,6 +4775,7 @@ async function review3Reads() {
         W.READ_PART = 64 * 1024;   /* (this file's body: several parts) */
         const parts = Math.ceil((s.bytes.length - at) / W.READ_PART);
         p.hooks.timer = (ms) => ms === 50 ? 1500 : ms;
+        const bodies = bodyBuffers(p, s.bytes.length - at);   /* (round 4, finding 2: a body's buffer counted, not only its disk reads) */
         let release;
         const gate = new Promise((r) => { release = r; });
         const a = gated(new File([s.bytes], 'first.oceanworld'), gate, (x) => x < at), b = countedFile(s.bytes, 'second.oceanworld'), c = countedFile(s.bytes, 'third.oceanworld');
@@ -4785,12 +4795,14 @@ async function review3Reads() {
         release();   /* A's part comes now: dropped */
         await new Promise(r => setTimeout(r, 100));
         p.hooks.timer = null; W.READ_PART = part;
+        const made = bodies.undo();
         const aParts = a.reads.filter(r => r[0] >= at);
         const k = { parts: parts > 2, noBodyWhileHeld: !waiting.b && !waiting.c && waiting.held, aOnePart: aParts.length === 1 && aParts[0][1] - aParts[0][0] === 64 * 1024,
-                    bNever: !bodyRead(b, at), cOpened: /^Opened the saved world third\.oceanworld/.test(opened) && bodyRead(c, at),
+                    bNever: !bodyRead(b, at) && made === 2, cOpened: /^Opened the saved world third\.oceanworld/.test(opened) && bodyRead(c, at),
                     quiet: p.msg() === opened && !/first|second/.test(opened + toastText(p)) };
         ok(all(k), 'A\'s body (' + parts + ' parts of 64 kB) stuck at its first part; B and C picked meanwhile: no body read while A holds the turn; A lets it go with that one part ' +
-           'on its way (' + aParts.length + ' asked for, dropped when it came), B (superseded when its turn came) reads none, C opens' + nots(k));
+           'on its way (' + aParts.length + ' asked for, dropped when it came), B (superseded when its turn came) reads none and makes no buffer for it (' + made +
+           ' body buffers: A\'s and C\'s), C opens' + nots(k));
     }
     {   /* the budget again when its turn comes: B fits when picked, but the run grows while it waits (deviceMemory 0.5, 40 MB -> 70 MB;
          * A, superseded, holds the turn 1.5 s, its body stuck) */
@@ -4924,6 +4936,65 @@ async function review3Save() {
     }
 }
 
+/* ---------------------------------------------------------------------
+ * Codex's fourth review of #44 (codex_reviews/2026-11-04_rereview4_pr44_world-file.md):
+ * each check fails with its fix taken out (the PR lists the planted runs).
+ * --------------------------------------------------------------------- */
+async function review4Fence() {
+    section('Fourth review of #44, findings 1 and 3: a trap in an inner fence ends the whole operation, no allocator call after it (an edit held for ' +
+            'Turbo\'s hand-back, replayed; Turbo\'s worker failing meanwhile); the console\'s readers fenced (their snapshot cut again)');
+    /* Turbo; Stop, its hand-back held (the worker's answer queued); a live edit meanwhile: held for the hand-back */
+    const held = async (p) => {
+        p.click('turbobtn');
+        await until(() => p.T.turboState === 'turbo', 'Turbo');
+        const sh = p.worker();
+        sh.pause();
+        p.click('turboexit');
+        await until(() => sh.queued(isType('memory')), 'the hand-back, held');
+        p.edit('minSpeed', 36);
+        if (!Object.keys(p.T.live.held()).length) throw new Error('the edit was not held');
+    };
+    const gone = (p) => p.T.turboState === 'live' && p.workers.every(w => w.terminated) ? '' : 'Turbo left ' + p.T.turboState;
+    const stale = (p) => { growMiB(p.M); };   /* (the views out of date: a reader cuts a new snapshot, from the engine) */
+    const ways = [
+        ['the edit held for Turbo\'s hand-back, replayed (oc_set_param)', '_oc_set_param', held, (p) => p.worker().resume(), gone],
+        ['the edit held, replayed as Turbo\'s worker fails (oc_set_param)', '_oc_set_param', held, (p) => p.worker().onerror({ message: 'injected: the worker failed' }), gone],
+        ['the console\'s state', '_oc_creature_count', stale, (p) => p.ctx.EvoOcean.state()],
+        ['the console\'s deepest', '_oc_creature_count', stale, (p) => p.ctx.EvoOcean.deepest()],
+        ['the console\'s steepest', '_oc_creature_count', stale, (p) => p.ctx.EvoOcean.steepest()]
+    ];
+    const [fine, bad] = await fenceWays(ways);
+    ok(!bad.length, 'a first trap in ' + fine.join(', ') + ': the engine stops once, said once; from the trap on nothing reaches the module (no free of the ' +
+       'setting\'s C string, no oc_last_error, no frame read), and nothing after it does' + (bad.length ? ' — ' + bad.join('; ') : ''));
+}
+
+async function review4Reads() {
+    section('Fourth review of #44, finding 2: a read superseded before its body is read makes no buffer for it (the page\'s queued read: review3Reads)');
+    const { s } = await aSavedWorld();
+    const at = HO.worldHeader(s.bytes).at, len = s.bytes.length - at, part = HO.WORLD.READ_PART, Real = globalThis.Uint8Array;
+    let made = 0, reads = 0, why = '';
+    HO.WORLD.READ_PART = 64 * 1024;   /* (this body: several parts, one buffer for them) */
+    try {
+        const src = HO.bytesSource(s.bytes), counted = { size: src.size, read: (x, y) => { if (x >= at) reads++; return src.read(x, y); } };
+        const r = await HO.readWorld(counted);
+        globalThis.Uint8Array = new Proxy(Real, { construct(t, a, nt) { if (a[0] === len) made++; return Reflect.construct(t, a, nt); } });
+        why = await r.body(() => true).then(() => '', (e) => String(e.message));
+    } finally { globalThis.Uint8Array = Real; HO.WORLD.READ_PART = part; }
+    ok(why === HO.CANCELLED && made === 0 && reads === 0 && len > 2 * 64 * 1024,
+       'a body of ' + Math.ceil(len / 65536) + ' parts, superseded before it is read: cancelled with no buffer made (' + made + ') and no part read (' + reads + ')');
+    {   /* superseded between two parts that come at once (before the 50 ms look at a part on its way): no further part is read */
+        let stale = false, n = 0, why2 = '';
+        HO.WORLD.READ_PART = 64 * 1024;
+        try {
+            const src = HO.bytesSource(s.bytes), counted = { size: src.size, read: (x, y) => { if (x >= at) { n++; stale = true; } return src.read(x, y); } };
+            const r = await HO.readWorld(counted);
+            why2 = await r.body(() => stale).then(() => '', (e) => String(e.message));
+        } finally { HO.WORLD.READ_PART = part; }
+        ok(why2 === HO.CANCELLED && n === 1, 'a read superseded while its first part is read (that part comes at once): no further part is read (' + n + ' of ' +
+           Math.ceil(len / 65536) + ')');
+    }
+}
+
 /* Every section, in order; `node tests/ocean_turbo_handoff.js NAME...` runs only those. */
 const SECTIONS = {
     repeatedKeys, liveLedger, growthPage, randomize, imports,
@@ -4946,7 +5017,8 @@ const SECTIONS = {
     worldCodec, pageWorldFile, pageWorldTurbo, pageWorldRefusals,
     reviewLimits, reviewHeader, reviewTransaction, reviewEngineId, reviewDraft, reviewCapture, reviewStaleRead, reviewTurboStates,
     review2Budget, review2LateFailure, review2Fence, review2SaveLimits, review2SaveFailures, review2Canon,
-    review3Worker, review3Reads, review3Fence, review3Save
+    review3Worker, review3Reads, review3Fence, review3Save,
+    review4Fence, review4Reads
 };
 const unhandled = [];
 process.on('unhandledRejection', (e) => { unhandled.push(e); });
