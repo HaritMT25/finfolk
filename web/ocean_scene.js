@@ -522,24 +522,28 @@
   /* The radius of a sphere about the centre between the fish's head and tail
    * (at its height y) that holds everything the shaders draw for it: every
    * point of the spine's polyline lies within half its length L of that
-   * centre, the Catmull-Rom curve within .4 of the longest link of the
-   * polyline (the Hermite basis' bound), the extrapolation past the ends
-   * within the reach above; off the spine, pad x R; and the pitch lifts a
-   * point by at most its distance from the head x |tan(pitch)| (clamped at
-   * 1.2, as fishWorld). Glass walls only pull points toward the tank. vz: the
-   * pitch (iX.x), lam: lambda (iX.z; the legacy kinds 1), K: the reach. */
+   * centre (here L <= sqrt(5 x the sum of the squared links), Cauchy-Schwarz:
+   * two square roots, tight for the near-equal links the engine keeps), the
+   * Catmull-Rom curve within .4 of the longest link lmax (the Hermite basis'
+   * bound), the extrapolation past the ends (along the end links, each at
+   * most lmax) within the reach above; off the spine, pad x R; and the pitch
+   * lifts a point by at most its distance from the head x |tan(pitch)|
+   * (clamped at 1.2, as fishWorld). Glass walls only pull points toward the
+   * tank. vz: the pitch (iX.x), lam: lambda (iX.z; the legacy kinds 1), K:
+   * the reach. */
   function reachRadius(xs, ys, R, vz, lam, K) {
-    var L = 0, lmax = 0, l0 = 0, l4 = 0;
+    var S = 0, M2 = 0;
     for (var k = 0; k < 5; k++) {
-      var dx = xs[k + 1] - xs[k], dy = ys[k + 1] - ys[k], l = Math.sqrt(dx * dx + dy * dy);
-      L += l; if (l > lmax) lmax = l;
-      if (k === 0) l0 = l;
-      l4 = l;
+      var dx = xs[k + 1] - xs[k], dy = ys[k + 1] - ys[k], q = dx * dx + dy * dy;
+      S += q; if (q > M2) M2 = q;
     }
+    var L = Math.sqrt(5 * S), lmax = Math.sqrt(M2);
     lam = lam > 0.5 ? lam : 0.5;
-    var ef = 5 * l0 * Math.min(K.uf, K.sn + K.kf / lam), eb = 5 * l4 * Math.min(K.ub, K.tb + K.kb / lam);
-    var t = vz === vz ? Math.min(1.2, Math.abs(vz)) : 0;
-    return 0.5 * L + 0.4 * lmax + Math.max(ef, eb) + K.pad * R + t * Math.max(L + 0.4 * lmax + eb, ef);
+    var a = K.sn + K.kf / lam, b = K.tb + K.kb / lam;
+    var ef = 5 * lmax * (a < K.uf ? a : K.uf), eb = 5 * lmax * (b < K.ub ? b : K.ub), e = ef > eb ? ef : eb;
+    var t = vz === vz ? (vz < 0 ? -vz : vz) : 0, s = L + 0.4 * lmax + eb;
+    if (t > 1.2) t = 1.2;
+    return 0.5 * L + 0.4 * lmax + e + K.pad * R + t * (s > ef ? s : ef);
   }
   /* The swim polish's size weight of one fish (POSE_GLSL's iPose.w), from
    * what the renderer uploads for it: its spine as unwrapped (xs, ys: the
@@ -550,46 +554,69 @@
    * between head and tail, radius half their distance + 2 R), R x focal /
    * depth, with the focal length from the projection matrix (FOV, zoom and
    * the panels' view offset; CSS px, so DPR plays no part): none under 6 px
-   * (the cheap test every fish gets), all from 11; and 0 for a fish whose
-   * whole reach (reachRadius: everything drawn for it) lies behind the near
-   * plane or wholly outside a side plane of the view frustum, so a fish
-   * partly in view never loses its polish there. Display only. */
-  function poseWeight(xs, ys, R, y, G, vz, lam, K) {
+   * (posePx: the cheap test every fish gets; the fills inline it), all from
+   * 11; and 0 for a fish whose whole reach (reachRadius: everything drawn
+   * for it) lies behind the near plane or wholly outside a side plane of the
+   * view frustum, so a fish partly in view never loses its polish there
+   * (poseVisibleQ, for a fish over 6 px: its weight in 7 bits, 0 .. 127, an
+   * integer so nothing is boxed). Display only. */
+  function posePx(xs, ys, R, y, G) {
     var V = G.view;
     var cx = 0.5 * (xs[0] + xs[5]) - G.halfW, cz = 0.5 * (ys[0] + ys[5]) - G.halfH;
-    var ex = xs[0] - xs[5], ey = ys[0] - ys[5], rb = 0.5 * Math.sqrt(ex * ex + ey * ey) + 2 * R;
-    var dz = -(V[2] * cx + V[6] * y + V[10] * cz + V[14]);   /* the centre's camera-space depth */
-    var px = R * G.focal / Math.max(dz - rb, G.near);
-    if (!(px > 6)) return 0;
-    var rv = reachRadius(xs, ys, R, vz, lam, K || REACH_APP);
-    if (dz + rv <= G.near) return 0;
-    var vx = V[0] * cx + V[4] * y + V[8] * cz + V[12], vy = V[1] * cx + V[5] * y + V[9] * cz + V[13], F = G.planes;
-    /* the side planes (poseCamera; unit normals in the camera's x / y and depth) */
-    if (F[0] * vx + F[1] * dz > rv || F[2] * vx + F[3] * dz > rv || F[4] * vy + F[5] * dz > rv || F[6] * vy + F[7] * dz > rv) return 0;
-    return smoothCPU(6, 11, px);
+    var ex = xs[0] - xs[5], ey = ys[0] - ys[5];
+    var dn = -(V[2] * cx + V[6] * y + V[10] * cz + V[14]) - 0.5 * Math.sqrt(ex * ex + ey * ey) - 2 * R;   /* the body's nearest depth */
+    return R * G.focal / (dn > G.near ? dn : G.near);
   }
-  /* the swim pose packed (packPose) of a fish of size weight w > 0: the roll
-   * into its turn (scaled by w, so a fish fading out of the polish levels
-   * out and the plain programs, which draw it level, take over seamlessly)
-   * and, at swimming speed v (/ 150, the engine's default top speed; 0: no
-   * fold), the paired fins' fold, eased in a hard turn, times w */
-  function posePack(xs, ys, v, w) {
+  function poseVisibleQ(xs, ys, R, y, G, vz, lam, K, px) {
+    var V = G.view, F = G.planes;
+    var cx = 0.5 * (xs[0] + xs[5]) - G.halfW, cz = 0.5 * (ys[0] + ys[5]) - G.halfH;
+    var vx = V[0] * cx + V[4] * y + V[8] * cz + V[12], vy = V[1] * cx + V[5] * y + V[9] * cz + V[13];
+    var dz = -(V[2] * cx + V[6] * y + V[10] * cz + V[14]);   /* the centre's camera-space depth */
+    /* the centre's distances outside the side planes (poseCamera; unit normals in the camera's x / y and depth) */
+    var m = F[0] * vx + F[1] * dz, m1 = F[2] * vx + F[3] * dz, m2 = F[4] * vy + F[5] * dz, m3 = F[6] * vy + F[7] * dz;
+    if (m1 > m) m = m1;
+    if (m2 > m) m = m2;
+    if (m3 > m) m = m3;
+    if (m > 0 || dz <= G.near) {   /* the centre is out of view: does the reach come back in? */
+      var rv = reachRadius(xs, ys, R, vz, lam, K);
+      if (dz + rv <= G.near || m > rv) return 0;
+    }
+    return (127 * smoothCPU(6, 11, px) + 0.5) | 0;
+  }
+  /* the swim pose packed (packPose) of a fish of size weight qw / 127 > 0:
+   * the roll into its turn (scaled by the weight, so a fish fading out of
+   * the polish levels out and the plain programs, which draw it level, take
+   * over seamlessly) and, at swimming speed v (/ 150, the engine's default
+   * top speed; 0: no fold), the paired fins' fold, eased in a hard turn,
+   * times the weight */
+  function posePack(xs, ys, v, qw) {
     var d0x = xs[0] - xs[1], d0y = ys[0] - ys[1], d1x = xs[1] - xs[2], d1y = ys[1] - ys[2], d2x = xs[2] - xs[3], d2y = ys[2] - ys[3];
-    var l0 = Math.sqrt(d0x * d0x + d0y * d0y), l1 = Math.sqrt(d1x * d1x + d1y * d1y), l2 = Math.sqrt(d2x * d2x + d2y * d2y);
+    var q1 = d1x * d1x + d1y * d1y;
+    var n01 = Math.sqrt((d0x * d0x + d0y * d0y) * q1), n12 = Math.sqrt(q1 * (d2x * d2x + d2y * d2y));   /* l0 l1, l1 l2 */
     /* + = turning toward its +side; the back leans into the turn's centre */
-    var turn = 0.65 * (d1x * d0y - d1y * d0x) / Math.max(l0 * l1, 1e-6) + 0.35 * (d2x * d1y - d2y * d1x) / Math.max(l1 * l2, 1e-6);
-    var bank = Math.max(-0.6, Math.min(0.6, 1.6 * turn)) * w;
-    var tuck = v > 0 ? smoothCPU(0.40, 0.90, v) * (1 - smoothCPU(0.10, 0.35, Math.abs(turn))) : 0;
-    return packPose(Math.sin(bank), tuck * w, w);
+    var turn = 0.65 * (d1x * d0y - d1y * d0x) / (n01 > 1e-6 ? n01 : 1e-6) + 0.35 * (d2x * d1y - d2y * d1x) / (n12 > 1e-6 ? n12 : 1e-6);
+    var bank = 1.6 * turn;
+    bank = (bank > 0.6 ? 0.6 : bank < -0.6 ? -0.6 : bank) * qw / 127;
+    var b2 = bank * bank, sb = bank * (1 - b2 / 6 * (1 - b2 / 20));   /* sin, |bank| <= .6: error < 6e-6, under the 10 bits' 1.2e-3 */
+    var at = turn < 0 ? -turn : turn;
+    var tuck = v > 0 ? smoothCPU(0.40, 0.90, v) * (1 - smoothCPU(0.10, 0.35, at)) : 0;
+    /* packPose(sin, tuck w, w): every rounded value >= 0, so round = floor(x + .5) = (x + .5) | 0 */
+    return ((sb / 0.6 * 511 + 512.5) | 0) * 16384 + ((tuck * qw + 0.5) | 0) * 128 + qw;
   }
   /* The swim pose of one fish (POSE_GLSL's iPose) packed in one float: its
-   * size weight (poseWeight; with G.gate false every fish weighs 1, the
-   * measurements' ungated reference; G.zero, 0), then, if it is lit, the
-   * roll and the fold (posePack); unlit, POSE0. Display only. */
+   * size weight (posePx, poseVisibleQ; with G.gate false every fish weighs
+   * 1, the measurements' ungated reference; G.zero, 0), then, if it is lit,
+   * the roll and the fold (posePack); unlit, POSE0. Display only. */
   var POSE0 = 512 * 16384;   /* packPose(0, 0, 0): level, spread, weight 0 */
+  function poseQ(xs, ys, R, y, G, vz, lam, K) {
+    if (G.zero) return 0;
+    if (!G.gate) return 127;
+    var px = posePx(xs, ys, R, y, G);
+    return px > 6 ? poseVisibleQ(xs, ys, R, y, G, vz, lam, K || REACH_APP, px) : 0;
+  }
   function swimPose(xs, ys, R, y, v, G, vz, lam, K) {
-    var w = G.zero ? 0 : (G.gate ? poseWeight(xs, ys, R, y, G, vz, lam, K) : 1);
-    return w > 0 ? posePack(xs, ys, v, w) : POSE0;
+    var qw = poseQ(xs, ys, R, y, G, vz, lam, K);
+    return qw > 0 ? posePack(xs, ys, v, qw) : POSE0;
   }
   /* The swim pose in one float, an integer below 2^24 (exact in a float32):
    * sin(roll) in 10 bits (steps of 0.6 / 511, 0 exact), the fold and the weight in 7 each (0 stays
@@ -2906,8 +2933,15 @@
           if (hgt > yMax) yMax = hgt;
         }
         if (posing) {
-          var w = G.zero ? 0 : (G.gate ? poseWeight(xs, ys, BODY[o], hgt, G, X[o], X[o + 2], REACH_APP) : 1);
-          if (w > 0) {
+          var qw = 0;   /* the weight in 7 bits (poseQ, its size test inlined: posePx) */
+          if (!G.gate) qw = G.zero ? 0 : 127;
+          else if (!G.zero) {
+            var cxw = 0.5 * (xs[0] + xs[5]) - G.halfW, czw = 0.5 * (ys[0] + ys[5]) - G.halfH, exw = xs[0] - xs[5], eyw = ys[0] - ys[5], GV = G.view;
+            var dnw = -(GV[2] * cxw + GV[6] * hgt + GV[10] * czw + GV[14]) - 0.5 * Math.sqrt(exw * exw + eyw * eyw) - 2 * BODY[o];
+            var pxw = BODY[o] * G.focal / (dnw > G.near ? dnw : G.near);
+            if (pxw > 6) qw = poseVisibleQ(xs, ys, BODY[o], hgt, G, X[o], X[o + 2], REACH_APP, pxw);
+          }
+          if (qw > 0) {
             /* the swimming speed (above): this fish in the last frame's list of lit fish */
             var sv = 0.55, hx = segs[b], hy = segs[b + 1];
             while (sj < SP0.n && SP0.ids[sj] < id) sj++;
@@ -2918,7 +2952,7 @@
               sj++;
             }
             SP1.ids[sk] = id; SP1.x[sk] = hx; SP1.y[sk] = hy; SP1.v[sk] = sv; sk++;
-            poseCount(BODY[o + 3] = posePack(xs, ys, sv, w));
+            poseCount(BODY[o + 3] = posePack(xs, ys, sv, qw));
             lit++;
           } else BODY[o + 3] = POSE0;
         }
@@ -2998,8 +3032,15 @@
           if (hgt > yMax) yMax = hgt;
         }
         if (posing) {
-          var w = G.zero ? 0 : (G.gate ? poseWeight(xs, ys, BODY[o], hgt, G, X[o], 1, fish.reach) : 1);
-          if (w > 0) { poseCount(X[o + 1] = posePack(xs, ys, 0, w)); lit++; }   /* no paired fins to fold */
+          var qw = 0;   /* the weight in 7 bits (poseQ, its size test inlined: posePx) */
+          if (!G.gate) qw = G.zero ? 0 : 127;
+          else if (!G.zero) {
+            var cxw = 0.5 * (xs[0] + xs[5]) - G.halfW, czw = 0.5 * (ys[0] + ys[5]) - G.halfH, exw = xs[0] - xs[5], eyw = ys[0] - ys[5], GV = G.view;
+            var dnw = -(GV[2] * cxw + GV[6] * hgt + GV[10] * czw + GV[14]) - 0.5 * Math.sqrt(exw * exw + eyw * eyw) - 2 * BODY[o];
+            var pxw = BODY[o] * G.focal / (dnw > G.near ? dnw : G.near);
+            if (pxw > 6) qw = poseVisibleQ(xs, ys, BODY[o], hgt, G, X[o], 1, fish.reach, pxw);
+          }
+          if (qw > 0) { poseCount(X[o + 1] = posePack(xs, ys, 0, qw)); lit++; }   /* no paired fins to fold */
           else X[o + 1] = POSE0;
         }
       }
@@ -3900,8 +3941,9 @@
     /* the swim pose of one fish (tests) and the fish programs' GLSL, plain
      * (P false: as before the polish) or polished */
     swimPose: swimPose, packPose: packPose, unpackPose: unpackPose, POSE0: POSE0,
-    /* swimPose's visibility sphere (its radius) and the appearance fish's reach */
-    reachRadius: reachRadius, REACH_APP: REACH_APP,
+    /* swimPose's parts (the fills' own: the size, the visibility, the pack), its visibility
+     * sphere (its radius) and the appearance fish's reach */
+    posePx: posePx, poseVisibleQ: poseVisibleQ, posePack: posePack, reachRadius: reachRadius, REACH_APP: REACH_APP,
     shaderSources: function (P) {
       var i = P === "lite" ? 2 : P ? 1 : 0, EA = window.EvoAppearance, a = EA ? appearanceShaders(EA, P === "lite" ? "lite" : !!P) : null;
       return { fishVs: FISH_VS[i], fishFs: FISH_FS[i], shadowVs: SHADOW_VS[i ? 1 : 0], shadowFs: SHADOW_FS,
