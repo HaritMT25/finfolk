@@ -817,7 +817,12 @@ def task_bank(args):
 # Bernoulli branch.) Alternatives keep r = v / (mu (1 - mu)) as the mean changes (marginal_alt).
 ZIB_PZ = 0.05        # the largest exact-zero probability of a losing invader (mu < ZIB_LOSING), as in the pilot
 ZIB_LOSING = 0.03
-MARGINAL_EDGE = 1e-12   # relative: v within this of mu (1 - mu) is the Bernoulli endpoint (rounding only)
+# Numerical conventions (FIT_FREEZE.md): (1) a requested v within the relative band MARGINAL_EDGE of
+# mu (1 - mu), on either side, is the Bernoulli endpoint (flagged 'edge'; a request beyond the band is
+# invalid); (2) the Beta part's variance is computed without cancellation,
+# vb = (v (1 - p0) - p0 mu^2) / (1 - p0)^2, and vb = v when p0 = 0 (review of #49: (v + mu^2) - mu^2
+# lost v = 1e-18 at mu = 0.5).
+MARGINAL_EDGE = 1e-12
 
 
 def marginal(mu, v, cap=False):
@@ -827,7 +832,7 @@ def marginal(mu, v, cap=False):
     -> dict(kind 'point' | 'beta' | 'bernoulli' | 'invalid', mu, v (achieved), v_req, p0, mb, vb, alpha,
     beta, valid, capped, reason)."""
     out = {"mu": mu, "v": v, "v_req": v, "p0": 0.0, "mb": mu, "vb": 0.0, "alpha": None, "beta": None,
-           "valid": True, "capped": False, "reason": None, "kind": "point"}
+           "valid": True, "capped": False, "edge": False, "reason": None, "kind": "point"}
     if not (isinstance(mu, (int, float)) and isinstance(v, (int, float)) and math.isfinite(mu) and math.isfinite(v)):
         return dict(out, kind="invalid", valid=False, reason=f"non-finite mean / variance ({mu}, {v})")
     if not 0.0 < mu < 1.0:
@@ -844,10 +849,10 @@ def marginal(mu, v, cap=False):
     if v == 0.0:
         return out
     if v >= vmax * (1.0 - MARGINAL_EDGE):
-        return dict(out, kind="bernoulli", v=vmax, mb=mu, vb=vmax)
+        return dict(out, kind="bernoulli", v=vmax, mb=mu, vb=vmax, edge=(v != vmax and not out["capped"]))
     p0 = min(ZIB_PZ, v / (2.0 * (v + mu * mu))) if mu < ZIB_LOSING else 0.0
     mb = mu / (1.0 - p0)
-    vb = (v + mu * mu) / (1.0 - p0) - mb * mb
+    vb = v if p0 == 0.0 else (v * (1.0 - p0) - p0 * mu * mu) / ((1.0 - p0) * (1.0 - p0))
     if not 0.0 < vb < mb * (1.0 - mb):   # (rounding at the edges only; the algebra above guarantees it)
         return dict(out, kind="invalid", valid=False, reason=f"Beta part infeasible (mb {mb:.6g}, vb {vb:.6g})")
     phi = mb * (1.0 - mb) / vb - 1.0
@@ -872,7 +877,8 @@ def marginal_moments(m):
         return m["mu"], m["mu"] * (1.0 - m["mu"])
     q = 1.0 - m["p0"]
     mean = q * m["mb"]
-    return mean, q * (m["vb"] + m["mb"] ** 2) - mean * mean
+    # (law of total variance, no cancellation: E Var + Var E over the zero-mass indicator)
+    return mean, q * m["vb"] + m["p0"] * q * m["mb"] ** 2
 
 
 def draw_marginal(rnd, m):
@@ -917,12 +923,39 @@ def _log_tails(a, b, lb, t):
     lf = lb + a * lx + b * l1x
     x, x1 = math.exp(lx), math.exp(l1x)
     if x < (a + 1.0) / (a + b + 2.0):
-        llo = lf + math.log(hodge._betacf(a, b, x) / a)
+        llo = lf + math.log(_betacf(a, b, x) / a)
         lhi = math.log1p(-math.exp(llo)) if llo < -1e-300 else -math.inf
         return llo, lhi
-    lhi = lf + math.log(hodge._betacf(b, a, x1) / b)
+    lhi = lf + math.log(_betacf(b, a, x1) / b)
     llo = math.log1p(-math.exp(lhi)) if lhi < -1e-300 else -math.inf
     return llo, lhi
+
+
+def _betacf(a, b, x):
+    """hodge._betacf (Numerical Recipes' continued fraction) with an iteration budget that grows as
+    sqrt(max(a, b)) (hodge's fixed 10,000 is short for shapes beyond ~1e8); not converging raises."""
+    qab, qap, qam = a + b, a + 1.0, a - 1.0
+    c, d = 1.0, 1.0 - qab * x / qap
+    d = 1.0 / (d if abs(d) > 1e-300 else 1e-300)
+    h = d
+    for m in range(1, 10000 + int(50.0 * math.sqrt(max(a, b)))):
+        m2 = 2 * m
+        aa = m * (b - m) * x / ((qam + m2) * (a + m2))
+        d = 1.0 + aa * d
+        d = 1.0 / (d if abs(d) > 1e-300 else 1e-300)
+        c = 1.0 + aa / c
+        c = c if abs(c) > 1e-300 else 1e-300
+        h *= d * c
+        aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2))
+        d = 1.0 + aa * d
+        d = 1.0 / (d if abs(d) > 1e-300 else 1e-300)
+        c = 1.0 + aa / c
+        c = c if abs(c) > 1e-300 else 1e-300
+        de = d * c
+        h *= de
+        if abs(de - 1.0) < 1e-15:
+            return h
+    raise ValueError(f"incomplete beta continued fraction did not converge (a {a:.4g}, b {b:.4g}, x {x:.4g})")
 
 
 QTABLE_S = 36.0      # tabulated |logit u| range (u down to ~2e-16); beyond it the quantile is solved exactly
@@ -1037,6 +1070,8 @@ def quantile_marginal(m, lo, hi):
         if lo <= p0:
             return 0.0
         lo, hi = (lo - p0) / (1.0 - p0), hi / (1.0 - p0)
+    if min(m["alpha"], m["beta"]) > QCF_MIN:
+        return _beta_quantile_cf(m["alpha"], m["beta"], lo, hi)
     key = (m["alpha"], m["beta"])
     q = _QCACHE.get(key)
     if q is None:
@@ -1044,6 +1079,26 @@ def quantile_marginal(m, lo, hi):
             _QCACHE.clear()
         q = _QCACHE[key] = BetaQuantile(m["alpha"], m["beta"])
     return q(lo, hi)
+
+
+QCF_MIN = 1e7   # both Beta shapes above this (a cell's SD < ~1e-4 of its mean scale): Cornish-Fisher
+
+
+def _beta_quantile_cf(a, b, lo, hi):
+    """Beta(a, b) quantile for very concentrated laws (min(a, b) > QCF_MIN, a numerical convention of
+    FIT_FREEZE.md): the fourth-order Cornish-Fisher expansion around the mean. Its error is
+    O(SD |skewness|^3) <= ~1e-11 SD there, below a double's resolution of the mean; the continued
+    fraction would need ~sqrt(max(a, b)) iterations per node."""
+    from statistics import NormalDist
+    nd = NormalDist()
+    z = nd.inv_cdf(lo) if lo < 0.5 else -nd.inv_cdf(hi)
+    s_ = a + b
+    m = a / s_
+    sd = math.sqrt(a * b / (s_ * s_ * (s_ + 1.0)))
+    g1 = 2.0 * (b - a) * math.sqrt(s_ + 1.0) / ((s_ + 2.0) * math.sqrt(a * b))
+    g2 = 6.0 * ((a - b) ** 2 * (s_ + 1.0) - a * b * (s_ + 2.0)) / (a * b * (s_ + 2.0) * (s_ + 3.0))
+    w = z + (z * z - 1.0) * g1 / 6.0 + (z ** 3 - 3.0 * z) * g2 / 24.0 - (2.0 * z ** 3 - 5.0 * z) * g1 * g1 / 36.0
+    return min(max(m + sd * w, 0.0), 1.0)
 
 
 def _phi_tails(w):
