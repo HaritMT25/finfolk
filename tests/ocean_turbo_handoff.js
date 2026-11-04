@@ -4585,15 +4585,19 @@ async function fenceTrapping(name, setup, query) {
     }
     return { p, calls, trapAt: () => t.at };
 }
+/* a tap on the tank's empty water (it lets the picked fish go) */
+function tapTank(p) {
+    const tap = (type) => { const e = new p.Ev(type, { bubbles: true }); Object.assign(e, { isPrimary: true, button: 0, clientX: 600, clientY: 400, pointerId: 7, pointerType: 'mouse' });
+                            p.el('tank').dispatchEvent(e); };
+    tap('pointerdown'); tap('pointerup');
+}
 /* what a visitor does after: frames, the console's state (the memory grown), a tap on the tank, a fish picked, its card closed, Esc,
  * the follow button, a live setting, a colour, follow, Turbo, Save world, R, Replay, a scenario card, the charts' wiring */
 async function fenceAfterwards(p) {
     for (let i = 0; i < 3; i++) p.raf(performance.now() + 1000 * i);
     growMiB(p.M);   /* (the views out of date: a fresh() would cut new ones, from the engine) */
     p.ctx.EvoOcean.state();
-    const tap = (type) => { const e = new p.Ev(type, { bubbles: true }); Object.assign(e, { isPrimary: true, button: 0, clientX: 600, clientY: 400, pointerId: 7, pointerType: 'mouse' });
-                            p.el('tank').dispatchEvent(e); };
-    tap('pointerdown'); tap('pointerup');   /* a tap on empty water: it would let the picked fish go */
+    tapTank(p);
     p.ctx.EvoOcean.select(0);
     p.click('iclose'); p.key('Escape'); p.click('followbtn');   /* (a fish still picked when it stopped: Close and Esc let it go) */
     p.edit('minSpeed', 33); p.edit('L0', 3);
@@ -4816,7 +4820,7 @@ async function review3Reads() {
 }
 
 async function review3Fence() {
-    section('Third review of #44, finding 3: Close, Esc, follow, Replay, a scenario card, the E1 button, a live setting\'s light read, T, Turbo\'s hand-back and failure, ' +
+    section('Third review of #44, finding 3: Close, Esc, a tap, follow, Replay, a scenario card, the E1 button, a live setting\'s light read, T, Turbo\'s hand-back and failure, ' +
             'an open\'s request: each fenced whole, a first trap there stops the engine once');
     const { s } = await aSavedWorld();
     const picked = async (p) => { p.ctx.EvoOcean.select(0); p.raf(performance.now()); if (p.el('drawer').classList.contains('open')) p.click('drawerclose'); };
@@ -4825,6 +4829,8 @@ async function review3Fence() {
     const ways = [
         ['the fish card\'s Close', '_oc_set_capture', picked, (p) => p.click('iclose')],
         ['Esc letting the fish go', '_oc_set_capture', picked, (p) => p.key('Escape')],
+        ['a tap on empty water letting the fish go', '_oc_set_capture', picked, (p) => tapTank(p)],
+        ['the console\'s select picking a fish', '_oc_set_capture', null, (p) => p.ctx.EvoOcean.select(0)],
         ['follow (the console\'s and the tour\'s, as F) picking a fish', '_oc_set_capture', null, (p) => p.ctx.EvoOcean.follow()],
         ['Replay (oc_reset)', '_oc_reset', null, (p) => p.click('replay')],
         ['a scenario card (the E1 preset)', '_oc_e1_preset', null, (p) => p.click('advreset')],
