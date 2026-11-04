@@ -11,7 +11,7 @@
 //   --arms: instead of profiler modes, the swim polish's arms, each capture spansGpu (cpu spans, GPU frame
 //        queries every 6th) with rAF timestamps: main (--main-base's site: before the polish), off / on /
 //        ungated / zero (this site with scene.setPolish false / true / "ungated": every fish at full weight, the
-//        reference that shows what the size gate saves; "zero": every weight 0, so the lite programs). Per cell, each round runs the arms in order
+//        reference that shows what the size gate saves; "zero": every weight 0, so none lit: the plain programs). Per cell, each round runs the arms in order
 //        (reversed on odd rounds, so drift cancels), a fresh page per site, a warm-up after each load and a
 //        settle after each switch; every observation records the arm, the effective polish state
 //        (scene.polish(): programs, gate, the last frame's weights), quality, DPR, the drawing buffer, the
@@ -127,51 +127,56 @@ function benchUrl(c, extra = {}, base = BASE) {
 }
 /* The swim polish's size weights against an independent projection (in the
  * page): for every fish as the last frame uploaded it (scene.poseOf: its
- * unwrapped spine, radius, height and iPose), the bounding sphere (centre
- * between head and tail, radius half their distance + 2 R) in camera space
- * through the full view matrix; the radius R projected through the full
- * projection matrix at the sphere's nearest depth, in CSS px of the canvas's
- * own rectangle; outside the view or behind the near plane, 0; else
+ * unwrapped spine, radius, height, pitch, lambda and iPose; POSE0's when the
+ * frame packed none, posed false: then every expected weight must be 0), the
+ * body's sphere (centre between head and tail, radius half their distance +
+ * 2 R) in camera space through the full view matrix; the radius R projected
+ * through the full projection matrix at the sphere's nearest depth, in CSS
+ * px of the canvas's own rectangle: at most 6 px, 0 (below); else 0 when the
+ * fish's whole reach (EvoOceanScene.reachRadius about the same centre, whose
+ * enclosure of every drawn vertex the vertex check proves) is behind the near
+ * plane or wholly outside a side plane of the frustum (the planes taken from
+ * the projection matrix's rows, Gribb-Hartmann: row 3 +- rows 0, 1), else
  * smoothstep(6, 11, px). The uploaded weight has 7 bits (|err| <= 1 / 254).
- * Reports the worst |uploaded - expected| over all
- * fish, how many are below 4 px, in between and above 9, the canvas and the
- * drawing buffer, and checks every uploaded pose (unpacked: scene.poseOf)
- * is finite with a unit sin / cos and a roll within the clamp. */
+ * Reports the worst |uploaded - expected| over all fish, how many are at most
+ * 6 px, in between, above 11 and outside, the canvas and the drawing buffer,
+ * and checks every uploaded pose is finite with a unit sin / cos and a roll
+ * within the clamp times the fish's weight (the roll scales with it). */
 const GATE_CHECK = async (label) => {
   const S = EvoOcean.scene;
   for (let k = 0; k < 3; k++) await new Promise((res) => requestAnimationFrame(res));   /* (no bench in a plain page) */
   const G = S.poseCamera(), st = S.polish(), n = EvoOcean.state().n, V = G.view, P = G.proj;
   const rect = document.getElementById("tank").getBoundingClientRect();
-  const out = { label, n, maxErr: 0, worst: null, below: 0, mid: 0, above: 0, outside: 0, nonFinite: 0, badRoll: 0,
+  const out = { label, n, maxErr: 0, worst: null, below: 0, mid: 0, above: 0, outside: 0, nonFinite: 0, badRoll: 0, posed: 0,
                 canvasCss: [rect.width, rect.height], drawingBuffer: G.drawingBuffer, dpr: devicePixelRatio, focalCss: G.focalCss, state: st };
   const clip = (q) => { const w = P[3] * q[0] + P[7] * q[1] + P[11] * q[2] + P[15];
     return [(P[0] * q[0] + P[4] * q[1] + P[8] * q[2] + P[12]) / w, (P[1] * q[0] + P[5] * q[1] + P[9] * q[2] + P[13]) / w]; };
+  const row = (r) => [P[r], P[4 + r], P[8 + r], P[12 + r]];
+  const planes = [[3, 0, 1], [3, 0, -1], [3, 1, 1], [3, 1, -1]].map(([a, b, sg]) => { const A = row(a), B = row(b), q = A.map((x, k) => x + sg * B[k]);
+    const l = Math.hypot(q[0], q[1], q[2]); return q.map((x) => x / l); });   /* inside: q . (x, y, z, 1) >= 0 */
   const sm = (x) => { const t = Math.max(0, Math.min(1, (x - 6) / 5)); return t * t * (3 - 2 * t); };
   for (let i = 0; i < n; i++) {
     const f = S.poseOf(i), p = f.pose;
+    if (f.posed) out.posed++;
     if (!p.every(Number.isFinite)) { out.nonFinite++; continue; }
-    if (Math.abs(p[0] * p[0] + p[1] * p[1] - 1) > 1e-5 || Math.abs(Math.atan2(p[0], p[1])) > 0.6 + 2e-3) out.badRoll++;
+    if (Math.abs(p[0] * p[0] + p[1] * p[1] - 1) > 1e-5 || Math.abs(Math.atan2(p[0], p[1])) > 0.6 * p[3] + 2e-3) out.badRoll++;
     const xs = [0, 2, 4, 6, 8, 10].map((k) => f.spine[k]), ys = [1, 3, 5, 7, 9, 11].map((k) => f.spine[k]);
     const c = [(xs[0] + xs[5]) / 2 - G.halfW, f.y, (ys[0] + ys[5]) / 2 - G.halfH];
     const rb = 0.5 * Math.hypot(xs[0] - xs[5], ys[0] - ys[5]) + 2 * f.R;
     const v = [0, 1, 2].map((r) => V[r] * c[0] + V[4 + r] * c[1] + V[8 + r] * c[2] + V[12 + r]), dz = -v[2];
-    let want, px = Infinity;
-    if (dz + rb <= G.near) { want = 0; out.outside++; }
+    const dn = Math.max(dz - rb, G.near);
+    const a = clip([v[0], v[1], -dn]), b = clip([v[0], v[1] + f.R, -dn]);
+    const px = Math.abs(b[1] - a[1]) * 0.5 * rect.height;
+    let want;
+    if (!(px > 6)) { want = 0; out.below++; }
     else {
-      const dn = Math.max(dz - rb, G.near);
-      const a = clip([v[0], v[1], -dn]), b = clip([v[0], v[1] + f.R, -dn]);
-      px = Math.abs(b[1] - a[1]) * 0.5 * rect.height;
-      /* outside: the sphere's NDC box (its centre's projection, widened by its radius at the nearest depth) misses [-1, 1]^2 */
-      let outside = false;
-      if (dz > 0) {
-        const m = clip([v[0], v[1], -dz]), ex = clip([v[0] + rb, v[1], -dn])[0] - clip([v[0], v[1], -dn])[0], ey = clip([v[0], v[1] + rb, -dn])[1] - clip([v[0], v[1], -dn])[1];
-        outside = Math.abs(m[0]) - Math.abs(ex) > 1 || Math.abs(m[1]) - Math.abs(ey) > 1;
-      }
+      const rv = EvoOceanScene.reachRadius(xs, ys, f.R, f.vz, f.lam, f.reach);
+      const outside = dz + rv <= G.near || planes.some((q) => q[0] * v[0] + q[1] * v[1] + q[2] * v[2] + q[3] < -rv);
       if (outside) { want = 0; out.outside++; }
-      else { want = sm(px); if (px <= 6) out.below++; else if (px >= 11) out.above++; else out.mid++; }
+      else { want = sm(px); if (px >= 11) out.above++; else out.mid++; }
     }
     const e = Math.abs(want - p[3]);
-    if (e > out.maxErr) { out.maxErr = e; out.worst = { fish: i, want, got: p[3], px }; }
+    if (e > out.maxErr) { out.maxErr = e; out.worst = { fish: i, want, got: p[3], px, posed: f.posed }; }
   }
   return out;
 };
@@ -261,7 +266,13 @@ async function partCorrectness() {
         pp.appearance && pathSummary({ appearance: pp.appearance }).appearance);
   check("  polished vertex, recolour mode: 11 components", pp.recolour && pp.recolour.ok && pp.recolour.components === 11 && pp.recolour.polish === true,
         pp.recolour && pathSummary({ recolour: pp.recolour }).recolour);
-  check("  lite vertex (the roll only), both colour modes: 71 fish, animated and walled",
+  /* the size gate's visibility sphere (reachRadius) holds every vertex the GPU placed: plain, polished and lite, both colour modes */
+  const reachOf = (r) => r && r.templates ? Object.fromEntries(Object.entries(r.templates).map(([k, t]) => [k, t.reach && { verts: t.reach.verts, outside: t.reach.outside, maxRatio: +t.reach.maxRatio.toFixed(3), worst: t.reach.outside ? t.reach.worst : undefined }])) : null;
+  const reachRuns = { plain: pathRes.appearance, plainRecolour: pathRes.recolour, polished: pp.appearance, polishedRecolour: pp.recolour, lite: pp.lite && pp.lite.appearance, liteRecolour: pp.lite && pp.lite.recolour };
+  const reachRep = Object.fromEntries(Object.entries(reachRuns).map(([k, r]) => [k, reachOf(r)]));
+  check("  the size gate's reach sphere holds every vertex drawn (bent, rolled, folded, wagging, pitched, walled; genes 0 / 1, long fins and barbels): plain, polished, lite",
+        Object.values(reachRep).every((r) => r && Object.values(r).length === 3 && Object.values(r).every((t) => t && t.verts > 0 && t.outside === 0)), reachRep);
+  check("  lite vertex (the roll only: the polished shadows' stage), both colour modes: 71 fish, animated and walled",
         pp.lite && pp.lite.appearance.ok && pp.lite.recolour.ok && pp.lite.appearance.fish === 71 && pp.lite.appearance.components === 51 && pp.lite.recolour.components === 11,
         pp.lite && { appearance: pathSummary({ appearance: pp.lite.appearance }).appearance, recolour: pathSummary({ recolour: pp.lite.recolour }).recolour });
   check("  polished fragment: front-lit with the highlight, weight 0 == plain, backlit (zero half vector: finite, no highlight; fins glow through)",
@@ -293,6 +304,17 @@ async function partCorrectness() {
         bankOf(sp.left) * bankOf(sp.right) < 0 && Math.abs(bankOf(sp.left) + bankOf(sp.right)) < 2e-3 &&
         Math.abs(Math.abs(bankOf(sp.sharpL)) - 0.6) < 2e-3 && Math.abs(Math.abs(bankOf(sp.sharpR)) - 0.6) < 2e-3 && sp.sharpL[2] < 0.05 &&
         bankOf(sp.collapsed) === 0 && sp.slow[2] === 0 && sp.still[2] === 0, sp);
+  /* the roll scales with the size weight (option 1 of #48: no pop when a kind switches between its plain and full programs) */
+  const sw = await L.page.evaluate(() => {
+    const S = EvoOceanScene, xs = [500], ys = [500];
+    for (let k = 1; k < 6; k++) { xs.push(xs[k - 1] - 4 * Math.cos(0.3 + 1.2 * k)); ys.push(ys[k - 1] - 4 * Math.sin(0.3 + 1.2 * k)); }
+    /* a camera looking down -z from z = d at the fish (three: X = x - halfW, Z = y - halfH), focal 500 css px, so R = 4.6 shows at 2300 / d px */
+    const G = (d) => ({ gate: true, view: [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, -d, 1], proj: [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, -1, -1, 0, 0, -2, 0],
+                        focal: 500, near: 1, halfW: 498, halfH: 498, planes: [0.7071, -0.7071, -0.7071, -0.7071, 0.7071, -0.7071, -0.7071, -0.7071] });
+    return [600, 300, 250, 210].map((d) => { const p = S.unpackPose(S.swimPose(xs, ys, 4.6, 0, 1, G(d), 0, 4, S.REACH_APP)); return [d, Math.atan2(p[0], p[1]), p[2], p[3]]; });
+  });
+  check("  the roll and the fold scale with the size weight: unlit (under 6 px) level and spread (POSE0), then growing with it up to the clamp",
+        sw[0][1] === 0 && sw[0][3] === 0 && sw[0][2] === 0 && sw.slice(1).every((r) => r[3] > 0 && Math.abs(Math.abs(r[1]) - 0.6 * r[3]) < 4e-3) && sw[3][3] === 1, sw);
   /* the size weights in the production frame: whole tank, close up (following), a panel's inset, zoomed out; ungated; off */
   const gw = await L.page.evaluate(GATE_CHECK, "whole 1920x1080@1");
   await L.page.evaluate((cd) => EvoOcean.bench.prepare(Object.assign({}, cd, { camera: "follow", colourMode: "appearance", settleMs: 1500 })), c);
@@ -305,13 +327,29 @@ async function partCorrectness() {
   const gok = (g) => g.nonFinite === 0 && g.badRoll === 0 && g.maxErr <= 4e-3;
   check("size weights == the independent projection (|err| <= .004: 7-bit weights), finite, unit rolls within 0.6: whole, follow, inset, zoomed",
         [gw, gf, gi, gz].every(gok), [gw, gf, gi, gz].map((g) => ({ label: g.label, maxErr: g.maxErr, worst: g.worst, below: g.below, mid: g.mid, above: g.above, outside: g.outside, focal: g.focalCss, canvas: g.canvasCss })));
-  check("  the whole view: fish under 6 px (none of the polish: the lite programs), none at 11; close up: in the 6 .. 11 ramp, above 11, and the rest outside the view (0)",
-        gw.below > 0 && gw.above === 0 && gw.state.variant === (gw.mid ? "full" : "lite") && gf.mid > 0 && gf.above > 0 && gf.outside > 0 && gf.state.variant === "full",
-        { whole: [gw.below, gw.mid, gw.above, gw.outside], follow: [gf.below, gf.mid, gf.above, gf.outside] });
+  check("  the whole view: fish under 6 px, none at 11, and with none lit main's plain programs; close up: in the 6 .. 11 ramp, above 11, and the rest outside the view (0), the full programs (compiled ahead)",
+        gw.below > 0 && gw.above === 0 && gw.state.variant === (gw.mid || gw.state.hold > 0 ? "full" : "plain") &&
+        gf.mid > 0 && gf.above > 0 && gf.outside > 0 && gf.state.variant === "full" && gf.state.ready === true,
+        { whole: [gw.below, gw.mid, gw.above, gw.outside], wholeState: gw.state, follow: [gf.below, gf.mid, gf.above, gf.outside], followState: gf.state });
+  check("  the whole view packs no swim pose when no fish can be lit (the frame's bound under 6 px), and close up every fish's",
+        (gw.state.bound > 6 || (gw.state.posing === false && gw.posed === 0)) && gf.state.posing === true && gf.posed === gf.n,
+        { whole: { bound: gw.state.bound, posing: gw.state.posing, posed: gw.posed }, follow: { bound: gf.state.bound, posing: gf.state.posing, posed: gf.posed } });
   check("  the panel's inset changes the projection (view offset) and the weights follow it; zooming out brings fish into the view",
         gi.focalCss !== gf.focalCss && gz.outside < gf.outside, { focal: [gf.focalCss, gi.focalCss], outside: [gf.outside, gi.outside, gz.outside], mean: [gf.state.meanWeight, gi.state.meanWeight, gz.state.meanWeight] });
   check("  ungated: every fish at full weight; off: the plain programs (no weights)",
-        gu.state.gated === false && gu.state.full === gu.state.fish && gu.state.fish === 2500 && goff.on === false && goff.any === 0, { ungated: gu.state, off: goff });
+        gu.state.gated === false && gu.state.full === gu.state.fish && gu.state.fish === 2500 && goff.on === false && goff.any === 0 && goff.variant === "plain", { ungated: gu.state, off: goff });
+  /* hysteresis: from the close view (lit fish, full programs) straight to the whole view (none lit): the full programs are
+   * held 30 frames, then main's plain ones for good; frame by frame, no switching back and forth */
+  const hy = await L.page.evaluate(async () => {
+    const S = EvoOcean.scene, B = EvoOcean.bench, seq = [];
+    await B.prepare({ camera: "follow", settleMs: 600 });
+    S.resetView(false);
+    for (let k = 0; k < 50; k++) { await B.frames(1); const p = S.polish(); seq.push([p.variant === "full" ? 1 : 0, p.any, p.hold, p.posing ? 1 : 0]); }
+    return seq;
+  });
+  const flips = hy.slice(1).filter((r, k) => r[0] !== hy[k][0]).length, firstPlain = hy.findIndex((r) => r[0] === 0);
+  check("  hysteresis: leaving a close view, the full programs are held ~30 frames after the last lit fish, then plain, switching once",
+        flips === 1 && firstPlain >= 25 && firstPlain <= 34 && hy.slice(firstPlain).every((r) => r[0] === 0 && r[1] === 0), { flips, firstPlain, seq: hy.map((r) => r.join("")).join(" ") });
   await L.page.evaluate((cd) => EvoOcean.bench.prepare(Object.assign({}, cd, { camera: "whole", colourMode: "appearance", settleMs: 300 })), c);
 
   const ref = await L.page.evaluate(() => {
