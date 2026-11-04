@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Planted-fault suite for tools/gate_receipts.{sh,py}: temp git repos and fake tools only.
 No Emscripten, no simulation gate. Run: python3 -I tests/test_gate_receipts.py"""
-import importlib.util, json, os, pwd, shutil, signal, stat, subprocess, tempfile, time, unittest
+import contextlib, importlib.util, json, os, pwd, shutil, signal, stat, subprocess, tempfile, time, unittest
 
 TOOLS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools")
 FAKE_EMCONFIG = ('#!/bin/sh\ncase "$1" in LLVM_ROOT) echo "$EMSDK/llvm";; BINARYEN_ROOT) echo "$EMSDK/binaryen";; '
-                 'NODE_JS) echo "[\'$EMSDK/node\']";; EMSCRIPTEN_ROOT) echo "$EMSDK/em";; CLANG_ADD_VERSION|LLVM_ADD_VERSION) echo None;; '
+                 'NODE_JS) if [ -f "$EMSDK/nodehook" ]; then echo "[\'$EMSDK/node\', \'--require\', \'$EMSDK/hook.cjs\']"; else echo "[\'$EMSDK/node\']"; fi;; EMSCRIPTEN_ROOT) echo "$EMSDK/em";; CLANG_ADD_VERSION|LLVM_ADD_VERSION) echo None;; '
                  'COMPILER_WRAPPER) if [ -f "$EMSDK/wrapper" ]; then echo /usr/local/bin/ccache; else echo None; fi;; *) exit 1;; esac\n')
 SDK_FILES = ["llvm/clang", "llvm/clang++", "llvm/wasm-ld", "llvm/llvm-ar", "llvm/llvm-nm", "binaryen/bin/wasm-opt", "node", "em/emscripten-version.txt", "em/emcc.py"]
 GATE = ('echo $PPID > "$HOME/ppid"\n'
@@ -288,6 +288,57 @@ class Receipts(Base):
         wr(os.path.join(self.t, "emsdk", "wrapper"), "x")
         for _ in range(2): self.pass_once("ocean-fast", OCEAN, FAST="1")
         self.assertEqual((self.n(), self.check("ocean-fast", OCEAN, FAST="1")[1]["reason"]), (2, "nonreusable"))
+    def test_configured_node_arguments_make_parity_record_only(self):
+        wr(os.path.join(self.t, "emsdk", "nodehook"), "x"); self.put(os.path.join(self.t, "emsdk", "hook.cjs"), "v1")
+        self.pass_once("ocean-fast", OCEAN, FAST="1")
+        wr(os.path.join(self.t, "emsdk", "hook.cjs"), "v2 changes compilation")  # a preload the SDK identity cannot see
+        self.pass_once("ocean-fast", OCEAN, FAST="1")
+        self.assertEqual((self.n(), self.check("ocean-fast", OCEAN, FAST="1")[1]["reason"]), (2, "nonreusable"))
+    def test_casefold_on_any_ancestor_refuses_reuse(self):
+        m = self.mod(); real = m.casefold; self.addCleanup(setattr, m, "casefold", real)
+        deep = os.path.join(self.t, "a", "b", "c"); os.makedirs(deep); self.assertIsNone(m.fs_reason([deep], "x", self.t))
+        for flagged in (self.t + "/a/b", self.t + "/a", self.t):  # an intermediate directory only, and the top itself
+            m.casefold = lambda q, f=flagged: q == f
+            self.assertIn(flagged, m.fs_reason([deep], "x", self.t) or "")
+        m.casefold = lambda q: q == self.t + "/a"
+        self.assertIsNone(m.fs_reason([deep], "x"))  # without `top` only the nearest existing directory is inspected
+    @contextlib.contextmanager
+    def deadline(self, secs):
+        def boom(*_): raise AssertionError("timed out after %d s (hang)" % secs)
+        old = signal.signal(signal.SIGALRM, boom); signal.alarm(secs)
+        try: yield
+        finally: signal.alarm(0); signal.signal(signal.SIGALRM, old)
+    def test_pipe_read_failure_terminates_the_gate(self):
+        m = self.mod(); real = m.subprocess.Popen
+        class P(real):
+            def __init__(s, *a, **k):
+                super().__init__(*a, **k); raw = s.stdout
+                class Bad:
+                    def read(self, n): raise OSError("injected read failure")
+                    def close(self): raw.close()
+                s.stdout = Bad()
+        m.subprocess.Popen = P; self.addCleanup(setattr, m.subprocess, "Popen", real)
+        t0 = time.time()
+        with self.deadline(25): code, clean = m.execute(["sleep", "60"], dict(os.environ), self.fake_store(), "x", [])
+        self.assertEqual((code, clean), (137, False)); self.assertLess(time.time() - t0, 20)
+    def fake_store(self):
+        d = os.path.join(self.t, "evidence"); os.makedirs(os.path.join(d, "runs"), exist_ok=True)
+        class S:
+            def path(self, *a): return os.path.join(d, *a)
+        return S()
+    def test_escaped_descendant_holding_the_pipes_cannot_hang_the_coordinator(self):
+        m = self.mod(); m.JOIN_S = 1; pidf = os.path.join(self.t, "daemon.pid")
+        self.addCleanup(lambda: os.path.exists(pidf) and os.kill(int(rd(pidf)), signal.SIGKILL))
+        with self.deadline(25):  # setsid: leaves the gate's process group but keeps stdout/stderr open and writes nothing
+            code, clean = m.execute(["sh", "-c", "setsid sh -c 'echo $$ > %s; exec sleep 60' & sleep 0.3; echo hi" % pidf], dict(os.environ), self.fake_store(), "y", [])
+        self.assertEqual((code, clean), (0, False))
+    def test_relative_store_override_does_not_loop(self):
+        for fn in ("run", "check"):
+            p = self.start(fn, "turbo", TURBO, GATE_RECEIPTS_DIR="rel-store")  # no such directory, relative to the repository root
+            try: p.communicate(timeout=30)
+            except subprocess.TimeoutExpired: os.killpg(p.pid, signal.SIGKILL); p.communicate(); self.fail("%s hung on a relative store path" % fn)
+            self.assertIn(p.returncode, (0, 1))
+        self.assertTrue(os.path.isdir(os.path.join(self.repo, "rel-store", "keys")))
     def test_helper_replaced_while_waiting_is_refused(self):
         wt = os.path.join(self.t, "wt"); self.git("worktree", "add", "-q", "--detach", wt); wr(os.path.join(self.home, "slow"), "1.5")
         a = self.start("run", "turbo", TURBO); time.sleep(0.4); b = self.start("run", "turbo", TURBO, cwd=wt); time.sleep(0.6)

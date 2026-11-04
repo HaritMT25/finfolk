@@ -7,6 +7,7 @@ It is a trusted local optimisation, never an attestation: CI runs every gate its
 """
 import ast, fcntl, hashlib, json, os, platform, pwd, re, shutil, signal, stat, struct, subprocess, sys, tempfile, threading, time, uuid
 
+JOIN_S = 30  # bound on waiting for an output pump after the gate exits
 SCHEMA, REPO_ID = 1, "github.com/HaritMT25/finfolk"
 KEPT = ("PATH", "HOME", "USER", "LOGNAME", "TMPDIR", "EMSDK", "EMSDK_NODE", "EMSDK_PYTHON", "EM_CONFIG", "EM_CACHE")  # all keyed
 HELPERS = ("awk", "sed", "grep", "sort", "xargs", "mktemp", "cat", "head", "tail", "timeout", "nproc", "uname", "rm", "mkdir", "cp", "mv",
@@ -114,14 +115,23 @@ def casefold(path):  # FS_IOC_GETFLAGS on a directory; FS_CASEFOLD_FL = 0x400000
     try: return bool(struct.unpack("i", fcntl.ioctl(fd, 0x80086601, b"\0" * 8)[:4])[0] & 0x40000000)
     finally: os.close(fd)
 
-def fs_reason(paths, label):
-    """Reuse only on the plain local ext4 filesystem holding the user's home (no casefold, no nested mounts); else record-only."""
+def fs_reason(paths, label, top=None):
+    """Reuse only on the plain local ext4 filesystem holding the user's home (no casefold, no nested mounts); else record-only.
+    Each path is checked at its nearest existing directory and, with `top`, at every ancestor up to and including `top`."""
     try:
         home = os.stat(pwd.getpwuid(os.getuid()).pw_dir).st_dev
         if dev_fstype(home) != "ext4": return "the home filesystem is not ext4"
+        top, seen = top and os.path.abspath(top), set()
         for q in paths:
-            while not os.path.exists(q): q = os.path.dirname(q)
-            if os.stat(q).st_dev != home or casefold(q): return "%s is not on the plain local ext4 home filesystem: %s" % (label, q)
+            q = os.path.abspath(q)
+            while not os.path.exists(q):
+                if os.path.dirname(q) == q: return "cannot verify the filesystem of %s: no existing ancestor" % label
+                q = os.path.dirname(q)
+            while q not in seen:  # an ancestor already seen was verified along with everything above it
+                seen.add(q)
+                if os.stat(q).st_dev != home or casefold(q): return "%s is not on the plain local ext4 home filesystem: %s" % (label, q)
+                if top is None or q == top or os.path.dirname(q) == q: break
+                q = os.path.dirname(q)
     except (OSError, KeyError) as e: return "cannot verify the filesystem of %s: %s" % (label, e)
 
 def host_identity(root):
@@ -147,6 +157,7 @@ def sdk_identity(env):
         if r.returncode or not txt: raise Identity("em-config %s failed" % k)
         try: txt = ast.literal_eval(txt)
         except (ValueError, SyntaxError): pass
+        if k == "NODE_JS" and isinstance(txt, list) and len(txt) != 1: raise Identity("NODE_JS has arguments we cannot identify")
         v[k] = txt[0] if isinstance(txt, list) else txt
     paths = [os.path.join(v["LLVM_ROOT"], f) for f in SDK_FILES[0][1]] + [os.path.join(v["BINARYEN_ROOT"], f) for f in SDK_FILES[1][1]] + [v["NODE_JS"]]
     root = v["EMSCRIPTEN_ROOT"]
@@ -224,7 +235,7 @@ def prepare(gate, argv, root, parent):
 
 class Store:
     @staticmethod
-    def default_root(): return os.environ.get("GATE_RECEIPTS_DIR") or os.path.expanduser("~/wasm_parity/receipts_store/finfolk/v1")
+    def default_root(): return os.path.abspath(os.environ.get("GATE_RECEIPTS_DIR") or os.path.expanduser("~/wasm_parity/receipts_store/finfolk/v1"))
 
     def __init__(self):
         self.root = self.default_root()
@@ -278,35 +289,35 @@ def execute(argv, env, store, run_id, fds):
     """Run argv holding the lock descriptors `fds`; returns (exit code, clean). Not clean: a log/mirror failure, a surviving
     process holding the output pipes, or a cancellation. Pump failures never stop the draining, so the gate cannot block."""
     out = {x: open(store.path("runs", "%s.%s" % (run_id, x)), "wb") for x in ("stdout", "stderr")}
-    try: p = subprocess.Popen(argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True, pass_fds=fds)
+    try: p = subprocess.Popen(argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0, start_new_session=True, pass_fds=fds)  # raw pipes: no buffer lock to block on
     except OSError as e:
         out["stderr"].write(("cannot execute %s: %s\n" % (argv[0], e)).encode())
         for f in out.values(): f.close()
         return 127, True
     bad = []
-    def forward(sig, _):
-        bad.append("cancelled by signal %d" % sig)
+    def kill(sig):
         try: os.killpg(p.pid, sig)
         except ProcessLookupError: pass
+    def forward(sig, _):
+        bad.append("cancelled by signal %d" % sig); kill(sig)
     old = {sig: signal.signal(sig, forward) for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
     def pump(src, log, sink):
         live = True
         try:
-            for chunk in iter(lambda: src.read1(65536), b""):
+            for chunk in iter(lambda: src.read(65536), b""):
                 if live:
                     try: log.write(chunk); sink.write(chunk); sink.flush()
                     except (OSError, ValueError) as e: bad.append("output handling failed: %r" % e); live = False
-        except (OSError, ValueError) as e: bad.append("pipe read failed: %r" % e)
+        except (OSError, ValueError) as e: bad.append("pipe read failed: %r" % e); kill(signal.SIGKILL)  # nobody drains: stop the gate
     ts = [threading.Thread(target=pump, args=(p.stdout, out["stdout"], sys.stdout.buffer), daemon=True),
           threading.Thread(target=pump, args=(p.stderr, out["stderr"], sys.stderr.buffer), daemon=True)]
     [t.start() for t in ts]; rc = p.wait()
-    try: os.killpg(p.pid, signal.SIGKILL)  # reap whatever the gate left behind in its process group
-    except ProcessLookupError: pass
-    for t in ts:
-        t.join(30)
-        if t.is_alive(): bad.append("a detached process still holds the output pipes")
+    kill(signal.SIGKILL)  # reap whatever the gate left behind in its process group
+    for t, pipe in zip(ts, (p.stdout, p.stderr)):
+        t.join(JOIN_S)
+        if t.is_alive(): bad.append("a detached process still holds the output pipes")  # left open: its reader owns it until process exit
+        else: pipe.close()
     for sig, h in old.items(): signal.signal(sig, h)
-    for pipe in (p.stdout, p.stderr): pipe.close()
     for f in out.values():
         try: f.flush(); os.fsync(f.fileno())
         except (OSError, ValueError) as e: bad.append("evidence flush failed: %r" % e)
@@ -338,7 +349,7 @@ def snapshot(gate, rest, root):
     if sha_file(__file__) != HELPER_SHA: raise Identity("tools/gate_receipts.py changed while this invocation was running: rerun")
     prof, env, material, reasons = prepare(gate, rest, root, os.environ)
     cand = repo_state(root)
-    reasons.append(fs_reason([root, *cand["dirs"]], "repository"))
+    reasons.append(fs_reason([root, *cand["dirs"]], "repository", root))
     reasons[:] = [r for r in reasons if r]
     if cand["problems"]: reasons.append("dirty: " + "; ".join(cand["problems"][:3]))
     key = None

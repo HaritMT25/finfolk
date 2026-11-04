@@ -30,7 +30,7 @@ wasm-ld, llvm-ar/nm, wasm-opt, node, the emscripten Python sources and version),
 artifact hashes, OS/arch, and the bytes of the helper that is executing. The Emscripten sysroot/cache is not
 hashed: a versioned emsdk install is treated as trusted and immutable (custom `EM_CACHE` locations or hand-modified
 sysroots are outside that assumption). A config that sets `COMPILER_WRAPPER`, `CLANG_ADD_VERSION` or
-`LLVM_ADD_VERSION` is record-only. The tested commit is recorded separately: a rebase or merge with an identical
+`LLVM_ADD_VERSION`, or a `NODE_JS` with more than the executable (e.g. `--require` hooks), is record-only. The tested commit is recorded separately: a rebase or merge with an identical
 tree is a hit and keeps the original tested SHA.
 
 | Profile | Exact requirement |
@@ -54,8 +54,8 @@ The child runs with a closed environment, and every retained value is keyed: `PA
 `NODE_OPTIONS`, `CPATH`, `LD_PRELOAD`, `EMCC_CFLAGS` etc. are dropped. Missing em++ is exit `125`. A run is
 record-only (executes, never reused) when anything unverifiable remains: Emscripten config or SDK tools that
 `em-config` cannot resolve, no package inventory, a bad pin, case-colliding tracked paths, or a filesystem other
-than the plain local ext4 one holding your home: the repository (every tracked directory, so nested mounts count),
-the store and the output dir must share the home device, which must be ext4, with no casefold directory. 9p/DrvFs/NFS,
+than the plain local ext4 one holding your home: the repository (every tracked directory and each ancestor up to the repository root),
+the store and the output dir must share the home device, which must be ext4, with no casefold directory on that path (a relative `GATE_RECEIPTS_DIR` is made absolute). 9p/DrvFs/NFS,
 tmpfs and `/mnt/*` therefore never give reuse. A pass whose log could not be written or mirrored, whose output
 pipes outlived it, or that was cancelled (SIGINT/SIGTERM/SIGHUP are forwarded to the gate) is a failure (`125` if
 the gate itself passed), never reusable. Processes a gate leaves in its own process group are killed when it
