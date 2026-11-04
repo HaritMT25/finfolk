@@ -115,6 +115,17 @@ def casefold(path):  # FS_IOC_GETFLAGS on a directory; FS_CASEFOLD_FL = 0x400000
     try: return bool(struct.unpack("i", fcntl.ioctl(fd, 0x80086601, b"\0" * 8)[:4])[0] & 0x40000000)
     finally: os.close(fd)
 
+def noexec(path): return bool(os.statvfs(path).f_flag & os.ST_NOEXEC)  # per-mount flag: a bind mount can differ from its device's other mounts
+
+def exec_reason(path, label):
+    """The gate executes binaries it builds in its output dir (an automatic one lives in /tmp): that mount must allow exec."""
+    try:
+        while not os.path.exists(path):
+            if os.path.dirname(path) == path: return "cannot verify exec flags of %s" % label
+            path = os.path.dirname(path)
+        if noexec(path): return "%s is on a noexec mount: %s" % (label, path)
+    except OSError as e: return "cannot verify exec flags of %s: %s" % (label, e)
+
 def fs_reason(paths, label, top=None):
     """Reuse only on the plain local ext4 filesystem holding the user's home (no casefold, no nested mounts); else record-only.
     Each path is checked at its nearest existing directory and, with `top`, at every ancestor up to and including `top`."""
@@ -210,7 +221,8 @@ def prepare(gate, argv, root, parent):
     if d and knobs[d]: knobs[d] = os.path.realpath(knobs[d])
     elif d: knobs[d] = "auto"
     env.update({k: v for k, v in knobs.items() if v is not None and not (k == d and v == "auto")})
-    reasons += [fs_reason([knobs[d]], "output dir") if d and knobs[d] != "auto" else None, fs_reason([Store.default_root()], "receipt store")]
+    reasons += [fs_reason([knobs[d]], "output dir") if d and knobs[d] != "auto" else None, fs_reason([Store.default_root()], "receipt store"),
+                exec_reason(os.path.abspath(knobs[d]) if knobs[d] != "auto" else "/tmp", "output dir") if d else None]
     if prof.get("emsdk"):
         cfg = env.get("EM_CONFIG") or (os.path.join(env["EMSDK"], ".emscripten") if env.get("EMSDK") else "")
         if not shutil.which("em++", path=env["PATH"]): raise Identity("em++ not on PATH: source emsdk_env.sh first")

@@ -332,6 +332,15 @@ class Receipts(Base):
         with self.deadline(25):  # setsid: leaves the gate's process group but keeps stdout/stderr open and writes nothing
             code, clean = m.execute(["sh", "-c", "setsid sh -c 'echo $$ > %s; exec sleep 60' & sleep 0.3; echo hi" % pidf], dict(os.environ), self.fake_store(), "y", [])
         self.assertEqual((code, clean), (0, False))
+    def test_noexec_output_mount_refuses_reuse(self):
+        out = self.t + "/o"; os.makedirs(out); st = os.stat(out); m = self.mod()
+        real = m.noexec; self.addCleanup(setattr, m, "noexec", real)
+        self.assertIsNone(m.exec_reason(out + "/new", "x")); m.noexec = lambda q: q == out  # same device and inode, only the mount flag differs
+        self.assertIn("noexec", m.exec_reason(out + "/new", "x") or ""); self.assertEqual((os.stat(out).st_dev, os.stat(out).st_ino), (st.st_dev, st.st_ino))
+        m.noexec = lambda q: q == "/tmp"; self.assertIn("noexec", m.exec_reason("/tmp", "x") or "")  # the automatic scratch location
+        m.noexec = lambda q: os.stat("/nonexistent/x"); self.assertIn("cannot verify", m.exec_reason(out, "x"))
+        e = dict(FAST="1", OCEAN_PARITY_DIR=out); self.pass_once("ocean-fast", OCEAN, **e)  # real mount: exec allowed, fresh on repeat
+        self.pass_once("ocean-fast", OCEAN, **e); self.assertEqual(self.n(), 1)
     def test_relative_store_override_does_not_loop(self):
         for fn in ("run", "check"):
             p = self.start(fn, "turbo", TURBO, GATE_RECEIPTS_DIR="rel-store")  # no such directory, relative to the repository root
