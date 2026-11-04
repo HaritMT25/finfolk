@@ -193,27 +193,34 @@ class Model:
 GTOL = 1e-9   # stationarity at the iteration cap: max |J'r| <= GTOL x max(1, ||y||)
 STAT_TOL = 1e-4   # first-order stationarity at every non-exact exit (prereg gate, review round 5 item 4):
 STAT_ABS = 1e-12  # the Gauss-Newton step may not promise more than STAT_TOL SSE + STAT_ABS max(||y||^2, n)
-SAT_D = 1e-12     # a cell whose Jacobian row is <= SAT_D everywhere is numerically saturated (|eta| >~ 27.6)
+STAT_RIDGE = 1e-12   # the ridge of the COLUMN-SCALED normal matrix (unit diagonal) in the stationarity test
+SAT_D = 1e-12     # (reported only) a cell whose Jacobian row is <= SAT_D everywhere is numerically saturated
 ETA_CLAMP = 40.0  # model.eval clamps eta to +-40 (beyond it the link is constant)
+LM_DIAG = 1e-18   # lm's absolute diagonal stabilizer: (J'J + lam diag(J'J) + LM_DIAG I) step = J'r
 
 # The fitting freeze (preregistration section 3, "Fit failures"): deterministic initialization, this optimizer
 # and these tolerances are part of the registered procedure; the gate manifest records this dict and the
 # source hash of this file; tools/invasion/FIT_FREEZE.md is the dated attachment. Every fit reports its
-# termination reason, gradient and stationarity.
+# termination reason, gradient and stationarity. The classifier only ever MARKS a fit unconverged: it never
+# changes a fitted value (no outcome-dependent rescue).
 FIT_FREEZE = {
-    "optimizer": "Levenberg-Marquardt (bounded.lm), lambda0 1e-3, /3 on an accepted step, x10 on a rejected one",
-    "iters": 200, "tol": 1e-11, "gtol": GTOL, "stat_tol": STAT_TOL, "stat_abs": STAT_ABS, "sat_d": SAT_D,
-    "eta_clamp": ETA_CLAMP,
+    "optimizer": ("Levenberg-Marquardt (bounded.lm): (J'J + lam diag(J'J) + 1e-18 I) step = J'r; lambda0 1e-3, /3 "
+                  "(floor 1e-9) on an accepted step, x10 on a rejected one; exits: an exact fit (SSE <= 1e-26 "
+                  "||y||^2), a relative SSE improvement < tol, a step <= 1e-12 (1 + max|theta|), damping > 1e6, "
+                  "or the iteration cap"),
+    "iters": 200, "tol": 1e-11, "gtol": GTOL, "stat_tol": STAT_TOL, "stat_abs": STAT_ABS, "stat_ridge": STAT_RIDGE,
+    "lm_diag": LM_DIAG, "eta_clamp": ETA_CLAMP,
     "init": "logistic: two-way additive fit of the logit:0.001-clipped means (bounded.initial); no restarts",
     "derivatives": "sigma'(x) = e^-|x| / (1 + e^-|x|)^2 (stable), evaluated at the clamped eta",
-    "converged": ("exact fit (SSE <= 1e-26 ||y||^2); otherwise the exit (relative SSE improvement < tol, a step "
-                  "<= 1e-12 (1 + max|theta|), damping > 1e6, or the iteration cap) counts as converged only if, "
-                  "with allow = stat_tol SSE + stat_abs max(||y||^2, n) (n = cells): (1) the Gauss-Newton predicted "
-                  "decrease r'J (J'J + 1e-12 max diag)^-1 J'r <= allow, a vanished Jacobian (max diag 0) predicting "
-                  "the whole SSE; (2) the residual energy on numerically saturated cells (every Jacobian entry "
-                  "<= sat_d) <= allow - a vanished derivative never certifies an appreciable residual; (3) at the "
+    "converged": ("an exact fit; otherwise the exit counts as converged only if, with allow = stat_tol SSE + "
+                  "stat_abs max(||y||^2, n) (n = cells): (1) the Gauss-Newton predicted decrease in COLUMN-SCALED "
+                  "form, g~'(J~'J~ + stat_ridge I)^-1 g~ with J~ = J D^-1/2, D = diag(J'J), g~ = D^-1/2 J'r, is <= "
+                  "allow - every parameter direction is assessed on its own scale, so a weak (nearly saturated) "
+                  "direction is not hidden by a global ridge; a vanished Jacobian predicts the whole SSE; (2) at the "
                   "cap also max |J'r| <= gtol max(1, ||y||); a non-finite SSE, parameter or fitted value is never "
-                  "converged. A boundary infimum with negligible SSE (an item whose targets are all 0) passes"),
+                  "converged. A first-order test: a legitimate minimum keeps whatever residual it cannot remove "
+                  "locally (its score is zero), a stalled saturation (a large scaled score) does not pass, and a "
+                  "boundary infimum with negligible SSE passes"),
     "unavailable": "any required unconverged fit, non-finite result or failed projection makes H1b unavailable",
 }
 
@@ -244,9 +251,12 @@ def _normal(J, r, P):
 
 
 def stationarity(J, r, P):
-    """-> (r'J (J'J + ridge)^-1 J'r / r'r, max |J'r|): the share of the residual that the model's tangent
-    space can still explain (0 at a least-squares optimum; ~1 on a saturated plateau, where the gradient
-    is tiny only because every derivative is). The ridge is relative (1e-12 of the largest diagonal)."""
+    """-> (the Gauss-Newton predicted decrease / r'r, max |J'r|), the decrease computed in COLUMN-SCALED form
+    (review of #49, round 2): with D = diag(J'J), J~ = J D^-1/2 has unit columns, g~ = D^-1/2 J'r, and the
+    predicted decrease is g~'(J~'J~ + STAT_RIDGE I)^-1 g~ - each parameter direction on its own scale, so a
+    weak direction (a nearly saturated item, derivatives ~1e-11) is not hidden by a ridge sized to the strong
+    ones. 0 at a least-squares stationary point; ~1 on a stalled saturation; a vanished Jacobian (every
+    column zero) explains nothing, and so predicts the whole SSE."""
     JtJ, Jtr = _normal(J, r, P)
     S = sum(x * x for x in r)
     grad = max(abs(x) for x in Jtr) if Jtr else 0.0
@@ -254,16 +264,19 @@ def stationarity(J, r, P):
         return float("inf"), grad
     if S <= 0.0:
         return 0.0, grad
-    mx = max(JtJ[a_][a_] for a_ in range(P))
-    if mx <= 0.0:
+    live = [a_ for a_ in range(P) if JtJ[a_][a_] > 0.0]
+    if not live:
         return 1.0, grad   # a vanished Jacobian explains nothing: never 'stationary' with a residual left
-    for a_ in range(P):
-        JtJ[a_][a_] += 1e-12 * mx
+    sc = {a_: 1.0 / math.sqrt(JtJ[a_][a_]) for a_ in live}
+    Ms = [[JtJ[a_][b_] * sc[a_] * sc[b_] + (STAT_RIDGE if a_ == b_ else 0.0) for b_ in live] for a_ in live]
+    gs = [Jtr[a_] * sc[a_] for a_ in live]
+    if not all(math.isfinite(x) for row in Ms for x in row) or not all(math.isfinite(x) for x in gs):
+        return float("inf"), grad
     try:
-        st = hodge.solve(JtJ, Jtr)
+        st = hodge.solve(Ms, gs)
     except ValueError:
         return 1.0, grad
-    return max(0.0, sum(a_ * b_ for a_, b_ in zip(st, Jtr)) / S), grad
+    return max(0.0, sum(a_ * b_ for a_, b_ in zip(st, gs)) / S), grad
 
 
 def lm(model, cells, y, th0, iters=200, tol=1e-11):
@@ -288,8 +301,8 @@ def lm(model, cells, y, th0, iters=200, tol=1e-11):
         finite = math.isfinite(S) and all(math.isfinite(t) for t in th) and all(math.isfinite(x) for x in r)
         yy = sum(v * v for v in y)
         allow = STAT_TOL * S + STAT_ABS * max(yy, float(len(y)))
-        sat = sum(ri * ri for row, ri in zip(J, r) if max(abs(x) for x in row) <= SAT_D)
-        ok = finite and (reason == "exact" or (st * S <= allow and sat <= allow))
+        sat = sum(ri * ri for row, ri in zip(J, r) if max(abs(x) for x in row) <= SAT_D)   # (reported only)
+        ok = finite and (reason == "exact" or st * S <= allow)
         if cap:
             ok = ok and grad <= GTOL * max(1.0, math.sqrt(yy))
         res = LMResult((th, S, ok))
@@ -300,7 +313,7 @@ def lm(model, cells, y, th0, iters=200, tol=1e-11):
             return out("exact")
         JtJ, Jtr = _normal(J, r, P)
         while True:
-            M = [[JtJ[a_][b_] + (lam * JtJ[a_][a_] + 1e-18 if a_ == b_ else 0.0) for b_ in range(P)] for a_ in range(P)]
+            M = [[JtJ[a_][b_] + (lam * JtJ[a_][a_] + LM_DIAG if a_ == b_ else 0.0) for b_ in range(P)] for a_ in range(P)]
             try:
                 step = hodge.solve(M, Jtr)
             except ValueError:
