@@ -960,13 +960,19 @@ def _betacf(a, b, x):
 
 QTABLE_S = 36.0      # tabulated |logit u| range (u down to ~2e-16); beyond it the quantile is solved exactly
 QTABLE_TOL = 1e-10   # interpolation error allowed at every interval midpoint, in logit(x)
+QTABLE_DS = 0.5      # and no interval wider than this in logit(u)
+QTABLE_MIN_DT = 1e-9    # refinement floor: an interval this narrow in logit(x) relative to the law's logit SD is
+                        # kept even if its midpoint test fails (counted in .floor_hits; 0 in every tested law)
 
 
 class BetaQuantile:
-    """Quantile function of Beta(a, b), tabulated in (s, t) = (logit u, logit x) with exact nodes and
-    exact slopes dt/ds and cubic Hermite interpolation, refined until the interpolant matches the exact
-    curve at every interval midpoint to QTABLE_TOL (|x error| <= QTABLE_TOL / 4); |s| > QTABLE_S is
-    solved exactly by bisection. The self-test compares it with exact inversion."""
+    """Quantile function of Beta(a, b), tabulated in (s, t) = (logit u, logit x) on EXACTLY the registered
+    domain s in [-QTABLE_S, QTABLE_S] (review of #49, round 2: the table used to keep its whole bracketing
+    overshoot - a = b = 9e6 overshot to |s| ~ 557,000 and ~2.2 million nodes): both endpoints t(-36), t(+36)
+    are solved by bracketing and bisection, nodes are exact with exact slopes dt/ds, cubic Hermite
+    interpolation, refined until every interval is at most QTABLE_DS wide in s and its interpolant matches
+    the exact curve at the midpoint to QTABLE_TOL (|x error| <= QTABLE_TOL / 4), or the interval is narrower
+    than QTABLE_MIN_DT logit SDs (counted). |s| > QTABLE_S is solved exactly by bisection (exact_t)."""
 
     def __init__(self, a, b):
         import bisect as _b
@@ -975,33 +981,58 @@ class BetaQuantile:
         self.lb = math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b)
         mean = a / (a + b)
         t0 = math.log(mean / (1.0 - mean))
-        lo_t, hi_t = t0, t0
-        step = 0.5
-        nodes = [self._node(t0)]
-        while nodes[0][0] > -QTABLE_S:
-            lo_t -= step
-            step *= 1.6
-            nodes.insert(0, self._node(lo_t))
-        step = 0.5
-        while nodes[-1][0] < QTABLE_S:
-            hi_t += step
-            step *= 1.6
-            nodes.append(self._node(hi_t))
+        s_ = a + b
+        # the law's SD on the logit scale (delta method): the bracketing step and the refinement floor's scale
+        self.sd_t = max(math.sqrt(a * b / (s_ * s_ * (s_ + 1.0))) / (mean * (1.0 - mean)), 1e-300)
+        self.floor_hits = 0
+        lo_n = self._endpoint(-QTABLE_S, t0)
+        hi_n = self._endpoint(QTABLE_S, t0)
+        nodes = [lo_n] + ([self._node(t0)] if lo_n[1] < t0 < hi_n[1] else []) + [hi_n]
         out = [nodes[0]]
         stack = [(nodes[i], nodes[i + 1]) for i in range(len(nodes) - 1)][::-1]
+        min_dt = QTABLE_MIN_DT * self.sd_t
         while stack:
             n0, n1 = stack.pop()
             tm = 0.5 * (n0[1] + n1[1])
             nm = self._node(tm)
-            if (abs(n1[0] - n0[0]) > 0.5 or abs(self._herm(n0, n1, nm[0]) - tm) > QTABLE_TOL) and n1[1] - n0[1] > 1e-9:
+            need = abs(n1[0] - n0[0]) > QTABLE_DS or abs(self._herm(n0, n1, nm[0]) - tm) > QTABLE_TOL
+            if need and n1[1] - n0[1] > min_dt:
                 stack.append((nm, n1))
                 stack.append((n0, nm))
             else:
+                self.floor_hits += need
                 out.append(n1)
         from array import array
         self.s = array("d", (n[0] for n in out))   # (compact: a worker holds ~1,000 of these tables)
         self.t = array("d", (n[1] for n in out))
         self.d = array("d", (n[2] for n in out))
+
+    def _endpoint(self, s_target, t0):
+        """The node at s = s_target exactly (to 1e-9 in s): bracket from t0 in steps growing from the law's
+        logit SD, then bisect."""
+        sign = 1.0 if s_target > 0 else -1.0
+        step = 0.5 * self.sd_t
+        a_t, a_n = t0, self._node(t0)
+        b_t = t0 + sign * step
+        b_n = self._node(b_t)
+        while (b_n[0] - s_target) * sign < 0:
+            a_t, a_n = b_t, b_n
+            step *= 1.6
+            b_t = b_t + sign * step
+            b_n = self._node(b_t)
+        lo_t, hi_t = (a_t, b_t) if sign > 0 else (b_t, a_t)
+        for _ in range(300):
+            mid = 0.5 * (lo_t + hi_t)
+            nm = self._node(mid)
+            if abs(nm[0] - s_target) <= 1e-9:
+                return nm
+            if nm[0] < s_target:
+                lo_t = mid
+            else:
+                hi_t = mid
+            if hi_t - lo_t <= 1e-15 * max(1.0, abs(mid)):
+                break
+        return self._node(0.5 * (lo_t + hi_t))
 
     def _node(self, t):
         llo, lhi = _log_tails(self.a, self.b, self.lb, t)
@@ -1045,8 +1076,8 @@ class BetaQuantile:
         if hi <= 0.0:
             return 1.0
         s = math.log(lo) - math.log(hi)
-        if s <= self.s[0] or s >= self.s[-1]:
-            t = self.exact_t(s)
+        if s < -QTABLE_S or s > QTABLE_S or s <= self.s[0] or s >= self.s[-1]:
+            t = self.exact_t(s)   # beyond the registered domain (or within 1e-9 of its solved endpoints)
         else:
             k = self._bisect(self.s, s)
             t = self._herm((self.s[k - 1], self.t[k - 1], self.d[k - 1]), (self.s[k], self.t[k], self.d[k]), s)
@@ -1295,6 +1326,10 @@ def feasible_plant(eta, mean0, th0, v, target, iters=60):
                 "clip_sum": tot, "clip_max": mx}
     clip0 = at(0.0)   # the clipped null (sub-0.002 cells moved up): what any c > 0 starts from
     d_clip0 = clip0["d_res"]
+    if not clip0["converged"]:
+        # review of #49, round 2: a required noiseless refit that failed - the plant is NOT constructed
+        return dict(clip0, solved=False, evals=evals[0], grid_m=None, d_res_clip0=d_clip0, clip0_converged=False,
+                    failure="the clipped null's noiseless refit did not converge")
     prev, hit, gm = {"c": 0.0, "d_res": 0.0, "converged": True}, None, None
     for m_ in range(1, PLANT_GRID + 1):
         x = at(m_ / PLANT_GRID)
@@ -1306,9 +1341,10 @@ def feasible_plant(eta, mean0, th0, v, target, iters=60):
             break
         prev = x
     if hit is None:   # no crossing on [0, 1]: infeasible
-        return dict(prev, solved=False, evals=evals[0], grid_m=None, d_res_clip0=d_clip0,
+        return dict(prev, solved=False, evals=evals[0], grid_m=None, d_res_clip0=d_clip0, clip0_converged=True,
                     mean=prev.get("mean", mean0), d_add=prev.get("d_add", 0.0), clipped=prev.get("clipped", 0),
-                    clip_sum=prev.get("clip_sum", 0.0), clip_max=prev.get("clip_max", 0.0))
+                    clip_sum=prev.get("clip_sum", 0.0), clip_max=prev.get("clip_max", 0.0),
+                    failure="no crossing of the target on the grid")
     best, lo, hi = hit, prev["c"], hit["c"]
     k = 0
     while hit["converged"] and abs(best["d_res"] - target) > PLANT_TOL * target and k < iters:
@@ -1325,7 +1361,8 @@ def feasible_plant(eta, mean0, th0, v, target, iters=60):
             best = x
     best = dict(best)
     best["solved"] = bool(best["converged"]) and abs(best["d_res"] - target) <= PLANT_TOL * target
-    best.update(evals=evals[0], grid_m=gm, d_res_clip0=d_clip0)
+    best.update(evals=evals[0], grid_m=gm, d_res_clip0=d_clip0, clip0_converged=True,
+                failure=None if best["solved"] else "a noiseless refit failed or the bisection ran out of steps")
     return best
 
 
