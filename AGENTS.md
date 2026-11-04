@@ -20,7 +20,7 @@ the site is static three.js/JS in `web/` (no JS build step). Python tools run ex
   `evo_wasm.cpp`, `ocean_wasm.cpp` (the module APIs).
 - `web/` the site. Committed build outputs (never hand-edit): `evo_boids*.{js,wasm}`, `evo_ocean.{js,wasm}`
   (from `wasm/build_*.sh`), `vendor/three.bundle.min.js` (from `tools/three_bundle/build.sh`).
-  Hand-written: `ocean.html` (Ocean page), `index.html` (Classic), `ocean.js`, `ocean_scene.js`,
+  Hand-written: `ocean.html` (Ocean page), `index.html` (Classic), `ocean.js`, `ocean_scene.js`, `ocean_reef.js` + `ocean_reef_ui.js` (the opt-in Reef look),
   `ocean_config.js`, `ocean_handoff.js`, `ocean_worker.js` (Turbo), `ocean_dash.js`, `dashboard.js`, `charts.js`.
 - `tests/` `core_tests.cpp`, `ocean_tests.cpp` (+ `ocean_*_tests.hpp`), `ocean_turbo_handoff.js`,
   `ocean_render_browser.mjs`, `ocean_baseline/` (committed fingerprints), `fixtures/`, `*.sh` end-to-end tests.

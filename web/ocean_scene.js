@@ -1570,6 +1570,7 @@
     var quality = opts.coarse ? 2 : 3;
     var insets = { top: 0, right: 0, bottom: 0, left: 0 };
     var cw = 1, ch = 1;
+    var reef = null;   /* the Reef look (web/ocean_reef.js, setLook); null until the scene is built */
 
     function v3(a) { return new THREE.Vector3(a[0], a[1], a[2]); }
     var common = {
@@ -2033,6 +2034,7 @@
      * y between just above the floor and a bit above the surface; the camera
      * never goes under the sand (it slides in along its line of sight) */
     function clampView() {
+      if (reef && reef.rig()) { reef.clamp(); return; }   /* the Reef look: at the front glass */
       var t = controls.target, cp = camera.position, mx = halfW + 80, mz = halfH + 80;
       var x = Math.max(-mx, Math.min(mx, t.x)), z = Math.max(-mz, Math.min(mz, t.z));
       var y = Math.max(FLOOR_Y + 8, Math.min(SURF_TOP, t.y));
@@ -2057,6 +2059,7 @@
       controls.enablePan = !on;
       controls.mouseButtons.LEFT = on ? MOUSE.ROTATE : MOUSE.PAN;
       controls.touches.ONE = on ? TOUCH.ROTATE : TOUCH.PAN;
+      if (reef) reef.onFollow(on);
     }
 
     /* ---- keyboard flight (the page's W A S D, Q / E; setMove) ----
@@ -2081,6 +2084,7 @@
     }
     function stepFly(dt) {
       if (!(dt > 0)) return;
+      if (reef && reef.rig() && reef.keys(moveIn, dt)) return;   /* the Reef look: glide, closer, up */
       var m = moveIn, any = !!(m.f || m.r || m.u), boost = m.boost ? FLY.boost : 1;
       var k = 1 - Math.exp(-dt / (any ? FLY.tIn : FLY.tOut));
       var t = controls.target, cp = camera.position;
@@ -2173,10 +2177,11 @@
       return { target: target, pos: target.clone().addScaledVector(D, d), dist: d };
     }
     function resetView(animated) {
-      var f = computeFit();
+      var reefOn = !!(reef && reef.on());
+      var f = reefOn ? reef.fit() : computeFit();   /* the Reef look: back to the front glass */
       fitDist = f.dist;
       controls.maxDistance = fitDist * 1.9;
-      common.uFogDensity.value = 0.42 / fitDist * fogK;   /* fogK: the water's clarity */
+      common.uFogDensity.value = reefOn ? reef.fogDensity() : 0.42 / fitDist * fogK;   /* fogK: the water's clarity */
       if (follow) { follow = false; setFollowControls(false); onFollow(false); }
       userMoved = false;
       if (animated && !reduced) {
@@ -2205,7 +2210,8 @@
       renderer.setPixelRatio(dpr);
       renderer.setSize(cw, ch, false);
       applyViewOffset();
-      if (!userMoved && !follow) resetView(false);
+      if (reef && reef.rig()) resetView(false);   /* the Reef look keeps its place along the glass */
+      else if (!userMoved && !follow) resetView(false);
     }
 
     /* depth (optional): a new tank depth D; the floor, shading and snow follow.
@@ -2244,6 +2250,7 @@
       glass.visible = WALLS;
       for (var s = 0; s < STREAKS; s++) streak[4 * s + 2] = streak[4 * s + 3] = 1;   /* respawn */
       trailLen = 0;
+      if (reef) reef.setWorld();
       resetView(false);
     }
 
@@ -2265,7 +2272,7 @@
       return true;
     }
     function fillApp(s, selIdx, hovIdx) {
-      var n = s.n, lod = quality >= 3 ? "medium" : "coarse";
+      var n = s.n, lod = quality >= 3 || (reef && reef.on() && n <= 1500) ? "medium" : "coarse";   /* the Reef look's eyes need the medium body */
       appKind.ensure(n, lod);
       var at = appKind.attrs;
       var A = at.iA.array, B = at.iB.array, Cc = at.iC.array, BODY = at.iBody.array, X = at.iX.array;
@@ -2586,7 +2593,7 @@
       stepAnim(dt);
       var sel = info.selIdx;
       if (follow) {
-        if (sel < 0) { follow = false; setFollowControls(false); onFollow(false); }
+        if (sel < 0) { follow = false; setFollowControls(false); onFollow(false); if (reef && reef.on()) resetView(true); }
         else {
           /* the target follows the fish's depth too */
           var tx = s.segs[12 * sel] - halfW, tz = s.segs[12 * sel + 1] - halfH, ty = fishY(s, sel);
@@ -2628,13 +2635,14 @@
         hoverRing.position.set(s.segs[12 * hoverIdx] - halfW, fishY(s, hoverIdx) - 1.5, s.segs[12 * hoverIdx + 1] - halfH);
         hoverRing.scale.set(34, 34, 1);
       } else hoverRing.visible = false;
-      snow.visible = quality >= 3 && !reduced;
+      snow.visible = quality >= 3 && !reduced && !(reef && reef.on());
       if (causticFade < 1 && causticReady) {
         causticFade = Math.min(1, causticFade + dt / 1.4);
         floorMat.uniforms.uCausticAmt.value = causticAmt();   /* strong enough to read on the sand */
         floorMat.uniforms.uCausticTrue.value = causticTrue();
       }
       aimBeam(s, sel, dt);
+      if (reef) reef.frame(dt, s, info);
       profiler.lap(SP.otherPack, pt);
       var submitT = profiler.beginCpu(), ok = false;
       profiler.beginSubmission();
@@ -3057,6 +3065,7 @@
       foodMat.uniforms.uFoodGain.value = mix("foodGain");
       causticK = mix("causticK");
       if (causticReady) floorMat.uniforms.uCausticAmt.value = causticAmt();
+      if (reef) reef.regrade();   /* the Reef look's own water, on top */
     }
     clarityUniforms(fishMat.uniforms);
     clarityUniforms(foodMat.uniforms);
@@ -3076,6 +3085,35 @@
       common.uKWater.value = on && isFinite(l.k) ? +l.k : 0;
     }
 
+    /* The Reef look (web/ocean_reef.js; opt-in, setLook): built now, shown
+     * only when chosen. Without the module, or if it fails, the look is
+     * simply not offered (look() stays "ocean"). */
+    if (window.EvoReef) {
+      try {
+        reef = window.EvoReef.create(THREE, {
+          scene: scene, camera: camera, controls: controls, canvas: canvas, common: common, light: LIGHT, FOV: FOV,
+          caustic: floorMat.uniforms.uCaustic, floorMat: floorMat, fishMat: fishMat, fishUniforms: fishUniforms,
+          FISH_CORE: FISH_CORE, FOG_FN: FOG_FN, BEAM_FN: BEAM_FN, beamUniforms: beamUniforms,
+          watch: function (o, label) { profiler.watch(o, label); },
+          appKind: function () { return appKind; },
+          fishKind: function () { return fish; },
+          preds: function () { return preds; },
+          rings: function () { return [selRing, hoverRing]; },
+          state: function () {
+            return { W: W, H: H, halfW: halfW, halfH: halfH, TD: TD, FLOOR_Y: FLOOR_Y, WALLS: WALLS, quality: quality,
+                     reduced: reduced, cw: cw, ch: ch, insets: insets, follow: follow };
+          },
+          moved: function () { userMoved = true; anim = null; },
+          dpr: function () { return renderer.getPixelRatio(); },
+          clarity: function () { return clarity; },
+          setClearColor: function (f) { renderer.setClearColor(new THREE.Color().setRGB(f[0], f[1], f[2], "srgb"), 1); },
+          restoreGrade: function () { setClarity(clarity); },
+          resetView: function (animated) { resetView(animated); }
+        });
+      } catch (e) { reef = null; console.warn("finfolk: the Reef look could not be built", e); }
+    }
+    if (reef && opts.look === "reef") reef.setActive(true, { animate: false });
+
     return {
       renderer: "three.js (WebGL2)",
       setWorld: setWorld,
@@ -3090,7 +3128,7 @@
         if (!changed) return;
         insets = { top: ins.top || 0, right: ins.right || 0, bottom: ins.bottom || 0, left: ins.left || 0 };
         applyViewOffset();
-        if (!userMoved && !follow) resetView(true);
+        if ((reef && reef.rig()) || (!userMoved && !follow)) resetView(true);
       },
       /* index of the fish nearest a viewport point (client px), or -1 */
       pick: function (s, clientX, clientY, reach) {
@@ -3114,8 +3152,21 @@
         userMoved = true;
         setFollowControls(on);
         onFollow(on);
+        if (!on && reef && reef.on()) resetView(true);   /* the Reef look: back to the glass */
       },
       following: function () { return follow; },
+      /* the look (drawing and camera only; web/ocean_reef.js): "ocean", the
+       * default, or "reef", the sunlit aquarium. false when it can't be had */
+      setLook: function (l, o) {
+        if (l === "reef" && !reef) return false;
+        if (reef) reef.setActive(l === "reef", o);
+        return true;
+      },
+      look: function () { return reef && reef.on() ? "reef" : "ocean"; },
+      /* the Reef look's family glow: a per-fish mask (1 family) for this
+       * snapshot's order, or null; drawing only */
+      setGlow: function (m) { if (reef) reef.setGlow(m); },
+      reefStatus: function () { return reef ? reef.status() : "not loaded"; },
       depth: function () { return TD; },
       /* the view up (+) or down (-) by dy sim units, kept between just above
        * the floor and a bit above the surface; stops a follow */

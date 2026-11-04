@@ -1593,6 +1593,7 @@
     var k = function (keys, what) { return "<span class='k'><kbd>" + keys.join("</kbd><kbd>") + "</kbd> " + what + "</span>"; };
     var live = turboState === "live", parts;
     if (live && scene && scene.following()) parts = [k(["W", "S"], "closer / farther"), k(["A", "D"], "circle"), k(["Esc"], "let go")];
+    else if (look === "reef") parts = [k(["←", "→"], "glide"), k(["W", "S"], "closer"), live ? k(["F"], "follow a fish") : k(["Space"], "stop Turbo"), k(["H"], "its family")];
     else parts = [k(["W", "A", "S", "D"], "fly"), live ? k(["F"], "follow a fish") : k(["Space"], "stop Turbo")];
     if (live && paused) parts.push(k(["."], "one step"));
     parts.push(k(["?"], "all keys"));
@@ -2500,6 +2501,7 @@
     }
     s.selIdx = idx;
     lastS = s;
+    if (look === "reef" && reefUI()) { s = reefUI().frame(s); lastS = s; }   /* the Reef look's family glow */
     PROF.lap(SP.controller, pt);
     if (!(dash() && dash().isOpen())) scene.render(s, { animT: animT, dtSim: steps * DT, selIdx: idx });
     pt = PROF.beginCpu();
@@ -2570,6 +2572,7 @@
           if (drawerEl.classList.contains("open")) setDrawer(false);
           else if (statOpen) setStatPanel(false);
           else if (scene.following()) unfollow();
+          else if (look === "reef" && reefUI() && reefUI().glowing()) reefUI().clearGlow();   /* the Reef look's glow, before the fish */
           else { select(null); if (turboReturn) { turboReturn = null; showNote("Let go: no fish to pick up after Turbo."); } }
         }
         if (document.activeElement && document.activeElement.blur) document.activeElement.blur();
@@ -2584,13 +2587,18 @@
       /* the camera's movement: also with a button focused (letters don't press it) */
       var mv = MOVE_CODES[e.code], mk = mv ? "c:" + e.code : null;
       if (!mv && MOVE_KEYS[lk]) { mv = MOVE_KEYS[lk]; mk = "k:" + lk; }
+      /* the Reef look: ← → glide along the glass (not while the tour pages with them) */
+      if (!mv && look === "reef" && (k === "ArrowLeft" || k === "ArrowRight") && !document.getElementById("guide")) {
+        mv = ["r", k === "ArrowRight" ? 1 : -1]; mk = "k:" + lk;
+      }
       if (mv) {
         heldMoveKeys[mk] = mv; shiftHeld = e.shiftKey;
         e.preventDefault();
         return;
       }
       /* the dock's and the top bar's own keys (Turbo's too: T stops it; letters press no button) */
-      if (e.repeat && /^[?vtgoil]$/.test(lk)) return;   /* a held toggle acts once (the camera and speed keys repeat) */
+      if (e.repeat && /^[?vtgoilh]$/.test(lk)) return;   /* a held toggle acts once (the camera and speed keys repeat) */
+      if (lk === "h" && look === "reef" && reefUI()) { reefUI().toggleGlowSelected(); return; }   /* the Reef look: light up the fish's family */
       /* ? and V open as their buttons do from the keyboard: the focus into the
        * popover, and back to the button when it closes */
       if (k === "?") { togglePop("help", el(POPS.help[1]), true); return; }
@@ -2661,7 +2669,7 @@
     if (!scene) return;
     var vh = window.innerHeight, open = drawerEl.classList.contains("open");
     var top = 0, bottom = 0, right = 0;
-    if (!compactMQ.matches) {
+    if (!compactMQ.matches || look === "reef") {   /* the Reef look frames its water between the bars on a phone too */
       top = el("topbar").getBoundingClientRect().bottom + 6;
       bottom = vh - el("dock").getBoundingClientRect().top + 6;
     }
@@ -2965,6 +2973,42 @@
     applyClarity();
   });
   el("clarity").addEventListener("pointerup", function () { this.blur(); });   /* the keys go back to the tank; arrow keys keep it */
+  /* The look (web/ocean_reef.js; drawing and camera only, live): "ocean",
+   * the default, or "reef", a sunlit aquarium seen through its front glass.
+   * ?look= wins and is not stored; then the visitor's own last pick; else
+   * ocean. A look switch never starts a world or touches the address. */
+  var look = "ocean";
+  function parseLook(v) { v = v === null || v === undefined ? "" : String(v).trim().toLowerCase(); return v === "reef" || v === "ocean" ? v : null; }
+  function showLook() {
+    document.documentElement.classList.toggle("look-reef", look === "reef");
+    el("lookMode").querySelectorAll("button").forEach(function (b) { b.setAttribute("aria-pressed", b.dataset.look === look ? "true" : "false"); });
+  }
+  function setLook(l, picked) {
+    l = parseLook(l) || "ocean";
+    if (scene && scene.setLook && !scene.setLook(l, { animate: !reducedMQ.matches })) l = "ocean";   /* the reef module is missing */
+    look = l;
+    if (picked && !BENCH) store("evo_boids.ocean.look", look);   /* a benchmark's cases are not the visitor's choice */
+    showLook();
+    if (reefUI()) reefUI().setActive(look === "reef");
+    if (scene) { slowSince = 0; if (governorOn) restoreDetail(); updateInsets(); updateModeline(); updateKeysLegend(); }
+  }
+  /* the Reef look's gestures (web/ocean_reef_ui.js): double-tap to swim with
+   * a fish, press and hold to light up its family */
+  function reefUI() { return window.EvoReefUI || null; }
+  /* a fish's founder line (oc_inspect's lineage; it may grow the memory) */
+  function lineOf(i) {
+    if (!has("oc_inspect") || !M._oc_inspect(i)) return null;
+    return Math.round(HO.f64(M, M._oc_inspect_info(), M._oc_inspect_len())[7]);
+  }
+  (function () {
+    var want = parseLook(P.get("look")), saved = parseLook(store("evo_boids.ocean.look"));
+    look = want || saved || "ocean";
+    showLook();
+  })();
+  el("lookMode").addEventListener("click", function (e) {
+    var b = e.target.closest("button");
+    if (b && b.dataset.look) setLook(b.dataset.look, true);
+  });
   function updateModeline() {
     /* the world's appearance genes (bit 1 patterns, bit 2 shapes; 0 = off, or a module without them) */
     var flags = HAS_APP ? (has("oc_appearance_flags") ? M._oc_appearance_flags() : 3) : 0;
@@ -2975,7 +3019,7 @@
     el("modeline").textContent = "Running the single-threaded Ocean module, reproducible from the seed" +
       (HAS_EYE ? " (the eye build)" : "") + ". The tank: " + W + " × " + H + " × " + D +
       (WALLS ? ", glass walls" : ", the sides wrap around") +
-      ". Drawing: the 3D tank" + (scene ? ", detail " + scene.quality() + " of 3" : "") +
+      ". Drawing: " + (look === "reef" ? "the Reef look, the tank through its front glass" : "the 3D tank") + (scene ? ", detail " + scene.quality() + " of 3" : "") +
       what + ".";
     var noApp = !!M && colourMode === "appearance" && !flags;   /* the View menu: what the colours show, or why not */
     el("colourwhy").classList.toggle("why", noApp);
@@ -3013,6 +3057,13 @@
             var looks = colourMode === "appearance" && HAS_APP
               ? "each fish wears the skin pattern and body shape it inherited from its parents"
               : colourBrain ? "a fish's colour follows its brain's wiring" : "each family has its own colour";
+            if (look === "reef") {   /* the Reef look: the tank through its front glass */
+              return "You are looking through the tank's front glass. Glowing specks are food, " + looks +
+                     ", and the dark fish with burning eyes are predators. " +
+                     (h.touch() ? "Drag to glide along the glass, pinch to come closer. Double-tap a fish to swim with it; press and hold one to light up its whole family."
+                                : "Drag or <kbd>←</kbd> <kbd>→</kbd> to glide along the glass, scroll to come closer. Double-click a fish to swim with it; " +
+                                  "hold the button on one (or <kbd>H</kbd>) to light up its whole family.");
+            }
             return "Glowing specks are food, " + looks + ", and the dark fish with glowing eyes are " +
                    "predators. <b>View</b>, in the dock, colours them by family or brain and makes the water realistic. " +
                    (h.touch() ? "Drag to move, pinch to zoom, twist with two fingers to turn (below the horizon too)."
@@ -3230,7 +3281,8 @@
       coarse: coarseMQ.matches,
       reducedMotion: reducedMQ.matches,
       bodyScale: bodyScale, onFollowChange: onFollowChange,
-      profiler: PERF ? PROF : null, visualRandom: BENCH ? PERF.visualRandom(2463534242) : null
+      profiler: PERF ? PROF : null, visualRandom: BENCH ? PERF.visualRandom(2463534242) : null,
+      look: look
     });
     if (!scene) throw new Error("This browser could not start WebGL2, which the 3-D tank needs. 2-D Classic draws its world without it.");
     detail0 = scene.quality();
@@ -3239,10 +3291,21 @@
     if (scene.setAppearance) scene.setAppearance(colourMode === "appearance");
     labelHist();
     wireInput();
+    if (reefUI()) reefUI().attach({
+      canvas: canvas, scene: function () { return scene; }, fresh: fresh, last: function () { return fresh(lastS); },
+      epoch: function () { return worldEpoch; }, live: function () { return turboState === "live"; },
+      selectedId: function () { return selectedId; }, follow: follow, unfollow: unfollow,
+      following: function () { return !!(scene && scene.following()); }, lineOf: lineOf,
+      familyColor: function (line) { return has("oc_family_color") ? M._oc_family_color(line) : -1; },
+      colourByFamily: function () { return !colourBrain; }, toast: toast, pictureHint: turboPictureHint,
+      coarse: function () { return coarseMQ.matches; }, reduced: function () { return reducedMQ.matches; }
+    });
+    if (reefUI()) reefUI().setActive(look === "reef");
     updateInsets();
     updateLight();
     updateModeline();
     applyClarity();
+    if (look !== scene.look()) { look = scene.look(); showLook(); }   /* the reef could not be built: the default look */
     if (dash()) dash().attach({
       depth: function () { return D; },
       familyColor: function (id) { return has("oc_family_color") ? M._oc_family_color(id) : 0x3b5957; },
@@ -3271,6 +3334,9 @@
         return !!ok;
       },
       select: function (idx) { var s = fresh(lastS); if (s && idx >= 0 && idx < s.n) select(s.ids[idx]); },
+      /* the latest snapshot (tests: where a fish is on screen, scene.project) */
+      last: function () { return fresh(lastS); },
+      look: function () { return look; },
       /* index of the deepest fish right now (-1 with none) */
       deepest: function () {
         var s = fresh(lastS), best = -1;

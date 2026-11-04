@@ -270,11 +270,13 @@ const PAGE_IDS = (() => {   /* id -> {tag, type, href}: ocean.html's elements, a
         const id = /\sid="([^"]+)"/.exec(x[2]);
         if (!id || m.has(id[1])) continue;
         const type = /\stype="([^"]+)"/.exec(x[2]), href = /\shref="([^"]+)"/.exec(x[2]);
-        m.set(id[1], { tag: x[1], type: type ? type[1] : '', href: href ? new URL(href[1], 'http://ocean.test/ocean.html').href : null, colours: [] });
+        m.set(id[1], { tag: x[1], type: type ? type[1] : '', href: href ? new URL(href[1], 'http://ocean.test/ocean.html').href : null, colours: [], looks: [] });
     }
-    /* the View menu's colour buttons (their data-c), the one group the page reads by its children */
+    /* the View menu's colour buttons (their data-c) and look buttons (data-look), the groups the page reads by their children */
     const cm = /<span id="colourMode"[^>]*>([\s\S]*?)<\/span>/.exec(html);
     if (cm && m.has('colourMode')) m.get('colourMode').colours = [...cm[1].matchAll(/data-c="([^"]+)"/g)].map(x => x[1]);
+    const lm = /<span id="lookMode"[^>]*>([\s\S]*?)<\/span>/.exec(html);
+    if (lm && m.has('lookMode')) m.get('lookMode').looks = [...lm[1].matchAll(/data-look="([^"]+)"/g)].map(x => x[1]);
     return m;
 })();
 function onceIn(src, marker, file) {
@@ -307,12 +309,16 @@ const PAGE_SRC = (() => {
     return src.slice(0, end) + access + src.slice(end);
 })();
 /* the scene: fixed answers, but the skin it was last told to draw (setAppearance -> appearance().skin), and a
- * follow and a flashlight with state: setFollow tells the page (onFollowChange) as ocean_scene.js does, at once */
+ * follow and a flashlight with state: setFollow tells the page (onFollowChange) as ocean_scene.js does, at once;
+ * its look (create's opts.look, setLook -> look()) and the last held movement (setMove -> move()) */
 const SCENE_STUB = `window.EvoOceanScene = { load: function () { return Promise.resolve(); }, create: function (canvas, opts) {
   var fixed = { following: false, flashlight: false, quality: 3, flashlightLevel: 0, pick: -1, project: null, view: null, degrade: false,
-                appearance: { want: false, skin: false, shapes: true, drawing: false } };
+                appearance: { want: false, skin: false, shapes: true, drawing: false },
+                look: opts && opts.look === "reef" ? "reef" : "ocean", move: [0, 0, 0] };
   return new Proxy({}, { get: function (t, k) {
     if (k === "setAppearance") return function (on) { fixed.appearance = { want: !!on, skin: !!on, shapes: true, drawing: !!on }; };
+    if (k === "setLook") return function (l) { fixed.look = l === "reef" ? "reef" : "ocean"; return true; };
+    if (k === "setMove") return function (f, r, u) { fixed.move = [+f || 0, +r || 0, +u || 0]; };
     if (k === "setFollow") return function (on) {
       on = !!on;
       if (on === fixed.following) return;
@@ -480,6 +486,9 @@ function makeDom(page) {
                 for (const c of d.colours) {   /* #colourMode's buttons */
                     const b = new El('button'); b.type = 'button'; b.dataset.c = c; b.setAttribute('aria-pressed', 'false'); e.appendChild(b);
                 }
+                for (const l of d.looks || []) {   /* #lookMode's buttons */
+                    const b = new El('button'); b.type = 'button'; b.dataset.look = l; b.setAttribute('aria-pressed', 'false'); e.appendChild(b);
+                }
                 body.appendChild(e);
             }
             return e || null;
@@ -515,7 +524,7 @@ async function bootPage(query, opts) {
     const loc = {};
     const setLoc = (u) => { const x = new URL(u); Object.assign(loc, { href: x.href, search: x.search, origin: x.origin, protocol: x.protocol, pathname: x.pathname }); };
     setLoc('http://ocean.test/ocean.html' + (query || ''));
-    const storage = new Map(), winLs = {}, mqs = new Map();
+    const storage = new Map(Object.entries(opts.storage || {})), winLs = {}, mqs = new Map();   /* opts.storage: the visitor's earlier choices */
     const say = (level) => (...a) => page.logs.push([level, a.map(String).join(' ')]);
     /* one MediaQueryList per query, as a browser's: its matches can change, and it tells its listeners */
     const matchMedia = (q) => {
@@ -1750,6 +1759,67 @@ async function pageFreshVisit() {
         const got = p.failed ? 'refused: ' + p.failed : p.M._oc_walls_enabled();
         ok(got === want && p.el('o_walls').checked === !!want,
            (q || 'a bare address') + ': ' + (want ? 'glass walls' : 'wrapping, as before walls') + ' (walls ' + got + ')');
+    }
+}
+
+/* The Reef look (web/ocean_reef.js, View › Look): opt-in and drawing only.
+ * ?look= wins and is never stored; the visitor's own pick is; a benchmark's
+ * never is. A switch is live: no world start (no oc_init, the same epoch),
+ * no address, no setup touched. ?look=reef alone is still a new visit (glass
+ * walls). The arrows glide along the glass in the Reef look only. */
+async function pageLook() {
+    section('The page: the Reef look is opt-in and live (View › Look, ?look=): never a world start, a link change or a stored setup');
+    const cls = (p) => p.doc.documentElement.classList.contains('look-reef');
+    const pressed = (p) => p.el('lookMode').querySelectorAll('button[aria-pressed="true"]').map(b => b.dataset.look).join();
+    const btn = (p, l) => p.el('lookMode').querySelectorAll('button[data-look="' + l + '"]')[0];
+    const KEY = 'evo_boids.ocean.look';
+    {
+        const p = await bootPage(PAGE_Q);
+        ok(!p.failed && p.ctx.EvoOcean.look() === 'ocean' && p.ctx.EvoOcean.scene.look() === 'ocean' && !cls(p) && pressed(p) === 'ocean',
+           'a link without look=: the default look (the page, the scene, no reef class, Ocean pressed)');
+    }
+    const p = await bootPage('?look=reef&' + PAGE_Q.slice(1));
+    ok(!p.failed && p.ctx.EvoOcean.look() === 'reef' && p.ctx.EvoOcean.scene.look() === 'reef' && cls(p) && pressed(p) === 'reef' &&
+       p.ctx.localStorage.getItem(KEY) === null,
+       '?look=reef: the Reef look from the start (the page, the scene\'s create, the class, Reef pressed), and not stored');
+    const before = { inits: p.inits.length, epoch: p.T.worldEpoch, url: p.loc.href, world: p.world() };
+    btn(p, 'ocean').click();
+    ok(p.ctx.EvoOcean.look() === 'ocean' && p.ctx.EvoOcean.scene.look() === 'ocean' && !cls(p) && pressed(p) === 'ocean' &&
+       p.ctx.localStorage.getItem(KEY) === 'ocean', 'View › Look › Ocean: live, and the visitor\'s pick is stored');
+    btn(p, 'reef').click();
+    ok(p.ctx.EvoOcean.look() === 'reef' && cls(p) && p.ctx.localStorage.getItem(KEY) === 'reef', 'and back to Reef, stored');
+    ok(p.inits.length === before.inits && p.T.worldEpoch === before.epoch && p.loc.href === before.url && p.world() === before.world,
+       'switching looks started no world, changed no address and touched no setup (' + (p.inits.length - before.inits) + ' oc_init)');
+    /* the arrows: glide in the Reef look (a held "r" axis to the scene), nothing in the default look */
+    const frame = () => { const cb = p.raf; p.raf = null; if (cb) cb(performance.now()); };
+    const up = (key) => { const ev = new p.Ev('keyup'); Object.assign(ev, { key, code: '' }); p.doc.dispatchEvent(ev); };
+    p.key('ArrowRight'); frame();
+    const rReef = p.ctx.EvoOcean.scene.move()[1];
+    up('ArrowRight'); frame();
+    const rUp = p.ctx.EvoOcean.scene.move()[1];
+    btn(p, 'ocean').click();
+    const speed0 = p.ctx.EvoOcean.state().speed;
+    p.key('ArrowRight'); frame();
+    const rOcean = p.ctx.EvoOcean.scene.move()[1];
+    up('ArrowRight');
+    ok(rReef === 1 && rUp === 0 && rOcean === 0 && p.ctx.EvoOcean.state().speed === speed0,
+       '→ glides along the glass in the Reef look (r ' + rReef + ', released ' + rUp + '), and does nothing in the default look (r ' + rOcean + ')');
+    ok(p.uncaught.length === 0, 'no exception escaped the page\'s handlers' + (p.uncaught.length ? ' (' + p.uncaught[0] + ')' : ''));
+    {
+        const q = await bootPage(PAGE_Q, { storage: { [KEY]: 'reef' } });
+        const r = await bootPage('?look=ocean&' + PAGE_Q.slice(1), { storage: { [KEY]: 'reef' } });
+        ok(q.ctx.EvoOcean.look() === 'reef' && r.ctx.EvoOcean.look() === 'ocean' && r.ctx.localStorage.getItem(KEY) === 'reef',
+           'the visitor\'s stored pick opens the Reef look; ?look=ocean wins over it and leaves it stored');
+    }
+    {
+        const q = await bootPage('?look=reef');
+        ok(!q.failed && q.M._oc_walls_enabled() === 1 && q.ctx.EvoOcean.look() === 'reef',
+           '?look=reef alone is still a new visit: glass walls (walls ' + (q.failed ? 'refused' : q.M._oc_walls_enabled()) + ')');
+    }
+    {
+        const q = await bootPage('?renderBench=1&look=reef&' + PAGE_Q.slice(1), { perf: true });
+        btn(q, 'ocean').click();
+        ok(q.ctx.EvoOcean.look() === 'ocean' && q.ctx.localStorage.getItem(KEY) === null, 'a benchmark\'s look is never stored as the visitor\'s choice');
     }
 }
 
@@ -3390,7 +3460,7 @@ const SECTIONS = {
     },
     failures: failures_,
     pageHeld, pageRefusal, pageAsyncSetup, pageStartFailures, pageOverflow, pageBools, pageDashboards,
-    pageWallsOverride, pageFreshVisit, pageSizeFields, pageRoundTrip,
+    pageWallsOverride, pageFreshVisit, pageLook, pageSizeFields, pageRoundTrip,
     pageColourBench, pageLayers, pageResize, pageKeys, pageStartupFailures, pageTourEscape, pageWholeFields,
     pageTurboFraction, pageCardNumbers, pageMixedRecovery, pageEscOwner, pageTabKeys, pageIntegralFloats,
     pageTurboMode, pageStartDoor, pageFollowBack, pageDraft, pageScenarios,
