@@ -1477,7 +1477,12 @@ def main(argv=None):
                 running[p.pid] = (p, spec["id"], time.time())
             if not admit and not running:
                 break
-            time.sleep(0.5)
+            # Up to 0.5 s, but back as soon as a cell worker exits: a finished cell's slot is refilled at
+            # once rather than at the next half-second tick, which idled a worker ~0.25 s per cell
+            # (~2% of a 4-worker bank; docs/throughput.md). Scheduling only: no output changes.
+            t_wait = time.time() + 0.5
+            while time.time() < t_wait and all(p.poll() is None for p, _, _ in running.values()):
+                time.sleep(0.02)
     except BaseException as e:
         # guaranteed cleanup (review round 4): whatever breaks the loop, no cell worker or engine outlives
         # the runner (terminate() has already done this for a signal)

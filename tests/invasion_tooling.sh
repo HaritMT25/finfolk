@@ -70,6 +70,9 @@
 #      legacy cell's snapshot has moved;
 #  31. the registered bank is the approved plan with its policies (state, predators); a failed plant
 #      construction or source fit is a counted power failure, never power at the target.
+#  Throughput (docs/throughput.md):
+#  5b. identity.py: the same binary twice is IDENTICAL and matches the root's record; a binary that changes
+#      one byte of end.json is caught on that file; a held root and --out inside the root are refused.
 set -u
 BIN=${1:?usage: invasion_tooling.sh EVO_BOIDS WORKDIR}
 W=${2:?usage: invasion_tooling.sh EVO_BOIDS WORKDIR}
@@ -153,6 +156,47 @@ $PY "$T/plan.py" design.json > plan.jsonl || fail "plan.py"
 $PY "$T/run.py" --plan plan.jsonl --root root --binary "$BIN" --workers 2 > run.log 2>&1 || fail "run.py: $(tail -3 run.log)"
 [ -f root/cells/off_f100_A_B_r00/done.json ] && [ -f root/cells/off_f100_A_sham_r00/done.json ] || fail "run.py: no done.json"
 $PY "$T/run.py" --plan plan.jsonl --root root --binary "$BIN" --workers 2 | grep -q "2 already done" || fail "run.py resume"
+
+# 5b. identity.py (the gate a new engine binary passes, docs/throughput.md): the same binary twice is
+#     IDENTICAL and reproduces the root's own record (score.json included: same tools); a "binary" that
+#     changes one digit of end.json is NOT, on exactly that file; a root a runner holds, and --out inside
+#     the root, are refused
+cat > tamper.sh <<EOF
+#!/bin/bash
+"$BIN" "\$@" || exit \$?
+python3 -I - <<'PY'
+import re
+s = open("end.json").read()
+i = re.search(r'"posX":\[-?([0-9])', s).start(1)   # first digit of the first fish's x (the score never reads it)
+d = "1" if s[i] != "1" else "2"
+open("end.json", "w").write(s[:i] + d + s[i + 1:])
+PY
+EOF
+chmod +x tamper.sh
+$PY "$T/identity.py" --root root --out id_same --binary a="$BIN" --binary b="$BIN" --sample 2 --workers 2 > id1.log 2>&1 \
+    || fail "identity.py, the same binary twice: $(tail -3 id1.log)"
+$PY "$T/identity.py" --root root --out id_tamper --binary a="$BIN" --binary t="$W/tamper.sh" --sample 2 > id2.log 2>&1 \
+    && fail "identity.py passed a binary that changes end.json"
+$PY - <<'PY' || fail "identity.py verdicts"
+import json
+r = json.load(open("id_same/identity.json"))
+assert r["verdict"] == "IDENTICAL" and r["identical"] == 2 and r["cells"] == 2, r["verdict"]
+assert r["record_hashes_checked"] >= 2 * 5 and not r["record_mismatch"], r["record_hashes_checked"]
+assert all("score.json" in c["record_checked"] for c in r["per_cell"].values())
+t = json.load(open("id_tamper/identity.json"))
+assert t["verdict"] == "NOT IDENTICAL" and len(t["different"]) == 2, t["verdict"]
+assert all(c["different_files"] == ["end.json"] for c in t["per_cell"].values()), t["per_cell"]
+assert not t["record_mismatch"], "the reference (the real engine) still matches the record"
+PY
+( flock -x 9; sleep 4 ) 9> root/.runner.lock &
+sleep 1
+$PY "$T/identity.py" --root root --out id_live --binary a="$BIN" --binary b="$BIN" --sample 1 > id3.log 2>&1
+rc=$?
+wait
+[ "$rc" = 2 ] || fail "identity.py read a root a runner holds (exit $rc)"
+$PY "$T/identity.py" --root root --out root/id_inside --binary a="$BIN" --binary b="$BIN" --sample 1 > id4.log 2>&1 \
+    && fail "identity.py accepted --out inside the study root"
+[ -e root/id_inside ] && fail "identity.py wrote inside the study root"
 
 # 6. the memory gate fails closed and honours cgroup v2 limits up the tree
 mkdir -p cg/a/b
