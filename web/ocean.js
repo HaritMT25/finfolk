@@ -486,34 +486,56 @@
       showError("The engine could not restart (" + (e && e.message || e) + "). Reload the page to go on; Save setup still saves this world's setup.");
     });
   }
-  /* the engine trapped while the page used it: nothing more is stepped, read or started (a reload is the way on) */
+  /* the engine trapped while the page used it: nothing more is stepped, read or started (a reload is the way on);
+   * said once per trap (an inner fence says it, then hands the trap to the operation's own) */
+  var stoppedBy = null;
   function engineStopped(err) {
+    if (engineState === "down" && stoppedBy === err) return;
+    stoppedBy = err;
     engineState = "down";
     showError("The engine stopped (" + (err && err.message || err) + "), so this world can't go on. Reload the page to go on; Save setup still saves its setup.");
+  }
+  /* How deep the fences are now (the frame, an operation from outside, an
+   * engine call). A trap stops the engine at the innermost; it then goes on
+   * to the outermost, which ends the whole operation: nothing after it in
+   * the operation reaches the module (review of #44, round 4, finding 1:
+   * an inner fence that swallowed it let the operation call on, a live
+   * setting's refusal reading lastError, a recovery reading the frame). */
+  var fenceDepth = 0;
+  function trapped(err) {
+    if (!(err instanceof WebAssembly.RuntimeError)) return false;
+    engineStopped(err);
+    return fenceDepth === 1;   /* (the outermost: the operation ends here) */
   }
   /* An engine call outside the frame and the transaction: a control, the
    * charts' timer, the console's handle. Nothing while the engine is
    * restarting or down (fallback; said so once a while for a visitor's
    * action: say); a trap in it stops the engine once (engineStopped)
-   * instead of throwing at every use. */
+   * instead of throwing at every use; inside an operation, that operation
+   * ends with it. */
   var busySaidT = -Infinity;
   function engineCall(fn, fallback, say) {
     if (!M || engineState !== "ok") {
       if (say && M && performance.now() - busySaidT > 2000) { busySaidT = performance.now(); showNote(say + ": " + engineBusyWhy() + "."); }
       return fallback;
     }
+    fenceDepth++;
     try { return fn(); }
-    catch (err) { if (err instanceof WebAssembly.RuntimeError) { engineStopped(err); return fallback; } throw err; }
+    catch (err) { if (trapped(err)) return fallback; throw err; }
+    finally { fenceDepth--; }
   }
   /* A whole operation from outside (a button, a key, a field, Turbo's
-   * messages), as one: a trap anywhere in it stops the engine once instead
-   * of escaping, and nothing after it in the operation runs (review of #44,
-   * round 3, finding 3). What it reaches while the engine is down is gated
-   * where it reaches it (select, startWorld, follow, the hand-back, ...). */
+   * messages, the console's handles), as one: a trap anywhere in it stops
+   * the engine once instead of escaping, and nothing after it in the
+   * operation runs (review of #44, round 3, finding 3). What it reaches
+   * while the engine is down is gated where it reaches it (select,
+   * startWorld, follow, the hand-back, ...). */
   function fenced(fn) {
     return function () {
+      fenceDepth++;
       try { return fn.apply(this, arguments); }
-      catch (err) { if (err instanceof WebAssembly.RuntimeError) { engineStopped(err); return undefined; } throw err; }
+      catch (err) { if (trapped(err)) return undefined; throw err; }
+      finally { fenceDepth--; }
     };
   }
   /* the sheet shows the world that now runs: its seed, size and settings
@@ -1774,7 +1796,7 @@
       return r.body(req.stale, function () {
         return heavyTurn().then(function (rel) {
           release = rel;
-          if (req.stale()) return;   /* (body() stops it) */
+          if (req.stale()) throw new Error(HO.CANCELLED);   /* (superseded while it waited: it ends here, nothing read or made; review of #44, round 4, finding 2) */
           var now = openNeeds(header);
           if (now > dev.budget) throw new Error(overBudget(header, now, dev));
         });
@@ -3037,8 +3059,10 @@
   function frame(now) {
     requestAnimationFrame(frame);
     if (engineState !== "ok") return;   /* restarting (a new module on its way) or stopped: nothing to step or read */
+    fenceDepth++;   /* (a fence too: an engine call inside it hands a trap on to it) */
     try { frameBody(now); }
     catch (err) { if (err instanceof WebAssembly.RuntimeError) { engineStopped(err); return; } throw err; }
+    finally { fenceDepth--; }
   }
   function frameBody(now) {
     PROF.beginFrame(now, worldEpoch, turboState, paused);   /* the raw rAF interval, before the clamp below */
@@ -3883,15 +3907,17 @@
         if (turboWorker && (turboState === "entering" || turboState === "turbo")) turboWorker.postMessage({ cmd: "rec", every: every });
       }
     });
+    /* (the handles that read the world through fresh(), which cuts a new snapshot from the engine when
+     * the memory grew: each fenced whole, as select's and set's are; review of #44, round 4, finding 3) */
     window.EvoOcean = {
       module: M, scene: scene,
-      steepest: function (sinking) {
+      steepest: fenced(function (sinking) {
         var s = fresh(lastS), best = -1, bv = 0;
         if (!s || !s.vz) return null;
         for (var i = 0; i < s.n; i++) { var v = sinking ? s.vz[i] : Math.abs(s.vz[i]); if (v > bv) { bv = v; best = i; } }
         return best < 0 ? null : { idx: best, id: s.ids[best], vz: s.vz[best], x: s.segs[12 * best], y: s.segs[12 * best + 1],
                                    x1: s.segs[12 * best + 2], y1: s.segs[12 * best + 3], depth: s.depth[best] };
-      },
+      }),
       set: function (name, v) {
         return engineCall(function () {
           if (!has("oc_set_param")) return false;
@@ -3903,14 +3929,14 @@
       },
       select: function (idx) { engineCall(function () { var s = fresh(lastS); if (s && idx >= 0 && idx < s.n) select(s.ids[idx]); }); },
       /* index of the deepest fish right now (-1 with none) */
-      deepest: function () {
+      deepest: fenced(function () {
         var s = fresh(lastS), best = -1;
         if (s) for (var i = 0; i < s.n; i++) if (best < 0 || s.depth[i] > s.depth[best]) best = i;
         return best;
-      },
+      }),
       follow: follow,
       turbo: function () { return turboState; },
-      state: function () {
+      state: fenced(function () {
         var s = fresh(lastS);
         if (!s) return null;
         var lo = Infinity, hi = -Infinity;
@@ -3924,11 +3950,11 @@
                  stats: Array.prototype.slice.call(s.stats), depthMin: s.n ? lo : 0, depthMax: s.n ? hi : 0,
                  dashRows: dash() ? dash()._rows().length : 0, worldEpoch: worldEpoch,
                  engine: engineState, rebuilds: rebuilds, engineId: pinned ? pinned.sha256 : null };
-      }
+      })
     };
     if (PROF.enabled) EvoOcean.perf = PROF;   /* ?renderBench=1 / ?perf=1 (web/ocean_perf.js) */
     if (BENCH) EvoOcean.bench = PERF.bench({ module: M, scene: scene, profiler: PROF, page: EvoOcean, setPaused: setPaused,
-      last: function () { return fresh(lastS); }, epoch: function () { return worldEpoch; }, initArgs: function () { return initArgs; },
+      last: fenced(function () { return fresh(lastS); }), epoch: function () { return worldEpoch; }, initArgs: function () { return initArgs; },
       importWorld: importWorld,
       /* the page's own colour switch and state, and whether the charts are up (they suspend the tank) */
       setColourMode: setColourMode, colourMode: function () { return colourMode; },

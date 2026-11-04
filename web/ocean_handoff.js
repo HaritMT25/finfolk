@@ -87,7 +87,9 @@
     for (var i = ptr; i < end; i++) s += String.fromCharCode(h[i]);
     return s;
   }
-  /* fn(ptr) with str as a temporary C string (0 for an empty one) */
+  /* fn(ptr) with str as a temporary C string (0 for an empty one), freed
+   * after it; not when fn trapped: a module that trapped is not entered
+   * again, its allocator neither (its stack and globals can't be trusted) */
   function withCString(M, str, fn) {
     if (str === null || str === undefined || str === "") return fn(0);
     str = String(str);
@@ -99,7 +101,10 @@
     var h = new Uint8Array(buffer(M));   /* after the malloc: it may have grown the memory */
     h.set(bytes, ptr);
     h[ptr + bytes.length] = 0;
-    try { return fn(ptr); } finally { M._free(ptr); }
+    var trap = false;
+    try { return fn(ptr); }
+    catch (e) { trap = e instanceof WebAssembly.RuntimeError; throw e; }
+    finally { if (!trap) M._free(ptr); }
   }
 
   /* len doubles / floats at ptr, copied out. Call it with the export inline,
@@ -614,10 +619,11 @@
     });
   }
   /* bytes [a, z) of src, READ_PART at a time into one buffer (one part: as
-   * read); cancelled() true stops it before a part and while one is on its
-   * way (looked at every 50 ms) */
+   * read); cancelled() true stops it before the buffer is made, before a
+   * part and while one is on its way (looked at every 50 ms) */
   function readParts(src, a, z, cancelled) {
     var part = WORLD.READ_PART;
+    if (cancelled && cancelled()) return Promise.reject(new Error(CANCELLED));   /* (before any of it is allocated: review of #44, round 4, finding 2) */
     if (z - a <= part) return readPart(src, a, z, cancelled);
     var out = new Uint8Array(z - a), at = a;
     return (function next() {
