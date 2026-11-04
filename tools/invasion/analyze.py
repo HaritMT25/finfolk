@@ -1187,7 +1187,9 @@ def primary_blocks(rows, meta, registry, cores, sims, seed=5, kind=infer.DEFAULT
                         "h1b_diagnostics": (f"logistic fits converged {ro['fits_converged']}/{ro['conditions']}; "
                                             f"bootstrap draws with an unconverged refit {ro['boot_not_converged']}/{bsims}"
                                             + (f"; INVALID: {ro['invalid']} (descriptive p "
-                                               f"{ro['p_flip_unconverged']:.5g})" if not ro["valid"] else ""))})
+                                               + (f"{ro['p_flip_unconverged']:.5g}" if ro["p_flip_unconverged"] is not None
+                                                  else "unavailable") + ")"
+                                               if not ro["valid"] else ""))})
             row["p_primary"] = primary_p(row)
             row["claim_beyond_bounded"] = None
             if ro["p_flip"] is None or row["p_primary"] is None:

@@ -1943,7 +1943,8 @@ by = {j["G"]: j for j in pj}
 assert by[13500.0]["claim_beyond_bounded"] is True and by[13500.0]["claim_status"].startswith("formal"), by[13500.0]
 assert by[27000.0]["claim_beyond_bounded"] is None and "not the confirmatory horizon" in by[27000.0]["claim_status"], by[27000.0]
 _, _, pj = pj_(reg, dict(ok, gate_problems=["the gate decision is 'fail', not 'pass'"]))
-assert all(j["claim_beyond_bounded"] is None and "no passed gate" in j["claim_status"] for j in pj), pj
+assert all(j["claim_beyond_bounded"] is None and j["both_rejected"] is True for j in pj), pj
+assert "no passed gate" in {j["G"]: j for j in pj}[13500.0]["claim_status"], pj
 reg9 = {k: dict(v) for k, v in reg.items()}
 reg9[("off", 0.05)][("x03", "x05", "invade")] = set(range(9))     # one cell registers 0..8
 _, pb, pj = pj_(reg9, None)
