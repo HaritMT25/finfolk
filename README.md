@@ -210,6 +210,38 @@ A second switch in the Run tab (or `?fish=1`) draws each fish in the flat view a
 
 So fish shapes add about 0.2 ms of drawing at 2,000 agents, and 0.4 ms (windowed) to 0.75 ms (headless) at 8,000. In the windowed runs, where the display's 56.6 Hz sets the pace, circles and fish shapes each held it up to 10,000 agents in one round and 12,000 in the other, so the stable limit didn't separate them. In both headless sets the step took 6–7.5 ms at 2,000 agents, against 3.9 ms in the flat-vs-tank rounds on AC power, so the step, not the drawing, set the stable-60 limit. A control run showed the fish branch with the switch off drawing exactly like the branch before it (1.075 vs 1.06 ms at 2,000). In headless Firefox 155 (2 rounds) both drew in 17–19 ms at 2,000 agents, which is headless Firefox's fixed copy cost (see Benchmarks), and fish shapes added nothing measurable on top.
 
+### The Ocean's Reef look (opt-in)
+
+The 3-D Ocean can also be drawn as a sunlit aquarium seen through its front glass: sky and a far island above a wavy waterline, bright blue water, a procedural reef around the tank, and storybook fish with cartoon eyes (`web/ocean_reef.js`, its gestures in `web/ocean_reef_ui.js`, by techy-Nik). View › Look › **Reef** turns it on and the page remembers the choice (`evo_boids.ocean.look`); `?look=reef` (or `?look=ocean`) wins over that and is never stored. It is drawing, camera and gestures only: switching starts no world, changes no address and touches no setup, and with the look off nothing of it is in the scene.
+
+| | Touch | Mouse | Keys |
+|---|---|---|---|
+| Glide along the glass | drag | drag, or the wheel sideways (Shift + wheel) | ← → or A D |
+| Come closer / back off | pinch | wheel | W S |
+| Lower / raise the eye | | | Q E |
+| See a fish | tap | click | |
+| Swim with it | double-tap | double-click | F |
+| Light up its family | press and hold (0.65 s) | hold the button | H, or the card's family button |
+| Let go, put the glow out | | | Esc |
+| Back to the glass | | | C |
+
+- **What is drawn from the simulation:** every fish, food speck and predator where the engine has it, with the same spines, depths, pitches, inherited bodies and colours as the default look. A fish's lit side is exactly its family (or brain) colour, or its gene skin: the storybook shading only steps its brightness in three soft bands, and depth and distance only darken it (at most about a quarter and a third), so no hue shifts. In the flashlight it keeps its true colours. The family glow is the founder line from `oc_inspect`, exact.
+- **What is added for looks:** the sky, clouds and island; the sea band and the waterline; the reef (rocks, shells, coral, kelp, a few ruined columns); light shafts (drawn before the fish, so a fish covers them and is never tinted); bubbles (hollow pale rings, never a filled glowing dot like the food); the fish's cartoon eyes (white, a pupil that looks ahead and down while sinking, a blink every few seconds while the run goes); the predators' brows and ember slit eyes. Marine snow is off in this look.
+- **No fish swims through scenery.** Decor inside the tank stays low, at most 6 units (pebbles, shells, flat coral crusts, short turf): the floor is 14 units below the deepest spine, and a big fish's body reaches lower. Everything taller stands behind the back glass and beyond the ends. Gliding stops at the tank's ends, so the wrapping seam (glass walls off) is never in view.
+- **What the camera changes:** it stands at the long front glass with a long lens (6°) from far off, so the tank reads nearly flat from the side: far fish are only a little smaller than near ones (about 70% at the back glass), and the sand is a strip at the bottom. A portrait world puts the glass on its long side too. Following a fish uses the scene's own lens; letting go returns to the glass.
+
+**Cost** (the page's own render benchmark, `?renderBench=1` with the view kept as the look frames it, `camera: "keep"`; headless Chrome on the laptop's Iris Xe, 1400×900, DPR 1, detail 3, paused, GPU time per frame, p50, 2026-11-03):
+
+| fish | default look | Reef look | added | fps (default / Reef) |
+|---:|---:|---:|---:|---|
+| 500 | 8.70 ms | 11.57 ms | +2.9 ms | 60.0 / 59.9 |
+| 1,500 | 20.50 ms | 22.94 ms | +2.4 ms | 43.5 / 39.6 |
+| 2,500 | 33.76 ms | 37.16 ms | +3.4 ms | 27.8 / 25.7 |
+
+At 1,500 fish the scenery itself (sky, reef, kelp, shafts, bubbles) took 0.73 ms and the sand 1.2 ms less than in the default view; the rest is the fish, which the side view shows about three times larger (more pixels shaded) with the storybook shading and eyes. Hold 60 fps sheds the Reef look's extras first: detail 2 drops the bubbles and the sway and keeps four shafts, detail 1 drops the shafts and the kelp. With up to 1,500 fish the Reef look draws the medium body at every detail, so the eyes show on phones too.
+
+Not tested yet: real phones, Firefox and Safari, and the Reef look inside the Brave UI matrix and `tests/ocean_render_browser.mjs`. `tests/ocean_turbo_handoff.js` checks the switch (link, stored pick, live switch with no world start or address change, the arrows, a new visit's walls, the benchmark not storing it).
+
 ### Randomize and the first-visit guide
 
 **Randomize** (the dice in the dock, or the top of the settings' Run tab) draws a whole setup, restarts, and lists what it picked. Every value also lands in the settings, so you can tweak it and press Restart.

@@ -585,6 +585,8 @@
         api.select(idx);
         api.follow();
         out.selectedId = s.ids[idx]; out.barbels = pickBarb >= 0;
+      } else if (kind === "keep") {
+        /* the view as the look framed it (the Reef look's front glass): no camera move */
       } else {
         api.scene.lookFrom([0, 920, 1620], [0, -120, 0]);
       }
@@ -633,6 +635,7 @@
             cam.view = st.view; cam.flashlightLevel = st.flashlightLevel; cam.following = st.following; cam.selectedId = st.selectedId;
             return { world: [st.W, st.H, st.D], walls: st.walls, n: st.n, tick: st.frame, worldEpoch: h.epoch(), seed: st.seed,
                      colourMode: h.colourMode(), quality: scene.quality(), paused: st.paused,
+                     look: scene.look ? scene.look() : "ocean",
                      governor: doc.getElementById("governor").checked, camera: cam, appearance: scene.appearance() };
           });
         });
