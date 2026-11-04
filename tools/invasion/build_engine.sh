@@ -10,9 +10,11 @@
 #   --pgo ARENA...      profile-guided optimisation: build with -fprofile-generate, run each ARENA checkpoint
 #                       headless (--train-steps, default 4000, with every output the cells write: CSV,
 #                       birth log, periodic and final checkpoints), then rebuild with -fprofile-use. Train on
-#                       arenas that are NOT the ones the binary will be judged on.
+#                       arenas that are NOT the ones the binary will be judged on. NOT for a study binary:
+#                       two PGO builds of the same inputs came out different (g++ 13.3), and it ran 6.5%
+#                       SLOWER than --arch x86-64-v3 --lto (docs/throughput.md); kept for experiments
 #   --epoch S           SOURCE_DATE_EPOCH (the "built ..." stamp the binary prints); default: the commit's time.
-#                       Same commit + compiler + options + epoch (+ training inputs) = the same bytes.
+#                       Same commit + compiler + options + epoch = the same bytes (without --pgo)
 #   --rev REV           the commit to build (default HEAD); the build uses `git archive REV`, never the
 #                       working tree, so uncommitted edits cannot reach a study binary
 #
@@ -44,7 +46,13 @@ COMMIT=$(git -C "$REPO" rev-parse --verify "$REV^{commit}")
 [ -n "$EPOCH" ] || EPOCH=$(git -C "$REPO" log -1 --format=%ct "$COMMIT")
 export SOURCE_DATE_EPOCH=$EPOCH
 [ -e "$OUT" ] && { echo "$OUT exists: refusing to overwrite a binary" >&2; exit 2; }
-W=$(mktemp -d "${TMPDIR:-/tmp}/build_engine.XXXXXX")
+# A FIXED work path, not mktemp, so nothing path-dependent can vary between two builds (the non-PGO
+# builds came out the same from different paths anyway; PGO builds differ even with the path fixed).
+# One build at a time (the lock); the directory is removed afterwards.
+W=/tmp/finfolk_build_engine
+exec 9> "$W.lock"
+flock -n 9 || { echo "another build_engine.sh holds $W.lock" >&2; exit 2; }
+rm -rf "$W"; mkdir -p "$W"
 trap 'rm -rf "$W"' EXIT
 mkdir -p "$W/src" "$W/train"
 git -C "$REPO" archive "$COMMIT" | tar -x -C "$W/src"
@@ -73,6 +81,9 @@ if [ ${#PGO[@]} -gt 0 ]; then
     i=$((i + 1))
   done
   TRAIN_JSON+="]"
+  NGCDA=$(find "$W/pgo" -name '*.gcda' 2>/dev/null | wc -l)
+  [ "$NGCDA" -gt 0 ] || { echo "the training runs wrote no profile (*.gcda) under $W/pgo" >&2; exit 1; }
+  echo "profile: $NGCDA .gcda file(s)"
   build use
 else
   build ""

@@ -284,9 +284,12 @@ def main(argv=None):
     ap.add_argument("--workers", type=int, default=1)
     ap.add_argument("--keep", action="store_true")
     ap.add_argument("--report")
+    ap.add_argument("--resume", help="NEW_DIR of an interrupted run: redo only the runs without a digest")
     a = ap.parse_args(argv)
     if a.report:
         return compare(os.path.abspath(a.report))
+    if a.resume:
+        return resume(os.path.abspath(a.resume), a.workers, a.keep)
     if not (a.root and a.out) or len(a.binary) < 2 or not (a.sample or a.ids):
         ap.error("--root, --out, two or more --binary NAME=PATH and --sample or --ids are required")
     if not 1 <= a.workers <= 4:
@@ -345,10 +348,15 @@ def main(argv=None):
             jobs.append((k, cid))
     print(f"{len(cells)} cells x {len(names)} binaries = {len(jobs)} runs, {a.workers} worker(s), nice 19 -> {out}",
           flush=True)
+    run_jobs(out, jobs, a.workers)
+    return compare(out)
+
+
+def run_jobs(out, jobs, workers):
     t0 = time.time()
     running, failed, done_n = {}, [], 0
     while jobs or running:
-        while jobs and len(running) < a.workers:
+        while jobs and len(running) < workers:
             k, cid = jobs.pop(0)
             log = open(os.path.join(out, "runs", k, cid, "identity.log"), "w")
             p = subprocess.Popen([sys.executable, "-I", os.path.abspath(__file__), "--_one", out, k, cid]
@@ -368,6 +376,32 @@ def main(argv=None):
             print(f"FAILED {k} {cid} (exit {rc})", flush=True)
         if done_n % 20 == 0 or not (jobs or running):
             print(f"{done_n} runs done, {time.time() - t0:.0f} s", flush=True)
+    return failed
+
+
+def resume(out, workers, keep):
+    """Redo every run of an interrupted identity check that has no digest (its directory cleared but
+    for cell.json), with the binaries, cells and order it was started with."""
+    global KEEP
+    KEEP = keep
+    if not 1 <= workers <= 4:
+        raise SystemExit("--workers must be 1..4")
+    os.nice(19 - os.nice(0))
+    meta = json.load(open(os.path.join(out, "binaries.json")))
+    names = sorted(meta, key=lambda k: meta[k]["order"])
+    cells = [ln.strip() for ln in open(os.path.join(out, "cells.txt")) if ln.strip()]
+    jobs = []
+    for cid in cells:
+        for k in names:
+            d = os.path.join(out, "runs", k, cid)
+            if os.path.exists(os.path.join(d, "digest.json")):
+                continue
+            for f in os.listdir(d):
+                if f != "cell.json":
+                    os.remove(os.path.join(d, f))
+            jobs.append((k, cid))
+    print(f"resume: {len(jobs)} runs left of {len(cells) * len(names)}, {workers} worker(s) -> {out}", flush=True)
+    run_jobs(out, jobs, workers)
     return compare(out)
 
 

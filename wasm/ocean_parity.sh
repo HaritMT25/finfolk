@@ -66,6 +66,10 @@
 #   FAST=1 wasm/ocean_parity.sh       # CI's subset (FAST_CASES below: 49 of the 124 cases)
 #                                     # with EVERY guard and both
 #                                     # builds' unit checks; not with --rebaseline
+#   NATIVE_CXXFLAGS="-march=x86-64-v3 -mno-fma -flto=auto" wasm/ocean_parity.sh
+#                                     # extra flags for the NATIVE builds only (a throughput
+#                                     # build, CMakeLists.txt EVO_NATIVE_ARCH / EVO_LTO), held to
+#                                     # the same wasm and baselines; not with --rebaseline
 #
 # Two builds: the plain Ocean build (-DEVO_WORLD_OCEAN; every case not named
 # eye_*) and the compound-eye build (+ -DEVO_OCEAN_EYE: 64 sensors, its own
@@ -140,6 +144,10 @@ if [ "$REBASE" = 1 ] && [ -n "${FAST:-}" ]; then
     echo "--rebaseline cannot go with FAST (CI's subset): run the whole matrix, or name the cases with ONLY" >&2
     exit 2
 fi
+if [ "$REBASE" = 1 ] && [ -n "${NATIVE_CXXFLAGS:-}" ]; then
+    echo "--rebaseline cannot go with NATIVE_CXXFLAGS: baselines are recorded from the default native build" >&2
+    exit 2
+fi
 cd "$(dirname "$0")/.."
 T0=$(date +%s)
 BASE=tests/ocean_baseline
@@ -174,6 +182,7 @@ GPP_VER=$(g++ -dumpversion); EM_VER=$(em++ --version | head -1 | sed 's/.*) //')
 echo "== tree: $(git rev-parse --abbrev-ref HEAD 2>/dev/null) $(git rev-parse --short HEAD 2>/dev/null)," \
      "$(git status --porcelain 2>/dev/null | wc -l) changed/untracked path(s)"
 echo "== building (g++ $GPP_VER, $EM_VER)"
+[ -n "${NATIVE_CXXFLAGS:-}" ] && echo "   native extra flags: $NATIVE_CXXFLAGS"
 TIMEV=(); [ -x /usr/bin/time ] && /usr/bin/time -v true > /dev/null 2>&1 && TIMEV=(/usr/bin/time -v)
 build () {  # build LABEL CMD...   (rc in build_LABEL.rc; peak RSS in build_LABEL.time when /usr/bin/time exists)
     local label=$1; shift
@@ -191,10 +200,12 @@ echo "   (at most $BUILD_JOBS compiler job(s) at once)"
 for v in $VARIANTS; do
     # binaries: plain = opd_native / opd_wasm.js / ocean_tests_*; eye = *_eye
     if [ $v = eye ]; then F="$CXXFLAGS -DEVO_OCEAN_EYE"; S=_eye; else F="$CXXFLAGS"; S=; fi
-    bgbuild driver_native$S g++ $F tools/ocean_parity_driver.cpp -o "$OUT/opd_native$S"
+    # shellcheck disable=SC2086
+    bgbuild driver_native$S g++ $F ${NATIVE_CXXFLAGS:-} tools/ocean_parity_driver.cpp -o "$OUT/opd_native$S"
     bgbuild driver_wasm$S   em++ $F $EMFLAGS tools/ocean_parity_driver.cpp -o "$OUT/opd_wasm$S.js"
     if [ -z "${NO_TESTS:-}" ]; then
-        bgbuild tests_native$S g++ $F tests/ocean_tests.cpp -o "$OUT/ocean_tests_native$S"
+        # shellcheck disable=SC2086
+        bgbuild tests_native$S g++ $F ${NATIVE_CXXFLAGS:-} tests/ocean_tests.cpp -o "$OUT/ocean_tests_native$S"
         bgbuild tests_wasm$S   em++ $F $EMFLAGS tests/ocean_tests.cpp -o "$OUT/ocean_tests_wasm$S.js"
     fi
 done
