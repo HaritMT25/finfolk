@@ -2061,7 +2061,7 @@ cases = {
     "core order": (design(cores=[["p4", [f"p{t:02d}" for t in range(12)]], ["np", [f"n{t:02d}" for t in range(12)]]]),
                    "home predator counts"),
     "derived seeds": ({k: v for k, v in design().items() if k != "seed_scheme"}, "seed namespace"),
-    "off only": (design(conditions={"off": 0}, seed_scheme=dict(SCH, assays=["off"])), "lacks assay predA4"),
+    "off only": (design(conditions={"off": 0}, seed_scheme=dict(SCH, assays=["off"])), "primary trajectories are registered"),
 }
 for nm, (d, why) in cases.items():
     p = probs(d)
@@ -2072,7 +2072,18 @@ d = design(); d["snapshots"] = snaps(pred_np=4)
 assert any("home predator counts" in x for x in probs(d)), probs(d)
 def bump(cells):
     cells[17]["donor_seed"] += 1
-assert any("donor_seed not the indexed allocation" in x for x in probs(design(), bump)), probs(design(), bump)
+assert any("donor_seed not the confirm-v1 manifest's" in x for x in probs(design(), bump)), probs(design(), bump)
+# review of #49, round 2 (Codex's alias case): every resident j = 0 and both cores h = 0 - u = r, slot 3e9 + r,
+# donor 3.1e9 + 12 r, predator 3.2e9 + r, reseed 3.3e9 + 2 r + a - keeps every inferred index consistent; it must
+# fail the bijections cores <-> h and members <-> j
+def alias(cells):
+    for c in cells:
+        r = c["replicate"]
+        a = 0 if c["condition"] == "off" else 1
+        c.update(slot_seed=3000000000 + r, donor_seed=3100000000 + 12 * r, reseed=3300000000 + 2 * r + a,
+                 pred_seed=3200000000 + r if a else None)
+p = probs(design(), alias)
+assert any("cores and h are not a bijection" in x for x in p) and any("not a bijection onto 0..11" in x for x in p), p
 PY
 
 # 41. review of #49, finding 2: a passed gate is a complete, consistent chain. gate.verify_record re-reads the
@@ -2082,30 +2093,54 @@ PY
 $PY - "$T" <<'PY' || fail "the gate record's chain verification"
 import hashlib, json, os, shutil, sys
 sys.path.insert(0, sys.argv[1]); import gate
-s, p = gate.verify_record("g37", require_formal=False)
-assert len(p) == 2 and "not 'pass'" in p[0] and "acceptance rule FAILS" in p[1], p
+RC = json.load(open("g37/receipt.json"))["receipt"]      # (the coordinator records it outside the directory)
+s, p = gate.verify_record("g37", require_formal=False, receipt_sha=RC)
+assert len(p) == 2 and "not 'pass'" in p[0] and "acceptance rule FAILS" in p[1] and s["receipt"] == RC, p
+q = gate.verify_record("g37", require_formal=False)[1]
+assert any("no external receipt" in x for x in q), q
+assert any("not the one recorded outside" in x for x in gate.verify_record("g37", False, "0" * 64)[1])
 def fresh():
     shutil.rmtree("g41", ignore_errors=True)
     shutil.copytree("g37", "g41")
 def rewrite(name, f):
     d = json.load(open(f"g41/{name}")); f(d); open(f"g41/{name}", "w").write(gate.canon(d))
-def check(why):
-    q = gate.verify_record("g41", require_formal=False)[1]
+def task(i, f):
+    t = json.load(open(f"g41/tasks/{i:05d}.json")); f(t); open(f"g41/tasks/{i:05d}.json", "w").write(json.dumps(t))
+def check(why, rc=RC):
+    q = gate.verify_record("g41", require_formal=False, receipt_sha=rc)[1]
     assert any(why in x for x in q), (why, q)
 fresh(); rewrite("decision.json", lambda d: d.update(decision="pass", reasons=[]))
-check("acceptance rule FAILS")
+check("acceptance rule FAILS"); check("differs from the one the evidence regenerates"); check("not the one recorded outside")
 fresh(); os.remove("g41/tasks/00003.json")
 check("task record(s) missing or invalid")
 fresh()
-t = json.load(open("g41/tasks/00000.json"))
-new = 0 if t["rej"]["claim"] else 1   # (a valid record with another count)
-t["rej"]["claim"] = new; t["rej05"]["claim"] = max(t["rej05"]["claim"], new)
-open("g41/tasks/00000.json", "w").write(json.dumps(t))
-check("criteria differ")
-fresh(); t = json.load(open("g41/tasks/00005.json")); t["run_sha256"] = "0" * 64; open("g41/tasks/00005.json", "w").write(json.dumps(t))
-check("another run")
+def flip(t):   # (a valid record with another count)
+    new = 0 if t["rej"]["claim"] else 1
+    t["rej"]["claim"] = new; t["rej"]["H1"] = max(t["rej"]["H1"], new); t["rej"]["H1b"] = max(t["rej"]["H1b"], new)
+    for k_ in ("H1", "H1b", "claim"):
+        t["rej05"][k_] = max(t["rej05"][k_], t["rej"][k_])
+task(0, flip)
+check("differs from the one the evidence regenerates")
+fresh(); task(5, lambda t: t.update(run_sha256="0" * 64)); check("another run")
+def impossible(t):   # 1 conjunction rejection with no H1 / H1b rejection
+    t["rej"].update(claim=1, H1=0, H1b=0); t["rej05"].update(claim=max(t["rej05"]["claim"], 1))
+fresh(); task(0, impossible); check("more conjunction rejections")
+fresh(); task(0, lambda t: t.update(built=False)); check("not built as registered")
+fresh(); task(19, lambda t: t["plants"]["0/0"].update(d_res=0.5)); check("plants are not the reference")
+fresh(); task(0, lambda t: t["fit_info"]["0/0"].update(sse=1.0)); check("source-fit reports are not the reference")
+outer = [t for t in json.load(open("g37/manifest.json"))["schedule"] if t[2] == "outer0"][0][0]
+def at05(t):   # another rej05 count for H1, still a valid record: no criterion changes, the diagnostics do
+    r5, r = t["rej05"]["H1"], t["rej"]["H1"]
+    t["rej05"]["H1"] = r5 + 1 if r5 + 1 <= t["n"] else max(r, r5 - 1)
+fresh(); task(outer, at05)
+q = gate.verify_record("g41", require_formal=False, receipt_sha=RC)[1]
+assert any("differs from the one the evidence regenerates" in x and "diagnostics" in x for x in q), q
 fresh(); rewrite("run.json", lambda d: d.update(platform="elsewhere"))
 check("run.json is not the one the decision bound")
+fresh(); rewrite("run.json", lambda d: d["bank"]["blocks"].update(sha256="0" * 64))
+check("the blocks file it binds is missing or changed")
+fresh(); rewrite("run.json", lambda d: d["bank"].update(inputs=None))
+check("no inputs binding")
 fresh()
 m = json.load(open("g41/manifest.json")); m["tools"]["calibrate.py"] = "0" * 64; txt = gate.canon(m)
 open("g41/manifest.json", "w").write(txt)
@@ -2113,11 +2148,19 @@ rewrite("decision.json", lambda d: d.update(manifest_sha256=hashlib.sha256(txt.e
 check("other tool sources: ['calibrate.py']")
 fresh(); rewrite("cell_laws.json", lambda d: d.update(run_sha256="0" * 64))
 check("cell_laws.json is not bound")
+fresh()
+def law(d):
+    d["rows"][5]["mean_achieved"] *= 1.01
+rewrite("cell_laws.json", law)
+cl_sha = hashlib.sha256(open("g41/cell_laws.json").read().encode()).hexdigest()
+rewrite("decision.json", lambda d: d.update(cell_laws_sha256=cl_sha))
+check("not the construction the bank export replays to"); check("incomplete or inexact laws")
+fresh(); open("g41/gate.md", "a").write("edited\n"); check("gate.md is not the report")
 shutil.rmtree("g41b", ignore_errors=True); os.makedirs("g41b")
 shutil.copy("g37/decision.json", "g41b/decision.json"); shutil.copy("g37/manifest.json", "g41b/manifest.json")
-q = gate.verify_record("g41b", require_formal=False)[1]
+q = gate.verify_record("g41b", require_formal=False, receipt_sha=RC)[1]
 assert any("run.json: missing" in x for x in q), q
-assert any("exploratory" in x for x in gate.verify_record("g37")[1])
+assert any("exploratory" in x for x in gate.verify_record("g37", receipt_sha=RC)[1])
 PY
 
 # 44. review of #49, finding 5: the prescribed diagnostics are part of validity - completed, constructed, every
@@ -2302,7 +2345,105 @@ assert all(out[k][0] for k in good), [k for k in good if not out[k][0]]
 assert not any(out[k][0] for k in bad), [k for k in bad if out[k][0]]
 assert out["interior"][1] < 1e-9 and all(out[k][1] > 1 for k in bad)
 f = bounded.fit(H, "logistic", [40.0] + [0.0] * (2 * N - 2))
-assert not f["converged"] and f["saturated_sse"] > 30 and "sat_d" in bounded.FIT_FREEZE, f["reason"]
+assert not f["converged"] and f["saturated_sse"] > 30 and "stat_ridge" in bounded.FIT_FREEZE, f["reason"]
+PY
+# ... and review of #49, round 2: (A) a0 = +25, a11 = -25 with targets 0.5 (SSE 5.5, derivatives 1.4e-11: the
+#     global ridge used to hide those directions) is NOT converged; (B) Codex's rectangle - a finite local minimum
+#     whose residual sits partly on a saturated cell (score exactly 0) - IS converged. Checked against an
+#     INDEPENDENT reference that shares no code with bounded.py: its own model and derivative (tanh / cosh), an
+#     overparametrized (mu, a_0..11, b_0..11) form, its own Cholesky and Gauss-Newton with line search
+$PY - "$T" <<'PY' || fail "the fitting classifier against Codex's round-2 fixtures and an independent reference"
+import math, random, sys
+sys.path.insert(0, sys.argv[1]); import bounded
+N = 12
+cells = bounded._cells(N)
+model = bounded.Model("logistic", N)
+def rsig(x):
+    return 0.5 * (1.0 + math.tanh(0.5 * x))
+def rdsig(x):
+    c = math.cosh(0.5 * x) if abs(x) < 1400 else float("inf")
+    return 1.0 / (4.0 * c * c)
+def reval(th, Y):
+    mu, a, b = th[0], th[1:1 + N], th[1 + N:]
+    r, Jr = [], []
+    for (i, j) in cells:
+        e = mu + a[i] + b[j]
+        r.append(Y[(i, j)] - rsig(e))
+        d = rdsig(e)
+        row = [0.0] * (1 + 2 * N)
+        row[0], row[1 + i], row[1 + N + j] = d, d, d
+        Jr.append(row)
+    return r, Jr
+def rsse(th, Y):
+    return sum(x * x for x in reval(th, Y)[0])
+def rchol_solve(A, bv):
+    n = len(A)
+    L = [[0.0] * n for _ in range(n)]
+    for i in range(n):
+        for j in range(i + 1):
+            s = A[i][j] - sum(L[i][k] * L[j][k] for k in range(j))
+            L[i][j] = math.sqrt(s) if i == j else s / L[j][j]
+    z = [0.0] * n
+    for i in range(n):
+        z[i] = (bv[i] - sum(L[i][k] * z[k] for k in range(i))) / L[i][i]
+    x = [0.0] * n
+    for i in reversed(range(n)):
+        x[i] = (z[i] - sum(L[k][i] * x[k] for k in range(i + 1, n))) / L[i][i]
+    return x
+def rgn(th, Y, iters=400, lam=1e-8):
+    S = rsse(th, Y)
+    for _ in range(iters):
+        r, Jr = reval(th, Y)
+        P = len(th)
+        A = [[sum(row[p] * row[q] for row in Jr) + (lam if p == q else 0.0) for q in range(P)] for p in range(P)]
+        step = rchol_solve(A, [sum(row[p] * ri for row, ri in zip(Jr, r)) for p in range(P)])
+        t = 1.0
+        while t > 1e-12:
+            thn = [x + t * s for x, s in zip(th, step)]
+            Sn = rsse(thn, Y)
+            if Sn < S:
+                break
+            t *= 0.5
+        if t <= 1e-12 or S - Sn <= 1e-15 * max(S, 1e-300):
+            return th, S
+        th, S = thn, Sn
+    return th, S
+def rscore(th, Y):
+    r, Jr = reval(th, Y)
+    S = sum(x * x for x in r)
+    return max(sum(row[p] * ri for row, ri in zip(Jr, r)) ** 2 / sum(row[p] ** 2 for row in Jr) / S for p in range(len(th)))
+def bth(mu, a, b):
+    ma, mb = sum(a) / N, sum(b) / N
+    return [mu + ma + mb] + [x - ma for x in a[:N - 1]] + [x - mb for x in b[:N - 1]]
+YA = {c: 0.5 for c in cells}
+aA = [25.0] + [0.0] * 10 + [-25.0]
+rA = bounded.lm(model, cells, [YA[c] for c in cells], bth(0.0, aA, [0.0] * N), iters=0)
+assert not rA[2] and abs(rA[1] - 5.5) < 1e-6, (rA[2], rA[1])
+assert rsse([0.0] * (1 + 2 * N), YA) == 0.0 and rscore([0.0] + aA + [0.0] * N, YA) > 0.4   # (independently: not a minimum)
+aB = [15.0] + [0.0] * (N - 1)
+bB = [0.0, 15.0] + [0.0] * (N - 2)
+d01 = rdsig(30.0)
+rr = {(0, 1): -0.5, (0, 3): d01 / (2 * rdsig(15.0)), (2, 1): d01 / (2 * rdsig(15.0)), (2, 3): -2 * d01}
+YB = {(i, j): rsig(aB[i] + bB[j]) + rr.get((i, j), 0.0) for (i, j) in cells}
+assert all(0.0 <= v <= 1.0 for v in YB.values())
+rB = bounded.lm(model, cells, [YB[c] for c in cells], bth(0.0, aB, bB), iters=0)
+assert rB[2] and abs(rB[1] - 0.25) < 1e-9, (rB[2], rB[1], rB.stationarity)
+thB = [0.0] + aB + bB
+SB = rsse(thB, YB)
+rnd = random.Random(7)
+for _ in range(200):          # (independently: every nearby point is worse - a local minimum)
+    for h in (1e-3, 1e-2):
+        d = [rnd.gauss(0, 1) for _ in thB]
+        nd = math.sqrt(sum(x * x for x in d))
+        assert rsse([x + h * y / nd for x, y in zip(thB, d)], YB) >= SB - 1e-15
+assert rgn(list(thB), YB)[1] >= SB - 1e-12
+rnd = random.Random(42)
+a = [rnd.gauss(0, 0.8) for _ in range(N)]
+b = [rnd.gauss(0, 0.6) for _ in range(N)]
+YI = {(i, j): min(1, max(0, bounded.sigmoid(-2.3 + a[i] + b[j]) + rnd.gauss(0, 0.01))) for (i, j) in cells}
+fI = bounded.fit([[YI[(i, j)] if i != j else None for j in range(N)] for i in range(N)], "logistic")
+_, SR = rgn([-2.3] + [0.0] * (2 * N), YI)
+assert fI["converged"] and abs(fI["sse"] - SR) / SR < 1e-9, (fI["sse"], SR)
 PY
 
 # 43. review of #49, finding 4: the Beta part's variance without cancellation (mu 0.5, v 1e-18 used to become
@@ -2324,6 +2465,56 @@ assert abs((x - 0.5) / 1e-9 - 1.959964) < 1e-4, x
 q = calibrate.BetaQuantile(2e5, 5e5)
 for u in (1e-6, 0.01, 0.3, 0.5, 0.99, 1 - 1e-6):
     assert abs(q(u, 1 - u) - calibrate._beta_quantile_cf(2e5, 5e5, u, 1 - u)) < 5e-10, u
+PY
+# ... and review of #49, round 2: the table spans EXACTLY s = logit u in [-36, 36] (its endpoints solved), so a
+#     valid concentrated law (mu 0.5, v 0.25 / 18,000,001: shapes 9e6, below the Cornish-Fisher cutoff) is a
+#     small table - it used to keep its bracketing overshoot to |s| ~ 557,000, ~2.2 million nodes - and the
+#     quantile beyond |s| = 36 is solved exactly
+$PY - "$T" <<'PY' || fail "the quantile table's registered domain"
+import math, sys, time
+sys.path.insert(0, sys.argv[1]); import bounded, calibrate
+m = calibrate.marginal(0.5, 0.25 / 18000001)
+assert m["kind"] == "beta" and abs(m["alpha"] - 9e6) < 1 and abs(m["beta"] - 9e6) < 1, m
+t0 = time.time()
+q = calibrate.BetaQuantile(m["alpha"], m["beta"])
+assert len(q.s) <= 2000 and time.time() - t0 < 60 and q.floor_hits == 0, (len(q.s), q.floor_hits)
+assert abs(q.s[0] + 36.0) <= 1e-9 and abs(q.s[-1] - 36.0) <= 1e-9, (q.s[0], q.s[-1])
+for u in (1e-30, 1e-20, 1e-14, 1e-6, 0.3, 0.5, 0.9, 1 - 1e-9):
+    s = math.log(u) - math.log1p(-u)
+    assert abs(q(u, 1 - u) - bounded.sigmoid(q.exact_t(s))) < 1e-9, u
+for a, b in ((0.05, 3.0), (2.0, 2.0), (0.8, 0.02)):
+    q = calibrate.BetaQuantile(a, b)
+    assert abs(q.s[0] + 36.0) <= 1e-9 and abs(q.s[-1] - 36.0) <= 1e-9 and len(q.s) < 5000, (a, b, len(q.s))
+PY
+
+# 49. review of #49, round 2, finding 5: a required noiseless refit of the CLIPPED NULL that does not converge
+#     leaves the plant unconstructed (it used to be ignored: only its d_res was kept), and the gate's validity fails
+$PY - "$T" <<'PY' || fail "an unconverged clipped-null refit"
+import copy, json, random, sys
+sys.path.insert(0, sys.argv[1]); import calibrate, gate, infer
+rnd = random.Random(49)
+N = 12
+par = {"mu": -2.3, "a": [rnd.gauss(0, 0.8) for _ in range(N)], "b": [rnd.gauss(0, 0.6) for _ in range(N)]}
+eta, mean0, th0 = calibrate._ladder(par, list(range(N)), N)
+v = infer.cycle_template(N, "diffuse", seed=5)
+ok = calibrate.feasible_plant(eta, mean0, th0, v, 0.01)
+assert ok["solved"] and ok["clip0_converged"] is True
+pd0 = calibrate.plant_diagnostics
+calls = []
+def pd(m, m0, th):
+    out = pd0(m, m0, th)
+    calls.append(1)
+    return out[:2] + ((False,) if len(calls) == 1 else (out[2],)) + out[3:]   # only the first (c = 0) refit fails
+calibrate.plant_diagnostics = pd
+x = calibrate.feasible_plant(eta, mean0, th0, v, 0.01)
+calibrate.plant_diagnostics = pd0
+assert not x["solved"] and x["clip0_converged"] is False and "clipped null" in x["failure"], x.get("failure")
+man = json.load(open("g37/manifest.json"))
+res = {t[0]: json.load(open(f"g37/tasks/{t[0]:05d}.json")) for t in man["schedule"]}
+agg = gate.aggregate(res, man["schedule"])
+agg[("L", "target")]["plants"]["0/1"]["clip0_converged"] = False
+v_ = [c for c in gate.decide_gate(agg, None, False, [])[0] if c["criterion"] == "validity"][0]
+assert not v_["ok"] and any("target plant 0/1" in p for p in v_["problems"]), v_
 PY
 
 # 19. self-tests of the inference and bounded-scale modules
