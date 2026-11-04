@@ -70,6 +70,16 @@
 #      legacy cell's snapshot has moved;
 #  31. the registered bank is the approved plan with its policies (state, predators); a failed plant
 #      construction or source fit is a counted power failure, never power at the target.
+#  Preregistered calibration gate (the round-5 "not in this PR" list):
+#  33. the registered bounded marginal law (exact moments or failure; Bernoulli / point mass; alternatives
+#      keep v / (mu (1 - mu)); the exact quantile);
+#  34. the joint bounded worlds J0, J8, R05-D, R05-C, R01-D, R01-C;
+#  35. the registered plant (probability scale, grid first crossing + bisection, 1e-4 relative);
+#  36. one invalid-dataset path (saturated fits, failed projections, non-finite results: unavailable; the
+#      gate screen counts an unavailable null decision as a rejection);
+#  37. gate.py: the frozen manifest before any computation, the schedule and seeds, refusals, the decision;
+#  38. the bank's original identity (item IDs, snapshot hashes, all 28,800 cells);
+#  39. the headline claim: strict registration, a passed gate, T only; the prose; the confirmation seeds.
 set -u
 BIN=${1:?usage: invasion_tooling.sh EVO_BOIDS WORKDIR}
 W=${2:?usage: invasion_tooling.sh EVO_BOIDS WORKDIR}
@@ -887,7 +897,8 @@ pbs = {(p["group"], p["cond"]): p for p in json.load(open("bank24.json"))["prima
 zq = [[pbs[(g, c)]["zq"] for c in ("off", "predA4")] for g in ("np", "p4")]
 calibrate.G.update({"bank_zq": zq})
 seen = []
-calibrate._zib = lambda rnd, mu, sd: seen.append((mu, sd)) or min(max(mu + 0.01 * rnd.random(), 0.0), 1.0)
+import math
+calibrate.draw_marginal = lambda rnd, m: seen.append((m["mu"], math.sqrt(m["v_req"]))) or min(max(m["mu"] + 0.01 * rnd.random(), 0.0), 1.0)
 calibrate.task_compound((None, 4, 3, 2, 1, "null", 9))
 exp = []
 for g in range(2):
@@ -1009,8 +1020,17 @@ for g in ("np", "p4"):
 good = {"schema": "finfolk.invasion.blocks/2", "plan_sha256": sha, "analysis_sha256": "x", "clock": "steps",
         "blocks": [], "primary_blocks": pbs}
 json.dump(good, open("bank26.json", "w"))
+cells = [json.loads(l) for l in open("plan26.jsonl")]
+registry = {}
+for c in cells:
+    registry.setdefault(c["core"], {})[c["resident_name"]] = c["resident_sha256"]
 json.dump({"items": 4, "K": 12, "plan_sha256": sha, "state": "slot", "predators": {"off": 0, "predA4": 4},
-           "steps": 13500}, open("spec26.json", "w"))
+           "steps": 13500, "registry": registry, "cells": len(cells)}, open("spec26.json", "w"))
+# (prereg gate) the bank analysis' inputs.json, beside the export: every registered cell finished, the files read
+json.dump({"plan": {"sha256": sha, "cells": len(cells)}, "clock": "steps", "complete": True, "registered_missing": [],
+           "unregistered_finished": [], "identity_problems": [], "finished": len(cells), "cells_csv": {"cells": len(cells)},
+           "snapshots": {nm: h for v in registry.values() for nm, h in v.items()}, "analysis_code": {"analyze.py": "x"}},
+          open("inputs.json", "w"))
 def variant(name, f):
     b = json.loads(json.dumps(good)); f(b); json.dump(b, open(name, "w"))
 variant("bank26_offonly.json", lambda b: b.update(primary_blocks=[p for p in b["primary_blocks"] if p["cond"] == "off"]))
@@ -1082,7 +1102,7 @@ for g in range(2):
 zq = [[pbs[(g, c)] for c in range(2)] for g in range(2)]
 calibrate.G.update({"bank_zq": zq})
 seen = []
-calibrate._zib = lambda rnd_, mu, sd: seen.append(mu) or mu
+calibrate.draw_marginal = lambda rnd_, m: seen.append(m["mu"]) or m["mu"]
 calibrate.task_compound((None, 4, 3, 2, 1, "null", 9))
 exp = []
 for g in range(2):
@@ -1104,7 +1124,7 @@ assert abs(m - 2e-5) < 5 * 2e-5 / math.sqrt(n), m
 for mu, sd in ((2e-5, 2e-5), (0.01, 0.001), (0.02, 0.03), (0.3, 0.2), (0.7, 0.01), (0.5, 0.0)):
     z = calibrate.zib_moments(mu, sd)
     assert abs((1 - z["pz"]) * z["mb"] - mu) <= 1e-15 * mu and abs(z["sd"] - sd) <= 1e-9 * max(sd, 1e-12) and not z["capped"], (mu, sd, z)
-z = calibrate.zib_moments(0.3, 0.47)       # beyond the Bernoulli-type bound: capped, flagged, mean kept
+z = calibrate.zib_moments(0.3, 0.47)       # beyond the Bernoulli bound: the pilot-sourced world caps it, flagged, mean kept
 assert z["capped"] and z["sd"] < 0.47 and abs((1 - z["pz"]) * z["mb"] - 0.3) < 1e-15, z
 PY
 $PY "$T/calibrate.py" --blocks an3/blocks.json --key off/0.1/0.25 --out cal27 --sims 0 --bank bank26.json \
@@ -1119,8 +1139,10 @@ for t in (0.01, 0.02, 0.03):
     lab = f"bounded ladder + feasible plant d_res={t} in all conditions"
     r = d[("d_res: noiseless logistic-residual RMS per planted condition", lab)]
     assert abs(float(r["min"]) - t) <= calibrate.PLANT_TOL * t and abs(float(r["max"]) - t) <= calibrate.PLANT_TOL * t, r
-    assert float(d[("clipped cells per planted condition", lab)]["max"]) == 0
+    assert ("clipped cells per planted condition", lab) in d
     assert rows[(f"plant at its target (feasible family: solved; refits converged): {lab}", "null", "0.95")]["x"] == "2"
+    # (prereg gate: the registered plant is the probability-scale one, so it may clip; what it clipped is exported)
+    assert ("d_res of the clipped null alone (c -> 0+)", lab) in d and ("plant amplitude c (probability scale)", lab) in d
 for t in (0.01, 0.02, 0.03):
     lab = f"bounded ladder + d_C={t} in all conditions"
     assert ("d_add: RMS added circulation per planted condition", lab) in d and ("d_res: noiseless logistic-residual RMS per planted condition", lab) in d
@@ -1149,7 +1171,8 @@ for c in ("off", "predA"):
                     rows.append({"cond": c, "frac": 0.05, "G": 13500.0, "mode": mode, "i": i, "j": j, "rep": r,
                                  "s": q - 0.05 + rnd.gauss(0, 0.003), "f0": 0.05, "missed": False})
 pr, pb, pj = analyze.primary_blocks(rows, None, reg, cores, 49, bsims=9)
-assert pj[0]["status"] == "formal" and pj[0]["claim_beyond_bounded"] is True and pj[0]["h1b_valid"], pj   # the data reject
+assert pj[0]["status"] == "formal" and pj[0]["both_rejected"] is True and pj[0]["h1b_valid"], pj   # the data reject
+assert pj[0]["claim_beyond_bounded"] is None and "no calibration gate record" in pj[0]["claim_status"], pj   # (prereg gate)
 lm0 = bounded.lm
 bounded.lm = lambda model, cells, y, th0, iters=200, tol=1e-11: lm0(model, cells, y, th0, 1, tol)   # unfinished fits
 pr, pb, pj = analyze.primary_blocks(rows, None, reg, cores, 49, bsims=9)
@@ -1474,7 +1497,7 @@ def run(tag):
     return cnt, n
 cnt, n = run("ok")                                   # the plant is detectable when it is built
 assert cnt[("claim: H1 and H1b", lab, 0.05)] >= 3, cnt[("claim: H1 and H1b", lab, 0.05)]
-fail_key = f"world not built as registered (source fit or plant failed; counted as a failure): {lab}"
+fail_key = f"world not built as registered (source fit, law or plant failed; counted as a failure): {lab}"
 cases = {
     "an unsolved plant (iteration limit)": lambda: setattr(calibrate, "feasible_plant", lambda *a, **k: fp0(*a, **dict(k, iters=1))),
     "an unconverged noiseless refit": lambda: setattr(calibrate, "plant_diagnostics", lambda *a: pd0(*a)[:2] + (False,) + pd0(*a)[3:]),
@@ -1490,7 +1513,7 @@ for what, patch in cases.items():
                                                "H1b logistic residual sign-flip omnibus") for a in A), (what, cnt[("claim: H1 and H1b", lab, 0.05)])
     assert cnt.get((fail_key, "null", 0.95)) == n == 4, (what, cnt.get((fail_key, "null", 0.95)))
     if what == "an unconverged source fit":   # the whole world is invalid, null included
-        assert cnt[("world not built as registered (source fit or plant failed; counted as a failure): bounded ladder", "null", 0.95)] == n
+        assert cnt[("world not built as registered (source fit, law or plant failed; counted as a failure): bounded ladder", "null", 0.95)] == n
 PY
 
 # 32. quick check of round 5 (P2): a failed directory fsync must not leave replay dependencies cached as
@@ -1527,6 +1550,459 @@ ev.clear()
 run.durability_barrier(root, [h])
 assert ev == [], ev
 PY
+
+# 33. prereg gate, review round 5 items 5 / 6: the registered bounded marginal law. Exact feasible moments
+#     (the old law capped mu 0.5 / SD 0.49 at SD 0.47434), the zero mass as registered, a point mass at
+#     v = 0, Bernoulli at v = mu (1 - mu), FAILURE on an invalid specification (no cap), alternatives that keep
+#     v / (mu (1 - mu)), and a quantile function that is the exact inverse (the joint worlds need it)
+$PY - "$T" <<'PY' || fail "the registered bounded marginal law"
+import math, random, sys
+sys.path.insert(0, sys.argv[1]); import bounded, calibrate, hodge
+for mu, v in ((0.5, 0.49 ** 2), (0.3, 0.04), (0.01, 1e-6), (2e-5, 4e-10), (0.02, 9e-4), (0.7, 1e-4), (0.002, 0.0019)):
+    m = calibrate.marginal(mu, v)
+    mm, vv = calibrate.marginal_moments(m)
+    assert m["valid"] and not m["capped"] and abs(mm - mu) <= 1e-13 * mu and abs(vv - v) <= 1e-9 * v, (mu, v, m)
+m = calibrate.marginal(0.01, 1e-4)
+assert abs(m["p0"] - min(0.05, 1e-4 / (2 * (1e-4 + 1e-4)))) < 1e-15 and calibrate.marginal(0.04, 1e-4)["p0"] == 0.0
+assert calibrate.marginal(0.4, 0.0)["kind"] == "point"
+b = calibrate.marginal(0.3, 0.21)
+assert b["kind"] == "bernoulli" and calibrate.marginal_moments(b) == (0.3, 0.21), b
+bad = calibrate.marginal(0.3, 0.2209)
+assert not bad["valid"] and "infeasible" in bad["reason"] and calibrate.marginal(0.3, 0.2209, cap=True)["capped"]
+assert not calibrate.marginal(0.0, 0.0)["valid"] and not calibrate.marginal(0.5, -1e-9)["valid"]
+assert not hasattr(calibrate, "ZIB_VMAX")
+alt = calibrate.marginal_alt(0.1, 0.0045, 0.2)
+assert alt["valid"] and abs(alt["v"] - 0.0045 / 0.09 * 0.16) < 1e-15, alt
+rnd = random.Random(33)
+n = 100000
+for law in (b, calibrate.marginal(0.5, 0.49 ** 2), calibrate.marginal(0.01, 1e-4)):
+    xs = [calibrate.draw_marginal(rnd, law) for _ in range(n)]
+    mu, v = calibrate.marginal_moments(law)
+    m_ = sum(xs) / n
+    v_ = sum((x - m_) ** 2 for x in xs) / (n - 1)
+    assert abs(m_ - mu) < 5 * math.sqrt(v / n) and abs(v_ / v - 1) < 0.05, (law["kind"], m_, mu, v_, v)
+for a, bb in ((0.05, 3.0), (2.0, 2.0), (900.0, 1100.0), (0.8, 0.02)):
+    q = calibrate.BetaQuantile(a, bb)
+    for u in (1e-14, 1e-6, 0.01, 0.37, 0.5, 0.93, 1 - 1e-9):
+        x = q(u, 1 - u)
+        xe = bounded.sigmoid(q.exact_t(math.log(u) - math.log1p(-u)))
+        assert abs(x - xe) < 1e-9, (a, bb, u, x, xe)
+        if 0.01 <= u <= 0.93 and bb > 0.1:   # (an independent CDF; Beta(0.8, 0.02) puts u = 0.37 at 1 - 1.4e-10,
+            assert abs(hodge.betainc(a, bb, x) - u) < 1e-9, (a, bb, u, hodge.betainc(a, bb, x))   # finer than a double)
+PY
+
+# 34. review round 5 item 8: the six joint bounded worlds. Through the copula the uniforms stay exactly uniform
+#     (so every marginal is the registered law), J0's assays are latently independent and J8's correlated
+#     (Spearman 6/pi asin(0.4) = 0.786), within an assay the column factor loads (-1)^i, and the rare event is
+#     shared across assays: in R05-D even invaders sit in their top 5% and odd ones in their bottom 5% together
+#     in ~pi of the columns; R05-C touches only resident 0's invaders 1 (low) and 2 (high)
+$PY - "$T" <<'PY' || fail "the joint stress worlds"
+import math, random, sys
+sys.path.insert(0, sys.argv[1]); import calibrate
+assert sorted(calibrate.JOINT_WORLDS) == ["J0", "J8", "R01-C", "R01-D", "R05-C", "R05-D"]
+calibrate.quantile_marginal = lambda m, lo, hi: lo          # observe the uniforms themselves
+laws = [[None] * 5 for _ in range(2)]
+rnd = random.Random(34)
+def rank_corr(x, y):
+    n = len(x)
+    rx = {v: i for i, v in enumerate(sorted(x))}
+    ry = {v: i for i, v in enumerate(sorted(y))}
+    a, b = [rx[v] for v in x], [ry[v] for v in y]
+    ma, mb = sum(a) / n, sum(b) / n
+    return sum((p - ma) * (q - mb) for p, q in zip(a, b)) / math.sqrt(sum((p - ma) ** 2 for p in a) * sum((q - mb) ** 2 for q in b))
+n = 20000
+for name, w in calibrate.JOINT_WORLDS.items():
+    for p in (0, 3):
+        qs = [calibrate.joint_column(rnd, laws, p, w["kappa"], w["rare"]) for _ in range(n)]
+        for c in range(2):
+            for i in range(5):
+                if i == p:
+                    continue
+                u = [q[c][i] for q in qs]
+                m, v = sum(u) / n, sum((x - 0.5) ** 2 for x in u) / n
+                assert abs(m - 0.5) < 5 * math.sqrt(1 / 12 / n) and abs(v * 12 - 1) < 0.04, (name, p, c, i, m, v)
+        i1 = 1 if p != 1 else 2
+        cross = rank_corr([q[0][i1] for q in qs], [q[1][i1] for q in qs])
+        within = rank_corr([q[0][i1] for q in qs], [q[0][i1 + 1 if i1 + 1 != p else i1 + 2] for q in qs])
+        want = 6 / math.pi * math.asin(w["kappa"] / 2)
+        if w["rare"] is None:
+            assert abs(cross - want) < 0.03 and within < -0.7, (name, cross, want, within)
+        if w["rare"] is not None:
+            pi_ = w["rare"]["pi"]
+            if w["rare"]["where"] == "distributed" or p == 0:
+                sel = [i for i in range(5) if calibrate.rare_selected(w["rare"]["where"], p, i)]
+                both = sum(all((q[c][i] >= 1 - pi_) if i % 2 == 0 else (q[c][i] <= pi_) for c in range(2) for i in sel)
+                           for q in qs) / n
+                assert abs(both - pi_) < 4 * math.sqrt(pi_ / n) + 0.004, (name, p, both, pi_)
+            else:   # concentrated: other columns are plain J8 (no event at all)
+                assert not any(calibrate.rare_selected("concentrated", p, i) for i in range(5))
+assert calibrate.rare_selected("concentrated", 0, 1) and calibrate.rare_selected("concentrated", 0, 2) \
+    and not calibrate.rare_selected("concentrated", 0, 3) and not calibrate.rare_selected("concentrated", 1, 2)
+PY
+
+# 35. review round 5 item 7: the registered plant. Probability scale, clipped to [0.002, 0.998], amplitude c at
+#     the FIRST grid crossing of d_res >= target on 0, 0.001, ..., 1 then bisection to 1e-4 relative; the null
+#     untouched; an unreachable target is not solved (never silently weakened)
+$PY - "$T" <<'PY' || fail "the registered plant construction"
+import random, sys
+sys.path.insert(0, sys.argv[1]); import bounded, calibrate, infer
+rnd = random.Random(35)
+N = 12
+par = {"mu": -2.3, "a": [rnd.gauss(0, 0.8) for _ in range(N)], "b": [rnd.gauss(0, 0.6) for _ in range(N)]}
+eta, mean0, th0 = calibrate._ladder(par, list(range(N)), N)
+keep = [row[:] for row in mean0]
+v = infer.cycle_template(N, "diffuse", seed=5)
+for target in (0.01, 0.02):
+    x = calibrate.feasible_plant(eta, mean0, th0, v, target)
+    assert x["solved"] and x["converged"] and abs(x["d_res"] - target) <= calibrate.PLANT_TOL * target, x["d_res"]
+    m = x["grid_m"]
+    assert m and (m - 1) / calibrate.PLANT_GRID < x["c"] <= m / calibrate.PLANT_GRID, (m, x["c"])
+    if m > 1:   # the crossing is the first one on the grid
+        lo = calibrate.nominal_plant(mean0, v, (m - 1) / calibrate.PLANT_GRID)[0]
+        assert calibrate.plant_diagnostics(lo, mean0, th0)[1] < target
+    want, ncl, _, _ = calibrate.nominal_plant(mean0, v, x["c"])
+    assert x["mean"] == want and x["clipped"] == ncl, "the alternative is the clipped probability-scale plant at c"
+assert mean0 == keep
+calibrate.PLANT_GRID = 20   # (a coarse grid only to keep this check short: no crossing anywhere on [0, 1])
+far = calibrate.feasible_plant(eta, mean0, th0, v, 5.0)
+assert not far["solved"] and far["grid_m"] is None and far["evals"] == 21, (far["d_res"], far["evals"])
+PY
+
+# 36. review round 5 items 4 / 10: one invalid-dataset path. A saturated plateau (every logit 30, targets 0.5:
+#     tiny gradient, SSE 33) is no longer 'converged'; every fit reports its termination reason, gradient and
+#     stationarity; a failed projection or a non-finite result makes H1b UNAVAILABLE instead of aborting (the
+#     analysis and a calibration dataset alike); the gate screen counts an unavailable null decision as a
+#     REJECTION and an unavailable alternative as a FAILURE, beside the raw procedure rate
+$PY - "$T" <<'PY' || fail "one invalid-dataset path"
+import json, math, random, sys
+sys.path.insert(0, sys.argv[1]); import analyze, bounded, calibrate
+model, cells = bounded.Model("logistic", 12), bounded._cells(12)
+r = bounded.lm(model, cells, [0.5] * len(cells), [30.0] + [0.0] * 22)
+assert r[2] is False and r[1] > 30 and r.grad < 1e-9 and r.stationarity > 0.5, (r[2], r[1], r.grad, r.stationarity)
+assert "stat_tol" in bounded.FIT_FREEZE and bounded.FIT_FREEZE["iters"] == 200 and bounded.FIT_FREEZE["tol"] == 1e-11
+pbs = {(p["group"], p["cond"]): p for p in json.load(open("bank26.json"))["primary_blocks"]}
+groups = [[pbs[(g, c)]["zq"] for c in ("off", "predA4")] for g in ("np", "p4")]
+f = bounded.fit_matrix(groups[0][0])
+assert f["converged"] and f["reason"] in ("tol", "exact", "step", "damping", "cap") and f["grad"] is not None and f["stationarity"] is not None
+ok = calibrate.decide(groups)
+assert ok["valid"] and ok["conj"] is not None, ok
+inv0 = bounded._inverse
+bounded._inverse = lambda M: (_ for _ in ()).throw(ValueError("singular"))
+ro = bounded.residual_omnibus(groups)
+dec = calibrate.decide(groups)
+bounded._inverse = inv0
+assert not ro["valid"] and ro["p_flip"] is None and "projection failed" in ro["invalid"], ro["invalid"]
+assert dec["conj"] is None and dec["p1b"] is None and not dec["valid"] and dec["p1"] is not None, dec
+nan = json.loads(json.dumps(groups))
+nan[1][1][2][3][0] = float("nan")
+dn = calibrate.decide(nan)
+assert dn["conj"] is None and not dn["valid"], dn
+assert calibrate.screen_p(None, null=True) == 0.0 and calibrate.screen_p(None, null=False) is None and calibrate.screen_p(0.3, True) == 0.3
+# the analysis: a failed projection is descriptive, not an abort
+rnd = random.Random(36)
+cores = {"x": ["x1", "x2", "x3", "x4"], "y": ["y1", "y2", "y3", "y4"]}
+reg, rows = {}, []
+for c in ("off", "predA"):
+    for core in cores.values():
+        for jj, j in enumerate(core):
+            for ii, i in enumerate(core):
+                mode = "sham" if i == j else "invade"
+                reg.setdefault((c, 0.05), {})[(i, j, mode)] = set(range(6))
+                for rr in range(6):
+                    q = 0.05 if i == j else bounded.sigmoid(-2.0 + 0.6 * ii - 0.4 * jj)
+                    rows.append({"cond": c, "frac": 0.05, "G": 13500.0, "mode": mode, "i": i, "j": j, "rep": rr,
+                                 "s": q - 0.05 + rnd.gauss(0, 0.003), "f0": 0.05, "missed": False})
+bounded._inverse = lambda M: (_ for _ in ()).throw(ValueError("singular"))
+pr, pb, pj = analyze.primary_blocks(rows, None, reg, cores, 19)
+bounded._inverse = inv0
+assert pj[0]["status"] == "formal" and pj[0]["p_res_flip"] is None and pj[0]["claim_beyond_bounded"] is None, pj
+assert "projection failed" in pj[0]["claim_status"] and all(r_.get("p_res_flip") is None for r_ in pr if "F_res" in r_), pj
+# calibration: unconverged fits in every dataset -> raw rates count non-rejections, the gate screen rejections
+calibrate.G.update({"bank_zq": groups})
+lm0 = bounded.lm
+sf0 = calibrate._source_fit
+def sf(zq):
+    bounded.lm = lm0
+    try:
+        return sf0(zq)
+    finally:
+        bounded.lm = lm1
+lm1 = lambda model, cells, y, th0, iters=200, tol=1e-11: lm0(model, cells, y, th0, 1, tol)
+calibrate._source_fit = sf
+bounded.lm = lm1
+gk, cnt, n, *_ = calibrate.task_compound((None, 4, 6, 2, 3, "null", 36))
+bounded.lm, calibrate._source_fit = lm0, sf0
+a = calibrate.ALPHAS[-1]
+assert cnt[("claim: H1 and H1b", "bounded ladder", a)] == 0 and cnt[("claim: H1 and H1b [gate screen]", "bounded ladder", a)] == n == 3, cnt
+assert cnt[("H1b logistic residual sign-flip omnibus [gate screen]", "bounded ladder", a)] == n
+PY
+
+# 37. review round 5 item 11: the gate driver. 'freeze' writes the frozen manifest (master seed 20271103, the
+#     ordered schedule and its seeds, every count: 104,000 + 116,000 datasets, the registered bank identity,
+#     the tool hashes, the fitting freeze, the acceptance rule) and nothing else; 'run' writes it BEFORE any
+#     computation, refuses a changed manifest and a bank that is not the registered one (formal), and writes a
+#     machine-readable decision (exit 1 on fail, with reasons); results do not depend on the worker count or on
+#     an interruption; an invalid law (v > mu (1 - mu)) fails validity
+$PY "$T/gate.py" freeze --out gf37 > gf37.log 2>&1 || fail "gate.py freeze: $(tail -3 gf37.log)"
+$PY - "$T" <<'PY' || fail "the frozen gate manifest"
+import hashlib, json, os, sys
+sys.path.insert(0, sys.argv[1]); import bounded, calibrate, gate
+assert sorted(os.listdir("gf37")) == ["manifest.json"]
+m = json.load(open("gf37/manifest.json"))
+p = m["protocol"]
+assert m["formal"] is True and p["master_seed"] == 20271103 and p["counts"] == {"null": 10000, "alt": 2000, "diag": 2000,
+       "outer": 100, "outer_inner": 1000, "chunk": 50}, p["counts"]
+assert p["gate_datasets"] == 104000 and p["diagnostic_datasets"] == 116000 and p["geometry"] == {"N": 12, "k": 10, "G": 2, "C": 2}
+assert abs(p["alpha"] - 0.05 / 12) < 1e-15 and abs(p["level_ceiling"] - 0.1 / 12) < 1e-15 and p["power_bound"] == 0.8
+assert [c["criterion"] for c in p["acceptance"]] == ["level", "power", "validity"] and p["fitting"] == json.loads(json.dumps(bounded.FIT_FREEZE))
+assert p["bank"]["plan_sha256"].startswith("1040e673") and p["bank"]["cells"] == 28800
+assert sum(len(v) for v in p["bank"]["registry"].values()) == 24 and all(len(h) == 64 for v in p["bank"]["registry"].values() for h in v.values())
+assert p["preregistration"]["sha256"].startswith("cf1518bc") and p["preregistration"]["approved_utc"] == "2026-11-04T06:44Z"
+s = m["schedule"]
+assert m["tasks"] == len(s) == 9 * 200 + 7 * 40 + 8 * 40 + 100 * 20 and [t[0] for t in s] == list(range(len(s)))
+assert s[0][1:3] == ["L", "null"] and s[-1][1:3] == ["E", "outer99"] and sum(t[3] for t in s) == 104000 + 116000
+assert all(t[4] == gate.task_seed(t[0], t[1], t[2]) for t in s) and len({t[4] for t in s}) == len(s)
+assert m["schedule_sha256"] == hashlib.sha256(gate.canon(s).encode()).hexdigest()
+for f in gate.TOOLS:
+    assert m["tools"][f] == hashlib.sha256(open(os.path.join(sys.argv[1], f), "rb").read()).hexdigest(), f
+PY
+$PY - "$T" "$W" <<'PY' || fail "building the registered 12-item toy bank"
+import hashlib, json, os, random, sys
+sys.path.insert(0, sys.argv[1]); import bounded, calibrate, plan
+W = sys.argv[2]
+files = [f"{W}/{x}.json" for x in ("A", "B", "C", "As", "Bs", "Cs")]
+cores = {"np": [f"n{t:02d}" for t in range(12)], "p4": [f"p{t:02d}" for t in range(12)]}
+K = 12
+design = {"name": "t37", "snapshots": {nm: files[t % 6] for names in cores.values() for t, nm in enumerate(names)},
+          "conditions": {"off": 0, "predA4": 4}, "fractions": [0.05], "replicates": K, "steps": 13500,
+          "checkpoint_every": 4500, "log_every": 1000, "cores": [[g, v] for g, v in cores.items()]}
+cells = plan.expand(design)
+text = "".join(json.dumps(c, sort_keys=True) + "\n" for c in cells)
+open("plan37.jsonl", "w").write(text)
+sha = hashlib.sha256(text.encode()).hexdigest()
+reg = {}
+for c in cells:
+    reg.setdefault(c["core"], {})[c["resident_name"]] = c["resident_sha256"]
+rnd = random.Random(37)
+pbs = []
+for g, names in cores.items():
+    a = [rnd.gauss(0, 0.8) for _ in range(12)]
+    b = [rnd.gauss(0, 0.6) for _ in range(12)]
+    mus = {c: [[bounded.sigmoid(-2.3 + a[i] + b[p] + (0.2 if c == "predA4" else 0.0)) for i in range(12)] for p in range(12)]
+           for c in ("off", "predA4")}
+    laws = {c: [[(calibrate.marginal(mus[c][p][i], rnd.uniform(0.005, 0.04) * mus[c][p][i] * (1 - mus[c][p][i]))
+                  if i != p else None) for i in range(12)] for p in range(12)] for c in ("off", "predA4")}
+    zq = {c: [[None] * K for _ in range(12)] for c in laws}
+    for p in range(12):
+        for r in range(K):
+            q = calibrate.joint_column(rnd, [laws["off"][p], laws["predA4"][p]], p, 0.4)
+            zq["off"][p][r], zq["predA4"][p][r] = q
+    for c in ("off", "predA4"):
+        sham = [[0.05 + 0.005 * rnd.gauss(0, 1) for _ in range(K)] for _ in range(12)]
+        z = [[[zq[c][p][r][i] - sham[p][r] if i != p else 0.0 for i in range(12)] for r in range(K)] for p in range(12)]
+        pbs.append({"cond": c, "frac": 0.05, "G": 13500.0, "group": g, "names": sorted(names), "reps": list(range(K)),
+                    "z": z, "zq": zq[c], "status": "formal"})
+os.makedirs("bank37", exist_ok=True)
+os.makedirs("bank37bad", exist_ok=True)
+bb = {"schema": "finfolk.invasion.blocks/2", "plan_sha256": sha, "analysis_sha256": "a37", "clock": "steps",
+      "blocks": [], "primary_blocks": pbs}
+json.dump(bb, open("bank37/blocks.json", "w"))
+inputs = {"plan": {"sha256": sha, "cells": len(cells)}, "clock": "steps", "complete": True, "registered_missing": [],
+          "unregistered_finished": [], "identity_problems": [], "finished": len(cells), "cells_csv": {"cells": len(cells)},
+          "snapshots": {nm: h for v in reg.values() for nm, h in v.items()}, "analysis_code": {"analyze.py": "a37"}}
+json.dump(inputs, open("bank37/inputs.json", "w"))
+json.dump(inputs, open("bank37bad/inputs.json", "w"))
+json.dump({"plan_sha256": sha, "registry": reg, "K": K, "cells": len(cells)}, open("spec37.json", "w"))
+json.dump({"null": 4, "alt": 4, "diag": 2, "outer": 2, "outer_inner": 2, "chunk": 2}, open("counts37.json", "w"))
+json.dump({"null": 2, "alt": 2, "diag": 2, "outer": 1, "outer_inner": 2, "chunk": 2}, open("counts37b.json", "w"))
+for r in range(K):   # one cell whose variance exceeds mu (1 - mu): the registered law cannot exist
+    pbs[0]["zq"][1][r][0] = float(r % 2)
+json.dump(bb, open("bank37bad/blocks.json", "w"))
+PY
+g37() {   # out bank counts extra...: a gate run on the toy bank (exploratory: its own spec and counts)
+    local out=$1 bank=$2 counts=$3; shift 3
+    $PY "$T/gate.py" run --out "$out" --bank "$bank" --bank-plan plan37.jsonl --bank-spec spec37.json --counts "$counts" "$@" \
+        > "$out.log" 2>&1
+}
+g37 g37 bank37/blocks.json counts37.json --workers 1; rc=$?
+[ $rc = 1 ] || fail "gate.py run on tiny counts must FAIL (exit 1), got $rc: $(tail -4 g37.log)"
+$PY - "$T" <<'PY' || fail "the gate decision record"
+import json, os, sys
+sys.path.insert(0, sys.argv[1]); import gate
+d = json.load(open("g37/decision.json"))
+assert d["schema"] == "finfolk.invasion.gate-decision/1" and d["decision"] == "fail" and d["formal"] is False and d["reasons"], d["decision"]
+lv = [c for c in d["criteria"] if c["criterion"] == "level"]
+pw = [c for c in d["criteria"] if c["criterion"] == "power"]
+va = [c for c in d["criteria"] if c["criterion"] == "validity"]
+assert sorted((c["world"], c["test"]) for c in lv) == sorted((w, t) for w in gate.NULL_WORLDS for t in gate.LEVEL_TESTS[w])
+assert sorted(c["world"] for c in pw) == sorted(gate.BOUNDED_WORLDS) and all(c["n"] == 4 for c in pw + lv)
+assert len(va) == 1 and va[0]["ok"] is True, va      # the toy world is built as registered: tiny counts fail on level / power
+assert all(x["solved"] and abs(x["d_res"] - 0.01) <= 1e-6 for x in d["target_plants"].values()), d["target_plants"]
+assert all(f["converged"] for f in d["source_fits"].values())
+man = os.path.getmtime("g37/manifest.json")
+tasks = [os.path.getmtime(os.path.join("g37/tasks", f)) for f in os.listdir("g37/tasks")]
+assert len(tasks) == json.load(open("g37/manifest.json"))["tasks"] and man <= min(tasks), "manifest after a task"
+json.dump(d["criteria"], open("g37_criteria.json", "w"), sort_keys=True)
+for f in sorted(os.listdir("g37/tasks"))[::2]:
+    os.remove(os.path.join("g37/tasks", f))
+PY
+g37 g37 bank37/blocks.json counts37.json --workers 2; rc=$?
+[ $rc = 1 ] || fail "gate.py run (resumed, 2 workers): exit $rc: $(tail -3 g37.log)"
+grep -q "already done" g37.log || fail "the interrupted gate run did not resume"
+$PY - <<'PY' || fail "the gate's result depends on the worker count / an interruption"
+import json
+assert json.load(open("g37/decision.json"))["criteria"] == json.load(open("g37_criteria.json"))
+PY
+g37 g37 bank37/blocks.json counts37b.json --workers 1; rc=$?
+[ $rc = 2 ] && grep -q "differs from the regenerated manifest" g37.log || fail "a changed gate manifest was not refused (exit $rc)"
+$PY "$T/gate.py" run --out g37f --bank bank37/blocks.json --bank-plan plan37.jsonl --workers 1 > g37f.log 2>&1; rc=$?
+[ $rc = 2 ] && grep -q "not the registered bank" g37f.log && [ -z "$(ls g37f/tasks)" ] \
+    && $PY -c "import json; d = json.load(open('g37f/decision.json')); assert d['decision'] == 'refused' and d['reasons']" \
+    || fail "the formal gate ran on a bank that is not the registered one (exit $rc): $(tail -3 g37f.log)"
+g37 g37b bank37bad/blocks.json counts37b.json --workers 1; rc=$?
+[ $rc = 1 ] && $PY -c "
+import json; d = json.load(open('g37b/decision.json')); v = [c for c in d['criteria'] if c['criterion'] == 'validity'][0]
+assert not v['ok'] and any('infeasible' in p for p in v['problems']), v" || fail "an invalid law did not fail the gate's validity (exit $rc)"
+
+# 38. review round 5 items 3 / 6: the bank's ORIGINAL identity. The frozen spec carries bank1's 24 item IDs with
+#     their snapshot hashes and its 28,800 cells; a bank is refused if an item is renamed, a cell's snapshot hash
+#     differs, a registered cell is missing from the analysis, a snapshot read is another file, or the analysis
+#     inputs are absent
+$PY - "$T" <<'PY' || fail "the bank's original identity"
+import json, sys
+sys.path.insert(0, sys.argv[1]); import calibrate
+s = calibrate.BANK_SPEC
+assert s["cells"] == 28800 and sorted(s["registry"]) == ["np", "p4"] and all(len(v) == 12 for v in s["registry"].values())
+assert s["registry"]["np"]["n201l"].startswith("6ceb84c7") and s["registry"]["p4"]["p212m"].startswith("138b8948")
+spec = dict(s, **json.load(open("spec37.json")))
+bb = json.load(open("bank37/blocks.json"))
+cells = [json.loads(l) for l in open("plan37.jsonl")]
+inputs = json.load(open("bank37/inputs.json"))
+sha = spec["plan_sha256"]
+def probs(bb_=bb, cells_=cells, inputs_=inputs):
+    return calibrate.validate_bank(bb_, spec, cells_, sha, inputs_)[3]
+assert probs() == [], probs()
+def jd(x):
+    return json.loads(json.dumps(x))
+b2 = jd(bb); b2["primary_blocks"][0]["names"][3] = "zz"; b2["primary_blocks"][1]["names"][3] = "zz"
+assert any("registered item IDs" in p for p in probs(bb_=b2)), probs(bb_=b2)
+c2 = jd(cells); c2[7]["resident_sha256"] = "0" * 64
+assert any("snapshot hash is not the registered one" in p for p in probs(cells_=c2)), probs(cells_=c2)
+i2 = jd(inputs); i2["registered_missing"] = ["off_f050_n00_n01_r00"]; i2["complete"] = False; i2["finished"] -= 1
+assert any("registered_missing" in p for p in probs(inputs_=i2)) and any("not complete" in p for p in probs(inputs_=i2))
+i3 = jd(inputs); i3["snapshots"]["p05"] = "f" * 64
+assert any("snapshots read differ" in p for p in probs(inputs_=i3)), probs(inputs_=i3)
+assert any("no analysis inputs.json" in p for p in probs(inputs_=None))
+c4 = cells[:-1]
+assert any("the registered bank" in p for p in probs(cells_=c4)), probs(cells_=c4)
+PY
+$PY "$T/calibrate.py" --blocks an3/blocks.json --key off/0.1/0.25 --out cal38 --sims 0 --bank bank37/blocks.json \
+    --bank-plan plan37.jsonl --bank-spec spec37.json --bank-inputs bank37bad/inputs.json --bank-sims 0 --compound 12:4:2 \
+    --compound-sims 2 --compound-variants null --workers 1 > cal38.log 2>&1 || fail "calibrate.py refused the registered toy bank: $(tail -3 cal38.log)"
+$PY - <<'PY' || fail "a missing registered cell in the bank analysis"
+import json
+i = json.load(open("bank37bad/inputs.json")); i["registered_missing"] = ["x"]; json.dump(i, open("inputs38.json", "w"))
+PY
+$PY "$T/calibrate.py" --blocks an3/blocks.json --key off/0.1/0.25 --out cal38m --sims 0 --bank bank37/blocks.json \
+    --bank-plan plan37.jsonl --bank-spec spec37.json --bank-inputs inputs38.json --bank-sims 0 --compound 12:4:2 \
+    --compound-sims 2 --compound-variants null --workers 1 > cal38m.log 2>&1
+[ $? = 2 ] && grep -q "registered_missing" cal38m.log || fail "a bank with a missing registered cell was calibrated"
+
+# 39. review round 5 items 1 / 2 / 12: the headline claim needs the strict confirmation registration, a
+#     verified PASSED formal gate record and reads T only (2T is descriptive); a 0-8 / 0-9 registration is no
+#     nine-replicate formal block under the protocol; no 'Holm family' / 'bounded logistic transitivity'
+#     prose; the confirmation seed manifest (indexed confirm-v1 allocation, 5,760 trajectories) and its
+#     disjointness check
+! grep -n "Holm family\|bounded logistic transitivity\|Holm's first step" "$T"/*.py || fail "superseded claim prose in the tools"
+$PY - "$T" <<'PY' || fail "the headline claim is tied to the gate, T and the strict registration"
+import hashlib, json, os, random, sys
+sys.path.insert(0, sys.argv[1]); import analyze, bounded, gate
+rnd = random.Random(39)
+cores = {"x": [f"x{t:02d}" for t in range(12)], "y": [f"y{t:02d}" for t in range(12)]}
+cyc = {(0, 1): 0.06, (1, 2): 0.06, (2, 0): 0.06}
+reg, rows = {}, []
+for G in (13500.0, 27000.0):
+    for c in ("off", "predA4"):
+        for core in cores.values():
+            for jj, j in enumerate(core):
+                for ii, i in enumerate(core):
+                    mode = "sham" if i == j else "invade"
+                    reg.setdefault((c, 0.05), {})[(i, j, mode)] = set(range(10))
+                    for r in range(10):
+                        q = 0.05 if i == j else bounded.sigmoid(-2.0 + 0.15 * ii - 0.1 * jj) + cyc.get((ii, jj), 0.0) - cyc.get((jj, ii), 0.0)
+                        rows.append({"cond": c, "frac": 0.05, "G": G, "mode": mode, "i": i, "j": j, "rep": r,
+                                     "s": q - 0.05 + rnd.gauss(0, 0.003), "f0": 0.05, "missed": False})
+strict = {"groups": 2, "N": 12, "k": 10, "assays": ["off", "predA4"], "fraction": 0.05}
+def pj_(reg_, confirm):
+    return analyze.primary_blocks(rows, None, reg_, cores, 19, windows_registered={13500.0, 27000.0}, confirm=confirm)
+_, _, pj = pj_(reg, None)
+assert all(j["status"] == "formal" and j["both_rejected"] is True and j["claim_beyond_bounded"] is None for j in pj), pj
+ok = {"T": 13500.0, "strict": strict, "gate": {}, "gate_problems": []}
+_, _, pj = pj_(reg, ok)
+by = {j["G"]: j for j in pj}
+assert by[13500.0]["claim_beyond_bounded"] is True and by[13500.0]["claim_status"].startswith("formal"), by[13500.0]
+assert by[27000.0]["claim_beyond_bounded"] is None and "not the confirmatory horizon" in by[27000.0]["claim_status"], by[27000.0]
+_, _, pj = pj_(reg, dict(ok, gate_problems=["the gate decision is 'fail', not 'pass'"]))
+assert all(j["claim_beyond_bounded"] is None and "no passed gate" in j["claim_status"] for j in pj), pj
+reg9 = {k: dict(v) for k, v in reg.items()}
+reg9[("off", 0.05)][("x03", "x05", "invade")] = set(range(9))     # one cell registers 0..8
+_, pb, pj = pj_(reg9, None)
+assert pb[("off", 0.05, 13500.0, "x")]["status"] == "formal" and pb[("off", 0.05, 13500.0, "x")]["reps"] == list(range(9))
+_, pb, pj = pj_(reg9, ok)
+assert pb[("off", 0.05, 13500.0, "x")]["status"].startswith("descriptive: confirmation protocol") and "no intersection" in \
+    pb[("off", 0.05, 13500.0, "x")]["status"], pb[("off", 0.05, 13500.0, "x")]["status"]
+assert all(j["status"].startswith("descriptive") and j.get("claim_beyond_bounded") is None for j in pj), pj
+small = {k: {kk: vv for kk, vv in v.items() if kk[0] not in ("x11", "y11") and kk[1] not in ("x11", "y11")} for k, v in reg.items()}
+c11 = {g: v[:11] for g, v in cores.items()}
+_, pb, pj = analyze.primary_blocks(rows, None, small, c11, 19, windows_registered={13500.0}, confirm=ok)
+assert all(b["status"].startswith("descriptive: confirmation protocol") for b in pb.values()), [b["status"] for b in pb.values()]
+# the gate record: verified pass, else a problem each
+os.makedirs("gate39", exist_ok=True)
+text = gate.canon(gate.manifest())
+open("gate39/manifest.json", "w").write(text)
+dec = {"schema": "finfolk.invasion.gate-decision/1", "decision": "pass", "formal": True,
+       "manifest_sha256": hashlib.sha256(text.encode()).hexdigest()}
+json.dump(dec, open("gate39/decision.json", "w"))
+s, p = analyze.verify_gate("gate39")
+assert p == [] and s["decision"] == "pass", p
+for bad, why in ((dict(dec, decision="fail"), "not 'pass'"), (dict(dec, formal=False), "exploratory"),
+                 (dict(dec, manifest_sha256="0" * 64), "not the one its decision bound")):
+    json.dump(bad, open("gate39/decision.json", "w"))
+    assert any(why in x for x in analyze.verify_gate("gate39")[1]), (why, analyze.verify_gate("gate39")[1])
+m = json.loads(text); m["tools"]["bounded.py"] = "0" * 64; t2 = gate.canon(m)
+open("gate39/manifest.json", "w").write(t2)
+json.dump(dict(dec, manifest_sha256=hashlib.sha256(t2.encode()).hexdigest()), open("gate39/decision.json", "w"))
+assert any("another bounded.py" in x for x in analyze.verify_gate("gate39")[1])
+m = json.loads(text); m["protocol"]["counts"]["null"] = 100; t3 = gate.canon(m)
+open("gate39/manifest.json", "w").write(t3)
+json.dump(dict(dec, manifest_sha256=hashlib.sha256(t3.encode()).hexdigest()), open("gate39/decision.json", "w"))
+assert any("not the frozen protocol" in x for x in analyze.verify_gate("gate39")[1])
+open("gate39/manifest.json", "w").write(text)
+json.dump(dec, open("gate39/decision.json", "w"))
+PY
+$PY "$T/analyze.py" --root root3 --out an39 --plan plan3.jsonl --clock steps --horizon hz3.json --sims 50 --scales "" \
+    --bounded "" --gate gate39 > an39.log 2>&1 || fail "analyze.py --gate: $(tail -4 an39.log)"
+$PY -c "import json; g = json.load(open('an39/inputs.json'))['gate']; assert g['decision'] == 'pass' and g['problems'] == [] and g['T'] == 13500.0, g" \
+    || fail "analyze.py --gate did not record the verified gate"
+$PY "$T/gate.py" seeds --out seeds39.json --avoid plan3.jsonl --avoid plan20.jsonl --home-seeds-used 101,102,201,212 > seeds39.log 2>&1 \
+    || fail "gate.py seeds: $(tail -2 seeds39.log)"
+$PY - <<'PY' || fail "the confirmation seed manifest"
+import json
+s = json.load(open("seeds39.json"))
+assert s["trajectories"] == 5760 and s["invasions"] == 5280 and s["shams"] == 480 and s["collisions"] == [] == s["home_collisions"]
+assert s["protocol"]["home_seeds"] == {"off": list(range(430001, 430007)), "predA4": list(range(430007, 430013))}
+c = {(x["h"], x["assay"], x["j"], x["i"], x["r"]): x for x in s["cells"]}
+x = c[(1, "predA4", 11, 4, 9)]
+u = 10 * (12 * 1 + 11) + 9
+assert (x["slot_seed"], x["donor_seed"], x["pred_seed"], x["reseed"]) == (3000000000 + u, 3100000000 + 12 * u + 4, 3200000000 + u, 3300000000 + 2 * u + 1)
+x = c[(0, "off", 3, 3, 0)]
+assert x["mode"] == "sham" and x["donor_seed"] == 3100000000 + 12 * 30 + 3 and x["pred_seed"] is None and x["reseed"] == 3300000000 + 60
+open("plan39x.jsonl", "w").write(json.dumps({"slot_seed": 3000000007, "donor_seed": None, "pred_seed": None, "reseed": 5}) + "\n")
+PY
+$PY "$T/gate.py" seeds --out seeds39x.json --avoid plan39x.jsonl > seeds39x.log 2>&1
+[ $? = 2 ] && $PY -c "import json; assert json.load(open('seeds39x.json'))['collisions'] == [3000000007]" || fail "a seed collision was not refused"
+$PY "$T/gate.py" seeds --out seeds39h.json --home-seeds-used 430003 > /dev/null 2>&1
+[ $? = 2 ] || fail "a home-seed collision was not refused"
 
 # 19. self-tests of the inference and bounded-scale modules
 $PY "$T/infer.py" > /dev/null || fail "infer.py self-test"

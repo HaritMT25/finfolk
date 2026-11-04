@@ -80,20 +80,29 @@ draws Gaussian units with each column's joint cross-assay covariance; --bank-out
 the bank itself (finite-bank uncertainty, reported separately). The bank must BE the registered
 one (review round 4): validate_bank checks it against the frozen BANK_SPEC (or --bank-spec) and
 its plan (--bank-plan): exact assays and groups (the plan's cores, items included), every block
-formal at the fixed-step horizon, replicates 0..K-1, aligned assays, unique keys, shapes; a bank
-that fails is refused (exit 2) unless --bank-exploratory (rows keyed 'bank (exploratory)').
+formal at the fixed-step horizon, replicates 0..K-1, aligned assays, unique keys, shapes; and (prereg
+gate) its original identity: the registered item IDs and snapshot hashes, all 28,800 registered cells,
+checked in the plan and in the bank analysis' inputs.json (--bank-inputs, default beside --bank: every
+registered cell finished, none excluded, the registered files read). A bank that fails is refused
+(exit 2) unless --bank-exploratory (rows keyed 'bank (exploratory)').
 
 COMPOUND DECISION (--compound N:k:G): the frozen decision (H1, H1b, the claim = both rejected) in
-a transitive bounded world: logistic ladders sigma(mu + a_i + b_j), support-preserving
-zero-inflated Beta endpoints with the declared means exactly (zib_moments; infeasible SDs capped
-and counted), and two families of alternatives (review round 4): the old nominal plants on the
-probability scale (clipped; their achieved d_add / d_res and clipping in diag.csv) and feasible
-logit-scale plants solved to a noiseless logistic-residual RMS d_res (the gate's effect
-definition). A dataset whose H1b fit did not converge is a non-rejection, kept in the denominator.
+a transitive bounded world: logistic ladders sigma(mu + a_i + b_j), independent endpoints from the
+registered bounded marginal law (marginal(): exact means and variances, a zero mass below mean
+0.03, Beta, point mass / Bernoulli at the edges; the bank-sourced world fails on an infeasible
+cell, the pilot-sourced pre-check world caps its pooled SDs and counts them), and two families of
+alternatives: the old nominal plants on the probability scale (clipped; their achieved d_add /
+d_res and clipping in diag.csv) and the registered plants solved to a noiseless logistic-residual
+RMS d_res (feasible_plant: probability scale, clip, grid crossing + bisection; the gate's effect
+definition), alternative variances keeping v / (mu (1 - mu)). Raw rates count an unavailable
+decision (an unconverged fit, a failed projection, a world not built as registered) as a
+non-rejection; the '[gate screen]' rows count it as a rejection under the null and a failure
+under an alternative. The preregistered gate itself (nine worlds, fixed counts, the acceptance
+rule) is gate.py, which uses these generators.
 Without --bank the --key blocks are the conditions and each dataset draws N items (with
 replacement) from their fitted items and per-cell SDs from their cells; with --bank, each group /
 condition is the bank's own primary block: its own fitted ladder over its own items and its own
-cell SDs (key 'bank' in calib.csv), so N:G must be the bank's.
+cell variances (key 'bank' in calib.csv), so N:G must be the bank's.
 
 Outputs in OUTDIR: calib.csv (one row per key, scale, world, N, k, G, C, test, effect, alpha:
 rate, its Clopper-Pearson interval, n), diag.csv (compound diagnostics: n, mean, SD, min, max of
