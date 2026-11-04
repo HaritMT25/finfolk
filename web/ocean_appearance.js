@@ -727,6 +727,9 @@
 
   window.EvoAppearance = {
     LAWS: LAWS, NG: NG, MO: MO, NM: NM, STRIDE: STRIDE,
+    /* the paired fins' span law's constant (mBuild: span = area / (chord PHI_I)),
+     * for the renderer's fin pose (web/ocean_scene.js finPose: the fold keeps the root) */
+    PHI_I: PHI_I,
     GLSL: { COMMON: COMMON, VARY: VARY, DECODE: DECODE, SKIN: SKIN, GENES: GENES, MORPH: MORPH },
     LODS: LODS, buildTemplate: buildTemplate, buildBarbels: buildBarbels,
     decode: decode, flankAt: flankAt, flankImage: flankImage, lambdaOf: lambdaOf,
