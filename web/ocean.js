@@ -210,7 +210,6 @@
   var pageError = "";
   function lastError() {
     if (pageError) { var e = pageError; pageError = ""; return e; }
-    if (engineState !== "ok") return engineBusyWhy();   /* (never read from a stopped or restarting engine) */
     return M._oc_last_error ? cString(M._oc_last_error()) : "(no oc_last_error)";
   }
   /* Take a whole memory image of this same module (the Turbo hand-off; a
@@ -826,17 +825,12 @@
       return null;
     }
     if (!has("oc_set_param")) return false;
-    /* the setting and what follows it here (the light read back, the engine's reason for a refusal) are
-     * one engine call: a trap in any of them stops the engine once (review of #44, round 3, finding 3) */
-    var before = engineState;
-    var ok = engineCall(function () {
-      var r = withCString(key, function (p) { return M._oc_set_param(p, num); });
-      if (r) liveApplied(key, valOf(key, num), quiet);
-      else refuse(key, lastError(), keep);
-      return !!r;
-    }, null);
-    if (ok === null) { refuse(key, engineBusyWhy(), keep, before === "ok"); return false; }   /* (the engine is not there; or it trapped just now: its stop is said, the field goes back) */
-    return ok;
+    var ok = engineCall(function () { return withCString(key, function (p) { return M._oc_set_param(p, num); }); }, null);
+    if (ok === null) { refuse(key, engineBusyWhy(), keep); return false; }   /* (it trapped, or the engine is not there) */
+    /* (what follows, the light read back: inside the operation's fence, its field's change or Turbo's hand-back) */
+    if (ok) liveApplied(key, valOf(key, num), quiet);
+    else refuse(key, lastError(), keep);
+    return !!ok;
   }
   /* seq: the worker's acknowledgment of that edit. With no newer edit of the
    * key on its way, the field shows what now runs (a refusal in between may
@@ -857,8 +851,8 @@
   /* a refused live value: the field goes back to the newest edit of it still
    * on its way to the world (held for Turbo's hand-off, with its note, or with
    * the worker), else to what the world runs with (keep: a newer edit of it
-   * follows, so the field stays; quiet: said already) */
-  function refuse(key, why, keep, quiet) {
+   * follows, so the field stays) */
+  function refuse(key, why, keep) {
     var back = null, p = null, next = nextOnlyNow(key);
     if (!keep) {
       p = live ? live.latest(key) : null;
@@ -870,7 +864,6 @@
       }
       renderStartBar();
     }
-    if (quiet) return;
     showError((LABELS[key] || key) + ": " + why + (keep ? "" : draft || next ? " (the running world keeps " + shown(back) + ")" :
               " (back to " + shown(back) + (p ? ", on its way" : "") + ")"));
   }
@@ -1335,11 +1328,7 @@
     return "waiting";
   }
   function commitStart(plan) {
-    /* the start fenced whole (every visitor's start comes here): a trap
-     * outside the open's own undo (oc_init, Replay's oc_reset, a new
-     * world's reads) stops the engine once, its message standing */
-    var r = fenced(startWorld)(plan);
-    if (!r) return false;
+    var r = startWorld(plan);
     if (!r.ok) { showError((plan.failed || "Couldn't start that world: ") + r.why); return false; }
     if (plan.done && r.undo) {   /* an open's last step is part of it: its failure puts the run back too */
       try { plan.done(); }

@@ -602,35 +602,42 @@
         if (d !== h.sha256) throw new Error("That world file is damaged: its header does not match its checksum.");
         /* body(cancelled, turn): turn(), a Promise to wait for before any of the body is read (the
          * page's one at a time: a read waiting for its turn holds no body; review of #44, round 3,
-         * finding 2); cancelled() true (a superseded read) stops it at once: when its turn comes,
-         * between the parts it is read in, once it is read, at the unpacking's next chunk */
+         * finding 2); cancelled() true (a superseded read) stops it at once: before each part it is
+         * read in (the first: when its turn comes), while a part is on its way (a slow disk: it lets
+         * the turn go, that part's bytes dropped when they come), at the unpacking's next chunk */
         return { header: h, at: at, body: function (cancelled, turn) {
-          var stop = function () { if (cancelled && cancelled()) throw new Error(CANCELLED); };
           return (turn ? turn() : Promise.resolve()).then(function () {
-            stop();
-            return readParts(src, at, size, stop);
-          }).then(function (b) { stop(); return unpack(h, b, cancelled); });
+            return readParts(src, at, size, cancelled);
+          }).then(function (b) { return unpack(h, b, cancelled); });
         } };
       });
     });
   }
   /* bytes [a, z) of src, READ_PART at a time into one buffer (one part: as
-   * read), between() (it may throw: a superseded read) after each part */
-  function readParts(src, a, z, between) {
+   * read); cancelled() true stops it before a part and while one is on its
+   * way (looked at every 50 ms) */
+  function readParts(src, a, z, cancelled) {
     var part = WORLD.READ_PART;
-    if (z - a <= part) return src.read(a, z);
+    if (z - a <= part) return readPart(src, a, z, cancelled);
     var out = new Uint8Array(z - a), at = a;
     return (function next() {
       if (at >= z) return out;
       var e = Math.min(z, at + part);
-      return src.read(at, e).then(function (b) {
+      return readPart(src, at, e, cancelled).then(function (b) {
         if (b.length !== e - at) throw new Error("That world file is cut short: it ended while its world was read.");
         out.set(b, at - a);
         at = e;
-        between();
         return next();
       });
     })();
+  }
+  function readPart(src, a, z, cancelled) {
+    if (!cancelled) return src.read(a, z);
+    if (cancelled()) return Promise.reject(new Error(CANCELLED));
+    return new Promise(function (resolve, reject) {
+      var watch = setInterval(function () { if (cancelled()) { clearInterval(watch); reject(new Error(CANCELLED)); } }, 50);
+      src.read(a, z).then(function (b) { clearInterval(watch); resolve(b); }, function (e) { clearInterval(watch); reject(e); });
+    });
   }
   /* a body into the image's stored bytes, checked: {data, bytes} */
   function unpack(h, body, cancelled) {
