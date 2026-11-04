@@ -2005,6 +2005,91 @@ $PY "$T/gate.py" seeds --out seeds39x.json --avoid plan39x.jsonl > seeds39x.log 
 $PY "$T/gate.py" seeds --out seeds39h.json --home-seeds-used 430003 > /dev/null 2>&1
 [ $? = 2 ] || fail "a home-seed collision was not refused"
 
+# 42. review of #49, finding 3: the fitting classifier on prespecified fixtures. A numerically vanished Jacobian
+#     never certifies an appreciable residual (all logits 30 / 40 / 45 with targets 0.5: SSE 33; one item's effect
+#     pushed to +47), derivatives are stable (sigma' without the 1 - sigma cancellation), and boundary infima
+#     with negligible SSE are NOT spuriously unavailable (an all-zero target matrix, an all-zero invader row, an
+#     all-zero resident column, an invader that always wins); an interior fit matches an independent reference
+#     (2,000 iterations from the true parameters) and a low-variance ladder converges
+$PY - "$T" <<'PY' || fail "the fitting classifier fixtures"
+import math, random, sys
+sys.path.insert(0, sys.argv[1]); import bounded
+assert bounded.dsigmoid(40.0) > 4e-18 and abs(bounded.dsigmoid(30.0) - math.exp(-30.0)) < 1e-25
+N = 12
+cells = bounded._cells(N)
+model = bounded.Model("logistic", N)
+rnd = random.Random(42)
+a = [rnd.gauss(0, 0.8) for _ in range(N)]
+b = [rnd.gauss(0, 0.6) for _ in range(N)]
+def ladder():
+    return [[bounded.sigmoid(-2.3 + a[i] + b[j]) if i != j else None for j in range(N)] for i in range(N)]
+def lmfit(M, th0=None):
+    y = [M[i][j] for i, j in cells]
+    return bounded.lm(model, cells, y, bounded.initial("logistic", M) if th0 is None else th0), y
+out = {}
+M = [[(min(1, max(0, v + rnd.gauss(0, 0.01))) if v is not None else None) for v in row] for row in ladder()]
+r, y = lmfit(M)
+th_true = [-2.3 + sum(a) / N + sum(b) / N] + [x - sum(a) / N for x in a[:N - 1]] + [x - sum(b) / N for x in b[:N - 1]]
+ref = bounded.lm(model, cells, y, th_true, iters=2000)
+out["interior"] = (r[2], abs(r[1] - ref[1]) / ref[1])
+M = [[(v + 1e-9 * rnd.gauss(0, 1) if v is not None else None) for v in row] for row in ladder()]
+out["low variance"] = (lmfit(M)[0][2], 0)
+M = ladder()
+for j in range(N):
+    if j != 3:
+        M[3][j] = 0.0
+M = [[(min(1, max(0, v + rnd.gauss(0, 0.005))) if (v is not None and i != 3) else v) for v in row] for i, row in enumerate(M)]
+out["zero row"] = (lmfit(M)[0][2], 0)
+M = ladder()
+for i in range(N):
+    if i != 5:
+        M[i][5] = 0.0
+out["zero column"] = (lmfit(M)[0][2], 0)
+M = ladder()
+for j in range(N):
+    if j != 7:
+        M[7][j] = 1.0
+out["one row"] = (lmfit(M)[0][2], 0)
+out["all zero"] = (lmfit([[0.0 if i != j else None for j in range(N)] for i in range(N)])[0][2], 0)
+H = [[0.5 if i != j else None for j in range(N)] for i in range(N)]
+for L in (30.0, 40.0, 45.0):
+    r, _ = lmfit(H, [L] + [0.0] * (2 * N - 2))
+    out[f"saturated {L:g}"] = (r[2], r.saturated_sse)
+th = list(th_true)
+th[3] += 47.0   # (classified where it stands: iters = 0)
+r = bounded.lm(model, cells, [ladder()[i][j] for i, j in cells], th, iters=0)
+out["partly saturated"] = (r[2], r.saturated_sse)
+print(out)
+good = ("interior", "low variance", "zero row", "zero column", "one row", "all zero")
+bad = ("saturated 30", "saturated 40", "saturated 45", "partly saturated")
+assert all(out[k][0] for k in good), [k for k in good if not out[k][0]]
+assert not any(out[k][0] for k in bad), [k for k in bad if out[k][0]]
+assert out["interior"][1] < 1e-9 and all(out[k][1] > 1 for k in bad)
+f = bounded.fit(H, "logistic", [40.0] + [0.0] * (2 * N - 2))
+assert not f["converged"] and f["saturated_sse"] > 30 and "sat_d" in bounded.FIT_FREEZE, f["reason"]
+PY
+
+# 43. review of #49, finding 4: the Beta part's variance without cancellation (mu 0.5, v 1e-18 used to become
+#     0 and an invalid law), exact moments of very concentrated laws, the 1e-12 endpoint band as an explicit,
+#     flagged convention, and the Cornish-Fisher quantile of very concentrated Betas against the exact table
+$PY - "$T" <<'PY' || fail "a feasible concentrated law rejected through cancellation"
+import sys
+sys.path.insert(0, sys.argv[1]); import calibrate
+for mu, v in ((0.5, 1e-18), (0.01, 1e-12), (2e-5, 4e-10), (0.7, 1e-16)):
+    m = calibrate.marginal(mu, v)
+    mm, vv = calibrate.marginal_moments(m)
+    assert m["valid"] and m["kind"] == "beta" and abs(mm - mu) <= 1e-15 * mu and abs(vv - v) <= 1e-12 * v, (mu, v, m["kind"], vv)
+assert calibrate.marginal(0.5, 1e-18)["vb"] == 1e-18
+e = calibrate.marginal(0.3, 0.21 * (1 + 5e-13))
+assert e["valid"] and e["kind"] == "bernoulli" and e["edge"] and not e["capped"], e
+assert not calibrate.marginal(0.3, 0.21 * (1 + 1e-11))["valid"] and not calibrate.marginal(0.3, 0.2)["edge"]
+x = calibrate.quantile_marginal(calibrate.marginal(0.5, 1e-18), 0.975, 0.025)
+assert abs((x - 0.5) / 1e-9 - 1.959964) < 1e-4, x
+q = calibrate.BetaQuantile(2e5, 5e5)
+for u in (1e-6, 0.01, 0.3, 0.5, 0.99, 1 - 1e-6):
+    assert abs(q(u, 1 - u) - calibrate._beta_quantile_cf(2e5, 5e5, u, 1 - u)) < 5e-10, u
+PY
+
 # 19. self-tests of the inference and bounded-scale modules
 $PY "$T/infer.py" > /dev/null || fail "infer.py self-test"
 $PY "$T/bounded.py" > /dev/null || fail "bounded.py self-test"

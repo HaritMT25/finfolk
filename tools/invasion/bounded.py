@@ -65,6 +65,12 @@ def sigmoid(x):
     return e / (1.0 + e)
 
 
+def dsigmoid(x):
+    """sigma'(x) = e^-|x| / (1 + e^-|x|)^2, without the cancellation of sigma (1 - sigma) near sigma = 1."""
+    e = math.exp(-abs(x))
+    return e / ((1.0 + e) * (1.0 + e))
+
+
 def transform(spec):
     """-> (h, eps): the endpoint transform named by spec, and its clip (None if it has none)."""
     if spec == "raw":
@@ -154,7 +160,7 @@ class Model:
                 row[-1] = (1.0 - w) * dU                           # d g / d om
             else:
                 g = sigmoid(x)
-                d = g * (1.0 - g)
+                d = dsigmoid(x)   # (stable: g (1 - g) cancels to 0 near g = 1; review of #49)
             row[0] = d
             if nm == "strength":
                 for t, sgn in ((i, 1.0), (j, -1.0)):
@@ -186,21 +192,28 @@ class Model:
 
 GTOL = 1e-9   # stationarity at the iteration cap: max |J'r| <= GTOL x max(1, ||y||)
 STAT_TOL = 1e-4   # first-order stationarity at every non-exact exit (prereg gate, review round 5 item 4):
-STAT_ABS = 1e-12  # the Gauss-Newton step may not promise more than STAT_TOL SSE + STAT_ABS ||y||^2
+STAT_ABS = 1e-12  # the Gauss-Newton step may not promise more than STAT_TOL SSE + STAT_ABS max(||y||^2, n)
+SAT_D = 1e-12     # a cell whose Jacobian row is <= SAT_D everywhere is numerically saturated (|eta| >~ 27.6)
+ETA_CLAMP = 40.0  # model.eval clamps eta to +-40 (beyond it the link is constant)
 
 # The fitting freeze (preregistration section 3, "Fit failures"): deterministic initialization, this optimizer
 # and these tolerances are part of the registered procedure; the gate manifest records this dict and the
-# source hash of this file. Every fit reports its termination reason and gradient.
+# source hash of this file; tools/invasion/FIT_FREEZE.md is the dated attachment. Every fit reports its
+# termination reason, gradient and stationarity.
 FIT_FREEZE = {
     "optimizer": "Levenberg-Marquardt (bounded.lm), lambda0 1e-3, /3 on an accepted step, x10 on a rejected one",
-    "iters": 200, "tol": 1e-11, "gtol": GTOL, "stat_tol": STAT_TOL, "stat_abs": STAT_ABS,
+    "iters": 200, "tol": 1e-11, "gtol": GTOL, "stat_tol": STAT_TOL, "stat_abs": STAT_ABS, "sat_d": SAT_D,
+    "eta_clamp": ETA_CLAMP,
     "init": "logistic: two-way additive fit of the logit:0.001-clipped means (bounded.initial); no restarts",
+    "derivatives": "sigma'(x) = e^-|x| / (1 + e^-|x|)^2 (stable), evaluated at the clamped eta",
     "converged": ("exact fit (SSE <= 1e-26 ||y||^2); otherwise the exit (relative SSE improvement < tol, a step "
-                  "<= 1e-12 (1 + max|theta|), damping > 1e6, or the iteration cap) counts as converged only if "
-                  "the fit is first-order stationary: the Gauss-Newton predicted decrease "
-                  "r'J (J'J + 1e-12 max diag)^-1 J'r <= stat_tol SSE + stat_abs ||y||^2 (a saturated plateau, "
-                  "every fitted mean at 0 or 1, predicts ~all of its SSE), and at the cap also "
-                  "max |J'r| <= gtol max(1, ||y||); a non-finite SSE, parameter or fitted value is never converged"),
+                  "<= 1e-12 (1 + max|theta|), damping > 1e6, or the iteration cap) counts as converged only if, "
+                  "with allow = stat_tol SSE + stat_abs max(||y||^2, n) (n = cells): (1) the Gauss-Newton predicted "
+                  "decrease r'J (J'J + 1e-12 max diag)^-1 J'r <= allow, a vanished Jacobian (max diag 0) predicting "
+                  "the whole SSE; (2) the residual energy on numerically saturated cells (every Jacobian entry "
+                  "<= sat_d) <= allow - a vanished derivative never certifies an appreciable residual; (3) at the "
+                  "cap also max |J'r| <= gtol max(1, ||y||); a non-finite SSE, parameter or fitted value is never "
+                  "converged. A boundary infimum with negligible SSE (an item whose targets are all 0) passes"),
     "unavailable": "any required unconverged fit, non-finite result or failed projection makes H1b unavailable",
 }
 
@@ -210,6 +223,7 @@ class LMResult(tuple):
     reason = None
     grad = None
     stationarity = None
+    saturated_sse = None
 
 
 def _normal(J, r, P):
@@ -242,7 +256,7 @@ def stationarity(J, r, P):
         return 0.0, grad
     mx = max(JtJ[a_][a_] for a_ in range(P))
     if mx <= 0.0:
-        return (0.0 if grad == 0.0 else 1.0), grad
+        return 1.0, grad   # a vanished Jacobian explains nothing: never 'stationary' with a residual left
     for a_ in range(P):
         JtJ[a_][a_] += 1e-12 * mx
     try:
@@ -272,11 +286,14 @@ def lm(model, cells, y, th0, iters=200, tol=1e-11):
     def out(reason, cap=False):
         st, grad = stationarity(J, r, P)
         finite = math.isfinite(S) and all(math.isfinite(t) for t in th) and all(math.isfinite(x) for x in r)
-        ok = finite and (reason == "exact" or st * S <= STAT_TOL * S + STAT_ABS * sum(v * v for v in y))
+        yy = sum(v * v for v in y)
+        allow = STAT_TOL * S + STAT_ABS * max(yy, float(len(y)))
+        sat = sum(ri * ri for row, ri in zip(J, r) if max(abs(x) for x in row) <= SAT_D)
+        ok = finite and (reason == "exact" or (st * S <= allow and sat <= allow))
         if cap:
-            ok = ok and grad <= GTOL * max(1.0, math.sqrt(sum(v * v for v in y)))
+            ok = ok and grad <= GTOL * max(1.0, math.sqrt(yy))
         res = LMResult((th, S, ok))
-        res.reason, res.grad, res.stationarity = reason, grad, st
+        res.reason, res.grad, res.stationarity, res.saturated_sse = reason, grad, st, sat
         return res
     for _ in range(iters):
         if S <= floor:
@@ -349,7 +366,8 @@ def fit(M, model_name, th0=None):
     finite = math.isfinite(sse) and all(math.isfinite(t) for t in th) and all(math.isfinite(v) for v in g)
     return {"model": model_name, "theta": th, "F": F, "sse": sse, "converged": bool(ok) and finite,
             "params": model.describe(th), "reason": getattr(res, "reason", None) if finite else "non-finite",
-            "grad": getattr(res, "grad", None), "stationarity": getattr(res, "stationarity", None)}
+            "grad": getattr(res, "grad", None), "stationarity": getattr(res, "stationarity", None),
+            "saturated_sse": getattr(res, "saturated_sse", None)}
 
 
 # ------------------------------------------------------------ energies
