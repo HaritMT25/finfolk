@@ -17,10 +17,12 @@ run     (1) writes DIR/manifest.json BEFORE any computation (if DIR already has 
         manifest must equal it byte for byte, or the run is refused: exit 2); (2) DIR/run.json, the
         hashes of the bank inputs; (3) validates the bank against the registration (refused, exit 2,
         if it is not the registered bank); (4) runs every scheduled task (DIR/tasks/NNNNN.json, one
-        file per task, bound to this run's inputs, so an interrupted run resumes; results do not depend
-        on the worker count); (5) writes DIR/cell_laws.json, DIR/decision.json (machine-readable),
-        DIR/gate.md and DIR/receipt.json, and prints the RECEIPT: one hash over the manifest, the run
-        record, every task record in schedule order and the decision. Record it in the approval record
+        file per task, bound to this run's inputs; results do not depend on the worker count; an
+        interrupted EXPLORATORY run resumes from its records, while a FORMAL run ignores every cached
+        record and recomputes all tasks); (5) writes DIR/cell_laws.json, DIR/decision.json
+        (machine-readable), DIR/gate.md and DIR/receipt.json, and prints the RECEIPT: one hash over the
+        manifest, the run record, every task record in schedule order and the decision - formal only
+        when the run is formal and computed every task itself. Record it in the approval record
         right after the run; analyze.py --gate DIR --gate-receipt SHA requires it (verify_record checks
         the whole chain against the evidence). Exit 0 = pass, 1 = fail.
 seeds   the confirmation assay seed manifest of section 2 (namespace confirm-v1, the indexed
