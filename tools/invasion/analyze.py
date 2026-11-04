@@ -642,6 +642,17 @@ def _largest_complete(names, has):
     return names
 
 
+def _fit_diag_text(what, fd):
+    """The fit classifier's reports for H1b (review of #49, round 4, P2-3): probed (the exact gain above the
+    allowance) and probe-certified fits, the largest probe decrease, unresolved-block energy and flat-cell SSE."""
+    if not fd or not fd.get("fits"):
+        return ""
+    def g_(v):
+        return "-" if v is None else f"{v:.3g}"
+    return (f"; {what}: {fd['fits']}, probed {fd['probed']}, probe-certified {fd['probe_certified']}, max probe decrease "
+            f"{g_(fd['max_probe_decrease'])}, max unresolved-block energy {g_(fd['max_unresolved_gain'])}, max flat-cell "
+            f"SSE {g_(fd['max_flat_sse'])}, min resolved Hessian eigenvalue {g_(fd['min_hess_min'])}")
+
 def primary_p(d):
     """The p-value of the frozen primary lack-of-fit test (infer.PRIMARY) from a row's fields."""
     return d.get("p_lof_flip") if infer.PRIMARY["test"] == "signflip" else d.get("p_lof")
@@ -1177,6 +1188,8 @@ def primary_blocks(rows, meta, registry, cores, sims, seed=5, kind=infer.DEFAULT
                         "h1b_valid": ro["valid"],
                         "h1b_diagnostics": (f"logistic fits converged {ro['fits_converged']}/{ro['conditions']}; "
                                             f"bootstrap draws with an unconverged refit {ro['boot_not_converged']}/{bsims}"
+                                            + _fit_diag_text("fits", ro.get("fit_diag"))
+                                            + _fit_diag_text("bootstrap refits", ro.get("boot_fit_diag"))
                                             + (f"; INVALID: {ro['invalid']} (descriptive p "
                                                + (f"{ro['p_flip_unconverged']:.5g}" if ro["p_flip_unconverged"] is not None
                                                   else "unavailable") + ")"

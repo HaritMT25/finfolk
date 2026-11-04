@@ -1653,7 +1653,8 @@ def decide(groups, h1b=True):
     if not ro["valid"]:
         why = (why + "; " if why else "") + str(ro.get("invalid"))
     conj = max(p1, p1b) if p1 is not None and p1b is not None else None
-    return {"p1": p1, "p1b": p1b, "conj": conj, "h1b_valid": bool(ro["valid"]), "valid": conj is not None, "why": why}
+    return {"p1": p1, "p1b": p1b, "conj": conj, "h1b_valid": bool(ro["valid"]), "valid": conj is not None, "why": why,
+            "fit_diag": ro.get("fit_diag")}
 
 
 def _source_fit(zq):

@@ -314,10 +314,32 @@ def _task_problems(r, t, man_sha, run_sha):
         probs.append("plants malformed")
     if not isinstance(r.get("problems", []), list):
         probs.append("problems malformed")
+    fd = r.get("fit_diag")
+    if t[1] in ("E", "G"):
+        if fd is not None:
+            probs.append("an H1-only world with fit diagnostics")
+    elif not _fit_diag_ok(fd, n):
+        probs.append("fit_diag malformed")
     return probs
 
 
+def _fit_diag_ok(fd, n):
+    """A task's detector-fit summary (bounded.fit_diag): the keys, sane counts (at most four fits per dataset),
+    finite or None extremes."""
+    if not isinstance(fd, dict) or sorted(fd) != sorted(bounded.FIT_DIAG_KEYS):
+        return False
+    cnt = [fd[k_] for k_ in ("fits", "unconverged", "probed", "probe_certified")]
+    if not all(isinstance(v, int) and not isinstance(v, bool) and v >= 0 for v in cnt):
+        return False
+    if not (fd["fits"] <= 4 * n and fd["unconverged"] <= fd["fits"] and fd["probe_certified"] <= fd["probed"] <= fd["fits"]):
+        return False
+    return all(fd[k_] is None or (isinstance(fd[k_], (int, float)) and not isinstance(fd[k_], bool) and math.isfinite(fd[k_]))
+               for k_ in ("max_probe_decrease", "max_unresolved_gain", "max_flat_sse", "min_hess_min"))
+
+
 # ------------------------------------------------------------------- the worker side
+FIT_REPORTS = ("rank", "flat_sse", "probe_decrease", "unresolved_gain", "hess_min", "hess_max")
+
 W = {}
 
 
@@ -342,7 +364,8 @@ def _bounded_state():
         for c in range(C):
             f = bounded.fit_matrix(zq[g][c])
             st["fit_info"][f"{g}/{c}"] = {"converged": bool(f["converged"]), "reason": f.get("reason"),
-                                          "grad": f.get("grad"), "stationarity": f.get("stationarity"), "sse": f["sse"]}
+                                          "grad": f.get("grad"), "stationarity": f.get("stationarity"), "sse": f["sse"],
+                                          **{k_: f.get(k_) for k_ in FIT_REPORTS}}
             if not f["converged"]:
                 st["problems"].append(f"source fit {g}/{c} not converged ({f.get('reason')})")
             st["base"][(g, c)] = calibrate._ladder(f["params"], list(range(N)), N)
@@ -456,9 +479,12 @@ def run_task(t):
     rnd = random.Random(seed)
     res = {"index": idx, "world": world, "variant": variant, "n": n, "seed": seed, "outer": outer,
            "rej": {"H1": 0, "H1b": 0, "claim": 0}, "rej05": {"H1": 0, "H1b": 0, "claim": 0},
-           "unavailable": {"H1": 0, "H1b": 0, "claim": 0}, "why": {}, "plants": None, "built": True, "problems": []}
+           "unavailable": {"H1": 0, "H1b": 0, "claim": 0}, "why": {}, "plants": None, "built": True, "problems": [],
+           "fit_diag": None}
 
     def count(dec, tests):
+        if "H1b" in tests:   # (review of #49, round 4, P2-3: every H1b decision's fit reports, summarized)
+            res["fit_diag"] = bounded.merge_fit_diag(res["fit_diag"], dec.get("fit_diag"))
         for t_, p_ in (("H1", dec["p1"]), ("H1b", dec["p1b"]), ("claim", dec["conj"])):
             if t_ not in tests:
                 continue
@@ -477,6 +503,7 @@ def run_task(t):
             count(calibrate.decide(groups, h1b=False), ("H1",))
     else:
         st = _bounded_state()
+        res["fit_diag"] = bounded.fit_diag()
         laws, plants, probs = _variant(variant)
         res["plants"] = plants
         res["problems"] = st["problems"] + probs
@@ -591,6 +618,8 @@ def aggregate(results, sched):
                 a["problems"].append(p_)
         if r.get("fit_info") is not None:
             a["fit_info"] = r["fit_info"]
+        if r.get("fit_diag") is not None:
+            a["fit_diag"] = bounded.merge_fit_diag(a.get("fit_diag"), r["fit_diag"])
     return agg
 
 
@@ -664,7 +693,7 @@ def decide_gate(agg, counts, formal, bank_probs, ref_plants=None):
 
 
 def diagnostics(agg, counts):
-    out = {"placements_and_triangles": [], "outer": None, "raw_procedure_rates": []}
+    out = {"placements_and_triangles": [], "outer": None, "raw_procedure_rates": [], "fit_classifier": []}
     for g, c in PLACEMENTS:
         for v in (f"place-g{g}c{c}", f"tri-g{g}c{c}"):
             a = agg[("L", v)]
@@ -696,6 +725,8 @@ def diagnostics(agg, counts):
     for (w, v), a in sorted(agg.items()):
         if v.startswith("outer"):
             continue
+        if a.get("fit_diag") is not None:   # (review of #49, round 4, P2-3: reported, not gating)
+            out["fit_classifier"].append({"world": w, "variant": v, "n": a["n"], **a["fit_diag"]})
         out["raw_procedure_rates"].append({"world": w, "variant": v, "n": a["n"],
                                            **{f"{t_}_raw_at_a": (a["rej"][t_] / a["n"] if a["n"] else None)
                                               for t_ in ("H1", "H1b", "claim")},
@@ -759,6 +790,20 @@ def report_md(dec):
         pl = "; ".join(f"{gc}: {x['d_res']:.5f} / {x['c']:.5f} / {x['clipped']}" for gc, x in (r["plants"] or {}).items())
         md.append(f"| {r['variant']} | {r['n']} | {(r['H1']['rate'] or 0):.4f} | {(r['H1b']['rate'] or 0):.4f} | "
                   f"{(r['claim']['rate'] or 0):.4f} [{r['claim']['cp_lo']:.4f}, {r['claim']['cp_hi']:.4f}] | {pl} |")
+    fc = d.get("fit_classifier") or []
+    if fc:
+        tot = None
+        for x in fc:
+            tot = bounded.merge_fit_diag(tot, {k_: x[k_] for k_ in bounded.FIT_DIAG_KEYS})
+
+        def g_(v):
+            return "-" if v is None else f"{v:.3g}"
+        md.append("\nDetector fits (H1b's four logistic mean fits per dataset; reported, not gating): "
+                  f"{tot['fits']} fits, {tot['unconverged']} unconverged, {tot['probed']} probed (exact gain above the "
+                  f"allowance), {tot['probe_certified']} probe-certified; largest probe decrease "
+                  f"{g_(tot['max_probe_decrease'])}, unresolved-block energy {g_(tot['max_unresolved_gain'])}, "
+                  f"flat-cell SSE {g_(tot['max_flat_sse'])}; smallest resolved Hessian eigenvalue "
+                  f"{g_(tot['min_hess_min'])}.\n")
     if d["outer"]:
         o = d["outer"]
         md.append(f"\nOuter bank resamples ({o['resamples']} x {o['inner']}, H1 in world E): level at a mean "
