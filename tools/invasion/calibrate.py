@@ -121,7 +121,7 @@ import bounded  # noqa: E402
 import hodge  # noqa: E402
 import infer  # noqa: E402
 
-ALPHAS = (0.05, 0.01, 0.0045, 0.05 / 12)   # 0.05/12: Holm's first step over hypotheses 1-11 + 1b
+ALPHAS = (0.05, 0.01, 0.0045, 0.05 / 12)   # 0.05/12 = a: the fixed allocation of each of the twelve slots
 D_GRID = (0.0025, 0.005, 0.01, 0.02)
 WORLDS = ("iso", "hetero", "pilotcov", "empirical", "skew", "concentrated", "skewfactor", "mixture", "rare1", "bounded")
 CODE = ("calibrate.py", "infer.py", "hodge.py", "bounded.py")
@@ -481,10 +481,41 @@ def task_bnull(args):
 # Review round 5: strict validation also binds the bank to its APPROVED original plan (plan_sha256 =
 # bank1/plan.jsonl as registered on 2026-11-02, so its items, snapshot hashes, seeds and policies), and checks
 # the arena state policy, every assay's predator count and the run length explicitly.
-BANK_SPEC = {"schema": "finfolk.invasion.bank-spec/2", "clock": "steps", "frac": 0.05, "G": 13500.0,
+# Prereg gate (review round 5 items 3 / 6): the bank's ORIGINAL identity is frozen here too - every
+# registered item ID with the SHA-256 of its snapshot, per core (from bank1/plan.jsonl as approved,
+# sha256 1040e673...), and the complete registered bank, 28,800 cells; validate_bank checks the plan's
+# cells, the export's groups and items, and the analysis' inputs.json (every registered cell finished,
+# none excluded or unregistered, no identity problem, each item read from exactly its registered file).
+BANK_ITEMS = {
+    "np": {"n201l": "6ceb84c7da340af2e2231024a3aa05e4e38a74c10ab9979704d2d91b51f77a34",
+           "n201m": "c91f6244222e6191bff361dcd5c8adbd63befe4cc0a98410658863448aef448b",
+           "n202l": "683a58c2b11f39bacc25b4c8999b632cf7f4aa5e1fac52c1fa2e13b1fa72ec16",
+           "n202m": "e9c59ca8260340809285be4bf0a9fc0b0d26f4c0f369438591c27858486d1937",
+           "n203l": "a91fdd8332bea370cfdb82b2c10cf403cbf16c1ce899e44fa497f0347157cd68",
+           "n203m": "ef29720b512dd651f4df1f6d708facb1bb2a27cc60df7f28d47883e130c4e176",
+           "n204l": "c9aa4a2ac4ee6d7df9f2e661e4522be53221c58d18c811c6761a08db76b2a724",
+           "n204m": "6551c5bc73ef5f04ee774529e11cf8ed05de2eb1b1e74ce137b380ff3aad168a",
+           "n205l": "6cc6b2cbec12f88118a75a6f8ab817fddffb0aba5a95391ef96b227e5cf608bd",
+           "n205m": "ef143a0641a5a24a268757fdf3f2f4f186f6981b2d0c8ac3c53653d9066724ca",
+           "n206l": "bd0ad132c25376789924aa09e9cd9e953aa13a951a8c51237d4f39fe15ea4903",
+           "n206m": "a911b66c25528ea03e755083bb9575046cdf0f28bd45f88ceb13ba92d892500b"},
+    "p4": {"p207l": "368adfbbd558a7de2648d3e370d3253feb3d6238e0cabe2bcfa0d89f40f5bf14",
+           "p207m": "d833a29137e95dc7e6d0d5af81415bdecb6d92b4b56e1dec927705427fab0e3c",
+           "p208l": "59815a651f7b978be9eedbc40bb37b6d8dfa1d27ec7a0e1869c6bd990054fbc2",
+           "p208m": "3fc080929030607879fadf395cb1cc7ae8dbb4b784101eb7807134889d36b8d0",
+           "p209l": "ca6b906b34cb5b471ad050de24c65facb6bee8f14f3049363d236c7954045935",
+           "p209m": "6ec6395ccc74024704b390701557d1884b1fddfc7b3e78f50b82721e63104cce",
+           "p210l": "4a6cf48d1abfa49624c25e09bdb7be68b6d4eba576b721484a55bd525f36f844",
+           "p210m": "c75e334836e8139e04e2bf45070980c760eb76660e4c67f29b8e744126bca68c",
+           "p211l": "ced4489b6461bec62dd30f4862814afc816fee8519081ac20646d453c26d93fd",
+           "p211m": "a537ada7130a940db01523e4f7bf9bb7d0291b0d1e17b199cf3d08d83202a2fb",
+           "p212l": "7fbf274caa042dcccda0f18a952f278662f82b7f68e9aeb5204d4523fe087442",
+           "p212m": "138b8948625ddc59e55fc3c27a3165cc087d74b99b906f11122813cd0fbdac2b"}}
+BANK_SPEC = {"schema": "finfolk.invasion.bank-spec/3", "clock": "steps", "frac": 0.05, "G": 13500.0,
              "assays": ["off", "predA4"], "groups": 2, "items": 12, "K": 50,
              "state": "slot", "predators": {"off": 0, "predA4": 4}, "steps": 13500,
-             "plan_sha256": "1040e6736a864e7794f47baf7ad4d17b04ebb2ed4631fb6431bd3834f6a00e77"}
+             "plan_sha256": "1040e6736a864e7794f47baf7ad4d17b04ebb2ed4631fb6431bd3834f6a00e77",
+             "registry": BANK_ITEMS, "cells": 28800}
 BLOCKS_SCHEMA = "finfolk.invasion.blocks/2"
 
 
@@ -515,7 +546,65 @@ def _finite_shape(z, N, K, what):
     return []
 
 
-def validate_bank(bb, spec, plan_cells=None, plan_sha=None):
+def validate_identity(spec, gnames, byk, cnames, plan_cells=None, inputs=None):
+    """The bank's original identity (prereg gate, review round 5 items 3 / 6): the spec's registry of
+    item IDs and snapshot hashes per core and its registered cell count, against the export's groups
+    and items, the plan's cells, and the analysis' inputs.json. -> problems."""
+    probs = []
+    reg, ncell = spec.get("registry"), spec.get("cells")
+    if reg is None and ncell is None:
+        return probs
+    if reg is not None:
+        if sorted(gnames) != sorted(reg):
+            probs.append(f"groups {sorted(gnames)} are not the registered cores {sorted(reg)}")
+        for g_ in gnames:
+            got = sorted(byk.get((g_, cnames[0]), {}).get("names", [])) if cnames else []
+            if g_ in reg and got != sorted(reg[g_]):
+                probs.append(f"group {g_}: items {got[:4]}... are not its registered item IDs {sorted(reg[g_])[:4]}...")
+    if plan_cells is not None:
+        if ncell is not None and len(plan_cells) != ncell:
+            probs.append(f"the plan has {len(plan_cells)} cells, the registered bank {ncell}")
+        if reg is not None:
+            bad = set()
+            for c in plan_cells:
+                core = reg.get(c.get("core"), {})
+                roles = [("resident", c.get("resident_name"), c.get("resident_sha256"))]
+                if c.get("mode") == "invade":
+                    roles.append(("invader", c.get("invader_name"), c.get("invader_sha256")))
+                for role, nm, h in roles:
+                    if core.get(nm) != h:
+                        bad.add(f"{c.get('core')}/{nm} ({role}) {str(h)[:12]}")
+            if bad:
+                probs.append(f"plan cells whose item / snapshot hash is not the registered one: {sorted(bad)[:4]} "
+                             f"({len(bad)})")
+    if inputs is None:
+        probs.append("no analysis inputs.json (--bank-inputs): the original bank identity (every registered cell "
+                     "finished, the snapshot files read) is unchecked")
+        return probs
+    pl = inputs.get("plan") or {}
+    if pl.get("sha256") != spec.get("plan_sha256"):
+        probs.append(f"inputs.json: plan {str(pl.get('sha256'))[:12]} is not the approved {str(spec.get('plan_sha256'))[:12]}")
+    if inputs.get("clock") != spec.get("clock"):
+        probs.append(f"inputs.json: clock {inputs.get('clock')!r}")
+    for fld in ("registered_missing", "unregistered_finished", "identity_problems"):
+        if inputs.get(fld):
+            probs.append(f"inputs.json: {fld} = {len(inputs[fld])} ({inputs[fld][:3]}...)")
+    if inputs.get("complete") is not True:
+        probs.append("inputs.json: the analysis is not complete")
+    if ncell is not None:
+        got = (inputs.get("finished"), pl.get("cells"), (inputs.get("cells_csv") or {}).get("cells"))
+        if any(x != ncell for x in got):
+            probs.append(f"inputs.json: finished / plan / cells.csv cells {got}, the registered bank {ncell}")
+    if reg is not None:
+        snaps = inputs.get("snapshots") or {}
+        want = {nm: h for g_ in reg.values() for nm, h in g_.items()}
+        if snaps != want:
+            diff = sorted(nm for nm in set(snaps) | set(want) if snaps.get(nm) != want.get(nm))
+            probs.append(f"inputs.json: snapshots read differ from the registered item IDs / hashes: {diff[:4]} ({len(diff)})")
+    return probs
+
+
+def validate_bank(bb, spec, plan_cells=None, plan_sha=None, inputs=None):
     """Check an analysis' blocks.json against the frozen bank specification (and, given the plan,
     against its registration): schema, the fixed-step clock, exactly the spec's assays and number
     of groups at (frac, G), unique (group, assay) keys, every block formal, `items` items and
@@ -606,6 +695,9 @@ def validate_bank(bb, spec, plan_cells=None, plan_sha=None):
                 reps.setdefault((c["condition"], c["invader_name"], c["resident_name"]), set()).add(c["replicate"])
         if any(v != set(range(K)) for v in reps.values()):
             probs.append(f"the plan's core cells do not all register replicates 0..{K - 1}")
+    if inputs is not None and inputs.get("analysis_code", {}).get("analyze.py") != bb.get("analysis_sha256"):
+        probs.append("inputs.json and the export come from different analyses (analyze.py hashes differ)")
+    probs += validate_identity(spec, gnames, byk, cnames, plan_cells, inputs)
     return gnames, cnames, byk, probs
 
 
@@ -637,6 +729,38 @@ def _bank_cov(res_g):
     return out
 
 
+def draw_bank_dataset(world, groups0, covs, k, rnd):
+    """One k-replicate dataset from an error bank's centred, variance-restored units groups0[g][c]:
+    'bank' (preregistration world E) draws k units per column WITH replacement, the same draw for
+    every assay of a group (aligned units), groups independently; 'bank-gauss' (world G) draws
+    Gaussian units with each column's joint cross-assay covariance (covs = _bank_cov per group)."""
+    groups = []
+    N = len(groups0[0][0])
+    for g, rg in enumerate(groups0):
+        C = len(rg)
+        zs = [[None] * N for _ in range(C)]
+        for p in range(N):
+            if world == "bank":
+                K = len(rg[0][p])
+                pick = [rnd.randrange(K) for _ in range(k)]
+                for ci in range(C):
+                    zs[ci][p] = [list(rg[ci][p][i]) for i in pick]
+            else:
+                idx, L = covs[g][p]
+                for ci in range(C):
+                    zs[ci][p] = []
+                for _r in range(k):
+                    e = [rnd.gauss(0, 1) for _ in idx]
+                    v = [sum(L[a][t] * e[t] for t in range(a + 1)) for a in range(len(idx))]
+                    rows = [[0.0] * N for _ in range(C)]
+                    for (ci, i), x in zip(idx, v):
+                        rows[ci][i] = x
+                    for ci in range(C):
+                        zs[ci][p].append(rows[ci])
+        groups.append(zs)
+    return groups
+
+
 def task_bank(args):
     """Omnibus calibration from an error bank (review round 3): k units per column drawn WITH
     replacement from the bank's centred, variance-restored units, the same draw for every assay of
@@ -652,29 +776,7 @@ def task_bank(args):
     plants = G["bank_plants"]
     c = Counter()
     for _ in range(n):
-        groups = []
-        for g, rg in enumerate(groups0):
-            C = len(rg)
-            zs = [[None] * N for _ in range(C)]
-            for p in range(N):
-                if world == "bank":
-                    K = len(rg[0][p])
-                    pick = [rnd.randrange(K) for _ in range(k)]
-                    for ci in range(C):
-                        zs[ci][p] = [list(rg[ci][p][i]) for i in pick]
-                else:
-                    idx, L = covs[g][p]
-                    for ci in range(C):
-                        zs[ci][p] = []
-                    for _r in range(k):
-                        e = [rnd.gauss(0, 1) for _ in idx]
-                        v = [sum(L[a][t] * e[t] for t in range(a + 1)) for a in range(len(idx))]
-                        rows = [[0.0] * N for _ in range(C)]
-                        for (ci, i), x in zip(idx, v):
-                            rows[ci][i] = x
-                        for ci in range(C):
-                            zs[ci][p].append(rows[ci])
-            groups.append(zs)
+        groups = draw_bank_dataset(world, groups0, covs, k, rnd)
         bs = rnd.randrange(1 << 30)
         FC = boot_null(groups, B, bs, kind)[0] if G.get("omni_tests", "both") == "both" else None
 
@@ -695,46 +797,313 @@ def task_bank(args):
             C0), c.cnt, n
 
 
-ZIB_PZ = 0.05        # exact-zero probability of a losing invader (mu < ZIB_LOSING), as in the pilot
+# ------------------------------------------------ the bounded marginal law (preregistration section 4)
+# "Bounded marginal specification": for fitted mean mu and bank sample variance v, require
+# 0 <= v <= mu (1 - mu) and match both moments exactly. For 0 < mu < 0.03 a zero mass
+# p0 = min(0.05, v / (2 (v + mu^2))), otherwise p0 = 0; the rest is a Beta with mean mb = mu / (1 - p0)
+# and variance vb = (v + mu^2) / (1 - p0) - mb^2 (vb <= mb (1 - mb) iff v <= mu (1 - mu), whatever p0).
+# A point mass at v = 0, a Bernoulli(mu) endpoint at v = mu (1 - mu). No silent mean or variance
+# clipping: an invalid specification is reported (valid False) and fails the gate. (Review round 5
+# items 5 / 6: the old law capped feasible variances at 0.9 mb (1 - mb), ZIB_VMAX, and had no
+# Bernoulli branch.) Alternatives keep r = v / (mu (1 - mu)) as the mean changes (marginal_alt).
+ZIB_PZ = 0.05        # the largest exact-zero probability of a losing invader (mu < ZIB_LOSING), as in the pilot
 ZIB_LOSING = 0.03
-ZIB_VMAX = 0.9       # the Beta part's variance stays <= 0.9 mb (1 - mb) (phi >= 1/9: no degenerate U)
+MARGINAL_EDGE = 1e-12   # relative: v within this of mu (1 - mu) is the Bernoulli endpoint (rounding only)
+
+
+def marginal(mu, v, cap=False):
+    """The registered endpoint law for mean mu and variance v (see above). cap=True is ONLY for the
+    pilot-sourced pre-check world (pooled pilot SDs meet unrelated means; the approval keeps them,
+    capped cells diagnosed): an infeasible v is set to mu (1 - mu) and flagged 'capped'.
+    -> dict(kind 'point' | 'beta' | 'bernoulli' | 'invalid', mu, v (achieved), v_req, p0, mb, vb, alpha,
+    beta, valid, capped, reason)."""
+    out = {"mu": mu, "v": v, "v_req": v, "p0": 0.0, "mb": mu, "vb": 0.0, "alpha": None, "beta": None,
+           "valid": True, "capped": False, "reason": None, "kind": "point"}
+    if not (isinstance(mu, (int, float)) and isinstance(v, (int, float)) and math.isfinite(mu) and math.isfinite(v)):
+        return dict(out, kind="invalid", valid=False, reason=f"non-finite mean / variance ({mu}, {v})")
+    if not 0.0 < mu < 1.0:
+        return dict(out, kind="invalid", valid=False, reason=f"mean {mu!r} outside (0, 1)")
+    if v < 0.0:
+        return dict(out, kind="invalid", valid=False, reason=f"negative variance {v!r}")
+    vmax = mu * (1.0 - mu)
+    if v > vmax * (1.0 + MARGINAL_EDGE):
+        if not cap:
+            return dict(out, kind="invalid", valid=False,
+                        reason=f"variance {v:.6g} > mu (1 - mu) = {vmax:.6g} at mu = {mu:.6g} (infeasible)")
+        out.update(v=vmax, capped=True)
+        v = vmax
+    if v == 0.0:
+        return out
+    if v >= vmax * (1.0 - MARGINAL_EDGE):
+        return dict(out, kind="bernoulli", v=vmax, mb=mu, vb=vmax)
+    p0 = min(ZIB_PZ, v / (2.0 * (v + mu * mu))) if mu < ZIB_LOSING else 0.0
+    mb = mu / (1.0 - p0)
+    vb = (v + mu * mu) / (1.0 - p0) - mb * mb
+    if not 0.0 < vb < mb * (1.0 - mb):   # (rounding at the edges only; the algebra above guarantees it)
+        return dict(out, kind="invalid", valid=False, reason=f"Beta part infeasible (mb {mb:.6g}, vb {vb:.6g})")
+    phi = mb * (1.0 - mb) / vb - 1.0
+    return dict(out, kind="beta", p0=p0, mb=mb, vb=vb, alpha=mb * phi, beta=(1.0 - mb) * phi)
+
+
+def marginal_alt(mu0, v0, mu, cap=False):
+    """The alternative's law at a planted mean mu: the null cell's r = v0 / (mu0 (1 - mu0)) is kept
+    (preregistration: 'hold v / {mu (1 - mu)} fixed as the mean changes'), v = r mu (1 - mu)."""
+    m0 = marginal(mu0, v0, cap)
+    if not m0["valid"]:
+        return m0
+    r = m0["v"] / (mu0 * (1.0 - mu0))
+    return marginal(mu, r * mu * (1.0 - mu))
+
+
+def marginal_moments(m):
+    """(mean, variance) of the law m, computed from its parts (a check of the construction)."""
+    if m["kind"] == "point":
+        return m["mu"], 0.0
+    if m["kind"] == "bernoulli":
+        return m["mu"], m["mu"] * (1.0 - m["mu"])
+    q = 1.0 - m["p0"]
+    mean = q * m["mb"]
+    return mean, q * (m["vb"] + m["mb"] ** 2) - mean * mean
+
+
+def draw_marginal(rnd, m):
+    """One independent endpoint draw from the law m (L world)."""
+    k = m["kind"]
+    if k == "point":
+        return m["mu"]
+    if k == "bernoulli":
+        return 1.0 if rnd.random() < m["mu"] else 0.0
+    if k != "beta":
+        raise ValueError(f"no draw from an invalid law: {m['reason']}")
+    if m["p0"] and rnd.random() < m["p0"]:
+        return 0.0
+    return rnd.betavariate(m["alpha"], m["beta"])
 
 
 def zib_moments(mu, sd):
-    """The zero-inflated Beta endpoint law for mean mu and SD sd (review round 4: the MEAN is exact,
-    never clipped, so a null world's declared means are the generator's means; the SD is exact
-    whenever it is feasible). X = 0 with probability pz, else Beta with mean mb = mu / (1 - pz) and
-    variance vb, so E X = mu and Var X = (1 - pz)(vb + mb^2) - mu^2.
-      pz   ZIB_PZ for a losing invader (mu < ZIB_LOSING: exact zeros), lowered to half of
-           sd^2 / (sd^2 + mu^2) where the zeros alone would exceed the requested variance;
-      vb   from the requested variance; feasible iff sd^2 < mu (1 - mu) (the Bernoulli bound,
-           whatever pz); kept <= ZIB_VMAX mb (1 - mb): a request beyond it is CAPPED (flagged,
-           its achieved SD returned).
-    A mean outside (0, 1) has only the point mass (flagged 'boundary').
-    -> {pz, mb, vb, sd (achieved), capped, boundary}."""
-    s2 = sd * sd
-    if not 0.0 < mu < 1.0:
-        return {"pz": 0.0, "mb": min(max(mu, 0.0), 1.0), "vb": 0.0, "sd": 0.0, "capped": sd > 0, "boundary": True}
-    pz = min(ZIB_PZ, 0.5 * s2 / (s2 + mu * mu)) if mu < ZIB_LOSING and s2 > 0 else 0.0
-    mb = mu / (1.0 - pz)
-    vb = (s2 + mu * mu) / (1.0 - pz) - mb * mb
-    vmax = ZIB_VMAX * mb * (1.0 - mb)
-    capped = vb > vmax
-    vb = min(max(vb, 0.0), vmax)
-    return {"pz": pz, "mb": mb, "vb": vb, "sd": math.sqrt(max(0.0, (1.0 - pz) * (vb + mb * mb) - mu * mu)),
-            "capped": capped, "boundary": False}
+    """Compatibility view of marginal() for the pilot-sourced pre-check world (requested SD sd; an
+    infeasible request is capped at the Bernoulli bound and flagged). -> {pz, mb, vb, sd (achieved),
+    capped, boundary, valid}."""
+    m = marginal(mu, sd * sd, cap=True)
+    if not m["valid"]:
+        return {"pz": 0.0, "mb": min(max(mu, 0.0), 1.0), "vb": 0.0, "sd": 0.0, "capped": sd > 0, "boundary": True,
+                "valid": False}
+    return {"pz": m["p0"], "mb": m["mb"], "vb": m["vb"], "sd": math.sqrt(marginal_moments(m)[1]),
+            "capped": m["capped"], "boundary": False, "valid": True}
 
 
 def _zib(rnd, mu, sd):
-    """One support-preserving endpoint draw in [0, 1] with mean exactly mu (zib_moments)."""
-    m = zib_moments(mu, sd)
-    if m["pz"] and rnd.random() < m["pz"]:
-        return 0.0
-    mb, vb = m["mb"], m["vb"]
-    if m["boundary"] or vb <= 1e-15 * mb * (1.0 - mb):
-        return mb
-    phi = mb * (1.0 - mb) / vb - 1.0
-    return rnd.betavariate(mb * phi, (1.0 - mb) * phi)
+    """One support-preserving endpoint draw in [0, 1] with mean exactly mu (pilot-sourced world: the
+    requested SD capped at the Bernoulli bound when infeasible)."""
+    m = marginal(mu, sd * sd, cap=True)
+    return draw_marginal(rnd, m) if m["valid"] else min(max(mu, 0.0), 1.0)
+
+
+# ---------------------------------------------- quantiles of the law (joint worlds: q = F^-1(Phi(W)))
+def _log_tails(a, b, lb, t):
+    """(log I_x(a, b), log(1 - I_x(a, b))) at x = sigmoid(t), both to full relative precision in either
+    tail (lb = lgamma(a + b) - lgamma(a) - lgamma(b))."""
+    lx = -math.log1p(math.exp(-t)) if t > -700 else t          # log x
+    l1x = -math.log1p(math.exp(t)) if t < 700 else -t          # log (1 - x)
+    lf = lb + a * lx + b * l1x
+    x, x1 = math.exp(lx), math.exp(l1x)
+    if x < (a + 1.0) / (a + b + 2.0):
+        llo = lf + math.log(hodge._betacf(a, b, x) / a)
+        lhi = math.log1p(-math.exp(llo)) if llo < -1e-300 else -math.inf
+        return llo, lhi
+    lhi = lf + math.log(hodge._betacf(b, a, x1) / b)
+    llo = math.log1p(-math.exp(lhi)) if lhi < -1e-300 else -math.inf
+    return llo, lhi
+
+
+QTABLE_S = 36.0      # tabulated |logit u| range (u down to ~2e-16); beyond it the quantile is solved exactly
+QTABLE_TOL = 1e-10   # interpolation error allowed at every interval midpoint, in logit(x)
+
+
+class BetaQuantile:
+    """Quantile function of Beta(a, b), tabulated in (s, t) = (logit u, logit x) with exact nodes and
+    exact slopes dt/ds and cubic Hermite interpolation, refined until the interpolant matches the exact
+    curve at every interval midpoint to QTABLE_TOL (|x error| <= QTABLE_TOL / 4); |s| > QTABLE_S is
+    solved exactly by bisection. The self-test compares it with exact inversion."""
+
+    def __init__(self, a, b):
+        import bisect as _b
+        self._bisect = _b.bisect_right
+        self.a, self.b = a, b
+        self.lb = math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b)
+        mean = a / (a + b)
+        t0 = math.log(mean / (1.0 - mean))
+        lo_t, hi_t = t0, t0
+        step = 0.5
+        nodes = [self._node(t0)]
+        while nodes[0][0] > -QTABLE_S:
+            lo_t -= step
+            step *= 1.6
+            nodes.insert(0, self._node(lo_t))
+        step = 0.5
+        while nodes[-1][0] < QTABLE_S:
+            hi_t += step
+            step *= 1.6
+            nodes.append(self._node(hi_t))
+        out = [nodes[0]]
+        stack = [(nodes[i], nodes[i + 1]) for i in range(len(nodes) - 1)][::-1]
+        while stack:
+            n0, n1 = stack.pop()
+            tm = 0.5 * (n0[1] + n1[1])
+            nm = self._node(tm)
+            if (abs(n1[0] - n0[0]) > 0.5 or abs(self._herm(n0, n1, nm[0]) - tm) > QTABLE_TOL) and n1[1] - n0[1] > 1e-9:
+                stack.append((nm, n1))
+                stack.append((n0, nm))
+            else:
+                out.append(n1)
+        from array import array
+        self.s = array("d", (n[0] for n in out))   # (compact: a worker holds ~1,000 of these tables)
+        self.t = array("d", (n[1] for n in out))
+        self.d = array("d", (n[2] for n in out))
+
+    def _node(self, t):
+        llo, lhi = _log_tails(self.a, self.b, self.lb, t)
+        s = llo - lhi
+        lx = -math.log1p(math.exp(-t)) if t > -700 else t
+        l1x = -math.log1p(math.exp(t)) if t < 700 else -t
+        # ds/dt = x^a (1 - x)^b / (B u (1 - u))
+        lds = self.a * lx + self.b * l1x + self.lb - llo - lhi
+        return s, t, math.exp(-lds) if lds > -700 else 0.0
+
+    @staticmethod
+    def _herm(n0, n1, s):
+        h = n1[0] - n0[0]
+        if h <= 0:
+            return n0[1]
+        u = (s - n0[0]) / h
+        u2, u3 = u * u, u * u * u
+        return ((2 * u3 - 3 * u2 + 1) * n0[1] + (u3 - 2 * u2 + u) * h * n0[2]
+                + (-2 * u3 + 3 * u2) * n1[1] + (u3 - u2) * h * n1[2])
+
+    def exact_t(self, s):
+        lo, hi = self.t[0], self.t[-1]
+        while self._node(lo)[0] > s:
+            lo -= max(1.0, abs(lo))
+        while self._node(hi)[0] < s:
+            hi += max(1.0, abs(hi))
+        for _ in range(200):
+            mid = 0.5 * (lo + hi)
+            if self._node(mid)[0] < s:
+                lo = mid
+            else:
+                hi = mid
+            if hi - lo <= 1e-13 * max(1.0, abs(mid)):
+                break
+        return 0.5 * (lo + hi)
+
+    def __call__(self, lo, hi):
+        """x = F^-1(u) from (u, 1 - u), each accurate in its own tail."""
+        if lo <= 0.0:
+            return 0.0
+        if hi <= 0.0:
+            return 1.0
+        s = math.log(lo) - math.log(hi)
+        if s <= self.s[0] or s >= self.s[-1]:
+            t = self.exact_t(s)
+        else:
+            k = self._bisect(self.s, s)
+            t = self._herm((self.s[k - 1], self.t[k - 1], self.d[k - 1]), (self.s[k], self.t[k], self.d[k]), s)
+        return bounded.sigmoid(t)
+
+
+_QCACHE = {}
+
+
+def quantile_marginal(m, lo, hi):
+    """F^-1 of the law m at u, given as (u, 1 - u) (each accurate in its own tail)."""
+    k = m["kind"]
+    if k == "point":
+        return m["mu"]
+    if k == "bernoulli":
+        return 1.0 if hi < m["mu"] else 0.0
+    if k != "beta":
+        raise ValueError(f"no quantile of an invalid law: {m['reason']}")
+    p0 = m["p0"]
+    if p0:
+        if lo <= p0:
+            return 0.0
+        lo, hi = (lo - p0) / (1.0 - p0), hi / (1.0 - p0)
+    key = (m["alpha"], m["beta"])
+    q = _QCACHE.get(key)
+    if q is None:
+        if len(_QCACHE) > 4096:
+            _QCACHE.clear()
+        q = _QCACHE[key] = BetaQuantile(m["alpha"], m["beta"])
+    return q(lo, hi)
+
+
+def _phi_tails(w):
+    """(Phi(w), 1 - Phi(w)), each accurate in its own tail."""
+    return 0.5 * math.erfc(-w / math.sqrt(2.0)), 0.5 * math.erfc(w / math.sqrt(2.0))
+
+
+# ------------------------------------------ joint bounded stress worlds (preregistration section 4)
+# "Joint stress specification": within one resident column p (one replicate, one home group), for
+# assay c and invader i != p, W_ci = (-1)^i {sqrt(kappa) H + sqrt(0.8 - kappa) H_c} + sqrt(0.2) e_ci,
+# q_ci = F_ci^-1(Phi(W_ci)), with independent standard normals; columns, replicates and groups are
+# independent. kappa = 0 (J0) or 0.8 (J8) is the latent cross-assay correlation; within an assay the
+# column factor loads (-1)^i with latent correlation +-0.8.
+# Rare-event worlds (kappa = 0.8): for SELECTED coordinates U = Phi(W) becomes (1 - pi) U without the
+# column's shared Bernoulli(pi) event and 1 - pi + pi U with it (each marginal stays exactly uniform);
+# the event is shared across the column's selected coordinates and both assays. 'Reflect alternate
+# coordinates as 1 - U' is implemented as conjugation, U' = 1 - T(1 - U), on the odd invaders (the ones
+# the column factor loads with -1): the event sends even invaders to their top pi-quantile and odd ones
+# to their bottom pi-quantile, the column factor's own +-1 pattern is kept, and pi -> 0 recovers J8
+# exactly. Distributed: every column's invaders; concentrated: resident 0, invaders 1 and 2 (opposite
+# reflections). pi = 0.05 (R05) or 0.01 (R01).
+JOINT_WORLDS = {
+    "J0": {"kappa": 0.0, "rare": None},
+    "J8": {"kappa": 0.8, "rare": None},
+    "R05-D": {"kappa": 0.8, "rare": {"pi": 0.05, "where": "distributed"}},
+    "R05-C": {"kappa": 0.8, "rare": {"pi": 0.05, "where": "concentrated"}},
+    "R01-D": {"kappa": 0.8, "rare": {"pi": 0.01, "where": "distributed"}},
+    "R01-C": {"kappa": 0.8, "rare": {"pi": 0.01, "where": "concentrated"}},
+}
+
+
+def rare_selected(where, p, i):
+    """Is coordinate (column p, invader i) selected for the shared rare event?"""
+    if where == "distributed":
+        return i != p
+    if where == "concentrated":
+        return p == 0 and i in (1, 2)
+    raise ValueError(where)
+
+
+def joint_column(rnd, margs, p, kappa, rare=None):
+    """One replicate of resident column p in every assay: margs[c][i] (the law of invader i in assay
+    c; margs[c][p] unused). -> q[c][i] (q[c][p] = 0)."""
+    C, N = len(margs), len(margs[0])
+    H = rnd.gauss(0.0, 1.0)
+    Hc = [rnd.gauss(0.0, 1.0) for _ in range(C)]
+    sa, sb, se = math.sqrt(kappa), math.sqrt(max(0.0, 0.8 - kappa)), math.sqrt(0.2)
+    ev = None
+    if rare is not None and any(rare_selected(rare["where"], p, i) for i in range(N)):
+        ev = rnd.random() < rare["pi"]
+    out = []
+    for c in range(C):
+        row = [0.0] * N
+        f = sa * H + sb * Hc[c]
+        for i in range(N):
+            if i == p:
+                continue
+            w = (f if i % 2 == 0 else -f) + se * rnd.gauss(0.0, 1.0)
+            lo, hi = _phi_tails(w)
+            if ev is not None and rare_selected(rare["where"], p, i):
+                pi_ = rare["pi"]
+                if i % 2:
+                    lo, hi = hi, lo
+                lo, hi = ((1.0 - pi_ + pi_ * lo, pi_ * hi) if ev else ((1.0 - pi_) * lo, pi_ + (1.0 - pi_) * hi))
+                if i % 2:
+                    lo, hi = hi, lo
+            row[i] = quantile_marginal(margs[c][i], lo, hi)
+        out.append(row)
+    return out
 
 
 # ------------------------------------------------- planted alternatives in the compound world
@@ -744,11 +1113,15 @@ def _zib(rnd, mu, sd):
 # circulation per pair (||Q A(mean - null mean)|| / sqrt(P), after clipping), and d_res = the
 # NOISELESS residual RMS per pair after refitting the logistic model (||Q A(mean - logistic fit)|| /
 # sqrt(P)) - the cyclic signal beyond the logistic family that H1b tests. The gate's target is
-# defined on d_res: the 'feasible' plants put a divergence-free cycle on the LOGIT scale,
-# mean = sigmoid(eta + c v / 2 ...), inside (0, 1) for every c (no clipping), with c solved per
-# block so that d_res = the target exactly (relative tolerance PLANT_TOL).
+# defined on d_res (approved 2026-11-04): the plant at a target d_res is the preregistration's
+# construction (section 4, 'Achieved effect'; review round 5 item 7: it used to be a logit-scale plant
+# solved by regula falsi): the cycle on the PROBABILITY scale with amplitude c, clipped to PLANT_CLIP,
+# c = the first crossing of d_res(c) >= target on the grid 0, 0.001, ..., 1, then bisection to
+# |d_res - target| <= PLANT_TOL target (the approved construction tolerance, 1e-4 relative; tighter
+# than the draft's absolute 1e-5 at 0.01), every evaluation a converged noiseless logistic refit.
 PLANT_CLIP = (0.002, 0.998)
 PLANT_TOL = 1e-4
+PLANT_GRID = 1000      # c on 0, 1/PLANT_GRID, ..., 1
 
 
 def _cols_to_M(mean):
@@ -814,49 +1187,61 @@ def nominal_plant(mean0, v, d):
     return mean, n, tot, mx
 
 
-def feasible_plant(eta, mean0, th0, v, target, iters=40):
-    """The logit-scale plant at noiseless residual RMS d_res = target (see above): Illinois
-    regula falsi on c, each step one logistic refit (warm-started). -> dict(mean, c, d_add, d_res,
-    converged (the refit), solved (|d_res - target| <= PLANT_TOL target), evals)."""
-    N = len(eta)
-    g = [bounded.sigmoid(eta[p][i]) * (1.0 - bounded.sigmoid(eta[p][i])) for p in range(N) for i in range(N) if i != p]
+def feasible_plant(eta, mean0, th0, v, target, iters=60):
+    """The registered plant at noiseless residual RMS d_res = target (preregistration section 4):
+    mean(c) = clip(mean0 + c v / 2 on each reciprocal pair, PLANT_CLIP) on the probability scale (c > 0;
+    c = 0 is the null ladder, never clipped); the first grid point c_m = m / PLANT_GRID with
+    d_res(c_m) >= target, then bisection on [c_(m-1), c_m] (at most `iters` steps) until
+    |d_res - target| <= PLANT_TOL target. Every evaluation is a noiseless logistic refit, warm-started
+    from the previous one (deterministic). Not solved (an infeasible target, which fails the gate,
+    never silently weakened): no crossing on the grid, the bisection out of steps, or an unconverged
+    refit at the solution. (eta is unused: kept for the call signature.)
+    -> dict(mean, c, d_add, d_res, converged (the refit at c), solved, evals, grid_m, clipped,
+    clip_sum, clip_max, d_res_clip0 (d_res of the clipped null alone, c -> 0+))."""
     warm = [list(th0)]
+    evals = [0]
 
     def at(c):
-        e2 = _plant_cols(eta, v, c)
-        m = [[bounded.sigmoid(e2[p][i]) if i != p else 0.0 for i in range(N)] for p in range(N)]
+        m, ncl, tot, mx = nominal_plant(mean0, v, c)
         d_add, d_res, ok, th = plant_diagnostics(m, mean0, warm[0])
-        warm[0] = th
-        return d_res - target, {"mean": m, "c": c, "d_add": d_add, "d_res": d_res, "converged": ok}
-    a, fa = 0.0, -target                        # d_res(0) = 0: the null ladder is a logistic one
-    b = target / max(sum(g) / len(g), 1e-6)     # first order: d_res ~ c x the mean slope sigma'(eta)
-    fb, best = at(b)
-    evals = 1
-    while fb < 0 and evals < iters:             # bracket (d_res saturates: a target can be out of reach)
-        a, fa = b, fb
-        b *= 2.0
-        fb, x = at(b)
-        evals += 1
-        best = x if abs(fb) < abs(best["d_res"] - target) else best
-    side = 0
-    while fb >= 0 > fa and abs(best["d_res"] - target) > PLANT_TOL * target and evals < iters:
-        c = b - fb * (b - a) / (fb - fa)         # Illinois regula falsi, bracket [a, b]
-        fc, x = at(c)
-        evals += 1
-        if abs(fc) < abs(best["d_res"] - target):
+        if ok:
+            warm[0] = th
+        evals[0] += 1
+        return {"mean": m, "c": c, "d_add": d_add, "d_res": d_res, "converged": ok, "clipped": ncl,
+                "clip_sum": tot, "clip_max": mx}
+    clip0 = at(0.0)   # the clipped null (sub-0.002 cells moved up): what any c > 0 starts from
+    d_clip0 = clip0["d_res"]
+    prev, hit, gm = {"c": 0.0, "d_res": 0.0, "converged": True}, None, None
+    for m_ in range(1, PLANT_GRID + 1):
+        x = at(m_ / PLANT_GRID)
+        if not x["converged"]:
+            hit, gm = x, m_
+            break
+        if x["d_res"] >= target:
+            hit, gm = x, m_
+            break
+        prev = x
+    if hit is None:   # no crossing on [0, 1]: infeasible
+        return dict(prev, solved=False, evals=evals[0], grid_m=None, d_res_clip0=d_clip0,
+                    mean=prev.get("mean", mean0), d_add=prev.get("d_add", 0.0), clipped=prev.get("clipped", 0),
+                    clip_sum=prev.get("clip_sum", 0.0), clip_max=prev.get("clip_max", 0.0))
+    best, lo, hi = hit, prev["c"], hit["c"]
+    k = 0
+    while hit["converged"] and abs(best["d_res"] - target) > PLANT_TOL * target and k < iters:
+        x = at(0.5 * (lo + hi))
+        k += 1
+        if not x["converged"]:
             best = x
-        if fc >= 0:
-            b, fb = c, fc
-            if side == 1:
-                fa *= 0.5
-            side = 1
+            break
+        if x["d_res"] >= target:
+            hi = x["c"]
         else:
-            a, fa = c, fc
-            if side == -1:
-                fb *= 0.5
-            side = -1
-    best["solved"] = abs(best["d_res"] - target) <= PLANT_TOL * target
-    best["evals"] = evals
+            lo = x["c"]
+        if abs(x["d_res"] - target) <= abs(best["d_res"] - target):
+            best = x
+    best = dict(best)
+    best["solved"] = bool(best["converged"]) and abs(best["d_res"] - target) <= PLANT_TOL * target
+    best.update(evals=evals[0], grid_m=gm, d_res_clip0=d_clip0)
     return best
 
 
@@ -865,14 +1250,17 @@ def task_compound(args):
     omnibus), H1b (bounded.residual_omnibus sign-flip) and the claim (both <= alpha), under a
     TRANSITIVE bounded world: per group (home regime) N items drawn from the pilot's items, each
     assay's endpoint means the pilot block's fitted logistic ladder sigma(mu + a_i + b_j), cells'
-    SDs drawn from that block's endpoint SDs, support-preserving zero-inflated Beta endpoints
-    (zib_moments: the means EXACT, the SDs exact where feasible, capped SDs counted).
+    SDs drawn from that block's pooled endpoint SDs (the pilot-sourced pre-check world: an infeasible
+    pooled SD is capped at the Bernoulli bound, counted), independent endpoints from the registered
+    bounded marginal law (marginal(): exact means and variances).
     With an error bank (keys None): each group / condition is the bank's own primary block - its
-    fitted ladder over its own items (not resampled) and its cells' own SDs.
-    Review round 4: the null's means are the ladder itself (no clipping ever); alternatives are the
-    old nominal plants (probability scale, clipped, now measured: d_add, d_res, clipping) and the
-    feasible logit-scale plants at a registered d_res (see feasible_plant); a dataset whose H1b fit
-    did not converge counts as a non-rejection and stays in the denominator (its count reported)."""
+    fitted ladder over its own items (not resampled) and its cells' own variances, EXACT (an
+    infeasible cell makes the world not built: every dataset fails).
+    Review round 4 / prereg gate: the null's means are the ladder itself (no clipping ever);
+    alternatives are the old nominal plants (probability scale, clipped, measured: d_add, d_res,
+    clipping) and the registered plants at a target d_res (feasible_plant); alternative variances keep
+    v / (mu (1 - mu)). Raw procedure rates count an unavailable decision as a non-rejection; the
+    '[gate screen]' rows count it as a rejection under the null and a failure under an alternative."""
     keys, N, k, Gn, n, variants, seed = args
     fits, pools = [], []
     srcs = ([[(G["bank_zq"][g][c]) for c in range(len(G["bank_zq"][g]))] for g in range(len(G["bank_zq"]))]
@@ -899,6 +1287,7 @@ def task_compound(args):
     # with a bank the items (hence every noiseless mean and plant) are the same in every dataset:
     # each plant is built once per worker
     cache = G.setdefault("_plants", {}) if keys is None else None
+    cap = keys is not None   # pooled pilot SDs (the pre-check world) may be capped, diagnosed; a bank's never
     for _ in range(n):
         if keys is None:   # the bank's own items and cells
             items = [list(range(N)) for _ in range(Gn)]
@@ -920,18 +1309,17 @@ def task_compound(args):
                     plants[key_] = {"mean": mean, "clipped": ncl, "clip_sum": tot, "clip_max": mx, "d_add": d_add,
                                     "d_res": d_res, "converged": ok, "solved": True}
                 else:
-                    x = feasible_plant(eta, mean0, th0, tmpl[g], d)
-                    x.update(clipped=0, clip_sum=0.0, clip_max=0.0)
-                    plants[key_] = x
+                    plants[key_] = feasible_plant(eta, mean0, th0, tmpl[g], d)
             return plants[key_]
         for label, fam, d, where in vlist:
             groups = []
-            ncl = ncap = nbound = ncells = 0
+            ncl = ncap = nbad = ncells = 0
             clip_max, ratio_min, unsolved, refit_bad = 0.0, 1.0, 0, 0
             for g in range(Gn):
                 zs = []
                 for ci in range(C):
-                    mean = base[(g, ci)][1]   # the null mean: exactly the ladder (never clipped)
+                    mean0 = base[(g, ci)][1]   # the null mean: exactly the ladder (never clipped)
+                    mean = mean0
                     if d and (where == "all" or (g, ci) == (0, 0)):
                         x = planted(fam, d, g, ci)
                         mean = x["mean"]
@@ -944,41 +1332,54 @@ def task_compound(args):
                         c.stat("clipped cells per planted condition", label, x["clipped"])
                         c.stat("|clip| summed per planted condition", label, x["clip_sum"])
                         if fam == "target":
-                            c.stat("logit plant scale c", label, x["c"])
+                            c.stat("plant amplitude c (probability scale)", label, x["c"])
                             c.stat("refits to solve the plant", label, x["evals"])
+                            c.stat("d_res of the clipped null alone (c -> 0+)", label, x["d_res_clip0"])
+                    # the registered law (exact moments; alternatives keep v / (mu (1 - mu))); the pilot-sourced
+                    # world caps an infeasible pooled SD (diagnosed), the bank-sourced one never does
+                    laws = [[None] * N for _ in range(N)]
                     for p in range(N):
                         for i in range(N):
                             if i != p:
-                                m_ = zib_moments(mean[p][i], sds[g][ci][p][i])
+                                sd_ = sds[g][ci][p][i]
+                                m_ = (marginal(mean0[p][i], sd_ * sd_, cap) if mean is mean0
+                                      else marginal_alt(mean0[p][i], sd_ * sd_, mean[p][i], cap))
+                                laws[p][i] = m_
                                 ncells += 1
                                 ncap += m_["capped"]
-                                nbound += m_["boundary"]
-                                if sds[g][ci][p][i] > 0:
-                                    ratio_min = min(ratio_min, m_["sd"] / sds[g][ci][p][i])
-                    zs.append([[[_zib(rnd, mean[p][i], sds[g][ci][p][i]) if i != p else 0.0 for i in range(N)]
+                                nbad += not m_["valid"]
+                                if sd_ > 0 and m_["valid"] and mean is mean0:
+                                    ratio_min = min(ratio_min, math.sqrt(marginal_moments(m_)[1]) / sd_)
+                    if nbad:
+                        zs.append(None)
+                        continue
+                    zs.append([[[draw_marginal(rnd, laws[p][i]) if i != p else 0.0 for i in range(N)]
                                 for _ in range(k)] for p in range(N)])
                 groups.append(zs)
             # review round 5: a dataset is evidence about its label only if its world was built as
-            # registered - every source fit converged and, for a feasible plant, every planted block was
-            # solved to its target with a converged noiseless refit. Otherwise it is a FAILED dataset:
-            # no test is run, it stays in the denominator as a non-rejection (a power failure), counted.
-            built = src_ok and not (fam == "target" and (unsolved or refit_bad))
-            if built:
-                p1 = infer.signflip_groups(groups, "curl")
-                ro = bounded.residual_omnibus(groups)
-                p1b = ro["p_flip"]   # None: H1b invalid (a fit did not converge) -> no rejection, still counted
-            else:
-                p1 = p1b = None
-                ro = {"valid": False}
-            c.hit("H1 raw sign-flip omnibus", label, p1)
-            c.hit("H1b logistic residual sign-flip omnibus", label, p1b)
-            c.hit("claim: H1 and H1b", label, max(p1, p1b) if p1b is not None and p1 is not None else None)
-            c.cover(f"world not built as registered (source fit or plant failed; counted as a failure): {label}",
+            # registered - every source fit converged, every cell's law is valid (the bank-sourced world:
+            # exact moments or nothing) and, for a feasible plant, every planted block was solved to its
+            # target with a converged noiseless refit. Otherwise it is a FAILED dataset: no test is run,
+            # it stays in the denominator, counted (gate screen: a rejection under the null, a failure
+            # under an alternative).
+            built = src_ok and nbad == 0 and not (fam == "target" and (unsolved or refit_bad))
+            dec = decide(groups) if built else {"p1": None, "p1b": None, "conj": None, "h1b_valid": False,
+                                                 "valid": False, "why": "world not built as registered"}
+            c.hit("H1 raw sign-flip omnibus", label, dec["p1"])
+            c.hit("H1b logistic residual sign-flip omnibus", label, dec["p1b"])
+            c.hit("claim: H1 and H1b", label, dec["conj"])
+            # the gate screen (preregistration section 4, review round 5 item 10): an unavailable decision
+            # counts as a REJECTION in a null world and as a FAILURE under an alternative; the raw procedure
+            # rates above count it as a non-rejection
+            for t_, p_ in (("H1 raw sign-flip omnibus", dec["p1"]), ("H1b logistic residual sign-flip omnibus", dec["p1b"]),
+                           ("claim: H1 and H1b", dec["conj"])):
+                c.hit(f"{t_} [gate screen]", label, screen_p(p_, null=not d))
+            c.cover(f"world not built as registered (source fit, law or plant failed; counted as a failure): {label}",
                     not built)
-            c.cover(f"H1b invalid (a logistic fit did not converge): {label}", built and not ro["valid"])
-            c.cover(f"all four fits converged: {label}", ro["valid"])
+            c.cover(f"H1b invalid (a logistic fit did not converge): {label}", built and not dec["h1b_valid"])
+            c.cover(f"all four fits converged: {label}", dec["h1b_valid"])
             c.cover(f"feasible (no clipped mean): {label}", ncl == 0)
-            c.cover(f"feasible SDs (no capped cell, no boundary mean): {label}", ncap == 0 and nbound == 0)
+            c.cover(f"feasible SDs (no capped cell, no invalid law): {label}", ncap == 0 and nbad == 0)
             if d:
                 c.cover(f"plant at its target (feasible family: solved; refits converged): {label}",
                         unsolved == 0 and refit_bad == 0)
@@ -990,6 +1391,40 @@ def task_compound(args):
     return ((G.get("bank_label", "bank") if keys is None else "compound"), "compound", world, N, k, Gn, C), c.cnt, n, c.st
 
 
+def screen_p(p, null):
+    """The gate screen's p of one decision: an unavailable decision (p None) is a rejection (p = 0) in a
+    null world and a failure (None) under an alternative (preregistration section 4)."""
+    if p is None:
+        return 0.0 if null else None
+    return p
+
+
+def decide(groups, h1b=True):
+    """The frozen decision on one dataset (groups[g][c] = endpoint units), through ONE invalid path
+    (review round 5 item 4): H1 = the raw grouped sign-flip omnibus (no fit), H1b = bounded.residual_omnibus
+    (an unconverged / non-finite fit or a failed projection makes it unavailable), the claim = both <= alpha
+    (max of the two p's). Nothing raises: an error or a non-finite p is 'unavailable' with a reason.
+    -> dict(p1, p1b, conj, h1b_valid, valid (every requested decision available), why)."""
+    why = None
+    try:
+        p1 = infer.signflip_groups(groups, "curl")
+        if p1 is None or not math.isfinite(p1):
+            p1, why = None, "H1: non-finite sign-flip statistic"
+    except (ValueError, ArithmeticError) as e:
+        p1, why = None, f"H1 failed ({e})"
+    if not h1b:
+        return {"p1": p1, "p1b": None, "conj": None, "h1b_valid": False, "valid": p1 is not None, "why": why}
+    try:
+        ro = bounded.residual_omnibus(groups)
+    except (ValueError, ArithmeticError) as e:
+        ro = {"valid": False, "p_flip": None, "invalid": f"H1b failed ({e})"}
+    p1b = ro["p_flip"] if ro["valid"] else None
+    if not ro["valid"]:
+        why = (why + "; " if why else "") + str(ro.get("invalid"))
+    conj = max(p1, p1b) if p1 is not None and p1b is not None else None
+    return {"p1": p1, "p1b": p1b, "conj": conj, "h1b_valid": bool(ro["valid"]), "valid": conj is not None, "why": why}
+
+
 def _source_fit(zq):
     """The logistic fit of a source block (pilot or bank) that defines a compound world's ladder."""
     return bounded.fit_matrix(zq)
@@ -997,7 +1432,8 @@ def _source_fit(zq):
 
 def compound_variants(which):
     """(label, family, d, where) of the compound world. 'nominal' = the old probability-scale plant
-    (clipped; d = its nominal d_C), 'target' = the feasible logit-scale plant at d_res = d."""
+    (clipped; d = its nominal d_C), 'target' = the registered plant solved to d_res = d (feasible_plant:
+    probability scale, grid + bisection)."""
     out = [("bounded ladder", None, 0.0, "all")]
     if which in ("all", "nominal"):
         out += [(f"bounded ladder + d_C={d} in all conditions", "nominal", d, "all") for d in (0.01, 0.02, 0.03)]
@@ -1154,6 +1590,8 @@ def main(argv=None):
                     "default: the frozen confirmation bank (2 groups x off / predA4, 12 items, K = 50, T = 13500)")
     ap.add_argument("--bank-plan", help="the bank's registered plan (JSONL): its hash, cores, conditions and "
                     "replicates must be the bank's (required unless --bank-exploratory)")
+    ap.add_argument("--bank-inputs", help="the bank analysis' inputs.json (default: beside --bank): every registered "
+                    "cell finished, the snapshot files read (the spec's registry)")
     ap.add_argument("--bank-exploratory", action="store_true",
                     help="run a bank that fails the specification anyway, rows labelled 'bank (exploratory)'")
     ap.add_argument("--bank-frac", type=float, default=None, help="(overrides the spec: exploratory only)")
@@ -1252,7 +1690,10 @@ def main(argv=None):
                 spec[fld] = opt   # an explicit override is a different specification: exploratory only
                 spec.setdefault("overridden", []).append(fld)
         plan_cells = [json.loads(ln) for ln in open(a.bank_plan) if ln.strip()] if a.bank_plan else None
-        gnames, cnames, byk, bprobs = validate_bank(bb, spec, plan_cells, sha256(a.bank_plan) if a.bank_plan else None)
+        inp_path = a.bank_inputs or os.path.join(os.path.dirname(os.path.abspath(a.bank)), "inputs.json")
+        inputs = json.load(open(inp_path)) if os.path.exists(inp_path) else None
+        gnames, cnames, byk, bprobs = validate_bank(bb, spec, plan_cells, sha256(a.bank_plan) if a.bank_plan else None,
+                                                    inputs)
         if spec.get("overridden"):
             bprobs.append(f"--bank-frac / --bank-G override the frozen spec ({spec['overridden']})")
         if bprobs:
@@ -1275,6 +1716,7 @@ def main(argv=None):
         bank_info = {"path": os.path.abspath(a.bank), "sha256": sha256(a.bank), "groups": gnames, "conditions": cnames,
                      "N": Nb, "K": len(bank[0][0][0]), "spec": spec, "problems": bprobs, "label": bank_label,
                      "plan": {"path": os.path.abspath(a.bank_plan), "sha256": sha256(a.bank_plan)} if a.bank_plan else None,
+                     "inputs": {"path": inp_path, "sha256": sha256(inp_path)} if inputs is not None else None,
                      "status": {f"{g_}/{c_}": b["status"] for (g_, c_), b in byk.items()}}
         for w in a.bank_worlds.split(","):
             for c0 in range(0, a.bank_sims, a.chunk):
@@ -1448,7 +1890,7 @@ def report(a, bj, blocks, rows, plants, oplants, kinds, worlds, design, omni, rh
         md.append(f"\n## Omnibus design (G independent groups x C aligned conditions; per-cell SDs from {a.key[0]}; "
                   f"assay correlation {rho:.3f})\n")
         md.append("The stats spec's hypothesis 1: F = sum T_C / sum tau_C over every condition. Power = P(p <= alpha); "
-                  "alpha 0.0045 = 0.05/11 (Holm's first step). [Clopper-Pearson 95%]; the spec's criterion is a lower "
+                  "alpha 0.0045 = 0.05/11 (the old eleven-test planning threshold). [Clopper-Pearson 95%]; the spec's criterion is a lower "
                   "bound >= 0.80 at d_min = 0.01.\n")
         md.append("| world | N:k:G:C | effect | boot a=0.05 | boot a=0.0045 | sign-flip a=0.05 | sign-flip a=0.0045 |\n|---|---|---|---|---|---|---|")
         for N, k, Gn, C in omni:

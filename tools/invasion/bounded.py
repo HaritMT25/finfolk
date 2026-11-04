@@ -185,14 +185,82 @@ class Model:
 
 
 GTOL = 1e-9   # stationarity at the iteration cap: max |J'r| <= GTOL x max(1, ||y||)
+STAT_TOL = 1e-4   # first-order stationarity at every non-exact exit (prereg gate, review round 5 item 4):
+STAT_ABS = 1e-12  # the Gauss-Newton step may not promise more than STAT_TOL SSE + STAT_ABS ||y||^2
+
+# The fitting freeze (preregistration section 3, "Fit failures"): deterministic initialization, this optimizer
+# and these tolerances are part of the registered procedure; the gate manifest records this dict and the
+# source hash of this file. Every fit reports its termination reason and gradient.
+FIT_FREEZE = {
+    "optimizer": "Levenberg-Marquardt (bounded.lm), lambda0 1e-3, /3 on an accepted step, x10 on a rejected one",
+    "iters": 200, "tol": 1e-11, "gtol": GTOL, "stat_tol": STAT_TOL, "stat_abs": STAT_ABS,
+    "init": "logistic: two-way additive fit of the logit:0.001-clipped means (bounded.initial); no restarts",
+    "converged": ("exact fit (SSE <= 1e-26 ||y||^2); otherwise the exit (relative SSE improvement < tol, a step "
+                  "<= 1e-12 (1 + max|theta|), damping > 1e6, or the iteration cap) counts as converged only if "
+                  "the fit is first-order stationary: the Gauss-Newton predicted decrease "
+                  "r'J (J'J + 1e-12 max diag)^-1 J'r <= stat_tol SSE + stat_abs ||y||^2 (a saturated plateau, "
+                  "every fitted mean at 0 or 1, predicts ~all of its SSE), and at the cap also "
+                  "max |J'r| <= gtol max(1, ||y||); a non-finite SSE, parameter or fitted value is never converged"),
+    "unavailable": "any required unconverged fit, non-finite result or failed projection makes H1b unavailable",
+}
+
+
+class LMResult(tuple):
+    """(theta, SSE, converged) with .reason (the exit), .grad (max |J'r|) and .stationarity."""
+    reason = None
+    grad = None
+    stationarity = None
+
+
+def _normal(J, r, P):
+    JtJ = [[0.0] * P for _ in range(P)]
+    Jtr = [0.0] * P
+    for row, ri in zip(J, r):
+        for a_ in range(P):
+            ra = row[a_]
+            if ra:
+                Jtr[a_] += ra * ri
+                Ja = JtJ[a_]
+                for b_ in range(a_, P):
+                    Ja[b_] += ra * row[b_]
+    for a_ in range(P):
+        for b_ in range(a_):
+            JtJ[a_][b_] = JtJ[b_][a_]
+    return JtJ, Jtr
+
+
+def stationarity(J, r, P):
+    """-> (r'J (J'J + ridge)^-1 J'r / r'r, max |J'r|): the share of the residual that the model's tangent
+    space can still explain (0 at a least-squares optimum; ~1 on a saturated plateau, where the gradient
+    is tiny only because every derivative is). The ridge is relative (1e-12 of the largest diagonal)."""
+    JtJ, Jtr = _normal(J, r, P)
+    S = sum(x * x for x in r)
+    grad = max(abs(x) for x in Jtr) if Jtr else 0.0
+    if not (math.isfinite(S) and math.isfinite(grad)):
+        return float("inf"), grad
+    if S <= 0.0:
+        return 0.0, grad
+    mx = max(JtJ[a_][a_] for a_ in range(P))
+    if mx <= 0.0:
+        return (0.0 if grad == 0.0 else 1.0), grad
+    for a_ in range(P):
+        JtJ[a_][a_] += 1e-12 * mx
+    try:
+        st = hodge.solve(JtJ, Jtr)
+    except ValueError:
+        return 1.0, grad
+    return max(0.0, sum(a_ * b_ for a_, b_ in zip(st, Jtr)) / S), grad
 
 
 def lm(model, cells, y, th0, iters=200, tol=1e-11):
     """Levenberg-Marquardt least squares; stops when an accepted step improves the SSE by less
-    than tol (relative). -> (theta, SSE, converged). At the iteration cap the fit counts as
-    converged only if it is stationary, max |J'r| <= GTOL max(1, ||y||) (review round 4: such
-    fits are boundary infima - a fitted cell mean creeping to 0, an effect drifting to -inf, the
-    SSE flat to ~1e-9 relative; anything else is NOT converged and decides nothing)."""
+    than tol (relative). -> LMResult (theta, SSE, converged) with .reason / .grad / .stationarity.
+    Converged (FIT_FREEZE): an exact fit, or any other exit at a first-order stationary point
+    (stationarity <= STAT_TOL; prereg gate: a saturated plateau - every fitted mean at 0 or 1, the
+    gradient tiny only because every derivative is - used to pass, review round 5); at the
+    iteration cap also max |J'r| <= GTOL max(1, ||y||) (review round 4: such fits are boundary
+    infima - a fitted cell mean creeping to 0, an effect drifting to -inf, the SSE flat to ~1e-9
+    relative; anything else is NOT converged and decides nothing)."""
     th = list(th0)
     g, J = model.eval(th, cells)
     r = [a - b for a, b in zip(y, g)]
@@ -200,22 +268,20 @@ def lm(model, cells, y, th0, iters=200, tol=1e-11):
     lam = 1e-3
     P = model.P
     floor = 1e-26 * max(1e-30, sum(v * v for v in y))   # an exact fit: nothing left to improve
+
+    def out(reason, cap=False):
+        st, grad = stationarity(J, r, P)
+        finite = math.isfinite(S) and all(math.isfinite(t) for t in th) and all(math.isfinite(x) for x in r)
+        ok = finite and (reason == "exact" or st * S <= STAT_TOL * S + STAT_ABS * sum(v * v for v in y))
+        if cap:
+            ok = ok and grad <= GTOL * max(1.0, math.sqrt(sum(v * v for v in y)))
+        res = LMResult((th, S, ok))
+        res.reason, res.grad, res.stationarity = reason, grad, st
+        return res
     for _ in range(iters):
         if S <= floor:
-            return th, S, True
-        JtJ = [[0.0] * P for _ in range(P)]
-        Jtr = [0.0] * P
-        for row, ri in zip(J, r):
-            for a_ in range(P):
-                ra = row[a_]
-                if ra:
-                    Jtr[a_] += ra * ri
-                    Ja = JtJ[a_]
-                    for b_ in range(a_, P):
-                        Ja[b_] += ra * row[b_]
-        for a_ in range(P):
-            for b_ in range(a_):
-                JtJ[a_][b_] = JtJ[b_][a_]
+            return out("exact")
+        JtJ, Jtr = _normal(J, r, P)
         while True:
             M = [[JtJ[a_][b_] + (lam * JtJ[a_][a_] + 1e-18 if a_ == b_ else 0.0) for b_ in range(P)] for a_ in range(P)]
             try:
@@ -224,7 +290,7 @@ def lm(model, cells, y, th0, iters=200, tol=1e-11):
                 step = None
             if step is not None:
                 if max(abs(s_) for s_ in step) <= 1e-12 * (1.0 + max(abs(t) for t in th)):
-                    return th, S, True   # nothing left to move
+                    return out("step")   # nothing left to move
                 thn = [t + s_ for t, s_ in zip(th, step)]
                 gn, Jn = model.eval(thn, cells)
                 rn = [a - b for a, b in zip(y, gn)]
@@ -234,13 +300,12 @@ def lm(model, cells, y, th0, iters=200, tol=1e-11):
                     th, J, r, S = thn, Jn, rn, Sn
                     lam = max(lam / 3.0, 1e-9)
                     if done:
-                        return th, S, True
+                        return out("exact" if S <= floor else "tol")
                     break
             lam *= 10.0
             if lam > 1e6:
-                return th, S, True   # no descent along even a short gradient step: a (local) minimum
-    grad = max(abs(sum(row[a_] * ri for row, ri in zip(J, r))) for a_ in range(P))
-    return th, S, grad <= GTOL * max(1.0, math.sqrt(sum(v * v for v in y)))
+                return out("damping")   # no descent along even a short gradient step: a (local) minimum
+    return out("cap", cap=True)
 
 
 def _cells(N):
@@ -275,12 +340,16 @@ def fit(M, model_name, th0=None):
     y = [M[i][j] for i, j in cells]
     if th0 is None:
         th0 = initial(model_name, M, fit(M, "logistic")["theta"] if model_name != "logistic" else None)
-    th, sse, ok = lm(model, cells, y, th0)
+    res = lm(model, cells, y, th0)
+    th, sse, ok = res
     g, _ = model.eval(th, cells)
     F = [[None] * N for _ in range(N)]
     for (i, j), v in zip(cells, g):
         F[i][j] = v
-    return {"model": model_name, "theta": th, "F": F, "sse": sse, "converged": ok, "params": model.describe(th)}
+    finite = math.isfinite(sse) and all(math.isfinite(t) for t in th) and all(math.isfinite(v) for v in g)
+    return {"model": model_name, "theta": th, "F": F, "sse": sse, "converged": bool(ok) and finite,
+            "params": model.describe(th), "reason": getattr(res, "reason", None) if finite else "non-finite",
+            "grad": getattr(res, "grad", None), "stationarity": getattr(res, "stationarity", None)}
 
 
 # ------------------------------------------------------------ energies
@@ -346,8 +415,15 @@ def model_test(zq, model_name, B=1999, seed=1, kind=infer.DEFAULT_KIND, TA_pair=
     RC_nc = RC - nullC
     den = (TA_pair - tauA_pair) if TA_pair is not None else None
     P = N * (N - 1) // 2
-    # an unconverged fit decides nothing (review round 4): no p-value rests on it
+    # an unconverged fit decides nothing (review round 4): no p-value rests on it; nor does a failed
+    # projection (prereg gate: unavailable, not an abort)
     ok_fit, ok_boot = bool(f["converged"]), bad == 0
+    p_res_flip = None
+    if ok_fit:
+        try:
+            p_res_flip = infer.flip_p_vectors([residual_replicate_vectors(zq, model_name, f)[0]])
+        except Unavailable:
+            p_res_flip = None
     return {"model": model_name, "N": N, "k": k, "B": B, "kind": kind, "converged": f["converged"],
             "boot_not_converged": bad, "sse": f["sse"], "params": f["params"],
             "T_C": st["TC"], "tau_C": st["tauC"], "C_fit": C_fit, "R_A": RA, "R_C": RC,
@@ -359,9 +435,8 @@ def model_test(zq, model_name, B=1999, seed=1, kind=infer.DEFAULT_KIND, TA_pair=
             "dC_res": math.sqrt(max(0.0, RC_nc) / P),
             "T_S": st["TS"], "tau_S": st["tauS"], "R_S": RS, "F_res_S": F_res_S,
             "p_res_S": (1 + sum(1 for x in FS if x >= F_res_S)) / (B + 1) if ok_fit and ok_boot else None,
-            "R_S_null": nullS, "R_S_nc": RS - nullS,
-            "p_res_flip": (infer.flip_p_vectors([residual_replicate_vectors(zq, model_name, f)[0]])
-                           if ok_fit else None)}
+            "R_S_null": nullS, "R_S_nc": RS - nullS, "p_res_flip": p_res_flip,
+            "reason": f.get("reason"), "grad": f.get("grad"), "stationarity": f.get("stationarity")}
 
 
 # ------------------------------------------------------- the frozen co-primary (hypothesis 1b)
@@ -369,7 +444,7 @@ def model_test(zq, model_name, B=1999, seed=1, kind=infer.DEFAULT_KIND, TA_pair=
 # four primary matrices (two home regimes x two assays), four separate mean fits, paired resampling
 # (the assays of one regime share their units; regimes are independent) and a fixed multiplicity
 # family. Frozen here:
-#   H1b  "the four primary matrices are bounded logistic ladders": for every condition c, fit
+#   H1b  "all four primary endpoint-mean matrices belong to the fitted logistic family": for every condition c, fit
 #        sigma(mu_c + a_ci + b_cj) to that matrix's endpoint means; project each replicate r's cell
 #        residuals d_cr = y_cr - fit_c off the model's tangent space at the fit (P_perp = I -
 #        J (J'J)^-1 J'), take their curl, v_cr = Q A(P_perp d_cr), and sign-flip whole replicates
@@ -381,16 +456,21 @@ def model_test(zq, model_name, B=1999, seed=1, kind=infer.DEFAULT_KIND, TA_pair=
 #        to first order in the fit (the fit is not redone per pattern) - its level is calibrated
 #        (calibrate.py --compound). The joint refitting bootstrap (residual_omnibus(B > 0): every
 #        draw refits all four models, paired plans) is reported beside it.
-#   Family: hypotheses 1-11 of the stats spec plus H1b = 12 tests, Holm; planning threshold
-#        ALPHA_FAMILY = 0.05 / 12.
-#   Claim rule: "a cyclic component beyond bounded (logistic) transitivity" needs BOTH H1 (raw
-#        grouped sign-flip omnibus) and H1b rejected by Holm over the 12-test family; for planning
-#        and calibration, both p <= 0.05/12 (sufficient for both under Holm, whatever the order).
-#   Fit failures (review round 4): if any of the four logistic mean fits did not converge, H1b is
-#        INVALID: p_flip is None (the computed value is kept as p_flip_unconverged, a diagnostic),
-#        so neither H1b nor the claim can reject; calibration counts such a dataset as a
-#        non-rejection and keeps it in the denominator. Likewise the refitting bootstrap's p_boot is
-#        None if any of its refits did not converge (boot_not_converged counts them).
+#   Allocation (preregistration section 3): twelve fixed alpha slots (the stats spec's hypotheses
+#        1-11 plus H1b), of which only H1 and H1b are active; ALPHA_FAMILY = a = 0.05 / 12. The ten
+#        inactive slots get p = 1 and their allocations stay unused.
+#   Claim rule: the fixed conjunction "H1 and H1b both p <= a" (with a valid complete dataset and a
+#        passed calibration gate, read at T only: analyze.py --gate). It is sufficient for both
+#        rejections under twelve-test Holm but it is NOT full Holm: no later Holm thresholds, no
+#        recycled alpha. The claim it licenses: cardinal circulation beyond the fitted logistic
+#        endpoint-mean family (not an ordinal cycle, not every transitive model).
+#   Fit failures (review round 4; prereg gate): if any of the four logistic mean fits did not
+#        converge, or a result is non-finite, or the tangent-space projection fails, H1b is
+#        UNAVAILABLE: p_flip is None (a computed value is kept as p_flip_unconverged, a
+#        diagnostic), so neither H1b nor the claim can reject. calibrate.py reports the raw
+#        procedure rate (unavailable = no rejection) and the gate screen (unavailable = a
+#        rejection under a null, a failure under an alternative). Likewise the refitting
+#        bootstrap's p_boot is None if any of its refits did not converge (boot_not_converged).
 CO_PRIMARY_MODEL = "logistic"
 ALPHA_FAMILY = 0.05 / 12
 
@@ -400,21 +480,34 @@ def _inverse(Mx):
     return [list(col) for col in zip(*[hodge.solve(Mx, [1.0 if a == b else 0.0 for a in range(n)]) for b in range(n)])]
 
 
+class Unavailable(ValueError):
+    """A required H1b quantity cannot be computed (failed projection, non-finite result): the test is
+    unavailable - never an abort, never a rejection (preregistration section 3, 'Fit failures')."""
+
+
 def residual_replicate_vectors(zq, model_name=CO_PRIMARY_MODEL, fitres=None):
     """Per replicate r: Q A(P_perp (y_r - fit)), the curl of replicate r's cell residuals after
-    projecting off the fitted model's tangent space. -> (vectors, fit)."""
+    projecting off the fitted model's tangent space. -> (vectors, fit). Raises Unavailable if the
+    projection fails (singular normal matrix) or anything is non-finite."""
     N, k = len(zq), len(zq[0])
     m = infer.column_means(zq)
     M = [[(m[j][i] if i != j else None) for j in range(N)] for i in range(N)]
     f = fitres or fit(M, model_name)
     model = Model(model_name, N)
     cells = _cells(N)
+    if not all(math.isfinite(t) for t in f["theta"]):
+        raise Unavailable("non-finite fitted parameters")
     g, J = model.eval(f["theta"], cells)
     P = model.P
     JtJ = [[sum(row[a] * row[b] for row in J) for b in range(P)] for a in range(P)]
     for a in range(P):
         JtJ[a][a] += 1e-12 * max(JtJ[a][a], 1e-30)
-    inv = _inverse(JtJ)
+    try:
+        inv = _inverse(JtJ)
+    except (ValueError, ZeroDivisionError, OverflowError) as e:
+        raise Unavailable(f"tangent-space projection failed ({e})") from None
+    if not all(math.isfinite(x) for row in inv for x in row):
+        raise Unavailable("tangent-space projection failed (non-finite inverse)")
     out = []
     for r in range(k):
         d = [zq[j][r][i] - gv for (i, j), gv in zip(cells, g)]
@@ -423,7 +516,10 @@ def residual_replicate_vectors(zq, model_name=CO_PRIMARY_MODEL, fitres=None):
         mm = [[0.0] * N for _ in range(N)]
         for (i, j), dv, row in zip(cells, d, J):
             mm[j][i] = dv - sum(row[a] * co[a] for a in range(P))
-        out.append(infer.curl_vec(infer.antisym(mm), N)[0])
+        v = infer.curl_vec(infer.antisym(mm), N)[0]
+        if not all(math.isfinite(x) for x in v):
+            raise Unavailable("non-finite projected residual")
+        out.append(v)
     return out, f
 
 
@@ -433,30 +529,55 @@ def residual_omnibus(groups, model_name=CO_PRIMARY_MODEL, B=0, seed=1, kind=infe
     mean fit did not converge, see above), p_boot (joint refitting bootstrap with paired plans, if
     B > 0; None if any refit did not converge), per-condition R_C / C_fit / T_C / converged, and
     'valid' / 'invalid' / 'diagnostics'."""
-    fl = [[fit_matrix(zq, model_name) if fits is None else fits[g][c] for c, zq in enumerate(zs)]
-          for g, zs in enumerate(groups)]
-    gv = []
-    per = []
+    # One invalid-dataset path (prereg gate, review round 5 item 4): an unconverged or non-finite fit,
+    # a failed projection or a non-finite statistic makes H1b UNAVAILABLE (valid False, p_flip None,
+    # 'invalid' says why); nothing here may abort the analysis or a calibration dataset.
+    fl, gv, per, why = [], [], [], []
     for g, zs in enumerate(groups):
-        vec_c = [residual_replicate_vectors(zq, model_name, fl[g][c])[0] for c, zq in enumerate(zs)]
-        k = len(vec_c[0])
-        gv.append([[x for vc in vec_c for x in vc[r]] for r in range(k)])
+        fg, vec_c = [], []
         for c, zq in enumerate(zs):
+            try:
+                f = fit_matrix(zq, model_name) if fits is None else fits[g][c]
+            except (ValueError, ZeroDivisionError, OverflowError) as e:
+                f = None
+                why.append(f"{g}/{c}: fit failed ({e})")
+            fg.append(f)
+            vec = None
+            if f is not None:
+                try:
+                    vec = residual_replicate_vectors(zq, model_name, f)[0]
+                except Unavailable as e:
+                    why.append(f"{g}/{c}: {e}")
+                except (ValueError, ZeroDivisionError, OverflowError) as e:
+                    why.append(f"{g}/{c}: projection failed ({e})")
+            vec_c.append(vec)
             st = infer.block_stats(zq)
             M = _means(zq)
             per.append({"group": g, "cond": c, "T_C": st["TC"], "tau_C": st["tauC"],
-                        "C_fit": energies(fl[g][c]["F"])[1], "R_C": energies(_sub(M, fl[g][c]["F"]))[1],
-                        "converged": bool(fl[g][c]["converged"]), "sse": fl[g][c]["sse"]})
+                        "C_fit": energies(f["F"])[1] if f else float("nan"),
+                        "R_C": energies(_sub(M, f["F"]))[1] if f else float("nan"),
+                        "converged": bool(f and f["converged"]), "sse": f["sse"] if f else None,
+                        "reason": f.get("reason") if f else "failed", "grad": f.get("grad") if f else None,
+                        "stationarity": f.get("stationarity") if f else None})
+        fl.append(fg)
+        if all(v is not None for v in vec_c):
+            k = len(vec_c[0])
+            gv.append([[x for vc in vec_c for x in vc[r]] for r in range(k)])
     F = infer._ratio(sum(x["R_C"] for x in per), sum(x["tau_C"] for x in per))
     bad = [f"{x['group']}/{x['cond']}" for x in per if not x["converged"]]
-    p_flip = infer.flip_p_vectors(gv)
+    p_flip = infer.flip_p_vectors(gv) if len(gv) == len(groups) else None
+    if not why and (p_flip is None or not math.isfinite(p_flip)):
+        why.append("non-finite sign-flip statistic")
+    invalid = "; ".join(([f"logistic mean fit(s) not converged: group/condition {' '.join(bad)}"] if bad else []) + why)
+    valid = not invalid
     out = {"model": model_name, "groups": len(groups), "conditions": len(per), "F_res_joint": F,
-           "p_flip": None if bad else p_flip, "p_flip_unconverged": p_flip if bad else None,
-           "valid": not bad, "invalid": (f"logistic mean fit(s) not converged: group/condition {' '.join(bad)}"
-                                         if bad else None),
+           "p_flip": p_flip if valid else None, "p_flip_unconverged": None if valid else p_flip,
+           "valid": valid, "invalid": invalid or None,
            "fits_converged": len(per) - len(bad), "per_condition": per, "B": B, "p_boot": None,
            "boot_not_converged": 0,
            "flip_min_p": math.prod(1.0 / (1 << (len(zs[0][0]) - 1)) for zs in groups)}
+    if not valid:
+        return out
     if B > 0:
         rnd = random.Random(seed)
         shape = [(len(zs[0]), len(zs[0][0])) for zs in groups]

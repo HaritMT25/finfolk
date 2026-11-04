@@ -1055,13 +1055,19 @@ def primary_blocks(rows, meta, registry, cores, sims, seed=5, kind=infer.DEFAULT
                             "p_lof": inf["p_lof"] if formal else None, "p_lof_flip": inf["p_lof_flip"] if formal else None})
                 row["p_primary"] = primary_p(row)
                 if n * (n - 1) - bounded.Model(bounded.CO_PRIMARY_MODEL, n).P >= (n - 1) * (n - 2) // 2:
-                    vecs, fitres = bounded.residual_replicate_vectors(zq)
+                    fitres = bounded.fit_matrix(zq)
+                    try:   # one invalid path (prereg gate): a failed projection is unavailable, not an abort
+                        vecs = bounded.residual_replicate_vectors(zq, fitres=fitres)[0]
+                        perr = None
+                    except bounded.Unavailable as e:
+                        vecs, perr = None, str(e)
                     R_C = bounded.energies(bounded._sub(bounded._means(zq), fitres["F"]))[1]
-                    ok = bool(fitres["converged"])   # an unconverged fit decides nothing (review round 4)
+                    ok = bool(fitres["converged"]) and perr is None   # an unconverged fit decides nothing (review round 4)
                     row.update({"R_C_logistic": R_C, "F_res": infer._ratio(R_C, infer.block_stats(zq)["tauC"]),
-                                "fit_converged": ok, "p_res_flip": infer.flip_p_vectors([vecs]) if formal and ok else None})
+                                "fit_converged": bool(fitres["converged"]),
+                                "p_res_flip": infer.flip_p_vectors([vecs]) if formal and ok else None})
                     if not ok:
-                        row["note"] = "logistic fit not converged: H1b descriptive"
+                        row["note"] = ("logistic fit not converged" if perr is None else perr) + ": H1b descriptive"
             else:
                 row["note"] = "k > 16: exported (blocks.json), not tested"
             pblocks[(cond, frac, G, gname)] = {"cond": cond, "frac": frac, "G": G, "group": gname, "names": names,
