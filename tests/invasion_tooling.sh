@@ -2493,8 +2493,12 @@ assert "rank_tol" in bounded.FIT_FREEZE and "stat_ridge" not in bounded.FIT_FREE
 # review of #49, round 4 (Claude), P1-1: the gain's rank cut NESTS inside the flat-cell rule (RANK_TOL / sqrt(n) |R_11|,
 # and |R_11| <= sqrt(n) max|J|). At RANK_TOL |R_11| a weak combination on cells with derivatives between 2.5e-14 and
 # ~7e-14 was neither in the gain nor flat: A was certified at eta0 = +-30.3 .. 31.3 in the 8 arrangements without item
-# 11. Now A over eta0 in [20, 45] (0.05 steps) is never certified, in any of the 12 arrangements
-assert abs(bounded.gain_cut(len(cells)) - bounded.RANK_TOL / math.sqrt(len(cells))) < 1e-30
+# 11. Now A over eta0 in [20, 45] (0.05 steps) is never certified, in any of the 12 arrangements. (Every check below
+# records its failure, so each one shows on older code.)
+def allow_of(y_, S_):
+    return 1e-4 * S_ + 1e-12 * max(sum(v * v for v in y_), float(len(y_)))
+bad = []
+yA = [YA[c] for c in cells]
 cert = []
 for side in ("a", "b"):
     for i, j in ((0, 1), (0, 11), (1, 0), (5, 6), (11, 3), (4, 9)):
@@ -2502,13 +2506,14 @@ for side in ("a", "b"):
             e0 = 20.0 + 0.05 * k
             e = [0.0] * N; e[i] = e0; e[j] = -e0
             aa, bb = (e, [0.0] * N) if side == "a" else ([0.0] * N, e)
-            if bounded.lm(model, cells, [YA[c] for c in cells], bth(0.0, aa, bb), iters=0)[2]:
+            if bounded.lm(model, cells, yA, bth(0.0, aa, bb), iters=0)[2]:
                 cert.append((side, i, j, round(e0, 2)))
-assert not cert, (len(cert), cert[:8])
+if cert:
+    bad.append(f"A certified at {len(cert)} of 6012 points, e.g. {cert[:4]}")
 e = [0.0] * N; e[0] = 30.8; e[1] = -30.8   # (inside the old gap: resolved at full rank, the probe realizes it)
-r = bounded.lm(model, cells, [YA[c] for c in cells], bth(0.0, e, [0.0] * N), iters=0)
-assert not r[2] and r.rank == 2 * N - 1 and r.stationarity > 0.99 and r.probe_decrease >= r.allow, \
-    (r.rank, r.stationarity, r.probe_decrease, r.allow)
+r = bounded.lm(model, cells, yA, bth(0.0, e, [0.0] * N), iters=0)
+if r[2] or r.rank != 2 * N - 1 or not r.stationarity > 0.99 or not (r.probe_decrease or 0.0) >= allow_of(yA, r[1]):
+    bad.append(f"A at +-30.8: converged {r[2]}, rank {r.rank}, gain/S {r.stationarity}, probe {r.probe_decrease}")
 # ... while B-type legitimate minima stay converged (gain ~0) up to where the flat-cell rule fails closed (a false
 # unavailability, never a false certification: from 15.7 + 15.7 the cells at |eta| ~ 31.4 are flat)
 def yB(sB):
@@ -2516,28 +2521,33 @@ def yB(sB):
     d01_ = rdsig(2 * sB)
     rr_ = {(0, 1): -0.5, (0, 3): d01_ / (2 * rdsig(sB)), (2, 1): d01_ / (2 * rdsig(sB)), (2, 3): -2 * d01_}
     return [rsig(aB_[i] + bB_[j]) + rr_.get((i, j), 0.0) for (i, j) in cells], bth(0.0, aB_, bB_)
-for sB in (10.0, 12.0, 14.0, 15.0, 15.5, 15.65):
+for sB in (10.0, 12.0, 14.0, 15.0, 15.5, 15.65, 15.7, 16.0, 17.0):
     yb_, th_ = yB(sB)
     r = bounded.lm(model, cells, yb_, th_, iters=0)
-    assert r[2] and r.stationarity < 1e-12 and r.probe_decrease is None, (sB, r[2], r.stationarity, r.flat_sse)
-for sB in (15.7, 16.0, 17.0):
-    yb_, th_ = yB(sB)
-    r = bounded.lm(model, cells, yb_, th_, iters=0)
-    assert not r[2] and r.stationarity < 1e-12 and r.flat_sse > r.allow, (sB, r[2], r.flat_sse)
+    flat_ok = sB < 15.7
+    if r[2] != flat_ok or not r.stationarity < 1e-12 or (flat_ok and r.probe_decrease is not None) or             (not flat_ok and not r.flat_sse > allow_of(yb_, r[1])):
+        bad.append(f"B at {sB}: converged {r[2]}, gain/S {r.stationarity}, flat {r.flat_sse}, probe {r.probe_decrease}")
 # review of #49, round 4 (Claude), P2-2: the probe refines its coarse 0.8 grid around the scanned SSE's local minima
 # (golden section in log t). The reviewer's planted cycles - row 0 at eta0 with targets 1 - 1e-3, items 1-11 at
 # 0.5 + kappa sin(2 pi (i - j) / 11), orthogonal to the tangent space - leave a decrease window narrower than the
 # grid's 1.25 ratio; they were certified, they are NOT converged, and independently (the reference's own SSE)
 # moving row 0 to logit(0.999) lowers the SSE by 10x / 20x the allowance
-assert all(k_ in bounded.FIT_FREEZE for k_ in ("probe_shrink", "probe_steps", "probe_refine", "probe_golden"))
 for kap, e0, mult in ((0.0135, 29.96, 9.0), (0.0095, 29.48, 18.0)):
     YC = {(i, j): (1 - 1e-3 if i == 0 else (0.5 if j == 0 else 0.5 + kap * math.sin(2 * math.pi * (i - j) / 11)))
           for (i, j) in cells}
+    yC = [YC[c] for c in cells]
     aC = [e0] + [0.0] * (N - 1)
-    r = bounded.lm(model, cells, [YC[c] for c in cells], bth(0.0, aC, [0.0] * N), iters=0)
-    assert not r[2] and r.probe_decrease is not None and r.probe_decrease >= r.allow, (kap, r[2], r.probe_decrease, r.allow)
+    r = bounded.lm(model, cells, yC, bth(0.0, aC, [0.0] * N), iters=0)
+    al = allow_of(yC, r[1])
+    if r[2] or not (r.probe_decrease or 0.0) >= al:
+        bad.append(f"planted cycle kappa {kap}: converged {r[2]}, probe / allow {(r.probe_decrease or 0.0) / al:.3g}")
     drop = rsse([0.0] + aC + [0.0] * N, YC) - rsse([0.0, math.log(0.999 / 0.001)] + [0.0] * (N - 1) + [0.0] * N, YC)
-    assert drop >= mult * r.allow, (kap, drop, r.allow)
+    assert drop >= mult * al, (kap, drop, al)   # (the reference: a decrease IS available)
+if not all(k_ in bounded.FIT_FREEZE for k_ in ("probe_shrink", "probe_steps", "probe_refine", "probe_golden")):
+    bad.append("the probe's constants are not frozen dict keys")
+if not abs(getattr(bounded, "gain_cut", lambda n: 0.0)(len(cells)) - bounded.RANK_TOL / math.sqrt(len(cells))) < 1e-30:
+    bad.append("no gain_cut = RANK_TOL / sqrt(n)")
+assert not bad, bad
 PY
 
 # 43. review of #49, finding 4: the Beta part's variance without cancellation (mu 0.5, v 1e-18 used to become
