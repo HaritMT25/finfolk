@@ -1051,6 +1051,11 @@
       <span class="d" id="colourwhy"></span>
     </div>
     <div class="vrow">
+      <span class="n" id="look-l">Look</span>
+      <span id="lookMode" class="seg3" role="group" aria-labelledby="look-l"><button type="button" data-look="ocean" aria-pressed="true">Ocean</button><button type="button" data-look="reef" aria-pressed="false">Reef</button></span>
+      <span class="d">Reef: a sunlit aquarium seen through its front glass. Drawing and camera only: the fish and the run don't change.</span>
+    </div>
+    <div class="vrow">
       <label class="n" for="governor">Hold 60 fps</label>
       <input id="governor" class="switch" type="checkbox" role="switch" checked>
       <span class="d">When this device can't keep up: fewer steps per frame first, then less detail. The simulation itself never changes.</span>
@@ -1170,6 +1175,7 @@
   <script src="ocean_handoff.js"></script>
   <script src="ocean_appearance.js"></script>
   <script src="ocean_perf.js"></script>
+  <script src="ocean_reef.js"></script>
   <script src="ocean_scene.js"></script>
   <script src="ocean_config.js"></script>
   <script src="charts.js"></script>

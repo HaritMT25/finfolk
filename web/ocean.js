@@ -2661,7 +2661,7 @@
     if (!scene) return;
     var vh = window.innerHeight, open = drawerEl.classList.contains("open");
     var top = 0, bottom = 0, right = 0;
-    if (!compactMQ.matches) {
+    if (!compactMQ.matches || look === "reef") {   /* the Reef look frames its water between the bars on a phone too */
       top = el("topbar").getBoundingClientRect().bottom + 6;
       bottom = vh - el("dock").getBoundingClientRect().top + 6;
     }
@@ -2965,6 +2965,33 @@
     applyClarity();
   });
   el("clarity").addEventListener("pointerup", function () { this.blur(); });   /* the keys go back to the tank; arrow keys keep it */
+  /* The look (web/ocean_reef.js; drawing and camera only, live): "ocean",
+   * the default, or "reef", a sunlit aquarium seen through its front glass.
+   * ?look= wins and is not stored; then the visitor's own last pick; else
+   * ocean. A look switch never starts a world or touches the address. */
+  var look = "ocean";
+  function parseLook(v) { v = v === null || v === undefined ? "" : String(v).trim().toLowerCase(); return v === "reef" || v === "ocean" ? v : null; }
+  function showLook() {
+    document.documentElement.classList.toggle("look-reef", look === "reef");
+    el("lookMode").querySelectorAll("button").forEach(function (b) { b.setAttribute("aria-pressed", b.dataset.look === look ? "true" : "false"); });
+  }
+  function setLook(l, picked) {
+    l = parseLook(l) || "ocean";
+    if (scene && scene.setLook && !scene.setLook(l, { animate: !reducedMQ.matches })) l = "ocean";   /* the reef module is missing */
+    look = l;
+    if (picked && !BENCH) store("evo_boids.ocean.look", look);   /* a benchmark's cases are not the visitor's choice */
+    showLook();
+    if (scene) { slowSince = 0; if (governorOn) restoreDetail(); updateInsets(); updateModeline(); }
+  }
+  (function () {
+    var want = parseLook(P.get("look")), saved = parseLook(store("evo_boids.ocean.look"));
+    look = want || saved || "ocean";
+    showLook();
+  })();
+  el("lookMode").addEventListener("click", function (e) {
+    var b = e.target.closest("button");
+    if (b && b.dataset.look) setLook(b.dataset.look, true);
+  });
   function updateModeline() {
     /* the world's appearance genes (bit 1 patterns, bit 2 shapes; 0 = off, or a module without them) */
     var flags = HAS_APP ? (has("oc_appearance_flags") ? M._oc_appearance_flags() : 3) : 0;
@@ -3230,7 +3257,8 @@
       coarse: coarseMQ.matches,
       reducedMotion: reducedMQ.matches,
       bodyScale: bodyScale, onFollowChange: onFollowChange,
-      profiler: PERF ? PROF : null, visualRandom: BENCH ? PERF.visualRandom(2463534242) : null
+      profiler: PERF ? PROF : null, visualRandom: BENCH ? PERF.visualRandom(2463534242) : null,
+      look: look
     });
     if (!scene) throw new Error("This browser could not start WebGL2, which the 3-D tank needs. 2-D Classic draws its world without it.");
     detail0 = scene.quality();
@@ -3243,6 +3271,7 @@
     updateLight();
     updateModeline();
     applyClarity();
+    if (look !== scene.look()) { look = scene.look(); showLook(); }   /* the reef could not be built: the default look */
     if (dash()) dash().attach({
       depth: function () { return D; },
       familyColor: function (id) { return has("oc_family_color") ? M._oc_family_color(id) : 0x3b5957; },
