@@ -316,7 +316,10 @@
    *   the header at most MAX_HEADER, 1 MiB (a header is 2 to 15 kB: the
    *     settings three times), 8 levels deep and 20,000 values;
    *   the file at most its prefix, the biggest header and the biggest
-   *     body: checked from its size, before a byte of it is read.
+   *     body: checked from its size, before a byte of it is read;
+   *   the body read READ_PART (4 MiB) at a time into one buffer, once the
+   *     page's turn has come (readWorld's body()): a read superseded
+   *     meanwhile stops at its next part.
    * Those are the format's. A page also has its device's (worldLimits'
    * deviceBytes, web/ocean.js deviceBudget): a smaller image cap on a
    * device with less memory, and a budget for everything an open holds at
@@ -328,7 +331,7 @@
   var MiB = 1048576;
   var WORLD = { MAGIC: "evo_ocean_world\n", FORMAT: "evo_ocean_world", VERSION: 1, EXT: ".oceanworld", PREFIX: 20,
                 MAX_HEADER: MiB, MAX_IMAGE: 512 * MiB, MAX_SETUP: MiB, MAX_DEPTH: 8, MAX_VALUES: 20000, RATIO: 1032,
-                DIGEST: "evo_ocean_world 1\n" };
+                READ_PART: 4 * MiB, DIGEST: "evo_ocean_world 1\n" };
   function ascii(s) { var b = new Uint8Array(s.length); for (var i = 0; i < s.length; i++) b[i] = s.charCodeAt(i) & 255; return b; }
   function utf8(s) { return enc ? enc.encode(s) : ascii(s); }
   function fromUtf8(u8) { if (dec) return dec.decode(u8); var s = ""; for (var i = 0; i < u8.length; i++) s += String.fromCharCode(u8[i]); return s; }
@@ -506,11 +509,14 @@
 
   /* A world file of `header` (a JSON object: the page's) and `image` (an
    * ArrayBuffer or a view: a whole memory image). opts.raw: no compression
-   * (as a browser without CompressionStream writes it). Answers {parts (for
-   * a Blob), header (with its image record and checksum), size}. */
+   * (as a browser without CompressionStream writes it); opts.limits: the
+   * reader's (worldLimits; the format's without): an image it would refuse
+   * is not written. Answers {parts (for a Blob), header (with its image
+   * record and checksum), size}. */
   function encodeWorld(header, image, opts) {
-    var u8 = u8of(image);
+    var u8 = u8of(image), L = opts && opts.limits || worldLimits();
     if (!u8.length || u8.length % PAGE) return Promise.reject(new Error("not a memory image: " + u8.length + " bytes"));
+    if (u8.length > L.image) return Promise.reject(new Error("its memory (" + mb(u8.length) + ") is more than a world file holds (" + mb(L.image) + " at most), so it could not be opened again"));
     var stored = storedLength(u8), body = u8.subarray(0, stored), gzip = !(opts && opts.raw) && typeof root.CompressionStream === "function";
     return sha256(body).then(function (sum) {
       if (!gzip) return [sum, [body]];
@@ -594,16 +600,37 @@
       if (size > want) throw new Error("That world file is damaged: it has " + (size - want) + " bytes after its end.");
       return headerDigest(h).then(function (d) {
         if (d !== h.sha256) throw new Error("That world file is damaged: its header does not match its checksum.");
-        /* body(cancelled, turn): cancelled() true stops the unpacking at its next chunk (a superseded
-         * read); turn(), a Promise to wait for once the body is read, before it is unpacked (the
-         * page's one-at-a-time) */
+        /* body(cancelled, turn): turn(), a Promise to wait for before any of the body is read (the
+         * page's one at a time: a read waiting for its turn holds no body; review of #44, round 3,
+         * finding 2); cancelled() true (a superseded read) stops it at once: when its turn comes,
+         * between the parts it is read in, once it is read, at the unpacking's next chunk */
         return { header: h, at: at, body: function (cancelled, turn) {
-          return src.read(at, size).then(function (b) {
-            return (turn ? turn() : Promise.resolve()).then(function () { return unpack(h, b, cancelled); });
-          });
+          var stop = function () { if (cancelled && cancelled()) throw new Error(CANCELLED); };
+          return (turn ? turn() : Promise.resolve()).then(function () {
+            stop();
+            return readParts(src, at, size, stop);
+          }).then(function (b) { stop(); return unpack(h, b, cancelled); });
         } };
       });
     });
+  }
+  /* bytes [a, z) of src, READ_PART at a time into one buffer (one part: as
+   * read), between() (it may throw: a superseded read) after each part */
+  function readParts(src, a, z, between) {
+    var part = WORLD.READ_PART;
+    if (z - a <= part) return src.read(a, z);
+    var out = new Uint8Array(z - a), at = a;
+    return (function next() {
+      if (at >= z) return out;
+      var e = Math.min(z, at + part);
+      return src.read(at, e).then(function (b) {
+        if (b.length !== e - at) throw new Error("That world file is cut short: it ended while its world was read.");
+        out.set(b, at - a);
+        at = e;
+        between();
+        return next();
+      });
+    })();
   }
   /* a body into the image's stored bytes, checked: {data, bytes} */
   function unpack(h, body, cancelled) {

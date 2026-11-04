@@ -19,6 +19,8 @@
  *   in : {cmd:'set', key, value}   -> oc_set_param (a live setting, mid-Turbo)
  *   in : {cmd:'rec', every}        -> the dashboards' sampling interval
  *   in : {cmd:'stop'}              -> finish the chunk, post the memory back
+ *                                     (the page, once it has it, terminates
+ *                                     this worker: its memory goes too)
  *   in : {cmd:'resume'}            -> the page could not take the memory
  *                                     back: carry on running this world
  *   in : {cmd:'wiring'}            -> the Brains dashboard's wiring of the
