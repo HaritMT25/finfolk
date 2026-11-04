@@ -3104,6 +3104,7 @@
                      reduced: reduced, cw: cw, ch: ch, insets: insets, follow: follow };
           },
           moved: function () { userMoved = true; anim = null; },
+          dpr: function () { return renderer.getPixelRatio(); },
           clarity: function () { return clarity; },
           setClearColor: function (f) { renderer.setClearColor(new THREE.Color().setRGB(f[0], f[1], f[2], "srgb"), 1); },
           restoreGrade: function () { setClarity(clarity); },

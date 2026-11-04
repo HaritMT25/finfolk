@@ -349,6 +349,81 @@
     ].join("\n");
   }
 
+  /* ---- sea grass and kelp: flat blades facing the glass, swaying (one
+   * instanced draw). Inside the tank only short turf (at most 6 units); the
+   * tall kelp stands outside it ---- */
+  var BLADE_SEGS = 7;
+  function bladeTemplate() {
+    var T = [], idx = [];
+    for (var i = 0; i <= BLADE_SEGS; i++) { var v = i / BLADE_SEGS; T.push(-0.5, v, 0.5, v); }
+    for (i = 0; i < BLADE_SEGS; i++) { var a = 2 * i; idx.push(a, a + 1, a + 3, a, a + 3, a + 2); }
+    return { T: new Float32Array(T), idx: idx };
+  }
+  var BLADE_VS = [
+    "attribute vec2 aT;",
+    "attribute vec3 iPos; attribute vec4 iSize; attribute vec3 iCol;",   /* base; height, width, phase, outside; colour */
+    "uniform vec3 uAlong; uniform float uClock; uniform float uSway;",
+    "varying vec3 vWorld; varying vec3 vCol; varying float vOut;",
+    "void main() {",
+    "  float v = aT.y, h = iSize.x, w = iSize.y * (1.0 - 0.8 * v);",
+    "  float sw = uSway * sin(uClock * (0.8 + 0.5 * fract(iSize.z * 3.7)) + iSize.z * 6.2831 + v * 1.7) * v * v * h * 0.14;",
+    "  vec3 p = iPos + uAlong * (aT.x * w + sw) + vec3(0.0, v * h, 0.0);",
+    "  vWorld = p; vCol = iCol * (0.72 + 0.4 * v); vOut = iSize.w;",
+    "  gl_Position = projectionMatrix * viewMatrix * vec4(p, 1.0);",
+    "}"
+  ].join("\n");
+
+  /* ---- light shafts: soft slanted bands of sunlight from the surface,
+   * drawn before the fish (in the opaque list, added on) so a fish is never
+   * tinted by them: it covers them ---- */
+  var SHAFT_VS = [
+    "attribute vec3 aUV;",   /* across, down (0 surface .. 1 floor), seed */
+    "varying vec3 vUV;",
+    "void main() { vUV = aUV; gl_Position = projectionMatrix * viewMatrix * modelMatrix * vec4(position, 1.0); }"
+  ].join("\n");
+  var SHAFT_FS = [
+    "uniform float uClock; uniform float uShaft;",
+    "varying vec3 vUV;",
+    "void main() {",
+    "  float across = smoothstep(0.0, 0.75, 1.0 - abs(vUV.x * 2.0 - 1.0));",
+    "  float fall = pow(1.0 - vUV.y, 1.5);",
+    "  float flick = 0.7 + 0.3 * sin(uClock * 0.55 + vUV.z * 20.0 + vUV.y * 2.5);",
+    "  float a = across * fall * flick * uShaft * (0.09 + 0.08 * vUV.z);",
+    "  gl_FragColor = vec4(vec3(0.86, 0.98, 1.0) * a, 1.0);",
+    "}"
+  ].join("\n");
+
+  /* ---- bubbles: hollow pale rings rising from vents outside the tank
+   * (never a filled glowing dot: that is the food) ---- */
+  var BUBBLE_VS = [
+    "attribute float aSeed;",
+    "uniform float uClock; uniform float uPx; uniform float uFloorY; uniform vec3 uAlong; uniform float uMove;",
+    "varying float vA;",
+    "void main() {",
+    "  float L = -uFloorY - 4.0;",
+    "  float rise = mod(uClock * uMove * (16.0 + 14.0 * fract(aSeed * 7.3)) + aSeed * L, L);",
+    "  vec3 p = position + uAlong * sin(uClock * uMove * 2.1 + aSeed * 30.0) * 2.2;",
+    "  p.y = uFloorY + 2.0 + rise;",
+    "  float t = rise / L;",
+    "  vec4 mv = viewMatrix * vec4(p, 1.0);",
+    "  gl_Position = projectionMatrix * mv;",
+    "  vA = smoothstep(0.0, 0.05, t) * (1.0 - smoothstep(0.92, 1.0, t));",
+    "  gl_PointSize = max(2.0, (1.4 + 1.8 * fract(aSeed * 3.1)) * (1.0 + 0.7 * t) * uPx / -mv.z);",
+    "}"
+  ].join("\n");
+  var BUBBLE_FS = [
+    "varying float vA;",
+    "void main() {",
+    "  vec2 q = gl_PointCoord - 0.5; float r = length(q) * 2.0;",
+    "  if (r > 1.0) discard;",
+    "  float ring = smoothstep(0.58, 0.76, r) * (1.0 - smoothstep(0.86, 1.0, r));",
+    "  float glint = 1.0 - smoothstep(0.10, 0.20, length(q - vec2(-0.16, -0.16)));",
+    "  float a = (0.55 * ring + 0.55 * glint) * vA;",
+    "  if (a < 0.01) discard;",
+    "  gl_FragColor = vec4(0.88, 0.98, 1.0, a);",
+    "}"
+  ].join("\n");
+
   /* a seeded generator (the reef never draws from the simulation's random numbers) */
   function rng(seed) {
     var s = (seed >>> 0) || 0x9e3779b9;
@@ -356,7 +431,7 @@
   }
   function hexc(h) { return [((h >> 16) & 255) / 255, ((h >> 8) & 255) / 255, (h & 255) / 255]; }
   var PAL = {
-    rock: [0x8c8478, 0x9a8f7f, 0x7d7a74, 0xa59a86], rockFar: [0x6f7b85, 0x7d8890, 0x66727c],
+    rock: [0x8c8478, 0x9a8f7f, 0x7d7a74, 0xa59a86], rockFar: [0x7f9178, 0x8e8a76, 0x76877f, 0x96906f],
     pebble: [0xb9ab92, 0xa7987e, 0xcbbd9f, 0x8f8a80],
     shell: [0xf2dcc7, 0xf6c9b8, 0xeedfb6, 0xf3e7d8],
     crust: [0xe8836f, 0xc86fa6, 0xf0a648, 0x9b7fd1],
@@ -494,8 +569,8 @@
     for (i = 0; i < Math.round(26 * area); i++) place((r() - 0.5) * (L - 30), 15 + r() * (Dp - 30), "crust");
     /* behind the back glass */
     var span = L + 900;
-    for (i = 0; i < Math.round(span / 120); i++) place((r() - 0.5) * span, Dp + 40 + r() * 340, "rock");
-    for (i = 0; i < Math.round(span / 50); i++) place((r() - 0.5) * span, Dp + 25 + r() * 260, "coral");
+    for (i = 0; i < Math.round(span / 170); i++) place((r() - 0.5) * span, Dp + 60 + r() * 320, "rock");
+    for (i = 0; i < Math.round(span / 34); i++) place((r() - 0.5) * span, Dp + 25 + r() * 260, "coral");
     for (i = 0; i < Math.round(span / 160); i++) place((r() - 0.5) * span, Dp + 30 + r() * 300, "brain");
     for (i = 0; i < 4; i++) place((r() - 0.5) * L * 0.9, Dp + 120 + r() * 220, "column");
     place((r() - 0.5) * L * 0.6, Dp + 90 + r() * 120, "fallen");
@@ -513,7 +588,7 @@
         case "pebble": dome(B, r, a, y, b, 1.5 + 2.5 * r(), 0.8 + 1.6 * r(), pick(PAL.pebble), 0, 5, 2); break;
         case "shell": shell(B, r, a, y, b, 1.6 + 1.8 * r(), pick(PAL.shell)); break;
         case "crust": dome(B, r, a, y, b, 5 + 7 * r(), 2 + 3.5 * r(), pick(PAL.crust), 0, 8, 2); break;
-        case "rock": dome(B, r, a, y, b, 30 + 60 * r(), 35 + 110 * r(), pick(PAL.rockFar), 1, 8, 4); break;
+        case "rock": dome(B, r, a, y, b, 28 + 44 * r(), 26 + 70 * r(), pick(PAL.rockFar), 1, 8, 4); break;
         case "lowrock": dome(B, r, a, y, b, 10 + 18 * r(), 6 + 12 * r(), pick(PAL.rock), 0, 7, 3); break;
         case "coral": coralTree(B, r, a, y, b, 35 + 75 * r(), pick(PAL.coral), out); break;
         case "brain": dome(B, r, a, y, b, 14 + 18 * r(), 12 + 16 * r(), pick(PAL.brain), out, 9, 3); break;
@@ -522,6 +597,49 @@
       }
     });
     return B;
+  }
+
+  /* The moving parts, in the tank's frame (a along the glass, b behind it):
+   * blades (sea grass inside, at most 6 units; kelp and grass outside), the
+   * light shafts' bands, and the bubbles' vents (outside only). */
+  var GREENS = [0x5f9e3a, 0x7dab3c, 0x4f8a45, 0x9bb94a, 0x3f7f5a, 0xa3a447];
+  function buildLife(L, Dp, floorY, seed) {
+    var r = rng(seed ^ 0x2c1b3c6d), blades = [], shafts = [], vents = [], i, k;
+    function blade(a, b, h, w, out) {
+      var c = hexc(GREENS[Math.floor(r() * GREENS.length) % GREENS.length]);
+      blades.push([a, b, h, w, r(), out, c[0], c[1], c[2]]);
+    }
+    function tuft(a, b, n, hMin, hMax, w, out) {
+      for (var j = 0; j < n; j++) blade(a + (r() - 0.5) * w * 6, b + (r() - 0.5) * w * 3, hMin + (hMax - hMin) * r(), w * (0.7 + 0.6 * r()), out);
+    }
+    var area = L * Dp / (1920 * 1080);
+    /* inside: short turf, no taller than 6 units */
+    for (i = 0; i < Math.round(36 * area); i++) tuft((r() - 0.5) * (L - 30), 15 + r() * (Dp - 30), 5 + Math.floor(r() * 5), 2.5, 6, 1.1, 0);
+    /* behind the back glass and beyond the ends: kelp (up to just under the surface) and grass */
+    var span = L + 800, top = -floorY - 18;
+    for (i = 0; i < Math.round(span / 48); i++) {
+      var a = (r() - 0.5) * span, b = Dp + 20 + r() * 260;
+      if (r() < 0.55) tuft(a, b, 2 + Math.floor(r() * 4), top * 0.45, top * (0.75 + 0.25 * r()), 7 + 5 * r(), 1);
+      else tuft(a, b, 5 + Math.floor(r() * 6), 12, 40, 3, 1);
+    }
+    [-1, 1].forEach(function (sd) {
+      for (k = 0; k < 9; k++) {
+        var a2 = sd * (L / 2 + 40 + r() * 340), b2 = -40 + r() * (Dp + 300);
+        if (r() < 0.5) tuft(a2, b2, 2 + Math.floor(r() * 3), top * 0.4, top * 0.9, 7 + 4 * r(), 1);
+        else tuft(a2, b2, 6, 10, 34, 3, 1);
+      }
+    });
+    /* in front of the glass: low tufts by the rocks */
+    for (i = 0; i < Math.round(L / 120); i++) tuft((r() - 0.5) * (L + 200), -(25 + r() * 100), 4 + Math.floor(r() * 4), 5, 14, 2, 1);
+    /* the light shafts, spread along the tank and a little beyond, at several depths */
+    for (i = 0; i < 10; i++) shafts.push([(i / 9 - 0.5) * (L + 300) + (r() - 0.5) * 120, 120 + r() * (Dp + 150), 22 + 40 * r(), r()]);
+    /* bubble vents: behind the back glass and beyond the ends, a stream of bubbles each */
+    for (i = 0; i < 10; i++) {
+      var va = i < 7 ? (r() - 0.5) * (L + 400) : (i % 2 ? 1 : -1) * (L / 2 + 60 + r() * 200);
+      var vb = i < 7 ? Dp + 30 + r() * 180 : r() * Dp;
+      for (k = 0; k < 14; k++) vents.push([va + (r() - 0.5) * 6, vb + (r() - 0.5) * 6, r()]);
+    }
+    return { blades: blades, shafts: shafts, bubbles: vents };
   }
 
   /* ================= the reef object ================= */
@@ -539,7 +657,10 @@
       uDeepTop: { value: v3(GRADE.deepTop[1]) }, uDeepBot: { value: v3(GRADE.deepBot[1]) },
       uSunDir: { value: v3(ctx.light) }, uAz0: { value: 0 }, uMove: { value: 1 },
       uGlassN: { value: new THREE.Vector2(0, 1) }, uGlassC: { value: 540 },   /* the front glass: dot(xz, N) = C */
-      uDp: { value: 1080 }, uSkySpan: { value: 0.02 }
+      uDp: { value: 1080 }, uSkySpan: { value: 0.02 },
+      /* the reef's own clock (seconds; still with reduced motion), the blades' sway, the shafts' strength, the bubbles' pixel scale */
+      uClock: { value: 0 }, uSway: { value: 1 }, uShaft: { value: 1 }, uPxB: { value: 500 },
+      uAlong: { value: new THREE.Vector3(1, 0, 0) }
     };
     function glassU(u) { u.uGlassN = U.uGlassN; u.uGlassC = U.uGlassC; u.uDp = U.uDp; return u; }
 
@@ -554,7 +675,7 @@
       var m = new THREE.ShaderMaterial({ vertexShader: DOME_VS, fragmentShader: DOME_FS, side: THREE.DoubleSide,
         uniforms: { uSkyTop: U.uSkyTop, uSkyHorizon: U.uSkyHorizon, uCloud: U.uCloud, uCloudShade: U.uCloudShade,
                     uHill: U.uHill, uHillDark: U.uHillDark, uBeach: U.uBeach, uRock: U.uRock,
-                    uDeepTop: U.uDeepTop, uDeepBot: U.uDeepBot, uSunDir: U.uSunDir, uTime: common.uTime, uAz0: U.uAz0,
+                    uDeepTop: U.uDeepTop, uDeepBot: U.uDeepBot, uSunDir: U.uSunDir, uTime: U.uClock, uAz0: U.uAz0,
                     uSea: U.uSea, uGlassN: U.uGlassN, uGlassC: U.uGlassC, uSkySpan: U.uSkySpan, uFogC: common.uFog },
         depthWrite: false, depthTest: false });
       return add(new THREE.Mesh(g, m), -10);
@@ -562,7 +683,7 @@
 
     /* ---- the sea band: the water's top, from the front glass back ---- */
     var seaMat = new THREE.ShaderMaterial({ vertexShader: DOME_VS, fragmentShader: SEA_FS,
-      uniforms: { uSea: U.uSea, uSeaHi: U.uSeaHi, uSkyHorizon: U.uSkyHorizon, uTime: common.uTime, uCaustic: ctx.caustic },
+      uniforms: { uSea: U.uSea, uSeaHi: U.uSeaHi, uSkyHorizon: U.uSkyHorizon, uTime: U.uClock, uCaustic: ctx.caustic },
       transparent: true, depthWrite: false, side: THREE.DoubleSide });
     var sea = add(new THREE.Mesh(new THREE.PlaneGeometry(1, 1), seaMat), 7);
     sea.rotation.x = -Math.PI / 2;
@@ -570,13 +691,30 @@
     /* ---- the waterline on the front glass ---- */
     var lineGeo = new THREE.BufferGeometry();
     var lineMat = new THREE.ShaderMaterial({ vertexShader: LINE_VS, fragmentShader: LINE_FS,
-      uniforms: { uTime: common.uTime, uMove: U.uMove }, transparent: true, depthWrite: false, side: THREE.DoubleSide });
+      uniforms: { uTime: U.uClock, uMove: U.uMove }, transparent: true, depthWrite: false, side: THREE.DoubleSide });
     var waterline = add(new THREE.Mesh(lineGeo, lineMat), 9);
 
     /* ---- the reef: one merged mesh, rebuilt with the tank ---- */
     var decorMat = new THREE.ShaderMaterial({ vertexShader: DECOR_VS, fragmentShader: decorFS(ctx.FOG_FN, ctx.BEAM_FN),
       uniforms: glassU(ctx.beamUniforms({ uLight: common.uLight, uFog: common.uFog, uFogDensity: common.uFogDensity })) });
     var decor = add(new THREE.Mesh(new THREE.BufferGeometry(), decorMat), 0);
+
+    /* ---- sea grass and kelp (instanced blades), light shafts, bubbles ---- */
+    var bladeTpl = bladeTemplate();
+    var bladeMat = new THREE.ShaderMaterial({ vertexShader: BLADE_VS, fragmentShader: decorFS(ctx.FOG_FN, ctx.BEAM_FN),
+      uniforms: glassU(ctx.beamUniforms({ uLight: common.uLight, uFog: common.uFog, uFogDensity: common.uFogDensity,
+                                          uAlong: U.uAlong, uClock: U.uClock, uSway: U.uSway })),
+      side: THREE.DoubleSide });
+    var blades = add(new THREE.Mesh(new THREE.InstancedBufferGeometry(), bladeMat), 0);
+    var shaftMat = new THREE.ShaderMaterial({ vertexShader: SHAFT_VS, fragmentShader: SHAFT_FS,
+      uniforms: { uClock: U.uClock, uShaft: U.uShaft },
+      blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide });   /* not transparent: drawn before the fish */
+    var shafts = add(new THREE.Mesh(new THREE.BufferGeometry(), shaftMat), 1);
+    var bubbleMat = new THREE.ShaderMaterial({ vertexShader: BUBBLE_VS, fragmentShader: BUBBLE_FS,
+      uniforms: { uClock: U.uClock, uPx: U.uPxB, uFloorY: common.uFloorY, uAlong: U.uAlong, uMove: U.uMove },
+      transparent: true, depthWrite: false });
+    var bubbles = add(new THREE.Points(new THREE.BufferGeometry(), bubbleMat), 6);
+    var SHAFT_N = 10;
 
     /* ---- the predators' faces ---- */
     var faceTpl = faceTemplate();
@@ -692,6 +830,57 @@
       waterline.geometry = lineGeo;
       /* the island ahead-left of the view, whichever side the glass is on */
       U.uAz0.value = F.land ? 0 : Math.PI / 2;
+      U.uAlong.value.copy(F.along);
+      buildLifeMeshes(st, tmp);
+    }
+    /* the blades, shafts and bubbles in three's coordinates */
+    function buildLifeMeshes(st, tmp) {
+      var life = buildLife(F.L, F.Dp, st.FLOOR_Y, 0x7a11 + st.W * 5 + st.H * 11), i;
+      /* blades: the template, and per blade its base, size and colour */
+      var nb = life.blades.length, iPos = new Float32Array(nb * 3), iSize = new Float32Array(nb * 4), iCol = new Float32Array(nb * 3);
+      for (i = 0; i < nb; i++) {
+        var B = life.blades[i];
+        toWorld(B[0], B[1], st.FLOOR_Y - 0.5, tmp);
+        iPos[3 * i] = tmp.x; iPos[3 * i + 1] = tmp.y; iPos[3 * i + 2] = tmp.z;
+        iSize[4 * i] = B[2]; iSize[4 * i + 1] = B[3]; iSize[4 * i + 2] = B[4]; iSize[4 * i + 3] = B[5];
+        iCol[3 * i] = B[6]; iCol[3 * i + 1] = B[7]; iCol[3 * i + 2] = B[8];
+      }
+      var g = new THREE.InstancedBufferGeometry();
+      var p3 = new Float32Array(bladeTpl.T.length / 2 * 3);
+      for (i = 0; i < bladeTpl.T.length / 2; i++) { p3[3 * i] = bladeTpl.T[2 * i]; p3[3 * i + 1] = bladeTpl.T[2 * i + 1]; }
+      g.setAttribute("position", new THREE.BufferAttribute(p3, 3));   /* three's bookkeeping; the shader reads aT */
+      g.setAttribute("aT", new THREE.BufferAttribute(bladeTpl.T, 2));
+      g.setIndex(bladeTpl.idx);
+      g.setAttribute("iPos", new THREE.InstancedBufferAttribute(iPos, 3));
+      g.setAttribute("iSize", new THREE.InstancedBufferAttribute(iSize, 4));
+      g.setAttribute("iCol", new THREE.InstancedBufferAttribute(iCol, 3));
+      g.instanceCount = nb;
+      blades.geometry.dispose(); blades.geometry = g;
+      /* shafts: bands from the surface to the sand, slanted along the light */
+      var L = ctx.light, H = -st.FLOOR_Y, shiftA = -(L[0] * F.along.x + L[2] * F.along.z) / L[1] * H;
+      var P = [], UV = [];
+      life.shafts.forEach(function (S) {
+        var a = S[0], b = S[1], w = S[2] / 2, sd = S[3];
+        var c = [[a - w, 1, 0, 0], [a + w, 1, 1, 0], [a + w + shiftA, st.FLOOR_Y + 2, 1, 1], [a - w + shiftA, st.FLOOR_Y + 2, 0, 1]];
+        [0, 1, 2, 0, 2, 3].forEach(function (k) {
+          toWorld(c[k][0], b, c[k][1], tmp);
+          P.push(tmp.x, tmp.y, tmp.z); UV.push(c[k][2], c[k][3], sd);
+        });
+      });
+      var sg = new THREE.BufferGeometry();
+      sg.setAttribute("position", new THREE.BufferAttribute(new Float32Array(P), 3));
+      sg.setAttribute("aUV", new THREE.BufferAttribute(new Float32Array(UV), 3));
+      shafts.geometry.dispose(); shafts.geometry = sg;
+      /* bubbles: one point each, risen in the shader */
+      var nbb = life.bubbles.length, BP = new Float32Array(nbb * 3), BS = new Float32Array(nbb);
+      for (i = 0; i < nbb; i++) {
+        toWorld(life.bubbles[i][0], life.bubbles[i][1], 0, tmp);
+        BP[3 * i] = tmp.x; BP[3 * i + 1] = 0; BP[3 * i + 2] = tmp.z; BS[i] = life.bubbles[i][2];
+      }
+      var bg = new THREE.BufferGeometry();
+      bg.setAttribute("position", new THREE.BufferAttribute(BP, 3));
+      bg.setAttribute("aSeed", new THREE.BufferAttribute(BS, 1));
+      bubbles.geometry.dispose(); bubbles.geometry = bg;
     }
 
     /* ---- framing: the camera at the front glass ---- */
@@ -838,7 +1027,7 @@
       common.uFogDensity.value = fogDensity();
     }
 
-    var blink = 0, lastAnimT = null, sinceMove = 0;
+    var blink = 0, lastAnimT = null, sinceMove = 0, clock = 0;
     function frame(dt, s, info) {
       if (!on) return;
       build();
@@ -853,6 +1042,19 @@
         face.visible = !!pk && pk.n > 0;
       }
       waterline.visible = cam.position.y > -1;
+      /* the reef's own motion: its clock runs while the page shows (the run
+       * may be paused; the reef still breathes), never with reduced motion */
+      if (!st.reduced) clock += dt;
+      U.uClock.value = clock;
+      /* detail: 3 everything; 2 no bubbles, no sway, four shafts; 1 no shafts, no blades */
+      var q = st.quality;
+      U.uSway.value = !st.reduced && q >= 3 ? 1 : 0;
+      bubbles.visible = q >= 3;
+      blades.visible = q >= 2;
+      shafts.visible = q >= 2;
+      shafts.geometry.setDrawRange(0, (q >= 3 ? SHAFT_N : 4) * 6);
+      var fullH0 = cam.view && cam.view.enabled ? cam.view.fullHeight : st.ch;
+      U.uPxB.value = fullH0 * ctx.dpr() / (2 * Math.tan(cam.fov * Math.PI / 360));
       /* the sky band: from the horizon to the top of the view (the island and clouds are sized to it) */
       var fullH = cam.view && cam.view.enabled ? cam.view.fullHeight : st.ch;
       var vh = Math.max(1, st.ch - st.insets.top - st.insets.bottom);
