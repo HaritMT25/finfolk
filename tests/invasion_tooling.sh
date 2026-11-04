@@ -1493,6 +1493,41 @@ for what, patch in cases.items():
         assert cnt[("world not built as registered (source fit or plant failed; counted as a failure): bounded ladder", "null", 0.95)] == n
 PY
 
+# 32. quick check of round 5 (P2): a failed directory fsync must not leave replay dependencies cached as
+# durable. Two cells with the same dependencies: the first barrier's fsync of store/ fails (EIO), so that
+# cell deletes nothing; the second cell's barrier must sync the blob, store/ and the root again before its
+# deletions. Once durable, a third cell syncs nothing more
+rm -rf root32 && mkdir -p root32/store root32/bin
+$PY - "$T" <<'PY' > t32.log 2>&1 || fail "a failed directory fsync left the replay dependencies cached as durable: $(tail -3 t32.log)"
+import errno, os, sys
+sys.path.insert(0, sys.argv[1]); import run
+root = os.path.abspath("root32"); h = "b" * 64; sd = f"{root}/store"
+open(f"{sd}/{h}", "w").write("blob\n")
+ev, boom, of = [], [True], os.fsync
+def fs(fd):
+    p = os.readlink(f"/proc/self/fd/{fd}")
+    ev.append(p)
+    if p == sd and boom[0]:
+        boom[0] = False
+        raise OSError(errno.EIO, "injected")
+    return of(fd)
+os.fsync = fs
+run._SYNCED.clear()
+try:
+    run.durability_barrier(root, [h])
+    raise SystemExit("the first barrier did not raise")
+except OSError as e:
+    assert e.errno == errno.EIO, e
+assert (root, h) not in run._SYNCED, "a blob was cached as durable although store/ did not sync"
+ev.clear()
+run.durability_barrier(root, [h])
+assert f"{sd}/{h}" in ev and sd in ev and root in ev, ev
+assert (root, h) in run._SYNCED
+ev.clear()
+run.durability_barrier(root, [h])
+assert ev == [], ev
+PY
+
 # 19. self-tests of the inference and bounded-scale modules
 $PY "$T/infer.py" > /dev/null || fail "infer.py self-test"
 $PY "$T/bounded.py" > /dev/null || fail "bounded.py self-test"

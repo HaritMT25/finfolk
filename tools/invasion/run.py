@@ -672,11 +672,12 @@ def durability_barrier(root, blobs):
     by another process, or found by a cache fast path), then the store directory (their entries),
     the pinned binary and its sha256 record, bin/ (their entries), and the root (the entries of
     store/ and bin/). Each path is synced once per process; a blob new to this process re-syncs
-    the store directory and the root."""
+    the store directory and the root.
+    A blob counts as synced only after its content, store/ and the root all synced (quick check of
+    round 5): if a directory fsync raises, the next call with the same blobs syncs them again."""
     new = [h for h in blobs if (root, h) not in _SYNCED]
     for h in new:
         _fsync_path(store_path(root, h))
-        _SYNCED.add((root, h))
     sd = os.path.join(root, STORE)
     if new and os.path.isdir(sd):
         fsync_dir(sd)
@@ -688,6 +689,7 @@ def durability_barrier(root, blobs):
     if new or (root, root) not in _SYNCED:
         fsync_dir(root)
         _SYNCED.add((root, root))
+    _SYNCED.update((root, h) for h in new)
 
 
 def replay_prereqs(root, d, done, put=True):
