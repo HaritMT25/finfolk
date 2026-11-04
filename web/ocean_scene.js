@@ -58,12 +58,13 @@
  *   - the swim polish (POSE_GLSL, POLISH_FN; drawn from detail 2 up): the
  *     fish roll into their turns; on a fish big enough on screen to show it
  *     (swimPose's size weight), the appearance fish's paired fins fold back
- *     at speed (the renderer's estimate, fillApp) and scull, the tail's
+ *     at speed (the renderer's estimate, fillApp), the tail's
  *     trailing edge lags, thin fins let the light through and glow against
  *     it, a wet highlight runs on the facets, the genes' skin has a sheen at
  *     grazing angles, and backs near the surface catch faint caustics. Every
  *     fish program has a plain variant, the fish exactly as before (its
- *     GLSL byte for byte, its cost), drawn at detail 1. Display only, like
+ *     GLSL byte for byte, its cost), drawn at detail 1, and a lite one (the
+ *     roll only) drawn while no fish of its kind is lit. Display only, like
  *     everything here
  *
  * Big tanks: the sand, caustics and surface are world-unit procedural
@@ -79,7 +80,7 @@
  * Cost model: one instanced draw for all fish, one for their shadows, one each
  * for predators, food, currents and the floor. Per frame the CPU only packs
  * the spine points (20 floats per fish) into instance buffers (and, with the
- * polish, each fish's swim pose: 4 floats, from its spine, a swimming-speed
+ * polish, each fish's swim pose: one packed float, from its spine, a swimming-speed
  * estimate (a merge by id, no allocation) and its size on screen); the
  * bending, shading and tail beat happen in the shaders.
  *
@@ -166,8 +167,8 @@
   }
 
   /* ---------------- shaders ---------------- */
-  /* The swim polish: every fish program comes in two variants, built by the
-   * same function from a flag P. Plain (P false) is the fish exactly as
+  /* The swim polish: every fish program comes in variants, built by the
+   * same function from a flag P (plain, full, lite). Plain (P false) is the fish exactly as
    * before the polish, its GLSL byte for byte, and its cost: no pose read,
    * no swimming-speed history kept. Polished (P true) reads each fish's swim
    * pose from one float the CPU packs once per fish (swimPose, from the
