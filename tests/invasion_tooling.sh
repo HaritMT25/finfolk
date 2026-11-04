@@ -2345,7 +2345,7 @@ assert all(out[k][0] for k in good), [k for k in good if not out[k][0]]
 assert not any(out[k][0] for k in bad), [k for k in bad if out[k][0]]
 assert out["interior"][1] < 1e-9 and all(out[k][1] > 1 for k in bad)
 f = bounded.fit(H, "logistic", [40.0] + [0.0] * (2 * N - 2))
-assert not f["converged"] and f["saturated_sse"] > 30 and "stat_ridge" in bounded.FIT_FREEZE, f["reason"]
+assert not f["converged"] and f["saturated_sse"] > 30 and f["flat_sse"] is not None, f["reason"]
 PY
 # ... and review of #49, round 2: (A) a0 = +25, a11 = -25 with targets 0.5 (SSE 5.5, derivatives 1.4e-11: the
 #     global ridge used to hide those directions) is NOT converged; (B) Codex's rectangle - a finite local minimum
@@ -2444,6 +2444,49 @@ YI = {(i, j): min(1, max(0, bounded.sigmoid(-2.3 + a[i] + b[j]) + rnd.gauss(0, 0
 fI = bounded.fit([[YI[(i, j)] if i != j else None for j in range(N)] for i in range(N)], "logistic")
 _, SR = rgn([-2.3] + [0.0] * (2 * N), YI)
 assert fI["converged"] and abs(fI["sse"] - SR) / SR < 1e-9, (fI["sse"], SR)
+# review of #49, round 3: A in item permutations - a WEAK COMBINATION of strong columns (a0 = +25 / a1 = -25:
+# Codex's case, where column scaling plus a ridge hid a0 - a1) - is NOT converged in every arrangement, on the
+# invader and on the resident effects; the reference confirms independently: its own (modified Gram-Schmidt)
+# least-squares gain is ~the whole SSE and a line search along its own Gauss-Newton direction realizes a
+# large part of it (25% of the SSE in every arrangement; the allowance is 1e-4 of it)
+def rmgs(Jr, r):
+    m, P = len(Jr), len(Jr[0])
+    Q, R, keep = [[Jr[i][p] for i in range(m)] for p in range(P)], [[0.0] * P for _ in range(P)], []
+    big = max(math.sqrt(sum(x * x for x in q)) for q in Q)
+    for p in range(P):
+        v = Q[p]
+        for _ in range(2):
+            for k in keep:
+                dd = sum(x * y for x, y in zip(Q[k], v)); R[k][p] += dd
+                v = [x - dd * y for x, y in zip(v, Q[k])]
+        nv = math.sqrt(sum(x * x for x in v))
+        if nv > 1e-13 * big:
+            R[p][p] = nv; Q[p] = [x / nv for x in v]; keep.append(p)
+    qr = {p: sum(x * y for x, y in zip(Q[p], r)) for p in keep}
+    dlt = [0.0] * P
+    for p in reversed(keep):
+        dlt[p] = (qr[p] - sum(R[p][c] * dlt[c] for c in keep if c > p)) / R[p][p]
+    return sum(v * v for v in qr.values()), dlt
+def rprobe(th, Y):
+    r, Jr = reval(th, Y)
+    S = sum(x * x for x in r)
+    gain, dlt = rmgs(Jr, r)
+    best, t = 0.0, 1.0
+    for _ in range(260):
+        best = max(best, S - rsse([x + t * y for x, y in zip(th, dlt)], Y))
+        t *= 0.8
+    return S, gain, best
+for side in ("a", "b"):
+    for i, j in ((0, 1), (0, 11), (1, 0), (5, 6), (11, 3), (4, 9)):
+        e = [0.0] * N; e[i] = 25.0; e[j] = -25.0
+        aa, bb = (e, [0.0] * N) if side == "a" else ([0.0] * N, e)
+        r = bounded.lm(model, cells, [YA[c] for c in cells], bth(0.0, aa, bb), iters=0)
+        assert not r[2] and r.rank == 2 * N - 1, (side, i, j, r[2], r.stationarity)
+        S, gain, best = rprobe([0.0] + aa + bb, YA)
+        assert gain > 0.99 * S and best > 0.1 * S, (side, i, j, S, gain, best)
+S, gain, best = rprobe(thB, YB)
+assert gain < 1e-12 * S and best <= 1e-12, (gain, best)   # B: nothing to gain, nothing realizable
+assert "rank_tol" in bounded.FIT_FREEZE and "stat_ridge" not in bounded.FIT_FREEZE
 PY
 
 # 43. review of #49, finding 4: the Beta part's variance without cancellation (mu 0.5, v 1e-18 used to become
@@ -2486,6 +2529,34 @@ for a, b in ((0.05, 3.0), (2.0, 2.0), (0.8, 0.02)):
     q = calibrate.BetaQuantile(a, b)
     assert abs(q.s[0] + 36.0) <= 1e-9 and abs(q.s[-1] - 36.0) <= 1e-9 and len(q.s) < 5000, (a, b, len(q.s))
 PY
+# ... and review of #49, round 3: the log-Beta normalizer for large asymmetric shapes (lgamma(a + b) - lgamma(b)
+#     was 0 at a = 1, b = 1e16, the true -log B = 36.84) and the extreme-asymmetry regime, against CLOSED FORMS that
+#     share nothing with the CDF evaluator: Beta(1, b): F^-1(u) = -expm1(log(1 - u) / b); Beta(a, 1): F^-1(u) =
+#     u^(1/a); b and a up to 1e16, u down to e^-40 (beyond the tabulated range: the exact fallback)
+$PY - "$T" <<'PY' || fail "the Beta quantile against closed forms"
+import math, sys
+sys.path.insert(0, sys.argv[1]); import calibrate
+US = (math.exp(-40), 1e-10, 0.3, 0.9, 1 - 1e-12)
+def close(x, xe, one_minus_xe):
+    if xe < 0.5:
+        return abs(x - xe) <= 1e-9 * xe
+    return abs(x - xe) <= max(1e-9 * one_minus_xe, 4.5e-16)   # (near 1: the double's own resolution)
+for b in (3.0, 1e4, 1e9, 1e16):
+    q = calibrate.BetaQuantile(1.0, b)
+    assert len(q.s) < 3000 and q.floor_hits == 0, (b, len(q.s))
+    for u in US:
+        lxe = math.log1p(-u) / b
+        assert close(q(u, 1 - u), -math.expm1(lxe), math.exp(lxe)), (b, u, q(u, 1 - u), -math.expm1(lxe))
+for a in (3.0, 1e4, 1e9, 1e16):
+    q = calibrate.BetaQuantile(a, 1.0)
+    assert len(q.s) < 3000 and q.floor_hits == 0, (a, len(q.s))
+    for u in US:
+        lxe = math.log(u) / a
+        assert close(q(u, 1 - u), math.exp(lxe), -math.expm1(lxe)), (a, u, q(u, 1 - u), math.exp(lxe))
+assert abs(calibrate.betaln(1.0, 1e16) + math.log(1e16)) < 1e-12 and abs(calibrate.betaln(1e16, 1.0) + math.log(1e16)) < 1e-12
+for a, b in ((12.0, 30.0), (3.0, 47.0), (0.5, 11.0), (100.0, 250.0), (2.0, 3.0)):
+    assert abs(calibrate.betaln(a, b) - (math.lgamma(a) + math.lgamma(b) - math.lgamma(a + b))) < 1e-11, (a, b)
+PY
 
 # 49. review of #49, round 2, finding 5: a required noiseless refit of the CLIPPED NULL that does not converge
 #     leaves the plant unconstructed (it used to be ignored: only its d_res was kept), and the gate's validity fails
@@ -2515,6 +2586,46 @@ agg = gate.aggregate(res, man["schedule"])
 agg[("L", "target")]["plants"]["0/1"]["clip0_converged"] = False
 v_ = [c for c in gate.decide_gate(agg, None, False, [])[0] if c["criterion"] == "validity"][0]
 assert not v_["ok"] and any("target plant 0/1" in p for p in v_["problems"]), v_
+PY
+
+# 50. review of #49, round 3, finding 1: a FORMAL receipt covers only tasks computed by the run that issues it.
+#     Coherent fabrication planted in the cache BEFORE the receipt is issued - every record correctly bound
+#     (manifest, run, construction) but with invented counters - is ignored by a formal run, which recomputes
+#     every task; an exploratory resume may reuse its cache, and its receipt is not formal
+$PY - "$T" <<'PY' > t50.log 2>&1 || fail "a formal receipt over fabricated cached counters: $(tail -3 t50.log)"
+import argparse, contextlib, io, json, os, shutil, sys
+sys.path.insert(0, sys.argv[1]); import gate
+m0 = gate.manifest
+gate.manifest = lambda counts=None, spec=None: dict(m0(counts, spec), formal=True)   # the formal path on the toy registration
+shutil.rmtree("g50", ignore_errors=True)
+args = argparse.Namespace(out="g50", bank="bank37/blocks.json", bank_plan="plan37.jsonl", bank_inputs=None, workers=1,
+                          counts="counts37b.json", bank_spec="spec37.json")
+with contextlib.redirect_stdout(io.StringIO()):
+    gate.cmd_run(args)
+genuine = {f: open(f"g50/tasks/{f}").read() for f in os.listdir("g50/tasks")}
+for f, text in genuine.items():   # fabricate: every null clean, every alternative rejects - coherent and bound
+    t = json.loads(text)
+    n = t["n"]
+    alt = t["variant"] != "null" and not t["variant"].startswith("outer")
+    for k_ in ("H1", "H1b", "claim"):
+        if t["world"] in ("E", "G") and k_ != "H1":
+            continue
+        t["rej"][k_] = t["rej05"][k_] = n if alt else 0
+        t["unavailable"][k_] = 0
+    open(f"g50/tasks/{f}", "w").write(json.dumps(t, sort_keys=True) + "\n")
+out = io.StringIO()
+with contextlib.redirect_stdout(out):
+    gate.cmd_run(args)
+log = out.getvalue()
+assert "formal run: %d cached task record(s) ignored" % len(genuine) in log and "0 already done" in log, log[:400]
+def body(text):   # a recomputed record equals the genuine one, up to its wall time
+    t = json.loads(text); t.pop("seconds"); return t
+assert all(body(open(f"g50/tasks/{f}").read()) == body(text) for f, text in genuine.items()), "a fabricated record survived"
+rc = json.load(open("g50/receipt.json"))["components"]
+assert rc["formal"] is True and rc["tasks_computed_by_this_run"] == len(genuine) and "RECEIPT" in log, rc
+gate.manifest = m0
+q = gate.verify_record("g37", receipt_sha=json.load(open("g37/receipt.json"))["receipt"])[1]
+assert any("not a formal receipt" in x for x in q), q   # (g37 was resumed: 21 of 42 tasks came from its cache)
 PY
 
 # 19. self-tests of the inference and bounded-scale modules
