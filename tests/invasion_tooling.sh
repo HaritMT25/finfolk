@@ -1173,6 +1173,9 @@ for c in ("off", "predA"):
 pr, pb, pj = analyze.primary_blocks(rows, None, reg, cores, 49, bsims=9)
 assert pj[0]["status"] == "formal" and pj[0]["both_rejected"] is True and pj[0]["h1b_valid"], pj   # the data reject
 assert pj[0]["claim_beyond_bounded"] is None and "no calibration gate record" in pj[0]["claim_status"], pj   # (prereg gate)
+# (review of #49, round 4, P2-3: probed / probe-certified fits and refits are reported with the H1b decision)
+assert "; fits: 4, probed " in pj[0]["h1b_diagnostics"] and "; bootstrap refits: 36, probed " in pj[0]["h1b_diagnostics"] \
+    and "probe-certified" in pj[0]["h1b_diagnostics"], pj[0]["h1b_diagnostics"]
 lm0 = bounded.lm
 bounded.lm = lambda model, cells, y, th0, iters=200, tol=1e-11: lm0(model, cells, y, th0, 1, tol)   # unfinished fits
 pr, pb, pj = analyze.primary_blocks(rows, None, reg, cores, 49, bsims=9)
@@ -2487,6 +2490,54 @@ for side in ("a", "b"):
 S, gain, best = rprobe(thB, YB)
 assert gain < 1e-12 * S and best <= 1e-12, (gain, best)   # B: nothing to gain, nothing realizable
 assert "rank_tol" in bounded.FIT_FREEZE and "stat_ridge" not in bounded.FIT_FREEZE
+# review of #49, round 4 (Claude), P1-1: the gain's rank cut NESTS inside the flat-cell rule (RANK_TOL / sqrt(n) |R_11|,
+# and |R_11| <= sqrt(n) max|J|). At RANK_TOL |R_11| a weak combination on cells with derivatives between 2.5e-14 and
+# ~7e-14 was neither in the gain nor flat: A was certified at eta0 = +-30.3 .. 31.3 in the 8 arrangements without item
+# 11. Now A over eta0 in [20, 45] (0.05 steps) is never certified, in any of the 12 arrangements
+assert abs(bounded.gain_cut(len(cells)) - bounded.RANK_TOL / math.sqrt(len(cells))) < 1e-30
+cert = []
+for side in ("a", "b"):
+    for i, j in ((0, 1), (0, 11), (1, 0), (5, 6), (11, 3), (4, 9)):
+        for k in range(501):
+            e0 = 20.0 + 0.05 * k
+            e = [0.0] * N; e[i] = e0; e[j] = -e0
+            aa, bb = (e, [0.0] * N) if side == "a" else ([0.0] * N, e)
+            if bounded.lm(model, cells, [YA[c] for c in cells], bth(0.0, aa, bb), iters=0)[2]:
+                cert.append((side, i, j, round(e0, 2)))
+assert not cert, (len(cert), cert[:8])
+e = [0.0] * N; e[0] = 30.8; e[1] = -30.8   # (inside the old gap: resolved at full rank, the probe realizes it)
+r = bounded.lm(model, cells, [YA[c] for c in cells], bth(0.0, e, [0.0] * N), iters=0)
+assert not r[2] and r.rank == 2 * N - 1 and r.stationarity > 0.99 and r.probe_decrease >= r.allow, \
+    (r.rank, r.stationarity, r.probe_decrease, r.allow)
+# ... while B-type legitimate minima stay converged (gain ~0) up to where the flat-cell rule fails closed (a false
+# unavailability, never a false certification: from 15.7 + 15.7 the cells at |eta| ~ 31.4 are flat)
+def yB(sB):
+    aB_, bB_ = [sB] + [0.0] * (N - 1), [0.0, sB] + [0.0] * (N - 2)
+    d01_ = rdsig(2 * sB)
+    rr_ = {(0, 1): -0.5, (0, 3): d01_ / (2 * rdsig(sB)), (2, 1): d01_ / (2 * rdsig(sB)), (2, 3): -2 * d01_}
+    return [rsig(aB_[i] + bB_[j]) + rr_.get((i, j), 0.0) for (i, j) in cells], bth(0.0, aB_, bB_)
+for sB in (10.0, 12.0, 14.0, 15.0, 15.5, 15.65):
+    yb_, th_ = yB(sB)
+    r = bounded.lm(model, cells, yb_, th_, iters=0)
+    assert r[2] and r.stationarity < 1e-12 and r.probe_decrease is None, (sB, r[2], r.stationarity, r.flat_sse)
+for sB in (15.7, 16.0, 17.0):
+    yb_, th_ = yB(sB)
+    r = bounded.lm(model, cells, yb_, th_, iters=0)
+    assert not r[2] and r.stationarity < 1e-12 and r.flat_sse > r.allow, (sB, r[2], r.flat_sse)
+# review of #49, round 4 (Claude), P2-2: the probe refines its coarse 0.8 grid around the scanned SSE's local minima
+# (golden section in log t). The reviewer's planted cycles - row 0 at eta0 with targets 1 - 1e-3, items 1-11 at
+# 0.5 + kappa sin(2 pi (i - j) / 11), orthogonal to the tangent space - leave a decrease window narrower than the
+# grid's 1.25 ratio; they were certified, they are NOT converged, and independently (the reference's own SSE)
+# moving row 0 to logit(0.999) lowers the SSE by 10x / 20x the allowance
+assert all(k_ in bounded.FIT_FREEZE for k_ in ("probe_shrink", "probe_steps", "probe_refine", "probe_golden"))
+for kap, e0, mult in ((0.0135, 29.96, 9.0), (0.0095, 29.48, 18.0)):
+    YC = {(i, j): (1 - 1e-3 if i == 0 else (0.5 if j == 0 else 0.5 + kap * math.sin(2 * math.pi * (i - j) / 11)))
+          for (i, j) in cells}
+    aC = [e0] + [0.0] * (N - 1)
+    r = bounded.lm(model, cells, [YC[c] for c in cells], bth(0.0, aC, [0.0] * N), iters=0)
+    assert not r[2] and r.probe_decrease is not None and r.probe_decrease >= r.allow, (kap, r[2], r.probe_decrease, r.allow)
+    drop = rsse([0.0] + aC + [0.0] * N, YC) - rsse([0.0, math.log(0.999 / 0.001)] + [0.0] * (N - 1) + [0.0] * N, YC)
+    assert drop >= mult * r.allow, (kap, drop, r.allow)
 PY
 
 # 43. review of #49, finding 4: the Beta part's variance without cancellation (mu 0.5, v 1e-18 used to become
@@ -2558,6 +2609,100 @@ for a, b in ((12.0, 30.0), (3.0, 47.0), (0.5, 11.0), (100.0, 250.0), (2.0, 3.0))
     assert abs(calibrate.betaln(a, b) - (math.lgamma(a) + math.lgamma(b) - math.lgamma(a + b))) < 1e-11, (a, b)
 PY
 
+# ... and review of #49, round 4 (Claude), P3: Beta(a, 1) / Beta(1, b) make the BGRAT series' coefficients c_k (k >= 1)
+#     vanish, so the expansion proper was untested. Beta(2, b) (I_x = 1 - (1 - x)^b (1 + b x)) for b up to 1e16 and
+#     Beta(1/2, n) (a < 1: the finite-sum identity for an integer second shape), both tails and mirrored: the
+#     quantile lies within 1e-9 relative (or the double's resolution) of the reference
+$PY - "$T" <<'PY' || fail "the Beta quantile against Beta(2, b) and Beta(1/2, n) references"
+import math, sys
+sys.path.insert(0, sys.argv[1]); import calibrate
+# Beta(2, b): I_x = 1 - (1 - x)^b (1 + b x), as positive terms. With z = -b log(1 - x) and
+# delta = b (-log(1 - x) - x) >= 0: P = [1 - e^-z (1 + z)] + e^-z delta; Q = exp(b log(1 - x) + log1p(b x))
+def p2(z):   # 1 - e^-z (1 + z) = e^-z sum_{k>=2} z^k / k!
+    if z >= 0.5:
+        return -math.expm1(-z) - z * math.exp(-z)
+    t, s, k = z * z / 2.0, 0.0, 2
+    while t > 1e-300 and t > 1e-18 * s:
+        s += t
+        k += 1
+        t *= z / k
+    return math.exp(-z) * s
+def nl1(x, x1):   # -log(1 - x) - x >= 0
+    if x < 0.1:
+        t, s, k = x * x, 0.0, 2
+        while t / k > 1e-18 * max(s, 1e-300):
+            s += t / k
+            k += 1
+            t *= x
+        return s
+    return -math.log(x1) - x
+def beta2(b, x, x1, upper):   # -> P (or Q = 1 - P) of Beta(2, b) at x (x1 = 1 - x)
+    if upper:
+        return math.exp(b * (math.log1p(-x) if x < 0.5 else math.log(x1)) + math.log1p(b * x))
+    z = -b * math.log(x1) if x >= 0.1 else b * (x + nl1(x, x1))
+    return p2(z) + math.exp(-z) * b * nl1(x, x1)
+# Beta(1/2, n), n integer: I_x = sqrt(x) sum_{k<n} (1/2)_k / k! (1 - x)^k (the finite-sum identity for an integer second
+# shape), and 1 - I_x = sqrt(x) sum_{k>=n} (1/2)_k / k! (1 - x)^k (the binomial series of (1 - y)^(-1/2) = x^(-1/2))
+def betahalf(n, x, x1, upper):
+    n = int(n)
+    if not upper:
+        c, w, lo = 1.0, 1.0, 0.0
+        for k in range(n):
+            lo += c * w
+            c *= (k + 0.5) / (k + 1.0)
+            w *= x1
+        return math.sqrt(x) * lo
+    lc = math.lgamma(n + 0.5) - math.lgamma(0.5) - math.lgamma(n + 1.0) + n * math.log(x1) if x1 > 0 else -math.inf
+    t, hi, k = math.exp(lc), 0.0, n
+    while t > 1e-19 * hi and t > 0:
+        hi += t
+        t *= (k + 0.5) / (k + 1.0) * x1
+        k += 1
+    return math.sqrt(x) * hi
+def check(cdf, x, x1, u, u1, floor=0.0, eps=1e-9):
+    """u lies between the reference CDF at the quantile moved by +-eps relative (or the double's resolution)."""
+    if x < 0.5:
+        d = max(eps * x, floor)
+        xl, xh = x - d, x + d
+        xl1, xh1 = 1.0 - xl, 1.0 - xh
+    else:
+        d = max(eps * x1, 4.5e-16, floor)
+        xl1, xh1 = x1 + d, max(x1 - d, 1e-300)
+        xl, xh = 1.0 - xl1, 1.0 - xh1
+    up = u > 0.5
+    Fl, Fh = cdf(max(xl, 1e-300), xl1, up), cdf(xh, xh1, up)
+    if not up:
+        return Fl <= u <= Fh, (Fl, u, Fh)
+    return Fl >= u1 >= Fh, (Fl, u1, Fh)
+US = (math.exp(-40), 1e-10, 0.3, 0.9, 1 - 1e-12)
+# the references agree with each other's closed forms where they overlap: Beta(2, 1) = x^2, Beta(1/2, 1) = sqrt(x)
+for x in (1e-9, 0.01, 0.4, 0.93):
+    P, Q = beta2(1.0, x, 1 - x, False), beta2(1.0, x, 1 - x, True)
+    assert abs(P - x * x) <= 1e-15 * x * x and abs(P + Q - 1) < 1e-15, (x, P)
+    P = betahalf(1, x, 1 - x, False)
+    assert abs(P - math.sqrt(x)) <= 1e-15 * math.sqrt(x), (x, P)
+    if x >= 0.01:   # (the upper-tail series needs ~40 / x terms)
+        Q = betahalf(1, x, 1 - x, True)
+        assert abs(P + Q - 1) < 1e-13, (x, P, Q)
+        P, Q = betahalf(40, x, 1 - x, False), betahalf(40, x, 1 - x, True)
+        assert abs(P + Q - 1) < 1e-13, (x, P, Q)
+res = []
+for a, b, cdf in [(2.0, bb, (lambda x, x1, up, bb=bb: beta2(bb, x, x1, up))) for bb in (3.0, 50.0, 1e4, 1e9, 1e16)] + \
+                 [(0.5, bb, (lambda x, x1, up, bb=bb: betahalf(bb, x, x1, up))) for bb in (3.0, 50.0, 1e4)]:
+    q = calibrate.BetaQuantile(a, b)
+    qm = calibrate.BetaQuantile(b, a) if b <= 1e9 else None   # (mirrored: x -> 1 - x)
+    assert len(q.s) < 3000 and q.floor_hits == 0, (a, b, len(q.s))
+    for u in US:
+        ok, info = check(cdf, q(u, 1 - u), 1 - q(u, 1 - u), u, 1 - u)
+        res.append((a, b, u, ok))
+        assert ok, (a, b, u, info)
+        if qm is not None:
+            xm = qm(1 - u, u)   # = 1 - (the (a, b) quantile at u)
+            ok, info = check(cdf, 1.0 - xm, xm, u, 1 - u, floor=2.3e-16)
+            assert ok, ("mirrored", a, b, u, info)
+assert calibrate._asym_ok(2.0, 1e4) and calibrate._asym_ok(2.0, 1e16) and calibrate._asym_ok(0.5, 1e4)
+PY
+
 # 49. review of #49, round 2, finding 5: a required noiseless refit of the CLIPPED NULL that does not converge
 #     leaves the plant unconstructed (it used to be ignored: only its d_res was kept), and the gate's validity fails
 $PY - "$T" <<'PY' || fail "an unconverged clipped-null refit"
@@ -2626,6 +2771,47 @@ assert rc["formal"] is True and rc["tasks_computed_by_this_run"] == len(genuine)
 gate.manifest = m0
 q = gate.verify_record("g37", receipt_sha=json.load(open("g37/receipt.json"))["receipt"])[1]
 assert any("not a formal receipt" in x for x in q), q   # (g37 was resumed: 21 of 42 tasks came from its cache)
+PY
+
+# 51. review of #49, round 4 (Claude), P2-3: the fit classifier's reports are recorded - the source fits carry every
+#     report, every bounded task record summarizes its H1b decisions' fits (fits, unconverged, probed,
+#     probe-certified, the largest probe decrease, unresolved-block energy and flat-cell SSE, the smallest resolved
+#     Hessian eigenvalue), the decision's diagnostics and gate.md report them, and a malformed summary is a problem
+$PY - "$T" <<'PY' > t51.log 2>&1 || fail "the gate's fit-classifier reports: $(tail -3 t51.log)"
+import copy, json, os, sys
+sys.path.insert(0, sys.argv[1]); import bounded, gate
+man_sha, run_sha = gate.sha256_file("g37/manifest.json"), gate.sha256_file("g37/run.json")
+sched = {t[0]: t for t in json.load(open("g37/manifest.json"))["schedule"]}
+cl = json.load(open("g37/cell_laws.json"))
+assert all(set(gate.FIT_REPORTS) <= set(fi) for fi in cl["fit_info"].values()), cl["fit_info"]
+tot, recs = None, {}
+for f in sorted(os.listdir("g37/tasks")):
+    r = json.load(open(f"g37/tasks/{f}"))
+    t = sched[r["index"]]
+    recs[r["index"]] = (r, t)
+    if t[1] in ("E", "G"):
+        assert r["fit_diag"] is None, r["fit_diag"]
+        continue
+    fd = r["fit_diag"]
+    assert sorted(fd) == sorted(bounded.FIT_DIAG_KEYS) and fd["fits"] == (4 * t[3] if r["built"] else 0), (t, fd)
+    assert fd["probe_certified"] <= fd["probed"] <= fd["fits"] and fd["unconverged"] <= fd["fits"], fd
+    tot = bounded.merge_fit_diag(tot, fd)
+dec = json.load(open("g37/decision.json"))
+rows = dec["diagnostics"]["fit_classifier"]
+assert rows and sum(x["fits"] for x in rows) == tot["fits"] and sum(x["probed"] for x in rows) == tot["probed"], (rows, tot)
+assert "Detector fits (H1b's four logistic mean fits per dataset" in open("g37/gate.md").read()
+r, t = next(v for v in recs.values() if v[1][1] == "L")
+assert not gate.task_problems(r, t, man_sha, run_sha), gate.task_problems(r, t, man_sha, run_sha)
+for mut in ({"fits": 4 * t[3] + 1}, {"probe_certified": r["fit_diag"]["probed"] + 1}, {"max_probe_decrease": "x"}):
+    r2 = copy.deepcopy(r)
+    r2["fit_diag"].update(mut)
+    assert "fit_diag malformed" in gate.task_problems(r2, t, man_sha, run_sha), mut
+r2 = copy.deepcopy(r)
+del r2["fit_diag"]
+assert "fit_diag malformed" in gate.task_problems(r2, t, man_sha, run_sha)
+r, t = next(v for v in recs.values() if v[1][1] == "E")
+r2 = dict(r, fit_diag=bounded.fit_diag())
+assert "an H1-only world with fit diagnostics" in gate.task_problems(r2, t, man_sha, run_sha)
 PY
 
 # 19. self-tests of the inference and bounded-scale modules
