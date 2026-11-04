@@ -977,48 +977,29 @@ def primary_registration(registry, groups, cores, strict=None):
                         why = "fewer than 2 common registered replicates"
             spec.setdefault((cond, frac), {})[gname] = {"names": names, "reps": R, "why": why}
             required.setdefault(frac, set()).add(gname)
+    if strict is not None:
+        # review of #49, finding 1: the required primary design is the confirmation specification's group x assay
+        # product, whatever the plan registers - an absent assay (or group) is a missing primary block, never a
+        # smaller formal omnibus
+        fr = strict["fraction"]
+        for g_ in sorted(groups):
+            required.setdefault(fr, set()).add(g_)
+            for c_ in strict["assays"]:
+                spec.setdefault((c_, fr), {}).setdefault(g_, {"names": [], "reps": [], "why":
+                                                            f"confirmation protocol: assay {c_} is not registered "
+                                                            f"for group {g_}"})
     return spec, {f: sorted(v) for f, v in required.items()}
 
 
-def verify_gate(path):
-    """The calibration gate record the headline claim needs (review round 5 item 1): path = the
-    gate's output directory (or its decision.json). Verified: a decision 'pass', formal (the frozen
-    counts and the registered bank), its manifest.json by hash, that manifest's protocol equal to
-    the frozen one of this code (gate.protocol()), and the statistical implementation it calibrated
-    (bounded.py, infer.py, hodge.py) byte-identical to the one analysing now.
-    -> (summary dict, problems); any problem withholds the claim."""
+def verify_gate(path, require_formal=True):
+    """The calibration gate record the headline claim needs (review round 5 item 1; review of #49, finding 2):
+    path = the gate's output directory. gate.verify_record checks the complete chain - a formal 'pass'
+    decision, the manifest by hash and byte-identical to the one this code regenerates (the frozen protocol,
+    the schedule and all six tool hashes), run.json and cell_laws.json bound to it, every scheduled task
+    record present, valid and bound to this run, and the decision re-aggregated with the acceptance rule
+    applied afresh. -> (summary dict, problems); any problem (missing evidence included) withholds the claim."""
     import gate
-    d = path if os.path.isdir(path) else os.path.dirname(os.path.abspath(path))
-    dp = os.path.join(path, "decision.json") if os.path.isdir(path) else path
-    probs = []
-    try:
-        dec = json.load(open(dp))
-    except (OSError, ValueError) as e:
-        return {"path": dp}, [f"no readable gate decision ({e})"]
-    if dec.get("schema") != "finfolk.invasion.gate-decision/1":
-        probs.append(f"not a gate decision record (schema {dec.get('schema')!r})")
-    if dec.get("decision") != "pass":
-        probs.append(f"the gate decision is {dec.get('decision')!r}, not 'pass'")
-    if dec.get("formal") is not True:
-        probs.append("the gate record is exploratory (formal = false)")
-    mp = os.path.join(d, "manifest.json")
-    man = None
-    if not os.path.exists(mp):
-        probs.append("the gate's manifest.json is missing")
-    else:
-        if sha256(mp) != dec.get("manifest_sha256"):
-            probs.append("the gate's manifest.json is not the one its decision bound")
-        man = json.load(open(mp))
-        if man.get("formal") is not True:
-            probs.append("the gate manifest is exploratory")
-        if man.get("protocol") != json.loads(gate.canon(gate.protocol())):
-            probs.append("the gate's protocol is not the frozen protocol of this code")
-        here = os.path.dirname(os.path.abspath(__file__))
-        for f in gate.STAT_TOOLS:
-            if (man.get("tools") or {}).get(f) != sha256(os.path.join(here, f)):
-                probs.append(f"the gate calibrated another {f} than the one analysing now")
-    return {"path": os.path.abspath(dp), "sha256": sha256(dp), "decision": dec.get("decision"),
-            "formal": dec.get("formal"), "manifest_sha256": dec.get("manifest_sha256")}, probs
+    return gate.verify_record(path, require_formal)
 
 
 def primary_blocks(rows, meta, registry, cores, sims, seed=5, kind=infer.DEFAULT_KIND, windows_registered=None,
@@ -1083,7 +1064,8 @@ def primary_blocks(rows, meta, registry, cores, sims, seed=5, kind=infer.DEFAULT
             status, names, reps = None, [], []
             sp = spec.get((cond, frac), {}).get(gname)
             if not reg:
-                status = "descriptive: no plan given" if registry is None else "descriptive: nothing registered"
+                status = ("descriptive: no plan given" if registry is None else
+                          f"descriptive: {sp['why']}" if sp and sp.get("why") else "descriptive: nothing registered")
             elif sp is None:
                 if gname not in required.get(frac, ()):
                     continue   # not a primary group at this fraction
@@ -1153,6 +1135,13 @@ def primary_blocks(rows, meta, registry, cores, sims, seed=5, kind=infer.DEFAULT
             conds = sorted({c_ for (c_, f_) in registry if f_ == frac})
             gnames = required.get(frac, [])   # frozen from the registration (review round 4)
             why = None
+            strict = (confirm or {}).get("strict")
+            if strict is not None:   # review of #49, finding 1: the specification's product, not the plan's
+                conds = sorted(set(conds) | (set(strict["assays"]) if frac == strict["fraction"] else set()))
+                if frac != strict["fraction"]:
+                    why = f"descriptive: fraction {frac} is not the confirmation fraction {strict['fraction']}"
+                elif len(gnames) != strict["groups"]:
+                    why = f"descriptive: {len(gnames)} group(s), the confirmation registers {strict['groups']}"
         if not gnames or not conds:
             continue
         miss = [f"{c_}/{g_}" for c_ in conds for g_ in gnames
@@ -1204,6 +1193,9 @@ def primary_blocks(rows, meta, registry, cores, sims, seed=5, kind=infer.DEFAULT
                     row["claim_status"] = "descriptive: no calibration gate record (the headline needs analyze.py --gate)"
                 elif float(G) != float(confirm["T"]):
                     row["claim_status"] = f"descriptive: window {G:g} is not the confirmatory horizon T = {confirm['T']}"
+                elif confirm.get("plan_problems"):
+                    row["claim_status"] = ("descriptive: the plan is not the registered confirmation design: "
+                                           + "; ".join(confirm["plan_problems"][:3]))
                 elif confirm.get("gate_problems"):
                     row["claim_status"] = "descriptive: no passed gate: " + "; ".join(confirm["gate_problems"])
                 else:
@@ -1564,10 +1556,14 @@ def main(argv=None):
         gsum, gprobs = verify_gate(a.gate)
         if a.clock != "steps":
             gprobs.append("the confirmation protocol reads fixed steps (--clock steps)")
-        confirm = {"T": float(gate_.T_STEPS), "gate": gsum, "gate_problems": gprobs,
+        # review of #49, finding 1: the plan itself must be the approved confirmation design (seeds, assays,
+        # horizon, snapshot times, home regimes) as far as the repository can check
+        pprobs = gate_.confirmation_plan_problems(list(plan.values())) if plan else ["no --plan"]
+        confirm = {"T": float(gate_.T_STEPS), "gate": gsum, "gate_problems": gprobs, "plan_problems": pprobs,
                    "strict": {"groups": 2, "N": gate_.CONFIRM["N"], "k": gate_.CONFIRM["k"],
                               "assays": gate_.CONFIRM["assays"], "fraction": gate_.CONFIRM["fraction"]}}
-        prov["gate"] = {**gsum, "problems": gprobs, "strict_registration": confirm["strict"], "T": confirm["T"]}
+        prov["gate"] = {**gsum, "problems": gprobs, "plan_problems": pprobs, "strict_registration": confirm["strict"],
+                        "T": confirm["T"]}
     prows, pblocks, pjoint = primary_blocks(rows, meta, registry, cores, a.sims, kind=a.kind,
                                             windows_registered=windows_registered, bsims=a.bounded_sims,
                                             confirm=confirm)
