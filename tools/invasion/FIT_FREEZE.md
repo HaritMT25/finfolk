@@ -92,6 +92,6 @@ Numerical conventions:
 - **Noiseless refits:** each uses `bounded.fit`, warm-started from the previous evaluation, and must converge under §3.
 - **Diagnostics exported:** `d_res_clip0`, the effect of the clipped null alone.
 
-## 7. Open choice, not frozen here
+## 7. The rare-event reflection
 
-The rare-event reflection is `calibrate.RARE_REFLECTION`, currently "conjugate" (U' = 1 − T(1 − U)); the alternative is "literal" (1 − T(U)). The gate manifest records the choice. It awaits the user's decision; per Codex's ruling, keeping conjugation needs a dated amendment.
+The rare-event reflection is `calibrate.RARE_REFLECTION`, "conjugate" (U' = 1 − T(1 − U)); the alternative reading is "literal" (1 − T(U)). The gate manifest records the choice. It is conjugate, per Amendment 1 (2026-11-04T16:23Z) of the approval record; per Codex's ruling, keeping conjugation needed that dated amendment.
