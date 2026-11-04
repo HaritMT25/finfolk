@@ -505,7 +505,8 @@
 
   /* ---------------- the benchmark controls (EvoOcean.bench, ?renderBench=1) ----------------
    * hooks (from web/ocean.js): module, scene, profiler, page (EvoOcean), last()
-   * (the current snapshot), epoch(), initArgs(), importWorld(...) (the page's
+   * (the current snapshot; none once the engine stopped), step(n) (oc_step,
+   * oc_sync, fenced: false when it could not), epoch(), initArgs(), importWorld(...) (the page's
    * own setup import: oc_init, the sheet, afterNewWorld), setPaused(on),
    * setColourMode(mode) / colourMode() (the page's own colour switch, the View
    * menu's buttons' too, and the mode it is in), dashOpen() (the charts are up).
@@ -521,7 +522,7 @@
    *   rafProbe(ms)    rAF timestamps only (the profiler-off baseline)
    *   info()          the drawing context, the page's display state */
   function bench(h) {
-    var scene = h.scene, M = h.module, prof = h.profiler, api = h.page;
+    var scene = h.scene, prof = h.profiler, api = h.page;
     var doc = root.document;
     function frames(k) {
       return new Promise(function (res) { var i = 0; (function f() { if (i++ >= k) res(); else root.requestAnimationFrame(f); })(); });
@@ -536,17 +537,24 @@
       if (!e) throw new Error("no #" + id);
       if (e.checked !== on) { e.checked = on; e.dispatchEvent(new Event("change")); }
     }
-    function tick() { var s = h.last(); return s ? s.stats[1] : 0; }
+    /* the frame the page's snapshot is at; no snapshot (its reader is fenced: the engine stopped while it was cut again) is an
+     * error, never frame 0 (review of #44, round 5) */
+    function tick() {
+      var s = h.last();
+      if (!s) throw new Error("the benchmark has no snapshot of the world (the engine stopped)");
+      return s.stats[1];
+    }
+    /* every step, the first and each one after a frame, through the page's fenced hook (h.step: nothing into a stopped or
+     * restarting engine, a trap stops it there); a step it could not take rejects, and no further step is tried */
     function stepToTick(t) {
       t = Math.floor(t);
       function go() {
         var left = t - tick();
         if (left <= 0) return frames(2);
-        M._oc_step(Math.min(64, left));
-        M._oc_sync();
+        if (!h.step(Math.min(64, left))) throw new Error("stepToTick: the engine could not step (it stopped, or is restarting)");
         return frames(1).then(go);
       }
-      return go();
+      return Promise.resolve().then(go);
     }
     function snapshotCopy() {
       var s = h.last();

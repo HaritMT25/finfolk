@@ -3955,6 +3955,8 @@
     if (PROF.enabled) EvoOcean.perf = PROF;   /* ?renderBench=1 / ?perf=1 (web/ocean_perf.js) */
     if (BENCH) EvoOcean.bench = PERF.bench({ module: M, scene: scene, profiler: PROF, page: EvoOcean, setPaused: setPaused,
       last: fenced(function () { return fresh(lastS); }), epoch: function () { return worldEpoch; }, initArgs: function () { return initArgs; },
+      /* stepToTick's every step, fenced: none into a stopped or restarting engine (false), a trap stops it (false) (review of #44, round 5) */
+      step: function (n) { return engineCall(function () { M._oc_step(n); M._oc_sync(); return true; }, false); },
       importWorld: importWorld,
       /* the page's own colour switch and state, and whether the charts are up (they suspend the tank) */
       setColourMode: setColourMode, colourMode: function () { return colourMode; },

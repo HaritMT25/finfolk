@@ -4995,6 +4995,46 @@ async function review4Reads() {
     }
 }
 
+/* ---------------------------------------------------------------------
+ * Codex's fifth review of #44 (codex_reviews/2026-11-04_rereview5_pr44_world-file.md)
+ * --------------------------------------------------------------------- */
+async function review5Bench() {
+    section('Fifth review of #44: the benchmark\'s stepToTick steps through the page\'s fenced hook, every step; a trap while its snapshot is cut again, ' +
+            'or in a later step, stops the engine once and the stepping with it, nothing reaching the module after');
+    /* a paused benchmark page (its own frames step nothing); from the `from`th call of `name` on, it traps; then stepToTick far ahead,
+     * its frames run (at most 300) until it settles */
+    async function run(name, from, grow) {
+        const p = await bootPage('?renderBench=1&' + PAGE_Q7.slice(1), { perf: true });
+        p.click('pausebtn');
+        const f0 = frame(p.M);
+        if (grow) growMiB(p.M);   /* (the views out of date: the benchmark's snapshot is cut again, from the engine) */
+        const calls = {};
+        let n = 0, at = null, settled = null;
+        for (const f of FENCE_EXPORTS) {
+            const real = p.M[f];
+            calls[f] = 0;
+            p.M[f] = function () {
+                calls[f]++;
+                if (f === name && ++n >= from) { if (!at) at = Object.assign({}, calls); throw new WebAssembly.RuntimeError('injected: a trap in ' + name); }
+                return real.apply(this, arguments);
+            };
+        }
+        p.raf = null;   /* (the page's own frame let go: only the benchmark's frames run here, so the trap comes in its path) */
+        try {
+            p.ctx.EvoOcean.bench.stepToTick(f0 + 600).then(() => { settled = 'resolved'; }, (e) => { settled = 'rejected: ' + String(e && e.message || e); });
+        } catch (e) { settled = 'threw: ' + String(e && e.message || e); }
+        for (let i = 0; i < 300 && settled === null; i++) { const cb = p.raf; p.raf = null; if (cb) cb(performance.now()); await tick(); }
+        const more = at ? FENCE_EXPORTS.filter(f => calls[f] !== at[f]).map(f => f + ' ' + (calls[f] - at[f])) : ['no trap'];
+        const stops = p.logs.filter(l => /^ocean: The engine stopped \(/.test(l[1])).length;
+        return { settled: settled || 'still stepping after 300 frames', down: p.T.engineState === 'down', more, stops, said: p.msg().slice(0, 80), uncaught: p.uncaught.length };
+    }
+    const a = await run('_oc_creature_count', 1, true), b = await run('_oc_step', 2, false);
+    const k = { snapshot: /^rejected: the benchmark has no snapshot/.test(a.settled) && a.down && !a.more.length && a.stops === 1 && !a.uncaught,
+                laterStep: /^rejected: stepToTick: the engine could not step/.test(b.settled) && b.down && !b.more.length && b.stops === 1 && !b.uncaught };
+    ok(all(k), 'a first trap while stepToTick\'s snapshot is cut again (' + JSON.stringify(a) + '), and in its second step, after a frame (' + JSON.stringify(b) +
+       '): the engine stops once, said once; stepToTick rejects; from the trap on nothing reaches the module' + nots(k));
+}
+
 /* Every section, in order; `node tests/ocean_turbo_handoff.js NAME...` runs only those. */
 const SECTIONS = {
     repeatedKeys, liveLedger, growthPage, randomize, imports,
@@ -5018,7 +5058,7 @@ const SECTIONS = {
     reviewLimits, reviewHeader, reviewTransaction, reviewEngineId, reviewDraft, reviewCapture, reviewStaleRead, reviewTurboStates,
     review2Budget, review2LateFailure, review2Fence, review2SaveLimits, review2SaveFailures, review2Canon,
     review3Worker, review3Reads, review3Fence, review3Save,
-    review4Fence, review4Reads
+    review4Fence, review4Reads, review5Bench
 };
 const unhandled = [];
 process.on('unhandledRejection', (e) => { unhandled.push(e); });
