@@ -575,13 +575,13 @@ def validate_identity(spec, gnames, byk, cnames, plan_cells=None, inputs=None):
             probs.append(f"the plan has {len(plan_cells)} cells, the registered bank {ncell}")
         if reg is not None:
             bad = set()
-            for c in plan_cells:
-                core = reg.get(c.get("core"), {})
+            flat = {nm: h for g_ in reg.values() for nm, h in g_.items()}   # (a secondary cross-home cell's
+            for c in plan_cells:                                            # invader is another core's item)
                 roles = [("resident", c.get("resident_name"), c.get("resident_sha256"))]
                 if c.get("mode") == "invade":
                     roles.append(("invader", c.get("invader_name"), c.get("invader_sha256")))
                 for role, nm, h in roles:
-                    if core.get(nm) != h:
+                    if flat.get(nm) != h or (role == "resident" and c.get("core") and nm not in reg.get(c["core"], {})):
                         bad.add(f"{c.get('core')}/{nm} ({role}) {str(h)[:12]}")
             if bad:
                 probs.append(f"plan cells whose item / snapshot hash is not the registered one: {sorted(bad)[:4]} "
