@@ -915,11 +915,121 @@ def _zib(rnd, mu, sd):
 
 
 # ---------------------------------------------- quantiles of the law (joint worlds: q = F^-1(Phi(W)))
+def _stirling_w(x):
+    """lgamma(x) - [(x - 1/2) log x - x + log(2 pi) / 2] for x >= 10 (the Stirling series to 1/x^7; error
+    below 1/(1188 x^9) <= 1e-12)."""
+    x2 = 1.0 / (x * x)
+    return (1.0 / 12.0 - x2 * (1.0 / 360.0 - x2 * (1.0 / 1260.0 - x2 / 1680.0))) / x
+
+
+def betaln(a, b):
+    """log B(a, b) without the cancellation of lgamma(a) + lgamma(b) - lgamma(a + b) (review of #49, round 3:
+    at a = 1, b = 1e16 that difference was 0, the true value -log b = -36.84): both shapes < 10 directly; the
+    larger >= 10 by the Stirling form with log1p, lgamma(b) - lgamma(a + b) = -a log(a + b)
+    - (b - 1/2) log1p(a / b) + a + w(b) - w(a + b); both >= 10 by the symmetric Stirling form."""
+    if a > b:
+        a, b = b, a
+    if b < 10.0:
+        return math.lgamma(a) + math.lgamma(b) - math.lgamma(a + b)
+    s = a + b
+    if a < 10.0:
+        return math.lgamma(a) - a * math.log(s) - (b - 0.5) * math.log1p(a / b) + a + _stirling_w(b) - _stirling_w(s)
+    return (0.5 * math.log(2.0 * math.pi) - 0.5 * math.log(s) - (a - 0.5) * math.log1p(b / a)
+            - (b - 0.5) * math.log1p(a / b) + _stirling_w(a) + _stirling_w(b) - _stirling_w(s))
+
+
+def _log_gamma_pq(a, z):
+    """(log P(a, z), log Q(a, z)): the regularized incomplete gamma function, each in its own tail (series
+    below z = a + 1, Lentz's continued fraction above)."""
+    if z <= 0.0:
+        return -math.inf, 0.0
+    lpre = a * math.log(z) - z - math.lgamma(a)
+    if z < a + 1.0:
+        term = s = 1.0 / a
+        n = 0
+        while abs(term) > 1e-17 * abs(s) and n < 100000:
+            n += 1
+            term *= z / (a + n)
+            s += term
+        lP = lpre + math.log(s)
+        return lP, (math.log1p(-math.exp(lP)) if lP < -1e-300 else -math.inf)
+    bb = z + 1.0 - a
+    c, d = 1e300, 1.0 / bb
+    h = d
+    for i in range(1, 100000):
+        an = -i * (i - a)
+        bb += 2.0
+        d = an * d + bb
+        d = 1.0 / (d if abs(d) > 1e-300 else 1e-300)
+        c = bb + an / c
+        c = c if abs(c) > 1e-300 else 1e-300
+        de = d * c
+        h *= de
+        if abs(de - 1.0) < 1e-16:
+            break
+    lQ = lpre + math.log(h)
+    return (math.log1p(-math.exp(lQ)) if lQ < -1e-300 else -math.inf), lQ
+
+
+_BERN = (1.0 / 6, -1.0 / 30, 1.0 / 42, -1.0 / 30, 5.0 / 66, -691.0 / 2730, 7.0 / 6, -3617.0 / 510, 43867.0 / 798,
+         -174611.0 / 330)
+QASYM = 1e3   # b >= QASYM (a + 1) with a small expansion parameter: the incomplete-gamma series (extreme asymmetry)
+
+
+def _asym_ok(a, b):
+    """Is Beta(a, b) in the extreme-asymmetry regime of _log_tails_asym (b >> a)?"""
+    return b >= QASYM * (a + 1.0) and abs(a - 1.0) * (a + 10.0 * math.sqrt(a) + 40.0) / b <= 0.5
+
+
+def _log_tails_asym(a, b, tau):
+    """(log I_x(a, b), log(1 - I_x(a, b))) for b >> a from tau = -log(1 - x) (review of #49, round 3: the
+    continued fraction then needs 1 - x to more precision than a double holds). With t = 1 - e^-s,
+    I_x = int_0^tau (1 - e^-s)^(a - 1) e^-bs ds / B(a, b) and (1 - e^-s)^(a - 1) = s^(a - 1) sum_k c_k s^k, so
+    I_x = sum_k c_k Gamma(a + k) / (B(a, b) b^(a + k)) P(a + k, b tau) and 1 - I_x the same with Q (the
+    series of the Didonato-Morris BGRAT kind; log((1 - e^-s) / s) = -s/2 + sum_n B_2n s^2n / (2n (2n)!))."""
+    K = 30
+    f = [0.0] * (K + 1)
+    f[1] = -0.5 * (a - 1.0)
+    fact = 2.0
+    for n, B2n in enumerate(_BERN, 1):
+        if 2 * n > K:
+            break
+        fact *= (2 * n - 1) * (2 * n) if n > 1 else 1.0
+        f[2 * n] = (a - 1.0) * B2n / (2 * n * fact)
+    c = [1.0] + [0.0] * K
+    for n in range(1, K + 1):
+        c[n] = sum(k * f[k] * c[n - k] for k in range(1, n + 1)) / n
+    lnb = math.log(b)
+    base = -betaln(a, b) - a * lnb
+    lo_terms, hi_terms = [], []
+    z = b * tau
+    for k in range(K + 1):
+        if c[k] == 0.0:
+            continue
+        lw = base + math.lgamma(a + k) - k * lnb + math.log(abs(c[k]))
+        lP, lQ = _log_gamma_pq(a + k, z)
+        lo_terms.append((lw + lP, c[k] > 0))
+        hi_terms.append((lw + lQ, c[k] > 0))
+
+    def lsum(terms):
+        m = max(t_[0] for t_ in terms)
+        if m == -math.inf:
+            return -math.inf
+        s = sum((1.0 if pos else -1.0) * math.exp(v - m) for v, pos in terms)
+        return m + math.log(s) if s > 0 else -math.inf
+    return lsum(lo_terms), lsum(hi_terms)
+
+
 def _log_tails(a, b, lb, t):
     """(log I_x(a, b), log(1 - I_x(a, b))) at x = sigmoid(t), both to full relative precision in either
-    tail (lb = lgamma(a + b) - lgamma(a) - lgamma(b))."""
+    tail (lb = -betaln(a, b)); extreme asymmetry (b >> a, or a >> b mirrored) by _log_tails_asym."""
     lx = -math.log1p(math.exp(-t)) if t > -700 else t          # log x
     l1x = -math.log1p(math.exp(t)) if t < 700 else -t          # log (1 - x)
+    if _asym_ok(a, b):
+        return _log_tails_asym(a, b, -l1x)
+    if _asym_ok(b, a):
+        lo_, hi_ = _log_tails_asym(b, a, -lx)
+        return hi_, lo_
     lf = lb + a * lx + b * l1x
     x, x1 = math.exp(lx), math.exp(l1x)
     if x < (a + 1.0) / (a + b + 2.0):
@@ -978,12 +1088,12 @@ class BetaQuantile:
         import bisect as _b
         self._bisect = _b.bisect_right
         self.a, self.b = a, b
-        self.lb = math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b)
-        mean = a / (a + b)
-        t0 = math.log(mean / (1.0 - mean))
+        self.lb = -betaln(a, b)
+        t0 = math.log(a) - math.log(b)   # logit of the mean a / (a + b), without forming 1 - mean
         s_ = a + b
-        # the law's SD on the logit scale (delta method): the bracketing step and the refinement floor's scale
-        self.sd_t = max(math.sqrt(a * b / (s_ * s_ * (s_ + 1.0))) / (mean * (1.0 - mean)), 1e-300)
+        # the law's SD on the logit scale (delta method: sd_x / (m (1 - m)) = s / sqrt(a b (s + 1))): the bracketing
+        # step and the refinement floor's scale
+        self.sd_t = max(s_ / math.sqrt(a * b * (s_ + 1.0)), 1e-300)
         self.floor_hits = 0
         lo_n = self._endpoint(-QTABLE_S, t0)
         hi_n = self._endpoint(QTABLE_S, t0)
