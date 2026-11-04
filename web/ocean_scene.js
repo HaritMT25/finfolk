@@ -3163,6 +3163,9 @@
         return true;
       },
       look: function () { return reef && reef.on() ? "reef" : "ocean"; },
+      /* the Reef look's family glow: a per-fish mask (1 family) for this
+       * snapshot's order, or null; drawing only */
+      setGlow: function (m) { if (reef) reef.setGlow(m); },
       reefStatus: function () { return reef ? reef.status() : "not loaded"; },
       depth: function () { return TD; },
       /* the view up (+) or down (-) by dy sim units, kept between just above

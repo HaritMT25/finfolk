@@ -50,6 +50,15 @@
     }
   })();
 </script>
+<script>
+  /* the Reef look before the first paint (?look=, else the visitor's last
+   * pick), so the page doesn't flash dark first; web/ocean.js keeps it in step */
+  (function () {
+    var l = new URLSearchParams(location.search).get("look");
+    try { if (l === null) l = localStorage.getItem("evo_boids.ocean.look"); } catch (e) { /* private mode */ }
+    if (l === "reef") document.documentElement.classList.add("look-reef");
+  })();
+</script>
 <style>
   /* ---------- tokens (web/index.html's) ---------- */
   :root {
@@ -912,6 +921,87 @@
     *, *::before, *::after { animation-duration: 1ms !important; transition-duration: 1ms !important; }
     #splash .swim::after { animation: none; width: 100%; }
   }
+
+  /* ---------- the Reef look (View › Look › Reef; web/ocean_reef.js) ----------
+   * A sunlit aquarium: shell-white controls with deep-sea ink over the bright
+   * water, a sea-glass teal for what is primary or picked, sun amber for
+   * Turbo, coral for the family glow. Only under html.look-reef: the default
+   * look is untouched. The brain and the dashboards keep the dark tokens
+   * (instruments drawn for a dark ground). */
+  html.look-reef {
+    color-scheme: light;
+    --abyss: oklch(0.60 0.10 232);
+    --surface: oklch(0.985 0.008 210);
+    --surface-2: oklch(0.955 0.012 210);
+    --surface-3: oklch(0.915 0.018 212);
+    --line: oklch(0.80 0.026 215);
+    --line-soft: oklch(0.88 0.02 215);
+    --ink: oklch(0.27 0.05 242);
+    --ink-2: oklch(0.38 0.05 240);
+    --ink-3: oklch(0.47 0.045 238);
+    --plankton: oklch(0.50 0.10 200);
+    --plankton-ink: oklch(0.99 0.005 200);
+    --plankton-soft: oklch(0.50 0.10 200 / 0.14);
+    --ember: oklch(0.52 0.15 48);
+    --ember-soft: oklch(0.52 0.15 48 / 0.14);
+    --current: oklch(0.48 0.10 232);
+    --deep: oklch(0.50 0.12 238);
+    --beam: oklch(0.50 0.11 88);
+    --beam-soft: oklch(0.80 0.12 90 / 0.28);
+    --focus: oklch(0.45 0.12 232);
+    --coral: oklch(0.62 0.16 30);
+    --r-sm: 10px; --r-md: 16px; --r-lg: 22px;
+    --shadow: 0 10px 28px oklch(0.30 0.06 238 / 0.22);
+    --font: ui-rounded, "SF Pro Rounded", "Hiragino Maru Gothic ProN", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  html.look-reef .chip-surface { background: oklch(0.985 0.008 210 / 0.93); }
+  html.look-reef body::after { display: none; }   /* no dark vignette over a sunlit tank */
+  html.look-reef #tank { -webkit-touch-callout: none; -webkit-user-select: none; user-select: none; }   /* a long press is the family glow */
+  html.look-reef .btn.primary:hover { background: oklch(0.45 0.10 200); }
+  html.look-reef #worlds .w3[aria-current] { background: oklch(0.50 0.12 238 / 0.14); color: oklch(0.38 0.10 242); }
+  html.look-reef #hist .track { background: oklch(0.86 0.02 215 / 0.9); }
+  html.look-reef #drawer { box-shadow: 0 -10px 32px oklch(0.30 0.06 238 / 0.22); }
+  html.look-reef #guide .spot { box-shadow: 0 0 0 200vmax oklch(0.20 0.05 238 / 0.45); }
+  html.look-reef select {
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%23465a74' stroke-width='2.4' stroke-linecap='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+  }
+  html.look-reef #splash { background: linear-gradient(oklch(0.80 0.08 230) 0%, oklch(0.88 0.05 215) 34%, oklch(0.62 0.11 232) 36%, oklch(0.50 0.11 238) 82%, oklch(0.80 0.05 85) 100%); }
+  html.look-reef #splash .word, html.look-reef #splash p { color: oklch(0.22 0.05 242); }
+  /* the instruments keep their dark ground */
+  html.look-reef .fc-brain, html.look-reef #dash {
+    color-scheme: dark;
+    --abyss: oklch(0.22 0.03 200); --surface: oklch(0.255 0.03 196); --surface-2: oklch(0.295 0.032 194); --surface-3: oklch(0.34 0.035 192);
+    --line: oklch(0.44 0.036 190); --line-soft: oklch(0.35 0.032 192);
+    --ink: oklch(0.96 0.012 180); --ink-2: oklch(0.86 0.02 185); --ink-3: oklch(0.74 0.025 188);
+    --plankton: oklch(0.86 0.19 125); --plankton-ink: oklch(0.22 0.06 130); --plankton-soft: oklch(0.86 0.19 125 / 0.16);
+    --ember: oklch(0.72 0.18 38); --current: oklch(0.83 0.10 225); --deep: oklch(0.70 0.11 235); --focus: oklch(0.90 0.17 125);
+    color: var(--ink);
+  }
+  html.look-reef .fc-brain { background: var(--surface); border-radius: 0 0 var(--r-md) var(--r-md); }
+  /* the look's own controls and words */
+  html:not(.look-reef) .reef-only, html.look-reef .ocean-only { display: none !important; }
+  html.look-reef #ifamily[aria-pressed="true"] { background: oklch(0.62 0.16 30 / 0.16); color: var(--coral); }
+  /* the card's head has a fourth button here (the family glow): the little
+   * portrait gives way to the title (the skin swatch under it shows the fish) */
+  html.look-reef #iportrait { display: none; }
+  @media (max-width: 479px) {   /* small phones: the four 44 px buttons and the title on one line each */
+    html.look-reef .fc-head { gap: 4px; }
+    html.look-reef #isub { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  }
+  #glowchip {
+    position: fixed; z-index: var(--z-hud); left: 50%; top: calc(64px + var(--safe-t)); transform: translateX(-50%);
+    display: none; align-items: center; gap: 8px; min-height: 44px; padding: 0 4px 0 14px;
+    border-radius: 999px; font-size: 13px; color: var(--ink-2); white-space: nowrap;
+  }
+  html.look-reef #glowchip:not([hidden]) { display: inline-flex; }
+  #glowchip .gdot { width: 10px; height: 10px; border-radius: 50%; background: var(--coral); box-shadow: 0 0 0 3px oklch(0.62 0.16 30 / 0.22); }
+  #glowchip .gt { font-weight: 600; color: var(--ink); }
+  #holdring {
+    position: fixed; z-index: var(--z-hud); left: 0; top: 0; width: 64px; height: 64px; pointer-events: none;
+    border-radius: 50%; border: 3px solid var(--coral, oklch(0.62 0.16 30));
+    opacity: 0; transform: translate(-50%, -50%) scale(0.4);
+  }
+  @media (prefers-reduced-motion: reduce) { #holdring { transition: none !important; } }
 </style>
 </head>
 <body>
@@ -975,6 +1065,8 @@
     <div id="worlds-alt"><a id="to2dmenu" class="btn" href="#to2d">2-D Classic<svg class="i out" aria-hidden="true"><use href="#i-out"/></svg></a><span>The original flat world, on its own page. This run stops.</span></div>
   </div>
   <button id="fitbtn" class="btn chip-surface" hidden title="Sizes the next world for this screen (Setup: then Start)"><svg class="i"><use href="#i-restart"/></svg>Fit the world to this screen…</button>
+  <!-- the Reef look's family glow: who glows, and × to put it out (web/ocean_reef_ui.js) -->
+  <div id="glowchip" class="chip-surface reef-only" role="status" hidden><span class="gdot" aria-hidden="true"></span><span class="gt"></span><button type="button" class="icon-btn" aria-label="stop the family glow" title="Stop the glow (Esc)"><svg class="i"><use href="#i-close"/></svg></button></div>
   <div id="toasts" aria-live="polite"></div>
   <div id="keys" class="chip-surface" role="note" aria-label="keyboard shortcuts"></div>
   <div id="coach" class="chip-surface" role="status" hidden>
@@ -987,6 +1079,7 @@
       <canvas id="iportrait" aria-hidden="true"></canvas>
       <div class="fc-title"><div id="ititle">Fish</div><div id="isub"></div></div>
       <button id="followbtn" class="icon-btn" aria-pressed="false" title="Follow this fish (F)"><svg class="i"><use href="#i-follow"/></svg><span class="sr">follow</span></button>
+      <button id="ifamily" class="icon-btn reef-only" aria-pressed="false" title="Light up its family (H)"><svg class="i" viewBox="0 0 24 24"><circle cx="12" cy="7" r="2.6" fill="currentColor"/><circle cx="6" cy="16" r="2.6" fill="currentColor"/><circle cx="18" cy="16" r="2.6" fill="currentColor"/><path d="M12 9.6v2.6M12 12.2 7.4 14M12 12.2l4.6 1.8" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg><span class="sr">family</span></button>
       <button id="iexpand" class="icon-btn" aria-expanded="false" title="Show its brain"><svg class="i"><use href="#i-chevron"/></svg><span class="sr">brain</span></button>
       <button id="iclose" class="icon-btn" aria-label="close"><svg class="i"><use href="#i-close"/></svg></button>
     </div>
@@ -1065,9 +1158,9 @@
   <!-- Help: every key, the tour, Turbo explained (the page's only "?") -->
   <div id="helppop" class="pop chip-surface" role="dialog" aria-label="help and keys" hidden>
     <div class="pop-head"><h2>Help</h2><button id="helpclose" class="icon-btn" aria-label="close help"><svg class="i"><use href="#i-close"/></svg></button></div>
-    <p class="touchhint">Drag to move · pinch to zoom · twist two fingers to turn · tap a fish to see its brain.</p>
+    <p class="touchhint"><span class="ocean-only">Drag to move · pinch to zoom · twist two fingers to turn · tap a fish to see its brain.</span><span class="reef-only">Drag to glide along the glass · pinch to come closer · tap a fish to see it · double-tap to swim with it · press and hold to light up its family.</span></p>
     <h3>Watch</h3>
-    <span class="k"><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> fly (following: closer, circle)</span><span class="k"><kbd>Q</kbd><kbd>E</kbd> down / up</span><span class="k"><kbd>Shift</kbd> faster</span><span class="k"><kbd>F</kbd> follow a fish</span><span class="k"><kbd>L</kbd> flashlight</span><span class="k"><kbd>V</kbd> View menu</span><span class="k"><kbd>C</kbd> fit the tank</span><span class="k"><kbd>Esc</kbd> let go / close</span>
+    <span class="k ocean-only"><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> fly (following: closer, circle)</span><span class="k reef-only"><kbd>A</kbd><kbd>D</kbd> or <kbd>←</kbd><kbd>→</kbd> glide along the glass</span><span class="k reef-only"><kbd>W</kbd><kbd>S</kbd> closer / back</span><span class="k"><kbd>Q</kbd><kbd>E</kbd> down / up</span><span class="k"><kbd>Shift</kbd> faster</span><span class="k"><kbd>F</kbd> follow a fish</span><span class="k reef-only"><kbd>H</kbd> light up its family</span><span class="k"><kbd>L</kbd> flashlight</span><span class="k"><kbd>V</kbd> View menu</span><span class="k ocean-only"><kbd>C</kbd> fit the tank</span><span class="k reef-only"><kbd>C</kbd> back to the glass</span><span class="k"><kbd>Esc</kbd> let go / close</span>
     <h3>Time</h3>
     <span class="k"><kbd>Space</kbd> pause / play (in Turbo: stop it)</span><span class="k"><kbd>.</kbd> one step (paused)</span><span class="k"><kbd>+</kbd><kbd>−</kbd> speed</span><span class="k"><kbd>T</kbd> Turbo on / off</span>
     <h3>World</h3>
@@ -1180,6 +1273,7 @@
   <script src="ocean_config.js"></script>
   <script src="charts.js"></script>
   <script src="ocean_dash.js"></script>
+  <script src="ocean_reef_ui.js"></script>
   <script src="ocean.js"></script>
   <script src="guide.js"></script>
 </body>

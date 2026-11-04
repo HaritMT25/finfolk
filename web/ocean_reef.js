@@ -83,7 +83,7 @@
     "float behindGlass(vec3 w) { return (uGlassC - dot(w.xz, uGlassN)) / uDp; }"
   ].join("\n");
   var BAND_FN = [
-    "uniform float uReefDepthK;",
+    "uniform float uReefDepthK; uniform float uGlowOn; uniform vec3 uGlowCol;",
     BEHIND_FN,
     "float reefBand(vec3 N) {",
     "  float l = max(dot(N, uLight), 0.0) * 0.78 + 0.22 * (0.5 + 0.5 * N.y);",
@@ -95,6 +95,16 @@
     "  float f = 0.32 * clamp(behindGlass(w), 0.0, 1.0), lc = max(dot(c, " + LUMA + "), 1e-3);",
     "  return mix(c, c * (dot(uFog, " + LUMA + ") / lc), f);",
     "}"
+  ].join("\n");
+
+  /* the family glow (setGlow): relatives (highlight 0.22) get a coral edge,
+   * the others (0.12) dim to under half their brightness; selection (1) and
+   * hover (0.5) are kept. Value only: no fish changes colour */
+  var GLOW_CODE = [
+    "  if (uGlowOn > 0.5) {",
+    "    if (vSel > 0.05 && vSel < 0.17) { col *= 0.42; clear *= 0.42; }",
+    "    else if (vSel > 0.18 && vSel < 0.26) add += uGlowCol * (0.16 + 0.75 * rim);",
+    "  }"
   ].join("\n");
 
   /* the appearance fish (the scene's appearanceShaders): storybook body,
@@ -143,7 +153,8 @@
       "    ec = mix(ec, lid * 0.55, smoothstep(0.88, 0.97, d));",   /* a soft dark rim */
       "    if (e.y > 1.0 - 2.05 * vBlink) ec = lid;",
       "    col = ec * (1.0 - 0.5 * uReefDepthK * depthOf(vWorld.y)); clear = ec;",
-      "  }"
+      "  }",
+      GLOW_CODE
     ].join("\n"));
     fs = splice(fs, A_FOG, "  vec3 murky = reefHaze(col, vWorld);", true);
     return { vs: vs, fs: fs };
@@ -159,6 +170,7 @@
       "  col = rlit * (1.0 - uReefDepthK * depthOf(vWorld.y));",
       "  clear = rlit;"
     ].join("\n"));
+    fs = splice(fs, A_SEL, GLOW_CODE);
     fs = splice(fs, A_FOG, "  vec3 murky = reefHaze(col, vWorld);", true);
     return fs;
   }
@@ -660,7 +672,8 @@
       uDp: { value: 1080 }, uSkySpan: { value: 0.02 },
       /* the reef's own clock (seconds; still with reduced motion), the blades' sway, the shafts' strength, the bubbles' pixel scale */
       uClock: { value: 0 }, uSway: { value: 1 }, uShaft: { value: 1 }, uPxB: { value: 500 },
-      uAlong: { value: new THREE.Vector3(1, 0, 0) }
+      uAlong: { value: new THREE.Vector3(1, 0, 0) },
+      uGlowOn: { value: 0 }, uGlowCol: { value: v3([1.0, 0.52, 0.40]) }
     };
     function glassU(u) { u.uGlassN = U.uGlassN; u.uGlassC = U.uGlassC; u.uDp = U.uDp; return u; }
 
@@ -745,7 +758,8 @@
     var mats = { app: null, appFor: null, plain: null };   /* reef copies */
     var saved = new Map();   /* mesh -> its own material */
     function reefCopy(base, vs, fs) {
-      var u = glassU(Object.assign({}, base.uniforms, { uReefDepthK: U.uReefDepthK, uBlinkOn: U.uBlinkOn }));
+      var u = glassU(Object.assign({}, base.uniforms, { uReefDepthK: U.uReefDepthK, uBlinkOn: U.uBlinkOn,
+                                                         uGlowOn: U.uGlowOn, uGlowCol: U.uGlowCol }));
       return new THREE.ShaderMaterial({ vertexShader: vs, fragmentShader: fs, uniforms: u, side: base.side });
     }
     function swapIn(mesh, mat) {
@@ -1028,6 +1042,21 @@
     }
 
     var blink = 0, lastAnimT = null, sinceMove = 0, clock = 0;
+    var glowMask = null;
+    /* the family glow: each fish's highlight, rewritten after the scene packed
+     * it (before the draw): 0.22 family, 0.12 the others; selected and hovered kept */
+    function applyGlow() {
+      U.uGlowOn.value = 0;
+      if (!glowMask || failed) return;
+      var ak = ctx.appKind(), kind = ak && ak.mesh && ak.mesh.visible && ak.n ? ak : ctx.fishKind();
+      if (!kind || !kind.attrs || !kind.n) return;
+      var B = kind.attrs.iBody.array, n = Math.min(kind.n, glowMask.length);
+      for (var c = 0; c < n; c++) {
+        var o = 4 * c + 2;
+        if (B[o] < 0.4) B[o] = glowMask[c] ? 0.22 : 0.12;
+      }
+      U.uGlowOn.value = 1;
+    }
     function frame(dt, s, info) {
       if (!on) return;
       build();
@@ -1070,6 +1099,7 @@
       var want = !st.reduced && sinceMove < 0.4 ? 1 : 0;
       blink += (want - blink) * (1 - Math.exp(-dt * 6));
       U.uBlinkOn.value = blink;
+      applyGlow();
     }
 
     function setActive(want, o) {
@@ -1109,6 +1139,7 @@
         rigControls(!following);
         if (!following) ctx.resetView(true);
       },
+      setGlow: function (m) { glowMask = m && m.length ? m : null; if (!glowMask) U.uGlowOn.value = 0; },
       status: function () { return failed ? "fish shaders: " + failed : (on ? "on" : "off"); }
     };
   }
