@@ -642,6 +642,17 @@ def _largest_complete(names, has):
     return names
 
 
+def _fit_diag_text(what, fd):
+    """The fit classifier's reports for H1b (review of #49, round 4, P2-3): probed (the exact gain above the
+    allowance) and probe-certified fits, the largest probe decrease, unresolved-block energy and flat-cell SSE."""
+    if not fd or not fd.get("fits"):
+        return ""
+    def g_(v):
+        return "-" if v is None else f"{v:.3g}"
+    return (f"; {what}: {fd['fits']}, probed {fd['probed']}, probe-certified {fd['probe_certified']}, max probe decrease "
+            f"{g_(fd['max_probe_decrease'])}, max unresolved-block energy {g_(fd['max_unresolved_gain'])}, max flat-cell "
+            f"SSE {g_(fd['max_flat_sse'])}, min resolved Hessian eigenvalue {g_(fd['min_hess_min'])}")
+
 def primary_p(d):
     """The p-value of the frozen primary lack-of-fit test (infer.PRIMARY) from a row's fields."""
     return d.get("p_lof_flip") if infer.PRIMARY["test"] == "signflip" else d.get("p_lof")
@@ -921,7 +932,7 @@ def cores_from_plan(plan):
     return {k: sorted(v) for k, v in cores.items()} or None
 
 
-def primary_registration(registry, groups, cores):
+def primary_registration(registry, groups, cores, strict=None):
     """The registered primary structure, frozen from the registration BEFORE any result is read
     (review round 4): for every registered (condition, fraction) and every group with a registered
     item there, the registered block - a core's items (which must be registered as a complete
@@ -929,7 +940,12 @@ def primary_registration(registry, groups, cores):
     and its common registered replicates; 'why' says why a registration defines no complete
     primary matrix (then that block can never be formal). -> (spec {(cond, frac): {group: {names,
     reps, why}}}, required {frac: sorted groups}): a group registered at a fraction is required
-    in every registered condition there, whatever has finished."""
+    in every registered condition there, whatever has finished.
+    strict (the confirmation protocol, analyze.py --gate; review round 5 item 2): the frozen panel
+    only - registered cores (no legacy clique), exactly strict['groups'] cores of strict['N'] items,
+    the registered assays at the registered fraction, and EVERY primary cell registering exactly
+    replicates 0..k-1: no intersection of replicate sets, no reduction (a 0-8 cell among 0-9 cells
+    makes the block non-formal instead of a nine-replicate block)."""
     rk = lambda a_, b_: (a_, b_, "sham" if a_ == b_ else "invade")   # noqa: E731
     spec, required = {}, {}
     for (cond, frac), reg in sorted(registry.items(), key=lambda kv: (str(kv[0][0]), kv[0][1])):
@@ -945,7 +961,25 @@ def primary_registration(registry, groups, cores):
                     why = f"core {gname} is not registered as a complete matrix"
             else:
                 names = _largest_complete(inreg, lambda a_, b_: rk(a_, b_) in reg)
-            if why is None:
+            if strict is not None and why is None:
+                k_ = strict["k"]
+                if not cores:
+                    why = "confirmation protocol: no registered cores (a legacy clique is a reduction)"
+                elif len(groups) != strict["groups"] or len(names) != strict["N"]:
+                    why = (f"confirmation protocol: {len(groups)} core(s) of {len(names)} items, the registration "
+                           f"is {strict['groups']} x {strict['N']}")
+                elif cond not in strict["assays"] or frac != strict["fraction"]:
+                    why = f"confirmation protocol: {cond} / {frac} is not a registered assay / fraction"
+                else:
+                    off = [(a_, b_) for a_ in names for b_ in names if reg[rk(a_, b_)] != set(range(k_))]
+                    if off:
+                        a_, b_ = off[0]
+                        why = (f"confirmation protocol: cell {a_} -> {b_} registers replicates "
+                               f"{sorted(reg[rk(a_, b_)])[:3]}...({len(reg[rk(a_, b_)])}), not exactly 0..{k_ - 1} "
+                               f"({len(off)} such cell(s); no intersection or reduction)")
+                    else:
+                        R = list(range(k_))
+            if why is None and not R:
                 if len(names) < 3:
                     why = "fewer than 3 registered items"
                 else:
@@ -954,11 +988,35 @@ def primary_registration(registry, groups, cores):
                         why = "fewer than 2 common registered replicates"
             spec.setdefault((cond, frac), {})[gname] = {"names": names, "reps": R, "why": why}
             required.setdefault(frac, set()).add(gname)
+    if strict is not None:
+        # review of #49, finding 1: the required primary design is the confirmation specification's group x assay
+        # product, whatever the plan registers - an absent assay (or group) is a missing primary block, never a
+        # smaller formal omnibus
+        fr = strict["fraction"]
+        for g_ in sorted(groups):
+            required.setdefault(fr, set()).add(g_)
+            for c_ in strict["assays"]:
+                spec.setdefault((c_, fr), {}).setdefault(g_, {"names": [], "reps": [], "why":
+                                                            f"confirmation protocol: assay {c_} is not registered "
+                                                            f"for group {g_}"})
     return spec, {f: sorted(v) for f, v in required.items()}
 
 
+def verify_gate(path, require_formal=True, receipt=None):
+    """The calibration gate record the headline claim needs (review round 5 item 1; review of #49, finding 2):
+    path = the gate's output directory. gate.verify_record checks the complete chain - a formal 'pass'
+    decision, the manifest by hash and byte-identical to the one this code regenerates (the frozen protocol,
+    the schedule and all six tool hashes), run.json and cell_laws.json bound to it, every scheduled task
+    record present, valid and bound to this run, and the decision re-aggregated with the acceptance rule
+    applied afresh; and the run's receipt equal to `receipt`, the hash recorded outside the directory (the
+    approval record; review of #49, round 2). -> (summary dict, problems); any problem (missing evidence or
+    receipt included) withholds the claim."""
+    import gate
+    return gate.verify_record(path, require_formal, receipt)
+
+
 def primary_blocks(rows, meta, registry, cores, sims, seed=5, kind=infer.DEFAULT_KIND, windows_registered=None,
-                   bsims=0):
+                   bsims=0, confirm=None):
     """The stats spec's primary matrices, built EXPLICITLY per home regime and condition (review
     round 3: they used to be sub-blocks of the one largest complete pooled clique, so two disjoint
     complete regime cores kept only one regime).
@@ -977,10 +1035,15 @@ def primary_blocks(rows, meta, registry, cores, sims, seed=5, kind=infer.DEFAULT
       H1b  the frozen co-primary, bounded.residual_omnibus: four separate logistic mean fits, the
            grouped sign-flip of the projected residual replicate vectors (and, with bsims > 0, the
            joint refitting bootstrap beside it);
-      claim "cyclic beyond bounded logistic transitivity" iff both p <= bounded.ALPHA_FAMILY
-           (= 0.05/12: hypotheses 1-11 + 1b, Holm; sufficient for both whatever their order);
-           if a logistic fit did not converge, H1b and the claim are INVALID (claim None,
-           claim_status and h1b_diagnostics say why), never a rejection.
+      both_rejected  H1 and H1b both p <= bounded.ALPHA_FAMILY = a = 0.05/12 (the fixed conjunction at
+           the twelve-slot allocation, two slots active; not full Holm): descriptive;
+      claim_beyond_bounded  the preregistered headline ("cardinal circulation beyond the fitted
+           logistic endpoint-mean family"): both_rejected, and ONLY with confirm (analyze.py --gate:
+           the strict confirmation registration, a verified passed calibration gate record) and
+           ONLY at the confirmatory horizon T (2T and other windows: None, descriptive); if a
+           logistic fit did not converge (or a projection failed), H1b and the claim are INVALID
+           (claim None, claim_status and h1b_diagnostics say why), never a rejection.
+    confirm: {"strict": registration spec, "T": steps, "gate": summary, "gate_problems": [...]}.
     A group with k > 16 replicates is exported only (the enumeration of sign patterns is limited
     to 16; an error bank is resampled by calibrate.py, not tested). -> (rows, blocks, joint rows)."""
     if cores:
@@ -995,7 +1058,8 @@ def primary_blocks(rows, meta, registry, cores, sims, seed=5, kind=infer.DEFAULT
     # the required groups and their blocks come from the registration alone (review round 4: they
     # used to come from whichever blocks had results, so a legacy regime with no finished cell
     # silently left a formal two-block omnibus)
-    spec, required = primary_registration(registry, groups, cores) if registry is not None else ({}, {})
+    spec, required = (primary_registration(registry, groups, cores, (confirm or {}).get("strict"))
+                      if registry is not None else ({}, {}))
     prows, pblocks = [], {}
     keys = {(x["cond"], x["frac"], x["G"]) for x in rows}
     seenG = {}
@@ -1013,7 +1077,8 @@ def primary_blocks(rows, meta, registry, cores, sims, seed=5, kind=infer.DEFAULT
             status, names, reps = None, [], []
             sp = spec.get((cond, frac), {}).get(gname)
             if not reg:
-                status = "descriptive: no plan given" if registry is None else "descriptive: nothing registered"
+                status = ("descriptive: no plan given" if registry is None else
+                          f"descriptive: {sp['why']}" if sp and sp.get("why") else "descriptive: nothing registered")
             elif sp is None:
                 if gname not in required.get(frac, ()):
                     continue   # not a primary group at this fraction
@@ -1055,13 +1120,19 @@ def primary_blocks(rows, meta, registry, cores, sims, seed=5, kind=infer.DEFAULT
                             "p_lof": inf["p_lof"] if formal else None, "p_lof_flip": inf["p_lof_flip"] if formal else None})
                 row["p_primary"] = primary_p(row)
                 if n * (n - 1) - bounded.Model(bounded.CO_PRIMARY_MODEL, n).P >= (n - 1) * (n - 2) // 2:
-                    vecs, fitres = bounded.residual_replicate_vectors(zq)
+                    fitres = bounded.fit_matrix(zq)
+                    try:   # one invalid path (prereg gate): a failed projection is unavailable, not an abort
+                        vecs = bounded.residual_replicate_vectors(zq, fitres=fitres)[0]
+                        perr = None
+                    except bounded.Unavailable as e:
+                        vecs, perr = None, str(e)
                     R_C = bounded.energies(bounded._sub(bounded._means(zq), fitres["F"]))[1]
-                    ok = bool(fitres["converged"])   # an unconverged fit decides nothing (review round 4)
+                    ok = bool(fitres["converged"]) and perr is None   # an unconverged fit decides nothing (review round 4)
                     row.update({"R_C_logistic": R_C, "F_res": infer._ratio(R_C, infer.block_stats(zq)["tauC"]),
-                                "fit_converged": ok, "p_res_flip": infer.flip_p_vectors([vecs]) if formal and ok else None})
+                                "fit_converged": bool(fitres["converged"]),
+                                "p_res_flip": infer.flip_p_vectors([vecs]) if formal and ok else None})
                     if not ok:
-                        row["note"] = "logistic fit not converged: H1b descriptive"
+                        row["note"] = ("logistic fit not converged" if perr is None else perr) + ": H1b descriptive"
             else:
                 row["note"] = "k > 16: exported (blocks.json), not tested"
             pblocks[(cond, frac, G, gname)] = {"cond": cond, "frac": frac, "G": G, "group": gname, "names": names,
@@ -1077,6 +1148,13 @@ def primary_blocks(rows, meta, registry, cores, sims, seed=5, kind=infer.DEFAULT
             conds = sorted({c_ for (c_, f_) in registry if f_ == frac})
             gnames = required.get(frac, [])   # frozen from the registration (review round 4)
             why = None
+            strict = (confirm or {}).get("strict")
+            if strict is not None:   # review of #49, finding 1: the specification's product, not the plan's
+                conds = sorted(set(conds) | (set(strict["assays"]) if frac == strict["fraction"] else set()))
+                if frac != strict["fraction"]:
+                    why = f"descriptive: fraction {frac} is not the confirmation fraction {strict['fraction']}"
+                elif len(gnames) != strict["groups"]:
+                    why = f"descriptive: {len(gnames)} group(s), the confirmation registers {strict['groups']}"
         if not gnames or not conds:
             continue
         miss = [f"{c_}/{g_}" for c_ in conds for g_ in gnames
@@ -1110,16 +1188,36 @@ def primary_blocks(rows, meta, registry, cores, sims, seed=5, kind=infer.DEFAULT
                         "h1b_valid": ro["valid"],
                         "h1b_diagnostics": (f"logistic fits converged {ro['fits_converged']}/{ro['conditions']}; "
                                             f"bootstrap draws with an unconverged refit {ro['boot_not_converged']}/{bsims}"
+                                            + _fit_diag_text("fits", ro.get("fit_diag"))
+                                            + _fit_diag_text("bootstrap refits", ro.get("boot_fit_diag"))
                                             + (f"; INVALID: {ro['invalid']} (descriptive p "
-                                               f"{ro['p_flip_unconverged']:.5g})" if not ro["valid"] else ""))})
+                                               + (f"{ro['p_flip_unconverged']:.5g}" if ro["p_flip_unconverged"] is not None
+                                                  else "unavailable") + ")"
+                                               if not ro["valid"] else ""))})
             row["p_primary"] = primary_p(row)
+            row["claim_beyond_bounded"] = None
             if ro["p_flip"] is None or row["p_primary"] is None:
                 # review round 4: an unconverged fit gives no decision, never a formal rejection
-                row["claim_beyond_bounded"] = None
+                row["both_rejected"] = None
                 row["claim_status"] = f"invalid: {ro['invalid'] or 'H1 has no p-value'}"
             else:
-                row["claim_beyond_bounded"] = (row["p_primary"] <= bounded.ALPHA_FAMILY and ro["p_flip"] <= bounded.ALPHA_FAMILY)
-                row["claim_status"] = "formal"
+                row["both_rejected"] = (row["p_primary"] <= bounded.ALPHA_FAMILY and ro["p_flip"] <= bounded.ALPHA_FAMILY)
+                # review round 5 item 1: the headline needs the confirmation protocol, a verified passed
+                # gate and the confirmatory horizon T; anything else is descriptive
+                if confirm is None:
+                    row["claim_status"] = "descriptive: no calibration gate record (the headline needs analyze.py --gate)"
+                elif float(G) != float(confirm["T"]):
+                    row["claim_status"] = f"descriptive: window {G:g} is not the confirmatory horizon T = {confirm['T']}"
+                elif confirm.get("plan_problems"):
+                    row["claim_status"] = ("descriptive: the plan is not the registered confirmation design: "
+                                           + "; ".join(confirm["plan_problems"][:3]))
+                elif confirm.get("gate_problems"):
+                    row["claim_status"] = "descriptive: no passed gate: " + "; ".join(confirm["gate_problems"])
+                else:
+                    row["claim_beyond_bounded"] = row["both_rejected"]
+                    row["claim_status"] = "formal (confirmation protocol, gate passed, T)"
+        elif registry is not None and confirm is not None:
+            row["claim_status"] = f"unavailable: {why}"
         pjoint.append(row)
     return prows, pblocks, pjoint
 
@@ -1242,6 +1340,14 @@ def main(argv=None):
                     help="skip the sensor-relevant genetic dissimilarity of the snapshots (needs --meta and --plan)")
     ap.add_argument("--plan", help="the registered plan (JSONL): every cell is validated against it, and only a "
                                    "complete registered matrix gets formal decisions")
+    ap.add_argument("--gate", help="the confirmation protocol: the calibration gate's output directory (gate.py run; "
+                                   "its decision.json + manifest.json). The primary registration must be the frozen "
+                                   "panel (2 cores x 12 items, off / predA4 at 0.05, replicates exactly 0..9 in every "
+                                   "cell) and claim_beyond_bounded is reported only with a verified PASSED formal gate, "
+                                   "at T = 13,500 only. Without it the claim column is None (both_rejected is "
+                                   "descriptive)")
+    ap.add_argument("--gate-receipt", help="the gate run's receipt (gate.py run prints it; the hash recorded in the "
+                                           "approval record right after the run): required for the headline claim")
     a = ap.parse_args(argv)
     os.makedirs(a.out, exist_ok=True)
     horizon = json.load(open(a.horizon)) if a.horizon else None
@@ -1461,15 +1567,30 @@ def main(argv=None):
         prov["windows_registered"] = sorted(windows_registered)
     mats, mdet, blocks, joint, subs = matrices(rows, meta, sims=a.sims, registry=registry, kind=a.kind, dG=dG,
                                                cores=cores, windows_registered=windows_registered)
+    confirm = None
+    if a.gate:
+        import gate as gate_
+        gsum, gprobs = verify_gate(a.gate, receipt=a.gate_receipt)
+        if a.clock != "steps":
+            gprobs.append("the confirmation protocol reads fixed steps (--clock steps)")
+        # review of #49, finding 1: the plan itself must be the approved confirmation design (seeds, assays,
+        # horizon, snapshot times, home regimes) as far as the repository can check
+        pprobs = gate_.confirmation_plan_problems(list(plan.values())) if plan else ["no --plan"]
+        confirm = {"T": float(gate_.T_STEPS), "gate": gsum, "gate_problems": gprobs, "plan_problems": pprobs,
+                   "strict": {"groups": 2, "N": gate_.CONFIRM["N"], "k": gate_.CONFIRM["k"],
+                              "assays": gate_.CONFIRM["assays"], "fraction": gate_.CONFIRM["fraction"]}}
+        prov["gate"] = {**gsum, "problems": gprobs, "plan_problems": pprobs, "strict_registration": confirm["strict"],
+                        "T": confirm["T"]}
     prows, pblocks, pjoint = primary_blocks(rows, meta, registry, cores, a.sims, kind=a.kind,
-                                            windows_registered=windows_registered, bsims=a.bounded_sims)
+                                            windows_registered=windows_registered, bsims=a.bounded_sims,
+                                            confirm=confirm)
     prov["cores"] = cores
     if registry is not None and (cores or meta):
         pgroups = {g_: list(v) for g_, v in cores.items()} if cores else {}
         if not cores:
             for nm, m_ in meta.items():
                 pgroups.setdefault(str(m_.get("regime")), []).append(nm)
-        pspec, preq = primary_registration(registry, pgroups, cores)
+        pspec, preq = primary_registration(registry, pgroups, cores, (confirm or {}).get("strict"))
         prov["primary_registration"] = {"required_groups": {str(f_): g_ for f_, g_ in preq.items()},
                                         "blocks": {f"{c_}/{f_}/{g_}": v for (c_, f_), gs in pspec.items()
                                                    for g_, v in gs.items()}}
@@ -1496,8 +1617,8 @@ def main(argv=None):
         write_csv(os.path.join(a.out, "primary_joint.csv"), pjoint,
                   ["frac", "G", "structure", "status", "required", "conditions", "groups", "n", "k", "F_lof",
                    "p_primary", "p_lof", "p_lof_flip", "flip_min_p", "F_sym", "p_sym", "p_sym_flip", "F_res_joint",
-                   "p_res_flip", "p_res_boot", "h1b_valid", "h1b_diagnostics", "claim_beyond_bounded", "claim_status",
-                   "boot", "plan_sha256", "analysis_sha256"])
+                   "p_res_flip", "p_res_boot", "h1b_valid", "h1b_diagnostics", "both_rejected", "claim_beyond_bounded",
+                   "claim_status", "boot", "plan_sha256", "analysis_sha256"])
     if prows or pjoint:
         md.append("\n## Primary matrices: one per home regime x condition (stats spec), built explicitly\n")
         md.append(f"Groups: {prows[0]['source'] if prows else ''}. A primary block is formal when every registered "
@@ -1505,23 +1626,27 @@ def main(argv=None):
                   "registered T or 2T, read exactly). The primary omnibus needs every registered condition x group "
                   "formal: H1 = the raw grouped sign-flip omnibus (primary test; bootstrap beside it), H1b = the "
                   "frozen co-primary (bounded.py: four separate logistic mean fits, grouped sign-flip of the "
-                  "projected residual replicate vectors; joint refitting bootstrap beside it). Claim 'cyclic beyond "
-                  f"bounded logistic transitivity' iff both p <= 0.05/12 = {bounded.ALPHA_FAMILY:.5f} (Holm family of "
-                  "12). Both sign-flips are exact only under joint central symmetry; H1b also only to first order in "
-                  "the fit; levels are calibrated by calibrate.py --compound.\n")
+                  "projected residual replicate vectors; joint refitting bootstrap beside it). 'both' = H1 and H1b "
+                  f"both p <= a = 0.05/12 = {bounded.ALPHA_FAMILY:.5f}: the fixed conjunction at the twelve-slot "
+                  "allocation (two slots active, ten unused; not full Holm). The headline claim - cardinal "
+                  "circulation beyond the fitted logistic endpoint-mean family, for this fixed panel (not an ordinal "
+                  "cycle, not every transitive model) - is reported only under the confirmation protocol "
+                  "(analyze.py --gate: the strict registration and a passed calibration gate) at T only. Both "
+                  "sign-flips are exact only under joint central symmetry; H1b also only to first order in the fit; "
+                  "the level is screened by the calibration gate (gate.py).\n")
         md.append("| condition | fraction | window | group | status | items | cyclic share | noise-corrected | d_C | F lof | p sign-flip | p boot | logistic residual F | p residual flip |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
         for r_ in prows:
             md.append(f"| {r_['cond']} | {r_['frac']} | {r_['G']} | {r_['group']} | {r_['status'][:40]} | {r_['names']} | "
                       f"{fmt(r_.get('cyclic_share'), 3)} | {fmt(r_.get('noise_corrected'), 3)} | {fmt(r_.get('dC'), 4)} | "
                       f"{fmt(r_.get('F_lof'), 2)} | {fmt(r_.get('p_lof_flip'), 4)} | {fmt(r_.get('p_lof'), 4)} | "
                       f"{fmt(r_.get('F_res'), 2)} | {fmt(r_.get('p_res_flip'), 4)} |")
-        md.append("\n| fraction | window | status | groups | H1: F lof | H1 p sign-flip (floor) | H1 p boot | H1b: F_res joint | H1b p sign-flip | H1b p boot | claim beyond bounded |\n|---|---|---|---|---|---|---|---|---|---|---|")
+        md.append("\n| fraction | window | status | groups | H1: F lof | H1 p sign-flip (floor) | H1 p boot | H1b: F_res joint | H1b p sign-flip | H1b p boot | both <= a | headline claim |\n|---|---|---|---|---|---|---|---|---|---|---|---|")
         for j_ in pjoint:
             md.append(f"| {j_['frac']} | {j_['G']} | {j_['status'][:60]} | {j_['groups']} | {fmt(j_.get('F_lof'), 2)} | "
                       f"{fmt(j_.get('p_lof_flip'), 5)} ({fmt(j_.get('flip_min_p'), 5)}) | {fmt(j_.get('p_lof'), 4)} | "
                       f"{fmt(j_.get('F_res_joint'), 2)} | {fmt(j_.get('p_res_flip'), 5)} | {fmt(j_.get('p_res_boot'), 4)} | "
-                      f"{j_.get('claim_beyond_bounded', '')}"
-                      + (f" ({j_['claim_status']})" if j_.get("claim_status", "formal") != "formal" else "") + " |")
+                      f"{j_.get('both_rejected', '')} | {j_.get('claim_beyond_bounded', '')}"
+                      + (f" ({j_['claim_status']})" if j_.get("claim_status") else "") + " |")
         for j_ in pjoint:
             if j_.get("h1b_diagnostics"):
                 md.append(f"\nH1b at fraction {j_['frac']}, window {j_['G']}: {j_['h1b_diagnostics']}.")
