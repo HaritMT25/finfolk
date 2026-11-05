@@ -27,6 +27,7 @@
  * production pose code"). Numbers only, no WebGL: node can load it. Display
  * only: the simulation never reads any of it. */
 (function (root) {
+  root.EvoOceanPose = null;   /* registered at the end: a throw on the way leaves null (the scene: "failed to run") */
   /* How far a kind's geometry reaches past its spine (swimPose's visibility
    * sphere, reachRadius), in the shaders' own terms. Along the spine, u body
    * lengths (s = 5 u): forward of the head at most min(uf, sn + kf / lambda),

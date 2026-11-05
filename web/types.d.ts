@@ -709,6 +709,99 @@ interface EvoOceanPoseApi {
   smoothCPU(a: number, b: number, x: number): number;
 }
 
+/* ---------------- web/ocean_scene_parity.js (window.EvoOceanSceneParity) ---------------- */
+
+/** The water's clarity (the scene's CLARITY): each entry [realistic, clear]; the fragment check sets the
+ * realistic column's uniforms. Declared by what the checks read. */
+interface WaterClarity {
+  fog: [number[], number[]]; deepTint: [number[], number[]]; deepDim: [number, number]; deepAdd: [number[], number[]];
+  lKeep: [number, number]; floorMin: [number, number]; back: [number, number];
+  ambLo: [number[], number[]]; ambHi: [number[], number[]]; vivid: [number[], number[]];
+}
+/** What the checks take from the scene (bind, as it loads): the gene texture's layout as the renderer lays
+ * it out (GENES_W texels a row, genesRows(capacity) rows, packGenes(T, R, r, slot, ST): row r of R into
+ * slot's 16 texels of T) and its capacities (capFor(n): 256 up, powers of two); the water's constants the
+ * fragment check sets (CLARITY, C.select). */
+interface ParityScene {
+  GENES_W: number;
+  genesRows(cap: number): number;
+  packGenes(T: Float32Array, R: Float32Array, r: number, slot: number, ST: number): void;
+  capFor(n: number): number;
+  CLARITY: WaterClarity;
+  C: { select: number[] };
+}
+/** a check's options: colourBy 0 appearance / 1 recolour; polish the variant; mutate / fsMutate a planted
+ * fault (vertex: row0, nextRow, slot, partW, drawIndex; fragment: swapRB, branch); slotMap the fish's gene
+ * slots; injectSweep NaN / +-Inf into each captured component */
+interface ParityCheckOptions {
+  colourBy?: number; polish?: FishVariant; mutate?: string; fsMutate?: string;
+  slotMap?: "identity" | "permuted" | "sparse"; injectSweep?: boolean;
+}
+/** What the probes use of the scene's three.js renderer (its WebGL2 context untyped here, as the checks'
+ * gl): their own render targets, three's state restored after, the shader-error hook. */
+interface ParityRenderer {
+  getContext(): any;
+  resetState(): void;
+  getRenderTarget(): unknown;
+  setRenderTarget(rt: unknown): void;
+  autoClear: boolean;
+  debug: { onShaderError: ((gl: any, prog: any, vs: any, fs: any) => void) | null };
+  state: { buffers: { color: { setMask(on: boolean): void } }; setScissorTest(on: boolean): void };
+  render(scene: unknown, camera: unknown): void;
+}
+/** What the probes read of the appearance fish's kind (the scene's AppKind) as the frame drew it: its
+ * draw's fish (n) and capacity (cap), the instance attributes' names (inst) and three attributes by name
+ * (attrs; iGeneSlot each draw's gene slot), the live gene texture (tex: three's DataTexture), its slots
+ * (capacity, stats), its programs (shaders: the probes' raw / chart stages), the fish material's uGenes
+ * uniform (bound by the probes, so three's uploader is what they test) and whether its mesh is shown. */
+interface ParityAppKind {
+  n: number;
+  cap: number;
+  inst: string[];
+  attrs: Record<string, any>;
+  tex: any;
+  slots: { capacity: number; stats(): unknown };
+  shaders: AppearancePrograms;
+  mat: { uniforms: { uGenes: unknown } };
+  mesh: { visible: boolean };
+}
+/** The scene's port for the probes (attach, once a scene): fixed parts and live getters, read at each
+ * probe, never copied (web/ocean_scene_parity.js attach says what each is). */
+interface ParityProbePort {
+  THREE: any;
+  renderer: ParityRenderer;
+  profiler: { suspend<T>(fn: () => T): T };
+  geneIO: { uploads: number };
+  bodyScale(size: number): number;
+  ea(): EvoAppearanceApi | null;
+  status(): string;
+  appKind(): ParityAppKind | null;
+  drawn(): boolean;
+}
+/** The probes on a live scene and their queue: runProbes(s) right after a production draw (s the snapshot
+ * drawn), failProbes(why) when there is none; testFaults.holdGeneUploads leaves the scene's gene upload out
+ * (a stale texture must then fail appearanceTextureParity). */
+interface ParityProbes {
+  testFaults: { holdGeneUploads: boolean };
+  probes: unknown[];
+  failProbes(why: string): void;
+  runProbes(s: OceanSnapshot): void;
+  appearanceParity(rows: ArrayLike<number>[], lams: number[], cellW?: number, cellH?: number): object;
+  appearanceTextureParity(expected?: BenchSnapshotCopy | null, o?: { mutate?: string; pendingUpload?: boolean; charts?: number; rawWords?: boolean }): Promise<any>;
+}
+/** The appearance fish's GPU == CPU checks (web/ocean_scene_parity.js says what each checks): on any
+ * WebGL2 context, a Promise of the report (.error: it did not run; .ok: it passed). EA: EvoAppearance;
+ * rows / lams: fish added to the fixed fixture. And the probes on a live scene (attach). */
+interface EvoOceanSceneParityApi {
+  /** the scene's layout and water (once, as web/ocean_scene.js loads; before it a check throws) */
+  bind(scene: ParityScene): void;
+  appearancePathCheck(gl: WebGL2RenderingContext, EA: EvoAppearanceApi, rows?: ArrayLike<number>[] | null, lams?: number[] | null, opts?: ParityCheckOptions): Promise<any>;
+  appearanceVertexCheck(gl: WebGL2RenderingContext, EA: EvoAppearanceApi, rows: ArrayLike<number>[], lams: number[], opts?: ParityCheckOptions): Promise<any>;
+  appearanceFragmentCheck(gl: WebGL2RenderingContext, EA: EvoAppearanceApi, opts?: ParityCheckOptions): Promise<any>;
+  /** the probes on a live scene (web/ocean_scene.js create(), once a scene) */
+  attach(port: ParityProbePort): ParityProbes;
+}
+
 /* ---------------- not checked yet: declared by what checked files use ---------------- */
 
 /** the scene (web/ocean_scene.js create()): what the benchmark and the page's API use of it */
@@ -749,11 +842,16 @@ declare var EvoAppearanceSlots: EvoAppearanceSlotsApi;
 declare var EvoOceanPerf: EvoOceanPerfApi;
 declare var EvoOceanConfig: EvoOceanConfigApi;
 declare var EvoAppearance: EvoAppearanceApi;
-declare var EvoOceanShaders: EvoOceanShadersApi;
-declare var EvoOceanPose: EvoOceanPoseApi;
+/** the scripts web/ocean_scene.js needs: undefined when the file did not load, null when it threw as it
+ * loaded (each sets its namespace null first and registers at the end) */
+declare var EvoOceanShaders: EvoOceanShadersApi | null | undefined;
+declare var EvoOceanPose: EvoOceanPoseApi | null | undefined;
+declare var EvoOceanSceneParity: EvoOceanSceneParityApi | null | undefined;
 declare var EvoOceanScene: EvoOceanSceneApi;
-/** set by web/ocean_scene.js when a script it needs did not load ("ocean_shaders.js", "ocean_pose.js" or
- * both, " and "): the page's "could not start" names it (else "ocean_scene.js", the scene itself) */
+/** set by web/ocean_scene.js when a script it needs did not load or failed to run, in words: "<files>
+ * missing", "<files> failed to run" or both, "; " between ("ocean_shaders.js", "ocean_pose.js",
+ * "ocean_scene_parity.js", " and " between): the page's "could not start" says it (else "ocean_scene.js
+ * missing", the scene itself) */
 declare var EvoOceanSceneMissing: string | undefined;
 declare var EvoOcean: OceanPageApi;
 declare var EVO_ASSETS: EvoAssets;

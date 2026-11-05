@@ -46,8 +46,10 @@
 //   noperf       web/ocean_perf.js blocked (a normal link, ?renderBench=1):
 //                the page starts and draws with no other error
 //   missing      a script the 3-D scene needs blocked (ocean_shaders.js,
-//                ocean_pose.js, both, or ocean_scene.js itself): the page
-//                stops, and its splash names the file, with no other error
+//                ocean_pose.js, both, ocean_scene_parity.js, or ocean_scene.js
+//                itself): the page stops, and its splash names the file, with
+//                no other error; one of the first three throwing as it loads:
+//                its splash says it failed to run
 //   faults       each planted fault must be caught (and compile and run):
 //                the texture lookup (row0, nextRow, slot) and vPart.w in both
 //                vertex reports; the slot selector on the draw index again
@@ -264,7 +266,7 @@ async function manifestOf(page, label, extra = {}) {
   return Object.assign({ label, base: BASE, launchArgs: LAUNCH_ARGS, headless: !HEADED, playwright: require(PW + "/package.json").version,
     hashes: { "web/evo_ocean.wasm": sha("web/evo_ocean.wasm"), "web/ocean_scene.js": sha("web/ocean_scene.js"), "web/ocean_perf.js": sha("web/ocean_perf.js"),
               "web/ocean_appearance_slots.js": sha("web/ocean_appearance_slots.js"), "web/ocean_shaders.js": sha("web/ocean_shaders.js"),
-              "web/ocean_pose.js": sha("web/ocean_pose.js"),
+              "web/ocean_pose.js": sha("web/ocean_pose.js"), "web/ocean_scene_parity.js": sha("web/ocean_scene_parity.js"),
               "web/ocean.js": sha("web/ocean.js"), "web/vendor/three.bundle.min.js": sha("web/vendor/three.bundle.min.js") },
     host: { platform: process.platform, cpus: os.cpus().length, cpuModel: os.cpus()[0] && os.cpus()[0].model, totalMemGB: Math.round(os.totalmem() / 1e9) },
     info }, extra);
@@ -740,12 +742,14 @@ async function partNoPerf() {
 }
 
 /* ---------------- a script the scene needs, missing ---------------- */
-/* web/ocean_shaders.js, web/ocean_pose.js, both, or web/ocean_scene.js itself
- * blocked (a route abort): the page does not start, and its splash names the
- * file (the scene's EvoOceanSceneMissing; without the scene, ocean_scene.js) */
+/* web/ocean_shaders.js, web/ocean_pose.js, both, web/ocean_scene_parity.js or
+ * web/ocean_scene.js itself blocked (a route abort): the page does not start,
+ * and its splash names the file (the scene's EvoOceanSceneMissing; without the
+ * scene, ocean_scene.js). Then each of the first three throwing as it loads:
+ * the splash says it failed to run */
 async function partMissing() {
   console.log("== a script the 3-D scene needs, missing (blocked): the splash names it");
-  for (const files of [["ocean_shaders"], ["ocean_pose"], ["ocean_shaders", "ocean_pose"], ["ocean_scene"]]) {
+  for (const files of [["ocean_shaders"], ["ocean_pose"], ["ocean_shaders", "ocean_pose"], ["ocean_scene_parity"], ["ocean_scene"]]) {
     const label = "missing-" + files.join("+");
     const L = await launch(label);
     let blocked = 0;
@@ -761,6 +765,34 @@ async function partMissing() {
     report.parts[label] = Object.assign({ blocked, want, errors: L.errors }, r);
     check(files.map((f) => f + ".js").join(" + ") + " blocked: the page stops, its splash says \"" + want + "\"",
           !r.started && !r.scene && blocked === files.length && r.splash.includes(want), r);
+    check("  no other console / page / network error", other.length === 0, other.slice(0, 5));
+    await L.ctx.close();
+  }
+  /* a script that loads but throws as it runs (its own text served, a throw
+   * planted just before it registers its namespace): the splash says it failed
+   * to run, not that it is missing */
+  const NS = { ocean_shaders: "EvoOceanShaders", ocean_pose: "EvoOceanPose", ocean_scene_parity: "EvoOceanSceneParity" };
+  for (const f of Object.keys(NS)) {
+    const label = "throws-" + f;
+    const L = await launch(label);
+    let planted = 0;
+    await L.ctx.route(new RegExp("/" + f + "(\\.[0-9a-f]+)?\\.js(\\?.*)?$"), async (rt) => {
+      const resp = await rt.fetch(), body = await resp.text(), at = "\n  root." + NS[f] + " = API;\n";
+      if (body.split(at).length === 2) planted++;
+      return rt.fulfill({ response: resp, body: body.replace(at, "\n  throw new Error(\"planted: " + f + ".js throws as it loads\");" + at) });
+    });
+    await L.page.goto(BASE + "/ocean.html?guide=0&intro=0&seed=7");
+    await L.page.waitForFunction(() => /could not start/.test(document.body.textContent) || (window.EvoApp && EvoApp.ready === true), null, { timeout: 90000 });
+    const r = await L.page.evaluate((ns) => ({ started: !!(window.EvoApp && EvoApp.ready === true), scene: !!window.EvoOceanScene,
+                                               namespace: window[ns] === null ? "null" : typeof window[ns],
+                                               flag: window.EvoOceanSceneMissing === undefined ? null : window.EvoOceanSceneMissing,
+                                               splash: (document.getElementById("splashstate") || {}).textContent || "" }), NS[f]);
+    const want = f + ".js failed to run";
+    /* the planted throw, and the scene saying which, are expected; nothing else may fail */
+    const other = L.errors.filter((e) => !e.includes(f + "."));
+    report.parts[label] = Object.assign({ planted, want, errors: L.errors }, r);
+    check(f + ".js throws as it loads: the page stops, its splash says \"" + want + "\"",
+          !r.started && !r.scene && planted === 1 && r.namespace === "null" && r.flag === want && r.splash.includes(want), r);
     check("  no other console / page / network error", other.length === 0, other.slice(0, 5));
     await L.ctx.close();
   }

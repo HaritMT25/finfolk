@@ -3801,8 +3801,9 @@
   var CLASSIC_KEYS = ["view", "fish", "gl", "bench", "threads", "nthreads"];
   var linkRefused = false;   /* oc_init refused the link's ?cfg= / ?e1=1 */
   splashSay(MOCK ? "Starting the ocean (mock engine)…" : "Starting the ocean…");
-  /* (no scene: its own file, or one it needs that it found missing, EvoOceanSceneMissing) */
-  var sceneReady = window.EvoOceanScene ? EvoOceanScene.load() : Promise.reject(new Error((window.EvoOceanSceneMissing || "ocean_scene.js") + " missing"));
+  /* (no scene: its own file missing, or why it did not register, EvoOceanSceneMissing: a file it needs
+   * missing or failed to run) */
+  var sceneReady = window.EvoOceanScene ? EvoOceanScene.load() : Promise.reject(new Error(window.EvoOceanSceneMissing || "ocean_scene.js missing"));
   Promise.all([loadModule().catch(function (e) {
     var why = String(e && e.message || e);
     if (/could not load/.test(why) && !MOCK) why += "\nThe Ocean module is web/evo_ocean.js + .wasm, built by wasm/build_ocean.sh.";
