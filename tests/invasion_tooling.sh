@@ -2824,6 +2824,75 @@ r2 = dict(r, fit_diag=bounded.fit_diag())
 assert "an H1-only world with fit diagnostics" in gate.task_problems(r2, t, man_sha, run_sha)
 PY
 
+# 52. the confirmation is registered before its home runs finish: plan.py --pending plans the approved confirm-v1
+#     design from snapshot PATHS (files absent, every hash "pending"); such a plan cannot run (run.py refuses it,
+#     exit 2) and the confirmation check reports only its snapshots; once the files exist, plan.py --against
+#     accepts exactly the registered plan with its hashes filled in and refuses any other change
+mkdir -p t52
+$PY - "$T" "$W/t52" "$BIN" <<'PY' > t52.log 2>&1 || fail "the pending confirmation plan: $(tail -3 t52.log)"
+import json, os, subprocess, sys
+T, D, BIN = sys.argv[1], sys.argv[2], sys.argv[3]
+sys.path.insert(0, T); import gate, plan
+SCH = {"type": "indexed", "namespace": "confirm-v1", "slot_base": 3000000000, "donor_base": 3100000000,
+       "pred_base": 3200000000, "reseed_base": 3300000000, "assays": ["off", "predA4"]}
+names = {core: [f"{core[0]}{430001 + 6 * h + t // 2}{'el'[t % 2]}" for t in range(12)] for h, core in enumerate(("np", "p4"))}
+paths = {nm: f"{D}/snap/{nm}.json" for v in names.values() for nm in v}
+def design(**kw):
+    d = {"name": "c52", "snapshots": paths, "conditions": {"off": 0, "predA4": 4}, "fractions": [0.05], "replicates": 10,
+         "steps": 27000, "checkpoint_every": 4500, "log_every": 1000, "seed_scheme": dict(SCH),
+         "cores": [["np", names["np"]], ["p4", names["p4"]]]}
+    d.update(kw)
+    return d
+def plan_py(d, *args):
+    json.dump(d, open(f"{D}/design.json", "w"))
+    p_ = subprocess.run([sys.executable, "-I", f"{T}/plan.py", f"{D}/design.json", *args], capture_output=True, text=True)
+    return p_.returncode, p_.stdout, p_.stderr
+assert not any(os.path.exists(p_) for p_ in paths.values())
+rc, out, err = plan_py(design(), "--pending")
+assert rc == 0 and "pending plan: 5760 cells" in err, (rc, err)
+open(f"{D}/pending.jsonl", "w").write(out)
+pend = [json.loads(ln) for ln in out.splitlines()]
+assert len(pend) == 5760 and all(c["resident_sha256"] == "pending" for c in pend)
+assert all((c["invader_sha256"] == "pending") == (c["mode"] == "invade") for c in pend)
+# the registered design, as far as the plan alone tells; with the files read, only the absent snapshots
+assert gate.confirmation_plan_problems(pend, read_snapshots=False) == [], gate.confirmation_plan_problems(pend, False)
+pr = gate.confirmation_plan_problems(pend)
+assert sum("unreadable (FileNotFoundError)" in x for x in pr) == 24 and all(x.startswith(("snapshot ", "core ")) for x in pr), pr
+# a pending plan cannot run, even once the files exist
+os.makedirs(f"{D}/snap", exist_ok=True)
+for core, pred in (("np", 0), ("p4", 4)):
+    for t, nm in enumerate(names[core]):
+        json.dump({"world": {"frame": (500000, 3000000)[t % 2]}, "config": {"predatorCount": pred}, "tag": nm}, open(paths[nm], "w"))
+open(f"{D}/one.jsonl", "w").write(out.splitlines()[0] + "\n")
+r = subprocess.run([sys.executable, "-I", f"{T}/run.py", "--plan", f"{D}/one.jsonl", "--root", f"{D}/root", "--binary",
+                    BIN, "--workers", "1", "--disk-min", "none"], capture_output=True, text=True)
+assert not os.listdir(f"{D}/root/cells"), os.listdir(f"{D}/root/cells")
+assert r.returncode == 2 and "registered pending" in r.stdout + r.stderr, (r.returncode, r.stdout[-400:], r.stderr[-400:])
+assert any("the file is not the registered one" in x for x in gate.confirmation_plan_problems(pend))
+# the final plan: exactly the registered one with its hashes filled in, and then the approved design
+rc, out, err = plan_py(design(), "--against", f"{D}/pending.jsonl")
+assert rc == 0 and "with its 5760 cells' snapshot hashes filled in" in err, (rc, err)
+fin = [json.loads(ln) for ln in out.splitlines()]
+assert all(len(c["resident_sha256"]) == 64 for c in fin) and plan.pending_problems(fin, pend) == []
+assert gate.confirmation_plan_problems(fin) == [], gate.confirmation_plan_problems(fin)
+# ... and nothing else: another design field, another cell set, a real hash in the registration, or both flags
+rc, _, err = plan_py(design(steps=13500), "--against", f"{D}/pending.jsonl")
+assert rc == 2 and "differs from the registered pending plan in ['steps']" in err, err
+open(f"{D}/short.jsonl", "w").write("".join(json.dumps(c) + "\n" for c in pend[:1] + pend[2:]))
+rc, _, err = plan_py(design(), "--against", f"{D}/short.jsonl")
+assert rc == 2 and "5760 cells, the registered pending plan has 5759" in err, err
+real = [dict(c) for c in pend]
+real[5]["resident_sha256"] = fin[5]["resident_sha256"]
+open(f"{D}/real.jsonl", "w").write("".join(json.dumps(c) + "\n" for c in real))
+rc, _, err = plan_py(design(), "--against", f"{D}/real.jsonl")
+assert rc == 2 and "it is not a pending plan" in err, err
+swap = [dict(c) for c in pend]
+swap[0], swap[1] = swap[1], swap[0]
+assert any("differs from the registered pending plan" in x for x in plan.pending_problems(fin, swap))
+rc, _, _ = plan_py(design(), "--pending", "--against", f"{D}/pending.jsonl")
+assert rc == 2
+PY
+
 # 19. self-tests of the inference and bounded-scale modules
 $PY "$T/infer.py" > /dev/null || fail "infer.py self-test"
 $PY "$T/bounded.py" > /dev/null || fail "bounded.py self-test"

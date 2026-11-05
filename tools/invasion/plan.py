@@ -1,9 +1,17 @@
 #!/usr/bin/env python3
 """plan.py: expand an invasion design (JSON) into a runner plan (JSONL, one cell per line).
 
-    plan.py DESIGN.json [--avoid OLD_PLAN.jsonl ...] > PLAN.jsonl
+    plan.py DESIGN.json [--avoid OLD_PLAN.jsonl ...] [--pending | --against PENDING.jsonl] > PLAN.jsonl
 
 --avoid: refuse (exit 2) if any seed of the new plan equals any seed of an archived plan.
+--pending: plan BEFORE the snapshots exist (a confirmation registered before its home runs finish):
+    the files need not exist, and every resident_sha256 / invader_sha256 is the string "pending".
+    Such a plan cannot run: no file hashes to "pending", so run.py refuses the batch (exit 2) and
+    gate.confirmation_plan_problems reports every snapshot. Its sha256 is what a registration binds.
+--against PENDING.jsonl: the final plan, once the snapshots exist, must be the pending plan with
+    only the "pending" hashes filled in (the same cells in the same order, every other field equal;
+    every cell of one snapshot then carries one hash, as plan.py always gives): refused (exit 2)
+    otherwise, so the plan that runs is provably the one registered.
 
 DESIGN.json:
   {
@@ -74,7 +82,11 @@ def per(v, key):
     return v[key] if isinstance(v, dict) else v
 
 
-def expand(design):
+PENDING = "pending"   # the snapshot hash of a plan registered before its snapshots exist (--pending)
+SHA_KEYS = ("resident_sha256", "invader_sha256")
+
+
+def expand(design, pending=False):
     snaps = design["snapshots"]
     for k, p in snaps.items():
         if not os.path.isabs(p):
@@ -131,7 +143,7 @@ def expand(design):
     for n in used:
         if n not in snaps:
             raise SystemExit(f"unknown snapshot {n}")
-    digest = {n: invlib.sha256_file(snaps[n]) for n in sorted(used)}
+    digest = {n: PENDING if pending else invlib.sha256_file(snaps[n]) for n in sorted(used)}
     out = []
     order = {"sham": 0, "self": 1, "invade": 2}
     for frac in design["fractions"]:
@@ -194,6 +206,31 @@ def collisions(cells, avoid_paths):
     return sorted(seed_values(cells) & old)
 
 
+def pending_problems(cells, registered):
+    """The final plan `cells` against the plan registered before its snapshots existed (--pending):
+    the same cells in the same order, equal in every field except the snapshot hashes, each of which
+    goes from "pending" to a real hash (a None stays None). -> problems (empty = the registered plan)."""
+    probs = []
+    reg_pending = [c for c in registered if any(c.get(k) not in (None, PENDING) for k in SHA_KEYS)]
+    if reg_pending:
+        probs.append(f"{len(reg_pending)} cell(s) of the registered plan carry real snapshot hashes, not "
+                     f"'pending' (e.g. {reg_pending[0].get('id')}): it is not a pending plan")
+    if len(cells) != len(registered):
+        return probs + [f"{len(cells)} cells, the registered pending plan has {len(registered)}"]
+    for n, (c, r) in enumerate(zip(cells, registered)):
+        masked = dict(c)
+        for k in SHA_KEYS:
+            if r.get(k) == PENDING and isinstance(c.get(k), str) and len(c[k]) == 64:
+                masked[k] = PENDING
+        if masked != r:
+            keys = sorted(k for k in set(masked) | set(r) if masked.get(k) != r.get(k))
+            probs.append(f"line {n + 1} ({c.get('id')}): differs from the registered pending plan in {keys}")
+            if len(probs) >= 10:
+                probs.append("(further differences not listed)")
+                break
+    return probs
+
+
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     avoid = []
@@ -201,11 +238,32 @@ def main(argv=None):
         k = argv.index("--avoid")
         avoid.append(argv[k + 1])
         del argv[k:k + 2]
-    if len(argv) != 1:
+    pending = "--pending" in argv
+    if pending:
+        argv.remove("--pending")
+    against = None
+    if "--against" in argv:
+        k = argv.index("--against")
+        against = argv[k + 1]
+        del argv[k:k + 2]
+    if len(argv) != 1 or (pending and against):
         print(__doc__, file=sys.stderr)
         return 2
     design = json.load(open(argv[0]))
-    cells = expand(design)
+    cells = expand(design, pending=pending)
+    if pending:
+        print(f"pending plan: {len(cells)} cells, snapshot hashes 'pending' (not runnable; build the final plan "
+              f"with --against once the snapshots exist)", file=sys.stderr)
+    if against:
+        registered = [json.loads(ln) for ln in open(against) if ln.strip()]
+        probs = pending_problems(cells, registered)
+        if probs:
+            print(f"not the registered pending plan {against}:", file=sys.stderr)
+            for p in probs:
+                print(f"  {p}", file=sys.stderr)
+            return 2
+        print(f"the registered pending plan {against} with its {len(cells)} cells' snapshot hashes filled in",
+              file=sys.stderr)
     if avoid:
         hit = collisions(cells, avoid)
         if hit:
