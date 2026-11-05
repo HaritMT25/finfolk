@@ -51,8 +51,8 @@
     ["controller", "the pitch estimate, the movement axes, the selected fish by id and its death hand-over", false],
     ["cameraPick", "scene.render: animation, follow, flight, controls, near / far, hover picking", false],
     ["fishPack", "fillFish(): the fish's instance attributes; inclusive of appearanceRows and geneRanges", true],
-    ["appearanceRows", "the genes copied into the gene texture's staging array (packGenes); inside fishPack", false],
-    ["geneRanges", "preparing the gene texture's upload (PR1: one full upload a frame); inside fishPack", false],
+    ["appearanceRows", "the gene slots' reconciliation (EvoAppearanceSlots.prepare: ids matched, the dead released, the new fish's genes copied into their slots, iGeneSlot written); inside fishPack", false],
+    ["geneRanges", "planning the gene texture's upload (the dirty slots' ranges, or nothing); inside fishPack", false],
     ["otherPack", "predators, food, currents, trail and rings, the snow switch, the caustic fade, the flashlight's aim", false],
     ["submit", "renderer.render(scene, camera), with the GPU frame query's begin / end", false],
     ["card", "updateCard()", false],
@@ -83,14 +83,17 @@
     ["lines", "renderer.info.render.lines"],
     ["instBytes", "fish instance-attribute bytes queued for upload (update ranges)"],
     ["instAllocBytes", "fish instance-attribute bytes allocated (a rebuilt geometry, uploaded whole)"],
-    ["geneSrcBytes", "gene bytes copied into the staging array (63 floats a fish)"],
-    ["genePadBytes", "padding bytes written (one float a fish)"],
-    ["geneDirtySlots", "gene slots marked for upload"],
-    ["geneRanges", "gene upload ranges prepared (0: one full upload)"],
-    ["geneUploads", "gene texture uploads three performed (DataTexture.onUpdate)"],
-    ["geneUploadBytes", "bytes of those uploads (the pending upload plan's)"],
+    ["geneSrcBytes", "gene bytes copied into the gene slots (63 floats a fish new to the renderer; 0 when the fish are the last frame's)"],
+    ["genePadBytes", "padding bytes written (one float a new fish)"],
+    ["geneDirtySlots", "gene slots outstanding for upload (the plan's)"],
+    ["geneRanges", "gene upload ranges planned (0: none, or one full upload: geneFull)"],
+    ["geneUploads", "gene texture updates three performed (DataTexture.onUpdate; one per consumed texture version)"],
+    ["geneUploadBytes", "bytes of those uploads (the consumed plan's)"],
     ["texAllocs", "gene textures allocated"],
     ["texCapacity", "gene texture capacity, fish slots"],
+    ["geneFull", "1 when a whole-texture gene upload was planned (new GPU storage, or the full policy)"],
+    ["geneUploadCalls", "gene texSubImage2D calls of the consumed uploads (one per range, one for a whole upload)"],
+    ["litInst", "lit appearance fish drawn apart on the full programs (the split; the rest plain)"],
     ["gpuIssued", "GPU elapsed queries begun this frame"]
   ];
   var LABELS = ["frame", "fishBody", "barbels", "fishShadow", "predBody", "predShadow", "floor", "surface", "food", "snow", "other"];
@@ -442,7 +445,7 @@
     cap.schema.counters.forEach(function (c, k) {
       var v = [];
       keep.forEach(function (fr) { var x = cap.cnt[fr * NK + k]; if (x === x) v.push(x); });
-      if (v.length) { var qq = quantiles(v); counters[c[0]] = { mean: qq.mean, min: Float64Array.from(v).sort()[0], max: qq.max }; }
+      if (v.length) { var qq = quantiles(v); counters[c[0]] = { mean: qq.mean, min: Float64Array.from(v).sort()[0], p99: qq.p99, max: qq.max }; }
     });
     var g = cap.gpu && cap.gpu.results, gpu = null;
     if (cap.gpu) {

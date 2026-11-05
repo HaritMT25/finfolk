@@ -17,8 +17,10 @@
  *   - the shared templates (medium and coarse qualities, the barbel strips);
  *   - the genes' GPU layout: a fish's 63 floats (oc_creature_appearance's row,
  *     plus one zero) in 16 RGBA32F texels of one texture (512 texels wide),
- *     fetched by gl_InstanceID, so the fish program needs only 7 vertex
- *     attributes (WebGL2 guarantees 16; ANGLE on D3D11 refused 15);
+ *     fetched from the fish's gene slot (fetchGenes(slot): the slot the
+ *     renderer keeps for the fish's id, web/ocean_appearance_slots.js, read
+ *     from its scalar iGeneSlot attribute), so the fish program needs only 8
+ *     vertex attributes (WebGL2 guarantees 16; ANGLE on D3D11 refused 15);
  *   - a CPU mirror of the pattern law (the colour a material site gets), for
  *     the GPU == CPU check (EvoOceanScene's appearanceParity: the K12 check of
  *     the gallery, p99.9 <= .002) and the fish card's swatch.

@@ -1,7 +1,7 @@
 // tests/ocean_render_browser.mjs: the Ocean's render checks and benchmark on the real page, in headless Brave.
 //
 //   node tests/ocean_render_browser.mjs --base http://localhost:8152 [--out DIR]
-//        [--parts correctness,noperf,faults,timer,beam,iframe,gate,perf] [--counts 500,1500,2500]
+//        [--parts correctness,slots,noperf,faults,timer,beam,iframe,gate,offimage,perf] [--counts 500,1500,2500]
 //        [--dur 15000] [--warm 10000] [--rounds 2] [--headed]
 //        [--cameras whole,dense,follow,fit] [--colours appearance,family,brain]   (perf; default whole, appearance)
 //        [--modes off,frame,spans,spansGpu] [--viewport 1920x1080[@1]]       (perf; the default: all four, 1920 x 1080 at DPR 1)
@@ -11,7 +11,9 @@
 //   --arms: instead of profiler modes, the swim polish's arms, each capture spansGpu (cpu spans, GPU frame
 //        queries every 6th) with rAF timestamps: main (--main-base's site: before the polish), off / on /
 //        ungated / zero (this site with scene.setPolish false / true / "ungated": every fish at full weight, the
-//        reference that shows what the size gate saves; "zero": every weight 0, so none lit: the plain programs). Per cell, each round runs the arms in order
+//        reference that shows what the size gate saves; "zero": every weight 0, so none lit: the plain programs; "fullUp": the polish on with
+//        the whole gene texture uploaded every frame, as before render PR2; "split": the polish on with the lit fish drawn apart,
+//        render PR2's opt-in split). Per cell, each round runs the arms in order
 //        (reversed on odd rounds, so drift cancels), a fresh page per site, a warm-up after each load and a
 //        settle after each switch; every observation records the arm, the effective polish state
 //        (scene.polish(): programs, gate, the last frame's weights), quality, DPR, the drawing buffer, the
@@ -24,17 +26,29 @@
 // independent run: a fresh browser and temporary profile, one at a time.
 //   correctness  the production checks (appearancePathCheck: the fixed
 //                fixture through the vertex shader in both colour modes and
-//                the fragment shader), the attribute-fed reference
+//                the fragment shader, and with permuted / sparse gene slots),
+//                the attribute-fed reference
 //                (appearanceParity), the live gene texture (appearance-,
 //                family- and brain-colour frames), and the profiler's
-//                gene-upload counters against intercepted WebGL uploads; the
+//                gene-upload counters against intercepted WebGL uploads
+//                (paused: none at all; stepping: the new fish's slots only); the
 //                bench itself (a case's tick restored, its colour modes not
 //                stored, a Restart's link without renderBench / perf)
+//   slots        render PR2's gene slots through the real render path:
+//                synthetic snapshots of a 2,048-fish world (reordered, deaths
+//                and births, the owners of slots 31 / 32 / 63 / 64 and 2047 /
+//                2048, growth to 2,049 then 2,500, shrink and refill, detail
+//                and colour changes, held uploads, a new epoch with the same
+//                ids, a refused snapshot), each checked by the live-texture
+//                probe, with its uploads counted (calls, bytes, rectangles,
+//                allocations); the dirty uploads' texture word for word
+//                against the whole-texture policy's
 //   noperf       web/ocean_perf.js blocked (a normal link, ?renderBench=1):
 //                the page starts and draws with no other error
 //   faults       each planted fault must be caught (and compile and run):
 //                the texture lookup (row0, nextRow, slot) and vPart.w in both
-//                vertex reports; red / blue unpacking and the colour-mode
+//                vertex reports; the slot selector on the draw index again
+//                (drawIndex: the slot maps); red / blue unpacking and the colour-mode
 //                branch in the fragment report; NaN / +-Inf in every captured
 //                component; on the live texture, a wrong slot, a pending
 //                upload the probe would perform, and a held-back upload under
@@ -147,7 +161,7 @@ const GATE_CHECK = async (label) => {
   for (let k = 0; k < 3; k++) await new Promise((res) => requestAnimationFrame(res));   /* (no bench in a plain page) */
   const G = S.poseCamera(), st = S.polish(), n = EvoOcean.state().n, V = G.view, P = G.proj;
   const rect = document.getElementById("tank").getBoundingClientRect();
-  const out = { label, n, maxErr: 0, worst: null, below: 0, mid: 0, above: 0, outside: 0, nonFinite: 0, badRoll: 0, posed: 0,
+  const out = { label, n, maxErr: 0, worst: null, below: 0, mid: 0, above: 0, outside: 0, nonFinite: 0, badRoll: 0, posed: 0, apart: 0, apartUnlit: 0,
                 canvasCss: [rect.width, rect.height], drawingBuffer: G.drawingBuffer, dpr: devicePixelRatio, focalCss: G.focalCss, state: st };
   const clip = (q) => { const w = P[3] * q[0] + P[7] * q[1] + P[11] * q[2] + P[15];
     return [(P[0] * q[0] + P[4] * q[1] + P[8] * q[2] + P[12]) / w, (P[1] * q[0] + P[5] * q[1] + P[9] * q[2] + P[13]) / w]; };
@@ -158,6 +172,7 @@ const GATE_CHECK = async (label) => {
   for (let i = 0; i < n; i++) {
     const f = S.poseOf(i), p = f.pose;
     if (f.posed) out.posed++;
+    if (f.apart >= 0) { out.apart++; if (!(p[3] > 0)) out.apartUnlit++; }   /* drawn apart (render PR2's split): lit fish only */
     if (!p.every(Number.isFinite)) { out.nonFinite++; continue; }
     if (Math.abs(p[0] * p[0] + p[1] * p[1] - 1) > 1e-5 || Math.abs(Math.atan2(p[0], p[1])) > 0.6 * p[3] + 2e-3) out.badRoll++;
     const xs = [0, 2, 4, 6, 8, 10].map((k) => f.spine[k]), ys = [1, 3, 5, 7, 9, 11].map((k) => f.spine[k]);
@@ -203,34 +218,49 @@ function texSummary(r) {
   if (!r) return r;
   return { ok: r.ok, error: r.error, failures: r.failures, fish: r.fish, worldEpoch: r.worldEpoch, tick: r.tick, extraUploads: r.extraUploads,
            rawGenes: r.rawGenes, intrinsic: r.intrinsic && Object.assign({}, r.intrinsic, { draws: undefined, ids: undefined, charted: r.intrinsic.draws }),
-           texture: r.texture, mutate: r.mutate, pendingUpload: r.pendingUpload };
+           texture: r.texture, slots: r.slots, mutate: r.mutate, pendingUpload: r.pendingUpload };
 }
 
-/* the upload interceptor: texImage2D / texSubImage2D / texStorage2D calls whose
- * pixels are the gene texture's staging array (window.__geneBuf), while __up.on */
+/* the upload interceptor, while __up.on: texImage2D / texSubImage2D calls whose
+ * pixels are the gene texture's storage (the scene's current one, asked at the
+ * call: it is replaced when the slots grow; a typed array, the last argument, or
+ * the one before a WebGL2 source offset), with each rectangle (x, y, w, h: a
+ * range is one texture row) and its bytes; texStorage2D allocations of a
+ * 512-wide RGBA32F texture (the gene texture's GPU storage) apart */
 const INTERCEPT = () => {
-  window.__up = { on: false, n: 0, bytes: 0, other: 0 };
+  window.__up = { on: false, n: 0, bytes: 0, other: 0, allocs: 0, rects: [], reset() { this.n = this.bytes = this.other = this.allocs = 0; this.rects = []; } };
   const P = WebGL2RenderingContext.prototype;
+  const geneBuf = () => { const S = window.EvoOcean && EvoOcean.scene, g = S && S.geneTexture && S.geneTexture(); return g && g.data ? g.data.buffer : null; };
   for (const name of ["texImage2D", "texSubImage2D"]) {
     const f = P[name];
     P[name] = function () {
       const a = arguments, u = window.__up;
       if (u && u.on) {
-        const px = a[a.length - 1];
-        if (px && px.buffer && window.__geneBuf && px.buffer === window.__geneBuf) {
-          const w = name === "texImage2D" ? a[3] : a[4], h = name === "texImage2D" ? a[4] : a[5];
+        let px = a[a.length - 1];
+        if (typeof px === "number" && a.length >= 2) px = a[a.length - 2];   /* (pixels, srcOffset) */
+        const buf = geneBuf();
+        if (px && px.buffer && buf && px.buffer === buf) {
+          const sub = name === "texSubImage2D", w = sub ? a[4] : a[3], h = sub ? a[5] : a[4];
           u.n++; u.bytes += w * h * 16;
+          if (u.rects.length < 4096) u.rects.push(sub ? [a[2], a[3], w, h] : [0, 0, w, h]);
         } else u.other++;
       }
       return f.apply(this, a);
     };
   }
+  const st = P.texStorage2D;
+  P.texStorage2D = function (target, levels, fmt, w, h) {
+    const u = window.__up;
+    if (u && u.on && fmt === 0x8814 && w === 512) u.allocs++;   /* RGBA32F, 512 wide */
+    return st.apply(this, arguments);
+  };
 };
 
 async function manifestOf(page, label, extra = {}) {
   const info = await page.evaluate(() => EvoOcean.bench ? EvoOcean.bench.info() : null);
   return Object.assign({ label, base: BASE, launchArgs: LAUNCH_ARGS, headless: !HEADED, playwright: require(PW + "/package.json").version,
     hashes: { "web/evo_ocean.wasm": sha("web/evo_ocean.wasm"), "web/ocean_scene.js": sha("web/ocean_scene.js"), "web/ocean_perf.js": sha("web/ocean_perf.js"),
+              "web/ocean_appearance_slots.js": sha("web/ocean_appearance_slots.js"),
               "web/ocean.js": sha("web/ocean.js"), "web/vendor/three.bundle.min.js": sha("web/vendor/three.bundle.min.js") },
     host: { platform: process.platform, cpus: os.cpus().length, cpuModel: os.cpus()[0] && os.cpus()[0].model, totalMemGB: Math.round(os.totalmem() / 1e9) },
     info }, extra);
@@ -244,6 +274,8 @@ async function partCorrectness() {
   await L.page.goto(benchUrl(c));
   await ready(L.page, true);
   const prep = await L.page.evaluate((cd) => EvoOcean.bench.prepare(cd), Object.assign({}, c, { camera: "whole", colourMode: "appearance" }));
+  /* render PR2's split (the lit fish apart: off by default, it measured slower) on for this part, so its checks see it */
+  await L.page.evaluate(() => EvoOcean.scene.setLitSplit(true));
   report.parts.correctness = { manifest: await manifestOf(L.page, "correctness", { browserVersion: L.browserVersion, case: prep }) };
   const ctx = report.parts.correctness.manifest.info.context;
   console.log("  gpu " + ctx.renderer + "; drawing buffer " + ctx.drawingBuffer.join(" x ") + "; timer " + ctx.timerQuery);
@@ -259,6 +291,11 @@ async function partCorrectness() {
   check("  vertex, recolour mode: 11 components, nonzero packed colours reach vPart.w", pathRes.recolour.ok && pathRes.recolour.components === 11);
   check("  fragment: recolour (Family + Brain palettes, parts 0..7) and skin within .003",
         pathRes.fragment.ok && pathRes.fragment.modes.recolour.cases === 240 && pathRes.fragment.modes.appearance.cases === 9, pathRes.fragment.modes);
+  /* render PR2: the genes read from each fish's own slot (iGeneSlot), whatever the draw order */
+  const sl = pathRes.slots || {};
+  check("  gene slots apart from the draw order (iGeneSlot): a permuted map and a sparse one (31 / 32, 63 / 64, 2047 / 2048 on both sides; a 4,096-slot texture), every part",
+        sl.ok === true && sl.permuted.slotMap === "permuted" && sl.permuted.allParts && sl.sparse.slotMap === "sparse" && sl.sparse.maxSlot >= 2048 && sl.sparse.texRows === 128,
+        sl.permuted && { permuted: pathSummary({ appearance: sl.permuted }).appearance, sparse: pathSummary({ appearance: sl.sparse }).appearance, maxSlot: sl.sparse.maxSlot });
   /* the swim polish's programs: animated, walled, posed (POSE_SPECIAL: a pane, a collapsed spine, sharp turns, genes 0 / 1) */
   const pp = pathRes.polish || {};
   check("  polished vertex, appearance mode: 71 fish (65 + 6 special), 51 components, every part, animated and walled",
@@ -328,7 +365,7 @@ async function partCorrectness() {
   check("size weights == the independent projection (|err| <= .004: 7-bit weights), finite, unit rolls within 0.6: whole, follow, inset, zoomed",
         [gw, gf, gi, gz].every(gok), [gw, gf, gi, gz].map((g) => ({ label: g.label, maxErr: g.maxErr, worst: g.worst, below: g.below, mid: g.mid, above: g.above, outside: g.outside, focal: g.focalCss, canvas: g.canvasCss })));
   check("  the whole view: fish under 6 px, none at 11, and with none lit main's plain programs; close up: in the 6 .. 11 ramp, above 11, and the rest outside the view (0), the full programs (compiled ahead)",
-        gw.below > 0 && gw.above === 0 && gw.state.variant === (gw.mid || gw.state.hold > 0 ? "full" : "plain") &&
+        gw.below > 0 && gw.above === 0 && gw.state.variant === (gw.mid ? "full" : "plain") &&
         gf.mid > 0 && gf.above > 0 && gf.outside > 0 && gf.state.variant === "full" && gf.state.ready === true,
         { whole: [gw.below, gw.mid, gw.above, gw.outside], wholeState: gw.state, follow: [gf.below, gf.mid, gf.above, gf.outside], followState: gf.state });
   check("  the whole view packs no swim pose when no fish can be lit (the frame's bound under 6 px), and close up every fish's",
@@ -338,18 +375,37 @@ async function partCorrectness() {
         gi.focalCss !== gf.focalCss && gz.outside < gf.outside, { focal: [gf.focalCss, gi.focalCss], outside: [gf.outside, gi.outside, gz.outside], mean: [gf.state.meanWeight, gi.state.meanWeight, gz.state.meanWeight] });
   check("  ungated: every fish at full weight; off: the plain programs (no weights)",
         gu.state.gated === false && gu.state.full === gu.state.fish && gu.state.fish === 2500 && goff.on === false && goff.any === 0 && goff.variant === "plain", { ungated: gu.state, off: goff });
-  /* hysteresis: from the close view (lit fish, full programs) straight to the whole view (none lit): the full programs are
-   * held 30 frames, then main's plain ones for good; frame by frame, no switching back and forth */
-  const hy = await L.page.evaluate(async () => {
+  /* render PR2's split: close up, the lit fish (and only they) drawn apart on the full programs, the rest plain; every fish lit
+   * (ungated): no split (the whole kind on the full programs); the whole view: nothing apart */
+  check("  close up: the lit fish drawn apart on the full programs (each one lit, all of them), the rest plain; ungated (all lit): no split; whole view: none apart",
+        gf.state.split === true && gf.state.litDrawn === gf.state.any && gf.apart === gf.state.any && gf.apartUnlit === 0 && gf.state.any > 0 && gf.state.any * 2 <= gf.n &&
+        gu.state.split === false && gu.state.litDrawn === 0 && gw.apart === 0 && gw.state.litDrawn === 0,
+        { follow: { split: gf.state.split, litDrawn: gf.state.litDrawn, lit: gf.state.any, apart: gf.apart, apartUnlit: gf.apartUnlit, n: gf.n },
+          ungated: { split: gu.state.split, litDrawn: gu.state.litDrawn }, whole: { apart: gw.apart, litDrawn: gw.state.litDrawn } });
+  /* hysteresis: from the close view (lit fish, full programs) straight to the whole view (none lit). Without the split
+   * (setLitSplit(false): the whole kind on the full programs while any fish is lit) the full programs are held 30 frames,
+   * then main's plain ones for good, no switching back and forth; with the split (the default: only lit fish on the full
+   * programs, apart) there is no whole-draw cost to hold: plain from the first frame with no fish lit (review of #53,
+   * P3-2), while the hold still keeps the poses packed */
+  const HYST = async (split) => {
     const S = EvoOcean.scene, B = EvoOcean.bench, seq = [];
+    S.setLitSplit(split);
     await B.prepare({ camera: "follow", settleMs: 600 });
+    const before = S.polish();
     S.resetView(false);
-    for (let k = 0; k < 50; k++) { await B.frames(1); const p = S.polish(); seq.push([p.variant === "full" ? 1 : 0, p.any, p.hold, p.posing ? 1 : 0]); }
-    return seq;
-  });
-  const flips = hy.slice(1).filter((r, k) => r[0] !== hy[k][0]).length, firstPlain = hy.findIndex((r) => r[0] === 0);
-  check("  hysteresis: leaving a close view, the full programs are held ~30 frames after the last lit fish, then plain, switching once",
-        flips === 1 && firstPlain >= 25 && firstPlain <= 34 && hy.slice(firstPlain).every((r) => r[0] === 0 && r[1] === 0), { flips, firstPlain, seq: hy.map((r) => r.join("")).join(" ") });
+    for (let k = 0; k < 50; k++) { await B.frames(1); const p = S.polish(); seq.push([p.variant === "full" ? 1 : 0, p.any, p.hold, p.posing ? 1 : 0, p.split ? 1 : 0]); }
+    S.setLitSplit(true);
+    return { before: { variant: before.variant, split: before.split, lit: before.any }, seq };
+  };
+  const hyU = await L.page.evaluate(HYST, false), hyS = await L.page.evaluate(HYST, true);
+  const hy = hyU.seq, flips = hy.slice(1).filter((r, k) => r[0] !== hy[k][0]).length, firstPlain = hy.findIndex((r) => r[0] === 0);
+  check("  hysteresis without the split: leaving a close view, the full programs are held ~30 frames after the last lit fish, then plain, switching once",
+        hyU.before.variant === "full" && hyU.before.split === false && flips === 1 && firstPlain >= 25 && firstPlain <= 34 && hy.slice(firstPlain).every((r) => r[0] === 0 && r[1] === 0),
+        { flips, firstPlain, seq: hy.map((r) => r.join("")).join(" ") });
+  const sPlain = hyS.seq.findIndex((r) => r[0] === 0 && r[1] === 0), sHold = hyS.seq.filter((r) => r[0] === 0 && r[2] > 0 && r[3] === 1).length;
+  check("  with the split: the close view's lit fish apart, then plain from the first frame with none lit (no 30-frame hold of the full programs), for good; the hold keeps the poses packed",
+        hyS.before.variant === "full" && hyS.before.split === true && sPlain >= 0 && sPlain <= 2 && hyS.seq.slice(sPlain).every((r) => r[0] === 0 && r[4] === 0) && sHold >= 20,
+        { before: hyS.before, firstPlain: sPlain, plainWhileHeld: sHold, seq: hyS.seq.map((r) => r.join("")).join(" ") });
   await L.page.evaluate((cd) => EvoOcean.bench.prepare(Object.assign({}, cd, { camera: "whole", colourMode: "appearance", settleMs: 300 })), c);
 
   const ref = await L.page.evaluate(() => {
@@ -390,31 +446,59 @@ async function partCorrectness() {
   check("bench.info().dashboardOpen is EvoOceanDash.isOpen(): closed, open, after a capture with them open, closed",
         dsh.map(String).join(" ") === "false,false true,true true,true false,false", dsh);
   const t0 = parity.texture_appearance;
-  check("  charted slots include both sides of 31/32 and 2047/2048", t0 && [31, 32, 2047, 2048].every((d) => t0.intrinsic.charted.includes(d)), t0 && t0.intrinsic.charted);
-  check("  the texture: 512 x 128 RGBA float, nearest, no mipmaps, capacity 4,096", t0 && t0.texture.width === 512 && t0.texture.height === 128 &&
-        t0.texture.type === 1015 && t0.texture.format === 1023 && t0.texture.minFilter === 1003 && t0.texture.magFilter === 1003 && !t0.texture.mipmaps && t0.texture.capacity === 4096, t0 && t0.texture);
+  check("  charted slots include both sides of 31/32 and 2047/2048 (their owners' draws)", t0 && [31, 32, 2047, 2048].every((d) => t0.intrinsic.slots.includes(d)), t0 && { slots: t0.intrinsic.slots, draws: t0.intrinsic.charted });
+  check("  the texture: 512 x 128 RGBA float, nearest, no mipmaps, gene-slot capacity 4,096 (draw capacity apart: 4,096)", t0 && t0.texture.width === 512 && t0.texture.height === 128 &&
+        t0.texture.type === 1015 && t0.texture.format === 1023 && t0.texture.minFilter === 1003 && t0.texture.magFilter === 1003 && !t0.texture.mipmaps &&
+        t0.texture.capacity === 4096 && t0.texture.drawCapacity === 4096 && t0.slots && t0.slots.owners === 2500, t0 && { texture: t0.texture, slots: t0.slots });
 
-  /* the profiler's gene-upload counters against the WebGL calls themselves (outside any timed run) */
-  const up = await L.page.evaluate(async () => {
-    window.__geneBuf = EvoOcean.scene.geneTexture().data.buffer;
-    const io0 = EvoOcean.scene.geneTexture();
-    window.__up.n = 0; window.__up.bytes = 0; window.__up.other = 0; window.__up.on = true;
-    const cap = await EvoOcean.bench.capture({ durationMs: 2000, cpu: true, gpu: "off", drainMs: 0, raw: true });
+  /* the profiler's gene-upload counters against the WebGL calls themselves (outside any timed run): paused (the
+   * same fish every frame: nothing), then stepping 64 ticks a frame (births and deaths: the dirty slots only) */
+  const UPLOADS = async (stepTo) => {
+    const S = EvoOcean.scene, io0 = S.geneTexture();
+    window.__up.reset(); window.__up.on = true;
+    const dur = stepTo ? 16000 : 2000, t0 = performance.now();   /* (a loaded machine steps 64 ticks of 2,500 fish in ~1 s) */
+    const capP = EvoOcean.bench.capture({ durationMs: dur, cpu: true, gpu: "off", drainMs: 0, raw: true });
+    let stepMs = 0;
+    if (stepTo) { await EvoOcean.bench.wait(300); await EvoOcean.bench.stepToTick(EvoOcean.state().frame + stepTo); await EvoOcean.bench.frames(3); stepMs = performance.now() - t0; }
+    const cap = await capP;
     window.__up.on = false;
-    const io1 = EvoOcean.scene.geneTexture(), NK = cap.schema.counters.length, K = EvoOceanPerf.K;
-    let n = 0, bytes = 0, frames = 0, sub = 0;
+    const io1 = S.geneTexture(), NK = cap.schema.counters.length, K = EvoOceanPerf.K, texBytes = io1.data.byteLength;
+    const sum = { uploads: 0, calls: 0, bytes: 0, src: 0, pad: 0, frames: 0, submitted: 0, framesUploading: 0, maxBytes: 0, maxCalls: 0, full: 0, rangeFrames: 0, badFrames: 0, bad: [] };
     for (let f = 0; f < cap.frames; f++) {
-      const a = cap.cnt[f * NK + K.geneUploads], b = cap.cnt[f * NK + K.geneUploadBytes];
-      if (a === a) n += a; if (b === b) bytes += b;
-      frames++; if (cap.cnt[f * NK + K.submitted] === 1) sub++;
+      const g = (k) => { const v = cap.cnt[f * NK + K[k]]; return v === v ? v : 0; };
+      sum.uploads += g("geneUploads"); sum.calls += g("geneUploadCalls"); sum.bytes += g("geneUploadBytes");
+      sum.src += g("geneSrcBytes"); sum.pad += g("genePadBytes"); sum.full += g("geneFull");
+      sum.frames++; if (g("submitted") === 1) sum.submitted++;
+      sum.maxBytes = Math.max(sum.maxBytes, g("geneUploadBytes")); sum.maxCalls = Math.max(sum.maxCalls, g("geneUploadCalls"));
+      if (!g("geneUploads")) continue;
+      sum.framesUploading++;
+      /* each uploading frame: its new fish's slots in at most 32 ranges (256 bytes each), or one whole upload */
+      const ok = g("geneUploads") === 1 && (g("geneFull") ? g("geneUploadCalls") === 1 && g("geneUploadBytes") === texBytes
+                                                          : g("geneUploadCalls") <= 32 && g("geneUploadBytes") === g("geneSrcBytes") / 252 * 256);
+      if (!g("geneFull")) sum.rangeFrames++;
+      if (!ok) { sum.badFrames++; if (sum.bad.length < 4) sum.bad.push({ f, uploads: g("geneUploads"), calls: g("geneUploadCalls"), bytes: g("geneUploadBytes"), src: g("geneSrcBytes"), full: g("geneFull") }); }
     }
-    return { profiler: { uploads: n, bytes: bytes, frames: frames, submitted: sub }, intercepted: { calls: window.__up.n, bytes: window.__up.bytes },
-             sceneIO: { uploads: io1.uploads - io0.uploads, bytes: io1.bytes - io0.bytes }, perFrameBytes: io1.data.byteLength };
-  });
-  report.parts.correctness.uploads = up;
-  check("gene-upload counters == intercepted WebGL uploads (calls and bytes)",
-        up.profiler.uploads > 0 && up.profiler.uploads === up.intercepted.calls && up.profiler.bytes === up.intercepted.bytes && up.sceneIO.uploads === up.intercepted.calls, up);
-  check("  PR1 baseline: one full 1 MiB gene upload a submitted frame", up.perFrameBytes === 1048576 && up.profiler.uploads === up.profiler.submitted, up.profiler);
+    return { durMs: dur, stepMs, inside: stepMs < dur - 200, profiler: sum, intercepted: { calls: window.__up.n, bytes: window.__up.bytes, allocs: window.__up.allocs, other: window.__up.other },
+             sceneIO: { uploads: io1.uploads - io0.uploads, calls: io1.calls - io0.calls, bytes: io1.bytes - io0.bytes, allocs: io1.allocs - io0.allocs },
+             capacity: io1.capacity, slots: io1.slots, textureBytes: io1.data.byteLength };
+  };
+  const still = await L.page.evaluate(UPLOADS, 0);
+  const moving = await L.page.evaluate(UPLOADS, 512);
+  const movingTex = await L.page.evaluate(() => EvoOcean.bench.textureParity());
+  report.parts.correctness.uploads = { paused: still, stepping: moving };
+  parity.texture_afterBirths = texSummary(movingTex);
+  check("paused (the same fish every frame): no gene copy, no upload, no call, no byte (profiler, scene and intercepted)",
+        still.profiler.frames > 30 && still.profiler.submitted > 30 && still.profiler.uploads === 0 && still.profiler.calls === 0 && still.profiler.bytes === 0 &&
+        still.profiler.src === 0 && still.profiler.pad === 0 && still.sceneIO.uploads === 0 && still.intercepted.calls === 0 && still.intercepted.bytes === 0, still);
+  check("stepping 64 ticks a frame (births, deaths): gene-upload counters == intercepted WebGL calls and bytes; 252 bytes copied a new fish; no allocation",
+        moving.inside && moving.profiler.uploads > 0 && moving.profiler.calls === moving.intercepted.calls && moving.profiler.bytes === moving.intercepted.bytes &&
+        moving.sceneIO.calls === moving.intercepted.calls && moving.sceneIO.uploads === moving.profiler.uploads &&
+        moving.profiler.pad * 63 === moving.profiler.src && moving.intercepted.allocs === 0 && moving.sceneIO.allocs === 0, moving);
+  check("  each uploading frame: its new fish's slots (256 bytes each) in at most 32 ranges, or one whole upload (review of #53, P3-1); the live texture bit-exact after the births",
+        moving.profiler.badFrames === 0 && moving.profiler.maxCalls <= 32 && movingTex.ok === true && movingTex.rawGenes.mismatches === 0,
+        { framesUploading: moving.profiler.framesUploading, rangeFrames: moving.profiler.rangeFrames, wholeFrames: moving.profiler.full, maxCalls: moving.profiler.maxCalls,
+          maxBytes: moving.profiler.maxBytes, bad: moving.profiler.bad, texture: texSummary(movingTex) });
+  await L.page.evaluate((cd) => EvoOcean.bench.prepare(Object.assign({}, cd, { camera: "whole", colourMode: "appearance", settleMs: 200 })), c);   /* back to tick 0 */
 
   /* the bench itself: a case's tick restored after stepping; the colour modes it used not stored; a Restart's link clean */
   const b = await L.page.evaluate(async (cd) => {
@@ -437,6 +521,184 @@ async function partCorrectness() {
   check("the benchmark's colour modes (Appearance, Family, Brain) were not stored as the visitor's", b.stored === null, b.stored);
   check("a Restart's setup link has no renderBench / perf", b.link.renderBench === null && b.link.perf === null && b.link.seed === "42", b.link);
   check("no console / page / network errors", L.errors.length === 0, L.errors.slice(0, 5));
+  await L.ctx.close();
+}
+
+/* ---------------- the gene slots' lifecycle through the real render path ---------------- */
+/* render PR2. A real world of 2,048 fish (paused at tick 0), then synthetic
+ * snapshots made from it (its fish reordered, dropped, replaced by new ids
+ * with other genes, added; a new epoch with the same ids; a refused one),
+ * handed to the page's own scene.render in place of the real snapshot (the
+ * whole fillFish / fillApp / commit path and three's submission and upload),
+ * each followed by the live-texture probe against owned copies of that
+ * synthetic snapshot (bit-exact genes and padding, charts, no probe upload),
+ * with the gene uploads counted three ways (the scene's onUpdate tallies, the
+ * intercepted texSubImage2D calls with their rectangles, texStorage2D
+ * allocations). */
+async function partSlots() {
+  console.log("== the gene slots' lifecycle, through the real render path (synthetic snapshots of a 2,048-fish world)");
+  const c = caseFor(2048);
+  const L = await launch("slots", { init: INTERCEPT });
+  await L.page.goto(benchUrl(c));
+  await ready(L.page, true);
+  await L.page.evaluate((cd) => EvoOcean.bench.prepare(Object.assign({}, cd, { camera: "whole", colourMode: "appearance", settleMs: 300 })), c);
+  const r = await L.page.evaluate(async () => {
+    const B = EvoOcean.bench, S = EvoOcean.scene, ST = 63, out = { steps: {} };
+    const base = B.snapshotCopy(), nb = base.n;
+    let maxId = 0; for (let i = 0; i < nb; i++) maxId = Math.max(maxId, base.ids[i]);
+    let synth = null;
+    const orig = S.render;
+    S.render = function (s, inf) { return orig.call(this, synth ? Object.assign({}, s, synth) : s, Object.assign({}, inf, { selIdx: -1 })); };
+    /* a snapshot of list's fish: [base fish to copy the body / place from, its id, its genes' variant (0: the base fish's own)] */
+    function make(list, epoch) {
+      const n = list.length, f = { n, worldEpoch: epoch, ids: new Float64Array(n), app: new Float32Array(n * ST), body: new Float32Array(2 * n),
+                                   segs: new Float32Array(12 * n), depth: new Float32Array(n), colors: new Uint8Array(3 * n), vz: new Float32Array(n) };
+      list.forEach(([from, id, v], k) => {
+        f.ids[k] = id; f.depth[k] = base.depth[from];
+        f.body[2 * k] = base.body[2 * from]; f.body[2 * k + 1] = base.body[2 * from + 1];
+        for (let j = 0; j < 12; j++) f.segs[12 * k + j] = base.segs[12 * from + j];
+        for (let j = 0; j < ST; j++) { const g = base.app[ST * from + j]; f.app[ST * k + j] = v ? Math.fround(((g * 0.61 + 0.173 * v + 0.0137 * j) % 1)) : g; }
+        f.colors[3 * k] = (id * 37) & 255; f.colors[3 * k + 1] = (id * 91) & 255; f.colors[3 * k + 2] = (id * 13) & 255;
+      });
+      return f;
+    }
+    const io = () => { const g = S.geneTexture(); return { uploads: g.uploads, calls: g.calls, bytes: g.bytes, allocs: g.allocs, tex: g.texture, cap: g.capacity, slots: g.slots }; };
+    /* show snapshot f for k frames; the gene uploads it caused; the probe against it; each fish's slot */
+    async function show(name, f, k, probe = true) {
+      const a = io();
+      window.__up.reset(); window.__up.on = true;
+      synth = f;
+      await B.frames(k);
+      window.__up.on = false;
+      const b = io(), slots = S.geneSlots();
+      const t = probe ? await B.textureParity({ expected: { worldEpoch: f.worldEpoch, n: f.n, ids: f.ids, app: f.app, body: f.body } }) : null;
+      const st = { n: f.n, uploads: b.uploads - a.uploads, calls: b.calls - a.calls, bytes: b.bytes - a.bytes, allocs: b.allocs - a.allocs,
+                   sameTexture: a.tex === b.tex, capacity: b.cap, owners: b.slots.owners, nextSlot: b.slots.nextSlot,
+                   intercepted: { calls: window.__up.n, bytes: window.__up.bytes, allocs: window.__up.allocs, rects: window.__up.rects.slice(0, 12) },
+                   drawn: S.appearance().shapes, status: S.appearance().status,
+                   probe: t && { ok: t.ok, error: t.error, failures: t.failures, mismatches: t.rawGenes && t.rawGenes.mismatches, padding: t.rawGenes && t.rawGenes.paddingMismatches,
+                                 extraUploads: t.extraUploads, p999: t.intrinsic && t.intrinsic.p999, chartedSlots: t.intrinsic && t.intrinsic.slots } };
+      out.steps[name] = st;
+      return { st, slots };
+    }
+    const E = base.worldEpoch, all = Array.from({ length: nb }, (_, i) => [i, base.ids[i], 0]);
+    const slotOfId = (slots, f) => { const m = new Map(); for (let k = 0; k < f.n; k++) m.set(f.ids[k], slots[k]); return m; };
+    /* 0. the real world itself, as the page draws it */
+    let f0 = make(all, E), s0 = await show("same", f0, 6);
+    const own0 = slotOfId(s0.slots, f0);
+    out.identity = s0.slots.every((x, k) => x === k);
+    /* 1. reversed: every fish keeps its slot, nothing uploaded */
+    let f1 = make(all.slice().reverse(), E), s1 = await show("reversed", f1, 4);
+    out.reversedKeeps = Array.from(f1.ids).every((id, k) => s1.slots[k] === own0.get(id));
+    /* 2. one died, one born (other genes): the birth takes the freed slot, 256 bytes */
+    const gone = 700, born = maxId + 1;
+    let list2 = all.filter((x) => x[0] !== gone).concat([[gone, born, 1]]), f2 = make(list2, E), s2 = await show("oneReplaced", f2, 4);
+    out.bornSlot = s2.slots[f2.n - 1]; out.goneSlot = own0.get(base.ids[gone]);
+    /* 3. the owners of slots 31, 32, 63, 64 replaced: four ranges, one per side of the rows */
+    const own2 = slotOfId(s2.slots, f2), bySlot = new Map(); own2.forEach((s, id) => bySlot.set(s, id));
+    const kill = new Set([31, 32, 63, 64].map((s) => bySlot.get(s)));
+    let list3 = list2.filter((x) => !kill.has(x[1])).concat([[10, born + 1, 2], [11, born + 2, 2], [12, born + 3, 2], [13, born + 4, 2]]);
+    let f3 = make(list3, E), s3 = await show("rowPairs", f3, 4);
+    /* 4. 2,048 -> 2,049: one growth (4,096 slots), one whole upload; -> 2,500: the new slots only */
+    let list4 = list3.concat([[20, born + 5, 3]]), f4 = make(list4, E), s4a = await show("grow2049", f4, 4);
+    const own4 = slotOfId(s4a.slots, f4);
+    out.survivorsKept = Array.from(f3.ids).every((id) => own4.get(id) === slotOfId(s3.slots, f3).get(id));
+    let list5 = list4.concat(Array.from({ length: 451 }, (_, k) => [(k * 7) % nb, born + 6 + k, 4])), f5 = make(list5, E), s5 = await show("to2500", f5, 4);
+    /* 5. the owners of slots 2047 and 2048 replaced: two ranges, rows 63 and 64 */
+    const own5 = slotOfId(s5.slots, f5), by5 = new Map(); own5.forEach((s, id) => by5.set(s, id));
+    const kill5 = new Set([2047, 2048].map((s) => by5.get(s)));
+    let list6 = list5.filter((x) => !kill5.has(x[1])).concat([[30, born + 500, 5], [31, born + 501, 5]]), f6 = make(list6, E), s6 = await show("pair2047", f6, 4);
+    /* 6. shrink to 1,000, refill to 2,500 with new fish: freed slots reused, no growth, survivors in place */
+    let list7 = list6.filter((x, k) => k % 5 < 2), f7 = make(list7, E), s7 = await show("shrink", f7, 4);
+    out.shrinkKeeps = Array.from(f7.ids).every((id, k) => s7.slots[k] === slotOfId(s6.slots, f6).get(id));
+    let list8 = list7.concat(Array.from({ length: f6.n - f7.n }, (_, k) => [(k * 11) % nb, born + 1000 + k, 6])), f8 = make(list8, E), s8 = await show("refill", f8, 4);
+    /* 7. quality 3 -> 2 -> 1 -> 3 and the colour modes: the same texture, the same owners, no upload */
+    const q0 = io();
+    for (const q of [2, 1, 3]) { S.setQuality(q); await B.frames(3); }
+    for (const m of [false, true]) { S.setAppearance(m); await B.frames(3); }
+    const q1 = io();
+    out.qualityColour = { uploads: q1.uploads - q0.uploads, allocs: q1.allocs - q0.allocs, sameTexture: q0.tex === q1.tex, quality: S.quality(), slotsSame: S.geneSlots().every((x, k) => x === s8.slots[k]) };
+    const sq = await show("afterQuality", f8, 3);
+    /* 8. a frame not drawn (uploads held) while fish are born: nothing lost, the next upload covers them */
+    S.testFaults.holdGeneUploads = true;
+    let list9 = list8.concat([[40, born + 3000, 7], [41, born + 3001, 7]]), f9 = make(list9, E);
+    await show("held", f9, 3, false);
+    let list10 = list9.concat([[42, born + 3002, 7]]), f10 = make(list10, E);
+    synth = f10; await B.frames(2);
+    S.testFaults.holdGeneUploads = false;
+    await show("released", f10, 3);
+    /* 9. the dirty uploads' texture == the whole-texture policy's, word for word */
+    const dirtyW = await B.textureParity({ expected: { worldEpoch: f10.worldEpoch, n: f10.n, ids: f10.ids, app: f10.app, body: f10.body }, rawWords: true });
+    S.setGeneUploads("full"); await B.frames(3);
+    const fullIo0 = io(); await B.frames(6); const fullIo1 = io();
+    const fullW = await B.textureParity({ expected: { worldEpoch: f10.worldEpoch, n: f10.n, ids: f10.ids, app: f10.app, body: f10.body }, rawWords: true });
+    S.setGeneUploads("dirty"); await B.frames(3);
+    const quiet0 = io(); await B.frames(6); const quiet1 = io();
+    let diffWords = 0; for (let i = 0; i < f10.n * 64; i++) if (dirtyW.rawWords[i] !== fullW.rawWords[i]) diffWords++;
+    out.dirtyVsFull = { words: f10.n * 64, differing: diffWords, dirtyOk: dirtyW.ok, fullOk: fullW.ok, fullUploads: fullIo1.uploads - fullIo0.uploads,
+                        fullBytesPerUpload: (fullIo1.bytes - fullIo0.bytes) / Math.max(1, fullIo1.uploads - fullIo0.uploads), dirtyAgainUploads: quiet1.uploads - quiet0.uploads };
+    /* 9b. a Turbo-like hand-back: every other fish replaced (births in freed slots all over the texture): one whole upload, not hundreds of ranges */
+    const half = list10.filter((x, k) => k % 2 === 0);
+    let listT = half.concat(Array.from({ length: list10.length - half.length }, (_, k) => [(k * 13) % nb, born + 5000 + k, 9])), fT = make(listT, E);
+    await show("turnover", fT, 4);
+    /* 9c. every fish's genes changed under its id (the engine never does this): found by the per-frame row check, every fish installed again */
+    const rc0 = S.geneTexture().rowChanges;
+    let fR = make(listT.map(([i, id, v]) => [i, id, v + 20]), E);
+    await show("rowsChanged", fR, 4);
+    out.rowChanges = S.geneTexture().rowChanges - rc0;
+    /* 10. a new world's epoch with the same ids and other genes (a Restart): every fish new */
+    let list11 = all.map(([i, id]) => [i, id, 8]), f11 = make(list11, E + 1000), s11 = await show("newEpoch", f11, 4);
+    out.newEpochIdentity = s11.slots.every((x, k) => x === k);
+    /* 11. a snapshot with a repeated id: refused, the plain fish drawn, no error; then a good one: every fish installed again */
+    let f12 = make(all.slice(0, 100).concat([[5, base.ids[3], 0]]), E + 1000);
+    const s12 = await show("repeatedId", f12, 3, false);
+    let f13 = make(all.map(([i, id]) => [i, id, 8]), E + 1000), s13 = await show("afterRefusal", f13, 4);
+    synth = null; S.render = orig; await B.frames(3);
+    out.final = await B.textureParity();
+    out.final = { ok: out.final.ok, failures: out.final.failures };
+    return out;
+  });
+  report.parts.slots = r;
+  const st = r.steps, P = (x) => x.probe && x.probe.ok === true && x.probe.mismatches === 0 && x.probe.padding === 0 && x.probe.extraUploads === 0;
+  const none = (x) => x.uploads === 0 && x.calls === 0 && x.bytes === 0 && x.allocs === 0 && x.intercepted.calls === 0 && x.intercepted.allocs === 0;
+  check("the real world (2,048 fish, a new epoch): identity slots, then nothing uploaded frame after frame; exact", r.identity && st.same.n === 2048 && none(st.same) && P(st.same), st.same);
+  check("reversed draw order: every fish keeps its slot, no gene upload, exact", r.reversedKeeps && none(st.reversed) && P(st.reversed), st.reversed);
+  check("one died, one born with other genes: the birth takes the freed slot; one upload, one call, 256 bytes (intercepted too), no allocation; exact",
+        r.bornSlot === r.goneSlot && st.oneReplaced.uploads === 1 && st.oneReplaced.calls === 1 && st.oneReplaced.bytes === 256 && st.oneReplaced.intercepted.calls === 1 &&
+        st.oneReplaced.intercepted.bytes === 256 && st.oneReplaced.allocs === 0 && P(st.oneReplaced), { born: r.bornSlot, gone: r.goneSlot, step: st.oneReplaced });
+  const rects = JSON.stringify(st.rowPairs.intercepted.rects.slice().sort((a, b) => a[1] - b[1] || a[0] - b[0]));
+  check("the owners of slots 31, 32, 63, 64 replaced: one upload of four ranges, each inside a texture row (496,0 / 0,1 / 496,1 / 0,2, 16 texels), 1 KiB; exact",
+        st.rowPairs.uploads === 1 && st.rowPairs.calls === 4 && st.rowPairs.bytes === 1024 && rects === "[[496,0,16,1],[0,1,16,1],[496,1,16,1],[0,2,16,1]]" && P(st.rowPairs), { rects, step: st.rowPairs });
+  check("2,048 -> 2,049: one growth to 4,096 slots (a new texture, one 512 x 128 RGBA32F allocation), one whole 1 MiB upload, every survivor's slot kept; exact",
+        st.grow2049.capacity === 4096 && st.grow2049.allocs === 1 && st.grow2049.intercepted.allocs === 1 && !st.grow2049.sameTexture && st.grow2049.uploads === 1 &&
+        st.grow2049.bytes === 1048576 && st.grow2049.intercepted.bytes === 1048576 && r.survivorsKept && P(st.grow2049), st.grow2049);
+  check("  -> 2,500: no allocation, the 451 new slots only (451 x 256 bytes) in ranges; exact",
+        st.to2500.allocs === 0 && st.to2500.sameTexture && st.to2500.uploads === 1 && st.to2500.bytes === 451 * 256 && st.to2500.intercepted.bytes === 451 * 256 &&
+        st.to2500.calls === st.to2500.intercepted.calls && P(st.to2500), st.to2500);
+  check("the owners of slots 2047 and 2048 replaced: two ranges, the ends of rows 63 and 64; exact",
+        st.pair2047.calls === 2 && JSON.stringify(st.pair2047.intercepted.rects.slice().sort((a, b) => a[1] - b[1])) === "[[496,63,16,1],[0,64,16,1]]" && P(st.pair2047), st.pair2047);
+  const whole = (x) => x.uploads === 1 && x.calls === 1 && x.bytes === 1048576 && x.intercepted.calls === 1 && x.intercepted.bytes === 1048576 && x.allocs === 0 && x.intercepted.allocs === 0;
+  check("shrink to 1,000: no upload, no repacking (the survivors in place); refill to 2,500 (1,500 births: over an eighth of the texture): the freed slots reused, no growth, one whole upload; exact",
+        r.shrinkKeeps && none(st.shrink) && P(st.shrink) && st.refill.capacity === 4096 && st.refill.nextSlot === st.shrink.nextSlot && whole(st.refill) && P(st.refill),
+        { shrink: st.shrink, refill: st.refill });
+  check("detail 3 -> 2 -> 1 -> 3 and the colours (skin off, on): the same gene texture and slots, no gene upload; exact after",
+        r.qualityColour.uploads === 0 && r.qualityColour.allocs === 0 && r.qualityColour.sameTexture && r.qualityColour.quality === 3 && r.qualityColour.slotsSame && none(st.afterQuality) && P(st.afterQuality), r.qualityColour);
+  check("uploads held for frames with births: nothing lost; released, one upload of the outstanding slots; exact",
+        st.held.uploads === 0 && st.released.uploads === 1 && st.released.bytes === 3 * 256 && P(st.released), { held: st.held, released: st.released });
+  check("the dirty uploads' texture == the whole-texture policy's, every word of every fish (both exact); the full policy uploads 1 MiB every frame, the dirty one nothing",
+        r.dirtyVsFull.differing === 0 && r.dirtyVsFull.dirtyOk && r.dirtyVsFull.fullOk && r.dirtyVsFull.fullUploads >= 5 && r.dirtyVsFull.fullBytesPerUpload === 1048576 &&
+        r.dirtyVsFull.dirtyAgainUploads === 0, r.dirtyVsFull);
+  check("a Turbo-like turnover (every other fish replaced): one whole 1 MiB upload in one call (not hundreds of ranges), no allocation; exact",
+        whole(st.turnover) && P(st.turnover), st.turnover);
+  check("every fish's genes changed under its id: caught by the per-frame row check (review of #53, P3-4), every fish installed again (one whole upload); exact against the changed genes",
+        r.rowChanges >= 1 && whole(st.rowsChanged) && P(st.rowsChanged), { rowChanges: r.rowChanges, step: st.rowsChanged });
+  check("a new epoch with the same ids and other genes: every fish new (identity slots), one whole upload (no allocation); exact against the new genes",
+        r.newEpochIdentity && whole(st.newEpoch) && P(st.newEpoch), st.newEpoch);
+  check("a repeated id: refused, the plain fish drawn (no error); the good snapshot again: all reinstalled (one whole upload), exact",
+        st.repeatedId.drawn === false && /refused/.test(st.repeatedId.status) && st.afterRefusal.drawn === true && whole(st.afterRefusal) && P(st.afterRefusal),
+        { refused: { drawn: st.repeatedId.drawn, status: st.repeatedId.status }, after: st.afterRefusal });
+  check("the real snapshot again: exact", r.final.ok === true, r.final);
+  check("no console / page / network errors", L.errors.filter((e) => !/gene slots refused/.test(e)).length === 0, L.errors.slice(0, 5));
   await L.ctx.close();
 }
 
@@ -486,17 +748,27 @@ async function partFaults() {
   check("unmutated first: the production checks pass", clean.ok === true, pathSummary(clean));
   for (const m of ["row0", "nextRow", "slot", "partW"]) {
     const r = await L.page.evaluate((mm) => EvoOcean.scene.appearancePathCheck(null, null, { mutate: mm }), m);
-    pf["vertex_" + m] = { appearance: r.appearance.ok, recolour: r.recolour.ok, polishAppearance: r.polish.appearance.ok, polishRecolour: r.polish.recolour.ok, error: r.error,
+    pf["vertex_" + m] = { appearance: r.appearance.ok, recolour: r.recolour.ok, polishAppearance: r.polish.appearance.ok, polishRecolour: r.polish.recolour.ok,
+                          slots: [r.slots.permuted.ok, r.slots.sparse.ok], error: r.error,
                           worst: (r.appearance.templates && r.appearance.templates.medium.worst) || r.appearance.error };
-    check("vertex mutation " + m + ": compiles, runs, fails both colour modes, plain and polished",
+    check("vertex mutation " + m + ": compiles, runs, fails both colour modes, plain and polished" + (m === "partW" ? "" : ", and both slot maps"),
           !r.error && r.appearance.ok === false && r.recolour.ok === false && r.fragment.ok === true &&
-          r.polish.appearance.ok === false && r.polish.recolour.ok === false && r.polish.fragment.ok === true, pf["vertex_" + m]);
+          r.polish.appearance.ok === false && r.polish.recolour.ok === false && r.polish.fragment.ok === true &&
+          (m === "partW" || (r.slots.permuted.ok === false && r.slots.sparse.ok === false)), pf["vertex_" + m]);
+  }
+  /* the slot selector back on the draw index (before PR2): the identity map cannot see it, the permuted and sparse ones must */
+  {
+    const r = await L.page.evaluate(() => EvoOcean.scene.appearancePathCheck(null, null, { mutate: "drawIndex" }));
+    pf.vertex_drawIndex = { identity: r.appearance.ok, permuted: r.slots.permuted.ok, sparse: r.slots.sparse.ok, error: r.error,
+                            worst: r.slots.permuted.templates && r.slots.permuted.templates.medium.worst };
+    check("vertex mutation drawIndex (genes by gl_InstanceID): compiles, runs; the identity map passes, the permuted and sparse slot maps fail",
+          !r.error && r.appearance.ok === true && r.slots.permuted.ok === false && r.slots.sparse.ok === false, pf.vertex_drawIndex);
   }
   for (const m of ["swapRB", "branch"]) {
     const r = await L.page.evaluate((mm) => EvoOcean.scene.appearancePathCheck(null, null, { fsMutate: mm }), m);
     pf["fragment_" + m] = { fragment: r.fragment.ok, polishFragment: r.polish.fragment.ok, failures: r.fragment.failures, modes: r.fragment.modes, worst: r.fragment.worst, error: r.error };
     check("fragment mutation " + m + ": compiles, runs, fails, plain and polished",
-          !r.error && r.fragment.ok === false && r.polish.fragment.ok === false && r.appearance.ok && r.recolour.ok && r.polish.appearance.ok && r.polish.recolour.ok, pf["fragment_" + m]);
+          !r.error && r.fragment.ok === false && r.polish.fragment.ok === false && r.appearance.ok && r.recolour.ok && r.polish.appearance.ok && r.polish.recolour.ok && r.slots.ok, pf["fragment_" + m]);
   }
   const sw = await L.page.evaluate(() => EvoOcean.scene.appearancePathCheck(null, null, { injectSweep: true }));
   pf.injectSweep = { appearance: sw.appearance.sweep, recolour: sw.recolour.sweep };
@@ -770,7 +1042,13 @@ async function partGate() {
  * additive glow in the Family and Brain close-ups after the polished
  * programs drew in Appearance colours; no fish pixel: the fish programs and
  * inputs are main's). Then the polish on (switched): it must differ where a
- * fish is close (the comparison can see it). */
+ * fish is close (the comparison can see it).
+ * A main with the polish (after #48: its scene has setPolish; render PR2's
+ * reference) is captured twice too: "main" as it opens (the polish on, its
+ * default look) and "mainFresh" (plain from the start); then this site's
+ * look as it opens ("switched" before it is switched off) must be main's
+ * default look exactly, its plain programs from the start main's plain ones
+ * exactly, and switched off within the 1 / 255 tolerance of mainFresh. */
 const PLAIN_FROM_START = () => {
   Object.defineProperty(window, "EvoOceanScene", { configurable: true, get() { return undefined; }, set(v) {
     const c = v.create;
@@ -784,16 +1062,21 @@ const OFF_STATES = [
   { name: "family-close", cfg: { appearance: 3, walls: true }, colour: "family", cam: "close" },
   { name: "brain-close", cfg: { appearance: 3, walls: true }, colour: "brain", cam: "close" },
   { name: "plain-bodies-close", cfg: { appearance: 0, walls: true }, colour: "family", cam: "close" },
+  /* the close fish selected and the one nearest the view's centre hovered (render PR2's split copies their highlights into the lit draw) */
+  { name: "appearance-close-select-hover", cfg: { appearance: 3, walls: true }, colour: "appearance", cam: "close", pickHover: true },
   { name: "predators-wrapping", cfg: { appearance: 3, walls: false, predatorCount: 4 }, colour: "appearance", cam: "whole" }
 ];
 async function partOffImage() {
   console.log("== the polish off draws main's image, pixel for pixel (main " + MAIN_BASE + ")");
   if (!MAIN_BASE) { check("offimage: --main-base given", false); return; }
-  const VP = { width: 1280, height: 720 }, got = { main: {}, fresh: {}, switched: {} };
+  const VP = { width: 1280, height: 720 }, got = { main: {}, mainFresh: {}, fresh: {}, switched: {} };
   report.parts.offimage = { viewport: VP, states: {} };
-  for (const site of ["main", "fresh", "switched"]) {
-    const base = site === "main" ? MAIN_BASE : BASE;
-    const init = site === "fresh" ? "(" + AFTER_FRAME.toString() + ")(); (" + PLAIN_FROM_START.toString() + ")();" : AFTER_FRAME;
+  const sites = ["main", "fresh", "switched"];
+  let polishedMain = false;
+  for (let si = 0; si < sites.length; si++) {
+    const site = sites[si], ofMain = site === "main" || site === "mainFresh";
+    const base = ofMain ? MAIN_BASE : BASE;
+    const init = site === "fresh" || site === "mainFresh" ? "(" + AFTER_FRAME.toString() + ")(); (" + PLAIN_FROM_START.toString() + ")();" : AFTER_FRAME;
     const L = await launch("offimage-" + site, { viewport: VP, init });
     for (const st of OFF_STATES) {
       const c = caseFor(600, { config: Object.assign({}, st.cfg) });
@@ -807,33 +1090,68 @@ async function partOffImage() {
           let s = ""; for (let i = 0; i < px.length; i += 0x8000) s += String.fromCharCode.apply(null, px.subarray(i, i + 0x8000));
           res(btoa(s));
         }));
-        if (cand) S.setPolish(false);
+        if (cand === "fresh") S.setPolish(false);   /* (the init's already) */
         const orig = S.render;
         S.render = function (s, inf) { return orig.call(this, s, Object.assign({}, inf, { animT: 20.0 })); };
         await B.prepare(Object.assign({}, cd, { camera: "whole", colourMode: st.colour, settleMs: 200 }));
         await B.stepToTick(180);
         const s = B.snapshotCopy(), wW = EvoOcean.state().W, wH = EvoOcean.state().H;
+        let pick = -1;
         if (st.cam === "close") {
-          let pick = -1;
           for (let i = 0; i < s.n; i++) if (pick < 0 || s.ids[i] < s.ids[pick]) pick = i;
           const hp = (k) => [s.segs[12 * pick + 2 * k] - wW / 2, -s.depth[pick], s.segs[12 * pick + 2 * k + 1] - wH / 2];
           const h0 = hp(0), h2 = hp(2), mid = hp(1), fl = Math.hypot(h0[0] - h2[0], h0[2] - h2[2]) || 1, fx = (h0[0] - h2[0]) / fl, fz = (h0[2] - h2[2]) / fl;
           S.lookFrom([mid[0] - fz * 46 - fx * 8, mid[1] + 16, mid[2] + fx * 46 - fz * 8], mid);
         }
         S.setFlashlight(!!st.beam);
+        /* the close fish selected; hovered (a mouse pointermove on its head), the fish nearest the camera whose head is on the
+         * canvas (40 px in) and 40 px or more from every other fish's head on screen (so the pick is it) */
+        let pickHover = null;
+        if (st.pickHover) {
+          await B.frames(3);   /* (project() uses the last drawn frame's camera: after lookFrom) */
+          const cv = document.getElementById("tank"), rc = cv.getBoundingClientRect(), cam = S.view().pos;
+          const scr = [];
+          for (let i = 0; i < s.n; i++) scr.push(S.project(s, i));
+          let hov = -1, best = Infinity;
+          for (let i = 0; i < s.n; i++) {
+            const p = scr[i];
+            if (i === pick || !p || p.x < rc.left + 40 || p.x > rc.right - 40 || p.y < rc.top + 40 || p.y > rc.bottom - 40) continue;
+            if (scr.some((q, j) => j !== i && q && Math.hypot(q.x - p.x, q.y - p.y) < 40)) continue;
+            const d = Math.hypot(s.segs[12 * i] - wW / 2 - cam[0], -s.depth[i] - cam[1], s.segs[12 * i + 1] - wH / 2 - cam[2]);
+            if (d < best) { best = d; hov = i; }
+          }
+          EvoOcean.select(pick);
+          const hp = S.project(s, hov);
+          cv.dispatchEvent(new PointerEvent("pointermove", { clientX: hp.x, clientY: hp.y, pointerType: "mouse", bubbles: true }));
+          pickHover = { selected: pick, hovered: hov, at: [hp.x, hp.y] };
+        }
         await B.wait(2600);   /* the caustics' and the flashlight's fades */
         await B.frames(4);
         const out = { n: EvoOcean.state().n, pc: EvoOcean.state().pc, tick: EvoOcean.state().frame, view: S.view(), size: [W, H],
-                      polish: S.polish ? S.polish() : null, appearance: S.appearance(), off: await grab() };
+                      polishApi: !!S.setPolish, appearance: S.appearance(), pickHover };
+        if (pickHover) pickHover.hovering = document.getElementById("tank").style.cursor === "pointer";
+        /* switched: the page as it opens (its default look), then switched to plain */
+        if (cand === "switched") { out.polishOn0 = S.polish(); out.on0 = await grab(); S.setPolish(false); await B.wait(1500); await B.frames(4); }
+        out.polish = S.polish ? S.polish() : null;
+        out.off = await grab();
         if (cand === "switched") { S.setPolish(true); await B.wait(1500); await B.frames(4); out.polishOn = S.polish(); out.on = await grab(); }
+        /* render PR2's split (opt-in: setLitSplit(true)): the same frame with the lit fish drawn apart */
+        if (cand === "switched" && st.cam === "close" && S.setLitSplit) {
+          S.setLitSplit(true); await B.wait(300); await B.frames(4); out.polishOnSplit = S.polish(); out.onSplit = await grab();
+          if (pickHover) { const a = S.poseOf(pickHover.selected), b = S.poseOf(pickHover.hovered);
+                           out.pickApart = { selected: { weight: a.pose[3], apart: a.apart }, hovered: { weight: b.pose[3], apart: b.apart } }; }
+          S.setLitSplit(false); await B.frames(2);
+        }
         S.render = orig;
         return out;
-      }, [st, c, site === "main" ? false : site]);
+      }, [st, c, ofMain ? false : site]);
       got[site][st.name] = r;
     }
     check("offimage " + site + ": no console / page / network errors", L.errors.length === 0, L.errors.slice(0, 5));
     await L.ctx.close();
+    if (site === "main" && Object.values(got.main).every((x) => x.polishApi)) { polishedMain = true; sites.splice(si + 1, 0, "mainFresh"); }
   }
+  report.parts.offimage.polishedMain = polishedMain;
   function diff(a64, b64) {
     const a = Buffer.from(a64, "base64"), b = Buffer.from(b64, "base64");
     if (a.length !== b.length) return { sizeMismatch: [a.length, b.length] };
@@ -844,17 +1162,43 @@ async function partOffImage() {
     }
     return { pixels: a.length / 4, differing: px, maxDiff: max, sha: [crypto.createHash("sha256").update(a).digest("hex").slice(0, 16), crypto.createHash("sha256").update(b).digest("hex").slice(0, 16)] };
   }
-  const same = (m, c) => m.tick === c.tick && m.n === c.n && JSON.stringify(m.view) === JSON.stringify(c.view) && c.polish && c.polish.on === false;
+  const sameView = (m, c) => m.tick === c.tick && m.n === c.n && JSON.stringify(m.view) === JSON.stringify(c.view);
+  const same = (m, c) => sameView(m, c) && c.polish && c.polish.on === false;
   for (const st of OFF_STATES) {
-    const m = got.main[st.name], f = got.fresh[st.name], c = got.switched[st.name];
+    /* m: main's plain image (pre-polish main as it is; a polished main's plain from the start) */
+    const m = polishedMain ? got.mainFresh[st.name] : got.main[st.name], f = got.fresh[st.name], c = got.switched[st.name];
     const d0 = diff(m.off, f.off), d1 = diff(m.off, c.off), d2 = diff(m.off, c.on);
-    report.parts.offimage.states[st.name] = { main: { tick: m.tick, n: m.n, pc: m.pc, view: m.view, appearance: m.appearance },
-      fresh: { tick: f.tick, n: f.n, polish: f.polish }, switched: { tick: c.tick, n: c.n, pc: c.pc, view: c.view, polishOff: c.polish, polishOn: c.polishOn, appearance: c.appearance },
+    report.parts.offimage.states[st.name] = { main: { tick: m.tick, n: m.n, pc: m.pc, view: m.view, appearance: m.appearance, polish: m.polish },
+      fresh: { tick: f.tick, n: f.n, polish: f.polish }, switched: { tick: c.tick, n: c.n, pc: c.pc, view: c.view, polishOff: c.polish, polishOn: c.polishOn, polishOn0: c.polishOn0, appearance: c.appearance },
       mainVsFresh: d0, mainVsSwitched: d1, mainVsOn: d2 };
-    check("offimage " + st.name + ": the plain programs from the start == main, every RGBA8 pixel (tick " + m.tick + ", " + m.n + " fish, " + m.pc + " predators, same camera)",
+    if (polishedMain) {
+      /* the default look: this page as it opens (the polish on) == main's as it opens */
+      const md = got.main[st.name], dd = diff(md.off, c.on0);
+      report.parts.offimage.states[st.name].mainDefault = { polish: md.polish, view: md.view };
+      report.parts.offimage.states[st.name].defaultVsMain = dd;
+      check("offimage " + st.name + ": the look as the page opens (the polish on) == main's, every RGBA8 pixel (tick " + md.tick + ", " + md.n + " fish, " + md.pc + " predators, same camera)",
+            sameView(md, c) && md.polish && md.polish.on === true && c.polishOn0 && c.polishOn0.on === true && dd.differing === 0,
+            Object.assign({ main: md.polish && { variant: md.polish.variant, lit: md.polish.any }, pr2: c.polishOn0 && { variant: c.polishOn0.variant, lit: c.polishOn0.any, split: c.polishOn0.split, apart: c.polishOn0.litDrawn } }, dd));
+    }
+    check("offimage " + st.name + ": the plain programs from the start == main" + (polishedMain ? "'s plain programs from the start" : "") + ", every RGBA8 pixel (tick " + m.tick + ", " + m.n + " fish, " + m.pc + " predators, same camera)",
           same(m, f) && d0.differing === 0, d0);
     check("offimage " + st.name + ":   switched off at run time: within 1 / 255, on under 0.01 % of the pixels", same(m, c) && d1.maxDiff <= 1 && d1.differing <= d1.pixels * 1e-4, d1);
     if (st.cam === "close") check("offimage " + st.name + ":   and the polish on differs (the comparison can see it)", c.polishOn.on === true && d2.differing > 0, d2);
+    if (st.pickHover) {
+      check("offimage " + st.name + ":   the same fish selected and hovered on every site (the pointer on it), both lit and drawn apart by the split",
+            ["main", "fresh", "switched"].every((k) => got[k][st.name].pickHover && JSON.stringify(got[k][st.name].pickHover) === JSON.stringify(c.pickHover)) && c.pickHover.hovering &&
+            c.pickApart && c.pickApart.selected.weight > 0 && c.pickApart.hovered.weight > 0 && c.pickApart.selected.apart >= 0 && c.pickApart.hovered.apart >= 0,
+            { pick: c.pickHover, apart: c.pickApart });
+    }
+    if (st.cam === "close" && c.onSplit) {
+      /* the lit fish apart (the opt-in split) vs the default, the whole kind on the full programs: an unlit fish looks the same on either */
+      const d3 = diff(c.on, c.onSplit);
+      report.parts.offimage.states[st.name].splitVsUnsplit = Object.assign({ split: { split: c.polishOnSplit.split, litDrawn: c.polishOnSplit.litDrawn, lit: c.polishOnSplit.any, fish: c.polishOnSplit.fish },
+                                                                             unsplit: { split: c.polishOn.split, variant: c.polishOn.variant } }, d3);
+      check("offimage " + st.name + ":   the polish on with the lit fish apart (setLitSplit(true)) == the default (the whole kind on the full programs), every RGBA8 pixel",
+            (c.polishOnSplit.split === true || c.polishOnSplit.variant === "plain" || !(c.appearance && c.appearance.shapes)) && c.polishOn.split === false && d3.differing === 0,
+            report.parts.offimage.states[st.name].splitVsUnsplit);
+    }
   }
 }
 
@@ -956,11 +1300,19 @@ async function partPerfArms() {
         for (const arm of group) {
           const r = await L.page.evaluate(async ([arm, m, ms]) => {
             const S = EvoOcean.scene;
-            if (arm !== "main") { S.setPolish(arm === "on" ? true : arm === "off" ? false : arm); await EvoOcean.bench.wait(2500); }   /* a switch compiles once: settle */
+            if (arm !== "main") {   /* fullUp: the polish on, the whole gene texture uploaded every frame (PR2's slots, main's upload); split: the polish
+                                       on, the lit fish drawn apart (setLitSplit(true): opt-in) */
+              S.setPolish(arm === "on" || arm === "fullUp" || arm === "split" ? true : arm === "off" ? false : arm);
+              if (S.setGeneUploads) S.setGeneUploads(arm === "fullUp" ? "full" : "dirty");
+              if (S.setLitSplit) S.setLitSplit(arm === "split");
+              await EvoOcean.bench.wait(2500);   /* a switch compiles once: settle */
+            }
             const rp = EvoOcean.bench.rafProbe(ms), cap = EvoOcean.bench.capture(Object.assign({ durationMs: ms }, m));
             const out = { raf: await rp, cap: await cap };
+            const gt = S.geneTexture ? S.geneTexture() : null;
             out.state = { polish: S.polish ? S.polish() : null, quality: S.quality(), dpr: devicePixelRatio, drawingBuffer: S.contextInfo().drawingBuffer,
-                          view: S.view(), n: EvoOcean.state().n, tick: EvoOcean.state().frame, paused: EvoOcean.state().paused };
+                          view: S.view(), n: EvoOcean.state().n, tick: EvoOcean.state().frame, paused: EvoOcean.state().paused,
+                          genes: gt ? { policy: gt.policy || "full (before PR2)", capacity: gt.capacity, uploads: gt.uploads, bytes: gt.bytes } : null };
             return out;
           }, [arm, ARM_MODE, DUR]);
           const tag = `${key}_${arm}_${round}`;
@@ -971,7 +1323,9 @@ async function partPerfArms() {
           console.log(`  ${key} ${arm.padEnd(7)} r${round}: rAF ${r.raf.rafFps.toFixed(1)} fps (p95 ${r.raf.raf.p95.toFixed(2)} ms, >25ms ${(100 * r.raf.over25ms).toFixed(1)}%)` +
                       `, frameCpu p50 ${sm.spans.frameCpu.p50.toFixed(3)} p95 ${sm.spans.frameCpu.p95.toFixed(3)}, fishPack p50 ${sm.spans.fishPack.p50.toFixed(3)}` +
                       (g ? `, gpu p50 ${g.p50.toFixed(3)} p95 ${g.p95.toFixed(3)} (valid ${(100 * sm.gpu.validFraction).toFixed(0)}%)` : ", no gpu") +
-                      (r.state.polish ? `, polish ${r.state.polish.want}/${r.state.polish.variant || (r.state.polish.on ? "on" : "off")} lit ${r.state.polish.any}/${r.state.polish.fish} full ${r.state.polish.full}` : ", (main)"));
+                      (r.state.polish ? `, polish ${r.state.polish.want}/${r.state.polish.variant || (r.state.polish.on ? "on" : "off")} lit ${r.state.polish.any}/${r.state.polish.fish} full ${r.state.polish.full}` +
+                                        (r.state.polish.split !== undefined ? ` apart ${r.state.polish.split ? r.state.polish.litDrawn : "-"}` : "") : ", (main)") +
+                      (r.state.genes ? `, genes ${r.state.genes.policy}` : ""));
         }
         check(`perf ${key} r${round} ${site}: no console / page / network errors`, L.errors.length === 0, L.errors.slice(0, 5));
         await L.ctx.close();
@@ -980,7 +1334,7 @@ async function partPerfArms() {
   }
 }
 
-const RUN = { correctness: partCorrectness, noperf: partNoPerf, faults: partFaults, timer: partTimer, beam: partBeam, iframe: partIframe,
+const RUN = { correctness: partCorrectness, slots: partSlots, noperf: partNoPerf, faults: partFaults, timer: partTimer, beam: partBeam, iframe: partIframe,
               gate: partGate, offimage: partOffImage, perf: () => (ARMS ? partPerfArms() : partPerf()) };
 (async () => {
   for (const p of PARTS) {
