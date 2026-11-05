@@ -93,6 +93,7 @@
     ["texCapacity", "gene texture capacity, fish slots"],
     ["geneFull", "1 when a whole-texture gene upload was planned (new GPU storage, or the full policy)"],
     ["geneUploadCalls", "gene texSubImage2D calls of the consumed uploads (one per range, one for a whole upload)"],
+    ["litInst", "lit appearance fish drawn apart on the full programs (the split; the rest plain)"],
     ["gpuIssued", "GPU elapsed queries begun this frame"]
   ];
   var LABELS = ["frame", "fishBody", "barbels", "fishShadow", "predBody", "predShadow", "floor", "surface", "food", "snow", "other"];

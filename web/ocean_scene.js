@@ -65,7 +65,9 @@
  *     fish program has a plain variant, the fish exactly as before (its
  *     GLSL byte for byte, its cost), drawn at detail 1 and whenever no fish
  *     of its kind is lit (a whole-tank view: main's programs and cost; the
- *     roll scales with the size weight too, so nothing pops). Display only,
+ *     roll scales with the size weight too, so nothing pops); with a few
+ *     appearance fish lit (a close view), only those are drawn on the full
+ *     programs, apart, the rest plain (AppKind's split). Display only,
  *     like everything here
  *
  * Big tanks: the sand, caustics and surface are world-unit procedural
@@ -659,6 +661,19 @@
    * draw order is then free (gl_InstanceID no longer picks the genes). */
   var GENE_SLOT_RET = "return int(iGeneSlot);";
   var GENE_SLOT_GLSL = "attribute float iGeneSlot;\nint appearanceSlot() { " + GENE_SLOT_RET + " }";
+  /* The lit fish drawn apart (AppKind's split): in the main draw a lit
+   * fish's iBody.z (its highlight: 0, .5 or 1; read by the body programs
+   * only, never by the shadows) is LIT_SKIP, and the plain body program
+   * drawn beside the lit fish's own draw (litSkip: the plain vertex stage
+   * plus this one line) puts all its vertices on one point past the far
+   * plane, before any gene fetch: clipped, no fragment. The shadows stay in
+   * the main draw, in instance order */
+  var LIT_SKIP = -1;
+  var LIT_SKIP_GLSL = "  if (iBody.z < 0.0) { gl_Position = vec4(0.0, 0.0, 2.0, 1.0); return; }";
+  function litSkip(vs) {
+    if (occurrences(vs, "void main() {") !== 1) throw new Error("litSkip: the vertex stage has " + occurrences(vs, "void main() {") + " mains");
+    return vs.split("void main() {").join("void main() {\n" + LIT_SKIP_GLSL);
+  }
   /* the pattern genes of the fetched slot -> the flat pattern varyings (the
    * fish's vertex shader and the texture-backed chart probe) */
   var DECODE_CALL = "patternDecode(GT[0], GT[1], GT[2], GT[3], GT[4], GT[5], GT[6], GT[7].xyz, vec2(GT[7].w, GT[8].x), iX.z);";
@@ -2191,7 +2206,10 @@
      * only while one of its fish is lit (weight > 0) and for HOLD frames after
      * the last one (hysteresis: a fish at the 6 px threshold does not switch
      * the whole draw's cost every frame), and only once they are compiled
-     * (warm); plain otherwise. A gate per kind (the fish, the predators):
+     * (warm); plain otherwise. The appearance fish (render PR2, their genes in
+     * their own slots) then draw only the lit ones on the full programs, in a
+     * draw of their own, the rest on the plain ones (AppKind's split; unless
+     * more than half are lit). A gate per kind (the fish, the predators):
      * hold; lit, this frame's lit fish; posing, whether this frame packed the
      * swim poses (with no fish able to be lit, mayLight, nothing is
      * computed); and the last frame's extent of the fish (mayLight's). */
@@ -2350,6 +2368,8 @@
      * texture every frame, as before PR2, through the same slots: measurements
      * and the dirty-vs-full reference only; setGeneUploads) */
     var genePolicy = "dirty";
+    /* the lit fish drawn apart (AppKind's split): on; setLitSplit(false) for measurements */
+    var litSplit = true;
     function AppKind() {
       if (!SLOTS) throw new Error("web/ocean_appearance_slots.js not loaded");
       var gl0 = renderer.getContext(), maxTex = gl0.getParameter(gl0.MAX_TEXTURE_SIZE);
@@ -2380,11 +2400,29 @@
                                           transparent: true, depthWrite: true, depthFunc: THREE.LessDepth, side: THREE.DoubleSide });
       });
       var shMat = shMats[0];
+      /* The lit fish drawn apart (render PR2's stretch; option 2 of the #48
+       * review). While the full programs are due (settle) and at most half the
+       * fish are lit, the lit fish's bodies and barbels are copied into a small
+       * draw of their own (lit: its own instance buffers, the same gene
+       * texture through their slots) on the full programs, and the main draw
+       * keeps every fish in snapshot order on the plain body program plus one
+       * line (litSkip: an instance whose iBody.z is the LIT_SKIP sentinel is
+       * clipped before any gene fetch): so a close view's few lit fish no
+       * longer put every other fish on the full programs. The shadows are not
+       * split: every fish's in the main draw on the lite shadow program, as
+       * without the split. An unlit fish looks the same on either body
+       * program (the roll, the fold and the polish terms scale with its size
+       * weight, 0). setLitSplit(false): the whole kind on the full programs,
+       * as before (measurements). */
+      var matSkip = new THREE.ShaderMaterial({ vertexShader: litSkip(sh.vs), fragmentShader: sh.fs, uniforms: U, side: THREE.DoubleSide });
       /* cap: the draw's capacity (instance buffers); slots.capacity: the gene texture's (gene slots) */
       var self = { cap: 0, n: 0, lod: "", attrs: null, geo: null, bgeo: null, mesh: null, bmesh: null, shadow: null,
-                   tex: null, texData: null, slots: slots, pending: null, slotAttrFresh: false, last: null,
+                   tex: null, texData: null, slots: slots, pending: null, slotAttrFresh: false, last: null, litIdx: new Int32Array(0),
+                   lit: { cap: 0, n: 0, on: false, lod: "", attrs: null, geo: null, bgeo: null, mesh: null, bmesh: null, bytes: 0 },
                    mat: mat, shaders: sh, barbels: false, tpls: tpls, barbTpl: barbTpl, bytes: 0 };
-      self.warm = Warm([mats[1], shMats[1]], function () { return self.geo; });   /* its polished programs (warmUp) */
+      var lit = self.lit;
+      /* its polished programs and the split's plain body one with the skip (warmUp) */
+      self.warm = Warm([mats[1], shMats[1], matSkip], function () { return self.geo; });
       var INST = ["iA", "iB", "iC", "iBody", "iX", "iGeneSlot"];
       self.inst = INST;   /* the instance attributes the probes share (iGeneSlot: the slots they read through) */
       /* three uploaded the gene texture (DataTexture.onUpdate, after its
@@ -2447,8 +2485,65 @@
         }
         setRings(tpls[lod]);
         self.geo = g; self.bgeo = bg; self.attrs = at; self.cap = cap; self.lod = lod;
+        if (self.litIdx.length < cap) self.litIdx = new Int32Array(cap);
         self.slotAttrFresh = true;   /* the slots are written into the new iGeneSlot: upload it */
       }
+      /* the lit draw's instance buffers (cap fish) and geometries (body, barbels; their shadows stay in the main draw) */
+      function rebuildLit(cap, lod) {
+        var at = {};
+        INST.forEach(function (name) {
+          var k = name === "iGeneSlot" ? 1 : 4;
+          var a = new THREE.InstancedBufferAttribute(new Float32Array(cap * k), k);
+          a.setUsage(THREE.DynamicDrawUsage);
+          at[name] = a;
+        });
+        var g = geometry(tpls[lod], at), bg = barbTpl ? geometry(barbTpl, at) : null;
+        if (lit.geo) {
+          lit.geo.dispose(); if (lit.bgeo) lit.bgeo.dispose();
+          lit.mesh.geometry = g;
+          if (lit.bmesh && bg) lit.bmesh.geometry = bg;
+        } else {
+          lit.mesh = new THREE.Mesh(g, mats[1]);
+          lit.mesh.frustumCulled = false; lit.mesh.renderOrder = 2; lit.mesh.visible = false;
+          scene.add(lit.mesh);
+          profiler.watch(lit.mesh, "fishBody");
+          if (bg) {
+            lit.bmesh = new THREE.Mesh(bg, mats[1]);
+            lit.bmesh.frustumCulled = false; lit.bmesh.renderOrder = 2; lit.bmesh.visible = false;
+            scene.add(lit.bmesh);
+            profiler.watch(lit.bmesh, "barbels");
+          }
+        }
+        lit.geo = g; lit.bgeo = bg; lit.attrs = at; lit.cap = cap; lit.lod = lod;
+      }
+      /* the k lit fish (litIdx: their draw indices, fillApp's) into the lit
+       * draw, in their order; their main instances get the skip sentinel in
+       * iBody.z (after the copy: the lit draw keeps their highlight; the
+       * main shadow draw never reads it) */
+      function drawLit(k, barbels) {
+        if (k > lit.cap || self.lod !== lit.lod) { var cap = Math.max(64, lit.cap); while (cap < k) cap *= 2; rebuildLit(cap, self.lod); }
+        var m = self.attrs, L = lit.attrs, idx = self.litIdx;
+        var mA = m.iA.array, mB = m.iB.array, mC = m.iC.array, mY = m.iBody.array, mX = m.iX.array, mS = m.iGeneSlot.array;
+        var lA = L.iA.array, lB = L.iB.array, lC = L.iC.array, lY = L.iBody.array, lX = L.iX.array, lS = L.iGeneSlot.array;
+        for (var j = 0; j < k; j++) {
+          var c = idx[j], o = 4 * c, q = 4 * j;
+          for (var t = 0; t < 4; t++) { lA[q + t] = mA[o + t]; lB[q + t] = mB[o + t]; lC[q + t] = mC[o + t]; lY[q + t] = mY[o + t]; lX[q + t] = mX[o + t]; }
+          lS[j] = mS[c];
+          mY[o + 2] = LIT_SKIP;
+        }
+        lit.n = k; lit.on = true;
+        lit.geo.instanceCount = k;
+        if (lit.bgeo) lit.bgeo.instanceCount = k;
+        lit.bytes = commitInstances(L, k);
+        lit.mesh.visible = k > 0;
+        if (lit.bmesh) lit.bmesh.visible = k > 0 && !!barbels && self.lod === "medium";
+      }
+      function hideLit() {
+        lit.n = 0; lit.on = false; lit.bytes = 0;
+        if (lit.mesh) { lit.mesh.visible = false; if (lit.bmesh) lit.bmesh.visible = false; }
+      }
+      /* draw index c's lit-draw index, or -1 (tests: poseOf) */
+      self.litIndexOf = function (c) { for (var j = 0; j < lit.n; j++) if (self.litIdx[j] === c) return j; return -1; };
       /* the gene texture over the slots' storage: new GPU storage (one whole
        * upload) the first time and whenever the slots' storage grew; the
        * uniform then names the new texture before the old one is disposed */
@@ -2492,15 +2587,20 @@
         return r;
       };
       /* v: the programs drawn (settle; fillApp packed the swim pose in iBody.w
-       * for 1); slotsMoved: reconcile's changed (iGeneSlot is uploaded only then) */
-      self.commit = function (n, barbels, v, slotsMoved) {
+       * for 1); slotsMoved: reconcile's changed (iGeneSlot is uploaded only
+       * then); nLit: how many fish fillApp lit (litIdx). With v 1 and at most
+       * half the fish lit, the split (above): the lit fish's own draw on the
+       * full programs, the main one on the plain programs with the skip */
+      self.commit = function (n, barbels, v, slotsMoved, nLit) {
+        var split = v === 1 && litSplit && nLit * 2 <= n;
+        if (split) drawLit(nLit, barbels); else hideLit();
         self.n = n;
         self.geo.instanceCount = n;
         if (self.bgeo) self.bgeo.instanceCount = n;
-        self.bytes = commitInstances(self.attrs, n, slotsMoved || self.slotAttrFresh ? null : "iGeneSlot");
+        self.bytes = commitInstances(self.attrs, n, slotsMoved || self.slotAttrFresh ? null : "iGeneSlot") + lit.bytes;
         self.slotAttrFresh = false;
-        self.mesh.material = mats[v || 0]; self.shadow.material = shMats[v ? 1 : 0];
-        if (self.bmesh) self.bmesh.material = mats[v || 0];
+        self.mesh.material = split ? matSkip : mats[v || 0]; self.shadow.material = shMats[v ? 1 : 0];
+        if (self.bmesh) self.bmesh.material = split ? matSkip : mats[v || 0];
         /* the gene texture's upload: the slots' plan, if any (none: the
          * texture's version stays, three uploads nothing); "full" policy: the
          * whole texture every frame */
@@ -2524,8 +2624,9 @@
         self.shadow.visible = n > 0 && quality >= 2;
         if (self.bmesh) self.bmesh.visible = n > 0 && !!barbels && self.lod === "medium";
       };
-      self.hide = function () { if (self.mesh) { self.mesh.visible = self.shadow.visible = false; if (self.bmesh) self.bmesh.visible = false; } };
-      self.variant = function () { return self.mesh ? mats.indexOf(self.mesh.material) : 0; };
+      self.hide = function () { if (self.mesh) { self.mesh.visible = self.shadow.visible = false; if (self.bmesh) self.bmesh.visible = false; } hideLit(); };
+      /* 1: the full programs drawn (all the fish, or the lit ones apart: lit.on) */
+      self.variant = function () { return self.mesh ? (self.mesh.material === matSkip ? 1 : mats.indexOf(self.mesh.material)) : 0; };
       return self;
     }
 
@@ -3002,7 +3103,7 @@
     function fillApp(s, selIdx, hovIdx, rec) {
       var n = s.n, pose = polishNow();
       var at = appKind.attrs;
-      var A = at.iA.array, B = at.iB.array, Cc = at.iC.array, BODY = at.iBody.array, X = at.iX.array;
+      var A = at.iA.array, B = at.iB.array, Cc = at.iC.array, BODY = at.iBody.array, X = at.iX.array, LIT = appKind.litIdx;
       var segs = s.segs, cols = s.colors, body = s.body, ids = s.ids, depth = s.depth, vz = s.vz;
       if (!heights || heights.length < n) heights = new Float32Array(Math.max(n, 2048));
       var xs = SX, ys = SY;
@@ -3071,7 +3172,7 @@
             }
             SP1.ids[sk] = id; SP1.x[sk] = hx; SP1.y[sk] = hy; SP1.v[sk] = sv; sk++;
             poseCount(BODY[o + 3] = posePack(xs, ys, sv, qw));
-            lit++;
+            LIT[lit++] = c;   /* (the split's lit draw, commit) */
           } else BODY[o + 3] = POSE0;
         }
       }
@@ -3081,13 +3182,14 @@
       var tanHalf = Math.tan(camera.fov * Math.PI / 360);
       appKind.mat.uniforms.uPxPerUnit.value = ch / (2 * tanHalf);
       appKind.mat.uniforms.uColourBy.value = appSkin ? 0 : 1;
-      appKind.commit(n, rec.hasBarbels, settle(gt, pose, lit, appKind.warm.ready), rec.changed);
+      appKind.commit(n, rec.hasBarbels, settle(gt, pose, lit, appKind.warm.ready), rec.changed, lit);
       if (profiler.active) {
         var tp = appKind.tpls[appKind.lod], ST = EA.STRIDE;
         profiler.count(PK.lod, appKind.lod === "medium" ? 2 : 1); profiler.count(PK.bodyInst, n);
         profiler.count(PK.shadowInst, appKind.shadow.visible ? n : 0); profiler.count(PK.barbelInst, appKind.bmesh && appKind.bmesh.visible ? n : 0);
         profiler.count(PK.tplVerts, tp.verts); profiler.count(PK.tplTris, tp.idx.length / 3);
         profiler.count(PK.geneSrcBytes, rec.newRows * ST * 4); profiler.count(PK.genePadBytes, rec.newRows * (64 - ST) * 4);
+        profiler.count(PK.litInst, appKind.lit.n);
       }
     }
     var appDrawn = false;   /* this frame drew the appearance fish (the probes need it) */
@@ -3840,10 +3942,13 @@
      * ready: the polished programs are compiled (warmUp)) and what its fish got */
     function setPolish(on) { polishWant = on === "ungated" || on === "zero" ? on : (on === false || on === "off" ? "off" : "on"); }
     var VARIANT = ["plain", "full"];
+    /* split: the appearance fish's lit ones drawn apart on the full programs
+     * (litDrawn of them), the rest on the plain ones (AppKind's split) */
     function polishState() {
       var k = appKind && appDrawn ? appKind : fish;
       return { want: polishWant, on: polishNow(), gated: polishWant !== "ungated", quality: quality,
-               variant: VARIANT[k.variant()], hold: gateFish.hold, posing: gateFish.posing, bound: gateFish.bound,
+               variant: VARIANT[k.variant()], split: k === appKind && appKind.lit.on, litDrawn: k === appKind ? appKind.lit.n : 0, splitEnabled: litSplit,
+               hold: gateFish.hold, posing: gateFish.posing, bound: gateFish.bound,
                ready: (k === fish ? warmFish : appKind.warm).ready,
                fish: poseLast.fish, any: poseLast.any, full: poseLast.full, meanWeight: poseLast.fish ? poseLast.sum / poseLast.fish : 0,
                preds: { n: preds.n, variant: VARIANT[preds.variant()], lit: gatePred.lit, hold: gatePred.hold },
@@ -4000,7 +4105,8 @@
       poseOf: function (i) {
         var app = appDrawn && appKind, at = app ? appKind.attrs : fish.attrs, o = 4 * i, A = at.iA.array, B = at.iB.array, Cc = at.iC.array;
         var raw = app ? at.iBody.array[o + 3] : at.iX.array[o + 1], posed = gateFish.posing;
-        return { pose: unpackPose(posed ? raw : POSE0), packed: raw, posed: posed,
+        var litAt = app && at.iBody.array[o + 2] < 0 ? appKind.litIndexOf(i) : -1;   /* drawn apart (the split: its lit-draw index) */
+        return { pose: unpackPose(posed ? raw : POSE0), packed: raw, posed: posed, apart: litAt,
                  R: at.iBody.array[o], y: at.iBody.array[o + 1], vz: at.iX.array[o], lam: app ? at.iX.array[o + 2] : 1, reach: app ? REACH_APP : fish.reach,
                  spine: [A[o], A[o + 1], A[o + 2], A[o + 3], B[o], B[o + 1], B[o + 2], B[o + 3], Cc[o], Cc[o + 1], Cc[o + 2], Cc[o + 3]] };
       },
@@ -4043,6 +4149,10 @@
        * whole texture every frame, through the same slots: measurements and
        * the dirty-vs-full reference only) */
       setGeneUploads: function (p) { genePolicy = p === "full" ? "full" : "dirty"; },
+      /* the lit appearance fish drawn apart on the full programs, the rest
+       * plain (on: the default); off, the whole kind on the full programs
+       * while any is lit, as before (measurements) */
+      setLitSplit: function (on) { litSplit = on !== false; },
       testFaults: testFaults,
       /* the drawing context: renderer strings, extensions, attributes, drawing buffer */
       contextInfo: contextInfo,
