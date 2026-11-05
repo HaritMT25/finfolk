@@ -12,7 +12,8 @@
 //        queries every 6th) with rAF timestamps: main (--main-base's site: before the polish), off / on /
 //        ungated / zero (this site with scene.setPolish false / true / "ungated": every fish at full weight, the
 //        reference that shows what the size gate saves; "zero": every weight 0, so none lit: the plain programs; "fullUp": the polish on with
-//        the whole gene texture uploaded every frame, as before render PR2). Per cell, each round runs the arms in order
+//        the whole gene texture uploaded every frame, as before render PR2; "nosplit": the polish on, the whole kind on the full programs
+//        while any fish is lit, as before PR2's split). Per cell, each round runs the arms in order
 //        (reversed on odd rounds, so drift cancels), a fresh page per site, a warm-up after each load and a
 //        settle after each switch; every observation records the arm, the effective polish state
 //        (scene.polish(): programs, gate, the last frame's weights), quality, DPR, the drawing buffer, the
@@ -160,7 +161,7 @@ const GATE_CHECK = async (label) => {
   for (let k = 0; k < 3; k++) await new Promise((res) => requestAnimationFrame(res));   /* (no bench in a plain page) */
   const G = S.poseCamera(), st = S.polish(), n = EvoOcean.state().n, V = G.view, P = G.proj;
   const rect = document.getElementById("tank").getBoundingClientRect();
-  const out = { label, n, maxErr: 0, worst: null, below: 0, mid: 0, above: 0, outside: 0, nonFinite: 0, badRoll: 0, posed: 0,
+  const out = { label, n, maxErr: 0, worst: null, below: 0, mid: 0, above: 0, outside: 0, nonFinite: 0, badRoll: 0, posed: 0, apart: 0, apartUnlit: 0,
                 canvasCss: [rect.width, rect.height], drawingBuffer: G.drawingBuffer, dpr: devicePixelRatio, focalCss: G.focalCss, state: st };
   const clip = (q) => { const w = P[3] * q[0] + P[7] * q[1] + P[11] * q[2] + P[15];
     return [(P[0] * q[0] + P[4] * q[1] + P[8] * q[2] + P[12]) / w, (P[1] * q[0] + P[5] * q[1] + P[9] * q[2] + P[13]) / w]; };
@@ -171,6 +172,7 @@ const GATE_CHECK = async (label) => {
   for (let i = 0; i < n; i++) {
     const f = S.poseOf(i), p = f.pose;
     if (f.posed) out.posed++;
+    if (f.apart >= 0) { out.apart++; if (!(p[3] > 0)) out.apartUnlit++; }   /* drawn apart (render PR2's split): lit fish only */
     if (!p.every(Number.isFinite)) { out.nonFinite++; continue; }
     if (Math.abs(p[0] * p[0] + p[1] * p[1] - 1) > 1e-5 || Math.abs(Math.atan2(p[0], p[1])) > 0.6 * p[3] + 2e-3) out.badRoll++;
     const xs = [0, 2, 4, 6, 8, 10].map((k) => f.spine[k]), ys = [1, 3, 5, 7, 9, 11].map((k) => f.spine[k]);
@@ -371,6 +373,13 @@ async function partCorrectness() {
         gi.focalCss !== gf.focalCss && gz.outside < gf.outside, { focal: [gf.focalCss, gi.focalCss], outside: [gf.outside, gi.outside, gz.outside], mean: [gf.state.meanWeight, gi.state.meanWeight, gz.state.meanWeight] });
   check("  ungated: every fish at full weight; off: the plain programs (no weights)",
         gu.state.gated === false && gu.state.full === gu.state.fish && gu.state.fish === 2500 && goff.on === false && goff.any === 0 && goff.variant === "plain", { ungated: gu.state, off: goff });
+  /* render PR2's split: close up, the lit fish (and only they) drawn apart on the full programs, the rest plain; every fish lit
+   * (ungated): no split (the whole kind on the full programs); the whole view: nothing apart */
+  check("  close up: the lit fish drawn apart on the full programs (each one lit, all of them), the rest plain; ungated (all lit): no split; whole view: none apart",
+        gf.state.split === true && gf.state.litDrawn === gf.state.any && gf.apart === gf.state.any && gf.apartUnlit === 0 && gf.state.any > 0 && gf.state.any * 2 <= gf.n &&
+        gu.state.split === false && gu.state.litDrawn === 0 && gw.apart === 0 && gw.state.litDrawn === 0,
+        { follow: { split: gf.state.split, litDrawn: gf.state.litDrawn, lit: gf.state.any, apart: gf.apart, apartUnlit: gf.apartUnlit, n: gf.n },
+          ungated: { split: gu.state.split, litDrawn: gu.state.litDrawn }, whole: { apart: gw.apart, litDrawn: gw.state.litDrawn } });
   /* hysteresis: from the close view (lit fish, full programs) straight to the whole view (none lit): the full programs are
    * held 30 frames, then main's plain ones for good; frame by frame, no switching back and forth */
   const hy = await L.page.evaluate(async () => {
@@ -433,7 +442,7 @@ async function partCorrectness() {
   const UPLOADS = async (stepTo) => {
     const S = EvoOcean.scene, io0 = S.geneTexture();
     window.__up.reset(); window.__up.on = true;
-    const dur = stepTo ? 9000 : 2000, t0 = performance.now();
+    const dur = stepTo ? 16000 : 2000, t0 = performance.now();   /* (a loaded machine steps 64 ticks of 2,500 fish in ~1 s) */
     const capP = EvoOcean.bench.capture({ durationMs: dur, cpu: true, gpu: "off", drainMs: 0, raw: true });
     let stepMs = 0;
     if (stepTo) { await EvoOcean.bench.wait(300); await EvoOcean.bench.stepToTick(EvoOcean.state().frame + stepTo); await EvoOcean.bench.frames(3); stepMs = performance.now() - t0; }
@@ -454,7 +463,7 @@ async function partCorrectness() {
              capacity: io1.capacity, slots: io1.slots, textureBytes: io1.data.byteLength };
   };
   const still = await L.page.evaluate(UPLOADS, 0);
-  const moving = await L.page.evaluate(UPLOADS, 640);
+  const moving = await L.page.evaluate(UPLOADS, 512);
   const movingTex = await L.page.evaluate(() => EvoOcean.bench.textureParity());
   report.parts.correctness.uploads = { paused: still, stepping: moving };
   parity.texture_afterBirths = texSummary(movingTex);
@@ -997,7 +1006,13 @@ async function partGate() {
  * additive glow in the Family and Brain close-ups after the polished
  * programs drew in Appearance colours; no fish pixel: the fish programs and
  * inputs are main's). Then the polish on (switched): it must differ where a
- * fish is close (the comparison can see it). */
+ * fish is close (the comparison can see it).
+ * A main with the polish (after #48: its scene has setPolish; render PR2's
+ * reference) is captured twice too: "main" as it opens (the polish on, its
+ * default look) and "mainFresh" (plain from the start); then this site's
+ * look as it opens ("switched" before it is switched off) must be main's
+ * default look exactly, its plain programs from the start main's plain ones
+ * exactly, and switched off within the 1 / 255 tolerance of mainFresh. */
 const PLAIN_FROM_START = () => {
   Object.defineProperty(window, "EvoOceanScene", { configurable: true, get() { return undefined; }, set(v) {
     const c = v.create;
@@ -1016,11 +1031,14 @@ const OFF_STATES = [
 async function partOffImage() {
   console.log("== the polish off draws main's image, pixel for pixel (main " + MAIN_BASE + ")");
   if (!MAIN_BASE) { check("offimage: --main-base given", false); return; }
-  const VP = { width: 1280, height: 720 }, got = { main: {}, fresh: {}, switched: {} };
+  const VP = { width: 1280, height: 720 }, got = { main: {}, mainFresh: {}, fresh: {}, switched: {} };
   report.parts.offimage = { viewport: VP, states: {} };
-  for (const site of ["main", "fresh", "switched"]) {
-    const base = site === "main" ? MAIN_BASE : BASE;
-    const init = site === "fresh" ? "(" + AFTER_FRAME.toString() + ")(); (" + PLAIN_FROM_START.toString() + ")();" : AFTER_FRAME;
+  const sites = ["main", "fresh", "switched"];
+  let polishedMain = false;
+  for (let si = 0; si < sites.length; si++) {
+    const site = sites[si], ofMain = site === "main" || site === "mainFresh";
+    const base = ofMain ? MAIN_BASE : BASE;
+    const init = site === "fresh" || site === "mainFresh" ? "(" + AFTER_FRAME.toString() + ")(); (" + PLAIN_FROM_START.toString() + ")();" : AFTER_FRAME;
     const L = await launch("offimage-" + site, { viewport: VP, init });
     for (const st of OFF_STATES) {
       const c = caseFor(600, { config: Object.assign({}, st.cfg) });
@@ -1034,7 +1052,7 @@ async function partOffImage() {
           let s = ""; for (let i = 0; i < px.length; i += 0x8000) s += String.fromCharCode.apply(null, px.subarray(i, i + 0x8000));
           res(btoa(s));
         }));
-        if (cand) S.setPolish(false);
+        if (cand === "fresh") S.setPolish(false);   /* (the init's already) */
         const orig = S.render;
         S.render = function (s, inf) { return orig.call(this, s, Object.assign({}, inf, { animT: 20.0 })); };
         await B.prepare(Object.assign({}, cd, { camera: "whole", colourMode: st.colour, settleMs: 200 }));
@@ -1051,16 +1069,26 @@ async function partOffImage() {
         await B.wait(2600);   /* the caustics' and the flashlight's fades */
         await B.frames(4);
         const out = { n: EvoOcean.state().n, pc: EvoOcean.state().pc, tick: EvoOcean.state().frame, view: S.view(), size: [W, H],
-                      polish: S.polish ? S.polish() : null, appearance: S.appearance(), off: await grab() };
+                      polishApi: !!S.setPolish, appearance: S.appearance() };
+        /* switched: the page as it opens (its default look), then switched to plain */
+        if (cand === "switched") { out.polishOn0 = S.polish(); out.on0 = await grab(); S.setPolish(false); await B.wait(1500); await B.frames(4); }
+        out.polish = S.polish ? S.polish() : null;
+        out.off = await grab();
         if (cand === "switched") { S.setPolish(true); await B.wait(1500); await B.frames(4); out.polishOn = S.polish(); out.on = await grab(); }
+        /* render PR2's split: the same frame with the whole kind on the full programs (as before the split) */
+        if (cand === "switched" && st.cam === "close" && S.setLitSplit) {
+          S.setLitSplit(false); await B.frames(4); out.polishOnUnsplit = S.polish(); out.onUnsplit = await grab(); S.setLitSplit(true); await B.frames(2);
+        }
         S.render = orig;
         return out;
-      }, [st, c, site === "main" ? false : site]);
+      }, [st, c, ofMain ? false : site]);
       got[site][st.name] = r;
     }
     check("offimage " + site + ": no console / page / network errors", L.errors.length === 0, L.errors.slice(0, 5));
     await L.ctx.close();
+    if (site === "main" && Object.values(got.main).every((x) => x.polishApi)) { polishedMain = true; sites.splice(si + 1, 0, "mainFresh"); }
   }
+  report.parts.offimage.polishedMain = polishedMain;
   function diff(a64, b64) {
     const a = Buffer.from(a64, "base64"), b = Buffer.from(b64, "base64");
     if (a.length !== b.length) return { sizeMismatch: [a.length, b.length] };
@@ -1071,17 +1099,38 @@ async function partOffImage() {
     }
     return { pixels: a.length / 4, differing: px, maxDiff: max, sha: [crypto.createHash("sha256").update(a).digest("hex").slice(0, 16), crypto.createHash("sha256").update(b).digest("hex").slice(0, 16)] };
   }
-  const same = (m, c) => m.tick === c.tick && m.n === c.n && JSON.stringify(m.view) === JSON.stringify(c.view) && c.polish && c.polish.on === false;
+  const sameView = (m, c) => m.tick === c.tick && m.n === c.n && JSON.stringify(m.view) === JSON.stringify(c.view);
+  const same = (m, c) => sameView(m, c) && c.polish && c.polish.on === false;
   for (const st of OFF_STATES) {
-    const m = got.main[st.name], f = got.fresh[st.name], c = got.switched[st.name];
+    /* m: main's plain image (pre-polish main as it is; a polished main's plain from the start) */
+    const m = polishedMain ? got.mainFresh[st.name] : got.main[st.name], f = got.fresh[st.name], c = got.switched[st.name];
     const d0 = diff(m.off, f.off), d1 = diff(m.off, c.off), d2 = diff(m.off, c.on);
-    report.parts.offimage.states[st.name] = { main: { tick: m.tick, n: m.n, pc: m.pc, view: m.view, appearance: m.appearance },
-      fresh: { tick: f.tick, n: f.n, polish: f.polish }, switched: { tick: c.tick, n: c.n, pc: c.pc, view: c.view, polishOff: c.polish, polishOn: c.polishOn, appearance: c.appearance },
+    report.parts.offimage.states[st.name] = { main: { tick: m.tick, n: m.n, pc: m.pc, view: m.view, appearance: m.appearance, polish: m.polish },
+      fresh: { tick: f.tick, n: f.n, polish: f.polish }, switched: { tick: c.tick, n: c.n, pc: c.pc, view: c.view, polishOff: c.polish, polishOn: c.polishOn, polishOn0: c.polishOn0, appearance: c.appearance },
       mainVsFresh: d0, mainVsSwitched: d1, mainVsOn: d2 };
-    check("offimage " + st.name + ": the plain programs from the start == main, every RGBA8 pixel (tick " + m.tick + ", " + m.n + " fish, " + m.pc + " predators, same camera)",
+    if (polishedMain) {
+      /* the default look: this page as it opens (the polish on) == main's as it opens */
+      const md = got.main[st.name], dd = diff(md.off, c.on0);
+      report.parts.offimage.states[st.name].mainDefault = { polish: md.polish, view: md.view };
+      report.parts.offimage.states[st.name].defaultVsMain = dd;
+      check("offimage " + st.name + ": the look as the page opens (the polish on) == main's, every RGBA8 pixel (tick " + md.tick + ", " + md.n + " fish, " + md.pc + " predators, same camera)",
+            sameView(md, c) && md.polish && md.polish.on === true && c.polishOn0 && c.polishOn0.on === true && dd.differing === 0,
+            Object.assign({ main: md.polish && { variant: md.polish.variant, lit: md.polish.any }, pr2: c.polishOn0 && { variant: c.polishOn0.variant, lit: c.polishOn0.any, split: c.polishOn0.split, apart: c.polishOn0.litDrawn } }, dd));
+    }
+    check("offimage " + st.name + ": the plain programs from the start == main" + (polishedMain ? "'s plain programs from the start" : "") + ", every RGBA8 pixel (tick " + m.tick + ", " + m.n + " fish, " + m.pc + " predators, same camera)",
           same(m, f) && d0.differing === 0, d0);
     check("offimage " + st.name + ":   switched off at run time: within 1 / 255, on under 0.01 % of the pixels", same(m, c) && d1.maxDiff <= 1 && d1.differing <= d1.pixels * 1e-4, d1);
     if (st.cam === "close") check("offimage " + st.name + ":   and the polish on differs (the comparison can see it)", c.polishOn.on === true && d2.differing > 0, d2);
+    if (st.cam === "close" && c.onUnsplit) {
+      /* the lit fish apart (split) vs the whole kind on the full programs: an unlit fish looks the same in either program */
+      const d3 = diff(c.onUnsplit, c.on);
+      report.parts.offimage.states[st.name].splitVsUnsplit = Object.assign({ split: { split: c.polishOn.split, litDrawn: c.polishOn.litDrawn, lit: c.polishOn.any, fish: c.polishOn.fish },
+                                                                             unsplit: { split: c.polishOnUnsplit.split, variant: c.polishOnUnsplit.variant } }, d3);
+      check("offimage " + st.name + ":   the polish on with the lit fish apart (split) == the whole kind on the full programs, within 1 / 255 on under 0.1 % of the pixels",
+            (c.polishOn.split === true || c.polishOn.variant === "plain" || !(c.appearance && c.appearance.shapes)) && c.polishOnUnsplit.split === false &&
+            d3.maxDiff <= 1 && d3.differing <= d3.pixels * 1e-3,
+            report.parts.offimage.states[st.name].splitVsUnsplit);
+    }
   }
 }
 
@@ -1183,9 +1232,11 @@ async function partPerfArms() {
         for (const arm of group) {
           const r = await L.page.evaluate(async ([arm, m, ms]) => {
             const S = EvoOcean.scene;
-            if (arm !== "main") {   /* fullUp: the polish on, the whole gene texture uploaded every frame (PR2's slots, main's upload) */
-              S.setPolish(arm === "on" || arm === "fullUp" ? true : arm === "off" ? false : arm);
+            if (arm !== "main") {   /* fullUp: the polish on, the whole gene texture uploaded every frame (PR2's slots, main's upload); nosplit: the polish
+                                       on, the whole kind on the full programs while any fish is lit (no lit fish drawn apart) */
+              S.setPolish(arm === "on" || arm === "fullUp" || arm === "nosplit" ? true : arm === "off" ? false : arm);
               if (S.setGeneUploads) S.setGeneUploads(arm === "fullUp" ? "full" : "dirty");
+              if (S.setLitSplit) S.setLitSplit(arm !== "nosplit");
               await EvoOcean.bench.wait(2500);   /* a switch compiles once: settle */
             }
             const rp = EvoOcean.bench.rafProbe(ms), cap = EvoOcean.bench.capture(Object.assign({ durationMs: ms }, m));
@@ -1204,7 +1255,9 @@ async function partPerfArms() {
           console.log(`  ${key} ${arm.padEnd(7)} r${round}: rAF ${r.raf.rafFps.toFixed(1)} fps (p95 ${r.raf.raf.p95.toFixed(2)} ms, >25ms ${(100 * r.raf.over25ms).toFixed(1)}%)` +
                       `, frameCpu p50 ${sm.spans.frameCpu.p50.toFixed(3)} p95 ${sm.spans.frameCpu.p95.toFixed(3)}, fishPack p50 ${sm.spans.fishPack.p50.toFixed(3)}` +
                       (g ? `, gpu p50 ${g.p50.toFixed(3)} p95 ${g.p95.toFixed(3)} (valid ${(100 * sm.gpu.validFraction).toFixed(0)}%)` : ", no gpu") +
-                      (r.state.polish ? `, polish ${r.state.polish.want}/${r.state.polish.variant || (r.state.polish.on ? "on" : "off")} lit ${r.state.polish.any}/${r.state.polish.fish} full ${r.state.polish.full}` : ", (main)"));
+                      (r.state.polish ? `, polish ${r.state.polish.want}/${r.state.polish.variant || (r.state.polish.on ? "on" : "off")} lit ${r.state.polish.any}/${r.state.polish.fish} full ${r.state.polish.full}` +
+                                        (r.state.polish.split !== undefined ? ` apart ${r.state.polish.split ? r.state.polish.litDrawn : "-"}` : "") : ", (main)") +
+                      (r.state.genes ? `, genes ${r.state.genes.policy}` : ""));
         }
         check(`perf ${key} r${round} ${site}: no console / page / network errors`, L.errors.length === 0, L.errors.slice(0, 5));
         await L.ctx.close();
