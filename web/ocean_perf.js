@@ -570,7 +570,12 @@
     /* the head of fish c in three's coordinates */
     function head(s, c, W, H) { return [s.segs[12 * c] - W / 2, -s.depth[c], s.segs[12 * c + 1] - H / 2]; }
     function camera(kind) {
-      var st = api.state(), s = h.last(), W = st.W, H = st.H, out = { kind: kind };
+      var st = api.state(), s = h.last();
+      /* (prepare calls this right after tick() found a snapshot: these hold unless the engine stopped since) */
+      if (!st || !s) throw new Error("the benchmark has no snapshot of the world (the engine stopped)");
+      /* the dense and follow cameras frame a fish: a world without one has no view to give them (not a NaN camera) */
+      if ((kind === "dense" || kind === "follow") && !(s.n > 0)) throw new Error("the " + kind + " camera needs a fish, and the world has none at tick " + s.stats[1]);
+      var W = st.W, H = st.H, out = { kind: kind };
       if (kind === "dense") {
         var cells = {}, best = null;
         for (var c = 0; c < s.n; c++) {
@@ -642,6 +647,8 @@
           var cam = camera(cd.camera || "whole");
           return wait(cd.settleMs === undefined ? 1500 : cd.settleMs).then(function () {
             var st = api.state();
+            /* the engine may have stopped during the settle: say so (as tick() does), not a TypeError */
+            if (!st) throw new Error("prepare: the page has no state of the world after the settle (the engine stopped)");
             cam.view = st.view; cam.flashlightLevel = st.flashlightLevel; cam.following = st.following; cam.selectedId = st.selectedId;
             return { world: [st.W, st.H, st.D], walls: st.walls, n: st.n, tick: st.frame, worldEpoch: h.epoch(), seed: st.seed,
                      colourMode: h.colourMode(), quality: scene.quality(), paused: st.paused,
