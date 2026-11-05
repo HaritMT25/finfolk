@@ -3,8 +3,9 @@
 How many invasion cells an hour the machine can run, where a cell's time goes, what was changed to run
 more of them, and how a faster engine binary may enter a study without changing a single result.
 
-Measured 2026-11-04 on the maintainer's i7-1165G7 (4 cores, 8 threads), WSL Ubuntu 24.04, g++ 13.3.0,
-on AC power. Branch `throughput`.
+Measured 2026-11-04/05 on the maintainer's i7-1165G7 (4 cores, 8 threads), WSL Ubuntu 24.04, g++ 13.3.0,
+on AC power. Branch `throughput`. The scratch harness (profiler, A/B and throughput scripts) lives in
+`~/wasm_parity/thru/`.
 
 ## 1. Where a cell's time goes
 
@@ -24,16 +25,17 @@ One pilot1 cell's inputs in bank1's configuration (13,500 steps, checkpoints eve
 | checkpoint saves (3 periodic + end.json, ~20 ms each) | 0.7% | 0.6% |
 | score.py (arena, 3 checkpoints, birth log) | 2.0% | 1.6% |
 
-The whole runner, measured per cell from `attempts.tsv` and `done.json`, adds 0.12 to 0.45 s per cell. That
-time covers the worker's Python start, finalization, the prune and the runner's poll; it is the "other"
-column below. Python and JSON, all of it, come to 5.8% of a cell at 1 worker and 7.5% at 4. The engine
-is the other 92–94%.
+The whole runner adds 0.12–0.45 s per cell, measured from `attempts.tsv` and `done.json`. That time covers
+the worker's Python start, finalization, the prune and the runner's poll. Across 25 end-to-end runner
+runs (§2), everything outside the engine (Python, JSON, hashing, fsync, gzip, scheduling) was 5–6% of a
+cell at 1 worker. At 4 workers it was 7–8% with origin/main's runner and 5.5–6.5% with this branch's.
+The engine is the other 92–95%.
 
 Gemini's estimate (q28) of ~40% Python/JSON overhead does not hold. It assumed the cells sit on `/mnt/c`
-(9P); bank1 sits on WSL's own ext4. The pilot's "1126 steps/s" was the right clue. Its one heavy piece is
-score.py on a pilot cell, at 4.1% (18 checkpoints). With Python at 6–8%, well under the 15% bar, the batch
-mode / fork server (step 3 of the brief) is not worth its risk: it would save at most about 7%. It was not
-built.
+(9P), but bank1 sits on WSL's own ext4; the pilot's "1126 steps/s" was the right clue. The one heavier
+Python piece is score.py on a 36,000-step pilot cell, at 4.1% (18 checkpoints). With Python at 5–8%, well
+under the 15% bar, a batch mode or fork server (step 3 of the brief) is not worth its risk: it could save
+at most about 6%. It was not built.
 
 ## 2. What was changed, and what it buys
 
@@ -59,9 +61,40 @@ different binaries (the profile records run-time values). A study binary has to 
 recipe. `build_engine.sh --pgo` stays for experiments.
 
 **The candidate study binary is x86-64-v3 (no FMA) + LTO**: `tools/invasion/build_engine.sh OUT --arch
-x86-64-v3 --lto`, sha256 `4e39ed8a…` at this commit with the pin's epoch.
+x86-64-v3 --lto`. With the pin's epoch it is sha256 `4e39ed8a…`, from any commit whose `src/` and
+CMakeLists.txt match this branch's: no commit hash goes into the binary.
 
-TBD-CELLS
+**Runner (tools/invasion/run.py).** The admission loop slept a fixed 0.5 s, so a finished cell's slot sat
+idle for 0.25 s on average. It now returns as soon as a cell worker exits. The runner's overhead per cell
+(the time not spent in arena.py, the engine or score.py) was 0.36–0.41 s with origin/main's run.py and
+0.17–0.29 s with this branch's, at 2 workers. That is about 0.2 s, or 1.5–2% of a cell. It changes
+scheduling only.
+
+**Cells per hour, end to end.** These are real runner runs (`run.py --prune`, as bank1 runs) on bank-like
+cells: pilot1 inputs at 13,500 steps with checkpoints every 4,500, 16 cells per worker. "Steady" is
+workers × 3600 / mean per-cell time. Single runs of a few minutes swing by 6–12% on this laptop
+(turbo, thermals, the Windows host). The 1-worker comparison therefore ran both binaries' runners at the
+same time on their own cores. The 4-worker runs ran in the order A B B A while nothing else was running.
+
+| | 1 worker | 4 workers, session 1 (origin/main runner) | 4 workers, session 2 (this runner) |
+|---|---:|---:|---:|
+| pinned binary | 493, 440 (mean 467) | 1321, 1174 (mean 1248) | 1057, 1025 (mean 1041) |
+| x86-64-v3 + LTO | 545, 486 (mean 516) | 1376, 1395 (mean 1386) | 1314, 1292 (mean 1303) |
+| gain | **+10.6%** | **+11%** | **+25%** |
+
+The other changes, as cells/hour, follow from the engine ratios above and the measured split of a cell
+(engine 95% at 1 worker, 94% at 4):
+
+- x86-64-v3 alone: +9.7%;
+- LTO alone: ±0;
+- v3 + LTO: +11.5% expected, against +10.6% to +25% measured;
+- the runner fix: about +1.5–2% more.
+
+**For a bank.** bank1 ran its 28,800 cells at 1,136 cells/h on 4 workers (its own session rate), so about
+25.4 h. With the new binary and the runner fix, the conservative estimate (engine 1.12×, runner +1.5%)
+is about 1,290 cells/h: **about 22 h for the same bank**. At session 2's +25% it would be about 20 h.
+Bigger wins would have to come from the engine's own step (the local perf ledger,
+`docs/evo_boids_perf.md`) or from the statistical design (fewer cells), not from the Python around it.
 
 ## 3. Proof that nothing changed
 
@@ -87,7 +120,27 @@ LTO binary (`4e39ed8a…`). The cells were 36,000 steps each, with checkpoints e
 Evidence: `~/wasm_parity/thru/id240/identity.json` (sha256 `e5391b88…`). Over the same 240 cells the engine's
 total user time was 6,932 s for the pinned binary and 6,086 s for the new one (1.14×).
 
-TBD-GATES
+**native == wasm still holds with the new flags.** Both parity gates were run with
+`NATIVE_CXXFLAGS="-march=x86-64-v3 -mno-fma -flto=auto"` on the native side:
+
+- `wasm/parity.sh`: 23/23 cases PASS, native serial == wasm, bit for bit;
+- `FAST=1 wasm/ocean_parity.sh`: 49/49 cases PASS, native == wasm == baseline at every step, with every
+  guard and the unit checks of both builds.
+
+Neither native driver contains an FMA instruction (`objdump`; 1,637 and 3,848 ymm instructions, so the
+flags took effect). `tests/invasion_tooling.sh` passes with the pinned binary (92 s), including its new
+section 5b.
+
+**Why this is exact, and how far the proof reaches.** Under `-ffp-contract=off` without `-ffast-math`, the
+compiler may not reassociate, contract or approximate a float operation. The transformations x86-64-v3 and
+LTO add are wider vectors, VEX encodings, inlining and code layout, and none of them changes an IEEE-754
+result. FMA, the one instruction that would, is compiled out. The src tree has no ISA-specific intrinsics or
+`#ifdef __AVX__` paths, and libm calls go to the same shared glibc in both binaries. That glibc picks its
+own code paths by host CPU, for the pinned binary as much as for the new one, so a replay on another host
+is a question for any binary, not one this change adds. The 240 cells are the
+empirical check on that argument: about 4 billion fish-steps per binary, in a chaotic system where one
+flipped bit diverges a run within a few hundred steps. Each new compiler, commit or flag set needs its own
+identity run. That is the registration rule below.
 
 ## 4. Registering a new engine binary
 
