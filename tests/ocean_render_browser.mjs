@@ -1127,7 +1127,10 @@ const OFF_STATES = [
   { name: "plain-bodies-close", cfg: { appearance: 0, walls: true }, colour: "family", cam: "close" },
   /* the close fish selected and the one nearest the view's centre hovered (render PR2's split copies their highlights into the lit draw) */
   { name: "appearance-close-select-hover", cfg: { appearance: 3, walls: true }, colour: "appearance", cam: "close", pickHover: true },
-  { name: "predators-wrapping", cfg: { appearance: 3, walls: false, predatorCount: 4 }, colour: "appearance", cam: "whole" }
+  { name: "predators-wrapping", cfg: { appearance: 3, walls: false, predatorCount: 4 }, colour: "appearance", cam: "whole" },
+  /* the legacy fish and the predators together (the plain bodies: one material per pass and variant for both kinds, so three's
+   * opaque sort, material id then depth, draws them in main's order: #58's review) */
+  { name: "plain-bodies-predators-whole", cfg: { appearance: 0, walls: false, predatorCount: 4 }, colour: "family", cam: "whole" }
 ];
 async function partOffImage() {
   console.log("== the polish off draws main's image, pixel for pixel (main " + MAIN_BASE + ")");

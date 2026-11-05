@@ -18,6 +18,13 @@
 //   - lazy assembly: prepare() makes the materials (in the scene's old order) without assembling; a planted
 //     scan failure in the polish (a declaration collision) no longer fails ocean_shaders.js as it loads, and the
 //     binder draws the plain programs for that variant, said once
+//   - the review of #58: the legacy fish and the predators share one material per pass and variant (main's 4, in
+//     main's order: three's opaque sort is material id, then depth); a Look's faces keyed by their GLSL; a Look
+//     activated again draws its new uniform objects; a kind defined while a Look is active (its clarity uniforms
+//     in, its own activation, the base set until then); the compile's check without three's checkShaderErrors, a
+//     check that throws, its budget and its timer; material() refuses when not even the plain programs assemble;
+//     has() for the split's skip; features() once a set; the replaced sets' materials freed; a pre-existing entry
+//     failing in an activation said; no feature ahead of the split's skip; one writer of .material in web/
 "use strict";
 const fs = require("fs"), path = require("path"), vm = require("vm"), crypto = require("crypto");
 
@@ -181,7 +188,8 @@ section("the cache's keys");
   ok(B.key("fish", "shadow", 1) === "abi1|fish|shadow|fish/1|v1|look:-|vs:" + L + "@1|fs:(SHADOW_FS)", "a shadow: the lite polish, SHADOW_FS (no slots)");
   const mats = new Set();
   for (const k of ["fish", "pred", "app"]) for (const p of M.KINDS[k].passes) for (const v of [0, 1]) { if (p === "litSkip" && v) continue; mats.add(B.material(k, p, v)); }
-  ok(mats.size === 13 && B.state().entries.length === 13, "13 keys, 13 materials (fish and pred 4 each, app 5)", { mats: mats.size, entries: B.state().entries.length });
+  ok(mats.size === 9 && B.state().entries.length === 13 && B.state().materials === 9, "13 keys, 9 materials (the legacy fish and the predators share their 4; app 5)",
+     { mats: mats.size, entries: B.state().entries.length, materials: B.state().materials });
   ok(B.material("fish", "body", 1) === B.material("fish", "body", 1), "one material per key (asked again: the same)");
   U.fish.uTime.value = 123;
   ok(B.key("fish", "body", 1) === k1 && B.material("fish", "body", 1).uniforms === U.fish, "uniform values are not in the key; a kind's materials share its uniform objects");
@@ -274,7 +282,7 @@ section("the predators' faces (a Look's attached pass) follow the predators' ver
     for (const v of [0, 1]) {
       const g = B.programs("face", "body", v), pv = B.key("pred", "body", v).split("|vs:")[1].split("|")[0];
       const want = SH.program("fish.attach.vs", SH.parts.fishAttach(DECL, BODY), v ? [F, "faces.sway"] : ["faces.sway"]);
-      ok(g.own && g.vs === want && g.fs === FS && g.key.includes("|vs:" + pv + "|") && g.key.includes("|fs:(faces)"),
+      ok(g.own && g.vs === want && g.fs === FS && g.key.includes("|vs:" + pv + "|") && /\|fs:\(faces:[0-9a-f]{8}\)$/.test(g.key),
          "faces variant " + v + ": fish.attach.vs with the predators' vertex features [" + pv + "], the Look's fragment stage", g.key);
     }
     const v1 = B.programs("face", "body", 1).vs;
@@ -303,13 +311,14 @@ section("atomic activation");
   const mesh = { material: null };
   B.bind(mesh, "fish", "body", 1);
   const before = mesh.material, n0 = B.state().entries.length;
-  ok(B.state().entries.filter((e) => e.state === "reserved").length === 13 - 1, "prepare() made 13 materials and assembled none; one bound: assembled (lazy)", B.state().entries.map((e) => e.state));
+  ok(B.state().entries.filter((e) => e.state === "reserved").length === 13 - 2, "prepare() made 13 keys' materials and assembled none; one bound: assembled (lazy; its material the predators' too)",
+     B.state().entries.map((e) => e.state));
   const emit = (id) => ({ look: "glow", features: (q) => (q.stage === "fs" && q.pass === "body" ? q.base.concat([id]) : q.base) });
   {
     const r1 = await B.activate(emit("planted.emit"));
     B.bind(mesh, "fish", "body", 1);
-    ok(!r1.ok && r1.stage === "compile" && /did not compile/.test(r1.error) && compiled.length === 1 && compiled[0].length === 13,
-       "a planted compile failure: refused at the compile, which had every reachable variant (13: app 5, fish 4, pred 4)", { r1, n: compiled[0] && compiled[0].length });
+    ok(!r1.ok && r1.stage === "compile" && /did not compile/.test(r1.error) && compiled.length === 1 && compiled[0].length === 9,
+       "a planted compile failure: refused at the compile, which had every reachable variant (13 keys, 9 materials: app 5, fish and pred 4)", { r1, n: compiled[0] && compiled[0].length });
     ok(B.state().look === "" && B.state().version === 0 && mesh.material === before && B.state().entries.length === n0 && B.bound(mesh).key === B.key("fish", "body", 1),
        "  the previous set stays (the mesh bound as before); the failed set's materials dropped", { look: B.state().look, entries: B.state().entries.length, n0 });
     ok(compiled[0].filter((x) => x.key.includes("look:glow")).every((x) => x.material.disposed), "  and disposed");
@@ -318,8 +327,8 @@ section("atomic activation");
        "a planted assembly error (a declaration collision): refused before any compile; the previous set stays, nothing kept", r2);
     const r3 = await B.activate(emit("glow.emit"));
     B.bind(mesh, "fish", "body", 1);
-    ok(r3.ok && r3.keys.length === 13 && compiled.length === 2 && compiled[1].length === 13 && B.state().look === "glow" && B.state().version === 1,
-       "a good set: every reachable variant assembled and compiled (13), then it takes effect", r3);
+    ok(r3.ok && r3.keys.length === 13 && r3.materials === 9 && compiled.length === 2 && compiled[1].length === 9 && B.state().look === "glow" && B.state().version === 1,
+       "a good set: every reachable variant assembled and compiled (13 keys, 9 materials), then it takes effect", r3);
     ok(mesh.material !== before && mesh.material.fragmentShader === SH.program("fish.fs", SH.parts.fishFs(), [F, "glow.emit"]) && B.bound(mesh).key.includes("look:glow"),
        "  the next bind draws the set's material (fish.fs [full, glow.emit])");
     let release;
@@ -361,10 +370,11 @@ section("lazy assembly, and the plain programs on an assembly error");
      st.entries.filter((x) => x.state === "failed").every((x) => /declaration collision: uTime/.test(x.error)),
      "  bound(): asked 1, drew 0 (fallback); state(): the two failed keys and why", { b, failed: st.failed });
   B.bind(fishBody, "fish", "body", 1); B.bind(predBody, "pred", "body", 1);
-  ok(warned.length === 2 && warned.every((w) => /could not be assembled: .*declaration collision: uTime.*The plain programs are drawn instead/.test(w)), "  said once per variant on the console (binding again: no more)", warned);
+  ok(warned.length === 1 && warned.every((w) => /could not be assembled: .*declaration collision: uTime.*The plain programs are drawn instead/.test(w)),
+     "  said once on the console (one material for both kinds; binding again: no more)", warned);
   const w = B.warm(["fish", "pred"]);
-  ok(w.length === 4 && w[0] === B.material("fish", "body", 0) && w[1] === B.material("pred", "body", 0) && w[2] === B.material("fish", "shadow", 1) && w[3] === B.material("pred", "shadow", 1),
-     "  the warm list: the plain bodies stand in for the failed full ones (nothing more to compile), then the polished shadows");
+  ok(w.length === 2 && w[0] === B.material("fish", "body", 0) && w[0] === B.material("pred", "body", 0) && w[1] === B.material("fish", "shadow", 1) && w[1] === B.material("pred", "shadow", 1),
+     "  the warm list: the plain body stands in for the failed full one (nothing more to compile), then the polished shadow");
   ok(pv.program("fish.fs", pv.parts.fishFs(), []) === SH.FISH_FS[0], "  (the plain fish.fs is the same text: the planted collision is only in the polish)");
   /* lazy: prepare() makes the materials in the scene's old order, assembles none */
   const { B: C } = sceneBinder(ctx);
@@ -376,6 +386,207 @@ section("lazy assembly, and the plain programs on an assembly error");
   const wa = C.warm(["app"]);
   ok(wa.length === 3 && C.state().entries.filter((x) => x.state === "ready").map((x) => x.key.split("|").slice(1, 3).concat(x.key.split("|")[4]).join(" ")).join(", ") === "app body v1, app shadow v1, app litSkip v0",
      "  warm(app): its full body, its polished shadow and the split's main draw (as the scene warmed them), assembled then");
+}
+
+const S = ctx.EvoOceanShaders;
+const tick = () => new Promise((r) => setImmediate(r));
+section("review P1-1: the legacy fish and the predators share their materials, as on main");
+{
+  const { B } = sceneBinder(ctx);
+  const same = ["body", "shadow"].every((p) => [0, 1].every((v) => B.material("fish", p, v) === B.material("pred", p, v)));
+  ok(same && B.state().materials === 9, "fish and pred: one material per pass and variant (main's fishMats[v] / shadowMats[v]); 9 materials in all");
+  const ids = [["fish", "body", 0], ["fish", "body", 1], ["fish", "shadow", 0], ["fish", "shadow", 1], ["app", "body", 0], ["app", "body", 1], ["app", "shadow", 0], ["app", "shadow", 1], ["app", "litSkip", 0]]
+    .map(([k, p, v]) => B.material(k, p, v).id);
+  ok(ids.every((x, i) => i === 0 || x === ids[i - 1] + 1), "made in main's order, one id after another: legacy body 0, body 1, shadow 0, shadow 1; app body 0, 1, shadow 0, 1, the split's", ids);
+  const mf = { material: null }, mp = { material: null };
+  B.bind(mf, "fish", "body", 1); B.bind(mp, "pred", "body", 1);
+  ok(mf.material === mp.material && B.bound(mf).key.includes("|fish|") && B.bound(mp).key.includes("|pred|"), "bound(): the kinds keep their own keys over the one material");
+  S.feature({ id: "share.pred", abi: 1, targets: ["fish.vs"], append: { "fish.varyings": "  // share.pred" } });
+  const U2 = { b: { uTime: { value: 0 } }, s: {} };
+  const mk = () => { const C = M.create({ THREE: fakeThree() }); C.define("fish", { uniforms: { body: U2.b, shadow: U2.s } }); C.define("pred", { uniforms: { body: U2.b, shadow: U2.s } }); return C; };
+  const C1 = mk();
+  await C1.activate({ look: "share", features: (q) => (q.kind === "pred" && q.stage === "vs" && q.pass === "body" ? q.base.concat(["share.pred"]) : q.base) });
+  ok(C1.material("fish", "body", 1) !== C1.material("pred", "body", 1) && C1.material("fish", "shadow", 1) === C1.material("pred", "shadow", 1),
+     "a Look with features for the predators only: their bodies' materials apart, the shadows still one");
+  const C2 = mk();
+  await C2.activate({ look: "share", uniforms: { pred: { uEye: { value: 1 } } } });
+  ok(C2.material("fish", "body", 0) !== C2.material("pred", "body", 0) && C2.material("pred", "body", 0).uniforms.uEye, "uniforms of their own for the predators: apart");
+  const C3 = mk();
+  await C3.activate({ look: "share", claims: { fish: { "iX.z": "share.x" } } });
+  ok(C3.material("fish", "body", 0) !== C3.material("pred", "body", 0), "a claim on the legacy fish's layout only: apart");
+  const C4 = mk();
+  await C4.activate({ look: "share" });
+  ok(C4.material("fish", "body", 1) === C4.material("pred", "body", 1) && C4.state().materials === 4, "a Look that changes neither: one again (4 materials for the 8 keys)", C4.state().materials);
+}
+
+section("review P2-1: a Look's faces keyed by their GLSL; a Look activated again draws its new uniforms");
+{
+  const DECL = "attribute vec3 aLoc;\nvarying vec3 vLoc;", BODY = "  vec3 w = fishWorld(); vLoc = aLoc;\n  gl_Position = projectionMatrix * viewMatrix * vec4(w, 1.0);";
+  const face = (fs, u) => ({ decl: DECL, body: BODY, fs: fs, uniforms: u });
+  const { B } = sceneBinder(ctx, () => ({ ok: true }));
+  const holderA = { value: 1 }, faceA = { value: 2 };
+  const setA = () => ({ look: "rf", uniforms: { fish: { uRf: holderA } }, attach: { face: face("varying vec3 vLoc;\nvoid main() { gl_FragColor = vec4(vLoc, 1.0); }", { uFace: faceA }) } });
+  await B.activate(setA());
+  const k1 = B.key("face", "body", 0), mesh = { material: null }, fm = { material: null };
+  B.bind(mesh, "fish", "body", 0); B.bind(fm, "face", "body", 0);
+  ok(mesh.material.uniforms.uRf === holderA && fm.material.uniforms.uFace === faceA, "on: the Look's uniform objects in its materials (legacy fish, faces)");
+  await B.activate(null);
+  const holderB = { value: 3 }, faceB = { value: 4 };
+  const setB = { look: "rf", uniforms: { fish: { uRf: holderB } }, attach: { face: face("varying vec3 vLoc;\nvoid main() { gl_FragColor = vec4(vLoc, 1.0); }", { uFace: faceB }) } };
+  await B.activate(setB);
+  B.bind(mesh, "fish", "body", 0); B.bind(fm, "face", "body", 0);
+  ok(B.key("face", "body", 0) === k1 && mesh.material.uniforms.uRf === holderB && fm.material.uniforms.uFace === faceB, "off, then on with new uniform objects (the same Look id): its materials hold the new ones");
+  const holderC = { value: 5 };
+  await B.activate({ look: "rf", uniforms: { fish: { uRf: holderC } }, attach: setB.attach });
+  B.bind(mesh, "fish", "body", 0);
+  ok(mesh.material.uniforms.uRf === holderC, "on again straight from on (no off between): the new ones too");
+  await B.activate({ look: "rf", uniforms: setB.uniforms, attach: { face: face("varying vec3 vLoc;\nvoid main() { gl_FragColor = vec4(vLoc * 0.5, 1.0); }", { uFace: faceB }) } });
+  ok(B.key("face", "body", 0) !== k1 && B.programs("face", "body", 0).fs.includes("vLoc * 0.5"), "the same Look id with other faces' GLSL: another key, its own program");
+  const k2 = B.key("face", "body", 0);
+  await B.activate({ look: "rf", uniforms: setB.uniforms, attach: { face: Object.assign(face("varying vec3 vLoc;\nvoid main() { gl_FragColor = vec4(vLoc * 0.5, 1.0); }", { uFace: faceB }), { options: { side: 0 } }) } });
+  ok(B.key("face", "body", 0) !== k2, "... and with other material options: another key");
+}
+
+section("review P2-2: a kind defined while a Look is active");
+{
+  const compiled = [];
+  const compile = (items) => { compiled.push(items.map((x) => x.key)); return Promise.resolve({ ok: true }); };
+  S.feature({ id: "later.app", abi: 1, targets: ["app.body.fs"], append: { "app.emissive": "  murky += vec3(0.0);" } });
+  const extra = { uLook: { value: 7 } };
+  const B = M.create({ THREE: fakeThree(), compile });
+  const U = { fish: { uTime: { value: 0 } }, shadow: {}, app: { uGenes: { value: null } }, appShadow: {} };
+  B.define("fish", { uniforms: { body: U.fish, shadow: U.shadow } }); B.define("pred", { uniforms: { body: U.fish, shadow: U.shadow } }); B.prepare(["fish", "pred"]);
+  await B.activate({ look: "later", uniforms: { app: extra }, features: (q) => (q.kind === "app" && q.stage === "fs" && q.pass === "body" ? q.base.concat(["later.app"]) : q.base) });
+  U.app.uClarityLike = { value: 0.5 };   /* (the scene's clarityUniforms(U), before define: AppKind's) */
+  B.define("app", { uniforms: { body: U.app, shadow: U.appShadow }, env: { EA } });
+  B.prepare(["app"]);
+  const m = { material: null };
+  B.bind(m, "app", "body", 1);
+  const before = B.bound(m).key;
+  await tick(); await tick();
+  B.bind(m, "app", "body", 1);
+  ok(/look:-/.test(before) && /look:later/.test(B.bound(m).key) && m.material.fragmentShader.includes("murky += vec3(0.0);"),
+     "drawn under the base set until its own activation of the Look compiled, then the Look's", { before, after: B.bound(m).key });
+  ok(compiled.length === 2 && compiled[1].length === 5 && compiled[1].every((k) => k.includes("|app|")) && B.state().covered.indexOf("app") >= 0,
+     "its own activation: the kind's variants alone (5), compiled; then covered", compiled[1]);
+  ok(m.material.uniforms.uClarityLike === U.app.uClarityLike && m.material.uniforms.uLook === extra.uLook && B.material("app", "litSkip", 0).uniforms.uClarityLike === U.app.uClarityLike &&
+     B.material("app", "body", 0).uniforms.uClarityLike === U.app.uClarityLike,
+     "its uniforms: the kind's (with what the scene added before define: its clarity) and the Look's, in every body material");
+  const warned = [];
+  const B2 = M.create({ THREE: fakeThree(), compile, warn: (x) => warned.push(x) });
+  B2.define("fish", { uniforms: { body: U.fish, shadow: U.shadow } }); B2.define("pred", { uniforms: { body: U.fish, shadow: U.shadow } });
+  await B2.activate({ look: "throws", features: (q) => { if (q.kind === "app") throw new Error("no app here"); return q.base; } });
+  let threw = null;
+  try { B2.define("app", { uniforms: { body: U.app, shadow: U.appShadow }, env: { EA } }); B2.prepare(["app"]); } catch (e) { threw = e.message; }
+  await tick(); await tick();
+  const m2 = { material: null };
+  ok(threw === null && B2.bind(m2, "app", "body", 0) === 0 && /look:-/.test(B2.bound(m2).key) && m2.material.vertexShader === app(false).vs &&
+     warned.length === 1 && /could not be made for the appearance fish: .*no app here/.test(warned[0]),
+     "a Look whose features() throw for the new kind: prepare() does not throw, the kind is drawn without it, said once", { threw, warned });
+  /* a key that cannot be worked out at bind time (not reachable, so not activated): said once, not each frame */
+  const B3 = M.create({ THREE: fakeThree(), compile, warn: (x) => warned.push(x) });
+  B3.define("fish", { uniforms: { body: U.fish, shadow: U.shadow } }); B3.define("pred", { uniforms: { body: U.fish, shadow: U.shadow } });
+  B3.define("app", { uniforms: { body: U.app, shadow: U.appShadow }, env: { EA } });
+  const odd = { on: false };   /* (an impure features(): fine while the set is activated, throwing after) */
+  await B3.activate({ look: "odd", features: (q) => { if (q.pass === "body" && q.kind === "app" && q.variant === 1 && q.stage === "vs" && odd.on) throw new Error("odd"); return q.base; } });
+  odd.on = true;
+  const n0 = warned.length;
+  for (let i = 0; i < 5; i++) B3.bind({ material: null }, "app", "litSkip", 1);
+  ok(warned.length === n0 + 1 && /could not be keyed: .*odd/.test(warned[n0]), "a key that throws at bind time: the plain programs, said once (5 binds, 1 line)", warned.slice(n0));
+}
+
+section("review P3-1: the compile's check (compiler())");
+{
+  function fakeRenderer(progs, opts) {
+    opts = opts || {};
+    const gl = { LINK_STATUS: 0x8B82, getProgramParameter: (p, k) => (k === 0x8B82 ? p.linked : null) };
+    return { debug: { checkShaderErrors: !!opts.checkShaderErrors }, getContext: () => gl,
+             properties: { get: (m) => ({ currentProgram: progs.get(m) }) },
+             compileAsync: opts.hang ? () => new Promise(() => {}) : () => Promise.resolve() };
+  }
+  const T3 = { Scene: function () { this.add = function () {}; }, Mesh: function (g, m) { this.material = m; } };
+  const timers = { sets: 0, clears: 0, last: null, set(f) { this.sets++; this.last = f; return 1; }, clear() { this.clears++; } };
+  const mat = (k) => ({ key: k });
+  const prog = (linked, extra) => Object.assign({ program: { linked }, getUniforms() {}, diagnostics: null }, extra || {});
+  const items = (ms) => ms.map((m) => ({ key: m.key, kind: "fish", pass: "body", variant: 0, material: m, geometry: null }));
+  const a = mat("a"), b = mat("b");
+  const geometry = () => ({});
+  let r = await M.compiler({ THREE: T3, renderer: fakeRenderer(new Map([[a, prog(true)], [b, prog(true)]])), geometry, timers })(items([a, b]));
+  ok(r.ok && timers.sets === 1 && timers.clears === 1, "linked and runnable: ok; the budget's timer cleared once settled", { r, timers: [timers.sets, timers.clears] });
+  r = await M.compiler({ THREE: T3, renderer: fakeRenderer(new Map([[a, prog(true)], [b, prog(false)]]), { checkShaderErrors: false }), geometry, timers })(items([a, b]));
+  ok(!r.ok && r.error === "did not compile: b", "three's checkShaderErrors off (no diagnostics): the GL link status still refuses a broken program", r);
+  r = await M.compiler({ THREE: T3, renderer: fakeRenderer(new Map([[a, prog(true, { diagnostics: { runnable: false } })]])), geometry, timers })(items([a]));
+  ok(!r.ok && /did not compile: a/.test(r.error), "three's diagnostics not runnable: refused", r);
+  r = await M.compiler({ THREE: T3, renderer: fakeRenderer(new Map([[a, prog(true, { getUniforms() { throw new Error("moved"); } })]])), geometry, timers })(items([a]));
+  ok(!r.ok && /could not be checked: moved/.test(r.error), "a check that throws (say three moved getUniforms): a refusal, not an unhandled rejection", r);
+  r = await M.compiler({ THREE: T3, renderer: fakeRenderer(new Map([[a, undefined]])), geometry, timers })(items([a]));
+  ok(!r.ok, "no program for a material: refused", r);
+  const p = M.compiler({ THREE: T3, renderer: fakeRenderer(new Map(), { hang: true }), geometry, timers, budgetMs: 60000 })(items([a]));
+  timers.last();
+  r = await p;
+  ok(!r.ok && /did not finish in 60 s/.test(r.error), "a compile that never finishes: refused at the budget", r);
+  r = await M.compiler({ THREE: T3, renderer: fakeRenderer(new Map()), geometry, timers, lost: () => true })(items([a]));
+  ok(!r.ok && /lost/.test(r.error), "a lost context: refused", r);
+}
+
+section("review P3: the plain fallback, the split's skip, features() once, freeing, a said failure, the skip first");
+{
+  /* P3-2: not even the plain programs: material() throws (the scene's "unavailable" path, not three's default shader) */
+  const B = M.create({ THREE: fakeThree(), warn: () => {} });
+  B.define("app", { uniforms: { body: {}, shadow: {} }, env: {} });
+  throws(() => B.material("app", "body", 0), ["could not be assembled, nor their plain ones", "appearance law"], "P3-2: no plain programs: material() throws");
+  const mesh = { material: "before" };
+  B.bind(mesh, "app", "body", 0);
+  ok(mesh.material === "before", "  bind() leaves the mesh's material as it was");
+  /* P3-3: the split's skip not assembling (planted: the skip's line declares a name main() has): has() says so; the scene then
+   * draws the whole kind on the full programs instead of drawing the lit fish twice */
+  const sk = load({ "ocean_shaders.js": (s) => s.replace('var LIT_SKIP_GLSL = "  if (iBody.z < 0.0)', 'var LIT_SKIP_GLSL = "  vec3 w = vec3(0.0); if (iBody.z < 0.0)') });
+  const { B: K } = sceneBinder(sk);
+  const ms = { material: null };
+  ok(K.has("app", "body", 1) && !K.has("app", "litSkip", 0) && K.bind(ms, "app", "litSkip", 0) === 0 && K.bound(ms).fallback,
+     "P3-3: has(app, litSkip, 0) false when the skip does not assemble (its bind a fallback); has() true for the full body");
+  /* P3-4: features() runs while a set is worked out, never per bind */
+  let calls = 0;
+  const { B: F2 } = sceneBinder(ctx, () => ({ ok: true }));
+  await F2.activate({ look: "count", features: (q) => { calls++; return q.base; } });
+  const c0 = calls, mm = { material: null };
+  for (let i = 0; i < 200; i++) { F2.bind(mm, "fish", "body", i & 1); F2.bind(mm, "app", "body", i & 1); F2.bind(mm, "app", "litSkip", 0); F2.bind(mm, "pred", "shadow", i & 1); }
+  ok(c0 > 0 && calls === c0, "P3-4: features() ran " + c0 + " times for the activation, none for 800 binds");
+  /* P3-5: the replaced sets' materials freed */
+  const { B: E } = sceneBinder(ctx, () => ({ ok: true }));
+  await E.activate({ look: "one", uniforms: { fish: { u1: { value: 1 } } } });
+  const one = E.material("fish", "body", 0);
+  await E.activate({ look: "two", uniforms: { fish: { u2: { value: 2 } } } });
+  const two = E.material("fish", "body", 0), nTwo = E.state().entries.length;
+  ok(one.disposed && !two.disposed && E.state().entries.every((x) => !/look:one/.test(x.key)) && nTwo === 13 + 13, "P3-5: a set replaced by another: its materials disposed, its keys gone (the base set's kept)", nTwo);
+  await E.activate(null);
+  const base = E.material("fish", "body", 0);
+  ok(two.disposed && !base.disposed && E.state().entries.length === 13 && E.state().materials === 9, "  back to no Look: the Look's freed, the base set's 13 keys and 9 materials kept");
+  /* P3-7: an entry made before (reserved), failing in an activation: said, as its binds will fall back */
+  const pc = load({ "ocean_shaders.js": (s) => s.replace('append["fish.fs.decl"] = POLISH_VARY;', 'append["fish.fs.decl"] = POLISH_VARY + "\\nuniform float uTime;";') });
+  const { B: P, warned: pw } = sceneBinder(pc, () => ({ ok: true }));
+  const rp = await P.activate(null);
+  ok(!rp.ok && rp.stage === "assembly" && pw.length === 1 && /\|fish\|body\|.*\|v1\|.*could not be assembled/.test(pw[0]), "P3-7: a base entry failing in an activation: refused, and said on the console", { rp, pw });
+  /* P3-8: no feature ahead of the split's skip in app.pose */
+  S.feature({ id: "early.pose", abi: 1, targets: ["app.body.vs"], order: -2, append: { "app.pose": "  // early" } });
+  S.feature({ id: "a.pose", abi: 1, targets: ["app.body.vs"], order: -1, append: { "app.pose": "  // a" } });
+  S.feature({ id: "z.pose", abi: 1, targets: ["app.body.vs"], order: -1, append: { "app.pose": "  // z" } });
+  for (const [id, good] of [["early.pose", false], ["a.pose", false], ["z.pose", true]]) {
+    const { B: Q } = sceneBinder(ctx, () => ({ ok: true }));
+    const rq = await Q.activate({ look: "order", features: (q) => (q.kind === "app" && q.stage === "vs" && q.pass === "body" ? q.base.concat([id]) : q.base) });
+    ok(good ? rq.ok && Q.programs("app", "litSkip", 0).vs.includes(SH.LIT_SKIP_GLSL + "\n  // z") : !rq.ok && /ahead of the split's skip/.test(rq.error),
+       "P3-8: " + id + (good ? " (order -1, its id after scene.litSkip): after the skip" : ": refused (it would run ahead of the skip)"), rq);
+  }
+}
+
+section("review P3-9: one writer of .material in web/ (a source scan)");
+{
+  const files = fs.readdirSync(WEB).filter((f) => f.endsWith(".js") && f !== "scene3d.js" && f !== "ocean_materials.js");
+  const hits = [];
+  for (const f of files) fs.readFileSync(path.join(WEB, f), "utf8").split("\n").forEach((l, i) => { if (/\.material\s*=(?!=)/.test(l)) hits.push(f + ":" + (i + 1)); });
+  const own = fs.readFileSync(path.join(WEB, "ocean_materials.js"), "utf8").split("\n").filter((l) => /\.material\s*=(?!=)/.test(l));
+  ok(hits.length === 0 && own.length === 1 && /mesh\.material = u\.e\.rec\.material/.test(own[0]),
+     "no .material = in web/*.js (" + files.length + " files; vendor/ and Classic's scene3d.js aside) but the binder's one, in bind()", { hits, own });
 }
 
 console.log((fails ? "FAIL" : "ok") + ": " + (checks - fails) + "/" + checks + " checks");
