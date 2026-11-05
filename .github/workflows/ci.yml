@@ -29,6 +29,16 @@ jobs:
       - name: Test
         run: ctest --test-dir build --output-on-failure
 
+  # The web front end's type check: tsc --checkJs over tsconfig.json's files (those that
+  # carry // @ts-check) with web/types.d.ts. Checking only, nothing is built: the runner
+  # image's own node / npx, TypeScript pinned (the same command runs locally).
+  web-types:
+    name: web types (tsc --checkJs)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - run: npx -y -p typescript@5.6.3 tsc -p tsconfig.json
+
   # tools/gate_receipts.*: fault suite on temp repos and fake tools (no Emscripten, no gate reuse in CI).
   receipts:
     name: gate receipts (fault suite)

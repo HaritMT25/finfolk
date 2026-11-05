@@ -1,3 +1,4 @@
+// @ts-check
 "use strict";
 /* evo_boids 3-D Ocean: the settings the page offers (web/ocean.js builds the
  * sheet from these), their explanations, and 🎲 Randomize's ranges.
@@ -16,6 +17,7 @@
   /* key: [default, {step, min, max, int, options, bit}]
    *   boolean default = a switch (JSON true / false); bit = a switch that is
    *   an int key (JSON 0 / 1); options = a select (int value) */
+  /** @satisfies {Record<string, ConfigKey>} */
   var KEYS = {
     seed: [42, { step: 1, min: 0, int: true }], population: [300, { step: 1, min: 0, int: true }],
     depth: [240, { step: 10, min: 10, max: 100000 }],
@@ -92,11 +94,13 @@
            lightEnabled: true, depthCostScaled: true, cHold: 0.05, cPress: 0.03, steerFrame: 1 }
   };
   /* The tank sizes a setup may have (oc_init's own limits) */
-  var SIZE_LIMITS = { side: [100, 100000], depth: [10, 100000], population: [0, 100000] };
+  /** @type {SizeLimits} */
+  var SIZE_LIMITS ={ side: [100, 100000], depth: [10, 100000], population: [0, 100000] };
   /* The standard tank, the reference volume Randomize scales a recipe from */
   var REFERENCE = { width: 1920, height: 1080, depth: 240 };
 
   /* oc_set_param's whitelist: these apply at once */
+  /** @type {Record<string, number>} */
   var LIVE = {};
   ["kBuoy", "pitchMax", "vDrag", "wallBand", "buoyMutation", "cHold", "cPress", "foodDepthSpread",
    "waveSpeed", "waveBand", "waveGravity", "deepCurrent", "lightEnabled", "L0", "kWater",
@@ -114,11 +118,13 @@
    * wasm/ocean_wasm.cpp configOk). The sheet keeps such a value for the next
    * Restart, marked so; a negative value for any other live key is outside its
    * range and the field goes back. */
+  /** @type {Record<string, number>} */
   var NEG_ON_RESTART = {};
   ["kBuoy", "foodSpawnBase", "foodSpawnAmp", "foodEnergy", "metabolicRate", "maxAge", "reproEnergy",
    "newbornEnergy"].forEach(function (k) { NEG_ON_RESTART[k] = 1; });
 
   /* The sheet: tabs, then groups of keys. "run" is static HTML in ocean.html. */
+  /** @type {ConfigTab[]} */
   var TABS = [
     { id: "run", title: "Run" },
     { id: "world", title: "World", groups: [
@@ -338,6 +344,7 @@
    * Classic's: food fills the depth too) and sight, plus the Ocean's own: the
    * tuned E1 physics preset, patches at their own depths, own-frame steering.
    * key: [min, max, step, source] */
+  /** @type {Record<string, ConfigRange>} */
   var RANGES = {
     popFactor: [0.7, 1.4, 0.05, "around the default 300"],
     targetFood: [2000, 4800, 100, "Classic's 500-1200, x4 (the Ocean's default is 4 x Classic's)"],
@@ -447,7 +454,7 @@
     function chance(p) { return rand() < p; }
     function pick(a) { return a[Math.floor(rand() * a.length)]; }
     function range(key) { var r = RANGES[key]; return round(r[0] + (r[1] - r[0]) * rand(), r[2]); }
-    var set = {}, labels = [];
+    var set = /** @type {Record<string, any>} */ ({}), labels = /** @type {any[]} (strings, or functions writing one) */ ([]);
     var population = Math.max(50, Math.round(basePop * range("popFactor")));
     var thrust = false;
     var u = rand();
@@ -583,7 +590,7 @@
   function tankText(w, h, d) { return w + " × " + h + " × " + d; }
   function scenario(id, ctx) {
     var sw = ctx.screen, fresh = ctx.walls ? Object.assign({}, FRESH) : {};
-    var r = { id: id, seed: ctx.seed >>> 0, population: KEYS.population[0], depth: KEYS.depth[0], width: sw[0], height: sw[1], cfg: fresh, labels: [] };
+    var r = /** @type {Scenario} (title and summary: below) */ ({ id: id, seed: ctx.seed >>> 0, population: KEYS.population[0], depth: KEYS.depth[0], width: sw[0], height: sw[1], cfg: fresh, labels: /** @type {string[]} */ ([]) });
     var walls = function (cfg) { return cfg.walls === true ? "glass walls" : "wrapping sides"; };
     if (id === "bigtank") {
       var b = BIG_TANK;

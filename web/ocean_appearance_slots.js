@@ -1,3 +1,4 @@
+// @ts-check
 "use strict";
 /* evo_boids 3-D Ocean: the appearance fish's gene slots (window.EvoAppearanceSlots).
  *
@@ -68,6 +69,7 @@
 
   function grown(a, cap) { var b = new a.constructor(cap); b.set(a); return b; }
 
+  /** a store (types: web/types.d.ts SlotStore) @param {SlotStoreOptions} [opts] @returns {SlotStore} */
   function create(opts) {
     opts = opts || {};
     var STRIDE = opts.stride || 63;
@@ -75,12 +77,12 @@
     var BARB = opts.barbelGene === undefined ? -1 : opts.barbelGene, BARB_MIN = opts.barbelMin === undefined ? 0.2 : opts.barbelMin;
     var maxCap = Math.min(MAX_CAP, opts.maxCapacity || MAX_CAP), MAX_RANGES = opts.maxRanges || 32;
 
-    var S = {
+    var S = /** @type {SlotStore} (its methods are added below) */ ({
       epoch: undefined, capacity: 0, data: new Float32Array(0),
       needFull: true,       /* the GPU storage needs one whole upload (new, grown, or restored) */
       dirtyCount: 0, size: 0, nextSlot: 0,
       allocs: 0             /* storage allocations (growths) */
-    };
+    });
     var byId = new Map();                     /* id -> slot */
     var slotId = new Float64Array(0), owned = new Uint8Array(0), mark = new Uint32Array(0);
     var barb = new Uint8Array(0), dirty = new Uint8Array(0), wtime = new Float64Array(0);
@@ -250,7 +252,7 @@
     S.requireFull = function () { S.needFull = true; };
     S.resetOwnership = resetOwnership;
     S.invalidate = function () { resetOwnership(undefined); S.epoch = {}; };   /* (an epoch no snapshot has: the next one installs all) */
-    if (opts.initialCapacity > 0) grow(opts.initialCapacity);
+    if (/** @type {number} (undefined: not > 0) */ (opts.initialCapacity) > 0) grow(opts.initialCapacity);
     S.slotOf = function (id) { var s = byId.get(id); return s === undefined ? -1 : s; };
     S.isDirty = function (s) { return !!dirty[s]; };
     S.stats = function () {
@@ -260,7 +262,9 @@
     return S;
   }
 
+  /** @type {EvoAppearanceSlotsApi} */
   var API = { create: create, SLOT_FLOATS: SLOT_FLOATS, ROW_SLOTS: ROW_SLOTS, MIN_CAPACITY: MIN_CAP, MAX_CAPACITY: MAX_CAP };
   if (typeof module === "object" && module.exports) module.exports = API;
   if (root && root.document) root.EvoAppearanceSlots = API;
-})(typeof window !== "undefined" ? window : this);
+  /* (root: the page; in node, module.exports, which has no document: the API only exported) */
+})(/** @type {Window & typeof globalThis} */ (typeof window !== "undefined" ? window : this));
