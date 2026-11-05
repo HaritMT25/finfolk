@@ -606,7 +606,9 @@
           end(bad.length ? { ok: false, error: "did not compile: " + bad.join(", ") } : { ok: true });
         }
         function fail(e) { end({ ok: false, error: String(e && e.message || e) }); }
-        setTimeout(function () { end({ ok: false, error: "the compile did not finish in 10 s" }); }, 10000);
+        /* (a budget, not a stall: the frames go on drawing the previous set meanwhile; ANGLE / D3D11 on an
+         * Iris Xe takes ~1.2 s a program, and a Look adds about eight) */
+        setTimeout(function () { end({ ok: false, error: "the compile did not finish in 60 s" }); }, 60000);
         try {
           if (renderer.compileAsync) renderer.compileAsync(ws, camera, scene).then(verify, fail);
           else { renderer.compile(ws, camera, scene); verify(); }
