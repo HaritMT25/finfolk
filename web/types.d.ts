@@ -583,6 +583,32 @@ interface EvoAppearanceApi {
   morphBuild(M: any, rings: any, a: number, pat: any, time: number, wag: number, minW: number): any;
 }
 
+/* ---------------- web/ocean_shaders.js (window.EvoOceanShaders) ---------------- */
+
+/** The scene's GLSL text that comes in no variants: the chunks its programs share and the
+ * environment's programs (web/ocean_shaders.js says what each draws). */
+interface EvoOceanShadersApi {
+  FOG_FN: string;
+  BEAM_FN: string;
+  DEPTH_FN: string;
+  CLARITY_FN: string;
+  FLOOR_VS: string;
+  FLOOR_FS: string;
+  SURF_FS: string;
+  FOOD_VS: string;
+  FOOD_FS: string;
+  GLOW_VS: string;
+  GLOW_FS: string;
+  SNOW_VS: string;
+  SNOW_FS: string;
+  GLASS_VS: string;
+  GLASS_FS: string;
+  LINE_VS: string;
+  LINE_FS: string;
+  RING_VS: string;
+  RING_FS: string;
+}
+
 /* ---------------- not checked yet: declared by what checked files use ---------------- */
 
 /** the scene (web/ocean_scene.js create()): what the benchmark and the page's API use of it */
@@ -623,6 +649,7 @@ declare var EvoAppearanceSlots: EvoAppearanceSlotsApi;
 declare var EvoOceanPerf: EvoOceanPerfApi;
 declare var EvoOceanConfig: EvoOceanConfigApi;
 declare var EvoAppearance: EvoAppearanceApi;
+declare var EvoOceanShaders: EvoOceanShadersApi;
 declare var EvoOceanScene: EvoOceanSceneApi;
 declare var EvoOcean: OceanPageApi;
 declare var EVO_ASSETS: EvoAssets;
