@@ -580,6 +580,19 @@ section("review P3-1: the compile's check (compiler())");
   ok(!r.ok && /did not finish in 60 s/.test(r.error), "a compile that never finishes: refused at the budget", r);
   r = await M.compiler({ THREE: T3, renderer: fakeRenderer(new Map()), geometry, timers, lost: () => true })(items([a]));
   ok(!r.ok && /lost/.test(r.error), "a lost context: refused", r);
+  /* the default timers against the browser's rule: setTimeout / clearTimeout called with any `this` but the global (or none)
+   * throw "Illegal invocation" (node's do not care, so a detached native only failed in the browser: g3 at 33fd919) */
+  {
+    const calls = { set: 0, clear: 0 };
+    const strict = vm.createContext({ console });
+    strict.window = strict; strict.globalThis = strict;
+    strict.setTimeout = function (f, ms) { if (this !== undefined && this !== strict) throw new TypeError("Illegal invocation"); calls.set++; return setTimeout(f, ms); };
+    strict.clearTimeout = function (t) { if (this !== undefined && this !== strict) throw new TypeError("Illegal invocation"); calls.clear++; clearTimeout(t); };
+    for (const f of ["ocean_appearance.js", "ocean_shaders.js", "ocean_materials.js"]) vm.runInContext(fs.readFileSync(path.join(WEB, f), "utf8"), strict, { filename: f });
+    const rs = await strict.EvoOceanMaterials.compiler({ THREE: T3, renderer: fakeRenderer(new Map([[a, prog(true)]])), geometry })(items([a]));
+    ok(rs.ok && calls.set === 1 && calls.clear === 1, "the default timers (no opts.timers) under a this-strict setTimeout / clearTimeout, as a browser's: ok, set and cleared",
+       { rs, calls });
+  }
 }
 
 section("review P3: the plain fallback, the split's skip, features() once, freeing, a said failure, the skip first");

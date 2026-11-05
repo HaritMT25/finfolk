@@ -594,7 +594,12 @@
    * check that throws is a failure, never a pass; the budget (60 s: ANGLE / D3D11 takes ~1.2 s a program) only bounds a hung
    * compile, its timer cleared once settled. @param {MaterialCompilerOptions} o */
   function compiler(o) {
-    var budget = o.budgetMs || 60000, timers = o.timers || { set: setTimeout, clear: clearTimeout };
+    /* the platform's timers called as functions: setTimeout / clearTimeout detached into an object and called as its
+     * methods throw "Illegal invocation" in a browser (this would be the object, not the window) */
+    var budget = o.budgetMs || 60000, timers = o.timers || {
+      set: function (/** @type {() => void} */ f, /** @type {number} */ ms) { return setTimeout(f, ms); },
+      clear: function (/** @type {any} */ t) { clearTimeout(t); }
+    };
     /** @param {MaterialCompileItem[]} items @returns {Promise<{ ok: boolean, error?: string }>} */
     return function (items) {
       return new Promise(function (resolve) {
