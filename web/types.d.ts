@@ -752,5 +752,8 @@ declare var EvoAppearance: EvoAppearanceApi;
 declare var EvoOceanShaders: EvoOceanShadersApi;
 declare var EvoOceanPose: EvoOceanPoseApi;
 declare var EvoOceanScene: EvoOceanSceneApi;
+/** set by web/ocean_scene.js when a script it needs did not load ("ocean_shaders.js", "ocean_pose.js" or
+ * both, " and "): the page's "could not start" names it (else "ocean_scene.js", the scene itself) */
+declare var EvoOceanSceneMissing: string | undefined;
 declare var EvoOcean: OceanPageApi;
 declare var EVO_ASSETS: EvoAssets;
