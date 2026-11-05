@@ -38,6 +38,7 @@
  * and the functions that build them, no WebGL: node can load it. Display
  * only: the simulation never reads any of it. */
 (function (root) {
+  root.EvoOceanShaders = null;   /* registered at the end: a throw on the way leaves null (the scene: "failed to run") */
   var FOG_FN = [
     "uniform vec3 uFog; uniform float uFogDensity;",
     "float fogOf(vec3 w) { float d = length(cameraPosition - w) * uFogDensity; return 1.0 - exp(-d * d); }"

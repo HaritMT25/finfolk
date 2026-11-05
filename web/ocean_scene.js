@@ -110,14 +110,19 @@
   /* the GLSL (web/ocean_shaders.js), the swim pose's CPU half (web/ocean_pose.js) and the
    * diagnostics (web/ocean_scene_parity.js, which reads the other two as it loads), all loaded before
    * this file; without any of them there is no scene to offer: the page then says the 3-D tank can't
-   * start, naming the file (EvoOceanSceneMissing) */
-  var SHADERS = window.EvoOceanShaders, POSE = window.EvoOceanPose, PARITY = window.EvoOceanSceneParity, MISSING = [];
-  if (!SHADERS) MISSING.push("ocean_shaders.js");
-  if (!POSE) MISSING.push("ocean_pose.js");
-  if (SHADERS && POSE && !PARITY) MISSING.push("ocean_scene_parity.js");
-  if (MISSING.length) {
-    window.EvoOceanSceneMissing = MISSING.join(" and ");
-    console.error("evo_boids: web/" + MISSING.join(" and web/") + (MISSING.length > 1 ? " are" : " is") + " missing: the 3-D tank cannot be drawn");
+   * start, and why (EvoOceanSceneMissing): a file missing (its namespace undefined: it never ran), or
+   * one that failed to run (null: each sets its namespace null first, so a throw before it registers
+   * leaves null). The diagnostics are not blamed for a file they need */
+  var SHADERS = window.EvoOceanShaders, POSE = window.EvoOceanPose, PARITY = window.EvoOceanSceneParity, MISSING = [], FAILED = [];
+  function need(api, file) { if (api === null) FAILED.push(file); else if (!api) MISSING.push(file); }
+  need(SHADERS, "ocean_shaders.js"); need(POSE, "ocean_pose.js");
+  if (SHADERS && POSE) need(PARITY, "ocean_scene_parity.js");
+  if (MISSING.length || FAILED.length) {
+    var WHY = [];
+    if (MISSING.length) WHY.push(MISSING.join(" and ") + " missing");
+    if (FAILED.length) WHY.push(FAILED.join(" and ") + " failed to run");
+    window.EvoOceanSceneMissing = WHY.join("; ");
+    console.error("evo_boids: the 3-D tank cannot be drawn: web/" + WHY.join("; web/") + (FAILED.length ? " (threw as it loaded)" : ""));
     return;
   }
   var THREE = null;

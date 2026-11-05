@@ -842,13 +842,16 @@ declare var EvoAppearanceSlots: EvoAppearanceSlotsApi;
 declare var EvoOceanPerf: EvoOceanPerfApi;
 declare var EvoOceanConfig: EvoOceanConfigApi;
 declare var EvoAppearance: EvoAppearanceApi;
-declare var EvoOceanShaders: EvoOceanShadersApi;
-declare var EvoOceanPose: EvoOceanPoseApi;
-declare var EvoOceanSceneParity: EvoOceanSceneParityApi;
+/** the scripts web/ocean_scene.js needs: undefined when the file did not load, null when it threw as it
+ * loaded (each sets its namespace null first and registers at the end) */
+declare var EvoOceanShaders: EvoOceanShadersApi | null | undefined;
+declare var EvoOceanPose: EvoOceanPoseApi | null | undefined;
+declare var EvoOceanSceneParity: EvoOceanSceneParityApi | null | undefined;
 declare var EvoOceanScene: EvoOceanSceneApi;
-/** set by web/ocean_scene.js when a script it needs did not load ("ocean_shaders.js", "ocean_pose.js",
- * "ocean_scene_parity.js", " and " between): the page's "could not start" names it (else "ocean_scene.js",
- * the scene itself) */
+/** set by web/ocean_scene.js when a script it needs did not load or failed to run, in words: "<files>
+ * missing", "<files> failed to run" or both, "; " between ("ocean_shaders.js", "ocean_pose.js",
+ * "ocean_scene_parity.js", " and " between): the page's "could not start" says it (else "ocean_scene.js
+ * missing", the scene itself) */
 declare var EvoOceanSceneMissing: string | undefined;
 declare var EvoOcean: OceanPageApi;
 declare var EVO_ASSETS: EvoAssets;

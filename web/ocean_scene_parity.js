@@ -39,8 +39,9 @@
  * move"; module ocean_scene_parity.js). WebGL only through the context a
  * caller hands in. Display only: the simulation never reads any of it. */
 (function (root) {
+  root.EvoOceanSceneParity = null;   /* registered at the end: a throw on the way leaves null (the scene: "failed to run") */
   var SHADERS = root.EvoOceanShaders, POSE = root.EvoOceanPose;
-  if (!SHADERS || !POSE) return;   /* (the scene names the file it misses) */
+  if (!SHADERS || !POSE) return;   /* (the scene names the file missing, or failed to run, not this one) */
   var lines = SHADERS.lines, occurrences = SHADERS.occurrences;
   /** @type {(EA: EvoAppearanceApi, P?: any) => AppearancePrograms} (P: false, true or "lite", read off opts) */
   var appearanceShaders = SHADERS.appearanceShaders;
