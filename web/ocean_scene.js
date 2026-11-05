@@ -501,12 +501,17 @@
      * warmed (an assembly error: the plain programs), and assigns them (bind:
      * the kinds' commits below hand it the variant settle() chose); a feature
      * set (setFeatures: a Look's) takes effect only once every reachable
-     * variant compiled (compileMaterials). The legacy fish and the predators:
-     * the plain [0] and full [1] programs (the lite one is the shadows' only),
-     * sharing their uniforms; made here in the order their materials were made
-     * before the binder (plain, then full; body, then shadow), so three's draw
-     * order is the same; fishMat, shadowMat: the legacy fish's plain ones */
-    var binder = MATERIALS.create({ THREE: THREE, compile: compileMaterials });
+     * variant compiled (its compiler: three's compile, as warmUp's, on each
+     * kind's geometry, then each program checked linked and runnable). The
+     * legacy fish and the predators: the plain [0] and full [1] programs (the
+     * lite one is the shadows' only), sharing their uniforms and, as before
+     * the binder, their materials; made here in the order they were made
+     * before it (plain, then full; body, then shadow), so three's draw order
+     * is the same; fishMat, shadowMat: the plain ones */
+    var binder = MATERIALS.create({ THREE: THREE, compile: MATERIALS.compiler({
+      THREE: THREE, renderer: renderer, camera: camera, scene: scene, lost: function () { return lost; },
+      geometry: function (x) { return (x.kind === "app" ? appKind && appKind.geo : x.kind === "pred" ? preds.geo : fish.geo) || fish.geo; }
+    }) });
     binder.define("fish", { uniforms: { body: fishUniforms, shadow: shadowU } });
     binder.define("pred", { uniforms: { body: fishUniforms, shadow: shadowU } });
     binder.prepare(["fish", "pred"]);
@@ -581,39 +586,6 @@
         } catch (e) { done(); }
       }, 0);
       return false;
-    }
-    /* A feature set's activation (binder.activate, setFeatures): its
-     * materials compiled as warmUp does (on their kind's geometry, the faces'
-     * on the Look's), then each program checked runnable (three checks a
-     * program's link when it is first used: getUniforms; diagnostics). A
-     * Promise of {ok, error}; the binder switches to the set only on ok */
-    function compileMaterials(items) {
-      return new Promise(function (resolve) {
-        if (lost) { resolve({ ok: false, error: "the WebGL context is lost" }); return; }
-        var ws = new THREE.Scene(), settled = false;
-        function end(r) { if (!settled) { settled = true; resolve(r); } }
-        items.forEach(function (x) {
-          var g = x.geometry ? x.geometry() : x.kind === "app" ? appKind && appKind.geo : x.kind === "pred" ? preds.geo : fish.geo;
-          var o = new THREE.Mesh(g || fish.geo, x.material); o.frustumCulled = false; ws.add(o);
-        });
-        function verify() {
-          var bad = items.filter(function (x) {
-            var p = renderer.properties.get(x.material).currentProgram;
-            if (!p) return true;
-            p.getUniforms();
-            return !!(p.diagnostics && p.diagnostics.runnable === false);
-          }).map(function (x) { return x.key; });
-          end(bad.length ? { ok: false, error: "did not compile: " + bad.join(", ") } : { ok: true });
-        }
-        function fail(e) { end({ ok: false, error: String(e && e.message || e) }); }
-        /* (a budget, not a stall: the frames go on drawing the previous set meanwhile; ANGLE / D3D11 on an
-         * Iris Xe takes ~1.2 s a program, and a Look adds about eight) */
-        setTimeout(function () { end({ ok: false, error: "the compile did not finish in 60 s" }); }, 60000);
-        try {
-          if (renderer.compileAsync) renderer.compileAsync(ws, camera, scene).then(verify, fail);
-          else { renderer.compile(ws, camera, scene); verify(); }
-        } catch (e) { fail(e); }
-      });
     }
     /* the instance attributes' uploads for n instances (but skip's); returns
      * the bytes queued (item-size aware) */
@@ -757,8 +729,10 @@
                       uAlpha: shadowMat.uniforms.uAlpha, uPxPerUnit: U.uPxPerUnit,
                       uGenes: U.uGenes, uRingT: U.uRingT, uRingN: U.uRingN, uHalfRing: U.uHalfRing, uWalls: common.uWalls };
       /* its materials (the binder's): the body's plain and full programs (settle), the shadow's plain and
-       * polished (the roll only: the lite polish), sharing their uniforms, and the split's main draw (below);
-       * made in that order, as before the binder. mat: the plain body's (the probes bind its uGenes) */
+       * polished (the roll only: the lite polish), sharing their uniforms (the water's clarity's among them,
+       * added first: a Look's materials merge them in when they are made), and the split's main draw
+       * (below); made in that order, as before the binder. mat: the plain body's (the probes bind its uGenes) */
+      clarityUniforms(U);
       binder.define("app", { uniforms: { body: U, shadow: shadowU }, env: { EA: EA } });
       binder.prepare(["app"]);
       var mat = binder.material("app", "body", 0);
@@ -987,6 +961,8 @@
         if (full && litSplit) {
           if (nLit === 0) full = false;
           else split = self.splitOn ? nLit * 5 <= n * 3 : nLit * 2 <= n;
+          /* (no skip to draw the main draw with: the lit fish would be drawn twice; the whole kind full instead) */
+          if (split && !binder.has("app", "litSkip", 0)) split = false;
         }
         self.splitOn = split;
         var w = full ? 1 : 0;
@@ -1438,7 +1414,7 @@
     function appearanceDrawn(s) {
       if (!EA || !s.app || s.app.length < s.n * EA.STRIDE) return null;
       if (!appKind) {
-        try { appKind = AppKind(); clarityUniforms(appKind.mat.uniforms); appStatus = "drawing"; }
+        try { appKind = AppKind(); appStatus = "drawing"; }   /* (its clarity uniforms: AppKind's own, before the binder's) */
         catch (e) { appStatus = "unavailable: " + (e && e.message || e); EA = null; console.warn("evo_boids: appearance renderer", e); return null; }
       }
       var r = appKind.reconcile(s, quality >= 3 ? "medium" : "coarse");

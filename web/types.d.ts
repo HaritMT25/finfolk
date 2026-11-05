@@ -802,21 +802,39 @@ interface MaterialSet {
   readonly attach: { face: MaterialAttach } | null;
   readonly uniforms: { [kind: string]: { [name: string]: { value: any } } } | null;
   readonly layouts: { readonly [kind: string]: AttributeLayout };
+  /** a digest of the faces' GLSL and options ("" without them): in the faces' key */
+  readonly faceDigest: string;
 }
 /** A kind as the scene defines it: its uniforms by pass (the scene's objects: every variant shares them), the programs'
  * environment (the appearance law). */
 interface MaterialKindDef { uniforms: { [pass: string]: object }; env?: ShaderEnv }
-/** A cached material: its key and what it is; state reserved: made, its GLSL not assembled yet. */
+/** What a (kind, pass, variant) draws under a set: its features per stage, its layout, its key, and its share key (the key
+ * without the kind: the keys whose material would be identical share it). */
+interface Described {
+  key: string; share: string; kind: string; pass: string; variant: number; vs: string[]; fs: string[]; layout: AttributeLayout; set: MaterialSet;
+}
+/** A material and its state, shared by the keys it draws (refs); reserved: made, its GLSL not assembled yet. */
+interface BinderRecord { share: string; material: any; state: "reserved" | "ready" | "failed"; error: string; refs: number }
+/** A cached material: its key, what it is, its (shared) record. */
 interface BinderEntry {
   key: string; kind: string; pass: string; variant: number; vs: string[]; fs: string[];
-  layout: AttributeLayout; set: MaterialSet; material: any; state: "reserved" | "ready" | "failed"; error: string;
+  layout: AttributeLayout; set: MaterialSet; rec: BinderRecord;
 }
 /** What a mesh was last bound to: the variant asked, the one drawn (0 on a fallback), the material's key. */
 interface MaterialBound { kind: string; pass: string; variant: number; effective: number; key: string; fallback: boolean }
 /** One material an activation compiles. */
 interface MaterialCompileItem { key: string; kind: string; pass: string; variant: number; material: any; geometry: (() => any) | null }
-/** An activation's outcome (stage: where it failed). */
-interface MaterialActivation { ok: boolean; look: string; stage?: "spec" | "assembly" | "compile"; error?: string; keys?: string[] }
+/** An activation's outcome (stage: where it failed); keys: every key it covers; materials: the distinct ones compiled. */
+interface MaterialActivation { ok: boolean; look: string; stage?: "spec" | "assembly" | "compile"; error?: string; keys?: string[]; materials?: number }
+/** The scene's compile for activations (EvoOceanMaterials.compiler): three (Scene, Mesh), its renderer, camera and scene, a
+ * kind's geometry, whether the context is lost; the budget (ms, 60 s) and the timers (tests). */
+interface MaterialCompilerOptions {
+  THREE: any; renderer: any; camera: any; scene: any;
+  geometry: (item: MaterialCompileItem) => any;
+  lost?: () => boolean;
+  budgetMs?: number;
+  timers?: { set: (f: () => void, ms: number) => any; clear: (t: any) => void };
+}
 /** The binder's needs: three (ShaderMaterial, DoubleSide, LessDepth), the activation's compile, the console. */
 interface MaterialBinderDeps {
   THREE: any;
@@ -824,7 +842,7 @@ interface MaterialBinderDeps {
   warn?: (m: string) => void;
 }
 interface MaterialBinderState {
-  look: string; version: number; pending: boolean; kinds: string[];
+  look: string; version: number; pending: boolean; kinds: string[]; covered: string[]; materials: number;
   entries: { key: string; state: string; error: string }[]; failed: string[];
 }
 /** The scene's material binder (EvoOceanMaterials.create): web/ocean_materials.js says what each does. */
@@ -832,6 +850,8 @@ interface MaterialBinder {
   define(kind: string, def: MaterialKindDef): void;
   prepare(kinds: string[]): void;
   material(kind: string, pass: string, variant: number): any;
+  /** its own programs assemble (no fallback): the split asks before it skips the lit fish in the main draw */
+  has(kind: string, pass: string, variant: number): boolean;
   bind(mesh: { material: any }, kind: string, pass: string, variant: number): number;
   bound(mesh: object): MaterialBound | null;
   variantOf(mesh: object): number;
@@ -851,6 +871,7 @@ interface EvoOceanMaterialsApi {
   LIT_SKIP_FEATURE: string;
   layout(kind: string, claims?: { [component: string]: string }): AttributeLayout;
   create(deps: MaterialBinderDeps): MaterialBinder;
+  compiler(o: MaterialCompilerOptions): (items: MaterialCompileItem[]) => Promise<{ ok: boolean; error?: string }>;
 }
 
 /* ---------------- web/ocean_pose.js (window.EvoOceanPose) ---------------- */
