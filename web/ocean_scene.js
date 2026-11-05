@@ -80,7 +80,9 @@
  *
  * Cost model: one instanced draw for all fish, one for their shadows, one each
  * for predators, food, currents and the floor. Per frame the CPU only packs
- * the spine points (20 floats per fish) into instance buffers (and, with the
+ * the spine points (20 floats per fish) into instance buffers (the appearance
+ * genes only of the fish new to the renderer, into their gene slots, and
+ * only those slots are uploaded: web/ocean_appearance_slots.js; and, with the
  * polish, each lit fish's swim pose: one packed float, from its spine, a swimming-speed
  * estimate (a merge by id, no allocation) and its size on screen); the
  * bending, shading and tail beat happen in the shaders.
@@ -637,7 +639,7 @@
    * the M1 template deformed by the 30 shape genes and its skin is pattern
    * law 3 from the 33 pattern floats, at the vertex's canonical material
    * site, evaluated before the bend and the swim, so the pattern never
-   * slides. 7 vertex attributes. The legacy base / countershade / fin tint stage is not
+   * slides. 8 vertex attributes. The legacy base / countershade / fin tint stage is not
    * applied to the skin (the genes carry their own).
    * uColourBy = 1 (the page's Family / Brain colours) keeps the body and
    * swaps only the skin: the fish's family / brain colour, packed 0xRRGGBB in
@@ -646,12 +648,17 @@
    * back, pale belly, paler fins) at the legacy template's height, (1 − 2v)
    * times the canonical profile, which equals FISH_FS's vOy on a neutral
    * body. The lighting, eyes, selection, fog and flashlight are shared. */
-  /* An instance's gene slot: the 16-texel row of the gene texture its genes
+  /* An instance's gene slot: the 16-texel run of the gene texture its genes
    * are in (EvoAppearance GENES fetchGenes). One string for every program
-   * that reads genes (the fish and its shadow, the transform-feedback check,
-   * the live-texture probes), so that a change of ownership changes them all
-   * at once. Today the slot is the draw index. */
-  var GENE_SLOT_GLSL = "int appearanceSlot() { return gl_InstanceID; }";
+   * that reads genes (the fish and its shadow in every variant, the
+   * transform-feedback check, the live-texture probes), so that a change of
+   * ownership changes them all at once. The slot is the fish's own (render
+   * PR2: web/ocean_appearance_slots.js keeps it for the fish's id while it
+   * lives), handed over in the scalar instance attribute iGeneSlot: an
+   * integer in a float (exact below 2^24), so int() needs no rounding. The
+   * draw order is then free (gl_InstanceID no longer picks the genes). */
+  var GENE_SLOT_RET = "return int(iGeneSlot);";
+  var GENE_SLOT_GLSL = "attribute float iGeneSlot;\nint appearanceSlot() { " + GENE_SLOT_RET + " }";
   /* the pattern genes of the fetched slot -> the flat pattern varyings (the
    * fish's vertex shader and the texture-backed chart probe) */
   var DECODE_CALL = "patternDecode(GT[0], GT[1], GT[2], GT[3], GT[4], GT[5], GT[6], GT[7].xyz, vec2(GT[7].w, GT[8].x), iX.z);";
@@ -894,7 +901,7 @@
     /* the live gene texture's probes (appearanceTextureParity), with the
      * fish's own GENES, GENE_SLOT_GLSL and DECODE_CALL. probeRawVs: an
      * instance's 16 texels as fetched, onto 16 pixels of a float target
-     * (placed by draw index, read through appearanceSlot()); probeChartVs: the
+     * (placed by draw index, read from its slot through appearanceSlot()); probeChartVs: the
      * chart above, fed from the gene texture and the production iX, in the
      * cell iCell gives it (off the target for an instance not charted) */
     var probeRawVs = [
@@ -989,16 +996,18 @@
   }
 
   /* The genes' GPU layout (EvoAppearance GENES fetchGenes): a fish's 63
-   * floats and one zero in 16 RGBA32F texels, 512 texels a texture row. The
-   * renderer (AppKind, fillApp) and the production-path check pack it with these. */
+   * floats and one zero in 16 RGBA32F texels at its slot, 512 texels a
+   * texture row (32 slots). The renderer's storage is the slot store's
+   * (web/ocean_appearance_slots.js, the same layout); the production-path
+   * check packs its fixture at its slots with these. */
   var GENES_W = 512, GENE_TEXELS = 16;
   function genesRows(cap) { return Math.ceil(cap * GENE_TEXELS / GENES_W); }
-  function packGenes(T, R, r, c, ST) {
-    var to = 4 * GENE_TEXELS * c;
+  function packGenes(T, R, r, slot, ST) {
+    var to = 4 * GENE_TEXELS * slot;
     for (var j = 0; j < ST; j++) T[to + j] = R[r + j];
     T[to + 63] = 0;
   }
-  /* the renderer's capacity for n fish (AppKind ensure) */
+  /* a power-of-two capacity (256 up) for n: the instance buffers' (AppKind ensure), the fixture's texture */
   function capFor(n) { var cap = 256; while (cap < n) cap *= 2; return cap; }
 
   /* The fixed fixture of appearancePathCheck, whatever the caller's world:
@@ -1033,8 +1042,14 @@
    * arithmetic (a NaN fails no |a - b| > tol test, and min(x, 10) hides an
    * infinity); report.nan counts the vertices with any non-finite output.
    * opts.mutate plants a fault ("row0", "nextRow", "slot": the texture
-   * lookup; "partW": vPart.w loses the packed colour): the check must then
-   * fail. opts.injectSweep: after the run, NaN / +Inf / -Inf put into each
+   * lookup; "partW": vPart.w loses the packed colour; "drawIndex": the slot
+   * selector back on gl_InstanceID, which only a nonidentity slot map
+   * catches): the check must then fail.
+   * opts.slotMap: the fish's gene slots (iGeneSlot), "identity" (the
+   * default: slot = draw), "permuted" (a bijection of the draws) or "sparse"
+   * (both sides of the texture rows' 31 / 32, 63 / 64 and 2047 / 2048, the
+   * rest spread: a 4,096-slot texture); the genes are packed at their slots,
+   * the expected rows stay in draw order. opts.injectSweep: after the run, NaN / +Inf / -Inf put into each
    * captured component in turn (of two fish of the medium body, one on the
    * second texture row) must each fail with that component named.
    * opts.polish: the polished program (POSE_GLSL) instead of the plain one,
@@ -1055,8 +1070,22 @@
     row0: [PATH_FETCH, "int li = 16 * 0 + k;"],
     nextRow: [PATH_FETCH, "int li = 16 * (inst + 1) + k;"],
     slot: [PATH_FETCH, "int li = 16 * inst + (k ^ 1);"],
-    partW: ["vPart = vec4(aPattern.x, aPattern.z, iBody.z, iX.w);", "vPart = vec4(aPattern.x, aPattern.z, iBody.z, 0.0);"]
+    partW: ["vPart = vec4(aPattern.x, aPattern.z, iBody.z, iX.w);", "vPart = vec4(aPattern.x, aPattern.z, iBody.z, 0.0);"],
+    drawIndex: [GENE_SLOT_RET, "return gl_InstanceID;"]
   };
+  function gcd(a, b) { while (b) { var t = a % b; a = b; b = t; } return a; }
+  /* the check's gene slots for n fish (opts.slotMap above) */
+  function slotMap(kind, n) {
+    var out = new Float32Array(n), c;
+    if (kind === "permuted") {
+      var m = [7, 11, 13, 17, 19, 23, 29, 31].filter(function (k) { return gcd(k, n) === 1; })[0] || 1;
+      for (c = 0; c < n; c++) out[c] = (c * m + 3) % n;
+    } else if (kind === "sparse") {
+      var fixed = [2048, 31, 32, 2047, 63, 64, 0, 1], seen = {};
+      for (c = 0; c < n; c++) { var sl = c < fixed.length ? fixed[c] : 100 + 29 * c; while (seen[sl]) sl++; seen[sl] = 1; out[c] = sl; }
+    } else for (c = 0; c < n; c++) out[c] = c;
+    return out;
+  }
   var POSE_SPECIAL = ["straight, into a pane", "collapsed", "sharp left", "sharp right", "genes 0", "genes 1"];
   function poseFixture(c) {   /* packed (packPose) */
     var w = [1, 0.6, 0.25, 0][c % 4], bank = 0.6 * Math.sin(1.7 * c + 0.4);
@@ -1094,12 +1123,15 @@
       rows = rows.concat([rows[0], rows[1], rows[2], rows[3], g0, g1]);
       lams = lams.concat([4, 4, 4, 4, 4, 4]);
     }
-    var n = rows.length, ST = EA.STRIDE, cap = capFor(n), texRows = genesRows(cap);
+    var n = rows.length, ST = EA.STRIDE, slots = slotMap(opts.slotMap, n), top = 0;
+    for (var c0 = 0; c0 < n; c0++) if (slots[c0] > top) top = slots[c0];
+    var cap = capFor(top + 1), texRows = genesRows(cap);
     var T = new Float32Array(GENES_W * texRows * 4), R = new Float32Array(n * ST);
-    for (var c = 0; c < n; c++) { for (var j = 0; j < ST; j++) R[c * ST + j] = rows[c][j]; packGenes(T, R, c * ST, c, ST); }
+    for (var c = 0; c < n; c++) { for (var j = 0; j < ST; j++) R[c * ST + j] = rows[c][j]; packGenes(T, R, c * ST, slots[c], ST); }
     var U = { half: [960, 540], px: 500, cam: [120, 380, 900], colourBy: colourBy,
               polish: !!P, lite: P === "lite", time: P ? 0.7 : 0, wag: P ? 1 : 0, walls: !!P };
-    var inst = { iA: new Float32Array(4 * n), iB: new Float32Array(4 * n), iC: new Float32Array(4 * n), iBody: new Float32Array(4 * n), iX: new Float32Array(4 * n) };
+    var inst = { iA: new Float32Array(4 * n), iB: new Float32Array(4 * n), iC: new Float32Array(4 * n), iBody: new Float32Array(4 * n), iX: new Float32Array(4 * n),
+                 iGeneSlot: slots };
     var poseG = { gate: false }, xs = [], ys = [];
     for (c = 0; c < n; c++) {
       var lam = Math.fround(lams[c]), Rb = Math.fround(4.6 * (0.8 + 0.4 * ((c * 0.37) % 1))), sp = lam * Rb / 5;
@@ -1146,15 +1178,15 @@
       gl.uniform1fv(uni("uRingT[0]") || uni("uRingT"), ringT); gl.uniform1i(uni("uRingN"), tpl.ringT.length); gl.uniform1f(uni("uHalfRing"), tpl.half);
       var vao = gl.createVertexArray();
       gl.bindVertexArray(vao);
-      function attr(name, data, divisor) {
+      function attr(name, data, divisor, size) {
         var loc = gl.getAttribLocation(prog, name);
         if (loc < 0) return;
         var b = gl.createBuffer(); bufs.push(b);
         gl.bindBuffer(gl.ARRAY_BUFFER, b); gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
-        gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, 4, gl.FLOAT, false, 0, 0); gl.vertexAttribDivisor(loc, divisor);
+        gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, size || 4, gl.FLOAT, false, 0, 0); gl.vertexAttribDivisor(loc, divisor);
       }
       attr("aT", tpl.pos, 0); attr("aPattern", tpl.pat, 0);
-      Object.keys(inst).forEach(function (nm) { attr(nm, inst[nm], 1); });
+      Object.keys(inst).forEach(function (nm) { attr(nm, inst[nm], 1, nm === "iGeneSlot" ? 1 : 4); });
       var out = gl.createBuffer(); bufs.push(out);
       gl.bindBuffer(gl.TRANSFORM_FEEDBACK_BUFFER, out);
       gl.bufferData(gl.TRANSFORM_FEEDBACK_BUFFER, tpl.verts * n * NC * 4, gl.STREAM_READ);
@@ -1183,7 +1215,8 @@
     }
     return fenceDone(gl, sync, 10000).then(function (why) {
       if (why) { cleanup(); return { error: why, colourBy: colourBy }; }
-      var res = { fish: n, texRows: texRows, colourBy: colourBy, polish: P, special: P ? POSE_SPECIAL : undefined, components: NC, mutate: opts.mutate || "", tol: PATH_TOL, templates: {}, ok: true };
+      var res = { fish: n, texRows: texRows, slotMap: opts.slotMap || "identity", maxSlot: top, colourBy: colourBy, polish: P, special: P ? POSE_SPECIAL : undefined,
+                  components: NC, mutate: opts.mutate || "", tol: PATH_TOL, templates: {}, ok: true };
       var datas = {};
       jobs.forEach(function (jb) {
         var V = jb.tpl.verts, data = new Float32Array(V * n * NC);
@@ -1461,8 +1494,9 @@
    * shader, for the plain programs (appearance, recolour, fragment), the
    * full ones (polish.appearance, polish.recolour, polish.fragment) and the
    * lite ones (polish.lite.appearance, .recolour; their fragment stage is
-   * the plain one).
-   * opts.mutate / opts.fsMutate as above (planted in both); opts.injectSweep
+   * the plain one); and the gene slots apart from the draw order (slots:
+   * the plain appearance mode with a permuted and a sparse slot map).
+   * opts.mutate / opts.fsMutate as above (planted in all); opts.injectSweep
    * on the plain vertex checks. */
   function appearancePathCheck(gl, EA, rows, lams, opts) {
     opts = opts || {};
@@ -1475,14 +1509,18 @@
                         appearanceVertexCheck(gl, EA, R, L, o({ colourBy: 1, polish: true, injectSweep: false })),
                         appearanceFragmentCheck(gl, EA, o({ polish: true })),
                         appearanceVertexCheck(gl, EA, R, L, o({ colourBy: 0, polish: "lite", injectSweep: false })),
-                        appearanceVertexCheck(gl, EA, R, L, o({ colourBy: 1, polish: "lite", injectSweep: false }))])
+                        appearanceVertexCheck(gl, EA, R, L, o({ colourBy: 1, polish: "lite", injectSweep: false })),
+                        appearanceVertexCheck(gl, EA, R, L, o({ colourBy: 0, slotMap: "permuted", injectSweep: false })),
+                        appearanceVertexCheck(gl, EA, R, L, o({ colourBy: 0, slotMap: "sparse", injectSweep: false }))])
       .then(function (r) {
         var errs = [];
-        ["appearance", "recolour", "fragment", "polish.appearance", "polish.recolour", "polish.fragment", "polish.lite.appearance", "polish.lite.recolour"].forEach(function (k, i) { if (r[i].error) errs.push(k + ": " + r[i].error); });
+        ["appearance", "recolour", "fragment", "polish.appearance", "polish.recolour", "polish.fragment", "polish.lite.appearance", "polish.lite.recolour",
+         "slots.permuted", "slots.sparse"].forEach(function (k, i) { if (r[i].error) errs.push(k + ": " + r[i].error); });
         var out = { ok: errs.length === 0 && r.every(function (x) { return x.ok === true; }), fixture: fx.rows.length, fish: R.length,
                     appearance: r[0], recolour: r[1], fragment: r[2],
                     polish: { ok: r[3].ok === true && r[4].ok === true && r[5].ok === true && r[6].ok === true && r[7].ok === true,
-                              appearance: r[3], recolour: r[4], fragment: r[5], lite: { appearance: r[6], recolour: r[7] } } };
+                              appearance: r[3], recolour: r[4], fragment: r[5], lite: { appearance: r[6], recolour: r[7] } },
+                    slots: { ok: r[8].ok === true && r[9].ok === true, permuted: r[8], sparse: r[9] } };
         if (errs.length) out.error = errs.join("; ");
         return out;
       });
@@ -2015,10 +2053,11 @@
     var SP = profiler.SPAN || {}, PK = profiler.K || {};
     profiler.attachGL(renderer.getContext());
     var vrand = opts.visualRandom || Math.random;
-    /* the gene texture's uploads as three performed them (DataTexture.onUpdate),
-     * kept with or without a profiler: the live-texture probe asserts it
-     * caused none */
-    var geneIO = { uploads: 0, bytes: 0, allocs: 0 };
+    /* the gene texture's uploads as three performed them (DataTexture.onUpdate:
+     * uploads, one per consumed texture update; calls, its texSubImage2D calls,
+     * one per range or one for the whole texture; bytes), kept with or without
+     * a profiler: the live-texture probe asserts it caused none */
+    var geneIO = { uploads: 0, calls: 0, bytes: 0, allocs: 0 };
     /* test-only: holdGeneUploads leaves the gene texture's upload out, so a
      * stale texture can be shown to fail appearanceTextureParity */
     var testFaults = { holdGeneUploads: false };
@@ -2028,7 +2067,11 @@
     renderer.setClearColor(new THREE.Color().setRGB(C.fog[0], C.fog[1], C.fog[2], "srgb"), 1);
     var lost = false;
     canvas.addEventListener("webglcontextlost", function (e) { e.preventDefault(); lost = true; });
-    canvas.addEventListener("webglcontextrestored", function () { lost = false; });
+    canvas.addEventListener("webglcontextrestored", function () {
+      lost = false;
+      /* three made new GPU storage for the gene texture: one whole upload (the slots keep their owners and data) */
+      if (appKind) { appKind.slots.requireFull(); appKind.pending = null; }
+    });
 
     var scene = new THREE.Scene();
     var camera = new THREE.PerspectiveCamera(FOV, 1, 4, 20000);
@@ -2205,11 +2248,12 @@
       }, 0);
       return false;
     }
-    /* the instance attributes' uploads for n instances; returns the bytes
-     * queued (item-size aware) */
-    function commitInstances(attrs, n) {
+    /* the instance attributes' uploads for n instances (but skip's); returns
+     * the bytes queued (item-size aware) */
+    function commitInstances(attrs, n, skip) {
       var bytes = 0;
       Object.keys(attrs).forEach(function (name) {
+        if (name === skip) return;
         var a = attrs[name];
         a.clearUpdateRanges();
         a.addUpdateRange(0, n * a.itemSize);
@@ -2282,16 +2326,37 @@
     var warmFish = Warm([fishMats[1], shadowMats[1]], function () { return fish.geo; });
 
     /* The appearance genome's fish (built on the first snapshot with s.app;
-     * null without web/ocean_appearance.js or float textures): the M1
-     * template at two qualities (medium; coarse while the tank's detail is
-     * below 3), the barbel strips as a second instanced draw sharing every
-     * instance attribute, and a fish's 63 genes in a RGBA32F texture (16
-     * texels a fish, 512 wide). Rebuilt only when it has to grow. appSkin
-     * (setAppearance): the skin from the genes, else the family / brain colour. */
-    var EA = window.EvoAppearance || null;
-    var appSkin = false, appStatus = EA ? "ready" : "web/ocean_appearance.js not loaded";
+     * null without web/ocean_appearance.js, web/ocean_appearance_slots.js or
+     * float textures): the M1 template at two qualities (medium; coarse while
+     * the tank's detail is below 3), the barbel strips as a second instanced
+     * draw sharing every instance attribute, and a fish's 63 genes in a
+     * RGBA32F texture (16 texels a fish, 512 wide) at the fish's own gene
+     * slot (render PR2): AppKind.slots (EvoAppearanceSlots) owns the slots and
+     * the texture's storage, keyed by the fish's id and the world's epoch;
+     * reconcile(s) hands it each snapshot (a fish's genes are copied once,
+     * when it is first seen) and writes each draw's slot into iGeneSlot. Two
+     * lifetimes: the instance buffers and geometries (rebuildGeometry: on
+     * growth of the draw, or a quality change: the gene texture stays), and
+     * the gene texture (ensureGeneTexture: new GPU storage only when the
+     * slots' storage grew). The upload (commit) is the slots' plan: nothing
+     * on a frame whose fish are the last frame's, the dirty slots' ranges
+     * after births, the whole texture for new GPU storage; a plan counts as
+     * done only when three performed it (onUpdate). appSkin (setAppearance):
+     * the skin from the genes, else the family / brain colour. */
+    var EA = window.EvoAppearance || null, SLOTS = window.EvoAppearanceSlots || null;
+    var appSkin = false, appStatus = !EA ? "web/ocean_appearance.js not loaded" : (SLOTS ? "ready" : "web/ocean_appearance_slots.js not loaded");
     var appKind = null;
+    /* the gene uploads: "dirty" (the slots' plans), or "full" (the whole
+     * texture every frame, as before PR2, through the same slots: measurements
+     * and the dirty-vs-full reference only; setGeneUploads) */
+    var genePolicy = "dirty";
     function AppKind() {
+      if (!SLOTS) throw new Error("web/ocean_appearance_slots.js not loaded");
+      var gl0 = renderer.getContext(), maxTex = gl0.getParameter(gl0.MAX_TEXTURE_SIZE);
+      if (!(maxTex >= GENES_W)) throw new Error("MAX_TEXTURE_SIZE " + maxTex + " is below the gene texture's width " + GENES_W);
+      /* at most MAX_TEXTURE_SIZE rows of 32 slots (and 2^24: a slot is exact in a float) */
+      var slots = SLOTS.create({ stride: EA.STRIDE, barbelGene: EA.MO + 26, barbelMin: 0.2, initialCapacity: 256,
+                                 maxCapacity: Math.min(SLOTS.MAX_CAPACITY, maxTex * (GENES_W / GENE_TEXELS)) });
       var sh = appearanceShaders(EA, false), shP = appearanceShaders(EA, true);
       var tpls = { medium: EA.buildTemplate("medium"), coarse: EA.buildTemplate("coarse") };
       var barbTpl = EA.buildBarbels("medium");
@@ -2315,18 +2380,24 @@
                                           transparent: true, depthWrite: true, depthFunc: THREE.LessDepth, side: THREE.DoubleSide });
       });
       var shMat = shMats[0];
+      /* cap: the draw's capacity (instance buffers); slots.capacity: the gene texture's (gene slots) */
       var self = { cap: 0, n: 0, lod: "", attrs: null, geo: null, bgeo: null, mesh: null, bmesh: null, shadow: null,
-                   tex: null, texData: null, mat: mat, shaders: sh, barbels: false, tpls: tpls, barbTpl: barbTpl, planBytes: 0, bytes: 0 };
+                   tex: null, texData: null, slots: slots, pending: null, slotAttrFresh: false, last: null,
+                   mat: mat, shaders: sh, barbels: false, tpls: tpls, barbTpl: barbTpl, bytes: 0 };
       self.warm = Warm([mats[1], shMats[1]], function () { return self.geo; });   /* its polished programs (warmUp) */
-      var INST = ["iA", "iB", "iC", "iBody", "iX"];
-      self.inst = INST;   /* the instance attributes the probes share */
-      /* three uploaded the gene texture (DataTexture.onUpdate): the pending
-       * upload's bytes (a number: nothing allocated a frame) */
-      function onGeneUpload() {
-        var bytes = self.planBytes || self.texData.byteLength;
-        self.planBytes = 0;
-        geneIO.uploads++; geneIO.bytes += bytes;
-        profiler.add(PK.geneUploads, 1); profiler.add(PK.geneUploadBytes, bytes);
+      var INST = ["iA", "iB", "iC", "iBody", "iX", "iGeneSlot"];
+      self.inst = INST;   /* the instance attributes the probes share (iGeneSlot: the slots they read through) */
+      /* three uploaded the gene texture (DataTexture.onUpdate, after its
+       * texSubImage2D calls): the pending plan is done (its slots clean, its
+       * calls and bytes counted); an upload no plan asked for (a probe's
+       * planted needsUpdate) was the whole texture */
+      function onGeneUpload(t) {
+        if (t && t !== self.tex) return;   /* (a texture replaced on growth) */
+        var p = self.pending, calls = 1, bytes = self.texData.byteLength;
+        self.pending = null;
+        if (p) { calls = p.calls; bytes = p.bytes; slots.acknowledge(p); }
+        geneIO.uploads++; geneIO.calls += calls; geneIO.bytes += bytes;
+        profiler.add(PK.geneUploads, 1); profiler.add(PK.geneUploadCalls, calls); profiler.add(PK.geneUploadBytes, bytes);
       }
       function geometry(tpl, at) {
         var g = new THREE.InstancedBufferGeometry();
@@ -2344,28 +2415,20 @@
         for (var i = 0; i < 16; i++) U.uRingT.value[i] = i < tpl.ringT.length ? tpl.ringT[i] : 0;
         U.uRingN.value = tpl.ringT.length; U.uHalfRing.value = tpl.half;
       }
-      function build(cap, lod) {
+      /* the instance buffers (four floats a fish, one for the slot) and the
+       * geometries for a draw of cap fish at quality lod; the gene texture is not touched */
+      function rebuildGeometry(cap, lod) {
         var at = {};
         INST.forEach(function (name) {
-          var a = new THREE.InstancedBufferAttribute(new Float32Array(cap * 4), 4);
+          var k = name === "iGeneSlot" ? 1 : 4;
+          var a = new THREE.InstancedBufferAttribute(new Float32Array(cap * k), k);
           a.setUsage(THREE.DynamicDrawUsage);
           at[name] = a;
         });
         var g = geometry(tpls[lod], at), bg = barbTpl ? geometry(barbTpl, at) : null;
-        var rows = genesRows(cap);   /* 16 texels a fish */
-        var data = new Float32Array(GENES_W * rows * 4);
-        /* RGBA32F, nearest, no mipmaps (three's RGBAFormat 1023, FloatType 1015,
-         * NearestFilter 1003: the trimmed bundle does not export the names) */
-        var tex = new THREE.DataTexture(data, GENES_W, rows, 1023, 1015);
-        tex.magFilter = tex.minFilter = 1003;
-        tex.generateMipmaps = false;
-        tex.needsUpdate = true;
-        tex.onUpdate = onGeneUpload;
-        self.planBytes = data.byteLength;   /* its allocation's upload */
-        geneIO.allocs++;
-        profiler.add(PK.texAllocs, 1); profiler.add(PK.instAllocBytes, allocBytes(at, cap));
+        profiler.add(PK.instAllocBytes, allocBytes(at, cap));
         if (self.geo) {
-          self.geo.dispose(); if (self.bgeo) self.bgeo.dispose(); self.tex.dispose();
+          self.geo.dispose(); if (self.bgeo) self.bgeo.dispose();
           self.mesh.geometry = g; self.shadow.geometry = g;
           if (self.bmesh && bg) self.bmesh.geometry = bg;
         } else {
@@ -2382,35 +2445,80 @@
             profiler.watch(self.bmesh, "barbels");
           }
         }
-        U.uGenes.value = tex;
         setRings(tpls[lod]);
-        self.geo = g; self.bgeo = bg; self.attrs = at; self.cap = cap; self.lod = lod; self.tex = tex; self.texData = data;
+        self.geo = g; self.bgeo = bg; self.attrs = at; self.cap = cap; self.lod = lod;
+        self.slotAttrFresh = true;   /* the slots are written into the new iGeneSlot: upload it */
+      }
+      /* the gene texture over the slots' storage: new GPU storage (one whole
+       * upload) the first time and whenever the slots' storage grew; the
+       * uniform then names the new texture before the old one is disposed */
+      function ensureGeneTexture() {
+        if (self.tex && self.texData === slots.data) return;
+        var data = slots.data, old = self.tex;
+        /* RGBA32F, nearest, no mipmaps (three's RGBAFormat 1023, FloatType 1015,
+         * NearestFilter 1003: the trimmed bundle does not export the names) */
+        var tex = new THREE.DataTexture(data, GENES_W, genesRows(slots.capacity), 1023, 1015);
+        tex.magFilter = tex.minFilter = 1003;
+        tex.generateMipmaps = false;
+        tex.onUpdate = onGeneUpload;
+        U.uGenes.value = tex;
+        self.tex = tex; self.texData = data; self.pending = null;
+        slots.requireFull();
+        if (old) old.dispose();
+        geneIO.allocs++;
+        profiler.add(PK.texAllocs, 1);
       }
       self.ensure = function (n, lod) {
         if (n <= self.cap && lod === self.lod) return;
         var cap = Math.max(256, self.cap);
         while (cap < n) cap *= 2;
-        build(cap, lod);
+        rebuildGeometry(cap, lod);
       };
-      /* v: the programs drawn (settle; fillApp packed the swim pose in iBody.w for 1) */
-      self.commit = function (n, barbels, v) {
+      /* One complete snapshot (fillFish, before any packing): the draw's
+       * buffers for its n fish at quality lod, the slots reconciled (births
+       * copied in, the dead released) and each draw's slot in iGeneSlot, the
+       * gene texture for the slots' storage. Returns the slots' result (ok
+       * false: the snapshot was refused, e.g. a repeated id, and its fish are
+       * drawn the plain way; the ownership is forgotten) */
+      self.reconcile = function (s, lod) {
+        var n = s.n;
+        self.ensure(n, lod);
+        var tg = profiler.beginCpu();
+        var r = slots.prepare(s.worldEpoch, s.ids, s.app, n, self.attrs.iGeneSlot.array);
+        profiler.endCpu(SP.appearanceRows, tg);
+        self.last = r;
+        if (!r.ok) { slots.invalidate(); return r; }
+        ensureGeneTexture();
+        return r;
+      };
+      /* v: the programs drawn (settle; fillApp packed the swim pose in iBody.w
+       * for 1); slotsMoved: reconcile's changed (iGeneSlot is uploaded only then) */
+      self.commit = function (n, barbels, v, slotsMoved) {
         self.n = n;
         self.geo.instanceCount = n;
         if (self.bgeo) self.bgeo.instanceCount = n;
-        self.bytes = commitInstances(self.attrs, n);
+        self.bytes = commitInstances(self.attrs, n, slotsMoved || self.slotAttrFresh ? null : "iGeneSlot");
+        self.slotAttrFresh = false;
         self.mesh.material = mats[v || 0]; self.shadow.material = shMats[v ? 1 : 0];
         if (self.bmesh) self.bmesh.material = mats[v || 0];
-        /* the gene texture's upload: the whole texture every frame (one full
-         * upload, no ranges); planBytes is what onGeneUpload counts */
-        var tg = profiler.beginCpu();
-        if (!testFaults.holdGeneUploads) {
-          self.planBytes = self.texData.byteLength;
-          self.tex.needsUpdate = true;
+        /* the gene texture's upload: the slots' plan, if any (none: the
+         * texture's version stays, three uploads nothing); "full" policy: the
+         * whole texture every frame */
+        var tg = profiler.beginCpu(), plan = null;
+        if (genePolicy === "full") slots.requireFull();
+        if (!testFaults.holdGeneUploads) plan = slots.plan();
+        if (plan) {
+          var tex = self.tex;
+          tex.clearUpdateRanges();   /* none: the whole texture */
+          for (var i = 0; i < plan.ranges.length; i++) tex.addUpdateRange(plan.ranges[i].start, plan.ranges[i].count);
+          tex.needsUpdate = true;
+          self.pending = plan;
         }
         profiler.endCpu(SP.geneRanges, tg);
         if (profiler.active) {
-          profiler.count(PK.instBytes, self.bytes); profiler.count(PK.geneDirtySlots, n);
-          profiler.count(PK.geneRanges, 0); profiler.count(PK.texCapacity, self.cap);
+          profiler.count(PK.instBytes, self.bytes); profiler.count(PK.geneDirtySlots, plan ? plan.slots : slots.dirtyCount);
+          profiler.count(PK.geneRanges, plan ? plan.ranges.length : 0); profiler.count(PK.geneFull, plan && plan.full ? 1 : 0);
+          profiler.count(PK.texCapacity, slots.capacity);
         }
         self.mesh.visible = n > 0;
         self.shadow.visible = n > 0 && quality >= 2;
@@ -2822,15 +2930,25 @@
     var heights = null;
     var SX = new Float64Array(6), SY = new Float64Array(6);
     /* Is this snapshot drawn in the fish's own bodies? (the module exports the
-     * appearance genome, one row per fish, and the kind could be built), in
-     * every colour mode; the skin is appSkin's */
+     * appearance genome, one row per fish, the kind could be built, and its
+     * gene slots took the snapshot), in every colour mode; the skin is
+     * appSkin's. Returns the slots' reconciliation (AppKind.reconcile: the
+     * draw's buffers ready, each fish's slot in iGeneSlot), or null: the
+     * plain fish are drawn */
     function appearanceDrawn(s) {
-      if (!EA || !s.app || s.app.length < s.n * EA.STRIDE) return false;
+      if (!EA || !s.app || s.app.length < s.n * EA.STRIDE) return null;
       if (!appKind) {
         try { appKind = AppKind(); clarityUniforms(appKind.mat.uniforms); appStatus = "drawing"; }
-        catch (e) { appStatus = "unavailable: " + (e && e.message || e); EA = null; console.warn("evo_boids: appearance renderer", e); return false; }
+        catch (e) { appStatus = "unavailable: " + (e && e.message || e); EA = null; console.warn("evo_boids: appearance renderer", e); return null; }
       }
-      return true;
+      var r = appKind.reconcile(s, quality >= 3 ? "medium" : "coarse");
+      if (!r.ok) {
+        var why = "the plain fish (the gene slots refused the snapshot: " + r.error + ")";
+        if (appStatus !== why) { appStatus = why; console.warn("evo_boids: " + why); }
+        return null;
+      }
+      appStatus = "drawing";
+      return r;
     }
     /* The swim pose's camera for this frame (swimPose's G; after updateVP),
      * and what the last frame's fish got: how many, how many with any of the
@@ -2879,15 +2997,15 @@
     var SIM_DT = 0.016;   /* oc_step's fixed step (web/ocean.js DT) */
     function swimBufs(cap) { return { n: 0, epoch: -1, tick: 0, ids: new Float64Array(cap), x: new Float32Array(cap), y: new Float32Array(cap), v: new Float32Array(cap) }; }
     var swimA = swimBufs(2048), swimB = swimBufs(2048);
-    function fillApp(s, selIdx, hovIdx) {
-      var n = s.n, lod = quality >= 3 ? "medium" : "coarse", pose = polishNow();
-      appKind.ensure(n, lod);
+    /* rec: this snapshot's reconciliation (appearanceDrawn): the buffers are
+     * sized, the genes in their slots; here the poses, colours and highlights */
+    function fillApp(s, selIdx, hovIdx, rec) {
+      var n = s.n, pose = polishNow();
       var at = appKind.attrs;
       var A = at.iA.array, B = at.iB.array, Cc = at.iC.array, BODY = at.iBody.array, X = at.iX.array;
-      var T = appKind.texData, R = s.app, ST = EA.STRIDE, MO = EA.MO;
       var segs = s.segs, cols = s.colors, body = s.body, ids = s.ids, depth = s.depth, vz = s.vz;
       if (!heights || heights.length < n) heights = new Float32Array(Math.max(n, 2048));
-      var xs = SX, ys = SY, barbels = false;
+      var xs = SX, ys = SY;
       var SP0 = swimA, SP1 = null, G = null, tick = 0, sj = 0, sk = 0, sa = 0, sinv = 0, sjump = 0, lit = 0;
       var gt = gateFish, posing = false, rMax = 0, cMax = 0, yMin = Infinity, yMax = -Infinity;
       if (pose) { G = poseCamera(); posing = gateStart(gt, s, G); warmUp(appKind.warm); }
@@ -2959,31 +3077,26 @@
       }
       if (posing) { SP1.n = sk; SP1.epoch = s.worldEpoch; SP1.tick = tick; swimA = SP1; swimB = SP0; }
       if (pose) { gt.rMax = rMax; gt.cMax = cMax; gt.yMin = yMin; gt.yMax = yMax; }
-      /* the genes, by draw index: 16 texels a fish, the 63 genes and one zero */
-      var tg = profiler.beginCpu();
-      for (c = 0; c < n; c++) {
-        packGenes(T, R, ST * c, c, ST);
-        if (R[ST * c + MO + 26] > 0.2) barbels = true;
-      }
-      profiler.endCpu(SP.appearanceRows, tg);
+      /* (the genes are in their slots already: reconcile copied the new fish's, and only theirs) */
       var tanHalf = Math.tan(camera.fov * Math.PI / 360);
       appKind.mat.uniforms.uPxPerUnit.value = ch / (2 * tanHalf);
       appKind.mat.uniforms.uColourBy.value = appSkin ? 0 : 1;
-      appKind.commit(n, barbels, settle(gt, pose, lit, appKind.warm.ready));
+      appKind.commit(n, rec.hasBarbels, settle(gt, pose, lit, appKind.warm.ready), rec.changed);
       if (profiler.active) {
-        var tp = appKind.tpls[appKind.lod];
+        var tp = appKind.tpls[appKind.lod], ST = EA.STRIDE;
         profiler.count(PK.lod, appKind.lod === "medium" ? 2 : 1); profiler.count(PK.bodyInst, n);
         profiler.count(PK.shadowInst, appKind.shadow.visible ? n : 0); profiler.count(PK.barbelInst, appKind.bmesh && appKind.bmesh.visible ? n : 0);
         profiler.count(PK.tplVerts, tp.verts); profiler.count(PK.tplTris, tp.idx.length / 3);
-        profiler.count(PK.geneSrcBytes, n * ST * 4); profiler.count(PK.genePadBytes, n * 4);
+        profiler.count(PK.geneSrcBytes, rec.newRows * ST * 4); profiler.count(PK.genePadBytes, rec.newRows * (64 - ST) * 4);
       }
     }
     var appDrawn = false;   /* this frame drew the appearance fish (the probes need it) */
     function fillFish(s, selIdx, hovIdx) {
       poseLast.fish = s.n; poseLast.any = poseLast.full = poseLast.sum = 0;   /* poseCount, this frame */
-      appDrawn = appearanceDrawn(s);
+      var rec = appearanceDrawn(s);
+      appDrawn = !!rec;
       if (appDrawn) {
-        fillApp(s, selIdx, hovIdx);
+        fillApp(s, selIdx, hovIdx, rec);
         fish.commit(0);
         return;
       }
@@ -3470,16 +3583,19 @@
      *     the snapshot's 63 genes and the zero after them (never re-packed)
      *   intrinsic: pattern charts, 96 x 48 a fish, at most 64 a batch, the
      *     whole instance sequence drawn with the uncharted fish off the
-     *     target, of fish on both sides of the 32-fish rows and of slot 2048,
+     *     target, of the fish whose slots are on both sides of the texture's
+     *     32-slot rows and of slot 2048 (draws and slots reported),
      *     against EvoAppearance.decode / flankAt of the original rows (p99.9
      *     <= .002, nothing non-finite)
      * The probe must upload nothing: one that did would have repaired a
      * missed production upload, and that fails. expected: owned copies
      * {worldEpoch, n, ids, app, body} (EvoOcean.bench.snapshotCopy), which
      * must be the snapshot drawn; absent, that snapshot's own copies.
-     * o.mutate "slot": the probes read a wrong slot; o.pendingUpload: a
-     * production upload left pending (the probe would perform it); both must
-     * fail. o.charts: how many fish to chart (24). A diagnostic: the frame is
+     * o.mutate "slot": the probes read a wrong slot (each fish's own, xor 1);
+     * o.pendingUpload: a production upload left pending (the probe would
+     * perform it); both must fail. o.charts: how many fish to chart (24).
+     * o.rawWords: the raw words read, in draw order (res.rawWords: n x 64
+     * uint32), for the dirty-vs-full reference. A diagnostic: the frame is
      * marked, never part of a timed capture. */
     var probes = [];
     var PROBE_SENTINEL = new Float32Array([-9, -9, -9, -9]);
@@ -3513,11 +3629,15 @@
         p.then(rq.resolve, function (e) { rq.resolve({ ok: false, error: "probe: " + (e && e.message || e) }); });
       });
     }
-    /* the draw indices charted: both sides of the 32-fish rows and of 2048, the last, then spread */
-    function chartPicks(n, want) {
-      var pick = [], seen = {};
+    /* the draw indices charted: the owners of the slots on both sides of the
+     * texture's 32-slot rows and of slot 2048, of the highest slot, the last
+     * draw, then spread (slotOf: each draw's slot, iGeneSlot) */
+    function chartPicks(n, want, slotOf) {
+      var pick = [], seen = {}, owner = new Map(), top = -1;
+      for (var c = 0; c < n; c++) { owner.set(slotOf[c], c); if (slotOf[c] > top) top = slotOf[c]; }
       function add(i) { if (i >= 0 && i < n && !seen[i]) { seen[i] = true; pick.push(i); } }
-      [0, 1, 31, 32, 33, 63, 64, 2047, 2048, 2049, n - 1].forEach(add);
+      [0, 1, 31, 32, 33, 63, 64, 2047, 2048, 2049, top].forEach(function (sl) { if (owner.has(sl)) add(owner.get(sl)); });
+      add(n - 1);
       for (var k = 1; pick.length < Math.min(want, n) && k < 64 * want; k++) add(Math.floor((k * 0.6180339887 % 1) * n));
       return pick.sort(function (a, b) { return a - b; });
     }
@@ -3541,16 +3661,17 @@
       if (!why && (!exp.app || exp.app.length < n * ST || !exp.body || exp.body.length < 2 * n)) why = "it has no appearance rows or bodies";
       if (why) { res.error = "the expected snapshot is not the one drawn: " + why; return Promise.resolve(res); }
       var app = exp.app instanceof Float32Array ? exp.app : Float32Array.from(exp.app), body = exp.body;
-      var tex = appKind.tex;
+      var tex = appKind.tex, slotOf = appKind.attrs.iGeneSlot.array;
       res.texture = { width: tex.image.width, height: tex.image.height, type: tex.type, format: tex.format,
-                      internalFormat: tex.internalFormat || "RGBA32F (three: RGBAFormat + FloatType)", capacity: appKind.cap,
-                      minFilter: tex.minFilter, magFilter: tex.magFilter, mipmaps: tex.generateMipmaps };
+                      internalFormat: tex.internalFormat || "RGBA32F (three: RGBAFormat + FloatType)", capacity: appKind.slots.capacity,
+                      drawCapacity: appKind.cap, minFilter: tex.minFilter, magFilter: tex.magFilter, mipmaps: tex.generateMipmaps };
+      res.slots = appKind.slots.stats();
       var sh = appKind.shaders, rawVs = sh.probeRawVs, chartVs = sh.probeChartVs;
-      if (o.mutate === "slot") {
-        var wrong = "int appearanceSlot() { return gl_InstanceID ^ 1; }";
+      if (o.mutate === "slot") {   /* the slot each fish really has, xor 1 (a permutation could equal gl_InstanceID ^ 1) */
+        var wrong = GENE_SLOT_GLSL.split(GENE_SLOT_RET).join("return int(iGeneSlot) ^ 1;");
         rawVs = rawVs.split(GENE_SLOT_GLSL).join(wrong); chartVs = chartVs.split(GENE_SLOT_GLSL).join(wrong);
       } else if (o.mutate) { res.error = "unknown mutation " + o.mutate; return Promise.resolve(res); }
-      var picks = chartPicks(n, o.charts || 24), CW = 96, CH = 48, PER = 64, COLS = 8;
+      var picks = chartPicks(n, o.charts || 24, slotOf), pickSlots = picks.map(function (c) { return slotOf[c]; }), CW = 96, CH = 48, PER = 64, COLS = 8;
       var geos = [], mats = [], rts = [], reads = [], batches = [], err = null, shaderErr = null;
       var keepRT = renderer.getRenderTarget(), keepClear = renderer.autoClear, keepOnErr = renderer.debug.onShaderError;
       var cam = new THREE.PerspectiveCamera(), up0 = geneIO.uploads;
@@ -3657,6 +3778,7 @@
           } else if (gotU[gi] !== 0) R.paddingMismatches++;
         }
         res.rawGenes = R;
+        if (o.rawWords) res.rawWords = gotU.slice(0, n * 64);   /* (tests: the words as read, in draw order; dirty vs full) */
         /* the charts against the CPU mirror of the original rows */
         var errs = [], nonFinite = 0, over = 0, maxErr = 0, worst = "", out = [0, 0, 0];
         batches.forEach(function (bt) {
@@ -3677,7 +3799,7 @@
         });
         cleanup();
         var E = Float64Array.from(errs).sort();
-        res.intrinsic = { fish: picks.length, draws: picks, ids: picks.map(function (c) { return exp.ids[c]; }), samples: E.length,
+        res.intrinsic = { fish: picks.length, draws: picks, slots: pickSlots, ids: picks.map(function (c) { return exp.ids[c]; }), samples: E.length,
                           p99: E.length ? E[Math.floor(E.length * 0.99)] : null, p999: E.length ? E[Math.floor(E.length * 0.999)] : null,
                           maxErr: maxErr, over002: E.length ? over / E.length : null, nonFinite: nonFinite, worst: worst };
         if (res.extraUploads) res.failures.push("the probe uploaded the gene texture " + res.extraUploads + "x (a production upload was pending)");
@@ -3907,11 +4029,20 @@
       },
       /* the live gene texture after the next production draw (see there): a Promise of the report */
       appearanceTextureParity: appearanceTextureParity,
-      /* the gene texture and its upload counts (tests: upload interception) */
+      /* the gene texture and its upload counts (tests: upload interception):
+       * capacity, the gene slots' (the texture's); drawCapacity, the instance
+       * buffers'; slots, the owners (EvoAppearanceSlots stats); policy */
       geneTexture: function () {
-        return appKind ? { texture: appKind.tex, data: appKind.texData, capacity: appKind.cap, n: appKind.n,
-                           uploads: geneIO.uploads, bytes: geneIO.bytes, allocs: geneIO.allocs } : null;
+        return appKind && appKind.tex ? { texture: appKind.tex, data: appKind.texData, capacity: appKind.slots.capacity, drawCapacity: appKind.cap, n: appKind.n,
+                                          uploads: geneIO.uploads, calls: geneIO.calls, bytes: geneIO.bytes, allocs: geneIO.allocs,
+                                          slots: appKind.slots.stats(), policy: genePolicy, last: appKind.last && Object.assign({}, appKind.last) } : null;
       },
+      /* the gene slot of each fish as the last frame drew them (draw order; tests) */
+      geneSlots: function () { return appKind && appDrawn ? Array.from(appKind.attrs.iGeneSlot.array.subarray(0, appKind.n)) : null; },
+      /* the gene uploads: "dirty" (the default: what changed) or "full" (the
+       * whole texture every frame, through the same slots: measurements and
+       * the dirty-vs-full reference only) */
+      setGeneUploads: function (p) { genePolicy = p === "full" ? "full" : "dirty"; },
       testFaults: testFaults,
       /* the drawing context: renderer strings, extensions, attributes, drawing buffer */
       contextInfo: contextInfo,
@@ -3936,7 +4067,7 @@
     appearancePathCheck: function (gl, rows, lams, opts) { return appearancePathCheck(gl, window.EvoAppearance, rows, lams, opts); },
     appearanceVertexCheck: function (gl, rows, lams, opts) { return appearanceVertexCheck(gl, window.EvoAppearance, rows, lams, opts); },
     appearanceFragmentCheck: function (gl, opts) { return appearanceFragmentCheck(gl, window.EvoAppearance, opts); },
-    /* the shared slot selector (the probes and PR2's ownership change read it) */
+    /* the shared slot selector (every gene-reading program and probe) */
     GENE_SLOT_GLSL: GENE_SLOT_GLSL,
     /* the swim pose of one fish (tests) and the fish programs' GLSL, plain
      * (P false: as before the polish) or polished */
