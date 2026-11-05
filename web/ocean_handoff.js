@@ -1,3 +1,4 @@
+// @ts-check
 "use strict";
 /* evo_boids 3-D Ocean: the module-memory helpers the page (web/ocean.js) and
  * the Turbo worker (web/ocean_worker.js) share, so the hand-off has one
@@ -40,12 +41,14 @@
   var dec = typeof TextDecoder !== "undefined" ? new TextDecoder("utf-8") : null;
 
   /* the module's memory as it is now (never cache it across a call) */
+  /** @param {OceanModule} M */
   function buffer(M) { return M.wasmMemory ? M.wasmMemory.buffer : M.HEAPU8.buffer; }
 
   /* Grow M's memory to at least `bytes`: by exactly the pages missing, with
    * wasmMemory.grow; without an exported memory, through the allocator (a
    * block of `bytes` ends past `bytes`, so it must grow that far). Returns
    * whether the memory is now that big. */
+  /** @param {OceanModule} M @param {number} bytes */
   function growTo(M, bytes) {
     var have = buffer(M).byteLength;
     if (have >= bytes) return true;
@@ -63,6 +66,7 @@
    * stores the image without its zero tail): the rest of it is zeros. Throws,
    * with M's memory as it was (grown, perhaps, never overwritten), when it
    * can't grow far enough; the caller still holds the image. */
+  /** @param {OceanModule} M @param {ArrayBuffer | ArrayBufferView} src @param {string} [who] @param {number} [full] */
   function take(M, src, who, full) {
     var s = u8of(src), need = full === undefined ? s.length : full, have = buffer(M).byteLength;
     if (!Number.isSafeInteger(need) || !need || need % PAGE || s.length > need)
@@ -78,6 +82,7 @@
   function u8of(x) { return ArrayBuffer.isView(x) ? new Uint8Array(x.buffer, x.byteOffset, x.byteLength) : new Uint8Array(x); }
 
   /* a C string at ptr, read from the live buffer */
+  /** @param {OceanModule} M @param {number} ptr */
   function cString(M, ptr) {
     if (!ptr) return "";
     var h = new Uint8Array(buffer(M)), end = ptr;
@@ -90,6 +95,7 @@
   /* fn(ptr) with str as a temporary C string (0 for an empty one), freed
    * after it; not when fn trapped: a module that trapped is not entered
    * again, its allocator neither (its stack and globals can't be trusted) */
+  /** @template T @param {OceanModule} M @param {string | null | undefined} str @param {(ptr: number) => T} fn @returns {T} */
   function withCString(M, str, fn) {
     if (str === null || str === undefined || str === "") return fn(0);
     str = String(str);
@@ -110,12 +116,15 @@
   /* len doubles / floats at ptr, copied out. Call it with the export inline,
    * f64(M, M._oc_summary(), M._oc_summary_len()): the buffer is taken here,
    * after the export ran. */
+  /** @param {OceanModule} M @param {number} ptr @param {number} len @returns {number[]} */
   function f64(M, ptr, len) { return Array.prototype.slice.call(new Float64Array(buffer(M), ptr, len)); }
+  /** @param {OceanModule} M @param {number} ptr @param {number} len @returns {number[]} */
   function f32(M, ptr, len) { return Array.prototype.slice.call(new Float32Array(buffer(M), ptr, len)); }
 
   /* One dashboard sample of a synced world (web/ocean_dash.js row()): the
    * stats first (copied before anything allocates), then the summary, then
    * the family lines. statsLen: oc_stats_len(). */
+  /** @param {OceanModule} M @param {number} famK @param {number} statsLen */
   function row(M, famK, statsLen) {
     var st = f64(M, M._oc_stats(), statsLen);
     var su = f64(M, M._oc_summary(), M._oc_summary_len());
@@ -180,7 +189,7 @@
         return l;
       },
       /* the held edits as {key: its newest value} (EvoOcean.state); never what is applied */
-      held: function () { var o = {}; held.forEach(function (e) { o[e.key] = e.num; }); return o; },
+      held: function () { var o = /** @type {Record<string, number>} */ ({}); held.forEach(function (e) { o[e.key] = e.num; }); return o; },
       inflight: function () { return inflight.map(function (e) { return [e.key, e.num]; }); }
     };
   }
@@ -505,7 +514,7 @@
   function shapeOk(h) {
     var stack = [[h, 1]], values = 0;
     while (stack.length) {
-      var e = stack.pop(), v = e[0];
+      var e = /** @type {[any, number]} (the stack is not empty) */ (stack.pop()), v = e[0];
       if (++values > WORLD.MAX_VALUES || e[1] > WORLD.MAX_DEPTH) return false;
       if (v && typeof v === "object") (Array.isArray(v) ? v : Object.keys(v).map(function (k) { return v[k]; })).forEach(function (x) { stack.push([x, e[1] + 1]); });
     }
@@ -704,6 +713,7 @@
   var START_KEYS = ["seed", "population", "depth", "width", "height", "cfg"];
   var TOP_KEYS = ["format", "version", "app", "saved", "engine", "frame", "fish", "food", "predators", "start", "runCfg", "setup", "picked", "image", "sha256"];
   var SETUP_KEYS = ["format", "version", "seed", "population", "depth", "width", "height", "walls", "config"];
+  /** @param {any} h (a parsed header: anything JSON) @param {HeaderRules} R */
   function headerProblem(h, R) {
     var obj = function (o) { return !!o && typeof o === "object" && !Array.isArray(o); };
     var whole = function (v, lo, hi) { return Number.isSafeInteger(v) && v >= lo && v <= hi; };
@@ -761,13 +771,14 @@
    * inside the memory (aligned, its length the counts'), the frame a whole
    * number, the ids and the fish's segments finite. Throws why not (a
    * module whose image is not a world: a null world reads 0 × 0). */
+  /** @param {OceanModule} M @returns {WorldNow} */
   function worldNow(M) {
     M._oc_sync();
     var len = buffer(M).byteLength;
     var r = { w: M._oc_width(), h: M._oc_height(), d: M._oc_depth_max(), fish: M._oc_creature_count(), food: M._oc_food_count(),
               pred: M._oc_predator_count(), walls: typeof M._oc_walls_enabled === "function" ? !!M._oc_walls_enabled() : false, frame: -1 };
     var statsLen = M._oc_stats_len();
-    [["fish", r.fish], ["food", r.food], ["predators", r.pred], ["stats", statsLen]].forEach(function (c) {
+    /** @type {Array<[string, number]>} */ ([["fish", r.fish], ["food", r.food], ["predators", r.pred], ["stats", statsLen]]).forEach(function (c) {
       if (!Number.isSafeInteger(c[1]) || c[1] < 0 || c[1] > len) throw new Error("its count of " + c[0] + " is " + c[1]);
     });
     if (!(r.w > 0 && r.h > 0 && r.d > 0 && isFinite(r.w) && isFinite(r.h) && isFinite(r.d))) throw new Error("it holds no world (its tank is " + r.w + " × " + r.h + " × " + r.d + ")");
@@ -801,11 +812,13 @@
     return r;
   }
   /* what a world file's header says its world is (worldNow's terms) */
+  /** @param {WorldHeader} h @returns {WorldExpect} */
   function worldExpect(h) {
     return { w: h.setup.width, h: h.setup.height, d: h.start.depth, frame: h.frame, fish: h.fish, food: h.food, pred: h.predators,
              walls: h.setup.walls, picked: !!h.picked };
   }
   /* "" or how a module's world (worldNow) differs from the one expected */
+  /** @param {WorldNow} a @param {WorldExpect} e */
   function worldMismatch(a, e) {
     if (a.w !== e.w || a.h !== e.h || Math.fround(a.d) !== Math.fround(e.d))
       return "its tank is " + a.w + " × " + a.h + " × " + a.d + ", not the " + e.w + " × " + e.h + " × " + e.d + " its header says";
@@ -821,6 +834,7 @@
    * it opens (the display switches, the readout's summary, the charts'
    * family lines, a fish card), one step, checked again. {ok, at (its
    * worldNow before the step), why}. A trap throws (the caller says so). */
+  /** @param {OceanModule} M @param {ArrayBuffer | ArrayBufferView} data @param {number} bytes @param {WorldExpect} expect */
   function probeWorld(M, data, bytes, expect) {
     take(M, data, "the test module's", bytes);
     var a = worldNow(M), why = worldMismatch(a, expect);

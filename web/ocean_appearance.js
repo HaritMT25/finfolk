@@ -1,3 +1,4 @@
+// @ts-check
 "use strict";
 /* evo_boids 3-D Ocean: the appearance genome's renderer law (window.EvoAppearance).
  *
@@ -371,7 +372,7 @@
     var half = L.half, step = PI / half, R = L.rings, nr = R.length, i, k, s0;
     var ring = [];
     for (i = 1; i < nr; i++) {
-      var row = { "1": [], "-1": [] };
+      var row = /** @type {{"1": number[], "-1": number[]}} */ ({ "1": [], "-1": [] });
       for (k = 0; k <= half; k++) {
         var th = -0.5 * PI + k * step;
         if (k === 0 || k === half) { var vv = V(R[i], th, 1, 0, 0, 1); row["1"][k] = vv; row["-1"][k] = vv; }

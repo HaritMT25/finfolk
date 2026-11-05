@@ -1,3 +1,4 @@
+// @ts-check
 "use strict";
 /* evo_boids 3-D Ocean: the render profiler and the benchmark controls
  * (window.EvoOceanPerf; in node, module.exports, for tests/ocean_perf_tests.cjs).
@@ -43,6 +44,7 @@
  * bench(hooks): EvoOcean.bench (see there). */
 (function (root) {
   /* [name, exact boundary, inclusive of other spans] */
+  /** @type {SpanSpec[]} */
   var SPANS = [
     ["step", "M._oc_step(steps): the page's own timing of it, reused (no extra clock read)", false],
     ["sync", "M._oc_sync()", false],
@@ -60,6 +62,7 @@
     ["gpuPoll", "the GPU queries' availability and disjoint processing (at the frame's start)", false],
     ["frameCpu", "the whole application frame callback; inclusive of every span above", true]
   ];
+  /** @type {CounterSpec[]} */
   var COUNTERS = [
     ["epoch", "the world's epoch (ocean.js afterNewWorld; Turbo keeps it)"],
     ["turbo", "0 live, 1 entering, 2 turbo, 3 exiting"],
@@ -96,15 +99,19 @@
     ["litInst", "lit appearance fish drawn apart on the full programs (the split; the rest plain)"],
     ["gpuIssued", "GPU elapsed queries begun this frame"]
   ];
+  /** @type {GpuLabel[]} */
   var LABELS = ["frame", "fishBody", "barbels", "fishShadow", "predBody", "predShadow", "floor", "surface", "food", "snow", "other"];
   var STATUS = ["ok", "disjoint", "aborted", "lost"];
+  /** @type {Record<string, number>} */
   var TURBO = { live: 0, entering: 1, turbo: 2, exiting: 3 };
-  function index(list) { var o = {}; list.forEach(function (e, i) { o[typeof e === "string" ? e : e[0]] = i; }); return o; }
+  /** name -> its index in the list @template {string} N @param {Array<N | [N, ...unknown[]]>} list @returns {Record<N, number>} */
+  function index(list) { var o = /** @type {Record<N, number>} */ ({}); list.forEach(function (e, i) { o[typeof e === "string" ? e : e[0]] = i; }); return o; }
   var SPAN = index(SPANS), K = index(COUNTERS), LABEL = index(LABELS);
 
   function perfNow() { return typeof performance !== "undefined" ? performance.now() : Date.now(); }
 
   /* ---------------- GPU timer: EXT_disjoint_timer_query_webgl2 ---------------- */
+  /** @constructor @param {WebGL2RenderingContext} gl @param {GpuTimerOptions} [o] */
   function GpuTimer(gl, o) {
     o = o || {};
     this.gl = gl;
@@ -116,6 +123,11 @@
     this.out = []; this.active = null;
     this.rFrame = new Float64Array(this.resCap); this.rLabel = new Uint8Array(this.resCap);
     this.rMs = new Float64Array(this.resCap); this.rStatus = new Uint8Array(this.resCap); this.rGen = new Uint32Array(this.resCap);
+    /* (declarations for the type check only: resetStats sets them) */
+    /** @type {number} */
+    this.rN;
+    /** @type {GpuStats} */
+    this.st;
     this.resetStats();
     this.acquire();
   }
@@ -525,19 +537,22 @@
    *   stepToTick(t)   step the paused engine to frame t
    *   rafProbe(ms)    rAF timestamps only (the profiler-off baseline)
    *   info()          the drawing context, the page's display state */
+  /** @param {BenchHooks} h @returns {Bench} */
   function bench(h) {
     var scene = h.scene, prof = h.profiler, api = h.page;
     var doc = root.document;
+    /** @returns {Promise<void>} */
     function frames(k) {
       return new Promise(function (res) { var i = 0; (function f() { if (i++ >= k) res(); else root.requestAnimationFrame(f); })(); });
     }
+    /** @returns {Promise<void>} */
     function wait(ms) { return new Promise(function (res) { setTimeout(res, ms); }); }
     /* the case's colour mode through the page's own switch; the mode the page is then in */
     function setColour(mode) {
       if (!h.setColourMode(mode) || h.colourMode() !== mode) throw new Error("the page has no colour mode " + mode);
     }
     function setCheck(id, on) {
-      var e = doc.getElementById(id);
+      var e = /** @type {HTMLInputElement | null} */ (doc.getElementById(id));
       if (!e) throw new Error("no #" + id);
       if (e.checked !== on) { e.checked = on; e.dispatchEvent(new Event("change")); }
     }
@@ -570,9 +585,14 @@
     /* the head of fish c in three's coordinates */
     function head(s, c, W, H) { return [s.segs[12 * c] - W / 2, -s.depth[c], s.segs[12 * c + 1] - H / 2]; }
     function camera(kind) {
-      var st = api.state(), s = h.last(), W = st.W, H = st.H, out = { kind: kind };
+      var st = api.state(), s = h.last();
+      /* (prepare calls this right after tick() found a snapshot: these hold unless the engine stopped since) */
+      if (!st || !s) throw new Error("the benchmark has no snapshot of the world (the engine stopped)");
+      /* the dense and follow cameras frame a fish: a world without one has no view to give them (not a NaN camera) */
+      if ((kind === "dense" || kind === "follow") && !(s.n > 0)) throw new Error("the " + kind + " camera needs a fish, and the world has none at tick " + s.stats[1]);
+      var W = st.W, H = st.H, out = { kind: kind };
       if (kind === "dense") {
-        var cells = {}, best = null;
+        var cells = {}, best = /** @type {any} (set below: the world has a fish) */ (null);
         for (var c = 0; c < s.n; c++) {
           var cx = Math.floor(s.segs[12 * c] / 256), cy = Math.floor(s.segs[12 * c + 1] / 256), key = cy * 1e6 + cx;
           var e = cells[key] || (cells[key] = { cx: cx, cy: cy, n: 0, x: 0, y: 0, d: 0 });
@@ -623,7 +643,7 @@
       prepare: function (cd) {
         cd = cd || {};
         /* the case's world, or (a case without one) the running world's set-up */
-        var ia = h.initArgs() || {}, has = cd.worldSeed !== undefined, world = cd.world || [ia.width, ia.height, ia.depth];
+        var ia = h.initArgs() || /** @type {any} */ ({}), has = cd.worldSeed !== undefined, world = cd.world || [ia.width, ia.height, ia.depth];
         var want = has ? { seed: cd.worldSeed >>> 0, pop: cd.population, cfg: cd.config || {} } : { seed: ia.seed, pop: ia.population, cfg: ia.cfg || {} };
         var same = ia.seed === want.seed && ia.population === want.pop && ia.width === world[0] && ia.height === world[1] &&
           ia.depth === world[2] && JSON.stringify(ia.cfg || {}) === JSON.stringify(want.cfg);
@@ -642,10 +662,12 @@
           var cam = camera(cd.camera || "whole");
           return wait(cd.settleMs === undefined ? 1500 : cd.settleMs).then(function () {
             var st = api.state();
+            /* the engine may have stopped during the settle: say so (as tick() does), not a TypeError */
+            if (!st) throw new Error("prepare: the page has no state of the world after the settle (the engine stopped)");
             cam.view = st.view; cam.flashlightLevel = st.flashlightLevel; cam.following = st.following; cam.selectedId = st.selectedId;
             return { world: [st.W, st.H, st.D], walls: st.walls, n: st.n, tick: st.frame, worldEpoch: h.epoch(), seed: st.seed,
                      colourMode: h.colourMode(), quality: scene.quality(), paused: st.paused,
-                     governor: doc.getElementById("governor").checked, camera: cam, appearance: scene.appearance() };
+                     governor: /** @type {HTMLInputElement} (setCheck found it) */ (doc.getElementById("governor")).checked, camera: cam, appearance: scene.appearance() };
           });
         });
       },
@@ -658,9 +680,9 @@
         return wait(c.durationMs || 120000).then(function () {
           prof.stopSampling();
           var t0 = perfNow(), lim = c.drainMs === undefined ? 5000 : c.drainMs;
-          return new Promise(function (res) {
+          return /** @type {Promise<void>} */ (new Promise(function (res) {
             (function drain() { if (!prof.pending() || perfNow() - t0 > lim) res(); else setTimeout(drain, 16); })();
-          });
+          }));
         }).then(function () {
           var cap = prof.drain();
           prof.configure({ cpu: false, gpu: "off" });
@@ -687,6 +709,7 @@
     return B;
   }
 
+  /** @type {EvoOceanPerfApi} */
   var API = {
     SPANS: SPANS, COUNTERS: COUNTERS, LABELS: LABELS, STATUS: STATUS, SPAN: SPAN, K: K, LABEL: LABEL,
     create: create, disabled: disabled, forPage: forPage, GpuTimer: GpuTimer,
@@ -694,4 +717,5 @@
   };
   if (typeof module === "object" && module.exports) module.exports = API;
   if (root && root.document) root.EvoOceanPerf = API;
-})(typeof window !== "undefined" ? window : this);
+  /* (root: the page; in node, module.exports, which has no document: the API only exported) */
+})(/** @type {Window & typeof globalThis} */ (typeof window !== "undefined" ? window : this));
