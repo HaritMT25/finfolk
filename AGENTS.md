@@ -21,7 +21,8 @@ the site is static three.js/JS in `web/` (no JS build step). Python tools run ex
 - `web/` the site. Committed build outputs (never hand-edit): `evo_boids*.{js,wasm}`, `evo_ocean.{js,wasm}`
   (from `wasm/build_*.sh`), `vendor/three.bundle.min.js` (from `tools/three_bundle/build.sh`).
   Hand-written: `ocean.html` (Ocean page), `index.html` (Classic), `ocean.js`, `ocean_scene.js`,
-  `ocean_shaders.js` (the scene's variant-free GLSL: shared chunks, the environment's programs),
+  `ocean_shaders.js` (the scene's GLSL: shared chunks, the environment's programs, the fish programs in their
+  swim-polish variants), `ocean_pose.js` (the swim pose on the CPU: size weight, packing, reach),
   `ocean_config.js`, `ocean_handoff.js`, `ocean_worker.js` (Turbo), `ocean_dash.js`, `dashboard.js`, `charts.js`.
   A new page script is listed in `ocean.html` and published by `wasm/build_site.sh` (its asserted rewrites).
   Plain `<script>` IIFEs, each registering one `window.Evo*` namespace (no bundler); `types.d.ts` declares

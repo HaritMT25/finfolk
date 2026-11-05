@@ -261,6 +261,7 @@ async function manifestOf(page, label, extra = {}) {
   return Object.assign({ label, base: BASE, launchArgs: LAUNCH_ARGS, headless: !HEADED, playwright: require(PW + "/package.json").version,
     hashes: { "web/evo_ocean.wasm": sha("web/evo_ocean.wasm"), "web/ocean_scene.js": sha("web/ocean_scene.js"), "web/ocean_perf.js": sha("web/ocean_perf.js"),
               "web/ocean_appearance_slots.js": sha("web/ocean_appearance_slots.js"), "web/ocean_shaders.js": sha("web/ocean_shaders.js"),
+              "web/ocean_pose.js": sha("web/ocean_pose.js"),
               "web/ocean.js": sha("web/ocean.js"), "web/vendor/three.bundle.min.js": sha("web/vendor/three.bundle.min.js") },
     host: { platform: process.platform, cpus: os.cpus().length, cpuModel: os.cpus()[0] && os.cpus()[0].model, totalMemGB: Math.round(os.totalmem() / 1e9) },
     info }, extra);

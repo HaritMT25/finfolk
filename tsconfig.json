@@ -26,6 +26,7 @@
     "web/ocean_perf.js",
     "web/ocean_config.js",
     "web/ocean_appearance.js",
-    "web/ocean_shaders.js"
+    "web/ocean_shaders.js",
+    "web/ocean_pose.js"
   ]
 }
