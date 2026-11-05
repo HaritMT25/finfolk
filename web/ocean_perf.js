@@ -445,7 +445,7 @@
     cap.schema.counters.forEach(function (c, k) {
       var v = [];
       keep.forEach(function (fr) { var x = cap.cnt[fr * NK + k]; if (x === x) v.push(x); });
-      if (v.length) { var qq = quantiles(v); counters[c[0]] = { mean: qq.mean, min: Float64Array.from(v).sort()[0], max: qq.max }; }
+      if (v.length) { var qq = quantiles(v); counters[c[0]] = { mean: qq.mean, min: Float64Array.from(v).sort()[0], p99: qq.p99, max: qq.max }; }
     });
     var g = cap.gpu && cap.gpu.results, gpu = null;
     if (cap.gpu) {

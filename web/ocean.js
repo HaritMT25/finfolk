@@ -295,7 +295,14 @@
    * whether this module knows them at all */
   function hasWalls() { return has("oc_walls_enabled"); }
   function wallsOn() { return hasWalls() && !!M._oc_walls_enabled(); }
-  var worldReady = false, worldEpoch = 0;   /* epoch: a new world's (fish ids start over); Turbo keeps it */
+  /* epoch: a new world's (fish ids start over); Turbo keeps it. Invariant: an
+   * epoch number names one world for the page's whole life. A new world takes
+   * the next number above every one handed out (epochHigh), never one a world
+   * put back (pageBack: the run before a failed start, with its own number)
+   * left free: the renderer keeps each fish's appearance genes by (epoch, id)
+   * (web/ocean_appearance_slots.js), so a reused number with ids that start
+   * over would draw the old world's genes on the new world's fish */
+  var worldReady = false, worldEpoch = 0, epochHigh = 0;
   /* oc_init, and the bookkeeping of what it took: startWorld's alone.
    * repeats: the later occurrences of cfg's repeated keys (HO.parseFirst), so
    * oc_init checks each and takes the first, as it does for its own JSON.
@@ -587,7 +594,7 @@
   }
   /* a new world (oc_init or oc_reset; a saved world opened), or one handed back by Turbo */
   function afterNewWorld(fromTurbo) {
-    if (!fromTurbo) worldEpoch++;
+    if (!fromTurbo) worldEpoch = ++epochHigh;   /* (the invariant above) */
     var w0 = W, h0 = H, d0 = D, g0 = WALLS;
     readWorld();
     WALLS = wallsOn();

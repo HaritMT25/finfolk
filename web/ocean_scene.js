@@ -2072,7 +2072,7 @@
      * uploads, one per consumed texture update; calls, its texSubImage2D calls,
      * one per range or one for the whole texture; bytes), kept with or without
      * a profiler: the live-texture probe asserts it caused none */
-    var geneIO = { uploads: 0, calls: 0, bytes: 0, allocs: 0 };
+    var geneIO = { uploads: 0, calls: 0, bytes: 0, allocs: 0, rowChanges: 0, full: { storage: 0, bytes: 0, ranges: 0, policy: 0 } };
     /* test-only: holdGeneUploads leaves the gene texture's upload out, so a
      * stale texture can be shown to fail appearanceTextureParity */
     var testFaults = { holdGeneUploads: false };
@@ -2209,7 +2209,8 @@
      * (warm); plain otherwise. The appearance fish (render PR2, their genes in
      * their own slots) then draw only the lit ones on the full programs, in a
      * draw of their own, the rest on the plain ones (AppKind's split; unless
-     * more than half are lit). A gate per kind (the fish, the predators):
+     * more than half are lit), and none on the full ones while none is lit
+     * (their hold only keeps the poses packed). A gate per kind (the fish, the predators):
      * hold; lit, this frame's lit fish; posing, whether this frame packed the
      * swim poses (with no fish able to be lit, mayLight, nothing is
      * computed); and the last frame's extent of the fish (mayLight's). */
@@ -2401,8 +2402,10 @@
       });
       var shMat = shMats[0];
       /* The lit fish drawn apart (render PR2's stretch; option 2 of the #48
-       * review). While the full programs are due (settle) and at most half the
-       * fish are lit, the lit fish's bodies and barbels are copied into a small
+       * review). While the full programs are due (settle) and some fish, at
+       * most half of them, are lit (commit: 60 % once split; none lit, e.g.
+       * the hold after the last one, draws the plain programs), the lit fish's
+       * bodies and barbels are copied into a small
        * draw of their own (lit: its own instance buffers, the same gene
        * texture through their slots) on the full programs, and the main draw
        * keeps every fish in snapshot order on the plain body program plus one
@@ -2433,7 +2436,10 @@
         if (t && t !== self.tex) return;   /* (a texture replaced on growth) */
         var p = self.pending, calls = 1, bytes = self.texData.byteLength;
         self.pending = null;
-        if (p) { calls = p.calls; bytes = p.bytes; slots.acknowledge(p); }
+        if (p) {
+          calls = p.calls; bytes = p.bytes; slots.acknowledge(p);
+          if (p.full) geneIO.full[genePolicy === "full" ? "policy" : p.reason]++;   /* why a whole upload: new storage, over an eighth dirty, over 32 ranges */
+        }
         geneIO.uploads++; geneIO.calls += calls; geneIO.bytes += bytes;
         profiler.add(PK.geneUploads, 1); profiler.add(PK.geneUploadCalls, calls); profiler.add(PK.geneUploadBytes, bytes);
       }
@@ -2515,6 +2521,7 @@
           }
         }
         lit.geo = g; lit.bgeo = bg; lit.attrs = at; lit.cap = cap; lit.lod = lod;
+        profiler.add(PK.instAllocBytes, allocBytes(at, cap));
       }
       /* the k lit fish (litIdx: their draw indices, fillApp's) into the lit
        * draw, in their order; their main instances get the skip sentinel in
@@ -2574,33 +2581,56 @@
        * copied in, the dead released) and each draw's slot in iGeneSlot, the
        * gene texture for the slots' storage. Returns the slots' result (ok
        * false: the snapshot was refused, e.g. a repeated id, and its fish are
-       * drawn the plain way; the ownership is forgotten) */
+       * drawn the plain way; the ownership is forgotten). A row is copied
+       * once, when its fish is first seen (the engine's rows never change
+       * under an id and epoch); VERIFY owners a frame, in turn, are compared
+       * with their snapshot rows all the same, and a difference forgets the
+       * ownership and installs every fish again in this frame (warned once) */
+      var VERIFY = 2, warnedRows = false;
       self.reconcile = function (s, lod) {
         var n = s.n;
         self.ensure(n, lod);
         var tg = profiler.beginCpu();
         var r = slots.prepare(s.worldEpoch, s.ids, s.app, n, self.attrs.iGeneSlot.array);
+        var bad = r.ok ? slots.verify(s.ids, s.app, n, VERIFY) : null;
+        if (bad) {
+          geneIO.rowChanges++;
+          if (!warnedRows) { warnedRows = true; console.warn("evo_boids: fish " + bad.id + "'s appearance genes changed under the same id and world epoch (gene " + bad.gene + "): every fish's genes are installed again"); }
+          slots.invalidate();
+          r = slots.prepare(s.worldEpoch, s.ids, s.app, n, self.attrs.iGeneSlot.array);
+        }
         profiler.endCpu(SP.appearanceRows, tg);
         self.last = r;
         if (!r.ok) { slots.invalidate(); return r; }
         ensureGeneTexture();
         return r;
       };
-      /* v: the programs drawn (settle; fillApp packed the swim pose in iBody.w
+      /* v: the programs due (settle; fillApp packed the swim pose in iBody.w
        * for 1); slotsMoved: reconcile's changed (iGeneSlot is uploaded only
-       * then); nLit: how many fish fillApp lit (litIdx). With v 1 and at most
-       * half the fish lit, the split (above): the lit fish's own draw on the
-       * full programs, the main one on the plain programs with the skip */
+       * then); nLit: how many fish fillApp lit (litIdx). With the split on
+       * (litSplit) and v 1: no fish lit (the hold after the last one: with
+       * the lit fish drawn apart there is no whole-draw cost to hold) draws
+       * the plain programs; some lit, at most half of the fish (60 % once
+       * split: a little hysteresis), the split (above): the lit fish's own
+       * draw on the full programs, the main one on the plain programs with
+       * the skip; more, the whole kind on the full programs */
+      self.splitOn = false;
       self.commit = function (n, barbels, v, slotsMoved, nLit) {
-        var split = v === 1 && litSplit && nLit * 2 <= n;
+        var full = v === 1, split = false;
+        if (full && litSplit) {
+          if (nLit === 0) full = false;
+          else split = self.splitOn ? nLit * 5 <= n * 3 : nLit * 2 <= n;
+        }
+        self.splitOn = split;
+        var w = full ? 1 : 0;
         if (split) drawLit(nLit, barbels); else hideLit();
         self.n = n;
         self.geo.instanceCount = n;
         if (self.bgeo) self.bgeo.instanceCount = n;
         self.bytes = commitInstances(self.attrs, n, slotsMoved || self.slotAttrFresh ? null : "iGeneSlot") + lit.bytes;
         self.slotAttrFresh = false;
-        self.mesh.material = split ? matSkip : mats[v || 0]; self.shadow.material = shMats[v ? 1 : 0];
-        if (self.bmesh) self.bmesh.material = split ? matSkip : mats[v || 0];
+        self.mesh.material = split ? matSkip : mats[w]; self.shadow.material = shMats[w];
+        if (self.bmesh) self.bmesh.material = split ? matSkip : mats[w];
         /* the gene texture's upload: the slots' plan, if any (none: the
          * texture's version stays, three uploads nothing); "full" policy: the
          * whole texture every frame */
@@ -4141,6 +4171,7 @@
       geneTexture: function () {
         return appKind && appKind.tex ? { texture: appKind.tex, data: appKind.texData, capacity: appKind.slots.capacity, drawCapacity: appKind.cap, n: appKind.n,
                                           uploads: geneIO.uploads, calls: geneIO.calls, bytes: geneIO.bytes, allocs: geneIO.allocs,
+                                          fullUploads: Object.assign({}, geneIO.full), rowChanges: geneIO.rowChanges,
                                           slots: appKind.slots.stats(), policy: genePolicy, last: appKind.last && Object.assign({}, appKind.last) } : null;
       },
       /* the gene slot of each fish as the last frame drew them (draw order; tests) */
