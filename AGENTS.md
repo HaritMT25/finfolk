@@ -58,7 +58,11 @@ bash wasm/build_site.sh         # -> dist/ (SITE_DIR=/x to build elsewhere)
 python3 wasm/serve.py web 8123   # local server (production isolation headers) with web/ as its root; ROOT/PORT optional (default: repo root, 8123, so pages are under /web/)
 ```
 
-Presets: `native`, `native-serial`, `wasm-st`, `wasm-mt`. The window app needs SFML; without it CMake skips it.
+Presets: `native`, `native-serial`, `native-serial-fast`, `wasm-st`, `wasm-mt`. The window app needs SFML; without it CMake skips it.
+`native-serial-fast` (x86-64-v3 without FMA, plus LTO) is the serial build's arithmetic, faster. A study may use
+a binary built that way only after `tools/invasion/identity.py` shows it byte-identical to the study's pinned
+binary (`docs/throughput.md`). Study binaries come from `tools/invasion/build_engine.sh`, which is reproducible
+from a commit.
 Memory is tight on the maintainer's PC: use `JOBS`/`BUILD_JOBS`, `nice -n 19`, and do not start browsers casually.
 
 ## Gates (what each proves)
@@ -77,6 +81,10 @@ Memory is tight on the maintainer's PC: use `JOBS`/`BUILD_JOBS`, `nice -n 19`, a
   the printed per-command RSS is indicative, not a memory ceiling. `wasm/parity.sh` and `wasm/bench.sh` follow the
   same dir policy (`PARITY_DIR`, `BENCH_DIR`, `KEEP_OUT`).
 - `wasm/parity.sh`: Classic native serial == wasm, byte-identical FINAL checkpoints (not a per-step chain).
+  `NATIVE_CXXFLAGS="..."` (also in `ocean_parity.sh`) adds flags to the native side only, so a throughput build is held
+  to the same wasm.
+- `tools/invasion/identity.py --root STUDY --out DIR --binary pinned=A --binary new=B --sample N`: a new engine binary
+  against a study's pinned one on that study's real cells. Every output must be byte-identical (`docs/throughput.md`).
 - `ctest` (serial, OpenMP, thread-pool builds): `core_tests`, `predator_smoke`, plus `reseed_after_load`,
   `invasion_tooling` in the serial build with SFML.
 - `build_ocean.sh` / `build_wasm.sh` then `git diff --quiet -- web/` (exit 0 = unchanged; CI also uses `git diff --quiet -- web/evo_ocean.js web/evo_ocean.wasm`

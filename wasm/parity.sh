@@ -20,7 +20,11 @@ fi
 echo "== outputs in $OUT"
 
 echo "== building parity drivers"
-g++ -O3 -std=c++20 -ffp-contract=off -I src wasm/parity_driver.cpp -o "$OUT/parity_native"
+# NATIVE_CXXFLAGS: extra flags for the NATIVE side only, to hold a throughput build (CMakeLists.txt,
+# EVO_NATIVE_ARCH / EVO_LTO) to the same wasm, e.g. NATIVE_CXXFLAGS="-march=x86-64-v3 -mno-fma -flto=auto".
+[ -n "${NATIVE_CXXFLAGS:-}" ] && echo "   native extra flags: $NATIVE_CXXFLAGS"
+# shellcheck disable=SC2086  # NATIVE_CXXFLAGS is a list of flags: split on purpose
+g++ -O3 -std=c++20 -ffp-contract=off ${NATIVE_CXXFLAGS:-} -I src wasm/parity_driver.cpp -o "$OUT/parity_native"
 # -msimd128: the browser modules are built with it (wasm/wasm.cmake), so the
 # parity check runs the same vectorised code.
 em++ -O3 -std=c++20 -ffp-contract=off -msimd128 -I src wasm/parity_driver.cpp -o "$OUT/parity_wasm.js"

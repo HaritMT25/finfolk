@@ -15,6 +15,13 @@
       "cacheVariables": { "CMAKE_BUILD_TYPE": "Release", "EVO_NO_OPENMP": "ON" }
     },
     {
+      "name": "native-serial-fast",
+      "displayName": "Native, single-threaded, AVX2 without FMA + LTO: the serial build's results, faster (docs/throughput.md)",
+      "binaryDir": "${sourceDir}/build_serial_fast",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release", "EVO_NO_OPENMP": "ON",
+                          "EVO_NATIVE_ARCH": "x86-64-v3", "EVO_LTO": "ON" }
+    },
+    {
       "name": "wasm-st",
       "displayName": "Browser module, single-threaded (deterministic) -> web/evo_boids.{js,wasm}",
       "binaryDir": "${sourceDir}/build_wasm_st",
@@ -32,6 +39,7 @@
   "buildPresets": [
     { "name": "native", "configurePreset": "native" },
     { "name": "native-serial", "configurePreset": "native-serial" },
+    { "name": "native-serial-fast", "configurePreset": "native-serial-fast" },
     { "name": "wasm-st", "configurePreset": "wasm-st" },
     { "name": "wasm-mt", "configurePreset": "wasm-mt" }
   ]

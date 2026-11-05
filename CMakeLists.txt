@@ -26,6 +26,51 @@ set(CMAKE_CXX_FLAGS_DEBUG "-g -O0")
 # Do not add -ffast-math: it implies contraction and much worse.
 add_compile_options(-ffp-contract=off)
 
+# Throughput build for headless experiments (tools/invasion, docs/throughput.md):
+# the serial build's arithmetic, compiled to run faster. All OFF by default, so
+# every other build is exactly what it was.
+#   EVO_NATIVE_ARCH=x86-64-v3  AVX2 code (Haswell / Zen 1 and later only: the
+#       binary dies with SIGILL elsewhere), always with -mno-fma. FMA is the one
+#       x86-64-v3 feature that can change a result (a fused multiply-add rounds
+#       once instead of twice). -ffp-contract=off already forbids the compiler
+#       to form one; -mno-fma removes the instruction as well, so no path (an
+#       intrinsic, a header, LTO's link-time code generation) can emit it.
+#   EVO_LTO=ON  link-time optimisation (-flto=auto).
+#   EVO_PGO=generate|use  profile-guided optimisation, profile in EVO_PGO_DIR
+#       (tools/invasion/build_engine.sh runs both passes).
+# None of these may change one output byte, and "should not" is not evidence: a
+# binary built this way serves a study only after tools/invasion/identity.py has
+# shown it byte-identical to the study's pinned binary on real cells, and
+# wasm/parity.sh with NATIVE_CXXFLAGS has shown native == wasm with its flags.
+set(EVO_NATIVE_ARCH "" CACHE STRING "-march for a throughput build, e.g. x86-64-v3 (adds -mno-fma); empty = the default target")
+option(EVO_LTO "Link-time optimisation (-flto=auto)" OFF)
+set(EVO_PGO "" CACHE STRING "Profile-guided optimisation pass: empty, generate or use")
+set(EVO_PGO_DIR "${CMAKE_BINARY_DIR}/pgo" CACHE PATH "Profile data directory for EVO_PGO")
+if(NOT EMSCRIPTEN)
+    set(EVO_FAST_FLAGS "")
+    if(EVO_NATIVE_ARCH)
+        list(APPEND EVO_FAST_FLAGS -march=${EVO_NATIVE_ARCH} -mno-fma)
+    endif()
+    if(EVO_LTO)
+        list(APPEND EVO_FAST_FLAGS -flto=auto)
+    endif()
+    if(EVO_PGO STREQUAL "generate")
+        list(APPEND EVO_FAST_FLAGS -fprofile-generate -fprofile-dir=${EVO_PGO_DIR} -fprofile-update=single)
+    elseif(EVO_PGO STREQUAL "use")
+        list(APPEND EVO_FAST_FLAGS -fprofile-use -fprofile-dir=${EVO_PGO_DIR} -fprofile-partial-training
+                                   -Wno-missing-profile)
+    elseif(EVO_PGO)
+        message(FATAL_ERROR "EVO_PGO must be empty, generate or use (got '${EVO_PGO}')")
+    endif()
+    if(EVO_FAST_FLAGS)
+        add_compile_options(${EVO_FAST_FLAGS})
+        # LTO generates code at the link, and the profile runtime links there:
+        # the same flags go to the link, -ffp-contract=off included.
+        add_link_options(${EVO_FAST_FLAGS} -ffp-contract=off)
+        message(STATUS "throughput build: ${EVO_FAST_FLAGS}")
+    endif()
+endif()
+
 # Serial build switch. OpenMP parallelises the sensor/movement phase with
 # per-thread RNGs, which makes runs NON-reproducible even at a fixed --seed (see
 # the Stage-A schooling finding). Configure with -DEVO_NO_OPENMP=ON to build a

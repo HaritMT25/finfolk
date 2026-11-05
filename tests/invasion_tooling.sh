@@ -80,6 +80,10 @@
 #  37. gate.py: the frozen manifest before any computation, the schedule and seeds, refusals, the decision;
 #  38. the bank's original identity (item IDs, snapshot hashes, all 28,800 cells);
 #  39. the headline claim: strict registration, a passed gate, T only; the prose; the confirmation seeds.
+#  Throughput (docs/throughput.md):
+#  5b. identity.py: the same binary twice is IDENTICAL and matches the root's record; a binary that changes
+#      one byte of end.json is caught on that file; a held root, --out inside the root and a binary that is
+#      not its --expect'ed bytes are refused; the report carries the host fingerprint.
 set -u
 BIN=${1:?usage: invasion_tooling.sh EVO_BOIDS WORKDIR}
 W=${2:?usage: invasion_tooling.sh EVO_BOIDS WORKDIR}
@@ -163,6 +167,56 @@ $PY "$T/plan.py" design.json > plan.jsonl || fail "plan.py"
 $PY "$T/run.py" --plan plan.jsonl --root root --binary "$BIN" --workers 2 > run.log 2>&1 || fail "run.py: $(tail -3 run.log)"
 [ -f root/cells/off_f100_A_B_r00/done.json ] && [ -f root/cells/off_f100_A_sham_r00/done.json ] || fail "run.py: no done.json"
 $PY "$T/run.py" --plan plan.jsonl --root root --binary "$BIN" --workers 2 | grep -q "2 already done" || fail "run.py resume"
+
+# 5b. identity.py (the gate a new engine binary passes, docs/throughput.md): the same binary twice is
+#     IDENTICAL and reproduces the root's own record (score.json included: same tools); a "binary" that
+#     changes one digit of end.json is NOT, on exactly that file; a root a runner holds, and --out inside
+#     the root, are refused
+cat > tamper.sh <<EOF
+#!/bin/bash
+"$BIN" "\$@" || exit \$?
+python3 -I - <<'PY'
+import re
+s = open("end.json").read()
+i = re.search(r'"posX":\[-?([0-9])', s).start(1)   # first digit of the first fish's x (the score never reads it)
+d = "1" if s[i] != "1" else "2"
+open("end.json", "w").write(s[:i] + d + s[i + 1:])
+PY
+EOF
+chmod +x tamper.sh
+BIN_SHA=$(sha256sum "$BIN" | cut -d' ' -f1)
+$PY "$T/identity.py" --root root --out id_same --binary a="$BIN" --binary b="$BIN" --expect a="$BIN_SHA" \
+    --sample 2 --workers 2 > id1.log 2>&1 || fail "identity.py, the same binary twice: $(tail -3 id1.log)"
+# --expect: a binary that is not the expected bytes is refused before anything is written
+$PY "$T/identity.py" --root root --out id_wrong --binary a="$BIN" --binary t="$W/tamper.sh" --expect t="$BIN_SHA" \
+    --sample 1 > id5.log 2>&1
+rc=$?
+[ "$rc" = 2 ] || fail "identity.py --expect with the wrong bytes exited $rc, expected 2"
+[ -e id_wrong ] && fail "identity.py wrote its --out before refusing an unexpected binary"
+$PY "$T/identity.py" --root root --out id_tamper --binary a="$BIN" --binary t="$W/tamper.sh" --sample 2 > id2.log 2>&1 \
+    && fail "identity.py passed a binary that changes end.json"
+$PY - <<'PY' || fail "identity.py verdicts"
+import json
+r = json.load(open("id_same/identity.json"))
+assert r["verdict"] == "IDENTICAL" and r["identical"] == 2 and r["cells"] == 2, r["verdict"]
+assert r["record_hashes_checked"] >= 2 * 5 and not r["record_mismatch"], r["record_hashes_checked"]
+assert all("score.json" in c["record_checked"] for c in r["per_cell"].values())
+assert r["binaries"]["a"]["expected_sha256"] == r["binaries"]["a"]["sha256"] and r["binaries"]["b"]["expected_sha256"] is None
+assert r["host"]["cpu_model"] and r["host"]["glibc"] and r["host"]["python"], r["host"]
+t = json.load(open("id_tamper/identity.json"))
+assert t["verdict"] == "NOT IDENTICAL" and len(t["different"]) == 2, t["verdict"]
+assert all(c["different_files"] == ["end.json"] for c in t["per_cell"].values()), t["per_cell"]
+assert not t["record_mismatch"], "the reference (the real engine) still matches the record"
+PY
+( flock -x 9; sleep 4 ) 9> root/.runner.lock &
+sleep 1
+$PY "$T/identity.py" --root root --out id_live --binary a="$BIN" --binary b="$BIN" --sample 1 > id3.log 2>&1
+rc=$?
+wait
+[ "$rc" = 2 ] || fail "identity.py read a root a runner holds (exit $rc)"
+$PY "$T/identity.py" --root root --out root/id_inside --binary a="$BIN" --binary b="$BIN" --sample 1 > id4.log 2>&1 \
+    && fail "identity.py accepted --out inside the study root"
+[ -e root/id_inside ] && fail "identity.py wrote inside the study root"
 
 # 6. the memory gate fails closed and honours cgroup v2 limits up the tree
 mkdir -p cg/a/b
