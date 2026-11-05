@@ -627,9 +627,9 @@ interface EvoOceanShadersApi {
   /** the plain fish's and the predators' programs: the vertex stages' common part, the body's vertex and
    * fragment stages, the shadow's vertex stage */
   fishCore(P: FishVariant): string;
-  fishVs(P: FishVariant): string;
-  fishFs(P: FishVariant): string;
-  shadowVs(P: FishVariant): string;
+  fishVs(P: FishVariant, more?: string[]): string;
+  fishFs(P: FishVariant, more?: string[]): string;
+  shadowVs(P: FishVariant, more?: string[]): string;
   /** built once: FISH_VS / FISH_FS [plain, full, lite] (lite's fragment stage is the plain one),
    * SHADOW_VS [plain, lite], SHADOW_FS (every variant's) */
   FISH_VS: string[];
@@ -648,11 +648,99 @@ interface EvoOceanShadersApi {
   DECODE_CALL: string;
   /** a float32 constant as a GLSL float literal */
   glslF(x: number): string;
-  /** the appearance fish's programs (P absent: plain); appCore, the vertex stages' common part;
-   * appearanceShadersOf, the programs around given common parts (body, shadow) */
-  appearanceShaders(EA: EvoAppearanceApi, P?: FishVariant): AppearancePrograms;
+  /** the appearance fish's programs (P absent: plain; more: other features' ids, for the programs they
+   * target); appCore, the vertex stages' common part */
+  appearanceShaders(EA: EvoAppearanceApi, P?: FishVariant, more?: string[]): AppearancePrograms;
   appCore(EA: EvoAppearanceApi, P?: FishVariant): string;
-  appearanceShadersOf(EA: EvoAppearanceApi, P: FishVariant | undefined, CORE: string, SCORE: string, F: boolean | undefined): AppearancePrograms;
+  /** the fish programs' named slots (step 4a): the slots' ABI, each slot's contract, the programs with slots */
+  ABI: number;
+  SLOTS: { readonly [slot: string]: ShaderSlotSpec };
+  PROGRAMS: { readonly [program: string]: ShaderProgramSpec };
+  /** a named slot in a program's parts (fallback: its text when no enabled feature replaces it; null none) */
+  slot(name: string, fallback: string | null): ShaderSlot;
+  /** the names a GLSL source declares, scope by scope (the checks' scan) */
+  declarations(src: string): ShaderDeclaration[];
+  /** the module's own assembler: register a feature; assemble a program, or a vertex stage's common part
+   * (core: the slots it has), with the enabled features' ids; the registered ids */
+  feature(spec: ShaderFeatureSpec): ShaderFeature;
+  program(name: string, parts: ShaderPart[], features?: string[], env?: ShaderEnv): string;
+  core(name: string, parts: ShaderPart[], features?: string[], env?: ShaderEnv): string;
+  features(): string[];
+  /** a fresh registry and assembler (no feature registered: the tests') */
+  assembler(): ShaderAssembler;
+  /** each program's parts (fresh arrays): the legacy fish's, the appearance fish's (EA's GLSL) */
+  parts: FishProgramParts;
+  /** the swim polish's two features (plain is neither), and its spec in a mode (to register elsewhere) */
+  POLISH: { readonly lite: string; readonly full: string };
+  polishFeature(mode: "lite" | "full"): ShaderFeatureSpec;
+}
+
+/** A named slot in a fish program's parts (EvoOceanShaders.slot). */
+interface ShaderSlot { slot: string; fallback: string | null }
+/** A program's part: GLSL, null (none: lines() drops it) or a named slot. */
+type ShaderPart = string | null | ShaderSlot;
+/** What a program is assembled for: the appearance programs pass the appearance law (EA). */
+interface ShaderEnv { EA?: EvoAppearanceApi }
+/** A feature's text for a slot: GLSL, or a function of the program's environment giving it. */
+type ShaderText = string | ((env: ShaderEnv) => string);
+/** A feature, as registered (EvoOceanShaders.feature): the slots' ABI; the programs it supports; by slot,
+ * the text it appends (additive slots) or replaces the fallback with (replacement slots); order: where its
+ * appends go among others' (then by id; default 0). */
+interface ShaderFeatureSpec {
+  id: string;
+  abi: number;
+  targets: string[];
+  append?: { [slot: string]: ShaderText };
+  replace?: { [slot: string]: ShaderText };
+  order?: number;
+}
+/** A registered feature (frozen). */
+interface ShaderFeature {
+  readonly id: string;
+  readonly abi: number;
+  readonly targets: readonly string[];
+  readonly append: { readonly [slot: string]: ShaderText };
+  readonly replace: { readonly [slot: string]: ShaderText };
+  readonly order: number;
+}
+/** A slot's contract: kind (append: additive, any number of features in their order; replace: one
+ * provider), stage, where it is, what it may read, what it writes; must: what a replacement declares. */
+interface ShaderSlotSpec {
+  readonly kind: "append" | "replace";
+  readonly stage: "vs" | "fs";
+  readonly at: string;
+  readonly reads: readonly string[];
+  readonly writes: readonly string[];
+  readonly must: readonly string[];
+}
+/** A program with slots: its slots in order. */
+interface ShaderProgramSpec {
+  readonly abi: number;
+  readonly stage: "vs" | "fs";
+  readonly doc: string;
+  readonly slots: readonly string[];
+}
+/** A declaration the source scan found: its name, scope ("" the globals, else "function#k"), kind
+ * (uniform, attribute, varying, const, global, struct, function, local) and the offset of its statement. */
+interface ShaderDeclaration { name: string; scope: string; kind: string; at: number }
+/** A registry of features and the assembler over it. */
+interface ShaderAssembler {
+  feature(spec: ShaderFeatureSpec): ShaderFeature;
+  program(name: string, parts: ShaderPart[], features?: string[], env?: ShaderEnv): string;
+  core(name: string, parts: ShaderPart[], features?: string[], env?: ShaderEnv): string;
+  features(): string[];
+  get(id: string): ShaderFeature | null;
+}
+/** The fish programs' parts, fresh each call. */
+interface FishProgramParts {
+  fishCore(): ShaderPart[];
+  fishVs(): ShaderPart[];
+  fishFs(): ShaderPart[];
+  shadowVs(): ShaderPart[];
+  appCore(EA: EvoAppearanceApi): ShaderPart[];
+  appBodyVs(EA: EvoAppearanceApi): ShaderPart[];
+  appBodyFs(EA: EvoAppearanceApi): ShaderPart[];
+  appShadowVs(EA: EvoAppearanceApi): ShaderPart[];
 }
 
 /* ---------------- web/ocean_pose.js (window.EvoOceanPose) ---------------- */
