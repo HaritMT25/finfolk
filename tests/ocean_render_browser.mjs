@@ -1,7 +1,7 @@
 // tests/ocean_render_browser.mjs: the Ocean's render checks and benchmark on the real page, in headless Brave.
 //
 //   node tests/ocean_render_browser.mjs --base http://localhost:8152 [--out DIR]
-//        [--parts correctness,slots,noperf,faults,timer,beam,iframe,gate,offimage,perf] [--counts 500,1500,2500]
+//        [--parts correctness,slots,noperf,missing,faults,timer,beam,iframe,gate,offimage,perf] [--counts 500,1500,2500]
 //        [--dur 15000] [--warm 10000] [--rounds 2] [--headed]
 //        [--cameras whole,dense,follow,fit] [--colours appearance,family,brain]   (perf; default whole, appearance)
 //        [--modes off,frame,spans,spansGpu] [--viewport 1920x1080[@1]]       (perf; the default: all four, 1920 x 1080 at DPR 1)
@@ -45,6 +45,9 @@
 //                against the whole-texture policy's
 //   noperf       web/ocean_perf.js blocked (a normal link, ?renderBench=1):
 //                the page starts and draws with no other error
+//   missing      a script the 3-D scene needs blocked (ocean_shaders.js,
+//                ocean_pose.js, both, or ocean_scene.js itself): the page
+//                stops, and its splash names the file, with no other error
 //   faults       each planted fault must be caught (and compile and run):
 //                the texture lookup (row0, nextRow, slot) and vPart.w in both
 //                vertex reports; the slot selector on the draw index again
@@ -261,6 +264,7 @@ async function manifestOf(page, label, extra = {}) {
   return Object.assign({ label, base: BASE, launchArgs: LAUNCH_ARGS, headless: !HEADED, playwright: require(PW + "/package.json").version,
     hashes: { "web/evo_ocean.wasm": sha("web/evo_ocean.wasm"), "web/ocean_scene.js": sha("web/ocean_scene.js"), "web/ocean_perf.js": sha("web/ocean_perf.js"),
               "web/ocean_appearance_slots.js": sha("web/ocean_appearance_slots.js"), "web/ocean_shaders.js": sha("web/ocean_shaders.js"),
+              "web/ocean_pose.js": sha("web/ocean_pose.js"),
               "web/ocean.js": sha("web/ocean.js"), "web/vendor/three.bundle.min.js": sha("web/vendor/three.bundle.min.js") },
     host: { platform: process.platform, cpus: os.cpus().length, cpuModel: os.cpus()[0] && os.cpus()[0].model, totalMemGB: Math.round(os.totalmem() / 1e9) },
     info }, extra);
@@ -730,6 +734,33 @@ async function partNoPerf() {
     report.parts[label] = Object.assign({ blocked, errors: L.errors }, r);
     check((bench ? "?renderBench=1, " : "") + "ocean_perf.js blocked: the page starts, runs and draws the fish's bodies (no profiler, no bench)",
           r.started && blocked >= 1 && !r.perfFile && !r.perf && !r.bench && !r.paused && r.advancing && r.app.drawing && r.n > 0, r);
+    check("  no other console / page / network error", other.length === 0, other.slice(0, 5));
+    await L.ctx.close();
+  }
+}
+
+/* ---------------- a script the scene needs, missing ---------------- */
+/* web/ocean_shaders.js, web/ocean_pose.js, both, or web/ocean_scene.js itself
+ * blocked (a route abort): the page does not start, and its splash names the
+ * file (the scene's EvoOceanSceneMissing; without the scene, ocean_scene.js) */
+async function partMissing() {
+  console.log("== a script the 3-D scene needs, missing (blocked): the splash names it");
+  for (const files of [["ocean_shaders"], ["ocean_pose"], ["ocean_shaders", "ocean_pose"], ["ocean_scene"]]) {
+    const label = "missing-" + files.join("+");
+    const L = await launch(label);
+    let blocked = 0;
+    await L.ctx.route(new RegExp("/(" + files.join("|") + ")(\\.[0-9a-f]+)?\\.js(\\?.*)?$"), (r) => { blocked++; return r.abort(); });
+    await L.page.goto(BASE + "/ocean.html?guide=0&intro=0&seed=7");
+    await L.page.waitForFunction(() => /could not start/.test(document.body.textContent) || (window.EvoApp && EvoApp.ready === true), null, { timeout: 90000 });
+    const r = await L.page.evaluate(() => ({ started: !!(window.EvoApp && EvoApp.ready === true), scene: !!window.EvoOceanScene,
+                                             flag: window.EvoOceanSceneMissing === undefined ? null : window.EvoOceanSceneMissing,
+                                             splash: (document.getElementById("splashstate") || {}).textContent || "" }));
+    const want = (files.includes("ocean_scene") ? "ocean_scene.js" : files.map((f) => f + ".js").join(" and ")) + " missing";
+    /* the blocked scripts' own failures, and the scene saying which, are expected; nothing else may fail */
+    const other = L.errors.filter((e) => !files.some((f) => e.includes(f + ".")));
+    report.parts[label] = Object.assign({ blocked, want, errors: L.errors }, r);
+    check(files.map((f) => f + ".js").join(" + ") + " blocked: the page stops, its splash says \"" + want + "\"",
+          !r.started && !r.scene && blocked === files.length && r.splash.includes(want), r);
     check("  no other console / page / network error", other.length === 0, other.slice(0, 5));
     await L.ctx.close();
   }
@@ -1334,7 +1365,7 @@ async function partPerfArms() {
   }
 }
 
-const RUN = { correctness: partCorrectness, slots: partSlots, noperf: partNoPerf, faults: partFaults, timer: partTimer, beam: partBeam, iframe: partIframe,
+const RUN = { correctness: partCorrectness, slots: partSlots, noperf: partNoPerf, missing: partMissing, faults: partFaults, timer: partTimer, beam: partBeam, iframe: partIframe,
               gate: partGate, offimage: partOffImage, perf: () => (ARMS ? partPerfArms() : partPerf()) };
 (async () => {
   for (const p of PARTS) {

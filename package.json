@@ -1,0 +1,11 @@
+{
+  "name": "finfolk-web-checks",
+  "private": true,
+  "description": "Development only: the web front end's type check (tsc --checkJs over tsconfig.json's files; CI's web-types job). The site has no build step and ships nothing from here.",
+  "scripts": {
+    "types": "tsc -p tsconfig.json"
+  },
+  "devDependencies": {
+    "typescript": "5.6.3"
+  }
+}

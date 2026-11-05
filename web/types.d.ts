@@ -585,8 +585,18 @@ interface EvoAppearanceApi {
 
 /* ---------------- web/ocean_shaders.js (window.EvoOceanShaders) ---------------- */
 
-/** The scene's GLSL text that comes in no variants: the chunks its programs share and the
- * environment's programs (web/ocean_shaders.js says what each draws). */
+/** A fish program's variant (the swim polish): false plain (the fish as before the polish, its GLSL byte
+ * for byte), true full, "lite" the roll only. */
+type FishVariant = boolean | "lite";
+/** The appearance fish's programs, one variant (appearanceShaders): the body's vertex and fragment stages,
+ * its shadow's vertex stage, and the checks' and probes' programs (the flank chart, the live texture's raw
+ * genes and charts). */
+interface AppearancePrograms {
+  vs: string; fs: string; shadowVs: string;
+  chartVs: string; chartFs: string; probeRawVs: string; probeRawFs: string; probeChartVs: string;
+}
+/** The scene's GLSL: the chunks its programs share, the environment's programs, and the fish programs in
+ * their variants with the functions that build them (web/ocean_shaders.js says what each draws). */
 interface EvoOceanShadersApi {
   FOG_FN: string;
   BEAM_FN: string;
@@ -607,6 +617,96 @@ interface EvoOceanShadersApi {
   LINE_FS: string;
   RING_VS: string;
   RING_FS: string;
+  /** a program from its lines (the null ones, a variant's absent lines, left out) */
+  lines(a: (string | null)[]): string;
+  /** how often sub occurs in s */
+  occurrences(s: string, sub: string): number;
+  /** the swim pose's GLSL (poseOf: the packed float -> iPose; rollTo, wagAt, causOf) and the polish's light */
+  POSE_GLSL: string;
+  POLISH_FN: string;
+  /** the plain fish's and the predators' programs: the vertex stages' common part, the body's vertex and
+   * fragment stages, the shadow's vertex stage */
+  fishCore(P: FishVariant): string;
+  fishVs(P: FishVariant): string;
+  fishFs(P: FishVariant): string;
+  shadowVs(P: FishVariant): string;
+  /** built once: FISH_VS / FISH_FS [plain, full, lite] (lite's fragment stage is the plain one),
+   * SHADOW_VS [plain, lite], SHADOW_FS (every variant's) */
+  FISH_VS: string[];
+  FISH_FS: string[];
+  SHADOW_VS: string[];
+  SHADOW_FS: string;
+  /** an instance's gene slot, read by every gene-reading program (and the statement it returns) */
+  GENE_SLOT_RET: string;
+  GENE_SLOT_GLSL: string;
+  /** the split: a lit appearance fish's highlight (iBody.z) in the main draw, the line that skips such an
+   * instance, and litSkip(vs), a vertex stage (one main) with that line first */
+  LIT_SKIP: number;
+  LIT_SKIP_GLSL: string;
+  litSkip(vs: string): string;
+  /** the fetched slot's pattern genes -> the flat pattern varyings */
+  DECODE_CALL: string;
+  /** a float32 constant as a GLSL float literal */
+  glslF(x: number): string;
+  /** the appearance fish's programs (P absent: plain); appCore, the vertex stages' common part;
+   * appearanceShadersOf, the programs around given common parts (body, shadow) */
+  appearanceShaders(EA: EvoAppearanceApi, P?: FishVariant): AppearancePrograms;
+  appCore(EA: EvoAppearanceApi, P?: FishVariant): string;
+  appearanceShadersOf(EA: EvoAppearanceApi, P: FishVariant | undefined, CORE: string, SCORE: string, F: boolean | undefined): AppearancePrograms;
+}
+
+/* ---------------- web/ocean_pose.js (window.EvoOceanPose) ---------------- */
+
+/** How far a kind's geometry reaches past its spine (reachRadius): forward of the head at most
+ * min(uf, sn + kf / lambda) body lengths, behind the tail at most min(ub, tb + kb / lambda), and pad body
+ * radii off the spine. */
+interface PoseReach { sn: number; kf: number; uf: number; tb: number; kb: number; ub: number; pad: number }
+/** The swim pose's camera for one frame (the scene's poseCamera()). */
+interface PoseCamera {
+  /** false: every fish weighs 1 (the measurements' ungated reference) */
+  gate: boolean;
+  /** true: every weight 0 (the plain programs' reference) */
+  zero: boolean;
+  /** the view matrix (world -> camera), column-major, 16 */
+  view: ArrayLike<number>;
+  /** the frustum's four side planes in camera space: (x or y, depth) unit normals, + outside, 8 */
+  planes: ArrayLike<number>;
+  /** the focal length in CSS px (the projection's, with the zoom and the panels' view offset) */
+  focal: number;
+  /** the near plane's distance */
+  near: number;
+  /** half the tank's width and height (the sim -> three offset) */
+  halfW: number;
+  halfH: number;
+}
+/** The swim pose on the CPU: a fish's size weight, its pose packed in one float, the reach. xs, ys: its
+ * spine as uploaded (six sim points, head first, unwrapped); R its body radius, y its height (three Y), vz
+ * its pitch, lam its lambda (the legacy kinds 1); v its swimming speed / 150 (0: no fold); qw a weight in
+ * 7 bits (1 .. 127). */
+interface EvoOceanPoseApi {
+  /** the appearance fish's reach; the tail beat's largest offset (body radii); the unlit pose */
+  REACH_APP: PoseReach;
+  WAG_MAX: number;
+  POSE0: number;
+  /** a legacy template's reach (its positions, 3 a vertex) */
+  reachOfTemplate(pos: ArrayLike<number>): PoseReach;
+  /** the radius about the head-tail centre that holds everything drawn for the fish */
+  reachRadius(xs: ArrayLike<number>, ys: ArrayLike<number>, R: number, vz: number, lam: number, K: PoseReach): number;
+  /** the body radius in CSS px at its nearest depth */
+  posePx(xs: ArrayLike<number>, ys: ArrayLike<number>, R: number, y: number, G: PoseCamera): number;
+  /** the size weight in 7 bits, 0 for a fish whose whole reach is out of view (px: posePx's, over 6) */
+  poseVisibleQ(xs: ArrayLike<number>, ys: ArrayLike<number>, R: number, y: number, G: PoseCamera, vz: number, lam: number, K: PoseReach, px: number): number;
+  /** the size weight in 7 bits (G.gate false: 127; G.zero: 0; K absent: REACH_APP) */
+  poseQ(xs: ArrayLike<number>, ys: ArrayLike<number>, R: number, y: number, G: PoseCamera, vz?: number, lam?: number, K?: PoseReach): number;
+  /** the roll and the fold of a lit fish, packed (packPose's layout) */
+  posePack(xs: ArrayLike<number>, ys: ArrayLike<number>, v: number, qw: number): number;
+  /** one fish's swim pose, packed: posePack if it is lit, else POSE0 */
+  swimPose(xs: ArrayLike<number>, ys: ArrayLike<number>, R: number, y: number, v: number, G: PoseCamera, vz?: number, lam?: number, K?: PoseReach): number;
+  /** the float's layout: sin(roll), fold, weight -> an integer below 2^24, and back to [sin, cos, fold, weight] */
+  packPose(s: number, tuck: number, w: number): number;
+  unpackPose(p: number): number[];
+  /** GLSL's smoothstep */
+  smoothCPU(a: number, b: number, x: number): number;
 }
 
 /* ---------------- not checked yet: declared by what checked files use ---------------- */
@@ -650,6 +750,10 @@ declare var EvoOceanPerf: EvoOceanPerfApi;
 declare var EvoOceanConfig: EvoOceanConfigApi;
 declare var EvoAppearance: EvoAppearanceApi;
 declare var EvoOceanShaders: EvoOceanShadersApi;
+declare var EvoOceanPose: EvoOceanPoseApi;
 declare var EvoOceanScene: EvoOceanSceneApi;
+/** set by web/ocean_scene.js when a script it needs did not load ("ocean_shaders.js", "ocean_pose.js" or
+ * both, " and "): the page's "could not start" names it (else "ocean_scene.js", the scene itself) */
+declare var EvoOceanSceneMissing: string | undefined;
 declare var EvoOcean: OceanPageApi;
 declare var EVO_ASSETS: EvoAssets;

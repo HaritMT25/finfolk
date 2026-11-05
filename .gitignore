@@ -22,3 +22,6 @@ docs/evo_boids_perf.md
 # deploy output (wasm/build_site.sh) and the Vercel CLI's project link
 dist/
 .vercel/
+
+# the type check's TypeScript (npm ci: package.json, package-lock.json)
+node_modules/
