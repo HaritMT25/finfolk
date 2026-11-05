@@ -12,8 +12,8 @@
 //        queries every 6th) with rAF timestamps: main (--main-base's site: before the polish), off / on /
 //        ungated / zero (this site with scene.setPolish false / true / "ungated": every fish at full weight, the
 //        reference that shows what the size gate saves; "zero": every weight 0, so none lit: the plain programs; "fullUp": the polish on with
-//        the whole gene texture uploaded every frame, as before render PR2; "nosplit": the polish on, the whole kind on the full programs
-//        while any fish is lit, as before PR2's split). Per cell, each round runs the arms in order
+//        the whole gene texture uploaded every frame, as before render PR2; "split": the polish on with the lit fish drawn apart,
+//        render PR2's opt-in split). Per cell, each round runs the arms in order
 //        (reversed on odd rounds, so drift cancels), a fresh page per site, a warm-up after each load and a
 //        settle after each switch; every observation records the arm, the effective polish state
 //        (scene.polish(): programs, gate, the last frame's weights), quality, DPR, the drawing buffer, the
@@ -274,6 +274,8 @@ async function partCorrectness() {
   await L.page.goto(benchUrl(c));
   await ready(L.page, true);
   const prep = await L.page.evaluate((cd) => EvoOcean.bench.prepare(cd), Object.assign({}, c, { camera: "whole", colourMode: "appearance" }));
+  /* render PR2's split (the lit fish apart: off by default, it measured slower) on for this part, so its checks see it */
+  await L.page.evaluate(() => EvoOcean.scene.setLitSplit(true));
   report.parts.correctness = { manifest: await manifestOf(L.page, "correctness", { browserVersion: L.browserVersion, case: prep }) };
   const ctx = report.parts.correctness.manifest.info.context;
   console.log("  gpu " + ctx.renderer + "; drawing buffer " + ctx.drawingBuffer.join(" x ") + "; timer " + ctx.timerQuery);
@@ -1132,14 +1134,13 @@ async function partOffImage() {
         if (cand === "switched") { out.polishOn0 = S.polish(); out.on0 = await grab(); S.setPolish(false); await B.wait(1500); await B.frames(4); }
         out.polish = S.polish ? S.polish() : null;
         out.off = await grab();
-        if (cand === "switched") {
-          S.setPolish(true); await B.wait(1500); await B.frames(4); out.polishOn = S.polish(); out.on = await grab();
+        if (cand === "switched") { S.setPolish(true); await B.wait(1500); await B.frames(4); out.polishOn = S.polish(); out.on = await grab(); }
+        /* render PR2's split (opt-in: setLitSplit(true)): the same frame with the lit fish drawn apart */
+        if (cand === "switched" && st.cam === "close" && S.setLitSplit) {
+          S.setLitSplit(true); await B.wait(300); await B.frames(4); out.polishOnSplit = S.polish(); out.onSplit = await grab();
           if (pickHover) { const a = S.poseOf(pickHover.selected), b = S.poseOf(pickHover.hovered);
                            out.pickApart = { selected: { weight: a.pose[3], apart: a.apart }, hovered: { weight: b.pose[3], apart: b.apart } }; }
-        }
-        /* render PR2's split: the same frame with the whole kind on the full programs (as before the split) */
-        if (cand === "switched" && st.cam === "close" && S.setLitSplit) {
-          S.setLitSplit(false); await B.frames(4); out.polishOnUnsplit = S.polish(); out.onUnsplit = await grab(); S.setLitSplit(true); await B.frames(2);
+          S.setLitSplit(false); await B.frames(2);
         }
         S.render = orig;
         return out;
@@ -1189,14 +1190,13 @@ async function partOffImage() {
             c.pickApart && c.pickApart.selected.weight > 0 && c.pickApart.hovered.weight > 0 && c.pickApart.selected.apart >= 0 && c.pickApart.hovered.apart >= 0,
             { pick: c.pickHover, apart: c.pickApart });
     }
-    if (st.cam === "close" && c.onUnsplit) {
-      /* the lit fish apart (split) vs the whole kind on the full programs: an unlit fish looks the same in either program */
-      const d3 = diff(c.onUnsplit, c.on);
-      report.parts.offimage.states[st.name].splitVsUnsplit = Object.assign({ split: { split: c.polishOn.split, litDrawn: c.polishOn.litDrawn, lit: c.polishOn.any, fish: c.polishOn.fish },
-                                                                             unsplit: { split: c.polishOnUnsplit.split, variant: c.polishOnUnsplit.variant } }, d3);
-      check("offimage " + st.name + ":   the polish on with the lit fish apart (split) == the whole kind on the full programs, within 1 / 255 on under 0.1 % of the pixels",
-            (c.polishOn.split === true || c.polishOn.variant === "plain" || !(c.appearance && c.appearance.shapes)) && c.polishOnUnsplit.split === false &&
-            d3.maxDiff <= 1 && d3.differing <= d3.pixels * 1e-3,
+    if (st.cam === "close" && c.onSplit) {
+      /* the lit fish apart (the opt-in split) vs the default, the whole kind on the full programs: an unlit fish looks the same on either */
+      const d3 = diff(c.on, c.onSplit);
+      report.parts.offimage.states[st.name].splitVsUnsplit = Object.assign({ split: { split: c.polishOnSplit.split, litDrawn: c.polishOnSplit.litDrawn, lit: c.polishOnSplit.any, fish: c.polishOnSplit.fish },
+                                                                             unsplit: { split: c.polishOn.split, variant: c.polishOn.variant } }, d3);
+      check("offimage " + st.name + ":   the polish on with the lit fish apart (setLitSplit(true)) == the default (the whole kind on the full programs), every RGBA8 pixel",
+            (c.polishOnSplit.split === true || c.polishOnSplit.variant === "plain" || !(c.appearance && c.appearance.shapes)) && c.polishOn.split === false && d3.differing === 0,
             report.parts.offimage.states[st.name].splitVsUnsplit);
     }
   }
@@ -1300,11 +1300,11 @@ async function partPerfArms() {
         for (const arm of group) {
           const r = await L.page.evaluate(async ([arm, m, ms]) => {
             const S = EvoOcean.scene;
-            if (arm !== "main") {   /* fullUp: the polish on, the whole gene texture uploaded every frame (PR2's slots, main's upload); nosplit: the polish
-                                       on, the whole kind on the full programs while any fish is lit (no lit fish drawn apart) */
-              S.setPolish(arm === "on" || arm === "fullUp" || arm === "nosplit" ? true : arm === "off" ? false : arm);
+            if (arm !== "main") {   /* fullUp: the polish on, the whole gene texture uploaded every frame (PR2's slots, main's upload); split: the polish
+                                       on, the lit fish drawn apart (setLitSplit(true): opt-in) */
+              S.setPolish(arm === "on" || arm === "fullUp" || arm === "split" ? true : arm === "off" ? false : arm);
               if (S.setGeneUploads) S.setGeneUploads(arm === "fullUp" ? "full" : "dirty");
-              if (S.setLitSplit) S.setLitSplit(arm !== "nosplit");
+              if (S.setLitSplit) S.setLitSplit(arm === "split");
               await EvoOcean.bench.wait(2500);   /* a switch compiles once: settle */
             }
             const rp = EvoOcean.bench.rafProbe(ms), cap = EvoOcean.bench.capture(Object.assign({ durationMs: ms }, m));

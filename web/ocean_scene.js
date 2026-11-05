@@ -65,9 +65,10 @@
  *     fish program has a plain variant, the fish exactly as before (its
  *     GLSL byte for byte, its cost), drawn at detail 1 and whenever no fish
  *     of its kind is lit (a whole-tank view: main's programs and cost; the
- *     roll scales with the size weight too, so nothing pops); with a few
- *     appearance fish lit (a close view), only those are drawn on the full
- *     programs, apart, the rest plain (AppKind's split). Display only,
+ *     roll scales with the size weight too, so nothing pops); optionally
+ *     (setLitSplit(true); off: it measured slower), only the lit appearance
+ *     fish drawn on the full programs, apart, the rest plain (AppKind's
+ *     split). Display only,
  *     like everything here
  *
  * Big tanks: the sand, caustics and surface are world-unit procedural
@@ -2206,7 +2207,8 @@
      * only while one of its fish is lit (weight > 0) and for HOLD frames after
      * the last one (hysteresis: a fish at the 6 px threshold does not switch
      * the whole draw's cost every frame), and only once they are compiled
-     * (warm); plain otherwise. The appearance fish (render PR2, their genes in
+     * (warm); plain otherwise. With setLitSplit(true) (off by default: see
+     * litSplit) the appearance fish (render PR2, their genes in
      * their own slots) then draw only the lit ones on the full programs, in a
      * draw of their own, the rest on the plain ones (AppKind's split; unless
      * more than half are lit), and none on the full ones while none is lit
@@ -2369,8 +2371,19 @@
      * texture every frame, as before PR2, through the same slots: measurements
      * and the dirty-vs-full reference only; setGeneUploads) */
     var genePolicy = "dirty";
-    /* the lit fish drawn apart (AppKind's split): on; setLitSplit(false) for measurements */
-    var litSplit = true;
+    /* the lit fish drawn apart (AppKind's split): OFF by default, setLitSplit(true)
+     * to draw it. Measured on Iris Xe (render PR2's perf, headless Brave / ANGLE
+     * D3D11, 1400 x 900) it never paid: +0.4 ms GPU at 300 fish following one
+     * (67 lit), +1.8 ms at 2,000 (375 lit), +0.8 / +1.2 ms with 274 / 491 lit
+     * in nearer whole-tank views. The skipped instances still run the plain
+     * vertex stage (the compiler flattens the early return, as it does the size
+     * weight's guards), so each lit fish pays two vertex passes, while drawing
+     * the many small unlit fish plain saves little; and this tank's fish cross
+     * the 6 px threshold together (0 lit, then hundreds), so the "a few lit
+     * fish" case it was for barely occurs. A compacted draw (a base instance,
+     * or the lit fish moved out of the main draw) would be its next form. The
+     * look is the same either way (0 differing pixels) */
+    var litSplit = false;
     function AppKind() {
       if (!SLOTS) throw new Error("web/ocean_appearance_slots.js not loaded");
       var gl0 = renderer.getContext(), maxTex = gl0.getParameter(gl0.MAX_TEXTURE_SIZE);
@@ -2509,13 +2522,16 @@
           lit.mesh.geometry = g;
           if (lit.bmesh && bg) lit.bmesh.geometry = bg;
         } else {
+          /* drawn before the main fish draw (renderOrder 1.5 < 2): the lit fish are the large close ones, so
+           * the depth test then rejects the fragments of the fish behind them before they are shaded (as the
+           * single draw does when the close fish come first) */
           lit.mesh = new THREE.Mesh(g, mats[1]);
-          lit.mesh.frustumCulled = false; lit.mesh.renderOrder = 2; lit.mesh.visible = false;
+          lit.mesh.frustumCulled = false; lit.mesh.renderOrder = 1.5; lit.mesh.visible = false;
           scene.add(lit.mesh);
           profiler.watch(lit.mesh, "fishBody");
           if (bg) {
             lit.bmesh = new THREE.Mesh(bg, mats[1]);
-            lit.bmesh.frustumCulled = false; lit.bmesh.renderOrder = 2; lit.bmesh.visible = false;
+            lit.bmesh.frustumCulled = false; lit.bmesh.renderOrder = 1.5; lit.bmesh.visible = false;
             scene.add(lit.bmesh);
             profiler.watch(lit.bmesh, "barbels");
           }
@@ -4180,10 +4196,10 @@
        * whole texture every frame, through the same slots: measurements and
        * the dirty-vs-full reference only) */
       setGeneUploads: function (p) { genePolicy = p === "full" ? "full" : "dirty"; },
-      /* the lit appearance fish drawn apart on the full programs, the rest
-       * plain (on: the default); off, the whole kind on the full programs
-       * while any is lit, as before (measurements) */
-      setLitSplit: function (on) { litSplit = on !== false; },
+      /* true: the lit appearance fish drawn apart on the full programs, the
+       * rest plain (AppKind's split); false (the default: see litSplit), the
+       * whole kind on the full programs while any is lit, as before */
+      setLitSplit: function (on) { litSplit = on === true; },
       testFaults: testFaults,
       /* the drawing context: renderer strings, extensions, attributes, drawing buffer */
       contextInfo: contextInfo,
