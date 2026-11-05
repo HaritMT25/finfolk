@@ -72,7 +72,8 @@
 #      construction or source fit is a counted power failure, never power at the target.
 #  Throughput (docs/throughput.md):
 #  5b. identity.py: the same binary twice is IDENTICAL and matches the root's record; a binary that changes
-#      one byte of end.json is caught on that file; a held root and --out inside the root are refused.
+#      one byte of end.json is caught on that file; a held root, --out inside the root and a binary that is
+#      not its --expect'ed bytes are refused; the report carries the host fingerprint.
 set -u
 BIN=${1:?usage: invasion_tooling.sh EVO_BOIDS WORKDIR}
 W=${2:?usage: invasion_tooling.sh EVO_BOIDS WORKDIR}
@@ -173,8 +174,15 @@ open("end.json", "w").write(s[:i] + d + s[i + 1:])
 PY
 EOF
 chmod +x tamper.sh
-$PY "$T/identity.py" --root root --out id_same --binary a="$BIN" --binary b="$BIN" --sample 2 --workers 2 > id1.log 2>&1 \
-    || fail "identity.py, the same binary twice: $(tail -3 id1.log)"
+BIN_SHA=$(sha256sum "$BIN" | cut -d' ' -f1)
+$PY "$T/identity.py" --root root --out id_same --binary a="$BIN" --binary b="$BIN" --expect a="$BIN_SHA" \
+    --sample 2 --workers 2 > id1.log 2>&1 || fail "identity.py, the same binary twice: $(tail -3 id1.log)"
+# --expect: a binary that is not the expected bytes is refused before anything is written
+$PY "$T/identity.py" --root root --out id_wrong --binary a="$BIN" --binary t="$W/tamper.sh" --expect t="$BIN_SHA" \
+    --sample 1 > id5.log 2>&1
+rc=$?
+[ "$rc" = 2 ] || fail "identity.py --expect with the wrong bytes exited $rc, expected 2"
+[ -e id_wrong ] && fail "identity.py wrote its --out before refusing an unexpected binary"
 $PY "$T/identity.py" --root root --out id_tamper --binary a="$BIN" --binary t="$W/tamper.sh" --sample 2 > id2.log 2>&1 \
     && fail "identity.py passed a binary that changes end.json"
 $PY - <<'PY' || fail "identity.py verdicts"
@@ -183,6 +191,8 @@ r = json.load(open("id_same/identity.json"))
 assert r["verdict"] == "IDENTICAL" and r["identical"] == 2 and r["cells"] == 2, r["verdict"]
 assert r["record_hashes_checked"] >= 2 * 5 and not r["record_mismatch"], r["record_hashes_checked"]
 assert all("score.json" in c["record_checked"] for c in r["per_cell"].values())
+assert r["binaries"]["a"]["expected_sha256"] == r["binaries"]["a"]["sha256"] and r["binaries"]["b"]["expected_sha256"] is None
+assert r["host"]["cpu_model"] and r["host"]["glibc"] and r["host"]["python"], r["host"]
 t = json.load(open("id_tamper/identity.json"))
 assert t["verdict"] == "NOT IDENTICAL" and len(t["different"]) == 2, t["verdict"]
 assert all(c["different_files"] == ["end.json"] for c in t["per_cell"].values()), t["per_cell"]

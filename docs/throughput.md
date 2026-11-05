@@ -80,19 +80,24 @@ same time on their own cores. The 4-worker runs ran in the order A B B A while n
 |---|---:|---:|---:|
 | pinned binary | 493, 440 (mean 467) | 1321, 1174 (mean 1248) | 1057, 1025 (mean 1041) |
 | x86-64-v3 + LTO | 545, 486 (mean 516) | 1376, 1395 (mean 1386) | 1314, 1292 (mean 1303) |
-| gain | **+10.6%** | **+11%** | **+25%** |
+| gain | **+10.6%** | **+11%** | +25% |
+
+**The figure to quote is +11–12%.** That is the 1-worker paired measurement, session 1, and the
+engine's own 1.122× (§2, tight IQR) diluted by the 5–8% of a cell that is not the engine. Session 2's
++25% is within this laptop's session-to-session noise: its two pinned runs were slower than session
+1's. Treat it as an upper reading, not the expected gain.
 
 The other changes, as cells/hour, follow from the engine ratios above and the measured split of a cell
 (engine 95% at 1 worker, 94% at 4):
 
 - x86-64-v3 alone: +9.7%;
 - LTO alone: ±0;
-- v3 + LTO: +11.5% expected, against +10.6% to +25% measured;
+- v3 + LTO: +11.5%;
 - the runner fix: about +1.5–2% more.
 
 **For a bank.** bank1 ran its 28,800 cells at 1,136 cells/h on 4 workers (its own session rate), so about
-25.4 h. With the new binary and the runner fix, the conservative estimate (engine 1.12×, runner +1.5%)
-is about 1,290 cells/h: **about 22 h for the same bank**. At session 2's +25% it would be about 20 h.
+25.4 h. With the new binary and the runner fix (engine 1.12×, runner +1.5%), expect about 1,290 cells/h:
+**about 22 h for the same bank**.
 Bigger wins would have to come from the engine's own step (the local perf ledger,
 `docs/evo_boids_perf.md`) or from the statistical design (fewer cells), not from the Python around it.
 
@@ -131,16 +136,31 @@ Neither native driver contains an FMA instruction (`objdump`; 1,637 and 3,848 ym
 flags took effect). `tests/invasion_tooling.sh` passes with the pinned binary (92 s), including its new
 section 5b.
 
-**Why this is exact, and how far the proof reaches.** Under `-ffp-contract=off` without `-ffast-math`, the
-compiler may not reassociate, contract or approximate a float operation. The transformations x86-64-v3 and
-LTO add are wider vectors, VEX encodings, inlining and code layout, and none of them changes an IEEE-754
-result. FMA, the one instruction that would, is compiled out. The src tree has no ISA-specific intrinsics or
-`#ifdef __AVX__` paths, and libm calls go to the same shared glibc in both binaries. That glibc picks its
-own code paths by host CPU, for the pinned binary as much as for the new one, so a replay on another host
-is a question for any binary, not one this change adds. The 240 cells are the
-empirical check on that argument: about 4 billion fish-steps per binary, in a chaotic system where one
-flipped bit diverges a run within a few hundred steps. Each new compiler, commit or flag set needs its own
-identity run. That is the registration rule below.
+**Why this is exact, and how far the proof reaches.**
+
+- *Compiler.* `-ffp-contract=off` is set on every translation unit and at the LTO link, with no
+  `-ffast-math`. So the compiler may not reassociate, contract or approximate a float operation.
+- *Instructions.* x86-64-v3 and LTO add wider vectors, VEX encodings, inlining and code layout. None of
+  these changes an IEEE-754 result. FMA, the one instruction that would, is compiled out. `build_engine.sh`
+  also refuses any binary that contains FMA or approximate-reciprocal (`rcp`/`rsqrt`) instructions.
+- *Source.* `src/` has no ISA-specific intrinsics and no `#ifdef __AVX__` paths.
+- *Math library.* **The engine calls no CPU-dispatched libm.** Its transcendentals (tanhf, sinf, cosf,
+  atanf, atan2f, expm1f, expf, logf, double tanh) are vendored musl code, `evomath::` in
+  `src/core/portable_math.hpp` (lines 8–43). They were adopted because glibc's run-time (ifunc) dispatch
+  was measured to differ by CPU. The libm calls that remain (sqrt, floor, ceil, trunc, lround, fmod,
+  ldexp, scalbn) are exact by the IEEE standard on any host.
+- *The one dispatched call.* The only CPU-dispatched math anywhere in a cell's pipeline is Python's
+  `math.cos`/`math.sin` in `tools/invasion/arena.py:223`. It sets the headings of injected predators, using
+  glibc's double cos/sin, whose code path can depend on the host CPU. It predates this PR and does not
+  depend on the engine binary. It is documented, not changed: changing it would change the arenas of
+  every existing predator cell. On a new host it is covered by the host check in §4, because identity.py
+  compares each replayed arena.json with the study's record.
+
+The 240 cells are the empirical check on this argument: about 4 billion fish-steps per binary, in a
+chaotic system where one flipped bit diverges a run within a few hundred steps. That evidence is for this
+host. On other x86-64 CPUs, exactness rests on the by-construction argument above, and §4 adds a short
+check per host. Each new compiler, commit, flag set or host needs its own identity run. That is the
+registration rule below.
 
 ## 4. Registering a new engine binary
 
@@ -160,27 +180,62 @@ before the study's first cell:
 
 1. **Build it reproducibly.**
    `tools/invasion/build_engine.sh ~/wasm_parity/invasion/bin/evo_boids_<commit>_v3lto --rev <commit> --arch x86-64-v3 --lto --epoch <E>`.
-   This builds from `git archive <commit>`, so no uncommitted edit can reach it. It refuses to overwrite
-   an existing file and refuses a binary with an FMA instruction. It writes `<binary>.build.json`, which
-   holds the commit, flags, compiler, `SOURCE_DATE_EPOCH` and sha256. The same inputs give the same bytes:
-   this script with `--rev 62b18b1` and the pin's epoch rebuilds the bank's binary bit for bit.
-2. **Prove it identical on real cells.** Run
-   `tools/invasion/identity.py --root <a closed study> --out <new dir> --binary pinned=<the reference binary> --binary new=<candidate> --sample 240 --workers 4`.
-   It must print `IDENTICAL`. Then the parity gates must pass with the candidate's flags:
-   `NATIVE_CXXFLAGS="<flags>" bash wasm/parity.sh` and
-   `NATIVE_CXXFLAGS="<flags>" FAST=1 bash wasm/ocean_parity.sh`.
-   Prove it on cells that are already open (pilot1). identity.py refuses a root while its runner holds
-   it. A replay of a blind bank's cells would write their scores to disk, so do not run it on bank1
-   while bank1 must stay blind.
-3. **Record it in the preregistration.** Record the binary's sha256, its `build.json`, the sha256 and
-   verdict of `identity.json` (with N cells, and the reference binary's sha256 it was proven against),
-   and the two parity logs. The claim this supports is: "the confirmatory cells were run by a binary
-   whose outputs were byte-identical to the bank's binary on N real cells, and whose flags keep
-   native == wasm".
+   What it guarantees:
+   - It builds from `git archive <commit>`, so no uncommitted edit can reach it.
+   - It unsets the caller's compiler environment (`CXXFLAGS`, `CXX`, ...) and passes the compiler
+     explicitly.
+   - It refuses `--arch native`. It refuses an option the commit's CMakeLists.txt does not actually apply,
+     so a pre-throughput commit with `--arch` fails instead of quietly building the baseline.
+   - It refuses a binary with FMA or rcp/rsqrt instructions, or one objdump cannot read, and refuses to
+     overwrite an existing file.
+   - It writes `<binary>.build.json`: the commit, the options, the compile and link lines CMake generated,
+     the toolchain (compiler path and version, cmake, binutils, glibc, libstdc++, SFML),
+     `SOURCE_DATE_EPOCH` and the sha256.
+   - The same inputs give the same bytes: `--rev 62b18b1` at the pin's epoch rebuilds the bank's binary
+     bit for bit.
+2. **Prove it identical on real cells.** Run:
+
+   ```
+   tools/invasion/identity.py --root <a closed study> --out <new dir> \
+       --binary pinned=<the reference binary> --binary new=<candidate> --binary default=<default build of the same commit> \
+       --expect pinned=<sha256 in bank1/root/bin/evo_boids.sha256> --expect new=<sha256 of the candidate> \
+       --sample 240 --workers 4
+   ```
+
+   - It must print `IDENTICAL` for all three binaries.
+   - The default build (`build_engine.sh` without options, at the same commit) is the fallback for
+     hosts that cannot run AVX2 (step 5), so it is proven in the same run.
+   - Then both parity gates must pass with the candidate's flags:
+     `NATIVE_CXXFLAGS="<flags>" bash wasm/parity.sh` and
+     `NATIVE_CXXFLAGS="<flags>" FAST=1 bash wasm/ocean_parity.sh`.
+   - Prove it on cells that are already open (pilot1). identity.py refuses a root while its runner
+     holds it. A replay of a blind bank's cells would write their scores to disk, so do not run it on
+     bank1 while bank1 must stay blind.
+3. **Record it in the preregistration.** Two conditions must hold, and `--expect` enforces both:
+   - the reference must be the bank's own pin: its sha256 equals `bank1/root/bin/evo_boids.sha256`;
+   - the registered candidate must be the very bytes identity.py tested. A rebuild with another
+     `--epoch` is a different binary, so register the tested file or re-prove the rebuild.
+
+   Record:
+   - the candidate's sha256 and `build.json`;
+   - the sha256 and verdict of `identity.json`, with N cells, the reference sha256, the expectations and
+     the host fingerprint;
+   - the two parity logs.
+
+   The claim this supports: "the confirmatory cells were run by a binary whose outputs were byte-identical
+   to the bank's binary on N real cells, and whose flags keep native == wasm".
 4. **Run it.** Start the confirmatory root with `--binary <candidate>`; run.py pins it for the life of the
-   root. Never swap a root's binary mid-study. A different binary needs a new root and a new
-   registration.
-5. **Portability.** The AVX2 binary dies with SIGILL on hosts older than Haswell. A replay elsewhere copies
-   the root, `bin/` included. On a host that cannot run it, use the default build of the same commit
-   (`build_engine.sh` without options, reproducible byte for byte). Step 2 shows its outputs equal the
-   fast binary's on the tested cells.
+   root. Never swap a root's binary mid-study. A different binary needs a new root and a new registration.
+5. **Hosts.** The proof in step 2 is empirical for the host it ran on (identity.json records the CPU
+   model and flags, kernel, glibc and Python).
+   - **Before any confirmatory cell runs on a different host**, run
+     `identity.py ... --sample 24 --expect ...` there with the same binaries; it must print `IDENTICAL`.
+     This also checks arena.py's one host-dependent call (§3).
+   - The AVX2 binary dies with SIGILL on hosts older than Haswell. A replay elsewhere copies the root,
+     `bin/` included. On a host that cannot run it, use the default build proven in step 2.
+6. **Recommended: a preregistered post-hoc audit.** After the confirmatory run, replay about 240 of its
+   cells with the bank's pin:
+   `identity.py --root <confirmatory root> --binary new=<its pinned binary> --binary pinned=<the bank's pin> --sample 240`.
+   It checks the reference against the confirmatory root's own record and the pin against both. This
+   needs no compute before the run. It turns "identical on the pilot" into "identical on the
+   confirmatory cells themselves", for about 1% of the matrix's cost.

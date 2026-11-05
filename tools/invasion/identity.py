@@ -2,8 +2,10 @@
 """identity.py: are two engine binaries byte-identical on a study's real cells?
 
     identity.py --root STUDY_ROOT --out NEW_DIR --binary ref=PINNED --binary new=CANDIDATE
+                [--binary default=DEFAULT_BUILD ...] [--expect NAME=SHA256 ...]
                 [--sample N [--seed S] | --ids FILE] [--workers 1..4] [--keep]
     identity.py --report NEW_DIR
+    identity.py --resume NEW_DIR [--workers 1..4]
 
 The gate a new engine binary passes before a study may use it (docs/throughput.md,
 "Registering a new engine binary"). Every selected finished cell of STUDY_ROOT is
@@ -35,6 +37,13 @@ unset only the small files of each run are kept (digest.json, score.json, logs).
 --sample N picks N finished cells, round-robin over the (condition, mode,
 predators) strata, shuffled within each stratum by --seed: every kind of cell is
 covered before any kind repeats.
+
+--expect NAME=SHA256 refuses to start (exit 2) unless binary NAME has exactly that
+hash: the reference must be the study's own pin (its bin/evo_boids.sha256) and the
+candidate the very bytes that will be registered (a rebuild with another
+SOURCE_DATE_EPOCH is another binary). identity.json records the expectations and
+the host (CPU model and flags, kernel, glibc, Python): the proof is empirical for
+that host, so a new host runs its own check first (docs/throughput.md, section 4).
 """
 from __future__ import annotations
 
@@ -156,6 +165,31 @@ KEEP = False
 
 
 # ------------------------------------------------------------------ the driver
+def host_fingerprint():
+    """What the empirical proof is tied to: CPU model and flags, kernel, glibc, Python."""
+    import platform
+    model, flags = None, []
+    try:
+        for ln in open("/proc/cpuinfo"):
+            k, _, v = ln.partition(":")
+            if k.strip() == "model name" and model is None:
+                model = v.strip()
+            elif k.strip() == "flags" and not flags:
+                flags = v.split()
+    except OSError:
+        pass
+    try:
+        glibc = os.confstr("CS_GNU_LIBC_VERSION")
+    except (ValueError, OSError):
+        glibc = " ".join(platform.libc_ver())
+    return {"cpu_model": model, "cpu_count": os.cpu_count(),
+            "cpu_flags_sha256": hashlib.sha256(" ".join(sorted(flags)).encode()).hexdigest() if flags else None,
+            "cpu_flags_relevant": sorted(f for f in flags if f in ("sse4_1", "sse4_2", "avx", "avx2", "fma", "f16c",
+                                                                   "bmi1", "bmi2", "avx512f", "avx512vl")),
+            "kernel": platform.release(), "machine": platform.machine(), "glibc": glibc,
+            "python": platform.python_version()}
+
+
 def root_busy(root):
     """A runner holds the root (its flock), or its progress.json says running."""
     try:
@@ -252,6 +286,7 @@ def compare(out):
     ok = not bad and not missing and not rec_bad and bool(cells)
     rep = {"schema": SCHEMA, "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
            "source": src, "binaries": meta, "reference": ref,
+           "host": host_fingerprint(), "host_at_start": src.get("host"),
            "tools_sha256": {f: invlib.sha256_file(os.path.join(HERE, f)) for f in
                             ("invlib.py", "arena.py", "score.py", "run.py", "identity.py")},
            "cells": len(cells), "composition": comp, "files_compared_per_binary": n_files,
@@ -263,9 +298,13 @@ def compare(out):
     print(f"{rep['verdict']}: {rep['identical']}/{len(cells)} cells identical across {', '.join(names)} "
           f"({n_files} files per binary); reference vs the study's record: {rec_n} hashes, "
           f"{len(rec_bad)} cells mismatched; {len(missing)} missing or failed")
+    h = rep["host"]
+    print(f"  host: {h['cpu_model']}; {' '.join(h['cpu_flags_relevant'])}; kernel {h['kernel']}; {h['glibc']}; "
+          f"Python {h['python']}")
     for k in names:
         s = speed[k]
-        print(f"  {k}: {meta[k]['sha256'][:16]}  median engine {s['median_engine_wall_s']} s wall, "
+        print(f"  {k}: {meta[k]['sha256'][:16]}{' (as expected)' if meta[k].get('expected_sha256') else ''}"
+              f"  median engine {s['median_engine_wall_s']} s wall, "
               f"{s['median_engine_user_s']} s user; total user {s['total_engine_user_s']} s")
     for cid in (bad + rec_bad)[:10]:
         print(f"  {cid}: {res[cid]}")
@@ -278,6 +317,7 @@ def main(argv=None):
     ap.add_argument("--root")
     ap.add_argument("--out", required=False)
     ap.add_argument("--binary", action="append", default=[], help="NAME=PATH (the first is the reference)")
+    ap.add_argument("--expect", action="append", default=[], help="NAME=SHA256: refuse unless binary NAME has it")
     ap.add_argument("--sample", type=int)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--ids")
@@ -304,17 +344,34 @@ def main(argv=None):
         return 2
     if os.path.exists(out) and os.listdir(out):
         ap.error(f"--out {out} must be new or empty")
+    bins = {}
+    for b in a.binary:
+        name, sep, path = b.partition("=")
+        if not sep or not re.fullmatch(r"[A-Za-z0-9_.-]+", name) or name in bins:
+            ap.error(f"--binary {b!r}: expected a unique NAME=PATH")
+        if not os.path.isfile(path):
+            ap.error(f"--binary {b!r}: no such file")
+        bins[name] = path
+    expect = {}
+    for e in a.expect:
+        name, sep, sha = e.partition("=")
+        if not sep or name not in bins or not re.fullmatch(r"[0-9a-f]{64}", sha):
+            ap.error(f"--expect {e!r}: expected NAME=SHA256 for a --binary NAME")
+        expect[name] = sha
+    for name, sha in expect.items():   # before anything is written: the right bytes or nothing
+        have = invlib.sha256_file(bins[name])
+        if have != sha:
+            print(f"refused: --binary {name} ({bins[name]}) is {have}, not the expected {sha}", file=sys.stderr)
+            return 2
     os.nice(19 - os.nice(0))
     os.makedirs(os.path.join(out, "bin"), exist_ok=True)
     meta = {}
-    for i, b in enumerate(a.binary):
-        name, sep, path = b.partition("=")
-        if not sep or not re.fullmatch(r"[A-Za-z0-9_.-]+", name) or name in meta:
-            ap.error(f"--binary {b!r}: expected a unique NAME=PATH")
+    for i, (name, path) in enumerate(bins.items()):
         dst = os.path.join(out, "bin", name)
         shutil.copy2(path, dst)
-        meta[name] = {"path": os.path.abspath(path), "sha256": invlib.sha256_file(dst), "order": i}
-        if invlib.sha256_file(path) != meta[name]["sha256"]:
+        meta[name] = {"path": os.path.abspath(path), "sha256": invlib.sha256_file(dst), "order": i,
+                      "expected_sha256": expect.get(name)}
+        if invlib.sha256_file(path) != meta[name]["sha256"] or meta[name]["sha256"] != expect.get(name, meta[name]["sha256"]):
             print(f"{path} changed while it was copied", file=sys.stderr)
             return 2
     invlib.write_json_atomic(os.path.join(out, "binaries.json"), meta)
@@ -331,7 +388,7 @@ def main(argv=None):
         f.write("".join(c + "\n" for c in cells))
     invlib.write_json_atomic(os.path.join(out, "source.json"),
                              {"root": root, "selection": f"--ids {a.ids}" if a.ids else f"--sample {a.sample} --seed {a.seed}",
-                              "finished_cells": len(ids)})
+                              "finished_cells": len(ids), "host": host_fingerprint()})
     names = sorted(meta, key=lambda k: meta[k]["order"])
     jobs = []
     for cid in cells:
