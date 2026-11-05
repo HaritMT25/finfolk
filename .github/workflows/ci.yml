@@ -92,6 +92,8 @@ jobs:
           fi
       - name: The page's Turbo hand-off (node, two real modules)
         run: node tests/ocean_turbo_handoff.js
+      - name: The appearance fish's gene slots (node)
+        run: node tests/ocean_appearance_slots_tests.cjs
       - name: Ocean parity (FAST subset), guards and unit checks
         run: FAST=1 JOBS=$(nproc) bash wasm/ocean_parity.sh
       # The appearance-off twin of the live-knob case, as the weekly
