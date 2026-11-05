@@ -31,13 +31,15 @@ jobs:
 
   # The web front end's type check: tsc --checkJs over tsconfig.json's files (those that
   # carry // @ts-check) with web/types.d.ts. Checking only, nothing is built: the runner
-  # image's own node / npx, TypeScript pinned (the same command runs locally).
+  # image's own node / npm, TypeScript from package.json's pin and package-lock.json's exact
+  # tree (npm ci; the same commands run locally).
   web-types:
     name: web types (tsc --checkJs)
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
-      - run: npx -y -p typescript@5.6.3 tsc -p tsconfig.json
+      - run: npm ci --no-audit --no-fund
+      - run: npx --no-install tsc -p tsconfig.json
 
   # tools/gate_receipts.*: fault suite on temp repos and fake tools (no Emscripten, no gate reuse in CI).
   receipts:

@@ -94,7 +94,8 @@ Memory is tight on the maintainer's PC: use `JOBS`/`BUILD_JOBS`, `nice -n 19`, a
 - `build_ocean.sh` / `build_wasm.sh` then `git diff --quiet -- web/` (exit 0 = unchanged; CI also uses `git diff --quiet -- web/evo_ocean.js web/evo_ocean.wasm`
   for the Ocean): the rebuilt committed modules match their sources. If `web/` shows changes, the modules were stale.
 - `node tests/ocean_turbo_handoff.js`: Turbo hand-off, exit 0 = pass.
-- `npx -y -p typescript@5.6.3 tsc -p tsconfig.json`: the web type check (exit 0 = pass): `tsc --checkJs` over the
+- `npm ci && npx tsc -p tsconfig.json`: the web type check (exit 0 = pass; `package.json` pins TypeScript,
+  `package-lock.json` the exact tree, development only): `tsc --checkJs` over the
   files `tsconfig.json` lists that carry `// @ts-check`, against `web/types.d.ts`. A new or extracted web module
   should be checked from the start: list it there and give it the comment.
 - `node tests/ocean_render_browser.mjs --base http://localhost:8123` (serve with `python3 wasm/serve.py web 8123`; it appends `/ocean.html`; headless Brave, Playwright; see its header):

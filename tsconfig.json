@@ -2,7 +2,8 @@
  * shapes and the window.Evo* globals). Checking only: nothing is emitted, the site still ships its
  * plain scripts as they are. A file is checked when it carries // @ts-check (checkJs stays off, so a
  * file listed without it only lends its types); add a file here and the comment there together.
- *   npx -y -p typescript@5.6.3 tsc -p tsconfig.json      (CI's "web types" job, the same pin)
+ *   npm ci && npx tsc -p tsconfig.json      (CI's "web types" job: package.json pins TypeScript,
+ *                                            package-lock.json the exact tree; development only)
  * Strict, except noImplicitAny (an unannotated parameter is any, not an error: the files grow JSDoc
  * where a seam needs it, not everywhere at once) and useUnknownInCatchVariables (a caught value is
  * any: these files catch the platform's Errors). */
