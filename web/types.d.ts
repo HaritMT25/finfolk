@@ -737,17 +737,69 @@ interface ParityCheckOptions {
   colourBy?: number; polish?: FishVariant; mutate?: string; fsMutate?: string;
   slotMap?: "identity" | "permuted" | "sparse"; injectSweep?: boolean;
 }
+/** What the probes use of the scene's three.js renderer (its WebGL2 context untyped here, as the checks'
+ * gl): their own render targets, three's state restored after, the shader-error hook. */
+interface ParityRenderer {
+  getContext(): any;
+  resetState(): void;
+  getRenderTarget(): unknown;
+  setRenderTarget(rt: unknown): void;
+  autoClear: boolean;
+  debug: { onShaderError: ((gl: any, prog: any, vs: any, fs: any) => void) | null };
+  state: { buffers: { color: { setMask(on: boolean): void } }; setScissorTest(on: boolean): void };
+  render(scene: unknown, camera: unknown): void;
+}
+/** What the probes read of the appearance fish's kind (the scene's AppKind) as the frame drew it: its
+ * draw's fish (n) and capacity (cap), the instance attributes' names (inst) and three attributes by name
+ * (attrs; iGeneSlot each draw's gene slot), the live gene texture (tex: three's DataTexture), its slots
+ * (capacity, stats), its programs (shaders: the probes' raw / chart stages), the fish material's uGenes
+ * uniform (bound by the probes, so three's uploader is what they test) and whether its mesh is shown. */
+interface ParityAppKind {
+  n: number;
+  cap: number;
+  inst: string[];
+  attrs: Record<string, any>;
+  tex: any;
+  slots: { capacity: number; stats(): unknown };
+  shaders: AppearancePrograms;
+  mat: { uniforms: { uGenes: unknown } };
+  mesh: { visible: boolean };
+}
+/** The scene's port for the probes (attach, once a scene): fixed parts and live getters, read at each
+ * probe, never copied (web/ocean_scene_parity.js attach says what each is). */
+interface ParityProbePort {
+  THREE: any;
+  renderer: ParityRenderer;
+  profiler: { suspend<T>(fn: () => T): T };
+  geneIO: { uploads: number };
+  bodyScale(size: number): number;
+  ea(): EvoAppearanceApi | null;
+  status(): string;
+  appKind(): ParityAppKind | null;
+  drawn(): boolean;
+}
+/** The probes on a live scene and their queue: runProbes(s) right after a production draw (s the snapshot
+ * drawn), failProbes(why) when there is none; testFaults.holdGeneUploads leaves the scene's gene upload out
+ * (a stale texture must then fail appearanceTextureParity). */
+interface ParityProbes {
+  testFaults: { holdGeneUploads: boolean };
+  probes: unknown[];
+  failProbes(why: string): void;
+  runProbes(s: OceanSnapshot): void;
+  appearanceParity(rows: ArrayLike<number>[], lams: number[], cellW?: number, cellH?: number): object;
+  appearanceTextureParity(expected?: BenchSnapshotCopy | null, o?: { mutate?: string; pendingUpload?: boolean; charts?: number; rawWords?: boolean }): Promise<any>;
+}
 /** The appearance fish's GPU == CPU checks (web/ocean_scene_parity.js says what each checks): on any
  * WebGL2 context, a Promise of the report (.error: it did not run; .ok: it passed). EA: EvoAppearance;
- * rows / lams: fish added to the fixed fixture. */
+ * rows / lams: fish added to the fixed fixture. And the probes on a live scene (attach). */
 interface EvoOceanSceneParityApi {
   /** the scene's layout and water (once, as web/ocean_scene.js loads; before it a check throws) */
   bind(scene: ParityScene): void;
-  /** resolves null once the GPU passed sync, else why not (lost, failed, ms) */
-  fenceDone(gl: WebGL2RenderingContext, sync: WebGLSync, ms: number): Promise<string | null>;
   appearancePathCheck(gl: WebGL2RenderingContext, EA: EvoAppearanceApi, rows?: ArrayLike<number>[] | null, lams?: number[] | null, opts?: ParityCheckOptions): Promise<any>;
   appearanceVertexCheck(gl: WebGL2RenderingContext, EA: EvoAppearanceApi, rows: ArrayLike<number>[], lams: number[], opts?: ParityCheckOptions): Promise<any>;
   appearanceFragmentCheck(gl: WebGL2RenderingContext, EA: EvoAppearanceApi, opts?: ParityCheckOptions): Promise<any>;
+  /** the probes on a live scene (web/ocean_scene.js create(), once a scene) */
+  attach(port: ParityProbePort): ParityProbes;
 }
 
 /* ---------------- not checked yet: declared by what checked files use ---------------- */

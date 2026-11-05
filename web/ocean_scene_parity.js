@@ -16,6 +16,14 @@
  * (appearanceFragmentCheck). Planted faults (plant: PATH_MUT, FRAG_MUT) must
  * fail them.
  *
+ * On a live scene (attach(port), once a scene: web/ocean_scene.js create()):
+ * appearanceParity, the pattern law alone on the scene's context, and
+ * appearanceTextureParity, the live gene texture as three uploaded it, read
+ * right after a production draw of the appearance fish (textureProbe; its
+ * queue, runProbes and failProbes, the scene's render() drives); testFaults
+ * (holdGeneUploads, which the scene's gene upload reads). The probe uploads
+ * nothing: one that did fails.
+ *
  * What they take: the appearance fish's programs, the gene slot and the
  * strings' helpers from web/ocean_shaders.js, the swim pose and the reach
  * from web/ocean_pose.js (both loaded first), under the names they had in
@@ -23,7 +31,8 @@
  * texture's layout as the renderer lays it out (GENES_W, genesRows,
  * packGenes; capFor, its capacities) and the water's constants the fragment
  * check sets (CLARITY's realistic column, C.select). Those are
- * production's, so they stay there.
+ * production's, so they stay there. On a live scene, its renderer and what
+ * it drew, through attach's port.
  *
  * Moved from web/ocean_scene.js unchanged (the structure pass's third
  * extraction: renderer_seams_plan_codex.md, "extract diagnostics as a pure
@@ -35,7 +44,7 @@
   var lines = SHADERS.lines, occurrences = SHADERS.occurrences;
   /** @type {(EA: EvoAppearanceApi, P?: any) => AppearancePrograms} (P: false, true or "lite", read off opts) */
   var appearanceShaders = SHADERS.appearanceShaders;
-  var GENE_SLOT_RET = SHADERS.GENE_SLOT_RET;
+  var GENE_SLOT_GLSL = SHADERS.GENE_SLOT_GLSL, GENE_SLOT_RET = SHADERS.GENE_SLOT_RET;
   var packPose = POSE.packPose, unpackPose = POSE.unpackPose, smoothCPU = POSE.smoothCPU;
   /** @type {(xs: ArrayLike<number>, ys: ArrayLike<number>, R: number, y: number, v: number, G: any) => number} (G: {gate: false}, ungated) */
   var swimPose = POSE.swimPose;
@@ -757,9 +766,363 @@
     return r;
   }
 
+  /* The probes on a live scene (attach(port): web/ocean_scene.js create(),
+   * once a scene). The port is the scene's renderer and live getters of what
+   * it drew, read at each probe (never copies: a probe checks what production
+   * uploaded):
+   *   THREE, renderer, profiler: the scene's, fixed for its life
+   *   geneIO: its gene texture's upload counts (live: a probe asserts it
+   *     caused none), bodyScale: opts.bodyScale (fillApp's lambda)
+   *   ea(), status(): EvoAppearance (null once the appearance renderer
+   *     failed) and the appearance status
+   *   appKind(), drawn(): the appearance fish's kind (its instance
+   *     attributes, gene texture and slots, material and programs) and
+   *     whether this frame drew it
+   * It returns the probes and their queue: the scene's render() calls
+   * runProbes(s) right after a production draw (and failProbes(why) when
+   * the context is lost), so a probe always runs after the draw it checks;
+   * testFaults is read by the scene's gene upload. */
+  /** @param {ParityProbePort} port @returns {ParityProbes} */
+  function attach(port) {
+    var THREE = port.THREE, renderer = port.renderer, profiler = port.profiler, geneIO = port.geneIO, bodyScale = port.bodyScale;
+    /* test-only: holdGeneUploads leaves the gene texture's upload out, so a
+     * stale texture can be shown to fail appearanceTextureParity */
+    var testFaults = { holdGeneUploads: false };
+
+    /* GPU == CPU (the gallery's K12): each row's canonical flank chart,
+     * rendered unlit and unfiltered (uIntrinsic = 1) into a float target and
+     * read back, against the CPU mirror EvoAppearance.flankAt at every pixel
+     * centre. Raw WebGL2 on three's context (the same GLSL as the fish, with
+     * its own prefix; three's state is reset after). Returns the error
+     * statistics (max over r, g, b per pixel). Display code only. */
+    function appearanceParity(rows, lams, cellW, cellH) {
+      var EA = port.ea(), appStatus = port.status();   /* (the port's live getters, as the scene's names) */
+      if (!EA) return { error: appStatus };
+      var gl = renderer.getContext();
+      if (!gl.getExtension("EXT_color_buffer_float")) return { error: "no float render targets (EXT_color_buffer_float)" };
+      var sh = appearanceShaders(EA);
+      var pre = "#version 300 es\nprecision highp float;\nprecision highp int;\n";
+      function compile(type, src) {
+        var o = gl.createShader(type); gl.shaderSource(o, src); gl.compileShader(o);
+        if (!gl.getShaderParameter(o, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(o));
+        return o;
+      }
+      var prog = gl.createProgram();
+      gl.attachShader(prog, compile(gl.VERTEX_SHADER, pre + "#define attribute in\n#define varying out\nin vec3 position;\n" + sh.chartVs));
+      gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, pre + "#define varying in\nout highp vec4 pcFrag;\n#define gl_FragColor pcFrag\n" + sh.chartFs));
+      gl.linkProgram(prog);
+      if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) return { error: gl.getProgramInfoLog(prog) };
+      var n = rows.length, cols = Math.min(8, n), nr = Math.ceil(n / cols);
+      var w = cellW || 96, h = cellH || 48, TW = cols * w, TH = nr * h;
+      var tex = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, tex);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, TW, TH, 0, gl.RGBA, gl.FLOAT, null);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+      var fb = gl.createFramebuffer();
+      gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+      var vao = gl.createVertexArray(); gl.bindVertexArray(vao);
+      var bufs = [];
+      function attr(name, data, size, divisor) {
+        var loc = gl.getAttribLocation(prog, name);
+        if (loc < 0) return;
+        var b = gl.createBuffer(); bufs.push(b);
+        gl.bindBuffer(gl.ARRAY_BUFFER, b); gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
+        gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, size, gl.FLOAT, false, 0, 0); gl.vertexAttribDivisor(loc, divisor);
+      }
+      attr("position", new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0, 1, 1, 0]), 3, 0);
+      var names = ["iG0", "iG1", "iG2", "iG3", "iG4", "iG5", "iG6", "iCol", "iX", "iCell"], arr = {};
+      names.forEach(function (nm) { arr[nm] = new Float32Array(n * 4); });
+      for (var k = 0; k < n; k++) {
+        var R = rows[k], o = 4 * k;
+        for (var q = 0; q < 7; q++) for (var c = 0; c < 4; c++) arr["iG" + q][o + c] = R[4 * q + c];
+        arr.iCol[o] = R[28]; arr.iCol[o + 1] = R[29]; arr.iCol[o + 2] = R[30]; arr.iCol[o + 3] = 0;
+        arr.iX[o] = 0; arr.iX[o + 1] = R[31]; arr.iX[o + 2] = R[32]; arr.iX[o + 3] = lams[k];
+        var cx = k % cols, cy = Math.floor(k / cols);
+        arr.iCell[o] = -1 + 2 * cx / cols; arr.iCell[o + 1] = -1 + 2 * cy / nr; arr.iCell[o + 2] = 2 / cols; arr.iCell[o + 3] = 2 / nr;
+      }
+      names.forEach(function (nm) { attr(nm, arr[nm], 4, 1); });
+      gl.useProgram(prog);
+      gl.uniform1f(gl.getUniformLocation(prog, "uIntrinsic"), 1);
+      gl.viewport(0, 0, TW, TH);
+      gl.disable(gl.DEPTH_TEST); gl.disable(gl.BLEND); gl.disable(gl.SCISSOR_TEST); gl.disable(gl.CULL_FACE);
+      gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
+      gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, n);
+      var px = new Float32Array(TW * TH * 4);
+      gl.readPixels(0, 0, TW, TH, gl.RGBA, gl.FLOAT, px);
+      gl.bindVertexArray(null); gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      gl.deleteVertexArray(vao); bufs.forEach(function (b) { gl.deleteBuffer(b); });
+      gl.deleteFramebuffer(fb); gl.deleteTexture(tex); gl.deleteProgram(prog);
+      renderer.resetState();
+      var errs = [], sum = 0, maxErr = 0, over = 0, out = [0, 0, 0], worst = "";
+      for (k = 0; k < n; k++) {
+        var D = EA.decode(rows[k], lams[k]), x0 = (k % cols) * w, y0 = Math.floor(k / cols) * h;
+        for (var j = 0; j < h; j++) for (var i = 0; i < w; i++) {
+          EA.flankAt(D, (i + 0.5) / w, (j + 0.5) / h, out);
+          var p = ((y0 + j) * TW + x0 + i) * 4;
+          var e = Math.max(Math.abs(px[p] - out[0]), Math.abs(px[p + 1] - out[1]), Math.abs(px[p + 2] - out[2]));
+          errs.push(e); sum += e; if (e > 0.002) over++;
+          if (e > maxErr) { maxErr = e; worst = "row " + k + " u " + ((i + 0.5) / w).toFixed(3) + " v " + ((j + 0.5) / h).toFixed(3); }
+        }
+      }
+      errs.sort(function (a, b) { return a - b; });
+      return { fish: n, samples: errs.length, maxErr: maxErr, meanErr: sum / errs.length, p99: errs[Math.floor(errs.length * 0.99)],
+               p999: errs[Math.floor(errs.length * 0.999)], over002: over / errs.length, worst: worst };
+    }
+
+    /* ---- the live gene texture, checked (appearanceTextureParity) ----
+     * Right after a production draw of the appearance fish, two diagnostic
+     * draws read appKind.tex itself, bound through the fish material's own
+     * uGenes uniform (so three's uploader is what is tested), with the
+     * production instance attributes (iX) and the same slot selector
+     * (GENE_SLOT_GLSL), into RGBA32F targets (nearest, no mipmaps, no MSAA,
+     * no depth) read back through pixel-pack buffers and a fence (polled,
+     * 10 s; three's state is restored before anything waits):
+     *   raw: every fish's 16 texels, bit for bit, against owned copies of
+     *     the snapshot's 63 genes and the zero after them (never re-packed)
+     *   intrinsic: pattern charts, 96 x 48 a fish, at most 64 a batch, the
+     *     whole instance sequence drawn with the uncharted fish off the
+     *     target, of the fish whose slots are on both sides of the texture's
+     *     32-slot rows and of slot 2048 (draws and slots reported),
+     *     against EvoAppearance.decode / flankAt of the original rows (p99.9
+     *     <= .002, nothing non-finite)
+     * The probe must upload nothing: one that did would have repaired a
+     * missed production upload, and that fails. expected: owned copies
+     * {worldEpoch, n, ids, app, body} (EvoOcean.bench.snapshotCopy), which
+     * must be the snapshot drawn; absent, that snapshot's own copies.
+     * o.mutate "slot": the probes read a wrong slot (each fish's own, xor 1);
+     * o.pendingUpload: a production upload left pending (the probe would
+     * perform it); both must fail. o.charts: how many fish to chart (24).
+     * o.rawWords: the raw words read, in draw order (res.rawWords: n x 64
+     * uint32), for the dirty-vs-full reference. A diagnostic: the frame is
+     * marked, never part of a timed capture. */
+    var probes = [];
+    var PROBE_SENTINEL = new Float32Array([-9, -9, -9, -9]);
+    var RAW_QUADS = (function () {   /* 16 pixel quads, one a gene texel */
+      var pos = new Float32Array(16 * 6 * 3), tx = new Float32Array(16 * 6), Q = [[0, 0], [1, 0], [0, 1], [0, 1], [1, 0], [1, 1]];
+      for (var k = 0; k < 16; k++) for (var v = 0; v < 6; v++) { var i = 6 * k + v; pos[3 * i] = Q[v][0]; pos[3 * i + 1] = Q[v][1]; tx[i] = k; }
+      return { pos: pos, texel: tx };
+    })();
+    function appearanceTextureParity(expected, o) {
+      return new Promise(function (resolve) {
+        var rq = { expected: expected || null, o: o || {}, resolve: resolve };
+        rq.timer = setTimeout(function () {
+          var i = probes.indexOf(rq);
+          if (i >= 0) { probes.splice(i, 1); resolve({ ok: false, error: "no production draw of the appearance fish within 10 s" }); }
+        }, 10000);
+        probes.push(rq);
+      });
+    }
+    function failProbes(why) {
+      var list = probes.splice(0);   /* (in place: the scene reads this array) */
+      list.forEach(function (rq) { clearTimeout(rq.timer); rq.resolve({ ok: false, error: why }); });
+    }
+    function runProbes(s) {
+      var appKind = port.appKind(), appDrawn = port.drawn(), appStatus = port.status();
+      if (!appDrawn || !appKind || !appKind.mesh.visible) { failProbes("the appearance fish were not drawn this frame (" + appStatus + ")"); return; }
+      var list = probes.splice(0);   /* (in place: the scene reads this array) */
+      list.forEach(function (rq) {
+        clearTimeout(rq.timer);
+        var p;
+        try { p = profiler.suspend(function () { return textureProbe(rq, s); }); }
+        catch (e) { p = Promise.resolve({ ok: false, error: "probe: " + (e && e.message || e) }); }
+        p.then(rq.resolve, function (e) { rq.resolve({ ok: false, error: "probe: " + (e && e.message || e) }); });
+      });
+    }
+    /* the draw indices charted: the owners of the slots on both sides of the
+     * texture's 32-slot rows and of slot 2048, of the highest slot, the last
+     * draw, then spread (slotOf: each draw's slot, iGeneSlot) */
+    function chartPicks(n, want, slotOf) {
+      var pick = [], seen = {}, owner = new Map(), top = -1;
+      for (var c = 0; c < n; c++) { owner.set(slotOf[c], c); if (slotOf[c] > top) top = slotOf[c]; }
+      function add(i) { if (i >= 0 && i < n && !seen[i]) { seen[i] = true; pick.push(i); } }
+      [0, 1, 31, 32, 33, 63, 64, 2047, 2048, 2049, top].forEach(function (sl) { if (owner.has(sl)) add(owner.get(sl)); });
+      add(n - 1);
+      for (var k = 1; pick.length < Math.min(want, n) && k < 64 * want; k++) add(Math.floor((k * 0.6180339887 % 1) * n));
+      return pick.sort(function (a, b) { return a - b; });
+    }
+    function floatTarget(w, h) {
+      return new THREE.WebGLRenderTarget(w, h, { type: 1015, format: 1023, minFilter: 1003, magFilter: 1003, generateMipmaps: false,
+                                                 depthBuffer: false, stencilBuffer: false, samples: 0 });
+    }
+    function textureProbe(rq, s) {
+      var appKind = /** @type {ParityAppKind} */ (port.appKind()), EA = /** @type {EvoAppearanceApi} */ (port.ea());   /* (runProbes: drawn) */
+      var o = rq.o, gl = renderer.getContext(), n = appKind.n, ST = EA.STRIDE, inst = appKind.inst;
+      /** @type {{failures: string[], [more: string]: any}} */
+      var res = { ok: false, worldEpoch: s.worldEpoch, tick: s.stats ? s.stats[1] : null, fish: n,
+                  mutate: o.mutate || "", pendingUpload: !!o.pendingUpload, failures: [] };
+      if (!THREE.WebGLRenderTarget) { res.error = "the three bundle has no WebGLRenderTarget (tools/three_bundle)"; return Promise.resolve(res); }
+      /* what was drawn: owned copies, before any probe work */
+      var drawnIds = Float64Array.from(s.ids.subarray(0, n));
+      var exp = rq.expected || { worldEpoch: s.worldEpoch, tick: res.tick, n: n, ids: drawnIds,
+                                 app: Float32Array.from(s.app.subarray(0, n * ST)), body: Float32Array.from(s.body.subarray(0, 2 * n)) };
+      var why = null;
+      if (exp.n !== n) why = "it has " + exp.n + " fish, " + n + " were drawn";
+      else if (exp.worldEpoch !== undefined && s.worldEpoch !== undefined && exp.worldEpoch !== s.worldEpoch) why = "world epoch " + exp.worldEpoch + ", drawn " + s.worldEpoch;
+      else for (var i = 0; i < n; i++) if (exp.ids[i] !== drawnIds[i]) { why = "draw " + i + " is fish " + exp.ids[i] + ", drawn " + drawnIds[i]; break; }
+      if (!why && (!exp.app || exp.app.length < n * ST || !exp.body || exp.body.length < 2 * n)) why = "it has no appearance rows or bodies";
+      if (why) { res.error = "the expected snapshot is not the one drawn: " + why; return Promise.resolve(res); }
+      var app = exp.app instanceof Float32Array ? exp.app : Float32Array.from(exp.app), body = exp.body;
+      var tex = appKind.tex, slotOf = appKind.attrs.iGeneSlot.array;
+      res.texture = { width: tex.image.width, height: tex.image.height, type: tex.type, format: tex.format,
+                      internalFormat: tex.internalFormat || "RGBA32F (three: RGBAFormat + FloatType)", capacity: appKind.slots.capacity,
+                      drawCapacity: appKind.cap, minFilter: tex.minFilter, magFilter: tex.magFilter, mipmaps: tex.generateMipmaps };
+      res.slots = appKind.slots.stats();
+      var sh = appKind.shaders, rawVs = sh.probeRawVs, chartVs = sh.probeChartVs;
+      if (o.mutate === "slot") {   /* the slot each fish really has, xor 1 (a permutation could equal gl_InstanceID ^ 1) */
+        var wrong = GENE_SLOT_GLSL.split(GENE_SLOT_RET).join("return int(iGeneSlot) ^ 1;");
+        rawVs = rawVs.split(GENE_SLOT_GLSL).join(wrong); chartVs = chartVs.split(GENE_SLOT_GLSL).join(wrong);
+      } else if (o.mutate) { res.error = "unknown mutation " + o.mutate; return Promise.resolve(res); }
+      var picks = chartPicks(n, o.charts || 24, slotOf), pickSlots = picks.map(function (c) { return slotOf[c]; }), CW = 96, CH = 48, PER = 64, COLS = 8;
+      var geos = [], mats = [], rts = [], reads = [], batches = [], err = null, shaderErr = null;
+      var keepRT = renderer.getRenderTarget(), keepClear = renderer.autoClear, keepOnErr = renderer.debug.onShaderError;
+      var cam = new THREE.PerspectiveCamera(), up0 = geneIO.uploads;
+      function geometry() {   /* shares the fish's instance attributes (and their GL buffers) */
+        var g = new THREE.InstancedBufferGeometry();
+        inst.forEach(function (nm) { g.setAttribute(nm, appKind.attrs[nm]); });
+        g.instanceCount = n;
+        geos.push(g);
+        return g;
+      }
+      function material(vs, fs, extra) {
+        var u = { uGenes: appKind.mat.uniforms.uGenes };   /* the fish material's own uniform: appKind.tex */
+        Object.keys(extra).forEach(function (k) { u[k] = extra[k]; });
+        var m = new THREE.ShaderMaterial({ vertexShader: vs, fragmentShader: fs, uniforms: u, depthTest: false, depthWrite: false, side: THREE.DoubleSide });
+        mats.push(m);
+        return m;
+      }
+      function draw(rt, g, m) {
+        var mesh = new THREE.Mesh(g, m), sc = new THREE.Scene();
+        mesh.frustumCulled = false; sc.add(mesh);
+        renderer.setRenderTarget(rt);
+        var st = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+        if (st !== gl.FRAMEBUFFER_COMPLETE) throw new Error("the probe's float target is incomplete (" + st + ")");
+        renderer.state.buffers.color.setMask(true);
+        renderer.state.setScissorTest(false);
+        gl.clearBufferfv(gl.COLOR, 0, PROBE_SENTINEL);
+        renderer.render(sc, cam);
+        renderer.setRenderTarget(rt);
+        var b = gl.createBuffer();   /* the target -> a pixel-pack buffer; nothing waits here */
+        gl.bindBuffer(gl.PIXEL_PACK_BUFFER, b);
+        gl.bufferData(gl.PIXEL_PACK_BUFFER, rt.width * rt.height * 16, gl.STREAM_READ);
+        gl.readPixels(0, 0, rt.width, rt.height, gl.RGBA, gl.FLOAT, 0);
+        gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+        reads.push(b);
+        return { buf: b, w: rt.width, h: rt.height };
+      }
+      var raw = null;
+      if (o.pendingUpload) tex.needsUpdate = true;   /* a production upload left undone */
+      try {
+        renderer.autoClear = false;
+        renderer.debug.onShaderError = function (g, prog, vs, fs) {
+          shaderErr = ((g.getShaderInfoLog(vs) || "") + " " + (g.getShaderInfoLog(fs) || "") + " " + (g.getProgramInfoLog(prog) || "")).trim() || "the probe's program did not link";
+        };
+        /* raw genes: 16 pixels a fish, 512 a row */
+        var rawH = Math.ceil(16 * n / GENES_W), rawRT = floatTarget(GENES_W, rawH), rg = geometry();
+        rts.push(rawRT);
+        rg.setAttribute("position", new THREE.BufferAttribute(RAW_QUADS.pos, 3));
+        rg.setAttribute("aTexel", new THREE.BufferAttribute(RAW_QUADS.texel, 1));
+        raw = draw(rawRT, rg, material(rawVs, sh.probeRawFs, { uProbeSize: { value: new THREE.Vector2(GENES_W, rawH) } }));
+        /* the charts, a batch of at most 64 at a time */
+        var cg = geometry(), cell = new THREE.InstancedBufferAttribute(new Float32Array(n * 4), 4);
+        cg.setAttribute("position", new THREE.BufferAttribute(new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0, 1, 1, 0]), 3));
+        cg.setIndex([0, 1, 2, 2, 1, 3]);
+        cg.setAttribute("iCell", cell);
+        var cm = material(chartVs, sh.chartFs, { uIntrinsic: { value: 1 } });
+        for (var b0 = 0; b0 < picks.length; b0 += PER) {
+          var part = picks.slice(b0, b0 + PER), rowsN = Math.ceil(part.length / COLS), A = cell.array;
+          for (var q = 0; q < n; q++) { A[4 * q] = 4; A[4 * q + 1] = 4; A[4 * q + 2] = 0; A[4 * q + 3] = 0; }   /* off the target */
+          part.forEach(function (c, k) {
+            var cx = k % COLS, cy = Math.floor(k / COLS);
+            A[4 * c] = -1 + 2 * cx / COLS; A[4 * c + 1] = -1 + 2 * cy / rowsN; A[4 * c + 2] = 2 / COLS; A[4 * c + 3] = 2 / rowsN;
+          });
+          cell.needsUpdate = true;
+          var rt = floatTarget(COLS * CW, rowsN * CH);
+          rts.push(rt);
+          batches.push({ fish: part, read: draw(rt, cg, cm) });
+        }
+      } catch (e) { err = e; }
+      finally {
+        renderer.setRenderTarget(keepRT);
+        renderer.autoClear = keepClear;
+        renderer.debug.onShaderError = keepOnErr;
+      }
+      res.extraUploads = geneIO.uploads - up0;
+      var sync = err || shaderErr ? null : gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
+      if (sync) gl.flush();
+      function cleanup() {
+        gl.bindBuffer(gl.COPY_READ_BUFFER, null);
+        reads.forEach(function (b) { gl.deleteBuffer(b); });
+        if (sync) gl.deleteSync(sync);
+        geos.forEach(function (g) { inst.forEach(function (nm) { g.deleteAttribute(nm); }); g.dispose(); });   /* the fish keep theirs */
+        mats.forEach(function (m) { m.dispose(); }); rts.forEach(function (t) { t.dispose(); });
+      }
+      if (err || shaderErr) { cleanup(); res.error = shaderErr ? "probe shader: " + shaderErr : "probe: " + (err.message || err); return Promise.resolve(res); }
+      return fenceDone(gl, sync, 10000).then(function (why) {
+        if (why) { cleanup(); res.error = why; return res; }
+        function fetch(rd) {
+          var px = new Float32Array(rd.w * rd.h * 4);
+          gl.bindBuffer(gl.COPY_READ_BUFFER, rd.buf);
+          gl.getBufferSubData(gl.COPY_READ_BUFFER, 0, px);
+          return px;
+        }
+        /* raw: the genes' bit patterns, then the zero */
+        var rp = fetch(raw), gotU = new Uint32Array(rp.buffer), appU = new Uint32Array(app.buffer, app.byteOffset, n * ST);
+        /** @type {{compared: number, mismatches: number, paddingMismatches: number, nonFinite: number, examples: object[]}} */
+        var R = { compared: n * 64, mismatches: 0, paddingMismatches: 0, nonFinite: 0, examples: [] };
+        for (var c = 0; c < n; c++) for (var j = 0; j < 64; j++) {
+          var gi = 64 * c + j;
+          if (!Number.isFinite(rp[gi])) R.nonFinite++;
+          if (j < 63) {
+            if (gotU[gi] !== appU[ST * c + j]) {
+              R.mismatches++;
+              if (R.examples.length < 6) R.examples.push({ draw: c, id: exp.ids[c], gene: j, want: app[ST * c + j], got: rp[gi] });
+            }
+          } else if (gotU[gi] !== 0) R.paddingMismatches++;
+        }
+        res.rawGenes = R;
+        if (o.rawWords) res.rawWords = gotU.slice(0, n * 64);   /* (tests: the words as read, in draw order; dirty vs full) */
+        /* the charts against the CPU mirror of the original rows */
+        var errs = [], nonFinite = 0, over = 0, maxErr = 0, worst = "", out = [0, 0, 0];
+        batches.forEach(function (bt) {
+          var px = fetch(bt.read), TW = bt.read.w;
+          bt.fish.forEach(function (c, k) {
+            var size = body[2 * c], elong = body[2 * c + 1];
+            var lam = Math.fround(20 * size * elong / Math.fround(4.6 * bodyScale(size)));   /* fillApp's iX.z */
+            var D = EA.decode(app.subarray(ST * c, ST * c + ST), lam), x0 = (k % COLS) * CW, y0 = Math.floor(k / COLS) * CH;
+            for (var jj = 0; jj < CH; jj++) for (var ii = 0; ii < CW; ii++) {
+              EA.flankAt(D, (ii + 0.5) / CW, (jj + 0.5) / CH, out);
+              var p = ((y0 + jj) * TW + x0 + ii) * 4;
+              if (!Number.isFinite(px[p]) || !Number.isFinite(px[p + 1]) || !Number.isFinite(px[p + 2])) { nonFinite++; continue; }
+              var e = Math.max(Math.abs(px[p] - out[0]), Math.abs(px[p + 1] - out[1]), Math.abs(px[p + 2] - out[2]));
+              errs.push(e); if (e > 0.002) over++;
+              if (e > maxErr) { maxErr = e; worst = "draw " + c + " (fish " + exp.ids[c] + ") u " + ((ii + 0.5) / CW).toFixed(3) + " v " + ((jj + 0.5) / CH).toFixed(3); }
+            }
+          });
+        });
+        cleanup();
+        var E = Float64Array.from(errs).sort();
+        res.intrinsic = { fish: picks.length, draws: picks, slots: pickSlots, ids: picks.map(function (c) { return exp.ids[c]; }), samples: E.length,
+                          p99: E.length ? E[Math.floor(E.length * 0.99)] : null, p999: E.length ? E[Math.floor(E.length * 0.999)] : null,
+                          maxErr: maxErr, over002: E.length ? over / E.length : null, nonFinite: nonFinite, worst: worst };
+        if (res.extraUploads) res.failures.push("the probe uploaded the gene texture " + res.extraUploads + "x (a production upload was pending)");
+        if (R.mismatches) res.failures.push(R.mismatches + " raw gene mismatches");
+        if (R.paddingMismatches) res.failures.push(R.paddingMismatches + " padding mismatches");
+        if (R.nonFinite) res.failures.push(R.nonFinite + " non-finite raw components");
+        if (nonFinite) res.failures.push(nonFinite + " non-finite chart pixels");
+        if (!E.length || !(res.intrinsic.p999 <= 0.002)) res.failures.push("chart p99.9 " + res.intrinsic.p999 + " > .002");
+        if (tex.type !== 1015 || tex.format !== 1023) res.failures.push("the gene texture is not RGBA float");
+        res.ok = res.failures.length === 0;
+        return res;
+      });
+    }
+    return { testFaults: testFaults, probes: probes, failProbes: failProbes, runProbes: runProbes,
+             appearanceParity: appearanceParity, appearanceTextureParity: appearanceTextureParity };
+  }
+
   /** @type {EvoOceanSceneParityApi} */
   var API = {
-    bind: bind, fenceDone: fenceDone,
+    bind: bind, attach: attach,
     appearancePathCheck: appearancePathCheck, appearanceVertexCheck: appearanceVertexCheck, appearanceFragmentCheck: appearanceFragmentCheck
   };
   root.EvoOceanSceneParity = API;
