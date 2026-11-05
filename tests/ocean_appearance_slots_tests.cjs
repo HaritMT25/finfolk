@@ -102,9 +102,9 @@ section("reorder, death, same-count death and birth, several births");
   s = snap(range(100, 140).filter((id) => id !== 117 && id !== 125).concat([500]));
   r = st.prepare(7, s.ids, s.rows, s.n, out);
   let p = st.plan();
-  ok(r.ok && r.released === 1 && r.newRows === 1 && !r.grew && st.slotOf(500) === slot0[125] && p && !p.full && p.calls === 1 && p.bytes === 256 &&
-     p.ranges[0].start === slot0[125] * 64 && p.ranges[0].count === 64,
-     "same count, one died and one born: the birth takes the slot freed this frame (released first), one 256-byte range", { r, p });
+  ok(r.ok && r.released === 1 && r.newRows === 1 && !r.grew && st.slotOf(500) === slot0[117] && slot0[117] < slot0[125] && p && !p.full && p.calls === 1 && p.bytes === 256 &&
+     p.ranges[0].start === slot0[117] * 64 && p.ranges[0].count === 64 && st.stats().free === 1,
+     "same count, one died and one born (released first): the birth takes the lowest free slot (117's, freed a frame before; 125's stays free), one 256-byte range", { r, p });
   upload(st, gpu, p);
   ok(exact(st, s, out, gpu).bad === 0, "exact after the upload");
   const before = st.stats();
@@ -125,8 +125,8 @@ section("complete same-count replacement");
   const cap = st.capacity;
   s = snap(range(1000, 1300));
   const r = st.prepare(2, s.ids, s.rows, s.n, out), p = st.plan();
-  ok(r.ok && r.released === 300 && r.newRows === 300 && !r.grew && st.capacity === cap && p.bytes === 300 * 256,
-     "300 new fish for 300 gone: no growth, every slot reused, 300 x 256 bytes", { r, cap: st.capacity });
+  ok(r.ok && r.released === 300 && r.newRows === 300 && !r.grew && st.capacity === cap && p.slots === 300 && p.full && p.reason === "bytes" && p.calls === 1,
+     "300 new fish for 300 gone: no growth, every slot reused; 300 dirty of 512 (over an eighth): one whole upload", { r, cap: st.capacity, reason: p.reason });
   upload(st, gpu, p);
   ok(exact(st, s, out, gpu).bad === 0, "every new owner exact (no count-based shortcut)");
 }
@@ -184,8 +184,10 @@ section("growth 2,048 -> 2,049 -> 2,500, shrink, refill");
      "shrink to 500: no shrinking or repacking, survivors keep their slots, nothing to upload", st.stats());
   ids = ids.concat(range(9000, 11000)); s = snap(ids);
   r = st.prepare(4, s.ids, s.rows, s.n, out);
-  ok(r.ok && !r.grew && st.stats().nextSlot === 2500 && st.capacity === 4096, "refill to 2,500: the freed slots reused (the high-water mark stays 2,500)", st.stats());
-  upload(st, gpu, st.plan());
+  p = st.plan();
+  ok(r.ok && !r.grew && st.stats().nextSlot === 2500 && st.capacity === 4096 && p.full && p.calls === 1,
+     "refill to 2,500: the freed slots reused (the high-water mark stays 2,500); 2,000 dirty: one whole upload", { stats: st.stats(), reason: p.reason });
+  upload(st, gpu, p);
   ok(exact(st, s, out, gpu).bad === 0, "  exact");
 }
 
@@ -197,8 +199,8 @@ section("epochs: a new world with the same ids");
   st.prepare(1, snap(range(5, 40)).ids, snap(range(5, 40)).rows, 35, out);   /* some freed: the next world starts clean */
   s = snap(range(0, 40), 1);   /* the same ids, other genes */
   const r = st.prepare(2, s.ids, s.rows, s.n, out), p = st.plan();
-  ok(r.ok && r.newRows === 40 && Array.from(out.subarray(0, 40)).every((x, c) => x === c) && !p.full && p.bytes === 40 * 256,
-     "a new epoch: every fish new (identity slots again), uploaded as ranges (the storage is the same)", { r, p: p && { full: p.full, bytes: p.bytes } });
+  ok(r.ok && r.newRows === 40 && Array.from(out.subarray(0, 40)).every((x, c) => x === c) && p.slots === 40 && st.stats().allocs === 1,
+     "a new epoch: every fish new (identity slots again), 40 dirty, the same storage", { r, p: p && { full: p.full, reason: p.reason, slots: p.slots } });
   upload(st, gpu, p);
   ok(exact(st, s, out, gpu).bad === 0, "the new world's genes, not the old ones");
 }
@@ -231,6 +233,76 @@ section("bad snapshots install nothing");
   ok(r2.ok && new Set(big.map((id) => st.slotOf(id))).size === 5 && st.slotOf(2 ** 40) !== st.slotOf(2 ** 40 + 2 ** 32), "ids above 2^32 kept apart (2^40 and 2^40 + 2^32)", big.map((id) => st.slotOf(id)));
   const lim = make({ maxCapacity: 512 }), r3 = lim.prepare(1, Float64Array.from(range(0, 600)), new Float32Array(600 * ST), 600, new Float32Array(600));
   ok(!r3.ok && /cannot hold/.test(r3.error) && lim.capacity === 256, "past the GPU's limit: refused, no growth", r3.error);
+  /* the limit is checked before any owner is released (review of #53, P3-5) */
+  const lim2 = make({ maxCapacity: 512 }), o2 = new Float32Array(1024);
+  let t2 = snap(range(0, 200)); lim2.prepare(1, t2.ids, t2.rows, t2.n, o2);
+  const before2 = JSON.stringify(lim2.stats());
+  t2 = snap(range(0, 100).concat(range(5000, 5500)));
+  const r4 = lim2.prepare(1, t2.ids, t2.rows, t2.n, o2);
+  ok(!r4.ok && /cannot hold 600/.test(r4.error) && JSON.stringify(lim2.stats()) === before2,
+     "100 survivors, 100 gone, 500 born past the limit: refused before the 100 are released", { error: r4.error, stats: lim2.stats() });
+  ok(!st.prepare(1, null, s.rows, s.n, out).ok, "a snapshot without ids: refused (the plain fish are drawn)");
+}
+
+section("lowest free slot first; an upload is at most 32 calls, or one whole upload (review of #53, P3-1)");
+{
+  const st = make({ initialCapacity: 4096 }), gpu = Gpu();
+  const out = new Float32Array(4096);
+  let ids = range(0, 2500), s = snap(ids);
+  st.prepare(1, s.ids, s.rows, s.n, out); upload(st, gpu, st.plan());
+  /* fish 10, 3 and 7 die (their slots: identity), three are born: they take 3, 7, 10 */
+  ids = ids.filter((id) => ![3, 7, 10].includes(id)); s = snap(ids); st.prepare(1, s.ids, s.rows, s.n, out); upload(st, gpu, st.plan());
+  ids = ids.concat([9001, 9002, 9003]); s = snap(ids); st.prepare(1, s.ids, s.rows, s.n, out);
+  ok([9001, 9002, 9003].map((id) => st.slotOf(id)).join() === "3,7,10", "births take the lowest free slots, in order", [9001, 9002, 9003].map((id) => st.slotOf(id)));
+  upload(st, gpu, st.plan());
+  /* k births, one in each of k texture rows (the owners of slots 32r + 5 replaced) */
+  const isolated = (k, base) => {
+    const dead = new Set(range(0, k).map((r) => ids.find((id) => st.slotOf(id) === r * 32 + 5)));
+    ids = ids.filter((id) => !dead.has(id)).concat(range(base, base + k)); s = snap(ids);
+    st.prepare(1, s.ids, s.rows, s.n, out);
+    const p = st.plan(); upload(st, gpu, p);
+    return { full: p.full, reason: p.reason, calls: p.calls, bytes: p.bytes, exact: exact(st, s, out, gpu).bad === 0 };
+  };
+  const i32 = isolated(32, 20000);
+  ok(!i32.full && i32.calls === 32 && i32.bytes === 32 * 256 && i32.exact, "32 births in 32 texture rows: 32 ranges of 256 bytes", i32);
+  const i40 = isolated(40, 21000);
+  ok(i40.full && i40.reason === "ranges" && i40.calls === 1 && i40.exact, "40 births in 40 rows (10 KiB): more than 32 calls, so one whole upload", i40);
+  /* a Turbo-like hand-back: every other fish replaced */
+  const keep = ids.filter((id, k) => k % 2 === 0);
+  ids = keep.concat(range(30000, 30000 + (ids.length - keep.length))); s = snap(ids);
+  const r = st.prepare(1, s.ids, s.rows, s.n, out), p = st.plan();
+  ok(r.ok && r.newRows > 1200 && p.full && p.calls === 1 && p.bytes === 1048576,
+     "a 50 % turnover (" + r.newRows + " births in freed slots all over the texture): one whole upload, not hundreds of ranges", { reason: p.reason, slots: p.slots });
+  upload(st, gpu, p);
+  ok(exact(st, s, out, gpu).bad === 0 && st.plan() === null, "  exact, nothing left");
+  /* the Big tank's new world (2,000 fish, a new epoch on the same storage) */
+  const big = make(), gb = Gpu(), ob = new Float32Array(2048);
+  let sb = snap(range(0, 2000)); big.prepare(1, sb.ids, sb.rows, sb.n, ob); upload(big, gb, big.plan());
+  const allocs = big.stats().allocs;
+  sb = snap(range(0, 2000), 3);
+  big.prepare(2, sb.ids, sb.rows, sb.n, ob);
+  const pb = big.plan();
+  ok(pb.full && pb.calls === 1 && pb.reason === "bytes" && big.stats().allocs === allocs, "the Big tank's new world (2,000 fish, the same storage): one whole upload, no new storage", { reason: pb.reason });
+  upload(big, gb, pb);
+  ok(exact(big, sb, ob, gb).bad === 0, "  exact");
+}
+
+section("verify: the copy-once assumption watched (review of #53, P3-4)");
+{
+  const st = make(), out = new Float32Array(64);
+  const s = snap(range(0, 40));
+  let found = null;
+  for (let f = 0; f < 20 && !found; f++) { st.prepare(1, s.ids, s.rows, s.n, out); found = st.verify(s.ids, s.rows, s.n, 2); }
+  ok(found === null, "unchanged rows: no difference over a whole rotation (20 frames x 2 of 40)");
+  const t = snap(range(0, 40)); t.rows.set(rowOf(17, 5), 17 * ST);   /* fish 17's genes changed under its id */
+  let at = -1;
+  for (let f = 0; f < 20 && !found; f++) { st.prepare(1, t.ids, t.rows, t.n, out); found = st.verify(t.ids, t.rows, t.n, 2); if (found) at = f; }
+  ok(found && found.id === 17 && found.slot === st.slotOf(17) && at >= 0, "a row changed under its id: found within a rotation (frame " + at + ")", found);
+  st.invalidate();
+  const r = st.prepare(1, t.ids, t.rows, t.n, out);
+  let again = null;
+  for (let f = 0; f < 20 && !again; f++) again = st.verify(t.ids, t.rows, t.n, 2);
+  ok(r.ok && r.newRows === 40 && again === null, "invalidated and reinstalled: the new rows, no difference left");
 }
 
 section("upload plans: acknowledged only after the upload, nothing lost");
@@ -292,7 +364,7 @@ section("random lives against the GPU model");
   let seed = 12345;
   const rnd = () => { seed = (seed * 1103515245 + 12345) >>> 0; return seed / 4294967296; };
   const st = make(), gpu = Gpu();
-  let out = new Float32Array(256), ids = range(0, 300), next = 300, epoch = 1, peak = 300, bad = 0, steps = 0, skipped = 0, worst = null;
+  let out = new Float32Array(256), ids = range(0, 300), next = 300, epoch = 1, peak = 300, bad = 0, steps = 0, skipped = 0, worst = null, maxCalls = 0, fulls = 0;
   let s = snap(ids);
   for (let t = 0; t < 400; t++) {
     const born = Math.floor(rnd() * (t % 50 < 25 ? 60 : 5)), dieP = t % 50 < 25 ? 0.01 : 0.12;
@@ -306,13 +378,16 @@ section("random lives against the GPU model");
     const r = st.prepare(epoch, s.ids, s.rows, s.n, out);
     if (!r.ok) { bad++; worst = r.error; continue; }
     if (rnd() < 0.3) { skipped++; continue; }   /* not drawn this frame: the upload waits */
-    upload(st, gpu, st.plan());
+    const pl = st.plan();
+    if (pl) { maxCalls = Math.max(maxCalls, pl.calls); if (pl.full) fulls++; }
+    upload(st, gpu, pl);
     const e = exact(st, s, out, gpu);
     if (e.bad) { bad++; worst = worst || e.where; }
     steps++;
   }
   let cap = 256; while (cap < peak) cap *= 2;
   ok(bad === 0, "every drawn frame: each fish's slot exact on the GPU (" + steps + " uploads, " + skipped + " frames not drawn)", worst);
+  ok(maxCalls <= 32, "every upload at most 32 calls (most " + maxCalls + "; " + fulls + " whole)");
   ok(st.capacity <= cap, "storage bounded by the peak population (" + peak + " -> at most " + cap + "), not by the births (" + next + ")", st.stats());
 }
 
