@@ -12,8 +12,9 @@
  *     the Look (the faces: with a digest of their GLSL and options), and the enabled features' ids and
  *     versions stage by stage (the vertex and fragment stages may differ: under Reef, [swimPolish.full,
  *     reef.fish] / [reef.fish]). Uniform values are not in it: a kind's materials share its uniforms
- *     (the scene's objects, so setClarity, setLight and the rest reach every variant; a Look's, merged
- *     in, refreshed whenever it is activated again). Keys whose material would be identical (the
+ *     (the scene's objects, so setClarity, setLight and the rest reach every variant; a Look's merged
+ *     with them into an object of the binder's, the Look's own objects by identity in its keys: the
+ *     binder never writes a uniform object). Keys whose material would be identical (the
  *     legacy fish's and the predators': the same programs, options and uniforms) share one material
  *     object, as the scene's two kinds shared theirs before the binder. Each program is
  *     EvoOceanShaders.program(name, parts, the stage's features), so a feature that is not enabled
@@ -30,7 +31,8 @@
  *     kind's passes and variants, and the set's attached pass) is assembled, then compiled (compiler():
  *     three's compile, then each program checked linked and runnable), before the set takes effect; an
  *     assembly or compile failure keeps the previous set, and drops what it made. On success the
- *     materials of the sets it replaces are freed (the base set's stay). A kind defined while a Look is
+ *     materials of the sets it replaces are freed (the base set's stay, and the set replaced right
+ *     now, for one switch: off and on again relinks its programs). A kind defined while a Look is
  *     active (the appearance fish, on their first snapshot) draws under the base set until its own
  *     activation of the Look compiled
  *   - lazy assembly: a variant's programs are assembled when it is first drawn, warmed or activated,
@@ -294,7 +296,7 @@
     /** @type {WeakMap<object, number>} */
     var uids = new WeakMap();
     var uidN = 0;
-    /** @type {WeakMap<object, Map<object, object>>} a kind's uniforms merged with a set's, once per pair */
+    /** @type {WeakMap<object, WeakMap<object, object>>} a kind's uniforms merged with a set's, once per pair (neither kept alive) */
     var merges = new WeakMap();
 
     /** @param {string} key @param {string} text */
@@ -305,7 +307,9 @@
     function extrasOf(set, kind) {
       return (kind === "face" ? set.attach && set.attach.face.uniforms : set.uniforms && set.uniforms[kind]) || null;
     }
-    /** a kind's uniforms (the scene's objects), merged with the set's own for it (once per pair: kinds with the same share it)
+    /** a kind's uniforms (the scene's objects), merged with the set's own for it into an object of the binder's (once per pair:
+     * kinds with the same share it). Neither is ever written after: the set's own uniform objects are in its keys (describe),
+     * so a Look activated again with others draws new materials (the same programs: three links them from its cache)
      * @param {MaterialSet} set @param {string} kind @param {string} pass @returns {object} */
     function uniformsOf(set, kind, pass) {
       var k = kind === "face" ? "pred" : kind;
@@ -315,7 +319,7 @@
       var extra = extrasOf(set, kind);
       if (!extra) return u;
       var m = merges.get(u);
-      if (!m) { m = new Map(); merges.set(u, m); }
+      if (!m) { m = new WeakMap(); merges.set(u, m); }
       var x = m.get(extra);
       if (!x) { x = Object.assign({}, u, extra); m.set(extra, x); }
       return x;
@@ -344,6 +348,9 @@
       var lay = set.layouts[KINDS[kind].layout];
       var fsKey = pass === "shadow" ? "(SHADOW_FS)" : kind === "face" ? "(" + set.look + ":" + set.faceDigest + ")" : idsKey(fs);
       var rest = ["v" + variant, "look:" + (set.look || "-"), "vs:" + idsKey(vs), "fs:" + fsKey];
+      /* the set's own uniform objects for the kind, by identity (none: no part; the base set never has any) */
+      var extra = extrasOf(set, kind);
+      if (extra) rest.push("u" + uid(extra));
       return { key: ["abi" + SH.ABI, kind, pass, lay.id].concat(rest).join("|"), kind: kind, pass: pass, variant: variant, vs: vs, fs: fs, layout: lay, set: set,
                share: ["abi" + SH.ABI, KINDS[kind].family, pass, "claims" + lay.id.slice(lay.id.indexOf("/"))].concat(rest).join("|") };
     }
@@ -374,8 +381,11 @@
       cache[d.key] = e; order.push(d.key);
       return e;
     }
-    /** an entry out of the cache; its material disposed with the last key that drew it @param {BinderEntry} e */
+    /** an entry out of the cache; its material disposed with the last key that drew it. Once only, and never one another
+     * activation has taken up since (a one-kind activation failing after a newer set's success with the same keys)
+     * @param {BinderEntry} e */
     function remove(e) {
+      if (cache[e.key] !== e) return;
       delete cache[e.key];
       var i = order.indexOf(e.key);
       if (i >= 0) order.splice(i, 1);
@@ -438,24 +448,15 @@
                  (set.look ? ", Look " + set.look : "") + ") could not be keyed: " + r.error + ". The plain programs are drawn instead");
       return { e: fallback(set, kind, pass, variant), own: false };
     }
-    /** a set's uniforms on the entries it reuses (a Look activated again with new uniform objects: its materials read them)
-     * @param {BinderEntry} e @param {MaterialSet} set */
-    function refresh(e, set) {
-      e.set = set;
-      var x = /** @type {Object<string, any> | null} */ (extrasOf(set, e.kind));
-      if (!x) return;
-      var extra = x, U = e.rec.material.uniforms, added = false;
-      Object.keys(extra).forEach(function (n) { if (!hasOwn.call(U, n)) added = true; U[n] = extra[n]; });
-      if (added) e.rec.material.needsUpdate = true;   /* (a name three's uniform list for the program does not have yet) */
-    }
     /** assemble and compile every reachable variant of these kinds under a set; a Promise of the outcome, what it made dropped
-     * on a failure @param {MaterialSet} set @param {string[]} kinds @returns {Promise<MaterialActivation>} */
+     * on a failure (but what a newer activation has taken up since: live) @param {MaterialSet} set @param {string[]} kinds
+     * @returns {Promise<MaterialActivation>} */
     function run(set, kinds) {
       /** @type {BinderEntry[]} */
       var made = [], used = [];
       /** @type {MaterialCompileItem[]} */
       var items = [];
-      function drop() { made.forEach(remove); }
+      function drop() { made.forEach(function (e) { if (!live[e.key]) remove(e); }); }
       try {
         reachable(set, kinds).forEach(function (r) {
           var rr = resolve(set, r.kind, r.pass, r.variant, "set");   /* (worked out once: the binds then look it up) */
@@ -478,7 +479,7 @@
       try { p = Promise.resolve(deps.compile ? deps.compile(items) : { ok: true }); } catch (x) { p = Promise.reject(x); }
       return p.then(function (r) {
         if (!r || r.ok !== true) { drop(); return { ok: false, look: set.look, stage: "compile", error: (r && r.error) || "the programs did not compile" }; }
-        used.forEach(function (e) { refresh(e, set); });
+        used.forEach(function (e) { e.set = set; });   /* (the same key: the same programs and uniform objects; the set that drew it last) */
         return { ok: true, look: set.look, keys: used.map(function (e) { return e.key; }), materials: items.length };
       }, function (x) {
         drop();
@@ -564,11 +565,14 @@
           pending = false;
           if (!r.ok) return r;
           active = set.look ? set : BASE; version++;   /* (no Look: the base set itself) */
+          var before = live;
           covered = {}; live = {};
           kinds.forEach(function (k) { covered[k] = true; });
           (r.keys || []).forEach(function (k) { live[k] = true; });
-          /* the sets it replaces: their materials freed (the base set's stay: the plain fallback, and back to no Look) */
-          Object.keys(cache).forEach(function (k) { var e = cache[k]; if (e.set.look && !live[k]) remove(e); });
+          /* the sets it replaces: their materials freed, but the base set's (the plain fallback, and back to no Look) and the
+           * set it replaces right now (kept one switch: a Look turned off and on again links its programs from three's cache
+           * rather than compiling them again, ~10 s on ANGLE) */
+          Object.keys(cache).forEach(function (k) { var e = cache[k]; if (e.set.look && !live[k] && !before[k]) remove(e); });
           /* a kind defined while it compiled: its own activation */
           if (set !== BASE && set.look) Object.keys(defs).forEach(function (k) { if (!covered[k]) activateKind(k); });
           return r;

@@ -282,7 +282,7 @@ section("the predators' faces (a Look's attached pass) follow the predators' ver
     for (const v of [0, 1]) {
       const g = B.programs("face", "body", v), pv = B.key("pred", "body", v).split("|vs:")[1].split("|")[0];
       const want = SH.program("fish.attach.vs", SH.parts.fishAttach(DECL, BODY), v ? [F, "faces.sway"] : ["faces.sway"]);
-      ok(g.own && g.vs === want && g.fs === FS && g.key.includes("|vs:" + pv + "|") && /\|fs:\(faces:[0-9a-f]{8}\)$/.test(g.key),
+      ok(g.own && g.vs === want && g.fs === FS && g.key.includes("|vs:" + pv + "|") && /\|fs:\(faces:[0-9a-f]{8}\)\|u\d+$/.test(g.key),
          "faces variant " + v + ": fish.attach.vs with the predators' vertex features [" + pv + "], the Look's fragment stage", g.key);
     }
     const v1 = B.programs("face", "body", 1).vs;
@@ -419,32 +419,85 @@ section("review P1-1: the legacy fish and the predators share their materials, a
   ok(C4.material("fish", "body", 1) === C4.material("pred", "body", 1) && C4.state().materials === 4, "a Look that changes neither: one again (4 materials for the 8 keys)", C4.state().materials);
 }
 
-section("review P2-1: a Look's faces keyed by their GLSL; a Look activated again draws its new uniforms");
+section("review P2-1, re-check P2-R1: a Look's faces keyed by their GLSL; a Look's own uniform objects in its keys");
 {
   const DECL = "attribute vec3 aLoc;\nvarying vec3 vLoc;", BODY = "  vec3 w = fishWorld(); vLoc = aLoc;\n  gl_Position = projectionMatrix * viewMatrix * vec4(w, 1.0);";
-  const face = (fs, u) => ({ decl: DECL, body: BODY, fs: fs, uniforms: u });
+  const FS1 = "varying vec3 vLoc;\nvoid main() { gl_FragColor = vec4(vLoc, 1.0); }", FS2 = "varying vec3 vLoc;\nvoid main() { gl_FragColor = vec4(vLoc * 0.5, 1.0); }";
+  const face = (fs, u, o) => Object.assign({ decl: DECL, body: BODY, fs: fs, uniforms: u }, o ? { options: o } : {});
   const { B } = sceneBinder(ctx, () => ({ ok: true }));
-  const holderA = { value: 1 }, faceA = { value: 2 };
-  const setA = () => ({ look: "rf", uniforms: { fish: { uRf: holderA } }, attach: { face: face("varying vec3 vLoc;\nvoid main() { gl_FragColor = vec4(vLoc, 1.0); }", { uFace: faceA }) } });
-  await B.activate(setA());
-  const k1 = B.key("face", "body", 0), mesh = { material: null }, fm = { material: null };
+  const holderA = { value: 1 }, faceA = { value: 2 }, fishUA = { uRf: holderA }, faceUA = { uFace: faceA };
+  await B.activate({ look: "rf", uniforms: { fish: fishUA }, attach: { face: face(FS1, faceUA) } });
+  const k1 = B.key("face", "body", 0), kf1 = B.key("fish", "body", 0), mesh = { material: null }, fm = { material: null };
   B.bind(mesh, "fish", "body", 0); B.bind(fm, "face", "body", 0);
-  ok(mesh.material.uniforms.uRf === holderA && fm.material.uniforms.uFace === faceA, "on: the Look's uniform objects in its materials (legacy fish, faces)");
+  const mA = mesh.material, fA = fm.material;
+  ok(mA.uniforms.uRf === holderA && fA.uniforms.uFace === faceA && /\|u\d+$/.test(kf1) && /\|u\d+$/.test(k1) && !/\|u\d+$/.test(B.key("pred", "body", 0)),
+     "on: the Look's uniform objects in its materials (legacy fish, faces); in their keys by identity (the predators, with none, without)", { kf1, k1 });
   await B.activate(null);
-  const holderB = { value: 3 }, faceB = { value: 4 };
-  const setB = { look: "rf", uniforms: { fish: { uRf: holderB } }, attach: { face: face("varying vec3 vLoc;\nvoid main() { gl_FragColor = vec4(vLoc, 1.0); }", { uFace: faceB }) } };
-  await B.activate(setB);
+  ok(!mA.disposed && !fA.disposed, "off: the Look's materials kept for one switch");
+  await B.activate({ look: "rf", uniforms: { fish: fishUA }, attach: { face: face(FS1, faceUA) } });
   B.bind(mesh, "fish", "body", 0); B.bind(fm, "face", "body", 0);
-  ok(B.key("face", "body", 0) === k1 && mesh.material.uniforms.uRf === holderB && fm.material.uniforms.uFace === faceB, "off, then on with new uniform objects (the same Look id): its materials hold the new ones");
+  ok(B.key("face", "body", 0) === k1 && mesh.material === mA && fm.material === fA, "on again with the same objects: the same keys, its kept materials (nothing made, nothing compiled anew)");
+  await B.activate(null);
+  const holderB = { value: 3 }, faceB = { value: 4 }, fishUB = { uRf: holderB }, faceUB = { uFace: faceB };
+  await B.activate({ look: "rf", uniforms: { fish: fishUB }, attach: { face: face(FS1, faceUB) } });
+  B.bind(mesh, "fish", "body", 0); B.bind(fm, "face", "body", 0);
+  ok(B.key("face", "body", 0) !== k1 && mesh.material !== mA && mesh.material.uniforms.uRf === holderB && fm.material.uniforms.uFace === faceB &&
+     mesh.material.vertexShader === mA.vertexShader && mesh.material.fragmentShader === mA.fragmentShader,
+     "off, then on with new uniform objects (the same Look id): new keys, new materials holding them, the same programs");
+  ok(mA.uniforms.uRf === holderA && fA.uniforms.uFace === faceA, "  the first materials never written (no uniform object is)");
   const holderC = { value: 5 };
-  await B.activate({ look: "rf", uniforms: { fish: { uRf: holderC } }, attach: setB.attach });
+  await B.activate({ look: "rf", uniforms: { fish: { uRf: holderC } }, attach: { face: face(FS1, faceUB) } });
   B.bind(mesh, "fish", "body", 0);
-  ok(mesh.material.uniforms.uRf === holderC, "on again straight from on (no off between): the new ones too");
-  await B.activate({ look: "rf", uniforms: setB.uniforms, attach: { face: face("varying vec3 vLoc;\nvoid main() { gl_FragColor = vec4(vLoc * 0.5, 1.0); }", { uFace: faceB }) } });
-  ok(B.key("face", "body", 0) !== k1 && B.programs("face", "body", 0).fs.includes("vLoc * 0.5"), "the same Look id with other faces' GLSL: another key, its own program");
+  ok(mesh.material.uniforms.uRf === holderC, "on again straight from on (no off between) with others: the new ones too");
+  await B.activate({ look: "rf", uniforms: { fish: fishUB }, attach: { face: face(FS2, faceUB) } });
   const k2 = B.key("face", "body", 0);
-  await B.activate({ look: "rf", uniforms: setB.uniforms, attach: { face: Object.assign(face("varying vec3 vLoc;\nvoid main() { gl_FragColor = vec4(vLoc * 0.5, 1.0); }", { uFace: faceB }), { options: { side: 0 } }) } });
+  ok(k2 !== k1 && B.programs("face", "body", 0).fs.includes("vLoc * 0.5"), "the same Look id with other faces' GLSL (the same uniform objects): another key, its own program");
+  await B.activate({ look: "rf", uniforms: { fish: fishUB }, attach: { face: face(FS2, faceUB, { side: 0 }) } });
   ok(B.key("face", "body", 0) !== k2, "... and with other material options: another key");
+}
+
+section("re-check P2-R1: the binder never writes the scene's uniform objects (a Look's uniforms for a kind appearing on re-activation)");
+{
+  const sceneSelect = { value: "the scene's" };
+  const fishU = { uTime: { value: 0 }, uSelect: sceneSelect }, shadowU = { uAlpha: { value: 0.4 } };
+  const before = Object.keys(fishU).join();
+  const B = M.create({ THREE: fakeThree(), compile: () => ({ ok: true }) });
+  B.define("fish", { uniforms: { body: fishU, shadow: shadowU } }); B.define("pred", { uniforms: { body: fishU, shadow: shadowU } });
+  B.prepare(["fish", "pred"]);
+  const base = B.material("fish", "body", 0);
+  await B.activate({ look: "x" });
+  ok(B.material("pred", "body", 0).uniforms === fishU && B.material("fish", "body", 0) === B.material("pred", "body", 0), "a Look without uniforms of its own: the scene's object, fish and predators sharing");
+  const lookSelect = { value: "the Look's" };
+  await B.activate({ look: "x", uniforms: { pred: { uSelect: lookSelect, uEye: { value: 1 } } } });
+  ok(fishU.uSelect === sceneSelect && Object.keys(fishU).join() === before, "the same Look again, now with predator uniforms: the scene's fishUniforms untouched (its uSelect, no uEye)");
+  ok(B.material("fish", "body", 0) !== B.material("pred", "body", 0) && B.material("pred", "body", 0).uniforms.uSelect === lookSelect && B.material("fish", "body", 0).uniforms.uSelect === sceneSelect,
+     "  fish and predators apart under it: the predators draw the Look's uSelect, the fish the scene's");
+  await B.activate(null);
+  ok(B.material("fish", "body", 0) === base && base.uniforms === fishU && fishU.uSelect === sceneSelect && !("uEye" in fishU), "back to no Look: the base material, the scene's own uSelect");
+}
+
+section("re-check P3-R1: a failing one-kind activation never drops what a newer activation took up");
+{
+  let hold = null;
+  /* the appearance kind's own activation held (its compile a promise released later); every other compile at once */
+  const compile = (items) => (hold === null && items.every((x) => x.kind === "app") ? new Promise((res) => { hold = res; }) : Promise.resolve({ ok: true }));
+  const U = { fish: { uTime: { value: 0 } }, shadow: {}, app: { uGenes: { value: null } }, appShadow: {} };
+  const B = M.create({ THREE: fakeThree(), compile, warn: () => {} });
+  B.define("fish", { uniforms: { body: U.fish, shadow: U.shadow } }); B.define("pred", { uniforms: { body: U.fish, shadow: U.shadow } }); B.prepare(["fish", "pred"]);
+  const features = (q) => q.base;
+  await B.activate({ look: "k", features });
+  B.define("app", { uniforms: { body: U.app, shadow: U.appShadow }, env: { EA } });
+  B.prepare(["app"]);   /* (its own activation of "k" starts, and waits) */
+  await tick();
+  const r = await B.activate({ look: "k", features });   /* a newer activation, the same keys: it takes up the app entries */
+  const m = { material: null };
+  B.bind(m, "app", "body", 1);
+  const taken = m.material, n = B.state().entries.length;
+  hold({ ok: false, error: "planted" });   /* the older one fails now */
+  await tick(); await tick();
+  B.bind(m, "app", "body", 1);
+  ok(r.ok && hold && /look:k/.test(B.bound(m).key) && m.material === taken && !taken.disposed && B.state().entries.length === n,
+     "the newer set's entries kept (not dropped, not disposed) when the older one-kind activation fails after it", { ok: r.ok, entries: [n, B.state().entries.length], disposed: taken.disposed });
 }
 
 section("review P2-2: a kind defined while a Look is active");
@@ -552,16 +605,19 @@ section("review P3: the plain fallback, the split's skip, features() once, freei
   const c0 = calls, mm = { material: null };
   for (let i = 0; i < 200; i++) { F2.bind(mm, "fish", "body", i & 1); F2.bind(mm, "app", "body", i & 1); F2.bind(mm, "app", "litSkip", 0); F2.bind(mm, "pred", "shadow", i & 1); }
   ok(c0 > 0 && calls === c0, "P3-4: features() ran " + c0 + " times for the activation, none for 800 binds");
-  /* P3-5: the replaced sets' materials freed */
+  /* P3-5 (and the re-check's P3-R2): the replaced sets' materials freed, the one replaced right now kept for one switch */
   const { B: E } = sceneBinder(ctx, () => ({ ok: true }));
   await E.activate({ look: "one", uniforms: { fish: { u1: { value: 1 } } } });
   const one = E.material("fish", "body", 0);
   await E.activate({ look: "two", uniforms: { fish: { u2: { value: 2 } } } });
   const two = E.material("fish", "body", 0), nTwo = E.state().entries.length;
-  ok(one.disposed && !two.disposed && E.state().entries.every((x) => !/look:one/.test(x.key)) && nTwo === 13 + 13, "P3-5: a set replaced by another: its materials disposed, its keys gone (the base set's kept)", nTwo);
+  ok(!one.disposed && !two.disposed && nTwo === 13 * 3, "P3-5, P3-R2: a set replaced by another: kept for this one switch (off and on again relinks its programs)", nTwo);
   await E.activate(null);
   const base = E.material("fish", "body", 0);
-  ok(two.disposed && !base.disposed && E.state().entries.length === 13 && E.state().materials === 9, "  back to no Look: the Look's freed, the base set's 13 keys and 9 materials kept");
+  ok(one.disposed && !two.disposed && E.state().entries.every((x) => !/look:one/.test(x.key)) && E.state().entries.length === 13 * 2,
+     "  one switch later: its materials disposed, its keys gone; the set replaced now kept", E.state().entries.length);
+  await E.activate(null);
+  ok(two.disposed && !base.disposed && E.state().entries.length === 13 && E.state().materials === 9, "  and the next: the base set's 13 keys and 9 materials alone");
   /* P3-7: an entry made before (reserved), failing in an activation: said, as its binds will fall back */
   const pc = load({ "ocean_shaders.js": (s) => s.replace('append["fish.fs.decl"] = POLISH_VARY;', 'append["fish.fs.decl"] = POLISH_VARY + "\\nuniform float uTime;";') });
   const { B: P, warned: pw } = sceneBinder(pc, () => ({ ok: true }));
