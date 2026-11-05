@@ -681,11 +681,13 @@ interface ShaderSlot { slot: string; fallback: string | null }
 type ShaderPart = string | null | ShaderSlot;
 /** What a program is assembled for: the appearance programs pass the appearance law (EA). */
 interface ShaderEnv { EA?: EvoAppearanceApi }
-/** A feature's text for a slot: GLSL, or a function of the program's environment giving it. */
+/** A feature's text for a slot: GLSL, or a function of the program's environment giving it ("" adds no
+ * line). */
 type ShaderText = string | ((env: ShaderEnv) => string);
-/** A feature, as registered (EvoOceanShaders.feature): the slots' ABI; the programs it supports; by slot,
- * the text it appends (additive slots) or replaces the fallback with (replacement slots); order: where its
- * appends go among others' (then by id; default 0). */
+/** A feature, as registered (EvoOceanShaders.feature): its id (namespaced by its owner, "reef.fish"; registered
+ * once, as its script loads); the slots' ABI; the programs it supports; by slot, the text it appends
+ * (additive slots) or replaces the fallback with (replacement slots); order: where its appends go among
+ * others' in every slot it appends to (then by id; default 0). */
 interface ShaderFeatureSpec {
   id: string;
   abi: number;
@@ -737,6 +739,9 @@ interface FishProgramParts {
   fishVs(): ShaderPart[];
   fishFs(): ShaderPart[];
   shadowVs(): ShaderPart[];
+  /** a pass a look owns on the legacy fish's instances (program "fish.attach.vs"): the common part, the
+   * look's declarations, main() with the pose read first, then the look's body (it calls fishWorld()) */
+  fishAttach(decl: string, body: string): ShaderPart[];
   appCore(EA: EvoAppearanceApi): ShaderPart[];
   appBodyVs(EA: EvoAppearanceApi): ShaderPart[];
   appBodyFs(EA: EvoAppearanceApi): ShaderPart[];

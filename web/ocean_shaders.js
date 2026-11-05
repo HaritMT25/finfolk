@@ -536,10 +536,16 @@
    * append, replace, order}), names the programs it supports (targets) and,
    * slot by slot, the GLSL it appends or the GLSL that replaces the fallback
    * (or a function of the program's environment env giving it: the
-   * appearance programs pass {EA}). Registering enables nothing: a program
-   * is assembled with the feature ids it is given (an id it does not
-   * target adds nothing to it). The swim polish is two features
-   * (swimPolish.lite, swimPolish.full; plain is neither).
+   * appearance programs pass {EA}; a function that throws is reported with
+   * the feature, the slot and the program). A text of "" adds no line (a
+   * replacement by "" removes the fallback). Registering enables nothing: a
+   * program is assembled with the feature ids it is given (an id it does
+   * not target adds nothing to it). Ids are namespaced by their owner
+   * ("swimPolish.full", "reef.fish") and registered once, as their script
+   * loads: a Look registers its features at load, never in attach() (a
+   * second registration of an id throws, so a rebuild would). The swim
+   * polish is two features (swimPolish.lite, swimPolish.full; plain is
+   * neither).
    * The checks are on the source, as it is assembled (a GLSL compile and
    * link stays a separate check):
    *   - the parts hold each of the program's slots (PROGRAMS) once, in its
@@ -553,9 +559,11 @@
    *     level) where a feature made one of the declarations
    * SLOTS documents each slot: where it is, what it may read, what it
    * writes. The programs with slots: the legacy fish's and the predators'
-   * body (fish.vs, fish.fs) and shadow (fish.shadow.vs), the appearance
-   * fish's body and barbels (app.body.vs, app.body.fs: one program) and
-   * shadow (app.shadow.vs). The shadows' fragment stage (SHADOW_FS), the
+   * body (fish.vs, fish.fs) and shadow (fish.shadow.vs), a pass a look owns
+   * on their instances (fish.attach.vs: the common part, the pose read, the
+   * look's own main(); #47's predator faces), the appearance fish's body
+   * and barbels (app.body.vs, app.body.fs: one program) and shadow
+   * (app.shadow.vs). The shadows' fragment stage (SHADOW_FS), the
    * environment's programs and the probes' come in no variants and have no
    * slots. A vertex stage's common part (fishCore, appCore) is assembled
    * alone with core(): the slots it has. */
@@ -583,7 +591,10 @@
   var FISH_VARY = "vWorld, vCol, vPart (0 body, 1 fin, 2 eye), vOy, vSel, vEmber (the body's varyings)";
   var APP_VARY = "vWorld, vMatV (the material site, margin), vPart (fin, side, highlight, colour); the pattern law's VARY";
   var LIGHTING_WRITES = ["float rim (the rim term)", "float bk (the flashlight's share, 0..1)",
-    "vec3 col (the colour in the murky water: lit, then the water's grading)", "vec3 clear (the colour in the flashlight's clear light)"];
+    "vec3 col (the lit colour, before the water)", "vec3 clear (the colour in the flashlight's clear light)"];
+  var TERMS_READS = ["rim, bk, col, clear and the lighting's other names (the polish's: diff, thin, nl, pk)", "N, V"];
+  var WATER_READS = ["col (lit, before the water)", "vWorld", "DEPTH_FN (underwaterAt), CLARITY_FN (vivid)"];
+  var EMISSIVE_READS = ["murky (final: the fog and the flashlight's light blended)", "clear, bk, add", "vWorld, N, V", "fogOf()"];
   /** Each slot: kind (append: additive, any number of features, in their order; replace: one provider),
    * stage, where it is, what it may read, what it writes; must: what a replacement declares.
    * @type {Object<string, ShaderSlotSpec>} */
@@ -602,17 +613,23 @@
       LIGHT_READS, ["functions and constants of the light model"]),
     "fish.fs.decl": S("append", "fs", "after the stage's varyings, before baseOf()",
       LIGHT_READS.concat([FISH_VARY]), ["uniforms, varyings, functions"]),
-    "fish.lighting": S("replace", "fs", "main(), after the facet's normal: the light model and the water",
+    "fish.lighting": S("replace", "fs", "main(), after the facet's normal: the light model",
       ["N, V (the facet's normal, toward the camera)", "baseOf(back) (the skin: darker back, pale belly, paler fins)", FISH_VARY].concat(LIGHT_READS),
       LIGHTING_WRITES, ["rim", "bk", "col", "clear"]),
-    "fish.lightMods": S("append", "fs", "after the lighting, before the eyes",
-      ["rim, bk, col, clear and the lighting's other names", "N, V", FISH_VARY], ["col, clear"]),
+    "fish.lightTerms": S("append", "fs", "after the lighting, before the water: light terms added to the lit colour",
+      TERMS_READS.concat([FISH_VARY, "baseOf()"], LIGHT_READS), ["col, clear (terms added in clear water)"]),
+    "fish.water": S("replace", "fs", "after the light terms: the water's grading of the murky colour (its fallback: underwaterAt(vivid(col)))",
+      WATER_READS, ["col"]),
+    "fish.lightMods": S("append", "fs", "after the water, before the predator's ember colour and the eyes",
+      ["rim, bk, col (graded), clear and the lighting's other names", "N, V", FISH_VARY], ["col, clear"]),
     "fish.eyes": S("replace", "fs", "after vec3 add and the predator's ember colour: the eyes, and a predator's ember rim",
       ["vPart (> 1.5: an eye), vEmber (> .5: a predator)", "ember", "N, V, rim, col"], ["col, clear (an eye's own colour)", "add (the ember rim)"]),
     "fish.highlights": S("append", "fs", "after the eyes (its fallback: the selection's and the hover's rim), before col += add",
       ["vSel (1 selected, .5 hover)", "rim, uSelect", "col, clear"], ["add", "col, clear (scaled)"]),
     "fish.fog": S("replace", "fs", "after col += add: the water's fog",
       ["col", "vWorld", "uFog, fogOf()"], ["vec3 murky (the colour in the fog)"], ["murky"]),
+    "fish.emissive": S("append", "fs", "after the fog and the flashlight's blend, before the output: light the fish emits (bioluminescence)",
+      EMISSIVE_READS.concat([FISH_VARY]), ["murky (light added)"]),
     /* the appearance fish's vertex stages */
     "app.world": S("replace", "vs", "the vertex stages' common part, after seg() and spine(), before minWidth(): the world position",
       APP_CORE_READS, ["vec3 appWorld(vec3 geo): the deformed rest point (body radii; x = lambda u) in the world",
@@ -634,17 +651,23 @@
     "app.surface": S("append", "fs", "main(), after the skin's colour, before the facet's normal",
       ["fin (0 body, 1-3, 5, 6 fins, 4 eye, 7 barbel)", "u, v, zL, oyL (the material site)", "base", APP_VARY, "colourBase()"],
       ["base (the skin's colour before the light)"]),
-    "app.lighting": S("replace", "fs", "main(), after the facet's normal: the light model and the water",
+    "app.lighting": S("replace", "fs", "main(), after the facet's normal: the light model",
       ["base, fin, u, oyL", "N, V (the facet's normal, toward the camera)", "colourBase(fin, oy, back)", APP_VARY].concat(LIGHT_READS),
       LIGHTING_WRITES, ["rim", "bk", "col", "clear"]),
-    "app.lightMods": S("append", "fs", "after the lighting, before vec3 add",
-      ["rim, bk, col, clear and the lighting's other names", "base, fin, N, V", APP_VARY], ["col, clear"]),
+    "app.lightTerms": S("append", "fs", "after the lighting, before the water: light terms added to the lit colour",
+      TERMS_READS.concat(["base, fin, u, oyL", APP_VARY, "colourBase()"], LIGHT_READS), ["col, clear (terms added in clear water)"]),
+    "app.water": S("replace", "fs", "after the light terms: the water's grading of the murky colour (its fallback: underwaterAt(vivid(col)))",
+      WATER_READS.concat(["base, fin"]), ["col"]),
+    "app.lightMods": S("append", "fs", "after the water, before vec3 add",
+      ["rim, bk, col (graded), clear and the lighting's other names", "base, fin, N, V", APP_VARY], ["col, clear"]),
     "app.eyes": S("replace", "fs", "after vec3 add and float vSel: the eyes (fin 4)",
       ["fin", "N, V, rim, base, col", APP_VARY], ["col, clear (an eye's own colour)", "add; it may discard"]),
     "app.highlights": S("append", "fs", "after the eyes (its fallback: the selection's and the hover's rim), before col += add",
       ["vSel (1 selected, .5 hover)", "rim, uSelect", "col, clear", "fin"], ["add", "col, clear (scaled)"]),
     "app.fog": S("replace", "fs", "after col += add: the water's fog",
-      ["col", "vWorld", "uFog, fogOf()"], ["vec3 murky (the colour in the fog)"], ["murky"])
+      ["col", "vWorld", "uFog, fogOf()"], ["vec3 murky (the colour in the fog)"], ["murky"]),
+    "app.emissive": S("append", "fs", "after the fog and the flashlight's blend, before the output: light the fish emits (bioluminescence)",
+      EMISSIVE_READS.concat(["fin", APP_VARY]), ["murky (light added)"])
   };
   /** @param {"vs" | "fs"} stage @param {string} doc @param {string[]} slots @returns {ShaderProgramSpec} */
   function C(stage, doc, slots) { return Object.freeze({ abi: ABI, stage: stage, doc: doc, slots: Object.freeze(slots) }); }
@@ -652,11 +675,15 @@
   var PROGRAMS = {
     "fish.vs": C("vs", "the legacy fish's and the predators' body (fishVs; FISH_VS)", ["fish.world", "fish.vs.decl", "fish.pose", "fish.varyings"]),
     "fish.fs": C("fs", "their body's fragment stage (fishFs; FISH_FS)",
-      ["fish.fs.lib", "fish.fs.decl", "fish.lighting", "fish.lightMods", "fish.eyes", "fish.highlights", "fish.fog"]),
+      ["fish.fs.lib", "fish.fs.decl", "fish.lighting", "fish.lightTerms", "fish.water", "fish.lightMods", "fish.eyes", "fish.highlights",
+       "fish.fog", "fish.emissive"]),
     "fish.shadow.vs": C("vs", "their shadow (shadowVs; SHADOW_VS, with SHADOW_FS)", ["fish.world", "fish.pose"]),
+    "fish.attach.vs": C("vs", "a pass a look owns on their instances (parts.fishAttach(decl, body): the common part, the look's " +
+      "declarations, main() with the pose read first, then the look's body, which calls fishWorld(); #47's predator faces)", ["fish.world", "fish.pose"]),
     "app.body.vs": C("vs", "the appearance fish's body and barbels (appearanceShaders: vs)", ["app.world", "app.vs.decl", "app.pose", "app.rest", "app.varyings"]),
     "app.body.fs": C("fs", "their fragment stage (appearanceShaders: fs)",
-      ["app.fs.lib", "app.fs.decl", "app.surface", "app.lighting", "app.lightMods", "app.eyes", "app.highlights", "app.fog"]),
+      ["app.fs.lib", "app.fs.decl", "app.surface", "app.lighting", "app.lightTerms", "app.water", "app.lightMods", "app.eyes", "app.highlights",
+       "app.fog", "app.emissive"]),
     "app.shadow.vs": C("vs", "their shadow (appearanceShaders: shadowVs, with SHADOW_FS)", ["app.world", "app.pose", "app.rest"])
   };
   Object.keys(PROGRAMS).forEach(function (p) {   /* the contracts agree with the slots (a typo here throws as the module loads) */
@@ -672,7 +699,20 @@
    * functions (prototypes left out), and each function's top-level locals,
    * with the offset of each declaration's statement. A scan of statements
    * (comments and preprocessor lines blanked), not a parser: enough for the
-   * fish programs' GLSL, whose declarations it finds all of. */
+   * fish programs' GLSL, whose declarations it finds all of. The subset a
+   * feature keeps to, for the checks to hold:
+   *   - no overloads: a function a feature defines under a name the program
+   *     (or another feature) has is a collision, whatever its parameters
+   *   - no declarations under #if / #ifdef: preprocessor lines are blanked,
+   *     so both branches' declarations count (a false collision), and a
+   *     #define is neither expanded nor seen as a declaration
+   *   - three's own declarations (its prefix: position, modelMatrix,
+   *     projectionMatrix, cameraPosition, ...) are not in the source: a
+   *     feature redeclaring one is not caught here (the compile fails)
+   *   - a struct's declarators (struct S { ... } s;) are not seen; declare
+   *     the struct, then its variables
+   *   - a slot's must is a name, not its kind: "float murky" passes as well
+   *     as "vec3 murky" (the compile says which is wrong) */
   var GLSL_TYPE = /^(?:void|bool|int|uint|float|[biu]?vec[234]|mat[234](?:x[234])?|[iu]?sampler(?:2D|3D|Cube|2DArray)(?:Shadow)?)$/;
   var DECL = /^((?:(?:uniform|attribute|varying|flat|smooth|centroid|const|in|out|highp|mediump|lowp|invariant)\s+)*)([A-Za-z_]\w*)\s+([\s\S]+)$/;
   /** @param {string} src @returns {ShaderDeclaration[]} */
@@ -777,7 +817,6 @@
       if (!Array.isArray(targets) || !targets.length) throw err("feature " + id + " has no targets");
       targets.forEach(function (t) {
         if (!hasOwn.call(PROGRAMS, t)) throw err("feature " + id + ": unsupported target " + t + " (the programs with slots: " + Object.keys(PROGRAMS).join(", ") + ")");
-        if (PROGRAMS[t].abi !== spec.abi) throw err("feature " + id + ": unsupported target " + t + " (its ABI is " + PROGRAMS[t].abi + ")");
       });
       var append = spec.append || {}, replace = spec.replace || {}, n = 0;
       /** @param {"append" | "replace"} kind @param {Object<string, ShaderText>} map */
@@ -832,10 +871,16 @@
       on.sort(byOrder);
       /** @param {ShaderFeature} f @param {string} s @param {ShaderText} v */
       function text(f, s, v) {
-        var t = typeof v === "function" ? v(env || {}) : v;
+        var t = v;
+        if (typeof v === "function") {
+          try { t = v(env || {}); }
+          catch (e) { throw err(name + ": " + f.id + "'s text for " + s + " threw: " + (e && e.message || e)); }
+        }
         if (typeof t !== "string") throw err(name + ": " + f.id + "'s text for " + s + " is not GLSL");
         return t;
       }
+      /** a feature's piece ("" adds no line) @param {AsmPiece} p */
+      function add(p) { if (p.text !== "" || !p.by) pieces.push(p); }
       /** @type {AsmPiece[]} */
       var pieces = [];
       parts.forEach(function (x) {
@@ -843,9 +888,12 @@
         if (typeof x === "string") { pieces.push({ text: x, by: "", slot: "", replaces: false }); return; }
         var s = x.slot, rep = on.filter(function (f) { return hasOwn.call(f.replace, s); });
         if (rep.length > 1) throw err(name + ": " + s + " has " + rep.length + " providers (" + rep.map(function (f) { return f.id; }).join(", ") + "); a replacement slot takes one");
-        if (rep.length) pieces.push({ text: text(rep[0], s, rep[0].replace[s]), by: rep[0].id, slot: s, replaces: true });
-        else if (x.fallback !== null) pieces.push({ text: x.fallback, by: "", slot: s, replaces: false });
-        on.forEach(function (f) { if (hasOwn.call(f.append, s)) pieces.push({ text: text(f, s, f.append[s]), by: f.id, slot: s, replaces: false }); });
+        if (rep.length) {
+          var t = text(rep[0], s, rep[0].replace[s]);
+          if (t === "" && SLOTS[s].must.length) throw err(name + ": " + rep[0].id + "'s " + s + " is empty: it does not declare " + SLOTS[s].must.join(", "));
+          add({ text: t, by: rep[0].id, slot: s, replaces: true });
+        } else if (x.fallback !== null) pieces.push({ text: x.fallback, by: "", slot: s, replaces: false });
+        on.forEach(function (f) { if (hasOwn.call(f.append, s)) add({ text: text(f, s, f.append[s]), by: f.id, slot: s, replaces: false }); });
       });
       if (on.length) checkDecls(name, pieces);
       return pieces.map(function (p) { return p.text; }).join("\n");
@@ -976,18 +1024,16 @@
     "  if (bk > 0.0) {",
     "    clear = (clear + add) * (1.0 + 0.2 * max(dot(N, -uBeamDir), 0.0));",        /* the beam's own light on the side facing it */
     "    murky = mix(murky, clear, bk);",
-    "  }",
-    "  gl_FragColor = vec4(murky, 1.0);",
-    "}"
+    "  }"
   ];
+  var FRAG_OUT = ["  gl_FragColor = vec4(murky, 1.0);", "}"];
   var FISH_LIGHT = lines([
     "  float diff = max(dot(N, uLight), 0.0);",
     RIM,
     "  vec3 col = lit(baseOf(uBack), ambOf(N.y), diff, rim);",
     BEAM_AT,
     /* in the flashlight's clear light: the true colours, the same in any water */
-    "  vec3 clear = bk > 0.0 ? lit(baseOf(BACK_TRUE), ambTrue(N.y), diff, rim) : col;",
-    WATER
+    "  vec3 clear = bk > 0.0 ? lit(baseOf(BACK_TRUE), ambTrue(N.y), diff, rim) : col;"
   ]);
   var FISH_EYES = lines([
     "  if (vPart > 1.5) {",                                                            /* eyes */
@@ -1021,6 +1067,8 @@
       "void main() {"
     ].concat(FACET, [
       slot("fish.lighting", FISH_LIGHT),
+      slot("fish.lightTerms", null),
+      slot("fish.water", WATER),
       slot("fish.lightMods", null),
       "  vec3 ember = vec3(1.0, 0.38, 0.16) * (0.8 + 0.2 * sin(uTime * 6.0));",
       "  vec3 add = vec3(0.0);",
@@ -1028,7 +1076,15 @@
       slot("fish.highlights", HIGHLIGHT),
       "  col += add;",
       slot("fish.fog", FOG_AT)
-    ], BEAM_MIX);
+    ], BEAM_MIX, [slot("fish.emissive", null)], FRAG_OUT);
+  }
+  /** a pass a look owns on the legacy fish's / predators' instances (#47's predator faces): the vertex
+   * stages' common part, the look's declarations (decl: attributes, varyings), main() with the swim pose
+   * read first (fish.pose: the polish's iPose = poseOf(iX.y)), then the look's body (body: main()'s lines,
+   * which call fishWorld()). program("fish.attach.vs", parts, the kind's features) poses it as its kind.
+   * @param {string} decl @param {string} body @returns {ShaderPart[]} */
+  function fishAttachParts(decl, body) {
+    return fishCoreParts().concat([decl, "void main() {", slot("fish.pose", null), body, "}"]);
   }
 
   /* ---- the appearance genome's fish (web/ocean_appearance.js: EvoAppearance) ----
@@ -1193,8 +1249,7 @@
     "  vec3 col = lit(base, ambOf(N.y), diff, rim);",
     BEAM_AT,
     /* in the flashlight's clear light: the true colours, the same in any water (the skin never sees the water) */
-    "  vec3 clear = bk > 0.0 ? lit(uColourBy > 0.5 ? colourBase(fin, oyL, BACK_TRUE) : base, ambTrue(N.y), diff, rim) : col;",
-    WATER
+    "  vec3 clear = bk > 0.0 ? lit(uColourBy > 0.5 ? colourBase(fin, oyL, BACK_TRUE) : base, ambTrue(N.y), diff, rim) : col;"
   ]);
   var APP_EYES = lines([
     "  if (fin == 4) {",
@@ -1243,6 +1298,8 @@
       slot("app.surface", null)
     ].concat(FACET, [
       slot("app.lighting", APP_LIGHT),
+      slot("app.lightTerms", null),
+      slot("app.water", WATER),
       slot("app.lightMods", null),
       "  vec3 add = vec3(0.0);",
       "  float vSel = vPart.z;",
@@ -1250,7 +1307,7 @@
       slot("app.highlights", HIGHLIGHT),
       "  col += add;",
       slot("app.fog", FOG_AT)
-    ], BEAM_MIX);
+    ], BEAM_MIX, [slot("app.emissive", null)], FRAG_OUT);
   }
 
   /* ---- the swim polish, a feature in two modes ----
@@ -1261,7 +1318,16 @@
    * light (POLISH_FN; its terms in the lighting, which it replaces, so a look
    * that replaces the lighting too is refused while the full polish is on:
    * one provider). Plain is neither. Every text here is the polished
-   * variants' as they were drawn before the slots, byte for byte. */
+   * variants' as they were drawn before the slots, byte for byte, which is
+   * why the light terms stay inside the lighting: the wrapped diffuse and the
+   * terms added inside the lit colour's expression (lit(...) + polishOn(...)
+   * + sheen) cannot move to *.lightTerms without changing the bytes (and the
+   * rounding); that move, which would let a look's lighting keep them, is a
+   * look change of its own. The passes each mode targets: lite, every
+   * vertex stage the scene poses (the bodies, the shadows, a look's attached
+   * pass); full, the bodies' stages, the legacy shadow (shadowVs(true), as
+   * main built it; the scene draws the lite shadow) and a look's attached
+   * pass, not the appearance shadow (always lite). */
   var POLISH = Object.freeze({ lite: "swimPolish.lite", full: "swimPolish.full" });
   var POLISH_VARY = "flat varying float vPw; varying float vCaus;";   /* the size weight, the caustic light */
   var POLISH_OUT = "  vPw = iPose.w; vCaus = causOf(w);";
@@ -1319,8 +1385,7 @@
     "  vec3 col = lit(b, ambOf(N.y), diff, rim) + polishOn(b, pk);",
     BEAM_AT,
     "  vec3 clear = col;",
-    "  if (bk > 0.0) { vec3 bt = baseOf(BACK_TRUE); clear = lit(bt, ambTrue(N.y), diff, rim) + polishOn(bt, pk); }",
-    WATER
+    "  if (bk > 0.0) { vec3 bt = baseOf(BACK_TRUE); clear = lit(bt, ambTrue(N.y), diff, rim) + polishOn(bt, pk); }"
   ]);
   /* the polish's thinness (POLISH_FN): the fins 1, the barbels .6, the
    * peduncle a little, the body and eyes 0 */
@@ -1349,8 +1414,7 @@
     "  if (bk > 0.0) {",
     "    vec3 bt = uColourBy > 0.5 ? colourBase(fin, oyL, BACK_TRUE) : base;",
     "    clear = lit(bt, ambTrue(N.y), diff, rim) + polishOn(bt, pk) + sheen;",
-    "  }",
-    WATER
+    "  }"
   ]);
   /** the swim polish in one of its modes, as a feature (registered in the module's own assembler below; a
    * fresh assembler registers it from here) @param {"lite" | "full"} mode @returns {ShaderFeatureSpec} */
@@ -1374,8 +1438,8 @@
       replace["app.lighting"] = POLISH_APP_LIGHT;
     }
     return { id: F ? POLISH.full : POLISH.lite, abi: ABI, append: append, replace: replace,
-             targets: F ? ["fish.vs", "fish.fs", "fish.shadow.vs", "app.body.vs", "app.body.fs", "app.shadow.vs"]
-                        : ["fish.vs", "fish.shadow.vs", "app.body.vs", "app.shadow.vs"] };
+             targets: F ? ["fish.vs", "fish.fs", "fish.shadow.vs", "fish.attach.vs", "app.body.vs", "app.body.fs"]
+                        : ["fish.vs", "fish.shadow.vs", "fish.attach.vs", "app.body.vs", "app.shadow.vs"] };
   }
   A0.feature(polishFeature("lite"));
   A0.feature(polishFeature("full"));
@@ -1494,7 +1558,7 @@
     DECODE_CALL: DECODE_CALL, glslF: glslF, appearanceShaders: appearanceShaders, appCore: appCore,
     ABI: ABI, SLOTS: SLOTS, PROGRAMS: PROGRAMS, slot: slot, declarations: declarations,
     feature: A0.feature, program: A0.program, core: A0.core, features: A0.features, assembler: assembler,
-    parts: Object.freeze({ fishCore: fishCoreParts, fishVs: fishVsParts, fishFs: fishFsParts, shadowVs: shadowVsParts,
+    parts: Object.freeze({ fishCore: fishCoreParts, fishVs: fishVsParts, fishFs: fishFsParts, shadowVs: shadowVsParts, fishAttach: fishAttachParts,
                            appCore: appCoreParts, appBodyVs: appBodyVsParts, appBodyFs: appBodyFsParts, appShadowVs: appShadowVsParts }),
     POLISH: POLISH, polishFeature: polishFeature
   };
