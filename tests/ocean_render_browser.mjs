@@ -46,10 +46,10 @@
 //   noperf       web/ocean_perf.js blocked (a normal link, ?renderBench=1):
 //                the page starts and draws with no other error
 //   missing      a script the 3-D scene needs blocked (ocean_shaders.js,
-//                ocean_pose.js, both, ocean_scene_parity.js, or ocean_scene.js
-//                itself): the page stops, and its splash names the file, with
-//                no other error; one of the first three throwing as it loads:
-//                its splash says it failed to run
+//                ocean_pose.js, both, ocean_materials.js, ocean_scene_parity.js,
+//                or ocean_scene.js itself): the page stops, and its splash names
+//                the file, with no other error; one of the first four throwing as
+//                it loads: its splash says it failed to run
 //   faults       each planted fault must be caught (and compile and run):
 //                the texture lookup (row0, nextRow, slot) and vPart.w in both
 //                vertex reports; the slot selector on the draw index again
@@ -266,8 +266,8 @@ async function manifestOf(page, label, extra = {}) {
   return Object.assign({ label, base: BASE, launchArgs: LAUNCH_ARGS, headless: !HEADED, playwright: require(PW + "/package.json").version,
     hashes: { "web/evo_ocean.wasm": sha("web/evo_ocean.wasm"), "web/ocean_scene.js": sha("web/ocean_scene.js"), "web/ocean_perf.js": sha("web/ocean_perf.js"),
               "web/ocean_appearance_slots.js": sha("web/ocean_appearance_slots.js"), "web/ocean_shaders.js": sha("web/ocean_shaders.js"),
-              "web/ocean_pose.js": sha("web/ocean_pose.js"), "web/ocean_scene_parity.js": sha("web/ocean_scene_parity.js"),
-              "web/ocean.js": sha("web/ocean.js"), "web/vendor/three.bundle.min.js": sha("web/vendor/three.bundle.min.js") },
+              "web/ocean_pose.js": sha("web/ocean_pose.js"), "web/ocean_materials.js": sha("web/ocean_materials.js"),
+              "web/ocean_scene_parity.js": sha("web/ocean_scene_parity.js"), "web/ocean.js": sha("web/ocean.js"), "web/vendor/three.bundle.min.js": sha("web/vendor/three.bundle.min.js") },
     host: { platform: process.platform, cpus: os.cpus().length, cpuModel: os.cpus()[0] && os.cpus()[0].model, totalMemGB: Math.round(os.totalmem() / 1e9) },
     info }, extra);
 }
@@ -742,14 +742,14 @@ async function partNoPerf() {
 }
 
 /* ---------------- a script the scene needs, missing ---------------- */
-/* web/ocean_shaders.js, web/ocean_pose.js, both, web/ocean_scene_parity.js or
- * web/ocean_scene.js itself blocked (a route abort): the page does not start,
- * and its splash names the file (the scene's EvoOceanSceneMissing; without the
- * scene, ocean_scene.js). Then each of the first three throwing as it loads:
- * the splash says it failed to run */
+/* web/ocean_shaders.js, web/ocean_pose.js, both, web/ocean_materials.js,
+ * web/ocean_scene_parity.js or web/ocean_scene.js itself blocked (a route
+ * abort): the page does not start, and its splash names the file (the scene's
+ * EvoOceanSceneMissing; without the scene, ocean_scene.js). Then each of the
+ * first four throwing as it loads: the splash says it failed to run */
 async function partMissing() {
   console.log("== a script the 3-D scene needs, missing (blocked): the splash names it");
-  for (const files of [["ocean_shaders"], ["ocean_pose"], ["ocean_shaders", "ocean_pose"], ["ocean_scene_parity"], ["ocean_scene"]]) {
+  for (const files of [["ocean_shaders"], ["ocean_pose"], ["ocean_shaders", "ocean_pose"], ["ocean_materials"], ["ocean_scene_parity"], ["ocean_scene"]]) {
     const label = "missing-" + files.join("+");
     const L = await launch(label);
     let blocked = 0;
@@ -771,7 +771,7 @@ async function partMissing() {
   /* a script that loads but throws as it runs (its own text served, a throw
    * planted just before it registers its namespace): the splash says it failed
    * to run, not that it is missing */
-  const NS = { ocean_shaders: "EvoOceanShaders", ocean_pose: "EvoOceanPose", ocean_scene_parity: "EvoOceanSceneParity" };
+  const NS = { ocean_shaders: "EvoOceanShaders", ocean_pose: "EvoOceanPose", ocean_materials: "EvoOceanMaterials", ocean_scene_parity: "EvoOceanSceneParity" };
   for (const f of Object.keys(NS)) {
     const label = "throws-" + f;
     const L = await launch(label);
