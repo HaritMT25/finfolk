@@ -41,6 +41,16 @@ jobs:
       - run: npm ci --no-audit --no-fund
       - run: npx --no-install tsc -p tsconfig.json
 
+  # The fish programs' named slots and their assembler (web/ocean_shaders.js: program, feature, SLOTS):
+  # the source-level contract, each assembly error with a planted mistake, the appends' order, and the
+  # swim polish as a feature. Node only (the runner image's own), no browser, no GLSL compiler.
+  web-shader-slots:
+    name: web shader slots (node)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - run: node tests/ocean_shader_slots_tests.cjs
+
   # tools/gate_receipts.*: fault suite on temp repos and fake tools (no Emscripten, no gate reuse in CI).
   receipts:
     name: gate receipts (fault suite)

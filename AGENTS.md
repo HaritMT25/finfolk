@@ -22,14 +22,16 @@ the site is static three.js/JS in `web/` (no JS build step). Python tools run ex
   (from `wasm/build_*.sh`), `vendor/three.bundle.min.js` (from `tools/three_bundle/build.sh`).
   Hand-written: `ocean.html` (Ocean page), `index.html` (Classic), `ocean.js`, `ocean_scene.js`,
   `ocean_shaders.js` (the scene's GLSL: shared chunks, the environment's programs, the fish programs in their
-  swim-polish variants), `ocean_pose.js` (the swim pose on the CPU: size weight, packing, reach),
+  swim-polish variants, assembled from named slots: `SLOTS`, `PROGRAMS`, `program`, `feature`; a fish shader
+  change goes in a slot or a feature, never in a text splice), `ocean_pose.js` (the swim pose on the CPU: size weight, packing, reach),
   `ocean_scene_parity.js` (the scene's diagnostics: the appearance checks against the CPU mirror),
   `ocean_config.js`, `ocean_handoff.js`, `ocean_worker.js` (Turbo), `ocean_dash.js`, `dashboard.js`, `charts.js`.
   A new page script is listed in `ocean.html` and published by `wasm/build_site.sh` (its asserted rewrites).
   Plain `<script>` IIFEs, each registering one `window.Evo*` namespace (no bundler); `types.d.ts` declares
   their shared shapes and globals for the type check (`tsconfig.json`), and is never loaded by a page.
 - `tests/` `core_tests.cpp`, `ocean_tests.cpp` (+ `ocean_*_tests.hpp`), `ocean_turbo_handoff.js`,
-  `ocean_render_browser.mjs`, `ocean_baseline/` (committed fingerprints), `fixtures/`, `*.sh` end-to-end tests.
+  `ocean_shader_slots_tests.cjs`, `ocean_render_browser.mjs`, `ocean_baseline/` (committed fingerprints), `fixtures/`,
+  `*.sh` end-to-end tests.
 - `tools/` `ocean_parity_driver.cpp` + `ocean_fingerprint.hpp` (the parity harness), `ocean_eye_*`,
   `gen_planes*.{cpp,sh}` (regenerate plane headers), `invasion/` (invasion-matrix study: plan/run/score/analyze),
   `alife2027/` (ALIFE 2027 study runner: plan/run/analyze), `three_bundle/`.
@@ -96,6 +98,10 @@ Memory is tight on the maintainer's PC: use `JOBS`/`BUILD_JOBS`, `nice -n 19`, a
 - `build_ocean.sh` / `build_wasm.sh` then `git diff --quiet -- web/` (exit 0 = unchanged; CI also uses `git diff --quiet -- web/evo_ocean.js web/evo_ocean.wasm`
   for the Ocean): the rebuilt committed modules match their sources. If `web/` shows changes, the modules were stale.
 - `node tests/ocean_turbo_handoff.js`: Turbo hand-off, exit 0 = pass.
+- `node tests/ocean_shader_slots_tests.cjs`: the fish programs' slot contract (`web/ocean_shaders.js`): with no
+  feature each program is the plain one; the swim polish's feature gives the lite / full variants; every assembly
+  error (slots, targets, ABI, providers, declaration collisions) with a planted mistake; the appends' order.
+  Source-level only: a shader change still needs the browser's compile (`ocean_render_browser.mjs`).
 - `npm ci && npx tsc -p tsconfig.json`: the web type check (exit 0 = pass; `package.json` pins TypeScript,
   `package-lock.json` the exact tree, development only): `tsc --checkJs` over the
   files `tsconfig.json` lists that carry `// @ts-check`, against `web/types.d.ts`. A new or extracted web module
@@ -105,7 +111,8 @@ Memory is tight on the maintainer's PC: use `JOBS`/`BUILD_JOBS`, `nice -n 19`, a
 - Classic sha pin: any `src/core` change changes the Classic wasm; the committed `web/evo_boids*.wasm` hashes are
   pinned by the maintainer (a change needs a rebuild and an explicit decision).
 - CI jobs: `native` (3 variants), `wasm` (build, freshness, `parity.sh`, `build_site.sh`), `ocean` (freshness,
-  turbo hand-off, FAST parity, `app_live_s21` twin), `web-types` (the type check), `receipts`.
+  turbo hand-off, FAST parity, `app_live_s21` twin), `web-types` (the type check), `web-shader-slots` (the slot
+  contract), `receipts`.
 
 - Gate receipts (`tools/gate_receipts.sh`, `docs/gate_receipts.md`): a local, never-CI speed-up that skips re-running a
   gate whose whole tracked tree, command, environment and toolchain are unchanged. Receipts never replace a gate in CI,
