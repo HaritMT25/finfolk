@@ -28,6 +28,7 @@
     "web/ocean_appearance.js",
     "web/ocean_shaders.js",
     "web/ocean_pose.js",
+    "web/ocean_materials.js",
     "web/ocean_scene_parity.js"
   ]
 }
