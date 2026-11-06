@@ -183,6 +183,13 @@ if(SFML_FOUND AND EVO_NO_OPENMP AND NOT EVO_POOL_THREADS)
         add_test(NAME invasion_tooling
                  COMMAND bash ${CMAKE_SOURCE_DIR}/tests/invasion_tooling.sh
                          $<TARGET_FILE:evo_boids> ${CMAKE_CURRENT_BINARY_DIR}/invasion_tooling_work)
+        # redqueen_tooling — tools/redqueen (the Stage C checkpoint adapter, the
+        # common-environment prey checkpoint, plan + runner with 10 workers, the
+        # chunked store, determinism, kills and replay) against the real engine.
+        add_test(NAME redqueen_tooling
+                 COMMAND bash ${CMAKE_SOURCE_DIR}/tests/redqueen_tooling.sh
+                         $<TARGET_FILE:evo_boids> ${CMAKE_CURRENT_BINARY_DIR}/redqueen_tooling_work)
+        set_tests_properties(redqueen_tooling PROPERTIES ENVIRONMENT "PYTHON=${Python3_EXECUTABLE}")
     endif()
 endif()
 
