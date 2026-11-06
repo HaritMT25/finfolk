@@ -384,6 +384,22 @@
      * one per range or one for the whole texture; bytes), kept with or without
      * a profiler: the live-texture probe asserts it caused none */
     var geneIO = { uploads: 0, calls: 0, bytes: 0, allocs: 0, rowChanges: 0, full: { storage: 0, bytes: 0, ranges: 0, policy: 0 } };
+    /* the fish's body scale (opts.bodyScale: the page's size law; 1 without) */
+    var bodyScale = opts.bodyScale || function () { return 1; };
+    /* The probes (web/ocean_scene_parity.js attach, which says what each
+     * checks): appearanceParity, appearanceTextureParity and its queue (probes:
+     * runProbes right after a production draw, render; failProbes when there
+     * is none), testFaults (holdGeneUploads: AppKind's gene upload). Attached
+     * here, beside the counters they read, before anything that reads them is
+     * made (attach makes no three object). They read this renderer and what
+     * it drew through these live getters, never copies, and upload nothing */
+    var parity = PARITY.attach({
+      THREE: THREE, renderer: renderer, profiler: profiler, geneIO: geneIO, bodyScale: bodyScale,
+      ea: function () { return EA; }, status: function () { return appStatus; },
+      appKind: function () { return appKind; }, drawn: function () { return appDrawn; }
+    });
+    var testFaults = parity.testFaults, probes = parity.probes, failProbes = parity.failProbes, runProbes = parity.runProbes;
+    var appearanceParity = parity.appearanceParity, appearanceTextureParity = parity.appearanceTextureParity;
     /* the shaders write sRGB as-is, but three colour-manages the clear colour:
      * hand it over as sRGB ("srgb" = THREE.SRGBColorSpace) so the water above
      * the horizon (seen from a low camera) is the fog colour, not a pale teal */
@@ -1419,7 +1435,6 @@
     }
 
     /* ---------------- per-frame packing ---------------- */
-    var bodyScale = opts.bodyScale || function () { return 1; };
     /* per-instance swim height: -depth when the snapshot has depths (s.depth),
      * else keyed off the fish id as in the shallow tank */
     var heights = null;
@@ -1994,19 +2009,6 @@
       causticReady = true;
     }, { timeout: 1200 });
 
-    /* The probes (web/ocean_scene_parity.js attach, which says what each
-     * checks): appearanceParity, appearanceTextureParity and its queue (probes:
-     * runProbes right after a production draw, render; failProbes when there
-     * is none), testFaults (holdGeneUploads: the gene upload above). They read
-     * this renderer and what it drew through these live getters, never copies,
-     * and upload nothing */
-    var parity = PARITY.attach({
-      THREE: THREE, renderer: renderer, profiler: profiler, geneIO: geneIO, bodyScale: bodyScale,
-      ea: function () { return EA; }, status: function () { return appStatus; },
-      appKind: function () { return appKind; }, drawn: function () { return appDrawn; }
-    });
-    var testFaults = parity.testFaults, probes = parity.probes, failProbes = parity.failProbes, runProbes = parity.runProbes;
-    var appearanceParity = parity.appearanceParity, appearanceTextureParity = parity.appearanceTextureParity;
     function contextInfo() {
       var gl = renderer.getContext(), d = gl.getExtension("WEBGL_debug_renderer_info");
       return { version: gl.getParameter(gl.VERSION), glsl: gl.getParameter(gl.SHADING_LANGUAGE_VERSION),
