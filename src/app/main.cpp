@@ -514,6 +514,11 @@ int main(int argc, char** argv) {
             std::cerr << "!! cannot resume from '" << loadCheckpoint << "': " << err << "\n";
             return 1;
         }
+        // A checkpoint's format version decides whether its predators have
+        // brains (checkpoint_io.hpp); say so rather than drop the flag quietly.
+        if (cfg.predatorBrain && !world.cfg.predatorBrain && !transplantMode)
+            std::cerr << "Note: --predator-brain is ignored: this checkpoint's predators have no genomes.\n"
+                         "      Give a world brains with --predators-from random --transplant-out FILE.\n";
         std::cout << "Resumed from " << loadCheckpoint
                   << " at frame " << world.frame
                   << " (" << world.creatures.size() << " creatures, "
