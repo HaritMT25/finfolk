@@ -4,7 +4,8 @@
 // materials and geometry) and a recording stand-in for WebGLRenderer. The scene is created and driven through a scripted
 // session (#58's): appearance snapshots in a whole-tank view, close up (fish lit: the full programs once their prewarm
 // compiled), the hold back to plain, the lit fish's split, the polish off / on, detail 1 / 3, the skin, legacy snapshots,
-// predators close, the legacy fish and predators whole, and back. Each frame the recorder emulates three's render list
+// predators close, the legacy fish and predators whole, back, then a panel's inset two ways (the view offset moves the
+// frustum's side planes) and none. Each frame the recorder emulates three's render list
 // (opaque by renderOrder, material id, then depth as three takes it: the geometry's bounding-sphere centre through
 // matrixWorld and the projection; transparent by renderOrder, depth, object id) and records, draw by draw: the object (its
 // place in the scene), the material by source text (sha256 of each stage), its options and uniforms (names and values),
@@ -16,13 +17,16 @@
 //      strings (FISH_VS / FISH_FS / SHADOW_VS / SHADOW_FS, appearanceShaders, litSkip)
 //   2. the session's recording against its committed sha256 (GOLDEN): any change in what the scene draws, in what order,
 //      with what uniforms, what it uploads or compiles, shows here (an intended one updates GOLDEN, its reason in the commit)
-//   3. planted: the appearance kind, or the legacy kinds, binding the variant a frame late: the recording differs
-//   4. a WebGL context loss during the polished programs' prewarm (#50's review, P2): a compile started before the loss,
+//   3. planted: the appearance kind, or the legacy kinds, binding the variant a frame late; a second writer of .material;
+//      the side planes never recomputed (the inset steps): each is seen
+//   4. a WebGL context loss and the polished programs' prewarm (#50's review, P2): a compile started before the loss,
 //      finishing after the restore (or the old 5 s fallback running out while the context was lost), never lets a kind
-//      draw its polished programs in the restored context before a prewarm there has compiled them; and a feature set's
-//      activation the loss overtook is refused
+//      draw its polished programs in the restored context before a prewarm there has compiled them; a prewarm finished
+//      before the loss counts for nothing after the restore (planted: main's readiness, which outlives it, is seen); a
+//      feature set's activation the loss overtook is refused; a prewarm past its budget is asked again (planted: not)
+//   5. the diagnostics before bind() (step 3's review)
 //   --against OLD_WEB: both sides' sessions, frame by frame (the structure PRs' identity proof against main's web/)
-//   --web DIR: another web/ (main's, to see check 4 fail on it)
+//   --web DIR: another web/ (main's, to see checks 4 and 5 fail on it)
 import fs from "node:fs";
 import path from "node:path";
 import vm from "node:vm";
@@ -36,9 +40,16 @@ const WEB = path.resolve(opt("--web") || path.join(HERE, "..", "web"));
 const AGAINST = opt("--against") ? path.resolve(opt("--against")) : null;
 const OUTF = opt("--frames-out");
 /* the recording of the session on this tree's web/ (sha256 of its frames, 16 hex). It changes only when what the scene draws
- * changes: then the new value goes here, with the reason in the commit */
-const GOLDEN = "06d8477362e68680";
+ * changes: then the new value goes here, with the reason in the commit. ff2f626dc192c801: main f2a16b4's recording of this
+ * session (465 frames: #58's 415 (06d8477362e68680), then the inset steps), the same frame for frame on render-followups1 */
+const GOLDEN = "ff2f626dc192c801";
 const H = (s) => crypto.createHash("sha256").update(s).digest("hex").slice(0, 16);
+/* planted reverts of render-followups1's fixes in web/ocean_scene.js (the review of #59): each must be seen */
+const MUTANTS = {
+  readyOutlives: ["function warm(wm) { return wm.ready === ctxGen; }", "function warm(wm) { return wm.ready >= 0; }"],   /* main's readiness: it outlives a restore */
+  noRetry: ["if (r.timeout) wm.asked = -1;", ""],                                                                         /* a prewarm past its budget never asked again */
+  planesOnce: ["if (p0 === K[0] && p5 === K[1] && p8 === K[2] && p9 === K[3]) return;", "if (K[0] === K[0]) return;"]    /* the side planes never recomputed */
+};
 const SCRIPTS = ["ocean_appearance.js", "ocean_appearance_slots.js", "ocean_shaders.js", "ocean_pose.js", "ocean_materials.js", "ocean_scene_parity.js", "ocean_scene.js"];
 
 let fails = 0, checks = 0;
@@ -225,6 +236,11 @@ async function side(web, tag, opts) {
         if (src.split(a).length !== 2) throw new Error("mutant strayWrite: anchor");
         src = src.replace(a, a + ' if (v) self.mesh["mate" + "rial"] = binder.material(name, "body", 0);');
       }
+      if (MUTANTS[opts.mutant]) {
+        const [a, b] = MUTANTS[opts.mutant];
+        if (src.split(a).length !== 2) throw new Error("mutant " + opts.mutant + ": its anchor is not in this web/");
+        src = src.replace(a, b);
+      }
     }
     vm.runInContext(src, ctx, { filename: tag + "/" + f });
   }
@@ -309,6 +325,41 @@ async function side(web, tag, opts) {
     Object.assign(out, { asked, slow, heldBefore: heldBefore.length, restoredAt, seen, actResult, after: rec.compiles.slice(nBefore).length, look: scene.materials ? scene.materials().look : null });
     return out;
   }
+  if (opts.session === "staleReady") {
+    /* check 4 (the review of #59, P2-1): the prewarm FINISHES, the legacy fish drawn full; then the context is lost and
+     * restored with every compile held: until a compile in the restored context finished, plain and not ready */
+    const legacy = World(250, 8, false, 2), seen = [], st = () => scene.polish();
+    for (let i = 0; i < 6; i++) { close(legacy, 3); await frame(legacy, 3); }
+    const before = { variant: st().variant, ready: st().ready };
+    rec.hold = true;
+    fire("webglcontextlost");
+    for (let i = 0; i < 2; i++) { close(legacy, 3); await frame(legacy, 3); }
+    fire("webglcontextrestored");
+    const n0 = rec.compiles.length;
+    const look = (f) => ({ frame: f.n, variant: st().variant, ready: st().ready, done: rec.compiles.slice(n0).filter((c) => c.done).length });
+    for (let i = 0; i < 6; i++) { close(legacy, 3); seen.push(look(await frame(legacy, 3))); }
+    rec.compiles.slice(n0).forEach((c) => { if (!c.done) c.resolve(); });   /* the restored context's prewarm finishes */
+    await settleAll();
+    for (let i = 0; i < 3; i++) { close(legacy, 3); seen.push(look(await frame(legacy, 3))); }
+    Object.assign(out, { before, seen, asked: rec.compiles.length - n0 });
+    return out;
+  }
+  if (opts.session === "timeout") {
+    /* check 4 (the review of #59, P3-1): the prewarm's compile does not finish in its budget (60 s): plain, said once, and a
+     * later frame asks again; once the driver is done, that compile finishes and the polish comes on */
+    const legacy = World(250, 8, false, 2), seen = [], st = () => scene.polish();
+    rec.hold = true;
+    for (let i = 0; i < 3; i++) { close(legacy, 3); await frame(legacy, 3); }
+    const n1 = rec.compiles.length;
+    now += 61000; await runTimers();   /* the budget runs out */
+    for (let i = 0; i < 3; i++) { close(legacy, 3); const f = await frame(legacy, 3); seen.push({ frame: f.n, variant: st().variant, asked: rec.compiles.length }); }
+    const n2 = rec.compiles.length;
+    rec.compiles.forEach((c) => { if (!c.done) c.resolve(); });   /* the driver finishes */
+    await settleAll();
+    for (let i = 0; i < 3; i++) { close(legacy, 3); const f = await frame(legacy, 3); seen.push({ frame: f.n, variant: st().variant, asked: rec.compiles.length }); }
+    Object.assign(out, { n1, n2, seen });
+    return out;
+  }
   const app = World(300, 6, true, 1), legacy = World(250, 8, false, 2);
   for (let i = 0; i < 30; i++) await frame(app);                                   /* whole tank: plain */
   for (let i = 0; i < 60; i++) { close(app, 5); await frame(app, 5); }           /* close: lit, the full programs once warm */
@@ -333,6 +384,12 @@ async function side(web, tag, opts) {
   scene.resetView(false);
   for (let i = 0; i < 40; i++) await frame(legacy);
   for (let i = 0; i < 30; i++) { close(app, 20); await frame(app, 20); }         /* back to the appearance fish */
+  scene.setInsets({ left: 420, right: 0, top: 0, bottom: 160 });                  /* a panel's inset: the view offset moves P8, P9 */
+  for (let i = 0; i < 20; i++) { close(app, 5); await frame(app, 5); }
+  scene.setInsets({ left: 0, right: 380, top: 120, bottom: 0 });
+  for (let i = 0; i < 20; i++) { close(app, 5); await frame(app, 5); }
+  scene.setInsets({});
+  for (let i = 0; i < 10; i++) { close(app, 5); await frame(app, 5); }
   out.final = scene.polish();
   out.materials = scene.materials ? scene.materials() : null;
   return out;
@@ -363,6 +420,15 @@ for (const m of ["lateApp", "lateFish"]) {
   const B = await side(WEB, "mut-stray", { mutant: "strayWrite" });
   ok(B.bad.length > 0, "   planted: a second writer of the legacy bodies' material (plain while bound full): check 1 sees it in " + new Set(B.bad.map((x) => x.frame)).size + " frames", B.bad.slice(0, 1));
 }
+/* a planted revert of this tree's fix: run it, or say its anchor is not here (another web/, say main's) */
+async function planted(mutant, session) {
+  try { return await side(WEB, "mut-" + mutant, { mutant, session }); } catch (e) { return { error: String(e && e.message || e) }; }
+}
+{
+  const B = await planted("planesOnce");
+  const fa = A.frames.map((f) => JSON.stringify(f)), n = B.error ? 0 : fa.filter((x, i) => x !== JSON.stringify(B.frames[i])).length;
+  ok(n > 0, "   planted: the side planes never recomputed (the review of #59, P3-3): " + (B.error || n + " frames differ from the recording (the inset steps)"));
+}
 console.log("== a WebGL context loss during the prewarm (#50's review, P2)");
 {
   const C = await side(WEB, "ctx", { session: "contextLoss" });
@@ -372,6 +438,26 @@ console.log("== a WebGL context loss during the prewarm (#50's review, P2)");
   ok(early.length === 0, "  after the restore, no frame drew the legacy fish's polished programs before a compile in the restored context finished (a lit fish in view)", C.seen);
   ok(C.after >= 1 && C.seen[C.seen.length - 1].variant === "full", "  the restored context's own prewarm asked, and once it finished the polish came back", { after: C.after, last: C.seen[C.seen.length - 1] });
   ok(!C.actResult || (C.actResult.ok === false && C.look === ""), "  a feature set's activation the loss overtook: refused, no Look in effect", { act: C.actResult, look: C.look });
+}
+console.log("== the prewarm finished, then a loss and a restore (the review of #59, P2-1)");
+{
+  const staleOk = (S) => S.before.variant === "full" && S.before.ready === true && S.seen.some((x) => x.done === 0) &&
+                         S.seen.filter((x) => x.done === 0).every((x) => x.variant === "plain" && x.ready === false);
+  const S = await side(WEB, "stale", { session: "staleReady" });
+  ok(S.before.variant === "full" && S.before.ready === true, "before the loss: compiled ahead, the full programs drawn", S.before);
+  ok(staleOk(S), "  after the restore: the plain programs, and not ready, until the restored context's own compile finished (" + S.seen.filter((x) => x.done === 0).length + " frames)", S.seen);
+  ok(S.asked >= 1 && S.seen[S.seen.length - 1].variant === "full" && S.seen[S.seen.length - 1].ready === true, "  the restored context's prewarm asked; full and ready once it finished", { asked: S.asked, last: S.seen[S.seen.length - 1] });
+  const M = await planted("readyOutlives", "staleReady");
+  ok(!M.error && !staleOk(M), "  planted: main's readiness (outliving the restore) is seen: " + (M.error || JSON.stringify(M.seen && M.seen[0])));
+}
+console.log("== a prewarm past its budget (the review of #59, P3-1)");
+{
+  const timeoutOk = (T) => T.seen.slice(0, 3).every((x) => x.variant === "plain") && T.n2 > T.n1 && T.seen[T.seen.length - 1].variant === "full";
+  const T = await side(WEB, "timeout", { session: "timeout" });
+  ok(timeoutOk(T) && T.logs.length === 1 && /did not finish in 60 s.*drawn plain until they are/.test(T.logs[0]),
+     "the budget ran out: plain, said once, asked again by a later frame (" + T.n1 + " -> " + T.n2 + " compiles); full once the driver finished", { seen: T.seen, logs: T.logs });
+  const M = await planted("noRetry", "timeout");
+  ok(!M.error && !timeoutOk(M), "  planted: never asked again is seen: " + (M.error || JSON.stringify(M.seen && M.seen[M.seen.length - 1])));
 }
 console.log("== the diagnostics bound first (web/ocean_scene_parity.js; step 3's review)");
 {
@@ -387,8 +473,10 @@ console.log("== the diagnostics bound first (web/ocean_scene_parity.js; step 3's
   const rp = await run("path", () => P.appearancePathCheck(null, EA));
   const at = await run("attach", () => P.attach({}));
   const bd = await run("bind", () => P.bind({ GENES_W: 512 }));
+  const bo = await run("bind2", () => P.bind({ GENES_W: 512, genesRows() { return 1; }, packGenes() {}, capFor() { return 32; } }));
   const unbound = (r) => !!r && /bind\(\) has not run/.test(r.error || "") && r.ok !== true;
-  ok(unbound(rv) && unbound(rf) && unbound(rp) && at === null && /attach/.test(said[3][0]) && /bind\(\) has not run/.test(said[3][1]) && bd === null && /genesRows \(a function\) is missing/.test(said[4][1]),
+  ok(unbound(rv) && unbound(rf) && unbound(rp) && at === null && /attach/.test(said[3][0]) && /bind\(\) has not run/.test(said[3][1]) && bd === null && /genesRows \(a function\) is missing/.test(said[4][1]) &&
+     bo === null && /CLARITY \(an object\) is missing/.test(said[5][1]),
      "before bind(): each check's report says it could not run (never a pass), attach() refuses, and a bind() short of a member names it", said);
 }
 if (AGAINST) {

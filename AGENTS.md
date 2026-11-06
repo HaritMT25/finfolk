@@ -112,7 +112,8 @@ Memory is tight on the maintainer's PC: use `JOBS`/`BUILD_JOBS`, `nice -n 19`, a
   stand-in for the renderer) through a scripted session: every frame each fish mesh draws its bound variant's programs;
   the whole recording (draws in three's order, uploads, programs, counters) against its committed sha256 (`GOLDEN`:
   an intended change to what the scene draws updates it, with the reason); a context loss during the polish's prewarm.
-  `--against OLD_WEB` compares two `web/` trees frame by frame (a refactor's identity proof).
+  `--against OLD_WEB` compares two `web/` trees frame by frame (a refactor's identity proof). Node 20.19 or later (it
+  imports the ES-module three bundle by syntax detection; CI pins 20.x).
 - `npm ci && npx tsc -p tsconfig.json`: the web type check (exit 0 = pass; `package.json` pins TypeScript,
   `package-lock.json` the exact tree, development only): `tsc --checkJs` over the
   files `tsconfig.json` lists that carry `// @ts-check`, against `web/types.d.ts`. A new or extracted web module

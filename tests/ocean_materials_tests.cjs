@@ -586,7 +586,7 @@ section("review P3-1: the compile's check (compiler())");
   const p = M.compiler({ THREE: T3, renderer: fakeRenderer(new Map(), { hang: true }), geometry, timers, budgetMs: 60000 })(items([a]));
   timers.last();
   r = await p;
-  ok(!r.ok && /did not finish in 60 s/.test(r.error), "a compile that never finishes: refused at the budget", r);
+  ok(!r.ok && /did not finish in 60 s/.test(r.error) && r.timeout === true, "a compile that never finishes: refused at the budget, as a timeout (the prewarm asks again)", r);
   r = await M.compiler({ THREE: T3, renderer: fakeRenderer(new Map()), geometry, timers, lost: () => true })(items([a]));
   ok(!r.ok && /lost/.test(r.error), "a lost context: refused", r);
   /* the context's generation (#50's review, P2): a compile that a loss overtook (lost and restored, and three's compileAsync,
@@ -610,6 +610,21 @@ section("review P3-1: the compile's check (compiler())");
     release2();
     const rf = await pf;
     ok(!rf.ok && /lost during the compile/.test(rf.error), "  a failing one the loss overtook: refused as lost (not as the restored context's program)", rf);
+    /* the review of #59, P3-2: a lost context's programs read complete, so three's poll can resolve before the loss's event has
+     * run (the generation not moved yet); the context itself says it is lost: refused as lost, not as "did not compile" */
+    let release3 = null;
+    const held3 = fakeRenderer(new Map([[a, prog(true)]]));
+    held3.compileAsync = () => new Promise((res) => { release3 = res; });
+    const gl3 = held3.getContext();
+    let lost3 = false;
+    gl3.isContextLost = function () { if (this !== gl3) throw new TypeError("Illegal invocation"); return lost3; };
+    const p3 = M.compiler({ THREE: T3, renderer: held3, geometry, timers, generation: () => gen })(items([a]));
+    lost3 = true;
+    release3();
+    const r3 = await p3;
+    ok(!r3.ok && /lost during the compile/.test(r3.error), "  a loss whose event has not run yet (the context lost, the generation not moved): refused as lost", r3);
+    const ok5 = await M.compiler({ THREE: T3, renderer: fakeRenderer(new Map([[a, prog(true)]])), geometry, timers, generation: () => gen })(items([a]));
+    ok(ok5.ok && ok5.timeout === undefined, "  a context that is not lost, a generation that did not move: ok (no timeout flag)", ok5);
   }
   /* the default timers against the browser's rule: setTimeout / clearTimeout called with any `this` but the global (or none)
    * throw "Illegal invocation" (node's do not care, so a detached native only failed in the browser: g3 at 33fd919) */
