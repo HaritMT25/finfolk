@@ -339,10 +339,10 @@
       if (kind === "face" && !set.attach) throw err("no attached pass: the faces are a Look's (activate a set with attach.face)");
     }
     /** what a (kind, pass, variant) draws under a set: its features stage by stage (mode "set"; "polish": the swim polish's
-     * only, the faces' fallback; "plain": none), its layout, its key and its share key
+     * only, the faces' fallback; "plain": none), its layout, its key and its share key. The (kind, pass, variant) is one the
+     * set has: its callers asked (use, key, has) or took it from reachable() (prepare, run), or from one asked (fallback)
      * @param {MaterialSet} set @param {string} kind @param {string} pass @param {number} variant @param {string} mode @returns {Described} */
     function describe(set, kind, pass, variant, mode) {
-      asked(set, kind, pass, variant);
       var plain = mode === "plain", noSet = mode === "polish";
       var vs = plain ? [] : featuresOf(set, kind, pass, "vs", variant, noSet), fs = plain ? [] : featuresOf(set, kind, pass, "fs", variant, noSet);
       var lay = set.layouts[KINDS[kind].layout];
@@ -522,6 +522,7 @@
         return u.e.rec.material;
       },
       has: function (kind, pass, variant) {
+        try { asked(active, kind, pass, variant); } catch (x) { return false; }   /* (one it does not have: it has not) */
         var set = setFor(kind), r = resolve(set, kind, pass, variant, "set");
         return !!r.d && assemble(entry(r.d), false);
       },
