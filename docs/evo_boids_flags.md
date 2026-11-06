@@ -386,7 +386,8 @@ operators and network evaluation) but with the predator's own inputs and outputs
   lottery, × `--predator-mutation`). Each predator has an id, a lineage (its founder's id)
   and a parent id. A floor refill is a **random-genome founder of a new lineage**.
 - **Without `--predator-economy`** the brain still runs: a fixed number of immortal neural
-  hunters that never bud (the *frozen* mode a time-shift assay runs in).
+  hunters that never bud, with energy and age not accounted, so their ENERGY and AGE inputs
+  read 0 (the *frozen-newborn* assay below).
 - **Random draws:** the predators' genomes, mutations and noise input come from their own
   stream, seeded by one draw at the end of the world's set-up; every draw Stage B made
   stays where it was. A `--seed` reproduces a run in the serial build, and native == wasm.
@@ -396,9 +397,27 @@ operators and network evaluation) but with the predator's own inputs and outputs
 | `--predator-brain` | off | Neural predators. |
 | `--predator-mutation F` | 1 | Multiplies the per-bud mutation rate. Must be finite and ≥ 0. |
 | `--predator-turn-rate F` | 4 | rad/s at full TURN (the prey's `--max-turn-rate` default). |
-| `--predator-min-speed F` | 0 | THRUST's floor. 0 lets a predator stop and wait (ambush). |
+| `--predator-min-speed F` | 0 | THRUST's floor. 0 lets a predator stop and wait (ambush). Must not exceed `--predator-speed`. |
 | `--predator-primer` | off | Founders start with two pursuit genes (PREY_LR → TURN, PREY_PROX → THRUST) written over their first two genes. Off = random genomes. |
-| `--predator-log` | off | Stream every predator founding (F), floor refill (R), bud (B) and death (S starved, A aged) to `<name>.predlog.csv` (frame, event, id, parent, lineage, generation, age, captures, energy, genome length, traits). Never decimated. |
+| `--predator-log` | off | Stream every predator founding (F), floor refill (R), bud (B) and death (S starved, A aged) to `<name>.predlog.csv` (frame, event, id, parent, lineage, generation, age, captures, energy, genome length, traits, source). Never decimated. See "The lineage log across runs" below. |
+
+**On a resume** the checkpoint decides: a version-2 file has brains and its own Stage C
+settings (as for every other setting, the command line does not override them); a version-1
+file has none, and **any Stage C flag on its resume (`--predator-brain`, `--predator-mutation`,
+`--predator-turn-rate`, `--predator-min-speed`, `--predator-primer`, `--predator-log`) is an
+error (exit 1)**, since it can never be honoured. Give such a world brains with the
+transplant: `--predators-from random --transplant-count K --transplant-out ARENA`.
+
+**The lineage log across runs.** `<name>.predlog.csv` is written to disk at every sample and
+before every checkpoint write, so a run killed after a checkpoint has logged everything up to
+that checkpoint's frame. A run that starts from a checkpoint opens its log with one row per
+live predator: `L` (loaded) or, on an arena's first run, `T` (transplanted; `source` = the
+predator's id in the checkpoint it came from, another id namespace). **An existing predlog is
+never overwritten:** the run refuses to start, so give every run or resumed segment its own
+`--name`. To stitch segment 1 (which ran past or up to frame F) and segment 2 (resumed from
+the checkpoint at frame F): keep segment 1's rows with frame ≤ F, then segment 2's rows
+without its `L` rows. The result is the log of the uninterrupted run (tested in ctest
+`stagec_cli` and `core_tests`).
 
 **The Stage C recipe (an evolving run):** `--predators 6 --predator-economy
 --predator-brain --predator-max-pop N --predator-min-pop 2 --predator-max-age 120` plus a
@@ -428,6 +447,15 @@ recipe with cap 40, floor 2 and max age 120; meal 1.2× and 1.5× of the 8.54 br
 - **What this means for a study:** this arena needs tuning before a long study. A longer life
   or a richer meal would let lineages last; relaxing the prey cap would let predators regulate
   numbers, not only turnover.
+- **Speed.**
+  - The pilot's binary had a slowdown that the review of PR #60 found (P1-1, fixed since): its
+    brain-off prey ran about 1.9× slower in the default builds.
+  - The fixed build ran the pilot's first 300k steps (m15, seed 1) at 1,411 steps/s on one core,
+    with output bit-identical to the pilot's. That puts 200M steps at **≈ 39 h per replicate**
+    on one core of the maintainer's laptop.
+  - With the brain off, the fixed build is as fast as v0.26.0 (A/B within ±1 % in the serial,
+    OpenMP and serial-fast builds). Neural predators cost about +5 % per step over scripted
+    ones at 40 predators.
 
 **Outputs with the brain on** (the main CSV is unchanged):
 
@@ -461,18 +489,39 @@ recipe with cap 40, floor 2 and max age 120; meal 1.2× and 1.5× of the 8.54 br
   the frame (and with it the food cycle's phase), counters, the random stream, the config.
   X's predators are dropped.
 - **From Y**: K predators sampled with `--transplant-seed` (all of them by default; with
-  replacement if K > |Y|), carrying only their genome, lineage, generation and traits.
-  `--predators-from random` makes K random-genome founders instead (how to start Stage C on
-  an evolved prey world).
-- **Reset**: energy (newborn), age, digest, captures, speed (top), recurrent outputs (0.5),
-  ids (fresh; Y's are in `arena.manifest.json`), positions and headings (drawn from the
-  transplant seed, never from the world's stream).
-- **Config**: X's. The predator physics (perception, speed, capture radius, cooldown,
-  metabolism, move costs, meal, repro and newborn energy, turn rate, min speed) must match Y's,
-  or the transplant is refused (`--transplant-allow-mismatch` keeps X's).
-  `--predator-mutation` / `--predator-primer` come from Y.
-- **`--assay frozen`** (default): economy off (K immortal predators that neither bud nor
-  mutate), no predator floor or cap, prey `--min-pop 0`. **`--assay live`**: X's config.
+  replacement if K > |Y|), carrying only their genome, lineage, generation and traits, and
+  their Y id as `sourceId`. `--predators-from random` makes K random-genome founders instead
+  (how to start Stage C on an evolved prey world). `--transplant-count` takes a whole number
+  ≥ 0 (anything else is refused).
+- **Reset**: energy (the spawn energy, `--predator-newborn-energy`), age 0, digest, captures,
+  speed (top), recurrent outputs (0.5), positions and headings (drawn from the transplant
+  seed, never from the world's stream). The manifest records this start state.
+- **Ids**: fresh, starting at max(X's next predator id, Y's next predator id, 1 + Y's largest
+  lineage id). So no bud or floor refill in the assay can reuse a transplanted lineage's label,
+  and founders keep `lineageId == id`.
+- **Config**: X's. The predator physics that matter to the assay must match Y's, or the
+  transplant is refused (`--transplant-allow-mismatch` keeps X's and lists the differences):
+  - frozen-newborn: perception, speed, capture radius, cooldown, turn rate, min speed and
+    `fastTanh`;
+  - frozen and live: those, plus metabolism, both move costs, meal, repro and newborn energy,
+    and max age.
+
+  `--predator-mutation` and `--predator-primer` come from Y. With `random` they are X's (a
+  version-2 X) or the command line's, else the defaults. The manifest's `stageC` block gives
+  every Stage C key's value and source.
+- **Assay modes:**
+  - **`--assay frozen`** (default): the economy runs its accounting (burn, meals, ageing) so the
+    ENERGY and AGE inputs keep their evolved range, but nobody dies or buds. Energy is held in
+    [0, budding threshold], age at most `--predator-max-age`. The K predators stay K. No
+    predator floor or cap, prey `--min-pop 0`.
+  - **`--assay frozen-newborn`**: the economy off. The predators are immortal and fixed, and
+    ENERGY and AGE read 0 throughout, as if every predator were a newborn. An ablation of the
+    above.
+  - **`--assay live`**: X's config (predators starve, age out and bud).
+- **The arena file** is marked (`world.arena`), and its first run's lineage log opens with `T`
+  rows. The manifest holds both sources' paths, frames and FNV-1a 64 hashes, the picked
+  predators (source id → new id, lineage, generation), the config changes and the physics
+  compared.
 - **Deterministic**: the arena is a function of (X, Y, K, seed, assay) byte for byte, and the
   assay a function of (arena, R) in the serial build. Score from `<name>.predators.csv`
   (captures per predator-second) and the main CSV (predation deaths).
