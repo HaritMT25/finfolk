@@ -20,7 +20,7 @@
  *     EvoOceanShaders.program(name, parts, the stage's features), so a feature that is not enabled
  *     contributes no GLSL
  *   - one writer of a fish mesh's material (bind): the scene's kinds commit the variant settle() chose
- *     (its prewarm and hysteresis unchanged) and the binder assigns the material
+ *     (its prewarm, through this file's compiler, and its hysteresis) and the binder assigns the material
  *   - the lit fish's split is a feature (LIT_SKIP_FEATURE): it appends the skip to app.pose with order
  *     -1, so it is the first line of main(), byte for byte the old text insert litSkip(vs)
  *   - the declared attribute layouts (LAYOUTS, layout()): each kind's instance attributes, component
@@ -588,11 +588,13 @@
     return binder;
   }
 
-  /** The scene's compile for an activation (deps.compile): the materials compiled as the scene warms them (three's
-   * compileAsync on a scratch scene, each on its kind's geometry), then each program checked: linked (the GL status, so it
-   * holds whatever three's checkShaderErrors) and runnable by three's own first-use check (getUniforms; diagnostics). A
-   * check that throws is a failure, never a pass; the budget (60 s: ANGLE / D3D11 takes ~1.2 s a program) only bounds a hung
-   * compile, its timer cleared once settled. @param {MaterialCompilerOptions} o */
+  /** The scene's compile for an activation (deps.compile) and for its prewarm: the materials compiled as the scene warms
+   * them (three's compileAsync on a scratch scene, each on its kind's geometry), then each program checked: linked (the GL
+   * status, so it holds whatever three's checkShaderErrors) and runnable by three's own first-use check (getUniforms;
+   * diagnostics). A check that throws is a failure, never a pass; the budget (60 s: ANGLE / D3D11 takes ~1.2 s a program)
+   * only bounds a hung compile, its timer cleared once settled. Fenced by the context's generation (o.generation: one more
+   * at each loss and restore): a compile that a loss overtook is refused, whatever three said since (a restored context
+   * has new programs, and three's compileAsync, polling the old ones, can resolve then). @param {MaterialCompilerOptions} o */
   function compiler(o) {
     /* the platform's timers called as functions: setTimeout / clearTimeout detached into an object and called as its
      * methods throw "Illegal invocation" in a browser (this would be the object, not the window) */
@@ -600,14 +602,21 @@
       set: function (/** @type {() => void} */ f, /** @type {number} */ ms) { return setTimeout(f, ms); },
       clear: function (/** @type {any} */ t) { clearTimeout(t); }
     };
+    var LOST = "the WebGL context was lost during the compile (its programs were the lost context's)";
     /** @param {MaterialCompileItem[]} items @returns {Promise<{ ok: boolean, error?: string }>} */
     return function (items) {
       return new Promise(function (resolve) {
         if (o.lost && o.lost()) { resolve({ ok: false, error: "the WebGL context is lost" }); return; }
+        var gen = o.generation ? o.generation() : 0;
+        function moved() { return !!o.generation && o.generation() !== gen; }
         var settled = false, /** @type {any} */ timer = null;
         /** @param {{ ok: boolean, error?: string }} r */
-        function end(r) { if (settled) return; settled = true; if (timer !== null) timers.clear(timer); timer = null; resolve(r); }
+        function end(r) {
+          if (settled) return; settled = true; if (timer !== null) timers.clear(timer); timer = null;
+          resolve(moved() ? { ok: false, error: LOST } : r);
+        }
         function verify() {
+          if (moved()) { end({ ok: false, error: LOST }); return; }   /* (not the restored context's programs: not checked) */
           try {
             var gl = o.renderer.getContext(), bad = /** @type {string[]} */ ([]);
             items.forEach(function (x) {
