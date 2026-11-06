@@ -4144,7 +4144,10 @@ async function reviewEngineId() {
         await openWorld(q, other, 'fromB.oceanworld');
         const m = q.el('startaskmsg').textContent;
         q.click('startcancel');
-        ok(/another engine build \([0-9a-f]{8}; this page runs 040d633c\)/.test(m) && q.T.worldEpoch === e0, 'a world saved by engine B: its setup offered, not its fish ("' + m.slice(0, 90) + '…")');
+        /* the page names the build it runs: the committed module's own hash (was the literal 040d633c,
+           which every rebuild of web/evo_ocean.wasm broke) */
+        const runs = new RegExp('another engine build \\([0-9a-f]{8}; this page runs ' + WASM_SHA.slice(0, 8) + '\\)');
+        ok(runs.test(m) && q.T.worldEpoch === e0, 'a world saved by engine B: its setup offered, not its fish ("' + m.slice(0, 90) + '…")');
     }
 }
 
