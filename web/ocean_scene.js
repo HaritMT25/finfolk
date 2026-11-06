@@ -1452,10 +1452,17 @@
     var poseLast = { fish: 0, any: 0, full: 0, sum: 0 };
     /* the frustum's side planes in camera space (x or y, and the depth d):
      * right / left NDC x = P0 x / d - P8 = +-1, top / bottom with P5, P9 (the
-     * view offset); unit normals, + outside (poseWeight) */
+     * view offset); unit normals, + outside (poseWeight). Written in place
+     * (nothing allocated a frame), and only when one of the four terms they
+     * are made of changed since (planesOf: a resize, the field of view, an
+     * inset's view offset; the near / far planes do not move them) */
+    var planesOf = new Float64Array([NaN, NaN, NaN, NaN]);
+    function sidePlane(F, i, a, b) { var l = Math.hypot(a, b) || 1; F[2 * i] = a / l; F[2 * i + 1] = b / l; }
     function sidePlanes(Pm, F) {
-      var q = [[Pm[0], -(1 + Pm[8])], [-Pm[0], Pm[8] - 1], [Pm[5], -(1 + Pm[9])], [-Pm[5], Pm[9] - 1]];
-      for (var i = 0; i < 4; i++) { var l = Math.hypot(q[i][0], q[i][1]) || 1; F[2 * i] = q[i][0] / l; F[2 * i + 1] = q[i][1] / l; }
+      var p0 = Pm[0], p5 = Pm[5], p8 = Pm[8], p9 = Pm[9], K = planesOf;
+      if (p0 === K[0] && p5 === K[1] && p8 === K[2] && p9 === K[3]) return;
+      K[0] = p0; K[1] = p5; K[2] = p8; K[3] = p9;
+      sidePlane(F, 0, p0, -(1 + p8)); sidePlane(F, 1, -p0, p8 - 1); sidePlane(F, 2, p5, -(1 + p9)); sidePlane(F, 3, -p5, p9 - 1);
     }
     function poseCamera() {
       var Pm = camera.projectionMatrix.elements;
