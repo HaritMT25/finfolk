@@ -405,6 +405,30 @@ operators and network evaluation) but with the predator's own inputs and outputs
 meal of 1.2–1.5× break-even. **Use a max age with a cap:** predators at the cap neither die
 nor bud, so without turnover evolution stops (the CLI warns).
 
+**Measured (pilot, 2026-11-06; serial build, the research arena `--food-patches 0
+--target-food 2000 --food-spawn 12 --max-pop 600 --min-pop 20 --move-cost 7e-5` plus the
+recipe with cap 40, floor 2 and max age 120; meal 1.2× and 1.5× of the 8.54 break-even; seeds
+1–2 for 1.5M steps each, seed 3 cut short at 0.6–0.7M):**
+
+- **The predators evolve pursuit while a lineage lasts.** From random genomes,
+  `pursuit_align` went from ~0 to rolling peaks of +0.23 to +0.44, and mean speed rose to
+  75–107. The share of time at top speed reached 0.48–0.89 (bursts). Wiring of the steering
+  input PREY_LR rose to 0.96–0.98 in the lineages that lasted.
+- **The prey answered at 1.5×.** `neighbor_align` rose from 0.04–0.10 to 0.91–0.93 (schooling,
+  as in Stage A).
+- **Coexistence was floor-assisted.**
+  - Prey stayed at their cap almost throughout. One dip to 74 came when the evolved hunters peaked.
+  - Evolved predator lineages went extinct 2–11 times per run. They hit an R0 of about 1:
+    capped by the 3 s digest at ~0.25 catches/s, they rarely bud within a 120 s life. The floor's
+    founders restarted them each time.
+  - Floor refills were 1.3–4.5 % of predator births.
+- **Time shift.** Prey of one run's end against K = 6 predators: 0.157 catches per
+  predator-second from random founders, 0.187 from the same run's frame 250k, and 0.245 from
+  its contemporaries.
+- **What this means for a study:** this arena needs tuning before a long study. A longer life
+  or a richer meal would let lineages last; relaxing the prey cap would let predators regulate
+  numbers, not only turnover.
+
 **Outputs with the brain on** (the main CSV is unchanged):
 
 - `<name>.predators.csv`, one row per `--log-every`: predator and prey counts; this
