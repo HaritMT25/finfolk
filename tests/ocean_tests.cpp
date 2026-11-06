@@ -1131,7 +1131,6 @@ void testInactiveBrainKeys() {
         R"("predatorMinSpeed":5,"predatorPrimer":true,"predatorFrozen":true})"};
     ofp::Fingerprint fp[2];
     std::string dump[2];
-    bool dumped = true;
     for (int k = 0; k < 2; ++k) {
         OceanWorld w;
         std::string err;
@@ -1140,23 +1139,23 @@ void testInactiveBrainKeys() {
             return;
         for (int s = 0; s < 300; ++s) w.update(0.016f);
         fp[k] = ofp::fingerprint(w, /*withActivations*/ false);
+        // dumpState writes to a FILE*: an ISO C tmpfile works natively and under
+        // node (the wasm build links NODERAWFS). The read buffer lives on the
+        // heap: wasm's whole stack is 64 KB.
         std::FILE* f = std::tmpfile();
-        if (!f) { dumped = false; continue; }
+        if (!t.expect(f != nullptr, "tmpfile() failed: no state dump to compare")) return;
         ofp::dumpState(w, f);
         std::rewind(f);
-        char buf[65536];
+        std::vector<char> buf(4096);
         std::size_t n;
-        while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) dump[k].append(buf, n);
+        while ((n = std::fread(buf.data(), 1, buf.size(), f)) > 0) dump[k].append(buf.data(), n);
         std::fclose(f);
     }
     t.expect(fp[0] == fp[1], "inactive Stage C keys changed the fingerprint (all %016llx vs %016llx, cfg %016llx vs %016llx)",
              (unsigned long long)fp[0].all, (unsigned long long)fp[1].all, (unsigned long long)fp[0].cfg,
              (unsigned long long)fp[1].cfg);
-    if (dumped)
-        t.expect(!dump[0].empty() && dump[0] == dump[1], "inactive Stage C keys changed the state dump (%zu vs %zu bytes)",
-                 dump[0].size(), dump[1].size());
-    else
-        t.note("no tmpfile here: the dump comparison was skipped");
+    t.expect(dump[0].size() > 1000 && dump[0] == dump[1], "inactive Stage C keys changed the state dump (%zu vs %zu bytes)",
+             dump[0].size(), dump[1].size());
     // the gate is wired: with the brain on, the block is hashed, and its values count
     SimConfig on;
     on.predatorBrain = true;
