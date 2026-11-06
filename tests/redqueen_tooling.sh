@@ -23,6 +23,16 @@
 #      resumes to identical bundles;
 #   8. STOP file, disk guard, memory guard (fail closed), a changed source, a changed plan row
 #      and a pending plan are all refused.
+#  Review round 2 (Codex, PR #61):
+#   9. sources enter the store as independent read-only copies (P1-1); --link-sources is refused
+#      for an archive that is not finalized and read-only, and hard-links a finalized one;
+#  10. SIGTERM to a runner whose worker is SIGSTOPped escalates to SIGKILL within the grace and
+#      exits 130 with nothing left running (P2-7);
+#  11. a live challenge on a prey world with a predator floor is refused at planning (P2-5);
+#  12. --on-bio-failure skip: an extinct donor's cells are recorded in the ledger and skipped,
+#      the rest of the plan finishes, a restart keeps skipping them; stop (the default) stops.
+#  (P1-2 recovery order, P2-3/4 single-read plan and hashes, P2-6 hybrid sampling and the P2-8
+#  parent check are covered by test_redqueen.py and the sampling checks of section 2.)
 set -u
 BIN=${1:?usage: redqueen_tooling.sh EVO_BOIDS WORKDIR}
 W=${2:?usage: redqueen_tooling.sh EVO_BOIDS WORKDIR}
@@ -30,6 +40,7 @@ case "$BIN" in /*) ;; *) BIN="$PWD/$BIN" ;; esac
 T=$(cd "$(dirname "${BASH_SOURCE[0]}")/../tools/redqueen" && pwd)
 PY="${PYTHON:-python3} -I"
 NW=${RQ_TEST_WORKERS:-10}
+[ -d "$W" ] && chmod -R u+w "$W" 2> /dev/null   # (a read-only archive of section 9)
 rm -rf "$W"; mkdir -p "$W"; cd "$W" || exit 2
 fail() { echo "FAIL: $*" >&2; exit 1; }
 eng() { "$BIN" --no-render --log-every 250 "$@" > /dev/null 2>&1 || fail "evo_boids $* exited $?"; }
@@ -111,7 +122,9 @@ for i, r in enumerate(ckpt.prey(c)):
     assert r["genes"] == pool[m["slots"]["source_index"][i]]["genes"]
 m4 = json.load(open("c4.manifest.json"))
 s4 = m4["sampling"]
-assert s4["pool"] < 150 and s4["with_replacement"] and s4["max_copies"] >= 2 and s4["distinct"] == s4["pool"], s4
+assert s4["policy"] == "hybrid" and s4["pool"] < 150 and s4["with_replacement"], s4   # the design's law
+assert s4["max_copies"] >= 2 and s4["distinct"] <= s4["pool"] and s4["duplicated_slots"] == 150 - s4["distinct"], s4
+assert m["sampling"]["policy"] == "hybrid"
 PY
 $PY "$T/common.py" validate --binary "$BIN" --work val1 c1.json > val1.log 2>&1 || fail "common.py validate: $(tail -3 val1.log)"
 $PY "$T/common.py" validate --binary "$BIN" --work val4 c4.json > val4.log 2>&1 || fail "common.py validate (duplicated): $(tail -3 val4.log)"
@@ -128,7 +141,7 @@ cat > design.json <<EOF
  "worlds": {"A": {"uuid": "11111111-aaaa", "pattern": "$W/A.{frame}.json", "paths": {"F1": "$W/A.F1.json"}},
             "B": {"uuid": "22222222-bbbb", "pattern": "$W/B.{frame}.json", "paths": {"F1": "$W/B.F1.json"}}},
  "templates": ["$W/T.json"],
- "defaults": {"assay": "frozen", "k": 3, "prey_policy": "common", "n_prey": 100, "sampling": "wor-balanced",
+ "defaults": {"assay": "frozen", "k": 3, "prey_policy": "common", "n_prey": 100, "sampling": "hybrid",
               "steps": 600, "horizons": [200, 600], "log_every": 100, "checkpoint_every": 200},
  "blocks": [
   {"name": "coarse", "prey_worlds": ["A"], "prey_times": ["F1", "T3000"], "predators": "same",
@@ -187,7 +200,7 @@ assert any(b["score"]["horizons"][-1]["captures"] > 0 for b in B.values()), "no 
 assert any(b["cell"]["prey_policy"] == "native" for b in B.values())
 PY
 $RUN --plan plan.jsonl --root r1 --binary "$BIN" --workers $NW $GUARD > r1b.log 2>&1 || fail "run.py resume"
-grep -q "14 already done, 0 to run" r1b.log || fail "run.py resume did not skip the finished cells: $(tail -3 r1b.log)"
+grep -q "14 already done or skipped, 0 to run" r1b.log || fail "run.py resume did not skip the finished cells: $(tail -3 r1b.log)"
 
 # bundles of a root by cell id, as JSON lines (for the comparisons below)
 bundles() { $PY - "$T" "$1" <<'PY'
@@ -303,5 +316,97 @@ PY
 $PY "$T/plan.py" design_z.json --out plan_z.jsonl 2> plan_z.log || fail "plan.py (extinct donor): $(cat plan_z.log)"
 grep -q "no predators" plan_z.log || fail "plan.py did not warn about the extinct donor"
 $RUN --plan plan_z.jsonl --root r10 --binary "$BIN" $GUARD > r10.log 2>&1; rc=$?
-[ "$rc" = 1 ] && grep -q "FAILED .*(exit 9).*biological" r10/runner.log || fail "an extinct donor did not fail as biological (exit $rc)"
+[ "$rc" = 1 ] && grep -q "FAILED .*(exit 9, biological" r10/runner.log || fail "an extinct donor did not fail as biological (exit $rc)"
+[ "$(wc -l < r10/bio_failures.jsonl)" = 1 ] || fail "the stopped biological failure is not in the ledger"
+
+# 9. the store's sources: independent read-only copies by default; hard links only into a finalized,
+#    read-only archive (--link-sources)
+$PY - "$T" <<'PY' || fail "store objects are not independent read-only copies"
+import json, os, sys; sys.path.insert(0, sys.argv[1]); import store
+_, cells = store.load_index("r1")
+n = 0
+for cid in cells:
+    c = json.loads(store.read_member("r1", cid, cells=cells))["cell"]
+    for role in ("prey", "predators", "template"):
+        x = c.get(role)
+        if isinstance(x, dict) and x.get("sha256"):
+            st = os.stat(store.has("r1", x["sha256"]))
+            assert st.st_nlink == 1 and st.st_mode & 0o777 == 0o444, (cid, role, oct(st.st_mode), st.st_nlink)
+            assert st.st_ino != os.stat(x["path"]).st_ino
+            n += 1
+assert n > 20, n
+PY
+mkdir -p arch
+cp A.1500.json arch/A.1500.json
+cat > design_l.json <<JSON
+{"schema": "finfolk.redqueen.design/1", "name": "link", "seed_namespace": "rq-smoke-link",
+ "times": {"T1500": 1500}, "worlds": {"A": {"uuid": "11111111-aaaa", "pattern": "$W/arch/A.{frame}.json"}},
+ "templates": [], "defaults": {"assay": "frozen", "k": 3, "prey_policy": "native", "steps": 400, "horizons": [400],
+ "log_every": 100, "checkpoint_every": 200},
+ "blocks": [{"name": "n", "prey_worlds": ["A"], "prey_times": ["T1500"], "predators": "same",
+             "predator_times": ["T1500"], "replicates": 1, "with_nopred": true}]}
+JSON
+$PY "$T/plan.py" design_l.json --out plan_l.jsonl 2> /dev/null || fail "plan.py (link)"
+$RUN --plan plan_l.jsonl --root r11 --binary "$BIN" --link-sources $GUARD > r11a.log 2>&1; rc=$?
+[ "$rc" = 2 ] && grep -q "not finalized and read-only" r11a.log || fail "--link-sources on a writable archive (exit $rc)"
+chmod 444 arch/A.1500.json; touch arch/FINALIZED; chmod 555 arch
+if [ -w arch/A.1500.json ]; then
+    echo "redqueen_tooling: note: running as root, the --link-sources acceptance check is skipped"
+else
+    $RUN --plan plan_l.jsonl --root r11 --binary "$BIN" --link-sources $GUARD > r11b.log 2>&1 \
+        || fail "--link-sources on a finalized archive: $(tail -3 r11b.log)"
+    $PY - "$T" "$W" <<'PY' || fail "--link-sources did not hard-link the finalized source"
+import os, sys; sys.path.insert(0, sys.argv[1]); import rqlib, store
+p = sys.argv[2] + "/arch/A.1500.json"
+o = store.has("r11", rqlib.sha256_file(p))
+assert o and os.stat(o).st_ino == os.stat(p).st_ino, o
+PY
+fi
+chmod 755 arch
+
+# 10. a SIGSTOPped worker: SIGTERM to the runner escalates to SIGKILL after the grace, exit 130
+rm -f pause_once
+RQ_KILL_GRACE=3 RQ_TEST_PAUSE="after-transplant:60:$W/pause_once" $RUN --plan plan.jsonl --root r12 --binary "$BIN" \
+    --workers 2 $GUARD > r12.log 2>&1 &
+rp=$!
+victim=$(paused) || { kill $rp; fail "no cell reached the pause (r12)"; }
+vpid=$(pgrep -f -- "--root $W/r12 --_cell $victim" | head -1)
+[ -n "$vpid" ] || { kill $rp; fail "no paused worker (r12)"; }
+kill -STOP "$vpid"
+t0=$(date +%s)
+kill -TERM $rp
+wait $rp; rc=$?
+dt=$(( $(date +%s) - t0 ))
+[ "$rc" = 130 ] || fail "the runner with a stopped worker exited $rc, expected 130"
+[ "$dt" -le 20 ] || fail "the runner took $dt s to stop a stopped worker"
+grep -q "SIGKILL" r12/runner.log || fail "no SIGKILL escalation was logged"
+[ -z "$(workers_of r12)" ] && [ -z "$(pgrep -f "$W/r12/bin/evo_boids")" ] || fail "something outlived the stopped-worker shutdown"
+
+# 11. a live challenge needs a prey world without a predator floor (T.json has --predator-min-pop 2)
+sed 's/"assay": "frozen"/"assay": "live"/' design.json > design_live.json
+$PY "$T/plan.py" design_live.json --out x.jsonl 2> live.log && fail "a live challenge on a world with a predator floor"
+grep -q "predatorMinPopulation 0" live.log || fail "the live-floor refusal does not say why: $(cat live.log)"
+
+# 12. --on-bio-failure skip: the extinct donor's cells are recorded and skipped, the rest finishes
+$PY - <<'PY' || fail "building the skip design"
+import json
+d = json.load(open("design_z.json"))
+d["blocks"].append({"name": "ok", "prey_worlds": ["A"], "prey_times": ["T1500"], "predators": "random", "replicates": 1})
+d["blocks"][0]["replicates"] = 2
+json.dump(d, open("design_zs.json", "w"))
+PY
+$PY "$T/plan.py" design_zs.json --out plan_zs.jsonl 2> /dev/null || fail "plan.py (skip design)"
+$RUN --plan plan_zs.jsonl --root r13 --binary "$BIN" --workers 1 --on-bio-failure skip $GUARD > r13.log 2>&1 \
+    || fail "--on-bio-failure skip did not finish the rest: $(tail -3 r13.log)"
+grep -q "BIOLOGICAL .*skipping it and 1 queued" r13/runner.log || fail "the skip is not logged: $(grep -i bio r13/runner.log)"
+grep -q "EXCEPT 2 skipped" r13/runner.log || fail "the final line does not count the skipped cells"
+$RUN --root r13 --status > st13.json
+$PY - <<'PY' || fail "the skip's records"
+import json
+st = json.load(open("st13.json"))
+assert len(st["bio_failure_ledger"]) == 1 and st["bio_failure_ledger"][0]["role"] == "predators", st
+assert st["packed"] == 1 and st["runner"]["bio_skipped"] == 2, st
+PY
+$RUN --plan plan_zs.jsonl --root r13 --binary "$BIN" --on-bio-failure skip $GUARD > r13b.log 2>&1 || fail "skip restart"
+grep -q "BIOLOGICAL: 2 cells skipped" r13/runner.log || fail "a restart does not keep skipping the ledger's cells"
 echo "redqueen_tooling: ok ($NW workers)"

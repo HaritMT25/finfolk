@@ -13,8 +13,12 @@ execute(cell, d, exe, paths) runs, in the empty directory d:
      Y is pred.json (a symlink to the registered predator snapshot), or "random"; the
      predator-free fork is "random" with K = 0. Relative paths only, so the engine's arena
      manifest is the same in a replay;
-  3. the checks: the checkpoint schedule (end.<f0 + m C>.json for every m, end.json the last
-     step's state, byte-identical to the periodic one), then score.py at every horizon;
+  3. the checks: a serial-build arena; a live arena (challenge or control) without a predator
+     floor; the checkpoint schedule (end.<f0 + m C>.json for every m, end.json the last step's
+     state, byte-identical to the periodic one), then score.py at every horizon (the predator-
+     free fork refused if a predator, capture, birth or refill shows anywhere). The arena's prey
+     settings (its config without the predator keys) are hashed into the bundle, so the runner
+     can check that a challenge and its control share them;
   4. the BUNDLE (bundle.json, canonical JSON): the cell row, the binary's and the output tools'
      SHA-256, both engine argument lists, the SHA-256 of every file the cell produced (the
      checkpoints too, which are then deleted: they replay exactly), the common manifest's hash,
@@ -52,9 +56,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 
 class CellFailure(Exception):
-    def __init__(self, code, msg):
+    def __init__(self, code, msg, role=None):
         super().__init__(msg)
         self.code = code
+        self.role = role          # for a biological failure (9): the source's role, "prey" / "predators"
 
 
 def tools_sha256(here=HERE):
@@ -94,8 +99,11 @@ def commands(cell, x_name):
 
 def _engine(exe, args, d, name, procs):
     with open(os.path.join(d, name + ".stdout.log"), "w") as so, open(os.path.join(d, name + ".stderr.log"), "w") as se:
-        p = subprocess.Popen([exe] + args, cwd=d, stdout=so, stderr=se, stdin=subprocess.DEVNULL,
-                             preexec_fn=rqlib.die_with_parent)
+        try:
+            p = subprocess.Popen([exe] + args, cwd=d, stdout=so, stderr=se, stdin=subprocess.DEVNULL,
+                                 preexec_fn=rqlib.death_signal())
+        except (OSError, subprocess.SubprocessError) as e:
+            raise CellFailure(3, f"engine ({name}) could not start: {e}")
         procs.append(p)
         _, status, ru = os.wait4(p.pid, 0)
     p.returncode = os.waitstatus_to_exitcode(status)
@@ -146,7 +154,7 @@ def execute(cell, d, exe, paths, procs=None):
     del raw
     smeta = ckpt.meta(x_cp)
     if smeta["prey_alive"] == 0:
-        raise CellFailure(9, f"biological: the prey snapshot {cell['prey']['path']} has no living prey")
+        raise CellFailure(9, f"biological: the prey snapshot {cell['prey']['path']} has no living prey", "prey")
     if int(smeta["frame"]) != int(cell["prey"]["frame"]):
         raise CellFailure(5, f"the prey snapshot is at frame {smeta['frame']}, registered {cell['prey']['frame']}")
     if cell["kind"] == "assay" and cell["predators"].get("source") != "random":
@@ -165,7 +173,8 @@ def execute(cell, d, exe, paths, procs=None):
         if ym["frame"] != int(cell["predators"]["frame"]):
             raise CellFailure(5, f"the predator snapshot is at frame {ym['frame']}, registered {cell['predators']['frame']}")
         if ym["predators"] == 0:
-            raise CellFailure(9, f"biological: the predator snapshot {cell['predators']['path']} has no predators")
+            raise CellFailure(9, f"biological: the predator snapshot {cell['predators']['path']} has no predators",
+                              "predators")
         os.symlink(os.path.abspath(paths["predators"]), os.path.join(d, "pred.json"))
         info["donor_predators"] = ym["predators"]
 
@@ -180,7 +189,8 @@ def execute(cell, d, exe, paths, procs=None):
                 source_meta={"world": cell["prey"]["world"], "uuid": cell["prey"]["uuid"], "time": cell["prey"]["time"]},
                 source_cp=x_cp, source_sha=cell["prey"]["sha256"])
         except (common.CommonError, ckpt.CheckpointError) as e:
-            raise CellFailure(9 if "no living prey" in str(e) else 5, f"common checkpoint: {e}")
+            bio = "no living prey" in str(e)
+            raise CellFailure(9 if bio else 5, f"common checkpoint: {e}", "prey" if bio else None)
         if man["template"]["sha256"] != cell["template"]["sha256"]:
             raise CellFailure(5, "the template is not its registered content")
         x_name = "common.json"
@@ -205,6 +215,14 @@ def execute(cell, d, exe, paths, procs=None):
     arena = ckpt.load(os.path.join(d, "arena.json"))
     if not str(arena.get("determinism", "")).startswith("serial build"):
         raise CellFailure(2, f"the engine is not a serial build ({arena.get('determinism')!r}): its assays do not replay")
+    acfg = arena["config"]
+    if cell["assay"] == "live" and int(acfg.get("predatorMinPopulation", 0)) != 0:
+        # (review round 2) a live arena keeps X's config, floor included: a floor would refill
+        # predators into a challenge's control and change the challenge's density
+        raise CellFailure(4, f"a live challenge or its control needs predatorMinPopulation 0 in the prey world "
+                             f"(it is {acfg.get('predatorMinPopulation')})")
+    # the prey settings the challenge and its control must share (checked across cells at packing)
+    prey_cfg_sha = rqlib.canonical_sha({k: v for k, v in acfg.items() if not k.startswith("predator")})
     f0, steps, ce = int(arena["world"]["frame"]), int(cell["steps"]), int(cell["checkpoint_every"])
     want = [f0 + m * ce for m in range(1, steps // ce + 1)]
     missing = [f for f in want if not os.path.isfile(os.path.join(d, f"end.{f}.json"))]
@@ -225,7 +243,7 @@ def execute(cell, d, exe, paths, procs=None):
     t2 = time.time()
     try:
         sc = score_mod.score(d, 0 if cell["kind"] == "nopred" else int(cell["k"]), steps, list(cell["horizons"]),
-                             int(cell["log_every"]), cell["assay"])
+                             int(cell["log_every"]), cell["assay"], fork=cell["kind"] == "nopred")
     except (score_mod.ScoreError, ckpt.CheckpointError, KeyError, ValueError) as e:
         raise CellFailure(4, f"score check failed: {e}")
     info["t_score"] = time.time() - t2
@@ -240,6 +258,7 @@ def execute(cell, d, exe, paths, procs=None):
         "binary_sha256": rqlib.sha256_file(exe), "tools_sha256": tools_sha256(),
         "engine_args": {"transplant": targs, "assay": aargs},
         "files": files, "common_manifest_sha256": common_manifest_sha,
+        "arena_prey_config_sha256": prey_cfg_sha,
         "arena_manifest": arena_manifest, "score": sc,
         "predators_csv": pred_csv, "run_csv": run_csv,
     }
@@ -256,7 +275,10 @@ def forward_signals(procs):
                     q.wait(timeout=20)
                 except subprocess.TimeoutExpired:
                     q.kill()
-                    q.wait()
+                    try:
+                        q.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        pass
         os._exit(128 + signum)
     for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         signal.signal(s, fwd)

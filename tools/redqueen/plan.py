@@ -8,9 +8,11 @@
     template hash is "pending" and nothing is read. Such a plan cannot run (run.py refuses it).
 --against: the final plan, once the files exist, must be the pending plan with only the
     "pending" hashes filled in: the same cells in the same order, every other field equal
-    (refused, exit 2, otherwise). The final plan also checks every snapshot's actual frame
-    against its registered one, that predator snapshots have brains (format 2), that templates
-    have enough slots, and that every file is a valid checkpoint (ckpt.py).
+    (refused, exit 2, otherwise). The final plan reads every file once, hashes and validates
+    that one buffer (ckpt.py), and checks every snapshot's actual frame against its registered
+    one, that predator snapshots have brains (format 2), that templates have enough slots, and
+    that every live challenge (and its predator-free control) runs on a prey world without a
+    predator floor (a live arena keeps its prey world's config: a floor would refill predators).
 --avoid: refuse (exit 2) if an engine seed (transplant, reseed) of this plan also occurs in an
     archived plan (this tooling's or tools/invasion's).
 Expansion is deterministic: the same design gives the same bytes (rows sorted by id).
@@ -27,7 +29,7 @@ DESIGN.json:
   },
   "templates": ["/abs/template_a.json", ...],   # replicate r uses templates[r % len]
   "defaults": {"assay": "frozen", "k": 6, "prey_policy": "common", "n_prey": 600,
-               "sampling": "wor-balanced", "steps": 20000, "horizons": [5000, 10000, 20000],
+               "sampling": "hybrid", "steps": 20000, "horizons": [5000, 10000, 20000],
                "log_every": 500, "checkpoint_every": 5000},
   "blocks": [
     {"name": "coarse", "prey_worlds": ["w01", ...], "prey_times": ["F1", "5M", ...],
@@ -76,7 +78,7 @@ PLAN_SCHEMA = "finfolk.redqueen.plan/1"
 DESIGN_SCHEMA = "finfolk.redqueen.design/1"
 ASSAYS = ("frozen", "frozen-newborn", "live")
 POLICIES = ("common", "native")
-SAMPLINGS = ("wor-balanced", "iid")
+SAMPLINGS = ("hybrid", "wor-balanced", "iid")   # hybrid: design section 2
 DEFAULT_KEYS = ("assay", "k", "prey_policy", "n_prey", "sampling", "steps", "horizons", "log_every",
                 "checkpoint_every")
 NAME_RE = re.compile(r"^[A-Za-z0-9-]+$")
@@ -264,7 +266,10 @@ def assign_seeds(rows, ns):
 
 
 def fill_hashes(rows):
-    """The final plan: hash every file once, check frames, versions and template slots."""
+    """The final plan: every file read ONCE, its SHA-256 computed from that buffer and the same
+    buffer parsed and validated (review round 2, P2-4: a file replaced between two reads can no
+    longer pass the checks as one checkpoint and be registered as another); then frames,
+    versions, template slots, and zero predator floors in every live challenge's prey world."""
     import ckpt
     cache, warnings = {}, []
 
@@ -272,14 +277,25 @@ def fill_hashes(rows):
         if p not in cache:
             if not os.path.isfile(p):
                 raise DesignError(f"{p}: missing (a final plan needs every file; --pending plans before they exist)")
+            raw = rqlib.read_bytes(p)
             try:
-                cp = ckpt.load(p)
-            except ckpt.CheckpointError as e:
+                cp = ckpt.loads(raw.decode("utf-8"), p)
+                ckpt.validate(cp, p)
+            except (ckpt.CheckpointError, UnicodeDecodeError) as e:
                 raise DesignError(str(e))
-            cache[p] = (rqlib.sha256_file(p), ckpt.meta(cp))
+            m = ckpt.meta(cp)
+            m["predator_min_population"] = int((cp.get("config") or {}).get("predatorMinPopulation", 0))
+            cache[p] = (rqlib.sha256_bytes(raw), m)
         return cache[p]
 
     for row in rows:
+        # a live arena keeps its prey world's config, predator floor included (transplant.hpp): a
+        # floor would refill predators into the predator-free control and change the challenge's K
+        if row["assay"] == "live":
+            x = row["template"] if row["prey_policy"] == "common" else row["prey"]
+            if info(x["path"])[1]["predator_min_population"] != 0:
+                raise DesignError(f"{row['id']}: a live challenge (or its control) needs predatorMinPopulation 0 in "
+                                  f"its prey world {x['path']}")
         for role in ("prey", "predators", "template"):
             x = row.get(role)
             if not (isinstance(x, dict) and x.get("path")):

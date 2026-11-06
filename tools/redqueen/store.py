@@ -6,8 +6,10 @@ into verified chunks and only then deletes the cell's working files. Everything 
 either content-addressed once (sources, common manifests, tools, the binary) or deleted with
 its SHA-256 kept (checkpoints: they replay exactly).
 
-STUDY/store/objects/<aa>/<sha256>      a blob (a snapshot or template, hard-linked when the
-                                        filesystem allows, else copied; a tool version; the binary)
+STUDY/store/objects/<aa>/<sha256>      a blob: a snapshot or template (an independent, verified,
+                                        read-only copy; a hard link only with --link-sources, and
+                                        only into a finalized, read-only archive: see
+                                        link_contract_problem), a tool version, the binary
 STUDY/store/objects/<aa>/<sha256>.gz   a gzip-compressed JSON blob (common manifests): the name
                                         is the SHA-256 of the UNcompressed content
 STUDY/chunks/chunk_<NNNNNN>.zip         members <id>/bundle.json and <id>/done.json, sorted by id
@@ -19,10 +21,11 @@ Pack protocol (pack()): (1) every candidate cell's bundle.json re-hashed against
 (2) the chunk written as a temporary file, fsync'd, renamed, the directory fsync'd; (3) the chunk
 re-read: zip CRCs, and every member's SHA-256 against its record; (4) the index line appended
 and fsync'd (the commit point); (5) only then the cells' working directories deleted and
-work/ fsync'd. recover() (at every runner start) undoes a crash at any point: a chunk file
-without an index line is deleted (its cells still have their working directories), a truncated
-last index line is dropped, leftover working directories of committed cells are deleted after
-their bundle is checked against the index, and temporary files go.
+work/ fsync'd. recover() (at every runner start) undoes a crash at any point: a truncated last
+index line is dropped and the index fsync'd, a chunk file without an index line is deleted (its
+cells still have their working directories), the committed chunks are verified (in full where a
+packed cell's working directory is still there), and only then are those leftover directories
+deleted; a chunk that fails verification keeps them and stops the runner.
 Common-group consistency: every cell of one common group (prey world, time, replicate) must have
 built the same common checkpoint (SHA-256); a disagreement is nondeterminism, and pack() refuses.
 """
@@ -54,23 +57,53 @@ def _obj(root, sha, gz=False):
     return os.path.join(root, OBJECTS, sha[:2], sha + (".gz" if gz else ""))
 
 
+def _writable(p):
+    return bool(os.stat(p).st_mode & 0o222)
+
+
 def has(root, sha):
-    """The path of a verified blob with this content (raw or .gz), else None."""
+    """The path of a verified blob with this content (raw or .gz), else None. Only read-only blobs
+    are remembered as verified; a writable one (it should not exist) is re-hashed at every call."""
     if not rqlib.is_sha256(sha):
         return None
     for gz in (False, True):
         p = _obj(root, sha, gz)
         if not os.path.isfile(p):
             continue
-        if (root, sha, gz) in _VERIFIED:
+        if (root, sha, gz) in _VERIFIED and not _writable(p):
             return p
         try:
             got = rqlib.sha256_bytes(gzip.decompress(rqlib.read_bytes(p))) if gz else rqlib.sha256_file(p)
         except (OSError, EOFError, gzip.BadGzipFile):
             continue
         if got == sha:
-            _VERIFIED.add((root, sha, gz))
+            if not _writable(p):
+                _VERIFIED.add((root, sha, gz))
             return p
+    return None
+
+
+FINALIZED = "FINALIZED"   # the marker a finished archive directory carries (the --link-sources contract)
+
+
+def link_contract_problem(src):
+    """Why src may NOT be hard-linked into the store (None = it may). Review round 2, P1-1: a hard
+    link shares the archive's inode, so the archive must be immutable, not merely hashed once:
+    the file has no write permission for anyone, its directory has none either (no entry can be
+    replaced), and the directory holds the FINALIZED marker its archiver writes when the world is
+    complete."""
+    try:
+        st = os.stat(src)
+        d = os.path.dirname(os.path.abspath(src))
+        dst = os.stat(d)
+    except OSError as e:
+        return f"{src}: {e}"
+    if st.st_mode & 0o222:
+        return f"{src} is writable (mode {st.st_mode & 0o777:o})"
+    if dst.st_mode & 0o222:
+        return f"its directory {d} is writable (mode {dst.st_mode & 0o777:o})"
+    if not os.path.isfile(os.path.join(d, FINALIZED)):
+        return f"its directory {d} has no {FINALIZED} marker"
     return None
 
 
@@ -88,33 +121,42 @@ def _mkdirs(root, sha):
     return d
 
 
-def put_file(root, src, want=None, link=True):
-    """src into the store under its SHA-256: hard link when allowed (same filesystem; the bytes
-    are shared, so an archive file stays one copy), else a read-only copy. Idempotent, atomic,
-    durable, safe for concurrent workers. want: the content src must have. -> sha."""
-    sha = rqlib.sha256_file(src)
-    if want is not None and sha != want:
-        raise StoreError(f"{src} is {sha[:12]}, not the needed {want[:12]}")
-    if has(root, sha):
-        return sha
-    _mkdirs(root, sha)
-    final = _obj(root, sha)
-    tmp = f"{final}.tmp.{os.getpid()}"
-    linked = False
+def put_file(root, src, want=None, link=False):
+    """src into the store under its SHA-256 -> sha. By default an INDEPENDENT copy: written to a
+    temporary file, fsync'd, hashed (that hash is the object's name and must equal `want` when
+    given), made read-only (0444), renamed, the directory fsync'd. link=True (the runner's
+    --link-sources) hard-links instead, and only when link_contract_problem(src) is None (else
+    StoreError): the archive must be finalized and read-only. Idempotent, atomic, durable, safe
+    for concurrent workers."""
+    if want is not None and has(root, want):
+        return want
     if link:
-        try:
-            os.link(src, tmp)
-            linked = True
-        except OSError:
-            linked = False
-    if not linked:
+        why = link_contract_problem(src)
+        if why:
+            raise StoreError(f"--link-sources refused: {why}")
+    stage = os.path.join(root, OBJECTS)
+    os.makedirs(stage, exist_ok=True)
+    tmp = os.path.join(stage, f".put.tmp.{os.getpid()}")
+    if os.path.lexists(tmp):
+        os.remove(tmp)
+    if link:
+        os.link(src, tmp)
+    else:
         shutil.copyfile(src, tmp)
         os.chmod(tmp, 0o444)
     rqlib.fsync_file(tmp)
-    if rqlib.sha256_file(tmp) != sha:
+    sha = rqlib.sha256_file(tmp)
+    if want is not None and sha != want:
         os.remove(tmp)
-        raise StoreError(f"{src} changed while it was put into the store")
-    _publish(root, tmp, final)
+        raise StoreError(f"{src} is {sha[:12]}, not the needed {want[:12]}")
+    if link and _writable(tmp):
+        os.remove(tmp)
+        raise StoreError(f"--link-sources: {src} became writable")
+    if has(root, sha):
+        os.remove(tmp)
+        return sha
+    _mkdirs(root, sha)
+    _publish(root, tmp, _obj(root, sha))
     _VERIFIED.add((root, sha, False))
     return sha
 
@@ -213,6 +255,18 @@ def common_groups(cells):
     return out
 
 
+def pair_groups(cells):
+    """{pair group (reseed group | prey policy | assay): the arena's prey-config sha256} over indexed
+    cells: a challenge and its predator-free control run on the same prey settings (raises if not)."""
+    out = {}
+    for cid, (_, e) in cells.items():
+        g, h = e.get("pair_group"), e.get("prey_config_sha256")
+        if g and h:
+            if out.setdefault(g, h) != h:
+                raise StoreError(f"pair group {g}: two different prey settings ({out[g][:12]}, {h[:12]})")
+    return out
+
+
 def next_chunk_name(root, recs):
     used = {r["chunk"] for r in recs}
     k = len(recs) + 1
@@ -242,6 +296,7 @@ def pack(root, ids=None, log=print):
     if not todo:
         return None, 0
     groups = common_groups(cells)
+    pairs = pair_groups(cells)
     members, entries = [], {}
     for cid in todo:
         d = os.path.join(root, WORK, cid)
@@ -254,11 +309,15 @@ def pack(root, ids=None, log=print):
         if g and h and groups.setdefault(g, h) != h:
             raise StoreError(f"{cid}: common group {g} built {h[:12]}, other cells built {groups[g][:12]} "
                              "(nondeterministic common checkpoint)")
+        pg, ph = done.get("pair_group"), done.get("prey_config_sha256")
+        if pg and ph and pairs.setdefault(pg, ph) != ph:
+            raise StoreError(f"{cid}: its arena's prey settings differ from those of the other cells of {pg} "
+                             "(a challenge and its predator-free control must share them)")
         members.append((f"{cid}/bundle.json", b))
         members.append((f"{cid}/done.json", dn))
         entries[cid] = {"bundle_sha256": done["bundle_sha256"], "done_sha256": rqlib.sha256_bytes(dn),
                         "row_sha256": done.get("row_sha256"), "common_group": g, "common_sha256": h,
-                        "kind": done.get("kind")}
+                        "pair_group": pg, "prey_config_sha256": ph, "kind": done.get("kind")}
     cdir = os.path.join(root, CHUNKS)
     if not os.path.isdir(cdir):
         os.makedirs(cdir, exist_ok=True)
@@ -345,11 +404,23 @@ def verify_all(root, deep=True):
     return probs
 
 
-def recover(root, log=print):
-    """Finish or undo whatever a crash interrupted (see the module doc) -> a list of actions taken."""
-    acts = []
+def recover(root, log=print, deep=True):
+    """Finish or undo whatever a crash interrupted -> (actions taken, problems). Review round 2,
+    P1-2: the order is (1) repair a torn index tail and fsync the index and its directory WHATEVER
+    (a record written but not yet fsync'd when the runner died is made durable before anything
+    relies on it); (2) delete uncommitted chunk files and temporaries (their cells still have
+    their working directories); (3) verify the committed chunks: every chunk holding a cell whose
+    working directory is still there in full (its SHA-256, CRCs and every member against the
+    index), the others by SHA-256 (deep) or by size; (4) only if all of that passed, delete those
+    leftover working directories (each bundle first checked against the index). Any problem
+    keeps every working directory and is returned for the caller to stop on."""
+    acts, probs = [], []
     cdir = os.path.join(root, CHUNKS)
     recs, cells = load_index(root, repair=True)
+    ip = os.path.join(root, INDEX)
+    if os.path.isfile(ip):
+        rqlib.fsync_file(ip)
+        rqlib.fsync_dir(cdir)
     committed = {r["chunk"] for r in recs}
     if os.path.isdir(cdir):
         for f in sorted(os.listdir(cdir)):
@@ -359,15 +430,29 @@ def recover(root, log=print):
                 acts.append(f"removed uncommitted {f}")
         rqlib.fsync_dir(cdir)
     wd = os.path.join(root, WORK)
-    for x in sorted(os.listdir(wd)) if os.path.isdir(wd) else []:
-        if x in cells:
-            d = os.path.join(wd, x)
-            bp = os.path.join(d, "bundle.json")
-            if os.path.isfile(bp) and rqlib.sha256_file(bp) != cells[x][1]["bundle_sha256"]:
-                raise StoreError(f"work/{x} is packed, but its bundle.json differs from the packed one")
-            shutil.rmtree(d)
-            acts.append(f"deleted the packed cell's working directory {x}")
-    if acts and os.path.isdir(wd):
+    leftovers = [x for x in (sorted(os.listdir(wd)) if os.path.isdir(wd) else []) if x in cells]
+    need_full = {cells[x][0]["chunk"] for x in leftovers}
+    for r in recs:
+        p = os.path.join(cdir, r["chunk"])
+        if not os.path.isfile(p) or os.path.getsize(p) != r["bytes"]:
+            probs.append(f"{r['chunk']} missing or of the wrong size")
+        elif (deep or r["chunk"] in need_full) and rqlib.sha256_file(p) != r["sha256"]:
+            probs.append(f"{r['chunk']} does not match its SHA-256")
+        elif r["chunk"] in need_full:
+            probs += [f"{r['chunk']}: {x}" for x in verify_chunk(p, r["cells"])]
+    if probs:
+        if leftovers:
+            log(f"recover: {len(leftovers)} packed cells' working directories KEPT (the chunks failed verification)")
+        return acts, probs
+    for x in leftovers:
+        d = os.path.join(wd, x)
+        bp = os.path.join(d, "bundle.json")
+        if os.path.isfile(bp) and rqlib.sha256_file(bp) != cells[x][1]["bundle_sha256"]:
+            probs.append(f"work/{x} is packed, but its bundle.json differs from the packed one (kept)")
+            continue
+        shutil.rmtree(d)
+        acts.append(f"deleted the packed cell's working directory {x}")
+    if leftovers and os.path.isdir(wd):
         rqlib.fsync_dir(wd)
     od = os.path.join(root, OBJECTS)
     for dp, _, fs in os.walk(od) if os.path.isdir(od) else []:
@@ -377,4 +462,4 @@ def recover(root, log=print):
                 acts.append(f"removed a temporary store file {f}")
     for a in acts:
         log(f"recover: {a}")
-    return acts
+    return acts, probs

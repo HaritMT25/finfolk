@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """common.py: build a common-environment prey checkpoint (Red Queen design section 2).
 
-    common.py build --template T.json --source X.json --n 600 --seed S [--sampling wor-balanced|iid]
+    common.py build --template T.json --source X.json --n 600 --seed S [--sampling hybrid|wor-balanced|iid]
                     --out X.common.json --manifest X.common.manifest.json [--allow-config-mismatch]
     common.py validate --binary EVO_BOIDS --work EMPTY_DIR X.common.json
 
@@ -26,11 +26,13 @@ adds the predators):
     0.5 (buildNeuralNet's birth state); id i + 1, lineageId = its own id (a founder), generation
     0. The heritable body parameters (bodySize, bodyElong) come with the genome (1.0 / 1.0 when
     the body model is off, as in the study).
-  * SAMPLING, from the source's living prey (seeded, frequency-preserving):
-      wor-balanced (default): without replacement when the source has >= n prey; otherwise every
-        source creature n // m times plus n % m distinct extras, so frequencies are kept as
-        evenly as the counts allow (duplication recorded);
-      iid: n independent uniform draws with replacement (duplication recorded).
+  * SAMPLING, from the source's m living prey (seeded, frequency-preserving):
+      hybrid (default; the design's law): without replacement when m >= n, otherwise n
+        independent uniform draws with replacement (duplication recorded);
+      wor-balanced (an explicit protocol amendment only): without replacement when m >= n,
+        otherwise every source creature n // m times plus n % m distinct extras (it removes the
+        sampling variance of a small archive, and guarantees rare genotypes a slot);
+      iid: n independent uniform draws with replacement, whatever m.
     The slot order is random (the draw order), so source order never maps onto slot positions.
   * the MANIFEST: template and source (registered labels, SHA-256, frames), the policy and its
     duplication summary, every reset value, config differences, and per slot the source index,
@@ -62,7 +64,7 @@ import ckpt  # noqa: E402
 import rqlib  # noqa: E402
 
 SCHEMA = "finfolk.redqueen.common/1"
-POLICIES = ("wor-balanced", "iid")
+POLICIES = ("hybrid", "wor-balanced", "iid")   # hybrid: design section 2 (review round 2)
 # src/core/agent_core.hpp member defaults (a test parses the header to keep these in step).
 AGENT_DEFAULTS = {"age": 0.0, "foodReserves": 30.0, "speed": 80.0, "reproTimer": 0.0,
                   "interactTimer": 0.0, "responsiveness": 0.5, "oscPeriod": 34.0}
@@ -82,7 +84,9 @@ def sample_indices(m, n, seed, policy):
     if n <= 0:
         raise CommonError("n must be >= 1")
     rng = rqlib.SplitMix64(seed)
-    if policy == "wor-balanced":
+    if policy == "hybrid":
+        picks = rng.sample(m, n) if m >= n else [rng.below(m) for _ in range(n)]
+    elif policy == "wor-balanced":
         if m >= n:
             picks = rng.sample(m, n)
         else:
@@ -116,7 +120,7 @@ def _clear_predators(cp):
     cp["predators"] = out
 
 
-def build(template, source, n, seed, policy="wor-balanced", template_label=None, source_label=None,
+def build(template, source, n, seed, policy="hybrid", template_label=None, source_label=None,
           template_sha=None, source_sha=None, source_meta=None, allow_config_mismatch=False):
     """template, source: checkpoint dicts (ckpt.load). -> (common checkpoint dict, manifest dict).
     The manifest's 'output' (the written file's hash) is the caller's to add."""
@@ -279,7 +283,7 @@ def main(argv=None):
     b.add_argument("--source", required=True)
     b.add_argument("--n", type=int, required=True)
     b.add_argument("--seed", type=int, required=True)
-    b.add_argument("--sampling", default="wor-balanced", choices=POLICIES)
+    b.add_argument("--sampling", default="hybrid", choices=POLICIES)
     b.add_argument("--out", required=True)
     b.add_argument("--manifest", required=True)
     b.add_argument("--allow-config-mismatch", action="store_true")

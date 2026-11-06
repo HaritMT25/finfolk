@@ -20,16 +20,38 @@ def now_utc():
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def die_with_parent():
-    """preexec_fn: SIGTERM this child when its parent dies, even by SIGKILL (Linux
-    PR_SET_PDEATHSIG; a no-op elsewhere). Workers are plain subprocesses (no multiprocessing:
-    Python 3.14 changed its default start method), so this is the only process plumbing."""
-    import signal
+def _libc():
     try:
         import ctypes
-        ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, signal.SIGTERM, 0, 0, 0)
-    except (OSError, AttributeError):
-        pass
+        return ctypes.CDLL("libc.so.6", use_errno=True)
+    except (OSError, ImportError):
+        return None
+
+
+_LIBC = _libc()        # loaded in the parent: the forked child only calls into it
+PR_SET_PDEATHSIG = 1
+
+
+def death_signal(expected_parent=None):
+    """-> a preexec_fn for subprocess.Popen: the child gets SIGTERM when its parent dies, even by
+    SIGKILL (Linux PR_SET_PDEATHSIG). Workers are plain subprocesses (no multiprocessing: Python
+    3.14 changed its default start method), so this is the only process plumbing.
+    expected_parent: the spawning process's pid, taken BEFORE the fork. A parent that died between
+    the fork and the prctl would not signal the child (it has been reparented already), so after
+    a successful prctl the child compares getppid() with it and exits at once if they differ. A
+    failing prctl raises in the child (Popen then raises in the parent: nothing runs unguarded).
+    Without libc (not Linux) it is a no-op."""
+    import signal
+    parent = os.getpid() if expected_parent is None else expected_parent
+
+    def pre():
+        if _LIBC is None:
+            return
+        if _LIBC.prctl(PR_SET_PDEATHSIG, signal.SIGTERM, 0, 0, 0) != 0:
+            raise OSError("prctl(PR_SET_PDEATHSIG) failed")
+        if os.getppid() != parent:
+            os._exit(1)      # the parent is already gone: run nothing
+    return pre
 
 
 # ------------------------------------------------------------------- hashing

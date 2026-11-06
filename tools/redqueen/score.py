@@ -21,8 +21,10 @@ Readouts per horizon h (summed counts over summed exposure, never a mean of inte
     (exact; the main CSV's first interval row can carry a loaded world's history).
 Checks (any failure raises ScoreError): rows exactly at f0 + m x log_every; the checkpoint at
 each horizon at its frame; the arena's and every checkpoint's predator count == K in the frozen
-modes, no predator births / deaths / refills there; and the predation-death counter difference
-equals the summed captures.
+modes, no predator births / deaths / refills there; the predation-death counter difference
+equals the summed captures; and in the predator-free fork (--fork), in every assay mode, no
+predator at any sample or horizon, no capture, predator birth or refill in any row, and no
+change of the predator-birth, refill or predation-death counters.
 """
 from __future__ import annotations
 
@@ -56,7 +58,10 @@ def _ratio(a, b):
     return a / b if b > 0 else None
 
 
-def score(d, k, steps, horizons, log_every, assay):
+def score(d, k, steps, horizons, log_every, assay, fork=False):
+    """fork: the predator-free continuation (K = 0). Any predator at any sample or horizon, any
+    capture, predator birth or refill, or any predation death refuses it (review round 2: a live
+    control could otherwise be refilled by a predator floor and still pass)."""
     arena = ckpt.load(os.path.join(d, "arena.json"))
     f0 = int(arena["world"]["frame"])
     start_ids = {int(i) for i, a in zip(arena["creatures"]["id"], arena["creatures"]["alive"]) if int(a)}
@@ -73,6 +78,14 @@ def score(d, k, steps, horizons, log_every, assay):
         raise ScoreError(f"predators.csv rows at {steps_seen[:3]}..., expected every {log_every} from {f0 + log_every} "
                          f"to {f0 + steps}")
     frozen = assay in FROZEN
+    if fork:
+        if k != 0:
+            raise ScoreError(f"a predator-free fork with K = {k}")
+        for r in prow:
+            bad = {c: r[c] for c in ("predator_pop", "captures_interval", "births_interval", "reseeds_interval")
+                   if int(r[c]) != 0}
+            if bad:
+                raise ScoreError(f"the predator-free fork has predators at step {r['step']}: {bad}")
     if frozen:
         for r in prow:
             if int(r["predator_pop"]) != k:
@@ -89,6 +102,12 @@ def score(d, k, steps, horizons, log_every, assay):
             raise ScoreError(f"end.{f0 + h}.json is at frame {cp['world']['frame']}")
         if frozen and int(cp["predators"]["count"]) != k:
             raise ScoreError(f"{cp['predators']['count']} predators at frame {f0 + h} in a frozen assay (K = {k})")
+        if fork:
+            moved = {c: int(cp["counters"].get(c, 0)) - int(base.get(c, 0)) for c in
+                     ("totalPredatorBirths", "totalPredatorReseeds", "totalDeathsPredation")}
+            if int(cp["predators"]["count"]) != 0 or any(moved.values()):
+                raise ScoreError(f"the predator-free fork at frame {f0 + h}: {cp['predators']['count']} predators, "
+                                 f"counter changes {moved}")
         rows = [r for r in prow if int(r["step"]) <= f0 + h]
         captures = sum(int(r["captures_interval"]) for r in rows)
         pred_s = sum(int(r["predator_pop"]) * log_every * DT for r in rows)
@@ -116,7 +135,8 @@ def score(d, k, steps, horizons, log_every, assay):
         })
     return {"schema": SCHEMA, "f0": f0, "k": k, "assay": assay, "n_start": n0, "dt": DT, "log_every": log_every,
             "steps": steps, "horizons": out,
-            "checks": {"rows": len(prow), "frozen_k_constant": frozen, "predation_deaths_equal_captures": True}}
+            "checks": {"rows": len(prow), "frozen_k_constant": frozen, "predation_deaths_equal_captures": True,
+                       "fork_predator_free": fork}}
 
 
 def main(argv=None):
@@ -127,9 +147,10 @@ def main(argv=None):
     ap.add_argument("--horizons", required=True)
     ap.add_argument("--log-every", type=int, required=True)
     ap.add_argument("--assay", default="frozen")
+    ap.add_argument("--fork", action="store_true", help="the predator-free continuation (K = 0)")
     a = ap.parse_args(argv)
     try:
-        res = score(a.dir, a.k, a.steps, [int(x) for x in a.horizons.split(",")], a.log_every, a.assay)
+        res = score(a.dir, a.k, a.steps, [int(x) for x in a.horizons.split(",")], a.log_every, a.assay, a.fork)
     except (ScoreError, ckpt.CheckpointError, OSError, KeyError, ValueError) as e:
         print(f"score.py: {e}", file=sys.stderr)
         return 1
