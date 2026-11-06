@@ -1,7 +1,17 @@
-# Finfolk — evo_boids CLI reference (v0.26.0)
+# Finfolk — evo_boids CLI reference (v0.27.0)
 
 Headless runner for the evolutionary boids simulation. Defaults reproduce the
 original behaviour, so any flag is an opt-in change.
+
+> **v0.27.0 — neural predators (Stage C)** (`--predator-brain`, `--predator-mutation`,
+> `--predator-turn-rate`, `--predator-min-speed`, `--predator-primer`, `--predator-log`,
+> and the transplant `--predators-from` … `--transplant-out`; see the section after the
+> predator floor): the hunt becomes a network built from each predator's genome, a bud
+> inherits its parent's genome with a mutation, and two checkpoints can be combined into
+> a time-shift assay arena (prey of one, predators of another). Off by default, and off
+> **every output is byte-identical to v0.26.0's** apart from the version string: no CSV
+> column, no sidecar line and no checkpoint key is added. Brain runs write their own
+> `<name>.predators.csv` and checkpoints in format version 2.
 
 > **v0.26.0 — predator floor, ceiling and heritable traits** (`--predator-min-pop`,
 > `--predator-max-pop`, `--predator-inherit`, `--predator-trait-mutation`; see the
@@ -353,6 +363,95 @@ arena above and the web page's defaults).**
   speed ×0.83 and budding ×0.85 (medians, 6/6 seeds), so a cheaper cruise and an earlier
   bud. That evolved population filled the cap and caught twice as many prey. At 1.4×
   the traits barely moved. Use it with a kinetic cost, a lifespan and a cap.
+
+## Neural predators (Stage C, v0.27.0)
+
+**Off by default.** `--predator-brain` replaces the scripted hunt with a network built
+from each predator's own genome, made with the prey's machinery (the same genes, mutation
+operators and network evaluation) but with the predator's own inputs and outputs:
+
+- **21 inputs** (frozen; checkpoints carry the sensor-set version, 1): the nearest prey
+  within `--predator-perception` (bearing forward / right, proximity, its heading forward
+  / right), the prey in range (count, centroid forward / right), the nearest other
+  predator (forward / right / proximity), own state (energy relative to the budding
+  threshold, digesting, speed, age), the prey's pheromone (here, forward, right),
+  the current (forward, right), and noise.
+- **2 outputs:** TURN (up to `--predator-turn-rate` rad/s) and THRUST (speed ±50/s², between
+  `--predator-min-speed` and `--predator-speed` × speedFactor). The kinetic cost is paid
+  at the current speed, so slowing down saves energy.
+- **Capture, the cooldown and the meal are Stage B's**: the nearest prey within the
+  capture radius dies if the predator is not digesting. The cap rule above still holds.
+- **Reproduction:** with `--predator-economy`, a predator buds as in Stage B, and the bud
+  gets its parent's genome with a mutation (the prey's operators and per-birth rate
+  lottery, × `--predator-mutation`). Each predator has an id, a lineage (its founder's id)
+  and a parent id. A floor refill is a **random-genome founder of a new lineage**.
+- **Without `--predator-economy`** the brain still runs: a fixed number of immortal neural
+  hunters that never bud (the *frozen* mode a time-shift assay runs in).
+- **Random draws:** the predators' genomes, mutations and noise input come from their own
+  stream, seeded by one draw at the end of the world's set-up; every draw Stage B made
+  stays where it was. A `--seed` reproduces a run in the serial build, and native == wasm.
+
+| Flag | Default | Effect |
+|---|---|---|
+| `--predator-brain` | off | Neural predators. |
+| `--predator-mutation F` | 1 | Multiplies the per-bud mutation rate. Must be finite and ≥ 0. |
+| `--predator-turn-rate F` | 4 | rad/s at full TURN (the prey's `--max-turn-rate` default). |
+| `--predator-min-speed F` | 0 | THRUST's floor. 0 lets a predator stop and wait (ambush). |
+| `--predator-primer` | off | Founders start with two pursuit genes (PREY_LR → TURN, PREY_PROX → THRUST) written over their first two genes. Off = random genomes. |
+| `--predator-log` | off | Stream every predator founding (F), floor refill (R), bud (B) and death (S starved, A aged) to `<name>.predlog.csv` (frame, event, id, parent, lineage, generation, age, captures, energy, genome length, traits). Never decimated. |
+
+**The Stage C recipe (an evolving run):** `--predators 6 --predator-economy
+--predator-brain --predator-max-pop N --predator-min-pop 2 --predator-max-age 120` plus a
+meal of 1.2–1.5× break-even. **Use a max age with a cap:** predators at the cap neither die
+nor bud, so without turnover evolution stops (the CLI warns).
+
+**Outputs with the brain on** (the main CSV is unchanged):
+
+- `<name>.predators.csv`, one row per `--log-every`: predator and prey counts; this
+  interval's births, starvations, deaths of age, refills and captures; captures per
+  predator-second; `pursuit_frac` (predator-steps with a prey in range);
+  `captures_per_pursuit_s`; **`pursuit_align`** (mean cosine of heading against the bearing to
+  the nearest prey — the hunter's mirror of `predator_align`); speed mean, CV and the share
+  at ≥ 95 % of top speed; mean energy, age and generation, max generation; lineages alive;
+  mean genome length; `genome_dist_mean` (mean pairwise distance of the folded networks, first
+  64 predators); the share of predators wiring prey / rival / pheromone / own-state inputs;
+  deaths this interval and their mean lifetime captures and age.
+- `<name>.pwiring.csv` with `--wiring-log`: per predator input, the share wiring it.
+- Console: ` pGen  pLen  pAln` (mean generation, genome length, pursuit alignment).
+- Checkpoints are **format version 2** (a v0.26 binary refuses them): predator ids,
+  lineages, parents, speed, captures, recurrent outputs and genomes, the predators' stream
+  and id counter. Brain-off checkpoints stay version 1, byte for byte.
+
+## Transplant: time-shift assay arenas (Stage C, v0.27.0)
+
+```bash
+# the arena: X's whole world, K of Y's predators (written, not run)
+./build/evo_boids --load-checkpoint X.json --predators-from Y.json --transplant-count 6 \
+    --transplant-seed 1 --assay frozen --transplant-out arena.json
+# the assay: an ordinary resume, one per replicate seed R
+./build/evo_boids --load-checkpoint arena.json --reseed-after-load R --headless 20000 \
+    --csv runs/assay_R.csv --no-render
+```
+
+- **Kept from X**: the prey (genomes, brain state, ids), food, pheromones, patches, currents,
+  the frame (and with it the food cycle's phase), counters, the random stream, the config.
+  X's predators are dropped.
+- **From Y**: K predators sampled with `--transplant-seed` (all of them by default; with
+  replacement if K > |Y|), carrying only their genome, lineage, generation and traits.
+  `--predators-from random` makes K random-genome founders instead (how to start Stage C on
+  an evolved prey world).
+- **Reset**: energy (newborn), age, digest, captures, speed (top), recurrent outputs (0.5),
+  ids (fresh; Y's are in `arena.manifest.json`), positions and headings (drawn from the
+  transplant seed, never from the world's stream).
+- **Config**: X's. The predator physics (perception, speed, capture radius, cooldown,
+  metabolism, move costs, meal, repro and newborn energy, turn rate, min speed) must match Y's,
+  or the transplant is refused (`--transplant-allow-mismatch` keeps X's).
+  `--predator-mutation` / `--predator-primer` come from Y.
+- **`--assay frozen`** (default): economy off (K immortal predators that neither bud nor
+  mutate), no predator floor or cap, prey `--min-pop 0`. **`--assay live`**: X's config.
+- **Deterministic**: the arena is a function of (X, Y, K, seed, assay) byte for byte, and the
+  assay a function of (arena, R) in the serial build. Score from `<name>.predators.csv`
+  (captures per predator-second) and the main CSV (predation deaths).
 
 ## Environment — currents & spatial food
 
