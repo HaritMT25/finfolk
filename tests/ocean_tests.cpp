@@ -3499,6 +3499,7 @@ void testShimBools() {
         {"triangularMotion", &SimConfig::triangularMotion}, {"foodDrift", &SimConfig::foodDrift},
         {"predatorEconomy", &SimConfig::predatorEconomy}, {"predatorInheritance", &SimConfig::predatorInheritance},
         {"predatorBrain", &SimConfig::predatorBrain}, {"predatorPrimer", &SimConfig::predatorPrimer},   // v0.27.0
+        {"predatorFrozen", &SimConfig::predatorFrozen},
         {"fastTanh", &SimConfig::fastTanh},
     };
     const struct { const char* key; bool OceanConfig::*m; } oceans[] = {

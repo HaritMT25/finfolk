@@ -176,6 +176,7 @@ inline void writeConfig(jsonm::Writer& w, const SimConfig& c) {
         w.field("predatorTurnRate", c.predatorTurnRate);
         w.field("predatorMinSpeed", c.predatorMinSpeed);
         w.field("predatorPrimer", c.predatorPrimer);
+        w.field("predatorFrozen", c.predatorFrozen);
     }
     w.field("fastTanh", c.fastTanh);
     w.endObject();
@@ -268,6 +269,7 @@ inline void readConfig(const jsonm::Value& j, SimConfig& c) {
     c.predatorTurnRate = o->floatOr("predatorTurnRate", c.predatorTurnRate);
     c.predatorMinSpeed = o->floatOr("predatorMinSpeed", c.predatorMinSpeed);
     c.predatorPrimer = o->boolOr("predatorPrimer", c.predatorPrimer);
+    c.predatorFrozen = o->boolOr("predatorFrozen", c.predatorFrozen);
     c.fastTanh = o->boolOr("fastTanh", c.fastTanh);
 }
 
@@ -301,6 +303,7 @@ inline std::string serialize(const World& world, const char* engineVersion) {
     w.field("frame", (unsigned long long)world.frame);
     w.field("nextId", (unsigned long long)world.nextId_);
     if (brain) w.field("nextPredatorId", (unsigned long long)world.nextPredatorId_);
+    if (brain && world.arenaFresh_) w.field("arena", true);   // a transplant's arena, not yet run
     w.endObject();
     w.newline();
 
@@ -397,6 +400,12 @@ inline std::string serialize(const World& world, const char* engineVersion) {
         w.key("parentId"); w.beginArray(); for (const Predator& p : ps) w.value((unsigned long long)p.parentId); w.endArray();
         w.key("speed"); w.beginArray(); for (const Predator& p : ps) w.value(p.speed); w.endArray();
         w.key("captures"); w.beginArray(); for (const Predator& p : ps) w.value((unsigned long long)p.captures); w.endArray();
+        // Transplanted predators' ids in their source checkpoint: only when any has one.
+        bool anySource = false;
+        for (const Predator& p : ps) anySource = anySource || p.sourceId != 0;
+        if (anySource) {
+            w.key("sourceId"); w.beginArray(); for (const Predator& p : ps) w.value((unsigned long long)p.sourceId); w.endArray();
+        }
         w.key("neuronOutputs"); w.beginArray();
         for (const Predator& p : ps)
             for (int k = 0; k < MAX_INTERNAL_NEURONS; ++k) w.value(p.nnet.neurons[(size_t)k].output);
@@ -546,7 +555,7 @@ inline bool readPredators(const jsonm::Value& jp, bool brain, std::uint64_t next
     }
 
     // Stage C brain columns (version 2 only).
-    std::vector<long long> ids, lin, par, cap, glen, genes;
+    std::vector<long long> ids, lin, par, cap, glen, genes, src;
     std::vector<float> spd, neur;
     if (brain) {
         const int set = jp.intOr("sensorSet", -1);
@@ -576,6 +585,11 @@ inline bool readPredators(const jsonm::Value& jp, bool brain, std::uint64_t next
                 error = "'nextPredatorId' must exceed every predator id"; return false;
             }
             if (lin[i] <= 0 || par[i] < 0) { error = "predator lineageId / parentId out of range"; return false; }
+            // Every lineage id is some founder's id, so it is below the counter
+            // too (an arena's first id is above every transplanted lineage).
+            if (nextPredatorId > 0 && (unsigned long long)lin[i] >= nextPredatorId) {
+                error = "'nextPredatorId' must exceed every predator lineageId"; return false;
+            }
             if (cap[i] < 0 || cap[i] > (long long)UINT32_MAX) { error = "predator 'captures' out of range"; return false; }
             if (!(spd[i] >= 0.0f) || !std::isfinite(spd[i])) { error = "predator 'speed' must be finite and >= 0"; return false; }
         }
@@ -587,6 +601,12 @@ inline bool readPredators(const jsonm::Value& jp, bool brain, std::uint64_t next
             needed += (size_t)L * 2;
         }
         if (genes.size() != needed) { error = "predator 'genes' length does not match 'genomeLengths'"; return false; }
+        // Optional: written only when some predator was transplanted.
+        if (jp.find("sourceId") && !jsonm::readInts(jp, "sourceId", src, n)) {
+            error = "malformed predator 'sourceId' array (length mismatch?)"; return false;
+        }
+        for (long long v : src)
+            if (v < 0) { error = "predator 'sourceId' out of range"; return false; }
     }
 
     out.clear();
@@ -608,6 +628,7 @@ inline bool readPredators(const jsonm::Value& jp, bool brain, std::uint64_t next
             p.lineageId = (std::uint64_t)lin[i];
             p.parentId = (std::uint64_t)par[i];
             p.captures = (std::uint32_t)cap[i];
+            p.sourceId = src.empty() ? 0u : (std::uint64_t)src[i];
             p.speed = spd[i];
             p.genome.clear();
             p.genome.reserve((size_t)glen[i]);
@@ -713,12 +734,14 @@ inline bool deserialize(const std::string& text, World& world, std::string& erro
     world.frame  = jw->ullOr("frame", 0);
     world.nextId_ = jw->ullOr("nextId", 1);
     world.nextPredatorId_ = 1;
+    world.arenaFresh_ = false;
     if (brain) {
         const jsonm::Value* np = jw->find("nextPredatorId");
         if (!np || np->type != jsonm::Value::Type::Number || !(np->num >= 1.0)) {
             error = "a version-2 checkpoint needs world.nextPredatorId >= 1"; return false;
         }
         world.nextPredatorId_ = (std::uint64_t)np->num;
+        world.arenaFresh_ = jw->boolOr("arena", false);   // an arena not yet run (transplant.hpp)
     }
 
     if (const jsonm::Value* jc = j.find("counters")) {

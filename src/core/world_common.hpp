@@ -133,8 +133,12 @@ struct WorldCommon {
     std::uint64_t nextPredatorId_ = 1;
 
     // The lineage log (cfg.predatorLog): one record per founding (F: initial
-    // spawn, R: floor refill), bud (B) and death (S: starved, A: aged). Drained
-    // by the headless runner at every sample, never decimated. Not world state.
+    // spawn, R: floor refill), bud (B) and death (S: starved, A: aged), plus,
+    // at the start of a run that did not come from init(), one record per live
+    // predator: L (loaded from a checkpoint) or T (transplanted: the first run
+    // of an arena; `source` = its id in the source checkpoint). Drained by the
+    // headless runner at every sample and before every checkpoint write, never
+    // decimated. Not world state.
     struct PredatorEvent {
         unsigned long long frame = 0;
         char event = '?';
@@ -145,8 +149,14 @@ struct WorldCommon {
         float energy = 0.0f;
         int genomeLen = 0;
         float speedFactor = 1.0f, buddingFactor = 1.0f;
+        std::uint64_t source = 0;
     };
     std::vector<PredatorEvent> predLog_;
+
+    // Set by the transplant on the arena it builds (written to the arena file
+    // as world.arena = true) and cleared once the arena's first run has logged
+    // its T rows, so only the arena file itself carries it.
+    bool arenaFresh_ = false;
 
     // Per-interval sums for <stem>.predators.csv (predator_stats.hpp), reset at
     // each sample. Diagnostics only: nothing in the step reads them back.
@@ -175,7 +185,17 @@ struct WorldCommon {
         e.generation = p.generation; e.age = p.age; e.captures = p.captures; e.energy = p.energy;
         e.genomeLen = (int)p.genome.size();
         e.speedFactor = p.speedFactor; e.buddingFactor = p.buddingFactor;
+        e.source = (event == 'T') ? p.sourceId : 0;
         predLog_.push_back(e);
+    }
+
+    // A run that starts from a checkpoint: one L row (or T, for an arena's
+    // first run) per live predator, so the log segment is self-contained.
+    // Stitching: keep the earlier segment's rows with frame <= this frame, then
+    // this segment's rows without its L rows.
+    template <class Predators>
+    void notePredatorsAtStart(const Predators& ps, char event) {
+        for (const auto& p : ps) notePredator(event, p);
     }
 
     // Seed the run's streams from S: the global rng, then (brain on) the

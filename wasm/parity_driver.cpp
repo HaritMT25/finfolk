@@ -40,10 +40,11 @@
 //            needs native==wasm proven on its own path.
 //   --pred-count N / --pred-meal F  override --rich's 4 predators / absorb meal,
 //            to reach a regime where the floor or the cap actually bites.
-//   --pred-brain / --pred-noecon / --pred-primer / --pred-max-age F  (v0.27.0)
-//            Stage C neural predators (their own random stream, predRng_), the
-//            frozen mode (brains without the economy), the pursuit primer, and a
-//            predator lifespan for turnover under a cap.
+//   --pred-brain / --pred-noecon / --pred-frozen / --pred-primer / --pred-max-age F
+//            (v0.27.0) Stage C neural predators (their own random stream,
+//            predRng_), the frozen-newborn assay (brains without the economy),
+//            the frozen assay (the economy's accounting with no deaths or buds),
+//            the pursuit primer, and a predator lifespan for turnover.
 //   --trace  print "frame fingerprint" to stderr every N steps (divergence bisection)
 #include <cstdio>
 #include <cstdlib>
@@ -131,7 +132,7 @@ int main(int argc, char** argv) {
     float reproSoftWidth = 0.0f, reproGracePeriod = 0.0f;
     int predFloor = 0, predCap = 0, predCount = -1;
     bool predInherit = false;
-    bool predBrain = false, predNoEcon = false, predPrimer = false;
+    bool predBrain = false, predNoEcon = false, predPrimer = false, predFrozen = false;
     float predMaxAge = 0.0f;
     float predMeal = -2.0f;   // < -1.5 => leave the config default alone
     const char* engineVersion = "parity";
@@ -159,6 +160,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--pred-brain")) predBrain = true;
         else if (!std::strcmp(argv[i], "--pred-noecon")) predNoEcon = true;
         else if (!std::strcmp(argv[i], "--pred-primer")) predPrimer = true;
+        else if (!std::strcmp(argv[i], "--pred-frozen")) predFrozen = true;
         else if (!std::strcmp(argv[i], "--pred-max-age") && i + 1 < argc)
             predMaxAge = (float)std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "--engine-version") && i + 1 < argc) engineVersion = argv[++i];
@@ -196,6 +198,7 @@ int main(int argc, char** argv) {
     if (predBrain) world.cfg.predatorBrain = true;           // Stage C (v0.27.0)
     if (predNoEcon) world.cfg.predatorEconomy = false;       // the frozen mode
     if (predPrimer) world.cfg.predatorPrimer = true;
+    if (predFrozen) world.cfg.predatorFrozen = true;         // the frozen assay's accounting
     if (predMaxAge > 0.0f) world.cfg.predatorMaxAge = predMaxAge;
     world.init(1920, 1080, 300);
 

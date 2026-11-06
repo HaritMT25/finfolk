@@ -128,12 +128,15 @@ run_case "pall_s42"     42   6000 --rich --pred-count 20 --pred-meal 12 --pred-f
 #                     generation 11, 197 captures.
 #   pbrain_all_s7     inheritance + floor 3 + cap 16 + max age 20 + toroidal: 3 buds,
 #                     9 aged out, 1 starved, 6 random-genome refills.
-#   pbrain_frozen_s3  no economy (the frozen assay mode): 4 immortal predators,
+#   pbrain_frozen_s3  no economy (the frozen-newborn assay): 4 immortal predators,
 #                     no buds, 29 captures by their networks.
+#   pbrain_frozenacct_s3  the frozen assay (economy accounting, no deaths or buds;
+#                     energy held in [0, T], age capped at the max age of 10 s).
 #   pbrain_primer_s5  the pursuit primer on 8 founders: 406 buds, 434 captures.
 run_case "pbrain_s42"       42 2000 --rich --pred-brain
 run_case "pbrain_all_s7"    7  4000 --rich --toroidal --pred-brain --pred-inherit --pred-floor 3 --pred-cap 16 --pred-max-age 20 --pred-meal 14
 run_case "pbrain_frozen_s3" 3  2000 --rich --pred-brain --pred-noecon
+run_case "pbrain_frozenacct_s3" 3 2000 --rich --pred-brain --pred-frozen --pred-max-age 10
 run_case "pbrain_primer_s5" 5  2000 --rich --pred-brain --pred-primer --pred-count 8
 run_case "long_s42"    42    10000
 

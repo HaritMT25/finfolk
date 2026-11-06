@@ -376,7 +376,7 @@ inline bool isOceanIntKey(const std::string& k) {
 // kOceanBoolKeys readOceanConfig's readBool keys: wasm/ocean_parity.sh checks both.
 inline constexpr const char* kSimConfigBoolKeys[] = {"toroidal", "bodyModel", "triangularMotion", "foodDrift",
                                                      "predatorEconomy", "predatorInheritance", "predatorBrain",
-                                                     "predatorPrimer", "fastTanh"};
+                                                     "predatorPrimer", "predatorFrozen", "fastTanh"};
 inline constexpr const char* kOceanBoolKeys[] = {"deepCurrent", "lightEnabled", "depthCostScaled",
                                                  "sizeDrift", "sizeFight", "mouthGate", "walls"};
 inline bool isSimConfigBoolKey(const std::string& k) {

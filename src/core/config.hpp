@@ -280,7 +280,9 @@ struct SimConfig {
     // predator's genome (predator_brain.hpp: 21 inputs, TURN and THRUST out).
     // With predatorEconomy a bud inherits its parent's genome with a mutation, so
     // the predators evolve; without it they are immortal, fixed-count neural
-    // hunters that never bud (the "frozen" mode a time-shift assay runs in).
+    // hunters that never bud, with their energy and age pinned (ENERGY and AGE
+    // read 0: the "frozen-newborn" assay). predatorFrozen (with the economy) is
+    // the default assay mode: energy and age are accounted, nobody dies or buds.
     // Capture, the cooldown and the meal are Stage B's. A floor refill is a
     // random-genome founder. Its draws (genomes, mutation, the RANDOM input) come
     // from WorldCommon::predRng_; every draw Stage B made stays where it was.
@@ -293,6 +295,12 @@ struct SimConfig {
     bool  predatorPrimer   = false;  // founders' genomes start with two "pursuit primer"
                                      // genes (PREY_LR -> TURN, PREY_PROX -> THRUST); off =
                                      // random genomes (the default)
+    bool  predatorFrozen   = false;  // [brain + economy] the frozen assay (transplant.hpp,
+                                     // --assay frozen): energy and age are accounted (burn,
+                                     // meals, ageing) so ENERGY and AGE keep their evolved
+                                     // range, but nobody starves, ages out or buds: energy is
+                                     // held in [0, repro threshold], age at most predatorMaxAge
+                                     // (when > 0). Brain predators only.
 
     // --- Inspection & analysis (visual/diagnostic; do not affect dynamics) ---
     // Capture each creature's last sensor inputs / action outputs every step so a
@@ -445,6 +453,7 @@ struct SimConfig {
               << " predatorTurnRate=" << predatorTurnRate
               << " predatorMinSpeed=" << predatorMinSpeed
               << " predatorPrimer="   << (predatorPrimer ? "on" : "off")
+              << " predatorFrozen="   << (predatorFrozen ? "on (no deaths, no buds)" : "off")
               << " predatorLog="      << (predatorLog ? "on" : "off");
         return o.str();
     }
@@ -462,5 +471,9 @@ inline const char* predatorBrainConfigError(const SimConfig& c) {
         return "predatorTurnRate must be finite and >= 0";
     if (!(c.predatorMinSpeed >= 0.0f) || !std::isfinite(c.predatorMinSpeed))
         return "predatorMinSpeed must be finite and >= 0";
+    // With the brain on, a floor above the cruise would silently raise the
+    // ceiling (predbrain::topSpeed takes the max): refuse it instead.
+    if (c.predatorBrain && c.predatorMinSpeed > c.predatorSpeed)
+        return "predatorMinSpeed must not exceed predatorSpeed";
     return nullptr;
 }

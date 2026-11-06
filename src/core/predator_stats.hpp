@@ -173,17 +173,25 @@ inline std::string wiringRow(int step, const World& w) {
 }
 
 // <stem>.predlog.csv: the lineage log (cfg.predatorLog), drained at each call.
+// Events: F founder (init), R floor refill, B bud, S starved, A aged; and at the
+// start of a segment that began from a checkpoint, L (loaded) or T
+// (transplanted; `source` = its id in the source checkpoint, another id
+// namespace) for every live predator.
 inline std::string logHeader() {
-    return "frame,event,id,parent,lineage,generation,age,captures,energy,genome_len,speed_factor,budding_factor";
+    return "frame,event,id,parent,lineage,generation,age,captures,energy,genome_len,speed_factor,budding_factor,source";
+}
+inline std::string logRow(const WorldCommon::PredatorEvent& e) {
+    char buf[320];
+    std::snprintf(buf, sizeof buf, "%llu,%c,%llu,%llu,%llu,%u,%.6g,%u,%.6g,%d,%.6g,%.6g,%llu",
+                  e.frame, e.event, (unsigned long long)e.id, (unsigned long long)e.parent,
+                  (unsigned long long)e.lineage, (unsigned)e.generation, (double)e.age,
+                  (unsigned)e.captures, (double)e.energy, e.genomeLen, (double)e.speedFactor,
+                  (double)e.buddingFactor, (unsigned long long)e.source);
+    return buf;
 }
 inline std::size_t drainLog(World& w, std::FILE* f) {
     const std::size_t n = w.predLog_.size();
-    for (const auto& e : w.predLog_)
-        std::fprintf(f, "%llu,%c,%llu,%llu,%llu,%u,%.6g,%u,%.6g,%d,%.6g,%.6g\n",
-                     e.frame, e.event, (unsigned long long)e.id, (unsigned long long)e.parent,
-                     (unsigned long long)e.lineage, (unsigned)e.generation, (double)e.age,
-                     (unsigned)e.captures, (double)e.energy, e.genomeLen, (double)e.speedFactor,
-                     (double)e.buddingFactor);
+    for (const auto& e : w.predLog_) std::fprintf(f, "%s\n", logRow(e).c_str());
     w.predLog_.clear();
     return n;
 }

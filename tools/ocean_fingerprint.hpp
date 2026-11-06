@@ -209,19 +209,19 @@ constexpr std::size_t fieldCount() {
 
 #define OFP_FIELDS(T, N) \
     static_assert(detail::fieldCount<T>() == (N), #T " gained or lost a field: hash it in tools/ocean_fingerprint.hpp, then update this count")
-OFP_FIELDS(SimConfig, 77);   // 71 + the six Stage C keys (visitSimConfigBrain, predatorLog)
+OFP_FIELDS(SimConfig, 78);   // 71 + the seven Stage C keys (visitSimConfigBrain)
 OFP_FIELDS(OceanConfig, 37);
 OFP_FIELDS(appearance::Stats, 10);   // founders, offspring, pattern[4], morph[4]
 OFP_FIELDS(AgentCore, 16 + NUM_SENSES + NUM_ACTIONS + 1);   // 14 scalars + genome + nnet, the two arrays, colour
 OFP_FIELDS(Fish, 1 + 6 + Fish::BODY_LEN);                   // base, pos .. bodyBuoy, body[]
-OFP_FIELDS(Predator, 16);   // 9 + the Stage C brain (genome .. captures): hashPredator's tagged block
+OFP_FIELDS(Predator, 17);   // 9 + the Stage C brain (genome .. sourceId): hashPredator's tagged block
 OFP_FIELDS(OceanPredator, 3);                               // base, depth, pitch
 OFP_FIELDS(OceanFood, 5 + (kOceanHasEye ? 1 : 0));   // pos, depth, alive, size, age (+ eyeCon)
 OFP_FIELDS(Gene, 5);
 OFP_FIELDS(NeuralNet, 2);
 OFP_FIELDS(NeuralNet::Neuron, 2);
 OFP_FIELDS(NeuralNet::FlatConn, 2);
-OFP_FIELDS(WorldCommon, 29);   // 25 + Stage C: predRng_, nextPredatorId_ (ctr's tagged block), predLog_, predTally_ (statistics, not hashed)
+OFP_FIELDS(WorldCommon, 30);   // 25 + Stage C: predRng_, nextPredatorId_, arenaFresh_ (ctr's tagged block), predLog_, predTally_ (statistics, not hashed)
 OFP_FIELDS(WorldCommon::DeathRecord, 7 + CLUSTER_SKETCH_DIM);
 OFP_FIELDS(WorldCommon::BirthRecord, 6);
 OFP_FIELDS(repro::Edge, 2);
@@ -385,14 +385,22 @@ void visitSimConfig(const SimConfig& c, V& v) {
 template <class V>
 void visitSimConfigBrain(const SimConfig& c, V& v) {
     OFP_B(predatorBrain); OFP_F(predatorMutation); OFP_F(predatorTurnRate); OFP_F(predatorMinSpeed);
-    OFP_B(predatorPrimer); OFP_B(predatorLog);
+    OFP_B(predatorPrimer); OFP_B(predatorFrozen); OFP_B(predatorLog);
 }
+// "At its defaults" is derived from the visitor itself (every visited key, bit
+// for bit, against a default SimConfig), so a key added to the visitor can
+// never be left out of the test and alias an old fingerprint.
+struct ConfigWords {
+    std::vector<std::uint64_t> w;
+    void f32(const char*, float v) { std::uint32_t x; std::memcpy(&x, &v, 4); w.push_back(x); }
+    void i32(const char*, int v) { w.push_back((std::uint32_t)v); }
+    void b(const char*, bool v) { w.push_back(v ? 1u : 0u); }
+};
 inline bool simBrainAtDefaults(const SimConfig& c) {
-    const SimConfig d{};
-    auto same = [](float a, float b) { std::uint32_t x, y; std::memcpy(&x, &a, 4); std::memcpy(&y, &b, 4); return x == y; };
-    return c.predatorBrain == d.predatorBrain && same(c.predatorMutation, d.predatorMutation) &&
-           same(c.predatorTurnRate, d.predatorTurnRate) && same(c.predatorMinSpeed, d.predatorMinSpeed) &&
-           c.predatorPrimer == d.predatorPrimer && c.predatorLog == d.predatorLog;
+    ConfigWords a, d;
+    visitSimConfigBrain(c, a);
+    visitSimConfigBrain(SimConfig{}, d);
+    return a.w == d.w;
 }
 template <class V>
 void visitOceanConfig(const OceanConfig& c, V& v) {
@@ -490,9 +498,10 @@ inline void hashCounters(Hasher& h, const OceanWorld& w) {
     // Stage C: the predator stream and id counter, only with the brain on (the
     // stream is otherwise at its fixed construction seed and never drawn).
     // predLog_ / predTally_ are statistics and not hashed (like foodEaten).
-    if (w.cfg.predatorBrain || w.nextPredatorId_ != 1) {
+    if (w.cfg.predatorBrain || w.nextPredatorId_ != 1 || w.arenaFresh_) {
         h.u64(kBrainCtrTag);
         h.u64(w.nextPredatorId_);
+        h.b(w.arenaFresh_);
         const auto& eng = field<peek::RgEngine>(w.predRng_);
         const auto& x = field<peek::MtWords>(eng);
         for (int i = 0; i < 624; i += 2) h.u64((std::uint64_t)x[i] | ((std::uint64_t)x[i + 1] << 32));
@@ -569,9 +578,10 @@ inline void hashPredator(Hasher& h, const OceanPredator& p) {
     // Stage C's brain fields: a tagged block, only when any is off its default
     // (a scripted predator's never are), so existing baselines are unchanged.
     if (!p.genome.empty() || !p.nnet.flat.empty() || !p.nnet.neurons.empty() || p.id != 0 ||
-        p.lineageId != 0 || p.parentId != 0 || bits(p.speed) != 0u || p.captures != 0) {
+        p.lineageId != 0 || p.parentId != 0 || bits(p.speed) != 0u || p.captures != 0 || p.sourceId != 0) {
         h.u64(kBrainPredTag);
         h.u64(p.id); h.u64(p.lineageId); h.u64(p.parentId); h.f32(p.speed); h.u32(p.captures);
+        h.u64(p.sourceId);
         h.u64(p.genome.size());
         for (const Gene& g : p.genome) h.u32(geneWord(g));
         h.u64(p.nnet.neurons.size());

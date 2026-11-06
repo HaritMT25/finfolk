@@ -75,6 +75,8 @@ struct Predator {
     std::uint64_t parentId  = 0; // the budding parent's id; 0 for a founder / transplant
     float speed             = 0.0f;  // current speed (the THRUST action integrates it)
     std::uint32_t captures  = 0;     // prey caught in this predator's life
+    std::uint64_t sourceId  = 0;     // a transplanted predator's id in its SOURCE checkpoint
+                                     // (another id namespace; transplant.hpp); 0 otherwise
 
     // Forward unit vector (mirrors Creature::forward()).
     Vec2 forward() const {

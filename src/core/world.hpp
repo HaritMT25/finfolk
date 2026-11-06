@@ -870,11 +870,15 @@ private:
     //   7. life cycle (economy only): starve, age out, or bud — Stage B's rules,
     //      cap and global-rng draws, plus the child's genome (inherited with a
     //      mutation) and network from predRng_.
-    // Without the economy nothing ages, starves or buds: a fixed, immortal
-    // population of neural hunters (the frozen assay mode).
+    // Without the economy nothing ages, starves or buds and energy is inert: a
+    // fixed, immortal population of neural hunters whose ENERGY and AGE read 0
+    // (the frozen-newborn assay). With the economy and cfg.predatorFrozen (the
+    // frozen assay) energy and age are accounted as usual but step 7 only holds
+    // energy in [0, T] and age at most predatorMaxAge: no deaths, no buds.
     void updateBrainPredators(float dt) {
         if (predators.empty()) return;
         const bool  econ     = cfg.predatorEconomy;
+        const bool  frozen   = econ && cfg.predatorFrozen;
         const float pmc      = (cfg.predatorMoveCost >= 0.0f) ? cfg.predatorMoveCost : cfg.moveCost;
         const float R        = cfg.predatorPerception;
         const float R2       = R * R;
@@ -1022,7 +1026,13 @@ private:
             }
 
             // 7. life cycle (Stage B's order and draws)
-            if (econ) {
+            if (frozen) {
+                // The frozen assay: the accounting above ran, nobody dies or buds.
+                // No draws, so the population and both streams stay fixed.
+                const float T = cfg.predatorReproEnergy * p.buddingFactor;
+                p.energy = std::max(0.0f, std::min(p.energy, std::max(0.0f, T)));
+                if (cfg.predatorMaxAge > 0.0f && p.age > cfg.predatorMaxAge) p.age = cfg.predatorMaxAge;
+            } else if (econ) {
                 if (p.energy < 0.0f) {
                     p.alive = false;
                     totalPredatorDeathsStarvation++;
