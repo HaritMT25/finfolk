@@ -7,7 +7,8 @@
 //
 // The machinery is the prey's: the same Gene encoding, the same mutation
 // operators (genome.hpp, given the predators' own stream), the same NeuralNet
-// storage and the same flat, sink-grouped evaluation with evomath::tanhfArray.
+// storage and the same flat, sink-grouped evaluation (activations: the scalar
+// evomath::tanhf, bit-identical to the prey's tanhfArray; see feedForward).
 // What differs is the I/O space: 21 inputs a hunter can use and 2 outputs.
 // buildNet / feedForward below are siblings of buildNeuralNet / feedForward,
 // sized for that space; the prey's tuned hot path is left untouched, and
@@ -131,6 +132,13 @@ inline void buildNet(const Genome& genome, NeuralNet& nnet) {
 
 // feedForward's algorithm with the predator's I/O sizes (recurrent hidden
 // neurons, tanh activations; an undriven neuron keeps its output).
+//
+// The activations use the SCALAR evomath::tanhf, not tanhfArray. The two are
+// bit-identical (tanhfArray's contract), but extra inlined copies of
+// tanhfArray made GCC stop inlining detail::tanhfSelect in the default
+// builds, which de-vectorised the PREY's tanh loop and ran the whole sim ~1.9x
+// slower with the brain off (review of PR #60, P1-1). 14 scalar calls per
+// predator-step cost nothing measurable; the prey's hot path keeps main's code.
 inline void feedForward(NeuralNet& nnet, const float sensors[], float actions[], bool fastTanh) {
     float vals[NUM_PRED_SENSES + MAX_INTERNAL_NEURONS];
     std::memcpy(vals, sensors, NUM_PRED_SENSES * sizeof(float));
@@ -142,13 +150,9 @@ inline void feedForward(NeuralNet& nnet, const float sensors[], float actions[],
         for (int i = 0; i < MAX_INTERNAL_NEURONS; ++i)
             if (nnet.neurons[i].driven) nnet.neurons[i].output = fastTanhApprox(accum[NUM_PRED_ACTIONS + i]);
     } else {
-        evomath::tanhfArray(accum, actions, NUM_PRED_ACTIONS);
-        float hidden[MAX_INTERNAL_NEURONS];
-        evomath::tanhfArray(accum + NUM_PRED_ACTIONS, hidden, MAX_INTERNAL_NEURONS);
-        for (int i = 0; i < MAX_INTERNAL_NEURONS; ++i) {
-            NeuralNet::Neuron& n = nnet.neurons[i];
-            n.output = n.driven ? hidden[i] : n.output;
-        }
+        for (int i = 0; i < NUM_PRED_ACTIONS; ++i) actions[i] = evomath::tanhf(accum[i]);
+        for (int i = 0; i < MAX_INTERNAL_NEURONS; ++i)
+            if (nnet.neurons[i].driven) nnet.neurons[i].output = evomath::tanhf(accum[NUM_PRED_ACTIONS + i]);
     }
 }
 
