@@ -596,6 +596,10 @@ radd r_repro_big    '1 10 --cfg {"reproEnergy":-2e6}'
 radd r_pred_meal_big '1 10 --cfg {"predatorCount":4,"predatorEconomy":true,"predatorMeal":3e38}'
 radd r_pred_mcost_big '1 10 --cfg {"predatorCount":2,"predatorEconomy":true,"predatorMoveCost":1e38}'
 radd r_pred_newborn_big '1 10 --cfg {"predatorCount":2,"predatorEconomy":true,"predatorNewbornEnergy":-3e38}'
+# Stage C (v0.27.0) is Classic-only for now: the Ocean refuses the switch
+# (oceanSimConfigError) rather than run scripted predators under it.
+radd r_pred_brain   '1 10 --cfg {"predatorCount":2,"predatorEconomy":true,"predatorBrain":true}'
+radd r_pred_mut_inf '1 10 --cfg {"predatorMutation":1e39}'
 radd r_live_energy  '1 10 --set foodEnergy=1000001@5'
 radd r_live_pred_metab '1 10 --cfg {"predatorCount":2,"predatorEconomy":true} --set predatorMetabolism=1e30@5'
 # (Each just past its ceiling, and still small enough to allocate: were the

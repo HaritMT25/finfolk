@@ -1118,6 +1118,57 @@ void testCaptureNeutral() {
              (unsigned long long)fp[0].fish, (unsigned long long)fp[1].fish);
 }
 
+// Stage C's keys are inert with the brain OFF (the simulation reads them only on
+// the neural path), so they must not reach the fingerprint or the state dump:
+// a brain-off config holding non-default values of them fingerprints and dumps
+// exactly as the default config does, i.e. as main (0.26.0) does. With the
+// brain on they are hashed (the gate is wired).
+void testInactiveBrainKeys() {
+    Test t("inactive_brain_keys");
+    const char* cfgs[2] = {
+        R"({"predatorCount":3,"predatorEconomy":true})",
+        R"({"predatorCount":3,"predatorEconomy":true,"predatorMutation":2,"predatorTurnRate":3,)"
+        R"("predatorMinSpeed":5,"predatorPrimer":true,"predatorFrozen":true})"};
+    ofp::Fingerprint fp[2];
+    std::string dump[2];
+    for (int k = 0; k < 2; ++k) {
+        OceanWorld w;
+        std::string err;
+        if (!t.expect(ofp::initWorld(w, 45, 1920, 1080, 240.0f, 300, cfgs[k], err), "config %d refused: %s", k,
+                      err.c_str()))
+            return;
+        for (int s = 0; s < 300; ++s) w.update(0.016f);
+        fp[k] = ofp::fingerprint(w, /*withActivations*/ false);
+        // dumpState writes to a FILE*: an ISO C tmpfile works natively and under
+        // node (the wasm build links NODERAWFS). The read buffer lives on the
+        // heap: wasm's whole stack is 64 KB.
+        std::FILE* f = std::tmpfile();
+        if (!t.expect(f != nullptr, "tmpfile() failed: no state dump to compare")) return;
+        ofp::dumpState(w, f);
+        std::rewind(f);
+        std::vector<char> buf(4096);
+        std::size_t n;
+        while ((n = std::fread(buf.data(), 1, buf.size(), f)) > 0) dump[k].append(buf.data(), n);
+        std::fclose(f);
+    }
+    t.expect(fp[0] == fp[1], "inactive Stage C keys changed the fingerprint (all %016llx vs %016llx, cfg %016llx vs %016llx)",
+             (unsigned long long)fp[0].all, (unsigned long long)fp[1].all, (unsigned long long)fp[0].cfg,
+             (unsigned long long)fp[1].cfg);
+    t.expect(dump[0].size() > 1000 && dump[0] == dump[1], "inactive Stage C keys changed the state dump (%zu vs %zu bytes)",
+             dump[0].size(), dump[1].size());
+    // the gate is wired: with the brain on, the block is hashed, and its values count
+    SimConfig on;
+    on.predatorBrain = true;
+    SimConfig on2 = on;
+    on2.predatorMutation = 2.0f;
+    const OceanConfig oc;
+    ofp::Hasher h0, h1, h2;
+    ofp::hashConfig(h0, SimConfig{}, oc);
+    ofp::hashConfig(h1, on, oc);
+    ofp::hashConfig(h2, on2, oc);
+    t.expect(h0.value() != h1.value() && h1.value() != h2.value(), "the Stage C config block is not hashed with the brain on");
+}
+
 // ---- the compound eye -------------------------------------------------------
 #ifdef EVO_OCEAN_EYE
 // One sector's three inputs, as eyeWrite computes them, for an object at
@@ -3498,6 +3549,8 @@ void testShimBools() {
         {"toroidal", &SimConfig::toroidal}, {"bodyModel", &SimConfig::bodyModel},
         {"triangularMotion", &SimConfig::triangularMotion}, {"foodDrift", &SimConfig::foodDrift},
         {"predatorEconomy", &SimConfig::predatorEconomy}, {"predatorInheritance", &SimConfig::predatorInheritance},
+        {"predatorBrain", &SimConfig::predatorBrain}, {"predatorPrimer", &SimConfig::predatorPrimer},   // v0.27.0
+        {"predatorFrozen", &SimConfig::predatorFrozen},
         {"fastTanh", &SimConfig::fastTanh},
     };
     const struct { const char* key; bool OceanConfig::*m; } oceans[] = {
@@ -4840,6 +4893,7 @@ int main(int argc, char** argv) {
     ot::testCurrentSensors();
     ot::testWalls();
     ot::testCaptureNeutral();
+    ot::testInactiveBrainKeys();
     ot::testEye();
     ot::testEyeOnly();
     ot::testEyeCode();

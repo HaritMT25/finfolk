@@ -2,6 +2,7 @@
 #include <cmath>
 #include <cstdint>
 #include "vec2.hpp"
+#include "genome.hpp"   // Genome, NeuralNet: the Stage C brain (predator_brain.hpp)
 
 // Range of the heritable predator traits (v0.26.0), the same band as the prey
 // body parameters (body_model.hpp): a trait at the edge has halved or doubled
@@ -25,7 +26,14 @@ inline constexpr float PRED_TRAIT_MAX = 2.0f;
 //     cfg.predatorMinPopulation refills the economy up to a floor with fresh
 //     scripted predators, and cfg.predatorInheritance lets a bud inherit its
 //     parent's two traits below with a mutation. Two heritable numbers, not a
-//     genome — a neural predator is still Stage C.
+//     genome.
+//   * Stage C (v0.27.0, cfg.predatorBrain, off by default): the hunt is a
+//     network built from a genome (predator_brain.hpp), a bud carries a copied,
+//     mutated genome, and the fields at the end of this struct are live. With
+//     the brain off they keep their defaults and nothing reads them. With the
+//     brain on and the economy off, the predators are immortal and fixed in
+//     number (the "frozen" assay mode): they hunt by their networks but never
+//     bud, so nothing evolves.
 //
 // The hunt + the economy (nearest-prey query, steering, capture, burn, birth,
 // death) live in World::updatePredators so they can reuse the creature spatial
@@ -56,6 +64,21 @@ struct Predator {
                                   // and leaves the parent a thinner reserve.
     std::uint32_t generation = 0; // buds since a spawned/refilled founder. Counted
                                   // with inheritance off too (no rng involved).
+
+    // --- Stage C brain (v0.27.0; only set and read when cfg.predatorBrain) ---
+    // Appended after every older field, so no brace-initialiser moves.
+    Genome    genome;            // the predator's own I/O space (predator_brain.hpp)
+    NeuralNet nnet;              // built from genome; neurons[].output is live state
+    std::uint64_t id        = 0; // WorldCommon::nextPredatorId_ (a namespace of its
+                                 // own, apart from the prey ids); 0 = unassigned
+    std::uint64_t lineageId = 0; // the founder's id: own id for a founder, else the parent's
+    std::uint64_t parentId  = 0; // the budding parent's id; 0 for a founder / transplant
+    float speed             = 0.0f;  // current speed (the THRUST action integrates it)
+    std::uint32_t captures  = 0;     // prey caught in this predator's life
+    std::uint64_t sourceId  = 0;     // a transplanted predator's id in its SOURCE checkpoint
+                                     // (another id namespace; transplant.hpp); 0 otherwise
+    std::uint32_t virtualBuds = 0;   // the frozen assay's buds that made no child
+                                     // (cfg.predatorFrozen): a per-predator fitness readout
 
     // Forward unit vector (mirrors Creature::forward()).
     Vec2 forward() const {

@@ -31,6 +31,9 @@
 #include "core/wiring_log.hpp"
 #include "core/json_min.hpp"
 #include "core/checkpoint_io.hpp"
+#include "core/predator_brain.hpp"
+#include "core/predator_stats.hpp"
+#include "core/transplant.hpp"
 
 static int g_checks = 0;
 static int g_failures = 0;
@@ -1237,6 +1240,19 @@ static std::uint64_t deepFingerprint(const World& w) {
         mixF(p.digestTimer); mixF(p.energy); mixF(p.age);
         // v0.26.0 heritable traits + generation, for the body-model reason above.
         mixF(p.speedFactor); mixF(p.buddingFactor); mixI((long long)p.generation);
+        // v0.27.0 Stage C brains (only with the brain on: the scripted
+        // predator's brain fields are inert defaults).
+        if (w.cfg.predatorBrain) {
+            mixI((long long)p.id); mixI((long long)p.lineageId); mixI((long long)p.parentId);
+            mixF(p.speed); mixI((long long)p.captures);
+            for (const Gene& g : p.genome) { mixI((long long)checkpoint::packGene(g)); mixI(g.weight); }
+            for (const auto& nr : p.nnet.neurons) mixF(nr.output);
+        }
+    }
+    if (w.cfg.predatorBrain) {
+        mixI((long long)w.nextPredatorId_);
+        const std::string ps = w.predRng_.state();
+        mixBytes(ps.data(), ps.size());
     }
     for (uint8_t v : w.signals.data()) mixBytes(&v, 1);
     return h;
@@ -3713,6 +3729,728 @@ static void test_predator_floor_inherit() {
     }
 }
 
+// ---------------------------------------------------------------
+// Stage C (v0.27.0): neural predators, their checkpoints and the transplant.
+namespace predref {
+// A gene-by-gene reference for predbrain::buildNet / feedForward: genome order,
+// no flattening (the oracle above, with the predator's I/O sizes).
+struct Net { std::vector<Gene> conns; float out[MAX_INTERNAL_NEURONS]; bool driven[MAX_INTERNAL_NEURONS]; };
+static void build(const Genome& g, Net& n) {
+    n.conns.clear();
+    for (int i = 0; i < MAX_INTERNAL_NEURONS; ++i) { n.out[i] = 0.5f; n.driven[i] = false; }
+    for (Gene c : g) {
+        c.sourceNum = (c.sourceType == SOURCE_SENSOR) ? c.sourceNum % NUM_PRED_SENSES : c.sourceNum % MAX_INTERNAL_NEURONS;
+        c.sinkNum = (c.sinkType == SINK_ACTION) ? c.sinkNum % NUM_PRED_ACTIONS : c.sinkNum % MAX_INTERNAL_NEURONS;
+        n.conns.push_back(c);
+        if (c.sinkType == SINK_NEURON) n.driven[c.sinkNum] = true;
+    }
+}
+static void step(Net& n, const float s[], float a[]) {
+    float acc[MAX_INTERNAL_NEURONS] = {};
+    for (int i = 0; i < NUM_PRED_ACTIONS; ++i) a[i] = 0.0f;
+    for (const Gene& c : n.conns) {
+        const float v = (c.sourceType == SOURCE_SENSOR) ? s[c.sourceNum] : n.out[c.sourceNum];
+        const float x = v * c.weightAsFloat();
+        if (c.sinkType == SINK_ACTION) a[c.sinkNum] += x; else acc[c.sinkNum] += x;
+    }
+    for (int i = 0; i < MAX_INTERNAL_NEURONS; ++i) if (n.driven[i]) n.out[i] = evomath::tanhf(acc[i]);
+    for (int i = 0; i < NUM_PRED_ACTIONS; ++i) a[i] = evomath::tanhf(a[i]);
+}
+}  // namespace predref
+
+static World bareBrainWorld(unsigned seed, int preds, bool econ) {
+    rng.seed(seed);
+    World w;
+    w.cfg.predatorCount = preds;
+    w.cfg.predatorEconomy = econ;
+    w.cfg.predatorBrain = true;
+    w.cfg.predatorMoveCost = 0.0f;
+    w.cfg.minPopulation = 0;
+    w.cfg.targetFood = 0;
+    w.init(640, 480, 0);
+    w.creatures.clear();
+    return w;
+}
+
+static void test_predator_brain() {
+    std::printf("Stage C: neural predators...\n");
+
+    // --- 1. defaults: off, and a default predator has no brain ------------
+    {
+        SimConfig c;
+        CHECK(!c.predatorBrain && !c.predatorPrimer && !c.predatorLog && !c.predatorFrozen);
+        {
+            SimConfig m = c; m.predatorMinSpeed = 200.0f;        // above predatorSpeed (110)
+            CHECK(predatorBrainConfigError(m) == nullptr);       // irrelevant with the brain off
+            m.predatorBrain = true;
+            CHECK(predatorBrainConfigError(m) != nullptr);       // refused with it on
+        }
+        CHECK(bitEq(c.predatorMutation, 1.0f) && bitEq(c.predatorTurnRate, 4.0f) && bitEq(c.predatorMinSpeed, 0.0f));
+        CHECK(predatorBrainConfigError(c) == nullptr);
+        SimConfig bad = c; bad.predatorMutation = -1.0f;
+        CHECK(predatorBrainConfigError(bad) != nullptr);
+        bad = c; bad.predatorTurnRate = std::numeric_limits<float>::quiet_NaN();
+        CHECK(predatorBrainConfigError(bad) != nullptr);
+        bad = c; bad.predatorMinSpeed = std::numeric_limits<float>::infinity();
+        CHECK(predatorBrainConfigError(bad) != nullptr);
+        Predator p;
+        CHECK(p.genome.empty() && p.nnet.flat.empty() && p.id == 0 && p.captures == 0 && bitEq(p.speed, 0.0f));
+        CHECK(c.dump().find("predatorBrain") == std::string::npos);   // an off sidecar is 0.26.0's
+        CHECK(NUM_PRED_SENSES == 21 && NUM_PRED_ACTIONS == 2 && PRED_SENSOR_SET == 1);
+    }
+
+    // --- 2. the predator net == a gene-by-gene reference, bit for bit -----
+    {
+        rng.seed(2027u);
+        RandomGen r(77u);
+        bool same = true;
+        for (int g = 0; g < 60 && same; ++g) {
+            const Genome genome = makeRandomGenome(4, 70, r);
+            NeuralNet net; predbrain::buildNet(genome, net);
+            predref::Net ref; predref::build(genome, ref);
+            for (int t = 0; t < 6 && same; ++t) {
+                float s[NUM_PRED_SENSES];
+                for (float& v : s) v = r.range(-1.0f, 1.0f);
+                float a1[NUM_PRED_ACTIONS], a2[NUM_PRED_ACTIONS];
+                predbrain::feedForward(net, s, a1, false);
+                predref::step(ref, s, a2);
+                for (int k = 0; k < NUM_PRED_ACTIONS; ++k) same = same && bitEq(a1[k], a2[k]);
+                for (int k = 0; k < MAX_INTERNAL_NEURONS; ++k) same = same && bitEq(net.neurons[k].output, ref.out[k]);
+            }
+        }
+        CHECK(same);
+        // the explicit-stream genome ops draw exactly what the rng-default ones do
+        rng.seed(31u);
+        Genome a = makeRandomGenome(10, 40);
+        mutateGenome(a, 0.3f, 16, 80);
+        const std::string sa = rng.state();
+        RandomGen q(31u);
+        Genome b = makeRandomGenome(10, 40, q);
+        mutateGenome(b, 0.3f, 16, 80, q);
+        bool eq = a.size() == b.size() && q.state() == sa;
+        for (size_t i = 0; eq && i < a.size(); ++i) eq = checkpoint::packGene(a[i]) == checkpoint::packGene(b[i]) && a[i].weight == b[i].weight;
+        CHECK(eq);
+        CHECK(bitEq(kernel::birthMutationRate(0.0f), 0.5f) && bitEq(kernel::birthMutationRate(0.05f), 0.05f) &&
+              bitEq(kernel::birthMutationRate(0.2f), 0.01f) && bitEq(kernel::birthMutationRate(0.9f), 0.002f));
+    }
+
+    // --- 3. init: Stage B's world + genomes, after exactly one more draw --
+    {
+        auto make = [](bool brain) {
+            rng.seed(4242u);
+            World w;
+            configureRichWorld(w);
+            w.cfg.predatorBrain = brain;
+            w.init(900, 700, 200);
+            return w;
+        };
+        World off = make(false);
+        rng.uint();                                   // the one extra draw
+        const std::string afterOff = rng.state();
+        World on = make(true);
+        CHECK(rng.state() == afterOff);
+        bool samePlaces = off.predators.size() == on.predators.size() && off.creatures.size() == on.creatures.size() &&
+                          off.food.size() == on.food.size();
+        for (size_t i = 0; samePlaces && i < off.predators.size(); ++i)
+            samePlaces = bitEq(off.predators[i].pos.x, on.predators[i].pos.x) && bitEq(off.predators[i].vel.y, on.predators[i].vel.y);
+        for (size_t i = 0; samePlaces && i < off.food.size(); ++i)
+            samePlaces = bitEq(off.food[i].pos.x, on.food[i].pos.x) && bitEq(off.food[i].pos.y, on.food[i].pos.y);
+        CHECK(samePlaces);
+        bool founders = true;
+        for (size_t i = 0; i < on.predators.size(); ++i) {
+            const Predator& p = on.predators[i];
+            founders = founders && p.id == i + 1 && p.lineageId == p.id && p.parentId == 0 &&
+                       (int)p.genome.size() >= on.cfg.genomeInitMin && (int)p.genome.size() <= on.cfg.genomeInitMax &&
+                       p.nnet.flat.size() == p.genome.size() && bitEq(p.speed, on.cfg.predatorSpeed);
+        }
+        CHECK(founders);
+        CHECK(on.nextPredatorId_ == on.predators.size() + 1);
+        CHECK(off.nextPredatorId_ == 1 && off.predators[0].genome.empty());
+        // the primer writes its two genes and draws nothing extra
+        rng.seed(4242u);
+        World pr; configureRichWorld(pr); pr.cfg.predatorBrain = true; pr.cfg.predatorPrimer = true;
+        pr.init(900, 700, 200);
+        CHECK(rng.state() == afterOff);
+        CHECK(pr.predators[0].genome.size() == on.predators[0].genome.size());
+        CHECK(pr.predators[0].genome[0].sourceNum == PS_PREY_LR && pr.predators[0].genome[0].sinkNum == PA_TURN &&
+              pr.predators[0].genome[1].sourceNum == PS_PREY_PROX && pr.predators[0].genome[1].sinkNum == PA_THRUST);
+        bool rest = true;
+        for (size_t k = 2; k < pr.predators[0].genome.size(); ++k)
+            rest = rest && pr.predators[0].genome[k].weight == on.predators[0].genome[k].weight;
+        CHECK(rest);
+    }
+
+    // --- 4. TURN and THRUST do what they say (one gene each, no prey) -----
+    {
+        World w = bareBrainWorld(5u, 1, false);
+        Predator& p = w.predators[0];
+        p.pos = {320.0f, 240.0f}; p.vel = {1.0f, 0.0f};
+        Gene t{}; t.sourceType = SOURCE_NEURON; t.sourceNum = 0; t.sinkType = SINK_ACTION; t.sinkNum = PA_TURN; t.weight = 16384;
+        Gene s{}; s.sourceType = SOURCE_NEURON; s.sourceNum = 0; s.sinkType = SINK_ACTION; s.sinkNum = PA_THRUST; s.weight = -24576;
+        p.genome = {t, s};
+        predbrain::buildNet(p.genome, p.nnet);   // neuron 0 is undriven: a constant 0.5
+        const float dt = 0.016f;
+        w.update(dt);
+        const Predator& q = w.predators[0];
+        const float turn = evomath::tanhf(0.5f * (16384 / 8192.0f)) * 4.0f * dt;
+        const Vec2 v = {evomath::cosf(turn), evomath::sinf(turn)};
+        CHECK(bitEq(q.vel.x, v.x) && bitEq(q.vel.y, v.y));
+        CHECK(q.vel.y > 0.0f);                                          // + turns toward +right
+        const float spd = std::clamp(110.0f + evomath::tanhf(0.5f * (-24576 / 8192.0f)) * 50.0f * dt, 0.0f, 110.0f);
+        CHECK(bitEq(q.speed, spd) && q.speed < 110.0f);
+        CHECK(approx(q.pos.x, 320.0f + v.x * spd * dt, 1e-4f));
+        CHECK(w.predators.size() == 1u && bitEq(q.energy, w.cfg.predatorNewbornEnergy));   // frozen: no burn
+        for (int i = 0; i < 2000; ++i) w.update(dt);
+        CHECK(w.predators.size() == 1u && bitEq(w.predators[0].speed, 0.0f));          // braked to the floor
+        w.cfg.predatorMinSpeed = 20.0f;
+        w.update(dt);
+        CHECK(bitEq(w.predators[0].speed, 20.0f));
+    }
+
+    // --- 5. pursuit: the primer genes steer toward the prey's side --------
+    {
+        for (int side = -1; side <= 1; side += 2) {
+            World w = bareBrainWorld(9u, 1, false);
+            Predator& p = w.predators[0];
+            p.pos = {320.0f, 240.0f}; p.vel = {1.0f, 0.0f};
+            p.genome = {predbrain::primerGene(PS_PREY_LR, PA_TURN, 3.0f), predbrain::primerGene(PS_PREY_PROX, PA_THRUST, 2.0f)};
+            predbrain::buildNet(p.genome, p.nnet);
+            w.creatures.push_back(makeRandomCreature({370.0f, 240.0f + 50.0f * side}));
+            w.update(0.016f);
+            CHECK((w.predators[0].vel.y > 0.0f) == (side > 0));
+        }
+    }
+
+    // --- 6. capture: the nearest prey in reach, the meal, the cooldown ----
+    {
+        auto capture = [](float digest) {
+            World w = bareBrainWorld(13u, 1, true);
+            w.cfg.predatorMeal = 7.0f;
+            w.cfg.predatorMetabolism = 2.0f;
+            Predator& p = w.predators[0];
+            p.pos = {320.0f, 240.0f};
+            p.digestTimer = digest;
+            p.genome.clear(); predbrain::buildNet(p.genome, p.nnet);   // no genes: drifts at top speed
+            w.creatures.push_back(makeRandomCreature({322.0f, 241.0f}));
+            w.update(0.016f);
+            return w;
+        };
+        World ate = capture(0.0f);
+        CHECK(ate.totalDeathsPredation == 1 && ate.predators[0].captures == 1u && ate.creatures.empty());
+        CHECK(approx(ate.predators[0].energy, 30.0f - 2.0f * 0.016f + 7.0f, 1e-4f));
+        CHECK(approx(ate.predators[0].digestTimer, 3.0f));
+        World full = capture(1.0f);
+        CHECK(full.totalDeathsPredation == 0 && full.predators[0].captures == 0u && full.creatures.size() == 1u);
+    }
+
+    // --- 7. a bud: the genome from predRng_, Stage B's three global draws --
+    {
+        World w = bareBrainWorld(17u, 1, true);
+        w.cfg.predatorReproEnergy = 40.0f;
+        w.cfg.predatorMutation = 5.0f;          // make the mutation visible
+        Predator& p = w.predators[0];
+        p.energy = 100.0f; p.generation = 3;
+        const std::uint64_t pid = p.id, plin = p.lineageId;
+        const Genome pg = p.genome;
+        const std::string g0 = rng.state(), r0 = w.predRng_.state();
+        w.update(0.016f);
+        RandomGen g; g.setState(g0); g.uint(); g.uint(); g.uint();   // the bud's x, y, heading
+        CHECK(rng.state() == g.state());
+        CHECK(w.predRng_.state() != r0);
+        CHECK(w.predators.size() == 2u && w.totalPredatorBirths == 1);
+        if (w.predators.size() == 2u) {
+            const Predator& c = w.predators[1];
+            CHECK(c.parentId == pid && c.lineageId == plin && c.id == 2u && c.generation == 4u);
+            CHECK(c.nnet.flat.size() == c.genome.size() && bitEq(c.speed, 110.0f));
+            CHECK(w.predators[0].genome.size() == pg.size());           // the parent is untouched
+            CHECK(approx(c.energy, w.cfg.predatorNewbornEnergy));
+        }
+        CHECK(w.nextPredatorId_ == 3u);
+        // at the cap: no bud, and no draw in either stream beyond RANDOM's one
+        World cap = bareBrainWorld(17u, 1, true);
+        cap.cfg.predatorReproEnergy = 40.0f;
+        cap.cfg.predatorMaxPopulation = 1;
+        cap.predators[0].energy = 100.0f;
+        const std::string cg0 = rng.state(), cr0 = cap.predRng_.state();
+        cap.update(0.016f);
+        RandomGen cr; cr.setState(cr0); cr.uint();
+        CHECK(rng.state() == cg0 && cap.predRng_.state() == cr.state() && cap.predators.size() == 1u);
+    }
+
+    // --- 8. the floor refills with random-genome founders of new lineages --
+    {
+        World w = bareBrainWorld(11u, 3, true);
+        w.cfg.predatorMinPopulation = 3;
+        w.cfg.predatorLog = true;
+        w.cfg.predatorMetabolism = 50.0f;      // everyone starves fast
+        w.predLog_.clear();
+        for (int i = 0; i < 200; ++i) w.update(0.016f);
+        CHECK(w.predators.size() == 3u && w.totalPredatorReseeds >= 3 && w.totalPredatorDeathsStarvation >= 3);
+        bool fresh = true;
+        for (const auto& p : w.predators) fresh = fresh && p.id > 3u && p.lineageId == p.id && !p.genome.empty();
+        CHECK(fresh);
+        long r = 0, s = 0;
+        for (const auto& e : w.predLog_) { r += e.event == 'R'; s += e.event == 'S'; }
+        CHECK(r == w.totalPredatorReseeds && s == w.totalPredatorDeathsStarvation);
+    }
+
+    // --- 9. frozen: no economy => fixed, immortal, no buds ---------------
+    {
+        rng.seed(808u);
+        World w; configureRichWorld(w);
+        w.cfg.predatorEconomy = false;
+        w.cfg.predatorBrain = true;
+        w.cfg.predatorReproEnergy = 1.0f;
+        w.init(900, 700, 260);
+        const size_t n0 = w.predators.size();
+        for (int i = 0; i < 600; ++i) w.update(0.016f);
+        bool fixed = w.predators.size() == n0 && w.totalPredatorBirths == 0;
+        for (const auto& p : w.predators) fixed = fixed && bitEq(p.energy, w.cfg.predatorNewbornEnergy) && bitEq(p.age, 0.0f);
+        CHECK(fixed);
+    }
+
+    // --- 10. a live run, its determinism and its checkpoints --------------
+    World live;
+    {
+        auto run = [](World& w) {
+            rng.seed(5150u);
+            configureRichWorld(w);
+            w.cfg.predatorBrain = true;
+            w.cfg.predatorMeal = 14.0f;
+            w.cfg.predatorMaxPopulation = 12;
+            w.cfg.predatorMinPopulation = 2;
+            w.cfg.predatorMaxAge = 30.0f;
+            w.cfg.predatorInheritance = true;
+            w.init(900, 700, 260);
+            for (int i = 0; i < 1500; ++i) w.update(0.016f);
+        };
+        run(live);
+        CHECK(live.totalPredatorBirths > 0);
+        CHECK(live.totalDeathsPredation > 0);
+        bool sane = !live.predators.empty();
+        for (const auto& p : live.predators)
+            sane = sane && std::isfinite(p.energy) && std::isfinite(p.speed) && p.speed >= 0.0f &&
+                   p.speed <= live.cfg.predatorSpeed * p.speedFactor + 1e-3f && p.id < live.nextPredatorId_;
+        CHECK(sane);
+#ifdef EVO_DETERMINISTIC
+        World again;
+        run(again);
+        CHECK(deepFingerprint(again) == deepFingerprint(live));
+        CHECK(checkpoint::serialize(again, "t") == checkpoint::serialize(live, "t"));
+#endif
+    }
+    {
+        const std::string blob = checkpoint::serialize(live, "test");
+        CHECK(blob.find("\"formatVersion\":2") != std::string::npos);
+        CHECK(blob.find("\"predatorRngState\"") != std::string::npos && blob.find("\"sensorSet\":1") != std::string::npos);
+        std::string err;
+        World r;
+        CHECK(checkpoint::deserialize(blob, r, err));
+        CHECK(r.cfg.predatorBrain && r.nextPredatorId_ == live.nextPredatorId_);
+        CHECK(checkpoint::serialize(r, "test") == blob);
+#ifdef EVO_DETERMINISTIC
+        {
+            // Uninterrupted: a copy, continued from the saved rng state (a load
+            // restores it). Resumed: a fresh load. One after the other: the two
+            // worlds share the global rng.
+            World a = live;
+            World b;
+            CHECK(checkpoint::deserialize(blob, b, err));
+            for (int i = 0; i < 400; ++i) a.update(0.016f);
+            const std::uint64_t uninterrupted = deepFingerprint(a);
+            CHECK(checkpoint::deserialize(blob, b, err));
+            for (int i = 0; i < 400; ++i) b.update(0.016f);
+            CHECK(deepFingerprint(b) == uninterrupted);
+            CHECK(b.totalPredatorBirths == a.totalPredatorBirths && b.nextPredatorId_ == a.nextPredatorId_);
+        }
+#endif
+        // a brain-off checkpoint is version 1 and mentions no brain
+        rng.seed(3u);
+        World off; configureRichWorld(off); off.init(900, 700, 200);
+        for (int i = 0; i < 50; ++i) off.update(0.016f);
+        const std::string ob = checkpoint::serialize(off, "test");
+        CHECK(ob.find("\"formatVersion\":1") != std::string::npos);
+        CHECK(ob.find("predatorBrain") == std::string::npos && ob.find("nextPredatorId") == std::string::npos &&
+              ob.find("predatorRngState") == std::string::npos && ob.find("sensorSet") == std::string::npos);
+        // a CLI value cannot make a version-1 file a brain world, and the file's brain key decides
+        World leak; leak.cfg.predatorBrain = true;
+        CHECK(checkpoint::deserialize(ob, leak, err) && !leak.cfg.predatorBrain);
+        auto replaceOnce = [](std::string s, const std::string& from, const std::string& to) {
+            const size_t at = s.find(from);
+            if (at != std::string::npos) s.replace(at, from.size(), to);
+            return s;
+        };
+        World x1, x2, x3, x4, x5, x6, x7, x8;
+        CHECK(!checkpoint::deserialize(replaceOnce(ob, "\"fastTanh\"", "\"predatorBrain\":true,\"fastTanh\""), x1, err));
+        CHECK(!checkpoint::deserialize(replaceOnce(blob, "\"predatorBrain\":true", "\"predatorBrain\":false"), x2, err));
+        CHECK(!checkpoint::deserialize(replaceOnce(blob, "\"sensorSet\":1", "\"sensorSet\":2"), x3, err));
+        CHECK(!checkpoint::deserialize(replaceOnce(blob, "\"genomeLengths\":[", "\"genomeLengths\":[1000,"), x4, err));
+        CHECK(!checkpoint::deserialize(replaceOnce(blob, "\"nextPredatorId\":", "\"nextPredatorId\":1,\"x\":"), x5, err));
+        CHECK(!checkpoint::deserialize(replaceOnce(blob, "\"predatorRngState\"", "\"predatorRngStateX\""), x6, err));
+        {
+            // the first predator neuron output -> nan (the length stays right)
+            const size_t at = blob.find("\"neuronOutputs\":[", blob.find("\"predators\"")) + 17;
+            std::string bad = blob;
+            bad.replace(at, bad.find(',', at) - at, "nan");
+            CHECK(!checkpoint::deserialize(bad, x7, err));
+            CHECK(err.find("not finite") != std::string::npos);
+        }
+        {
+            // two predators with one id
+            const size_t idAt = blob.find("\"id\":[", blob.find("\"predators\""));
+            std::string dup = blob;
+            const size_t v0 = idAt + 6, c1 = dup.find(',', v0), c2 = dup.find_first_of(",]", c1 + 1);
+            dup.replace(c1 + 1, c2 - c1 - 1, dup.substr(v0, c1 - v0));
+            CHECK(live.predators.size() < 2u || !checkpoint::deserialize(dup, x8, err));
+        }
+        // a reseed draws the predators' stream from the reseeded rng
+        World s1 = live, s2 = live;
+        s1.reseedStreams(77u); const std::string a1 = s1.predRng_.state(), g1 = rng.state();
+        s2.reseedStreams(77u);
+        CHECK(a1 == s2.predRng_.state() && g1 == rng.state() && a1 != live.predRng_.state());
+    }
+
+    // --- 11. the transplant ----------------------------------------------
+    {
+        rng.seed(6001u);
+        World X; configureRichWorld(X); X.init(900, 700, 200);
+        for (int i = 0; i < 300; ++i) X.update(0.016f);
+        const std::string xBlob = checkpoint::serialize(X, "t");
+        const std::string yBlob = checkpoint::serialize(live, "t");
+        auto loadX = [&]() { World w; std::string e; checkpoint::deserialize(xBlob, w, e); return w; };
+        transplant::Options o;
+        o.predatorsFrom = "Y.json"; o.count = 3; o.seed = 9u;
+        // live has its own predator economy: X's (configureRichWorld) except meal 14
+        // and max age 30. The kinematics agree.
+        std::string man, err;
+        World t1 = loadX();
+        CHECK(!transplant::apply(t1, o, yBlob, man, err));            // frozen compares the economy: refused
+        CHECK(err.find("predatorMeal") != std::string::npos);
+        transplant::Options nb = o; nb.assay = "frozen-newborn";      // ... frozen-newborn does not
+        World t2 = loadX();
+        CHECK(transplant::apply(t2, nb, yBlob, man, err));
+        CHECK(!t2.cfg.predatorEconomy && !t2.cfg.predatorFrozen && man.find("\"physicsMismatches\":[]") != std::string::npos);
+        World t3 = loadX(); t3.cfg.fastTanh = true;                   // fastTanh is compared in every mode
+        CHECK(!transplant::apply(t3, nb, yBlob, man, err) && err.find("fastTanh") != std::string::npos);
+        transplant::Options neg = o; neg.count = -5;
+        World t4 = loadX();
+        CHECK(!transplant::apply(t4, neg, yBlob, man, err));          // below -1: refused
+        o.allowMismatch = true;
+        World a = loadX();
+        const std::string g0 = rng.state();
+        CHECK(transplant::apply(a, o, yBlob, man, err));
+        CHECK(rng.state() == g0);                                      // the world's stream untouched
+        CHECK(a.predators.size() == 3u && a.cfg.predatorBrain && a.cfg.predatorEconomy && a.cfg.predatorFrozen &&
+              a.cfg.minPopulation == 0 && a.cfg.predatorMinPopulation == 0 && a.cfg.predatorMaxPopulation == 0 &&
+              a.cfg.predatorCount == 3 && a.arenaFresh_);
+        // fresh ids above Y's counter and every Y lineage label (P2-2)
+        std::uint64_t maxLin = 0;
+        for (const auto& q : live.predators) maxLin = std::max(maxLin, q.lineageId);
+        const std::uint64_t firstId = std::max<std::uint64_t>(live.nextPredatorId_, maxLin + 1);
+        CHECK(a.nextPredatorId_ == firstId + 3);
+        bool fromY = true;
+        for (size_t i = 0; i < a.predators.size(); ++i) {
+            const Predator& p = a.predators[i];
+            bool found = false;
+            for (const auto& q : live.predators)
+                if (q.id == p.sourceId && q.lineageId == p.lineageId && q.genome.size() == p.genome.size() &&
+                    q.generation == p.generation) {
+                    bool g = true;
+                    for (size_t k = 0; k < q.genome.size(); ++k) g = g && q.genome[k].weight == p.genome[k].weight;
+                    found = found || g;
+                }
+            fromY = fromY && found && p.id == firstId + i && p.id > maxLin && p.parentId == 0 && p.captures == 0 &&
+                    bitEq(p.energy, a.cfg.predatorNewbornEnergy) && bitEq(p.age, 0.0f) &&
+                    bitEq(p.nnet.neurons[0].output, 0.5f);
+        }
+        CHECK(fromY);
+        CHECK(man.find("\"startState\"") != std::string::npos && man.find("\"stageC\"") != std::string::npos &&
+              man.find("\"predator checkpoint\"") != std::string::npos && man.find("\"fnv1a64\"") != std::string::npos);
+        const std::string ab = checkpoint::serialize(a, "t");
+        CHECK(ab.find("\"arena\":true") != std::string::npos && ab.find("\"sourceId\"") != std::string::npos);
+        // X's world, line by line, apart from the world line, the config and the predators
+        auto lineOf = [](const std::string& blob, const std::string& prefix) {
+            size_t at = blob.find("\n" + prefix);
+            if (at == std::string::npos) return std::string("<missing ") + prefix + ">";
+            ++at;
+            return blob.substr(at, blob.find('\n', at) - at);
+        };
+        bool sameWorld = true;
+        for (const char* k : {",\"counters\"", ",\"rngState\"", ",\"currentVortices\"", ",\"signals\"", ",\"food\"",
+                              ",\"creatures\""})
+            sameWorld = sameWorld && lineOf(ab, k) == lineOf(xBlob, k);
+        CHECK(sameWorld);
+        CHECK(man.find("\"configChanges\"") != std::string::npos && man.find("predatorMeal") != std::string::npos);
+        World b = loadX();
+        std::string man2;
+        CHECK(transplant::apply(b, o, yBlob, man2, err) && checkpoint::serialize(b, "t") == ab && man2 == man);
+        o.seed = 10u;
+        World c = loadX();
+        CHECK(transplant::apply(c, o, yBlob, man2, err) && checkpoint::serialize(c, "t") != ab);
+        // the frozen arena runs: fixed and immortal, but energy and age are
+        // accounted, so ENERGY and AGE move inside their evolved range (P2-1)
+        float s0[NUM_PRED_SENSES] = {}, s1[NUM_PRED_SENSES] = {};
+        predbrain::writeOwnSensors(a.predators[0], a.cfg, predbrain::topSpeed(a.predators[0], a.cfg), s0);
+        const long long starv0 = a.totalPredatorDeathsStarvation, age0 = a.totalPredatorDeathsAge;
+        for (int i = 0; i < 300; ++i) a.update(0.016f);
+        predbrain::writeOwnSensors(a.predators[0], a.cfg, predbrain::topSpeed(a.predators[0], a.cfg), s1);
+        CHECK(a.predators.size() == 3u && a.totalPredatorBirths == X.totalPredatorBirths &&
+              a.totalPredatorDeathsStarvation == starv0 && a.totalPredatorDeathsAge == age0);
+        CHECK(!bitEq(s0[PS_ENERGY], s1[PS_ENERGY]) && s1[PS_AGE] > s0[PS_AGE] && s1[PS_AGE] > 0.0f);
+        bool inRange = true, aged = true;
+        for (const auto& p : a.predators) {
+            inRange = inRange && p.energy >= 0.0f;
+            aged = aged && approx(p.age, 300 * 0.016f, 1e-3f);     // X has no max age: no wrap
+        }
+        CHECK(inRange && aged);
+        // the layout is a function of (seed, K, the world) only: a donor of
+        // another size, and "random", put the K predators on the same spots
+        {
+            const std::string y2 = checkpoint::serialize(t2, "t");   // 3 predators, all taken
+            World b2 = loadX(), r2 = loadX(), b1 = loadX();
+            transplant::Options o2 = o; o2.seed = 9u;
+            transplant::Options or2 = o2; or2.predatorsFrom = "random"; or2.assay = "frozen";
+            std::string m2;
+            CHECK(transplant::apply(b1, o2, yBlob, m2, err) && transplant::apply(b2, o2, y2, m2, err) &&
+                  transplant::apply(r2, or2, "", m2, err));
+            bool same = b1.predators.size() == 3u && b2.predators.size() == 3u && r2.predators.size() == 3u;
+            auto samePlace = [](const Predator& p, const Predator& q) {
+                return bitEq(p.pos.x, q.pos.x) && bitEq(p.pos.y, q.pos.y) &&
+                       bitEq(p.vel.x, q.vel.x) && bitEq(p.vel.y, q.vel.y);
+            };
+            for (size_t i = 0; same && i < 3; ++i)
+                same = samePlace(b1.predators[i], b2.predators[i]) && samePlace(b1.predators[i], r2.predators[i]);
+            CHECK(same);
+            CHECK(live.predators.size() != 3u);   // the two donors really differ in size
+        }
+        // ... and the frozen-newborn ablation pins both at 0
+        for (int i = 0; i < 300; ++i) t2.update(0.016f);
+        float sn[NUM_PRED_SENSES] = {};
+        predbrain::writeOwnSensors(t2.predators[0], t2.cfg, predbrain::topSpeed(t2.predators[0], t2.cfg), sn);
+        CHECK(bitEq(sn[PS_ENERGY], 0.0f) && bitEq(sn[PS_AGE], 0.0f) && t2.predators.size() == 3u);
+        // random founders; a brain-less Y is refused; live keeps X's config
+        transplant::Options rnd; rnd.predatorsFrom = "random"; rnd.count = 4; rnd.assay = "live";
+        World d = loadX();
+        CHECK(transplant::apply(d, rnd, "", man, err));
+        bool rf = d.predators.size() == 4u && d.cfg.predatorEconomy && !d.cfg.predatorFrozen;
+        for (const auto& p : d.predators) rf = rf && p.lineageId == p.id && !p.genome.empty() && p.sourceId == 0;
+        CHECK(rf);
+        World e = loadX();
+        CHECK(!transplant::apply(e, o, xBlob, man, err));
+        transplant::Options none = rnd; none.count = -1;
+        World f = loadX();
+        CHECK(!transplant::apply(f, none, "", man, err));
+        // the arena survives its own checkpoint
+        World g;
+        CHECK(checkpoint::deserialize(ab, g, err) && checkpoint::serialize(g, "t") == ab && g.arenaFresh_);
+        // a live arena from Y: later buds and floor refills never reuse a
+        // transplanted lineage label, and every founder has lineageId == id (P2-2)
+        transplant::Options lv = o; lv.assay = "live"; lv.count = 4;
+        World h = loadX();
+        CHECK(transplant::apply(h, lv, yBlob, man, err));
+        h.cfg.predatorMinPopulation = 4;
+        h.cfg.predatorMetabolism = 40.0f;         // turnover: starvations and refills
+        std::vector<std::uint64_t> labels;
+        for (const auto& p : h.predators) labels.push_back(p.lineageId);
+        long long refills0 = h.totalPredatorReseeds;
+        for (int i = 0; i < 1500; ++i) h.update(0.016f);
+        CHECK(h.totalPredatorReseeds > refills0);
+        bool noReuse = true, foundersOk = true;
+        for (const auto& p : h.predators) {
+            for (std::uint64_t l : labels) noReuse = noReuse && (p.id != l || p.sourceId != 0);
+            if (p.parentId == 0 && p.sourceId == 0) foundersOk = foundersOk && p.lineageId == p.id;
+        }
+        CHECK(noReuse && foundersOk);
+        // a version-2 file with a lineage label at or above its counter is refused
+        {
+            std::string badLin = ab;
+            const size_t at = badLin.find("\"lineageId\":[", badLin.find("\"predators\"")) + 13;
+            badLin.replace(at, badLin.find_first_of(",]", at) - at, "999999999");
+            World x9;
+            CHECK(!checkpoint::deserialize(badLin, x9, err) && err.find("lineageId") != std::string::npos);
+        }
+        // ... and so is one without its predators block
+        {
+            std::string noPred = ab;
+            const size_t at = noPred.find("\n,\"predators\"") + 1;
+            noPred.erase(at, noPred.find('\n', at) - at + 1);
+            CHECK(noPred.find("\"predators\"") == std::string::npos);
+            World x10;
+            CHECK(!checkpoint::deserialize(noPred, x10, err) && err.find("predators") != std::string::npos);
+        }
+    }
+
+    // --- 12. the frozen assay's accounting: virtual buds, wrapping age ----
+    {
+        World w = bareBrainWorld(41u, 2, true);
+        w.cfg.predatorFrozen = true;
+        w.cfg.predatorMetabolism = 50.0f;     // would starve in < 1 s
+        w.cfg.predatorMaxAge = 1.0f;          // would age out in 1 s
+        w.predators[1].energy = 1000.0f;      // would bud at once, again and again
+        std::set<std::uint32_t> energyBits;
+        int wraps = 0;
+        float lastAge = 0.0f;
+        for (int i = 0; i < 200; ++i) {
+            w.update(0.016f);
+            float s[NUM_PRED_SENSES] = {};
+            predbrain::writeOwnSensors(w.predators[1], w.cfg, predbrain::topSpeed(w.predators[1], w.cfg), s);
+            energyBits.insert(floatBits(s[PS_ENERGY]));
+            if (w.predators[0].age < lastAge) ++wraps;
+            lastAge = w.predators[0].age;
+        }
+        CHECK(w.predators.size() == 2u && w.totalPredatorBirths == 0 &&
+              w.totalPredatorDeathsStarvation == 0 && w.totalPredatorDeathsAge == 0);
+        CHECK(bitEq(w.predators[0].energy, 0.0f));                       // floored, not dead
+        CHECK(wraps == 3 && w.predators[0].age >= 0.0f && w.predators[0].age < 1.0f);   // 3.2 s of a 1 s life
+        CHECK(energyBits.size() > 20);                                   // ENERGY moved
+        CHECK(w.predators[1].virtualBuds > 20 && w.predators[0].virtualBuds == 0);
+        CHECK(w.predators[1].energy < w.cfg.predatorReproEnergy);
+        predstats::Last last;
+        const predstats::Row r = predstats::sample(w, 0.016f, last);
+        CHECK(r.virtualBuds == (long long)w.predators[1].virtualBuds && r.virtualBudsPerPredS > 0.0 &&
+              approx((float)r.virtualBudsMean, 0.5f * w.predators[1].virtualBuds, 1e-3f));
+        // the per-predator count survives a checkpoint
+        std::string err;
+        World back;
+        CHECK(checkpoint::deserialize(checkpoint::serialize(w, "t"), back, err) &&
+              back.predators[1].virtualBuds == w.predators[1].virtualBuds);
+    }
+
+    // --- 12a. a virtual bud is funded; age folds any number of lifespans --
+    {
+        // threshold 40 x 0.5 = 20 sits BELOW the newborn energy 30: a predator
+        // between the two cannot pay for a bud, so it makes none
+        World w = bareBrainWorld(42u, 3, true);
+        w.cfg.predatorFrozen = true;
+        w.cfg.predatorMetabolism = 0.0f;      // no move cost, no prey: only buds move energy
+        w.cfg.predatorReproEnergy = 40.0f;
+        w.cfg.predatorNewbornEnergy = 30.0f;
+        for (Predator& p : w.predators) p.buddingFactor = 0.5f;
+        w.predators[0].energy = 20.0f;        // at the threshold, cannot pay
+        w.predators[1].energy = 29.5f;        // above it, still cannot
+        w.predators[2].energy = 35.0f;        // can, once
+        w.update(0.016f);
+        CHECK(w.predators[0].virtualBuds == 0 && bitEq(w.predators[0].energy, 20.0f));
+        CHECK(w.predators[1].virtualBuds == 0 && bitEq(w.predators[1].energy, 29.5f));
+        CHECK(w.predators[2].virtualBuds == 1 && bitEq(w.predators[2].energy, 5.0f));   // paid exactly 30
+        for (int i = 0; i < 50; ++i) w.update(0.016f);
+        CHECK(w.predators[0].virtualBuds == 0 && w.predators[1].virtualBuds == 0 &&
+              w.predators[2].virtualBuds == 1 && w.predTally_.virtualBuds == 1);
+    }
+    {
+        // a max age shorter than one step: every step folds back into [0, maxAge)
+        World w = bareBrainWorld(43u, 2, true);
+        w.cfg.predatorFrozen = true;
+        w.cfg.predatorMetabolism = 0.0f;
+        w.cfg.predatorMaxAge = 0.005f;
+        bool inRange = true;
+        for (int i = 0; i < 100; ++i) {
+            w.update(0.016f);
+            for (const Predator& p : w.predators) inRange = inRange && p.age >= 0.0f && p.age < 0.005f;
+        }
+        CHECK(inRange && w.predators.size() == 2u && w.totalPredatorDeathsAge == 0);
+        // a loaded age of several lifespans folds at its first step
+        World x = bareBrainWorld(44u, 1, true);
+        x.cfg.predatorFrozen = true;
+        x.cfg.predatorMetabolism = 0.0f;
+        x.cfg.predatorMaxAge = 1.0f;
+        x.predators[0].age = 5.5f;
+        std::string err;
+        World y;
+        CHECK(checkpoint::deserialize(checkpoint::serialize(x, "t"), y, err) && bitEq(y.predators[0].age, 5.5f));
+        const float aged = 5.5f + 0.016f;
+        y.update(0.016f);
+        CHECK(bitEq(y.predators[0].age, std::fmod(aged, 1.0f)) && y.predators[0].age < 1.0f);
+        // one lifespan past (the usual case) is the plain subtraction (Sterbenz)
+        y.predators[0].age = 0.99f;
+        const float past = 0.99f + 0.016f;
+        y.update(0.016f);
+        CHECK(bitEq(y.predators[0].age, past - 1.0f));
+    }
+
+    // --- 12b. a lineage-log write that fails keeps its events --------------
+#ifdef __linux__
+    {
+        World w = bareBrainWorld(43u, 2, false);
+        w.cfg.predatorLog = true;
+        w.notePredatorsAtStart(w.predators, 'L');
+        std::FILE* full = std::fopen("/dev/full", "w");
+        if (full) {
+            CHECK(!predstats::drainLog(w, full) && w.predLog_.size() == 2u);
+            std::fclose(full);
+        }
+        CHECK(!predstats::drainLog(w, nullptr) && w.predLog_.size() == 2u);
+    }
+#endif
+
+    // --- 13. the lineage log across a resume: stitched == uninterrupted ----
+#ifdef EVO_DETERMINISTIC
+    {
+        auto make = [](World& w) {
+            rng.seed(9090u);
+            configureRichWorld(w);
+            w.cfg.predatorBrain = true;
+            w.cfg.predatorMeal = 14.0f;
+            w.cfg.predatorMaxPopulation = 10;
+            w.cfg.predatorMinPopulation = 2;
+            w.cfg.predatorMaxAge = 20.0f;
+            w.cfg.predatorLog = true;
+            w.init(900, 700, 220);
+        };
+        World A;
+        make(A);
+        for (int i = 0; i < 700; ++i) A.update(0.016f);
+        const unsigned long long F = A.frame;
+        const std::string cut = checkpoint::serialize(A, "t");
+        for (int i = 0; i < 900; ++i) A.update(0.016f);
+        std::vector<std::string> full, stitched;
+        for (const auto& e : A.predLog_) full.push_back(predstats::logRow(e));
+        for (const auto& e : A.predLog_) if (e.frame <= F) stitched.push_back(predstats::logRow(e));
+        World B;
+        B.cfg.predatorLog = true;             // a CLI setting, not world state
+        std::string err;
+        CHECK(checkpoint::deserialize(cut, B, err));
+        CHECK(B.predLog_.empty());
+        B.notePredatorsAtStart(B.predators, 'L');
+        size_t lRows = 0;
+        for (const auto& e : B.predLog_) lRows += (e.event == 'L' && e.frame == F);
+        CHECK(lRows == B.predators.size() && lRows > 0);
+        for (int i = 0; i < 900; ++i) B.update(0.016f);
+        for (const auto& e : B.predLog_) if (e.event != 'L') stitched.push_back(predstats::logRow(e));
+        long births = 0, deaths = 0;
+        for (const auto& e : A.predLog_) { births += e.event == 'B'; deaths += e.event == 'S' || e.event == 'A'; }
+        CHECK(births > 0 && deaths > 0);
+        CHECK(stitched == full);
+    }
+#endif
+
+    // --- 14. toroidal sensing: a prey across the seam is seen, and steered to
+    {
+        for (int tor = 0; tor <= 1; ++tor) {
+            rng.seed(55u);
+            World w;
+            w.cfg.predatorCount = 1;
+            w.cfg.predatorBrain = true;
+            w.cfg.minPopulation = 0;
+            w.cfg.targetFood = 0;
+            w.cfg.toroidal = tor != 0;
+            w.init(640, 480, 0);
+            w.creatures.clear();
+            Predator& p = w.predators[0];
+            p.pos = {5.0f, 240.0f}; p.vel = {0.0f, 1.0f};      // heading +y; rht = (-1, 0)
+            p.genome = {predbrain::primerGene(PS_PREY_LR, PA_TURN, 3.0f)};
+            predbrain::buildNet(p.genome, p.nnet);
+            Creature prey = makeRandomCreature({620.0f, 240.0f});   // 20 to the -x side across the seam
+            prey.vel = {0.0f, 1.0f};
+            w.creatures.push_back(prey);
+            w.update(0.016f);
+            const float vx = w.predators[0].vel.x;
+            if (tor) CHECK(vx < 0.0f);          // turned toward -x: through the seam
+            else     CHECK(bitEq(vx, 0.0f));    // 615 away: unseen, no turn
+        }
+    }
+}
+
 int main() {
     std::printf("=== evo_boids core tests (no SFML linked) ===\n");
     test_portable_mt19937();
@@ -3740,6 +4478,7 @@ int main() {
     test_repro_mitigations();
     test_generation();
     test_predator_floor_inherit();
+    test_predator_brain();
 #ifdef EVO_POOL_THREADS
     test_thread_pool();
 #endif

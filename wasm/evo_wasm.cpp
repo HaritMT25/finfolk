@@ -417,6 +417,12 @@ EVO_EXPORT int evo_init(unsigned seed, int width, int height, int population,
         g_error = "predatorTraitMutation must be finite and >= 0";
         return 0;
     }
+    // Stage C (v0.27.0): the brain knobs, refused on the same terms by every
+    // frontend and the checkpoint loader (config.hpp predatorBrainConfigError).
+    if (const char* why = predatorBrainConfigError(cfg)) {
+        g_error = why;
+        return 0;
+    }
     // Same refusal main.cpp makes for the gate knobs, so the frontends agree
     // there too. Negative is legal and means off (the reproMaxDistance
     // convention); non-finite is not: every comparison against NaN is false, so
@@ -887,6 +893,9 @@ EVO_EXPORT int evo_load_checkpoint(const char* json) {
     delete g_world;
     g_world = w;
     g_world->cfg.captureActivations = true;  // see evo_init
+    // A loaded arena (Stage C) is being run now, so the checkpoints this page
+    // saves are ordinary ones, as main.cpp's are (a later CLI run logs L rows).
+    g_world->arenaFresh_ = false;
     // A Turbo hand-off carries on the same run: re-baseline quietly. A file
     // load is a new run; the page then calls evo_rec_reset(1).
     recReset(*g_world, false, false);

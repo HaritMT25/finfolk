@@ -12,6 +12,7 @@
 #include "creature.hpp"
 #include "body_model.hpp"
 #include "predator.hpp"
+#include "predator_brain.hpp"
 #include "quadtree.hpp"
 #include "spatial_grid.hpp"
 #include "config.hpp"
@@ -243,6 +244,15 @@ public:
 
         food.clear();
         for (int i = 0; i < cfg.targetFood; ++i) spawnFood();
+
+        // Stage C: seed the predators' stream from ONE global draw, taken last,
+        // so every draw above is exactly Stage B's at the same seed; then give
+        // each spawned predator a founder's genome from that stream. Off: no
+        // draw, nothing changes.
+        if (cfg.predatorBrain) {
+            predRng_.seed(rng.uint());
+            for (Predator& p : predators) foundPredator(p, 'F');
+        }
     }
 
     void spawnFood() {
@@ -653,6 +663,8 @@ private:
     // the dead erased AFTER the loop (the prey remove_if pattern) so neither
     // invalidates the predator we're iterating.
     void updatePredators(float dt) {
+        // Stage C replaces the scripted hunt below, which is otherwise unchanged.
+        if (cfg.predatorBrain) { updateBrainPredators(dt); return; }
         if (predators.empty()) return;
         const bool  econ     = cfg.predatorEconomy;
         // Predator kinetic coefficient: reuse the prey --move-cost when <0.
@@ -817,8 +829,283 @@ private:
             const float a = rng.range(0.0f, 6.2832f);
             p.vel = {evomath::cosf(a), evomath::sinf(a)};
             p.energy = cfg.predatorNewbornEnergy;
-            predators.push_back(p);
+            // Stage C: a refill is a random-genome founder of a new lineage,
+            // from the predators' stream (the three draws above are unchanged).
+            if (cfg.predatorBrain) foundPredator(p, 'R');
+            predators.push_back(std::move(p));
             totalPredatorReseeds++;
+        }
+    }
+
+    // ---- Stage C (cfg.predatorBrain): founders and the neural hunt ----------
+
+    // A founder (initial spawn 'F', floor refill 'R'): a random genome (with
+    // the pursuit primer if cfg.predatorPrimer) from predRng_, its network, a
+    // fresh id that starts its own lineage, top speed. Position, heading,
+    // energy and traits are the caller's (Stage B's draws).
+    void foundPredator(Predator& p, char event) {
+        p.genome = predbrain::founderGenome(cfg, predRng_);
+        predbrain::buildNet(p.genome, p.nnet);
+        p.id = nextPredatorId_++;
+        p.lineageId = p.id;
+        p.parentId = 0;
+        p.speed = predbrain::topSpeed(p, cfg);
+        p.captures = 0;
+        notePredator(event, p);
+    }
+
+    // The neural hunt + the Stage B economy. Per predator, in vector order:
+    //   1. sense: the 21 inputs (predator_brain.hpp). Prey from the creature
+    //      grid at their moved positions (the scripted hunt's query); rivals
+    //      from a snapshot of predator positions taken before the loop, so a
+    //      predator's view does not depend on who moved first;
+    //   2. think: the network (predbrain::feedForward);
+    //   3. act: turn by TURN x predatorTurnRate x dt, speed += THRUST x 50 x dt
+    //      within [predatorMinSpeed, predatorSpeed x speedFactor];
+    //   4. economy: burn metabolism + move-cost x speed^2 at THIS speed (Stage
+    //      B's formula, per step), so a slow predator saves energy;
+    //   5. move (current and wrap as the scripted hunt);
+    //   6. capture: the nearest living prey within the capture radius, if not
+    //      digesting — Stage B's meal and cooldown;
+    //   7. life cycle (economy only): starve, age out, or bud — Stage B's rules,
+    //      cap and global-rng draws, plus the child's genome (inherited with a
+    //      mutation) and network from predRng_.
+    // Without the economy nothing ages, starves or buds and energy is inert: a
+    // fixed, immortal population of neural hunters whose ENERGY and AGE read 0
+    // (the frozen-newborn assay). With the economy and cfg.predatorFrozen (the
+    // frozen assay) energy and age are accounted as usual, but step 7 neither
+    // kills nor buds: a predator at the threshold pays for a VIRTUAL bud (no
+    // child), age wraps at predatorMaxAge, and energy is floored at 0.
+    void updateBrainPredators(float dt) {
+        if (predators.empty()) return;
+        const bool  econ     = cfg.predatorEconomy;
+        const bool  frozen   = econ && cfg.predatorFrozen;
+        const float pmc      = (cfg.predatorMoveCost >= 0.0f) ? cfg.predatorMoveCost : cfg.moveCost;
+        const float R        = cfg.predatorPerception;
+        const float R2       = R * R;
+        const float capture2 = cfg.predatorCaptureRadius * cfg.predatorCaptureRadius;
+        // The prey list must also cover the capture disc after this step's
+        // move (perception is 150 by default, far more than 14 + a step).
+        const float queryR   = std::max(R, cfg.predatorCaptureRadius + 64.0f);
+
+        const int n = (int)predators.size();
+        std::vector<Vec2> snap((size_t)n);
+        for (int i = 0; i < n; ++i) snap[(size_t)i] = predators[(size_t)i].pos;
+
+        std::vector<Predator> newborns;
+        std::vector<int> near;
+        for (int pi = 0; pi < n; ++pi) {
+            Predator& p = predators[(size_t)pi];
+            const float top = predbrain::topSpeed(p, cfg);
+            p.digestTimer -= dt;
+            if (econ) p.age += dt;
+
+            // 1. sense
+            float s[NUM_PRED_SENSES];
+            std::memset(s, 0, sizeof(s));
+            const Vec2 fwd = p.forward();
+            const Vec2 rht = {-fwd.y, fwd.x};
+
+            near.clear();
+            if (cfg.toroidal) creatureGrid_.queryRadiusWrapped(p.pos, queryR, near);
+            else              creatureGrid_.queryRadius(p.pos, queryR, near);
+            int   best = -1;
+            float bestD2 = R2;
+            Vec2  bestOff = {0.0f, 0.0f};
+            int   count = 0;
+            float sx = 0.0f, sy = 0.0f;
+            for (int ci : near) {
+                const Creature& prey = creatures[ci];
+                if (!prey.alive) continue;
+                float dx = prey.pos.x - p.pos.x;
+                float dy = prey.pos.y - p.pos.y;
+                if (cfg.toroidal) { dx = wrapDx(dx); dy = wrapDy(dy); }
+                const float d2 = dx * dx + dy * dy;
+                if (!(d2 < R2)) continue;
+                ++count; sx += dx; sy += dy;
+                if (d2 < bestD2) { bestD2 = d2; best = ci; bestOff = {dx, dy}; }
+            }
+            if (best >= 0) {
+                const float d   = std::sqrt(bestD2);
+                const float inv = (d > 1e-3f) ? 1.0f / d : 0.0f;
+                const Vec2  u   = {bestOff.x * inv, bestOff.y * inv};   // toward the prey
+                s[PS_PREY_FWD]  = u.x * fwd.x + u.y * fwd.y;
+                s[PS_PREY_LR]   = u.x * rht.x + u.y * rht.y;
+                s[PS_PREY_PROX] = 1.0f - d / R;
+                const Vec2 h = creatures[best].forward();
+                s[PS_PREY_HEAD_FWD] = h.x * fwd.x + h.y * fwd.y;
+                s[PS_PREY_HEAD_LR]  = h.x * rht.x + h.y * rht.y;
+                const float invN = 1.0f / (float)count;
+                const float mx = sx * invN, my = sy * invN;
+                s[PS_PREY_CENTROID_FWD] = evomath::tanhf((mx * fwd.x + my * fwd.y) / R);
+                s[PS_PREY_CENTROID_LR]  = evomath::tanhf((mx * rht.x + my * rht.y) / R);
+            }
+            s[PS_PREY_COUNT] = tanhCountOver10(count);
+            {
+                int   rb = -1;
+                float rd2 = R2;
+                Vec2  ro = {0.0f, 0.0f};
+                const Vec2 self = snap[(size_t)pi];
+                for (int j = 0; j < n; ++j) {
+                    if (j == pi) continue;
+                    float dx = snap[(size_t)j].x - self.x;
+                    float dy = snap[(size_t)j].y - self.y;
+                    if (cfg.toroidal) { dx = wrapDx(dx); dy = wrapDy(dy); }
+                    const float d2 = dx * dx + dy * dy;
+                    if (d2 < rd2) { rd2 = d2; rb = j; ro = {dx, dy}; }
+                }
+                if (rb >= 0) {
+                    const float d   = std::sqrt(rd2);
+                    const float inv = (d > 1e-3f) ? 1.0f / d : 0.0f;
+                    const Vec2  u   = {ro.x * inv, ro.y * inv};
+                    s[PS_RIVAL_FWD]  = u.x * fwd.x + u.y * fwd.y;
+                    s[PS_RIVAL_LR]   = u.x * rht.x + u.y * rht.y;
+                    s[PS_RIVAL_PROX] = 1.0f - d / R;
+                }
+            }
+            predbrain::writeOwnSensors(p, cfg, top, s);
+            s[PS_SIGNAL]     = signals.read(p.pos);
+            s[PS_SIGNAL_FWD] = signals.readInDir(p.pos, fwd) - signals.readInDir(p.pos, {-fwd.x, -fwd.y});
+            s[PS_SIGNAL_LR]  = signals.readInDir(p.pos, rht) - signals.readInDir(p.pos, {-rht.x, -rht.y});
+            if (current_.active()) {
+                const Vec2 cur = current_.velocityAt(p.pos);
+                s[PS_CURRENT_FWD] = evomath::tanhf((cur.x * fwd.x + cur.y * fwd.y) / 100.0f);
+                s[PS_CURRENT_LR]  = evomath::tanhf((cur.x * rht.x + cur.y * rht.y) / 100.0f);
+            }
+            s[PS_RANDOM] = predRng_.range(-1.0f, 1.0f);
+
+            // 2. think, 3. act
+            float a[NUM_PRED_ACTIONS];
+            predbrain::feedForward(p.nnet, s, a, cfg.fastTanh);
+            const float turn = a[PA_TURN] * cfg.predatorTurnRate * dt;
+            const float cs = evomath::cosf(turn), sn = evomath::sinf(turn);
+            p.vel = {fwd.x * cs - fwd.y * sn, fwd.x * sn + fwd.y * cs};   // +turn rotates toward rht
+            p.speed = std::clamp(p.speed + a[PA_THRUST] * predbrain::kThrustAccel * dt,
+                                 cfg.predatorMinSpeed, top);
+
+            // 4. economy: this step's burn at this step's speed
+            if (econ) p.energy -= (cfg.predatorMetabolism + pmc * p.speed * p.speed) * dt;
+
+            predTally_.predSteps++;
+            predTally_.speedSum   += p.speed;
+            predTally_.speedSqSum += (double)p.speed * p.speed;
+            if (p.speed >= 0.95f * top) predTally_.topSteps++;
+            if (best >= 0) { predTally_.pursuitSteps++; predTally_.alignSum += s[PS_PREY_FWD]; }
+
+            // 5. move
+            p.pos.x += p.vel.x * p.speed * dt;
+            p.pos.y += p.vel.y * p.speed * dt;
+            if (current_.active()) {
+                const Vec2 cur = current_.velocityAt(p.pos);
+                p.pos.x += cur.x * dt;
+                p.pos.y += cur.y * dt;
+            }
+            if (p.pos.x < 0) p.pos.x += width;  else if (p.pos.x >= width)  p.pos.x -= width;
+            if (p.pos.y < 0) p.pos.y += height; else if (p.pos.y >= height) p.pos.y -= height;
+
+            // 6. capture
+            if (p.digestTimer <= 0.0f) {
+                int   cb  = -1;
+                float cd2 = 0.0f;
+                for (int ci : near) {
+                    const Creature& prey = creatures[ci];
+                    if (!prey.alive) continue;
+                    float dx = prey.pos.x - p.pos.x;
+                    float dy = prey.pos.y - p.pos.y;
+                    if (cfg.toroidal) { dx = wrapDx(dx); dy = wrapDy(dy); }
+                    const float d2 = dx * dx + dy * dy;
+                    if (d2 <= capture2 && (cb < 0 || d2 < cd2)) { cb = ci; cd2 = d2; }
+                }
+                if (cb >= 0) {
+                    if (econ) p.energy += (cfg.predatorMeal >= 0.0f) ? cfg.predatorMeal
+                                                                      : creatures[cb].foodReserves;
+                    recordDeath(creatures[cb], 'p');
+                    p.digestTimer = cfg.predatorCooldown;
+                    ++p.captures;
+                    predTally_.captures++;
+                }
+            }
+
+            // 7. life cycle (Stage B's order and draws)
+            if (frozen) {
+                // The frozen assay: the accounting above ran, nobody dies or buds,
+                // and no draw is taken, so the population and both streams stay
+                // fixed. So that ENERGY and AGE cycle through the range they have
+                // in an evolving run (not parked at "full" and "old"):
+                //  * a VIRTUAL BUD where Stage B would bud: at the threshold the
+                //    predator pays the newborn energy and makes no child; counted
+                //    per predator (virtualBuds) and per interval — a direct
+                //    fitness readout of the assayed genome. Only a FUNDED one:
+                //    the predator must also hold the newborn energy it pays
+                //    (a threshold below it, buddingFactor < 1, would otherwise
+                //    count a bud it could not pay for);
+                //  * age WRAPS: modulo the max age, so any number of lifespans
+                //    folds (a max age shorter than a step, a loaded age of many
+                //    lifespans). std::fmod is exact, so the same bits native and
+                //    wasm, and one lifespan past (the usual case) it equals
+                //    age - maxAge (Sterbenz);
+                //  * energy is floored at 0 where Stage B would starve.
+                if (p.energy < 0.0f) p.energy = 0.0f;
+                if (cfg.predatorMaxAge > 0.0f && p.age >= cfg.predatorMaxAge)
+                    p.age = std::fmod(p.age, cfg.predatorMaxAge);
+                if (p.energy >= std::max(cfg.predatorReproEnergy * p.buddingFactor, cfg.predatorNewbornEnergy)) {
+                    p.energy -= cfg.predatorNewbornEnergy;   // >= 0: it held at least this much
+                    ++p.virtualBuds;
+                    predTally_.virtualBuds++;
+                    notePredator('V', p);
+                }
+            } else if (econ) {
+                if (p.energy < 0.0f) {
+                    p.alive = false;
+                    totalPredatorDeathsStarvation++;
+                    notePredator('S', p);
+                } else if (cfg.predatorMaxAge > 0.0f && p.age >= cfg.predatorMaxAge) {
+                    p.alive = false;
+                    totalPredatorDeathsAge++;
+                    notePredator('A', p);
+                } else if (p.energy >= cfg.predatorReproEnergy * p.buddingFactor &&
+                           (cfg.predatorMaxPopulation <= 0 ||
+                            (int)predators.size() + (int)newborns.size() < cfg.predatorMaxPopulation)) {
+                    Predator child;
+                    if (cfg.toroidal) {
+                        child.pos = { wrapCoord(p.pos.x + rng.range(-8.0f, 8.0f), (float)width),
+                                      wrapCoord(p.pos.y + rng.range(-8.0f, 8.0f), (float)height) };
+                    } else {
+                        child.pos = { std::clamp(p.pos.x + rng.range(-8.0f, 8.0f), 0.0f, (float)width  - 1.0f),
+                                      std::clamp(p.pos.y + rng.range(-8.0f, 8.0f), 0.0f, (float)height - 1.0f) };
+                    }
+                    const float ang = rng.range(0.0f, 6.2832f);
+                    child.vel    = {evomath::cosf(ang), evomath::sinf(ang)};
+                    child.energy = cfg.predatorNewbornEnergy;
+                    p.energy    -= cfg.predatorNewbornEnergy;   // energy-conserving
+                    child.generation = p.generation + 1;
+                    if (cfg.predatorInheritance) {
+                        const float m = cfg.predatorTraitMutation;
+                        child.speedFactor   = std::clamp(p.speedFactor + rng.range(-m, m),
+                                                         PRED_TRAIT_MIN, PRED_TRAIT_MAX);
+                        child.buddingFactor = std::clamp(p.buddingFactor + rng.range(-m, m),
+                                                         PRED_TRAIT_MIN, PRED_TRAIT_MAX);
+                    }
+                    // the brain: the parent's genome with a mutation, from predRng_
+                    predbrain::inheritGenome(child, p, cfg, predRng_);
+                    predbrain::buildNet(child.genome, child.nnet);
+                    child.id        = nextPredatorId_++;
+                    child.lineageId = p.lineageId;
+                    child.parentId  = p.id;
+                    child.speed     = predbrain::topSpeed(child, cfg);
+                    newborns.push_back(std::move(child));
+                    totalPredatorBirths++;
+                    notePredator('B', newborns.back());
+                }
+            }
+        }
+
+        if (econ) {
+            for (auto& baby : newborns) predators.push_back(std::move(baby));
+            predators.erase(
+                std::remove_if(predators.begin(), predators.end(),
+                               [](const Predator& p) { return !p.alive; }),
+                predators.end());
         }
     }
 

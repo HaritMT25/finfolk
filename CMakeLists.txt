@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(evo_boids VERSION 0.26.0 LANGUAGES CXX)
+project(evo_boids VERSION 0.27.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -169,6 +169,13 @@ if(SFML_FOUND AND EVO_NO_OPENMP AND NOT EVO_POOL_THREADS)
     add_test(NAME reseed_after_load
              COMMAND bash ${CMAKE_SOURCE_DIR}/tests/reseed_after_load.sh
                      $<TARGET_FILE:evo_boids> ${CMAKE_CURRENT_BINARY_DIR}/reseed_after_load_work)
+    # stagec_cli — the Stage C CLI rules (v0.27.0): the lineage log across a
+    # resume (stitched == uninterrupted), never overwritten; Stage C flags
+    # refused on a version-1 resume; --transplant-count; an arena's T / L rows
+    # and the frozen assay.
+    add_test(NAME stagec_cli
+             COMMAND bash ${CMAKE_SOURCE_DIR}/tests/stagec_cli.sh
+                     $<TARGET_FILE:evo_boids> ${CMAKE_CURRENT_BINARY_DIR}/stagec_cli_work)
     # invasion_tooling — tools/invasion (arena, score, run, hodge) against the
     # real engine; pins the child-id derivation the invasion scores rely on.
     find_package(Python3 COMPONENTS Interpreter QUIET)

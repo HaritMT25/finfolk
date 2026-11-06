@@ -209,19 +209,19 @@ constexpr std::size_t fieldCount() {
 
 #define OFP_FIELDS(T, N) \
     static_assert(detail::fieldCount<T>() == (N), #T " gained or lost a field: hash it in tools/ocean_fingerprint.hpp, then update this count")
-OFP_FIELDS(SimConfig, 71);
+OFP_FIELDS(SimConfig, 78);   // 71 + the seven Stage C keys (visitSimConfigBrain)
 OFP_FIELDS(OceanConfig, 37);
 OFP_FIELDS(appearance::Stats, 10);   // founders, offspring, pattern[4], morph[4]
 OFP_FIELDS(AgentCore, 16 + NUM_SENSES + NUM_ACTIONS + 1);   // 14 scalars + genome + nnet, the two arrays, colour
 OFP_FIELDS(Fish, 1 + 6 + Fish::BODY_LEN);                   // base, pos .. bodyBuoy, body[]
-OFP_FIELDS(Predator, 9);
+OFP_FIELDS(Predator, 18);   // 9 + the Stage C brain (genome .. virtualBuds): hashPredator's tagged block
 OFP_FIELDS(OceanPredator, 3);                               // base, depth, pitch
 OFP_FIELDS(OceanFood, 5 + (kOceanHasEye ? 1 : 0));   // pos, depth, alive, size, age (+ eyeCon)
 OFP_FIELDS(Gene, 5);
 OFP_FIELDS(NeuralNet, 2);
 OFP_FIELDS(NeuralNet::Neuron, 2);
 OFP_FIELDS(NeuralNet::FlatConn, 2);
-OFP_FIELDS(WorldCommon, 25);
+OFP_FIELDS(WorldCommon, 30);   // 25 + Stage C: predRng_, nextPredatorId_, arenaFresh_ (ctr's tagged block), predLog_, predTally_ (statistics, not hashed)
 OFP_FIELDS(WorldCommon::DeathRecord, 7 + CLUSTER_SKETCH_DIM);
 OFP_FIELDS(WorldCommon::BirthRecord, 6);
 OFP_FIELDS(repro::Edge, 2);
@@ -378,6 +378,17 @@ void visitSimConfig(const SimConfig& c, V& v) {
     OFP_B(clusterMap); OFP_I(clusterMax); OFP_I(clusterEpoch); OFP_B(clusterPca); OFP_I(clusterColor);
     OFP_B(wiringLog); OFP_B(profile); OFP_B(fastTanh);
 }
+// The Stage C keys (v0.27.0; the Ocean refuses predatorBrain for now): scanned
+// like the rest, but hashed in `cfg` (one tagged block) and dumped only when the
+// brain is ON (simBrainActive). With it off every one of them is inert (the
+// simulation reads them only on the neural path), so a brain-off config hashes
+// and dumps exactly as before they existed, whatever values they hold.
+template <class V>
+void visitSimConfigBrain(const SimConfig& c, V& v) {
+    OFP_B(predatorBrain); OFP_F(predatorMutation); OFP_F(predatorTurnRate); OFP_F(predatorMinSpeed);
+    OFP_B(predatorPrimer); OFP_B(predatorFrozen); OFP_B(predatorLog);
+}
+inline bool simBrainActive(const SimConfig& c) { return c.predatorBrain; }
 template <class V>
 void visitOceanConfig(const OceanConfig& c, V& v) {
     OFP_F(depth); OFP_F(kBuoy); OFP_F(buoyMutation); OFP_F(pitchMax); OFP_F(vDrag); OFP_F(wallBand);
@@ -413,6 +424,11 @@ void visitOceanConfigWalls(const OceanConfig& c, V& v) {
 
 // The tagged walls block's tag (an FNV-1a word like VisionTagger's, of "walls-block").
 inline constexpr std::uint64_t kWallsTag = 0x9A1C5E77D0B0C4E5ull;
+// The Stage C blocks' tags (config keys; a predator's brain; the predator
+// stream and id counter), each hashed only off its defaults.
+inline constexpr std::uint64_t kBrainCfgTag = 0xB3A1C0DE5EED0001ull;
+inline constexpr std::uint64_t kBrainPredTag = 0xB3A1C0DE5EED0002ull;
+inline constexpr std::uint64_t kBrainCtrTag = 0xB3A1C0DE5EED0003ull;
 
 // A distinct tag word per key, then its value (bit pattern for the float).
 struct VisionTagger {
@@ -435,6 +451,10 @@ inline void hashConfig(Hasher& h, const SimConfig& c, const OceanConfig& o) {
     if (!oceanWallsAtDefaults(o)) {   // the glass walls: one tagged block, only off the defaults
         h.u64(kWallsTag);
         visitOceanConfigWalls(o, h);
+    }
+    if (simBrainActive(c)) {          // Stage C's keys: only with the brain on
+        h.u64(kBrainCfgTag);
+        visitSimConfigBrain(c, h);
     }
 }
 
@@ -462,6 +482,18 @@ inline void hashCounters(Hasher& h, const OceanWorld& w) {
         h.u64(r.frame);
     }
     for (int i = 0; i < OceanWorld::kWaveTrains; ++i) h.f64(w.wavePhase(i));
+    // Stage C: the predator stream and id counter, only with the brain on (the
+    // stream is otherwise at its fixed construction seed and never drawn).
+    // predLog_ / predTally_ are statistics and not hashed (like foodEaten).
+    if (w.cfg.predatorBrain || w.nextPredatorId_ != 1 || w.arenaFresh_) {
+        h.u64(kBrainCtrTag);
+        h.u64(w.nextPredatorId_);
+        h.b(w.arenaFresh_);
+        const auto& eng = field<peek::RgEngine>(w.predRng_);
+        const auto& x = field<peek::MtWords>(eng);
+        for (int i = 0; i < 624; i += 2) h.u64((std::uint64_t)x[i] | ((std::uint64_t)x[i + 1] << 32));
+        h.i32(field<peek::MtPos>(eng));
+    }
 }
 
 // ages: the world's foodLife > 0. Ages count only then; switched off live,
@@ -530,6 +562,21 @@ inline void hashPredator(Hasher& h, const OceanPredator& p) {
     h.v2(p.pos); h.v2(p.vel); h.f32x2(p.digestTimer, p.energy); h.f32(p.age); h.b(p.alive);
     h.f32x2(p.speedFactor, p.buddingFactor); h.u32(p.generation);
     h.f32x2(p.depth, p.pitch);
+    // Stage C's brain fields: a tagged block, only when any is off its default
+    // (a scripted predator's never are), so existing baselines are unchanged.
+    if (!p.genome.empty() || !p.nnet.flat.empty() || !p.nnet.neurons.empty() || p.id != 0 ||
+        p.lineageId != 0 || p.parentId != 0 || bits(p.speed) != 0u || p.captures != 0 || p.sourceId != 0 ||
+        p.virtualBuds != 0) {
+        h.u64(kBrainPredTag);
+        h.u64(p.id); h.u64(p.lineageId); h.u64(p.parentId); h.f32(p.speed); h.u32(p.captures);
+        h.u64(p.sourceId); h.u32(p.virtualBuds);
+        h.u64(p.genome.size());
+        for (const Gene& g : p.genome) h.u32(geneWord(g));
+        h.u64(p.nnet.neurons.size());
+        for (const auto& nr : p.nnet.neurons) { h.f32(nr.output); h.b(nr.driven); }
+        h.u64(p.nnet.flat.size());
+        for (const auto& fc : p.nnet.flat) h.u32((std::uint32_t)fc.srcSink | ((std::uint32_t)(std::uint16_t)fc.weight << 16));
+    }
 }
 
 // The fixed lattice the current is sampled on, and the three depth fractions
@@ -714,12 +761,15 @@ inline long countNonFinite(const OceanWorld& w) {
         f(fd.eyeCon);
 #endif
     }
-    for (const OceanPredator& p : w.predators)
+    for (const OceanPredator& p : w.predators) {
         for (float v : {p.pos.x, p.pos.y, p.vel.x, p.vel.y, p.digestTimer, p.energy, p.age, p.speedFactor,
-                        p.buddingFactor, p.depth, p.pitch})
+                        p.buddingFactor, p.depth, p.pitch, p.speed})
             f(v);
+        for (const auto& nr : p.nnet.neurons) f(nr.output);
+    }
     f(w.D);
     visitSimConfig(w.cfg, nf);
+    visitSimConfigBrain(w.cfg, nf);
     visitOceanConfig(w.ocfg, nf);
     visitOceanConfigVision(w.ocfg, nf);
     visitOceanConfigAppearance(w.ocfg, nf);
@@ -796,6 +846,9 @@ inline void dumpState(const OceanWorld& w, std::FILE* out) {
     d.ull("fish", w.creatures.size()); d.ull("food", w.food.size()); d.ull("pred", w.predators.size());
     std::fprintf(out, "\nsimconfig");
     visitSimConfig(w.cfg, d);
+    // The Stage C keys only with the brain on, as they are hashed, so a
+    // brain-off dump is the 0.26.0 dump line for line (inactive values too).
+    if (simBrainActive(w.cfg)) visitSimConfigBrain(w.cfg, d);
     std::fprintf(out, "\noceanconfig");
     visitOceanConfig(w.ocfg, d);
     visitOceanConfigVision(w.ocfg, d);

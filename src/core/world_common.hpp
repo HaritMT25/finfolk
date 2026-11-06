@@ -7,7 +7,9 @@
 //
 // World derives from WorldCommon, so every member keeps its name
 // (world.totalBirths, world.cfg, World::BirthRecord) and no caller changes.
-// None of this draws a random number or touches the simulation's floats.
+// None of this draws a random number or touches the simulation's floats —
+// except the Stage C predator stream (predRng_), which only a world with
+// cfg.predatorBrain on ever draws from.
 // ----------------------------------------------------------------------------
 #include <vector>
 #include <cstdio>
@@ -18,6 +20,8 @@
 #include "config.hpp"
 #include "cluster_projection.hpp"
 #include "kernel.hpp"
+#include "predator.hpp"
+#include "random.hpp"
 #include "repro_graph.hpp"
 
 struct WorldCommon {
@@ -112,6 +116,97 @@ struct WorldCommon {
     // rng — the simulation stays byte-for-byte and deterministic regardless of
     // ids.
     std::uint64_t nextId_ = 1;
+
+    // ---- Stage C: the predator brains (cfg.predatorBrain; predator_brain.hpp) ----
+    // All of this stays at its default while the brain is off: nothing draws
+    // from predRng_, no id is handed out, nothing is logged or tallied, and no
+    // checkpoint or CSV mentions any of it.
+    //
+    // predRng_: the predators' own random stream — founders' genomes, bud
+    // mutations and the RANDOM input. Used only in the single-threaded predator
+    // phase. Seeded from ONE draw of the global rng at the end of World::init
+    // (so a --seed fixes it, and the prey, predator and food draws before it
+    // are exactly Stage B's), reseeded the same way by reseedStreams, and
+    // carried by brain checkpoints (predatorRngState).
+    RandomGen predRng_{5489u};
+    // Predator ids: their own namespace (the prey's nextId_ is untouched), 1-based.
+    std::uint64_t nextPredatorId_ = 1;
+
+    // The lineage log (cfg.predatorLog): one record per founding (F: initial
+    // spawn, R: floor refill), bud (B), death (S: starved, A: aged) and the
+    // frozen assay's virtual bud (V: paid for, no child), plus,
+    // at the start of a run that did not come from init(), one record per live
+    // predator: L (loaded from a checkpoint) or T (transplanted: the first run
+    // of an arena; `source` = its id in the source checkpoint). Drained by the
+    // headless runner at every sample and before every checkpoint write, never
+    // decimated. Not world state.
+    struct PredatorEvent {
+        unsigned long long frame = 0;
+        char event = '?';
+        std::uint64_t id = 0, parent = 0, lineage = 0;
+        std::uint32_t generation = 0;
+        float age = 0.0f;
+        std::uint32_t captures = 0;
+        float energy = 0.0f;
+        int genomeLen = 0;
+        float speedFactor = 1.0f, buddingFactor = 1.0f;
+        std::uint64_t source = 0;
+    };
+    std::vector<PredatorEvent> predLog_;
+
+    // Set by the transplant on the arena it builds (written to the arena file
+    // as world.arena = true) and cleared once the arena's first run has logged
+    // its T rows, so only the arena file itself carries it.
+    bool arenaFresh_ = false;
+
+    // Per-interval sums for <stem>.predators.csv (predator_stats.hpp), reset at
+    // each sample. Diagnostics only: nothing in the step reads them back.
+    struct PredatorTally {
+        long long predSteps = 0;      // predator-steps
+        long long pursuitSteps = 0;   // ... with a prey within perception
+        long long topSteps = 0;       // ... at >= 95 % of top speed
+        long long captures = 0;
+        double alignSum = 0.0;        // PREY_FWD over pursuit steps (cos heading vs bearing)
+        double speedSum = 0.0, speedSqSum = 0.0;
+        long long deaths = 0;         // predators that died (starved or aged)
+        double deathCaptures = 0.0, deathAge = 0.0;
+        long long virtualBuds = 0;    // the frozen assay's virtual buds
+    };
+    PredatorTally predTally_;
+
+    void notePredator(char event, const Predator& p) {
+        if (event == 'S' || event == 'A') {
+            ++predTally_.deaths;
+            predTally_.deathCaptures += p.captures;
+            predTally_.deathAge += p.age;
+        }
+        if (!cfg.predatorLog) return;
+        PredatorEvent e;
+        e.frame = frame; e.event = event;
+        e.id = p.id; e.parent = p.parentId; e.lineage = p.lineageId;
+        e.generation = p.generation; e.age = p.age; e.captures = p.captures; e.energy = p.energy;
+        e.genomeLen = (int)p.genome.size();
+        e.speedFactor = p.speedFactor; e.buddingFactor = p.buddingFactor;
+        e.source = (event == 'T') ? p.sourceId : 0;
+        predLog_.push_back(e);
+    }
+
+    // A run that starts from a checkpoint: one L row (or T, for an arena's
+    // first run) per live predator, so the log segment is self-contained.
+    // Stitching: keep the earlier segment's rows with frame <= this frame, then
+    // this segment's rows without its L rows.
+    template <class Predators>
+    void notePredatorsAtStart(const Predators& ps, char event) {
+        for (const auto& p : ps) notePredator(event, p);
+    }
+
+    // Seed the run's streams from S: the global rng, then (brain on) the
+    // predators' from one draw of it — the rule World::init follows. Used by
+    // --reseed-after-load; with the brain off it is exactly rng.seed(S).
+    void reseedStreams(unsigned s) {
+        rng.seed(s);
+        if (cfg.predatorBrain) predRng_.seed(rng.uint());
+    }
 
     // ---- Phase profiler (cfg.profile). Accumulates wall-time per phase plus a
     // CPU-time split inside the parallel loop (gather vs feedForward vs apply,
