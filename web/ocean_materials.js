@@ -593,9 +593,11 @@
    * them (three's compileAsync on a scratch scene, each on its kind's geometry), then each program checked: linked (the GL
    * status, so it holds whatever three's checkShaderErrors) and runnable by three's own first-use check (getUniforms;
    * diagnostics). A check that throws is a failure, never a pass; the budget (60 s: ANGLE / D3D11 takes ~1.2 s a program)
-   * only bounds a hung compile, its timer cleared once settled. Fenced by the context's generation (o.generation: one more
-   * at each loss and restore): a compile that a loss overtook is refused, whatever three said since (a restored context
-   * has new programs, and three's compileAsync, polling the old ones, can resolve then). @param {MaterialCompilerOptions} o */
+   * only bounds a hung compile, its timer cleared once settled, and says so (timeout: the prewarm asks again later). Fenced
+   * by the context's generation (o.generation: one more at each loss and restore) and the context itself: a compile that a
+   * loss overtook is refused as lost, whatever three said since (a restored context has new programs, and three's
+   * compileAsync, polling the old ones, can resolve then; a lost context's programs read complete, so the poll can resolve
+   * before the loss's event has run: getContext().isContextLost()). @param {MaterialCompilerOptions} o */
   function compiler(o) {
     /* the platform's timers called as functions: setTimeout / clearTimeout detached into an object and called as its
      * methods throw "Illegal invocation" in a browser (this would be the object, not the window) */
@@ -604,14 +606,18 @@
       clear: function (/** @type {any} */ t) { clearTimeout(t); }
     };
     var LOST = "the WebGL context was lost during the compile (its programs were the lost context's)";
-    /** @param {MaterialCompileItem[]} items @returns {Promise<{ ok: boolean, error?: string }>} */
+    /** @param {MaterialCompileItem[]} items @returns {Promise<MaterialCompileResult>} */
     return function (items) {
       return new Promise(function (resolve) {
         if (o.lost && o.lost()) { resolve({ ok: false, error: "the WebGL context is lost" }); return; }
         var gen = o.generation ? o.generation() : 0;
-        function moved() { return !!o.generation && o.generation() !== gen; }
+        /* lost since it started: a generation moved on, or the context lost with its event still to come */
+        function moved() {
+          if (o.generation && o.generation() !== gen) return true;
+          try { var c = o.renderer.getContext(); return !!c && typeof c.isContextLost === "function" && c.isContextLost() === true; } catch (e) { return false; }
+        }
         var settled = false, /** @type {any} */ timer = null;
-        /** @param {{ ok: boolean, error?: string }} r */
+        /** @param {MaterialCompileResult} r */
         function end(r) {
           if (settled) return; settled = true; if (timer !== null) timers.clear(timer); timer = null;
           resolve(moved() ? { ok: false, error: LOST } : r);
@@ -632,7 +638,7 @@
         try {
           var ws = new o.THREE.Scene();
           items.forEach(function (x) { var m = new o.THREE.Mesh(x.geometry ? x.geometry() : o.geometry(x), x.material); m.frustumCulled = false; ws.add(m); });
-          timer = timers.set(function () { timer = null; end({ ok: false, error: "the compile did not finish in " + Math.round(budget / 1000) + " s" }); }, budget);
+          timer = timers.set(function () { timer = null; end({ ok: false, timeout: true, error: "the compile did not finish in " + Math.round(budget / 1000) + " s" }); }, budget);
           if (o.renderer.compileAsync) o.renderer.compileAsync(ws, o.camera, o.scene).then(verify, function (/** @type {any} */ e) { end({ ok: false, error: msg(e) }); });
           else { o.renderer.compile(ws, o.camera, o.scene); verify(); }
         } catch (e) { end({ ok: false, error: msg(e) }); }

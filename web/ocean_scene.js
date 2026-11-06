@@ -600,10 +600,12 @@
      * program checked linked and runnable), so the first lit fish never
      * stalls a frame on a compile. Until they are compiled in this
      * generation (warm) the kind keeps its plain programs: a compile that
-     * fails, or does not finish in its budget, keeps them plain (said once),
-     * and after a context loss they are compiled again in the restored
-     * context before they draw (a compile started before the loss is
-     * refused, and its result was for the lost context's programs). mats:
+     * fails keeps them plain (said once); one that does not finish in its
+     * budget is asked again by a later frame (until it succeeds: three's
+     * program cache makes that cheap once the driver is done); and after a
+     * context loss they are compiled again in the restored context before
+     * they draw (a compile started before the loss is refused, and its
+     * result was for the lost context's programs). mats:
      * the binder's materials for them (binder.warm: assembled then, not
      * before); asked, ready: the generation that asked, that compiled them */
     function Warm(name, mats, geo) { return { name: name, mats: mats, geo: geo, asked: -1, ready: -1, said: false }; }
@@ -616,8 +618,9 @@
         var items = wm.mats().map(function (m, i) { return { key: wm.name + " polish " + i, kind: wm.name, pass: "warm", variant: 1, material: m, geometry: wm.geo }; });
         compile(items).then(function (r) {
           if (gen !== ctxGen) return;   /* (refused, or for programs a lost context held) */
-          if (r.ok) wm.ready = gen;
-          else if (!wm.said) { wm.said = true; console.warn("evo_boids: the " + (wm.name === "app" ? "appearance fish's" : "legacy fish's and predators'") + " polished programs could not be compiled ahead (" + r.error + "): drawn plain"); }
+          if (r.ok) { wm.ready = gen; return; }
+          if (r.timeout) wm.asked = -1;   /* (not finished yet: a later frame asks again) */
+          if (!wm.said) { wm.said = true; console.warn("evo_boids: the " + (wm.name === "app" ? "appearance fish's" : "legacy fish's and predators'") + " polished programs could not be compiled ahead (" + r.error + "): drawn plain" + (r.timeout ? " until they are" : "")); }
         });
       }, 0);
       return false;
@@ -1470,7 +1473,8 @@
      * view offset); unit normals, + outside (poseWeight). Written in place
      * (nothing allocated a frame), and only when one of the four terms they
      * are made of changed since (planesOf: a resize, the field of view, an
-     * inset's view offset; the near / far planes do not move them) */
+     * inset's view offset; a re-fit of the near / far planes can move them
+     * by an ulp, as three derives the frustum from near: recomputed then) */
     var planesOf = new Float64Array([NaN, NaN, NaN, NaN]);
     function sidePlane(F, i, a, b) { var l = Math.hypot(a, b) || 1; F[2 * i] = a / l; F[2 * i + 1] = b / l; }
     function sidePlanes(Pm, F) {

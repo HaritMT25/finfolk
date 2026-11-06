@@ -77,7 +77,7 @@
   function bind(scene) {
     [["GENES_W", "number"], ["genesRows", "function"], ["packGenes", "function"], ["capFor", "function"], ["CLARITY", "object"], ["C", "object"]].forEach(function (m) {
       var v = scene ? /** @type {any} */ (scene)[m[0]] : undefined;
-      if (typeof v !== m[1] || v === null) throw new Error("EvoOceanSceneParity.bind(): the scene's " + m[0] + " (a " + m[1] + ") is missing");
+      if (typeof v !== m[1] || v === null) throw new Error("EvoOceanSceneParity.bind(): the scene's " + m[0] + " (" + (m[1] === "object" ? "an " : "a ") + m[1] + ") is missing");
     });
     GENES_W = scene.GENES_W; genesRows = scene.genesRows; packGenes = scene.packGenes; capFor = scene.capFor;
     CLARITY = scene.CLARITY; C = scene.C;

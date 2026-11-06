@@ -826,6 +826,8 @@ interface MaterialBound { kind: string; pass: string; variant: number; effective
 interface MaterialCompileItem { key: string; kind: string; pass: string; variant: number; material: any; geometry: (() => any) | null }
 /** An activation's outcome (stage: where it failed); keys: every key it covers; materials: the distinct ones compiled. */
 interface MaterialActivation { ok: boolean; look: string; stage?: "spec" | "assembly" | "compile"; error?: string; keys?: string[]; materials?: number }
+/** A compile's outcome (EvoOceanMaterials.compiler): timeout, it did not finish in its budget (not a failed program). */
+interface MaterialCompileResult { ok: boolean; error?: string; timeout?: boolean }
 /** The scene's compile for activations and its prewarm (EvoOceanMaterials.compiler): three (Scene, Mesh), its renderer,
  * camera and scene, a kind's geometry, whether the context is lost, the context's generation (one more at each loss and
  * restore: a compile it moved under is refused); the budget (ms, 60 s) and the timers (tests). */
@@ -873,7 +875,7 @@ interface EvoOceanMaterialsApi {
   LIT_SKIP_FEATURE: string;
   layout(kind: string, claims?: { [component: string]: string }): AttributeLayout;
   create(deps: MaterialBinderDeps): MaterialBinder;
-  compiler(o: MaterialCompilerOptions): (items: MaterialCompileItem[]) => Promise<{ ok: boolean; error?: string }>;
+  compiler(o: MaterialCompilerOptions): (items: MaterialCompileItem[]) => Promise<MaterialCompileResult>;
 }
 
 /* ---------------- web/ocean_pose.js (window.EvoOceanPose) ---------------- */
