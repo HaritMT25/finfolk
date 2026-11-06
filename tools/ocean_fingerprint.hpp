@@ -378,30 +378,17 @@ void visitSimConfig(const SimConfig& c, V& v) {
     OFP_B(clusterMap); OFP_I(clusterMax); OFP_I(clusterEpoch); OFP_B(clusterPca); OFP_I(clusterColor);
     OFP_B(wiringLog); OFP_B(profile); OFP_B(fastTanh);
 }
-// The Stage C keys (v0.27.0; the Ocean refuses predatorBrain for now): dumped
-// and scanned like the rest, hashed in `cfg` as one tagged block only when any
-// is off its default (hashConfig; simBrainAtDefaults), so a config without them
-// hashes exactly as before they existed.
+// The Stage C keys (v0.27.0; the Ocean refuses predatorBrain for now): scanned
+// like the rest, but hashed in `cfg` (one tagged block) and dumped only when the
+// brain is ON (simBrainActive). With it off every one of them is inert (the
+// simulation reads them only on the neural path), so a brain-off config hashes
+// and dumps exactly as before they existed, whatever values they hold.
 template <class V>
 void visitSimConfigBrain(const SimConfig& c, V& v) {
     OFP_B(predatorBrain); OFP_F(predatorMutation); OFP_F(predatorTurnRate); OFP_F(predatorMinSpeed);
     OFP_B(predatorPrimer); OFP_B(predatorFrozen); OFP_B(predatorLog);
 }
-// "At its defaults" is derived from the visitor itself (every visited key, bit
-// for bit, against a default SimConfig), so a key added to the visitor can
-// never be left out of the test and alias an old fingerprint.
-struct ConfigWords {
-    std::vector<std::uint64_t> w;
-    void f32(const char*, float v) { std::uint32_t x; std::memcpy(&x, &v, 4); w.push_back(x); }
-    void i32(const char*, int v) { w.push_back((std::uint32_t)v); }
-    void b(const char*, bool v) { w.push_back(v ? 1u : 0u); }
-};
-inline bool simBrainAtDefaults(const SimConfig& c) {
-    ConfigWords a, d;
-    visitSimConfigBrain(c, a);
-    visitSimConfigBrain(SimConfig{}, d);
-    return a.w == d.w;
-}
+inline bool simBrainActive(const SimConfig& c) { return c.predatorBrain; }
 template <class V>
 void visitOceanConfig(const OceanConfig& c, V& v) {
     OFP_F(depth); OFP_F(kBuoy); OFP_F(buoyMutation); OFP_F(pitchMax); OFP_F(vDrag); OFP_F(wallBand);
@@ -465,7 +452,7 @@ inline void hashConfig(Hasher& h, const SimConfig& c, const OceanConfig& o) {
         h.u64(kWallsTag);
         visitOceanConfigWalls(o, h);
     }
-    if (!simBrainAtDefaults(c)) {     // Stage C's keys: likewise
+    if (simBrainActive(c)) {          // Stage C's keys: only with the brain on
         h.u64(kBrainCfgTag);
         visitSimConfigBrain(c, h);
     }
@@ -859,9 +846,9 @@ inline void dumpState(const OceanWorld& w, std::FILE* out) {
     d.ull("fish", w.creatures.size()); d.ull("food", w.food.size()); d.ull("pred", w.predators.size());
     std::fprintf(out, "\nsimconfig");
     visitSimConfig(w.cfg, d);
-    // The Stage C keys only off their defaults, as they are hashed, so a
-    // brain-off dump is the 0.26.0 dump line for line.
-    if (!simBrainAtDefaults(w.cfg)) visitSimConfigBrain(w.cfg, d);
+    // The Stage C keys only with the brain on, as they are hashed, so a
+    // brain-off dump is the 0.26.0 dump line for line (inactive values too).
+    if (simBrainActive(w.cfg)) visitSimConfigBrain(w.cfg, d);
     std::fprintf(out, "\noceanconfig");
     visitOceanConfig(w.ocfg, d);
     visitOceanConfigVision(w.ocfg, d);

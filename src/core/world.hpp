@@ -1035,14 +1035,21 @@ private:
                 //  * a VIRTUAL BUD where Stage B would bud: at the threshold the
                 //    predator pays the newborn energy and makes no child; counted
                 //    per predator (virtualBuds) and per interval — a direct
-                //    fitness readout of the assayed genome;
-                //  * age WRAPS at the max age (one lifespan after another), and
-                //    energy is floored at 0 where Stage B would starve.
+                //    fitness readout of the assayed genome. Only a FUNDED one:
+                //    the predator must also hold the newborn energy it pays
+                //    (a threshold below it, buddingFactor < 1, would otherwise
+                //    count a bud it could not pay for);
+                //  * age WRAPS: modulo the max age, so any number of lifespans
+                //    folds (a max age shorter than a step, a loaded age of many
+                //    lifespans). std::fmod is exact, so the same bits native and
+                //    wasm, and one lifespan past (the usual case) it equals
+                //    age - maxAge (Sterbenz);
+                //  * energy is floored at 0 where Stage B would starve.
                 if (p.energy < 0.0f) p.energy = 0.0f;
-                if (cfg.predatorMaxAge > 0.0f && p.age >= cfg.predatorMaxAge) p.age -= cfg.predatorMaxAge;
-                if (p.energy >= cfg.predatorReproEnergy * p.buddingFactor) {
-                    p.energy -= cfg.predatorNewbornEnergy;
-                    if (p.energy < 0.0f) p.energy = 0.0f;
+                if (cfg.predatorMaxAge > 0.0f && p.age >= cfg.predatorMaxAge)
+                    p.age = std::fmod(p.age, cfg.predatorMaxAge);
+                if (p.energy >= std::max(cfg.predatorReproEnergy * p.buddingFactor, cfg.predatorNewbornEnergy)) {
+                    p.energy -= cfg.predatorNewbornEnergy;   // >= 0: it held at least this much
                     ++p.virtualBuds;
                     predTally_.virtualBuds++;
                     notePredator('V', p);

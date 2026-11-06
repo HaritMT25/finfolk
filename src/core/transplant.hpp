@@ -330,9 +330,10 @@ inline bool apply(World& world, const Options& o, const std::string& yText,
     w.endObject();
     w.field("assay", o.assay);
     w.field("assayRules", o.assay == "frozen"
-        ? "economy accounting on; no deaths, no buds: at the budding threshold a virtual bud (pays the newborn "
-          "energy, no child, counted as virtual_buds in predators.csv and per predator as virtualBuds in "
-          "checkpoints); age wraps at the max age; energy floored at 0; score from predators.csv"
+        ? "economy accounting on; no deaths, no buds: at the budding threshold, holding at least the newborn "
+          "energy, a virtual bud (pays the newborn energy, no child, counted as virtual_buds in predators.csv "
+          "and per predator as virtualBuds in checkpoints); age wraps modulo the max age; energy floored at 0; "
+          "score from predators.csv"
         : o.assay == "frozen-newborn"
         ? "economy off: immortal, fixed; ENERGY and AGE read 0 throughout; score from predators.csv"
         : "the prey world's config: predators starve, age out and bud; score from predators.csv");

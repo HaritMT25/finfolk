@@ -299,9 +299,10 @@ struct SimConfig {
                                      // --assay frozen): energy and age are accounted (burn,
                                      // meals, ageing) so ENERGY and AGE keep their evolved
                                      // range, but nobody starves, ages out or buds: at the
-                                     // budding threshold a predator pays the newborn energy
-                                     // for a "virtual bud" (no child; counted), age wraps at
-                                     // predatorMaxAge (when > 0), energy is floored at 0.
+                                     // budding threshold, holding at least the newborn
+                                     // energy, a predator pays it for a "virtual bud" (no
+                                     // child; counted), age wraps modulo predatorMaxAge
+                                     // (when > 0), energy is floored at 0.
                                      // No draws. Brain predators only.
 
     // --- Inspection & analysis (visual/diagnostic; do not affect dynamics) ---

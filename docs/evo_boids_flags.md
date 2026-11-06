@@ -531,11 +531,14 @@ recipe with cap 40, floor 2 and max age 120; meal 1.2× and 1.5× of the 8.54 br
 - **Assay modes:**
   - **`--assay frozen`** (default): the economy runs its accounting (burn, meals, ageing) so the
     ENERGY and AGE inputs keep their evolved range, but nobody dies or buds. Energy floors at
-    0. On reaching the budding threshold a predator makes a **virtual bud**: the newborn's
-    energy is subtracted, as for a real bud, but no child is made. The count is a per-predator
+    0. On reaching the budding threshold, and holding at least the newborn's energy, a
+    predator makes a **virtual bud**: the newborn's energy is subtracted, as for a real bud,
+    but no child is made. (With `buddingFactor` < 1 the threshold can sit below the newborn's
+    energy; a bud the predator could not pay for is not counted.) The count is a per-predator
     fitness readout (`V` rows in the lineage log, the `virtual_buds_*` columns of
     `predators.csv`, a `virtualBuds` column in the checkpoint). Age **wraps** modulo
-    `--predator-max-age` instead of stopping there. So neither input parks at "full and old".
+    `--predator-max-age` (any number of lifespans, so also a max age shorter than a step)
+    instead of stopping there. So neither input parks at "full and old".
     Neither draws a random number. The K predators stay K. No predator floor or cap, prey
     `--min-pop 0`.
   - **`--assay frozen-newborn`**: the economy off. The predators are immortal and fixed, and

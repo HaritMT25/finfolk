@@ -4316,6 +4316,58 @@ static void test_predator_brain() {
               back.predators[1].virtualBuds == w.predators[1].virtualBuds);
     }
 
+    // --- 12a. a virtual bud is funded; age folds any number of lifespans --
+    {
+        // threshold 40 x 0.5 = 20 sits BELOW the newborn energy 30: a predator
+        // between the two cannot pay for a bud, so it makes none
+        World w = bareBrainWorld(42u, 3, true);
+        w.cfg.predatorFrozen = true;
+        w.cfg.predatorMetabolism = 0.0f;      // no move cost, no prey: only buds move energy
+        w.cfg.predatorReproEnergy = 40.0f;
+        w.cfg.predatorNewbornEnergy = 30.0f;
+        for (Predator& p : w.predators) p.buddingFactor = 0.5f;
+        w.predators[0].energy = 20.0f;        // at the threshold, cannot pay
+        w.predators[1].energy = 29.5f;        // above it, still cannot
+        w.predators[2].energy = 35.0f;        // can, once
+        w.update(0.016f);
+        CHECK(w.predators[0].virtualBuds == 0 && bitEq(w.predators[0].energy, 20.0f));
+        CHECK(w.predators[1].virtualBuds == 0 && bitEq(w.predators[1].energy, 29.5f));
+        CHECK(w.predators[2].virtualBuds == 1 && bitEq(w.predators[2].energy, 5.0f));   // paid exactly 30
+        for (int i = 0; i < 50; ++i) w.update(0.016f);
+        CHECK(w.predators[0].virtualBuds == 0 && w.predators[1].virtualBuds == 0 &&
+              w.predators[2].virtualBuds == 1 && w.predTally_.virtualBuds == 1);
+    }
+    {
+        // a max age shorter than one step: every step folds back into [0, maxAge)
+        World w = bareBrainWorld(43u, 2, true);
+        w.cfg.predatorFrozen = true;
+        w.cfg.predatorMetabolism = 0.0f;
+        w.cfg.predatorMaxAge = 0.005f;
+        bool inRange = true;
+        for (int i = 0; i < 100; ++i) {
+            w.update(0.016f);
+            for (const Predator& p : w.predators) inRange = inRange && p.age >= 0.0f && p.age < 0.005f;
+        }
+        CHECK(inRange && w.predators.size() == 2u && w.totalPredatorDeathsAge == 0);
+        // a loaded age of several lifespans folds at its first step
+        World x = bareBrainWorld(44u, 1, true);
+        x.cfg.predatorFrozen = true;
+        x.cfg.predatorMetabolism = 0.0f;
+        x.cfg.predatorMaxAge = 1.0f;
+        x.predators[0].age = 5.5f;
+        std::string err;
+        World y;
+        CHECK(checkpoint::deserialize(checkpoint::serialize(x, "t"), y, err) && bitEq(y.predators[0].age, 5.5f));
+        const float aged = 5.5f + 0.016f;
+        y.update(0.016f);
+        CHECK(bitEq(y.predators[0].age, std::fmod(aged, 1.0f)) && y.predators[0].age < 1.0f);
+        // one lifespan past (the usual case) is the plain subtraction (Sterbenz)
+        y.predators[0].age = 0.99f;
+        const float past = 0.99f + 0.016f;
+        y.update(0.016f);
+        CHECK(bitEq(y.predators[0].age, past - 1.0f));
+    }
+
     // --- 12b. a lineage-log write that fails keeps its events --------------
 #ifdef __linux__
     {
