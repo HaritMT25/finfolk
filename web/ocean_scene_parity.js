@@ -55,7 +55,12 @@
    * gene texture's layout as the renderer lays it out (GENES_W, genesRows,
    * packGenes) and its capacities (capFor), for the fixture's texture; the
    * water's constants the fragment check sets (CLARITY's realistic [0]
-   * column, C.select). A check run before bind has no layout: it throws */
+   * column, C.select). A check run before bind has no layout: its report
+   * says so (UNBOUND), as a check that could not run (.error, never a pass);
+   * and bind names a member the scene left out, rather than a check failing
+   * on it later */
+  var BOUND = false;
+  var UNBOUND = "EvoOceanSceneParity.bind() has not run: the checks need the scene's gene texture layout and water constants (web/ocean_scene.js binds them as it loads)";
   /** @type {number} */
   var GENES_W;
   /** @type {ParityScene["genesRows"]} */
@@ -70,8 +75,13 @@
   var C;
   /** @param {ParityScene} scene */
   function bind(scene) {
+    [["GENES_W", "number"], ["genesRows", "function"], ["packGenes", "function"], ["capFor", "function"], ["CLARITY", "object"], ["C", "object"]].forEach(function (m) {
+      var v = scene ? /** @type {any} */ (scene)[m[0]] : undefined;
+      if (typeof v !== m[1] || v === null) throw new Error("EvoOceanSceneParity.bind(): the scene's " + m[0] + " (" + (m[1] === "object" ? "an " : "a ") + m[1] + ") is missing");
+    });
     GENES_W = scene.GENES_W; genesRows = scene.genesRows; packGenes = scene.packGenes; capFor = scene.capFor;
     CLARITY = scene.CLARITY; C = scene.C;
+    BOUND = true;
   }
 
   /* The appearance checks: three layers, each against the CPU mirror
@@ -223,6 +233,7 @@
   /** @returns {Promise<any>} */
   function appearanceVertexCheck(gl, EA, rows, lams, opts) {
     opts = opts || {};
+    if (!BOUND) return Promise.resolve({ error: UNBOUND });
     if (!EA || !EA.morphBuild) return Promise.resolve({ error: "web/ocean_appearance.js (with its CPU mirror) not loaded" });
     var colourBy = opts.colourBy === 1 ? 1 : 0, P = opts.polish === "lite" ? "lite" : !!opts.polish;
     var feedback = colourBy ? TF_OUT.slice(0, 3) : TF_OUT, names = componentNames(feedback);
@@ -463,6 +474,7 @@
   /** @returns {Promise<any>} */
   function appearanceFragmentCheck(gl, EA, opts) {
     opts = opts || {};
+    if (!BOUND) return Promise.resolve({ error: UNBOUND });
     if (!EA || !EA.flankAt) return Promise.resolve({ error: "web/ocean_appearance.js not loaded" });
     var P = !!opts.polish;
     var fsrc = appearanceShaders(EA, P).fs;
@@ -627,6 +639,7 @@
    * on the plain vertex checks. */
   function appearancePathCheck(gl, EA, rows, lams, opts) {
     opts = opts || {};
+    if (!BOUND) return Promise.resolve({ ok: false, error: UNBOUND });
     if (!EA || !EA.morphBuild) return Promise.resolve({ error: "web/ocean_appearance.js (with its CPU mirror) not loaded" });
     var fx = pathFixture(EA), R = fx.rows.concat(rows || []), L = fx.lams.concat(lams || []);
     function o(x) { return Object.assign({}, opts, x); }
@@ -785,6 +798,7 @@
    * testFaults is read by the scene's gene upload. */
   /** @param {ParityProbePort} port @returns {ParityProbes} */
   function attach(port) {
+    if (!BOUND) throw new Error(UNBOUND);   /* (the texture probe reads the layout: bind first) */
     var THREE = port.THREE, renderer = port.renderer, profiler = port.profiler, geneIO = port.geneIO, bodyScale = port.bodyScale;
     /* test-only: holdGeneUploads leaves the gene texture's upload out, so a
      * stale texture can be shown to fail appearanceTextureParity */

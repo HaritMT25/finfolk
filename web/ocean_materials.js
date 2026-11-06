@@ -20,7 +20,7 @@
  *     EvoOceanShaders.program(name, parts, the stage's features), so a feature that is not enabled
  *     contributes no GLSL
  *   - one writer of a fish mesh's material (bind): the scene's kinds commit the variant settle() chose
- *     (its prewarm and hysteresis unchanged) and the binder assigns the material
+ *     (its prewarm, through this file's compiler, and its hysteresis) and the binder assigns the material
  *   - the lit fish's split is a feature (LIT_SKIP_FEATURE): it appends the skip to app.pose with order
  *     -1, so it is the first line of main(), byte for byte the old text insert litSkip(vs)
  *   - the declared attribute layouts (LAYOUTS, layout()): each kind's instance attributes, component
@@ -339,10 +339,10 @@
       if (kind === "face" && !set.attach) throw err("no attached pass: the faces are a Look's (activate a set with attach.face)");
     }
     /** what a (kind, pass, variant) draws under a set: its features stage by stage (mode "set"; "polish": the swim polish's
-     * only, the faces' fallback; "plain": none), its layout, its key and its share key
+     * only, the faces' fallback; "plain": none), its layout, its key and its share key. The (kind, pass, variant) is one the
+     * set has: its callers asked (use, key, has) or took it from reachable() (prepare, run), or from one asked (fallback)
      * @param {MaterialSet} set @param {string} kind @param {string} pass @param {number} variant @param {string} mode @returns {Described} */
     function describe(set, kind, pass, variant, mode) {
-      asked(set, kind, pass, variant);
       var plain = mode === "plain", noSet = mode === "polish";
       var vs = plain ? [] : featuresOf(set, kind, pass, "vs", variant, noSet), fs = plain ? [] : featuresOf(set, kind, pass, "fs", variant, noSet);
       var lay = set.layouts[KINDS[kind].layout];
@@ -522,6 +522,7 @@
         return u.e.rec.material;
       },
       has: function (kind, pass, variant) {
+        try { asked(active, kind, pass, variant); } catch (x) { return false; }   /* (one it does not have: it has not) */
         var set = setFor(kind), r = resolve(set, kind, pass, variant, "set");
         return !!r.d && assemble(entry(r.d), false);
       },
@@ -588,11 +589,15 @@
     return binder;
   }
 
-  /** The scene's compile for an activation (deps.compile): the materials compiled as the scene warms them (three's
-   * compileAsync on a scratch scene, each on its kind's geometry), then each program checked: linked (the GL status, so it
-   * holds whatever three's checkShaderErrors) and runnable by three's own first-use check (getUniforms; diagnostics). A
-   * check that throws is a failure, never a pass; the budget (60 s: ANGLE / D3D11 takes ~1.2 s a program) only bounds a hung
-   * compile, its timer cleared once settled. @param {MaterialCompilerOptions} o */
+  /** The scene's compile for an activation (deps.compile) and for its prewarm: the materials compiled as the scene warms
+   * them (three's compileAsync on a scratch scene, each on its kind's geometry), then each program checked: linked (the GL
+   * status, so it holds whatever three's checkShaderErrors) and runnable by three's own first-use check (getUniforms;
+   * diagnostics). A check that throws is a failure, never a pass; the budget (60 s: ANGLE / D3D11 takes ~1.2 s a program)
+   * only bounds a hung compile, its timer cleared once settled, and says so (timeout: the prewarm asks again later). Fenced
+   * by the context's generation (o.generation: one more at each loss and restore) and the context itself: a compile that a
+   * loss overtook is refused as lost, whatever three said since (a restored context has new programs, and three's
+   * compileAsync, polling the old ones, can resolve then; a lost context's programs read complete, so the poll can resolve
+   * before the loss's event has run: getContext().isContextLost()). @param {MaterialCompilerOptions} o */
   function compiler(o) {
     /* the platform's timers called as functions: setTimeout / clearTimeout detached into an object and called as its
      * methods throw "Illegal invocation" in a browser (this would be the object, not the window) */
@@ -600,14 +605,25 @@
       set: function (/** @type {() => void} */ f, /** @type {number} */ ms) { return setTimeout(f, ms); },
       clear: function (/** @type {any} */ t) { clearTimeout(t); }
     };
-    /** @param {MaterialCompileItem[]} items @returns {Promise<{ ok: boolean, error?: string }>} */
+    var LOST = "the WebGL context was lost during the compile (its programs were the lost context's)";
+    /** @param {MaterialCompileItem[]} items @returns {Promise<MaterialCompileResult>} */
     return function (items) {
       return new Promise(function (resolve) {
         if (o.lost && o.lost()) { resolve({ ok: false, error: "the WebGL context is lost" }); return; }
+        var gen = o.generation ? o.generation() : 0;
+        /* lost since it started: a generation moved on, or the context lost with its event still to come */
+        function moved() {
+          if (o.generation && o.generation() !== gen) return true;
+          try { var c = o.renderer.getContext(); return !!c && typeof c.isContextLost === "function" && c.isContextLost() === true; } catch (e) { return false; }
+        }
         var settled = false, /** @type {any} */ timer = null;
-        /** @param {{ ok: boolean, error?: string }} r */
-        function end(r) { if (settled) return; settled = true; if (timer !== null) timers.clear(timer); timer = null; resolve(r); }
+        /** @param {MaterialCompileResult} r */
+        function end(r) {
+          if (settled) return; settled = true; if (timer !== null) timers.clear(timer); timer = null;
+          resolve(moved() ? { ok: false, error: LOST } : r);
+        }
         function verify() {
+          if (moved()) { end({ ok: false, error: LOST }); return; }   /* (not the restored context's programs: not checked) */
           try {
             var gl = o.renderer.getContext(), bad = /** @type {string[]} */ ([]);
             items.forEach(function (x) {
@@ -622,7 +638,7 @@
         try {
           var ws = new o.THREE.Scene();
           items.forEach(function (x) { var m = new o.THREE.Mesh(x.geometry ? x.geometry() : o.geometry(x), x.material); m.frustumCulled = false; ws.add(m); });
-          timer = timers.set(function () { timer = null; end({ ok: false, error: "the compile did not finish in " + Math.round(budget / 1000) + " s" }); }, budget);
+          timer = timers.set(function () { timer = null; end({ ok: false, timeout: true, error: "the compile did not finish in " + Math.round(budget / 1000) + " s" }); }, budget);
           if (o.renderer.compileAsync) o.renderer.compileAsync(ws, o.camera, o.scene).then(verify, function (/** @type {any} */ e) { end({ ok: false, error: msg(e) }); });
           else { o.renderer.compile(ws, o.camera, o.scene); verify(); }
         } catch (e) { end({ ok: false, error: msg(e) }); }

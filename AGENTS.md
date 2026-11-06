@@ -32,7 +32,7 @@ the site is static three.js/JS in `web/` (no JS build step). Python tools run ex
   Plain `<script>` IIFEs, each registering one `window.Evo*` namespace (no bundler); `types.d.ts` declares
   their shared shapes and globals for the type check (`tsconfig.json`), and is never loaded by a page.
 - `tests/` `core_tests.cpp`, `ocean_tests.cpp` (+ `ocean_*_tests.hpp`), `ocean_turbo_handoff.js`,
-  `ocean_shader_slots_tests.cjs`, `ocean_materials_tests.cjs`, `ocean_render_browser.mjs`, `ocean_baseline/` (committed fingerprints), `fixtures/`,
+  `ocean_shader_slots_tests.cjs`, `ocean_materials_tests.cjs`, `ocean_mock_three_tests.mjs`, `ocean_render_browser.mjs`, `ocean_baseline/` (committed fingerprints), `fixtures/`,
   `*.sh` end-to-end tests.
 - `tools/` `ocean_parity_driver.cpp` + `ocean_fingerprint.hpp` (the parity harness), `ocean_eye_*`,
   `gen_planes*.{cpp,sh}` (regenerate plane headers), `invasion/` (invasion-matrix study: plan/run/score/analyze),
@@ -107,7 +107,13 @@ Memory is tight on the maintainer's PC: use `JOBS`/`BUILD_JOBS`, `nice -n 19`, a
 - `node tests/ocean_materials_tests.cjs`: the material binder (`web/ocean_materials.js`): its keys (per stage), every
   drawn program against the scene digests, the split's skip as a feature, the shadow's lite polish, the faces on the
   predators' vertex features, the layouts, atomic activation (a planted compile failure) and the plain fallback (a
-  planted assembly error).
+  planted assembly error); its compile fenced by the WebGL context's generation.
+- `node tests/ocean_mock_three_tests.mjs`: the scene itself (all its page scripts, the real three bundle, a recording
+  stand-in for the renderer) through a scripted session: every frame each fish mesh draws its bound variant's programs;
+  the whole recording (draws in three's order, uploads, programs, counters) against its committed sha256 (`GOLDEN`:
+  an intended change to what the scene draws updates it, with the reason); a context loss during the polish's prewarm.
+  `--against OLD_WEB` compares two `web/` trees frame by frame (a refactor's identity proof). Node 20.19 or later (it
+  imports the ES-module three bundle by syntax detection; CI pins 20.x).
 - `npm ci && npx tsc -p tsconfig.json`: the web type check (exit 0 = pass; `package.json` pins TypeScript,
   `package-lock.json` the exact tree, development only): `tsc --checkJs` over the
   files `tsconfig.json` lists that carry `// @ts-check`, against `web/types.d.ts`. A new or extracted web module

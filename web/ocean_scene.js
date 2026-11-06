@@ -384,14 +384,39 @@
      * one per range or one for the whole texture; bytes), kept with or without
      * a profiler: the live-texture probe asserts it caused none */
     var geneIO = { uploads: 0, calls: 0, bytes: 0, allocs: 0, rowChanges: 0, full: { storage: 0, bytes: 0, ranges: 0, policy: 0 } };
+    /* the fish's body scale (opts.bodyScale: the page's size law; 1 without) */
+    var bodyScale = opts.bodyScale || function () { return 1; };
+    /* The probes (web/ocean_scene_parity.js attach, which says what each
+     * checks): appearanceParity, appearanceTextureParity and its queue (probes:
+     * runProbes right after a production draw, render; failProbes when there
+     * is none), testFaults (holdGeneUploads: AppKind's gene upload). Attached
+     * here, beside the counters they read, before anything that reads them is
+     * made (attach makes no three object). They read this renderer and what
+     * it drew through these live getters, never copies, and upload nothing */
+    var parity = PARITY.attach({
+      THREE: THREE, renderer: renderer, profiler: profiler, geneIO: geneIO, bodyScale: bodyScale,
+      ea: function () { return EA; }, status: function () { return appStatus; },
+      appKind: function () { return appKind; }, drawn: function () { return appDrawn; }
+    });
+    var testFaults = parity.testFaults, probes = parity.probes, failProbes = parity.failProbes, runProbes = parity.runProbes;
+    var appearanceParity = parity.appearanceParity, appearanceTextureParity = parity.appearanceTextureParity;
     /* the shaders write sRGB as-is, but three colour-manages the clear colour:
      * hand it over as sRGB ("srgb" = THREE.SRGBColorSpace) so the water above
      * the horizon (seen from a low camera) is the fog colour, not a pale teal */
     renderer.setClearColor(new THREE.Color().setRGB(C.fog[0], C.fog[1], C.fog[2], "srgb"), 1);
     var lost = false;
-    canvas.addEventListener("webglcontextlost", function (e) { e.preventDefault(); lost = true; });
+    /* the context's generation: one more at each loss and at each restore.
+     * three makes every program anew in a restored context, so a compile
+     * started in an earlier generation (the polished programs' prewarm,
+     * warmUp; a feature set's activation) says nothing of this one's
+     * programs: the binder's compile refuses it (compiler: generation), and
+     * the programs compiled ahead count only in the generation that
+     * compiled them (warm: so a kind draws its plain ones after a restore
+     * until a prewarm in the restored context has compiled its polished ones) */
+    var ctxGen = 0;
+    canvas.addEventListener("webglcontextlost", function (e) { e.preventDefault(); lost = true; ctxGen++; });
     canvas.addEventListener("webglcontextrestored", function () {
-      lost = false;
+      lost = false; ctxGen++;
       /* three made new GPU storage for the gene texture: one whole upload (the slots keep their owners and data) */
       if (appKind) { appKind.slots.requireFull(); appKind.pending = null; }
     });
@@ -507,11 +532,14 @@
      * lite one is the shadows' only), sharing their uniforms and, as before
      * the binder, their materials; made here in the order they were made
      * before it (plain, then full; body, then shadow), so three's draw order
-     * is the same; fishMat, shadowMat: the plain ones */
-    var binder = MATERIALS.create({ THREE: THREE, compile: MATERIALS.compiler({
-      THREE: THREE, renderer: renderer, camera: camera, scene: scene, lost: function () { return lost; },
+     * is the same; fishMat, shadowMat: the plain ones. compile: the
+     * binder's compile (three's, then each program checked linked and
+     * runnable, in this context's generation), the prewarm's too (warmUp) */
+    var compile = MATERIALS.compiler({
+      THREE: THREE, renderer: renderer, camera: camera, scene: scene, lost: function () { return lost; }, generation: function () { return ctxGen; },
       geometry: function (x) { return (x.kind === "app" ? appKind && appKind.geo : x.kind === "pred" ? preds.geo : fish.geo) || fish.geo; }
-    }) });
+    });
+    var binder = MATERIALS.create({ THREE: THREE, compile: compile });
     binder.define("fish", { uniforms: { body: fishUniforms, shadow: shadowU } });
     binder.define("pred", { uniforms: { body: fishUniforms, shadow: shadowU } });
     binder.prepare(["fish", "pred"]);
@@ -565,25 +593,35 @@
       return g.bound > 6;
     }
     /* The polished programs compiled ahead, off the frame: the first time a
-     * kind draws with the polish on, a timeout hands its full and lite
-     * programs to renderer.compileAsync (with KHR_parallel_shader_compile the
-     * driver compiles them off the main thread; three polls them ready), so
-     * the first lit fish never stalls a frame on a compile; until they are
-     * ready (or 5 s passed) the kind keeps its plain programs. mats: the
-     * binder's materials for them (binder.warm: assembled then, not before) */
-    function Warm(mats, geo) { return { mats: mats, geo: geo, asked: false, ready: false }; }
+     * kind draws with the polish on in a context generation (ctxGen), a
+     * timeout hands its full and lite programs to the binder's compile
+     * (renderer.compileAsync: with KHR_parallel_shader_compile the driver
+     * compiles them off the main thread, three polls them ready; then each
+     * program checked linked and runnable), so the first lit fish never
+     * stalls a frame on a compile. Until they are compiled in this
+     * generation (warm) the kind keeps its plain programs: a compile that
+     * fails keeps them plain (said once); one that does not finish in its
+     * budget is asked again by a later frame (until it succeeds: three's
+     * program cache makes that cheap once the driver is done); and after a
+     * context loss they are compiled again in the restored context before
+     * they draw (a compile started before the loss is refused, and its
+     * result was for the lost context's programs). mats:
+     * the binder's materials for them (binder.warm: assembled then, not
+     * before); asked, ready: the generation that asked, that compiled them */
+    function Warm(name, mats, geo) { return { name: name, mats: mats, geo: geo, asked: -1, ready: -1, said: false }; }
+    function warm(wm) { return wm.ready === ctxGen; }
     function warmUp(wm) {
-      if (wm.asked) return wm.ready;
-      wm.asked = true;
+      if (wm.asked === ctxGen) return warm(wm);
+      var gen = wm.asked = ctxGen;
       setTimeout(function () {
-        var done = function () { wm.ready = true; };
-        if (lost) { wm.asked = false; return; }
-        var ws = new THREE.Scene();
-        wm.mats().forEach(function (m) { var o = new THREE.Mesh(wm.geo(), m); o.frustumCulled = false; ws.add(o); });
-        try {
-          if (renderer.compileAsync) { renderer.compileAsync(ws, camera, scene).then(done, done); setTimeout(done, 5000); }
-          else { renderer.compile(ws, camera, scene); done(); }
-        } catch (e) { done(); }
+        if (gen !== ctxGen) return;   /* (lost since: the restored context's frames ask again) */
+        var items = wm.mats().map(function (m, i) { return { key: wm.name + " polish " + i, kind: wm.name, pass: "warm", variant: 1, material: m, geometry: wm.geo }; });
+        compile(items).then(function (r) {
+          if (gen !== ctxGen) return;   /* (refused, or for programs a lost context held) */
+          if (r.ok) { wm.ready = gen; return; }
+          if (r.timeout) wm.asked = -1;   /* (not finished yet: a later frame asks again) */
+          if (!wm.said) { wm.said = true; console.warn("evo_boids: the " + (wm.name === "app" ? "appearance fish's" : "legacy fish's and predators'") + " polished programs could not be compiled ahead (" + r.error + "): drawn plain" + (r.timeout ? " until they are" : "")); }
+        });
       }, 0);
       return false;
     }
@@ -666,7 +704,7 @@
     }
     var fish = Kind(false), preds = Kind(true);
     /* the legacy fish's and the predators' polished programs (one pair of programs for both kinds) */
-    var warmFish = Warm(function () { return binder.warm(["fish", "pred"]); }, function () { return fish.geo; });
+    var warmFish = Warm("fish", function () { return binder.warm(["fish", "pred"]); }, function () { return fish.geo; });
 
     /* The appearance genome's fish (built on the first snapshot with s.app;
      * null without web/ocean_appearance.js, web/ocean_appearance_slots.js or
@@ -760,7 +798,7 @@
                    mat: mat, shaders: sh, barbels: false, tpls: tpls, barbTpl: barbTpl, bytes: 0 };
       var lit = self.lit;
       /* its polished programs and the split's plain body one with the skip (warmUp) */
-      self.warm = Warm(function () { return binder.warm(["app"]); }, function () { return self.geo; });
+      self.warm = Warm("app", function () { return binder.warm(["app"]); }, function () { return self.geo; });
       var INST = ["iA", "iB", "iC", "iBody", "iX", "iGeneSlot"];
       self.inst = INST;   /* the instance attributes the probes share (iGeneSlot: the slots they read through) */
       /* three uploaded the gene texture (DataTexture.onUpdate, after its
@@ -1400,7 +1438,6 @@
     }
 
     /* ---------------- per-frame packing ---------------- */
-    var bodyScale = opts.bodyScale || function () { return 1; };
     /* per-instance swim height: -depth when the snapshot has depths (s.depth),
      * else keyed off the fish id as in the shallow tank */
     var heights = null;
@@ -1433,10 +1470,18 @@
     var poseLast = { fish: 0, any: 0, full: 0, sum: 0 };
     /* the frustum's side planes in camera space (x or y, and the depth d):
      * right / left NDC x = P0 x / d - P8 = +-1, top / bottom with P5, P9 (the
-     * view offset); unit normals, + outside (poseWeight) */
+     * view offset); unit normals, + outside (poseWeight). Written in place
+     * (nothing allocated a frame), and only when one of the four terms they
+     * are made of changed since (planesOf: a resize, the field of view, an
+     * inset's view offset; a re-fit of the near / far planes can move them
+     * by an ulp, as three derives the frustum from near: recomputed then) */
+    var planesOf = new Float64Array([NaN, NaN, NaN, NaN]);
+    function sidePlane(F, i, a, b) { var l = Math.hypot(a, b) || 1; F[2 * i] = a / l; F[2 * i + 1] = b / l; }
     function sidePlanes(Pm, F) {
-      var q = [[Pm[0], -(1 + Pm[8])], [-Pm[0], Pm[8] - 1], [Pm[5], -(1 + Pm[9])], [-Pm[5], Pm[9] - 1]];
-      for (var i = 0; i < 4; i++) { var l = Math.hypot(q[i][0], q[i][1]) || 1; F[2 * i] = q[i][0] / l; F[2 * i + 1] = q[i][1] / l; }
+      var p0 = Pm[0], p5 = Pm[5], p8 = Pm[8], p9 = Pm[9], K = planesOf;
+      if (p0 === K[0] && p5 === K[1] && p8 === K[2] && p9 === K[3]) return;
+      K[0] = p0; K[1] = p5; K[2] = p8; K[3] = p9;
+      sidePlane(F, 0, p0, -(1 + p8)); sidePlane(F, 1, -p0, p8 - 1); sidePlane(F, 2, p5, -(1 + p9)); sidePlane(F, 3, -p5, p9 - 1);
     }
     function poseCamera() {
       var Pm = camera.projectionMatrix.elements;
@@ -1557,7 +1602,7 @@
       var tanHalf = Math.tan(camera.fov * Math.PI / 360);
       appKind.mat.uniforms.uPxPerUnit.value = ch / (2 * tanHalf);
       appKind.mat.uniforms.uColourBy.value = appSkin ? 0 : 1;
-      appKind.commit(n, rec.hasBarbels, settle(gt, pose, lit, appKind.warm.ready), rec.changed, lit);
+      appKind.commit(n, rec.hasBarbels, settle(gt, pose, lit, warm(appKind.warm)), rec.changed, lit);
       if (profiler.active) {
         var tp = appKind.tpls[appKind.lod], ST = EA.STRIDE;
         profiler.count(PK.lod, appKind.lod === "medium" ? 2 : 1); profiler.count(PK.bodyInst, n);
@@ -1635,7 +1680,7 @@
         }
       }
       if (pose) { gt.rMax = rMax; gt.cMax = cMax; gt.yMin = yMin; gt.yMax = yMax; }
-      fish.commit(n, settle(gt, pose, lit, warmFish.ready));
+      fish.commit(n, settle(gt, pose, lit, warm(warmFish)));
       if (profiler.active) {
         profiler.count(PK.lod, 0); profiler.count(PK.bodyInst, n); profiler.count(PK.barbelInst, 0);
         profiler.count(PK.shadowInst, fish.shadow.visible ? n : 0);
@@ -1713,7 +1758,7 @@
         }
       }
       gatePred.posing = pose;
-      preds.commit(n, settle(gatePred, pose, predLit, warmFish.ready));
+      preds.commit(n, settle(gatePred, pose, predLit, warm(warmFish)));
       glowGeo.setDrawRange(0, Math.min(n, GLOW_MAX));
       glowGeo.attributes.position.needsUpdate = true;
       glowGeo.attributes.amt.needsUpdate = true;
@@ -1968,19 +2013,6 @@
       causticReady = true;
     }, { timeout: 1200 });
 
-    /* The probes (web/ocean_scene_parity.js attach, which says what each
-     * checks): appearanceParity, appearanceTextureParity and its queue (probes:
-     * runProbes right after a production draw, render; failProbes when there
-     * is none), testFaults (holdGeneUploads: the gene upload above). They read
-     * this renderer and what it drew through these live getters, never copies,
-     * and upload nothing */
-    var parity = PARITY.attach({
-      THREE: THREE, renderer: renderer, profiler: profiler, geneIO: geneIO, bodyScale: bodyScale,
-      ea: function () { return EA; }, status: function () { return appStatus; },
-      appKind: function () { return appKind; }, drawn: function () { return appDrawn; }
-    });
-    var testFaults = parity.testFaults, probes = parity.probes, failProbes = parity.failProbes, runProbes = parity.runProbes;
-    var appearanceParity = parity.appearanceParity, appearanceTextureParity = parity.appearanceTextureParity;
     function contextInfo() {
       var gl = renderer.getContext(), d = gl.getExtension("WEBGL_debug_renderer_info");
       return { version: gl.getParameter(gl.VERSION), glsl: gl.getParameter(gl.SHADING_LANGUAGE_VERSION),
@@ -2015,7 +2047,7 @@
       return { want: polishWant, on: polishNow(), gated: polishWant !== "ungated", quality: quality,
                variant: VARIANT[k.variant()], split: k === appKind && appKind.lit.on, litDrawn: k === appKind ? appKind.lit.n : 0, splitEnabled: litSplit,
                hold: gateFish.hold, posing: gateFish.posing, bound: gateFish.bound,
-               ready: (k === fish ? warmFish : appKind.warm).ready,
+               ready: warm(k === fish ? warmFish : appKind.warm),
                fish: poseLast.fish, any: poseLast.any, full: poseLast.full, meanWeight: poseLast.fish ? poseLast.sum / poseLast.fish : 0,
                preds: { n: preds.n, variant: VARIANT[preds.variant()], lit: gatePred.lit, hold: gatePred.hold },
                focalCss: poseCam.focal, canvasCss: [cw, ch] };

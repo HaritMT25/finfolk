@@ -25,6 +25,8 @@
 //     check that throws, its budget and its timer; material() refuses when not even the plain programs assemble;
 //     has() for the split's skip; features() once a set; the replaced sets' materials freed; a pre-existing entry
 //     failing in an activation said; no feature ahead of the split's skip; one writer of .material in web/
+//   - render-followups1: the compile fenced by the WebGL context's generation (#50's review, P2: a compile a loss
+//     overtook is refused); has() for what the binder does not have; FISH_VS / FISH_FS / SHADOW_VS as getters
 "use strict";
 const fs = require("fs"), path = require("path"), vm = require("vm"), crypto = require("crypto");
 
@@ -164,7 +166,11 @@ section("every program the binder draws, against main's drawn strings (sha256)")
   drawn["litSkip(app(false).vs)"] = SH.litSkip(app(false).vs);
   const keys = Object.keys(SCENE_SHA256), differ = keys.filter((k) => drawn[k] === undefined || sha(drawn[k]) !== SCENE_SHA256[k]);
   ok(Object.keys(drawn).join() === keys.join() && !differ.length, "the " + keys.length + " strings the scene drew before the binder: each its committed sha256", differ.length ? differ : undefined);
-  ok(SH.FISH_VS === SH.FISH_VS && SH.SHADOW_VS === SH.SHADOW_VS, "FISH_VS / FISH_FS / SHADOW_VS: built on first read, once (the same arrays after)");
+  /* (#58's follow-up: SH.FISH_VS === SH.FISH_VS held for a plain property too; that they are not built as the module loads is
+   * the planted collision's proof, below) */
+  const getters = ["FISH_VS", "FISH_FS", "SHADOW_VS"].map((k) => Object.getOwnPropertyDescriptor(SH, k));
+  ok(getters.every((d) => d && typeof d.get === "function" && !("value" in d)) && SH.FISH_VS === SH.FISH_VS && SH.SHADOW_VS === SH.SHADOW_VS,
+     "FISH_VS / FISH_FS / SHADOW_VS: getters (built on first read), and once (the same arrays after)");
 }
 
 section("the split's skip, a feature (byte for byte litSkip(vs))");
@@ -241,6 +247,9 @@ section("one writer of mesh.material (bind)");
   ok(B.bind(skip, "app", "litSkip", 0) === 0 && skip.material.vertexShader === SH.litSkip(app(false).vs), "the split's main draw: the litSkip pass, variant 0");
   throws(() => B.bind({ material: null }, "face", "body", 0), ["no attached pass"], "the faces without a Look: refused (no attached pass)");
   throws(() => B.bind({ material: null }, "fish", "litSkip", 0), ["fish has no litSkip pass"], "a pass the kind does not have: refused");
+  const n0 = B.state().entries.length;
+  ok(!B.has("fish", "litSkip", 0) && !B.has("nope", "body", 0) && !B.has("fish", "body", 2) && !B.has("face", "body", 0) && B.state().entries.length === n0,
+     "has(): false for a pass, kind, variant or attached pass the binder does not have (asked once: describe() trusts its callers), nothing made");
 }
 
 section("the declared attribute layouts");
@@ -577,9 +586,46 @@ section("review P3-1: the compile's check (compiler())");
   const p = M.compiler({ THREE: T3, renderer: fakeRenderer(new Map(), { hang: true }), geometry, timers, budgetMs: 60000 })(items([a]));
   timers.last();
   r = await p;
-  ok(!r.ok && /did not finish in 60 s/.test(r.error), "a compile that never finishes: refused at the budget", r);
+  ok(!r.ok && /did not finish in 60 s/.test(r.error) && r.timeout === true, "a compile that never finishes: refused at the budget, as a timeout (the prewarm asks again)", r);
   r = await M.compiler({ THREE: T3, renderer: fakeRenderer(new Map()), geometry, timers, lost: () => true })(items([a]));
   ok(!r.ok && /lost/.test(r.error), "a lost context: refused", r);
+  /* the context's generation (#50's review, P2): a compile that a loss overtook (lost and restored, and three's compileAsync,
+   * polling the lost context's programs, resolving after) is refused, whatever the check would say of the restored context */
+  {
+    let gen = 4, release = null;
+    const held = fakeRenderer(new Map([[a, prog(true)]]));
+    held.compileAsync = () => new Promise((res) => { release = res; });
+    const pg = M.compiler({ THREE: T3, renderer: held, geometry, timers, generation: () => gen })(items([a]));
+    gen += 2;   /* lost, then restored */
+    release();
+    const rg = await pg;
+    ok(!rg.ok && /lost during the compile/.test(rg.error), "a compile a context loss overtook (lost, restored, then three resolved): refused", rg);
+    const rs = await M.compiler({ THREE: T3, renderer: fakeRenderer(new Map([[a, prog(true)]])), geometry, timers, generation: () => gen })(items([a]));
+    ok(rs.ok, "  one generation throughout: ok", rs);
+    let release2 = null;
+    const held2 = fakeRenderer(new Map([[a, prog(false)]]));
+    held2.compileAsync = () => new Promise((res) => { release2 = res; });
+    const pf = M.compiler({ THREE: T3, renderer: held2, geometry, timers, generation: () => gen })(items([a]));
+    gen++;
+    release2();
+    const rf = await pf;
+    ok(!rf.ok && /lost during the compile/.test(rf.error), "  a failing one the loss overtook: refused as lost (not as the restored context's program)", rf);
+    /* the review of #59, P3-2: a lost context's programs read complete, so three's poll can resolve before the loss's event has
+     * run (the generation not moved yet); the context itself says it is lost: refused as lost, not as "did not compile" */
+    let release3 = null;
+    const held3 = fakeRenderer(new Map([[a, prog(true)]]));
+    held3.compileAsync = () => new Promise((res) => { release3 = res; });
+    const gl3 = held3.getContext();
+    let lost3 = false;
+    gl3.isContextLost = function () { if (this !== gl3) throw new TypeError("Illegal invocation"); return lost3; };
+    const p3 = M.compiler({ THREE: T3, renderer: held3, geometry, timers, generation: () => gen })(items([a]));
+    lost3 = true;
+    release3();
+    const r3 = await p3;
+    ok(!r3.ok && /lost during the compile/.test(r3.error), "  a loss whose event has not run yet (the context lost, the generation not moved): refused as lost", r3);
+    const ok5 = await M.compiler({ THREE: T3, renderer: fakeRenderer(new Map([[a, prog(true)]])), geometry, timers, generation: () => gen })(items([a]));
+    ok(ok5.ok && ok5.timeout === undefined, "  a context that is not lost, a generation that did not move: ok (no timeout flag)", ok5);
+  }
   /* the default timers against the browser's rule: setTimeout / clearTimeout called with any `this` but the global (or none)
    * throw "Illegal invocation" (node's do not care, so a detached native only failed in the browser: g3 at 33fd919) */
   {
