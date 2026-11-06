@@ -32,6 +32,14 @@ REPO = os.path.dirname(os.path.dirname(HERE))
 NPC, BLEN = 3, 2
 
 
+def wr(path, data, mode=None):
+    """Write (or with mode "ab" append) str / bytes to path, closing the file."""
+    if isinstance(data, str):
+        data = data.encode()
+    with open(path, mode or "wb") as f:
+        f.write(data)
+
+
 def mk_cp(n_prey=8, n_pred=3, version=2, frame=100, seed=1, cfg_extra=None):
     """A small, self-consistent synthetic checkpoint (not engine output: the layout only)."""
     rng = rqlib.SplitMix64(seed)
@@ -109,12 +117,12 @@ class TestRng(unittest.TestCase):
 class TestTemplateValues(unittest.TestCase):
     def test_agent_core_defaults(self):
         """common.AGENT_DEFAULTS are agent_core.hpp's member defaults, and 0.5 genome.hpp's neuron output."""
-        src = open(os.path.join(REPO, "src", "core", "agent_core.hpp")).read()
+        src = rqlib.read_text(os.path.join(REPO, "src", "core", "agent_core.hpp"))
         for k, v in common.AGENT_DEFAULTS.items():
             m = re.search(r"float\s+" + k + r"\s*=\s*([0-9.]+)f\s*;", src)
             self.assertIsNotNone(m, k)
             self.assertEqual(float(m.group(1)), v, k)
-        g = open(os.path.join(REPO, "src", "core", "genome.hpp")).read()
+        g = rqlib.read_text(os.path.join(REPO, "src", "core", "genome.hpp"))
         self.assertRegex(g, r"float output = 0\.5f;")
         self.assertEqual(common.NEURON_BIRTH_OUTPUT, 0.5)
 
@@ -394,11 +402,11 @@ class TestStore(unittest.TestCase):
         d = os.path.join(self.root, store.WORK, cid)
         os.makedirs(d)
         b = rqlib.canonical({"id": cid, "payload": payload})
-        open(os.path.join(d, "bundle.json"), "wb").write(b)
+        wr(os.path.join(d, "bundle.json"), b)
         rqlib.write_json_durable(os.path.join(d, "done.json"), {
             "schema": run.DONE_SCHEMA, "id": cid, "kind": "assay", "bundle_sha256": rqlib.sha256_bytes(b),
             "row_sha256": "r" * 64, "common_group": group, "common_sha256": csha})
-        open(os.path.join(d, "end.json"), "w").write("big")
+        wr(os.path.join(d, "end.json"), "big")
 
     def test_objects(self):
         sha = store.put_bytes(self.root, b'{"a":1}', compress=True)
@@ -513,8 +521,8 @@ class TestStore(unittest.TestCase):
         # an orphan chunk (crash after the rename, before the index line) and a truncated index line
         name2, _ = store.pack(self.root, ids=["c3"], log=lambda m: None)
         ip = os.path.join(self.root, store.INDEX)
-        raw = open(ip, "rb").read()
-        open(ip, "wb").write(raw[:-40])            # the second line torn
+        raw = rqlib.read_bytes(ip)
+        wr(ip, raw[:-40])            # the second line torn
         self.mk_cell("c3", group="g1", csha="a" * 64)   # its cell directory is back (deleted after the commit)
         acts, probs = store.recover(self.root, log=lambda m: None)
         self.assertEqual(probs, [])
@@ -522,10 +530,10 @@ class TestStore(unittest.TestCase):
         recs, cells = store.load_index(self.root)
         self.assertEqual(len(recs), 1)
         self.assertNotIn("c3", cells)
-        self.assertTrue(open(ip, "rb").read().endswith(b"\n"))
+        self.assertTrue(rqlib.read_bytes(ip).endswith(b"\n"))
         # a packed cell's leftover directory is deleted at recover (after its bundle is checked)
         os.makedirs(os.path.join(self.root, store.WORK, "c0"))
-        open(os.path.join(self.root, store.WORK, "c0", "bundle.json"), "wb").write(
+        wr(os.path.join(self.root, store.WORK, "c0", "bundle.json"),
             rqlib.canonical({"id": "c0", "payload": "x"}))
         self.assertEqual(store.recover(self.root, log=lambda m: None)[1], [])
         self.assertFalse(os.path.exists(os.path.join(self.root, store.WORK, "c0")))
@@ -538,12 +546,12 @@ class TestStore(unittest.TestCase):
         # a damaged chunk is found
         recs, _ = store.load_index(self.root)
         cp = os.path.join(self.root, store.CHUNKS, recs[0]["chunk"])
-        b = bytearray(open(cp, "rb").read())
+        b = bytearray(rqlib.read_bytes(cp))
         b[40] ^= 1
-        open(cp, "wb").write(bytes(b))
+        wr(cp, bytes(b))
         self.assertTrue(store.verify_all(self.root))
         # a bundle that does not match its done record is refused
-        open(os.path.join(self.root, store.WORK, "c9", "bundle.json"), "ab").write(b" ")
+        wr(os.path.join(self.root, store.WORK, "c9", "bundle.json"), b" ", "ab")
         with self.assertRaisesRegex(store.StoreError, "does not match"):
             store.pack(self.root, ids=["c9"], log=lambda m: None)
 
@@ -614,19 +622,55 @@ class TestProcesses(unittest.TestCase):
                              preexec_fn=rqlib.death_signal())
         self.assertEqual((out.returncode, out.stdout.strip()), (0, b"ran"))
 
+    # A stand-in worker: it HANDLES SIGTERM (as a real worker does, cell.forward_signals: stop the
+    # engine, exit), says "ready" once the handler is installed, then waits. A process that leaves
+    # SIGTERM at its default action can be killed by the kernel even while stopped (a fatal signal
+    # wakes a stopped task: round 2's CI failure), so it cannot model the hang; a HANDLED SIGTERM
+    # stays pending while the process is stopped, which is the case the escalation exists for.
+    WORKER = ("import os, signal, sys, time\n"
+              "signal.signal(signal.SIGTERM, lambda s, f: os._exit(0))\n"
+              "sys.stdout.write('ready\\n'); sys.stdout.flush()\n"
+              "time.sleep(120)\n")
+
+    def _worker(self):
+        import subprocess
+        p = subprocess.Popen([sys.executable, "-I", "-c", self.WORKER], start_new_session=True,
+                             stdout=subprocess.PIPE, stdin=subprocess.DEVNULL)
+        self.assertEqual(p.stdout.readline(), b"ready\n")    # the handler is in place
+        p.stdout.close()
+        return p
+
+    @staticmethod
+    def _state(pid):
+        """The kernel's process state letter (/proc/<pid>/stat): 'S', 'T' (stopped), 'Z', ..."""
+        with open(f"/proc/{pid}/stat") as f:
+            return f.read().rsplit(")", 1)[1].split()[0]
+
+    @unittest.skipUnless(os.path.isdir("/proc/self"), "needs /proc")
     def test_stop_groups_stopped_worker(self):
         """Review round 2, P2-7: a SIGSTOPped worker cannot act on SIGTERM; the bounded wait escalates
-        to SIGKILL instead of hanging."""
+        to SIGKILL after the grace instead of hanging. Deterministic: the worker handles SIGTERM, and
+        the test waits until the kernel reports it stopped before it stops the group."""
         import signal
-        import subprocess
         import time
-        p = subprocess.Popen(["sleep", "60"], start_new_session=True)
+        p = self._worker()
         os.kill(p.pid, signal.SIGSTOP)
+        deadline = time.monotonic() + 10
+        while self._state(p.pid) != "T":
+            self.assertLess(time.monotonic(), deadline, "the worker never reached the stopped state")
+            time.sleep(0.01)
+        grace = 1.0
         t0 = time.monotonic()
-        killed = run.stop_groups([p], grace=0.5)
-        self.assertLess(time.monotonic() - t0, 8)
-        self.assertEqual(killed, [p.pid])
-        self.assertEqual(p.returncode, -signal.SIGKILL)
+        killed = run.stop_groups([p], grace=grace)
+        dt = time.monotonic() - t0
+        self.assertEqual(killed, [p.pid])                    # it needed the SIGKILL ...
+        self.assertEqual(p.returncode, -signal.SIGKILL)      # ... and that is what ended it
+        self.assertGreaterEqual(dt, grace)                   # after the grace, not before
+        self.assertLess(dt, grace + 10)                      # and within the bound
+        # contrast: the same worker, running, honours SIGTERM and gets no SIGKILL
+        q = self._worker()
+        self.assertEqual(run.stop_groups([q], grace=grace), [])
+        self.assertEqual(q.returncode, 0)
 
 
 class TestRunner(unittest.TestCase):
@@ -669,18 +713,18 @@ class TestRunner(unittest.TestCase):
         tmp = tempfile.mkdtemp()
         try:
             os.makedirs(f"{tmp}/cg/a/b")
-            open(f"{tmp}/meminfo", "w").write("MemTotal: 9000000 kB\nMemAvailable: 8000000 kB\n")
-            open(f"{tmp}/proc_cgroup", "w").write("0::/a/b\n")
-            open(f"{tmp}/cg/a/b/memory.max", "w").write("1073741824\n")
-            open(f"{tmp}/cg/a/b/memory.current", "w").write("536870912\n")
-            open(f"{tmp}/cg/a/memory.max", "w").write("max\n")
+            wr(f"{tmp}/meminfo", "MemTotal: 9000000 kB\nMemAvailable: 8000000 kB\n")
+            wr(f"{tmp}/proc_cgroup", "0::/a/b\n")
+            wr(f"{tmp}/cg/a/b/memory.max", "1073741824\n")
+            wr(f"{tmp}/cg/a/b/memory.current", "536870912\n")
+            wr(f"{tmp}/cg/a/memory.max", "max\n")
             os.environ.update(RQ_MEMINFO=f"{tmp}/meminfo", RQ_PROC_CGROUP=f"{tmp}/proc_cgroup",
                               RQ_CGROUP_ROOT=f"{tmp}/cg")
             self.assertEqual(run.mem_headroom_mb(), 512)
-            open(f"{tmp}/cg/a/b/memory.max", "w").write("max\n")
+            wr(f"{tmp}/cg/a/b/memory.max", "max\n")
             self.assertEqual(run.mem_headroom_mb(), 7812)
-            open(f"{tmp}/cg/a/b/memory.max", "w").write("1073741824\n")
-            open(f"{tmp}/cg/a/b/memory.current", "w").write("oops\n")
+            wr(f"{tmp}/cg/a/b/memory.max", "1073741824\n")
+            wr(f"{tmp}/cg/a/b/memory.current", "oops\n")
             self.assertIsNone(run.mem_headroom_mb())
             os.environ["RQ_MEMINFO"] = f"{tmp}/none"
             self.assertIsNone(run.mem_headroom_mb())

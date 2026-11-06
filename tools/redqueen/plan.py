@@ -369,7 +369,7 @@ def main(argv=None):
     if a.pending and a.against:
         ap.error("--pending and --against exclude each other")
     try:
-        design = json.load(open(a.design))
+        design = json.loads(rqlib.read_text(a.design))
         rows, warnings = expand(design, pending=a.pending)
     except (DesignError, OSError, ValueError, KeyError) as e:
         print(f"plan.py: {e}", file=sys.stderr)
@@ -377,7 +377,7 @@ def main(argv=None):
     for w in warnings:
         print(f"warning: {w}", file=sys.stderr)
     if a.against:
-        reg = [json.loads(ln) for ln in open(a.against) if ln.strip()]
+        reg = [json.loads(ln) for ln in rqlib.read_text(a.against).split("\n") if ln.strip()]
         probs = pending_problems(rows, reg)
         if probs:
             print(f"not the registered pending plan {a.against}:", file=sys.stderr)
@@ -388,7 +388,7 @@ def main(argv=None):
     if a.avoid:
         old = set()
         for p in a.avoid:
-            old |= plan_seeds(json.loads(ln) for ln in open(p) if ln.strip())
+            old |= plan_seeds(json.loads(ln) for ln in rqlib.read_text(p).split("\n") if ln.strip())
         hit = sorted(plan_seeds(rows) & old)
         if hit:
             print(f"{len(hit)} engine seed(s) also used by {a.avoid}: {hit[:10]}", file=sys.stderr)

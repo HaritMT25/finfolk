@@ -81,6 +81,7 @@ subprocesses, never multiprocessing, so Python 3.10 to 3.14 behave the same):
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime
 import json
 import os
@@ -639,6 +640,11 @@ def pin_env(root, build_manifest, log):
 
 # ------------------------------------------------------------------ runner
 def main(argv=None):
+    with contextlib.ExitStack() as files:   # the lock, the logs: closed on every path
+        return _main(argv, files)
+
+
+def _main(argv, files):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--plan")
     ap.add_argument("--root", required=True)
@@ -679,7 +685,7 @@ def main(argv=None):
         ap.error("--chunk-size >= 1 and --retries >= 0")
 
     os.makedirs(os.path.join(root, store.WORK), exist_ok=True)
-    lock = open(os.path.join(root, ".runner.lock"), "w")
+    lock = files.enter_context(open(os.path.join(root, ".runner.lock"), "w"))
     try:
         import fcntl
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -687,7 +693,7 @@ def main(argv=None):
         print(f"another runner holds {root}", file=sys.stderr)
         return 73
     os.nice(19 - os.nice(0))
-    logf = open(os.path.join(root, "runner.log"), "a")
+    logf = files.enter_context(open(os.path.join(root, "runner.log"), "a"))
     lost = [0]
     log = log_to(logf, lost)
     try:
@@ -774,7 +780,7 @@ def main(argv=None):
     running = {}      # pid -> (Popen, id, t0)
     failed, tries = [], {}
     stop_reason = None
-    attempts_log = open(os.path.join(root, "attempts.tsv"), "a")
+    attempts_log = files.enter_context(open(os.path.join(root, "attempts.tsv"), "a"))
     queue = list(todo)
     n_done, n_before, t_start = 0, len(rows) - len(todo) - n_bio_start, time.time()
     rss_mb, mem_bad = 0, 0
