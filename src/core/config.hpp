@@ -298,9 +298,11 @@ struct SimConfig {
     bool  predatorFrozen   = false;  // [brain + economy] the frozen assay (transplant.hpp,
                                      // --assay frozen): energy and age are accounted (burn,
                                      // meals, ageing) so ENERGY and AGE keep their evolved
-                                     // range, but nobody starves, ages out or buds: energy is
-                                     // held in [0, repro threshold], age at most predatorMaxAge
-                                     // (when > 0). Brain predators only.
+                                     // range, but nobody starves, ages out or buds: at the
+                                     // budding threshold a predator pays the newborn energy
+                                     // for a "virtual bud" (no child; counted), age wraps at
+                                     // predatorMaxAge (when > 0), energy is floored at 0.
+                                     // No draws. Brain predators only.
 
     // --- Inspection & analysis (visual/diagnostic; do not affect dynamics) ---
     // Capture each creature's last sensor inputs / action outputs every step so a

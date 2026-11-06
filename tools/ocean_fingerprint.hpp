@@ -214,7 +214,7 @@ OFP_FIELDS(OceanConfig, 37);
 OFP_FIELDS(appearance::Stats, 10);   // founders, offspring, pattern[4], morph[4]
 OFP_FIELDS(AgentCore, 16 + NUM_SENSES + NUM_ACTIONS + 1);   // 14 scalars + genome + nnet, the two arrays, colour
 OFP_FIELDS(Fish, 1 + 6 + Fish::BODY_LEN);                   // base, pos .. bodyBuoy, body[]
-OFP_FIELDS(Predator, 17);   // 9 + the Stage C brain (genome .. sourceId): hashPredator's tagged block
+OFP_FIELDS(Predator, 18);   // 9 + the Stage C brain (genome .. virtualBuds): hashPredator's tagged block
 OFP_FIELDS(OceanPredator, 3);                               // base, depth, pitch
 OFP_FIELDS(OceanFood, 5 + (kOceanHasEye ? 1 : 0));   // pos, depth, alive, size, age (+ eyeCon)
 OFP_FIELDS(Gene, 5);
@@ -578,10 +578,11 @@ inline void hashPredator(Hasher& h, const OceanPredator& p) {
     // Stage C's brain fields: a tagged block, only when any is off its default
     // (a scripted predator's never are), so existing baselines are unchanged.
     if (!p.genome.empty() || !p.nnet.flat.empty() || !p.nnet.neurons.empty() || p.id != 0 ||
-        p.lineageId != 0 || p.parentId != 0 || bits(p.speed) != 0u || p.captures != 0 || p.sourceId != 0) {
+        p.lineageId != 0 || p.parentId != 0 || bits(p.speed) != 0u || p.captures != 0 || p.sourceId != 0 ||
+        p.virtualBuds != 0) {
         h.u64(kBrainPredTag);
         h.u64(p.id); h.u64(p.lineageId); h.u64(p.parentId); h.f32(p.speed); h.u32(p.captures);
-        h.u64(p.sourceId);
+        h.u64(p.sourceId); h.u32(p.virtualBuds);
         h.u64(p.genome.size());
         for (const Gene& g : p.genome) h.u32(geneWord(g));
         h.u64(p.nnet.neurons.size());
@@ -858,7 +859,9 @@ inline void dumpState(const OceanWorld& w, std::FILE* out) {
     d.ull("fish", w.creatures.size()); d.ull("food", w.food.size()); d.ull("pred", w.predators.size());
     std::fprintf(out, "\nsimconfig");
     visitSimConfig(w.cfg, d);
-    visitSimConfigBrain(w.cfg, d);
+    // The Stage C keys only off their defaults, as they are hashed, so a
+    // brain-off dump is the 0.26.0 dump line for line.
+    if (!simBrainAtDefaults(w.cfg)) visitSimConfigBrain(w.cfg, d);
     std::fprintf(out, "\noceanconfig");
     visitOceanConfig(w.ocfg, d);
     visitOceanConfigVision(w.ocfg, d);

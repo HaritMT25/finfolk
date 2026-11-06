@@ -399,7 +399,7 @@ operators and network evaluation) but with the predator's own inputs and outputs
 | `--predator-turn-rate F` | 4 | rad/s at full TURN (the prey's `--max-turn-rate` default). |
 | `--predator-min-speed F` | 0 | THRUST's floor. 0 lets a predator stop and wait (ambush). Must not exceed `--predator-speed`. |
 | `--predator-primer` | off | Founders start with two pursuit genes (PREY_LR → TURN, PREY_PROX → THRUST) written over their first two genes. Off = random genomes. |
-| `--predator-log` | off | Stream every predator founding (F), floor refill (R), bud (B) and death (S starved, A aged) to `<name>.predlog.csv` (frame, event, id, parent, lineage, generation, age, captures, energy, genome length, traits, source). Never decimated. See "The lineage log across runs" below. |
+| `--predator-log` | off | Stream every predator founding (F), floor refill (R), bud (B), death (S starved, A aged) and, in the frozen assay, virtual bud (V) to `<name>.predlog.csv` (frame, event, id, parent, lineage, generation, age, captures, energy, genome length, traits, source). Never decimated. See "The lineage log across runs" below. |
 
 **On a resume** the checkpoint decides: a version-2 file has brains and its own Stage C
 settings (as for every other setting, the command line does not override them); a version-1
@@ -417,7 +417,10 @@ never overwritten:** the run refuses to start, so give every run or resumed segm
 `--name`. To stitch segment 1 (which ran past or up to frame F) and segment 2 (resumed from
 the checkpoint at frame F): keep segment 1's rows with frame ≤ F, then segment 2's rows
 without its `L` rows. The result is the log of the uninterrupted run (tested in ctest
-`stagec_cli` and `core_tests`).
+`stagec_cli` and `core_tests`). **A requested log that cannot be written stops the run**
+(exit 1): failing to open it stops the run before the first step, and a failed write or flush
+stops it at once, before any further checkpoint. So no checkpoint ever claims events its log
+lacks, and the last checkpoint written is a consistent place to resume from.
 
 **The Stage C recipe (an evolving run):** `--predators 6 --predator-economy
 --predator-brain --predator-max-pop N --predator-min-pop 2 --predator-max-age 120` plus a
@@ -441,9 +444,12 @@ recipe with cap 40, floor 2 and max age 120; meal 1.2× and 1.5× of the 8.54 br
     capped by the 3 s digest at ~0.25 catches/s, they rarely bud within a 120 s life. The floor's
     founders restarted them each time.
   - Floor refills were 1.3–4.5 % of predator births.
-- **Time shift.** Prey of one run's end against K = 6 predators: 0.157 catches per
-  predator-second from random founders, 0.187 from the same run's frame 250k, and 0.245 from
-  its contemporaries.
+- **Time shift.** Prey of one run's end (1.5×, seed 2, frame 1.5M) against K = 6 predators,
+  20k steps × 3 reseeds. Catches per predator-second under `frozen` (the default) /
+  `frozen-newborn`: **0.146** / 0.156 from random founders, **0.201** / 0.182 from the same
+  run's frame 250k, and **0.249** / 0.249 from its contemporaries. The frozen assay's virtual
+  buds per predator-second rank them the same way: 0.0028, 0.0050, 0.0111. (The contemporary
+  lineage wires no own-state input, so both modes score it alike.)
 - **What this means for a study:** this arena needs tuning before a long study. A longer life
   or a richer meal would let lineages last; relaxing the prey cap would let predators regulate
   numbers, not only turnover.
@@ -459,7 +465,10 @@ recipe with cap 40, floor 2 and max age 120; meal 1.2× and 1.5× of the 8.54 br
 
 **Outputs with the brain on** (the main CSV is unchanged):
 
-- `<name>.predators.csv`, one row per `--log-every`: predator and prey counts; this
+- `<name>.predators.csv`, one row per `--log-every`, its `step` column the world's frame (so
+  a resumed segment's rows continue the uninterrupted run's; with the checkpoint at a
+  multiple of `--log-every`, segment 1's file followed by segment 2's rows is the
+  uninterrupted file, tested in `stagec_cli`): predator and prey counts; this
   interval's births, starvations, deaths of age, refills and captures; captures per
   predator-second; `pursuit_frac` (predator-steps with a prey in range);
   `captures_per_pursuit_s`; **`pursuit_align`** (mean cosine of heading against the bearing to
@@ -467,8 +476,12 @@ recipe with cap 40, floor 2 and max age 120; meal 1.2× and 1.5× of the 8.54 br
   at ≥ 95 % of top speed; mean energy, age and generation, max generation; lineages alive;
   mean genome length; `genome_dist_mean` (mean pairwise distance of the folded networks, first
   64 predators); the share of predators wiring prey / rival / pheromone / own-state inputs;
-  deaths this interval and their mean lifetime captures and age.
-- `<name>.pwiring.csv` with `--wiring-log`: per predator input, the share wiring it.
+  deaths this interval and their mean lifetime captures and age; the frozen assay's virtual
+  buds (`virtual_buds_interval`, `virtual_buds_per_pred_s` and `virtual_buds_mean`, the mean
+  per-predator count so far; 0 outside it). Like the main CSV, a file that cannot be opened
+  stops the run.
+- `<name>.pwiring.csv` with `--wiring-log`: per predator input, the share wiring it (rows by
+  the world's frame, as above).
 - Console: ` pGen  pLen  pAln` (mean generation, genome length, pursuit alignment).
 - Checkpoints are **format version 2** (a v0.26 binary refuses them): predator ids,
   lineages, parents, speed, captures, recurrent outputs and genomes, the predators' stream
@@ -492,10 +505,16 @@ recipe with cap 40, floor 2 and max age 120; meal 1.2× and 1.5× of the 8.54 br
   replacement if K > |Y|), carrying only their genome, lineage, generation and traits, and
   their Y id as `sourceId`. `--predators-from random` makes K random-genome founders instead
   (how to start Stage C on an evolved prey world). `--transplant-count` takes a whole number
-  ≥ 0 (anything else is refused).
+  ≥ 0, or -1 for all of Y's predators (the default); anything else is refused.
 - **Reset**: energy (the spawn energy, `--predator-newborn-energy`), age 0, digest, captures,
-  speed (top), recurrent outputs (0.5), positions and headings (drawn from the transplant
-  seed, never from the world's stream). The manifest records this start state.
+  virtual buds, speed (top), recurrent outputs (0.5), positions and headings. The manifest
+  records this start state.
+- **Random streams**: four, each derived from the transplant seed S and never from the
+  world's stream: one picks Y's predators, one places them (positions and headings), one
+  draws the `random` founders' genomes, and one seeds the arena's predator stream. So the
+  layout is a function of (S, K, X) alone: the same S and K give the same positions whichever
+  donor, and whatever its size, fills them (tested in `core_tests`). (Arenas written by
+  earlier builds of this branch, which drew everything from one stream, place differently.)
 - **Ids**: fresh, starting at max(X's next predator id, Y's next predator id, 1 + Y's largest
   lineage id). So no bud or floor refill in the assay can reuse a transplanted lineage's label,
   and founders keep `lineageId == id`.
@@ -511,9 +530,14 @@ recipe with cap 40, floor 2 and max age 120; meal 1.2× and 1.5× of the 8.54 br
   every Stage C key's value and source.
 - **Assay modes:**
   - **`--assay frozen`** (default): the economy runs its accounting (burn, meals, ageing) so the
-    ENERGY and AGE inputs keep their evolved range, but nobody dies or buds. Energy is held in
-    [0, budding threshold], age at most `--predator-max-age`. The K predators stay K. No
-    predator floor or cap, prey `--min-pop 0`.
+    ENERGY and AGE inputs keep their evolved range, but nobody dies or buds. Energy floors at
+    0. On reaching the budding threshold a predator makes a **virtual bud**: the newborn's
+    energy is subtracted, as for a real bud, but no child is made. The count is a per-predator
+    fitness readout (`V` rows in the lineage log, the `virtual_buds_*` columns of
+    `predators.csv`, a `virtualBuds` column in the checkpoint). Age **wraps** modulo
+    `--predator-max-age` instead of stopping there. So neither input parks at "full and old".
+    Neither draws a random number. The K predators stay K. No predator floor or cap, prey
+    `--min-pop 0`.
   - **`--assay frozen-newborn`**: the economy off. The predators are immortal and fixed, and
     ENERGY and AGE read 0 throughout, as if every predator were a newborn. An ablation of the
     above.
@@ -523,8 +547,12 @@ recipe with cap 40, floor 2 and max age 120; meal 1.2× and 1.5× of the 8.54 br
   predators (source id → new id, lineage, generation), the config changes and the physics
   compared.
 - **Deterministic**: the arena is a function of (X, Y, K, seed, assay) byte for byte, and the
-  assay a function of (arena, R) in the serial build. Score from `<name>.predators.csv`
-  (captures per predator-second) and the main CSV (predation deaths).
+  assay a function of (arena, R) in the serial build.
+- **Score from `<name>.predators.csv`** (`captures_interval`, `captures_per_pred_s`,
+  `virtual_buds_*`). Its interval counters start at the load. The main CSV's do not: on any
+  resume, its first row's interval columns (`kills_interval`, `births_interval`, …) carry
+  the loaded world's whole history, a v0.26 convention kept so brain-off output stays byte
+  for byte. If you read the main CSV, drop its first row or difference its cumulative columns.
 
 ## Environment — currents & spatial food
 

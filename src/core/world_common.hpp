@@ -133,7 +133,8 @@ struct WorldCommon {
     std::uint64_t nextPredatorId_ = 1;
 
     // The lineage log (cfg.predatorLog): one record per founding (F: initial
-    // spawn, R: floor refill), bud (B) and death (S: starved, A: aged), plus,
+    // spawn, R: floor refill), bud (B), death (S: starved, A: aged) and the
+    // frozen assay's virtual bud (V: paid for, no child), plus,
     // at the start of a run that did not come from init(), one record per live
     // predator: L (loaded from a checkpoint) or T (transplanted: the first run
     // of an arena; `source` = its id in the source checkpoint). Drained by the
@@ -169,6 +170,7 @@ struct WorldCommon {
         double speedSum = 0.0, speedSqSum = 0.0;
         long long deaths = 0;         // predators that died (starved or aged)
         double deathCaptures = 0.0, deathAge = 0.0;
+        long long virtualBuds = 0;    // the frozen assay's virtual buds
     };
     PredatorTally predTally_;
 

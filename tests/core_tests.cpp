@@ -4199,11 +4199,30 @@ static void test_predator_brain() {
         CHECK(!bitEq(s0[PS_ENERGY], s1[PS_ENERGY]) && s1[PS_AGE] > s0[PS_AGE] && s1[PS_AGE] > 0.0f);
         bool inRange = true, aged = true;
         for (const auto& p : a.predators) {
-            const float T = a.cfg.predatorReproEnergy * p.buddingFactor;
-            inRange = inRange && p.energy >= 0.0f && p.energy <= T;
-            aged = aged && approx(p.age, 300 * 0.016f, 1e-3f);
+            inRange = inRange && p.energy >= 0.0f;
+            aged = aged && approx(p.age, 300 * 0.016f, 1e-3f);     // X has no max age: no wrap
         }
         CHECK(inRange && aged);
+        // the layout is a function of (seed, K, the world) only: a donor of
+        // another size, and "random", put the K predators on the same spots
+        {
+            const std::string y2 = checkpoint::serialize(t2, "t");   // 3 predators, all taken
+            World b2 = loadX(), r2 = loadX(), b1 = loadX();
+            transplant::Options o2 = o; o2.seed = 9u;
+            transplant::Options or2 = o2; or2.predatorsFrom = "random"; or2.assay = "frozen";
+            std::string m2;
+            CHECK(transplant::apply(b1, o2, yBlob, m2, err) && transplant::apply(b2, o2, y2, m2, err) &&
+                  transplant::apply(r2, or2, "", m2, err));
+            bool same = b1.predators.size() == 3u && b2.predators.size() == 3u && r2.predators.size() == 3u;
+            auto samePlace = [](const Predator& p, const Predator& q) {
+                return bitEq(p.pos.x, q.pos.x) && bitEq(p.pos.y, q.pos.y) &&
+                       bitEq(p.vel.x, q.vel.x) && bitEq(p.vel.y, q.vel.y);
+            };
+            for (size_t i = 0; same && i < 3; ++i)
+                same = samePlace(b1.predators[i], b2.predators[i]) && samePlace(b1.predators[i], r2.predators[i]);
+            CHECK(same);
+            CHECK(live.predators.size() != 3u);   // the two donors really differ in size
+        }
         // ... and the frozen-newborn ablation pins both at 0
         for (int i = 0; i < 300; ++i) t2.update(0.016f);
         float sn[NUM_PRED_SENSES] = {};
@@ -4250,21 +4269,67 @@ static void test_predator_brain() {
             World x9;
             CHECK(!checkpoint::deserialize(badLin, x9, err) && err.find("lineageId") != std::string::npos);
         }
+        // ... and so is one without its predators block
+        {
+            std::string noPred = ab;
+            const size_t at = noPred.find("\n,\"predators\"") + 1;
+            noPred.erase(at, noPred.find('\n', at) - at + 1);
+            CHECK(noPred.find("\"predators\"") == std::string::npos);
+            World x10;
+            CHECK(!checkpoint::deserialize(noPred, x10, err) && err.find("predators") != std::string::npos);
+        }
     }
 
-    // --- 12. the frozen assay's accounting at its limits ------------------
+    // --- 12. the frozen assay's accounting: virtual buds, wrapping age ----
     {
         World w = bareBrainWorld(41u, 2, true);
         w.cfg.predatorFrozen = true;
         w.cfg.predatorMetabolism = 50.0f;     // would starve in < 1 s
         w.cfg.predatorMaxAge = 1.0f;          // would age out in 1 s
-        w.predators[1].energy = 1000.0f;      // would bud at once
-        for (int i = 0; i < 200; ++i) w.update(0.016f);
+        w.predators[1].energy = 1000.0f;      // would bud at once, again and again
+        std::set<std::uint32_t> energyBits;
+        int wraps = 0;
+        float lastAge = 0.0f;
+        for (int i = 0; i < 200; ++i) {
+            w.update(0.016f);
+            float s[NUM_PRED_SENSES] = {};
+            predbrain::writeOwnSensors(w.predators[1], w.cfg, predbrain::topSpeed(w.predators[1], w.cfg), s);
+            energyBits.insert(floatBits(s[PS_ENERGY]));
+            if (w.predators[0].age < lastAge) ++wraps;
+            lastAge = w.predators[0].age;
+        }
         CHECK(w.predators.size() == 2u && w.totalPredatorBirths == 0 &&
               w.totalPredatorDeathsStarvation == 0 && w.totalPredatorDeathsAge == 0);
-        CHECK(bitEq(w.predators[0].energy, 0.0f) && approx(w.predators[0].age, 1.0f, 1e-6f));
-        CHECK(w.predators[1].energy <= w.cfg.predatorReproEnergy && w.predators[1].energy >= 0.0f);
+        CHECK(bitEq(w.predators[0].energy, 0.0f));                       // floored, not dead
+        CHECK(wraps == 3 && w.predators[0].age >= 0.0f && w.predators[0].age < 1.0f);   // 3.2 s of a 1 s life
+        CHECK(energyBits.size() > 20);                                   // ENERGY moved
+        CHECK(w.predators[1].virtualBuds > 20 && w.predators[0].virtualBuds == 0);
+        CHECK(w.predators[1].energy < w.cfg.predatorReproEnergy);
+        predstats::Last last;
+        const predstats::Row r = predstats::sample(w, 0.016f, last);
+        CHECK(r.virtualBuds == (long long)w.predators[1].virtualBuds && r.virtualBudsPerPredS > 0.0 &&
+              approx((float)r.virtualBudsMean, 0.5f * w.predators[1].virtualBuds, 1e-3f));
+        // the per-predator count survives a checkpoint
+        std::string err;
+        World back;
+        CHECK(checkpoint::deserialize(checkpoint::serialize(w, "t"), back, err) &&
+              back.predators[1].virtualBuds == w.predators[1].virtualBuds);
     }
+
+    // --- 12b. a lineage-log write that fails keeps its events --------------
+#ifdef __linux__
+    {
+        World w = bareBrainWorld(43u, 2, false);
+        w.cfg.predatorLog = true;
+        w.notePredatorsAtStart(w.predators, 'L');
+        std::FILE* full = std::fopen("/dev/full", "w");
+        if (full) {
+            CHECK(!predstats::drainLog(w, full) && w.predLog_.size() == 2u);
+            std::fclose(full);
+        }
+        CHECK(!predstats::drainLog(w, nullptr) && w.predLog_.size() == 2u);
+    }
+#endif
 
     // --- 13. the lineage log across a resume: stitched == uninterrupted ----
 #ifdef EVO_DETERMINISTIC

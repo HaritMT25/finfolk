@@ -77,6 +77,8 @@ struct Predator {
     std::uint32_t captures  = 0;     // prey caught in this predator's life
     std::uint64_t sourceId  = 0;     // a transplanted predator's id in its SOURCE checkpoint
                                      // (another id namespace; transplant.hpp); 0 otherwise
+    std::uint32_t virtualBuds = 0;   // the frozen assay's buds that made no child
+                                     // (cfg.predatorFrozen): a per-predator fitness readout
 
     // Forward unit vector (mirrors Creature::forward()).
     Vec2 forward() const {

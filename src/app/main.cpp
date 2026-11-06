@@ -340,7 +340,8 @@ int main(int argc, char** argv) {
             char* end = nullptr;
             const long k = std::strtol(v, &end, 10);
             if (end == v || *end != '\0' || k < -1 || k > 1000000) {
-                std::cerr << "Error: --transplant-count must be a whole number >= 0 (got '" << v << "').\n";
+                std::cerr << "Error: --transplant-count must be a whole number >= 0, or -1 for all of the"
+                             " source's predators (got '" << v << "').\n";
                 return 1;
             }
             transplantOpt.count = (int)k;
@@ -713,7 +714,13 @@ int main(int argc, char** argv) {
                 const std::string ppath = clusterStem + ".predators.csv";
                 openNext(ppath);
                 predCsv.open(ppath);
-                if (predCsv) { predCsv << predstats::header() << "\n"; predCsv.flush(); }
+                // As for the main CSV: the assays are scored from this file.
+                if (!predCsv) {
+                    std::cerr << "Could not open the predator metrics file for writing: " << ppath << "\n";
+                    return 1;
+                }
+                predCsv << predstats::header() << "\n";
+                predCsv.flush();
             }
             if (world.cfg.wiringLog) {
                 const std::string ppath = clusterStem + ".pwiring.csv";
@@ -725,19 +732,31 @@ int main(int argc, char** argv) {
                 const std::string ppath = clusterStem + ".predlog.csv";
                 openNext(ppath);
                 predLog = std::fopen(ppath.c_str(), "w");   // absent: checked before the run
-                if (predLog) {
-                    std::fprintf(predLog, "%s\n", predstats::logHeader().c_str());
-                    // A run from a checkpoint starts its segment with the predators
-                    // alive at the load: L rows, or T rows for an arena's first run.
-                    if (!loadCheckpoint.empty())
-                        world.notePredatorsAtStart(world.predators, loadedArenaStart ? 'T' : 'L');
-                    predstats::drainLog(world, predLog);   // ... or the founders of init()
-                    std::fflush(predLog);
-                } else {
-                    std::cerr << "Could not open " << ppath << " for writing.\n";
+                // A requested lineage log that cannot be written is fatal: a gap
+                // in it cannot be recovered later (the run goes on without it).
+                if (!predLog || std::fprintf(predLog, "%s\n", predstats::logHeader().c_str()) < 0) {
+                    std::cerr << "Error: cannot write the lineage log " << ppath << ".\n";
+                    return 1;
+                }
+                // A run from a checkpoint starts its segment with the predators
+                // alive at the load: L rows, or T rows for an arena's first run.
+                if (!loadCheckpoint.empty())
+                    world.notePredatorsAtStart(world.predators, loadedArenaStart ? 'T' : 'L');
+                if (!predstats::drainLog(world, predLog)) {   // ... or the founders of init()
+                    std::cerr << "Error: cannot write the lineage log " << ppath << ".\n";
+                    return 1;
                 }
             }
         }
+        // A lineage-log write that fails mid-run stops the run at once (exit 1,
+        // no further checkpoint), so no checkpoint ever claims events the log lacks.
+        auto drainOrDie = [&]() {
+            if (predLog && !predstats::drainLog(world, predLog)) {
+                std::cerr << "Error: writing the lineage log failed at frame " << world.frame
+                          << "; stopping (the last checkpoint is consistent with the log).\n";
+                std::exit(1);
+            }
+        };
 
         auto      lastSampleTime  = startTime;
         int       lastSampleStep  = 0;
@@ -813,12 +832,14 @@ int main(int argc, char** argv) {
                     std::cout << "  pGen " << std::setprecision(1) << pr.genMean
                               << " pLen " << std::setprecision(1) << pr.genomeLenMean
                               << " pAln " << std::setprecision(2) << pr.pursuitAlign;
+                // Rows carry the world's frame, as the main CSV does, so a resumed
+                // segment's rows continue the uninterrupted run's.
                 if (predCsv.is_open()) {
-                    predCsv << predstats::row(stepsDone, pr) << "\n";
+                    predCsv << predstats::row(world.frame, pr) << "\n";
                     if ((rowsWritten + 1) % flushEvery == 0) predCsv.flush();
                 }
-                if (predWiring.is_open()) predWiring << predstats::wiringRow(stepsDone, world) << "\n";
-                if (predLog) { predstats::drainLog(world, predLog); std::fflush(predLog); }
+                if (predWiring.is_open()) predWiring << predstats::wiringRow(world.frame, world) << "\n";
+                drainOrDie();
             }
             std::cout << "  ("     << std::setprecision(1) << elapsed << "s, "
                       << static_cast<long>(sps) << "/s)\n";
@@ -859,8 +880,9 @@ int main(int argc, char** argv) {
         auto writeCheckpoint = [&](const std::string& path) {
             std::string err;
             // The lineage log is on disk up to this frame before the checkpoint
-            // is: a run killed after it loses nothing a resume would not redo.
-            if (predLog) { predstats::drainLog(world, predLog); std::fflush(predLog); }
+            // is (a failed write stops the run before any checkpoint is
+            // published): a run killed after it loses nothing a resume would not redo.
+            drainOrDie();
             if (!checkpoint::save(world, path, EVO_VERSION, err)) {
                 std::cerr << "!! checkpoint failed: " << err << "\n";
                 return false;
@@ -901,8 +923,11 @@ int main(int argc, char** argv) {
         }
         if (predWiring.is_open()) predWiring.close();
         if (predLog) {
-            predstats::drainLog(world, predLog);
-            std::fclose(predLog);
+            drainOrDie();
+            if (std::fclose(predLog) != 0) {
+                std::cerr << "Error: closing the lineage log failed.\n";
+                return 1;
+            }
             std::cout << "Wrote predator lineage log to " << clusterStem << ".predlog.csv\n";
         }
 

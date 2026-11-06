@@ -406,6 +406,12 @@ inline std::string serialize(const World& world, const char* engineVersion) {
         if (anySource) {
             w.key("sourceId"); w.beginArray(); for (const Predator& p : ps) w.value((unsigned long long)p.sourceId); w.endArray();
         }
+        // The frozen assay's virtual buds per predator: only when any has one.
+        bool anyVirtual = false;
+        for (const Predator& p : ps) anyVirtual = anyVirtual || p.virtualBuds != 0;
+        if (anyVirtual) {
+            w.key("virtualBuds"); w.beginArray(); for (const Predator& p : ps) w.value((unsigned long long)p.virtualBuds); w.endArray();
+        }
         w.key("neuronOutputs"); w.beginArray();
         for (const Predator& p : ps)
             for (int k = 0; k < MAX_INTERNAL_NEURONS; ++k) w.value(p.nnet.neurons[(size_t)k].output);
@@ -555,7 +561,7 @@ inline bool readPredators(const jsonm::Value& jp, bool brain, std::uint64_t next
     }
 
     // Stage C brain columns (version 2 only).
-    std::vector<long long> ids, lin, par, cap, glen, genes, src;
+    std::vector<long long> ids, lin, par, cap, glen, genes, src, vbuds;
     std::vector<float> spd, neur;
     if (brain) {
         const int set = jp.intOr("sensorSet", -1);
@@ -607,6 +613,12 @@ inline bool readPredators(const jsonm::Value& jp, bool brain, std::uint64_t next
         }
         for (long long v : src)
             if (v < 0) { error = "predator 'sourceId' out of range"; return false; }
+        // Optional: written only when some predator made a virtual bud (frozen assay).
+        if (jp.find("virtualBuds") && !jsonm::readInts(jp, "virtualBuds", vbuds, n)) {
+            error = "malformed predator 'virtualBuds' array (length mismatch?)"; return false;
+        }
+        for (long long v : vbuds)
+            if (v < 0 || v > (long long)UINT32_MAX) { error = "predator 'virtualBuds' out of range"; return false; }
     }
 
     out.clear();
@@ -629,6 +641,7 @@ inline bool readPredators(const jsonm::Value& jp, bool brain, std::uint64_t next
             p.parentId = (std::uint64_t)par[i];
             p.captures = (std::uint32_t)cap[i];
             p.sourceId = src.empty() ? 0u : (std::uint64_t)src[i];
+            p.virtualBuds = vbuds.empty() ? 0u : (std::uint32_t)vbuds[i];
             p.speed = spd[i];
             p.genome.clear();
             p.genome.reserve((size_t)glen[i]);
@@ -804,9 +817,11 @@ inline bool deserialize(const std::string& text, World& world, std::string& erro
         for (size_t i = 0; i < n; ++i) { world.food[i].pos = Vec2{x[i], y[i]}; world.food[i].alive = alive[i] != 0; }
     }
 
-    // predators
+    // predators (a version-2 checkpoint must carry the block: its brains are the point)
     if (const jsonm::Value* jp = j.find("predators")) {
         if (!readPredators(*jp, brain, world.nextPredatorId_, world.predators, error)) return false;
+    } else if (brain) {
+        error = "a version-2 checkpoint needs its 'predators' block"; return false;
     }
 
     // creatures

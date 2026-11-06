@@ -873,8 +873,9 @@ private:
     // Without the economy nothing ages, starves or buds and energy is inert: a
     // fixed, immortal population of neural hunters whose ENERGY and AGE read 0
     // (the frozen-newborn assay). With the economy and cfg.predatorFrozen (the
-    // frozen assay) energy and age are accounted as usual but step 7 only holds
-    // energy in [0, T] and age at most predatorMaxAge: no deaths, no buds.
+    // frozen assay) energy and age are accounted as usual, but step 7 neither
+    // kills nor buds: a predator at the threshold pays for a VIRTUAL bud (no
+    // child), age wraps at predatorMaxAge, and energy is floored at 0.
     void updateBrainPredators(float dt) {
         if (predators.empty()) return;
         const bool  econ     = cfg.predatorEconomy;
@@ -1027,11 +1028,25 @@ private:
 
             // 7. life cycle (Stage B's order and draws)
             if (frozen) {
-                // The frozen assay: the accounting above ran, nobody dies or buds.
-                // No draws, so the population and both streams stay fixed.
-                const float T = cfg.predatorReproEnergy * p.buddingFactor;
-                p.energy = std::max(0.0f, std::min(p.energy, std::max(0.0f, T)));
-                if (cfg.predatorMaxAge > 0.0f && p.age > cfg.predatorMaxAge) p.age = cfg.predatorMaxAge;
+                // The frozen assay: the accounting above ran, nobody dies or buds,
+                // and no draw is taken, so the population and both streams stay
+                // fixed. So that ENERGY and AGE cycle through the range they have
+                // in an evolving run (not parked at "full" and "old"):
+                //  * a VIRTUAL BUD where Stage B would bud: at the threshold the
+                //    predator pays the newborn energy and makes no child; counted
+                //    per predator (virtualBuds) and per interval — a direct
+                //    fitness readout of the assayed genome;
+                //  * age WRAPS at the max age (one lifespan after another), and
+                //    energy is floored at 0 where Stage B would starve.
+                if (p.energy < 0.0f) p.energy = 0.0f;
+                if (cfg.predatorMaxAge > 0.0f && p.age >= cfg.predatorMaxAge) p.age -= cfg.predatorMaxAge;
+                if (p.energy >= cfg.predatorReproEnergy * p.buddingFactor) {
+                    p.energy -= cfg.predatorNewbornEnergy;
+                    if (p.energy < 0.0f) p.energy = 0.0f;
+                    ++p.virtualBuds;
+                    predTally_.virtualBuds++;
+                    notePredator('V', p);
+                }
             } else if (econ) {
                 if (p.energy < 0.0f) {
                     p.alive = false;

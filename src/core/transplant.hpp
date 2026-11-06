@@ -27,10 +27,14 @@
 //     so no later id (a bud's, a floor refill's) can repeat a transplanted
 //     lineage label. Y's ids are in the manifest and in each sourceId.
 //
-// Determinism: every draw here comes from RandomGen(seed) — the sample, the
-// placements, the "random" genomes, and predRng_'s seed when X has no brains —
-// never from the world's rng, so X's random stream is untouched and the arena
-// is a pure function of (X, Y, count, seed, assay).
+// Determinism: every draw here comes from four streams derived from the
+// transplant seed S (streamSeed(S, k)): k = 1 picks Y's predators, k = 2 places
+// them (position, heading), k = 3 makes the "random" founders' genomes, k = 4
+// seeds predRng_ when X has no brains. Never the world's rng, so X's random
+// stream is untouched and the arena is a pure function of (X, Y, count, seed,
+// assay). Separate streams make the LAYOUT a function of (S, K, the world's
+// size) only: whatever the donor's size, and whether the source is Y or
+// "random", the K predators land on the same spots with the same headings.
 //
 // Config: X's, except
 //   * predatorBrain on; predatorCount = K; from Y (a Y without brains is
@@ -47,10 +51,12 @@
 //                       in live the deaths and buds);
 //   * the assay:
 //       frozen (the default): the economy ON with predatorFrozen — energy and age
-//         are accounted (burn, meals, ageing) so ENERGY and AGE keep their
-//         evolved range, but nobody dies or buds (energy held in [0, T], age at
-//         most the max age); the predator floor and cap 0; the prey minPopulation
-//         0 (no random founders join the prey);
+//         are accounted (burn, meals, ageing) so ENERGY and AGE cycle through
+//         their evolved range, but nobody dies or buds: at the budding threshold
+//         a predator pays the newborn energy for a VIRTUAL bud (no child; counted,
+//         a fitness readout), age wraps at the max age, energy is floored at 0;
+//         the predator floor and cap 0; the prey minPopulation 0 (no random
+//         founders join the prey);
 //       frozen-newborn: the economy OFF — immortal, fixed, and every predator's
 //         ENERGY and AGE read 0 for the whole assay (an ablation of the above);
 //       live: X's config as it is (predators starve, age out and bud).
@@ -76,6 +82,17 @@ struct Options {
     bool allowMismatch = false;
     std::vector<std::string> cliKeys;   // Stage C keys given on the command line (manifest only)
 };
+
+// The k-th stream's seed from the transplant seed S (splitmix64's finaliser over
+// S and k): the streams are independent, so drawing more from one (a bigger
+// donor to sample from) never moves another (the placements).
+inline unsigned streamSeed(unsigned s, unsigned k) {
+    std::uint64_t z = (std::uint64_t)s * 0x9E3779B97F4A7C15ull + (std::uint64_t)k * 0xD1B54A32D192ED03ull;
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    z ^= z >> 31;
+    return (unsigned)(z ^ (z >> 32));
+}
 
 // FNV-1a 64 of a file's bytes: identifies a source checkpoint in a manifest
 // (not a cryptographic hash; tools add SHA-256 where they need one).
@@ -159,7 +176,8 @@ inline bool apply(World& world, const Options& o, const std::string& yText,
     }
 
     const int K = (o.count < 0) ? (int)pool.size() : o.count;
-    RandomGen tr(o.seed);
+    RandomGen pickRng(streamSeed(o.seed, 1)), placeRng(streamSeed(o.seed, 2)),
+              genomeRng(streamSeed(o.seed, 3)), seedRng(streamSeed(o.seed, 4));
 
     // 1. which of Y's predators (indices into pool)
     std::vector<int> picks;
@@ -170,13 +188,13 @@ inline bool apply(World& world, const Options& o, const std::string& yText,
             for (int i = 0; i < np; ++i) idx[(size_t)i] = i;
             if (K < np) {   // partial Fisher-Yates; all of Y => Y's order, no draws
                 for (int i = 0; i < K; ++i) {
-                    const int j = i + (int)tr.uint((uint32_t)(np - 1 - i));
+                    const int j = i + (int)pickRng.uint((uint32_t)(np - 1 - i));
                     std::swap(idx[(size_t)i], idx[(size_t)j]);
                 }
             }
             picks.assign(idx.begin(), idx.begin() + K);
         } else {
-            for (int i = 0; i < K; ++i) picks.push_back((int)tr.uint((uint32_t)(np - 1)));
+            for (int i = 0; i < K; ++i) picks.push_back((int)pickRng.uint((uint32_t)(np - 1)));
         }
     }
 
@@ -237,7 +255,7 @@ inline bool apply(World& world, const Options& o, const std::string& yText,
     for (int i = 0; i < K; ++i) {
         Predator p;
         if (fromRandom) {
-            p.genome = predbrain::founderGenome(cfg, tr);
+            p.genome = predbrain::founderGenome(cfg, genomeRng);
         } else {
             const Predator& src = pool[(size_t)picks[(size_t)i]];
             p.genome = src.genome;
@@ -247,8 +265,8 @@ inline bool apply(World& world, const Options& o, const std::string& yText,
             p.buddingFactor = src.buddingFactor;
             p.sourceId = src.id;
         }
-        p.pos = {tr.range(10.0f, W - 10.0f), tr.range(10.0f, H - 10.0f)};
-        const float a = tr.range(0.0f, 6.2832f);
+        p.pos = {placeRng.range(10.0f, W - 10.0f), placeRng.range(10.0f, H - 10.0f)};
+        const float a = placeRng.range(0.0f, 6.2832f);
         p.vel = {evomath::cosf(a), evomath::sinf(a)};
         p.energy = cfg.predatorNewbornEnergy;   // the spawn energy
         p.age = 0.0f;
@@ -259,7 +277,7 @@ inline bool apply(World& world, const Options& o, const std::string& yText,
         p.speed = predbrain::topSpeed(p, cfg);
         added.push_back(std::move(p));
     }
-    if (!xBrain) world.predRng_.seed(tr.uint());
+    if (!xBrain) world.predRng_.seed(seedRng.uint());
     world.predators = std::move(added);
     world.predLog_.clear();
     world.predTally_ = WorldCommon::PredatorTally{};
@@ -311,6 +329,14 @@ inline bool apply(World& world, const Options& o, const std::string& yText,
     w.endArray();
     w.endObject();
     w.field("assay", o.assay);
+    w.field("assayRules", o.assay == "frozen"
+        ? "economy accounting on; no deaths, no buds: at the budding threshold a virtual bud (pays the newborn "
+          "energy, no child, counted as virtual_buds in predators.csv and per predator as virtualBuds in "
+          "checkpoints); age wraps at the max age; energy floored at 0; score from predators.csv"
+        : o.assay == "frozen-newborn"
+        ? "economy off: immortal, fixed; ENERGY and AGE read 0 throughout; score from predators.csv"
+        : "the prey world's config: predators starve, age out and bud; score from predators.csv");
+    w.field("streams", "streamSeed(seed, k): 1 selection, 2 placement, 3 founder genomes, 4 the predator stream");
     w.key("stageC"); w.beginObject();   // every Stage C key of the arena, with its source
     auto keyBlock = [&](const char* k, auto value) {
         std::string src = "?";

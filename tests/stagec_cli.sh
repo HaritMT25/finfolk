@@ -9,13 +9,16 @@
 #   1. the lineage log across a resume: segment 1 cut at the checkpoint frame,
 #      then segment 2 without its L rows, equals the uninterrupted log; the log
 #      is flushed at every checkpoint write; segment 2 opens with one L row per
-#      live predator;
+#      live predator; predators.csv and pwiring.csv rows carry the world's
+#      frame, so a resumed segment's rows continue the uninterrupted run's; a
+#      lineage log that cannot be written stops the run before any checkpoint;
 #   2. a lineage log is never overwritten (the run refuses, the old log stays);
 #   3. Stage C flags on a version-1 resume are refused (exit 1), not ignored;
 #   4. --transplant-count below -1, or not a number, is refused;
 #   5. an arena's first run opens its log with T rows (source = the source id),
 #      a resume of that run with L rows; the default frozen assay keeps the
-#      predator count and lets energy move.
+#      predator count and lets energy and age move, and its virtual-bud
+#      columns agree with the log's V rows.
 set -u
 BIN=${1:?usage: stagec_cli.sh EVO_BOIDS WORKDIR}
 W=${2:?usage: stagec_cli.sh EVO_BOIDS WORKDIR}
@@ -26,7 +29,7 @@ STAGEC="--population 200 --predators 6 --predator-economy --predator-brain --pre
         --predator-max-pop 12 --predator-min-pop 2 --predator-max-age 15 --predator-log"
 
 # 1. resume and stitch (checkpoint at 1700, not a multiple of --log-every)
-run --headless 3000 --seed 5 $STAGEC --name full
+run --headless 3000 --seed 5 $STAGEC --name full --wiring-log
 run --headless 1700 --seed 5 $STAGEC --name seg1 --save-checkpoint seg1.json
 run --headless 1300 --load-checkpoint seg1.json --predator-log --name seg2
 F=1700
@@ -39,6 +42,33 @@ NPRED=$(python3 -c "import json; print(json.load(open('seg1.json'))['predators']
 [ "$(awk -F, 'NR > 1 && $2 == "L" && $1 == 1700' runs/seg2.predlog.csv | wc -l)" = "$NPRED" ] ||
     fail "segment 2 does not open with one L row per live predator ($NPRED)"
 grep -q ',B,' runs/full.predlog.csv || fail "no buds in the test run (the test would prove nothing)"
+
+# predators.csv and pwiring.csv rows carry the world's frame, so a resumed
+# segment's rows continue the uninterrupted run's (samples fall every --log-every
+# steps of each run, as for the main CSV, so a checkpoint at a multiple of it
+# samples at the same frames)
+run --headless 1500 --seed 5 $STAGEC --name pseg1 --wiring-log --save-checkpoint pseg1.json
+run --headless 1500 --load-checkpoint pseg1.json --name pseg2 --wiring-log
+for kind in predators pwiring; do
+    cp runs/pseg1.$kind.csv pstitched.csv
+    tail -n +2 runs/pseg2.$kind.csv >> pstitched.csv
+    cmp -s pstitched.csv runs/full.$kind.csv || fail "the stitched $kind.csv differs from the uninterrupted one"
+done
+[ "$(awk -F, 'NR == 2 {print $1}' runs/pseg2.predators.csv)" = 1750 ] || fail "a resumed predators.csv does not start at its frame"
+
+# a lineage log that cannot be written is fatal, before any checkpoint
+mkdir -p ro/runs && chmod 555 ro/runs
+if [ -w ro/runs ]; then
+    echo "stagec_cli: note: running as root, the unwritable-log check is skipped"
+else
+    if (cd ro && "$BIN" --no-render --headless 300 --seed 5 $STAGEC --save-checkpoint ../ro_ck.json \
+            > /dev/null 2> ../ro_err.txt); then
+        fail "a run with an unwritable lineage log succeeded"
+    fi
+    grep -q 'lineage log' ro_err.txt || fail "the unwritable-log error does not name the lineage log"
+    [ -e ro_ck.json ] && fail "a run that could not write its lineage log published a checkpoint"
+fi
+chmod 755 ro/runs
 
 # the log is on disk at a checkpoint: the periodic checkpoint's frame is covered
 run --headless 1000 --seed 6 $STAGEC --name per --checkpoint-every 400
@@ -81,11 +111,16 @@ run --headless 600 --load-checkpoint arena.json --reseed-after-load 1 --predator
 grep -q '"arena":true' a1.json && fail "a checkpoint of the arena's run is still marked as a fresh arena"
 run --headless 100 --load-checkpoint a1.json --predator-log --name a2
 [ "$(awk -F, 'NR > 1 && $2 == "L"' runs/a2.predlog.csv | wc -l)" = 4 ] || fail "a resumed arena run does not open with L rows"
-python3 - runs/a1.predators.csv <<'PY' || fail "the frozen assay: the count moved or the energy did not"
+python3 - runs/a1.predators.csv runs/a1.predlog.csv <<'PY' || fail "the frozen assay: count, energy, age or virtual buds"
 import csv, sys
 rows = list(csv.DictReader(open(sys.argv[1])))
 assert all(int(r["predator_pop"]) == 4 for r in rows), "count moved"
 assert all(int(r["births_interval"]) == 0 and int(r["deaths_starv_interval"]) == 0 for r in rows), "births/deaths"
 assert len({r["energy_mean"] for r in rows}) > 1, "energy pinned"
+assert len({r["age_mean"] for r in rows}) > 1, "age pinned"
+# the virtual-bud readout: the interval column sums to the log's V rows
+v = sum(1 for e in csv.DictReader(open(sys.argv[2])) if e["event"] == "V")
+assert sum(int(r["virtual_buds_interval"]) for r in rows) == v, "virtual_buds_interval vs V rows"
+assert abs(float(rows[-1]["virtual_buds_mean"]) * 4 - v) < 1e-6, "virtual_buds_mean vs V rows"
 PY
 echo "stagec_cli: ok"

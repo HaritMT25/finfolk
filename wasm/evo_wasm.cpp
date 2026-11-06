@@ -893,6 +893,9 @@ EVO_EXPORT int evo_load_checkpoint(const char* json) {
     delete g_world;
     g_world = w;
     g_world->cfg.captureActivations = true;  // see evo_init
+    // A loaded arena (Stage C) is being run now, so the checkpoints this page
+    // saves are ordinary ones, as main.cpp's are (a later CLI run logs L rows).
+    g_world->arenaFresh_ = false;
     // A Turbo hand-off carries on the same run: re-baseline quietly. A file
     // load is a new run; the page then calls evo_rec_reset(1).
     recReset(*g_world, false, false);

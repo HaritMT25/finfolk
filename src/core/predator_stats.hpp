@@ -37,14 +37,20 @@ struct Row {
     double wirePrey = 0, wireRival = 0, wireSignal = 0, wireOwn = 0;
     long long deaths = 0;
     double lifeCapturesMean = 0, lifeAgeMean = 0;
+    long long virtualBuds = 0;            // the frozen assay's, this interval
+    double virtualBudsPerPredS = 0;       // ... per predator-second (a fitness readout)
+    double virtualBudsMean = 0;           // per live predator, cumulative since the arena
 };
 
+// `step` is the world's frame (as in the main CSV), so a resumed segment's rows
+// continue the uninterrupted run's.
 inline std::string header() {
     return "step,predator_pop,prey_pop,births_interval,deaths_starv_interval,deaths_age_interval,"
            "reseeds_interval,captures_interval,captures_per_pred_s,pursuit_frac,captures_per_pursuit_s,"
            "pursuit_align,speed_mean,speed_cv,top_speed_frac,energy_mean,age_mean,gen_mean,gen_max,"
            "lineages_alive,genome_len_mean,genome_dist_mean,wire_prey,wire_rival,wire_signal,wire_own,"
-           "deaths_interval,life_captures_mean,life_age_mean";
+           "deaths_interval,life_captures_mean,life_age_mean,"
+           "virtual_buds_interval,virtual_buds_per_pred_s,virtual_buds_mean";
 }
 
 // A predator's genome folded onto its decoded (source, sink) cells, in the
@@ -89,7 +95,14 @@ inline Row sample(World& w, float dt, Last& last) {
         r.lifeCapturesMean = t.deathCaptures / (double)t.deaths;
         r.lifeAgeMean = t.deathAge / (double)t.deaths;
     }
+    r.virtualBuds = t.virtualBuds;
+    if (t.predSteps > 0) r.virtualBudsPerPredS = (double)t.virtualBuds / ((double)t.predSteps * dt);
     w.predTally_ = WorldCommon::PredatorTally{};
+    if (!ps.empty()) {
+        double vb = 0;
+        for (const Predator& p : ps) vb += p.virtualBuds;
+        r.virtualBudsMean = vb / (double)ps.size();
+    }
 
     if (!ps.empty()) {
         double e = 0, a = 0, g = 0, gl = 0;
@@ -136,16 +149,17 @@ inline Row sample(World& w, float dt, Last& last) {
     return r;
 }
 
-inline std::string row(int step, const Row& r) {
+inline std::string row(unsigned long long frame, const Row& r) {
     char buf[1024];
     std::snprintf(buf, sizeof buf,
-                  "%d,%d,%d,%lld,%lld,%lld,%lld,%lld,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%lld,"
-                  "%d,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%lld,%.6g,%.6g",
-                  step, r.pop, r.preyPop, r.births, r.deathsStarv, r.deathsAge, r.reseeds, r.captures,
+                  "%llu,%d,%d,%lld,%lld,%lld,%lld,%lld,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%lld,"
+                  "%d,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%lld,%.6g,%.6g,%lld,%.6g,%.6g",
+                  frame, r.pop, r.preyPop, r.births, r.deathsStarv, r.deathsAge, r.reseeds, r.captures,
                   r.capturesPerPredS, r.pursuitFrac, r.capturesPerPursuitS, r.pursuitAlign, r.speedMean,
                   r.speedCv, r.topSpeedFrac, r.energyMean, r.ageMean, r.genMean, r.genMax, r.lineages,
                   r.genomeLenMean, r.genomeDistMean, r.wirePrey, r.wireRival, r.wireSignal, r.wireOwn,
-                  r.deaths, r.lifeCapturesMean, r.lifeAgeMean);
+                  r.deaths, r.lifeCapturesMean, r.lifeAgeMean, r.virtualBuds, r.virtualBudsPerPredS,
+                  r.virtualBudsMean);
     return buf;
 }
 
@@ -155,14 +169,14 @@ inline std::string wiringHeader() {
     for (int s = 0; s < NUM_PRED_SENSES; ++s) { h += ','; h += kPredSenseNames[s]; }
     return h;
 }
-inline std::string wiringRow(int step, const World& w) {
+inline std::string wiringRow(unsigned long long frame, const World& w) {
     long counts[NUM_PRED_SENSES] = {};
     for (const Predator& p : w.predators) {
         bool used[NUM_PRED_SENSES];
         predbrain::usedSensors(p.nnet, used);
         for (int s = 0; s < NUM_PRED_SENSES; ++s) counts[s] += used[s];
     }
-    std::string out = std::to_string(step);
+    std::string out = std::to_string(frame);
     char buf[32];
     for (int s = 0; s < NUM_PRED_SENSES; ++s) {
         std::snprintf(buf, sizeof buf, ",%.6g",
@@ -173,10 +187,10 @@ inline std::string wiringRow(int step, const World& w) {
 }
 
 // <stem>.predlog.csv: the lineage log (cfg.predatorLog), drained at each call.
-// Events: F founder (init), R floor refill, B bud, S starved, A aged; and at the
-// start of a segment that began from a checkpoint, L (loaded) or T
-// (transplanted; `source` = its id in the source checkpoint, another id
-// namespace) for every live predator.
+// Events: F founder (init), R floor refill, B bud, S starved, A aged, V the
+// frozen assay's virtual bud; and at the start of a segment that began from a
+// checkpoint, L (loaded) or T (transplanted; `source` = its id in the source
+// checkpoint, another id namespace) for every live predator.
 inline std::string logHeader() {
     return "frame,event,id,parent,lineage,generation,age,captures,energy,genome_len,speed_factor,budding_factor,source";
 }
@@ -189,11 +203,16 @@ inline std::string logRow(const WorldCommon::PredatorEvent& e) {
                   (double)e.buddingFactor, (unsigned long long)e.source);
     return buf;
 }
-inline std::size_t drainLog(World& w, std::FILE* f) {
-    const std::size_t n = w.predLog_.size();
-    for (const auto& e : w.predLog_) std::fprintf(f, "%s\n", logRow(e).c_str());
+// Write the buffered events and flush them to the file. Returns false on any
+// write or flush error, and then KEEPS the events (the caller must stop: a
+// lineage log with a gap is not a phylogeny), else clears them.
+inline bool drainLog(World& w, std::FILE* f) {
+    if (!f) return false;
+    for (const auto& e : w.predLog_)
+        if (std::fprintf(f, "%s\n", logRow(e).c_str()) < 0) return false;
+    if (std::fflush(f) != 0 || std::ferror(f)) return false;
     w.predLog_.clear();
-    return n;
+    return true;
 }
 
 }  // namespace predstats
