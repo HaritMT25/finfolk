@@ -40,6 +40,10 @@
 //            needs native==wasm proven on its own path.
 //   --pred-count N / --pred-meal F  override --rich's 4 predators / absorb meal,
 //            to reach a regime where the floor or the cap actually bites.
+//   --pred-brain / --pred-noecon / --pred-primer / --pred-max-age F  (v0.27.0)
+//            Stage C neural predators (their own random stream, predRng_), the
+//            frozen mode (brains without the economy), the pursuit primer, and a
+//            predator lifespan for turnover under a cap.
 //   --trace  print "frame fingerprint" to stderr every N steps (divergence bisection)
 #include <cstdio>
 #include <cstdlib>
@@ -90,6 +94,15 @@ static uint64_t fingerprint(const World& w) {
             mix(&p.speedFactor, sizeof p.speedFactor);
             mix(&p.buddingFactor, sizeof p.buddingFactor);
         }
+        // v0.27.0 Stage C brains, by the same rule: only with the brain on, so
+        // every brain-off trace is the 0.26.0 trace line for line.
+        if (w.cfg.predatorBrain) {
+            mix(&p.speed, sizeof p.speed);
+            mix(&p.energy, sizeof p.energy);
+            mix(&p.id, sizeof p.id);
+            for (const Gene& g : p.genome) { const int16_t wt = g.weight; mix(&wt, sizeof wt); }
+            for (const auto& nr : p.nnet.neurons) mix(&nr.output, sizeof nr.output);
+        }
     }
     if (!w.signals.data().empty())
         mix(w.signals.data().data(), w.signals.data().size());
@@ -118,6 +131,8 @@ int main(int argc, char** argv) {
     float reproSoftWidth = 0.0f, reproGracePeriod = 0.0f;
     int predFloor = 0, predCap = 0, predCount = -1;
     bool predInherit = false;
+    bool predBrain = false, predNoEcon = false, predPrimer = false;
+    float predMaxAge = 0.0f;
     float predMeal = -2.0f;   // < -1.5 => leave the config default alone
     const char* engineVersion = "parity";
     long traceEvery = 0;
@@ -141,6 +156,11 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--pred-meal") && i + 1 < argc)
             predMeal = (float)std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "--pred-inherit")) predInherit = true;
+        else if (!std::strcmp(argv[i], "--pred-brain")) predBrain = true;
+        else if (!std::strcmp(argv[i], "--pred-noecon")) predNoEcon = true;
+        else if (!std::strcmp(argv[i], "--pred-primer")) predPrimer = true;
+        else if (!std::strcmp(argv[i], "--pred-max-age") && i + 1 < argc)
+            predMaxAge = (float)std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "--engine-version") && i + 1 < argc) engineVersion = argv[++i];
         else if (!std::strcmp(argv[i], "--trace") && i + 1 < argc) traceEvery = std::strtol(argv[++i], nullptr, 10);
         else { std::fprintf(stderr, "unknown arg %s\n", argv[i]); return 2; }
@@ -173,6 +193,10 @@ int main(int argc, char** argv) {
     world.cfg.predatorInheritance   = predInherit;   // predatorTraitMutation stays at 0.1
     if (predCount >= 0) world.cfg.predatorCount = predCount;
     if (predMeal > -1.5f) world.cfg.predatorMeal = predMeal;
+    if (predBrain) world.cfg.predatorBrain = true;           // Stage C (v0.27.0)
+    if (predNoEcon) world.cfg.predatorEconomy = false;       // the frozen mode
+    if (predPrimer) world.cfg.predatorPrimer = true;
+    if (predMaxAge > 0.0f) world.cfg.predatorMaxAge = predMaxAge;
     world.init(1920, 1080, 300);
 
     const auto t0 = std::chrono::steady_clock::now();

@@ -57,6 +57,17 @@ namespace kernel {
 
 // ---- Life cycle -------------------------------------------------------------
 
+// The per-birth mutation rate picked by one uniform draw u: a heavy-tailed
+// lottery (3 % of births mutate at 0.5, 7 % at 0.05, 20 % at 0.01, the rest at
+// 0.002). One definition for the prey (inheritGenome below) and the Stage C
+// predators' buds (predator_brain.hpp). No draws.
+inline float birthMutationRate(float u) {
+    if (u < 0.03f) return 0.5f;
+    if (u < 0.10f) return 0.05f;
+    if (u < 0.30f) return 0.01f;
+    return 0.002f;
+}
+
 // A child's genome: crossover of the two source records, then ONE rng.unit()
 // that picks the mutation rate, then the mutation draws. Called before the
 // world places the child, as makeChild always did. Draws (serial phase).
@@ -64,12 +75,7 @@ inline void inheritGenome(AgentCore& child, const AgentCore& p1, const AgentCore
                           int minLen, int maxLen, float mutMultiplier) {
     child.genome = crossover(p1.genome, p2.genome);
 
-    float mut = rng.unit();
-    float rate;
-    if (mut < 0.03f) rate = 0.5f;
-    else if (mut < 0.10f) rate = 0.05f;
-    else if (mut < 0.30f) rate = 0.01f;
-    else rate = 0.002f;
+    const float rate = birthMutationRate(rng.unit());
     mutateGenome(child.genome, rate * mutMultiplier, minLen, maxLen);
 }
 

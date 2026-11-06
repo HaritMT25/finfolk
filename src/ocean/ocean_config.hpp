@@ -375,7 +375,8 @@ inline bool isOceanIntKey(const std::string& k) {
 // kSimConfigBoolKeys must list exactly readConfig's boolOr keys, and
 // kOceanBoolKeys readOceanConfig's readBool keys: wasm/ocean_parity.sh checks both.
 inline constexpr const char* kSimConfigBoolKeys[] = {"toroidal", "bodyModel", "triangularMotion", "foodDrift",
-                                                     "predatorEconomy", "predatorInheritance", "fastTanh"};
+                                                     "predatorEconomy", "predatorInheritance", "predatorBrain",
+                                                     "predatorPrimer", "fastTanh"};
 inline constexpr const char* kOceanBoolKeys[] = {"deepCurrent", "lightEnabled", "depthCostScaled",
                                                  "sizeDrift", "sizeFight", "mouthGate", "walls"};
 inline bool isSimConfigBoolKey(const std::string& k) {
@@ -665,9 +666,14 @@ inline std::string oceanSimConfigError(const SimConfig& c) {
         {"interactCooldown", c.interactCooldown}, {"minSpeed", c.minSpeed},
         {"mutationMultiplier", c.mutationMultiplier}, {"predatorCooldown", c.predatorCooldown},
         {"predatorMaxAge", c.predatorMaxAge}, {"predatorTraitMutation", c.predatorTraitMutation},
+        {"predatorMutation", c.predatorMutation}, {"predatorTurnRate", c.predatorTurnRate},
+        {"predatorMinSpeed", c.predatorMinSpeed},
     };
     for (const auto& e : finite)
         if (!std::isfinite(e.v)) return std::string(e.name) + " must be finite";
+    // Stage C (v0.27.0) is in Classic only; the Ocean's predators are scripted.
+    // Refused, not ignored, so a page or harness that asks for it hears so.
+    if (c.predatorBrain) return "predatorBrain (neural predators) is not in the Ocean yet";
     // Counts that size allocations (founders added each step up to the floor,
     // predators, food-patch centres): generous ceilings against resource
     // exhaustion (an int key may hold up to 2^31 - 1).

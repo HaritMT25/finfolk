@@ -94,6 +94,13 @@ private:
 // break, documented in the research log).
 class RandomGen {
 public:
+    // The global `rng` below starts from std::random_device (main and the
+    // modules seed it). A second stream that must be reproducible from its
+    // first use - the predator brains' (WorldCommon::predRng_) - starts from a
+    // fixed seed instead, so a World's construction reads no entropy.
+    RandomGen() = default;
+    explicit RandomGen(unsigned s) : engine_(s) {}
+
     void seed(unsigned s) { engine_.seed(s); }
     void seed() { engine_.seed(std::random_device{}()); }
 

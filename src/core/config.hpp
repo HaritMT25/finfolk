@@ -1,4 +1,5 @@
 #pragma once
+#include <cmath>
 #include <string>
 #include <sstream>
 #include "genome.hpp"  // GENOME_* defaults — single source of truth for bounds
@@ -272,6 +273,27 @@ struct SimConfig {
     float predatorTraitMutation = 0.10f;  // uniform half-width per trait per bud (the
                                           // --body-mutation default)
 
+    // --- Stage C: neural predators (v0.27.0; OFF by default => a run writes and
+    // computes exactly what 0.26.0 did — no CSV column, no sidecar line, no
+    // checkpoint key) ---
+    // predatorBrain replaces the scripted hunt with a network built from each
+    // predator's genome (predator_brain.hpp: 21 inputs, TURN and THRUST out).
+    // With predatorEconomy a bud inherits its parent's genome with a mutation, so
+    // the predators evolve; without it they are immortal, fixed-count neural
+    // hunters that never bud (the "frozen" mode a time-shift assay runs in).
+    // Capture, the cooldown and the meal are Stage B's. A floor refill is a
+    // random-genome founder. Its draws (genomes, mutation, the RANDOM input) come
+    // from WorldCommon::predRng_; every draw Stage B made stays where it was.
+    bool  predatorBrain    = false;
+    float predatorMutation = 1.0f;   // multiplies the per-bud mutation rate (the prey's
+                                     // rate lottery, kernel::inheritGenome); >= 0
+    float predatorTurnRate = 4.0f;   // rad/s at |TURN| = 1 (the prey's maxTurnRate default)
+    float predatorMinSpeed = 0.0f;   // THRUST's floor; 0 lets a predator stop (ambush).
+                                     // The ceiling is predatorSpeed * speedFactor.
+    bool  predatorPrimer   = false;  // founders' genomes start with two "pursuit primer"
+                                     // genes (PREY_LR -> TURN, PREY_PROX -> THRUST); off =
+                                     // random genomes (the default)
+
     // --- Inspection & analysis (visual/diagnostic; do not affect dynamics) ---
     // Capture each creature's last sensor inputs / action outputs every step so a
     // click-selected creature's neural net can be drawn "firing live". Off by
@@ -293,6 +315,10 @@ struct SimConfig {
                                   // pairing is not a group)
     bool reproLog        = false; // write <stem>.births.csv at end of run (headless)
     int  reproLogMax     = 20000; // max event records kept in RAM (decimated above this)
+    // Stage C: stream every predator founding, bud, refill and death to
+    // <stem>.predlog.csv (headless, needs predatorBrain). Never decimated: a
+    // decimated tree is not a phylogeny. Not world state, so not serialized.
+    bool predatorLog     = false;
 
     // Death-cluster map: log a 2-D projection of each dead creature's network and
     // write <name>.deaths.csv + <name>.cluster.svg at end of run. Off by default
@@ -412,6 +438,29 @@ struct SimConfig {
           << " reproMinCluster="  << reproMinCluster
           << " reproLog="         << (reproLog ? "on" : "off")
           << " reproLogMax="      << reproLogMax;
+        // Stage C, only when on: an off run's sidecar reads as 0.26.0's did.
+        if (predatorBrain)
+            o << "\npredatorBrain=on (neural predators)"
+              << " predatorMutation=" << predatorMutation
+              << " predatorTurnRate=" << predatorTurnRate
+              << " predatorMinSpeed=" << predatorMinSpeed
+              << " predatorPrimer="   << (predatorPrimer ? "on" : "off")
+              << " predatorLog="      << (predatorLog ? "on" : "off");
         return o.str();
     }
 };
+
+// The Stage C knobs every frontend and the checkpoint loader refuse, on the
+// terms the other mutation knobs are refused (finite and >= 0; negated tests
+// because NaN compares false to everything). Checked whatever predatorBrain
+// says, so a value is never accepted now and refused once the brain goes on.
+// nullptr when the config is fine.
+inline const char* predatorBrainConfigError(const SimConfig& c) {
+    if (!(c.predatorMutation >= 0.0f) || !std::isfinite(c.predatorMutation))
+        return "predatorMutation must be finite and >= 0";
+    if (!(c.predatorTurnRate >= 0.0f) || !std::isfinite(c.predatorTurnRate))
+        return "predatorTurnRate must be finite and >= 0";
+    if (!(c.predatorMinSpeed >= 0.0f) || !std::isfinite(c.predatorMinSpeed))
+        return "predatorMinSpeed must be finite and >= 0";
+    return nullptr;
+}

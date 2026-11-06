@@ -174,6 +174,56 @@ void runWorld(const char* tag, bool econ, int steps, int logEvery,
     std::printf("\n");
 }
 
+// Stage C (v0.27.0): neural predators with the economy, floor 2, cap 20 and a
+// 60 s lifespan (the Stage C recipe). Asserts every step: the count sits in
+// [floor, cap], every predator has a genome within the bounds and a built net,
+// its speed is finite and inside [min, top], ids are below nextPredatorId; and
+// over the run: buds happened, generations climbed, the floor's refills and the
+// births were both counted, captures happened. It does not assert coexistence
+// or evolution: those are the pilot's questions, not a smoke test's.
+void runBrain(int steps, int logEvery) {
+    rng.seed(42u);
+    World w;
+    w.cfg.minPopulation = 50;
+    w.cfg.moveCost = 0.00007f;
+    w.cfg.predatorCount = 6;
+    w.cfg.predatorEconomy = true;
+    w.cfg.predatorBrain = true;
+    w.cfg.predatorMeal = 14.0f;
+    w.cfg.predatorMinPopulation = 2;
+    w.cfg.predatorMaxPopulation = 20;
+    w.cfg.predatorMaxAge = 60.0f;
+    w.init(1920, 1080, 300);
+    std::printf("=== predator integration smoke (Stage C: neural, floor 2, cap 20, max age 60) ===\n");
+    bool inLimits = true, brainsOk = true, speedsOk = true;
+    std::uint32_t maxGen = 0;
+    for (int s = 1; s <= steps; ++s) {
+        w.update(0.016f);
+        const int n = (int)w.predators.size();
+        if (n < 2 || n > 20) inLimits = false;
+        for (const auto& p : w.predators) {
+            if (p.genome.empty() || (int)p.genome.size() > w.cfg.genomeMaxLength ||
+                p.nnet.flat.size() != p.genome.size() || p.id == 0 || p.id >= w.nextPredatorId_)
+                brainsOk = false;
+            const float top = predbrain::topSpeed(p, w.cfg);
+            if (!std::isfinite(p.speed) || p.speed < 0.0f || p.speed > top || !std::isfinite(p.energy)) speedsOk = false;
+            maxGen = std::max(maxGen, p.generation);
+        }
+        if (s % logEvery == 0)
+            std::printf("step %-8d pop %5zu pred %3d births %lld reseeds %lld kills %lld maxGen %u\n", s,
+                        w.creatures.size(), n, w.totalPredatorBirths, w.totalPredatorReseeds,
+                        w.totalDeathsPredation, maxGen);
+    }
+    check(inLimits, "Stage C: predator count stayed inside [floor 2, cap 20] every tick");
+    check(brainsOk, "Stage C: every predator had a genome in bounds, a built net and a valid id");
+    check(speedsOk, "Stage C: every predator speed stayed finite and inside [min, top]");
+    check(w.totalPredatorBirths > 0 && maxGen >= 1, "Stage C: predators budded (generations climbed)");
+    check(w.totalDeathsPredation > 0, "Stage C: captures happened");
+    check(w.totalDeaths == w.totalDeathsPredation + w.totalDeathsStarvation + w.totalDeathsAge,
+          "Stage C: prey deaths == predation + starvation + age");
+    std::printf("\n");
+}
+
 }  // namespace
 
 int main() {
@@ -184,6 +234,7 @@ int main() {
     runWorld("Stage B: energy economy",       /*econ=*/true,  steps, logEvery);
     runWorld("Stage B + floor 3, ceiling 20, inheritance", /*econ=*/true, steps, logEvery,
              /*predFloor=*/3, /*predCap=*/20, /*inherit=*/true);
+    runBrain(steps, logEvery);
 
     if (g_fails == 0) { std::printf("SMOKE OK\n"); return 0; }
     std::printf("SMOKE FAILED (%d)\n", g_fails);

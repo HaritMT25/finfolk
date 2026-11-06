@@ -8,6 +8,8 @@
 #include <algorithm>
 #include <fstream>
 #include <filesystem>
+#include <sstream>
+#include <cstdio>
 
 #include "core/world.hpp"
 #include "core/stats.hpp"
@@ -15,6 +17,8 @@
 #include "core/wiring_log.hpp"
 #include "core/birth_log.hpp"
 #include "core/checkpoint_io.hpp"
+#include "core/predator_stats.hpp"
+#include "core/transplant.hpp"
 #include "render/sfml_renderer.hpp"  // the only translation unit pulling SFML
 
 // Set by CMake (project version). Falls back to "dev" for ad-hoc builds.
@@ -128,7 +132,33 @@ void printUsage(const char* prog) {
         "                            0=no cap (default 0)\n"
         "  --predator-inherit        [economy] buds inherit the parent's speed and budding\n"
         "                            threshold (x0.5..x2) with a mutation (default off)\n"
-        "  --predator-trait-mutation F  uniform mutation half-width per trait per bud (default 0.1)\n\n"
+        "  --predator-trait-mutation F  uniform mutation half-width per trait per bud (default 0.1)\n"
+        "Neural predators (Stage C; opt-in, off => every output is v0.26.0's):\n"
+        "  --predator-brain          the hunt is a network built from each predator's genome (21\n"
+        "                            inputs, TURN + THRUST out). With --predator-economy a bud\n"
+        "                            inherits its parent's genome with a mutation, so predators\n"
+        "                            evolve; without it they are immortal and fixed in number\n"
+        "                            (the frozen mode a time-shift assay runs in). Recipe for an\n"
+        "                            evolving run: --predator-economy --predator-max-pop N\n"
+        "                            --predator-min-pop M --predator-max-age 120 (without a max\n"
+        "                            age, capped predators never die or bud and stop evolving)\n"
+        "  --predator-mutation F     multiplies the per-bud mutation rate, F >= 0 (default 1)\n"
+        "  --predator-turn-rate F    rad/s at full TURN (default 4)\n"
+        "  --predator-min-speed F    THRUST's floor; 0 lets a predator stop (default 0)\n"
+        "  --predator-primer         founders start with two pursuit genes (PREY_LR -> TURN,\n"
+        "                            PREY_PROX -> THRUST); default off = random genomes\n"
+        "  --predator-log            stream every predator founding/bud/death to <name>.predlog.csv\n"
+        "  (with the brain on, a CSV run also writes <name>.predators.csv every --log-every)\n"
+        "Transplant (Stage C time-shift assays; needs --load-checkpoint X and --transplant-out):\n"
+        "  --predators-from Y|random  replace X's predators with K of checkpoint Y's (their genomes,\n"
+        "                            lineages and traits; everything else reset) or K random founders\n"
+        "  --transplant-count K      how many (default: all of Y's; required with 'random')\n"
+        "  --transplant-seed S       the transplant's own stream: sample, placement (default 1)\n"
+        "  --assay frozen|live       frozen (default): economy off, no floor/cap, prey --min-pop 0;\n"
+        "                            live: X's config as it is\n"
+        "  --transplant-allow-mismatch  accept X and Y with different predator physics (X's stand)\n"
+        "  --transplant-out FILE     write the arena checkpoint (+ FILE's .manifest.json) and exit;\n"
+        "                            run the assay with --load-checkpoint FILE --reseed-after-load R\n\n"
         "Analysis / inspection:\n"
         "  --cluster-map             at end of run, write <name>.deaths.csv + <name>.cluster.svg\n"
         "                            (a 2-D projection of each dead creature's network)\n"
@@ -191,6 +221,10 @@ int main(int argc, char** argv) {
     // the engine or the wasm module sees changes.
     bool        haveReseedAfterLoad = false;
     unsigned    reseedAfterLoad     = 0;
+    // Stage C transplant (CLI-only, like --reseed-after-load).
+    transplant::Options transplantOpt;
+    bool        haveTransplantSeed  = false;
+    std::string transplantOut;
 
     int       initialPopulation = 300;  // starting creature count
     SimConfig cfg;                       // all other tunable parameters
@@ -286,6 +320,19 @@ int main(int argc, char** argv) {
         else if (arg == "--predator-max-pop")       cfg.predatorMaxPopulation = std::atoi(next("--predator-max-pop"));
         else if (arg == "--predator-inherit")       cfg.predatorInheritance = true;
         else if (arg == "--predator-trait-mutation")cfg.predatorTraitMutation = std::atof(next("--predator-trait-mutation"));
+        // --- neural predators (Stage C) + the transplant ---
+        else if (arg == "--predator-brain")         cfg.predatorBrain       = true;
+        else if (arg == "--predator-mutation")      cfg.predatorMutation    = std::atof(next("--predator-mutation"));
+        else if (arg == "--predator-turn-rate")     cfg.predatorTurnRate    = std::atof(next("--predator-turn-rate"));
+        else if (arg == "--predator-min-speed")     cfg.predatorMinSpeed    = std::atof(next("--predator-min-speed"));
+        else if (arg == "--predator-primer")        cfg.predatorPrimer      = true;
+        else if (arg == "--predator-log")           cfg.predatorLog         = true;
+        else if (arg == "--predators-from")         transplantOpt.predatorsFrom = next("--predators-from");
+        else if (arg == "--transplant-count")       transplantOpt.count = std::atoi(next("--transplant-count"));
+        else if (arg == "--transplant-seed")      { transplantOpt.seed = static_cast<unsigned>(std::strtoul(next("--transplant-seed"), nullptr, 10)); haveTransplantSeed = true; }
+        else if (arg == "--assay")                  transplantOpt.assay = next("--assay");
+        else if (arg == "--transplant-allow-mismatch") transplantOpt.allowMismatch = true;
+        else if (arg == "--transplant-out")         transplantOut = next("--transplant-out");
         else if (arg == "--cluster-map")            cfg.clusterMap          = true;
         else if (arg == "--cluster-max")             cfg.clusterMax          = std::atoi(next("--cluster-max"));
         else if (arg == "--cluster-epoch")           cfg.clusterEpoch        = std::max(1, std::atoi(next("--cluster-epoch")));
@@ -372,6 +419,36 @@ int main(int argc, char** argv) {
                      " --predator-economy; ignored.\n";
     if (cfg.predatorMaxPopulation > 0 && cfg.predatorMinPopulation > cfg.predatorMaxPopulation)
         std::cerr << "Note: --predator-min-pop is above --predator-max-pop; the floor wins.\n";
+    // Stage C. The knobs are refused on the terms of the other mutation knobs.
+    if (const char* why = predatorBrainConfigError(cfg)) {
+        std::cerr << "Error: " << why << ".\n";
+        return 1;
+    }
+    if (cfg.predatorBrain && loadCheckpoint.empty()) {
+        if (!cfg.predatorEconomy)
+            std::cerr << "Note: --predator-brain without --predator-economy: immortal, fixed-count neural\n"
+                         "      predators that never bud (the frozen mode); nothing evolves.\n";
+        else if (cfg.predatorMaxPopulation > 0 && !(cfg.predatorMaxAge > 0.0f))
+            std::cerr << "Warning: --predator-brain with --predator-max-pop and no --predator-max-age:\n"
+                         "      predators at the cap neither die nor bud, so evolution stops there.\n"
+                         "      The Stage C recipe adds --predator-max-age (e.g. 120).\n";
+    }
+    if ((cfg.predatorPrimer || cfg.predatorLog) && !cfg.predatorBrain && transplantOpt.predatorsFrom.empty() &&
+        loadCheckpoint.empty())
+        std::cerr << "Note: --predator-primer and --predator-log need --predator-brain; ignored.\n";
+    const bool transplantMode = !transplantOpt.predatorsFrom.empty() || !transplantOut.empty();
+    if (transplantMode) {
+        if (loadCheckpoint.empty() || transplantOpt.predatorsFrom.empty() || transplantOut.empty()) {
+            std::cerr << "Error: a transplant needs --load-checkpoint X, --predators-from Y|random and"
+                         " --transplant-out FILE.\n";
+            return 1;
+        }
+        if (headlessSteps > 0 || haveReseedAfterLoad) {
+            std::cerr << "Error: --transplant-out writes the arena and exits; run the assay as a separate\n"
+                         "       --load-checkpoint ARENA --reseed-after-load R --headless N run.\n";
+            return 1;
+        }
+    }
     // A NEGATIVE soft width or grace period is not an error — like
     // --repro-max-distance, anything <= 0 means off. Non-finite is different:
     // std::atof parses "nan" and "inf", and both silently inverts the soft
@@ -446,8 +523,52 @@ int main(int argc, char** argv) {
         // world is exactly the checkpoint's; only the random stream from here
         // on is S's, which is what makes replicate forks of one state differ.
         if (haveReseedAfterLoad) {
-            rng.seed(reseedAfterLoad);
+            // rng.seed(S), then (brain worlds only) the predators' stream from
+            // one draw of it (WorldCommon::reseedStreams).
+            world.reseedStreams(reseedAfterLoad);
             std::cout << "Reseeded the rng after the load: " << reseedAfterLoad << "\n";
+        }
+        // Stage C transplant: the loaded world is X; write the arena and stop.
+        if (transplantMode) {
+            std::string yText;
+            if (transplantOpt.predatorsFrom != "random") {
+                std::ifstream yf(transplantOpt.predatorsFrom, std::ios::binary);
+                if (!yf) {
+                    std::cerr << "!! cannot read '" << transplantOpt.predatorsFrom << "'\n";
+                    return 1;
+                }
+                std::ostringstream ss;
+                ss << yf.rdbuf();
+                yText = ss.str();
+            }
+            transplantOpt.preyPath = loadCheckpoint;
+            std::string manifest, err;
+            if (!transplant::apply(world, transplantOpt, yText, manifest, err)) {
+                std::cerr << "!! transplant failed: " << err << "\n";
+                return 1;
+            }
+            const auto parent = std::filesystem::path(transplantOut).parent_path();
+            if (!parent.empty()) std::filesystem::create_directories(parent);
+            if (!checkpoint::save(world, transplantOut, EVO_VERSION, err)) {
+                std::cerr << "!! cannot write the arena: " << err << "\n";
+                return 1;
+            }
+            std::string mpath = transplantOut;
+            if (mpath.size() > 5 && mpath.compare(mpath.size() - 5, 5, ".json") == 0) mpath.resize(mpath.size() - 5);
+            mpath += ".manifest.json";
+            {
+                std::ofstream mf(mpath, std::ios::binary);
+                if (!(mf << manifest)) {
+                    std::cerr << "!! cannot write the manifest '" << mpath << "'\n";
+                    return 1;
+                }
+            }
+            std::cout << "Arena " << transplantOut << ": " << world.creatures.size() << " prey (frame "
+                      << world.frame << ") + " << world.predators.size() << " predators from "
+                      << transplantOpt.predatorsFrom << ", assay " << transplantOpt.assay
+                      << ", transplant seed " << transplantOpt.seed
+                      << (haveTransplantSeed ? "" : " (default)") << "; manifest " << mpath << "\n";
+            return 0;
         }
 #ifndef EVO_DETERMINISTIC
         std::cerr << "Note: this is a multi-threaded build, so the resumed run will NOT reproduce\n"
@@ -513,6 +634,46 @@ int main(int argc, char** argv) {
             if (wp.has_parent_path()) std::filesystem::create_directories(wp.parent_path());
             wiringCsv.open(wpath);
             if (wiringCsv) { wiringCsv << wiring::header() << "\n"; wiringCsv.flush(); }
+        }
+
+        // Stage C outputs (brain on only; each its own file, so the metrics CSV
+        // keeps one schema): per-interval predator metrics next to the CSV, the
+        // predator wiring next to the wiring log, the streamed lineage log.
+        const bool brain = world.cfg.predatorBrain;
+        std::ofstream predCsv, predWiring;
+        std::FILE* predLog = nullptr;
+        predstats::Last predLast;
+        predLast.births = world.totalPredatorBirths; predLast.starv = world.totalPredatorDeathsStarvation;
+        predLast.age = world.totalPredatorDeathsAge; predLast.reseeds = world.totalPredatorReseeds;
+        if (brain) {
+            auto openNext = [&](const std::string& path) {
+                const std::filesystem::path pp(path);
+                if (pp.has_parent_path()) std::filesystem::create_directories(pp.parent_path());
+            };
+            if (!csvPath.empty()) {
+                const std::string ppath = clusterStem + ".predators.csv";
+                openNext(ppath);
+                predCsv.open(ppath);
+                if (predCsv) { predCsv << predstats::header() << "\n"; predCsv.flush(); }
+            }
+            if (world.cfg.wiringLog) {
+                const std::string ppath = clusterStem + ".pwiring.csv";
+                openNext(ppath);
+                predWiring.open(ppath);
+                if (predWiring) { predWiring << predstats::wiringHeader() << "\n"; predWiring.flush(); }
+            }
+            if (world.cfg.predatorLog) {
+                const std::string ppath = clusterStem + ".predlog.csv";
+                openNext(ppath);
+                predLog = std::fopen(ppath.c_str(), "w");
+                if (predLog) {
+                    std::fprintf(predLog, "%s\n", predstats::logHeader().c_str());
+                    predstats::drainLog(world, predLog);   // the founders of init()
+                    std::fflush(predLog);
+                } else {
+                    std::cerr << "Could not open " << ppath << " for writing.\n";
+                }
+            }
         }
 
         auto      lastSampleTime  = startTime;
@@ -581,6 +742,20 @@ int main(int argc, char** argv) {
                     if (world.cfg.predatorInheritance)
                         std::cout << "  pSpd " << std::setprecision(2) << st.predatorSpeedFactor;
                 }
+            }
+            // Stage C (brain on only): this interval's predator readout.
+            if (brain) {
+                const predstats::Row pr = predstats::sample(world, fixedDt, predLast);
+                if (st.predatorPop > 0)
+                    std::cout << "  pGen " << std::setprecision(1) << pr.genMean
+                              << " pLen " << std::setprecision(1) << pr.genomeLenMean
+                              << " pAln " << std::setprecision(2) << pr.pursuitAlign;
+                if (predCsv.is_open()) {
+                    predCsv << predstats::row(stepsDone, pr) << "\n";
+                    if ((rowsWritten + 1) % flushEvery == 0) predCsv.flush();
+                }
+                if (predWiring.is_open()) predWiring << predstats::wiringRow(stepsDone, world) << "\n";
+                if (predLog) { predstats::drainLog(world, predLog); std::fflush(predLog); }
             }
             std::cout << "  ("     << std::setprecision(1) << elapsed << "s, "
                       << static_cast<long>(sps) << "/s)\n";
@@ -654,6 +829,16 @@ int main(int argc, char** argv) {
             wiringCsv.close();
             std::cout << "Wrote sensor-wiring log to " << clusterStem << ".wiring.csv\n";
         }
+        if (predCsv.is_open()) {
+            predCsv.close();
+            std::cout << "Wrote predator metrics to " << clusterStem << ".predators.csv\n";
+        }
+        if (predWiring.is_open()) predWiring.close();
+        if (predLog) {
+            predstats::drainLog(world, predLog);
+            std::fclose(predLog);
+            std::cout << "Wrote predator lineage log to " << clusterStem << ".predlog.csv\n";
+        }
 
         if (noRender) {
             if (world.cfg.profile) world.dumpProfile();
@@ -688,6 +873,9 @@ int main(int argc, char** argv) {
     // The live neural inspector captures per-step activations; only needed now that
     // a window is opening (headless paid nothing for it).
     world.cfg.captureActivations = true;
+    // The predator lineage log is drained only by the headless loop above.
+    world.cfg.predatorLog = false;
+    world.predLog_.clear();
 
     // --- Visual phase: drive the simulation through the renderer interface ---
     std::unique_ptr<IRenderer> renderer =

@@ -52,6 +52,11 @@
 namespace checkpoint {
 
 inline constexpr int FORMAT_VERSION = 1;
+// A world with Stage C brains (cfg.predatorBrain) is written as version 2, so
+// a 0.26 reader refuses it ("this build reads version 1") instead of resuming
+// it with scripted predators. Every other world is still written as version 1,
+// byte for byte as 0.26.0 wrote it. This build reads both.
+inline constexpr int FORMAT_VERSION_BRAIN = 2;
 inline constexpr const char* FORMAT_ID = "evo_boids.checkpoint";
 
 // Genes are bitfields, whose in-memory layout is implementation-defined, so
@@ -163,6 +168,15 @@ inline void writeConfig(jsonm::Writer& w, const SimConfig& c) {
     w.field("predatorMaxPopulation", c.predatorMaxPopulation);
     w.field("predatorInheritance", c.predatorInheritance);
     w.field("predatorTraitMutation", c.predatorTraitMutation);
+    // Stage C (v0.27.0): written only with the brain on, so a brain-off
+    // checkpoint is 0.26.0's byte for byte. Absent => off / the defaults.
+    if (c.predatorBrain) {
+        w.field("predatorBrain", c.predatorBrain);
+        w.field("predatorMutation", c.predatorMutation);
+        w.field("predatorTurnRate", c.predatorTurnRate);
+        w.field("predatorMinSpeed", c.predatorMinSpeed);
+        w.field("predatorPrimer", c.predatorPrimer);
+    }
     w.field("fastTanh", c.fastTanh);
     w.endObject();
 }
@@ -246,6 +260,14 @@ inline void readConfig(const jsonm::Value& j, SimConfig& c) {
     c.predatorMaxPopulation = o->intOr("predatorMaxPopulation", c.predatorMaxPopulation);
     c.predatorInheritance = o->boolOr("predatorInheritance", c.predatorInheritance);
     c.predatorTraitMutation = o->floatOr("predatorTraitMutation", c.predatorTraitMutation);
+    // Absent before v0.27.0 and in every brain-off checkpoint since. (A
+    // checkpoint's own format version decides whether its predators have
+    // brains; deserialize() checks the two agree.)
+    c.predatorBrain = o->boolOr("predatorBrain", c.predatorBrain);
+    c.predatorMutation = o->floatOr("predatorMutation", c.predatorMutation);
+    c.predatorTurnRate = o->floatOr("predatorTurnRate", c.predatorTurnRate);
+    c.predatorMinSpeed = o->floatOr("predatorMinSpeed", c.predatorMinSpeed);
+    c.predatorPrimer = o->boolOr("predatorPrimer", c.predatorPrimer);
     c.fastTanh = o->boolOr("fastTanh", c.fastTanh);
 }
 
@@ -255,9 +277,10 @@ inline std::string serialize(const World& world, const char* engineVersion) {
     out.reserve(1024 * 64);
     jsonm::Writer w(out);
 
+    const bool brain = world.cfg.predatorBrain;   // Stage C: version 2 + the brain fields
     w.beginObject();
     w.field("format", FORMAT_ID);
-    w.field("formatVersion", FORMAT_VERSION);
+    w.field("formatVersion", brain ? FORMAT_VERSION_BRAIN : FORMAT_VERSION);
     w.field("engineVersion", engineVersion ? engineVersion : "unknown");
     // Recorded because a resume is only bit-exact within the same numerics.
     // A checkpoint written by an FMA-contracted or OpenMP build can still be
@@ -277,6 +300,7 @@ inline std::string serialize(const World& world, const char* engineVersion) {
     w.field("height", world.height);
     w.field("frame", (unsigned long long)world.frame);
     w.field("nextId", (unsigned long long)world.nextId_);
+    if (brain) w.field("nextPredatorId", (unsigned long long)world.nextPredatorId_);
     w.endObject();
     w.newline();
 
@@ -304,6 +328,11 @@ inline std::string serialize(const World& world, const char* engineVersion) {
     // sequence and diverges immediately, even though everything else matches.
     w.field("rngState", rng.state());
     w.newline();
+    // The predators' stream (Stage C), for the same reason.
+    if (brain) {
+        w.field("predatorRngState", world.predRng_.state());
+        w.newline();
+    }
 
     writeConfig(w, world.cfg);
     w.newline();
@@ -356,6 +385,28 @@ inline std::string serialize(const World& world, const char* engineVersion) {
     w.key("speedFactor"); w.beginArray(); for (const Predator& p : world.predators) w.value(p.speedFactor); w.endArray();
     w.key("buddingFactor"); w.beginArray(); for (const Predator& p : world.predators) w.value(p.buddingFactor); w.endArray();
     w.key("generation"); w.beginArray(); for (const Predator& p : world.predators) w.value((unsigned long long)p.generation); w.endArray();
+    // Stage C brains (v0.27.0): only in a brain checkpoint (version 2), where
+    // they are required. The sensor-set version pins what the genes mean; the
+    // network is rebuilt from the genome, its recurrent outputs restored.
+    if (brain) {
+        const auto& ps = world.predators;
+        w.field("sensorSet", PRED_SENSOR_SET);
+        w.field("neuronsPerPredator", MAX_INTERNAL_NEURONS);
+        w.key("id"); w.beginArray(); for (const Predator& p : ps) w.value((unsigned long long)p.id); w.endArray();
+        w.key("lineageId"); w.beginArray(); for (const Predator& p : ps) w.value((unsigned long long)p.lineageId); w.endArray();
+        w.key("parentId"); w.beginArray(); for (const Predator& p : ps) w.value((unsigned long long)p.parentId); w.endArray();
+        w.key("speed"); w.beginArray(); for (const Predator& p : ps) w.value(p.speed); w.endArray();
+        w.key("captures"); w.beginArray(); for (const Predator& p : ps) w.value((unsigned long long)p.captures); w.endArray();
+        w.key("neuronOutputs"); w.beginArray();
+        for (const Predator& p : ps)
+            for (int k = 0; k < MAX_INTERNAL_NEURONS; ++k) w.value(p.nnet.neurons[(size_t)k].output);
+        w.endArray();
+        w.key("genomeLengths"); w.beginArray(); for (const Predator& p : ps) w.value((long long)p.genome.size()); w.endArray();
+        w.key("genes"); w.beginArray();
+        for (const Predator& p : ps)
+            for (const Gene& g : p.genome) { w.value(packGene(g)); w.value((long long)g.weight); }
+        w.endArray();
+    }
     w.endObject();
     w.newline();
 
@@ -444,6 +495,132 @@ inline bool save(const World& world, const std::string& path,
     return true;
 }
 
+// The "predators" block -> `out`. Shared by deserialize() and the Stage C
+// transplant (transplant.hpp), so a predator is read one way everywhere. With
+// `brain` (a version-2 checkpoint) the brain columns are REQUIRED and checked:
+// the sensor set must be this build's, ids unique, non-zero and below
+// `nextPredatorId` (0 = skip that test), gene counts consistent, every float
+// finite. Reject rather than repair, the rule of every other column.
+inline bool readPredators(const jsonm::Value& jp, bool brain, std::uint64_t nextPredatorId,
+                          std::vector<Predator>& out, std::string& error) {
+    const size_t n = (size_t)jp.llOr("count", 0);
+    std::vector<float> px, py, vx, vy, dt, en, ag;
+    std::vector<long long> alive;
+    if (!jsonm::readFloats(jp, "posX", px, n) || !jsonm::readFloats(jp, "posY", py, n) ||
+        !jsonm::readFloats(jp, "velX", vx, n) || !jsonm::readFloats(jp, "velY", vy, n) ||
+        !jsonm::readFloats(jp, "digestTimer", dt, n) || !jsonm::readFloats(jp, "energy", en, n) ||
+        !jsonm::readFloats(jp, "age", ag, n) || !jsonm::readInts(jp, "alive", alive, n)) {
+        error = "malformed 'predators' arrays"; return false;
+    }
+    // Traits + generation (v0.26.0): OPTIONAL, on the prey body columns'
+    // terms. A pre-0.26 checkpoint has none of them and its predators ran
+    // at 1.0/1.0, so that is the restoration. The two traits are
+    // both-or-neither (serialize() writes both, always) and must lie in
+    // [PRED_TRAIT_MIN, PRED_TRAIT_MAX], the only values inheritance can
+    // produce; anything else is corruption or hand editing, and a speed
+    // factor of NaN or -1 is not survivable. Negated range test for NaN.
+    std::vector<float> sf, bf;
+    std::vector<long long> gen;
+    const bool hasSf = jp.find("speedFactor") != nullptr;
+    const bool hasBf = jp.find("buddingFactor") != nullptr;
+    if (hasSf != hasBf) {
+        error = "checkpoint has only one of 'speedFactor'/'buddingFactor' (both or neither)";
+        return false;
+    }
+    if (hasSf && (!jsonm::readFloats(jp, "speedFactor", sf, n) ||
+                  !jsonm::readFloats(jp, "buddingFactor", bf, n))) {
+        error = "malformed predator trait arrays (length mismatch?)"; return false;
+    }
+    for (size_t i = 0; i < sf.size(); ++i) {
+        if (!(sf[i] >= PRED_TRAIT_MIN && sf[i] <= PRED_TRAIT_MAX) ||
+            !(bf[i] >= PRED_TRAIT_MIN && bf[i] <= PRED_TRAIT_MAX)) {
+            error = "predator trait value out of range [0.5, 2]"; return false;
+        }
+    }
+    const bool hasGen = jp.find("generation") != nullptr;
+    if (hasGen && !jsonm::readInts(jp, "generation", gen, n)) {
+        error = "malformed predator 'generation' array (length mismatch?)"; return false;
+    }
+    for (long long v : gen) {
+        if (v < 0 || v > (long long)UINT32_MAX) { error = "predator 'generation' value out of range"; return false; }
+    }
+
+    // Stage C brain columns (version 2 only).
+    std::vector<long long> ids, lin, par, cap, glen, genes;
+    std::vector<float> spd, neur;
+    if (brain) {
+        const int set = jp.intOr("sensorSet", -1);
+        if (set != PRED_SENSOR_SET) {
+            error = "checkpoint's predator sensor set is " + std::to_string(set) +
+                    ", this build's is " + std::to_string(PRED_SENSOR_SET);
+            return false;
+        }
+        if (jp.intOr("neuronsPerPredator", -1) != MAX_INTERNAL_NEURONS) {
+            error = "checkpoint's neurons per predator differ from this build's"; return false;
+        }
+        if (!jsonm::readInts(jp, "id", ids, n) || !jsonm::readInts(jp, "lineageId", lin, n) ||
+            !jsonm::readInts(jp, "parentId", par, n) || !jsonm::readInts(jp, "captures", cap, n) ||
+            !jsonm::readFloats(jp, "speed", spd, n) ||
+            !jsonm::readFloats(jp, "neuronOutputs", neur, n * MAX_INTERNAL_NEURONS) ||
+            !jsonm::readInts(jp, "genomeLengths", glen, n) ||
+            !jsonm::readInts(jp, "genes", genes, (size_t)-1)) {
+            error = "malformed predator brain arrays (missing or length mismatch)"; return false;
+        }
+        std::vector<long long> sorted = ids;
+        std::sort(sorted.begin(), sorted.end());
+        for (size_t i = 0; i < n; ++i) {
+            if (sorted[i] <= 0 || (i > 0 && sorted[i] == sorted[i - 1])) {
+                error = "predator ids must be unique and > 0"; return false;
+            }
+            if (nextPredatorId > 0 && (unsigned long long)sorted[i] >= nextPredatorId) {
+                error = "'nextPredatorId' must exceed every predator id"; return false;
+            }
+            if (lin[i] <= 0 || par[i] < 0) { error = "predator lineageId / parentId out of range"; return false; }
+            if (cap[i] < 0 || cap[i] > (long long)UINT32_MAX) { error = "predator 'captures' out of range"; return false; }
+            if (!(spd[i] >= 0.0f) || !std::isfinite(spd[i])) { error = "predator 'speed' must be finite and >= 0"; return false; }
+        }
+        for (float v : neur)
+            if (!std::isfinite(v)) { error = "predator neuron output is not finite"; return false; }
+        size_t needed = 0;
+        for (long long L : glen) {
+            if (L < 0) { error = "negative predator genome length"; return false; }
+            needed += (size_t)L * 2;
+        }
+        if (genes.size() != needed) { error = "predator 'genes' length does not match 'genomeLengths'"; return false; }
+    }
+
+    out.clear();
+    out.resize(n);
+    size_t gi = 0;
+    for (size_t i = 0; i < n; ++i) {
+        Predator& p = out[i];
+        p.pos = Vec2{px[i], py[i]};
+        p.vel = Vec2{vx[i], vy[i]};
+        p.digestTimer = dt[i];
+        p.energy = en[i];
+        p.age = ag[i];
+        p.alive = alive[i] != 0;
+        p.speedFactor   = hasSf ? sf[i] : 1.0f;
+        p.buddingFactor = hasBf ? bf[i] : 1.0f;
+        p.generation    = hasGen ? (std::uint32_t)gen[i] : 0u;
+        if (brain) {
+            p.id = (std::uint64_t)ids[i];
+            p.lineageId = (std::uint64_t)lin[i];
+            p.parentId = (std::uint64_t)par[i];
+            p.captures = (std::uint32_t)cap[i];
+            p.speed = spd[i];
+            p.genome.clear();
+            p.genome.reserve((size_t)glen[i]);
+            for (long long k = 0; k < glen[i]; ++k, gi += 2) p.genome.push_back(unpackGene(genes[gi], genes[gi + 1]));
+            // the wiring is derived; the recurrent outputs are live state
+            predbrain::buildNet(p.genome, p.nnet);
+            for (int k = 0; k < MAX_INTERNAL_NEURONS; ++k)
+                p.nnet.neurons[(size_t)k].output = neur[i * MAX_INTERNAL_NEURONS + (size_t)k];
+        }
+    }
+    return true;
+}
+
 // -------------------------------------------------------------------- load --
 // Restores `world` in place. On failure returns false with `error` set and
 // leaves the world untouched-but-unusable, so callers should treat a failed
@@ -454,10 +631,26 @@ inline bool deserialize(const std::string& text, World& world, std::string& erro
     if (!j.isObject()) { error = "checkpoint root is not an object"; return false; }
     if (j.stringOr("format", "") != FORMAT_ID) { error = "not an evo_boids checkpoint"; return false; }
     const int ver = j.intOr("formatVersion", -1);
-    if (ver != FORMAT_VERSION) {
+    if (ver != FORMAT_VERSION && ver != FORMAT_VERSION_BRAIN) {
         error = "checkpoint format version " + std::to_string(ver) +
-                ", this build reads version " + std::to_string(FORMAT_VERSION);
+                ", this build reads versions " + std::to_string(FORMAT_VERSION) + " and " +
+                std::to_string(FORMAT_VERSION_BRAIN);
         return false;
+    }
+    // Version 2 <=> the predators have Stage C brains. The file, not whatever
+    // the caller's config held, decides; a config key that disagrees with the
+    // version is a hand edit that cannot be honoured (a version-1 file has no
+    // genomes to give its predators — build such a world with --predators-from).
+    const bool brain = (ver == FORMAT_VERSION_BRAIN);
+    {
+        const jsonm::Value* jcfg = j.find("config");
+        const bool keyBrain = jcfg && jcfg->boolOr("predatorBrain", false);
+        if (keyBrain != brain) {
+            error = brain ? "a version-2 checkpoint must have 'predatorBrain': true"
+                          : "'predatorBrain' is on but this version-1 checkpoint has no predator genomes "
+                            "(make the world with --predators-from random)";
+            return false;
+        }
     }
 
     const jsonm::Value* jw = j.find("world");
@@ -468,6 +661,11 @@ inline bool deserialize(const std::string& text, World& world, std::string& erro
 
     // Config first: init() sizes the spatial grids from cfg.perceptionRadius.
     readConfig(j, world.cfg);
+    world.cfg.predatorBrain = brain;
+    if (const char* why = predatorBrainConfigError(world.cfg)) {
+        error = std::string("config: ") + why;
+        return false;
+    }
 
     // The config block is hand-editable by design, so it is also the one place
     // a value can enter the engine without passing a frontend. The only legal
@@ -507,9 +705,21 @@ inline bool deserialize(const std::string& text, World& world, std::string& erro
     world.reproWindowNext_ = 0;
     world.totalBirthsLogged_ = 0;
     world.reproStride_ = 1;
+    // Stage C per-run records: init() above may have founded (and logged) the
+    // configured predators; they are not the checkpoint's.
+    world.predLog_.clear();
+    world.predTally_ = WorldCommon::PredatorTally{};
 
     world.frame  = jw->ullOr("frame", 0);
     world.nextId_ = jw->ullOr("nextId", 1);
+    world.nextPredatorId_ = 1;
+    if (brain) {
+        const jsonm::Value* np = jw->find("nextPredatorId");
+        if (!np || np->type != jsonm::Value::Type::Number || !(np->num >= 1.0)) {
+            error = "a version-2 checkpoint needs world.nextPredatorId >= 1"; return false;
+        }
+        world.nextPredatorId_ = (std::uint64_t)np->num;
+    }
 
     if (const jsonm::Value* jc = j.find("counters")) {
         world.totalBirths = jc->llOr("totalBirths", 0);
@@ -573,60 +783,7 @@ inline bool deserialize(const std::string& text, World& world, std::string& erro
 
     // predators
     if (const jsonm::Value* jp = j.find("predators")) {
-        const size_t n = (size_t)jp->llOr("count", 0);
-        std::vector<float> px, py, vx, vy, dt, en, ag;
-        std::vector<long long> alive;
-        if (!jsonm::readFloats(*jp, "posX", px, n) || !jsonm::readFloats(*jp, "posY", py, n) ||
-            !jsonm::readFloats(*jp, "velX", vx, n) || !jsonm::readFloats(*jp, "velY", vy, n) ||
-            !jsonm::readFloats(*jp, "digestTimer", dt, n) || !jsonm::readFloats(*jp, "energy", en, n) ||
-            !jsonm::readFloats(*jp, "age", ag, n) || !jsonm::readInts(*jp, "alive", alive, n)) {
-            error = "malformed 'predators' arrays"; return false;
-        }
-        // Traits + generation (v0.26.0): OPTIONAL, on the prey body columns'
-        // terms. A pre-0.26 checkpoint has none of them and its predators ran
-        // at 1.0/1.0, so that is the restoration. The two traits are
-        // both-or-neither (serialize() writes both, always) and must lie in
-        // [PRED_TRAIT_MIN, PRED_TRAIT_MAX], the only values inheritance can
-        // produce; anything else is corruption or hand editing, and a speed
-        // factor of NaN or -1 is not survivable. Negated range test for NaN.
-        std::vector<float> sf, bf;
-        std::vector<long long> gen;
-        const bool hasSf = jp->find("speedFactor") != nullptr;
-        const bool hasBf = jp->find("buddingFactor") != nullptr;
-        if (hasSf != hasBf) {
-            error = "checkpoint has only one of 'speedFactor'/'buddingFactor' (both or neither)";
-            return false;
-        }
-        if (hasSf && (!jsonm::readFloats(*jp, "speedFactor", sf, n) ||
-                      !jsonm::readFloats(*jp, "buddingFactor", bf, n))) {
-            error = "malformed predator trait arrays (length mismatch?)"; return false;
-        }
-        for (size_t i = 0; i < sf.size(); ++i) {
-            if (!(sf[i] >= PRED_TRAIT_MIN && sf[i] <= PRED_TRAIT_MAX) ||
-                !(bf[i] >= PRED_TRAIT_MIN && bf[i] <= PRED_TRAIT_MAX)) {
-                error = "predator trait value out of range [0.5, 2]"; return false;
-            }
-        }
-        const bool hasGen = jp->find("generation") != nullptr;
-        if (hasGen && !jsonm::readInts(*jp, "generation", gen, n)) {
-            error = "malformed predator 'generation' array (length mismatch?)"; return false;
-        }
-        for (long long v : gen) {
-            if (v < 0 || v > (long long)UINT32_MAX) { error = "predator 'generation' value out of range"; return false; }
-        }
-        world.predators.resize(n);
-        for (size_t i = 0; i < n; ++i) {
-            Predator& p = world.predators[i];
-            p.pos = Vec2{px[i], py[i]};
-            p.vel = Vec2{vx[i], vy[i]};
-            p.digestTimer = dt[i];
-            p.energy = en[i];
-            p.age = ag[i];
-            p.alive = alive[i] != 0;
-            p.speedFactor   = hasSf ? sf[i] : 1.0f;
-            p.buddingFactor = hasBf ? bf[i] : 1.0f;
-            p.generation    = hasGen ? (std::uint32_t)gen[i] : 0u;
-        }
+        if (!readPredators(*jp, brain, world.nextPredatorId_, world.predators, error)) return false;
     }
 
     // creatures
@@ -784,6 +941,10 @@ inline bool deserialize(const std::string& text, World& world, std::string& erro
     // this has to overwrite it or the resumed run follows a different sequence.
     const std::string state = j.stringOr("rngState", "");
     if (state.empty() || !rng.setState(state)) { error = "missing or unreadable rngState"; return false; }
+    if (brain) {
+        const std::string ps = j.stringOr("predatorRngState", "");
+        if (ps.empty() || !world.predRng_.setState(ps)) { error = "missing or unreadable predatorRngState"; return false; }
+    }
 
     return true;
 }

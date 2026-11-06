@@ -35,15 +35,19 @@ struct Gene {
 
     float weightAsFloat() const { return weight / 8192.0f; }
 
-    static Gene makeRandom() {
+    // From a given stream: the prey use the global `rng` (the overload
+    // below), the predator brains their own stream (predator_brain.hpp). The
+    // same five draws in the same order either way.
+    static Gene makeRandom(RandomGen& r) {
         Gene g;
-        g.sourceType = rng.uint(1);
-        g.sourceNum  = rng.uint(127);
-        g.sinkType   = rng.uint(1);
-        g.sinkNum    = rng.uint(127);
-        g.weight     = static_cast<int16_t>(rng.uint(0xFFFF) - 0x8000);
+        g.sourceType = r.uint(1);
+        g.sourceNum  = r.uint(127);
+        g.sinkType   = r.uint(1);
+        g.sinkNum    = r.uint(127);
+        g.weight     = static_cast<int16_t>(r.uint(0xFFFF) - 0x8000);
         return g;
     }
+    static Gene makeRandom() { return makeRandom(rng); }
 };
 
 using Genome = std::vector<Gene>;
@@ -128,15 +132,20 @@ inline Gene asGene(const NeuralNet::FlatConn& fc) {
 
 // --- Genome operations ---
 
-inline Genome makeRandomGenome(int initMin = GENOME_INITIAL_MIN,
-                               int initMax = GENOME_INITIAL_MAX) {
-    int length = rng.intRange(initMin, initMax);
+// The genome operations take the stream they draw from; the overloads without
+// one use the global `rng` (the prey's), with the same draws in the same order.
+inline Genome makeRandomGenome(int initMin, int initMax, RandomGen& r) {
+    int length = r.intRange(initMin, initMax);
     Genome genome;
     genome.reserve(length);
     for (int i = 0; i < length; ++i) {
-        genome.push_back(Gene::makeRandom());
+        genome.push_back(Gene::makeRandom(r));
     }
     return genome;
+}
+inline Genome makeRandomGenome(int initMin = GENOME_INITIAL_MIN,
+                               int initMax = GENOME_INITIAL_MAX) {
+    return makeRandomGenome(initMin, initMax, rng);
 }
 
 // Build neural net wiring from genome
@@ -282,41 +291,44 @@ inline Genome crossover(const Genome& parent1, const Genome& parent2) {
     return child;
 }
 
-inline void mutateGenome(Genome& genome, float rate = 0.01f,
-                         int minLen = GENOME_MIN_LENGTH,
-                         int maxLen = GENOME_MAX_LENGTH) {
+inline void mutateGenome(Genome& genome, float rate, int minLen, int maxLen, RandomGen& r) {
     // Weight mutations and rewiring
     for (auto& gene : genome) {
-        if (rng.unit() < rate) {
+        if (r.unit() < rate) {
             // Mutate the weight
-            gene.weight += static_cast<int16_t>(rng.intRange(-1000, 1000));
+            gene.weight += static_cast<int16_t>(r.intRange(-1000, 1000));
         }
-        if (rng.unit() < rate * 0.5f) {
+        if (r.unit() < rate * 0.5f) {
             // Rarely rewire a connection entirely
-            gene = Gene::makeRandom();
+            gene = Gene::makeRandom(r);
         }
     }
 
     // Gene insertion — genome can grow
-    if (rng.unit() < rate * 2.0f && (int)genome.size() < maxLen) {
-        int pos = rng.intRange(0, (int)genome.size());
-        genome.insert(genome.begin() + pos, Gene::makeRandom());
+    if (r.unit() < rate * 2.0f && (int)genome.size() < maxLen) {
+        int pos = r.intRange(0, (int)genome.size());
+        genome.insert(genome.begin() + pos, Gene::makeRandom(r));
     }
 
     // Gene deletion — genome can shrink
-    if (rng.unit() < rate * 2.0f && (int)genome.size() > minLen) {
-        int pos = rng.intRange(0, (int)genome.size() - 1);
+    if (r.unit() < rate * 2.0f && (int)genome.size() > minLen) {
+        int pos = r.intRange(0, (int)genome.size() - 1);
         genome.erase(genome.begin() + pos);
     }
 
     // Gene duplication — copy an existing gene to a new position (rare)
-    if (rng.unit() < rate * 0.5f && (int)genome.size() < maxLen) {
-        int src = rng.intRange(0, (int)genome.size() - 1);
+    if (r.unit() < rate * 0.5f && (int)genome.size() < maxLen) {
+        int src = r.intRange(0, (int)genome.size() - 1);
         Gene dup = genome[src];
         // Slightly mutate the duplicate's weight
-        dup.weight += static_cast<int16_t>(rng.intRange(-500, 500));
+        dup.weight += static_cast<int16_t>(r.intRange(-500, 500));
         genome.push_back(dup);
     }
+}
+inline void mutateGenome(Genome& genome, float rate = 0.01f,
+                         int minLen = GENOME_MIN_LENGTH,
+                         int maxLen = GENOME_MAX_LENGTH) {
+    mutateGenome(genome, rate, minLen, maxLen, rng);
 }
 
 inline float genomeSimilarity(const Genome& g1, const Genome& g2) {
