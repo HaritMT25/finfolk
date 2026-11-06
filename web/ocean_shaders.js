@@ -22,7 +22,7 @@
  *     "lite" the roll only): the swim pose's GLSL (POSE_GLSL: poseOf unpacks
  *     the float web/ocean_pose.js packs) and the polish's light (POLISH_FN);
  *     the plain fish's and the predators' (fishCore, fishVs, fishFs,
- *     shadowVs, built once into FISH_VS / FISH_FS [plain, full, lite] and
+ *     shadowVs, built on first read into FISH_VS / FISH_FS [plain, full, lite] and
  *     SHADOW_VS [plain, lite] / SHADOW_FS); the appearance fish's
  *     (appearanceShaders(EA, P): its body, its shadow, and the checks' and
  *     probes' programs, around web/ocean_appearance.js's GLSL), the gene slot
@@ -533,7 +533,7 @@
    * then its id: never the order they registered or were listed in); the
    * result is lines() of all that, so with no feature every program is its
    * fallbacks' text, byte for byte. A feature, feature({id, abi, targets,
-   * append, replace, order}), names the programs it supports (targets) and,
+   * append, replace, order, version}), names the programs it supports (targets) and,
    * slot by slot, the GLSL it appends or the GLSL that replaces the fallback
    * (or a function of the program's environment env giving it: the
    * appearance programs pass {EA}; a function that throws is reported with
@@ -834,8 +834,11 @@
       if (!n) throw err("feature " + id + " appends and replaces nothing");
       var order = spec.order === undefined ? 0 : spec.order;
       if (typeof order !== "number" || !isFinite(order)) throw err("feature " + id + ": its order is not a number");
+      /* its version (default 1): the binder's material key holds id and version (web/ocean_materials.js) */
+      var version = spec.version === undefined ? 1 : spec.version;
+      if (typeof version !== "number" || !(version >= 1) || Math.floor(version) !== version) throw err("feature " + id + ": its version is not a whole number from 1");
       /** @type {ShaderFeature} */
-      var f = Object.freeze({ id: id, abi: ABI, targets: Object.freeze(targets.slice()), append: Object.freeze(Object.assign({}, append)),
+      var f = Object.freeze({ id: id, abi: ABI, version: version, targets: Object.freeze(targets.slice()), append: Object.freeze(Object.assign({}, append)),
                               replace: Object.freeze(Object.assign({}, replace)), order: order });
       reg[id] = f;
       return f;
@@ -1465,9 +1468,19 @@
   function shadowVs(P, more) { return A0.program("fish.shadow.vs", shadowVsParts(), polishFor(P).concat(also(more))); }
   /* the legacy fish (and predators): plain [0], full [1], lite [2] (the
    * roll only, the plain fragment stage); their shadows plain [0] or lite
-   * [1] (a shadow shows neither the fold nor the lag) */
-  var FISH_VS = [fishVs(false), fishVs(true), fishVs("lite")], FISH_FS = [fishFs(false), fishFs(true), fishFs(false)];
-  var SHADOW_VS = [shadowVs(false), shadowVs("lite")];
+   * [1] (a shadow shows neither the fold nor the lag). Built on first read
+   * (API.FISH_VS, ...), not as the module loads: an assembly error in a
+   * polished variant (a scan's false positive) then fails only what reads
+   * them, never the module and so the plain fish (the scene's materials
+   * assemble their own, variant by variant, falling back to the plain
+   * programs: web/ocean_materials.js) */
+  /** @type {{ FISH_VS: string[], FISH_FS: string[], SHADOW_VS: string[] } | null} */
+  var BUILT = null;
+  function built() {
+    if (!BUILT) BUILT = { FISH_VS: [fishVs(false), fishVs(true), fishVs("lite")], FISH_FS: [fishFs(false), fishFs(true), fishFs(false)],
+                          SHADOW_VS: [shadowVs(false), shadowVs("lite")] };
+    return BUILT;
+  }
   var SHADOW_FS = [
     FOG_FN,
     "uniform float uAlpha;",
@@ -1553,11 +1566,12 @@
     LINE_VS: LINE_VS, LINE_FS: LINE_FS, RING_VS: RING_VS, RING_FS: RING_FS,
     lines: lines, occurrences: occurrences, POSE_GLSL: POSE_GLSL, POLISH_FN: POLISH_FN,
     fishCore: fishCore, fishVs: fishVs, fishFs: fishFs, shadowVs: shadowVs,
-    FISH_VS: FISH_VS, FISH_FS: FISH_FS, SHADOW_VS: SHADOW_VS, SHADOW_FS: SHADOW_FS,
+    get FISH_VS() { return built().FISH_VS; }, get FISH_FS() { return built().FISH_FS; }, get SHADOW_VS() { return built().SHADOW_VS; },
+    SHADOW_FS: SHADOW_FS,
     GENE_SLOT_RET: GENE_SLOT_RET, GENE_SLOT_GLSL: GENE_SLOT_GLSL, LIT_SKIP: LIT_SKIP, LIT_SKIP_GLSL: LIT_SKIP_GLSL, litSkip: litSkip,
     DECODE_CALL: DECODE_CALL, glslF: glslF, appearanceShaders: appearanceShaders, appCore: appCore,
     ABI: ABI, SLOTS: SLOTS, PROGRAMS: PROGRAMS, slot: slot, declarations: declarations,
-    feature: A0.feature, program: A0.program, core: A0.core, features: A0.features, assembler: assembler,
+    feature: A0.feature, program: A0.program, core: A0.core, features: A0.features, featureOf: A0.get, assembler: assembler,
     parts: Object.freeze({ fishCore: fishCoreParts, fishVs: fishVsParts, fishFs: fishFsParts, shadowVs: shadowVsParts, fishAttach: fishAttachParts,
                            appCore: appCoreParts, appBodyVs: appBodyVsParts, appBodyFs: appBodyFsParts, appShadowVs: appShadowVsParts }),
     POLISH: POLISH, polishFeature: polishFeature

@@ -630,11 +630,12 @@ interface EvoOceanShadersApi {
   fishVs(P: FishVariant, more?: string[]): string;
   fishFs(P: FishVariant, more?: string[]): string;
   shadowVs(P: FishVariant, more?: string[]): string;
-  /** built once: FISH_VS / FISH_FS [plain, full, lite] (lite's fragment stage is the plain one),
-   * SHADOW_VS [plain, lite], SHADOW_FS (every variant's) */
-  FISH_VS: string[];
-  FISH_FS: string[];
-  SHADOW_VS: string[];
+  /** built on first read (an assembly error then fails the read, not the module): FISH_VS / FISH_FS
+   * [plain, full, lite] (lite's fragment stage is the plain one), SHADOW_VS [plain, lite]; SHADOW_FS
+   * (every variant's) */
+  readonly FISH_VS: string[];
+  readonly FISH_FS: string[];
+  readonly SHADOW_VS: string[];
   SHADOW_FS: string;
   /** an instance's gene slot, read by every gene-reading program (and the statement it returns) */
   GENE_SLOT_RET: string;
@@ -666,6 +667,8 @@ interface EvoOceanShadersApi {
   program(name: string, parts: ShaderPart[], features?: string[], env?: ShaderEnv): string;
   core(name: string, parts: ShaderPart[], features?: string[], env?: ShaderEnv): string;
   features(): string[];
+  /** a registered feature by id (null: none) */
+  featureOf(id: string): ShaderFeature | null;
   /** a fresh registry and assembler (no feature registered: the tests') */
   assembler(): ShaderAssembler;
   /** each program's parts (fresh arrays): the legacy fish's, the appearance fish's (EA's GLSL) */
@@ -687,7 +690,8 @@ type ShaderText = string | ((env: ShaderEnv) => string);
 /** A feature, as registered (EvoOceanShaders.feature): its id (namespaced by its owner, "reef.fish"; registered
  * once, as its script loads); the slots' ABI; the programs it supports; by slot, the text it appends
  * (additive slots) or replaces the fallback with (replacement slots); order: where its appends go among
- * others' in every slot it appends to (then by id; default 0). */
+ * others' in every slot it appends to (then by id; default 0); version: a whole number from 1 (default 1),
+ * part of the material binder's key with the id. */
 interface ShaderFeatureSpec {
   id: string;
   abi: number;
@@ -695,11 +699,13 @@ interface ShaderFeatureSpec {
   append?: { [slot: string]: ShaderText };
   replace?: { [slot: string]: ShaderText };
   order?: number;
+  version?: number;
 }
 /** A registered feature (frozen). */
 interface ShaderFeature {
   readonly id: string;
   readonly abi: number;
+  readonly version: number;
   readonly targets: readonly string[];
   readonly append: { readonly [slot: string]: ShaderText };
   readonly replace: { readonly [slot: string]: ShaderText };
@@ -746,6 +752,126 @@ interface FishProgramParts {
   appBodyVs(EA: EvoAppearanceApi): ShaderPart[];
   appBodyFs(EA: EvoAppearanceApi): ShaderPart[];
   appShadowVs(EA: EvoAppearanceApi): ShaderPart[];
+}
+
+/* ---------------- web/ocean_materials.js (window.EvoOceanMaterials) ---------------- */
+
+/** A kind's declared attribute layout (EvoOceanMaterials.layout): its template's attributes, its instance attributes
+ * component by component as the scene's fills write them, the swim pose's component reserved, the components the scene
+ * uses, the spare ones a Look may claim, the claims made. A component is "iX.y", a scalar attribute's its name. */
+interface AttributeLayout {
+  readonly id: string;
+  readonly kind: string;
+  readonly template: readonly string[];
+  readonly attributes: { readonly [name: string]: readonly string[] };
+  readonly reserved: { readonly [component: string]: string };
+  readonly used: { readonly [component: string]: string };
+  readonly spare: readonly string[];
+  readonly claims: { readonly [component: string]: string };
+  readonly pose: string;
+}
+/** A kind the binder draws: its programs' family, its layout's kind, its passes. */
+interface MaterialKindSpec {
+  readonly family: "app" | "fish" | "attach";
+  readonly layout: string;
+  readonly passes: readonly string[];
+  readonly doc: string;
+}
+/** What a feature set's features() is asked: a kind's pass's stage in a variant, and the swim polish's ids for it. */
+interface MaterialFeatureQuery { kind: string; pass: string; stage: "vs" | "fs"; variant: number; base: string[] }
+/** A Look's attached pass on the predators (#47's faces): its declarations and main() body (fish.attach.vs), its own
+ * fragment stage, its uniforms (beside the predators'), material options, geometry (for the activation's compile). */
+interface MaterialAttach {
+  decl: string; body: string; fs: string;
+  uniforms?: { [name: string]: { value: any } };
+  options?: object;
+  geometry?: () => any;
+}
+/** A feature set (activate): the Look's id, its features by stage, its attached pass, its uniforms and claims by kind. */
+interface MaterialSetSpec {
+  look: string;
+  features?: (q: MaterialFeatureQuery) => string[];
+  attach?: { face?: MaterialAttach };
+  uniforms?: { [kind: string]: { [name: string]: { value: any } } };
+  claims?: { [kind: string]: { [component: string]: string } };
+}
+/** A feature set, normalized (frozen), with its layouts by kind. */
+interface MaterialSet {
+  readonly look: string;
+  readonly features: ((q: MaterialFeatureQuery) => string[]) | null;
+  readonly attach: { face: MaterialAttach } | null;
+  readonly uniforms: { [kind: string]: { [name: string]: { value: any } } } | null;
+  readonly layouts: { readonly [kind: string]: AttributeLayout };
+  /** a digest of the faces' GLSL and options ("" without them): in the faces' key */
+  readonly faceDigest: string;
+}
+/** A kind as the scene defines it: its uniforms by pass (the scene's objects: every variant shares them), the programs'
+ * environment (the appearance law). */
+interface MaterialKindDef { uniforms: { [pass: string]: object }; env?: ShaderEnv }
+/** What a (kind, pass, variant) draws under a set: its features per stage, its layout, its key, and its share key (the key
+ * without the kind: the keys whose material would be identical share it). */
+interface Described {
+  key: string; share: string; kind: string; pass: string; variant: number; vs: string[]; fs: string[]; layout: AttributeLayout; set: MaterialSet;
+}
+/** A material and its state, shared by the keys it draws (refs); reserved: made, its GLSL not assembled yet. */
+interface BinderRecord { share: string; material: any; state: "reserved" | "ready" | "failed"; error: string; refs: number }
+/** A cached material: its key, what it is, its (shared) record. */
+interface BinderEntry {
+  key: string; kind: string; pass: string; variant: number; vs: string[]; fs: string[];
+  layout: AttributeLayout; set: MaterialSet; rec: BinderRecord;
+}
+/** What a mesh was last bound to: the variant asked, the one drawn (0 on a fallback), the material's key. */
+interface MaterialBound { kind: string; pass: string; variant: number; effective: number; key: string; fallback: boolean }
+/** One material an activation compiles. */
+interface MaterialCompileItem { key: string; kind: string; pass: string; variant: number; material: any; geometry: (() => any) | null }
+/** An activation's outcome (stage: where it failed); keys: every key it covers; materials: the distinct ones compiled. */
+interface MaterialActivation { ok: boolean; look: string; stage?: "spec" | "assembly" | "compile"; error?: string; keys?: string[]; materials?: number }
+/** The scene's compile for activations (EvoOceanMaterials.compiler): three (Scene, Mesh), its renderer, camera and scene, a
+ * kind's geometry, whether the context is lost; the budget (ms, 60 s) and the timers (tests). */
+interface MaterialCompilerOptions {
+  THREE: any; renderer: any; camera: any; scene: any;
+  geometry: (item: MaterialCompileItem) => any;
+  lost?: () => boolean;
+  budgetMs?: number;
+  timers?: { set: (f: () => void, ms: number) => any; clear: (t: any) => void };
+}
+/** The binder's needs: three (ShaderMaterial, DoubleSide, LessDepth), the activation's compile, the console. */
+interface MaterialBinderDeps {
+  THREE: any;
+  compile?: (items: MaterialCompileItem[]) => Promise<{ ok: boolean; error?: string }> | { ok: boolean; error?: string };
+  warn?: (m: string) => void;
+}
+interface MaterialBinderState {
+  look: string; version: number; pending: boolean; kinds: string[]; covered: string[]; materials: number;
+  entries: { key: string; state: string; error: string }[]; failed: string[];
+}
+/** The scene's material binder (EvoOceanMaterials.create): web/ocean_materials.js says what each does. */
+interface MaterialBinder {
+  define(kind: string, def: MaterialKindDef): void;
+  prepare(kinds: string[]): void;
+  material(kind: string, pass: string, variant: number): any;
+  /** its own programs assemble (no fallback): the split asks before it skips the lit fish in the main draw */
+  has(kind: string, pass: string, variant: number): boolean;
+  bind(mesh: { material: any }, kind: string, pass: string, variant: number): number;
+  bound(mesh: object): MaterialBound | null;
+  variantOf(mesh: object): number;
+  warm(kinds: string[]): any[];
+  key(kind: string, pass: string, variant: number): string;
+  programs(kind: string, pass: string, variant: number): { key: string; own: boolean; vs: string; fs: string; material: any };
+  activate(spec: MaterialSetSpec | null): Promise<MaterialActivation>;
+  state(): MaterialBinderState;
+}
+interface EvoOceanMaterialsApi {
+  KINDS: { readonly [kind: string]: MaterialKindSpec };
+  PASSES: readonly string[];
+  VARIANTS: readonly number[];
+  LAYOUTS: { readonly [kind: string]: AttributeLayout };
+  LAYOUT_ABI: number;
+  /** the lit fish's split, a feature (app.pose, order -1) */
+  LIT_SKIP_FEATURE: string;
+  layout(kind: string, claims?: { [component: string]: string }): AttributeLayout;
+  create(deps: MaterialBinderDeps): MaterialBinder;
+  compiler(o: MaterialCompilerOptions): (items: MaterialCompileItem[]) => Promise<{ ok: boolean; error?: string }>;
 }
 
 /* ---------------- web/ocean_pose.js (window.EvoOceanPose) ---------------- */
@@ -939,11 +1065,12 @@ declare var EvoAppearance: EvoAppearanceApi;
  * loaded (each sets its namespace null first and registers at the end) */
 declare var EvoOceanShaders: EvoOceanShadersApi | null | undefined;
 declare var EvoOceanPose: EvoOceanPoseApi | null | undefined;
+declare var EvoOceanMaterials: EvoOceanMaterialsApi | null | undefined;
 declare var EvoOceanSceneParity: EvoOceanSceneParityApi | null | undefined;
 declare var EvoOceanScene: EvoOceanSceneApi;
 /** set by web/ocean_scene.js when a script it needs did not load or failed to run, in words: "<files>
  * missing", "<files> failed to run" or both, "; " between ("ocean_shaders.js", "ocean_pose.js",
- * "ocean_scene_parity.js", " and " between): the page's "could not start" says it (else "ocean_scene.js
+ * "ocean_materials.js", "ocean_scene_parity.js", " and " between): the page's "could not start" says it (else "ocean_scene.js
  * missing", the scene itself) */
 declare var EvoOceanSceneMissing: string | undefined;
 declare var EvoOcean: OceanPageApi;

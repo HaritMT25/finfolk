@@ -101,21 +101,29 @@
  * web/ocean_pose.js's (window.EvoOceanPose: swimPose and its parts, the
  * reach). The appearance checks and probes (appearancePathCheck and its
  * parts, appearanceParity, appearanceTextureParity) are
- * web/ocean_scene_parity.js's (window.EvoOceanSceneParity). All three load
- * first; this file reads them under the names they had here.
+ * web/ocean_scene_parity.js's (window.EvoOceanSceneParity). The fish kinds'
+ * materials are web/ocean_materials.js's binder (window.EvoOceanMaterials):
+ * it makes them, assembles their programs variant by variant (the swim
+ * polish and the split's skip as features) and is the one writer of a fish
+ * mesh's material (bind: a kind's commit hands it the variant settle()
+ * chose). All four load first; this file reads them under the names they
+ * had here.
  *
  * EvoOceanScene.load() -> Promise (imports the trimmed three bundle,
  * window.EVO_ASSETS.three); EvoOceanScene.create(canvas, opts) -> scene or null. */
 (function () {
-  /* the GLSL (web/ocean_shaders.js), the swim pose's CPU half (web/ocean_pose.js) and the
-   * diagnostics (web/ocean_scene_parity.js, which reads the other two as it loads), all loaded before
-   * this file; without any of them there is no scene to offer: the page then says the 3-D tank can't
-   * start, and why (EvoOceanSceneMissing): a file missing (its namespace undefined: it never ran), or
-   * one that failed to run (null: each sets its namespace null first, so a throw before it registers
-   * leaves null). The diagnostics are not blamed for a file they need */
+  /* the GLSL (web/ocean_shaders.js), the swim pose's CPU half (web/ocean_pose.js), the fish's
+   * materials (web/ocean_materials.js, which reads the GLSL as it loads) and the diagnostics
+   * (web/ocean_scene_parity.js, which reads the first two), all loaded before this file; without any
+   * of them there is no scene to offer: the page then says the 3-D tank can't start, and why
+   * (EvoOceanSceneMissing): a file missing (its namespace undefined: it never ran), or one that failed
+   * to run (null: each sets its namespace null first, so a throw before it registers leaves null). The
+   * materials and the diagnostics are not blamed for a file they need */
   var SHADERS = window.EvoOceanShaders, POSE = window.EvoOceanPose, PARITY = window.EvoOceanSceneParity, MISSING = [], FAILED = [];
+  var MATERIALS = window.EvoOceanMaterials;
   function need(api, file) { if (api === null) FAILED.push(file); else if (!api) MISSING.push(file); }
   need(SHADERS, "ocean_shaders.js"); need(POSE, "ocean_pose.js");
+  if (SHADERS) need(MATERIALS, "ocean_materials.js");
   if (SHADERS && POSE) need(PARITY, "ocean_scene_parity.js");
   if (MISSING.length || FAILED.length) {
     var WHY = [];
@@ -208,14 +216,14 @@
   var FOG_FN = SHADERS.FOG_FN, BEAM_FN = SHADERS.BEAM_FN, DEPTH_FN = SHADERS.DEPTH_FN, CLARITY_FN = SHADERS.CLARITY_FN;
 
   /* The fish programs, in their variants (the swim polish: plain, full, lite;
-   * web/ocean_shaders.js says what each draws and reads): the plain fish's and
-   * the predators' (FISH_VS / FISH_FS [plain, full, lite], their shadows'
-   * SHADOW_VS [plain, lite] / SHADOW_FS) and the appearance fish's
-   * (appearanceShaders(EA, P)), the gene slot every gene-reading program shares
-   * (GENE_SLOT_GLSL) and the lit fish's split (LIT_SKIP, litSkip) */
-  var FISH_VS = SHADERS.FISH_VS, FISH_FS = SHADERS.FISH_FS, SHADOW_VS = SHADERS.SHADOW_VS, SHADOW_FS = SHADERS.SHADOW_FS;
+   * web/ocean_shaders.js says what each draws and reads), are the binder's
+   * (web/ocean_materials.js: assembled variant by variant, when first drawn or
+   * warmed); here the appearance fish's probes' programs (appearanceShaders(EA,
+   * false)), the gene slot every gene-reading program shares (GENE_SLOT_GLSL)
+   * and the split's sentinel (LIT_SKIP: the skip itself is the binder's
+   * feature) */
   var appearanceShaders = SHADERS.appearanceShaders, GENE_SLOT_GLSL = SHADERS.GENE_SLOT_GLSL;
-  var LIT_SKIP = SHADERS.LIT_SKIP, litSkip = SHADERS.litSkip;
+  var LIT_SKIP = SHADERS.LIT_SKIP;
   /* The swim pose each lit fish's programs read, packed on the CPU
    * (web/ocean_pose.js): swimPose and its parts (posePx, poseVisibleQ, posePack;
    * POSE0 unlit), the float's layout (packPose, unpackPose) and the reach
@@ -485,19 +493,29 @@
       uDepth: common.uDepth, uLightOn: common.uLightOn, uL0: common.uL0, uKWater: common.uKWater,
       uWalls: common.uWalls
     });
-    /* the plain [0] and full [1] programs (the lite one is the shadows' only) */
-    var fishMats = [0, 1].map(function (P) {
-      return new THREE.ShaderMaterial({ vertexShader: FISH_VS[P], fragmentShader: FISH_FS[P], uniforms: fishUniforms, side: THREE.DoubleSide });
-    });
-    var fishMat = fishMats[0];
     var shadowU = { uHalf: common.uHalf, uTime: common.uTime, uWag: fishUniforms.uWag, uLight: common.uLight,
                     uFloorY: common.uFloorY, uDepth: common.uDepth, uFog: common.uFog, uFogDensity: common.uFogDensity,
                     uAlpha: { value: 0.40 }, uWalls: common.uWalls };
-    var shadowMats = [0, 1].map(function (P) {
-      return new THREE.ShaderMaterial({ vertexShader: SHADOW_VS[P], fragmentShader: SHADOW_FS, uniforms: shadowU,
-                                        transparent: true, depthWrite: true, depthFunc: THREE.LessDepth, side: THREE.DoubleSide });
-    });
-    var shadowMat = shadowMats[0];
+    /* The fish kinds' materials: the binder (web/ocean_materials.js) makes
+     * them, assembles each variant's programs when it is first drawn or
+     * warmed (an assembly error: the plain programs), and assigns them (bind:
+     * the kinds' commits below hand it the variant settle() chose); a feature
+     * set (setFeatures: a Look's) takes effect only once every reachable
+     * variant compiled (its compiler: three's compile, as warmUp's, on each
+     * kind's geometry, then each program checked linked and runnable). The
+     * legacy fish and the predators: the plain [0] and full [1] programs (the
+     * lite one is the shadows' only), sharing their uniforms and, as before
+     * the binder, their materials; made here in the order they were made
+     * before it (plain, then full; body, then shadow), so three's draw order
+     * is the same; fishMat, shadowMat: the plain ones */
+    var binder = MATERIALS.create({ THREE: THREE, compile: MATERIALS.compiler({
+      THREE: THREE, renderer: renderer, camera: camera, scene: scene, lost: function () { return lost; },
+      geometry: function (x) { return (x.kind === "app" ? appKind && appKind.geo : x.kind === "pred" ? preds.geo : fish.geo) || fish.geo; }
+    }) });
+    binder.define("fish", { uniforms: { body: fishUniforms, shadow: shadowU } });
+    binder.define("pred", { uniforms: { body: fishUniforms, shadow: shadowU } });
+    binder.prepare(["fish", "pred"]);
+    var fishMat = binder.material("fish", "body", 0), shadowMat = binder.material("fish", "shadow", 0);
     /* Which programs a kind draws: 0 plain (main's, at main's cost), 1 full
      * (the polish; its shadow the lite one, the roll). The shader compiler
      * flattens the size weight's guards (a weight 0 costs the full programs
@@ -551,7 +569,8 @@
      * programs to renderer.compileAsync (with KHR_parallel_shader_compile the
      * driver compiles them off the main thread; three polls them ready), so
      * the first lit fish never stalls a frame on a compile; until they are
-     * ready (or 5 s passed) the kind keeps its plain programs */
+     * ready (or 5 s passed) the kind keeps its plain programs. mats: the
+     * binder's materials for them (binder.warm: assembled then, not before) */
     function Warm(mats, geo) { return { mats: mats, geo: geo, asked: false, ready: false }; }
     function warmUp(wm) {
       if (wm.asked) return wm.ready;
@@ -560,7 +579,7 @@
         var done = function () { wm.ready = true; };
         if (lost) { wm.asked = false; return; }
         var ws = new THREE.Scene();
-        wm.mats.forEach(function (m) { var o = new THREE.Mesh(wm.geo(), m); o.frustumCulled = false; ws.add(o); });
+        wm.mats().forEach(function (m) { var o = new THREE.Mesh(wm.geo(), m); o.frustumCulled = false; ws.add(o); });
         try {
           if (renderer.compileAsync) { renderer.compileAsync(ws, camera, scene).then(done, done); setTimeout(done, 5000); }
           else { renderer.compile(ws, camera, scene); done(); }
@@ -585,10 +604,11 @@
     function allocBytes(attrs, cap) { var b = 0; Object.keys(attrs).forEach(function (k) { b += cap * attrs[k].itemSize * 4; }); return b; }
 
     /* One instanced kind: template + six per-instance attributes (iX: the
-     * pitch; iX.y the packed swim pose, POSE_GLSL). The geometry is rebuilt
-     * (and the old one disposed) only when it has to grow. */
+     * pitch; iX.y the packed swim pose, POSE_GLSL; the binder's layout, fish
+     * or pred). The geometry is rebuilt (and the old one disposed) only when
+     * it has to grow. */
     function Kind(pred) {
-      var tpl = fishTemplate(pred);
+      var tpl = fishTemplate(pred), name = pred ? "pred" : "fish";
       var self = { cap: 0, n: 0, geo: null, mesh: null, shadow: null, attrs: null, verts: tpl.pos.length / 3, tris: tpl.idx.length / 3, bytes: 0,
                    reach: reachOfTemplate(tpl.pos) };
       function build(cap) {
@@ -609,8 +629,9 @@
           self.mesh.geometry = g;
           self.shadow.geometry = g;
         } else {
-          self.mesh = new THREE.Mesh(g, fishMat);
-          self.shadow = new THREE.Mesh(g, shadowMat);
+          /* (made with the binder's plain materials; from the first commit on, the binder binds them) */
+          self.mesh = new THREE.Mesh(g, binder.material(name, "body", 0));
+          self.shadow = new THREE.Mesh(g, binder.material(name, "shadow", 0));
           self.mesh.frustumCulled = self.shadow.frustumCulled = false;
           self.shadow.renderOrder = 1;
           self.mesh.renderOrder = 2;
@@ -627,23 +648,25 @@
         while (cap < n) cap *= 2;
         build(cap);
       };
-      /* v: the programs drawn (settle; the fill packed the swim pose for 1) */
+      /* v: the programs drawn (settle; the fill packed the swim pose for 1),
+       * handed to the binder, which assigns the materials */
       self.commit = function (n, v) {
         self.n = n;
         self.geo.instanceCount = n;
         self.bytes = commitInstances(self.attrs, n);
-        self.mesh.material = fishMats[v || 0];
-        self.shadow.material = shadowMats[v ? 1 : 0];
+        binder.bind(self.mesh, name, "body", v ? 1 : 0);
+        binder.bind(self.shadow, name, "shadow", v ? 1 : 0);
         self.mesh.visible = n > 0;
         self.shadow.visible = n > 0 && quality >= 2;
       };
-      self.variant = function () { return fishMats.indexOf(self.mesh.material); };
+      /* the programs the last commit drew (1 full; 0 plain, or the plain ones a failed assembly fell back to) */
+      self.variant = function () { return binder.variantOf(self.mesh); };
       self.ensure(pred ? 64 : 2048);
       return self;
     }
     var fish = Kind(false), preds = Kind(true);
-    /* the legacy fish's and the predators' polished programs (one pair for both kinds) */
-    var warmFish = Warm([fishMats[1], shadowMats[1]], function () { return fish.geo; });
+    /* the legacy fish's and the predators' polished programs (one pair of programs for both kinds) */
+    var warmFish = Warm(function () { return binder.warm(["fish", "pred"]); }, function () { return fish.geo; });
 
     /* The appearance genome's fish (built on the first snapshot with s.app;
      * null without web/ocean_appearance.js, web/ocean_appearance_slots.js or
@@ -690,7 +713,7 @@
       /* at most MAX_TEXTURE_SIZE rows of 32 slots (and 2^24: a slot is exact in a float) */
       var slots = SLOTS.create({ stride: EA.STRIDE, barbelGene: EA.MO + 26, barbelMin: 0.2, initialCapacity: 256,
                                  maxCapacity: Math.min(SLOTS.MAX_CAPACITY, maxTex * (GENES_W / GENE_TEXELS)) });
-      var sh = appearanceShaders(EA, false), shP = appearanceShaders(EA, true);
+      var sh = appearanceShaders(EA, false);   /* (the probes' programs: chart, raw genes, texture-fed chart) */
       var tpls = { medium: EA.buildTemplate("medium"), coarse: EA.buildTemplate("coarse") };
       var barbTpl = EA.buildBarbels("medium");
       var U = beamUniforms({
@@ -701,18 +724,18 @@
         uGenes: { value: null }, uRingT: { value: new Float32Array(16) }, uRingN: { value: 0 }, uHalfRing: { value: 4 },
         uWalls: common.uWalls
       });
-      /* the plain and full programs (appearanceShaders P, settle), sharing their uniforms */
-      var mats = [sh, shP].map(function (x) { return new THREE.ShaderMaterial({ vertexShader: x.vs, fragmentShader: x.fs, uniforms: U, side: THREE.DoubleSide }); });
-      var mat = mats[0];
       var shadowU = { uHalf: common.uHalf, uTime: common.uTime, uWag: fishUniforms.uWag, uLight: common.uLight,
                       uFloorY: common.uFloorY, uDepth: common.uDepth, uFog: common.uFog, uFogDensity: common.uFogDensity,
                       uAlpha: shadowMat.uniforms.uAlpha, uPxPerUnit: U.uPxPerUnit,
                       uGenes: U.uGenes, uRingT: U.uRingT, uRingN: U.uRingN, uHalfRing: U.uHalfRing, uWalls: common.uWalls };
-      var shMats = [sh, shP].map(function (x) {   /* plain; the polished shadow (the roll only: the lite core) */
-        return new THREE.ShaderMaterial({ vertexShader: x.shadowVs, fragmentShader: SHADOW_FS, uniforms: shadowU,
-                                          transparent: true, depthWrite: true, depthFunc: THREE.LessDepth, side: THREE.DoubleSide });
-      });
-      var shMat = shMats[0];
+      /* its materials (the binder's): the body's plain and full programs (settle), the shadow's plain and
+       * polished (the roll only: the lite polish), sharing their uniforms (the water's clarity's among them,
+       * added first: a Look's materials merge them in when they are made), and the split's main draw
+       * (below); made in that order, as before the binder. mat: the plain body's (the probes bind its uGenes) */
+      clarityUniforms(U);
+      binder.define("app", { uniforms: { body: U, shadow: shadowU }, env: { EA: EA } });
+      binder.prepare(["app"]);
+      var mat = binder.material("app", "body", 0);
       /* The lit fish drawn apart (render PR2's stretch; option 2 of the #48
        * review). While the full programs are due (settle) and some fish, at
        * most half of them, are lit (commit: 60 % once split; none lit, e.g.
@@ -721,7 +744,8 @@
        * draw of their own (lit: its own instance buffers, the same gene
        * texture through their slots) on the full programs, and the main draw
        * keeps every fish in snapshot order on the plain body program plus one
-       * line (litSkip: an instance whose iBody.z is the LIT_SKIP sentinel is
+       * line (the binder's litSkip pass, its skip feature first in main(): an
+       * instance whose iBody.z is the LIT_SKIP sentinel is
        * clipped before any gene fetch): so a close view's few lit fish no
        * longer put every other fish on the full programs. The shadows are not
        * split: every fish's in the main draw on the lite shadow program, as
@@ -729,7 +753,6 @@
        * program (the roll, the fold and the polish terms scale with its size
        * weight, 0). setLitSplit(false): the whole kind on the full programs,
        * as before (measurements). */
-      var matSkip = new THREE.ShaderMaterial({ vertexShader: litSkip(sh.vs), fragmentShader: sh.fs, uniforms: U, side: THREE.DoubleSide });
       /* cap: the draw's capacity (instance buffers); slots.capacity: the gene texture's (gene slots) */
       var self = { cap: 0, n: 0, lod: "", attrs: null, geo: null, bgeo: null, mesh: null, bmesh: null, shadow: null,
                    tex: null, texData: null, slots: slots, pending: null, slotAttrFresh: false, last: null, litIdx: new Int32Array(0),
@@ -737,7 +760,7 @@
                    mat: mat, shaders: sh, barbels: false, tpls: tpls, barbTpl: barbTpl, bytes: 0 };
       var lit = self.lit;
       /* its polished programs and the split's plain body one with the skip (warmUp) */
-      self.warm = Warm([mats[1], shMats[1], matSkip], function () { return self.geo; });
+      self.warm = Warm(function () { return binder.warm(["app"]); }, function () { return self.geo; });
       var INST = ["iA", "iB", "iC", "iBody", "iX", "iGeneSlot"];
       self.inst = INST;   /* the instance attributes the probes share (iGeneSlot: the slots they read through) */
       /* three uploaded the gene texture (DataTexture.onUpdate, after its
@@ -788,8 +811,9 @@
           self.mesh.geometry = g; self.shadow.geometry = g;
           if (self.bmesh && bg) self.bmesh.geometry = bg;
         } else {
+          /* (made with the binder's plain materials; from the first commit on, the binder binds them) */
           self.mesh = new THREE.Mesh(g, mat);
-          self.shadow = new THREE.Mesh(g, shMat);
+          self.shadow = new THREE.Mesh(g, binder.material("app", "shadow", 0));
           self.mesh.frustumCulled = self.shadow.frustumCulled = false;
           self.shadow.renderOrder = 1; self.mesh.renderOrder = 2;
           scene.add(self.shadow); scene.add(self.mesh);
@@ -823,13 +847,13 @@
         } else {
           /* drawn before the main fish draw (renderOrder 1.5 < 2): the lit fish are the large close ones, so
            * the depth test then rejects the fragments of the fish behind them before they are shaded (as the
-           * single draw does when the close fish come first) */
-          lit.mesh = new THREE.Mesh(g, mats[1]);
+           * single draw does when the close fish come first) (the binder's full body material; drawLit binds it) */
+          lit.mesh = new THREE.Mesh(g, binder.material("app", "body", 1));
           lit.mesh.frustumCulled = false; lit.mesh.renderOrder = 1.5; lit.mesh.visible = false;
           scene.add(lit.mesh);
           profiler.watch(lit.mesh, "fishBody");
           if (bg) {
-            lit.bmesh = new THREE.Mesh(bg, mats[1]);
+            lit.bmesh = new THREE.Mesh(bg, binder.material("app", "body", 1));
             lit.bmesh.frustumCulled = false; lit.bmesh.renderOrder = 1.5; lit.bmesh.visible = false;
             scene.add(lit.bmesh);
             profiler.watch(lit.bmesh, "barbels");
@@ -857,6 +881,8 @@
         lit.geo.instanceCount = k;
         if (lit.bgeo) lit.bgeo.instanceCount = k;
         lit.bytes = commitInstances(L, k);
+        binder.bind(lit.mesh, "app", "body", 1);
+        if (lit.bmesh) binder.bind(lit.bmesh, "app", "body", 1);
         lit.mesh.visible = k > 0;
         if (lit.bmesh) lit.bmesh.visible = k > 0 && !!barbels && self.lod === "medium";
       }
@@ -935,6 +961,8 @@
         if (full && litSplit) {
           if (nLit === 0) full = false;
           else split = self.splitOn ? nLit * 5 <= n * 3 : nLit * 2 <= n;
+          /* (no skip to draw the main draw with: the lit fish would be drawn twice; the whole kind full instead) */
+          if (split && !binder.has("app", "litSkip", 0)) split = false;
         }
         self.splitOn = split;
         var w = full ? 1 : 0;
@@ -944,8 +972,9 @@
         if (self.bgeo) self.bgeo.instanceCount = n;
         self.bytes = commitInstances(self.attrs, n, slotsMoved || self.slotAttrFresh ? null : "iGeneSlot") + lit.bytes;
         self.slotAttrFresh = false;
-        self.mesh.material = split ? matSkip : mats[w]; self.shadow.material = shMats[w];
-        if (self.bmesh) self.bmesh.material = split ? matSkip : mats[w];
+        /* the programs due, handed to the binder (the split's main draw: the plain body with the skip) */
+        binder.bind(self.mesh, "app", split ? "litSkip" : "body", split ? 0 : w); binder.bind(self.shadow, "app", "shadow", w);
+        if (self.bmesh) binder.bind(self.bmesh, "app", split ? "litSkip" : "body", split ? 0 : w);
         /* the gene texture's upload: the slots' plan, if any (none: the
          * texture's version stays, three uploads nothing); "full" policy: the
          * whole texture every frame */
@@ -970,8 +999,9 @@
         if (self.bmesh) self.bmesh.visible = n > 0 && !!barbels && self.lod === "medium";
       };
       self.hide = function () { if (self.mesh) { self.mesh.visible = self.shadow.visible = false; if (self.bmesh) self.bmesh.visible = false; } hideLit(); };
-      /* 1: the full programs drawn (all the fish, or the lit ones apart: lit.on) */
-      self.variant = function () { return self.mesh ? (self.mesh.material === matSkip ? 1 : mats.indexOf(self.mesh.material)) : 0; };
+      /* 1: the full programs drawn (all the fish, or the lit ones apart: lit.on); 0 plain, or the plain
+       * ones a failed assembly fell back to */
+      self.variant = function () { return self.mesh ? binder.variantOf(lit.on ? lit.mesh : self.mesh) : 0; };
       return self;
     }
 
@@ -1384,7 +1414,7 @@
     function appearanceDrawn(s) {
       if (!EA || !s.app || s.app.length < s.n * EA.STRIDE) return null;
       if (!appKind) {
-        try { appKind = AppKind(); clarityUniforms(appKind.mat.uniforms); appStatus = "drawing"; }
+        try { appKind = AppKind(); appStatus = "drawing"; }   /* (its clarity uniforms: AppKind's own, before the binder's) */
         catch (e) { appStatus = "unavailable: " + (e && e.message || e); EA = null; console.warn("evo_boids: appearance renderer", e); return null; }
       }
       var r = appKind.reconcile(s, quality >= 3 ? "medium" : "coarse");
@@ -2190,6 +2220,14 @@
        * rest plain (AppKind's split); false (the default: see litSplit), the
        * whole kind on the full programs while any is lit, as before */
       setLitSplit: function (on) { litSplit = on === true; },
+      /* the fish's materials (web/ocean_materials.js): the binder's state
+       * (its Look, every cached material by key: reserved, ready or failed);
+       * setFeatures(set): a feature set (a Look's: web/ocean_materials.js says
+       * its shape; null, none), a Promise of the outcome: it takes effect only
+       * once every reachable variant assembled and compiled, else the previous
+       * set stays */
+      materials: function () { return binder.state(); },
+      setFeatures: function (set) { return binder.activate(set); },
       testFaults: testFaults,
       /* the drawing context: renderer strings, extensions, attributes, drawing buffer */
       contextInfo: contextInfo,
@@ -2224,7 +2262,7 @@
     posePx: posePx, poseVisibleQ: poseVisibleQ, posePack: posePack, reachRadius: reachRadius, REACH_APP: REACH_APP,
     shaderSources: function (P) {
       var i = P === "lite" ? 2 : P ? 1 : 0, EA = window.EvoAppearance, a = EA ? appearanceShaders(EA, P === "lite" ? "lite" : !!P) : null;
-      return { fishVs: FISH_VS[i], fishFs: FISH_FS[i], shadowVs: SHADOW_VS[i ? 1 : 0], shadowFs: SHADOW_FS,
+      return { fishVs: SHADERS.FISH_VS[i], fishFs: SHADERS.FISH_FS[i], shadowVs: SHADERS.SHADOW_VS[i ? 1 : 0], shadowFs: SHADERS.SHADOW_FS,
                app: a ? { vs: a.vs, fs: a.fs, shadowVs: a.shadowVs } : null };
     }
   };
