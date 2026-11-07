@@ -491,7 +491,13 @@ def run_cell(root, cid, link=False):
     data = rqlib.canonical(bundle)
     rqlib.write_durable(os.path.join(d, "bundle.json"), data)
     g = c["groups"].get("common")
+    # (plan/2, design v4 §3.5) the transplant group's realized donor draw and placement: one per
+    # predator snapshot x replicate x K (checked across cells at packing)
+    sh = bundle.get("sharing")
+    tg = f"{c['groups'].get('transplant')}|k{c['k']}" if sh and c["kind"] == "assay" else None
     done = {"schema": DONE_SCHEMA, "id": cid, "kind": c["kind"], "bundle_sha256": rqlib.sha256_bytes(data),
+            "transplant_group": tg,
+            "transplant_realized_sha256": sh["realized"]["transplant_realized_sha256"] if tg else None,
             "row_sha256": row_sha(c), "common_group": g if c["prey_policy"] == "common" else None,
             "common_sha256": bundle["files"].get("common.json"),
             # a challenge and its predator-free control share their prey settings (checked at packing)

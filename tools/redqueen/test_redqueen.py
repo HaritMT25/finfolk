@@ -400,15 +400,32 @@ class TestStore(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.root)
 
-    def mk_cell(self, cid, group="g1", csha="c" * 64, payload="x"):
+    def mk_cell(self, cid, group="g1", csha="c" * 64, payload="x", transplant=None):
         d = os.path.join(self.root, store.WORK, cid)
         os.makedirs(d)
         b = rqlib.canonical({"id": cid, "payload": payload})
         wr(os.path.join(d, "bundle.json"), b)
-        rqlib.write_json_durable(os.path.join(d, "done.json"), {
-            "schema": run.DONE_SCHEMA, "id": cid, "kind": "assay", "bundle_sha256": rqlib.sha256_bytes(b),
-            "row_sha256": "r" * 64, "common_group": group, "common_sha256": csha})
+        done = {"schema": run.DONE_SCHEMA, "id": cid, "kind": "assay", "bundle_sha256": rqlib.sha256_bytes(b),
+                "row_sha256": "r" * 64, "common_group": group, "common_sha256": csha}
+        if transplant:
+            done.update(transplant_group=transplant[0], transplant_realized_sha256=transplant[1])
+        rqlib.write_json_durable(os.path.join(d, "done.json"), done)
         wr(os.path.join(d, "end.json"), "big")
+
+    def test_transplant_groups(self):
+        """Design v4 §3.5: one transplant group (a predator snapshot x replicate x K) realizes one donor
+        draw and placement; a disagreement is refused at packing (within a pack and against the index)."""
+        self.mk_cell("t1", group="g1", transplant=("P.w01.t5|r00|k6", "d" * 64))
+        self.mk_cell("t2", group="g2", csha="b" * 64, transplant=("P.w01.t5|r00|k6", "d" * 64))
+        self.mk_cell("t3", group="g3", csha="e" * 64, transplant=("P.w02.t5|r00|k6", "f" * 64))
+        store.pack(self.root, log=lambda m: None)
+        recs, cells = store.load_index(self.root)
+        self.assertEqual(cells["t1"][1]["transplant_group"], "P.w01.t5|r00|k6")
+        self.assertEqual(store.transplant_groups(cells), {"P.w01.t5|r00|k6": "d" * 64, "P.w02.t5|r00|k6": "f" * 64})
+        self.mk_cell("t4", group="g4", csha="9" * 64, transplant=("P.w01.t5|r00|k6", "0" * 64))
+        with self.assertRaisesRegex(store.StoreError, "transplant group P.w01.t5.r00.k6 realized"):
+            store.pack(self.root, log=lambda m: None)
+        self.assertTrue(os.path.exists(os.path.join(self.root, store.WORK, "t4", "bundle.json")))
 
     def test_objects(self):
         sha = store.put_bytes(self.root, b'{"a":1}', compress=True)
@@ -669,6 +686,34 @@ class TestStore(unittest.TestCase):
         recs, _ = store.load_index(self.root)
         with zipfile.ZipFile(os.path.join(self.root, store.CHUNKS, recs[0]["chunk"])) as z:
             self.assertEqual(sorted(z.namelist()), ["z1/bundle.json", "z1/done.json"])
+
+
+class TestSharing(unittest.TestCase):
+    def test_sharing_record(self):
+        """Design v4 §3.5: a plan/2 bundle records its group keys, seeds and realized draws."""
+        arena = mk_cp(n_pred=3)
+        man = {"predators": {"source": "pred.json", "seed": 77, "pool": 6, "count": 3, "withReplacement": False,
+                             "picked": [{"sourceIndex": 5, "sourceId": 6, "lineageId": 6, "id": 7},
+                                        {"sourceIndex": 1, "sourceId": 2, "lineageId": 2, "id": 8},
+                                        {"sourceIndex": 0, "sourceId": 1, "lineageId": 1, "id": 9}]}}
+        c = {"groups": {"common": "pk", "transplant": "qk"}, "seeds": {"sample": 1, "transplant": 77}}
+        files = {"common.json": "c" * 64, "common.manifest.json": "m" * 64}
+        a = cell.sharing_record(c, arena, man, files)
+        self.assertEqual(a["schema"], cell.SHARING_SCHEMA)
+        self.assertEqual((a["keys"], a["seeds"]), (c["groups"], c["seeds"]))
+        self.assertEqual(a["realized"]["transplant"]["picked"], [[5, 6, 6], [1, 2, 2], [0, 1, 1]])
+        self.assertEqual(a["realized"]["common_sha256"], "c" * 64)
+        self.assertEqual(a, cell.sharing_record(c, copy.deepcopy(arena), copy.deepcopy(man), files))
+        moved = copy.deepcopy(arena)
+        moved["predators"]["posX"][0] += 1.0            # another placement: another realized transplant
+        b = cell.sharing_record(c, moved, man, files)
+        self.assertEqual(b["realized"]["transplant_draw_sha256"], a["realized"]["transplant_draw_sha256"])
+        self.assertNotEqual(b["realized"]["transplant_realized_sha256"], a["realized"]["transplant_realized_sha256"])
+        other = copy.deepcopy(man)
+        other["predators"]["picked"][0]["sourceIndex"] = 4    # another donor
+        self.assertNotEqual(cell.sharing_record(c, arena, other, files)["realized"]["transplant_draw_sha256"],
+                            a["realized"]["transplant_draw_sha256"])
+        self.assertEqual(cell.sharing_record(c, mk_cp(n_pred=0), {}, files)["realized"]["transplant"]["picked"], [])
 
 
 class TestFork(unittest.TestCase):

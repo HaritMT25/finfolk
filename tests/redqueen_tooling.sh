@@ -44,7 +44,9 @@
 #      sampling, reference ages permuted per prey snapshot x replicate (common manifest /2), one
 #      common checkpoint and reseed per prey snapshot x replicate and one transplant seed per
 #      predator snapshot x replicate across families, short and long horizons (the long subset
-#      exact), bundles /2 with their roles in the chunk index, and a replay.
+#      exact), bundles /2 with their roles in the chunk index, the actual sharing recorded (group
+#      keys, seeds, the realized common checkpoint, donor draw and placement: one per transplant
+#      group, checked at packing), and a replay.
 set -u
 BIN=${1:?usage: redqueen_tooling.sh EVO_BOIDS WORKDIR}
 W=${2:?usage: redqueen_tooling.sh EVO_BOIDS WORKDIR}
@@ -532,6 +534,27 @@ assert x["cell"]["seeds"]["reseed"] == y["cell"]["seeds"]["reseed"] == z["cell"]
 p1, p2 = B["A.T3000~A.T3000.common.frozen.k3.r01"], B["B.T3000~A.T3000.common.frozen.k3.r01"]
 assert p1["cell"]["seeds"]["transplant"] == p2["cell"]["seeds"]["transplant"]
 assert p1["cell"]["seeds"]["reseed"] != p2["cell"]["seeds"]["reseed"]
+# the actual sharing (design v4 §3.5): recorded in every bundle and the index; the coupled donor draw
+# and placement of one predator snapshot x replicate are the same whatever the prey
+for cid, b in B.items():
+    s = b["sharing"]
+    assert s["schema"] == "finfolk.redqueen.sharing/1" and s["keys"] == b["cell"]["groups"], cid
+    assert s["realized"]["common_sha256"] == b["files"]["common.json"]
+    e = cells[cid][1]
+    if b["cell"]["kind"] == "assay":
+        assert e["transplant_group"] == f"{b['cell']['groups']['transplant']}|k{b['cell']['k']}", (cid, e)
+        assert e["transplant_realized_sha256"] == s["realized"]["transplant_realized_sha256"]
+        assert len(s["realized"]["transplant"]["picked"]) == 3
+    else:
+        assert e["transplant_group"] is None and s["realized"]["transplant"]["picked"] == []
+assert p1["sharing"]["realized"]["transplant_realized_sha256"] == p2["sharing"]["realized"]["transplant_realized_sha256"]
+assert p1["sharing"]["realized"]["placement_sha256"] == p2["sharing"]["realized"]["placement_sha256"]
+groups = {}
+for cid, b in B.items():
+    if b["cell"]["kind"] == "assay":
+        groups.setdefault(cells[cid][1]["transplant_group"], set()).add(b["sharing"]["realized"]["transplant_realized_sha256"])
+assert all(len(v) == 1 for v in groups.values()) and any(
+    sum(1 for c in B if B[c]["cell"]["kind"] == "assay" and cells[c][1]["transplant_group"] == g) > 1 for g in groups), groups
 PY
 FORKV3=$(grep -o '"id":"A.T3000~none[^"]*r00"' plan_v3.jsonl | cut -d'"' -f4)
 $RUN --root r15 --replay "$FORKV3" --out rp15 > rp15.log 2>&1 || fail "replay of a v3 cell: $(tail -3 rp15.log)"

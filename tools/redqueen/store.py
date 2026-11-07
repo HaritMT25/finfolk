@@ -344,6 +344,19 @@ def pair_groups(cells):
     return out
 
 
+def transplant_groups(cells):
+    """{transplant group (predator snapshot x replicate x K, plan/2): the realized donor draw and
+    placement} over indexed cells (raises on a disagreement: design v4 §3.5)."""
+    out = {}
+    for cid, (_, e) in cells.items():
+        g, h = e.get("transplant_group"), e.get("transplant_realized_sha256")
+        if g and h:
+            if out.setdefault(g, h) != h:
+                raise StoreError(f"transplant group {g}: two different realized donor draws / placements "
+                                 f"({out[g][:12]}, {h[:12]})")
+    return out
+
+
 def next_chunk_name(root, recs):
     used = {r["chunk"] for r in recs}
     k = len(recs) + 1
@@ -374,6 +387,7 @@ def pack(root, ids=None, log=print):
         return None, 0
     groups = common_groups(cells)
     pairs = pair_groups(cells)
+    tgroups = transplant_groups(cells)
     members, entries = [], {}
     for cid in todo:
         d = os.path.join(root, WORK, cid)
@@ -390,12 +404,16 @@ def pack(root, ids=None, log=print):
         if pg and ph and pairs.setdefault(pg, ph) != ph:
             raise StoreError(f"{cid}: its arena's prey settings differ from those of the other cells of {pg} "
                              "(a challenge and its predator-free control must share them)")
+        tg, th = done.get("transplant_group"), done.get("transplant_realized_sha256")
+        if tg and th and tgroups.setdefault(tg, th) != th:
+            raise StoreError(f"{cid}: transplant group {tg} realized {th[:12]}, other cells {tgroups[tg][:12]}: the "
+                             "shared donor draw / placement differs (design v4 §3.5)")
         members.append((f"{cid}/bundle.json", b))
         members.append((f"{cid}/done.json", dn))
         entries[cid] = {"bundle_sha256": done["bundle_sha256"], "done_sha256": rqlib.sha256_bytes(dn),
                         "row_sha256": done.get("row_sha256"), "common_group": g, "common_sha256": h,
                         "pair_group": pg, "prey_config_sha256": ph, "kind": done.get("kind"),
-                        "role": done.get("role")}
+                        "role": done.get("role"), "transplant_group": tg, "transplant_realized_sha256": th}
     cdir = os.path.join(root, CHUNKS)
     if not os.path.isdir(cdir):
         os.makedirs(cdir, exist_ok=True)
