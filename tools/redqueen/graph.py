@@ -47,6 +47,16 @@ FAMILIES (v4 §4.5; quotas checked; no pair twice).
   noisy A/B and snapshot-test errors down; +5,178 pairs, about 0.24 production days at 5k);
   --snapshot-topup 0 --ab-topup 0 gives the v4 graph alone. They come after every registered
   family, which they leave unchanged.
+  lag7_probe  (v4 amendment, 2026-11-07) every NON-intensive C world's coarse prey snapshots (F1, 5M,
+              ..., 200M) against its own predators 7M later and 7M earlier, where they exist: 78 per
+              world, 24 x 78 = 1,872 within-world pairs (about 11,200 5k trajectories at R = 6, about
+              2 nominal hours). Why: Annex H.3.3's support rule 4 (lag phases in all four quadrants,
+              largest circular gap <= pi/2) fails for P = 15M in every non-intensive world (its lags
+              mod 15 miss 6-9: a 120-degree gap); +-7M lags close it (largest gap 48 degrees), so the
+              15M candidate is supported in all 32 C worlds, with statistical weight. Within-world
+              pairs: never in the Level-1 fit (as "within"); roles by endpoint; the randomized 1/8
+              long pool. --lag-probe 0 gives the graph without it. It comes after every other family,
+              which it leaves unchanged.
 
 ROLES. A pair is "support" when it is declared placement support of a held-out population: its four
 reference pairs, two of its existing matching pairs with an eligible training opponent (world
@@ -86,7 +96,9 @@ QUOTAS = {"within": 72_992, "ref_prey": 25_728, "ref_pred": 25_728, "ref_ab": 12
           "cross": 51_456, "ab_to_c": 12_864, "support_c": 19_296, "support_ab": 2_412, "train_match": 14_480}
 # optional top-ups (no registered quota: their counts are what the options generate)
 TOPUPS = ("support_snap", "ab_train_c")
-FAMILIES = tuple(QUOTAS) + TOPUPS
+LAG_PROBE = 7                       # (v4 amendment: the lag7_probe family; 0 = none)
+FAMILIES = tuple(QUOTAS) + TOPUPS + ("lag7_probe",)
+WITHIN = ("within", "lag7_probe")   # within-world families: never in the Level-1 (option a) fit
 GLOBAL = ("ref_prey", "ref_pred", "ref_ab", "ref_grid", "cross", "ab_to_c", "support_c", "support_ab", "train_match") \
     + TOPUPS
 HORIZON = {"ref_grid": "long", "support_c": "short", "support_ab": "short", "train_match": "short",
@@ -181,7 +193,7 @@ SNAPSHOT_TOPUP, AB_TOPUP = 6, 8     # the recommended top-ups (the recovery comp
 
 
 def build(ns="rq2026-graph", worlds=None, train_matchings=True, snapshot_topup=SNAPSHOT_TOPUP, ab_topup=AB_TOPUP,
-          ab_topup_mode="fitting"):
+          ab_topup_mode="fitting", lag_probe=LAG_PROBE):
     """-> the graph: {"schema", "namespace", "worlds", "split", "fork", "intensive", "holdout",
     "edges": [(prey, pred, family, role, horizon)], ...}.
     snapshot_topup N: every snapshot-holdout population with fewer than N training opponents among
@@ -372,6 +384,14 @@ def build(ns="rq2026-graph", worlds=None, train_matchings=True, snapshot_topup=S
                 need = ab_topup - c_opp[x] - (4 if ab_topup_mode == "fitting" else 0)
                 if need > 0:
                     new_opponents(x, "Q", need, "ab_train_c", "ab-train", as_support=False)
+    if lag_probe:                            # (v4 amendment) the +-lag_probe M within-world probes
+        for w in cs:
+            if w in intensive:
+                continue
+            for s_ in COARSE:
+                for t in (s_ + lag_probe, s_ - lag_probe):
+                    if TIMES[0] <= t <= TIMES[-1] and not add(Q(w, s_), P(w, t), "lag7_probe"):
+                        raise GraphError(f"lag7_probe {w} {s_}->{t}: the pair exists")
     order = {"test": 2, "val": 1, "train": 0}
     role_name = {2: "test", 1: "validation", 0: "training"}
     edges = []
@@ -384,6 +404,7 @@ def build(ns="rq2026-graph", worlds=None, train_matchings=True, snapshot_topup=S
     edges.sort(key=lambda e: (FAMILIES.index(e[2]), e[0], e[1]))
     return {"schema": GRAPH_SCHEMA, "namespace": ns, "train_matchings": train_matchings,
             "topups": {"snapshot": snapshot_topup, "ab": ab_topup, "ab_mode": ab_topup_mode},
+            "lag_probe": lag_probe,
             "worlds": worlds, "split": split, "fork": fork, "intensive": intensive,
             "holdout": {f"{w}:{t}": v for (w, t), v in sorted(holdout.items())},
             "ref_subsets": {"predator_refs_of_block": sub_p, "prey_refs_of_block": sub_q},
@@ -397,6 +418,11 @@ def check_quotas(g):
              if (f != "train_match" or g["train_matchings"]) and c.get(f, 0) != n]
     if len({(e[0], e[1]) for e in g["edges"]}) != len(g["edges"]):
         probs.append("a pair occurs twice")
+    if g.get("lag_probe"):                   # 78 per non-intensive C world (41 coarse times, +-7M where they fit)
+        n = sum(1 for w in g["worlds"] if w["treatment"] == "C" and w["id"] not in g["intensive"])
+        want = n * sum((0 <= s + d <= 200) for s in COARSE for d in (g["lag_probe"], -g["lag_probe"]))
+        if c.get("lag7_probe", 0) != want:
+            probs.append(f"lag7_probe: {c.get('lag7_probe', 0)} pairs, the amendment has {want}")
     return probs
 
 
@@ -444,7 +470,7 @@ def fitting(g, rule):
             continue
         if fam == "train_match" and rule in ("no_new_matchings", "option_b"):
             continue
-        if fam == "within" and rule != "option_b":
+        if fam in WITHIN and rule != "option_b":
             continue
         if rule == "forward_time" and any(parse(x)[1] is not None and parse(x)[2] > FORWARD_LAST for x in (q, p)):
             continue
@@ -541,6 +567,8 @@ def main(argv=None):
     b.add_argument("--snapshot-topup", type=int, default=SNAPSHOT_TOPUP, metavar="N", help="0: none (pure v4)")
     b.add_argument("--ab-topup", type=int, default=AB_TOPUP, metavar="N", help="0: none (pure v4)")
     b.add_argument("--ab-topup-mode", choices=("fitting", "c"), default="fitting")
+    b.add_argument("--lag-probe", type=int, default=LAG_PROBE, metavar="M",
+                   help="the lag7_probe family's lag (v4 amendment; 0: none)")
     r = sub.add_parser("report")
     r.add_argument("--graph", required=True)
     r.add_argument("--out")
@@ -548,7 +576,7 @@ def main(argv=None):
     try:
         if a.cmd == "build":
             g = build(a.namespace, registry_worlds(a.registry) if a.registry else None, not a.no_train_matchings,
-                      a.snapshot_topup, a.ab_topup, a.ab_topup_mode)
+                      a.snapshot_topup, a.ab_topup, a.ab_topup_mode, a.lag_probe)
             probs = check_quotas(g)
             if probs:
                 raise GraphError("; ".join(probs))

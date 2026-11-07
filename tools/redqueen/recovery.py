@@ -196,7 +196,7 @@ class Data:
         self.pj = np.fromiter((pn[e[1]] for e in g["edges"]), int, E)
         self.fam = np.fromiter((FAMS.index(e[2]) for e in g["edges"]), int, E)
         self.role = np.fromiter((ROLES.index(e[3]) for e in g["edges"]), int, E)
-        self.within = self.fam == FAMS.index("within")
+        self.within = np.isin(self.fam, [FAMS.index(f) for f in graphlib.WITHIN])
         lag = self.pt[self.pj] - self.qt[self.qi]
         self.lagbin = np.where(self.within, np.digitize(lag, LAG_EDGES[1:-1]), -1)
         self.nbins = len(LAG_EDGES) - 1
