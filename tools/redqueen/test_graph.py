@@ -248,6 +248,22 @@ class TestRecovery(unittest.TestCase):
         again = self.rec.simulate(self.D, self.rec.SCENARIOS["r1_034"], 11)
         self.assertTrue(np.array_equal(again["z"], data["z"]) and np.array_equal(again["s0"], data["s0"]))
 
+    def test_capture_noise(self):
+        """The measured 5k noise model: the per-replicate logit SD (binomial included) follows the capture
+        level: about 0.6 below C/B 0.25, 0.15 above 0.45; x1.5 in _cap15; the flat scenarios unchanged."""
+        for name, k in (("r0_cap", 1.0), ("r0_cap15", 1.5)):
+            data = self.rec.simulate(self.D, self.rec.SCENARIOS[name], 31)
+            p = 1.0 / (1.0 + np.exp(-data["eta"]))
+            sd2 = data["z"].var(axis=1, ddof=1)
+            lo, hi = (p > 0.18) & (p < 0.25), p > 0.47
+            self.assertGreater(lo.sum(), 500)
+            self.assertGreater(hi.sum(), 500)
+            self.assertAlmostEqual(float(np.sqrt(sd2[lo].mean())), 0.6 * k, delta=0.1 * k)
+            self.assertAlmostEqual(float(np.sqrt(sd2[hi].mean())), 0.15 * k, delta=0.05 * k)
+        a = self.rec.simulate(self.D, self.rec.SCENARIOS["r0"], 31)
+        self.assertEqual(self.rec.SCENARIOS["r0"].get("noise_model", "flat"), "flat")
+        self.assertTrue(np.array_equal(a["z"], self.rec.simulate(self.D, dict(rank=0, noise_model="flat"), 31)["z"]))
+
     def test_noiseless_identification(self):
         data = self.rec.simulate(self.D, self.rec.SCENARIOS["num_r2"], 12)
         out = self.rec.numerical(self.D, data, "a", 2, 60, 12)
@@ -289,6 +305,103 @@ class TestRecovery(unittest.TestCase):
         self.assertEqual(self.rec.wilson(0, 0), None)
         lo, hi = self.rec.wilson(16, 20)
         self.assertTrue(lo < 0.8 < hi)
+
+
+@unittest.skipIf(np is None, "numpy is not installed (set RQ_PYLIB, or RQ_REQUIRE_NUMPY=1 to require it)")
+class TestMap(unittest.TestCase):
+    """map.py, the registered map (item 7): the monotone QP and surface, the SVD warm start, and the
+    joint fit (its rank-0 false-positive regression)."""
+
+    @classmethod
+    def setUpClass(cls):
+        import map as mapfit
+        import recovery
+        cls.M, cls.rec = mapfit, recovery
+        cls.D = recovery.Data(full())
+
+    def test_monotone_qp(self):
+        M = self.M
+        A, c = np.eye(2), np.array([2.0, 1.0])
+        C = np.array([[-1.0, 1.0]])                                # x1 >= x0
+        x = M.monotone_qp(A, c, C, np.zeros(2))
+        self.assertTrue(np.allclose(x, [1.5, 1.5]), x)            # the isotonic projection
+        x = M.monotone_qp(A, np.array([1.0, 2.0]), C, np.zeros(2))
+        self.assertTrue(np.allclose(x, [1.0, 2.0]), x)            # already feasible: unconstrained
+
+    def test_surface_monotone(self):
+        M = self.M
+        rng = np.random.default_rng(3)
+        a, b = rng.normal(size=4000), rng.normal(size=4000)
+        y = np.tanh(a) - 0.5 * b + rng.normal(0, 0.3, 4000)         # nondecreasing in a, nonincreasing in b
+        y[:200] = -y[:200]                                           # some contrary data
+        s = M.Surface(M._knots(a), M._knots(b), ("inc", "dec"))
+        s.fit(a, b, y, np.ones(4000))
+        self.assertGreaterEqual(float((M.CONS[("inc", "dec")] @ s.theta.ravel()).min()), -1e-9)
+        grid = np.linspace(-2, 2, 9)
+        va = s.value(grid, np.zeros(9))
+        vb = s.value(np.zeros(9), grid)
+        self.assertTrue((np.diff(va) >= -1e-9).all() and (np.diff(vb) <= 1e-9).all())
+
+    def test_svd_warm_start(self):
+        M = self.M
+        rng = np.random.default_rng(1)
+        nQ, nP = 60, 50
+        U0, V0 = rng.normal(size=(nQ, 2)), rng.normal(size=(nP, 2))
+        mask = rng.random((nQ, nP)) < 0.3
+        mask[7, :] = False                                           # a prey node without fitting pairs
+        qi, pj = np.nonzero(mask)
+        val = (U0 @ V0.T)[qi, pj]
+        U, s, V = M.top_singular(qi, pj, val, nQ, nP, 2, seed=0, iters=30)
+        Z = np.zeros((nQ, nP))
+        Z[qi, pj] = val
+        self.assertTrue(np.allclose(s, np.linalg.svd(Z, compute_uv=False)[:2], rtol=1e-6))
+        u, v = M.svd_start(qi, pj, val, nQ, nP, 2, seed=0)
+        self.assertEqual((u.shape, v.shape), ((nQ, 2), (nP, 2)))
+        self.assertEqual(float(np.abs(u[7]).max()), 0.0)
+        self.assertGreater(float(np.corrcoef((u[qi] * v[pj]).sum(axis=1), val)[0, 1]), 0.6)
+
+    def test_fit_smoke_and_rank0_regression(self):
+        """Both starts run and keep the surfaces monotone; on a noisy rank-0 two-way truth the joint
+        fit does not prefer rank 1 (the false positive that head-specific survival qualities fixed)."""
+        D, M, rec = self.D, self.M, self.rec
+        idx = D.fit["a"]
+        data = rec.simulate(D, rec.SCENARIOS["r0_twoway"], 101)
+        with self.assertRaisesRegex(ValueError, "warm or cold"):
+            M.fit(D, idx, data, 1, 0.1, False, 1, 1, start="hot")
+        scores = {}
+        for rank, start in ((0, "warm"), (1, "warm"), (1, "cold")):
+            m = M.fit(D, idx, data, rank, 0.1, False, 30, 1, start=start)
+            for surf, key in ((m["surfC"], ("inc", "dec")), (m["surfS"], ("dec", "inc"))):
+                self.assertGreaterEqual(float((M.CONS[key] @ surf.theta.ravel()).min()), -1e-9)
+            p = M.predict(D, m, idx)
+            self.assertTrue(np.isfinite(p).all())
+            s2 = float(((data["z"][idx] - p[:, None]) ** 2).mean())
+            scores[(rank, start)] = rec.world_mean(rec.lpd(data["z"][D.val_idx], M.predict(D, m, D.val_idx), s2),
+                                                   D.val_world)[0]
+        self.assertGreaterEqual(scores[(0, "warm")], scores[(1, "warm")], scores)
+        self.assertGreaterEqual(scores[(0, "warm")], scores[(1, "cold")], scores)
+
+    def test_own_world_stage2(self):
+        """q30b: option (b) is refused inside the Level-1 fit; the cross-fitted stage-2 layer recovers a
+        strong own-world lag effect on the within-world pairs out of fold (Level 1 untouched)."""
+        D, M, rec = self.D, self.M, self.rec
+        data = rec.simulate(D, rec.SCENARIOS["r0_ownworld"], 21)
+        with self.assertRaisesRegex(ValueError, "option .b. is dropped"):
+            M.fit(D, D.fit["a"], data, 0, 0.1, True, 1, 1)
+        m = M.fit(D, D.fit["a"], data, 0, 0.1, False, 15, 1)
+        idx_w = np.flatnonzero(D.within & (D.role == rec.ROLES.index("training")))
+        before = {k: v.copy() for k, v in m.items() if isinstance(v, np.ndarray)}
+        own = M.own_world_stage2(D, m, data, idx_w, folds=5)
+        self.assertTrue(all(np.array_equal(before[k], m[k]) for k in before))
+        truth = data["eta"][idx_w] - M.predict(D, m, idx_w)               # what Level 1 leaves out there
+        self.assertGreater(float(np.corrcoef(own["oof"], truth)[0, 1]), 0.5)
+        self.assertLess(float(np.mean((truth - own["oof"]) ** 2)), 0.5 * float(np.mean(truth ** 2)))
+        self.assertEqual(sorted(np.unique(own["fold"]).tolist()), [0, 1, 2, 3, 4])
+        p = M.predict(D, m, idx_w, own=own)
+        self.assertTrue(np.allclose(p, M.predict(D, m, idx_w) + own["h"][D.lagbin[idx_w]]
+                                    + own["hw"][D.ownw[idx_w], D.lagbin[idx_w]]))      # (identity link here)
+        with self.assertRaisesRegex(ValueError, "within-world pairs only"):
+            M.own_world_stage2(D, m, data, D.fit["a"][:10])
 
 
 if __name__ == "__main__":

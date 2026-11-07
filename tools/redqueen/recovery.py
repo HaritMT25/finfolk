@@ -51,6 +51,10 @@ clustered strategies, a strong own-world lag, doubled noise (also at 1.7%). The 
 (row 0.15, column 0.15, cell 0.20 on the logit scale, plus the binomial) are planning values until
 the independent noise bank (v4 §7.4) measures them. power (--reps // 2 each): the noise tripled and
 quadrupled at 3.4% and 1.7% (and rank 0 at triple noise), where the options can differ.
+capture-level noise (the measured 5k assay noise, predC/noise5k variant 2; scenarios *_cap and *_cap15
+for r0, r0_twoway, r1_017, r2_017, r2_034): the per-replicate logit SD, binomial included, is 0.6 at a
+capture fraction <= 0.25, linear to 0.15 at >= 0.45 (CAPTURE_SD), the row / column / cell structure kept;
+_cap15 is x1.5 (the age-permutation component was not measured: a lower bound).
 numerical: noiseless data at ranks 1-4, fitted at the true rank with a penalty continuation (relative
 test RMSE: the graph identifies them). --scenarios runs a list instead of a set.
 
@@ -93,6 +97,14 @@ OPTIONS = ("a", "b", "base")
 REF_TIMES = (0, 20, 60, 100, 120, 140, 180, 200)
 LAG_EDGES = (-200, -50, -20, -10, -5, -3, -2, -1, 0, 1, 2, 3, 5, 10, 20, 50, 201)
 
+SC0 = {"r0": dict(rank=0), "r0_twoway": dict(rank=0, kappa=0.25), "r1_017": dict(rank=1, energy=0.017),
+       "r2_017": dict(rank=2, energy=0.017), "r2_034": dict(rank=2, energy=0.034)}
+CAP_SET = ("r0", "r0_twoway", "r1_017", "r2_017", "r2_034")
+# per-replicate logit SD at 5k against the capture fraction C/B (noise5k REPORT.md, variant 2: 0.47-0.79
+# at C/B 0.23-0.31, 0.10-0.24 at C/B >= 0.42): 0.6 at <= 0.25, linear to 0.15 at >= 0.45; it INCLUDES the
+# binomial count noise (the simulated Gaussian part is the remainder, at least 0.05). Not measured: the
+# reference-age permutation (a lower bound: hence the x1.5 case)
+CAPTURE_SD = ((0.25, 0.6), (0.45, 0.15))
 SCENARIOS = {
     "r0": dict(rank=0), "r1_017": dict(rank=1, energy=0.017), "r1_034": dict(rank=1, energy=0.034),
     "r2_017": dict(rank=2, energy=0.017), "r2_034": dict(rank=2, energy=0.034),
@@ -106,6 +118,10 @@ SCENARIOS = {
     "r2_017_x4": dict(rank=2, energy=0.017, noise_scale=4.0),
     "r1_034_x3": dict(rank=1, energy=0.034, noise_scale=3.0), "r2_034_x3": dict(rank=2, energy=0.034, noise_scale=3.0),
     "r1_034_x4": dict(rank=1, energy=0.034, noise_scale=4.0), "r2_034_x4": dict(rank=2, energy=0.034, noise_scale=4.0),
+    # the measured 5k noise (predC/noise5k, v4-like variant 2: the donor draw varies per replicate): the
+    # per-replicate logit SD depends on the capture level (CAPTURE_SD), x1.5 the conservative case
+    **{f"{n}_cap": dict(SC0[n], noise_model="capture") for n in CAP_SET},
+    **{f"{n}_cap15": dict(SC0[n], noise_model="capture", noise_scale=1.5) for n in CAP_SET},
     "num_r1": dict(rank=1, energy=0.034, noiseless=True), "num_r2": dict(rank=2, energy=0.034, noiseless=True),
     "num_r3": dict(rank=3, energy=0.034, noiseless=True), "num_r4": dict(rank=4, energy=0.034, noiseless=True),
 }
@@ -117,7 +133,14 @@ SETS = {"main": ["r0", "r1_017", "r1_034", "r2_017", "r2_034"],
                   "r1_017_x3", "r2_017_x3", "r1_017_x4", "r2_017_x4"]}
 DEFAULTS = dict(rank=0, energy=0.0, link="logit", kappa=0.0, clustered=False, own=-0.25, noise_scale=1.0,
                 noiseless=False, mu0=-0.5, rise=1.5, rw_end=0.5, snap_sd=0.1,
-                noise_row=0.15, noise_col=0.15, noise_cell=0.20)
+                noise_row=0.15, noise_col=0.15, noise_cell=0.20, noise_model="flat")
+SETS_CAP = [f"{n}_cap" for n in CAP_SET] + [f"{n}_cap15" for n in CAP_SET]
+
+
+def capture_sd(p, scale=1.0):
+    """The measured per-replicate logit SD at capture fraction p (CAPTURE_SD, flat beyond its ends), x scale."""
+    (p0, s0), (p1, s1) = CAPTURE_SD
+    return scale * np.interp(p, [p0, p1], [s0, s1])
 
 
 # ------------------------------------------------------------------ data
@@ -266,6 +289,23 @@ def simulate(D, sc, seed):
     eta = eta0 + own + inter
     if s["noiseless"]:
         z = np.repeat(eta[:, None], R_REPS, axis=1)
+    elif s["noise_model"] == "capture":
+        # the row / column / cell structure kept, its total per-pair SD set by the pair's capture level:
+        # the Gaussian part's SD g = sqrt(capture_sd^2 - binomial variance), at least 0.05
+        pt = 1.0 / (1.0 + np.exp(-eta))
+        if s["link"] == "asym":
+            pt = 0.03 + 0.77 * pt
+        flat = math.sqrt(s["noise_row"] ** 2 + s["noise_col"] ** 2 + s["noise_cell"] ** 2)
+        g = np.sqrt(np.maximum(capture_sd(pt, s["noise_scale"]) ** 2 - 1.0 / (B_COUNT * pt * (1.0 - pt)), 0.05 ** 2))
+        y = eta[:, None] + (g / flat)[:, None] * (
+            s["noise_row"] * rng.normal(size=(D.nQ, R_REPS))[D.qi]
+            + s["noise_col"] * rng.normal(size=(D.nP, R_REPS))[D.pj]
+            + s["noise_cell"] * rng.normal(size=(len(eta), R_REPS)))
+        p = 1.0 / (1.0 + np.exp(-y))
+        if s["link"] == "asym":
+            p = 0.03 + 0.77 * p
+        cnt = rng.binomial(B_COUNT, p)
+        z = np.log((cnt + 0.5) / (B_COUNT - cnt + 0.5))
     else:
         k = s["noise_scale"]
         y = (eta[:, None] + k * s["noise_row"] * rng.normal(size=(D.nQ, R_REPS))[D.qi]
@@ -426,15 +466,16 @@ def cluster_lb(diff, worlds, rng, n=2000):
 FITTERS = ("minimal", "registered")
 
 
-def any_fit(fitter, D, idx, data, rank, lam, own_layer, iters, seed, ab_cap=None, init=None, balance=False):
+def any_fit(fitter, D, idx, data, rank, lam, own_layer, iters, seed, ab_cap=None, init=None, balance=False,
+            start="warm"):
     """The minimal fitter (fit) or the registered map (map.py: monotone 6 x 6 tensor baseline,
-    bounded link, the joint survival head)."""
+    bounded link, the joint survival head; start: its embedding's SVD warm start or a cold one)."""
     if fitter == "registered":
         try:
             import map as mapfit
         except ImportError:
             raise SystemExit("--fitter registered needs map.py (item 7, the registered map; its own PR)")
-        return mapfit.fit(D, idx, data, rank, lam, own_layer, iters, seed, init=init)
+        return mapfit.fit(D, idx, data, rank, lam, own_layer, iters, seed, init=init, start=start)
     return fit(D, idx, data["zbar"], rank, lam, own_layer, iters, seed, ab_cap=ab_cap, init=init, balance=balance)
 
 
@@ -458,17 +499,23 @@ def class_accuracy(D, data, m1, m0):
     return out
 
 
-def procedure(D, data, option, ranks, lambdas, iters, seed, ab_cap=None, fitter="minimal"):
-    """The registered selection and prediction procedure on one dataset for one fitting option."""
+PRIMARY_RANKS = 2      # (v4 amendment proposed 2026-11-07: the primary confirmatory rank set is {0, 1, 2})
+
+
+def procedure(D, data, option, ranks, lambdas, iters, seed, ab_cap=None, fitter="minimal", start="warm"):
+    """The registered selection and prediction procedure on one dataset for one fitting option.
+    Every candidate also records its test improvement over rank 0 and the world-cluster lower
+    bound, and the selection restricted to ranks <= PRIMARY_RANKS is reported beside the full one
+    (selected_primary)."""
     idx = D.fit[option]
     own_layer = option == "b"
     cands = [(0, 0.0)] + [(r, lam) for r in range(1, ranks + 1) for lam in lambdas]
-    out = {"candidates": [], "fitter": fitter}
+    out = {"candidates": [], "fitter": fitter, "start": start if fitter == "registered" else None}
     best, models = None, {}
     predict = any_predict              # noqa: F811 (the procedure scores whichever fitter it ran)
     for r, lam in cands:
         t0 = time.time()
-        m = any_fit(fitter, D, idx, data, r, lam, own_layer, iters, seed, ab_cap=ab_cap)
+        m = any_fit(fitter, D, idx, data, r, lam, own_layer, iters, seed, ab_cap=ab_cap, start=start)
         s2 = float(((data["z"][idx] - predict(D, m, idx)[:, None]) ** 2).mean())
         pv = predict(D, m, D.val_idx)
         vscore, _ = world_mean(lpd(data["z"][D.val_idx], pv, s2), D.val_world)
@@ -484,7 +531,16 @@ def procedure(D, data, option, ranks, lambdas, iters, seed, ab_cap=None, fitter=
     m1, s21 = models[sel]
     m0, s20 = models[(0, 0.0)]
     zt = data["z"][D.test_idx]
-    diff = lpd(zt, predict(D, m1, D.test_idx), s21) - lpd(zt, predict(D, m0, D.test_idx), s20)
+    base = lpd(zt, predict(D, m0, D.test_idx), s20)
+    for rec in out["candidates"]:      # (every candidate against rank 0: any restricted selection, post hoc)
+        mk, sk = models[(rec["rank"], rec["lambda"])]
+        rec["test_improvement"], rec["test_lb"], _ = cluster_lb(lpd(zt, predict(D, mk, D.test_idx), sk) - base,
+                                                                D.test_world, np.random.default_rng(seed + 7))
+    prim = max((c for c in out["candidates"] if c["rank"] <= PRIMARY_RANKS), key=lambda c: c["val_lpd"])
+    out["selected_primary"] = {"ranks": list(range(PRIMARY_RANKS + 1)), "rank": prim["rank"],
+                               "lambda": prim["lambda"], "test_improvement": prim["test_improvement"],
+                               "test_lb": prim["test_lb"], "success": bool(prim["rank"] > 0 and prim["test_lb"] > 0)}
+    diff = lpd(zt, predict(D, m1, D.test_idx), s21) - base
     mean, lb, per = cluster_lb(diff, D.test_world, np.random.default_rng(seed + 7))
     zs = data["z"][D.stest_idx]
     sdiff = lpd(zs, predict(D, m1, D.stest_idx), s21) - lpd(zs, predict(D, m0, D.stest_idx), s20)
@@ -552,12 +608,13 @@ def one(a):
            "graph_edges_sha256": D.g["edges_sha256"], "options": {}}
     cap = a.ab_cap if a.ab_cap >= 0 else None
     res["fitter"] = a.fitter
+    res["start"] = a.start
     for opt in a.options.split(","):
         if sc.get("noiseless"):
             res["options"][opt] = numerical(D, data, opt, sc["rank"], a.iters, seed, ab_cap=cap, fitter=a.fitter)
         else:
             res["options"][opt] = procedure(D, data, opt, a.ranks, [float(x) for x in a.lambdas.split(",")],
-                                            a.iters, seed, ab_cap=cap, fitter=a.fitter)
+                                            a.iters, seed, ab_cap=cap, fitter=a.fitter, start=a.start)
     res["seconds"] = round(time.time() - t0, 1)
     rqlib.write_json_durable(a.out, res)
     return 0
@@ -584,7 +641,7 @@ def run(a):
             cmd = [sys.executable, os.path.abspath(__file__), "one", "--graph", a.graph, "--scenario", sc,
                    "--rep", str(rep), "--out", f, "--options", a.options, "--ranks", str(a.ranks),
                    "--lambdas", a.lambdas, "--iters", str(a.iters), "--namespace", a.namespace,
-                   "--ab-cap", str(a.ab_cap), "--fitter", a.fitter]
+                   "--ab-cap", str(a.ab_cap), "--fitter", a.fitter, "--start", a.start]
             running.append((subprocess.Popen(cmd, env=env, stdin=subprocess.DEVNULL), sc, rep))
         time.sleep(0.5)
         for item in list(running):
@@ -621,9 +678,21 @@ def summarize(d):
             sel = {}
             for o in lst:
                 sel[o["selected"]["rank"]] = sel.get(o["selected"]["rank"], 0) + 1
+            prim = [o["selected_primary"] for o in lst if "selected_primary" in o]
+            kp = sum(p["success"] for p in prim)
+            selp = {}
+            for p in prim:
+                selp[p["rank"]] = selp.get(p["rank"], 0) + 1
             out["cells"].append({"scenario": sc, "option": opt, "datasets": len(lst), "successes": k,
                                  "rate": round(k / len(lst), 3), "wilson95": wilson(k, len(lst)),
                                  "selected_ranks": dict(sorted(sel.items())),
+                                 "positive_rank_selected": sum(o["selected"]["rank"] > 0 for o in lst),
+                                 "primary": ({"ranks": prim[0]["ranks"], "datasets": len(prim), "successes": kp,
+                                              "rate": round(kp / len(prim), 3), "wilson95": wilson(kp, len(prim)),
+                                              "selected_ranks": dict(sorted(selp.items())),
+                                              "positive_rank_selected": sum(p["rank"] > 0 for p in prim)}
+                                             if prim else None),
+                                 "start": lst[0].get("start"),
                                  "mean_test_improvement": float(np.mean([o["test_improvement"] for o in lst])),
                                  "mean_test_lb": float(np.mean([o["test_lb"] for o in lst])),
                                  "fit_pairs": lst[0]["fit_pairs"],
@@ -707,6 +776,8 @@ def main(argv=None):
                            help="hold the A/B prey's interaction to rank <= R in every fit (-1: no cap)")
             s.add_argument("--fitter", choices=FITTERS, default="minimal",
                            help="minimal (ridge ALS) or registered (map.py, item 7: the v4 §6 map)")
+            s.add_argument("--start", choices=("warm", "cold"), default="warm",
+                           help="the registered map's embedding start: SVD warm start (registered) or cold")
         if name == "run":
             s.add_argument("--set", choices=("main", "stress", "power", "numerical", "all"), default="main")
             s.add_argument("--scenarios", help="a comma list instead of --set (--reps each; numerical: 1)")
