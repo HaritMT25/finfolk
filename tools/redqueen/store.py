@@ -146,7 +146,19 @@ def migrate_all(root, log=print):
     return n, probs
 
 
-FINALIZED = "FINALIZED"   # the marker a finished archive directory carries (the --link-sources contract)
+def start_session(root, link_sources, log=print):
+    """A runner's start (review round 4): migrate_all under the COPY policy first, so every object an
+    earlier session left shared (a hard link, however read-only, whose archive contract nobody
+    re-checked) or writable becomes a verified independent copy; only then this session's policy.
+    With --link-sources, links therefore exist only for this session's insertions, each made
+    through put_file's archive-contract check. -> migrate_all's (count, problems)."""
+    allow_links(False)
+    res = migrate_all(root, log)
+    allow_links(link_sources)
+    return res
+
+
+FINALIZED ="FINALIZED"   # the marker a finished archive directory carries (the --link-sources contract)
 
 
 def link_contract_problem(src):

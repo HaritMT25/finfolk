@@ -443,6 +443,40 @@ class TestStore(unittest.TestCase):
             f.write("ARCHIVE v2")
         self.assertEqual(store.get_bytes(self.root, sha), b"archive v1")
 
+    def test_link_session_start(self):
+        """Review round 4: a READ-ONLY legacy hard link into an archive without FINALIZED, in a root
+        resumed with --link-sources, is migrated to an independent copy at the start (the copy
+        policy runs first); a mismatched one is reported and never served; the session's policy
+        is the requested one afterwards."""
+        arch = os.path.join(self.root, "archive")
+        os.makedirs(arch)                                    # no FINALIZED, writable directory
+        objs = {}
+        for name, text in (("good", "legacy world"), ("bad", "legacy world two")):
+            p = os.path.join(arch, name + ".json")
+            wr(p, text)
+            sha = rqlib.sha256_bytes(text.encode())
+            o = os.path.join(self.root, store.OBJECTS, sha[:2], sha)
+            os.makedirs(os.path.dirname(o), exist_ok=True)
+            os.link(p, o)
+            objs[name] = (p, sha, o)
+        p_bad = objs["bad"][0]
+        wr(p_bad, "LEGACY WORLD TWO")                        # rewritten through the shared inode ...
+        for p, _, _ in objs.values():
+            os.chmod(p, 0o444)                               # ... and both read-only now
+        try:
+            n, probs = store.start_session(self.root, True, log=lambda m: None)
+            self.assertEqual(n, 1)
+            self.assertTrue(len(probs) == 1 and objs["bad"][1][:12] in probs[0], probs)
+            p, sha, o = objs["good"]
+            self.assertEqual((os.stat(o).st_nlink, os.stat(o).st_mode & 0o777), (1, 0o444))
+            self.assertNotEqual(os.stat(o).st_ino, os.stat(p).st_ino)
+            self.assertTrue(store._LINKS_ALLOWED)            # the session's policy, set afterwards
+            self.assertIsNone(store.has(self.root, objs["bad"][1]))   # still never served
+        finally:
+            for p, _, _ in objs.values():
+                os.chmod(p, 0o644)
+            store.allow_links(False)
+
     def test_link_contract(self):
         """--link-sources: refused for a writable file, a writable directory or no FINALIZED marker;
         accepted (one shared inode) for a finalized read-only archive."""
@@ -852,6 +886,34 @@ class TestRunner(unittest.TestCase):
                 run.recover_bio_ledger(root)
             with self.assertRaises(run.LedgerError):
                 run.read_bio_ledger(root)
+        finally:
+            shutil.rmtree(root)
+
+    def test_bio_ledger_partial_write(self):
+        """Review round 4: a write error after a PARTIAL record blocks every further append of the
+        session (the next failure stays unacknowledged instead of landing on the partial bytes); the
+        restart's recovery cuts the partial record and keeps every acknowledged one."""
+        import errno
+        root = tempfile.mkdtemp()
+        try:
+            led = run.BioLedger(root)
+            led.append({"cell": "c1", "role": "prey", "sha256": "1" * 64})       # acknowledged
+
+            def partial(f, data):
+                f.write(data[: len(data) // 2])
+                raise OSError(errno.ENOSPC, "No space left on device")
+            led._write = partial
+            with self.assertRaises(OSError):
+                led.append({"cell": "c2", "role": "prey", "sha256": "2" * 64})   # partly written, failed
+            del led._write
+            with self.assertRaises(run.LedgerError):                           # blocked for the session
+                led.append({"cell": "c3", "role": "predators", "sha256": "3" * 64})
+            self.assertFalse(rqlib.read_bytes(os.path.join(root, run.BIO_LEDGER)).endswith(b"\n"))
+            recs, torn = run.recover_bio_ledger(root)                          # the restart
+            self.assertEqual([r["cell"] for r in recs], ["c1"])
+            self.assertTrue(torn)
+            run.BioLedger(root).append({"cell": "c4", "role": "prey", "sha256": "4" * 64})
+            self.assertEqual([r["cell"] for r in run.recover_bio_ledger(root)[0]], ["c1", "c4"])
         finally:
             shutil.rmtree(root)
 

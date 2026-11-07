@@ -212,15 +212,37 @@ def recover_bio_ledger(root):
     return recs, tail
 
 
+class BioLedger:
+    """The runner's appender (only after recover_bio_ledger: the file then ends with a newline or is
+    empty). Review round 4: after ANY write error it refuses every further append this session (a
+    partial record may now end the file, and only recover_bio_ledger, at the next start under the
+    lock, may append after it); the caller keeps such a failure as failed and unacknowledged."""
+
+    def __init__(self, root):
+        self.root = root
+        self.blocked = None
+
+    def _write(self, f, data):          # (a test seam: a partial write)
+        f.write(data)
+
+    def append(self, entry):
+        """One record, durably (written, the file and the root fsync'd); raises OSError or LedgerError."""
+        if self.blocked:
+            raise LedgerError(f"ledger appends blocked for this session after: {self.blocked}")
+        try:
+            with open(os.path.join(self.root, BIO_LEDGER), "ab") as f:
+                self._write(f, rqlib.canonical(dict(entry, schema=BIO_SCHEMA)))
+                f.flush()
+                os.fsync(f.fileno())
+            rqlib.fsync_dir(self.root)
+        except OSError as e:
+            self.blocked = repr(e)
+            raise
+
+
 def append_bio_ledger(root, entry):
-    """Append one record durably (write, fsync the file, fsync the root). Only after
-    recover_bio_ledger: the file then ends with a newline (or is empty)."""
-    p = os.path.join(root, BIO_LEDGER)
-    with open(p, "ab") as f:
-        f.write(rqlib.canonical(dict(entry, schema=BIO_SCHEMA)))
-        f.flush()
-        os.fsync(f.fileno())
-    rqlib.fsync_dir(root)
+    """One record, durably (a one-shot BioLedger)."""
+    BioLedger(root).append(entry)
 
 
 def bio_match(cell, ledger):
@@ -714,7 +736,8 @@ def _main(argv, files):
                          "skip that source's cells only")
     ap.add_argument("--link-sources", action="store_true",
                     help="hard-link sources into the store instead of copying them; refused unless every source's "
-                         "archive directory is finalized (a FINALIZED marker) and read-only")
+                         "archive directory is finalized (a FINALIZED marker) and read-only. Links last one "
+                         "session: the next start turns them into verified independent copies")
     ap.add_argument("--status", action="store_true")
     ap.add_argument("--pack", action="store_true")
     ap.add_argument("--replay", metavar="CELL_ID")
@@ -755,10 +778,10 @@ def _main(argv, files):
     if probs:
         log(f"committed chunks damaged or inconsistent (working copies kept): {probs[:5]}")
         return 1
-    # (review round 3) the store policy of this run, and legacy objects (writable, or hard links an
-    # archive shares) replaced by independent read-only copies before anything relies on them
-    store.allow_links(a.link_sources)
-    n_mig, mprobs = store.migrate_all(root, log)
+    # (review rounds 3-4) legacy objects (writable, or hard links an archive shares, read-only or not)
+    # replaced by independent read-only copies under the COPY policy, before anything relies on
+    # them; only then this session's policy
+    n_mig, mprobs = store.start_session(root, a.link_sources, log)
     for m in mprobs:
         log(f"WARNING: {m}")
     # (review round 3) the bio-failure ledger recovered under the lock before it is applied or appended to
@@ -849,6 +872,7 @@ def _main(argv, files):
     n_done, n_before, t_start = 0, len(rows) - len(todo) - n_bio_start, time.time()
     rss_mb, mem_bad = 0, 0
     persist_failed = []
+    bio_ledger = BioLedger(root)   # blocks itself after a write error (review round 4)
     unpacked = set(fin)   # finished, reaped, not yet packed (a running worker's cell never is)
     n_bio = n_bio_start   # cells skipped for a biologically unusable source (--on-bio-failure skip)
 
@@ -952,9 +976,10 @@ def _main(argv, files):
                         entry = {"utc": rqlib.now_utc(), "cell": cid, "role": bio.get("role"), "path": bio.get("path"),
                                  "sha256": bio.get("sha256"), "reason": bio.get("reason"), "policy": a.on_bio_failure}
                         try:
-                            append_bio_ledger(root, entry)
-                        except OSError as e:
-                            log(f"the bio-failure ledger could not be written ({e}): {cid} counts as a failure")
+                            bio_ledger.append(entry)
+                        except (OSError, LedgerError) as e:
+                            log(f"the bio-failure ledger could not be written ({e}): {cid} counts as a failure, "
+                                "unacknowledged")
                             entry = None
                     if entry is not None and a.on_bio_failure == "skip":
                         try:
