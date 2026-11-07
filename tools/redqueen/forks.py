@@ -84,9 +84,19 @@ def m_label(frame):
 
 
 # ================================================================== registry
-def register(study, splits_path, ns, origins=ORIGINS, horizon=HORIZON, seeds=SEEDS, pilot=None):
+def register(study, splits_path, ns, origins=ORIGINS, horizon=HORIZON, seeds=SEEDS, pilot=None, avoid_paths=()):
     wpath = os.path.join(study, "config", "worlds.json")
     hreg = rqlib.read_json(wpath)
+    # reserved seeds: the histories' founder seeds and every --avoid input (worlds.read_avoid: integers,
+    # or any JSON / JSONL whose keys contain "seed": archived plans, reservations)
+    reserved = {int(w["founder_seed"]): f"the founder seed of history {w['id']}" for w in hreg["worlds"]
+                if isinstance(w.get("founder_seed"), int)}
+    avoid_rec = []
+    for ap_ in avoid_paths:
+        got = worlds.read_avoid(ap_)
+        for x in got:
+            reserved.setdefault(int(x), f"a seed reserved in {ap_}")
+        avoid_rec.append({"path": os.path.abspath(ap_), "sha256": rqlib.sha256_file(ap_), "seeds": len(got)})
     sp = rqlib.read_json(splits_path)
     split, fork = sp.get("split") or {}, list(sp.get("fork") or [])
     by = {w["id"]: w for w in hreg["worlds"]}
@@ -114,6 +124,8 @@ def register(study, splits_path, ns, origins=ORIGINS, horizon=HORIZON, seeds=SEE
         seed = rqlib.derive_seed(ns, "fork", root["uuid"], origin, k)
         if seed in seen:
             raise ForkError(f"fork seeds of {seen[seed]} and {bid} collide: change the namespace")
+        if seed in reserved:
+            raise ForkError(f"the fork seed of {bid} ({seed}) is {reserved[seed]}: change the namespace")
         seen[seed] = bid
         b = {"id": bid, "uuid": str(uuid.uuid5(uuid.NAMESPACE_URL, f"finfolk:fork:{ns}:{bid}")), "kind": kind,
              "root": wid, "root_uuid": root["uuid"], "split": ROLE[split[wid]] if kind == "main" else "diagnostic",
@@ -140,7 +152,8 @@ def register(study, splits_path, ns, origins=ORIGINS, horizon=HORIZON, seeds=SEE
             "pilot": dict(pilot, world=pool[0] if pool else None), "fork_worlds": sorted(fork),
             "native_panel": sorted(w for w in by if by[w]["treatment"] == "C"),
             "split": {w: ROLE[s] for w, s in sorted(split.items()) if s in ROLE},
-            "worlds": out}
+            "holdout": {k: ROLE[v] for k, v in sorted((sp.get("holdout") or {}).items()) if v in ROLE},
+            "avoid": avoid_rec, "worlds": out}
 
 
 def load_forks(study):
@@ -156,15 +169,31 @@ def load_forks(study):
 
 
 # ================================================================== origins
-def origin_status(study, b, ledger=None):
-    """-> ("available", archive record) | ("waiting", why) | ("unavailable", why) for a branch's origin
-    in the histories' archive (its bytes verified against the record)."""
+def origin_invalid(study, b, ledger=None):
+    """Why a branch's origin is not a valid fork origin on the CURRENT evidence (None if it is): its
+    root reached a zero at or before the origin (the histories' supported first zeros, the ledger
+    read now), or the archived origin itself holds no prey (or, C and B, no predators)."""
     root, f = b["root"], b["origin"]["frame"]
     led = worlds.read_jsonl(os.path.join(study, "availability.jsonl")) if ledger is None else ledger
     zeros = worlds.first_zeros(led, root, study)
     early = sorted((fz, g) for g, fz in zeros.items() if fz <= f)
     if early:
-        return "unavailable", f"its root {root}'s {early[0][1]} reached 0 at frame {early[0][0]}, at or before the origin"
+        return f"its root {root}'s {early[0][1]} reached 0 at frame {early[0][0]}, at or before the origin"
+    rec = worlds.archive_records(study, root).get(b["origin"]["label"])
+    if rec is not None and (rec.get("prey") == 0 or (b["treatment"] != "A" and rec.get("predators") == 0)):
+        return (f"the archived origin {b['origin']['label']} of {root} holds {rec.get('prey')} prey and "
+                f"{rec.get('predators')} predators")
+    return None
+
+
+def origin_status(study, b, ledger=None):
+    """-> ("available", archive record) | ("waiting", why) | ("unavailable", why) for a branch's origin,
+    from the CURRENT evidence: the histories' availability ledger read now (its supported first
+    zeros), the archived origin's own guild populations, its bytes verified against the record."""
+    root = b["root"]
+    why = origin_invalid(study, b, ledger)
+    if why:
+        return "unavailable", why
     rec = worlds.archive_records(study, root).get(b["origin"]["label"])
     st = worlds.read_state(study, root)
     if rec is None:
@@ -208,34 +237,79 @@ def freeze_origin(fr, b, rec):
     return p, rec["sha256"]
 
 
+def verify_frozen(fr, bid):
+    """The branch's frozen origin against its durable digest (origin.rec.json) -> (path, sha256), or
+    None if it was never frozen; ForkError if the file is missing or its bytes changed."""
+    d = worlds.wdir(fr, bid)
+    p, rp = os.path.join(d, "origin.json"), os.path.join(d, "origin.rec.json")
+    if not os.path.isfile(rp):
+        return None
+    sha = rqlib.read_json(rp)["sha256"]
+    if not os.path.isfile(p) or rqlib.sha256_file(p) != sha:
+        raise ForkError(f"{bid}: its frozen origin {p} does not match its recorded digest {sha[:12]}")
+    return p, sha
+
+
 def refresh_origins(study, reg, log):
-    """Every pending / waiting branch's origin: frozen (pending), still waiting, or unavailable
-    (recorded in forks/origins.jsonl) -> the runtime registry (the branches with their frozen origins)."""
+    """Under the fork lock, before anything runs: the origins ledger's torn tail repaired; every
+    branch's frozen origin verified against its digest (a mismatch fails the branch, whatever its
+    state); every pending / waiting branch's origin admitted (frozen), left waiting or recorded
+    unavailable from the CURRENT evidence; an admitted branch whose origin newly turns out to lie at or
+    after its root's extinction (or to hold an empty guild) is INVALIDATED (its artifacts kept, the
+    invalidation recorded); the ledger reconciled with the branch states idempotently (an event
+    missing after a crash between the two writes is appended) -> the runtime registry."""
     fr = froot(study)
-    led = worlds.read_jsonl(os.path.join(study, "availability.jsonl"))
+    lp = os.path.join(fr, "origins.jsonl")
+    events = worlds.read_jsonl(lp, repair=True)
+    have = {(e.get("branch"), e.get("status")) for e in events}
+
+    def record(bid, status, **kw):
+        if (bid, status) not in have:
+            worlds._append_durable(lp, dict({"branch": bid, "status": status, "utc": rqlib.now_utc()}, **kw))
+            have.add((bid, status))
     out = []
     for b in reg["worlds"]:
-        st = worlds.read_state(fr, b["id"])
+        bid = b["id"]
+        st = worlds.read_state(fr, bid)
+        fresh = not os.path.isfile(os.path.join(worlds.wdir(fr, bid), "state.json"))
+        try:
+            frozen = verify_frozen(fr, bid)
+        except ForkError as e:
+            frozen = None
+            if st["status"] not in ("failed", "unavailable", "invalidated"):
+                st = dict(st, status="failed", end_reason=str(e))
+                worlds.write_state(fr, bid, st)
+                log(f"{bid}: FAILED: {e}")
+            record(bid, "origin_changed", reason=str(e))
         if st["status"] in ("pending", "waiting"):
-            kind, info = origin_status(study, b, led)
+            kind, info = origin_status(study, b)
             if kind == "available":
                 path, sha = freeze_origin(fr, b, info)
-                if st["status"] == "waiting" or not os.path.isfile(os.path.join(worlds.wdir(fr, b["id"]), "state.json")):
-                    worlds._append_durable(os.path.join(fr, "origins.jsonl"), {
-                        "branch": b["id"], "status": "available", "sha256": sha, "utc": rqlib.now_utc()})
-                    worlds.write_state(fr, b["id"], dict(st, status="pending"))
+                frozen = (path, sha)
+                if st["status"] == "waiting" or fresh:
+                    st = dict(st, status="pending")
+                    worlds.write_state(fr, bid, st)
             elif kind == "unavailable":
-                worlds.write_state(fr, b["id"], dict(st, status="unavailable", end_reason=info))
-                worlds._append_durable(os.path.join(fr, "origins.jsonl"), {
-                    "branch": b["id"], "status": "unavailable", "reason": info, "utc": rqlib.now_utc()})
-                log(f"{b['id']}: UNAVAILABLE ({info}); recorded, not replaced")
+                st = dict(st, status="unavailable", end_reason=info)
+                worlds.write_state(fr, bid, st)
+                log(f"{bid}: UNAVAILABLE ({info}); recorded, not replaced")
             elif st["status"] != "waiting":
-                worlds.write_state(fr, b["id"], dict(st, status="waiting", end_reason=info))
+                st = dict(st, status="waiting", end_reason=info)
+                worlds.write_state(fr, bid, st)
+        elif st["status"] not in ("unavailable", "invalidated", "failed"):
+            info = origin_invalid(study, b)
+            if info:
+                st = dict(st, status="invalidated", end_reason=info, invalidated_from=st["status"])
+                worlds.write_state(fr, bid, st)
+                log(f"{bid}: INVALIDATED ({info}); its artifacts are kept")
+        # the ledger follows the durable states (idempotent)
+        if frozen:
+            record(bid, "available", sha256=frozen[1])
+        if st["status"] in ("unavailable", "invalidated"):
+            record(bid, st["status"], reason=st.get("end_reason"))
         rw = json.loads(json.dumps(b))
-        rp = os.path.join(worlds.wdir(fr, b["id"]), "origin.rec.json")
-        if os.path.isfile(rp):
-            rw["origin"].update(local=os.path.join(worlds.wdir(fr, b["id"]), "origin.json"),
-                                sha256=rqlib.read_json(rp)["sha256"])
+        if frozen:
+            rw["origin"].update(local=frozen[0], sha256=frozen[1])
         out.append(rw)
     return dict(reg, worlds=out)
 
@@ -292,8 +366,25 @@ def status(study):
     return 0
 
 
+RANK = {"diagnostic": -1, "training": 0, "validation": 1, "test": 2}
+PILOT_FAMILIES = ("pilot_branch", "pilot_original")
+
+
+def merge_role(a, b):
+    """The role a pair measured once must carry when two profiles need it: the most held-out (test >
+    validation > training > diagnostic)."""
+    return a if RANK[a] >= RANK[b] else b
+
+
 def profile_design(study, refs, with_pilot_10m=False):
-    """The common-profile measurements as a design/2 fragment (worlds, times, edges): see the module doc."""
+    """The common-profile measurements as a design/2 fragment (worlds, times, edges): see the module doc.
+    refs: {"prey": [8 entries], "predators": [8 entries]}, an entry {"world", "frame"} for a main
+    history, or {"world", "frame", "uuid", "archive"} for an external (sentinel) reference: its own UUID
+    and the directory holding its checkpoints (end.<frame>.json, F1.json). Each guild needs 8 DISTINCT
+    snapshots. An edge's role is its most held-out endpoint (test before validation before training;
+    a training world's snapshot holdout counts; an external reference is training); the pilot's
+    families are diagnostic unless an endpoint outside the pilot is validation or test. A repeated pair
+    is measured once with the most held-out role it is required in (diagnostic below training)."""
     reg = runtime_registry(study)
     hist_ar = rqlib.read_json(os.path.join(study, "study.json"))["archive_root"]
     fr = froot(study)
@@ -301,68 +392,110 @@ def profile_design(study, refs, with_pilot_10m=False):
         os.path.join(fr, "study.json")) else os.path.join(fr, "archive")
     hreg = rqlib.read_json(os.path.join(study, "config", "worlds.json"))
     huuid = {w["id"]: w["uuid"] for w in hreg["worlds"]}
-    wmap, times, edges, seen, dup = {}, {}, [], set(), [0]
+    branch_role = {b["id"]: b["split"] for b in reg["worlds"]}
+    pilot_ids = {b["id"] for b in reg["worlds"] if b["kind"] == "pilot"} | (
+        {reg["pilot"]["world"]} if reg["pilot"].get("world") else set())    # (diagnostic in pilot families only)
+    wmap, times, pairs, dup, external = {}, {}, {}, [0], set()
 
-    def world(wid, uid, ar):
-        if wid not in wmap:
-            ad = os.path.join(ar, "worlds", wid)
-            wmap[wid] = {"uuid": uid, "pattern": os.path.join(ad, "end.{frame}.json"),
-                         "paths": {"F1": os.path.join(ad, "F1.json")}}
+    def world(wid, uid, ad):
+        w = {"uuid": uid, "pattern": os.path.join(ad, "end.{frame}.json"), "paths": {"F1": os.path.join(ad, "F1.json")}}
+        if wid in wmap and wmap[wid] != w:
+            raise ForkError(f"world {wid} is defined twice with another identity ({wmap[wid]['uuid']} / {uid})")
+        for other, x in wmap.items():
+            if other != wid and x["uuid"] == uid:
+                raise ForkError(f"the UUID {uid} names two worlds ({other}, {wid})")
+        wmap[wid] = w
         return wid
 
     def t(frame):
-        lab = f"f{frame}"
+        frame = int(frame)
+        lab = "F1" if frame == 1 else f"f{frame}"
         times[lab] = frame
         return lab
 
-    if len(refs.get("prey") or []) != 8 or len(refs.get("predators") or []) != 8:
-        raise ForkError("the reference panel is 8 prey and 8 predator snapshots")
-    rp = [(world(r["world"], huuid[r["world"]], hist_ar), t(int(r["frame"]))) for r in refs["prey"]]
-    rq = [(world(r["world"], huuid[r["world"]], hist_ar), t(int(r["frame"]))) for r in refs["predators"]]
+    def ref(r):
+        wid, frame = r["world"], int(r["frame"])
+        if wid in huuid:
+            if r.get("uuid") not in (None, huuid[wid]) or r.get("archive") not in (
+                    None, os.path.join(hist_ar, "worlds", wid)):
+                raise ForkError(f"reference {wid}: its UUID / archive conflict with the history of that id")
+            return world(wid, huuid[wid], os.path.join(hist_ar, "worlds", wid)), t(frame)
+        if not (r.get("uuid") and r.get("archive")):
+            raise ForkError(f"reference {wid} is not a main history: give its uuid and archive directory")
+        external.add(wid)
+        return world(wid, r["uuid"], r["archive"]), t(frame)
+    for guild in ("prey", "predators"):
+        lst = refs.get(guild) or []
+        ids = {(huuid.get(r.get("world"), r.get("uuid")), int(r.get("frame", -1))) for r in lst}
+        if len(lst) != 8 or len(ids) != 8:
+            raise ForkError(f"the reference panel is 8 DISTINCT {guild} snapshots ({len(ids)} distinct of {len(lst)})")
+    rp = [ref(r) for r in refs["prey"]]
+    rq = [ref(r) for r in refs["predators"]]
 
-    def state(family, role, wid, frame):
+    def endpoint_role(wid, lab):
+        if wid in branch_role:
+            return branch_role[wid]
+        if wid in external:
+            return "training"
+        role = reg["split"].get(wid, "training")
+        frame = times[lab]
+        tix = 0 if frame == 1 else frame // 1_000_000
+        if role == "training" and frame % 1_000_000 in (0, 1):
+            role = reg.get("holdout", {}).get(f"{wid}:{tix}", "training")
+        return role
+
+    def add(family, prey, pred):
+        ends = [prey] + ([pred] if pred else [])
+        if family in PILOT_FAMILIES:           # declared diagnostic, unless an endpoint outside the pilot is held out
+            outside = [endpoint_role(*e) for e in ends if e[0] not in pilot_ids]
+            outside = [r for r in outside if r in ("validation", "test")]
+            role = max(outside, key=RANK.__getitem__) if outside else "diagnostic"
+        else:
+            role = max((endpoint_role(*e) for e in ends), key=RANK.__getitem__)
+        key = (prey, pred)
+        if key in pairs:                       # measured once, with the most held-out role it is needed in
+            dup[0] += 1
+            pairs[key]["role"] = merge_role(pairs[key]["role"], role)
+            return
+        pairs[key] = {"family": family, "role": role, "prey": {"world": prey[0], "time": prey[1]},
+                      "predators": None if pred is None else {"world": pred[0], "time": pred[1]}}
+
+    def state(family, wid, frame):
         lab = t(frame)
         for pw, pt in rq:                      # its prey against the 8 predator references
-            add(family, role, (wid, lab), (pw, pt))
+            add(family, (wid, lab), (pw, pt))
         for qw, qt in rp:                      # the 8 prey references against its predators
-            add(family, role, (qw, qt), (wid, lab))
-        add(family, role, (wid, lab), None)    # its prey's predator-free continuation
-
-    def add(family, role, prey, pred):
-        key = (prey, pred)
-        if key in seen:                        # (measured once: e.g. a reference snapshot inside a panel state)
-            dup[0] += 1
-            return
-        seen.add(key)
-        edges.append({"family": family, "role": role, "prey": {"world": prey[0], "time": prey[1]},
-                      "predators": None if pred is None else {"world": pred[0], "time": pred[1]}})
+            add(family, (qw, qt), (wid, lab))
+        add(family, (wid, lab), None)          # its prey's predator-free continuation
     H = reg["horizon"]
     for b in reg["worlds"]:
-        world(b["id"], b["uuid"], fork_ar)
+        world(b["id"], b["uuid"], os.path.join(fork_ar, "worlds", b["id"]))
         o = b["origin"]["frame"]
         if b["kind"] == "main":
             for h in SHORT + (H,):
-                state("fork_branch", b["split"], b["id"], o + h)
+                state("fork_branch", b["id"], o + h)
         else:
             for h in SHORT + ((reg["pilot"]["horizon"],) if with_pilot_10m else ()):
-                state("pilot_branch", "diagnostic", b["id"], o + h)
+                state("pilot_branch", b["id"], o + h)
     for wid in reg["fork_worlds"]:                  # original continuations, the short horizons
-        world(wid, huuid[wid], hist_ar)
+        world(wid, huuid[wid], os.path.join(hist_ar, "worlds", wid))
         for o in reg["origins"]:
             for h in SHORT:
-                state("fork_original", reg["split"][wid], wid, o + h)
+                state("fork_original", wid, o + h)
     pw_ = reg["pilot"].get("world")
     if pw_:
-        world(pw_, huuid[pw_], hist_ar)
+        world(pw_, huuid[pw_], os.path.join(hist_ar, "worlds", pw_))
         for h in SHORT + ((reg["pilot"]["horizon"],) if with_pilot_10m else ()):
-            state("pilot_original", "diagnostic", pw_, reg["pilot"]["origin"] + h)
+            state("pilot_original", pw_, reg["pilot"]["origin"] + h)
     for wid in reg["native_panel"]:                 # the primary target times (fork roots included, once)
-        world(wid, huuid[wid], hist_ar)
+        world(wid, huuid[wid], os.path.join(hist_ar, "worlds", wid))
         for o in reg["origins"]:
-            state("native_panel", reg["split"].get(wid, "training"), wid, o + H)
+            state("native_panel", wid, o + H)
+    edges = list(pairs.values())
     return {"schema": PROFILE_SCHEMA, "forks_sha256": rqlib.sha256_file(os.path.join(study, "config", "forks.json")),
             "worlds": wmap, "times": dict(sorted(times.items(), key=lambda kv: kv[1])), "edges": edges,
             "counts": {f: sum(1 for e in edges if e["family"] == f) for f in sorted({e["family"] for e in edges})},
+            "roles": {r: sum(1 for e in edges if e["role"] == r) for r in sorted({e["role"] for e in edges})},
             "deduplicated": dup[0]}
 
 
@@ -381,6 +514,8 @@ def main(argv=None):
     r.add_argument("--pilot-seeds", type=int, default=PILOT["seeds"])
     r.add_argument("--pilot-first", type=int, default=PILOT["first"])
     r.add_argument("--pilot-horizon", type=int, default=PILOT["horizon"])
+    r.add_argument("--avoid", action="append", default=[], metavar="FILE",
+                   help="reserved seeds (integers, or JSON / JSONL with seed keys); the founder seeds always")
     for name in ("launch", "status", "stitch", "profile-design"):
         s = sub.add_parser(name)
         s.add_argument("--study", required=True)
@@ -409,7 +544,7 @@ def main(argv=None):
         if a.cmd == "register":
             reg = register(study, a.splits, a.namespace, [int(x) for x in a.origins.split(",")], a.horizon, a.seeds,
                            {"origin": a.pilot_origin, "seeds": a.pilot_seeds, "first": a.pilot_first,
-                            "horizon": a.pilot_horizon})
+                            "horizon": a.pilot_horizon}, a.avoid)
             out = a.out or os.path.join(study, "config", "forks.json")
             new = worlds.write_registry(out, rqlib.canonical(reg))
             print(f"registered {len(reg['worlds'])} branches -> {out} ({'written' if new else 'unchanged'}; "

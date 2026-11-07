@@ -49,23 +49,27 @@ read CW1 CW2 < <($PY -c 'import json; print(*sorted(w["id"] for w in json.load(o
 echo "{\"split\": {\"$CW1\": \"test\", \"$CW2\": \"val\"}, \"fork\": [\"$CW1\"]}" > splits.json
 
 # 2. the fork registry
-$FK register --study R --splits splits.json --namespace rq-test-forks --origins 8000,28000 --horizon 8000 --seeds 2 \
+$FK register --study R --splits splits.json --namespace rq-test-forks --origins 8000,28000 --horizon 24000 --seeds 2 \
     --pilot-origin 12000 --pilot-seeds 2 --pilot-first 4000 --pilot-horizon 8000 2> fr.log || fail "forks register: $(cat fr.log)"
 cp R/config/forks.json forks1.json
-$FK register --study R --splits splits.json --namespace rq-test-forks --origins 8000,28000 --horizon 8000 --seeds 2 \
+$FK register --study R --splits splits.json --namespace rq-test-forks --origins 8000,28000 --horizon 24000 --seeds 2 \
     --pilot-origin 12000 --pilot-seeds 2 --pilot-first 4000 --pilot-horizon 8000 2> /dev/null || fail "register again"
 cmp -s forks1.json R/config/forks.json || fail "forks register is not deterministic"
 $FK register --study R --splits splits.json --namespace other --origins 8000 2> ow.log && fail "the fork registry was replaced"
 grep -q "never replaced" ow.log || fail "the overwrite refusal does not say why: $(cat ow.log)"
 
-# 3. launch; every branch engine killed after its first checkpoint; technical resumes
+# 3. launch: one main branch's engine killed before its first acceptance (a ROOT REPLAY, the same seed),
+#    the other's after its first verified acceptance (a TECHNICAL RESUME, no reseed)
+read B0 S0 B1 S1 < <($PY -c 'import json
+bs = [b for b in json.load(open("R/config/forks.json"))["worlds"] if b["kind"] == "main" and b["origin"]["frame"] == 8000]
+print(bs[0]["id"], bs[0]["origin"]["seed"], bs[1]["id"], bs[1]["origin"]["seed"])')
 $FK launch --study R --binary "$BIN" --workers 4 $GUARD > fl.log 2>&1 &
 sp=$!
-for _ in $(seq 1 3000); do
-    [ "$(ls R/forks/worlds/*/ckpt/end.12000.json R/forks/worlds/*/ckpt/end.16000.json 2> /dev/null | wc -l)" -ge 2 ] && break
-    sleep 0.01
-done
-pkill -KILL -f "$W/R/forks/bin/evo_boids" || echo "(no fork engine left to kill: they finished first)"
+for _ in $(seq 1 3000); do pgrep -f "reseed-after-load $S1 " > /dev/null && break; sleep 0.01; done
+pkill -KILL -f "reseed-after-load $S1 " || { kill $sp; fail "no engine of $B1 to kill before its first acceptance"; }
+for _ in $(seq 1 6000); do [ -s "R/forks/worlds/$B0/accept.jsonl" ] && break; sleep 0.01; done
+[ -s "R/forks/worlds/$B0/accept.jsonl" ] || { kill $sp; fail "$B0 accepted nothing"; }
+pkill -KILL -f "reseed-after-load $S0 " || { kill $sp; fail "$B0's engine ended before it could be killed after an acceptance"; }
 wait $sp; rc=$?
 [ "$rc" = 0 ] || fail "forks launch (exit $rc): $(tail -5 fl.log)"
 cat > ref.sh <<'SH'
@@ -95,7 +99,7 @@ for b in pilot:
 led = [json.loads(l) for l in open(os.path.join(fr, "origins.jsonl"))]
 assert sum(1 for e in led if e["status"] == "unavailable") == 2, led
 hist = worlds.archive_records("R", main[0]["root"])
-resumed = 0
+resumed, replayed = 0, 0
 for b in [x for x in main if x["origin"]["frame"] == 8000]:
     o = b["origin"]
     assert rqlib.sha256_file(o["local"]) == hist["end.8000"]["sha256"] == o["sha256"]       # the frozen origin
@@ -105,11 +109,13 @@ for b in [x for x in main if x["origin"]["frame"] == 8000]:
         assert ("--reseed-after-load" in s["args"]) == (s["start_frame"] == 8000), s
         if "--reseed-after-load" in s["args"]:
             assert s["args"][s["args"].index("--reseed-after-load") + 1] == str(o["seed"]), s
-    resumed += len(segs) > 1
+    resumed += any(s["start_frame"] > 8000 for s in segs)                 # a technical resume (no reseed)
+    replayed += sum(s["start_frame"] == 8000 for s in segs) >= 2           # a root replay (the same seed)
     ref = os.path.join(W, "ref_" + b["id"])
-    subprocess.check_call(["bash", "ref.sh", BIN, os.path.abspath(o["local"]), str(o["seed"]), "8000", ref])
+    subprocess.check_call(["bash", "ref.sh", BIN, os.path.abspath(o["local"]), str(o["seed"]), "24000", ref])
     arec = worlds.archive_records(fr, b["id"])
-    for f in (12000, 16000):
+    assert sorted(r["frame"] for r in arec.values()) == list(range(12000, 32001, 4000)), sorted(arec)
+    for f in range(12000, 32001, 4000):
         assert rqlib.sha256_file(os.path.join(ref, "ckpt", f"end.{f}.json")) == arec[f"end.{f}"]["sha256"], (b["id"], f)
     worlds.stitch(fr, b["id"], reg)
     sd = os.path.join(fr, "worlds", b["id"], "stitched")
@@ -130,7 +136,8 @@ a0, a1 = worlds.archive_records(fr, b0["id"]), worlds.archive_records(fr, b1["id
 assert a0["end.12000"]["sha256"] != a1["end.12000"]["sha256"], "two seeds gave the same future"
 assert a0["end.12000"]["sha256"] != hist["end.12000"]["sha256"], "a reseeded branch equals the original continuation"
 assert worlds.audit_archive(fr, b0["id"], json.load(open(os.path.join(fr, "study.json")))["archive_root"], "done")
-print("branches ok; engines killed and resumed:", resumed)
+assert resumed >= 1 and replayed >= 1, (resumed, replayed)
+print("branches ok; technical resumes:", resumed, "root replays:", replayed)
 PY
 grep -q "UNAVAILABLE" fl.log || fail "the unavailable origins were not logged"
 

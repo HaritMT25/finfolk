@@ -114,10 +114,80 @@ class TestRegister(unittest.TestCase):
         self.assertIn(b["role"], ("training", "validation", "test"))
         self.assertTrue(out["worlds"][b["prey"]["world"]]["pattern"].endswith("end.{frame}.json"))
         self.assertEqual(sum(1 for e in out["edges"] if e["predators"] is None), out["edges"].__len__() // 17)
-        with self.assertRaisesRegex(forks.ForkError, "8 prey and 8 predator"):
+        with self.assertRaisesRegex(forks.ForkError, "8 DISTINCT prey"):
             forks.profile_design(self.study, dict(refs, prey=refs["prey"][:7]))
+        with self.assertRaisesRegex(forks.ForkError, "8 DISTINCT predators"):       # (P3) repeated entries
+            forks.profile_design(self.study, dict(refs, predators=[refs["predators"][0]] * 8))
         out10 = forks.profile_design(self.study, refs, with_pilot_10m=True)
         self.assertEqual(out10["counts"]["pilot_branch"], 6 * 3 * 17)
+
+
+    def test_profile_roles_and_references(self):
+        """#65 review 2, 6, 7: an edge's role is its most held-out endpoint (a training branch against a
+        test-world reference is test; a training world's snapshot holdout counts); a pair needed twice
+        keeps the most held-out role; external (sentinel) references carry their own UUID and archive,
+        identity conflicts are refused; frame 1 is F1 (F1.json)."""
+        sp = splits_for(self.hreg)
+        cs = sorted(w["id"] for w in self.hreg["worlds"] if w["treatment"] == "C")
+        train_w = cs[5]                                     # a training world outside the fork set
+        sp["holdout"] = {f"{train_w}:20": "test"}
+        wr(self.splits, json.dumps(sp))
+        reg = forks.register(self.study, self.splits, "ns-f")
+        worlds.write_registry(os.path.join(self.study, "config", "forks.json"), rqlib.canonical(reg))
+        rqlib.write_json_durable(os.path.join(self.study, "study.json"), {"archive_root": os.path.join(self.tmp, "ar")})
+        test_w = next(w for w in cs if sp["split"][w] == "test")
+        refs = {"prey": [{"world": cs[i], "frame": 60 * M} for i in range(6, 13)]
+                + [{"world": "S1", "frame": 1, "uuid": "uuid-s1", "archive": os.path.join(self.tmp, "sentinels", "S1")}],
+                "predators": [{"world": test_w, "frame": 60 * M}] + [{"world": cs[i], "frame": 70 * M} for i in range(6, 12)]
+                + [{"world": train_w, "frame": 20 * M}]}
+        out = forks.profile_design(self.study, refs)
+        role = {(e["prey"]["world"], e["prey"]["time"], (e["predators"] or {}).get("world"),
+                 (e["predators"] or {}).get("time")): e["role"] for e in out["edges"]}
+        tb = next(b for b in reg["worlds"] if b["kind"] == "main" and b["split"] == "training")
+        lab = f"f{tb['origin']['frame'] + 1 * M}"
+        self.assertEqual(role[(tb["id"], lab, test_w, "f60000000")], "test")           # the test-world reference
+        self.assertEqual(role[(tb["id"], lab, train_w, "f20000000")], "test")          # a snapshot holdout (test)
+        self.assertEqual(role[(tb["id"], lab, cs[6], "f70000000")], "training")
+        self.assertEqual(out["worlds"]["S1"]["uuid"], "uuid-s1")
+        self.assertEqual(out["worlds"]["S1"]["paths"]["F1"], os.path.join(self.tmp, "sentinels", "S1", "F1.json"))
+        self.assertEqual(out["times"]["F1"], 1)
+        self.assertTrue(any(e["prey"] == {"world": "S1", "time": "F1"} for e in out["edges"]))
+        self.assertEqual(forks.merge_role("training", "test"), "test")
+        self.assertEqual(forks.merge_role("diagnostic", "training"), "training")
+        self.assertEqual(forks.merge_role("validation", "diagnostic"), "validation")
+        # a pilot measurement is diagnostic unless an endpoint outside the pilot is held out
+        pb = next(b for b in reg["worlds"] if b["kind"] == "pilot")
+        plab = f"f{pb['origin']['frame'] + 1 * M}"
+        self.assertEqual(role[(pb["id"], plab, cs[6], "f70000000")], "diagnostic")
+        self.assertEqual(role[(pb["id"], plab, test_w, "f60000000")], "test")
+        arch = os.path.join(self.tmp, "sentinels", "S1")
+        for guild, bad, msg in (
+                ("predators", {"world": "S1", "frame": 5 * M, "uuid": "other", "archive": arch}, "another identity"),
+                ("predators", {"world": "S9", "frame": 5 * M, "uuid": "uuid-s1", "archive": arch}, "names two worlds"),
+                ("prey", dict(refs["prey"][0], frame=65 * M, uuid="not-the-registry's"), "conflict"),
+                ("prey", {"world": "S2", "frame": 5 * M}, "not a main history")):
+            lst = list(refs[guild])
+            lst[1] = bad
+            with self.assertRaisesRegex(forks.ForkError, msg):
+                forks.profile_design(self.study, dict(refs, **{guild: lst}))
+
+    def test_reserved_seeds(self):
+        """#65 review 5: a fork seed equal to a history's founder seed or to a reserved seed is refused."""
+        reg = forks.register(self.study, self.splits, "ns-f")
+        seed = reg["worlds"][3]["origin"]["seed"]
+        av = os.path.join(self.tmp, "reserved.json")
+        wr(av, json.dumps({"seeds": [seed]}))
+        with self.assertRaisesRegex(forks.ForkError, "reserved in"):
+            forks.register(self.study, self.splits, "ns-f", avoid_paths=[av])
+        founder = self.hreg["worlds"][0]["founder_seed"]
+        real = rqlib.derive_seed
+        try:
+            forks.rqlib.derive_seed = lambda *parts: founder if parts[1] == "fork" else real(*parts)
+            with self.assertRaisesRegex(forks.ForkError, "founder seed"):
+                forks.register(self.study, self.splits, "ns-f")
+        finally:
+            forks.rqlib.derive_seed = real
+        self.assertEqual(forks.register(self.study, self.splits, "ns-f")["avoid"], [])
 
 
 class TestBranches(unittest.TestCase):
@@ -228,6 +298,72 @@ class TestBranches(unittest.TestCase):
         s2.startup()
         self.assertEqual(worlds.read_state(fr, b["id"])["status"], "done", msgs)
         self.assertTrue(any("hold is lifted" in m for m in msgs), msgs)
+
+    def test_frozen_origin_verified_at_every_use(self):
+        """#65 review 1: a branch crashes before its first acceptance; a schema-valid edit of its frozen
+        origin is then refused at the relaunch (the root replay never runs on it), by the fork refresh
+        and by the Supervisor itself."""
+        study, fr, far, rt, b, cp = self.setup_branch(ckpts=())
+        st = worlds.read_state(fr, b["id"])
+        worlds.write_state(fr, b["id"], dict(st, status="running"))      # (crashed before any acceptance)
+        local = rt["worlds"][0]["origin"]["local"]
+        doc = ckpt.load(local)
+        doc["creatures"]["genes"][0] = int(doc["creatures"]["genes"][0]) + 1   # schema-valid, different
+        os.chmod(local, 0o644)
+        wr(local, ckpt.dumps(doc))
+        os.chmod(local, 0o444)
+        s, msgs = supervisor(fr, rt, far)
+        s.startup()
+        st = worlds.read_state(fr, b["id"])
+        self.assertEqual(st["status"], "failed", msgs)
+        self.assertIn("does not match its recorded digest", st["end_reason"])
+        self.assertEqual(len(st["segments"]), 1)                          # no root replay was spawned
+        freg = dict(rt, worlds=[dict(b)])
+        worlds.write_state(fr, b["id"], dict(st, status="interrupted"))
+        logs = []
+        out = forks.refresh_origins(study, freg, logs.append)
+        self.assertEqual(worlds.read_state(fr, b["id"])["status"], "failed")
+        self.assertNotIn("local", out["worlds"][0]["origin"])
+        ev = worlds.read_jsonl(os.path.join(fr, "origins.jsonl"))
+        self.assertTrue(any(e["status"] == "origin_changed" for e in ev), ev)
+
+    def test_eligibility_and_ledger(self):
+        """#65 review 3, 4: admission and re-checks use the CURRENT evidence (a root zero recorded later at
+        or before the origin invalidates an admitted branch, its artifacts kept); the origins ledger's torn
+        tail is repaired before appending; a state written before a crash without its ledger event is
+        reconciled once (idempotent)."""
+        study, fr, far, rt, b, cp = self.setup_branch()
+        freg = dict(rt, worlds=[dict(b)])
+        lp = os.path.join(fr, "origins.jsonl")
+        out = forks.refresh_origins(study, freg, lambda m: None)
+        self.assertEqual(out["worlds"][0]["origin"]["sha256"], rt["worlds"][0]["origin"]["sha256"])
+        wr(lp, rqlib.read_text(lp) + '{"branch": "torn')                    # a crash mid-append
+        forks.refresh_origins(study, freg, lambda m: None)
+        ev = worlds.read_jsonl(lp)                                          # every line parses
+        self.assertEqual([e["status"] for e in ev], ["available"])
+        hw = b["root"]
+        d = worlds.wdir(study, hw)
+        os.makedirs(os.path.join(d, "seg000"), exist_ok=True)
+        head = "step,population,predator_pop\n900,0,8\n"
+        wr(os.path.join(d, "seg000", "run.csv"), head)
+        worlds._append_durable(os.path.join(study, "availability.jsonl"), {
+            "schema": worlds.AVAIL_SCHEMA, "world": hw, "guild": "prey", "first_zero_frame": 900,
+            "segment": "seg000", "csv_bytes": len(head), "csv_sha256": rqlib.sha256_bytes(head.encode())})
+        logs = []
+        forks.refresh_origins(study, freg, logs.append)
+        st = worlds.read_state(fr, b["id"])
+        self.assertEqual((st["status"], st["invalidated_from"]), ("invalidated", "interrupted"))
+        self.assertTrue(os.path.isfile(rt["worlds"][0]["origin"]["local"]))   # artifacts kept
+        self.assertEqual([e["status"] for e in worlds.read_jsonl(lp)], ["available", "invalidated"])
+        # the crash between an "unavailable" state and its ledger event: reconciled exactly once
+        b2 = dict(b, id=b["id"] + "x")
+        worlds.write_state(fr, b2["id"], {"schema": worlds.STATE_SCHEMA, "id": b2["id"], "status": "unavailable",
+                                          "end_reason": "its root ended", "failures": 0, "segments": []})
+        f2 = dict(freg, worlds=[dict(b), b2])
+        forks.refresh_origins(study, f2, lambda m: None)
+        forks.refresh_origins(study, f2, lambda m: None)
+        ev = [e for e in worlds.read_jsonl(lp) if e["branch"] == b2["id"]]
+        self.assertEqual([e["status"] for e in ev], ["unavailable"])
 
     def test_origin_unavailable_and_changed(self):
         study, fr, far, rt, b, cp = self.setup_branch()

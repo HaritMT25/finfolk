@@ -1520,9 +1520,18 @@ class Supervisor:
         return min(self.Tw(wid), self.hold.get(wid, self.Tw(wid)))
 
     def origin_path(self, wid):
-        """A fork branch's origin checkpoint (None for a history): forks.py freezes a verified copy."""
+        """A fork branch's frozen origin checkpoint (None for a history), VERIFIED against its durable
+        digest at every use (a root replay, the lineage counters' start, any resume decision): a
+        missing file or changed bytes fail closed (WorldsError)."""
         o = self.worlds[wid].get("origin")
-        return o.get("local") if o else None
+        if not o:
+            return None
+        p = o.get("local")
+        if not p or not o.get("sha256"):
+            raise WorldsError(f"{wid}: its origin was never frozen")
+        if not os.path.isfile(p) or rqlib.sha256_file(p) != o["sha256"]:
+            raise WorldsError(f"{wid}: its frozen origin {p} does not match its recorded digest {o['sha256'][:12]}")
+        return p
 
     def good(self, wid, st):
         return verified_records(self.root, wid, st, self.worlds[wid]["treatment"], self.base(wid))
@@ -1951,7 +1960,12 @@ class Supervisor:
             self.end_world(wid, "extinct", reason)
             self.log(f"{wid}: ended as extinct ({self.state(wid)['end_reason']})")
             return
-        nxt = self.resume(wid, self.state(wid))[0]
+        try:
+            nxt = self.resume(wid, self.state(wid))[0]
+        except (WorldsError, OSError) as e:
+            self.end_world(wid, "failed", str(e))
+            self.log(f"FAILED {wid}: {e}")
+            return
         if nxt >= self.Tw(wid):
             self.end_world(wid, "done", f"{self.Tw(wid)} steps")
             self.log(f"{wid}: history complete ({self.Tw(wid)} steps, every log accepted through the final frame)")
