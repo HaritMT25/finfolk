@@ -108,13 +108,15 @@ import rqlib  # noqa: E402
 import store  # noqa: E402
 
 PLAN_SCHEMA = "finfolk.redqueen.plan/1"
+PLAN_SCHEMA_V2 = "finfolk.redqueen.plan/2"
 DONE_SCHEMA = "finfolk.redqueen.done/1"
 REPLAY_SCHEMA = "finfolk.redqueen.replay/1"
 TOOL_FILES = ("rqlib.py", "ckpt.py", "common.py", "score.py", "cell.py", "store.py", "run.py", "plan.py")
 OUTPUT_TOOLS = ("rqlib.py", "ckpt.py", "common.py", "score.py", "cell.py")   # = cell.OUTPUT_TOOLS
 ROW_KEYS = ("schema", "id", "kind", "prey", "predators", "template", "prey_policy", "n_prey", "sampling", "assay",
             "k", "steps", "horizons", "log_every", "checkpoint_every", "replicate", "seeds", "groups")
-ROLES = ("prey", "predators", "template")
+ROW_KEYS_V2 = ROW_KEYS + ("unit", "families", "role", "namespace", "horizon", "ages")
+ROLES = ("prey", "predators", "template", "ages")      # (a plan/1 row has no "ages")
 RETRYABLE = {10, -9, -15, 137, 143}
 MAX_WORKERS = 64
 
@@ -145,9 +147,9 @@ def load_plan(path, raw=None):
         if not ln.strip():
             continue
         r = json.loads(ln)
-        if r.get("schema") != PLAN_SCHEMA:
-            raise SystemExit(f"{path}:{n}: schema {r.get('schema')!r}, expected {PLAN_SCHEMA}")
-        miss = [k for k in ROW_KEYS if k not in r]
+        if r.get("schema") not in (PLAN_SCHEMA, PLAN_SCHEMA_V2):
+            raise SystemExit(f"{path}:{n}: schema {r.get('schema')!r}, expected {PLAN_SCHEMA} or {PLAN_SCHEMA_V2}")
+        miss = [k for k in (ROW_KEYS_V2 if r["schema"] == PLAN_SCHEMA_V2 else ROW_KEYS) if k not in r]
         if miss:
             raise SystemExit(f"{path}:{n}: cell {r.get('id')} lacks {miss}")
         for role in ROLES:
@@ -494,6 +496,8 @@ def run_cell(root, cid, link=False):
             "common_sha256": bundle["files"].get("common.json"),
             # a challenge and its predator-free control share their prey settings (checked at packing)
             "pair_group": f"{c['groups']['reseed']}|{c['prey_policy']}|{c['assay']}",
+            # (plan/2) the split role, for sealed target stores later; None for a plan/1 row
+            "role": c.get("role"), "families": c.get("families"),
             "prey_config_sha256": bundle["arena_prey_config_sha256"], "finished_utc": rqlib.now_utc(),
             "host": platform.node(),
             "timing": {"wall_s": round(time.time() - t0, 3), "build_s": round(info["t_build"], 3),

@@ -394,7 +394,8 @@ def pack(root, ids=None, log=print):
         members.append((f"{cid}/done.json", dn))
         entries[cid] = {"bundle_sha256": done["bundle_sha256"], "done_sha256": rqlib.sha256_bytes(dn),
                         "row_sha256": done.get("row_sha256"), "common_group": g, "common_sha256": h,
-                        "pair_group": pg, "prey_config_sha256": ph, "kind": done.get("kind")}
+                        "pair_group": pg, "prey_config_sha256": ph, "kind": done.get("kind"),
+                        "role": done.get("role")}
     cdir = os.path.join(root, CHUNKS)
     if not os.path.isdir(cdir):
         os.makedirs(cdir, exist_ok=True)
