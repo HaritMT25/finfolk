@@ -51,8 +51,19 @@ clustered strategies, a strong own-world lag, doubled noise (also at 1.7%). The 
 (row 0.15, column 0.15, cell 0.20 on the logit scale, plus the binomial) are planning values until
 the independent noise bank (v4 §7.4) measures them. power (--reps // 2 each): the noise tripled and
 quadrupled at 3.4% and 1.7% (and rank 0 at triple noise), where the options can differ.
-numerical: noiseless data at ranks 1-4,
-fitted at the true rank (relative test RMSE: the graph identifies them).
+numerical: noiseless data at ranks 1-4, fitted at the true rank with a penalty continuation (relative
+test RMSE: the graph identifies them). --scenarios runs a list instead of a set.
+
+ACCURACY BY TARGET CLASS (every dataset): the selected map's and rank 0's RMSE against the truth on
+the world-transfer targets with A/B prey, those with C prey, and the snapshot-test targets
+(numerical: the relative RMSE per class). --ab-cap R holds the A/B prey's interaction to rank <= R
+in every fit (the comparison's rejected option, kept for the record).
+
+THE SURVIVAL HEAD'S DATA (simulate_survival: its own random stream, so the capture data stay what
+they were): logit S_i0 = c_i (one predator-free control per prey snapshot x replicate) and logit
+S_ij = c_i - 0.6 (a_j - b_i) - 0.3 [+ u_i' D_S v_j, a full D_S]; the control and the exposed cells
+of a prey x replicate share its row noise (the global seeds); survivors ~ Binomial(600). The
+minimal fitter ignores them; --fitter registered (map.py, item 7) fits both heads jointly.
 """
 from __future__ import annotations
 
@@ -76,7 +87,7 @@ import rqlib  # noqa: E402
 RESULT_SCHEMA = "finfolk.redqueen.recovery/1"
 R_REPS = 6
 B_COUNT = 324                     # K [1 + floor(80 s / 1.5 s)]: the 1.5 s cooldown's capture bound
-FAMS = list(graphlib.QUOTAS)
+FAMS = list(graphlib.FAMILIES)
 ROLES = ["training", "validation", "test", "support"]
 OPTIONS = ("a", "b", "base")
 REF_TIMES = (0, 20, 60, 100, 120, 140, 180, 200)
@@ -173,6 +184,11 @@ class Data:
         self.fit = {"a": np.flatnonzero(glob & fitrole),
                     "base": np.flatnonzero(glob & fitrole & ~tm),
                     "b": np.flatnonzero((glob & fitrole & ~tm) | (self.within & (self.role == ROLES.index("training"))))}
+        # target classes: world-transfer targets with A/B prey and with C prey; snapshot-test targets
+        self.qab = (self.qw >= 0) & np.isin(self.treat[np.maximum(self.qw, 0)], ["A", "B"]) & ~self.qref
+        ab = self.qab[self.qi[self.test_idx]]
+        self.classes = {"world_test_ab_prey": self.test_idx[ab], "world_test_c_prey": self.test_idx[~ab],
+                        "snapshot_test": self.stest_idx}
 
 
 # ------------------------------------------------------------------ truth
@@ -261,8 +277,39 @@ def simulate(D, sc, seed):
         cnt = rng.binomial(B_COUNT, p)
         z = np.log((cnt + 0.5) / (B_COUNT - cnt + 0.5))
     energy = float(np.var(c * (inter / c - additive_projection(D, inter / c))) / np.var(eta)) if rank else 0.0
-    return {"eta": eta, "inter": inter, "z": z, "zbar": z.mean(axis=1), "c": c, "energy": energy,
-            "settings": s}
+    out = {"eta": eta, "inter": inter, "z": z, "zbar": z.mean(axis=1), "c": c, "energy": energy, "settings": s}
+    out.update(simulate_survival(D, s, seed, a, b, u, v, c, rank))
+    return out
+
+
+N_SURV = 600
+
+
+def simulate_survival(D, s, seed, a, b, u, v, c, rank):
+    """The survival head's truth and data (its own stream: the capture data stay what they were):
+    logit S_i0 = c_i (predator-free controls, one per prey snapshot x replicate), logit S_ij =
+    c_i - 0.6 (a_j - b_i) - 0.3 + c' u_i' D_S v_j (a full D_S); the prey-row noise of a replicate
+    is shared by its control and its exposed cells (the global seeds); survivors ~ Binomial(600)."""
+    rng = np.random.default_rng([seed, 2])
+    cS = 1.4 + 0.35 * rng.normal(size=D.nQ)
+    etaS = cS[D.qi] - 0.6 * (a[D.pj] - b[D.qi]) - 0.3
+    DS = None
+    if rank:
+        DS = rng.normal(size=(rank, rank)) / math.sqrt(rank)
+        etaS = etaS + 0.8 * c * (u[D.qi] * (v[D.pj] @ DS.T)).sum(axis=1)
+    if s["noiseless"]:
+        S = np.repeat(etaS[:, None], R_REPS, axis=1)
+        S0 = np.repeat(cS[:, None], R_REPS, axis=1)
+    else:
+        k = s["noise_scale"]
+        row = k * 0.15 * rng.normal(size=(D.nQ, R_REPS))
+        y = (etaS[:, None] + row[D.qi] + k * 0.10 * rng.normal(size=(D.nP, R_REPS))[D.pj]
+             + k * 0.15 * rng.normal(size=(len(etaS), R_REPS)))
+        y0 = cS[:, None] + row + k * 0.15 * rng.normal(size=(D.nQ, R_REPS))
+        lg = lambda x: np.log((x + 0.5) / (N_SURV - x + 0.5))  # noqa: E731
+        S = lg(rng.binomial(N_SURV, 1.0 / (1.0 + np.exp(-y))))
+        S0 = lg(rng.binomial(N_SURV, 1.0 / (1.0 + np.exp(-y0))))
+    return {"cS": cS, "etaS": etaS, "DS": DS, "s": S, "sbar": S.mean(axis=1), "s0": S0, "s0bar": S0.mean(axis=1)}
 
 
 def additive_projection(D, y, iters=40):
@@ -294,11 +341,12 @@ def _solve_nodes(idx, X, y, n, ridge):
 
 
 def fit(D, idx, zbar, rank, lam, own_layer, iters=40, seed=0, lam_ab=1e-3, lam_world=10.0, balance=False,
-        init=None):
+        init=None, ab_cap=None):
     """Ridge ALS of z = mu + a_j - b_i + u_i.v_j [+ h(lag) + h_w(lag) on within pairs] -> params.
     balance: rescale each latent dimension to equal u and v norms after every sweep (the product is
     unchanged; it keeps a nearly unpenalized fit, the numerical check's, from drifting along the
-    scale freedom). init: a previous fit's parameters to start from (a warm start)."""
+    scale freedom). init: a previous fit's parameters to start from (a warm start). ab_cap r: the
+    A/B prey's interaction is held to its first r dimensions (the rest pinned at 0)."""
     rng = np.random.default_rng(seed)
     qi, pj, z = D.qi[idx], D.pj[idx], zbar[idx]
     a, b = np.zeros(D.nP), np.zeros(D.nQ)
@@ -313,12 +361,17 @@ def fit(D, idx, zbar, rank, lam, own_layer, iters=40, seed=0, lam_ab=1e-3, lam_w
     wi = D.within[idx] if own_layer else np.zeros(len(idx), bool)
     lb, lw = D.lagbin[idx][wi], D.ownw[idx][wi]
     ridge = np.array([lam_ab] + [lam] * rank)
+    ridge_q = ridge
+    if ab_cap is not None and ab_cap < rank:
+        ridge_q = np.tile(ridge, (D.nQ, 1))
+        ridge_q[D.qab, 1 + ab_cap:] = 1e9
+        u[D.qab, ab_cap:] = 0.0
     one = np.ones(len(idx))
     for _ in range(iters):
         own = np.zeros(len(idx))
         if wi.any():
             own[wi] = h[lb] + hw[lw, lb]
-        th = _solve_nodes(qi, np.column_stack([-one, v[pj]]), z - mu - a[pj] - own, D.nQ, ridge)
+        th = _solve_nodes(qi, np.column_stack([-one, v[pj]]), z - mu - a[pj] - own, D.nQ, ridge_q)
         b, u = th[:, 0], th[:, 1:]
         th = _solve_nodes(pj, np.column_stack([one, u[qi]]), z - mu + b[qi] - own, D.nP, ridge)
         a, v = th[:, 0], th[:, 1:]
@@ -370,16 +423,52 @@ def cluster_lb(diff, worlds, rng, n=2000):
     return float(per.mean()), float(np.quantile(boots, 0.025)), per.tolist()
 
 
-def procedure(D, data, option, ranks, lambdas, iters, seed):
+FITTERS = ("minimal", "registered")
+
+
+def any_fit(fitter, D, idx, data, rank, lam, own_layer, iters, seed, ab_cap=None, init=None, balance=False):
+    """The minimal fitter (fit) or the registered map (map.py: monotone 6 x 6 tensor baseline,
+    bounded link, the joint survival head)."""
+    if fitter == "registered":
+        try:
+            import map as mapfit
+        except ImportError:
+            raise SystemExit("--fitter registered needs map.py (item 7, the registered map; its own PR)")
+        return mapfit.fit(D, idx, data, rank, lam, own_layer, iters, seed, init=init)
+    return fit(D, idx, data["zbar"], rank, lam, own_layer, iters, seed, ab_cap=ab_cap, init=init, balance=balance)
+
+
+def any_predict(D, m, idx):
+    if "surfC" in m:
+        import map as mapfit
+        return mapfit.predict(D, m, idx)
+    return predict(D, m, idx)
+
+
+def class_accuracy(D, data, m1, m0):
+    """Per target class: the selected map's and rank 0's RMSE against the truth."""
+    out = {}
+    for name, ix in D.classes.items():
+        if len(ix):
+            e = data["eta"][ix]
+            out[name] = {"n": int(len(ix)),
+                         "rmse_selected": float(np.sqrt(np.mean((any_predict(D, m1, ix) - e) ** 2))),
+                         "rmse_rank0": float(np.sqrt(np.mean((any_predict(D, m0, ix) - e) ** 2))),
+                         "interaction_sd": float(np.std(data["inter"][ix]))}
+    return out
+
+
+def procedure(D, data, option, ranks, lambdas, iters, seed, ab_cap=None, fitter="minimal"):
     """The registered selection and prediction procedure on one dataset for one fitting option."""
     idx = D.fit[option]
     own_layer = option == "b"
     cands = [(0, 0.0)] + [(r, lam) for r in range(1, ranks + 1) for lam in lambdas]
-    out = {"candidates": []}
+    out = {"candidates": [], "fitter": fitter}
     best, models = None, {}
+    predict = any_predict              # noqa: F811 (the procedure scores whichever fitter it ran)
     for r, lam in cands:
         t0 = time.time()
-        m = fit(D, idx, data["zbar"], r, lam, own_layer, iters, seed)
+        m = any_fit(fitter, D, idx, data, r, lam, own_layer, iters, seed, ab_cap=ab_cap)
         s2 = float(((data["z"][idx] - predict(D, m, idx)[:, None]) ** 2).mean())
         pv = predict(D, m, D.val_idx)
         vscore, _ = world_mean(lpd(data["z"][D.val_idx], pv, s2), D.val_world)
@@ -409,22 +498,24 @@ def procedure(D, data, option, ranks, lambdas, iters, seed):
     out.update(selected={"rank": sel[0], "lambda": sel[1]}, test_improvement=mean, test_lb=lb,
                per_test_world=per, success=bool(sel[0] > 0 and lb > 0),
                snapshot_test_improvement=float(sdiff.mean()), alignment_u1_b=align,
-               fit_pairs=int(len(idx)))
+               fit_pairs=int(len(idx)), classes=class_accuracy(D, data, m1, m0), ab_cap=ab_cap)
     return out
 
 
 CONTINUATION = (0.3, 0.1, 0.03, 0.01, 0.003, 0.001)
 
 
-def numerical(D, data, option, rank, iters, seed):
+def numerical(D, data, option, rank, iters, seed, ab_cap=None, fitter="minimal"):
     """Noiseless data fitted at the true rank (the penalty continued down to 0.001, warm-started and
     balanced, 100 sweeps per step: a cold nearly unpenalized ALS stalls short of the exact fit): the
     test targets' errors relative to the interaction's SD, overall and without the targets that have
     an endpoint with fewer fitting pairs than the rank's parameters (rank + 1: not identifiable)."""
     idx = D.fit[option]
     m = None
+    predict = any_predict              # noqa: F811
     for lam in CONTINUATION:
-        m = fit(D, idx, data["zbar"], rank, lam, option == "b", 100, seed, balance=True, init=m)
+        m = any_fit(fitter, D, idx, data, rank, lam, option == "b", 100 if fitter == "minimal" else 30, seed,
+                    ab_cap=ab_cap, init=m, balance=True)
     t = D.test_idx
     err = predict(D, m, t) - data["eta"][t]
     sd = float(np.std(data["inter"][t]))
@@ -432,10 +523,12 @@ def numerical(D, data, option, rank, iters, seed):
     dp = np.bincount(D.pj[idx], minlength=D.nP)
     under = (dq[D.qi[t]] < rank + 1) | (dp[D.pj[t]] < rank + 1)
     rel = lambda e: float(np.sqrt(np.mean(e ** 2)) / sd) if len(e) and sd else None  # noqa: E731
+    cls = {name: rel(predict(D, m, ix) - data["eta"][ix]) for name, ix in D.classes.items() if len(ix)}
     return {"rank": rank, "interaction_sd": sd, "relative": rel(err),
             "relative_identified": rel(err[~under]), "underdetermined_targets": int(under.sum()),
             "median_abs_relative": float(np.median(np.abs(err)) / sd) if sd else None,
-            "p90_abs_relative": float(np.quantile(np.abs(err), 0.9) / sd) if sd else None}
+            "p90_abs_relative": float(np.quantile(np.abs(err), 0.9) / sd) if sd else None,
+            "relative_by_class": cls, "ab_cap": ab_cap}
 
 
 # ------------------------------------------------------------------ commands
@@ -457,12 +550,14 @@ def one(a):
     res = {"schema": RESULT_SCHEMA, "scenario": a.scenario, "rep": a.rep, "seed": seed,
            "settings": data["settings"], "interaction_scale": data["c"], "energy_check": data["energy"],
            "graph_edges_sha256": D.g["edges_sha256"], "options": {}}
+    cap = a.ab_cap if a.ab_cap >= 0 else None
+    res["fitter"] = a.fitter
     for opt in a.options.split(","):
         if sc.get("noiseless"):
-            res["options"][opt] = numerical(D, data, opt, sc["rank"], a.iters, seed)
+            res["options"][opt] = numerical(D, data, opt, sc["rank"], a.iters, seed, ab_cap=cap, fitter=a.fitter)
         else:
             res["options"][opt] = procedure(D, data, opt, a.ranks, [float(x) for x in a.lambdas.split(",")],
-                                            a.iters, seed)
+                                            a.iters, seed, ab_cap=cap, fitter=a.fitter)
     res["seconds"] = round(time.time() - t0, 1)
     rqlib.write_json_durable(a.out, res)
     return 0
@@ -471,9 +566,11 @@ def one(a):
 def run(a):
     os.makedirs(a.out, exist_ok=True)
     names = SETS[a.set] if a.set != "all" else [n for s in ("main", "stress", "power", "numerical") for n in SETS[s]]
+    if a.scenarios:
+        names = a.scenarios.split(",")
     jobs = []
     for sc in names:
-        reps = a.reps if sc in SETS["main"] else 1 if sc in SETS["numerical"] else max(2, a.reps // 2)
+        reps = 1 if sc in SETS["numerical"] else a.reps if (sc in SETS["main"] or a.scenarios) else max(2, a.reps // 2)
         for rep in range(reps):
             f = os.path.join(a.out, f"{sc}.{rep:03d}.json")
             if not os.path.exists(f):
@@ -486,7 +583,8 @@ def run(a):
             sc, rep, f = jobs.pop(0)
             cmd = [sys.executable, os.path.abspath(__file__), "one", "--graph", a.graph, "--scenario", sc,
                    "--rep", str(rep), "--out", f, "--options", a.options, "--ranks", str(a.ranks),
-                   "--lambdas", a.lambdas, "--iters", str(a.iters), "--namespace", a.namespace]
+                   "--lambdas", a.lambdas, "--iters", str(a.iters), "--namespace", a.namespace,
+                   "--ab-cap", str(a.ab_cap), "--fitter", a.fitter]
             running.append((subprocess.Popen(cmd, env=env, stdin=subprocess.DEVNULL), sc, rep))
         time.sleep(0.5)
         for item in list(running):
@@ -528,13 +626,17 @@ def summarize(d):
                                  "selected_ranks": dict(sorted(sel.items())),
                                  "mean_test_improvement": float(np.mean([o["test_improvement"] for o in lst])),
                                  "mean_test_lb": float(np.mean([o["test_lb"] for o in lst])),
-                                 "fit_pairs": lst[0]["fit_pairs"]})
+                                 "fit_pairs": lst[0]["fit_pairs"],
+                                 "classes": {k: {f: float(np.mean([o["classes"][k][f] for o in lst]))
+                                                 for f in ("rmse_selected", "rmse_rank0", "interaction_sd")}
+                                             for k in (lst[0].get("classes") or {})}})
         else:
             out["cells"].append({"scenario": sc, "option": opt, "datasets": len(lst),
                                  "relative_test_rmse": [o["relative"] for o in lst],
                                  "relative_test_rmse_identified": [o.get("relative_identified") for o in lst],
                                  "median_abs_relative": [o.get("median_abs_relative") for o in lst],
-                                 "underdetermined_targets": [o.get("underdetermined_targets") for o in lst]})
+                                 "underdetermined_targets": [o.get("underdetermined_targets") for o in lst],
+                                 "relative_by_class": [o.get("relative_by_class") for o in lst]})
     return out
 
 
@@ -601,8 +703,13 @@ def main(argv=None):
             s.add_argument("--lambdas", default="0.02,0.1,0.5")
             s.add_argument("--namespace", default="rq2026-recovery")
             s.add_argument("--out", required=True)
+            s.add_argument("--ab-cap", type=int, default=-1, metavar="R",
+                           help="hold the A/B prey's interaction to rank <= R in every fit (-1: no cap)")
+            s.add_argument("--fitter", choices=FITTERS, default="minimal",
+                           help="minimal (ridge ALS) or registered (map.py, item 7: the v4 §6 map)")
         if name == "run":
             s.add_argument("--set", choices=("main", "stress", "power", "numerical", "all"), default="main")
+            s.add_argument("--scenarios", help="a comma list instead of --set (--reps each; numerical: 1)")
             s.add_argument("--reps", type=int, default=20)
             s.add_argument("--jobs", type=int, default=2)
         if name == "one":

@@ -33,8 +33,9 @@ _G = {}
 
 
 def full(ns=NS, tm=True):
+    """The v4 graph alone (no top-ups): the registered families' checks."""
     if (ns, tm) not in _G:
-        _G[(ns, tm)] = graph.build(ns, None, tm)
+        _G[(ns, tm)] = graph.build(ns, None, tm, snapshot_topup=0, ab_topup=0)
     return _G[(ns, tm)]
 
 
@@ -55,8 +56,12 @@ class TestGraph(unittest.TestCase):
         self.assertEqual(graph.check_quotas(self.g), [])
         self.assertEqual(len(self.g["edges"]), 237_884)
         self.assertEqual(sum(graph.QUOTAS.values()), 237_884)
-        again = graph.build(NS)
+        again = graph.build(NS, snapshot_topup=0, ab_topup=0)
         self.assertEqual(again["edges"], self.g["edges"])
+        default = graph.build()          # the default namespace and the approved top-ups (v4 amendment)
+        self.assertEqual(Counter(e[2] for e in default["edges"] if e[2] in graph.TOPUPS),
+                         Counter(support_snap=1301, ab_train_c=3877))
+        self.assertEqual(len(default["edges"]), 243_062)
         self.assertNotEqual(full("rq-test-other")["edges"], self.g["edges"])
         no = full(NS, False)
         self.assertEqual(graph.check_quotas(no), [])
@@ -178,6 +183,38 @@ class TestGraph(unittest.TestCase):
         finally:
             shutil.rmtree(tmp)
 
+    def test_topups(self):
+        """The optional top-ups: snapshot holdouts to six training opponents in their support (other
+        worlds only), training A/B prey to eight fitting pairs or eight C opponents; the registered
+        families are unchanged."""
+        base = {(e[0], e[1]): e for e in self.g["edges"]}
+        for ab_mode in ("fitting", "c"):
+            g = graph.build(NS, None, True, snapshot_topup=6, ab_topup=8, ab_topup_mode=ab_mode)
+            self.assertEqual(graph.check_quotas(g), [])
+            new = [e for e in g["edges"] if (e[0], e[1]) not in base]
+            self.assertTrue(all(e[2] in graph.TOPUPS for e in new))
+            self.assertEqual(len(g["edges"]) - len(new), len(base))
+            self.assertTrue(all(base[(e[0], e[1])] == e for e in g["edges"] if (e[0], e[1]) in base))
+            opp, fitp, copp = Counter(), Counter(), Counter()
+            for q, p, fam, role, _ in g["edges"]:
+                if role == "support":
+                    for x, y in ((q, p), (p, q)):
+                        if graph.parse(y)[1] is not None and (graph.parse(x)[1], graph.parse(x)[2]) in self.hold:
+                            opp[x] += 1
+                if fam == "support_snap":
+                    self.assertEqual(role, "support")
+                    self.assertNotEqual(graph.parse(q)[1], graph.parse(p)[1])
+                if fam == "ab_train_c":
+                    self.assertEqual((role, self.status(p)), ("training", "train"))
+                if self.treat.get(graph.parse(q)[1]) in ("A", "B") and self.split[graph.parse(q)[1]] == "train" \
+                        and role == "training":
+                    fitp[q] += 1
+                    copp[q] += graph.parse(p)[1] is not None
+            self.assertEqual(len(opp), 800)
+            self.assertGreaterEqual(min(opp.values()), 6)
+            self.assertEqual(len(fitp), 10 * 201)
+            self.assertGreaterEqual(min((fitp if ab_mode == "fitting" else copp).values()), 8)
+
 
 @unittest.skipIf(np is None, "numpy is not installed (set RQ_PYLIB, or RQ_REQUIRE_NUMPY=1 to require it)")
 class TestRecovery(unittest.TestCase):
@@ -206,6 +243,10 @@ class TestRecovery(unittest.TestCase):
         data = self.rec.simulate(self.D, self.rec.SCENARIOS["r1_034"], 11)
         self.assertAlmostEqual(data["energy"], 0.034, delta=0.002)
         self.assertEqual(data["z"].shape, (len(self.D.qi), self.rec.R_REPS))
+        # the survival head's data: exposed cells and one predator-free control per prey x replicate
+        self.assertEqual((data["s"].shape, data["s0"].shape), ((len(self.D.qi), 6), (self.D.nQ, 6)))
+        again = self.rec.simulate(self.D, self.rec.SCENARIOS["r1_034"], 11)
+        self.assertTrue(np.array_equal(again["z"], data["z"]) and np.array_equal(again["s0"], data["s0"]))
 
     def test_noiseless_identification(self):
         data = self.rec.simulate(self.D, self.rec.SCENARIOS["num_r2"], 12)
@@ -231,6 +272,14 @@ class TestRecovery(unittest.TestCase):
         self.assertIn("predators:snapshot-val", rep)
         self.assertEqual(rep["prey:world-test"]["singular"], 0)
         self.assertEqual(rep["prey:train"]["n"], 3620 + 2010)     # eligible C training states + A/B training prey
+
+    def test_ab_cap(self):
+        data = self.rec.simulate(self.D, self.rec.SCENARIOS["r2_034"], 15)
+        m = self.rec.fit(self.D, self.D.fit["a"], data["zbar"], 3, 0.1, False, 5, 0, ab_cap=2)
+        self.assertLess(float(np.abs(m["u"][self.D.qab, 2]).max()), 1e-6)
+        self.assertGreater(float(np.abs(m["u"][~self.D.qab, 2]).max()), 1e-3)
+        self.assertEqual(set(self.D.classes), {"world_test_ab_prey", "world_test_c_prey", "snapshot_test"})
+        self.assertGreater(len(self.D.classes["world_test_ab_prey"]), 0)
 
     def test_helpers(self):
         rng = np.random.default_rng(1)

@@ -2,7 +2,7 @@
 """graph.py: the Red Queen map graph of design v4 (§4.1-4.5, §5.1, §7.1) and its pre-seal reports.
 
     graph.py build --out DIR [--namespace NS] [--registry STUDY/config/worlds.json]
-                   [--no-train-matchings]
+                   [--no-train-matchings] [--snapshot-topup 6] [--ab-topup 8 [--ab-topup-mode fitting|c]]
     graph.py report --graph DIR/graph.jsonl.gz [--out report.json]
 
 The graph is the set of (prey population, predator population) pairs the assays measure for the
@@ -37,16 +37,26 @@ FAMILIES (v4 §4.5; quotas checked; no pair twice).
   support_ab  two more training C predators for every held-out A/B prey snapshot: 2,412
   train_match four edge-disjoint matchings of the 3,620 eligible training states (20 training C
               worlds x 201 - 400 snapshot holdouts), across worlds, new pairs only (v4 §4.4): 14,480
-  total 237,884 (223,404 without --no-train-matchings... i.e. with it).
+  total 237,884 (223,404 with --no-train-matchings), and the default top-ups (no fixed quota):
+  support_snap every snapshot-holdout population up to six training opponents in its support,
+              new support pairs to eligible training states of other worlds: 1,301
+  ab_train_c  every training A/B prey snapshot up to eight fitting pairs (its four references
+              included; --ab-topup-mode c: eight training C opponents) with new training pairs to
+              eligible training C predators: 3,877
+  The top-ups are the recovery comparison's choice (rank 4 identifiable for every population, the
+  noisy A/B and snapshot-test errors down; +5,178 pairs, about 0.24 production days at 5k);
+  --snapshot-topup 0 --ab-topup 0 gives the v4 graph alone. They come after every registered
+  family, which they leave unchanged.
 
 ROLES. A pair is "support" when it is declared placement support of a held-out population: its four
 reference pairs, two of its existing matching pairs with an eligible training opponent (world
-holdouts) or up to six (snapshot holdouts, which get no new pairs: v4 §4.4), every ab_to_c pair of a
-held-out A/B world, and the support_c / support_ab pairs. Otherwise a pair inherits its most
-held-out endpoint: test before validation before training (references count as training).
+holdouts) or up to six (snapshot holdouts), every ab_to_c pair of a held-out A/B world, and the
+support_c / support_ab / support_snap pairs. Otherwise a pair inherits its most held-out endpoint:
+test before validation before training (references count as training).
 
-HORIZONS (§4.6): the reference grid "long"; support_c, support_ab and train_match "short"; every
-other family is in the randomized 1/8 long pool (no horizon: plan.py's pre-randomized long subset).
+HORIZONS (§4.6): the reference grid "long"; support_c, support_ab, train_match and the top-ups
+"short"; every other family is in the randomized 1/8 long pool (no horizon: plan.py's
+pre-randomized long subset).
 
 The report (graph.py report) gives: family quotas, role x family counts, uniqueness, the support
 counts of every held-out population, the fitting degree of every population and the connected
@@ -74,8 +84,13 @@ WINDOWS = ((0, 20), (90, 110), (180, 200))
 OFFSETS = (0, 1, -1, 2, -2, 4, -4)
 QUOTAS = {"within": 72_992, "ref_prey": 25_728, "ref_pred": 25_728, "ref_ab": 12_864, "ref_grid": 64,
           "cross": 51_456, "ab_to_c": 12_864, "support_c": 19_296, "support_ab": 2_412, "train_match": 14_480}
-GLOBAL = ("ref_prey", "ref_pred", "ref_ab", "ref_grid", "cross", "ab_to_c", "support_c", "support_ab", "train_match")
-HORIZON = {"ref_grid": "long", "support_c": "short", "support_ab": "short", "train_match": "short"}
+# optional top-ups (no registered quota: their counts are what the options generate)
+TOPUPS = ("support_snap", "ab_train_c")
+FAMILIES = tuple(QUOTAS) + TOPUPS
+GLOBAL = ("ref_prey", "ref_pred", "ref_ab", "ref_grid", "cross", "ab_to_c", "support_c", "support_ab", "train_match") \
+    + TOPUPS
+HORIZON = {"ref_grid": "long", "support_c": "short", "support_ab": "short", "train_match": "short",
+           "support_snap": "short", "ab_train_c": "short"}
 REF_BASE = (0, 1, 2, 4)            # cyclic 4-of-8 subsets: every reference in exactly four blocks
 FORWARD_LAST = 120                 # the forward-time rule's last fitted time (120M, §7.3)
 
@@ -162,9 +177,19 @@ def splits(ns, worlds):
     return split, sorted(fork), sorted(intensive), holdout
 
 
-def build(ns="rq2026-graph", worlds=None, train_matchings=True):
+SNAPSHOT_TOPUP, AB_TOPUP = 6, 8     # the recommended top-ups (the recovery comparison: 5,178 pairs)
+
+
+def build(ns="rq2026-graph", worlds=None, train_matchings=True, snapshot_topup=SNAPSHOT_TOPUP, ab_topup=AB_TOPUP,
+          ab_topup_mode="fitting"):
     """-> the graph: {"schema", "namespace", "worlds", "split", "fork", "intensive", "holdout",
-    "edges": [(prey, pred, family, role, horizon)], ...}."""
+    "edges": [(prey, pred, family, role, horizon)], ...}.
+    snapshot_topup N: every snapshot-holdout population with fewer than N training opponents among
+    its support gets new support pairs to eligible training states of other worlds (support_snap).
+    ab_topup N: every training A/B prey snapshot gets new training pairs to eligible training C
+    predators (ab_train_c) until it has N fitting pairs (mode "fitting": its four reference pairs
+    included) or N training C opponents (mode "c"). Both come after every registered family, which
+    they leave unchanged."""
     worlds = worlds or synthetic_worlds()
     split, fork, intensive, holdout = splits(ns, worlds)
     block = {w["id"]: w["block"] for w in worlds}
@@ -274,17 +299,21 @@ def build(ns="rq2026-graph", worlds=None, train_matchings=True):
     # four more training opponents for every held-out-world C population; two for held-out A/B prey
     elig = [(w, t) for w in train_c for t in TIMES if eligible(w, t)]
 
-    def new_opponents(x, guild, n, fam, tag):
+    def new_opponents(x, guild, n, fam, tag, as_support=True):
         r = Rng(ns, "support", tag, x)
+        own = parse(x)[1]
         got, tries = 0, 0
         while got < n:
             tries += 1
             if tries > 10_000:
                 raise GraphError(f"{x}: no new support opponent")
             w2, t2 = elig[r.below(len(elig))]
+            if w2 == own:                    # (another world's: never an own-world pair)
+                continue
             q, p = (x, P(w2, t2)) if guild == "Q" else (Q(w2, t2), x)
             if add(q, p, fam):
-                support.add((q, p))
+                if as_support:
+                    support.add((q, p))
                 got += 1
     for w in cs:
         if split[w] == "train":
@@ -321,6 +350,28 @@ def build(ns="rq2026-graph", worlds=None, train_matchings=True):
                 (w1, t1), (w2, t2) = elig[i], elig[perm[i]]
                 if not add(Q(w1, t1), P(w2, t2), "train_match"):
                     raise GraphError("train_match: a pair twice")
+    if snapshot_topup:                       # snapshot holdouts up to N training opponents in support
+        have = Counter()
+        for q, p in support:
+            for x, y in ((q, p), (p, q)):
+                if parse(y)[1] is not None and parse(x)[1] is not None and split[parse(x)[1]] == "train" \
+                        and status(x) != "train":
+                    have[x] += 1
+        for (w, t) in sorted(holdout):
+            for x, guild in ((Q(w, t), "Q"), (P(w, t), "P")):
+                if snapshot_topup > have[x]:
+                    new_opponents(x, guild, snapshot_topup - have[x], "support_snap", "snap")
+    if ab_topup:                             # training A/B prey up to N fitting pairs / C opponents
+        c_opp = Counter(q for (q, p), fam in pairs.items()
+                        if fam == "ab_to_c" and eligible(parse(p)[1], parse(p)[2]))
+        for w in abs_:
+            if split[w] != "train":
+                continue
+            for t in TIMES:
+                x = Q(w, t)
+                need = ab_topup - c_opp[x] - (4 if ab_topup_mode == "fitting" else 0)
+                if need > 0:
+                    new_opponents(x, "Q", need, "ab_train_c", "ab-train", as_support=False)
     order = {"test": 2, "val": 1, "train": 0}
     role_name = {2: "test", 1: "validation", 0: "training"}
     edges = []
@@ -330,8 +381,9 @@ def build(ns="rq2026-graph", worlds=None, train_matchings=True):
         else:
             role = role_name[max(order[status(q)], order[status(p)])]
         edges.append((q, p, fam, role, HORIZON.get(fam)))
-    edges.sort(key=lambda e: (list(QUOTAS).index(e[2]), e[0], e[1]))
+    edges.sort(key=lambda e: (FAMILIES.index(e[2]), e[0], e[1]))
     return {"schema": GRAPH_SCHEMA, "namespace": ns, "train_matchings": train_matchings,
+            "topups": {"snapshot": snapshot_topup, "ab": ab_topup, "ab_mode": ab_topup_mode},
             "worlds": worlds, "split": split, "fork": fork, "intensive": intensive,
             "holdout": {f"{w}:{t}": v for (w, t), v in sorted(holdout.items())},
             "ref_subsets": {"predator_refs_of_block": sub_p, "prey_refs_of_block": sub_q},
@@ -442,7 +494,8 @@ def report(g):
     out = {"schema": "finfolk.redqueen.graphreport/1", "namespace": g["namespace"],
            "quota_problems": check_quotas(g), "pairs": len(g["edges"]),
            "families": dict(Counter(e[2] for e in g["edges"])),
-           "roles": {f: dict(Counter(e[3] for e in g["edges"] if e[2] == f)) for f in QUOTAS}}
+           "roles": {f: dict(Counter(e[3] for e in g["edges"] if e[2] == f)) for f in FAMILIES
+                     if f in QUOTAS or any(e[2] == f for e in g["edges"])}}
     # support of held-out populations: references and training opponents among their support pairs
     sup = defaultdict(lambda: [0, 0])
     for q, p, fam, role, _ in g["edges"]:
@@ -485,13 +538,17 @@ def main(argv=None):
     b.add_argument("--namespace", default="rq2026-graph")
     b.add_argument("--registry")
     b.add_argument("--no-train-matchings", action="store_true")
+    b.add_argument("--snapshot-topup", type=int, default=SNAPSHOT_TOPUP, metavar="N", help="0: none (pure v4)")
+    b.add_argument("--ab-topup", type=int, default=AB_TOPUP, metavar="N", help="0: none (pure v4)")
+    b.add_argument("--ab-topup-mode", choices=("fitting", "c"), default="fitting")
     r = sub.add_parser("report")
     r.add_argument("--graph", required=True)
     r.add_argument("--out")
     a = ap.parse_args(argv)
     try:
         if a.cmd == "build":
-            g = build(a.namespace, registry_worlds(a.registry) if a.registry else None, not a.no_train_matchings)
+            g = build(a.namespace, registry_worlds(a.registry) if a.registry else None, not a.no_train_matchings,
+                      a.snapshot_topup, a.ab_topup, a.ab_topup_mode)
             probs = check_quotas(g)
             if probs:
                 raise GraphError("; ".join(probs))
