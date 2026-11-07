@@ -403,6 +403,42 @@ class TestMap(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "within-world pairs only"):
             M.own_world_stage2(D, m, data, D.fit["a"][:10])
 
+    def test_weights_starts_and_scoring(self):
+        """The coordinator's item-7 decisions: capture cells weighted by 1 / V(p) from the registered
+        variance function (the generator's in recovery); both starts run, the lower penalized training
+        objective kept (never validation); per-pair predictive variances phi V(p) in the scores."""
+        D, M, rec = self.D, self.M, self.rec
+        idx = D.fit["a"]
+        data = rec.simulate(D, rec.SCENARIOS["r1_017_cap"], 41)
+        vf = rec.var_model(data["settings"])
+        self.assertAlmostEqual(float(vf(np.array([0.2]))[0]), 0.36)
+        self.assertAlmostEqual(float(vf(np.array([0.5]))[0]), 0.0225)
+        self.assertIsNone(rec.var_model(dict(rank=2, noiseless=True)))
+        flat = rec.var_model(rec.SCENARIOS["r0"])
+        self.assertAlmostEqual(float(flat(np.array([0.5]))[0]), 0.15 ** 2 + 0.15 ** 2 + 0.2 ** 2 + 1 / (rec.B_COUNT * 0.25))
+        mw = M.fit(D, idx, data, 1, 0.05, False, 10, 1, var_fn=vf)
+        mu = M.fit(D, idx, data, 1, 0.05, False, 10, 1)
+        self.assertTrue(mw["weighted"] and not mu["weighted"])
+        self.assertFalse(np.allclose(M.predict(D, mw, idx), M.predict(D, mu, idx)))
+        best = M.fit_best(D, idx, data, 1, 0.05, 10, 1, var_fn=vf)
+        self.assertEqual(set(best["objectives"]), {"warm", "cold"})
+        self.assertEqual(best["objective"], min(best["objectives"].values()))
+        self.assertEqual(best["start"], min(best["objectives"], key=best["objectives"].get))
+        self.assertEqual(set(M.fit_best(D, idx, data, 0, 0.0, 5, 1)["objectives"]), {"warm"})   # rank 0: one fit
+        s2 = rec.predictive_var(D, data, best, idx, "registered")
+        v = s2(D.val_idx)
+        self.assertEqual(v.shape, D.val_idx.shape)
+        self.assertGreater(float(v.max()) / float(v.min()), 3.0)              # heteroscedastic
+        s1 = rec.predictive_var(D, data, best, idx, "minimal")
+        self.assertIsInstance(s1(D.val_idx), float)
+        z = data["z"][D.val_idx[:5]]
+        pr = M.predict(D, best, D.val_idx[:5])
+        self.assertTrue(np.allclose(rec.lpd(z, pr, np.full(5, 0.3)), rec.lpd(z, pr, 0.3)))
+        out = rec.procedure(D, data, "a", 1, [0.05], 8, 41, fitter="registered")
+        self.assertEqual({c["start"] for c in out["candidates"] if c["rank"]} <= {"warm", "cold"}, True)
+        self.assertIn("selected_primary", out)
+        self.assertEqual(rec.REGISTERED_LAMBDAS, (0.01, 0.02, 0.05, 0.2))
+
 
 if __name__ == "__main__":
     unittest.main()

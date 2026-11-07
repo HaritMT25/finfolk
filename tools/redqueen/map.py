@@ -126,6 +126,7 @@ class Surface:
     def __init__(self, ka, kb, direction):
         self.ka, self.kb, self.direction = ka, kb, direction
         self.theta = np.zeros((K, K))
+        self.pen = 0.0
 
     def parts(self, a, b):
         ia, ta, ha = _hat(a, self.ka)
@@ -163,6 +164,8 @@ class Surface:
         if (C @ x0 < -1e-9).any():
             x0 = np.full(n, float(np.sum(w * y) / np.sum(w)))
         self.theta = monotone_qp(A, c, C, x0).reshape(K, K)
+        th = self.theta.ravel()
+        self.pen = float(SMOOTH * scale * th @ PEN @ th)
 
 
 def _knots(x):
@@ -223,10 +226,6 @@ def _solve_nodes(idx, X, y, w, n, ridge, damp_to=None, damp=0.0):
     return np.linalg.solve(A, rhs[..., None])[..., 0]
 
 
-def ones_(n):
-    return np.ones(n)
-
-
 def _noise(x):
     """The noise variance of a replicate mean: the mean replicate variance / R."""
     return float(np.mean(np.var(x, axis=1, ddof=1)) / x.shape[1])
@@ -267,10 +266,14 @@ def svd_start(qi, pj, resid, nQ, nP, rank, seed=0):
 
 
 def fit(D, idx, data, rank, lam, own_layer=False, iters=40, seed=0, survival=True, link=True,
-        lam_ab=1e-3, lam_world=10.0, init=None, start="warm"):
+        lam_ab=1e-3, lam_world=10.0, init=None, start="warm", var_fn=None):
     """The registered map on the fitting pairs idx -> its parameters (see the module doc). start:
-    "warm" (registered: the embedding starts from svd_start on the rank-0 spline residuals) or "cold"
-    (small random normals; for the comparison only); init (a previous fit) overrides both."""
+    "warm" (the embedding starts from svd_start on the rank-0 spline residuals) or "cold" (small
+    random normals); init (a previous fit) overrides both; fit_best runs both and keeps the lower
+    penalized training objective. var_fn (the registered capture-level variance function, p ->
+    per-replicate variance of the empirical logit; in production from the noise bank, v4 §7.4):
+    every capture cell is weighted by 1 / var_fn(p_ij) at its fitted capture fraction (IRLS: the
+    weights follow the fit; normalized to mean 1 so the penalties keep their meaning); None: equal."""
     import recovery as rec          # (the data layout and the additive start)
     if own_layer:
         raise ValueError("option (b) is dropped (q30b): the Level-1 map is placed on the common cross-world "
@@ -286,6 +289,14 @@ def fit(D, idx, data, rank, lam, own_layer=False, iters=40, seed=0, survival=Tru
         wS0 = 1.0 / max(_noise(data["s0"]), 1e-6) / wC        #  penalties mean what recovery.fit's do)
         s0 = data["s0bar"]
     wC = 1.0
+
+    def cap_weights(zfit):
+        if var_fn is None:
+            return np.ones(len(idx))
+        p = np.clip(1.0 / (1.0 + np.exp(-zfit)), 1e-4, 1.0 - 1e-4)
+        w = 1.0 / np.maximum(var_fn(p), 1e-8)
+        return w / w.mean()
+    wC = cap_weights(z)
     # the additive starts (rank 0, identity link) for each head's own ordered qualities (v4 §6.2:
     # head-specific ordered terms; only the interaction embedding u, v is shared)
     if init is None:
@@ -313,7 +324,7 @@ def fit(D, idx, data, rank, lam, own_layer=False, iters=40, seed=0, survival=Tru
     if init is not None:
         u, v = init["u"].copy(), init["v"].copy()
     elif start == "warm" and rank:
-        surfC.fit(a[pj], b[qi], z, wC * ones_(len(idx)))
+        surfC.fit(a[pj], b[qi], z, wC)
         u, v = svd_start(qi, pj, z - surfC.value(a[pj], b[qi]), D.nQ, D.nP, rank, seed)
     elif start in ("warm", "cold"):
         u, v = rng.normal(0.0, 0.1, (D.nQ, rank)), rng.normal(0.0, 0.1, (D.nP, rank))
@@ -339,6 +350,7 @@ def fit(D, idx, data, rank, lam, own_layer=False, iters=40, seed=0, survival=Tru
         FC = surfC.value(a[pj], b[qi])
         eta = FC + inter + own
         g, dg = lk.G(eta), lk.dG(eta)
+        wC = cap_weights(g)
         work = eta + (z - g) / np.maximum(dg, 1e-6)
         surfC.fit(a[pj], b[qi], work - inter - own, wC * dg ** 2)
         FC = surfC.value(a[pj], b[qi])
@@ -348,7 +360,7 @@ def fit(D, idx, data, rank, lam, own_layer=False, iters=40, seed=0, survival=Tru
             for lo in LINK_LO:
                 for hi in LINK_HI:
                     L = Link(lo, hi)
-                    sse = float(np.sum((z - L.G(base)) ** 2))
+                    sse = float(np.sum(wC * (z - L.G(base)) ** 2))
                     if best is None or sse < best[0]:
                         best = (sse, lo, hi)
             lk = Link(best[1], best[2])
@@ -371,7 +383,7 @@ def fit(D, idx, data, rank, lam, own_layer=False, iters=40, seed=0, survival=Tru
         g, dg = lk.G(eta), lk.dG(eta)
         rows_X = [np.column_stack([dg * FCb, zero, dg[:, None] * v[pj]])]
         rows_y = [z - g + dg * (FCb * b[qi] + inter)]
-        rows_w = [wC * ones]
+        rows_w = [wC]
         rows_i = [qi]
         if surv:
             FS, FSa, FSb = surfS.value(aS[pj], bS[qi], grads=True)
@@ -388,7 +400,7 @@ def fit(D, idx, data, rank, lam, own_layer=False, iters=40, seed=0, survival=Tru
         g, dg = lk.G(eta), lk.dG(eta)
         rows_X = [np.column_stack([dg * FCa, zero, dg[:, None] * u[qi]])]
         rows_y = [z - g + dg * (FCa * a[pj] + inter)]
-        rows_w = [wC * ones]
+        rows_w = [wC]
         rows_i = [pj]
         if surv:
             uDS = u[qi] @ DS if rank else np.zeros((len(idx), 0))
@@ -400,8 +412,35 @@ def fit(D, idx, data, rank, lam, own_layer=False, iters=40, seed=0, survival=Tru
                           np.concatenate(rows_w), D.nP, ridge, np.stack([a, aS], axis=1), 1.0)
         a, aS, v = th[:, 0], th[:, 1], th[:, 2:]
         standardize()
+    # the penalized training objective at the end (the criterion between starts: never validation)
+    inter = (u[qi] * v[pj]).sum(axis=1)
+    g = lk.G(surfC.value(a[pj], b[qi]) + inter)
+    wC = cap_weights(g)
+    obj = float(np.sum(wC * (z - g) ** 2)) + surfC.pen
+    if surv:
+        interS = (u[qi] * (v[pj] @ DS.T)).sum(axis=1) if rank else zero
+        obj += float(wS * np.sum((s - c[qi] - surfS.value(aS[pj], bS[qi]) - interS) ** 2)
+                     + wS0 * np.sum((s0 - c) ** 2)) + surfS.pen
+    obj += lam * float(np.sum(u ** 2) + np.sum(v ** 2)) + lam_ab * float(np.sum(a ** 2) + np.sum(b ** 2)
+                                                                      + np.sum(aS ** 2) + np.sum(bS ** 2))
     return {"a": a, "b": b, "aS": aS, "bS": bS, "u": u, "v": v, "DS": DS, "c": c, "surfC": surfC,
-            "surfS": surfS, "link": lk, "h": h, "hw": hw, "own": False, "rank": rank}
+            "surfS": surfS, "link": lk, "h": h, "hw": hw, "own": False, "rank": rank, "objective": obj,
+            "start": "init" if init is not None else start, "weighted": var_fn is not None}
+
+
+def fit_best(D, idx, data, rank, lam, iters=40, seed=0, starts=("warm", "cold"), **kw):
+    """The registered fit: every start in `starts` (rank > 0; rank 0 has no embedding to start) and
+    the one with the lower PENALIZED TRAINING objective kept (never chosen by validation) -> the fit,
+    with "objectives" {start: value}."""
+    if not rank or kw.get("init") is not None:
+        m = fit(D, idx, data, rank, lam, False, iters, seed, start=starts[0], **kw)
+        m["objectives"] = {m["start"]: m["objective"]}
+        return m
+    fits = {st: fit(D, idx, data, rank, lam, False, iters, seed, start=st, **kw) for st in starts}
+    best = min(starts, key=lambda st: fits[st]["objective"])
+    m = fits[best]
+    m["objectives"] = {st: fits[st]["objective"] for st in starts}
+    return m
 
 
 def _eta(D, m, idx):

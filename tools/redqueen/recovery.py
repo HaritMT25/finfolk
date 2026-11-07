@@ -137,6 +137,18 @@ DEFAULTS = dict(rank=0, energy=0.0, link="logit", kappa=0.0, clustered=False, ow
 SETS_CAP = [f"{n}_cap" for n in CAP_SET] + [f"{n}_cap15" for n in CAP_SET]
 
 
+def var_model(settings):
+    """The registered capture-level variance function of a scenario (the generator's own noise model:
+    p -> per-replicate variance of the empirical logit, binomial included); None for noiseless data."""
+    s = dict(DEFAULTS, **(settings or {}))
+    if s["noiseless"]:
+        return None
+    if s["noise_model"] == "capture":
+        return lambda p: capture_sd(p, s["noise_scale"]) ** 2
+    flat = s["noise_scale"] ** 2 * (s["noise_row"] ** 2 + s["noise_col"] ** 2 + s["noise_cell"] ** 2)
+    return lambda p: flat + 1.0 / (B_COUNT * np.clip(p, 1e-4, 1 - 1e-4) * (1 - np.clip(p, 1e-4, 1 - 1e-4)))
+
+
 def capture_sd(p, scale=1.0):
     """The measured per-replicate logit SD at capture fraction p (CAPTURE_SD, flat beyond its ends), x scale."""
     (p0, s0), (p1, s1) = CAPTURE_SD
@@ -446,8 +458,27 @@ def predict(D, m, idx):
 
 
 def lpd(z, pred, s2):
-    """Mean log predictive density per replicate observation, per pair (Gaussian working model)."""
+    """Mean log predictive density per replicate observation, per pair (Gaussian working model); s2 a
+    scalar or one variance per pair."""
+    s2 = np.asarray(s2, dtype=float)
+    if s2.ndim:
+        s2 = s2[:, None]
     return (-0.5 * np.log(2 * math.pi * s2) - ((z - pred[:, None]) ** 2) / (2 * s2)).mean(axis=1)
+
+
+def predictive_var(D, data, m, idx, fitter, weighted=True):
+    """The predictive variance model of a fit: the registered map with a variance function scores with
+    phi V(p_ij) (V the scenario's capture-level variance at the predicted capture fraction, phi the
+    dispersion fitted on the training pairs); otherwise one variance (the training residual mean
+    square) -> a function idx -> s2 (an array, or a scalar)."""
+    vf = var_model(data.get("settings")) if (fitter == "registered" and weighted) else None
+    pf = any_predict(D, m, idx)
+    if vf is None:
+        s2 = float(((data["z"][idx] - pf[:, None]) ** 2).mean())
+        return lambda ix: s2
+    V = lambda pr: np.maximum(vf(1.0 / (1.0 + np.exp(-pr))), 1e-8)          # noqa: E731
+    phi = float((((data["z"][idx] - pf[:, None]) ** 2) / V(pf)[:, None]).mean())
+    return lambda ix: phi * V(any_predict(D, m, ix))
 
 
 def world_mean(vals, worlds):
@@ -467,15 +498,20 @@ FITTERS = ("minimal", "registered")
 
 
 def any_fit(fitter, D, idx, data, rank, lam, own_layer, iters, seed, ab_cap=None, init=None, balance=False,
-            start="warm"):
+            start="both", weighted=True):
     """The minimal fitter (fit) or the registered map (map.py: monotone 6 x 6 tensor baseline,
-    bounded link, the joint survival head; start: its embedding's SVD warm start or a cold one)."""
+    bounded link, the joint survival head, heteroscedastic capture weights from the scenario's
+    variance function; start "both": warm and cold, the lower penalized training objective kept)."""
     if fitter == "registered":
         try:
             import map as mapfit
         except ImportError:
             raise SystemExit("--fitter registered needs map.py (item 7, the registered map; its own PR)")
-        return mapfit.fit(D, idx, data, rank, lam, own_layer, iters, seed, init=init, start=start)
+        if own_layer:
+            return mapfit.fit(D, idx, data, rank, lam, own_layer, iters, seed)     # (refused: option b)
+        vf = var_model(data.get("settings")) if weighted else None
+        starts = ("warm", "cold") if start == "both" else (start,)
+        return mapfit.fit_best(D, idx, data, rank, lam, iters, seed, starts=starts, init=init, var_fn=vf)
     return fit(D, idx, data["zbar"], rank, lam, own_layer, iters, seed, ab_cap=ab_cap, init=init, balance=balance)
 
 
@@ -502,7 +538,7 @@ def class_accuracy(D, data, m1, m0):
 PRIMARY_RANKS = 2      # (v4 amendment proposed 2026-11-07: the primary confirmatory rank set is {0, 1, 2})
 
 
-def procedure(D, data, option, ranks, lambdas, iters, seed, ab_cap=None, fitter="minimal", start="warm"):
+def procedure(D, data, option, ranks, lambdas, iters, seed, ab_cap=None, fitter="minimal", start="both"):
     """The registered selection and prediction procedure on one dataset for one fitting option.
     Every candidate also records its test improvement over rank 0 and the world-cluster lower
     bound, and the selection restricted to ranks <= PRIMARY_RANKS is reported beside the full one
@@ -516,11 +552,12 @@ def procedure(D, data, option, ranks, lambdas, iters, seed, ab_cap=None, fitter=
     for r, lam in cands:
         t0 = time.time()
         m = any_fit(fitter, D, idx, data, r, lam, own_layer, iters, seed, ab_cap=ab_cap, start=start)
-        s2 = float(((data["z"][idx] - predict(D, m, idx)[:, None]) ** 2).mean())
+        s2 = predictive_var(D, data, m, idx, fitter)
         pv = predict(D, m, D.val_idx)
-        vscore, _ = world_mean(lpd(data["z"][D.val_idx], pv, s2), D.val_world)
+        vscore, _ = world_mean(lpd(data["z"][D.val_idx], pv, s2(D.val_idx)), D.val_world)
         pt = predict(D, m, D.test_idx)
-        rec = {"rank": r, "lambda": lam, "s2": s2, "val_lpd": vscore,
+        rec = {"rank": r, "lambda": lam, "val_lpd": vscore, "start": m.get("start"),
+               "objectives": m.get("objectives"),
                "test_rmse_truth": float(np.sqrt(np.mean((pt - data["eta"][D.test_idx]) ** 2))),
                "seconds": round(time.time() - t0, 2)}
         out["candidates"].append(rec)
@@ -531,19 +568,20 @@ def procedure(D, data, option, ranks, lambdas, iters, seed, ab_cap=None, fitter=
     m1, s21 = models[sel]
     m0, s20 = models[(0, 0.0)]
     zt = data["z"][D.test_idx]
-    base = lpd(zt, predict(D, m0, D.test_idx), s20)
+    base = lpd(zt, predict(D, m0, D.test_idx), s20(D.test_idx))
     for rec in out["candidates"]:      # (every candidate against rank 0: any restricted selection, post hoc)
         mk, sk = models[(rec["rank"], rec["lambda"])]
-        rec["test_improvement"], rec["test_lb"], _ = cluster_lb(lpd(zt, predict(D, mk, D.test_idx), sk) - base,
-                                                                D.test_world, np.random.default_rng(seed + 7))
+        rec["test_improvement"], rec["test_lb"], _ = cluster_lb(lpd(zt, predict(D, mk, D.test_idx), sk(D.test_idx))
+                                                                - base, D.test_world, np.random.default_rng(seed + 7))
     prim = max((c for c in out["candidates"] if c["rank"] <= PRIMARY_RANKS), key=lambda c: c["val_lpd"])
     out["selected_primary"] = {"ranks": list(range(PRIMARY_RANKS + 1)), "rank": prim["rank"],
                                "lambda": prim["lambda"], "test_improvement": prim["test_improvement"],
                                "test_lb": prim["test_lb"], "success": bool(prim["rank"] > 0 and prim["test_lb"] > 0)}
-    diff = lpd(zt, predict(D, m1, D.test_idx), s21) - base
+    diff = lpd(zt, predict(D, m1, D.test_idx), s21(D.test_idx)) - base
     mean, lb, per = cluster_lb(diff, D.test_world, np.random.default_rng(seed + 7))
     zs = data["z"][D.stest_idx]
-    sdiff = lpd(zs, predict(D, m1, D.stest_idx), s21) - lpd(zs, predict(D, m0, D.stest_idx), s20)
+    sdiff = lpd(zs, predict(D, m1, D.stest_idx), s21(D.stest_idx)) - lpd(zs, predict(D, m0, D.stest_idx),
+                                                                          s20(D.stest_idx))
     if sel[0] > 0:
         trn = D.fit[option]
         qn = np.unique(D.qi[trn])
@@ -559,6 +597,10 @@ def procedure(D, data, option, ranks, lambdas, iters, seed, ab_cap=None, fitter=
 
 
 CONTINUATION = (0.3, 0.1, 0.03, 0.01, 0.003, 0.001)
+# the registered map's path ends at 0.01, its minimum on noiseless data (below it the flexible surface and
+# the interaction trade off: the error rises; the registered grid never goes below 0.01)
+REG_CONTINUATION = (0.3, 0.1, 0.03, 0.01)
+REGISTERED_LAMBDAS = (0.01, 0.02, 0.05, 0.2)
 
 
 def numerical(D, data, option, rank, iters, seed, ab_cap=None, fitter="minimal"):
@@ -569,9 +611,9 @@ def numerical(D, data, option, rank, iters, seed, ab_cap=None, fitter="minimal")
     idx = D.fit[option]
     m = None
     predict = any_predict              # noqa: F811
-    for lam in CONTINUATION:
+    for lam in CONTINUATION if fitter == "minimal" else REG_CONTINUATION:
         m = any_fit(fitter, D, idx, data, rank, lam, option == "b", 100 if fitter == "minimal" else 30, seed,
-                    ab_cap=ab_cap, init=m, balance=True)
+                    ab_cap=ab_cap, init=m, balance=True, start="warm" if m is None else "both", weighted=False)
     t = D.test_idx
     err = predict(D, m, t) - data["eta"][t]
     sd = float(np.std(data["inter"][t]))
@@ -776,8 +818,9 @@ def main(argv=None):
                            help="hold the A/B prey's interaction to rank <= R in every fit (-1: no cap)")
             s.add_argument("--fitter", choices=FITTERS, default="minimal",
                            help="minimal (ridge ALS) or registered (map.py, item 7: the v4 §6 map)")
-            s.add_argument("--start", choices=("warm", "cold"), default="warm",
-                           help="the registered map's embedding start: SVD warm start (registered) or cold")
+            s.add_argument("--start", choices=("both", "warm", "cold"), default="both",
+                           help="the registered map's embedding start: both (registered: the lower penalized "
+                                "training objective kept), or one")
         if name == "run":
             s.add_argument("--set", choices=("main", "stress", "power", "numerical", "all"), default="main")
             s.add_argument("--scenarios", help="a comma list instead of --set (--reps each; numerical: 1)")
