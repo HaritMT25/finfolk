@@ -42,10 +42,16 @@ unless it is given --allow-placeholder again (tests only).
 THE STUDY ROOT. The first f1 or launch binds STUDY to its registry: STUDY/study.json records a
 study id, the registry's sha256 and the archive root (default STUDY/archive); every later command
 refuses a different registry or archive root. The archive root belongs to its study: it must be
-new or empty when the study is bound, and ARCHIVE/OWNER.json (written durably) names the study id;
-an archive root owned by another study, or not empty and unowned, is refused, so a new study can
-never publish into another's archive. The engine is pinned in STUDY/bin (its sha256) and probed
-once: it must be the serial build (its checkpoints say "resume is bit-exact").
+new or empty when the study is bound, and ARCHIVE/OWNER.json names the study id; an archive root
+owned by another study, or not empty and unowned, is refused, so a new study can never publish
+into another's archive. Every writing command (f1, launch, verify-f1) holds, besides the study
+root's lock, an flock on ARCHIVE/.archive.lock for its whole run: two roots naming one archive
+never run at once. The claim is exclusive: OWNER.json.tmp is written and fsync'd, then hard-linked
+to OWNER.json (which fails if any marker exists), the directory fsync'd, the tmp removed; a
+leftover tmp carrying this study's id (a claim a crash interrupted) is completed, another study's
+or an unreadable one is refused. Every directory the tool creates is made durable with its
+ancestors. The engine is pinned in STUDY/bin (its sha256) and probed once: it must be the serial
+build (its checkpoints say "resume is bit-exact").
 
 THE HISTORIES (launch: a resumable supervisor; one runner per root, flock). Every world runs as a
 sequence of SEGMENTS in STUDY/worlds/<id>/: seg000 from the founder seed (only once its F1 is
@@ -75,17 +81,24 @@ offsets and sha256 of the part since the previous acceptance). A resume starts f
 record whose log bytes still verify, in a segment whose own start is such a record (back to the
 founder segment); a lost or damaged log tail therefore sends the history back to the last point
 it fully covers, to be redone. A world is "done" only when the final frame is accepted; a world
-found at its final accepted frame is finalized without another segment. A local checkpoint that is
-demonstrably an interrupted write (empty, or JSON cut short) is moved to ckpt/quarantine/ and
-recorded in quarantine.jsonl, and the world resumes from its last accepted checkpoint; a complete
-file that is not a valid checkpoint, or holds another frame, is kept as evidence and fails the world
-(closed). The dense logs' header and every row's width are checked at acceptance; a resumed
-segment's headers must equal those of the segment it resumed. A new segment's directory is made
-durable at creation and again (its log entries) before its first acceptance. A done or extinct
-world keeps its status at a restart only while its evidence holds: a done world's verified chain
-must reach the final frame, an extinct world needs a zero whose evidence holds and a latest
-acceptance that verifies, and its archive must rehash (see ARCHIVE); otherwise it is reopened and
-recovered from its verified evidence (damage inside a finalized archive fails it, exit 1).
+found at its final accepted frame is finalized without another segment. Local checkpoints follow
+a COMMITMENT rule (never a guess from where a parse fails): a checkpoint is committed once it has
+an archive record. An uncommitted one that is not a valid serial-build checkpoint of its frame,
+for any reason, is moved to ckpt/quarantine/ (its bytes, the move and both directories fsync'd,
+then recorded in quarantine.jsonl) and the world replays from its last accepted checkpoint; if the
+replay regenerates an invalid file at a frame quarantined before (its writer finished it: the
+main CSV has a row past it), the world fails closed. A committed one with other bytes than its
+record fails closed when its last writer finished it (a deterministic regeneration must reproduce
+the record); otherwise (a rewrite cut short, or damage to a copy no running segment writes) the
+local copy is restored from the verified archived copy, its bad bytes quarantined. The dense logs'
+header and every row's width are checked at acceptance; a resumed segment's headers must equal
+those of the segment it resumed. A new segment's directory is made durable at creation and again
+(its log entries) before its first acceptance. At every start a finalized archive is audited in
+full (every indexed object rehashed) before anything else, its damage failing the world (exit 1).
+A done or extinct world then keeps its status only while its evidence holds: a done world's
+verified chain must reach the final frame; an extinct world needs a zero whose evidence holds and
+its latest acceptance at or before the first zero must verify; otherwise it is reopened and
+recovered from its verified evidence.
 
 ARCHIVE. Every complete periodic checkpoint (and F1) is copied verified into ARCHIVE/worlds/<id>/
 (a temporary file, fsync'd, hashed, read-only 0444, renamed, directory fsync'd) and recorded in
@@ -94,9 +107,10 @@ archived bytes (determinism; a difference stops the world as "failed"). An archi
 missing, damaged or writable is repaired from verified local bytes (refused once finalized).
 When a world ends ("done" or "extinct"), its archive is audited and finalized: a FINALIZED marker
 (published atomically: the world, its status and archived frames), every file 0444, the directory
-0555, both fsync'd: the contract run.py --link-sources checks. Every start reconciles the
-finalization of the terminal worlds, rehashing every indexed object. Nothing is ever published,
-replaced or reopened inside a finalized directory, and a destination file without this study's
+0555, both fsync'd: the contract run.py --link-sources checks. Every start audits each
+finalized archive (rehashing every indexed object) and reconciles the finalization of the
+terminal worlds. No checkpoint is ever published or replaced inside a finalized directory (only
+the marker's and directory's modes are reconciled), and a destination file without this study's
 record is never replaced. --prune-local deletes local copies of the checkpoints of the currently
 verified acceptance chain, up to the active segment's last acceptance (a replay keeps every later
 one), except the two latest, after verifying their archived copies.
@@ -110,7 +124,11 @@ count (the replay finds the zero again). Every restart, terminal worlds included
 segment's main CSV, so a zero the previous supervisor did not see is recorded with its earliest
 frame ("recovered"). Extinction is absorbing (both floors are zero);
 --on-extinction stop (default) then ends the world as "extinct" without advancing it (its valid
-pre-extinction snapshots stay archived; nothing is refilled or replaced).
+pre-extinction snapshots stay archived; nothing is refilled or replaced), but only while the stop
+is evidenced (above): a world at its zero whose accepted logs through the zero no longer verify
+replays from its latest verified record through the zero, which stops it again; if that replay
+did not repair them, it fails (exit 1). Such a replay's checkpoints past the zero are not
+published into a finalized archive (not part of the history).
 
 F1 (f1, verify-f1). F1 is the first step of an identically seeded founder replay (the same flags,
 --headless 1) by the pinned engine, with the registered configuration, archived as F1.json (its
@@ -250,7 +268,16 @@ class WorldsError(Exception):
 
 
 class TornCheckpoint(WorldsError):
-    """A local checkpoint that does not parse or is not at its frame: an interrupted write."""
+    """An UNCOMMITTED local checkpoint (no archive record) that is not a valid serial-build
+    checkpoint of its frame, for any reason: quarantined, and the world replays."""
+
+
+class CommittedMismatch(WorldsError):
+    """A local checkpoint of a COMMITTED label (it has an archive record) with other bytes."""
+
+    def __init__(self, msg, rec):
+        super().__init__(msg)
+        self.rec = rec
 
 
 # ================================================================== registry
@@ -497,7 +524,7 @@ def register(arena_path, namespace, blocks=8, per_block=None, avoid_paths=(), sc
 def _flock(path):
     """An exclusive, non-blocking flock on path (created) -> the open file; WorldsError if held."""
     import fcntl
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    mkdirs_durable(os.path.dirname(path))
     f = open(path, "a")
     try:
         fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -520,7 +547,7 @@ def write_registry(out, data):
                 return False
             raise WorldsError(f"{out} exists with other bytes: a study's registry is never replaced (changed "
                               "seeds, treatments or schedule need a new study root)")
-        os.makedirs(d, exist_ok=True)
+        mkdirs_durable(d)
         rqlib.write_durable(out, data)
         return True
     finally:
@@ -551,47 +578,103 @@ def load_registry(root, allow_placeholder=False):
     return reg, rqlib.sha256_bytes(raw)
 
 
-def _archive_free(ar):
-    """Why the archive root `ar` cannot be claimed by a new study (None: it can: absent or empty)."""
+ARCHIVE_LOCK = ".archive.lock"
+_HELD = {}     # archive root -> its lock file, held for the whole command
+
+
+def lock_archive(ar):
+    """An exclusive flock on ARCHIVE/.archive.lock, held until the process ends (with the root lock:
+    one command at a time per archive root, whatever study root names it)."""
+    if ar not in _HELD:
+        mkdirs_durable(ar)
+        _HELD[ar] = _flock(os.path.join(ar, ARCHIVE_LOCK))
+    return _HELD[ar]
+
+
+def release_archives():
+    """Release the archive locks this process holds (the end of a command; tests)."""
+    while _HELD:
+        _HELD.popitem()[1].close()
+
+
+def _owner_tmp(ar):
+    """The study id of a leftover OWNER.json.tmp (an interrupted claim): None if there is none;
+    "?" if it is unreadable."""
+    p = os.path.join(ar, OWNER + ".tmp")
+    if not os.path.exists(p):
+        return None
+    try:
+        return rqlib.read_json(p).get("study_id") or "?"
+    except (OSError, ValueError):
+        return "?"
+
+
+def _archive_free(ar, study_id=None):
+    """Why the archive root `ar` cannot be claimed by a new study (None: it can: absent, empty but
+    for its lock file, or holding only this study's interrupted claim)."""
     if not os.path.exists(ar):
         return None
     if not os.path.isdir(ar):
         return f"{ar} is not a directory"
-    entries = os.listdir(ar)
-    if not entries:
-        return None
     owner = os.path.join(ar, OWNER)
     if os.path.isfile(owner):
         o = rqlib.read_json(owner)
+        if o.get("study_id") == study_id:
+            return None
         return f"the archive root {ar} belongs to another study ({o.get('study_root')}, study {o.get('study_id')})"
-    return f"the archive root {ar} is not empty and has no owner ({', '.join(sorted(entries)[:3])})"
+    tmp = _owner_tmp(ar)
+    if tmp not in (None, study_id):
+        return f"the archive root {ar} holds another study's interrupted claim (OWNER.json.tmp: {tmp})"
+    entries = sorted(set(os.listdir(ar)) - {ARCHIVE_LOCK, OWNER + ".tmp"})
+    if entries:
+        return f"the archive root {ar} is not empty and has no owner ({', '.join(entries[:3])})"
+    return None
 
 
 def claim_archive(ar, study, write=True):
-    """The archive root's ownership marker (OWNER.json: the study's id, root and registry), written
-    durably (write); an existing one must name this study."""
+    """The archive root's ownership marker (OWNER.json: the study's id, root and registry). An
+    existing one must name this study. A claim (write; under the archive lock) is exclusive: the
+    marker is written to OWNER.json.tmp, fsync'd, and hard-linked to OWNER.json (which fails if any
+    marker exists), the directory fsync'd, the tmp removed. A leftover tmp of this study (a claim a
+    crash interrupted) is completed; another study's, or an unreadable one, is refused."""
     owner = os.path.join(ar, OWNER)
     if os.path.isfile(owner):
         o = rqlib.read_json(owner)
         if o.get("study_id") != study["study_id"]:
             raise WorldsError(f"the archive root {ar} belongs to another study ({o.get('study_root')}, study "
                               f"{o.get('study_id')}): every study needs its own archive root")
+        if write and _owner_tmp(ar) == study["study_id"]:
+            os.remove(owner + ".tmp")
+            rqlib.fsync_dir(ar)
         return
     if not write:
         raise WorldsError(f"the archive root {ar} carries no ownership marker of this study")
-    why = _archive_free(ar)
+    lock_archive(ar)
+    why = _archive_free(ar, study["study_id"])
     if why:
         raise WorldsError(why)
-    mkdirs_durable(ar)
-    rec = {"schema": OWNER_SCHEMA, "study_id": study["study_id"], "study_root": study["study_root"],
-           "registry_sha256": study["registry_sha256"], "claimed_utc": rqlib.now_utc()}
     tmp = owner + ".tmp"
-    with open(tmp, "wb") as f:
-        f.write(rqlib.canonical(rec))
-        f.flush()
-        os.fsync(f.fileno())
-    os.chmod(tmp, 0o444)
-    os.replace(tmp, owner)
+    mine = _owner_tmp(ar) is None
+    if mine:
+        rec = {"schema": OWNER_SCHEMA, "study_id": study["study_id"], "study_root": study["study_root"],
+               "registry_sha256": study["registry_sha256"], "claimed_utc": rqlib.now_utc()}
+        with open(tmp, "xb") as f:
+            f.write(rqlib.canonical(rec))
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o444)
+        rqlib.fsync_dir(ar)
+    try:
+        os.link(tmp, owner)                        # exclusive: fails if any marker exists
+    except FileExistsError:
+        o = rqlib.read_json(owner)
+        if o.get("study_id") != study["study_id"]:
+            if mine:
+                os.remove(tmp)
+                rqlib.fsync_dir(ar)
+            raise WorldsError(f"the archive root {ar} was claimed by another study ({o.get('study_id')}) first")
+    rqlib.fsync_dir(ar)
+    os.remove(tmp)
     rqlib.fsync_dir(ar)
 
 
@@ -610,6 +693,8 @@ def bind_root(root, reg_sha, archive_root=None, create=False, readonly=False):
                               f"is now {reg_sha[:12]}: a changed registry needs a new study root")
         if archive_root and os.path.abspath(archive_root) != rec["archive_root"]:
             raise WorldsError(f"{root} is bound to the archive root {rec['archive_root']}, not {archive_root}")
+        if not readonly:
+            lock_archive(rec["archive_root"])
         claim_archive(rec["archive_root"], rec, write=not readonly)   # (completes an interrupted claim)
         return rec["archive_root"]
     if not create:
@@ -621,9 +706,14 @@ def bind_root(root, reg_sha, archive_root=None, create=False, readonly=False):
     why = _archive_free(ar)
     if why:
         raise WorldsError(why + ": a new study needs a new (or empty) archive root")
+    lock_archive(ar)                                # (refused while another command holds it)
+    why = _archive_free(ar)
+    if why:
+        raise WorldsError(why + ": a new study needs a new (or empty) archive root")
     rec = {"schema": STUDY_SCHEMA, "study_id": str(uuid.uuid4()), "study_root": os.path.abspath(root),
            "registry_sha256": reg_sha, "archive_root": ar, "created_utc": rqlib.now_utc(),
            "tool_sha256": rqlib.sha256_file(os.path.abspath(__file__))}
+    mkdirs_durable(root)
     rqlib.write_json_durable(p, rec)
     claim_archive(ar, rec)
     return ar
@@ -991,23 +1081,6 @@ def mkdirs_durable(path):
         rqlib.fsync_dir(os.path.dirname(d))
 
 
-def incomplete_write(raw):
-    """True if the bytes are demonstrably an interrupted write of a JSON document: empty, a UTF-8
-    sequence cut at the end, or JSON that fails only because its input ends. A file that parses,
-    or fails anywhere else, is complete (and, if not a valid checkpoint, corrupt: never torn)."""
-    if not raw.strip():
-        return True
-    try:
-        text = raw.decode("utf-8")
-    except UnicodeDecodeError as e:
-        return e.start >= len(raw) - 4 and "unexpected end" in e.reason
-    try:
-        json.loads(text)
-        return False
-    except json.JSONDecodeError as e:
-        return e.pos >= len(text.rstrip()) or e.msg.startswith("Unterminated string")
-
-
 def _copy_verified(raw, dst, sha):
     d = os.path.dirname(dst)
     if os.path.isfile(os.path.join(d, "FINALIZED")):
@@ -1063,35 +1136,34 @@ def ensure_archived(wid, rec, raw, log, verified=None):
 
 def archive_one(root, wid, archive_root, frame, src, log, extra=None, verified=None):
     """Verified copy of checkpoint `src` (at `frame`) into the archive -> (its record, the parsed
-    checkpoint). TornCheckpoint: an interrupted write (incomplete_write); WorldsError (fail closed,
-    the file kept as evidence): a complete file that is not a valid checkpoint or not at its frame,
-    a checkpoint that is not the serial build's, bytes that differ from an earlier archived copy of
-    the frame, or a destination this study does not own (a finalized archive, a foreign file)."""
+    checkpoint), under the COMMITMENT rule (no guess from where a parse fails). A label with an
+    archive record is committed: the local bytes must be the record's (else CommittedMismatch: the
+    caller fails closed, or restores the local copy from the verified archived one, see
+    Supervisor.archive_ckpt) and its archived copy is checked (ensure_archived). An uncommitted file
+    that is not a valid serial-build checkpoint of `frame`, for ANY reason (cut short, corrupt,
+    another frame, another build), is TornCheckpoint: the caller quarantines it (the evidence kept)
+    and the world replays. WorldsError: a new label's destination this study does not own (a
+    finalized archive, a foreign file)."""
     raw = rqlib.read_bytes(src)
     sha = rqlib.sha256_bytes(raw)
-    try:
-        cp = ckpt.loads(raw.decode("utf-8"), src)
-    except (ckpt.CheckpointError, UnicodeDecodeError, ValueError, KeyError, TypeError) as e:
-        if incomplete_write(raw):
-            raise TornCheckpoint(f"{src} is an interrupted write ({str(e)[:120]})")
-        raise WorldsError(f"{src} is complete but not a checkpoint ({str(e)[:120]}): kept as evidence")
-    try:
-        ckpt.validate(cp, src)
-    except (ckpt.CheckpointError, KeyError, TypeError, ValueError) as e:
-        raise WorldsError(f"{src} is a complete but invalid checkpoint ({str(e)[:120]}): kept as evidence")
-    if int(cp["world"]["frame"]) != frame:
-        raise WorldsError(f"{src} is a complete checkpoint of frame {cp['world']['frame']}, not {frame}: "
-                          "kept as evidence")
-    if cp.get("determinism") != SERIAL:
-        raise WorldsError(f"{src} declares {cp.get('determinism')!r}: a history needs the serial build's exact resume")
     lab = label_of(frame)
     recs = archive_records(root, wid)
     if lab in recs:
         if recs[lab]["sha256"] != sha:
-            raise WorldsError(f"{wid} {lab}: rewritten with other bytes than its archived copy "
-                              f"({sha[:12]} != {recs[lab]['sha256'][:12]}): the history is not deterministic")
+            raise CommittedMismatch(f"{wid} {lab}: the local {os.path.basename(src)} has other bytes than its "
+                                    f"committed record ({sha[:12]} != {recs[lab]['sha256'][:12]})", recs[lab])
         ensure_archived(wid, recs[lab], raw, log, verified)
-        return recs[lab], cp
+        return recs[lab], ckpt.loads(raw.decode("utf-8"), src)
+    try:
+        cp = ckpt.loads(raw.decode("utf-8"), src)
+        ckpt.validate(cp, src)
+        if int(cp["world"]["frame"]) != frame:
+            raise ValueError(f"it holds frame {cp['world']['frame']}")
+        if cp.get("determinism") != SERIAL:
+            raise ValueError(f"it declares {cp.get('determinism')!r}, not the serial build's exact resume")
+    except (ckpt.CheckpointError, UnicodeDecodeError, ValueError, KeyError, TypeError) as e:
+        raise TornCheckpoint(f"{os.path.basename(src)} has no record and is not a valid checkpoint of frame "
+                             f"{frame} ({str(e)[:120]})")
     ad = adir(archive_root, wid)
     name = "F1.json" if frame == 1 else f"end.{frame}.json"
     dst = os.path.join(ad, name)
@@ -1115,7 +1187,34 @@ def archive_one(root, wid, archive_root, frame, src, log, extra=None, verified=N
     return rec, cp
 
 
-def finalize_archive(root, wid, archive_root, status, log=lambda m: None):
+def audit_archive(root, wid, archive_root, status=None):
+    """The full audit of a finalized archive (no-op without a FINALIZED marker; nothing written):
+    the marker describes it (world, archived frames; with status, the status too) and every indexed
+    object is present, 0444, of its size and rehashes to its record. WorldsError otherwise."""
+    ad = adir(archive_root, wid)
+    marker = os.path.join(ad, "FINALIZED")
+    if not os.path.isfile(marker):
+        return False
+    recs = archive_records(root, wid)
+    want = {"world": wid, "frames": sorted(r["frame"] for r in recs.values())}
+    if status is not None:
+        want["status"] = status
+    try:
+        have = json.loads(rqlib.read_text(marker))
+    except ValueError:
+        have = {}
+    if {k: have.get(k) for k in want} != want:
+        raise WorldsError(f"{wid}: {marker} does not describe its archive ({ {k: have.get(k) for k in want} })")
+    for r in recs.values():
+        s = os.stat(r["path"]) if os.path.isfile(r["path"]) else None
+        if s is None or s.st_size != r["bytes"] or s.st_mode & 0o777 != 0o444 \
+                or rqlib.sha256_file(r["path"]) != r["sha256"]:
+            raise WorldsError(f"{wid}: the finalized archive's {os.path.basename(r['path'])} is missing, "
+                              "damaged or writable")
+    return True
+
+
+def finalize_archive(root, wid, archive_root, status, log=lambda m: None, audited=False):
     """Audit and finalize a terminal world's archive (idempotent: it also completes or checks an
     earlier, interrupted finalization): every record's file present, its bytes (repaired from a
     verified local copy if need be) and 0444; the FINALIZED marker (world, status, frames)
@@ -1128,18 +1227,8 @@ def finalize_archive(root, wid, archive_root, status, log=lambda m: None):
     want = {"world": wid, "status": status, "frames": sorted(r["frame"] for r in recs.values())}
     marker = os.path.join(ad, "FINALIZED")
     if os.path.isfile(marker):
-        try:
-            have = json.loads(rqlib.read_text(marker))
-        except ValueError:
-            have = {}
-        if {k: have.get(k) for k in want} != want:
-            raise WorldsError(f"{wid}: {marker} does not describe its archive ({ {k: have.get(k) for k in want} })")
-        for r in recs.values():
-            s = os.stat(r["path"]) if os.path.isfile(r["path"]) else None
-            if s is None or s.st_size != r["bytes"] or s.st_mode & 0o777 != 0o444 \
-                    or rqlib.sha256_file(r["path"]) != r["sha256"]:
-                raise WorldsError(f"{wid}: the finalized archive's {os.path.basename(r['path'])} is missing, "
-                                  "damaged or writable")
+        if not audited:                       # (audited: by the caller, just before)
+            audit_archive(root, wid, archive_root, status)
     else:
         if not os.access(ad, os.W_OK):
             os.chmod(ad, 0o755)
@@ -1352,7 +1441,7 @@ def pin_binary(root, binary=None):
     """Pin the engine in STUDY/bin (or, binary=None, check the pinned one) -> (path, sha256);
     refused unless it is the serial build (probed once, bin/identity.json)."""
     bdir = os.path.join(root, "bin")
-    os.makedirs(bdir, exist_ok=True)
+    mkdirs_durable(bdir)
     pinned = os.path.join(bdir, "evo_boids")
     want = None
     if binary is not None:
@@ -1362,6 +1451,7 @@ def pin_binary(root, binary=None):
             shutil.copy2(binary, tmp)
             rqlib.fsync_file(tmp)
             os.replace(tmp, pinned)
+            rqlib.fsync_dir(bdir)
             rqlib.write_durable(pinned + ".sha256", f"{want}  {os.path.abspath(binary)}\n")
     if not os.path.exists(pinned + ".sha256"):
         raise WorldsError(f"{root} has no pinned engine (worlds.py f1 --binary pins it)")
@@ -1479,7 +1569,70 @@ class Supervisor:
         return found
 
     # ---------------------------------------------------------------- archive and acceptance
-    def quarantine(self, wid, frame, path, reason):
+    def completed(self, wid, f):
+        """Whether checkpoint f's last writer finished it: the last segment started before f and its
+        main CSV has a row past f (the engine saves a checkpoint before it steps on)."""
+        st = self.state(wid)
+        if not st["segments"] or st["segments"][-1]["start_frame"] >= f:
+            return False
+        if wid in self.running:
+            return self.last_frame.get(wid, -1) > f
+        row = _last_row(os.path.join(wdir(self.root, wid), st["segments"][-1]["name"], "run.csv"))[1]
+        try:
+            return row is not None and int(row[0]) > f
+        except (ValueError, IndexError):
+            return False
+
+    def first_zero(self, wid):
+        z = self.zeros.get(wid) or {}
+        return min(z.values()) if z else None
+
+    def archive_ckpt(self, wid, f, path):
+        """archive_one under the COMMITMENT rule -> (record, checkpoint), or None (not usable: it was
+        quarantined, or it is past the zero of a world whose archive is finalized).
+        - uncommitted and invalid for any reason: quarantined, the world replays; but if the replay
+          regenerated an invalid file at a frame quarantined before (its writer finished it), the
+          world fails closed (the engine does not reproduce a valid checkpoint there);
+        - committed with other bytes: fails closed if its last writer finished it (a deterministic
+          regeneration must reproduce the committed bytes); else (a rewrite cut short, or damage to a
+          copy no running segment writes) the local copy is restored from the verified archived
+          copy, the bad bytes kept in quarantine; no verified archived copy: fails closed."""
+        if self.past_finalized_zero(wid, f):
+            self.warn_once((wid, f, "pastzero"), f"{wid}: end.{f} lies past its zero and its archive is finalized: "
+                                                 "not archived (not part of its history)")
+            return None
+        try:
+            return archive_one(self.root, wid, self.archive_root, f, path, self.log, verified=self.verified)
+        except TornCheckpoint as e:
+            if self.completed(wid, f) and any(q.get("frame") == f and not q.get("committed") for q in
+                                              read_jsonl(os.path.join(wdir(self.root, wid), "quarantine.jsonl"))):
+                raise WorldsError(f"{wid}: the replay regenerated an invalid checkpoint of frame {f} (an earlier one "
+                                  f"was quarantined): {e}")
+            self.quarantine(wid, f, path, str(e))
+            return None
+        except CommittedMismatch as e:
+            if self.completed(wid, f):
+                raise WorldsError(f"{e}, and its writer finished it: the history is not deterministic")
+            rec = e.rec
+            try:
+                ok = os.path.isfile(rec["path"]) and rqlib.sha256_file(rec["path"]) == rec["sha256"]
+            except OSError:
+                ok = False
+            if not ok:
+                raise WorldsError(f"{e}, and its archived copy does not verify either")
+            self.quarantine(wid, f, path, f"{e}; restored from the archived copy", committed=True)
+            rqlib.write_durable(path, rqlib.read_bytes(rec["path"]))
+            self.log(f"{wid}: RESTORED {os.path.basename(path)} from its verified archived copy")
+            return archive_one(self.root, wid, self.archive_root, f, path, self.log, verified=self.verified)
+
+    def past_finalized_zero(self, wid, f):
+        """An uncommitted checkpoint past the first zero of a world whose archive is finalized (a
+        reopened world's replay ran on past the zero): not part of its history, nothing to publish."""
+        fz = self.first_zero(wid)
+        return fz is not None and f > fz and label_of(f) not in archive_records(self.root, wid) \
+            and os.path.isfile(os.path.join(adir(self.archive_root, wid), "FINALIZED"))
+
+    def quarantine(self, wid, frame, path, reason, committed=False):
         qd = os.path.join(wdir(self.root, wid), "ckpt", "quarantine")
         mkdirs_durable(qd)
         n = 1
@@ -1487,17 +1640,21 @@ class Supervisor:
             n += 1
         dst = os.path.join(qd, f"{os.path.basename(path)}.{n}")
         raw = rqlib.read_bytes(path)
-        os.rename(path, dst)
+        rqlib.fsync_file(path)                # the evidence's bytes, then both directory entries,
+        os.rename(path, dst)                  # before the quarantine record that points at it
+        rqlib.fsync_file(dst)
+        rqlib.fsync_dir(qd)
         rqlib.fsync_dir(os.path.dirname(path))
         _append_durable(os.path.join(wdir(self.root, wid), "quarantine.jsonl"), {
             "schema": QUARANTINE_SCHEMA, "world": wid, "frame": frame, "from": path, "to": dst, "bytes": len(raw),
-            "sha256": rqlib.sha256_bytes(raw), "reason": reason, "utc": rqlib.now_utc()})
+            "sha256": rqlib.sha256_bytes(raw), "committed": committed, "reason": reason, "utc": rqlib.now_utc()})
         self.seen.pop((wid, frame), None)
         self.log(f"{wid}: QUARANTINED {os.path.basename(path)} ({reason}); not used to resume")
 
     def archive_pass(self, wid, alive):
-        """Archive every complete local checkpoint (a rewritten one is compared with its archive);
-        quarantine a torn one; with --prune-local drop old local copies of accepted checkpoints."""
+        """Archive every complete local checkpoint under the commitment rule (archive_ckpt: a
+        committed one is compared with its record, an invalid uncommitted one quarantined); with
+        --prune-local drop old local copies of accepted checkpoints."""
         loc = local_ckpts(self.root, wid)
         for f in sorted(loc):
             if alive and self.last_frame.get(wid, -1) <= f:
@@ -1509,12 +1666,8 @@ class Supervisor:
             key = (s_.st_mtime_ns, s_.st_size)
             if self.seen.get((wid, f)) == key:
                 continue
-            try:
-                archive_one(self.root, wid, self.archive_root, f, loc[f], self.log, verified=self.verified)
-            except TornCheckpoint as e:
-                self.quarantine(wid, f, loc[f], str(e))
-                continue
-            self.seen[(wid, f)] = key
+            if self.archive_ckpt(wid, f, loc[f]) is not None or os.path.exists(loc[f]):
+                self.seen[(wid, f)] = key
         if self.a.prune_local and wid in self.chain:
             # only checkpoints of the currently verified chain, at or before the active segment's last
             # acceptance (a replay still needs every later one), but its two latest
@@ -1558,11 +1711,10 @@ class Supervisor:
             p = local_ckpts(self.root, wid).get(F)
             if p is None or (alive and self.last_frame.get(wid, -1) <= F):
                 return
-            try:
-                arec, cp = archive_one(self.root, wid, self.archive_root, F, p, self.log, verified=self.verified)
-            except TornCheckpoint as e:
-                self.quarantine(wid, F, p, str(e))
+            got = self.archive_ckpt(wid, F, p)
+            if got is None:
                 return
+            arec, cp = got
             probs = verify_config(cp, w["flags"])
             if probs:
                 raise WorldsError(f"{wid} end.{F}: the configuration differs from the registry: " + "; ".join(probs))
@@ -1606,24 +1758,32 @@ class Supervisor:
             self.chain_active[wid] = F
             prev, last = rec, F
 
+    def extinct_problems(self, wid, st, good=None):
+        """Why an extinction stop is not evidenced (None if it is): it needs a zero whose evidence
+        holds, and the latest acceptance record at or before the first zero must verify (the
+        accepted logs through the zero intact, back to the founder seed)."""
+        fz = self.first_zero(wid)
+        if fz is None:
+            return "no zero whose evidence still holds"
+        good = verified_records(self.root, wid, st, self.worlds[wid]["treatment"]) if good is None else good
+        names = {s["name"] for s in st["segments"]}
+        recs = [r for r in accept_records(self.root, wid) if r["segment"] in names and r["frame"] <= fz]
+        if recs:
+            last = max(recs, key=lambda r: (r["frame"], _seg_index(r["segment"])))
+            if (last["segment"], last["frame"]) not in good:
+                return f"its acceptance record of frame {last['frame']} ({last['segment']}) no longer verifies"
+        return None
+
     def terminal_problems(self, wid, st):
         """Why a done / extinct world's status no longer stands (None if it does): a done world's
-        verified acceptance chain must reach the final frame; an extinct world needs a zero whose
-        evidence still holds, and its latest acceptance record must still verify. (The archive is
-        audited next, by finalize_archive: every object rehashed.)"""
+        verified acceptance chain must reach the final frame; an extinct world's stop must still be
+        evidenced (extinct_problems). (Its finalized archive was audited before: audit_archive.)"""
         good = verified_records(self.root, wid, st, self.worlds[wid]["treatment"])
         frame = resume_point(self.root, wid, st, self.worlds[wid]["treatment"], good)[0]
         if st["status"] == "done" and frame != self.T:
             return f"its verified logs end at frame {frame}, not {self.T}"
         if st["status"] == "extinct":
-            if not self.zero_reason(wid):
-                return "no zero whose evidence still holds"
-            names = {s["name"] for s in st["segments"]}
-            recs = [r for r in accept_records(self.root, wid) if r["segment"] in names]
-            if recs:
-                last = max(recs, key=lambda r: (r["frame"], _seg_index(r["segment"])))
-                if (last["segment"], last["frame"]) not in good:
-                    return f"its acceptance record of frame {last['frame']} no longer verifies"
+            return self.extinct_problems(wid, st, good)
         return None
 
     def refresh_chain(self, wid, st=None):
@@ -1645,10 +1805,17 @@ class Supervisor:
 
     # ---------------------------------------------------------------- what next
     def next_action(self, wid):
-        """-> ("extinct" | "done", reason) | ("verify", None) | ("segment", (start, checkpoint path, record))."""
-        if self.a.on_extinction == "stop" and self.zero_reason(wid):
-            return "extinct", self.zero_reason(wid)
+        """-> ("extinct" | "done", reason) | ("verify", None) | ("segment", (start, checkpoint path, record)).
+        The extinction shortcut applies only while the stop is evidenced (extinct_problems); else the
+        world replays from its latest verified record, through the zero, which stops it again (and
+        reap_segment fails it if the replay did not repair the accepted logs)."""
         st = self.state(wid)
+        if self.a.on_extinction == "stop" and self.zero_reason(wid):
+            why = self.extinct_problems(wid, st)
+            if not why:
+                return "extinct", self.zero_reason(wid)
+            self.warn_once((wid, "unevidenced"), f"{wid}: at its zero, but {why}: replaying through the zero to "
+                                                 "repair its accepted logs")
         frame, path, rec = resume_point(self.root, wid, st, self.worlds[wid]["treatment"])
         if frame >= self.T:
             return "done", f"{self.T} steps (its final checkpoint and logs accepted)"
@@ -1685,7 +1852,7 @@ class Supervisor:
         recs = archive_records(self.root, wid)
         d = os.path.join(wdir(self.root, wid), "f1verify")
         shutil.rmtree(d, ignore_errors=True)
-        os.makedirs(d)
+        mkdirs_durable(d)
         self.set_status(wid, "running")
         p = self._popen(verify_args(recs["F1"]["path"], self.ce), d, d)
         self.running[wid] = (p, "f1verify", "verify")
@@ -1730,7 +1897,14 @@ class Supervisor:
             self.log(f"FAILED {wid}: {e}")
             return
         if wid in self.extinct:
-            self.end_world(wid, "extinct", self.extinct.pop(wid))
+            reason = self.extinct.pop(wid)
+            why = self.extinct_problems(wid, self.state(wid))
+            if why:                           # (a replay through the zero that did not repair its logs)
+                self.end_world(wid, "failed", f"stopped at its zero ({reason}), but {why}: its accepted logs "
+                                              "through the zero could not be repaired")
+                self.log(f"FAILED {wid}: {self.state(wid)['end_reason']}")
+                return
+            self.end_world(wid, "extinct", reason)
             self.log(f"{wid}: ended as extinct ({self.state(wid)['end_reason']})")
             return
         nxt = resume_point(self.root, wid, self.state(wid), self.worlds[wid]["treatment"])[0]
@@ -1769,14 +1943,25 @@ class Supervisor:
                     st["failures"] = 0
                 st["status"] = "interrupted"
                 write_state(self.root, wid, st)
+            audited = False
+            if st["status"] in ("done", "extinct", "pending", "interrupted"):
+                # a finalized archive is audited in full (every object rehashed) before anything else,
+                # in particular before a reopened world's recovery starts
+                try:
+                    audited = audit_archive(self.root, wid, self.archive_root,
+                                            st["status"] if st["status"] in ("done", "extinct") else None)
+                except (WorldsError, OSError) as e:
+                    self.set_status(wid, "failed", end_reason=f"its finalized archive: {e}")
+                    self.log(f"FAILED {wid}: its finalized archive: {e}")
+                    continue
             if st["status"] in ("done", "extinct"):
-                # a terminal world keeps its status only while its evidence holds: its archive (every
-                # object rehashed), the acceptance chain through its endpoint, its earliest zero
+                # a terminal world keeps its status only while its evidence holds: its audited archive,
+                # the acceptance chain through its endpoint, its earliest zero
                 try:
                     self.recover_zeros(wid)
                     why = self.terminal_problems(wid, st)
                     if not why:
-                        finalize_archive(self.root, wid, self.archive_root, st["status"], self.log)
+                        finalize_archive(self.root, wid, self.archive_root, st["status"], self.log, audited)
                         continue
                 except (WorldsError, OSError) as e:
                     self.set_status(wid, "failed", end_reason=f"its terminal evidence: {e}")
@@ -1930,7 +2115,7 @@ def f1(a, log):
         d = os.path.join(wdir(root, w["id"]), "f1")
         if os.path.isdir(d):
             shutil.rmtree(d)
-        os.makedirs(d)
+        mkdirs_durable(d)                    # (the worlds/, world and f1 directories, with their ancestors)
         args = segment_args(w, sched, "f1", 0)
         args[args.index("--headless") + 1] = "1"
         args[args.index("--save-checkpoint") + 1] = "f1/F1.json"
@@ -1970,7 +2155,7 @@ def verify_f1(a, log):
         d = os.path.join(wdir(root, w["id"]), "f1verify")
         if os.path.isdir(d):
             shutil.rmtree(d)
-        os.makedirs(d)
+        mkdirs_durable(d)
         with open(os.path.join(d, "stdout.log"), "w") as so, open(os.path.join(d, "stderr.log"), "w") as se:
             r = subprocess.call([exe] + verify_args(recs["F1"]["path"], first), cwd=d, stdout=so, stderr=se,
                                 stdin=subprocess.DEVNULL, preexec_fn=rqlib.death_signal())
@@ -2013,7 +2198,7 @@ def stitch(root, wid, reg, partial=False):
     chain.reverse()
     d = wdir(root, wid)
     out = os.path.join(d, "stitched")
-    os.makedirs(out, exist_ok=True)
+    mkdirs_durable(out)
     arecs = archive_records(root, wid)
     man = {"world": wid, "status": st["status"], "endpoint": endpoint, "complete": endpoint == T, "files": {}}
     for name, kind in log_kinds(w["treatment"]):

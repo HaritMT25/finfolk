@@ -395,6 +395,7 @@ class TestSupervisor(unittest.TestCase):
         self.tmp = tempfile.mkdtemp()
 
     def tearDown(self):
+        worlds.release_archives()
         rm_tree(self.tmp)
 
     def world(self, total=3000, status="interrupted", logs_to=3000, ckpts=(1000, 2000, 3000), zero_at=None):
@@ -711,39 +712,376 @@ class TestSupervisor(unittest.TestCase):
         seg = os.path.abspath(os.path.join(worlds.wdir(root, wid), "seg000"))
         self.assertLess(calls.index(("dir", seg)), calls.index(("append", "accept.jsonl")))
 
-    def test_complete_invalid_checkpoints_fail_closed(self):
-        """N5: only a demonstrably interrupted write is torn (quarantined); a complete file that is
-        not a valid checkpoint, or holds another frame, is kept and fails the world."""
-        self.assertTrue(worlds.incomplete_write(b""))
-        self.assertTrue(worlds.incomplete_write(b'{"a": [1, 2'))
-        self.assertTrue(worlds.incomplete_write(b'{"a": "abc'))
-        self.assertTrue(worlds.incomplete_write('{"a": "é'.encode()[:-1]))
-        self.assertFalse(worlds.incomplete_write(b'{"a": 1 xx}'))
-        self.assertFalse(worlds.incomplete_write(b'{"a": 1}'))
+    # ---------------------------------------------------------------- review round 3
+    def sub_world(self, **kw):
+        sub = tempfile.mkdtemp(dir=self.tmp)
+        self.tmp, keep = sub, self.tmp
+        try:
+            return self.world(**kw)
+        finally:
+            self.tmp = keep
+
+    def quarantined(self, root, wid):
+        return worlds.read_jsonl(os.path.join(worlds.wdir(root, wid), "quarantine.jsonl"))
+
+    def test_commitment_rule_uncommitted(self):
+        """Round 3, 3 (a): an uncommitted checkpoint (no archive record) that is not a valid checkpoint
+        of its frame, for ANY reason, is quarantined (evidence kept) and the world replays: cut inside
+        a literal, a number or an escape, a corrupted closing quote with the suffix intact, another
+        frame, duplicate ids, interior garbage, empty. No parse-position guess."""
         flags = None
-        for name, data in (("wrong frame", "frame"), ("invalid", "invalid"), ("garbage", "garbage")):
+        for name in ("literal", "number", "escape", "quote", "frame", "invalid", "garbage", "empty"):
+            root, reg, ar, wid = self.sub_world(total=4000, ckpts=(1000,))
+            flags = reg["worlds"][0]["flags"]
+            good = ckpt.dumps(mk_cp(frame=2000, cfg_extra=cfg_for(flags)))
+            i = good.rindex('"genes":')
+            data = {"literal": good[: good.index('"fastTanh":false') + len('"fastTanh":fal')],
+                    "number": good[: good.index("-1546") + 1],
+                    "escape": good[: good.index('"rngState":"') + len('"rngState":"12')] + "\\",
+                    "quote": good[: i + 6] + "x" + good[i + 7:],               # same length, suffix intact
+                    "frame": ckpt.dumps(mk_cp(frame=1500, cfg_extra=cfg_for(flags))),
+                    "garbage": '{"format": 1 xx}', "empty": ""}.get(name)
+            if name == "invalid":
+                cp = mk_cp(frame=2000, cfg_extra=cfg_for(flags))
+                cp["predators"]["id"][1] = cp["predators"]["id"][0]             # duplicate predator ids
+                data = ckpt.dumps(cp)
+            p = os.path.join(worlds.wdir(root, wid), "ckpt", "end.2000.json")
+            wr(p, data)
+            s, msgs = supervisor(root, reg, ar)
+            s.startup()
+            st = worlds.read_state(root, wid)
+            self.assertEqual(st["status"], "interrupted", (name, msgs))
+            self.assertFalse(os.path.exists(p), name)
+            q = self.quarantined(root, wid)
+            self.assertEqual([(r["frame"], r["committed"]) for r in q], [(2000, False)], name)
+            self.assertEqual(rqlib.read_bytes(q[0]["to"]), data.encode(), name)     # the evidence kept
+            self.assertEqual(worlds.resume_point(root, wid, st, "A")[0], 1000, name)
+
+    def test_commitment_rule_regeneration_fails_closed(self):
+        """Round 3, 3 (b): the replay regenerating an invalid file at a frame quarantined before (its
+        writer finished it: the main CSV has a row past it) fails the world, the file kept; a file
+        whose writer did not finish it is quarantined again (another interrupted write)."""
+        root, reg, ar, wid = self.world(total=4000, ckpts=(1000,))       # seg000's CSV reaches 3000
+        good = ckpt.dumps(mk_cp(frame=2000, cfg_extra=cfg_for(reg["worlds"][0]["flags"])))
+        p = os.path.join(worlds.wdir(root, wid), "ckpt", "end.2000.json")
+        bad = good[: good.index('"fastTanh":false') + len('"fastTanh":fal')]
+        wr(p, bad)
+        s, msgs = supervisor(root, reg, ar)
+        s.startup()
+        self.assertEqual(len(self.quarantined(root, wid)), 1, msgs)
+        wr(p, bad)                                                         # regenerated, finished, invalid
+        s, msgs = supervisor(root, reg, ar)
+        s.startup()
+        st = worlds.read_state(root, wid)
+        self.assertEqual(st["status"], "failed", msgs)
+        self.assertIn("regenerated an invalid checkpoint of frame 2000", st["end_reason"])
+        self.assertTrue(os.path.isfile(p))
+        self.assertEqual(len(self.quarantined(root, wid)), 1)
+        # unfinished writes at the same frame: quarantined each time, never a failure
+        root, reg, ar, wid = self.sub_world(total=4000, logs_to=1500, ckpts=(1000,))
+        p = os.path.join(worlds.wdir(root, wid), "ckpt", "end.2000.json")
+        for k in (1, 2):
+            wr(p, bad)
+            s, msgs = supervisor(root, reg, ar)
+            s.startup()
+            self.assertEqual(worlds.read_state(root, wid)["status"], "interrupted", msgs)
+            self.assertEqual(len(self.quarantined(root, wid)), k)
+
+    def test_commitment_rule_committed(self):
+        """Round 3, 3 (c): a committed checkpoint (archive record) whose local bytes differ fails
+        closed when its writer finished it (here: a corrupted closing quote, suffix intact, that a
+        parse-position rule would have called torn); a local copy whose rewrite was cut short is
+        restored from the verified archived copy (the bad bytes quarantined)."""
+        root, reg, ar, wid = self.world(total=4000, ckpts=(1000, 2000))   # seg000's CSV reaches 3000
+        s, _ = supervisor(root, reg, ar)
+        s.startup()
+        rec = worlds.archive_records(root, wid)["end.2000"]
+        p = os.path.join(worlds.wdir(root, wid), "ckpt", "end.2000.json")
+        good = rqlib.read_text(p)
+        i = good.rindex('"genes":')
+        wr(p, good[: i + 6] + "x" + good[i + 7:])
+        s, msgs = supervisor(root, reg, ar)
+        s.startup()
+        st = worlds.read_state(root, wid)
+        self.assertEqual(st["status"], "failed", msgs)
+        self.assertIn("not deterministic", st["end_reason"])
+        self.assertTrue(os.path.isfile(p))
+        self.assertEqual(self.quarantined(root, wid), [])
+        # a committed frame whose writer never finished it (the CSV stops before it): restored
+        root, reg, ar, wid = self.sub_world(total=4000, logs_to=1500, ckpts=(1000, 2000))
+        s, _ = supervisor(root, reg, ar)
+        s.startup()
+        rec = worlds.archive_records(root, wid)["end.2000"]
+        p = os.path.join(worlds.wdir(root, wid), "ckpt", "end.2000.json")
+        good = rqlib.read_bytes(p)
+        wr(p, good[: len(good) // 2].decode())
+        s, msgs = supervisor(root, reg, ar)
+        s.startup()
+        self.assertEqual(worlds.read_state(root, wid)["status"], "interrupted", msgs)
+        self.assertEqual(rqlib.sha256_file(p), rec["sha256"])
+        self.assertTrue(any("RESTORED" in m for m in msgs), msgs)
+        self.assertEqual([(r["frame"], r["committed"]) for r in self.quarantined(root, wid)], [(2000, True)])
+        # no verified archived copy to restore from: fails closed
+        wr(p, good[: len(good) // 2].decode())
+        os.chmod(rec["path"], 0o644)
+        wr(rec["path"], "damaged")
+        s, msgs = supervisor(root, reg, ar)
+        s.startup()
+        st = worlds.read_state(root, wid)
+        self.assertEqual(st["status"], "failed", msgs)
+        self.assertIn("does not verify", st["end_reason"])
+
+    def extinct_world(self):
+        """An extinct world: acceptances 1000 and 2000, the prey's zero at 2500 (stopped)."""
+        root, reg, ar, wid = self.world(total=4000, logs_to=2600, ckpts=(1000, 2000), zero_at=2500)
+        s, msgs = supervisor(root, reg, ar)
+        s.startup()
+        self.assertEqual(worlds.read_state(root, wid)["status"], "extinct", msgs)
+        return root, reg, ar, wid
+
+    def damage_wiring(self, root, wid, frame=2000):
+        """Flip a byte of seg000's wiring log inside the part the record of `frame` accepted."""
+        r = [x for x in worlds.accept_records(root, wid) if x["frame"] == frame][0]["logs"]["run.wiring.csv"]
+        p = os.path.join(worlds.wdir(root, wid), "seg000", "run.wiring.csv")
+        raw = bytearray(rqlib.read_bytes(p))
+        k = (r["from"] + r["bytes"]) // 2                         # (from, bytes: the part's byte offsets)
+        raw[k] = ord("7") if raw[k] != ord("7") else ord("8")
+        wr(p, raw.decode())
+
+    def replay_segment(self, root, wid, wiring_to):
+        """The replay a reopened world gets: seg001 from seg000's 1000, through the zero again."""
+        d = worlds.wdir(root, wid)
+        r1000 = [x for x in worlds.accept_records(root, wid) if x["frame"] == 1000][0]
+        st = worlds.read_state(root, wid)
+        st["segments"].append({"name": "seg001", "start_frame": 1000, "resumed_from": "ckpt/end.1000.json",
+                               "resumed_accept": {"segment": "seg000", "frame": 1000, "sha256": r1000["sha256"]},
+                               "args": []})
+        st["status"] = "running"
+        worlds.write_state(root, wid, st)
+        os.makedirs(os.path.join(d, "seg001"))
+        wr(os.path.join(d, "seg001", "run.csv"), "step,population,predator_pop\n" + "".join(
+            f"{f},{0 if f >= 2500 else 50},8\n" for f in range(1100, 2601, 100)))
+        wr(os.path.join(d, "seg001", "run.wiring.csv"), "step,PREY_FWD\n" + "".join(
+            f"{f},0.5\n" for f in range(100, wiring_to + 1, 100)))
+
+    def test_reopened_extinct_world_replays_through_the_zero(self):
+        """Round 3, 2 (P1): an extinct world whose accepted wiring bytes between two acceptances were
+        damaged, its zero evidence intact, under --on-extinction stop: reopened, and the extinction
+        shortcut does NOT apply (it replays from its latest verified record instead); the replay
+        through the zero repairs the accepted logs and the world is extinct again."""
+        root, reg, ar, wid = self.extinct_world()
+        self.damage_wiring(root, wid)
+        s, msgs = supervisor(root, reg, ar)
+        s.startup()
+        st = worlds.read_state(root, wid)
+        self.assertEqual(st["status"], "interrupted", msgs)
+        self.assertIn("frame 2000", st["reopened"])
+        self.assertEqual(s.first_zero(wid), 2500)                       # the zero still supported
+        self.assertNotEqual(s.next_action(wid)[0], "extinct")
+        self.assertEqual(worlds.resume_point(root, wid, st, "A")[0], 1000)
+        self.replay_segment(root, wid, wiring_to=1600)
+        s, msgs = supervisor(root, reg, ar)
+        s.tails[wid] = worlds.Tail(os.path.join(worlds.wdir(root, wid), "seg001", "run.csv"))
+        s.zeros[wid] = {"prey": 2500}
+        s.reap_segment(wid, "seg001", 0)
+        st = worlds.read_state(root, wid)
+        self.assertEqual(st["status"], "extinct", msgs)
+        good = worlds.verified_records(root, wid, st, "A")
+        self.assertIn(("seg001", 2000), good)
+        self.assertTrue(worlds.audit_archive(root, wid, ar, "extinct"))
+        s, msgs = supervisor(root, reg, ar)                             # and it stays extinct
+        s.startup()
+        self.assertEqual(worlds.read_state(root, wid)["status"], "extinct", msgs)
+
+    def test_reopened_extinct_world_unrepaired_fails(self):
+        """Round 3, 2 (P1): a replay through the zero that does not repair the accepted logs fails
+        the world explicitly (exit 1), instead of finalizing it as extinct again."""
+        root, reg, ar, wid = self.extinct_world()
+        self.damage_wiring(root, wid)
+        s, msgs = supervisor(root, reg, ar)
+        s.startup()
+        self.replay_segment(root, wid, wiring_to=900)                    # its wiring log stops short
+        s, msgs = supervisor(root, reg, ar)
+        s.tails[wid] = worlds.Tail(os.path.join(worlds.wdir(root, wid), "seg001", "run.csv"))
+        s.zeros[wid] = {"prey": 2500}
+        s.reap_segment(wid, "seg001", 0)
+        st = worlds.read_state(root, wid)
+        self.assertEqual(st["status"], "failed", msgs)
+        self.assertIn("could not be repaired", st["end_reason"])
+
+    def test_finalized_archive_audited_before_recovery(self):
+        """Round 3, 2: at a start the finalized archive is audited in full before a reopened world's
+        recovery begins: damaged archived bytes fail it even when its logs would reopen it."""
+        root, reg, ar, wid = self.extinct_world()
+        self.damage_wiring(root, wid)
+        rec = worlds.archive_records(root, wid)["end.1000"]
+        n = os.path.getsize(rec["path"])
+        os.chmod(rec["path"], 0o644)
+        wr(rec["path"], "x" * n)
+        os.chmod(rec["path"], 0o444)
+        s, msgs = supervisor(root, reg, ar)
+        s.startup()
+        st = worlds.read_state(root, wid)
+        self.assertEqual(st["status"], "failed", msgs)
+        self.assertIn("finalized archive", st["end_reason"])
+        self.assertFalse(any("REOPENED" in m for m in msgs), msgs)
+
+    def test_archive_claim_exclusive(self):
+        """Round 3, 1 (P1): two study roots claiming one empty archive at once: one wins, the other
+        refuses with nothing written (a second command is refused while the archive lock is held)."""
+        reg_bytes = None
+        roots = []
+        arena = os.path.join(self.tmp, "arena.json")
+        wr(arena, json.dumps(ARENA))
+        reg = worlds.register(arena, "ns-unit", blocks=1, per_block={"A": 1, "B": 0, "C": 0}, schedule=SCHED)
+        reg_bytes = rqlib.canonical(reg)
+        for k in range(2):
+            r = os.path.join(self.tmp, f"root{k}")
+            worlds.write_registry(os.path.join(r, "config", "worlds.json"), reg_bytes)
+            roots.append(r)
+        ar = os.path.join(self.tmp, "shared_archive")
+        code = ("import sys; sys.path.insert(0, %r); import worlds\n"
+                "root, ar = sys.argv[1], sys.argv[2]\n"
+                "_, sha = worlds.load_registry(root)\n"
+                "try:\n"
+                "    worlds.bind_root(root, sha, ar, create=True); print('WON', flush=True)\n"
+                "except worlds.WorldsError as e:\n"
+                "    print('REFUSED', e, flush=True)\n"
+                "sys.stdin.read()\n") % worlds.HERE
+        import subprocess
+        ps = [subprocess.Popen([sys.executable, "-I", "-c", code, r, ar], stdin=subprocess.PIPE,
+                               stdout=subprocess.PIPE, text=True) for r in roots]
+        outs = [p.stdout.readline().strip() for p in ps]                 # both decided, both still running
+        for p in ps:
+            p.stdin.close()
+            p.wait()
+            p.stdout.close()
+        won = [k for k, o in enumerate(outs) if o.startswith("WON")]
+        self.assertEqual(len(won), 1, outs)
+        lost = 1 - won[0]
+        self.assertTrue(outs[lost].startswith("REFUSED"), outs)
+        self.assertFalse(os.path.exists(os.path.join(roots[lost], "study.json")))   # nothing written
+        owner = rqlib.read_json(os.path.join(ar, worlds.OWNER))
+        self.assertEqual(owner["study_id"], rqlib.read_json(os.path.join(roots[won[0]], "study.json"))["study_id"])
+        self.assertEqual(sorted(os.listdir(ar)), sorted([worlds.ARCHIVE_LOCK, worlds.OWNER]))
+        # a command holding the archive lock refuses another root's binding outright
+        worlds.release_archives()
+        root3 = os.path.join(self.tmp, "root3")
+        worlds.write_registry(os.path.join(root3, "config", "worlds.json"), reg_bytes)
+        _, sha = worlds.load_registry(root3)
+        ar2 = os.path.join(self.tmp, "archive2")
+        held = worlds._flock(os.path.join(ar2, worlds.ARCHIVE_LOCK))
+        try:
+            with self.assertRaisesRegex(worlds.WorldsError, "another worlds.py holds"):
+                worlds.bind_root(root3, sha, ar2, create=True)
+        finally:
+            held.close()
+        self.assertFalse(os.path.exists(os.path.join(root3, "study.json")))
+        self.assertEqual(os.listdir(ar2), [worlds.ARCHIVE_LOCK])
+        # the marker's publication is exclusive even past every check (a hard link, not a rename): a
+        # rival marker published between this claim's checks and its link wins, this one is refused
+        worlds.bind_root(root3, sha, ar2, create=True)
+        mine = rqlib.read_json(os.path.join(ar2, worlds.OWNER))
+        ar3 = os.path.join(self.tmp, "archive3")
+        os.makedirs(ar3)
+        rival = os.path.join(self.tmp, "rival.json")
+        wr(rival, json.dumps(mine))
+        intruder = dict(mine, study_id="00000000-0000-4000-8000-00000000beef")
+        real_link = os.link
+
+        def racing_link(src, dst):
+            real_link(rival, dst)                                  # the rival publishes first
+            return real_link(src, dst)
+        os.link = racing_link
+        try:
+            with self.assertRaisesRegex(worlds.WorldsError, "claimed by another study"):
+                worlds.claim_archive(ar3, intruder)
+        finally:
+            os.link = real_link
+        self.assertEqual(rqlib.read_json(os.path.join(ar3, worlds.OWNER))["study_id"], mine["study_id"])
+        self.assertNotIn(worlds.OWNER + ".tmp", os.listdir(ar3))
+
+    def test_interrupted_claim_resumed(self):
+        """Round 3, 1: a crash between the marker's tmp and its link: the same study's next command
+        completes the claim; another study's or an unreadable tmp is refused."""
+        root, reg, ar = make_root(self.tmp, "A")
+        study = rqlib.read_json(os.path.join(root, "study.json"))
+        sha = study["registry_sha256"]
+        owner = os.path.join(ar, worlds.OWNER)
+        rec = rqlib.read_bytes(owner)
+        for tmp_bytes, ok in ((rec, True), (rec.replace(study["study_id"].encode(),
+                                                         b"00000000-0000-4000-8000-00000000beef"), False),
+                              (b"", False)):
+            worlds.release_archives()
+            os.chmod(owner, 0o644)
+            os.remove(owner)
+            wr(owner + ".tmp", tmp_bytes.decode())
+            if ok:
+                self.assertEqual(worlds.bind_root(root, sha), ar)
+                self.assertEqual(rqlib.read_json(owner)["study_id"], study["study_id"])
+                self.assertNotIn(worlds.OWNER + ".tmp", os.listdir(ar))
+            else:
+                with self.assertRaisesRegex(worlds.WorldsError, "interrupted claim"):
+                    worlds.bind_root(root, sha)
+                self.assertFalse(os.path.exists(owner))
+                os.remove(owner + ".tmp")
+                wr(owner, rec.decode())
+
+    def test_bootstrap_and_quarantine_durability(self):
+        """Round 3, 4: directories are created with mkdirs_durable (every new ancestor's parent
+        fsync'd), every bootstrap path included; a quarantine fsyncs the moved file and both
+        directories before its record."""
+        calls = []
+        real_dir, real_file, real_append = worlds.rqlib.fsync_dir, worlds.rqlib.fsync_file, worlds._append_durable
+        worlds.rqlib.fsync_dir = lambda p: (calls.append(("dir", os.path.abspath(p))), real_dir(p))[1]
+        worlds.rqlib.fsync_file = lambda p: (calls.append(("file", os.path.abspath(p))), real_file(p))[1]
+        worlds._append_durable = lambda p, r: (calls.append(("append", os.path.basename(p))), real_append(p, r))[1]
+        try:
+            base = os.path.join(self.tmp, "a")
+            worlds.mkdirs_durable(os.path.join(base, "b", "c"))
+            for d in (self.tmp, base, os.path.join(base, "b")):
+                self.assertIn(("dir", os.path.abspath(d)), calls)
+            # f1 on a freshly bound root (a stand-in engine that writes a prepared checkpoint)
+            root, reg, ar = make_root(self.tmp, "A")
+            wid = reg["worlds"][0]["id"]
+            src = os.path.join(self.tmp, "F1src.json")
+            wr(src, ckpt.dumps(mk_cp(frame=1, cfg_extra=cfg_for(reg["worlds"][0]["flags"]))))
+            exe = os.path.join(self.tmp, "fake_engine")
+            wr(exe, '#!/bin/sh\nout=""; prev=""\nfor a in "$@"; do\n  if [ "$prev" = "--save-checkpoint" ]; '
+                    'then out="$a"; fi\n  prev="$a"\ndone\ncp "%s" "$out"\n' % src)
+            os.chmod(exe, 0o755)
+            worlds.release_archives()
+            del calls[:]
+            a = argparse.Namespace(root=root, allow_placeholder=False, archive_root=None, binary=exe, world=None)
+            self.assertEqual(worlds.f1(a, lambda m: None), 0)
+            self.assertIn("F1", worlds.archive_records(root, wid))
+            wd = worlds.wdir(root, wid)
+            for d in (os.path.join(root, "bin"), os.path.join(root, "worlds"), wd, os.path.join(wd, "f1")):
+                self.assertIn(("dir", os.path.dirname(d)), calls, d)
+            self.assertLess(calls.index(("dir", os.path.join(root, "worlds"))), calls.index(("append", "archive.jsonl")))
+            # a quarantine
             sub = tempfile.mkdtemp(dir=self.tmp)
             self.tmp, keep = sub, self.tmp
             try:
                 root, reg, ar, wid = self.world(total=4000, ckpts=(1000,))
             finally:
                 self.tmp = keep
-            flags = reg["worlds"][0]["flags"]
             p = os.path.join(worlds.wdir(root, wid), "ckpt", "end.2000.json")
-            if data == "frame":
-                wr(p, ckpt.dumps(mk_cp(frame=1500, cfg_extra=cfg_for(flags))))
-            elif data == "invalid":
-                cp = mk_cp(frame=2000, cfg_extra=cfg_for(flags))
-                cp["predators"]["id"][1] = cp["predators"]["id"][0]           # duplicate predator ids
-                wr(p, ckpt.dumps(cp))
-            else:
-                wr(p, '{"format": 1 xx}')
+            wr(p, "")
+            del calls[:]
             s, msgs = supervisor(root, reg, ar)
             s.startup()
-            st = worlds.read_state(root, wid)
-            self.assertEqual(st["status"], "failed", (name, msgs))
-            self.assertTrue(os.path.isfile(p), name)                 # the evidence kept
-            self.assertFalse(os.path.exists(os.path.join(worlds.wdir(root, wid), "quarantine.jsonl")), name)
+            q = self.quarantined(root, wid)[0]
+            qd = os.path.dirname(q["to"])
+            k = calls.index(("append", "quarantine.jsonl"))
+            for c in (("file", q["to"]), ("dir", qd), ("dir", os.path.dirname(p))):
+                self.assertLess(calls.index(c), k, c)
+        finally:
+            worlds.rqlib.fsync_dir, worlds.rqlib.fsync_file, worlds._append_durable = real_dir, real_file, real_append
+        # no plain os.makedirs left on a bootstrap path (the helper itself and the throwaway probe only)
+        src = rqlib.read_text(os.path.join(worlds.HERE, "worlds.py")).splitlines()
+        plain = [ln.strip() for ln in src if "os.makedirs(" in ln]
+        self.assertEqual(plain, ["os.makedirs(path, exist_ok=True)", "os.makedirs(d)"], plain)
 
     def test_non_serial_checkpoint_refused(self):
         """P2 (6): a checkpoint that declares a non-exact resume is never archived or accepted."""
@@ -752,7 +1090,7 @@ class TestSupervisor(unittest.TestCase):
         cp["determinism"] = "openmp-build (resume is NOT bit-exact)"
         p = os.path.join(worlds.wdir(root, wid), "ckpt", "end.1000.json")
         wr(p, ckpt.dumps(cp))
-        with self.assertRaisesRegex(worlds.WorldsError, "serial build"):
+        with self.assertRaisesRegex(worlds.TornCheckpoint, "serial build"):
             worlds.archive_one(root, wid, ar, 1000, p, lambda m: None)
 
 

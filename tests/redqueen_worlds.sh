@@ -28,7 +28,10 @@
 #      again without a new segment;
 #   8. a world found at its final accepted frame, and an interrupted finalization: the restart
 #      finalizes both without a new segment; a changed registry is refused by the bound root;
-#      STOP stops admission (exit 75); design-block lists the archive.
+#      STOP stops admission (exit 75); design-block lists the archive;
+#   9. two fresh roots claiming one archive root at once: one wins, the other writes nothing;
+#  10. an extinct world whose accepted wiring is damaged between acceptances (its zero evidence
+#      intact, stop): reopened, replayed through the zero, extinct again, its archive untouched.
 set -u
 BIN=${1:?usage: redqueen_worlds.sh EVO_BOIDS WORKDIR}
 W=${2:?usage: redqueen_worlds.sh EVO_BOIDS WORKDIR}
@@ -390,5 +393,80 @@ b = json.load(open("block.json"))
 assert b["times"] == {"F1": 1, "f4000": 4000, "f8000": 8000, "f12000": 12000, "f16000": 16000, "f20000": 20000, "f24000": 24000}
 w = next(iter(b["worlds"].values()))
 assert w["pattern"].endswith("end.{frame}.json") and w["paths"]["F1"].endswith("F1.json")
+PY
+
+# 9. (round 3) two fresh study roots claim one archive root at once: one wins, the other is refused
+#    with nothing written (the archive lock and the hard-linked OWNER.json)
+mkroot R8; mkroot R9
+$WS f1 --root R8 --binary "$BIN" --archive-root "$W/arch8" > r8.log 2>&1 & p8=$!
+$WS f1 --root R9 --binary "$BIN" --archive-root "$W/arch8" > r9.log 2>&1 & p9=$!
+wait $p8; rc8=$?; wait $p9; rc9=$?
+$PY - "$T" $rc8 $rc9 <<'PY' || fail "the concurrent archive claims: $(tail -2 r8.log r9.log)"
+import json, os, sys; sys.path.insert(0, sys.argv[1]); import worlds
+rc = {"R8": int(sys.argv[2]), "R9": int(sys.argv[3])}
+won = [r for r, c in rc.items() if c == 0]
+assert len(won) == 1, rc
+lost = ({"R8", "R9"} - set(won)).pop()
+assert not any(os.path.exists(f"{lost}/{x}") for x in ("study.json", "worlds", "bin")), os.listdir(lost)
+assert json.load(open("arch8/OWNER.json"))["study_id"] == json.load(open(f"{won[0]}/study.json"))["study_id"]
+assert not os.path.exists("arch8/OWNER.json.tmp")
+print("claims", rc)
+PY
+
+# 10. (round 3) an extinct world whose accepted wiring bytes are damaged between two acceptances, its
+#     zero evidence intact, under --on-extinction stop: reopened, the extinction shortcut refused, a
+#     replay from the last verified record through the zero repairs the logs; extinct again, its
+#     finalized archive untouched
+cat > arena_y.json <<'JSON'
+{"schema": "finfolk.redqueen.arena/1", "status": "selected",
+ "common": {"population": 8, "min-pop": 0, "predator-min-pop": 0, "max-pop": 8, "target-food": 20,
+            "food-spawn": 3, "food-amp": 2, "food-patches": 0, "current": 0, "move-cost": 0, "gene-cost": 0},
+ "treatments": {"A": {"predators": 4, "predator-capture-radius": 60}}}
+JSON
+$WS register --arena arena_y.json --namespace rq-test-y --blocks 1 --per-block A=1 --total-steps 24000 \
+    --checkpoint-every 400 --log-every 100 --out RY/config/worlds.json 2> /dev/null || fail "register (RY)"
+$WS f1 --root RY --binary "$BIN" > ryf1.log 2>&1 || fail "f1 RY"
+$WS launch --root RY --binary "$BIN" --workers 1 $GUARD > ry.log 2>&1 || fail "launch RY: $(tail -3 ry.log)"
+$PY - "$T" <<'PY' || fail "setting up the damaged extinct world"
+import json, os, shutil, sys; sys.path.insert(0, sys.argv[1]); import worlds, rqlib
+led = [json.loads(l) for l in open("RY/availability.jsonl")]
+wid, fz = led[0]["world"], led[0]["first_zero_frame"]
+st = worlds.read_state("RY", wid)
+assert st["status"] == "extinct", st
+recs = [r for r in worlds.accept_records("RY", wid) if r["frame"] <= fz]
+assert len(recs) >= 2, (fz, [r["frame"] for r in recs])
+p = f"RY/worlds/{wid}/seg000/run.wiring.csv"
+shutil.copy(p, "ry_wiring.orig")
+part = recs[1]["logs"]["run.wiring.csv"]                     # the second acceptance's part
+raw = bytearray(open(p, "rb").read())
+k = (part["from"] + part["bytes"]) // 2
+raw[k] = ord("7") if raw[k] != ord("7") else ord("8")
+open(p, "wb").write(bytes(raw))
+arch = {r["label"]: rqlib.sha256_file(r["path"]) for r in worlds.archive_records("RY", wid).values()}
+json.dump({"wid": wid, "fz": fz, "f0": recs[0]["frame"], "arch": arch}, open("ry_info.json", "w"))
+PY
+RYW=$($PY -c 'import json; print(json.load(open("ry_info.json"))["wid"])')
+$WS launch --root RY --binary "$BIN" --workers 1 $GUARD > ry2.log 2>&1 || fail "the reopening launch (RY): $(tail -3 ry2.log)"
+grep -q "$RYW: REOPENED (extinct" ry2.log || fail "the damaged extinct world was not reopened: $(tail -3 ry2.log)"
+grep -q "replaying through the zero" ry2.log || fail "the extinction shortcut applied to unverified logs: $(tail -3 ry2.log)"
+$WS stitch --root RY --world "$RYW" > /dev/null || fail "stitch RY"
+$PY - "$T" <<'PY' || fail "the replayed extinct world"
+import json, os, sys; sys.path.insert(0, sys.argv[1]); import worlds, rqlib
+info = json.load(open("ry_info.json"))
+wid = info["wid"]
+st = worlds.read_state("RY", wid)
+assert st["status"] == "extinct" and len(st["segments"]) == 2 and st["segments"][1]["start_frame"] == info["f0"], st
+good = worlds.verified_records("RY", wid, st, "A")
+assert max(f for (s, f) in good if f <= info["fz"]) >= max(r["frame"] for r in worlds.accept_records("RY", wid)
+                                                           if r["frame"] <= info["fz"] and r["segment"] == "seg000")
+man = json.load(open(f"RY/worlds/{wid}/stitched/manifest.json"))
+orig = open("ry_wiring.orig").read().splitlines()
+got = open(f"RY/worlds/{wid}/stitched/run.wiring.csv").read().splitlines()
+upto = min(man["endpoint"], int(orig[-1].split(",")[0]))
+cut = lambda rows: [rows[0]] + [l for l in rows[1:] if int(l.split(",")[0]) <= upto]
+assert upto >= info["fz"] - 400 and cut(got) == cut(orig), (upto, len(got), len(orig))
+arch = {r["label"]: rqlib.sha256_file(r["path"]) for r in worlds.archive_records("RY", wid).values()}
+assert arch == info["arch"], sorted(set(arch) ^ set(info["arch"]))
+assert worlds.audit_archive("RY", wid, json.load(open("RY/study.json"))["archive_root"], "extinct")
 PY
 echo "redqueen_worlds: ok"
