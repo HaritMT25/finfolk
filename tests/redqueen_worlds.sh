@@ -125,7 +125,16 @@ for w in reg["worlds"]:
     if w["treatment"] == "C":
         ev = [l.split(",")[1] for l in open(f"R1/worlds/{w['id']}/seg000/run.predlog.csv").read().splitlines()[1:]]
         assert ev.count("B") > 20 and ev.count("A") > 10, "the tiny C world's predators should bud and age"
+assert json.load(open("arch1/OWNER.json"))["study_id"] == json.load(open("R1/study.json"))["study_id"]
 PY
+# (N1) a new study root naming R1's (finalized) archive root is refused; nothing in it changes
+mkroot R7
+snap() { find arch1 -type f -exec sha256sum {} + | sort; find arch1 -type d -exec stat -c '%a %n' {} + | sort; }
+snap > arch1.before
+$WS f1 --root R7 --binary "$BIN" --archive-root "$W/arch1" > r7.log 2>&1 && fail "a second study published into R1's archive"
+grep -q "belongs to another study" r7.log || fail "the ownership refusal does not say why: $(cat r7.log)"
+snap > arch1.after
+cmp -s arch1.before arch1.after || fail "the refused study changed R1's archive"
 
 # 3. a SIGKILLed C engine: F1 verified, resume, identical archive, stitched logs = the uninterrupted logs
 mkroot R2
@@ -172,7 +181,7 @@ grep -q "verifying F1 with the pinned engine" r2.log || fail "the supervisor did
 # 4. lineage-log loss after a SIGKILLed supervisor: back to the last checkpoint the log covers
 mkroot R5
 $WS f1 --root R5 --binary "$BIN" --archive-root "$W/arch5" > r5f1.log 2>&1 || fail "f1 R5"
-$WS launch --root R5 --binary "$BIN" --workers 3 --on-extinction continue $GUARD > r5a.log 2>&1 &
+$WS launch --root R5 --binary "$BIN" --workers 3 --on-extinction continue --prune-local $GUARD > r5a.log 2>&1 &
 sp=$!
 for _ in $(seq 1 3000); do grep -qs '"label":"end.16000"' "R5/worlds/$CW/accept.jsonl" && break; sleep 0.01; done
 kill -KILL $sp; wait $sp 2> /dev/null
@@ -189,8 +198,8 @@ with open(f"R5/worlds/{cw}/seg000/run.predlog.csv", "r+b") as f:
     f.truncate(cut)
 open("r5_expect", "w").write(str(recs[k - 1]["frame"] if k else 0))
 PY
-$WS launch --root R5 --binary "$BIN" --workers 3 --on-extinction continue $GUARD > r5b.log 2>&1 \
-    || fail "the restart after the lineage-log loss: $(tail -5 r5b.log)"
+$WS launch --root R5 --binary "$BIN" --workers 3 --on-extinction continue --prune-local $GUARD > r5b.log 2>&1 \
+    || fail "the restart after the lineage-log loss (--prune-local, N2): $(tail -5 r5b.log)"
 $WS stitch --root R5 --world "$CW" > /dev/null || fail "stitch R5"
 $PY cmp_stitch.py "$T" R5 "$CW" || fail "R5 differs from the uninterrupted history"
 $PY - "$T" "$CW" <<'PY' || fail "the resume after the lineage-log loss"
@@ -288,11 +297,23 @@ st = worlds.read_state("RX", wid)
 assert st["status"] == "extinct", st["status"]
 ad = os.path.join("RX", "archive", "worlds", wid)
 assert os.path.isfile(os.path.join(ad, "FINALIZED"))
-# the previous supervisor "never saw" the zero and died before ending the world
+assert worlds.zero_supported("RX", led[0]), led[0]          # bound to its CSV prefix (R3)
 open("rx_zero", "w").write(f"{wid} {led[0]['first_zero_frame']} {len(st['segments'])}")
+os.remove("RX/availability.jsonl")                           # (R3) the ledger lost, the world still extinct
+PY
+$WS launch --root RX --binary "$BIN" --workers 1 $GUARD > rx1.log 2>&1 || fail "relaunch (terminal, no ledger): $(tail -3 rx1.log)"
+$PY - "$T" <<'PY' || fail "the terminal world's recovered zero"
+import json, os, sys; sys.path.insert(0, sys.argv[1]); import worlds
+wid, z, nseg = open("rx_zero").read().split()
+led = [json.loads(l) for l in open("RX/availability.jsonl")]
+assert len(led) == 1 and led[0]["first_zero_frame"] == int(z) and led[0]["recovered"] is True, led
+st = worlds.read_state("RX", wid)
+assert st["status"] == "extinct" and len(st["segments"]) == int(nseg), st
+# the previous supervisor "never saw" the zero and died before ending the world
 os.remove("RX/availability.jsonl")
 st["status"] = "interrupted"
 worlds.write_state("RX", wid, st)
+ad = os.path.join("RX", "archive", "worlds", wid)
 os.chmod(ad, 0o755)
 os.remove(os.path.join(ad, "FINALIZED"))
 PY
@@ -329,6 +350,25 @@ for w in json.load(open("R1/config/worlds.json"))["worlds"]:
     ad = os.path.join("arch1", "worlds", w["id"])
     assert st["status"] == "done" and len(st["segments"]) == 1, (w["id"], st)
     assert os.path.isfile(os.path.join(ad, "FINALIZED")) and os.stat(ad).st_mode & 0o777 == 0o555, w["id"]
+PY
+# (R1) a done C world whose accepted lineage log loses its tail: reopened, replayed, done again
+cp "R1/worlds/$CW/seg000/run.predlog.csv" predlog.orig
+cp "R1/worlds/$CW/seg000/run.pwiring.csv" pwiring.orig
+$PY - "$CW" <<'PY' || fail "setting up the damaged done world"
+import os, sys
+p = f"R1/worlds/{sys.argv[1]}/seg000/run.predlog.csv"
+with open(p, "r+b") as f:
+    f.truncate(os.path.getsize(p) - 300)
+PY
+$WS launch --root R1 --binary "$BIN" --workers 3 --on-extinction continue $GUARD > r1e.log 2>&1 || fail "the reopening launch: $(tail -3 r1e.log)"
+grep -q "$CW: REOPENED (done" r1e.log || fail "the damaged done world was not reopened: $(tail -3 r1e.log)"
+$WS stitch --root R1 --world "$CW" > /dev/null || fail "stitch after the reopening"
+cmp -s predlog.orig "R1/worlds/$CW/stitched/run.predlog.csv" || fail "the replayed lineage log differs"
+cmp -s pwiring.orig "R1/worlds/$CW/stitched/run.pwiring.csv" || fail "the replayed pwiring differs"
+$PY - "$T" "$CW" <<'PY' || fail "the reopened world"
+import sys; sys.path.insert(0, sys.argv[1]); import worlds
+st = worlds.read_state("R1", sys.argv[2])
+assert st["status"] == "done" and len(st["segments"]) == 2 and st["segments"][1]["start_frame"] > 0, st
 PY
 $WS register --arena arena.json --namespace rq-test-other --blocks 1 --per-block C=1,A=1,B=1 \
     --total-steps 24000 --checkpoint-every 4000 --log-every 100 --out reg_other.json 2> /dev/null || fail "register (other)"

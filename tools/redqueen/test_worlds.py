@@ -152,6 +152,10 @@ class TestRegistry(unittest.TestCase):
         self.refused(lambda a: a["treatments"]["B"].update({"predator-speed": 120}), "C and B must share")
         self.refused(lambda a: a["treatments"]["A"].update({"predator-cooldown": 3}), "A must share the predator kin")
         self.refused(lambda a: a["treatments"]["A"].update({"predator-max-age": 30}), "A: --predator-max-age needs")
+        # N6: the refusals name the canonical form
+        self.refused(lambda a: a["treatments"]["A"].update({"predator-max-age": 0, "predator-economy": False}),
+                     "A's canonical form leaves every economy flag out")
+        self.refused(lambda a: (a["treatments"]["C"].update({"predator-speed": 110})), "canonical form gives a shared")
         self.refused(lambda a: a["treatments"]["C"].update({"population": 500}), "common environment differs")
         self.refused(lambda a: a["common"].pop("move-cost"), "--move-cost must be given explicitly")
         self.refused(lambda a: a["common"].update({"food-spwan": 3}), "not an engine flag")
@@ -299,6 +303,28 @@ class TestLogs(unittest.TestCase):
         worlds._append_durable(p, {"label": "F1", "frame": 1, "sha256": "a" * 64})
         wr(p, '{"label": "end.4', "a")                     # a torn last record: that copy is redone
         self.assertEqual(list(worlds.archive_records(root, "w01")), ["F1"])
+
+    def test_dense_rows_and_headers(self):
+        """N4: acceptance checks a dense log's header and every row's width (a short final row, a
+        long row or a bad header is never accepted); the cut carries the header's hash."""
+        p = os.path.join(self.tmp, "w.csv")
+        wr(p, "step,A,B\n100,1,2\n200\n")                       # a short final row, newline-terminated
+        self.assertIsNone(worlds.dense_cut(p, "frame", 0, 200, 100))
+        wr(p, "step,A,B\n100,1,2\n200,1,2,3\n")
+        self.assertIsNone(worlds.dense_cut(p, "frame", 0, 200, 100))
+        wr(p, "x,A,B\n100,1,2\n200,1,2\n")
+        self.assertIsNone(worlds.dense_cut(p, "frame", 0, 200, 100))
+        wr(p, "step,A,B\n100,1,2\n200,1,2\n")
+        a = worlds.dense_cut(p, "frame", 0, 100, 100)
+        self.assertEqual((a["columns"], a["header_sha256"]), (3, rqlib.sha256_bytes(b"step,A,B")))
+        b = worlds.dense_cut(p, "frame", 0, 200, 100, a)
+        self.assertEqual(b["header_sha256"], a["header_sha256"])
+        e = os.path.join(self.tmp, "e.csv")
+        wr(e, "frame,event,id\n0,F,1\n")
+        self.assertEqual(worlds.events_cut(e, 10)["header_sha256"], rqlib.sha256_bytes(b"frame,event,id"))
+        t = worlds.Tail(p)
+        self.assertEqual(t.lines(), [["100", "1", "2"], ["200", "1", "2"]])
+        self.assertEqual(t.ends, [len("step,A,B\n100,1,2\n"), len("step,A,B\n100,1,2\n200,1,2\n")])
 
     def test_dense_cuts(self):
         p = os.path.join(self.tmp, "run.csv")
@@ -472,9 +498,11 @@ class TestSupervisor(unittest.TestCase):
                                "resumed_accept": None, "args": []})
         worlds.write_state(root, wid, st)
         os.makedirs(os.path.join(d, "seg001"))
-        wr(os.path.join(d, "seg001", "run.csv"), "step,population,predator_pop\n2100,0,8\n2200,0,8\n")
-        worlds._append_durable(os.path.join(root, "availability.jsonl"), {
-            "schema": worlds.AVAIL_SCHEMA, "world": wid, "guild": "prey", "first_zero_frame": 2100})
+        head = "step,population,predator_pop\n2100,0,8\n"
+        wr(os.path.join(d, "seg001", "run.csv"), head + "2200,0,8\n")
+        worlds._append_durable(os.path.join(root, "availability.jsonl"), {      # (with its evidence)
+            "schema": worlds.AVAIL_SCHEMA, "world": wid, "guild": "prey", "first_zero_frame": 2100,
+            "segment": "seg001", "csv_bytes": len(head), "csv_sha256": rqlib.sha256_bytes(head.encode())})
         s, msgs = supervisor(root, reg, ar)
         s.startup()
         led = worlds.read_jsonl(os.path.join(root, "availability.jsonl"))
@@ -530,6 +558,192 @@ class TestSupervisor(unittest.TestCase):
         wr(rec["path"], "garbage")
         with self.assertRaisesRegex(worlds.WorldsError, "finalized archive"):
             worlds.archive_one(root, wid, ar, 1000, loc, msgs.append)
+
+    # ---------------------------------------------------------------- review round 2
+    def test_archive_ownership(self):
+        """N1 (P1): an archive root belongs to one study: a second study root naming it (finalized or
+        not), or a nonempty unowned one, is refused; nothing new is published into a finalized
+        directory; a destination file without this study's record is never replaced."""
+        root, reg, ar, wid = self.world()
+        study = rqlib.read_json(os.path.join(root, "study.json"))
+        owner = rqlib.read_json(os.path.join(ar, worlds.OWNER))
+        self.assertEqual((owner["study_id"], owner["study_root"]), (study["study_id"], root))
+        root2 = os.path.join(self.tmp, "root2")
+        worlds.write_registry(os.path.join(root2, "config", "worlds.json"),
+                              rqlib.read_bytes(os.path.join(root, "config", "worlds.json")))
+        _, sha = worlds.load_registry(root2)
+        with self.assertRaisesRegex(worlds.WorldsError, "belongs to another study"):
+            worlds.bind_root(root2, sha, ar, create=True)
+        self.assertFalse(os.path.exists(os.path.join(root2, "study.json")))
+        other = os.path.join(self.tmp, "other")
+        os.makedirs(os.path.join(other, "x"))
+        with self.assertRaisesRegex(worlds.WorldsError, "not empty and has no owner"):
+            worlds.bind_root(root2, sha, other, create=True)
+        s, _ = supervisor(root, reg, ar)
+        s.startup()                                             # done and finalized
+        ad = worlds.adir(ar, wid)
+        before = {f: rqlib.sha256_file(os.path.join(ad, f)) for f in os.listdir(ad)}
+        p = os.path.join(worlds.wdir(root, wid), "ckpt", "end.4000.json")
+        wr(p, ckpt.dumps(mk_cp(frame=4000, cfg_extra=cfg_for(reg["worlds"][0]["flags"]))))
+        with self.assertRaisesRegex(worlds.WorldsError, "finalized"):
+            worlds.archive_one(root, wid, ar, 4000, p, lambda m: None)
+        self.assertEqual({f: rqlib.sha256_file(os.path.join(ad, f)) for f in os.listdir(ad)}, before)
+        self.assertEqual(os.stat(ad).st_mode & 0o777, 0o555)
+        # an unfinalized directory holding a file this study has no record of
+        ad2 = worlds.adir(ar, "w99")
+        os.chmod(ar, 0o755)
+        os.makedirs(ad2)
+        wr(os.path.join(ad2, "end.1000.json"), "someone else's")
+        with self.assertRaisesRegex(worlds.WorldsError, "exists with other bytes"):
+            worlds.archive_one(root, "w99", ar, 1000, os.path.join(worlds.wdir(root, wid), "ckpt", "end.1000.json"),
+                               lambda m: None)
+        # read-only commands verify the owner; a bound root completes an interrupted claim
+        os.chmod(os.path.join(ar, worlds.OWNER), 0o644)
+        os.remove(os.path.join(ar, worlds.OWNER))
+        with self.assertRaisesRegex(worlds.WorldsError, "no ownership marker"):
+            worlds.bind_root(root, study["registry_sha256"], readonly=True)
+
+    def test_terminal_done_world_reverified(self):
+        """R1 (P1): a done world whose accepted logs were damaged after it finished is reopened at
+        the next start (recovered from its verified evidence), not kept done."""
+        root, reg, ar, wid = self.world()
+        s, _ = supervisor(root, reg, ar)
+        s.startup()
+        self.assertEqual(worlds.read_state(root, wid)["status"], "done")
+        p = os.path.join(worlds.wdir(root, wid), "seg000", "run.wiring.csv")
+        with open(p, "r+b") as f:
+            f.truncate(os.path.getsize(p) - 20)                 # a lost tail, after "done"
+        s, msgs = supervisor(root, reg, ar)
+        s.startup()
+        st = worlds.read_state(root, wid)
+        self.assertEqual(st["status"], "interrupted", msgs)
+        self.assertIn("not 3000", st["reopened"])
+        self.assertTrue(any("REOPENED" in m for m in msgs), msgs)
+        self.assertEqual(s.next_action(wid), ("verify", None))  # a replay, from the last verified frame
+
+    def test_terminal_archive_rehashed(self):
+        """R2: same-size damage inside a finalized archive is found at the next start (every object
+        rehashed); it fails the world (nothing inside a finalized directory is replaced)."""
+        root, reg, ar, wid = self.world()
+        s, _ = supervisor(root, reg, ar)
+        s.startup()
+        rec = worlds.archive_records(root, wid)["end.2000"]
+        n = os.path.getsize(rec["path"])
+        os.chmod(rec["path"], 0o644)
+        wr(rec["path"], "x" * n)
+        os.chmod(rec["path"], 0o444)
+        s, msgs = supervisor(root, reg, ar)
+        s.startup()
+        st = worlds.read_state(root, wid)
+        self.assertEqual(st["status"], "failed", msgs)
+        self.assertIn("damaged", st["end_reason"])
+
+    def test_terminal_extinct_world_reconciled(self):
+        """R3: an extinct world's earliest zero is reconciled at every start (a lost ledger is
+        recovered from the CSVs); a zero whose evidence is lost does not count, and the world is
+        reopened to find it again."""
+        root, reg, ar, wid = self.world(total=4000, logs_to=2500, ckpts=(1000, 2000), zero_at=1500)
+        s, _ = supervisor(root, reg, ar)
+        s.startup()
+        self.assertEqual(worlds.read_state(root, wid)["status"], "extinct")
+        led = worlds.read_jsonl(os.path.join(root, "availability.jsonl"))
+        self.assertEqual([(e["first_zero_frame"], e["segment"]) for e in led], [(1500, "seg000")])
+        self.assertTrue(worlds.zero_supported(root, led[0]))
+        os.remove(os.path.join(root, "availability.jsonl"))     # the ledger lost; the world still extinct
+        s, msgs = supervisor(root, reg, ar)
+        s.startup()
+        led = worlds.read_jsonl(os.path.join(root, "availability.jsonl"))
+        self.assertEqual(worlds.first_zeros(led, wid, root), {"prey": 1500})
+        self.assertEqual(worlds.read_state(root, wid)["status"], "extinct", msgs)
+        p = os.path.join(worlds.wdir(root, wid), "seg000", "run.csv")
+        keep = rqlib.read_bytes(p)
+        cut = keep.index(b"\n1500,") + 1
+        wr(p, keep[:cut].decode())                              # the zero row's evidence lost
+        self.assertFalse(worlds.zero_supported(root, led[0]))
+        s, msgs = supervisor(root, reg, ar)
+        s.startup()
+        st = worlds.read_state(root, wid)
+        self.assertEqual(st["status"], "interrupted", msgs)
+        self.assertIn("no zero whose evidence", st["reopened"])
+
+    def test_prune_keeps_what_a_replay_needs(self):
+        """N2: --prune-local deletes only checkpoints of the currently verified chain up to the
+        active segment's last acceptance: a replay after a log loss keeps the old frames it rewrites."""
+        root, reg, ar, wid = self.world(total=6000, logs_to=5000, ckpts=(1000, 2000, 3000, 4000, 5000))
+        s, _ = supervisor(root, reg, ar)
+        s.startup()
+        recs = worlds.accept_records(root, wid)
+        self.assertEqual([r["frame"] for r in recs], [1000, 2000, 3000, 4000, 5000])
+        d = worlds.wdir(root, wid)
+        with open(os.path.join(d, "seg000", "run.csv"), "r+b") as f:
+            f.truncate(recs[0]["logs"]["run.csv"]["bytes"] + 5)    # the chain now ends at 1000
+        st = worlds.read_state(root, wid)
+        st["segments"].append({"name": "seg001", "start_frame": 1000, "resumed_from": "ckpt/end.1000.json",
+                               "resumed_accept": {"segment": "seg000", "frame": 1000, "sha256": recs[0]["sha256"]},
+                               "args": []})
+        worlds.write_state(root, wid, st)
+        os.makedirs(os.path.join(d, "seg001"))
+        wr(os.path.join(d, "seg001", "run.csv"), "step,population,predator_pop\n" + "".join(
+            f"{f},50,8\n" for f in range(1100, 2501, 100)))
+        wr(os.path.join(d, "seg001", "run.wiring.csv"), "step,PREY_FWD\n" + "".join(
+            f"{f},0.5\n" for f in range(100, 1501, 100)))
+        s, msgs = supervisor(root, reg, ar, prune_local=True)
+        s.startup()
+        s.archive_pass(wid, alive=False)
+        mine = [r["frame"] for r in worlds.accept_records(root, wid) if r["segment"] == "seg001"]
+        self.assertEqual(mine, [2000], msgs)
+        self.assertEqual(s.chain[wid], {1000, 2000})
+        left = sorted(worlds.local_ckpts(root, wid))
+        self.assertEqual(left, [1000, 2000, 3000, 4000, 5000])   # 3000-5000: the replay rewrites them
+
+    def test_segment_directory_durable_before_acceptance(self):
+        """N3: a segment's directory (its log entries) is fsync'd before its first acceptance."""
+        root, reg, ar, wid = self.world()
+        calls = []
+        real_dir, real_append = worlds.rqlib.fsync_dir, worlds._append_durable
+        worlds.rqlib.fsync_dir = lambda p: (calls.append(("dir", os.path.abspath(p))), real_dir(p))[1]
+        worlds._append_durable = lambda p, r: (calls.append(("append", os.path.basename(p))), real_append(p, r))[1]
+        try:
+            s, _ = supervisor(root, reg, ar)
+            s.startup()
+        finally:
+            worlds.rqlib.fsync_dir, worlds._append_durable = real_dir, real_append
+        seg = os.path.abspath(os.path.join(worlds.wdir(root, wid), "seg000"))
+        self.assertLess(calls.index(("dir", seg)), calls.index(("append", "accept.jsonl")))
+
+    def test_complete_invalid_checkpoints_fail_closed(self):
+        """N5: only a demonstrably interrupted write is torn (quarantined); a complete file that is
+        not a valid checkpoint, or holds another frame, is kept and fails the world."""
+        self.assertTrue(worlds.incomplete_write(b""))
+        self.assertTrue(worlds.incomplete_write(b'{"a": [1, 2'))
+        self.assertTrue(worlds.incomplete_write(b'{"a": "abc'))
+        self.assertTrue(worlds.incomplete_write('{"a": "é'.encode()[:-1]))
+        self.assertFalse(worlds.incomplete_write(b'{"a": 1 xx}'))
+        self.assertFalse(worlds.incomplete_write(b'{"a": 1}'))
+        flags = None
+        for name, data in (("wrong frame", "frame"), ("invalid", "invalid"), ("garbage", "garbage")):
+            sub = tempfile.mkdtemp(dir=self.tmp)
+            self.tmp, keep = sub, self.tmp
+            try:
+                root, reg, ar, wid = self.world(total=4000, ckpts=(1000,))
+            finally:
+                self.tmp = keep
+            flags = reg["worlds"][0]["flags"]
+            p = os.path.join(worlds.wdir(root, wid), "ckpt", "end.2000.json")
+            if data == "frame":
+                wr(p, ckpt.dumps(mk_cp(frame=1500, cfg_extra=cfg_for(flags))))
+            elif data == "invalid":
+                cp = mk_cp(frame=2000, cfg_extra=cfg_for(flags))
+                cp["predators"]["id"][1] = cp["predators"]["id"][0]           # duplicate predator ids
+                wr(p, ckpt.dumps(cp))
+            else:
+                wr(p, '{"format": 1 xx}')
+            s, msgs = supervisor(root, reg, ar)
+            s.startup()
+            st = worlds.read_state(root, wid)
+            self.assertEqual(st["status"], "failed", (name, msgs))
+            self.assertTrue(os.path.isfile(p), name)                 # the evidence kept
+            self.assertFalse(os.path.exists(os.path.join(worlds.wdir(root, wid), "quarantine.jsonl")), name)
 
     def test_non_serial_checkpoint_refused(self):
         """P2 (6): a checkpoint that declares a non-exact resume is never archived or accepted."""

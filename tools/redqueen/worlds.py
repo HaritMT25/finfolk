@@ -39,9 +39,12 @@ are refused. An unresolved "SELECTED_*" value or a placeholder arena is refused 
 --allow-placeholder; the registry then records the taint, and every later command refuses it
 unless it is given --allow-placeholder again (tests only).
 
-THE STUDY ROOT. The first f1 or launch binds STUDY to its registry: STUDY/study.json records the
-registry's sha256 and the archive root (default STUDY/archive); every later command refuses a
-different registry or archive root. The engine is pinned in STUDY/bin (its sha256) and probed
+THE STUDY ROOT. The first f1 or launch binds STUDY to its registry: STUDY/study.json records a
+study id, the registry's sha256 and the archive root (default STUDY/archive); every later command
+refuses a different registry or archive root. The archive root belongs to its study: it must be
+new or empty when the study is bound, and ARCHIVE/OWNER.json (written durably) names the study id;
+an archive root owned by another study, or not empty and unowned, is refused, so a new study can
+never publish into another's archive. The engine is pinned in STUDY/bin (its sha256) and probed
 once: it must be the serial build (its checkpoints say "resume is bit-exact").
 
 THE HISTORIES (launch: a resumable supervisor; one runner per root, flock). Every world runs as a
@@ -72,9 +75,17 @@ offsets and sha256 of the part since the previous acceptance). A resume starts f
 record whose log bytes still verify, in a segment whose own start is such a record (back to the
 founder segment); a lost or damaged log tail therefore sends the history back to the last point
 it fully covers, to be redone. A world is "done" only when the final frame is accepted; a world
-found at its final accepted frame is finalized without another segment. A local checkpoint that
-does not parse or is not at its frame (a torn write) is moved to ckpt/quarantine/ and recorded in
-quarantine.jsonl, and the world resumes from its last accepted checkpoint.
+found at its final accepted frame is finalized without another segment. A local checkpoint that is
+demonstrably an interrupted write (empty, or JSON cut short) is moved to ckpt/quarantine/ and
+recorded in quarantine.jsonl, and the world resumes from its last accepted checkpoint; a complete
+file that is not a valid checkpoint, or holds another frame, is kept as evidence and fails the world
+(closed). The dense logs' header and every row's width are checked at acceptance; a resumed
+segment's headers must equal those of the segment it resumed. A new segment's directory is made
+durable at creation and again (its log entries) before its first acceptance. A done or extinct
+world keeps its status at a restart only while its evidence holds: a done world's verified chain
+must reach the final frame, an extinct world needs a zero whose evidence holds and a latest
+acceptance that verifies, and its archive must rehash (see ARCHIVE); otherwise it is reopened and
+recovered from its verified evidence (damage inside a finalized archive fails it, exit 1).
 
 ARCHIVE. Every complete periodic checkpoint (and F1) is copied verified into ARCHIVE/worlds/<id>/
 (a temporary file, fsync'd, hashed, read-only 0444, renamed, directory fsync'd) and recorded in
@@ -84,14 +95,20 @@ missing, damaged or writable is repaired from verified local bytes (refused once
 When a world ends ("done" or "extinct"), its archive is audited and finalized: a FINALIZED marker
 (published atomically: the world, its status and archived frames), every file 0444, the directory
 0555, both fsync'd: the contract run.py --link-sources checks. Every start reconciles the
-finalization of the terminal worlds. --prune-local deletes local copies of accepted checkpoints
-except the two latest, after verifying their archived copies.
+finalization of the terminal worlds, rehashing every indexed object. Nothing is ever published,
+replaced or reopened inside a finalized directory, and a destination file without this study's
+record is never replaced. --prune-local deletes local copies of the checkpoints of the currently
+verified acceptance chain, up to the active segment's last acceptance (a replay keeps every later
+one), except the two latest, after verifying their archived copies.
 
 BIOLOGY. A guild that reaches zero in the main CSV (prey: population; predators of C and B:
 predator_pop) is recorded in STUDY/availability.jsonl (append-only, fsync'd: world, guild, first
-frame, the archived frames before it); a guild's first zero is the minimum over its records. A
-restart first scans every segment's main CSV, so a zero the previous supervisor did not see is
-recorded with its earliest frame ("recovered"). Extinction is absorbing (both floors are zero);
+frame, the archived frames before it) with its evidence: the segment's main-CSV prefix through the
+zero row is fsync'd first and the record binds its byte count and sha256. A guild's first zero is
+the minimum over the records whose evidence still holds; a record whose evidence is lost does not
+count (the replay finds the zero again). Every restart, terminal worlds included, scans every
+segment's main CSV, so a zero the previous supervisor did not see is recorded with its earliest
+frame ("recovered"). Extinction is absorbing (both floors are zero);
 --on-extinction stop (default) then ends the world as "extinct" without advancing it (its valid
 pre-extinction snapshots stay archived; nothing is refilled or replaced).
 
@@ -147,6 +164,8 @@ AVAIL_SCHEMA = "finfolk.redqueen.availability/1"
 ACCEPT_SCHEMA = "finfolk.redqueen.accept/1"
 BINARY_SCHEMA = "finfolk.redqueen.binary/1"
 QUARANTINE_SCHEMA = "finfolk.redqueen.quarantine/1"
+OWNER_SCHEMA = "finfolk.redqueen.archiveowner/1"
+OWNER = "OWNER.json"
 SERIAL = "serial build (resume is bit-exact)"
 TREATMENTS = ("C", "A", "B")
 C_FOUNDERS = 6
@@ -331,8 +350,13 @@ def world_flag_problems(f, t, c_founders=C_FOUNDERS):
             probs.append("A: needs a fixed positive --predators count")
         for k in ECONOMY_ONLY:
             if k in f and k not in FORBIDDEN:
-                probs.append(f"A: --{k} needs the economy")
+                probs.append(f"A: --{k} needs the economy (A's canonical form leaves every economy flag out, "
+                             "--predator-economy included; with the economy off they would be inert)")
     return probs, unresolved
+
+
+CANONICAL = ("the canonical form gives a shared setting the same explicit value in every treatment (best in "
+             "'common'); an omitted flag is not taken as equal to an explicit engine default")
 
 
 def _norm(v):
@@ -368,14 +392,15 @@ def arena_problems(arena, treatments_used, allow_placeholder=False, c_founders=C
         return out
     env = sorted({k for f in eff.values() for k in f if not k.startswith("predator")})
     for d in differ(env, list(eff)):
-        probs.append(f"the common environment differs across treatments: --{d}")
+        probs.append(f"the common environment differs across treatments: --{d} ({CANONICAL})")
     if "C" in eff and "B" in eff:
         for d in differ(SAME_CB, ["C", "B"]):
-            probs.append(f"C and B must share the selected economics and kinematics: --{d}")
+            probs.append(f"C and B must share the selected economics and kinematics: --{d} ({CANONICAL})")
     if "A" in eff:
         for o in [t for t in ("C", "B") if t in eff][:1]:
             for d in differ(SAME_KINEMATICS, ["A", o]):
-                probs.append(f"A must share the predator kinematics: --{d}")
+                probs.append(f"A must share the predator kinematics (cooldown included: v4 makes A's predator count "
+                             f"its pressure knob): --{d} ({CANONICAL})")
     if unresolved and not allow_placeholder:
         probs += [f"{u} is unresolved" for u in unresolved]
     return probs, unresolved
@@ -526,19 +551,66 @@ def load_registry(root, allow_placeholder=False):
     return reg, rqlib.sha256_bytes(raw)
 
 
-def bind_root(root, reg_sha, archive_root=None, create=False):
-    """The study root's binding (STUDY/study.json: the registry's sha256 and the archive root) ->
-    the archive root. create: bind an unbound root (refused if it already holds artifacts)."""
+def _archive_free(ar):
+    """Why the archive root `ar` cannot be claimed by a new study (None: it can: absent or empty)."""
+    if not os.path.exists(ar):
+        return None
+    if not os.path.isdir(ar):
+        return f"{ar} is not a directory"
+    entries = os.listdir(ar)
+    if not entries:
+        return None
+    owner = os.path.join(ar, OWNER)
+    if os.path.isfile(owner):
+        o = rqlib.read_json(owner)
+        return f"the archive root {ar} belongs to another study ({o.get('study_root')}, study {o.get('study_id')})"
+    return f"the archive root {ar} is not empty and has no owner ({', '.join(sorted(entries)[:3])})"
+
+
+def claim_archive(ar, study, write=True):
+    """The archive root's ownership marker (OWNER.json: the study's id, root and registry), written
+    durably (write); an existing one must name this study."""
+    owner = os.path.join(ar, OWNER)
+    if os.path.isfile(owner):
+        o = rqlib.read_json(owner)
+        if o.get("study_id") != study["study_id"]:
+            raise WorldsError(f"the archive root {ar} belongs to another study ({o.get('study_root')}, study "
+                              f"{o.get('study_id')}): every study needs its own archive root")
+        return
+    if not write:
+        raise WorldsError(f"the archive root {ar} carries no ownership marker of this study")
+    why = _archive_free(ar)
+    if why:
+        raise WorldsError(why)
+    mkdirs_durable(ar)
+    rec = {"schema": OWNER_SCHEMA, "study_id": study["study_id"], "study_root": study["study_root"],
+           "registry_sha256": study["registry_sha256"], "claimed_utc": rqlib.now_utc()}
+    tmp = owner + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(rqlib.canonical(rec))
+        f.flush()
+        os.fsync(f.fileno())
+    os.chmod(tmp, 0o444)
+    os.replace(tmp, owner)
+    rqlib.fsync_dir(ar)
+
+
+def bind_root(root, reg_sha, archive_root=None, create=False, readonly=False):
+    """The study root's binding (STUDY/study.json: a study id, the registry's sha256 and the archive
+    root, which the study owns: ARCHIVE/OWNER.json names the study) -> the archive root. create:
+    bind an unbound root (refused if it already holds artifacts, or if the archive root is another
+    study's or not empty)."""
     p = os.path.join(root, "study.json")
     if os.path.isfile(p):
         rec = rqlib.read_json(p)
-        if rec.get("schema") != STUDY_SCHEMA:
-            raise WorldsError(f"{p}: schema {rec.get('schema')!r}")
+        if rec.get("schema") != STUDY_SCHEMA or not rec.get("study_id"):
+            raise WorldsError(f"{p}: schema {rec.get('schema')!r}, study id {rec.get('study_id')!r}")
         if rec["registry_sha256"] != reg_sha:
             raise WorldsError(f"{root} is bound to the registry {rec['registry_sha256'][:12]}, but config/worlds.json "
                               f"is now {reg_sha[:12]}: a changed registry needs a new study root")
         if archive_root and os.path.abspath(archive_root) != rec["archive_root"]:
             raise WorldsError(f"{root} is bound to the archive root {rec['archive_root']}, not {archive_root}")
+        claim_archive(rec["archive_root"], rec, write=not readonly)   # (completes an interrupted claim)
         return rec["archive_root"]
     if not create:
         raise WorldsError(f"{root} is not bound to its registry yet (worlds.py f1 or launch binds it)")
@@ -546,9 +618,14 @@ def bind_root(root, reg_sha, archive_root=None, create=False):
     if present:
         raise WorldsError(f"{root} holds study artifacts ({', '.join(present)}) but no study.json: not binding it")
     ar = os.path.abspath(archive_root or os.path.join(root, "archive"))
-    rqlib.write_json_durable(p, {"schema": STUDY_SCHEMA, "registry_sha256": reg_sha, "archive_root": ar,
-                                 "created_utc": rqlib.now_utc(),
-                                 "tool_sha256": rqlib.sha256_file(os.path.abspath(__file__))})
+    why = _archive_free(ar)
+    if why:
+        raise WorldsError(why + ": a new study needs a new (or empty) archive root")
+    rec = {"schema": STUDY_SCHEMA, "study_id": str(uuid.uuid4()), "study_root": os.path.abspath(root),
+           "registry_sha256": reg_sha, "archive_root": ar, "created_utc": rqlib.now_utc(),
+           "tool_sha256": rqlib.sha256_file(os.path.abspath(__file__))}
+    rqlib.write_json_durable(p, rec)
+    claim_archive(ar, rec)
     return ar
 
 
@@ -569,7 +646,7 @@ def read_state(root, wid):
 
 
 def write_state(root, wid, st):
-    os.makedirs(wdir(root, wid), exist_ok=True)
+    mkdirs_durable(wdir(root, wid))
     rqlib.write_json_durable(os.path.join(wdir(root, wid), "state.json"), st)
 
 
@@ -617,11 +694,26 @@ def label_of(frame):
     return "F1" if frame == 1 else f"end.{frame}"
 
 
-def first_zeros(ledger, wid):
-    """{guild: the earliest recorded first-zero frame} of a world (the ledger's minimum)."""
+def zero_supported(root, e):
+    """An availability record's evidence still holds: the prefix of its segment's main CSV that
+    contains the zero row (its byte count and sha256, fsync'd before the record) is intact."""
+    seg, n, sha = e.get("segment"), e.get("csv_bytes"), e.get("csv_sha256")
+    if not (seg and n and sha):
+        return False
+    try:
+        with open(os.path.join(wdir(root, e["world"]), seg, "run.csv"), "rb") as f:
+            data = f.read(n)
+    except OSError:
+        return False
+    return len(data) == n and rqlib.sha256_bytes(data) == sha
+
+
+def first_zeros(ledger, wid, root=None):
+    """{guild: the earliest recorded first-zero frame} of a world (the ledger's minimum; with root,
+    over the records whose evidence still holds)."""
     out = {}
     for e in ledger:
-        if e["world"] == wid:
+        if e["world"] == wid and (root is None or zero_supported(root, e)):
             out[e["guild"]] = min(out.get(e["guild"], e["first_zero_frame"]), e["first_zero_frame"])
     return out
 
@@ -659,12 +751,14 @@ def _last_row(path, tail=65536):
 
 
 class Tail:
-    """New complete lines of a growing file since the last call (a torn last line waits)."""
+    """New complete lines of a growing file since the last call (a torn last line waits); `ends`
+    holds each returned row's end offset in the file (the prefix that supports it)."""
 
     def __init__(self, path):
-        self.path, self.offset, self.header = path, 0, None
+        self.path, self.offset, self.header, self.ends = path, 0, None, []
 
     def lines(self):
+        self.ends = []
         if not os.path.isfile(self.path):
             return []
         with open(self.path, "rb") as f:
@@ -673,12 +767,18 @@ class Tail:
         cut = data.rfind(b"\n")
         if cut < 0:
             return []
+        base = self.offset
         self.offset += cut + 1
-        out = data[:cut].decode("utf-8").split("\n")
-        if self.header is None and out:
-            self.header = next(csv.reader([out[0]]))
-            out = out[1:]
-        return [next(csv.reader([ln])) for ln in out if ln]
+        rows, pos = [], 0
+        for ln in data[:cut + 1].split(b"\n")[:-1]:
+            pos += len(ln) + 1
+            if self.header is None:
+                self.header = next(csv.reader([ln.decode("utf-8")]))
+                continue
+            if ln:
+                rows.append(next(csv.reader([ln.decode("utf-8")])))
+                self.ends.append(base + pos)
+        return rows
 
 
 def _contiguous_until(frames, start, step):
@@ -705,10 +805,20 @@ def _read_from(path, offset):
         return f.read()
 
 
+def _header(line):
+    """(columns, header sha256) of a log's header line; None if it is not one (its first column must
+    be step or frame, and it needs a second)."""
+    names = line.split(b",")
+    if len(names) < 2 or names[0].strip() not in (b"step", b"frame") or any(not n.strip() for n in names):
+        return None
+    return len(names), rqlib.sha256_bytes(line)
+
+
 def dense_cut(path, kind, start, frame, step, prev=None):
-    """The next accepted part of a dense log: from the end of `prev` (or the start of the file,
-    header included) through the row of `frame`, every `step` without a gap -> {"from", "bytes",
-    "sha256", "last_frame"}; None while the file does not reach `frame` (or has a gap)."""
+    """The next accepted part of a dense log: from the end of `prev` (or the start of the file, its
+    header included and checked) through the row of `frame`, every `step` without a gap, every row
+    as wide as the header -> {"from", "bytes", "sha256", "last_frame", "columns", "header_sha256"};
+    None while the file does not reach `frame` (or has a gap, a short or long row, a bad header)."""
     if not os.path.isfile(path):
         return None
     off = prev["bytes"] if prev else 0
@@ -719,20 +829,30 @@ def dense_cut(path, kind, start, frame, step, prev=None):
         nl = data.find(b"\n")
         if nl < 0:
             return None
+        h = _header(data[:nl])
+        if h is None:
+            return None
+        ncol, hsha = h
         pos = nl + 1
+    else:
+        ncol, hsha = prev["columns"], prev["header_sha256"]
     while last < frame:
         nl = data.find(b"\n", pos)
         if nl < 0:
             return None
+        parts = data[pos:nl].split(b",")
+        if len(parts) != ncol:
+            return None
         try:
-            v = int(data[pos:nl].split(b",", 1)[0])
+            v = int(parts[0])
         except ValueError:
             return None
         fr = start + v if kind == "steps" else v
         if fr != last + step:
             return None
         last, pos = fr, nl + 1
-    return {"from": off, "bytes": off + pos, "sha256": rqlib.sha256_bytes(data[:pos]), "last_frame": frame}
+    return {"from": off, "bytes": off + pos, "sha256": rqlib.sha256_bytes(data[:pos]), "last_frame": frame,
+            "columns": ncol, "header_sha256": hsha}
 
 
 def events_cut(path, frame, prev=None):
@@ -749,10 +869,13 @@ def events_cut(path, frame, prev=None):
         nl = data.find(b"\n")
         if nl < 0:
             return None
-        ncol, maxf = data[:nl].count(b",") + 1, -1
+        h = _header(data[:nl])
+        if h is None:
+            return None
+        (ncol, hsha), maxf = h, -1
         pos = nl + 1
     else:
-        ncol, maxf = prev["columns"], prev["max_frame"]
+        ncol, maxf, hsha = prev["columns"], prev["max_frame"], prev["header_sha256"]
     while True:
         nl = data.find(b"\n", pos)
         if nl < 0:
@@ -771,7 +894,7 @@ def events_cut(path, frame, prev=None):
         counts[ev] = counts.get(ev, 0) + 1
         pos = nl + 1
     return {"from": off, "bytes": off + pos, "sha256": rqlib.sha256_bytes(data[:pos]), "last_frame": frame,
-            "events": counts, "columns": ncol, "max_frame": maxf}
+            "events": counts, "columns": ncol, "max_frame": maxf, "header_sha256": hsha}
 
 
 def lineage_problems(events, start_cp, cp, start_frame):
@@ -855,8 +978,41 @@ def local_ckpts(root, wid):
     return out
 
 
+def mkdirs_durable(path):
+    """os.makedirs, then every directory it created is made durable (its parent fsync'd)."""
+    path = os.path.abspath(path)
+    missing = []
+    p = path
+    while not os.path.isdir(p):
+        missing.append(p)
+        p = os.path.dirname(p)
+    os.makedirs(path, exist_ok=True)
+    for d in reversed(missing):
+        rqlib.fsync_dir(os.path.dirname(d))
+
+
+def incomplete_write(raw):
+    """True if the bytes are demonstrably an interrupted write of a JSON document: empty, a UTF-8
+    sequence cut at the end, or JSON that fails only because its input ends. A file that parses,
+    or fails anywhere else, is complete (and, if not a valid checkpoint, corrupt: never torn)."""
+    if not raw.strip():
+        return True
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as e:
+        return e.start >= len(raw) - 4 and "unexpected end" in e.reason
+    try:
+        json.loads(text)
+        return False
+    except json.JSONDecodeError as e:
+        return e.pos >= len(text.rstrip()) or e.msg.startswith("Unterminated string")
+
+
 def _copy_verified(raw, dst, sha):
     d = os.path.dirname(dst)
+    if os.path.isfile(os.path.join(d, "FINALIZED")):
+        raise WorldsError(f"{d} is finalized: nothing is published into it")
+    mkdirs_durable(d)
     if not os.access(d, os.W_OK):
         os.chmod(d, 0o755)
     tmp = dst + f".tmp.{os.getpid()}"
@@ -907,17 +1063,25 @@ def ensure_archived(wid, rec, raw, log, verified=None):
 
 def archive_one(root, wid, archive_root, frame, src, log, extra=None, verified=None):
     """Verified copy of checkpoint `src` (at `frame`) into the archive -> (its record, the parsed
-    checkpoint). TornCheckpoint: it does not parse or is not at its frame; WorldsError: it is not
-    the serial build's, or its bytes differ from an earlier archived copy of the frame."""
+    checkpoint). TornCheckpoint: an interrupted write (incomplete_write); WorldsError (fail closed,
+    the file kept as evidence): a complete file that is not a valid checkpoint or not at its frame,
+    a checkpoint that is not the serial build's, bytes that differ from an earlier archived copy of
+    the frame, or a destination this study does not own (a finalized archive, a foreign file)."""
     raw = rqlib.read_bytes(src)
     sha = rqlib.sha256_bytes(raw)
     try:
         cp = ckpt.loads(raw.decode("utf-8"), src)
-        ckpt.validate(cp, src)
     except (ckpt.CheckpointError, UnicodeDecodeError, ValueError, KeyError, TypeError) as e:
-        raise TornCheckpoint(f"{src} is not a complete checkpoint ({str(e)[:120]})")
+        if incomplete_write(raw):
+            raise TornCheckpoint(f"{src} is an interrupted write ({str(e)[:120]})")
+        raise WorldsError(f"{src} is complete but not a checkpoint ({str(e)[:120]}): kept as evidence")
+    try:
+        ckpt.validate(cp, src)
+    except (ckpt.CheckpointError, KeyError, TypeError, ValueError) as e:
+        raise WorldsError(f"{src} is a complete but invalid checkpoint ({str(e)[:120]}): kept as evidence")
     if int(cp["world"]["frame"]) != frame:
-        raise TornCheckpoint(f"{src} is at frame {cp['world']['frame']}, not {frame}")
+        raise WorldsError(f"{src} is a complete checkpoint of frame {cp['world']['frame']}, not {frame}: "
+                          "kept as evidence")
     if cp.get("determinism") != SERIAL:
         raise WorldsError(f"{src} declares {cp.get('determinism')!r}: a history needs the serial build's exact resume")
     lab = label_of(frame)
@@ -929,10 +1093,16 @@ def archive_one(root, wid, archive_root, frame, src, log, extra=None, verified=N
         ensure_archived(wid, recs[lab], raw, log, verified)
         return recs[lab], cp
     ad = adir(archive_root, wid)
-    os.makedirs(ad, exist_ok=True)
     name = "F1.json" if frame == 1 else f"end.{frame}.json"
     dst = os.path.join(ad, name)
-    _copy_verified(raw, dst, sha)
+    if os.path.isfile(os.path.join(ad, "FINALIZED")):
+        raise WorldsError(f"{wid}: {name} has no record, but {ad} is finalized: nothing is published into it")
+    if os.path.exists(dst):
+        if rqlib.sha256_file(dst) != sha:
+            raise WorldsError(f"{dst} exists with other bytes and no record of this study: not replacing it")
+        # (this study's copy, published before a crash that lost its record)
+    else:
+        _copy_verified(raw, dst, sha)
     m = ckpt.meta(cp)
     rec = {"label": lab, "frame": frame, "sha256": sha, "bytes": len(raw), "path": os.path.abspath(dst),
            "prey": m["prey_alive"], "predators": m["predators"], "utc": rqlib.now_utc()}
@@ -949,9 +1119,11 @@ def finalize_archive(root, wid, archive_root, status, log=lambda m: None):
     """Audit and finalize a terminal world's archive (idempotent: it also completes or checks an
     earlier, interrupted finalization): every record's file present, its bytes (repaired from a
     verified local copy if need be) and 0444; the FINALIZED marker (world, status, frames)
-    published atomically and 0444; the directory 0555; both fsync'd."""
+    published atomically and 0444; the directory 0555; both fsync'd. An existing marker is checked
+    against the archive and every indexed object is rehashed (nothing inside a finalized directory
+    is ever replaced: damage there is an error)."""
     ad = adir(archive_root, wid)
-    os.makedirs(ad, exist_ok=True)
+    mkdirs_durable(ad)
     recs = archive_records(root, wid)
     want = {"world": wid, "status": status, "frames": sorted(r["frame"] for r in recs.values())}
     marker = os.path.join(ad, "FINALIZED")
@@ -964,9 +1136,10 @@ def finalize_archive(root, wid, archive_root, status, log=lambda m: None):
             raise WorldsError(f"{wid}: {marker} does not describe its archive ({ {k: have.get(k) for k in want} })")
         for r in recs.values():
             s = os.stat(r["path"]) if os.path.isfile(r["path"]) else None
-            if s is None or s.st_size != r["bytes"] or s.st_mode & 0o777 != 0o444:
+            if s is None or s.st_size != r["bytes"] or s.st_mode & 0o777 != 0o444 \
+                    or rqlib.sha256_file(r["path"]) != r["sha256"]:
                 raise WorldsError(f"{wid}: the finalized archive's {os.path.basename(r['path'])} is missing, "
-                                  "resized or writable")
+                                  "damaged or writable")
     else:
         if not os.access(ad, os.W_OK):
             os.chmod(ad, 0o755)
@@ -1063,6 +1236,23 @@ def resume_point(root, wid, st, treatment, good=None):
     return 0, None, None
 
 
+def verified_chain(st, good):
+    """The records of the chain that ends at the latest verified record: each segment's records up
+    to the frame the next segment resumed from (the last one's up to its end)."""
+    if not good:
+        return []
+    end = max(good.values(), key=lambda r: (r["frame"], _seg_index(r["segment"])))
+    segs = {s["name"]: s for s in st["segments"]}
+    out, seg, upto = [], end["segment"], end["frame"]
+    while True:
+        out += [r for (sg, f), r in good.items() if sg == seg and f <= upto]
+        s = segs[seg]
+        if s["start_frame"] == 0:
+            return sorted(out, key=lambda r: r["frame"])
+        ra = s["resumed_accept"]
+        seg, upto = ra["segment"], ra["frame"]
+
+
 def f1_bound(root, wid, exe_sha):
     return archive_records(root, wid).get("F1", {}).get("binary_sha256") == exe_sha
 
@@ -1096,20 +1286,33 @@ def record_verify(root, wid, rc, d, first, exe_sha):
 
 
 def scan_zeros(root, wid, st, treatment):
-    """{guild: the earliest frame at which it is 0 in any segment's main CSV}."""
+    """{guild: (the earliest frame at which it is 0 in any segment's main CSV, that segment, the
+    byte count of the CSV prefix through the row)}."""
     out = {}
     for s in st["segments"]:
-        hdr, rows = _rows(os.path.join(wdir(root, wid), s["name"], "run.csv"))
-        if not hdr:
+        p = os.path.join(wdir(root, wid), s["name"], "run.csv")
+        if not os.path.isfile(p):
             continue
-        for guild, col in GUILDS:
-            if (guild == "predators" and treatment == "A") or col not in hdr:
+        raw = rqlib.read_bytes(p)
+        lines = raw[: raw.rfind(b"\n") + 1].split(b"\n")[:-1]
+        if not lines:
+            continue
+        hdr = next(csv.reader([lines[0].decode("utf-8")]))
+        pos = len(lines[0]) + 1
+        found = {}
+        for ln in lines[1:]:
+            pos += len(ln) + 1
+            if not ln:
                 continue
-            i = hdr.index(col)
-            for r in rows:
-                if int(float(r[i])) == 0:
-                    out[guild] = min(out.get(guild, int(r[0])), int(r[0]))
-                    break
+            r = next(csv.reader([ln.decode("utf-8")]))
+            for guild, col in GUILDS:
+                if (guild == "predators" and treatment == "A") or col not in hdr or guild in found:
+                    continue
+                if int(float(r[hdr.index(col)])) == 0:
+                    found[guild] = (int(r[0]), s["name"], pos)
+        for g, v in found.items():
+            if g not in out or v[0] < out[g][0]:
+                out[g] = v
     return out
 
 
@@ -1196,7 +1399,9 @@ class Supervisor:
         self.verified = {}    # archived path -> (mtime_ns, size) once its bytes were verified
         self.start_cps = {}   # (wid, segment) -> the checkpoint the segment started from
         self.warned = set()
-        self.zeros = {}       # wid -> {guild: first-zero frame} (the ledger's minimum)
+        self.zeros = {}       # wid -> {guild: first-zero frame} (the minimum over the supported records)
+        self.chain = {}       # wid -> frames of the currently verified acceptance chain (pruning may use)
+        self.chain_active = {}  # wid -> the active segment's last accepted frame (or its start)
 
     # ---------------------------------------------------------------- state
     def state(self, wid):
@@ -1224,14 +1429,22 @@ class Supervisor:
             self.log(msg)
 
     # ---------------------------------------------------------------- biology
-    def note_zero(self, wid, guild, frame, recovered=False):
+    def note_zero(self, wid, guild, frame, seg, csv_bytes, recovered=False):
+        """Record a guild's first zero, bound to its evidence: the segment's main-CSV prefix through
+        the zero row is fsync'd, then the record (its byte count and sha256) is appended durably. Only
+        a record whose evidence still holds counts (zero_supported: a stop is irreversible only then)."""
         z = self.zeros.setdefault(wid, {})
         if guild in z and z[guild] <= frame:
             return
         w = self.worlds[wid]
+        p = os.path.join(wdir(self.root, wid), seg, "run.csv")
+        rqlib.fsync_file(p)
+        with open(p, "rb") as f:
+            data = f.read(csv_bytes)
         arecs = archive_records(self.root, wid)
         rec = {"schema": AVAIL_SCHEMA, "world": wid, "uuid": w["uuid"], "treatment": w["treatment"], "guild": guild,
-               "first_zero_frame": frame, "detected_utc": rqlib.now_utc(),
+               "first_zero_frame": frame, "detected_utc": rqlib.now_utc(), "segment": seg,
+               "csv_bytes": len(data), "csv_sha256": rqlib.sha256_bytes(data),
                "archived_frames_before": sorted(x["frame"] for x in arecs.values() if x["frame"] < frame)}
         if recovered:
             rec.update(recovered=True, supersedes=z.get(guild))
@@ -1241,8 +1454,8 @@ class Supervisor:
                  + (", recovered from an earlier segment" if recovered else "") + ")")
 
     def recover_zeros(self, wid):
-        for guild, f in scan_zeros(self.root, wid, self.state(wid), self.worlds[wid]["treatment"]).items():
-            self.note_zero(wid, guild, f, recovered=True)
+        for guild, (f, seg, n) in scan_zeros(self.root, wid, self.state(wid), self.worlds[wid]["treatment"]).items():
+            self.note_zero(wid, guild, f, seg, n, recovered=True)
 
     def zero_reason(self, wid):
         z = self.zeros.get(wid) or {}
@@ -1251,8 +1464,9 @@ class Supervisor:
     def watch(self, wid):
         """New main-CSV rows of a running segment: the frame reached; a guild at zero -> (guild, frame)."""
         t = self.tails[wid]
+        seg = self.running[wid][1] if wid in self.running else self.state(wid)["segments"][-1]["name"]
         found = None
-        for r in t.lines():
+        for r, end in zip(t.lines(), t.ends):
             fr = int(r[0])
             self.last_frame[wid] = fr
             row = dict(zip(t.header, r))
@@ -1260,14 +1474,14 @@ class Supervisor:
                 if guild == "predators" and self.worlds[wid]["treatment"] == "A":
                     continue
                 if int(float(row[col])) == 0:
-                    self.note_zero(wid, guild, fr)
+                    self.note_zero(wid, guild, fr, seg, end)
                     found = found or (guild, fr)
         return found
 
     # ---------------------------------------------------------------- archive and acceptance
     def quarantine(self, wid, frame, path, reason):
         qd = os.path.join(wdir(self.root, wid), "ckpt", "quarantine")
-        os.makedirs(qd, exist_ok=True)
+        mkdirs_durable(qd)
         n = 1
         while os.path.exists(os.path.join(qd, f"{os.path.basename(path)}.{n}")):
             n += 1
@@ -1301,14 +1515,17 @@ class Supervisor:
                 self.quarantine(wid, f, loc[f], str(e))
                 continue
             self.seen[(wid, f)] = key
-        if self.a.prune_local:
-            acc = sorted({r["frame"] for r in accept_records(self.root, wid)})
-            keep = set(acc[-2:])
+        if self.a.prune_local and wid in self.chain:
+            # only checkpoints of the currently verified chain, at or before the active segment's last
+            # acceptance (a replay still needs every later one), but its two latest
+            chain = sorted(self.chain[wid])
+            done_upto = self.chain_active.get(wid, -1)
+            keep = set(chain[-2:])
             arecs = archive_records(self.root, wid)
             for f, p in local_ckpts(self.root, wid).items():
                 r = arecs.get(label_of(f))
-                if f in acc and f not in keep and r and rqlib.sha256_file(r["path"]) == r["sha256"] \
-                        and rqlib.sha256_file(p) == r["sha256"]:
+                if f in self.chain[wid] and f <= done_upto and f not in keep and r \
+                        and rqlib.sha256_file(r["path"]) == r["sha256"] and rqlib.sha256_file(p) == r["sha256"]:
                     os.remove(p)
                     self.seen.pop((wid, f), None)
 
@@ -1367,13 +1584,64 @@ class Supervisor:
                     self.warn_once((wid, name, F, "lineage"), f"{wid}: {name}'s lineage log is incomplete at frame "
                                                               f"{F} ({'; '.join(probs)}): end.{F} is not accepted")
                     return
+            if prev is None and seg.get("resumed_accept"):     # a resumed segment's logs: the same headers
+                ra = seg["resumed_accept"]
+                base = next((r for r in accept_records(self.root, wid)
+                             if r["segment"] == ra["segment"] and r["frame"] == ra["frame"]), None)
+                bad = [n for n in logs if base and base["logs"].get(n, {}).get("header_sha256")
+                       not in (None, logs[n]["header_sha256"])]
+                if bad:
+                    self.warn_once((wid, name, "header"), f"{wid}: {name}'s {bad} headers differ from the "
+                                                          f"segment it resumed: not accepted")
+                    return
             for lname in logs:
                 rqlib.fsync_file(os.path.join(d, lname))
+            if prev is None:                  # the logs' directory entries, before their first acceptance
+                rqlib.fsync_dir(d)
             rec = {"schema": ACCEPT_SCHEMA, "world": wid, "segment": name, "start_frame": s0, "frame": F,
                    "label": label_of(F), "sha256": arec["sha256"], "binary_sha256": self.exe_sha, "logs": logs,
                    "utc": rqlib.now_utc()}
             _append_durable(os.path.join(wdir(self.root, wid), "accept.jsonl"), rec)
+            self.chain.setdefault(wid, set()).add(F)
+            self.chain_active[wid] = F
             prev, last = rec, F
+
+    def terminal_problems(self, wid, st):
+        """Why a done / extinct world's status no longer stands (None if it does): a done world's
+        verified acceptance chain must reach the final frame; an extinct world needs a zero whose
+        evidence still holds, and its latest acceptance record must still verify. (The archive is
+        audited next, by finalize_archive: every object rehashed.)"""
+        good = verified_records(self.root, wid, st, self.worlds[wid]["treatment"])
+        frame = resume_point(self.root, wid, st, self.worlds[wid]["treatment"], good)[0]
+        if st["status"] == "done" and frame != self.T:
+            return f"its verified logs end at frame {frame}, not {self.T}"
+        if st["status"] == "extinct":
+            if not self.zero_reason(wid):
+                return "no zero whose evidence still holds"
+            names = {s["name"] for s in st["segments"]}
+            recs = [r for r in accept_records(self.root, wid) if r["segment"] in names]
+            if recs:
+                last = max(recs, key=lambda r: (r["frame"], _seg_index(r["segment"])))
+                if (last["segment"], last["frame"]) not in good:
+                    return f"its acceptance record of frame {last['frame']} no longer verifies"
+        return None
+
+    def refresh_chain(self, wid, st=None):
+        """The currently verified chain's frames, and how far the active (last) segment has accepted
+        (its start if it accepted nothing, provided it resumed from the chain; else nothing to prune)."""
+        st = st or self.state(wid)
+        good = verified_records(self.root, wid, st, self.worlds[wid]["treatment"])
+        recs = verified_chain(st, good)
+        self.chain[wid] = {r["frame"] for r in recs}
+        last = st["segments"][-1] if st["segments"] else None
+        mine = [r["frame"] for r in recs if last and r["segment"] == last["name"]]
+        ra = (last or {}).get("resumed_accept")
+        if mine:
+            self.chain_active[wid] = max(mine)
+        elif last and (last["start_frame"] == 0 or (ra and (ra["segment"], ra["frame"]) in good)):
+            self.chain_active[wid] = last["start_frame"]
+        else:
+            self.chain_active[wid] = -1
 
     # ---------------------------------------------------------------- what next
     def next_action(self, wid):
@@ -1395,8 +1663,8 @@ class Supervisor:
         d = wdir(self.root, wid)
         if os.path.exists(os.path.join(d, seg)):      # (a segment directory the state never recorded)
             os.rename(os.path.join(d, seg), os.path.join(d, f"{seg}.orphan.{time.time_ns()}"))
-        os.makedirs(os.path.join(d, seg))
-        os.makedirs(os.path.join(d, "ckpt"), exist_ok=True)
+        mkdirs_durable(os.path.join(d, seg))
+        mkdirs_durable(os.path.join(d, "ckpt"))
         if cpath and os.path.abspath(cpath).startswith(d + os.sep):
             cpath = os.path.relpath(os.path.abspath(cpath), d)
         args = segment_args(w, self.sched, seg, start, cpath)
@@ -1406,6 +1674,7 @@ class Supervisor:
                                "started_utc": rqlib.now_utc(), "args": args})
         st["status"] = "running"
         write_state(self.root, wid, st)
+        self.refresh_chain(wid, st)
         p = self._popen(args, d, os.path.join(d, seg))
         self.running[wid] = (p, seg, "segment")
         self.tails[wid] = Tail(os.path.join(d, seg, "run.csv"))
@@ -1484,9 +1753,10 @@ class Supervisor:
         """Repair torn ledger tails, reconcile terminal worlds' finalization, and recover what the
         previous supervisor left: acceptances, quarantines, zeros, worlds already at an end."""
         a = self.a
-        for e in read_jsonl(self.avail_p, repair=True):
-            z = self.zeros.setdefault(e["world"], {})
-            z[e["guild"]] = min(z.get(e["guild"], e["first_zero_frame"]), e["first_zero_frame"])
+        for e in read_jsonl(self.avail_p, repair=True):     # (only records whose evidence still holds)
+            if e["world"] in self.worlds and zero_supported(self.root, e):
+                z = self.zeros.setdefault(e["world"], {})
+                z[e["guild"]] = min(z.get(e["guild"], e["first_zero_frame"]), e["first_zero_frame"])
         missing_f1 = []
         for wid, w in self.worlds.items():
             archive_records(self.root, wid, repair=True)
@@ -1500,12 +1770,20 @@ class Supervisor:
                 st["status"] = "interrupted"
                 write_state(self.root, wid, st)
             if st["status"] in ("done", "extinct"):
+                # a terminal world keeps its status only while its evidence holds: its archive (every
+                # object rehashed), the acceptance chain through its endpoint, its earliest zero
                 try:
-                    finalize_archive(self.root, wid, self.archive_root, st["status"], self.log)
+                    self.recover_zeros(wid)
+                    why = self.terminal_problems(wid, st)
+                    if not why:
+                        finalize_archive(self.root, wid, self.archive_root, st["status"], self.log)
+                        continue
                 except (WorldsError, OSError) as e:
-                    self.set_status(wid, "failed", end_reason=f"finalizing its archive: {e}")
-                    self.log(f"FAILED {wid}: finalizing its archive: {e}")
-                continue
+                    self.set_status(wid, "failed", end_reason=f"its terminal evidence: {e}")
+                    self.log(f"FAILED {wid}: its terminal evidence: {e}")
+                    continue
+                self.log(f"{wid}: REOPENED ({st['status']}, but {why}): recovering from its verified evidence")
+                st = self.set_status(wid, "interrupted", reopened=why, failures=0)
             if st["status"] not in ("pending", "interrupted"):
                 continue
             if not f1_bound(self.root, wid, self.exe_sha):
@@ -1515,6 +1793,7 @@ class Supervisor:
                     self.archive_pass(wid, alive=False)
                     self.accept_pass(wid, alive=False)
                     self.recover_zeros(wid)
+                    self.refresh_chain(wid)
                     kind, info = self.next_action(wid)
                 except (WorldsError, ckpt.CheckpointError, OSError, ValueError) as e:
                     self.end_world(wid, "failed", str(e))
@@ -1805,7 +2084,7 @@ def design_block(root, reg, archive_root):
     led = read_jsonl(os.path.join(root, "availability.jsonl"))
     for w in reg["worlds"]:
         ad = adir(archive_root, w["id"])
-        zeros = first_zeros(led, w["id"])
+        zeros = first_zeros(led, w["id"], root)
         st = read_state(root, w["id"])
         ws[w["id"]] = {"uuid": w["uuid"], "treatment": w["treatment"], "block": w["block"], "status": st["status"],
                        "pattern": os.path.join(ad, "end.{frame}.json"), "paths": {"F1": os.path.join(ad, "F1.json")},
@@ -1820,7 +2099,7 @@ def status(root):
     reg, sha = load_registry(root, allow_placeholder=True)
     out = {"root": root, "worlds": {}}
     try:
-        out["archive_root"] = bind_root(root, sha)
+        out["archive_root"] = bind_root(root, sha, readonly=True)
     except WorldsError as e:
         out["binding"] = str(e)
     for w in reg["worlds"]:
@@ -1902,12 +2181,12 @@ def main(argv=None):
             return status(root)
         if a.cmd == "design-block":
             reg, sha = load_registry(root, allow_placeholder=True)
-            blk = design_block(root, reg, bind_root(root, sha, a.archive_root))
+            blk = design_block(root, reg, bind_root(root, sha, a.archive_root, readonly=True))
             rqlib.write_durable(a.out, rqlib.canonical(blk))
             return 0
         if a.cmd == "stitch":
             reg, sha = load_registry(root, a.allow_placeholder)
-            bind_root(root, sha, a.archive_root)
+            bind_root(root, sha, a.archive_root, readonly=True)
             man = stitch(root, a.world, reg, a.partial)
             print(json.dumps(man["files"], indent=1, sort_keys=True))
             return 0
