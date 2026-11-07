@@ -7,6 +7,7 @@ The end-to-end tests against the real engine are tests/redqueen_tooling.sh (ctes
 """
 from __future__ import annotations
 
+import contextlib
 import copy
 import io
 import json
@@ -401,27 +402,34 @@ class TestStore(unittest.TestCase):
         shutil.rmtree(self.root)
 
     def mk_cell(self, cid, group="g1", csha="c" * 64, payload="x", transplant=None, sharing=True, role="training",
-                done_role=None, done_tg=None):
-        """A finished cell; transplant (predator key, sha): a /2 bundle with its sharing record."""
+                done_role=None, done_tg=None, done_extra=None):
+        """A finished cell (a /1 bundle; transplant (predator key, sha): a /2 bundle with its sharing
+        record) whose done.json summaries are the bundle's, as run.py writes them (done_*: altered)."""
         d = os.path.join(self.root, store.WORK, cid)
         os.makedirs(d)
-        bundle = {"id": cid, "payload": payload}
-        done = {"schema": run.DONE_SCHEMA, "id": cid, "kind": "assay", "row_sha256": "r" * 64,
-                "common_group": group, "common_sha256": csha}
+        cell_ = {"id": cid, "schema": run.PLAN_SCHEMA, "kind": "assay", "prey_policy": "common", "assay": "frozen",
+                 "k": 6, "groups": {"common": group, "reseed": f"rs-{cid}"}, "seeds": {"reseed": 5}}
+        bundle = {"schema": "finfolk.redqueen.bundle/1", "payload": payload, "cell": cell_,
+                  "files": {"common.json": csha}, "arena_prey_config_sha256": "p" * 64}
         if transplant:
-            cell_ = {"groups": {"transplant": transplant[0]}, "seeds": {"transplant": 7}, "kind": "assay", "k": 6,
-                     "role": role, "families": ["f"]}
-            bundle.update(schema=store.BUNDLE_V2, cell=cell_)
+            cell_.update(schema=plan.PLAN_SCHEMA_V2, role=role, families=["f"])
+            cell_["groups"]["transplant"] = transplant[0]
+            cell_["seeds"]["transplant"] = 7
+            bundle["schema"] = store.BUNDLE_V2
             if sharing:
                 bundle["sharing"] = {"schema": store.SHARING_SCHEMA, "keys": cell_["groups"], "seeds": cell_["seeds"],
-                                     "realized": {"transplant_realized_sha256": transplant[1]}}
+                                     "realized": {"common_sha256": csha, "transplant_realized_sha256": transplant[1]}}
+        done = dict(store.summary_of(bundle), schema=run.DONE_SCHEMA, id=cid)
+        if transplant:
             done.update(transplant_group=done_tg or f"{transplant[0]}|k6", transplant_realized_sha256=transplant[1],
                         role=done_role or role, families=["f"])
+        done.update(done_extra or {})
         b = rqlib.canonical(bundle)
         wr(os.path.join(d, "bundle.json"), b)
         done["bundle_sha256"] = rqlib.sha256_bytes(b)
         rqlib.write_json_durable(os.path.join(d, "done.json"), done)
         wr(os.path.join(d, "end.json"), "big")
+        return b
 
     def test_transplant_groups(self):
         """Design v4 §3.5: one transplant group (a predator snapshot x replicate x K) realizes one donor
@@ -454,7 +462,77 @@ class TestStore(unittest.TestCase):
         self.assertEqual(store.pack(self.root, log=lambda m: None)[1], 1)
         _, cells = store.load_index(self.root)
         self.assertEqual(cells["ok"][1]["role"], "training")
-        self.assertEqual(store.completion_problems({}, {"id": "legacy"}), [])        # /1 stays as it was
+        b1 = json.loads(self.mk_cell("v1"))                                       # a consistent /1 completion
+        self.assertEqual(store.completion_problems(rqlib.read_json(os.path.join(self.root, store.WORK, "v1",
+                                                                                "done.json")), b1), [])
+
+    # ---------------------------------------------------------------- review of d4dc4b7
+    def test_altered_summaries_refused(self):
+        """Review of d4dc4b7, P2 1: every done.json summary is checked against the bundle at packing:
+        a common checkpoint hash changed to the one already indexed for its group (hiding another
+        bundled common checkpoint), a pair group, prey settings, kind, row hash: each refused."""
+        self.mk_cell("a0", group="g1", csha="a" * 64)
+        store.pack(self.root, log=lambda m: None)
+        for cid, extra, field in (("x1", {"common_sha256": "a" * 64}, "common_sha256"),
+                                  ("x2", {"pair_group": "rs-a0|common|frozen"}, "pair_group"),
+                                  ("x3", {"prey_config_sha256": "q" * 64}, "prey_config_sha256"),
+                                  ("x4", {"kind": "nopred"}, "kind"),
+                                  ("x5", {"row_sha256": "r" * 64}, "row_sha256")):
+            self.mk_cell(cid, group="g1", csha="b" * 64, done_extra=extra)    # its bundle built "b..."
+            with self.assertRaisesRegex(store.StoreError, field):
+                store.pack(self.root, ids=[cid], log=lambda m: None)
+            self.assertTrue(os.path.exists(os.path.join(self.root, store.WORK, cid, "bundle.json")))
+            shutil.rmtree(os.path.join(self.root, store.WORK, cid))
+        # the /2 sharing record's realized common checkpoint must be the bundle's too
+        d = os.path.join(self.root, store.WORK, "x6")
+        self.mk_cell("x6", group="g6", csha="6" * 64, transplant=("P.w01.t5|r00", "d" * 64))
+        b = json.loads(rqlib.read_bytes(os.path.join(d, "bundle.json")))
+        b["sharing"]["realized"]["common_sha256"] = "7" * 64
+        self.assertTrue(any("realized common" in x for x in store.completion_problems(
+            rqlib.read_json(os.path.join(d, "done.json")), b)))
+
+    def legacy_root(self):
+        """A root holding a /2 completion packed before 03a608b: no sharing record in its bundle, no
+        bundle schema or transplant summary in its index entry."""
+        self.mk_cell("old", group="g1", transplant=("P.w01.t5|r00", "d" * 64), sharing=False)
+        real = store.completion_problems
+        store.completion_problems = lambda done, bundle: []
+        try:
+            store.pack(self.root, log=lambda m: None)
+        finally:
+            store.completion_problems = real
+        ip = os.path.join(self.root, store.INDEX)
+        recs = [json.loads(ln) for ln in rqlib.read_text(ip).splitlines() if ln.strip()]
+        for r in recs:
+            for e in r["cells"].values():
+                for k in ("bundle_schema", "transplant_group", "transplant_realized_sha256", "role"):
+                    e.pop(k, None)
+        rqlib.write_durable(ip, b"".join(rqlib.canonical(r) for r in recs))
+
+    def test_legacy_packed_cell_refuses_extension(self):
+        """Review of d4dc4b7, P2 1: a root holding a legacy /2 completion (packed without sharing
+        records) is refused whatever plan extends it: a disjoint cell is not packed next to it, and
+        the runner refuses the root at its start (before any plan row is looked at)."""
+        self.legacy_root()
+        probs = store.index_problems(self.root)
+        self.assertTrue(any("old" in x and "sharing record" in x for x in probs), probs)
+        self.mk_cell("new", group="g2", csha="b" * 64, transplant=("P.w02.t5|r00", "f" * 64))   # disjoint
+        with self.assertRaisesRegex(store.StoreError, "cannot be extended"):
+            store.pack(self.root, log=lambda m: None)
+        self.assertTrue(os.path.exists(os.path.join(self.root, store.WORK, "new", "bundle.json")))
+        p = os.path.join(self.root, "disjoint.jsonl")
+        wr(p, "")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = run.main(["--root", self.root, "--plan", p, "--binary", "/nonexistent/evo_boids"])
+        self.assertEqual(rc, 2, err.getvalue())
+        self.assertIn("rerun the study in a new root", err.getvalue())
+        # an index entry that names a group without its realized draw (or a /2 assay without either)
+        rec = {"chunk": "x"}
+        for e in ({"transplant_group": "g|k6", "transplant_realized_sha256": None},
+                  {"bundle_schema": store.BUNDLE_V2, "kind": "assay", "transplant_group": None}):
+            with self.assertRaisesRegex(store.StoreError, "without its group or realized draw"):
+                store.transplant_groups({"c": (rec, e)})
 
     def test_objects(self):
         sha = store.put_bytes(self.root, b'{"a":1}', compress=True)
@@ -670,7 +748,7 @@ class TestStore(unittest.TestCase):
         self.assertTrue(os.path.exists(os.path.join(self.root, store.WORK, "c3")))
         recs, cells = store.load_index(self.root)
         self.assertEqual(sorted(cells), ["c0", "c1", "c2"])
-        self.assertEqual(json.loads(store.read_member(self.root, "c1", cells=cells)), {"id": "c1", "payload": "x"})
+        self.assertEqual(json.loads(store.read_member(self.root, "c1", cells=cells))["cell"]["id"], "c1")
         self.assertEqual(store.verify_all(self.root), [])
         # an orphan chunk (crash after the rename, before the index line) and a truncated index line
         name2, _ = store.pack(self.root, ids=["c3"], log=lambda m: None)
@@ -686,9 +764,9 @@ class TestStore(unittest.TestCase):
         self.assertNotIn("c3", cells)
         self.assertTrue(rqlib.read_bytes(ip).endswith(b"\n"))
         # a packed cell's leftover directory is deleted at recover (after its bundle is checked)
+        c0 = store.read_member(self.root, "c0")
         os.makedirs(os.path.join(self.root, store.WORK, "c0"))
-        wr(os.path.join(self.root, store.WORK, "c0", "bundle.json"),
-            rqlib.canonical({"id": "c0", "payload": "x"}))
+        wr(os.path.join(self.root, store.WORK, "c0", "bundle.json"), c0)
         self.assertEqual(store.recover(self.root, log=lambda m: None)[1], [])
         self.assertFalse(os.path.exists(os.path.join(self.root, store.WORK, "c0")))
         # the rest packs; a common group with two different checkpoints is refused, nothing deleted
@@ -1135,6 +1213,12 @@ class TestV3Common(unittest.TestCase):
         pooled = sorted([float(j) for j in range(6)] + [float(10 + j) for j in range(6)])
         self.assertEqual(ref["ages"], [pooled[int((i + 0.5) / 4 * 12)] for i in range(4)])
         self.assertEqual((ref["n"], ref["pooled"], ref["max_age"]), (4, 12, 120.0))
+        # (review of d4dc4b7, P3) at an exact CDF jump ((i + 0.5) M / N an integer) the UPPER order
+        # statistic: M = 4 pooled ages, N = 2 -> ranks 1 and 3 (the lower convention would give 0, 2)
+        one = mk_cp(n_prey=4, seed=5)
+        one["creatures"]["age"] = [0.0, 10.0, 20.0, 30.0]
+        one["config"]["maxAge"] = 120.0
+        self.assertEqual(common.reference_ages([one], 2)["ages"], [10.0, 30.0])
         common.load_age_reference(ref)
         bad = dict(ref, ages=list(reversed(ref["ages"])))
         with self.assertRaises(common.CommonError):
@@ -1284,6 +1368,32 @@ class TestPlanV2(unittest.TestCase):
         self.assertEqual(plan.main([d, "--pending", "--out", os.path.join(self.tmp, "x.jsonl"), "--joint", p2]), 2)
         self.assertEqual(plan.main([d, "--pending", "--out", os.path.join(self.tmp, "x.jsonl"), "--joint", p1]), 0)
 
+    def test_joint_is_one_seed_universe(self):
+        """Review of d4dc4b7, new P2: repeated --joint plans and the generated rows are ONE seed
+        universe: an external-file-versus-external-file collision (production 42, audit 42) is refused
+        although neither file collides with the generated plan alone."""
+        new, _, _ = plan.expand_v2(design2(self.tmp, [E("random", "training", "A", "F1", "random")]), pending=True)
+        prod, _, _ = plan.expand_v2(design2(self.tmp, [E("cross", "training", "A", "T2", "B", "T2")]), pending=True)
+        aud, _, _ = plan.expand_v2(design2(self.tmp, [E("audit", "audit", "B", "T2", "A", "T2")]), pending=True)
+        for r in prod + aud:                         # one reseed group of each file gets the seed 42
+            if r["groups"]["reseed"].endswith("|r00"):
+                r["seeds"]["reseed"] = 42
+        self.assertEqual(plan.joint_seed_problems(new, prod), [])
+        self.assertEqual(plan.joint_seed_problems(new, aud), [])
+        p1, p2 = os.path.join(self.tmp, "prod.jsonl"), os.path.join(self.tmp, "aud.jsonl")
+        plan.write_plan(prod, p1)
+        plan.write_plan(aud, p2)
+        d = os.path.join(self.tmp, "d.json")
+        wr(d, json.dumps(design2(self.tmp, [E("random", "training", "A", "F1", "random")])))
+        out = os.path.join(self.tmp, "x.jsonl")
+        for files in ([p1], [p2]):
+            self.assertEqual(plan.main([d, "--pending", "--out", out] + [x for f in files for x in ("--joint", f)]), 0)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = plan.main([d, "--pending", "--out", out, "--joint", p1, "--joint", p2])
+        self.assertEqual(rc, 2)
+        self.assertIn("reseed seed 42 is shared by groups", err.getvalue())
+
     def test_canonical_pairs_and_condition_roles(self):
         """P2 4: two labels of one snapshot merge into one pair (aliases recorded); one endpoint pair
         keeps one role across condition versions, but an explicit support exception."""
@@ -1334,10 +1444,17 @@ class TestPlanV2(unittest.TestCase):
         self.assertEqual(plan.main([d, "--pending", "--out", pend, "--long-manifest", man]), 0)
         self.assertEqual(rqlib.read_json(man)["plan_sha256"], rqlib.sha256_file(pend))
         before = rqlib.read_bytes(man)
-        wr(d, json.dumps(design2(self.tmp, self.edges[:-1])))              # a changed design
-        self.assertEqual(plan.main([d, "--against", pend, "--out", os.path.join(self.tmp, "f.jsonl"),
-                                    "--long-manifest", man]), 2)
+        for name, frame in (("A.F1", 1), ("A.2000", 2000), ("B.F1", 1), ("B.2000", 2000), ("T0", 7)):
+            wr(os.path.join(self.tmp, name + ".json"), ckpt.dumps(mk_cp(n_prey=8, frame=frame)))
+        wr(os.path.join(self.tmp, "ages.json"), rqlib.canonical(common.reference_ages([mk_cp(n_prey=8, seed=9)], 4)))
+        wr(d, json.dumps(design2(self.tmp, self.edges[:-1])))              # a changed design (final inputs exist)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = plan.main([d, "--against", pend, "--out", os.path.join(self.tmp, "f.jsonl"), "--long-manifest", man])
+        self.assertEqual(rc, 2)
+        self.assertIn(f"not the registered pending plan {pend}", err.getvalue())   # refused AT --against
         self.assertEqual(rqlib.read_bytes(man), before)                     # untouched by the refused plan
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "f.jsonl")))
         self.assertEqual(plan.snapshot_uuid("00000000-0000-4000-8000-000000000001", 1000000),
                          "be3bbb37-f696-572c-b70c-5afcfaa9686d")
 
@@ -1357,6 +1474,12 @@ class TestPlanV2(unittest.TestCase):
         wr(os.path.join(self.tmp, "ages.json"), rqlib.canonical(common.reference_ages([src], 5)))
         with self.assertRaisesRegex(plan.DesignError, "reference ages"):
             plan.expand_v2(d)
+        # (review of d4dc4b7, P3) final planning checks the reference's maxAge against the template's
+        wr(os.path.join(self.tmp, "ages.json"),
+           rqlib.canonical(common.reference_ages([mk_cp(n_prey=8, seed=9, cfg_extra={"maxAge": 60.0})], 4)))
+        with self.assertRaisesRegex(plan.DesignError, "maxAge 60.0"):
+            plan.expand_v2(d)
+        wr(os.path.join(self.tmp, "ages.json"), rqlib.canonical(ref))
         p = os.path.join(self.tmp, "plan.jsonl")
         plan.write_plan(final, p)
         self.assertEqual(len(run.load_plan(p)), len(final))      # the runner reads plan/2 rows
@@ -1365,6 +1488,17 @@ class TestPlanV2(unittest.TestCase):
         plan.write_plan(bad, p)
         with self.assertRaises(SystemExit):
             run.load_plan(p)
+
+    def test_long_fraction_half_unit(self):
+        """(Review of d4dc4b7, P3) the default 1/8: floor(N / 8 + 0.5) long units, a half unit rounding up."""
+        for n, want in ((3, 0), (4, 1), (11, 1), (12, 2), (20, 3)):
+            units = [{"id": f"u{i:02d}", "attrs": {"family": "f"}} for i in range(n)]
+            chosen, man = plan.select_long(units, 0.125, ["family"], "ns")
+            self.assertEqual((len(chosen), man["long"]), (want, want), n)
+        d = design2(self.tmp, self.edges)
+        del d["long"]                                                            # the default: 1/8
+        _, _, man = plan.expand_v2(d, pending=True)
+        self.assertEqual((man["fraction"], man["units"], man["long"]), (0.125, 9, 1))
 
     def test_cli(self):
         p = os.path.join(self.tmp, "design.json")

@@ -791,6 +791,18 @@ def _main(argv, files):
     if probs:
         log(f"committed chunks damaged or inconsistent (working copies kept): {probs[:5]}")
         return 1
+    # (review of d4dc4b7, P2 1) EVERY indexed cell, whatever plan extends the root: a /2 completion
+    # without its sharing records, or with summaries its bundle contradicts, refuses the root
+    try:
+        iprobs = store.index_problems(root)
+    except (store.StoreError, OSError) as e:
+        iprobs = [str(e)]
+    if iprobs:
+        for p in iprobs[:10]:
+            log(f"index: {p}")
+        print(f"{root}: its index holds completions a /2 study cannot extend ({len(iprobs)}: {iprobs[0]}): "
+              "rerun the study in a new root", file=sys.stderr)
+        return 2
     # (review rounds 3-4) legacy objects (writable, or hard links an archive shares, read-only or not)
     # replaced by independent read-only copies under the COPY policy, before anything relies on
     # them; only then this session's policy

@@ -348,36 +348,94 @@ SHARING_SCHEMA = "finfolk.redqueen.sharing/1"
 BUNDLE_V2 = "finfolk.redqueen.bundle/2"
 
 
+def summary_of(bundle):
+    """The summaries done.json and the index carry, as the bundle (the authority) determines them:
+    the cell's kind and row hash, its common group and the common checkpoint it built, its pair
+    group and the arena's prey settings (run.py writes them from the same bundle)."""
+    c = bundle.get("cell") or {}
+    g = c.get("groups") or {}
+    return {"kind": c.get("kind"), "row_sha256": rqlib.canonical_sha(c) if c else None,
+            "common_group": g.get("common") if c.get("prey_policy") == "common" else None,
+            "common_sha256": (bundle.get("files") or {}).get("common.json"),
+            "pair_group": f"{g.get('reseed')}|{c.get('prey_policy')}|{c.get('assay')}",
+            "prey_config_sha256": bundle.get("arena_prey_config_sha256")}
+
+
 def completion_problems(done, bundle):
-    """How a /2 completion's done.json disagrees with its (hash-valid) bundle: the bundle must carry
-    the sharing record (a /2 bundle without one was completed before 03a608b: refused, never mixed
-    in), and done.json's role, families, transplant group and realized draw must be the bundle's."""
+    """How a completion's done.json disagrees with its (hash-valid) bundle. Every summary the store
+    indexes is the bundle's (summary_of: kind, row hash, common group and checkpoint, pair group,
+    prey settings), whatever the schema. A /2 bundle must carry its sharing record (one completed
+    before 03a608b: refused, never mixed in) whose keys, seeds and realized common checkpoint are
+    the cell's and the bundle's; done.json's role, families, transplant group and realized draw
+    must be the bundle's (an assay's realized draw is required)."""
+    if not isinstance(bundle.get("cell"), dict):
+        return ["the bundle carries no cell"]
+    want = summary_of(bundle)
+    probs = [f"done.json's {k} ({str(done.get(k))[:24]}) is not the bundle's ({str(v)[:24]})"
+             for k, v in want.items() if done.get(k) != v]
     if bundle.get("schema") != BUNDLE_V2:
-        return [] if not done.get("transplant_group") else ["a /1 bundle with a /2 transplant group"]
+        return probs + (["a /1 bundle with a /2 transplant group"] if done.get("transplant_group") else [])
     c, sh = bundle.get("cell") or {}, bundle.get("sharing")
     if not isinstance(sh, dict) or sh.get("schema") != SHARING_SCHEMA:
-        return ["a /2 bundle without its sharing record (completed before 03a608b): rerun it in a new root"]
-    probs = []
+        return probs + ["a /2 bundle without its sharing record (completed before 03a608b): rerun it in a new root"]
     if sh.get("keys") != c.get("groups") or sh.get("seeds") != c.get("seeds"):
         probs.append("the sharing record's keys or seeds are not the cell's")
+    if (sh.get("realized") or {}).get("common_sha256") != want["common_sha256"]:
+        probs.append("the sharing record's realized common checkpoint is not the bundle's")
     if done.get("role") != c.get("role") or done.get("families") != c.get("families"):
         probs.append(f"done.json's role / families ({done.get('role')}, {done.get('families')}) are not the "
                      f"bundle's ({c.get('role')}, {c.get('families')})")
     tg = f"{(c.get('groups') or {}).get('transplant')}|k{c.get('k')}" if c.get("kind") == "assay" else None
     th = (sh.get("realized") or {}).get("transplant_realized_sha256") if tg else None
+    if tg and not th:
+        probs.append("a /2 assay whose sharing record lacks its realized transplant draw")
     if done.get("transplant_group") != tg or done.get("transplant_realized_sha256") != th:
         probs.append(f"done.json's transplant group / realized draw ({done.get('transplant_group')}) are not the "
                      f"bundle's ({tg})")
     return probs
 
 
+def index_problems(root, cells=None):
+    """(Review of d4dc4b7, P2 1) Every indexed cell, not only those of the plan being run or packed:
+    an entry packed with its bundle's schema recorded must, if /2, carry its sharing summary (role,
+    transplant group); an older entry (no "bundle_schema") is checked against its chunk's bundle and
+    done.json (completion_problems): a root holding a /2 completion without sharing records, or with
+    summaries its bundle contradicts, is refused (a /2 study is rerun in a new root) -> problems."""
+    if cells is None:
+        _, cells = load_index(root)
+    probs = []
+    for cid, (rec, e) in sorted(cells.items()):
+        if "bundle_schema" in e:
+            if e["bundle_schema"] == BUNDLE_V2 and ("transplant_group" not in e or not e.get("role")):
+                probs.append(f"{cid}: a /2 completion indexed without its sharing summary")
+            continue
+        try:
+            b = json.loads(read_member(root, cid, "bundle.json", cells))
+            d = json.loads(read_member(root, cid, "done.json", cells))
+        except (OSError, ValueError, KeyError, zipfile.BadZipFile, StoreError) as x:
+            probs.append(f"{cid}: its packed bundle cannot be checked ({x})")
+            continue
+        if not (isinstance(b, dict) and isinstance(d, dict)):
+            probs.append(f"{cid}: its packed bundle or done.json is not a JSON object")
+            continue
+        probs += [f"{cid} (packed in {rec['chunk']}): {p}" for p in completion_problems(d, b)]
+        if b.get("schema") == BUNDLE_V2 and "transplant_group" not in e:
+            probs.append(f"{cid} (packed in {rec['chunk']}): a /2 completion indexed without its sharing summary")
+    return probs
+
+
 def transplant_groups(cells):
     """{transplant group (predator snapshot x replicate x K, plan/2): the realized donor draw and
-    placement} over indexed cells (raises on a disagreement: design v4 §3.5)."""
+    placement} over indexed cells. Raises on a disagreement (design v4 §3.5), and on an entry it
+    cannot place: a group without its realized draw (or a draw without a group), or a /2 assay
+    entry without either (never silently skipped)."""
     out = {}
     for cid, (_, e) in cells.items():
         g, h = e.get("transplant_group"), e.get("transplant_realized_sha256")
-        if g and h:
+        if bool(g) != bool(h) or (not g and e.get("bundle_schema") == BUNDLE_V2 and e.get("kind") == "assay"):
+            raise StoreError(f"cell {cid}: an indexed transplant summary without its group or realized draw "
+                             f"({g}, {h})")
+        if g:
             if out.setdefault(g, h) != h:
                 raise StoreError(f"transplant group {g}: two different realized donor draws / placements "
                                  f"({out[g][:12]}, {h[:12]})")
@@ -412,6 +470,9 @@ def pack(root, ids=None, log=print):
     todo = sorted(c for c in (fin if ids is None else ids) if c in fin and c not in cells)
     if not todo:
         return None, 0
+    probs = index_problems(root, cells)        # (every indexed cell, not only the new ones)
+    if probs:
+        raise StoreError("the root's index holds completions that cannot be extended: " + "; ".join(probs[:3]))
     groups = common_groups(cells)
     pairs = pair_groups(cells)
     tgroups = transplant_groups(cells)
@@ -427,7 +488,7 @@ def pack(root, ids=None, log=print):
             bjson = json.loads(b)
         except ValueError:
             raise StoreError(f"{cid}: bundle.json is not JSON")
-        probs = completion_problems(done, bjson) if isinstance(bjson, dict) else []
+        probs = completion_problems(done, bjson) if isinstance(bjson, dict) else ["bundle.json is not a JSON object"]
         if probs:
             raise StoreError(f"{cid}: " + "; ".join(probs))
         g, h = done.get("common_group"), done.get("common_sha256")
@@ -447,7 +508,8 @@ def pack(root, ids=None, log=print):
         entries[cid] = {"bundle_sha256": done["bundle_sha256"], "done_sha256": rqlib.sha256_bytes(dn),
                         "row_sha256": done.get("row_sha256"), "common_group": g, "common_sha256": h,
                         "pair_group": pg, "prey_config_sha256": ph, "kind": done.get("kind"),
-                        "role": done.get("role"), "transplant_group": tg, "transplant_realized_sha256": th}
+                        "role": done.get("role"), "transplant_group": tg, "transplant_realized_sha256": th,
+                        "bundle_schema": bjson.get("schema")}
     cdir = os.path.join(root, CHUNKS)
     if not os.path.isdir(cdir):
         os.makedirs(cdir, exist_ok=True)

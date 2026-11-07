@@ -107,8 +107,9 @@ SEEDS are global per snapshot x replicate, whatever the edge's family: sample, a
 from (namespace, prey snapshot UUID, r); transplant (donor draw and placement) from (namespace,
 predator snapshot UUID, r), or (namespace, random, K, r); the fork's from its prey key. Each is
 derive_seed(seed_namespace, kind, group key) and a 32-bit collision between two groups is refused
-(never re-derived per plan), so a group's seed is the same in every plan; --joint checks another
-plan (an audit's against production's) as one seed universe. The SNAPSHOT UUID is exactly
+(never re-derived per plan), so a group's seed is the same in every plan; --joint (repeatable)
+checks the generated rows and every other plan given (an audit's, production's family plans)
+together as ONE seed universe. The SNAPSHOT UUID is exactly
 uuid5(uuid.NAMESPACE_URL, "finfolk:snapshot:<world uuid>:<frame>") (the world UUID as text, the
 frame as a decimal integer; a fixed test vector is in test_redqueen.py). The age reference
 (common.py ages) is the upper order statistic at the empirical CDF's jumps: sorted pooled ages
@@ -728,7 +729,8 @@ def main(argv=None):
                                             "(after every check passed; it names the plan's sha256)")
     ap.add_argument("--joint", action="append", default=[], metavar="PLAN",
                     help="(design /2) another plan (an audit's, production's) checked jointly: no seed value "
-                         "shared by two different groups, no group with two seeds")
+                         "shared by two different groups, no group with two seeds (repeatable: the generated "
+                         "rows and every --joint plan form ONE seed universe, checked once)")
     a = ap.parse_args(argv)
     if a.pending and a.against:
         ap.error("--pending and --against exclude each other")
@@ -739,10 +741,13 @@ def main(argv=None):
             rows, warnings, long_man = expand_v2(design, pending=a.pending)
         else:
             rows, warnings = expand(design, pending=a.pending)
-        for p in a.joint:
-            probs = joint_seed_problems(rows, [json.loads(ln) for ln in rqlib.read_text(p).split("\n") if ln.strip()])
+        if a.joint:           # ONE seed universe: the generated rows and every --joint plan together
+            other = []
+            for p in a.joint:
+                other += [json.loads(ln) for ln in rqlib.read_text(p).split("\n") if ln.strip()]
+            probs = joint_seed_problems(rows, other)
             if probs:
-                raise DesignError(f"jointly with {p}: " + "; ".join(probs[:5]))
+                raise DesignError(f"jointly with {', '.join(a.joint)}: " + "; ".join(probs[:5]))
     except (DesignError, OSError, ValueError, KeyError) as e:
         print(f"plan.py: {e}", file=sys.stderr)
         return 2
