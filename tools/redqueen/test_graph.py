@@ -35,7 +35,7 @@ _G = {}
 def full(ns=NS, tm=True):
     """The v4 graph alone (no top-ups): the registered families' checks."""
     if (ns, tm) not in _G:
-        _G[(ns, tm)] = graph.build(ns, None, tm, snapshot_topup=0, ab_topup=0)
+        _G[(ns, tm)] = graph.build(ns, None, tm, snapshot_topup=0, ab_topup=0, lag_probe=0)
     return _G[(ns, tm)]
 
 
@@ -56,12 +56,34 @@ class TestGraph(unittest.TestCase):
         self.assertEqual(graph.check_quotas(self.g), [])
         self.assertEqual(len(self.g["edges"]), 237_884)
         self.assertEqual(sum(graph.QUOTAS.values()), 237_884)
-        again = graph.build(NS, snapshot_topup=0, ab_topup=0)
+        again = graph.build(NS, snapshot_topup=0, ab_topup=0, lag_probe=0)
         self.assertEqual(again["edges"], self.g["edges"])
         default = graph.build()          # the default namespace and the approved top-ups (v4 amendment)
         self.assertEqual(Counter(e[2] for e in default["edges"] if e[2] in graph.TOPUPS),
                          Counter(support_snap=1301, ab_train_c=3877))
-        self.assertEqual(len(default["edges"]), 243_062)
+        self.assertEqual(len(default["edges"]), 243_062 + 1_872)     # (+ the lag7_probe amendment)
+        self.assertEqual(graph.check_quotas(default), [])
+        self.check_lag_probe(default)
+
+    def check_lag_probe(self, g):
+        """The v4 amendment: +-7M within-world probes from every coarse prey time of the 24 non-intensive
+        C worlds; roles by endpoint; the 1/8 long pool; never in the Level-1 fit."""
+        lp = [e for e in g["edges"] if e[2] == "lag7_probe"]
+        self.assertEqual(len(lp), 24 * 78)
+        ws = set()
+        for q, p, fam, role, hz in lp:
+            _, wq, tq = graph.parse(q)
+            _, wp, tp = graph.parse(p)
+            self.assertEqual(wq, wp)
+            self.assertNotIn(wq, g["intensive"])
+            self.assertIn(tq, graph.COARSE)
+            self.assertIn(tp - tq, (7, -7))
+            self.assertIsNone(hz)
+            self.assertIn(role, ("training", "validation", "test"))
+            ws.add(wq)
+        self.assertEqual(len(ws), 24)
+        fit = graph.fitting(g, "v4")
+        self.assertFalse(any(e[2] == "lag7_probe" for e in fit))
         self.assertNotEqual(full("rq-test-other")["edges"], self.g["edges"])
         no = full(NS, False)
         self.assertEqual(graph.check_quotas(no), [])
@@ -188,8 +210,11 @@ class TestGraph(unittest.TestCase):
         worlds only), training A/B prey to eight fitting pairs or eight C opponents; the registered
         families are unchanged."""
         base = {(e[0], e[1]): e for e in self.g["edges"]}
+        g7 = graph.build(NS, None, True, snapshot_topup=0, ab_topup=0, lag_probe=7)   # the amendment alone
+        self.assertEqual([e for e in g7["edges"] if e[2] != "lag7_probe"], self.g["edges"])  # nothing else moves
+        self.check_lag_probe(g7)
         for ab_mode in ("fitting", "c"):
-            g = graph.build(NS, None, True, snapshot_topup=6, ab_topup=8, ab_topup_mode=ab_mode)
+            g = graph.build(NS, None, True, snapshot_topup=6, ab_topup=8, ab_topup_mode=ab_mode, lag_probe=0)
             self.assertEqual(graph.check_quotas(g), [])
             new = [e for e in g["edges"] if (e[0], e[1]) not in base]
             self.assertTrue(all(e[2] in graph.TOPUPS for e in new))
