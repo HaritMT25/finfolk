@@ -7,6 +7,7 @@ The end-to-end tests against the real engine are tests/redqueen_tooling.sh (ctes
 """
 from __future__ import annotations
 
+import contextlib
 import copy
 import io
 import json
@@ -201,8 +202,8 @@ class TestCommon(unittest.TestCase):
         missed = sum(common.sample_indices(30, 60, k, "hybrid")[1]["distinct"] < 30 for k in range(50))
         self.assertGreater(missed, 40)
         self.assertTrue(all(common.sample_indices(30, 60, k, "wor-balanced")[1]["distinct"] == 30 for k in range(10)))
-        self.assertEqual(common.POLICIES[0], "hybrid")
-        self.assertEqual(plan.SAMPLINGS[0], "hybrid")
+        self.assertIn("hybrid", common.POLICIES)        # (an explicit option; wor-balanced is the v3 default)
+        self.assertIn("hybrid", plan.SAMPLINGS)
 
     def test_sampling(self):
         p, s = common.sample_indices(50, 20, 7, "wor-balanced")
@@ -400,15 +401,138 @@ class TestStore(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.root)
 
-    def mk_cell(self, cid, group="g1", csha="c" * 64, payload="x"):
+    def mk_cell(self, cid, group="g1", csha="c" * 64, payload="x", transplant=None, sharing=True, role="training",
+                done_role=None, done_tg=None, done_extra=None):
+        """A finished cell (a /1 bundle; transplant (predator key, sha): a /2 bundle with its sharing
+        record) whose done.json summaries are the bundle's, as run.py writes them (done_*: altered)."""
         d = os.path.join(self.root, store.WORK, cid)
         os.makedirs(d)
-        b = rqlib.canonical({"id": cid, "payload": payload})
+        cell_ = {"id": cid, "schema": run.PLAN_SCHEMA, "kind": "assay", "prey_policy": "common", "assay": "frozen",
+                 "k": 6, "groups": {"common": group, "reseed": f"rs-{cid}"}, "seeds": {"reseed": 5}}
+        bundle = {"schema": "finfolk.redqueen.bundle/1", "payload": payload, "cell": cell_,
+                  "files": {"common.json": csha}, "arena_prey_config_sha256": "p" * 64}
+        if transplant:
+            cell_.update(schema=plan.PLAN_SCHEMA_V2, role=role, families=["f"])
+            cell_["groups"]["transplant"] = transplant[0]
+            cell_["seeds"]["transplant"] = 7
+            bundle["schema"] = store.BUNDLE_V2
+            if sharing:
+                bundle["sharing"] = {"schema": store.SHARING_SCHEMA, "keys": cell_["groups"], "seeds": cell_["seeds"],
+                                     "realized": {"common_sha256": csha, "transplant_realized_sha256": transplant[1]}}
+        done = dict(store.summary_of(bundle), schema=run.DONE_SCHEMA, id=cid)
+        if transplant:
+            done.update(transplant_group=done_tg or f"{transplant[0]}|k6", transplant_realized_sha256=transplant[1],
+                        role=done_role or role, families=["f"])
+        done.update(done_extra or {})
+        b = rqlib.canonical(bundle)
         wr(os.path.join(d, "bundle.json"), b)
-        rqlib.write_json_durable(os.path.join(d, "done.json"), {
-            "schema": run.DONE_SCHEMA, "id": cid, "kind": "assay", "bundle_sha256": rqlib.sha256_bytes(b),
-            "row_sha256": "r" * 64, "common_group": group, "common_sha256": csha})
+        done["bundle_sha256"] = rqlib.sha256_bytes(b)
+        rqlib.write_json_durable(os.path.join(d, "done.json"), done)
         wr(os.path.join(d, "end.json"), "big")
+        return b
+
+    def test_transplant_groups(self):
+        """Design v4 §3.5: one transplant group (a predator snapshot x replicate x K) realizes one donor
+        draw and placement; a disagreement is refused at packing (within a pack and against the index)."""
+        self.mk_cell("t1", group="g1", transplant=("P.w01.t5|r00", "d" * 64))
+        self.mk_cell("t2", group="g2", csha="b" * 64, transplant=("P.w01.t5|r00", "d" * 64))
+        self.mk_cell("t3", group="g3", csha="e" * 64, transplant=("P.w02.t5|r00", "f" * 64))
+        store.pack(self.root, log=lambda m: None)
+        recs, cells = store.load_index(self.root)
+        self.assertEqual(cells["t1"][1]["transplant_group"], "P.w01.t5|r00|k6")
+        self.assertEqual(store.transplant_groups(cells), {"P.w01.t5|r00|k6": "d" * 64, "P.w02.t5|r00|k6": "f" * 64})
+        self.mk_cell("t4", group="g4", csha="9" * 64, transplant=("P.w01.t5|r00", "0" * 64))
+        with self.assertRaisesRegex(store.StoreError, "transplant group P.w01.t5.r00.k6 realized"):
+            store.pack(self.root, log=lambda m: None)
+        self.assertTrue(os.path.exists(os.path.join(self.root, store.WORK, "t4", "bundle.json")))
+
+    def test_v2_completions_checked(self):
+        """Review of 03a608b, P2 1: packing (and resume) require a /2 completion's sharing record and
+        cross-check done.json's role and transplant summary against the hash-valid bundle; a /2 bundle
+        without sharing records (completed before 03a608b) is refused, never mixed in."""
+        for cid, kw, msg in (("old", {"sharing": False}, "before 03a608b"),
+                             ("role", {"done_role": "test"}, "role / families"),
+                             ("tg", {"done_tg": "P.w09.t5|r00|k6"}, "transplant group")):
+            self.mk_cell(cid, group=f"g{cid}", csha=rqlib.sha256_bytes(cid.encode()),
+                         transplant=("P.w01.t5|r00", "d" * 64), **kw)
+            with self.assertRaisesRegex(store.StoreError, msg):
+                store.pack(self.root, ids=[cid], log=lambda m: None)
+            shutil.rmtree(os.path.join(self.root, store.WORK, cid))
+        self.mk_cell("ok", transplant=("P.w01.t5|r00", "d" * 64))
+        self.assertEqual(store.pack(self.root, log=lambda m: None)[1], 1)
+        _, cells = store.load_index(self.root)
+        self.assertEqual(cells["ok"][1]["role"], "training")
+        b1 = json.loads(self.mk_cell("v1"))                                       # a consistent /1 completion
+        self.assertEqual(store.completion_problems(rqlib.read_json(os.path.join(self.root, store.WORK, "v1",
+                                                                                "done.json")), b1), [])
+
+    # ---------------------------------------------------------------- review of d4dc4b7
+    def test_altered_summaries_refused(self):
+        """Review of d4dc4b7, P2 1: every done.json summary is checked against the bundle at packing:
+        a common checkpoint hash changed to the one already indexed for its group (hiding another
+        bundled common checkpoint), a pair group, prey settings, kind, row hash: each refused."""
+        self.mk_cell("a0", group="g1", csha="a" * 64)
+        store.pack(self.root, log=lambda m: None)
+        for cid, extra, field in (("x1", {"common_sha256": "a" * 64}, "common_sha256"),
+                                  ("x2", {"pair_group": "rs-a0|common|frozen"}, "pair_group"),
+                                  ("x3", {"prey_config_sha256": "q" * 64}, "prey_config_sha256"),
+                                  ("x4", {"kind": "nopred"}, "kind"),
+                                  ("x5", {"row_sha256": "r" * 64}, "row_sha256")):
+            self.mk_cell(cid, group="g1", csha="b" * 64, done_extra=extra)    # its bundle built "b..."
+            with self.assertRaisesRegex(store.StoreError, field):
+                store.pack(self.root, ids=[cid], log=lambda m: None)
+            self.assertTrue(os.path.exists(os.path.join(self.root, store.WORK, cid, "bundle.json")))
+            shutil.rmtree(os.path.join(self.root, store.WORK, cid))
+        # the /2 sharing record's realized common checkpoint must be the bundle's too
+        d = os.path.join(self.root, store.WORK, "x6")
+        self.mk_cell("x6", group="g6", csha="6" * 64, transplant=("P.w01.t5|r00", "d" * 64))
+        b = json.loads(rqlib.read_bytes(os.path.join(d, "bundle.json")))
+        b["sharing"]["realized"]["common_sha256"] = "7" * 64
+        self.assertTrue(any("realized common" in x for x in store.completion_problems(
+            rqlib.read_json(os.path.join(d, "done.json")), b)))
+
+    def legacy_root(self):
+        """A root holding a /2 completion packed before 03a608b: no sharing record in its bundle, no
+        bundle schema or transplant summary in its index entry."""
+        self.mk_cell("old", group="g1", transplant=("P.w01.t5|r00", "d" * 64), sharing=False)
+        real = store.completion_problems
+        store.completion_problems = lambda done, bundle: []
+        try:
+            store.pack(self.root, log=lambda m: None)
+        finally:
+            store.completion_problems = real
+        ip = os.path.join(self.root, store.INDEX)
+        recs = [json.loads(ln) for ln in rqlib.read_text(ip).splitlines() if ln.strip()]
+        for r in recs:
+            for e in r["cells"].values():
+                for k in ("bundle_schema", "transplant_group", "transplant_realized_sha256", "role"):
+                    e.pop(k, None)
+        rqlib.write_durable(ip, b"".join(rqlib.canonical(r) for r in recs))
+
+    def test_legacy_packed_cell_refuses_extension(self):
+        """Review of d4dc4b7, P2 1: a root holding a legacy /2 completion (packed without sharing
+        records) is refused whatever plan extends it: a disjoint cell is not packed next to it, and
+        the runner refuses the root at its start (before any plan row is looked at)."""
+        self.legacy_root()
+        probs = store.index_problems(self.root)
+        self.assertTrue(any("old" in x and "sharing record" in x for x in probs), probs)
+        self.mk_cell("new", group="g2", csha="b" * 64, transplant=("P.w02.t5|r00", "f" * 64))   # disjoint
+        with self.assertRaisesRegex(store.StoreError, "cannot be extended"):
+            store.pack(self.root, log=lambda m: None)
+        self.assertTrue(os.path.exists(os.path.join(self.root, store.WORK, "new", "bundle.json")))
+        p = os.path.join(self.root, "disjoint.jsonl")
+        wr(p, "")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = run.main(["--root", self.root, "--plan", p, "--binary", "/nonexistent/evo_boids"])
+        self.assertEqual(rc, 2, err.getvalue())
+        self.assertIn("rerun the study in a new root", err.getvalue())
+        # an index entry that names a group without its realized draw (or a /2 assay without either)
+        rec = {"chunk": "x"}
+        for e in ({"transplant_group": "g|k6", "transplant_realized_sha256": None},
+                  {"bundle_schema": store.BUNDLE_V2, "kind": "assay", "transplant_group": None}):
+            with self.assertRaisesRegex(store.StoreError, "without its group or realized draw"):
+                store.transplant_groups({"c": (rec, e)})
 
     def test_objects(self):
         sha = store.put_bytes(self.root, b'{"a":1}', compress=True)
@@ -624,7 +748,7 @@ class TestStore(unittest.TestCase):
         self.assertTrue(os.path.exists(os.path.join(self.root, store.WORK, "c3")))
         recs, cells = store.load_index(self.root)
         self.assertEqual(sorted(cells), ["c0", "c1", "c2"])
-        self.assertEqual(json.loads(store.read_member(self.root, "c1", cells=cells)), {"id": "c1", "payload": "x"})
+        self.assertEqual(json.loads(store.read_member(self.root, "c1", cells=cells))["cell"]["id"], "c1")
         self.assertEqual(store.verify_all(self.root), [])
         # an orphan chunk (crash after the rename, before the index line) and a truncated index line
         name2, _ = store.pack(self.root, ids=["c3"], log=lambda m: None)
@@ -640,9 +764,9 @@ class TestStore(unittest.TestCase):
         self.assertNotIn("c3", cells)
         self.assertTrue(rqlib.read_bytes(ip).endswith(b"\n"))
         # a packed cell's leftover directory is deleted at recover (after its bundle is checked)
+        c0 = store.read_member(self.root, "c0")
         os.makedirs(os.path.join(self.root, store.WORK, "c0"))
-        wr(os.path.join(self.root, store.WORK, "c0", "bundle.json"),
-            rqlib.canonical({"id": "c0", "payload": "x"}))
+        wr(os.path.join(self.root, store.WORK, "c0", "bundle.json"), c0)
         self.assertEqual(store.recover(self.root, log=lambda m: None)[1], [])
         self.assertFalse(os.path.exists(os.path.join(self.root, store.WORK, "c0")))
         # the rest packs; a common group with two different checkpoints is refused, nothing deleted
@@ -669,6 +793,34 @@ class TestStore(unittest.TestCase):
         recs, _ = store.load_index(self.root)
         with zipfile.ZipFile(os.path.join(self.root, store.CHUNKS, recs[0]["chunk"])) as z:
             self.assertEqual(sorted(z.namelist()), ["z1/bundle.json", "z1/done.json"])
+
+
+class TestSharing(unittest.TestCase):
+    def test_sharing_record(self):
+        """Design v4 §3.5: a plan/2 bundle records its group keys, seeds and realized draws."""
+        arena = mk_cp(n_pred=3)
+        man = {"predators": {"source": "pred.json", "seed": 77, "pool": 6, "count": 3, "withReplacement": False,
+                             "picked": [{"sourceIndex": 5, "sourceId": 6, "lineageId": 6, "id": 7},
+                                        {"sourceIndex": 1, "sourceId": 2, "lineageId": 2, "id": 8},
+                                        {"sourceIndex": 0, "sourceId": 1, "lineageId": 1, "id": 9}]}}
+        c = {"groups": {"common": "pk", "transplant": "qk"}, "seeds": {"sample": 1, "transplant": 77}}
+        files = {"common.json": "c" * 64, "common.manifest.json": "m" * 64}
+        a = cell.sharing_record(c, arena, man, files)
+        self.assertEqual(a["schema"], cell.SHARING_SCHEMA)
+        self.assertEqual((a["keys"], a["seeds"]), (c["groups"], c["seeds"]))
+        self.assertEqual(a["realized"]["transplant"]["picked"], [[5, 6, 6], [1, 2, 2], [0, 1, 1]])
+        self.assertEqual(a["realized"]["common_sha256"], "c" * 64)
+        self.assertEqual(a, cell.sharing_record(c, copy.deepcopy(arena), copy.deepcopy(man), files))
+        moved = copy.deepcopy(arena)
+        moved["predators"]["posX"][0] += 1.0            # another placement: another realized transplant
+        b = cell.sharing_record(c, moved, man, files)
+        self.assertEqual(b["realized"]["transplant_draw_sha256"], a["realized"]["transplant_draw_sha256"])
+        self.assertNotEqual(b["realized"]["transplant_realized_sha256"], a["realized"]["transplant_realized_sha256"])
+        other = copy.deepcopy(man)
+        other["predators"]["picked"][0]["sourceIndex"] = 4    # another donor
+        self.assertNotEqual(cell.sharing_record(c, arena, other, files)["realized"]["transplant_draw_sha256"],
+                            a["realized"]["transplant_draw_sha256"])
+        self.assertEqual(cell.sharing_record(c, mk_cp(n_pred=0), {}, files)["realized"]["transplant"]["picked"], [])
 
 
 class TestFork(unittest.TestCase):
@@ -1012,6 +1164,348 @@ class TestRunner(unittest.TestCase):
         self.assertEqual(t[3:6], ["random", "--transplant-count", "0"])
         self.assertEqual(cell.normalize_run_csv("step,elapsed_s,pop,steps_per_sec\n1,0.5,9,100\n"), "step,pop\n1,9\n")
         self.assertEqual(run.OUTPUT_TOOLS, cell.OUTPUT_TOOLS)
+
+
+def design2(tmp, edges, **kw):
+    d = {"schema": plan.DESIGN_SCHEMA_V2, "name": "t2", "seed_namespace": "ns2",
+         "times": {"F1": 1, "T1": 1000, "T2": 2000},
+         "worlds": {"A": {"uuid": "uA", "pattern": f"{tmp}/A.{{frame}}.json", "paths": {"F1": f"{tmp}/A.F1.json"}},
+                    "B": {"uuid": "uB", "pattern": f"{tmp}/B.{{frame}}.json", "paths": {"F1": f"{tmp}/B.F1.json"}}},
+         "templates": [f"{tmp}/T0.json"], "age_reference": f"{tmp}/ages.json", "replicates": 2,
+         "defaults": {"n_prey": 4, "short_steps": 400, "long_steps": 800, "short_horizons": [400],
+                      "long_horizons": [400, 800], "log_every": 100, "checkpoint_every": 200, "k": 3},
+         "long": {"fraction": 0.25, "strata": ["family"]},
+         "edges": edges}
+    d.update(kw)
+    return d
+
+
+def E(fam, role, pw, pt, qw=None, qt=None, **kw):
+    e = {"family": fam, "role": role, "prey": {"world": pw, "time": pt},
+         "predators": None if qw is None else ({"source": "random"} if qw == "random" else {"world": qw, "time": qt})}
+    e.update(kw)
+    return e
+
+
+class TestV3Common(unittest.TestCase):
+    """Design v3 §3.1-3.2: wor-balanced is the default; reference ages, permuted per snapshot x replicate."""
+
+    def test_defaults_and_diversity(self):
+        self.assertEqual(common.POLICIES[0], "wor-balanced")
+        tpl, src = mk_cp(n_prey=10, seed=2), mk_cp(n_prey=6, seed=3)
+        out, man = common.build(tpl, src, 8, 5)
+        s = man["sampling"]
+        self.assertEqual(s["policy"], "wor-balanced")
+        self.assertEqual((s["distinct_individuals"], s["pool"]), (6, 6))     # 8 slots from 6: every one, 2 twice
+        self.assertLessEqual(s["distinct_genomes"], 6)
+        self.assertGreater(s["effective_genomes"], 1)
+        self.assertGreater(s["effective_lineages"], 1)
+        self.assertEqual(len(man["slots"]["genome_sha16"]), 8)
+        self.assertEqual(man["schema"], common.SCHEMA)
+        self.assertEqual(set(out["creatures"]["age"]), {0.0})
+
+    def test_reference_ages(self):
+        srcs = [mk_cp(n_prey=6, seed=k) for k in (1, 2)]
+        for k, cp in enumerate(srcs):
+            cp["creatures"]["age"] = [float(10 * k + j) for j in range(6)]
+            cp["config"]["maxAge"] = 120.0
+        ref = common.reference_ages(srcs, 4, ["s0", "s1"])
+        pooled = sorted([float(j) for j in range(6)] + [float(10 + j) for j in range(6)])
+        self.assertEqual(ref["ages"], [pooled[int((i + 0.5) / 4 * 12)] for i in range(4)])
+        self.assertEqual((ref["n"], ref["pooled"], ref["max_age"]), (4, 12, 120.0))
+        # (review of d4dc4b7, P3) at an exact CDF jump ((i + 0.5) M / N an integer) the UPPER order
+        # statistic: M = 4 pooled ages, N = 2 -> ranks 1 and 3 (the lower convention would give 0, 2)
+        one = mk_cp(n_prey=4, seed=5)
+        one["creatures"]["age"] = [0.0, 10.0, 20.0, 30.0]
+        one["config"]["maxAge"] = 120.0
+        self.assertEqual(common.reference_ages([one], 2)["ages"], [10.0, 30.0])
+        common.load_age_reference(ref)
+        bad = dict(ref, ages=list(reversed(ref["ages"])))
+        with self.assertRaises(common.CommonError):
+            common.load_age_reference(bad)
+        tpl, src = mk_cp(n_prey=10, seed=2, cfg_extra={"maxAge": 120.0}), mk_cp(n_prey=6, seed=3, cfg_extra={"maxAge": 120.0})
+        out, man = common.build(tpl, src, 4, 5, age_reference=ref, age_seed=77, ages_label="AGES", ages_sha="s")
+        ages = out["creatures"]["age"]
+        self.assertEqual(sorted(ages), ref["ages"])
+        perm = rqlib.SplitMix64(77).shuffle(list(range(4)))
+        self.assertEqual(ages, [ref["ages"][perm[i]] for i in range(4)])
+        self.assertEqual(man["schema"], common.SCHEMA_AGES)
+        self.assertEqual((man["ages"]["permutation_seed"], man["ages"]["label"]), (77, "AGES"))
+        out2, _ = common.build(tpl, src, 4, 5, age_reference=ref, age_seed=77)
+        self.assertEqual(out2["creatures"]["age"], ages)                    # one realization per seed
+        out3, _ = common.build(tpl, src, 4, 5, age_reference=ref, age_seed=78)
+        self.assertNotEqual(out3["creatures"]["age"], ages)
+        for kw, msg in (({"age_seed": None}, "permutation seed"),):
+            with self.assertRaisesRegex(common.CommonError, msg):
+                common.build(tpl, src, 4, 5, age_reference=ref, **kw)
+        with self.assertRaisesRegex(common.CommonError, "slots"):
+            common.build(tpl, src, 5, 5, age_reference=ref, age_seed=1)
+        tpl_other = mk_cp(n_prey=10, seed=2, cfg_extra={"maxAge": 60.0})
+        src_other = mk_cp(n_prey=6, seed=3, cfg_extra={"maxAge": 60.0})
+        with self.assertRaisesRegex(common.CommonError, "maxAge"):
+            common.build(tpl_other, src_other, 4, 5, age_reference=ref, age_seed=1)
+
+
+class TestPlanV2(unittest.TestCase):
+    """Design v3 §3.5 / §4.6 / §7.1: explicit edge lists with roles, global snapshot x replicate seeds,
+    the pre-randomized long subset, schema /2."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.edges = [E("within", "training", "A", "F1", "A", "F1"), E("within", "training", "A", "F1", "A", "T2"),
+                      E("within", "training", "A", "T2", "A", "T2"), E("within", "training", "A", "T2", "A", "F1"),
+                      E("cross", "training", "A", "T2", "B", "T2"), E("cross", "test", "B", "T2", "B", "T2"),
+                      E("nopred", "training", "A", "T2"), E("random", "training", "A", "T2", "random"),
+                      E("reference", "training", "A", "T2", "B", "T2"),               # the same pair, another family
+                      E("audit", "audit", "A", "T2", "B", "T2", namespace="audit"),
+                      E("grid", "training", "B", "F1", "A", "F1", horizon="long")]
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def test_expand(self):
+        rows, _, man = plan.expand_v2(design2(self.tmp, self.edges), pending=True)
+        rows2, _, _ = plan.expand_v2(design2(self.tmp, self.edges), pending=True)
+        self.assertEqual(b"".join(map(rqlib.canonical, rows)), b"".join(map(rqlib.canonical, rows2)))
+        self.assertEqual(len(rows), 10 * 2)                       # 11 edges, one pair listed twice, x R
+        self.assertTrue(all(r["schema"] == plan.PLAN_SCHEMA_V2 for r in rows))
+        by = {r["id"]: r for r in rows}
+        merged = by["A.T2~B.T2.common.frozen.k3.r00"]
+        self.assertEqual(merged["families"], ["cross", "reference"])
+        a1, a2 = by["A.T2~A.T2.common.frozen.k3.r01"], by["A.T2~A.F1.common.frozen.k3.r01"]
+        fork, rnd = by["A.T2~none.common.frozen.k0.r01"], by["A.T2~random.common.frozen.k3.r01"]
+        cross = by["A.T2~B.T2.common.frozen.k3.r01"]
+        for x in (a2, fork, rnd, cross):                          # one prey snapshot x replicate: one key
+            for k in ("sample", "ages", "reseed"):
+                self.assertEqual(x["seeds"][k], a1["seeds"][k], (x["id"], k))
+        self.assertNotEqual(a1["seeds"]["sample"], by["A.T2~A.T2.common.frozen.k3.r00"]["seeds"]["sample"])
+        bb = by["B.T2~B.T2.common.frozen.k3.r01"]                 # one predator snapshot x replicate: one key
+        self.assertEqual(bb["seeds"]["transplant"], cross["seeds"]["transplant"])
+        self.assertNotEqual(bb["seeds"]["reseed"], cross["seeds"]["reseed"])
+        self.assertEqual(a1["prey"]["snapshot"], plan.snapshot_uuid("uA", 2000))
+        self.assertEqual(a2["predators"]["snapshot"], plan.snapshot_uuid("uA", 1))
+        audit = by["A.T2~B.T2.common.frozen.k3.audit.r01"]       # an independent namespace
+        for k in ("sample", "ages", "reseed", "transplant"):
+            self.assertNotEqual(audit["seeds"][k], cross["seeds"][k], k)
+        self.assertEqual((audit["role"], audit["namespace"]), ("audit", "audit"))
+        self.assertEqual((bb["role"], fork["kind"], fork["predators"], fork["k"]), ("test", "nopred", None, 0))
+        self.assertEqual(rnd["predators"], {"source": "random"})
+        self.assertEqual(a1["sampling"], "wor-balanced")
+        self.assertEqual(a1["ages"], {"path": f"{self.tmp}/ages.json", "sha256": "pending"})
+        # every replicate of a pair has one horizon; the explicit long edge is long; the long subset is exact
+        units = {}
+        for r in rows:
+            units.setdefault(r["unit"], set()).add((r["horizon"], r["steps"], tuple(r["horizons"])))
+        self.assertTrue(all(len(v) == 1 for v in units.values()))
+        grid = by["B.F1~A.F1.common.frozen.k3.r00"]
+        self.assertEqual((grid["horizon"], grid["steps"], grid["horizons"]), ("long", 800, [400, 800]))
+        free = 9      # the pairs without a fixed horizon
+        self.assertEqual(man["units"], free)
+        self.assertEqual(man["long"], int(0.25 * free + 0.5))
+        self.assertEqual(sum(1 for u, v in units.items() if next(iter(v))[0] == "long"), man["long"] + 1)
+        self.assertEqual(sum(s["long"] for s in man["per_stratum"]), man["long"])
+        short = next(r for r in rows if r["horizon"] == "short")
+        self.assertEqual((short["steps"], short["horizons"], short["expected"]["checkpoint_steps"]), (400, [400], [200, 400]))
+        # seeds unique within a kind across groups
+        for kind in plan.SEED_KINDS_V2:
+            per = {}
+            for r in rows:
+                if r["groups"].get(kind):
+                    per.setdefault(r["seeds"][kind], set()).add(r["groups"][kind])
+            self.assertTrue(all(len(g) == 1 for g in per.values()), kind)
+
+    def test_conflicts(self):
+        bad = self.edges + [E("cross", "validation", "A", "T2", "B", "T2")]     # another role for one pair
+        with self.assertRaisesRegex(plan.DesignError, "keeps one role"):
+            plan.expand_v2(design2(self.tmp, bad), pending=True)
+        bad = self.edges + [E("grid", "training", "B", "F1", "A", "F1", horizon="short")]
+        with self.assertRaisesRegex(plan.DesignError, "two horizons"):
+            plan.expand_v2(design2(self.tmp, bad), pending=True)
+        with self.assertRaisesRegex(plan.DesignError, "role"):
+            plan.expand_v2(design2(self.tmp, [E("x", "nonsense", "A", "F1")]), pending=True)
+        with self.assertRaisesRegex(plan.DesignError, "first horizon"):
+            plan.expand_v2(design2(self.tmp, self.edges, defaults={"short_steps": 400, "long_steps": 800,
+                                   "short_horizons": [400], "long_horizons": [800], "log_every": 100,
+                                   "checkpoint_every": 200}), pending=True)
+
+    # ---------------------------------------------------------------- review of 03a608b
+    def test_audit_namespace(self):
+        """P2 2: an audit edge (its control too) defaults to an independent namespace; "main" is refused."""
+        edges = [E("cross", "training", "A", "T2", "B", "T2"), E("audit", "audit", "A", "T2", "B", "T2"),
+                 E("audit", "audit", "A", "T2")]
+        rows, _, _ = plan.expand_v2(design2(self.tmp, edges), pending=True)
+        by = {r["id"]: r for r in rows}
+        prod, aud = by["A.T2~B.T2.common.frozen.k3.r00"], by["A.T2~B.T2.common.frozen.k3.audit.r00"]
+        ctl = by["A.T2~none.common.frozen.k0.audit.r00"]
+        self.assertEqual((aud["namespace"], ctl["namespace"]), ("audit", "audit"))
+        for k in ("sample", "ages", "reseed", "transplant"):
+            self.assertNotEqual(prod["seeds"][k], aud["seeds"][k], k)
+        self.assertEqual(ctl["seeds"]["reseed"], aud["seeds"]["reseed"])
+        with self.assertRaisesRegex(plan.DesignError, "independent namespace"):
+            plan.expand_v2(design2(self.tmp, [E("audit", "audit", "A", "T2", namespace="main")]), pending=True)
+
+    def test_seed_collisions_refused(self):
+        """P2 3: a 32-bit collision between two groups is refused (never re-derived per plan), and a
+        joint check finds a seed shared across plans (an audit against production)."""
+        real = rqlib.derive_seed
+        try:
+            plan.rqlib.derive_seed = lambda ns, kind, *rest: 42 if kind == "reseed" else real(ns, kind, *rest)
+            with self.assertRaisesRegex(plan.DesignError, "reseed seeds of groups .* collide"):
+                plan.expand_v2(design2(self.tmp, self.edges), pending=True)
+        finally:
+            plan.rqlib.derive_seed = real
+        prod, _, _ = plan.expand_v2(design2(self.tmp, [E("cross", "training", "A", "T2", "B", "T2")]), pending=True)
+        aud, _, _ = plan.expand_v2(design2(self.tmp, [E("audit", "audit", "A", "T2", "B", "T2")]), pending=True)
+        self.assertEqual(plan.joint_seed_problems(prod, aud), [])
+        bad = json.loads(json.dumps(aud))
+        bad[0]["seeds"]["reseed"] = prod[0]["seeds"]["reseed"]
+        self.assertTrue(any("shared by groups" in p for p in plan.joint_seed_problems(prod, bad)))
+        p1, p2 = os.path.join(self.tmp, "prod.jsonl"), os.path.join(self.tmp, "aud.jsonl")
+        plan.write_plan(prod, p1)
+        plan.write_plan(bad, p2)
+        d = os.path.join(self.tmp, "d.json")
+        wr(d, json.dumps(design2(self.tmp, [E("cross", "training", "A", "T2", "B", "T2")])))
+        self.assertEqual(plan.main([d, "--pending", "--out", os.path.join(self.tmp, "x.jsonl"), "--joint", p2]), 2)
+        self.assertEqual(plan.main([d, "--pending", "--out", os.path.join(self.tmp, "x.jsonl"), "--joint", p1]), 0)
+
+    def test_joint_is_one_seed_universe(self):
+        """Review of d4dc4b7, new P2: repeated --joint plans and the generated rows are ONE seed
+        universe: an external-file-versus-external-file collision (production 42, audit 42) is refused
+        although neither file collides with the generated plan alone."""
+        new, _, _ = plan.expand_v2(design2(self.tmp, [E("random", "training", "A", "F1", "random")]), pending=True)
+        prod, _, _ = plan.expand_v2(design2(self.tmp, [E("cross", "training", "A", "T2", "B", "T2")]), pending=True)
+        aud, _, _ = plan.expand_v2(design2(self.tmp, [E("audit", "audit", "B", "T2", "A", "T2")]), pending=True)
+        for r in prod + aud:                         # one reseed group of each file gets the seed 42
+            if r["groups"]["reseed"].endswith("|r00"):
+                r["seeds"]["reseed"] = 42
+        self.assertEqual(plan.joint_seed_problems(new, prod), [])
+        self.assertEqual(plan.joint_seed_problems(new, aud), [])
+        p1, p2 = os.path.join(self.tmp, "prod.jsonl"), os.path.join(self.tmp, "aud.jsonl")
+        plan.write_plan(prod, p1)
+        plan.write_plan(aud, p2)
+        d = os.path.join(self.tmp, "d.json")
+        wr(d, json.dumps(design2(self.tmp, [E("random", "training", "A", "F1", "random")])))
+        out = os.path.join(self.tmp, "x.jsonl")
+        for files in ([p1], [p2]):
+            self.assertEqual(plan.main([d, "--pending", "--out", out] + [x for f in files for x in ("--joint", f)]), 0)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = plan.main([d, "--pending", "--out", out, "--joint", p1, "--joint", p2])
+        self.assertEqual(rc, 2)
+        self.assertIn("reseed seed 42 is shared by groups", err.getvalue())
+
+    def test_canonical_pairs_and_condition_roles(self):
+        """P2 4: two labels of one snapshot merge into one pair (aliases recorded); one endpoint pair
+        keeps one role across condition versions, but an explicit support exception."""
+        edges = [E("cross", "training", "A", "T2", "B", "T2"), E("reference", "training", "A", "T2b", "B", "T2")]
+        d = design2(self.tmp, edges, times={"F1": 1, "T1": 1000, "T2": 2000, "T2b": 2000})
+        rows, _, _ = plan.expand_v2(d, pending=True)
+        self.assertEqual(len(rows), 2)                          # one pair x R
+        self.assertEqual((rows[0]["unit"], rows[0]["aliases"]), ("A.T2b~B.T2.common.frozen.k3", ["A.T2~B.T2.common.frozen.k3"]))
+        self.assertEqual(rows[0]["families"], ["cross", "reference"])
+        live = edges[:1] + [E("cross", "test", "A", "T2", "B", "T2", assay="live")]
+        with self.assertRaisesRegex(plan.DesignError, "keeps one role"):
+            plan.expand_v2(design2(self.tmp, live), pending=True)
+        ok = edges[:1] + [E("cross", "support", "A", "T2", "B", "T2", assay="live", support_exception=True)]
+        rows, _, _ = plan.expand_v2(design2(self.tmp, ok), pending=True)
+        self.assertEqual(sorted({r["role"] for r in rows}), ["support", "training"])
+        with self.assertRaisesRegex(plan.DesignError, "support_exception"):
+            plan.expand_v2(design2(self.tmp, [E("cross", "test", "A", "T2", "B", "T2", support_exception=True)]),
+                           pending=True)
+
+    def test_primary_stratum_order_independent(self):
+        """P2 5: a merged pair's stratum is its primary family (registered priority, then name), so
+        reordering the edge list changes nothing."""
+        lg = {"fraction": 0.5, "strata": ["family"], "family_priority": ["reference"]}
+        edges = [dict(e, edge=f"e{i:02d}") for i, e in enumerate(self.edges)]
+        a, _, ma = plan.expand_v2(design2(self.tmp, edges, long=lg), pending=True)
+        b, _, mb = plan.expand_v2(design2(self.tmp, list(reversed(edges)), long=lg), pending=True)
+        self.assertEqual(b"".join(map(rqlib.canonical, a)), b"".join(map(rqlib.canonical, b)))
+        self.assertEqual(ma, mb)
+        merged = next(r for r in a if r["unit"] == "A.T2~B.T2.common.frozen.k3")
+        self.assertEqual(merged["primary_family"], "reference")
+
+    def test_mixed_plans_and_manifest(self):
+        """P2 6: a plan mixing /1 and /2 rows is refused; P3 7: the long manifest is written only for
+        an accepted plan and names its sha256; P3 8: the snapshot UUID's fixed test vector."""
+        rows, _, _ = plan.expand_v2(design2(self.tmp, self.edges), pending=True)
+        for r in rows:                                   # (as if final: no pending hash)
+            for k in ("prey", "predators", "template", "ages"):
+                if isinstance(r.get(k), dict) and r[k].get("sha256") == "pending":
+                    r[k]["sha256"] = "a" * 64
+        one = dict(rows[0], schema=run.PLAN_SCHEMA, id="legacy")
+        p = os.path.join(self.tmp, "mixed.jsonl")
+        wr(p, rqlib.canonical(rows[0]) + rqlib.canonical(one))
+        with self.assertRaisesRegex(SystemExit, "one schema"):
+            run.load_plan(p)
+        d = os.path.join(self.tmp, "d.json")
+        wr(d, json.dumps(design2(self.tmp, self.edges)))
+        pend, man = os.path.join(self.tmp, "pend.jsonl"), os.path.join(self.tmp, "long.json")
+        self.assertEqual(plan.main([d, "--pending", "--out", pend, "--long-manifest", man]), 0)
+        self.assertEqual(rqlib.read_json(man)["plan_sha256"], rqlib.sha256_file(pend))
+        before = rqlib.read_bytes(man)
+        for name, frame in (("A.F1", 1), ("A.2000", 2000), ("B.F1", 1), ("B.2000", 2000), ("T0", 7)):
+            wr(os.path.join(self.tmp, name + ".json"), ckpt.dumps(mk_cp(n_prey=8, frame=frame)))
+        wr(os.path.join(self.tmp, "ages.json"), rqlib.canonical(common.reference_ages([mk_cp(n_prey=8, seed=9)], 4)))
+        wr(d, json.dumps(design2(self.tmp, self.edges[:-1])))              # a changed design (final inputs exist)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = plan.main([d, "--against", pend, "--out", os.path.join(self.tmp, "f.jsonl"), "--long-manifest", man])
+        self.assertEqual(rc, 2)
+        self.assertIn(f"not the registered pending plan {pend}", err.getvalue())   # refused AT --against
+        self.assertEqual(rqlib.read_bytes(man), before)                     # untouched by the refused plan
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "f.jsonl")))
+        self.assertEqual(plan.snapshot_uuid("00000000-0000-4000-8000-000000000001", 1000000),
+                         "be3bbb37-f696-572c-b70c-5afcfaa9686d")
+
+    def test_final_binding_with_ages(self):
+        for name, frame in (("A.F1", 1), ("A.2000", 2000), ("B.F1", 1), ("B.2000", 2000), ("T0", 7)):
+            wr(os.path.join(self.tmp, name + ".json"), ckpt.dumps(mk_cp(n_prey=8, frame=frame)))
+        src = mk_cp(n_prey=8, seed=9)
+        ref = common.reference_ages([src], 4)
+        wr(os.path.join(self.tmp, "ages.json"), rqlib.canonical(ref))
+        d = design2(self.tmp, self.edges)
+        pend, _, m1 = plan.expand_v2(d, pending=True)
+        final, _, m2 = plan.expand_v2(d)
+        self.assertEqual(m1, m2)
+        self.assertEqual(plan.pending_problems(final, pend), [])
+        a = next(r for r in final if r["ages"])
+        self.assertEqual(a["ages"]["sha256"], rqlib.sha256_file(os.path.join(self.tmp, "ages.json")))
+        wr(os.path.join(self.tmp, "ages.json"), rqlib.canonical(common.reference_ages([src], 5)))
+        with self.assertRaisesRegex(plan.DesignError, "reference ages"):
+            plan.expand_v2(d)
+        # (review of d4dc4b7, P3) final planning checks the reference's maxAge against the template's
+        wr(os.path.join(self.tmp, "ages.json"),
+           rqlib.canonical(common.reference_ages([mk_cp(n_prey=8, seed=9, cfg_extra={"maxAge": 60.0})], 4)))
+        with self.assertRaisesRegex(plan.DesignError, "maxAge 60.0"):
+            plan.expand_v2(d)
+        wr(os.path.join(self.tmp, "ages.json"), rqlib.canonical(ref))
+        p = os.path.join(self.tmp, "plan.jsonl")
+        plan.write_plan(final, p)
+        self.assertEqual(len(run.load_plan(p)), len(final))      # the runner reads plan/2 rows
+        bad = [dict(final[0])]
+        del bad[0]["role"]
+        plan.write_plan(bad, p)
+        with self.assertRaises(SystemExit):
+            run.load_plan(p)
+
+    def test_long_fraction_half_unit(self):
+        """(Review of d4dc4b7, P3) the default 1/8: floor(N / 8 + 0.5) long units, a half unit rounding up."""
+        for n, want in ((3, 0), (4, 1), (11, 1), (12, 2), (20, 3)):
+            units = [{"id": f"u{i:02d}", "attrs": {"family": "f"}} for i in range(n)]
+            chosen, man = plan.select_long(units, 0.125, ["family"], "ns")
+            self.assertEqual((len(chosen), man["long"]), (want, want), n)
+        d = design2(self.tmp, self.edges)
+        del d["long"]                                                            # the default: 1/8
+        _, _, man = plan.expand_v2(d, pending=True)
+        self.assertEqual((man["fraction"], man["units"], man["long"]), (0.125, 9, 1))
+
+    def test_cli(self):
+        p = os.path.join(self.tmp, "design.json")
+        wr(p, json.dumps(design2(self.tmp, self.edges)))
+        out, lm = os.path.join(self.tmp, "p.jsonl"), os.path.join(self.tmp, "long.json")
+        self.assertEqual(plan.main([p, "--pending", "--out", out, "--long-manifest", lm]), 0)
+        self.assertEqual(rqlib.read_json(lm)["long"], int(0.25 * 9 + 0.5))
 
 
 if __name__ == "__main__":
