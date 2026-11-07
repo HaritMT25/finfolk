@@ -61,6 +61,37 @@ jobs:
       - run: node tests/ocean_materials_tests.cjs
       - run: node tests/ocean_mock_three_tests.mjs
 
+  # tools/redqueen (the Red Queen tournament tooling) on the Python versions it must run on: the
+  # serial job's ctest runs it on the runner image's python3 (3.12); this job builds the serial app
+  # only and runs the same unit + end-to-end tests on 3.14 (the study server's: its multiprocessing
+  # default start method changed, so the runner uses plain subprocess workers) and the oldest 3.10.
+  redqueen:
+    name: redqueen tools (Python ${{ matrix.python }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.14"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install SFML (the app target)
+        run: sudo apt-get update -q && sudo apt-get install -y -q libsfml-dev
+      - name: Build the serial app
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DEVO_NO_OPENMP=ON
+          cmake --build build --target evo_boids -j
+      - name: Unit tests
+        # (a leaked file handle is a failure: ResourceWarning as an error, and none in the output)
+        run: |
+          python3 -I -W error::ResourceWarning tools/redqueen/test_redqueen.py -v 2>&1 | tee unit.log
+          test "${PIPESTATUS[0]}" = 0
+          ! grep -q ResourceWarning unit.log
+      - name: End to end (10 workers)
+        run: PYTHON=python3 RQ_TEST_WORKERS=10 bash tests/redqueen_tooling.sh build/evo_boids "$RUNNER_TEMP/rq_work"
+
   # tools/gate_receipts.*: fault suite on temp repos and fake tools (no Emscripten, no gate reuse in CI).
   receipts:
     name: gate receipts (fault suite)
