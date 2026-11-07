@@ -155,8 +155,10 @@ def load_age_reference(path_or_dict):
 
 def reference_ages(sources, n, labels=None):
     """One prey age CDF pooled from the living prey of `sources` (checkpoint dicts of the frozen
-    stable interval) -> its n quantile ages at the mid-probabilities (i + 0.5) / n, i = 0 .. n - 1
-    (the empirical inverse CDF, step definition: the pooled sorted age at floor(p M))."""
+    stable interval) -> its n quantile ages at the mid-probabilities (i + 0.5) / n, i = 0 .. n - 1:
+    the pooled sorted ages at floor((i + 0.5) M / n), in exact integer arithmetic (the upper order
+    statistic at the empirical CDF's jumps). The sources must share one maxAge (recorded; the
+    construction and the final plan both check it against the template's)."""
     pooled, srcs = [], []
     max_age = None
     for k, cp in enumerate(sources):
@@ -173,9 +175,10 @@ def reference_ages(sources, n, labels=None):
         raise CommonError("the age sources hold no living prey")
     pooled.sort()
     M = len(pooled)
-    ages = [pooled[min(M - 1, int((i + 0.5) / n * M))] for i in range(n)]
+    ages = [pooled[min(M - 1, ((2 * i + 1) * M) // (2 * n))] for i in range(n)]
     return {"schema": AGE_SCHEMA, "n": n, "ages": ages, "pooled": M, "max_age": max_age,
-            "method": "empirical inverse CDF of the pooled living-prey ages at (i + 0.5) / n (sorted[floor(p M)])",
+            "method": "the pooled living-prey ages, sorted, at floor((i + 0.5) M / n), i = 0 .. n - 1 (the upper "
+                      "order statistic at the empirical CDF's jumps)",
             "sources": srcs}
 
 

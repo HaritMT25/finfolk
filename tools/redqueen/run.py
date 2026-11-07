@@ -160,6 +160,9 @@ def load_plan(path, raw=None):
     ids = [r["id"] for r in rows]
     if len(set(ids)) != len(ids):
         raise SystemExit(f"{path}: duplicate cell ids")
+    if len({r["schema"] for r in rows}) > 1:
+        raise SystemExit(f"{path}: rows of {sorted({r['schema'] for r in rows})}: a plan has one schema (a /1 plan "
+                         "and a /2 plan run separately)")
     return rows
 
 
@@ -825,9 +828,15 @@ def _main(argv, files):
     todo = []
     for r in rows:
         rs = row_sha(r)
+        v2 = r["schema"] == PLAN_SCHEMA_V2
         if r["id"] in packed:
-            if packed[r["id"]][1].get("row_sha256") != rs:
+            e = packed[r["id"]][1]
+            if e.get("row_sha256") != rs:
                 print(f"cell {r['id']}: the plan row differs from the one it was packed with", file=sys.stderr)
+                return 2
+            if v2 and ("transplant_group" not in e or e.get("role") != r["role"]):
+                print(f"cell {r['id']}: packed without the /2 sharing records or with another role (a completion "
+                      "before 03a608b): a /2 study is rerun in a new root, not resumed", file=sys.stderr)
                 return 2
             continue
         if r["id"] in fin:
@@ -836,9 +845,15 @@ def _main(argv, files):
                 print(f"cell {r['id']}: the plan row differs from the one it finished with", file=sys.stderr)
                 return 2
             d = os.path.join(root, store.WORK, r["id"])
-            if rqlib.sha256_file(os.path.join(d, "bundle.json")) != dn["bundle_sha256"]:
+            raw = rqlib.read_bytes(os.path.join(d, "bundle.json"))
+            if rqlib.sha256_bytes(raw) != dn["bundle_sha256"]:
                 print(f"cell {r['id']}: its bundle.json no longer matches done.json", file=sys.stderr)
                 return 1
+            if v2:
+                probs = store.completion_problems(dn, json.loads(raw))
+                if probs:
+                    print(f"cell {r['id']}: {'; '.join(probs)}", file=sys.stderr)
+                    return 2
             continue
         todo.append(r)
     n_bio_start = 0

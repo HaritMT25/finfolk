@@ -78,26 +78,44 @@ Design /2 (design v3 §3.5, §4, §4.6, §7.1):
                "sampling": "wor-balanced", "short_steps": 5000, "long_steps": 20000,
                "short_horizons": [5000], "long_horizons": [5000, 10000, 20000],
                "log_every": 500, "checkpoint_every": 5000},
-  "long": {"fraction": 0.125, "strata": ["family", "prey_world"]},   # (STRATA lists the keys)
+  "long": {"fraction": 0.125, "strata": ["family", "prey_world"],    # (STRATA lists the keys)
+           "family_priority": ["reference", "cross", ...]},          # (a merged pair's primary family)
   "edges": "/abs/config/edges.jsonl" | [...]
 }
 An EDGE (one line): {"edge": "e000001", "family": "within", "role": "training" | "validation" |
 "test" | "support" | "audit" | "diagnostic", "prey": {"world", "time"}, "predators": {"world",
 "time"} | {"source": "random"} | null (the predator-free continuation), and optionally "assay",
 "k", "prey_policy", "horizon": "short" | "long" (absent: the pre-randomized long subset decides),
-"namespace": "main" | "audit" | ... (an independently seeded re-measurement)}.
-A PAIR (prey snapshot, opponent, prey policy, assay, K, namespace) becomes R cells, all with one
-role and one horizon: the same pair listed by several families appears once (its families
-merged); with different roles or horizons it is refused. The long subset: of the pairs whose
-horizon is not fixed, exactly round(fraction x N) are long, apportioned over the strata by
-largest remainder and chosen within a stratum by a hash order (--long-manifest writes it).
+"namespace": "main" | "audit" | ... (an independently seeded re-measurement; an audit edge, its
+controls included, defaults to "audit" and may not use "main"), "support_exception": true (a
+support edge whose role may differ from the pair's other condition versions, v4 §7.1)}.
+A PAIR is canonical: (prey snapshot UUID, opponent snapshot UUID | random | none, prey policy,
+assay, K, namespace); display labels that alias one snapshot merge into it (its row id is the
+smallest label, the others are recorded as "aliases"; aliases with different files are refused).
+A pair becomes R cells, all with one role and one horizon: the same pair listed by several
+families appears once (its families merged; its "primary_family", the stratum it is drawn in, is
+the first in long.family_priority, then the smallest name, so the edge order cannot move it);
+with different roles or horizons it is refused. Split roles are per endpoint pair across condition
+versions (policy, assay, K): two versions with different roles are refused unless one is a support
+edge marked support_exception. The long subset: of the pairs whose horizon is not fixed, exactly
+floor(fraction x N + 0.5) are long (the nearest whole unit: "1/8" is floor(N / 8 + 0.5)),
+apportioned over the strata by largest remainder and chosen within a stratum by a hash order;
+--long-manifest writes it only after every check passed, with the accepted plan's sha256.
 A long cell runs long_steps with its long_horizons (its first is the short horizon: a long
 trajectory includes its short measurement).
 SEEDS are global per snapshot x replicate, whatever the edge's family: sample, ages and reseed
 from (namespace, prey snapshot UUID, r); transplant (donor draw and placement) from (namespace,
-predator snapshot UUID, r), or (namespace, random, K, r); the fork's from its prey key. A
-snapshot UUID is a UUID5 of its world's UUID and frame. Rows (plan/2) carry the pair ("unit"),
-families, role, namespace, horizon, both snapshot UUIDs, the age reference and every group.
+predator snapshot UUID, r), or (namespace, random, K, r); the fork's from its prey key. Each is
+derive_seed(seed_namespace, kind, group key) and a 32-bit collision between two groups is refused
+(never re-derived per plan), so a group's seed is the same in every plan; --joint checks another
+plan (an audit's against production's) as one seed universe. The SNAPSHOT UUID is exactly
+uuid5(uuid.NAMESPACE_URL, "finfolk:snapshot:<world uuid>:<frame>") (the world UUID as text, the
+frame as a decimal integer; a fixed test vector is in test_redqueen.py). The age reference
+(common.py ages) is the upper order statistic at the empirical CDF's jumps: sorted pooled ages
+at floor((i + 0.5) M / N) for i = 0 .. N - 1; the final plan also checks its maxAge against every
+template's (as the construction does). Rows (plan/2) carry the pair ("unit"), its aliases,
+families and primary family, role, namespace, horizon, both snapshot UUIDs, the age reference
+and every group. A plan's rows all have one schema (run.py refuses /1 and /2 mixed).
 """
 from __future__ import annotations
 
@@ -280,19 +298,25 @@ def expand(design, pending=False):
     return rows, warnings
 
 
-def assign_seeds(rows, ns, kinds=SEED_KINDS):
+def assign_seeds(rows, ns, kinds=SEED_KINDS, reject_collisions=False):
+    """Every group's seed of each kind: derive_seed(ns, kind, group). Design /1 re-derives a
+    collision with a counter (in sorted group order); design /2 (reject_collisions) refuses it, so a
+    group's seed is a function of its namespace and key alone, the same in every plan (v4 §3.5)."""
     for kind in kinds:
         gkey = kind
         groups = sorted({r["groups"][gkey] for r in rows if r["groups"].get(gkey)})
-        used, val = set(), {}
+        used, val = {}, {}
         for g in groups:
             k = 0
             while True:
                 s = rqlib.derive_seed(ns, kind, g, *([k] if k else []))
                 if s not in used:
                     break
+                if reject_collisions:
+                    raise DesignError(f"{kind} seeds of groups {used[s]} and {g} collide ({s}): a global seed cannot "
+                                      "be re-derived per plan; change the seed namespace")
                 k += 1
-            used.add(s)
+            used[s] = g
             val[g] = s
         for r in rows:
             r.setdefault("seeds", {})[kind] = val[r["groups"][gkey]] if r["groups"].get(gkey) else None
@@ -335,6 +359,7 @@ def fill_hashes(rows):
             m = ckpt.meta(cp)
             m["predator_min_population"] = int((cp.get("config") or {}).get("predatorMinPopulation", 0))
             m["min_population"] = int((cp.get("config") or {}).get("minPopulation", 0))
+            m["max_age"] = float((cp.get("config") or {}).get("maxAge", 120.0))
             cache[p] = (rqlib.sha256_bytes(raw), m)
         return cache[p]
 
@@ -357,6 +382,11 @@ def fill_hashes(rows):
             ax["sha256"], ref = ages_info(ax["path"])
             if ref["n"] != row["n_prey"]:
                 raise DesignError(f"{ax['path']}: {ref['n']} reference ages, the cells sample {row['n_prey']} prey")
+            # (also at final planning, not only at construction: the reference's maxAge is the template's)
+            tm = info(row["template"]["path"])[1] if row.get("template") else None
+            if tm and ref.get("max_age") is not None and float(ref["max_age"]) != tm["max_age"]:
+                raise DesignError(f"{ax['path']}: estimated under prey maxAge {ref['max_age']}, the template "
+                                  f"{row['template']['path']} has {tm['max_age']}")
         for role in ("prey", "predators", "template"):
             x = row.get(role)
             if not (isinstance(x, dict) and x.get("path")):
@@ -413,6 +443,24 @@ def plan_seeds(rows, kinds=ENGINE_SEEDS):
     return out
 
 
+def joint_seed_problems(rows, other):
+    """Two plan/2 row sets checked as one seed universe: within each kind, one seed per group key
+    and no seed shared by two group keys (an audit plan against production, family plans)."""
+    probs = []
+    for kind in SEED_KINDS_V2:
+        by_group, by_seed = {}, {}
+        for r in list(rows) + list(other):
+            g = (r.get("groups") or {}).get(kind)
+            s = (r.get("seeds") or {}).get(kind)
+            if not g or s is None:
+                continue
+            if by_group.setdefault(g, s) != s:
+                probs.append(f"{kind} group {g} has two seeds ({by_group[g]}, {s})")
+            if by_seed.setdefault(s, g) != g:
+                probs.append(f"{kind} seed {s} is shared by groups {by_seed[s]} and {g}")
+    return sorted(set(probs))
+
+
 def write_plan(rows, path):
     data = b"".join(rqlib.canonical(r) for r in rows)
     rqlib.write_durable(path, data)
@@ -431,7 +479,8 @@ STRATA = ("family", "role", "kind", "assay", "prey_world", "pred_world", "prey_t
 
 
 def snapshot_uuid(world_uuid, frame):
-    """The global key of one archived snapshot (design v3 §3.5): a UUID5 of its world's UUID and frame."""
+    """The global key of one archived snapshot (design v3 §3.5), exactly
+    uuid5(NAMESPACE_URL, "finfolk:snapshot:<world uuid>:<frame>") (the frame a decimal integer)."""
     import uuid
     return str(uuid.uuid5(uuid.NAMESPACE_URL, f"finfolk:snapshot:{world_uuid}:{int(frame)}"))
 
@@ -530,7 +579,10 @@ def expand_v2(design, pending=False):
         return {"world": wn, "uuid": wu, "snapshot": snapshot_uuid(wu, times[label]), "time": label,
                 "frame": times[label], "path": snapshot_path(design, wn, label)}
 
-    units, edges = {}, []
+    priority = lg.get("family_priority") or []
+    if not isinstance(priority, list) or any(not isinstance(f, str) for f in priority):
+        raise DesignError("long.family_priority: a list of family names (the primary stratum of a merged pair)")
+    units, endpoints = {}, {}
     for n, e in enumerate(read_edges(design), 1):
         if not isinstance(e, dict) or not isinstance(e.get("prey"), dict):
             raise DesignError(f"edge {n}: needs prey {{world, time}}")
@@ -538,7 +590,15 @@ def expand_v2(design, pending=False):
         if role not in SPLIT_ROLES:
             raise DesignError(f"edge {n}: role {role!r}, one of {SPLIT_ROLES}")
         fam = _name("family", e.get("family"))
-        space = _name("namespace", e.get("namespace", "main"))
+        space = e.get("namespace")
+        if role == "audit":            # (v4 §7.5: an independently seeded remeasurement, controls too)
+            space = space or "audit"
+            if space == "main":
+                raise DesignError(f"edge {n}: an audit edge needs an independent namespace, not 'main'")
+        space = _name("namespace", space or "main")
+        exception = e.get("support_exception", False)
+        if exception not in (True, False) or (exception and role != "support"):
+            raise DesignError(f"edge {n}: support_exception is for a support edge only (v4 §7.1)")
         policy = e.get("prey_policy", s["prey_policy"])
         assay = e.get("assay", s["assay"])
         if policy not in POLICIES or assay not in ASSAYS:
@@ -563,33 +623,58 @@ def expand_v2(design, pending=False):
             raise DesignError(f"edge {n}: horizon short, long or absent (the pre-randomized long subset)")
         if policy == "common" and not templates:
             raise DesignError("the common prey policy needs 'templates'")
-        uid = (f"{prey['world']}.{prey['time']}~{ptag}.{policy}.{assay}.k{K}"
-               + ("" if space == "main" else f".{space}"))
+        label = (f"{prey['world']}.{prey['time']}~{ptag}.{policy}.{assay}.k{K}"
+                 + ("" if space == "main" else f".{space}"))
+        # the pair's identity is canonical: snapshot UUIDs, not display labels (aliases merge)
+        pkey = preds["snapshot"] if preds and preds.get("snapshot") else ptag
+        ukey = (prey["snapshot"], pkey, policy, assay, K, space)
         lag = (preds["frame"] - prey["frame"]) if preds and preds.get("world") == prey["world"] else "cross"
-        attrs = {"family": fam, "role": role, "kind": kind, "assay": assay, "prey_world": prey["world"],
+        attrs = {"role": role, "kind": kind, "assay": assay, "prey_world": prey["world"],
                  "pred_world": preds.get("world") if preds else ptag, "prey_time": prey["time"],
                  "pred_time": preds.get("time") if preds else ptag, "lag": lag}
-        content = {"prey": prey, "predators": preds, "policy": policy, "assay": assay, "k": K, "role": role,
-                   "space": space, "kind": kind}
-        if uid in units:
-            u = units[uid]
+        content = {"prey": prey["snapshot"], "prey_path": prey["path"], "predators": pkey,
+                   "pred_path": preds.get("path") if preds else None, "policy": policy, "assay": assay, "k": K,
+                   "role": role, "space": space, "kind": kind}
+        # split roles are per endpoint pair, across condition versions (v4 §7.1), but explicit
+        # support exceptions
+        if not exception:
+            ek = (prey["snapshot"], pkey, space)
+            if endpoints.setdefault(ek, (role, label))[0] != role:
+                raise DesignError(f"edge {n}: {label} is {role}, but {endpoints[ek][1]} (the same endpoints) is "
+                                  f"{endpoints[ek][0]}: every condition version of a pair keeps one role "
+                                  "(mark a support exception with support_exception)")
+        if ukey in units:
+            u = units[ukey]
             if u["content"] != content:
-                raise DesignError(f"edge {n}: pair {uid} appears twice with different content or roles "
-                                  "(all replicates, horizons and modes of a pair stay together)")
+                raise DesignError(f"edge {n}: pair {label} (= {u['label']}) appears twice with different content, "
+                                  "files or roles (all replicates, horizons and modes of a pair stay together)")
             if hz is not None and u["horizon"] not in (None, hz):
-                raise DesignError(f"edge {n}: pair {uid} has two horizons")
+                raise DesignError(f"edge {n}: pair {label} has two horizons")
             u["horizon"] = u["horizon"] or hz
             u["families"].add(fam)
             u["edges"].add(e.get("edge", f"line{n}"))
+            u["labels"].add(label)
+            if (label, prey["world"], prey["time"]) < (u["label"], u["prey"]["world"], u["prey"]["time"]):
+                u.update(label=label, prey=prey, preds=preds, attrs=attrs)    # (the canonical display)
             continue
-        units[uid] = {"id": uid, "content": content, "horizon": hz, "families": {fam}, "attrs": attrs,
-                      "edges": {e.get("edge", f"line{n}")}}
-    free = [u for u in units.values() if u["horizon"] is None]
+        units[ukey] = {"label": label, "labels": {label}, "content": content, "prey": prey, "preds": preds,
+                       "horizon": hz, "families": {fam}, "attrs": attrs, "edges": {e.get("edge", f"line{n}")}}
+    # the primary stratum of a pair listed by several families: registered priority, then name
+    rank = {f: i for i, f in enumerate(priority)}
+    byid = {}
+    for u in units.values():
+        u["id"] = u["label"]
+        u["primary_family"] = min(u["families"], key=lambda f: (rank.get(f, len(rank)), f))
+        u["attrs"]["family"] = u["primary_family"]
+        if u["id"] in byid:
+            raise DesignError(f"pair label {u['id']} names two different pairs")
+        byid[u["id"]] = u
+    free = [u for u in byid.values() if u["horizon"] is None]
     long_ids, long_man = select_long(free, fraction, strata, ns)
     rows = []
-    for uid in sorted(units):
-        u = units[uid]
-        c = u["content"]
+    for uid in sorted(byid):
+        u = byid[uid]
+        c = dict(u["content"], prey=u["prey"], predators=u["preds"])
         is_long = u["horizon"] == "long" or (u["horizon"] is None and uid in long_ids)
         for r in range(R):
             pk = f"{c['space']}|{c['prey']['snapshot']}|r{r:02d}"
@@ -605,7 +690,8 @@ def expand_v2(design, pending=False):
                       "prey": pk, "pred": None if c["kind"] == "nopred" else qk}
             rows.append({
                 "schema": PLAN_SCHEMA_V2, "id": f"{uid}.r{r:02d}", "design": design.get("name", ""),
-                "unit": uid, "edges": sorted(u["edges"]), "families": sorted(u["families"]), "role": c["role"],
+                "unit": uid, "edges": sorted(u["edges"]), "families": sorted(u["families"]),
+                "primary_family": u["primary_family"], "aliases": sorted(u["labels"] - {uid}), "role": c["role"],
                 "namespace": c["space"], "kind": c["kind"], "prey": dict(c["prey"]),
                 "predators": dict(c["predators"]) if c["predators"] else None,
                 "template": {"index": r % len(templates), "path": templates[r % len(templates)]} if common else None,
@@ -620,7 +706,7 @@ def expand_v2(design, pending=False):
                 "expected": {"checkpoint_steps": list(range(s["checkpoint_every"],
                                                             (s["long_steps"] if is_long else s["short_steps"]) + 1,
                                                             s["checkpoint_every"]))}})
-    assign_seeds(rows, ns, SEED_KINDS_V2)
+    assign_seeds(rows, ns, SEED_KINDS_V2, reject_collisions=True)
     for row in rows:
         for role in ("prey", "predators", "template", "ages"):
             x = row.get(role)
@@ -638,18 +724,25 @@ def main(argv=None):
     ap.add_argument("--against")
     ap.add_argument("--avoid", action="append", default=[])
     ap.add_argument("--out", required=True)
-    ap.add_argument("--long-manifest", help="(design /2) write the pre-randomized long subset's manifest here")
+    ap.add_argument("--long-manifest", help="(design /2) write the pre-randomized long subset's manifest here "
+                                            "(after every check passed; it names the plan's sha256)")
+    ap.add_argument("--joint", action="append", default=[], metavar="PLAN",
+                    help="(design /2) another plan (an audit's, production's) checked jointly: no seed value "
+                         "shared by two different groups, no group with two seeds")
     a = ap.parse_args(argv)
     if a.pending and a.against:
         ap.error("--pending and --against exclude each other")
+    long_man = None
     try:
         design = json.loads(rqlib.read_text(a.design))
         if design.get("schema") == DESIGN_SCHEMA_V2:
             rows, warnings, long_man = expand_v2(design, pending=a.pending)
-            if a.long_manifest:
-                rqlib.write_durable(a.long_manifest, rqlib.canonical(long_man))
         else:
             rows, warnings = expand(design, pending=a.pending)
+        for p in a.joint:
+            probs = joint_seed_problems(rows, [json.loads(ln) for ln in rqlib.read_text(p).split("\n") if ln.strip()])
+            if probs:
+                raise DesignError(f"jointly with {p}: " + "; ".join(probs[:5]))
     except (DesignError, OSError, ValueError, KeyError) as e:
         print(f"plan.py: {e}", file=sys.stderr)
         return 2
@@ -674,6 +767,8 @@ def main(argv=None):
             return 2
         print(f"engine seeds checked against {len(a.avoid)} archived plan(s): no overlap", file=sys.stderr)
     sha = write_plan(rows, a.out)
+    if a.long_manifest and long_man is not None:      # (only for a plan that passed every check)
+        rqlib.write_durable(a.long_manifest, rqlib.canonical(dict(long_man, plan_sha256=sha, plan=os.path.abspath(a.out))))
     kinds = {}
     for r in rows:
         kinds[r["kind"]] = kinds.get(r["kind"], 0) + 1

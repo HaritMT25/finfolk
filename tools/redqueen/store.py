@@ -344,6 +344,33 @@ def pair_groups(cells):
     return out
 
 
+SHARING_SCHEMA = "finfolk.redqueen.sharing/1"
+BUNDLE_V2 = "finfolk.redqueen.bundle/2"
+
+
+def completion_problems(done, bundle):
+    """How a /2 completion's done.json disagrees with its (hash-valid) bundle: the bundle must carry
+    the sharing record (a /2 bundle without one was completed before 03a608b: refused, never mixed
+    in), and done.json's role, families, transplant group and realized draw must be the bundle's."""
+    if bundle.get("schema") != BUNDLE_V2:
+        return [] if not done.get("transplant_group") else ["a /1 bundle with a /2 transplant group"]
+    c, sh = bundle.get("cell") or {}, bundle.get("sharing")
+    if not isinstance(sh, dict) or sh.get("schema") != SHARING_SCHEMA:
+        return ["a /2 bundle without its sharing record (completed before 03a608b): rerun it in a new root"]
+    probs = []
+    if sh.get("keys") != c.get("groups") or sh.get("seeds") != c.get("seeds"):
+        probs.append("the sharing record's keys or seeds are not the cell's")
+    if done.get("role") != c.get("role") or done.get("families") != c.get("families"):
+        probs.append(f"done.json's role / families ({done.get('role')}, {done.get('families')}) are not the "
+                     f"bundle's ({c.get('role')}, {c.get('families')})")
+    tg = f"{(c.get('groups') or {}).get('transplant')}|k{c.get('k')}" if c.get("kind") == "assay" else None
+    th = (sh.get("realized") or {}).get("transplant_realized_sha256") if tg else None
+    if done.get("transplant_group") != tg or done.get("transplant_realized_sha256") != th:
+        probs.append(f"done.json's transplant group / realized draw ({done.get('transplant_group')}) are not the "
+                     f"bundle's ({tg})")
+    return probs
+
+
 def transplant_groups(cells):
     """{transplant group (predator snapshot x replicate x K, plan/2): the realized donor draw and
     placement} over indexed cells (raises on a disagreement: design v4 §3.5)."""
@@ -396,6 +423,13 @@ def pack(root, ids=None, log=print):
         if rqlib.sha256_bytes(b) != done.get("bundle_sha256"):
             raise StoreError(f"{cid}: bundle.json does not match its done.json")
         dn = rqlib.read_bytes(os.path.join(d, "done.json"))
+        try:
+            bjson = json.loads(b)
+        except ValueError:
+            raise StoreError(f"{cid}: bundle.json is not JSON")
+        probs = completion_problems(done, bjson) if isinstance(bjson, dict) else []
+        if probs:
+            raise StoreError(f"{cid}: " + "; ".join(probs))
         g, h = done.get("common_group"), done.get("common_sha256")
         if g and h and groups.setdefault(g, h) != h:
             raise StoreError(f"{cid}: common group {g} built {h[:12]}, other cells built {groups[g][:12]} "
