@@ -285,17 +285,24 @@ def fill_hashes(rows):
                 raise DesignError(str(e))
             m = ckpt.meta(cp)
             m["predator_min_population"] = int((cp.get("config") or {}).get("predatorMinPopulation", 0))
+            m["min_population"] = int((cp.get("config") or {}).get("minPopulation", 0))
             cache[p] = (rqlib.sha256_bytes(raw), m)
         return cache[p]
 
     for row in rows:
-        # a live arena keeps its prey world's config, predator floor included (transplant.hpp): a
-        # floor would refill predators into the predator-free control and change the challenge's K
+        # a live arena keeps its prey world's config, both floors included (transplant.hpp; the
+        # frozen modes set them to 0): a predator floor would refill predators into the
+        # predator-free control, a prey floor (review round 3) would replenish the prey a
+        # challenge removes
         if row["assay"] == "live":
             x = row["template"] if row["prey_policy"] == "common" else row["prey"]
-            if info(x["path"])[1]["predator_min_population"] != 0:
+            m = info(x["path"])[1]
+            if m["predator_min_population"] != 0:
                 raise DesignError(f"{row['id']}: a live challenge (or its control) needs predatorMinPopulation 0 in "
                                   f"its prey world {x['path']}")
+            if m["min_population"] != 0:
+                raise DesignError(f"{row['id']}: a live challenge (or its control) needs a prey minPopulation of 0 "
+                                  f"in its prey world {x['path']} (it is {m['min_population']})")
         for role in ("prey", "predators", "template"):
             x = row.get(role)
             if not (isinstance(x, dict) and x.get("path")):

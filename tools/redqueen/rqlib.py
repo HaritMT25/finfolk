@@ -33,9 +33,14 @@ PR_SET_PDEATHSIG = 1
 
 
 def death_signal(expected_parent=None):
-    """-> a preexec_fn for subprocess.Popen: the child gets SIGTERM when its parent dies, even by
+    """-> a preexec_fn for subprocess.Popen: the child gets SIGKILL when its parent dies, even by
     SIGKILL (Linux PR_SET_PDEATHSIG). Workers are plain subprocesses (no multiprocessing: Python
     3.14 changed its default start method), so this is the only process plumbing.
+    SIGKILL, not SIGTERM (review round 3): a worker HANDLES SIGTERM (orderly shutdown: stop the
+    engine, exit), and a handled signal stays pending while the process is stopped, so a SIGSTOPped
+    worker would outlive its dead runner, and its engine (whose parent, the worker, is alive) with
+    it. SIGKILL ends a stopped process; the worker's death then SIGKILLs its engine the same way.
+    The runner's own orderly shutdown still goes through SIGTERM to each group (run.stop_groups).
     expected_parent: the spawning process's pid, taken BEFORE the fork. A parent that died between
     the fork and the prctl would not signal the child (it has been reparented already), so after
     a successful prctl the child compares getppid() with it and exits at once if they differ. A
@@ -47,7 +52,7 @@ def death_signal(expected_parent=None):
     def pre():
         if _LIBC is None:
             return
-        if _LIBC.prctl(PR_SET_PDEATHSIG, signal.SIGTERM, 0, 0, 0) != 0:
+        if _LIBC.prctl(PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0) != 0:
             raise OSError("prctl(PR_SET_PDEATHSIG) failed")
         if os.getppid() != parent:
             os._exit(1)      # the parent is already gone: run nothing

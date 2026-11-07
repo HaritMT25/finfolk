@@ -61,26 +61,89 @@ def _writable(p):
     return bool(os.stat(p).st_mode & 0o222)
 
 
+_LINKS_ALLOWED = False   # set by a runner or worker started with --link-sources (allow_links)
+
+
+def allow_links(flag):
+    """The store policy of this process: False (the default) = every object must be an independent
+    read-only copy; True (--link-sources) = read-only hard links into a finalized archive accepted."""
+    global _LINKS_ALLOWED
+    _LINKS_ALLOWED = bool(flag)
+
+
+def _acceptable(p):
+    """An object this policy may serve as it is: no write bit, and (unless links are allowed) no
+    other name for its inode (link count 1)."""
+    st = os.stat(p)
+    if st.st_mode & 0o222:
+        return False
+    return st.st_nlink == 1 or _LINKS_ALLOWED
+
+
+def _migrate(p, data):
+    """Replace object p by an independent read-only copy of `data` (the bytes just read from p and
+    verified against its name): a new file, fsync'd, 0444, renamed over p, the directory fsync'd.
+    The old inode (a legacy hard link shares it with the archive) is left as it was: never
+    chmod'ed, never written."""
+    tmp = f"{p}.mig.tmp.{os.getpid()}"
+    with open(tmp, "wb") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    os.chmod(tmp, 0o444)
+    os.replace(tmp, p)
+    rqlib.fsync_dir(os.path.dirname(p))
+
+
 def has(root, sha):
-    """The path of a verified blob with this content (raw or .gz), else None. Only read-only blobs
-    are remembered as verified; a writable one (it should not exist) is re-hashed at every call."""
+    """The path of a verified blob with this content (raw or .gz), else None. Review round 3, P1-1:
+    a blob the policy does not accept as it is (writable, or a hard link shared with an archive:
+    an object a root made before round 2 can be either) is re-hashed from the bytes read and, if
+    they are right, replaced by an independent read-only copy of THOSE bytes (_migrate) before it
+    is served; a blob that no longer matches its name is not served."""
     if not rqlib.is_sha256(sha):
         return None
     for gz in (False, True):
         p = _obj(root, sha, gz)
         if not os.path.isfile(p):
             continue
-        if (root, sha, gz) in _VERIFIED and not _writable(p):
+        if (root, sha, gz) in _VERIFIED and _acceptable(p):
             return p
         try:
-            got = rqlib.sha256_bytes(gzip.decompress(rqlib.read_bytes(p))) if gz else rqlib.sha256_file(p)
+            data = rqlib.read_bytes(p)
+            got = rqlib.sha256_bytes(gzip.decompress(data) if gz else data)
         except (OSError, EOFError, gzip.BadGzipFile):
             continue
-        if got == sha:
-            if not _writable(p):
-                _VERIFIED.add((root, sha, gz))
-            return p
+        if got != sha:
+            continue
+        if not _acceptable(p):
+            _migrate(p, data)
+        _VERIFIED.add((root, sha, gz))
+        return p
     return None
+
+
+def migrate_all(root, log=print):
+    """At a runner's start: every object the policy does not accept as it is goes through has()
+    (migrated to an independent read-only copy if its content is still right). -> (migrated count,
+    problems: objects whose content no longer matches their name)."""
+    od = os.path.join(root, OBJECTS)
+    n, probs = 0, []
+    for dp, _, fs in os.walk(od) if os.path.isdir(od) else []:
+        for f in sorted(fs):
+            name = f[:-3] if f.endswith(".gz") else f
+            if not rqlib.is_sha256(name):
+                continue
+            p = os.path.join(dp, f)
+            if _acceptable(p):
+                continue
+            if has(root, name) is None:
+                probs.append(f"store object {name[:12]} no longer matches its name (changed through a shared link?)")
+            else:
+                n += 1
+    if n:
+        log(f"store: {n} legacy object(s) replaced by independent read-only copies")
+    return n, probs
 
 
 FINALIZED = "FINALIZED"   # the marker a finished archive directory carries (the --link-sources contract)
@@ -152,6 +215,8 @@ def put_file(root, src, want=None, link=False):
     if link and _writable(tmp):
         os.remove(tmp)
         raise StoreError(f"--link-sources: {src} became writable")
+    if link:
+        allow_links(True)    # (the caller chose the link policy for this process)
     if has(root, sha):
         os.remove(tmp)
         return sha
@@ -411,9 +476,10 @@ def recover(root, log=print, deep=True):
     relies on it); (2) delete uncommitted chunk files and temporaries (their cells still have
     their working directories); (3) verify the committed chunks: every chunk holding a cell whose
     working directory is still there in full (its SHA-256, CRCs and every member against the
-    index), the others by SHA-256 (deep) or by size; (4) only if all of that passed, delete those
-    leftover working directories (each bundle first checked against the index). Any problem
-    keeps every working directory and is returned for the caller to stop on."""
+    index), the others by SHA-256 (deep) or by size; (4) check EVERY leftover bundle against the
+    index (round 3: all of them before any deletion); (5) only if all of that passed, delete those
+    leftover working directories. Any problem keeps every working directory and is returned for
+    the caller to stop on."""
     acts, probs = [], []
     cdir = os.path.join(root, CHUNKS)
     recs, cells = load_index(root, repair=True)
@@ -444,13 +510,15 @@ def recover(root, log=print, deep=True):
         if leftovers:
             log(f"recover: {len(leftovers)} packed cells' working directories KEPT (the chunks failed verification)")
         return acts, probs
-    for x in leftovers:
-        d = os.path.join(wd, x)
-        bp = os.path.join(d, "bundle.json")
+    for x in leftovers:     # (review round 3) every bundle checked first: one mismatch keeps them all
+        bp = os.path.join(wd, x, "bundle.json")
         if os.path.isfile(bp) and rqlib.sha256_file(bp) != cells[x][1]["bundle_sha256"]:
-            probs.append(f"work/{x} is packed, but its bundle.json differs from the packed one (kept)")
-            continue
-        shutil.rmtree(d)
+            probs.append(f"work/{x} is packed, but its bundle.json differs from the packed one")
+    if probs:
+        log(f"recover: {len(leftovers)} packed cells' working directories KEPT (a bundle differs from its chunk)")
+        return acts, probs
+    for x in leftovers:
+        shutil.rmtree(os.path.join(wd, x))
         acts.append(f"deleted the packed cell's working directory {x}")
     if leftovers and os.path.isdir(wd):
         rqlib.fsync_dir(wd)

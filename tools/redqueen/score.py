@@ -24,7 +24,9 @@ each horizon at its frame; the arena's and every checkpoint's predator count == 
 modes, no predator births / deaths / refills there; the predation-death counter difference
 equals the summed captures; and in the predator-free fork (--fork), in every assay mode, no
 predator at any sample or horizon, no capture, predator birth or refill in any row, and no
-change of the predator-birth, refill or predation-death counters.
+change of the predator-birth, refill or predation-death counters; and in every cell, no prey
+replenishment (a prey floor's injected founders): at each horizon the living prey are exactly
+the start plus births minus deaths, and no prey outside the initial cohort is a founder.
 """
 from __future__ import annotations
 
@@ -121,6 +123,16 @@ def score(d, k, steps, horizons, log_every, assay, fork=False):
         if dc["totalDeathsPredation"] != captures:
             raise ScoreError(f"horizon {h}: {dc['totalDeathsPredation']} predation deaths in the counters, "
                              f"{captures} captures in predators.csv")
+        # (review round 3) prey replenishment: the prey alive now must be exactly the start plus
+        # births minus deaths (a floor's injected founders are neither); and no prey that is not
+        # of the initial cohort may be a founder (generation 0, or its own lineage)
+        alive_now = sum(1 for a in cs["alive"] if int(a))
+        injected = alive_now - (n0 + dc["totalBirths"] - dc["totalDeaths"])
+        founders = [int(i) for i, a, ln, g in zip(cs["id"], cs["alive"], cs["lineageId"], cs["generation"])
+                    if int(a) and int(i) not in start_ids and (int(g) == 0 or int(ln) == int(i))]
+        if injected != 0 or founders:
+            raise ScoreError(f"horizon {h}: prey replenished during the assay ({injected} beyond births and deaths; "
+                             f"new founders {founders[:5]})")
         out.append({
             "steps": h, "frame": f0 + h, "captures": captures, "predator_seconds": pred_s,
             "exposure": "exact (fixed K)" if frozen else "sampled (count at each log row)",
@@ -136,7 +148,7 @@ def score(d, k, steps, horizons, log_every, assay, fork=False):
     return {"schema": SCHEMA, "f0": f0, "k": k, "assay": assay, "n_start": n0, "dt": DT, "log_every": log_every,
             "steps": steps, "horizons": out,
             "checks": {"rows": len(prow), "frozen_k_constant": frozen, "predation_deaths_equal_captures": True,
-                       "fork_predator_free": fork}}
+                       "fork_predator_free": fork, "no_prey_replenishment": True}}
 
 
 def main(argv=None):

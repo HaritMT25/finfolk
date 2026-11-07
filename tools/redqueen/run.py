@@ -37,10 +37,15 @@ subprocesses, never multiprocessing, so Python 3.10 to 3.14 behave the same):
     and rewritten if it is not those bytes (an interrupted copy);
   * sources: every registered snapshot / template a cell to run reads is hashed before anything
     is admitted (one changed file refuses the batch, exit 2) and again by the worker, from the
-    very bytes it parses (exit 5). A finished cell's sources go into the store as independent,
-    verified, read-only copies (hard links only with --link-sources, refused unless each source
-    is read-only in a read-only, FINALIZED archive directory), and its common manifest (gzip),
-    before its done.json, so a replay never depends on the archive;
+    very bytes it parses (exit 5), which it writes as FROZEN read-only copies in the cell: the
+    engine reads only those (never an archive path), and the store is filled from them. A
+    finished cell's sources go into the store as independent, verified, read-only copies (hard
+    links only with --link-sources, refused unless each source is read-only in a read-only,
+    FINALIZED archive directory), and its common manifest (gzip), before its done.json, so a
+    replay never depends on the archive. At start, objects the policy does not accept as they
+    are (writable, or hard links an archive shares: a pre-round-2 root's) are replaced by
+    independent read-only copies of their verified bytes (store.migrate_all; no chmod of a
+    shared inode), and an object that no longer matches its name is reported and never served;
   * durable completion: bundle.json, then done.json, each fsync'd and renamed with a directory
     fsync; the cell's checkpoints are deleted only after both (their hashes are in the bundle);
   * resume: a packed cell (in the chunk index) or a finished one (done.json whose bundle matches)
@@ -52,7 +57,9 @@ subprocesses, never multiprocessing, so Python 3.10 to 3.14 behave the same):
     source has no living prey, or the donor has no predators), which is always recorded in the
     durable bio-failure ledger and then, with --on-bio-failure stop (default), stops admission,
     or with skip, skips that source's cells in that role only (now and on every later start),
-    logged as BIOLOGICAL, counted in progress.json, never silently;
+    logged as BIOLOGICAL, counted in progress.json, never silently. The ledger is recovered under
+    the lock at start before it is applied or appended to (a torn final record cut, a malformed
+    interior record refused, file and root fsync'd);
   * STOP: the file STUDY/STOP stops admission; running cells finish and are packed; exit 75;
   * memory, fail closed: a cell is admitted only while min(MemAvailable, every cgroup v2
     memory.max - memory.current up the tree) >= --mem-min-mb + the largest per-cell RSS seen
@@ -65,13 +72,15 @@ subprocesses, never multiprocessing, so Python 3.10 to 3.14 behave the same):
     (store.pack: written, verified, committed, then deleted; a challenge and its predator-free
     control must show the same arena prey settings, and one common group one common checkpoint);
     at start store.recover() repairs and fsyncs the index, verifies the committed chunks (in full
-    where a packed cell's working directory remains; --quick-resume: the others by size) and only
-    then deletes those leftovers; a failed verification keeps them and exits 1;
+    where a packed cell's working directory remains; --quick-resume: the others by size), checks
+    every leftover bundle, and only then deletes those leftovers; any failure keeps them all and
+    exits 1;
   * signals: SIGINT / SIGTERM to the runner stop every worker's process group: SIGTERM, bounded
     polling for RQ_KILL_GRACE seconds (20), then SIGKILL (which also ends a SIGSTOPped worker),
     then bounded reaps; exit 130. Workers forward signals to their engine. Every child (worker or
-    engine) gets PR_SET_PDEATHSIG and then checks that its parent is still the process that
-    spawned it (exiting at once otherwise), so none outlives a SIGKILLed runner;
+    engine) gets PR_SET_PDEATHSIG = SIGKILL (not the handled SIGTERM, which a stopped worker could
+    not act on) and then checks that its parent is still the process that spawned it (exiting at
+    once otherwise), so none outlives a SIGKILLed runner, stopped or not;
   * replay: --replay rebuilds one cell (packed or not) into an empty directory from the pinned
     binary, the tool versions it ran (from the store when they are no longer pinned) and its
     sources (registered path, else the store), and compares the new bundle with the recorded one
@@ -156,22 +165,56 @@ BIO_LEDGER = "bio_failures.jsonl"
 BIO_SCHEMA = "finfolk.redqueen.biofailure/1"
 
 
+class LedgerError(Exception):
+    pass
+
+
+def _parse_ledger(raw):
+    """-> (records, torn): every newline-terminated line must be a record of BIO_SCHEMA (else
+    LedgerError: a malformed INTERIOR record is damage, not a crash); bytes after the last newline
+    are a torn final record (a crash while appending, even when they happen to be complete JSON:
+    its append was not acknowledged)."""
+    body, sep, tail = raw.rpartition(b"\n")
+    if not sep:
+        body, tail = b"", raw
+    recs = []
+    for k, ln in enumerate(body.split(b"\n") if body else [], 1):
+        try:
+            r = json.loads(ln.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            raise LedgerError(f"{BIO_LEDGER}: line {k} is malformed (not the torn tail): repair by hand")
+        if not isinstance(r, dict) or r.get("schema") != BIO_SCHEMA:
+            raise LedgerError(f"{BIO_LEDGER}: line {k} is not a {BIO_SCHEMA} record")
+        recs.append(r)
+    return recs, tail
+
+
 def read_bio_ledger(root):
-    """The bio-failure ledger's entries (a torn last line, from a crash while appending, is ignored)."""
+    """The ledger's acknowledged records (read only: a torn tail is ignored, not repaired)."""
     p = os.path.join(root, BIO_LEDGER)
-    out = []
-    if os.path.isfile(p):
-        for ln in rqlib.read_text(p).split("\n"):
-            if ln.strip():
-                try:
-                    out.append(json.loads(ln))
-                except ValueError:
-                    pass
-    return out
+    return _parse_ledger(rqlib.read_bytes(p))[0] if os.path.isfile(p) else []
+
+
+def recover_bio_ledger(root):
+    """Under the root lock, before the ledger is applied or appended to (review round 3): keep the
+    validated newline-terminated records, cut a torn final record (rewritten durably), refuse a
+    malformed interior record (LedgerError), and fsync the file and the root whatever, so the
+    records used to skip cells are durable. -> (records, the torn bytes dropped)."""
+    p = os.path.join(root, BIO_LEDGER)
+    if not os.path.isfile(p):
+        return [], b""
+    raw = rqlib.read_bytes(p)
+    recs, tail = _parse_ledger(raw)
+    if tail:
+        rqlib.write_durable(p, raw[:len(raw) - len(tail)])
+    rqlib.fsync_file(p)
+    rqlib.fsync_dir(root)
+    return recs, tail
 
 
 def append_bio_ledger(root, entry):
-    """Append one entry durably (write, fsync the file, fsync the root)."""
+    """Append one record durably (write, fsync the file, fsync the root). Only after
+    recover_bio_ledger: the file then ends with a newline (or is empty)."""
     p = os.path.join(root, BIO_LEDGER)
     with open(p, "ab") as f:
         f.write(rqlib.canonical(dict(entry, schema=BIO_SCHEMA)))
@@ -380,6 +423,7 @@ def run_cell(root, cid, link=False):
     """Worker: build, run, score, publish one cell. Exit 0 only once done.json is durable. A
     biological failure (exit 9) leaves bio.json (which source, in which role) for the runner."""
     import cell as cell_mod
+    store.allow_links(link)
     d = os.path.join(root, store.WORK, cid)
     c = rqlib.read_json(os.path.join(d, "cell.json"))
     exe = os.path.join(root, "bin", "evo_boids")
@@ -406,7 +450,11 @@ def run_cell(root, cid, link=False):
     # provenance first (review-round lesson of the first study): everything a replay needs is in
     # the store, durably, before done.json says the cell is finished
     try:
-        shas = [store.put_file(root, paths[role], want=c[role]["sha256"], link=link)
+        # from the cell's FROZEN copies (the very bytes verified and run, review round 3); a hard
+        # link (--link-sources) goes to the archive file itself, under its contract
+        frozen = info.get("frozen_inputs") or {}
+        shas = [store.put_file(root, paths[role] if link else frozen.get(role, paths[role]),
+                               want=c[role]["sha256"], link=link)
                 for role, _, _ in registered_sources(c)]
         if bundle["common_manifest_sha256"]:
             with open(os.path.join(d, "common.manifest.json"), "rb") as f:
@@ -561,7 +609,10 @@ def status(root):
         prog = rqlib.read_json(os.path.join(root, "progress.json"))
     except (OSError, ValueError):
         pass
-    ledger = read_bio_ledger(root)
+    try:
+        ledger = read_bio_ledger(root)
+    except LedgerError as e:
+        ledger = [{"cell": f"DAMAGED: {e}"}]
     st = {"root": root, "plan_cells": total, "done": len(done_ids & plan_ids) if plan_ids else len(done_ids),
           "packed": len(cells), "finished_unpacked": len(fin), "in_flight_or_interrupted": len(inflight),
           "failed_attempts": len(attempts), "chunks": len(recs), "chunk_bytes": sum(r["bytes"] for r in recs),
@@ -704,6 +755,20 @@ def _main(argv, files):
     if probs:
         log(f"committed chunks damaged or inconsistent (working copies kept): {probs[:5]}")
         return 1
+    # (review round 3) the store policy of this run, and legacy objects (writable, or hard links an
+    # archive shares) replaced by independent read-only copies before anything relies on them
+    store.allow_links(a.link_sources)
+    n_mig, mprobs = store.migrate_all(root, log)
+    for m in mprobs:
+        log(f"WARNING: {m}")
+    # (review round 3) the bio-failure ledger recovered under the lock before it is applied or appended to
+    try:
+        ledger, torn = recover_bio_ledger(root)
+    except LedgerError as e:
+        log(f"the bio-failure ledger is damaged: {e}")
+        return 1
+    if torn:
+        log(f"recover: dropped a torn final record of {BIO_LEDGER} ({len(torn)} bytes, never acknowledged)")
     if a.pack:
         name, n = store.pack(root, log=log)
         log(f"pack: {n} cells" + (f" into {name}" if name else "") + (f" (recovered: {len(acts)} actions)" if acts else ""))
@@ -743,7 +808,6 @@ def _main(argv, files):
                 return 1
             continue
         todo.append(r)
-    ledger = read_bio_ledger(root)
     n_bio_start = 0
     if ledger and a.on_bio_failure == "skip":
         keep = [r for r in todo if not bio_match(r, ledger)]

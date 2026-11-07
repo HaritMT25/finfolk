@@ -394,6 +394,8 @@ class TestPlan(unittest.TestCase):
 class TestStore(unittest.TestCase):
     def setUp(self):
         self.root = tempfile.mkdtemp()
+        store.allow_links(False)       # the default policy (a link test turns it on for its process)
+        store._VERIFIED.clear()
 
     def tearDown(self):
         shutil.rmtree(self.root)
@@ -500,12 +502,84 @@ class TestStore(unittest.TestCase):
             acts, probs = store.recover(self.root, log=lambda m: None, deep=deep)
             self.assertTrue(probs, deep)
             self.assertEqual(sorted(os.listdir(os.path.join(self.root, store.WORK))), ["k0", "k1", "k2"])
-        with open(chunk, "wb") as f:
-            f.write(good)
+        wr(chunk, good)
+        # (review round 3) the chunk is fine but ONE leftover bundle differs: nothing is deleted,
+        # not even the leftovers that do match (they are all checked before any deletion)
+        k2 = os.path.join(self.root, store.WORK, "k2", "bundle.json")
+        k2_good = rqlib.read_bytes(k2)
+        wr(k2, b" ", "ab")
+        acts, probs = store.recover(self.root, log=lambda m: None, deep=False)
+        self.assertTrue(probs and "k2" in probs[0], probs)
+        self.assertEqual(sorted(os.listdir(os.path.join(self.root, store.WORK))), ["k0", "k1", "k2"])
+        wr(k2, k2_good)
         acts, probs = store.recover(self.root, log=lambda m: None, deep=False)
         self.assertEqual(probs, [])
         self.assertEqual(os.listdir(os.path.join(self.root, store.WORK)), [])
         self.assertEqual(sum("deleted the packed cell" in x for x in acts), 3)
+
+    def test_legacy_objects_migrated(self):
+        """Review round 3, P1-1: an object a pre-round-2 root holds as a WRITABLE HARD LINK to an
+        archive file (or as a writable copy) is replaced by an independent read-only copy before it
+        is served (has, put_file's shortcut, the start-of-run sweep); the archive's inode is not
+        touched (no chmod); a later in-place rewrite of the archive cannot reach the object; an
+        object whose content no longer matches its name is not served."""
+        store.allow_links(False)
+        arch = os.path.join(self.root, "a.json")
+        wr(arch, "the archived world")
+        os.chmod(arch, 0o644)
+        sha = rqlib.sha256_bytes(b"the archived world")
+        obj = os.path.join(self.root, store.OBJECTS, sha[:2], sha)
+        os.makedirs(os.path.dirname(obj))
+        os.link(arch, obj)                                   # the legacy object
+        self.assertEqual(store.put_file(self.root, arch, want=sha), sha)   # the shortcut migrates
+        st, sa = os.stat(obj), os.stat(arch)
+        self.assertEqual((st.st_nlink, st.st_mode & 0o777), (1, 0o444))
+        self.assertNotEqual(st.st_ino, sa.st_ino)
+        self.assertEqual(sa.st_mode & 0o777, 0o644)          # the archive file was not chmod'ed
+        with open(arch, "r+") as f:
+            f.write("THE ARCHIVED WORLD")                    # rewritten in place
+        self.assertEqual(store.get_bytes(self.root, sha), b"the archived world")
+        # the sweep at a runner's start: a writable copy and another shared link
+        sha2 = store.put_bytes(self.root, b"tool v1")
+        o2 = store.has(self.root, sha2)
+        os.chmod(o2, 0o644)
+        arch3 = os.path.join(self.root, "b.json")
+        wr(arch3, "another world")
+        sha3 = rqlib.sha256_bytes(b"another world")
+        o3 = os.path.join(self.root, store.OBJECTS, sha3[:2], sha3)
+        os.makedirs(os.path.dirname(o3), exist_ok=True)
+        os.link(arch3, o3)
+        store._VERIFIED.clear()
+        n, probs = store.migrate_all(self.root, log=lambda m: None)
+        self.assertEqual((n, probs), (2, []))
+        for o in (o2, o3):
+            self.assertEqual((os.stat(o).st_nlink, os.stat(o).st_mode & 0o777), (1, 0o444))
+        # a legacy link whose archive has ALREADY been rewritten cannot be saved, and is not served
+        arch4 = os.path.join(self.root, "c.json")
+        wr(arch4, "world four")
+        sha4 = rqlib.sha256_bytes(b"world four")
+        o4 = os.path.join(self.root, store.OBJECTS, sha4[:2], sha4)
+        os.makedirs(os.path.dirname(o4), exist_ok=True)
+        os.link(arch4, o4)
+        wr(arch4, "WORLD FOUR")
+        self.assertIsNone(store.has(self.root, sha4))
+        n, probs = store.migrate_all(self.root, log=lambda m: None)
+        self.assertEqual(n, 0)
+        self.assertTrue(any(sha4[:12] in p for p in probs), probs)
+        # under --link-sources a read-only shared link is accepted as it is
+        store.allow_links(True)
+        try:
+            os.chmod(arch3, 0o444)
+            arch5 = os.path.join(self.root, "d.json")
+            wr(arch5, "world five")
+            os.chmod(arch5, 0o444)
+            sha5 = rqlib.sha256_bytes(b"world five")
+            o5 = os.path.join(self.root, store.OBJECTS, sha5[:2], sha5)
+            os.makedirs(os.path.dirname(o5), exist_ok=True)
+            os.link(arch5, o5)
+            self.assertEqual(os.stat(store.has(self.root, sha5)).st_ino, os.stat(arch5).st_ino)
+        finally:
+            store.allow_links(False)
 
     def test_pack_verify_recover(self):
         for i in range(5):
@@ -608,8 +682,72 @@ class TestFork(unittest.TestCase):
             with self.assertRaises(score.ScoreError):
                 score.score(self.d, 1, 200, [200], 100, assay, fork=True)
 
+    def test_prey_replenishment(self):
+        """Review round 3, P2-5: prey injected by a floor are refused in every cell (fork or not): a
+        founder outside the initial cohort, or a living count beyond start + births - deaths (an
+        injected prey that died again before the horizon)."""
+        import score
+        for fork in (True, False):
+            for assay in ("frozen", "live"):
+                self.write()
+                score.score(self.d, 0, 200, [200], 100, assay, fork=fork)
+                end = copy.deepcopy(self.end)            # an injected founder, alive at the horizon
+                rows = ckpt.prey(end)
+                new = dict(rows[0], id=999, lineageId=999, generation=0)
+                ckpt.set_prey(end, rows + [new])
+                end["world"]["nextId"] = 1000
+                end["counters"]["totalBirths"] += 1      # (even if it were counted as a birth)
+                self.write(end=end)
+                with self.assertRaisesRegex(score.ScoreError, "prey replenished"):
+                    score.score(self.d, 0, 200, [200], 100, assay, fork=fork)
+                end = copy.deepcopy(self.end)            # one injected and dead again: the count shows it
+                end["counters"]["totalDeaths"] += 1
+                end["counters"]["totalDeathsStarvation"] += 1
+                self.write(end=end)
+                with self.assertRaisesRegex(score.ScoreError, "prey replenished"):
+                    score.score(self.d, 0, 200, [200], 100, assay, fork=fork)
+
 
 class TestProcesses(unittest.TestCase):
+    PARENT = ("import os, subprocess, sys, time\n"
+              "sys.path.insert(0, sys.argv[1])\n"
+              "import rqlib\n"
+              "child = subprocess.Popen([sys.executable, '-I', '-c', sys.argv[2]], preexec_fn=rqlib.death_signal())\n"
+              "sys.stdout.write(f'{child.pid}\\n'); sys.stdout.flush()\n"
+              "time.sleep(120)\n")
+
+    @unittest.skipUnless(rqlib._LIBC is not None and os.path.isdir("/proc/self"), "needs Linux")
+    def test_parent_death_kills_a_stopped_worker(self):
+        """Review round 3: the parent-death signal is SIGKILL, so a STOPPED child that handles SIGTERM
+        (a worker) still dies with its parent (with SIGTERM it would stay pending, the worker and
+        its engine running on)."""
+        import signal
+        import subprocess
+        import time
+        par = subprocess.Popen([sys.executable, "-I", "-c", self.PARENT, HERE, self.WORKER],
+                               stdout=subprocess.PIPE, stdin=subprocess.DEVNULL, start_new_session=True)
+        lines = sorted([par.stdout.readline(), par.stdout.readline()])   # the child's pid, and its "ready"
+        par.stdout.close()
+        self.assertEqual(lines[1], b"ready\n")                 # the child's handler is in place
+        child = int(lines[0])
+        os.kill(child, signal.SIGSTOP)
+        deadline = time.monotonic() + 10
+        while self._state(child) != "T":
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.01)
+        os.kill(par.pid, signal.SIGKILL)
+        par.wait()
+        deadline = time.monotonic() + 10
+        while True:
+            try:
+                st = self._state(child)
+            except FileNotFoundError:
+                break
+            if st in ("Z", "X"):
+                break
+            self.assertLess(time.monotonic(), deadline, f"the stopped child outlived its parent (state {st})")
+            time.sleep(0.02)
+
     @unittest.skipUnless(rqlib._LIBC is not None, "PR_SET_PDEATHSIG needs Linux libc")
     def test_death_signal_parent_check(self):
         """Review round 2, P2-8: a child whose spawning parent is already gone (getppid differs from the
@@ -676,11 +814,12 @@ class TestProcesses(unittest.TestCase):
 class TestRunner(unittest.TestCase):
     def test_bio_ledger(self):
         root = tempfile.mkdtemp()
+        led_p = os.path.join(root, run.BIO_LEDGER)
         try:
             self.assertEqual(run.read_bio_ledger(root), [])
+            self.assertEqual(run.recover_bio_ledger(root), ([], b""))
             run.append_bio_ledger(root, {"cell": "c", "role": "predators", "sha256": "a" * 64})
-            with open(os.path.join(root, run.BIO_LEDGER), "a") as f:
-                f.write('{"torn')                 # a crash while appending
+            wr(led_p, '{"torn', "ab")                       # a crash while appending
             led = run.read_bio_ledger(root)
             self.assertEqual(len(led), 1)
             self.assertEqual(led[0]["schema"], run.BIO_SCHEMA)
@@ -689,22 +828,59 @@ class TestRunner(unittest.TestCase):
         finally:
             shutil.rmtree(root)
 
+    def test_bio_ledger_recovery(self):
+        """Review round 3: a torn tail is cut under the lock before the next append, so an acknowledged
+        record is never swallowed; a complete record without its newline counts as torn; a restart
+        sees exactly the acknowledged records; a malformed interior record is refused."""
+        root = tempfile.mkdtemp()
+        led_p = os.path.join(root, run.BIO_LEDGER)
+        try:
+            run.append_bio_ledger(root, {"cell": "c1", "role": "prey", "sha256": "1" * 64})
+            wr(led_p, '{"torn', "ab")
+            recs, torn = run.recover_bio_ledger(root)
+            self.assertEqual(([r["cell"] for r in recs], torn), (["c1"], b'{"torn'))
+            run.append_bio_ledger(root, {"cell": "c2", "role": "predators", "sha256": "2" * 64})
+            self.assertEqual([r["cell"] for r in run.read_bio_ledger(root)], ["c1", "c2"])
+            self.assertEqual([r["cell"] for r in run.recover_bio_ledger(root)[0]], ["c1", "c2"])   # a restart
+            self.assertTrue(rqlib.read_bytes(led_p).endswith(b"\n"))
+            whole = rqlib.canonical({"cell": "c3", "schema": run.BIO_SCHEMA})[:-1]   # complete JSON, no newline
+            wr(led_p, whole, "ab")
+            recs, torn = run.recover_bio_ledger(root)
+            self.assertEqual(([r["cell"] for r in recs], torn), (["c1", "c2"], whole))
+            wr(led_p, b"garbage\n" + rqlib.read_bytes(led_p))           # damage before acknowledged records
+            with self.assertRaises(run.LedgerError):
+                run.recover_bio_ledger(root)
+            with self.assertRaises(run.LedgerError):
+                run.read_bio_ledger(root)
+        finally:
+            shutil.rmtree(root)
+
     def test_live_floor_refused_at_planning(self):
         tmp = tempfile.mkdtemp()
         try:
             for name, frame, extra in (("A.F1", 1, {}), ("T0", 7, {"predatorMinPopulation": 2}),
-                                       ("T1", 7, {"predatorMinPopulation": 0})):
-                with open(os.path.join(tmp, name + ".json"), "w") as f:
-                    f.write(ckpt.dumps(mk_cp(n_prey=8, frame=frame, cfg_extra=extra)))
+                                       ("T1", 7, {"predatorMinPopulation": 0}),
+                                       ("T2", 7, {"predatorMinPopulation": 0, "minPopulation": 50}),
+                                       ("B.F1", 1, {"minPopulation": 50})):
+                wr(os.path.join(tmp, name + ".json"), ckpt.dumps(mk_cp(n_prey=8, frame=frame, cfg_extra=extra)))
             d = design(tmp, times={"F1": 1}, templates=[f"{tmp}/T0.json"],
                        blocks=[{"name": "l", "prey_worlds": ["A"], "prey_times": ["F1"], "predators": "same",
                                 "predator_times": ["F1"], "replicates": 1, "with_nopred": True, "assay": "live"}])
             with self.assertRaisesRegex(plan.DesignError, "predatorMinPopulation 0"):
                 plan.expand(d)
+            d["templates"] = [f"{tmp}/T2.json"]             # (review round 3) a prey floor, common prey
+            with self.assertRaisesRegex(plan.DesignError, "prey minPopulation of 0"):
+                plan.expand(d)
             d["templates"] = [f"{tmp}/T1.json"]
             rows, _ = plan.expand(d)
             self.assertEqual([r["kind"] for r in rows], ["assay", "nopred"])
             self.assertTrue(all(rqlib.is_sha256(r["template"]["sha256"]) for r in rows))
+            nat = dict(d, blocks=[dict(d["blocks"][0], prey_worlds=["B"], predators={"world": "A"},
+                                       prey_policy="native")])
+            with self.assertRaisesRegex(plan.DesignError, "prey minPopulation of 0"):   # a prey floor, native prey
+                plan.expand(nat)
+            nat["blocks"][0]["assay"] = "frozen"            # frozen arenas get no floor (the transplant)
+            self.assertEqual(len(plan.expand(nat)[0]), 2)
         finally:
             shutil.rmtree(tmp)
 

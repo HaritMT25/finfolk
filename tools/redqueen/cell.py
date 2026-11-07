@@ -4,13 +4,16 @@ execute(cell, d, exe, paths) runs, in the empty directory d:
   1. the prey world X:
        prey_policy "common": common.py builds common.json (+ common.manifest.json) from the
        registered template and prey snapshot with the cell's sampling seed;
-       prey_policy "native": prey.json, a symlink to the prey snapshot itself;
+       prey_policy "native": prey.json, the prey snapshot itself;
+     every input (prey snapshot, donor, template) is first FROZEN: read once, hashed against
+     its registered SHA-256, and written as a read-only file in d from those very bytes; the
+     engine and the provenance store read only these copies, never an archive path;
   2. the design's two engine calls, and nothing else (design section 2):
        evo_boids --load-checkpoint X --predators-from Y --transplant-count K
                  --transplant-seed S --assay MODE --transplant-out arena.json
        evo_boids --load-checkpoint arena.json --reseed-after-load R --headless STEPS --no-render
                  --log-every L --checkpoint-every C --save-checkpoint end.json --csv run.csv
-     Y is pred.json (a symlink to the registered predator snapshot), or "random"; the
+     Y is pred.json (the frozen predator snapshot), or "random"; the
      predator-free fork is "random" with K = 0. Relative paths only, so the engine's arena
      manifest is the same in a replay;
   3. the checks: a serial-build arena; a live arena (challenge or control) without a predator
@@ -135,13 +138,26 @@ def _pause_hook(stage, d):
     time.sleep(float(parts[1]))
 
 
+def _freeze(d, name, data, sha):
+    """Write `data` (bytes already hashed to `sha`) as the read-only file d/name the engine will
+    read, and check the file's own hash: the engine never opens an archive path."""
+    p = os.path.join(d, name)
+    with open(p, "wb") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    os.chmod(p, 0o444)
+    if rqlib.sha256_file(p) != sha:
+        raise CellFailure(5, f"the frozen copy {name} does not hash to its registered content")
+
+
 def execute(cell, d, exe, paths, procs=None):
     """Run cell (a plan row) in the empty directory d with the engine exe. paths: role -> the file to
     read for that role ('prey', 'predators', 'template'), already checked against the registered
     SHA-256 by the caller. -> (bundle dict, info dict); raises CellFailure."""
     procs = [] if procs is None else procs
     t0 = time.time()
-    info = {}
+    info = {"frozen_inputs": {}}
     prey_src = paths["prey"]
     raw = rqlib.read_bytes(prey_src)       # hashed and parsed from the same bytes
     if rqlib.sha256_bytes(raw) != cell["prey"]["sha256"]:
@@ -151,6 +167,11 @@ def execute(cell, d, exe, paths, procs=None):
         ckpt.validate(x_cp, prey_src)
     except ckpt.CheckpointError as e:
         raise CellFailure(5, str(e))
+    # (review round 3) every input is frozen: the engine (native prey) and the store (provenance)
+    # read a copy of the very bytes verified above, never the archive path, which could be
+    # replaced between the check and a later open
+    _freeze(d, "prey.json", raw, cell["prey"]["sha256"])
+    info["frozen_inputs"]["prey"] = os.path.join(d, "prey.json")
     del raw
     smeta = ckpt.meta(x_cp)
     if smeta["prey_alive"] == 0:
@@ -166,7 +187,6 @@ def execute(cell, d, exe, paths, procs=None):
             ckpt.validate(y, paths["predators"])
         except ckpt.CheckpointError as e:
             raise CellFailure(5, str(e))
-        del yraw
         ym = ckpt.meta(y)
         if ym["format_version"] != ckpt.V2:
             raise CellFailure(5, "the predator snapshot has no predator brains (format version 2 required)")
@@ -175,15 +195,24 @@ def execute(cell, d, exe, paths, procs=None):
         if ym["predators"] == 0:
             raise CellFailure(9, f"biological: the predator snapshot {cell['predators']['path']} has no predators",
                               "predators")
-        os.symlink(os.path.abspath(paths["predators"]), os.path.join(d, "pred.json"))
+        _freeze(d, "pred.json", yraw, cell["predators"]["sha256"])   # the engine reads the verified bytes
+        info["frozen_inputs"]["predators"] = os.path.join(d, "pred.json")
+        del yraw
         info["donor_predators"] = ym["predators"]
 
     files = {}
     common_manifest_sha = None
     if cell["prey_policy"] == "common":
+        traw = rqlib.read_bytes(paths["template"])
+        if rqlib.sha256_bytes(traw) != cell["template"]["sha256"]:
+            raise CellFailure(5, f"the template {paths['template']} is not its registered content")
+        _freeze(d, "template.json", traw, cell["template"]["sha256"])
+        info["frozen_inputs"]["template"] = os.path.join(d, "template.json")
+        del traw
         try:
             man, csha = common.build_files(
-                paths["template"], prey_src, int(cell["n_prey"]), int(cell["seeds"]["sample"]), cell["sampling"],
+                info["frozen_inputs"]["template"], prey_src, int(cell["n_prey"]), int(cell["seeds"]["sample"]),
+                cell["sampling"],
                 os.path.join(d, "common.json"), os.path.join(d, "common.manifest.json"),
                 template_label=cell["template"]["path"], source_label=cell["prey"]["path"],
                 source_meta={"world": cell["prey"]["world"], "uuid": cell["prey"]["uuid"], "time": cell["prey"]["time"]},
@@ -199,8 +228,7 @@ def execute(cell, d, exe, paths, procs=None):
         files["common.manifest.json"] = common_manifest_sha
         info["sampling"] = man["sampling"]
     else:
-        os.symlink(os.path.abspath(prey_src), os.path.join(d, "prey.json"))
-        x_name = "prey.json"
+        x_name = "prey.json"     # frozen above
     info["t_build"] = time.time() - t0
 
     targs, aargs = commands(cell, x_name)
@@ -221,6 +249,11 @@ def execute(cell, d, exe, paths, procs=None):
         # predators into a challenge's control and change the challenge's density
         raise CellFailure(4, f"a live challenge or its control needs predatorMinPopulation 0 in the prey world "
                              f"(it is {acfg.get('predatorMinPopulation')})")
+    if int(acfg.get("minPopulation", 0)) != 0:
+        # (review round 3) a prey floor would replenish the prey a challenge removes (and not those
+        # of its control): every arena must be without one (the frozen modes set it to 0 already)
+        raise CellFailure(4, f"the arena has a prey floor (minPopulation {acfg.get('minPopulation')}): prey would "
+                             "be replenished during the assay")
     # the prey settings the challenge and its control must share (checked across cells at packing)
     prey_cfg_sha = rqlib.canonical_sha({k: v for k, v in acfg.items() if not k.startswith("predator")})
     f0, steps, ce = int(arena["world"]["frame"]), int(cell["steps"]), int(cell["checkpoint_every"])

@@ -33,6 +33,12 @@
 #      the rest of the plan finishes, a restart keeps skipping them; stop (the default) stops.
 #  (P1-2 recovery order, P2-3/4 single-read plan and hashes, P2-6 hybrid sampling and the P2-8
 #  parent check are covered by test_redqueen.py and the sampling checks of section 2.)
+#  Review round 3:
+#  13. a live challenge on a prey world with a PREY floor is refused at planning (and every cell
+#      of this test passes score.py's no-replenishment check: start + births - deaths, no founders);
+#  14. the engine reads frozen, verified read-only copies in the cell (never an archive path), and a
+#      SIGSTOPped worker whose engine runs dies with a SIGKILLed runner, its engine with it.
+#  (legacy store objects, all-or-nothing leftover cleanup and the torn bio ledger: test_redqueen.py)
 set -u
 BIN=${1:?usage: redqueen_tooling.sh EVO_BOIDS WORKDIR}
 W=${2:?usage: redqueen_tooling.sh EVO_BOIDS WORKDIR}
@@ -359,8 +365,11 @@ else
     $PY - "$T" "$W" <<'PY' || fail "--link-sources did not hard-link the finalized source"
 import os, sys; sys.path.insert(0, sys.argv[1]); import rqlib, store
 p = sys.argv[2] + "/arch/A.1500.json"
-o = store.has("r11", rqlib.sha256_file(p))
-assert o and os.stat(o).st_ino == os.stat(p).st_ino, o
+sha = rqlib.sha256_file(p)
+o = os.path.join("r11", store.OBJECTS, sha[:2], sha)      # by path: has() under the default (copy)
+assert os.stat(o).st_ino == os.stat(p).st_ino, o          # policy would migrate the link
+store.allow_links(True)
+assert store.has("r11", sha) == o and os.stat(o).st_ino == os.stat(p).st_ino   # the link policy keeps it
 PY
 fi
 chmod 755 arch
@@ -410,4 +419,52 @@ assert st["packed"] == 1 and st["runner"]["bio_skipped"] == 2, st
 PY
 $RUN --plan plan_zs.jsonl --root r13 --binary "$BIN" --on-bio-failure skip $GUARD > r13b.log 2>&1 || fail "skip restart"
 grep -q "BIOLOGICAL: 2 cells skipped" r13/runner.log || fail "a restart does not keep skipping the ledger's cells"
+# 13. (review round 3) a live challenge needs a prey world without a PREY floor either
+eng --headless 1 --seed 98 --population 200 --predators 6 --predator-economy --predator-brain --predator-meal 14 \
+    --predator-max-pop 12 --predator-min-pop 0 --predator-max-age 15 --save-checkpoint T0.json
+sed "s#$W/T.json#$W/T0.json#; s/\"assay\": \"frozen\"/\"assay\": \"live\"/" design.json > design_live0.json
+$PY "$T/plan.py" design_live0.json --out x.jsonl 2> live0.log && fail "a live challenge on a world with a prey floor"
+grep -q "prey minPopulation of 0" live0.log || fail "the prey-floor refusal does not say why: $(cat live0.log)"
+
+# 14. (review round 3) the engine reads frozen, verified copies; and a STOPPED worker whose engine is
+#     running dies with a SIGKILLed runner (parent-death SIGKILL), and its engine with it
+$PY - <<'PY' || fail "building the long design"
+import json
+d = json.load(open("design.json"))
+d["defaults"].update(steps=600000, horizons=[600000], log_every=100000, checkpoint_every=300000)
+d["blocks"] = [{"name": "long", "prey_worlds": ["A"], "prey_times": ["T3000"], "predators": "same",
+                "predator_times": ["T3000"], "replicates": 1}]
+json.dump(d, open("design_long.json", "w"))
+PY
+$PY "$T/plan.py" design_long.json --out plan_long.jsonl 2> /dev/null || fail "plan.py (long)"
+$RUN --plan plan_long.jsonl --root r14 --binary "$BIN" --workers 1 $GUARD > r14.log 2>&1 &
+rp=$!
+eng_pid=""
+for _ in $(seq 1 300); do
+    eng_pid=$(pgrep -f "$W/r14/bin/evo_boids --load-checkpoint arena.json" | head -1)
+    [ -n "$eng_pid" ] && break
+    sleep 0.1
+done
+[ -n "$eng_pid" ] || { kill $rp; fail "the long cell's assay engine did not start"; }
+cdir=$(ls -d r14/work/*/ | head -1)
+for f in prey.json pred.json template.json; do
+    [ -f "$cdir/$f" ] && [ ! -L "$cdir/$f" ] || { kill $rp; fail "$f is not a frozen regular file in the cell"; }
+    [ "$(stat -c %a "$cdir/$f")" = 444 ] || { kill $rp; fail "$f is not read-only"; }
+done
+$PY - "$T" "$cdir" <<'PY' || { kill $rp; fail "a frozen input does not hash to its registered content"; }
+import json, os, sys; sys.path.insert(0, sys.argv[1]); import rqlib
+c = json.load(open(os.path.join(sys.argv[2], "cell.json")))
+for f, role in (("prey.json", "prey"), ("pred.json", "predators"), ("template.json", "template")):
+    assert rqlib.sha256_file(os.path.join(sys.argv[2], f)) == c[role]["sha256"], f
+PY
+wpid=$(pgrep -f -- "--root $W/r14 --_cell" | head -1)
+[ -n "$wpid" ] || { kill $rp; fail "no worker (r14)"; }
+kill -STOP "$wpid"
+kill -KILL $rp; wait $rp 2> /dev/null
+for _ in $(seq 1 100); do
+    [ -z "$(pgrep -f -- "--root $W/r14 --_cell")" ] && [ -z "$(pgrep -f "$W/r14/bin/evo_boids")" ] && break
+    sleep 0.1
+done
+[ -z "$(pgrep -f -- "--root $W/r14 --_cell")" ] || { pkill -KILL -f -- "--root $W/r14"; fail "a stopped worker outlived its SIGKILLed runner"; }
+[ -z "$(pgrep -f "$W/r14/bin/evo_boids")" ] || { pkill -KILL -f "$W/r14/bin/evo_boids"; fail "the stopped worker's engine outlived the runner"; }
 echo "redqueen_tooling: ok ($NW workers)"
