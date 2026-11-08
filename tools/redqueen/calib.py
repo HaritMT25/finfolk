@@ -196,7 +196,7 @@ LAMBDA_GRID = tuple(0.5 * k for k in range(21))
 LAMBDA_TOL = 1e-3        # the null-side acceptance of the multiplier: E in [b (1 - LAMBDA_TOL), b]
 LAMBDA_JUMP = 1e-3       # a bracket narrower than this (relative) without an accepted point: a jump
 LAMBDA_EVALS = 60        # evaluations before the multiplier search is a numerical failure
-LAMBDA_FROZEN_METRIC = False   # the frozen-metric lambda proposals (a CPU lever; OFF until Codex r5 rules)
+LAMBDA_FROZEN_METRIC = True    # the frozen-metric lambda proposals (Codex round 5 C3: accepted with conditions)
 FROZEN_ROUNDS = 4        # re-anchorings of the frozen metric before the true-metric search takes over
 BOUNDARY_TOL = 0.05      # the ONE-SIDED boundary window, energy scale [b (1 - 0.05), b] (RMS: [0.9747, 1] x d)
 TAU_NUM = 2 * DIR_TOL / min(stats.DELTA_P, stats.DELTA_Q)    # = 1e-3: null membership's NUMERICAL allowance
@@ -204,6 +204,7 @@ D_C, D_Q = recurrence.D_C, recurrence.D_Q
 ROUNDS = 3               # each quota cell's proposal cap K_c = ROUNDS x n_c (the D2 ruling)
 N_MIN = {"dev": 99, "val": 149}
 UNREACHED = ("unreached", "infeasible")
+STRUCTURAL_MODES = ("T0", "T1", "T2", "T3")   # (C2: membership witnessed by the verified slopes alone)
 NTHETA = 98
 F_MODES = ("F0", "F1", "F2", "F3", "F4")
 T_MODES = ("T0", "T1", "T2", "T3", "T4")
@@ -1193,7 +1194,7 @@ class Panel:
             anchor = 1.0
             for _ in range(FROZEN_ROUNDS):
                 E(anchor)                                   # (the true metric at the anchor: its designs frozen)
-                designs = [w["_dcache_nf"]["full"] for w in self.worlds]
+                designs = [self.design_nf(w, "full") for w in self.worlds]
                 memo = {}
 
                 def Ef(lam, designs=designs, memo=memo):
@@ -1281,6 +1282,10 @@ class Panel:
             return {"member": None, "by": "alternative"}
         if self.hyp == "H-F" and self.mode in ("F0", "F1", "F2"):
             return {"member": True, "by": "construction"}
+        if self.hyp == "H-T" and self.mode in STRUCTURAL_MODES:
+            w_ = self.structural_witness()
+            if w_["member"]:
+                return w_
         fn = self.functionals()
         out = {"by": "functionals", "functionals": fn}
         if self.hyp == "H-F":
@@ -1295,6 +1300,35 @@ class Panel:
         if decl is not None:
             out["boundary"] = boundary_residual(decl, fn)
         return out
+
+    def structural_witness(self):
+        """C2 (Codex round 5, accepted): H-T null membership from the COMPLETED, VERIFIED noise-free capture and
+        survival epoch slopes alone. Every candidate's slope-only margins (beta[a], delta -+ beta[f], beta[a] -
+        beta[f], panel means of the verified per-world slopes, exactly as the functionals compute them) are
+        evaluated; the panel is a member when max_c min_j (slope margin)_cj / s_j <= TAU_NUM. T0 / T2 (beta_P =
+        1.5 delta_P in every epoch): delta_P - beta_P[f] scaled <= -0.5 + DIR_TOL / delta_P; T1 / T3 (beta_P
+        = 0): beta_P[a] scaled <= DIR_TOL / delta_P (about 1.05e-4 < TAU_NUM = 1e-3). The witness (per candidate
+        its pinning margin and scaled value) and the bound are recorded; the noisy analysis runs in full."""
+        E = transition.EPOCHS
+        comps = {e: {"beta_P": float(np.mean([w["betas_true"][e][0] for w in self.worlds])),
+                     "beta_Q": float(np.mean([w["betas_true"][e][1] for w in self.worlds]))} for e in E}
+        slope_only = [k for k in MARGIN_NAMES if "E" not in k]
+        wit, best = {}, -math.inf
+        for a, f, _ in transition.candidates():
+            A, F = comps[a], comps[f]
+            vals = {"beta_P[a]": A["beta_P"], "beta_Q[a]": A["beta_Q"],
+                    "dP-beta_P[f]": stats.DELTA_P - F["beta_P"], "dP+beta_P[f]": stats.DELTA_P + F["beta_P"],
+                    "dQ-beta_Q[f]": stats.DELTA_Q - F["beta_Q"], "dQ+beta_Q[f]": stats.DELTA_Q + F["beta_Q"],
+                    "beta_P[a]-beta_P[f]": A["beta_P"] - F["beta_P"], "beta_Q[a]-beta_Q[f]": A["beta_Q"] - F["beta_Q"]}
+            assert set(vals) == set(slope_only)
+            nm = min(vals, key=lambda k: (vals[k] / MARGIN_SCALE[k], k))
+            sc = vals[nm] / MARGIN_SCALE[nm]
+            if math.isnan(sc):
+                raise CalibError("a NaN verified slope (a numerical failure)")
+            wit[f"{a}->{f}"] = {"margin": nm, "scaled": float(sc)}
+            best = max(best, sc)
+        return {"member": bool(best <= TAU_NUM), "by": "structural", "witness": wit, "strongest_margin": float(best),
+                "bound": DIR_TOL / stats.DELTA_P, "tau_num": TAU_NUM}
 
     def boundary_final(self):
         """The ENFORCED D1 boundary check after observe (#68 round 4 P2-1): the declared boundary quantity on
@@ -1396,12 +1430,17 @@ class Panel:
             return lambda t: _cum_slope(t, sl)
         E = transition.EPOCHS
         bC, bQ = (dict(init[0]), dict(init[1])) if init else ({e: 0.0 for e in E}, {e: 0.0 for e in E})
-        # capture: a per-epoch secant on the (near-unit) response, all epochs together
-        prev = {}
+        # (#68 round 5 P2-1: every knob, warm starts included, stays in the registered [-KNOB_MAX, KNOB_MAX])
+        bC = {e: min(max(v, -KNOB_MAX), KNOB_MAX) for e, v in bC.items()}
+        bQ = {e: min(max(v, -KNOB_MAX), KNOB_MAX) for e, v in bQ.items()}
+        # capture: a per-epoch secant on the (near-unit) response, all epochs together; an iterate leaving the
+        # domain ends it (the per-epoch bracketed fallback below searches the domain itself)
+        prev, conv = {}, False
         for _ in range(DIR_STEPS):
             base = self.noiseless_betas(wg, th, pl, u, make(bC), make(bQ), which="P", amp=amp)
             err = {e: base[e][0] - pl["dir"][e][0] for e in E}
             if all(abs(v) <= DIR_TOL / 4 for v in err.values()):
+                conv = True
                 break
             for e in E:
                 d = 1.0
@@ -1409,8 +1448,45 @@ class Panel:
                     d = (err[e] - prev[e][1]) / (bC[e] - prev[e][0])
                 prev[e] = (bC[e], err[e])
                 bC[e] -= err[e] / (d if abs(d) > 1e-3 else 1.0)
-        else:
-            raise CalibError(f"{wg.id}: the capture slope solver did not converge")
+            if any(abs(v) > KNOB_MAX for v in bC.values()):
+                bC = {e: min(max(v, -KNOB_MAX), KNOB_MAX) for e, v in bC.items()}
+                break
+        if not conv:
+            # (#68 repair: the coupled secant did not converge, e.g. two epochs oscillating: each epoch in time
+            # order alone, bracketed on KNOB_GRID and solved by the safeguarded root; not reached on the grid:
+            # UNREACHED, clipped to the attained extremum, like the survival knob)
+            for e in E:
+                tgt = pl["dir"][e][0]
+
+                def gP(x, e=e, tgt=tgt):
+                    bC[e] = x
+                    return self.noiseless_betas(wg, th, pl, u, make(bC), make(bQ), only=e, which="P", amp=amp)[e][0] - tgt
+                x0 = bC[e]
+                f0 = gP(x0)
+                if abs(f0) <= DIR_TOL / 4:
+                    continue
+                xs = list(KNOB_GRID)
+                gs = [gP(x) for x in xs]
+                if not all(math.isfinite(v) for v in gs):
+                    raise CalibError(f"{wg.id} {e}: a nonfinite capture slope on the knob grid")
+                br = [k for k in range(len(xs) - 1) if gs[k] * gs[k + 1] <= 0]
+                if br:
+                    k = min(br, key=lambda k: (abs(xs[k] - x0), k))
+                    bC[e] = root(gP, xs[k], gs[k], xs[k + 1], gs[k + 1], DIR_TOL / 4, f"{wg.id} {e} capture slope {tgt:.6g}")
+                    gP(bC[e])
+                    continue
+                sgn = 1.0 if gs[0] < 0 else -1.0
+                xm, gm = extremum(gP, xs, sgn)
+                if sgn * gm >= 0:
+                    nb = min((x for x in xs if x != xm), key=lambda x: (abs(x - xm), x))
+                    bC[e] = root(gP, nb, gP(nb), xm, gP(xm), DIR_TOL / 4, f"{wg.id} {e} capture slope {tgt:.6g}")
+                    gP(bC[e])
+                    continue
+                bC[e] = xm
+                gP(xm)
+                self.unattainable.append({"world": wg.id, "scope": e, "readout": "beta_P", "target": tgt,
+                                          "kind": "unreached-above" if sgn > 0 else "unreached-below",
+                                          "nearest": tgt + gm, "knob": xm, "shortfall": abs(gm)})
         dirC = make(bC)
         for e in E:                                      # (in time order: a later epoch's knob leaves earlier ones)
             tgt = pl["dir"][e][1]
@@ -1426,7 +1502,7 @@ class Panel:
             sgn = -1.0 if f0 > 0 else 1.0
             step, a, fa = max(0.05, 4 * abs(f0)), x0, f0
             b, fb = None, None
-            while abs(a + sgn * step - x0) <= KNOB_MAX + 1e-12:
+            while abs(x0 + sgn * step) <= KNOB_MAX:           # (the ACTUAL trial knob, #68 round 5 P2-1)
                 xb = x0 + sgn * step
                 fx = g(xb)
                 if fx * f0 <= 0:
@@ -1696,7 +1772,8 @@ def proposal_of(hyp, mode, n, cell, k):
 # ================================================================== provenance
 TOOLS = ("calib.py", "recurrence.py", "transition.py", "backbone.py", "stats.py")
 GATES_SCHEMA = "finfolk.redqueen.annexH.gates/1"
-IDENT = ("graph_sha256", "graph_source", "params_sha256", "params_fitted", "tools_sha256", "draws", "production")
+IDENT = ("graph_sha256", "graph_source", "params_sha256", "params_fitted", "tools_sha256", "solver_sha256", "draws",
+         "production")
 
 
 def doc_sha(d):
@@ -1721,9 +1798,20 @@ def tools_sha():
     return h.hexdigest()
 
 
+def solver_identity():
+    """The registered generator / solver settings (#68 round 5 C3: bound into every artifact; tools_sha256 binds
+    the implementation itself)."""
+    return {"lambda_frozen_metric": LAMBDA_FROZEN_METRIC, "frozen_rounds": FROZEN_ROUNDS, "lambda_grid": list(LAMBDA_GRID),
+            "lambda_tol": LAMBDA_TOL, "lambda_jump": LAMBDA_JUMP, "lambda_evals": LAMBDA_EVALS,
+            "amp_grid": list(AMP_GRID), "knob_grid": [KNOB_GRID[0], KNOB_GRID[-1], len(KNOB_GRID)],
+            "boundary_tol": BOUNDARY_TOL, "tau_num": TAU_NUM, "rounds": ROUNDS, "n_min": N_MIN,
+            "structural_modes": list(STRUCTURAL_MODES), "epoch_periods": list(recurrence.EPOCH_PERIODS)}
+
+
 def manifest(graph, params, draws, gates=None, production=False, graph_source="synthetic"):
     """Everything a panel record depends on: crit / accept refuse to mix two of them (#68 round 2 P1-3)."""
     return {"graph_sha256": graph_sha(graph), "graph_source": graph_source, "worlds": len(graph),
+            "solver": solver_identity(), "solver_sha256": doc_sha(solver_identity()),
             "params_sha256": hashlib.sha256(json.dumps(params, sort_keys=True).encode()).hexdigest(),
             "params_fitted": params.get("fitted") is True, "tools_sha256": tools_sha(), "draws": int(draws),
             "gates_sha256": None if gates is None else hashlib.sha256(json.dumps(gates, sort_keys=True).encode()).hexdigest(),
@@ -2237,19 +2325,26 @@ def acceptance(records, crit, production=True):
 
 
 def decision_inputs(crit, acc):
-    """The UNAVAILABILITY ADAPTER (#68 round 4 P3): per hypothesis the critical value to hand to
-    recurrence.hf_decision / transition.ht, or None with the reason; a None never reaches a numeric API:
-    the decision is unavailable and its p enters Holm as 1."""
+    """The UNAVAILABILITY ADAPTER (#68 round 4 P3; round 5 P3: per claim): H-F DETECTION (c_F and its
+    validation) is independent of the nested exceeding-material claim (c_M and its validation, which also
+    needs detection), so an F3-only cap leaves detection available; H-T (c_T). A None never reaches a numeric
+    API: the claim is unavailable and its p enters Holm as 1."""
     out = {}
-    for hyp, keys, passes in (("H-F", ("c_F", "c_M"), ("H-F detection", "H-F material")), ("H-T", ("c_T",), ("H-T",))):
-        if hyp not in crit.get("manifest", {}):
-            continue
-        cs = {k: crit.get(k) for k in keys}
-        missing = [k for k, v in cs.items() if v is None]
-        failed = [p for p in passes if (acc or {}).get("pass", {}).get(p) is not True]
-        out[hyp] = {"critical": cs, "available": not missing and not failed,
-                    "reason": None if not missing and not failed else
-                    f"unavailable: {missing or ''} {failed or ''} (p = 1 in Holm)".strip()}
+    acc = acc or {}
+    if "H-F" in crit.get("manifest", {}):
+        for claim, keys, passes in (("H-F detection", ("c_F",), ("H-F detection",)),
+                                    ("H-F material", ("c_F", "c_M"), ("H-F detection", "H-F material"))):
+            cs = {k: crit.get(k) for k in keys}
+            missing = [k for k, v in cs.items() if v is None]
+            failed = [p for p in passes if acc.get("pass", {}).get(p) is not True]
+            out[claim] = {"critical": cs, "available": not missing and not failed,
+                          "reason": None if not missing and not failed else
+                          f"unavailable: {missing or ''} {failed or ''} (p = 1 in Holm)".strip()}
+    if "H-T" in crit.get("manifest", {}):
+        missing = [] if crit.get("c_T") is not None else ["c_T"]
+        failed = [] if acc.get("pass", {}).get("H-T") is True else ["H-T"]
+        out["H-T"] = {"critical": {"c_T": crit.get("c_T")}, "available": not missing and not failed,
+                      "reason": None if not missing and not failed else f"unavailable: {missing} {failed} (p = 1 in Holm)"}
     return out
 
 
@@ -2383,11 +2478,15 @@ def report(records):
         tg = {}
         for r in rs:
             for k, v in (r.get("targets") or {}).items():
-                d = tg.setdefault(k, {"requested": [], "n": 0, "clipped": 0, "max_abs_dev": 0.0})
+                d = tg.setdefault(k, {"requested": [], "n": 0, "clipped": 0, "max_abs_dev": 0.0,
+                                      "achieved_min": None, "achieved_max": None})
                 d["requested"] = sorted(set(map(str, d["requested"])) | set(map(str, v["requested"])))
                 d["n"] += v["n"]
                 d["clipped"] += v["clipped"]
                 d["max_abs_dev"] = max(d["max_abs_dev"], v["max_abs_dev"])
+                for key_, fn_ in (("achieved_min", min), ("achieved_max", max)):     # (#68 round 5 P3)
+                    if v.get(key_) is not None:
+                        d[key_] = v[key_] if d[key_] is None else fn_(d[key_], v[key_])
         aud = [r for r in rs if r.get("cell") is not None and r.get("k") is not None
                and r.get("stream") is None and r.get("stage") in ("dev", "val")]
         g = {"counts": proposal_counts(rs), "audit": audit_classes(aud) if aud else None,

@@ -443,6 +443,82 @@ class TestRound3(unittest.TestCase):
         a = cb.audit_classes([r, dict(r, eligible="B", role="B", status="feasible"), bad])
         self.assertEqual((a["n"], a["classes"]["I_eligible"], a["classes"]["B"], a["classes"]["failed"]), (2, 1, 1, 1))
 
+    def test_capture_slope_fallback(self):
+        """#68 repair: when the coupled capture secant does not converge (forced here: DIR_STEPS = 1), each epoch
+        is solved alone on KNOB_GRID with the safeguarded root; the completed panel still verifies its slopes."""
+        cb = self.cb
+        old = cb.DIR_STEPS
+        cb.DIR_STEPS = 1
+        try:
+            pn = cb.Panel(self.graph, self.params, "H-T", "dev", "actual", "T0", 0).triage()
+        finally:
+            cb.DIR_STEPS = old
+        self.assertTrue(all(v["ok"] for v in pn.verified))
+        for v in pn.verified:
+            for e in ("E1", "E2", "E3"):
+                self.assertAlmostEqual(v["dir"][f"{e}/beta_P"], 1.5 * cb.stats.DELTA_P, delta=cb.DIR_TOL)
+
+    def test_knob_stays_in_its_domain(self):
+        """#68 round 5 P2-1: a survival-slope root just outside the registered knob domain (8.2 > KNOB_MAX = 8) with
+        a warm start at 7.5: the walk never evaluates beyond 8, the grid search finds no bracket, and the target is
+        UNREACHED at a knob inside the domain (never an accepted root at 8.2)."""
+        cb = self.cb
+        pn = cb.Panel(self.graph, self.params, "H-T", "dev", "actual", "T0", 0)
+        pn.member = lambda: {"member": True, "by": "test"}
+        pn.triage()
+        w = pn.worlds[0]
+        th, u, dirC, dirQ = w["_ctx"]
+        seen = []
+        mid = {"E1": (10.0, 40.0), "E2": (85.0, 115.0), "E3": (160.0, 190.0)}
+
+        def fake(wg, th_, pl, u_, dC, dQ, only=None, which="PQ", amp=None):
+            out = {}
+            for e in ([only] if only else cb.transition.EPOCHS):
+                t1, t2 = mid[e]
+                kq = (dQ(t2) - dQ(t1)) / (t2 - t1) * 50.0
+                seen.append(kq)
+                out[e] = (pl["dir"][e][0], pl["dir"][e][1] + 0.1 * (kq - 8.2))
+            return out
+        pn.noiseless_betas = fake
+        pn.unattainable = []
+        E = cb.transition.EPOCHS
+        _, _, (bC, bQ) = pn.solve_dir(w["graph"], th, w["plan"], u, {}, ({e: 0.0 for e in E}, {e: 7.5 for e in E}))
+        self.assertTrue(all(abs(k) <= cb.KNOB_MAX + 1e-9 for k in seen), max(seen))
+        self.assertTrue(all(abs(v) <= cb.KNOB_MAX for v in bQ.values()))
+        un = [x for x in pn.unattainable if x["readout"] == "beta_Q"]
+        self.assertEqual(len(un), 3)
+        self.assertTrue(all(x["kind"] == "unreached-above" and abs(x["knob"]) <= cb.KNOB_MAX for x in un))
+
+    def test_structural_membership(self):
+        """C2 (Codex round 5): T0-T3 membership from the completed, verified slopes alone (no functionals),
+        with its witness: T1 pins beta_P[a] (scaled <= DIR_TOL / delta_P), T0 pins delta_P - beta_P[f] (about
+        -0.5)."""
+        cb = self.cb
+        orig = cb.Panel.functionals
+        cb.Panel.functionals = lambda self_, final=False: (_ for _ in ()).throw(AssertionError("functionals called"))
+        try:
+            p1 = cb.Panel(self.graph, self.params, "H-T", "dev", "actual", "T1", 0).triage()
+            p0 = cb.Panel(self.graph, self.params, "H-T", "dev", "actual", "T0", 1).triage()
+        finally:
+            cb.Panel.functionals = orig
+        for pn, pin, lim in ((p1, "beta_P[a]", cb.DIR_TOL / cb.stats.DELTA_P), (p0, "dP-beta_P[f]", -0.5 + cb.DIR_TOL / cb.stats.DELTA_P)):
+            m = pn.membership
+            self.assertEqual((m["by"], m["member"]), ("structural", True))
+            self.assertEqual(len(m["witness"]), 6)
+            self.assertLessEqual(m["strongest_margin"], lim + 1e-12)
+            self.assertLess(m["bound"], cb.TAU_NUM)
+            self.assertTrue(all(v["scaled"] <= lim + 1e-12 for v in m["witness"].values()))
+            self.assertTrue(set(v["margin"] for v in m["witness"].values()) <= set(cb.MARGIN_NAMES))
+
+    def test_solver_identity_in_the_manifest(self):
+        """C3: the registered solver settings (the frozen-metric lambda included) are bound into every manifest
+        and compared across artifacts (IDENT)."""
+        cb = self.cb
+        man = cb.manifest(self.graph, self.params, 19)
+        self.assertEqual(man["solver"]["lambda_frozen_metric"], cb.LAMBDA_FROZEN_METRIC)
+        self.assertEqual(man["solver_sha256"], cb.doc_sha(cb.solver_identity()))
+        self.assertIn("solver_sha256", cb.IDENT)
+
     def test_verify_enforces_the_declared_tolerance(self):
         """The completed noise-free panel must meet each declared RMS target to AMP_TOL on both sides."""
         cb = self.cb
@@ -459,9 +535,14 @@ class TestRound3(unittest.TestCase):
         res = {"available": True, "S_F": 9.0, "material_point": True, "M_F": 2.0, "R_C": 0.2, "R_Q": 0.1}
         d = cb.recurrence.hf_decision(res, None, p_F=0.001)
         self.assertFalse(d["available"])
-        inp = cb.decision_inputs({"manifest": {"H-F": {}, "H-T": {}}, "c_F": None, "c_M": 1.0, "c_T": 7.0},
-                                 {"pass": {"H-F detection": True, "H-F material": True, "H-T": True}})
-        self.assertEqual((inp["H-F"]["available"], inp["H-T"]["available"]), (False, True))
+        ok = {"pass": {"H-F detection": True, "H-F material": True, "H-T": True}}
+        inp = cb.decision_inputs({"manifest": {"H-F": {}, "H-T": {}}, "c_F": None, "c_M": 1.0, "c_T": 7.0}, ok)
+        self.assertEqual((inp["H-F detection"]["available"], inp["H-F material"]["available"], inp["H-T"]["available"]),
+                         (False, False, True))
+        # (#68 round 5 P3: an F3-only cap leaves detection available)
+        inp = cb.decision_inputs({"manifest": {"H-F": {}}, "c_F": 1.0, "c_M": None},
+                                 {"pass": {"H-F detection": True, "H-F material": False}})
+        self.assertEqual((inp["H-F detection"]["available"], inp["H-F material"]["available"]), (True, False))
 
 
 class TestStrata(unittest.TestCase):
@@ -514,12 +595,14 @@ class TestStrata(unittest.TestCase):
         a, b = cb.recurrence.analyze_world(d1, w["y"]), cb.recurrence.analyze_world(fresh, w["y"])
         self.assertEqual(json.dumps(a, default=str, sort_keys=True), json.dumps(b, default=str, sort_keys=True))
         self.assertIs(pn.design_nf(w, "full"), pn.design_nf(w, "full"))
-        off = self.run_("F4", 0)
-        cb.LAMBDA_FROZEN_METRIC = True
+        old = cb.LAMBDA_FROZEN_METRIC
         try:
+            cb.LAMBDA_FROZEN_METRIC = False
+            off = self.run_("F4", 0)
+            cb.LAMBDA_FROZEN_METRIC = True
             on = self.run_("F4", 0)
         finally:
-            cb.LAMBDA_FROZEN_METRIC = False
+            cb.LAMBDA_FROZEN_METRIC = old
         for r in (off, on):
             bs = r["boundary_solve"]
             self.assertEqual(bs["outcome"], "feasible")
@@ -556,6 +639,8 @@ class TestStrata(unittest.TestCase):
         self.assertNotIn("boundary_final", r)
         g = cb.report([r])["groups"]["H-F|dev|F3|actual"]
         self.assertEqual(g["boundary_solve"]["outcomes"]["unreached"], 1)
+        self.assertIsNotNone(g["targets"]["full/Q"]["achieved_max"])           # (#68 round 5 P3: "max" ranges kept)
+        self.assertLessEqual(g["targets"]["full/Q"]["achieved_min"], g["targets"]["full/Q"]["achieved_max"])
 
     def test_boundary_outside_the_range_and_failures(self):
         """E(lambda) above the boundary on the whole registered grid (patched functionals): unreached and,
