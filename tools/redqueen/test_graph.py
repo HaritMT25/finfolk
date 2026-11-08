@@ -6,7 +6,9 @@ simulation; numpy: skipped without it unless RQ_REQUIRE_NUMPY=1, as in CI).
 """
 from __future__ import annotations
 
+import contextlib
 import gzip
+import io
 import json
 import os
 import shutil
@@ -152,22 +154,32 @@ class TestGraph(unittest.TestCase):
                 for x, y in ((q, p), (p, q)):
                     if self.status(x) != "train" and graph.parse(x)[1] is not None:
                         sup[x][graph.parse(y)[1] is not None] += 1
-        short = 0
         for x, (nref, nopp) in sup.items():
             w = graph.parse(x)[1]
             self.assertEqual(nref, 4, x)
-            if self.split[w] != "train":                       # world holdouts: 4 references + 6 opponents
-                self.assertGreaterEqual(nopp, 4, x)            # (the four added ones at least)
-                short += nopp < 6
-            else:                                              # snapshot holdouts: existing matchings only
-                self.assertTrue(1 <= nopp <= 6, x)
-        self.assertLess(short, 20)                             # (the report counts the shortfall)
+            if self.split[w] != "train":                       # world holdouts: 4 references + 2 existing + 4 added
+                self.assertGreaterEqual(nopp, 6, x)
+            else:                                              # snapshot holdouts: 2..6 from the existing matchings
+                self.assertTrue(2 <= nopp <= 6, x)
+        # #64 review 2: EVERY held-out C population has >= 2 eligible training opponents in the existing
+        # (cross) matchings, after the snapshot masking (the deterministic repair swaps)
+        elig = Counter()
+        for q, p, fam, *_ in self.g["edges"]:
+            if fam == "cross":
+                for x, y in ((q, p), (p, q)):
+                    if self.status(x) != "train" and self.status(y) == "train":
+                        elig[x] += 1
+        held = [x for w in self.treat if self.treat[w] == "C" for t in range(201)
+                for x in (f"Q:{w}:{t}", f"P:{w}:{t}") if self.status(x) != "train"]
+        self.assertEqual([x for x in held if elig[x] < 2], [])
+        self.assertGreater(self.g["cross_shifts"]["repair_swaps"], 0)
         cs = sorted(w for w in self.treat if self.treat[w] == "C")
         sh = self.g["cross_shifts"]["shifts"]
         for i, w in enumerate(cs):
-            if self.split[w] != "train":
-                for d in (1, -1):
+            for d in (1, -1):
+                if self.split[w] != "train":
                     self.assertGreaterEqual(sum(self.split[cs[(i + d * s) % 32]] == "train" for s in sh), 4)
+                self.assertGreaterEqual(sum(self.split[cs[(i + d * s) % 32]] == "train" for s in sh[2:]), 2)
         blocks = self.g["ref_subsets"]
         for key in ("predator_refs_of_block", "prey_refs_of_block"):
             use = Counter(k for b in blocks[key].values() for k in b)
@@ -202,6 +214,39 @@ class TestGraph(unittest.TestCase):
             self.assertEqual(graph.check_quotas(gr), [])
             used = {graph.parse(x)[1] for e in gr["edges"] for x in e[:2]} - {None}
             self.assertEqual(used, {w["id"] for w in ws})
+        finally:
+            shutil.rmtree(tmp)
+
+    def test_registered_invocations_and_permuted_registry(self):
+        """#64 review 5: the registered two-flag command `--snapshot-topup 0 --ab-topup 0` gives the pure v4
+        graph (237,884 pairs: the lag probe is part of the top-up switch); P3: a permuted registry gives
+        byte-identical artifacts."""
+        tmp = tempfile.mkdtemp()
+        try:
+            d1 = os.path.join(tmp, "pure")
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                self.assertEqual(graph.main(["build", "--out", d1, "--namespace", NS, "--snapshot-topup", "0",
+                                             "--ab-topup", "0"]), 0)
+            meta = json.loads(rqlib.read_text(os.path.join(d1, "graph.meta.json")))
+            self.assertEqual((meta["edges"], meta["lag_probe"]), (237_884, 0))
+            self.assertEqual(graph.build(NS, snapshot_topup=6, ab_topup=0)["lag_probe"], graph.LAG_PROBE)
+            self.assertEqual(graph.build(NS, snapshot_topup=0, ab_topup=0, lag_probe=7)["lag_probe"], 7)
+            ws = graph.synthetic_worlds()
+            reg = os.path.join(tmp, "worlds.json")
+            regp = os.path.join(tmp, "worlds_perm.json")
+            with open(reg, "w") as f:
+                json.dump({"worlds": ws}, f)
+            with open(regp, "w") as f:
+                json.dump({"worlds": list(reversed(ws[::2])) + ws[1::2]}, f)
+            outs = []
+            for k, r in enumerate((reg, regp)):
+                d = os.path.join(tmp, f"g{k}")
+                with contextlib.redirect_stderr(err):
+                    self.assertEqual(graph.main(["build", "--out", d, "--namespace", NS, "--registry", r,
+                                                 "--snapshot-topup", "0", "--ab-topup", "0"]), 0)
+                outs.append([rqlib.read_bytes(os.path.join(d, f)) for f in ("graph.meta.json", "graph.jsonl.gz")])
+            self.assertEqual(outs[0], outs[1])
         finally:
             shutil.rmtree(tmp)
 
@@ -263,6 +308,88 @@ class TestRecovery(unittest.TestCase):
         fitset = set(D.fit["b"].tolist())
         self.assertFalse(fitset & set(D.test_idx.tolist()))
         self.assertFalse(fitset & set(D.val_idx.tolist()))
+
+    def test_crossed_bootstrap(self):
+        """#64 review 1: the lower bound resamples BOTH source worlds of every target. Test-world prey
+        facing predators of two shared source worlds with opposite effects: a test-world-only cluster
+        bootstrap sees no spread, the crossed one does; references are never resampled; deterministic."""
+        rec = self.rec
+        tw, qw, pw, diff = [], [], [], []
+        for t in range(6):
+            for k in range(40):
+                src = 100 + (k % 2)
+                tw.append(t)
+                qw.append(t)
+                pw.append(src)
+                diff.append((1.0 if src == 100 else -0.8) + 0.01 * ((k * 7 + t) % 5 - 2))
+        tw, qw, pw, diff = map(np.array, (tw, qw, pw, diff))
+        m1, lb1, per1 = rec.cluster_lb(diff, tw, np.random.default_rng(1))
+        m2, lb2, per2 = rec.crossed_lb(diff, tw, qw, pw, np.random.default_rng(1))
+        self.assertAlmostEqual(m1, m2, places=12)
+        self.assertGreater(lb1, 0.05)                       # (the one-world assignment: falsely tight)
+        self.assertLess(lb2, 0.0)                           # (the shared predator worlds' spread)
+        self.assertEqual(rec.crossed_lb(diff, tw, qw, pw, np.random.default_rng(1))[1], lb2)
+        ref = np.full_like(pw, -1)                          # against frozen references: only the prey world
+        m3, lb3, _ = rec.crossed_lb(diff, tw, qw, ref, np.random.default_rng(1))
+        self.assertGreater(lb3, lb2)
+
+    def test_forward_sets(self):
+        """#64 review 4: the forward-time sets (v4 §7.3)."""
+        D, F = self.D, self.D.forward
+        QT, PT = D.qt[D.qi], D.pt[D.pj]
+        qr, pr = D.qref[D.qi], D.pref[D.pj]
+        qs = np.where(D.qw[D.qi] >= 0, D.wsplit[np.maximum(D.qw[D.qi], 0)], "ref")
+        ps = np.where(D.pw[D.pj] >= 0, D.wsplit[np.maximum(D.pw[D.pj], 0)], "ref")
+        f = F["fit"]
+        main = f[~qr[f] & ~pr[f]]
+        self.assertTrue(len(main) and (QT[main] <= 120).all() and (PT[main] <= 120).all())
+        self.assertTrue(((qs[main] == "train") & (ps[main] == "train")).all())
+        refs = f[qr[f] ^ pr[f]]
+        self.assertTrue(len(refs) and (np.where(qr[refs], QT[refs], PT[refs]) <= 120).all())
+        self.assertGreater((np.where(qr[refs], PT[refs], QT[refs]) > 120).sum(), 0)    # future snapshots placed
+        self.assertFalse(D.within[f].any())
+        v = F["val"]
+        self.assertTrue(len(v) and ((QT[v] >= 141) & (QT[v] <= 160) & (PT[v] >= 141) & (PT[v] <= 160)).all())
+        ft, it = F["tests"]["forward_transfer"], F["tests"]["intersection"]
+        for t in (ft, it):
+            self.assertTrue(len(t) and ((QT[t] >= 181) & (PT[t] >= 181)).all())
+        self.assertTrue(((qs[ft] == "train") & (ps[ft] == "train")).all())
+        self.assertTrue(((qs[it] == "test") | (ps[it] == "test")).all())
+        for a_, b_ in ((f, v), (f, ft), (f, it), (v, ft), (v, it), (ft, it)):
+            self.assertFalse(set(a_.tolist()) & set(b_.tolist()))
+
+    def test_forward_procedure(self):
+        data = self.rec.simulate(self.D, dict(rank=1, energy=0.10), 17)
+        out = self.rec.forward_procedure(self.D, data, 1, [0.1], 6, 17)
+        self.assertEqual(out["procedure"], "forward")
+        self.assertIn(out["selected"]["rank"], (0, 1))
+        for k in ("forward_transfer", "intersection"):
+            self.assertTrue(out[k]["available"], out[k])
+            self.assertIn("test_lb", out[k])
+
+    def test_config_manifest(self):
+        """#64 review 3: a run is bound to its configuration: a resume of another one, or a summary over two,
+        is refused."""
+        import argparse as ap_
+        tmp = tempfile.mkdtemp()
+        try:
+            gdir = os.path.join(tmp, "g")
+            graph.write(full(), gdir)
+            a = ap_.Namespace(graph=os.path.join(gdir, "graph.jsonl.gz"), namespace="ns", fitter="minimal",
+                              options="a", ranks=1, lambdas="0.1", iters=5, ab_cap=-1, out=os.path.join(tmp, "o"),
+                              set="main", scenarios="r0", reps=0, jobs=1)
+            self.assertEqual(self.rec.run(a), 0)                  # (no datasets: the manifest only)
+            self.assertTrue(os.path.isfile(os.path.join(a.out, "config.json")))
+            b = ap_.Namespace(**dict(vars(a), iters=6))
+            with self.assertRaisesRegex(SystemExit, "another configuration"):
+                self.rec.run(b)
+            for k, c in enumerate(("x" * 64, "y" * 64)):
+                with open(os.path.join(a.out, f"r0.{k:03d}.json"), "w") as f:
+                    json.dump({"scenario": "r0", "options": {}, "config_sha256": c}, f)
+            with self.assertRaisesRegex(SystemExit, "mixed summary"):
+                self.rec.summarize(a.out)
+        finally:
+            shutil.rmtree(tmp)
 
     def test_energy_calibration(self):
         data = self.rec.simulate(self.D, self.rec.SCENARIOS["r1_034"], 11)
