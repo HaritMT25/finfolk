@@ -139,21 +139,33 @@ def world_epoch(wd, y, loads, xi):
         yh = np.asarray(y["ref"][h], float)[rd.mask]
         Lh = loads.get(h) if loads else None
         Lm = np.asarray(Lh, float)[rd.mask] if Lh is not None else None
+        where = f"world {wd.id} ({wd.scope}, readout {h})"
+        if not np.all(np.isfinite(yh)) or (Lm is not None and not np.all(np.isfinite(Lm))) \
+                or not np.all(np.isfinite(xi)):
+            raise TransitionError(f"{where}: a nonfinite response, loading or reference-source draw")
 
         def lin(op):                       # op y + (op L) xi_b for every draw b -> (..., B)
             base = op @ yh
             if Lm is None:
                 return np.repeat(np.asarray(base, float)[..., None], B, axis=-1)
             return np.asarray(base, float)[..., None] + np.asarray(op @ Lm) @ xi.T
-        rho, den = lin(rd.rbar), lin(rd.mean_op)                 # (period-free: once per readout)
+
+        def finite(x, what, P=None):       # (#68 round 2: a failed perturbation is a failure, BEFORE any gate)
+            bad = ~np.isfinite(x)
+            if bad.any():
+                cols_ = np.flatnonzero(bad.reshape(-1, B).any(axis=0))
+                raise TransitionError(f"{where}{'' if P is None else f' P={P:g}'}: a nonfinite perturbed {what} "
+                                      f"in {len(cols_)} draw(s), first {int(cols_[0])}")
+            return x
+        rho, den = finite(lin(rd.rbar), "window residual"), finite(lin(rd.mean_op), "capture denominator")
         cs = np.vstack([np.zeros((1, B)), np.cumsum(rho, axis=0)])
         for i, P in enumerate(P_all):
             if not static[i]:
                 continue
             hm = rd.harm[P]
-            b = hm.Sqinv @ lin(hm.WQ.T)                          # 2 x B (the stable basis)
-            a = hm.Rinv @ b
-            dbar = hm.avgQ @ b
+            b = finite(hm.Sqinv @ lin(hm.WQ.T), "harmonic coordinate", P)     # 2 x B (the stable basis)
+            a = finite(hm.Rinv @ b, "harmonic coefficient", P)
+            dbar = finite(hm.avgQ @ b, "recurrent component", P)
             A = np.hypot(a[0], a[1])
             phi = np.arctan2(a[1], a[0])
             ms = np.mean(dbar ** 2, axis=0) if len(dbar) else np.zeros(B)
@@ -173,6 +185,10 @@ def world_epoch(wd, y, loads, xi):
             if h == "C":
                 g &= den > 0
             G[h][i] = g
+    for h in "CQ":                         # (every evaluated draw: a value or the registered +inf, never NaN)
+        ev = np.array(static, bool)
+        if np.isnan(r2[h][ev]).any():
+            raise TransitionError(f"world {wd.id} ({wd.scope}): a NaN {h} energy draw")
     JC = np.array([r.get("J_C", 0.0) for r in obs["periods"]])
     JQ = np.array([r.get("J_Q", 0.0) for r in obs["periods"]])
     s = (G["C"] & G["Q"]) * np.minimum(JC, JQ)[:, None]                         # nP x B
@@ -352,6 +368,11 @@ def ht(epochs, betas, gates, loads=None, k=0, analysis="main", draws=stats.B_BOO
     report is set."""
     ids = canonical_ids(epochs, betas, loads)
     n = len(ids)
+    missing = [e for e in EPOCHS if gates.get(e) is None]
+    if missing:                                        # (H.12: every gate H-T requires needs a passing calibration)
+        return {"available": False, "reject": False, "T_T": None, "winner": None, "candidates": [], "worlds": ids,
+                "error": f"the recurrence gate of {missing} lacks a passing frozen calibration", "c_T": max(GUARD, c_T),
+                "p_model": p_model, "phase_support": {}, "EU_unsupported": {}}
     for e in EPOCHS:                                   # (canonical order: one index = one world everywhere)
         by = {wd.id: (wd, y) for wd, y in epochs[e]}
         epochs = dict(epochs, **{e: [by[w] for w in ids]})
@@ -362,16 +383,17 @@ def ht(epochs, betas, gates, loads=None, k=0, analysis="main", draws=stats.B_BOO
                 "winner": None, "candidates": [], "worlds": ids, "c_T": max(GUARD, c_T), "p_model": p_model,
                 "phase_support": {}, "EU_unsupported": {}}
     idx, xi = draw_streams(analysis, n, k, draws)
-    per = {e: [world_epoch(wd, y, (loads or {}).get(w), xi) for w, (wd, y) in zip(ids, epochs[e])] for e in EPOCHS}
     obs, dr, res = {}, {}, {}
-    for e in EPOCHS:
-        obs[e], dr[e], res[e] = epoch_components(per[e], bet[e], idx)
     try:
+        per = {e: [world_epoch(wd, y, (loads or {}).get(w), xi) for w, (wd, y) in zip(ids, epochs[e])]
+               for e in EPOCHS}
+        for e in EPOCHS:
+            obs[e], dr[e], res[e] = epoch_components(per[e], bet[e], idx)
         stat = ht_statistic(obs, dr, gates)
-    except TransitionError as err:
+    except TransitionError as err:          # (a numerical failure anywhere: unavailable, never a rejection)
         return {"available": False, "reject": False, "T_T": None, "error": str(err), "winner": None,
                 "candidates": [], "components": obs, "c_T": max(GUARD, c_T), "p_model": p_model, "worlds": ids,
-                "phase_support": {e: res[e]["phase_support"] for e in EPOCHS}, "EU_unsupported": {}}
+                "phase_support": {e: res[e]["phase_support"] for e in res}, "EU_unsupported": {}}
     c_T = max(GUARD, c_T)
     out = {"T_T": stat["T_T"], "c_T": c_T, "p_model": p_model, "winner": stat["winner"], "worlds": ids,
            "candidates": stat["candidates"], "components": obs, "available": all(res[e]["available"] for e in EPOCHS),

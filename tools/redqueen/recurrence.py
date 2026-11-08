@@ -496,10 +496,11 @@ def ref_geometry(t, ref, bounds, periods):
     return _cached(key, build)
 
 
-def ref_rms(t, ref, cov, scope, P, y):
+def ref_rms_op(t, ref, cov, scope, P):
     """The reference-panel readout's RMS and capture denominator alone (RefDesign.readout's "rms" and
-    "den", the same operators) without the support machinery: the calibration generator's amplitude
-    solver evaluates it many times per world. -> (rms, den), or None (not four references / rank)."""
+    "den", the same operators) without the support machinery, as an operator y -> (rms, den) for a FIXED
+    metric (the calibration generator's amplitude solver evaluates it many times per world), or None (not
+    four references / rank)."""
     bounds = scope_bounds(scope)
     geo = ref_geometry(t, ref, bounds, (float(P),))
     if len(geo["refs"]) != 4:
@@ -507,10 +508,19 @@ def ref_rms(t, ref, cov, scope, P, y):
     hm = Projector(geo["X"], cov.subset(geo["mask"])).harmonics(H=geo["H"])[0]
     if not hm.rank2:
         return None
-    ym = np.asarray(y, float)[geo["mask"]]
-    _, b = hm.coords(ym)
-    dbar = (geo["avg"] @ hm.Q) @ b
-    return (float(np.sqrt(np.mean(dbar ** 2))) if len(dbar) else 0.0), float(geo["mean_op"] @ ym)
+    avgQ, mask, mean_op = geo["avg"] @ hm.Q, geo["mask"], geo["mean_op"]
+
+    def op(y):
+        ym = np.asarray(y, float)[mask]
+        _, b = hm.coords(ym)
+        dbar = avgQ @ b
+        return (float(np.sqrt(np.mean(dbar ** 2))) if len(dbar) else 0.0), float(mean_op @ ym)
+    return op
+
+
+def ref_rms(t, ref, cov, scope, P, y):
+    op = ref_rms_op(t, ref, cov, scope, P)
+    return None if op is None else op(y)
 
 
 # ================================================================== designs

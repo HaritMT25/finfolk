@@ -269,6 +269,32 @@ class TestTransition(unittest.TestCase):
             tr.ht_statistic(obs, draws, {e: True for e in tr.EPOCHS})
         self.assertEqual(tr.classify(obs["E2"], draws["E2"], True)["class"], "unresolved")
 
+    def test_failed_perturbations_are_failures(self):
+        """#68 round 2 (P1-3 residual): a nonfinite loading makes the perturbed coefficients NaN; that is a
+        failure BEFORE any gate or zero substitution (never zero energy), and the analysis is unavailable."""
+        tr, rc = self.tr, self.rc
+        refs = np.array(["a", "b", "c", "d"], object)
+        L, U = rc.SCOPES["E2"]
+        t = np.array([L] + [L + float(k) for k in range(1, 51)])
+        ti, tj = (a.ravel() for a in np.meshgrid(t, t, indexing="ij"))
+        rt, rr = np.tile(t, 4), np.repeat(refs, len(t))
+        cw, cr = rc.Cov(np.full(len(ti), 1e-4)), rc.Cov(np.full(len(rt), 1e-4))
+        wd = rc.WorldDesign("w0", {"C": (ti, tj, cw), "Q": (ti, tj, cw)}, {"C": (rt, rr, cr), "Q": (rt, rr, cr)},
+                            "E2", (8.0, 12.0))
+        lag = 2 * math.pi * (tj - ti) / 8.0
+        y = {"within": {"C": 0.3 + 0.05 * np.cos(lag), "Q": -0.1 + 0.02 * np.cos(lag)},
+             "ref": {"C": 0.4 + 0.05 * np.cos(2 * math.pi * rt / 8.0), "Q": -0.1 + 0.02 * np.cos(2 * math.pi * rt / 8.0)}}
+        Lc = np.zeros((len(rt), 2))
+        Lc[5, 0] = math.nan
+        xi = tr.VecSplitMix64(3).normals(40).reshape(20, 2)
+        with self.assertRaises(tr.TransitionError) as cm:
+            tr.world_epoch(wd, y, {"C": Lc}, xi)
+        self.assertIn("w0", str(cm.exception))
+        Lc[5, 0] = 1e308                                          # (finite, but the perturbed projection overflows)
+        Lc[6, 0] = -1e308
+        with self.assertRaises(tr.TransitionError):
+            tr.world_epoch(wd, y, {"C": Lc * 1e10}, xi)
+
     def test_mixed_needs_affirmative_evidence(self):
         """#68 review 8: material recurrence with directional bounds spanning the band is UNRESOLVED, not
         mixed; bounds without a passed gate are unresolved; mixed needs both affirmatively."""
