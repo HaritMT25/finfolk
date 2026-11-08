@@ -405,8 +405,9 @@ def epoch_coverage(designs, per_world, grid):
     registered one and the excluded periods; per world x readout (C, Q; and jointly) x period band, the
     supported cells of all; the totals; the worlds with an unsupported cell (E^U = +inf whenever any:
     complete support is required, never assumed) and the failing rules. A readout's candidate is supported
-    when its within and reference designs pass rules 1-5 and its fitted-phase chain exists (rule 6), the
-    capture denominator positive (capture); the joint support is analyze_world's."""
+    when ITS within and reference designs pass rules 1-5 and ITS fitted-phase chain exists (rule 6), the
+    capture denominator positive (capture), each readout evaluated independently of the other (#68 round 6
+    P3); the joint support is analyze_world's."""
     bands = (("4-8", 4.0, 8.0), ("9-14", 9.0, 14.0), ("15-20", 15.0, 20.0))
 
     def band(P):
@@ -414,17 +415,24 @@ def epoch_coverage(designs, per_world, grid):
     out = {"grid": list(grid), "registered": list(recurrence.EPOCH_PERIODS),
            "excluded_periods": list(recurrence.EPOCH_EXCLUDED), "worlds": {}, "totals": {}, "worlds_unsupported": 0,
            "fail_rules": {}}
-    for (wd, _), w in zip(designs, per_world):
+    for (wd, yy), w in zip(designs, per_world):
+        y_ = {h: yy["ref"][h] for h in "CQ"}
         rec = {h: {} for h in ("C", "Q", "joint")}
         bad = False
+        pre = {}
         for r in w["obs"]["periods"]:
             P, b_ = r["P"], band(r["P"])
             ro = r.get("readout") or {}
             sup = {"joint": bool(r["supported"])}
             for h in "CQ":
-                ok = not (wd.within[h].fails[P] or wd.ref[h].fails[P]) and bool((ro.get(h) or {}).get("chain"))
-                if h == "C":
-                    ok = ok and (ro.get("C") or {}).get("den", 0.0) > 0
+                ok = not (wd.within[h].fails[P] or wd.ref[h].fails[P])
+                if ok:                       # (#68 round 6 P3: this readout's own fitted-phase chain, independently)
+                    rh = ro.get(h)
+                    if rh is None:
+                        if h not in pre:
+                            pre[h] = wd.ref[h].prepare(y_[h])
+                        rh = wd.ref[h].readout(None, P, pre[h])
+                    ok = bool(rh["chain"]) and (h != "C" or rh["den"] > 0)
                 sup[h] = bool(ok)
             for h, v in sup.items():
                 d = rec[h].setdefault(b_, [0, 0])
@@ -553,7 +561,7 @@ def classify(obs_e, draws_e, gate, a=LEVEL):
 
 
 def ht(epochs, betas, gates, loads=None, k=0, analysis="main", draws=stats.B_BOOT, c_T=GUARD, p_model=None,
-       report=True, domain=None):
+       report=True):
     """The complete H-T analysis. epochs: {e: [(WorldDesign for e, responses y)]} (the same unique world
     ids in every epoch, any order); betas: {e: {"P": {world id: slope}, "Q": {world id: slope}}}; gates:
     {e: the epoch's calibrated recurrence-detection gate (bool)}; loads: {world id: {"C": L, "Q": L}}
@@ -561,12 +569,12 @@ def ht(epochs, betas, gates, loads=None, k=0, analysis="main", draws=stats.B_BOO
     report is set. c_T None (an unavailable calibration, e.g. a capped mode: #68 round 4 P3) never enters
     a comparison: the result is unavailable, never a rejection (p = 1 in Holm). The result reports the
     E^U support COVERAGE per epoch (the registered domain recurrence.EPOCH_PERIODS, by period band). Every
-    epoch design must use the registered domain (#68 round 5 P2-2: recurrence.EPOCH_PERIODS, or `domain` in a
-    test); a design on any other list makes the analysis unavailable (failure "domain")."""
+    epoch design must use the registered domain recurrence.EPOCH_PERIODS, with no override (#68 rounds 5-6
+    P2-2): a design on any other list makes the analysis unavailable (failure "domain")."""
     calibrated = c_T is not None
     c_T = max(GUARD, c_T) if calibrated else GUARD
     ids = canonical_ids(epochs, betas, loads)
-    grid = tuple(recurrence.EPOCH_PERIODS) if domain is None else tuple(float(p) for p in domain)
+    grid = tuple(recurrence.EPOCH_PERIODS)
     off = sorted({(e, wd.id) for e in EPOCHS for wd, _ in epochs[e] if tuple(wd.periods) != grid})
     if off:                                  # (#68 round 5 P2-2: the registered domain, never a supplied list)
         return {"available": False, "reject": False, "T_T": None, "winner": None, "candidates": [], "worlds": ids,

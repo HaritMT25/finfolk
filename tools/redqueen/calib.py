@@ -664,6 +664,7 @@ def plan_world(hyp, mode, panel, k, rng):
 
 # ================================================================== a panel
 _BS = {}
+_VERSION = __import__("itertools").count(1)          # (cache-guard versions: never reused, unlike id())
 
 
 def _bspline_full(t):
@@ -1062,7 +1063,7 @@ class Panel:
             states[lam] = {"E": v, "clips": clips, "worlds": [{k: w[k] for k in ("amp", "mu", "y_true")}
                                                               for w in self.worlds]}
             last.clear()
-            last.update(lam=lam, nf=[(w.get("cov_nf"), w.get("_dcache_nf")) for w in self.worlds])
+            last.update(lam=lam, nf=[(w.get("cov_nf"), w.get("_dcache_nf"), w.get("_cov_nf_ver")) for w in self.worlds])
             path.append((lam, v))
             return v
 
@@ -1079,7 +1080,7 @@ class Panel:
                 w.update(x)
                 self._reset_nf(w)
                 if reuse and last["nf"][i][0] is not None:
-                    w["cov_nf"], w["_dcache_nf"] = last["nf"][i]
+                    w["cov_nf"], w["_dcache_nf"], w["_cov_nf_ver"] = last["nf"][i]
                 w["plan"]["rec"]["full"] = tuple(lam * base if i_ == h else t
                                                  for i_, t in enumerate(w["plan"]["rec"]["full"]))
             self.unattainable = list(st["clips"])
@@ -1099,7 +1100,8 @@ class Panel:
                 self.verified.append(dict(ver, world=w["id"]))
             return {"outcome": outcome, "lambda": lam, "functional": st["E"], "boundary": b, "evals": len(path),
                     "residual": (st["E"] - b) / b, "path": [list(x) for x in path],
-                    "frozen": {"evals": frozen["evals"], "proposals": frozen["path"]} if LAMBDA_FROZEN_METRIC else None}
+                    "frozen": {"evals": frozen["evals"], "proposals": frozen["path"], "handoff": frozen.get("handoff")}
+                    if LAMBDA_FROZEN_METRIC else None}
 
         def drive(Ef, seen):
             """The registered search with the evaluator Ef (seen: its evaluated points): -> ("feasible", lam),
@@ -1180,6 +1182,15 @@ class Panel:
                 if abs(hi - lo) <= width / 2:
                     width, since = abs(hi - lo), 0
 
+        def true_bracket():
+            """The tightest pair of TRUE evaluations straddling b (the null side below the acceptance window, the
+            other above b), or None: the frozen proposals' bracket handed to the true safeguarded solver."""
+            lo_ = [(v, lam) for lam, v in path if v - b < -tolb]
+            hi_ = [(v, lam) for lam, v in path if v > b]
+            if not lo_ or not hi_:
+                return None
+            return max(lo_)[1], min(hi_)[1]
+
         def unreached(kind, jump_lo=None):
             if jump_lo is not None:
                 keep = jump_lo                                          # (the attained null-side endpoint)
@@ -1213,8 +1224,13 @@ class Panel:
                 frozen["path"].append(val)
                 if accepted(E(val)):
                     return finish(float(val), "feasible")
+                br = true_bracket()
+                if br is not None:                          # (the handoff: two TRUE values straddle b)
+                    frozen["handoff"] = list(br)
+                    break
                 anchor = float(val)
-        kind, val = drive(E, states)
+        br = true_bracket() if LAMBDA_FROZEN_METRIC else None
+        kind, val = drive_from(br[0], br[1], E, states) if br is not None else drive(E, states)
         if kind == "feasible":
             return finish(float(val), "feasible")
         if kind == "jump":
@@ -1245,6 +1261,8 @@ class Panel:
                     for k, i in refkeys.items()}
         for w in self.worlds:
             w.update(self.observe(w["graph"], w["mu"], w["plan"], w["k"], ref_comp, refkeys, LR, LD))
+            w["_cov_ver"] = next(_VERSION)                    # (the final metric's version: the cache guard)
+            w.pop("_dcache", None)
         return self
 
     # -------------------------------------------------------- the registered functionals of the noise-free panel
@@ -1624,13 +1642,22 @@ class Panel:
         return recurrence.WorldDesign(wg.id, {"C": (wg.ti, wg.tj, cv["C"]), "Q": (wg.ti, wg.tj, cv["Q"])},
                                       {"C": (wg.cT, wg.cR, cv["RC"]), "Q": (wg.qT, wg.qR, cv["RQ"])}, scope)
 
+    def _cached(self, w, cache, ver, cv, scope):
+        """A cached design with its GUARD (#68 round 6 P3): the entry stores the covariance's version (a counter,
+        never reused, unlike id()), the graph object and the scope's registered period tuple, and every lookup
+        must match all three: a stale design is impossible (a mismatch raises)."""
+        token = (w[ver], id(w["graph"]), tuple(recurrence.PERIODS[scope]))
+        dc = w.setdefault(cache, {})
+        if scope not in dc:
+            dc[scope] = (token, self._world_design(w["graph"], cv, scope))
+        elif dc[scope][0] != token:
+            raise CalibError(f"{w['id']} {scope}: a stale cached design (covariance, graph or periods changed)")
+        return dc[scope][1]
+
     def design(self, w, scope):
         """The world's design under the FINAL metric (the observed means), CACHED per scope (#68 CPU lever (a),
-        exact: the analysis and the final-metric boundary check use the identical covariance)."""
-        dc = w.setdefault("_dcache", {})
-        if scope not in dc:
-            dc[scope] = self._world_design(w["graph"], w["cov"], scope)
-        return dc[scope]
+        exact: the analysis and the final-metric boundary check use the identical covariance), guarded."""
+        return self._cached(w, "_dcache", "_cov_ver", w["cov"], scope)
 
     def design_nf(self, w, scope):
         """The world's design under the triage metric (the plug-in model at the noise-free means), CACHED per
@@ -1642,15 +1669,14 @@ class Panel:
                            "RC": self.cov(wg, {"C": mu["RC"]}, "RC"),
                            "RQ": self.cov(wg, {"S": mu["RS"], "F": mu["F"]}, "RQ")}
             w["_dcache_nf"] = {}
-        dc = w["_dcache_nf"]
-        if scope not in dc:
-            dc[scope] = self._world_design(w["graph"], w["cov_nf"], scope)
-        return dc[scope]
+            w["_cov_nf_ver"] = next(_VERSION)
+        return self._cached(w, "_dcache_nf", "_cov_nf_ver", w["cov_nf"], scope)
 
     @staticmethod
     def _reset_nf(w):
         w.pop("cov_nf", None)
         w.pop("_dcache_nf", None)
+        w.pop("_cov_nf_ver", None)
 
     def analyze_hf(self):
         """S_F, M_F, R_C, R_Q (full history) and the epoch scores S_e with their availability (the H-T

@@ -652,6 +652,45 @@ class TestStrata(unittest.TestCase):
         self.assertLessEqual(on["boundary_solve"]["evals"], off["boundary_solve"]["evals"])
         self.assertEqual(on["role"], off["role"])
 
+    def test_design_cache_guard(self):
+        """#68 round 6 P3: a cached design carries its covariance version, graph and periods; a lookup after the
+        covariance changed raises (a stale design is impossible); observe resets the final-metric cache."""
+        cb = self.cb
+        pn = cb.Panel(self.graph, self.params, "H-F", "dev", "actual", "F1", 0).simulate()
+        w = pn.worlds[0]
+        pn.design(w, "full")
+        w["_cov_ver"] += 1000
+        with self.assertRaises(cb.CalibError):
+            pn.design(w, "full")
+        pn.observe_all()
+        self.assertIsNotNone(pn.design(w, "full"))
+        d = pn.design_nf(w, "E2")
+        self.assertIs(pn.design_nf(w, "E2"), d)
+        w["_cov_nf_ver"] += 1000
+        with self.assertRaises(cb.CalibError):
+            pn.design_nf(w, "E2")
+
+    def test_lambda_bracket_handoff(self):
+        """The frozen-metric proposals hand their first TRUE bracket to the true safeguarded solver: the
+        classification equals the pure true-metric search's, the accepted functional lies in the same true
+        window, and the handoff never takes more true evaluations than the pure search."""
+        cb = self.cb
+        old = cb.LAMBDA_FROZEN_METRIC
+        out = {}
+        try:
+            for flag in (False, True):
+                cb.LAMBDA_FROZEN_METRIC = flag
+                out[flag] = [self.run_(m, k) for m, k in (("F3", 0), ("F3", 1), ("F4", 0), ("F4", 1))]
+        finally:
+            cb.LAMBDA_FROZEN_METRIC = old
+        for a, b in zip(out[False], out[True]):
+            self.assertEqual((a["status"], a.get("eligible")), (b["status"], b.get("eligible")))
+            for r in (a, b):
+                bs = r["boundary_solve"]
+                if bs["outcome"] == "feasible":
+                    self.assertTrue(-cb.BOUNDARY_TOL <= bs["residual"] <= 0.0)
+            self.assertLessEqual(b["boundary_solve"]["evals"], a["boundary_solve"]["evals"] + 1)
+
     def test_final_metric_failure_is_discarded(self):
         """#68 round 4 P2-1: F3 slot 1 meets its boundary on the noise-free metric but not under the FINAL
         metric (residual about -10%): it never enters B (discarded "final-boundary", counted)."""

@@ -249,6 +249,15 @@ class TestTransition(unittest.TestCase):
         off = {e: [(bad_wd if e == "E2" and wd.id == "w1" else wd, y_) for wd, y_ in epochs[e]] for e in tr.EPOCHS}
         dom = tr.ht(off, betas, {e: True for e in tr.EPOCHS}, loads=None, k=0, analysis="t", draws=19)
         self.assertEqual((dom["available"], dom["reject"], dom["failure"]), (False, False, "domain"))
+        # (#68 round 6 P3: a static failure of Q alone leaves C's coverage intact; joint support falls)
+        wd0 = epochs["E2"][0][0]
+        wd0.within["Q"].fails[8.0] = ["test-Q-only"]
+        one = tr.ht(epochs, betas, {e: True for e in tr.EPOCHS}, loads=None, k=0, analysis="t", draws=19)
+        cw0 = one["coverage"]["E2"]["worlds"]["w0"]
+        self.assertEqual(cw0["C"]["4-8"], cov["worlds"]["w0"]["C"]["4-8"])
+        self.assertEqual(cw0["Q"]["4-8"][0], cov["worlds"]["w0"]["Q"]["4-8"][0] - 1)
+        self.assertEqual(cw0["joint"]["4-8"][0], cov["worlds"]["w0"]["joint"]["4-8"][0] - 1)
+        del wd0.within["Q"].fails[8.0][:]
         nc = tr.ht(epochs, betas, {e: True for e in tr.EPOCHS}, loads=None, k=0, analysis="t", draws=19, c_T=None)
         self.assertEqual((nc["available"], nc["reject"], nc["c_T"]), (False, False, None))   # (no calibration)
         # #68 review 11: identities, not positions. One epoch's worlds reversed (their slopes keyed by id):
