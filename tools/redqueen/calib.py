@@ -33,22 +33,55 @@ is a documented synthetic stand-in ("fitted": false) for the tests and the bench
   binomial layer.
   Recurrence (H.9.3): world period uniform on the registered grid, phase uniform; a lag harmonic
   cos(omega (t_j - t_i) - phi) within the world and cos(omega t - phi) on the reference panels, one latent
-  amplitude per readout (and epoch), solved (safeguarded secant) so that the NOISE-FREE post-refit
-  native RMS on the world's reference panel (recurrence.RefDesign, the actual graph and metric) equals
-  the target (convergence required); "max" (as large as bounded means permit) = the amplitude in [0, 6]
-  MAXIMIZING the native RMS (grid + golden section); an unattainable target is recorded: an alternative
-  is then a non-success, a null panel fails (never redrawn); a background already above a target is
-  recorded as a deviation (above a boundary null: conservative).
+  amplitude >= 0 per readout (and epoch), solved so that the NOISE-FREE post-refit native RMS on the
+  world's reference panel (recurrence.ref_rms_op; the metric: the plug-in bank model at the world's BASE
+  noise-free means, decision D1) equals the target to AMP_TOL relative, on BOTH sides (no overshoot is
+  accepted; #68 round 3): the smallest such amplitude on the grid AMP_GRID ([0, A_MAX] by 0.5, then 12,
+  24 = A_SUP), its bracket solved by the Illinois method. "max" (as large as bounded means permit) = the
+  native RMS maximized over [0, A_SUP] (grid, golden-section refinement).
   Directional knobs (H-T modes): per epoch, a latent focal-time slope (capture: predator time; exposed
   survival: prey time), continuous, linear within each epoch. The knobs and the amplitudes are solved
   JOINTLY (alternating, each with the other present) and the COMPLETED noise-free panel is verified
-  against every declared constraint (epoch slopes to 1e-5, RMS targets to 1e-6 relative); a panel that
-  does not verify fails.
+  against every declared constraint (epoch slopes to DIR_TOL, RMS targets to AMP_TOL relative, both
+  sides); a panel that does not verify is a numerical failure.
   The analysis covariance V of a panel is the bank model evaluated at the panel's observed per-channel
   replicate means (clipped to [1/2N, 1 - 1/2N]; the delta method; shared columns per sharing key) - the
   same plug-in rule the real analysis uses.
 
-MODES (H.10). H-F (full history): F0 none; F1 capture only (RMS 0.10 / 0.20 by panel parity); F2
+FEASIBILITY AND STRATA (the D2 ruling, 2026-11-08; an Annex H amendment). A target is INFEASIBLE only
+when the bounded-mean limit shows it: an RMS target above the native RMS's supremum over EVERY amplitude
+(the evidence ladder continues past A_SUP to A_LIM, the step pattern), or below its infimum (a
+background above the target at every amplitude); a survival-slope target outside the range of the noise-
+free epoch slope over the knob, the ladder continued until the slope's limit has converged. A target
+inside those limits that the solver cannot reach (an amplitude or knob ceiling, non-convergence, a limit
+that cannot be established) is a NUMERICAL FAILURE: an error, never infeasible; its allocation is
+refused until repaired and rerun (H.12). An infeasible target is CLIPPED to the nearest attainable value
+(the attainable supremum / infimum on the generating domain) and recorded (requested, achieved).
+PROPOSALS. The proposal unit is the complete panel (its worlds and their dependence kept). One stream
+family per hyp x stage x mode x graph: slot j (0..n-1, carrying panel j's registered parity / subtype /
+direction), retry r (0..ROUNDS-1; r = 0 is the slot's original stream tag, r >= 1 the tag
+"<j>/retry<r>"). TRIAGE (noise-free) classifies a proposal on its final noise-free mean panel under the
+registered analysis functionals (Panel.functionals: the plug-in metric at the noise-free means): FEASIBLE
+(every declared constraint met) or INFEASIBLE (a target clipped), then NULL MEMBERSHIP: H-F F0-F2 by
+construction (the absent readout's amplitude is zero); F3 / F4 not both R_C > d_C and R_Q > d_Q beyond
+BOUNDARY_TOL; H-T: for EVERY one of the six candidates some margin <= BOUNDARY_TOL x its scale (clipping
+one component can strengthen another candidate). A non-member is discarded (counted). STRATA per mode x
+graph: B = feasible members (slot j's first in retry order), I = infeasible members (the first n_I = n in
+(retry, slot) order). Round 0 proposes every slot; round r >= 1 re-proposes the slots without a B panel
+and, while I is short and q-hat (the infeasible fraction of the complete rounds) x K could still reach
+N_MIN, every slot; K = ROUNDS x n. Only kept proposals get the noisy simulation and the analysis. A slot
+without a B panel after ROUNDS proposals is CAPPED: the mode's calibration is UNAVAILABLE (reported; the
+decisions needing it are unavailable, p = 1 in Holm), never a non-rejection. I is calibrated when it
+holds >= N_MIN panels (dev 99: the plus-one 0.99 order statistic exists; val 149: 0 false positives give
+U95 <= 0.02); otherwise its scope is reported: q-hat, its Clopper-Pearson q_U and alpha_F + q_U.
+Alternatives are unchanged (an infeasible alternative target is a non-success). q-hat from the synthetic
+placeholder parameters is illustrative only; the binding q-hat is the production run's.
+BOUNDARY (the D1 caveat). A B panel with a declared boundary (F3: R_C = d_C; F4: R_Q = d_Q; T4 components
+0-13: margin k of its candidate = 0) is labelled an Annex H boundary null only when the boundary
+quantity, recomputed on the noise-free means under the FINAL analysis metric (built from the observed
+means), lies within BOUNDARY_TOL x its scale of the boundary (recorded per panel and reported).
+
+MODES (H.10).MODES (H.10). H-F (full history): F0 none; F1 capture only (RMS 0.10 / 0.20 by panel parity); F2
 survival only (0.04 / 0.08); F3 capture 0.10 + survival max; F4 survival 0.04 + capture max;
 alternatives FA1 (0.10, 0.04), FA2 (0.20, 0.08). H-T (epochs; one period per world across epochs): T0
 stable material directional (1.5 delta), no recurrence; T1 stable recurrence (0.15, 0.06), no
@@ -58,31 +91,39 @@ transition) x 2 directions) over the three epoch pairs; alternatives TA1 / TA2 (
 direction by panel parity). Graph strata: "actual" (the qualifying worlds) and "stress24" (24 worlds by
 sha256 of the registry id). Streams: AnnexH/1/<hyp>/<stage>:<stratum>/<mode>/<panel>[/<purpose>].
 
-DECISIONS (H.11). Development: per stratum (160 panels) the plus-one 0.99 order statistic (= the
-maximum); the largest applicable stratum value: c_F over F0-F2, c_M (M_F) over F0-F4, epoch gates
-c_E1..c_E3 (S_e) over F0-F2, c_T = max(log 600, over T0-T4). Every allocation must be COMPLETE: every
-mode x graph stratum, panels 0..n-1 each once, no failed panel (a failure is repaired and rerun, H.12),
-one manifest (graph, parameters, tools, draws, gates), production records only (fitted parameters,
-the real graph, 9,999 draws). Validation (acceptance) is INDEPENDENT of the panels it judges: the
-false positives of the FROZEN critical rules (the model p-value can only reduce rejections) on the
-1,000-panel validation allocation per mode x graph stratum: H-F detection (F0-F2: the raw reciprocal
-rule), the nested exceeding-material claim (F0-F4), each epoch gate (F0-F2), H-T (T0-T4; T4 subtype
-rates as diagnostics); U95 <= 0.02 for every rate. The validation null scores then form the p-tables
-of the final evaluation (p_m(s) = (1 + #{null >= s}) / 1001, p_model = max_m). H-T needs the FROZEN
-epoch-gate artifact (`gates`: every epoch's c_E with a passing validation); without it H-T is
-unavailable. Power: development alternatives with Wilson intervals, H-T by generating direction.
+DECISIONS (H.11). Development: per mode x graph x stratum (B; I when calibrated) the plus-one 0.99
+order statistic; a decision's critical value is the LARGEST over its applicable modes, graphs and strata
+(never pooled: interior I cases would dilute the boundary): c_F over F0-F2, c_M (M_F) over F0-F4, epoch
+gates c_E1..c_E3 (S_e) over F0-F2, c_T = max(log 600, over T0-T4); a capped mode makes it unavailable.
+Every allocation must be COMPLETE: every mode x graph with its registered proposal rounds, no failed
+proposal (a failure is repaired and rerun, H.12), one manifest (graph, parameters, tools, draws, gates),
+production records only (fitted parameters, the real graph, 9,999 draws). Validation (acceptance) is
+INDEPENDENT of the panels it judges: the false positives of the FROZEN critical rules (the model p-value
+can only reduce rejections) on the 1,000-panel validation B stratum (and the calibrated I stratum) per
+mode x graph: H-F detection (F0-F2: the raw reciprocal rule), the nested exceeding-material claim
+(F0-F4), each epoch gate (F0-F2), H-T (T0-T4; T4 subtype counts with denominators as diagnostics); U95 <=
+0.02 for every rate. The claim is "passed the model-based screen (U95 <= 0.02) for the registered
+strata", never certified alpha control (H.11). The validation null scores form the p-tables per stratum
+(p_m(s) = (1 + #{null >= s}) / (N + 1), p_model = the LARGEST over the tables). The acceptance report
+names the critical-value artifact it evaluated (crit_sha256); the frozen epoch-gate artifact (`gates`)
+binds that identity, the acceptance's, the recomputed gate rates and the H-F manifest, and H-T refuses
+gates calibrated on another graph, parameters, code or draws. Power: development alternatives (the
+registered 100 panels per mode x graph, failures counted as non-successes) with Wilson intervals, H-T
+by generating direction (assigned from panel parity before generation).
 BENCHMARK (H.12). `calib.py bench` runs the first 50 development panels of a hypothesis (the ten strata
 in turn) with every fit, period, window, material rule, epoch, direction and bootstrap used in the
 decision, and reports CPU seconds per panel against the 13.5 s target (smoke records: never accepted
 by crit / accept).
 
-    python3 calib.py panels --hyp H-F --stage dev --graph g.jsonl.gz --params fitted.json --mode F0 \\
-        --stratum actual --to 160 --out dev_HF.jsonl                       (production; --smoke for tests)
+    python3 calib.py panels --hyp H-F --stage dev --graph g.jsonl.gz --params fitted.json --mode F3 \\
+        --stratum actual --to 160 --out dev_HF_r0.jsonl          (round 0; production; --smoke for tests)
+    python3 calib.py panels ... --round 1 --prior dev_HF_r0.jsonl --out dev_HF_r1.jsonl   (rounds 1, 2)
     python3 calib.py crit dev_HF.jsonl > crit_HF.json
     python3 calib.py accept --crit crit_HF.json val_HF.jsonl > acc_HF.json
     python3 calib.py gates --crit crit_HF.json --accept acc_HF.json --out gates.json
     python3 calib.py panels --hyp H-T ... --gates gates.json ...; crit / accept / power likewise
     python3 calib.py bench --hyp H-F [--graph g.jsonl.gz] [--params p.json] [--panels 50]
+    python3 calib.py report dev_*.jsonl val_*.jsonl > report.json       (proposals, clips, boundaries, CPU)
 """
 from __future__ import annotations
 
@@ -122,8 +163,17 @@ A_MAX = 6.0
 AMP_TOL = 1e-7           # the amplitude solver's relative RMS tolerance
 DIR_TOL = 1e-5           # the declared epoch slopes, met on the completed noise-free panel to this (absolute)
 DIR_STEPS = 12
-KNOB_MAX = 8.0           # |a directional knob| in latent logit per 50M
+KNOB_MAX = 8.0           # the survival knob's search grid [-KNOB_MAX, KNOB_MAX] (latent logit per 50M)
+KNOB_LIM = 1024.0        # the knob's evidence ladder (the bounded-mean limit; infeasibility evidence only)
 JOINT_ROUNDS = 24
+A_SUP = 4 * A_MAX        # the generating amplitude domain [0, A_SUP] (the means stay inside the location tables)
+A_LIM = 1e4              # the amplitude's bounded-mean limit (the step pattern; infeasibility evidence only)
+AMP_GRID = tuple(0.5 * k for k in range(13)) + (2 * A_MAX, A_SUP)
+LIM_GRID = tuple(A_SUP * 2.0 ** k for k in range(1, 9)) + (A_LIM,)
+BOUNDARY_TOL = 0.05      # boundary residuals and null membership, relative to the margin's scale
+D_C, D_Q = recurrence.D_C, recurrence.D_Q
+ROUNDS = 3               # the proposal cap K = ROUNDS x n per stage x mode x graph (the D2 ruling)
+N_MIN = {"dev": 99, "val": 149}
 NTHETA = 98
 F_MODES = ("F0", "F1", "F2", "F3", "F4")
 T_MODES = ("T0", "T1", "T2", "T3", "T4")
@@ -138,7 +188,63 @@ class CalibError(Exception):
 
 
 def sig(x):
-    return 1.0 / (1.0 + np.exp(-x))
+    with np.errstate(over="ignore"):                      # (exp overflow at the limit ladders: sigma = 0 exactly)
+        return 1.0 / (1.0 + np.exp(-x))
+
+
+def extremum(f, grid, sign):
+    """The maximum of sign * f over a registered grid, refined by golden section between the best grid
+    point's neighbours -> (argument, f there). A nonfinite value is a numerical failure."""
+    grid = [float(x) for x in grid]
+    vals = [sign * f(x) for x in grid]
+    if not all(math.isfinite(v) for v in vals):
+        raise CalibError("a nonfinite value in an extremum search")
+    k = int(np.argmax(vals))
+    best = (vals[k], grid[k])
+    lo, hi = grid[max(k - 1, 0)], grid[min(k + 1, len(grid) - 1)]
+    if hi > lo:
+        g = (math.sqrt(5) - 1) / 2
+        x1, x2 = hi - g * (hi - lo), lo + g * (hi - lo)
+        f1, f2 = sign * f(x1), sign * f(x2)
+        for _ in range(24):
+            if f1 >= f2:
+                hi, x2, f2 = x2, x1, f1
+                x1 = hi - g * (hi - lo)
+                f1 = sign * f(x1)
+            else:
+                lo, x1, f1 = x1, x2, f2
+                x2 = lo + g * (hi - lo)
+                f2 = sign * f(x2)
+        best = max(best, (f1, x1), (f2, x2))
+    if not math.isfinite(best[0]):
+        raise CalibError("a nonfinite value in an extremum search")
+    return float(best[1]), sign * float(best[0])
+
+
+def root(g, lo, glo, hi, ghi, tol, what):
+    """g(x) = 0 to |g| <= tol on a sign-change bracket (Illinois). Exhaustion or a jump across zero is a
+    NUMERICAL FAILURE (CalibError), never infeasibility."""
+    side = 0
+    for _ in range(200):
+        c = (lo * ghi - hi * glo) / (ghi - glo)
+        gc = g(c)
+        if not math.isfinite(gc):
+            raise CalibError(f"{what}: a nonfinite value in the solver (a numerical failure)")
+        if abs(gc) <= tol:
+            return c
+        if gc * ghi > 0:
+            hi, ghi = c, gc
+            if side == -1:
+                glo /= 2
+            side = -1
+        else:
+            lo, glo = c, gc
+            if side == 1:
+                ghi /= 2
+            side = 1
+        if abs(hi - lo) <= 1e-13 * max(1.0, abs(lo)):
+            raise CalibError(f"{what}: the function jumps across its target (a numerical failure)")
+    raise CalibError(f"{what}: the solver did not converge (a numerical failure)")
 
 
 def logit(p):
@@ -555,12 +661,14 @@ def _cum_slope(t, slopes):
 class Panel:
     """Simulates one panel on a graph stratum and builds the analysis inputs."""
 
-    def __init__(self, graph, params, hyp, stage, stratum, mode, panel, stress=None):
+    def __init__(self, graph, params, hyp, stage, stratum, mode, panel, stress=None, retry=0):
         self.g, self.p = graph, check_params(params)
         self.hyp, self.stage, self.stratum, self.mode, self.panel = hyp, stage, stratum, mode, panel
+        self.retry = int(retry)
         self.stress = (stage == "val") if stress is None else stress
-        self.tag = (hyp, f"{stage}:{stratum}", mode, panel)
-        self.unattainable, self.deviations, self.verified, self.achieved = [], [], [], {}
+        # (the slot's original streams at retry 0; the D2 retries have their own)
+        self.tag = (hyp, f"{stage}:{stratum}", mode, panel if self.retry == 0 else f"{panel}/retry{self.retry}")
+        self.unattainable, self.verified, self.achieved, self.maxima = [], [], {}, []
         self._metric = {}
 
     def rng(self, purpose):
@@ -729,90 +837,72 @@ class Panel:
         return rms / den if h == 0 else rms
 
     def solve_amp(self, wg, th, pl, u, amp, scope, h, target, dirC, dirQ):
-        """The latent amplitude giving the target noise-free post-refit native RMS (safeguarded secant on
-        [0, A_MAX]; CONVERGENCE REQUIRED: exhaustion is a CalibError). "max": the amplitude maximizing the
-        native RMS (as large as bounded means permit, H.10). An unattainable target is recorded (an
-        alternative: a non-success; a null: a failed panel); a background already above the target is
-        recorded as a deviation (the panel stays: above a boundary null is conservative)."""
+        """The latent amplitude (>= 0) giving the target noise-free post-refit native RMS to AMP_TOL relative
+        (both sides): the smallest on AMP_GRID's brackets. "max": the amplitude in [0, A_SUP] maximizing the
+        native RMS (H.10). FEASIBILITY (the D2 ruling): a target outside the native RMS's range over EVERY
+        amplitude (the evidence ladder LIM_GRID to the bounded-mean limit A_LIM) is INFEASIBLE, recorded and
+        CLIPPED to the nearest attainable value on [0, A_SUP] (kind "above-sup": the supremum is below the
+        target; "below-inf": the infimum, a background, is above it). A target inside that range that is not
+        reached on [0, A_SUP] (a ceiling), or a solver that fails, is a NUMERICAL FAILURE (CalibError)."""
         def f(a):
             am = dict(amp)
             cur = list(am.get(scope, (0.0, 0.0)))
             cur[h] = a
             am[scope] = tuple(cur)
-            return self.rms_of(wg, th, pl, u, am, scope, h, dirC, dirQ)
+            v = self.rms_of(wg, th, pl, u, am, scope, h, dirC, dirQ)
+            if not math.isfinite(v):
+                raise CalibError(f"{wg.id} {scope} {'CQ'[h]}: a nonfinite noise-free RMS (a numerical failure)")
+            return v
         tag = {"world": wg.id, "scope": scope, "readout": "CQ"[h], "target": target}
-        if target == "max":
-            return self.native_max(f)
-        hi_v = f(A_MAX)
-        if not (hi_v >= target):
-            a_m = self.native_max(f)
-            v_m = f(a_m)
-            if v_m >= target:                       # (the RMS is not monotone in the latent amplitude)
-                hi_v, top = v_m, a_m
-            else:
-                self.unattainable.append(dict(tag, max=v_m))
-                return a_m
-        else:
-            top = A_MAX
-        lo, hi, flo, fhi = 0.0, top, f(0.0) - target, hi_v - target
-        if not math.isfinite(flo) or not math.isfinite(fhi):
-            raise CalibError(f"{wg.id} {scope} {'CQ'[h]}: a nonfinite noise-free RMS")
         key = (wg.id, scope, h)
-        if flo >= 0:
-            self.deviations.append(dict(tag, type="background", achieved=flo + target))
-            self.achieved[key] = flo + target
-            return 0.0
-        a = lo + (hi - lo) * (-flo) / (fhi - flo)
-        for it in range(200):
-            fa = f(a) - target
-            if abs(fa) <= AMP_TOL * max(target, 1e-12):
-                self.achieved[key] = fa + target
+        if target == "max":
+            a_m, v_m = extremum(f, AMP_GRID, 1.0)
+            self.maxima.append(dict(tag, amp=a_m, value=v_m, edge=bool(a_m >= A_SUP - 1e-9)))
+            return a_m
+        tol = AMP_TOL * target
+        what = f"{wg.id} {scope} {'CQ'[h]} RMS {target}"
+        grid = [float(a) for a in AMP_GRID]
+        gv = [f(a) - target for a in grid]
+        for k, (a, v) in enumerate(zip(grid, gv)):                 # (the smallest amplitude meeting the target)
+            if abs(v) <= tol:
+                self.achieved[key] = v + target
                 return a
-            if fa < 0:
-                lo, flo = a, fa
-            else:
-                hi, fhi = a, fa
-            if hi - lo <= 1e-11 * max(1.0, hi):
-                # the bracket closed on a JUMP of the noise-free RMS (the plug-in metric's noise-scale bins
-                # switch there): the upper side, at least the target (a boundary null: conservative), recorded
-                self.deviations.append(dict(tag, type="metric_discontinuity", achieved=fhi + target,
-                                            below=flo + target))
-                self.achieved[key] = fhi + target
-                return hi
-            a_sec = lo + (hi - lo) * (-flo) / (fhi - flo)
-            a = a_sec if (lo < a_sec < hi and it < 40 and (hi - lo) > 1e-9) else (lo + hi) / 2
-        raise CalibError(f"{wg.id} {scope} {'CQ'[h]}: the amplitude solver did not converge to RMS {target}")
+            if k + 1 < len(grid) and v * gv[k + 1] < 0:
+                a_r = root(lambda x: f(x) - target, a, v, grid[k + 1], gv[k + 1], tol, what)
+                self.achieved[key] = f(a_r)
+                return a_r
+        sign = 1.0 if gv[0] < 0 else -1.0                           # (every grid value on one side)
+        a_x, v_x = extremum(f, grid, sign)
+        if sign * (v_x - target) >= -tol:                           # (the extremum reaches it: bracket there)
+            if abs(v_x - target) <= tol:
+                self.achieved[key] = v_x
+                return a_x
+            nb = min((x for x in grid if x != a_x), key=lambda x: (abs(x - a_x), x))
+            a_r = root(lambda x: f(x) - target, nb, f(nb) - target, a_x, v_x - target, tol, what)
+            self.achieved[key] = f(a_r)
+            return a_r
+        # the bounded-mean limit: does ANY amplitude reach the target? (evidence only)
+        _, v_l = extremum(f, (A_SUP,) + LIM_GRID, sign)
+        if sign * (v_l - target) >= -tol:
+            raise CalibError(f"{what}: reached only beyond the generating domain [0, {A_SUP:g}] (an amplitude "
+                             f"ceiling: a numerical failure, not infeasibility; limit {v_l:.6g})")
+        self.unattainable.append(dict(tag, kind="above-sup" if sign > 0 else "below-inf", nearest=v_x,
+                                      limit=v_l, amp=a_x))
+        return a_x
 
-    @staticmethod
-    def native_max(f):
-        """argmax over [0, A_MAX] of the native RMS f (a 13-point grid, then golden-section refinement)."""
-        grid = np.linspace(0.0, A_MAX, 13)
-        vals = [f(a) for a in grid]
-        if not all(math.isfinite(v) for v in vals):
-            raise CalibError("a nonfinite noise-free RMS in the maximum search")
-        k = int(np.argmax(vals))
-        lo, hi = grid[max(k - 1, 0)], grid[min(k + 1, len(grid) - 1)]
-        g = (math.sqrt(5) - 1) / 2
-        x1, x2 = hi - g * (hi - lo), lo + g * (hi - lo)
-        f1, f2 = f(x1), f(x2)
-        for _ in range(24):
-            if f1 >= f2:
-                hi, x2, f2 = x2, x1, f1
-                x1 = hi - g * (hi - lo)
-                f1 = f(x1)
-            else:
-                lo, x1, f1 = x1, x2, f2
-                x2 = lo + g * (hi - lo)
-                f2 = f(x2)
-        best = max([(vals[k], grid[k]), (f1, x1), (f2, x2)])
-        return float(best[1])
-
-    # -------------------------------------------------------- simulate
+    # -------------------------------------------------------- simulate = triage + observe
     def simulate(self):
+        """The whole panel: the noise-free triage, then the noisy observation of every world."""
+        return self.triage().observe_all()
+
+    def triage(self):
+        """A proposal's NOISE-FREE stage (the D2 ruling): every world's coefficients, plan and red variation,
+        the jointly solved knobs and amplitudes (an infeasible target clipped and recorded), the completed
+        panel verified; then the panel's class (feasible / infeasible) and, under the registered analysis
+        functionals on its noise-free means, its null membership and declared-boundary residual."""
         p = self.p
         th_all = np.asarray(p["theta"], float)
         thbar = th_all.mean(axis=0)
-        R, N = R_REP, p["capture_bound"]
         ar = p["ar"]
         rho = np.asarray(ar["rho"], float)
         Sig = np.asarray(ar["Sigma"], float)
@@ -820,6 +910,29 @@ class Panel:
             rho = np.full(5, STRESS_RHO)
             Sig = Sig * STRESS_SD ** 2
         rw = self.rng("worlds")
+        self.worlds = []
+        for k, wg in enumerate(self.g):
+            s = int(rw.below(len(th_all), 1)[0])
+            th = thbar + COEF_STRESS * (th_all[s] - thbar)
+            pl = plan_world(self.hyp, self.mode, self.panel, k, rw)
+            u = ar_paths(wg.times, rho, Sig, ar["step"], self.rng(f"ar/{wg.id}").normals(len(wg.times) * 5).reshape(-1, 5))
+            dirC, dirQ, amp, ver = self.solve_joint(wg, th, pl, u)
+            self.verified.append(dict(ver, world=wg.id))
+            lat = self.latent(wg, th, pl, u, amp, dirC, dirQ)
+            nat = self.native(wg, lat)
+            w = {"id": wg.id, "plan": pl, "amp": {sc: list(v) for sc, v in amp.items()}, "graph": wg, "k": k,
+                 "mu": {ch: sig(lat[ch]) for ch in lat},
+                 "y_true": {"within": {"C": nat["C"], "Q": nat["Q"]}, "ref": {"C": nat["RC"], "Q": nat["RQ"]}}}
+            if pl["dir"] is not None:
+                w["betas_true"] = {e: (ver["dir"][f"{e}/beta_P"], ver["dir"][f"{e}/beta_Q"]) for e in transition.EPOCHS}
+            self.worlds.append(w)
+        self.status = "infeasible" if self.unattainable else "feasible"
+        self.membership = self.member()
+        return self
+
+    def observe_all(self):
+        """The noisy observation of every triaged world (the shared reference components first)."""
+        p, R = self.p, R_REP
         refkeys = {}
         for wg in self.g:
             for r in wg.cR:
@@ -832,19 +945,83 @@ class Panel:
         zr = self.rng("reference-noise").normals(len(refkeys) * R * 3).reshape(len(refkeys), R, 3)
         ref_comp = {k: zr[i] @ (LR.T if k[0] == "RQ" else np.vstack([LD.T, np.zeros((1, 2))])[:3, :])
                     for k, i in refkeys.items()}
-        self.worlds = []
-        for k, wg in enumerate(self.g):
-            s = int(rw.below(len(th_all), 1)[0])
-            th = thbar + COEF_STRESS * (th_all[s] - thbar)
-            pl = plan_world(self.hyp, self.mode, self.panel, k, rw)
-            u = ar_paths(wg.times, rho, Sig, ar["step"], self.rng(f"ar/{wg.id}").normals(len(wg.times) * 5).reshape(-1, 5))
-            dirC, dirQ, amp, ver = self.solve_joint(wg, th, pl, u)
-            self.verified.append(dict(ver, world=wg.id))
-            lat = self.latent(wg, th, pl, u, amp, dirC, dirQ)
-            mu = {ch: sig(lat[ch]) for ch in lat}
-            self.worlds.append(self.observe(wg, mu, pl, k, ref_comp, refkeys, LR, LD))
-            self.worlds[-1].update(id=wg.id, plan=pl, amp={s: list(v) for s, v in amp.items()}, graph=wg)
+        for w in self.worlds:
+            w.update(self.observe(w["graph"], w["mu"], w["plan"], w["k"], ref_comp, refkeys, LR, LD))
         return self
+
+    # -------------------------------------------------------- the registered functionals of the noise-free panel
+    def functionals(self, final=False):
+        """The registered analysis functionals of the panel's NOISE-FREE means: H-F the full-history hf()
+        quantities (E_C, E_Q, R_C, R_Q, M_F); H-T per epoch the components (the noise-free slopes, the
+        searched E^U, the gated selected E^F) and every candidate's fourteen margins. The metric: the
+        plug-in bank model at the noise-free means (triage), or the FINAL one, built from the observed
+        means (final=True: the D1 boundary check, after observe)."""
+        def design(w, scope):
+            wg = w["graph"]
+            if final:
+                cv = w["cov"]
+            else:
+                if "cov_nf" not in w:
+                    mu = w["mu"]
+                    w["cov_nf"] = {"C": self.cov(wg, {"C": mu["C"]}, "C"),
+                                   "Q": self.cov(wg, {"S": mu["S"], "F": mu["F"]}, "Q"),
+                                   "RC": self.cov(wg, {"C": mu["RC"]}, "RC"),
+                                   "RQ": self.cov(wg, {"S": mu["RS"], "F": mu["F"]}, "RQ")}
+                cv = w["cov_nf"]
+            return recurrence.WorldDesign(wg.id, {"C": (wg.ti, wg.tj, cv["C"]), "Q": (wg.ti, wg.tj, cv["Q"])},
+                                          {"C": (wg.cT, wg.cR, cv["RC"]), "Q": (wg.qT, wg.qR, cv["RQ"])}, scope)
+        if self.hyp == "H-F":
+            res = recurrence.hf([recurrence.analyze_world(design(w, "full"), w["y_true"]) for w in self.worlds])
+            return {k: (bool(res[k]) if k == "available" else float(res[k]))
+                    for k in ("E_C", "E_Q", "R_C", "R_Q", "M_F", "available")}
+        comps = {}
+        for e in transition.EPOCHS:
+            per = []
+            for w in self.worlds:
+                obs = recurrence.analyze_world(design(w, e), w["y_true"])
+                per.append({"obs": obs, "EU_obs": transition.eu_observed(obs)[0]})
+            bt = {"P": [w["betas_true"][e][0] for w in self.worlds], "Q": [w["betas_true"][e][1] for w in self.worlds]}
+            c = transition.epoch_components(per, bt)[0]
+            comps[e] = {k: float(c[k]) for k in transition.KEYS}
+        return {"components": comps,
+                "margins": {f"{a}->{f}": {k: float(v) for k, v in transition.margins(comps, a, f)}
+                            for a, f, _ in transition.candidates()}}
+
+    def member(self):
+        """Null membership on the noise-free functionals (the triage metric), with the declared boundary's
+        residual there (the D2 ruling). H-F F0-F2: by construction (the absent readout's amplitude is 0);
+        F3 / F4: not both R_C > d_C and R_Q > d_Q beyond BOUNDARY_TOL (energy scale); H-T: every one of the
+        six candidates has a margin <= BOUNDARY_TOL x its scale. Alternatives: not applicable."""
+        if self.stage == "alt":
+            return {"member": None, "by": "alternative"}
+        if self.hyp == "H-F" and self.mode in ("F0", "F1", "F2"):
+            return {"member": True, "by": "construction"}
+        fn = self.functionals()
+        out = {"by": "functionals", "functionals": fn}
+        if self.hyp == "H-F":
+            ex = min((fn["E_C"] - D_C ** 2) / D_C ** 2, (fn["E_Q"] - D_Q ** 2) / D_Q ** 2)
+            if math.isnan(ex):
+                raise CalibError("a NaN material functional (a numerical failure)")
+            out.update(member=bool(ex <= BOUNDARY_TOL), exceedance=float(ex))
+        else:
+            ok, cand, val = ht_membership(fn["margins"])
+            out.update(member=ok, strongest=cand, strongest_margin=val)
+        decl = declared_boundary(self.hyp, self.mode, self.panel)
+        if decl is not None:
+            out["boundary"] = boundary_residual(decl, fn)
+        return out
+
+    def boundary_final(self):
+        """The D1 boundary check after observe: the declared boundary quantity on the noise-free means under
+        the FINAL analysis metric (built from the observed means). None without a declared boundary."""
+        decl = declared_boundary(self.hyp, self.mode, self.panel)
+        if decl is None or self.stage == "alt":
+            return None
+        try:
+            return dict(boundary_residual(decl, self.functionals(final=True)), metric="final")
+        except (recurrence.RecurrenceError, transition.TransitionError, backbone.BackboneError,
+                np.linalg.LinAlgError, FloatingPointError, ValueError) as e:
+            return {"ok": False, "metric": "final", "failure": f"{type(e).__name__}: {e}"}
 
     def solve_amps(self, wg, th, pl, u, dirC, dirQ):
         amp = {}
@@ -868,7 +1045,7 @@ class Panel:
         dirC = dirQ = (lambda t: _cum_slope(t, zero))
         knobs, amp, seq = None, {}, []
         for r in range(JOINT_ROUNDS):
-            u0, d0 = len(self.unattainable), len(self.deviations)
+            u0 = len(self.unattainable)
             if pl["dir"] is not None:
                 dirC, dirQ, knobs = self.solve_dir(wg, th, pl, u, amp, knobs)
                 seq.append((dict(knobs[0]), dict(knobs[1])))
@@ -878,7 +1055,7 @@ class Panel:
                 return dirC, dirQ, amp, dict(ver, rounds=r + 1)
             if pl["dir"] is None:
                 break
-            del self.unattainable[u0:], self.deviations[d0:]     # (the next round records its own)
+            del self.unattainable[u0:]                           # (the next round records its own)
             if len(seq) >= 3 and len(seq) % 3 == 0 and pl["rec"]:
                 # the alternation knob -> amplitude -> knob converges linearly (often oscillating): Aitken's
                 # extrapolation of the knobs, the amplitudes re-solved there, then the alternation resumes
@@ -895,13 +1072,13 @@ class Panel:
                 knobs = tuple(ext)
                 amp = self.solve_amps(wg, th, pl, u, (lambda t, s_=dict(ext[0]): _cum_slope(t, s_)),
                                       (lambda t, s_=dict(ext[1]): _cum_slope(t, s_)))
-        raise CalibError(f"{wg.id}: the declared constraints are not met after the joint solve: "
-                         f"{ver['violations'][:3]}")
+        raise CalibError(f"{wg.id}: the declared constraints are not met after the joint solve (a numerical "
+                         f"failure): {ver['violations'][:3]}")
 
     def verify(self, wg, th, pl, u, amp, dirC, dirQ):
         """The completed NOISE-FREE panel against its declared constraints: every directional epoch slope
-        (beta_P, beta_Q) and every numeric post-refit RMS target (an unattainable one is the recorded
-        exception: a non-success alternative / a failed null)."""
+        (beta_P, beta_Q) to DIR_TOL and every numeric post-refit RMS target to AMP_TOL (both sides); an
+        infeasible (clipped) target is the recorded exception."""
         viol, out = [], {"dir": {}, "rms": {}}
         if pl["dir"] is not None:
             b = self.noiseless_betas(wg, th, pl, u, dirC, dirQ, amp=amp)
@@ -920,9 +1097,10 @@ class Panel:
                 v = self.rms_of(wg, th, pl, u, amp, scope, h, dirC, dirQ)
                 out["rms"][f"{scope}/{'CQ'[h]}"] = v
                 ach = self.achieved.get((wg.id, scope, h))
-                # the completed panel reproduces the solver's value, which is the target (to AMP_TOL) or the
-                # recorded upper side of a jump / a background above it: never below the target
-                if ach is None or not abs(v - ach) <= 1e-9 * max(ach, 1e-12) or v < tg[h] * (1 - 10 * AMP_TOL):
+                # the completed panel reproduces the solver's value AND meets the declared target to AMP_TOL
+                # on both sides (#68 round 3 P2-4: no overshoot is accepted)
+                if (ach is None or not abs(v - ach) <= 1e-9 * max(ach, 1e-12)
+                        or not abs(v - tg[h]) <= AMP_TOL * tg[h] + 1e-9 * max(ach, 1e-12)):
                     viol.append(f"{scope} RMS {'CQ'[h]} {v:.6g} vs target {tg[h]} (solved {ach})")
         out.update(ok=not viol, violations=viol)
         return out
@@ -974,30 +1152,46 @@ class Panel:
                     break
                 a, fa, step = xb, fx, step * 2
             if b is None:
-                bQ[e] = x0 if abs(f0) <= abs(fa) else a
-                self.unattainable.append({"world": wg.id, "scope": e, "readout": "beta_Q", "target": tgt,
-                                          "best": tgt + min(abs(f0), abs(fa)) * (1 if f0 > 0 else -1)})
-                continue
-            side = 0
-            for _ in range(80):
-                c = (a * fb - b * fa) / (fb - fa)
-                fc = g(c)
-                if abs(fc) <= DIR_TOL / 4:
-                    break
-                if fc * fb > 0:
-                    b, fb = c, fc
-                    if side == -1:
-                        fa /= 2
-                    side = -1
+                # no bracket on the warm-started walk: the registered knob grid, then the extremum, then the
+                # bounded-mean limit (the D2 ruling: a ceiling is a numerical failure, not infeasibility)
+                xs = [float(x) for x in np.linspace(-KNOB_MAX, KNOB_MAX, 33)]
+                gs = [g(x) for x in xs]
+                if not all(math.isfinite(v) for v in gs):
+                    raise CalibError(f"{wg.id} {e}: a nonfinite survival slope on the knob grid")
+                br = [k for k in range(len(xs) - 1) if gs[k] * gs[k + 1] <= 0]
+                if br:
+                    k = min(br, key=lambda k: (abs(xs[k] - x0), k))
+                    a, fa, b, fb = xs[k], gs[k], xs[k + 1], gs[k + 1]
                 else:
-                    a, fa = c, fc
-                    if side == 1:
-                        fb /= 2
-                    side = 1
-                if abs(b - a) <= 1e-13 * max(1.0, abs(a)):
-                    raise CalibError(f"{wg.id} {e}: the survival slope jumps across its target (no solution)")
-            else:
-                raise CalibError(f"{wg.id} {e}: the survival slope solver did not converge")
+                    sgn = 1.0 if gs[0] < 0 else -1.0
+                    xm, gm = extremum(g, xs, sgn)
+                    if sgn * gm >= 0:
+                        nb = min((x for x in xs if x != xm), key=lambda x: (abs(x - xm), x))
+                        a, fa, b, fb = nb, g(nb), xm, g(xm)
+                    else:
+                        lad = [s_ * KNOB_MAX * 2.0 ** k for k in range(1, 8) for s_ in (-1, 1)]
+                        lad = [x for x in lad if abs(x) <= KNOB_LIM]
+                        try:
+                            lv = {x: g(x) for x in lad}
+                        except (backbone.BackboneError, np.linalg.LinAlgError, FloatingPointError, ValueError) as err:
+                            raise CalibError(f"{wg.id} {e}: the survival slope's bounded-mean limit cannot be "
+                                             f"established ({type(err).__name__}): a numerical failure") from None
+                        ends = [lv[x] for x in lad[-4:]]
+                        conv = (all(math.isfinite(v) for v in lv.values())
+                                and abs(ends[0] - ends[2]) <= DIR_TOL and abs(ends[1] - ends[3]) <= DIR_TOL)
+                        if any(sgn * v >= 0 for v in lv.values()) or not conv:
+                            raise CalibError(f"{wg.id} {e}: the survival slope target {tgt:.6g} is "
+                                             f"{'reached beyond the knob grid' if conv else 'not shown unattainable'}"
+                                             f" (a ceiling: a numerical failure, not infeasibility)")
+                        bQ[e] = xm
+                        g(xm)
+                        self.unattainable.append({"world": wg.id, "scope": e, "readout": "beta_Q", "target": tgt,
+                                                  "kind": "above-sup" if sgn > 0 else "below-inf",
+                                                  "nearest": tgt + gm, "limit": tgt + max(lv.values(), key=lambda v: sgn * v),
+                                                  "knob": xm})
+                        continue
+            bQ[e] = root(g, a, fa, b, fb, DIR_TOL / 4, f"{wg.id} {e} survival slope {tgt:.6g}")
+            g(bQ[e])
         return dirC, make(bQ), (bC, dict(bQ))
 
     def noiseless_betas(self, wg, th, pl, u, dirC, dirQ, only=None, which="PQ", amp=None):
@@ -1118,12 +1312,68 @@ class Panel:
         return {"T": res["T_T"], "S_e": S, "gates": gates, "available": res["available"],
                 "winner": None if not res["winner"] else [res["winner"]["ARD"], res["winner"]["FSD"]],
                 "phase_support": res["phase_support"], "EU_unsupported": res["EU_unsupported"],
-                "error": res.get("error")}
+                "error": res.get("error"), "failure": res.get("failure")}
+
+
+# ================================================================== declared boundaries, membership
+MARGIN_NAMES = tuple(n for n, _ in transition.margins({e: {k: 0.0 for k in transition.KEYS} for e in transition.EPOCHS},
+                                                      "E1", "E2"))
+MARGIN_SCALE = dict(zip(MARGIN_NAMES, (stats.DELTA_P, stats.DELTA_Q, D_C ** 2, D_Q ** 2, D_C ** 2, D_Q ** 2,
+                                       stats.DELTA_P, stats.DELTA_P, stats.DELTA_Q, stats.DELTA_Q,
+                                       stats.DELTA_P, stats.DELTA_Q, D_C ** 2, D_Q ** 2)))
+
+
+def declared_boundary(hyp, mode, slot):
+    """The scientific boundary a null panel is constructed AT (the D1 caveat / the D2 ruling): F3 E_C =
+    d_C^2 (R_C = d_C), F4 E_Q = d_Q^2; T4 components 0-13: margin k of the subtype's candidate = 0. Other
+    modes' numeric levels are settings, not boundaries (None)."""
+    if hyp == "H-F" and mode in ("F3", "F4"):
+        b = D_C ** 2 if mode == "F3" else D_Q ** 2
+        return {"kind": "hf", "name": "E_C" if mode == "F3" else "E_Q", "boundary": b, "scale": b}
+    if hyp == "H-T" and mode == "T4":
+        sub = slot % 32
+        if sub // 2 > 13:
+            return None
+        pair = transition.PAIRS[(slot // 32) % 3]
+        a, f = (pair[0], pair[1]) if sub % 2 == 0 else (pair[1], pair[0])
+        nm = MARGIN_NAMES[sub // 2]
+        return {"kind": "ht", "cand": f"{a}->{f}", "name": nm, "boundary": 0.0, "scale": MARGIN_SCALE[nm]}
+    return None
+
+
+def boundary_residual(decl, fn):
+    v = fn[decl["name"]] if decl["kind"] == "hf" else fn["margins"][decl["cand"]][decl["name"]]
+    r = (v - decl["boundary"]) / decl["scale"]
+    out = {"quantity": decl["name"] if decl["kind"] == "hf" else f"{decl['cand']}:{decl['name']}",
+           "value": float(v), "residual": float(r), "ok": bool(math.isfinite(r) and abs(r) <= BOUNDARY_TOL)}
+    return out
+
+
+def ht_membership(margins):
+    """H-T null membership from every candidate's margins {cand: {name: value}}: a member iff EVERY one of
+    the six candidates has some margin <= BOUNDARY_TOL x its scale (no genuine qualifying transition in any
+    epoch pair or direction: clipping one component can strengthen another candidate). -> (member, the
+    strongest candidate, its smallest scaled margin). A NaN margin is a numerical failure."""
+    best = None
+    for cand in sorted(margins):
+        vals = [margins[cand][k] / MARGIN_SCALE[k] for k in MARGIN_NAMES]
+        if any(math.isnan(v) for v in vals):
+            raise CalibError(f"a NaN noise-free margin ({cand}): a numerical failure")
+        m = min(vals)
+        if best is None or m > best[1]:
+            best = (cand, m)
+    return bool(best[1] <= BOUNDARY_TOL), best[0], float(best[1])
 
 
 # ================================================================== provenance
 TOOLS = ("calib.py", "recurrence.py", "transition.py", "backbone.py", "stats.py")
 GATES_SCHEMA = "finfolk.redqueen.annexH.gates/1"
+IDENT = ("graph_sha256", "graph_source", "params_sha256", "params_fitted", "tools_sha256", "draws", "production")
+
+
+def doc_sha(d):
+    """The identity of a JSON artifact (canonical: sorted keys)."""
+    return hashlib.sha256(json.dumps(d, sort_keys=True).encode()).hexdigest()
 
 
 def graph_sha(graph):
@@ -1152,38 +1402,99 @@ def manifest(graph, params, draws, gates=None, production=False, graph_source="s
             "production": bool(production)}
 
 
-def check_gates(art):
-    """A frozen epoch-gate artifact (calib.py gates): every epoch's c_E with its passing validation."""
+def gate_rates_pass(rates):
+    """Every epoch gate's validation re-derived from its counts: the B stratum of F0-F2 x every graph on the
+    complete 1,000-panel allocation, each present rate (B and a calibrated I) with its U95 recomputed <=
+    0.02. -> {epoch: passed}"""
+    out = {}
+    for e in transition.EPOCHS:
+        ok = all(isinstance(rates.get(f"gate_{e}|{m}|{s}|B"), dict) and rates[f"gate_{e}|{m}|{s}|B"].get("n") == N_VAL
+                 for m in ("F0", "F1", "F2") for s in STRATA)
+        for k, v in rates.items():
+            if not k.startswith(f"gate_{e}|"):
+                continue
+            fp, n = v.get("fp"), v.get("n")
+            if not (isinstance(fp, int) and isinstance(n, int) and 0 <= fp <= n and n >= N_MIN["val"]):
+                ok = False
+                continue
+            ok = ok and stats.clopper_pearson_upper(fp, n) <= 0.02
+        out[e] = bool(ok)
+    return out
+
+
+def check_gates(art, man=None, production=False):
+    """A frozen epoch-gate artifact (calib.py gates; #68 round 3 P2): every epoch's c_E with its passing
+    validation (the rates re-derived), bound to the critical-value and acceptance artifacts it came from;
+    with `man` (the consuming H-T run's manifest) the gates must have been calibrated on the SAME graph,
+    parameters, code and draws."""
     if not isinstance(art, dict) or art.get("schema") != GATES_SCHEMA:
         raise CalibError("H-T needs the frozen epoch-gate artifact (calib.py gates), schema " + GATES_SCHEMA)
     for e in transition.EPOCHS:
-        if not isinstance(art.get("c_E", {}).get(e), (int, float)) or art.get("passed", {}).get(e) is not True:
+        c = art.get("c_E", {}).get(e)
+        if not isinstance(c, (int, float)) or math.isnan(c) or art.get("passed", {}).get(e) is not True:
             raise CalibError(f"the recurrence gate of {e} lacks a passing frozen calibration: H-T is unavailable")
+    bad = [e for e, ok in gate_rates_pass(art.get("rates", {})).items() if not ok]
+    if bad:
+        raise CalibError(f"the gate artifact's validation rates do not support {bad}: H-T is unavailable")
+    if not all(isinstance(art.get(k), str) and len(art[k]) == 64 for k in ("crit_sha256", "accept_sha256")):
+        raise CalibError("the gate artifact is not bound to its critical-value and acceptance artifacts")
+    hm = art.get("hf_manifest") or {}
+    if production and not (art.get("production") is True and hm.get("production") is True):
+        raise CalibError("production H-T needs gates from a production H-F calibration")
+    if man is not None:
+        diff = [k for k in IDENT if hm.get(k) != man.get(k)]
+        if diff:
+            raise CalibError(f"the epoch gates were calibrated on another graph / parameters / code / draws "
+                             f"({diff}): H-T cannot consume them")
     return art
 
 
 # ================================================================== a panel
-def run_panel(graph, params, hyp, stage, stratum, mode, panel, gates_c=None, draws=stats.B_BOOT, man=None):
-    """One registered panel -> its JSON record (score, support report, constraint checks, CPU seconds,
-    failures, the manifest). The graph is canonicalized (sorted by world id) first: results never depend
-    on the caller's order. An unattainable NULL target fails the panel (an alternative's makes it a
-    non-success)."""
+def run_panel(graph, params, hyp, stage, stratum, mode, panel, gates_c=None, draws=stats.B_BOOT, man=None,
+              retry=0, keep=None):
+    """One registered PROPOSAL (slot `panel`, retry `retry`; the D2 ruling) -> its JSON record. The graph is
+    canonicalized (sorted by world id) first. TRIAGE (noise-free): the class (feasible / infeasible: a
+    clipped target), the clips (requested, nearest attainable, the limit evidence), the "max" targets,
+    null membership and the noise-free boundary residual. Role: "B" (a feasible member), "I" (an
+    infeasible member), "discarded" (a non-member, or `keep(record)` false: a surplus), "alt" (an
+    alternative: an infeasible target makes it a non-success), "failed" (a numerical failure ANYWHERE:
+    never infeasible, never a non-rejection). Only B / I / alt proposals are simulated with noise and
+    analysed (B with the D1 boundary check under the final metric)."""
     t0 = time.process_time()
-    rec = {"hyp": hyp, "stage": stage, "stratum": stratum, "mode": mode, "panel": panel, "manifest": man,
-           "draws": int(draws)}
+    rec = {"hyp": hyp, "stage": stage, "stratum": stratum, "mode": mode, "panel": int(panel), "retry": int(retry),
+           "manifest": man, "draws": int(draws)}
     if hyp == "H-T" and mode == "T4":
         rec["subtype"] = panel % 32
+    if hyp == "H-T" and mode in ("TA1", "TA2"):            # (before generation: a failed alternative keeps it)
+        rec["direction"] = "ARD->FSD" if panel % 2 == 0 else "FSD->ARD"
     try:
         g = sorted(graph, key=lambda w: w.id)
-        pn = Panel(stratum_worlds(g, stratum), params, hyp, stage, stratum, mode, panel).simulate()
-        rec.update(unattainable=pn.unattainable, deviations=pn.deviations,
-                   joint_rounds=max((v.get("rounds", 1) for v in pn.verified), default=0))
-        if pn.unattainable and stage != "alt":
-            raise CalibError(f"unattainable null targets: {pn.unattainable[:3]}")
-        rec["non_success"] = bool(pn.unattainable)
-        if hyp == "H-T" and mode in ("TA1", "TA2"):
-            rec["direction"] = "ARD->FSD" if panel % 2 == 0 else "FSD->ARD"
+        pn = Panel(stratum_worlds(g, stratum), params, hyp, stage, stratum, mode, panel, retry=retry).triage()
+        mx = [m["value"] for m in pn.maxima]
+        rec.update(status=pn.status, member=pn.membership["member"], membership=pn.membership, worlds=len(pn.g),
+                   clips=pn.unattainable, joint_rounds=max((v.get("rounds", 1) for v in pn.verified), default=0),
+                   maxima={"n": len(mx), "min": min(mx) if mx else None, "max": max(mx) if mx else None,
+                           "at_edge": sum(1 for m in pn.maxima if m["edge"])})
+        if stage == "alt":
+            rec.update(role="alt", non_success=bool(pn.unattainable))
+        elif not pn.membership["member"]:
+            rec["role"] = "discarded"
+        else:
+            rec["role"] = "B" if pn.status == "feasible" else "I"
+            if keep is not None and not keep(rec):
+                rec.update(role="discarded", surplus=True)
         t1 = time.process_time()
+        rec["cpu"] = {"triage": t1 - t0}
+        if rec["role"] == "discarded":
+            rec["available"] = False
+            rec["cpu_total"] = time.process_time() - t0
+            return rec
+        pn.observe_all()
+        if rec["role"] == "B":
+            bf = pn.boundary_final()
+            if bf is not None:
+                rec["boundary_final"] = bf
+        t2 = time.process_time()
         if hyp == "H-F":
             a = pn.analyze_hf()
             f = a["full"]
@@ -1193,14 +1504,16 @@ def run_panel(graph, params, hyp, stage, stratum, mode, panel, gates_c=None, dra
                        available=f["available"], phase_support={s: a[s]["phase_support"] for s in a})
         else:
             a = pn.analyze_ht(gates_c or {}, draws)
+            if a.get("failure"):
+                raise CalibError(f"H-T numerical failure (a failed panel, never a non-rejection): {a['error']}")
             rec.update(score=a["T"], S_e=a["S_e"], gates=a["gates"], available=a["available"], winner=a["winner"],
                        phase_support=a["phase_support"], EU_unsupported=a["EU_unsupported"])
             if a.get("error"):
                 rec["unavailable_reason"] = a["error"]
-        rec["cpu"] = {"simulate": t1 - t0, "analyze": time.process_time() - t1}
+        rec["cpu"].update(simulate=t2 - t1, analyze=time.process_time() - t2)
     except (CalibError, recurrence.RecurrenceError, transition.TransitionError, backbone.BackboneError,
             stats.StatsError, np.linalg.LinAlgError, ValueError, FloatingPointError, KeyError) as e:
-        rec.update(error=f"{type(e).__name__}: {e}", available=False)
+        rec.update(error=f"{type(e).__name__}: {e}", available=False, role="failed", status="failed")
     rec["cpu_total"] = time.process_time() - t0
     return rec
 
@@ -1222,11 +1535,21 @@ def _num(v):
     return -math.inf if v is None else float(v)
 
 
-def complete(records, hyp, stage, n, production):
-    """The registered allocation of one hypothesis and stage, complete and clean (#68 round 2 P1-3): every
-    mode x graph stratum with exactly the panels 0..n-1, each once; no failed panel (a failure must be
-    repaired and rerun, H.12); one manifest; production records only (unless a smoke run). -> {(mode,
-    stratum): [records by panel]}, the manifest."""
+def _manifest(rs, production, probs):
+    mans = {json.dumps(r.get("manifest"), sort_keys=True) for r in rs}
+    if len(mans) > 1:
+        probs.append(f"{len(mans)} different manifests (graph, parameters, tools, draws or gates)")
+    man = json.loads(next(iter(mans))) if len(mans) == 1 else None
+    if production and (man is None or not man.get("production") or man.get("draws") != stats.B_BOOT
+                       or not man.get("params_fitted") or man.get("graph_source") == "synthetic"):
+        probs.append("not a production calibration (fitted parameters, the real graph, 9,999 draws)")
+    return man
+
+
+def complete(records, hyp, stage, n, production, modes=None, allow_failed=False):
+    """A plain registered allocation (the alternatives): every mode x graph with exactly the panels 0..n-1,
+    each once; failures refused unless allow_failed (power counts them as non-successes); one manifest;
+    production records only (unless a smoke run). -> {(mode, graph): [records by panel]}, the manifest."""
     rs = [r for r in records if r.get("hyp") == hyp and r.get("stage") == stage]
     by, seen, probs = {}, set(), []
     for r in rs:
@@ -1235,53 +1558,164 @@ def complete(records, hyp, stage, n, production):
             probs.append(f"duplicate panel {key}")
         seen.add(key)
         by.setdefault((r["mode"], r["stratum"]), []).append(r)
-    for m, s in strata_of(hyp):
-        got = sorted(r["panel"] for r in by.get((m, s), []))
-        if got != list(range(n)):
-            probs.append(f"{hyp} {stage} {m} {s}: {len(got)} panels, the registered 0..{n - 1} needed")
+    for m in (modes or (F_MODES if hyp == "H-F" else T_MODES)):
+        for s in STRATA:
+            got = sorted(r["panel"] for r in by.get((m, s), []))
+            if got != list(range(n)):
+                probs.append(f"{hyp} {stage} {m} {s}: {len(got)} panels, the registered 0..{n - 1} needed")
     failed = [(r["mode"], r["stratum"], r["panel"], r["error"]) for r in rs if r.get("error")]
-    if failed:
+    if failed and not allow_failed:
         probs.append(f"{len(failed)} failed panels (repair and rerun): {failed[:3]}")
-    mans = {json.dumps(r.get("manifest"), sort_keys=True) for r in rs}
-    if len(mans) > 1:
-        probs.append(f"{len(mans)} different manifests (graph, parameters, tools, draws or gates)")
-    man = json.loads(next(iter(mans))) if len(mans) == 1 else None
-    if production and (man is None or not man.get("production") or man.get("draws") != stats.B_BOOT
-                       or not man.get("params_fitted") or man.get("graph_source") == "synthetic"):
-        probs.append("not a production calibration (fitted parameters, the real graph, 9,999 draws)")
+    man = _manifest(rs, production, probs)
     if probs:
         raise CalibError("; ".join(probs[:6]))
     return {k: sorted(v, key=lambda r: r["panel"]) for k, v in by.items()}, man
 
 
+def q_hat(rs, n):
+    """The panel-level infeasible fraction over the COMPLETE rounds (every slot proposed: unconditional
+    draws of the registered slot mixture), failed proposals excluded, with its Clopper-Pearson q_U."""
+    by_r = {}
+    for x in rs:
+        by_r.setdefault(int(x.get("retry", 0)), []).append(x)
+    full = [x for xs in by_r.values() if len({int(y["panel"]) for y in xs}) == n for x in xs]
+    cl = [x for x in full if x.get("status") in ("feasible", "infeasible")]
+    k = sum(1 for x in cl if x["status"] == "infeasible")
+    return {"infeasible": k, "proposals": len(cl), "q_hat": k / len(cl) if cl else 0.0,
+            "q_U": stats.clopper_pearson_upper(k, len(cl)) if cl else 1.0}
+
+
+def round_plan(rs, n, stage, r):
+    """The registered round-r slots (r >= 1) of one stage x mode x graph from its records of rounds < r:
+    the slots without a B panel, and EVERY slot while I is short (< n) and q-hat x K could still reach
+    N_MIN (I collection)."""
+    prev = [x for x in rs if int(x.get("retry", 0)) < r]
+    filled = {int(x["panel"]) for x in prev if x.get("role") == "B"}
+    n_i = sum(1 for x in prev if x.get("role") == "I")
+    if n_i < n and q_hat(prev, n)["q_hat"] * ROUNDS * n >= N_MIN.get(stage, math.inf):
+        return list(range(n))
+    return [j for j in range(n) if j not in filled]
+
+
+def proposal_counts(xs):
+    c = {"proposals": len(xs), "worlds": sum(int(x.get("worlds", 0)) for x in xs),
+         "world_clips": sum(len({c_["world"] for c_ in x.get("clips", [])}) for x in xs)}
+    for k in ("feasible", "infeasible", "failed"):
+        c[k] = sum(1 for x in xs if x.get("status") == k)
+    c["non_null"] = sum(1 for x in xs if x.get("member") is False)
+    for k in ("B", "I", "discarded"):
+        c[k] = sum(1 for x in xs if x.get("role") == k)
+    c["surplus"] = sum(1 for x in xs if x.get("surplus"))
+    c["cpu_h"] = sum(float(x.get("cpu_total", 0.0)) for x in xs) / 3600
+    return c
+
+
+def strata(records, hyp, stage, production):
+    """The stratified null allocation of one hypothesis and stage (the D2 ruling; #68 round 2 P1-3): per
+    mode x graph the complete registered proposal rounds (round 0 every slot; round r exactly round_plan),
+    each proposal once, no failed proposal (repair and rerun), B = each slot's FIRST feasible member, every
+    infeasible member kept as I, one manifest, production records only (unless a smoke run). -> ({(mode,
+    graph): {"B": [by slot], "I": [the first n in (retry, slot) order], "capped": [slots without B],
+    "q": q_hat, "counts"}}, the manifest)."""
+    n = {"dev": N_DEV, "val": N_VAL}[stage]
+    rs = [r for r in records if r.get("hyp") == hyp and r.get("stage") == stage]
+    by, seen, probs = {}, set(), []
+    for r in rs:
+        key = (r["mode"], r["stratum"], int(r["panel"]), int(r.get("retry", 0)))
+        if key in seen:
+            probs.append(f"duplicate proposal {key}")
+        seen.add(key)
+        by.setdefault((r["mode"], r["stratum"]), []).append(r)
+    failed = [(r["mode"], r["stratum"], r["panel"], r.get("retry", 0), r["error"]) for r in rs if r.get("error")]
+    if failed:
+        probs.append(f"{len(failed)} failed proposals (numerical failures: repair and rerun): {failed[:3]}")
+    man = _manifest(rs, production, probs)
+    out = {}
+    for m, s in strata_of(hyp):
+        xs = by.get((m, s), [])
+        where = f"{hyp} {stage} {m} {s}"
+        if any(not 0 <= int(x["panel"]) < n or not 0 <= int(x.get("retry", 0)) < ROUNDS for x in xs):
+            probs.append(f"{where}: a proposal outside slots 0..{n - 1} x retries 0..{ROUNDS - 1}")
+            continue
+        r0 = sorted(int(x["panel"]) for x in xs if int(x.get("retry", 0)) == 0)
+        if r0 != list(range(n)):
+            probs.append(f"{where}: round 0 holds {len(r0)} of the {n} slots")
+            continue
+        bad_round = False
+        for rr in range(1, ROUNDS):
+            want = round_plan(xs, n, stage, rr)
+            got = sorted(int(x["panel"]) for x in xs if int(x.get("retry", 0)) == rr)
+            if got != sorted(want):
+                probs.append(f"{where}: round {rr} proposed {len(got)} slots, the registered plan {len(want)}")
+                bad_round = True
+                break
+        if bad_round:
+            continue
+        B = {}
+        for x in sorted(xs, key=lambda x: int(x.get("retry", 0))):
+            j = int(x["panel"])
+            if x.get("status") == "feasible" and x.get("member") and j not in B:
+                if x.get("role") != "B":
+                    probs.append(f"{where}: slot {j}'s first feasible member (retry {x.get('retry', 0)}) is not its B")
+                B[j] = x
+            elif x.get("role") == "B":
+                probs.append(f"{where}: slot {j} has a second B panel (retry {x.get('retry', 0)})")
+        if any(x.get("status") == "infeasible" and x.get("member") and x.get("role") != "I" for x in xs):
+            probs.append(f"{where}: an infeasible member was not kept in I")
+        I = sorted((x for x in xs if x.get("role") == "I"), key=lambda x: (int(x.get("retry", 0)), int(x["panel"])))
+        out[(m, s)] = {"B": [B[j] for j in sorted(B)], "I": I[:n], "capped": [j for j in range(n) if j not in B],
+                       "q": q_hat(xs, n), "counts": proposal_counts(xs)}
+    if probs:
+        raise CalibError("; ".join(probs[:6]))
+    return out, man
+
+
+def _crit(vals):
+    sc = sorted(vals)
+    return sc[min(math.ceil(0.99 * (len(sc) + 1)), len(sc)) - 1]
+
+
 def critical_values(records, production=True):
-    """H.11 development critical values from the COMPLETE development allocations of the hypotheses
-    present (every stratum required; none silently skipped)."""
-    out = {"strata": {}, "manifest": {}}
+    """H.11 development critical values from the COMPLETE stratified development allocations of the
+    hypotheses present (the D2 ruling): per mode x graph x stratum (B; I when it holds >= N_MIN["dev"]
+    panels) the plus-one 0.99 order statistic; a decision's value is the LARGEST over its applicable
+    modes, graphs and strata; a capped mode makes every decision needing it unavailable (None)."""
+    out = {"strata": {}, "manifest": {}, "proposals": {}, "unavailable": {}, "cpu": {}}
     for hyp in ("H-F", "H-T"):
         if not any(r.get("hyp") == hyp and r.get("stage") == "dev" for r in records):
             continue
-        by, man = complete(records, hyp, "dev", N_DEV, production)
+        st, man = strata(records, hyp, "dev", production)
         out["manifest"][hyp] = man
-        for (m, s), rs in sorted(by.items()):
-            def crit(vals):
-                sc = sorted(vals)
-                return sc[min(math.ceil(0.99 * (len(sc) + 1)), len(sc)) - 1]
-            rec = {"score": crit(_num(r["score"]) if r["available"] else -math.inf for r in rs)}
-            if hyp == "H-F":
-                rec["M"] = crit(_num(r["M"]) if r["available"] else -math.inf for r in rs)
-                for e in transition.EPOCHS:
-                    rec[f"S_{e}"] = crit(_num(r["S_e"][e]) if r["S_e_available"][e] else -math.inf for r in rs)
-            out["strata"][f"{hyp}|{m}|{s}"] = rec
+        out["cpu"][hyp] = {"proposals": sum(d["counts"]["proposals"] for d in st.values()),
+                           "cpu_h": sum(d["counts"]["cpu_h"] for d in st.values()), "ceiling_h": stats.CPU_CEILING_H}
+        for (m, s), d in sorted(st.items()):
+            key = f"{hyp}|{m}|{s}"
+            out["proposals"][key] = {"capped": d["capped"], "q": d["q"], "counts": d["counts"], "I_panels": len(d["I"]),
+                                     "I_calibrated": len(d["I"]) >= N_MIN["dev"]}
+            if d["capped"]:
+                out["unavailable"][key] = f"{len(d['capped'])} slot(s) without a B panel after {ROUNDS} proposals"
+                continue
+            for name, rs in (("B", d["B"]), ("I", d["I"])):
+                if name == "I" and len(rs) < N_MIN["dev"]:
+                    continue
+                rec = {"n": len(rs), "score": _crit(_num(r["score"]) if r["available"] else -math.inf for r in rs)}
+                if hyp == "H-F":
+                    rec["M"] = _crit(_num(r["M"]) if r["available"] else -math.inf for r in rs)
+                    for e in transition.EPOCHS:
+                        rec[f"S_{e}"] = _crit(_num(r["S_e"][e]) if r["S_e_available"][e] else -math.inf for r in rs)
+                out["strata"][f"{key}|{name}"] = rec
 
     def mx(hyp, modes, key):
-        return max(out["strata"][f"{hyp}|{m}|{s}"][key] for m in modes for s in STRATA)
+        if any(f"{hyp}|{m}|{s}" in out["unavailable"] for m in modes for s in STRATA):
+            return None
+        return max(v[key] for k, v in out["strata"].items() if k.split("|")[0] == hyp and k.split("|")[1] in modes)
     if "H-F" in out["manifest"]:
         out["c_F"] = mx("H-F", ("F0", "F1", "F2"), "score")
         out["c_M"] = mx("H-F", F_MODES, "M")
         out["c_E"] = {e: mx("H-F", ("F0", "F1", "F2"), f"S_{e}") for e in transition.EPOCHS}
     if "H-T" in out["manifest"]:
-        out["c_T"] = max(transition.GUARD, mx("H-T", T_MODES, "score"))
+        cT = mx("H-T", T_MODES, "score")
+        out["c_T"] = None if cT is None else max(transition.GUARD, cT)
     return out
 
 
@@ -1293,91 +1727,139 @@ def p_model(s, tables):
 def hf_rejects(r, crit):
     """The locked H-F rules on one record (the critical part; the p-table requirement can only reduce
     rejections, so validating it is conservative): detection, and the complete nested exceeding-material
-    claim (detection, both material points, M_F > c_M, R_C > 0.10, R_Q > 0.04)."""
-    if not r["available"]:
+    claim (detection, both material points, M_F > c_M, R_C > 0.10, R_Q > 0.04). An unavailable (None)
+    critical value is never a rejection here: the decision itself is unavailable (reported separately)."""
+    if not r["available"] or crit.get("c_F") is None:
         return False, False
     det = _num(r["score"]) > crit["c_F"]
-    mat = (det and bool(r["material_point"]) and _num(r["M"]) > crit["c_M"] and _num(r["R_C"]) > recurrence.D_C
-           and _num(r["R_Q"]) > recurrence.D_Q)
+    mat = (det and crit.get("c_M") is not None and bool(r["material_point"]) and _num(r["M"]) > crit["c_M"]
+           and _num(r["R_C"]) > recurrence.D_C and _num(r["R_Q"]) > recurrence.D_Q)
     return det, mat
 
 
 def acceptance(records, crit, production=True):
-    """INDEPENDENT validation (H.11; #68 round 2 P1-1): the false positives of the FROZEN critical rules on
-    the complete validation allocation (a panel is never judged against a table containing itself), the
-    one-sided Clopper-Pearson U95 per applicable mode x graph rate, pass iff every U95 <= 0.02. Rates: H-F
-    detection (F0-F2; the raw reciprocal-detection rule), the nested exceeding-material claim (F0-F4),
-    every epoch recurrence gate (F0-F2: S_e > c_E); H-T (T0-T4). The validation manifest must equal the
-    development one. Then the model p-value tables (the validation null scores) for the final evaluation."""
-    out = {"rates": {}, "pass": {}, "ptables": {}, "diagnostics": {}}
+    """INDEPENDENT validation (H.11; #68 round 2 P1-1; the D2 ruling): the false positives of the FROZEN
+    critical rules on the complete stratified validation allocation (a panel is never judged against a
+    table containing itself), per mode x graph x stratum (B; I when it holds >= N_MIN["val"] panels, else
+    its scope is reported: q-hat, q_U, alpha_F + q_U with alpha_F the B rate's U95), the one-sided
+    Clopper-Pearson U95, pass iff every U95 <= 0.02 and the decision is available. Rates: H-F detection
+    (F0-F2), the nested exceeding-material claim (F0-F4), every epoch gate (F0-F2: S_e > c_E); H-T (T0-T4;
+    T4 subtype counts with their denominators). The validation manifest must equal the development one.
+    Then the model p-value tables per stratum. The report names the critical-value artifact it evaluated
+    (crit_sha256). Claim: "passed the model-based screen (U95 <= 0.02) for the registered strata"."""
+    out = {"rates": {}, "pass": {}, "ptables": {}, "diagnostics": {}, "proposals": {}, "unavailable": {},
+           "scope": {}, "cpu": {}, "crit_sha256": doc_sha(crit), "production": bool(production),
+           "critical": {k: crit.get(k) for k in ("c_F", "c_M", "c_E", "c_T") if k in crit},
+           "claim": "passed the model-based screen (U95 <= 0.02) for the registered strata"}
     for hyp in ("H-F", "H-T"):
         if hyp not in crit.get("manifest", {}):
             continue
-        by, man = complete(records, hyp, "val", N_VAL, production)
+        st, man = strata(records, hyp, "val", production)
         dev = dict(crit["manifest"][hyp])
         if production or dev.get("production"):
-            same = {k: man.get(k) == dev.get(k) for k in ("graph_sha256", "params_sha256", "tools_sha256", "draws",
-                                                          "gates_sha256")}
+            same = {k: man.get(k) == dev.get(k) for k in IDENT + ("gates_sha256",)}
             if not all(same.values()):
                 raise CalibError(f"{hyp}: the validation manifest differs from the development one: {same}")
-        rates = {}
+        out["cpu"][hyp] = {"proposals": sum(d["counts"]["proposals"] for d in st.values()),
+                           "cpu_h": sum(d["counts"]["cpu_h"] for d in st.values()), "ceiling_h": stats.CPU_CEILING_H}
+        rates, tables = {}, {}
 
         def rate(name, flags):
             k, n = sum(flags), len(flags)
             u = stats.clopper_pearson_upper(k, n)
             rates[name] = {"fp": k, "n": n, "U95": u, "pass": u <= 0.02}
-        for (m, s), rs in sorted(by.items()):
-            if hyp == "H-F":
-                rej = [hf_rejects(r, crit) for r in rs]
-                if m in ("F0", "F1", "F2"):
-                    rate(f"detection|{m}|{s}", [d for d, _ in rej])
-                    for e in transition.EPOCHS:
-                        rate(f"gate_{e}|{m}|{s}", [bool(r["S_e_available"][e]) and _num(r["S_e"][e]) > crit["c_E"][e]
-                                                   for r in rs])
-                rate(f"material|{m}|{s}", [x for _, x in rej])
-                out["diagnostics"][f"{hyp}|{m}|{s}"] = {
-                    "unavailable": sum(1 for r in rs if not r["available"]),
-                    "background_deviations": sum(1 for r in rs if r.get("deviations"))}
-            else:
-                flags = [bool(r["available"]) and _num(r["score"]) > crit["c_T"] for r in rs]
-                rate(f"transition|{m}|{s}", flags)
-                d = {"unavailable": sum(1 for r in rs if not r["available"]),
-                     "background_deviations": sum(1 for r in rs if r.get("deviations"))}
-                if m == "T4":                           # (subtype rates: diagnostics, H.10)
-                    d["subtypes"] = {st: sum(f for f, r in zip(flags, rs) if r.get("subtype") == st)
-                                     for st in range(32)}
-                out["diagnostics"][f"{hyp}|{m}|{s}"] = d
+        for (m, s), d in sorted(st.items()):
+            key = f"{hyp}|{m}|{s}"
+            calI = len(d["I"]) >= N_MIN["val"]
+            out["proposals"][key] = {"capped": d["capped"], "q": d["q"], "counts": d["counts"],
+                                     "I_panels": len(d["I"]), "I_calibrated": calI}
+            if d["capped"]:
+                out["unavailable"][key] = f"{len(d['capped'])} slot(s) without a B panel after {ROUNDS} proposals"
+                continue
+            for name, rs in (("B", d["B"]), ("I", d["I"] if calI else [])):
+                if not rs:
+                    continue
+                sk = f"{m}|{s}|{name}"
+                if hyp == "H-F":
+                    rej = [hf_rejects(r, crit) for r in rs]
+                    if m in ("F0", "F1", "F2"):
+                        if crit.get("c_F") is not None:
+                            rate(f"detection|{sk}", [d_ for d_, _ in rej])
+                        for e in transition.EPOCHS:
+                            if crit.get("c_E", {}).get(e) is not None:
+                                rate(f"gate_{e}|{sk}", [bool(r["S_e_available"][e]) and _num(r["S_e"][e]) > crit["c_E"][e]
+                                                        for r in rs])
+                        tables.setdefault("H-F detection", {})[sk] = sorted(_num(r["score"]) if r["available"]
+                                                                            else -math.inf for r in rs)
+                    if crit.get("c_M") is not None:
+                        rate(f"material|{sk}", [x for _, x in rej])
+                    tables.setdefault("H-F material", {})[sk] = sorted(_num(r["M"]) if r["available"] else -math.inf
+                                                                       for r in rs)
+                    dg = {}
+                else:
+                    flags = [bool(r["available"]) and crit.get("c_T") is not None and _num(r["score"]) > crit["c_T"]
+                             for r in rs]
+                    if crit.get("c_T") is not None:
+                        rate(f"transition|{sk}", flags)
+                    tables.setdefault("H-T", {})[sk] = sorted(_num(r["score"]) if r["available"] else -math.inf
+                                                              for r in rs)
+                    dg = {}
+                    if m == "T4":                           # (subtype counts with denominators: diagnostics, H.10)
+                        dg["subtypes"] = {st_: {"fp": sum(f for f, r in zip(flags, rs) if r.get("subtype") == st_),
+                                                "n": sum(1 for r in rs if r.get("subtype") == st_)} for st_ in range(32)}
+                bl = [r.get("boundary_final") for r in rs if r.get("boundary_final")]
+                dg.update(unavailable=sum(1 for r in rs if not r["available"]),
+                          boundary_checked=len(bl), boundary_null=sum(1 for b in bl if b.get("ok")),
+                          boundary_max_abs_residual=max((abs(b["residual"]) for b in bl if "residual" in b), default=None))
+                out["diagnostics"][f"{hyp}|{sk}"] = dg
+            if not calI:
+                bounds = {nm.rsplit("|", 3)[0]: {"alpha_F": v["U95"], "alpha_F_plus_q_U": v["U95"] + d["q"]["q_U"]}
+                          for nm, v in rates.items() if nm.endswith(f"|{m}|{s}|B")}
+                out["scope"][key] = {"claim": "feasibility-conditioned", "I_panels": len(d["I"]), "q_hat": d["q"]["q_hat"],
+                                     "q_U": d["q"]["q_U"], "bounds": bounds}
         out["rates"][hyp] = rates
+        out["ptables"].update(tables)
+
+        def ok(prefix, modes):
+            if any(f"{hyp}|{m}|{s}" in out["unavailable"] for m in modes for s in STRATA):
+                return False
+            sel = [v["pass"] for k, v in rates.items() if k.startswith(prefix)]
+            return bool(sel) and all(sel)
         if hyp == "H-F":
-            out["pass"]["H-F detection"] = all(v["pass"] for k, v in rates.items() if k.startswith("detection"))
-            out["pass"]["H-F material"] = all(v["pass"] for k, v in rates.items() if k.startswith("material"))
+            out["pass"]["H-F detection"] = ok("detection|", ("F0", "F1", "F2"))
+            out["pass"]["H-F material"] = ok("material|", F_MODES)
             for e in transition.EPOCHS:
-                out["pass"][f"gate {e}"] = all(v["pass"] for k, v in rates.items() if k.startswith(f"gate_{e}|"))
-            out["ptables"]["H-F detection"] = {f"{m}|{s}": sorted(_num(r["score"]) if r["available"] else -math.inf
-                                                                  for r in by[(m, s)])
-                                               for m in ("F0", "F1", "F2") for s in STRATA}
-            out["ptables"]["H-F material"] = {f"{m}|{s}": sorted(_num(r["M"]) if r["available"] else -math.inf
-                                                                 for r in by[(m, s)])
-                                              for m in F_MODES for s in STRATA}
+                out["pass"][f"gate {e}"] = ok(f"gate_{e}|", ("F0", "F1", "F2"))
         else:
-            out["pass"]["H-T"] = all(v["pass"] for v in rates.values())
-            out["ptables"]["H-T"] = {f"{m}|{s}": sorted(_num(r["score"]) if r["available"] else -math.inf
-                                                        for r in by[(m, s)]) for m in T_MODES for s in STRATA}
+            out["pass"]["H-T"] = ok("transition|", T_MODES)
         out.setdefault("manifest", {})[hyp] = man
     return out
 
 
-def freeze_gates(crit, acc):
-    """The frozen epoch-gate artifact H-T development needs (H.11-H.12): every epoch's c_E with its
-    independently passing validation rate; a gate that did not pass refuses the freeze (H-T unavailable)."""
-    if "c_E" not in crit:
+def freeze_gates(crit, acc, production=True):
+    """The frozen epoch-gate artifact H-T development needs (H.11-H.12; #68 round 3 P2): every epoch's c_E
+    with its independently passing validation, BOUND to the artifacts: the acceptance must have evaluated
+    exactly this critical-value artifact (crit_sha256) on the same graph, parameters, code and draws, and
+    the gate rates are re-derived from their counts; a gate that did not pass refuses the freeze."""
+    if crit.get("c_E") is None or "H-F" not in crit.get("manifest", {}):
         raise CalibError("no H-F development calibration (c_E)")
-    passed = {e: acc.get("pass", {}).get(f"gate {e}") is True for e in transition.EPOCHS}
+    if acc.get("crit_sha256") != doc_sha(crit):
+        raise CalibError("the acceptance report did not evaluate this critical-value artifact (crit_sha256 differs)")
+    dm, vm = crit["manifest"]["H-F"], (acc.get("manifest") or {}).get("H-F") or {}
+    diff = [k for k in IDENT if vm.get(k) != dm.get(k)]
+    if diff:
+        raise CalibError(f"the acceptance ran on another graph / parameters / code / draws: {diff}")
+    if production and not (acc.get("production") is True and dm.get("production") is True):
+        raise CalibError("a production gate artifact needs a production calibration and acceptance")
+    rates = {k: v for k, v in acc.get("rates", {}).get("H-F", {}).items() if k.startswith("gate_")}
+    passed = gate_rates_pass(rates)
+    passed = {e: passed[e] and acc.get("pass", {}).get(f"gate {e}") is True and crit["c_E"].get(e) is not None
+              for e in transition.EPOCHS}
     if not all(passed.values()):
         raise CalibError(f"epoch gates without a passing validation: {[e for e, p in passed.items() if not p]}: "
                          "H-T is unavailable")
-    return {"schema": GATES_SCHEMA, "c_E": crit["c_E"], "passed": passed, "hf_manifest": crit["manifest"]["H-F"],
-            "rates": {k: v for k, v in acc["rates"]["H-F"].items() if k.startswith("gate_")}}
+    return {"schema": GATES_SCHEMA, "c_E": crit["c_E"], "passed": passed, "hf_manifest": dm, "rates": rates,
+            "crit_sha256": doc_sha(crit), "accept_sha256": doc_sha(acc), "production": bool(production)}
 
 
 def wilson(k, n, z=1.96):
@@ -1390,37 +1872,106 @@ def wilson(k, n, z=1.96):
     return [max(c - h, 0.0), min(c + h, 1.0)]
 
 
-def power(records, crit):
-    """Development-alternative power (H.10-H.11) with binomial (Wilson) Monte Carlo intervals: a success is
-    the frozen rule's rejection on a panel whose targets were all attained (an unattainable alternative is
-    a non-success); H-T also by generating direction (denominator 50 each)."""
+def power(records, crit, production=True):
+    """Development-alternative power (H.10-H.11) with binomial (Wilson) Monte Carlo intervals on the
+    registered allocation (#68 round 3 P2): every alternative mode x graph with exactly the panels 0..99,
+    one manifest compatible with the development one; a failed or infeasible (non-success) alternative
+    counts in the denominator; H-T also by generating direction (assigned from panel parity BEFORE
+    generation: 50 each)."""
     out = {}
-    for r in records:
-        if r.get("stage") != "alt":
+    for hyp in ("H-F", "H-T"):
+        if not any(r.get("hyp") == hyp and r.get("stage") == "alt" for r in records):
             continue
-        key = f"{r['hyp']}|{r['mode']}|{r['stratum']}"
-        if r.get("error"):
-            ok = False
-        elif r["hyp"] == "H-F":
-            d, mt = hf_rejects(r, crit)
-            ok = {"detection": d, "material": mt}
-        else:
-            ok = bool(r["available"]) and _num(r["score"]) > crit["c_T"]
-        rec = out.setdefault(key, {"n": 0, "failed": 0, "non_success": 0, "success": {}, "by_direction": {}})
-        rec["n"] += 1
-        rec["failed"] += bool(r.get("error"))
-        rec["non_success"] += bool(r.get("non_success"))
-        flags = ok if isinstance(ok, dict) else {"rejection": ok}
-        for k, v in flags.items():
-            rec["success"][k] = rec["success"].get(k, 0) + bool(v and not r.get("non_success"))
-        if r["hyp"] == "H-T":
-            dd = rec["by_direction"].setdefault(r.get("direction"), {"n": 0, "success": 0})
-            dd["n"] += 1
-            dd["success"] += bool(flags["rejection"] and not r.get("non_success"))
+        by, man = complete(records, hyp, "alt", N_ALT, production, modes=ALT[hyp], allow_failed=True)
+        dev = (crit.get("manifest") or {}).get(hyp)
+        if production and dev is None:
+            raise CalibError(f"{hyp}: the critical values carry no development manifest")
+        if dev is not None and (production or dev.get("production")):
+            diff = [k for k in IDENT + ("gates_sha256",) if man.get(k) != dev.get(k)]
+            if diff:
+                raise CalibError(f"{hyp}: the alternatives ran on another graph / parameters / code / draws / gates: {diff}")
+        for (m, s), rs in sorted(by.items()):
+            rec = out.setdefault(f"{hyp}|{m}|{s}", {"n": 0, "failed": 0, "non_success": 0, "success": {}, "by_direction": {}})
+            for r in rs:
+                if r.get("error"):
+                    ok = False
+                elif hyp == "H-F":
+                    d, mt = hf_rejects(r, crit)
+                    ok = {"detection": d, "material": mt}
+                else:
+                    ok = bool(r["available"]) and crit.get("c_T") is not None and _num(r["score"]) > crit["c_T"]
+                rec["n"] += 1
+                rec["failed"] += bool(r.get("error"))
+                rec["non_success"] += bool(r.get("non_success"))
+                flags = ok if isinstance(ok, dict) else ({"detection": False, "material": False} if hyp == "H-F"
+                                                         else {"rejection": ok})
+                for k, v in flags.items():
+                    rec["success"][k] = rec["success"].get(k, 0) + bool(v and not r.get("non_success"))
+                if hyp == "H-T":
+                    dn = r.get("direction") or ("ARD->FSD" if r["panel"] % 2 == 0 else "FSD->ARD")
+                    dd = rec["by_direction"].setdefault(dn, {"n": 0, "success": 0})
+                    dd["n"] += 1
+                    dd["success"] += bool(flags["rejection"] and not r.get("non_success"))
     for rec in out.values():
         rec["wilson95"] = {k: wilson(v, rec["n"]) for k, v in rec["success"].items()}
         for dd in rec["by_direction"].values():
             dd["wilson95"] = wilson(dd["success"], dd["n"])
+    return out
+
+
+def _dist(xs):
+    xs = sorted(xs)
+    if not xs:
+        return {"n": 0}
+    return {"n": len(xs), "mean": sum(xs) / len(xs), "median": xs[len(xs) // 2], "max": xs[-1]}
+
+
+def report(records):
+    """The D2 report per hyp x stage x mode x graph (and per T4 subtype / TA direction): proposals by class
+    and role, capped slots, numerical failures, world-level clip rates, requested vs achieved (the clip
+    frequency and the shortfall distribution, maximum included), the "max" targets, the boundary
+    residuals (noise-free and final metric), null membership, CPU over EVERY proposal (discarded ones
+    included), and the registered rules."""
+    groups = {}
+    for r in records:
+        key = f"{r.get('hyp')}|{r.get('stage')}|{r.get('mode')}|{r.get('stratum')}"
+        groups.setdefault(key, []).append(r)
+        if r.get("subtype") is not None:
+            groups.setdefault(f"{key}|sub{int(r['subtype']):02d}", []).append(r)
+        if r.get("direction"):
+            groups.setdefault(f"{key}|{r['direction']}", []).append(r)
+    fitted = {bool((r.get("manifest") or {}).get("params_fitted")) for r in records}
+    out = {"rules": {"rounds": ROUNDS, "K": "ROUNDS x n per stage x mode x graph", "N_MIN": N_MIN,
+                     "n_I": "n (dev 160, val 1000)", "BOUNDARY_TOL": BOUNDARY_TOL, "AMP_TOL": AMP_TOL,
+                     "DIR_TOL": DIR_TOL, "A_SUP": A_SUP, "A_LIM": A_LIM, "KNOB_MAX": KNOB_MAX, "KNOB_LIM": KNOB_LIM,
+                     "streams": "AnnexH/1/<hyp>/<stage>:<graph>/<mode>/<slot>[/retry<r>]/<purpose>",
+                     "rounds_rule": "round 0 every slot; round r: the slots without B, every slot while I < n "
+                                    "and q_hat x K >= N_MIN"},
+           "note": None if fitted == {True} else ("q-hat from synthetic placeholder parameters: illustrative only; "
+                                                  "the binding q-hat is the production run's"),
+           "groups": {}}
+    for key, rs in sorted(groups.items()):
+        clips = [c for r in rs for c in r.get("clips", [])]
+        rms = [abs(c["target"] - c["nearest"]) / abs(c["target"]) for c in clips if c["readout"] in ("C", "Q")]
+        slo = [abs(c["target"] - c["nearest"]) for c in clips if c["readout"].startswith("beta")]
+        nb = [r["membership"]["boundary"] for r in rs if (r.get("membership") or {}).get("boundary")]
+        fb = [r["boundary_final"] for r in rs if r.get("boundary_final")]
+        mem = [r for r in rs if r.get("member") is not None]
+        g = {"counts": proposal_counts(rs),
+             "clips": {"proposals_clipped": sum(1 for r in rs if r.get("clips")), "world_readouts": len(clips),
+                       "kinds": {k: sum(1 for c in clips if c.get("kind") == k) for k in ("above-sup", "below-inf")},
+                       "rms_shortfall_relative": _dist(rms), "slope_shortfall": _dist(slo)},
+             "maxima_at_edge": sum(int((r.get("maxima") or {}).get("at_edge", 0)) for r in rs),
+             "boundary_noise_free": {"n": len(nb), "ok": sum(1 for b in nb if b["ok"]),
+                                     "max_abs_residual": max((abs(b["residual"]) for b in nb), default=None)},
+             "boundary_final": {"n": len(fb), "ok": sum(1 for b in fb if b.get("ok")),
+                                "max_abs_residual": max((abs(b["residual"]) for b in fb if "residual" in b), default=None)},
+             "membership": {"members": sum(1 for r in mem if r["member"]), "non_members": sum(1 for r in mem if not r["member"]),
+                            "strongest_candidates": {c: sum(1 for r in mem if not r["member"]
+                                                            and r["membership"].get("strongest") == c)
+                                                     for c in sorted({r["membership"].get("strongest") for r in mem
+                                                                      if not r["member"] and r["membership"].get("strongest")})}}}
+        out["groups"][key] = g
     return out
 
 
@@ -1465,6 +2016,8 @@ def main(argv=None):
             s.add_argument("--stratum", choices=STRATA, required=True)
             s.add_argument("--from", dest="lo", type=int, default=0)
             s.add_argument("--to", dest="hi", type=int, required=True)
+            s.add_argument("--round", type=int, default=0, help="the proposal round (D2): 0, then 1..ROUNDS-1")
+            s.add_argument("--prior", nargs="*", default=[], help="the records of the earlier rounds (round >= 1)")
             s.add_argument("--out", required=True)
         else:
             s.add_argument("--panels", type=int, default=50)
@@ -1479,6 +2032,9 @@ def main(argv=None):
     s.add_argument("--crit", required=True)
     s.add_argument("--accept", required=True)
     s.add_argument("--out", required=True)
+    s.add_argument("--smoke", action="store_true")
+    s = sub.add_parser("report")
+    s.add_argument("files", nargs="+")
     a = ap.parse_args(argv)
     try:
         if a.cmd in ("panels", "bench"):
@@ -1491,8 +2047,8 @@ def main(argv=None):
                                  "(--smoke for a test run)")
             gates, art = None, None
             if a.gates:
-                with open(a.gates) as f:
-                    art = check_gates(json.load(f))
+                with open(a.gates) as f:                  # (#68 round 3: the gates' graph / parameters / code)
+                    art = check_gates(json.load(f), manifest(graph, params, a.draws, None, production, src), production)
                 gates = art["c_E"]
             elif a.hyp == "H-T":
                 if production:
@@ -1501,9 +2057,25 @@ def main(argv=None):
             man = manifest(graph, params, a.draws, art if art else (gates if a.hyp == "H-T" else None),
                            production, src)
             if a.cmd == "panels":
+                n_reg = {"dev": N_DEV, "val": N_VAL, "alt": N_ALT}[a.stage]
+                if not 0 <= a.lo <= a.hi <= n_reg:
+                    raise CalibError(f"slots {a.lo}..{a.hi} outside the registered 0..{n_reg}")
+                filled, slots = set(), list(range(a.lo, a.hi))
+                if a.round:
+                    if a.stage == "alt" or not 1 <= a.round < ROUNDS:
+                        raise CalibError(f"proposal rounds 1..{ROUNDS - 1} exist for the null stages only")
+                    prior = [r for r in read_records(a.prior) if r.get("hyp") == a.hyp and r.get("stage") == a.stage
+                             and r.get("mode") == a.mode and r.get("stratum") == a.stratum
+                             and int(r.get("retry", 0)) < a.round]
+                    if sorted({int(r["retry"]) for r in prior}) != list(range(a.round)):
+                        raise CalibError(f"round {a.round} needs the records of rounds 0..{a.round - 1} (--prior)")
+                    plan = set(round_plan(prior, n_reg, a.stage, a.round))
+                    slots = [j for j in slots if j in plan]
+                    filled = {int(r["panel"]) for r in prior if r.get("role") == "B"}
                 with open(a.out, "a") as f:
-                    for k in range(a.lo, a.hi):
-                        r = run_panel(graph, params, a.hyp, a.stage, a.stratum, a.mode, k, gates, a.draws, man)
+                    for k in slots:
+                        r = run_panel(graph, params, a.hyp, a.stage, a.stratum, a.mode, k, gates, a.draws, man,
+                                      retry=a.round, keep=lambda rec: rec["role"] != "B" or rec["panel"] not in filled)
                         f.write(json.dumps(r, sort_keys=True) + "\n")
                         f.flush()
                 return 0
@@ -1529,12 +2101,15 @@ def main(argv=None):
                 crit = json.load(f)
             with open(a.accept) as f:
                 acc = json.load(f)
-            art = freeze_gates(crit, acc)
+            art = freeze_gates(crit, acc, production=not a.smoke)
             with open(a.out, "w") as f:
                 json.dump(art, f, indent=1, sort_keys=True)
             print(json.dumps(art["passed"]))
             return 0
         recs = read_records(a.files)
+        if a.cmd == "report":
+            print(json.dumps(report(recs), indent=1, sort_keys=True))
+            return 0
         if a.cmd == "crit":
             print(json.dumps(critical_values(recs, production=not a.smoke), indent=1, sort_keys=True))
             return 0
@@ -1543,7 +2118,7 @@ def main(argv=None):
         if a.cmd == "accept":
             print(json.dumps(acceptance(recs, crit, production=not a.smoke), indent=1, sort_keys=True))
         else:
-            print(json.dumps(power(recs, crit), indent=1, sort_keys=True))
+            print(json.dumps(power(recs, crit, production=not a.smoke), indent=1, sort_keys=True))
         return 0
     except CalibError as e:
         print(f"calib.py {a.cmd}: {e}", file=sys.stderr)

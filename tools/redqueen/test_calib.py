@@ -4,7 +4,13 @@ graph. Covers:
   * whole H-F and H-T panels run, finite and deterministic;
   * the q33 speed-ups equal their reference routes: the cached loading sparsity (Panel.cov) against the
     direct construction, the amplitude solver's RMS (recurrence.ref_rms) against RefDesign.readout;
-  * the H-T analysis pairs worlds by id.
+  * the H-T analysis pairs worlds by id;
+  * #68 round 3: an H-T numerical failure fails the panel (never a non-rejection); gate artifacts bound to
+    their critical values, acceptance and manifests; a background above its target is clipped, never
+    accepted; a ceiling is a numerical failure; a failed alternative keeps its direction;
+  * the D2 strata: a feasible panel goes to B (verified, boundary residuals under both metrics), an
+    infeasible one to I (clipped, null-checked; a non-member discarded), crit = the maximum over strata,
+    H-T membership across all six candidates, cap exhaustion makes a mode unavailable, the round plan.
 numpy required (RQ_REQUIRE_NUMPY=1 makes a missing numpy a failure).
 
     python3 -I tools/redqueen/test_calib.py [-v]
@@ -204,7 +210,7 @@ class TestGenerator(unittest.TestCase):
 
 def rec(hyp, stage, mode, stratum, panel, man, **kw):
     r = {"hyp": hyp, "stage": stage, "mode": mode, "stratum": stratum, "panel": panel, "manifest": man,
-         "available": True, "score": 0.0}
+         "available": True, "score": 0.0, "retry": 0, "role": "B", "status": "feasible", "member": True}
     if hyp == "H-F":
         r.update(M=0.5, R_C=0.05, R_Q=0.02, material_point=False, S_e={e: 0.0 for e in ("E1", "E2", "E3")},
                  S_e_available={e: True for e in ("E1", "E2", "E3")})
@@ -250,19 +256,20 @@ class TestHarness(unittest.TestCase):
         cb = self.cb
         crit = cb.critical_values(self.allocation("H-F", "dev", cb.N_DEV))
         hi = cb.acceptance(self.allocation("H-F", "val", cb.N_VAL, score=lambda m, s, k: 5.0), crit)
-        self.assertEqual(hi["rates"]["H-F"]["detection|F0|actual"]["fp"], 1000)
+        self.assertEqual(hi["rates"]["H-F"]["detection|F0|actual|B"]["fp"], 1000)
         self.assertFalse(hi["pass"]["H-F detection"])
         lo = cb.acceptance(self.allocation("H-F", "val", cb.N_VAL, score=lambda m, s, k: 0.0), crit)
         self.assertTrue(lo["pass"]["H-F detection"] and lo["pass"]["H-F material"])
         self.assertTrue(all(lo["pass"][f"gate {e}"] for e in ("E1", "E2", "E3")))
-        self.assertEqual(len(lo["ptables"]["H-F detection"]["F0|actual"]), 1000)
+        self.assertEqual(len(lo["ptables"]["H-F detection"]["F0|actual|B"]), 1000)
+        self.assertEqual(lo["crit_sha256"], cb.doc_sha(crit))
         # 12 false positives pass, 13 fail (the frozen rule, exactly counted)
         def sc(n):
             return lambda m, s, k: (5.0 if (m == "F1" and s == "actual" and k < n) else 0.0)
         self.assertTrue(cb.acceptance(self.allocation("H-F", "val", cb.N_VAL, score=sc(12)), crit)["pass"]["H-F detection"])
         self.assertFalse(cb.acceptance(self.allocation("H-F", "val", cb.N_VAL, score=sc(13)), crit)["pass"]["H-F detection"])
         un = self.allocation("H-F", "val", cb.N_VAL, score=lambda m, s, k: 5.0, available=False)
-        self.assertEqual(cb.acceptance(un, crit)["rates"]["H-F"]["detection|F0|actual"]["fp"], 0)
+        self.assertEqual(cb.acceptance(un, crit)["rates"]["H-F"]["detection|F0|actual|B"]["fp"], 0)
         with self.assertRaises(cb.CalibError):                   # (1,000 FAILED panels never pass)
             cb.acceptance([dict(r, error="x") for r in self.allocation("H-F", "val", cb.N_VAL)], crit)
         with self.assertRaises(cb.CalibError):
@@ -273,8 +280,8 @@ class TestHarness(unittest.TestCase):
         mat = self.allocation("H-F", "val", cb.N_VAL, score=lambda m, s, k: 5.0 if m == "F3" else 0.0,
                               M=9.0, R_C=0.2, R_Q=0.1, material_point=True)
         acc = cb.acceptance(mat, crit)
-        self.assertEqual(acc["rates"]["H-F"]["material|F3|actual"]["fp"], 1000)
-        self.assertEqual(acc["rates"]["H-F"]["material|F4|actual"]["fp"], 0)
+        self.assertEqual(acc["rates"]["H-F"]["material|F3|actual|B"]["fp"], 1000)
+        self.assertEqual(acc["rates"]["H-F"]["material|F4|actual|B"]["fp"], 0)
 
     def test_frozen_gates(self):
         """H-T needs every epoch gate with a passing validation; a failed gate refuses the freeze; ht()
@@ -291,14 +298,306 @@ class TestHarness(unittest.TestCase):
         with self.assertRaises(cb.CalibError):
             cb.check_gates(dict(art, passed=dict(art["passed"], E3=False)))
 
-    def test_power_and_non_success(self):
+    def test_gates_bound_to_their_artifacts(self):
+        """#68 round 3 P2: acceptance names the critical artifact it evaluated; a gate freeze from another
+        artifact's acceptance, a tampered rate, an unbound artifact or a consumer on another graph /
+        parameters / code / draws is refused."""
         cb = self.cb
-        crit = {"c_F": 1.0, "c_M": 1.0, "c_T": 7.0}
-        alt = [rec("H-T", "alt", "TA1", "actual", k, self.man, score=9.0, direction="ARD->FSD" if k % 2 == 0 else
-                   "FSD->ARD", non_success=(k == 0)) for k in range(100)]
+        dev = self.allocation("H-F", "dev", cb.N_DEV)
+        crit = cb.critical_values(dev)
+        crit2 = cb.critical_values(self.allocation("H-F", "dev", cb.N_DEV, score=lambda m, s, k: 0.002 * k))
+        acc2 = cb.acceptance(self.allocation("H-F", "val", cb.N_VAL, score=lambda m, s, k: 0.0), crit2)
+        with self.assertRaises(cb.CalibError):
+            cb.freeze_gates(crit, acc2)                                     # (another crit's acceptance)
+        art = cb.freeze_gates(crit2, acc2)
+        self.assertEqual(art["crit_sha256"], cb.doc_sha(crit2))
+        cb.check_gates(art, self.man, production=True)
+        with self.assertRaises(cb.CalibError):
+            cb.check_gates(art, dict(self.man, params_sha256="other"))     # (gates from other parameters)
+        with self.assertRaises(cb.CalibError):
+            cb.check_gates(art, dict(self.man, tools_sha256="other"))      # (other code)
+        bad = json.loads(json.dumps(art))
+        bad["rates"]["gate_E2|F1|actual|B"]["fp"] = 40                     # (a tampered count: U95 > 0.02)
+        with self.assertRaises(cb.CalibError):
+            cb.check_gates(bad)
+        with self.assertRaises(cb.CalibError):
+            cb.check_gates({k: v for k, v in art.items() if k != "accept_sha256"})
+
+    def alt_allocation(self, hyp="H-T", **kw):
+        cb = self.cb
+        out = []
+        for m in cb.ALT[hyp]:
+            for s_ in cb.STRATA:
+                for k in range(cb.N_ALT):
+                    r = rec(hyp, "alt", m, s_, k, self.man, score=9.0, role="alt", **kw)
+                    if hyp == "H-T":
+                        r["direction"] = "ARD->FSD" if k % 2 == 0 else "FSD->ARD"
+                    out.append(r)
+        return out
+
+    def test_power_and_non_success(self):
+        """The registered alternative allocation (incomplete refused); a non-success and a FAILED
+        alternative count in the denominator of their direction (#68 round 3 P2: 49/50, not 49/49)."""
+        cb = self.cb
+        crit = {"c_F": 1.0, "c_M": 1.0, "c_T": 7.0, "manifest": {"H-T": dict(self.man, gates_sha256=None)}}
+        alt = self.alt_allocation()
+        alt[0]["non_success"] = True                                       # (TA1 actual panel 0: forward)
+        alt[2] = {k: v for k, v in alt[2].items() if k not in ("score", "direction")}
+        alt[2].update(error="CalibError: x", available=False)               # (TA1 actual panel 2: forward, failed)
+        alt[2]["direction"] = "ARD->FSD"
         pw = cb.power(alt, crit)["H-T|TA1|actual"]
-        self.assertEqual((pw["n"], pw["success"]["rejection"], pw["non_success"]), (100, 99, 1))
-        self.assertEqual(pw["by_direction"]["ARD->FSD"], {"n": 50, "success": 49, "wilson95": cb.wilson(49, 50)})
+        self.assertEqual((pw["n"], pw["success"]["rejection"], pw["non_success"], pw["failed"]), (100, 98, 1, 1))
+        self.assertEqual(pw["by_direction"]["ARD->FSD"], {"n": 50, "success": 48, "wilson95": cb.wilson(48, 50)})
+        self.assertEqual(pw["by_direction"]["FSD->ARD"]["n"], 50)
+        with self.assertRaises(cb.CalibError):
+            cb.power(alt[:-1], crit)                                         # (an incomplete allocation)
+        with self.assertRaises(cb.CalibError):
+            cb.power(alt, dict(crit, manifest={"H-T": dict(self.man, graph_sha256="other")}))
+
+    def test_failed_alternative_keeps_its_direction(self):
+        cb = self.cb
+        orig = cb.Panel.triage
+
+        def boom(self_):
+            raise cb.CalibError("a forced generator failure")
+        cb.Panel.triage = boom
+        try:
+            r = cb.run_panel(cb.synthetic_graph(4), cb.placeholder_params(), "H-T", "alt", "actual", "TA1", 1,
+                             {e: 0.0 for e in ("E1", "E2", "E3")}, draws=19)
+        finally:
+            cb.Panel.triage = orig
+        self.assertEqual((r["direction"], r["role"]), ("FSD->ARD", "failed"))
+
+
+class TestRound3(unittest.TestCase):
+    """#68 round 3 (be5464a): numerical failures are never non-rejections or infeasibility; a background
+    above its target is clipped, never accepted as an overshoot."""
+
+    @classmethod
+    def setUpClass(cls):
+        import calib
+        cls.cb = calib
+        cls.graph = calib.synthetic_graph(4)
+        cls.params = calib.placeholder_params()
+
+    def test_ht_numerical_failure_fails_the_panel(self):
+        cb = self.cb
+        orig = cb.transition.ht
+
+        def failing(*a, **k):
+            return {"available": False, "reject": False, "T_T": None, "error": "a nonfinite window mean",
+                    "failure": "numerical", "winner": None, "phase_support": {}, "EU_unsupported": {}}
+        cb.transition.ht = failing
+        try:
+            r = cb.run_panel(self.graph, self.params, "H-T", "dev", "actual", "T3", 0,
+                             {e: 0.0 for e in ("E1", "E2", "E3")}, draws=19)
+        finally:
+            cb.transition.ht = orig
+        self.assertEqual(r["role"], "failed")
+        self.assertIn("numerical failure", r["error"])
+        self.assertFalse(r["available"])
+        self.assertNotIn("score", r)
+
+    def with_rms(self, fn, mode="F1", panel=0):
+        cb = self.cb
+        orig = cb.Panel.rms_of
+
+        def rms_of(self_, wg, th, pl, u, amp, scope, h, dirC, dirQ):
+            return fn(amp.get(scope, (0.0, 0.0))[h], h)
+        cb.Panel.rms_of = rms_of
+        try:
+            return cb.run_panel(self.graph, self.params, "H-F", "dev", "actual", mode, panel)
+        finally:
+            cb.Panel.rms_of = orig
+
+    def test_background_above_target_is_clipped(self):
+        """A background RMS above the target at every amplitude (to the limit): INFEASIBLE, clipped to the
+        nearest attainable value (recorded), never accepted as the target."""
+        r = self.with_rms(lambda a, h: 0.2)
+        self.assertEqual((r["status"], r["role"]), ("infeasible", "I"))
+        c = r["clips"][0]
+        self.assertEqual((c["kind"], c["readout"], c["target"]), ("below-inf", "C", 0.10))
+        self.assertAlmostEqual(c["nearest"], 0.2)
+
+    def test_ceiling_is_a_numerical_failure(self):
+        """A target reached only beyond the generating amplitude domain (the limit ladder reaches it): a
+        NUMERICAL failure, never infeasible; failed proposals block the allocation and leave q-hat alone."""
+        cb = self.cb
+        r = self.with_rms(lambda a, h: 0.001 * a)
+        self.assertEqual((r["role"], r["status"]), ("failed", "failed"))
+        self.assertIn("ceiling", r["error"])
+        q = cb.q_hat([{"panel": 0, "status": "feasible"}, {"panel": 1, "status": "infeasible"}, dict(r, panel=2)], 3)
+        self.assertEqual((q["infeasible"], q["proposals"]), (1, 2))
+
+    def test_verify_enforces_the_declared_tolerance(self):
+        """The completed noise-free panel must meet each declared RMS target to AMP_TOL on both sides."""
+        cb = self.cb
+        pn = cb.Panel(self.graph, self.params, "H-F", "dev", "actual", "F1", 0).triage()
+        self.assertTrue(all(v["ok"] for v in pn.verified))
+        for v in pn.verified:
+            for k, x in v["rms"].items():
+                self.assertLessEqual(abs(x - 0.10), cb.AMP_TOL * 0.10 + 1e-12, k)
+
+
+class TestStrata(unittest.TestCase):
+    """The D2 ruling (2026-11-08): proposals, triage, the B / I strata, crit = the maximum over strata,
+    membership, cap exhaustion."""
+
+    @classmethod
+    def setUpClass(cls):
+        import calib
+        cls.cb = calib
+        cls.graph = calib.synthetic_graph(4)
+        cls.params = calib.placeholder_params()
+        cls.man = {"graph_sha256": "g", "graph_source": "file:x", "params_sha256": "p", "params_fitted": True,
+                   "tools_sha256": "t", "draws": 9999, "gates_sha256": None, "production": True}
+
+    def test_feasible_panel_goes_to_B_and_is_verified(self):
+        cb = self.cb
+        r = cb.run_panel(self.graph, self.params, "H-F", "dev", "actual", "F3", 0)
+        self.assertFalse(r.get("error"), r.get("error"))
+        self.assertEqual((r["status"], r["role"], r["member"]), ("feasible", "B", True))
+        nb, fb = r["membership"]["boundary"], r["boundary_final"]
+        self.assertEqual((nb["quantity"], fb["quantity"], fb["metric"]), ("E_C", "E_C", "final"))
+        self.assertTrue(math.isfinite(nb["residual"]) and math.isfinite(fb["residual"]))
+        self.assertEqual(fb["ok"], abs(fb["residual"]) <= cb.BOUNDARY_TOL)
+        self.assertTrue(math.isfinite(r["score"]))
+
+    def with_target(self, mode, target):
+        cb = self.cb
+        orig = cb.plan_world
+
+        def plan(hyp, mode_, panel, k, rng):
+            pl = orig(hyp, mode_, panel, k, rng)
+            if hyp == "H-F":
+                pl["rec"]["full"] = (target, pl["rec"]["full"][1])
+            return pl
+        cb.plan_world = plan
+        try:
+            return cb.run_panel(self.graph, self.params, "H-F", "dev", "actual", mode, 0)
+        finally:
+            cb.plan_world = orig
+
+    def test_infeasible_panel_goes_to_I_clipped_and_null_checked(self):
+        """A capture RMS of 50 is above the native RMS's supremum (to the limit): clipped to the attainable
+        supremum. F1 (a detection null by construction) keeps it in I; in F3 the clipped capture with the
+        maximal survival recurrence is NOT a material null: discarded (never in either stratum)."""
+        r = self.with_target("F1", 50.0)
+        self.assertEqual((r["status"], r["role"], r["member"]), ("infeasible", "I", True))
+        self.assertTrue(all(c["kind"] == "above-sup" and c["nearest"] < 50.0 and c["limit"] < 50.0 for c in r["clips"]))
+        self.assertEqual(len({c["world"] for c in r["clips"]}), len(self.graph))
+        self.assertTrue(math.isfinite(r["score"]))
+        r3 = self.with_target("F3", 50.0)
+        self.assertEqual((r3["status"], r3["member"], r3["role"]), ("infeasible", False, "discarded"))
+        self.assertGreater(r3["membership"]["exceedance"], self.cb.BOUNDARY_TOL)
+        self.assertNotIn("score", r3)
+
+    def test_ht_membership_spans_all_candidates(self):
+        """Clipping one candidate's component can strengthen another: a panel is a null member only if EVERY
+        one of the six candidates has a margin <= BOUNDARY_TOL x its scale."""
+        cb = self.cb
+        cands = [f"{a}->{f}" for a, f, _ in cb.transition.candidates()]
+        ms = {c: {k: -1.0 * cb.MARGIN_SCALE[k] if k == "beta_P[a]" else 1.0 * cb.MARGIN_SCALE[k]
+                  for k in cb.MARGIN_NAMES} for c in cands}
+        self.assertEqual(cb.ht_membership(ms)[0], True)
+        ms["E2->E3"] = {k: 1.0 * cb.MARGIN_SCALE[k] for k in cb.MARGIN_NAMES}       # (a genuine transition)
+        ok, cand, val = cb.ht_membership(ms)
+        self.assertEqual((ok, cand), (False, "E2->E3"))
+        self.assertAlmostEqual(val, 1.0)
+        ms["E2->E3"]["EF_Q[f]-dQ2"] = 0.5 * cb.BOUNDARY_TOL * cb.MARGIN_SCALE["EF_Q[f]-dQ2"]  # (at the boundary)
+        self.assertEqual(cb.ht_membership(ms)[:2], (True, "E2->E3"))
+        ms["E1->E2"]["beta_Q[a]"] = math.nan
+        with self.assertRaises(cb.CalibError):
+            cb.ht_membership(ms)
+
+    def allocation(self, stage, special=None):
+        """Every H-F mode x graph: slot k a B panel at retry 0 (score 0.001 k), unless special(mode, graph)
+        returns that stratum's own records."""
+        cb = self.cb
+        n = {"dev": cb.N_DEV, "val": cb.N_VAL}[stage]
+        out = []
+        for m, s_ in cb.strata_of("H-F"):
+            got = special(m, s_, n) if special else None
+            out.extend(got if got is not None else [rec("H-F", stage, m, s_, k, self.man, score=0.001 * k) for k in range(n)])
+        return out
+
+    def test_crit_is_the_maximum_over_strata(self):
+        """F1 actual: 40 infeasible slots in round 0 (I), retried in round 1 (q-hat x K >= N_MIN: every slot,
+        80 more infeasible), round 2 every slot again (all surplus). I = 120 >= 99: calibrated; its scores
+        (5.0) set c_F, never pooled into B."""
+        cb = self.cb
+
+        def special(m, s_, n):
+            if (m, s_) != ("F1", "actual"):
+                return None
+            out = []
+            for k in range(n):
+                if k < 120:
+                    out.append(rec("H-F", "dev", m, s_, k, self.man, score=0.001 * k))
+                else:
+                    out.append(rec("H-F", "dev", m, s_, k, self.man, score=5.0, role="I", status="infeasible"))
+            for k in range(n):
+                if k >= 120:
+                    out.append(rec("H-F", "dev", m, s_, k, self.man, score=0.001 * k, retry=1))
+                elif k < 80:
+                    out.append(rec("H-F", "dev", m, s_, k, self.man, score=5.0, retry=1, role="I", status="infeasible"))
+                else:
+                    out.append(rec("H-F", "dev", m, s_, k, self.man, retry=1, role="discarded", surplus=True))
+            out.extend(rec("H-F", "dev", m, s_, k, self.man, retry=2, role="discarded", surplus=True) for k in range(n))
+            return out
+        recs = self.allocation("dev", special)
+        crit = cb.critical_values(recs)
+        self.assertEqual(crit["strata"]["H-F|F1|actual|I"]["n"], 120)
+        self.assertEqual(crit["strata"]["H-F|F1|actual|I"]["score"], 5.0)
+        self.assertAlmostEqual(crit["strata"]["H-F|F1|actual|B"]["score"], 0.159)
+        self.assertEqual(crit["c_F"], 5.0)
+        self.assertTrue(crit["proposals"]["H-F|F1|actual"]["I_calibrated"])
+        self.assertAlmostEqual(crit["proposals"]["H-F|F1|actual"]["q"]["q_hat"], 120 / 480)
+        # the registered rounds are enforced: a missing round-2 proposal, or a dropped infeasible member
+        with self.assertRaises(cb.CalibError):
+            cb.critical_values([r for r in recs if not (r["mode"] == "F1" and r["retry"] == 2 and r["panel"] == 7)])
+        with self.assertRaises(cb.CalibError):
+            cb.critical_values([dict(r, role="discarded") if (r["mode"] == "F1" and r["retry"] == 1 and r["panel"] == 3)
+                                else r for r in recs])
+
+    def test_cap_exhaustion_makes_the_mode_unavailable(self):
+        """F2 actual slot 5 is infeasible at every one of its ROUNDS proposals: no B panel, the mode capped,
+        every decision needing F2 unavailable (None, never a non-rejection); I = 3 < N_MIN: scoped."""
+        cb = self.cb
+
+        def special(m, s_, n):
+            if (m, s_) != ("F2", "actual"):
+                return None
+            out = [rec("H-F", "dev", m, s_, k, self.man, score=0.001 * k) for k in range(n) if k != 5]
+            out += [rec("H-F", "dev", m, s_, 5, self.man, retry=r, role="I", status="infeasible") for r in range(cb.ROUNDS)]
+            return out
+        crit = cb.critical_values(self.allocation("dev", special))
+        self.assertIn("H-F|F2|actual", crit["unavailable"])
+        self.assertEqual((crit["c_F"], crit["c_M"]), (None, None))
+        self.assertTrue(all(v is None for v in crit["c_E"].values()))
+        self.assertFalse(crit["proposals"]["H-F|F2|actual"]["I_calibrated"])
+        acc = cb.acceptance(self.allocation("val"), crit)
+        self.assertFalse(acc["pass"]["H-F detection"] or acc["pass"]["H-F material"])
+        with self.assertRaises(cb.CalibError):
+            cb.freeze_gates(crit, acc)
+        # a slot retried fewer than ROUNDS times is incomplete, not capped
+        def short(m, s_, n):
+            got = special(m, s_, n)
+            return None if got is None else [r for r in got if r["retry"] < 2]
+        with self.assertRaises(cb.CalibError):
+            cb.critical_values(self.allocation("dev", short))
+
+    def test_round_plan(self):
+        cb = self.cb
+        n = 10
+        r0 = [{"panel": k, "retry": 0, "role": "B" if k != 3 else "I", "status": "feasible" if k != 3 else "infeasible"}
+              for k in range(n)]
+        self.assertEqual(cb.round_plan(r0, n, "dev", 1), [3])                # (q-hat 0.1 x K 30 = 3 < 99)
+        big = [{"panel": k, "retry": 0, "role": "I" if k < 40 else "B", "status": "infeasible" if k < 40 else "feasible"}
+               for k in range(160)]
+        self.assertEqual(cb.round_plan(big, 160, "dev", 1), list(range(160)))  # (I collection: 0.25 x 480 = 120 >= 99)
+        self.assertEqual(cb.round_plan(big, 160, "val", 1), list(range(40)))   # (120 < 149: only the slots without B)
+
 
 
 def direct_cov(pn, wg, m, kind):
