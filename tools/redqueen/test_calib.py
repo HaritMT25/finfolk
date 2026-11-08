@@ -8,9 +8,12 @@ graph. Covers:
   * #68 round 3: an H-T numerical failure fails the panel (never a non-rejection); gate artifacts bound to
     their critical values, acceptance and manifests; a background above its target is clipped, never
     accepted; a ceiling is a numerical failure; a failed alternative keeps its direction;
-  * the D2 strata: a feasible panel goes to B (verified, boundary residuals under both metrics), an
-    infeasible one to I (clipped, null-checked; a non-member discarded), crit = the maximum over strata,
-    H-T membership across all six candidates, cap exhaustion makes a mode unavailable, the round plan.
+  * the D2 strata (#68 round 4): a feasible panel enters B only inside the one-sided boundary window under
+    BOTH metrics (a final-metric failure is discarded), an unreached one goes to I (clipped, null-checked;
+    a non-member discarded), membership without scientific slack across all six H-T candidates, pooled
+    ordered streams per quota cell with the registered stopping point, crit = the maximum over strata, cap
+    exhaustion makes a mode unavailable, the audit's q-hats, the stratum set frozen at dev, the
+    unavailability adapters, the CPU ledger.
 numpy required (RQ_REQUIRE_NUMPY=1 makes a missing numpy a failure).
 
     python3 -I tools/redqueen/test_calib.py [-v]
@@ -210,7 +213,13 @@ class TestGenerator(unittest.TestCase):
 
 def rec(hyp, stage, mode, stratum, panel, man, **kw):
     r = {"hyp": hyp, "stage": stage, "mode": mode, "stratum": stratum, "panel": panel, "manifest": man,
-         "available": True, "score": 0.0, "retry": 0, "role": "B", "status": "feasible", "member": True}
+         "available": True, "score": 0.0, "role": "B", "eligible": "B", "status": "feasible", "member": True,
+         "stream": None}
+    if stage in ("dev", "val"):
+        import calib
+        n = {"dev": calib.N_DEV, "val": calib.N_VAL}[stage]
+        c = calib.quota_cell(hyp, mode, panel)
+        r.update(cell=c, k=calib.cells_of(hyp, mode, n)[c].index(panel))
     if hyp == "H-F":
         r.update(M=0.5, R_C=0.05, R_Q=0.02, material_point=False, S_e={e: 0.0 for e in ("E1", "E2", "E3")},
                  S_e_available={e: True for e in ("E1", "E2", "E3")})
@@ -370,8 +379,8 @@ class TestHarness(unittest.TestCase):
 
 
 class TestRound3(unittest.TestCase):
-    """#68 round 3 (be5464a): numerical failures are never non-rejections or infeasibility; a background
-    above its target is clipped, never accepted as an overshoot."""
+    """#68 rounds 3-4: numerical failures are never non-rejections or unreached; a background above its
+    target is clipped (unreached), never accepted as an overshoot."""
 
     @classmethod
     def setUpClass(cls):
@@ -390,7 +399,7 @@ class TestRound3(unittest.TestCase):
         cb.transition.ht = failing
         try:
             r = cb.run_panel(self.graph, self.params, "H-T", "dev", "actual", "T3", 0,
-                             {e: 0.0 for e in ("E1", "E2", "E3")}, draws=19)
+                             {e: 0.0 for e in ("E1", "E2", "E3")}, draws=19, cell="all", k=0)
         finally:
             cb.transition.ht = orig
         self.assertEqual(r["role"], "failed")
@@ -406,28 +415,33 @@ class TestRound3(unittest.TestCase):
             return fn(amp.get(scope, (0.0, 0.0))[h], h)
         cb.Panel.rms_of = rms_of
         try:
-            return cb.run_panel(self.graph, self.params, "H-F", "dev", "actual", mode, panel)
+            return cb.run_panel(self.graph, self.params, "H-F", "dev", "actual", mode, panel, cell="lvl0", k=0)
         finally:
             cb.Panel.rms_of = orig
 
     def test_background_above_target_is_clipped(self):
-        """A background RMS above the target at every amplitude (to the limit): INFEASIBLE, clipped to the
-        nearest attainable value (recorded), never accepted as the target."""
+        """A background RMS above the target at every amplitude of the registered search: UNREACHED, clipped to
+        the attained minimum (recorded with its shortfall), never accepted as the target."""
         r = self.with_rms(lambda a, h: 0.2)
-        self.assertEqual((r["status"], r["role"]), ("infeasible", "I"))
+        self.assertEqual((r["status"], r["role"]), ("unreached", "I"))
         c = r["clips"][0]
-        self.assertEqual((c["kind"], c["readout"], c["target"]), ("below-inf", "C", 0.10))
+        self.assertEqual((c["kind"], c["readout"], c["target"]), ("unreached-below", "C", 0.10))
         self.assertAlmostEqual(c["nearest"], 0.2)
+        self.assertAlmostEqual(c["shortfall"], 0.1)
 
-    def test_ceiling_is_a_numerical_failure(self):
-        """A target reached only beyond the generating amplitude domain (the limit ladder reaches it): a
-        NUMERICAL failure, never infeasible; failed proposals block the allocation and leave q-hat alone."""
+    def test_unreached_is_neither_infeasible_nor_failed(self):
+        """#68 round 4 P2-4: a target above the maximum attained on the registered search ([0, A_SUP]) is
+        UNREACHED (an honest class, kept in I), whatever larger amplitudes might do; a nonfinite solver value
+        is a NUMERICAL failure, which blocks the allocation and stays out of every q-hat."""
         cb = self.cb
         r = self.with_rms(lambda a, h: 0.001 * a)
-        self.assertEqual((r["role"], r["status"]), ("failed", "failed"))
-        self.assertIn("ceiling", r["error"])
-        q = cb.q_hat([{"panel": 0, "status": "feasible"}, {"panel": 1, "status": "infeasible"}, dict(r, panel=2)], 3)
-        self.assertEqual((q["infeasible"], q["proposals"]), (1, 2))
+        self.assertEqual((r["status"], r["eligible"], r["role"]), ("unreached", "I", "I"))
+        self.assertTrue(all(c["kind"] == "unreached-above" and abs(c["nearest"] - 0.001 * cb.A_SUP) < 1e-12
+                            for c in r["clips"]))
+        bad = self.with_rms(lambda a, h: math.nan)
+        self.assertEqual((bad["role"], bad["status"]), ("failed", "failed"))
+        a = cb.audit_classes([r, dict(r, eligible="B", role="B", status="feasible"), bad])
+        self.assertEqual((a["n"], a["classes"]["I_eligible"], a["classes"]["B"], a["classes"]["failed"]), (2, 1, 1, 1))
 
     def test_verify_enforces_the_declared_tolerance(self):
         """The completed noise-free panel must meet each declared RMS target to AMP_TOL on both sides."""
@@ -438,10 +452,22 @@ class TestRound3(unittest.TestCase):
             for k, x in v["rms"].items():
                 self.assertLessEqual(abs(x - 0.10), cb.AMP_TOL * 0.10 + 1e-12, k)
 
+    def test_unavailability_adapters(self):
+        """#68 round 4 P3: an unavailable critical value never reaches a numeric comparison: hf_decision and
+        ht() return unavailable (p = 1 in Holm), decision_inputs reports it."""
+        cb = self.cb
+        res = {"available": True, "S_F": 9.0, "material_point": True, "M_F": 2.0, "R_C": 0.2, "R_Q": 0.1}
+        d = cb.recurrence.hf_decision(res, None, p_F=0.001)
+        self.assertFalse(d["available"])
+        inp = cb.decision_inputs({"manifest": {"H-F": {}, "H-T": {}}, "c_F": None, "c_M": 1.0, "c_T": 7.0},
+                                 {"pass": {"H-F detection": True, "H-F material": True, "H-T": True}})
+        self.assertEqual((inp["H-F"]["available"], inp["H-T"]["available"]), (False, True))
+
 
 class TestStrata(unittest.TestCase):
-    """The D2 ruling (2026-11-08): proposals, triage, the B / I strata, crit = the maximum over strata,
-    membership, cap exhaustion."""
+    """The D2 ruling with Codex round 4: proposals, triage, the enforced boundary, the B / I strata from
+    pooled per-cell streams, crit = the maximum over strata, membership, cap exhaustion, the audit, the
+    frozen stratum set, the CPU ledger."""
 
     @classmethod
     def setUpClass(cls):
@@ -452,58 +478,74 @@ class TestStrata(unittest.TestCase):
         cls.man = {"graph_sha256": "g", "graph_source": "file:x", "params_sha256": "p", "params_fitted": True,
                    "tools_sha256": "t", "draws": 9999, "gates_sha256": None, "production": True}
 
-    def test_feasible_panel_goes_to_B_and_is_verified(self):
-        """F3 slot 1: the panel multiplier lambda puts the noise-free FUNCTIONAL E_C on d_C^2 (to LAMBDA_TOL);
-        the panel goes to B; the final-metric residual is recorded with its label."""
+    def run_(self, mode, slot, **kw):
         cb = self.cb
-        r = cb.run_panel(self.graph, self.params, "H-F", "dev", "actual", "F3", 1)
+        c = cb.quota_cell("H-F", mode, slot)
+        return cb.run_panel(self.graph, self.params, "H-F", "dev", "actual", mode, slot, cell=c,
+                            k=cb.cells_of("H-F", mode, cb.N_DEV)[c].index(slot), **kw)
+
+    def test_feasible_panel_goes_to_B_and_is_verified(self):
+        """F4 slot 0: the panel multiplier lambda puts the noise-free FUNCTIONAL E_Q in the one-sided window
+        [d_Q^2 (1 - LAMBDA_TOL), d_Q^2]; the final-metric check passes too (ok REQUIRED); the panel is B."""
+        cb = self.cb
+        r = self.run_("F4", 0)
         self.assertFalse(r.get("error"), r.get("error"))
-        self.assertEqual((r["status"], r["role"], r["member"]), ("feasible", "B", True))
+        self.assertEqual((r["status"], r["eligible"], r["role"], r["member"]), ("feasible", "B", "B", True))
         bs = r["boundary_solve"]
         self.assertEqual(bs["outcome"], "feasible")
-        self.assertLessEqual(abs(bs["functional"] - 0.01), cb.LAMBDA_TOL * 0.01)
-        self.assertGreater(bs["lambda"], 1.0)                    # (the per-world 0.10 construction was interior)
+        self.assertTrue(-cb.LAMBDA_TOL * cb.D_Q ** 2 <= bs["functional"] - cb.D_Q ** 2 <= 0.0)
         nb, fb = r["membership"]["boundary"], r["boundary_final"]
-        self.assertEqual((nb["quantity"], fb["quantity"], fb["metric"]), ("E_C", "E_C", "final"))
-        self.assertTrue(nb["ok"] and abs(nb["residual"]) <= cb.LAMBDA_TOL)
-        self.assertTrue(math.isfinite(fb["residual"]))
-        self.assertEqual(fb["ok"], abs(fb["residual"]) <= cb.BOUNDARY_TOL)
+        self.assertTrue(nb["ok"] and fb["ok"])
+        self.assertEqual(fb["metric"], "final")
+        self.assertTrue(-cb.BOUNDARY_TOL <= fb["residual"] <= 0.0)
         self.assertTrue(math.isfinite(r["score"]))
+        self.assertIn("full/Q", r["targets"])
 
-    def test_boundary_jump_is_construction_infeasible(self):
-        """F3 slot 0 on four worlds: E_C(lambda) jumps over d_C^2 (a selection switches): CONSTRUCTION-
-        INFEASIBLE, kept in I at the largest lambda below the jump (functional on the null side), counted
-        separately from bounded-mean infeasibility and from numerical failures."""
+    def test_final_metric_failure_is_discarded(self):
+        """#68 round 4 P2-1: F3 slot 1 meets its boundary on the noise-free metric but not under the FINAL
+        metric (residual about -10%): it never enters B (discarded "final-boundary", counted)."""
+        r = self.run_("F3", 1)
+        self.assertEqual((r["eligible"], r["role"], r["discard"]), ("B", "discarded", "final-boundary"))
+        self.assertTrue(r["membership"]["boundary"]["ok"])
+        self.assertFalse(r["boundary_final"]["ok"])
+        self.assertLess(r["boundary_final"]["residual"], -self.cb.BOUNDARY_TOL)
+        self.assertNotIn("score", r)
+        self.assertEqual(self.cb.audit_classes([r])["classes"]["final_boundary"], 1)
+
+    def test_boundary_jump_is_unreached(self):
+        """F3 slot 0 on four worlds: E_C(lambda) jumps over d_C^2 (a selection switches) with the null-side
+        endpoint outside the window, and the registered LAMBDA_GRID holds no other bracket: UNREACHED on the
+        registered search, kept in I at the attained null-side endpoint, the shortfall recorded."""
         cb = self.cb
-        r = cb.run_panel(self.graph, self.params, "H-F", "dev", "actual", "F3", 0)
-        self.assertEqual((r["status"], r["role"], r["member"]), ("construction-infeasible", "I", True))
+        r = self.run_("F3", 0)
+        self.assertEqual((r["status"], r["eligible"], r["role"], r["member"]), ("unreached", "I", "I", True))
         j = [c for c in r["clips"] if c.get("kind") == "jump"]
         self.assertEqual(len(j), 1)
-        self.assertLess(j[0]["nearest"], 0.01)
+        self.assertLess(j[0]["nearest"], 0.01 * (1 - cb.BOUNDARY_TOL))
+        self.assertAlmostEqual(j[0]["shortfall"], 0.01 - j[0]["nearest"])
         self.assertEqual(r["boundary_solve"]["lambda"], j[0]["lambda"])
-        self.assertNotIn("boundary_final", r)                    # (an I panel is not a boundary null)
-        self.assertEqual(cb.q_hat([r, dict(r, panel=1, status="feasible")], 2)["infeasible"], 1)
-        rep_ = cb.report([r])["groups"]["H-F|dev|F3|actual"]
-        self.assertEqual(rep_["boundary_solve"]["outcomes"]["construction-infeasible"], 1)
+        self.assertIn(j[0]["lambda"], [p[0] for p in r["boundary_solve"]["path"]])      # (an evaluated point)
+        self.assertNotIn("boundary_final", r)
+        g = cb.report([r])["groups"]["H-F|dev|F3|actual"]
+        self.assertEqual(g["boundary_solve"]["outcomes"]["unreached"], 1)
 
     def test_boundary_outside_the_range_and_failures(self):
-        """E(lambda) above the boundary at EVERY lambda including 0 (patched functionals): infeasible
-        (below-inf) and, with E_Q above its material threshold, NOT a material null: discarded. A nonfinite
-        functional is a numerical failure."""
+        """E(lambda) above the boundary on the whole registered grid (patched functionals): unreached and,
+        with E_Q above its material threshold, NOT a material null: discarded. A nonfinite functional is a
+        numerical failure."""
         cb = self.cb
         orig = cb.Panel.functionals
         cb.Panel.functionals = lambda self_, final=False: {"E_C": 0.02, "E_Q": 0.01, "R_C": 0.1414, "R_Q": 0.1,
                                                            "M_F": 1.4, "available": True}
         try:
-            r = cb.run_panel(self.graph, self.params, "H-F", "dev", "actual", "F3", 1)
+            r = self.run_("F3", 1)
         finally:
             cb.Panel.functionals = orig
-        self.assertEqual((r["status"], r["member"], r["role"]), ("infeasible", False, "discarded"))
-        self.assertEqual(r["boundary_solve"]["lambda"], 0.0)
-        self.assertEqual([c["kind"] for c in r["clips"] if c["world"] == "panel"], ["below-inf"])
+        self.assertEqual((r["status"], r["member"], r["role"], r["discard"]), ("unreached", False, "discarded", "non-member"))
+        self.assertEqual([c["kind"] for c in r["clips"] if c["world"] == "panel"], ["unreached-below"])
         cb.Panel.functionals = lambda self_, final=False: {"E_C": math.nan, "E_Q": 0.0}
         try:
-            r = cb.run_panel(self.graph, self.params, "H-F", "dev", "actual", "F3", 1)
+            r = self.run_("F3", 1)
         finally:
             cb.Panel.functionals = orig
         self.assertEqual(r["role"], "failed")
@@ -520,125 +562,186 @@ class TestStrata(unittest.TestCase):
             return pl
         cb.plan_world = plan
         try:
-            return cb.run_panel(self.graph, self.params, "H-F", "dev", "actual", mode, 0)
+            return self.run_(mode, 0)
         finally:
             cb.plan_world = orig
 
-    def test_infeasible_panel_goes_to_I_clipped_and_null_checked(self):
-        """A capture RMS of 50 is above the native RMS's supremum (to the limit): clipped to the attainable
-        supremum; F1 (a detection null by construction) keeps it in I and analyses it."""
+    def test_unreached_panel_goes_to_I_clipped_and_null_checked(self):
+        """A capture RMS of 50 is above the maximum attained on the registered search: clipped to it; F1 (a
+        detection null by construction) keeps it in I and analyses it."""
         r = self.with_target("F1", 50.0)
-        self.assertEqual((r["status"], r["role"], r["member"]), ("infeasible", "I", True))
-        self.assertTrue(all(c["kind"] == "above-sup" and c["nearest"] < 50.0 and c["limit"] < 50.0 for c in r["clips"]))
+        self.assertEqual((r["status"], r["role"], r["member"]), ("unreached", "I", True))
+        self.assertTrue(all(c["kind"] == "unreached-above" and c["nearest"] < 50.0 for c in r["clips"]))
         self.assertEqual(len({c["world"] for c in r["clips"]}), len(self.graph))
+        self.assertEqual(r["targets"]["full/C"]["clipped"], len(self.graph))
         self.assertTrue(math.isfinite(r["score"]))
 
-    def test_ht_membership_spans_all_candidates(self):
-        """Clipping one candidate's component can strengthen another: a panel is a null member only if EVERY
-        one of the six candidates has a margin <= BOUNDARY_TOL x its scale."""
+    def test_ht_membership_has_no_scientific_slack(self):
+        """#68 round 4 P2-5: a member iff EVERY one of the six candidates has a margin <= TAU_NUM x its scale
+        (1e-3: the solver accuracy); Codex's +0.025 scaled candidate is a genuine transition (not a member)."""
         cb = self.cb
+        self.assertAlmostEqual(cb.TAU_NUM, 2 * cb.DIR_TOL / cb.stats.DELTA_Q)
         cands = [f"{a}->{f}" for a, f, _ in cb.transition.candidates()]
         ms = {c: {k: -1.0 * cb.MARGIN_SCALE[k] if k == "beta_P[a]" else 1.0 * cb.MARGIN_SCALE[k]
                   for k in cb.MARGIN_NAMES} for c in cands}
         self.assertEqual(cb.ht_membership(ms)[0], True)
-        ms["E2->E3"] = {k: 1.0 * cb.MARGIN_SCALE[k] for k in cb.MARGIN_NAMES}       # (a genuine transition)
+        ms["E2->E3"] = {k: 1.0 * cb.MARGIN_SCALE[k] for k in cb.MARGIN_NAMES}
+        ms["E2->E3"]["EF_Q[f]-dQ2"] = 0.025 * cb.MARGIN_SCALE["EF_Q[f]-dQ2"]          # (Codex: +0.025 scaled)
         ok, cand, val = cb.ht_membership(ms)
         self.assertEqual((ok, cand), (False, "E2->E3"))
-        self.assertAlmostEqual(val, 1.0)
-        ms["E2->E3"]["EF_Q[f]-dQ2"] = 0.5 * cb.BOUNDARY_TOL * cb.MARGIN_SCALE["EF_Q[f]-dQ2"]  # (at the boundary)
+        self.assertAlmostEqual(val, 0.025)
+        ms["E2->E3"]["EF_Q[f]-dQ2"] = 0.5 * cb.TAU_NUM * cb.MARGIN_SCALE["EF_Q[f]-dQ2"]  # (a solver-pinned zero)
         self.assertEqual(cb.ht_membership(ms)[:2], (True, "E2->E3"))
         ms["E1->E2"]["beta_Q[a]"] = math.nan
         with self.assertRaises(cb.CalibError):
             cb.ht_membership(ms)
 
-    def allocation(self, stage, special=None):
-        """Every H-F mode x graph: slot k a B panel at retry 0 (score 0.001 k), unless special(mode, graph)
-        returns that stratum's own records."""
+    def stream(self, stage, m, s_, cell, roles, score=lambda k: 0.001 * k):
+        """One quota cell's ordered stream from a role list ("B", "I", "s" = an I-eligible surplus, "n" = a
+        non-member, "f" = a B-eligible final-boundary failure)."""
         cb = self.cb
         n = {"dev": cb.N_DEV, "val": cb.N_VAL}[stage]
         out = []
+        for k, ro in enumerate(roles):
+            panel, st = cb.proposal_of("H-F", m, n, cell, k)
+            kw = {"cell": cell, "k": k, "stream": st, "score": score(k)}
+            if ro == "I":
+                kw.update(role="I", eligible="I", status="unreached", score=5.0)
+            elif ro == "s":
+                kw.update(role="discarded", eligible="I", status="unreached", discard="surplus")
+            elif ro == "n":
+                kw.update(role="discarded", eligible=None, status="feasible", member=False, discard="non-member")
+            elif ro == "f":
+                kw.update(role="discarded", eligible="B", status="feasible", discard="final-boundary")
+            out.append(rec("H-F", stage, m, s_, panel, self.man, **kw))
+        return out
+
+    def allocation(self, stage, special=None, score=None):
+        cb = self.cb
+        n = {"dev": cb.N_DEV, "val": cb.N_VAL}[stage]
+        sc = score or ((lambda k: 0.001 * k) if stage == "dev" else (lambda k: 0.0))
+        out = []
         for m, s_ in cb.strata_of("H-F"):
             got = special(m, s_, n) if special else None
-            out.extend(got if got is not None else [rec("H-F", stage, m, s_, k, self.man, score=0.001 * k) for k in range(n)])
+            out.extend(got if got is not None else [rec("H-F", stage, m, s_, k, self.man, score=sc(k)) for k in range(n)])
         return out
 
     def test_crit_is_the_maximum_over_strata(self):
-        """F1 actual: 40 infeasible slots in round 0 (I), retried in round 1 (q-hat x K >= N_MIN: every slot,
-        80 more infeasible), round 2 every slot again (all surplus). I = 120 >= 99: calibrated; its scores
-        (5.0) set c_F, never pooled into B."""
+        """F1 actual, each level cell (n_c = 80): an audit of 60 B then 20 I (I-eligible fraction 0.25 x K 480 =
+        120 >= 99: I collection), then the stream continues to 80 B and 80 I (k = 159, the registered stopping
+        point). I = 160 >= 99: calibrated; its scores (5.0) set c_F, never pooled into B."""
         cb = self.cb
 
         def special(m, s_, n):
             if (m, s_) != ("F1", "actual"):
                 return None
-            out = []
-            for k in range(n):
-                if k < 120:
-                    out.append(rec("H-F", "dev", m, s_, k, self.man, score=0.001 * k))
-                else:
-                    out.append(rec("H-F", "dev", m, s_, k, self.man, score=5.0, role="I", status="infeasible"))
-            for k in range(n):
-                if k >= 120:
-                    out.append(rec("H-F", "dev", m, s_, k, self.man, score=0.001 * k, retry=1))
-                elif k < 80:
-                    out.append(rec("H-F", "dev", m, s_, k, self.man, score=5.0, retry=1, role="I", status="infeasible"))
-                else:
-                    out.append(rec("H-F", "dev", m, s_, k, self.man, retry=1, role="discarded", surplus=True))
-            out.extend(rec("H-F", "dev", m, s_, k, self.man, retry=2, role="discarded", surplus=True) for k in range(n))
-            return out
+            return [r for c in ("lvl0", "lvl1") for r in self.stream("dev", m, s_, c, ["B"] * 60 + ["I"] * 20 + ["B"] * 20 + ["I"] * 60)]
         recs = self.allocation("dev", special)
         crit = cb.critical_values(recs)
-        self.assertEqual(crit["strata"]["H-F|F1|actual|I"]["n"], 120)
+        self.assertEqual(crit["strata"]["H-F|F1|actual|I"]["n"], 160)
         self.assertEqual(crit["strata"]["H-F|F1|actual|I"]["score"], 5.0)
-        self.assertAlmostEqual(crit["strata"]["H-F|F1|actual|B"]["score"], 0.159)
         self.assertEqual(crit["c_F"], 5.0)
-        self.assertTrue(crit["proposals"]["H-F|F1|actual"]["I_calibrated"])
-        self.assertAlmostEqual(crit["proposals"]["H-F|F1|actual"]["q"]["q_hat"], 120 / 480)
-        # the registered rounds are enforced: a missing round-2 proposal, or a dropped infeasible member
+        self.assertEqual(crit["strata_set"]["H-F|F1|actual"], ["B", "I"])
+        pr = crit["proposals"]["H-F|F1|actual"]
+        self.assertTrue(pr["I_calibrated"] and pr["collect_I"])
+        self.assertAlmostEqual(pr["audit"]["q_I"]["q_hat"], 40 / 160)
+        # the registered stream is enforced: a gap, a stop before the stopping point, a surplus before full
         with self.assertRaises(cb.CalibError):
-            cb.critical_values([r for r in recs if not (r["mode"] == "F1" and r["retry"] == 2 and r["panel"] == 7)])
+            cb.critical_values([r for r in recs if not (r["mode"] == "F1" and r.get("cell") == "lvl0" and r["k"] == 100)])
         with self.assertRaises(cb.CalibError):
-            cb.critical_values([dict(r, role="discarded") if (r["mode"] == "F1" and r["retry"] == 1 and r["panel"] == 3)
-                                else r for r in recs])
+            cb.critical_values([r for r in recs if not (r["mode"] == "F1" and r.get("cell") == "lvl1" and r["k"] >= 150)])
+        bad = [dict(r, role="discarded", discard="surplus") if (r["mode"] == "F1" and r.get("cell") == "lvl0" and r["k"] == 85)
+               else r for r in recs]
+        with self.assertRaises(cb.CalibError):
+            cb.critical_values(bad)
 
     def test_cap_exhaustion_makes_the_mode_unavailable(self):
-        """F2 actual slot 5 is infeasible at every one of its ROUNDS proposals: no B panel, the mode capped,
-        every decision needing F2 unavailable (None, never a non-rejection); I = 3 < N_MIN: scoped."""
+        """F2 actual, cell lvl1: 79 B in its audit and none after, the stream run to its cap K_c = 240 (the I
+        surplus once I is full): CAPPED, every decision needing F2 unavailable (None, never a non-rejection);
+        I = 80 < 99: not calibrated."""
         cb = self.cb
 
         def special(m, s_, n):
             if (m, s_) != ("F2", "actual"):
                 return None
-            out = [rec("H-F", "dev", m, s_, k, self.man, score=0.001 * k) for k in range(n) if k != 5]
-            out += [rec("H-F", "dev", m, s_, 5, self.man, retry=r, role="I", status="infeasible") for r in range(cb.ROUNDS)]
-            return out
+            return (self.stream("dev", m, s_, "lvl0", ["B"] * 80)
+                    + self.stream("dev", m, s_, "lvl1", ["B"] * 79 + ["I"] + ["I"] * 79 + ["s"] * 81))
         crit = cb.critical_values(self.allocation("dev", special))
         self.assertIn("H-F|F2|actual", crit["unavailable"])
+        self.assertEqual(crit["proposals"]["H-F|F2|actual"]["capped"], ["lvl1"])
         self.assertEqual((crit["c_F"], crit["c_M"]), (None, None))
         self.assertTrue(all(v is None for v in crit["c_E"].values()))
-        self.assertFalse(crit["proposals"]["H-F|F2|actual"]["I_calibrated"])
         acc = cb.acceptance(self.allocation("val"), crit)
         self.assertFalse(acc["pass"]["H-F detection"] or acc["pass"]["H-F material"])
         with self.assertRaises(cb.CalibError):
             cb.freeze_gates(crit, acc)
-        # a slot retried fewer than ROUNDS times is incomplete, not capped
-        def short(m, s_, n):
+
+        def short(m, s_, n):                                                  # (a stream stopped short of its cap)
             got = special(m, s_, n)
-            return None if got is None else [r for r in got if r["retry"] < 2]
+            return None if got is None else [r for r in got if not (r.get("cell") == "lvl1" and r["k"] >= 200)]
         with self.assertRaises(cb.CalibError):
             cb.critical_values(self.allocation("dev", short))
 
-    def test_round_plan(self):
+    def test_stratum_set_is_frozen_at_dev(self):
+        """#68 round 4 P2-7: an I not calibrated at dev is never rated at validation (the scope limitation,
+        with the audit's uncovered classes, carries through); an I calibrated at dev but short at validation
+        fails its decisions ("unvalidated")."""
         cb = self.cb
-        n = 10
-        r0 = [{"panel": k, "retry": 0, "role": "B" if k != 3 else "I", "status": "feasible" if k != 3 else "infeasible"}
-              for k in range(n)]
-        self.assertEqual(cb.round_plan(r0, n, "dev", 1), [3])                # (q-hat 0.1 x K 30 = 3 < 99)
-        big = [{"panel": k, "retry": 0, "role": "I" if k < 40 else "B", "status": "infeasible" if k < 40 else "feasible"}
-               for k in range(160)]
-        self.assertEqual(cb.round_plan(big, 160, "dev", 1), list(range(160)))  # (I collection: 0.25 x 480 = 120 >= 99)
-        self.assertEqual(cb.round_plan(big, 160, "val", 1), list(range(40)))   # (120 < 149: only the slots without B)
+        crit = cb.critical_values(self.allocation("dev"))
+        self.assertEqual(crit["strata_set"]["H-F|F3|actual"], ["B"])
 
+        def val_I(m, s_, n):                                               # (F3 val: 500 audit I, I collection)
+            if (m, s_) != ("F3", "actual"):
+                return None
+            return self.stream("val", m, s_, "all", ["B"] * 500 + ["I"] * 500 + ["B"] * 500 + ["I"] * 500,
+                               score=lambda k: 0.0)
+        acc = cb.acceptance(self.allocation("val", val_I), crit)
+        self.assertNotIn("material|F3|actual|I", acc["rates"]["H-F"])
+        sc = acc["scope"]["H-F|F3|actual"]
+        self.assertEqual((sc["uncovered_null_classes"]["I_eligible"], sc["audit_n"]), (500, 1000))
+        self.assertGreater(sc["q_uncovered_U"], 0.5)
+        self.assertIn("material", sc["bounds"])
+
+        def dev_I(m, s_, n):
+            if (m, s_) != ("F3", "actual"):
+                return None
+            return self.stream("dev", m, s_, "all", ["B"] * 100 + ["I"] * 60 + ["B"] * 60 + ["I"] * 100)
+        crit2 = cb.critical_values(self.allocation("dev", dev_I))
+        self.assertEqual(crit2["strata_set"]["H-F|F3|actual"], ["B", "I"])
+        acc2 = cb.acceptance(self.allocation("val"), crit2)
+        self.assertIn("H-F|F3|actual", acc2["unvalidated"])
+        self.assertFalse(acc2["pass"]["H-F material"])
+        self.assertTrue(acc2["pass"]["H-F detection"])                    # (F3 is not a detection mode)
+        with self.assertRaises(cb.CalibError):
+            cb.acceptance(self.allocation("val"), {k: v for k, v in crit.items() if k != "strata_set"})
+
+    def test_cell_stop_and_quota_cells(self):
+        cb = self.cb
+        self.assertEqual(sorted(cb.cells_of("H-F", "F1", 160)), ["lvl0", "lvl1"])
+        self.assertEqual(len(cb.cells_of("H-T", "T4", 160)), 96)
+        self.assertEqual(cb.proposal_of("H-F", "F1", 160, "lvl1", 3), (7, None))
+        self.assertEqual(cb.proposal_of("H-F", "F1", 160, "lvl1", 80), (1, "lvl1/80"))
+        with self.assertRaises(cb.CalibError):
+            cb.proposal_of("H-F", "F1", 160, "lvl1", 240)
+        cx = [{"k": k, "role": r} for k, r in enumerate(["B", "I", "B", "B"])]
+        self.assertEqual(cb.cell_stop(cx, 3, False), 3)
+        self.assertIsNone(cb.cell_stop(cx, 3, True))
+
+    def test_cpu_ledger(self):
+        import tempfile
+        cb = self.cb
+        d = tempfile.mkdtemp()
+        try:
+            p = os.path.join(d, "cpu.jsonl")
+            cb.ledger_add(p, {"kind": "panels", "cpu_s": 3600.0})
+            cb.ledger_add(p, {"kind": "fitting", "cpu_s": 7200.0})
+            t = cb.ledger_total([p])
+            self.assertAlmostEqual(t["cpu_h"], 3.0)
+            self.assertAlmostEqual(t["remaining_h"], cb.stats.CPU_CEILING_H - 3.0)
+            self.assertEqual(t["by_kind_h"], {"fitting": 2.0, "panels": 1.0})
+        finally:
+            import shutil
+            shutil.rmtree(d)
 
 
 def direct_cov(pn, wg, m, kind):
