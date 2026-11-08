@@ -60,7 +60,10 @@ is a documented synthetic stand-in ("fitted": false) for the tests and the bench
   linearly on logit(mu) over SMOOTH_W = 0.8 logit units centred on each bin edge (SMOOTH_W = 0 is exactly
   the bins); the validation-stress capture floor (0.80 / 0.35 at 0.35) is blended alike. The generator's
   location a(mu; s) interpolates linearly between tables on the registered s grid (S_STEP = 0.005), each
-  grid cell's interpolation verified once at its midpoint (|E[K/N] - mu| <= LOC_S_TOL).
+  grid cell's interpolation verified once at its midpoint (|E[K/N] - mu| <= LOC_S_TOL). The grid tables
+  depend on (s, N) only: they are built once per process, or once per code identity with the on-disk cache
+  (TABLE_CACHE: --table-cache / RQ_TABLE_CACHE, shared by shard processes; `calib.py tables` pre-builds
+  every cell a parameter set can reach). A cached entry is bitwise the built one (content-hashed).
 
 FEASIBILITY AND STRATA (the D2 ruling, 2026-11-08; Codex round 4). Three classes. UNREACHED ON THE
 REGISTERED SEARCH: the target is not reached by the registered deterministic search (AMP_GRID on [0, A_SUP],
@@ -561,49 +564,147 @@ def expected_fraction(a, s, N):
     return res / N
 
 
-def location_table(s, N):
+def _build_table(s, N):
     """a on a uniform grid and E[K/N](a) (exact), over the range where the expectation leaves (1e-12,
     1 - 1e-12); the linear interpolation's error is VERIFIED at every grid midpoint (<= LOC_TOL)."""
+    lo, hi = float(logit(0.5 / N)) - 9.0 * s - 2.0, float(logit(1 - 0.5 / N)) + 9.0 * s + 2.0
+    a = np.arange(lo, hi + LOC_STEP, LOC_STEP)
+    f = expected_fraction(a, s, N)
+    if np.any(np.diff(f) < 0):
+        raise CalibError(f"the rounded-count expectation is not monotone (s {s}, N {N})")
+    fm = expected_fraction((a[1:] + a[:-1]) / 2, s, N)
+    err = float(np.max(np.abs(fm - (f[1:] + f[:-1]) / 2)))
+    if err > LOC_TOL:
+        raise CalibError(f"the location table's interpolation error {err:.2e} exceeds {LOC_TOL} (s {s}, N {N})")
+    return a, f, err
+
+
+def location_table(s, N):
+    """The verified location table at any s (in-memory cache; the generator itself uses grid_table)."""
     key = (float(s), int(N))
     if key not in _LOC:
-        lo, hi = float(logit(0.5 / N)) - 9.0 * s - 2.0, float(logit(1 - 0.5 / N)) + 9.0 * s + 2.0
-        a = np.arange(lo, hi + LOC_STEP, LOC_STEP)
-        f = expected_fraction(a, s, N)
-        if np.any(np.diff(f) < 0):
-            raise CalibError(f"the rounded-count expectation is not monotone (s {s}, N {N})")
-        fm = expected_fraction((a[1:] + a[:-1]) / 2, s, N)
-        err = float(np.max(np.abs(fm - (f[1:] + f[:-1]) / 2)))
-        if err > LOC_TOL:
-            raise CalibError(f"the location table's interpolation error {err:.2e} exceeds {LOC_TOL} (s {s}, N {N})")
-        _LOC[key] = (a, f, err)
+        _LOC[key] = _build_table(s, N)
     return _LOC[key]
 
 
-def _location_at(mu, sv, N):
-    a, f, _ = location_table(sv, N)
+# ---- D4: the s-grid tables, built ONCE: in memory per process, and on disk (TABLE_CACHE) per code identity
+TABLE_CACHE = os.environ.get("RQ_TABLE_CACHE") or None
+_GRID, _SCELL, _IDENT = {}, {}, []
+
+
+def tables_identity():
+    """The grid tables' identity: the registered grid constants and the source of the code computing them; a
+    cached entry is reused only under the same identity."""
+    if not _IDENT:
+        import inspect
+        src = "".join(inspect.getsource(f) for f in (logit, erfc, expected_fraction, _build_table, _cell_error))
+        _IDENT.append(hashlib.sha256(json.dumps([LOC_STEP, LOC_TOL, S_STEP, LOC_S_TOL, src]).encode()).hexdigest()[:20])
+    return _IDENT[0]
+
+
+def _arrays_sha(d):
+    h = hashlib.sha256()
+    for n in sorted(d):
+        x = np.ascontiguousarray(d[n])
+        h.update(f"{n}|{x.dtype.str}|{x.shape}|".encode())
+        h.update(x.tobytes())
+    return h.hexdigest()
+
+
+def _disk(kind, k, N, arrays=None):
+    """Read (arrays None) or write one cached grid entry (None without a cache or an entry). Writes are atomic
+    (a temporary file renamed), so concurrent shard processes are safe; a damaged entry is a CalibError, never
+    silently rebuilt."""
+    if not TABLE_CACHE:
+        return None
+    path = os.path.join(TABLE_CACHE, f"{kind}-{tables_identity()}-N{int(N)}-k{int(k)}.npz")
+    if arrays is None:
+        if not os.path.isfile(path):
+            return None
+        try:
+            with np.load(path, allow_pickle=False) as z:
+                d = {n: z[n] for n in z.files}
+        except Exception as e:
+            raise CalibError(f"table cache {path}: unreadable ({type(e).__name__})")
+        sha = str(d.pop("sha256", ""))
+        if sha != _arrays_sha(d):
+            raise CalibError(f"table cache {path}: content hash mismatch")
+        return d
+    os.makedirs(TABLE_CACHE, exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "wb") as f:
+        np.savez(f, sha256=np.array(_arrays_sha(arrays)), **arrays)
+    os.replace(tmp, path)
+    return arrays
+
+
+def grid_table(k, N):
+    """The verified location table at s = k S_STEP: from memory, else the disk cache, else built (and stored)."""
+    key = (int(k), int(N))
+    if key not in _GRID:
+        d = _disk("loc", k, N)
+        if d is None:
+            a, f, err = _build_table(k * S_STEP, N)
+            d = {"a": a, "f": f, "err": np.array(err)}
+            _disk("loc", k, N, d)
+        _GRID[key] = (d["a"], d["f"], float(d["err"]))
+    return _GRID[key]
+
+
+def _location_grid(mu, k, N):
+    a, f, _ = grid_table(k, N)
     if np.any(mu <= f[0]) or np.any(mu >= f[-1]) or not np.all(np.isfinite(mu)):
         raise CalibError(f"an intended mean outside ({f[0]:.3g}, {1 - f[-1]:.3g} from 1): the bounded model "
                          "cannot attain it")
     return np.interp(mu, f, a)
 
 
-_SCELL = {}
+def _cell_error(k, N):
+    """D4: the error of the linear interpolation in s between the grid tables k and k + 1, at the cell's
+    midpoint s, over the interior expected fractions there of every 7th location of table k's grid."""
+    sm = (k + 0.5) * S_STEP
+    mu = expected_fraction(grid_table(k, N)[0][::7], sm, N)
+    mu = mu[(mu > 1e-9) & (mu < 1 - 1e-9)]
+    if not len(mu):
+        return 0.0
+    a = 0.5 * (_location_grid(mu, k, N) + _location_grid(mu, k + 1, N))
+    return float(np.max(np.abs(expected_fraction(a, sm, N) - mu)))
 
 
 def _verify_s_cell(k, N):
-    """D4: the linear interpolation in s between the grid tables k S_STEP and (k + 1) S_STEP, verified once at
-    the cell's midpoint over the midpoint table's interior means (|E[K/N] - mu| <= LOC_S_TOL)."""
+    """The grid cell [k, k + 1] S_STEP verified once (|E[K/N] - mu| <= LOC_S_TOL; memory, then the disk cache)."""
     key = (int(k), int(N))
     if key not in _SCELL:
-        sm = (k + 0.5) * S_STEP
-        _, f, _ = location_table(sm, N)
-        mu = f[(f > 1e-9) & (f < 1 - 1e-9)][::7]
-        a = 0.5 * (_location_at(mu, k * S_STEP, N) + _location_at(mu, (k + 1) * S_STEP, N))
-        err = float(np.max(np.abs(expected_fraction(a, sm, N) - mu))) if len(mu) else 0.0
+        d = _disk("cell", k, N)
+        err = float(d["err"]) if d is not None else _cell_error(k, N)
         if err > LOC_S_TOL:
-            raise CalibError(f"the s-grid interpolation error {err:.2e} exceeds {LOC_S_TOL} (s {sm:.4f}, N {N})")
+            raise CalibError(f"the s-grid interpolation error {err:.2e} exceeds {LOC_S_TOL} "
+                             f"(s {(k + 0.5) * S_STEP:.4f}, N {N})")
+        if d is None:
+            _disk("cell", k, N, {"err": np.array(err)})
         _SCELL[key] = err
     return _SCELL[key]
+
+
+def warm_tables(p, extras=(1.0, 1.5)):
+    """Build (and, with TABLE_CACHE, store) every grid table and cell the parameter set can reach: each
+    channel's s(mu) over (0, 1), unstressed and under validation stress, at the registered noise extras.
+    -> {N: [k_lo, k_hi]} (the cells verified)."""
+    mu = sig(np.linspace(-16.0, 16.0, 4001))
+    spans = {}
+    for ch, N in (("C", int(p["capture_bound"])), ("S", TRIALS), ("F", TRIALS)):
+        for stress in (False, True):
+            for extra in extras:
+                s = noise_scale(p, ch, mu, stress, extra)
+                lo, hi = spans.get(N, (math.inf, -math.inf))
+                spans[N] = (min(lo, float(np.min(s))), max(hi, float(np.max(s))))
+    out = {}
+    for N, (lo, hi) in sorted(spans.items()):
+        k0, k1 = int(math.floor(lo / S_STEP + 1e-9)), int(math.floor(hi / S_STEP + 1e-9))
+        for k in range(k0, k1 + 1):
+            _verify_s_cell(k, N)
+        out[N] = [k0, k1]
+    return out
 
 
 def location(mu, s, N):
@@ -619,12 +720,12 @@ def location(mu, s, N):
         m = k == kk
         x = mu[m]
         on = np.abs(t[m]) <= 1e-9
-        a_lo = _location_at(x, kk * S_STEP, N)
+        a_lo = _location_grid(x, kk, N)
         if on.all():
             out[m] = a_lo
             continue
         _verify_s_cell(kk, N)
-        a_hi = _location_at(x, (kk + 1) * S_STEP, N)
+        a_hi = _location_grid(x, kk + 1, N)
         out[m] = np.where(on, a_lo, (1 - t[m]) * a_lo + t[m] * a_hi)
     return out
 
@@ -2791,6 +2892,8 @@ def main(argv=None):
                            "proposal is kept)")
             s.add_argument("--out", required=True)
         s.add_argument("--ledger", help="append this run's CPU to the cumulative ledger (JSONL)")
+        s.add_argument("--table-cache", help="the on-disk location-table cache shared by shard processes "
+                       "(default: $RQ_TABLE_CACHE; none: built per process)")
         if name == "bench":
             s.add_argument("--panels", type=int, default=50)
             s.add_argument("--out")
@@ -2800,6 +2903,10 @@ def main(argv=None):
             s.add_argument("--crit", required=True)
         s.add_argument("--smoke", action="store_true")
         s.add_argument("files", nargs="+")
+    s = sub.add_parser("tables", help="pre-build the location tables a parameter set can reach (once per "
+                       "code identity) into --table-cache")
+    s.add_argument("--params")
+    s.add_argument("--table-cache", required=True)
     s = sub.add_parser("gates")
     s.add_argument("--crit", required=True)
     s.add_argument("--accept", required=True)
@@ -2812,7 +2919,15 @@ def main(argv=None):
     s.add_argument("--add", nargs=2, metavar=("KIND", "CPU_S"), help="append an entry (e.g. fitting 3600) to the "
                    "first file first")
     a = ap.parse_args(argv)
+    global TABLE_CACHE
+    if getattr(a, "table_cache", None):
+        TABLE_CACHE = os.path.abspath(a.table_cache)
     try:
+        if a.cmd == "tables":
+            c0 = time.process_time()
+            span = warm_tables(get_params(a))
+            print(json.dumps({"identity": tables_identity(), "cells": span, "cpu_s": round(time.process_time() - c0, 1)}))
+            return 0
         if a.cmd in ("panels", "bench"):
             graph, src = get_graph(a)
             params = get_params(a)

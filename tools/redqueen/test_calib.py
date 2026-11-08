@@ -175,6 +175,64 @@ class TestGenerator(unittest.TestCase):
             with self.assertRaises(cb.CalibError):
                 cb.location(np.array([bad]), np.array([0.3]), 600)
 
+    def test_d4_grid_table_cache(self):
+        """The D4 warm-up fix: the grid tables and cell checks are built once and, with TABLE_CACHE, stored and
+        reloaded BITWISE (no rebuild: expected_fraction is never called on a warm cache); a damaged entry is a
+        CalibError; warm_tables covers the parameter set's whole s range."""
+        import tempfile
+        cb = self.cb
+        mus = np.array([0.003, 0.2, 0.5, 0.9])
+        ss = np.array([0.2125, 0.31, 0.3125, 0.4])
+        saved = (cb.TABLE_CACHE, dict(cb._GRID), dict(cb._SCELL))
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                cb.TABLE_CACHE = d
+                cb._GRID.clear()
+                cb._SCELL.clear()
+                a1 = cb.location(mus, ss, 600)
+                files = sorted(os.listdir(d))
+                self.assertTrue(any(f.startswith("loc-") for f in files) and any(f.startswith("cell-") for f in files))
+                cb._GRID.clear()
+                cb._SCELL.clear()
+                ef = cb.expected_fraction
+                cb.expected_fraction = None                      # (a rebuild would crash)
+                try:
+                    a2 = cb.location(mus, ss, 600)
+                finally:
+                    cb.expected_fraction = ef
+                self.assertEqual(a1.tobytes(), a2.tobytes())
+                cb.TABLE_CACHE = None
+                cb._GRID.clear()
+                cb._SCELL.clear()
+                self.assertEqual(cb.location(mus, ss, 600).tobytes(), a1.tobytes())   # (no cache: the same bits)
+                cb.TABLE_CACHE = d
+                cb._GRID.clear()
+                bad = os.path.join(d, next(f for f in files if f.startswith("loc-")))
+                with np.load(bad) as z:
+                    arrs = {n: z[n] for n in z.files}
+                arrs["f"] = arrs["f"] + 1e-15
+                with open(bad, "wb") as f:
+                    np.savez(f, **arrs)
+                with self.assertRaises(cb.CalibError):
+                    cb.location(mus, ss, 600)
+            cb._GRID.clear()
+            cb._SCELL.clear()
+            cb.TABLE_CACHE = None
+            ns = cb.noise_scale                                  # (a narrow s range: a fast test)
+            cb.noise_scale = lambda p, ch, mu, stress=False, extra=1.0: np.where(mu < 0.5, 0.2, 0.2 + 0.006 * extra)
+            try:
+                span = cb.warm_tables(cb.placeholder_params())
+            finally:
+                cb.noise_scale = ns
+            self.assertEqual(span, {int(cb.placeholder_params()["capture_bound"]): [40, 41], cb.TRIALS: [40, 41]})
+            self.assertTrue(all((k, N) in cb._SCELL for N in span for k in (40, 41)))
+        finally:
+            cb.TABLE_CACHE = saved[0]
+            cb._GRID.clear()
+            cb._GRID.update(saved[1])
+            cb._SCELL.clear()
+            cb._SCELL.update(saved[2])
+
     def test_ou_red_variation(self):
         """Codex's counterexample rho = (0, .98) is refused, and so is rho = (.05, .98) with innovations
         correlated .95 (no PSD diffusion); valid parameters give PSD transition covariances at every gap."""
