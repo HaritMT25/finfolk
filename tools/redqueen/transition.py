@@ -3,9 +3,9 @@
 part 4), with the user's decision 3 (2026-11-07): FSD dominance also requires directional equivalence;
 material directional + material recurrent structure is "mixed". numpy; deterministic.
 
-EPOCHS E1 = [F1, 50], E2 = [75, 125], E3 = [150, 200] M; the epoch period set {4..20, 25} M; the same
-qualifying worlds in every epoch. Per epoch e (recurrence.py on the epoch's own designs, the
-phase-conditional rule 6 at the fitted phase included):
+EPOCHS E1 = [F1, 50], E2 = [75, 125], E3 = [150, 200] M; the epoch period set recurrence.EPOCH_PERIODS
+({4..20} M; 25M dropped provisionally); the same qualifying worlds in every epoch. Per epoch e
+(recurrence.py on the epoch's own designs, the phase-conditional rule 6 at the fitted phase included):
   S_e, the reversal-gated selected energies E^F_{C,e}, E^F_{Q,e} (H.3.4-H.3.6);
   the UNGATED, conservatively searched energies E^U_{h,e} = (1/n) sum_w max_P r_hw,e(P)^2 (no
     reversal, return, reciprocal or material gate); every candidate of every world must be supported,

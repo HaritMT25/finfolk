@@ -17,7 +17,8 @@ Frisch-Waugh-Lovell (exact): q = H'W M_X y, S = H'W M_X H, a = S^-1 q (the joint
 coefficients), J = (RSS_0 - RSS_1) / 2 = q'S^-1 q / 2 (dimensionless), the post-refit recurrent
 component Delta = M_X H a (= full refit minus nuisance-only fit).
 
-PERIODS AND SUPPORT (H.3.3). Full history {4..20} U {25..100 by 5} M (33); an epoch {4..20, 25} M (18).
+PERIODS AND SUPPORT (H.3.3). Full history {4..20} U {25..100 by 5} M (33); an epoch {4..20} M (17: the
+25M candidate is dropped PROVISIONALLY, see EPOCH_PERIODS).
 A candidate is supported for a world only when ALL SIX rules hold, for both readouts:
   1 both guilds' within-world source-time spans >= 2P (one engine step, 1e-6 M, of tolerance, here and
     in rule 2's span only);
@@ -30,11 +31,11 @@ A candidate is supported for a world only when ALL SIX rules hold, for both read
     QR factor; the fit then works in that orthonormal basis, never inverting H'W M_X H);
   6 PHASE-CONDITIONAL (the coordinator's pre-seal decision, 2026-11-07): the five-window chain of H.3.5
     can be constructed AT THE FITTED PHASE of each readout's reference panel. A candidate whose chain
-    exists only for some phases (the full-history 90-100M and the epoch 25M candidates on the real
-    graph) is supported exactly when its fitted phase admits the chain. The SAME rule, in this same
-    code, decides support inside every calibration null panel (calib.py calls analyze_world), and every
-    result reports, per world, how many candidates were phase-conditional and how many of those the
-    fitted phase supported (phase_support).
+    exists only for some phases (the full-history 90-100M candidates on the real graph; the epoch
+    25M candidate, dropped) is supported exactly when its fitted phase admits the chain. The SAME
+    rule, in this same code, decides support inside every calibration null panel (calib.py calls
+    analyze_world), and every result reports, per world, how many candidates were phase-conditional
+    and how many of those the fitted phase supported (phase_support).
 Also unsupported: a zero capture denominator (H.3.6). An unsupported candidate is excluded from that
 world's search, never shortened or interpolated; a world without any supported candidate makes the
 decision unavailable.
@@ -75,7 +76,14 @@ import numpy as np  # noqa: E402
 import backbone  # noqa: E402
 
 FULL_PERIODS = tuple(float(p) for p in list(range(4, 21)) + list(range(25, 101, 5)))
-EPOCH_PERIODS = tuple(float(p) for p in list(range(4, 21)) + [25])
+# The epoch candidate periods (H.3.3). P = 25M (two cycles in a 50M epoch) is the only epoch period whose
+# five-window chain is phase-conditional (rule 6); on the real g4 graph its fitted phase fails the chain in
+# 27-32 of the 32 worlds in every epoch, which made E^U = +inf in every epoch and H-T unreachable. PROVISIONAL
+# (the coordinator, 2026-11-08, pending Codex): dropped from BOTH sides of the epoch analysis (S_e and the
+# epoch gates, E^F, E^U, the H-T generator's period grid), so nothing detectable in an epoch is uncertifiable:
+# within-epoch recurrence is claimed at periods <= 20M; slower recurrence is H-F's (full history, to 100M).
+# Restoring it is this one line: + [25].
+EPOCH_PERIODS = tuple(float(p) for p in range(4, 21))
 SCOPES = {"full": (0.0, 200.0), "E1": (0.0, 50.0), "E2": (75.0, 125.0), "E3": (150.0, 200.0)}
 PERIODS = {"full": FULL_PERIODS, "E1": EPOCH_PERIODS, "E2": EPOCH_PERIODS, "E3": EPOCH_PERIODS}
 SPAN_TOL = 1e-6          # one engine step: the two-cycle span comparisons only
