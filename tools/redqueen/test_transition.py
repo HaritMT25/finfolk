@@ -295,6 +295,31 @@ class TestTransition(unittest.TestCase):
         with self.assertRaises(tr.TransitionError):
             tr.world_epoch(wd, y, {"C": Lc * 1e10}, xi)
 
+    def test_window_arithmetic_is_checked(self):
+        """#68 round 3 P2: FINITE residuals whose cumulative sums overflow, window means / contrasts that
+        overflow, ranges and squared components that overflow, and capture energies that overflow are
+        numerical failures before any comparison; a capture denominator <= 0 stays the registered +inf."""
+        tr = self.tr
+        with self.assertRaises(tr.TransitionError):
+            tr.cumulative(np.full((4, 3), 1e308), "w")                 # (finite inputs, an overflowing cumsum)
+        cs = np.array([[0.0], [-1e308], [1e308], [0.0], [1.0], [2.0], [3.0]])
+        lo = np.array([[0, 1, 2, 3, 4]])
+        hi = np.array([[1, 2, 3, 4, 5]])
+        with self.assertRaises(tr.TransitionError):
+            tr.windows(cs, lo, hi, np.array([0]), np.array([1.0]), "w")  # (inf - (-inf) -> a nonfinite window)
+        ok = np.cumsum(np.vstack([np.zeros((1, 1)), np.ones((6, 1))]), axis=0)
+        rev, ret = tr.windows(ok, lo, hi, np.array([0]), np.array([1.0]), "w")
+        self.assertEqual(rev.shape, (1,))
+        with self.assertRaises(tr.TransitionError):
+            tr.energy(np.array([[1e308], [-1e308]]), np.array([1.0]), "Q", "w")   # (the range overflows)
+        with self.assertRaises(tr.TransitionError):
+            tr.energy(np.array([[1e200], [1e200]]), np.array([1.0]), "Q", "w")   # (the squares overflow)
+        with self.assertRaises(tr.TransitionError):
+            tr.energy(np.array([[0.1], [-0.1]]), np.array([1e-200]), "C", "w")   # (the ratio overflows)
+        r2, _ = tr.energy(np.array([[0.1, 0.1], [-0.1, -0.1]]), np.array([0.0, 2.0]), "C", "w")
+        self.assertEqual(r2[0], math.inf)                                         # (the registered +inf)
+        self.assertAlmostEqual(r2[1], 0.01 / 4)
+
     def test_mixed_needs_affirmative_evidence(self):
         """#68 review 8: material recurrence with directional bounds spanning the band is UNRESOLVED, not
         mixed; bounds without a passed gate are unresolved; mixed needs both affirmatively."""

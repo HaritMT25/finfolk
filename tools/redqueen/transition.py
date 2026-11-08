@@ -42,7 +42,11 @@ with directional bounds spanning the band, or bounds without a passed gate, is "
 IDENTITIES. Worlds are paired across epochs BY ID: every epoch holds the same unique world ids
 (WorldDesign.id), the slopes and the reference-source loadings are keyed by id; all are put in one
 canonical (sorted) order before the paired draws. A NaN draw or margin is a numerical failure: the
-analysis is unavailable with its error, never a non-exceedance.
+analysis is unavailable with its error, never a non-exceedance; ht() marks it failure = "numerical"
+(a calibration panel with one is a FAILED panel, repaired and rerun: never a non-rejection), apart from
+the registered unavailability (a gate without a frozen calibration, failure None). Every window
+intermediate (cumulative sums, window means, contrasts, ranges, energies) is checked finite before it
+is compared: overflow is a failure, distinct from the registered +inf energies.
 """
 from __future__ import annotations
 
@@ -121,6 +125,73 @@ def draw_streams(analysis, n, k, draws):
 
 
 # ================================================================== per-world epoch quantities
+def _bad(x, where, what, B):
+    """TransitionError on any nonfinite entry of x (last axis: the B draws)."""
+    bad = ~np.isfinite(np.asarray(x, float))
+    if bad.any():
+        cols_ = np.flatnonzero(bad.reshape(-1, B).any(axis=0))
+        raise TransitionError(f"{where}: a nonfinite {what} in {len(cols_)} draw(s), first {int(cols_[0])}")
+    return x
+
+
+def cumulative(rho, where):
+    """The per-draw cumulative sums of the window residuals (rows: chain positions, columns: draws),
+    checked (#68 round 3 P2: finite residuals can overflow their cumulative sum, and inf - inf would then
+    make every window comparison false, i.e. a failed selection read as zero energy)."""
+    B = rho.shape[1]
+    with np.errstate(over="ignore", invalid="ignore"):
+        cs = np.vstack([np.zeros((1, B)), np.cumsum(rho, axis=0)])
+    return _bad(cs, where, "window cumulative sum", B)
+
+
+def windows(cs, lo, hi, kk, Rf, where):
+    """Rule 6 per draw from the cumulative sums: the five chain-window means, the reversal test (signed
+    consecutive contrasts) and the return test (|v_k+2 - v_k| <= R_fit / 2), every intermediate checked
+    finite before any comparison (#68 round 3 P2). -> (rev, ret), B booleans each."""
+    B = cs.shape[1]
+    cols = np.arange(B)[:, None]
+    cnt = np.maximum(hi - lo, 1)
+    with np.errstate(over="ignore", invalid="ignore"):
+        v = (cs[hi, cols] - cs[lo, cols]) / cnt                             # B x 5
+        d1 = v[:, 1:] - v[:, :-1]
+        d2 = v[:, 2:] - v[:, :-2]
+    _bad(np.asarray(Rf, float), where, "recurrent range", B)
+    for x, what in ((v, "window mean"), (d1, "window contrast"), (d2, "window return contrast")):
+        _bad(x.T, where, what, B)
+    e = np.where((kk[:, None] + np.arange(5)[None, :]) % 2 == 0, 1.0, -1.0)
+    rev = np.all(np.sign(e[:, 1:] - e[:, :-1]) * d1 > 0, axis=1)
+    ret = np.all(np.abs(d2) <= np.asarray(Rf, float)[:, None] / 2, axis=1)
+    return rev, ret
+
+
+def energy(dbar, den, h, where):
+    """r_h^2 per draw from the recurrent component dbar (m x B): its mean square, relative to the capture
+    denominator squared for capture; a capture denominator <= 0 is the registered +inf. Overflow (of the
+    squares, the range or the ratio) is a numerical failure, never the registered +inf (#68 round 3 P2)."""
+    B = dbar.shape[1]
+    with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+        ms = np.mean(dbar ** 2, axis=0) if len(dbar) else np.zeros(B)
+        Rf = np.ptp(dbar, axis=0) if len(dbar) else np.zeros(B)
+    _bad(ms, where, "squared recurrent component", B)
+    _bad(Rf, where, "recurrent range", B)
+    if h != "C":
+        return ms, Rf
+    pos = den > 0
+    with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+        r2 = ms / np.where(pos, den, 1.0) ** 2
+    _bad(np.where(pos, r2, 0.0), where, "capture energy", B)
+    return np.where(pos, r2, np.inf), Rf
+
+
+def eu_observed(obs):
+    """A world's observed E^U contribution from its epoch analysis: (max_P r_C^2, max_P r_Q^2) when every
+    candidate period is supported, else (+inf, +inf) (the epoch cannot be ARD-certified), with the
+    unsupported periods."""
+    if obs["periods"] and all(r["supported"] for r in obs["periods"]):
+        return (max(r["r_C"] ** 2 for r in obs["periods"]), max(r["r_Q"] ** 2 for r in obs["periods"])), []
+    return (math.inf, math.inf), [r["P"] for r in obs["periods"] if not r["supported"]]
+
+
 def world_epoch(wd, y, loads, xi):
     """One world, one epoch: observed analysis (recurrence.analyze_world) plus, over the bootstrap draws,
     per-candidate G_C, G_Q (rule 6 at each draw's phase) and r_C^2, r_Q^2 under the common reference-
@@ -158,7 +229,7 @@ def world_epoch(wd, y, loads, xi):
                                       f"in {len(cols_)} draw(s), first {int(cols_[0])}")
             return x
         rho, den = finite(lin(rd.rbar), "window residual"), finite(lin(rd.mean_op), "capture denominator")
-        cs = np.vstack([np.zeros((1, B)), np.cumsum(rho, axis=0)])
+        cs = cumulative(rho, where)
         for i, P in enumerate(P_all):
             if not static[i]:
                 continue
@@ -166,21 +237,13 @@ def world_epoch(wd, y, loads, xi):
             b = finite(hm.Sqinv @ lin(hm.WQ.T), "harmonic coordinate", P)     # 2 x B (the stable basis)
             a = finite(hm.Rinv @ b, "harmonic coefficient", P)
             dbar = finite(hm.avgQ @ b, "recurrent component", P)
-            A = np.hypot(a[0], a[1])
+            with np.errstate(over="ignore"):
+                A = np.hypot(a[0], a[1])
+            finite(A, "harmonic amplitude", P)
             phi = np.arctan2(a[1], a[0])
-            ms = np.mean(dbar ** 2, axis=0) if len(dbar) else np.zeros(B)
-            if h == "C":
-                r2[h][i] = np.where(den > 0, ms / np.where(den > 0, den, 1.0) ** 2, np.inf)
-            else:
-                r2[h][i] = ms
+            r2[h][i], Rf = energy(dbar, den, h, f"{where} P={P:g}")
             lo, hi, kk, ok = rd.tables[P].lookup(phi)                         # B x 5 (chain() exactly)
-            cols = np.arange(B)[:, None]
-            cnt = np.maximum(hi - lo, 1)
-            v = (cs[hi, cols] - cs[lo, cols]) / cnt                             # B x 5
-            e = np.where((kk[:, None] + np.arange(5)[None, :]) % 2 == 0, 1.0, -1.0)
-            rev = np.all((e[:, 1:] - e[:, :-1]) * (v[:, 1:] - v[:, :-1]) > 0, axis=1)
-            Rf = np.ptp(dbar, axis=0) if len(dbar) else np.zeros(B)
-            ret = np.all(np.abs(v[:, 2:] - v[:, :-2]) <= Rf[:, None] / 2, axis=1)
+            rev, ret = windows(cs, lo, hi, kk, Rf, f"{where} P={P:g}")
             g = ok & (A > 0) & rev & ret
             if h == "C":
                 g &= den > 0
@@ -198,15 +261,13 @@ def world_epoch(wd, y, loads, xi):
     cols = np.arange(B)
     out = {"obs": obs, "periods": P_all,
            "selC": np.where(g, r2["C"][sel, cols], 0.0), "selQ": np.where(g, r2["Q"][sel, cols], 0.0)}
-    all_sup = all(r["supported"] for r in obs["periods"])
-    if all_sup and len(P_all):
+    out["EU_obs"], unsup = eu_observed(obs)
+    if obs["periods"] and not unsup:
         out["maxC"] = np.max(r2["C"], axis=0)
         out["maxQ"] = np.max(r2["Q"], axis=0)
-        out["EU_obs"] = (max(r["r_C"] ** 2 for r in obs["periods"]), max(r["r_Q"] ** 2 for r in obs["periods"]))
     else:
         out["maxC"] = out["maxQ"] = np.full(B, np.inf)
-        out["EU_obs"] = (math.inf, math.inf)
-        out["EU_unsupported"] = [r["P"] for r in obs["periods"] if not r["supported"]]
+        out["EU_unsupported"] = unsup
     return out
 
 
@@ -371,7 +432,8 @@ def ht(epochs, betas, gates, loads=None, k=0, analysis="main", draws=stats.B_BOO
     missing = [e for e in EPOCHS if gates.get(e) is None]
     if missing:                                        # (H.12: every gate H-T requires needs a passing calibration)
         return {"available": False, "reject": False, "T_T": None, "winner": None, "candidates": [], "worlds": ids,
-                "error": f"the recurrence gate of {missing} lacks a passing frozen calibration", "c_T": max(GUARD, c_T),
+                "error": f"the recurrence gate of {missing} lacks a passing frozen calibration", "failure": None,
+                "c_T": max(GUARD, c_T),
                 "p_model": p_model, "phase_support": {}, "EU_unsupported": {}}
     for e in EPOCHS:                                   # (canonical order: one index = one world everywhere)
         by = {wd.id: (wd, y) for wd, y in epochs[e]}
@@ -380,6 +442,7 @@ def ht(epochs, betas, gates, loads=None, k=0, analysis="main", draws=stats.B_BOO
     bad = [f"{e}/{h}/{w}" for e in EPOCHS for h in ("P", "Q") for w, v in zip(ids, bet[e][h]) if not math.isfinite(v)]
     if bad:
         return {"available": False, "reject": False, "T_T": None, "error": f"nonfinite slopes: {bad[:5]}",
+                "failure": "numerical",
                 "winner": None, "candidates": [], "worlds": ids, "c_T": max(GUARD, c_T), "p_model": p_model,
                 "phase_support": {}, "EU_unsupported": {}}
     idx, xi = draw_streams(analysis, n, k, draws)
@@ -391,7 +454,8 @@ def ht(epochs, betas, gates, loads=None, k=0, analysis="main", draws=stats.B_BOO
             obs[e], dr[e], res[e] = epoch_components(per[e], bet[e], idx)
         stat = ht_statistic(obs, dr, gates)
     except TransitionError as err:          # (a numerical failure anywhere: unavailable, never a rejection)
-        return {"available": False, "reject": False, "T_T": None, "error": str(err), "winner": None,
+        return {"available": False, "reject": False, "T_T": None, "error": str(err), "failure": "numerical",
+                "winner": None,
                 "candidates": [], "components": obs, "c_T": max(GUARD, c_T), "p_model": p_model, "worlds": ids,
                 "phase_support": {e: res[e]["phase_support"] for e in res}, "EU_unsupported": {}}
     c_T = max(GUARD, c_T)
