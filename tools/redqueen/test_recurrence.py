@@ -337,6 +337,31 @@ class TestRecurrence(unittest.TestCase):
             if ws.harm[P].rank2:
                 self.assertAlmostEqual(ws.J(y, P), wd_.J(y, P), delta=1e-7 * max(1.0, abs(wd_.J(y, P))))
 
+    def test_subset_drops_zero_columns_exactly(self):
+        """#68 CPU lever L1: Cov.subset keeps only the shared-source columns loading on a kept row; on a g4-shaped
+        structured bank (n 2143, k 412, four nonzeros per row, random diagonal) W A on the epoch subset equals
+        the full-column subset to <= 1e-12 (relative), and both equal the dense solve on a smaller case."""
+        rc = self.rc
+        rng = np.random.default_rng(7)
+        for n, k, m in ((2143, 412, 267), (300, 60, 40)):
+            d = 1e-4 * (1 + rng.random(n))
+            U = np.zeros((n, k))
+            pre = rng.integers(0, k - 40, n)                     # (three prey-snapshot columns and a predator key)
+            for j, c in enumerate((pre, pre + 1, pre + 2, k - 40 + rng.integers(0, 40, n))):
+                U[np.arange(n), c] = 3e-3 * rng.standard_normal(n)
+            mask = np.zeros(n, bool)
+            mask[np.sort(rng.choice(n, m, replace=False))] = True
+            cov = rc.Cov(d, U)
+            sub, full = cov.subset(mask), rc.Cov(d[mask], U[mask])
+            self.assertLess(sub.U.shape[1], full.U.shape[1])
+            A = rng.standard_normal((m, 36))
+            ws, wf = sub.wmul(A), full.wmul(A)
+            self.assertLessEqual(float(np.max(np.abs(ws - wf)) / np.max(np.abs(wf))), 1e-12)
+            if n < 1000:
+                ridge = rc.RIDGE * float(np.median(full.diag))
+                dense = np.linalg.solve(np.diag(d[mask] + ridge) + U[mask] @ U[mask].T, A)
+                self.assertLessEqual(float(np.max(np.abs(ws - dense)) / np.max(np.abs(dense))), 1e-10)
+
     def test_no_period_from_graph_density(self):
         """21 (noiseless part): constant and drifting strategies on an irregular coarse + fine graph give
         zero residual recurrence at every candidate."""

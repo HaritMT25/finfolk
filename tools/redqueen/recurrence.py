@@ -163,12 +163,19 @@ class Cov:
         return self._M
 
     def subset(self, mask):
+        """The covariance of the masked rows. A structured bank keeps only the shared-source columns that load
+        on a kept row (#68 CPU lever L1, exact: an all-zero column adds an identity block to I + U'D^-1 U and a
+        zero column to its Woodbury factor, so W is unchanged; the ridge uses the same row diagonals)."""
         mask = np.asarray(mask, bool)
         if mask.all():                                   # (the whole bank: no refactorization)
             return self
         if self.V is not None:
             return Cov(dense=self.V[np.ix_(mask, mask)])
-        return Cov(self.d[mask], None if self.U is None else self.U[mask])
+        if self.U is None:
+            return Cov(self.d[mask])
+        Us = self.U[mask]
+        keep = np.any(Us != 0, axis=0)
+        return Cov(self.d[mask], Us[:, keep] if keep.any() else None)
 
     def wmul(self, A):
         """W A."""
