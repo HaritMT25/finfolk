@@ -35,10 +35,14 @@ reserved restart seed) and the production plans when they exist; otherwise produ
 passes this plan to its own --avoid.
 
 COLLECT (`collect`): the pilot study's packed cells through store.py's index. load_index refuses a cell
-in two chunks, and read_member checks every bundle against its indexed sha256. A cell of this design
-must be a cell of the plan (its id, prey, opponent, namespace, replicate and seeds as planned). The
-result is one observation per cell: world, time, condition (neural:<world> | scripted | free),
-replicate, survivors at the 5000-step horizon, cohort.
+in two chunks, and read_member checks every bundle against its indexed sha256. Collection is BOUND to
+the FINAL executable plan (the rows run.py ran, every content hash filled): the plan must be exactly the
+design's expansion but for those hashes (bind_plan); every bundle of the design must carry its plan row
+EXACTLY (inputs, hashes, seeds) and the registered cohort of 600; every plan cell must be collected
+unless declared missing, and the declaration must match exactly. The result is an observation document
+(the design's canonical sha256, the plan file's sha256, the missing cells) with one observation per
+cell: world, time, condition (neural:<world> | scripted | free), replicate, survivors at the 5000-step
+horizon, cohort, cell id and seeds; `estimate` re-checks that binding and records it in its result.
 
 ESTIMATOR (`estimate`; the registered definitions):
   VALIDATION against the plan: (world, time, condition, replicate) unique (a duplicate is refused,
@@ -74,10 +78,14 @@ ESTIMATOR (`estimate`; the registered definitions):
     v1 = V_C / 4 + V_ctrl, equated to 1.25 rho^2 0.02^2 (the homoskedastic 4C+1A+1B rationale). With
     the conservative envelope against the controls' few degrees of freedom (Gemini q34):
     V_dec = max(V_pooled, (V_C / 4 + V_ctrl) / 1.25), and rho = sqrt(V_dec) / 0.02.
-  BOOTSTRAP (the FITTED model): the plug-in expected sums of squares E_F (from the truncated
-    components) times independent chi-square(df_F) / df_F draws (df_F = round tr(P A_F), at least 1;
-    20,000 draws; stream AnnexH/1/H-C/rho-pilot/bootstrap). Each draw is re-estimated through the same
-    systems, truncation and envelope.
+  BOOTSTRAP (the FITTED Gaussian model, parametric; #69 round 2): each of 20,000 draws (stream
+    AnnexH/1/H-C/rho-pilot/bootstrap) simulates a whole pilot data set of the observed layout: per
+    world u ~ N(0, s_u,G^2), per available increment the fitted fixed effects + u + e, e ~ N(0, s_e,G^2)
+    (the latent snapshot means), per snapshot its n complete replicates N(mean, v n) (v n: the observed
+    replicate variance), from which y, v are formed as from real replicates; the COMPLETE estimator
+    (projection, sums of squares, assay terms from the re-estimated v, systems, truncation, envelope) is
+    rerun on it. So the joint law of the quadratic forms and the uncertainty of the assay variances are
+    both carried. (q75 of these draws is a registered conservative policy, not a calibrated bound.)
   THE DECISION STATISTIC: the registered field DECISION = "q75", the bootstrap 75th percentile of rho
     (the point estimate is median-biased low on few degrees of freedom). The point estimate, q75 and the
     90% interval (5th / 95th percentiles) are all reported.
@@ -91,8 +99,9 @@ THE ALLOCATION RULE (fixed now; never tuned):
 
     rho_pilot.py plan --block worlds_block.json --templates /abs/t1.json ... --age-reference /abs/ages.json \\
         --avoid PRODUCTION/config/worlds.json [--avoid PLAN.jsonl ...] --out design.json
-    rho_pilot.py collect --study PILOT_STUDY --design design.json --out obs.jsonl
-    rho_pilot.py estimate obs.jsonl --design design.json [--out rho.json]
+    rho_pilot.py collect --study PILOT_STUDY --design design.json --plan FINAL_PLAN.jsonl \\
+        [--declare-missing ids.txt] --out obs.json
+    rho_pilot.py estimate obs.json --design design.json --plan FINAL_PLAN.jsonl [--out rho.json]
 """
 from __future__ import annotations
 
@@ -270,39 +279,110 @@ def _condition(row):
     return "scripted" if row["predators"].get("source") == "scripted" else f"neural:{row['predators']['world']}"
 
 
-def _identity(row):
-    p = row.get("predators") or {}
-    return (row.get("kind"), row.get("namespace"), row.get("replicate"), (row.get("prey") or {}).get("snapshot"),
-            p.get("snapshot") or p.get("source"), json.dumps(row.get("seeds"), sort_keys=True))
+HASHED = ("prey", "predators", "template", "ages")
+OBS_SCHEMA = "finfolk.redqueen.rhopilot.obs/1"
 
 
-def collect(study, design):
-    """The pilot's packed cells through store.py's verified index -> observations (by cell id)."""
-    import store
+def _unhashed(row):
+    """A plan row without its content hashes (pending in the design's expansion, filled in the final plan)."""
+    r = json.loads(json.dumps(row))
+    for k in HASHED:
+        if isinstance(r.get(k), dict):
+            r[k].pop("sha256", None)
+    return r
+
+
+def bind_plan(design, plan_path):
+    """The FINAL executable plan (plan.py's rows, every content hash filled: what run.py runs) bound to the
+    design: exactly the design's cell ids, every row equal to the design's expansion but for the filled
+    hashes (template, age reference, prey and donor files, cohort, sampling, seeds: everything), every
+    hash filled, the registered cohort -> ({cell id: row}, the plan file's sha256)."""
     try:
-        rows, _, _ = planlib.expand_v2(design, pending=True)
+        exp, _, _ = planlib.expand_v2(design, pending=True)
     except planlib.DesignError as e:
         raise PilotError(f"the design: {e}")
-    planned = {r["id"]: r for r in rows}
+    want = {r["id"]: r for r in exp}
+    got = {}
+    for ln in rqlib.read_text(plan_path).split("\n"):
+        if ln.strip():
+            r = json.loads(ln)
+            if r.get("id") in got:
+                raise PilotError(f"plan {plan_path}: cell {r.get('id')} occurs twice")
+            got[r.get("id")] = r
+    if set(got) != set(want):
+        raise PilotError(f"plan {plan_path}: {len(set(want) - set(got))} design cells missing, "
+                         f"{len(set(got) - set(want))} cells the design does not have")
+    for cid, r in got.items():
+        if _unhashed(r) != _unhashed(want[cid]):
+            raise PilotError(f"plan {plan_path}: cell {cid} differs from the design's expansion")
+        for k in HASHED:
+            x = r.get(k)
+            if isinstance(x, dict) and x.get("path") and not (isinstance(x.get("sha256"), str)
+                                                              and len(x["sha256"]) == 64):
+                raise PilotError(f"plan {plan_path}: cell {cid} has no content hash for its {k} (a pending plan)")
+        if r.get("n_prey") != N_PREY:
+            raise PilotError(f"plan {plan_path}: cell {cid} has cohort {r.get('n_prey')}, not {N_PREY}")
+    return got, rqlib.sha256_file(plan_path)
+
+
+def _key(row):
+    return {"world": row["prey"]["world"], "time": row["prey"]["time"], "condition": _condition(row),
+            "replicate": row["replicate"]}
+
+
+def collect(study, design, plan_path, declared_missing=()):
+    """The pilot's packed cells through store.py's verified index, BOUND to the final plan (#69 round 2,
+    P1-5): every bundle of the design must be a plan cell whose complete row it carries, with the
+    registered cohort; every plan cell must be collected unless declared missing (the declaration must
+    match exactly) -> the observation document (its provenance: the design's and the plan's hashes)."""
+    import store
+    rows, plan_sha = bind_plan(design, plan_path)
     _, cells = store.load_index(study)
-    out = []
+    obs = []
     for cid in sorted(cells):
         b = json.loads(store.read_member(study, cid, cells=cells))
         c = b["cell"]
         if c.get("design") != design.get("name"):
             continue
-        exp = planned.get(cid)
-        if exp is None or c.get("id") != cid:
+        row = rows.get(cid)
+        if row is None or c.get("id") != cid:
             raise PilotError(f"{cid}: a cell of design {design.get('name')!r} that the plan does not have")
-        if _identity(c) != _identity(exp):
-            raise PilotError(f"{cid}: its prey, opponent, namespace, replicate or seeds differ from the plan")
+        if rqlib.canonical(c) != rqlib.canonical(row):
+            raise PilotError(f"{cid}: its bundle's cell row differs from the plan's (inputs, hashes or seeds)")
+        if b["score"].get("n_start") != row["n_prey"]:
+            raise PilotError(f"{cid}: cohort {b['score'].get('n_start')}, the plan registers {row['n_prey']}")
         h = [x for x in b["score"]["horizons"] if x["steps"] == HORIZON]
         if len(h) != 1:
             raise PilotError(f"{cid}: no single {HORIZON}-step horizon in its score")
-        out.append({"world": exp["prey"]["world"], "time": exp["prey"]["time"], "condition": _condition(exp),
-                    "replicate": exp["replicate"], "survivors": h[0]["survivors"], "cohort": b["score"]["n_start"],
-                    "cell": cid})
-    return out
+        obs.append(dict(_key(row), survivors=h[0]["survivors"], cohort=b["score"]["n_start"], cell=cid,
+                        seeds=row["seeds"]))
+    missing = sorted(set(rows) - {o["cell"] for o in obs})
+    if missing != sorted(set(declared_missing)):
+        raise PilotError(f"{len(missing)} plan cells are not collected (e.g. {missing[:3]}); a missing cell must be "
+                         f"declared (--declare-missing), exactly: declared {len(set(declared_missing))}")
+    return {"schema": OBS_SCHEMA, "design_sha256": rqlib.canonical_sha(design), "plan_sha256": plan_sha,
+            "plan_cells": len(rows), "collected": len(obs), "missing": missing, "observations": obs}
+
+
+def bound_observations(doc, design, plan_path):
+    """An observation document checked against the design and the final plan it was collected under
+    -> (observations, provenance)."""
+    if doc.get("schema") != OBS_SCHEMA:
+        raise PilotError(f"observations schema {doc.get('schema')!r}")
+    rows, plan_sha = bind_plan(design, plan_path)
+    if doc.get("design_sha256") != rqlib.canonical_sha(design) or doc.get("plan_sha256") != plan_sha:
+        raise PilotError("the observations were collected under another design or plan")
+    obs = doc["observations"]
+    ids = [o.get("cell") for o in obs]
+    if len(set(ids)) != len(ids) or set(ids) | set(doc["missing"]) != set(rows) or set(ids) & set(doc["missing"]):
+        raise PilotError("the observations do not cover the plan's cells exactly (with the declared missing ones)")
+    for o in obs:
+        row = rows[o["cell"]]
+        if {k: o.get(k) for k in ("world", "time", "condition", "replicate")} != _key(row) \
+                or o.get("seeds") != row["seeds"]:
+            raise PilotError(f"{o['cell']}: the observation's key or seeds differ from its plan cell")
+    return obs, {"design_sha256": doc["design_sha256"], "plan_sha256": plan_sha, "plan_cells": len(rows),
+                 "collected": len(obs), "missing": doc["missing"]}
 
 
 # ================================================================== the estimator: observations
@@ -332,8 +412,9 @@ def validate(obs, rp):
         if not _is_int(r) or not 0 <= r < rp["replicates"]:
             raise PilotError(f"{key}: the replicate is not in 0..{rp['replicates'] - 1}")
         s, n = o.get("survivors"), o.get("cohort")
-        if not (_is_int(s) and _is_int(n) and n > 0 and 0 <= s <= n):
-            raise PilotError(f"{key}: survivors {s!r} of cohort {n!r}")
+        if not (_is_int(s) and _is_int(n) and n == rp.get("n_prey", N_PREY) and 0 <= s <= n):
+            raise PilotError(f"{key}: survivors {s!r} of cohort {n!r} (the registered cohort is "
+                             f"{rp.get('n_prey', N_PREY)})")
         seen[key] = s / n
     return seen
 
@@ -598,15 +679,129 @@ def moments(lay):
     return {"K": Kmat, "c": c, "q": q, "df": df, "Kp": Kp, "cp": [c[0] + c[2], c[1] + c[3]]}
 
 
-def solve_components(m, q):
-    """Observed (or drawn) sums of squares -> ((su2_C, se2_C), (su2_K, se2_K), (su2_P, se2_P)), truncated
-    at 0; None if a system is singular."""
-    th = _solve(m["K"], [a - b for a, b in zip(q, m["c"])])
-    tp = _solve(m["Kp"], [q[0] + q[2] - m["cp"][0], q[1] + q[3] - m["cp"][1]])
+def solve_components(m, q, c=None):
+    """Sums of squares q and assay terms c (default: the observed ones) -> ((su2_C, se2_C), (su2_K, se2_K),
+    (su2_P, se2_P)), truncated at 0; None if a system is singular."""
+    c = m["c"] if c is None else c
+    th = _solve(m["K"], [a - b for a, b in zip(q, c)])
+    tp = _solve(m["Kp"], [q[0] + q[2] - c[0] - c[2], q[1] + q[3] - c[1] - c[3]])
     if th is None or tp is None:
         return None
     th = [max(0.0, x) for x in th]
     return (th[0], th[1]), (th[2], th[3]), (max(0.0, tp[0]), max(0.0, tp[1]))
+
+
+def assay_coefficients(lay):
+    """tr(P A_f P Sigma) is linear in the snapshot variances v: -> {form: {(world, snapshot j): kappa}} with
+    c_f = sum kappa v (Sigma: 25 (v_j + v_{j-1}) on the diagonal, -25 v_j between consecutive increments).
+    The entries of M = P A P on Sigma's pattern: A - Q(Q'A) - (AQ)Q' + Q (Q'AQ) Q'."""
+    m = len(lay.Q)
+    epoch = {}
+    for w in lay.worlds:
+        for i in lay.idx[w]:
+            epoch[i] = lay.ep[i]
+    out = {}
+    for f in FORMS:
+        AQ, qaq = lay.applied(lay.A, f)
+        kind, g = f
+        ws = set(lay.groups[g])
+        JT = {}
+        for w in ws:
+            JT[lay.treat[w]] = JT.get(lay.treat[w], 0) + len(lay.idx[w])
+
+        def M(a, b, w):
+            if w in ws:
+                Jw = len(lay.idx[w])
+                base = ((1.0 if a == b else 0.0) - 1.0 / Jw) if kind == "W" else 1.0 / Jw - 1.0 / JT[lay.treat[w]]
+            else:
+                base = 0.0
+            s = base - math.fsum(lay.Q[k][a] * AQ[k][b] + AQ[k][a] * lay.Q[k][b] for k in range(m))
+            return s + math.fsum(lay.Q[k][a] * qaq[k][l] * lay.Q[l][b] for k in range(m) for l in range(m))
+        kap = {}
+        for w in lay.worlds:
+            ids = lay.idx[w]
+            for x, a in enumerate(ids):
+                j = epoch[a]
+                d = 25.0 * M(a, a, w)
+                kap[(w, j)] = kap.get((w, j), 0.0) + d
+                kap[(w, j - 1)] = kap.get((w, j - 1), 0.0) + d
+                if x + 1 < len(ids) and epoch[ids[x + 1]] == j + 1:
+                    kap[(w, j)] = kap.get((w, j), 0.0) - 50.0 * M(a, ids[x + 1], w)
+        out[f] = kap
+    return out
+
+
+class Core:
+    """The estimator for one LAYOUT (the entered worlds' available snapshots and increments): the fixed-
+    effect basis, the expectation system and the assay coefficients are layout-fixed; evaluate() runs the
+    complete estimator on any (y, v, n) series of that layout. The observed estimate and every parametric-
+    bootstrap draw go through the same evaluate()."""
+
+    def __init__(self, series, treat, entered):
+        self.treat = treat
+        self.snaps = {w: sorted(series[w]) for w in entered}
+        inc, sig = increments({w: series[w] for w in entered})
+        self.lay = Layout(inc, sig, treat)
+        self.cells = [(w, j) for w in self.lay.worlds for j, _ in inc[w]]
+        self.m = moments(self.lay)
+        self.kappa = assay_coefficients(self.lay)
+        self.fitted = [d - r for d, r in zip(self.lay.D, self.lay.r)]
+        self.groups = {"C": [w for w in entered if treat[w] == "C"], "K": [w for w in entered if treat[w] != "C"]}
+        self.g, self.sxx = gamma_ols(), sxx_coarse()
+
+    def evaluate(self, s):
+        """(y, v, n) series of this layout -> the estimate record, or None (a singular system)."""
+        lay = self.lay
+        D = [5.0 * (s[w][j][0] - s[w][j - 1][0]) for w, j in self.cells]
+        r = lay.proj(D)
+        q = [_dot(r, lay.A(f, r)) for f in FORMS]
+        c = [math.fsum(k * s[w][j][1] for (w, j), k in self.kappa[f].items()) for f in FORMS]
+        comp = solve_components(self.m, q, c)
+        if comp is None:
+            return None
+
+        def vassay(ws):
+            cells = [s[w][j] for w in ws for j in self.snaps[w]]
+            return math.fsum(v * n / 6.0 for _, v, n in cells) / len(cells) / self.sxx
+        va = {"C": vassay(self.groups["C"]), "K": vassay(self.groups["K"]),
+              "P": vassay(self.groups["C"] + self.groups["K"])}
+        (uc, ec), (uk, ek), (up, ep) = comp
+        g = self.g
+        VC, VK, VP = uc + g * ec / 20.0 + va["C"], uk + g * ek / 20.0 + va["K"], up + g * ep / 20.0 + va["P"]
+        Vd = decision_variance(VC, VK, VP)
+        return {"comp": comp, "q": q, "c": c, "va": va, "V": (VC, VK, VP), "V_dec": Vd, "rho": math.sqrt(Vd) / DELTA}
+
+    def simulate(self, rng, est, s):
+        """One data set from the FITTED Gaussian model (#69 round 2, P1-1), at the replicate level: per world
+        a persistent velocity u ~ N(0, s_u,G^2), per available increment the fitted fixed effects + u +
+        e ~ N(0, s_e,G^2) (the latent snapshot means, levels arbitrary), per snapshot its n complete
+        replicates z ~ N(mean, sigma^2) with sigma^2 = v n (the observed replicate variance) -> (y, v, n)
+        from them, exactly as contrasts() forms them (so the assay variances are re-estimated too)."""
+        (uc, ec), (uk, ek), _ = est["comp"]
+        fit = dict(zip(self.cells, self.fitted))
+        out = {}
+        for w in self.lay.worlds:
+            su, se = (uc, ec) if self.treat[w] == "C" else (uk, ek)
+            u = math.sqrt(su) * _normal(rng)
+            lvl, sw = None, {}
+            for j in self.snaps[w]:
+                if lvl is None or (w, j) not in fit:
+                    lvl = s[w][j][0]                        # (a run's first snapshot: any level)
+                else:
+                    lvl += (fit[(w, j)] + u + math.sqrt(se) * _normal(rng)) / 5.0
+                _, v, n = s[w][j]
+                sd = math.sqrt(v * n)
+                z = [lvl + sd * _normal(rng) for _ in range(n)]
+                mz = math.fsum(z) / n
+                sw[j] = (mz, math.fsum((x - mz) ** 2 for x in z) / (n - 1) / n, n)
+            out[w] = sw
+        return out
+
+
+def _normal(rng):
+    u1 = 1.0 - rng.next64() / 2.0 ** 64
+    u2 = rng.next64() / 2.0 ** 64
+    return math.sqrt(-2.0 * math.log(u1)) * math.cos(2 * math.pi * u2)
 
 
 def decision_variance(VC, Vk, Vp):
@@ -614,30 +809,20 @@ def decision_variance(VC, Vk, Vp):
     return max(Vp, (VC / 4.0 + Vk) / 1.25)
 
 
-def _chi2(rng, df):
-    s = 0.0
-    for _ in range(df):
-        u1 = 1.0 - rng.next64() / 2.0 ** 64
-        u2 = rng.next64() / 2.0 ** 64
-        z = math.sqrt(-2.0 * math.log(u1)) * math.cos(2 * math.pi * u2)
-        s += z * z
-    return s
-
-
 def _q(srt, u):
     return srt[min(len(srt), max(1, math.ceil(u * (len(srt) + 1)))) - 1]
 
 
-def estimate(obs, design, boot=BOOT):
-    """The registered estimate, interval, decision and allocation."""
+def estimate(obs, design, boot=BOOT, provenance=None):
+    """The registered estimate, interval, decision and allocation (provenance: the plan binding)."""
     rp = design["rho_pilot"]
     treat = rp["treatment"]
     series, rep = contrasts(obs, rp)
-    inc, sig = increments(series)
-    g = gamma_ols()
+    inc, _ = increments(series)
     out = {"schema": SCHEMA, "decision_statistic": DECISION, "thresholds": list(THRESHOLDS),
-           "allocations": {str(k): v for k, v in ALLOCATIONS.items()}, "gamma_ols": g, "sxx_coarse": sxx_coarse(),
-           "report": rep, "skipped_snapshots": rp.get("skipped", []),
+           "allocations": {str(k): v for k, v in ALLOCATIONS.items()}, "gamma_ols": gamma_ols(),
+           "sxx_coarse": sxx_coarse(), "report": rep, "skipped_snapshots": rp.get("skipped", []),
+           "provenance": provenance,
            "post_burn_in_extinctions": [s for s in rp.get("skipped", []) if s["reason"].startswith("biological")]}
     entered = [w for w in sorted(inc) if len(inc[w]) >= MIN_INCREMENTS]
     out["excluded_worlds"] = {w: f"{len(inc.get(w, []))} increments (< {MIN_INCREMENTS})"
@@ -645,59 +830,48 @@ def estimate(obs, design, boot=BOOT):
     C = [w for w in entered if treat[w] == "C"]
     ctrl = [w for w in entered if treat[w] in ("A", "B")]
     out["entered"] = {"C": C, "controls": ctrl}
-    why, m = None, None
+    why, core, est = None, None, None
     if len(C) < MIN_C:
         why = f"{len(C)} C worlds entered (< {MIN_C})"
     elif len(ctrl) < MIN_CTRL or not any(treat[w] == "A" for w in ctrl) or not any(treat[w] == "B" for w in ctrl):
         why = f"{len(ctrl)} control worlds entered (needs >= {MIN_CTRL}, with >= 1 A and >= 1 B)"
     else:
-        lay = Layout({w: inc[w] for w in entered}, sig, treat)
-        m = moments(lay)
-        comp = solve_components(m, m["q"])
-        if comp is None:
+        core = Core(series, treat, entered)
+        est = core.evaluate(series)
+        if est is None:
             why = "the moment system is singular"
     if why is not None:
         out.update(available=False, reason=why, rho_point=None, rho_q75=None, rho_decision=None,
                    allocation=allocation(None))
         return out
-
-    def vassay(ws):
-        cells = [series[w][j] for w in ws for j in sorted(series[w])]
-        return math.fsum(v * n / 6.0 for _, v, n in cells) / len(cells) / sxx_coarse()
-    va = {"C": vassay(C), "K": vassay(ctrl), "P": vassay(C + ctrl)}
-
-    def project(comp):
-        (uc, ec), (uk, ek), (up, ep) = comp
-        VC, VK, VP = uc + g * ec / 20.0 + va["C"], uk + g * ek / 20.0 + va["K"], up + g * ep / 20.0 + va["P"]
-        return VC, VK, VP, decision_variance(VC, VK, VP)
-    VC, VK, VP, Vd = project(comp)
-    rho = math.sqrt(Vd) / DELTA
-    # the bootstrap of the FITTED model: the plug-in expected sums of squares x chi-square(df) / df
-    th = [comp[0][0], comp[0][1], comp[1][0], comp[1][1]]
-    E = [max(0.0, math.fsum(k * t for k, t in zip(m["K"][f], th)) + m["c"][f]) for f in range(4)]
-    dfs = [max(1, int(round(d))) for d in m["df"]]
+    # the PARAMETRIC BOOTSTRAP of the fitted Gaussian model: whole data sets simulated (replicates
+    # included) and the complete estimator rerun on each (#69 round 2, P1-1)
     rng = rqlib.SplitMix64(int.from_bytes(hashlib.sha256(BOOT_STREAM).digest()[:8], "little"))
     rs = []
     for _ in range(boot):
-        qs = [E[f] * _chi2(rng, dfs[f]) / dfs[f] for f in range(4)]
-        cs = solve_components(m, qs)
-        rs.append(math.sqrt(project(cs)[3]) / DELTA if cs is not None else math.inf)
+        e = core.evaluate(core.simulate(rng, est, series))
+        rs.append(e["rho"] if e is not None else math.inf)
     rs.sort()
     q75 = _q(rs, 0.75)
+    rho = est["rho"]
     dec = q75 if DECISION == "q75" else rho
-    names = {"C": (comp[0], VC, C, m["df"][1], m["df"][0]), "controls": (comp[1], VK, ctrl, m["df"][3], m["df"][2])}
+    m, comp = core.m, est["comp"]
+    VC, VK, VP = est["V"]
+    names = {"C": (comp[0], VC, C, m["df"][1], m["df"][0], est["va"]["C"]),
+             "controls": (comp[1], VK, ctrl, m["df"][3], m["df"][2], est["va"]["K"])}
     out.update(
         available=True, rho_point=rho, rho_q75=q75, rho_decision=dec, allocation=allocation(dec),
         ci90=[_q(rs, 0.05), _q(rs, 0.95)],
-        components={k: {"s_u2": c[0], "s_e2": c[1], "V": V, "assay_prod": va["C" if k == "C" else "K"],
-                        "worlds": len(ws), "df_between": db, "df_within": dw}
-                    for k, (c, V, ws, db, dw) in names.items()},
-        pooled={"s_u2": comp[2][0], "s_e2": comp[2][1], "V": VP, "assay_prod": va["P"]},
-        decision_variance={"V_pooled": VP, "block_equivalent": (VC / 4.0 + VK) / 1.25, "V_dec": Vd,
+        components={k: {"s_u2": c[0], "s_e2": c[1], "V": V, "assay_prod": va, "worlds": len(ws),
+                        "df_between": db, "df_within": dw}
+                    for k, (c, V, ws, db, dw, va) in names.items()},
+        pooled={"s_u2": comp[2][0], "s_e2": comp[2][1], "V": VP, "assay_prod": est["va"]["P"]},
+        decision_variance={"V_pooled": VP, "block_equivalent": (VC / 4.0 + VK) / 1.25, "V_dec": est["V_dec"],
                            "governs": "pooled" if VP >= (VC / 4.0 + VK) / 1.25 else "block contrast"},
-        moments={"forms": ["SSW_C", "SSB_C", "SSW_ctrl", "SSB_ctrl"], "observed": m["q"], "expected_fitted": E,
-                 "df": m["df"], "df_draws": dfs, "K": m["K"], "assay": m["c"]},
-        bootstrap={"draws": boot, "stream": BOOT_STREAM.decode()})
+        moments={"forms": ["SSW_C", "SSB_C", "SSW_ctrl", "SSB_ctrl"], "observed": est["q"], "df": m["df"],
+                 "K": m["K"], "assay": est["c"]},
+        bootstrap={"draws": boot, "stream": BOOT_STREAM.decode(), "method": "parametric: the fitted Gaussian model "
+                   "simulated at the replicate level, the complete estimator rerun", "singular_draws": rs.count(math.inf)})
     return out
 
 
@@ -715,10 +889,14 @@ def main(argv=None):
     s = sub.add_parser("collect")
     s.add_argument("--study", required=True)
     s.add_argument("--design", required=True)
+    s.add_argument("--plan", required=True, help="the FINAL plan the pilot study ran (plan.py --against)")
+    s.add_argument("--declare-missing", help="a file of cell ids (one per line) declared missing, exactly")
     s.add_argument("--out", required=True)
     s = sub.add_parser("estimate")
     s.add_argument("obs")
     s.add_argument("--design", required=True)
+    s.add_argument("--plan", required=True)
+    s.add_argument("--boot", type=int, default=BOOT, help=argparse.SUPPRESS)
     s.add_argument("--out")
     a = ap.parse_args(argv)
     try:
@@ -732,15 +910,14 @@ def main(argv=None):
             return 0
         design = rqlib.read_json(a.design)
         if a.cmd == "collect":
-            obs = collect(a.study, design)
-            with open(a.out, "w") as f:
-                for o in obs:
-                    f.write(json.dumps(o, sort_keys=True) + "\n")
-            print(f"{len(obs)} observations")
+            miss = ([x.strip() for x in rqlib.read_text(a.declare_missing).split("\n") if x.strip()]
+                    if a.declare_missing else [])
+            doc = collect(a.study, design, a.plan, miss)
+            rqlib.write_json_durable(a.out, doc)
+            print(f"{doc['collected']} observations of {doc['plan_cells']} plan cells; missing {len(doc['missing'])}")
             return 0
-        with open(a.obs) as f:
-            obs = [json.loads(ln) for ln in f if ln.strip()]
-        res = estimate(obs, design)
+        obs, prov = bound_observations(rqlib.read_json(a.obs), design, a.plan)
+        res = estimate(obs, design, boot=a.boot, provenance=prov)
         if a.out:
             rqlib.write_json_durable(a.out, res)
         print(json.dumps(res, indent=1, sort_keys=True))

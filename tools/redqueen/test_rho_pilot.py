@@ -203,8 +203,8 @@ class TestEstimator(unittest.TestCase):
         and 32 by the epoch effects' share); the decision is the bootstrap q75; deterministic whatever the
         observation order."""
         obs = simulate(PILOT, {"C": (0.02, 0.03), "K": (0.02, 0.03)}, seed=9, free=True)
-        r1 = rp.estimate(obs, meta(PILOT), boot=2000)
-        r2 = rp.estimate(list(reversed(obs)), meta(PILOT), boot=2000)
+        r1 = rp.estimate(obs, meta(PILOT), boot=300)
+        r2 = rp.estimate(list(reversed(obs)), meta(PILOT), boot=300)
         self.assertEqual(json.dumps(r1, sort_keys=True), json.dumps(r2, sort_keys=True))
         self.assertTrue(r1["available"])
         c, k = r1["components"]["C"], r1["components"]["controls"]
@@ -379,42 +379,59 @@ class TestPlan(unittest.TestCase):
         self.assertIn("panel needs 5", str(cm.exception))
 
 
+def final_plan(design, path):
+    """The final plan as plan.py --against writes it: the expansion with every content hash filled."""
+    rows, _, _ = plan.expand_v2(design, pending=True)
+    for r in rows:
+        for k in rp.HASHED:
+            if isinstance(r.get(k), dict) and r[k].get("path"):
+                r[k]["sha256"] = hashlib.sha256(f"{k}|{r[k]['path']}".encode()).hexdigest()
+    plan.write_plan(rows, path)
+    return {r["id"]: r for r in rows}
+
+
 class TestCli(unittest.TestCase):
     def test_plan_and_estimate(self):
-        """The CLI: plan writes the design; estimate reads observations against it (the plan's own
-        panel conditions) and writes the result; a refusal exits 2; --age-reference is required."""
+        """The CLI: plan writes the design; estimate reads the bound observation document (the plan's own
+        cells and seeds) and writes the result with its provenance; refusals exit 2; --age-reference is
+        required."""
         tmp = tempfile.mkdtemp()
         try:
             f = files(tmp)
-            bp, dp, op, rpth = (os.path.join(tmp, n) for n in ("block.json", "design.json", "obs.jsonl", "rho.json"))
+            bp, dp, pp, op, rpth = (os.path.join(tmp, n) for n in
+                                    ("block.json", "design.json", "plan.jsonl", "obs.json", "rho.json"))
             with open(bp, "w") as fh:
                 json.dump(make_block(tmp), fh)
             args = ["plan", "--block", bp, "--templates", f["t.json"], "--age-reference", f["ages.json"],
                     "--avoid", f["worlds.json"], "--out", dp]
-            quiet = contextlib.redirect_stdout(io.StringIO())
-            with quiet:
+            with contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(rp.main(args), 0)
             d = rqlib.read_json(dp)
+            rows = final_plan(d, pp)
             g = Rng(2)
-            with open(op, "w") as fh:
-                for w, pw in d["rho_pilot"]["per_world_panel"].items():
-                    for t in rp.TIMES_M:
-                        y = 0.01 * g.nrm()
-                        for r in range(rp.REPLICATES):
-                            for cond in [f"neural:{c}" for c in pw] + ["scripted", "free"]:
-                                s = round((0.5 + (y if cond.startswith("neural") else 0) + 0.02 * g.nrm()) * 600)
-                                fh.write(json.dumps({"world": w, "time": f"{t}M", "condition": cond, "replicate": r,
-                                                     "survivors": s, "cohort": 600}) + "\n")
+            ys = {}
+            obs = []
+            for cid in sorted(rows):
+                r = rows[cid]
+                key = rp._key(r)
+                y = ys.setdefault((key["world"], key["time"]), 0.01 * g.nrm())
+                sv = round((0.5 + (y if key["condition"].startswith("neural") else 0) + 0.02 * g.nrm()) * 600)
+                obs.append(dict(key, survivors=sv, cohort=600, cell=cid, seeds=r["seeds"]))
+            doc = {"schema": rp.OBS_SCHEMA, "design_sha256": rqlib.canonical_sha(d),
+                   "plan_sha256": rqlib.sha256_file(pp), "plan_cells": len(rows), "collected": len(obs),
+                   "missing": [], "observations": obs}
+            rqlib.write_json_durable(op, doc)
             with contextlib.redirect_stdout(io.StringIO()):
-                self.assertEqual(rp.main(["estimate", op, "--design", dp, "--out", rpth]), 0)
+                self.assertEqual(rp.main(["estimate", op, "--design", dp, "--plan", pp, "--boot", "40",
+                                          "--out", rpth]), 0)
             res = rqlib.read_json(rpth)
             self.assertTrue(res["available"])
             self.assertEqual(res["allocation"], rp.allocation(res["rho_decision"]))
-            with open(op, "a") as fh:
-                fh.write(json.dumps({"world": "w01", "time": "10M", "condition": "free", "replicate": 0,
-                                     "survivors": 1, "cohort": 600}) + "\n")
+            self.assertEqual(res["provenance"]["plan_sha256"], rqlib.sha256_file(pp))
+            bad = dict(doc, observations=obs[:-1])                     # (a cell neither collected nor declared)
+            rqlib.write_json_durable(op, bad)
             with contextlib.redirect_stderr(io.StringIO()):
-                self.assertEqual(rp.main(["estimate", op, "--design", dp]), 2)       # (a duplicate: refused)
+                self.assertEqual(rp.main(["estimate", op, "--design", dp, "--plan", pp, "--boot", "5"]), 2)
                 with self.assertRaises(SystemExit):
                     rp.main([a for a in args if a not in ("--age-reference", f["ages.json"])])
         finally:
@@ -443,30 +460,46 @@ class TestCollect(unittest.TestCase):
             f.write(json.dumps({"chunk": "c0001.zip", "cells": cells}) + "\n")
         return root
 
-    def test_collect_through_the_index(self):
-        """Observations from the verified index; a cell of the design outside the plan, or with other
-        seeds, is refused; a bundle that does not match its indexed sha256 is refused."""
+    def test_collect_bound_to_the_final_plan(self):
+        """#69 round 2, P1-5: collection is bound to the FINAL plan: every bundle carries its plan row
+        exactly and the registered cohort; every plan cell is collected or declared missing, exactly; the
+        plan itself must be the design's expansion with every hash filled; the document's binding is
+        re-checked by estimate; a tampered bundle is refused by the index."""
         d, _ = rp.make_design(make_block(self.tmp), [self.f["t.json"]], self.f["ages.json"], [self.f["worlds.json"]])
-        rows, _, _ = plan.expand_v2(d, pending=True)
-        pick = [r for r in rows if r["prey"]["world"] == "w09" and r["prey"]["time"] == "20M" and r["replicate"] == 0]
+        pp = os.path.join(self.tmp, "plan.jsonl")
+        rows = final_plan(d, pp)
+        pick = [r for r in rows.values() if r["prey"]["world"] == "w09" and r["prey"]["time"] == "20M"
+                and r["replicate"] == 0]
         self.assertEqual(len(pick), 6)
+        rest = sorted(set(rows) - {r["id"] for r in pick})
 
-        def bundle(r, surv=400):
-            return {"cell": r, "score": {"n_start": 600, "horizons": [{"steps": 5000, "survivors": surv}]}}
+        def bundle(r, surv=400, n=600):
+            return {"cell": r, "score": {"n_start": n, "horizons": [{"steps": 5000, "survivors": surv}]}}
         bs = {r["id"]: bundle(r, 300 + i) for i, r in enumerate(pick)}
         bs["other.r00"] = {"cell": {"design": "production"}, "score": {}}
-        obs = rp.collect(self.study(bs), d)
-        self.assertEqual(len(obs), 6)
+        doc = rp.collect(self.study(bs), d, pp, rest)
+        self.assertEqual((doc["collected"], doc["plan_cells"], len(doc["missing"])), (6, len(rows), len(rest)))
+        self.assertEqual(doc["plan_sha256"], rqlib.sha256_file(pp))
+        obs = doc["observations"]
         self.assertEqual(sorted(o["condition"] for o in obs),
                          sorted([f"neural:{c}" for c in d["rho_pilot"]["per_world_panel"]["w09"]] + ["scripted", "free"]))
-        self.assertTrue(all(o["world"] == "w09" and o["time"] == "20M" and o["replicate"] == 0 for o in obs))
         self.assertEqual(sorted(o["survivors"] for o in obs), list(range(300, 306)))
-        x = dict(pick[0], id="w09.20M~nope.r00")
-        with self.assertRaises(rp.PilotError):
-            rp.collect(self.study({x["id"]: bundle(x)}), d)
-        y = dict(pick[0], seeds=dict(pick[0]["seeds"], transplant=1))
-        with self.assertRaises(rp.PilotError):
-            rp.collect(self.study({y["id"]: bundle(y)}), d)
+        self.assertEqual(rp.bound_observations(doc, d, pp)[1]["collected"], 6)
+        root = self.study(bs)
+        with self.assertRaises(rp.PilotError):                           # (missing cells, undeclared)
+            rp.collect(root, d, pp)
+        with self.assertRaises(rp.PilotError):                           # (a declaration that does not match)
+            rp.collect(root, d, pp, rest[:-1])
+        cases = [dict(pick[0], id="w09.20M~nope.r00"),                     # (not a plan cell)
+                 dict(pick[0], seeds=dict(pick[0]["seeds"], transplant=1)),
+                 dict(pick[0], ages={"path": "/other/ages.json", "sha256": "a" * 64}),
+                 dict(pick[0], template=dict(pick[0]["template"], sha256="b" * 64))]
+        for c in cases:
+            with self.assertRaises(rp.PilotError):
+                rp.collect(self.study({c["id"]: bundle(c)}), d, pp, sorted(set(rows) - {c["id"]}))
+        with self.assertRaises(rp.PilotError):                           # (the registered cohort)
+            rp.collect(self.study({pick[0]["id"]: bundle(pick[0], n=599)}), d, pp,
+                       sorted(set(rows) - {pick[0]["id"]}))
         root = self.study({pick[0]["id"]: bundle(pick[0])})
         idx = os.path.join(root, store.INDEX)
         with open(idx) as f:
@@ -475,7 +508,57 @@ class TestCollect(unittest.TestCase):
         with open(idx, "w") as f:
             f.write(json.dumps(rec) + "\n")
         with self.assertRaises(store.StoreError):
-            rp.collect(root, d)
+            rp.collect(root, d, pp, sorted(set(rows) - {pick[0]["id"]}))
+        # the plan itself: a pending one, a row that differs from the design, another design (ages file)
+        pend, _, _ = plan.expand_v2(d, pending=True)
+        plan.write_plan(pend, os.path.join(self.tmp, "pending.jsonl"))
+        with self.assertRaises(rp.PilotError):
+            rp.bind_plan(d, os.path.join(self.tmp, "pending.jsonl"))
+        other_ages = os.path.join(self.tmp, "ages2.json")
+        with open(other_ages, "w") as f:
+            f.write("{}")
+        d2, _ = rp.make_design(make_block(self.tmp), [self.f["t.json"]], other_ages, [self.f["worlds.json"]])
+        with self.assertRaises(rp.PilotError):
+            rp.bind_plan(d2, pp)
+        with self.assertRaises(rp.PilotError):                           # (the document under another design)
+            rp.bound_observations(doc, d2, pp)
+
+
+class TestBootstrap(unittest.TestCase):
+    def test_fitted_model_simulation(self):
+        """#69 round 2, P1-1: the bootstrap simulates whole data sets from the FITTED Gaussian model at the
+        replicate level and reruns the complete estimator. The assay terms via the linear coefficients
+        equal the trace route; simulated data at known components re-estimate them (the pipeline at the
+        fitted parameters is consistent); the replicate variances are re-estimated in every draw."""
+        par = {"C": (0.02, 0.03), "K": (0.012, 0.02)}
+        obs = simulate(BIG, par, s_rep=0.01, seed=21)
+        rpm = meta(BIG)["rho_pilot"]
+        series, _ = rp.contrasts(obs, rpm)
+        core = rp.Core(series, BIG, sorted(series))
+        est = core.evaluate(series)
+        for a, b in zip(est["c"], core.m["c"]):
+            self.assertAlmostEqual(a, b, delta=1e-10 * max(1.0, abs(b)))
+        truth = dict(est, comp=((0.02 ** 2, 0.03 ** 2), (0.012 ** 2, 0.02 ** 2), (0.0, 0.0)))
+        rng = rqlib.SplitMix64(5)
+        acc = {k: [] for k in ("uC", "eC", "uK", "eK")}
+        vdiff = 0.0
+        for _ in range(6):
+            sim = core.simulate(rng, truth, series)
+            e = core.evaluate(sim)
+            (uc, ec), (uk, ek), _ = e["comp"]
+            for k, v in zip(acc, (uc, ec, uk, ek)):
+                acc[k].append(v)
+            vdiff += sum(abs(sim[w][j][1] - series[w][j][1]) for w in sim for j in sim[w])
+        mean = {k: sum(v) / len(v) for k, v in acc.items()}
+        self.assertAlmostEqual(mean["uC"], 0.02 ** 2, delta=0.25 * 0.02 ** 2)
+        self.assertAlmostEqual(mean["eC"], 0.03 ** 2, delta=0.12 * 0.03 ** 2)
+        self.assertAlmostEqual(mean["uK"], 0.012 ** 2, delta=0.35 * 0.012 ** 2)
+        self.assertAlmostEqual(mean["eK"], 0.02 ** 2, delta=0.15 * 0.02 ** 2)
+        self.assertGreater(vdiff, 0.0)
+        self.assertEqual({w: sorted(v) for w, v in sim.items()}, {w: sorted(v) for w, v in series.items()})
+        r1 = rp.estimate(obs[:20000], meta(BIG), boot=30)
+        r2 = rp.estimate(list(reversed(obs[:20000])), meta(BIG), boot=30)
+        self.assertEqual(r1["rho_q75"], r2["rho_q75"])
 
 
 if __name__ == "__main__":
