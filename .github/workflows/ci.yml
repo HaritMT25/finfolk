@@ -96,12 +96,14 @@ jobs:
           python3 -I -W error::ResourceWarning tools/redqueen/test_stats.py -v 2>&1 | tee stats.log
           test "${PIPESTATUS[0]}" = 0
           ! grep -q ResourceWarning stats.log
-      - name: Backbone estimators (Annex H.1-H.2, numpy required)
+      - name: Backbone estimators and H-F / H-T (Annex H.1-H.4, numpy required)
         run: |
           python3 -m pip install -q "numpy>=2"
-          RQ_REQUIRE_NUMPY=1 python3 -I -W error::ResourceWarning tools/redqueen/test_backbone.py -v 2>&1 | tee backbone.log
-          test "${PIPESTATUS[0]}" = 0
-          ! grep -q ResourceWarning backbone.log
+          for t in test_backbone test_recurrence test_transition; do
+            RQ_REQUIRE_NUMPY=1 python3 -I -W error::ResourceWarning tools/redqueen/$t.py -v 2>&1 | tee $t.log
+            test "${PIPESTATUS[0]}" = 0
+            ! grep -q ResourceWarning $t.log
+          done
 
   # tools/gate_receipts.*: fault suite on temp repos and fake tools (no Emscripten, no gate reuse in CI).
   receipts:
