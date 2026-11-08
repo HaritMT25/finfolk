@@ -189,6 +189,84 @@ def energy(dbar, den, h, where):
     return np.where(pos, r2, np.inf), Rf
 
 
+def hull_vertices(Q):
+    """The convex-hull vertices of the rows of Q (m x 2), deterministic (Andrew's monotone chain on the rows
+    sorted lexicographically; collinear and duplicate rows dropped, a single distinct row kept): the
+    maximum and minimum of any linear functional q -> q . b over the rows are attained at these vertices
+    (#68 draw-loop lever 1)."""
+    pts = sorted({(float(x), float(y)) for x, y in np.asarray(Q, float).reshape(-1, 2)})
+    if len(pts) <= 2:
+        return np.array(pts, float).reshape(-1, 2)
+
+    def cross(o, a, b):
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+    lower, upper = [], []
+    for p in pts:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
+            lower.pop()
+        lower.append(p)
+    for p in reversed(pts):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
+            upper.pop()
+        upper.append(p)
+    return np.array(lower[:-1] + upper[:-1], float)
+
+
+def draw_ops(rd, periods):
+    """The per-design draw operators of a reference readout (cached on the design): the stacked 2 nP x m
+    WQ' (one GEMM for every period's coordinates), and per period Sqinv, Rinv, G = the triangular factor R of
+    avgQ = Q_a R (Householder QR: ||avgQ b|| = ||R b||, the energy without the m x B product and without the
+    cancellation of a quadratic form) and the hull vertices of avgQ's rows (the range)."""
+    key = tuple(periods)
+    cache = rd.__dict__.setdefault("_draw_ops", {})
+    if key not in cache:
+        hs = [rd.harm[P] for P in periods]
+        cache[key] = {"W": np.vstack([hm.WQ.T for hm in hs]) if hs else np.zeros((0, len(rd.mask))),
+                      "Sqinv": np.array([hm.Sqinv for hm in hs]).reshape(-1, 2, 2),
+                      "Rinv": np.array([hm.Rinv for hm in hs]).reshape(-1, 2, 2),
+                      "m": [len(hm.avgQ) for hm in hs],
+                      "G": [np.linalg.qr(hm.avgQ, mode="r") if len(hm.avgQ) else np.zeros((0, 2)) for hm in hs],
+                      "V": [hull_vertices(hm.avgQ) for hm in hs]}
+    return cache[key]
+
+
+def energy_form(b, G, m, den, h, where):
+    """r_h^2 per draw = mean over the m recurrent-component rows of (q_r . b)^2 = ||G b||^2 / m with G the R
+    factor of avgQ (||avgQ b|| = ||R b||): exactly the mean square of dbar = avgQ b without forming it, as a
+    sum of squares (no cancellation); capture: of b / den, the division BEFORE the product (#68 round 4
+    P2-2), den <= 0 the registered +inf. Every intermediate checked."""
+    B = b.shape[1]
+    if m == 0:
+        return np.zeros(B)
+    if h != "C":
+        x = b
+    else:
+        pos = den > 0
+        with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+            x = b / np.where(pos, den, 1.0)[None, :]
+        _bad(np.where(pos[None, :], x, 0.0), where, "relative harmonic coordinate", B)
+    with np.errstate(over="ignore", invalid="ignore"):
+        z = G @ x
+        r2 = np.sum(z * z, axis=0) / m
+    if h != "C":
+        _bad(r2, where, "squared recurrent component", B)
+        return r2
+    _bad(np.where(pos, r2, 0.0), where, "capture energy", B)
+    return np.where(pos, r2, np.inf)
+
+
+def range_hull(b, V, where):
+    """ptp over the rows of dbar = avgQ b per draw, from the hull vertices V of avgQ's rows (exact: a linear
+    functional's extremes over a finite set are attained at its hull vertices); checked finite."""
+    B = b.shape[1]
+    if not len(V):
+        return np.zeros(B)
+    with np.errstate(over="ignore", invalid="ignore"):
+        vb = V @ b
+        Rf = vb.max(axis=0) - vb.min(axis=0)
+    return _bad(Rf, where, "recurrent range", B)
+
+
 def eu_observed(obs):
     """A world's observed E^U contribution from its epoch analysis: (max_P r_C^2, max_P r_Q^2) when every
     candidate period is supported, else (+inf, +inf) (the epoch cannot be ARD-certified), with the
@@ -198,7 +276,7 @@ def eu_observed(obs):
     return (math.inf, math.inf), [r["P"] for r in obs["periods"] if not r["supported"]]
 
 
-def world_epoch(wd, y, loads, xi):
+def world_epoch(wd, y, loads, xi, _expose=False):
     """One world, one epoch: observed analysis (recurrence.analyze_world) plus, over the bootstrap draws,
     per-candidate G_C, G_Q (rule 6 at each draw's phase) and r_C^2, r_Q^2 under the common reference-
     source draw xi (draws x k). loads: {"C": L (n_ref_obs x k), "Q": ...} on the full reference vectors
@@ -236,20 +314,24 @@ def world_epoch(wd, y, loads, xi):
             return x
         rho, den = finite(lin(rd.rbar), "window residual"), finite(lin(rd.mean_op), "capture denominator")
         cs = cumulative(rho, where)
-        for i, P in enumerate(P_all):
-            if not static[i]:
-                continue
-            hm = rd.harm[P]
-            b = finite(hm.Sqinv @ lin(hm.WQ.T), "harmonic coordinate", P)     # 2 x B (the stable basis)
-            a = finite(hm.Rinv @ b, "harmonic coefficient", P)
-            dbar = finite(hm.avgQ @ b, "recurrent component", P)
+        act = [i for i in range(len(P_all)) if static[i]]
+        ops = draw_ops(rd, [P_all[i] for i in act])
+        # (#68 draw-loop lever 1: every period's coordinates from ONE stacked GEMM; the energy as b'Gb and the
+        # range over the hull vertices of avgQ's rows: the m x B recurrent component is never formed)
+        c_all = lin(ops["W"]).reshape(len(act), 2, B)
+        for j, i in enumerate(act):
+            P = P_all[i]
+            b = finite(ops["Sqinv"][j] @ c_all[j], "harmonic coordinate", P)  # 2 x B (the stable basis)
+            a = finite(ops["Rinv"][j] @ b, "harmonic coefficient", P)
             with np.errstate(over="ignore"):
                 A = np.hypot(a[0], a[1])
             finite(A, "harmonic amplitude", P)
             phi = np.arctan2(a[1], a[0])
-            r2[h][i], Rf = energy(dbar, den, h, f"{where} P={P:g}")
+            wP = f"{where} P={P:g}"
+            r2[h][i] = energy_form(b, ops["G"][j], ops["m"][j], den, h, wP)
+            Rf = range_hull(b, ops["V"][j], wP)
             lo, hi, kk, ok = rd.tables[P].lookup(phi)                         # B x 5 (chain() exactly)
-            rev, ret = windows(cs, lo, hi, kk, Rf, f"{where} P={P:g}")
+            rev, ret = windows(cs, lo, hi, kk, Rf, wP)
             g = ok & (A > 0) & rev & ret
             if h == "C":
                 g &= den > 0
@@ -267,6 +349,8 @@ def world_epoch(wd, y, loads, xi):
     cols = np.arange(B)
     out = {"obs": obs, "periods": P_all,
            "selC": np.where(g, r2["C"][sel, cols], 0.0), "selQ": np.where(g, r2["Q"][sel, cols], 0.0)}
+    if _expose:                            # (tests: the per-period gates and energies)
+        out.update(_G=G, _r2=r2)
     out["EU_obs"], unsup = eu_observed(obs)
     if obs["periods"] and not unsup:
         out["maxC"] = np.max(r2["C"], axis=0)
@@ -316,27 +400,44 @@ def margins(c, a, f):
             ("EF_C[f]-EU_C[a]", F["EF_C"] - A["EU_C"]), ("EF_Q[f]-EU_Q[a]", F["EF_Q"] - A["EU_Q"])]
 
 
-def epoch_coverage(per_world):
-    """E^U's support coverage in one epoch (#68 round 4 (D)): per period band of the registered domain
-    (recurrence.EPOCH_PERIODS) the supported (world, period) cells of all, the worlds with an unsupported
-    in-domain cell (E^U = +inf whenever any: complete support is required, never assumed), the failing rules,
-    and the periods excluded from the domain. Support is joint over the readouts (both are required)."""
+def epoch_coverage(designs, per_world, grid):
+    """E^U's support coverage in one epoch (#68 round 4 (D), round 5 P2-2 / D3): the ACTUAL period grid, the
+    registered one and the excluded periods; per world x readout (C, Q; and jointly) x period band, the
+    supported cells of all; the totals; the worlds with an unsupported cell (E^U = +inf whenever any:
+    complete support is required, never assumed) and the failing rules. A readout's candidate is supported
+    when its within and reference designs pass rules 1-5 and its fitted-phase chain exists (rule 6), the
+    capture denominator positive (capture); the joint support is analyze_world's."""
     bands = (("4-8", 4.0, 8.0), ("9-14", 9.0, 14.0), ("15-20", 15.0, 20.0))
-    out = {"domain": [min(recurrence.EPOCH_PERIODS), max(recurrence.EPOCH_PERIODS)],
-           "excluded_periods": list(recurrence.EPOCH_EXCLUDED), "readouts": "joint (C and Q)",
-           "bands": {b: {"supported": 0, "cells": 0} for b, _, _ in bands}, "worlds": len(per_world),
-           "worlds_unsupported": 0, "fail_rules": {}}
-    for w in per_world:
+
+    def band(P):
+        return next((b for b, lo, hi in bands if lo <= P <= hi), f"{P:g}")
+    out = {"grid": list(grid), "registered": list(recurrence.EPOCH_PERIODS),
+           "excluded_periods": list(recurrence.EPOCH_EXCLUDED), "worlds": {}, "totals": {}, "worlds_unsupported": 0,
+           "fail_rules": {}}
+    for (wd, _), w in zip(designs, per_world):
+        rec = {h: {} for h in ("C", "Q", "joint")}
         bad = False
         for r in w["obs"]["periods"]:
-            band = next((b for b, lo, hi in bands if lo <= r["P"] <= hi), "other")
-            d = out["bands"].setdefault(band, {"supported": 0, "cells": 0})
-            d["cells"] += 1
-            d["supported"] += bool(r["supported"])
+            P, b_ = r["P"], band(r["P"])
+            ro = r.get("readout") or {}
+            sup = {"joint": bool(r["supported"])}
+            for h in "CQ":
+                ok = not (wd.within[h].fails[P] or wd.ref[h].fails[P]) and bool((ro.get(h) or {}).get("chain"))
+                if h == "C":
+                    ok = ok and (ro.get("C") or {}).get("den", 0.0) > 0
+                sup[h] = bool(ok)
+            for h, v in sup.items():
+                d = rec[h].setdefault(b_, [0, 0])
+                d[0] += v
+                d[1] += 1
+                t_ = out["totals"].setdefault(h, {}).setdefault(b_, [0, 0])
+                t_[0] += v
+                t_[1] += 1
             if not r["supported"]:
                 bad = True
                 for f in r["fails"]:
                     out["fail_rules"][f] = out["fail_rules"].get(f, 0) + 1
+        out["worlds"][wd.id] = rec
         out["worlds_unsupported"] += bad
     return out
 
@@ -452,17 +553,26 @@ def classify(obs_e, draws_e, gate, a=LEVEL):
 
 
 def ht(epochs, betas, gates, loads=None, k=0, analysis="main", draws=stats.B_BOOT, c_T=GUARD, p_model=None,
-       report=True):
+       report=True, domain=None):
     """The complete H-T analysis. epochs: {e: [(WorldDesign for e, responses y)]} (the same unique world
     ids in every epoch, any order); betas: {e: {"P": {world id: slope}, "Q": {world id: slope}}}; gates:
     {e: the epoch's calibrated recurrence-detection gate (bool)}; loads: {world id: {"C": L, "Q": L}}
     reference-source loadings (k columns). Bootstrap draws are computed when a candidate is eligible or
     report is set. c_T None (an unavailable calibration, e.g. a capped mode: #68 round 4 P3) never enters
     a comparison: the result is unavailable, never a rejection (p = 1 in Holm). The result reports the
-    E^U support COVERAGE per epoch (the registered domain recurrence.EPOCH_PERIODS, by period band)."""
+    E^U support COVERAGE per epoch (the registered domain recurrence.EPOCH_PERIODS, by period band). Every
+    epoch design must use the registered domain (#68 round 5 P2-2: recurrence.EPOCH_PERIODS, or `domain` in a
+    test); a design on any other list makes the analysis unavailable (failure "domain")."""
     calibrated = c_T is not None
     c_T = max(GUARD, c_T) if calibrated else GUARD
     ids = canonical_ids(epochs, betas, loads)
+    grid = tuple(recurrence.EPOCH_PERIODS) if domain is None else tuple(float(p) for p in domain)
+    off = sorted({(e, wd.id) for e in EPOCHS for wd, _ in epochs[e] if tuple(wd.periods) != grid})
+    if off:                                  # (#68 round 5 P2-2: the registered domain, never a supplied list)
+        return {"available": False, "reject": False, "T_T": None, "winner": None, "candidates": [], "worlds": ids,
+                "error": f"epoch designs off the registered period domain {list(grid)}: {off[:4]}",
+                "failure": "domain", "c_T": None if not calibrated else c_T, "p_model": p_model, "phase_support": {},
+                "EU_unsupported": {}}
     n = len(ids)
     missing = [e for e in EPOCHS if gates.get(e) is None]
     if missing:                                        # (H.12: every gate H-T requires needs a passing calibration)
@@ -488,7 +598,7 @@ def ht(epochs, betas, gates, loads=None, k=0, analysis="main", draws=stats.B_BOO
         for e in EPOCHS:
             obs[e], dr[e], res[e] = epoch_components(per[e], bet[e], idx)
         stat = ht_statistic(obs, dr, gates)
-        coverage = {e: epoch_coverage(per[e]) for e in EPOCHS}
+        coverage = {e: epoch_coverage(epochs[e], per[e], grid) for e in EPOCHS}
     except TransitionError as err:          # (a numerical failure anywhere: unavailable, never a rejection)
         return {"available": False, "reject": False, "T_T": None, "error": str(err), "failure": "numerical",
                 "winner": None,

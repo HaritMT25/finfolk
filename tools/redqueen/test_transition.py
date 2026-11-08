@@ -190,17 +190,18 @@ class TestTransition(unittest.TestCase):
         tr, rc = self.tr, self.rc
         refs = np.array(["a", "b", "c", "d"], object)
         nw = 3
-        epochs, betas, loads = {}, {}, {}
+        epochs, betas, loads, geo = {}, {}, {}, {}
         for e in tr.EPOCHS:
             L, U = rc.SCOPES[e]
             t = np.array([max(L, 1e-6)] + [L + float(k) for k in range(1, 51)])
             ti, tj = (a.ravel() for a in np.meshgrid(t, t, indexing="ij"))
             rt, rr = np.tile(t, 4), np.repeat(refs, len(t))
             cw, cr = rc.Cov(np.full(len(ti), 1e-4)), rc.Cov(np.full(len(rt), 1e-4))
+            geo[e] = (ti, tj, rt, rr, cw, cr)
             epochs[e], betas[e] = [], {"P": {}, "Q": {}}
             for w in range(nw):
                 wd = rc.WorldDesign(f"w{w}", {"C": (ti, tj, cw), "Q": (ti, tj, cw)}, {"C": (rt, rr, cr), "Q": (rt, rr, cr)},
-                                    e, (8.0, 12.0, 25.0))
+                                    e)                                # (#68 round 5: the registered grid)
                 P, ph = (8.0, 12.0, 8.0)[w], 0.7 * w
                 amp = 1.0 if e == "E2" else 0.0
                 lag = 2 * math.pi * (tj - ti) / P - ph
@@ -232,13 +233,22 @@ class TestTransition(unittest.TestCase):
         self.assertTrue(out["available"])
         self.assertEqual(set(out["phase_support"]), set(tr.EPOCHS))
         self.assertGreater(out["components"]["E2"]["EF_C"], 0)
-        self.assertEqual(out["components"]["E1"]["EF_C"], 0.0)
+        self.assertLess(out["components"]["E1"]["EF_C"], 1e-20)         # (no recurrence in E1)
         self.assertIn(out["classes"]["E1"]["class"], ("ARD", "unresolved"))
         self.assertEqual(out["worlds"], ["w0", "w1", "w2"])
-        cov = out["coverage"]["E2"]                                  # (#68 round 4 (D): E^U support coverage)
-        self.assertEqual(cov["worlds"], 3)
-        self.assertEqual(cov["excluded_periods"], [25.0])
-        self.assertEqual(sum(v["cells"] for v in cov["bands"].values()), 3 * 3)
+        cov = out["coverage"]["E2"]                       # (D3: per world x readout x band, the actual grid)
+        self.assertEqual(sorted(cov["worlds"]), ["w0", "w1", "w2"])
+        self.assertEqual((cov["grid"], cov["registered"], cov["excluded_periods"]),
+                         (list(rc.EPOCH_PERIODS), list(rc.EPOCH_PERIODS), [25.0]))
+        self.assertEqual(sum(v[1] for v in cov["totals"]["joint"].values()), 3 * len(rc.EPOCH_PERIODS))
+        self.assertEqual(set(cov["worlds"]["w0"]), {"C", "Q", "joint"})
+        self.assertEqual(sorted(cov["worlds"]["w0"]["C"]), ["15-20", "4-8", "9-14"])
+        ti2, tj2, rt2, rr2, cw2, cr2 = geo["E2"]                    # (one design on a supplied list: refused)
+        bad_wd = rc.WorldDesign("w1", {"C": (ti2, tj2, cw2), "Q": (ti2, tj2, cw2)},
+                                {"C": (rt2, rr2, cr2), "Q": (rt2, rr2, cr2)}, "E2", (8.0, 12.0, 25.0))
+        off = {e: [(bad_wd if e == "E2" and wd.id == "w1" else wd, y_) for wd, y_ in epochs[e]] for e in tr.EPOCHS}
+        dom = tr.ht(off, betas, {e: True for e in tr.EPOCHS}, loads=None, k=0, analysis="t", draws=19)
+        self.assertEqual((dom["available"], dom["reject"], dom["failure"]), (False, False, "domain"))
         nc = tr.ht(epochs, betas, {e: True for e in tr.EPOCHS}, loads=None, k=0, analysis="t", draws=19, c_T=None)
         self.assertEqual((nc["available"], nc["reject"], nc["c_T"]), (False, False, None))   # (no calibration)
         # #68 review 11: identities, not positions. One epoch's worlds reversed (their slopes keyed by id):
@@ -330,6 +340,68 @@ class TestTransition(unittest.TestCase):
         r2, _ = tr.energy(np.array([[8e153], [-8e153]]), np.array([2e154]), "C", "w")
         self.assertAlmostEqual(r2[0], 0.16, delta=1e-15)
 
+    def test_draw_loop_lever_matches_the_per_period_path(self):
+        """#68 draw-loop lever 1 against the pre-lever per-period path (the oracle below, verbatim): on random
+        epoch panels with a fixed reference-source draw, the per-draw gates, selections and window decisions
+        agree EXACTLY and the energies to <= 1e-12 relative, including a capture denominator near 0 (some draws
+        <= 0: the registered +inf) and a degenerate (collinear, duplicated) avgQ."""
+        tr, rc = self.tr, self.rc
+        rng = np.random.default_rng(11)
+        refs = np.array(["a", "b", "c", "d"], object)
+        for trial in range(4):
+            L, U = rc.SCOPES["E2"]
+            t = np.array([L] + [L + float(k) for k in range(1, 51)])
+            ti, tj = (a_.ravel() for a_ in np.meshgrid(t, t, indexing="ij"))
+            rt, rr = np.tile(t, 4), np.repeat(refs, len(t))
+            cw, cr = rc.Cov(np.full(len(ti), 1e-4)), rc.Cov(1e-4 * (1 + rng.random(len(rt))))
+            wd = rc.WorldDesign(f"w{trial}", {"C": (ti, tj, cw), "Q": (ti, tj, cw)}, {"C": (rt, rr, cr), "Q": (rt, rr, cr)},
+                                "E2", (6.0, 8.0, 12.0, 17.0))
+            P0, ph = (8.0, 12.0, 6.0, 17.0)[trial], rng.uniform(0, 6)
+            lag = 2 * math.pi * (tj - ti) / P0 - ph
+            dc = 0.4 if trial != 2 else 0.002                                 # (trial 2: a denominator near 0)
+            y = {"within": {"C": 0.3 + 0.05 * np.cos(lag), "Q": -0.1 + 0.02 * np.cos(lag)},
+                 "ref": {"C": dc + 0.05 * np.cos(2 * math.pi * rt / P0 - ph) + 0.01 * rng.standard_normal(len(rt)),
+                         "Q": -0.1 + 0.02 * np.cos(2 * math.pi * rt / P0 - ph) + 0.005 * rng.standard_normal(len(rt))}}
+            if trial == 3:                                                     # (a degenerate, collinear avgQ)
+                for hm in wd.ref["C"].harm.values():
+                    if hm.avgQ is not None and len(hm.avgQ):
+                        hm.avgQ = np.outer(np.repeat(np.linspace(-1, 1, (len(hm.avgQ) + 1) // 2), 2)[:len(hm.avgQ)],
+                                           [0.3, -0.7])
+            Lc = np.zeros((len(rt), 2))
+            Lc[:, 0] = 0.01 * np.sin(np.arange(len(rt)))
+            Lc[:, 1] = 0.003 * np.cos(2 * math.pi * rt / 8.0 + 1.3) if trial != 2 else 0.004   # (trial 2: den crosses 0)
+            xi = tr.VecSplitMix64(5 + trial).normals(2 * 999).reshape(999, 2)
+            new = tr.world_epoch(wd, y, {"C": Lc, "Q": 0.5 * Lc}, xi, _expose=True)
+            old = _world_epoch_oracle(tr, rc, wd, y, {"C": Lc, "Q": 0.5 * Lc}, xi)
+            for k in ("selC", "selQ", "maxC", "maxQ"):
+                fin = np.isfinite(old[k])
+                self.assertTrue(np.array_equal(fin, np.isfinite(new[k])), k)
+                self.assertTrue(np.array_equal(old[k] > 0, new[k] > 0), k)       # (the same selections / gates)
+                self.assertLessEqual(float(np.max(np.abs(old[k][fin] - new[k][fin]) / np.maximum(np.abs(old[k][fin]), 1e-300),
+                                                  initial=0.0)), 1e-10, k)
+            for h in "CQ":
+                self.assertTrue(np.array_equal(old["_G"][h], new["_G"][h]), h)       # (0 gate differences)
+                fo, fn = np.isfinite(old["_r2"][h]), np.isfinite(new["_r2"][h])
+                self.assertTrue(np.array_equal(fo, fn) and np.array_equal(np.isnan(old["_r2"][h]), np.isnan(new["_r2"][h])))
+                # (the error relative to the energy's rounding scale ||avgQ||^2 ||x||^2 / m, which bounds the energy:
+                # both routes are backward stable; on near-cancelling draws plain relative differences reach ~2e-12)
+                d = np.abs(old["_r2"][h][fo] - new["_r2"][h][fo]) / np.maximum(old["_scale"][h][fo], 1e-300)
+                self.assertLessEqual(float(np.max(d, initial=0.0)), 1e-12, h)
+                rel = np.abs(old["_r2"][h][fo] - new["_r2"][h][fo]) / np.maximum(np.abs(old["_r2"][h][fo]), 1e-300)
+                self.assertLessEqual(float(np.max(rel, initial=0.0)), 1e-10, h)
+            if trial == 2:
+                self.assertTrue(np.isinf(old["maxC"]).any() or np.isinf(old["_r2"]["C"]).any())
+        for Q in (rng.standard_normal((51, 2)), np.outer(np.linspace(-1, 1, 51), [0.3, -0.7]),
+                  np.repeat(rng.standard_normal((5, 2)), 10, axis=0)):            # (generic, collinear, duplicated)
+            bb = rng.standard_normal((2, 999)) * np.array([[1.0], [1e3]])
+            want = np.ptp(Q @ bb, axis=0)
+            got = tr.range_hull(bb, tr.hull_vertices(Q), "w")
+            sc = np.linalg.norm(Q, 2) * np.linalg.norm(bb, axis=0)
+            self.assertLessEqual(float(np.max(np.abs(got - want) / sc)), 1e-12)
+        V = tr.hull_vertices(np.array([[0, 0], [1, 1], [2, 2], [2, 2], [1, 0], [0, 1], [0.5, 0.5]]))
+        self.assertEqual(sorted(map(tuple, V.tolist())), [(0.0, 0.0), (0.0, 1.0), (1.0, 0.0), (2.0, 2.0)])
+        self.assertEqual(tr.hull_vertices(np.array([[1.0, 2.0], [1.0, 2.0]])).tolist(), [[1.0, 2.0]])
+
     def test_mixed_needs_affirmative_evidence(self):
         """#68 review 8: material recurrence with directional bounds spanning the band is UNRESOLVED, not
         mixed; bounds without a passed gate are unresolved; mixed needs both affirmatively."""
@@ -345,6 +417,70 @@ class TestTransition(unittest.TestCase):
         self.assertEqual(tr.classify(o["E1"], d["E1"], True)["class"], "mixed")
         c = tr.classify(o["E1"], d["E1"], False)                 # (the epoch gate failed)
         self.assertEqual((c["class"], c["recurrent"], c["recurrence_bounds"]), ("unresolved", False, True))
+
+
+def _world_epoch_oracle(tr, rc, wd, y, loads, xi, lever=False):
+    """The pre-lever world_epoch (transition.py before #68 draw-loop lever 1), verbatim but for exposing the
+    per-period gates and energies; lever=True swaps in the lever's energy and range only."""
+    obs = rc.analyze_world(wd, y)
+    B = xi.shape[0]
+    P_all = [r["P"] for r in obs["periods"]]
+    static = [set(r["fails"]) <= {"6-windows", "capture-denominator"} for r in obs["periods"]]
+    G = {h: np.zeros((len(P_all), B), bool) for h in "CQ"}
+    r2 = {h: np.full((len(P_all), B), np.nan) for h in "CQ"}
+    scale = {h: np.full((len(P_all), B), np.nan) for h in "CQ"}
+    for h in "CQ":
+        rd = wd.ref[h]
+        if not hasattr(rd, "proj") or not any(static):
+            continue
+        yh = np.asarray(y["ref"][h], float)[rd.mask]
+        Lh = loads.get(h) if loads else None
+        Lm = np.asarray(Lh, float)[rd.mask] if Lh is not None else None
+        where = f"world {wd.id}"
+
+        def lin(op):
+            base = op @ yh
+            if Lm is None:
+                return np.repeat(np.asarray(base, float)[..., None], B, axis=-1)
+            return np.asarray(base, float)[..., None] + np.asarray(op @ Lm) @ xi.T
+        rho, den = lin(rd.rbar), lin(rd.mean_op)
+        cs = tr.cumulative(rho, where)
+        for i, P in enumerate(P_all):
+            if not static[i]:
+                continue
+            hm = rd.harm[P]
+            b = hm.Sqinv @ lin(hm.WQ.T)
+            a = hm.Rinv @ b
+            A = np.hypot(a[0], a[1])
+            phi = np.arctan2(a[1], a[0])
+            if lever:
+                r2[h][i] = tr.energy_form(b, np.linalg.qr(hm.avgQ, mode="r"), len(hm.avgQ), den, h, where)
+                Rf = tr.range_hull(b, tr.hull_vertices(hm.avgQ), where)
+            else:
+                r2[h][i], Rf = tr.energy(hm.avgQ @ b, den, h, where)
+            x = b / np.where(den > 0, den, 1.0)[None, :] if h == "C" else b
+            scale[h][i] = np.linalg.norm(hm.avgQ, 2) ** 2 * np.sum(x * x, axis=0) / max(len(hm.avgQ), 1)
+            lo, hi, kk, ok = rd.tables[P].lookup(phi)
+            rev, ret = tr.windows(cs, lo, hi, kk, Rf, where)
+            g = ok & (A > 0) & rev & ret
+            if h == "C":
+                g &= den > 0
+            G[h][i] = g
+    JC = np.array([r.get("J_C", 0.0) for r in obs["periods"]])
+    JQ = np.array([r.get("J_Q", 0.0) for r in obs["periods"]])
+    s = (G["C"] & G["Q"]) * np.minimum(JC, JQ)[:, None]
+    best = s.max(axis=0) if len(P_all) else np.zeros(B)
+    sel = s.argmax(axis=0) if len(P_all) else np.zeros(B, int)
+    g = best > 0
+    cols = np.arange(B)
+    out = {"selC": np.where(g, r2["C"][sel, cols], 0.0), "selQ": np.where(g, r2["Q"][sel, cols], 0.0), "_G": G,
+           "_r2": r2, "_scale": scale}
+    EU, unsup = tr.eu_observed(obs)
+    if obs["periods"] and not unsup:
+        out["maxC"], out["maxQ"] = np.max(r2["C"], axis=0), np.max(r2["Q"], axis=0)
+    else:
+        out["maxC"] = out["maxQ"] = np.full(B, np.inf)
+    return out
 
 
 if __name__ == "__main__":
