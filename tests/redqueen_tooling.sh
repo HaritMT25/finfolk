@@ -490,7 +490,8 @@ E = lambda fam, role, p, q, **kw: dict({"family": fam, "role": role, "prey": dic
 edges = [E("within", "training", ("A", "T1500"), ("A", "T3000")), E("within", "training", ("A", "T3000"), ("A", "T1500")),
          E("within", "training", ("A", "T3000"), ("A", "T3000")), E("cross", "training", ("A", "T3000"), ("B", "T3000")),
          E("cross", "validation", ("B", "T3000"), ("A", "T3000")), E("nopred", "training", ("A", "T3000"), None),
-         E("grid", "training", ("B", "T1500"), ("A", "T1500"), horizon="long")]
+         E("grid", "training", ("B", "T1500"), ("A", "T1500"), horizon="long"),
+         dict(E("scripted", "training", ("A", "T3000"), None), predators={"source": "scripted"}, horizon="short")]
 with open("edges.jsonl", "w") as f:
     f.write("".join(json.dumps(e) + "\n" for e in edges))
 v2 = {"schema": "finfolk.redqueen.design/2", "name": "smoke-v3", "seed_namespace": "rq-smoke-v3",
@@ -508,12 +509,12 @@ $RUN --plan plan_v3.jsonl --root r15 --binary "$BIN" --workers $NW --chunk-size 
 $PY - "$T" <<'PY' || fail "the v3 cells"
 import json, sys; sys.path.insert(0, sys.argv[1]); import store, rqlib
 rows = {json.loads(l)["id"]: json.loads(l) for l in open("plan_v3.jsonl")}
-assert len(rows) == 14 and all(r["schema"] == "finfolk.redqueen.plan/2" for r in rows.values())
+assert len(rows) == 16 and all(r["schema"] == "finfolk.redqueen.plan/2" for r in rows.values())
 _, cells = store.load_index("r15")
 assert sorted(cells) == sorted(rows), sorted(set(cells) ^ set(rows))
 ref = json.load(open("ages.json"))
 lm = json.load(open("long_v3.json"))
-assert lm["units"] == 6 and lm["long"] == 2, lm
+assert lm["units"] == 6 and lm["long"] == 2, lm          # (the scripted edge's horizon is fixed short)
 B = {c: json.loads(store.read_member("r15", c, cells=cells)) for c in cells}
 for cid, b in B.items():
     c = b["cell"]
@@ -526,6 +527,19 @@ for cid, b in B.items():
     assert abs(man["ages"]["mean"] - sum(ref["ages"]) / len(ref["ages"])) < 1e-9 and man["ages"]["permutation_seed"] == c["seeds"]["ages"]
     assert man["sampling"]["policy"] == "wor-balanced" and man["sampling"]["distinct_individuals"] > 0
 assert B["B.T1500~A.T1500.common.frozen.k3.r00"]["cell"]["horizon"] == "long"
+# the scripted benchmark (the engine's --predators-from scripted): K fixed, immortal Stage A hunters,
+# a version-1 arena, no predators.csv, captures from the predation counter; its own transplant group
+for r_ in ("r00", "r01"):
+    sb = B[f"A.T3000~scripted.common.frozen.k3.{r_}"]
+    assert sb["engine_args"]["transplant"][sb["engine_args"]["transplant"].index("--predators-from") + 1] == "scripted"
+    assert sb["score"]["scripted"] and "run.predators.csv" not in sb["files"] and sb["predators_csv"] == "", r_
+    h = sb["score"]["horizons"][0]
+    assert h["predators"] == 3 and abs(h["predator_seconds"] - 3 * 400 * 0.016) < 1e-9, h
+    assert h["captures"] == h["deaths_predation"] and h["survivors"] >= 0, h
+    assert sb["arena_manifest"]["predators"]["source"] == "scripted" and sb["arena_manifest"]["predators"]["count"] == 3
+    assert sb["cell"]["groups"]["transplant"].endswith(f"|scripted-k3|{r_}"), sb["cell"]["groups"]
+    # the same prey snapshot x replicate: one common checkpoint and one reseed with the neural cells
+    assert sb["files"]["common.json"] == B[f"A.T3000~A.T1500.common.frozen.k3.{r_}"]["files"]["common.json"]
 # one prey snapshot x replicate: one common checkpoint and one reseed, whatever the family or opponent
 x, y, z = (B[f"A.T3000~{q}.common.frozen.k{k}.r01"] for q, k in (("A.T1500", 3), ("B.T3000", 3), ("none", 0)))
 assert x["files"]["common.json"] == y["files"]["common.json"] == z["files"]["common.json"]

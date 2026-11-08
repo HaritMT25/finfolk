@@ -4228,6 +4228,33 @@ static void test_predator_brain() {
         float sn[NUM_PRED_SENSES] = {};
         predbrain::writeOwnSensors(t2.predators[0], t2.cfg, predbrain::topSpeed(t2.predators[0], t2.cfg), sn);
         CHECK(bitEq(sn[PS_ENERGY], 0.0f) && bitEq(sn[PS_AGE], 0.0f) && t2.predators.size() == 3u);
+        // scripted (Stage A) hunters: no brain, immortal and fixed, the same layout as any source; the
+        // arena is a version-1 checkpoint that resumes; live is refused (the H-C scripted benchmark)
+        {
+            transplant::Options sc; sc.predatorsFrom = "scripted"; sc.count = 3; sc.seed = 9u; sc.assay = "frozen";
+            transplant::Options rr = sc; rr.predatorsFrom = "random";
+            World s1 = loadX(), r1 = loadX();
+            std::string ms;
+            CHECK(transplant::apply(s1, sc, "", ms, err) && transplant::apply(r1, rr, "", ms, err));
+            bool ok = s1.predators.size() == 3u && !s1.cfg.predatorBrain && !s1.cfg.predatorEconomy &&
+                      !s1.cfg.predatorFrozen && s1.cfg.predatorCount == 3 && s1.creatures.size() == X.creatures.size();
+            for (size_t i = 0; ok && i < 3; ++i)
+                ok = bitEq(s1.predators[i].pos.x, r1.predators[i].pos.x) && bitEq(s1.predators[i].pos.y, r1.predators[i].pos.y)
+                     && s1.predators[i].genome.empty();
+            CHECK(ok);
+            const std::string sb = checkpoint::serialize(s1, "t");
+            CHECK(sb.find("\"formatVersion\":1") != std::string::npos);
+            World s2;
+            CHECK(checkpoint::deserialize(sb, s2, err) && checkpoint::serialize(s2, "t") == sb);
+            for (int i = 0; i < 300; ++i) s2.update(0.016f);
+            CHECK(s2.predators.size() == 3u);                       // immortal, fixed: no deaths, no buds
+            transplant::Options lv2 = sc; lv2.assay = "live";
+            World s3 = loadX();
+            CHECK(!transplant::apply(s3, lv2, "", ms, err) && err.find("scripted") != std::string::npos);
+            transplant::Options nk = sc; nk.count = -1;
+            World s4 = loadX();
+            CHECK(!transplant::apply(s4, nk, "", ms, err));
+        }
         // random founders; a brain-less Y is refused; live keeps X's config
         transplant::Options rnd; rnd.predatorsFrom = "random"; rnd.count = 4; rnd.assay = "live";
         World d = loadX();
