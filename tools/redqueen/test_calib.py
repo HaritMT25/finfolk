@@ -175,6 +175,37 @@ class TestGenerator(unittest.TestCase):
             with self.assertRaises(cb.CalibError):
                 cb.location(np.array([bad]), np.array([0.3]), 600)
 
+    def test_d4_production_requires_the_bank_curve(self):
+        """Codex r8 P2-1: production parameters need validated monotone s_logit curves for C, S and F (the
+        blended bins only for synthetic / comparison runs); noise_scale evaluates them through noisescale (the
+        evaluator the bank's V builder shares); malformed curves are refused anywhere."""
+        cb = self.cb
+        p = cb.placeholder_params()
+        p["fitted"] = True
+        with self.assertRaises(cb.CalibError):
+            cb.check_params(p, production=True)                    # (bins only)
+        cb.check_params(p)                                         # (fine for a synthetic run)
+        good = {"C": {"x": [-2.0, 0.0, 1.5], "s": [0.6, 0.3, 0.25], "direction": "decreasing"},
+                "S": {"x": [0.0], "s": [0.2]}, "F": {"x": [-1.0, 2.0], "s": [0.2, 0.3]}}
+        p["noise"]["s_logit"] = good
+        cb.check_params(p, production=True)
+        mu = np.array([1e-6, 0.1, 0.5, 0.7, 0.99])
+        self.assertEqual(cb.noise_scale(p, "C", mu).tobytes(), cb.noisescale.evaluate(good["C"], mu).tobytes())
+        self.assertTrue(np.all(np.diff(cb.noise_scale(p, "C", mu)) <= 0))
+        self.assertEqual(float(cb.noise_scale(p, "C", np.array([1e-9]))[0]), 0.6)      # (constant beyond)
+        bad = [{"x": [0.0, 0.0], "s": [0.3, 0.2]}, {"x": [1.0, 0.0], "s": [0.3, 0.2]},
+               {"x": [0.0, 1.0, 2.0], "s": [0.3, 0.2, 0.3]}, {"x": [0.0], "s": [0.0]},
+               {"x": [0.0, float("nan")], "s": [0.3, 0.2]}, {"x": [0.0, 1.0], "s": [0.3]},
+               {"x": [0.0, 1.0], "s": [0.2, 0.3], "direction": "decreasing"}, {"x": [], "s": []}, [0.3]]
+        for b in bad:
+            p["noise"]["s_logit"] = dict(good, S=b)
+            with self.assertRaises(cb.CalibError):
+                cb.check_params(p)
+        p["noise"]["s_logit"] = {"C": good["C"], "S": good["S"]}
+        with self.assertRaises(cb.CalibError):
+            cb.check_params(p)                                     # (F missing)
+        self.assertEqual(len(cb.solver_identity()["m0_basis"]), 64)
+
     def test_d4_grid_table_cache(self):
         """The D4 warm-up fix: the grid tables and cell checks are built once and, with TABLE_CACHE, stored and
         reloaded BITWISE (no rebuild: expected_fraction is never called on a warm cache); a damaged entry is a

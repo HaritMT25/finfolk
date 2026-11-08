@@ -51,7 +51,9 @@ m_w (the reference: evolutionary multiplicity one). crossed_mean_draws returns r
 CALIBRATION ARITHMETIC (H.11, H.12). The one-sided Clopper-Pearson U95 = Beta^-1(0.95; k + 1, N - k)
 (1 if k = N); a null rate passes iff U95 <= 0.02 (N = 1,000: at most 12 false positives). Development
 critical value: the plus-one 0.99 order statistic. Model p-values (1 + #{null >= s}) / (N + 1), the
-maximum over strata. CPU: 24,000 x 14.4 s = 96 CPU-h; target (96 - 6) x 3600 / 24,000 = 13.5 s/panel.
+maximum over strata. CPU (H.12 as amended by D5, compute only, 2026-11-08: the ceiling 96 -> 240 CPU-h, the rest
+of H.12 unchanged, the ledger the record): 24,000 x 36 s = 240 CPU-h; target (240 - 6) x 3600 / 24,000 =
+35.1 s/panel.
 """
 from __future__ import annotations
 
@@ -72,7 +74,7 @@ DELTA_P = math.log(1.10)
 DELTA_Q = 0.02
 DELTA_C = 0.02
 BOUND_ALPHA = 0.01           # H.5's reported one-sided 99% lower bounds (fixed, not the decision level)
-CPU_CEILING_H = 96.0
+CPU_CEILING_H = 240.0         # (Annex amendment D5: was 96)
 CPU_RESERVE_H = 6.0
 PANELS = 24_000
 

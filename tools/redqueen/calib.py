@@ -49,16 +49,20 @@ is a documented synthetic stand-in ("fitted": false) for the tests and the bench
   channel, the unweighted (OLS) projection of the means onto that scope's own nuisance basis (the within
   design's tensor backbone, the reference design's time basis + reference effects, the predator-free
   survival's six B-splines in prey time), clipped to [1/2N, 1 - 1/2N]; the delta method; shared columns
-  per sharing key. The weights then cannot track the tested recurrent component (a score-test-style
-  metric under H0). The triage metric fits the TRUE means, the final metric (the analysis) the OBSERVED
+  per sharing key. The weights then cannot track a tested component that is ORTHOGONAL to the scope's
+  nuisance basis (m0 is exactly unchanged by it: a score-test-style metric under H0); a general harmonic
+  can overlap the basis and move m0 (the fixture's 3% metric-induced change is no general bound). The triage metric fits the TRUE means, the final metric (the analysis) the OBSERVED
   replicate means; the H-T shared-reference loadings use each reference row's epoch fit. V is computed
   ONCE per observed panel and held fixed across the bootstrap draws (V_PER_DRAW = False: a registered
   conditional approximation, measured by the calibration as part of the whole procedure); True re-fits
   m0 and V for every draw (Panel.redesign through transition.ht(redesign=...): exact but slow).
-  s(mu) is SMOOTH and monotone (D4): a fitted noise-bank curve on logit(mu) when the parameters carry one
-  (noise.s_logit: knots and values, linear between, constant beyond), else the registered bins blended
+  s(mu) is SMOOTH and monotone (D4): the noise bank's fitted curve on logit(mu) (noise.s_logit, evaluated
+  by noisescale.py, the ONE evaluator the bank's V builder shares: knots and values, linear between,
+  constant beyond). PRODUCTION REQUIRES validated curves for C, S and F (check_params; Codex r8 P2-1).
+  Synthetic and comparison runs only, when the parameters carry no curve, use the registered bins blended
   linearly on logit(mu) over SMOOTH_W = 0.8 logit units centred on each bin edge (SMOOTH_W = 0 is exactly
-  the bins); the validation-stress capture floor (0.80 / 0.35 at 0.35) is blended alike. The generator's
+  the bins; NOT monotone in general, e.g. the placeholder's survival bins). The validation-stress capture
+  floor (0.80 / 0.35 at 0.35) is blended alike. The generator's
   location a(mu; s) interpolates linearly between tables on the registered s grid (S_STEP = 0.005), each
   grid cell's interpolation verified once at its midpoint (|E[K/N] - mu| <= LOC_S_TOL). The grid tables
   depend on (s, N) only: they are built once per process, or once per code identity with the on-disk cache
@@ -162,7 +166,7 @@ by crit / accept).
     python3 calib.py panels --hyp H-T ... --gates gates.json ...; crit / accept / power likewise
     python3 calib.py bench --hyp H-F [--graph g.jsonl.gz] [--params p.json] [--panels 50]
     python3 calib.py report dev_*.jsonl val_*.jsonl > report.json       (proposals, clips, boundaries, CPU)
-    python3 calib.py ledger cpu.jsonl [--add fitting 7200]               (the cumulative CPU against 96 h)
+    python3 calib.py ledger cpu.jsonl [--add fitting 7200]               (the cumulative CPU against 240 h: D5)
 """
 from __future__ import annotations
 
@@ -185,6 +189,7 @@ if __name__ == "__main__":                 # one BLAS thread per process: honest
 import numpy as np  # noqa: E402
 
 import backbone  # noqa: E402
+import noisescale  # noqa: E402
 import recurrence  # noqa: E402
 import stats  # noqa: E402
 import transition  # noqa: E402
@@ -479,9 +484,19 @@ def check_params(p, production=False):
     if np.any(np.abs(tot - 1) > 1e-9) or SR[2, 2] > 1:
         raise CalibError("generator parameters: row + donor + cell variance must be the unit latent variance "
                          "(capture and exposed survival), the free row at most 1")
-    for ch in ("C", "S", "F"):
-        if np.any(np.asarray(nz["s"][ch], float) <= 0):
-            raise CalibError(f"generator parameters: noise scales s_{ch} must be positive")
+    if "s_logit" in nz:                      # (D4 / Codex r8 P2-1: the bank's monotone curves, validated)
+        try:
+            noisescale.check_set(nz["s_logit"])
+        except noisescale.ScaleError as e:
+            raise CalibError(f"generator parameters: {e}")
+    elif production:
+        raise CalibError("generator parameters: production needs the noise bank's monotone s(mu) curves "
+                         "(noise.s_logit for C, S and F; D4); the blended bins are for synthetic and comparison "
+                         "runs only")
+    if "s_logit" not in nz or "s" in nz:
+        for ch in ("C", "S", "F"):
+            if np.any(np.asarray(nz["s"][ch], float) <= 0):
+                raise CalibError(f"generator parameters: noise scales s_{ch} must be positive")
     return p
 
 
@@ -498,16 +513,15 @@ def _edge_weight(mu, edge, width):
 
 
 def noise_scale(p, ch, mu, stress=False, extra=1.0):
-    """s_ch(mu), SMOOTH and monotone (D4): the noise bank's fitted curve on logit(mu) when the parameters carry
-    one (noise.s_logit[ch]: {"x": logit knots, "s": values}; linear between, constant beyond), else the
-    registered bins blended on logit(mu) over SMOOTH_W at each edge (SMOOTH_W = 0: exactly the bins).
-    Validation stress (H.9.2): capture max(1.5 s, the floor 0.80 below 0.35 / 0.35 above, blended alike),
-    survival 1.5 s."""
+    """s_ch(mu), SMOOTH and monotone (D4): the noise bank's fitted curve (noise.s_logit[ch], evaluated by
+    noisescale.evaluate: the evaluator the bank's V builder shares; production requires it, check_params).
+    Synthetic / comparison runs without a curve: the registered bins blended on logit(mu) over SMOOTH_W at
+    each edge (SMOOTH_W = 0: exactly the bins; not monotone in general). Validation stress (H.9.2): capture
+    max(1.5 s, the floor 0.80 below 0.35 / 0.35 above, blended alike), survival 1.5 s."""
     mu = np.asarray(mu, float)
     fn = (p["noise"].get("s_logit") or {}).get(ch)
     if fn:
-        x = np.log(np.clip(mu, 1e-300, None) / np.clip(1 - mu, 1e-300, None))
-        out = np.interp(x, np.asarray(fn["x"], float), np.asarray(fn["s"], float))
+        out = noisescale.evaluate(fn, mu)
     else:
         s = np.asarray(p["noise"]["s"][ch], float)
         lo, hi = CAP_BINS if ch == "C" else SURV_BINS
@@ -1900,8 +1914,10 @@ class Panel:
     def _cached(self, w, cache, ver, means, scope, src=None):
         """A cached design with its GUARD (#68 round 6 P3): the entry stores the means' version (a counter, never
         reused, unlike id()), the graph object, the scope's registered period tuple and the registered
-        evaluation means (METRIC_MEANS), and every lookup must match: a stale design is impossible (a mismatch
-        raises). The covariance is built at that scope's evaluation means (D4)."""
+        evaluation means (METRIC_MEANS), and every lookup must match (a mismatch raises). This guards the
+        registered lifecycle (means replaced, never mutated in place; the m0 basis is fixed code, fingerprinted
+        in solver_identity as m0_basis); it does not detect in-place mutation of arrays or parameters. The
+        covariance is built at that scope's evaluation means (D4)."""
         token = (w[ver], id(w["graph"]), tuple(recurrence.PERIODS[scope]), METRIC_MEANS, SMOOTH_W, id(src))
         dc = w.setdefault(cache, {})
         if scope not in dc:
@@ -2107,7 +2123,16 @@ def solver_identity():
             "boundary_tol": BOUNDARY_TOL, "tau_num": TAU_NUM, "rounds": ROUNDS, "n_min": N_MIN,
             "structural_modes": list(STRUCTURAL_MODES), "epoch_periods": list(recurrence.EPOCH_PERIODS),
             "metric_means": METRIC_MEANS, "v_per_draw": V_PER_DRAW, "smooth_w": SMOOTH_W, "s_step": S_STEP,
-            "loc_s_tol": LOC_S_TOL}
+            "loc_s_tol": LOC_S_TOL, "m0_basis": m0_basis()}
+
+
+def m0_basis():
+    """The D4 null fit's basis fingerprint (Codex r8 P3): the scope bounds, the B-spline knots and penalty, the
+    registered periods per scope and NULL_RCOND."""
+    return doc_sha({"scopes": {k: list(v) for k, v in sorted(recurrence.SCOPES.items())},
+                    "knots": [float(x) for x in backbone.KNOTS], "penalty": backbone.PENALTY,
+                    "periods": {k: [float(x) for x in v] for k, v in sorted(recurrence.PERIODS.items())},
+                    "null_rcond": NULL_RCOND})
 
 
 def manifest(graph, params, draws, gates=None, production=False, graph_source="synthetic"):
@@ -2829,7 +2854,7 @@ def ledger_add(path, entry):
 
 
 def ledger_total(paths):
-    """The cumulative CPU ledger against the 96 CPU-hour ceiling: every entry (panels, benches, shards,
+    """The cumulative CPU ledger against the H.12 ceiling (stats.CPU_CEILING_H = 240 CPU-h, amendment D5): every entry (panels, benches, shards,
     repairs, reruns; fitting and anything else added with `ledger --add`)."""
     ent = read_records(paths)
     by = {}

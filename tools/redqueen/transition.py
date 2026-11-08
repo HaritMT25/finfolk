@@ -276,15 +276,23 @@ def eu_observed(obs):
     return (math.inf, math.inf), [r["P"] for r in obs["periods"] if not r["supported"]]
 
 
-def world_epoch(wd, y, loads, xi, _expose=False):
+def world_epoch(wd, y, loads, xi, _expose=False, support=None):
     """One world, one epoch: observed analysis (recurrence.analyze_world) plus, over the bootstrap draws,
     per-candidate G_C, G_Q (rule 6 at each draw's phase) and r_C^2, r_Q^2 under the common reference-
     source draw xi (draws x k). loads: {"C": L (n_ref_obs x k), "Q": ...} on the full reference vectors
-    (None: no shared-reference uncertainty). -> dict of observed values and per-draw arrays."""
+    (None: no shared-reference uncertainty). -> dict of observed values and per-draw arrays, and "support":
+    the OBSERVED support decisions (the periods, which are statically evaluable, the E^U-unsupported ones).
+    support: such a record from the observed analysis under the FIXED design. The per-draw-V diagnostic
+    (D4 item 16; Codex r8 P2-2) passes it so that a draw's metric changes only V: the static candidate set
+    and the E^U support (finite or +inf) stay the observed ones, never re-decided under the draw's metric."""
     obs = recurrence.analyze_world(wd, y)
     B = xi.shape[0]
     P_all = [r["P"] for r in obs["periods"]]
     static = [set(r["fails"]) <= {"6-windows", "capture-denominator"} for r in obs["periods"]]
+    if support is not None:
+        if list(support["periods"]) != P_all:
+            raise TransitionError(f"world {wd.id} ({wd.scope}): the observed support is for other periods")
+        static = list(support["static"])
     G = {h: np.zeros((len(P_all), B), bool) for h in "CQ"}
     r2 = {h: np.full((len(P_all), B), np.nan) for h in "CQ"}
     for h in "CQ":
@@ -352,6 +360,9 @@ def world_epoch(wd, y, loads, xi, _expose=False):
     if _expose:                            # (tests: the per-period gates and energies)
         out.update(_G=G, _r2=r2)
     out["EU_obs"], unsup = eu_observed(obs)
+    if support is not None:
+        unsup = list(support["unsup"])
+    out["support"] = {"periods": P_all, "static": static, "unsup": unsup}
     if obs["periods"] and not unsup:
         out["maxC"] = np.max(r2["C"], axis=0)
         out["maxQ"] = np.max(r2["Q"], axis=0)
@@ -609,8 +620,9 @@ def ht(epochs, betas, gates, loads=None, k=0, analysis="main", draws=stats.B_BOO
             for e in EPOCHS:
                 for i, (w, (wd, y)) in enumerate(zip(ids, epochs[e])):
                     cols = {key: np.empty(xi.shape[0]) for key in ("selC", "selQ", "maxC", "maxQ")}
-                    for b in range(xi.shape[0]):
-                        we = world_epoch(redesign(e, w, xi[b]), y, (loads or {}).get(w), xi[b:b + 1])
+                    for b in range(xi.shape[0]):          # (the OBSERVED support decision: Codex r8 P2-2)
+                        we = world_epoch(redesign(e, w, xi[b]), y, (loads or {}).get(w), xi[b:b + 1],
+                                         support=per[e][i]["support"])
                         for key in cols:
                             cols[key][b] = we[key][0]
                     per[e][i] = dict(per[e][i], **cols)

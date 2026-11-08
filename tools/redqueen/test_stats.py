@@ -353,9 +353,10 @@ class TestMultiplicityAndCalibration(unittest.TestCase):
         self.assertTrue(stats.acceptance(12, 1000)["pass"])
         self.assertFalse(stats.acceptance(13, 1000)["pass"])
         self.assertEqual(stats.clopper_pearson_upper(5, 5), 1.0)
-        self.assertAlmostEqual(24_000 * 14.4 / 3600, 96.0)
-        self.assertAlmostEqual(24_000 * 13.5 / 3600, 90.0)
-        self.assertEqual(stats.cpu_targets(), {"ceiling_cpu_s_per_panel": 14.4, "target_cpu_s_per_panel": 13.5})
+        self.assertEqual(stats.CPU_CEILING_H, 240.0)                       # (amendment D5)
+        self.assertAlmostEqual(24_000 * 36.0 / 3600, 240.0)
+        self.assertAlmostEqual(24_000 * 35.1 / 3600, 234.0)
+        self.assertEqual(stats.cpu_targets(), {"ceiling_cpu_s_per_panel": 36.0, "target_cpu_s_per_panel": 35.1})
         self.assertEqual(stats.critical_value(list(range(160))), 159)    # ceil(.99 x 161) = 160: the maximum
         self.assertAlmostEqual(stats.model_p(5.0, {"a": [1.0, 6.0, 7.0], "b": [9.0, 9.0, 1.0]}), 3 / 4)
         self.assertAlmostEqual(stats.t_sf(2.0395134, 31), 0.025, places=5)

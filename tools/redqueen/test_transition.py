@@ -441,6 +441,105 @@ class TestTransition(unittest.TestCase):
                          json.dumps(b["components"], sort_keys=True, default=float))
         self.assertEqual(a["T_T"], b["T_T"])
 
+    def _eligible_fixture(self):
+        """Three worlds; E1 directional with no recurrence, E2 recurrent (period 8 / 12 / 8), E3 flat: the
+        candidate (E1 ARD, E2 FSD) is eligible; nonzero reference-source loadings move the draws."""
+        tr, rc = self.tr, self.rc
+        refs = np.array(["a", "b", "c", "d"], object)
+        epochs, betas, loads = {}, {"E1": {"P": {}, "Q": {}}, "E2": {"P": {}, "Q": {}}, "E3": {"P": {}, "Q": {}}}, {}
+        geo = {}
+        for e in tr.EPOCHS:
+            L, U = rc.SCOPES[e]
+            t = np.array([max(L, 1e-6)] + [L + float(k) for k in range(1, 51)])
+            ti, tj = (a.ravel() for a in np.meshgrid(t, t, indexing="ij"))
+            rt, rr = np.tile(t, 4), np.repeat(refs, len(t))
+            geo[e] = (ti, tj, rt, rr)
+            epochs[e] = []
+            for w in range(3):
+                P, ph = (8.0, 12.0, 8.0)[w], 0.7 * w
+                amp = 1.0 if e == "E2" else 0.0
+                lag = 2 * math.pi * (tj - ti) / P - ph
+                y = {"within": {"C": 0.3 + amp * 0.08 * np.cos(lag), "Q": -0.1 + amp * 0.08 * np.cos(lag)},
+                     "ref": {"C": 0.4 + amp * 0.08 * np.cos(2 * math.pi * rt / P - ph),
+                             "Q": -0.1 + amp * 0.08 * np.cos(2 * math.pi * rt / P - ph)}}
+                epochs[e].append((self._wd(f"w{w}", geo[e], e, 1.0), y))
+                betas[e]["P"][f"w{w}"] = 0.2 if e == "E1" else 0.0
+                betas[e]["Q"][f"w{w}"] = 0.05 if e == "E1" else 0.0
+                Lc = np.zeros((len(rt), 2))
+                Lc[:, 0] = 0.004 * np.sin(np.arange(len(rt)))
+                Lc[:, 1] = 0.004 * np.cos(2 * math.pi * rt / P + 1.3)
+                loads[f"w{w}"] = {"C": Lc, "Q": 0.3 * Lc}
+        return epochs, betas, loads, geo
+
+    def _wd(self, wid, g, e, scale):
+        rc = self.rc
+        ti, tj, rt, rr = g
+        cw, cr = rc.Cov(np.full(len(ti), 1e-4 * scale)), rc.Cov(np.full(len(rt), 1e-4 * scale))
+        return rc.WorldDesign(wid, {"C": (ti, tj, cw), "Q": (ti, tj, cw)}, {"C": (rt, rr, cr), "Q": (rt, rr, cr)}, e)
+
+    def test_redesign_draw_oracle_and_observed_support(self):
+        """Codex r8 P2-2 + P3: the per-draw-V path on a fixture with an ELIGIBLE candidate. (1) A numerical
+        draw-level oracle: each draw's E^U maxima equal the plain observed analysis of that draw's perturbed
+        reference responses under that draw's own design. (2) Support-sensitive draws (the draw's design marks
+        a period unsupported) keep the OBSERVED support decision: the draws stay finite where the fixed-design
+        observed analysis is supported."""
+        tr, rc = self.tr, self.rc
+        epochs, betas, loads, geo = self._eligible_fixture()
+        gates = {e: True for e in tr.EPOCHS}
+        base = tr.ht(epochs, betas, gates, loads=loads, k=2, analysis="t", draws=9)
+        self.assertTrue(base["available"])
+        self.assertGreater(base["T_T"], -math.inf)                    # (an eligible candidate)
+        idx, xi = tr.draw_streams("t", 3, 2, 9)
+
+        def scale_of(xb):
+            return 1.0 + 0.5 * math.tanh(float(xb[0]))
+
+        def redesign(e, w, xb):
+            return self._wd(w, geo[e], e, scale_of(xb))
+        seen = []
+        real = tr.world_epoch
+
+        def spy(wd, y, ld, x, _expose=False, support=None):
+            out = real(wd, y, ld, x, _expose, support)
+            if support is not None:
+                seen.append((wd, y, ld, x, out))
+            return out
+        tr.world_epoch = spy
+        try:
+            got = tr.ht(epochs, betas, gates, loads=loads, k=2, analysis="t", draws=9, redesign=redesign)
+        finally:
+            tr.world_epoch = real
+        self.assertTrue(got["available"])
+        self.assertEqual(len(seen), 3 * 3 * 9)
+        compared = 0
+        for wd, y, ld, x, out in seen[::5]:
+            yb = {"within": y["within"], "ref": {h: np.asarray(y["ref"][h], float) + np.asarray(ld[h]) @ x[0]
+                                                 for h in "CQ"}}
+            o = rc.analyze_world(wd, yb)
+            if out["support"]["unsup"]:
+                continue
+            self.assertAlmostEqual(float(out["maxC"][0]), max(r["r_C"] ** 2 for r in o["periods"]), delta=1e-9)
+            self.assertAlmostEqual(float(out["maxQ"][0]), max(r["r_Q"] ** 2 for r in o["periods"]), delta=1e-9)
+            compared += 1
+        self.assertGreaterEqual(compared, 10)
+        # (2) support-sensitive draws: every draw's design marks period 8 unsupported for C
+        def flagged(e, w, xb):
+            wd = self._wd(w, geo[e], e, scale_of(xb))
+            wd.within["C"].fails[8.0] = ["test-draw-only"]
+            return wd
+        e2 = [we_ for we_ in (real(wd, y, loads[wd.id], xi) for wd, y in epochs["E2"])]
+        self.assertTrue(all(not w_["support"]["unsup"] for w_ in e2))          # (observed: all supported)
+        alone = real(flagged("E2", "w0", xi[0]), epochs["E2"][0][1], loads["w0"], xi[:1])
+        self.assertTrue(alone["support"]["unsup"])                              # (the draw's own decision: +inf)
+        self.assertEqual(float(alone["maxC"][0]), math.inf)
+        kept = real(flagged("E2", "w0", xi[0]), epochs["E2"][0][1], loads["w0"], xi[:1], support=e2[0]["support"])
+        self.assertTrue(math.isfinite(float(kept["maxC"][0])))                  # (the observed decision kept)
+        flg = tr.ht(epochs, betas, gates, loads=loads, k=2, analysis="t", draws=9, redesign=flagged)
+        self.assertTrue(flg["available"])
+        with self.assertRaises(tr.TransitionError):
+            real(epochs["E2"][0][0], epochs["E2"][0][1], loads["w0"], xi[:1],
+                 support=dict(e2[0]["support"], periods=[4.0]))
+
     def test_mixed_needs_affirmative_evidence(self):
         """#68 review 8: material recurrence with directional bounds spanning the band is UNRESOLVED, not
         mixed; bounds without a passed gate are unresolved; mixed needs both affirmatively."""
