@@ -91,6 +91,10 @@ jobs:
           ! grep -q ResourceWarning unit.log
       - name: End to end (10 workers)
         run: PYTHON=python3 RQ_TEST_WORKERS=10 bash tests/redqueen_tooling.sh build/evo_boids "$RUNNER_TEMP/rq_work"
+      - name: Histories (worlds.py, end to end; its unit tests first)
+        run: PYTHON=python3 bash tests/redqueen_worlds.sh build/evo_boids "$RUNNER_TEMP/rq_worlds"
+      - name: Fork branches (forks.py, end to end; its unit tests first)
+        run: PYTHON=python3 bash tests/redqueen_forks.sh build/evo_boids "$RUNNER_TEMP/rq_forks"
       - name: Sealing (split manifest, filters, prediction commitments, public freeze)
         run: |
           python3 -I -W error::ResourceWarning tools/redqueen/test_sealing.py -v 2>&1 | tee sealing.log

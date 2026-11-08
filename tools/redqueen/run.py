@@ -108,13 +108,15 @@ import rqlib  # noqa: E402
 import store  # noqa: E402
 
 PLAN_SCHEMA = "finfolk.redqueen.plan/1"
+PLAN_SCHEMA_V2 = "finfolk.redqueen.plan/2"
 DONE_SCHEMA = "finfolk.redqueen.done/1"
 REPLAY_SCHEMA = "finfolk.redqueen.replay/1"
 TOOL_FILES = ("rqlib.py", "ckpt.py", "common.py", "score.py", "cell.py", "store.py", "run.py", "plan.py")
 OUTPUT_TOOLS = ("rqlib.py", "ckpt.py", "common.py", "score.py", "cell.py")   # = cell.OUTPUT_TOOLS
 ROW_KEYS = ("schema", "id", "kind", "prey", "predators", "template", "prey_policy", "n_prey", "sampling", "assay",
             "k", "steps", "horizons", "log_every", "checkpoint_every", "replicate", "seeds", "groups")
-ROLES = ("prey", "predators", "template")
+ROW_KEYS_V2 = ROW_KEYS + ("unit", "families", "role", "namespace", "horizon", "ages")
+ROLES = ("prey", "predators", "template", "ages")      # (a plan/1 row has no "ages")
 RETRYABLE = {10, -9, -15, 137, 143}
 MAX_WORKERS = 64
 
@@ -145,9 +147,9 @@ def load_plan(path, raw=None):
         if not ln.strip():
             continue
         r = json.loads(ln)
-        if r.get("schema") != PLAN_SCHEMA:
-            raise SystemExit(f"{path}:{n}: schema {r.get('schema')!r}, expected {PLAN_SCHEMA}")
-        miss = [k for k in ROW_KEYS if k not in r]
+        if r.get("schema") not in (PLAN_SCHEMA, PLAN_SCHEMA_V2):
+            raise SystemExit(f"{path}:{n}: schema {r.get('schema')!r}, expected {PLAN_SCHEMA} or {PLAN_SCHEMA_V2}")
+        miss = [k for k in (ROW_KEYS_V2 if r["schema"] == PLAN_SCHEMA_V2 else ROW_KEYS) if k not in r]
         if miss:
             raise SystemExit(f"{path}:{n}: cell {r.get('id')} lacks {miss}")
         for role in ROLES:
@@ -158,6 +160,9 @@ def load_plan(path, raw=None):
     ids = [r["id"] for r in rows]
     if len(set(ids)) != len(ids):
         raise SystemExit(f"{path}: duplicate cell ids")
+    if len({r["schema"] for r in rows}) > 1:
+        raise SystemExit(f"{path}: rows of {sorted({r['schema'] for r in rows})}: a plan has one schema (a /1 plan "
+                         "and a /2 plan run separately)")
     return rows
 
 
@@ -489,11 +494,19 @@ def run_cell(root, cid, link=False):
     data = rqlib.canonical(bundle)
     rqlib.write_durable(os.path.join(d, "bundle.json"), data)
     g = c["groups"].get("common")
+    # (plan/2, design v4 §3.5) the transplant group's realized donor draw and placement: one per
+    # predator snapshot x replicate x K (checked across cells at packing)
+    sh = bundle.get("sharing")
+    tg = f"{c['groups'].get('transplant')}|k{c['k']}" if sh and c["kind"] == "assay" else None
     done = {"schema": DONE_SCHEMA, "id": cid, "kind": c["kind"], "bundle_sha256": rqlib.sha256_bytes(data),
+            "transplant_group": tg,
+            "transplant_realized_sha256": sh["realized"]["transplant_realized_sha256"] if tg else None,
             "row_sha256": row_sha(c), "common_group": g if c["prey_policy"] == "common" else None,
             "common_sha256": bundle["files"].get("common.json"),
             # a challenge and its predator-free control share their prey settings (checked at packing)
             "pair_group": f"{c['groups']['reseed']}|{c['prey_policy']}|{c['assay']}",
+            # (plan/2) the split role, for sealed target stores later; None for a plan/1 row
+            "role": c.get("role"), "families": c.get("families"),
             "prey_config_sha256": bundle["arena_prey_config_sha256"], "finished_utc": rqlib.now_utc(),
             "host": platform.node(),
             "timing": {"wall_s": round(time.time() - t0, 3), "build_s": round(info["t_build"], 3),
@@ -778,6 +791,18 @@ def _main(argv, files):
     if probs:
         log(f"committed chunks damaged or inconsistent (working copies kept): {probs[:5]}")
         return 1
+    # (review of d4dc4b7, P2 1) EVERY indexed cell, whatever plan extends the root: a /2 completion
+    # without its sharing records, or with summaries its bundle contradicts, refuses the root
+    try:
+        iprobs = store.index_problems(root)
+    except (store.StoreError, OSError) as e:
+        iprobs = [str(e)]
+    if iprobs:
+        for p in iprobs[:10]:
+            log(f"index: {p}")
+        print(f"{root}: its index holds completions a /2 study cannot extend ({len(iprobs)}: {iprobs[0]}): "
+              "rerun the study in a new root", file=sys.stderr)
+        return 2
     # (review rounds 3-4) legacy objects (writable, or hard links an archive shares, read-only or not)
     # replaced by independent read-only copies under the COPY policy, before anything relies on
     # them; only then this session's policy
@@ -815,9 +840,15 @@ def _main(argv, files):
     todo = []
     for r in rows:
         rs = row_sha(r)
+        v2 = r["schema"] == PLAN_SCHEMA_V2
         if r["id"] in packed:
-            if packed[r["id"]][1].get("row_sha256") != rs:
+            e = packed[r["id"]][1]
+            if e.get("row_sha256") != rs:
                 print(f"cell {r['id']}: the plan row differs from the one it was packed with", file=sys.stderr)
+                return 2
+            if v2 and ("transplant_group" not in e or e.get("role") != r["role"]):
+                print(f"cell {r['id']}: packed without the /2 sharing records or with another role (a completion "
+                      "before 03a608b): a /2 study is rerun in a new root, not resumed", file=sys.stderr)
                 return 2
             continue
         if r["id"] in fin:
@@ -826,9 +857,15 @@ def _main(argv, files):
                 print(f"cell {r['id']}: the plan row differs from the one it finished with", file=sys.stderr)
                 return 2
             d = os.path.join(root, store.WORK, r["id"])
-            if rqlib.sha256_file(os.path.join(d, "bundle.json")) != dn["bundle_sha256"]:
+            raw = rqlib.read_bytes(os.path.join(d, "bundle.json"))
+            if rqlib.sha256_bytes(raw) != dn["bundle_sha256"]:
                 print(f"cell {r['id']}: its bundle.json no longer matches done.json", file=sys.stderr)
                 return 1
+            if v2:
+                probs = store.completion_problems(dn, json.loads(raw))
+                if probs:
+                    print(f"cell {r['id']}: {'; '.join(probs)}", file=sys.stderr)
+                    return 2
             continue
         todo.append(r)
     n_bio_start = 0
