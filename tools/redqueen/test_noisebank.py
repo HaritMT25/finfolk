@@ -362,16 +362,27 @@ class TestNumerics(unittest.TestCase):
                                                    np.array([y + w]), r)[0]), 1e-80)       # (the cancellation)
         l1 = np.where(rng.random(n) < 0.15, -np.inf, c1)
         h2 = np.where(rng.random(n) < 0.15, np.inf, c2 + w2)
-        old = nb.PANEL_EFOLDS
+        old, oldmax = nb.PANEL_EFOLDS, nb.MAX_PANELS
         for r in (-0.995, -0.99, 0.0, 0.99, 0.995):
             a = nb.log_rect(l1, c1 + w1, c2, h2, r)
-            nb.PANEL_EFOLDS = old / 16
+            nb.PANEL_EFOLDS, nb.MAX_PANELS = old / 8, 1 << 16             # (a refinement, never capped)
             try:
                 b = nb.log_rect(l1, c1 + w1, c2, h2, r)
             finally:
-                nb.PANEL_EFOLDS = old
+                nb.PANEL_EFOLDS, nb.MAX_PANELS = old, oldmax
             self.assertTrue(np.all(np.isfinite(a)))
             self.assertLess(float(np.max(np.abs(a - b))), nb.LOG_RECT_TOL, r)
+        for bad in (([41.0], [41.5], [0.0], [0.1], 0.5), ([0.0], [0.0 + 1e-7], [0.0], [0.1], 0.5),
+                    ([0.0], [0.1], [0.0], [0.1], 0.996), ([np.inf], [np.inf], [0.0], [0.1], 0.5)):
+            with self.assertRaises(nb.NoiseBankError):                     # (outside the registered domain)
+                nb.log_rect(*(np.array(v, float) for v in bad[:4]), bad[4])
+        rs_ = np.random.default_rng(7)
+        A1 = np.where(rs_.random(300) < 0.2, -np.inf, rs_.uniform(-37, 37, 300))
+        A2 = rs_.uniform(-37, 37, 300)
+        B1 = np.where(np.isfinite(A1), A1 + rs_.uniform(1e-5, 2, 300), rs_.uniform(-37, 37, 300))
+        B2 = np.where(rs_.random(300) < 0.2, np.inf, A2 + rs_.uniform(1e-5, 2, 300))
+        for r in (-0.995, -0.6, 0.3, 0.995):                           # (argument order never matters)
+            self.assertLess(float(np.max(np.abs(nb.log_rect(A1, B1, A2, B2, r) - nb.log_rect(A2, B2, A1, B1, r)))), 1e-8)
         a = nb.log_rect(np.array([-np.inf]), np.array([0.3]), np.array([-0.2]), np.array([np.inf]), 0.4)
         self.assertAlmostEqual(float(a[0]), math.log(float(nb.bvn_upper(np.array([-0.3]), np.array([-0.2]), -0.4)[0])),
                                delta=1e-9)
@@ -380,32 +391,63 @@ class TestNumerics(unittest.TestCase):
                                    float(nb._logQ(np.array([40.5]))[0] - nb._logQ(np.array([40.0]))[0]))), delta=1e-12)
         self.assertTrue(float(nb._logQ(np.array([60.0]))[0]) < -1800)              # (no underflow to -inf)
 
+    def test_log_rect_against_an_independent_reference(self):
+        """Codex #72 r3 P2-1: log_rect against an INDEPENDENT reference (math.erfc and the asymptotic tail
+        series for log Q; log-space conditional probabilities; the mode by golden section and adaptive Simpson
+        integration outward from it) on the REGISTERED TEST SET spanning the admissible domain (centres to
+        +-39, widths 1e-5 .. 2 and half-infinite, rho to +-0.995), with Codex's counterexamples: a thin
+        discordant rectangle at the limits, the broad [0, 39]^2 quadrant at rho 0, X > 0 and Y > 39, and a
+        tiny central interval. Max |log error| <= LOG_RECT_TOL."""
+        cases = []
+        for cx in (-37.0, -7.0, 0.0, 1.0, 37.0):
+            for cy in (-37.0, 0.0, 7.0, 37.0):
+                for wx, wy in ((1e-5, 0.05), (0.05, 2.0), (None, 0.05), (2.0, None)):
+                    for r in (-0.995, -0.5, 0.0, 0.5, 0.995):
+                        lx, hx = (cx, cx + wx) if wx else (-math.inf, cx) if cx < 0 else (cx, math.inf)
+                        ly, hy = (cy, cy + wy) if wy else (-math.inf, cy) if cy < 0 else (cy, math.inf)
+                        cases.append((lx, hx, ly, hy, r))
+        cases += [(-1.0, -1.0 + 1e-4, 1.0, 1.0 + 1e-4, 0.995), (-1.0, -1.0 + 1e-4, -1.0, -1.0 + 1e-4, -0.995),
+                  (0.0, 39.0, 0.0, 39.0, 0.0), (0.0, math.inf, 39.0, math.inf, 0.995), (0.0, math.inf, 39.0, math.inf, -0.5),
+                  (-5e-6, 5e-6, -5e-6, 5e-6, 0.3), (-7.0, -6.99, 7.0, 7.01, 0.995)]
+        worst = 0.0
+        arr = [np.array([c[k] for c in cases]) for k in range(4)]
+        for r in sorted({c[4] for c in cases}):
+            sel = [i for i, c in enumerate(cases) if c[4] == r]
+            got = nb.log_rect(*(a_[sel] for a_ in arr), r)
+            for g_, i in zip(got, sel):
+                ref = _ref_log_rect(*cases[i])
+                worst = max(worst, abs(float(g_) - ref))
+        self.assertLess(worst, nb.LOG_RECT_TOL, worst)
+
     def test_grid_tolerances_near_the_limits(self):
-        """Codex #72 r2 P2: on the registered grid (241 nodes in atanh(rho)) every pair's interpolated
-        contribution is within GRID_LL_TOL of the exact one OFF the grid near both limits, for thin
-        concordant and discordant rectangles; a group objective's interpolated maximizer near 0.99 is within
-        GRID_RHO_TOL of the exact maximizer."""
+        """Codex #72 r2 P2 / r3: on the registered grid (z = atanh(rho), refined edges) every pair's
+        interpolated contribution is within GRID_LL_TOL of the exact one OFF the grid near both limits, for
+        thin concordant and discordant rectangles and Codex's (-7, 7) thin rectangle; a group objective's
+        interpolated maximizer near 0.99 is within GRID_RHO_TOL of the exact maximizer; the certification
+        inserts exact columns where the interpolant misses."""
         rng = np.random.default_rng(3)
         n = 40
         x = rng.normal(0, 1.2, n)
         y = np.concatenate([x[: n // 2] + rng.normal(0, 0.1, n // 2), -x[n // 2:] + rng.normal(0, 0.1, n - n // 2)])
-        w1, w2 = rng.uniform(0.02, 0.2, n), rng.uniform(0.02, 0.2, n)
+        x, y = np.append(x, [-7.0, -7.0]), np.append(y, [7.0, -7.0])
+        w1 = np.append(rng.uniform(0.02, 0.2, n), [0.01, 0.01])
+        w2 = np.append(rng.uniform(0.02, 0.2, n), [0.01, 0.01])
         l1, h1, l2, h2 = x, x + w1, y, y + w2
         base = nb._log_iprob(l1, h1) + nb._log_iprob(l2, h2)
-        grid = nb.rho_grid(nb.Z_INTERVALS)
-        vals = np.array([nb.log_rect(l1, h1, l2, h2, float(r)) - base for r in grid])     # (nodes x pairs)
+        zn = nb.z_nodes()
+        vals = np.array([nb.log_rect(l1, h1, l2, h2, float(np.tanh(z))) - base for z in zn])     # (nodes x pairs)
         for r in (0.9937, 0.9811, 0.9502, -0.9502, -0.9811, -0.9937, 0.9949, -0.9949):
             exact = nb.log_rect(l1, h1, l2, h2, r) - base
-            interp = np.array([float(nb._cubic(vals[:, k], np.array([r]), nb.Z_INTERVALS)[0]) for k in range(n)])
+            interp = np.array([float(nb.obj_rho(zn, vals[:, k], r)[0][0]) for k in range(len(x))])
             self.assertLess(float(np.max(np.abs(interp - exact))), nb.GRID_LL_TOL, r)
         z = rng.multivariate_normal([0, 0], [[1, 0.99], [0.99, 1]], 300)
         L1, L2 = z[:, 0] - 0.03, z[:, 1] - 0.03
         b2 = nb._log_iprob(L1, L1 + 0.06) + nb._log_iprob(L2, L2 + 0.06)
-        f = np.array([float(np.sum(nb.log_rect(L1, L1 + 0.06, L2, L2 + 0.06, float(r)) - b2)) for r in grid])
-        r_int, _ = nb._argmax(f, nb.Z_INTERVALS)
+        F = lambda r: float(np.sum(nb.log_rect(L1, L1 + 0.06, L2, L2 + 0.06, r) - b2))  # noqa: E731
+        f = np.array([F(float(np.tanh(v))) for v in zn])
+        r_int, _ = nb._argmax(zn, f)
         a, b = 0.9, 0.995                                         # (golden section on the EXACT objective)
         g = (math.sqrt(5) - 1) / 2
-        F = lambda r: float(np.sum(nb.log_rect(L1, L1 + 0.06, L2, L2 + 0.06, r) - b2))  # noqa: E731
         c, d = b - g * (b - a), a + g * (b - a)
         fc, fd = F(c), F(d)
         for _ in range(60):
@@ -418,6 +460,15 @@ class TestNumerics(unittest.TestCase):
                 d = a + g * (b - a)
                 fd = F(d)
         self.assertLess(abs(r_int - (a + b) / 2), nb.GRID_RHO_TOL)
+        # the certification: a coarse table misses; certify inserts exact columns until it does not
+        zc = np.linspace(-nb.Z_MAX, nb.Z_MAX, 12)
+        blocks = [(L1, L1 + 0.06, L2, L2 + 0.06, np.zeros(len(L1), int))]
+        T = np.array([[F(float(np.tanh(v))) for v in zc]])
+        tab = {gg: {"z": zc.copy(), "T": T.copy(), "keys": [((0,), (0,))], "pairs": len(L1), "blocks": blocks}
+               for gg in nb.GROUPS}
+        ins, worst = nb.certify(tab, {gg: 0.99 for gg in nb.GROUPS})
+        self.assertTrue(ins and worst > nb.GRID_LL_TOL)
+        self.assertGreater(len(tab["R_CC"]["z"]), 12)
 
     def test_marginal_mle(self):
         """The interval-censored marginal MLE recovers (a, sigma) of rounded logistic-normal counts (the
@@ -437,6 +488,75 @@ class TestNumerics(unittest.TestCase):
         D[1, :32] = 6
         D[2] = 0
         self.assertFalse(nb.fit_marginals(D, N)["ok"].any())
+
+
+# ================================================================== an independent reference for log_rect
+def _ref_logQ(z):
+    if z == math.inf:
+        return -math.inf
+    if z == -math.inf:
+        return 0.0
+    if z <= 25.0:
+        return math.log(0.5 * math.erfc(z / math.sqrt(2.0))) if z > -8.0 else math.log1p(-0.5 * math.erfc(-z / math.sqrt(2.0)))
+    t = 1.0 / (z * z)
+    ser = 1 - t + 3 * t ** 2 - 15 * t ** 3 + 105 * t ** 4 - 945 * t ** 5 + 10395 * t ** 6
+    return -0.5 * z * z - math.log(z * math.sqrt(2 * math.pi)) + math.log(ser)
+
+
+def _ref_log_iprob(a, b):
+    if b - a < 1e-6:
+        m, w = 0.5 * (a + b), b - a
+        return -0.5 * m * m - 0.5 * math.log(2 * math.pi) + math.log(w) + math.log1p(w * w * (m * m - 1) / 24)
+    if a > 0:
+        la, lb = _ref_logQ(a), _ref_logQ(b)
+        return la + math.log(-math.expm1(lb - la))
+    if b < 0:
+        lb, la = _ref_logQ(-b), _ref_logQ(-a)
+        return lb + math.log(-math.expm1(la - lb))
+    return math.log1p(-(math.exp(_ref_logQ(b)) + math.exp(_ref_logQ(-a))))
+
+
+def _ref_log_rect(l1, h1, l2, h2, r):
+    """An independent reference: the conditional integral over X in [l1, h1] (truncated at +-60) of
+    phi(x) P(l2 < Y < h2 | x), with log Q from math.erfc and the asymptotic series, the mode by golden section,
+    the range where log f is within 60 of it by bisection, and composite Simpson on 8,000 uniform intervals in
+    log-sum-exp form."""
+    s = math.sqrt(1 - r * r)
+    lo, hi = max(l1, -60.0), min(h1, 60.0)
+
+    def F(x):
+        return -0.5 * x * x - 0.5 * math.log(2 * math.pi) + _ref_log_iprob((l2 - r * x) / s, (h2 - r * x) / s)
+    a, b = lo, hi
+    g = (math.sqrt(5) - 1) / 2
+    c, d = b - g * (b - a), a + g * (b - a)
+    fc, fd = F(c), F(d)
+    for _ in range(120):
+        if fc > fd:
+            b, d, fd = d, c, fc
+            c = b - g * (b - a)
+            fc = F(c)
+        else:
+            a, c, fc = c, d, fd
+            d = a + g * (b - a)
+            fd = F(d)
+    xm = max(((x, F(x)) for x in (lo, hi, 0.5 * (a + b))), key=lambda t: t[1])[0]
+    fm = F(xm)
+
+    def cut(x_in, x_out):                     # (F(x_in) >= fm - 60 > F(x_out), concave)
+        if F(x_out) >= fm - 60:
+            return x_out
+        for _ in range(100):
+            mid = 0.5 * (x_in + x_out)
+            x_in, x_out = (mid, x_out) if F(mid) >= fm - 60 else (x_in, mid)
+        return x_out
+    xl, xh = cut(xm, lo), cut(xm, hi)
+    n = 8000
+    hstep = (xh - xl) / n
+    v = [F(xl + k * hstep) for k in range(n + 1)]
+    wts = [1.0 if k in (0, n) else (4.0 if k % 2 else 2.0) for k in range(n + 1)]
+    mx = max(v)
+    tot = sum(w_ * math.exp(f_ - mx) for w_, f_ in zip(wts, v)) * hstep / 3
+    return mx + math.log(tot)
 
 
 # ================================================================== the composite likelihood
@@ -558,8 +678,8 @@ class TestEstimator(unittest.TestCase):
 @unittest.skipIf(np is None, "numpy is not installed")
 class TestFeasibilityAndRefusals(unittest.TestCase):
     def quad(self, centre, curv=500.0):
-        g = nb.rho_grid(M)
-        return {k: -curv * (g - centre[k]) ** 2 for k in nb.GROUPS}
+        zn = nb.z_nodes(M)
+        return {k: (zn, -curv * (np.tanh(zn) - centre[k]) ** 2) for k in nb.GROUPS}
 
     def test_feasible_maxima_are_the_fit(self):
         r = {"R_CC": 0.3, "R_SS": 0.25, "R_CS": 0.1, "D_CC": 0.2, "D_SS": 0.15, "D_CS": 0.05, "T_CS": 0.3,
@@ -591,7 +711,7 @@ class TestFeasibilityAndRefusals(unittest.TestCase):
         self.assertAlmostEqual(SR[1, 1] + SD[1, 1] + SE[1, 1], 1.0, delta=1e-12)
         self.assertLessEqual(SR[2, 2], 1.0 + 1e-12)
         start = nb._theta_map(nb._theta_start(f["unconstrained"]))
-        ll0 = sum(float(nb._cubic(obj[g], start[g], M)) for g in nb.GROUPS)
+        ll0 = sum(float(nb.obj_rho(*obj[g], start[g])[0][0]) for g in nb.GROUPS)
         self.assertGreater(f["loglik"], ll0)
         for th in ([0.1] * 9, [1.0, 2.0, -0.5, 0.3, 1.4, -1.2, 0.7, 1.5, 2.5]):
             self.assertTrue(nb.components_of(nb._theta_map(th))[3])
@@ -602,30 +722,57 @@ class TestFeasibilityAndRefusals(unittest.TestCase):
         refused, never accepted."""
         r = {"R_CC": 0.999, "R_SS": 0.05, "R_CS": 0.3, "D_CC": 0.3, "D_SS": 0.2, "D_CS": 0.1, "T_CS": 0.99,
              "R_CF": 0.999, "R_SF": -0.6}
-        g = nb.rho_grid(M)
-        obj = {k: -500.0 * (g - min(max(r[k], -0.9999), 0.9999)) ** 2 for k in nb.GROUPS}
-        f = nb.fit_dependence(obj, M)
+        zn = nb.z_nodes(M)
+        obj = {k: (zn, -500.0 * (np.tanh(zn) - min(max(r[k], -0.9999), 0.9999)) ** 2) for k in nb.GROUPS}
+        f = nb.fit_dependence(obj)
         self.assertEqual(f["fit"], "constrained")
         self.assertTrue(all(abs(v) <= nb.RHO_MAX for v in f["rho"].values()))
-        self.assertLessEqual(f["starts"]["loglik_spread"], nb.START_TOL)
-        self.assertAlmostEqual(f["loglik"], sum(float(nb._cubic(obj[k], np.array([f["rho"][k]]), M)[0])
-                                                for k in nb.GROUPS), delta=1e-9)
+        self.assertLessEqual(f["starts"]["parameter_spread"], nb.PARAM_TOL)
+        self.assertGreaterEqual(f["starts"]["reaching_best"], nb.MIN_AGREE)
+        self.assertEqual(f["starts"]["label"], "multi-start validated, not a global certificate")
+        self.assertTrue(set(f["at_box"]) <= set(nb.GROUPS))
+        self.assertAlmostEqual(f["loglik"], sum(float(nb.obj_rho(*obj[k], f["rho"][k])[0][0]) for k in nb.GROUPS),
+                               delta=1e-9)
         ip = nb._interior
-        nb._interior = lambda *a, **k: (lambda x, L, ok: (x, L, False))(*ip(*a, **k))
+        nb._interior = lambda *a, **k: (lambda x, L, ok, res, mu: (x, L, False, res, mu))(*ip(*a, **k))
         try:
             with self.assertRaises(nb.NoiseBankError):
-                nb.fit_dependence(obj, M)                                     # (non-convergence propagates)
+                nb.fit_dependence(obj)                                       # (non-convergence propagates)
         finally:
             nb._interior = ip
-        old = nb.START_TOL
-        nb.START_TOL = -1.0
+        old = nb.PARAM_TOL
+        nb.PARAM_TOL = -1.0
         try:
             with self.assertRaises(nb.NoiseBankError):
-                nb.fit_dependence(obj, M)
+                nb.fit_dependence(obj)                                       # (disagreeing runs: refused)
         finally:
-            nb.START_TOL = old
+            nb.PARAM_TOL = old
         with self.assertRaises(nb.NoiseBankError):
-            nb._cubic(obj["R_CC"], np.array([0.999]), M)                         # (never clamped)
+            nb.obj_rho(*obj["R_CC"], 0.999)                                    # (never clamped)
+
+    def test_constrained_fit_against_a_dense_reference(self):
+        """Codex #72 r3 P2-3: validated against an independent reference optimum. Only the row and donor
+        capture shares compete (their maxima 0.7 + 0.6 exceed the unit total; the rest feasible at their
+        maxima): a dense search over the feasible (r, d) triangle of the exact quadratic objective agrees
+        with the interior-point fit."""
+        zn = nb.z_nodes(M)
+        c = {"R_CC": 0.7, "R_SS": 0.25, "R_CS": 0.05, "D_CC": 0.6, "D_SS": 0.2, "D_CS": 0.02, "T_CS": 0.1,
+             "R_CF": 0.05, "R_SF": 0.1}
+        curv = {"R_CC": 400.0, "D_CC": 250.0}
+        obj = {k: (zn, -curv.get(k, 300.0) * (np.tanh(zn) - c[k]) ** 2) for k in nb.GROUPS}
+        f = nb.fit_dependence(obj)
+        self.assertEqual(f["fit"], "constrained")
+        best, arg = -math.inf, None
+        for r_ in np.linspace(0.2, 0.9, 701):
+            for d_ in np.linspace(0.1, 0.8, 141):
+                x = dict(c, R_CC=float(r_), D_CC=float(d_))
+                if not nb.components_of(x)[3]:
+                    continue
+                v = -400 * (r_ - 0.7) ** 2 - 250 * (d_ - 0.6) ** 2
+                if v > best:
+                    best, arg = v, (r_, d_)
+        self.assertAlmostEqual(f["rho"]["R_CC"], arg[0], delta=2e-3)
+        self.assertAlmostEqual(f["rho"]["D_CC"], arg[1], delta=6e-3)
 
     def test_unidentified_and_missing_groups_are_refused(self):
         """One time and no crossing: no row-sharing and no donor-sharing pairs, refused with reasons; the
@@ -761,13 +908,22 @@ class TestScaleNu0Bootstrap(unittest.TestCase):
             self.assertEqual(shapes[g], {(1, 1)})
 
         def fit(m, mp):
-            return nb._entries(nb.fit_dependence({g: nb.pick_weights(tab[g]["keys"], m, mp) @ tab[g]["T"]
-                                                  for g in nb.GROUPS}, M))
+            return nb._entries(nb.fit_dependence({g: (tab[g]["z"], nb.pick_weights(tab[g]["keys"], m, mp) @ tab[g]["T"])
+                                                  for g in nb.GROUPS}))
         a = fit([2, 1, 1, 0], [1, 1, 1, 1])
         b = fit([1, 2, 1, 0], [1, 1, 1, 1])                                   # (the same distinct prey worlds)
         self.assertGreater(max(abs(x - y) for x, y in zip(a, b)), 1e-6)
-        D, failed = nb.bootstrap(tab, len(worlds), 5, 0, M)
+        D, failed, unident = nb.bootstrap(tab, len(worlds), 5, 0)
         self.assertEqual(D.shape[0] + failed, 5)
+        self.assertLessEqual(unident, failed)
+        old = nb.INFO_MIN
+        nb.INFO_MIN = 1e9                                   # (every weighted refit unidentified: all counted)
+        try:
+            D2, f2, u2 = nb.bootstrap(tab, len(worlds), 4, 0)
+        finally:
+            nb.INFO_MIN = old
+        self.assertEqual((len(D2), f2, u2), (0, 4, 4))
+        self.assertEqual(nb.interval_record(D2, f2, 4, u2)["status"], "unavailable")
 
 
 # ================================================================== the V builder

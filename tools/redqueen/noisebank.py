@@ -60,25 +60,37 @@ THE ESTIMATOR (per horizon; Annex H.9.2: an interval-censored Gaussian composite
     (1) per cell and channel, the marginal MLE (a_c, sigma_c), by Newton from the empirical-logit moments
         (STARTING VALUES ONLY);
     (2) the nine dependence parameters, by the pairwise dependence contributions at the stage-1 margins.
-  THE RECTANGLE PROBABILITIES (Codex #72 r2 P1): log_rect, the conditional integral over the narrower
-  interval of phi(x) P(l < Y < h | x) in LOG space (composite Gauss-Legendre with slope-bounded panels;
-  every conditional probability by the tail-stable _log_iprob): no differencing of tail probabilities, no
-  floor; contributions below log P = -700 are counted (deep_tail), never clipped.
-  THE GRID (Codex #72 r2 P2): each group's contribution is computed EXACTLY at Z_INTERVALS + 1 = 241 nodes
-  uniform in z = atanh(rho) over the evaluable domain |rho| <= RHO_MAX = 0.995, and interpolated by local
-  cubics IN z (the log likelihood bends like 1 / (1 - rho) near the limits; a uniform rho grid did not hold
-  the registered tolerances there). Registered tolerances, verified off-grid near both limits in the tests:
-  one pair's interpolated contribution within GRID_LL_TOL = 1e-3 log units, a group maximizer within
-  GRID_RHO_TOL = 1e-3.
+  THE RECTANGLE PROBABILITIES (Codex #72 r2 P1, r3): log_rect on a REGISTERED ADMISSIBLE DOMAIN (what the
+  bank produces; anything else is refused): finite standardized endpoints within +-E_MAX = 40 (infinite ends
+  only for the counts 0 and N), widths >= W_MIN = 1e-6, |rho| <= RHO_MAX. The conditional integral over the
+  narrower interval of phi(x) P(l < Y < h | x) (log-concave) in LOG space; half-infinite outer intervals
+  restricted to where log f is within DROP = 50 of its maximum, the omitted mass bounded by log-concavity
+  (refused above OMIT_TOL = 1e-14 relative); panels from a VALID slope bound (the Mills-ratio bound for
+  one-sided ends), refused (never capped) beyond MAX_PANELS; narrow conditional intervals by the corrected
+  midpoint rule, tail differences through expm1. No floor; deep-tail contributions (log P < -700) are
+  counted. VALIDATED against an independent reference (math.erfc, the asymptotic tail series, adaptive
+  Simpson integration) on the registered test set, Codex's counterexamples included: max |error| <=
+  LOG_RECT_TOL = 1e-8 (test_noisebank).
+  THE GRID (Codex #72 r2 P2, r3): exact contributions at 289 nodes in z = atanh(rho) (241 uniform, the outer 8
+  intervals at each end split in 4), interpolated by a not-a-knot cubic SPLINE in z (C2) with ANALYTIC derivatives
+  (l_rr = l_zz z_r^2 + l_z z_rr). CERTIFIED A POSTERIORI at the point estimate: per group, the EXACT objective
+  at the fitted rho and the off-grid midpoints of its bracket and neighbours; a miss above GRID_LL_TOL = 1e-3
+  per pair inserts those exact columns as nodes and the fit is redone (at most GRID_ROUNDS = 4 rounds, else
+  refused). The certification record is reported.
+  IDENTIFICATION (the point estimate and EVERY bootstrap refit alike): the analytic curvature per (weighted)
+  pair at the group maximum >= INFO_MIN; a maximum on the box |rho| = RHO_MAX is flagged (at_box) and needs a
+  one-sided slope per pair >= INFO_MIN instead.
   When the unconstrained group maxima are jointly FEASIBLE (all three components PSD, the unit totals
-  non-negative, the free row convention <= 1), they are the fit (a feasible vector of coordinate-wise
-  maxima maximizes their sum over the feasible set). Otherwise the composite likelihood is maximized over
-  the feasible set in the nine GROUP VALUES: three linear matrix inequalities (the row block with the free
-  convention [[rC, rCS, vC], [rCS, rS, vS], [vC, vS, 1]], the donor block, the cell block) and the evaluable
-  box |rho| < RHO_MAX, a convex set; by a log-barrier interior-point method (every evaluation strictly
-  inside: never a clamped value). The maximum is certified by MULTI_START = 5 registered strictly feasible
-  starts: every start must converge and their optima agree within START_TOL = 1e-4, else the fit is
-  refused. (_theta_map, the spherical-angle parametrization, remains as a feasibility construction only.)
+  non-negative, the free row convention <= 1), they are the fit. Otherwise: the feasible set in the nine
+  GROUP VALUES (three linear matrix inequalities: the row block with the free convention [[rC, rCS, vC],
+  [rCS, rS, vS], [vC, vS, 1]], the donor block, the cell block; and the box) is convex but the likelihood is
+  NOT concave there, so the fit is MULTI-START VALIDATED, NOT CERTIFIED: a log-barrier interior-point method
+  (analytic derivatives, every evaluation strictly inside) from MULTI_START = 16 registered quasi-random
+  (Halton) strictly feasible starts spread across the set; accepted only when >= MIN_AGREE = 3 runs reach the
+  best value within START_TOL = 1e-4, those runs agree in every group value within PARAM_TOL = 1e-3, and the
+  barrier problem's final relative Newton decrement (stationarity) is <= KKT_TOL; otherwise refused. The box |rho| <= 0.995 is a
+  registered NUMERICAL restriction (a variance share above 0.995 cannot be fitted); a fitted value on it is
+  flagged (at_box).
   FIXED-REPLICATE BIAS (Codex #72 r2): two-stage (IFM) estimation is consistent as replicates grow; with
   R = 64 fixed each cell's estimated location and scale leave an incidental-parameter bias (in the Gaussian
   limit a variance factor 63/64). It is measured by simulation at the registered size (the PR) and NOT
@@ -176,17 +188,28 @@ SIGMA_MIN = 0.01                   # (a marginal latent SD below this: degenerat
 MARG_INFO_MIN = 0.4                # (the observed information of log sigma below this x R: unidentified;
                                    #  an uncensored normal sample has 2 R)
 INFO_MIN = 1e-3                    # (a dependence group's curvature per pair below this: unidentified)
-RHO_MAX = 0.995                    # (the evaluable correlation domain)
+RHO_MAX = 0.995                    # (the registered evaluable box |rho| <= RHO_MAX: a NUMERICAL restriction)
 Z_MAX = math.atanh(RHO_MAX)
-Z_INTERVALS = 240                  # (the registered dependence grid: 241 nodes uniform in z = atanh(rho))
-GRID_LL_TOL = 1e-3                 # (registered: |interpolation error| of one pair's contribution, log units)
-GRID_RHO_TOL = 1e-3                # (registered: the interpolated group maximizer's error in rho)
-TRUNC = 40.0                       # (log_rect: an infinite outer end truncated this far beyond the bulk)
-PANEL_EFOLDS = 2.0                 # (log_rect: e-folds of the log integrand per Gauss-Legendre panel)
-MAX_PANELS = 4096
-LOG_RECT_TOL = 1e-6                # (log_rect's verified log-probability error against a 16x refinement)
-MULTI_START = 5                    # (the constrained fit's registered starts)
-START_TOL = 1e-4                   # (their optima must agree within this, log-likelihood units)
+Z_INTERVALS = 240                  # (the base grid: 241 nodes uniform in z = atanh(rho) ...)
+Z_EDGE_INTERVALS, Z_EDGE_SPLIT = 8, 4   # (... with the outer 8 intervals at each end split in 4: 289 nodes)
+GRID_LL_TOL = 1e-3                 # (registered: |interpolation - exact| of a group objective per pair, log units)
+GRID_RHO_TOL = 1e-3                # (registered: the maximizer's shift when the grid is refined, in rho)
+GRID_ROUNDS = 4                    # (local refinements before the grid is refused as uncertified)
+E_MAX = 40.0                       # (log_rect's admissible domain: finite standardized endpoints |e| <= E_MAX)
+W_MIN = 1e-6                       # (... and standardized interval widths >= W_MIN)
+TRUNC_MARGIN = 12.0                # (an infinite outer end is first truncated at +-(E_MAX + TRUNC_MARGIN))
+DROP = 50.0                        # (a restricted range: where log f >= its max - DROP)
+RESTRICT_PANELS = 16               # (a finite interval needing more panels than this is restricted too)
+OMIT_TOL = 1e-14                   # (the omitted mass beyond the integration range, relative: else refused)
+PANEL_EFOLDS = 2.0                 # (log_rect: e-folds of the log integrand per Gauss-Legendre panel, by a VALID bound)
+MAX_PANELS = 4096                  # (beyond: refused, never capped)
+TINY_W = 1e-4                      # (_log_iprob: narrower intervals by the corrected midpoint rule)
+LOG_RECT_TOL = 1e-8                # (registered: max |log_rect - reference| on the registered test set)
+MULTI_START = 16                   # (the constrained fit's registered quasi-random (Halton) starts)
+START_TOL = 1e-4                   # (log-likelihood units: the runs counted as reaching the best value)
+PARAM_TOL = 1e-3                   # (those runs must agree in every group value within this)
+MIN_AGREE = 3                      # (at least this many runs must reach the best value)
+KKT_TOL = 1e-7                     # (the final relative Newton decrement of the barrier problem: stationarity)
 BOOT_FAIL_MAX = 0.05               # (the interval is unavailable beyond this share of failed draws)
 MARGINAL_TOL = 1e-8                # (the marginal Newton's gradient tolerance, per replicate)
 FEAS_TOL = 1e-12                   # (the feasibility tolerance of the unconstrained group maxima)
@@ -566,7 +589,7 @@ def bvn_rect(l1, h1, l2, h2, r):
     log_rect for moderate rectangles; never the likelihood)."""
     return (bvn_upper(l1, l2, r) - bvn_upper(h1, l2, r) - bvn_upper(l1, h2, r) + bvn_upper(h1, h2, r))
 
-# ---- tail-stable log probabilities (Codex #72 r2 P1: no subtraction of tails, no floor)
+# ---- tail-stable log probabilities on a REGISTERED ADMISSIBLE DOMAIN (Codex #72 r2 P1, r3 P2-1)
 def _logQ(z):
     """log P(Z > z), vectorized over finite / infinite z, accurate in the far upper tail (the continued
     fraction of erfc in log form: no underflow)."""
@@ -587,73 +610,176 @@ def _logQ(z):
     return out
 
 
+def _logphi(x):
+    return -0.5 * x * x - 0.5 * math.log(2 * math.pi)
+
+
 def _log_iprob(a, b):
-    """log P(a < Z < b) (a < b), stable in either tail: the difference of the two tails taken on the side
-    of the smaller tail in log form (log1p(-exp(.))); -inf only for an empty interval."""
+    """log P(a < Z < b) (a < b) without cancellation: a narrow interval (b - a < TINY_W) by the corrected
+    midpoint rule log phi(m) + log w + log1p(w^2 (m^2 - 1) / 24); otherwise the difference of the two tails
+    on the side of the smaller tail as log Q(a) + log(-expm1(log Q(b) - log Q(a))); the central case as
+    log1p(-(Q(b) + Q(-a))). -inf only for an empty interval."""
     import numpy as np
     a, b = np.broadcast_arrays(np.asarray(a, float), np.asarray(b, float))
     out = np.full(a.shape, -np.inf)
     ok = b > a
-    up = ok & (a > 0)
-    dn = ok & (b < 0) & ~up
-    mid = ok & ~up & ~dn
-    with np.errstate(divide="ignore", invalid="ignore"):
+    with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+        w = b - a
+        tiny = ok & np.isfinite(w) & (w < TINY_W)
+        m = 0.5 * (a + b)
+        out[tiny] = _logphi(m[tiny]) + np.log(w[tiny]) + np.log1p(w[tiny] ** 2 * (m[tiny] ** 2 - 1) / 24.0)
+        rest = ok & ~tiny
+        up = rest & (a > 0)
+        dn = rest & (b < 0) & ~up
+        mid = rest & ~up & ~dn
         if up.any():
             la, lb = _logQ(a[up]), _logQ(b[up])
-            out[up] = la + np.log1p(-np.exp(lb - la))
+            out[up] = la + np.log(-np.expm1(lb - la))
         if dn.any():
             lb, la = _logQ(-b[dn]), _logQ(-a[dn])
-            out[dn] = lb + np.log1p(-np.exp(la - lb))
+            out[dn] = lb + np.log(-np.expm1(la - lb))
         if mid.any():
             out[mid] = np.log1p(-(_Q(b[mid]) + _Q(-a[mid])))
     return out
 
 
-def _logphi(x):
-    return -0.5 * x * x - 0.5 * math.log(2 * math.pi)
+def check_domain(l1, h1, l2, h2, r):
+    """THE REGISTERED ADMISSIBLE DOMAIN of log_rect (what the bank produces; anything else is refused):
+    |rho| <= RHO_MAX; every finite standardized endpoint within +-E_MAX (infinite ends only for the
+    counts 0 and N); every interval at least W_MIN wide."""
+    import numpy as np
+    if not abs(r) <= RHO_MAX:
+        raise NoiseBankError(f"log_rect: rho {r} outside the registered box")
+    for lo, hi in ((l1, h1), (l2, h2)):
+        bad = (np.isfinite(lo) & (np.abs(lo) > E_MAX)) | (np.isfinite(hi) & (np.abs(hi) > E_MAX)) | \
+            (lo == np.inf) | (hi == -np.inf) | ~(hi - lo >= W_MIN)
+        if bad.any():
+            k = int(np.flatnonzero(bad)[0])
+            raise NoiseBankError(f"log_rect: an interval outside the registered domain ([{lo[k]}, {hi[k]}]: "
+                                 f"|e| <= {E_MAX}, width >= {W_MIN})")
+
+
+def _cond(x, il, ih, r, s):
+    """log P(il < Y < ih | X = x) and E[Z | a < Z < b] (the truncated mean, from which the log integrand's
+    exact slope is -x + (r / s) E)."""
+    import numpy as np
+    a, b = (il - r * x) / s, (ih - r * x) / s
+    lg = _log_iprob(a, b)
+    with np.errstate(invalid="ignore", over="ignore"):
+        pa = np.where(np.isfinite(a), np.exp(_logphi(np.where(np.isfinite(a), a, 0.0)) - lg), 0.0)
+        pb = np.where(np.isfinite(b), np.exp(_logphi(np.where(np.isfinite(b), b, 0.0)) - lg), 0.0)
+    return lg, pa - pb
+
+
+def _logf(x, il, ih, r, s):
+    lg, e = _cond(x, il, ih, r, s)
+    return _logphi(x) + lg, -x + (r / s) * e
+
+
+def _bisect(fn, lo, hi, iters=80):
+    """Vectorized bisection for the root of a decreasing fn on [lo, hi] (fn(lo) > 0 > fn(hi))."""
+    import numpy as np
+    lo, hi = lo.copy(), hi.copy()
+    for _ in range(iters):
+        mid = 0.5 * (lo + hi)
+        pos = fn(mid) > 0
+        lo, hi = np.where(pos, mid, lo), np.where(pos, hi, mid)
+    return 0.5 * (lo + hi)
 
 
 def log_rect(l1, h1, l2, h2, r, chunk=20000):
-    """log P(l1 < X < h1, l2 < Y < h2) for the standard bivariate normal with correlation r (|r| < 1),
-    WITHOUT differencing tail probabilities (Codex #72 r2 P1). The registered evaluation: the conditional
-    integral over the outer variable (the narrower interval) of phi(x) P(l < Y < h | x), each conditional
-    probability by _log_iprob, by composite 20-point Gauss-Legendre in log space (log-sum-exp). An infinite
-    outer end is truncated TRUNC = 40 beyond the bulk. The panel count is the power of two >= (width x the
-    log-integrand slope bound) / PANEL_EFOLDS (at most MAX_PANELS), so each panel spans a bounded number of
-    e-folds; the log-probability error is verified in the tests (|error| <= LOG_RECT_TOL against a 16x
-    refinement, and against the thin-rectangle density limit)."""
+    """log P(l1 < X < h1, l2 < Y < h2) for the standard bivariate normal with correlation r, on the
+    REGISTERED ADMISSIBLE DOMAIN (check_domain; refused outside), WITHOUT differencing tail probabilities:
+    the conditional integral over the outer variable (the narrower interval) of f(x) = phi(x) P(l < Y < h |
+    x), log-concave, in log space by composite 20-point Gauss-Legendre.
+      - A half-infinite outer interval is truncated at +-(E_MAX + TRUNC_MARGIN), then (like a finite interval
+        that would need more than RESTRICT_PANELS panels: a steep integrand) restricted to where
+        log f >= max log f - DROP (the mode and the cut points by bisection on the exact slope); the mass
+        beyond each cut is bounded by f(cut) / |slope(cut)| (log-concavity) and must be below OMIT_TOL x the
+        result, else the rectangle is REFUSED.
+      - Panels: the power of two >= width x S / PANEL_EFOLDS with S a VALID bound on the log integrand's
+        |slope| over the range: the integrand is log-concave, so the exact slopes at the range's two ends
+        bound it (falling back to the Mills-ratio bound |x| + (|r| / s)(max finite |inner endpoint| + 1) where
+        an endpoint slope is not finite). More than MAX_PANELS is REFUSED, never capped.
+    Validated against an independent reference (math.erfc, the asymptotic tail series and adaptive Simpson
+    integration) on the registered test set: max |error| <= LOG_RECT_TOL."""
     import numpy as np
     l1, h1, l2, h2 = (np.asarray(v, float).ravel() for v in (l1, h1, l2, h2))
+    check_domain(l1, h1, l2, h2, r)
     w1, w2 = h1 - l1, h2 - l2
     swap = w2 < w1
     lo, hi = np.where(swap, l2, l1), np.where(swap, h2, h1)
     il, ih = np.where(swap, l1, l2), np.where(swap, h1, h2)
-    lo = np.where(np.isfinite(lo), lo, np.minimum(hi, 0.0) - TRUNC)
-    hi = np.where(np.isfinite(hi), hi, np.maximum(lo, 0.0) + TRUNC)
     s = math.sqrt((1.0 - r) * (1.0 + r))
-    slope = np.zeros(len(lo))
-    for x in (lo, hi):
-        za, zb = (il - r * x) / s, (ih - r * x) / s
-        m = np.maximum(np.where(np.isfinite(za), np.abs(za), 0.0), np.where(np.isfinite(zb), np.abs(zb), 0.0))
-        slope = np.maximum(slope, np.abs(x) + abs(r) / s * np.maximum(m, 1.0))
-    need = np.maximum(1.0, (hi - lo) * slope / PANEL_EFOLDS)
-    panels = np.minimum(2 ** np.ceil(np.log2(need)).astype(int), MAX_PANELS)
+    T = E_MAX + TRUNC_MARGIN
+    lo_fin, hi_fin = np.isfinite(lo), np.isfinite(hi)
+    lo, hi = np.where(lo_fin, lo, -T), np.where(hi_fin, hi, T)
+    a_, b_ = lo.copy(), hi.copy()
+
+    def restrict(k):
+        """The integration range where log f >= its maximum - DROP (log-concave: the mode and the cut points
+        by bisection on the exact slope)."""
+        def slope(x):
+            return _logf(x, il[k], ih[k], r, s)[1]
+        s_lo, s_hi = slope(lo[k]), slope(hi[k])
+        mode = np.where(s_lo <= 0, lo[k], np.where(s_hi >= 0, hi[k], _bisect(slope, lo[k], hi[k])))
+        fm = _logf(mode, il[k], ih[k], r, s)[0]
+
+        def drop(x):
+            return _logf(x, il[k], ih[k], r, s)[0] - (fm - DROP)
+        fl, fh = drop(lo[k]), drop(hi[k])
+        a_[k] = np.where(fl >= 0, lo[k], _bisect(lambda x: -drop(x), lo[k], mode))
+        b_[k] = np.where(fh >= 0, hi[k], _bisect(drop, mode, hi[k]))
+
+    def panels_needed():
+        """The log integrand is CONCAVE, so its |slope| over [a, b] is largest at an endpoint: the exact
+        endpoint slopes bound it (the Mills-ratio bound |x| + (|r| / s)(max |inner endpoint| + 1) where a slope
+        is not finite)."""
+        S = np.zeros(len(lo))
+        for x in (a_, b_):
+            sl = np.abs(_logf(x, il, ih, r, s)[1])
+            za, zb = (il - r * x) / s, (ih - r * x) / s
+            mfin = np.maximum(np.where(np.isfinite(za), np.abs(za), 0.0), np.where(np.isfinite(zb), np.abs(zb), 0.0))
+            S = np.maximum(S, np.where(np.isfinite(sl), sl, np.abs(x) + abs(r) / s * (mfin + 1.0)))
+        return np.maximum(1.0, (b_ - a_) * S / PANEL_EFOLDS)
+    restricted = ~(lo_fin & hi_fin)                     # (a half-infinite outer interval: always restricted)
+    if restricted.any():
+        restrict(np.flatnonzero(restricted))
+    need = panels_needed()
+    wide = ~restricted & (need > RESTRICT_PANELS)       # (a finite interval the integrand crosses steeply)
+    if wide.any():
+        restrict(np.flatnonzero(wide))
+        restricted |= wide
+        need = panels_needed()
     t, w = _gl20()
+    if np.any(need > MAX_PANELS):
+        raise NoiseBankError(f"log_rect: a rectangle needs more than {MAX_PANELS} panels (refused, not capped)")
+    panels = 2 ** np.ceil(np.log2(need)).astype(int)
     out = np.empty(len(lo))
     for n in np.unique(panels):
         sel = np.flatnonzero(panels == n)
-        u = ((np.arange(n)[:, None] + (t[None, :] + 1) / 2) / n).ravel()          # (n x 20 nodes on [0, 1])
+        u = ((np.arange(n)[:, None] + (t[None, :] + 1) / 2) / n).ravel()
         lw = np.log(np.tile(w, n) / (2 * n))
-        for c0 in range(0, len(sel), max(1, chunk // len(u))):
-            k = sel[c0:c0 + max(1, chunk // len(u))]
-            span = (hi[k] - lo[k])[:, None]
-            x = lo[k][:, None] + span * u[None, :]
+        step = max(1, chunk // len(u))
+        for c0 in range(0, len(sel), step):
+            k = sel[c0:c0 + step]
+            span = (b_[k] - a_[k])[:, None]
+            x = a_[k][:, None] + span * u[None, :]
             li = _log_iprob((il[k][:, None] - r * x) / s, (ih[k][:, None] - r * x) / s)
             v = lw[None, :] + np.log(span) + _logphi(x) + li
             mx = np.max(v, axis=1)
             out[k] = mx + np.log(np.sum(np.exp(v - mx[:, None]), axis=1))
+    if restricted.any():                               # (the omitted-mass bound, relative)
+        k = np.flatnonzero(restricted)
+        om = np.full(len(k), -np.inf)
+        for cut, edge, fin in ((a_[k], lo[k], lo_fin[k]), (b_[k], hi[k], hi_fin[k])):
+            f_, sl = _logf(cut, il[k], ih[k], r, s)
+            inner = ~(fin & (cut == edge))             # (a truncated infinite end is never a true edge)
+            with np.errstate(divide="ignore"):
+                om = np.logaddexp(om, np.where(inner, f_ - np.log(np.maximum(np.abs(sl), 1e-300)), -np.inf))
+        if np.any(om - out[k] > math.log(OMIT_TOL)):
+            raise NoiseBankError("log_rect: the omitted mass beyond the integration range exceeds OMIT_TOL (refused)")
     return out
-
 
 
 # ================================================================== stage 1: the marginals
@@ -864,93 +990,162 @@ def group_pairs(A, U):
     return G, worlds
 
 
+def z_nodes(m=Z_INTERVALS):
+    """The registered grid in z = atanh(rho): m + 1 uniform nodes over [-Z_MAX, Z_MAX], the outer
+    Z_EDGE_INTERVALS intervals at each end split in Z_EDGE_SPLIT (the log likelihood bends like
+    1 / (1 - rho) there; Codex #72 r3's (-7, 7) thin rectangle)."""
+    import numpy as np
+    if not isinstance(m, int) or m < 2 * Z_EDGE_INTERVALS + 4:
+        raise NoiseBankError(f"the grid needs at least {2 * Z_EDGE_INTERVALS + 4} intervals (got {m!r})")
+    base = np.linspace(-Z_MAX, Z_MAX, m + 1)
+    h = base[1] - base[0]
+    extra = [base[i] + h * j / Z_EDGE_SPLIT for i in list(range(Z_EDGE_INTERVALS)) + list(range(m - Z_EDGE_INTERVALS, m))
+             for j in range(1, Z_EDGE_SPLIT)]
+    return np.unique(np.concatenate([base, np.array(extra)]))
+
+
 def rho_grid(m=Z_INTERVALS):
-    """The registered dependence grid (Codex #72 r2 P2): m + 1 nodes UNIFORM IN z = atanh(rho) over
-    [-atanh(RHO_MAX), +atanh(RHO_MAX)] (finer in rho near the limits, where the log likelihood bends like
-    1 / (1 - rho)) -> the rho values."""
     import numpy as np
-    if not isinstance(m, int) or m < 8:
-        raise NoiseBankError(f"the grid needs at least 8 intervals (got {m!r})")
-    return np.tanh(np.linspace(-Z_MAX, Z_MAX, m + 1))
+    return np.tanh(z_nodes(m))
 
 
-def group_tables(A, U, G, m=Z_INTERVALS, chunk=40000):
-    """Stage 2's exact contributions: per group and per bootstrap source key, the summed dependence
-    contributions log P(both; rho) - log P(1) - log P(2) at every grid node (log_rect / _log_iprob: no
-    floor; the deep-tail contributions, log P(both) < -700, are counted per group) -> {g: {"keys": [(prey
-    worlds, predator worlds): DISTINCT worlds per role], "T": keys x nodes, "pairs": n, "deep_tail": n}}."""
+def _pair_blocks(A, U, G):
+    """Per group: the pair blocks (standardized bounds, source keys) and the keys."""
     import numpy as np
-    grid = rho_grid(m)
     out = {}
     for g in GROUPS:
-        keys, blocks, npairs = {}, [], 0
+        keys, blocks = {}, []
         for c1, r1, c2, r2, prey_w, pred_w in G[g]:
             l1, h1 = _std_bounds(A, U, c1, r1)
             l2, h2 = _std_bounds(A, U, c2, r2)
-            kp = np.stack(prey_w, 1)
-            kq = np.stack(pred_w, 1)
+            kp, kq = np.stack(prey_w, 1), np.stack(pred_w, 1)
             kid = np.array([keys.setdefault((tuple(sorted({int(x) for x in kp[i]})),
                                              tuple(sorted({int(x) for x in kq[i]}))), len(keys))
                             for i in range(len(r1))], int)
             blocks.append((l1.ravel(), h1.ravel(), l2.ravel(), h2.ravel(), np.repeat(kid, l1.shape[1])))
-            npairs += l1.size
-        T = np.zeros((len(keys), len(grid)))
-        deep = 0
-        for l1, h1, l2, h2, kid in blocks:
-            for c0 in range(0, len(l1), chunk):
-                sl = slice(c0, c0 + chunk)
-                base = _log_iprob(l1[sl], h1[sl]) + _log_iprob(l2[sl], h2[sl])
-                if not np.all(np.isfinite(base)):
-                    raise NoiseBankError(f"{g}: an empty marginal interval")
-                for j, r in enumerate(grid):
-                    lp = log_rect(l1[sl], h1[sl], l2[sl], h2[sl], float(r))
-                    if not np.all(np.isfinite(lp)):
-                        raise NoiseBankError(f"{g}: a rectangle log probability is not finite at rho {r:.4f}")
-                    deep += int(np.sum(lp < -700.0))
-                    T[:, j] += np.bincount(kid[sl], weights=lp - base, minlength=len(keys))
-        out[g] = {"keys": list(keys), "T": T, "pairs": int(npairs), "deep_tail": deep}
+        out[g] = (list(keys), blocks)
     return out
 
 
-def _zcoord(rho, m):
+def exact_column(blocks, nkeys, r, chunk=40000):
+    """The EXACT per-key summed contributions at one rho (and the deep-tail count)."""
     import numpy as np
-    return (np.arctanh(np.asarray(rho, float)) + Z_MAX) / (2 * Z_MAX / m)
+    col = np.zeros(nkeys)
+    deep = 0
+    for l1, h1, l2, h2, kid in blocks:
+        for c0 in range(0, len(l1), chunk):
+            sl = slice(c0, c0 + chunk)
+            base = _log_iprob(l1[sl], h1[sl]) + _log_iprob(l2[sl], h2[sl])
+            lp = log_rect(l1[sl], h1[sl], l2[sl], h2[sl], float(r))
+            if not (np.all(np.isfinite(lp)) and np.all(np.isfinite(base))):
+                raise NoiseBankError(f"a non-finite contribution at rho {r:.4f}")
+            deep += int(np.sum(lp < -700.0))
+            col += np.bincount(kid[sl], weights=lp - base, minlength=nkeys)
+    return col, deep
 
 
-def _cubic(vals, rho, m=Z_INTERVALS):
-    """The local-cubic interpolant (4 nodes, in z = atanh(rho)) of grid values at rho (array); rho must lie
-    in [-RHO_MAX, RHO_MAX] (never clamped)."""
+def group_tables(A, U, G, m=Z_INTERVALS):
+    """Stage 2's exact contributions: per group and per bootstrap source key (DISTINCT worlds per role), the
+    summed dependence contributions log P(both; rho) - log P(1) - log P(2) at every grid node, the pair blocks
+    (kept for the certification) -> {g: {"keys", "z" (nodes), "T" (keys x nodes), "pairs", "npk" (pairs per
+    key), "deep_tail", "blocks"}}."""
     import numpy as np
-    vals = np.asarray(vals, float)
-    rho = np.asarray(rho, float)
+    zn = z_nodes(m)
+    pb = _pair_blocks(A, U, G)
+    out = {}
+    for g in GROUPS:
+        keys, blocks = pb[g]
+        T = np.zeros((len(keys), len(zn)))
+        deep = 0
+        for j, z in enumerate(zn):
+            T[:, j], d = exact_column(blocks, len(keys), math.tanh(z))
+            deep += d
+        npk = np.zeros(len(keys))
+        for *_, kid in blocks:
+            npk += np.bincount(kid, minlength=len(keys))
+        out[g] = {"keys": keys, "z": zn.copy(), "T": T, "pairs": int(npk.sum()), "npk": npk, "deep_tail": deep,
+                  "blocks": blocks}
+    return out
+
+
+_SPL = {}
+
+
+def _spline_K(zn):
+    """The not-a-knot cubic spline's second derivatives as a linear map of the node values: M = K y
+    (cached per node set)."""
+    import numpy as np
+    key = zn.tobytes()
+    if key not in _SPL:
+        n = len(zn)
+        h = np.diff(zn)
+        A = np.zeros((n, n))
+        B = np.zeros((n, n))
+        for i in range(1, n - 1):
+            A[i, i - 1], A[i, i], A[i, i + 1] = h[i - 1], 2 * (h[i - 1] + h[i]), h[i]
+            B[i, i - 1], B[i, i], B[i, i + 1] = 6 / h[i - 1], -6 / h[i - 1] - 6 / h[i], 6 / h[i]
+        A[0, 0], A[0, 1], A[0, 2] = h[1], -(h[0] + h[1]), h[0]                 # (not-a-knot)
+        A[-1, -3], A[-1, -2], A[-1, -1] = h[-1], -(h[-2] + h[-1]), h[-2]
+        _SPL[key] = np.linalg.solve(A, B)
+        if len(_SPL) > 64:
+            _SPL.pop(next(iter(_SPL)))
+    return _SPL[key]
+
+
+def _interp(zn, vals, z):
+    """The not-a-knot cubic spline in z through the node values (C2: a smooth objective for Newton) and its
+    ANALYTIC first and second z-derivatives, vectorized over z in [zn[0], zn[-1]]."""
+    import numpy as np
+    z = np.atleast_1d(np.asarray(z, float))
+    y = np.asarray(vals, float)
+    M = _spline_K(zn) @ y
+    i = np.clip(np.searchsorted(zn, z, side="right") - 1, 0, len(zn) - 2)
+    z0, z1 = zn[i], zn[i + 1]
+    h = z1 - z0
+    a, b = z1 - z, z - z0
+    c0, c1 = y[i] / h - M[i] * h / 6, y[i + 1] / h - M[i + 1] * h / 6
+    f = M[i] * a ** 3 / (6 * h) + M[i + 1] * b ** 3 / (6 * h) + c0 * a + c1 * b
+    d1 = -M[i] * a ** 2 / (2 * h) + M[i + 1] * b ** 2 / (2 * h) - c0 + c1
+    d2 = M[i] * a / h + M[i + 1] * b / h
+    return f, d1, d2
+
+
+def obj_rho(zn, vals, rho):
+    """A group objective at rho (inside the registered box): value and ANALYTIC rho-derivatives (chain rule,
+    with the 2 rho l_z term: l_rr = l_zz z_r^2 + l_z z_rr)."""
+    import numpy as np
+    rho = np.atleast_1d(np.asarray(rho, float))
     if np.any(np.abs(rho) > RHO_MAX + 1e-12):
-        raise NoiseBankError("a correlation outside the evaluable domain [-RHO_MAX, RHO_MAX]")
-    x = _zcoord(np.clip(rho, -RHO_MAX, RHO_MAX), m)
-    M = len(vals)
-    k = np.clip(np.floor(x).astype(int), 1, M - 3)
-    u = x - k
-    v0, v1, v2, v3 = vals[k - 1], vals[k], vals[k + 1], vals[k + 2]
-    return (v0 * (-(u * (u - 1) * (u - 2)) / 6) + v1 * ((u + 1) * (u - 1) * (u - 2) / 2)
-            + v2 * (-(u + 1) * u * (u - 2) / 2) + v3 * ((u + 1) * u * (u - 1) / 6))
+        raise NoiseBankError("a correlation outside the registered box")
+    rho = np.clip(rho, -RHO_MAX, RHO_MAX)
+    z = np.arctanh(rho)
+    f, fz, fzz = _interp(zn, vals, z)
+    zr = 1.0 / (1.0 - rho * rho)
+    zrr = 2.0 * rho * zr * zr
+    return f, fz * zr, fzz * zr * zr + fz * zrr
 
 
-def _cubic1(vals, rho, m=Z_INTERVALS):
-    """_cubic for one rho over a Python list (the optimizer's inner loop); rho in the domain (checked by
-    the caller's barrier)."""
-    M = len(vals)
-    x = (math.atanh(rho) + Z_MAX) / (2 * Z_MAX / m)
-    k = min(max(int(math.floor(x)), 1), M - 3)
-    u = x - k
-    return (vals[k - 1] * (-(u * (u - 1) * (u - 2)) / 6) + vals[k] * ((u + 1) * (u - 1) * (u - 2) / 2)
-            + vals[k + 1] * (-(u + 1) * u * (u - 2) / 2) + vals[k + 2] * ((u + 1) * u * (u - 1) / 6))
-
-
-def _argmax(vals, m=Z_INTERVALS, sub=50):
+def _argmax(zn, vals, sub=40):
+    """The interpolant's maximizer: a dense search in z, then Newton on the analytic derivatives inside the
+    bracket -> (rho, value)."""
     import numpy as np
-    fine = np.tanh(np.linspace(-Z_MAX, Z_MAX, m * sub + 1))
-    f = _cubic(vals, np.clip(fine, -RHO_MAX, RHO_MAX), m)
+    fine = np.unique(np.concatenate([np.linspace(zn[i], zn[i + 1], sub + 1) for i in range(len(zn) - 1)]))
+    f = _interp(zn, vals, fine)[0]
     k = int(np.argmax(f))
-    return float(np.clip(fine[k], -RHO_MAX, RHO_MAX)), float(f[k])
+    z = float(fine[k])
+    lo, hi = float(fine[max(k - 1, 0)]), float(fine[min(k + 1, len(fine) - 1)])
+    for _ in range(50):
+        _, d1, d2 = _interp(zn, vals, np.array([z]))
+        if not d2[0] < 0:
+            break
+        zn_ = min(max(z - float(d1[0] / d2[0]), lo), hi)
+        if abs(zn_ - z) < 1e-14:
+            break
+        z = zn_
+    fz = float(_interp(zn, vals, np.array([z]))[0][0])
+    if fz < float(f[k]):
+        z, fz = float(fine[k]), float(f[k])
+    return math.tanh(z), fz
 
 
 # ================================================================== components from the nine groups
@@ -1072,7 +1267,6 @@ def _mats(r):
 
 
 def _dmats():
-    """d(LMI)/d(group value i), constant."""
     import numpy as np
     base = _mats(np.zeros(9))
     out = []
@@ -1083,36 +1277,34 @@ def _dmats():
     return out
 
 
-def _interior(lists, x0, m, mu0=1.0):
-    """Maximize sum_g l_g(rho_g) over {the three LMIs PD, |rho_g| < RHO_MAX}: a log-barrier interior-point
-    method (damped Newton on -L + mu B, mu decreased 5x per stage to 1e-10), every evaluation strictly
-    inside the evaluable domain -> (rho, L, converged)."""
+def _strict(x):
+    import numpy as np
+    return np.all(np.abs(x) < RHO_MAX) and all(np.min(np.linalg.eigvalsh(M)) > 1e-12 for M in _mats(x))
+
+
+def _interior(objs, x0, mu0=1.0):
+    """Maximize sum_g l_g(rho_g) over {three LMIs PD, |rho_g| < RHO_MAX}: log-barrier interior point, damped
+    Newton on the ANALYTIC interpolant derivatives, every evaluation strictly inside -> (x, L, converged,
+    stationarity residual at the final mu, the final mu)."""
     import numpy as np
     dM = _dmats()
     a2 = RHO_MAX ** 2
 
-    def feasible(x):
-        return np.all(np.abs(x) < RHO_MAX) and all(np.min(np.linalg.eigvalsh(M)) > 0 for M in _mats(x))
-
     def L(x):
-        return sum(_cubic1(lists[g], float(x[i]), m) for i, g in enumerate(GROUPS))
+        return sum(float(obj_rho(*objs[g], x[i])[0][0]) for i, g in enumerate(GROUPS))
 
     def phi(x, mu):
-        if not feasible(x):
+        if not _strict(x):
             return math.inf
         b = -sum(np.linalg.slogdet(M)[1] for M in _mats(x)) - float(np.sum(np.log(a2 - x * x)))
         return -L(x) + mu * b
 
     def grad_hess(x, mu):
-        h = 1e-6
         g = np.zeros(9)
         H = np.zeros((9, 9))
         for i, gr in enumerate(GROUPS):
-            xi = float(x[i])
-            lo, hi = max(xi - h, -RHO_MAX + 1e-12), min(xi + h, RHO_MAX - 1e-12)
-            f0, fm, fp = _cubic1(lists[gr], xi, m), _cubic1(lists[gr], lo, m), _cubic1(lists[gr], hi, m)
-            g[i] = -(fp - fm) / (hi - lo)
-            H[i, i] = -max((fp - 2 * f0 + fm) / ((hi - lo) / 2) ** 2, -1e12)
+            _, d1, d2 = obj_rho(*objs[gr], x[i])
+            g[i], H[i, i] = -float(d1[0]), -float(d2[0])
         inv = [np.linalg.inv(M) for M in _mats(x)]
         for i in range(9):
             g[i] += mu * (-sum(np.trace(Mi @ dM[i][k]) for k, Mi in enumerate(inv)) + 2 * x[i] / (a2 - x[i] ** 2))
@@ -1124,12 +1316,12 @@ def _interior(lists, x0, m, mu0=1.0):
                     H[j, i] += v
         return g, H
     x = np.array(x0, float)
-    if not feasible(x):
+    if not _strict(x):
         raise NoiseBankError("the interior-point start is not strictly feasible")
     mu = mu0
-    while mu > 1e-10:
+    while True:
         ok = False
-        for _ in range(200):
+        for _ in range(300):
             g, H = grad_hess(x, mu)
             lam = 0.0
             while True:
@@ -1141,82 +1333,152 @@ def _interior(lists, x0, m, mu0=1.0):
                     pass
                 lam = max(2 * lam, 1e-8 * (1 + float(np.max(np.abs(np.diag(H))))))
             dec = -float(g @ step)
-            if dec < 1e-12:
+            f0 = phi(x, mu)
+            scale = max(1.0, abs(f0))
+            if dec <= 1e-12 * scale:
                 ok = True
                 break
-            f0, t = phi(x, mu), 1.0
+            t = 1.0
             while t > 1e-14 and not phi(x + t * step, mu) <= f0 - 1e-4 * t * dec:
                 t *= 0.5
-            if t <= 1e-14:
-                ok = dec < 1e-8
+            if t <= 1e-14:                           # (no representable decrease left: float-limited)
+                ok = dec <= KKT_TOL * scale
                 break
             x = x + t * step
         if not ok:
-            return x, L(x), False
+            return x, L(x), False, math.inf, mu
+        if mu <= 1e-9:
+            break
         mu /= 5.0
-    return x, L(x), True
+    g, H = grad_hess(x, mu)
+    try:
+        dec = float(g @ np.linalg.solve(H, g))
+    except np.linalg.LinAlgError:
+        dec = math.inf
+    return x, L(x), True, abs(dec) / max(1.0, abs(L(x))), mu
 
 
-def _strict_start(un, frac):
-    """A strictly feasible start: the unconstrained maxima shrunk toward the central point (shares 1/3,
-    correlations 0) to frac of the largest feasible step."""
+def _halton(n, dims):
+    """The first n points of the Halton sequence (primes 2, 3, 5, ...), skipping the origin."""
+    primes = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29][:dims]
+    out = []
+    for i in range(1, n + 1):
+        row = []
+        for p in primes:
+            f, r, k = 1.0, 0.0, i
+            while k:
+                f /= p
+                r += f * (k % p)
+                k //= p
+            row.append(r)
+        out.append(row)
+    return out
+
+
+def _starts(un, k=MULTI_START):
+    """The registered quasi-random strictly feasible starts, spread across the feasible set: Halton points
+    mapped through the spherical-angle parametrization (_theta_map: every point PSD), each shrunk toward the
+    central point (shares 1/3, correlations 0) until strictly inside the box and the LMIs."""
     import numpy as np
     c0 = np.array([1 / 3, 1 / 3, 0, 1 / 3, 1 / 3, 0, 0, 0, 0], float)
-    u = np.clip(np.array([un[g] for g in GROUPS], float), -RHO_MAX, RHO_MAX)
+    out = []
+    for h in _halton(k, 9):
+        th = [math.pi * h[0], math.pi * h[1], math.pi * h[2], math.pi * h[3], math.pi * (h[4] - 0.5),
+              math.pi * (h[5] - 0.5), math.pi * (h[6] - 0.5), 0.5 * math.pi * h[7], 2 * math.pi * h[8]]
+        r = _theta_map(th)
+        x = np.array([r[g] for g in GROUPS], float)
+        t = 1.0
+        while not _strict(c0 + t * (x - c0)) and t > 1e-6:
+            t *= 0.9
+        out.append(c0 + t * (x - c0))
+    return out
 
-    def ok(x):
-        return np.all(np.abs(x) < RHO_MAX) and all(np.min(np.linalg.eigvalsh(M)) > 1e-12 for M in _mats(x))
-    lo, hi = 0.0, 1.0
-    if ok(u):
-        return u
-    for _ in range(60):
-        mid = 0.5 * (lo + hi)
-        lo, hi = (mid, hi) if ok(c0 + mid * (u - c0)) else (lo, mid)
-    return c0 + frac * lo * (u - c0)
 
-
-def fit_dependence(obj, m=Z_INTERVALS):
-    """Stage 2 from per-group grid objectives {g: values at the nodes} -> {"rho": the nine values, "fit":
-    "unconstrained" | "constrained", "loglik", "SigmaR", "SigmaD", "SigmaE", "unconstrained": the group
-    maxima, "problems": their infeasibilities, "starts": the multi-start record}.
-    The constrained branch (Codex #72 r2 P2-3) maximizes over the feasible set in the GROUP VALUES (three
-    linear matrix inequalities and the evaluable box |rho| < RHO_MAX: convex) by a log-barrier interior-point
-    method, every evaluation strictly inside the domain (never a clamped value), from MULTI_START registered
-    strictly feasible starts (the unconstrained maxima shrunk toward the central point: the first to 98% of
-    the feasible step, the rest to seeded fractions); every start must converge and their optima agree within
-    START_TOL (log-likelihood units), else the fit is REFUSED (NoiseBankError: not certified)."""
+def fit_dependence(objs, pairs=None):
+    """Stage 2 from per-group objectives {g: (z nodes, values)} -> {"rho", "fit": "unconstrained" |
+    "constrained", "loglik", "SigmaR", "SigmaD", "SigmaE", "unconstrained", "problems", "starts", "at_box"}.
+    The constrained branch (Codex #72 r3 P2-3): the interior-point fit (_interior) from MULTI_START = 16
+    registered quasi-random strictly feasible starts (_starts); ACCEPTED only when at least MIN_AGREE runs
+    reach the best log likelihood within START_TOL, all of those agree in every group value within
+    PARAM_TOL, and the best run's barrier stationarity residual (per pair) is within KKT_TOL; otherwise
+    REFUSED. "Multi-start validated, not a global certificate": the problem is not concave. A group value on
+    the registered box |rho| = RHO_MAX is FLAGGED (at_box)."""
     import numpy as np
-    un = {g: _argmax(obj[g], m)[0] for g in GROUPS}
+    un = {g: _argmax(*objs[g])[0] for g in GROUPS}
     SR, SD, SE, feas, prob = components_of(un)
-    lists = {g: [float(v) for v in obj[g]] for g in GROUPS}
     starts = None
     if feas:
         rho, how = un, "unconstrained"
     else:
-        import numpy as np
-        res = []
-        rng = np.random.default_rng(rqlib.derive_seed(SEED_NAMESPACE, "multistart"))
-        for k in range(MULTI_START):
-            frac = 0.98 if k == 0 else float(rng.uniform(0.05, 0.95))
-            x0 = _strict_start(un, frac)
-            x, Lx, ok = _interior(lists, x0, m)
-            if not ok:
-                raise NoiseBankError("the constrained fit did not converge (interior point)")
-            res.append((Lx, x))
-        Lbest = max(v for v, _ in res)
-        spread = Lbest - min(v for v, _ in res)
-        starts = {"starts": MULTI_START, "loglik_spread": spread}
-        if spread > START_TOL:
-            raise NoiseBankError(f"the constrained fit is not certified: {MULTI_START} starts disagree by "
-                                 f"{spread:.3g} log-likelihood units (> {START_TOL})")
-        best = max(res, key=lambda t: t[0])[1]
-        rho, how = {g: float(best[i]) for i, g in enumerate(GROUPS)}, "constrained"
+        runs = []
+        for x0 in _starts(un):
+            x, Lx, ok, resid, mu = _interior(objs, x0)
+            if ok:
+                runs.append((Lx, x, resid))
+        if not runs:
+            raise NoiseBankError("the constrained fit did not converge from any start")
+        Lbest = max(v for v, _, _ in runs)
+        top = [(v, x, rs) for v, x, rs in runs if v >= Lbest - START_TOL]
+        spread = max(float(np.max(np.abs(x - top[0][1]))) for _, x, _ in top)
+        best = max(top, key=lambda t: t[0])
+        starts = {"starts": MULTI_START, "converged": len(runs), "reaching_best": len(top),
+                  "parameter_spread": spread, "stationarity": best[2],
+                  "label": "multi-start validated, not a global certificate"}
+        if len(top) < MIN_AGREE or spread > PARAM_TOL or not best[2] <= KKT_TOL:
+            raise NoiseBankError(f"the constrained fit is refused: {len(top)} runs reach the best value, their "
+                                 f"parameters spread {spread:.3g}, stationarity {best[2]:.3g}")
+        rho, how = {g: float(best[1][i]) for i, g in enumerate(GROUPS)}, "constrained"
         SR, SD, SE, feas2, prob2 = components_of(rho)
         if not feas2:
             raise NoiseBankError(f"the constrained fit is infeasible: {prob2}")
-    ll = sum(_cubic1(lists[g], rho[g], m) for g in GROUPS)
+    ll = sum(float(obj_rho(*objs[g], rho[g])[0][0]) for g in GROUPS)
+    at_box = sorted(g for g in GROUPS if abs(rho[g]) >= RHO_MAX - 1e-6)
     return {"rho": rho, "fit": how, "loglik": ll, "SigmaR": SR, "SigmaD": SD, "SigmaE": SE,
-            "unconstrained": un, "problems": prob, "starts": starts}
+            "unconstrained": un, "problems": prob, "starts": starts, "at_box": at_box}
+
+
+def identified(zn, vals, rho, npairs):
+    """THE IDENTIFICATION RULE (point estimate and every bootstrap refit alike): the analytic curvature per
+    (weighted) pair at the group maximum, -l_rr / pairs >= INFO_MIN; a maximum on the registered box is
+    flagged and identified by its one-sided slope instead (|l_r| / pairs >= INFO_MIN: the likelihood still
+    rises into the box). -> (ok, curvature per pair, at_box)."""
+    _, d1, d2 = obj_rho(zn, vals, rho)
+    at_box = abs(rho) >= RHO_MAX - 1e-6
+    per = (abs(float(d1[0])) if at_box else -float(d2[0])) / max(npairs, 1e-300)
+    return per >= INFO_MIN, per, at_box
+
+
+def certify(tab, fitrho, rounds=GRID_ROUNDS):
+    """THE GRID CERTIFICATION (Codex #72 r3 P2-2), a posteriori, at the point estimate: per group, the EXACT
+    objective at the fitted rho and at the off-grid midpoints of its bracket and both neighbours; where the
+    interpolant misses by more than GRID_LL_TOL per pair, those exact columns are inserted as nodes (local
+    refinement) -> (refined?, the worst miss per pair). The caller refits until a round inserts nothing (at
+    most GRID_ROUNDS), else the bank is refused."""
+    import numpy as np
+    worst, inserted = 0.0, False
+    for g in GROUPS:
+        t = tab[g]
+        zn = t["z"]
+        z = math.atanh(max(-RHO_MAX, min(RHO_MAX, fitrho[g])))
+        k = int(np.clip(np.searchsorted(zn, z, side="right") - 1, 0, len(zn) - 2))
+        pts = [z] + [0.5 * (zn[i] + zn[i + 1]) for i in (k - 1, k, k + 1) if 0 <= i < len(zn) - 1]
+        newz, newc = [], []
+        for zz in pts:
+            if np.any(np.abs(zn - zz) < 1e-12):
+                continue
+            col, _ = exact_column(t["blocks"], len(t["keys"]), math.tanh(zz))
+            miss = abs(float(_interp(zn, t["T"].sum(axis=0), np.array([zz]))[0][0]) - float(col.sum())) / t["pairs"]
+            worst = max(worst, miss)
+            if miss > GRID_LL_TOL:
+                newz.append(zz)
+                newc.append(col)
+        if newz:
+            inserted = True
+            z_all = np.concatenate([zn, np.array(newz)])
+            T_all = np.hstack([t["T"], np.array(newc).T])
+            o = np.argsort(z_all)
+            t["z"], t["T"] = z_all[o], T_all[:, o]
+    return inserted, worst
 
 
 # ================================================================== s(mu)
@@ -1282,10 +1544,17 @@ def _trigamma(x):
 
 
 def inv_trigamma(y):
-    """x > 0 with trigamma(x) = y (> 0; trigamma is decreasing): bisection on log x inside a bracket grown
-    from the asymptotic guess 1 / y + 1/2 until it encloses the root (any tiny or large y)."""
+    """x > 0 with trigamma(x) = y (> 0, finite; trigamma is decreasing), in LOG space: bisection on log x
+    inside a bracket grown from the asymptotic guess; for very small y (x beyond 1e15) the asymptotic
+    inverse x = 1 / y + 1/2 (relative error below 1e-15) is used directly, so nothing overflows; a result
+    beyond the float range is a NoiseBankError (the caller reports full pooling)."""
     if not y > 0 or not math.isfinite(y):
         raise NoiseBankError(f"inv_trigamma needs a positive finite value (got {y!r})")
+    if y < 1e-15:
+        x = 1.0 / y + 0.5
+        if not math.isfinite(x):
+            raise NoiseBankError("inv_trigamma: the result overflows")
+        return x
     g = math.log(1.0 / y + 0.5)
     lo, hi = g - 2.0, g + 2.0
     while _trigamma(math.exp(lo)) <= y:
@@ -1317,15 +1586,17 @@ def nu0_of(mu, sigma, var_t, curve):
     rec = {"excess_log_variance": excess, "sampling_log_variance": samp, "cells": int(ok.sum())}
     if not excess > 0:
         return dict(rec, status="full_pooling")
-    return dict(rec, status="estimated", nu0=2.0 * inv_trigamma(excess))
+    try:
+        return dict(rec, status="estimated", nu0=2.0 * inv_trigamma(excess))
+    except NoiseBankError:
+        return dict(rec, status="full_pooling", note="nu0 beyond the float range: full pooling")
 
 
 # ================================================================== the estimate
 def pick_weights(keys, m, mp):
     """The registered bootstrap weights (Codex #72 r2 P2-4, the coordinator's ruling): a WORLD-MULTIPLICITY
     WEIGHTED LIKELIHOOD. Each pair's weight is the product of the prey-role multiplicities m over the DISTINCT
-    prey worlds of its sources and of the predator-role multiplicities mp over its DISTINCT predator worlds
-    (a world counts once however many of its snapshots the pair involves)."""
+    prey worlds of its sources and of the predator-role multiplicities mp over its DISTINCT predator worlds."""
     import numpy as np
     return np.array([math.prod(int(m[a]) for a in set(kp)) * math.prod(int(mp[b]) for b in set(kq))
                      for kp, kq in keys], float)
@@ -1339,39 +1610,47 @@ def _entries(f):
     return [SR[0, 0], SR[1, 1], SR[0, 1], SR[0, 2], SR[1, 2], SD[0, 0], SD[1, 1], SD[0, 1], SE[0, 0], SE[1, 1], SE[0, 1]]
 
 
-def bootstrap(tab, n_worlds, boot, seed, m=Z_INTERVALS):
-    """The registered uncertainty procedure (see the module docstring) -> (draws x BOOT_NAMES array, failed
-    draws: a group with no weight left, or a refused / non-converged fit)."""
+def bootstrap(tab, n_worlds, boot, seed):
+    """The registered uncertainty procedure -> (draws x BOOT_NAMES, failed draws, of which identification
+    rejections). Each weighted refit applies THE SAME identification rule as the point estimate (identified,
+    with the WEIGHTED pair counts); a group without weight, an unidentified group or a refused fit is a failed
+    draw (Codex #72 r3 P2-5)."""
     import numpy as np
     rng = np.random.default_rng(seed)
-    out, failed = [], 0
+    out, failed, unident = [], 0, 0
     for _ in range(boot):
         mm = np.bincount(rng.integers(0, n_worlds, n_worlds), minlength=n_worlds)
         mp = np.bincount(rng.integers(0, n_worlds, n_worlds), minlength=n_worlds)
-        ob = {}
+        objs, pairs, bad = {}, {}, False
         for g in GROUPS:
             w = pick_weights(tab[g]["keys"], mm, mp)
             if not w.any():
-                ob = None
+                bad = True
                 break
-            ob[g] = w @ tab[g]["T"]
-        if ob is None:
+            objs[g] = (tab[g]["z"], w @ tab[g]["T"])
+            pairs[g] = float(w @ tab[g]["npk"])
+            r_hat, _ = _argmax(*objs[g])
+            if not identified(*objs[g], r_hat, pairs[g])[0]:
+                bad = True
+                unident += 1
+                break
+        if bad:
             failed += 1
             continue
         try:
-            out.append(_entries(fit_dependence(ob, m)))
+            out.append(_entries(fit_dependence(objs, pairs)))
         except NoiseBankError:
             failed += 1
-    return np.array(out, float).reshape(len(out), len(BOOT_NAMES)), failed
+    return np.array(out, float).reshape(len(out), len(BOOT_NAMES)), failed, unident
 
 
-def interval_record(D, failed, boot):
-    """Codex #72 r2 P2-5: the failed draws are counted; the interval is UNAVAILABLE (its own status, apart
-    from the point estimate's) when they exceed BOOT_FAIL_MAX of the draws, otherwise reported with the
+def interval_record(D, failed, boot, unident=0):
+    """Codex #72 r2 P2-5 / r3 P2-5: the failed draws (identification rejections included) are counted; the
+    interval is UNAVAILABLE (its own status) beyond BOOT_FAIL_MAX of the draws, otherwise reported with the
     failure rate, labelled approximate and conditional on identification."""
     import numpy as np
     rate = failed / boot if boot else 1.0
-    rec = {"draws": boot, "failed": failed, "failure_rate": rate,
+    rec = {"draws": boot, "failed": failed, "identification_rejections": unident, "failure_rate": rate,
            "procedure": "world-multiplicity weighted likelihood (prey and predator roles resampled independently; "
                         "a pair weighted by the product over the DISTINCT worlds of each role); a departure from "
                         "H.7's materialized-record bootstrap: descriptive, outside the confirmatory family",
@@ -1384,8 +1663,9 @@ def interval_record(D, failed, boot):
 
 
 def horizon_estimate(A, boot=BOOT, seed=0, m=Z_INTERVALS):
-    """One horizon: the usable channels, the s(mu) curves and nu0, the nine groups, the components (or
-    "unavailable" with reasons), the registered uncertainty procedure."""
+    """One horizon: the usable channels, the s(mu) curves and nu0, the nine groups (identification), the
+    components (or "unavailable" with reasons) with the grid CERTIFIED at the fit, the registered uncertainty
+    procedure."""
     import numpy as np
     U = usable(A)
     rec = {"capture_bound": A["N"]["C"], "replicates": A["R"], "incomplete_cells": A["incomplete_cells"],
@@ -1402,39 +1682,46 @@ def horizon_estimate(A, boot=BOOT, seed=0, m=Z_INTERVALS):
     if reasons:
         rec.update(status="unavailable", reasons=reasons, components=None, bootstrap=None)
         return rec
-    tab = group_tables(A, U, G, m)
-    obj = {g: tab[g]["T"].sum(axis=0) for g in GROUPS}
-    groups = {}
-    for g in GROUPS:
-        r_hat, _ = _argmax(obj[g], m)
-        z, h = math.atanh(r_hat), 2 * Z_MAX / m
-        zs = [max(-Z_MAX, min(Z_MAX, z + d)) for d in (-h, 0.0, h)]
-        f = [float(_cubic(obj[g], math.tanh(v), m)) for v in zs]
-        d2 = (f[0] - 2 * f[1] + f[2]) / h ** 2 / (1 - r_hat ** 2) ** 2      # (d2 / d rho2 at the maximum)
-        per = -d2 / tab[g]["pairs"]
-        groups[g] = {"pairs": tab[g]["pairs"], "rho_max": r_hat, "curvature_per_pair": per,
-                     "at_grid_edge": abs(r_hat) >= RHO_MAX - 1e-12, "deep_tail": tab[g]["deep_tail"]}
-        if not per >= INFO_MIN:
-            reasons.append(f"{g} is unidentified (curvature per pair {per:.3g} < {INFO_MIN})")
-    rec["groups"] = groups
-    if reasons:
-        rec.update(status="unavailable", reasons=reasons, components=None, bootstrap=None)
-        return rec
     try:
-        fit = fit_dependence(obj, m)
+        tab = group_tables(A, U, G, m)
+        fit, cert = None, []
+        for rnd in range(GRID_ROUNDS + 1):
+            objs = {g: (tab[g]["z"], tab[g]["T"].sum(axis=0)) for g in GROUPS}
+            groups = {}
+            for g in GROUPS:
+                r_hat, _ = _argmax(*objs[g])
+                ok, per, at_box = identified(*objs[g], r_hat, tab[g]["pairs"])
+                groups[g] = {"pairs": tab[g]["pairs"], "rho_max": r_hat, "curvature_per_pair": per, "at_box": at_box,
+                             "deep_tail": tab[g]["deep_tail"], "nodes": int(len(tab[g]["z"]))}
+                if not ok:
+                    reasons.append(f"{g} is unidentified ({'one-sided slope' if at_box else 'curvature'} per pair "
+                                   f"{per:.3g} < {INFO_MIN})")
+            if reasons:
+                rec.update(status="unavailable", reasons=reasons, components=None, bootstrap=None, groups=groups)
+                return rec
+            fit = fit_dependence(objs, {g: tab[g]["pairs"] for g in GROUPS})
+            inserted, worst = certify(tab, fit["rho"])
+            cert.append(worst)
+            if not inserted:
+                break
+        else:
+            raise NoiseBankError(f"the grid is not certified after {GRID_ROUNDS} refinements (worst miss {cert[-1]:.3g} per pair)")
     except NoiseBankError as e:
         rec.update(status="unavailable", reasons=[str(e)], components=None, bootstrap=None)
         return rec
+    rec["groups"] = groups
+    rec["grid_certification"] = {"rounds": len(cert), "worst_miss_per_pair": cert, "tolerance": GRID_LL_TOL}
     rec["components"] = {"SigmaR": fit["SigmaR"].tolist(), "SigmaD": fit["SigmaD"].tolist(),
                          "SigmaE": fit["SigmaE"].tolist(), "fit": fit["fit"], "loglik": fit["loglik"],
-                         "unconstrained_problems": fit["problems"], "multistart": fit["starts"],
+                         "unconstrained_problems": fit["problems"], "multistart": fit["starts"], "at_box": fit["at_box"],
+                         "box": f"|rho| <= {RHO_MAX}: a registered numerical restriction (a share above it cannot be fitted)",
                          "SigmaR_FF": {"value": float(fit["SigmaR"][2, 2]), "status": "convention",
                                        "rule": "the minimal feasible free row variance v' A^+ v: one control per "
                                                "row leaves the free row / control split unidentified"},
                          "shares": {ch: {"row": float(fit["SigmaR"][k, k]), "donor": float(fit["SigmaD"][k, k]),
                                          "cell": float(fit["SigmaE"][k, k])} for k, ch in enumerate("CS")}}
-    D, failed = bootstrap(tab, len(worlds), boot, seed, m)
-    rec["bootstrap"] = interval_record(D, failed, boot)
+    D, failed, unident = bootstrap(tab, len(worlds), boot, seed)
+    rec["bootstrap"] = interval_record(D, failed, boot, unident)
     rec.update(status="ok", reasons=[])
     return rec
 
@@ -1451,7 +1738,11 @@ def estimate(doc, boot=BOOT, seed=0, m=Z_INTERVALS, replicates=None):
            "estimator": {"z_intervals": m, "rho_max": RHO_MAX, "saturation": list(SATURATION), "sigma_min": SIGMA_MIN,
                          "info_min": INFO_MIN, "multi_start": MULTI_START, "start_tol": START_TOL,
                          "boot": boot, "boot_fail_max": BOOT_FAIL_MAX, "seed": seed,
-                         "rectangle": "log_rect (conditional integral, log space)",
+                         "rectangle": f"log_rect on the registered domain (|e| <= {E_MAX}, width >= {W_MIN}, "
+                                      f"|rho| <= {RHO_MAX}); validated max error {LOG_RECT_TOL}",
+                         "grid": "z = atanh(rho), refined edges, certified a posteriori at the fit",
+                         "constrained_fit": "interior point from 16 Halton starts; multi-start validated, not a "
+                                            "global certificate",
                          "fixed_replicate_bias": "not corrected (see the PR's simulation)"}, "horizons": {}}
     for h in HORIZONS:
         A = arrays(obs, h)
