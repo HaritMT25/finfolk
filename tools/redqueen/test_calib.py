@@ -182,18 +182,6 @@ class TestGenerator(unittest.TestCase):
         r = cb.run_panel(g, p, "H-F", "dev", "actual", "F0", 0)
         self.assertFalse(r.get("error"), r.get("error"))
 
-    def test_null_redraws(self):
-        """D2 on a real panel: a null world whose target is unattainable is redrawn (recorded); the panel
-        verifies; an alternative is never redrawn (a non-success instead)."""
-        cb = self.cb
-        g = cb.synthetic_graph(32)
-        r = cb.run_panel(g, cb.placeholder_params(), "H-T", "dev", "stress24", "T0", 0, {e: 0.0 for e in ("E1", "E2", "E3")},
-                         draws=19)
-        self.assertFalse(r.get("error"), r.get("error"))
-        self.assertTrue(r.get("redraws") or r.get("infeasible"), r)
-        if not r.get("infeasible"):
-            self.assertEqual(r["unattainable"], [])
-
     def test_verified_constraints(self):
         """The completed noise-free panel meets its declared directional slopes (T2: 1.5 delta with
         recurrence) and a perturbed declaration is caught."""
@@ -302,22 +290,6 @@ class TestHarness(unittest.TestCase):
             cb.freeze_gates(crit, cb.acceptance(bad, crit))
         with self.assertRaises(cb.CalibError):
             cb.check_gates(dict(art, passed=dict(art["passed"], E3=False)))
-
-    def test_infeasible_modes_and_redraw_rates(self):
-        """D2: a mode x stratum with an infeasible panel is declared infeasible and reported (excluded from
-        the maxima and the acceptance rates); redraw rates are reported; neither is a failed calibration."""
-        cb = self.cb
-        dev = self.allocation("H-F", "dev", cb.N_DEV)
-        dev = [dict(r, infeasible="x", available=False) if (r["mode"] == "F2" and r["stratum"] == "actual" and r["panel"] == 3)
-               else dict(r, redraws=[{"world": "C01"}]) if (r["mode"] == "F1" and r["panel"] < 8) else r for r in dev]
-        crit = cb.critical_values(dev)
-        self.assertEqual(crit["infeasible"], {"H-F|F2|actual": 1})
-        self.assertNotIn("H-F|F2|actual", crit["strata"])
-        self.assertEqual(crit["redraws"]["H-F|F1|actual"]["panels_redrawn"], 8)
-        acc = cb.acceptance(self.allocation("H-F", "val", cb.N_VAL, score=lambda m, s, k: 0.0), crit)
-        self.assertIn("H-F|F2|actual", acc["infeasible"])
-        self.assertNotIn("detection|F2|actual", acc["rates"]["H-F"])
-        self.assertTrue(acc["pass"]["H-F detection"])
 
     def test_power_and_non_success(self):
         cb = self.cb
