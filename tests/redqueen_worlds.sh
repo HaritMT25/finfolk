@@ -501,7 +501,7 @@ for k in (0, 1):
 assert os.path.isfile(os.path.join(worlds.adir(ar, wid), "FINALIZED"))
 rep = worlds.burn_in_report("RZ", reg)["per_treatment"]["A"]
 assert rep == {"worlds": 1, "restarts": 2, "attempts_started": 3, "early_failures": 3, "established": 0, "pending": 0,
-               "unresolved": 0, "failed": 0, "early_failure_rate": 1.0}, rep       # (the exhausted one counts)
+               "unresolved": 0, "failed": 0, "failed_before_start": 0, "early_failure_rate": 1.0}, rep
 for k in (0, 1):                                       # each retained attempt resolves to its own bytes
     assert worlds.audit_attempt("RZ", wid, k) == [], (k, worlds.audit_attempt("RZ", wid, k))
     assert all(r["path"].startswith(os.path.join(ar, "restarts", f"{wid}.a{k}")) for r in

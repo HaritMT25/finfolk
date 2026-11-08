@@ -407,6 +407,39 @@ class TestBranches(unittest.TestCase):
         rqlib.write_json_durable(os.path.join(d, "attempt.json"), {"attempt": 1})
         self.assertIn("discarded attempt", forks.branch_invalid(study, b))
 
+    def test_restart_during_the_copy(self):
+        """#70 round 2, 1: the frozen origin is bound to the root attempt admitted; a restart between the
+        admission and the copy is detected: nothing frozen, the branch waits."""
+        study, reg, ar = make_root(self.tmp, "A", dict(SCHED, total_steps=3000))
+        w = reg["worlds"][0]
+        flags = w["flags"]
+        o = os.path.join(self.tmp, "o1000.json")
+        wr(o, ckpt.dumps(mk_cp(frame=1000, cfg_extra=cfg_for(flags))))
+        os.makedirs(worlds.wdir(study, w["id"]), exist_ok=True)
+        worlds.archive_one(study, w["id"], ar, 1000, o, lambda m: None)
+        b = {"id": f"{w['id']}.o1000.s0", "uuid": "u-branch", "kind": "main", "root": w["id"], "root_uuid": w["uuid"],
+             "split": "test", "treatment": "A", "block": 1, "flags": flags, "predator_log": False, "config_args": None,
+             "origin": {"frame": 1000, "label": "end.1000", "seed": 77, "k": 0}, "total_steps": 3000}
+        freg = {"schema": forks.SCHEMA, "schedule": dict(SCHED, total_steps=3000), "worlds": [b]}
+        fr = forks.froot(study)
+        os.makedirs(fr)
+        worlds.bind_root(fr, rqlib.canonical_sha(freg), create=True)
+        seq = iter([0, 1, 1, 1, 1, 1])
+        orig = worlds.attempt_of
+        worlds.attempt_of = lambda root, wid: next(seq) if wid == w["id"] else orig(root, wid)
+        logs = []
+        try:
+            forks.refresh_origins(study, freg, logs.append)
+        finally:
+            worlds.attempt_of = orig
+        self.assertTrue(any("restarted while the origin was copied" in m for m in logs), logs)
+        d = worlds.wdir(fr, b["id"])
+        self.assertFalse(os.path.exists(os.path.join(d, "origin.json")))
+        self.assertFalse(os.path.exists(os.path.join(d, "origin.rec.json")))
+        self.assertEqual(worlds.read_state(fr, b["id"])["status"], "waiting")
+        forks.refresh_origins(study, freg, logs.append)                 # (no race: frozen, bound to attempt 0)
+        self.assertEqual(rqlib.read_json(os.path.join(d, "origin.rec.json"))["root_attempt"], 0)
+
     def test_origin_unavailable_and_changed(self):
         study, fr, far, rt, b, cp = self.setup_branch()
         hw = b["root"]

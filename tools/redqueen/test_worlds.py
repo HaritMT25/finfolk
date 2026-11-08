@@ -1229,7 +1229,8 @@ class TestBurnIn(unittest.TestCase):
         rep_ = worlds.burn_in_report(root, reg)
         self.assertEqual(rep_["per_treatment"]["A"], {"worlds": 1, "restarts": 1, "attempts_started": 1,
                                                       "early_failures": 1, "established": 0, "pending": 1,
-                                                      "unresolved": 0, "failed": 0, "early_failure_rate": 1.0})
+                                                      "unresolved": 0, "failed": 0, "failed_before_start": 0,
+                                                      "early_failure_rate": 1.0})
         # the retained attempt's archive index resolves to its own relocated bytes (#70 review 3)
         recs = worlds.attempt_archive_records(root, wid, 0)
         self.assertTrue(recs and all(r["path"].startswith(os.path.join(ar, "restarts", f"{wid}.a0") + os.sep)
@@ -1340,8 +1341,10 @@ class TestBurnIn(unittest.TestCase):
         48 / 64; slots keep their seeds across them."""
         arena = os.path.join(self.tmp, "arena.json")
         wr(arena, json.dumps(ARENA))
-        regs = {n: worlds.register(arena, "ns-lay", blocks=8, per_block=worlds.LAYOUTS[n], schedule=SCHED)
+        regs = {n: worlds.register(arena, "ns-lay", blocks=8, per_block=worlds.LAYOUTS[n], schedule=SCHED, layout=n)
                 for n in ("48", "56", "64")}
+        self.assertEqual((regs["56"]["layout"], regs["56"]["block_allocations"]["2"]), ("56", {"C": 4, "A": 1, "B": 2}))
+        self.assertIn("exchangeable", regs["56"]["allocation_note"])
         for n, want in (("48", (32, 8, 8)), ("56", (32, 12, 12)), ("64", (32, 16, 16))):
             c = Counter(w["treatment"] for w in regs[n]["worlds"])
             self.assertEqual((c["C"], c["A"], c["B"]), want, n)
@@ -1383,6 +1386,65 @@ class TestBurnIn(unittest.TestCase):
                 self.assertEqual(worlds.attempt_of(root, wid), 1)
         finally:
             worlds.pin_binary = orig
+
+    def test_decided_needs_survival_without_an_early_zero(self):
+        """#70 round 2, 1 (P1): an attempt with an evidenced zero before the burn-in frame is never decided
+        alive, even with an acceptance at or past the burn-in frame; without the zero it is."""
+        for zero_at, want in ((1500, False), (10 ** 9, True)):
+            worlds.release_archives()
+            rm_tree(self.tmp)
+            os.makedirs(self.tmp)
+            root, reg, ar, wid = self.world(zero_at=zero_at, burn_in=2000)
+            s, msgs = supervisor(root, reg, ar)
+            s.archive_pass(wid, alive=False)
+            s.accept_pass(wid, alive=False)
+            s.recover_zeros(wid)
+            self.assertIn(2000, [r["frame"] for r in worlds.accept_records(root, wid)])
+            got, why = worlds.burn_in_decided(root, reg, wid)
+            self.assertEqual(got, want, why)
+            if not want:
+                self.assertIn("will be restarted", why)
+
+    def test_live_invalid_row_barrier_persists(self):
+        """#70 round 2, 2: once a segment shows an invalid row, no later row of it is evidence (the tail has
+        moved past the batch): 100,50,8 / 150,50,8 (off the sequence) / later 200,0,8: no zero."""
+        root, reg, ar, wid = self.world(zero_at=10 ** 9, burn_in=3000)
+        p = os.path.join(worlds.wdir(root, wid), "seg000", "run.csv")
+        wr(p, "step,population,predator_pop\n100,50,8\n150,50,8\n")
+        s, msgs = supervisor(root, reg, ar)
+        s.tails[wid] = worlds.Tail(p)
+        self.assertIsNone(s.watch(wid))
+        with open(p, "a") as f:
+            f.write("200,0,8\n")
+        self.assertIsNone(s.watch(wid))
+        self.assertEqual(s.zeros.get(wid), None)
+        self.assertFalse(os.path.isfile(os.path.join(root, "availability.jsonl")))
+
+    def test_report_keeps_an_established_attempt_through_a_technical_failure(self):
+        """#70 round 2, 3: one exhausted early failure and one established attempt that later failed
+        technically: 50 %; the technical failure is reported separately."""
+        arena = os.path.join(self.tmp, "arena.json")
+        wr(arena, json.dumps(ARENA))
+        reg = worlds.register(arena, "ns-rep", blocks=1, per_block={"A": 2, "B": 0, "C": 0}, schedule=SCHED,
+                              burn_in=2000)
+        root = os.path.join(self.tmp, "root")
+        worlds.write_registry(os.path.join(root, "config", "worlds.json"), rqlib.canonical(reg))
+        w1, w2 = (w["id"] for w in reg["worlds"])
+        seg = [{"name": "seg000", "start_frame": 0, "resumed_from": None, "resumed_accept": None, "args": []}]
+        worlds.write_state(root, w1, {"schema": worlds.STATE_SCHEMA, "id": w1, "status": "extinct", "failures": 0,
+                                      "segments": seg, "end_reason": "the prey reached 0; the restarts exhausted (0)"})
+        d = os.path.join(worlds.wdir(root, w2), "seg000")
+        os.makedirs(d)
+        head = "step,population,predator_pop\n2500,0,8\n"
+        wr(os.path.join(d, "run.csv"), head)
+        worlds._append_durable(os.path.join(root, "availability.jsonl"), {
+            "schema": worlds.AVAIL_SCHEMA, "world": w2, "guild": "prey", "first_zero_frame": 2500,
+            "segment": "seg000", "csv_bytes": len(head), "csv_sha256": rqlib.sha256_bytes(head.encode())})
+        worlds.write_state(root, w2, {"schema": worlds.STATE_SCHEMA, "id": w2, "status": "failed", "failures": 3,
+                                      "segments": seg, "end_reason": "exit 1, no progress"})
+        p = worlds.burn_in_report(root, reg)["per_treatment"]["A"]
+        self.assertEqual((p["early_failures"], p["established"], p["failed"], p["early_failure_rate"]), (1, 1, 1, 0.5))
+        self.assertEqual(worlds.audit_attempt(root, w1, 3)[0][:9], "attempt 3")        # (P3: no such attempt)
 
     def test_burn_in_off_for_old_registries(self):
         """A registry without seed reservations (scheme before slot/1) keeps the old behaviour."""
