@@ -64,6 +64,9 @@ $PY -c 'import sys; print("redqueen_tooling: Python", sys.version.split()[0])'
 
 $PY -W error::ResourceWarning "$T/test_redqueen.py" > unit.log 2>&1 || { tail -30 unit.log; fail "unit tests"; }
 grep -q ResourceWarning unit.log && { grep -m 5 ResourceWarning unit.log; fail "the unit tests leak file handles"; }
+# the map graph (stdlib) and the recovery simulation (numpy: skipped without it, unless RQ_REQUIRE_NUMPY=1)
+$PY -W error::ResourceWarning "$T/test_graph.py" > graph_unit.log 2>&1 || { tail -30 graph_unit.log; fail "graph unit tests"; }
+grep -q ResourceWarning graph_unit.log && fail "the graph unit tests leak file handles"
 
 # --- tiny Stage C worlds: A and B (periodic checkpoints at 1500 and 3000, a one-step F1 replay), a template
 STAGEC="--population 200 --predators 6 --predator-economy --predator-brain --predator-meal 14

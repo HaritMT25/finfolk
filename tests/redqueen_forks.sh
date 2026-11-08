@@ -41,7 +41,7 @@ cat > arena.json <<'JSON'
 JSON
 
 # 1. two C histories
-$WS register --arena arena.json --namespace rq-test-forks --blocks 1 --per-block C=2 --total-steps 24000 \
+$WS register --arena arena.json --namespace rq-test-forks --blocks 1 --per-block C=2 --total-steps 24000 --burn-in 0 \
     --checkpoint-every 4000 --log-every 100 --out R/config/worlds.json 2> /dev/null || fail "register"
 $WS f1 --root R --binary "$BIN" > rf1.log 2>&1 || fail "f1: $(tail -3 rf1.log)"
 $WS launch --root R --binary "$BIN" --workers 2 --on-extinction continue $GUARD > r.log 2>&1 || fail "launch: $(tail -3 r.log)"
