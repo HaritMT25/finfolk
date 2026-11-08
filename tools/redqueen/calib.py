@@ -196,6 +196,8 @@ LAMBDA_GRID = tuple(0.5 * k for k in range(21))
 LAMBDA_TOL = 1e-3        # the null-side acceptance of the multiplier: E in [b (1 - LAMBDA_TOL), b]
 LAMBDA_JUMP = 1e-3       # a bracket narrower than this (relative) without an accepted point: a jump
 LAMBDA_EVALS = 60        # evaluations before the multiplier search is a numerical failure
+LAMBDA_FROZEN_METRIC = False   # the frozen-metric lambda proposals (a CPU lever; OFF until Codex r5 rules)
+FROZEN_ROUNDS = 4        # re-anchorings of the frozen metric before the true-metric search takes over
 BOUNDARY_TOL = 0.05      # the ONE-SIDED boundary window, energy scale [b (1 - 0.05), b] (RMS: [0.9747, 1] x d)
 TAU_NUM = 2 * DIR_TOL / min(stats.DELTA_P, stats.DELTA_Q)    # = 1e-3: null membership's NUMERICAL allowance
 D_C, D_Q = recurrence.D_C, recurrence.D_Q
@@ -1019,37 +1021,47 @@ class Panel:
         nat = self.native(wg, lat)
         w.update(amp={sc: list(v) for sc, v in amp.items()}, mu={ch: sig(lat[ch]) for ch in lat},
                  y_true={"within": {"C": nat["C"], "Q": nat["Q"]}, "ref": {"C": nat["RC"], "Q": nat["RQ"]}})
-        w.pop("cov_nf", None)
+        self._reset_nf(w)
         return clips
 
     def solve_boundary(self, decl):
         """H-F F3 / F4: the panel multiplier lambda on the declared component's per-world RMS targets with the
         ACTUAL searched noise-free functional (E_C or E_Q of recurrence.hf: selection, gates, projections, the
         all-n denominator; the triage metric) in the null-side window [b (1 - LAMBDA_TOL), b] (see the
-        docstring's H-F F3 / F4 BOUNDARIES; #68 round 4 (C)). -> {"outcome": feasible / unreached, "lambda",
-        "functional", "boundary", "evals", "path"}; the panel is left at the retained lambda (its per-world
-        clips there recorded; verify re-run)."""
+        docstring's H-F F3 / F4 BOUNDARIES; #68 round 4 (C)). With LAMBDA_FROZEN_METRIC the iterates are first
+        PROPOSED on a metric frozen at an anchor's means (designs fixed: no rebuild per evaluation) and each
+        proposal is accepted only by the TRUE metric (re-anchored up to FROZEN_ROUNDS times); otherwise, and
+        whenever no proposal is accepted, the true-metric search decides (it alone classifies unreached).
+        -> {"outcome": feasible / unreached, "lambda", "functional", "boundary", "evals", "path"}; the panel
+        is left at the retained lambda (its per-world clips there recorded; verify re-run)."""
         h = 0 if decl["name"] == "E_C" else 1
         base = self.worlds[0]["plan"]["rec"]["full"][h]
         b = decl["boundary"]
         tolb = LAMBDA_TOL * b
-        states, path = {}, []
+        states, path, last = {}, [], {}
+        frozen = {"evals": 0, "path": []}
 
-        def E(lam):
+        def apply(lam):
+            clips = []
+            for w in self.worlds:
+                clips += self._world_at(w, h, lam * base)
+            return clips
+
+        def E(lam):                                         # (the TRUE metric)
             lam = float(lam)
             if lam in states:
                 return states[lam]["E"]
             if len(path) >= LAMBDA_EVALS:
                 raise CalibError(f"the boundary multiplier did not converge in {LAMBDA_EVALS} evaluations (a "
                                  f"numerical failure): {path[-4:]}")
-            clips = []
-            for w in self.worlds:
-                clips += self._world_at(w, h, lam * base)
+            clips = apply(lam)
             v = self.functionals()[decl["name"]]
             if not math.isfinite(v):
                 raise CalibError("a nonfinite boundary functional (a numerical failure)")
             states[lam] = {"E": v, "clips": clips, "worlds": [{k: w[k] for k in ("amp", "mu", "y_true")}
                                                               for w in self.worlds]}
+            last.clear()
+            last.update(lam=lam, nf=[(w.get("cov_nf"), w.get("_dcache_nf")) for w in self.worlds])
             path.append((lam, v))
             return v
 
@@ -1061,10 +1073,14 @@ class Panel:
 
         def finish(lam, outcome, kind=None):
             st = states[lam]
-            for w, x in zip(self.worlds, st["worlds"]):
+            reuse = last.get("lam") == lam                  # (the designs of the last evaluation: exact reuse)
+            for i, (w, x) in enumerate(zip(self.worlds, st["worlds"])):
                 w.update(x)
-                w.pop("cov_nf", None)
-                w["plan"]["rec"]["full"] = tuple(lam * base if i == h else t for i, t in enumerate(w["plan"]["rec"]["full"]))
+                self._reset_nf(w)
+                if reuse and last["nf"][i][0] is not None:
+                    w["cov_nf"], w["_dcache_nf"] = last["nf"][i]
+                w["plan"]["rec"]["full"] = tuple(lam * base if i_ == h else t
+                                                 for i_, t in enumerate(w["plan"]["rec"]["full"]))
             self.unattainable = list(st["clips"])
             if kind is not None:
                 self.unattainable.append({"world": "panel", "scope": "full", "readout": decl["name"], "target": b,
@@ -1081,24 +1097,74 @@ class Panel:
                                      f"{ver['violations'][:2]} (a numerical failure)")
                 self.verified.append(dict(ver, world=w["id"]))
             return {"outcome": outcome, "lambda": lam, "functional": st["E"], "boundary": b, "evals": len(path),
-                    "residual": (st["E"] - b) / b, "path": [list(x) for x in path]}
+                    "residual": (st["E"] - b) / b, "path": [list(x) for x in path],
+                    "frozen": {"evals": frozen["evals"], "proposals": frozen["path"]} if LAMBDA_FROZEN_METRIC else None}
 
-        def bracket(lo, glo, hi, ghi):
-            """Safeguarded Illinois / bisection on g = E - b between lo (g < 0) and hi (g > 0), either order:
-            an accepted null-side point, or None on a jump."""
-            side, width, since = 0, abs(hi - lo), 0
+        def drive(Ef, seen):
+            """The registered search with the evaluator Ef (seen: its evaluated points): -> ("feasible", lam),
+            ("jump", the null-side endpoint) or ("end", the unbracketed side: "unreached-above" / "-below")."""
+            lo = hi = None
+            lam = 1.0
+            while True:
+                v = Ef(lam)
+                if accepted(v):
+                    return "feasible", lam
+                if v < b:
+                    lo = (lam, v - b)
+                else:
+                    hi = (lam, v - b)
+                if lo is not None and hi is not None:
+                    break
+                if v < b and lam >= LAMBDA_MAX or v > b and lam <= 0.0:
+                    return "end", "unreached-above" if v < b else "unreached-below"
+                if v < b:
+                    lam = min(LAMBDA_MAX, lam * 2 if v <= 0 else lam * math.sqrt(b / v) * 1.02)
+                else:
+                    nl = lam * math.sqrt(b / v) * 0.98
+                    lam = 0.0 if nl < 1e-3 else nl
+                if lam in seen:
+                    lam = (lam + (lo[0] if lo is not None else 0.0)) / 2
+            return drive_from(lo[0], hi[0], Ef, seen)
+
+        def grid_search(skip):
+            """Every LAMBDA_GRID cell with a sign change of the TRUE E - b (increasing lambda; the cell holding a
+            known jump skipped): the first accepted point, else None."""
+            gv = [(x, E(x) - b) for x in LAMBDA_GRID]
+            for x, v in gv:
+                if accepted(v + b):
+                    return x
+            for (x0, v0), (x1, v1) in zip(gv, gv[1:]):
+                if v0 * v1 < 0 and not (skip is not None and x0 <= skip <= x1):
+                    res = drive_bracket(x0, v0, x1, v1)
+                    if res is not None:
+                        return res
+            return None
+
+        def drive_bracket(x0, v0, x1, v1):
+            lo_, hi_ = (x0, x1) if v0 < 0 else (x1, x0)
+            seen_ = {}
+
+            def Ef(x):
+                return E(x)
+            kind, val = drive_from(lo_, hi_, Ef, seen_)
+            return val if kind == "feasible" else None
+
+        def drive_from(lo_, hi_, Ef, seen_):
+            glo, ghi = Ef(lo_) - b, Ef(hi_) - b
+            side, width, since = 0, abs(hi_ - lo_), 0
+            lo, hi = lo_, hi_
             while True:
                 if abs(hi - lo) <= LAMBDA_JUMP * max(abs(lo), abs(hi), 1e-9):
-                    return None, lo
-                if since >= 2:                                          # (no halving in two steps: bisect)
+                    return "jump", lo
+                if since >= 2:
                     c = (lo + hi) / 2
                 else:
                     c = (lo * ghi - hi * glo) / (ghi - glo)
                     if not min(lo, hi) < c < max(lo, hi):
                         c = (lo + hi) / 2
-                gc = E(c) - b
+                gc = Ef(c) - b
                 if accepted(gc + b):
-                    return c, None
+                    return "feasible", c
                 if gc > 0:
                     hi, ghi = c, gc
                     if side == -1:
@@ -1113,21 +1179,6 @@ class Panel:
                 if abs(hi - lo) <= width / 2:
                     width, since = abs(hi - lo), 0
 
-        def grid_search(skip):
-            """Every LAMBDA_GRID cell with a sign change of E - b (in increasing lambda; the cell holding a
-            known jump skipped): the first accepted point, else None."""
-            gv = [(x, E(x) - b) for x in LAMBDA_GRID]
-            for x, v in gv:
-                if accepted(v + b):
-                    return x
-            for (x0, v0), (x1, v1) in zip(gv, gv[1:]):
-                if v0 * v1 < 0 and not (skip is not None and x0 <= skip <= x1):
-                    lo_, glo_, hi_, ghi_ = (x0, v0, x1, v1) if v0 < 0 else (x1, v1, x0, v0)
-                    c, _ = bracket(lo_, glo_, hi_, ghi_)
-                    if c is not None:
-                        return c
-            return None
-
         def unreached(kind, jump_lo=None):
             if jump_lo is not None:
                 keep = jump_lo                                          # (the attained null-side endpoint)
@@ -1138,39 +1189,43 @@ class Panel:
                 return finish(keep, "feasible")                        # (inside the registered boundary window)
             return finish(keep, "unreached", kind)
 
-        lo = hi = None
-        lam = 1.0
-        while True:
-            v = E(lam)
-            if accepted(v):
-                return finish(lam, "feasible")
-            if v < b:
-                lo = (lam, v - b)
-            else:
-                hi = (lam, v - b)
-            if lo is not None and hi is not None:
-                break
-            if v < b and lam >= LAMBDA_MAX or v > b and lam <= 0.0:
-                best = max(((x, lm) for lm, x in path if x <= b), default=None)
-                if best is not None and within(best[0]):
-                    return finish(best[1], "feasible")
-                c = grid_search(None)
-                return finish(c, "feasible") if c is not None else unreached(
-                    "unreached-above" if v < b else "unreached-below")
-            if v < b:
-                lam = min(LAMBDA_MAX, lam * 2 if v <= 0 else lam * math.sqrt(b / v) * 1.02)
-            else:
-                nl = lam * math.sqrt(b / v) * 0.98
-                lam = 0.0 if nl < 1e-3 else nl
-            if lam in states:
-                lam = (lam + (lo[0] if lo is not None else 0.0)) / 2
-        c, jlo = bracket(lo[0], lo[1], hi[0], hi[1])
-        if c is not None:
-            return finish(c, "feasible")
-        if within(states[jlo]["E"]):                                    # (a jump inside the window: met)
-            return finish(jlo, "feasible")
-        c = grid_search(jlo)
-        return finish(c, "feasible") if c is not None else unreached("jump", jlo)
+        if LAMBDA_FROZEN_METRIC:                            # (c): proposals on a frozen metric, the TRUE accepts
+            anchor = 1.0
+            for _ in range(FROZEN_ROUNDS):
+                E(anchor)                                   # (the true metric at the anchor: its designs frozen)
+                designs = [w["_dcache_nf"]["full"] for w in self.worlds]
+                memo = {}
+
+                def Ef(lam, designs=designs, memo=memo):
+                    lam = float(lam)
+                    if lam not in memo:
+                        if frozen["evals"] >= LAMBDA_EVALS * FROZEN_ROUNDS:
+                            raise CalibError("the frozen-metric proposals did not converge (a numerical failure)")
+                        apply(lam)
+                        memo[lam] = recurrence.hf([recurrence.analyze_world(d, w["y_true"])
+                                                   for d, w in zip(designs, self.worlds)])[decl["name"]]
+                        frozen["evals"] += 1
+                    return memo[lam]
+                kind, val = drive(Ef, memo)
+                if kind != "feasible":
+                    break
+                frozen["path"].append(val)
+                if accepted(E(val)):
+                    return finish(float(val), "feasible")
+                anchor = float(val)
+        kind, val = drive(E, states)
+        if kind == "feasible":
+            return finish(float(val), "feasible")
+        if kind == "jump":
+            if within(states[val]["E"]):                                # (a jump inside the window: met)
+                return finish(val, "feasible")
+            c = grid_search(val)
+            return finish(float(c), "feasible") if c is not None else unreached("jump", val)
+        best = max(((x, lm) for lm, x in path if x <= b), default=None)
+        if best is not None and within(best[0]):
+            return finish(best[1], "feasible")
+        c = grid_search(None)
+        return finish(float(c), "feasible") if c is not None else unreached(val)
 
     def observe_all(self):
         """The noisy observation of every triaged world (the shared reference components first)."""
@@ -1199,19 +1254,7 @@ class Panel:
         plug-in bank model at the noise-free means (triage), or the FINAL one, built from the observed
         means (final=True: the D1 boundary check, after observe)."""
         def design(w, scope):
-            wg = w["graph"]
-            if final:
-                cv = w["cov"]
-            else:
-                if "cov_nf" not in w:
-                    mu = w["mu"]
-                    w["cov_nf"] = {"C": self.cov(wg, {"C": mu["C"]}, "C"),
-                                   "Q": self.cov(wg, {"S": mu["S"], "F": mu["F"]}, "Q"),
-                                   "RC": self.cov(wg, {"C": mu["RC"]}, "RC"),
-                                   "RQ": self.cov(wg, {"S": mu["RS"], "F": mu["F"]}, "RQ")}
-                cv = w["cov_nf"]
-            return recurrence.WorldDesign(wg.id, {"C": (wg.ti, wg.tj, cv["C"]), "Q": (wg.ti, wg.tj, cv["Q"])},
-                                          {"C": (wg.cT, wg.cR, cv["RC"]), "Q": (wg.qT, wg.qR, cv["RQ"])}, scope)
+            return self.design(w, scope) if final else self.design_nf(w, scope)
         if self.hyp == "H-F":
             res = recurrence.hf([recurrence.analyze_world(design(w, "full"), w["y_true"]) for w in self.worlds])
             return {k: (bool(res[k]) if k == "available" else float(res[k]))
@@ -1500,10 +1543,38 @@ class Panel:
                 "loads": self.ref_loads(wg, m, refkeys), "nref": len(refkeys)}
 
     # -------------------------------------------------------- analyses
+    @staticmethod
+    def _world_design(wg, cv, scope):
+        return recurrence.WorldDesign(wg.id, {"C": (wg.ti, wg.tj, cv["C"]), "Q": (wg.ti, wg.tj, cv["Q"])},
+                                      {"C": (wg.cT, wg.cR, cv["RC"]), "Q": (wg.qT, wg.qR, cv["RQ"])}, scope)
+
     def design(self, w, scope):
-        wg = w["graph"]
-        return recurrence.WorldDesign(wg.id, {"C": (wg.ti, wg.tj, w["cov"]["C"]), "Q": (wg.ti, wg.tj, w["cov"]["Q"])},
-                                      {"C": (wg.cT, wg.cR, w["cov"]["RC"]), "Q": (wg.qT, wg.qR, w["cov"]["RQ"])}, scope)
+        """The world's design under the FINAL metric (the observed means), CACHED per scope (#68 CPU lever (a),
+        exact: the analysis and the final-metric boundary check use the identical covariance)."""
+        dc = w.setdefault("_dcache", {})
+        if scope not in dc:
+            dc[scope] = self._world_design(w["graph"], w["cov"], scope)
+        return dc[scope]
+
+    def design_nf(self, w, scope):
+        """The world's design under the triage metric (the plug-in model at the noise-free means), CACHED per
+        scope until the means change (_reset_nf)."""
+        if "cov_nf" not in w:
+            wg, mu = w["graph"], w["mu"]
+            w["cov_nf"] = {"C": self.cov(wg, {"C": mu["C"]}, "C"),
+                           "Q": self.cov(wg, {"S": mu["S"], "F": mu["F"]}, "Q"),
+                           "RC": self.cov(wg, {"C": mu["RC"]}, "RC"),
+                           "RQ": self.cov(wg, {"S": mu["RS"], "F": mu["F"]}, "RQ")}
+            w["_dcache_nf"] = {}
+        dc = w["_dcache_nf"]
+        if scope not in dc:
+            dc[scope] = self._world_design(w["graph"], w["cov_nf"], scope)
+        return dc[scope]
+
+    @staticmethod
+    def _reset_nf(w):
+        w.pop("cov_nf", None)
+        w.pop("_dcache_nf", None)
 
     def analyze_hf(self):
         """S_F, M_F, R_C, R_Q (full history) and the epoch scores S_e with their availability (the H-T

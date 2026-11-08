@@ -501,6 +501,34 @@ class TestStrata(unittest.TestCase):
         self.assertTrue(math.isfinite(r["score"]))
         self.assertIn("full/Q", r["targets"])
 
+    def test_design_cache_and_frozen_metric_lambda(self):
+        """#68 CPU levers: (a) a world's final-metric design is built once and shared by the analysis and the
+        final-metric boundary check (the identical covariance: exact); (c) with LAMBDA_FROZEN_METRIC the lambda
+        iterates are proposed on a frozen metric but ACCEPTED only by the true one (the same window)."""
+        cb = self.cb
+        pn = cb.Panel(self.graph, self.params, "H-F", "dev", "actual", "F4", 0).simulate()
+        w = pn.worlds[0]
+        d1 = pn.design(w, "full")
+        self.assertIs(pn.design(w, "full"), d1)
+        fresh = cb.Panel._world_design(w["graph"], w["cov"], "full")
+        a, b = cb.recurrence.analyze_world(d1, w["y"]), cb.recurrence.analyze_world(fresh, w["y"])
+        self.assertEqual(json.dumps(a, default=str, sort_keys=True), json.dumps(b, default=str, sort_keys=True))
+        self.assertIs(pn.design_nf(w, "full"), pn.design_nf(w, "full"))
+        off = self.run_("F4", 0)
+        cb.LAMBDA_FROZEN_METRIC = True
+        try:
+            on = self.run_("F4", 0)
+        finally:
+            cb.LAMBDA_FROZEN_METRIC = False
+        for r in (off, on):
+            bs = r["boundary_solve"]
+            self.assertEqual(bs["outcome"], "feasible")
+            self.assertTrue(-cb.LAMBDA_TOL * cb.D_Q ** 2 <= bs["functional"] - cb.D_Q ** 2 <= 0.0)   # (the TRUE metric)
+        self.assertIsNone(off["boundary_solve"]["frozen"])
+        self.assertGreater(on["boundary_solve"]["frozen"]["evals"], 0)
+        self.assertLessEqual(on["boundary_solve"]["evals"], off["boundary_solve"]["evals"])
+        self.assertEqual(on["role"], off["role"])
+
     def test_final_metric_failure_is_discarded(self):
         """#68 round 4 P2-1: F3 slot 1 meets its boundary on the noise-free metric but not under the FINAL
         metric (residual about -10%): it never enters B (discarded "final-boundary", counted)."""
