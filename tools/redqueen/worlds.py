@@ -3,6 +3,7 @@
 
     worlds.py register --arena config/arena.selected.json --namespace NS --out STUDY/config/worlds.json
                        [--blocks 8] [--per-block C=4,A=1,B=1] [--c-founders 6] [--avoid FILE ...]
+                       [--burn-in 5000000] [--max-restarts 8]
                        [--total-steps N] [--checkpoint-every N] [--log-every N] [--allow-placeholder]
     worlds.py f1 --root STUDY --binary EVO_BOIDS [--archive-root DIR] [--world ID ...]
     worlds.py launch --root STUDY --binary EVO_BOIDS [--archive-root DIR] [--workers 10]
@@ -15,12 +16,30 @@
 
 THE REGISTRY (register; deterministic: the same inputs give the same bytes; an existing registry
 is never replaced by other bytes: changed seeds, treatments or schedule need a new study root).
-Eight randomized blocks of four C, one A and one B history (48 worlds; --per-block for tests).
-Within each block the treatment order is a seeded permutation (namespace, "block-order", block),
-so a world's id does not reveal its treatment by position. Each world has an id (w01..w48), a
-UUID (uuid5 of the namespace and id), and a founder seed derived from (namespace, "founder", id),
-unique, and refused if it occurs in any --avoid file (integers, or any JSON / JSONL whose keys
-contain "seed": the archived plans and reservations of other streams).
+Eight randomized blocks of four C, one A and one B history (48 worlds; --per-block, up to 4C + 2A + 2B
+per block: the 56 / 64-world allocations of the H-C pilot rule; any count for tests). Within each
+block the treatment order is a seeded permutation (namespace, "block-order", block), so a world's id
+does not reveal its treatment by position. Each world has an id (w01..), a UUID (uuid5 of the
+namespace and id) and a SEED SLOT "b<block>:<treatment>:<k>" (k: its index among its block's
+worlds of that treatment). SEED RESERVATIONS (seed scheme "slot/1"): every slot of up to 4C + 2A + 2B
+per block (more if --per-block asks) reserves 1 + --max-restarts seeds, derived from (namespace,
+"founder", "b<b>", treatment, "k<k>"[, "a<attempt>"]), unique and refused if they occur in any --avoid
+file (integers, or any JSON / JSONL whose keys contain "seed": the archived plans and reservations of
+other streams); a world's founder seed is its slot's first, so a slot keeps its seeds whatever the
+allocation (48, 56 or 64 worlds need no re-registration logic).
+
+THE BURN-IN RULE (USER DECISIONS 2, item 6; registries of seed scheme slot/1, --burn-in frames, 0
+disables). A world (C, A or B) that goes extinct (any guild's evidenced first zero) BEFORE the burn-in
+frame (5M) is not ended: it is RESTARTED from its slot's next reserved seed. The restart is first
+recorded durably in STUDY/restarts.jsonl (world, slot, the attempt, the failed seed and the new one,
+the zero), then the failed attempt's directory is moved to STUDY/restarts/worlds/<id>.a<n> and its
+(unfinalized) archive to ARCHIVE/restarts/<id>.a<n>, and the world starts afresh (attempt.json: its
+attempt and seed; state pending): its F1 is made by the supervisor itself with the pinned engine, then
+the usual history (F1 verification before its first resume). A crash between the record and the moves
+is completed at the next start; availability records carry their attempt and count only for the
+current one. After --max-restarts restarts the world ends extinct (the restarts exhausted). Extinction
+at or after the burn-in frame is data, as before. status reports every restart and the early-
+establishment failure rate per treatment (restarts / attempts started).
 
 THE ARENA (config/arena.selected.json, schema finfolk.redqueen.arena/1: {"status": "selected" |
 "placeholder", "common": {...}, "treatments": {"C": {...}, "A": {...}, "B": {...}}}, engine flag
@@ -188,6 +207,12 @@ SERIAL = "serial build (resume is bit-exact)"
 TREATMENTS = ("C", "A", "B")
 C_FOUNDERS = 6
 DEFAULT_SCHEDULE = {"total_steps": 200_000_000, "checkpoint_every": 1_000_000, "log_every": 5000}
+SEED_SCHEME = "slot/1"
+RESERVE = {"C": 4, "A": 2, "B": 2}       # seed slots reserved per block (USER DECISIONS 2: up to 2A + 2B)
+BURN_IN = 5_000_000                      # frames: an extinction before it restarts the world
+MAX_RESTARTS = 8
+RESTART_SCHEMA = "finfolk.redqueen.restart/1"
+ATTEMPT_SCHEMA = "finfolk.redqueen.attempt/1"
 # flags this tool sets itself, never taken from the arena
 RESERVED = {"seed", "headless", "no-render", "log-every", "flush-every", "checkpoint-every", "save-checkpoint",
             "load-checkpoint", "csv", "name", "predator-log", "wiring-log", "reseed-after-load", "predators-from",
@@ -473,8 +498,10 @@ def parse_per_block(spec):
 
 
 def register(arena_path, namespace, blocks=8, per_block=None, avoid_paths=(), schedule=None,
-             allow_placeholder=False, c_founders=C_FOUNDERS):
+             allow_placeholder=False, c_founders=C_FOUNDERS, burn_in=BURN_IN, max_restarts=MAX_RESTARTS):
     per_block = per_block or {"C": 4, "A": 1, "B": 1}
+    if burn_in < 0 or max_restarts < 0:
+        raise WorldsError("--burn-in and --max-restarts are >= 0")
     schedule = dict(DEFAULT_SCHEDULE, **(schedule or {}))
     if not namespace or not re.fullmatch(r"[A-Za-z0-9._-]+", namespace):
         raise WorldsError("--namespace: letters, digits, '.', '_' and '-'")
@@ -492,29 +519,47 @@ def register(arena_path, namespace, blocks=8, per_block=None, avoid_paths=(), sc
         a = read_avoid(p)
         avoid |= a
         avoid_rec.append({"path": os.path.abspath(p), "sha256": rqlib.sha256_file(p), "seeds": len(a)})
-    worlds, used_seeds, idx = [], set(), 0
+    # every reserved slot's seeds first (block, treatment, k, attempt order): a slot's seeds never depend
+    # on the allocation actually registered
+    reserve = {t: max(RESERVE[t], per_block[t]) for t in TREATMENTS}
+    used_seeds, reserved, slot_seeds = set(), [], {}
     for b in range(1, blocks + 1):
-        order = [t for t in TREATMENTS for _ in range(per_block[t])]
+        for t in TREATMENTS:
+            for k in range(reserve[t]):
+                seeds, redo = [], []
+                for att in range(max_restarts + 1):
+                    j = 0
+                    while True:
+                        parts = [f"b{b}", t, f"k{k}"] + ([f"a{att}"] if att else []) + ([j] if j else [])
+                        seed = rqlib.derive_seed(namespace, "founder", *parts)
+                        if seed not in used_seeds and seed not in avoid and seed != 0:
+                            break
+                        j += 1
+                    used_seeds.add(seed)
+                    seeds.append(seed)
+                    redo.append(j)
+                key = f"b{b}:{t}:{k}"
+                slot_seeds[key] = (seeds, redo)
+                reserved.append({"slot": key, "block": b, "treatment": t, "k": k, "seeds": seeds})
+    worlds, idx = [], 0
+    for b in range(1, blocks + 1):
+        order = [(t, k) for t in TREATMENTS for k in range(per_block[t])]
         rqlib.SplitMix64(rqlib.derive64(namespace, "block-order", b)).shuffle(order)
-        for slot, t in enumerate(order):
+        for slot, (t, k) in enumerate(order):
             idx += 1
             wid = f"w{idx:02d}"
-            k = 0
-            while True:
-                seed = rqlib.derive_seed(namespace, "founder", wid, *([k] if k else []))
-                if seed not in used_seeds and seed not in avoid and seed != 0:
-                    break
-                k += 1
-            used_seeds.add(seed)
+            key = f"b{b}:{t}:{k}"
+            seed = slot_seeds[key][0][0]
             flags = treatment_flags(arena, t)
             worlds.append({
                 "id": wid, "uuid": str(uuid.uuid5(uuid.NAMESPACE_URL, f"finfolk:redqueen:{namespace}:{wid}")),
-                "index": idx, "block": b, "slot": slot, "treatment": t, "founder_seed": seed,
-                "seed_rederived": k, "flags": flags, "config_args": flags_to_args(flags) + ["--seed", str(seed)],
-                "predator_log": t == "C"})
+                "index": idx, "block": b, "slot": slot, "seed_slot": key, "treatment": t, "founder_seed": seed,
+                "seed_rederived": slot_seeds[key][1][0], "flags": flags,
+                "config_args": flags_to_args(flags) + ["--seed", str(seed)], "predator_log": t == "C"})
     tainted = arena.get("status") != "selected" or bool(unresolved)
     return {"schema": WORLDS_SCHEMA, "namespace": namespace, "blocks": blocks, "per_block": per_block,
-            "c_founders": c_founders, "schedule": schedule,
+            "c_founders": c_founders, "schedule": schedule, "seed_scheme": SEED_SCHEME, "burn_in": burn_in,
+            "max_restarts": max_restarts, "reserve_per_block": reserve, "reserved": reserved,
             "arena": {"path": os.path.abspath(arena_path), "sha256": rqlib.sha256_bytes(raw),
                       "status": arena.get("status")},
             "taint": {"tainted": tainted, "unresolved": unresolved},
@@ -795,11 +840,47 @@ def label_of(frame):
     return "F1" if frame == 1 else f"end.{frame}"
 
 
+def attempt_of(root, wid):
+    """A world directory's attempt (attempt.json; 0 without it)."""
+    p = os.path.join(wdir(root, wid), "attempt.json")
+    return int(rqlib.read_json(p)["attempt"]) if os.path.isfile(p) else 0
+
+
+def restart_records(root, wid=None, repair=False):
+    led = read_jsonl(os.path.join(root, "restarts.jsonl"), repair)
+    return [r for r in led if wid is None or r.get("world") == wid]
+
+
+def effective_world(reg, w, attempt):
+    """A registry world at an attempt: attempt n > 0 runs its slot's n-th reserved seed."""
+    if not attempt:
+        return w
+    slot = next((r for r in reg.get("reserved", []) if r["slot"] == w.get("seed_slot")), None)
+    if slot is None or attempt >= len(slot["seeds"]):
+        raise WorldsError(f"{w['id']}: attempt {attempt} has no reserved seed")
+    seed = slot["seeds"][attempt]
+    return dict(w, founder_seed=seed, config_args=flags_to_args(w["flags"]) + ["--seed", str(seed)], attempt=attempt)
+
+
+def effective_worlds(root, reg):
+    """{id: the registry world at its current attempt (the restart ledger's count)}."""
+    n = {}
+    for r in restart_records(root):
+        n[r["world"]] = max(n.get(r["world"], 0), int(r["attempt"]))
+    return {w["id"]: effective_world(reg, w, n.get(w["id"], 0)) for w in reg["worlds"]}
+
+
 def zero_supported(root, e):
     """An availability record's evidence still holds: the prefix of its segment's main CSV that
-    contains the zero row (its byte count and sha256, fsync'd before the record) is intact."""
+    contains the zero row (its byte count and sha256, fsync'd before the record) is intact, and it
+    belongs to the world's current attempt (a restarted world's earlier zeros are not its own)."""
     seg, n, sha = e.get("segment"), e.get("csv_bytes"), e.get("csv_sha256")
     if not (seg and n and sha):
+        return False
+    try:
+        if int(e.get("attempt", 0)) != attempt_of(root, e["world"]):
+            return False
+    except (OSError, ValueError, KeyError):
         return False
     try:
         with open(os.path.join(wdir(root, e["world"]), seg, "run.csv"), "rb") as f:
@@ -1493,7 +1574,10 @@ class Supervisor:
         self.archive_root, self.exe, self.exe_sha, self.a, self.log = archive_root, exe, exe_sha, a, log
         self.T = self.sched["total_steps"]       # (a history's; a fork branch has its own: self.Tw)
         self.ce = self.sched["checkpoint_every"]
-        self.worlds = {w["id"]: w for w in reg["worlds"]}
+        restart_records(root, repair=True)
+        self.worlds = effective_worlds(root, reg)  # (each at its attempt: the burn-in rule's reserved seeds)
+        self.burn_in = int(reg.get("burn_in") or 0) if reg.get("seed_scheme") == SEED_SCHEME else 0
+        self.max_restarts = int(reg.get("max_restarts") or 0)
         self.avail_p = os.path.join(root, "availability.jsonl")
         self.running = {}     # wid -> (Popen, job name, "segment" | "verify")
         self.tails = {}       # wid -> Tail of the running segment's main CSV
@@ -1560,6 +1644,12 @@ class Supervisor:
         self.log(f"INVALIDATED {wid}: {why}")
 
     def end_world(self, wid, status, reason):
+        if status == "extinct" and self.burn_in:
+            zf = min((self.zeros.get(wid) or {}).values(), default=None)
+            if zf is not None and zf < self.burn_in:
+                if self.restart(wid, reason, zf):
+                    return
+                reason = f"{reason}; before the burn-in frame {self.burn_in}, its {self.max_restarts} restarts exhausted"
         self.set_status(wid, status, end_reason=reason)
         if status in ("done", "extinct"):
             try:
@@ -1567,6 +1657,103 @@ class Supervisor:
             except (WorldsError, OSError) as e:
                 self.set_status(wid, "failed", end_reason=f"finalizing its archive: {e}")
                 self.log(f"FAILED {wid}: finalizing its archive: {e}")
+
+    # ---------------------------------------------------------------- the burn-in rule
+    def restart(self, wid, reason, zero_frame):
+        """An extinction before the burn-in frame: record the restart, then move the failed attempt aside
+        and start the world afresh from its slot's next reserved seed. -> False when exhausted."""
+        w = self.worlds[wid]
+        n = int(w.get("attempt", 0)) + 1
+        if n > self.max_restarts:
+            return False
+        nxt = effective_world(self.reg, next(x for x in self.reg["worlds"] if x["id"] == wid), n)
+        rec = {"schema": RESTART_SCHEMA, "world": wid, "uuid": w["uuid"], "treatment": w["treatment"],
+               "block": w.get("block"), "slot": w.get("seed_slot"), "attempt": n, "failed_attempt": n - 1,
+               "failed_seed": w["founder_seed"], "seed": nxt["founder_seed"], "zero_frame": zero_frame,
+               "reason": reason, "burn_in": self.burn_in, "utc": rqlib.now_utc()}
+        _append_durable(os.path.join(self.root, "restarts.jsonl"), rec)      # (the commitment point)
+        self.complete_restart(wid, rec)
+        self.log(f"BURN-IN: {wid} ({w['treatment']}) went extinct before frame {self.burn_in} ({reason}): restarted "
+                 f"as attempt {n} from its slot's next reserved seed {nxt['founder_seed']}")
+        return True
+
+    def complete_restart(self, wid, rec):
+        """The moves and the fresh start of a recorded restart (idempotent: a crash after the record is
+        completed at the next start)."""
+        n = int(rec["attempt"])
+        src = wdir(self.root, wid)
+        dst = os.path.join(self.root, "restarts", "worlds", f"{wid}.a{n - 1}")
+        asrc = adir(self.archive_root, wid)
+        adst = os.path.join(self.archive_root, "restarts", f"{wid}.a{n - 1}")
+        if os.path.isdir(src) and attempt_of(self.root, wid) == n - 1:
+            for a_, b_ in ((src, dst), (asrc, adst)):
+                if not os.path.isdir(a_):
+                    continue
+                if os.path.exists(b_):
+                    raise WorldsError(f"{wid}: restart {n}: {b_} already exists")
+                mkdirs_durable(os.path.dirname(b_))
+                os.rename(a_, b_)
+                rqlib.fsync_dir(os.path.dirname(a_))
+                rqlib.fsync_dir(os.path.dirname(b_))
+        elif os.path.isdir(asrc) and not os.path.isdir(src) and attempt_of(self.root, wid) != n:
+            if os.path.exists(adst):
+                raise WorldsError(f"{wid}: restart {n}: {adst} already exists")
+            mkdirs_durable(os.path.dirname(adst))
+            os.rename(asrc, adst)
+            rqlib.fsync_dir(os.path.dirname(asrc))
+            rqlib.fsync_dir(os.path.dirname(adst))
+        if attempt_of(self.root, wid) != n:
+            if os.path.isdir(src):
+                raise WorldsError(f"{wid}: restart {n}: {src} is neither attempt {n - 1} nor {n}")
+            new = f"{src}.new"                          # (made whole, then renamed into place)
+            shutil.rmtree(new, ignore_errors=True)
+            mkdirs_durable(new)
+            rqlib.write_durable(os.path.join(new, "attempt.json"), rqlib.canonical(
+                {"schema": ATTEMPT_SCHEMA, "world": wid, "attempt": n, "seed": rec["seed"], "slot": rec.get("slot")}))
+            os.rename(new, src)
+            rqlib.fsync_dir(os.path.dirname(src))
+            write_state(self.root, wid, {"schema": STATE_SCHEMA, "id": wid, "status": "pending", "failures": 0,
+                                         "segments": [], "attempt": n})
+        self.worlds[wid] = effective_world(self.reg, next(x for x in self.reg["worlds"] if x["id"] == wid), n)
+        for cache in (self.zeros, self.extinct, self.chain, self.chain_active, self.tails, self.last_frame):
+            cache.pop(wid, None)
+        for k in [k for k in self.seen if k[0] == wid]:
+            del self.seen[k]
+        for k in [k for k in self.start_cps if k[0] == wid]:
+            del self.start_cps[k]
+        ad = adir(self.archive_root, wid) + os.sep
+        for k in [k for k in self.verified if str(k).startswith(ad)]:
+            del self.verified[k]
+
+    def spawn_f1(self, wid):
+        """A restarted attempt's F1, by the pinned engine (the f1 command's run), as a supervisor job."""
+        w = self.worlds[wid]
+        d = os.path.join(wdir(self.root, wid), "f1")
+        shutil.rmtree(d, ignore_errors=True)
+        mkdirs_durable(d)
+        args = segment_args(w, self.sched, "f1", 0)
+        args[args.index("--headless") + 1] = "1"
+        args[args.index("--save-checkpoint") + 1] = "f1/F1.json"
+        args[args.index("--csv") + 1] = "f1/f1.csv"
+        self.set_status(wid, "running")
+        self.running[wid] = (self._popen(args, wdir(self.root, wid), d), "f1", "f1")
+        self.log(f"{wid}: attempt {w.get('attempt', 0)}: its F1 by the pinned engine (seed {w['founder_seed']})")
+
+    def reap_f1(self, wid, rc):
+        w = self.worlds[wid]
+        p = os.path.join(wdir(self.root, wid), "f1", "F1.json")
+        try:
+            if rc != 0 or not os.path.isfile(p):
+                raise WorldsError(f"the F1 replay exited {rc}")
+            probs = verify_config(ckpt.load(p), w["flags"])
+            if probs:
+                raise WorldsError(f"F1's configuration differs from the registry ({'; '.join(probs)})")
+            archive_one(self.root, wid, self.archive_root, 1, p, self.log, extra={"binary_sha256": self.exe_sha})
+        except (WorldsError, ckpt.CheckpointError, OSError, ValueError) as e:
+            self.end_world(wid, "failed", f"attempt {w.get('attempt', 0)}: its F1: {e}")
+            self.log(f"FAILED {wid}: {self.state(wid)['end_reason']}")
+            return
+        self.set_status(wid, "pending")
 
     def warn_once(self, key, msg):
         if key not in self.warned:
@@ -1591,6 +1778,8 @@ class Supervisor:
                "first_zero_frame": frame, "detected_utc": rqlib.now_utc(), "segment": seg,
                "csv_bytes": len(data), "csv_sha256": rqlib.sha256_bytes(data),
                "archived_frames_before": sorted(x["frame"] for x in arecs.values() if x["frame"] < frame)}
+        if w.get("attempt"):
+            rec["attempt"] = w["attempt"]
         if recovered:
             rec.update(recovered=True, supersedes=z.get(guild))
         _append_durable(self.avail_p, rec)
@@ -1862,7 +2051,7 @@ class Supervisor:
 
     # ---------------------------------------------------------------- what next
     def next_action(self, wid):
-        """-> ("extinct" | "done" | "held" | "invalidated", reason) | ("verify", None)
+        """-> ("extinct" | "done" | "held" | "invalidated", reason) | ("verify" | "f1", None)
         | ("segment", (start, checkpoint path, record)).
         The extinction shortcut applies only while the stop is evidenced (extinct_problems); else the
         world replays from its latest verified record, through the zero, which stops it again (and
@@ -1871,6 +2060,8 @@ class Supervisor:
         why = self.ineligible(wid) if self.ineligible else None
         if why:
             return "invalidated", why
+        if self.worlds[wid].get("attempt") and not f1_bound(self.root, wid, self.exe_sha):
+            return "f1", None                            # (a restarted attempt: its F1 first)
         if self.a.on_extinction == "stop" and self.zero_reason(wid):
             why = self.extinct_problems(wid, st)
             if not why:
@@ -1970,7 +2161,9 @@ class Supervisor:
                 self.log(f"FAILED {wid}: {self.state(wid)['end_reason']}")
                 return
             self.end_world(wid, "extinct", reason)
-            self.log(f"{wid}: ended as extinct ({self.state(wid)['end_reason']})")
+            st = self.state(wid)
+            if st["status"] == "extinct":                # (else: restarted by the burn-in rule)
+                self.log(f"{wid}: ended as extinct ({st['end_reason']})")
             return
         try:
             nxt = self.resume(wid, self.state(wid))[0]
@@ -2001,6 +2194,11 @@ class Supervisor:
         """Repair torn ledger tails, reconcile terminal worlds' finalization, and recover what the
         previous supervisor left: acceptances, quarantines, zeros, worlds already at an end."""
         a = self.a
+        for wid in self.worlds:                              # (a restart recorded, its moves interrupted)
+            led = restart_records(self.root, wid)
+            if led and attempt_of(self.root, wid) != max(int(r["attempt"]) for r in led):
+                self.complete_restart(wid, max(led, key=lambda r: int(r["attempt"])))
+                self.log(f"{wid}: its recorded restart (attempt {self.worlds[wid]['attempt']}) completed")
         for e in read_jsonl(self.avail_p, repair=True):     # (only records whose evidence still holds)
             if e["world"] in self.worlds and zero_supported(self.root, e):
                 z = self.zeros.setdefault(e["world"], {})
@@ -2053,7 +2251,7 @@ class Supervisor:
                 st = self.set_status(wid, "interrupted", reopened=why, failures=0)
             if st["status"] not in ("pending", "interrupted"):
                 continue
-            if not w.get("origin") and not f1_bound(self.root, wid, self.exe_sha):
+            if not w.get("origin") and not w.get("attempt") and not f1_bound(self.root, wid, self.exe_sha):
                 missing_f1.append(wid)
             if st["segments"]:
                 try:
@@ -2068,7 +2266,8 @@ class Supervisor:
                     continue
                 if kind in ("done", "extinct"):
                     self.end_world(wid, kind, info)
-                    self.log(f"{wid}: already at its end ({kind}: {info}); finalized without another segment")
+                    if self.state(wid)["status"] == kind:
+                        self.log(f"{wid}: already at its end ({kind}: {info}); finalized without another segment")
                 elif kind == "held":
                     self.set_status(wid, "held", end_reason=info)
                 elif kind == "invalidated":
@@ -2102,6 +2301,8 @@ class Supervisor:
                 del self.running[wid]
                 if kind == "verify":
                     self.reap_verify(wid, rc)
+                elif kind == "f1":
+                    self.reap_f1(wid, rc)
                 else:
                     self.reap_segment(wid, name, rc)
             for wid in list(self.running):
@@ -2149,7 +2350,8 @@ class Supervisor:
                     kind, info = self.next_action(wid)
                     if kind in ("done", "extinct"):
                         self.end_world(wid, kind, info)
-                        log(f"{wid}: at its end ({kind}: {info})")
+                        if self.state(wid)["status"] == kind:
+                            log(f"{wid}: at its end ({kind}: {info})")
                     elif kind == "held":
                         self.set_status(wid, "held", end_reason=info)
                         log(f"{wid}: {info}")
@@ -2157,6 +2359,8 @@ class Supervisor:
                         self.invalidate(wid, info)
                     elif kind == "verify":
                         self.spawn_verify(wid)
+                    elif kind == "f1":
+                        self.spawn_f1(wid)
                     else:
                         start, cpath, rec = info
                         self.spawn_segment(wid, start, cpath, rec)
@@ -2194,9 +2398,11 @@ def f1(a, log):
     exe, exe_sha = pin_binary(root, a.binary)
     sched = reg["schedule"]
     rc = 0
+    eff = effective_worlds(root, reg)
     for w in reg["worlds"]:
         if a.world and w["id"] not in a.world:
             continue
+        w = eff[w["id"]]                     # (a restarted world at its attempt)
         recs = archive_records(root, w["id"], repair=True)
         if "F1" in recs:
             if recs["F1"].get("binary_sha256") != exe_sha:
@@ -2369,12 +2575,31 @@ def design_block(root, reg, archive_root):
         zeros = first_zeros(led, w["id"], root)
         st = read_state(root, w["id"])
         ws[w["id"]] = {"uuid": w["uuid"], "treatment": w["treatment"], "block": w["block"], "status": st["status"],
+                       "attempt": attempt_of(root, w["id"]),
                        "pattern": os.path.join(ad, "end.{frame}.json"), "paths": {"F1": os.path.join(ad, "F1.json")},
                        # snapshots at or after a guild's first zero are not valid challengers (design §2.3)
                        "valid_before": min(zeros.values()) if zeros else None,
                        "archived": sorted(r["frame"] for r in archive_records(root, w["id"]).values())}
     return {"schema": "finfolk.redqueen.worldsblock/1", "registry_sha256": rqlib.sha256_file(
         os.path.join(root, "config", "worlds.json")), "times": times, "worlds": ws}
+
+
+def burn_in_report(root, reg):
+    """The burn-in rule's restarts and the early-establishment failure rate per treatment (restarts /
+    attempts started = restarts + worlds)."""
+    led = restart_records(root)
+    per = {}
+    for w in reg["worlds"]:
+        p = per.setdefault(w["treatment"], {"worlds": 0, "restarts": 0})
+        p["worlds"] += 1
+    for r in led:
+        per.setdefault(r["treatment"], {"worlds": 0, "restarts": 0})["restarts"] += 1
+    for p in per.values():
+        att = p["worlds"] + p["restarts"]
+        p["attempts"] = att
+        p["early_failure_rate"] = p["restarts"] / att if att else None
+    return {"burn_in": reg.get("burn_in") if reg.get("seed_scheme") == SEED_SCHEME else None,
+            "max_restarts": reg.get("max_restarts"), "restarts": led, "per_treatment": per}
 
 
 def status(root):
@@ -2396,11 +2621,12 @@ def status(root):
                 last = {k: r.get(k) for k in ("step", "population", "predator_pop", "steps_per_sec")}
         out["worlds"][w["id"]] = {"treatment": w["treatment"], "status": st["status"], "segments": len(st["segments"]),
                                   "archived": len(recs), "accepted_through": max(acc) if acc else None,
-                                  "last_row": last}
+                                  "last_row": last, "attempt": attempt_of(root, w["id"])}
     counts = {}
     for v in out["worlds"].values():
         counts[v["status"]] = counts.get(v["status"], 0) + 1
     out["counts"] = counts
+    out["burn_in"] = burn_in_report(root, reg)
     out["availability"] = read_jsonl(os.path.join(root, "availability.jsonl"))
     print(json.dumps(out, indent=1, sort_keys=True))
     return 0
@@ -2422,6 +2648,8 @@ def main(argv=None):
     r.add_argument("--checkpoint-every", type=int, default=DEFAULT_SCHEDULE["checkpoint_every"])
     r.add_argument("--log-every", type=int, default=DEFAULT_SCHEDULE["log_every"])
     r.add_argument("--allow-placeholder", action="store_true")
+    r.add_argument("--burn-in", type=int, default=BURN_IN, help="frames (0: no burn-in restarts)")
+    r.add_argument("--max-restarts", type=int, default=MAX_RESTARTS)
     for name in ("f1", "launch", "verify-f1", "stitch", "status", "design-block"):
         s = sub.add_parser(name)
         s.add_argument("--root", required=True)
@@ -2451,7 +2679,8 @@ def main(argv=None):
         if a.cmd == "register":
             reg = register(a.arena, a.namespace, a.blocks, parse_per_block(a.per_block), a.avoid,
                            {"total_steps": a.total_steps, "checkpoint_every": a.checkpoint_every,
-                            "log_every": a.log_every}, a.allow_placeholder, a.c_founders)
+                            "log_every": a.log_every}, a.allow_placeholder, a.c_founders, a.burn_in,
+                           a.max_restarts)
             new = write_registry(a.out, rqlib.canonical(reg))
             n = {t: sum(1 for w in reg["worlds"] if w["treatment"] == t) for t in TREATMENTS}
             print(f"registered {len(reg['worlds'])} worlds {n} in {a.blocks} blocks -> {a.out} "
