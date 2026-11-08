@@ -4,7 +4,7 @@ One split manifest, role-based evaluation filters, plain prediction hashes and a
 record. There is no access-control service, no sealed directory tree and no unlock manager.
 
     sealing.py manifest --graph-meta graph.meta.json --worlds config/worlds.json [--forks config/forks.json]
-                        --out config/splits.json
+                        [--references config/references.json] --out STUDY/config/splits.json
     sealing.py check    --manifest config/splits.json --records RECORDS.jsonl
     sealing.py filter   --manifest config/splits.json --records RECORDS.jsonl
                         --stage fit|nuisance|validation|test|audit|diagnostic --out OUT.jsonl
@@ -19,12 +19,18 @@ once, never replaced). Built from graph.py's graph (its meta and edges: their sh
 registry (every world's UUID: endpoints are bound to it) and, when given, the fork registry (every
 branch's root world and UUID). It holds every world's split (C 20/6/6, A and B 5/1/2: training /
 validation / test), the training C worlds' snapshot holdouts (t in M -> validation | test), the fork
-and intensive sets, and the REGISTERED SUPPORT EXCEPTIONS: the graph's support pairs (endpoint keys
-"Q:<world>:<t>", "P:<world>:<t>", references "RQ:<k>" / "RP:<k>").
+and intensive sets, the REGISTERED SUPPORT EXCEPTIONS: the graph's support pairs (endpoint keys
+"Q:<world>:<t>", "P:<world>:<t>", references "RQ:<k>" / "RP:<k>"), and the REGISTERED REFERENCE
+ASSIGNMENT (config/references.json, finfolk.redqueen.references/1: the eight prey and eight predator
+references selected, slot -> {"uuid", "snapshot"?, "archive", "sha256"}); without it no endpoint is a
+reference.
 
 ENDPOINTS. A record's endpoint is {"world", "frame"} and, as the plan carries them, "uuid" (its
-world's) and/or "snapshot" (uuid5(URL, "finfolk:snapshot:<world uuid>:<frame>")), or {"ref": "RP:<k>"}
-for a reference slot. The labels must agree with the identities: a world's UUID is the registry's;
+world's) and/or "snapshot" (uuid5(URL, "finfolk:snapshot:<world uuid>:<frame>")); or a REFERENCE
+{"ref": "RP:<k>"} (optionally its "uuid" / "snapshot", which must be the registered reference's), granted
+only for a registered slot of the endpoint's guild and refused when mixed with any world, frame or
+other identity key; or, for predators, the documented random-founder source {"source": "random"}
+(no held-out role: the edge's role is its prey's). The labels must agree with the identities: a world's UUID is the registry's;
 a fork branch (or a technical segment of one) resolves to its ROOT world (its own UUID binds its
 snapshots) and takes the root's split; a contradiction is refused before any role is computed.
 A snapshot's role is its world's split, or its holdout role in a training world. An EDGE's role is
@@ -40,20 +46,22 @@ declared roles. filter (after a full check) keeps what a stage may use: fit -> t
 on training-world observations, never on held-out populations' support); validation; test; audit
 (scoring only); diagnostic.
 
-COMMITMENTS. Every artifact below is PUBLISHED EXCLUSIVELY (a temporary file, fsync'd, hard-linked to
-its name, which fails if it exists, the directory fsync'd; the same bytes again are accepted, other
-bytes refused) under STUDY/registration/.lock, one transaction at a time; new directories are made
-durable. commit reads the predictions ONCE (one JSONL file, a unique "target_id" per line), validates
+COMMITMENTS. Every artifact below, the split manifest included, is PUBLISHED EXCLUSIVELY (a temporary
+file, fsync'd, hard-linked to its name, which fails if it exists, the directory fsync'd; the same bytes
+again are accepted, other bytes refused) under STUDY/registration/.lock, one transaction at a time; the
+directory setup happens INSIDE the lock and every directory from the study down is fsync'd
+unconditionally (whoever created it). commit reads the predictions ONCE (one JSONL file, a unique "target_id" per line), validates
 and hashes those bytes: registration/<stage>_predictions.json (the record, its sha256) and then the
 marker VAL_PRED_SHA / TEST_PRED_SHA (that sha256). open-validation records the validation evaluation
 (the sha256 of the validation scores, the time) after VAL_PRED_SHA; the test commitment requires it
 and names the frozen evaluation script. freeze (after TEST_PRED_SHA) requires the split manifest and
-records the public registration (OSF URL and/or DOI, and its user-supplied registration time), the
+records the public registration (OSF URL and/or DOI, and its registration time: a real UTC time, not
+in the future, not before the validation evaluation was opened), the
 sha256 of the preregistration, the evaluation script, the split manifest, VAL_PRED_SHA and
 TEST_PRED_SHA. Every marker must equal its record's sha256 (checked by freeze and by the gate).
 require_test_freeze (verify-test) reads the predictions, the script and the manifest ONCE, verifies
-them against the freeze record and returns those verified bytes: scoring consumes them, never the
-paths again.
+them against the freeze record (itself read ONCE) and returns those verified bytes and the freeze
+record parsed from the checked bytes: scoring consumes them, never the paths again.
 """
 from __future__ import annotations
 
@@ -73,6 +81,9 @@ SPLITS_SCHEMA = "finfolk.redqueen.splits/2"
 FREEZE_SCHEMA = "finfolk.redqueen.freeze/2"
 COMMIT_SCHEMA = "finfolk.redqueen.predcommit/2"
 VALEVAL_SCHEMA = "finfolk.redqueen.valeval/1"
+REFS_SCHEMA = "finfolk.redqueen.references/1"
+REF_SLOT = re.compile(r"^R[QP]:\d+$")
+ENDPOINT_IDENTITY = ("world", "frame", "uuid", "snapshot", "source")
 ROLES = ("training", "validation", "test", "support", "audit", "diagnostic")
 COMPUTED = ("training", "validation", "test")
 DECLARED = ("support", "audit", "diagnostic")
@@ -93,24 +104,28 @@ class SealError(Exception):
 
 
 # ================================================================== durable, exclusive publication
-def mkdirs_durable(path):
-    path = os.path.abspath(path)
-    missing = []
-    p = path
-    while not os.path.isdir(p):
-        missing.append(p)
-        p = os.path.dirname(p)
+def mkdirs_durable(path, root):
+    """Make `path` and fsync it and every directory up to and including `root`'s parent,
+    UNCONDITIONALLY (another writer may have created a directory and not yet fsync'd its parent)."""
+    path, root = os.path.abspath(path), os.path.abspath(root)
+    if os.path.commonpath([path, root]) != root:
+        raise SealError(f"{path} is not inside {root}")
     os.makedirs(path, exist_ok=True)
-    for d in reversed(missing):
-        rqlib.fsync_dir(os.path.dirname(d))
+    p = path
+    while True:
+        rqlib.fsync_dir(p)
+        if p == root:
+            rqlib.fsync_dir(os.path.dirname(p))
+            break
+        p = os.path.dirname(p)
 
 
-def publish(path, data):
+def publish(path, data, root=None):
     """Publish `data` at `path` exclusively: a temporary file, fsync'd, hard-linked to `path` (which fails
     if any file is there), the directory fsync'd. The same bytes already there: accepted (True if this
     call published). Other bytes: SealError (never replaced)."""
     d = os.path.dirname(os.path.abspath(path))
-    mkdirs_durable(d)
+    mkdirs_durable(d, root or d)
     if os.path.exists(path):
         if rqlib.read_bytes(path) == data:
             return False
@@ -138,13 +153,21 @@ def transaction(study):
     """One commitment / freeze transaction at a time per study (a blocking flock)."""
     import fcntl
     d = reg_dir(study)
-    mkdirs_durable(d)
+    os.makedirs(d, exist_ok=True)                    # (the lock's own directory; made durable under the lock)
     with open(os.path.join(d, ".lock"), "a") as f:
         fcntl.flock(f, fcntl.LOCK_EX)
         try:
+            mkdirs_durable(d, study)
             yield
         finally:
             fcntl.flock(f, fcntl.LOCK_UN)
+
+
+def publish_manifest(study, data):
+    """The split manifest, published at STUDY/config/splits.json under the registration lock."""
+    study = os.path.abspath(study)
+    with transaction(study):
+        return publish(os.path.join(study, "config", "splits.json"), data, study)
 
 
 # ================================================================== the split manifest
@@ -153,7 +176,30 @@ def snapshot_uuid(world_uuid, frame):
     return str(uuid.uuid5(uuid.NAMESPACE_URL, f"finfolk:snapshot:{world_uuid}:{int(frame)}"))
 
 
-def manifest(meta_path, worlds_path, forks_path=None):
+def load_references(path, uuids):
+    """The registered reference assignment: slot -> {"uuid", "snapshot"?, "archive", "sha256"}."""
+    r = rqlib.read_json(path)
+    if r.get("schema") != REFS_SCHEMA:
+        raise SealError(f"{path}: schema {r.get('schema')!r}")
+    out, seen = {}, {}
+    for slot, v in sorted((r.get("references") or {}).items()):
+        if not REF_SLOT.match(slot):
+            raise SealError(f"{path}: {slot!r} is not a reference slot (RQ:<k> / RP:<k>)")
+        if not isinstance(v, dict) or not isinstance(v.get("uuid"), str) or not SHA.match(str(v.get("sha256", ""))):
+            raise SealError(f"{path}: {slot} needs its uuid and its archive's sha256")
+        if v["uuid"] in set(uuids.values()):
+            raise SealError(f"{path}: {slot}'s uuid is a main world's")
+        if v["uuid"] in seen and seen[v["uuid"]][0] == slot[1]:
+            raise SealError(f"{path}: {slot} and {seen[v['uuid']][1]} are one reference")
+        seen[v["uuid"]] = (slot[1], slot)
+        out[slot] = {k: v[k] for k in ("uuid", "snapshot", "archive", "sha256") if v.get(k) is not None}
+    for g in "QP":
+        if sum(1 for s_ in out if s_[1] == g) != 8:
+            raise SealError(f"{path}: eight R{g} references are registered, not {sum(1 for s_ in out if s_[1] == g)}")
+    return out
+
+
+def manifest(meta_path, worlds_path, forks_path=None, refs_path=None):
     import gzip
     m = rqlib.read_json(meta_path)
     edges_path = os.path.join(os.path.dirname(os.path.abspath(meta_path)), "graph.jsonl.gz")
@@ -179,7 +225,15 @@ def manifest(meta_path, worlds_path, forks_path=None):
                      "namespace": m.get("namespace"), "graph_edges_sha256": m.get("edges_sha256")},
            "worlds_registry_sha256": rqlib.sha256_file(worlds_path),
            "worlds": split, "uuids": uuids, "snapshot_holdouts": hold, "fork": sorted(m.get("fork", [])),
-           "intensive": sorted(m.get("intensive", [])), "support_exceptions": sorted(support), "branches": {}}
+           "intensive": sorted(m.get("intensive", [])), "support_exceptions": sorted(support), "branches": {},
+           "references": {}}
+    if refs_path:
+        out["references"] = load_references(refs_path, uuids)
+        out["references_sha256"] = rqlib.sha256_file(refs_path)
+        for pair in support:
+            for k in pair:
+                if REF_SLOT.match(k) and k not in out["references"]:
+                    raise SealError(f"support pair {pair}: reference {k} is not registered")
     if forks_path:
         fk = rqlib.read_json(forks_path)
         for b in fk["worlds"]:
@@ -213,10 +267,25 @@ def resolve(m, e, guild):
     """An endpoint -> (key, role): its identity checked against the registered UUIDs (a fork branch's
     snapshot resolves to its ROOT world's split), its support-exception key ("Q:<world>:<t>" /
     "P:<world>:<t>"; a branch keys by its own id and frame) and its role. SealError on a contradiction."""
-    if e.get("ref"):
-        if not re.fullmatch(r"R[QP]:\d+", e["ref"]) or e["ref"][1] != guild:
-            raise SealError(f"reference endpoint {e['ref']!r} is not a {guild} reference slot")
-        return e["ref"], "training"
+    if "ref" in e:
+        ref = e["ref"]
+        mixed = sorted(k for k in ("world", "frame", "source") if k in e)
+        if mixed:
+            raise SealError(f"reference endpoint {ref!r} mixed with {mixed}: an endpoint is a world snapshot or a "
+                            "registered reference, never both")
+        if not isinstance(ref, str) or not REF_SLOT.match(ref) or ref[1] != guild:
+            raise SealError(f"reference endpoint {ref!r} is not a {guild} reference slot")
+        reg = m.get("references", {}).get(ref)
+        if reg is None:
+            raise SealError(f"reference {ref} is not in the registered reference assignment")
+        for k in ("uuid", "snapshot"):
+            if e.get(k) is not None and e[k] != reg.get(k, reg["uuid"] if k == "uuid" else None):
+                raise SealError(f"reference {ref}: its {k} {e[k]} is not the registered reference's")
+        return ref, "training"
+    if "source" in e:
+        if guild != "P" or e != {"source": "random"}:
+            raise SealError(f"endpoint {e}: only a predator endpoint may be exactly {{'source': 'random'}}")
+        return "random", None
     w, frame = e.get("world"), e.get("frame")
     if frame is None:
         raise SealError(f"endpoint {w}: no frame")
@@ -247,7 +316,7 @@ def edge_role(m, prey, predators):
     roles = [resolve(m, prey, "Q")[1]]
     if predators:
         roles.append(resolve(m, predators, "P")[1])
-    return max(roles, key=RANK.__getitem__)
+    return max((r for r in roles if r), key=RANK.__getitem__)
 
 
 def record_problems(m, rows):
@@ -281,7 +350,7 @@ def record_problems(m, rows):
             continue
         if role in DECLARED:
             continue
-        want = max([rq] + ([rp] if rp else []), key=RANK.__getitem__)
+        want = max([rq] + ([rp] if rp else []), key=RANK.__getitem__)      # (a random source has no role)
         if want != role:
             probs.append(f"{rid}: role {role}, but its most held-out endpoint makes it {want}")
     return probs
@@ -374,9 +443,9 @@ def commit(study, stage, pred_path, eval_script=None):
         if os.path.exists(rp) and rqlib.read_json(rp).get("sha256") != sha:
             raise SealError(f"{rp} records other predictions (an interrupted commitment): resolve it by hand")
         if not os.path.exists(rp):
-            publish(rp, rqlib.canonical(rec))
+            publish(rp, rqlib.canonical(rec), study)
         rec = rqlib.read_json(rp)
-        publish(os.path.join(d, name), (sha + "\n").encode())
+        publish(os.path.join(d, name), (sha + "\n").encode(), study)
         return rec
 
 
@@ -397,8 +466,37 @@ def open_validation(study, scores_path):
             if have.get("scores_sha256") != rec["scores_sha256"] or have.get("VAL_PRED_SHA") != val:
                 raise SealError(f"{p} exists with other contents: never replaced")
             return have
-        publish(p, rqlib.canonical(rec))
+        publish(p, rqlib.canonical(rec), study)
         return rec
+
+
+def parse_utc(text):
+    """A real UTC time YYYY-MM-DDTHH:MM:SSZ -> datetime (SealError otherwise)."""
+    import datetime
+    if not isinstance(text, str) or not UTC.match(text):
+        raise SealError(f"{text!r} is not a UTC time YYYY-MM-DDTHH:MM:SSZ")
+    try:
+        return datetime.datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
+    except ValueError:
+        raise SealError(f"{text!r} is not a real date and time") from None
+
+
+def registration_time_problem(text, opened_utc, now=None):
+    """Why the public registration time is not acceptable (None: it is): a real UTC time, not in the
+    future (60 s of clock tolerance), not before the validation evaluation was opened."""
+    import datetime
+    try:
+        t = parse_utc(text)
+    except SealError as e:
+        return str(e)
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    if t > now + datetime.timedelta(seconds=60):
+        return f"the registration time {text} is in the future"
+    if opened_utc is None:
+        return "no recorded validation evaluation to order the registration after"
+    if t < parse_utc(opened_utc):
+        return f"the registration time {text} precedes the validation evaluation ({opened_utc})"
+    return None
 
 
 def freeze(study, preregistration, eval_script, osf_url=None, doi=None, registered_utc=None):
@@ -420,6 +518,10 @@ def freeze(study, preregistration, eval_script, osf_url=None, doi=None, register
         es = rqlib.sha256_file(eval_script)
         if es != trec["evaluation_script_sha256"]:
             raise SealError("the evaluation script differs from the one the test commitment named")
+        ve = os.path.join(d, "validation_evaluation.json")
+        why = registration_time_problem(registered_utc, rqlib.read_json(ve).get("utc") if os.path.isfile(ve) else None)
+        if why:
+            raise SealError(f"--registered-utc: {why}")
         mp = os.path.join(study, "config", "splits.json")
         if not os.path.isfile(mp):
             raise SealError("the freeze requires the split manifest (config/splits.json)")
@@ -435,25 +537,33 @@ def freeze(study, preregistration, eval_script, osf_url=None, doi=None, register
                 raise SealError(f"{p} exists with other contents: a freeze record is never replaced")
             return have
         rec["utc"] = rqlib.now_utc()
-        publish(p, rqlib.canonical(rec))
+        publish(p, rqlib.canonical(rec), study)
         return rec
 
 
-def test_problems(study, pred_bytes, script_bytes, manifest_bytes):
-    """Why test scoring may not start on these exact bytes (empty: it may)."""
+def test_problems(study, pred_bytes, script_bytes, manifest_bytes, freeze_bytes=None):
+    """Why test scoring may not start on these exact bytes (empty: it may). freeze_bytes: the freeze
+    record as read once by the caller (else read here)."""
     d = reg_dir(study)
     p = os.path.join(d, "freeze.json")
-    if not os.path.isfile(p):
-        return ["no public freeze record (sealing.py freeze, after the OSF deposit)"]
-    f = rqlib.read_json(p)
+    if freeze_bytes is None:
+        if not os.path.isfile(p):
+            return ["no public freeze record (sealing.py freeze, after the OSF deposit)"]
+        freeze_bytes = rqlib.read_bytes(p)
+    try:
+        f = json.loads(freeze_bytes.decode("utf-8"))
+    except ValueError:
+        return ["freeze.json is not JSON"]
     probs = []
     if f.get("schema") != FREEZE_SCHEMA:
         probs.append(f"freeze.json: schema {f.get('schema')!r}")
     o = f.get("osf") or {}
     if not ((o.get("url") and OSF_URL.match(o["url"])) or (o.get("doi") and DOI.match(o["doi"]))):
         probs.append("the freeze record names no public registration (OSF URL or DOI)")
-    if not UTC.match(str(o.get("registered_utc") or "")):
-        probs.append("the freeze record lacks the public registration time")
+    try:
+        parse_utc(o.get("registered_utc"))
+    except SealError:
+        probs.append("the freeze record lacks a valid public registration time")
     for k in ("preregistration_sha256", "evaluation_script_sha256", "split_manifest_sha256", "VAL_PRED_SHA",
               "TEST_PRED_SHA"):
         if not SHA.match(str(f.get(k) or "")):
@@ -479,14 +589,18 @@ def require_test_freeze(study, pred_path, eval_script):
     """The gate a test-scoring script calls first: the predictions, the script and the manifest read ONCE,
     verified against the freeze record -> {"predictions": bytes, "manifest": bytes, "freeze": record}:
     scoring consumes these verified bytes, never the paths again."""
+    fp = os.path.join(reg_dir(study), "freeze.json")
+    if not os.path.isfile(fp):
+        raise SealError("test evaluation refused: no public freeze record (sealing.py freeze, after the OSF deposit)")
+    fb = rqlib.read_bytes(fp)                         # read ONCE: the record checked is the record returned
     pred = rqlib.read_bytes(pred_path)
     script = rqlib.read_bytes(eval_script)
     mp = os.path.join(study, "config", "splits.json")
     man = rqlib.read_bytes(mp) if os.path.isfile(mp) else None
-    probs = test_problems(study, pred, script, man)
+    probs = test_problems(study, pred, script, man, fb)
     if probs:
         raise SealError("test evaluation refused: " + "; ".join(probs))
-    return {"predictions": pred, "manifest": man, "freeze": rqlib.read_json(os.path.join(reg_dir(study), "freeze.json"))}
+    return {"predictions": pred, "manifest": man, "freeze": json.loads(fb.decode("utf-8")), "freeze_bytes": fb}
 
 
 # ================================================================== CLI
@@ -497,7 +611,8 @@ def main(argv=None):
     s.add_argument("--graph-meta", required=True)
     s.add_argument("--worlds", required=True)
     s.add_argument("--forks")
-    s.add_argument("--out", required=True)
+    s.add_argument("--references")
+    s.add_argument("--out", required=True, help="STUDY/config/splits.json (published under STUDY's lock)")
     for name in ("check", "filter"):
         s = sub.add_parser(name)
         s.add_argument("--manifest", required=True)
@@ -527,8 +642,11 @@ def main(argv=None):
     a = ap.parse_args(argv)
     try:
         if a.cmd == "manifest":
-            data = rqlib.canonical(manifest(a.graph_meta, a.worlds, a.forks))
-            publish(a.out, data)
+            data = rqlib.canonical(manifest(a.graph_meta, a.worlds, a.forks, a.references))
+            out = os.path.abspath(a.out)
+            if os.path.basename(out) != "splits.json" or os.path.basename(os.path.dirname(out)) != "config":
+                raise SealError("--out: the split manifest lives at STUDY/config/splits.json")
+            publish_manifest(os.path.dirname(os.path.dirname(out)), data)
             print(f"split manifest {a.out}: sha256 {rqlib.sha256_bytes(data)}", file=sys.stderr)
             return 0
         if a.cmd in ("check", "filter"):

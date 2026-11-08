@@ -54,7 +54,13 @@ def fixture(d):
                                    "root": "C06", "root_uuid": UUIDS["C06"]},
                                   {"id": "C01.o30M.s0", "uuid": "00000000-0000-4000-8000-0000000000f1",
                                    "root": "C01", "root_uuid": UUIDS["C01"]}]}))
+    rp = os.path.join(d, "references.json")
+    wr(rp, json.dumps({"schema": "finfolk.redqueen.references/1", "references": REFS}))
     return os.path.join(g, "graph.meta.json"), wp, fp
+
+
+REFS = {f"R{g}:{k}": {"uuid": f"00000000-0000-4000-8000-00000000{ord(g):02x}{k:02d}", "archive": f"/refs/{g}{k}.json",
+                     "sha256": f"{ord(g):02x}{k:02d}" * 16} for g in "QP" for k in range(8)}
 
 
 def E(role, pw, pf, qw=None, qf=None, rid=None, pe=None, qe=None, pref=None):
@@ -69,6 +75,7 @@ class TestManifest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
         self.mp, self.wp, self.fp = fixture(self.tmp)
+        self.rp = os.path.join(self.tmp, "references.json")
 
     def tearDown(self):
         shutil.rmtree(self.tmp)
@@ -120,7 +127,7 @@ class TestManifest(unittest.TestCase):
     def test_support_exceptions_and_filters(self):
         """#67 review 1: support only for registered exceptions; a target is never both evaluated and
         support; copies of one target keep one role; nuisance (H.8) takes training only."""
-        m = sealing.manifest(self.mp, self.wp)
+        m = sealing.manifest(self.mp, self.wp, refs_path=self.rp)
         rows = [E("training", "C03", 9 * M, "C04", 9 * M), E("validation", "C01", 1 * M, "C03", 9 * M),
                 E("test", "C06", 6 * M, "C03", 9 * M), E("test", "C02", 200 * M),
                 E("support", "C06", 5 * M, "C03", 9 * M), E("support", "C05", 2 * M, pref="RP:3"),
@@ -141,10 +148,12 @@ class TestManifest(unittest.TestCase):
         wrong = rows + [E("training", "C05", 3 * M, "C03", 9 * M, rid="mislabel")]
         self.assertTrue(any("mislabel" in p and "validation" in p for p in sealing.record_problems(m, wrong)))
         # the CLI: the manifest is published once
-        mf, rf, out = (os.path.join(self.tmp, x) for x in ("splits.json", "rows.jsonl", "fit.jsonl"))
+        mf, rf, out = (os.path.join(self.tmp, x) for x in (os.path.join("st", "config", "splits.json"), "rows.jsonl",
+                                                            "fit.jsonl"))
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
-            self.assertEqual(sealing.main(["manifest", "--graph-meta", self.mp, "--worlds", self.wp, "--out", mf]), 0)
+            self.assertEqual(sealing.main(["manifest", "--graph-meta", self.mp, "--worlds", self.wp, "--references",
+                                           self.rp, "--out", mf]), 0)
             wr(rf, "".join(json.dumps(r) + "\n" for r in rows))
             self.assertEqual(sealing.main(["filter", "--manifest", mf, "--records", rf, "--stage", "nuisance",
                                            "--out", out]), 0)
@@ -152,9 +161,62 @@ class TestManifest(unittest.TestCase):
             self.assertEqual(sealing.main(["check", "--manifest", mf, "--records", rf]), 2)
             g = json.loads(rqlib.read_text(self.mp))
             wr(self.mp, json.dumps(dict(g, fork=[])))
-            self.assertEqual(sealing.main(["manifest", "--graph-meta", self.mp, "--worlds", self.wp, "--out", mf]), 2)
+            self.assertEqual(sealing.main(["manifest", "--graph-meta", self.mp, "--worlds", self.wp, "--references",
+                                           self.rp, "--out", mf]), 2)
+            self.assertEqual(sealing.main(["manifest", "--graph-meta", self.mp, "--worlds", self.wp, "--references",
+                                           self.rp, "--out", os.path.join(self.tmp, "elsewhere.json")]), 2)
         self.assertEqual(len(rqlib.read_text(out).splitlines()), 1)
         self.assertIn("never replaced", err.getvalue())
+
+    def test_reference_assignment_and_random_source(self):
+        """#67 review 2, finding 1: reference status only for a REGISTERED reference slot, never mixed with
+        a world snapshot's identity (the test pair C06@6M x C03@9M relabelled with ref RQ:0 and declared
+        training is refused); finding 2: the documented {"source": "random"} predator form."""
+        m = sealing.manifest(self.mp, self.wp, refs_path=self.rp)
+        self.assertEqual(sorted(m["references"]), sorted(REFS))
+        test_pair = E("test", "C06", 6 * M, "C03", 9 * M, pe={"uuid": UUIDS["C06"],
+                                                              "snapshot": sealing.snapshot_uuid(UUIDS["C06"], 6 * M)})
+        self.assertEqual(sealing.record_problems(m, [test_pair]), [])
+        leak = json.loads(json.dumps(test_pair))
+        leak.update(id="relabelled", role="training")
+        leak["prey"]["ref"] = "RQ:0"
+        probs = sealing.record_problems(m, [test_pair, leak])
+        self.assertTrue(any("relabelled" in p and "mixed with" in p for p in probs), probs)
+        with self.assertRaisesRegex(sealing.SealError, "disagree"):
+            sealing.stage_filter(m, [test_pair, leak], "fit")
+        for bad_prey, why in (({"ref": "RQ:0", "world": "C06"}, "mixed with"), ({"ref": "RQ:0", "frame": 6 * M}, "mixed with"),
+                              ({"ref": "RP:0"}, "not a Q reference"), ({"ref": "RQ:9"}, "not in the registered"),
+                              ({"ref": "RQ:0", "uuid": UUIDS["C06"]}, "not the registered"),
+                              ({"ref": "RQ:0", "source": "random"}, "mixed with")):
+            r = {"id": "x", "role": "training", "prey": bad_prey, "predators": {"world": "C03", "frame": 9 * M}}
+            self.assertTrue(any(why in p for p in sealing.record_problems(m, [r])), (bad_prey, sealing.record_problems(m, [r])))
+        good = {"id": "g", "role": "training", "prey": {"ref": "RQ:0", "uuid": REFS["RQ:0"]["uuid"]},
+                "predators": {"world": "C03", "frame": 9 * M}}
+        self.assertEqual(sealing.record_problems(m, [good]), [])
+        m0 = sealing.manifest(self.mp, self.wp)                            # no registered assignment
+        self.assertTrue(any("not in the registered" in p for p in sealing.record_problems(m0, [good])))
+        # the random-founder source: no held-out role of its own; world endpoints keep their checks
+        rnd = [{"id": "r1", "role": "diagnostic", "prey": {"world": "C05", "frame": 50 * M}, "predators": {"source": "random"}},
+               {"id": "r2", "role": "test", "prey": {"world": "C06", "frame": 6 * M}, "predators": {"source": "random"}},
+               {"id": "r3", "role": "training", "prey": {"world": "C03", "frame": 9 * M}, "predators": {"source": "random"}}]
+        self.assertEqual(sealing.record_problems(m, rnd), [])
+        self.assertEqual([r["id"] for r in sealing.stage_filter(m, rnd + [test_pair], "fit")], ["r3"])
+        self.assertEqual(sealing.edge_role(m, rnd[1]["prey"], rnd[1]["predators"]), "test")
+        for bad in ({"id": "b1", "role": "training", "prey": {"world": "C06", "frame": 6 * M}, "predators": {"source": "random"}},
+                    {"id": "b2", "role": "training", "prey": {"source": "random"}, "predators": None},
+                    {"id": "b3", "role": "training", "prey": {"world": "C03", "frame": 9 * M},
+                     "predators": {"source": "random", "world": "C04", "frame": 9 * M}}):
+            self.assertTrue(sealing.record_problems(m, [bad]), bad)
+        # the assignment itself: eight per guild, distinct, never a main world's uuid
+        bad = dict(REFS)
+        bad.pop("RP:7")
+        wr(self.rp, json.dumps({"schema": "finfolk.redqueen.references/1", "references": bad}))
+        with self.assertRaisesRegex(sealing.SealError, "eight RP"):
+            sealing.manifest(self.mp, self.wp, refs_path=self.rp)
+        wr(self.rp, json.dumps({"schema": "finfolk.redqueen.references/1",
+                                "references": dict(REFS, **{"RQ:1": dict(REFS["RQ:1"], uuid=UUIDS["C01"])})}))
+        with self.assertRaisesRegex(sealing.SealError, "main world"):
+            sealing.manifest(self.mp, self.wp, refs_path=self.rp)
 
 
 COMPETE = """
@@ -240,11 +302,49 @@ class TestCommitments(unittest.TestCase):
         with self.assertRaisesRegex(sealing.SealError, "exists with other bytes"):
             sealing.publish(rp, b"something else")
 
+    def test_directories_fsynced_under_the_lock(self):
+        """#67 review 2, finding 3: the directory setup happens inside registration/.lock and every
+        directory from the study's parent down is fsync'd whoever created it (here: all pre-existing)."""
+        os.makedirs(os.path.join(self.study, "registration"))
+        calls = []
+        orig = sealing.rqlib.fsync_dir
+        sealing.rqlib.fsync_dir = lambda d: (calls.append(os.path.abspath(d)), orig(d))[1]
+        try:
+            sealing.commit(self.study, "validation", self.val)
+        finally:
+            sealing.rqlib.fsync_dir = orig
+        reg = os.path.abspath(os.path.join(self.study, "registration"))
+        for d in (reg, os.path.abspath(self.study), os.path.dirname(os.path.abspath(self.study))):
+            self.assertIn(d, calls)
+        # the manifest takes the same lock: a held lock blocks its publication
+        import fcntl
+        import threading
+        mp, wp, _ = fixture(os.path.join(self.tmp, "g2"))
+        st2 = os.path.join(self.tmp, "st2")
+        os.makedirs(os.path.join(st2, "registration"))
+        lk = open(os.path.join(st2, "registration", ".lock"), "a")
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        done = []
+        th = threading.Thread(target=lambda: done.append(sealing.publish_manifest(st2, rqlib.canonical(
+            sealing.manifest(mp, wp)))))
+        th.start()
+        th.join(0.5)
+        self.assertEqual(done, [])                                        # waiting for the lock
+        fcntl.flock(lk, fcntl.LOCK_UN)
+        lk.close()
+        th.join(10)
+        self.assertEqual(done, [True])
+        self.assertTrue(os.path.isfile(os.path.join(st2, "config", "splits.json")))
+
     def test_freeze_and_byte_bound_gate(self):
         """#67 review 3, 5, 7: the freeze needs the manifest, the OSF identifier and its registration time;
         the gate compares the manifest unconditionally and hands scoring the verified bytes."""
         self.commit_all()
-        kw = dict(osf_url="https://osf.io/abc12", doi="10.17605/OSF.IO/ABC12", registered_utc="2026-11-11T12:00:00Z")
+        kw = dict(osf_url="https://osf.io/abc12", doi="10.17605/OSF.IO/ABC12", registered_utc=rqlib.now_utc())
+        for t, why in (("2026-02-30T12:00:00Z", "not a real date"), ("2099-01-01T00:00:00Z", "in the future"),
+                       ("2020-01-01T00:00:00Z", "precedes the validation evaluation"), ("2026-11-08 12:00", "YYYY-MM-DD")):
+            with self.assertRaisesRegex(sealing.SealError, why):
+                sealing.freeze(self.study, self.prereg, self.script, **dict(kw, registered_utc=t))
         with self.assertRaisesRegex(sealing.SealError, "registered-utc"):
             sealing.freeze(self.study, self.prereg, self.script, osf_url="https://osf.io/abc12")
         mp = os.path.join(self.study, "config", "splits.json")
@@ -263,6 +363,8 @@ class TestCommitments(unittest.TestCase):
         with self.assertRaisesRegex(sealing.SealError, "never replaced"):
             sealing.freeze(self.study, self.prereg, self.script, **dict(kw, osf_url="https://osf.io/zzz99"))
         got = sealing.require_test_freeze(self.study, self.test, self.script)
+        self.assertEqual(got["freeze"], json.loads(got["freeze_bytes"]))      # the record checked is returned
+        self.assertEqual(got["freeze_bytes"], rqlib.read_bytes(os.path.join(self.study, "registration", "freeze.json")))
         wr(self.test, '{"target_id": "t1", "mean": 0.99}\n')          # replaced after the gate ...
         self.assertEqual(rqlib.sha256_bytes(got["predictions"]), f["TEST_PRED_SHA"])   # ... scoring uses these
         self.assertEqual(got["manifest"], keep)
