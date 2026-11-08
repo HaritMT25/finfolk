@@ -73,6 +73,18 @@ class TestRegister(unittest.TestCase):
                                                                                           "worlds.json")))
         self.assertEqual(len(reg["native_panel"]), 32)
 
+    def test_reserved_history_seeds(self):
+        """#70 review 7: a fork seed equal to ANY reserved history seed (a restart seed, an unused slot's) is
+        refused."""
+        target = next(x["seeds"][3] for x in self.hreg["reserved"] if x["treatment"] == "B" and x["k"] == 1)
+        orig = rqlib.derive_seed
+        rqlib.derive_seed = lambda ns, kind, *a: target if kind == "fork" else orig(ns, kind, *a)
+        try:
+            with self.assertRaisesRegex(forks.ForkError, "history seed slot"):
+                forks.register(self.study, self.splits, "ns-f")
+        finally:
+            rqlib.derive_seed = orig
+
     def test_refusals(self):
         with self.assertRaisesRegex(forks.ForkError, "multiples of the checkpoint"):
             forks.register(self.study, self.splits, "ns-f", origins=[30 * M + 5])
@@ -364,6 +376,69 @@ class TestBranches(unittest.TestCase):
         forks.refresh_origins(study, f2, lambda m: None)
         ev = [e for e in worlds.read_jsonl(lp) if e["branch"] == b2["id"]]
         self.assertEqual([e["status"] for e in ev], ["unavailable"])
+
+    def test_roots_under_the_burn_in_rule(self):
+        """#70 review 2 (P1): a root whose attempt can still be restarted is WAITING whatever its early
+        zeros (never unavailable); a branch frozen from a discarded attempt is invalidated; the fork registry
+        refuses a seed equal to any reserved history seed (restart seeds, unused slots)."""
+        study, reg, ar = make_root(self.tmp, "A", dict(SCHED, total_steps=3000), burn_in=3000)
+        w = reg["worlds"][0]
+        b = {"id": f"{w['id']}.o1000.s0", "root": w["id"], "treatment": "A",
+             "origin": {"frame": 1000, "label": "end.1000", "seed": 77, "k": 0}}
+        d = worlds.wdir(study, w["id"])
+        os.makedirs(os.path.join(d, "seg000"), exist_ok=True)
+        head = "step,population,predator_pop\n900,0,8\n"
+        wr(os.path.join(d, "seg000", "run.csv"), head)
+        worlds._append_durable(os.path.join(study, "availability.jsonl"), {
+            "schema": worlds.AVAIL_SCHEMA, "world": w["id"], "guild": "prey", "first_zero_frame": 900,
+            "segment": "seg000", "csv_bytes": len(head), "csv_sha256": rqlib.sha256_bytes(head.encode())})
+        kind, why = forks.origin_status(study, b)
+        self.assertEqual(kind, "waiting", why)                   # (an early zero of a replaceable attempt)
+        self.assertIn("burn-in", why)
+        # a branch frozen from attempt 0, then the root restarted: invalid
+        fr = forks.froot(study)
+        os.makedirs(worlds.wdir(fr, b["id"]))
+        rqlib.write_json_durable(os.path.join(worlds.wdir(fr, b["id"]), "origin.rec.json"),
+                                 {"schema": forks.ORIGIN_SCHEMA, "sha256": "0" * 64, "prey": 8, "predators": 3,
+                                  "root_attempt": 0})
+        os.makedirs(os.path.join(study, "restarts"), exist_ok=True)
+        os.rename(d, d + ".gone")
+        os.makedirs(d)
+        rqlib.write_json_durable(os.path.join(d, "attempt.json"), {"attempt": 1})
+        self.assertIn("discarded attempt", forks.branch_invalid(study, b))
+
+    def test_restart_during_the_copy(self):
+        """#70 round 2, 1: the frozen origin is bound to the root attempt admitted; a restart between the
+        admission and the copy is detected: nothing frozen, the branch waits."""
+        study, reg, ar = make_root(self.tmp, "A", dict(SCHED, total_steps=3000))
+        w = reg["worlds"][0]
+        flags = w["flags"]
+        o = os.path.join(self.tmp, "o1000.json")
+        wr(o, ckpt.dumps(mk_cp(frame=1000, cfg_extra=cfg_for(flags))))
+        os.makedirs(worlds.wdir(study, w["id"]), exist_ok=True)
+        worlds.archive_one(study, w["id"], ar, 1000, o, lambda m: None)
+        b = {"id": f"{w['id']}.o1000.s0", "uuid": "u-branch", "kind": "main", "root": w["id"], "root_uuid": w["uuid"],
+             "split": "test", "treatment": "A", "block": 1, "flags": flags, "predator_log": False, "config_args": None,
+             "origin": {"frame": 1000, "label": "end.1000", "seed": 77, "k": 0}, "total_steps": 3000}
+        freg = {"schema": forks.SCHEMA, "schedule": dict(SCHED, total_steps=3000), "worlds": [b]}
+        fr = forks.froot(study)
+        os.makedirs(fr)
+        worlds.bind_root(fr, rqlib.canonical_sha(freg), create=True)
+        seq = iter([0, 1, 1, 1, 1, 1])
+        orig = worlds.attempt_of
+        worlds.attempt_of = lambda root, wid: next(seq) if wid == w["id"] else orig(root, wid)
+        logs = []
+        try:
+            forks.refresh_origins(study, freg, logs.append)
+        finally:
+            worlds.attempt_of = orig
+        self.assertTrue(any("restarted while the origin was copied" in m for m in logs), logs)
+        d = worlds.wdir(fr, b["id"])
+        self.assertFalse(os.path.exists(os.path.join(d, "origin.json")))
+        self.assertFalse(os.path.exists(os.path.join(d, "origin.rec.json")))
+        self.assertEqual(worlds.read_state(fr, b["id"])["status"], "waiting")
+        forks.refresh_origins(study, freg, logs.append)                 # (no race: frozen, bound to attempt 0)
+        self.assertEqual(rqlib.read_json(os.path.join(d, "origin.rec.json"))["root_attempt"], 0)
 
     def test_origin_unavailable_and_changed(self):
         study, fr, far, rt, b, cp = self.setup_branch()

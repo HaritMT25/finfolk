@@ -444,6 +444,34 @@ def plan_seeds(rows, kinds=ENGINE_SEEDS):
     return out
 
 
+def collect_seeds(obj, out=None, hint=False):
+    """Every integer under a key whose name contains "seed" (a registry's founder seeds and reserved
+    seed slots, any nesting)."""
+    out = set() if out is None else out
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            collect_seeds(v, out, hint or "seed" in str(k).lower())
+    elif isinstance(obj, list):
+        for v in obj:
+            collect_seeds(v, out, hint)
+    elif isinstance(obj, int) and not isinstance(obj, bool) and hint:
+        out.add(obj)
+    return out
+
+
+def avoid_seeds(path):
+    """The seeds an --avoid input reserves: an archived plan (JSONL rows: their engine seeds) or any JSON
+    document (a worlds registry with its reserved history seeds, a reservation file: every nested seed)."""
+    text = rqlib.read_text(path)
+    try:
+        doc = json.loads(text)
+    except ValueError:
+        doc = None
+    if isinstance(doc, dict):
+        return collect_seeds(doc)
+    return plan_seeds(json.loads(ln) for ln in text.split("\n") if ln.strip())
+
+
 def joint_seed_problems(rows, other):
     """Two plan/2 row sets checked as one seed universe: within each kind, one seed per group key
     and no seed shared by two group keys (an audit plan against production, family plans)."""
@@ -765,7 +793,7 @@ def main(argv=None):
     if a.avoid:
         old = set()
         for p in a.avoid:
-            old |= plan_seeds(json.loads(ln) for ln in rqlib.read_text(p).split("\n") if ln.strip())
+            old |= avoid_seeds(p)
         hit = sorted(plan_seeds(rows) & old)
         if hit:
             print(f"{len(hit)} engine seed(s) also used by {a.avoid}: {hit[:10]}", file=sys.stderr)
