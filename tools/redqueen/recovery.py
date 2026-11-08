@@ -247,15 +247,23 @@ class Data:
         # distinct EARLY (<= 120M) reference slots among its fitted reference pairs, at the actual frames
         sup = {}
         er = oneref & (reft <= 120) & fitrole
-        for side, node, slot, isref in (("prey", self.qi, self.pj, pr), ("pred", self.pj, self.qi, qr)):
+        wblock = {i: w.get("block") for i, w in enumerate(sorted(self.g["worlds"], key=lambda w: w["id"]))}
+        for side, node, slot, isref, nw in (("prey", self.qi, self.pj, pr, self.qw), ("pred", self.pj, self.qi, qr, self.pw)):
             sel = np.flatnonzero(er & isref)
             per = {}
             for n_, k_ in zip(node[sel].tolist(), slot[sel].tolist()):
                 per.setdefault(n_, set()).add(k_)
             pops = np.unique(node[np.flatnonzero(glob & isref & ~(qr if side == "prey" else pr))])
             counts = [len(per.get(int(x), ())) for x in pops]
+            byb = {}                                   # (#71 r2 P2: per block x readout)
+            for x, c in zip(pops.tolist(), counts):
+                b = str(wblock.get(int(nw[x])))
+                d = byb.setdefault(b, {"populations": 0, "min_early_references": None, "without_early_reference": 0})
+                d["populations"] += 1
+                d["min_early_references"] = c if d["min_early_references"] is None else min(d["min_early_references"], c)
+                d["without_early_reference"] += c == 0
             sup[side] = {"populations": len(counts), "min_early_references": min(counts) if counts else 0,
-                         "without_early_reference": sum(1 for c in counts if c == 0)}
+                         "without_early_reference": sum(1 for c in counts if c == 0), "blocks": byb}
         val = np.flatnonzero(main & ((qs != "test") & (ps != "test")) & both(141, 160) & notest)
         fwd = np.flatnonzero(main & trainpair & both(181, 200))
         inter = np.flatnonzero(main & ((qs == "test") | (ps == "test")) & both(181, 200))
@@ -737,6 +745,7 @@ def one(a):
         else:
             res["options"][opt] = procedure(D, data, opt, a.ranks, [float(x) for x in a.lambdas.split(",")],
                                             a.iters, seed, ab_cap=cap, fitter=a.fitter)
+    res["reference_support"] = D.forward["reference_support"]            # (#71 r2 P2: persisted)
     res["seconds"] = round(time.time() - t0, 1)
     rqlib.write_json_durable(a.out, res)
     return 0
@@ -819,6 +828,13 @@ def summarize(d):
         for opt, o in r["options"].items():
             rows.setdefault((r["scenario"], opt), []).append(o)
     out = {"schema": "finfolk.redqueen.recoverysummary/1", "config_sha256": next(iter(cfgs), None), "cells": []}
+    sups = []
+    for f in sorted(os.listdir(d)):
+        if f.endswith(".json") and not f.startswith("summary") and f != "config.json":
+            sups.append(rqlib.canonical(rqlib.read_json(os.path.join(d, f)).get("reference_support")))
+    if len(set(sups)) > 1:
+        raise SystemExit(f"{d}: results with different reference support (another reference assignment?)")
+    out["reference_support"] = json.loads(sups[0]) if sups else None
     for (sc, opt), lst in sorted(rows.items()):
         if "success" in lst[0]:
             k = sum(o["success"] for o in lst)
@@ -892,7 +908,7 @@ def conditioning(D, rank, option="a", seed=0):
 
 
 def bench(a):
-    D = load_data(a.graph)
+    D = load_data(a.graph, getattr(a, "references", None))
     t0 = time.time()
     data = simulate(D, SCENARIOS["r2_034"], 1)
     t1 = time.time()
@@ -911,6 +927,7 @@ def main(argv=None):
         if name == "conditioning":
             s.add_argument("--graph", required=True)
             s.add_argument("--out")
+            s.add_argument("--references", help="the selected references/1 document (the actual frames)")
             continue
         if name != "summarize":
             s.add_argument("--graph", required=True)
@@ -946,8 +963,11 @@ def main(argv=None):
     if a.cmd == "bench":
         return bench(a)
     if a.cmd == "conditioning":
-        D = load_data(a.graph)
+        D = load_data(a.graph, a.references)
         rep = {opt: {f"rank{r}": conditioning(D, r, opt, r) for r in (1, 2, 3, 4)} for opt in OPTIONS}
+        rep["references"] = ({"sha256": reference_times(a.references)[1]} if a.references
+                             else {"assumed": list(REF_TIMES)})
+        rep["reference_support"] = D.forward["reference_support"]
         text = json.dumps(rep, indent=1, sort_keys=True)
         if a.out:
             rqlib.write_durable(a.out, text.encode() + b"\n")

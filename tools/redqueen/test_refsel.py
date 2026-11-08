@@ -46,6 +46,8 @@ except ImportError:
 
 NS = rs.VALIDATION_NAMESPACE
 MAIN_NS = "finfolk-rq-main-2026"
+LAYOUT = {"w04": "A", "w07": "A", "w05": "B", "w09": "B"}           # (arena #1's validation; the rest C)
+SENT = ("w01", "w02", "w03", "w06")                                  # (the rule: the first four C worlds)
 
 
 def write_json(path, obj):
@@ -55,24 +57,24 @@ def write_json(path, obj):
     return path
 
 
-def registry(ns, n=12, treatment="C"):
+def registry(ns, n=12, layout=None):
     return {"schema": rs.WORLDS_SCHEMA, "namespace": ns,
-            "worlds": [{"id": f"w{i:02d}", "uuid": rs.recipe(ns, f"w{i:02d}"), "treatment": treatment}
-                       for i in range(1, n + 1)]}
+            "worlds": [{"id": f"w{i:02d}", "uuid": rs.recipe(ns, f"w{i:02d}"),
+                        "treatment": (layout or {}).get(f"w{i:02d}", "C")} for i in range(1, n + 1)]}
 
 
 def block(root, valid_before=None, attempts=None):
     """worlds.py design-block's form (no root) of the validation registry at <root>/config/worlds.json."""
     rp = os.path.join(root, "config", "worlds.json")
     if not os.path.isfile(rp):
-        write_json(rp, registry(NS))
+        write_json(rp, registry(NS, layout=LAYOUT))
     ws = {}
     for i in range(1, 13):
         w = f"w{i:02d}"
         k = (attempts or {}).get(w, 0)
         u = rs.recipe(NS, w)
         ws[w] = {"uuid": u if not k else str(uuid.uuid5(uuid.NAMESPACE_URL, f"finfolk:attempt:{u}:{k}")),
-                 "attempt": k, "treatment": "C", "block": 1, "status": "running",
+                 "attempt": k, "treatment": LAYOUT.get(w, "C"), "block": 1, "status": "running",
                  "pattern": os.path.join(root, w, "end.{frame}.json"), "paths": {"F1": os.path.join(root, w, "F1.json")},
                  "valid_before": (valid_before or {}).get(w), "archived": [1] + [t * 1_000_000 for t in range(1, 201)]}
     times = {"F1": 1}
@@ -135,6 +137,11 @@ def simulate(rows, seed=1, rank=2, saturate=(), noise=0.15, B=324):
     return obs
 
 
+def graphlib_load(path):
+    import graph
+    return graph.load(path)
+
+
 class Base(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
@@ -162,7 +169,7 @@ class TestPlanAndBinding(Base):
         rows, _, _ = plan.expand_v2(d, pending=True)
         self.assertEqual(len(rows), (32 * 32 + 32) * 6)
         self.assertEqual(r["criterion_sha256"], rqlib.canonical_sha(rs.CRITERION))
-        self.assertEqual((r["sentinels"], r["sentinel_namespace"]), (list(rs.SENTINELS), NS))
+        self.assertEqual((r["sentinels"], r["sentinel_namespace"]), (list(SENT), NS))
         self.assertEqual(r["binding"]["registry_sha256"], rqlib.sha256_file(os.path.join(self.f["vdir"], "config", "worlds.json")))
         self.assertEqual(r["availability_sha256"], rqlib.canonical_sha(r["availability"]))
         self.assertEqual({x.get("kind", "main") for x in r["binding"]["studies"]}, {"main", "forks"})
@@ -189,13 +196,13 @@ class TestPlanAndBinding(Base):
         om = [o for o in r["omitted"] if o["world"] == "w06"]
         self.assertEqual(len(om), 7)
         self.assertTrue(all("first zero" in o["reason"] for o in om))
-        d2 = self.design(block(self.f["vdir"], attempts={"w05": 1}))
-        self.assertFalse(any(c[0] == "w05" for c in d2["refsel"]["candidates"]))
+        d2 = self.design(block(self.f["vdir"], attempts={"w03": 1}))
+        self.assertFalse(any(c[0] == "w03" for c in d2["refsel"]["candidates"]))
         self.assertTrue(all("restarted attempt" in o["reason"] for o in d2["refsel"]["omitted"]))
         with self.assertRaises(rs.RefselError):                         # (two usable sentinels)
-            self.design(block(self.f["vdir"], valid_before={"w05": 1, "w06": 1}))
+            self.design(block(self.f["vdir"], valid_before={"w03": 1, "w06": 1}))
         with self.assertRaises(rs.RefselError):                         # (no late snapshot anywhere)
-            self.design(block(self.f["vdir"], valid_before={w: 130_000_000 for w in rs.SENTINELS}))
+            self.design(block(self.f["vdir"], valid_before={w: 130_000_000 for w in SENT}))
 
     def test_binding(self):
         """Codex #71 r1 P1: the validation registry (its sha256 and namespace), the predetermined sentinel
@@ -213,7 +220,7 @@ class TestPlanAndBinding(Base):
         with self.assertRaises(rs.RefselError):
             self.design(main_registries=[])
         bad_main = registry(MAIN_NS, 4)
-        bad_main["worlds"].append({"id": "w99", "uuid": rs.recipe(NS, "w04"), "treatment": "C"})
+        bad_main["worlds"].append({"id": "w99", "uuid": rs.recipe(NS, "w02"), "treatment": "C"})
         with self.assertRaises(rs.RefselError):
             self.design(main_registries=[write_json(os.path.join(self.tmp, "m2", "worlds.json"), bad_main)])
         with self.assertRaises(rs.RefselError):
@@ -221,12 +228,16 @@ class TestPlanAndBinding(Base):
         fk = {"worlds": [{"id": "w01.o30M.s0", "uuid": rs.recipe(NS, "w01"), "root": "w01"}]}
         with self.assertRaises(rs.RefselError):
             self.design(forks=write_json(os.path.join(self.tmp, "fk", "forks.json"), fk))
-        bad_reg = registry(NS)
-        bad_reg["worlds"][0]["treatment"] = "A"                          # (w01 is not a C world)
+        bad_reg = registry(NS, layout=LAYOUT)
+        bad_reg["worlds"][0]["sentinel"] = True                           # (flags must agree with the rule)
+        bad_reg["worlds"][3]["sentinel"] = True
         vd2 = os.path.join(self.tmp, "v2")
         write_json(os.path.join(vd2, "config", "worlds.json"), bad_reg)
         with self.assertRaises(rs.RefselError):
             self.design(block(vd2), validation_dir=vd2)
+        self.assertEqual(rs.sentinels_of(registry(NS, layout=LAYOUT)), list(SENT))       # (the rule)
+        moved = registry(NS, layout=dict(LAYOUT, w02="A"))
+        self.assertEqual(rs.sentinels_of(moved), ["w01", "w03", "w06", "w08"])
         bp = write_json(os.path.join(self.tmp, "block.json"), b)
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             rs.main(["plan", "--block", bp, "--sentinels", "w01,w02,w03,w04", "--validation-dir", self.f["vdir"],
@@ -241,8 +252,41 @@ class TestPlanAndBinding(Base):
         with self.assertRaises(rs.RefselError):
             rs.rebind(d)
 
+    def test_rebind_validates_the_pool(self):
+        """Codex #71 r2 P1: at selection every candidate must be a registered sentinel at a registered time,
+        consistent with the recorded availability; the registry's CONTENT (namespace, C registrations) is
+        re-validated; the study exclusion covers all four sentinel identities, omitted ones included."""
+        d = self.design()
+        self.assertEqual(len(rs.rebind(d)), 2)
+        for bad in (["w08", "20M"], ["w01", "30M"], ["w01", "20M"]):           # (not a sentinel / time; a duplicate)
+            x = json.loads(json.dumps(d))
+            x["refsel"]["candidates"].append(bad)
+            x["worlds"].setdefault("w08", dict(x["worlds"]["w01"], uuid=rs.recipe(NS, "w08")))
+            with self.assertRaises(rs.RefselError):
+                rs.rebind(x)
+        x = json.loads(json.dumps(d))
+        x["refsel"]["availability"]["w02"]["valid_before"] = 50_000_000      # (the record's sha no longer matches)
+        with self.assertRaises(rs.RefselError):
+            rs.rebind(x)
+        x["refsel"]["availability_sha256"] = rqlib.canonical_sha(x["refsel"]["availability"])
+        with self.assertRaises(rs.RefselError):                              # (60M+ of w02 now inconsistent)
+            rs.rebind(x)
+        d6 = self.design(block(self.f["vdir"], valid_before={"w06": 6_900_000}))
+        clash = registry(MAIN_NS, 4)
+        clash["worlds"].append({"id": "w99", "uuid": rs.recipe(NS, "w06"), "treatment": "C"})
+        with self.assertRaises(rs.RefselError):                              # (w06's omitted snapshots count too)
+            rs.rebind(d6, [write_json(os.path.join(self.tmp, "m6", "worlds.json"), clash)])
+        rp = os.path.join(self.f["vdir"], "config", "worlds.json")
+        reg = rqlib.read_json(rp)
+        reg["worlds"][1]["treatment"] = "A"                                    # (w02 no longer C: the rule moves)
+        write_json(rp, reg)
+        x = json.loads(json.dumps(d))
+        x["refsel"]["binding"]["registry_sha256"] = rqlib.sha256_file(rp)
+        with self.assertRaises(rs.RefselError):
+            rs.rebind(x)
+
     def test_feasibility(self):
-        cands = [(w, t) for w in rs.SENTINELS for t in rs.TIMES]
+        cands = [(w, t) for w in SENT for t in rs.TIMES]
         self.assertTrue(rs.feasible([], cands))
         four_late = [("w01", "140M"), ("w01", "180M"), ("w01", "200M"), ("w04", "140M")]
         pool = [c for c in cands if c not in four_late]
@@ -269,7 +313,7 @@ class TestSelection(Base):
         saturating sentinel's predators are never chosen; every swap is non-improving at the end (converged);
         the provenance receipt (observations, plan, availability, omissions, binding, implementation); the
         frozen criterion is enforced."""
-        sat = {("w05", t) for t in rs.TIMES}
+        sat = {("w03", t) for t in rs.TIMES}
         obs = simulate(self.rows, seed=3, saturate=sat)
         doc, rep = rs.select(obs, self.d, self.rows, studies=rs.rebind(self.d), plan_sha="p" * 64)
         doc2, _ = rs.select(list(reversed(obs)), self.d, self.rows, studies=rs.rebind(self.d), plan_sha="p" * 64)
@@ -327,6 +371,10 @@ class TestSelection(Base):
         o = dict(next(x for x in obs if x["pred"]), captures=10 ** 6)
         with self.assertRaises(rs.RefselError):
             rs.matrices([o if x["cell"] == o["cell"] else x for x in obs], self.cands)
+        for coh in (300, None, True):                                         # (Codex #71 r2 P2: survival / 600)
+            o = dict(obs[5], cohort=coh)
+            with self.assertRaises(rs.RefselError):
+                rs.matrices([o if x["cell"] == o["cell"] else x for x in obs], self.cands)
 
     def test_information_prefers_spread(self):
         """With no saturation, a reference set whose embeddings span the rank-2 space beats one whose
@@ -366,6 +414,21 @@ class TestSelection(Base):
         g2 = {"readouts": {"x": {"emb": rot, "w": w, "reff": reff}}, "sat": np.zeros(n)}
         for idx in ([0, 1, 2, 3, 4, 5, 6, 7], [2, 4, 6, 8, 9, 10, 11, 0]):
             self.assertAlmostEqual(rs.objective(g, idx), rs.objective(g2, idx), places=9)
+
+    def test_rank_cap_refuses_structural_degeneracy(self):
+        """Codex #71 r2 P2: a tie group is followed to its end only up to rank 6; the fully symmetric centred
+        matrix (31 equal singular values) is a structural degeneracy and is refused."""
+        self.assertEqual(rs.tied_ranks(np.array([3.0, 2, 2, 2, 2, 2, 1.0]))[2], 6)
+        with self.assertRaises(rs.RefselError):
+            rs.tied_ranks(np.array([3.0, 2, 2, 2, 2, 2, 2, 1.0]))
+        n = 32
+        X = np.eye(n) - np.ones((n, n)) / n
+        self.assertEqual(int(np.sum(np.abs(np.linalg.svd(X)[1] - 1) < 1e-9)), 31)
+        mats = {k: np.zeros((n, n)) for k in ("l_mean", "q_mean", "cap_frac", "surv")}
+        mats.update(l_mean=X, q_mean=0.01 * X, l_var=np.full((n, n), 0.01), q_var=np.full((n, n), 0.001),
+                    cap_frac=np.full((n, n), 0.3), surv=np.full((n, n), 0.8))
+        with self.assertRaises(rs.RefselError):
+            rs.embeddings(mats)
 
     def test_swap_limit_is_reported(self):
         """Codex #71 r1 P3: the search record says whether it converged or stopped at the limit (max_swaps 0:
@@ -411,18 +474,30 @@ class TestSelection(Base):
         dup["references"]["RQ:1"] = dict(dup["references"]["RQ:2"])
         with self.assertRaisesRegex(sealing.SealError, "one reference"):
             sealing.load_references(write_json(rp, dup), uuids, branches, MAIN_NS)
-        import recovery
-        refs4 = json.loads(json.dumps(doc))
-        frames = [1, 20, 60, 100, 140, 160, 180, 200]                    # (exactly four early: slot 4 is 140M)
-        for g in ("RQ", "RP"):
-            for k, f_ in enumerate(frames):
-                refs4["references"][f"{g}:{k}"]["frame"] = f_ if f_ == 1 else f_ * 1_000_000
-        times, sha = recovery.reference_times(write_json(os.path.join(self.tmp, "refs4.json"), refs4))
-        self.assertEqual(times["RQ"][4], 140)
-        self.assertEqual(sha, rqlib.sha256_file(os.path.join(self.tmp, "refs4.json")))
         import graph
-        g_ = graph.build("rq-test-refsel", None, True, snapshot_topup=0, ab_topup=0, lag_probe=0)
-        assumed, actual = recovery.Data(g_), recovery.Data(g_, times)
+        import recovery
+        pick = [("w01", "F1"), ("w01", "20M"), ("w02", "60M"), ("w03", "100M"), ("w01", "140M"), ("w02", "180M"),
+                ("w03", "200M"), ("w06", "140M")]                   # (exactly four early: slot 4 is 140M)
+        refs4 = {"schema": rs.REFS_SCHEMA, "namespace": NS, "references": {}}
+        for g in ("RQ", "RP"):
+            sel = sorted(pick, key=lambda c: (rs.frame_of(c[1]), rs.tie_key(g, c[0], rs.frame_of(c[1]))))
+            for k, (w, lab) in enumerate(sel):
+                fr = rs.frame_of(lab)
+                u = self.d["worlds"][w]["uuid"]
+                refs4["references"][f"{g}:{k}"] = {"world": w, "frame": fr, "uuid": u,
+                                                   "snapshot": plan.snapshot_uuid(u, fr),
+                                                   "archive": plan.snapshot_path(self.d, w, lab),
+                                                   "sha256": rs._archive_sha(self.rows, w, lab, g)}
+        p4 = write_json(os.path.join(self.tmp, "refs4.json"), refs4)
+        self.assertEqual(len(sealing.load_references(p4, uuids, branches, MAIN_NS)), 16)   # (a VALID assignment)
+        times, sha = recovery.reference_times(p4)
+        self.assertEqual((times["RQ"][4], times["RP"][4]), (140, 140))
+        gdir = os.path.join(self.tmp, "g")
+        g_ = graph.build("rq-test-refsel")                          # (the default graph: lag7 probes included)
+        self.assertEqual(g_["lag_probe"], graph.LAG_PROBE)
+        graph.write(g_, gdir)
+        gp = os.path.join(gdir, "graph.jsonl.gz")
+        assumed, actual = recovery.Data(graphlib_load(gp)), recovery.load_data(gp, p4)
         for D in (assumed, actual):
             f = D.forward["fit"]
             ref = D.qref[D.qi][f] | D.pref[D.pj][f]
@@ -433,10 +508,17 @@ class TestSelection(Base):
                                   or (D.pref[D.pj[i]] and D.pkey[D.pj[i]].endswith(":4"))))
         self.assertGreater(slot4(assumed), 0)
         self.assertEqual(slot4(actual), 0)
-        self.assertEqual(actual.forward["reference_support"]["times"], "actual")
-        self.assertEqual(assumed.forward["reference_support"]["times"], "assumed")
-        for side in ("prey", "pred"):
-            self.assertGreater(actual.forward["reference_support"][side]["populations"], 0)
+        sup = actual.forward["reference_support"]
+        self.assertEqual((sup["times"], assumed.forward["reference_support"]["times"]), ("actual", "assumed"))
+        for side in ("prey", "pred"):                               # (per block x readout, persisted)
+            self.assertGreater(sup[side]["populations"], 0)
+            self.assertEqual(sum(v["populations"] for v in sup[side]["blocks"].values()), sup[side]["populations"])
+        out = os.path.join(self.tmp, "cond.json")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(recovery.main(["conditioning", "--graph", gp, "--references", p4, "--out", out]), 0)
+        cond = rqlib.read_json(out)
+        self.assertEqual(cond["references"]["sha256"], sha)
+        self.assertEqual(cond["reference_support"], json.loads(json.dumps(sup)))
 
 
 @unittest.skipIf(np is None, "numpy is not installed")
@@ -497,6 +579,11 @@ class TestCollectAndCli(Base):
             with open(os.path.join(self.tmp, "bad.json"), "w") as f:
                 f.write("{not json")
             self.assertEqual(rs.main(["select", os.path.join(self.tmp, "bad.json"), "--design", dp, "--plan",
+                                      os.path.join(self.tmp, "none.jsonl"), "--out", os.path.join(self.tmp, "r.json"),
+                                      "--report", os.path.join(self.tmp, "rep.json")]), 2)
+            with open(os.path.join(self.tmp, "arr.json"), "w") as f:
+                f.write("[1, 2]")
+            self.assertEqual(rs.main(["select", os.path.join(self.tmp, "arr.json"), "--design", dp, "--plan",
                                       os.path.join(self.tmp, "none.jsonl"), "--out", os.path.join(self.tmp, "r.json"),
                                       "--report", os.path.join(self.tmp, "rep.json")]), 2)
         self.assertNotIn("Traceback", err.getvalue())
