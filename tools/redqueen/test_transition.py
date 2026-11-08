@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import json
 import math
 import os
 import sys
@@ -196,7 +197,7 @@ class TestTransition(unittest.TestCase):
             ti, tj = (a.ravel() for a in np.meshgrid(t, t, indexing="ij"))
             rt, rr = np.tile(t, 4), np.repeat(refs, len(t))
             cw, cr = rc.Cov(np.full(len(ti), 1e-4)), rc.Cov(np.full(len(rt), 1e-4))
-            epochs[e], betas[e] = [], {"P": [], "Q": []}
+            epochs[e], betas[e] = [], {"P": {}, "Q": {}}
             for w in range(nw):
                 wd = rc.WorldDesign(f"w{w}", {"C": (ti, tj, cw), "Q": (ti, tj, cw)}, {"C": (rt, rr, cr), "Q": (rt, rr, cr)},
                                     e, (8.0, 12.0, 25.0))
@@ -207,9 +208,9 @@ class TestTransition(unittest.TestCase):
                      "ref": {"C": 0.4 + amp * 0.05 * np.cos(2 * math.pi * rt / P - ph),
                              "Q": -0.1 + amp * 0.02 * np.cos(2 * math.pi * rt / P - ph)}}
                 epochs[e].append((wd, y))
-                betas[e]["P"].append(0.2 if e == "E1" else 0.0)
-                betas[e]["Q"].append(0.05 if e == "E1" else 0.0)
-                loads[w] = {"C": np.repeat(np.eye(4), len(t), axis=0)[np.argsort(np.argsort(rr))] * 0.0,
+                betas[e]["P"][f"w{w}"] = 0.2 if e == "E1" else 0.0
+                betas[e]["Q"][f"w{w}"] = 0.05 if e == "E1" else 0.0
+                loads[f"w{w}"] = {"C": np.repeat(np.eye(4), len(t), axis=0)[np.argsort(np.argsort(rr))] * 0.0,
                             "Q": None}
         # zero loadings: every draw equals the observed analysis
         xi = np.zeros((7, 2))
@@ -233,6 +234,56 @@ class TestTransition(unittest.TestCase):
         self.assertGreater(out["components"]["E2"]["EF_C"], 0)
         self.assertEqual(out["components"]["E1"]["EF_C"], 0.0)
         self.assertIn(out["classes"]["E1"]["class"], ("ARD", "unresolved"))
+        self.assertEqual(out["worlds"], ["w0", "w1", "w2"])
+        # #68 review 11: identities, not positions. One epoch's worlds reversed (their slopes keyed by id):
+        # the identical result; a different world set, a duplicate id or position-keyed slopes are refused
+        rev = dict(epochs, E2=list(reversed(epochs["E2"])))
+        out2 = tr.ht(rev, betas, {e: True for e in tr.EPOCHS}, loads=None, k=0, analysis="t", draws=199)
+        self.assertEqual(json.dumps(out2["components"], sort_keys=True, default=float),
+                         json.dumps(out["components"], sort_keys=True, default=float))
+        self.assertEqual(out2["T_T"], out["T_T"])
+        bad = dict(epochs, E3=epochs["E3"][:2] + [epochs["E3"][0]])
+        with self.assertRaises(tr.TransitionError):
+            tr.ht(bad, betas, {e: True for e in tr.EPOCHS}, analysis="t", draws=19)
+        with self.assertRaises(tr.TransitionError):
+            tr.ht(epochs, dict(betas, E1={"P": [0.2] * 3, "Q": [0.05] * 3}), {e: True for e in tr.EPOCHS},
+                  analysis="t", draws=19)
+        with self.assertRaises(tr.TransitionError):
+            tr.ht(epochs, betas, {e: True for e in tr.EPOCHS}, loads={"zz": {}}, analysis="t", draws=19)
+        nanb = {e: {h: dict(betas[e][h]) for h in "PQ"} for e in tr.EPOCHS}
+        nanb["E2"]["P"]["w1"] = math.nan
+        u = tr.ht(epochs, nanb, {e: True for e in tr.EPOCHS}, analysis="t", draws=19)
+        self.assertEqual((u["available"], u["reject"]), (False, False))
+
+    def test_nan_draws_are_failures(self):
+        """#68 review 3: a NaN draw is a numerical failure (never a non-exceedance); +inf is a value."""
+        tr = self.tr
+        with self.assertRaises(tr.TransitionError):
+            tr.tail_p(0.1, [0.2, math.nan, 0.3])
+        with self.assertRaises(tr.TransitionError):
+            tr.tail_p(math.nan, [0.2, 0.3])
+        self.assertEqual(tr.tail_p(0.1, [0.2, math.inf, 0.0]), 3 / 4)
+        obs, draws = self.comps([ARD, FSD, FSD])
+        draws["E2"]["EF_C"] = np.where(np.arange(B) == 7, math.nan, draws["E2"]["EF_C"])
+        with self.assertRaises(tr.TransitionError):
+            tr.ht_statistic(obs, draws, {e: True for e in tr.EPOCHS})
+        self.assertEqual(tr.classify(obs["E2"], draws["E2"], True)["class"], "unresolved")
+
+    def test_mixed_needs_affirmative_evidence(self):
+        """#68 review 8: material recurrence with directional bounds spanning the band is UNRESOLVED, not
+        mixed; bounds without a passed gate are unresolved; mixed needs both affirmatively."""
+        tr = self.tr
+        rec = dict(EF_C=0.05, EF_Q=0.01, EU_C=0.05, EU_Q=0.01)
+        span = dict(rec, beta_P=0.0, beta_Q=0.0)                 # bounds wide: spanning the band
+        mat = dict(rec, beta_P=0.6, beta_Q=0.0)                  # beta_P far above delta_P
+        wide = dict(SD, beta_P=0.08, beta_Q=0.03)
+        o, d = self.comps([span, span, span], sd=wide)
+        c = tr.classify(o["E1"], d["E1"], True)
+        self.assertEqual((c["class"], c["directional"]), ("unresolved", "unresolved"))
+        o, d = self.comps([mat, mat, mat], sd=dict(SD, beta_P=0.02))
+        self.assertEqual(tr.classify(o["E1"], d["E1"], True)["class"], "mixed")
+        c = tr.classify(o["E1"], d["E1"], False)                 # (the epoch gate failed)
+        self.assertEqual((c["class"], c["recurrent"], c["recurrence_bounds"]), ("unresolved", False, True))
 
 
 if __name__ == "__main__":

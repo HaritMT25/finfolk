@@ -256,12 +256,86 @@ class TestRecurrence(unittest.TestCase):
                                                 "worlds_with_conditional": 2})
         # the chain table (the bootstrap's vectorized rule 6) agrees with chain() at any phase
         phis = np.linspace(-math.pi, math.pi, 997)
-        seg, k, ok = tab.lookup(phis)
-        for ph, kk, oo in zip(phis, k, ok):
-            ch = rc.chain(wd.ref["C"].common, 0.0, 50.0, P, ph)
-            self.assertEqual(bool(oo), ch is not None)
+        self.assert_table_matches(tab, wd.ref["C"].common, 0.0, 50.0, P, phis)
+
+    def assert_table_matches(self, tab, times, L, U, P, phis):
+        lo, hi, k, ok = tab.lookup(phis)
+        for b, ph in enumerate(phis):
+            ch = self.rc.chain(times, L, U, P, float(ph))
+            self.assertEqual(bool(ok[b]), ch is not None, ph)
             if ch is not None:
-                self.assertEqual(int(kk), ch[0])
+                self.assertEqual(int(k[b]), ch[0])
+                self.assertEqual([(int(x), int(y)) for x, y in zip(lo[b], hi[b])], ch[1], ph)
+
+    def test_chain_table_at_every_crossing(self):
+        """#68 review 7: at a window-boundary crossing the closed window holds the boundary time; the
+        table equals chain() AT every crossing and on both sides of it (window indices, k, feasibility),
+        and through the scalar route the readout uses (ChainTable.at)."""
+        rc = self.rc
+        t = np.array(sorted({1e-6} | {float(x) for x in range(1, 51)} | {12.5, 37.5, 6.25}))
+        for P in (8.0, 12.0, 25.0):
+            tab = rc.ChainTable(t, 0.0, 50.0, P)
+            w = 2 * math.pi / P
+            phis = []
+            for u in tab.bp:
+                for d in (0.0, 1e-12, -1e-12, 1e-9, -1e-9, 1e-7, -1e-7, 1e-5, -1e-5, 1e-3, -1e-3):
+                    for q in (0, 1, -2):
+                        phis.append(w * (u + d + q * P / 2))
+            self.assert_table_matches(tab, t, 0.0, 50.0, P, np.array(phis))
+            for ph in phis[:: 37]:
+                self.assertEqual(tab.at(ph), rc.chain(t, 0.0, 50.0, P, ph))
+            lo, hi, k, ok = tab.lookup([math.nan, math.inf])
+            self.assertFalse(ok.any())
+
+    def test_rank_rule_on_the_singular_values(self):
+        """#68 review 4: rule 5 is the registered metric, the singular values of M_X H itself (not the
+        W-weighted S); singular and near-threshold known answers; a strongly non-uniform W does not move
+        the decision; the stable fit equals the full refit."""
+        rc = self.rc
+        t = np.linspace(0.0, 40.0, 81)
+        w = 2 * math.pi / 8.0
+        base = np.cos(w * t)
+        for eps, want in ((0.0, False), (1e-13, False), (1e-8, True), (1.0, True)):
+            H = np.column_stack([base, base + eps * np.sin(w * t)])
+            for d in (np.ones(len(t)), np.exp(np.linspace(-12, 12, len(t)))):
+                proj = rc.Projector(np.ones((len(t), 1)), rc.Cov(d))
+                hm = proj.harmonic(H)
+                MH = H - np.ones((len(t), 1)) @ (proj.Ginv @ (proj.WX.T @ H))
+                sv = np.linalg.svd(MH, compute_uv=False)
+                ref = sv[1] / sv[0]
+                self.assertEqual(hm.rank2, want, (eps, d[0]))
+                self.assertAlmostEqual(hm.ratio, ref, delta=1e-6 * max(ref, 1e-16) + 1e-15)
+        # a valid harmonic under a very non-uniform W: J and Delta equal the dense joint refit
+        H = rc.harmonic_matrix(t, 8.0)
+        d = np.exp(np.linspace(-6, 6, len(t)))
+        X = np.column_stack([np.ones(len(t)), t / 40.0])
+        proj = rc.Projector(X, rc.Cov(d))
+        hm = proj.harmonic(H)
+        y = 0.3 + 0.1 * t / 40 + 0.05 * np.cos(w * t - 0.4) + 0.001 * np.sin(1.3 * t)
+        a, J, D = hm.fit(y)
+        full, coef = proj.joint_fit(y, H)
+        self.assertTrue(np.allclose(full - proj.null_fit(y), D, atol=1e-10))
+        self.assertTrue(np.allclose(coef, a, atol=1e-9))
+        Wy = proj.cov.wmul(y - proj.null_fit(y))
+        rss0 = float((y - proj.null_fit(y)) @ Wy)
+        r1 = y - full
+        self.assertAlmostEqual(J, 0.5 * (rss0 - float(r1 @ proj.cov.wmul(r1))), delta=1e-9 * rss0)
+
+    def test_structured_and_dense_covariances_agree(self):
+        """H.14: the Woodbury (diag + U U') and the dense metric give the same J, phases and support."""
+        rc = self.rc
+        rng = np.random.default_rng(3)
+        n = len(self.ti)
+        d = 1e-4 * (1 + rng.random(n))
+        U = 3e-3 * rng.standard_normal((n, 3))
+        dense = np.diag(d) + U @ U.T
+        ws, wd_ = rc.WithinDesign(self.ti, self.tj, rc.Cov(d, U), SC, PER), \
+            rc.WithinDesign(self.ti, self.tj, rc.Cov(dense=dense), SC, PER)
+        y = self.data(8.0, 0.3, 0.3, 0.05, 0.02, 0.06, 0.03)["within"]["C"]
+        for P in PER:
+            self.assertEqual(ws.fails[P], wd_.fails[P])
+            if ws.harm[P].rank2:
+                self.assertAlmostEqual(ws.J(y, P), wd_.J(y, P), delta=1e-7 * max(1.0, abs(wd_.J(y, P))))
 
     def test_no_period_from_graph_density(self):
         """21 (noiseless part): constant and drifting strategies on an irregular coarse + fine graph give

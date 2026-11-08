@@ -111,6 +111,44 @@ class TestBackbone(unittest.TestCase):
         for j in range(5):
             self.assertTrue(np.allclose(d1[j], d2[j], atol=1e-8))
 
+    def test_convergence_is_required(self):
+        """#68 review 5: an exhausted iteration budget raises (never a returned last iterate); saturated
+        counts (all zero, all bounded) converge under the safeguarded Newton; the fast fits too."""
+        t = np.array([1e-6] + [5.0 * k for k in range(1, 41)])
+        with self.assertRaises(self.bb.BackboneError):
+            self.bb._newton(self.bb.basis(t), np.full(len(t), 30.0), np.full(len(t), 100.0), iters=2)
+        with self.assertRaises(self.bb.BackboneError):
+            self.bb.fit_captures(t, [np.full(len(t), 30.0)], [np.full(len(t), 100.0)], iters=2)
+        free = (t, np.full(len(t), 500.0))
+        with self.assertRaises(self.bb.BackboneError):
+            self.bb.fit_survival(free, {0: (t, np.full(len(t), 400.0))}, iters=2)
+        for y in (np.zeros(len(t)), np.full(len(t), 100.0)):           # (saturated: the penalty bounds it)
+            g = self.bb.fit_capture(t, y, np.full(len(t), 100.0))
+            self.assertTrue(np.all(np.isfinite(g)))
+            G = self.bb.fit_captures(t, [y, np.full(len(t), 50.0)], [np.full(len(t), 100.0)] * 2)
+            self.assertTrue(np.allclose(G[0], g, atol=1e-6, rtol=1e-9))
+
+    def test_epoch_fits_see_their_epoch_only(self):
+        """#68 review 6: a capture panel observed over the whole history, flat inside E2 = [75, 125] but
+        changing outside it: the E2 fit restricts the focal observations (every opponent kept), so its
+        slope is 0; the basis refuses an out-of-interval time rather than clamping it."""
+        t = np.array([1e-6] + [5.0 * k for k in range(1, 41)])
+        foc = [x for x in t if 75 <= x <= 125]
+        y = np.where(t < 75, 10.0, np.where(t > 125, 90.0, 40.0))
+        cap = {k: (t, y, np.full(len(t), 100.0)) for k in range(4)}
+        b, m = self.bb.hp_world(cap, foc, (75.0, 125.0))
+        self.assertAlmostEqual(b, 0.0, places=8)
+        with self.assertRaises(self.bb.BackboneError):
+            self.bb.basis([70.0], (75.0, 125.0))
+        with self.assertRaises(self.bb.BackboneError):
+            self.bb.fit_capture(t, y, np.full(len(t), 100.0), (75.0, 125.0))
+        with self.assertRaises(self.bb.BackboneError):                     # (an opponent without an E2 row)
+            self.bb.hp_world({0: (t[:5], y[:5], np.full(5, 100.0))}, foc, (75.0, 125.0))
+        free = (t, np.where(t < 75, 300.0, 500.0))
+        ex = {j: (t, np.where(t > 125, 100.0, 400.0)) for j in range(3)}
+        bq, _ = self.bb.hq_world(free, ex, foc, (75.0, 125.0))
+        self.assertAlmostEqual(bq, 0.0, places=8)
+
     def test_directional_test(self):
         """The H.2 test on per-world slopes: detection at a material slope with world spread."""
         rng = self.st.stream("H-P", "unit-test", "worlds", 0)

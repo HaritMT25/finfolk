@@ -101,7 +101,7 @@ jobs:
       - name: Backbone estimators and H-F / H-T (Annex H.1-H.4, numpy required)
         run: |
           python3 -m pip install -q "numpy>=2"
-          for t in test_backbone test_recurrence test_transition; do
+          for t in test_backbone test_recurrence test_transition test_calib; do
             RQ_REQUIRE_NUMPY=1 python3 -I -W error::ResourceWarning tools/redqueen/$t.py -v 2>&1 | tee $t.log
             test "${PIPESTATUS[0]}" = 0
             ! grep -q ResourceWarning $t.log

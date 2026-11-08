@@ -23,15 +23,25 @@ eligible C worlds) - mean(d of its eligible G worlds) for G in {A, B} (a block n
 and B world; one or two controls per treatment), weight w_G,b = 1 / (1/n_C,b + 1/n_G,b) (normalized;
 equal for balanced intact blocks, where the test is H.5's). For each G, over every e in {-1, +1}^n:
 p_G = #{sum e_b w_G,b D_G,b >= sum w_G,b D_G,b} / 2^n; p_C = max(p_A, p_B); reject iff p_C is at most
-H-C's ACTIVE Holm level and both weighted estimates > 0. One-sided floor 2^-n: 8 blocks 0.0039, 7 blocks 0.0078 (can reject), 6 blocks
-0.0156 (cannot). Material: p computed on D - 0.02. 99% lower bounds by exact inversion: L_G = the
-(k+1)-th smallest nonempty-subset mean, k = floor(0.01 2^n) - 1 (-inf if k < 0); min(L_A, L_B) bounds
-min(Delta_A, Delta_B). t_A, t_B are reported, never calibrated.
+H-C's ACTIVE Holm level and both weighted estimates > 0. One-sided floor 2^-n: 8 blocks 0.0039, 7 blocks
+0.0078, 6 blocks 0.0156 (6 blocks cannot reject at 0.01, but can at an active Holm level >= 1/64, e.g.
+0.05/3). Material: p computed on D - 0.02. Ties are exact (signflip_p). The REPORTED 99% lower bounds
+(fixed 0.01, whatever the decision level) by exact inversion: L_G = the (k+1)-th smallest nonempty-subset
+mean, k = floor(0.01 2^n) - 1 (-inf if k < 0); min(L_A, L_B) bounds min(Delta_A, Delta_B); the bounds at
+the active decision level are reported beside them with their confidence. t_A, t_B are reported, never
+calibrated.
 
 MULTIPLICITY (the user's decision: Holm step-down at familywise 0.05 over H-P, H-Q, H-F, H-T, H-C,
 replacing H.6's fixed Bonferroni). An unavailable hypothesis keeps its row and enters as p = 1 (no
-alpha reallocation). The reciprocal-directional headline needs both H-P and H-Q rejected under Holm;
-its p is max(adjusted p_P, adjusted p_Q). Material claims are nested: only under a rejected parent.
+alpha reallocation). The step-down runs on the RAW p-values (ties: the family order); each hypothesis's
+active level alpha / (m - i) and whether the step-down reached it come from that order, never from the
+plateaued adjusted values. family_decision is authoritative (nominal 0.01 flags never substitute). The
+reciprocal-directional headline needs both H-P and H-Q rejected under Holm; its p is max(adjusted p_P,
+adjusted p_Q). Material claims are nested: only under a rejected parent.
+
+NUMERICAL FAILURES. Every bootstrap draw is validated: a failed or nonfinite estimate or SE makes the
+analysis unavailable (with the failing draw); only a genuine zero SE with a finite estimate takes the
+0 / +inf / -inf convention. A constant sample has se 0 exactly (mean_se).
 
 CROSSED SOURCES (H.7). Bootstrap multiplicities m_w of the drawn root worlds: a within-world record
 weighs m_w (not m_w^2), a cross-world record m_u m_v, a record against a frozen external reference
@@ -61,6 +71,7 @@ DETECT_ALPHA = 0.01
 DELTA_P = math.log(1.10)
 DELTA_Q = 0.02
 DELTA_C = 0.02
+BOUND_ALPHA = 0.01           # H.5's reported one-sided 99% lower bounds (fixed, not the decision level)
 CPU_CEILING_H = 96.0
 CPU_RESERVE_H = 6.0
 PANELS = 24_000
@@ -195,12 +206,19 @@ def acceptance(k, n, limit=0.02):
 
 def critical_value(null_scores, level=0.99):
     """The development critical value: the plus-one `level` order statistic ceil(level (n + 1))."""
+    if any(isinstance(x, float) and math.isnan(x) for x in null_scores):
+        raise StatsError("a NaN null score")
     s = sorted(null_scores)
     return s[min(len(s), math.ceil(level * (len(s) + 1) - 1e-12)) - 1]
 
 
 def model_p(s, strata):
-    """max over strata of (1 + #{null >= s}) / (N + 1)."""
+    """max over strata of (1 + #{null >= s}) / (N + 1). A NaN observed score or null score is a numerical
+    failure (StatsError: the analysis is unavailable), never the minimum p-value (#68 review 3)."""
+    if s is None or (isinstance(s, float) and math.isnan(s)):
+        raise StatsError("a NaN (or missing) observed score has no model p-value")
+    if any(isinstance(x, float) and math.isnan(x) for v in strata.values() for x in v):
+        raise StatsError("a NaN null score")
     return max((1 + sum(x >= s for x in v)) / (len(v) + 1) for v in strata.values())
 
 
@@ -211,11 +229,30 @@ def cpu_targets():
 
 # ================================================================== H-P / H-Q world resampling
 def mean_se(values):
-    """est() for a mean of per-world contributions: (mean, sd / sqrt(n))."""
+    """est() for a mean of per-world contributions: (mean, sd / sqrt(n)). A CONSTANT sample (every
+    value identical, exactly) has se 0 exactly (#68 review 2: a rounded mean must not invent a tiny
+    positive spread); otherwise the two-pass variance on the correctly rounded mean (math.fsum)."""
     n = len(values)
-    m = sum(values) / n
-    v = sum((x - m) ** 2 for x in values) / (n - 1) if n > 1 else 0.0
+    if n == 0:
+        raise StatsError("no values")
+    first = values[0]
+    if all(x == first for x in values):
+        return float(first), 0.0
+    m = math.fsum(values) / n
+    v = math.fsum((x - m) ** 2 for x in values) / (n - 1) if n > 1 else 0.0
     return m, math.sqrt(v / n)
+
+
+def _draw_ok(th, s):
+    return isinstance(th, (int, float)) and isinstance(s, (int, float)) and math.isfinite(th) and math.isfinite(s) \
+        and s >= 0
+
+
+def _tstar(th, s, theta):
+    """The studentized draw; a genuine zero SE (finite estimate) by the registered convention."""
+    if s > 0:
+        return (th - theta) / s
+    return 0.0 if th == theta else (math.inf if th > theta else -math.inf)
 
 
 def cluster_test(units, est, draws=B_BOOT, rng=None, null=0.0, delta=None, key=None):
@@ -238,12 +275,16 @@ def cluster_test(units, est, draws=B_BOOT, rng=None, null=0.0, delta=None, key=N
         return {"available": False, "reason": "the original standard error is 0", "estimate": theta}
     T = (theta - null) / se
     ts = []
-    for _ in range(draws):
-        th, s = est([units[rng.below(n)] for _ in range(n)])
-        if s > 0:
-            ts.append((th - theta) / s)
-        else:
-            ts.append(0.0 if th == theta else (math.inf if th > theta else -math.inf))
+    for b in range(draws):
+        try:
+            th, s = est([units[rng.below(n)] for _ in range(n)])
+        except (ValueError, ArithmeticError, StatsError) as e:
+            return {"available": False, "reason": f"bootstrap draw {b}: estimation failed: {e}", "failed_draw": b,
+                    "estimate": theta}
+        if not _draw_ok(th, s):                 # (#68 review 3: a failure, never a non-exceedance)
+            return {"available": False, "reason": f"bootstrap draw {b}: a nonfinite estimate or SE ({th}, {s})",
+                    "failed_draw": b, "estimate": theta}
+        ts.append(_tstar(th, s, theta))
     srt = sorted(ts)
     out = {"available": True, "estimate": theta, "se": se, "n": n, "T": T, "null": null, "draws": draws,
            "retained": len(ts), "p": (1 + sum(t >= T for t in ts)) / (draws + 1),
@@ -261,24 +302,34 @@ def cluster_test(units, est, draws=B_BOOT, rng=None, null=0.0, delta=None, key=N
     df = n - 1
     out["t_sensitivity"] = {"df": df, "p": t_sf(T, df),
                             "CI95": [theta - t_ppf(0.975, df) * se, theta + t_ppf(0.975, df) * se]}
-    loo = [est(units[:i] + units[i + 1:])[0] for i in range(n)]
-    out["leave_one_out"] = {"min": min(loo), "max": max(loo), "max_influence": max(abs(x - theta) for x in loo)}
+    try:
+        loo = [est(units[:i] + units[i + 1:])[0] for i in range(n)]
+        if not all(math.isfinite(x) for x in loo):
+            raise StatsError("a nonfinite leave-one-out estimate")
+        out["leave_one_out"] = {"min": min(loo), "max": max(loo), "max_influence": max(abs(x - theta) for x in loo)}
+    except (ValueError, ArithmeticError, StatsError) as e:      # (a sensitivity: reported, never deciding)
+        out["leave_one_out"] = {"available": False, "reason": str(e)}
     return out
 
 
 def cluster_interval(units, est, draws=B_BOOT, rng=None, level=0.95):
-    """Percentile and bootstrap-t intervals (the percentile one is secondary)."""
+    """Percentile and bootstrap-t intervals (the percentile one is secondary). A failed or nonfinite
+    estimate (original or drawn) makes the interval unavailable."""
     n = len(units)
     rng = rng or rqlib.SplitMix64(0)
     theta, se = est(units)
+    if not _draw_ok(theta, se):
+        return {"available": False, "reason": "a nonfinite estimate or SE"}
     ths, ts = [], []
-    for _ in range(draws):
+    for b in range(draws):
         th, s = est([units[rng.below(n)] for _ in range(n)])
+        if not _draw_ok(th, s):
+            return {"available": False, "reason": f"bootstrap draw {b}: a nonfinite estimate or SE", "failed_draw": b}
         ths.append(th)
-        ts.append((th - theta) / s if s > 0 else (0.0 if th == theta else math.copysign(math.inf, th - theta)))
+        ts.append(_tstar(th, s, theta))
     a = (1.0 - level) / 2.0
     sth, sts = sorted(ths), sorted(ts)
-    return {"estimate": theta, "se": se, "level": level, "percentile": [Q(sth, a), Q(sth, 1 - a)],
+    return {"available": True, "estimate": theta, "se": se, "level": level, "percentile": [Q(sth, a), Q(sth, 1 - a)],
             "bootstrap_t": [theta - Q(sts, 1 - a) * se, theta - Q(sts, a) * se], "draws": draws}
 
 
@@ -330,16 +381,14 @@ def t_stat(xs):
 
 def signflip_p(D, w=None):
     """The one-sided positive (weighted) Fisher-Pitman sign-flip p-value of T = sum w_b D_b:
-    #{e: sum e_b w_b D_b >= T} / 2^n, by enumeration (ties count). w None: equal weights."""
+    #{e: sum e_b w_b D_b >= T} / 2^n, by enumeration (ties count). w None: equal weights.
+    TIES ARE EXACT (#68 review 12): sum e x >= sum x  <=>  sum over the flipped set I of x_b <= 0, and the
+    sign of that sum is read from math.fsum (correctly rounded: its sign is the exact sum's), x_b =
+    w_b D_b; the inversion (signflip_lower) uses the same rule, so p and the bound agree exactly."""
     n = len(D)
     w = [1.0] * n if w is None else list(w)
     x = [wi * di for wi, di in zip(w, D)]
-    obs = sum(x)
-    tol = 1e-12 * max(1.0, sum(abs(v) for v in x))
-    k = 0
-    for mask in range(2 ** n):
-        s = sum(-v if mask >> i & 1 else v for i, v in enumerate(x))
-        k += s >= obs - tol
+    k = sum(math.fsum(x[i] for i in range(n) if mask >> i & 1) <= 0.0 for mask in range(2 ** n))
     return k, 2 ** n, k / 2 ** n
 
 
@@ -352,8 +401,8 @@ def signflip_lower(D, alpha=DETECT_ALPHA, w=None):
     k = math.floor(alpha * 2 ** n + 1e-12) - 1
     if k < 0:
         return -math.inf
-    means = sorted(sum(w[i] * x for i, x in enumerate(D) if mask >> i & 1)
-                   / sum(w[i] for i in range(n) if mask >> i & 1) for mask in range(1, 2 ** n))
+    means = sorted(math.fsum(w[i] * x for i, x in enumerate(D) if mask >> i & 1)
+                   / math.fsum(w[i] for i in range(n) if mask >> i & 1) for mask in range(1, 2 ** n))
     return means[k]
 
 
@@ -379,17 +428,23 @@ def hc_test(deltas, alpha=DETECT_ALPHA, delta=DELTA_C, weights=None):
     pC = max(pA, pB)
     mA = signflip_p([x - delta for x in DA], WA)[2]
     mB = signflip_p([x - delta for x in DB], WB)[2]
-    LA, LB = signflip_lower(DA, alpha, WA), signflip_lower(DB, alpha, WB)
+    # H.5's REPORTED bounds are 99% whatever the decision level (#68 review 9); bounds at the active
+    # decision level are reported beside them, with their own confidence level
+    LA, LB = signflip_lower(DA, BOUND_ALPHA, WA), signflip_lower(DB, BOUND_ALPHA, WB)
+    AA, AB = signflip_lower(DA, alpha, WA), signflip_lower(DB, alpha, WB)
     floor = 1.0 / N
     return {"available": True, "blocks": blocks, "n_blocks": n, "patterns": N, "alpha": alpha,
             "weights": {"A": WA, "B": WB},
             "estimate_A": eA, "estimate_B": eB, "t_A": t_stat(DA), "t_B": t_stat(DB),
             "tail_A": kA, "tail_B": kB, "p_A": pA, "p_B": pB, "p": pC, "p_floor": floor,
-            "alpha_attainable": floor <= alpha, "reject": pC <= alpha and eA > 0 and eB > 0,
+            "alpha_attainable": floor <= alpha, "reject_at_alpha": pC <= alpha and eA > 0 and eB > 0,
+            "reject": pC <= alpha and eA > 0 and eB > 0,
             "material_points": {"A": eA >= delta, "B": eB >= delta},
-            "p_material": max(mA, mB), "lower99": {"A": LA, "B": LB, "min": min(LA, LB)},
+            "p_material": max(mA, mB), "lower99": {"A": LA, "B": LB, "min": min(LA, LB), "confidence": 0.99},
+            "lower_at_alpha": {"A": AA, "B": AB, "min": min(AA, AB), "confidence": 1.0 - alpha},
             "note": None if floor <= alpha else
-            f"with {n} usable blocks the smallest attainable one-sided p is {floor:g} > {alpha}: H-C cannot reject"}
+            f"with {n} usable blocks the smallest attainable one-sided p is {floor:g} > {alpha}: H-C cannot reject "
+            "at this level"}
 
 
 # ================================================================== multiplicity
@@ -399,21 +454,37 @@ def holm(pvals, alpha=FAMILY_ALPHA, family=HYPOTHESES):
     "reject", "unavailable"}."""
     m = len(family)
     p = {h: (1.0 if pvals.get(h) is None else float(pvals[h])) for h in family}
-    order = sorted(family, key=lambda h: (p[h], family.index(h)))
+    if any(math.isnan(v) for v in p.values()):
+        raise StatsError("a NaN p-value in the Holm family")
+    order = sorted(family, key=lambda h: (p[h], family.index(h)))        # (the RAW step-down order)
     adj, run = {}, 0.0
+    level, reached, going = {}, {}, True
     for i, h in enumerate(order):
         run = max(run, min(1.0, (m - i) * p[h]))
         adj[h] = run
-    return {"adjusted": adj, "reject": {h: adj[h] <= alpha for h in family},
+        level[h] = alpha / (m - i)
+        reached[h] = going                       # (every hypothesis before it was rejected)
+        going = going and p[h] <= level[h]
+    return {"adjusted": adj, "reject": {h: adj[h] <= alpha for h in family}, "raw": p, "order": order,
+            "level": level, "reached": reached,
             "unavailable": sorted(h for h in family if pvals.get(h) is None), "alpha": alpha}
 
 
 def active_level(h, hyp):
-    """The Holm level at which hyp is tested: alpha / (m - i), i = its position in the step-down order
-    (its decision is Holm's; an earlier non-rejection stops the procedure before it)."""
-    m = len(h["adjusted"])
-    order = sorted(h["adjusted"], key=lambda x: (h["adjusted"][x], HYPOTHESES.index(x)))
-    return h["alpha"] / (m - order.index(hyp))
+    """The Holm level at which hyp is tested: alpha / (m - i), i = its position in the RAW p-value
+    step-down order (#68 review 1: adjusted p-values plateau and lose that order). Whether the step-down
+    reached it at all is h["reached"][hyp]; the decision is always Holm's (family_decision)."""
+    return h["level"][hyp]
+
+
+def family_decision(h, hc=None):
+    """The authoritative primary decisions: Holm's rejections (no nominal 0.01 flag substitutes); H-C
+    additionally needs both weighted estimates positive (its one-sided intersection-union direction)."""
+    out = dict(h["reject"])
+    if "H-C" in out:
+        out["H-C"] = bool(out["H-C"] and hc is not None and hc.get("available")
+                          and hc["estimate_A"] > 0 and hc["estimate_B"] > 0)
+    return out
 
 
 def reciprocal_directional(h):
@@ -431,14 +502,20 @@ def source_weight(m, u, v):
     return m.get(u, 0) * m.get(v, 0)
 
 
-def crossed_mean_draws(records, draws=B_BOOT, rng=None):
+def crossed_mean_draws(records, draws=B_BOOT, rng=None, undefined="fail"):
     """Resampled weighted means of records [(prey world, predator world or None, value)]: the union of
-    root worlds drawn once per draw, each record weighted by source_weight -> (full mean, [means])."""
+    root worlds drawn once per draw, each record weighted by source_weight -> (full mean, [means]).
+    A draw whose records all weigh 0 (e.g. one edge w1 -> w2 and a draw of w1 twice) has NO mean: the
+    draw vector is never silently shortened (#68 review 10). undefined="fail": StatsError (the analysis
+    is unavailable); "-inf": the draw is kept as -inf (the prospectively registered treatment for a
+    LOWER bound: an undefined draw can only lower it, as recovery.crossed_lb does)."""
+    if undefined not in ("fail", "-inf"):
+        raise StatsError(f"undefined={undefined!r}")
     ws = sorted({u for u, _, _ in records} | {v for _, v, _ in records if v is not None})
     full = sum(x for _, _, x in records) / len(records)
     rng = rng or rqlib.SplitMix64(0)
     out = []
-    for _ in range(draws):
+    for b in range(draws):
         m = {}
         for _i in range(len(ws)):
             w = ws[rng.below(len(ws))]
@@ -450,4 +527,8 @@ def crossed_mean_draws(records, draws=B_BOOT, rng=None):
             den += wt
         if den > 0:
             out.append(num / den)
+        elif undefined == "-inf":
+            out.append(-math.inf)
+        else:
+            raise StatsError(f"crossed draw {b}: every record weighs 0 (an undefined resampled mean)")
     return full, out

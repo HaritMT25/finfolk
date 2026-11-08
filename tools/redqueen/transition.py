@@ -34,9 +34,15 @@ model p-value <= 0.01, c_T = max(log 600, the development critical value).
 
 CLASSIFICATION (reporting; bounds at a = 1/600, the guard's component level). ARD: L(beta_P),
 L(beta_Q) > 0 and U(E^U_C) < d_C^2, U(E^U_Q) < d_Q^2. FSD: the epoch gate, L(E^F_C) > d_C^2,
-L(E^F_Q) > d_Q^2 AND directional equivalence (-delta < L, U < delta for both slopes). Material
-recurrence without directional equivalence: "mixed" (its directional part "material" when a bound
-excludes the band, else "unresolved"). Otherwise "unresolved".
+L(E^F_Q) > d_Q^2 AND directional equivalence (-delta < L, U < delta for both slopes). "mixed" needs
+AFFIRMATIVE evidence of both: material recurrence (the bounds and the epoch gate) and material
+directional change (a bound outside the equivalence band). Everything else, including recurrence
+with directional bounds spanning the band, or bounds without a passed gate, is "unresolved".
+
+IDENTITIES. Worlds are paired across epochs BY ID: every epoch holds the same unique world ids
+(WorldDesign.id), the slopes and the reference-source loadings are keyed by id; all are put in one
+canonical (sorted) order before the paired draws. A NaN draw or margin is a numerical failure: the
+analysis is unavailable with its error, never a non-exceedance.
 """
 from __future__ import annotations
 
@@ -128,19 +134,26 @@ def world_epoch(wd, y, loads, xi):
     r2 = {h: np.full((len(P_all), B), np.nan) for h in "CQ"}
     for h in "CQ":
         rd = wd.ref[h]
-        yh = np.asarray(y["ref"][h], float)[rd.mask] if hasattr(rd, "proj") else None
+        if not hasattr(rd, "proj") or not any(static):
+            continue
+        yh = np.asarray(y["ref"][h], float)[rd.mask]
         Lh = loads.get(h) if loads else None
-        Lm = np.asarray(Lh, float)[rd.mask] if (Lh is not None and yh is not None) else None
+        Lm = np.asarray(Lh, float)[rd.mask] if Lh is not None else None
+
+        def lin(op):                       # op y + (op L) xi_b for every draw b -> (..., B)
+            base = op @ yh
+            if Lm is None:
+                return np.repeat(np.asarray(base, float)[..., None], B, axis=-1)
+            return np.asarray(base, float)[..., None] + np.asarray(op @ Lm) @ xi.T
+        rho, den = lin(rd.rbar), lin(rd.mean_op)                 # (period-free: once per readout)
+        cs = np.vstack([np.zeros((1, B)), np.cumsum(rho, axis=0)])
         for i, P in enumerate(P_all):
             if not static[i]:
                 continue
             hm = rd.harm[P]
-            def lin(op):                   # op y + (op L) xi_b for every draw b -> (..., B)
-                base = op @ yh
-                if Lm is None:
-                    return np.repeat(np.asarray(base, float)[..., None], B, axis=-1)
-                return np.asarray(base, float)[..., None] + np.asarray(op @ Lm) @ xi.T
-            a, dbar, rho, den = lin(hm.aop), lin(hm.dbar), lin(rd.rbar), lin(rd.mean_op)
+            b = hm.Sqinv @ lin(hm.WQ.T)                          # 2 x B (the stable basis)
+            a = hm.Rinv @ b
+            dbar = hm.avgQ @ b
             A = np.hypot(a[0], a[1])
             phi = np.arctan2(a[1], a[0])
             ms = np.mean(dbar ** 2, axis=0) if len(dbar) else np.zeros(B)
@@ -148,10 +161,7 @@ def world_epoch(wd, y, loads, xi):
                 r2[h][i] = np.where(den > 0, ms / np.where(den > 0, den, 1.0) ** 2, np.inf)
             else:
                 r2[h][i] = ms
-            tab = rd.tables[P]
-            seg, kk, ok = tab.lookup(phi)
-            cs = np.vstack([np.zeros((1, B)), np.cumsum(rho, axis=0)])
-            lo, hi = tab.lo[seg], tab.hi[seg]                                   # B x 5
+            lo, hi, kk, ok = rd.tables[P].lookup(phi)                         # B x 5 (chain() exactly)
             cols = np.arange(B)[:, None]
             cnt = np.maximum(hi - lo, 1)
             v = (cs[hi, cols] - cs[lo, cols]) / cnt                             # B x 5
@@ -233,10 +243,17 @@ def candidates():
 
 
 def tail_p(m, draws):
-    """p_m = (1 + #{m*_b - m >= m}) / (B + 1) (ties count)."""
+    """p_m = (1 + #{m*_b - m >= m}) / (B + 1) (ties count). A NaN draw (or observed margin) is a
+    numerical failure, never a non-exceedance (#68 review 3): TransitionError (the analysis is then
+    unavailable). Signed infinities are values (an unsupported E^U draw is +inf by definition)."""
     d = np.asarray(draws, float)
+    if not math.isfinite(m) or np.isnan(d).any():
+        raise TransitionError(f"a nonfinite margin or NaN bootstrap draw ({int(np.isnan(d).sum())} of {len(d)})")
     with np.errstate(invalid="ignore"):
-        return (1 + int(np.sum((d - m) >= m))) / (len(d) + 1)
+        x = d - m
+    if np.isnan(x).any():                      # (inf - inf cannot arise: m is finite)
+        raise TransitionError("a NaN centred draw")
+    return (1 + int(np.sum(x >= m))) / (len(d) + 1)
 
 
 def candidate_scores(obs, draws, gates):
@@ -275,10 +292,34 @@ def basic_bounds(theta, draws, a=LEVEL):
     return theta - stats.Q(d, 1 - a), theta - stats.Q(d, a)
 
 
+def canonical_ids(epochs, betas, loads=None):
+    """The world ids of an H-T analysis, validated (#68 review 11): unique within every epoch, the same
+    set in every epoch, slopes keyed by exactly those ids, loadings only for them -> sorted ids."""
+    sets = {}
+    for e in EPOCHS:
+        ws = [wd.id for wd, _ in epochs[e]]
+        if len(set(ws)) != len(ws):
+            raise TransitionError(f"{e}: a world id occurs twice")
+        sets[e] = set(ws)
+    ids = sorted(sets[EPOCHS[0]], key=str)
+    for e in EPOCHS:
+        if sets[e] != set(ids):
+            raise TransitionError(f"{e}: the same qualifying worlds (by id) must enter every epoch")
+        for h in ("P", "Q"):
+            b = betas[e][h]
+            if not isinstance(b, dict) or set(b) != set(ids):
+                raise TransitionError(f"{e}: the {h} slopes must be keyed by exactly the epoch's world ids")
+    if loads is not None and not set(loads) <= set(ids):
+        raise TransitionError("reference-source loadings for worlds that are not in the analysis")
+    return ids
+
+
 def classify(obs_e, draws_e, gate, a=LEVEL):
     """An epoch's dominance class (reporting): "ARD", "FSD", "mixed" or "unresolved"."""
     if draws_e is None:
         return {"class": "unresolved", "reason": "no bootstrap draws"}
+    if any(np.isnan(np.asarray(draws_e[k], float)).any() for k in KEYS):
+        return {"class": "unresolved", "reason": "a NaN bootstrap draw (a numerical failure)"}
     b = {k: basic_bounds(obs_e[k], draws_e[k], a) for k in KEYS}
     ard = b["beta_P"][0] > 0 and b["beta_Q"][0] > 0 and b["EU_C"][1] < D_C ** 2 and b["EU_Q"][1] < D_Q ** 2
     rec = b["EF_C"][0] > D_C ** 2 and b["EF_Q"][0] > D_Q ** 2
@@ -288,13 +329,15 @@ def classify(obs_e, draws_e, gate, a=LEVEL):
                     or b["beta_Q"][0] > DELTA_Q or b["beta_Q"][1] < -DELTA_Q)
     out = {"bounds": {k: list(v) for k, v in b.items()},
            "rms_bounds": {k: [math.sqrt(max(v[0], 0.0)), math.sqrt(max(v[1], 0.0)) if math.isfinite(v[1]) else math.inf]
-                          for k, v in b.items() if k.startswith("E")}}
+                          for k, v in b.items() if k.startswith("E")},
+           "recurrent": bool(rec and gate), "recurrence_bounds": bool(rec), "gate": bool(gate),
+           "directional": "equivalent" if equiv else "material" if material_dir else "unresolved"}
     if ard:
         out["class"] = "ARD"
     elif rec and gate and equiv:
         out["class"] = "FSD"
-    elif rec:
-        out.update({"class": "mixed", "directional": "material" if material_dir else "unresolved"})
+    elif rec and gate and material_dir:        # (#68 review 8: AFFIRMATIVE recurrent and directional evidence)
+        out["class"] = "mixed"
     else:
         out["class"] = "unresolved"
     return out
@@ -302,21 +345,35 @@ def classify(obs_e, draws_e, gate, a=LEVEL):
 
 def ht(epochs, betas, gates, loads=None, k=0, analysis="main", draws=stats.B_BOOT, c_T=GUARD, p_model=None,
        report=True):
-    """The complete H-T analysis. epochs: {e: [(WorldDesign for e, responses y)] in registry order (the
-    same worlds in every epoch)}; betas: {e: {"P": [...], "Q": [...]}}; gates: {e: the epoch's calibrated
-    recurrence-detection gate (bool)}; loads: {world index: {"C": L, "Q": L}} reference-source loadings
-    (k columns). Bootstrap draws are computed when a candidate is eligible or report is set."""
-    n = len(epochs[EPOCHS[0]])
-    if any(len(epochs[e]) != n for e in EPOCHS):
-        raise TransitionError("the same qualifying worlds must enter every epoch")
+    """The complete H-T analysis. epochs: {e: [(WorldDesign for e, responses y)]} (the same unique world
+    ids in every epoch, any order); betas: {e: {"P": {world id: slope}, "Q": {world id: slope}}}; gates:
+    {e: the epoch's calibrated recurrence-detection gate (bool)}; loads: {world id: {"C": L, "Q": L}}
+    reference-source loadings (k columns). Bootstrap draws are computed when a candidate is eligible or
+    report is set."""
+    ids = canonical_ids(epochs, betas, loads)
+    n = len(ids)
+    for e in EPOCHS:                                   # (canonical order: one index = one world everywhere)
+        by = {wd.id: (wd, y) for wd, y in epochs[e]}
+        epochs = dict(epochs, **{e: [by[w] for w in ids]})
+    bet = {e: {h: [float(betas[e][h][w]) for w in ids] for h in ("P", "Q")} for e in EPOCHS}
+    bad = [f"{e}/{h}/{w}" for e in EPOCHS for h in ("P", "Q") for w, v in zip(ids, bet[e][h]) if not math.isfinite(v)]
+    if bad:
+        return {"available": False, "reject": False, "T_T": None, "error": f"nonfinite slopes: {bad[:5]}",
+                "winner": None, "candidates": [], "worlds": ids, "c_T": max(GUARD, c_T), "p_model": p_model,
+                "phase_support": {}, "EU_unsupported": {}}
     idx, xi = draw_streams(analysis, n, k, draws)
-    per = {e: [world_epoch(wd, y, (loads or {}).get(i), xi) for i, (wd, y) in enumerate(epochs[e])] for e in EPOCHS}
+    per = {e: [world_epoch(wd, y, (loads or {}).get(w), xi) for w, (wd, y) in zip(ids, epochs[e])] for e in EPOCHS}
     obs, dr, res = {}, {}, {}
     for e in EPOCHS:
-        obs[e], dr[e], res[e] = epoch_components(per[e], betas[e], idx)
-    stat = ht_statistic(obs, dr, gates)
+        obs[e], dr[e], res[e] = epoch_components(per[e], bet[e], idx)
+    try:
+        stat = ht_statistic(obs, dr, gates)
+    except TransitionError as err:
+        return {"available": False, "reject": False, "T_T": None, "error": str(err), "winner": None,
+                "candidates": [], "components": obs, "c_T": max(GUARD, c_T), "p_model": p_model, "worlds": ids,
+                "phase_support": {e: res[e]["phase_support"] for e in EPOCHS}, "EU_unsupported": {}}
     c_T = max(GUARD, c_T)
-    out = {"T_T": stat["T_T"], "c_T": c_T, "p_model": p_model, "winner": stat["winner"],
+    out = {"T_T": stat["T_T"], "c_T": c_T, "p_model": p_model, "winner": stat["winner"], "worlds": ids,
            "candidates": stat["candidates"], "components": obs, "available": all(res[e]["available"] for e in EPOCHS),
            "reject": stat["T_T"] > c_T and p_model is not None and p_model <= stats.DETECT_ALPHA,
            "phase_support": {e: res[e]["phase_support"] for e in EPOCHS},

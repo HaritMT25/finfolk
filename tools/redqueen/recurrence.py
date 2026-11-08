@@ -25,8 +25,9 @@ A candidate is supported for a world only when ALL SIX rules hold, for both read
   3 every time used in a reversal window has all four references measured (the windows use only the
     common times);
   4 the within-world lag phases 2 pi (t_j - t_i) / P cover the circle with no gap > pi/2 (+1e-10);
-  5 M_X H_P has rank two, within the world and on the reference panel (smaller / larger singular value
-    in the W metric >= 1e-10);
+  5 M_X H_P has rank two, within the world and on the reference panel: its smaller / larger singular
+    value >= 1e-10 (Annex H's metric: the singular values of the n x 2 matrix M_X H_P itself, from its
+    QR factor; the fit then works in that orthonormal basis, never inverting H'W M_X H);
   6 PHASE-CONDITIONAL (the coordinator's pre-seal decision, 2026-11-07): the five-window chain of H.3.5
     can be constructed AT THE FITTED PHASE of each readout's reference panel. A candidate whose chain
     exists only for some phases (the full-history 90-100M and the epoch 25M candidates on the real
@@ -82,6 +83,7 @@ RANK_TOL = 1e-10
 PHASE_TOL = 1e-10
 CLAMP_TOL = 1e-10
 WIN_EPS = 1e-9           # closed windows |t - c| <= P/8 (M; float safety only)
+BP_TOL = 1e-7            # a phase this close (in M of window centre) to a window-boundary crossing: scalar chain()
 RIDGE = 1e-8
 D_C, D_Q = 0.10, 0.04
 TRIALS = 600
@@ -137,16 +139,24 @@ class Cov:
             if np.any(dd <= 0):
                 raise RecurrenceError("a structured bank covariance needs a positive cell diagonal")
             self.dinv = 1.0 / dd
-            if self.U is not None and self.U.shape[1]:
-                DU = self.U * self.dinv[:, None]
-                Kc = _chol(np.eye(self.U.shape[1]) + self.U.T @ DU)
-                Ki = _chol_solve(Kc, np.eye(Kc.shape[0]))
-                self.M = DU @ ((Ki + Ki.T) / 2)          # W A = D^-1 A - M (U' D^-1 A)
-            else:
+            self._M = None                               # (the Woodbury factor: built on first use, q33)
+            if self.U is None or not self.U.shape[1]:
                 self.U = None
+
+    @property
+    def M(self):
+        """W A = D^-1 A - M (U' D^-1 A): built once, when first needed (a bank only subset never pays)."""
+        if self._M is None:
+            DU = self.U * self.dinv[:, None]
+            Kc = _chol(np.eye(self.U.shape[1]) + self.U.T @ DU)
+            Ki = _chol_solve(Kc, np.eye(Kc.shape[0]))
+            self._M = DU @ ((Ki + Ki.T) / 2)
+        return self._M
 
     def subset(self, mask):
         mask = np.asarray(mask, bool)
+        if mask.all():                                   # (the whole bank: no refactorization)
+            return self
         if self.V is not None:
             return Cov(dense=self.V[np.ix_(mask, mask)])
         return Cov(self.d[mask], None if self.U is None else self.U[mask])
@@ -167,31 +177,70 @@ class Cov:
 
 # ================================================================== Frisch-Waugh-Lovell
 class Harmonic:
-    """One period's projection operators: G = W M_X H (n x 2), S = H'W M_X H, M_X H; rank ratio."""
+    """One period's operators in a STABLE basis (#68 review 4). MH = M_X H (n x 2); rule 5 on its
+    singular values (the registered rank metric: s_min / s_max >= 1e-10, unweighted), computed from the
+    triangular factor of the thin QR MH = Q R (Householder: backward stable). Fitting never inverts
+    H'W M_X H: with WQ = W Q and the 2 x 2 positive-definite Sq = Q'W Q (its condition is W's on the
+    plane, whatever MH's), for any y: c = WQ'y (= Q'W M_X y, since W M_X = M_X'W and M_X Q = Q),
+    b = Sq^-1 c, J = c'b / 2 (= q'S^-1 q / 2, basis-free), Delta = Q b (= M_X H a), a = R^-1 b."""
 
-    def __init__(self, proj, H):
-        self.H = H
-        WH = proj.cov.wmul(H)
-        C = proj.Ginv @ (proj.WX.T @ H)
-        self.G = WH - proj.WX @ C
-        S = H.T @ self.G
-        self.S = (S + S.T) / 2
-        self.MH = H - proj.X @ C
-        ev = np.linalg.eigvalsh(self.S)
-        self.ratio = math.sqrt(max(ev[0], 0.0) / ev[1]) if ev[1] > 0 else 0.0
-        self.rank2 = self.ratio >= RANK_TOL
-        self.Sinv = np.linalg.inv(self.S) if self.rank2 else None
+    def __init__(self, MH, Q, R, WQ, sv):
+        self.MH, self.Q, self.R, self.WQ = MH, Q, R, WQ
+        self.sv = sv
+        self.ratio = float(sv[1] / sv[0]) if sv[0] > 0 else 0.0
+        self.rank2 = bool(np.isfinite(self.ratio) and self.ratio >= RANK_TOL)
+        self.Sqinv = self.Rinv = None
+        if self.rank2:
+            Sq = Q.T @ WQ
+            Sq = (Sq + Sq.T) / 2
+            self.Sqinv = np.linalg.solve(Sq, np.eye(2))
+            self.Sqinv = (self.Sqinv + self.Sqinv.T) / 2
+            self.Rinv = np.linalg.solve(R, np.eye(2))
+        self._aop = self._dbar = None
+        self.avgQ = None                     # (a reference design's: the four-reference average of Q)
+
+    @property
+    def dbar(self):
+        """y -> the four-reference average Delta (n_t x n; a reference design's harmonic)."""
+        if self._dbar is None:
+            self._dbar = self.avgQ @ self.Sqinv @ self.WQ.T
+        return self._dbar
+
+    @property
+    def S(self):
+        """H'W M_X H (= MH'W MH = R'Sq R), for checks."""
+        S = self.R.T @ (self.Q.T @ self.WQ) @ self.R
+        return (S + S.T) / 2
+
+    def coords(self, y):
+        """-> (c, b) for one response vector, or (2, ...) arrays for a matrix of them."""
+        c = self.WQ.T @ y
+        return c, self.Sqinv @ c
+
+    def score(self, y):
+        """J alone (the within-world readout: no n-vector is formed)."""
+        c, b = self.coords(y)
+        return _clamp(0.5 * float(c @ b))
 
     def fit(self, y):
         """-> (a (2,), J, Delta = M_X H a)."""
-        q = self.G.T @ y
-        a = self.Sinv @ q
-        J = 0.5 * float(q @ a)
-        if J < 0:
-            if J < -CLAMP_TOL:
-                raise RecurrenceError(f"a negative recurrence score J = {J} (an implementation failure)")
-            J = 0.0
-        return a, J, self.MH @ a
+        c, b = self.coords(y)
+        return self.Rinv @ b, _clamp(0.5 * float(c @ b)), self.Q @ b
+
+    @property
+    def aop(self):
+        """y -> a (2 x n)."""
+        if self._aop is None:
+            self._aop = self.Rinv @ self.Sqinv @ self.WQ.T
+        return self._aop
+
+
+def _clamp(J):
+    if J < 0:
+        if J < -CLAMP_TOL:
+            raise RecurrenceError(f"a negative recurrence score J = {J} (an implementation failure)")
+        return 0.0
+    return J
 
 
 class Projector:
@@ -207,7 +256,25 @@ class Projector:
         return self.X @ (self.Ginv @ (self.WX.T @ y))
 
     def harmonic(self, H):
-        return Harmonic(self, H)
+        return self.harmonics([H])[0]
+
+    def harmonics(self, Hs=None, H=None):
+        """Every period's Harmonic in one pass (one nuisance projection, one batched QR, one Woodbury
+        solve for all periods: #68 / q33's batching; identical operators to the per-period route).
+        Hs: the periods' n x 2 matrices, or H: them stacked (n x 2M)."""
+        if H is None:
+            if not Hs:
+                return []
+            H = np.hstack(Hs)                                      # n x 2M
+        n, M = self.X.shape[0], H.shape[1] // 2
+        if M == 0:
+            return []
+        MH = H - self.X @ (self.Ginv @ (self.WX.T @ H))
+        MH3 = MH.reshape(n, M, 2).transpose(1, 0, 2)               # M x n x 2
+        Q3, R3 = np.linalg.qr(MH3)
+        sv = np.linalg.svd(R3, compute_uv=False)                   # M x 2 (descending)
+        WQ = self.cov.wmul(Q3.transpose(1, 0, 2).reshape(n, 2 * M)).reshape(n, M, 2)
+        return [Harmonic(MH3[m], Q3[m], R3[m], WQ[:, m, :], sv[m]) for m in range(M)]
 
     def joint_fit(self, y, H):
         """The full refit [X, H] in the W metric (an independent route, for the FWL check)."""
@@ -284,10 +351,13 @@ def gate(v, e, R_fit):
 class ChainTable:
     """chain() tabulated over the phase, for vectorized bootstrap draws: the window structure depends on
     u = (phi / omega) mod (P/2) only through finitely many segments between the window-boundary
-    crossings u = (t +- (P/8 + eps)) mod (P/2); each segment holds (k relative to u, windows) or None."""
+    crossings u = (t +- (P/8 + eps)) mod (P/2); each segment holds (k relative to u, windows) or None.
+    AT a crossing the closed window holds the boundary time (membership differs from both open
+    sides): a phase within BP_TOL of a crossing is decided by the scalar chain() itself (#68 review 7),
+    so the table and chain() agree at every phase."""
 
     def __init__(self, times, L, U, P):
-        self.times, self.P = np.asarray(times, float), P
+        self.times, self.P, self.L, self.U = np.asarray(times, float), P, L, U
         half = P / 2
         h = P / 8 + WIN_EPS
         bp = np.sort(np.mod(np.concatenate([self.times - h, self.times + h]), half)) if len(times) else np.array([0.0])
@@ -309,14 +379,33 @@ class ChainTable:
                 self.hi[i] = [b for _, b in ch[1]]
 
     def lookup(self, phi):
-        """phi (B,) -> (segment index (B,), the draw's k (B,), feasible (B,))."""
+        """phi (B,) -> (window starts (B, 5), window ends (B, 5), the draw's k (B,), feasible (B,)): index
+        ranges into the common times, exactly chain()'s (near a crossing: chain() itself)."""
         P, half = self.P, self.P / 2
-        s = np.asarray(phi, float) / (2 * math.pi / P)
+        phi = np.atleast_1d(np.asarray(phi, float))
+        s = np.where(np.isfinite(phi), phi, 0.0) / (2 * math.pi / P)     # (a nonfinite phase: chain() below)
         u = np.mod(s, half)
         u = np.where(u < self.bp[0], u + half, u)                 # (the wrapping segment)
         q = np.rint((s - u) / half).astype(np.int64)
         seg = np.searchsorted(self.bp, u, "right") - 1
-        return seg, self.k[seg] - q, self.ok[seg]
+        lo, hi, k, ok = self.lo[seg].copy(), self.hi[seg].copy(), self.k[seg] - q, self.ok[seg].copy()
+        nxt = np.where(seg + 1 < len(self.bp), self.bp[np.minimum(seg + 1, len(self.bp) - 1)], self.bp[0] + half)
+        near = (np.minimum(u - self.bp[seg], nxt - u) <= BP_TOL) | ~np.isfinite(phi)
+        for b in np.flatnonzero(near):
+            ch = chain(self.times, self.L, self.U, P, float(phi[b]))
+            ok[b] = ch is not None
+            if ch is not None:
+                k[b] = ch[0]
+                lo[b] = [x for x, _ in ch[1]]
+                hi[b] = [y for _, y in ch[1]]
+        return lo, hi, k, ok
+
+    def at(self, phi):
+        """The scalar chain at one phase, (k, [(lo, hi)]) or None: chain()'s result through the table."""
+        lo, hi, k, ok = self.lookup([phi])
+        if not ok[0]:
+            return None
+        return int(k[0]), [(int(a), int(b)) for a, b in zip(lo[0], hi[0])]
 
 
 _TABLES = {}
@@ -333,6 +422,97 @@ def chain_table(times, L, U, P):
     return _TABLES[key]
 
 
+# ================================================================== graph geometry (cached)
+_GEO = {}
+
+
+def _cached(key, build):
+    """Everything about a design that depends on the measured times only (the graph), never on the
+    covariance or the responses, is built once and shared (calibration panels on one graph; q33)."""
+    g = _GEO.get(key)
+    if g is None:
+        if len(_GEO) > 512:
+            _GEO.clear()
+        g = _GEO[key] = build()
+    return g
+
+
+def within_geometry(ti, tj, bounds, periods):
+    """A within-world design's tensor nuisance, stacked harmonics and static support (rules 1, 4)."""
+    def build():
+        L, U = bounds
+        lag = tj - ti
+        span = min(np.ptp(ti), np.ptp(tj))
+        static = {}
+        for P in periods:
+            f = []
+            if not two_cycles(span, P):
+                f.append("1-span")
+            if not quadrants_ok(lag, P):
+                f.append("4-quadrants")
+            static[P] = tuple(f)
+        return {"X": tensor_basis(ti, tj, (L, U)), "static": static,
+                "H": np.hstack([harmonic_matrix(lag, P) for P in periods]) if periods else np.zeros((len(ti), 0))}
+    return _cached(("W", ti.tobytes(), tj.tobytes(), tuple(bounds), tuple(periods)), build)
+
+
+def ref_geometry(t, ref, bounds, periods):
+    """A reference panel's mask, common times, averaging operators, nuisance, stacked harmonics, static
+    support (rules 2, 3) and chain tables (rule 6's phase segments)."""
+    t = np.asarray(t, float)
+    ref = np.asarray(ref, object)
+    key = ("R", t.tobytes(), tuple(str(r) for r in ref.tolist()), tuple(bounds), tuple(periods))
+
+    def build():
+        L, U = bounds
+        mask = (t >= L) & (t <= U)
+        tm, rm = t[mask], ref[mask]
+        refs = sorted(set(rm.tolist()), key=str)
+        out = {"mask": mask, "refs": refs}
+        if len(refs) != 4:
+            return out
+        if len(set(zip(tm.tolist(), rm.tolist()))) != len(tm):
+            raise RecurrenceError("a reference series holds two observations at one time")
+        series = {r: sorted(set(tm[rm == r].tolist())) for r in refs}
+        common = np.array(sorted(set.intersection(*(set(s) for s in series.values()))), float)
+        n, nt = len(tm), len(common)
+        pos = {c: i for i, c in enumerate(common.tolist())}
+        avg = np.zeros((nt, n))
+        for o, tt in enumerate(tm.tolist()):
+            if tt in pos:
+                avg[pos[tt], o] = 0.25
+        eff = np.zeros((n, 3))
+        for k, r in enumerate(refs[:3]):
+            eff[rm == r, k] = 1.0
+        eff[rm == refs[3], :] = -1.0
+        X = np.hstack([backbone.basis(tm, (L, U)), eff])
+        tables = {P: chain_table(common, L, U, P) for P in periods}
+        out.update(t=tm, common=common, avg=avg, X=X, avgX=avg @ X, mean_op=avg.sum(axis=0) / max(nt, 1),
+                   H=np.hstack([harmonic_matrix(tm, P) for P in periods]) if periods else np.zeros((n, 0)),
+                   static={P: ("2-refseries",) if not all(series_ok(s, P) for s in series.values()) else ()
+                           for P in periods},
+                   tables=tables, cond={P: nt > 0 and not bool(np.all(tables[P].ok)) for P in periods})
+        return out
+    return _cached(key, build)
+
+
+def ref_rms(t, ref, cov, scope, P, y):
+    """The reference-panel readout's RMS and capture denominator alone (RefDesign.readout's "rms" and
+    "den", the same operators) without the support machinery: the calibration generator's amplitude
+    solver evaluates it many times per world. -> (rms, den), or None (not four references / rank)."""
+    bounds = scope_bounds(scope)
+    geo = ref_geometry(t, ref, bounds, (float(P),))
+    if len(geo["refs"]) != 4:
+        return None
+    hm = Projector(geo["X"], cov.subset(geo["mask"])).harmonics(H=geo["H"])[0]
+    if not hm.rank2:
+        return None
+    ym = np.asarray(y, float)[geo["mask"]]
+    _, b = hm.coords(ym)
+    dbar = (geo["avg"] @ hm.Q) @ b
+    return (float(np.sqrt(np.mean(dbar ** 2))) if len(dbar) else 0.0), float(geo["mean_op"] @ ym)
+
+
 # ================================================================== designs
 class WithinDesign:
     """One world's within-world matrix for one readout in one scope (rules 1, 4, 5)."""
@@ -341,28 +521,26 @@ class WithinDesign:
         L, U = scope_bounds(scope)
         ti, tj = np.asarray(ti, float), np.asarray(tj, float)
         self.mask = (ti >= L) & (ti <= U) & (tj >= L) & (tj <= U)
-        self.ti, self.tj = ti[self.mask], tj[self.mask]
+        self.ti, self.tj = np.ascontiguousarray(ti[self.mask]), np.ascontiguousarray(tj[self.mask])
         self.harm, self.fails = {}, {}
         if len(self.ti) < 37:
             for P in periods:
                 self.fails[P] = ["0-cells"]
             return
-        self.proj = Projector(tensor_basis(self.ti, self.tj, (L, U)), cov.subset(self.mask))
-        lag = self.tj - self.ti
-        span = min(np.ptp(self.ti), np.ptp(self.tj))
-        for P in periods:
-            f = []
-            if not two_cycles(span, P):
-                f.append("1-span")
-            if not quadrants_ok(lag, P):
-                f.append("4-quadrants")
-            hm = self.proj.harmonic(harmonic_matrix(lag, P))
+        geo = within_geometry(self.ti, self.tj, (L, U), tuple(periods))
+        self.proj = Projector(geo["X"], cov.subset(self.mask))
+        hms = self.proj.harmonics(H=geo["H"])
+        for P, hm in zip(periods, hms):
+            f = list(geo["static"][P])
             if not hm.rank2:
                 f.append("5-rank")
             self.harm[P], self.fails[P] = hm, f
 
-    def J(self, y, P):
-        return self.harm[P].fit(np.asarray(y, float)[self.mask])[1]
+    def masked(self, y):
+        return np.asarray(y, float)[self.mask]
+
+    def J(self, y, P, masked=False):
+        return self.harm[P].score(y if masked else self.masked(y))
 
 
 class RefDesign:
@@ -370,69 +548,54 @@ class RefDesign:
 
     def __init__(self, t, ref, cov, scope, periods):
         L, U = self.L, self.U = scope_bounds(scope)
-        t = np.asarray(t, float)
-        ref = np.asarray(ref, object)
-        self.mask = (t >= L) & (t <= U)
-        t, ref = t[self.mask], ref[self.mask]
-        self.refs = sorted(set(ref.tolist()), key=str)
         self.periods = tuple(periods)
+        geo = ref_geometry(t, ref, (L, U), self.periods)
+        self.mask, self.refs = geo["mask"], geo["refs"]
         self.harm, self.fails, self.cond, self.tables = {}, {}, {}, {}
-        series = {r: sorted(set(t[ref == r].tolist())) for r in self.refs}
         if len(self.refs) != 4:
             for P in periods:
                 self.fails[P] = ["2-references"]
             return
-        if len(set(zip(t.tolist(), ref.tolist()))) != len(t):
-            raise RecurrenceError("a reference series holds two observations at one time")
-        self.common = np.array(sorted(set.intersection(*(set(s) for s in series.values()))), float)
-        n, nt = len(t), len(self.common)
-        pos = {c: i for i, c in enumerate(self.common.tolist())}
-        self.avg = np.zeros((nt, n))
-        for o, (tt, rr) in enumerate(zip(t.tolist(), ref.tolist())):
-            if tt in pos:
-                self.avg[pos[tt], o] = 0.25
-        eff = np.zeros((n, 3))
-        for k, r in enumerate(self.refs[:3]):
-            eff[ref == r, k] = 1.0
-        eff[ref == self.refs[3], :] = -1.0
-        X = np.hstack([backbone.basis(t, (L, U)), eff])
+        self.common, self.avg, self.mean_op, self.t = geo["common"], geo["avg"], geo["mean_op"], geo["t"]
+        X = geo["X"]
         self.proj = Projector(X, cov.subset(self.mask))
-        self.mean_op = self.avg.sum(axis=0) / max(nt, 1)            # mean over the common (t, r) cells
-        self.rbar = self.avg - (self.avg @ X) @ self.proj.Ginv @ self.proj.WX.T   # avg of y - null fit
-        self.t = t
-        for P in periods:
-            f = []
-            if not all(series_ok(s, P) for s in series.values()):
-                f.append("2-refseries")
-            hm = self.proj.harmonic(harmonic_matrix(t, P))
+        self.rbar = self.avg - geo["avgX"] @ self.proj.Ginv @ self.proj.WX.T   # avg of y - null fit
+        hms = self.proj.harmonics(H=geo["H"])
+        for P, hm in zip(periods, hms):
+            f = list(geo["static"][P])
             if not hm.rank2:
                 f.append("5-rank-ref")
             else:
-                hm.aop = hm.Sinv @ hm.G.T                             # y -> a
-                hm.dbar = self.avg @ hm.MH @ hm.aop                   # y -> four-reference average Delta
+                hm.avgQ = self.avg @ hm.Q                             # b -> four-reference average Delta
             self.harm[P], self.fails[P] = hm, f
             # does the chain exist at EVERY phase? If not, rule 6 is phase-conditional for this candidate
             # (reported; the decision is always the fitted phase's). Exact: the chain's phase segments.
-            self.tables[P] = chain_table(self.common, L, U, P)
-            self.cond[P] = nt > 0 and not bool(np.all(self.tables[P].ok))
+            self.tables[P] = geo["tables"][P]
+            self.cond[P] = geo["cond"][P]
 
-    def readout(self, y, P):
+    def prepare(self, y):
+        """The period-free parts of a readout (computed once per response vector, #68 / q33)."""
+        ym = np.asarray(y, float)[self.mask]
+        return {"y": ym, "rho": self.rbar @ ym, "den": float(self.mean_op @ ym)}
+
+    def readout(self, y, P, pre=None):
         """The reference-panel readout at period P: phase, chain (rule 6 at the fitted phase), gate, RMS."""
         hm = self.harm[P]
-        y = np.asarray(y, float)[self.mask]
-        a = hm.aop @ y
+        pre = pre or self.prepare(y)
+        _, b = hm.coords(pre["y"])
+        a = hm.Rinv @ b
         A = math.hypot(a[0], a[1])
         phi = math.atan2(a[1], a[0])
-        dbar = hm.dbar @ y
+        dbar = hm.avgQ @ b
         out = {"phase": phi, "A": A, "rms": float(np.sqrt(np.mean(dbar ** 2))) if len(dbar) else 0.0,
-               "den": float(self.mean_op @ y), "R_fit": float(np.ptp(dbar)) if len(dbar) else 0.0}
-        ch = chain(self.common, self.L, self.U, P, phi) if A > 0 else None
+               "den": pre["den"], "R_fit": float(np.ptp(dbar)) if len(dbar) else 0.0}
+        ch = self.tables[P].at(phi) if A > 0 else None              # (= chain(common, L, U, P, phi))
         out["chain"] = ch is not None
         if ch is None:
             out.update(G=0, reversals=False, returns=False)
             return out
         k, wins = ch
-        rho = self.rbar @ y
+        rho = pre["rho"]
         v = [float(np.mean(rho[lo:hi])) for lo, hi in wins]
         e = [1.0 if (k + j) % 2 == 0 else -1.0 for j in range(5)]
         rev, ret = gate(v, e, out["R_fit"])
@@ -460,16 +623,20 @@ def analyze_world(wd, y):
     vectors in the designs' input order) -> {"periods": [per-candidate records], "phase_support": ...}.
     Support is decided here, the phase-conditional rule 6 at each readout's FITTED phase."""
     recs = []
+    ym, pre = {}, {}                                   # (the period-free parts, once per response vector)
     for P in wd.periods:
         fails = sorted(set(wd.within["C"].fails[P] + wd.within["Q"].fails[P]
                            + wd.ref["C"].fails[P] + wd.ref["Q"].fails[P]))
         rec = {"P": P, "fails": fails, "supported": False, "s": 0.0,
                "phase_conditional": bool(not fails and (wd.ref["C"].cond[P] or wd.ref["Q"].cond[P]))}
         if not fails:
-            rc = wd.ref["C"].readout(y["ref"]["C"], P)
-            rq = wd.ref["Q"].readout(y["ref"]["Q"], P)
-            JC = wd.within["C"].J(y["within"]["C"], P)
-            JQ = wd.within["Q"].J(y["within"]["Q"], P)
+            if not ym:
+                ym = {h: wd.within[h].masked(y["within"][h]) for h in "CQ"}
+                pre = {h: wd.ref[h].prepare(y["ref"][h]) for h in "CQ"}
+            rc = wd.ref["C"].readout(None, P, pre["C"])
+            rq = wd.ref["Q"].readout(None, P, pre["Q"])
+            JC = wd.within["C"].J(ym["C"], P, masked=True)
+            JQ = wd.within["Q"].J(ym["Q"], P, masked=True)
             if not (rc["chain"] and rq["chain"]):
                 fails.append("6-windows")
             if rc["den"] <= 0:

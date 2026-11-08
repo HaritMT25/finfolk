@@ -233,6 +233,101 @@ class TestHC(unittest.TestCase):
         self.assertGreater(stats.signflip_p([x - (L + eps) for x in D8])[2], 0.01)
 
 
+class TestReview68(unittest.TestCase):
+    def test_holm_plateau_keeps_the_raw_order(self):
+        """#68 review 1: raw p H-C = 3/256, H-P .012, H-Q .014, H-F .020, H-T .030: every adjusted p is
+        .05859375 and Holm rejects nothing; H-C is FIRST in the raw step-down, so its active level is .01
+        (not .05), the step-down reached it, and the family decision rejects nothing."""
+        h = stats.holm({"H-C": 3 / 256, "H-P": 0.012, "H-Q": 0.014, "H-F": 0.020, "H-T": 0.030})
+        self.assertTrue(all(abs(v - 0.05859375) < 1e-15 for v in h["adjusted"].values()))
+        self.assertEqual(h["order"], ["H-C", "H-P", "H-Q", "H-F", "H-T"])
+        self.assertEqual(stats.active_level(h, "H-C"), 0.01)
+        self.assertTrue(h["reached"]["H-C"])
+        self.assertFalse(h["reached"]["H-P"])                       # (H-C not rejected: the step-down stops)
+        hc = {"available": True, "estimate_A": 0.1, "estimate_B": 0.1}
+        self.assertEqual(stats.family_decision(h, hc), {k: False for k in stats.HYPOTHESES})
+        # a rejecting family: H-P .001 (level .01), H-C .0117 at level .0125, then H-Q .02 > .0167 stops
+        h2 = stats.holm({"H-C": 3 / 256, "H-P": 0.001, "H-Q": 0.02, "H-F": 0.5, "H-T": 0.6})
+        self.assertEqual((stats.active_level(h2, "H-C"), h2["reached"]["H-C"]), (0.05 / 4, True))
+        fd = stats.family_decision(h2, hc)
+        self.assertEqual((fd["H-P"], fd["H-C"], fd["H-Q"]), (True, True, False))
+        self.assertFalse(stats.family_decision(h2, dict(hc, estimate_B=-0.01))["H-C"])   # (the IUT direction)
+        with self.assertRaises(stats.StatsError):
+            stats.holm({"H-C": math.nan})
+
+    def test_constant_samples_have_zero_se(self):
+        """#68 review 2: non-dyadic constant samples (0.1 x 32, 0.1 x 30, 0.3 x 7): se exactly 0, so the
+        original-zero-SE rule makes the test unavailable (no T* = 0 artefact, no p = .0001)."""
+        for v, n in ((0.1, 32), (0.1, 30), (0.3, 7), (1 / 3, 11)):
+            m, se = stats.mean_se([v] * n)
+            self.assertEqual((m, se), (v, 0.0))
+            r = stats.cluster_test([v] * n, stats.mean_se, draws=50)
+            self.assertFalse(r["available"])
+            self.assertIn("standard error is 0", r["reason"])
+        m, se = stats.mean_se([0.1] * 31 + [0.1000000001])
+        self.assertGreater(se, 0)
+
+    def test_failed_draws_make_the_test_unavailable(self):
+        """#68 review 3: a NaN (or failing) bootstrap estimate is a failure with its draw recorded, never a
+        -inf or a non-exceedance; a NaN observed score has no model p-value."""
+        vals = [0.1 * k for k in range(12)]
+        calls = {"n": 0}
+
+        def est(units):
+            calls["n"] += 1
+            if calls["n"] == 5:                     # (the 4th bootstrap draw)
+                return math.nan, math.nan
+            return stats.mean_se(units)
+        r = stats.cluster_test(vals, est, draws=100, rng=rqlib.SplitMix64(1))
+        self.assertFalse(r["available"])
+        self.assertEqual(r["failed_draw"], 3)
+        calls["n"] = 0
+
+        def boom(units):
+            calls["n"] += 1
+            if calls["n"] == 3:
+                raise ZeroDivisionError("x")
+            return stats.mean_se(units)
+        r = stats.cluster_test(vals, boom, draws=100, rng=rqlib.SplitMix64(1))
+        self.assertEqual((r["available"], r["failed_draw"]), (False, 1))
+
+        def inf_se(units):
+            return stats.mean_se(units)[0], math.inf
+        self.assertFalse(stats.cluster_test(vals, lambda u: (stats.mean_se(u)[0], 0.5), draws=5)["available"] is False)
+        self.assertFalse(stats.cluster_interval(vals[:3], inf_se, draws=5)["available"])
+        with self.assertRaises(stats.StatsError):
+            stats.model_p(math.nan, {"a": [1.0, 2.0]})
+        with self.assertRaises(stats.StatsError):
+            stats.model_p(1.0, {"a": [math.nan, 2.0]})
+        with self.assertRaises(stats.StatsError):
+            stats.critical_value([1.0, math.nan])
+        self.assertEqual(stats.model_p(math.inf, {"a": [1.0, math.inf]}), 2 / 3)   # (+inf is a value)
+
+    def test_reported_bounds_are_99_percent(self):
+        """#68 review 9: lower99 is the 99% bound at every decision level; the active-level bound is
+        reported beside it with its own confidence."""
+        D = {b: (0.03 + 0.01 * math.sin(b), 0.02 - 0.015 * math.cos(3 * b)) for b in range(8)}
+        r1, r5 = stats.hc_test(D, alpha=0.01), stats.hc_test(D, alpha=0.05)
+        self.assertEqual(r1["lower99"], r5["lower99"])
+        self.assertEqual(r5["lower99"]["confidence"], 0.99)
+        self.assertEqual(r5["lower_at_alpha"]["confidence"], 0.95)
+        self.assertGreater(r5["lower_at_alpha"]["min"], r5["lower99"]["min"])
+
+    def test_exact_ties(self):
+        """#68 review 12: eight deltas all 1e-14: the exact sum test's p is 1/256 (no absolute tolerance),
+        and the inversion's 99% bound is positive, consistently; exact symmetric ties still count."""
+        D = [1e-14] * 8
+        self.assertEqual(stats.signflip_p(D)[2], 1 / 256)
+        self.assertGreater(stats.signflip_lower(D), 0.0)
+        self.assertEqual(stats.signflip_p([0.0] * 8)[2], 1.0)
+        self.assertEqual(stats.signflip_p([0.1, -0.1])[0], 3)          # (exact zero sums: ties, counted)
+        # p(D - a) <= alpha exactly when a < L, at the bound's breakpoint
+        D8 = [0.4, -0.1, 0.3, 0.25, 0.6, 0.05, 0.2, 0.15]
+        L = stats.signflip_lower(D8)
+        self.assertGreater(stats.signflip_p([x - L for x in D8])[2], 0.01)         # (closed at L)
+        self.assertLessEqual(stats.signflip_p([x - (L - 1e-12) for x in D8])[2], 0.01)
+
+
 class TestMultiplicityAndCalibration(unittest.TestCase):
     def test_holm(self):
         """The user's decision: Holm at familywise 0.05 over the five; an unavailable hypothesis keeps its
@@ -273,9 +368,27 @@ class TestMultiplicityAndCalibration(unittest.TestCase):
         self.assertEqual(stats.source_weight(m, 3, 1), 0)
         self.assertEqual(stats.source_weight(m, 1, None), 2)            # against a frozen reference
         recs = [("w1", "w2", 1.0), ("w2", "w1", 0.0), ("w1", "w1", 1.0), ("w3", None, 0.5)]
-        full, draws = stats.crossed_mean_draws(recs, draws=300, rng=rqlib.SplitMix64(4))
+        with self.assertRaises(stats.StatsError):                     # (a draw of w2 alone has no mean)
+            stats.crossed_mean_draws(recs, draws=300, rng=rqlib.SplitMix64(4))
+        full, draws = stats.crossed_mean_draws(recs, draws=300, rng=rqlib.SplitMix64(4), undefined="-inf")
         self.assertAlmostEqual(full, 2.5 / 4)
-        self.assertTrue(all(0.0 <= x <= 1.0 for x in draws))
+        self.assertEqual(len(draws), 300)                               # (never silently shortened)
+        self.assertTrue(all(0.0 <= x <= 1.0 or x == -math.inf for x in draws))
+        self.assertGreater(sum(x == -math.inf for x in draws), 0)
+
+    def test_undefined_crossed_draws(self):
+        """#68 review 10: one edge w1 -> w2: a draw of the same root twice weighs 0 (about half the draws);
+        "fail" refuses, "-inf" keeps every draw."""
+        recs = [("w1", "w2", 0.3)]
+        with self.assertRaises(stats.StatsError):
+            stats.crossed_mean_draws(recs, draws=200, rng=rqlib.SplitMix64(9))
+        _, d = stats.crossed_mean_draws(recs, draws=200, rng=rqlib.SplitMix64(9), undefined="-inf")
+        k = sum(x == -math.inf for x in d)
+        self.assertEqual(len(d), 200)
+        self.assertTrue(60 < k < 140, k)
+        self.assertTrue(all(x == 0.3 for x in d if x != -math.inf))
+        with self.assertRaises(stats.StatsError):
+            stats.crossed_mean_draws(recs, undefined="drop")
 
 
 if __name__ == "__main__":
