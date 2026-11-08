@@ -13,12 +13,14 @@ THE BLOCK, per world (the current attempt only):
              "finfolk:attempt:<registry uuid>:<k>") (another history, so other snapshot identities);
   pattern    <abs a<k>>/end.{frame}.json;
   archived   the frames f (multiples of 1M up to 200M) whose end.<f>.json exists and parses with
-             world.frame == f (every listed checkpoint is opened);
+             world.frame == f (every listed checkpoint is opened), and frame 1 when the attempt's founding
+             snapshot F1.json (runner_val's one-step replay) parses with world.frame == 1;
+  paths      {"F1": <abs a<k>/F1.json>} when it is archived (the F1 label's path override; refsel.py);
   valid_before  the FIRST main-CSV row (any segment of the attempt) at which either guild is 0, or None:
              a snapshot at or after it is not valid (design §2.3; the burn-in rule restarted any world
              whose zero came before 5M, so a zero here is data);
   treatment, block, status (done / extinct / failed / running), attempt.
-times: "<t>M" -> t x 1,000,000 for t = 1..200.
+times: "F1" -> 1 and "<t>M" -> t x 1,000,000 for t = 1..200.
 
     val_block.py --root ~/finfolk/validation --out block.json
 """
@@ -89,6 +91,17 @@ def archived(adir):
     return sorted(out)
 
 
+def founding(adir):
+    """{"F1": path} when a<k>/F1.json parses with world.frame == 1, else {}."""
+    p = os.path.join(adir, "F1.json")
+    try:
+        with open(p) as fh:
+            ok = json.load(fh).get("world", {}).get("frame") == 1
+    except (OSError, ValueError):
+        ok = False
+    return {"F1": p} if ok else {}
+
+
 def attempt_uuid(base, k):
     return base if k == 0 else str(uuid.uuid5(uuid.NAMESPACE_URL, f"finfolk:attempt:{base}:{k}"))
 
@@ -106,11 +119,12 @@ def block(root):
         if not os.path.isdir(adir):
             raise BlockError(f"{w['id']}: no directory for its attempt {k}")
         status = next((m for m in ("done", "extinct", "failed") if os.path.exists(os.path.join(adir, m))), "running")
+        paths = founding(adir)
         ws[w["id"]] = {"uuid": attempt_uuid(w["uuid"], k), "treatment": w["treatment"], "block": w["block"],
-                       "status": status, "attempt": k, "pattern": os.path.join(adir, "end.{frame}.json"), "paths": {},
-                       "valid_before": first_zero(adir), "archived": archived(adir)}
+                       "status": status, "attempt": k, "pattern": os.path.join(adir, "end.{frame}.json"), "paths": paths,
+                       "valid_before": first_zero(adir), "archived": ([1] if paths else []) + archived(adir)}
     return {"schema": SCHEMA, "registry_sha256": rqlib.sha256_file(rp), "source": "runner_val", "root": root,
-            "times": {f"{t}M": t * 1_000_000 for t in range(1, MAX_M + 1)}, "worlds": ws}
+            "times": dict({"F1": 1}, **{f"{t}M": t * 1_000_000 for t in range(1, MAX_M + 1)}), "worlds": ws}
 
 
 def main(argv=None):

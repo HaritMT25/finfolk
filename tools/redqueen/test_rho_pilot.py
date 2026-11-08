@@ -585,6 +585,9 @@ class TestValBlock(unittest.TestCase):
                 os.makedirs(os.path.join(ad, "runs"))
                 with open(os.path.join(base, "state.json"), "w") as f:
                     json.dump({"attempt": k}, f)
+                if w["id"] != "w03":                                    # (w03: no founding snapshot)
+                    with open(os.path.join(ad, "F1.json"), "w") as f:
+                        json.dump({"world": {"frame": 1 if w["id"] != "w06" else 2}}, f)   # (w06's is wrong)
                 for t in range(1, 101):
                     fr = t * 1_000_000 if not (w["id"] == "w07" and t == 40) else 1
                     with open(os.path.join(ad, f"end.{t * 1_000_000}.json"), "w") as f:
@@ -607,7 +610,12 @@ class TestValBlock(unittest.TestCase):
             self.assertEqual(v["w04"]["valid_before"], 63_000_000)
             self.assertIsNone(v["w01"]["valid_before"])
             self.assertNotIn(40_000_000, v["w07"]["archived"])
-            self.assertEqual(len(v["w01"]["archived"]), 100)
+            self.assertEqual(len(v["w01"]["archived"]), 101)                  # (F1 and 1..100M)
+            self.assertEqual(b["times"]["F1"], 1)
+            self.assertEqual(v["w01"]["paths"]["F1"], os.path.join(root, "worlds", "w01", "a0", "F1.json"))
+            self.assertEqual(v["w01"]["archived"][0], 1)
+            for bad in ("w03", "w06"):                                        # (missing / not frame 1)
+                self.assertEqual((v[bad]["paths"], 1 in v[bad]["archived"]), ({}, False))
             self.assertTrue(v["w05"]["pattern"].endswith(os.path.join("w05", "a1", "end.{frame}.json")))
             f = files(tmp)
             d, notes = rp.make_design(b, [f["t.json"]], f["ages.json"], [f["worlds.json"]])
