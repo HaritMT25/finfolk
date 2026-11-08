@@ -720,6 +720,17 @@ def bind_root(root, reg_sha, archive_root=None, create=False, readonly=False):
 
 
 # ================================================================== layout
+def base_frame(w):
+    """The frame a world's root segment starts from: 0 for a founder history, the origin frame for a
+    fork branch (forks.py: w["origin"] = {"frame", "path", "sha256", "seed"})."""
+    return int((w.get("origin") or {}).get("frame", 0))
+
+
+def total_steps(w, sched):
+    """The frame a world ends at: its own total_steps (a fork branch: origin + horizon) or the schedule's."""
+    return int(w.get("total_steps") or sched["total_steps"])
+
+
 def wdir(root, wid):
     return os.path.join(root, "worlds", wid)
 
@@ -1274,7 +1285,7 @@ def good_copy(root, wid, frame, sha, arecs=None):
     return None
 
 
-def verified_records(root, wid, st, treatment):
+def verified_records(root, wid, st, treatment, base=0):
     """{(segment, frame): acceptance record} of the records whose log parts still verify (each
     segment's parts in order, without a gap), in segments whose start is itself such a record
     (back to the founder segment)."""
@@ -1302,7 +1313,7 @@ def verified_records(root, wid, st, treatment):
         if name not in memo:
             s = segs[name]
             ra = s.get("resumed_accept")
-            memo[name] = s["start_frame"] == 0 or bool(
+            memo[name] = s["start_frame"] == base or bool(
                 ra and ra["frame"] == s["start_frame"] and (ra["segment"], ra["frame"]) in good
                 and good[(ra["segment"], ra["frame"])]["sha256"] == ra["sha256"] and chained(ra["segment"]))
         return memo[name]
@@ -1313,19 +1324,20 @@ def _seg_index(name):
     return int(name[3:])
 
 
-def resume_point(root, wid, st, treatment, good=None):
+def resume_point(root, wid, st, treatment, good=None, base=0, origin=None):
     """-> (frame, checkpoint path, acceptance record) the next segment starts from: the latest
-    verified record with a good copy of its checkpoint; (0, None, None) for the founder seed."""
-    good = verified_records(root, wid, st, treatment) if good is None else good
+    verified record with a good copy of its checkpoint; (0, None, None) for the founder seed, (base,
+    origin, None) for a fork branch's origin."""
+    good = verified_records(root, wid, st, treatment, base) if good is None else good
     arecs = archive_records(root, wid)
     for (name, f), r in sorted(good.items(), key=lambda kv: (kv[0][1], _seg_index(kv[0][0])), reverse=True):
         p = good_copy(root, wid, f, r["sha256"], arecs)
         if p:
             return f, p, r
-    return 0, None, None
+    return base, origin, None
 
 
-def verified_chain(st, good):
+def verified_chain(st, good, base=0):
     """The records of the chain that ends at the latest verified record: each segment's records up
     to the frame the next segment resumed from (the last one's up to its end)."""
     if not good:
@@ -1336,7 +1348,7 @@ def verified_chain(st, good):
     while True:
         out += [r for (sg, f), r in good.items() if sg == seg and f <= upto]
         s = segs[seg]
-        if s["start_frame"] == 0:
+        if s["start_frame"] == base:
             return sorted(out, key=lambda r: r["frame"])
         ra = s["resumed_accept"]
         seg, upto = ra["segment"], ra["frame"]
@@ -1406,14 +1418,16 @@ def scan_zeros(root, wid, st, treatment):
 
 
 # ================================================================== engine
-def segment_args(world, sched, seg, start, ckpt_path=None):
-    args = ["--no-render", "--headless", str(sched["total_steps"] - start), "--log-every", str(sched["log_every"]),
+def segment_args(world, sched, seg, start, ckpt_path=None, reseed=None):
+    args = ["--no-render", "--headless", str(total_steps(world, sched) - start), "--log-every", str(sched["log_every"]),
             "--flush-every", "1", "--checkpoint-every", str(sched["checkpoint_every"]),
             "--save-checkpoint", "ckpt/end.json", "--csv", f"{seg}/run.csv", "--wiring-log"]
     if world["predator_log"]:
         args.append("--predator-log")
     if ckpt_path is None:
         return world["config_args"] + args
+    if reseed is not None:      # (a fork branch's root segment only: technical resumes never reseed)
+        return ["--load-checkpoint", ckpt_path, "--reseed-after-load", str(int(reseed))] + args
     return ["--load-checkpoint", ckpt_path] + args
 
 
@@ -1477,7 +1491,7 @@ class Supervisor:
     def __init__(self, root, reg, archive_root, exe, exe_sha, a, log):
         self.root, self.reg, self.sched = root, reg, reg["schedule"]
         self.archive_root, self.exe, self.exe_sha, self.a, self.log = archive_root, exe, exe_sha, a, log
-        self.T = self.sched["total_steps"]
+        self.T = self.sched["total_steps"]       # (a history's; a fork branch has its own: self.Tw)
         self.ce = self.sched["checkpoint_every"]
         self.worlds = {w["id"]: w for w in reg["worlds"]}
         self.avail_p = os.path.join(root, "availability.jsonl")
@@ -1492,6 +1506,41 @@ class Supervisor:
         self.zeros = {}       # wid -> {guild: first-zero frame} (the minimum over the supported records)
         self.chain = {}       # wid -> frames of the currently verified acceptance chain (pruning may use)
         self.chain_active = {}  # wid -> the active segment's last accepted frame (or its start)
+        self.hold = {}          # wid -> a frame it stops at for now ("held": forks.py, the pilot's first horizon)
+        self.ineligible = None  # wid -> why it may no longer run (None: it may): forks.py's origin re-check,
+        #                         asked before EVERY segment (a resume, a retry, a replay)
+
+    # ---------------------------------------------------------------- per world
+    def base(self, wid):
+        return base_frame(self.worlds[wid])
+
+    def Tw(self, wid):
+        return total_steps(self.worlds[wid], self.sched)
+
+    def Teff(self, wid):
+        """Where the world's engines stop now: its end, or an earlier hold."""
+        return min(self.Tw(wid), self.hold.get(wid, self.Tw(wid)))
+
+    def origin_path(self, wid):
+        """A fork branch's frozen origin checkpoint (None for a history), VERIFIED against its durable
+        digest at every use (a root replay, the lineage counters' start, any resume decision): a
+        missing file or changed bytes fail closed (WorldsError)."""
+        o = self.worlds[wid].get("origin")
+        if not o:
+            return None
+        p = o.get("local")
+        if not p or not o.get("sha256"):
+            raise WorldsError(f"{wid}: its origin was never frozen")
+        if not os.path.isfile(p) or rqlib.sha256_file(p) != o["sha256"]:
+            raise WorldsError(f"{wid}: its frozen origin {p} does not match its recorded digest {o['sha256'][:12]}")
+        return p
+
+    def good(self, wid, st):
+        return verified_records(self.root, wid, st, self.worlds[wid]["treatment"], self.base(wid))
+
+    def resume(self, wid, st, good=None):
+        return resume_point(self.root, wid, st, self.worlds[wid]["treatment"], good, self.base(wid),
+                            self.origin_path(wid))
 
     # ---------------------------------------------------------------- state
     def state(self, wid):
@@ -1503,6 +1552,12 @@ class Supervisor:
         st.update(kw)
         write_state(self.root, wid, st)
         return st
+
+    def invalidate(self, wid, why):
+        """A fork branch whose origin is no longer valid: it stops for good (its artifacts kept)."""
+        st = self.state(wid)
+        self.set_status(wid, "invalidated", end_reason=why, invalidated_from=st["status"])
+        self.log(f"INVALIDATED {wid}: {why}")
 
     def end_world(self, wid, status, reason):
         self.set_status(wid, status, end_reason=reason)
@@ -1686,6 +1741,8 @@ class Supervisor:
         if seg["start_frame"] == 0:
             return None
         k = (wid, seg["name"])
+        if k not in self.start_cps and seg["start_frame"] == self.base(wid):    # a branch's origin
+            self.start_cps[k] = ckpt.load(self.origin_path(wid))
         if k not in self.start_cps:
             ra = seg["resumed_accept"]
             p = good_copy(self.root, wid, ra["frame"], ra["sha256"])
@@ -1706,7 +1763,7 @@ class Supervisor:
         mine = sorted((r for r in accept_records(self.root, wid) if r["segment"] == name), key=lambda r: r["frame"])
         prev = mine[-1] if mine else None
         last = prev["frame"] if prev else s0
-        while last + self.ce <= self.T:
+        while last + self.ce <= self.Teff(wid):
             F = last + self.ce
             p = local_ckpts(self.root, wid).get(F)
             if p is None or (alive and self.last_frame.get(wid, -1) <= F):
@@ -1765,7 +1822,7 @@ class Supervisor:
         fz = self.first_zero(wid)
         if fz is None:
             return "no zero whose evidence still holds"
-        good = verified_records(self.root, wid, st, self.worlds[wid]["treatment"]) if good is None else good
+        good = self.good(wid, st) if good is None else good
         names = {s["name"] for s in st["segments"]}
         recs = [r for r in accept_records(self.root, wid) if r["segment"] in names and r["frame"] <= fz]
         if recs:
@@ -1778,10 +1835,10 @@ class Supervisor:
         """Why a done / extinct world's status no longer stands (None if it does): a done world's
         verified acceptance chain must reach the final frame; an extinct world's stop must still be
         evidenced (extinct_problems). (Its finalized archive was audited before: audit_archive.)"""
-        good = verified_records(self.root, wid, st, self.worlds[wid]["treatment"])
-        frame = resume_point(self.root, wid, st, self.worlds[wid]["treatment"], good)[0]
-        if st["status"] == "done" and frame != self.T:
-            return f"its verified logs end at frame {frame}, not {self.T}"
+        good = self.good(wid, st)
+        frame = self.resume(wid, st, good)[0]
+        if st["status"] == "done" and frame != self.Tw(wid):
+            return f"its verified logs end at frame {frame}, not {self.Tw(wid)}"
         if st["status"] == "extinct":
             return self.extinct_problems(wid, st, good)
         return None
@@ -1790,36 +1847,42 @@ class Supervisor:
         """The currently verified chain's frames, and how far the active (last) segment has accepted
         (its start if it accepted nothing, provided it resumed from the chain; else nothing to prune)."""
         st = st or self.state(wid)
-        good = verified_records(self.root, wid, st, self.worlds[wid]["treatment"])
-        recs = verified_chain(st, good)
+        good = self.good(wid, st)
+        recs = verified_chain(st, good, self.base(wid))
         self.chain[wid] = {r["frame"] for r in recs}
         last = st["segments"][-1] if st["segments"] else None
         mine = [r["frame"] for r in recs if last and r["segment"] == last["name"]]
         ra = (last or {}).get("resumed_accept")
         if mine:
             self.chain_active[wid] = max(mine)
-        elif last and (last["start_frame"] == 0 or (ra and (ra["segment"], ra["frame"]) in good)):
+        elif last and (last["start_frame"] == self.base(wid) or (ra and (ra["segment"], ra["frame"]) in good)):
             self.chain_active[wid] = last["start_frame"]
         else:
             self.chain_active[wid] = -1
 
     # ---------------------------------------------------------------- what next
     def next_action(self, wid):
-        """-> ("extinct" | "done", reason) | ("verify", None) | ("segment", (start, checkpoint path, record)).
+        """-> ("extinct" | "done" | "held" | "invalidated", reason) | ("verify", None)
+        | ("segment", (start, checkpoint path, record)).
         The extinction shortcut applies only while the stop is evidenced (extinct_problems); else the
         world replays from its latest verified record, through the zero, which stops it again (and
         reap_segment fails it if the replay did not repair the accepted logs)."""
         st = self.state(wid)
+        why = self.ineligible(wid) if self.ineligible else None
+        if why:
+            return "invalidated", why
         if self.a.on_extinction == "stop" and self.zero_reason(wid):
             why = self.extinct_problems(wid, st)
             if not why:
                 return "extinct", self.zero_reason(wid)
             self.warn_once((wid, "unevidenced"), f"{wid}: at its zero, but {why}: replaying through the zero to "
                                                  "repair its accepted logs")
-        frame, path, rec = resume_point(self.root, wid, st, self.worlds[wid]["treatment"])
-        if frame >= self.T:
-            return "done", f"{self.T} steps (its final checkpoint and logs accepted)"
-        if frame > 0 and not f1_verified(self.root, wid, self.exe_sha, self.ce):
+        frame, path, rec = self.resume(wid, st)
+        if frame >= self.Tw(wid):
+            return "done", f"{self.Tw(wid)} steps (its final checkpoint and logs accepted)"
+        if frame >= self.Teff(wid):
+            return "held", f"held at frame {self.Teff(wid)} (its hold; it resumes when the hold is lifted)"
+        if frame > 0 and not self.base(wid) and not f1_verified(self.root, wid, self.exe_sha, self.ce):
             return "verify", None
         return "segment", (frame, path, rec)
 
@@ -1834,7 +1897,9 @@ class Supervisor:
         mkdirs_durable(os.path.join(d, "ckpt"))
         if cpath and os.path.abspath(cpath).startswith(d + os.sep):
             cpath = os.path.relpath(os.path.abspath(cpath), d)
-        args = segment_args(w, self.sched, seg, start, cpath)
+        b = self.base(wid)
+        args = segment_args(dict(w, total_steps=self.Teff(wid)), self.sched, seg, start, cpath,
+                            reseed=w["origin"]["seed"] if b and start == b and rec is None else None)
         st["segments"].append({"name": seg, "start_frame": start, "resumed_from": cpath,
                                "resumed_accept": ({"segment": rec["segment"], "frame": rec["frame"],
                                                    "sha256": rec["sha256"]} if rec else None),
@@ -1907,10 +1972,19 @@ class Supervisor:
             self.end_world(wid, "extinct", reason)
             self.log(f"{wid}: ended as extinct ({self.state(wid)['end_reason']})")
             return
-        nxt = resume_point(self.root, wid, self.state(wid), self.worlds[wid]["treatment"])[0]
-        if nxt >= self.T:
-            self.end_world(wid, "done", f"{self.T} steps")
-            self.log(f"{wid}: history complete ({self.T} steps, every log accepted through the final frame)")
+        try:
+            nxt = self.resume(wid, self.state(wid))[0]
+        except (WorldsError, OSError) as e:
+            self.end_world(wid, "failed", str(e))
+            self.log(f"FAILED {wid}: {e}")
+            return
+        if nxt >= self.Tw(wid):
+            self.end_world(wid, "done", f"{self.Tw(wid)} steps")
+            self.log(f"{wid}: history complete ({self.Tw(wid)} steps, every log accepted through the final frame)")
+            return
+        if nxt >= self.Teff(wid):
+            self.set_status(wid, "held", end_reason=f"held at frame {self.Teff(wid)}")
+            self.log(f"{wid}: held at frame {self.Teff(wid)} (accepted through it; not finalized)")
             return
         st = self.state(wid)
         st["failures"] = st.get("failures", 0) + 1 if st.get("last_failed_resume") == nxt else 1
@@ -1937,7 +2011,15 @@ class Supervisor:
             accept_records(self.root, wid, repair=True)
             read_jsonl(os.path.join(wdir(self.root, wid), "quarantine.jsonl"), repair=True)
             st = self.state(wid)
+            if st["status"] == "held" and self.Teff(wid) > (self.resume(wid, st)[0] if st["segments"] else 0):
+                self.log(f"{wid}: its hold is lifted: it resumes (no reseed)")
+                st["status"] = "interrupted"
+                write_state(self.root, wid, st)
             if st["status"] == "running" or (st["status"] == "failed" and a.retry_failed):
+                why = self.ineligible(wid) if self.ineligible else None
+                if why:                                   # (never retried, never resumed)
+                    self.invalidate(wid, why)
+                    continue
                 if st["status"] == "failed":
                     self.log(f"{wid}: retrying a failed world (--retry-failed; it was: {st.get('end_reason')})")
                     st["failures"] = 0
@@ -1971,7 +2053,7 @@ class Supervisor:
                 st = self.set_status(wid, "interrupted", reopened=why, failures=0)
             if st["status"] not in ("pending", "interrupted"):
                 continue
-            if not f1_bound(self.root, wid, self.exe_sha):
+            if not w.get("origin") and not f1_bound(self.root, wid, self.exe_sha):
                 missing_f1.append(wid)
             if st["segments"]:
                 try:
@@ -1987,6 +2069,10 @@ class Supervisor:
                 if kind in ("done", "extinct"):
                     self.end_world(wid, kind, info)
                     self.log(f"{wid}: already at its end ({kind}: {info}); finalized without another segment")
+                elif kind == "held":
+                    self.set_status(wid, "held", end_reason=info)
+                elif kind == "invalidated":
+                    self.invalidate(wid, info)
         if missing_f1:
             raise WorldsError(f"no F1 archived by the pinned engine for {', '.join(missing_f1)}: run worlds.py f1 first")
 
@@ -2064,6 +2150,11 @@ class Supervisor:
                     if kind in ("done", "extinct"):
                         self.end_world(wid, kind, info)
                         log(f"{wid}: at its end ({kind}: {info})")
+                    elif kind == "held":
+                        self.set_status(wid, "held", end_reason=info)
+                        log(f"{wid}: {info}")
+                    elif kind == "invalidated":
+                        self.invalidate(wid, info)
                     elif kind == "verify":
                         self.spawn_verify(wid)
                     else:
@@ -2175,11 +2266,12 @@ def stitch(root, wid, reg, partial=False):
     STUDY/worlds/<id>/stitched/ -> manifest."""
     w = {x["id"]: x for x in reg["worlds"]}[wid]
     sched = reg["schedule"]
-    T, L = sched["total_steps"], sched["log_every"]
+    T, L = total_steps(w, sched), sched["log_every"]
+    base = base_frame(w)
     st = read_state(root, wid)
     if st["status"] not in ("done", "extinct") and not partial:
         raise WorldsError(f"{wid} is {st['status']}, not done or extinct: --partial for a partial stitch")
-    good = verified_records(root, wid, st, w["treatment"])
+    good = verified_records(root, wid, st, w["treatment"], base)
     if not good:
         raise WorldsError(f"{wid}: no accepted checkpoint")
     end = max(good.values(), key=lambda r: (r["frame"], _seg_index(r["segment"])))
@@ -2191,7 +2283,7 @@ def stitch(root, wid, reg, partial=False):
     while True:
         s = segs[cur["segment"]]
         chain.append((s, cur))
-        if s["start_frame"] == 0:
+        if s["start_frame"] == base:
             break
         ra = s["resumed_accept"]
         cur = good[(ra["segment"], ra["frame"])]
@@ -2216,14 +2308,19 @@ def stitch(root, wid, reg, partial=False):
                 header = hdr
             elif hdr != header:
                 raise WorldsError(f"{wid}: {s['name']}/{name} has another header")
-            if kind == "events" and s["start_frame"] > 0:
+            if kind == "events" and s["start_frame"] > base:     # (a branch's root keeps the origin's L rows)
                 rows = [r for r in rows if r[1] != "L"]
             if kind == "steps":
                 rows = [[str(int(r[0]) + s["start_frame"])] + r[1:] for r in rows]
             if name == "run.csv" and s["start_frame"] > 0 and rows:
                 # the resumed segment's first row counts the loaded world's history in its interval columns
                 ra = s["resumed_accept"]
-                src = good_copy(root, wid, ra["frame"], ra["sha256"], arecs)
+                if s["start_frame"] == base:                    # a branch's root: its origin
+                    src = (w.get("origin") or {}).get("local")
+                    if not (src and os.path.isfile(src) and rqlib.sha256_file(src) == w["origin"]["sha256"]):
+                        raise WorldsError(f"{wid}: its origin checkpoint is gone or changed")
+                else:
+                    src = good_copy(root, wid, ra["frame"], ra["sha256"], arecs)
                 if src is None:
                     raise WorldsError(f"{wid}: the checkpoint {s['name']} resumed (frame {ra['frame']}) is gone")
                 ctr = ckpt.load(src)["counters"]
@@ -2239,7 +2336,7 @@ def stitch(root, wid, reg, partial=False):
         if kind == "events":
             if frames != sorted(frames) or (frames and frames[-1] > endpoint):
                 raise WorldsError(f"{wid} {name}: the stitched lineage log is out of frame order")
-        elif frames != list(range(L, endpoint + 1, L)):
+        elif frames != list(range(base + L, endpoint + 1, L)):
             raise WorldsError(f"{wid} {name}: the stitched rows are not contiguous every {L} steps through {endpoint}")
         buf = io.StringIO()
         wr = csv.writer(buf, lineterminator="\n")
