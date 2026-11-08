@@ -101,7 +101,70 @@ def logit_curve(gamma, times, interval=FULL):
     return basis(times, interval) @ gamma
 
 
-def fit_survival(free, exposed, interval=FULL, trials=TRIALS):
+def fit_captures(times, captures, bounds, interval=FULL, pen=PENALTY, iters=100, tol=1e-12):
+    """fit_capture for K opponents observed at the SAME focal times, batched (identical iterates):
+    captures, bounds (K x m) -> gammas (K x 6)."""
+    X = basis(times, interval)
+    Y, N = np.atleast_2d(np.asarray(captures, float)), np.atleast_2d(np.asarray(bounds, float))
+    g = np.zeros((Y.shape[0], X.shape[1]))
+    I = np.eye(X.shape[1])
+    for _ in range(iters):
+        mu = _sigma(g @ X.T)
+        grad = (N * mu - Y) @ X + pen * g
+        H = np.einsum("km,ma,mb->kab", N * mu * (1 - mu), X, X) + pen * I
+        step = np.linalg.solve(H, grad[:, :, None])[:, :, 0]
+        g = g - step
+        if np.max(np.abs(step)) < tol:
+            break
+    if not np.all(np.isfinite(g)):
+        raise BackboneError("the quasi-likelihood fit did not converge")
+    return g
+
+
+def fit_survival(free, exposed, interval=FULL, trials=TRIALS, pen=PENALTY, iters=100, tol=1e-12):
+    """The joint survival fit of one world (fit_survival_dense's estimator and Newton iterates, by the
+    arrowhead structure of its Hessian: the shared c block bordered by independent d_k blocks; a Schur
+    complement solve, O(K) instead of O(K^3))."""
+    keys = sorted(exposed)
+    ft, fs = free
+    Xf = basis(ft, interval)
+    yf = np.asarray(fs, float)
+    Xs = [basis(exposed[k][0], interval) for k in keys]
+    ys = [np.asarray(exposed[k][1], float) for k in keys]
+    c = np.zeros(6)
+    d = np.zeros((len(keys), 6))
+    I = np.eye(6)
+    for _ in range(iters):
+        mu = _sigma(Xf @ c)
+        gc = Xf.T @ (trials * mu - yf) + pen * c
+        Hcc = Xf.T @ (Xf * (trials * mu * (1 - mu))[:, None]) + pen * I
+        gd, Hkk, Hck = [], [], []
+        for k, (X, y) in enumerate(zip(Xs, ys)):
+            m = _sigma(X @ (c + d[k]))
+            r = X.T @ (trials * m - y)
+            A = X.T @ (X * (trials * m * (1 - m))[:, None])
+            gc += r
+            Hcc += A
+            gd.append(r + pen * d[k])
+            Hkk.append(A + pen * I)
+            Hck.append(A)
+        S, rhs, sol = Hcc.copy(), gc.copy(), []
+        for k in range(len(keys)):
+            Ki = np.linalg.solve(Hkk[k], np.column_stack([Hck[k].T, gd[k]]))     # Hkk^-1 [Hck', g_k]
+            S -= Hck[k] @ Ki[:, :6]
+            rhs -= Hck[k] @ Ki[:, 6]
+            sol.append(Ki)
+        dc = np.linalg.solve(S, rhs)
+        dd = np.array([Ki[:, 6] - Ki[:, :6] @ dc for Ki in sol]) if keys else d
+        c, d = c - dc, d - dd
+        if max(np.max(np.abs(dc)), np.max(np.abs(dd)) if len(keys) else 0.0) < tol:
+            break
+    if not (np.all(np.isfinite(c)) and np.all(np.isfinite(d))):
+        raise BackboneError("the quasi-likelihood fit did not converge")
+    return c, {key: d[n_] for n_, key in enumerate(keys)}
+
+
+def fit_survival_dense(free, exposed, interval=FULL, trials=TRIALS):
     """The joint survival fit of one world. free: (times, survivors) of the predator-free controls (each
     observation once); exposed: {opponent: (times, survivors)} -> (c (6,), {opponent: d (6,)})."""
     keys = sorted(exposed)
@@ -141,8 +204,14 @@ def hp_world(capture, focal_times, interval=FULL):
     if not capture:
         raise BackboneError("no capture panel")
     focal = np.asarray(focal_times, float)
+    keys = sorted(capture)
+    t0 = np.asarray(capture[keys[0]][0], float)
+    if all(np.array_equal(np.asarray(capture[k][0], float), t0) for k in keys):     # (batched, identical)
+        G = fit_captures(t0, [capture[k][1] for k in keys], [capture[k][2] for k in keys], interval)
+        m = np.mean(basis(focal, interval) @ G.T, axis=1)
+        return slope(focal, m), m
     m = np.zeros(len(focal))
-    for key in sorted(capture):
+    for key in keys:
         t, c, b = capture[key]
         m += logit_curve(fit_capture(t, c, b, interval), focal, interval)
     m /= len(capture)

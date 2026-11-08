@@ -138,7 +138,10 @@ class Cov:
                 raise RecurrenceError("a structured bank covariance needs a positive cell diagonal")
             self.dinv = 1.0 / dd
             if self.U is not None and self.U.shape[1]:
-                self.Kc = _chol(np.eye(self.U.shape[1]) + self.U.T @ (self.U * self.dinv[:, None]))
+                DU = self.U * self.dinv[:, None]
+                Kc = _chol(np.eye(self.U.shape[1]) + self.U.T @ DU)
+                Ki = _chol_solve(Kc, np.eye(Kc.shape[0]))
+                self.M = DU @ ((Ki + Ki.T) / 2)          # W A = D^-1 A - M (U' D^-1 A)
             else:
                 self.U = None
 
@@ -158,7 +161,7 @@ class Cov:
         else:
             out = A2 * self.dinv[:, None]
             if self.U is not None:
-                out = out - (self.dinv[:, None] * self.U) @ _chol_solve(self.Kc, self.U.T @ out)
+                out = out - self.M @ (self.U.T @ out)
         return out.ravel() if one else out
 
 
@@ -316,6 +319,20 @@ class ChainTable:
         return seg, self.k[seg] - q, self.ok[seg]
 
 
+_TABLES = {}
+
+
+def chain_table(times, L, U, P):
+    """ChainTable, cached by (times, scope, period): it depends on the measured times only (the graph),
+    so calibration panels on one graph share it."""
+    key = (np.asarray(times, float).tobytes(), float(L), float(U), float(P))
+    if key not in _TABLES:
+        if len(_TABLES) > 50000:
+            _TABLES.clear()
+        _TABLES[key] = ChainTable(times, L, U, P)
+    return _TABLES[key]
+
+
 # ================================================================== designs
 class WithinDesign:
     """One world's within-world matrix for one readout in one scope (rules 1, 4, 5)."""
@@ -396,7 +413,7 @@ class RefDesign:
             self.harm[P], self.fails[P] = hm, f
             # does the chain exist at EVERY phase? If not, rule 6 is phase-conditional for this candidate
             # (reported; the decision is always the fitted phase's). Exact: the chain's phase segments.
-            self.tables[P] = ChainTable(self.common, L, U, P)
+            self.tables[P] = chain_table(self.common, L, U, P)
             self.cond[P] = nt > 0 and not bool(np.all(self.tables[P].ok))
 
     def readout(self, y, P):

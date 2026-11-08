@@ -92,6 +92,25 @@ class TestBackbone(unittest.TestCase):
         r2 = self.bb.hc_world(free2, neural, scripted, COARSE)
         self.assertAlmostEqual(r2["d"], r["d"], delta=0.003)
 
+    def test_fast_fits_match_the_reference(self):
+        """The batched capture fit and the arrowhead survival fit reproduce the per-opponent and dense
+        Newton fits (the same estimator; algebra only)."""
+        bb = self.bb
+        panel = self.capture_panel(0.1)
+        keys = sorted(panel)
+        G = bb.fit_captures(COARSE, [panel[k][1] for k in keys], [panel[k][2] for k in keys])
+        for k, g in zip(keys, G):
+            self.assertTrue(np.allclose(g, bb.fit_capture(*panel[k]), atol=1e-9))
+        N = 600.0
+        s0 = [0.8 + 0.1 * math.sin(t / 30) for t in COARSE]
+        free = (COARSE, [N * s for s in s0])
+        exposed = {j: (COARSE, [N * (s - 0.2 + 0.01 * j + 0.02 * t / 50) for s, t in zip(s0, COARSE)]) for j in range(5)}
+        c1, d1 = bb.fit_survival(free, exposed)
+        c2, d2 = bb.fit_survival_dense(free, exposed)
+        self.assertTrue(np.allclose(c1, c2, atol=1e-8))
+        for j in range(5):
+            self.assertTrue(np.allclose(d1[j], d2[j], atol=1e-8))
+
     def test_directional_test(self):
         """The H.2 test on per-world slopes: detection at a material slope with world spread."""
         rng = self.st.stream("H-P", "unit-test", "worlds", 0)

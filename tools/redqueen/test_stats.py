@@ -127,6 +127,58 @@ class TestHC(unittest.TestCase):
         self.assertAlmostEqual(d[1][1], dc - (0.4 - 0.3))
         self.assertIn("0 B", bad[2])
 
+    def test_precision_weights(self):
+        """USER DECISIONS 2: the precision-weighted Fisher-Pitman IUT. Balanced intact blocks: exactly H.5's
+        statistic (p, estimates, bounds). Two-control blocks (4C+2A+1B, 4C+1A+2B): w = 1/(1/n_C + 1/n_G)
+        (5/3 relative weight), the weighted sum enumerated, the weighted inversion, exact level."""
+        import itertools
+        D = {b: (0.03 + 0.01 * math.sin(b), 0.02 - 0.015 * math.cos(3 * b)) for b in range(8)}
+        r0 = stats.hc_test(D)
+        r1 = stats.hc_test(D, weights={b: (0.8, 0.8) for b in D})               # balanced: constant weights
+        for k in ("p_A", "p_B", "p", "estimate_A", "estimate_B", "p_material"):
+            self.assertAlmostEqual(r0[k], r1[k], places=14)
+        self.assertEqual(r0["lower99"], r1["lower99"])
+        # the registry: half the blocks 4C+2A+1B, half 4C+1A+2B
+        ws = []
+        for b in range(1, 9):
+            ws += [{"id": f"C{b}{k}", "treatment": "C", "block": b} for k in range(4)]
+            na, nb = (2, 1) if b <= 4 else (1, 2)
+            ws += [{"id": f"A{b}{k}", "treatment": "A", "block": b} for k in range(na)]
+            ws += [{"id": f"B{b}{k}", "treatment": "B", "block": b} for k in range(nb)]
+        sl = {w["id"]: {"neural": 0.05 + 0.003 * i, "scripted": 0.01} for i, w in enumerate(ws)}
+        d, bad, wt = stats.hc_block_deltas(sl, ws, with_weights=True)
+        self.assertEqual(bad, {})
+        self.assertAlmostEqual(wt[1][0] / wt[1][1], (1 / (0.25 + 0.5)) / (1 / (0.25 + 1.0)))   # 5/3
+        self.assertAlmostEqual(wt[1][0], 4 / 3)
+        self.assertAlmostEqual(wt[5][1], 4 / 3)
+        dA1 = (sum(sl[f"C1{k}"]["neural"] - 0.01 for k in range(4)) / 4
+               - sum(sl[f"A1{k}"]["neural"] - 0.01 for k in range(2)) / 2)
+        self.assertAlmostEqual(d[1][0], dA1)
+        r = stats.hc_test(d, weights=wt, alpha=0.0167)
+        DA = [d[b][0] for b in sorted(d)]
+        WA = [wt[b][0] for b in sorted(d)]
+        tA = sum(w * x for w, x in zip(WA, DA))
+        k = sum(sum(e * w * x for e, w, x in zip(es, WA, DA)) >= tA - 1e-15
+                for es in itertools.product((1, -1), repeat=8))
+        self.assertEqual(r["p_A"], k / 256)
+        self.assertAlmostEqual(r["estimate_A"], tA / sum(WA))
+        L = r["lower99"]["A"]
+        eps = 1e-9
+        self.assertLessEqual(stats.signflip_p([x - (L - eps) for x in DA], WA)[2], 0.0167)
+        self.assertGreater(stats.signflip_p([x - (L + eps) for x in DA], WA)[2], 0.0167)
+        # exact level under block-error symmetry: over every sign pattern of fixed magnitudes, at most
+        # floor(alpha 2^n) patterns reject (the weights are known constants)
+        mags = [abs(x) + 0.001 * i for i, x in enumerate(DA)]
+        for alpha in (0.01, 0.0167, 0.05):
+            rej = sum(stats.signflip_p([e * m for e, m in zip(es, mags)], WA)[2] <= alpha
+                      for es in itertools.product((1, -1), repeat=8))
+            self.assertLessEqual(rej, math.floor(alpha * 256))
+        # H-C's threshold is its active Holm level
+        h = stats.holm({"H-P": 0.001, "H-Q": 0.002, "H-F": 0.2, "H-T": 0.5, "H-C": 0.015})
+        self.assertAlmostEqual(stats.active_level(h, "H-C"), 0.05 / 3)
+        self.assertTrue(stats.hc_test({b: (0.01 + 0.001 * b, 0.02) for b in range(7)},
+                                      alpha=stats.active_level(h, "H-C"))["reject"])     # 7 blocks: 1/128 <= 1/60
+
     def test_floors(self):
         """H.16 29-30: all-positive vectors give p = 2^-n (8 and 7 blocks can reject, 6 cannot); negative or
         opposite directions never reject; an all-zero control vector has p = 1."""

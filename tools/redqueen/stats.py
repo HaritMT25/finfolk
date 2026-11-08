@@ -17,11 +17,13 @@ Bootstrap-t intervals CI95, CI99 and the one-sided L99; material exceedance p_de
 (theta - delta) / se on the same draws; sensitivities: Student-t (n - 1 df) p-value and intervals,
 leave-one-world-out range and the largest absolute influence. Detection: p <= 0.01 and theta > null.
 
-H-C (H.5, the user's decision: one-sided positive intersection-union, no t / wild fallback). Per world
-d_w = beta_N - beta_S; per usable block D_G,b = mean(d of its eligible C worlds) - d_G,b for G in {A, B}
-(a block needs its A, its B and >= 1 eligible C world); blocks equally weighted. For each G, over every
-e in {-1, +1}^n: p_G = #{sum e_b D_G,b >= sum D_G,b} / 2^n; p_C = max(p_A, p_B); reject iff p_C <= 0.01
-and both estimates > 0. One-sided floor 2^-n: 8 blocks 0.0039, 7 blocks 0.0078 (can reject), 6 blocks
+H-C (H.5, the user's decision: one-sided positive intersection-union, no t / wild fallback; USER
+DECISIONS 2: precision weights). Per world d_w = beta_N - beta_S; per usable block D_G,b = mean(d of its
+eligible C worlds) - mean(d of its eligible G worlds) for G in {A, B} (a block needs >= 1 eligible C, A
+and B world; one or two controls per treatment), weight w_G,b = 1 / (1/n_C,b + 1/n_G,b) (normalized;
+equal for balanced intact blocks, where the test is H.5's). For each G, over every e in {-1, +1}^n:
+p_G = #{sum e_b w_G,b D_G,b >= sum w_G,b D_G,b} / 2^n; p_C = max(p_A, p_B); reject iff p_C is at most
+H-C's ACTIVE Holm level and both weighted estimates > 0. One-sided floor 2^-n: 8 blocks 0.0039, 7 blocks 0.0078 (can reject), 6 blocks
 0.0156 (cannot). Material: p computed on D - 0.02. 99% lower bounds by exact inversion: L_G = the
 (k+1)-th smallest nonempty-subset mean, k = floor(0.01 2^n) - 1 (-inf if k < 0); min(L_A, L_B) bounds
 min(Delta_A, Delta_B). t_A, t_B are reported, never calibrated.
@@ -281,10 +283,13 @@ def cluster_interval(units, est, draws=B_BOOT, rng=None, level=0.95):
 
 
 # ================================================================== H-C
-def hc_block_deltas(slopes, worlds):
+def hc_block_deltas(slopes, worlds, with_weights=False):
     """slopes {world id: {"neural": beta_N, "scripted": beta_S}}; worlds: registry entries (id, treatment,
-    block) -> (deltas {block: (D_A, D_B)} of the usable blocks, unusable {block: why}). d_w = beta_N -
-    beta_S; D_G,b = mean(d of the block's eligible C worlds) - d_G,b."""
+    block) -> (deltas {block: (D_A, D_B)} of the usable blocks, unusable {block: why}) [, weights {block:
+    (w_A, w_B)}]. d_w = beta_N - beta_S; D_G,b = mean(d of the block's eligible C worlds) - mean(d of its
+    eligible G worlds) (one or two controls per treatment: USER DECISIONS 2); a usable block has >= 1 C,
+    >= 1 A and >= 1 B eligible world. The precision weight w_G,b = 1 / (1/n_C,b + 1/n_G,b) (a known
+    constant given the eligibility pattern)."""
     by = {}
     for w in worlds:
         by.setdefault(w["block"], []).append(w)
@@ -297,16 +302,19 @@ def hc_block_deltas(slopes, worlds):
         if not all(isinstance(v, (int, float)) and math.isfinite(v) for v in (x, y)):
             return None
         return x - y
-    deltas, unusable = {}, {}
+    deltas, unusable, weights = {}, {}, {}
     for b, ws in sorted(by.items()):
         cs = [d(w) for w in ws if w["treatment"] == "C" and d(w) is not None]
         g = {t: [d(w) for w in ws if w["treatment"] == t and d(w) is not None] for t in ("A", "B")}
-        if not cs or len(g["A"]) != 1 or len(g["B"]) != 1:
+        if not cs or not g["A"] or not g["B"]:
             unusable[b] = (f"{len(cs)} eligible C, {len(g['A'])} A, {len(g['B'])} B worlds with both slopes "
-                           "(needs >= 1 C and exactly one A and one B)")
+                           "(needs >= 1 C, >= 1 A and >= 1 B)")
             continue
         dc = sum(cs) / len(cs)
-        deltas[b] = (dc - g["A"][0], dc - g["B"][0])
+        deltas[b] = (dc - sum(g["A"]) / len(g["A"]), dc - sum(g["B"]) / len(g["B"]))
+        weights[b] = tuple(1.0 / (1.0 / len(cs) + 1.0 / len(g[t])) for t in ("A", "B"))
+    if with_weights:
+        return deltas, unusable, weights
     return deltas, unusable
 
 
@@ -320,48 +328,61 @@ def t_stat(xs):
     return m / math.sqrt(v / n)
 
 
-def signflip_p(D):
-    """The one-sided positive sign-flip p-value of sum(D): #{e: sum e_b D_b >= sum D_b} / 2^n, by
-    enumeration (ties count)."""
+def signflip_p(D, w=None):
+    """The one-sided positive (weighted) Fisher-Pitman sign-flip p-value of T = sum w_b D_b:
+    #{e: sum e_b w_b D_b >= T} / 2^n, by enumeration (ties count). w None: equal weights."""
     n = len(D)
-    obs = sum(D)
-    tol = 1e-12 * max(1.0, sum(abs(x) for x in D))
+    w = [1.0] * n if w is None else list(w)
+    x = [wi * di for wi, di in zip(w, D)]
+    obs = sum(x)
+    tol = 1e-12 * max(1.0, sum(abs(v) for v in x))
     k = 0
     for mask in range(2 ** n):
-        s = sum(-x if mask >> i & 1 else x for i, x in enumerate(D))
+        s = sum(-v if mask >> i & 1 else v for i, v in enumerate(x))
         k += s >= obs - tol
     return k, 2 ** n, k / 2 ** n
 
 
-def signflip_lower(D, alpha=DETECT_ALPHA):
+def signflip_lower(D, alpha=DETECT_ALPHA, w=None):
     """The exact one-sided 1 - alpha lower bound: sup{a: p(D - a) <= alpha} = the (k+1)-th smallest
-    nonempty-subset mean, k = floor(alpha 2^n) - 1; -inf if alpha is unattainable."""
+    nonempty-subset (weighted) mean sum_I w_b D_b / sum_I w_b, k = floor(alpha 2^n) - 1; -inf if alpha
+    is unattainable."""
     n = len(D)
+    w = [1.0] * n if w is None else list(w)
     k = math.floor(alpha * 2 ** n + 1e-12) - 1
     if k < 0:
         return -math.inf
-    means = sorted(sum(x for i, x in enumerate(D) if mask >> i & 1) / bin(mask).count("1")
-                   for mask in range(1, 2 ** n))
+    means = sorted(sum(w[i] * x for i, x in enumerate(D) if mask >> i & 1)
+                   / sum(w[i] for i in range(n) if mask >> i & 1) for mask in range(1, 2 ** n))
     return means[k]
 
 
-def hc_test(deltas, alpha=DETECT_ALPHA, delta=DELTA_C):
-    """H-C's one-sided positive intersection-union sign-flip test (see the module doc)."""
+def hc_test(deltas, alpha=DETECT_ALPHA, delta=DELTA_C, weights=None):
+    """H-C's one-sided positive intersection-union sign-flip test (see the module doc), precision
+    weighted (USER DECISIONS 2): T_G = sum_b w_G,b D_G,b, the estimate the weighted mean (weights
+    normalized: the p-value does not depend on their scale). weights None: equal (== the precision
+    weights of balanced intact blocks). alpha: the ACTIVE Holm level of H-C (its decision is Holm's)."""
     blocks = sorted(deltas)
     n = len(blocks)
     if n < 2:
         return {"available": False, "reason": f"{n} usable blocks", "n_blocks": n}
     DA = [deltas[b][0] for b in blocks]
     DB = [deltas[b][1] for b in blocks]
-    kA, N, pA = signflip_p(DA)
-    kB, _, pB = signflip_p(DB)
-    eA, eB = sum(DA) / n, sum(DB) / n
+    WA = [1.0] * n if weights is None else [weights[b][0] for b in blocks]
+    WB = [1.0] * n if weights is None else [weights[b][1] for b in blocks]
+    WA = [x * n / sum(WA) for x in WA]
+    WB = [x * n / sum(WB) for x in WB]
+    kA, N, pA = signflip_p(DA, WA)
+    kB, _, pB = signflip_p(DB, WB)
+    eA = sum(w * x for w, x in zip(WA, DA)) / n
+    eB = sum(w * x for w, x in zip(WB, DB)) / n
     pC = max(pA, pB)
-    mA = signflip_p([x - delta for x in DA])[2]
-    mB = signflip_p([x - delta for x in DB])[2]
-    LA, LB = signflip_lower(DA, alpha), signflip_lower(DB, alpha)
+    mA = signflip_p([x - delta for x in DA], WA)[2]
+    mB = signflip_p([x - delta for x in DB], WB)[2]
+    LA, LB = signflip_lower(DA, alpha, WA), signflip_lower(DB, alpha, WB)
     floor = 1.0 / N
-    return {"available": True, "blocks": blocks, "n_blocks": n, "patterns": N,
+    return {"available": True, "blocks": blocks, "n_blocks": n, "patterns": N, "alpha": alpha,
+            "weights": {"A": WA, "B": WB},
             "estimate_A": eA, "estimate_B": eB, "t_A": t_stat(DA), "t_B": t_stat(DB),
             "tail_A": kA, "tail_B": kB, "p_A": pA, "p_B": pB, "p": pC, "p_floor": floor,
             "alpha_attainable": floor <= alpha, "reject": pC <= alpha and eA > 0 and eB > 0,
@@ -385,6 +406,14 @@ def holm(pvals, alpha=FAMILY_ALPHA, family=HYPOTHESES):
         adj[h] = run
     return {"adjusted": adj, "reject": {h: adj[h] <= alpha for h in family},
             "unavailable": sorted(h for h in family if pvals.get(h) is None), "alpha": alpha}
+
+
+def active_level(h, hyp):
+    """The Holm level at which hyp is tested: alpha / (m - i), i = its position in the step-down order
+    (its decision is Holm's; an earlier non-rejection stops the procedure before it)."""
+    m = len(h["adjusted"])
+    order = sorted(h["adjusted"], key=lambda x: (h["adjusted"][x], HYPOTHESES.index(x)))
+    return h["alpha"] / (m - order.index(hyp))
 
 
 def reciprocal_directional(h):
