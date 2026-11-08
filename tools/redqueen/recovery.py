@@ -220,10 +220,38 @@ class Data:
                     "base": np.flatnonzero(glob & fitrole & ~tm),
                     "b": np.flatnonzero((glob & fitrole & ~tm) | (self.within & (self.role == ROLES.index("training"))))}
         # target classes: world-transfer targets with A/B prey and with C prey; snapshot-test targets
+        # both source worlds of every test target (-1: a frozen reference), for the crossed bootstrap
+        self.test_qworld = self.qw[self.qi][self.test_idx]
+        self.test_pworld = self.pw[self.pj][self.test_idx]
+        self.forward = self.forward_sets(glob)
         self.qab = (self.qw >= 0) & np.isin(self.treat[np.maximum(self.qw, 0)], ["A", "B"]) & ~self.qref
         ab = self.qab[self.qi[self.test_idx]]
         self.classes = {"world_test_ab_prey": self.test_idx[ab], "world_test_c_prey": self.test_idx[~ab],
                         "snapshot_test": self.stest_idx}
+
+
+    def forward_sets(self, glob):
+        """The forward-time recovery's sets (v4 §7.3): fit on the training worlds' main outcomes through
+        120M (both endpoints, cross-world) plus every world snapshot's reference pairs against references
+        at <= 120M only (their placement); validation targets with both endpoints in 141-160M, test
+        targets in 181-200M (no window crossing the 20M separations); test split into the forward transfer
+        (both endpoints in training worlds) and the intersection (an endpoint in a test world)."""
+        QT, PT = self.qt[self.qi], self.pt[self.pj]
+        qw, pw = self.qw[self.qi], self.pw[self.pj]
+        qr, pr = self.qref[self.qi], self.pref[self.pj]
+        split = lambda w: np.where(w >= 0, self.wsplit[np.maximum(w, 0)], "ref")  # noqa: E731
+        qs, ps = split(qw), split(pw)
+        main = glob & ~qr & ~pr
+        oneref = glob & (qr ^ pr)
+        reft = np.where(qr, QT, PT)
+        both = lambda lo, hi: (QT >= lo) & (QT <= hi) & (PT >= lo) & (PT <= hi)  # noqa: E731
+        trainpair = (qs == "train") & (ps == "train")
+        fit = np.flatnonzero((main & trainpair & both(0, 120)) | (oneref & (reft <= 120)))
+        val = np.flatnonzero(main & ((qs != "test") & (ps != "test")) & both(141, 160))
+        fwd = np.flatnonzero(main & trainpair & both(181, 200))
+        inter = np.flatnonzero(main & ((qs == "test") | (ps == "test")) & both(181, 200))
+        return {"fit": fit, "val": val, "val_world": np.where(qw[val] >= 0, qw[val], pw[val]),
+                "tests": {"forward_transfer": fwd, "intersection": inter}}
 
 
 # ------------------------------------------------------------------ truth
@@ -487,11 +515,44 @@ def world_mean(vals, worlds):
 
 
 def cluster_lb(diff, worlds, rng, n=2000):
-    """Mean of the per-world means of diff, and its test-world cluster-bootstrap 2.5% quantile."""
+    """(Superseded for the decision by crossed_lb.) Mean of the per-world means of diff, and its
+    test-world cluster-bootstrap 2.5% quantile."""
     ws = np.unique(worlds)
     per = np.array([diff[worlds == w].mean() for w in ws])
     boots = per[rng.integers(0, len(ws), (n, len(ws)))].mean(axis=1)
     return float(per.mean()), float(np.quantile(boots, 0.025)), per.tolist()
+
+
+def crossed_lb(diff, test_world, qworld, pworld, rng, n=2000):
+    """The registered statistic (the mean over test worlds of their targets' mean score difference) and
+    its CROSSED source-world bootstrap 2.5% quantile (v4 §7.6; Annex H.7): every draw resamples the
+    targets' SOURCE worlds (both endpoints' worlds; a frozen reference is a calibration object, never
+    resampled) with replacement, multiplicities m; a target keeps its observed equal-test-world weight
+    times m_u m_v (cross-world), m_u (within one world, or against a reference). A draw whose weights
+    vanish counts as -inf (never dropped). -> (mean, lower bound, per-test-world means)."""
+    ws, tinv = np.unique(test_world, return_inverse=True)
+    nper = np.bincount(tinv)
+    per = np.bincount(tinv, weights=diff) / nper
+    base = 1.0 / (nper[tinv] * len(ws))
+    src = np.unique(np.concatenate([qworld[qworld >= 0], pworld[pworld >= 0]]))
+    qi = np.where(qworld >= 0, np.searchsorted(src, np.maximum(qworld, 0)), -1)
+    pj = np.where((pworld >= 0) & (pworld != qworld), np.searchsorted(src, np.maximum(pworld, 0)), -1)
+    keys, ginv = np.unique(np.stack([qi, pj]), axis=1, return_inverse=True)   # targets grouped by source pair
+    ginv = np.ravel(ginv)
+    gw = np.bincount(ginv, weights=base)
+    gd = np.bincount(ginv, weights=base * diff)
+    stats = np.empty(n)
+    for k0 in range(0, n, 500):
+        k1 = min(n, k0 + 500)
+        M = rng.multinomial(len(src), np.full(len(src), 1.0 / len(src)), size=k1 - k0).astype(float)
+        mq = np.where(keys[0] >= 0, M[:, np.maximum(keys[0], 0)], 1.0)
+        mp = np.where(keys[1] >= 0, M[:, np.maximum(keys[1], 0)], 1.0)
+        wts = mq * mp
+        den = wts @ gw
+        with np.errstate(invalid="ignore", divide="ignore"):
+            stats[k0:k1] = np.where(den > 0, (wts @ gd) / np.where(den > 0, den, 1.0), -np.inf)
+    srt = np.sort(stats)                     # (the order statistic: -inf draws stay in, never interpolated)
+    return float(per.mean()), float(srt[min(n, max(1, math.ceil(0.025 * (n + 1)))) - 1]), per.tolist()
 
 
 FITTERS = ("minimal", "registered")
@@ -571,14 +632,15 @@ def procedure(D, data, option, ranks, lambdas, iters, seed, ab_cap=None, fitter=
     base = lpd(zt, predict(D, m0, D.test_idx), s20(D.test_idx))
     for rec in out["candidates"]:      # (every candidate against rank 0: any restricted selection, post hoc)
         mk, sk = models[(rec["rank"], rec["lambda"])]
-        rec["test_improvement"], rec["test_lb"], _ = cluster_lb(lpd(zt, predict(D, mk, D.test_idx), sk(D.test_idx))
-                                                                - base, D.test_world, np.random.default_rng(seed + 7))
+        rec["test_improvement"], rec["test_lb"], _ = crossed_lb(
+            lpd(zt, predict(D, mk, D.test_idx), sk(D.test_idx)) - base, D.test_world, D.test_qworld, D.test_pworld,
+            np.random.default_rng(seed + 7))
     prim = max((c for c in out["candidates"] if c["rank"] <= PRIMARY_RANKS), key=lambda c: c["val_lpd"])
     out["selected_primary"] = {"ranks": list(range(PRIMARY_RANKS + 1)), "rank": prim["rank"],
                                "lambda": prim["lambda"], "test_improvement": prim["test_improvement"],
                                "test_lb": prim["test_lb"], "success": bool(prim["rank"] > 0 and prim["test_lb"] > 0)}
     diff = lpd(zt, predict(D, m1, D.test_idx), s21(D.test_idx)) - base
-    mean, lb, per = cluster_lb(diff, D.test_world, np.random.default_rng(seed + 7))
+    mean, lb, per = crossed_lb(diff, D.test_world, D.test_qworld, D.test_pworld, np.random.default_rng(seed + 7))
     zs = data["z"][D.stest_idx]
     sdiff = lpd(zs, predict(D, m1, D.stest_idx), s21(D.stest_idx)) - lpd(zs, predict(D, m0, D.stest_idx),
                                                                           s20(D.stest_idx))
@@ -593,6 +655,49 @@ def procedure(D, data, option, ranks, lambdas, iters, seed, ab_cap=None, fitter=
                per_test_world=per, success=bool(sel[0] > 0 and lb > 0),
                snapshot_test_improvement=float(sdiff.mean()), alignment_u1_b=align,
                fit_pairs=int(len(idx)), classes=class_accuracy(D, data, m1, m0), ab_cap=ab_cap)
+    return out
+
+
+def forward_procedure(D, data, ranks, lambdas, iters, seed, ab_cap=None, fitter="minimal", start="both"):
+    """The SEPARATE forward-time recovery (v4 §7.3): the same selection-and-prediction procedure on
+    D.forward's sets (fit through 120M plus references <= 120M; validation 141-160M; test 181-200M),
+    reported separately for the forward transfer and its intersection with the test worlds (each with
+    the crossed bootstrap)."""
+    F = D.forward
+    idx = F["fit"]
+    cands = [(0, 0.0)] + [(r, lam) for r in range(1, ranks + 1) for lam in lambdas]
+    out = {"procedure": "forward", "candidates": [], "fitter": fitter, "fit_pairs": int(len(idx)),
+           "val_pairs": int(len(F["val"])), "test_pairs": {k: int(len(v)) for k, v in F["tests"].items()}}
+    best, models = None, {}
+    for r, lam in cands:
+        m = any_fit(fitter, D, idx, data, r, lam, False, iters, seed, ab_cap=ab_cap, start=start)
+        s2 = predictive_var(D, data, m, idx, fitter)
+        vscore, _ = world_mean(lpd(data["z"][F["val"]], any_predict(D, m, F["val"]), s2(F["val"])), F["val_world"])
+        rec = {"rank": r, "lambda": lam, "val_lpd": vscore, "start": m.get("start")}
+        out["candidates"].append(rec)
+        models[(r, lam)] = (m, s2)
+        if best is None or vscore > best["val_lpd"]:
+            best = rec
+    sel = (best["rank"], best["lambda"])
+    m1, s21 = models[sel]
+    m0, s20 = models[(0, 0.0)]
+    out["selected"] = {"rank": sel[0], "lambda": sel[1]}
+    for name, t in F["tests"].items():
+        if not len(t):
+            out[name] = {"available": False, "reason": "no targets"}
+            continue
+        zt = data["z"][t]
+        diff = lpd(zt, any_predict(D, m1, t), s21(t)) - lpd(zt, any_predict(D, m0, t), s20(t))
+        qw, pw = D.qw[D.qi[t]], D.pw[D.pj[t]]
+        tw = np.where((qw >= 0) & (D.wsplit[np.maximum(qw, 0)] == ("test" if name == "intersection" else "train")),
+                      qw, pw)
+        mean, lb, per = crossed_lb(diff, tw, qw, pw, np.random.default_rng(seed + 11 + len(name)))
+        out[name] = {"available": True, "test_improvement": mean, "test_lb": lb, "per_world": per,
+                     "success": bool(sel[0] > 0 and lb > 0), "targets": int(len(t))}
+    out["success"] = out["forward_transfer"].get("success", False)
+    out["test_improvement"] = out["forward_transfer"].get("test_improvement")
+    out["test_lb"] = out["forward_transfer"].get("test_lb")
+    out["classes"] = {}
     return out
 
 
@@ -631,6 +736,22 @@ def numerical(D, data, option, rank, iters, seed, ab_cap=None, fitter="minimal")
 
 # ------------------------------------------------------------------ commands
 _DATA = {}
+CONFIG_SCHEMA = "finfolk.redqueen.recoverycfg/1"
+
+
+def run_config(a, graph_sha):
+    """Everything a recovery result depends on (resume and summary refuse to mix two of them)."""
+    tools = {f: rqlib.sha256_file(os.path.join(HERE, f)) for f in ("recovery.py", "map.py", "graph.py")
+             if os.path.isfile(os.path.join(HERE, f))}
+    return {"schema": CONFIG_SCHEMA, "graph_edges_sha256": graph_sha, "namespace": a.namespace,
+            "fitter": a.fitter, "options": a.options, "ranks": a.ranks, "lambdas": a.lambdas, "iters": a.iters,
+            "ab_cap": a.ab_cap, "start": getattr(a, "start", None), "tools_sha256": tools, "scenarios": SCENARIOS,
+            "defaults": DEFAULTS, "lambda_grid": list(REGISTERED_LAMBDAS) if "REGISTERED_LAMBDAS" in globals() else None,
+            "bootstrap": "crossed/1"}
+
+
+def graph_sha(path):
+    return rqlib.read_json(os.path.join(os.path.dirname(os.path.abspath(path)), "graph.meta.json"))["edges_sha256"]
 
 
 def load_data(path):
@@ -647,13 +768,17 @@ def one(a):
     data = simulate(D, sc, seed)
     res = {"schema": RESULT_SCHEMA, "scenario": a.scenario, "rep": a.rep, "seed": seed,
            "settings": data["settings"], "interaction_scale": data["c"], "energy_check": data["energy"],
-           "graph_edges_sha256": D.g["edges_sha256"], "options": {}}
+           "graph_edges_sha256": D.g["edges_sha256"], "options": {},
+           "config_sha256": rqlib.canonical_sha(run_config(a, D.g["edges_sha256"]))}
     cap = a.ab_cap if a.ab_cap >= 0 else None
     res["fitter"] = a.fitter
     res["start"] = a.start
     for opt in a.options.split(","):
         if sc.get("noiseless"):
             res["options"][opt] = numerical(D, data, opt, sc["rank"], a.iters, seed, ab_cap=cap, fitter=a.fitter)
+        elif opt == "fwd":
+            res["options"][opt] = forward_procedure(D, data, a.ranks, [float(x) for x in a.lambdas.split(",")],
+                                                    a.iters, seed, ab_cap=cap, fitter=a.fitter, start=a.start)
         else:
             res["options"][opt] = procedure(D, data, opt, a.ranks, [float(x) for x in a.lambdas.split(",")],
                                             a.iters, seed, ab_cap=cap, fitter=a.fitter, start=a.start)
@@ -664,6 +789,21 @@ def one(a):
 
 def run(a):
     os.makedirs(a.out, exist_ok=True)
+    cfg = rqlib.canonical(run_config(a, graph_sha(a.graph)))
+    cp = os.path.join(a.out, "config.json")
+    if os.path.isfile(cp):
+        if rqlib.read_bytes(cp) != cfg:
+            have = rqlib.read_json(cp)
+            diff = sorted(k for k in set(have) | set(json.loads(cfg)) if have.get(k) != json.loads(cfg).get(k))
+            raise SystemExit(f"{a.out} holds a recovery run of another configuration ({diff}): refusing to resume")
+    else:
+        rqlib.write_durable(cp, cfg)
+    want = rqlib.sha256_bytes(cfg)
+    for f in os.listdir(a.out):
+        if f.endswith(".json") and f != "config.json" and not f.startswith("summary"):
+            if rqlib.read_json(os.path.join(a.out, f)).get("config_sha256") != rqlib.canonical_sha(json.loads(cfg)):
+                raise SystemExit(f"{f}: a result of another configuration in {a.out}: refusing to resume")
+    del want
     names = SETS[a.set] if a.set != "all" else [n for s in ("main", "stress", "power", "numerical") for n in SETS[s]]
     if a.scenarios:
         names = a.scenarios.split(",")
@@ -707,13 +847,17 @@ def wilson(k, n, z=1.96):
 
 def summarize(d):
     rows = {}
+    cfgs = set()
     for f in sorted(os.listdir(d)):
-        if not f.endswith(".json") or f.startswith("summary"):
+        if not f.endswith(".json") or f.startswith("summary") or f == "config.json":
             continue
         r = rqlib.read_json(os.path.join(d, f))
+        cfgs.add(r.get("config_sha256"))
+        if len(cfgs) > 1 or None in cfgs:
+            raise SystemExit(f"{d}: results of different (or unrecorded) configurations: refusing a mixed summary")
         for opt, o in r["options"].items():
             rows.setdefault((r["scenario"], opt), []).append(o)
-    out = {"schema": "finfolk.redqueen.recoverysummary/1", "cells": []}
+    out = {"schema": "finfolk.redqueen.recoverysummary/1", "config_sha256": next(iter(cfgs), None), "cells": []}
     for (sc, opt), lst in sorted(rows.items()):
         if "success" in lst[0]:
             k = sum(o["success"] for o in lst)

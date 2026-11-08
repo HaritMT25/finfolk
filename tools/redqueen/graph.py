@@ -45,8 +45,9 @@ FAMILIES (v4 §4.5; quotas checked; no pair twice).
               eligible training C predators: 3,877
   The top-ups are the recovery comparison's choice (rank 4 identifiable for every population, the
   noisy A/B and snapshot-test errors down; +5,178 pairs, about 0.24 production days at 5k);
-  --snapshot-topup 0 --ab-topup 0 gives the v4 graph alone. They come after every registered
-  family, which they leave unchanged.
+  --snapshot-topup 0 --ab-topup 0 gives the v4 graph alone (237,884 pairs: the lag7 probe below is
+  part of the registered top-up switch). They come after every registered family, which they leave
+  unchanged.
   lag7_probe  (v4 amendment, 2026-11-07) every NON-intensive C world's coarse prey snapshots (F1, 5M,
               ..., 200M) against its own predators 7M later and 7M earlier, where they exist: 78 per
               world, 24 x 78 = 1,872 within-world pairs (about 11,200 5k trajectories at R = 6, about
@@ -55,8 +56,9 @@ FAMILIES (v4 §4.5; quotas checked; no pair twice).
               mod 15 miss 6-9: a 120-degree gap); +-7M lags close it (largest gap 48 degrees), so the
               15M candidate is supported in all 32 C worlds, with statistical weight. Within-world
               pairs: never in the Level-1 fit (as "within"); roles by endpoint; the randomized 1/8
-              long pool. --lag-probe 0 gives the graph without it. It comes after every other family,
-              which it leaves unchanged.
+              long pool. It is on with the top-ups and off without them (--lag-probe M overrides:
+              0 gives the top-ups without it). It comes after every other family, which it leaves
+              unchanged.
 
 ROLES. A pair is "support" when it is declared placement support of a held-out population: its four
 reference pairs, two of its existing matching pairs with an eligible training opponent (world
@@ -193,7 +195,7 @@ SNAPSHOT_TOPUP, AB_TOPUP = 6, 8     # the recommended top-ups (the recovery comp
 
 
 def build(ns="rq2026-graph", worlds=None, train_matchings=True, snapshot_topup=SNAPSHOT_TOPUP, ab_topup=AB_TOPUP,
-          ab_topup_mode="fitting", lag_probe=LAG_PROBE):
+          ab_topup_mode="fitting", lag_probe=None):
     """-> the graph: {"schema", "namespace", "worlds", "split", "fork", "intensive", "holdout",
     "edges": [(prey, pred, family, role, horizon)], ...}.
     snapshot_topup N: every snapshot-holdout population with fewer than N training opponents among
@@ -201,8 +203,11 @@ def build(ns="rq2026-graph", worlds=None, train_matchings=True, snapshot_topup=S
     ab_topup N: every training A/B prey snapshot gets new training pairs to eligible training C
     predators (ab_train_c) until it has N fitting pairs (mode "fitting": its four reference pairs
     included) or N training C opponents (mode "c"). Both come after every registered family, which
-    they leave unchanged."""
-    worlds = worlds or synthetic_worlds()
+    they leave unchanged. lag_probe None: part of the registered top-up switch (LAG_PROBE with any
+    top-up, 0 with none: --snapshot-topup 0 --ab-topup 0 is the pure v4 graph); an int sets it."""
+    if lag_probe is None:
+        lag_probe = LAG_PROBE if (snapshot_topup or ab_topup) else 0
+    worlds = sorted((dict(w) for w in (worlds or synthetic_worlds())), key=lambda w: w["id"])
     split, fork, intensive, holdout = splits(ns, worlds)
     block = {w["id"]: w["block"] for w in worlds}
     treat = {w["id"]: w["treatment"] for w in worlds}
@@ -259,21 +264,96 @@ def build(ns="rq2026-graph", worlds=None, train_matchings=True, snapshot_topup=S
         for m in range(8):
             add(f"RQ:{k}", f"RP:{m}", "ref_grid")
     # eight C cross-world matchings; the shifts are redrawn until every held-out C world meets at
-    # least four training worlds in each direction (so its two support opponents from the existing
-    # matchings exist, whatever the snapshot holdouts)
+    # least four training worlds in each direction; then EVERY held-out C population (world and
+    # snapshot holdouts) must have at least two ELIGIBLE training opponents (training world, not a
+    # held-out snapshot) in the existing matchings: a deterministic repair swaps time pairings inside
+    # the time-randomized matchings (m >= 2; the two time-aligned ones untouched), each swap only
+    # adding eligible opponents (shift redraws alone cannot reach zero shortfalls: about 8-18 per
+    # attempt); a population that cannot be repaired fails the build
     nc = len(cs)
     for attempt in range(1000):
         shifts = Rng(ns, "cross-shifts", attempt).perm(range(1, nc))[:8]
-        if all(sum(split[cs[(i + d * s) % nc]] == "train" for s in shifts) >= 4
-               for i, w in enumerate(cs) if split[w] != "train" for d in (1, -1)):
+        if (all(sum(split[cs[(i + d * s) % nc]] == "train" for s in shifts) >= 4
+                for i, w in enumerate(cs) if split[w] != "train" for d in (1, -1))
+                and all(sum(split[cs[(i + d * s) % nc]] == "train" for s in shifts[2:]) >= 2   # (the repairable ones)
+                        for i, w in enumerate(cs) for d in (1, -1))):
             break
     else:
-        raise GraphError("no cross-matching shifts give every held-out world four training opponents")
+        raise GraphError("no cross-matching shifts give every held-out world four training opponents and every "
+                         "C world two training partners among the time-randomized matchings")
+    taus = {(m, w): (list(TIMES) if m < 2 else Rng(ns, "cross-time", m, w).perm(TIMES))
+            for m in range(len(shifts)) for w in cs}
+    partner = {(m, w): cs[(i + s) % nc] for m, s in enumerate(shifts) for i, w in enumerate(cs)}
+    cnt = Counter()
+    for (m, w), tw in taus.items():
+        o = partner[(m, w)]
+        for t in TIMES:
+            q, p = Q(w, t), P(o, tw[t])
+            sq, sp = status(q), status(p)
+            if sq != "train" and sp == "train":
+                cnt[q] += 1
+            if sp != "train" and sq == "train":
+                cnt[p] += 1
+    heldpop = sorted(x for w in cs for t in TIMES for x in (Q(w, t), P(w, t)) if status(x) != "train")
+    repairs = []
+
+    def gains(q, p):                         # the eligible opponent each held-out endpoint of (q, p) gains
+        d = defaultdict(int)
+        sq, sp = status(q), status(p)
+        if sq != "train" and sp == "train":
+            d[q] += 1
+        if sp != "train" and sq == "train":
+            d[p] += 1
+        return d
+    for x in heldpop:
+        g_, w, t = parse(x)
+        while cnt[x] < 2:
+            done = False
+            for m in range(2, len(shifts)):
+                if g_ == "Q":
+                    v, o = w, partner[(m, w)]
+                    tw = taus[(m, v)]
+                    t0 = t
+                    other = o
+                else:
+                    v = next(y for y in cs if partner[(m, y)] == w)
+                    o = w
+                    tw = taus[(m, v)]
+                    t0 = tw.index(t)
+                    other = v
+                if split[other] != "train" or gains(Q(v, t0), P(o, tw[t0]))[x] > 0:
+                    continue                     # (no training partner here, or already eligible here)
+                for u in Rng(ns, "cross-repair", m, v, t0).perm(TIMES):
+                    if u == t0:
+                        continue
+                    a, b = tw[t0], tw[u]
+                    d = defaultdict(int)
+                    for k, dv in gains(Q(v, t0), P(o, b)).items():
+                        d[k] += dv
+                    for k, dv in gains(Q(v, u), P(o, a)).items():
+                        d[k] += dv
+                    for k, dv in gains(Q(v, t0), P(o, a)).items():
+                        d[k] -= dv
+                    for k, dv in gains(Q(v, u), P(o, b)).items():
+                        d[k] -= dv
+                    if d[x] <= 0 or any(dv < 0 and cnt[y] + dv < 2 for y, dv in d.items() if y != x):
+                        continue                 # (x must gain; nobody else may fall below two)
+                    tw[t0], tw[u] = b, a
+                    for k, dv in d.items():
+                        cnt[k] += dv
+                    repairs.append([m, v, t0, u])
+                    done = True
+                    break
+                if done:
+                    break
+            if not done:
+                raise GraphError(f"{x}: fewer than two eligible training opponents in the existing matchings, "
+                                 "and no repair swap")
     matched = defaultdict(list)   # population -> [(matching, other endpoint)]
     for m, s in enumerate(shifts):
         for i, w in enumerate(cs):
             o = cs[(i + s) % len(cs)]
-            tau = list(TIMES) if m < 2 else Rng(ns, "cross-time", m, w).perm(TIMES)
+            tau = taus[(m, w)]
             for t in TIMES:
                 q, p = Q(w, t), P(o, tau[t])
                 if not add(q, p, "cross"):
@@ -304,6 +384,8 @@ def build(ns="rq2026-graph", worlds=None, train_matchings=True, snapshot_topup=S
         if sx == "train":
             continue
         quota = 2 if split[w] != "train" else 6
+        if sum(status(y) == "train" for _, y in lst) < 2:
+            raise GraphError(f"{x}: fewer than two eligible existing training opponents (v4 §4.4)")
         for m, y in sorted(lst):
             if quota and status(y) == "train":
                 support.add((x, y) if g == "Q" else (y, x))
@@ -408,7 +490,8 @@ def build(ns="rq2026-graph", worlds=None, train_matchings=True, snapshot_topup=S
             "worlds": worlds, "split": split, "fork": fork, "intensive": intensive,
             "holdout": {f"{w}:{t}": v for (w, t), v in sorted(holdout.items())},
             "ref_subsets": {"predator_refs_of_block": sub_p, "prey_refs_of_block": sub_q},
-            "cross_shifts": {"shifts": shifts, "attempt": attempt},
+            "cross_shifts": {"shifts": shifts, "attempt": attempt, "repair_swaps": len(repairs),
+                             "repairs": repairs},
             "edges": edges}
 
 
@@ -567,8 +650,8 @@ def main(argv=None):
     b.add_argument("--snapshot-topup", type=int, default=SNAPSHOT_TOPUP, metavar="N", help="0: none (pure v4)")
     b.add_argument("--ab-topup", type=int, default=AB_TOPUP, metavar="N", help="0: none (pure v4)")
     b.add_argument("--ab-topup-mode", choices=("fitting", "c"), default="fitting")
-    b.add_argument("--lag-probe", type=int, default=LAG_PROBE, metavar="M",
-                   help="the lag7_probe family's lag (v4 amendment; 0: none)")
+    b.add_argument("--lag-probe", type=int, default=None, metavar="M",
+                   help="the lag7_probe family's lag (v4 amendment; default: 7 with the top-ups, 0 without them)")
     r = sub.add_parser("report")
     r.add_argument("--graph", required=True)
     r.add_argument("--out")
