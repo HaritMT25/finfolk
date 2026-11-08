@@ -1405,6 +1405,51 @@ class TestBurnIn(unittest.TestCase):
             if not want:
                 self.assertIn("will be restarted", why)
 
+    def test_decided_from_the_rows_before_the_zero_is_published(self):
+        """#70 round 3 (P1): the pre-publication window. A main-CSV zero at 1500 and an acceptance at 2000,
+        the admission BEFORE recover_zeros (no zero in the ledger yet): not decided (the verified rows show
+        the zero); a zero exactly at the burn-in frame is data (decided); no zero: decided alive; a chain
+        whose rows end before the burn-in frame: not decided."""
+        for zero_at, want, word in ((1500, False, "will be restarted"), (2000, True, "(data)"),
+                                    (10 ** 9, True, "nonzero through frame 2000")):
+            worlds.release_archives()
+            rm_tree(self.tmp)
+            os.makedirs(self.tmp)
+            root, reg, ar, wid = self.world(zero_at=zero_at, burn_in=2000)
+            s, msgs = supervisor(root, reg, ar)
+            s.archive_pass(wid, alive=False)
+            s.accept_pass(wid, alive=False)                 # (no recover_zeros: nothing published)
+            self.assertIn(2000, [r["frame"] for r in worlds.accept_records(root, wid)])
+            self.assertFalse(os.path.isfile(os.path.join(root, "availability.jsonl")))
+            got, why = worlds.burn_in_decided(root, reg, wid)
+            self.assertEqual(got, want, why)
+            self.assertIn(word, why)
+        worlds.release_archives()
+        rm_tree(self.tmp)
+        os.makedirs(self.tmp)
+        root, reg, ar, wid = self.world(zero_at=10 ** 9, burn_in=2500)
+        s, msgs = supervisor(root, reg, ar)
+        s.archive_pass(wid, alive=False)
+        s.accept_pass(wid, alive=False)                     # (the chain ends at 2000 < 2500)
+        got, why = worlds.burn_in_decided(root, reg, wid)
+        self.assertFalse(got, why)
+        self.assertIn("not passed the burn-in frame", why)
+
+    def test_startup_publishes_zeros_before_accepting(self):
+        """#70 round 3 (belt and braces): at startup a world's zeros are recovered (published) before its
+        acceptance pass, so no acceptance past an early zero exists while the zero is unpublished."""
+        root, reg, ar, wid = self.world(zero_at=1500, burn_in=2000)
+        s, msgs = supervisor(root, reg, ar)
+        seen = []
+        orig = s.accept_pass
+
+        def spy(w, alive):
+            seen.append(any(e["world"] == w for e in worlds.read_jsonl(os.path.join(root, "availability.jsonl"))))
+            return orig(w, alive)
+        s.accept_pass = spy
+        s.startup()
+        self.assertTrue(seen and seen[0], (seen, msgs))
+
     def test_live_invalid_row_barrier_persists(self):
         """#70 round 2, 2: once a segment shows an invalid row, no later row of it is evidence (the tail has
         moved past the batch): 100,50,8 / 150,50,8 (off the sequence) / later 200,0,8: no zero."""

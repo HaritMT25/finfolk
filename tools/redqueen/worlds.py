@@ -908,12 +908,68 @@ def burn_in_decided(root, reg, wid):
                        f"the burn-in frame {bi}: it will be restarted")      # whatever was accepted past it
     if z:
         return True, f"its first zero {min(z.values())} is at or after the burn-in frame"
+    # no published zero: survival is established from the BIOLOGICAL rows themselves (a zero may sit in
+    # verified logs before recovery publishes it), never from the ledger's silence
     w = next((x for x in reg["worlds"] if x["id"] == wid), None)
-    good = verified_records(root, wid, st, w["treatment"] if w else "C") if st["segments"] else {}
-    alive = [f for (_, f) in good]
-    if alive and max(alive) >= bi:
-        return True, f"verified alive through frame {max(alive)} >= the burn-in frame {bi}"
-    return False, f"attempt {attempt_of(root, wid)} has not passed the burn-in frame {bi} yet"
+    tr = w["treatment"] if w else "C"
+    good = verified_records(root, wid, st, tr) if st["segments"] else {}
+    how, f = chain_rows_through(root, wid, st, tr, good, bi, reg["schedule"]["log_every"])
+    if how == "zero":
+        return False, (f"attempt {attempt_of(root, wid)}'s verified main CSV has a zero at frame {f} before the "
+                       f"burn-in frame {bi}: it will be restarted")
+    if how == "zero-at":
+        return True, f"its verified main CSV's first zero is at frame {f}, at or after the burn-in frame (data)"
+    if how == "alive":
+        return True, f"its verified main-CSV rows are nonzero through frame {f} >= the burn-in frame {bi}"
+    return False, f"attempt {attempt_of(root, wid)} has not passed the burn-in frame {bi} yet (rows to {f})"
+
+
+def chain_rows_through(root, wid, st, treatment, good, bi, log_every):
+    """The VALIDATED main-CSV rows of the verified acceptance chain, through the burn-in frame: each chain
+    segment's verified prefix (the bytes its last chain record covers), its rows from its start frame on
+    the log_every sequence (valid_row), up to the frame the chain leaves it; the segments contiguous.
+    -> ("zero", f): a guild at 0 at f < bi; ("zero-at", f): the first zero at the first row f >= bi;
+    ("alive", f): every row before bi nonzero and a row at f >= bi; ("short", f): the rows end at f < bi."""
+    chain = verified_chain(st, good)
+    segs = {s["name"]: s for s in st["segments"]}
+    last, order = {}, []
+    for r in chain:                                     # (frame order = segment order along the chain)
+        if r["segment"] not in last:
+            order.append(r["segment"])
+        last[r["segment"]] = r
+    reached = 0
+    for name in order:
+        s, cut = segs[name], last[name]
+        if s["start_frame"] != reached:                 # (not contiguous with the rows before it)
+            return "short", reached
+        n = cut["logs"]["run.csv"]["bytes"]
+        try:
+            with open(os.path.join(wdir(root, wid), name, "run.csv"), "rb") as fh:
+                raw = fh.read(n)
+        except OSError:
+            return "short", reached
+        if len(raw) != n:
+            return "short", reached
+        lines = raw[: raw.rfind(b"\n") + 1].split(b"\n")[:-1]
+        if not lines:
+            return "short", reached
+        hdr = next(csv.reader([lines[0].decode("utf-8")]))
+        prev = s["start_frame"]
+        for ln in lines[1:]:
+            r = next(csv.reader([ln.decode("utf-8")]))
+            if not valid_row(hdr, r, prev, log_every) or int(r[0]) > cut["frame"]:
+                break
+            prev = int(r[0])
+            zero = any(int(r[hdr.index(col)]) == 0 for g, col in GUILDS
+                       if col in hdr and not (g == "predators" and treatment == "A"))
+            if zero:
+                return ("zero" if prev < bi else "zero-at"), prev
+            if prev >= bi:
+                return "alive", prev
+        if prev != cut["frame"]:                        # (its rows do not reach the frame the chain leaves it)
+            return "short", prev
+        reached = prev
+    return "short", reached
 
 
 def attempt_dir(root, wid, attempt):
@@ -2442,9 +2498,9 @@ class Supervisor:
                 missing_f1.append(wid)
             if st["segments"]:
                 try:
-                    self.archive_pass(wid, alive=False)
+                    self.recover_zeros(wid)                # (FIRST: an early zero is published before any
+                    self.archive_pass(wid, alive=False)    # acceptance past it is made)
                     self.accept_pass(wid, alive=False)
-                    self.recover_zeros(wid)
                     self.refresh_chain(wid)
                     kind, info = self.next_action(wid)
                 except (WorldsError, ckpt.CheckpointError, OSError, ValueError) as e:
