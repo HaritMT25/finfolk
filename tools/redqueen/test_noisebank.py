@@ -53,7 +53,7 @@ except ImportError:
     np = None
 
 NS = nb.VALIDATION_NAMESPACE
-STEP = 0.0199                    # (a coarse dependence grid for the tests: 101 nodes; registered 0.005)
+M = 60                           # (a coarse dependence grid for the tests: 61 nodes in atanh(rho); registered 240)
 
 
 def write_registry(path, ns, n=12, treatment="C"):
@@ -336,6 +336,89 @@ class TestNumerics(unittest.TestCase):
                                     np.array([edges[j + 1]]), 0.6)[0]) for i in range(4) for j in range(4))
         self.assertAlmostEqual(tot, 1.0, delta=1e-13)
 
+    def test_log_rect_is_tail_stable(self):
+        """Codex #72 r2 P1: log_rect agrees with differenced tails where those are accurate (moderate
+        rectangles), stays exact where they cancel (a thin discordant rectangle at rho = +-0.995: the density
+        limit, where differencing gives 0), is unchanged by a 16x panel refinement (LOG_RECT_TOL), handles
+        infinite ends, and never floors."""
+        rng = np.random.default_rng(0)
+        n = 600
+        c1, c2 = rng.normal(0, 1.5, n), rng.normal(0, 1.5, n)
+        w1, w2 = rng.uniform(0.01, 0.6, n), rng.uniform(0.01, 0.6, n)
+        for r in (-0.9, 0.0, 0.5, 0.95):
+            a = nb.log_rect(c1, c1 + w1, c2, c2 + w2, r)
+            b = nb.bvn_rect(c1, c1 + w1, c2, c2 + w2, r)
+            ok = b > 1e-8
+            self.assertLess(float(np.max(np.abs(a[ok] - np.log(b[ok])))), 1e-6, r)
+        for r, y in ((0.995, 1.0), (-0.995, -1.0)):
+            x, w = -1.0, 1e-4
+            lr = float(nb.log_rect(np.array([x]), np.array([x + w]), np.array([y]), np.array([y + w]), r)[0])
+            s_ = math.sqrt(1 - r * r)
+            xm, ym = x + w / 2, y + w / 2
+            dens = math.log(w * w) - math.log(2 * math.pi * s_) - (xm * xm - 2 * r * xm * ym + ym * ym) / (2 * s_ * s_)
+            self.assertAlmostEqual(lr, dens, delta=1e-3)
+            self.assertLess(lr, -200)
+            self.assertLessEqual(float(nb.bvn_rect(np.array([x]), np.array([x + w]), np.array([y]),
+                                                   np.array([y + w]), r)[0]), 1e-80)       # (the cancellation)
+        l1 = np.where(rng.random(n) < 0.15, -np.inf, c1)
+        h2 = np.where(rng.random(n) < 0.15, np.inf, c2 + w2)
+        old = nb.PANEL_EFOLDS
+        for r in (-0.995, -0.99, 0.0, 0.99, 0.995):
+            a = nb.log_rect(l1, c1 + w1, c2, h2, r)
+            nb.PANEL_EFOLDS = old / 16
+            try:
+                b = nb.log_rect(l1, c1 + w1, c2, h2, r)
+            finally:
+                nb.PANEL_EFOLDS = old
+            self.assertTrue(np.all(np.isfinite(a)))
+            self.assertLess(float(np.max(np.abs(a - b))), nb.LOG_RECT_TOL, r)
+        a = nb.log_rect(np.array([-np.inf]), np.array([0.3]), np.array([-0.2]), np.array([np.inf]), 0.4)
+        self.assertAlmostEqual(float(a[0]), math.log(float(nb.bvn_upper(np.array([-0.3]), np.array([-0.2]), -0.4)[0])),
+                               delta=1e-9)
+        self.assertAlmostEqual(float(nb._log_iprob(np.array([40.0]), np.array([40.5]))[0]),
+                               float(nb._logQ(np.array([40.0]))[0]) + math.log1p(-math.exp(
+                                   float(nb._logQ(np.array([40.5]))[0] - nb._logQ(np.array([40.0]))[0]))), delta=1e-12)
+        self.assertTrue(float(nb._logQ(np.array([60.0]))[0]) < -1800)              # (no underflow to -inf)
+
+    def test_grid_tolerances_near_the_limits(self):
+        """Codex #72 r2 P2: on the registered grid (241 nodes in atanh(rho)) every pair's interpolated
+        contribution is within GRID_LL_TOL of the exact one OFF the grid near both limits, for thin
+        concordant and discordant rectangles; a group objective's interpolated maximizer near 0.99 is within
+        GRID_RHO_TOL of the exact maximizer."""
+        rng = np.random.default_rng(3)
+        n = 40
+        x = rng.normal(0, 1.2, n)
+        y = np.concatenate([x[: n // 2] + rng.normal(0, 0.1, n // 2), -x[n // 2:] + rng.normal(0, 0.1, n - n // 2)])
+        w1, w2 = rng.uniform(0.02, 0.2, n), rng.uniform(0.02, 0.2, n)
+        l1, h1, l2, h2 = x, x + w1, y, y + w2
+        base = nb._log_iprob(l1, h1) + nb._log_iprob(l2, h2)
+        grid = nb.rho_grid(nb.Z_INTERVALS)
+        vals = np.array([nb.log_rect(l1, h1, l2, h2, float(r)) - base for r in grid])     # (nodes x pairs)
+        for r in (0.9937, 0.9811, 0.9502, -0.9502, -0.9811, -0.9937, 0.9949, -0.9949):
+            exact = nb.log_rect(l1, h1, l2, h2, r) - base
+            interp = np.array([float(nb._cubic(vals[:, k], np.array([r]), nb.Z_INTERVALS)[0]) for k in range(n)])
+            self.assertLess(float(np.max(np.abs(interp - exact))), nb.GRID_LL_TOL, r)
+        z = rng.multivariate_normal([0, 0], [[1, 0.99], [0.99, 1]], 300)
+        L1, L2 = z[:, 0] - 0.03, z[:, 1] - 0.03
+        b2 = nb._log_iprob(L1, L1 + 0.06) + nb._log_iprob(L2, L2 + 0.06)
+        f = np.array([float(np.sum(nb.log_rect(L1, L1 + 0.06, L2, L2 + 0.06, float(r)) - b2)) for r in grid])
+        r_int, _ = nb._argmax(f, nb.Z_INTERVALS)
+        a, b = 0.9, 0.995                                         # (golden section on the EXACT objective)
+        g = (math.sqrt(5) - 1) / 2
+        F = lambda r: float(np.sum(nb.log_rect(L1, L1 + 0.06, L2, L2 + 0.06, r) - b2))  # noqa: E731
+        c, d = b - g * (b - a), a + g * (b - a)
+        fc, fd = F(c), F(d)
+        for _ in range(60):
+            if fc > fd:
+                b, d, fd = d, c, fc
+                c = b - g * (b - a)
+                fc = F(c)
+            else:
+                a, c, fc = c, d, fd
+                d = a + g * (b - a)
+                fd = F(d)
+        self.assertLess(abs(r_int - (a + b) / 2), nb.GRID_RHO_TOL)
+
     def test_marginal_mle(self):
         """The interval-censored marginal MLE recovers (a, sigma) of rounded logistic-normal counts (the
         empirical-logit moments only start it), with calibrated observed-information errors; constant counts,
@@ -396,7 +479,7 @@ class TestEstimator(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.doc, cls.lat = simulate()
-        cls.bank = nb.estimate(cls.doc, boot=29, step=STEP)
+        cls.bank = nb.estimate(cls.doc, boot=29, m=M)
 
     def test_groups_track_the_true_latent_correlations(self):
         """The machinery check: at every horizon each group's composite-likelihood maximum equals the realized
@@ -433,8 +516,8 @@ class TestEstimator(unittest.TestCase):
             for ch in "CS":
                 sh = c["shares"][ch]
                 self.assertAlmostEqual(sh["row"] + sh["donor"] + sh["cell"], 1.0, delta=1e-12)
-            for M in (SR, SD, SE):
-                self.assertGreaterEqual(float(np.min(np.linalg.eigvalsh(M))), -1e-12)
+            for Mx in (SR, SD, SE):
+                self.assertGreaterEqual(float(np.min(np.linalg.eigvalsh(Mx))), -1e-12)
             bs = e["bootstrap"]
             self.assertEqual(bs["draws"], 29)
             lo, hi = bs["ci95"]["R_CC"]
@@ -475,18 +558,18 @@ class TestEstimator(unittest.TestCase):
 @unittest.skipIf(np is None, "numpy is not installed")
 class TestFeasibilityAndRefusals(unittest.TestCase):
     def quad(self, centre, curv=500.0):
-        g = nb.rho_grid(STEP)
+        g = nb.rho_grid(M)
         return {k: -curv * (g - centre[k]) ** 2 for k in nb.GROUPS}
 
     def test_feasible_maxima_are_the_fit(self):
         r = {"R_CC": 0.3, "R_SS": 0.25, "R_CS": 0.1, "D_CC": 0.2, "D_SS": 0.15, "D_CS": 0.05, "T_CS": 0.3,
              "R_CF": 0.1, "R_SF": 0.2}
-        f = nb.fit_dependence(self.quad(r), STEP)
+        f = nb.fit_dependence(self.quad(r), M)
         self.assertEqual(f["fit"], "unconstrained")
         for k in nb.GROUPS:
-            self.assertAlmostEqual(f["rho"][k], r[k], delta=STEP / 40)
+            self.assertAlmostEqual(f["rho"][k], r[k], delta=0.005)
         with self.assertRaises(nb.NoiseBankError):
-            nb.rho_grid(0.02)                                                   # (does not divide the grid)
+            nb.rho_grid(4)                                                      # (too coarse)
 
     def test_infeasible_maxima_give_a_psd_fit(self):
         """Codex #72 r1 P1-2: maxima with row + donor > 1, a too-large cross-channel row correlation and a free
@@ -499,26 +582,57 @@ class TestFeasibilityAndRefusals(unittest.TestCase):
         self.assertFalse(feas)
         self.assertTrue(prob)
         obj = self.quad(r)
-        f = nb.fit_dependence(obj, STEP)
+        f = nb.fit_dependence(obj, M)
         self.assertEqual(f["fit"], "constrained")
         SR, SD, SE = f["SigmaR"], f["SigmaD"], f["SigmaE"]
-        for M in (SR, SD, SE):
-            self.assertGreaterEqual(float(np.min(np.linalg.eigvalsh(M))), -1e-12)
+        for Mx in (SR, SD, SE):
+            self.assertGreaterEqual(float(np.min(np.linalg.eigvalsh(Mx))), -1e-12)
         self.assertAlmostEqual(SR[0, 0] + SD[0, 0] + SE[0, 0], 1.0, delta=1e-12)
         self.assertAlmostEqual(SR[1, 1] + SD[1, 1] + SE[1, 1], 1.0, delta=1e-12)
         self.assertLessEqual(SR[2, 2], 1.0 + 1e-12)
         start = nb._theta_map(nb._theta_start(f["unconstrained"]))
-        ll0 = sum(float(nb._cubic(obj[g], start[g], STEP)) for g in nb.GROUPS)
+        ll0 = sum(float(nb._cubic(obj[g], start[g], M)) for g in nb.GROUPS)
         self.assertGreater(f["loglik"], ll0)
         for th in ([0.1] * 9, [1.0, 2.0, -0.5, 0.3, 1.4, -1.2, 0.7, 1.5, 2.5]):
             self.assertTrue(nb.components_of(nb._theta_map(th))[3])
+
+    def test_constrained_domain_and_certification(self):
+        """The constrained fit stays inside the evaluable domain (maxima beyond it give |rho| <= RHO_MAX, the
+        reported matrices being the evaluated ones); a non-converged optimizer and disagreeing starts are
+        refused, never accepted."""
+        r = {"R_CC": 0.999, "R_SS": 0.05, "R_CS": 0.3, "D_CC": 0.3, "D_SS": 0.2, "D_CS": 0.1, "T_CS": 0.99,
+             "R_CF": 0.999, "R_SF": -0.6}
+        g = nb.rho_grid(M)
+        obj = {k: -500.0 * (g - min(max(r[k], -0.9999), 0.9999)) ** 2 for k in nb.GROUPS}
+        f = nb.fit_dependence(obj, M)
+        self.assertEqual(f["fit"], "constrained")
+        self.assertTrue(all(abs(v) <= nb.RHO_MAX for v in f["rho"].values()))
+        self.assertLessEqual(f["starts"]["loglik_spread"], nb.START_TOL)
+        self.assertAlmostEqual(f["loglik"], sum(float(nb._cubic(obj[k], np.array([f["rho"][k]]), M)[0])
+                                                for k in nb.GROUPS), delta=1e-9)
+        ip = nb._interior
+        nb._interior = lambda *a, **k: (lambda x, L, ok: (x, L, False))(*ip(*a, **k))
+        try:
+            with self.assertRaises(nb.NoiseBankError):
+                nb.fit_dependence(obj, M)                                     # (non-convergence propagates)
+        finally:
+            nb._interior = ip
+        old = nb.START_TOL
+        nb.START_TOL = -1.0
+        try:
+            with self.assertRaises(nb.NoiseBankError):
+                nb.fit_dependence(obj, M)
+        finally:
+            nb.START_TOL = old
+        with self.assertRaises(nb.NoiseBankError):
+            nb._cubic(obj["R_CC"], np.array([0.999]), M)                         # (never clamped)
 
     def test_unidentified_and_missing_groups_are_refused(self):
         """One time and no crossing: no row-sharing and no donor-sharing pairs, refused with reasons; the
         generator block is unavailable; the CLI exits 2 and still writes canonical JSON. An impossible
         curvature floor makes every group unidentified. Bad counts, schemas and draw counts are refused."""
         doc, _ = simulate(seed=7, W=4, T=1, R=16, cross=False)
-        bank = nb.estimate(doc, boot=3, step=STEP)
+        bank = nb.estimate(doc, boot=3, m=M)
         e = bank["horizons"]["5000"]
         self.assertEqual(e["status"], "unavailable")
         self.assertIn("no R_CC pairs", e["reasons"])
@@ -542,7 +656,7 @@ class TestFeasibilityAndRefusals(unittest.TestCase):
         old = nb.INFO_MIN
         nb.INFO_MIN = 1e9
         try:
-            e2 = nb.estimate(doc2, boot=2, step=STEP)["horizons"]["5000"]
+            e2 = nb.estimate(doc2, boot=2, m=M)["horizons"]["5000"]
         finally:
             nb.INFO_MIN = old
         self.assertEqual(e2["status"], "unavailable")
@@ -550,18 +664,18 @@ class TestFeasibilityAndRefusals(unittest.TestCase):
         with self.assertRaises(nb.NoiseBankError):
             nb.estimate(doc2, boot=0)
         with self.assertRaises(nb.NoiseBankError):
-            nb.estimate(doc2, boot=2, step=STEP, replicates=64)
+            nb.estimate(doc2, boot=2, m=M, replicates=64)
         bad = json.loads(json.dumps(doc2))
         bad["observations"][-1]["horizons"]["5000"]["survivors"] = 10 ** 6
         with self.assertRaises(nb.NoiseBankError):
-            nb.estimate(bad, boot=2, step=STEP)
+            nb.estimate(bad, boot=2, m=M)
         bad["observations"][-1]["horizons"]["5000"]["survivors"] = 1.5
         with self.assertRaises(nb.NoiseBankError):
-            nb.estimate(bad, boot=2, step=STEP)
+            nb.estimate(bad, boot=2, m=M)
         bad["observations"][-1]["horizons"]["5000"]["survivors"] = 1
         bad["observations"][-1]["replicate"] = 99
         with self.assertRaises(nb.NoiseBankError):
-            nb.estimate(bad, boot=2, step=STEP)
+            nb.estimate(bad, boot=2, m=M)
         with self.assertRaises(nb.NoiseBankError):
             nb.estimate(dict(doc2, schema="x"), boot=2)
 
@@ -611,8 +725,11 @@ class TestScaleNu0Bootstrap(unittest.TestCase):
         est = nb.nu0_of(np.full(400, 0.4), sig, np.full(400, 0.001), cv)
         self.assertEqual(est["status"], "estimated")
         self.assertAlmostEqual(nb._trigamma(est["nu0"] / 2), est["excess_log_variance"], delta=1e-9)
-        for x in (0.3, 2.0, 40.0, 900.0):
+        for x in (0.3, 2.0, 40.0, 900.0, 1e8, 1e20):
             self.assertAlmostEqual(nb.inv_trigamma(nb._trigamma(x)) / x, 1.0, delta=1e-9)
+        self.assertAlmostEqual(nb._trigamma(nb.inv_trigamma(1e-25)) / 1e-25, 1.0, delta=1e-9)      # (tiny excess)
+        with self.assertRaises(nb.NoiseBankError):
+            nb.inv_trigamma(0.0)
         for rec in (flat, est):
             rqlib.canonical(rec)
 
@@ -620,28 +737,36 @@ class TestScaleNu0Bootstrap(unittest.TestCase):
         """Codex #72 r1 P2-6: a pair's weight multiplies the multiplicities of its distinct sources (prey role
         m, predator role m'); two draws with the SAME distinct worlds but different multiplicities give
         different estimates; the source keys have the registered shapes (free pairs follow the prey)."""
-        self.assertEqual(nb.pick_weights([((0,), (1, 2)), ((0, 1), (2,)), ((2,), (1,))], [2, 1, 0], [1, 3, 2]).tolist(),
-                         [2 * 3 * 2, 2 * 1 * 2, 0])
+        self.assertEqual(nb.pick_weights([((0,), (1, 2)), ((0, 1), (2,)), ((2,), (1,)), ((0,), (1, 1))],
+                                         [2, 1, 0], [1, 3, 2]).tolist(),
+                         [2 * 3 * 2, 2 * 1 * 2, 0, 2 * 3])                     # (a world counts once: not 2 x 3^2)
         doc, _ = simulate(seed=9, W=4, T=2, R=16, horizons=(5000,))
         A = nb.arrays(doc["observations"], 5000)
         U = nb.usable(A)
         G, worlds = nb.group_pairs(A, U)
-        tab = nb.group_tables(A, U, G, STEP)
+        tab = nb.group_tables(A, U, G, M)
         shapes = {g: {(len(kp), len(kq)) for kp, kq in tab[g]["keys"]} for g in nb.GROUPS}
-        for g in ("R_CC", "R_SS", "R_CS"):
-            self.assertEqual(shapes[g], {(1, 2)})
+        for g in ("R_CC", "R_SS", "R_CS"):              # (two predators of one world: ONE predator world)
+            self.assertEqual(shapes[g], {(1, 1), (1, 2)})
         for g in ("D_CC", "D_SS", "D_CS"):
-            self.assertEqual(shapes[g], {(2, 1)})
+            self.assertEqual(shapes[g], {(1, 1), (2, 1)})
+        for g in nb.GROUPS:
+            self.assertTrue(all(len(set(kp)) == len(kp) and len(set(kq)) == len(kq) for kp, kq in tab[g]["keys"]))
+        rec = nb.interval_record(np.zeros((90, len(nb.BOOT_NAMES))), 10, 100)        # (10% failed: > 5%)
+        self.assertEqual((rec["status"], rec["ci95"]), ("unavailable", None))
+        rec = nb.interval_record(np.zeros((97, len(nb.BOOT_NAMES))), 3, 100)
+        self.assertEqual((rec["status"], rec["failure_rate"]), ("ok", 0.03))
+        self.assertIn("conditional on identification", rec["label"])
         for g in ("T_CS", "R_CF", "R_SF"):
             self.assertEqual(shapes[g], {(1, 1)})
 
         def fit(m, mp):
             return nb._entries(nb.fit_dependence({g: nb.pick_weights(tab[g]["keys"], m, mp) @ tab[g]["T"]
-                                                  for g in nb.GROUPS}, STEP))
+                                                  for g in nb.GROUPS}, M))
         a = fit([2, 1, 1, 0], [1, 1, 1, 1])
         b = fit([1, 2, 1, 0], [1, 1, 1, 1])                                   # (the same distinct prey worlds)
         self.assertGreater(max(abs(x - y) for x, y in zip(a, b)), 1e-6)
-        D, failed = nb.bootstrap(tab, len(worlds), 5, 0, STEP)
+        D, failed = nb.bootstrap(tab, len(worlds), 5, 0, M)
         self.assertEqual(D.shape[0] + failed, 5)
 
 

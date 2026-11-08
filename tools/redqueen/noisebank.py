@@ -60,15 +60,29 @@ THE ESTIMATOR (per horizon; Annex H.9.2: an interval-censored Gaussian composite
     (1) per cell and channel, the marginal MLE (a_c, sigma_c), by Newton from the empirical-logit moments
         (STARTING VALUES ONLY);
     (2) the nine dependence parameters, by the pairwise dependence contributions at the stage-1 margins.
-  Each group's contribution is computed EXACTLY on the registered grid rho = -RHO_MAX .. RHO_MAX, step
-  RHO_STEP, and interpolated by local cubics between nodes. When the unconstrained group maxima are jointly
-  FEASIBLE (all three components PSD, the unit totals non-negative, the free row convention <= 1), they are
-  the fit. Otherwise the composite likelihood is maximized over a PSD parametrization, by Nelder-Mead from
-  the projected start:
-    - the shares lie on the simplex, by spherical angles;
-    - the component correlations are sines;
-    - the free-row loading lies in the unit disk.
-  Every point of this parametrization is feasible, and every feasible point is reachable.
+  THE RECTANGLE PROBABILITIES (Codex #72 r2 P1): log_rect, the conditional integral over the narrower
+  interval of phi(x) P(l < Y < h | x) in LOG space (composite Gauss-Legendre with slope-bounded panels;
+  every conditional probability by the tail-stable _log_iprob): no differencing of tail probabilities, no
+  floor; contributions below log P = -700 are counted (deep_tail), never clipped.
+  THE GRID (Codex #72 r2 P2): each group's contribution is computed EXACTLY at Z_INTERVALS + 1 = 241 nodes
+  uniform in z = atanh(rho) over the evaluable domain |rho| <= RHO_MAX = 0.995, and interpolated by local
+  cubics IN z (the log likelihood bends like 1 / (1 - rho) near the limits; a uniform rho grid did not hold
+  the registered tolerances there). Registered tolerances, verified off-grid near both limits in the tests:
+  one pair's interpolated contribution within GRID_LL_TOL = 1e-3 log units, a group maximizer within
+  GRID_RHO_TOL = 1e-3.
+  When the unconstrained group maxima are jointly FEASIBLE (all three components PSD, the unit totals
+  non-negative, the free row convention <= 1), they are the fit (a feasible vector of coordinate-wise
+  maxima maximizes their sum over the feasible set). Otherwise the composite likelihood is maximized over
+  the feasible set in the nine GROUP VALUES: three linear matrix inequalities (the row block with the free
+  convention [[rC, rCS, vC], [rCS, rS, vS], [vC, vS, 1]], the donor block, the cell block) and the evaluable
+  box |rho| < RHO_MAX, a convex set; by a log-barrier interior-point method (every evaluation strictly
+  inside: never a clamped value). The maximum is certified by MULTI_START = 5 registered strictly feasible
+  starts: every start must converge and their optima agree within START_TOL = 1e-4, else the fit is
+  refused. (_theta_map, the spherical-angle parametrization, remains as a feasibility construction only.)
+  FIXED-REPLICATE BIAS (Codex #72 r2): two-stage (IFM) estimation is consistent as replicates grow; with
+  R = 64 fixed each cell's estimated location and scale leave an incidental-parameter bias (in the Gaussian
+  limit a variance factor 63/64). It is measured by simulation at the registered size (the PR) and NOT
+  corrected (no correction is exact for this model).
   REFUSED (status "unavailable", with reasons; never a silent number): a group without pairs, a group whose
   curvature per pair at its maximum is below INFO_MIN (unidentified), no usable cells.
   Support. Each CHANNEL has its own saturation mask: a cell's channel is unusable when its mean fraction lies
@@ -95,16 +109,20 @@ THE ESTIMATOR (per horizon; Annex H.9.2: an interval-censored Gaussian composite
     - encoded explicitly: {"status": "estimated", "nu0"}, {"status": "full_pooling"} (no excess dispersion:
       the prior is s(mu)^2 alone) or {"status": "unavailable", "reason"} (fewer than 3 cells); never Infinity
       or NaN.
-  Uncertainty: a CROSSED world bootstrap (Owen's pigeonhole rule).
-    - The 8 worlds are resampled with replacement TWICE, independently: for the prey role (multiplicities
-      m) and for the predator role (m').
-    - Every observation and pair keeps its multiplicity: a pair's weight is the product over its distinct
-      sources (row pair: m[prey world] m'[pred world 1] m'[pred world 2]; donor pair: m'[pred world]
-      m[prey world 1] m[prey world 2]; same-cell and exposed/free pairs: m[prey world] m'[pred world]).
-    - A free control follows its prey snapshot, the source it shares.
+  Uncertainty (registered; the coordinator's ruling on Codex #72 r2): a WORLD-MULTIPLICITY WEIGHTED
+  LIKELIHOOD.
+    - The 8 worlds are resampled with replacement twice, independently: prey-role multiplicities m and
+      predator-role multiplicities m'.
+    - Each pair's weight is the product of m over the DISTINCT prey worlds of its sources and of m' over its
+      DISTINCT predator worlds (a world counts once however many of its snapshots the pair involves); a free
+      control follows its prey snapshot.
     - Each draw refits stage 2 with the weighted contributions (the stage-1 margins are per cell and
-      unchanged by resampling).
-    - 999 draws, percentile intervals.
+      unchanged), 999 draws, percentile intervals.
+    - Failed draws (a group without weight, or a refused fit) are counted; the INTERVAL is "unavailable"
+      (a status separate from the point estimate's) when they exceed BOOT_FAIL_MAX = 5%, otherwise it is
+      reported with the failure rate, labelled approximate and conditional on identification.
+    - This departs from H.7's materialized-record bootstrap: the bank's intervals are descriptive and
+      outside the confirmatory family. No coverage study is registered.
 
 THE PRODUCTION V BUILDER (cov_parts; Annex H.3.1): one block's bank covariance diag(d) + U U' (for
 recurrence.Cov), from the bank's components and the bank's s(mu) curves (noisescale.evaluate, the
@@ -158,7 +176,18 @@ SIGMA_MIN = 0.01                   # (a marginal latent SD below this: degenerat
 MARG_INFO_MIN = 0.4                # (the observed information of log sigma below this x R: unidentified;
                                    #  an uncensored normal sample has 2 R)
 INFO_MIN = 1e-3                    # (a dependence group's curvature per pair below this: unidentified)
-RHO_MAX, RHO_STEP = 0.995, 0.005   # (the registered dependence grid: 399 nodes)
+RHO_MAX = 0.995                    # (the evaluable correlation domain)
+Z_MAX = math.atanh(RHO_MAX)
+Z_INTERVALS = 240                  # (the registered dependence grid: 241 nodes uniform in z = atanh(rho))
+GRID_LL_TOL = 1e-3                 # (registered: |interpolation error| of one pair's contribution, log units)
+GRID_RHO_TOL = 1e-3                # (registered: the interpolated group maximizer's error in rho)
+TRUNC = 40.0                       # (log_rect: an infinite outer end truncated this far beyond the bulk)
+PANEL_EFOLDS = 2.0                 # (log_rect: e-folds of the log integrand per Gauss-Legendre panel)
+MAX_PANELS = 4096
+LOG_RECT_TOL = 1e-6                # (log_rect's verified log-probability error against a 16x refinement)
+MULTI_START = 5                    # (the constrained fit's registered starts)
+START_TOL = 1e-4                   # (their optima must agree within this, log-likelihood units)
+BOOT_FAIL_MAX = 0.05               # (the interval is unavailable beyond this share of failed draws)
 MARGINAL_TOL = 1e-8                # (the marginal Newton's gradient tolerance, per replicate)
 FEAS_TOL = 1e-12                   # (the feasibility tolerance of the unconstrained group maxima)
 BOOT = 999
@@ -533,8 +562,98 @@ def bvn_upper(h, k, r):
 
 
 def bvn_rect(l1, h1, l2, h2, r):
-    """P(l1 < X < h1, l2 < Y < h2), standard bivariate normal with correlation r."""
+    """P(l1 < X < h1, l2 < Y < h2) by differencing upper tails: accurate in ABSOLUTE terms only (a check of
+    log_rect for moderate rectangles; never the likelihood)."""
     return (bvn_upper(l1, l2, r) - bvn_upper(h1, l2, r) - bvn_upper(l1, h2, r) + bvn_upper(h1, h2, r))
+
+# ---- tail-stable log probabilities (Codex #72 r2 P1: no subtraction of tails, no floor)
+def _logQ(z):
+    """log P(Z > z), vectorized over finite / infinite z, accurate in the far upper tail (the continued
+    fraction of erfc in log form: no underflow)."""
+    import numpy as np
+    z = np.asarray(z, float)
+    out = np.empty_like(z)
+    out[z == np.inf] = -np.inf
+    out[z == -np.inf] = 0.0
+    fin = np.isfinite(z)
+    sm = fin & (z < 5.0)
+    out[sm] = np.log(_Q(z[sm]))
+    big = fin & (z >= 5.0)
+    xl = z[big] / math.sqrt(2.0)
+    f = xl.copy()
+    for n in range(90, 0, -1):
+        f = xl + (n / 2.0) / f
+    out[big] = math.log(0.5) - xl * xl - 0.5 * math.log(math.pi) - np.log(f)
+    return out
+
+
+def _log_iprob(a, b):
+    """log P(a < Z < b) (a < b), stable in either tail: the difference of the two tails taken on the side
+    of the smaller tail in log form (log1p(-exp(.))); -inf only for an empty interval."""
+    import numpy as np
+    a, b = np.broadcast_arrays(np.asarray(a, float), np.asarray(b, float))
+    out = np.full(a.shape, -np.inf)
+    ok = b > a
+    up = ok & (a > 0)
+    dn = ok & (b < 0) & ~up
+    mid = ok & ~up & ~dn
+    with np.errstate(divide="ignore", invalid="ignore"):
+        if up.any():
+            la, lb = _logQ(a[up]), _logQ(b[up])
+            out[up] = la + np.log1p(-np.exp(lb - la))
+        if dn.any():
+            lb, la = _logQ(-b[dn]), _logQ(-a[dn])
+            out[dn] = lb + np.log1p(-np.exp(la - lb))
+        if mid.any():
+            out[mid] = np.log1p(-(_Q(b[mid]) + _Q(-a[mid])))
+    return out
+
+
+def _logphi(x):
+    return -0.5 * x * x - 0.5 * math.log(2 * math.pi)
+
+
+def log_rect(l1, h1, l2, h2, r, chunk=20000):
+    """log P(l1 < X < h1, l2 < Y < h2) for the standard bivariate normal with correlation r (|r| < 1),
+    WITHOUT differencing tail probabilities (Codex #72 r2 P1). The registered evaluation: the conditional
+    integral over the outer variable (the narrower interval) of phi(x) P(l < Y < h | x), each conditional
+    probability by _log_iprob, by composite 20-point Gauss-Legendre in log space (log-sum-exp). An infinite
+    outer end is truncated TRUNC = 40 beyond the bulk. The panel count is the power of two >= (width x the
+    log-integrand slope bound) / PANEL_EFOLDS (at most MAX_PANELS), so each panel spans a bounded number of
+    e-folds; the log-probability error is verified in the tests (|error| <= LOG_RECT_TOL against a 16x
+    refinement, and against the thin-rectangle density limit)."""
+    import numpy as np
+    l1, h1, l2, h2 = (np.asarray(v, float).ravel() for v in (l1, h1, l2, h2))
+    w1, w2 = h1 - l1, h2 - l2
+    swap = w2 < w1
+    lo, hi = np.where(swap, l2, l1), np.where(swap, h2, h1)
+    il, ih = np.where(swap, l1, l2), np.where(swap, h1, h2)
+    lo = np.where(np.isfinite(lo), lo, np.minimum(hi, 0.0) - TRUNC)
+    hi = np.where(np.isfinite(hi), hi, np.maximum(lo, 0.0) + TRUNC)
+    s = math.sqrt((1.0 - r) * (1.0 + r))
+    slope = np.zeros(len(lo))
+    for x in (lo, hi):
+        za, zb = (il - r * x) / s, (ih - r * x) / s
+        m = np.maximum(np.where(np.isfinite(za), np.abs(za), 0.0), np.where(np.isfinite(zb), np.abs(zb), 0.0))
+        slope = np.maximum(slope, np.abs(x) + abs(r) / s * np.maximum(m, 1.0))
+    need = np.maximum(1.0, (hi - lo) * slope / PANEL_EFOLDS)
+    panels = np.minimum(2 ** np.ceil(np.log2(need)).astype(int), MAX_PANELS)
+    t, w = _gl20()
+    out = np.empty(len(lo))
+    for n in np.unique(panels):
+        sel = np.flatnonzero(panels == n)
+        u = ((np.arange(n)[:, None] + (t[None, :] + 1) / 2) / n).ravel()          # (n x 20 nodes on [0, 1])
+        lw = np.log(np.tile(w, n) / (2 * n))
+        for c0 in range(0, len(sel), max(1, chunk // len(u))):
+            k = sel[c0:c0 + max(1, chunk // len(u))]
+            span = (hi[k] - lo[k])[:, None]
+            x = lo[k][:, None] + span * u[None, :]
+            li = _log_iprob((il[k][:, None] - r * x) / s, (ih[k][:, None] - r * x) / s)
+            v = lw[None, :] + np.log(span) + _logphi(x) + li
+            mx = np.max(v, axis=1)
+            out[k] = mx + np.log(np.sum(np.exp(v - mx[:, None]), axis=1))
+    return out
+
 
 
 # ================================================================== stage 1: the marginals
@@ -745,76 +864,93 @@ def group_pairs(A, U):
     return G, worlds
 
 
-def rho_grid(step=RHO_STEP):
-    """The dependence grid -RHO_MAX .. RHO_MAX (the step must divide 2 RHO_MAX)."""
+def rho_grid(m=Z_INTERVALS):
+    """The registered dependence grid (Codex #72 r2 P2): m + 1 nodes UNIFORM IN z = atanh(rho) over
+    [-atanh(RHO_MAX), +atanh(RHO_MAX)] (finer in rho near the limits, where the log likelihood bends like
+    1 / (1 - rho)) -> the rho values."""
     import numpy as np
-    m = int(round(2 * RHO_MAX / step))
-    if m < 4 or abs(m * step - 2 * RHO_MAX) > 1e-9:
-        raise NoiseBankError(f"the grid step {step} does not divide [-{RHO_MAX}, {RHO_MAX}] into at least 4 intervals")
-    return -RHO_MAX + step * np.arange(m + 1)
+    if not isinstance(m, int) or m < 8:
+        raise NoiseBankError(f"the grid needs at least 8 intervals (got {m!r})")
+    return np.tanh(np.linspace(-Z_MAX, Z_MAX, m + 1))
 
 
-def group_tables(A, U, G, step=RHO_STEP, chunk=40000):
+def group_tables(A, U, G, m=Z_INTERVALS, chunk=40000):
     """Stage 2's exact contributions: per group and per bootstrap source key, the summed dependence
-    contributions log P(both; rho) - log P(1) - log P(2) at every grid node -> {g: {"keys": [(prey worlds,
-    pred worlds)], "T": keys x nodes, "pairs": n}}."""
+    contributions log P(both; rho) - log P(1) - log P(2) at every grid node (log_rect / _log_iprob: no
+    floor; the deep-tail contributions, log P(both) < -700, are counted per group) -> {g: {"keys": [(prey
+    worlds, predator worlds): DISTINCT worlds per role], "T": keys x nodes, "pairs": n, "deep_tail": n}}."""
     import numpy as np
-    grid = rho_grid(step)
+    grid = rho_grid(m)
     out = {}
     for g in GROUPS:
         keys, blocks, npairs = {}, [], 0
         for c1, r1, c2, r2, prey_w, pred_w in G[g]:
             l1, h1 = _std_bounds(A, U, c1, r1)
             l2, h2 = _std_bounds(A, U, c2, r2)
-            kp = np.sort(np.stack(prey_w, 1), 1)
-            kq = np.sort(np.stack(pred_w, 1), 1)
-            kid = np.array([keys.setdefault((tuple(int(x) for x in kp[m]), tuple(int(x) for x in kq[m])), len(keys))
-                            for m in range(len(r1))], int)
+            kp = np.stack(prey_w, 1)
+            kq = np.stack(pred_w, 1)
+            kid = np.array([keys.setdefault((tuple(sorted({int(x) for x in kp[i]})),
+                                             tuple(sorted({int(x) for x in kq[i]}))), len(keys))
+                            for i in range(len(r1))], int)
             blocks.append((l1.ravel(), h1.ravel(), l2.ravel(), h2.ravel(), np.repeat(kid, l1.shape[1])))
             npairs += l1.size
         T = np.zeros((len(keys), len(grid)))
+        deep = 0
         for l1, h1, l2, h2, kid in blocks:
             for c0 in range(0, len(l1), chunk):
                 sl = slice(c0, c0 + chunk)
-                with np.errstate(divide="ignore"):
-                    base = np.log(_iprob(l1[sl], h1[sl])) + np.log(_iprob(l2[sl], h2[sl]))
-                for m, r in enumerate(grid):
-                    P = bvn_rect(l1[sl], h1[sl], l2[sl], h2[sl], float(r))
-                    v = np.log(np.maximum(P, 1e-300)) - base
-                    T[:, m] += np.bincount(kid[sl], weights=v, minlength=len(keys))
-        out[g] = {"keys": list(keys), "T": T, "pairs": int(npairs)}
+                base = _log_iprob(l1[sl], h1[sl]) + _log_iprob(l2[sl], h2[sl])
+                if not np.all(np.isfinite(base)):
+                    raise NoiseBankError(f"{g}: an empty marginal interval")
+                for j, r in enumerate(grid):
+                    lp = log_rect(l1[sl], h1[sl], l2[sl], h2[sl], float(r))
+                    if not np.all(np.isfinite(lp)):
+                        raise NoiseBankError(f"{g}: a rectangle log probability is not finite at rho {r:.4f}")
+                    deep += int(np.sum(lp < -700.0))
+                    T[:, j] += np.bincount(kid[sl], weights=lp - base, minlength=len(keys))
+        out[g] = {"keys": list(keys), "T": T, "pairs": int(npairs), "deep_tail": deep}
     return out
 
 
-def _cubic(vals, rho, step=RHO_STEP):
-    """The local-cubic interpolant (4 nodes) of grid values at rho (array), rho clamped to the grid."""
+def _zcoord(rho, m):
+    import numpy as np
+    return (np.arctanh(np.asarray(rho, float)) + Z_MAX) / (2 * Z_MAX / m)
+
+
+def _cubic(vals, rho, m=Z_INTERVALS):
+    """The local-cubic interpolant (4 nodes, in z = atanh(rho)) of grid values at rho (array); rho must lie
+    in [-RHO_MAX, RHO_MAX] (never clamped)."""
     import numpy as np
     vals = np.asarray(vals, float)
+    rho = np.asarray(rho, float)
+    if np.any(np.abs(rho) > RHO_MAX + 1e-12):
+        raise NoiseBankError("a correlation outside the evaluable domain [-RHO_MAX, RHO_MAX]")
+    x = _zcoord(np.clip(rho, -RHO_MAX, RHO_MAX), m)
     M = len(vals)
-    x = (np.clip(np.asarray(rho, float), -RHO_MAX, RHO_MAX) + RHO_MAX) / step
-    m = np.clip(np.floor(x).astype(int), 1, M - 3)
-    u = x - m
-    v0, v1, v2, v3 = vals[m - 1], vals[m], vals[m + 1], vals[m + 2]
+    k = np.clip(np.floor(x).astype(int), 1, M - 3)
+    u = x - k
+    v0, v1, v2, v3 = vals[k - 1], vals[k], vals[k + 1], vals[k + 2]
     return (v0 * (-(u * (u - 1) * (u - 2)) / 6) + v1 * ((u + 1) * (u - 1) * (u - 2) / 2)
             + v2 * (-(u + 1) * u * (u - 2) / 2) + v3 * ((u + 1) * u * (u - 1) / 6))
 
 
-def _cubic1(vals, rho, step=RHO_STEP):
-    """_cubic for one rho over a Python list (the optimizer's inner loop)."""
+def _cubic1(vals, rho, m=Z_INTERVALS):
+    """_cubic for one rho over a Python list (the optimizer's inner loop); rho in the domain (checked by
+    the caller's barrier)."""
     M = len(vals)
-    x = (min(max(rho, -RHO_MAX), RHO_MAX) + RHO_MAX) / step
-    m = min(max(int(math.floor(x)), 1), M - 3)
-    u = x - m
-    return (vals[m - 1] * (-(u * (u - 1) * (u - 2)) / 6) + vals[m] * ((u + 1) * (u - 1) * (u - 2) / 2)
-            + vals[m + 1] * (-(u + 1) * u * (u - 2) / 2) + vals[m + 2] * ((u + 1) * u * (u - 1) / 6))
+    x = (math.atanh(rho) + Z_MAX) / (2 * Z_MAX / m)
+    k = min(max(int(math.floor(x)), 1), M - 3)
+    u = x - k
+    return (vals[k - 1] * (-(u * (u - 1) * (u - 2)) / 6) + vals[k] * ((u + 1) * (u - 1) * (u - 2) / 2)
+            + vals[k + 1] * (-(u + 1) * u * (u - 2) / 2) + vals[k + 2] * ((u + 1) * u * (u - 1) / 6))
 
 
-def _argmax(vals, step=RHO_STEP, sub=50):
+def _argmax(vals, m=Z_INTERVALS, sub=50):
     import numpy as np
-    fine = np.linspace(-RHO_MAX, RHO_MAX, (len(vals) - 1) * sub + 1)
-    f = _cubic(vals, fine, step)
+    fine = np.tanh(np.linspace(-Z_MAX, Z_MAX, m * sub + 1))
+    f = _cubic(vals, np.clip(fine, -RHO_MAX, RHO_MAX), m)
     k = int(np.argmax(f))
-    return float(fine[k]), float(f[k])
+    return float(np.clip(fine[k], -RHO_MAX, RHO_MAX)), float(f[k])
 
 
 # ================================================================== components from the nine groups
@@ -892,15 +1028,17 @@ def _theta_start(r):
 
 
 def nelder_mead(f, x0, step=0.1, max_iter=6000, ftol=1e-12, xtol=1e-10):
-    """A plain deterministic Nelder-Mead MINIMIZER (no scipy)."""
+    """A plain deterministic Nelder-Mead MINIMIZER (no scipy) -> (x, f(x), converged)."""
     n = len(x0)
     pts = [list(x0)] + [[x0[j] + (step if j == i else 0.0) for j in range(n)] for i in range(n)]
     val = [f(p) for p in pts]
+    converged = False
     for _ in range(max_iter):
         order = sorted(range(n + 1), key=lambda k: val[k])
         pts, val = [pts[k] for k in order], [val[k] for k in order]
-        if abs(val[-1] - val[0]) <= ftol * (1 + abs(val[0])) and \
+        if math.isfinite(val[-1]) and abs(val[-1] - val[0]) <= ftol * (1 + abs(val[0])) and \
                 max(abs(pts[k][j] - pts[0][j]) for k in range(1, n + 1) for j in range(n)) <= xtol:
+            converged = True
             break
         cen = [sum(p[j] for p in pts[:-1]) / n for j in range(n)]
         xr = [cen[j] + (cen[j] - pts[-1][j]) for j in range(n)]
@@ -921,37 +1059,164 @@ def nelder_mead(f, x0, step=0.1, max_iter=6000, ftol=1e-12, xtol=1e-10):
                     pts[k] = [pts[0][j] + 0.5 * (pts[k][j] - pts[0][j]) for j in range(n)]
                     val[k] = f(pts[k])
     k = min(range(n + 1), key=lambda i: val[i])
-    return pts[k], val[k]
+    return pts[k], val[k], converged
 
 
-def fit_dependence(obj, step=RHO_STEP):
+def _mats(r):
+    """The three LMIs of the feasible set, affine in the nine group values (GROUPS order): the row block
+    with the free convention [[rC, rCS, vC], [rCS, rS, vS], [vC, vS, 1]], the donor block, the cell block."""
+    import numpy as np
+    rC, rS, rCS, dC, dS, dCS, T, vC, vS = r
+    return (np.array([[rC, rCS, vC], [rCS, rS, vS], [vC, vS, 1.0]]), np.array([[dC, dCS], [dCS, dS]]),
+            np.array([[1 - rC - dC, T - rCS - dCS], [T - rCS - dCS, 1 - rS - dS]]))
+
+
+def _dmats():
+    """d(LMI)/d(group value i), constant."""
+    import numpy as np
+    base = _mats(np.zeros(9))
+    out = []
+    for i in range(9):
+        e = np.zeros(9)
+        e[i] = 1.0
+        out.append([a - b for a, b in zip(_mats(e), base)])
+    return out
+
+
+def _interior(lists, x0, m, mu0=1.0):
+    """Maximize sum_g l_g(rho_g) over {the three LMIs PD, |rho_g| < RHO_MAX}: a log-barrier interior-point
+    method (damped Newton on -L + mu B, mu decreased 5x per stage to 1e-10), every evaluation strictly
+    inside the evaluable domain -> (rho, L, converged)."""
+    import numpy as np
+    dM = _dmats()
+    a2 = RHO_MAX ** 2
+
+    def feasible(x):
+        return np.all(np.abs(x) < RHO_MAX) and all(np.min(np.linalg.eigvalsh(M)) > 0 for M in _mats(x))
+
+    def L(x):
+        return sum(_cubic1(lists[g], float(x[i]), m) for i, g in enumerate(GROUPS))
+
+    def phi(x, mu):
+        if not feasible(x):
+            return math.inf
+        b = -sum(np.linalg.slogdet(M)[1] for M in _mats(x)) - float(np.sum(np.log(a2 - x * x)))
+        return -L(x) + mu * b
+
+    def grad_hess(x, mu):
+        h = 1e-6
+        g = np.zeros(9)
+        H = np.zeros((9, 9))
+        for i, gr in enumerate(GROUPS):
+            xi = float(x[i])
+            lo, hi = max(xi - h, -RHO_MAX + 1e-12), min(xi + h, RHO_MAX - 1e-12)
+            f0, fm, fp = _cubic1(lists[gr], xi, m), _cubic1(lists[gr], lo, m), _cubic1(lists[gr], hi, m)
+            g[i] = -(fp - fm) / (hi - lo)
+            H[i, i] = -max((fp - 2 * f0 + fm) / ((hi - lo) / 2) ** 2, -1e12)
+        inv = [np.linalg.inv(M) for M in _mats(x)]
+        for i in range(9):
+            g[i] += mu * (-sum(np.trace(Mi @ dM[i][k]) for k, Mi in enumerate(inv)) + 2 * x[i] / (a2 - x[i] ** 2))
+            H[i, i] += mu * 2 * (a2 + x[i] ** 2) / (a2 - x[i] ** 2) ** 2
+            for j in range(i, 9):
+                v = mu * sum(np.trace(Mi @ dM[i][k] @ Mi @ dM[j][k]) for k, Mi in enumerate(inv))
+                H[i, j] += v
+                if j != i:
+                    H[j, i] += v
+        return g, H
+    x = np.array(x0, float)
+    if not feasible(x):
+        raise NoiseBankError("the interior-point start is not strictly feasible")
+    mu = mu0
+    while mu > 1e-10:
+        ok = False
+        for _ in range(200):
+            g, H = grad_hess(x, mu)
+            lam = 0.0
+            while True:
+                try:
+                    step = -np.linalg.solve(H + lam * np.eye(9), g)
+                    if np.all(np.isfinite(step)) and g @ step < 0:
+                        break
+                except np.linalg.LinAlgError:
+                    pass
+                lam = max(2 * lam, 1e-8 * (1 + float(np.max(np.abs(np.diag(H))))))
+            dec = -float(g @ step)
+            if dec < 1e-12:
+                ok = True
+                break
+            f0, t = phi(x, mu), 1.0
+            while t > 1e-14 and not phi(x + t * step, mu) <= f0 - 1e-4 * t * dec:
+                t *= 0.5
+            if t <= 1e-14:
+                ok = dec < 1e-8
+                break
+            x = x + t * step
+        if not ok:
+            return x, L(x), False
+        mu /= 5.0
+    return x, L(x), True
+
+
+def _strict_start(un, frac):
+    """A strictly feasible start: the unconstrained maxima shrunk toward the central point (shares 1/3,
+    correlations 0) to frac of the largest feasible step."""
+    import numpy as np
+    c0 = np.array([1 / 3, 1 / 3, 0, 1 / 3, 1 / 3, 0, 0, 0, 0], float)
+    u = np.clip(np.array([un[g] for g in GROUPS], float), -RHO_MAX, RHO_MAX)
+
+    def ok(x):
+        return np.all(np.abs(x) < RHO_MAX) and all(np.min(np.linalg.eigvalsh(M)) > 1e-12 for M in _mats(x))
+    lo, hi = 0.0, 1.0
+    if ok(u):
+        return u
+    for _ in range(60):
+        mid = 0.5 * (lo + hi)
+        lo, hi = (mid, hi) if ok(c0 + mid * (u - c0)) else (lo, mid)
+    return c0 + frac * lo * (u - c0)
+
+
+def fit_dependence(obj, m=Z_INTERVALS):
     """Stage 2 from per-group grid objectives {g: values at the nodes} -> {"rho": the nine values, "fit":
     "unconstrained" | "constrained", "loglik", "SigmaR", "SigmaD", "SigmaE", "unconstrained": the group
-    maxima, "problems": their infeasibilities}."""
-    un = {g: _argmax(obj[g], step)[0] for g in GROUPS}
+    maxima, "problems": their infeasibilities, "starts": the multi-start record}.
+    The constrained branch (Codex #72 r2 P2-3) maximizes over the feasible set in the GROUP VALUES (three
+    linear matrix inequalities and the evaluable box |rho| < RHO_MAX: convex) by a log-barrier interior-point
+    method, every evaluation strictly inside the domain (never a clamped value), from MULTI_START registered
+    strictly feasible starts (the unconstrained maxima shrunk toward the central point: the first to 98% of
+    the feasible step, the rest to seeded fractions); every start must converge and their optima agree within
+    START_TOL (log-likelihood units), else the fit is REFUSED (NoiseBankError: not certified)."""
+    import numpy as np
+    un = {g: _argmax(obj[g], m)[0] for g in GROUPS}
     SR, SD, SE, feas, prob = components_of(un)
     lists = {g: [float(v) for v in obj[g]] for g in GROUPS}
+    starts = None
     if feas:
         rho, how = un, "unconstrained"
     else:
-        def negll(th):
-            r = _theta_map(th)
-            return -sum(_cubic1(lists[g], r[g], step) for g in GROUPS)
-        best = _theta_start(un)
-        fbest = negll(best)
-        for _ in range(3):                                    # (restarts from the best point)
-            x, fx = nelder_mead(negll, best, step=0.15)
-            if fx < fbest - 1e-12:
-                best, fbest = x, fx
-            else:
-                break
-        rho, how = _theta_map(best), "constrained"
+        import numpy as np
+        res = []
+        rng = np.random.default_rng(rqlib.derive_seed(SEED_NAMESPACE, "multistart"))
+        for k in range(MULTI_START):
+            frac = 0.98 if k == 0 else float(rng.uniform(0.05, 0.95))
+            x0 = _strict_start(un, frac)
+            x, Lx, ok = _interior(lists, x0, m)
+            if not ok:
+                raise NoiseBankError("the constrained fit did not converge (interior point)")
+            res.append((Lx, x))
+        Lbest = max(v for v, _ in res)
+        spread = Lbest - min(v for v, _ in res)
+        starts = {"starts": MULTI_START, "loglik_spread": spread}
+        if spread > START_TOL:
+            raise NoiseBankError(f"the constrained fit is not certified: {MULTI_START} starts disagree by "
+                                 f"{spread:.3g} log-likelihood units (> {START_TOL})")
+        best = max(res, key=lambda t: t[0])[1]
+        rho, how = {g: float(best[i]) for i, g in enumerate(GROUPS)}, "constrained"
         SR, SD, SE, feas2, prob2 = components_of(rho)
-        if not feas2:                                         # (feasible by construction: a numerical edge)
+        if not feas2:
             raise NoiseBankError(f"the constrained fit is infeasible: {prob2}")
-    ll = sum(_cubic1(lists[g], rho[g], step) for g in GROUPS)
+    ll = sum(_cubic1(lists[g], rho[g], m) for g in GROUPS)
     return {"rho": rho, "fit": how, "loglik": ll, "SigmaR": SR, "SigmaD": SD, "SigmaE": SE,
-            "unconstrained": un, "problems": prob}
+            "unconstrained": un, "problems": prob, "starts": starts}
 
 
 # ================================================================== s(mu)
@@ -1017,8 +1282,16 @@ def _trigamma(x):
 
 
 def inv_trigamma(y):
-    """x > 0 with trigamma(x) = y (> 0; trigamma is decreasing): bisection on log x."""
-    lo, hi = -30.0, 30.0
+    """x > 0 with trigamma(x) = y (> 0; trigamma is decreasing): bisection on log x inside a bracket grown
+    from the asymptotic guess 1 / y + 1/2 until it encloses the root (any tiny or large y)."""
+    if not y > 0 or not math.isfinite(y):
+        raise NoiseBankError(f"inv_trigamma needs a positive finite value (got {y!r})")
+    g = math.log(1.0 / y + 0.5)
+    lo, hi = g - 2.0, g + 2.0
+    while _trigamma(math.exp(lo)) <= y:
+        lo -= 2.0
+    while _trigamma(math.exp(hi)) > y:
+        hi += 2.0
     for _ in range(200):
         mid = 0.5 * (lo + hi)
         if _trigamma(math.exp(mid)) > y:
@@ -1049,10 +1322,13 @@ def nu0_of(mu, sigma, var_t, curve):
 
 # ================================================================== the estimate
 def pick_weights(keys, m, mp):
-    """The crossed bootstrap's pair weights: the product of the prey-role (m) and predator-role (mp)
-    multiplicities over a key's sources."""
+    """The registered bootstrap weights (Codex #72 r2 P2-4, the coordinator's ruling): a WORLD-MULTIPLICITY
+    WEIGHTED LIKELIHOOD. Each pair's weight is the product of the prey-role multiplicities m over the DISTINCT
+    prey worlds of its sources and of the predator-role multiplicities mp over its DISTINCT predator worlds
+    (a world counts once however many of its snapshots the pair involves)."""
     import numpy as np
-    return np.array([math.prod(int(m[a]) for a in kp) * math.prod(int(mp[b]) for b in kq) for kp, kq in keys], float)
+    return np.array([math.prod(int(m[a]) for a in set(kp)) * math.prod(int(mp[b]) for b in set(kq))
+                     for kp, kq in keys], float)
 
 
 BOOT_NAMES = ("R_CC", "R_SS", "R_CS", "R_CF", "R_SF", "D_CC", "D_SS", "D_CS", "E_CC", "E_SS", "E_CS")
@@ -1063,17 +1339,18 @@ def _entries(f):
     return [SR[0, 0], SR[1, 1], SR[0, 1], SR[0, 2], SR[1, 2], SD[0, 0], SD[1, 1], SD[0, 1], SE[0, 0], SE[1, 1], SE[0, 1]]
 
 
-def bootstrap(tab, n_worlds, boot, seed, step=RHO_STEP):
-    """The crossed world bootstrap (see the module docstring) -> (draws x BOOT_NAMES array, failed draws)."""
+def bootstrap(tab, n_worlds, boot, seed, m=Z_INTERVALS):
+    """The registered uncertainty procedure (see the module docstring) -> (draws x BOOT_NAMES array, failed
+    draws: a group with no weight left, or a refused / non-converged fit)."""
     import numpy as np
     rng = np.random.default_rng(seed)
     out, failed = [], 0
     for _ in range(boot):
-        m = np.bincount(rng.integers(0, n_worlds, n_worlds), minlength=n_worlds)
+        mm = np.bincount(rng.integers(0, n_worlds, n_worlds), minlength=n_worlds)
         mp = np.bincount(rng.integers(0, n_worlds, n_worlds), minlength=n_worlds)
         ob = {}
         for g in GROUPS:
-            w = pick_weights(tab[g]["keys"], m, mp)
+            w = pick_weights(tab[g]["keys"], mm, mp)
             if not w.any():
                 ob = None
                 break
@@ -1082,15 +1359,33 @@ def bootstrap(tab, n_worlds, boot, seed, step=RHO_STEP):
             failed += 1
             continue
         try:
-            out.append(_entries(fit_dependence(ob, step)))
+            out.append(_entries(fit_dependence(ob, m)))
         except NoiseBankError:
             failed += 1
     return np.array(out, float).reshape(len(out), len(BOOT_NAMES)), failed
 
 
-def horizon_estimate(A, boot=BOOT, seed=0, step=RHO_STEP):
+def interval_record(D, failed, boot):
+    """Codex #72 r2 P2-5: the failed draws are counted; the interval is UNAVAILABLE (its own status, apart
+    from the point estimate's) when they exceed BOOT_FAIL_MAX of the draws, otherwise reported with the
+    failure rate, labelled approximate and conditional on identification."""
+    import numpy as np
+    rate = failed / boot if boot else 1.0
+    rec = {"draws": boot, "failed": failed, "failure_rate": rate,
+           "procedure": "world-multiplicity weighted likelihood (prey and predator roles resampled independently; "
+                        "a pair weighted by the product over the DISTINCT worlds of each role); a departure from "
+                        "H.7's materialized-record bootstrap: descriptive, outside the confirmatory family",
+           "label": "approximate; conditional on identification (failed draws excluded)"}
+    if rate > BOOT_FAIL_MAX or not len(D):
+        return dict(rec, status="unavailable", ci95=None,
+                    reason=f"{failed} of {boot} draws failed (> {BOOT_FAIL_MAX:.0%})")
+    return dict(rec, status="ok", ci95={n: [float(np.percentile(D[:, k], 2.5)), float(np.percentile(D[:, k], 97.5))]
+                                        for k, n in enumerate(BOOT_NAMES)})
+
+
+def horizon_estimate(A, boot=BOOT, seed=0, m=Z_INTERVALS):
     """One horizon: the usable channels, the s(mu) curves and nu0, the nine groups, the components (or
-    "unavailable" with reasons), the crossed world bootstrap."""
+    "unavailable" with reasons), the registered uncertainty procedure."""
     import numpy as np
     U = usable(A)
     rec = {"capture_bound": A["N"]["C"], "replicates": A["R"], "incomplete_cells": A["incomplete_cells"],
@@ -1107,40 +1402,44 @@ def horizon_estimate(A, boot=BOOT, seed=0, step=RHO_STEP):
     if reasons:
         rec.update(status="unavailable", reasons=reasons, components=None, bootstrap=None)
         return rec
-    tab = group_tables(A, U, G, step)
+    tab = group_tables(A, U, G, m)
     obj = {g: tab[g]["T"].sum(axis=0) for g in GROUPS}
     groups = {}
     for g in GROUPS:
-        r_hat, _ = _argmax(obj[g], step)
-        d2 = float(_cubic(obj[g], r_hat + step, step) - 2 * _cubic(obj[g], r_hat, step)
-                   + _cubic(obj[g], r_hat - step, step)) / step ** 2
+        r_hat, _ = _argmax(obj[g], m)
+        z, h = math.atanh(r_hat), 2 * Z_MAX / m
+        zs = [max(-Z_MAX, min(Z_MAX, z + d)) for d in (-h, 0.0, h)]
+        f = [float(_cubic(obj[g], math.tanh(v), m)) for v in zs]
+        d2 = (f[0] - 2 * f[1] + f[2]) / h ** 2 / (1 - r_hat ** 2) ** 2      # (d2 / d rho2 at the maximum)
         per = -d2 / tab[g]["pairs"]
         groups[g] = {"pairs": tab[g]["pairs"], "rho_max": r_hat, "curvature_per_pair": per,
-                     "at_grid_edge": abs(r_hat) >= RHO_MAX - 1e-12}
+                     "at_grid_edge": abs(r_hat) >= RHO_MAX - 1e-12, "deep_tail": tab[g]["deep_tail"]}
         if not per >= INFO_MIN:
             reasons.append(f"{g} is unidentified (curvature per pair {per:.3g} < {INFO_MIN})")
     rec["groups"] = groups
     if reasons:
         rec.update(status="unavailable", reasons=reasons, components=None, bootstrap=None)
         return rec
-    fit = fit_dependence(obj, step)
+    try:
+        fit = fit_dependence(obj, m)
+    except NoiseBankError as e:
+        rec.update(status="unavailable", reasons=[str(e)], components=None, bootstrap=None)
+        return rec
     rec["components"] = {"SigmaR": fit["SigmaR"].tolist(), "SigmaD": fit["SigmaD"].tolist(),
                          "SigmaE": fit["SigmaE"].tolist(), "fit": fit["fit"], "loglik": fit["loglik"],
-                         "unconstrained_problems": fit["problems"],
+                         "unconstrained_problems": fit["problems"], "multistart": fit["starts"],
                          "SigmaR_FF": {"value": float(fit["SigmaR"][2, 2]), "status": "convention",
                                        "rule": "the minimal feasible free row variance v' A^+ v: one control per "
                                                "row leaves the free row / control split unidentified"},
                          "shares": {ch: {"row": float(fit["SigmaR"][k, k]), "donor": float(fit["SigmaD"][k, k]),
                                          "cell": float(fit["SigmaE"][k, k])} for k, ch in enumerate("CS")}}
-    D, failed = bootstrap(tab, len(worlds), boot, seed, step)
-    rec["bootstrap"] = {"draws": boot, "failed": failed, "unit": "crossed world (pigeonhole)",
-                        "ci95": ({n: [float(np.percentile(D[:, k], 2.5)), float(np.percentile(D[:, k], 97.5))]
-                                  for k, n in enumerate(BOOT_NAMES)} if len(D) else None)}
+    D, failed = bootstrap(tab, len(worlds), boot, seed, m)
+    rec["bootstrap"] = interval_record(D, failed, boot)
     rec.update(status="ok", reasons=[])
     return rec
 
 
-def estimate(doc, boot=BOOT, seed=0, step=RHO_STEP, replicates=None):
+def estimate(doc, boot=BOOT, seed=0, m=Z_INTERVALS, replicates=None):
     """The bank: per horizon (horizon_estimate); the generator noise block and map.py's prior at the
     production 5k horizon (available only when its components and all three curves are)."""
     if doc.get("schema") != OBS_SCHEMA:
@@ -1149,13 +1448,16 @@ def estimate(doc, boot=BOOT, seed=0, step=RHO_STEP, replicates=None):
         raise NoiseBankError(f"bootstrap draws must be a positive integer (got {boot!r})")
     obs = doc["observations"]
     out = {"schema": BANK_SCHEMA, "obs_design_sha256": doc.get("design_sha256"), "plan_sha256": doc.get("plan_sha256"),
-           "estimator": {"rho_step": step, "rho_max": RHO_MAX, "saturation": list(SATURATION), "sigma_min": SIGMA_MIN,
-                         "info_min": INFO_MIN, "boot": boot, "seed": seed}, "horizons": {}}
+           "estimator": {"z_intervals": m, "rho_max": RHO_MAX, "saturation": list(SATURATION), "sigma_min": SIGMA_MIN,
+                         "info_min": INFO_MIN, "multi_start": MULTI_START, "start_tol": START_TOL,
+                         "boot": boot, "boot_fail_max": BOOT_FAIL_MAX, "seed": seed,
+                         "rectangle": "log_rect (conditional integral, log space)",
+                         "fixed_replicate_bias": "not corrected (see the PR's simulation)"}, "horizons": {}}
     for h in HORIZONS:
         A = arrays(obs, h)
         if replicates is not None and A["R"] != replicates:
             raise NoiseBankError(f"{A['R']} replicates; {replicates} are registered")
-        out["horizons"][str(h)] = horizon_estimate(A, boot, seed, step)
+        out["horizons"][str(h)] = horizon_estimate(A, boot, seed, m)
     base = out["horizons"][str(HORIZONS[0])]
     why = list(base.get("reasons") or []) + [f"no {ch} curve" for ch in ("C", "S", "F") if base["scales"][ch] is None]
     if why:
