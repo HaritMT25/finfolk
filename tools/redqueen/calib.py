@@ -38,7 +38,11 @@ is a documented synthetic stand-in ("fitted": false) for the tests and the bench
   the target (convergence required); "max" (as large as bounded means permit) = the amplitude in [0, 6]
   MAXIMIZING the native RMS (grid + golden section); an unattainable target is recorded: an alternative
   is then a non-success, a null panel fails (never redrawn); a background already above a target is
-  recorded as a deviation (above a boundary null: conservative).
+  recorded as a deviation (above a boundary null: conservative). D2 (2026-11-08): a NULL world with an
+  unattainable target is redrawn from the same null mode with the next registered seed (its own redraw
+  streams), at most 5 times; beyond that the panel is INFEASIBLE (recorded, not a failure), its mode x
+  stratum is declared infeasible and reported (excluded from the critical maxima and the acceptance
+  rates); the redraw rate per mode is reported.
   Directional knobs (H-T modes): per epoch, a latent focal-time slope (capture: predator time; exposed
   survival: prey time), continuous, linear within each epoch. The knobs and the amplitudes are solved
   JOINTLY (alternating, each with the other present) and the COMPLETED noise-free panel is verified
@@ -124,6 +128,7 @@ DIR_TOL = 1e-5           # the declared epoch slopes, met on the completed noise
 DIR_STEPS = 12
 KNOB_MAX = 8.0           # |a directional knob| in latent logit per 50M
 JOINT_ROUNDS = 24
+REDRAW_CAP = 5           # D2: redraws of a null world with unattainable targets before the panel is infeasible
 NTHETA = 98
 F_MODES = ("F0", "F1", "F2", "F3", "F4")
 T_MODES = ("T0", "T1", "T2", "T3", "T4")
@@ -135,6 +140,11 @@ GREVILLE = np.array([0.0, 1 / 9, 1 / 3, 2 / 3, 8 / 9, 1.0])
 
 class CalibError(Exception):
     pass
+
+
+class PanelInfeasible(CalibError):
+    """A null panel whose declared targets stay unattainable after the capped redraws (D2): recorded as
+    infeasible (its mode reported), never a failed panel."""
 
 
 def sig(x):
@@ -561,7 +571,7 @@ class Panel:
         self.stress = (stage == "val") if stress is None else stress
         self.tag = (hyp, f"{stage}:{stratum}", mode, panel)
         self.unattainable, self.deviations, self.verified, self.achieved = [], [], [], {}
-        self._metric = {}
+        self._metric, self.redraws = {}, []
 
     def rng(self, purpose):
         return VecSplitMix64(stats.stream_seed(*self.tag, purpose))
@@ -838,7 +848,26 @@ class Panel:
             th = thbar + COEF_STRESS * (th_all[s] - thbar)
             pl = plan_world(self.hyp, self.mode, self.panel, k, rw)
             u = ar_paths(wg.times, rho, Sig, ar["step"], self.rng(f"ar/{wg.id}").normals(len(wg.times) * 5).reshape(-1, 5))
-            dirC, dirQ, amp, ver = self.solve_joint(wg, th, pl, u)
+            for j in range(REDRAW_CAP + 1):
+                n0 = len(self.unattainable)
+                dirC, dirQ, amp, ver = self.solve_joint(wg, th, pl, u)
+                if len(self.unattainable) == n0 or self.stage == "alt":     # (an alternative: a non-success)
+                    break
+                # D2 (2026-11-08): a NULL world whose declared target bounded means cannot attain is
+                # REDRAWN from the same null mode with the next registered seed (its own redraw streams:
+                # the other worlds' draws are untouched), at most REDRAW_CAP times; beyond the cap the
+                # panel is infeasible (recorded and reported; not a failed calibration)
+                self.redraws.append({"world": wg.id, "redraw": j + 1, "unattainable": self.unattainable[n0:]})
+                del self.unattainable[n0:]
+                if j == REDRAW_CAP:
+                    raise PanelInfeasible(f"{wg.id}: null targets unattainable after {REDRAW_CAP} redraws")
+                rr = self.rng(f"redraw/{wg.id}/{j + 1}")
+                s = int(rr.below(len(th_all), 1)[0])
+                th = thbar + COEF_STRESS * (th_all[s] - thbar)
+                pl = plan_world(self.hyp, self.mode, self.panel, k, rr)
+                u = ar_paths(wg.times, rho, Sig, ar["step"],
+                             self.rng(f"ar/{wg.id}/redraw{j + 1}").normals(len(wg.times) * 5).reshape(-1, 5))
+                self._metric = {key: v for key, v in self._metric.items() if key[0] != wg.id}
             self.verified.append(dict(ver, world=wg.id))
             lat = self.latent(wg, th, pl, u, amp, dirC, dirQ)
             mu = {ch: sig(lat[ch]) for ch in lat}
@@ -1175,11 +1204,17 @@ def run_panel(graph, params, hyp, stage, stratum, mode, panel, gates_c=None, dra
         rec["subtype"] = panel % 32
     try:
         g = sorted(graph, key=lambda w: w.id)
-        pn = Panel(stratum_worlds(g, stratum), params, hyp, stage, stratum, mode, panel).simulate()
-        rec.update(unattainable=pn.unattainable, deviations=pn.deviations,
+        pn = Panel(stratum_worlds(g, stratum), params, hyp, stage, stratum, mode, panel)
+        try:
+            pn.simulate()
+        except PanelInfeasible as e:                 # (D2: recorded and reported, not a failed panel)
+            rec.update(infeasible=str(e), redraws=pn.redraws, available=False)
+            rec["cpu_total"] = time.process_time() - t0
+            return rec
+        rec.update(unattainable=pn.unattainable, deviations=pn.deviations, redraws=pn.redraws,
                    joint_rounds=max((v.get("rounds", 1) for v in pn.verified), default=0))
         if pn.unattainable and stage != "alt":
-            raise CalibError(f"unattainable null targets: {pn.unattainable[:3]}")
+            raise CalibError(f"unattainable null targets after the redraws: {pn.unattainable[:3]}")
         rec["non_success"] = bool(pn.unattainable)
         if hyp == "H-T" and mode in ("TA1", "TA2"):
             rec["direction"] = "ARD->FSD" if panel % 2 == 0 else "FSD->ARD"
@@ -1263,7 +1298,11 @@ def critical_values(records, production=True):
             continue
         by, man = complete(records, hyp, "dev", N_DEV, production)
         out["manifest"][hyp] = man
+        out.setdefault("redraws", {}).update(redraw_report(by, hyp))
         for (m, s), rs in sorted(by.items()):
+            if any(r.get("infeasible") for r in rs):   # (D2: the mode is declared infeasible and reported)
+                out.setdefault("infeasible", {})[f"{hyp}|{m}|{s}"] = sum(1 for r in rs if r.get("infeasible"))
+                continue
             def crit(vals):
                 sc = sorted(vals)
                 return sc[min(math.ceil(0.99 * (len(sc) + 1)), len(sc)) - 1]
@@ -1275,13 +1314,27 @@ def critical_values(records, production=True):
             out["strata"][f"{hyp}|{m}|{s}"] = rec
 
     def mx(hyp, modes, key):
-        return max(out["strata"][f"{hyp}|{m}|{s}"][key] for m in modes for s in STRATA)
+        v = [out["strata"][f"{hyp}|{m}|{s}"][key] for m in modes for s in STRATA if f"{hyp}|{m}|{s}" in out["strata"]]
+        return max(v) if v else None
     if "H-F" in out["manifest"]:
         out["c_F"] = mx("H-F", ("F0", "F1", "F2"), "score")
         out["c_M"] = mx("H-F", F_MODES, "M")
         out["c_E"] = {e: mx("H-F", ("F0", "F1", "F2"), f"S_{e}") for e in transition.EPOCHS}
     if "H-T" in out["manifest"]:
-        out["c_T"] = max(transition.GUARD, mx("H-T", T_MODES, "score"))
+        cT = mx("H-T", T_MODES, "score")
+        out["c_T"] = None if cT is None else max(transition.GUARD, cT)
+    return out
+
+
+def redraw_report(by, hyp):
+    """D2: per mode x graph stratum, the panels with a redrawn null world, the redraws and the infeasible
+    panels (the redraw rate is reported, never hidden)."""
+    out = {}
+    for (m, s), rs in sorted(by.items()):
+        red = [len(r.get("redraws") or []) for r in rs]
+        out[f"{hyp}|{m}|{s}"] = {"panels": len(rs), "panels_redrawn": sum(1 for x in red if x),
+                                 "redraws": sum(red), "infeasible": sum(1 for r in rs if r.get("infeasible")),
+                                 "redraw_rate": sum(1 for x in red if x) / len(rs) if rs else None}
     return out
 
 
@@ -1321,12 +1374,18 @@ def acceptance(records, crit, production=True):
             if not all(same.values()):
                 raise CalibError(f"{hyp}: the validation manifest differs from the development one: {same}")
         rates = {}
+        out.setdefault("redraws", {}).update(redraw_report(by, hyp))
+        infeasible = {k for k, rs in by.items() if any(r.get("infeasible") for r in rs)} | {
+            tuple(k.split("|")[1:]) for k in crit.get("infeasible", {}) if k.startswith(hyp + "|")}
+        out.setdefault("infeasible", []).extend(sorted(f"{hyp}|{m}|{s}" for m, s in infeasible))
 
         def rate(name, flags):
             k, n = sum(flags), len(flags)
             u = stats.clopper_pearson_upper(k, n)
             rates[name] = {"fp": k, "n": n, "U95": u, "pass": u <= 0.02}
         for (m, s), rs in sorted(by.items()):
+            if (m, s) in infeasible:
+                continue
             if hyp == "H-F":
                 rej = [hf_rejects(r, crit) for r in rs]
                 if m in ("F0", "F1", "F2"):
@@ -1355,14 +1414,15 @@ def acceptance(records, crit, production=True):
                 out["pass"][f"gate {e}"] = all(v["pass"] for k, v in rates.items() if k.startswith(f"gate_{e}|"))
             out["ptables"]["H-F detection"] = {f"{m}|{s}": sorted(_num(r["score"]) if r["available"] else -math.inf
                                                                   for r in by[(m, s)])
-                                               for m in ("F0", "F1", "F2") for s in STRATA}
+                                               for m in ("F0", "F1", "F2") for s in STRATA if (m, s) not in infeasible}
             out["ptables"]["H-F material"] = {f"{m}|{s}": sorted(_num(r["M"]) if r["available"] else -math.inf
                                                                  for r in by[(m, s)])
-                                              for m in F_MODES for s in STRATA}
+                                              for m in F_MODES for s in STRATA if (m, s) not in infeasible}
         else:
             out["pass"]["H-T"] = all(v["pass"] for v in rates.values())
             out["ptables"]["H-T"] = {f"{m}|{s}": sorted(_num(r["score"]) if r["available"] else -math.inf
-                                                        for r in by[(m, s)]) for m in T_MODES for s in STRATA}
+                                                        for r in by[(m, s)])
+                                     for m in T_MODES for s in STRATA if (m, s) not in infeasible}
         out.setdefault("manifest", {})[hyp] = man
     return out
 
