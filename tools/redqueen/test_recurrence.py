@@ -399,6 +399,15 @@ class TestRecurrence(unittest.TestCase):
             v = cov.wmul(A[:, 0])                                           # (a vector: the same operator)
             self.assertLessEqual(float(np.max(np.abs(v - got[:, 0])) / np.max(np.abs(got[:, 0]))), 1e-13)
 
+    def test_empty_right_hand_side(self):
+        """Codex r7 P3: W applied to an (n, 0) right-hand side is an (n, 0) result, for both covariance forms."""
+        rc = self.rc
+        rng = np.random.default_rng(2)
+        n = 30
+        for cov in (rc.Cov(1e-4 * (1 + rng.random(n)), 1e-3 * rng.standard_normal((n, 4))),
+                    rc.Cov(dense=np.diag(1e-4 * (1 + rng.random(n))))):
+            self.assertEqual(cov.wmul(np.zeros((n, 0))).shape, (n, 0))
+
     def test_no_period_from_graph_density(self):
         """21 (noiseless part): constant and drifting strategies on an irregular coarse + fine graph give
         zero residual recurrence at every candidate."""

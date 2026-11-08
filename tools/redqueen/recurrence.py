@@ -155,7 +155,8 @@ class Cov:
     def _sparse(self):
         """The structured Woodbury factor, built once from U's SPARSE rows (#68 CPU lever L2, exact algebra):
         each row's nonzero columns (at most w; a bank row has 2 or 4) as an n x w index / value table; K = I +
-        U'D^-1 U assembled from the within-row pairs, O(n w^2) instead of the dense O(n k^2); its inverse once
+        U'D^-1 U assembled from the within-row pairs, O(n w^2) instead of the dense O(n k^2) (sparse assembly
+        with a DENSE K^-1: no Schur step); its inverse once
         (symmetrized); U'X by a sorted segment sum and U Z by a gather, so the dense n x k Woodbury product is
         never formed."""
         if self._sp is None:
@@ -205,12 +206,12 @@ class Cov:
         """W A."""
         A = np.asarray(A, float)
         one = A.ndim == 1
-        A2 = A.reshape(self.n, -1)
+        A2 = A.reshape(self.n, -1) if A.size else A.reshape(self.n, 0)   # (an empty right-hand side: (n, 0))
         if self.V is not None:
             out = _chol_solve(self.L, A2)
         else:
             out = A2 * self.dinv[:, None]
-            if self.U is not None:                   # (W A = D^-1 A - D^-1 U K^-1 U' D^-1 A, sparse in U: L2)
+            if self.U is not None and out.shape[1]:  # (W A = D^-1 A - D^-1 U K^-1 U' D^-1 A, sparse in U: L2)
                 sp = self._sparse()
                 c = out.shape[1]
                 prod = (sp["val"][:, :, None] * out[:, None, :]).reshape(-1, c)[sp["perm"]]

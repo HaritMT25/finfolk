@@ -561,7 +561,7 @@ def classify(obs_e, draws_e, gate, a=LEVEL):
 
 
 def ht(epochs, betas, gates, loads=None, k=0, analysis="main", draws=stats.B_BOOT, c_T=GUARD, p_model=None,
-       report=True):
+       report=True, redesign=None):
     """The complete H-T analysis. epochs: {e: [(WorldDesign for e, responses y)]} (the same unique world
     ids in every epoch, any order); betas: {e: {"P": {world id: slope}, "Q": {world id: slope}}}; gates:
     {e: the epoch's calibrated recurrence-detection gate (bool)}; loads: {world id: {"C": L, "Q": L}}
@@ -570,7 +570,9 @@ def ht(epochs, betas, gates, loads=None, k=0, analysis="main", draws=stats.B_BOO
     a comparison: the result is unavailable, never a rejection (p = 1 in Holm). The result reports the
     E^U support COVERAGE per epoch (the registered domain recurrence.EPOCH_PERIODS, by period band). Every
     epoch design must use the registered domain recurrence.EPOCH_PERIODS, with no override (#68 rounds 5-6
-    P2-2): a design on any other list makes the analysis unavailable (failure "domain")."""
+    P2-2): a design on any other list makes the analysis unavailable (failure "domain"). redesign (a callable
+    (epoch, world id, xi_b) -> WorldDesign; calib's V_PER_DRAW): each draw's per-world quantities are then
+    computed on the draw's own re-fitted design (the observed values stay the observed design's)."""
     calibrated = c_T is not None
     c_T = max(GUARD, c_T) if calibrated else GUARD
     ids = canonical_ids(epochs, betas, loads)
@@ -603,6 +605,15 @@ def ht(epochs, betas, gates, loads=None, k=0, analysis="main", draws=stats.B_BOO
     try:
         per = {e: [world_epoch(wd, y, (loads or {}).get(w), xi) for w, (wd, y) in zip(ids, epochs[e])]
                for e in EPOCHS}
+        if redesign is not None:           # (V per draw: each draw on its own design; slow, registered OFF)
+            for e in EPOCHS:
+                for i, (w, (wd, y)) in enumerate(zip(ids, epochs[e])):
+                    cols = {key: np.empty(xi.shape[0]) for key in ("selC", "selQ", "maxC", "maxQ")}
+                    for b in range(xi.shape[0]):
+                        we = world_epoch(redesign(e, w, xi[b]), y, (loads or {}).get(w), xi[b:b + 1])
+                        for key in cols:
+                            cols[key][b] = we[key][0]
+                    per[e][i] = dict(per[e][i], **cols)
         for e in EPOCHS:
             obs[e], dr[e], res[e] = epoch_components(per[e], bet[e], idx)
         stat = ht_statistic(obs, dr, gates)

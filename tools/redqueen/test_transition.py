@@ -411,6 +411,36 @@ class TestTransition(unittest.TestCase):
         self.assertEqual(sorted(map(tuple, V.tolist())), [(0.0, 0.0), (0.0, 1.0), (1.0, 0.0), (2.0, 2.0)])
         self.assertEqual(tr.hull_vertices(np.array([[1.0, 2.0], [1.0, 2.0]])).tolist(), [[1.0, 2.0]])
 
+    def test_redesign_path_is_exact_with_the_same_design(self):
+        """D4 spec 5: transition.ht's per-draw redesign path, handed the observed design itself for every draw,
+        reproduces the fixed-design path exactly (the machinery adds nothing)."""
+        tr, rc = self.tr, self.rc
+        refs = np.array(["a", "b", "c", "d"], object)
+        epochs, betas, loads = {}, {}, {}
+        for e in tr.EPOCHS:
+            L, U = rc.SCOPES[e]
+            tt = np.array([max(L, 1e-6)] + [L + float(k) for k in range(1, 51)])
+            ti, tj = (a_.ravel() for a_ in np.meshgrid(tt, tt, indexing="ij"))
+            rt, rr = np.tile(tt, 4), np.repeat(refs, len(tt))
+            cw, cr = rc.Cov(np.full(len(ti), 1e-4)), rc.Cov(np.full(len(rt), 1e-4))
+            epochs[e], betas[e] = [], {"P": {}, "Q": {}}
+            for w in range(2):
+                wd = rc.WorldDesign(f"w{w}", {"C": (ti, tj, cw), "Q": (ti, tj, cw)}, {"C": (rt, rr, cr), "Q": (rt, rr, cr)}, e)
+                lag = 2 * math.pi * (tj - ti) / 8.0 - 0.7 * w
+                y = {"within": {"C": 0.3 + 0.05 * np.cos(lag), "Q": -0.1 + 0.02 * np.cos(lag)},
+                     "ref": {"C": 0.4 + 0.05 * np.cos(2 * math.pi * rt / 8.0 - 0.7 * w),
+                             "Q": -0.1 + 0.02 * np.cos(2 * math.pi * rt / 8.0 - 0.7 * w)}}
+                epochs[e].append((wd, y))
+                betas[e]["P"][f"w{w}"], betas[e]["Q"][f"w{w}"] = 0.0, 0.0
+                loads[f"w{w}"] = {"C": 0.003 * np.ones((len(rt), 2)), "Q": 0.001 * np.ones((len(rt), 2))}
+        by = {(e, wd.id): wd for e in tr.EPOCHS for wd, _ in epochs[e]}
+        a = tr.ht(epochs, betas, {e: True for e in tr.EPOCHS}, loads=loads, k=2, analysis="t", draws=7)
+        b = tr.ht(epochs, betas, {e: True for e in tr.EPOCHS}, loads=loads, k=2, analysis="t", draws=7,
+                  redesign=lambda e, w, xb: by[(e, w)])
+        self.assertEqual(json.dumps(a["components"], sort_keys=True, default=float),
+                         json.dumps(b["components"], sort_keys=True, default=float))
+        self.assertEqual(a["T_T"], b["T_T"])
+
     def test_mixed_needs_affirmative_evidence(self):
         """#68 review 8: material recurrence with directional bounds spanning the band is UNRESOLVED, not
         mixed; bounds without a passed gate are unresolved; mixed needs both affirmatively."""

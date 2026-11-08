@@ -44,9 +44,23 @@ is a documented synthetic stand-in ("fitted": false) for the tests and the bench
   JOINTLY (alternating, each with the other present) and the COMPLETED noise-free panel is verified
   against every declared constraint (epoch slopes to DIR_TOL, RMS targets to AMP_TOL relative, both
   sides); a panel that does not verify is a numerical failure.
-  The analysis covariance V of a panel is the bank model evaluated at the panel's observed per-channel
-  replicate means (clipped to [1/2N, 1 - 1/2N]; the delta method; shared columns per sharing key) - the
-  same plug-in rule the real analysis uses.
+  The analysis covariance V (amendment D4, provisional, 2026-11-08): the bank model evaluated at the
+  NULL-MODEL FITTED means (METRIC_MEANS = "null_fit"): per scope (full history and each epoch), per
+  channel, the unweighted (OLS) projection of the means onto that scope's own nuisance basis (the within
+  design's tensor backbone, the reference design's time basis + reference effects, the predator-free
+  survival's six B-splines in prey time), clipped to [1/2N, 1 - 1/2N]; the delta method; shared columns
+  per sharing key. The weights then cannot track the tested recurrent component (a score-test-style
+  metric under H0). The triage metric fits the TRUE means, the final metric (the analysis) the OBSERVED
+  replicate means; the H-T shared-reference loadings use each reference row's epoch fit. V is computed
+  ONCE per observed panel and held fixed across the bootstrap draws (V_PER_DRAW = False: a registered
+  conditional approximation, measured by the calibration as part of the whole procedure); True re-fits
+  m0 and V for every draw (Panel.redesign through transition.ht(redesign=...): exact but slow).
+  s(mu) is SMOOTH and monotone (D4): a fitted noise-bank curve on logit(mu) when the parameters carry one
+  (noise.s_logit: knots and values, linear between, constant beyond), else the registered bins blended
+  linearly on logit(mu) over SMOOTH_W = 0.8 logit units centred on each bin edge (SMOOTH_W = 0 is exactly
+  the bins); the validation-stress capture floor (0.80 / 0.35 at 0.35) is blended alike. The generator's
+  location a(mu; s) interpolates linearly between tables on the registered s grid (S_STEP = 0.005), each
+  grid cell's interpolation verified once at its midpoint (|E[K/N] - mu| <= LOC_S_TOL).
 
 FEASIBILITY AND STRATA (the D2 ruling, 2026-11-08; Codex round 4). Three classes. UNREACHED ON THE
 REGISTERED SEARCH: the target is not reached by the registered deterministic search (AMP_GRID on [0, A_SUP],
@@ -66,7 +80,7 @@ P2-5): H-F F0-F2 by construction; F3 / F4 not both material energies above thres
 max_c min_j m_cj / s_j <= TAU_NUM over all six candidates (TAU_NUM = 2 DIR_TOL / min(delta) = 1e-3: two
 slopes each verified to DIR_TOL at the smallest delta). B-eligible: feasible members (with a declared
 boundary, its noise-free residual inside the one-sided window); I-eligible: unreached members. A cell's B
-is its first n_c accepted B panels (the FINAL-metric boundary check passed), its I its first n_c
+is its first n_c B panels (the triage-metric boundary inside its window), its I its first n_c
 I-eligible; the stream continues after the audit while B_c < n_c or (I collection and I_c < n_c), up to K_c;
 I collection runs when the mode's audit I-eligible fraction x K >= N_MIN. A cell short of B at K_c is
 CAPPED: the mode's calibration and every decision needing it are UNAVAILABLE (p = 1 in Holm), never a
@@ -85,8 +99,8 @@ TRIAGE metric: the registered analysis functional at the panel's TRUE (noise-fre
 covariance evaluated at those means (the analysis metric's population limit; null membership is a
 population property). It must hold ONE-SIDED from the null side, in the window [b (1 - BOUNDARY_TOL), b]
 (margins: [-BOUNDARY_TOL, TAU_NUM] x scale), else the proposal is unreached by the construction. The
-same quantity under the FINAL analysis metric (the plug-in covariance at the OBSERVED means) is REPORTED
-per panel as the estimator distortion at the boundary, and never gates (gating would condition B on the
+same functional of the TRUE means under the FINAL analysis metric, T{y(mu); V[m0(mu-hat)]}, is REPORTED
+per panel as the METRIC-INDUCED CHANGE at the boundary (not the estimator's total bias), and never gates (gating would condition B on the
 noise draw; solving under it would couple the truth to the noise). A numerical exception in the triage
 check is a failed proposal; one in the reported final-metric value is recorded with the panel.
 H-F F3 / F4 BOUNDARIES ARE FUNCTIONAL (the coordinator's decision (a), 2026-11-08): E_C = d_C^2 (F3) or
@@ -204,6 +218,12 @@ LAMBDA_FROZEN_METRIC = False   # the frozen-metric lambda proposals (Codex round
 FROZEN_ROUNDS = 4        # re-anchorings of the frozen metric before the true-metric search takes over
 BOUNDARY_TOL = 0.05      # the ONE-SIDED boundary window, energy scale [b (1 - 0.05), b] (RMS: [0.9747, 1] x d)
 TAU_NUM = 2 * DIR_TOL / min(stats.DELTA_P, stats.DELTA_Q)    # = 1e-3: null membership's NUMERICAL allowance
+METRIC_MEANS = "null_fit"    # D4 (provisional, 2026-11-08): V at the null-model fitted means ("raw": the means)
+V_PER_DRAW = False           # D4: V once per observed panel, held fixed across the bootstrap draws (registered:
+                             # a conditional approximation); True re-fits m0 and V per draw (a slow exact path)
+SMOOTH_W = 0.8               # D4: the smooth s(mu)'s blend width at each bin edge, logit units (0: the bins)
+S_STEP = 0.005               # D4: the location tables' s grid (linear interpolation between grid tables)
+LOC_S_TOL = 2e-6             # D4: the verified bound on |E[K/N](a(mu; s)) - mu| between grid tables
 D_C, D_Q = recurrence.D_C, recurrence.D_Q
 ROUNDS = 3               # each quota cell's proposal cap K_c = ROUNDS x n_c (the D2 ruling)
 N_MIN = {"dev": 99, "val": 149}
@@ -462,13 +482,38 @@ def check_params(p, production=False):
     return p
 
 
+def _edge_weight(mu, edge, width):
+    """0 below the blend band, 1 above, linear on logit(mu) across [logit(edge) - width / 2, + width / 2];
+    width 0: the step at the edge, the cutpoint itself in the UPPER bin (mu >= edge: the registered endpoint
+    convention of the bins; mooted by the smooth s)."""
+    mu = np.asarray(mu, float)
+    if width <= 0:
+        return (mu >= edge).astype(float)
+    x = np.log(np.clip(mu, 1e-300, None) / np.clip(1 - mu, 1e-300, None))
+    e = math.log(edge / (1 - edge))
+    return np.clip((x - (e - width / 2)) / width, 0.0, 1.0)
+
+
 def noise_scale(p, ch, mu, stress=False, extra=1.0):
-    """s_ch(mu) by the registered mean bins (validation stress: H.9.2's floors / multipliers)."""
-    s = np.asarray(p["noise"]["s"][ch], float)
-    bins = CAP_BINS if ch == "C" else SURV_BINS
-    out = np.where(mu < bins[0], s[0], np.where(mu < bins[1], s[1], s[2]))
+    """s_ch(mu), SMOOTH and monotone (D4): the noise bank's fitted curve on logit(mu) when the parameters carry
+    one (noise.s_logit[ch]: {"x": logit knots, "s": values}; linear between, constant beyond), else the
+    registered bins blended on logit(mu) over SMOOTH_W at each edge (SMOOTH_W = 0: exactly the bins).
+    Validation stress (H.9.2): capture max(1.5 s, the floor 0.80 below 0.35 / 0.35 above, blended alike),
+    survival 1.5 s."""
+    mu = np.asarray(mu, float)
+    fn = (p["noise"].get("s_logit") or {}).get(ch)
+    if fn:
+        x = np.log(np.clip(mu, 1e-300, None) / np.clip(1 - mu, 1e-300, None))
+        out = np.interp(x, np.asarray(fn["x"], float), np.asarray(fn["s"], float))
+    else:
+        s = np.asarray(p["noise"]["s"][ch], float)
+        lo, hi = CAP_BINS if ch == "C" else SURV_BINS
+        out = s[0] + (s[1] - s[0]) * _edge_weight(mu, lo, SMOOTH_W) + (s[2] - s[1]) * _edge_weight(mu, hi, SMOOTH_W)
     if stress:
-        out = np.maximum(1.5 * out, np.where(mu < 0.35, 0.80, 0.35)) if ch == "C" else 1.5 * out
+        if ch == "C":
+            out = np.maximum(1.5 * out, 0.80 + (0.35 - 0.80) * _edge_weight(mu, 0.35, SMOOTH_W))
+        else:
+            out = 1.5 * out
     return out * extra
 
 
@@ -534,26 +579,101 @@ def location_table(s, N):
     return _LOC[key]
 
 
+def _location_at(mu, sv, N):
+    a, f, _ = location_table(sv, N)
+    if np.any(mu <= f[0]) or np.any(mu >= f[-1]) or not np.all(np.isfinite(mu)):
+        raise CalibError(f"an intended mean outside ({f[0]:.3g}, {1 - f[-1]:.3g} from 1): the bounded model "
+                         "cannot attain it")
+    return np.interp(mu, f, a)
+
+
+_SCELL = {}
+
+
+def _verify_s_cell(k, N):
+    """D4: the linear interpolation in s between the grid tables k S_STEP and (k + 1) S_STEP, verified once at
+    the cell's midpoint over the midpoint table's interior means (|E[K/N] - mu| <= LOC_S_TOL)."""
+    key = (int(k), int(N))
+    if key not in _SCELL:
+        sm = (k + 0.5) * S_STEP
+        _, f, _ = location_table(sm, N)
+        mu = f[(f > 1e-9) & (f < 1 - 1e-9)][::7]
+        a = 0.5 * (_location_at(mu, k * S_STEP, N) + _location_at(mu, (k + 1) * S_STEP, N))
+        err = float(np.max(np.abs(expected_fraction(a, sm, N) - mu))) if len(mu) else 0.0
+        if err > LOC_S_TOL:
+            raise CalibError(f"the s-grid interpolation error {err:.2e} exceeds {LOC_S_TOL} (s {sm:.4f}, N {N})")
+        _SCELL[key] = err
+    return _SCELL[key]
+
+
 def location(mu, s, N):
     """a(mu) with E[floor(N sigma(a + s Z) + 1/2)] / N = mu, Z ~ N(0, 1) (vectorized over cells), over the
     FULL intended range (0, 1): no clipping, so distinct intended means keep distinct expected fractions
-    (#68 round 2 P2-6); a mean outside the table's range is refused."""
+    (#68 round 2 P2-6); a mean outside the table's range is refused. A continuous s (D4) interpolates
+    linearly between the tables of the registered s grid (S_STEP), each grid cell verified (LOC_S_TOL)."""
     mu, s = np.asarray(mu, float), np.asarray(s, float)
     out = np.empty_like(mu)
-    for sv in np.unique(s):
-        a, f, _ = location_table(sv, N)
-        m = s == sv
+    k = np.floor(s / S_STEP + 1e-9).astype(np.int64)
+    t = s / S_STEP - k
+    for kk in np.unique(k):
+        m = k == kk
         x = mu[m]
-        if np.any(x <= f[0]) or np.any(x >= f[-1]) or not np.all(np.isfinite(x)):
-            raise CalibError(f"an intended mean outside ({f[0]:.3g}, {1 - f[-1]:.3g} from 1): the bounded model "
-                             "cannot attain it")
-        out[m] = np.interp(x, f, a)
+        on = np.abs(t[m]) <= 1e-9
+        a_lo = _location_at(x, kk * S_STEP, N)
+        if on.all():
+            out[m] = a_lo
+            continue
+        _verify_s_cell(kk, N)
+        a_hi = _location_at(x, (kk + 1) * S_STEP, N)
+        out[m] = np.where(on, a_lo, (1 - t[m]) * a_lo + t[m] * a_hi)
     return out
 
 
 def counts(mu, s, eps, N):
     """K = floor(N sigma(a(mu) + eps) + 1/2) (eps already scaled by s(mu))."""
     return np.floor(N * sig(location(mu, s, N) + eps) + 0.5)
+
+
+# ================================================================== D4: the null-model fitted means
+NULL_RCOND = 1e-10           # D4: the null fit's lstsq cutoff (relative to the largest singular value)
+
+
+def _ols(X, y):
+    """The deterministic OLS projection of y on X (lstsq, rcond NULL_RCOND); a rank-deficient basis is a
+    numerical failure (D4 spec 1)."""
+    beta, _, rank, _ = np.linalg.lstsq(X, y, rcond=NULL_RCOND)
+    if rank < X.shape[1]:
+        raise CalibError(f"a rank-deficient nuisance basis in the null fit ({rank} < {X.shape[1]}): a numerical failure")
+    return X @ beta
+
+
+def null_fit_means(wg, means, scope, N):
+    """D4: m0, the means V is evaluated at for `scope`: per channel the unweighted (OLS) projection of `means`
+    onto the scope's OWN registered H.3.2 nuisance basis, no harmonics: within capture C and the EXPOSED
+    survival S (fitted separately, never the contrast S - F) on the within tensor surface; the free
+    controls F (one per prey snapshot, reused by every matched cell) on their six B-splines in prey time;
+    reference capture RC and reference exposed survival RS on the common trend + reference intercepts;
+    clipped to [0.5 / n, 1 - 0.5 / n]. Entries outside the scope are left as given (its designs mask them).
+    The same fit runs on the TRUE channels (the triage metric, the population analogue theta0(mu)) and on the
+    OBSERVED ones (the analysis and the final-metric diagnostic)."""
+    L, U = recurrence.scope_bounds(scope)
+    per = tuple(recurrence.PERIODS.get(scope, ()))
+    out = {k: np.array(v, float, copy=True) for k, v in means.items()}
+    mw = (wg.ti >= L) & (wg.ti <= U) & (wg.tj >= L) & (wg.tj <= U)
+    if mw.any():
+        X = recurrence.within_geometry(np.ascontiguousarray(wg.ti[mw]), np.ascontiguousarray(wg.tj[mw]), (L, U), per)["X"]
+        for ch, n in (("C", N), ("S", TRIALS)):
+            out[ch][mw] = np.clip(_ols(X, out[ch][mw]), 0.5 / n, 1 - 0.5 / n)
+    for ch, t, r, n in (("RC", wg.cT, wg.cR, N), ("RS", wg.qT, wg.qR, TRIALS)):
+        geo = recurrence.ref_geometry(t, r, (L, U), per)
+        if "X" in geo:
+            mk = geo["mask"]
+            out[ch][mk] = np.clip(_ols(geo["X"], out[ch][mk]), 0.5 / n, 1 - 0.5 / n)
+    pm = (wg.prey >= L) & (wg.prey <= U)
+    if pm.sum() >= 2:
+        Bf = backbone.basis(np.asarray(wg.prey, float)[pm], (L, U))
+        out["F"][pm] = np.clip(_ols(Bf, out["F"][pm]), 0.5 / TRIALS, 1 - 0.5 / TRIALS)
+    return out
 
 
 # ================================================================== red variation
@@ -830,6 +950,32 @@ class Panel:
         cache[kind] = ix
         return ix
 
+    def eval_means(self, wg, means, scope):
+        """D4: the means V is evaluated at (METRIC_MEANS: "null_fit", registered; "raw" for comparison)."""
+        if METRIC_MEANS == "raw":
+            return means
+        if METRIC_MEANS != "null_fit":
+            raise CalibError(f"METRIC_MEANS {METRIC_MEANS!r}")
+        return null_fit_means(wg, means, scope, self.p["capture_bound"])
+
+    def loading_means(self, wg, m):
+        """The H-T shared-reference loadings' means (D4): each reference observation at its own epoch's null fit
+        (the epochs are disjoint), the full-history fit between epochs."""
+        if METRIC_MEANS == "raw":
+            return m
+        out = self.eval_means(wg, m, "full")
+        for e in transition.EPOCHS:
+            fe = self.eval_means(wg, m, e)
+            L, U = recurrence.SCOPES[e]
+            for ch, t in (("RC", wg.cT), ("RS", wg.qT)):
+                k = (t >= L) & (t <= U)
+                out[ch][k] = fe[ch][k]
+        return out
+
+    def scope_covs(self, wg, m):
+        return {"C": self.cov(wg, {"C": m["C"]}, "C"), "Q": self.cov(wg, {"S": m["S"], "F": m["F"]}, "Q"),
+                "RC": self.cov(wg, {"C": m["RC"]}, "RC"), "RQ": self.cov(wg, {"S": m["RS"], "F": m["F"]}, "RQ")}
+
     def ref_loads(self, wg, m, refkeys):
         """The shared-reference source loadings (H.4.2) of the world's two reference panels over the
         panel's global reference keys."""
@@ -1067,7 +1213,7 @@ class Panel:
             states[lam] = {"E": v, "clips": clips, "worlds": [{k: w[k] for k in ("amp", "mu", "y_true")}
                                                               for w in self.worlds]}
             last.clear()
-            last.update(lam=lam, nf=[(w.get("cov_nf"), w.get("_dcache_nf"), w.get("_cov_nf_ver")) for w in self.worlds])
+            last.update(lam=lam, nf=[(w.get("_dcache_nf"), w.get("_cov_nf_ver")) for w in self.worlds])
             path.append((lam, v))
             return v
 
@@ -1084,7 +1230,7 @@ class Panel:
                 w.update(x)
                 self._reset_nf(w)
                 if reuse and last["nf"][i][0] is not None:
-                    w["cov_nf"], w["_dcache_nf"], w["_cov_nf_ver"] = last["nf"][i]
+                    w["_dcache_nf"], w["_cov_nf_ver"] = last["nf"][i]
                 w["plan"]["rec"]["full"] = tuple(lam * base if i_ == h else t
                                                  for i_, t in enumerate(w["plan"]["rec"]["full"]))
             self.unattainable = list(st["clips"])
@@ -1353,7 +1499,8 @@ class Panel:
                 "bound": DIR_TOL / stats.DELTA_P, "tau_num": TAU_NUM}
 
     def boundary_final(self):
-        """The REPORTED estimator distortion at the boundary (the coordinator's ruling, 2026-11-08): the declared
+        """The REPORTED metric-induced change at the boundary (the coordinator's ruling, 2026-11-08; Codex r7: it
+        measures T{y(mu); V[m0(mu-hat)]} against the definition, not the estimator's total bias): the declared
         boundary quantity on the noise-free means under the FINAL analysis metric (built from the observed
         means), with its residual and window flag. Never gates; a numerical exception is recorded here, not a
         failed proposal (the analysis itself decides that). None without a declared boundary."""
@@ -1640,10 +1787,8 @@ class Panel:
              "ref": {"C": KRC.mean(axis=1) / N, "Q": KRS.mean(axis=1) / TRIALS - fmean[Iq]}}
         m = {"C": KC.mean(axis=1) / N, "S": KS.mean(axis=1) / TRIALS, "F": fmean,
              "RC": KRC.mean(axis=1) / N, "RS": KRS.mean(axis=1) / TRIALS}
-        cov = {"C": self.cov(wg, {"C": m["C"]}, "C"), "Q": self.cov(wg, {"S": m["S"], "F": m["F"]}, "Q"),
-               "RC": self.cov(wg, {"C": m["RC"]}, "RC"), "RQ": self.cov(wg, {"S": m["RS"], "F": m["F"]}, "RQ")}
-        return {"y": y, "cov": cov, "K": {"C": KC.sum(axis=1), "S": KS.sum(axis=1), "F": KF.sum(axis=1)},
-                "loads": self.ref_loads(wg, m, refkeys), "nref": len(refkeys)}
+        return {"y": y, "m": m, "K": {"C": KC.sum(axis=1), "S": KS.sum(axis=1), "F": KF.sum(axis=1)},
+                "loads": self.ref_loads(wg, self.loading_means(wg, m), refkeys), "nref": len(refkeys)}
 
     # -------------------------------------------------------- analyses
     @staticmethod
@@ -1651,39 +1796,38 @@ class Panel:
         return recurrence.WorldDesign(wg.id, {"C": (wg.ti, wg.tj, cv["C"]), "Q": (wg.ti, wg.tj, cv["Q"])},
                                       {"C": (wg.cT, wg.cR, cv["RC"]), "Q": (wg.qT, wg.qR, cv["RQ"])}, scope)
 
-    def _cached(self, w, cache, ver, cv, scope):
-        """A cached design with its GUARD (#68 round 6 P3): the entry stores the covariance's version (a counter,
-        never reused, unlike id()), the graph object and the scope's registered period tuple, and every lookup
-        must match all three: a stale design is impossible (a mismatch raises)."""
-        token = (w[ver], id(w["graph"]), tuple(recurrence.PERIODS[scope]))
+    def _cached(self, w, cache, ver, means, scope, src=None):
+        """A cached design with its GUARD (#68 round 6 P3): the entry stores the means' version (a counter, never
+        reused, unlike id()), the graph object, the scope's registered period tuple and the registered
+        evaluation means (METRIC_MEANS), and every lookup must match: a stale design is impossible (a mismatch
+        raises). The covariance is built at that scope's evaluation means (D4)."""
+        token = (w[ver], id(w["graph"]), tuple(recurrence.PERIODS[scope]), METRIC_MEANS, SMOOTH_W, id(src))
         dc = w.setdefault(cache, {})
         if scope not in dc:
+            cv = self.scope_covs(w["graph"], self.eval_means(w["graph"], means, scope))
             dc[scope] = (token, self._world_design(w["graph"], cv, scope))
         elif dc[scope][0] != token:
-            raise CalibError(f"{w['id']} {scope}: a stale cached design (covariance, graph or periods changed)")
+            raise CalibError(f"{w['id']} {scope}: a stale cached design (means, graph, periods or metric changed)")
         return dc[scope][1]
 
     def design(self, w, scope):
-        """The world's design under the FINAL metric (the observed means), CACHED per scope (#68 CPU lever (a),
-        exact: the analysis and the final-metric boundary check use the identical covariance), guarded."""
-        return self._cached(w, "_dcache", "_cov_ver", w["cov"], scope)
+        """The world's design under the FINAL metric (V at the evaluation means of the OBSERVED replicate means;
+        D4: their null fit for this scope), CACHED per scope (#68 CPU lever (a), exact: the analysis and the
+        final-metric boundary value use the identical covariance), guarded."""
+        return self._cached(w, "_dcache", "_cov_ver", w["m"], scope, src=w["m"])
 
     def design_nf(self, w, scope):
-        """The world's design under the triage metric (the plug-in model at the noise-free means), CACHED per
-        scope until the means change (_reset_nf)."""
-        if "cov_nf" not in w:
-            wg, mu = w["graph"], w["mu"]
-            w["cov_nf"] = {"C": self.cov(wg, {"C": mu["C"]}, "C"),
-                           "Q": self.cov(wg, {"S": mu["S"], "F": mu["F"]}, "Q"),
-                           "RC": self.cov(wg, {"C": mu["RC"]}, "RC"),
-                           "RQ": self.cov(wg, {"S": mu["RS"], "F": mu["F"]}, "RQ")}
-            w["_dcache_nf"] = {}
+        """The world's design under the triage metric (V at the evaluation means of the TRUE means; D4: their
+        null fit for this scope), CACHED per scope until the means change (_reset_nf)."""
+        if "_cov_nf_ver" not in w:
             w["_cov_nf_ver"] = next(_VERSION)
-        return self._cached(w, "_dcache_nf", "_cov_nf_ver", w["cov_nf"], scope)
+            w["_dcache_nf"] = {}
+        mu = w["mu"]
+        return self._cached(w, "_dcache_nf", "_cov_nf_ver",
+                            {"C": mu["C"], "S": mu["S"], "F": mu["F"], "RC": mu["RC"], "RS": mu["RS"]}, scope, src=mu)
 
     @staticmethod
     def _reset_nf(w):
-        w.pop("cov_nf", None)
         w.pop("_dcache_nf", None)
         w.pop("_cov_nf_ver", None)
 
@@ -1700,6 +1844,19 @@ class Panel:
         return out
 
     def analyze_ht(self, gates_c, draws=stats.B_BOOT):
+        return self._analyze_ht(gates_c, draws)
+
+    def redesign(self, e, wid, xi_b):
+        """V_PER_DRAW (D4 spec 5; registered OFF): world wid's epoch-e design with V re-fitted for ONE bootstrap
+        draw: its reference channels perturbed by the draw's shared-reference source (y + L xi_b; the survival
+        loading on the exposed channel), m0 re-fitted, the covariances rebuilt. The within channels do not move."""
+        w = next(x for x in self.worlds if x["id"] == wid)
+        m = {k: np.array(v, float, copy=True) for k, v in w["m"].items()}
+        m["RC"] = m["RC"] + w["loads"]["C"] @ xi_b
+        m["RS"] = m["RS"] + w["loads"]["Q"] @ xi_b
+        return self._world_design(w["graph"], self.scope_covs(w["graph"], self.eval_means(w["graph"], m, e)), e)
+
+    def _analyze_ht(self, gates_c, draws=stats.B_BOOT):
         """The complete H-T analysis; gates_c: the FROZEN epoch critical values ({e: c_E}); an epoch without
         one has no passing gate calibration and H-T is unavailable (H.12)."""
         epochs, betas = {}, {}
@@ -1714,7 +1871,7 @@ class Panel:
         loads = {w["graph"].id: w["loads"] for w in self.worlds}           # (by world id: #68 review 11)
         k = self.worlds[0]["nref"] if self.worlds else 0
         res = transition.ht(epochs, betas, gates, loads=loads, k=k, analysis=f"calib/{'/'.join(map(str, self.tag))}",
-                            draws=draws, report=False)
+                            draws=draws, report=False, redesign=self.redesign if V_PER_DRAW else None)
         return {"T": res["T_T"], "S_e": S, "gates": gates, "available": res["available"],
                 "winner": None if not res["winner"] else [res["winner"]["ARD"], res["winner"]["FSD"]],
                 "phase_support": res["phase_support"], "EU_unsupported": res["EU_unsupported"],
@@ -1847,7 +2004,9 @@ def solver_identity():
             "lambda_tol": LAMBDA_TOL, "lambda_jump": LAMBDA_JUMP, "lambda_evals": LAMBDA_EVALS,
             "amp_grid": list(AMP_GRID), "knob_grid": [KNOB_GRID[0], KNOB_GRID[-1], len(KNOB_GRID)],
             "boundary_tol": BOUNDARY_TOL, "tau_num": TAU_NUM, "rounds": ROUNDS, "n_min": N_MIN,
-            "structural_modes": list(STRUCTURAL_MODES), "epoch_periods": list(recurrence.EPOCH_PERIODS)}
+            "structural_modes": list(STRUCTURAL_MODES), "epoch_periods": list(recurrence.EPOCH_PERIODS),
+            "metric_means": METRIC_MEANS, "v_per_draw": V_PER_DRAW, "smooth_w": SMOOTH_W, "s_step": S_STEP,
+            "loc_s_tol": LOC_S_TOL}
 
 
 def manifest(graph, params, draws, gates=None, production=False, graph_source="synthetic"):
@@ -1956,7 +2115,7 @@ def run_panel(graph, params, hyp, stage, stratum, mode, panel, gates_c=None, dra
             return rec
         pn.observe_all()
         if rec["role"] == "B":
-            bf = pn.boundary_final()                      # (REPORTED: the estimator distortion; never gates)
+            bf = pn.boundary_final()                      # (REPORTED: the metric-induced change; never gates)
             if bf is not None:
                 rec["boundary_final"] = bf
         t2 = time.process_time()
@@ -2041,7 +2200,8 @@ def audit_classes(xs):
     """The fixed AUDIT's classes (#68 round 4 P2-6: every cell's first n_c proposals, the mode's first n,
     classified regardless of any stopping) with fixed-sample Clopper-Pearson bounds. Population: the
     registered generator's proposals. Classes: B (a feasible member passing every boundary check),
-    final_boundary (a feasible member failing the final-metric check), I_eligible (an unreached member),
+    final_boundary (a legacy class, always 0 since the final metric is reported only), I_eligible (an
+    unreached member),
     feasible_non_member, unreached_non_member, failed (numerical: blocks the allocation)."""
     c = dict.fromkeys(("B", "final_boundary", "I_eligible", "feasible_non_member", "unreached_non_member",
                        "failed"), 0)
@@ -2327,7 +2487,8 @@ def acceptance(records, crit, production=True):
                 bl = [r.get("boundary_final") for r in rs if r.get("boundary_final")]
                 res_ = [b["residual"] for b in bl if "residual" in b and math.isfinite(b["residual"])]
                 dg.update(unavailable=sum(1 for r in rs if not r["available"]), boundary_checked=len(bl),
-                          estimator_distortion=_dist(res_),       # (the final-metric residuals: reported only)
+                          metric_induced_change=_dist(res_),      # (T{y(mu); V[m0(mu-hat)]}: reported only)
+                          final_metric_errors=sum(1 for b in bl if "error" in b),
                           boundary_max_abs_residual=max((abs(x) for x in res_), default=None))
                 out["diagnostics"][f"{hyp}|{sk}"] = dg
             if "I" not in dset:                             # (the dev scope limitation carries through)
@@ -2536,7 +2697,9 @@ def report(records):
              "boundary_noise_free": {"n": len(nb), "ok": sum(1 for b in nb if b["ok"]),
                                      "residual": _dist([b["residual"] for b in nb if math.isfinite(b["residual"])])},
              "boundary_final": {"n": len(fb), "ok": sum(1 for b in fb if b.get("ok")),
-                                "residual": _dist([b["residual"] for b in fb if math.isfinite(b["residual"])])},
+                                "errors": sum(1 for b in fb if "error" in b),
+                                "metric_induced_change": _dist([b["residual"] for b in fb if "residual" in b
+                                                                and math.isfinite(b["residual"])])},
              "membership": {"members": sum(1 for r in mem if r["member"]), "non_members": sum(1 for r in mem if not r["member"]),
                             "strongest_candidates": {c: sum(1 for r in mem if not r["member"]
                                                             and r["membership"].get("strongest") == c)

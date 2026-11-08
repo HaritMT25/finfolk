@@ -96,7 +96,7 @@ class TestCalib(unittest.TestCase):
                 return out.ravel() if A.ndim == 1 else out
         pn = cb.Panel(self.graph, self.params, "H-F", "dev", "actual", "F1", 0).simulate()
         for w in pn.worlds[:2]:
-            old = {k: v for k, v in w["cov"].items()}
+            old = pn.scope_covs(w["graph"], pn.eval_means(w["graph"], w["m"], "full"))
             for v in old.values():
                 v.__class__ = OldCov
             for scope in ("full", "E2"):
@@ -617,9 +617,9 @@ class TestStrata(unittest.TestCase):
         self.assertEqual(bs["outcome"], "feasible")
         self.assertTrue(-cb.LAMBDA_TOL * cb.D_Q ** 2 <= bs["functional"] - cb.D_Q ** 2 <= 0.0)
         nb, fb = r["membership"]["boundary"], r["boundary_final"]
-        self.assertTrue(nb["ok"] and fb["ok"])
+        self.assertTrue(nb["ok"])
         self.assertEqual(fb["metric"], "final")
-        self.assertTrue(-cb.BOUNDARY_TOL <= fb["residual"] <= 0.0)
+        self.assertLessEqual(abs(fb["residual"]), 0.03)                     # (D4: the metric-induced change, reported)
         self.assertTrue(math.isfinite(r["score"]))
         self.assertIn("full/Q", r["targets"])
 
@@ -632,7 +632,8 @@ class TestStrata(unittest.TestCase):
         w = pn.worlds[0]
         d1 = pn.design(w, "full")
         self.assertIs(pn.design(w, "full"), d1)
-        fresh = cb.Panel._world_design(w["graph"], w["cov"], "full")
+        fresh = cb.Panel._world_design(w["graph"], pn.scope_covs(w["graph"], pn.eval_means(w["graph"], w["m"], "full")),
+                                       "full")
         a, b = cb.recurrence.analyze_world(d1, w["y"]), cb.recurrence.analyze_world(fresh, w["y"])
         self.assertEqual(json.dumps(a, default=str, sort_keys=True), json.dumps(b, default=str, sort_keys=True))
         self.assertIs(pn.design_nf(w, "full"), pn.design_nf(w, "full"))
@@ -693,16 +694,120 @@ class TestStrata(unittest.TestCase):
             self.assertLessEqual(b["boundary_solve"]["evals"], a["boundary_solve"]["evals"] + 1)
 
     def test_final_metric_is_reported_never_gating(self):
-        """The coordinator's ruling (2026-11-08): F3 slot 1 meets its boundary under the triage metric (the
-        definition) but not under the FINAL metric (residual about -10%): it is a B panel, analysed, with the
-        final-metric value REPORTED as the estimator distortion (never a discard)."""
-        r = self.run_("F3", 1)
-        self.assertEqual((r["eligible"], r["role"], r.get("discard")), ("B", "B", None))
-        self.assertTrue(r["membership"]["boundary"]["ok"])
-        self.assertFalse(r["boundary_final"]["ok"])
-        self.assertLess(r["boundary_final"]["residual"], -self.cb.BOUNDARY_TOL)
-        self.assertTrue(math.isfinite(r["score"]))
-        self.assertEqual(self.cb.audit_classes([r])["classes"]["final_boundary"], 0)
+        """The coordinator's ruling (2026-11-08): the final-metric value is REPORTED as the estimator distortion,
+        never a discard; under D4 (V at the null-fit means, a smooth s) the distortion on the 4-world fixture's
+        boundary panels is at most 3% (it was about -10% with the raw-means metric on F3 slot 1)."""
+        cb = self.cb
+        for mode, slot in (("F3", 1), ("F4", 0), ("F4", 1)):
+            r = self.run_(mode, slot)
+            self.assertEqual((r["eligible"], r["role"], r.get("discard")), ("B", "B", None), (mode, slot))
+            self.assertTrue(r["membership"]["boundary"]["ok"])
+            self.assertLessEqual(abs(r["boundary_final"]["residual"]), 0.03, (mode, slot, r["boundary_final"]))
+            self.assertTrue(math.isfinite(r["score"]))
+            self.assertEqual(cb.audit_classes([r])["classes"]["final_boundary"], 0)
+        old = cb.METRIC_MEANS
+        try:
+            cb.METRIC_MEANS = "raw"                                      # (the raw-means metric: the old distortion)
+            r = self.run_("F3", 1)
+        finally:
+            cb.METRIC_MEANS = old
+        self.assertGreater(abs(r["boundary_final"]["residual"]), 0.03)
+
+    def test_d4_null_fit_cannot_follow_the_signal(self):
+        """D4: the evaluation means are the scope's OLS null fit, so adding a recurrent component orthogonal to the
+        scope's nuisance basis to the true means leaves them EXACTLY unchanged (the signal cannot move the
+        weights); the raw means would move with it."""
+        cb = self.cb
+        rc = cb.recurrence
+        pn = cb.Panel(self.graph, self.params, "H-F", "dev", "actual", "F1", 0)
+        pn.member = lambda: {"member": True, "by": "test"}
+        pn.triage()
+        w = pn.worlds[0]
+        wg = w["graph"]
+        mu = {k: np.array(w["mu"][k], float) for k in ("C", "S", "F", "RC", "RS")}
+        for scope in ("full", "E2"):
+            L, U = rc.scope_bounds(scope)
+            mw = (wg.ti >= L) & (wg.ti <= U) & (wg.tj >= L) & (wg.tj <= U)
+            X = rc.within_geometry(np.ascontiguousarray(wg.ti[mw]), np.ascontiguousarray(wg.tj[mw]), (L, U),
+                                   tuple(rc.PERIODS[scope]))["X"]
+            h = 0.02 * np.cos(2 * math.pi * (wg.tj[mw] - wg.ti[mw]) / 8.0 + 0.4)
+            h_perp = h - X @ np.linalg.lstsq(X, h, rcond=None)[0]               # (the recurrent part only)
+            mu2 = {k: v.copy() for k, v in mu.items()}
+            mu2["C"][mw] = mu2["C"][mw] + h_perp
+            a, b = cb.null_fit_means(wg, mu, scope, 324), cb.null_fit_means(wg, mu2, scope, 324)
+            self.assertLessEqual(float(np.max(np.abs(a["C"][mw] - b["C"][mw]))), 1e-12, scope)
+            self.assertGreater(float(np.max(np.abs(mu["C"][mw] - mu2["C"][mw]))), 1e-3)
+            for ch in ("S", "F", "RC", "RS"):
+                self.assertTrue(np.array_equal(a[ch], b[ch]), (scope, ch))
+
+    def test_d4_smooth_scale_and_the_s_grid(self):
+        """D4: the smooth s(mu) is continuous and monotone between the bins and reduces EXACTLY to the bins when
+        SMOOTH_W = 0 (the stress floor alike); the generator's location on the registered s grid meets
+        E[K/N] = mu to LOC_TOL + LOC_S_TOL at continuous s."""
+        cb = self.cb
+        p = cb.placeholder_params()
+        mu = np.linspace(0.01, 0.99, 981)
+        old = cb.SMOOTH_W
+        try:
+            cb.SMOOTH_W = 0.0
+            for ch, (lo, hi) in (("C", cb.CAP_BINS), ("S", cb.SURV_BINS)):
+                s = np.asarray(p["noise"]["s"][ch])
+                want = np.where(mu < lo, s[0], np.where(mu < hi, s[1], s[2]))
+                self.assertTrue(np.array_equal(cb.noise_scale(p, ch, mu), want), ch)
+            st = cb.noise_scale(p, "C", mu, stress=True)
+            s = np.asarray(p["noise"]["s"]["C"])
+            want = np.maximum(1.5 * np.where(mu < 0.35, s[0], np.where(mu < 0.70, s[1], s[2])), np.where(mu < 0.35, 0.80, 0.35))
+            self.assertTrue(np.array_equal(st, want))
+        finally:
+            cb.SMOOTH_W = old
+        for ch in ("C", "S"):
+            v = cb.noise_scale(p, ch, mu)
+            self.assertLess(float(np.max(np.abs(np.diff(v)))), 0.02, ch)          # (no jump at the edges)
+        v = cb.noise_scale(p, "C", mu)
+        self.assertTrue(np.all(np.diff(v[mu < 0.6]) <= 1e-15))                    # (decreasing across 0.35)
+        rng = np.random.default_rng(4)
+        for N in (324, 600):
+            s = rng.uniform(0.2, 0.9, 200)
+            m = rng.uniform(0.02, 0.98, 200)
+            a = cb.location(m, s, N)
+            got = np.array([cb.expected_fraction(a[i], s[i], N)[0] for i in range(len(s))])
+            self.assertLessEqual(float(np.max(np.abs(got - m))), cb.LOC_TOL + cb.LOC_S_TOL)
+
+    def test_d4_switches_and_the_bootstrap_v(self):
+        """D4: the registered switches are in the solver identity; the bootstrap switch works both ways: V held
+        fixed at the observed m0 (registered) and V re-fitted per draw (Panel.redesign: a slow exact path) give the
+        same observed epoch scores, and both complete."""
+        cb = self.cb
+        sol = cb.solver_identity()
+        self.assertEqual((sol["metric_means"], sol["v_per_draw"], sol["smooth_w"]), ("null_fit", False, cb.SMOOTH_W))
+        g0 = {e: 0.0 for e in cb.transition.EPOCHS}
+        out = {}
+        old = cb.V_PER_DRAW
+        try:
+            for flag in (False, True):
+                cb.V_PER_DRAW = flag
+                out[flag] = cb.run_panel(self.graph, self.params, "H-T", "dev", "actual", "T3", 0, g0, draws=9,
+                                         cell="all", k=0)
+        finally:
+            cb.V_PER_DRAW = old
+        for flag in (False, True):
+            self.assertFalse(out[flag].get("error"), out[flag].get("error"))
+        self.assertEqual(out[False]["S_e"], out[True]["S_e"])
+
+    def test_d4_cache_source_identity_and_report_errors(self):
+        """Codex r7 P3: replacing a world's observed means without a version bump raises (the cache token holds
+        the source's identity); report() counts a final-metric diagnostic error instead of crashing."""
+        cb = self.cb
+        pn = cb.Panel(self.graph, self.params, "H-F", "dev", "actual", "F1", 0).simulate()
+        w = pn.worlds[0]
+        pn.design(w, "full")
+        w["m"] = {k: np.array(v, copy=True) for k, v in w["m"].items()}
+        with self.assertRaises(cb.CalibError):
+            pn.design(w, "full")
+        rec = {"hyp": "H-F", "stage": "dev", "mode": "F3", "stratum": "actual", "boundary_final": {"metric": "final",
+               "ok": False, "error": "RecurrenceError: x"}}
+        g = cb.report([rec])["groups"]["H-F|dev|F3|actual"]["boundary_final"]
+        self.assertEqual((g["errors"], g["metric_induced_change"]["n"]), (1, 0))
 
     def test_boundary_jump_is_unreached(self):
         """F3 slot 0 on four worlds: E_C(lambda) jumps over d_C^2 (a selection switches) with the null-side
