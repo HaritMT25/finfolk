@@ -89,6 +89,13 @@ jobs:
           python3 -I -W error::ResourceWarning tools/redqueen/test_redqueen.py -v 2>&1 | tee unit.log
           test "${PIPESTATUS[0]}" = 0
           ! grep -q ResourceWarning unit.log
+      - name: Map graph and recovery simulation (numpy required)
+        run: |
+          python3 -m pip install -q "numpy>=2"
+          RQ_REQUIRE_NUMPY=1 python3 -I -W error::ResourceWarning tools/redqueen/test_graph.py -v 2>&1 | tee graph.log
+          test "${PIPESTATUS[0]}" = 0
+          ! grep -q ResourceWarning graph.log
+          ! grep -q "skipped" graph.log
       - name: End to end (10 workers)
         run: PYTHON=python3 RQ_TEST_WORKERS=10 bash tests/redqueen_tooling.sh build/evo_boids "$RUNNER_TEMP/rq_work"
       - name: Histories (worlds.py, end to end; its unit tests first)
