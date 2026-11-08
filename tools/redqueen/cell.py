@@ -111,8 +111,8 @@ def commands(cell, x_name):
     p = cell["predators"]
     if cell["kind"] == "nopred":
         src, k = "random", 0
-    elif p.get("source") == "random":
-        src, k = "random", int(cell["k"])
+    elif p.get("source") in ("random", "scripted"):
+        src, k = p["source"], int(cell["k"])
     else:
         src, k = "pred.json", int(cell["k"])
     s = cell["seeds"]
@@ -202,7 +202,8 @@ def execute(cell, d, exe, paths, procs=None):
         raise CellFailure(9, f"biological: the prey snapshot {cell['prey']['path']} has no living prey", "prey")
     if int(smeta["frame"]) != int(cell["prey"]["frame"]):
         raise CellFailure(5, f"the prey snapshot is at frame {smeta['frame']}, registered {cell['prey']['frame']}")
-    if cell["kind"] == "assay" and cell["predators"].get("source") != "random":
+    scripted = cell["kind"] == "assay" and cell["predators"].get("source") == "scripted"
+    if cell["kind"] == "assay" and cell["predators"].get("source") not in ("random", "scripted"):
         yraw = rqlib.read_bytes(paths["predators"])
         if rqlib.sha256_bytes(yraw) != cell["predators"]["sha256"]:
             raise CellFailure(5, f"the predator snapshot {paths['predators']} is not its registered content")
@@ -303,8 +304,16 @@ def execute(cell, d, exe, paths, procs=None):
                    and f not in {f"end.{x}.json" for x in want})
     if extra:
         raise CellFailure(6, f"unexpected checkpoints {extra[:5]}")
-    for f in ["arena.json", "arena.manifest.json", "run.predators.csv", "run.config.txt", "end.json"] + \
-            [f"end.{x}.json" for x in want]:
+    if scripted:
+        # a scripted (Stage A) arena has no brain: no predators.csv; it must be version 1, K hunters,
+        # immortal and fixed (the economy off)
+        if (int(arena.get("formatVersion", 0)) != ckpt.V1 or int(arena["predators"]["count"]) != int(cell["k"])
+                or acfg.get("predatorEconomy")):
+            raise CellFailure(4, "the scripted arena is not K immortal Stage A hunters (version 1, economy off)")
+        if os.path.exists(os.path.join(d, "run.predators.csv")):
+            raise CellFailure(4, "a scripted assay wrote predators.csv (a brain where none belongs)")
+    for f in ["arena.json", "arena.manifest.json"] + ([] if scripted else ["run.predators.csv"]) + \
+            ["run.config.txt", "end.json"] + [f"end.{x}.json" for x in want]:
         files[f] = rqlib.sha256_file(os.path.join(d, f))
     if steps % ce:
         raise CellFailure(6, f"steps {steps} is not a multiple of checkpoint_every {ce}")
@@ -314,12 +323,14 @@ def execute(cell, d, exe, paths, procs=None):
     t2 = time.time()
     try:
         sc = score_mod.score(d, 0 if cell["kind"] == "nopred" else int(cell["k"]), steps, list(cell["horizons"]),
-                             int(cell["log_every"]), cell["assay"], fork=cell["kind"] == "nopred")
+                             int(cell["log_every"]), cell["assay"], fork=cell["kind"] == "nopred", scripted=scripted)
     except (score_mod.ScoreError, ckpt.CheckpointError, KeyError, ValueError) as e:
         raise CellFailure(4, f"score check failed: {e}")
     info["t_score"] = time.time() - t2
-    with open(os.path.join(d, "run.predators.csv")) as f:
-        pred_csv = f.read()
+    pred_csv = ""
+    if not scripted:
+        with open(os.path.join(d, "run.predators.csv")) as f:
+            pred_csv = f.read()
     with open(os.path.join(d, "run.csv")) as f:
         run_csv = normalize_run_csv(f.read())
     files["run.csv (without timing columns)"] = rqlib.sha256_bytes(run_csv.encode())

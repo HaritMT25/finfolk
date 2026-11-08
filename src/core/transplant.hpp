@@ -18,7 +18,11 @@
 //     ONLY the heritable state crosses: genome, lineageId, generation,
 //     speedFactor, buddingFactor (and Y's id, kept as sourceId). With source
 //     "random", K random-genome founders (how a Stage C run starts on an evolved
-//     prey world).
+//     prey world). With source "scripted", K SCRIPTED hunters (Stage A: no brain,
+//     no genome; the fixed benchmark of the H-C contrast): the arena has
+//     predatorBrain off, the economy off (immortal, fixed: frozen and
+//     frozen-newborn alike; live is refused), and is written as a version-1
+//     checkpoint; its predators take X's predator physics.
 //   * reset, for every added predator: energy = predatorNewbornEnergy (the
 //     spawn energy), age 0, digestTimer 0, speed = top speed, recurrent outputs
 //     0.5 (the birth state), captures 0, parentId 0, position and heading drawn
@@ -75,7 +79,7 @@ namespace transplant {
 struct Options {
     std::string preyPath;          // X (manifest only; the caller loaded it)
     std::string preyHash;          // fnv1a64 of X's file (manifest only)
-    std::string predatorsFrom;     // Y's path, or "random"
+    std::string predatorsFrom;     // Y's path, "random" or "scripted"
     int count = -1;                // K; -1 = all of Y's (required with "random")
     unsigned seed = 1;             // the transplant's own stream
     std::string assay = "frozen";  // "frozen", "frozen-newborn" or "live"
@@ -130,8 +134,14 @@ inline bool apply(World& world, const Options& o, const std::string& yText,
         error = "--assay must be frozen, frozen-newborn or live"; return false;
     }
     if (o.count < -1) { error = "--transplant-count must be >= 0 (or -1 for all)"; return false; }
-    const bool fromRandom = (o.predatorsFrom == "random");
-    if (fromRandom && o.count < 0) { error = "--predators-from random needs --transplant-count K"; return false; }
+    const bool fromScripted = (o.predatorsFrom == "scripted");
+    const bool fromRandom = (o.predatorsFrom == "random") || fromScripted;   // (no donor checkpoint)
+    if (fromRandom && o.count < 0) {
+        error = "--predators-from " + o.predatorsFrom + " needs --transplant-count K"; return false;
+    }
+    if (fromScripted && o.assay == "live") {
+        error = "scripted hunters are fixed (Stage A): --assay frozen or frozen-newborn"; return false;
+    }
     const bool economyMatters = (o.assay != "frozen-newborn");
 
     SimConfig& cfg = world.cfg;
@@ -211,10 +221,16 @@ inline bool apply(World& world, const Options& o, const std::string& yText,
     const char* xSource = xBrain ? "prey checkpoint" : nullptr;
     auto xOrCli = [&](const char* k) { return std::string(xSource ? xSource : (onCli(k) ? "command line" : "default")); };
     std::vector<std::pair<std::string, std::string>> sources;   // key -> source
-    setB("predatorBrain", cfg.predatorBrain, true);
-    sources.push_back({"predatorBrain", "transplant"});
+    setB("predatorBrain", cfg.predatorBrain, !fromScripted);
+    sources.push_back({"predatorBrain", fromScripted ? "scripted hunters" : "transplant"});
     setI("predatorCount", cfg.predatorCount, K);
-    if (!fromRandom) {
+    if (fromScripted) {
+        // Stage A hunters: immortal and fixed whatever the assay label (no brain, no economy)
+        setB("predatorEconomy", cfg.predatorEconomy, false);
+        setB("predatorFrozen", cfg.predatorFrozen, false);
+        sources.push_back({"predatorEconomy", "scripted hunters"});
+        sources.push_back({"predatorFrozen", "scripted hunters"});
+    } else if (!fromRandom) {
         setF("predatorMutation", cfg.predatorMutation, yc.predatorMutation);
         setB("predatorPrimer", cfg.predatorPrimer, yc.predatorPrimer);
         sources.push_back({"predatorMutation", "predator checkpoint"});
@@ -225,7 +241,9 @@ inline bool apply(World& world, const Options& o, const std::string& yText,
     }
     sources.push_back({"predatorTurnRate", xOrCli("predatorTurnRate")});
     sources.push_back({"predatorMinSpeed", xOrCli("predatorMinSpeed")});
-    if (o.assay == "frozen") {
+    if (fromScripted) {
+        // (set above)
+    } else if (o.assay == "frozen") {
         setB("predatorEconomy", cfg.predatorEconomy, true);
         setB("predatorFrozen", cfg.predatorFrozen, true);
     } else if (o.assay == "frozen-newborn") {
@@ -234,14 +252,17 @@ inline bool apply(World& world, const Options& o, const std::string& yText,
     } else {
         setB("predatorFrozen", cfg.predatorFrozen, false);
     }
-    sources.push_back({"predatorEconomy", o.assay == "live" ? "prey checkpoint" : "assay"});
-    sources.push_back({"predatorFrozen", "assay"});
+    if (!fromScripted) {
+        sources.push_back({"predatorEconomy", o.assay == "live" ? "prey checkpoint" : "assay"});
+        sources.push_back({"predatorFrozen", "assay"});
+    }
     if (o.assay != "live") {
         setI("predatorMinPopulation", cfg.predatorMinPopulation, 0);
         setI("predatorMaxPopulation", cfg.predatorMaxPopulation, 0);
         setI("minPopulation", cfg.minPopulation, 0);
     }
-    if (const char* why = predatorBrainConfigError(cfg)) { error = std::string("arena config: ") + why; return false; }
+    if (!fromScripted)
+        if (const char* why = predatorBrainConfigError(cfg)) { error = std::string("arena config: ") + why; return false; }
 
     // 3. the predators. Fresh ids above every id and lineage label in X and Y.
     unsigned long long firstId = xBrain ? world.nextPredatorId_ : 1ull;
@@ -254,6 +275,14 @@ inline bool apply(World& world, const Options& o, const std::string& yText,
     const float W = (float)world.width, H = (float)world.height;
     for (int i = 0; i < K; ++i) {
         Predator p;
+        if (fromScripted) {       // a Stage A hunter: World::init's predator, placed from the placement stream
+            p.pos = {placeRng.range(10.0f, W - 10.0f), placeRng.range(10.0f, H - 10.0f)};
+            const float a = placeRng.range(0.0f, 6.2832f);
+            p.vel = {evomath::cosf(a), evomath::sinf(a)};
+            p.energy = cfg.predatorNewbornEnergy;
+            added.push_back(std::move(p));
+            continue;
+        }
         if (fromRandom) {
             p.genome = predbrain::founderGenome(cfg, genomeRng);
         } else {
@@ -277,7 +306,7 @@ inline bool apply(World& world, const Options& o, const std::string& yText,
         p.speed = predbrain::topSpeed(p, cfg);
         added.push_back(std::move(p));
     }
-    if (!xBrain) world.predRng_.seed(seedRng.uint());
+    if (!xBrain && !fromScripted) world.predRng_.seed(seedRng.uint());
     world.predators = std::move(added);
     world.predLog_.clear();
     world.predTally_ = WorldCommon::PredatorTally{};
