@@ -64,10 +64,14 @@ is a documented synthetic stand-in ("fitted": false) for the tests and the bench
   the bins; NOT monotone in general, e.g. the placeholder's survival bins). The validation-stress capture
   floor (0.80 / 0.35 at 0.35) is blended alike. The generator's
   location a(mu; s) interpolates linearly between tables on the registered s grid (S_STEP = 0.005), each
-  grid cell's interpolation verified once at its midpoint (|E[K/N] - mu| <= LOC_S_TOL). The grid tables
-  depend on (s, N) only: they are built once per process, or once per code identity with the on-disk cache
-  (TABLE_CACHE: --table-cache / RQ_TABLE_CACHE, shared by shard processes; `calib.py tables` pre-builds
-  every cell a parameter set can reach). A cached entry is bitwise the built one (content-hashed).
+  grid cell's interpolation verified once at its midpoint s over the REGISTERED PROBE SET (the expected
+  fractions there of every 7th location of the cell's lower table's grid, within (1e-9, 1 - 1e-9)):
+  |E[K/N] - mu| <= LOC_S_TOL. The grid tables depend on (s, N) only: they are built once per process, or
+  once per code identity with the on-disk cache (TABLE_CACHE: --table-cache / RQ_TABLE_CACHE, shared by
+  shard processes; `calib.py tables` pre-builds every cell a parameter set can reach). The identity is the
+  grid constants and tools_sha256 (any change to the tools is a new identity). Each entry carries its kind,
+  identity, N and k (checked on read: an entry copied under another name is refused) and a content hash; a
+  cell's verification carries the content hashes of its two endpoint tables (checked on read).
 
 FEASIBILITY AND STRATA (the D2 ruling, 2026-11-08; Codex round 4). Three classes. UNREACHED ON THE
 REGISTERED SEARCH: the target is not reached by the registered deterministic search (AMP_GRID on [0, A_SUP],
@@ -153,7 +157,7 @@ registered 100 panels per mode x graph, failures counted as non-successes) with 
 by generating direction (assigned from panel parity before generation).
 BENCHMARK (H.12). `calib.py bench` runs the first 50 development panels of a hypothesis (the ten strata
 in turn) with every fit, period, window, material rule, epoch, direction and bootstrap used in the
-decision, and reports CPU seconds per panel against the 13.5 s target (smoke records: never accepted
+decision, and reports CPU seconds per panel against stats.cpu_targets() (D5: 35.1 s; smoke records: never accepted
 by crit / accept).
 
     python3 calib.py panels --hyp H-F --stage dev --graph g.jsonl.gz --params fitted.json --mode F3 \\
@@ -607,12 +611,11 @@ _GRID, _SCELL, _IDENT = {}, {}, []
 
 
 def tables_identity():
-    """The grid tables' identity: the registered grid constants and the source of the code computing them; a
-    cached entry is reused only under the same identity."""
+    """The grid tables' identity (Codex r9 P2-2): the registered grid constants and tools_sha256, the whole
+    implementation (every numerical helper included); a cached entry is reused only under the same identity."""
     if not _IDENT:
-        import inspect
-        src = "".join(inspect.getsource(f) for f in (logit, erfc, expected_fraction, _build_table, _cell_error))
-        _IDENT.append(hashlib.sha256(json.dumps([LOC_STEP, LOC_TOL, S_STEP, LOC_S_TOL, src]).encode()).hexdigest()[:20])
+        _IDENT.append(hashlib.sha256(json.dumps([LOC_STEP, LOC_TOL, S_STEP, LOC_S_TOL, tools_sha()]).encode())
+                      .hexdigest()[:20])
     return _IDENT[0]
 
 
@@ -631,7 +634,9 @@ def _disk(kind, k, N, arrays=None):
     silently rebuilt."""
     if not TABLE_CACHE:
         return None
-    path = os.path.join(TABLE_CACHE, f"{kind}-{tables_identity()}-N{int(N)}-k{int(k)}.npz")
+    ident = tables_identity()
+    path = os.path.join(TABLE_CACHE, f"{kind}-{ident}-N{int(N)}-k{int(k)}.npz")
+    me = {"kind": np.array(kind), "identity": np.array(ident), "N": np.array(int(N)), "k": np.array(int(k))}
     if arrays is None:
         if not os.path.isfile(path):
             return None
@@ -643,11 +648,16 @@ def _disk(kind, k, N, arrays=None):
         sha = str(d.pop("sha256", ""))
         if sha != _arrays_sha(d):
             raise CalibError(f"table cache {path}: content hash mismatch")
-        return d
+        if any(n not in d or d[n].shape != () or d[n].item() != v.item() for n, v in me.items()):
+            raise CalibError(f"table cache {path}: the entry is not ({kind}, {ident}, N {N}, k {k})")
+        return {n: v for n, v in d.items() if n not in me}
+    import secrets
+    import socket
     os.makedirs(TABLE_CACHE, exist_ok=True)
-    tmp = f"{path}.{os.getpid()}.tmp"
+    full = dict(arrays, **me)
+    tmp = f"{path}.{socket.gethostname()}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
     with open(tmp, "wb") as f:
-        np.savez(f, sha256=np.array(_arrays_sha(arrays)), **arrays)
+        np.savez(f, sha256=np.array(_arrays_sha(full)), **full)
     os.replace(tmp, path)
     return arrays
 
@@ -675,7 +685,8 @@ def _location_grid(mu, k, N):
 
 def _cell_error(k, N):
     """D4: the error of the linear interpolation in s between the grid tables k and k + 1, at the cell's
-    midpoint s, over the interior expected fractions there of every 7th location of table k's grid."""
+    midpoint s, over the REGISTERED PROBE SET: the expected fractions there of every 7th location of table k's
+    grid, within (1e-9, 1 - 1e-9)."""
     sm = (k + 0.5) * S_STEP
     mu = expected_fraction(grid_table(k, N)[0][::7], sm, N)
     mu = mu[(mu > 1e-9) & (mu < 1 - 1e-9)]
@@ -685,26 +696,40 @@ def _cell_error(k, N):
     return float(np.max(np.abs(expected_fraction(a, sm, N) - mu)))
 
 
+def _ends(k, N):
+    """The content hashes of the cell's two endpoint tables (a cached verification is bound to them)."""
+    return np.array([_arrays_sha({"a": grid_table(j, N)[0], "f": grid_table(j, N)[1]}) for j in (k, k + 1)])
+
+
 def _verify_s_cell(k, N):
-    """The grid cell [k, k + 1] S_STEP verified once (|E[K/N] - mu| <= LOC_S_TOL; memory, then the disk cache)."""
+    """The grid cell [k, k + 1] S_STEP verified once (|E[K/N] - mu| <= LOC_S_TOL; memory, then the disk cache,
+    whose entry must name the content of the endpoint tables in use)."""
     key = (int(k), int(N))
     if key not in _SCELL:
         d = _disk("cell", k, N)
+        ends = _ends(k, N)
+        if d is not None and (d.get("ends") is None or d["ends"].shape != ends.shape or
+                              not np.array_equal(d["ends"], ends)):
+            raise CalibError(f"table cache: the cell (N {N}, k {k}) was verified on other endpoint tables")
         err = float(d["err"]) if d is not None else _cell_error(k, N)
         if err > LOC_S_TOL:
             raise CalibError(f"the s-grid interpolation error {err:.2e} exceeds {LOC_S_TOL} "
                              f"(s {(k + 0.5) * S_STEP:.4f}, N {N})")
         if d is None:
-            _disk("cell", k, N, {"err": np.array(err)})
+            _disk("cell", k, N, {"err": np.array(err), "ends": ends})
         _SCELL[key] = err
     return _SCELL[key]
 
 
 def warm_tables(p, extras=(1.0, 1.5)):
     """Build (and, with TABLE_CACHE, store) every grid table and cell the parameter set can reach: each
-    channel's s(mu) over (0, 1), unstressed and under validation stress, at the registered noise extras.
-    -> {N: [k_lo, k_hi]} (the cells verified)."""
-    mu = sig(np.linspace(-16.0, 16.0, 4001))
+    channel's s(mu) over (0, 1), unstressed and under validation stress, at the registered noise extras; the
+    logit sample covers [-16, 16] AND every knot of the parameters' s_logit curves (their extremes are at
+    knots). -> {N: [k_lo, k_hi]} (the cells verified)."""
+    xs = [np.linspace(-16.0, 16.0, 4001)]
+    for cv in ((p.get("noise") or {}).get("s_logit") or {}).values():
+        xs.append(np.asarray(cv.get("x", []), float))
+    mu = sig(np.concatenate(xs))
     spans = {}
     for ch, N in (("C", int(p["capture_bound"])), ("S", TRIALS), ("F", TRIALS)):
         for stress in (False, True):
@@ -2086,7 +2111,7 @@ def _dist(xs):
     return {"n": len(xs), "mean": sum(xs) / len(xs), "median": xs[len(xs) // 2], "min": xs[0], "max": xs[-1]}
 
 
-TOOLS = ("calib.py", "recurrence.py", "transition.py", "backbone.py", "stats.py")
+TOOLS = ("calib.py", "recurrence.py", "transition.py", "backbone.py", "stats.py", "noisescale.py")
 GATES_SCHEMA = "finfolk.redqueen.annexH.gates/1"
 IDENT = ("graph_sha256", "graph_source", "params_sha256", "params_fitted", "tools_sha256", "solver_sha256", "draws",
          "production")

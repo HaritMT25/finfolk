@@ -238,7 +238,38 @@ class TestGenerator(unittest.TestCase):
                 self.assertEqual(cb.location(mus, ss, 600).tobytes(), a1.tobytes())   # (no cache: the same bits)
                 cb.TABLE_CACHE = d
                 cb._GRID.clear()
-                bad = os.path.join(d, next(f for f in files if f.startswith("loc-")))
+                cb._SCELL.clear()
+                locs = sorted(f for f in files if f.startswith("loc-"))
+                cells = sorted(f for f in files if f.startswith("cell-"))
+                saved_files = {}
+                for f_ in locs + cells:
+                    with open(os.path.join(d, f_), "rb") as fh:
+                        saved_files[f_] = fh.read()
+                # (r9 P3: an entry copied under another name is refused)
+                with open(os.path.join(d, locs[1]), "wb") as f:
+                    f.write(saved_files[locs[0]])
+                with self.assertRaises(cb.CalibError):
+                    cb.location(mus, ss, 600)
+                with open(os.path.join(d, locs[1]), "wb") as f:
+                    f.write(saved_files[locs[1]])
+                # (r9 P3: a cell verification names its endpoint tables' content)
+                cb._GRID.clear()
+                cb._SCELL.clear()
+                with np.load(os.path.join(d, cells[0])) as z:
+                    arrs = {n: z[n] for n in z.files}
+                arrs["ends"] = np.array(["0" * 64, "0" * 64])
+                del arrs["sha256"]
+                with open(os.path.join(d, cells[0]), "wb") as f:
+                    np.savez(f, sha256=np.array(cb._arrays_sha(arrs)), **arrs)
+                with self.assertRaises(cb.CalibError):
+                    cb.location(mus, ss, 600)
+                with open(os.path.join(d, cells[0]), "wb") as f:
+                    f.write(saved_files[cells[0]])
+                cb._GRID.clear()
+                cb._SCELL.clear()
+                self.assertEqual(cb.location(mus, ss, 600).tobytes(), a1.tobytes())
+                cb._GRID.clear()
+                bad = os.path.join(d, locs[0])
                 with np.load(bad) as z:
                     arrs = {n: z[n] for n in z.files}
                 arrs["f"] = arrs["f"] + 1e-15
@@ -257,6 +288,15 @@ class TestGenerator(unittest.TestCase):
                 cb.noise_scale = ns
             self.assertEqual(span, {int(cb.placeholder_params()["capture_bound"]): [40, 41], cb.TRIALS: [40, 41]})
             self.assertTrue(all((k, N) in cb._SCELL for N in span for k in (40, 41)))
+            # (r9 P3: a curve whose extreme lies at a knot beyond logit +-16 is covered)
+            pk = cb.placeholder_params()
+            pk["noise"]["s_logit"] = {ch: {"x": [-20.0, 0.0], "s": [0.3, 0.2]} for ch in "CSF"}
+            cb.noise_scale = lambda p, ch, mu, stress=False, extra=1.0: np.where(mu < cb.sig(-18.0), 0.2 + 0.006, 0.2)
+            try:
+                span2 = cb.warm_tables(pk, extras=(1.0,))
+            finally:
+                cb.noise_scale = ns
+            self.assertEqual(span2[cb.TRIALS], [40, 41])
         finally:
             cb.TABLE_CACHE = saved[0]
             cb._GRID.clear()
