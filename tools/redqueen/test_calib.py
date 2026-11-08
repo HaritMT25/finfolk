@@ -453,15 +453,61 @@ class TestStrata(unittest.TestCase):
                    "tools_sha256": "t", "draws": 9999, "gates_sha256": None, "production": True}
 
     def test_feasible_panel_goes_to_B_and_is_verified(self):
+        """F3 slot 1: the panel multiplier lambda puts the noise-free FUNCTIONAL E_C on d_C^2 (to LAMBDA_TOL);
+        the panel goes to B; the final-metric residual is recorded with its label."""
         cb = self.cb
-        r = cb.run_panel(self.graph, self.params, "H-F", "dev", "actual", "F3", 0)
+        r = cb.run_panel(self.graph, self.params, "H-F", "dev", "actual", "F3", 1)
         self.assertFalse(r.get("error"), r.get("error"))
         self.assertEqual((r["status"], r["role"], r["member"]), ("feasible", "B", True))
+        bs = r["boundary_solve"]
+        self.assertEqual(bs["outcome"], "feasible")
+        self.assertLessEqual(abs(bs["functional"] - 0.01), cb.LAMBDA_TOL * 0.01)
+        self.assertGreater(bs["lambda"], 1.0)                    # (the per-world 0.10 construction was interior)
         nb, fb = r["membership"]["boundary"], r["boundary_final"]
         self.assertEqual((nb["quantity"], fb["quantity"], fb["metric"]), ("E_C", "E_C", "final"))
-        self.assertTrue(math.isfinite(nb["residual"]) and math.isfinite(fb["residual"]))
+        self.assertTrue(nb["ok"] and abs(nb["residual"]) <= cb.LAMBDA_TOL)
+        self.assertTrue(math.isfinite(fb["residual"]))
         self.assertEqual(fb["ok"], abs(fb["residual"]) <= cb.BOUNDARY_TOL)
         self.assertTrue(math.isfinite(r["score"]))
+
+    def test_boundary_jump_is_construction_infeasible(self):
+        """F3 slot 0 on four worlds: E_C(lambda) jumps over d_C^2 (a selection switches): CONSTRUCTION-
+        INFEASIBLE, kept in I at the largest lambda below the jump (functional on the null side), counted
+        separately from bounded-mean infeasibility and from numerical failures."""
+        cb = self.cb
+        r = cb.run_panel(self.graph, self.params, "H-F", "dev", "actual", "F3", 0)
+        self.assertEqual((r["status"], r["role"], r["member"]), ("construction-infeasible", "I", True))
+        j = [c for c in r["clips"] if c.get("kind") == "jump"]
+        self.assertEqual(len(j), 1)
+        self.assertLess(j[0]["nearest"], 0.01)
+        self.assertEqual(r["boundary_solve"]["lambda"], j[0]["lambda"])
+        self.assertNotIn("boundary_final", r)                    # (an I panel is not a boundary null)
+        self.assertEqual(cb.q_hat([r, dict(r, panel=1, status="feasible")], 2)["infeasible"], 1)
+        rep_ = cb.report([r])["groups"]["H-F|dev|F3|actual"]
+        self.assertEqual(rep_["boundary_solve"]["outcomes"]["construction-infeasible"], 1)
+
+    def test_boundary_outside_the_range_and_failures(self):
+        """E(lambda) above the boundary at EVERY lambda including 0 (patched functionals): infeasible
+        (below-inf) and, with E_Q above its material threshold, NOT a material null: discarded. A nonfinite
+        functional is a numerical failure."""
+        cb = self.cb
+        orig = cb.Panel.functionals
+        cb.Panel.functionals = lambda self_, final=False: {"E_C": 0.02, "E_Q": 0.01, "R_C": 0.1414, "R_Q": 0.1,
+                                                           "M_F": 1.4, "available": True}
+        try:
+            r = cb.run_panel(self.graph, self.params, "H-F", "dev", "actual", "F3", 1)
+        finally:
+            cb.Panel.functionals = orig
+        self.assertEqual((r["status"], r["member"], r["role"]), ("infeasible", False, "discarded"))
+        self.assertEqual(r["boundary_solve"]["lambda"], 0.0)
+        self.assertEqual([c["kind"] for c in r["clips"] if c["world"] == "panel"], ["below-inf"])
+        cb.Panel.functionals = lambda self_, final=False: {"E_C": math.nan, "E_Q": 0.0}
+        try:
+            r = cb.run_panel(self.graph, self.params, "H-F", "dev", "actual", "F3", 1)
+        finally:
+            cb.Panel.functionals = orig
+        self.assertEqual(r["role"], "failed")
+        self.assertIn("numerical failure", r["error"])
 
     def with_target(self, mode, target):
         cb = self.cb
@@ -480,17 +526,12 @@ class TestStrata(unittest.TestCase):
 
     def test_infeasible_panel_goes_to_I_clipped_and_null_checked(self):
         """A capture RMS of 50 is above the native RMS's supremum (to the limit): clipped to the attainable
-        supremum. F1 (a detection null by construction) keeps it in I; in F3 the clipped capture with the
-        maximal survival recurrence is NOT a material null: discarded (never in either stratum)."""
+        supremum; F1 (a detection null by construction) keeps it in I and analyses it."""
         r = self.with_target("F1", 50.0)
         self.assertEqual((r["status"], r["role"], r["member"]), ("infeasible", "I", True))
         self.assertTrue(all(c["kind"] == "above-sup" and c["nearest"] < 50.0 and c["limit"] < 50.0 for c in r["clips"]))
         self.assertEqual(len({c["world"] for c in r["clips"]}), len(self.graph))
         self.assertTrue(math.isfinite(r["score"]))
-        r3 = self.with_target("F3", 50.0)
-        self.assertEqual((r3["status"], r3["member"], r3["role"]), ("infeasible", False, "discarded"))
-        self.assertGreater(r3["membership"]["exceedance"], self.cb.BOUNDARY_TOL)
-        self.assertNotIn("score", r3)
 
     def test_ht_membership_spans_all_candidates(self):
         """Clipping one candidate's component can strengthen another: a panel is a null member only if EVERY

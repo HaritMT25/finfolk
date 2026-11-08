@@ -80,6 +80,16 @@ BOUNDARY (the D1 caveat). A B panel with a declared boundary (F3: R_C = d_C; F4:
 0-13: margin k of its candidate = 0) is labelled an Annex H boundary null only when the boundary
 quantity, recomputed on the noise-free means under the FINAL analysis metric (built from the observed
 means), lies within BOUNDARY_TOL x its scale of the boundary (recorded per panel and reported).
+H-F F3 / F4 BOUNDARIES ARE FUNCTIONAL (the coordinator's decision (a), 2026-11-08): E_C = d_C^2 (F3) or
+E_Q = d_Q^2 (F4) of the noise-free panel (the triage metric) is met by ONE panel multiplier lambda on the
+declared component's per-world targets (lambda x 0.10 / 0.04; the other readout's "max" unchanged):
+lambda in [0, LAMBDA_MAX = 10], from lambda = 1 by the scaling step lambda sqrt(b / E) until bracketed,
+then Illinois, |E - b| <= LAMBDA_TOL x b, at most LAMBDA_EVALS evaluations (else a numerical failure). A
+functional that JUMPS over b (a selection switching: the bracket narrows below LAMBDA_JUMP without
+convergence) is CONSTRUCTION-INFEASIBLE: kept in I at the largest lambda below the jump (its functional
+on the null side) and counted separately; it is infeasible within the registered construction, not shown
+unattainable. b outside the functional's range on [0, LAMBDA_MAX] is infeasible (above-sup / below-inf).
+T4's boundaries stay construction-level (labelled) pending the E^U support decision.
 
 MODES (H.10).MODES (H.10). H-F (full history): F0 none; F1 capture only (RMS 0.10 / 0.20 by panel parity); F2
 survival only (0.04 / 0.08); F3 capture 0.10 + survival max; F4 survival 0.04 + capture max;
@@ -173,6 +183,11 @@ LIM_GRID = tuple(A_SUP * 2.0 ** k for k in range(1, 9)) + (A_LIM,)
 BOUNDARY_TOL = 0.05      # boundary residuals and null membership, relative to the margin's scale
 D_C, D_Q = recurrence.D_C, recurrence.D_Q
 ROUNDS = 3               # the proposal cap K = ROUNDS x n per stage x mode x graph (the D2 ruling)
+LAMBDA_MAX = 10.0        # H-F F3 / F4: the panel multiplier's bracket [0, LAMBDA_MAX] on the declared per-world targets
+LAMBDA_TOL = 1e-3        # |functional - boundary| <= LAMBDA_TOL x boundary
+LAMBDA_JUMP = 1e-3       # a bracket narrower than this (relative) without convergence: a jump (construction-infeasible)
+LAMBDA_EVALS = 40        # evaluations before the iteration is a numerical failure
+INFEASIBLE = ("infeasible", "construction-infeasible")
 N_MIN = {"dev": 99, "val": 149}
 NTHETA = 98
 F_MODES = ("F0", "F1", "F2", "F3", "F4")
@@ -921,14 +936,141 @@ class Panel:
             lat = self.latent(wg, th, pl, u, amp, dirC, dirQ)
             nat = self.native(wg, lat)
             w = {"id": wg.id, "plan": pl, "amp": {sc: list(v) for sc, v in amp.items()}, "graph": wg, "k": k,
+                 "_ctx": (th, u, dirC, dirQ),
                  "mu": {ch: sig(lat[ch]) for ch in lat},
                  "y_true": {"within": {"C": nat["C"], "Q": nat["Q"]}, "ref": {"C": nat["RC"], "Q": nat["RQ"]}}}
             if pl["dir"] is not None:
                 w["betas_true"] = {e: (ver["dir"][f"{e}/beta_P"], ver["dir"][f"{e}/beta_Q"]) for e in transition.EPOCHS}
             self.worlds.append(w)
-        self.status = "infeasible" if self.unattainable else "feasible"
+        decl = declared_boundary(self.hyp, self.mode, self.panel)
+        self.lam = None
+        if decl is not None and decl["kind"] == "hf" and self.stage != "alt":
+            self.lam = self.solve_boundary(decl)
+            self.status = self.lam["outcome"]
+        else:
+            self.status = "infeasible" if self.unattainable else "feasible"
         self.membership = self.member()
         return self
+
+    def _world_at(self, w, h, target):
+        """One world's declared readout h re-solved to `target` (the other readout's amplitude kept) and its
+        noise-free means rebuilt. -> the world's clips."""
+        th, u, dirC, dirQ = w["_ctx"]
+        wg, pl = w["graph"], w["plan"]
+        amp = {sc: tuple(v) for sc, v in w["amp"].items()}
+        saved, self.unattainable = self.unattainable, []
+        try:
+            a = self.solve_amp(wg, th, pl, u, amp, "full", h, target, dirC, dirQ)
+            clips = self.unattainable
+        finally:
+            self.unattainable = saved
+        cur = list(amp.get("full", (0.0, 0.0)))
+        cur[h] = a
+        amp["full"] = tuple(cur)
+        lat = self.latent(wg, th, pl, u, amp, dirC, dirQ)
+        nat = self.native(wg, lat)
+        w.update(amp={sc: list(v) for sc, v in amp.items()}, mu={ch: sig(lat[ch]) for ch in lat},
+                 y_true={"within": {"C": nat["C"], "Q": nat["Q"]}, "ref": {"C": nat["RC"], "Q": nat["RQ"]}})
+        w.pop("cov_nf", None)
+        return clips
+
+    def solve_boundary(self, decl):
+        """H-F F3 / F4: the panel multiplier lambda on the declared component's per-world RMS targets with the
+        noise-free functional (E_C or E_Q, the triage metric) equal to the boundary (see the docstring's
+        H-F F3 / F4 BOUNDARIES). -> {"outcome": feasible / construction-infeasible / infeasible, "lambda",
+        "functional", "boundary", "evals", "path"}; the panel is left at the chosen lambda (its per-world
+        clips there recorded; verify re-run)."""
+        h = 0 if decl["name"] == "E_C" else 1
+        base = self.worlds[0]["plan"]["rec"]["full"][h]
+        b, tol = decl["boundary"], LAMBDA_TOL * decl["boundary"]
+        states, path = {}, []
+
+        def E(lam):
+            if lam in states:
+                return states[lam]["E"]
+            if len(path) >= LAMBDA_EVALS:
+                raise CalibError(f"the boundary multiplier did not converge in {LAMBDA_EVALS} evaluations (a "
+                                 f"numerical failure): {path[-4:]}")
+            clips = []
+            for w in self.worlds:
+                clips += self._world_at(w, h, lam * base)
+            v = self.functionals()[decl["name"]]
+            if not math.isfinite(v):
+                raise CalibError("a nonfinite boundary functional (a numerical failure)")
+            states[lam] = {"E": v, "clips": clips, "worlds": [{k: w[k] for k in ("amp", "mu", "y_true")}
+                                                              for w in self.worlds]}
+            path.append((lam, v))
+            return v
+
+        def finish(lam, outcome, kind=None):
+            st = states[lam]
+            for w, x in zip(self.worlds, st["worlds"]):
+                w.update(x)
+                w.pop("cov_nf", None)
+                w["plan"]["rec"]["full"] = tuple(lam * base if i == h else t for i, t in enumerate(w["plan"]["rec"]["full"]))
+            self.unattainable = list(st["clips"])
+            if kind is not None:
+                self.unattainable.append({"world": "panel", "scope": "full", "readout": decl["name"], "target": b,
+                                          "kind": kind, "nearest": st["E"], "lambda": lam})
+            self.verified = []
+            for w in self.worlds:
+                th, u, dirC, dirQ = w["_ctx"]
+                self.achieved.pop((w["id"], "full", h), None)
+                self.achieved[(w["id"], "full", h)] = self.rms_of(w["graph"], th, w["plan"], u,
+                                                                  {sc: tuple(v) for sc, v in w["amp"].items()},
+                                                                  "full", h, dirC, dirQ)
+                ver = self.verify(w["graph"], th, w["plan"], u, {sc: tuple(v) for sc, v in w["amp"].items()}, dirC, dirQ)
+                if not ver["ok"]:
+                    raise CalibError(f"{w['id']}: the per-world targets at lambda {lam:.6g} do not verify: "
+                                     f"{ver['violations'][:2]} (a numerical failure)")
+                self.verified.append(dict(ver, world=w["id"]))
+            return {"outcome": outcome, "lambda": lam, "functional": st["E"], "boundary": b, "evals": len(path),
+                    "residual": (st["E"] - b) / b, "path": [list(x) for x in path]}
+        lo = hi = None                                   # (lo: E < b, hi: E > b)
+        lam = 1.0
+        while True:
+            v = E(lam)
+            if abs(v - b) <= tol:
+                return finish(lam, "feasible")
+            if v < b:
+                lo = lam if lo is None or lam > lo else lo
+            else:
+                hi = lam if hi is None or lam < hi else hi
+            if lo is not None and hi is not None:
+                break
+            if v < b:
+                if lam >= LAMBDA_MAX:                    # (E(LAMBDA_MAX) < b: the bracket's top cannot reach it)
+                    return finish(lam, "infeasible", "above-sup")
+                lam = min(LAMBDA_MAX, lam * 2 if v <= 0 else lam * math.sqrt(b / v) * 1.02)
+            else:
+                if lam <= 0.0:                           # (E(0) > b: no multiplier reaches it)
+                    return finish(lam, "infeasible", "below-inf")
+                nl = lam * math.sqrt(b / v) * 0.98
+                lam = 0.0 if nl < 1e-3 else nl
+            if lam in states:                            # (the scaling step repeats itself: bracket by halving)
+                lam = (lam + (lo if lo is not None else 0.0)) / 2
+        # Illinois on E(lambda) - b between lo (E < b) and hi (E > b), in either order
+        glo, ghi = E(lo) - b, E(hi) - b
+        side = 0
+        while True:
+            if abs(hi - lo) <= LAMBDA_JUMP * max(abs(lo), abs(hi), 1e-9):
+                return finish(lo, "construction-infeasible", "jump")        # (lo: the null side of the jump)
+            c = (lo * ghi - hi * glo) / (ghi - glo)
+            if not min(lo, hi) < c < max(lo, hi):
+                c = (lo + hi) / 2
+            gc = E(c) - b
+            if abs(gc) <= tol:
+                return finish(c, "feasible")
+            if gc > 0:
+                hi, ghi = c, gc
+                if side == -1:
+                    glo /= 2
+                side = -1
+            else:
+                lo, glo = c, gc
+                if side == 1:
+                    ghi /= 2
+                side = 1
 
     def observe_all(self):
         """The noisy observation of every triaged world (the shared reference components first)."""
@@ -1471,6 +1613,8 @@ def run_panel(graph, params, hyp, stage, stratum, mode, panel, gates_c=None, dra
         g = sorted(graph, key=lambda w: w.id)
         pn = Panel(stratum_worlds(g, stratum), params, hyp, stage, stratum, mode, panel, retry=retry).triage()
         mx = [m["value"] for m in pn.maxima]
+        if pn.lam is not None:
+            rec["boundary_solve"] = pn.lam
         rec.update(status=pn.status, member=pn.membership["member"], membership=pn.membership, worlds=len(pn.g),
                    clips=pn.unattainable, joint_rounds=max((v.get("rounds", 1) for v in pn.verified), default=0),
                    maxima={"n": len(mx), "min": min(mx) if mx else None, "max": max(mx) if mx else None,
@@ -1480,7 +1624,7 @@ def run_panel(graph, params, hyp, stage, stratum, mode, panel, gates_c=None, dra
         elif not pn.membership["member"]:
             rec["role"] = "discarded"
         else:
-            rec["role"] = "B" if pn.status == "feasible" else "I"
+            rec["role"] = "B" if pn.status == "feasible" else "I"          # (both infeasible kinds: I)
             if keep is not None and not keep(rec):
                 rec.update(role="discarded", surplus=True)
         t1 = time.process_time()
@@ -1579,8 +1723,8 @@ def q_hat(rs, n):
     for x in rs:
         by_r.setdefault(int(x.get("retry", 0)), []).append(x)
     full = [x for xs in by_r.values() if len({int(y["panel"]) for y in xs}) == n for x in xs]
-    cl = [x for x in full if x.get("status") in ("feasible", "infeasible")]
-    k = sum(1 for x in cl if x["status"] == "infeasible")
+    cl = [x for x in full if x.get("status") in ("feasible",) + INFEASIBLE]
+    k = sum(1 for x in cl if x["status"] in INFEASIBLE)
     return {"infeasible": k, "proposals": len(cl), "q_hat": k / len(cl) if cl else 0.0,
             "q_U": stats.clopper_pearson_upper(k, len(cl)) if cl else 1.0}
 
@@ -1599,8 +1743,8 @@ def round_plan(rs, n, stage, r):
 
 def proposal_counts(xs):
     c = {"proposals": len(xs), "worlds": sum(int(x.get("worlds", 0)) for x in xs),
-         "world_clips": sum(len({c_["world"] for c_ in x.get("clips", [])}) for x in xs)}
-    for k in ("feasible", "infeasible", "failed"):
+         "world_clips": sum(len({c_["world"] for c_ in x.get("clips", []) if c_["world"] != "panel"}) for x in xs)}
+    for k in ("feasible",) + INFEASIBLE + ("failed",):
         c[k] = sum(1 for x in xs if x.get("status") == k)
     c["non_null"] = sum(1 for x in xs if x.get("member") is False)
     for k in ("B", "I", "discarded"):
@@ -1660,7 +1804,7 @@ def strata(records, hyp, stage, production):
                 B[j] = x
             elif x.get("role") == "B":
                 probs.append(f"{where}: slot {j} has a second B panel (retry {x.get('retry', 0)})")
-        if any(x.get("status") == "infeasible" and x.get("member") and x.get("role") != "I" for x in xs):
+        if any(x.get("status") in INFEASIBLE and x.get("member") and x.get("role") != "I" for x in xs):
             probs.append(f"{where}: an infeasible member was not kept in I")
         I = sorted((x for x in xs if x.get("role") == "I"), key=lambda x: (int(x.get("retry", 0)), int(x["panel"])))
         out[(m, s)] = {"B": [B[j] for j in sorted(B)], "I": I[:n], "capped": [j for j in range(n) if j not in B],
@@ -1952,16 +2096,20 @@ def report(records):
            "groups": {}}
     for key, rs in sorted(groups.items()):
         clips = [c for r in rs for c in r.get("clips", [])]
-        rms = [abs(c["target"] - c["nearest"]) / abs(c["target"]) for c in clips if c["readout"] in ("C", "Q")]
+        rms = [abs(c["target"] - c["nearest"]) / abs(c["target"]) for c in clips if c["readout"] in ("C", "Q", "E_C", "E_Q")]
         slo = [abs(c["target"] - c["nearest"]) for c in clips if c["readout"].startswith("beta")]
         nb = [r["membership"]["boundary"] for r in rs if (r.get("membership") or {}).get("boundary")]
         fb = [r["boundary_final"] for r in rs if r.get("boundary_final")]
         mem = [r for r in rs if r.get("member") is not None]
         g = {"counts": proposal_counts(rs),
              "clips": {"proposals_clipped": sum(1 for r in rs if r.get("clips")), "world_readouts": len(clips),
-                       "kinds": {k: sum(1 for c in clips if c.get("kind") == k) for k in ("above-sup", "below-inf")},
+                       "kinds": {k: sum(1 for c in clips if c.get("kind") == k) for k in ("above-sup", "below-inf", "jump")},
                        "rms_shortfall_relative": _dist(rms), "slope_shortfall": _dist(slo)},
              "maxima_at_edge": sum(int((r.get("maxima") or {}).get("at_edge", 0)) for r in rs),
+             "boundary_solve": {"outcomes": {o: sum(1 for r in rs if (r.get("boundary_solve") or {}).get("outcome") == o)
+                                             for o in ("feasible",) + INFEASIBLE},
+                                "lambda": _dist([r["boundary_solve"]["lambda"] for r in rs if r.get("boundary_solve")]),
+                                "evals": _dist([r["boundary_solve"]["evals"] for r in rs if r.get("boundary_solve")])},
              "boundary_noise_free": {"n": len(nb), "ok": sum(1 for b in nb if b["ok"]),
                                      "max_abs_residual": max((abs(b["residual"]) for b in nb), default=None)},
              "boundary_final": {"n": len(fb), "ok": sum(1 for b in fb if b.get("ok")),
