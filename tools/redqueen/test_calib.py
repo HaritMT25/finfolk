@@ -609,6 +609,7 @@ class TestStrata(unittest.TestCase):
         """F4 slot 0: the panel multiplier lambda puts the noise-free FUNCTIONAL E_Q in the one-sided window
         [d_Q^2 (1 - LAMBDA_TOL), d_Q^2]; the final-metric check passes too (ok REQUIRED); the panel is B."""
         cb = self.cb
+        self.assertFalse(cb.LAMBDA_FROZEN_METRIC)                            # (the registered value: OFF)
         r = self.run_("F4", 0)
         self.assertFalse(r.get("error"), r.get("error"))
         self.assertEqual((r["status"], r["eligible"], r["role"], r["member"]), ("feasible", "B", "B", True))
@@ -691,16 +692,17 @@ class TestStrata(unittest.TestCase):
                     self.assertTrue(-cb.BOUNDARY_TOL <= bs["residual"] <= 0.0)
             self.assertLessEqual(b["boundary_solve"]["evals"], a["boundary_solve"]["evals"] + 1)
 
-    def test_final_metric_failure_is_discarded(self):
-        """#68 round 4 P2-1: F3 slot 1 meets its boundary on the noise-free metric but not under the FINAL
-        metric (residual about -10%): it never enters B (discarded "final-boundary", counted)."""
+    def test_final_metric_is_reported_never_gating(self):
+        """The coordinator's ruling (2026-11-08): F3 slot 1 meets its boundary under the triage metric (the
+        definition) but not under the FINAL metric (residual about -10%): it is a B panel, analysed, with the
+        final-metric value REPORTED as the estimator distortion (never a discard)."""
         r = self.run_("F3", 1)
-        self.assertEqual((r["eligible"], r["role"], r["discard"]), ("B", "discarded", "final-boundary"))
+        self.assertEqual((r["eligible"], r["role"], r.get("discard")), ("B", "B", None))
         self.assertTrue(r["membership"]["boundary"]["ok"])
         self.assertFalse(r["boundary_final"]["ok"])
         self.assertLess(r["boundary_final"]["residual"], -self.cb.BOUNDARY_TOL)
-        self.assertNotIn("score", r)
-        self.assertEqual(self.cb.audit_classes([r])["classes"]["final_boundary"], 1)
+        self.assertTrue(math.isfinite(r["score"]))
+        self.assertEqual(self.cb.audit_classes([r])["classes"]["final_boundary"], 0)
 
     def test_boundary_jump_is_unreached(self):
         """F3 slot 0 on four worlds: E_C(lambda) jumps over d_C^2 (a selection switches) with the null-side

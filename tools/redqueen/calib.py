@@ -79,13 +79,16 @@ registered generator's proposals". Alternatives are unchanged (an unreached alte
 q-hat from the synthetic placeholder parameters is illustrative only; the binding q-hat is the production
 run's. T4 subtypes / directions are REPORTED per cell; critical values and p-tables are mode-level (H.10:
 the claim is scoped to the registered subtype mixture).
-BOUNDARY (the D1 caveat, ENFORCED: #68 round 4 P2-1). A declared boundary (F3: E_C = d_C^2; F4: E_Q =
-d_Q^2; T4 components 0-13: margin k of its candidate = 0) must hold ONE-SIDED from the null side, in the
-window [b (1 - BOUNDARY_TOL), b] (margins: [-BOUNDARY_TOL, TAU_NUM] x scale), BOTH on the noise-free means
-under the triage metric (else the proposal is unreached by the construction) AND under the FINAL analysis
-metric built from the observed means (else the B-eligible panel is discarded as a final-boundary failure,
-counted; this conditions on the noise draw through the metric and is reported as such). A numerical
-exception in either check is a failed proposal.
+BOUNDARY (#68 round 4 P2-1; the coordinator's ruling of 2026-11-08, Codex r7). A declared boundary (F3:
+E_C = d_C^2; F4: E_Q = d_Q^2; T4 components 0-13: margin k of its candidate = 0) is DEFINED under the
+TRIAGE metric: the registered analysis functional at the panel's TRUE (noise-free) means, the plug-in
+covariance evaluated at those means (the analysis metric's population limit; null membership is a
+population property). It must hold ONE-SIDED from the null side, in the window [b (1 - BOUNDARY_TOL), b]
+(margins: [-BOUNDARY_TOL, TAU_NUM] x scale), else the proposal is unreached by the construction. The
+same quantity under the FINAL analysis metric (the plug-in covariance at the OBSERVED means) is REPORTED
+per panel as the estimator distortion at the boundary, and never gates (gating would condition B on the
+noise draw; solving under it would couple the truth to the noise). A numerical exception in the triage
+check is a failed proposal; one in the reported final-metric value is recorded with the panel.
 H-F F3 / F4 BOUNDARIES ARE FUNCTIONAL (the coordinator's decision (a), 2026-11-08): E_C = d_C^2 (F3) or
 E_Q = d_Q^2 (F4) of the noise-free panel (the triage metric) is met by ONE panel multiplier lambda on the
 declared component's per-world targets (lambda x 0.10 / 0.04; the other readout's "max" unchanged):
@@ -196,7 +199,8 @@ LAMBDA_GRID = tuple(0.5 * k for k in range(21))
 LAMBDA_TOL = 1e-3        # the null-side acceptance of the multiplier: E in [b (1 - LAMBDA_TOL), b]
 LAMBDA_JUMP = 1e-3       # a bracket narrower than this (relative) without an accepted point: a jump
 LAMBDA_EVALS = 60        # evaluations before the multiplier search is a numerical failure
-LAMBDA_FROZEN_METRIC = True    # the frozen-metric lambda proposals (Codex round 5 C3: accepted with conditions)
+LAMBDA_FROZEN_METRIC = False   # the frozen-metric lambda proposals (Codex round 5 C3: accepted with conditions;
+                                 # OFF as registered, 2026-11-08: on g4 its bracket handoff took more true evaluations)
 FROZEN_ROUNDS = 4        # re-anchorings of the frozen metric before the true-metric search takes over
 BOUNDARY_TOL = 0.05      # the ONE-SIDED boundary window, energy scale [b (1 - 0.05), b] (RMS: [0.9747, 1] x d)
 TAU_NUM = 2 * DIR_TOL / min(stats.DELTA_P, stats.DELTA_Q)    # = 1e-3: null membership's NUMERICAL allowance
@@ -1349,13 +1353,18 @@ class Panel:
                 "bound": DIR_TOL / stats.DELTA_P, "tau_num": TAU_NUM}
 
     def boundary_final(self):
-        """The ENFORCED D1 boundary check after observe (#68 round 4 P2-1): the declared boundary quantity on
-        the noise-free means under the FINAL analysis metric (built from the observed means), in its one-sided
-        window. None without a declared boundary. A numerical exception propagates: a failed proposal."""
+        """The REPORTED estimator distortion at the boundary (the coordinator's ruling, 2026-11-08): the declared
+        boundary quantity on the noise-free means under the FINAL analysis metric (built from the observed
+        means), with its residual and window flag. Never gates; a numerical exception is recorded here, not a
+        failed proposal (the analysis itself decides that). None without a declared boundary."""
         decl = declared_boundary(self.hyp, self.mode, self.panel)
         if decl is None or self.stage == "alt":
             return None
-        return dict(boundary_residual(decl, self.functionals(final=True)), metric="final")
+        try:
+            return dict(boundary_residual(decl, self.functionals(final=True)), metric="final")
+        except (CalibError, recurrence.RecurrenceError, transition.TransitionError, np.linalg.LinAlgError,
+                FloatingPointError, ValueError) as e:
+            return {"metric": "final", "ok": False, "error": f"{type(e).__name__}: {e}"}
 
     def solve_amps(self, wg, th, pl, u, dirC, dirQ):
         amp = {}
@@ -1796,6 +1805,13 @@ def proposal_of(hyp, mode, n, cell, k):
 
 
 # ================================================================== provenance
+def _dist(xs):
+    xs = sorted(xs)
+    if not xs:
+        return {"n": 0}
+    return {"n": len(xs), "mean": sum(xs) / len(xs), "median": xs[len(xs) // 2], "min": xs[0], "max": xs[-1]}
+
+
 TOOLS = ("calib.py", "recurrence.py", "transition.py", "backbone.py", "stats.py")
 GATES_SCHEMA = "finfolk.redqueen.annexH.gates/1"
 IDENT = ("graph_sha256", "graph_source", "params_sha256", "params_fitted", "tools_sha256", "solver_sha256", "draws",
@@ -1900,7 +1916,7 @@ def run_panel(graph, params, hyp, stage, stratum, mode, panel, gates_c=None, dra
     the clips (requested, attained, shortfall), requested vs achieved for every constraint, null
     membership and the noise-free boundary residual. eligible: "B" (a feasible member), "I" (an unreached
     member) or None. role: "B" / "I" (kept: simulated with noise and analysed; a B panel with a declared
-    boundary must ALSO pass the final-metric check, else discarded "final-boundary"), "discarded" (a non-
+    boundary has its final-metric value REPORTED, never gating), "discarded" (a non-
     member, or `keep(record)` false: a surplus), "alt" (an unreached alternative is a non-success), "failed"
     (a numerical failure ANYWHERE: never unreached, never a non-rejection)."""
     t0 = time.process_time()
@@ -1940,14 +1956,9 @@ def run_panel(graph, params, hyp, stage, stratum, mode, panel, gates_c=None, dra
             return rec
         pn.observe_all()
         if rec["role"] == "B":
-            bf = pn.boundary_final()                      # (a numerical exception: a failed proposal)
+            bf = pn.boundary_final()                      # (REPORTED: the estimator distortion; never gates)
             if bf is not None:
                 rec["boundary_final"] = bf
-                if not bf["ok"]:
-                    rec.update(role="discarded", discard="final-boundary", available=False)
-                    rec["cpu"]["simulate"] = time.process_time() - t1
-                    rec["cpu_total"] = time.process_time() - t0
-                    return rec
         t2 = time.process_time()
         if hyp == "H-F":
             a = pn.analyze_hf()
@@ -2314,8 +2325,10 @@ def acceptance(records, crit, production=True):
                         dg["subtypes"] = {st_: {"fp": sum(f for f, r in zip(flags, rs) if r.get("subtype") == st_),
                                                 "n": sum(1 for r in rs if r.get("subtype") == st_)} for st_ in range(32)}
                 bl = [r.get("boundary_final") for r in rs if r.get("boundary_final")]
+                res_ = [b["residual"] for b in bl if "residual" in b and math.isfinite(b["residual"])]
                 dg.update(unavailable=sum(1 for r in rs if not r["available"]), boundary_checked=len(bl),
-                          boundary_max_abs_residual=max((abs(b["residual"]) for b in bl), default=None))
+                          estimator_distortion=_dist(res_),       # (the final-metric residuals: reported only)
+                          boundary_max_abs_residual=max((abs(x) for x in res_), default=None))
                 out["diagnostics"][f"{hyp}|{sk}"] = dg
             if "I" not in dset:                             # (the dev scope limitation carries through)
                 a = d["audit"]
@@ -2455,13 +2468,6 @@ def power(records, crit, production=True):
         for dd in rec["by_direction"].values():
             dd["wilson95"] = wilson(dd["success"], dd["n"])
     return out
-
-
-def _dist(xs):
-    xs = sorted(xs)
-    if not xs:
-        return {"n": 0}
-    return {"n": len(xs), "mean": sum(xs) / len(xs), "median": xs[len(xs) // 2], "max": xs[-1]}
 
 
 def report(records):
