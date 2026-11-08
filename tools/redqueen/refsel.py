@@ -261,19 +261,46 @@ def attempt_uuid(base, k):
     return base if not k else str(uuid.uuid5(uuid.NAMESPACE_URL, f"finfolk:attempt:{base}:{k}"))
 
 
+BURN_IN = 5_000_000              # (the validation run's burn-in rule: a zero before it restarts the world)
+
+
+def establishment(a, burn_in=BURN_IN):
+    """THE EVIDENCED ESTABLISHMENT DECISION of a sentinel's current attempt, as worlds.py's burn_in_decided,
+    from the block's evidence and SEPARATE from its technical status (Codex #71 r4 P2-1) -> (established, why):
+      - no burn-in rule: established;
+      - an evidenced zero (valid_before) before the burn-in frame: NOT established (a restart is due, or the
+        restarts are exhausted: an early failure), whatever the status;
+      - a first zero at or after the burn-in frame: established (data);
+      - no zero: established when its archives reach the burn-in frame alive (the acceptance chain passed it),
+        else not yet.
+    A later technical failure ("failed") keeps an established attempt's valid snapshots."""
+    if not burn_in:
+        return True, "no burn-in rule"
+    vb = a.get("valid_before")
+    if vb is not None and vb < burn_in:
+        return False, f"a zero at frame {vb} before the burn-in frame {burn_in}"
+    if vb is not None:
+        return True, f"its first zero {vb} is at or after the burn-in frame"
+    if max([f for f in (a.get("archived") or []) if isinstance(f, int)] or [0]) >= burn_in:
+        return True, "alive at the burn-in frame"
+    return False, f"not yet alive at the burn-in frame {burn_in}"
+
+
 def availability_reason(a, w, lab):
-    """THE AVAILABILITY RULE (Codex #71 r3 P2): None when (w, lab) is a candidate, else the registered
+    """THE AVAILABILITY RULE (Codex #71 r3 P2, r4): None when (w, lab) is a candidate, else the registered
     omission reason, from the availability record alone:
-      - the sentinel's current attempt must be ESTABLISHED (status not "failed"), its identity the registered
-        recipe (worlds.py keeps it across restarts) or val_block's attempt identity of it;
+      - the sentinel's current attempt must be ESTABLISHED (the evidenced decision, never the technical
+        status), its identity the registered recipe (worlds.py keeps it across restarts) or val_block's
+        attempt identity of it;
       - the snapshot must be archived and before the world's first zero."""
     reg_uuid = recipe(VALIDATION_NAMESPACE, w)
     k = a.get("attempt") or 0
     fr = frame_of(lab)
     if a.get("uuid") not in (reg_uuid, attempt_uuid(reg_uuid, k)):
         return "an identity that is not the registered one (nor its attempt's)"
-    if a.get("status") == "failed":
-        return f"attempt {k} is not established (failed)"
+    ok, why = establishment(a, a.get("burn_in", BURN_IN))
+    if not ok:
+        return f"attempt {k} is not established ({why})"
     if fr not in (a.get("archived") or []):
         return "not archived"
     if a.get("valid_before") is not None and fr >= a["valid_before"]:
@@ -297,6 +324,7 @@ def candidates(block, sentinels, reg=None):
             (r["seeds"][k] for r in (reg or {}).get("reserved", []) if r.get("slot") == rw.get("seed_slot")
              and k < len(r.get("seeds", []))), None)
         avail[w] = {"uuid": v.get("uuid"), "attempt": k, "status": v.get("status"), "seed": seed,
+                    "burn_in": int((reg or {}).get("burn_in") or BURN_IN),
                     "pattern": v.get("pattern"), "f1": (v.get("paths") or {}).get("F1"),
                     "valid_before": v.get("valid_before"),
                     "archived": sorted(f for f in v.get("archived", []) if f in {frame_of(t) for t in TIMES})}
@@ -359,8 +387,9 @@ def make_design(block, templates, ages, avoid_paths, validation_dir=None, main_r
         raise RefselError(f"the usable candidates ({len(cands)}; omitted: {len(omitted)}) cannot meet the "
                           "registered constraints (a sentinel is never replaced)")
     ws = block["worlds"]
-    worlds = {w: {"uuid": ws[w]["uuid"], "pattern": ws[w]["pattern"], "paths": ws[w].get("paths", {})}
-              for w in sorted({w for w, _ in cands})}
+    worlds = {w: {"uuid": recipe(VALIDATION_NAMESPACE, w), "pattern": ws[w]["pattern"], "paths": ws[w].get("paths", {})}
+              for w in sorted({w for w, _ in cands})}       # (the REGISTERED identity, before plan expansion:
+    #                                                         the assayed endpoints carry what selection emits)
     times = {lab: frame_of(lab) for lab in TIMES}
     edges = []
     for wq, tq in cands:
@@ -445,8 +474,8 @@ def rebind(design, main_registries=None, forks=None):
         if o.get("reason") != availability_reason(avail[o["world"]], o["world"], o["time"]):
             raise RefselError(f"{o['world']}@{o['time']}: the omission reason is not the availability's")
     for w, lab in cand:
-        if design["worlds"][w]["uuid"] != avail[w]["uuid"]:
-            raise RefselError(f"candidate {w}@{lab}: the design's identity is not the availability's")
+        if design["worlds"][w]["uuid"] != recipe(VALIDATION_NAMESPACE, w):
+            raise RefselError(f"candidate {w}@{lab}: the design's identity is not the registered one")
     return recs
 
 
