@@ -1,67 +1,123 @@
 #!/usr/bin/env python3
 """noisebank.py: the independent noise bank (design v4 §7.4; Annex H.3.1's bank covariance, H.9.2's noise
-model). The plan of its assays, their collection, and the estimator of the noise components that feed the
-analysis covariance V, map.py's replicate-variance function and calib.py's generator noise block.
+model, amendment D4's monotone s(mu)). The plan of its assays, their collection, and the estimator of the
+noise components that feed the analysis covariance V, map.py's replicate-variance prior and calib.py's
+generator noise block.
 
 THE PLAN (design/2, registered here):
-  worlds   the N_WORLDS = 8 C-treatment worlds of the worlds block (the validation run: val_block.py) whose
-           TIMES = 20, 40, 60, 80M snapshots are all archived and valid (before the world's first zero), in
-           the order of sha256("<seed namespace>|noisebank|<world uuid>"), the first 8; each world's partner
-           is the next one in that order (cyclically);
+  worlds   the N_WORLDS = 8 C-treatment worlds of the VALIDATION run whose TIMES = 20, 40, 60, 80M
+           snapshots are all archived and valid (before the world's first zero), in the order of
+           sha256("<seed namespace>|noisebank|<world uuid>"), the first 8; each world's partner is the next
+           one in that order (cyclically). The worlds block (worlds.py design-block or val_block.py) must
+           be bound to the validation registry <validation dir>/config/worlds.json:
+             - its sha256 is the block's registry_sha256;
+             - its namespace is VALIDATION_NAMESPACE;
+             - every block world is a registered identity of that namespace (uuid5(URL,
+               "finfolk:redqueen:<namespace>:<id>"), or val_block's attempt uuid of it);
+             - no validation identity occurs in the main-study registries (--main-registry, mandatory:
+               disjoint histories, not only disjoint seeds);
   pairs    every prey snapshot (w, t) meets the predator snapshots of its own world at all four times
            (4 within-pilot pairs) and of its partner at all four times (4 cross-pilot pairs): 32 prey
            snapshots x 8 = 128 within-pilot + 128 cross-pilot pairs; every predator snapshot faces 8 prey
-           snapshots (4 of its own world, 4 of the world whose partner it is): a CROSSED design, so the
-           predator-donor component is identified apart from the prey row;
+           snapshots: a CROSSED design (896 row-sharing and 896 donor-sharing cell pairs);
   controls one predator-free continuation per prey snapshot (32);
-  assays   the production assay (frozen, K 6, the common 600-prey cohort, the production templates and age
-           reference), 64 replicates, 20k steps scored at 5k, 10k and 20k, the PRODUCTION SEED SHARING of
-           plan.py (sample / reseed per prey snapshot x replicate: the row; transplant per predator snapshot
-           x replicate: the donor), its own seed namespace (rq2026-noisebank, plan namespace "noisebank"):
-           256 x 64 = 16,384 predator trajectories and 32 x 64 = 2,048 predator-free ones, 18,432 in all;
-           --avoid (the production reservations) and the age reference are mandatory, every engine seed
-           checked against them.
+  assays   the production assay:
+             - frozen, K 6, the common 600-prey cohort, the production templates and age reference;
+             - 64 replicates, 20k steps scored at 5k, 10k and 20k;
+             - the PRODUCTION SEED SHARING of plan.py (sample / reseed per prey snapshot x replicate: the row;
+               transplant per predator snapshot x replicate: the donor);
+             - its own seed namespace (rq2026-noisebank, plan namespace "noisebank");
+             - 16,384 predator trajectories and 2,048 predator-free ones, 18,432 in all;
+             - --avoid (the production reservations) and the age reference are mandatory, and every engine
+               seed is checked against the reservations.
 COLLECT: through store.py's verified index, bound to the final plan (rows exact, the 600 cohort, every cell
 collected or declared missing), the three horizons per cell.
 
-THE ESTIMATOR (per horizon; on the empirical-logit scale z = logit((x + 1/2) / (n + 1)), x the capture count
-of bound B(T) = K (1 + floor(T dt / cooldown)) or the survivors of 600). Model (H.9.2): z_ijr = mu_ij +
-s(mu_ij) (rho_ir + delta_jr + eps_ijr) with rho the prey-row (snapshot x replicate), delta the predator-donor
-(snapshot x replicate) and eps the cell component, the latent components normalized to unit total variance.
-Deviations from the cell means over the R = 64 replicates, d_ijr, standardized by each cell's own SD (the
-cell's total, s_ij), have E[d d'] = (component variance) x (1 - 1/R) for two cells sharing exactly the row
-(same prey, different predators), exactly the donor (different prey, same predator), or the cell itself:
-  row share     = mean over the row-sharing cell pairs and replicates of d~_ijr d~_ij'r / (1 - 1/R);
-  donor share   = mean over the donor-sharing pairs of d~_ijr d~_i'jr / (1 - 1/R);
-  cell share    = 1 - row - donor (unit total);
-the same cross-products across channels (capture C, exposed survival S; the predator-free survival F shares
-the prey row only) give SigmaR (3 x 3: C, S, F rows), SigmaD (2 x 2), SigmaE (2 x 2). The free channel's own
-row variance SigmaR_FF is not separable from its cell (one control per row): it is set to the smallest
-value keeping SigmaR positive semidefinite with the measured C-F and S-F row covariances (reported as a
-lower bound). Heteroscedasticity (fit_scale): s(mu) per registered mean bin (H.9.2: capture [0,.35),
-[.35,.70), [.70,1]; survival [0,.25), [.25,.75), [.75,1]) as the root mean of the cells' total variances in the
-bin, AND a monotone function of the latent location logit(mu) (the isotonic fit, linear between its blocks;
-the bins are its special case of a step function with knots at the edges), so either registration stays
-open; the per-cell curve (mean, SD) is reported too. Saturated cells (mean outside [0.02, 0.98])
-are excluded from the components and counted. map.py's shrinkage prior: the dispersion of the cells'
-log variances around s(mu)^2 beyond the R - 1 df sampling dispersion (trigamma) gives the prior degrees of
-freedom nu0 (inf: pool fully); a production cell's replicate-mean variance with R' replicates is then
-(nu0 s(mu)^2 + (R' - 1) s_obs^2) / (nu0 + R' - 1) / R'. Uncertainty: a world-cluster bootstrap (the 8 worlds
-resampled with their prey and predator snapshots), 999 draws, percentile intervals.
+THE ESTIMATOR (per horizon; Annex H.9.2: an interval-censored Gaussian composite likelihood).
+  Model. A count k of N (captures of B(T) = K (1 + floor(T dt / cooldown)), or survivors of 600) is
+  floor(N sigma(z) + 1/2) of a latent z = a_c + sigma_c u, so z lies in [logit((k - 1/2)/N),
+  logit((k + 1/2)/N)] (-inf at 0, +inf at N). Per cell c and channel there is a location a_c and a total
+  latent SD sigma_c = s(mu_c). The standardized latent u has unit variance and is the sum of the sharing
+  components (H.9.2):
+    exposed C, S of cell (i, j), replicate r:  u = R_ir + D_jr + E_ijr   (prey row, predator donor, cell),
+    free F of prey snapshot i, replicate r:     u = R_ir[F] + E_ir[F]     (its own control error).
+  SigmaR (3 x 3: C, S, F), SigmaD (2 x 2) and SigmaE (2 x 2) are PSD, with the unit total variance
+  rR + rD + rE = 1 per exposed channel (the marginal scale is s(mu)). The correlation of two latent
+  observations sharing a registered source is then one of NINE identified quantities (the groups):
+    R_CC, R_SS, R_CS   row-sharing pairs (same prey snapshot and replicate, different predators);
+    D_CC, D_SS, D_CS   donor-sharing pairs (same predator snapshot and replicate, different prey);
+    T_CS               capture with exposed survival of the same cell and replicate (SigmaR + SigmaD +
+                       SigmaE, C-S);
+    R_CF, R_SF         an exposed channel with its prey snapshot's free control, same replicate.
+  The free row variance SigmaR[F, F] is NOT identified: with one control per row only R_FF + E_FF = 1 is.
+  It is set by CONVENTION to its smallest feasible value v' A^+ v (A the C-S row block, v = (R_CF, R_SF))
+  and reported as a convention, never as a recovered variance. The survival-difference covariance depends
+  on the total free variance only.
+  Composite likelihood: the marginal interval log-likelihoods of every observation plus, for every pair of
+  observations sharing a registered source (the nine groups), the dependence contribution
+  log P(both intervals; rho) - log P(first) - log P(second) of the bivariate normal (Genz's BVNU,
+  20-point Gauss-Legendre). It is maximized in TWO STAGES (inference functions for margins):
+    (1) per cell and channel, the marginal MLE (a_c, sigma_c), by Newton from the empirical-logit moments
+        (STARTING VALUES ONLY);
+    (2) the nine dependence parameters, by the pairwise dependence contributions at the stage-1 margins.
+  Each group's contribution is computed EXACTLY on the registered grid rho = -RHO_MAX .. RHO_MAX, step
+  RHO_STEP, and interpolated by local cubics between nodes. When the unconstrained group maxima are jointly
+  FEASIBLE (all three components PSD, the unit totals non-negative, the free row convention <= 1), they are
+  the fit. Otherwise the composite likelihood is maximized over a PSD parametrization, by Nelder-Mead from
+  the projected start:
+    - the shares lie on the simplex, by spherical angles;
+    - the component correlations are sines;
+    - the free-row loading lies in the unit disk.
+  Every point of this parametrization is feasible, and every feasible point is reachable.
+  REFUSED (status "unavailable", with reasons; never a silent number): a group without pairs, a group whose
+  curvature per pair at its maximum is below INFO_MIN (unidentified), no usable cells.
+  Support. Each CHANNEL has its own saturation mask: a cell's channel is unusable when its mean fraction lies
+  outside SATURATION = [0.02, 0.98], and a saturated survival never removes the cell's capture. Each channel's
+  marginal must also be identified: converged, sigma >= SIGMA_MIN, a negative definite Hessian, and the
+  observed information of log sigma at least MARG_INFO_MIN R = 0.4 R (an uncensored normal sample has 2 R;
+  a cell whose counts barely leave one or two latent intervals has almost none). Every exclusion is counted.
+  s(mu) (D4 rule 13; the bins are retired), per channel:
+    - the isotonic regression of the cells' sigma^2 on x = logit(mu-hat) (mu-hat the cell's mean fraction),
+      with TIED LOCATIONS POOLED first (weights summed, the weighted mean variance);
+    - direction "increasing" / "decreasing" by the smaller weighted squared error ("decreasing" on an exact
+      tie);
+    - each PLATEAU of the isotonic fit (a maximal run of equal fitted values: the fit is unique, PAVA's
+      merge order is not) gives ONE knot, at the weighted mean of its locations, with value sqrt(the
+      plateau's variance);
+    - s is linear in logit(mu) between knots and CONSTANT beyond the outermost knots: an extrapolation
+      assumption beyond the bank's support, recorded with the support.
+  This family does not contain the H.9.2 bins: plateaus become ramps between block centres. The curves are
+  serialized for noisescale.py, the ONE evaluator shared with calib.py.
+  map.py's prior nu0, per channel:
+    - the excess: the dispersion of log sigma_c^2 around log s(mu_c)^2, beyond the mean sampling variance of
+      log sigma-hat^2 (from each marginal fit's observed information);
+    - the scaled-inverse-chi-square prior has Var log sigma^2 = trigamma(nu0 / 2), solved EXACTLY for nu0;
+    - encoded explicitly: {"status": "estimated", "nu0"}, {"status": "full_pooling"} (no excess dispersion:
+      the prior is s(mu)^2 alone) or {"status": "unavailable", "reason"} (fewer than 3 cells); never Infinity
+      or NaN.
+  Uncertainty: a CROSSED world bootstrap (Owen's pigeonhole rule).
+    - The 8 worlds are resampled with replacement TWICE, independently: for the prey role (multiplicities
+      m) and for the predator role (m').
+    - Every observation and pair keeps its multiplicity: a pair's weight is the product over its distinct
+      sources (row pair: m[prey world] m'[pred world 1] m'[pred world 2]; donor pair: m'[pred world]
+      m[prey world 1] m[prey world 2]; same-cell and exposed/free pairs: m[prey world] m'[pred world]).
+    - A free control follows its prey snapshot, the source it shares.
+    - Each draw refits stage 2 with the weighted contributions (the stage-1 margins are per cell and
+      unchanged by resampling).
+    - 999 draws, percentile intervals.
 
 THE PRODUCTION V BUILDER (cov_parts; Annex H.3.1): one block's bank covariance diag(d) + U U' (for
-recurrence.Cov) from the bank's components and s(mu) EVALUATED AT THE MEANS PASSED IN: raw replicate means or
-null-model fitted means are the caller's (the registration's) choice, never the builder's. The construction
-is calib.py's Panel.cov (capture: row + donor + cell; survival: the exposed cell minus its prey snapshot's
-free control).
-
-STATUS: plan and estimators only; no assay runs (the arena may still change: the plan records the
-validation directory and the arena id it was made for).
+recurrence.Cov), from the bank's components and the bank's s(mu) curves (noisescale.evaluate, the
+registered D4 scale; there is no binned default), EVALUATED AT THE MEANS PASSED IN (D4: the null-model
+fitted means m0; the builder never chooses). It is the LINEARIZED (delta-method) covariance of the
+replicate means, g(mu) = s(mu) mu (1 - mu): a first-order approximation of H.9.2's rounded logistic-normal
+counts, not their exact native-scale covariance (checked against simulation at small s in the tests).
 
     noisebank.py plan --block val_block.json --validation-dir ~/finfolk/validation --arena ARENA_ID \\
-        --templates t.json ... --age-reference ages.json --avoid production_plan.jsonl ... --out nb_design.json
+        --main-registry ~/finfolk/study/config/worlds.json --templates t.json ... \\
+        --age-reference ages.json --avoid production_plan.jsonl ... --out nb_design.json
     noisebank.py collect --study STUDY --design noisebank_design.json --plan plan.jsonl [--declare-missing ...]
-    noisebank.py estimate --obs noisebank_obs.json --out bank.json
+    noisebank.py estimate --obs noisebank_obs.json --out bank.json [--boot 999]
 """
 from __future__ import annotations
 
@@ -71,19 +127,23 @@ import json
 import math
 import os
 import sys
+import uuid
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 if os.environ.get("RQ_PYLIB"):
     sys.path.insert(0, os.environ["RQ_PYLIB"])
+import noisescale  # noqa: E402
 import plan as planlib  # noqa: E402
 import rqlib  # noqa: E402
 
-SCHEMA = "finfolk.redqueen.noisebank/1"
+SCHEMA = "finfolk.redqueen.noisebank/2"
 OBS_SCHEMA = "finfolk.redqueen.noisebank.obs/1"
-BANK_SCHEMA = "finfolk.redqueen.noisebank.bank/1"
+BANK_SCHEMA = "finfolk.redqueen.noisebank.bank/2"
+WORLDS_SCHEMA = "finfolk.redqueen.worlds/1"
 SEED_NAMESPACE = "rq2026-noisebank"
 PLAN_NAMESPACE = "noisebank"
+VALIDATION_NAMESPACE = "finfolk-rq-validation-pilot-2026-11"     # (the validation run's registry namespace)
 TIMES = ("20M", "40M", "60M", "80M")
 N_WORLDS = 8
 TREATMENT = "C"
@@ -93,9 +153,17 @@ N_PREY = 600
 STEPS = 20000
 HORIZONS = (5000, 10000, 20000)
 DT, COOLDOWN = 0.016, 1.5          # (the engine step and the predator cooldown in seconds: the capture bound)
-SATURATION = (0.02, 0.98)
-BINS = {"C": (0.35, 0.70), "S": (0.25, 0.75), "F": (0.25, 0.75)}
+SATURATION = (0.02, 0.98)          # (a channel's mean fraction outside: that channel of the cell is unusable)
+SIGMA_MIN = 0.01                   # (a marginal latent SD below this: degenerate, unidentified)
+MARG_INFO_MIN = 0.4                # (the observed information of log sigma below this x R: unidentified;
+                                   #  an uncensored normal sample has 2 R)
+INFO_MIN = 1e-3                    # (a dependence group's curvature per pair below this: unidentified)
+RHO_MAX, RHO_STEP = 0.995, 0.005   # (the registered dependence grid: 399 nodes)
+MARGINAL_TOL = 1e-8                # (the marginal Newton's gradient tolerance, per replicate)
+FEAS_TOL = 1e-12                   # (the feasibility tolerance of the unconstrained group maxima)
 BOOT = 999
+GROUPS = ("R_CC", "R_SS", "R_CS", "D_CC", "D_SS", "D_CS", "T_CS", "R_CF", "R_SF")
+KINDS = ("C", "RC", "Q", "RQ")
 
 
 class NoiseBankError(Exception):
@@ -109,6 +177,15 @@ def capture_bound(steps):
 
 def frame_of(label):
     return int(label[:-1]) * 1_000_000
+
+
+def registry_uuid(namespace, wid):
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"finfolk:redqueen:{namespace}:{wid}"))
+
+
+def attempt_uuid(base, k):
+    """val_block.py's identity of a restarted attempt k > 0 (another history)."""
+    return base if not k else str(uuid.uuid5(uuid.NAMESPACE_URL, f"finfolk:attempt:{base}:{k}"))
 
 
 # ================================================================== the plan
@@ -136,6 +213,60 @@ def pick_worlds(block, ns=SEED_NAMESPACE, n=N_WORLDS):
     return order, {w: order[(k + 1) % n] for k, w in enumerate(order)}
 
 
+def _registry(path, what):
+    try:
+        reg = rqlib.read_json(path)
+    except (OSError, ValueError) as e:
+        raise NoiseBankError(f"{what} {path}: unreadable ({type(e).__name__})")
+    if not isinstance(reg, dict) or reg.get("schema") != WORLDS_SCHEMA or not isinstance(reg.get("worlds"), list):
+        raise NoiseBankError(f"{what} {path}: not a worlds registry ({WORLDS_SCHEMA})")
+    return reg
+
+
+def bind_validation(block, validation_dir, main_registries):
+    """The worlds block bound to the VALIDATION registry and disjoint from the main study (Codex #72 r1 P2-8)
+    -> the binding record (registry path, sha256, namespace; the main registries checked)."""
+    vdir = os.path.abspath(validation_dir)
+    rp = os.path.join(vdir, "config", "worlds.json")
+    if not os.path.isfile(rp):
+        raise NoiseBankError(f"no validation registry at {rp}")
+    reg = _registry(rp, "validation registry")
+    sha = rqlib.sha256_file(rp)
+    if block.get("registry_sha256") != sha:
+        raise NoiseBankError(f"the worlds block was not made from the validation registry {rp} (registry_sha256 "
+                             "differs)")
+    if block.get("root") is not None and os.path.abspath(block["root"]) != vdir:
+        raise NoiseBankError(f"the worlds block was read from {block['root']!r}, not {vdir!r}")
+    if reg.get("namespace") != VALIDATION_NAMESPACE:
+        raise NoiseBankError(f"registry namespace {reg.get('namespace')!r}: the noise bank samples the validation "
+                             f"run ({VALIDATION_NAMESPACE})")
+    by = {w["id"]: w for w in reg["worlds"]}
+    for wid, v in block["worlds"].items():
+        r = by.get(wid)
+        if r is None:
+            raise NoiseBankError(f"block world {wid} is not in the validation registry")
+        if r.get("uuid") != registry_uuid(reg["namespace"], wid):
+            raise NoiseBankError(f"{wid}: its registry uuid is not the validation namespace's identity")
+        if v.get("uuid") not in (r["uuid"], attempt_uuid(r["uuid"], v.get("attempt") or 0)):
+            raise NoiseBankError(f"{wid}: the block's uuid is neither the registered identity nor its attempt")
+        if v.get("treatment") != r.get("treatment"):
+            raise NoiseBankError(f"{wid}: treatment {v.get('treatment')!r} in the block, {r.get('treatment')!r} "
+                                 "registered")
+    if not main_registries:
+        raise NoiseBankError("--main-registry: the main study's registries are mandatory (disjoint histories)")
+    val_ids = {w["uuid"] for w in reg["worlds"]} | {v.get("uuid") for v in block["worlds"].values()}
+    mains = []
+    for p in main_registries:
+        m = _registry(p, "main registry")
+        if m.get("namespace") == reg["namespace"]:
+            raise NoiseBankError(f"main registry {p}: the validation namespace itself")
+        hit = sorted(val_ids & {w.get("uuid") for w in m["worlds"]})
+        if hit:
+            raise NoiseBankError(f"main registry {p}: {len(hit)} validation identities are main-study worlds")
+        mains.append({"path": os.path.abspath(p), "sha256": rqlib.sha256_file(p), "namespace": m.get("namespace")})
+    return {"registry": rp, "registry_sha256": sha, "namespace": reg["namespace"], "main_registries": mains}
+
+
 def _collect_seeds(obj, out, hint=False):
     if isinstance(obj, dict):
         for k, v in obj.items():
@@ -160,14 +291,13 @@ def avoid_seeds(path):
     return planlib.plan_seeds(rows) | _collect_seeds(rows, set())
 
 
-def make_design(block, templates, ages, avoid_paths, ns=SEED_NAMESPACE, validation_dir=None, arena=None):
-    """The noise bank's design/2 (registered: see the module docstring), parameterized by the validation run
-    it samples (validation_dir: the worlds block must have been read from it) and its arena id (recorded; the
-    arena may still change before the bank runs)."""
+def make_design(block, templates, ages, avoid_paths, ns=SEED_NAMESPACE, validation_dir=None, arena=None,
+                main_registries=()):
+    """The noise bank's design/2 (registered: see the module docstring), bound to the validation registry it
+    samples and disjoint from the main study, with its arena id recorded (the arena may still change)."""
     if not validation_dir or not arena:
         raise NoiseBankError("--validation-dir and --arena are mandatory (the bank samples one validation run of one arena)")
-    if os.path.abspath(validation_dir) != os.path.abspath(block.get("root") or ""):
-        raise NoiseBankError(f"the worlds block was read from {block.get('root')!r}, not {validation_dir!r}")
+    binding = bind_validation(block, validation_dir, main_registries)
     if not isinstance(ages, str) or not os.path.isabs(ages) or not os.path.isfile(ages):
         raise NoiseBankError("--age-reference: the production age reference (an absolute path to a file) is mandatory")
     if not avoid_paths:
@@ -204,8 +334,8 @@ def make_design(block, templates, ages, avoid_paths, ns=SEED_NAMESPACE, validati
         checked.append({"path": os.path.abspath(p), "sha256": rqlib.sha256_file(p)})
     n_pred = sum(1 for r in rows if r.get("predators") is not None)
     design["noisebank"] = {"schema": SCHEMA, "validation_dir": os.path.abspath(validation_dir), "arena": str(arena),
-                           "worlds": order, "partner": partner, "times": list(TIMES),
-                           "registry_sha256": block.get("registry_sha256"), "avoid": checked, "cells": len(rows),
+                           "validation": binding, "worlds": order, "partner": partner, "times": list(TIMES),
+                           "registry_sha256": binding["registry_sha256"], "avoid": checked, "cells": len(rows),
                            "predator_trajectories": n_pred, "free_trajectories": len(rows) - n_pred,
                            "horizons": list(HORIZONS), "capture_bounds": {str(h): capture_bound(h) for h in HORIZONS}}
     return design
@@ -279,301 +409,838 @@ def collect(study, design, plan_path, declared_missing=()):
             "missing": missing, "observations": obs}
 
 
-# ================================================================== the estimator
-def _elogit(x, n):
+# ================================================================== numerics: normal tails, BVN
+def _erfc(x):
+    """erfc, vectorized, finite or +-inf: the alternating Taylor series of erf below |x| = 2, the continued
+    fraction of erfc above (relative error <= 1e-12)."""
     import numpy as np
     x = np.asarray(x, float)
-    return np.log((x + 0.5) / (n - x + 0.5))
+    out = np.empty_like(x)
+    fin = np.isfinite(x)
+    out[~fin] = np.where(x[~fin] > 0, 0.0, 2.0)
+    ax = np.abs(x)
+    sm = fin & (ax < 2.0)
+    xs = x[sm]
+    x2 = xs * xs
+    term, s = xs.copy(), xs.copy()
+    for n in range(1, 70):
+        term = term * (-x2) / n
+        s = s + term / (2 * n + 1)
+    out[sm] = 1.0 - 2.0 / math.sqrt(math.pi) * s
+    lg = fin & ~sm
+    xl = ax[lg]
+    f = xl.copy()
+    for n in range(90, 0, -1):
+        f = xl + (n / 2.0) / f
+    val = np.exp(-xl * xl) / math.sqrt(math.pi) / f
+    out[lg] = np.where(x[lg] > 0, val, 2.0 - val)
+    return out
 
 
+def _Q(z):
+    """The upper normal tail P(Z > z)."""
+    import numpy as np
+    return 0.5 * _erfc(np.asarray(z, float) / math.sqrt(2.0))
+
+
+def _phi(z):
+    import numpy as np
+    z = np.asarray(z, float)
+    with np.errstate(over="ignore"):
+        return np.exp(-0.5 * z * z) / math.sqrt(2 * math.pi)
+
+
+def _iprob(zl, zh):
+    """P(zl < Z < zh), accurate in either tail."""
+    import numpy as np
+    return np.where(zl > 0, _Q(zl) - _Q(zh), _Q(-zh) - _Q(-zl))
+
+
+_GL = []
+
+
+def _gl20():
+    if not _GL:
+        import numpy as np
+        _GL.append(np.polynomial.legendre.leggauss(20))
+    return _GL[0]
+
+
+def _bvnu_finite(h, k, r):
+    """P(X > h, Y > k) of a standard bivariate normal with correlation r (scalar, |r| < 1), finite h, k
+    (arrays): Genz's BVNU (Drezner-Wesolowsky with 20-point Gauss-Legendre; the asymptotic form for |r| >=
+    0.925); absolute error about 1e-15."""
+    import numpy as np
+    x, w = _gl20()
+    h, k = np.asarray(h, float), np.asarray(k, float)
+    hk = h * k
+    if abs(r) < 0.925:
+        hs = (h * h + k * k) / 2
+        asr = math.asin(r)
+        acc = np.zeros_like(h)
+        for t, wt in zip(x, w):
+            sn = math.sin(asr * (1 + t) / 2)
+            acc += wt * np.exp((sn * hk - hs) / (1 - sn * sn))
+        return np.clip(acc * asr / (4 * math.pi) + _Q(h) * _Q(k), 0.0, 1.0)
+    if r < 0:
+        k = -k
+        hk = -hk
+    as_ = (1 - r) * (1 + r)
+    a = math.sqrt(as_)
+    bs = (h - k) ** 2
+    c = (4 - hk) / 8
+    d = (12 - hk) / 16
+    with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+        asr = -(bs / as_ + hk) / 2
+        bvn = np.where(asr > -100, a * np.exp(asr) * (1 - c * (bs - as_) * (1 - d * bs / 5) / 3 + c * d * as_ * as_ / 5),
+                       0.0)
+        b = np.sqrt(bs)
+        sp = math.sqrt(2 * math.pi) * _Q(b / a)
+        bvn = bvn - np.where(hk > -100, np.exp(-hk / 2) * sp * b * (1 - c * bs * (1 - d * bs / 5) / 3), 0.0)
+        a2 = a / 2
+        for t, wt in zip(x, w):
+            xs = (a2 * (t + 1)) ** 2
+            rs = math.sqrt(1 - xs)
+            asr = -(bs / xs + hk) / 2
+            sp = 1 + c * xs * (1 + d * xs)
+            ep = np.exp(-hk * (1 - rs) / (2 * (1 + rs))) / rs
+            bvn = bvn + np.where(asr > -100, a2 * wt * np.exp(asr) * (ep - sp), 0.0)
+        bvn = -bvn / (2 * math.pi)
+    if r > 0:
+        bvn = bvn + _Q(np.maximum(h, k))
+    else:
+        L = np.where(h < 0, _Q(-k) - _Q(-h), _Q(h) - _Q(k))
+        bvn = np.where(h >= k, -bvn, L - bvn)
+    return np.clip(bvn, 0.0, 1.0)
+
+
+def bvn_upper(h, k, r):
+    """P(X > h, Y > k), any h, k in [-inf, +inf] (arrays), |r| < 1."""
+    import numpy as np
+    h, k = np.broadcast_arrays(np.asarray(h, float), np.asarray(k, float))
+    out = np.zeros(h.shape)
+    fh, fk = np.isfinite(h), np.isfinite(k)
+    both = fh & fk
+    if both.any():
+        out[both] = _bvnu_finite(h[both], k[both], r)
+    hm, km = h == -np.inf, k == -np.inf
+    out[hm & km] = 1.0
+    sel = hm & fk
+    out[sel] = _Q(k[sel])
+    sel = km & fh
+    out[sel] = _Q(h[sel])
+    return out                                   # (+inf anywhere: 0)
+
+
+def bvn_rect(l1, h1, l2, h2, r):
+    """P(l1 < X < h1, l2 < Y < h2), standard bivariate normal with correlation r."""
+    return (bvn_upper(l1, l2, r) - bvn_upper(h1, l2, r) - bvn_upper(l1, h2, r) + bvn_upper(h1, h2, r))
+
+
+# ================================================================== stage 1: the marginals
+def interval_bounds(k, N):
+    """The latent interval of count k of N: [logit((k - 1/2)/N), logit((k + 1/2)/N)], -inf at 0, +inf at N."""
+    import numpy as np
+    k = np.asarray(k, float)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        lo = np.where(k <= 0, -np.inf, np.log((k - 0.5) / (N - k + 0.5)))
+        hi = np.where(k >= N, np.inf, np.log((k + 0.5) / (N - k - 0.5)))
+    return lo, hi
+
+
+def _marg_ll(lo, hi, a, t):
+    """Per row: the interval log-likelihood and its gradient in (a, t = log sigma)."""
+    import numpy as np
+    s = np.exp(t)[:, None]
+    zl, zh = (lo - a[:, None]) / s, (hi - a[:, None]) / s
+    P = _iprob(zl, zh)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ll = np.sum(np.log(P), axis=1)
+        pl, ph = _phi(zl), _phi(zh)
+        zpl = np.where(np.isfinite(zl), zl * pl, 0.0)
+        zph = np.where(np.isfinite(zh), zh * ph, 0.0)
+        ga = np.sum((pl - ph) / (s * P), axis=1)
+        gt = np.sum((zpl - zph) / P, axis=1)
+    return ll, np.stack([ga, gt], axis=1)
+
+
+def _marg_hess(lo, hi, a, t, eps=1e-5):
+    """The symmetrized finite-difference Hessian of the analytic gradient (rows x 2 x 2)."""
+    import numpy as np
+    H = np.empty((len(a), 2, 2))
+    for j, (da, dt) in enumerate(((eps, 0.0), (0.0, eps))):
+        gp = _marg_ll(lo, hi, a + da, t + dt)[1]
+        gm = _marg_ll(lo, hi, a - da, t - dt)[1]
+        H[:, :, j] = (gp - gm) / (2 * eps)
+    return 0.5 * (H + np.transpose(H, (0, 2, 1)))
+
+
+def fit_marginals(K, N, max_iter=200):
+    """Stage 1: per row of K (rows x R counts of N) the interval-censored normal MLE (a, sigma): Newton
+    (finite-difference Hessian of the analytic gradient, step halving) from the EMPIRICAL-LOGIT MOMENTS (the
+    starting values only). -> dict a, sigma, loglik, ok (converged, sigma >= SIGMA_MIN, negative definite
+    Hessian), var_t (the observed-information variance of log sigma-hat)."""
+    import numpy as np
+    K = np.asarray(K, float)
+    n, R = K.shape
+    lo, hi = interval_bounds(K, N)
+    z0 = np.log((K + 0.5) / (N - K + 0.5))
+    a = z0.mean(axis=1)
+    t = np.log(np.maximum(z0.std(axis=1, ddof=1), 0.05))
+    ll, g = _marg_ll(lo, hi, a, t)
+    done = np.zeros(n, bool)
+    floor_t = math.log(SIGMA_MIN) - 3
+    for _ in range(max_iter):
+        act = np.flatnonzero(~done & np.isfinite(ll))
+        if not len(act):
+            break
+        lo_, hi_ = lo[act], hi[act]
+        H = _marg_hess(lo_, hi_, a[act], t[act])
+        ga = g[act]
+        step = np.empty_like(ga)
+        for m in range(len(act)):
+            Hm = H[m]
+            if Hm[0, 0] < 0 and np.linalg.det(Hm) > 0:
+                step[m] = -np.linalg.solve(Hm, ga[m])
+            else:                                             # (not concave here: a gradient step)
+                step[m] = ga[m] / (1.0 + np.abs(ga[m]).max())
+        lam = np.ones(len(act))
+        a0, t0, ll0 = a[act].copy(), t[act].copy(), ll[act].copy()
+        a_new, t_new = a0 + step[:, 0], t0 + step[:, 1]
+        ll_new, g_new = _marg_ll(lo_, hi_, a_new, t_new)
+        for _h in range(40):
+            bad = ~(np.isfinite(ll_new) & (ll_new >= ll0 - 1e-12))
+            if not bad.any():
+                break
+            lam[bad] *= 0.5
+            a_new[bad] = a0[bad] + lam[bad] * step[bad, 0]
+            t_new[bad] = t0[bad] + lam[bad] * step[bad, 1]
+            ll_new[bad], g_new[bad] = _marg_ll(lo_[bad], hi_[bad], a_new[bad], t_new[bad])
+        a[act], t[act], ll[act], g[act] = a_new, t_new, ll_new, g_new
+        conv = (np.abs(g_new).max(axis=1) < MARGINAL_TOL * R) | (lam * np.abs(step).max(axis=1) < 1e-13) | \
+            (t_new < floor_t)
+        done[act[conv]] = True
+    H = _marg_hess(lo, hi, a, t)
+    ok = done & np.isfinite(ll) & (np.exp(t) >= SIGMA_MIN) & (H[:, 0, 0] < 0) & (np.linalg.det(H) > 0) & \
+        (np.abs(g).max(axis=1) < 1e-5 * R)
+    var_t = np.full(n, np.nan)
+    good = np.flatnonzero(ok)
+    if len(good):
+        var_t[good] = np.linalg.inv(-H[good])[:, 1, 1]
+    ok &= var_t * MARG_INFO_MIN * R <= 1.0                 # (a spread the data cannot measure: degenerate)
+    var_t[~ok] = np.nan
+    return {"a": a, "sigma": np.exp(t), "loglik": ll, "ok": ok, "var_t": var_t}
+
+
+# ================================================================== the bank's arrays and pairs
 def arrays(obs, horizon):
-    """-> (prey keys, predator keys, C z (cells x R), S z, F z (prey x R), cell index (i, j), cell means
-    (capture fraction, exposed survival), free means), complete cells only (all R replicates)."""
+    """-> per horizon the complete exposed cells (prey / predator snapshot keys and indices, counts C and S:
+    cells x R), the free controls (prey snapshot x R, NaN where missing), N per channel, the replicates."""
     import numpy as np
     B = capture_bound(horizon)
     h = str(horizon)
     by, free = {}, {}
+    reps = {o["replicate"] for o in obs}
+    if any(not isinstance(r, int) or isinstance(r, bool) for r in reps) or sorted(reps) != list(range(len(reps))):
+        raise NoiseBankError(f"replicates must be the integers 0..R-1 (got {sorted(map(str, reps))[:5]}...)")
+    reps = sorted(reps)
     for o in obs:
         x = o["horizons"][h]
+        vals = [x.get("survivors")] + ([] if o["pred"] is None else [x.get("captures")])
+        if any(not isinstance(v, int) or isinstance(v, bool) for v in vals):
+            raise NoiseBankError(f"{o.get('cell')}: counts at {h} steps must be integers")
         if o["pred"] is None:
             free.setdefault(tuple(o["prey"]), {})[o["replicate"]] = x["survivors"]
         else:
-            by.setdefault((tuple(o["prey"]), tuple(o["pred"])), {})[o["replicate"]] = (x["captures"], x["survivors"])
-    reps = sorted({o["replicate"] for o in obs})
+            key = (tuple(o["prey"]), tuple(o["pred"]))
+            if o["replicate"] in by.get(key, {}):
+                raise NoiseBankError(f"{key} replicate {o['replicate']} occurs twice")
+            by.setdefault(key, {})[o["replicate"]] = (x["captures"], x["survivors"])
     R = len(reps)
     cells = sorted(k for k, v in by.items() if len(v) == R)
-    prey = sorted({i for i, _ in cells})
+    prey = sorted({i for i, _ in cells} | set(free))
     pred = sorted({j for _, j in cells})
     pi = {k: n for n, k in enumerate(prey)}
     pj = {k: n for n, k in enumerate(pred)}
-    Cc = np.array([[by[c][r][0] for r in reps] for c in cells], float)
-    Sc = np.array([[by[c][r][1] for r in reps] for c in cells], float)
-    if np.any(Cc < 0) or np.any(Cc > B) or np.any(Sc < 0) or np.any(Sc > N_PREY):
-        raise NoiseBankError(f"counts outside their bounds at {horizon} steps (captures <= {B}, survivors <= {N_PREY})")
-    Fc = np.array([[free.get(i, {}).get(r, np.nan) for r in reps] for i in prey], float)
-    return {"prey": prey, "pred": pred, "I": np.array([pi[i] for i, _ in cells]), "J": np.array([pj[j] for _, j in cells]),
-            "zC": _elogit(Cc, B), "zS": _elogit(Sc, N_PREY), "zF": _elogit(Fc, N_PREY),
-            "mC": Cc.mean(axis=1) / B, "mS": Sc.mean(axis=1) / N_PREY, "mF": np.nanmean(Fc, axis=1) / N_PREY, "R": R}
+    Cc = np.array([[by[c][r][0] for r in reps] for c in cells], float).reshape(len(cells), R)
+    Sc = np.array([[by[c][r][1] for r in reps] for c in cells], float).reshape(len(cells), R)
+    Fc = np.array([[free.get(i, {}).get(r, np.nan) for r in reps] for i in prey], float).reshape(len(prey), R)
+    for name, arr, n in (("captures", Cc, B), ("survivors", Sc, N_PREY), ("free survivors", Fc, N_PREY)):
+        v = arr[np.isfinite(arr)]
+        if np.any(v < 0) or np.any(v > n):
+            raise NoiseBankError(f"{name} outside the integers 0..{n} at {horizon} steps")
+    return {"prey": prey, "pred": pred, "I": np.array([pi[i] for i, _ in cells], int),
+            "J": np.array([pj[j] for _, j in cells], int), "C": Cc, "S": Sc, "F": Fc,
+            "N": {"C": B, "S": N_PREY, "F": N_PREY}, "R": R, "incomplete_cells": len(by) - len(cells)}
 
 
-def _pairs(I, J):
-    """Row-sharing (same prey, different predator) and donor-sharing (different prey, same predator) cell
-    pairs, each unordered pair once."""
+def usable(A):
+    """Per CHANNEL: the saturation mask, then the stage-1 marginal fits -> {ch: {"ok", "mu", "a", "sigma",
+    "var_t", "counts"}}."""
     import numpy as np
-    n = len(I)
-    a, b = np.triu_indices(n, 1)
-    row = (I[a] == I[b]) & (J[a] != J[b])
-    don = (J[a] == J[b]) & (I[a] != I[b])
-    return (a[row], b[row]), (a[don], b[don])
-
-
-def components(A, keep=None):
-    """The standardized component estimates of one horizon (see the module docstring) -> dict with SigmaR (C,
-    S, F), SigmaD (C, S), SigmaE (C, S), the shares and the cell counts. keep: a cell mask (the unsaturated)."""
-    import numpy as np
-    R = A["R"]
-    I, J = A["I"], A["J"]
-    keep = np.ones(len(I), bool) if keep is None else keep
-    dev = {}
-    for ch in ("C", "S"):
-        z = A["z" + ch]
-        d = z - z.mean(axis=1, keepdims=True)
-        sd = np.sqrt(np.sum(d * d, axis=1) / (R - 1))
-        dev[ch] = d / np.where(sd > 0, sd, np.nan)[:, None]
-    zF = A["zF"]
-    dF = zF - np.nanmean(zF, axis=1, keepdims=True)
-    sF = np.sqrt(np.nansum(dF * dF, axis=1) / (R - 1))
-    dF = dF / np.where(sF > 0, sF, np.nan)[:, None]
-    idx = np.flatnonzero(keep & np.all(np.isfinite(dev["C"]), axis=1) & np.all(np.isfinite(dev["S"]), axis=1))
-    Ik, Jk = I[idx], J[idx]
-    (ra, rb), (da, db) = _pairs(Ik, Jk)
-    f = 1.0 - 1.0 / R
-
-    def cross(x, y, a, b):
-        if not len(a):
-            return float("nan")
-        return float(np.mean(0.5 * (np.sum(x[a] * y[b], axis=1) + np.sum(x[b] * y[a], axis=1)) / R) / f)
-
-    out = {"cells": int(len(idx)), "row_pairs": int(len(ra)), "donor_pairs": int(len(da))}
-    dC, dS = dev["C"][idx], dev["S"][idx]
-    SR = np.zeros((3, 3))
-    SD = np.zeros((2, 2))
-    SE = np.zeros((2, 2))
-    for p, xp in enumerate((dC, dS)):
-        for q, xq in enumerate((dC, dS)):
-            SR[p, q] = cross(xp, xq, ra, rb)
-            SD[p, q] = cross(xp, xq, da, db)
-            same = float(np.mean(np.sum(xp * xq, axis=1) / R) / f)
-            SE[p, q] = same - SR[p, q] - SD[p, q]
-    # the free channel: its row covariance with the exposed rows of the same prey snapshot and replicate
-    dFk = dF[Ik]
-    for p, xp in enumerate((dC, dS)):
-        ok = np.all(np.isfinite(dFk), axis=1)
-        SR[p, 2] = SR[2, p] = float(np.mean(np.sum(xp[ok] * dFk[ok], axis=1) / R) / f) if ok.any() else float("nan")
-    # SigmaR_FF: the smallest value keeping SigmaR PSD (a lower bound; one control per row cannot split it)
-    sub = SR[:2, :2]
-    v = SR[:2, 2]
-    try:
-        lb = float(v @ np.linalg.pinv(sub) @ v)
-    except np.linalg.LinAlgError:
-        lb = float("nan")
-    SR[2, 2] = min(max(lb, 0.0), 1.0)
-    out.update(SigmaR=SR.tolist(), SigmaD=SD.tolist(), SigmaE=SE.tolist(), SigmaR_FF_lower_bound=lb,
-               shares={ch: {"row": SR[k, k], "donor": SD[k, k], "cell": SE[k, k]} for k, ch in enumerate("CS")})
+    out = {}
+    for ch in ("C", "S", "F"):
+        Kc = A[ch]
+        N = A["N"][ch]
+        complete = np.all(np.isfinite(Kc), axis=1)
+        mu = np.full(len(Kc), np.nan)
+        mu[complete] = Kc[complete].mean(axis=1) / N
+        sat = complete & ((mu < SATURATION[0]) | (mu > SATURATION[1]))
+        fit_rows = np.flatnonzero(complete & ~sat)
+        ok = np.zeros(len(Kc), bool)
+        a, sg, vt = (np.full(len(Kc), np.nan) for _ in range(3))
+        if len(fit_rows):
+            f = fit_marginals(Kc[fit_rows], N)
+            ok[fit_rows] = f["ok"]
+            a[fit_rows], sg[fit_rows], vt[fit_rows] = f["a"], f["sigma"], f["var_t"]
+        out[ch] = {"ok": ok, "mu": mu, "a": a, "sigma": sg, "var_t": vt,
+                   "counts": {"rows": int(len(Kc)), "incomplete": int((~complete).sum()), "saturated": int(sat.sum()),
+                              "unidentified": int(len(fit_rows) - ok[fit_rows].sum()), "usable": int(ok.sum())}}
     return out
 
 
+def _std_bounds(A, U, ch, rows):
+    """The standardized interval bounds (rows x R) of channel ch at the stage-1 margins."""
+    lo, hi = interval_bounds(A[ch][rows], A["N"][ch])
+    a, s = U[ch]["a"][rows][:, None], U[ch]["sigma"][rows][:, None]
+    return (lo - a) / s, (hi - a) / s
+
+
+def group_pairs(A, U):
+    """The nine groups' observation pairs (see the module docstring): per group a list of blocks (channel 1,
+    rows 1, channel 2, rows 2, [prey-world arrays], [predator-world arrays]); every pair is repeated over the
+    replicates (the same r for both members). Rows index the exposed cells (C, S) or the prey snapshots
+    (F). -> (groups, the worlds in index order)."""
+    import numpy as np
+    I, J = A["I"], A["J"]
+    n = len(I)
+    worlds = sorted({p[0] for p in A["prey"]} | {p[0] for p in A["pred"]})
+    wi = {w: k for k, w in enumerate(worlds)}
+    pw = np.array([wi[A["prey"][i][0]] for i in I], int).reshape(n)
+    qw = np.array([wi[A["pred"][j][0]] for j in J], int).reshape(n)
+    a, b = np.triu_indices(n, 1)
+    rowp = (I[a] == I[b]) & (J[a] != J[b])
+    donp = (J[a] == J[b]) & (I[a] != I[b])
+    ok = {ch: U[ch]["ok"] for ch in ("C", "S", "F")}
+    G = {g: [] for g in GROUPS}
+
+    def add(g, c1, r1, c2, r2, prey_w, pred_w):
+        m = ok[c1][r1] & ok[c2][r2]
+        if m.any():
+            G[g].append((c1, r1[m], c2, r2[m], [x[m] for x in prey_w], [x[m] for x in pred_w]))
+    ra, rb = a[rowp], b[rowp]
+    da, db = a[donp], b[donp]
+    add("R_CC", "C", ra, "C", rb, [pw[ra]], [qw[ra], qw[rb]])
+    add("R_SS", "S", ra, "S", rb, [pw[ra]], [qw[ra], qw[rb]])
+    add("R_CS", "C", ra, "S", rb, [pw[ra]], [qw[ra], qw[rb]])
+    add("R_CS", "S", ra, "C", rb, [pw[ra]], [qw[ra], qw[rb]])
+    add("D_CC", "C", da, "C", db, [pw[da], pw[db]], [qw[da]])
+    add("D_SS", "S", da, "S", db, [pw[da], pw[db]], [qw[da]])
+    add("D_CS", "C", da, "S", db, [pw[da], pw[db]], [qw[da]])
+    add("D_CS", "S", da, "C", db, [pw[da], pw[db]], [qw[da]])
+    cr = np.arange(n)
+    add("T_CS", "C", cr, "S", cr, [pw], [qw])
+    add("R_CF", "C", cr, "F", I, [pw], [qw])
+    add("R_SF", "S", cr, "F", I, [pw], [qw])
+    return G, worlds
+
+
+def rho_grid(step=RHO_STEP):
+    """The dependence grid -RHO_MAX .. RHO_MAX (the step must divide 2 RHO_MAX)."""
+    import numpy as np
+    m = int(round(2 * RHO_MAX / step))
+    if m < 4 or abs(m * step - 2 * RHO_MAX) > 1e-9:
+        raise NoiseBankError(f"the grid step {step} does not divide [-{RHO_MAX}, {RHO_MAX}] into at least 4 intervals")
+    return -RHO_MAX + step * np.arange(m + 1)
+
+
+def group_tables(A, U, G, step=RHO_STEP, chunk=40000):
+    """Stage 2's exact contributions: per group and per bootstrap source key, the summed dependence
+    contributions log P(both; rho) - log P(1) - log P(2) at every grid node -> {g: {"keys": [(prey worlds,
+    pred worlds)], "T": keys x nodes, "pairs": n}}."""
+    import numpy as np
+    grid = rho_grid(step)
+    out = {}
+    for g in GROUPS:
+        keys, blocks, npairs = {}, [], 0
+        for c1, r1, c2, r2, prey_w, pred_w in G[g]:
+            l1, h1 = _std_bounds(A, U, c1, r1)
+            l2, h2 = _std_bounds(A, U, c2, r2)
+            kp = np.sort(np.stack(prey_w, 1), 1)
+            kq = np.sort(np.stack(pred_w, 1), 1)
+            kid = np.array([keys.setdefault((tuple(int(x) for x in kp[m]), tuple(int(x) for x in kq[m])), len(keys))
+                            for m in range(len(r1))], int)
+            blocks.append((l1.ravel(), h1.ravel(), l2.ravel(), h2.ravel(), np.repeat(kid, l1.shape[1])))
+            npairs += l1.size
+        T = np.zeros((len(keys), len(grid)))
+        for l1, h1, l2, h2, kid in blocks:
+            for c0 in range(0, len(l1), chunk):
+                sl = slice(c0, c0 + chunk)
+                with np.errstate(divide="ignore"):
+                    base = np.log(_iprob(l1[sl], h1[sl])) + np.log(_iprob(l2[sl], h2[sl]))
+                for m, r in enumerate(grid):
+                    P = bvn_rect(l1[sl], h1[sl], l2[sl], h2[sl], float(r))
+                    v = np.log(np.maximum(P, 1e-300)) - base
+                    T[:, m] += np.bincount(kid[sl], weights=v, minlength=len(keys))
+        out[g] = {"keys": list(keys), "T": T, "pairs": int(npairs)}
+    return out
+
+
+def _cubic(vals, rho, step=RHO_STEP):
+    """The local-cubic interpolant (4 nodes) of grid values at rho (array), rho clamped to the grid."""
+    import numpy as np
+    vals = np.asarray(vals, float)
+    M = len(vals)
+    x = (np.clip(np.asarray(rho, float), -RHO_MAX, RHO_MAX) + RHO_MAX) / step
+    m = np.clip(np.floor(x).astype(int), 1, M - 3)
+    u = x - m
+    v0, v1, v2, v3 = vals[m - 1], vals[m], vals[m + 1], vals[m + 2]
+    return (v0 * (-(u * (u - 1) * (u - 2)) / 6) + v1 * ((u + 1) * (u - 1) * (u - 2) / 2)
+            + v2 * (-(u + 1) * u * (u - 2) / 2) + v3 * ((u + 1) * u * (u - 1) / 6))
+
+
+def _cubic1(vals, rho, step=RHO_STEP):
+    """_cubic for one rho over a Python list (the optimizer's inner loop)."""
+    M = len(vals)
+    x = (min(max(rho, -RHO_MAX), RHO_MAX) + RHO_MAX) / step
+    m = min(max(int(math.floor(x)), 1), M - 3)
+    u = x - m
+    return (vals[m - 1] * (-(u * (u - 1) * (u - 2)) / 6) + vals[m] * ((u + 1) * (u - 1) * (u - 2) / 2)
+            + vals[m + 1] * (-(u + 1) * u * (u - 2) / 2) + vals[m + 2] * ((u + 1) * u * (u - 1) / 6))
+
+
+def _argmax(vals, step=RHO_STEP, sub=50):
+    import numpy as np
+    fine = np.linspace(-RHO_MAX, RHO_MAX, (len(vals) - 1) * sub + 1)
+    f = _cubic(vals, fine, step)
+    k = int(np.argmax(f))
+    return float(fine[k]), float(f[k])
+
+
+# ================================================================== components from the nine groups
+def components_of(r):
+    """The nine group correlations -> (SigmaR, SigmaD, SigmaE, feasible, problems); SigmaR[F, F] by the
+    minimal-feasible CONVENTION v' A^+ v."""
+    import numpy as np
+    rC, rS, rCS = r["R_CC"], r["R_SS"], r["R_CS"]
+    dC, dS, dCS = r["D_CC"], r["D_SS"], r["D_CS"]
+    eC, eS = 1.0 - rC - dC, 1.0 - rS - dS
+    eCS = r["T_CS"] - rCS - dCS
+    A = np.array([[rC, rCS], [rCS, rS]], float)
+    v = np.array([r["R_CF"], r["R_SF"]], float)
+    Ap = np.linalg.pinv(A, rcond=1e-12)
+    FF = float(v @ Ap @ v)
+    SR = np.array([[rC, rCS, v[0]], [rCS, rS, v[1]], [v[0], v[1], FF]])
+    SD = np.array([[dC, dCS], [dCS, dS]])
+    SE = np.array([[eC, eCS], [eCS, eS]])
+    prob = []
+    for name, M in (("the C-S row block", A), ("SigmaD", SD), ("SigmaE", SE)):
+        if np.min(np.linalg.eigvalsh(M)) < -FEAS_TOL:
+            prob.append(f"{name} is not PSD")
+    if np.linalg.norm(A @ Ap @ v - v) > 1e-9 * max(1.0, float(np.linalg.norm(v))):
+        prob.append("the free row covariances are outside the C-S row block's range")
+    if FF > 1 + FEAS_TOL:
+        prob.append(f"the free row convention {FF:.4f} exceeds the unit free variance")
+    if np.min(np.linalg.eigvalsh(SR)) < -1e-9:
+        prob.append("SigmaR is not PSD")
+    return SR, SD, SE, not prob, prob
+
+
+def _theta_map(th):
+    """The PSD parametrization (9 angles) -> the nine group correlations (every point feasible)."""
+    pC1, pC2, pS1, pS2, psR, psD, psE, om, ta = th
+    rC, dC, eC = math.cos(pC1) ** 2, math.sin(pC1) ** 2 * math.cos(pC2) ** 2, math.sin(pC1) ** 2 * math.sin(pC2) ** 2
+    rS, dS, eS = math.cos(pS1) ** 2, math.sin(pS1) ** 2 * math.cos(pS2) ** 2, math.sin(pS1) ** 2 * math.sin(pS2) ** 2
+    cR, cD, cE = math.sin(psR), math.sin(psD), math.sin(psE)
+    rCS, dCS, eCS = cR * math.sqrt(rC * rS), cD * math.sqrt(dC * dS), cE * math.sqrt(eC * eS)
+    lr = math.sin(om)
+    l0, l1 = lr * math.cos(ta), lr * math.sin(ta)
+    vC = math.sqrt(rC) * l0
+    vS = cR * math.sqrt(rS) * l0 + math.sqrt(rS) * math.sqrt(max(0.0, 1 - cR * cR)) * l1
+    return {"R_CC": rC, "R_SS": rS, "R_CS": rCS, "D_CC": dC, "D_SS": dS, "D_CS": dCS, "T_CS": rCS + dCS + eCS,
+            "R_CF": vC, "R_SF": vS}
+
+
+def _theta_start(r):
+    """The projection of (possibly infeasible) group values onto the parametrization's angles."""
+    def shares(x, y):
+        v = [max(x, 0.0), max(y, 0.0), max(1.0 - x - y, 0.0)]
+        s = sum(v) or 1.0
+        return [q / s for q in v]
+    rC, dC, eC = shares(r["R_CC"], r["D_CC"])
+    rS, dS, eS = shares(r["R_SS"], r["D_SS"])
+
+    def ang(rr, dd, ee):
+        p1 = math.acos(min(1.0, math.sqrt(rr)))
+        p2 = math.acos(min(1.0, math.sqrt(dd / (dd + ee)))) if dd + ee > 0 else 0.0
+        return p1, p2
+
+    def corr(c, x, y):
+        return math.asin(max(-1.0, min(1.0, c / math.sqrt(x * y)))) if x * y > 1e-15 else 0.0
+    pC1, pC2 = ang(rC, dC, eC)
+    pS1, pS2 = ang(rS, dS, eS)
+    psR, psD = corr(r["R_CS"], rC, rS), corr(r["D_CS"], dC, dS)
+    psE = corr(r["T_CS"] - r["R_CS"] - r["D_CS"], eC, eS)
+    cR = math.sin(psR)
+    l0 = r["R_CF"] / math.sqrt(rC) if rC > 1e-15 else 0.0
+    den = math.sqrt(rS) * math.sqrt(max(0.0, 1 - cR * cR))
+    l1 = (r["R_SF"] - cR * math.sqrt(rS) * l0) / den if den > 1e-12 else 0.0
+    nrm = math.hypot(l0, l1)
+    if nrm > 1:
+        l0, l1, nrm = l0 / nrm, l1 / nrm, 1.0
+    return [pC1, pC2, pS1, pS2, psR, psD, psE, math.asin(nrm), math.atan2(l1, l0)]
+
+
+def nelder_mead(f, x0, step=0.1, max_iter=6000, ftol=1e-12, xtol=1e-10):
+    """A plain deterministic Nelder-Mead MINIMIZER (no scipy)."""
+    n = len(x0)
+    pts = [list(x0)] + [[x0[j] + (step if j == i else 0.0) for j in range(n)] for i in range(n)]
+    val = [f(p) for p in pts]
+    for _ in range(max_iter):
+        order = sorted(range(n + 1), key=lambda k: val[k])
+        pts, val = [pts[k] for k in order], [val[k] for k in order]
+        if abs(val[-1] - val[0]) <= ftol * (1 + abs(val[0])) and \
+                max(abs(pts[k][j] - pts[0][j]) for k in range(1, n + 1) for j in range(n)) <= xtol:
+            break
+        cen = [sum(p[j] for p in pts[:-1]) / n for j in range(n)]
+        xr = [cen[j] + (cen[j] - pts[-1][j]) for j in range(n)]
+        fr = f(xr)
+        if fr < val[0]:
+            xe = [cen[j] + 2 * (cen[j] - pts[-1][j]) for j in range(n)]
+            fe = f(xe)
+            pts[-1], val[-1] = (xe, fe) if fe < fr else (xr, fr)
+        elif fr < val[-2]:
+            pts[-1], val[-1] = xr, fr
+        else:
+            xc = [cen[j] + 0.5 * (pts[-1][j] - cen[j]) for j in range(n)]
+            fc = f(xc)
+            if fc < val[-1]:
+                pts[-1], val[-1] = xc, fc
+            else:
+                for k in range(1, n + 1):
+                    pts[k] = [pts[0][j] + 0.5 * (pts[k][j] - pts[0][j]) for j in range(n)]
+                    val[k] = f(pts[k])
+    k = min(range(n + 1), key=lambda i: val[i])
+    return pts[k], val[k]
+
+
+def fit_dependence(obj, step=RHO_STEP):
+    """Stage 2 from per-group grid objectives {g: values at the nodes} -> {"rho": the nine values, "fit":
+    "unconstrained" | "constrained", "loglik", "SigmaR", "SigmaD", "SigmaE", "unconstrained": the group
+    maxima, "problems": their infeasibilities}."""
+    un = {g: _argmax(obj[g], step)[0] for g in GROUPS}
+    SR, SD, SE, feas, prob = components_of(un)
+    lists = {g: [float(v) for v in obj[g]] for g in GROUPS}
+    if feas:
+        rho, how = un, "unconstrained"
+    else:
+        def negll(th):
+            r = _theta_map(th)
+            return -sum(_cubic1(lists[g], r[g], step) for g in GROUPS)
+        best = _theta_start(un)
+        fbest = negll(best)
+        for _ in range(3):                                    # (restarts from the best point)
+            x, fx = nelder_mead(negll, best, step=0.15)
+            if fx < fbest - 1e-12:
+                best, fbest = x, fx
+            else:
+                break
+        rho, how = _theta_map(best), "constrained"
+        SR, SD, SE, feas2, prob2 = components_of(rho)
+        if not feas2:                                         # (feasible by construction: a numerical edge)
+            raise NoiseBankError(f"the constrained fit is infeasible: {prob2}")
+    ll = sum(_cubic1(lists[g], rho[g], step) for g in GROUPS)
+    return {"rho": rho, "fit": how, "loglik": ll, "SigmaR": SR, "SigmaD": SD, "SigmaE": SE,
+            "unconstrained": un, "problems": prob}
+
+
+# ================================================================== s(mu)
 def pava(x, w, increasing=True):
-    """Weighted isotonic regression (pool adjacent violators) of x (in order) -> the fitted values."""
+    """Weighted isotonic regression (pool adjacent violators) of x (in order) -> (fitted values, the blocks
+    [(start, stop)])."""
     import numpy as np
     vals = np.asarray(x, float) if increasing else -np.asarray(x, float)
     out = []
-    for v, wt in zip(vals, np.asarray(w, float)):
-        out.append([v, wt, 1])
+    for k, (v, wt) in enumerate(zip(vals, np.asarray(w, float))):
+        out.append([v, wt, k, k + 1])
         while len(out) > 1 and out[-2][0] > out[-1][0]:
-            v2, w2, n2 = out.pop()
-            v1, w1, n1 = out.pop()
-            out.append([(v1 * w1 + v2 * w2) / (w1 + w2), w1 + w2, n1 + n2])
-    fit = np.concatenate([np.full(n, v) for v, _, n in out]) if out else np.zeros(0)
-    return fit if increasing else -fit
+            v2, w2, _, e2 = out.pop()
+            v1, w1, s1, _ = out.pop()
+            out.append([(v1 * w1 + v2 * w2) / (w1 + w2), w1 + w2, s1, e2])
+    fit = np.concatenate([np.full(e - s, v) for v, _, s, e in out]) if out else np.zeros(0)
+    return (fit if increasing else -fit), [(s, e) for _, _, s, e in out]
 
 
-def fit_scale(mu, var, ch, mode="bins", direction="auto"):
-    """s(mu) for one channel from the cells' means and total latent variances. mode "bins": H.9.2's
-    registered bins (the root mean variance per bin, a step function). mode "monotone": a monotone function
-    of the LATENT location logit(mu): the isotonic fit of the variances in logit(mu) (direction "increasing" /
-    "decreasing" / "auto": the better of the two in squared error), linear between the fitted blocks'
-    centres, constant beyond. The bins are the special case of a step function with knots at the bin
-    edges, so either registration remains open. -> {"mode", knots / edges, "s", "eval": mu -> s}."""
+def fit_scale(mu, var, weights=None):
+    """D4's s(mu) for one channel (see the module docstring): the tie-pooled isotonic regression of var on
+    logit(mu), one knot per plateau (its weighted mean location) with sqrt(its variance) -> a noisescale
+    curve with "direction", "support", "cells", "blocks"; None without usable cells."""
     import numpy as np
     mu, var = np.asarray(mu, float), np.asarray(var, float)
-    ok = np.isfinite(mu) & np.isfinite(var) & (mu > 0) & (mu < 1)
-    mu, var = mu[ok], var[ok]
-    if mode == "bins":
-        lo, hi = BINS[ch]
-        b = np.where(mu < lo, 0, np.where(mu < hi, 1, 2))
-        s = [float(np.sqrt(np.mean(var[b == k]))) if np.any(b == k) else None for k in range(3)]
-
-        def ev(m, s=s, lo=lo, hi=hi):
-            m = np.asarray(m, float)
-            return np.where(m < lo, s[0], np.where(m < hi, s[1], s[2]))
-        return {"mode": "bins", "edges": [lo, hi], "s": s, "eval": ev}
+    w = np.ones(len(mu)) if weights is None else np.asarray(weights, float)
+    ok = np.isfinite(mu) & np.isfinite(var) & (mu > 0) & (mu < 1) & (w > 0)
+    mu, var, w = mu[ok], var[ok], w[ok]
+    if not len(mu):
+        return None
     x = np.log(mu / (1 - mu))
-    o = np.argsort(x, kind="stable")
-    xs, vs = x[o], var[o]
+    ux, inv = np.unique(x, return_inverse=True)                         # (tied locations pooled)
+    W = np.bincount(inv, weights=w, minlength=len(ux))
+    V = np.bincount(inv, weights=w * var, minlength=len(ux)) / W
     fits = {}
-    for d in (("decreasing", "increasing") if direction == "auto" else (direction,)):
-        f = pava(vs, np.ones(len(vs)), increasing=(d == "increasing"))
-        fits[d] = (float(np.sum((vs - f) ** 2)), f)
+    for d in ("decreasing", "increasing"):
+        f, _ = pava(V, W, increasing=(d == "increasing"))
+        fits[d] = (float(np.sum(W * (V - f) ** 2)), f)
     d = min(fits, key=lambda k: (fits[k][0], k))
     f = fits[d][1]
-    ks, kv = [], []
-    for v in np.unique(f):                                     # (each fitted block: its centre and value)
-        sel = f == v
-        ks.append(float(np.mean(xs[sel])))
-        kv.append(float(np.sqrt(v)))
-    order = np.argsort(ks)
-    ks, kv = [ks[k] for k in order], [kv[k] for k in order]
-
-    def ev(m, ks=ks, kv=kv):
-        m = np.clip(np.asarray(m, float), 1e-12, 1 - 1e-12)
-        return np.interp(np.log(m / (1 - m)), ks, kv)
-    return {"mode": "monotone", "direction": d, "x": ks, "s": kv, "eval": ev}
-
-
-def bins_scale(bank_noise):
-    """s(ch, mu) from a bank noise block's binned s (the default registration)."""
-    import numpy as np
-
-    def sfun(ch, mu):
-        s = bank_noise["s"][ch]
-        lo, hi = BINS[ch]
-        mu = np.asarray(mu, float)
-        return np.where(mu < lo, s[0], np.where(mu < hi, s[1], s[2]))
-    return sfun
-
-
-def cov_parts(bank_noise, kind, structure, means, R=6, scale=None):
-    """THE PRODUCTION V BUILDER (Annex H.3.1): the bank covariance of one block's replicate means as (d, U),
-    V = diag(d) + U U' (recurrence.Cov(d, U)), from the bank's components and s(mu) evaluated at the means
-    GIVEN EXPLICITLY. `means` is the registration's choice (the raw replicate means or the null-model fitted
-    means): the builder never chooses. kind "C" / "RC" (capture: rows share a prey key and a predator key)
-    or "Q" / "RQ" (exposed survival minus its prey snapshot's free control: rows share the prey snapshot's
-    row and free components and the predator key). structure: {"prey": per-row prey-key index, "pred":
-    per-row predator-key index, "n_prey", "n_pred"}; means: {"C": per row} or {"S": per row, "F": per prey
-    key}; scale: s(ch, mu) (default: the bank's binned s). The construction is calib.Panel.cov's."""
-    import numpy as np
-    SR, SD = np.asarray(bank_noise["SigmaR"], float), np.asarray(bank_noise["SigmaD"], float)
-    sfun = scale or bins_scale(bank_noise)
-    pi, pj = np.asarray(structure["prey"], int), np.asarray(structure["pred"], int)
-    rows = np.arange(len(pi))
-
-    def g(ch, x, n):
-        x = np.clip(np.asarray(x, float), 0.5 / n, 1 - 0.5 / n)
-        return sfun(ch, x) * x * (1 - x)
-    if kind in ("C", "RC"):
-        gg = g("C", means["C"], bank_noise["capture_bound"])
-        d = gg ** 2 * (1 - SR[0, 0] - SD[0, 0]) / R
-        U1 = np.zeros((len(rows), structure["n_prey"]))
-        U1[rows, pi] = gg * math.sqrt(SR[0, 0] / R)
-        U2 = np.zeros((len(rows), structure["n_pred"]))
-        U2[rows, pj] = gg * math.sqrt(SD[0, 0] / R)
-        return d, np.hstack([U1, U2])
-    gS = g("S", means["S"], N_PREY)
-    gF = g("F", np.asarray(means["F"], float)[pi], N_PREY)
-    L = np.linalg.cholesky(np.array([[SR[1, 1], SR[1, 2]], [SR[1, 2], SR[2, 2]]]) + 1e-15 * np.eye(2))
-    eF = 1 - SR[2, 2]
-    d = gS ** 2 * (1 - SR[1, 1] - SD[1, 1]) / R
-    nuk = structure["n_prey"]
-    M = np.zeros((len(rows), 3 * nuk))
-    M[rows, 3 * pi] = (gS * L[0, 0] - gF * L[1, 0]) / math.sqrt(R)
-    M[rows, 3 * pi + 1] = (-gF * L[1, 1]) / math.sqrt(R)
-    M[rows, 3 * pi + 2] = (-gF * math.sqrt(eF)) / math.sqrt(R)
-    Md = np.zeros((len(rows), structure["n_pred"]))
-    Md[rows, pj] = gS * math.sqrt(SD[1, 1] / R)
-    return d, np.hstack([M, Md])
-
-
-def scales(A, keep=None):
-    """s(mu) per registered mean bin and channel (the root mean of the cells' total latent variances in
-    the bin), the per-cell (mean, SD) curve, and map.py's shrinkage prior nu0 per channel."""
-    import numpy as np
-    R = A["R"]
-    out = {"s": {}, "curve": {}, "nu0": {}, "bins": {k: list(v) for k, v in BINS.items()}}
-    for ch, m in (("C", A["mC"]), ("S", A["mS"]), ("F", A["mF"])):
-        z = A["z" + ch]
-        ok = np.isfinite(z).all(axis=1) & np.isfinite(m)
-        if keep is not None and ch != "F":
-            ok &= keep
-        var = np.var(z[ok], axis=1, ddof=1)
-        mm = m[ok]
-        lo, hi = BINS[ch]
-        b = np.where(mm < lo, 0, np.where(mm < hi, 1, 2))
-        s = fit_scale(mm, var, ch, "bins")["s"]
-        fm = fit_scale(mm, var, ch, "monotone")
-        out["s"][ch] = s
-        out.setdefault("monotone", {})[ch] = {"direction": fm["direction"], "logit_knots": fm["x"], "s": fm["s"]}
-        out["curve"][ch] = sorted([float(a), float(math.sqrt(c))] for a, c in zip(mm, var))
-        # nu0: the excess dispersion of log s^2 around its bin value over the (R - 1)-df sampling dispersion
-        fit = np.array([s[k] ** 2 if s[k] else np.nan for k in b])
-        lr = np.log(var / fit)
-        good = np.isfinite(lr)
-        samp = _trigamma((R - 1) / 2.0)
-        excess = float(np.var(lr[good], ddof=1) - samp) if good.sum() > 2 else float("nan")
-        out["nu0"][ch] = {"excess_log_variance": excess,
-                          "nu0": (float("inf") if not excess > 0 else 2.0 / excess)}
-    return out
+    starts = [0] + [i for i in range(1, len(f)) if f[i] != f[i - 1]]      # (the plateaus)
+    blocks = list(zip(starts, starts[1:] + [len(f)]))
+    kx = [float(np.sum(W[s:e] * ux[s:e]) / np.sum(W[s:e])) for s, e in blocks]
+    ks = [float(math.sqrt(max(f[s], 0.0))) for s, e in blocks]
+    if min(ks) <= 0:
+        return None
+    curve = {"x": kx, "s": ks, "direction": d, "support": [float(ux[0]), float(ux[-1])], "cells": int(len(mu)),
+             "blocks": len(blocks), "extrapolation": "constant beyond the outermost knots (an assumption beyond "
+                                                     "the bank's support, not an estimate)"}
+    return noisescale.check_curve(curve)
 
 
 def _trigamma(x):
-    """psi'(x) for x > 0 (recurrence then the asymptotic series)."""
+    """psi'(x) for x > 0: the recurrence up to x >= 10, then the asymptotic series through x^-15 (relative error
+    below 1e-13, so no visible jump where the recurrence count changes)."""
     acc = 0.0
-    while x < 6.0:
+    while x < 10.0:
         acc += 1.0 / (x * x)
         x += 1.0
     t = 1.0 / (x * x)
-    return acc + 1.0 / x + t / 2.0 + t / x * (1.0 / 6.0 - t * (1.0 / 30.0 - t / 42.0))
+    tail = 1 / 6 + t * (-1 / 30 + t * (1 / 42 + t * (-1 / 30 + t * (5 / 66 + t * (-691 / 2730 + t * 7 / 6)))))
+    return acc + 1.0 / x + t / 2.0 + t / x * tail
 
 
-def estimate(doc, boot=BOOT, seed=0):
-    """The bank per horizon: components (all unsaturated cells), scales, saturation counts, the world-cluster
-    bootstrap intervals of the shares, and the generator noise block / map prior at the production 5k
-    horizon."""
+def inv_trigamma(y):
+    """x > 0 with trigamma(x) = y (> 0; trigamma is decreasing): bisection on log x."""
+    lo, hi = -30.0, 30.0
+    for _ in range(200):
+        mid = 0.5 * (lo + hi)
+        if _trigamma(math.exp(mid)) > y:
+            lo = mid
+        else:
+            hi = mid
+    return math.exp(0.5 * (lo + hi))
+
+
+def nu0_of(mu, sigma, var_t, curve):
+    """map.py's prior degrees of freedom (see the module docstring), explicitly encoded."""
     import numpy as np
+    mu, sigma, var_t = (np.asarray(x, float) for x in (mu, sigma, var_t))
+    ok = np.isfinite(mu) & np.isfinite(sigma) & np.isfinite(var_t)
+    if curve is None:
+        return {"status": "unavailable", "reason": "no s(mu) curve"}
+    if ok.sum() < 3:
+        return {"status": "unavailable", "reason": f"{int(ok.sum())} usable cells (3 needed)"}
+    s = noisescale.evaluate(curve, mu[ok])
+    lr = np.log(sigma[ok] ** 2) - np.log(s ** 2)
+    samp = float(np.mean(4.0 * var_t[ok]))
+    excess = float(np.var(lr, ddof=1) - samp)
+    rec = {"excess_log_variance": excess, "sampling_log_variance": samp, "cells": int(ok.sum())}
+    if not excess > 0:
+        return dict(rec, status="full_pooling")
+    return dict(rec, status="estimated", nu0=2.0 * inv_trigamma(excess))
+
+
+# ================================================================== the estimate
+def pick_weights(keys, m, mp):
+    """The crossed bootstrap's pair weights: the product of the prey-role (m) and predator-role (mp)
+    multiplicities over a key's sources."""
+    import numpy as np
+    return np.array([math.prod(int(m[a]) for a in kp) * math.prod(int(mp[b]) for b in kq) for kp, kq in keys], float)
+
+
+BOOT_NAMES = ("R_CC", "R_SS", "R_CS", "R_CF", "R_SF", "D_CC", "D_SS", "D_CS", "E_CC", "E_SS", "E_CS")
+
+
+def _entries(f):
+    SR, SD, SE = f["SigmaR"], f["SigmaD"], f["SigmaE"]
+    return [SR[0, 0], SR[1, 1], SR[0, 1], SR[0, 2], SR[1, 2], SD[0, 0], SD[1, 1], SD[0, 1], SE[0, 0], SE[1, 1], SE[0, 1]]
+
+
+def bootstrap(tab, n_worlds, boot, seed, step=RHO_STEP):
+    """The crossed world bootstrap (see the module docstring) -> (draws x BOOT_NAMES array, failed draws)."""
+    import numpy as np
+    rng = np.random.default_rng(seed)
+    out, failed = [], 0
+    for _ in range(boot):
+        m = np.bincount(rng.integers(0, n_worlds, n_worlds), minlength=n_worlds)
+        mp = np.bincount(rng.integers(0, n_worlds, n_worlds), minlength=n_worlds)
+        ob = {}
+        for g in GROUPS:
+            w = pick_weights(tab[g]["keys"], m, mp)
+            if not w.any():
+                ob = None
+                break
+            ob[g] = w @ tab[g]["T"]
+        if ob is None:
+            failed += 1
+            continue
+        try:
+            out.append(_entries(fit_dependence(ob, step)))
+        except NoiseBankError:
+            failed += 1
+    return np.array(out, float).reshape(len(out), len(BOOT_NAMES)), failed
+
+
+def horizon_estimate(A, boot=BOOT, seed=0, step=RHO_STEP):
+    """One horizon: the usable channels, the s(mu) curves and nu0, the nine groups, the components (or
+    "unavailable" with reasons), the crossed world bootstrap."""
+    import numpy as np
+    U = usable(A)
+    rec = {"capture_bound": A["N"]["C"], "replicates": A["R"], "incomplete_cells": A["incomplete_cells"],
+           "channels": {ch: U[ch]["counts"] for ch in ("C", "S", "F")}, "scales": {}, "nu0": {}, "curve_points": {}}
+    for ch in ("C", "S", "F"):
+        ok = U[ch]["ok"]
+        cv = fit_scale(U[ch]["mu"][ok], U[ch]["sigma"][ok] ** 2)
+        rec["scales"][ch] = cv
+        rec["nu0"][ch] = nu0_of(U[ch]["mu"][ok], U[ch]["sigma"][ok], U[ch]["var_t"][ok], cv)
+        rec["curve_points"][ch] = sorted([float(a), float(b)] for a, b in zip(U[ch]["mu"][ok], U[ch]["sigma"][ok]))
+    G, worlds = group_pairs(A, U)
+    rec["worlds"] = worlds
+    reasons = [f"no {g} pairs" for g in GROUPS if not G[g]]
+    if reasons:
+        rec.update(status="unavailable", reasons=reasons, components=None, bootstrap=None)
+        return rec
+    tab = group_tables(A, U, G, step)
+    obj = {g: tab[g]["T"].sum(axis=0) for g in GROUPS}
+    groups = {}
+    for g in GROUPS:
+        r_hat, _ = _argmax(obj[g], step)
+        d2 = float(_cubic(obj[g], r_hat + step, step) - 2 * _cubic(obj[g], r_hat, step)
+                   + _cubic(obj[g], r_hat - step, step)) / step ** 2
+        per = -d2 / tab[g]["pairs"]
+        groups[g] = {"pairs": tab[g]["pairs"], "rho_max": r_hat, "curvature_per_pair": per,
+                     "at_grid_edge": abs(r_hat) >= RHO_MAX - 1e-12}
+        if not per >= INFO_MIN:
+            reasons.append(f"{g} is unidentified (curvature per pair {per:.3g} < {INFO_MIN})")
+    rec["groups"] = groups
+    if reasons:
+        rec.update(status="unavailable", reasons=reasons, components=None, bootstrap=None)
+        return rec
+    fit = fit_dependence(obj, step)
+    rec["components"] = {"SigmaR": fit["SigmaR"].tolist(), "SigmaD": fit["SigmaD"].tolist(),
+                         "SigmaE": fit["SigmaE"].tolist(), "fit": fit["fit"], "loglik": fit["loglik"],
+                         "unconstrained_problems": fit["problems"],
+                         "SigmaR_FF": {"value": float(fit["SigmaR"][2, 2]), "status": "convention",
+                                       "rule": "the minimal feasible free row variance v' A^+ v: one control per "
+                                               "row leaves the free row / control split unidentified"},
+                         "shares": {ch: {"row": float(fit["SigmaR"][k, k]), "donor": float(fit["SigmaD"][k, k]),
+                                         "cell": float(fit["SigmaE"][k, k])} for k, ch in enumerate("CS")}}
+    D, failed = bootstrap(tab, len(worlds), boot, seed, step)
+    rec["bootstrap"] = {"draws": boot, "failed": failed, "unit": "crossed world (pigeonhole)",
+                        "ci95": ({n: [float(np.percentile(D[:, k], 2.5)), float(np.percentile(D[:, k], 97.5))]
+                                  for k, n in enumerate(BOOT_NAMES)} if len(D) else None)}
+    rec.update(status="ok", reasons=[])
+    return rec
+
+
+def estimate(doc, boot=BOOT, seed=0, step=RHO_STEP, replicates=None):
+    """The bank: per horizon (horizon_estimate); the generator noise block and map.py's prior at the
+    production 5k horizon (available only when its components and all three curves are)."""
     if doc.get("schema") != OBS_SCHEMA:
         raise NoiseBankError(f"observations schema {doc.get('schema')!r}")
+    if not isinstance(boot, int) or isinstance(boot, bool) or boot < 1:
+        raise NoiseBankError(f"bootstrap draws must be a positive integer (got {boot!r})")
     obs = doc["observations"]
     out = {"schema": BANK_SCHEMA, "obs_design_sha256": doc.get("design_sha256"), "plan_sha256": doc.get("plan_sha256"),
-           "horizons": {}}
+           "estimator": {"rho_step": step, "rho_max": RHO_MAX, "saturation": list(SATURATION), "sigma_min": SIGMA_MIN,
+                         "info_min": INFO_MIN, "boot": boot, "seed": seed}, "horizons": {}}
     for h in HORIZONS:
         A = arrays(obs, h)
-        sat = (A["mC"] < SATURATION[0]) | (A["mC"] > SATURATION[1]) | (A["mS"] < SATURATION[0]) | (A["mS"] > SATURATION[1])
-        keep = ~sat
-        comp = components(A, keep)
-        sc = scales(A, keep)
-        worlds = sorted({p[0] for p in A["prey"]} | {p[0] for p in A["pred"]})
-        rng = np.random.default_rng(seed)
-        draws = []
-        for _ in range(boot):
-            pick = rng.choice(len(worlds), len(worlds), replace=True)
-            w = {worlds[k] for k in pick}
-            m = keep & np.array([A["prey"][i][0] in w and A["pred"][j][0] in w for i, j in zip(A["I"], A["J"])])
-            c = components(A, m)
-            draws.append([c["shares"][ch][k] for ch in "CS" for k in ("row", "donor", "cell")])
-        D = np.array(draws, float)
-        names = [f"{ch}.{k}" for ch in "CS" for k in ("row", "donor", "cell")]
-        ci = {n: [float(np.nanpercentile(D[:, k], 2.5)), float(np.nanpercentile(D[:, k], 97.5))]
-              for k, n in enumerate(names)}
-        out["horizons"][str(h)] = dict(comp, scales=sc, saturated=int(sat.sum()), cells_total=int(len(sat)),
-                                       capture_bound=capture_bound(h), bootstrap={"draws": boot, "ci95": ci,
-                                                                                  "unit": "world cluster"})
+        if replicates is not None and A["R"] != replicates:
+            raise NoiseBankError(f"{A['R']} replicates; {replicates} are registered")
+        out["horizons"][str(h)] = horizon_estimate(A, boot, seed, step)
     base = out["horizons"][str(HORIZONS[0])]
-    out["generator_noise"] = {"s": base["scales"]["s"], "s_monotone": base["scales"]["monotone"],
-                              "SigmaR": base["SigmaR"], "SigmaD": base["SigmaD"], "SigmaE": base["SigmaE"],
-                              "horizon": HORIZONS[0], "capture_bound": capture_bound(HORIZONS[0])}
-    out["map_variance"] = {"s": base["scales"]["s"], "bins": base["scales"]["bins"], "nu0": base["scales"]["nu0"],
-                           "rule": "replicate-mean variance (nu0 s(mu)^2 + (R - 1) s_obs^2) / (nu0 + R - 1) / R"}
+    why = list(base.get("reasons") or []) + [f"no {ch} curve" for ch in ("C", "S", "F") if base["scales"][ch] is None]
+    if why:
+        out["generator_noise"] = {"available": False, "reasons": why}
+    else:
+        c = base["components"]
+        out["generator_noise"] = {"available": True,
+                                  "s_logit": {ch: {k: base["scales"][ch][k] for k in ("x", "s", "direction")}
+                                              for ch in ("C", "S", "F")},
+                                  "SigmaR": c["SigmaR"], "SigmaD": c["SigmaD"], "SigmaE": c["SigmaE"],
+                                  "horizon": HORIZONS[0], "capture_bound": capture_bound(HORIZONS[0])}
+    out["map_variance"] = {"s_logit": out["generator_noise"].get("s_logit"), "nu0": base["nu0"],
+                           "rule": "replicate-mean variance (nu0 s(mu)^2 + (R - 1) s_obs^2) / (nu0 + R - 1) / R; "
+                                   "full_pooling: s(mu)^2 / R"}
     return out
+
+
+# ================================================================== THE PRODUCTION V BUILDER
+def _psd_factor(M):
+    """F with F F' = M for a PSD M (the eigen square root; a singular M is allowed)."""
+    import numpy as np
+    w, V = np.linalg.eigh(np.asarray(M, float))
+    if np.min(w) < -1e-12:
+        raise NoiseBankError("a bank covariance component is not PSD")
+    return V * np.sqrt(np.clip(w, 0.0, None))
+
+
+def cov_parts(bank_noise, kind, structure, means, R=6):
+    """THE PRODUCTION V BUILDER (Annex H.3.1): the bank covariance of one block's replicate means as (d, U),
+    V = diag(d) + U U' (recurrence.Cov(d, U)), from the bank's components and its s(mu) curves (the D4
+    registration, noisescale.evaluate), at the means GIVEN EXPLICITLY (the registration's choice: D4's
+    null-model fitted means). The LINEARIZED (delta-method) covariance, g(mu) = s(mu) mu (1 - mu) (see the
+    module docstring). kind "C" / "RC" (capture: rows share a prey key and a predator key) or "Q" / "RQ"
+    (exposed survival minus its prey snapshot's free control: rows share the prey snapshot's row and free
+    components and the predator key). structure: {"prey": per-row prey-key index, "pred": per-row
+    predator-key index, "n_prey", "n_pred"}; means: {"C": per row} or {"S": per row, "F": per prey key}."""
+    import numpy as np
+    if kind not in KINDS:
+        raise NoiseBankError(f"covariance kind {kind!r} (one of {KINDS})")
+    if not isinstance(R, int) or isinstance(R, bool) or R < 1:
+        raise NoiseBankError(f"replicates must be a positive integer (got {R!r})")
+    try:
+        curves = noisescale.check_set(bank_noise.get("s_logit"))
+    except noisescale.ScaleError as e:
+        raise NoiseBankError(f"the bank's s(mu): {e}")
+    SR, SD, SE = (np.asarray(bank_noise[k], float) for k in ("SigmaR", "SigmaD", "SigmaE"))
+    pi, pj = np.asarray(structure["prey"], int), np.asarray(structure["pred"], int)
+    n = len(pi)
+    if len(pj) != n or (n and (pi.min() < 0 or pi.max() >= structure["n_prey"] or pj.min() < 0
+                                or pj.max() >= structure["n_pred"])):
+        raise NoiseBankError("structure: prey / predator indices outside their key counts, or of unequal length")
+    rows = np.arange(n)
+
+    def g(ch, x, N):
+        x = np.clip(np.asarray(x, float), 0.5 / N, 1 - 0.5 / N)
+        return noisescale.evaluate(curves[ch], x) * x * (1 - x)
+    if kind in ("C", "RC"):
+        mC = np.asarray(means["C"], float)
+        if len(mC) != n:
+            raise NoiseBankError("means: one capture mean per row")
+        gg = g("C", mC, bank_noise["capture_bound"])
+        d = gg ** 2 * SE[0, 0] / R
+        U1 = np.zeros((n, structure["n_prey"]))
+        U1[rows, pi] = gg * math.sqrt(max(SR[0, 0], 0.0) / R)
+        U2 = np.zeros((n, structure["n_pred"]))
+        U2[rows, pj] = gg * math.sqrt(max(SD[0, 0], 0.0) / R)
+        return d, np.hstack([U1, U2])
+    mS, mF = np.asarray(means["S"], float), np.asarray(means["F"], float)
+    if len(mS) != n or len(mF) != structure["n_prey"]:
+        raise NoiseBankError("means: one exposed survival mean per row and one free mean per prey key")
+    gS = g("S", mS, N_PREY)
+    gF = g("F", mF[pi], N_PREY)
+    Fm = _psd_factor([[SR[1, 1], SR[1, 2]], [SR[1, 2], SR[2, 2]]])
+    eF = 1.0 - SR[2, 2]
+    if eF < -1e-12:
+        raise NoiseBankError("the free row variance exceeds the unit free variance")
+    d = gS ** 2 * SE[1, 1] / R
+    nuk = structure["n_prey"]
+    M = np.zeros((n, 3 * nuk))
+    M[rows, 3 * pi] = (gS * Fm[0, 0] - gF * Fm[1, 0]) / math.sqrt(R)
+    M[rows, 3 * pi + 1] = (gS * Fm[0, 1] - gF * Fm[1, 1]) / math.sqrt(R)
+    M[rows, 3 * pi + 2] = (-gF * math.sqrt(max(eF, 0.0))) / math.sqrt(R)
+    Md = np.zeros((n, structure["n_pred"]))
+    Md[rows, pj] = gS * math.sqrt(max(SD[1, 1], 0.0) / R)
+    return d, np.hstack([M, Md])
 
 
 # ================================================================== CLI
@@ -587,6 +1254,7 @@ def main(argv=None):
     s.add_argument("--avoid", nargs="+", default=[])
     s.add_argument("--seed-namespace", default=SEED_NAMESPACE)
     s.add_argument("--validation-dir", required=True)
+    s.add_argument("--main-registry", nargs="+", default=[], help="the main study's worlds registries (mandatory)")
     s.add_argument("--arena", required=True)
     s.add_argument("--out", required=True)
     s = sub.add_parser("collect")
@@ -603,7 +1271,8 @@ def main(argv=None):
     try:
         if a.cmd == "plan":
             d = make_design(rqlib.read_json(a.block), [os.path.abspath(t) for t in a.templates],
-                            os.path.abspath(a.age_reference), a.avoid, a.seed_namespace, a.validation_dir, a.arena)
+                            os.path.abspath(a.age_reference), a.avoid, a.seed_namespace, a.validation_dir, a.arena,
+                            a.main_registry)
             rqlib.write_json_durable(a.out, d)
             print(json.dumps({k: d["noisebank"][k] for k in ("worlds", "cells", "predator_trajectories",
                                                             "free_trajectories")}))
@@ -612,9 +1281,13 @@ def main(argv=None):
             rqlib.write_json_durable(a.out, doc)
             print(f"{len(doc['observations'])} observations, {len(doc['missing'])} declared missing")
         else:
-            bank = estimate(rqlib.read_json(a.obs), boot=a.boot)
+            bank = estimate(rqlib.read_json(a.obs), boot=a.boot, replicates=REPLICATES)
             rqlib.write_json_durable(a.out, bank)
-            print(json.dumps(bank["generator_noise"]))
+            g = bank["generator_noise"]
+            print(json.dumps(g))
+            if not g["available"]:
+                print(f"noisebank.py estimate: the 5k generator noise is unavailable: {g['reasons']}", file=sys.stderr)
+                return 2
         return 0
     except NoiseBankError as e:
         print(f"noisebank.py {a.cmd}: {e}", file=sys.stderr)
