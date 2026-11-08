@@ -68,15 +68,16 @@ THE ESTIMATOR (per horizon; Annex H.9.2: an interval-censored Gaussian composite
   (refused above OMIT_TOL = 1e-14 relative); panels from a VALID slope bound (the Mills-ratio bound for
   one-sided ends), refused (never capped) beyond MAX_PANELS; narrow conditional intervals by the corrected
   midpoint rule, tail differences through expm1. No floor; deep-tail contributions (log P < -700) are
-  counted. VALIDATED against an independent reference (math.erfc, the asymptotic tail series, adaptive
-  Simpson integration) on the registered test set, Codex's counterexamples included: max |error| <=
+  counted. VALIDATED against an independent reference (math.erfc, the asymptotic tail series, a fixed
+  8,000-interval composite Simpson rule) on the registered test set, Codex's counterexamples included: max |error| <=
   LOG_RECT_TOL = 1e-8 (test_noisebank).
   THE GRID (Codex #72 r2 P2, r3): exact contributions at 289 nodes in z = atanh(rho) (241 uniform, the outer 8
   intervals at each end split in 4), interpolated by a not-a-knot cubic SPLINE in z (C2) with ANALYTIC derivatives
-  (l_rr = l_zz z_r^2 + l_z z_rr). CERTIFIED A POSTERIORI at the point estimate: per group, the EXACT objective
+  (l_rr = l_zz z_r^2 + l_z z_rr). LOCAL OBJECTIVE-VALUE VALIDATION at the point estimate: per group, the EXACT objective
   at the fitted rho and the off-grid midpoints of its bracket and neighbours; a miss above GRID_LL_TOL = 1e-3
-  per pair inserts those exact columns as nodes and the fit is redone (at most GRID_ROUNDS = 4 rounds, else
-  refused). The certification record is reported.
+  per pair inserts those exact columns as nodes (deduplicated at MIN_KNOT), and the fit is redone ONCE on the
+  refined table; that refit's parameter shift is reported and FLAGGED above GRID_RHO_TOL = 1e-3 (never
+  refused). This validates objective values locally; it is not a global certificate.
   IDENTIFICATION (the point estimate and EVERY bootstrap refit alike): the analytic curvature per (weighted)
   pair at the group maximum >= INFO_MIN; a maximum on the box |rho| = RHO_MAX is flagged (at_box) and needs a
   one-sided slope per pair >= INFO_MIN instead.
@@ -88,7 +89,8 @@ THE ESTIMATOR (per horizon; Annex H.9.2: an interval-censored Gaussian composite
   (analytic derivatives, every evaluation strictly inside) from MULTI_START = 16 registered quasi-random
   (Halton) strictly feasible starts spread across the set; accepted only when >= MIN_AGREE = 3 runs reach the
   best value within START_TOL = 1e-4, those runs agree in every group value within PARAM_TOL = 1e-3, and the
-  barrier problem's final relative Newton decrement (stationarity) is <= KKT_TOL; otherwise refused. The box |rho| <= 0.995 is a
+  barrier problem's KKT residual (its gradient's max norm over max(1, ||grad L||)) is <= KKT_TOL = 1e-6, the
+  Newton model kept positive definite; otherwise refused. The box |rho| <= 0.995 is a
   registered NUMERICAL restriction (a variance share above 0.995 cannot be fitted); a fitted value on it is
   flagged (at_box).
   FIXED-REPLICATE BIAS (Codex #72 r2): two-stage (IFM) estimation is consistent as replicates grow; with
@@ -192,9 +194,9 @@ RHO_MAX = 0.995                    # (the registered evaluable box |rho| <= RHO_
 Z_MAX = math.atanh(RHO_MAX)
 Z_INTERVALS = 240                  # (the base grid: 241 nodes uniform in z = atanh(rho) ...)
 Z_EDGE_INTERVALS, Z_EDGE_SPLIT = 8, 4   # (... with the outer 8 intervals at each end split in 4: 289 nodes)
-GRID_LL_TOL = 1e-3                 # (registered: |interpolation - exact| of a group objective per pair, log units)
-GRID_RHO_TOL = 1e-3                # (registered: the maximizer's shift when the grid is refined, in rho)
-GRID_ROUNDS = 4                    # (local refinements before the grid is refused as uncertified)
+GRID_LL_TOL = 1e-3                 # (registered: |interpolation - exact| of a group objective / its pairs, log units)
+GRID_RHO_TOL = 1e-3                # (registered: a refit shift above this, after the local refinement, is FLAGGED)
+MIN_KNOT = 1e-6                    # (inserted knots: at least this far apart in z, from each other and the grid)
 E_MAX = 40.0                       # (log_rect's admissible domain: finite standardized endpoints |e| <= E_MAX)
 W_MIN = 1e-6                       # (... and standardized interval widths >= W_MIN)
 TRUNC_MARGIN = 12.0                # (an infinite outer end is first truncated at +-(E_MAX + TRUNC_MARGIN))
@@ -209,7 +211,8 @@ MULTI_START = 16                   # (the constrained fit's registered quasi-ran
 START_TOL = 1e-4                   # (log-likelihood units: the runs counted as reaching the best value)
 PARAM_TOL = 1e-3                   # (those runs must agree in every group value within this)
 MIN_AGREE = 3                      # (at least this many runs must reach the best value)
-KKT_TOL = 1e-7                     # (the final relative Newton decrement of the barrier problem: stationarity)
+KKT_TOL = 1e-6                     # (the barrier problem's KKT residual: ||gradient||_inf / max(1, ||grad L||_inf))
+MU_FINAL = 1e-7                    # (the last barrier weight: its duality gap, 25 mu, is far below START_TOL)
 BOOT_FAIL_MAX = 0.05               # (the interval is unavailable beyond this share of failed draws)
 MARGINAL_TOL = 1e-8                # (the marginal Newton's gradient tolerance, per replicate)
 FEAS_TOL = 1e-12                   # (the feasibility tolerance of the unconstrained group maxima)
@@ -701,8 +704,9 @@ def log_rect(l1, h1, l2, h2, r, chunk=20000):
         |slope| over the range: the integrand is log-concave, so the exact slopes at the range's two ends
         bound it (falling back to the Mills-ratio bound |x| + (|r| / s)(max finite |inner endpoint| + 1) where
         an endpoint slope is not finite). More than MAX_PANELS is REFUSED, never capped.
-    Validated against an independent reference (math.erfc, the asymptotic tail series and adaptive Simpson
-    integration) on the registered test set: max |error| <= LOG_RECT_TOL."""
+    Validated against an independent reference (math.erfc and the asymptotic tail series; a golden-section
+    mode; a FIXED 8,000-interval composite Simpson rule in log space) on the registered test set: max |error| <=
+    LOG_RECT_TOL."""
     import numpy as np
     l1, h1, l2, h2 = (np.asarray(v, float).ravel() for v in (l1, h1, l2, h2))
     check_domain(l1, h1, l2, h2, r)
@@ -1284,8 +1288,8 @@ def _strict(x):
 
 def _interior(objs, x0, mu0=1.0):
     """Maximize sum_g l_g(rho_g) over {three LMIs PD, |rho_g| < RHO_MAX}: log-barrier interior point, damped
-    Newton on the ANALYTIC interpolant derivatives, every evaluation strictly inside -> (x, L, converged,
-    stationarity residual at the final mu, the final mu)."""
+    Newton (a positive-definite, regularized model) on the ANALYTIC interpolant derivatives, every evaluation
+    strictly inside -> (x, L, converged, the KKT residual at the final mu, the final mu)."""
     import numpy as np
     dM = _dmats()
     a2 = RHO_MAX ** 2
@@ -1315,47 +1319,50 @@ def _interior(objs, x0, mu0=1.0):
                 if j != i:
                     H[j, i] += v
         return g, H
+    def kkt(x, mu):
+        """The barrier problem's KKT (stationarity) residual: ||grad(-L + mu B)||_inf scaled by
+        max(1, ||grad L||_inf); it does not depend on the Hessian's inertia (Codex #72 r4 P2-1)."""
+        g, _ = grad_hess(x, mu)
+        gl = np.array([float(obj_rho(*objs[gr], x[i])[1][0]) for i, gr in enumerate(GROUPS)])
+        return float(np.max(np.abs(g))) / max(1.0, float(np.max(np.abs(gl))))
     x = np.array(x0, float)
     if not _strict(x):
         raise NoiseBankError("the interior-point start is not strictly feasible")
     mu = mu0
     while True:
+        final = mu <= MU_FINAL
+        tol = KKT_TOL if final else max(KKT_TOL, 0.1 * mu)   # (centring: loose on the path, tight at the end)
         ok = False
         for _ in range(300):
             g, H = grad_hess(x, mu)
             lam = 0.0
-            while True:
+            while True:                                # (a POSITIVE-DEFINITE (regularized) Newton model)
                 try:
-                    step = -np.linalg.solve(H + lam * np.eye(9), g)
-                    if np.all(np.isfinite(step)) and g @ step < 0:
+                    C = np.linalg.cholesky(H + lam * np.eye(9))
+                    step = -np.linalg.solve(C.T, np.linalg.solve(C, g))
+                    if np.all(np.isfinite(step)):
                         break
                 except np.linalg.LinAlgError:
                     pass
                 lam = max(2 * lam, 1e-8 * (1 + float(np.max(np.abs(np.diag(H))))))
             dec = -float(g @ step)
             f0 = phi(x, mu)
-            scale = max(1.0, abs(f0))
-            if dec <= 1e-12 * scale:
+            if kkt(x, mu) <= tol or dec <= 1e-24 * max(1.0, abs(f0)):   # (stationary: the GRADIENT)
                 ok = True
                 break
             t = 1.0
             while t > 1e-14 and not phi(x + t * step, mu) <= f0 - 1e-4 * t * dec:
                 t *= 0.5
-            if t <= 1e-14:                           # (no representable decrease left: float-limited)
-                ok = dec <= KKT_TOL * scale
+            if t <= 1e-14 or float(np.max(np.abs(t * step))) <= 1e-15 * max(1.0, float(np.max(np.abs(x)))):
+                ok = kkt(x, mu) <= tol                   # (no representable progress left: float-limited)
                 break
             x = x + t * step
         if not ok:
             return x, L(x), False, math.inf, mu
-        if mu <= 1e-9:
+        if final:
             break
-        mu /= 5.0
-    g, H = grad_hess(x, mu)
-    try:
-        dec = float(g @ np.linalg.solve(H, g))
-    except np.linalg.LinAlgError:
-        dec = math.inf
-    return x, L(x), True, abs(dec) / max(1.0, abs(L(x))), mu
+        mu = max(mu / 5.0, MU_FINAL)
+    return x, L(x), True, kkt(x, mu), mu
 
 
 def _halton(n, dims):
@@ -1400,7 +1407,8 @@ def fit_dependence(objs, pairs=None):
     The constrained branch (Codex #72 r3 P2-3): the interior-point fit (_interior) from MULTI_START = 16
     registered quasi-random strictly feasible starts (_starts); ACCEPTED only when at least MIN_AGREE runs
     reach the best log likelihood within START_TOL, all of those agree in every group value within
-    PARAM_TOL, and the best run's barrier stationarity residual (per pair) is within KKT_TOL; otherwise
+    PARAM_TOL, and the best run's KKT residual (the scaled gradient of the barrier problem) is within KKT_TOL;
+    otherwise
     REFUSED. "Multi-start validated, not a global certificate": the problem is not concave. A group value on
     the registered box |rho| = RHO_MAX is FLAGGED (at_box)."""
     import numpy as np
@@ -1422,11 +1430,11 @@ def fit_dependence(objs, pairs=None):
         spread = max(float(np.max(np.abs(x - top[0][1]))) for _, x, _ in top)
         best = max(top, key=lambda t: t[0])
         starts = {"starts": MULTI_START, "converged": len(runs), "reaching_best": len(top),
-                  "parameter_spread": spread, "stationarity": best[2],
+                  "parameter_spread": spread, "kkt_residual": best[2],
                   "label": "multi-start validated, not a global certificate"}
         if len(top) < MIN_AGREE or spread > PARAM_TOL or not best[2] <= KKT_TOL:
             raise NoiseBankError(f"the constrained fit is refused: {len(top)} runs reach the best value, their "
-                                 f"parameters spread {spread:.3g}, stationarity {best[2]:.3g}")
+                                 f"parameters spread {spread:.3g}, KKT residual {best[2]:.3g}")
         rho, how = {g: float(best[1][i]) for i, g in enumerate(GROUPS)}, "constrained"
         SR, SD, SE, feas2, prob2 = components_of(rho)
         if not feas2:
@@ -1448,12 +1456,13 @@ def identified(zn, vals, rho, npairs):
     return per >= INFO_MIN, per, at_box
 
 
-def certify(tab, fitrho, rounds=GRID_ROUNDS):
-    """THE GRID CERTIFICATION (Codex #72 r3 P2-2), a posteriori, at the point estimate: per group, the EXACT
-    objective at the fitted rho and at the off-grid midpoints of its bracket and both neighbours; where the
-    interpolant misses by more than GRID_LL_TOL per pair, those exact columns are inserted as nodes (local
-    refinement) -> (refined?, the worst miss per pair). The caller refits until a round inserts nothing (at
-    most GRID_ROUNDS), else the bank is refused."""
+def validate_grid(tab, fitrho):
+    """LOCAL OBJECTIVE-VALUE VALIDATION (Codex #72 r3 P2-2, narrowed by the coordinator after r4): per group,
+    the EXACT objective at the fitted rho and at the off-grid midpoints of its bracket and both neighbours,
+    against the interpolant; where a miss exceeds GRID_LL_TOL per pair, those exact columns are inserted as
+    nodes (candidates deduplicated against each other and the grid at MIN_KNOT in z; an invalid grid is a
+    NoiseBankError) -> (inserted?, the worst miss per pair). This validates the objective VALUES locally; it
+    is not a global certificate."""
     import numpy as np
     worst, inserted = 0.0, False
     for g in GROUPS:
@@ -1461,11 +1470,15 @@ def certify(tab, fitrho, rounds=GRID_ROUNDS):
         zn = t["z"]
         z = math.atanh(max(-RHO_MAX, min(RHO_MAX, fitrho[g])))
         k = int(np.clip(np.searchsorted(zn, z, side="right") - 1, 0, len(zn) - 2))
-        pts = [z] + [0.5 * (zn[i] + zn[i + 1]) for i in (k - 1, k, k + 1) if 0 <= i < len(zn) - 1]
+        cand = sorted({round(v, 15) for v in [z] + [0.5 * (zn[i] + zn[i + 1]) for i in (k - 1, k, k + 1)
+                                                     if 0 <= i < len(zn) - 1]})
+        pts = []
+        for zz in cand:
+            if np.min(np.abs(zn - zz)) < MIN_KNOT or (pts and zz - pts[-1] < MIN_KNOT):
+                continue
+            pts.append(zz)
         newz, newc = [], []
         for zz in pts:
-            if np.any(np.abs(zn - zz) < 1e-12):
-                continue
             col, _ = exact_column(t["blocks"], len(t["keys"]), math.tanh(zz))
             miss = abs(float(_interp(zn, t["T"].sum(axis=0), np.array([zz]))[0][0]) - float(col.sum())) / t["pairs"]
             worst = max(worst, miss)
@@ -1477,7 +1490,10 @@ def certify(tab, fitrho, rounds=GRID_ROUNDS):
             z_all = np.concatenate([zn, np.array(newz)])
             T_all = np.hstack([t["T"], np.array(newc).T])
             o = np.argsort(z_all)
-            t["z"], t["T"] = z_all[o], T_all[:, o]
+            z_all, T_all = z_all[o], T_all[:, o]
+            if not np.all(np.diff(z_all) >= MIN_KNOT):
+                raise NoiseBankError(f"{g}: the refined grid has knots closer than {MIN_KNOT}")
+            t["z"], t["T"] = z_all, T_all
     return inserted, worst
 
 
@@ -1664,7 +1680,7 @@ def interval_record(D, failed, boot, unident=0):
 
 def horizon_estimate(A, boot=BOOT, seed=0, m=Z_INTERVALS):
     """One horizon: the usable channels, the s(mu) curves and nu0, the nine groups (identification), the
-    components (or "unavailable" with reasons) with the grid CERTIFIED at the fit, the registered uncertainty
+    components (or "unavailable" with reasons) with the grid VALIDATED LOCALLY at the fit, the registered uncertainty
     procedure."""
     import numpy as np
     U = usable(A)
@@ -1684,33 +1700,36 @@ def horizon_estimate(A, boot=BOOT, seed=0, m=Z_INTERVALS):
         return rec
     try:
         tab = group_tables(A, U, G, m)
-        fit, cert = None, []
-        for rnd in range(GRID_ROUNDS + 1):
-            objs = {g: (tab[g]["z"], tab[g]["T"].sum(axis=0)) for g in GROUPS}
-            groups = {}
-            for g in GROUPS:
-                r_hat, _ = _argmax(*objs[g])
-                ok, per, at_box = identified(*objs[g], r_hat, tab[g]["pairs"])
-                groups[g] = {"pairs": tab[g]["pairs"], "rho_max": r_hat, "curvature_per_pair": per, "at_box": at_box,
-                             "deep_tail": tab[g]["deep_tail"], "nodes": int(len(tab[g]["z"]))}
-                if not ok:
-                    reasons.append(f"{g} is unidentified ({'one-sided slope' if at_box else 'curvature'} per pair "
-                                   f"{per:.3g} < {INFO_MIN})")
-            if reasons:
-                rec.update(status="unavailable", reasons=reasons, components=None, bootstrap=None, groups=groups)
-                return rec
-            fit = fit_dependence(objs, {g: tab[g]["pairs"] for g in GROUPS})
-            inserted, worst = certify(tab, fit["rho"])
-            cert.append(worst)
-            if not inserted:
-                break
-        else:
-            raise NoiseBankError(f"the grid is not certified after {GRID_ROUNDS} refinements (worst miss {cert[-1]:.3g} per pair)")
+        objs = {g: (tab[g]["z"], tab[g]["T"].sum(axis=0)) for g in GROUPS}
+        groups = {}
+        for g in GROUPS:
+            r_hat, _ = _argmax(*objs[g])
+            ok, per, at_box = identified(*objs[g], r_hat, tab[g]["pairs"])
+            groups[g] = {"pairs": tab[g]["pairs"], "rho_max": r_hat, "curvature_per_pair": per, "at_box": at_box,
+                         "deep_tail": tab[g]["deep_tail"]}
+            if not ok:
+                reasons.append(f"{g} is unidentified ({'one-sided slope' if at_box else 'curvature'} per pair "
+                               f"{per:.3g} < {INFO_MIN})")
+        if reasons:
+            rec.update(status="unavailable", reasons=reasons, components=None, bootstrap=None, groups=groups)
+            return rec
+        fit = fit_dependence(objs, {g: tab[g]["pairs"] for g in GROUPS})
+        inserted, worst = validate_grid(tab, fit["rho"])
+        shift = 0.0
+        if inserted:                                   # (ONE refit on the locally refined table: its shift reported)
+            refit = fit_dependence({g: (tab[g]["z"], tab[g]["T"].sum(axis=0)) for g in GROUPS},
+                                   {g: tab[g]["pairs"] for g in GROUPS})
+            shift = max(abs(refit["rho"][g] - fit["rho"][g]) for g in GROUPS)
+            fit = refit
+        for g in GROUPS:
+            groups[g]["nodes"] = int(len(tab[g]["z"]))
     except NoiseBankError as e:
         rec.update(status="unavailable", reasons=[str(e)], components=None, bootstrap=None)
         return rec
     rec["groups"] = groups
-    rec["grid_certification"] = {"rounds": len(cert), "worst_miss_per_pair": cert, "tolerance": GRID_LL_TOL}
+    rec["grid_validation"] = {"label": "local objective-value validation (not a global certificate)",
+                              "worst_miss_per_pair": worst, "tolerance": GRID_LL_TOL, "refined": inserted,
+                              "refit_shift": shift, "shift_flag": shift > GRID_RHO_TOL}
     rec["components"] = {"SigmaR": fit["SigmaR"].tolist(), "SigmaD": fit["SigmaD"].tolist(),
                          "SigmaE": fit["SigmaE"].tolist(), "fit": fit["fit"], "loglik": fit["loglik"],
                          "unconstrained_problems": fit["problems"], "multistart": fit["starts"], "at_box": fit["at_box"],
@@ -1740,7 +1759,7 @@ def estimate(doc, boot=BOOT, seed=0, m=Z_INTERVALS, replicates=None):
                          "boot": boot, "boot_fail_max": BOOT_FAIL_MAX, "seed": seed,
                          "rectangle": f"log_rect on the registered domain (|e| <= {E_MAX}, width >= {W_MIN}, "
                                       f"|rho| <= {RHO_MAX}); validated max error {LOG_RECT_TOL}",
-                         "grid": "z = atanh(rho), refined edges, certified a posteriori at the fit",
+                         "grid": "z = atanh(rho), refined edges; local objective-value validation at the fit",
                          "constrained_fit": "interior point from 16 Halton starts; multi-start validated, not a "
                                             "global certificate",
                          "fixed_replicate_bias": "not corrected (see the PR's simulation)"}, "horizons": {}}

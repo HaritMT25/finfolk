@@ -393,8 +393,8 @@ class TestNumerics(unittest.TestCase):
 
     def test_log_rect_against_an_independent_reference(self):
         """Codex #72 r3 P2-1: log_rect against an INDEPENDENT reference (math.erfc and the asymptotic tail
-        series for log Q; log-space conditional probabilities; the mode by golden section and adaptive Simpson
-        integration outward from it) on the REGISTERED TEST SET spanning the admissible domain (centres to
+        series for log Q; log-space conditional probabilities; the mode by golden section and a FIXED 8,000-interval
+        composite Simpson rule) on the REGISTERED TEST SET spanning the admissible domain (centres to
         +-39, widths 1e-5 .. 2 and half-infinite, rho to +-0.995), with Codex's counterexamples: a thin
         discordant rectangle at the limits, the broad [0, 39]^2 quadrant at rho 0, X > 0 and Y > 39, and a
         tiny central interval. Max |log error| <= LOG_RECT_TOL."""
@@ -460,15 +460,24 @@ class TestNumerics(unittest.TestCase):
                 d = a + g * (b - a)
                 fd = F(d)
         self.assertLess(abs(r_int - (a + b) / 2), nb.GRID_RHO_TOL)
-        # the certification: a coarse table misses; certify inserts exact columns until it does not
+        # local objective-value validation: a coarse table misses; exact columns are inserted, deduplicated
         zc = np.linspace(-nb.Z_MAX, nb.Z_MAX, 12)
         blocks = [(L1, L1 + 0.06, L2, L2 + 0.06, np.zeros(len(L1), int))]
         T = np.array([[F(float(np.tanh(v))) for v in zc]])
         tab = {gg: {"z": zc.copy(), "T": T.copy(), "keys": [((0,), (0,))], "pairs": len(L1), "blocks": blocks}
                for gg in nb.GROUPS}
-        ins, worst = nb.certify(tab, {gg: 0.99 for gg in nb.GROUPS})
+        ins, worst = nb.validate_grid(tab, {gg: 0.99 for gg in nb.GROUPS})
         self.assertTrue(ins and worst > nb.GRID_LL_TOL)
         self.assertGreater(len(tab["R_CC"]["z"]), 12)
+        # (Codex #72 r4 P2-2: a fitted value AT a bracket midpoint is inserted once, never twice)
+        zc2 = np.linspace(-nb.Z_MAX, nb.Z_MAX, 12)
+        mid = 0.5 * (zc2[9] + zc2[10])
+        tab2 = {gg: {"z": zc2.copy(), "T": T.copy(), "keys": [((0,), (0,))], "pairs": len(L1), "blocks": blocks}
+                for gg in nb.GROUPS}
+        nb.validate_grid(tab2, {gg: float(np.tanh(mid)) for gg in nb.GROUPS})
+        zz = tab2["R_CC"]["z"]
+        self.assertTrue(np.all(np.diff(zz) >= nb.MIN_KNOT))
+        self.assertEqual(int(np.sum(np.abs(zz - mid) < 1e-9)), 1)
 
     def test_marginal_mle(self):
         """The interval-censored marginal MLE recovers (a, sigma) of rounded logistic-normal counts (the
