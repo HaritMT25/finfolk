@@ -14,6 +14,7 @@ import stat
 import sys
 import tempfile
 import unittest
+from collections import Counter
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -1226,7 +1227,16 @@ class TestBurnIn(unittest.TestCase):
         av = worlds.read_jsonl(os.path.join(root, "availability.jsonl"))
         self.assertTrue(av and not any(worlds.zero_supported(root, e) for e in av))   # not the new attempt's zero
         rep_ = worlds.burn_in_report(root, reg)
-        self.assertEqual(rep_["per_treatment"]["A"], {"worlds": 1, "restarts": 1, "attempts": 2, "early_failure_rate": 0.5})
+        self.assertEqual(rep_["per_treatment"]["A"], {"worlds": 1, "restarts": 1, "attempts_started": 1,
+                                                      "early_failures": 1, "established": 0, "pending": 1,
+                                                      "unresolved": 0, "failed": 0, "early_failure_rate": 1.0})
+        # the retained attempt's archive index resolves to its own relocated bytes (#70 review 3)
+        recs = worlds.attempt_archive_records(root, wid, 0)
+        self.assertTrue(recs and all(r["path"].startswith(os.path.join(ar, "restarts", f"{wid}.a0") + os.sep)
+                                     for r in recs.values()))
+        self.assertEqual(worlds.audit_attempt(root, wid, 0), [])
+        self.assertEqual(rqlib.read_json(os.path.join(old, "relocated.json"))["archive_to"],
+                         os.path.join(ar, "restarts", f"{wid}.a0"))
         # a new supervisor sees the attempt (the ledger), and the f1 command would use its seed
         s2, _ = supervisor(root, reg, ar)
         self.assertEqual(s2.worlds[wid]["founder_seed"], seeds[1])
@@ -1273,6 +1283,106 @@ class TestBurnIn(unittest.TestCase):
         s2.startup()
         self.assertFalse(any("completed" in m for m in msgs2), msgs2)
         self.assertEqual(len(os.listdir(os.path.join(root, "restarts", "worlds"))), 1)
+
+    def test_evidence_durable_before_the_commitment(self):
+        """#70 review 1 (P1): the failed attempt's evidence (its run.csv, its segment directory, every file and
+        directory of the attempt and its archive) is fsync'd BEFORE the restart record."""
+        root, reg, ar, wid = self.world(zero_at=2500, burn_in=3000)
+        ev = []
+        of, od, oa = worlds.rqlib.fsync_file, worlds.rqlib.fsync_dir, worlds._append_durable
+        worlds.rqlib.fsync_file = lambda q: (ev.append(("file", os.path.abspath(q))), of(q))[1]
+        worlds.rqlib.fsync_dir = lambda q: (ev.append(("dir", os.path.abspath(q))), od(q))[1]
+        worlds._append_durable = lambda q, rec: (ev.append(("append", os.path.basename(q))), oa(q, rec))[1]
+        try:
+            s, msgs = supervisor(root, reg, ar)
+            s.startup()
+        finally:
+            worlds.rqlib.fsync_file, worlds.rqlib.fsync_dir, worlds._append_durable = of, od, oa
+        commit = ev.index(("append", "restarts.jsonl"))
+        d = worlds.wdir(root, wid)
+        for e in (("file", os.path.join(d, "seg000", "run.csv")), ("dir", os.path.join(d, "seg000")), ("dir", d),
+                  ("file", os.path.join(worlds.adir(ar, wid), "F1.json")), ("dir", worlds.adir(ar, wid))):
+            self.assertIn(e, ev[:commit], e)
+
+    def test_exhausted_and_pending_in_the_rate(self):
+        """#70 review 5: an exhausted early failure counts; a not-yet-started attempt is outside the rate."""
+        root, reg, ar, wid = self.world(zero_at=2500, burn_in=3000, max_restarts=0)
+        s, msgs = supervisor(root, reg, ar)
+        s.startup()
+        st = worlds.read_state(root, wid)
+        self.assertEqual(st["status"], "extinct", msgs)
+        self.assertIn("restarts exhausted", st["end_reason"])
+        p = worlds.burn_in_report(root, reg)["per_treatment"]["A"]
+        self.assertEqual((p["restarts"], p["attempts_started"], p["early_failures"], p["early_failure_rate"]), (0, 1, 1, 1.0))
+
+    def test_continue_does_not_bypass_the_burn_in(self):
+        """#70 review 8: under --on-extinction continue an early zero still restarts the world."""
+        root, reg, ar, wid = self.world(zero_at=2500, burn_in=3000)
+        s, msgs = supervisor(root, reg, ar, on_extinction="continue")
+        s.startup()
+        self.assertEqual(len(worlds.restart_records(root)), 1, msgs)
+
+    def test_malformed_rows_are_no_evidence(self):
+        """#70 review 9: a non-integral count, a short row or a frame off the sequence is not a zero (and no
+        evidence is read past it); a valid zero row is."""
+        root, reg, ar, wid = self.world(zero_at=10 ** 9, burn_in=3000)
+        d = os.path.join(worlds.wdir(root, wid), "seg000", "run.csv")
+        st = worlds.read_state(root, wid)
+        hdr = "step,population,predator_pop\n"
+        for bad in ("100,50,8\n200,0.5,8\n", "100,50,8\n200,0\n", "100,50,8\n300,0,8\n", "100,50,8\n200,x,8\n300,0,8\n"):
+            wr(d, hdr + bad)
+            self.assertEqual(worlds.scan_zeros(root, wid, st, "A", 100), {}, bad)
+        wr(d, hdr + "100,50,8\n200,0,8\n")
+        self.assertEqual(worlds.scan_zeros(root, wid, st, "A", 100)["prey"][0], 200)
+
+    def test_layouts_and_slots(self):
+        """#70 review 6: the real 56 layout (4C+2A+1B and 4C+1A+2B blocks alternating: 32C, 12A, 12B), and
+        48 / 64; slots keep their seeds across them."""
+        arena = os.path.join(self.tmp, "arena.json")
+        wr(arena, json.dumps(ARENA))
+        regs = {n: worlds.register(arena, "ns-lay", blocks=8, per_block=worlds.LAYOUTS[n], schedule=SCHED)
+                for n in ("48", "56", "64")}
+        for n, want in (("48", (32, 8, 8)), ("56", (32, 12, 12)), ("64", (32, 16, 16))):
+            c = Counter(w["treatment"] for w in regs[n]["worlds"])
+            self.assertEqual((c["C"], c["A"], c["B"]), want, n)
+        by_block = Counter((w["block"], w["treatment"]) for w in regs["56"]["worlds"])
+        for b in range(1, 9):
+            self.assertEqual((by_block[(b, "A")], by_block[(b, "B")]), (2, 1) if b % 2 else (1, 2), b)
+        seeds = {n: {w["seed_slot"]: w["founder_seed"] for w in r["worlds"]} for n, r in regs.items()}
+        for slot, seed in seeds["56"].items():
+            self.assertEqual(seeds["64"][slot], seed)
+        self.assertEqual(regs["56"]["reserved"], regs["48"]["reserved"])
+        self.assertEqual(worlds.parse_per_block("C=4,A=2,B=1;C=4,A=1,B=2"), worlds.LAYOUTS["56"])
+
+    def test_reserved_universe_avoidable(self):
+        """#70 review 7: a worlds registry given to plan.py --avoid yields every reserved history seed."""
+        import plan
+        root, reg, ar, wid = self.world(zero_at=10 ** 9, burn_in=3000)
+        res = {x for slot in reg["reserved"] for x in slot["seeds"]}
+        got = plan.avoid_seeds(os.path.join(root, "config", "worlds.json"))
+        self.assertTrue(res <= got)
+
+    def test_f1_reconciles_before_writing(self):
+        """#70 review 4: f1 (and verify-f1) complete an interrupted restart before anything else."""
+        root, reg, ar, wid = self.world(zero_at=2500, burn_in=3000)
+        w = reg["worlds"][0]
+        seeds = next(x["seeds"] for x in reg["reserved"] if x["slot"] == w["seed_slot"])
+        worlds._append_durable(os.path.join(root, "restarts.jsonl"), {
+            "schema": worlds.RESTART_SCHEMA, "world": wid, "treatment": "A", "slot": w["seed_slot"], "attempt": 1,
+            "failed_attempt": 0, "failed_seed": seeds[0], "seed": seeds[1], "zero_frame": 2500})
+
+        class Stop(Exception):
+            pass
+        orig = worlds.pin_binary
+        worlds.pin_binary = lambda *a_, **k_: (_ for _ in ()).throw(Stop())
+        try:
+            for cmd in (worlds.f1, worlds.verify_f1):
+                with self.assertRaises(Stop):
+                    cmd(argparse.Namespace(root=root, allow_placeholder=False, archive_root=None, binary=None,
+                                           world=None), lambda m: None)
+                self.assertEqual(worlds.attempt_of(root, wid), 1)
+        finally:
+            worlds.pin_binary = orig
 
     def test_burn_in_off_for_old_registries(self):
         """A registry without seed reservations (scheme before slot/1) keeps the old behaviour."""

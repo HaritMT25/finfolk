@@ -65,7 +65,7 @@ cat > arena.json <<'JSON'
         "predator-meal": 20, "predator-cooldown": 1.5}}}
 JSON
 REG="register --arena arena.json --namespace rq-test-worlds --blocks 1 --per-block C=1,A=1,B=1
-     --total-steps 24000 --checkpoint-every 4000 --log-every 100"
+     --total-steps 24000 --checkpoint-every 4000 --log-every 100 --burn-in 0"
 
 # 1. the registry
 $WS $REG --out reg1.json 2> /dev/null || fail "register"
@@ -375,7 +375,7 @@ import sys; sys.path.insert(0, sys.argv[1]); import worlds
 st = worlds.read_state("R1", sys.argv[2])
 assert st["status"] == "done" and len(st["segments"]) == 2 and st["segments"][1]["start_frame"] > 0, st
 PY
-$WS register --arena arena.json --namespace rq-test-other --blocks 1 --per-block C=1,A=1,B=1 \
+$WS register --arena arena.json --namespace rq-test-other --blocks 1 --per-block C=1,A=1,B=1 --burn-in 0 \
     --total-steps 24000 --checkpoint-every 4000 --log-every 100 --out reg_other.json 2> /dev/null || fail "register (other)"
 cp R1/config/worlds.json r1_registry.bak
 chmod u+w R1/config/worlds.json; cp reg_other.json R1/config/worlds.json
@@ -500,7 +500,12 @@ for k in (0, 1):
     assert os.path.isfile(os.path.join("RZ", "restarts", "worlds", f"{wid}.a{k}", "seg000", "run.csv")), k
 assert os.path.isfile(os.path.join(worlds.adir(ar, wid), "FINALIZED"))
 rep = worlds.burn_in_report("RZ", reg)["per_treatment"]["A"]
-assert rep == {"worlds": 1, "restarts": 2, "attempts": 3, "early_failure_rate": 2 / 3}, rep
+assert rep == {"worlds": 1, "restarts": 2, "attempts_started": 3, "early_failures": 3, "established": 0, "pending": 0,
+               "unresolved": 0, "failed": 0, "early_failure_rate": 1.0}, rep       # (the exhausted one counts)
+for k in (0, 1):                                       # each retained attempt resolves to its own bytes
+    assert worlds.audit_attempt("RZ", wid, k) == [], (k, worlds.audit_attempt("RZ", wid, k))
+    assert all(r["path"].startswith(os.path.join(ar, "restarts", f"{wid}.a{k}")) for r in
+               worlds.attempt_archive_records("RZ", wid, k).values())
 av = worlds.read_jsonl("RZ/availability.jsonl")
 assert sum(worlds.zero_supported("RZ", e) for e in av) == 1, av    # only the current attempt's zero counts
 PY
