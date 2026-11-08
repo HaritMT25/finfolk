@@ -72,6 +72,46 @@ class TestCalib(unittest.TestCase):
         self.assertEqual(json.dumps(strip(r1), sort_keys=True, default=str),
                          json.dumps(strip(r2), sort_keys=True, default=str))
 
+    def test_structured_woodbury_end_to_end(self):
+        """#68 CPU lever L2 end to end: every world's full-history and epoch analysis (supports, selections,
+        phases, J, RMS) under the structured W-apply equals the pre-L2 dense Woodbury's (support and selection
+        decisions identical; values <= 1e-10 relative)."""
+        cb, rc = self.cb, self.rc
+
+        class OldCov(rc.Cov):
+            def subset(self, mask):
+                c = rc.Cov.subset(self, mask)
+                c.__class__ = OldCov
+                return c
+
+            def wmul(self, A):
+                A = np.asarray(A, float)
+                A2 = A.reshape(self.n, -1)
+                out = A2 * self.dinv[:, None]
+                if self.U is not None:
+                    DU = self.U * self.dinv[:, None]
+                    Kc = np.linalg.cholesky(np.eye(self.U.shape[1]) + self.U.T @ DU)
+                    Ki = np.linalg.solve(Kc.T, np.linalg.solve(Kc, np.eye(Kc.shape[0])))
+                    out = out - (DU @ ((Ki + Ki.T) / 2)) @ (self.U.T @ out)
+                return out.ravel() if A.ndim == 1 else out
+        pn = cb.Panel(self.graph, self.params, "H-F", "dev", "actual", "F1", 0).simulate()
+        for w in pn.worlds[:2]:
+            old = {k: v for k, v in w["cov"].items()}
+            for v in old.values():
+                v.__class__ = OldCov
+            for scope in ("full", "E2"):
+                a = rc.analyze_world(cb.Panel._world_design(w["graph"], old, scope), w["y"])
+                new = {k: rc.Cov(v.d, v.U) for k, v in old.items()}
+                b = rc.analyze_world(cb.Panel._world_design(w["graph"], new, scope), w["y"])
+                self.assertEqual(rc.select(a)[:1] + (rc.select(a)[2],), rc.select(b)[:1] + (rc.select(b)[2],))
+                for ra, rb in zip(a["periods"], b["periods"]):
+                    self.assertEqual((ra["supported"], ra["fails"]), (rb["supported"], rb["fails"]))
+                    for key in ("J_C", "J_Q", "r_C", "r_Q", "s"):
+                        if key in ra and math.isfinite(ra[key]):
+                            self.assertLessEqual(abs(ra[key] - rb[key]), 1e-10 * max(1.0, abs(ra[key])), (scope, key))
+            for v in old.values():
+                v.__class__ = rc.Cov
+
     def test_cached_loadings_equal_the_direct_construction(self):
         """Panel.cov through the cached sparsity equals the direct construction (the pre-q33 code)."""
         cb, rc = self.cb, self.rc

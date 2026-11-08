@@ -148,19 +148,43 @@ class Cov:
             if np.any(dd <= 0):
                 raise RecurrenceError("a structured bank covariance needs a positive cell diagonal")
             self.dinv = 1.0 / dd
-            self._M = None                               # (the Woodbury factor: built on first use, q33)
+            self._sp = None                              # (the structured Woodbury factor: built on first use)
             if self.U is None or not self.U.shape[1]:
                 self.U = None
 
-    @property
-    def M(self):
-        """W A = D^-1 A - M (U' D^-1 A): built once, when first needed (a bank only subset never pays)."""
-        if self._M is None:
-            DU = self.U * self.dinv[:, None]
-            Kc = _chol(np.eye(self.U.shape[1]) + self.U.T @ DU)
-            Ki = _chol_solve(Kc, np.eye(Kc.shape[0]))
-            self._M = DU @ ((Ki + Ki.T) / 2)
-        return self._M
+    def _sparse(self):
+        """The structured Woodbury factor, built once from U's SPARSE rows (#68 CPU lever L2, exact algebra):
+        each row's nonzero columns (at most w; a bank row has 2 or 4) as an n x w index / value table; K = I +
+        U'D^-1 U assembled from the within-row pairs, O(n w^2) instead of the dense O(n k^2); its inverse once
+        (symmetrized); U'X by a sorted segment sum and U Z by a gather, so the dense n x k Woodbury product is
+        never formed."""
+        if self._sp is None:
+            U = self.U
+            n, k = U.shape
+            nz = U != 0
+            w = max(int(nz.sum(axis=1).max()), 1)
+            order = np.argsort(~nz, axis=1, kind="stable")[:, :w]       # (each row's nonzero columns first)
+            take = np.take_along_axis(nz, order, axis=1)
+            idx = np.where(take, order, k)                                # (k: the padding column)
+            val = np.where(take, np.take_along_axis(U, order, axis=1), 0.0)
+            flat = idx.ravel()
+            perm = np.argsort(flat, kind="stable")
+            fs = flat[perm]
+            starts = np.flatnonzero(np.r_[True, fs[1:] != fs[:-1]])
+            cols = fs[starts]
+            K = np.zeros((k + 1) * (k + 1))
+            dv = self.dinv
+            for a in range(w):
+                for b in range(w):
+                    K += np.bincount(idx[:, a] * (k + 1) + idx[:, b], weights=dv * val[:, a] * val[:, b],
+                                     minlength=(k + 1) * (k + 1))
+            K = K.reshape(k + 1, k + 1)[:k, :k] + np.eye(k)
+            if not np.all(np.isfinite(K)):
+                raise RecurrenceError("the structured bank covariance is not finite")
+            Ki = np.linalg.inv(K)
+            self._sp = {"idx": idx, "val": val, "perm": perm, "starts": starts, "cols": cols, "k": k,
+                        "Ki": (Ki + Ki.T) / 2}
+        return self._sp
 
     def subset(self, mask):
         """The covariance of the masked rows. A structured bank keeps only the shared-source columns that load
@@ -186,8 +210,14 @@ class Cov:
             out = _chol_solve(self.L, A2)
         else:
             out = A2 * self.dinv[:, None]
-            if self.U is not None:
-                out = out - self.M @ (self.U.T @ out)
+            if self.U is not None:                   # (W A = D^-1 A - D^-1 U K^-1 U' D^-1 A, sparse in U: L2)
+                sp = self._sparse()
+                c = out.shape[1]
+                prod = (sp["val"][:, :, None] * out[:, None, :]).reshape(-1, c)[sp["perm"]]
+                Ut = np.zeros((sp["k"] + 1, c))
+                Ut[sp["cols"]] = np.add.reduceat(prod, sp["starts"], axis=0)
+                Z = np.vstack([sp["Ki"] @ Ut[:-1], np.zeros((1, c))])
+                out = out - self.dinv[:, None] * np.einsum("nw,nwc->nc", sp["val"], Z[sp["idx"]])
         return out.ravel() if one else out
 
 

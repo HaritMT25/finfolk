@@ -362,6 +362,43 @@ class TestRecurrence(unittest.TestCase):
                 dense = np.linalg.solve(np.diag(d[mask] + ridge) + U[mask] @ U[mask].T, A)
                 self.assertLessEqual(float(np.max(np.abs(ws - dense)) / np.max(np.abs(dense))), 1e-10)
 
+    def test_structured_woodbury_is_exact(self):
+        """#68 CPU lever L2: the structured W-apply (K assembled from U's sparse rows, the n x k product never
+        formed) against (i) the pre-L2 dense Woodbury, verbatim, and (ii) the dense solve, on g4-shaped full-scope
+        banks (n 2143; k 234 with two nonzeros per row, k 412 with four) including extreme diagonals (1e-6 and
+        1e6 entries): <= 1e-12 relative to the dense Woodbury and to the dense solve where it is well posed."""
+        rc = self.rc
+        rng = np.random.default_rng(13)
+        for n, k, w, extreme in ((2143, 234, 2, False), (2143, 412, 4, False), (2143, 412, 4, True), (500, 90, 4, True)):
+            d = 1e-4 * (1 + rng.random(n))
+            if extreme:
+                d[rng.random(n) < 0.3] = 1e-6
+                d[rng.random(n) < 0.3] = 1e6
+            U = np.zeros((n, k))
+            if w == 2:
+                cols = (rng.integers(0, k // 2, n), k // 2 + rng.integers(0, k - k // 2, n))
+            else:
+                pre = rng.integers(0, k - 42, n)
+                cols = (pre, pre + 1, pre + 2, k - 40 + rng.integers(0, 40, n))
+            for c in cols:
+                U[np.arange(n), c] = 3e-3 * rng.standard_normal(n)
+            cov = rc.Cov(d, U)
+            A = rng.standard_normal((n, 36))
+            got = cov.wmul(A)
+            DU = U * cov.dinv[:, None]                                      # (the pre-L2 dense Woodbury)
+            Kc = np.linalg.cholesky(np.eye(k) + U.T @ DU)
+            Ki = np.linalg.solve(Kc.T, np.linalg.solve(Kc, np.eye(k)))
+            old = A * cov.dinv[:, None] - (DU @ ((Ki + Ki.T) / 2)) @ (U.T @ (A * cov.dinv[:, None]))
+            rel = np.max(np.abs(got - old), axis=0) / np.max(np.abs(old), axis=0)
+            self.assertLessEqual(float(rel.max()), 1e-12, (n, k, extreme))
+            if n <= 600:
+                ridge = rc.RIDGE * float(np.median(cov.diag))
+                dense = np.linalg.solve(np.diag(d + ridge) + U @ U.T, A)
+                rel = np.max(np.abs(got - dense), axis=0) / np.max(np.abs(dense), axis=0)
+                self.assertLessEqual(float(rel.max()), 1e-12, (n, k, extreme))
+            v = cov.wmul(A[:, 0])                                           # (a vector: the same operator)
+            self.assertLessEqual(float(np.max(np.abs(v - got[:, 0])) / np.max(np.abs(got[:, 0]))), 1e-13)
+
     def test_no_period_from_graph_density(self):
         """21 (noiseless part): constant and drifting strategies on an irregular coarse + fine graph give
         zero residual recurrence at every candidate."""
