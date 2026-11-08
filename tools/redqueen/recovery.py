@@ -109,9 +109,13 @@ def reference_times(path):
         if g not in out or not k.isdigit() or not isinstance(fr, int) or (fr != 1 and fr % 1_000_000):
             raise SystemExit(f"{path}: {slot} is not a reference slot with a snapshot frame")
         out[g][int(k)] = 0 if fr == 1 else fr // 1_000_000
-    for g in out:
+        if not isinstance(v.get("world"), str):
+            raise SystemExit(f"{path}: {slot} needs its sentinel world")
+    for g in ("RQ", "RP"):
         if sorted(out[g]) != list(range(8)):
             raise SystemExit(f"{path}: {g} needs exactly the slots 0..7")
+    out["sentinels"] = {g: {int(s_.partition(":")[2]): v["world"] for s_, v in doc["references"].items()
+                            if s_.partition(":")[0] == g} for g in ("RQ", "RP")}
     return out, rqlib.sha256_file(path)
 LAG_EDGES = (-200, -50, -20, -10, -5, -3, -2, -1, 0, 1, 2, 3, 5, 10, 20, 50, 201)
 
@@ -165,20 +169,25 @@ class Data:
             qn.setdefault(q, len(qn))
             pn.setdefault(p, len(pn))
 
+        sents = sorted({x for g in ("RQ", "RP") for x in refs["sentinels"][g].values()}) if refs else None
+
         def nodes(d):
             w, t, ref, held = np.zeros(len(d), int), np.zeros(len(d), int), np.zeros(len(d), bool), \
                 np.zeros(len(d), "<U5")
+            sent = np.full(len(d), -1)
             for n, i in d.items():
                 gg, ww, tt = graphlib.parse(n)
                 if ww is None:
                     w[i], t[i], ref[i], held[i] = -1, (refs[gg][tt] if refs else REF_TIMES[tt]), True, "train"
+                    # (#71 r3 P2: the slot's ACTUAL sentinel; planning without references: slot mod 4, assumed)
+                    sent[i] = sents.index(refs["sentinels"][gg][tt]) if refs else tt % 4
                 else:
                     w[i], t[i] = widx[ww], tt
                     held[i] = split[ww] if split[ww] != "train" else holdout.get((ww, tt), "train")
-            return w, t, ref, held
+            return w, t, ref, held, sent
         self.nQ, self.nP = len(qn), len(pn)
-        self.qw, self.qt, self.qref, self.qheld = nodes(qn)
-        self.pw, self.pt, self.pref, self.pheld = nodes(pn)
+        self.qw, self.qt, self.qref, self.qheld, self.qsent = nodes(qn)
+        self.pw, self.pt, self.pref, self.pheld, self.psent = nodes(pn)
         self.qkey = {i: n for n, i in qn.items()}
         self.pkey = {i: n for n, i in pn.items()}
         E = len(g["edges"])
@@ -318,16 +327,16 @@ def simulate(D, sc, seed):
         return out
     emb = {"Q": embed(), "P": embed()}
 
-    def node_vals(g, wv, tv, ref):
-        sent = np.where(ref, nW + (np.arange(len(wv)) % 4), wv)
+    def node_vals(g, wv, tv, ref, sidx):
+        sent = np.where(ref, nW + sidx, wv)              # (a reference's history: its ACTUAL sentinel's)
         x = qual[g][sent, tv] + rng.normal(0.0, s["snap_sd"], len(wv))
         e = None
         if rank:
             e = emb[g][sent, tv] + rng.normal(0.0, 0.3, (len(wv), rank))
             e -= e[ref].mean(axis=0)               # centred on the eight references (v4 §6.3)
         return x, e
-    b, u = node_vals("Q", D.qw, D.qt, D.qref)
-    a, v = node_vals("P", D.pw, D.pt, D.pref)
+    b, u = node_vals("Q", D.qw, D.qt, D.qref, D.qsent)
+    a, v = node_vals("P", D.pw, D.pt, D.pref, D.psent)
     eta0 = s["mu0"] + a[D.pj] - b[D.qi] - s["kappa"] * a[D.pj] * b[D.qi]
     own = np.zeros(len(D.qi))
     if D.within.any():
@@ -701,7 +710,8 @@ def run_config(a, graph_sha):
     rp = getattr(a, "references", None)
     if rp:
         times, sha = reference_times(rp)
-        refs = {"sha256": sha, "times": {g: [times[g][k] for k in range(8)] for g in ("RQ", "RP")}}
+        refs = {"sha256": sha, "times": {g: [times[g][k] for k in range(8)] for g in ("RQ", "RP")},
+                "sentinels": {g: [times["sentinels"][g][k] for k in range(8)] for g in ("RQ", "RP")}}
     else:
         refs = {"assumed": list(REF_TIMES)}
     return {"schema": CONFIG_SCHEMA, "graph_edges_sha256": graph_sha, "namespace": a.namespace, "references": refs,
@@ -879,7 +889,7 @@ def conditioning(D, rank, option="a", seed=0):
     [-1, v_j] for a prey (the opponents' standard-normal embeddings; [1, u_i] for a predator) ->
     per population class, the condition-number quantiles and the share above 30 or singular."""
     rng = np.random.default_rng(seed)
-    idx = D.fit[option]
+    idx = D.forward["fit"] if option == "fwd" else D.fit[option]       # (#71 r3 P2: the forward panel too)
     out = {}
     for guild, me, other, n_me, n_other, held, wv, ref in (
             ("prey", D.qi, D.pj, D.nQ, D.nP, D.qheld, D.qw, D.qref),
@@ -964,7 +974,7 @@ def main(argv=None):
         return bench(a)
     if a.cmd == "conditioning":
         D = load_data(a.graph, a.references)
-        rep = {opt: {f"rank{r}": conditioning(D, r, opt, r) for r in (1, 2, 3, 4)} for opt in OPTIONS}
+        rep = {opt: {f"rank{r}": conditioning(D, r, opt, r) for r in (1, 2, 3, 4)} for opt in OPTIONS + ("fwd",)}
         rep["references"] = ({"sha256": reference_times(a.references)[1]} if a.references
                              else {"assumed": list(REF_TIMES)})
         rep["reference_support"] = D.forward["reference_support"]

@@ -256,31 +256,59 @@ def bind_validation(block, validation_dir, main_registries, forks=None):
             "sentinels": sent, "sentinel_rule": SENTINEL_RULE, "studies": recs}
 
 
-def candidates(block, sentinels):
+def attempt_uuid(base, k):
+    """val_block.py's identity of a restarted attempt k > 0 (worlds.py keeps the registry uuid instead)."""
+    return base if not k else str(uuid.uuid5(uuid.NAMESPACE_URL, f"finfolk:attempt:{base}:{k}"))
+
+
+def availability_reason(a, w, lab):
+    """THE AVAILABILITY RULE (Codex #71 r3 P2): None when (w, lab) is a candidate, else the registered
+    omission reason, from the availability record alone:
+      - the sentinel's current attempt must be ESTABLISHED (status not "failed"), its identity the registered
+        recipe (worlds.py keeps it across restarts) or val_block's attempt identity of it;
+      - the snapshot must be archived and before the world's first zero."""
+    reg_uuid = recipe(VALIDATION_NAMESPACE, w)
+    k = a.get("attempt") or 0
+    fr = frame_of(lab)
+    if a.get("uuid") not in (reg_uuid, attempt_uuid(reg_uuid, k)):
+        return "an identity that is not the registered one (nor its attempt's)"
+    if a.get("status") == "failed":
+        return f"attempt {k} is not established (failed)"
+    if fr not in (a.get("archived") or []):
+        return "not archived"
+    if a.get("valid_before") is not None and fr >= a["valid_before"]:
+        return f"at or after the world's first zero (frame {a['valid_before']})"
+    return None
+
+
+def candidates(block, sentinels, reg=None):
     """The usable (sentinel, time) candidates (the same for both guilds), the omitted ones with their reasons
-    (the extinction fallback) and every sentinel's availability record."""
+    (the extinction fallback) and every sentinel's availability record. A sentinel's ESTABLISHED current
+    attempt is accepted (Codex #71 r3 P2-3: a burn-in restart keeps the predetermined identity): its attempt
+    number, seed and archive provenance are bound in the availability record."""
     ws = block["worlds"]
+    by = {w.get("id"): w for w in (reg or {}).get("worlds", [])}
     out, omitted, avail = [], [], {}
     for w in sentinels:
         v = ws[w]
-        reg_uuid = recipe(VALIDATION_NAMESPACE, w)
-        restarted = (v.get("attempt") or 0) != 0 or v.get("uuid") != reg_uuid
-        avail[w] = {"uuid": v.get("uuid"), "attempt": v.get("attempt") or 0, "valid_before": v.get("valid_before"),
+        k = v.get("attempt") or 0
+        rw = by.get(w, {})
+        seed = rw.get("founder_seed") if not k else next(
+            (r["seeds"][k] for r in (reg or {}).get("reserved", []) if r.get("slot") == rw.get("seed_slot")
+             and k < len(r.get("seeds", []))), None)
+        avail[w] = {"uuid": v.get("uuid"), "attempt": k, "status": v.get("status"), "seed": seed,
+                    "pattern": v.get("pattern"), "f1": (v.get("paths") or {}).get("F1"),
+                    "valid_before": v.get("valid_before"),
                     "archived": sorted(f for f in v.get("archived", []) if f in {frame_of(t) for t in TIMES})}
         for lab in TIMES:
             fr = frame_of(lab)
             if block["times"].get(lab) != fr:
                 raise RefselError(f"the worlds block has no time {lab} = frame {fr}")
-            if restarted:
-                why = f"restarted attempt {v.get('attempt')}: another history, not the registered identity"
-            elif fr not in v.get("archived", []):
-                why = "not archived"
-            elif v.get("valid_before") is not None and fr >= v["valid_before"]:
-                why = f"at or after the world's first zero (frame {v['valid_before']})"
-            else:
+            why = availability_reason(avail[w], w, lab)
+            if why is None:
                 out.append((w, lab))
-                continue
-            omitted.append({"world": w, "time": lab, "reason": why})
+            else:
+                omitted.append({"world": w, "time": lab, "reason": why})
     return out, omitted, avail
 
 
@@ -326,7 +354,7 @@ def make_design(block, templates, ages, avoid_paths, validation_dir=None, main_r
         raise RefselError("--age-reference: the production age reference (an absolute path to a file) is mandatory")
     if not avoid_paths:
         raise RefselError("--avoid: the production reservations are mandatory")
-    cands, omitted, avail = candidates(block, binding["sentinels"])
+    cands, omitted, avail = candidates(block, binding["sentinels"], _registry(binding["registry"], "validation registry"))
     if not feasible([], cands):
         raise RefselError(f"the usable candidates ({len(cands)}; omitted: {len(omitted)}) cannot meet the "
                           "registered constraints (a sentinel is never replaced)")
@@ -395,25 +423,44 @@ def rebind(design, main_registries=None, forks=None):
         u = recipe(VALIDATION_NAMESPACE, w)
         if u in ids or any(planlib.snapshot_uuid(u, frame_of(lab)) in snaps for lab in TIMES):
             raise RefselError(f"sentinel {w}'s identity or a snapshot of it is a study identity")
+    times = design.get("times") or {}                  # (Codex #71 r3 P1: the SOURCE frames are the canonical ones)
+    if any(times.get(lab) != frame_of(lab) for lab in TIMES) or any(frame_of(lab) != fr for lab, fr in times.items()
+                                                                     if lab in TIMES):
+        raise RefselError("the design's time map is not the canonical one (a label mapped to another frame)")
     avail = rs.get("availability") or {}
-    if rqlib.canonical_sha(avail) != rs.get("availability_sha256"):
-        raise RefselError("the recorded availability does not match its sha256")
-    omitted = {(o["world"], o["time"]) for o in rs.get("omitted", [])}
-    seen = set()
-    for c in rs["candidates"]:
-        w, lab = tuple(c)
-        if w not in sent or lab not in TIMES or (w, lab) in seen or (w, lab) in omitted:
-            raise RefselError(f"candidate {w}@{lab} is not a registered sentinel time of the pool")
-        seen.add((w, lab))
-        a = avail.get(w) or {}
-        fr = frame_of(lab)
-        u = design["worlds"][w]["uuid"]
-        if (u != recipe(VALIDATION_NAMESPACE, w) or a.get("uuid") != u or a.get("attempt") != 0
-                or fr not in (a.get("archived") or []) or (a.get("valid_before") is not None and fr >= a["valid_before"])):
-            raise RefselError(f"candidate {w}@{lab} is inconsistent with the recorded availability")
-    if len(seen) + len(omitted) != len(sent) * len(TIMES):
+    if rqlib.canonical_sha(avail) != rs.get("availability_sha256") or set(avail) != set(sent):
+        raise RefselError("the recorded availability does not match its sha256 or the sentinels")
+    expected = {(w, lab) for w in sent for lab in TIMES}
+    cand = [tuple(c) for c in rs["candidates"]]
+    om = rs.get("omitted", [])
+    omk = [(o.get("world"), o.get("time")) for o in om]
+    if len(set(cand)) != len(cand) or len(set(omk)) != len(omk) or set(cand) & set(omk) \
+            or set(cand) | set(omk) != expected:
         raise RefselError("the candidates and the omissions are not exactly the registered sentinel x time set")
+    for w, lab in expected:                            # (availability alone decides the membership and the reason)
+        why = availability_reason(avail[w], w, lab)
+        if (why is None) != ((w, lab) in set(cand)):
+            raise RefselError(f"{w}@{lab}: its membership disagrees with the recorded availability")
+    for o in om:
+        if o.get("reason") != availability_reason(avail[o["world"]], o["world"], o["time"]):
+            raise RefselError(f"{o['world']}@{o['time']}: the omission reason is not the availability's")
+    for w, lab in cand:
+        if design["worlds"][w]["uuid"] != avail[w]["uuid"]:
+            raise RefselError(f"candidate {w}@{lab}: the design's identity is not the availability's")
     return recs
+
+
+def check_plan_endpoints(rows):
+    """Codex #71 r3 P1: every bound source endpoint of the final plan carries the CANONICAL frame of its time
+    label and the snapshot identity of that frame."""
+    for cid, r in rows.items():
+        for role in ("prey", "predators"):
+            e = r.get(role)
+            if not isinstance(e, dict):
+                continue
+            fr = frame_of(e.get("time"))
+            if e.get("frame") != fr or e.get("snapshot") != planlib.snapshot_uuid(e.get("uuid"), fr):
+                raise RefselError(f"plan cell {cid}: its {role} endpoint is not {e.get('time')}'s canonical frame")
 
 
 # ================================================================== collect (bound to the final plan)
@@ -709,6 +756,7 @@ def select(obs, design, plan_rows=None, crit=CRITERION, studies=None, plan_sha=N
     if rs["criterion_sha256"] != rqlib.canonical_sha(crit) or rs["criterion"] != crit:
         raise RefselError("the criterion is not the one frozen in the plan (sha256 differs)")
     if plan_rows is not None:
+        check_plan_endpoints(plan_rows)
         check_observations(obs, plan_rows)
     cands = [tuple(c) for c in rs["candidates"]]
     mats = matrices(obs, cands, crit)
@@ -722,9 +770,10 @@ def select(obs, design, plan_rows=None, crit=CRITERION, studies=None, plan_sha=N
         sel = sorted((cands[i] for i in idx), key=lambda c: (frame_of(c[1]), tie_key(guild, c[0], frame_of(c[1]), crit)))
         for k, (w, lab) in enumerate(sel):
             fr = frame_of(lab)
-            wu = design["worlds"][w]["uuid"]
+            wu = recipe(VALIDATION_NAMESPACE, w)          # (the predetermined identity, whatever the attempt)
             ent = {"world": w, "frame": fr, "uuid": wu, "snapshot": planlib.snapshot_uuid(wu, fr),
-                   "archive": planlib.snapshot_path(design, w, lab)}
+                   "archive": planlib.snapshot_path(design, w, lab),
+                   "attempt": (rs.get("availability") or {}).get(w, {}).get("attempt", 0)}
             ent["sha256"] = _archive_sha(plan_rows, w, lab, guild) if plan_rows else None
             refs[f"{guild}:{k}"] = ent
         report["guilds"][guild] = {"selected": [list(c) for c in sel], "objective": total, "parts": parts,

@@ -63,7 +63,7 @@ def registry(ns, n=12, layout=None):
                         "treatment": (layout or {}).get(f"w{i:02d}", "C")} for i in range(1, n + 1)]}
 
 
-def block(root, valid_before=None, attempts=None):
+def block(root, valid_before=None, attempts=None, attempt_uuids=False, status=None):
     """worlds.py design-block's form (no root) of the validation registry at <root>/config/worlds.json."""
     rp = os.path.join(root, "config", "worlds.json")
     if not os.path.isfile(rp):
@@ -73,10 +73,12 @@ def block(root, valid_before=None, attempts=None):
         w = f"w{i:02d}"
         k = (attempts or {}).get(w, 0)
         u = rs.recipe(NS, w)
-        ws[w] = {"uuid": u if not k else str(uuid.uuid5(uuid.NAMESPACE_URL, f"finfolk:attempt:{u}:{k}")),
+        ws[w] = {"uuid": u if not k or not attempt_uuids else rs.attempt_uuid(u, k),     # (worlds.py keeps the uuid)
                  "attempt": k, "treatment": LAYOUT.get(w, "C"), "block": 1, "status": "running",
                  "pattern": os.path.join(root, w, "end.{frame}.json"), "paths": {"F1": os.path.join(root, w, "F1.json")},
                  "valid_before": (valid_before or {}).get(w), "archived": [1] + [t * 1_000_000 for t in range(1, 201)]}
+        if status and w in status:
+            ws[w]["status"] = status[w]
     times = {"F1": 1}
     times.update({f"{t}M": t * 1_000_000 for t in range(1, 201)})
     return {"schema": "finfolk.redqueen.worldsblock/1", "registry_sha256": rqlib.sha256_file(rp), "times": times,
@@ -99,11 +101,18 @@ def files(tmp):
 
 
 def final_rows(design):
+    """The final plan with REAL content hashes: every endpoint's snapshot archive is created (its bytes name
+    the world and frame) and hashed; templates / ages likewise."""
     rows, _, _ = plan.expand_v2(design, pending=True)
     for r in rows:
         for k in rs.HASHED:
-            if isinstance(r.get(k), dict) and r[k].get("path"):
-                r[k]["sha256"] = rqlib.sha256_bytes(f"{k}|{r[k]['path']}".encode())
+            x = r.get(k)
+            if isinstance(x, dict) and x.get("path"):
+                if not os.path.isfile(x["path"]):
+                    os.makedirs(os.path.dirname(x["path"]), exist_ok=True)
+                    with open(x["path"], "w") as f:
+                        f.write(json.dumps({"world": x.get("world"), "frame": x.get("frame"), "role": k}))
+                x["sha256"] = rqlib.sha256_file(x["path"])
     return {r["id"]: r for r in rows}
 
 
@@ -196,9 +205,14 @@ class TestPlanAndBinding(Base):
         om = [o for o in r["omitted"] if o["world"] == "w06"]
         self.assertEqual(len(om), 7)
         self.assertTrue(all("first zero" in o["reason"] for o in om))
-        d2 = self.design(block(self.f["vdir"], attempts={"w03": 1}))
-        self.assertFalse(any(c[0] == "w03" for c in d2["refsel"]["candidates"]))
-        self.assertTrue(all("restarted attempt" in o["reason"] for o in d2["refsel"]["omitted"]))
+        for au in (False, True):                       # (Codex #71 r3 P2-3: an ESTABLISHED restart is kept)
+            d2 = self.design(block(self.f["vdir"], attempts={"w03": 1}, attempt_uuids=au))
+            self.assertEqual(sum(1 for c in d2["refsel"]["candidates"] if c[0] == "w03"), 8)
+            self.assertEqual(d2["refsel"]["availability"]["w03"]["attempt"], 1)
+            self.assertEqual(len(rs.rebind(d2)), 2)
+        d3 = self.design(block(self.f["vdir"], attempts={"w03": 2}, status={"w03": "failed"}))
+        self.assertFalse(any(c[0] == "w03" for c in d3["refsel"]["candidates"]))
+        self.assertTrue(all("not established" in o["reason"] for o in d3["refsel"]["omitted"]))
         with self.assertRaises(rs.RefselError):                         # (two usable sentinels)
             self.design(block(self.f["vdir"], valid_before={"w03": 1, "w06": 1}))
         with self.assertRaises(rs.RefselError):                         # (no late snapshot anywhere)
@@ -264,6 +278,18 @@ class TestPlanAndBinding(Base):
             x["worlds"].setdefault("w08", dict(x["worlds"]["w01"], uuid=rs.recipe(NS, "w08")))
             with self.assertRaises(rs.RefselError):
                 rs.rebind(x)
+        x = json.loads(json.dumps(d))                                       # (Codex's pruned pool: 31 + a foreign omission)
+        x["refsel"]["candidates"] = [c for c in x["refsel"]["candidates"] if c != ["w02", "20M"]]
+        x["refsel"]["omitted"] = [{"world": "w08", "time": "20M", "reason": "not archived"}]
+        with self.assertRaises(rs.RefselError):
+            rs.rebind(x)
+        x["refsel"]["omitted"] = [{"world": "w02", "time": "20M", "reason": "not archived"}]   # (archived and valid)
+        with self.assertRaises(rs.RefselError):
+            rs.rebind(x)
+        x = json.loads(json.dumps(d))                                       # (120M mapped to 160M: Codex's P1)
+        x["times"]["120M"] = 160_000_000
+        with self.assertRaises(rs.RefselError):
+            rs.rebind(x)
         x = json.loads(json.dumps(d))
         x["refsel"]["availability"]["w02"]["valid_before"] = 50_000_000      # (the record's sha no longer matches)
         with self.assertRaises(rs.RefselError):
@@ -489,6 +515,8 @@ class TestSelection(Base):
                                                    "archive": plan.snapshot_path(self.d, w, lab),
                                                    "sha256": rs._archive_sha(self.rows, w, lab, g)}
         p4 = write_json(os.path.join(self.tmp, "refs4.json"), refs4)
+        for v in refs4["references"].values():                           # (REAL archives: their bytes' hash)
+            self.assertEqual(rqlib.sha256_file(v["archive"]), v["sha256"])
         self.assertEqual(len(sealing.load_references(p4, uuids, branches, MAIN_NS)), 16)   # (a VALID assignment)
         times, sha = recovery.reference_times(p4)
         self.assertEqual((times["RQ"][4], times["RP"][4]), (140, 140))
@@ -518,6 +546,20 @@ class TestSelection(Base):
             self.assertEqual(recovery.main(["conditioning", "--graph", gp, "--references", p4, "--out", out]), 0)
         cond = rqlib.read_json(out)
         self.assertEqual(cond["references"]["sha256"], sha)
+        self.assertIn("fwd", cond)                                        # (the forward panel's conditioning)
+        # (Codex #71 r3 P2-5: the simulated reference histories follow the ACTUAL sentinels: regrouping the same
+        # slot times across other sentinels changes the data for a fixed seed; one sentinel = one history)
+        self.assertEqual({int(actual.qsent[i]) for i in range(actual.nQ) if actual.qref[i]} <= set(range(4)), True)
+        regroup = json.loads(json.dumps(refs4))
+        for k in range(8):
+            for g in ("RQ", "RP"):
+                regroup["references"][f"{g}:{k}"]["world"] = ("w01", "w02", "w03", "w06")[k % 4]
+        p5 = write_json(os.path.join(self.tmp, "refs5.json"), regroup)
+        D5 = recovery.load_data(gp, p5)
+        self.assertTrue(np.array_equal(D5.qt, actual.qt))
+        sim4 = recovery.simulate(actual, recovery.SCENARIOS["r2_034"], 7)
+        sim5 = recovery.simulate(D5, recovery.SCENARIOS["r2_034"], 7)
+        self.assertFalse(np.allclose(sim4["zbar"], sim5["zbar"]))
         self.assertEqual(cond["reference_support"], json.loads(json.dumps(sup)))
 
 
