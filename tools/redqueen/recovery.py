@@ -90,7 +90,29 @@ B_COUNT = 324                     # K [1 + floor(80 s / 1.5 s)]: the 1.5 s coold
 FAMS = list(graphlib.FAMILIES)
 ROLES = ["training", "validation", "test", "support"]
 OPTIONS = ("a", "b", "base")
-REF_TIMES = (0, 20, 60, 100, 120, 140, 180, 200)
+REF_TIMES = (0, 20, 60, 100, 120, 140, 180, 200)   # (ASSUMED slot times: planning only, before references exist)
+REFS_SCHEMA = "finfolk.redqueen.references/1"
+
+
+def reference_times(path):
+    """The ACTUAL reference frames per guild and slot from a references/1 document (refsel.py's selection;
+    Codex #71 r1 P2-5): {"RQ": {k: t_M}, "RP": {k: t_M}} (F1 = frame 1 -> 0), with the file's sha256. The
+    slot -> time map is the selection's, never the assumed REF_TIMES (several references may share a time, and
+    a panel with exactly four early references has its slot 4 late)."""
+    doc = rqlib.read_json(path)
+    if doc.get("schema") != REFS_SCHEMA:
+        raise SystemExit(f"{path}: not a references/1 document")
+    out = {"RQ": {}, "RP": {}}
+    for slot, v in (doc.get("references") or {}).items():
+        g, _, k = slot.partition(":")
+        fr = v.get("frame") if isinstance(v, dict) else None
+        if g not in out or not k.isdigit() or not isinstance(fr, int) or (fr != 1 and fr % 1_000_000):
+            raise SystemExit(f"{path}: {slot} is not a reference slot with a snapshot frame")
+        out[g][int(k)] = 0 if fr == 1 else fr // 1_000_000
+    for g in out:
+        if sorted(out[g]) != list(range(8)):
+            raise SystemExit(f"{path}: {g} needs exactly the slots 0..7")
+    return out, rqlib.sha256_file(path)
 LAG_EDGES = (-200, -50, -20, -10, -5, -3, -2, -1, 0, 1, 2, 3, 5, 10, 20, 50, 201)
 
 SCENARIOS = {
@@ -124,8 +146,11 @@ DEFAULTS = dict(rank=0, energy=0.0, link="logit", kappa=0.0, clustered=False, ow
 class Data:
     """The graph as arrays: prey / predator node indices of every pair, family, role, lags, worlds."""
 
-    def __init__(self, g):
+    def __init__(self, g, refs=None):
+        """refs: the ACTUAL reference times per guild and slot (reference_times); None: the assumed REF_TIMES
+        (planning before the selection exists, recorded as such)."""
         self.g = g
+        self.ref_times = refs
         split, treat = g["split"], {w["id"]: w["treatment"] for w in g["worlds"]}
         self.worlds = sorted(treat)
         widx = {w: i for i, w in enumerate(self.worlds)}
@@ -146,7 +171,7 @@ class Data:
             for n, i in d.items():
                 gg, ww, tt = graphlib.parse(n)
                 if ww is None:
-                    w[i], t[i], ref[i], held[i] = -1, REF_TIMES[tt], True, "train"
+                    w[i], t[i], ref[i], held[i] = -1, (refs[gg][tt] if refs else REF_TIMES[tt]), True, "train"
                 else:
                     w[i], t[i] = widx[ww], tt
                     held[i] = split[ww] if split[ww] != "train" else holdout.get((ww, tt), "train")
@@ -218,11 +243,25 @@ class Data:
         fitrole = (self.role == ROLES.index("training")) | (self.role == ROLES.index("support"))
         notest = self.role != ROLES.index("test")
         fit = np.flatnonzero(((main & trainpair & both(0, 120)) | (oneref & (reft <= 120))) & fitrole)
+        # the reference support of the forward fit (#71 r1 P2-5), per readout side: every world population's
+        # distinct EARLY (<= 120M) reference slots among its fitted reference pairs, at the actual frames
+        sup = {}
+        er = oneref & (reft <= 120) & fitrole
+        for side, node, slot, isref in (("prey", self.qi, self.pj, pr), ("pred", self.pj, self.qi, qr)):
+            sel = np.flatnonzero(er & isref)
+            per = {}
+            for n_, k_ in zip(node[sel].tolist(), slot[sel].tolist()):
+                per.setdefault(n_, set()).add(k_)
+            pops = np.unique(node[np.flatnonzero(glob & isref & ~(qr if side == "prey" else pr))])
+            counts = [len(per.get(int(x), ())) for x in pops]
+            sup[side] = {"populations": len(counts), "min_early_references": min(counts) if counts else 0,
+                         "without_early_reference": sum(1 for c in counts if c == 0)}
         val = np.flatnonzero(main & ((qs != "test") & (ps != "test")) & both(141, 160) & notest)
         fwd = np.flatnonzero(main & trainpair & both(181, 200))
         inter = np.flatnonzero(main & ((qs == "test") | (ps == "test")) & both(181, 200))
         return {"fit": fit, "val": val, "val_world": np.where(qw[val] >= 0, qw[val], pw[val]),
-                "tests": {"forward_transfer": fwd, "intersection": inter}}
+                "tests": {"forward_transfer": fwd, "intersection": inter},
+                "reference_support": dict(sup, times="actual" if self.ref_times else "assumed")}
 
 
 # ------------------------------------------------------------------ truth
@@ -647,10 +686,17 @@ CONFIG_SCHEMA = "finfolk.redqueen.recoverycfg/1"
 
 
 def run_config(a, graph_sha):
-    """Everything a recovery result depends on (resume and summary refuse to mix two of them)."""
+    """Everything a recovery result depends on (resume and summary refuse to mix two of them), the reference
+    assignment included (its sha256 and actual times, or the assumed REF_TIMES)."""
     tools = {f: rqlib.sha256_file(os.path.join(HERE, f)) for f in ("recovery.py", "map.py", "graph.py")
              if os.path.isfile(os.path.join(HERE, f))}
-    return {"schema": CONFIG_SCHEMA, "graph_edges_sha256": graph_sha, "namespace": a.namespace,
+    rp = getattr(a, "references", None)
+    if rp:
+        times, sha = reference_times(rp)
+        refs = {"sha256": sha, "times": {g: [times[g][k] for k in range(8)] for g in ("RQ", "RP")}}
+    else:
+        refs = {"assumed": list(REF_TIMES)}
+    return {"schema": CONFIG_SCHEMA, "graph_edges_sha256": graph_sha, "namespace": a.namespace, "references": refs,
             "fitter": a.fitter, "options": a.options, "ranks": a.ranks, "lambdas": a.lambdas, "iters": a.iters,
             "ab_cap": a.ab_cap, "tools_sha256": tools, "scenarios": SCENARIOS, "defaults": DEFAULTS,
             "bootstrap": "crossed/1"}
@@ -660,14 +706,15 @@ def graph_sha(path):
     return rqlib.read_json(os.path.join(os.path.dirname(os.path.abspath(path)), "graph.meta.json"))["edges_sha256"]
 
 
-def load_data(path):
-    if path not in _DATA:
-        _DATA[path] = Data(graphlib.load(path))
-    return _DATA[path]
+def load_data(path, refs_path=None):
+    key = (path, refs_path)
+    if key not in _DATA:
+        _DATA[key] = Data(graphlib.load(path), reference_times(refs_path)[0] if refs_path else None)
+    return _DATA[key]
 
 
 def one(a):
-    D = load_data(a.graph)
+    D = load_data(a.graph, getattr(a, "references", None))
     sc = SCENARIOS[a.scenario]
     seed = rqlib.derive_seed(a.namespace, "recovery", a.scenario, a.rep)
     t0 = time.time()
@@ -731,7 +778,8 @@ def run(a):
             cmd = [sys.executable, os.path.abspath(__file__), "one", "--graph", a.graph, "--scenario", sc,
                    "--rep", str(rep), "--out", f, "--options", a.options, "--ranks", str(a.ranks),
                    "--lambdas", a.lambdas, "--iters", str(a.iters), "--namespace", a.namespace,
-                   "--ab-cap", str(a.ab_cap), "--fitter", a.fitter]
+                   "--ab-cap", str(a.ab_cap), "--fitter", a.fitter] + \
+                (["--references", a.references] if getattr(a, "references", None) else [])
             running.append((subprocess.Popen(cmd, env=env, stdin=subprocess.DEVNULL), sc, rep))
         time.sleep(0.5)
         for item in list(running):
@@ -867,6 +915,8 @@ def main(argv=None):
         if name != "summarize":
             s.add_argument("--graph", required=True)
             s.add_argument("--iters", type=int, default=40)
+            s.add_argument("--references", help="the selected references/1 document: the ACTUAL reference "
+                                                "frames per guild (default: the assumed REF_TIMES, planning only)")
         if name in ("run", "one"):
             s.add_argument("--options", default="a,b,base")
             s.add_argument("--ranks", type=int, default=4)

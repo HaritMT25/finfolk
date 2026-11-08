@@ -5,28 +5,51 @@ on the registered information criterion, written as config/references.json (finf
 the format sealing.py consumes). The criterion and the constraints are FROZEN in the plan (their sha256)
 before any candidate outcome exists; main-world performance never enters (only the sentinel grid).
 
-CANDIDATES. The four predetermined sentinels (default w01, w04, w05, w06 of the validation registry)
-at F1, 20, 60, 100, 120, 140, 180, 200M, where the snapshot is archived and valid (before the world's
-first zero): the same (sentinel, time) set for both guilds (a candidate prey reference is the
+CANDIDATES. The four PREDETERMINED sentinels w01, w04, w05, w06 (fixed: no override) of the VALIDATION
+registry, at F1, 20, 60, 100, 120, 140, 180, 200M, where the snapshot is archived and valid (before the
+world's first zero): the same (sentinel, time) set for both guilds (a candidate prey reference is the
 sentinel's prey snapshot, a candidate predator reference its predators). Four usable sentinels: 32 per
-guild. Every sentinel's registry uuid must be uuid5(URL, "finfolk:redqueen:<sentinel namespace>:<id>")
-(the references' identity recipe).
+guild. THE BINDING (Codex #71 r1 P1; checked at plan AND at selection):
+  - the validation registry <validation dir>/config/worlds.json has the worlds block's registry_sha256 and
+    the registered namespace VALIDATION_NAMESPACE (the references' namespace);
+  - every sentinel is registered there, treatment C, with uuid uuid5(URL, "finfolk:redqueen:<namespace>:
+    <id>") (the references' identity recipe), and the block's uuid IS that identity;
+  - no sentinel identity and no candidate snapshot identity is a study identity (sealing.study_identities
+    of the main registries, --main-registry, mandatory, and the fork registry, --forks), and no main
+    registry uses the validation namespace.
+THE EXTINCTION FALLBACK (registered): a sentinel is never replaced. A candidate is OMITTED, with its reason
+recorded in the plan and the receipt, when its snapshot is not archived, lies at or after the world's first
+zero (valid_before), or its sentinel is a restarted attempt (another history: not the registered
+identity). The pool shrinks; the constraints (at least three distinct sentinels among the eight, the
+early / late counts) must still be satisfiable, else the plan is refused.
 
 PLAN (`plan`): a design/2 for plan.py: every prey candidate against every predator candidate (family
 refgrid) plus each prey candidate's predator-free control (refgrid-free), the production assay (frozen,
 K 6, 600 common prey, 5k, the production age reference: mandatory), R = 6, role diagnostic, its own seed
 namespace; every engine seed checked against every --avoid input (mandatory). 32 x 32 x 6 = 6,144 grid
-trajectories (+ 192 controls).
+trajectories (+ 192 controls). The plan records the binding, the omitted candidates with their reasons and
+the AVAILABILITY of every sentinel (its uuid, attempt, archived candidate frames, valid_before: the inputs
+that determine the pool, with their sha256) and the whole block's sha256.
 
 COLLECT (`collect`): the packed cells through store.py's verified index, bound to the FINAL plan (every
 bundle carries its plan row exactly; the 600 cohort; every cell collected or declared missing).
+
+THE OBSERVATIONS (Codex #71 r1 P2-2 / P2-3): exactly the registered replicates 0..R-1 (R = 6) of every grid
+cell, each with ITS matched predator-free control (the same prey candidate and replicate); a missing,
+extra or unregistered replicate, or a missing control, is refused (no silent fallback to fewer
+replicates). Every observation must be exactly a cell of the final plan (its id, prey, predators and
+replicate).
 
 THE CRITERION (registered; CRITERION below, frozen in the plan). Per cell and replicate: the capture
 logit l = logit((C + 1/2) / (B + 1)), B = the registered capture bound (324: K 6, the 1.5 s cooldown,
 5k), and the survival contrast q = (S_exposed - S_free) / 600 (the same replicate's common prey). Per
 readout X in {l, q}: the replicate means X (prey x predator candidates), double-centred (the map's
 intercepts removed), its SVD U S V'; a predator candidate's rank-r embedding v_j = V_j,1..r S_1..r^(1/2)
-(a prey candidate's u_i likewise). A predator-reference SET places a prey population from its responses:
+(a prey candidate's u_i likewise). TIED SINGULAR SUBSPACES (Codex #71 r1 P2-6): singular values within
+SV_TIE_REL = 1e-8 of the largest (relative) of each other form one group, and a rank r that would split a
+group is EXTENDED to the group's end (r_eff, reported): the information I_r then depends on the group's
+projector only, never on the SVD's basis within it (lambda_min is invariant to rotations inside an
+equal-scale group and to sign flips). A predator-reference SET places a prey population from its responses:
 its noise-weighted information for rank r is I_r = sum_{j in set} w_j [1, v_j][1, v_j]' (w_j = 1 / the
 mean over prey candidates of the cell's variance of the mean: the replicate variance / R, floored at the
 binomial count variance / R: 1 / (B p (1 - p)) for the capture logit at p = (C + 1/2) / (B + 1), and
@@ -43,11 +66,17 @@ CONSTRAINTS (each guild): eight references; at least three distinct sentinels; a
 PROCEDURE: greedy (add the best candidate whose addition keeps a constraint-satisfying completion
 possible: an exact search over the (sentinel, early/late) attribute counts), then swaps (the best
 improving exchange of a selected and an unselected candidate keeping the constraints, until none
-improves; at most 200); every tie (relative 1e-12) broken by the order of
+improves; at most 200, the report saying whether the search CONVERGED or stopped at the limit); every
+tie (relative 1e-12) broken by the order of
 sha256("<criterion namespace>|refsel|<guild>|<world>|<frame>"). Slots: the selected references sorted by
 (frame, that hash): RQ:0..7 (prey references), RP:0..7 (predator references).
+THE RECEIPT (references/1 "selection"; Codex #71 r1 P2-3): the criterion, design, final-plan and
+OBSERVATIONS content hashes, the block's and the availability's sha256 with the availability itself, the
+omitted candidates, the binding (the validation registry, the main / fork registries checked) and the
+implementation (refsel.py's sha256, numpy's version).
 
-    refsel.py plan --block worlds_block.json --sentinel-namespace NS --templates /abs/t.json ... \\
+    refsel.py plan --block worlds_block.json --validation-dir ~/finfolk/validation \\
+        --main-registry STUDY/config/worlds.json [--forks STUDY/config/forks.json] --templates /abs/t.json ... \\
         --age-reference /abs/ages.json --avoid PRODUCTION/config/worlds.json [--avoid ...] --out grid.json
     refsel.py collect --study GRID_STUDY --design grid.json --plan FINAL_PLAN.jsonl --out obs.json
     refsel.py select obs.json --design grid.json --plan FINAL_PLAN.jsonl --out config/references.json \\
@@ -74,7 +103,9 @@ SCHEMA = "finfolk.redqueen.refsel/1"
 REFS_SCHEMA = "finfolk.redqueen.references/1"
 OBS_SCHEMA = "finfolk.redqueen.refsel.obs/1"
 SEED_NAMESPACE = "rq2026-refgrid"
-SENTINELS = ("w01", "w04", "w05", "w06")
+VALIDATION_NAMESPACE = "finfolk-rq-validation-pilot-2026-11"     # (the validation registry's: the references')
+WORLDS_SCHEMA = "finfolk.redqueen.worlds/1"
+SENTINELS = ("w01", "w04", "w05", "w06")                         # (predetermined: never overridden)
 TIMES = ("F1", "20M", "60M", "100M", "120M", "140M", "180M", "200M")
 REPLICATES = 6
 HORIZON = 5000
@@ -86,6 +117,7 @@ CRITERION = {
     "capture_bound": 324, "saturation": [0.02, 0.98], "saturation_penalty": 2.0, "eps": 1e-9,
     "variance_floor": "binomial", "max_saturated_share": 0.5,
     "tie_namespace": "rq2026-refsel", "max_swaps": 200, "replicates": REPLICATES, "horizon": HORIZON,
+    "sv_tie_rel": 1e-8, "replicate_rule": "exact 0..R-1 with matched controls",
 }
 
 
@@ -131,26 +163,109 @@ def avoid_seeds(path):
 
 
 # ================================================================== the plan
-def candidates(block, sentinels, sentinel_ns):
-    """The usable (sentinel, time) candidates, the same for both guilds."""
-    ws = block["worlds"]
-    out = []
-    for w in sentinels:
-        if w not in ws:
+def recipe(namespace, wid):
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"finfolk:redqueen:{namespace}:{wid}"))
+
+
+def _registry(path, what):
+    try:
+        reg = rqlib.read_json(path)
+    except (OSError, ValueError) as e:
+        raise RefselError(f"{what} {path}: unreadable ({type(e).__name__})")
+    if not isinstance(reg, dict) or not isinstance(reg.get("worlds"), list):
+        raise RefselError(f"{what} {path}: not a worlds registry")
+    return reg
+
+
+def study_exclusion(main_registries, forks=None):
+    """The study identities the references must avoid (sealing.study_identities over every main registry
+    and the fork registry) -> (ids, snapshot ids, the registries' records)."""
+    import sealing
+    if not main_registries:
+        raise RefselError("--main-registry: the main study's registries are mandatory (the references must be "
+                          "disjoint from every study identity)")
+    uuids, recs, branches = {}, [], {}
+    for p in main_registries:
+        m = _registry(p, "main registry")
+        if m.get("namespace") == VALIDATION_NAMESPACE:
+            raise RefselError(f"main registry {p}: the validation namespace itself")
+        for w in m["worlds"]:
+            uuids[f"{m.get('namespace')}/{w.get('id')}"] = w.get("uuid")
+        recs.append({"path": os.path.abspath(p), "sha256": rqlib.sha256_file(p), "namespace": m.get("namespace")})
+    if forks:
+        fk = _registry(forks, "fork registry")
+        for b in fk["worlds"]:
+            branches[b.get("id")] = {"uuid": b.get("uuid")}
+        recs.append({"path": os.path.abspath(forks), "sha256": rqlib.sha256_file(forks), "kind": "forks"})
+    ids, snaps = sealing.study_identities(uuids, branches)
+    return ids, snaps, recs
+
+
+def bind_validation(block, validation_dir, main_registries, forks=None):
+    """THE BINDING (see the module docstring; Codex #71 r1 P1) -> the binding record."""
+    if block.get("schema") != "finfolk.redqueen.worldsblock/1":
+        raise RefselError(f"worlds block schema {block.get('schema')!r}")
+    if not validation_dir:
+        raise RefselError("--validation-dir: the validation run (its registry) is mandatory")
+    vdir = os.path.abspath(validation_dir)
+    rp = os.path.join(vdir, "config", "worlds.json")
+    if not os.path.isfile(rp):
+        raise RefselError(f"no validation registry at {rp}")
+    reg = _registry(rp, "validation registry")
+    sha = rqlib.sha256_file(rp)
+    if block.get("registry_sha256") != sha:
+        raise RefselError(f"the worlds block was not made from the validation registry {rp}")
+    if block.get("root") is not None and os.path.abspath(block["root"]) != vdir:
+        raise RefselError(f"the worlds block was read from {block['root']!r}, not {vdir!r}")
+    if reg.get("schema") != WORLDS_SCHEMA or reg.get("namespace") != VALIDATION_NAMESPACE:
+        raise RefselError(f"registry namespace {reg.get('namespace')!r}: the references come from the validation "
+                          f"registry ({VALIDATION_NAMESPACE})")
+    by = {w.get("id"): w for w in reg["worlds"]}
+    for w in SENTINELS:
+        r = by.get(w)
+        if r is None or r.get("treatment") != "C" or r.get("uuid") != recipe(VALIDATION_NAMESPACE, w):
+            raise RefselError(f"sentinel {w} is not a registered C identity of the validation namespace")
+        if w not in block["worlds"]:
             raise RefselError(f"sentinel {w} is not in the worlds block")
+    ids, snaps, recs = study_exclusion(main_registries, forks)
+    for w in SENTINELS:
+        u = by[w]["uuid"]
+        if u in ids:
+            raise RefselError(f"sentinel {w}'s identity is a study identity ({ids[u]})")
+        for lab in TIMES:
+            s = planlib.snapshot_uuid(u, frame_of(lab))
+            if s in snaps:
+                raise RefselError(f"sentinel {w}@{lab} is a study snapshot identity ({snaps[s]})")
+    return {"validation_dir": vdir, "registry": rp, "registry_sha256": sha, "namespace": VALIDATION_NAMESPACE,
+            "sentinels": list(SENTINELS), "studies": recs}
+
+
+def candidates(block):
+    """The usable (sentinel, time) candidates (the same for both guilds), the omitted ones with their reasons
+    (the extinction fallback) and every sentinel's availability record."""
+    ws = block["worlds"]
+    out, omitted, avail = [], [], {}
+    for w in SENTINELS:
         v = ws[w]
-        want = str(uuid.uuid5(uuid.NAMESPACE_URL, f"finfolk:redqueen:{sentinel_ns}:{w}"))
-        if v.get("uuid") != want:
-            raise RefselError(f"sentinel {w}: its uuid is not the references' recipe in namespace {sentinel_ns} "
-                              "(a restarted attempt or another registry)")
+        reg_uuid = recipe(VALIDATION_NAMESPACE, w)
+        restarted = (v.get("attempt") or 0) != 0 or v.get("uuid") != reg_uuid
+        avail[w] = {"uuid": v.get("uuid"), "attempt": v.get("attempt") or 0, "valid_before": v.get("valid_before"),
+                    "archived": sorted(f for f in v.get("archived", []) if f in {frame_of(t) for t in TIMES})}
         for lab in TIMES:
             fr = frame_of(lab)
             if block["times"].get(lab) != fr:
                 raise RefselError(f"the worlds block has no time {lab} = frame {fr}")
-            ok = fr in v.get("archived", []) and (v.get("valid_before") is None or fr < v["valid_before"])
-            if ok:
+            if restarted:
+                why = f"restarted attempt {v.get('attempt')}: another history, not the registered identity"
+            elif fr not in v.get("archived", []):
+                why = "not archived"
+            elif v.get("valid_before") is not None and fr >= v["valid_before"]:
+                why = f"at or after the world's first zero (frame {v['valid_before']})"
+            else:
                 out.append((w, lab))
-    return out
+                continue
+            omitted.append({"world": w, "time": lab, "reason": why})
+    return out, omitted, avail
 
 
 def feasible(chosen, pool, crit=CRITERION):
@@ -188,16 +303,17 @@ def feasible(chosen, pool, crit=CRITERION):
     return rec(0, need, [])
 
 
-def make_design(block, sentinels, sentinel_ns, templates, ages, avoid_paths, ns=SEED_NAMESPACE):
-    if block.get("schema") != "finfolk.redqueen.worldsblock/1":
-        raise RefselError(f"worlds block schema {block.get('schema')!r}")
+def make_design(block, templates, ages, avoid_paths, validation_dir=None, main_registries=(), forks=None,
+                ns=SEED_NAMESPACE):
+    binding = bind_validation(block, validation_dir, main_registries, forks)
     if not isinstance(ages, str) or not os.path.isabs(ages) or not os.path.isfile(ages):
         raise RefselError("--age-reference: the production age reference (an absolute path to a file) is mandatory")
     if not avoid_paths:
         raise RefselError("--avoid: the production reservations are mandatory")
-    cands = candidates(block, sentinels, sentinel_ns)
+    cands, omitted, avail = candidates(block)
     if not feasible([], cands):
-        raise RefselError(f"the usable candidates ({len(cands)}) cannot meet the registered constraints")
+        raise RefselError(f"the usable candidates ({len(cands)}; omitted: {len(omitted)}) cannot meet the "
+                          "registered constraints (a sentinel is never replaced)")
     ws = block["worlds"]
     worlds = {w: {"uuid": ws[w]["uuid"], "pattern": ws[w]["pattern"], "paths": ws[w].get("paths", {})}
               for w in sorted({w for w, _ in cands})}
@@ -228,10 +344,32 @@ def make_design(block, sentinels, sentinel_ns, templates, ages, avoid_paths, ns=
             raise RefselError(f"{len(hit)} grid engine seed(s) are reserved in {p}: {hit[:5]}")
         checked.append({"path": os.path.abspath(p), "sha256": rqlib.sha256_file(p)})
     design["refsel"] = {"schema": SCHEMA, "criterion": CRITERION, "criterion_sha256": rqlib.canonical_sha(CRITERION),
-                        "sentinels": list(sentinels), "sentinel_namespace": sentinel_ns,
-                        "candidates": [[w, t] for w, t in cands], "registry_sha256": block.get("registry_sha256"),
-                        "avoid": checked, "cells": len(rows)}
+                        "sentinels": list(SENTINELS), "sentinel_namespace": VALIDATION_NAMESPACE, "binding": binding,
+                        "candidates": [[w, t] for w, t in cands], "omitted": omitted, "availability": avail,
+                        "availability_sha256": rqlib.canonical_sha(avail), "block_sha256": rqlib.canonical_sha(block),
+                        "registry_sha256": block.get("registry_sha256"), "avoid": checked, "cells": len(rows)}
     return design
+
+
+def rebind(design, main_registries=None, forks=None):
+    """The binding checked AGAIN at selection (Codex #71 r1 P1): the recorded validation registry unchanged,
+    the sentinels and namespace the registered ones, and the exclusion re-evaluated on the CURRENT main /
+    fork registries (the recorded ones unless given) -> the current studies record."""
+    rs = design.get("refsel") or {}
+    b = rs.get("binding") or {}
+    if rs.get("sentinels") != list(SENTINELS) or rs.get("sentinel_namespace") != VALIDATION_NAMESPACE \
+            or b.get("namespace") != VALIDATION_NAMESPACE:
+        raise RefselError("the design's sentinels / namespace are not the registered ones")
+    if not b.get("registry") or not os.path.isfile(b["registry"]) or rqlib.sha256_file(b["registry"]) != b.get("registry_sha256"):
+        raise RefselError("the validation registry the plan was bound to is missing or changed")
+    mains = list(main_registries) if main_registries else [r["path"] for r in b.get("studies", []) if r.get("kind") != "forks"]
+    fk = forks or next((r["path"] for r in b.get("studies", []) if r.get("kind") == "forks"), None)
+    ids, snaps, recs = study_exclusion(mains, fk)
+    for w, lab in (tuple(c) for c in rs["candidates"]):
+        u = design["worlds"][w]["uuid"]
+        if u != recipe(VALIDATION_NAMESPACE, w) or u in ids or planlib.snapshot_uuid(u, frame_of(lab)) in snaps:
+            raise RefselError(f"candidate {w}@{lab} is not a sentinel identity outside the study")
+    return recs
 
 
 # ================================================================== collect (bound to the final plan)
@@ -309,6 +447,9 @@ def matrices(obs, cands, crit=CRITERION):
     free = {}
     cells = {}
     for o in obs:
+        r_ = o.get("replicate")
+        if not isinstance(r_, int) or isinstance(r_, bool) or not 0 <= r_ < R:
+            raise RefselError(f"{o.get('cell')}: replicate {r_!r} is not one of the registered 0..{R - 1}")
         if not (isinstance(o.get("survivors"), int) and 0 <= o["survivors"] <= N_PREY):
             raise RefselError(f"{o.get('cell')}: survivors {o.get('survivors')!r}")
         q = pos.get(tuple(o["prey"]))
@@ -330,10 +471,14 @@ def matrices(obs, cands, crit=CRITERION):
             raise RefselError(f"cell {o['prey']} x {o['pred']} r{o['replicate']} twice")
         cells[(q, p)][o["replicate"]] = (c, o["survivors"])
     out = {k: np.full((n, n), np.nan) for k in ("l_mean", "l_var", "q_mean", "q_var", "cap_frac", "surv")}
+    want = list(range(R))
+    for q in range(n):                          # (Codex #71 r1 P2-2: exactly R replicates, controls matched)
+        if [r for r in want if (q, r) in free] != want:
+            raise RefselError(f"prey candidate {cands[q]}: its predator-free controls are not exactly replicates 0..{R - 1}")
     for (q, p), reps in cells.items():
-        rs = sorted(r for r in reps if (q, r) in free)
-        if len(rs) < 2:
-            continue
+        rs = sorted(reps)
+        if rs != want:
+            raise RefselError(f"cell {cands[q]} x {cands[p]}: replicates {rs}, not exactly 0..{R - 1}")
         lv = [math.log((reps[r][0] + 0.5) / (B + 1 - reps[r][0] - 0.5)) if reps[r][0] < B + 0.5 else math.inf for r in rs]
         if not all(math.isfinite(x) for x in lv):
             raise RefselError(f"captures above the capture bound {B} in {cands[q]} x {cands[p]}")
@@ -352,8 +497,8 @@ def matrices(obs, cands, crit=CRITERION):
     for k, v in out.items():
         if np.isnan(v).any():
             miss = int(np.isnan(v).sum())
-            raise RefselError(f"the candidate grid is incomplete: {miss} cells without >= 2 complete replicates "
-                              "(the criterion needs the full grid)")
+            raise RefselError(f"the candidate grid is incomplete: {miss} cells missing (the criterion needs the "
+                              "full grid at every registered replicate)")
     return out
 
 
@@ -370,16 +515,31 @@ def embeddings(mats, crit=CRITERION):
             M = mats[mk]
             Mc = M - M.mean(axis=1, keepdims=True) - M.mean(axis=0, keepdims=True) + M.mean()
             U, S, Vt = np.linalg.svd(Mc)
-            Ssq = np.sqrt(S[:rmax])
-            emb = (Vt[:rmax].T * Ssq) if axis == 1 else (U[:, :rmax] * Ssq)
+            reff = tied_ranks(S, crit)
+            k = max(reff.values())
+            Ssq = np.sqrt(S[:k])
+            emb = (Vt[:k].T * Ssq) if axis == 1 else (U[:, :k] * Ssq)
             var = mats[vk].mean(axis=0) if axis == 1 else mats[vk].mean(axis=1)
             if np.any(var <= 0):
                 raise RefselError(f"{guild} {name}: a candidate with zero replicate variance")
-            g["readouts"][name] = {"emb": emb, "w": 1.0 / var, "sv": S[:rmax].tolist()}
+            g["readouts"][name] = {"emb": emb, "w": 1.0 / var, "sv": S[:k].tolist(), "reff": reff}
         satC = ((mats["cap_frac"] < lo) | (mats["cap_frac"] > hi)).mean(axis=0 if axis == 1 else 1)
         satS = ((mats["surv"] < lo) | (mats["surv"] > hi)).mean(axis=0 if axis == 1 else 1)
         g["sat"] = (satC + satS) / 2
         out[guild] = g
+    return out
+
+
+def tied_ranks(S, crit=CRITERION):
+    """{r: r_eff}: each registered rank extended to the end of its tied singular-value group (values within
+    sv_tie_rel x the largest of each other: Codex #71 r1 P2-6)."""
+    tol = crit["sv_tie_rel"] * (float(S[0]) if len(S) else 0.0)
+    out = {}
+    for r in crit["ranks"]:
+        k = min(r, len(S))
+        while k < len(S) and abs(float(S[k - 1]) - float(S[k])) <= tol:
+            k += 1
+        out[r] = k
     return out
 
 
@@ -390,10 +550,11 @@ def objective(g, idx, crit=CRITERION, detail=False):
     total, parts = 0.0, {}
     for name, rd in g["readouts"].items():
         for r in crit["ranks"]:
-            X = np.hstack([np.ones((n, 1)), rd["emb"][:, :r]])
+            k = rd["reff"][r]
+            X = np.hstack([np.ones((n, 1)), rd["emb"][:, :k]])
             Iall = (X * rd["w"][:, None]).T @ X
-            eps = crit["eps"] * np.trace(Iall) / ((r + 1) * n)
-            I = (X[idx] * rd["w"][idx][:, None]).T @ X[idx] + eps * np.eye(r + 1)
+            eps = crit["eps"] * np.trace(Iall) / ((k + 1) * n)
+            I = (X[idx] * rd["w"][idx][:, None]).T @ X[idx] + eps * np.eye(k + 1)
             lam = float(np.linalg.eigvalsh((I + I.T) / 2)[0])
             v = math.log(max(lam, 1e-300))
             parts[f"{name}/rank{r}"] = v
@@ -437,7 +598,8 @@ def select_guild(g, cands, guild, crit=CRITERION):
         chosen.append(best[2])
         log.append({"add": list(cands[best[2]]), "objective": best[0]})
     cur = objective(g, chosen, crit)
-    for _ in range(crit["max_swaps"]):
+    converged = False
+    for _ in range(crit["max_swaps"] + 1):
         best = None
         for s in sorted(chosen, key=lambda i: rank[i]):
             for c in order:
@@ -452,19 +614,51 @@ def select_guild(g, cands, guild, crit=CRITERION):
                     if better(cand, best):
                         best = cand
         if best is None:
+            converged = True
             break
+        if sum(1 for x in log if "swap_in" in x) >= crit["max_swaps"]:
+            break                       # (an improving exchange remains: the limit, not convergence)
         s, c = best[2]
         chosen = [c if x == s else x for x in chosen]
         cur = best[0]
         log.append({"swap_out": list(cands[s]), "swap_in": list(cands[c]), "objective": cur})
+    log.append({"converged": converged, "swaps": sum(1 for x in log if "swap_in" in x),
+                "max_swaps": crit["max_swaps"]})
     return chosen, log
 
 
-def select(obs, design, plan_rows=None, crit=CRITERION):
-    """The registered selection from the grid observations -> (references/1 document, report)."""
+def check_observations(obs, plan_rows):
+    """Codex #71 r1 P2-3: every observation is exactly a cell of the final plan (its id, prey, predators,
+    replicate), each cell once."""
+    seen = set()
+    for o in obs:
+        cid = o.get("cell")
+        r = plan_rows.get(cid)
+        if r is None:
+            raise RefselError(f"observation {cid!r} is not a cell of the final plan")
+        if cid in seen:
+            raise RefselError(f"observation {cid!r} occurs twice")
+        seen.add(cid)
+        p = r.get("predators")
+        if (list(o.get("prey") or []) != [r["prey"]["world"], r["prey"]["time"]] or o.get("replicate") != r["replicate"]
+                or (o.get("pred") is None) != (p is None)
+                or (p is not None and list(o["pred"]) != [p["world"], p["time"]])):
+            raise RefselError(f"observation {cid!r} disagrees with its plan row")
+
+
+def implementation():
+    import numpy as np
+    return {"refsel_sha256": rqlib.sha256_file(os.path.abspath(__file__)), "numpy": np.__version__}
+
+
+def select(obs, design, plan_rows=None, crit=CRITERION, studies=None, plan_sha=None):
+    """The registered selection from the grid observations -> (references/1 document with its provenance
+    receipt, report). plan_rows: the final plan (every observation is checked against it)."""
     rs = design["refsel"]
     if rs["criterion_sha256"] != rqlib.canonical_sha(crit) or rs["criterion"] != crit:
         raise RefselError("the criterion is not the one frozen in the plan (sha256 differs)")
+    if plan_rows is not None:
+        check_observations(obs, plan_rows)
     cands = [tuple(c) for c in rs["candidates"]]
     mats = matrices(obs, cands, crit)
     emb = embeddings(mats, crit)
@@ -472,6 +666,7 @@ def select(obs, design, plan_rows=None, crit=CRITERION):
     refs, report = {}, {"criterion_sha256": rs["criterion_sha256"], "guilds": {}}
     for guild in ("RQ", "RP"):
         idx, log = select_guild(emb[guild], cands, guild, crit)
+        conv = log.pop()
         total, parts = objective(emb[guild], idx, crit, detail=True)
         sel = sorted((cands[i] for i in idx), key=lambda c: (frame_of(c[1]), tie_key(guild, c[0], frame_of(c[1]), crit)))
         for k, (w, lab) in enumerate(sel):
@@ -485,10 +680,19 @@ def select(obs, design, plan_rows=None, crit=CRITERION):
                                    "steps": log, "sentinels": sorted({w for w, _ in sel}),
                                    "early": sum(1 for _, t in sel if time_m(t) <= crit["early_max_M"]),
                                    "late": sum(1 for _, t in sel if time_m(t) >= crit["late_min_M"]),
-                                   "singular_values": {k: v["sv"] for k, v in emb[guild]["readouts"].items()}}
-    doc = {"schema": REFS_SCHEMA, "namespace": ns, "references": refs,
-           "selection": {"refsel_schema": SCHEMA, "criterion_sha256": rs["criterion_sha256"],
-                         "design_sha256": rqlib.canonical_sha(design)}}
+                                   "singular_values": {k: v["sv"] for k, v in emb[guild]["readouts"].items()},
+                                   "effective_ranks": {k: {str(r): e for r, e in v["reff"].items()}
+                                                       for k, v in emb[guild]["readouts"].items()},
+                                   "search": conv}
+    receipt = {"refsel_schema": SCHEMA, "criterion_sha256": rs["criterion_sha256"],
+               "design_sha256": rqlib.canonical_sha(design), "plan_sha256": plan_sha,
+               "observations_sha256": rqlib.canonical_sha(sorted(obs, key=lambda o: str(o.get("cell")))),
+               "observations": len(obs), "block_sha256": rs.get("block_sha256"),
+               "availability_sha256": rs.get("availability_sha256"), "availability": rs.get("availability"),
+               "omitted": rs.get("omitted", []), "binding": rs.get("binding"), "studies_checked": studies,
+               "implementation": implementation()}
+    doc = {"schema": REFS_SCHEMA, "namespace": ns, "references": refs, "selection": receipt}
+    report["receipt_sha256"] = rqlib.canonical_sha(receipt)
     return doc, report
 
 
@@ -508,8 +712,9 @@ def main(argv=None):
     sub = ap.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("plan")
     s.add_argument("--block", required=True)
-    s.add_argument("--sentinels", default=",".join(SENTINELS))
-    s.add_argument("--sentinel-namespace", required=True)
+    s.add_argument("--validation-dir", required=True)
+    s.add_argument("--main-registry", action="append", default=[], help="the main study's registries (mandatory)")
+    s.add_argument("--forks", help="the fork registry (its branch identities are excluded too)")
     s.add_argument("--templates", nargs="+", required=True)
     s.add_argument("--age-reference", required=True)
     s.add_argument("--avoid", action="append", required=True)
@@ -527,11 +732,13 @@ def main(argv=None):
     s.add_argument("--plan", required=True)
     s.add_argument("--out", required=True)
     s.add_argument("--report", required=True)
+    s.add_argument("--main-registry", action="append", default=[], help="(default: the plan's recorded ones)")
+    s.add_argument("--forks", help="(default: the plan's recorded fork registry, if any)")
     a = ap.parse_args(argv)
     try:
         if a.cmd == "plan":
-            d = make_design(rqlib.read_json(a.block), a.sentinels.split(","), a.sentinel_namespace, a.templates,
-                            a.age_reference, a.avoid, a.namespace)
+            d = make_design(rqlib.read_json(a.block), a.templates, a.age_reference, a.avoid, a.validation_dir,
+                            a.main_registry, a.forks, a.namespace)
             rqlib.write_json_durable(a.out, d)
             print(f"{len(d['refsel']['candidates'])} candidates per guild; {d['refsel']['cells']} cells; "
                   f"criterion {d['refsel']['criterion_sha256'][:16]}")
@@ -549,15 +756,23 @@ def main(argv=None):
         if doc.get("schema") != OBS_SCHEMA or doc.get("plan_sha256") != plan_sha \
                 or doc.get("design_sha256") != rqlib.canonical_sha(design):
             raise RefselError("the observations were not collected under this design and final plan")
-        refs, report = select(doc["observations"], design, rows)
+        studies = rebind(design, a.main_registry or None, a.forks)
+        refs, report = select(doc["observations"], design, rows, studies=studies, plan_sha=plan_sha)
         report["plan_sha256"] = plan_sha
         rqlib.write_json_durable(a.out, refs)
         rqlib.write_json_durable(a.report, report)
         for g in ("RQ", "RP"):
             print(g, report["guilds"][g]["selected"])
         return 0
-    except RefselError as e:
-        print(f"refsel.py {a.cmd}: {e}", file=sys.stderr)
+    except Exception as e:                       # (Codex #71 r1 P3: every refusal is one normalized error)
+        import sealing
+        import store
+        known = (RefselError, OSError, ValueError, KeyError, TypeError, planlib.DesignError, store.StoreError,
+                 sealing.SealError)
+        if not isinstance(e, known):
+            raise
+        what = "" if isinstance(e, RefselError) else f"{type(e).__name__}: "
+        print(f"refsel.py {a.cmd}: {what}{e}", file=sys.stderr)
         return 2
 
 
