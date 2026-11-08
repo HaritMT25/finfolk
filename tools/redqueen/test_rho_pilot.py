@@ -561,5 +561,65 @@ class TestBootstrap(unittest.TestCase):
         self.assertEqual(r1["rho_q75"], r2["rho_q75"])
 
 
+class TestValBlock(unittest.TestCase):
+    def test_block_from_the_validation_layout(self):
+        """val_block.py: the worlds block of runner_val.py's layout: the current attempt only (another
+        uuid for a restarted world), every checkpoint opened (a mismatched one is not archived), the first
+        main-CSV zero over the attempt's segments; rho_pilot plans from it."""
+        import uuid as uuidlib
+        import val_block
+        tmp = tempfile.mkdtemp()
+        try:
+            root = os.path.join(tmp, "validation")
+            ws = []
+            for i, T in enumerate(["C", "A", "B", "C", "C", "C", "C", "B", "A", "C", "C", "C"]):
+                ws.append({"id": f"w{i + 1:02d}", "uuid": f"00000000-0000-0000-0000-{i + 1:012d}", "treatment": T,
+                           "block": i // 6 + 1})
+            os.makedirs(os.path.join(root, "config"))
+            with open(os.path.join(root, "config", "worlds.json"), "w") as f:
+                json.dump({"worlds": ws}, f)
+            for w in ws:
+                k = 1 if w["id"] == "w05" else 0
+                base = os.path.join(root, "worlds", w["id"])
+                ad = os.path.join(base, f"a{k}")
+                os.makedirs(os.path.join(ad, "runs"))
+                with open(os.path.join(base, "state.json"), "w") as f:
+                    json.dump({"attempt": k}, f)
+                for t in range(1, 101):
+                    fr = t * 1_000_000 if not (w["id"] == "w07" and t == 40) else 1
+                    with open(os.path.join(ad, f"end.{t * 1_000_000}.json"), "w") as f:
+                        json.dump({"world": {"frame": fr}}, f)
+                zero = 63_000_000 if w["id"] == "w04" else None
+                with open(os.path.join(ad, "runs", "seg000.csv"), "w") as f:
+                    f.write("step,elapsed_s,population,predator_pop\n")
+                    for fr in range(5_000_000, 60_000_001, 5_000_000):
+                        f.write(f"{fr},1.0,500,10\n")
+                with open(os.path.join(ad, "runs", "seg001.csv"), "w") as f:
+                    f.write("step,elapsed_s,population,predator_pop\n")
+                    for fr in range(60_000_000, 101_000_000, 1_000_000):
+                        f.write(f"{fr},1.0,{0 if zero and fr >= zero else 500},10\n")
+                    f.write("101000")                                     # (a torn last line)
+            b = val_block.block(root)
+            v = b["worlds"]
+            self.assertEqual(v["w05"]["uuid"], str(uuidlib.uuid5(uuidlib.NAMESPACE_URL,
+                                                                 "finfolk:attempt:00000000-0000-0000-0000-000000000005:1")))
+            self.assertEqual(v["w01"]["uuid"], ws[0]["uuid"])
+            self.assertEqual(v["w04"]["valid_before"], 63_000_000)
+            self.assertIsNone(v["w01"]["valid_before"])
+            self.assertNotIn(40_000_000, v["w07"]["archived"])
+            self.assertEqual(len(v["w01"]["archived"]), 100)
+            self.assertTrue(v["w05"]["pattern"].endswith(os.path.join("w05", "a1", "end.{frame}.json")))
+            f = files(tmp)
+            d, notes = rp.make_design(b, [f["t.json"]], f["ages.json"], [f["worlds.json"]])
+            sk = {(x["world"], x["time"]): x["reason"] for x in notes["skipped"]}
+            self.assertEqual(sorted(t for w, t in sk if w == "w04"), ["100M", "70M", "80M", "90M"])
+            self.assertTrue(sk[("w07", "40M")].startswith("technical"))
+            self.assertTrue(sk[("w04", "70M")].startswith("biological"))
+            self.assertNotIn("w04", d["rho_pilot"]["panel"])
+            self.assertTrue(d["edges"][0]["prey"]["world"].startswith("w"))
+        finally:
+            shutil.rmtree(tmp)
+
+
 if __name__ == "__main__":
     unittest.main()
