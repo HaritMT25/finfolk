@@ -165,20 +165,26 @@ def windows(cs, lo, hi, kk, Rf, where):
 
 
 def energy(dbar, den, h, where):
-    """r_h^2 per draw from the recurrent component dbar (m x B): its mean square, relative to the capture
-    denominator squared for capture; a capture denominator <= 0 is the registered +inf. Overflow (of the
-    squares, the range or the ratio) is a numerical failure, never the registered +inf (#68 round 3 P2)."""
+    """r_h^2 per draw from the recurrent component dbar (m x B): survival its mean square; capture the mean
+    square of the RELATIVE component dbar / den, the division BEFORE the squaring (#68 round 4 P2-2: a
+    finite denominator whose square overflows made the energy 0); a capture denominator <= 0 is the
+    registered +inf. Every intermediate (the range, the relative components, the squares, the mean) is
+    checked: overflow is a numerical failure, never the registered +inf (#68 round 3 P2)."""
     B = dbar.shape[1]
     with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
-        ms = np.mean(dbar ** 2, axis=0) if len(dbar) else np.zeros(B)
         Rf = np.ptp(dbar, axis=0) if len(dbar) else np.zeros(B)
-    _bad(ms, where, "squared recurrent component", B)
     _bad(Rf, where, "recurrent range", B)
     if h != "C":
+        with np.errstate(over="ignore", invalid="ignore"):
+            ms = np.mean(dbar ** 2, axis=0) if len(dbar) else np.zeros(B)
+        _bad(ms, where, "squared recurrent component", B)
         return ms, Rf
     pos = den > 0
     with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
-        r2 = ms / np.where(pos, den, 1.0) ** 2
+        rel = dbar / np.where(pos, den, 1.0)[None, :]
+    _bad(np.where(pos[None, :], rel, 0.0), where, "relative recurrent component", B)
+    with np.errstate(over="ignore", invalid="ignore"):
+        r2 = np.mean(rel ** 2, axis=0) if len(dbar) else np.zeros(B)
     _bad(np.where(pos, r2, 0.0), where, "capture energy", B)
     return np.where(pos, r2, np.inf), Rf
 
@@ -310,6 +316,31 @@ def margins(c, a, f):
             ("EF_C[f]-EU_C[a]", F["EF_C"] - A["EU_C"]), ("EF_Q[f]-EU_Q[a]", F["EF_Q"] - A["EU_Q"])]
 
 
+def epoch_coverage(per_world):
+    """E^U's support coverage in one epoch (#68 round 4 (D)): per period band of the registered domain
+    (recurrence.EPOCH_PERIODS) the supported (world, period) cells of all, the worlds with an unsupported
+    in-domain cell (E^U = +inf whenever any: complete support is required, never assumed), the failing rules,
+    and the periods excluded from the domain. Support is joint over the readouts (both are required)."""
+    bands = (("4-8", 4.0, 8.0), ("9-14", 9.0, 14.0), ("15-20", 15.0, 20.0))
+    out = {"domain": [min(recurrence.EPOCH_PERIODS), max(recurrence.EPOCH_PERIODS)],
+           "excluded_periods": list(recurrence.EPOCH_EXCLUDED), "readouts": "joint (C and Q)",
+           "bands": {b: {"supported": 0, "cells": 0} for b, _, _ in bands}, "worlds": len(per_world),
+           "worlds_unsupported": 0, "fail_rules": {}}
+    for w in per_world:
+        bad = False
+        for r in w["obs"]["periods"]:
+            band = next((b for b, lo, hi in bands if lo <= r["P"] <= hi), "other")
+            d = out["bands"].setdefault(band, {"supported": 0, "cells": 0})
+            d["cells"] += 1
+            d["supported"] += bool(r["supported"])
+            if not r["supported"]:
+                bad = True
+                for f in r["fails"]:
+                    out["fail_rules"][f] = out["fail_rules"].get(f, 0) + 1
+        out["worlds_unsupported"] += bad
+    return out
+
+
 def candidates():
     """The six candidates in tie-break order: (ARD epoch, FSD epoch, direction)."""
     out = []
@@ -426,7 +457,11 @@ def ht(epochs, betas, gates, loads=None, k=0, analysis="main", draws=stats.B_BOO
     ids in every epoch, any order); betas: {e: {"P": {world id: slope}, "Q": {world id: slope}}}; gates:
     {e: the epoch's calibrated recurrence-detection gate (bool)}; loads: {world id: {"C": L, "Q": L}}
     reference-source loadings (k columns). Bootstrap draws are computed when a candidate is eligible or
-    report is set."""
+    report is set. c_T None (an unavailable calibration, e.g. a capped mode: #68 round 4 P3) never enters
+    a comparison: the result is unavailable, never a rejection (p = 1 in Holm). The result reports the
+    E^U support COVERAGE per epoch (the registered domain recurrence.EPOCH_PERIODS, by period band)."""
+    calibrated = c_T is not None
+    c_T = max(GUARD, c_T) if calibrated else GUARD
     ids = canonical_ids(epochs, betas, loads)
     n = len(ids)
     missing = [e for e in EPOCHS if gates.get(e) is None]
@@ -453,6 +488,7 @@ def ht(epochs, betas, gates, loads=None, k=0, analysis="main", draws=stats.B_BOO
         for e in EPOCHS:
             obs[e], dr[e], res[e] = epoch_components(per[e], bet[e], idx)
         stat = ht_statistic(obs, dr, gates)
+        coverage = {e: epoch_coverage(per[e]) for e in EPOCHS}
     except TransitionError as err:          # (a numerical failure anywhere: unavailable, never a rejection)
         return {"available": False, "reject": False, "T_T": None, "error": str(err), "failure": "numerical",
                 "winner": None,
@@ -471,7 +507,11 @@ def ht(epochs, betas, gates, loads=None, k=0, analysis="main", draws=stats.B_BOO
                           ("E1", "E3"): "F1-200M"}[tuple(sorted((w["ARD"], w["FSD"])))]
     if report:
         out["classes"] = {e: classify(obs[e], dr[e], gates.get(e, False)) for e in EPOCHS}
+    out["coverage"] = coverage
     if not out["available"]:
         out["reject"] = False
         out["reasons"] = {e: res[e]["reasons"] for e in EPOCHS if not res[e]["available"]}
+    if not calibrated:
+        out.update(available=False, reject=False, c_T=None)
+        out.setdefault("reasons", {})["calibration"] = "c_T unavailable (a capped mode): p = 1 in Holm"
     return out

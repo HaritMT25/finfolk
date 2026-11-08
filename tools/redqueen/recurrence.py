@@ -84,6 +84,7 @@ FULL_PERIODS = tuple(float(p) for p in list(range(4, 21)) + list(range(25, 101, 
 # within-epoch recurrence is claimed at periods <= 20M; slower recurrence is H-F's (full history, to 100M).
 # Restoring it is this one line: + [25].
 EPOCH_PERIODS = tuple(float(p) for p in range(4, 21))
+EPOCH_EXCLUDED = (25.0,)          # (reported in every coverage summary; restore with the line above)
 SCOPES = {"full": (0.0, 200.0), "E1": (0.0, 50.0), "E2": (75.0, 125.0), "E3": (150.0, 200.0)}
 PERIODS = {"full": FULL_PERIODS, "E1": EPOCH_PERIODS, "E2": EPOCH_PERIODS, "E3": EPOCH_PERIODS}
 SPAN_TOL = 1e-6          # one engine step: the two-cycle span comparisons only
@@ -722,6 +723,8 @@ def hf_decision(res, c_F, p_F=None, c_M=None, p_M=None, alpha=0.01):
     development panels, model p-values from the validation tables; None: not calibrated yet)."""
     if not res["available"]:
         return {"available": False, "reasons": res["reasons"]}
+    if c_F is None:                      # (#68 round 4 P3: an unavailable calibration never enters a comparison)
+        return {"available": False, "reasons": ["the H-F calibration is unavailable (a capped mode): p = 1 in Holm"]}
     det = res["S_F"] > c_F and (p_F is not None and p_F <= alpha)
     op = det and res["material_point"]
     ex = (op and c_M is not None and res["M_F"] > c_M and p_M is not None and p_M <= alpha

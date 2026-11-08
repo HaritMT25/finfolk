@@ -235,6 +235,12 @@ class TestTransition(unittest.TestCase):
         self.assertEqual(out["components"]["E1"]["EF_C"], 0.0)
         self.assertIn(out["classes"]["E1"]["class"], ("ARD", "unresolved"))
         self.assertEqual(out["worlds"], ["w0", "w1", "w2"])
+        cov = out["coverage"]["E2"]                                  # (#68 round 4 (D): E^U support coverage)
+        self.assertEqual(cov["worlds"], 3)
+        self.assertEqual(cov["excluded_periods"], [25.0])
+        self.assertEqual(sum(v["cells"] for v in cov["bands"].values()), 3 * 3)
+        nc = tr.ht(epochs, betas, {e: True for e in tr.EPOCHS}, loads=None, k=0, analysis="t", draws=19, c_T=None)
+        self.assertEqual((nc["available"], nc["reject"], nc["c_T"]), (False, False, None))   # (no calibration)
         # #68 review 11: identities, not positions. One epoch's worlds reversed (their slopes keyed by id):
         # the identical result; a different world set, a duplicate id or position-keyed slopes are refused
         rev = dict(epochs, E2=list(reversed(epochs["E2"])))
@@ -319,6 +325,10 @@ class TestTransition(unittest.TestCase):
         r2, _ = tr.energy(np.array([[0.1, 0.1], [-0.1, -0.1]]), np.array([0.0, 2.0]), "C", "w")
         self.assertEqual(r2[0], math.inf)                                         # (the registered +inf)
         self.assertAlmostEqual(r2[1], 0.01 / 4)
+        # #68 round 4 P2-2 (Codex's counterexample): the denominator's square overflows, the relative energy
+        # is 0.16, never 0
+        r2, _ = tr.energy(np.array([[8e153], [-8e153]]), np.array([2e154]), "C", "w")
+        self.assertAlmostEqual(r2[0], 0.16, delta=1e-15)
 
     def test_mixed_needs_affirmative_evidence(self):
         """#68 review 8: material recurrence with directional bounds spanning the band is UNRESOLVED, not
