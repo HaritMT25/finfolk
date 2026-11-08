@@ -200,7 +200,11 @@ class Data:
         120M (both endpoints, cross-world) plus every world snapshot's reference pairs against references
         at <= 120M only (their placement); validation targets with both endpoints in 141-160M, test
         targets in 181-200M (no window crossing the 20M separations); test split into the forward transfer
-        (both endpoints in training worlds) and the intersection (an endpoint in a test world)."""
+        (both endpoints in training worlds) and the intersection (an endpoint in a test world).
+        The graph's ACCESS RULES hold alongside the time and world masks (v4 §7.1, the 400 snapshot
+        exclusions): the fit takes training and support pairs only (a non-support pair of a snapshot
+        held out for validation or test never enters it), and validation never takes a test-role pair
+        (a snapshot-test outcome never steers the selection)."""
         QT, PT = self.qt[self.qi], self.pt[self.pj]
         qw, pw = self.qw[self.qi], self.pw[self.pj]
         qr, pr = self.qref[self.qi], self.pref[self.pj]
@@ -211,8 +215,10 @@ class Data:
         reft = np.where(qr, QT, PT)
         both = lambda lo, hi: (QT >= lo) & (QT <= hi) & (PT >= lo) & (PT <= hi)  # noqa: E731
         trainpair = (qs == "train") & (ps == "train")
-        fit = np.flatnonzero((main & trainpair & both(0, 120)) | (oneref & (reft <= 120)))
-        val = np.flatnonzero(main & ((qs != "test") & (ps != "test")) & both(141, 160))
+        fitrole = (self.role == ROLES.index("training")) | (self.role == ROLES.index("support"))
+        notest = self.role != ROLES.index("test")
+        fit = np.flatnonzero(((main & trainpair & both(0, 120)) | (oneref & (reft <= 120))) & fitrole)
+        val = np.flatnonzero(main & ((qs != "test") & (ps != "test")) & both(141, 160) & notest)
         fwd = np.flatnonzero(main & trainpair & both(181, 200))
         inter = np.flatnonzero(main & ((qs == "test") | (ps == "test")) & both(181, 200))
         return {"fit": fit, "val": val, "val_world": np.where(qw[val] >= 0, qw[val], pw[val]),
@@ -673,7 +679,10 @@ def one(a):
     cap = a.ab_cap if a.ab_cap >= 0 else None
     res["fitter"] = a.fitter
     for opt in a.options.split(","):
-        if sc.get("noiseless"):
+        if sc.get("noiseless") and opt == "fwd":       # (the forward procedure is a noisy-data selection)
+            res["options"][opt] = {"procedure": "forward", "available": False,
+                                   "reason": "the forward-time procedure is not defined for a noiseless scenario"}
+        elif sc.get("noiseless"):
             res["options"][opt] = numerical(D, data, opt, sc["rank"], a.iters, seed, ab_cap=cap, fitter=a.fitter)
         elif opt == "fwd":
             res["options"][opt] = forward_procedure(D, data, a.ranks, [float(x) for x in a.lambdas.split(",")],
@@ -744,6 +753,11 @@ def wilson(k, n, z=1.96):
     return [round(c - h, 3), round(c + h, 3)]
 
 
+def _mean(xs):
+    v = [x for x in xs if x is not None]
+    return float(np.mean(v)) if v else None
+
+
 def summarize(d):
     rows = {}
     cfgs = set()
@@ -763,15 +777,29 @@ def summarize(d):
             sel = {}
             for o in lst:
                 sel[o["selected"]["rank"]] = sel.get(o["selected"]["rank"], 0) + 1
-            out["cells"].append({"scenario": sc, "option": opt, "datasets": len(lst), "successes": k,
-                                 "rate": round(k / len(lst), 3), "wilson95": wilson(k, len(lst)),
-                                 "selected_ranks": dict(sorted(sel.items())),
-                                 "mean_test_improvement": float(np.mean([o["test_improvement"] for o in lst])),
-                                 "mean_test_lb": float(np.mean([o["test_lb"] for o in lst])),
-                                 "fit_pairs": lst[0]["fit_pairs"],
-                                 "classes": {k: {f: float(np.mean([o["classes"][k][f] for o in lst]))
-                                                 for f in ("rmse_selected", "rmse_rank0", "interaction_sd")}
-                                             for k in (lst[0].get("classes") or {})}})
+            cell = {"scenario": sc, "option": opt, "datasets": len(lst), "successes": k,
+                    "rate": round(k / len(lst), 3), "wilson95": wilson(k, len(lst)),
+                    "selected_ranks": dict(sorted(sel.items())),
+                    "mean_test_improvement": _mean(o["test_improvement"] for o in lst),
+                    "mean_test_lb": _mean(o["test_lb"] for o in lst),
+                    "fit_pairs": lst[0]["fit_pairs"],
+                    "classes": {k: {f: float(np.mean([o["classes"][k][f] for o in lst]))
+                                    for f in ("rmse_selected", "rmse_rank0", "interaction_sd")}
+                                for k in (lst[0].get("classes") or {})}}
+            if lst[0].get("procedure") == "forward":       # (both branches: the top level is the transfer)
+                cell["branches"] = {}
+                for b in ("forward_transfer", "intersection"):
+                    av = [o[b] for o in lst if (o.get(b) or {}).get("available")]
+                    kb = sum(x["success"] for x in av)
+                    cell["branches"][b] = {"available": len(av), "successes": kb,
+                                           "rate": round(kb / len(av), 3) if av else None,
+                                           "wilson95": wilson(kb, len(av)) if av else None,
+                                           "mean_test_improvement": _mean(x["test_improvement"] for x in av),
+                                           "mean_test_lb": _mean(x["test_lb"] for x in av)}
+            out["cells"].append(cell)
+        elif "relative" not in lst[0]:                       # (unavailable, e.g. fwd on a noiseless scenario)
+            out["cells"].append({"scenario": sc, "option": opt, "datasets": len(lst), "available": False,
+                                 "reasons": sorted({o.get("reason", "") for o in lst})})
         else:
             out["cells"].append({"scenario": sc, "option": opt, "datasets": len(lst),
                                  "relative_test_rmse": [o["relative"] for o in lst],

@@ -358,6 +358,36 @@ class TestRecovery(unittest.TestCase):
         for a_, b_ in ((f, v), (f, ft), (f, it), (v, ft), (v, it), (ft, it)):
             self.assertFalse(set(a_.tolist()) & set(b_.tolist()))
 
+    def test_forward_sets_keep_the_access_rules(self):
+        """#64 round 2 (P2): the forward masks keep the graph's roles. Non-support pairs of snapshots held
+        out for validation or test never enter the prefix fit, and snapshot-test outcomes never enter the
+        validation selection. Both leaks are possible in this graph under the time and world masks alone,
+        so the checks are not vacuous."""
+        D, F = self.D, self.D.forward
+        R = self.rec.ROLES
+        QT, PT = D.qt[D.qi], D.pt[D.pj]
+        qr, pr = D.qref[D.qi], D.pref[D.pj]
+        qs = np.where(D.qw[D.qi] >= 0, D.wsplit[np.maximum(D.qw[D.qi], 0)], "ref")
+        ps = np.where(D.pw[D.pj] >= 0, D.wsplit[np.maximum(D.pw[D.pj], 0)], "ref")
+        glob, main = ~D.within, ~D.within & ~qr & ~pr
+        held = (D.role == R.index("validation")) | (D.role == R.index("test"))
+        snap = (D.qheld[D.qi] != "train") | (D.pheld[D.pj] != "train")      # (an endpoint held out)
+        w = lambda lo, hi: (QT >= lo) & (QT <= hi) & (PT >= lo) & (PT <= hi)  # noqa: E731
+        trainpair = (qs == "train") & (ps == "train")
+        leak_fit = main & trainpair & w(0, 120) & held
+        self.assertGreater(int((leak_fit & snap).sum()), 0)                  # (snapshot holdouts of training worlds)
+        leak_val = main & (qs != "test") & (ps != "test") & w(141, 160) & (D.role == R.index("test"))
+        self.assertGreater(int(leak_val.sum()), 0)
+        f, v = F["fit"], F["val"]
+        self.assertFalse(held[f].any())
+        self.assertTrue(np.isin(D.role[f], [R.index("training"), R.index("support")]).all())
+        self.assertFalse(set(np.flatnonzero(leak_fit).tolist()) & set(f.tolist()))
+        self.assertFalse((D.role[v] == R.index("test")).any())
+        self.assertFalse(set(np.flatnonzero(leak_val).tolist()) & set(v.tolist()))
+        # the support pairs of a held-out snapshot (its placement) still enter the fit
+        self.assertGreater(int(((D.role[f] == R.index("support")) & snap[f]).sum()), 0)
+        self.assertTrue(glob[f].all())
+
     def test_forward_procedure(self):
         data = self.rec.simulate(self.D, dict(rank=1, energy=0.10), 17)
         out = self.rec.forward_procedure(self.D, data, 1, [0.1], 6, 17)
@@ -366,6 +396,32 @@ class TestRecovery(unittest.TestCase):
         for k in ("forward_transfer", "intersection"):
             self.assertTrue(out[k]["available"], out[k])
             self.assertIn("test_lb", out[k])
+
+    def test_forward_on_noiseless_and_summary_branches(self):
+        """#64 round 2 P3s: fwd on a noiseless scenario is recorded unavailable (not a crash); the summary
+        of fwd keeps both branches, the forward transfer and the intersection."""
+        import argparse as ap_
+        tmp = tempfile.mkdtemp()
+        try:
+            gdir = os.path.join(tmp, "g")
+            graph.write(full(), gdir)
+            out = os.path.join(tmp, "o")
+            os.makedirs(out)
+            base = dict(graph=os.path.join(gdir, "graph.jsonl.gz"), namespace="ns", fitter="minimal", ranks=1,
+                        lambdas="0.1", iters=4, ab_cap=-1, set="main", jobs=1, start="registered")
+            nl = next(k for k, s in self.rec.SCENARIOS.items() if s.get("noiseless"))
+            for sc, rep in ((nl, 0), ("r1_017", 0), ("r1_017", 1)):
+                a = ap_.Namespace(**base, options="fwd", scenario=sc, rep=rep,
+                                  out=os.path.join(out, f"{sc}.{rep:03d}.json"))
+                self.assertEqual(self.rec.one(a), 0)
+            r = rqlib.read_json(os.path.join(out, f"{nl}.000.json"))
+            self.assertEqual(r["options"]["fwd"]["available"], False)
+            cells = {c["scenario"]: c for c in self.rec.summarize(out)["cells"]}
+            self.assertEqual(cells[nl]["available"], False)
+            self.assertEqual(set(cells["r1_017"]["branches"]), {"forward_transfer", "intersection"})
+            self.assertEqual(cells["r1_017"]["datasets"], 2)
+        finally:
+            shutil.rmtree(tmp)
 
     def test_config_manifest(self):
         """#64 review 3: a run is bound to its configuration: a resume of another one, or a summary over two,
