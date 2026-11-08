@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """common.py: build a common-environment prey checkpoint (Red Queen design section 2).
 
-    common.py build --template T.json --source X.json --n 600 --seed S [--sampling hybrid|wor-balanced|iid]
+    common.py build --template T.json --source X.json --n 600 --seed S [--sampling wor-balanced|hybrid|iid]
+                    [--ages config/age_reference.json --age-seed S2]
                     --out X.common.json --manifest X.common.manifest.json [--allow-config-mismatch]
+    common.py ages --source SENTINEL.json [--source ...] --n 600 --out config/age_reference.json
     common.py validate --binary EVO_BOIDS --work EMPTY_DIR X.common.json
 
 The transplant primitive (src/core/transplant.hpp) keeps everything of its prey world X: its
@@ -26,13 +28,21 @@ adds the predators):
     0.5 (buildNeuralNet's birth state); id i + 1, lineageId = its own id (a founder), generation
     0. The heritable body parameters (bodySize, bodyElong) come with the genome (1.0 / 1.0 when
     the body model is off, as in the study).
+  * AGE (design v3 §3.2), the one deliberate exception to newborn resetting: with an age
+    reference (--ages; schema finfolk.redqueen.agereference/1: n fixed quantile ages of one
+    frozen prey age CDF) slot i gets reference age perm[i], perm a permutation drawn from
+    --age-seed (the plan's prey-snapshot x replicate key, so one realization serves every
+    opponent and condition of that snapshot and replicate); the manifest is then schema /2.
+    Without one, every age is 0 (phase A's newborn construction, schema /1).
   * SAMPLING, from the source's m living prey (seeded, frequency-preserving):
-      hybrid (default; the design's law): without replacement when m >= n, otherwise n
-        independent uniform draws with replacement (duplication recorded);
-      wor-balanced (an explicit protocol amendment only): without replacement when m >= n,
-        otherwise every source creature n // m times plus n % m distinct extras (it removes the
-        sampling variance of a small archive, and guarantees rare genotypes a slot);
+      wor-balanced (default; design v3 §3.1, registered): without replacement when m >= n,
+        otherwise every source creature n // m times plus n % m distinct extras (no abrupt loss
+        of distinct individuals near the cap; at m = n a census);
+      hybrid: without replacement when m >= n, otherwise n independent uniform draws with
+        replacement (v2's law; explicit only);
       iid: n independent uniform draws with replacement, whatever m.
+    Every manifest records the source count, multiplicities, distinct genomes and lineages and
+    their effective numbers (inverse Simpson).
     The slot order is random (the draw order), so source order never maps onto slot positions.
   * the MANIFEST: template and source (registered labels, SHA-256, frames), the policy and its
     duplication summary, every reset value, config differences, and per slot the source index,
@@ -55,6 +65,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import json
 import os
 import subprocess
 import sys
@@ -64,7 +75,9 @@ import ckpt  # noqa: E402
 import rqlib  # noqa: E402
 
 SCHEMA = "finfolk.redqueen.common/1"
-POLICIES = ("hybrid", "wor-balanced", "iid")   # hybrid: design section 2 (review round 2)
+SCHEMA_AGES = "finfolk.redqueen.common/2"        # with reference ages (design v3 §3.2)
+AGE_SCHEMA = "finfolk.redqueen.agereference/1"
+POLICIES = ("wor-balanced", "hybrid", "iid")   # wor-balanced: design v3 §3.1 (registered)
 # src/core/agent_core.hpp member defaults (a test parses the header to keep these in step).
 AGENT_DEFAULTS = {"age": 0.0, "foodReserves": 30.0, "speed": 80.0, "reproTimer": 0.0,
                   "interactTimer": 0.0, "responsiveness": 0.5, "oscPeriod": 34.0}
@@ -107,6 +120,68 @@ def sample_indices(m, n, seed, policy):
     return picks, summary
 
 
+def _inverse_simpson(counts):
+    tot = sum(counts)
+    return tot * tot / sum(c * c for c in counts) if tot else 0.0
+
+
+def diversity(pool, picks):
+    """The sample's diversity: distinct source individuals, genomes and lineages, and the effective
+    (inverse Simpson) numbers of genomes and lineages among the n slots."""
+    g, ln = {}, {}
+    for p in picks:
+        h = ckpt.genome_sha(pool[p]["genes"])
+        g[h] = g.get(h, 0) + 1
+        k = int(pool[p]["lineageId"])
+        ln[k] = ln.get(k, 0) + 1
+    return {"distinct_individuals": len(set(picks)), "distinct_genomes": len(g), "distinct_lineages": len(ln),
+            "effective_genomes": _inverse_simpson(list(g.values())),
+            "effective_lineages": _inverse_simpson(list(ln.values()))}
+
+
+def load_age_reference(path_or_dict):
+    """A validated age reference -> dict (n ages, finite, >= 0, ascending)."""
+    ref = path_or_dict if isinstance(path_or_dict, dict) else rqlib.read_json(path_or_dict)
+    if ref.get("schema") != AGE_SCHEMA:
+        raise CommonError(f"age reference schema {ref.get('schema')!r}, expected {AGE_SCHEMA}")
+    ages = ref.get("ages")
+    if not isinstance(ages, list) or len(ages) != ref.get("n") or not ages:
+        raise CommonError("the age reference needs its n ages")
+    if any(not isinstance(a, (int, float)) or isinstance(a, bool) or not (a >= 0) or a != a or a == float("inf")
+           for a in ages) or ages != sorted(ages):
+        raise CommonError("reference ages must be finite, >= 0 and ascending (quantiles)")
+    return ref
+
+
+def reference_ages(sources, n, labels=None):
+    """One prey age CDF pooled from the living prey of `sources` (checkpoint dicts of the frozen
+    stable interval) -> its n quantile ages at the mid-probabilities (i + 0.5) / n, i = 0 .. n - 1:
+    the pooled sorted ages at floor((i + 0.5) M / n), in exact integer arithmetic (the upper order
+    statistic at the empirical CDF's jumps). The sources must share one maxAge (recorded; the
+    construction and the final plan both check it against the template's)."""
+    pooled, srcs = [], []
+    max_age = None
+    for k, cp in enumerate(sources):
+        ckpt.validate(cp, f"age source {k}")
+        a = [float(r["age"]) for r in ckpt.prey(cp, alive_only=True)]
+        pooled += a
+        ma = float(cp["config"].get("maxAge", 120.0))
+        if max_age is not None and ma != max_age:
+            raise CommonError("the age sources differ in maxAge")
+        max_age = ma
+        srcs.append({"label": (labels or [None] * len(sources))[k], "frame": int(cp["world"]["frame"]),
+                     "prey": len(a)})
+    if not pooled:
+        raise CommonError("the age sources hold no living prey")
+    pooled.sort()
+    M = len(pooled)
+    ages = [pooled[min(M - 1, ((2 * i + 1) * M) // (2 * n))] for i in range(n)]
+    return {"schema": AGE_SCHEMA, "n": n, "ages": ages, "pooled": M, "max_age": max_age,
+            "method": "the pooled living-prey ages, sorted, at floor((i + 0.5) M / n), i = 0 .. n - 1 (the upper "
+                      "order statistic at the empirical CDF's jumps)",
+            "sources": srcs}
+
+
 def _clear_predators(cp):
     jp = cp.get("predators") or {}
     out = {}
@@ -120,9 +195,11 @@ def _clear_predators(cp):
     cp["predators"] = out
 
 
-def build(template, source, n, seed, policy="hybrid", template_label=None, source_label=None,
-          template_sha=None, source_sha=None, source_meta=None, allow_config_mismatch=False):
+def build(template, source, n, seed, policy="wor-balanced", template_label=None, source_label=None,
+          template_sha=None, source_sha=None, source_meta=None, allow_config_mismatch=False,
+          age_reference=None, age_seed=None, ages_label=None, ages_sha=None):
     """template, source: checkpoint dicts (ckpt.load). -> (common checkpoint dict, manifest dict).
+    age_reference (load_age_reference's dict, n ages) + age_seed: the reference-age construction.
     The manifest's 'output' (the written file's hash) is the caller's to add."""
     ckpt.validate(template, template_label or "template")
     ckpt.validate(source, source_label or "source")
@@ -145,6 +222,18 @@ def build(template, source, n, seed, policy="hybrid", template_label=None, sourc
     gmin, gmax = int(tcfg["genomeMinLength"]), int(tcfg["genomeMaxLength"])
 
     picks, summary = sample_indices(len(pool), n, seed, policy)
+    summary.update(diversity(pool, picks))
+    slot_age = None
+    if age_reference is not None:
+        ref = load_age_reference(age_reference)
+        if ref["n"] != n:
+            raise CommonError(f"the age reference has {ref['n']} ages, the construction {n} slots")
+        if age_seed is None:
+            raise CommonError("reference ages need their permutation seed")
+        perm = rqlib.SplitMix64(age_seed).shuffle(list(range(n)))
+        slot_age = [float(ref["ages"][perm[i]]) for i in range(n)]
+        if ref.get("max_age") is not None and float(template["config"].get("maxAge", 120.0)) != float(ref["max_age"]):
+            raise CommonError("the age reference was estimated under another prey maxAge than the template's")
 
     out = copy.deepcopy(template)
     rows = []
@@ -156,6 +245,8 @@ def build(template, source, n, seed, policy="hybrid", template_label=None, sourc
         r = {k: slot[k] for k in SLOT_COLS}
         r["body"] = list(slot["body"])
         r.update(AGENT_DEFAULTS)
+        if slot_age is not None:
+            r["age"] = slot_age[i]
         r["neurons"] = [NEURON_BIRTH_OUTPUT] * len(slot["neurons"])
         r["genes"] = list(src["genes"])
         r["bodySize"], r["bodyElong"] = src["bodySize"], src["bodyElong"]
@@ -181,7 +272,7 @@ def build(template, source, n, seed, policy="hybrid", template_label=None, sourc
 
     smeta, tmeta = ckpt.meta(source), ckpt.meta(template)
     manifest = {
-        "schema": SCHEMA,
+        "schema": SCHEMA if slot_age is None else SCHEMA_AGES,
         "template": {"label": template_label, "sha256": template_sha, "frame": tmeta["frame"],
                      "format_version": tmeta["format_version"], "engine_version": tmeta["engine_version"],
                      "creatures": tmeta["prey"], "slots_used": n},
@@ -204,16 +295,28 @@ def build(template, source, n, seed, policy="hybrid", template_label=None, sourc
                   "source_id": [int(pool[p]["id"]) for p in picks],
                   "source_lineage": [int(pool[p]["lineageId"]) for p in picks],
                   "source_generation": [int(pool[p]["generation"]) for p in picks],
-                  "genome_length": [len(pool[p]["genes"]) // 2 for p in picks]},
+                  "genome_length": [len(pool[p]["genes"]) // 2 for p in picks],
+                  "genome_sha16": [ckpt.genome_sha(pool[p]["genes"])[:16] for p in picks]},
     }
+    if slot_age is not None:
+        manifest["ages"] = {"policy": "reference quantile ages, permuted", "label": ages_label, "sha256": ages_sha,
+                            "permutation_seed": int(age_seed), "n": n, "min": min(slot_age), "max": max(slot_age),
+                            "mean": sum(slot_age) / n}
+        manifest["reset"]["age"] = "the reference age of slot i (permuted)"
     return out, manifest
 
 
 def build_files(template_path, source_path, n, seed, policy, out_path, manifest_path, template_label=None,
                 source_label=None, source_meta=None, allow_config_mismatch=False, durable=False,
-                source_cp=None, source_sha=None):
+                source_cp=None, source_sha=None, ages_path=None, age_seed=None, ages_label=None):
     """Load, build, write the checkpoint and its manifest -> (manifest, checkpoint sha256).
-    source_cp / source_sha: the source already loaded and hashed by the caller (not re-read)."""
+    source_cp / source_sha: the source already loaded and hashed by the caller (not re-read).
+    ages_path: an age reference (read, hashed and parsed from the same bytes)."""
+    age_ref, ages_sha = None, None
+    if ages_path:
+        araw = rqlib.read_bytes(ages_path)
+        ages_sha = rqlib.sha256_bytes(araw)
+        age_ref = load_age_reference(json.loads(araw.decode("utf-8")))
     traw = rqlib.read_bytes(template_path)          # hashed and parsed from the same bytes
     tsha, tcp = rqlib.sha256_bytes(traw), ckpt.loads(traw.decode("utf-8"), template_path)
     if source_cp is None:
@@ -221,7 +324,8 @@ def build_files(template_path, source_path, n, seed, policy, out_path, manifest_
         source_sha, source_cp = rqlib.sha256_bytes(sraw), ckpt.loads(sraw.decode("utf-8"), source_path)
     cp, man = build(tcp, source_cp, n, seed, policy, template_label or os.path.abspath(template_path),
                     source_label or os.path.abspath(source_path), tsha, source_sha, source_meta,
-                    allow_config_mismatch)
+                    allow_config_mismatch, age_ref, age_seed,
+                    ages_label or (os.path.abspath(ages_path) if ages_path else None), ages_sha)
     text = ckpt.dumps(cp).encode()
     man["output"] = {"sha256": rqlib.sha256_bytes(text), "bytes": len(text)}
     write = rqlib.write_durable if durable else _write
@@ -283,10 +387,16 @@ def main(argv=None):
     b.add_argument("--source", required=True)
     b.add_argument("--n", type=int, required=True)
     b.add_argument("--seed", type=int, required=True)
-    b.add_argument("--sampling", default="hybrid", choices=POLICIES)
+    b.add_argument("--sampling", default="wor-balanced", choices=POLICIES)
+    b.add_argument("--ages", help="an age reference (common.py ages); the slots then get its permuted ages")
+    b.add_argument("--age-seed", type=int)
     b.add_argument("--out", required=True)
     b.add_argument("--manifest", required=True)
     b.add_argument("--allow-config-mismatch", action="store_true")
+    g = sub.add_parser("ages")
+    g.add_argument("--source", action="append", required=True, help="a checkpoint of the frozen stable interval")
+    g.add_argument("--n", type=int, required=True)
+    g.add_argument("--out", required=True)
     v = sub.add_parser("validate")
     v.add_argument("--binary", required=True)
     v.add_argument("--work", required=True)
@@ -294,20 +404,33 @@ def main(argv=None):
     a = ap.parse_args(argv)
     try:
         if a.cmd == "build":
+            if bool(a.ages) != (a.age_seed is not None):
+                raise CommonError("--ages and --age-seed go together")
             man, sha = build_files(a.template, a.source, a.n, a.seed, a.sampling, a.out, a.manifest,
-                                   allow_config_mismatch=a.allow_config_mismatch)
+                                   allow_config_mismatch=a.allow_config_mismatch, ages_path=a.ages,
+                                   age_seed=a.age_seed)
             s = man["sampling"]
             print(f"common {a.out}: {a.n} slots from {s['pool']} living prey ({s['policy']}, "
                   f"{s['distinct']} distinct, max copies {s['max_copies']}); frame {man['world']['frame']}; "
                   f"sha256 {sha[:12]}")
             for k, d in man["config_differences"].items():
                 print(f"warning: config {k}: source {d[0]!r}, template {d[1]!r} (template kept)", file=sys.stderr)
+        elif a.cmd == "ages":
+            raws = [rqlib.read_bytes(p) for p in a.source]
+            cps = [ckpt.loads(r.decode("utf-8"), p) for r, p in zip(raws, a.source)]
+            ref = reference_ages(cps, a.n, [os.path.abspath(p) for p in a.source])
+            for src, r in zip(ref["sources"], raws):
+                src["sha256"] = rqlib.sha256_bytes(r)
+            ref["tool_sha256"] = rqlib.sha256_file(os.path.abspath(__file__))
+            rqlib.write_durable(a.out, rqlib.canonical(ref))
+            print(f"age reference {a.out}: {a.n} quantile ages from {ref['pooled']} prey of {len(cps)} checkpoint(s) "
+                  f"(min {ref['ages'][0]:.2f}, median {ref['ages'][a.n // 2]:.2f}, max {ref['ages'][-1]:.2f} s)")
         else:
             rep = validate_with_engine(os.path.abspath(a.binary), a.common, a.work)
             rqlib.write_json_durable(os.path.join(a.work, "validate.json"), rep)
             print(f"valid: {a.common} loads, runs 100 steps ({rep['prey0']} -> {rep['prey_at_100']} prey), "
                   f"resumes exactly and round-trips through Python exactly")
-    except (CommonError, ckpt.CheckpointError, OSError) as e:
+    except (CommonError, ckpt.CheckpointError, OSError, ValueError) as e:
         print(f"common.py {a.cmd}: {e}", file=sys.stderr)
         return 1
     return 0

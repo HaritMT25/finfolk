@@ -53,6 +53,8 @@ import rqlib  # noqa: E402
 import score as score_mod  # noqa: E402
 
 BUNDLE_SCHEMA = "finfolk.redqueen.bundle/1"
+BUNDLE_SCHEMA_V2 = "finfolk.redqueen.bundle/2"   # a plan/2 row's (reference ages, roles, global seeds)
+SHARING_SCHEMA = "finfolk.redqueen.sharing/1"
 OUTPUT_TOOLS = ("rqlib.py", "ckpt.py", "common.py", "score.py", "cell.py")   # what a bundle depends on
 TIMING_COLS = ("elapsed_s", "steps_per_sec")   # run.csv columns that depend on the machine, not the run
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -63,6 +65,28 @@ class CellFailure(Exception):
         super().__init__(msg)
         self.code = code
         self.role = role          # for a biological failure (9): the source's role, "prey" / "predators"
+
+
+def sharing_record(cell, arena, arena_manifest, files):
+    """(design v4 §3.5) A plan/2 cell's actual sharing: its group keys and seeds, and what the shared
+    draws realized: the common checkpoint (the sample and the ages), the transplant's donor draw
+    (seed, pool, the donors picked) and the predators' placement in the arena (positions,
+    velocities, genomes). Cells of one transplant group (a predator snapshot x replicate) and one K
+    must realize the same draw and placement (run.py records it in done.json, store.py checks it at
+    packing): the coupled donor selection / placement is validated, not assumed."""
+    p = (arena_manifest or {}).get("predators") or {}
+    draw = {"source": p.get("source"), "seed": p.get("seed"), "pool": p.get("pool"), "count": p.get("count"),
+            "with_replacement": p.get("withReplacement"),
+            "picked": [[x.get("sourceIndex"), x.get("sourceId"), x.get("lineageId")] for x in p.get("picked") or []]}
+    place = [[r.get("posX"), r.get("posY"), r.get("velX"), r.get("velY"),
+              ckpt.genome_sha(r["genes"])[:16] if r.get("genes") is not None else None]
+             for r in ckpt.predators(arena)]
+    return {"schema": SHARING_SCHEMA, "keys": dict(cell.get("groups") or {}), "seeds": dict(cell.get("seeds") or {}),
+            "realized": {"common_sha256": files.get("common.json"),
+                         "common_manifest_sha256": files.get("common.manifest.json"),
+                         "transplant": draw, "transplant_draw_sha256": rqlib.canonical_sha(draw),
+                         "placement_sha256": rqlib.canonical_sha(place),
+                         "transplant_realized_sha256": rqlib.canonical_sha([draw, place])}}
 
 
 def tools_sha256(here=HERE):
@@ -209,19 +233,33 @@ def execute(cell, d, exe, paths, procs=None):
         _freeze(d, "template.json", traw, cell["template"]["sha256"])
         info["frozen_inputs"]["template"] = os.path.join(d, "template.json")
         del traw
+        ages = cell.get("ages")            # (plan/2) the reference-age construction, design v3 §3.2
+        if ages:
+            araw = rqlib.read_bytes(paths["ages"])
+            if rqlib.sha256_bytes(araw) != ages["sha256"]:
+                raise CellFailure(5, f"the age reference {paths['ages']} is not its registered content")
+            _freeze(d, "age_reference.json", araw, ages["sha256"])
+            info["frozen_inputs"]["ages"] = os.path.join(d, "age_reference.json")
+            del araw
+        meta = {"world": cell["prey"]["world"], "uuid": cell["prey"]["uuid"], "time": cell["prey"]["time"]}
+        if cell["prey"].get("snapshot"):
+            meta["snapshot"] = cell["prey"]["snapshot"]
         try:
             man, csha = common.build_files(
                 info["frozen_inputs"]["template"], prey_src, int(cell["n_prey"]), int(cell["seeds"]["sample"]),
                 cell["sampling"],
                 os.path.join(d, "common.json"), os.path.join(d, "common.manifest.json"),
                 template_label=cell["template"]["path"], source_label=cell["prey"]["path"],
-                source_meta={"world": cell["prey"]["world"], "uuid": cell["prey"]["uuid"], "time": cell["prey"]["time"]},
-                source_cp=x_cp, source_sha=cell["prey"]["sha256"])
+                source_meta=meta, source_cp=x_cp, source_sha=cell["prey"]["sha256"],
+                ages_path=info["frozen_inputs"].get("ages"), age_seed=(cell["seeds"].get("ages") if ages else None),
+                ages_label=ages["path"] if ages else None)
         except (common.CommonError, ckpt.CheckpointError) as e:
             bio = "no living prey" in str(e)
             raise CellFailure(9 if bio else 5, f"common checkpoint: {e}", "prey" if bio else None)
         if man["template"]["sha256"] != cell["template"]["sha256"]:
             raise CellFailure(5, "the template is not its registered content")
+        if ages and man["ages"]["sha256"] != ages["sha256"]:
+            raise CellFailure(5, "the age reference is not its registered content")
         x_name = "common.json"
         files["common.json"] = csha
         common_manifest_sha = rqlib.sha256_file(os.path.join(d, "common.manifest.json"))
@@ -286,8 +324,10 @@ def execute(cell, d, exe, paths, procs=None):
         run_csv = normalize_run_csv(f.read())
     files["run.csv (without timing columns)"] = rqlib.sha256_bytes(run_csv.encode())
     arena_manifest = rqlib.read_json(os.path.join(d, "arena.manifest.json"))
+    plan2 = cell.get("schema") == "finfolk.redqueen.plan/2"
     bundle = {
-        "schema": BUNDLE_SCHEMA, "cell": cell,
+        "schema": BUNDLE_SCHEMA_V2 if plan2 else BUNDLE_SCHEMA,
+        "cell": cell,
         "binary_sha256": rqlib.sha256_file(exe), "tools_sha256": tools_sha256(),
         "engine_args": {"transplant": targs, "assay": aargs},
         "files": files, "common_manifest_sha256": common_manifest_sha,
@@ -295,6 +335,8 @@ def execute(cell, d, exe, paths, procs=None):
         "arena_manifest": arena_manifest, "score": sc,
         "predators_csv": pred_csv, "run_csv": run_csv,
     }
+    if plan2:
+        bundle["sharing"] = sharing_record(cell, arena, arena_manifest, files)
     return bundle, info
 
 
