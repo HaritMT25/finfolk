@@ -169,39 +169,62 @@ def load_forks(study):
 
 
 # ================================================================== origins
-def origin_invalid(study, b, ledger=None):
-    """Why a branch's origin is not a valid fork origin on the CURRENT evidence (None if it is): its
-    root reached a zero at or before the origin (the histories' supported first zeros, the ledger
-    read now), or the archived origin itself holds no prey (or, C and B, no predators)."""
+def zero_before(study, b):
+    """Why the branch's root is extinct at or before its origin (None if not): the histories' supported
+    first zeros, the ledger read NOW."""
     root, f = b["root"], b["origin"]["frame"]
-    led = worlds.read_jsonl(os.path.join(study, "availability.jsonl")) if ledger is None else ledger
-    zeros = worlds.first_zeros(led, root, study)
-    early = sorted((fz, g) for g, fz in zeros.items() if fz <= f)
+    led = worlds.read_jsonl(os.path.join(study, "availability.jsonl"))
+    early = sorted((fz, g) for g, fz in worlds.first_zeros(led, root, study).items() if fz <= f)
     if early:
         return f"its root {root}'s {early[0][1]} reached 0 at frame {early[0][0]}, at or before the origin"
-    rec = worlds.archive_records(study, root).get(b["origin"]["label"])
+    return None
+
+
+def record_invalid(b, rec):
+    """Why this EXACT archive record (or frozen record) is not a valid fork origin (None if it is): no
+    prey, or (C and B) no predators."""
     if rec is not None and (rec.get("prey") == 0 or (b["treatment"] != "A" and rec.get("predators") == 0)):
-        return (f"the archived origin {b['origin']['label']} of {root} holds {rec.get('prey')} prey and "
+        return (f"the archived origin {b['origin']['label']} of {b['root']} holds {rec.get('prey')} prey and "
                 f"{rec.get('predators')} predators")
     return None
 
 
-def origin_status(study, b, ledger=None):
-    """-> ("available", archive record) | ("waiting", why) | ("unavailable", why) for a branch's origin,
-    from the CURRENT evidence: the histories' availability ledger read now (its supported first
-    zeros), the archived origin's own guild populations, its bytes verified against the record."""
+def origin_invalid(study, b, frozen_rec=None):
+    """Why an ADMITTED branch's origin is no longer valid on the current evidence (None if it is): the
+    guild counts of the record it froze (origin.rec.json), then the ledger read now."""
+    return record_invalid(b, frozen_rec) or zero_before(study, b)
+
+
+def branch_invalid(study, b):
+    """origin_invalid for an admitted branch, with the record it froze (an origin.rec.json written before
+    the guild counts were recorded falls back to the archive's record)."""
+    rp = os.path.join(worlds.wdir(froot(study), b["id"]), "origin.rec.json")
+    frec = rqlib.read_json(rp) if os.path.isfile(rp) else None
+    if frec is not None and "prey" not in frec:
+        frec = worlds.archive_records(study, b["root"]).get(b["origin"]["label"])
+    return origin_invalid(study, b, frec)
+
+
+def origin_status(study, b):
+    """-> ("available", archive record) | ("waiting", why) | ("unavailable", why). The archive record is
+    fetched ONCE, and that exact record is the one checked (its guild counts, its bytes) and frozen; the
+    availability ledger is read AFTER it was obtained (a zero recorded meanwhile is seen)."""
     root = b["root"]
-    why = origin_invalid(study, b, ledger)
+    rec = worlds.archive_records(study, root).get(b["origin"]["label"])
+    if rec is not None:
+        why = record_invalid(b, rec)
+        if why:
+            return "unavailable", why
+        if not os.path.isfile(rec["path"]) or rqlib.sha256_file(rec["path"]) != rec["sha256"]:
+            return "waiting", f"the archived {b['origin']['label']} of {root} does not verify (repaired by its supervisor first)"
+    why = zero_before(study, b)                 # (read now, after the record was obtained)
     if why:
         return "unavailable", why
-    rec = worlds.archive_records(study, root).get(b["origin"]["label"])
-    st = worlds.read_state(study, root)
     if rec is None:
+        st = worlds.read_state(study, root)
         if st["status"] in ("done", "extinct"):
             return "unavailable", f"its root {root} ended ({st['status']}) without archiving {b['origin']['label']}"
         return "waiting", f"its root {root} has not archived {b['origin']['label']} yet ({st['status']})"
-    if not os.path.isfile(rec["path"]) or rqlib.sha256_file(rec["path"]) != rec["sha256"]:
-        return "waiting", f"the archived {b['origin']['label']} of {root} does not verify (repaired by its supervisor first)"
     return "available", rec
 
 
@@ -232,7 +255,8 @@ def freeze_origin(fr, b, rec):
     os.replace(tmp, p)
     rqlib.fsync_dir(d)
     r = {"schema": ORIGIN_SCHEMA, "branch": b["id"], "root": b["root"], "label": b["origin"]["label"],
-         "frame": b["origin"]["frame"], "sha256": rec["sha256"], "source": rec["path"], "utc": rqlib.now_utc()}
+         "frame": b["origin"]["frame"], "sha256": rec["sha256"], "source": rec["path"], "prey": rec.get("prey"),
+         "predators": rec.get("predators"), "utc": rqlib.now_utc()}
     rqlib.write_json_durable(rp, r)
     return p, rec["sha256"]
 
@@ -272,10 +296,11 @@ def refresh_origins(study, reg, log):
         bid = b["id"]
         st = worlds.read_state(fr, bid)
         fresh = not os.path.isfile(os.path.join(worlds.wdir(fr, bid), "state.json"))
+        changed = False
         try:
             frozen = verify_frozen(fr, bid)
         except ForkError as e:
-            frozen = None
+            frozen, changed = None, True
             if st["status"] not in ("failed", "unavailable", "invalidated"):
                 st = dict(st, status="failed", end_reason=str(e))
                 worlds.write_state(fr, bid, st)
@@ -296,8 +321,9 @@ def refresh_origins(study, reg, log):
             elif st["status"] != "waiting":
                 st = dict(st, status="waiting", end_reason=info)
                 worlds.write_state(fr, bid, st)
-        elif st["status"] not in ("unavailable", "invalidated", "failed"):
-            info = origin_invalid(study, b)
+        elif st["status"] not in ("unavailable", "invalidated") and not changed:
+            # every admitted branch that may still run, a FAILED one included (--retry-failed resumes it)
+            info = branch_invalid(study, b)
             if info:
                 st = dict(st, status="invalidated", end_reason=info, invalidated_from=st["status"])
                 worlds.write_state(fr, bid, st)
@@ -328,8 +354,11 @@ def launch(a, log):
     sup = worlds.Supervisor(fr, runtime, ar, exe, exe_sha, a, log)
     if not a.extend_pilot:
         sup.hold = {b["id"]: b["hold_at"] for b in reg["worlds"] if b.get("hold_at")}
+    byid = {b["id"]: b for b in reg["worlds"]}
+    sup.ineligible = lambda wid: branch_invalid(study, byid[wid])     # before every segment, every retry
     sup.guards = runlib.disk_guards(a.disk_min, fr)
     rc = sup.run()
+    refresh_origins(study, reg, log)            # (the ledger records what the run invalidated)
     n = {}
     for b in reg["worlds"]:
         s = worlds.read_state(fr, b["id"])["status"]

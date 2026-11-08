@@ -1507,6 +1507,8 @@ class Supervisor:
         self.chain = {}       # wid -> frames of the currently verified acceptance chain (pruning may use)
         self.chain_active = {}  # wid -> the active segment's last accepted frame (or its start)
         self.hold = {}          # wid -> a frame it stops at for now ("held": forks.py, the pilot's first horizon)
+        self.ineligible = None  # wid -> why it may no longer run (None: it may): forks.py's origin re-check,
+        #                         asked before EVERY segment (a resume, a retry, a replay)
 
     # ---------------------------------------------------------------- per world
     def base(self, wid):
@@ -1550,6 +1552,12 @@ class Supervisor:
         st.update(kw)
         write_state(self.root, wid, st)
         return st
+
+    def invalidate(self, wid, why):
+        """A fork branch whose origin is no longer valid: it stops for good (its artifacts kept)."""
+        st = self.state(wid)
+        self.set_status(wid, "invalidated", end_reason=why, invalidated_from=st["status"])
+        self.log(f"INVALIDATED {wid}: {why}")
 
     def end_world(self, wid, status, reason):
         self.set_status(wid, status, end_reason=reason)
@@ -1854,11 +1862,15 @@ class Supervisor:
 
     # ---------------------------------------------------------------- what next
     def next_action(self, wid):
-        """-> ("extinct" | "done", reason) | ("verify", None) | ("segment", (start, checkpoint path, record)).
+        """-> ("extinct" | "done" | "held" | "invalidated", reason) | ("verify", None)
+        | ("segment", (start, checkpoint path, record)).
         The extinction shortcut applies only while the stop is evidenced (extinct_problems); else the
         world replays from its latest verified record, through the zero, which stops it again (and
         reap_segment fails it if the replay did not repair the accepted logs)."""
         st = self.state(wid)
+        why = self.ineligible(wid) if self.ineligible else None
+        if why:
+            return "invalidated", why
         if self.a.on_extinction == "stop" and self.zero_reason(wid):
             why = self.extinct_problems(wid, st)
             if not why:
@@ -2004,6 +2016,10 @@ class Supervisor:
                 st["status"] = "interrupted"
                 write_state(self.root, wid, st)
             if st["status"] == "running" or (st["status"] == "failed" and a.retry_failed):
+                why = self.ineligible(wid) if self.ineligible else None
+                if why:                                   # (never retried, never resumed)
+                    self.invalidate(wid, why)
+                    continue
                 if st["status"] == "failed":
                     self.log(f"{wid}: retrying a failed world (--retry-failed; it was: {st.get('end_reason')})")
                     st["failures"] = 0
@@ -2055,6 +2071,8 @@ class Supervisor:
                     self.log(f"{wid}: already at its end ({kind}: {info}); finalized without another segment")
                 elif kind == "held":
                     self.set_status(wid, "held", end_reason=info)
+                elif kind == "invalidated":
+                    self.invalidate(wid, info)
         if missing_f1:
             raise WorldsError(f"no F1 archived by the pinned engine for {', '.join(missing_f1)}: run worlds.py f1 first")
 
@@ -2135,6 +2153,8 @@ class Supervisor:
                     elif kind == "held":
                         self.set_status(wid, "held", end_reason=info)
                         log(f"{wid}: {info}")
+                    elif kind == "invalidated":
+                        self.invalidate(wid, info)
                     elif kind == "verify":
                         self.spawn_verify(wid)
                     else:

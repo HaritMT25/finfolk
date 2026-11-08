@@ -383,6 +383,135 @@ class TestBranches(unittest.TestCase):
         with self.assertRaisesRegex(forks.ForkError, "changed since it was frozen"):
             forks.freeze_origin(fr, b, rec)
 
+    # ---------------------------------------------------------------- #65 review 2, finding 3
+    def root_zero(self, study, b, frame=900):
+        """The branch's root records a supported prey zero at `frame` (the histories' ledger)."""
+        d = worlds.wdir(study, b["root"])
+        os.makedirs(os.path.join(d, "seg000"), exist_ok=True)
+        head = f"step,population,predator_pop\n{frame},0,8\n"
+        wr(os.path.join(d, "seg000", "run.csv"), head)
+        worlds._append_durable(os.path.join(study, "availability.jsonl"), {
+            "schema": worlds.AVAIL_SCHEMA, "world": b["root"], "guild": "prey", "first_zero_frame": frame,
+            "segment": "seg000", "csv_bytes": len(head), "csv_sha256": rqlib.sha256_bytes(head.encode())})
+
+    def records(self, seq, calls, side=None):
+        """A stand-in for worlds.archive_records whose successive calls return seq's records (the last one
+        repeated): a history re-archiving its origin label between two reads."""
+        def f(root, wid, repair=False):
+            calls.append(wid)
+            if side:
+                side()
+            return {"end.1000": dict(seq[min(len(calls), len(seq)) - 1])}
+        return f
+
+    def test_admission_validates_the_record_it_freezes(self):
+        """3(a): the archive record is fetched ONCE; that exact record's guild counts and bytes are checked
+        and it is the one frozen; the availability ledger is read AFTER the record was obtained."""
+        study, fr, far, rt, b, cp = self.setup_branch()
+        good = worlds.archive_records(study, b["root"])["end.1000"]
+        o2 = os.path.join(self.tmp, "o1000b.json")                       # other bytes, a verifying record
+        wr(o2, ckpt.dumps(mk_cp(frame=1000, seed=5, cfg_extra=cfg_for(b["flags"]))))
+        zero = dict(good, path=o2, sha256=rqlib.sha256_file(o2), prey=0)
+        b2 = dict(b, id=b["id"] + "y")
+        freg = dict(rt, worlds=[b2])
+        orig = worlds.archive_records
+        try:
+            # checked good, then re-read as the zero-prey record: the checked record is the one admitted
+            calls = []
+            worlds.archive_records = self.records([good, zero], calls)
+            kind, rec = forks.origin_status(study, b2)
+            self.assertEqual((kind, rec["sha256"], rec["prey"], len(calls)), ("available", good["sha256"], 8, 1))
+            calls = []
+            worlds.archive_records = self.records([good, zero], calls)
+            out = forks.refresh_origins(study, freg, lambda m: None)
+            frec = rqlib.read_json(os.path.join(worlds.wdir(fr, b2["id"]), "origin.rec.json"))
+            self.assertEqual((frec["sha256"], frec["prey"], frec["predators"]), (good["sha256"], 8, 3))
+            self.assertEqual(out["worlds"][0]["origin"]["sha256"], good["sha256"])
+            # the zero-prey record first: refused, nothing frozen, whatever a later read would say
+            b3 = dict(b, id=b["id"] + "z")
+            calls = []
+            worlds.archive_records = self.records([zero, good], calls)
+            out = forks.refresh_origins(study, dict(rt, worlds=[b3]), lambda m: None)
+            self.assertEqual(worlds.read_state(fr, b3["id"])["status"], "unavailable")
+            self.assertFalse(os.path.exists(os.path.join(worlds.wdir(fr, b3["id"]), "origin.json")))
+            self.assertNotIn("local", out["worlds"][0]["origin"])
+            # a root zero recorded while the record was being fetched is seen (the ledger is read after)
+            b4 = dict(b, id=b["id"] + "w")
+            calls = []
+            worlds.archive_records = self.records([good], calls, side=lambda: self.root_zero(study, b) if len(calls) == 1 else None)
+            kind, why = forks.origin_status(study, b4)
+            self.assertEqual(kind, "unavailable")
+            self.assertIn("reached 0 at frame 900", why)
+        finally:
+            worlds.archive_records = orig
+
+    def test_admission_refused_on_guild_counts_alone(self):
+        """3: a verifying record, no zero in the ledger, its root still running: refused solely because the
+        record holds no prey (any treatment) or no predators (C and B; A has none)."""
+        study, fr, far, rt, b, cp = self.setup_branch()
+        good = worlds.archive_records(study, b["root"])["end.1000"]
+        self.assertEqual(worlds.first_zeros(worlds.read_jsonl(os.path.join(study, "availability.jsonl")),
+                                            b["root"], study), {})
+        orig = worlds.archive_records
+        try:
+            for treat, prey, pred, want in (("A", 0, 3, "unavailable"), ("A", 8, 0, "available"),
+                                            ("C", 8, 0, "unavailable"), ("B", 8, 0, "unavailable"),
+                                            ("C", 0, 3, "unavailable"), ("C", 8, 3, "available")):
+                worlds.archive_records = self.records([dict(good, prey=prey, predators=pred)], [])
+                kind, info = forks.origin_status(study, dict(b, id=b["id"] + treat, treatment=treat))
+                self.assertEqual(kind, want, (treat, prey, pred, info))
+                if want == "unavailable":
+                    self.assertIn(f"holds {prey} prey and {pred} predators", info)
+            b2 = dict(b, id=b["id"] + "q")
+            worlds.archive_records = self.records([dict(good, prey=0)], [])
+            logs = []
+            forks.refresh_origins(study, dict(rt, worlds=[b2]), logs.append)
+        finally:
+            worlds.archive_records = orig
+        st = worlds.read_state(fr, b2["id"])
+        self.assertEqual(st["status"], "unavailable")
+        self.assertIn("holds 0 prey", st["end_reason"])
+        self.assertFalse(os.path.exists(os.path.join(worlds.wdir(fr, b2["id"]), "origin.json")))
+        ev = [e for e in worlds.read_jsonl(os.path.join(fr, "origins.jsonl")) if e["branch"] == b2["id"]]
+        self.assertEqual([e["status"] for e in ev], ["unavailable"])
+
+    def test_failed_branch_rechecked_before_retry(self):
+        """3(b): a FAILED branch whose root later records a zero at or before its origin is invalidated by
+        the fork refresh, and the Supervisor re-checks every branch before a --retry-failed retry and
+        before every resume (it never spawns a segment for it)."""
+        # the refresh
+        study, fr, far, rt, b, cp = self.setup_branch(ckpts=())
+        st = worlds.read_state(fr, b["id"])
+        worlds.write_state(fr, b["id"], dict(st, status="failed", end_reason="exit 1, no progress"))
+        self.root_zero(study, b)
+        forks.refresh_origins(study, dict(rt, worlds=[dict(b)]), lambda m: None)
+        st = worlds.read_state(fr, b["id"])
+        self.assertEqual((st["status"], st["invalidated_from"]), ("invalidated", "failed"))
+        ev = worlds.read_jsonl(os.path.join(fr, "origins.jsonl"))
+        self.assertEqual([e["status"] for e in ev], ["available", "invalidated"])
+        # the Supervisor, without a refresh: a --retry-failed retry
+        worlds.write_state(fr, b["id"], dict(st, status="failed"))
+        s, msgs = supervisor(fr, rt, far, retry_failed=True)
+        s.ineligible = lambda wid: forks.branch_invalid(study, b)
+        s.startup()
+        st = worlds.read_state(fr, b["id"])
+        self.assertEqual((st["status"], st["invalidated_from"], len(st["segments"])), ("invalidated", "failed", 1), msgs)
+        self.assertFalse(any("retrying a failed world" in m for m in msgs), msgs)
+        # ... and a resume of an interrupted branch, in the loop (no segment spawned)
+        worlds.write_state(fr, b["id"], dict(st, status="interrupted"))
+        s, msgs = supervisor(fr, rt, far)
+        s.ineligible = lambda wid: forks.branch_invalid(study, b)
+        self.assertEqual(s.next_action(b["id"])[0], "invalidated")
+        self.assertEqual(s.run(), 0, msgs)
+        st = worlds.read_state(fr, b["id"])
+        self.assertEqual((st["status"], len(st["segments"])), ("invalidated", 1), msgs)
+        # the same branch with an eligible origin is retried as before
+        worlds.write_state(fr, b["id"], dict(st, status="failed"))
+        s, msgs = supervisor(fr, rt, far, retry_failed=True)
+        s.ineligible = lambda wid: None
+        s.startup()
+        self.assertTrue(any("retrying a failed world" in m for m in msgs), msgs)
+
 
 if __name__ == "__main__":
     unittest.main()
