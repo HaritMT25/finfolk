@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import uuid
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -26,7 +27,14 @@ import sealing  # noqa: E402
 M = 1_000_000
 SPLIT = {"C01": "train", "C02": "train", "C03": "train", "C04": "train", "C05": "val", "C06": "test",
          "A1": "train", "A2": "test"}
-UUIDS = {w: f"00000000-0000-4000-8000-0000000000{i:02d}" for i, w in enumerate(sorted(SPLIT), 1)}
+UUIDS = {w: str(uuid.uuid5(uuid.NAMESPACE_URL, f"finfolk:redqueen:ns-main:{w}")) for w in sorted(SPLIT)}
+BR = {b: str(uuid.uuid5(uuid.NAMESPACE_URL, f"finfolk:redqueen:ns-forks:{b}")) for b in ("C06.o30M.s0", "C01.o30M.s0")}
+SENT = "rq-sentinel-test"
+
+
+def ref_entry(ns, world, frame, k):
+    u = str(uuid.uuid5(uuid.NAMESPACE_URL, f"finfolk:redqueen:{ns}:{world}"))
+    return {"world": world, "frame": frame, "uuid": u, "archive": f"/refs/{world}.json", "sha256": f"{k:02x}" * 32}
 
 
 def wr(path, text):
@@ -50,17 +58,16 @@ def fixture(d):
     wp = os.path.join(d, "worlds.json")
     wr(wp, json.dumps({"worlds": [{"id": w, "uuid": UUIDS[w]} for w in sorted(SPLIT)]}))
     fp = os.path.join(d, "forks.json")
-    wr(fp, json.dumps({"worlds": [{"id": "C06.o30M.s0", "uuid": "00000000-0000-4000-8000-0000000000f6",
+    wr(fp, json.dumps({"worlds": [{"id": "C06.o30M.s0", "uuid": BR["C06.o30M.s0"],
                                    "root": "C06", "root_uuid": UUIDS["C06"]},
-                                  {"id": "C01.o30M.s0", "uuid": "00000000-0000-4000-8000-0000000000f1",
+                                  {"id": "C01.o30M.s0", "uuid": BR["C01.o30M.s0"],
                                    "root": "C01", "root_uuid": UUIDS["C01"]}]}))
     rp = os.path.join(d, "references.json")
-    wr(rp, json.dumps({"schema": "finfolk.redqueen.references/1", "references": REFS}))
+    wr(rp, json.dumps({"schema": "finfolk.redqueen.references/1", "namespace": SENT, "references": REFS}))
     return os.path.join(g, "graph.meta.json"), wp, fp
 
 
-REFS = {f"R{g}:{k}": {"uuid": f"00000000-0000-4000-8000-00000000{ord(g):02x}{k:02d}", "archive": f"/refs/{g}{k}.json",
-                     "sha256": f"{ord(g):02x}{k:02d}" * 16} for g in "QP" for k in range(8)}
+REFS = {f"R{g}:{k}": ref_entry(SENT, f"s{g}{k}", (10 + k) * M, 16 * (g == "P") + k) for g in "QP" for k in range(8)}
 
 
 def E(role, pw, pf, qw=None, qf=None, rid=None, pe=None, qe=None, pref=None):
@@ -120,7 +127,7 @@ class TestManifest(unittest.TestCase):
         snap = E("training", "C03", 9 * M, "C04", 9 * M, pe={"snapshot": sealing.snapshot_uuid(UUIDS["C06"], 9 * M)})
         self.assertTrue(any("snapshot UUID" in p for p in sealing.record_problems(m, [snap])))
         br = E("training", "C06.o30M.s0", 31 * M, "C04", 9 * M,
-               pe={"snapshot": sealing.snapshot_uuid("00000000-0000-4000-8000-0000000000f6", 31 * M)})
+               pe={"snapshot": sealing.snapshot_uuid(BR["C06.o30M.s0"], 31 * M)})
         self.assertTrue(any("makes it test" in p for p in sealing.record_problems(m, [br])))   # the root is test
         self.assertEqual(sealing.record_problems(m, [dict(br, role="test")]), [])
 
@@ -207,15 +214,38 @@ class TestManifest(unittest.TestCase):
                     {"id": "b3", "role": "training", "prey": {"world": "C03", "frame": 9 * M},
                      "predators": {"source": "random", "world": "C04", "frame": 9 * M}}):
             self.assertTrue(sealing.record_problems(m, [bad]), bad)
-        # the assignment itself: eight per guild, distinct, never a main world's uuid
+        # the assignment itself: eight per guild, distinct, from the sentinel namespace, never a study identity
+        def refs_file(refs, ns=SENT):
+            wr(self.rp, json.dumps({"schema": "finfolk.redqueen.references/1", "namespace": ns, "references": refs}))
         bad = dict(REFS)
         bad.pop("RP:7")
-        wr(self.rp, json.dumps({"schema": "finfolk.redqueen.references/1", "references": bad}))
+        refs_file(bad)
         with self.assertRaisesRegex(sealing.SealError, "eight RP"):
             sealing.manifest(self.mp, self.wp, refs_path=self.rp)
-        wr(self.rp, json.dumps({"schema": "finfolk.redqueen.references/1",
-                                "references": dict(REFS, **{"RQ:1": dict(REFS["RQ:1"], uuid=UUIDS["C01"])})}))
-        with self.assertRaisesRegex(sealing.SealError, "main world"):
+        # #67 round 3: Codex's counterexample, RQ:0 = the test fork branch C06.o30M.s0 at 31M (its uuid and
+        # snapshot), with the fork registry: refused
+        alias = dict(REFS, **{"RQ:0": dict(REFS["RQ:0"], uuid=BR["C06.o30M.s0"], frame=31 * M,
+                                           snapshot=sealing.snapshot_uuid(BR["C06.o30M.s0"], 31 * M))})
+        refs_file(alias)
+        with self.assertRaises(sealing.SealError):
+            sealing.manifest(self.mp, self.wp, self.fp, refs_path=self.rp)
+        # ... and a sentinel-form reference that IS a study identity (the forks' or the main namespace's
+        # world): the collision check itself
+        for ns, world, frame, owner in (("ns-forks", "C06.o30M.s0", 31 * M, "fork branch C06.o30M.s0"),
+                                        ("ns-main", "C01", 9 * M, "world C01")):
+            allns = {f"R{g}:{k}": ref_entry(ns, f"s{g}{k}", (10 + k) * M, 16 * (g == "P") + k) for g in "QP" for k in range(8)}
+            refs_file(dict(allns, **{"RQ:0": ref_entry(ns, world, frame, 0)}), ns=ns)
+            with self.assertRaisesRegex(sealing.SealError, f"collides with a study identity \\({owner}"):
+                sealing.manifest(self.mp, self.wp, self.fp, refs_path=self.rp)
+        refs_file(dict(REFS, **{"RQ:1": dict(REFS["RQ:1"], uuid=REFS["RQ:2"]["uuid"])}))
+        with self.assertRaisesRegex(sealing.SealError, "not sentinel world"):
+            sealing.manifest(self.mp, self.wp, refs_path=self.rp)
+        refs_file(REFS, ns="")
+        with self.assertRaisesRegex(sealing.SealError, "sentinel namespace"):
+            sealing.manifest(self.mp, self.wp, refs_path=self.rp)
+        wr(self.wp, json.dumps({"namespace": SENT, "worlds": [{"id": w, "uuid": UUIDS[w]} for w in sorted(SPLIT)]}))
+        refs_file(REFS)
+        with self.assertRaisesRegex(sealing.SealError, "main registry's"):
             sealing.manifest(self.mp, self.wp, refs_path=self.rp)
 
 
@@ -336,6 +366,20 @@ class TestCommitments(unittest.TestCase):
         self.assertEqual(done, [True])
         self.assertTrue(os.path.isfile(os.path.join(st2, "config", "splits.json")))
 
+    def test_missing_study_parent_fsynced(self):
+        """#67 round 3, finding 2: a study whose parent does not exist yet: the whole missing chain is
+        fsync'd through its existing parent."""
+        st = os.path.join(self.tmp, "new-parent", "study")
+        calls = []
+        orig = sealing.rqlib.fsync_dir
+        sealing.rqlib.fsync_dir = lambda d: (calls.append(os.path.abspath(d)), orig(d))[1]
+        try:
+            sealing.commit(st, "validation", self.val)
+        finally:
+            sealing.rqlib.fsync_dir = orig
+        for d in (os.path.join(st, "registration"), st, os.path.join(self.tmp, "new-parent"), self.tmp):
+            self.assertIn(os.path.abspath(d), calls)
+
     def test_freeze_and_byte_bound_gate(self):
         """#67 review 3, 5, 7: the freeze needs the manifest, the OSF identifier and its registration time;
         the gate compares the manifest unconditionally and hands scoring the verified bytes."""
@@ -364,6 +408,17 @@ class TestCommitments(unittest.TestCase):
             sealing.freeze(self.study, self.prereg, self.script, **dict(kw, osf_url="https://osf.io/zzz99"))
         got = sealing.require_test_freeze(self.study, self.test, self.script)
         self.assertEqual(got["freeze"], json.loads(got["freeze_bytes"]))      # the record checked is returned
+        # the gate checks the registration chronology too: a time before the validation opening, or after
+        # the freeze record was made, is refused at the gate
+        fp_ = os.path.join(self.study, "registration", "freeze.json")
+        keep_f = rqlib.read_bytes(fp_)
+        for t in ("2020-01-01T00:00:00Z", "2099-01-01T00:00:00Z"):
+            os.chmod(fp_, 0o644)
+            rqlib.write_durable(fp_, rqlib.canonical(dict(json.loads(keep_f), osf=dict(json.loads(keep_f)["osf"],
+                                                                                         registered_utc=t))))
+            with self.assertRaisesRegex(sealing.SealError, "registration time"):
+                sealing.require_test_freeze(self.study, self.test, self.script)
+        rqlib.write_durable(fp_, keep_f)
         self.assertEqual(got["freeze_bytes"], rqlib.read_bytes(os.path.join(self.study, "registration", "freeze.json")))
         wr(self.test, '{"target_id": "t1", "mean": 0.99}\n')          # replaced after the gate ...
         self.assertEqual(rqlib.sha256_bytes(got["predictions"]), f["TEST_PRED_SHA"])   # ... scoring uses these

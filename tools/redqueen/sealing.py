@@ -21,9 +21,13 @@ branch's root world and UUID). It holds every world's split (C 20/6/6, A and B 5
 validation / test), the training C worlds' snapshot holdouts (t in M -> validation | test), the fork
 and intensive sets, the REGISTERED SUPPORT EXCEPTIONS: the graph's support pairs (endpoint keys
 "Q:<world>:<t>", "P:<world>:<t>", references "RQ:<k>" / "RP:<k>"), and the REGISTERED REFERENCE
-ASSIGNMENT (config/references.json, finfolk.redqueen.references/1: the eight prey and eight predator
-references selected, slot -> {"uuid", "snapshot"?, "archive", "sha256"}); without it no endpoint is a
-reference.
+ASSIGNMENT (config/references.json, finfolk.redqueen.references/1: the SENTINEL namespace and the eight
+prey and eight predator references selected, slot -> {"world" (a sentinel world id), "frame", "uuid" =
+uuid5(URL, "finfolk:redqueen:<sentinel namespace>:<world>"), "snapshot" = the snapshot UUID recipe of
+that uuid and frame, "archive", "sha256"}); the sentinel namespace differs from the main registry's,
+and no reference's uuid or snapshot UUID may be any study identity: a main world's, a fork branch's or
+its root's, at any snapshot frame (all identities are loaded before the references are checked);
+without an assignment no endpoint is a reference.
 
 ENDPOINTS. A record's endpoint is {"world", "frame"} and, as the plan carries them, "uuid" (its
 world's) and/or "snapshot" (uuid5(URL, "finfolk:snapshot:<world uuid>:<frame>")); or a REFERENCE
@@ -49,8 +53,8 @@ on training-world observations, never on held-out populations' support); validat
 COMMITMENTS. Every artifact below, the split manifest included, is PUBLISHED EXCLUSIVELY (a temporary
 file, fsync'd, hard-linked to its name, which fails if it exists, the directory fsync'd; the same bytes
 again are accepted, other bytes refused) under STUDY/registration/.lock, one transaction at a time; the
-directory setup happens INSIDE the lock and every directory from the study down is fsync'd
-unconditionally (whoever created it). commit reads the predictions ONCE (one JSONL file, a unique "target_id" per line), validates
+directory setup happens INSIDE the lock and every directory from the target up to the filesystem
+root is fsync'd unconditionally (whoever created it, wherever a missing chain began). commit reads the predictions ONCE (one JSONL file, a unique "target_id" per line), validates
 and hashes those bytes: registration/<stage>_predictions.json (the record, its sha256) and then the
 marker VAL_PRED_SHA / TEST_PRED_SHA (that sha256). open-validation records the validation evaluation
 (the sha256 of the validation scores, the time) after VAL_PRED_SHA; the test commitment requires it
@@ -105,17 +109,17 @@ class SealError(Exception):
 
 # ================================================================== durable, exclusive publication
 def mkdirs_durable(path, root):
-    """Make `path` and fsync it and every directory up to and including `root`'s parent,
-    UNCONDITIONALLY (another writer may have created a directory and not yet fsync'd its parent)."""
+    """Make `path` (inside `root`) and fsync it and EVERY ancestor up to the filesystem root,
+    UNCONDITIONALLY (another writer may have created a directory and not yet fsync'd its parent; a
+    missing chain may begin above the study)."""
     path, root = os.path.abspath(path), os.path.abspath(root)
     if os.path.commonpath([path, root]) != root:
         raise SealError(f"{path} is not inside {root}")
     os.makedirs(path, exist_ok=True)
-    p = path
-    while True:
+    p = path                                 # every ancestor, up to the filesystem root: whoever created a
+    while True:                              # directory (and wherever the chain began), its entry is durable
         rqlib.fsync_dir(p)
-        if p == root:
-            rqlib.fsync_dir(os.path.dirname(p))
+        if os.path.dirname(p) == p:
             break
         p = os.path.dirname(p)
 
@@ -176,23 +180,54 @@ def snapshot_uuid(world_uuid, frame):
     return str(uuid.uuid5(uuid.NAMESPACE_URL, f"finfolk:snapshot:{world_uuid}:{int(frame)}"))
 
 
-def load_references(path, uuids):
-    """The registered reference assignment: slot -> {"uuid", "snapshot"?, "archive", "sha256"}."""
+MAX_FRAME_INDEX = 400            # snapshot frames F1, 1M .. 400M: the identity space checked for collisions
+
+
+def study_identities(uuids, branches):
+    """Every study identity: {uuid: owner} of the main worlds, the fork branches and their roots, and
+    {snapshot uuid: owner} of all of them at every snapshot frame (F1 and k x 1M up to 400M)."""
+    ids = {u: f"world {w}" for w, u in uuids.items()}
+    for b, v in branches.items():
+        ids[v["uuid"]] = f"fork branch {b}"
+    snaps = {}
+    for u, owner in ids.items():
+        for f in [1] + [k * UNIT for k in range(1, MAX_FRAME_INDEX + 1)]:
+            snaps[snapshot_uuid(u, f)] = f"{owner}@{f}"
+    return ids, snaps
+
+
+def load_references(path, uuids, branches=None, main_namespace=None):
+    """The registered reference assignment: slot -> {"world", "frame", "uuid", "snapshot", "archive",
+    "sha256"}, the references from the SENTINEL namespace only, never a study identity (see the doc)."""
     r = rqlib.read_json(path)
     if r.get("schema") != REFS_SCHEMA:
         raise SealError(f"{path}: schema {r.get('schema')!r}")
+    ns = r.get("namespace")
+    if not isinstance(ns, str) or not ns:
+        raise SealError(f"{path}: the sentinel namespace the references come from is required")
+    if main_namespace is not None and ns == main_namespace:
+        raise SealError(f"{path}: the references' namespace {ns!r} is the main registry's")
+    ids, snaps = study_identities(uuids, branches or {})
     out, seen = {}, {}
     for slot, v in sorted((r.get("references") or {}).items()):
         if not REF_SLOT.match(slot):
             raise SealError(f"{path}: {slot!r} is not a reference slot (RQ:<k> / RP:<k>)")
-        if not isinstance(v, dict) or not isinstance(v.get("uuid"), str) or not SHA.match(str(v.get("sha256", ""))):
-            raise SealError(f"{path}: {slot} needs its uuid and its archive's sha256")
-        if v["uuid"] in set(uuids.values()):
-            raise SealError(f"{path}: {slot}'s uuid is a main world's")
+        if (not isinstance(v, dict) or not isinstance(v.get("uuid"), str) or not SHA.match(str(v.get("sha256", "")))
+                or not isinstance(v.get("world"), str) or not isinstance(v.get("frame"), int)):
+            raise SealError(f"{path}: {slot} needs its sentinel world, frame, uuid and archive sha256")
+        want = str(uuid.uuid5(uuid.NAMESPACE_URL, f"finfolk:redqueen:{ns}:{v['world']}"))
+        if v["uuid"] != want:
+            raise SealError(f"{path}: {slot}'s uuid is not sentinel world {v['world']}'s in namespace {ns}")
+        snap = snapshot_uuid(v["uuid"], v["frame"])
+        if v.get("snapshot") not in (None, snap):
+            raise SealError(f"{path}: {slot}'s snapshot UUID is not {v['world']}@{v['frame']}'s")
+        if v["uuid"] in ids or snap in snaps or v.get("snapshot") in snaps:
+            owner = ids.get(v["uuid"]) or snaps.get(snap) or snaps.get(v.get("snapshot"))
+            raise SealError(f"{path}: {slot} collides with a study identity ({owner})")
         if v["uuid"] in seen and seen[v["uuid"]][0] == slot[1]:
             raise SealError(f"{path}: {slot} and {seen[v['uuid']][1]} are one reference")
         seen[v["uuid"]] = (slot[1], slot)
-        out[slot] = {k: v[k] for k in ("uuid", "snapshot", "archive", "sha256") if v.get(k) is not None}
+        out[slot] = dict({k: v[k] for k in ("world", "frame", "uuid", "archive", "sha256")}, snapshot=snap)
     for g in "QP":
         if sum(1 for s_ in out if s_[1] == g) != 8:
             raise SealError(f"{path}: eight R{g} references are registered, not {sum(1 for s_ in out if s_[1] == g)}")
@@ -227,22 +262,24 @@ def manifest(meta_path, worlds_path, forks_path=None, refs_path=None):
            "worlds": split, "uuids": uuids, "snapshot_holdouts": hold, "fork": sorted(m.get("fork", [])),
            "intensive": sorted(m.get("intensive", [])), "support_exceptions": sorted(support), "branches": {},
            "references": {}}
-    if refs_path:
-        out["references"] = load_references(refs_path, uuids)
-        out["references_sha256"] = rqlib.sha256_file(refs_path)
-        for pair in support:
-            for k in pair:
-                if REF_SLOT.match(k) and k not in out["references"]:
-                    raise SealError(f"support pair {pair}: reference {k} is not registered")
-    if forks_path:
+    if forks_path:                           # (every study identity first: the references are checked against all)
         fk = rqlib.read_json(forks_path)
         for b in fk["worlds"]:
             if b["root"] not in uuids or b.get("root_uuid") not in (None, uuids[b["root"]]):
                 raise SealError(f"fork branch {b['id']}: its root {b['root']} is not the registry's")
             if b["id"] in uuids:
                 raise SealError(f"fork branch {b['id']} reuses a world id")
+            if b["uuid"] in set(uuids.values()):
+                raise SealError(f"fork branch {b['id']} reuses a world's uuid")
             out["branches"][b["id"]] = {"root": b["root"], "uuid": b["uuid"]}
         out["forks_sha256"] = rqlib.sha256_file(forks_path)
+    if refs_path:
+        out["references"] = load_references(refs_path, uuids, out["branches"], reg.get("namespace"))
+        out["references_sha256"] = rqlib.sha256_file(refs_path)
+        for pair in support:
+            for k in pair:
+                if REF_SLOT.match(k) and k not in out["references"]:
+                    raise SealError(f"support pair {pair}: reference {k} is not registered")
     return out
 
 
@@ -560,10 +597,15 @@ def test_problems(study, pred_bytes, script_bytes, manifest_bytes, freeze_bytes=
     o = f.get("osf") or {}
     if not ((o.get("url") and OSF_URL.match(o["url"])) or (o.get("doi") and DOI.match(o["doi"]))):
         probs.append("the freeze record names no public registration (OSF URL or DOI)")
+    ve = os.path.join(d, "validation_evaluation.json")
     try:
-        parse_utc(o.get("registered_utc"))
-    except SealError:
-        probs.append("the freeze record lacks a valid public registration time")
+        why = registration_time_problem(o.get("registered_utc"),
+                                        rqlib.read_json(ve).get("utc") if os.path.isfile(ve) else None,
+                                        parse_utc(f["utc"]) if f.get("utc") else None)
+    except SealError as e:
+        why = str(e)
+    if why:
+        probs.append(f"the freeze record's public registration time: {why}")
     for k in ("preregistration_sha256", "evaluation_script_sha256", "split_manifest_sha256", "VAL_PRED_SHA",
               "TEST_PRED_SHA"):
         if not SHA.match(str(f.get(k) or "")):
