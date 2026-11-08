@@ -190,6 +190,18 @@ if(SFML_FOUND AND EVO_NO_OPENMP AND NOT EVO_POOL_THREADS)
                  COMMAND bash ${CMAKE_SOURCE_DIR}/tests/redqueen_tooling.sh
                          $<TARGET_FILE:evo_boids> ${CMAKE_CURRENT_BINARY_DIR}/redqueen_tooling_work)
         set_tests_properties(redqueen_tooling PROPERTIES ENVIRONMENT "PYTHON=${Python3_EXECUTABLE}")
+        # redqueen_worlds — tools/redqueen/worlds.py: the 48-world registry, F1, the
+        # resumable history supervisor (kills, stitching, archive), extinction.
+        add_test(NAME redqueen_worlds
+                 COMMAND bash ${CMAKE_SOURCE_DIR}/tests/redqueen_worlds.sh
+                         $<TARGET_FILE:evo_boids> ${CMAKE_CURRENT_BINARY_DIR}/redqueen_worlds_work)
+        set_tests_properties(redqueen_worlds PROPERTIES ENVIRONMENT "PYTHON=${Python3_EXECUTABLE}")
+        # redqueen_forks — tools/redqueen/forks.py: the fork registry, origins from the
+        # histories' archive, reseeded root segments, technical resumes, the pilot's hold.
+        add_test(NAME redqueen_forks
+                 COMMAND bash ${CMAKE_SOURCE_DIR}/tests/redqueen_forks.sh
+                         $<TARGET_FILE:evo_boids> ${CMAKE_CURRENT_BINARY_DIR}/redqueen_forks_work)
+        set_tests_properties(redqueen_forks PROPERTIES ENVIRONMENT "PYTHON=${Python3_EXECUTABLE}")
     endif()
 endif()
 
