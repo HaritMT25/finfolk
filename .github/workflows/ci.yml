@@ -107,6 +107,20 @@ jobs:
           python3 -I -W error::ResourceWarning tools/redqueen/test_sealing.py -v 2>&1 | tee sealing.log
           test "${PIPESTATUS[0]}" = 0
           ! grep -q ResourceWarning sealing.log
+      - name: "Linear forecasts (forecast.py, design v4 section 10.6; numpy required)"
+        run: |
+          python3 -m pip install -q "numpy>=2"
+          RQ_REQUIRE_NUMPY=1 python3 -I -W error::ResourceWarning tools/redqueen/test_forecast.py -v 2>&1 | tee test_forecast.log
+          test "${PIPESTATUS[0]}" = 0
+          ! grep -q ResourceWarning test_forecast.log
+          ! grep -q "skipped" test_forecast.log
+      - name: "Level-3 probes (probes.py, design v4 section 11; numpy required)"
+        run: |
+          python3 -m pip install -q "numpy>=2"
+          RQ_REQUIRE_NUMPY=1 python3 -I -W error::ResourceWarning tools/redqueen/test_probes.py -v 2>&1 | tee test_probes.log
+          test "${PIPESTATUS[0]}" = 0
+          ! grep -q ResourceWarning test_probes.log
+          ! grep -q "skipped" test_probes.log
 
   # tools/gate_receipts.*: fault suite on temp repos and fake tools (no Emscripten, no gate reuse in CI).
   receipts:
