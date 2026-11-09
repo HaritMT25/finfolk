@@ -226,9 +226,10 @@ def load_references(path, uuids, branches=None, main_namespace=None):
         if v["uuid"] in ids or snap in snaps or v.get("snapshot") in snaps:
             owner = ids.get(v["uuid"]) or snaps.get(snap) or snaps.get(v.get("snapshot"))
             raise SealError(f"{path}: {slot} collides with a study identity ({owner})")
-        if v["uuid"] in seen and seen[v["uuid"]][0] == slot[1]:
-            raise SealError(f"{path}: {slot} and {seen[v['uuid']][1]} are one reference")
-        seen[v["uuid"]] = (slot[1], slot)
+        key = (slot[1], snap)                # (#71 r1 P2-4: one SNAPSHOT per guild; a sentinel world may give
+        if key in seen:                      #  several references at different frames)
+            raise SealError(f"{path}: {slot} and {seen[key]} are one reference (the same snapshot in one guild)")
+        seen[key] = slot
         out[slot] = dict({k: v[k] for k in ("world", "frame", "uuid", "archive", "sha256")}, snapshot=snap)
     for g in "QP":
         if sum(1 for s_ in out if s_[1] == g) != 8:
