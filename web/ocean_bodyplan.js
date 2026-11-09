@@ -33,6 +33,8 @@
   var layout = null, samples = null, tris = null, NS = 0, NT = 0, fixture = null;
   var PART_COLOURS = ["#6fa8c9", "#e0a050", "#c97fd0", "#7fd08a", "#f2f2f2", "#d0c07f", "#7fc9c4", "#d06f6f", "#8a6f4f"];
   var PART_NAMES = ["hull", "caudal", "dorsal", "pectoral", "eye", "anal", "pelvic", "barbel", "collar"];
+  /* body: {name, genes (63), physical (5), size, elong, lambda}; compiled: {ok, metrics, points} */
+  /** @type {{body: any, load: {gas: number, fuel: number}, yaw: number, pitch: number, compiled: any, overlays: Record<string, boolean>}} */
   var state = { body: null, load: { gas: 0, fuel: 0 }, yaw: -0.6, pitch: 0.35, compiled: null, overlays: { mouth: true, roots: true, areas: true, centroid: true, inertia: true } };
   function el(id) { return document.getElementById(id); }
   function status(msg) { var s = el("bpstatus"); if (s) s.textContent = msg; }
@@ -82,10 +84,12 @@
     for (var j = 0; j < 30; j++) g[33 + j] = NM[j];
     return g;
   }
+  /* lambda as the C++ law computes it: L = (20f·S)·E, R = 4.6f·S, L / R, every step rounded to binary32
+   * (4.6f first: fround(4.6 * S) would round once from the double 4.6) */
   function makeBody(name, genes, physical, size, elong) {
-    var S = Math.fround(size), E = Math.fround(elong);
+    var f = Math.fround, S = f(size), E = f(elong);
     return { name: name, genes: Float32Array.from(genes), physical: Float32Array.from(physical), size: S, elong: E,
-             lambda: Math.fround(Math.fround(Math.fround(20 * S) * E) / Math.fround(4.6 * S)) };
+             lambda: f(f(f(20 * S) * E) / f(f(4.6) * S)) };
   }
   function fromHash() {
     var m = /#fish=(\d+):([0-9a-f]{560})/.exec(location.hash || "");
@@ -113,7 +117,9 @@
   function drawView(cv, view) {
     var c = state.compiled;
     if (!c || !cv) return;
-    var ctx = cv.getContext("2d"), W = cv.width, H = cv.height, P = c.points, mm = c.metrics;
+    var ctx = cv.getContext("2d");
+    if (!ctx) return;
+    var W = cv.width, H = cv.height, P = c.points, mm = c.metrics;
     ctx.fillStyle = "#08161a"; ctx.fillRect(0, 0, W, H);
     var lo = [Infinity, Infinity], hi = [-Infinity, -Infinity], pr = new Array(NS), i;
     for (i = 0; i < NS; i++) {
@@ -190,8 +196,9 @@
     return 0;
   }
   function readout() {
-    var tb = el("bpmetrics"), c = state.compiled;
-    if (!tb || !c) return;
+    var tb0 = el("bpmetrics"), c = state.compiled;
+    if (!tb0 || !c) return;
+    var tb = /** @type {HTMLElement} */ (tb0);
     tb.textContent = "";
     var mm = c.metrics;
     Object.keys(layout.at).forEach(function (name) {
@@ -225,6 +232,7 @@
 
   /* ---------------- the GPU check ---------------- */
   function gpuCheck() {
+    /** @type {any} */
     var out = { ok: false, error: null, native: null, slots: {}, faults: {}, started: new Date().toISOString() };
     root.__bodyPlanCheck = null;
     if (!PAR || !PAR.bodyPlanVertexCheck) { out.error = "web/ocean_scene_parity.js (bodyPlanVertexCheck) not loaded"; root.__bodyPlanCheck = out; return Promise.resolve(out); }
@@ -267,8 +275,9 @@
     return s;
   }
   function buildControls(list) {
-    var sel = /** @type {HTMLSelectElement} */ (el("bpbody")), box = el("bpsliders");
-    if (!sel || !box) return;
+    var sel = /** @type {HTMLSelectElement} */ (el("bpbody")), box0 = el("bpsliders");
+    if (!sel || !box0) return;
+    var box = /** @type {HTMLElement} */ (box0);
     sel.textContent = "";
     list.forEach(function (b, i) { var o = document.createElement("option"); o.value = String(i); o.textContent = b.name; sel.appendChild(o); });
     function choose(i) {
@@ -307,8 +316,8 @@
       if (mine) list.unshift(mine);
       buildControls(list);
       ["gas", "fuel"].forEach(function (k) {
-        var s = /** @type {HTMLInputElement} */ (el("bpload_" + k));
-        if (s) s.addEventListener("input", function () { state.load[k] = Number(s.value); el("bpload_" + k + "v").textContent = Number(s.value).toFixed(2); redraw(); });
+        var s = /** @type {HTMLInputElement} */ (el("bpload_" + k)), sv = el("bpload_" + k + "v");
+        if (s) s.addEventListener("input", function () { state.load[k] = Number(s.value); if (sv) sv.textContent = Number(s.value).toFixed(2); redraw(); });
       });
       Object.keys(state.overlays).forEach(function (k) {
         var c = /** @type {HTMLInputElement} */ (el("bpo_" + k));
