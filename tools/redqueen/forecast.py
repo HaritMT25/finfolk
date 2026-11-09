@@ -352,10 +352,9 @@ def stage_rows(ctx, stages):
     rows; fork branches' and original continuations' rows) -> (prefix {(world, t)}, targets {(world, t)})."""
     pre, tgt = set(), set()
     for o in ctx["origins"]:
-        if o["stage"] not in stages:
+        if o["stage"] not in stages or o["excluded"]:
             continue
-        if not o["excluded"]:
-            pre.update((o["world"], t) for t in o["window"])
+        pre.update((o["world"], t) for t in o["window"])
         tgt.add((o["world"], o["target_t"]))
         tgt.update((b, o["target_t"]) for b in o["branches"])
     return pre, tgt
@@ -986,6 +985,8 @@ def check_targets(ctx, lines, T):
         raise ForecastError("the targets come from another map / measurement table than the predictions")
     want = set()
     for ln in lines:
+        if ctx["by_id"][ln["target_id"]]["excluded"]:
+            continue                                     # (a registered exclusion: never scored, its target never read)
         want.add((ln["world"], ln["target_t"]))
         want.update((b, ln["target_t"]) for b in ln["branches"])
     have = set(T["rows"])

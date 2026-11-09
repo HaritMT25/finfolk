@@ -467,6 +467,12 @@ class TestPipeline(unittest.TestCase):
         """The staged pipeline runs; categories are reported on their own; lambda is the argmin over the
         registered selection set; provenance binds every input; the test score records its fingerprint."""
         self.assertEqual([r[0] for r in self.rc], [0, 0, 0, 0], [r[1] for r in self.rc])
+        op = os.path.join(self.tmp, "origins.json")
+        self.assertEqual(run(["origins", "--root", self.root, "--out", op])[0], 0)
+        od = rqlib.read_json(op)                                                     # (the outcome-free manifest)
+        self.assertEqual(od["origins_sha256"], self.ctx["origins_sha"])
+        self.assertEqual({tuple(x) for x in od["rows"]["validation"]["prefix"]}, fc.stage_rows(self.ctx, {"validation"})[0])
+        self.assertFalse(any("z" in o for o in od["origins"]))
         cats = {(o["category"], o["stage"]) for o in self.ctx["origins"]}
         for want in (("world_transfer", "validation"), ("world_transfer", "test"), ("forward_time", "validation"),
                      ("forward_time", "test"), ("intersection", "validation"), ("intersection", "test"),
@@ -691,8 +697,11 @@ class TestPipeline(unittest.TestCase):
             fc.register(r2, c2)
         d = tempfile.mkdtemp(dir=self.tmp)
         r3, _ = make_root(d, {"temporal": {"test": [182, 200]}})
-        o = fc.load_ctx(r3)["by_id"]["fork:S0:185:10"]
-        self.assertIn("crosses the registered separation", o["excluded"])
+        c3 = fc.load_ctx(r3)
+        self.assertIn("crosses the registered separation", c3["by_id"]["fork:S0:185:10"]["excluded"])
+        pre, tgt = fc.stage_rows(c3, {"test"})
+        self.assertNotIn((bid("S0", 185, 0), 195), tgt)                             # (excluded: its targets never read)
+        self.assertNotIn(("S0", 181), pre)
 
 
 if __name__ == "__main__":
