@@ -92,10 +92,17 @@ def make_root(tmp, **over):
     man = rqlib.canonical(sealing.manifest(os.path.join(g, "graph.meta.json"), os.path.join(tmp, "worlds.json"),
                                            os.path.join(tmp, "forks.json")))
     sealing.publish_manifest(root, man)
+    m = json.loads(man)
+    founders = {"cohort": "C", "frame": 1, "worlds_registry_sha256": m["worlds_registry_sha256"], "size": len(CWORLDS),
+                "panel": {w: {"uuid": UUIDS[w], "treatment": "C", "block": BLOCK[w]} for w in CWORLDS}}
     cp = os.path.join(tmp, "probes_cfg.json")
-    wr(cp, config(split_manifest_sha256=rqlib.sha256_bytes(man), **over))
+    wr(cp, config(split_manifest_sha256=rqlib.sha256_bytes(man), **dict({"founders": founders}, **over)))
     pb.register(root, cp)
-    return root, cp, json.loads(man)
+    return root, cp, m
+
+
+CWORLDS = [w for k, w in enumerate(WORLDS) if k % 6]                 # (the fixture's C worlds: the founder panel)
+BLOCK = {w: int(w[1:]) // 6 for w in CWORLDS}                       # (six blocks of five)
 
 
 def simulate(seed=1):
@@ -202,11 +209,13 @@ class TestPipeline(unittest.TestCase):
         shutil.copytree(cls.root, cls.opened)
         cls.rc.append(run(["predict-test", "--root", cls.root, "--features", cls.f_test, "--model", cls.model,
                            "--selection", cls.scores, "--out", cls.test]))
-        sealing.commit(cls.root, "test", cls.test, pb.__file__)
+        cls.impl = os.path.join(cls.tmp, "impl.json")
+        cls.rc.append(run(["implementation", "--out", cls.impl]))
+        sealing.commit(cls.root, "test", cls.test, cls.impl)
         cls.unfrozen = os.path.join(cls.tmp, "unfrozen")
         shutil.copytree(cls.root, cls.unfrozen)
         pr = put("prereg.pdf", "the preregistration\n")
-        sealing.freeze(cls.root, pr, pb.__file__, osf_url="https://osf.io/abc12", registered_utc=rqlib.now_utc())
+        sealing.freeze(cls.root, pr, cls.impl, osf_url="https://osf.io/abc12", registered_utc=rqlib.now_utc())
         cls.rc.append(run(["evaluate-test", "--root", cls.root, "--predictions", cls.test, "--targets", cls.t_test,
                            "--out", cls.eval]))
 
@@ -228,8 +237,10 @@ class TestPipeline(unittest.TestCase):
         """P2-11 known answers through the staged pipeline: "wired" has a large residual R^2 for wiring and
         combined inputs and none for behaviour-only (validation and test); "density_only" has a high
         original-scale R^2 but no residual R^2. Roles come from the manifest (the held-out snapshot w00@30 is a
-        validation row; w01@40 a test row); provenance binds the inputs; the scores record the fingerprint."""
-        self.assertEqual([r[0] for r in self.rc], [0, 0, 0, 0], [r[1] for r in self.rc])
+        validation row; w01@40 a test row); provenance binds the inputs; the scores record the fingerprint.
+        Codex r2 P1-4: every score is per registered group (world role / row role): the training world's
+        snapshot holdouts never pool with the held-out roots."""
+        self.assertEqual([r[0] for r in self.rc], [0, 0, 0, 0, 0], [r[1] for r in self.rc])
         self.assertEqual((self.role[("w00", 30)], self.role[("w01", 40)], self.role[("w21.o30M.s0", 31)]),
                          ("validation", "test", "validation"))
         val = [json.loads(x) for x in rqlib.read_text(self.val).splitlines()]
@@ -245,7 +256,10 @@ class TestPipeline(unittest.TestCase):
         self.assertIn(w["selected"].split("/")[1], ("wiring", "combined"))
         d = sc["targets"]["density_only"]
         self.assertLess(max(v for v in d["best_residual_r2_by_set"].values()), 0.1)
-        self.assertGreater(d["validation"]["r2"], 0.5)                       # (the nuisance explains it: not the probe)
+        self.assertGreater(d["selection_set"]["r2"], 0.5)                    # (the nuisance explains it: not the probe)
+        self.assertEqual(sorted(w["groups"]), ["training/validation", "validation/validation"])
+        self.assertEqual(w["groups"]["training/validation"], {"available": False, "rows": 1})   # (w00@30 alone)
+        self.assertGreater(w["groups"]["validation/validation"]["residual_r2"], 0.8)
         mod = rqlib.read_json(self.model)
         lasso = mod["probes"]["wired"]["lasso/wiring/2"]
         names = sorted(FEATS)
@@ -254,10 +268,14 @@ class TestPipeline(unittest.TestCase):
         self.assertEqual(big, {"w_sensor_action", "w_recurrence"})
         ev = rqlib.read_json(self.eval)
         self.assertEqual((ev["TEST_PRED_SHA"], ev["targets_sha256"]), (rqlib.sha256_file(self.test), rqlib.sha256_file(self.t_test)))
-        self.assertGreater(ev["targets"]["wired"]["residual_r2"], 0.8)
-        self.assertLess(ev["targets"]["density_only"]["residual_r2"], 0.2)
-        self.assertGreater(ev["targets"]["density_only"]["r2"], 0.5)
+        self.assertEqual(sorted(ev["targets"]["wired"]["groups"]), ["test/test", "training/test"])
+        self.assertEqual(ev["targets"]["wired"]["groups"]["training/test"], {"available": False, "rows": 1})  # (w01@40)
+        self.assertGreater(ev["targets"]["wired"]["groups"]["test/test"]["residual_r2"], 0.8)
+        dt = ev["targets"]["density_only"]["groups"]["test/test"]
+        self.assertLess(dt["residual_r2"], 0.2)
+        self.assertGreater(dt["r2"], 0.5)
         self.assertTrue(ev["exploratory"])
+        self.assertEqual(ev["scoring"]["implementation_sha256"], rqlib.sha256_file(self.impl))
 
     def test_role_guards(self):
         """P1-2 / P1-3: every stage reads only its roles (computed from the manifest)."""
@@ -330,6 +348,49 @@ class TestPipeline(unittest.TestCase):
         rc, err = run(["evaluate-test", "--root", self.copy(self.root), "--predictions", self.test, "--targets",
                        self.put("t.json", tdoc(tt["rows"] + [self.rows[("w22", 10)]], self.ys)), "--out", ev])
         self.assertIn("validation-role row", err)
+        root = self.copy(self.root)                                  # (Codex r2 P1-3: the record, before the gate)
+        vp = os.path.join(root, "registration", "validation_evaluation.json")
+        os.chmod(vp, 0o644)
+        rqlib.write_durable(vp, rqlib.canonical(dict(rqlib.read_json(vp), scores_sha256="0" * 64)))
+        rc, err = run(["evaluate-test", "--root", root, "--predictions", self.test, "--targets", self.t_test, "--out", ev])
+        self.assertIn("not the validation evaluation the freeze recorded", err)
+        root = self.copy(self.unfrozen)                              # (Codex r2 P1-2: another frozen implementation)
+        imp = self.put("impl.json", rqlib.read_text(self.impl).replace('"machine"', ' "machine"', 1))
+        sealing.freeze(root, self.put("prereg.pdf", "the preregistration\n"), self.impl, osf_url="https://osf.io/abc12",
+                       registered_utc=rqlib.now_utc())
+        fp = os.path.join(root, "registration", "freeze.json")
+        os.chmod(fp, 0o644)
+        rqlib.write_durable(fp, rqlib.canonical(dict(rqlib.read_json(fp), evaluation_script_sha256=rqlib.sha256_file(imp))))
+        rc, err = run(["evaluate-test", "--root", root, "--predictions", self.test, "--targets", self.t_test, "--out", ev])
+        self.assertIn("not the frozen evaluation script", err)
+
+    def test_founder_binding(self):
+        """Codex r2 P2-8: the F1 control is bound to the registered founder panel: its pairs name registered
+        founders at the founder frame (identities checked); blocks come from the registration; a later
+        snapshot, a world outside the panel, another world's UUID, or caller-supplied blocks are refused."""
+        rng = np.random.default_rng(9)
+        pairs = []
+        for a in CWORLDS:
+            for b in CWORLDS:
+                if BLOCK[a] == BLOCK[b] or rng.random() < 0.1:
+                    pairs.append({"prey": {"world": a, "t": 0, "uuid": UUIDS[a]}, "predators": {"world": b, "t": 0},
+                                  "value": float(rng.normal(0, 0.1))})
+        doc = {"schema": pb.PAIRS, "pairs": pairs}
+        out = os.path.join(self.tmp, "f1.json")
+        rc, err = run(["enrichment", "--root", self.root, "--pairs", self.put("p.json", doc), "--out", out])
+        self.assertEqual(rc, 0, err)
+        rec = rqlib.read_json(out)
+        self.assertFalse(rec["audit"])
+        self.assertEqual(rec["founder_panel_sha256"], rqlib.canonical_sha(rqlib.read_json(self.cfg_path)["founders"]))
+        bad_cases = [(dict(doc, blocks={w: 0 for w in CWORLDS}), "registered founder panel"),
+                     (dict(doc, pairs=pairs + [dict(pairs[0], prey={"world": CWORLDS[0], "t": 10})]), "founder snapshot"),
+                     (dict(doc, pairs=pairs + [dict(pairs[0], prey={"world": "w00", "t": 0})]), "not a registered founder"),
+                     (dict(doc, pairs=pairs + [dict(pairs[0], prey={"world": CWORLDS[0], "t": 0, "uuid": UUIDS["w00"]})]), "UUID"),
+                     (dict(doc, pairs=pairs + [dict(pairs[0], prey={"world": "w05.o30M.s0", "t": 0})]), "not a registered founder")]
+        for d, why in bad_cases:
+            rc, err = run(["enrichment", "--root", self.root, "--pairs", self.put("p.json", d), "--out", out])
+            self.assertEqual(rc, 2, why)
+            self.assertIn(why, err)
 
 
 @unittest.skipIf(np is None, "numpy is not installed")

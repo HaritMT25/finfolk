@@ -13,8 +13,9 @@ SETS in tie-break order (wiring = wiring + diversity, behaviour = behaviour + en
 the PROBES in tie-break order with their penalty grids in DESCENDING penalty order (lasso: elastic net
 alpha 1, lambda = rel x lambda_max of the training data; enet: alpha 0.5; additive: a truncated-power cubic
 basis per feature with knots at registered training quantiles, ridge lambda x n); the minimum rows per
-stage; the coordinate-descent limits; the F1 control's permutations, audit level, seed namespace and
-largest block.
+stage (and per reported group); the coordinate-descent limits; the F1 control's permutations, audit level,
+seed namespace and largest block, and its outcome-free FOUNDER PANEL {cohort, frame (F1 = 1), the histories
+registry's sha256 (the manifest's), panel {world: {uuid, treatment, block}}, size}.
 
 ROWS. Features (features/2) and targets (probe_targets/2) name {world, t (M), uuid?, snapshot?}; their
 ROLE comes from the split manifest (a training world's held-out snapshot takes its holdout role; a fork
@@ -30,26 +31,35 @@ STAGES (sealing.py between them):
   predict-candidates  features of TRAINING and VALIDATION rows only, targets of TRAINING rows only: the
                       adjustment, every (probe, set, penalty) fitted on training; the model state
                       (--model-out); for every validation row x target, the nuisance-only prediction and
-                      every candidate's (sealing JSONL, one target_id per line).
+                      every candidate's (sealing JSONL, one target_id per line, its world role and role).
   score-validation    the committed bytes (VAL_PRED_SHA) and VALIDATION targets only. PRIMARY METRIC: the
                       held-out RESIDUAL R^2 = 1 - SS(y - y_hat) / SS(y - y_nuisance) (the improvement over
                       the nuisance-only prediction; negative when the probe hurts); the original-scale R^2 is
-                      a supporting metric. The selection per target: the largest validation residual R^2,
-                      ties to the earlier probe, the earlier set, the larger penalty.
+                      a supporting metric. The selection per target over the registered selection set (every
+                      validation row): the largest validation residual R^2, ties to the earlier probe, the
+                      earlier set, the larger penalty.
   predict-test        the recorded selection, the model state it names, features of TEST rows only.
-  evaluate-test       sealing.require_test_freeze (eval script = this file), its verified bytes, TEST
-                      targets only: residual R^2 (primary) and R^2 (supporting) per target.
-NEGATIVE CONTROL (v4 §11.2, `enrichment`): own-world enrichment among the 32 C F1 founder populations (no
-history: no coadaptation is possible). The statistic is mean(own-world pair values) - mean(cross-world pair
-values); its null permutes the predator worlds' labels WITHIN BLOCKS, two-sided plus-one p. The design is
-checked first, exactly (every block's permutations enumerated): it must give an own-world AND a cross-world
-pair under EVERY block-respecting permutation, so no draw is undefined; an unsupported design is refused.
-p < the registered audit level triggers an initializer, seed or measurement AUDIT (reported, never a finding).
+  implementation      the evaluator's implementation manifest (frozen as the test commitment's script).
+  evaluate-test       sealing.require_test_freeze against the manifest recomputed in-process, its verified
+                      bytes (predictions, validation-evaluation record), TEST targets only.
+REPORTING by registered role: every score is given per GROUP of world role x row role, never pooled across
+them: e.g. test/test (held-out test-root worlds: world transfer) apart from training/test (training worlds'
+snapshot-test holdouts: snapshot transfer); validation/validation apart from training/validation.
+NEGATIVE CONTROL (v4 §11.2, `enrichment`): own-world enrichment among the registered FOUNDER PANEL (the 32 C
+F1 populations: no history, no coadaptation possible). The pairs document names each endpoint {world, t,
+uuid?, snapshot?}; every endpoint must be a registered founder at the registered frame (identities checked
+against the manifest); the blocks are the registered panel's, never the caller's. The statistic is mean(own-
+world pair values) - mean(cross-world pair values); its null permutes the predator worlds' labels WITHIN
+BLOCKS, two-sided plus-one p. The design is checked first, exactly (every block's permutations enumerated):
+it must give an own-world AND a cross-world pair under EVERY block-respecting permutation, so no draw is
+undefined; an unsupported design is refused. p < the registered audit level triggers an initializer, seed
+or measurement AUDIT (reported, never a finding).
 
     probes.py register --root ROOT --config probes.json
     probes.py predict-candidates --root ROOT --features fv.json --fit-targets ft.json --model-out model.json --out val.jsonl
     probes.py score-validation --root ROOT --predictions val.jsonl --targets vt.json --out val_scores.json
     probes.py predict-test --root ROOT --features ftest.json --model model.json --selection val_scores.json --out test.jsonl
+    probes.py implementation --out impl.json
     probes.py evaluate-test --root ROOT --predictions test.jsonl --targets tt.json --out probe_eval.json
     probes.py enrichment --root ROOT --pairs f1_pairs.json --out f1_enrichment.json
 """
@@ -74,6 +84,7 @@ CFG_SCHEMA = "finfolk.redqueen.probecfg/1"
 CFG_NAME = "probes.json"
 FEATURES = "finfolk.redqueen.features/2"
 TARGETS = "finfolk.redqueen.probe_targets/2"
+PAIRS = "finfolk.redqueen.f1_pairs/1"
 PRED = "finfolk.redqueen.probe_pred/2"
 MODEL = "finfolk.redqueen.probe_model/1"
 VALSCORES = "finfolk.redqueen.probe_valscores/1"
@@ -106,7 +117,7 @@ def _num(x):
 
 
 # ================================================================== the registered configuration
-def validate_config(root, cfg):
+def validate_config(root, cfg, docs):
     _need(cfg.get("schema") == CFG_SCHEMA, f"schema {cfg.get('schema')!r}")
     for k in ("split_manifest_sha256", "feature_definition_sha256", "target_definition_sha256"):
         _need(rqlib.is_sha256(cfg.get(k)), f"{k} must be a sha256")
@@ -146,9 +157,21 @@ def validate_config(root, cfg):
     _need(_num(en.get("audit_alpha")) and 0 < en["audit_alpha"] < 1, "enrichment.audit_alpha in (0, 1)")
     _need(isinstance(en.get("seed_namespace"), str) and en["seed_namespace"], "enrichment.seed_namespace")
     _need(_int(en.get("max_block"), 2) and en["max_block"] <= 9, "enrichment.max_block in 2 .. 9 (exact enumeration)")
-    p = os.path.join(root, "config", "splits.json")
-    _need(os.path.isfile(p) and rqlib.sha256_file(p) == cfg["split_manifest_sha256"],
-          f"{p} is not the registered split manifest")
+    _, man, msha = docs["splits.json"]
+    _need(msha == cfg["split_manifest_sha256"], "config/splits.json is not the registered split manifest")
+    fd = cfg.get("founders") or {}
+    panel = fd.get("panel")
+    _need(isinstance(fd.get("cohort"), str) and fd["cohort"] and fd.get("frame") == 1,
+          "founders: the cohort and the founder frame (F1 = 1)")
+    _need(fd.get("worlds_registry_sha256") == man.get("worlds_registry_sha256"),
+          "founders.worlds_registry_sha256 is not the split manifest's histories registry")
+    _need(isinstance(panel, dict) and panel and _int(fd.get("size"), 1) and len(panel) == fd["size"],
+          "founders: the panel {world: {uuid, treatment, block}} of the registered size")
+    for w, v in sorted(panel.items()):
+        _need(w in man["worlds"] and isinstance(v, dict) and v.get("uuid") == man["uuids"].get(w),
+              f"founders.panel.{w}: a manifest world with its registered UUID")
+        _need(v.get("treatment") == fd["cohort"] and _int(v.get("block"), 0),
+              f"founders.panel.{w}: treatment {fd['cohort']} and an integer block")
 
 
 def register(root, cfg_path):
@@ -182,17 +205,19 @@ def _ident(ctx, r, name, roles):
 
 
 def load_features(ctx, path, roles, name="features"):
-    """Feature rows of the permitted roles only -> (rows sorted by (world, t), sha256)."""
+    """Feature rows of the permitted roles only (identities checked before any value) -> (rows sorted by
+    (world, t), sha256)."""
     np = _np()
     cfg = ctx["cfg"]
     _, doc, sha = staging.read_doc(path)
     if doc.get("schema") != FEATURES or doc.get("features") != cfg["features"]:
         raise ProbeError(f"{name}: a {FEATURES} document with the registered features")
+    raw = doc.get("rows") or []
+    ids = [_ident(ctx, r, f"{name} row {k + 1}", roles) for k, r in enumerate(raw)]
     if rqlib.canonical_sha(doc.get("definition")) != cfg["feature_definition_sha256"]:
         raise ProbeError(f"{name}: its feature definition is not the registered one")
     out, seen, treat = [], set(), {}
-    for k, r in enumerate(doc.get("rows") or []):
-        i = _ident(ctx, r, f"{name} row {k + 1}", roles)
+    for r, i in zip(raw, ids):
         key = (i["world"], i["t"])
         if key in seen:
             raise ProbeError(f"{name}: {key} occurs twice")
@@ -210,16 +235,18 @@ def load_features(ctx, path, roles, name="features"):
 
 
 def load_targets(ctx, path, roles, name="targets"):
-    """Target rows of the permitted roles only -> ({(world, t): {name: value | None}}, sha256)."""
+    """Target rows of the permitted roles only (identities checked before any value) -> ({(world, t):
+    {name: value | None}}, {(world, t): identity}, sha256)."""
     cfg = ctx["cfg"]
     _, doc, sha = staging.read_doc(path)
     if doc.get("schema") != TARGETS or doc.get("targets") != cfg["targets"]:
         raise ProbeError(f"{name}: a {TARGETS} document with the registered targets")
+    raw = doc.get("rows") or []
+    ids = [_ident(ctx, r, f"{name} row {k + 1}", roles) for k, r in enumerate(raw)]
     if rqlib.canonical_sha(doc.get("definition")) != cfg["target_definition_sha256"]:
         raise ProbeError(f"{name}: its target definition is not the registered one")
-    out = {}
-    for k, r in enumerate(doc.get("rows") or []):
-        i = _ident(ctx, r, f"{name} row {k + 1}", roles)
+    out, idents = {}, {}
+    for r, i in zip(raw, ids):
         key = (i["world"], i["t"])
         if key in out:
             raise ProbeError(f"{name}: {key} occurs twice")
@@ -227,7 +254,8 @@ def load_targets(ctx, path, roles, name="targets"):
         if not isinstance(y, dict) or set(y) != set(cfg["targets"]) or not all(y[t] is None or _num(y[t]) for t in y):
             raise ProbeError(f"{name} {key}: y must give every registered target (a number or null)")
         out[key] = {t: (None if y[t] is None else float(y[t])) for t in cfg["targets"]}
-    return out, sha
+        idents[key] = i
+    return out, idents, sha
 
 
 # ================================================================== adjustment
@@ -452,19 +480,52 @@ def enrichment(pairs, blocks, n_perm, seed_ns, alpha, max_block=8, seed_parts=("
                     "p < audit_alpha triggers an initializer / seed / measurement audit, never a finding"}
 
 
+def founder_pairs(ctx, doc):
+    """The F1 pairs document bound to the registered founder panel: every endpoint a registered founder at
+    the registered frame (identities checked against the manifest); blocks from the panel only -> (pairs
+    [{prey_world, pred_world, value}], blocks)."""
+    fd = ctx["cfg"]["founders"]
+    if doc.get("schema") != PAIRS:
+        raise ProbeError(f"pairs: schema {doc.get('schema')!r}")
+    if "blocks" in doc:
+        raise ProbeError("pairs: blocks come from the registered founder panel, never from the pairs document")
+    out = []
+    for k, p in enumerate(doc.get("pairs") or []):
+        ends = []
+        for side in ("prey", "predators"):
+            e = p.get(side)
+            try:
+                i = staging.resolve_row(ctx["manifest"], e, f"pair {k + 1} {side}")
+            except staging.StageError as ex:
+                raise ProbeError(str(ex)) from None
+            if i["branch"] or i["world"] not in fd["panel"]:
+                raise ProbeError(f"pair {k + 1} {side}: {i['world']} is not a registered founder")
+            if staging.frame_of(i["t"]) != fd["frame"]:
+                raise ProbeError(f"pair {k + 1} {side}: {i['world']}@{i['t']} is not the founder snapshot (frame {fd['frame']}, F1)")
+            ends.append(i["world"])
+        if not _num(p.get("value")):
+            raise ProbeError(f"pair {k + 1}: a finite value is required")
+        out.append({"prey_world": ends[0], "pred_world": ends[1], "value": float(p["value"])})
+    return out, {w: v["block"] for w, v in fd["panel"].items()}
+
+
 # ================================================================== stages
 def line_identity(ctx, ln, role):
     i = staging.resolve_row(ctx["manifest"], {"world": ln.get("world"), "t": ln.get("t")}, ln.get("target_id"))
-    if i["role"] != role:
-        raise ProbeError(f"{ln.get('target_id')}: a {i['role']}-role row in the {role} predictions")
+    if i["role"] != role or ln.get("role") != role or ln.get("world_role") != i["world_role"]:
+        raise ProbeError(f"{ln.get('target_id')}: not a {role}-role row as registered")
     return (i["world"], i["t"])
+
+
+def group_of(world_role, role):
+    return f"{world_role}/{role}"
 
 
 def predict_candidates(ctx, feat_path, fit_path, model_out, out):
     np = _np()
     cfg = ctx["cfg"]
     rows, fsha = load_features(ctx, feat_path, {"training", "validation"})
-    yt, tsha = load_targets(ctx, fit_path, {"training"}, "fit targets")
+    yt, _, tsha = load_targets(ctx, fit_path, {"training"}, "fit targets")
     keys = {r["key"] for r in rows}
     extra = sorted(set(yt) - keys)
     if extra:
@@ -491,7 +552,7 @@ def predict_candidates(ctx, feat_path, fit_path, model_out, out):
                      "target_ids_sha256": rqlib.canonical_sha(sorted([list(k) for k in yt]))},
              "adjustment": adj, "probes": {t: {cid: p.state() for cid, p in s.items()} for t, s in states.items()},
              "unavailable": avail, "environment": staging.environment(),
-             "implementation": staging.implementation(os.path.abspath(__file__))}
+             "implementation": json.loads(staging.implementation_manifest(os.path.abspath(__file__)))}
     data = rqlib.canonical(model)
     rqlib.write_durable(model_out, data)
     prov = {"config_sha256": ctx["cfg_sha"], "split_manifest_sha256": ctx["manifest_sha"], "features_sha256": fsha,
@@ -500,7 +561,8 @@ def predict_candidates(ctx, feat_path, fit_path, model_out, out):
     for k, r in enumerate(va):
         for t in cfg["targets"]:
             ln = {"schema": PRED, "target_id": f"probe:{t}:{r['key'][0]}:{r['key'][1]}", "world": r["key"][0],
-                  "t": r["key"][1], "target": t, "stage": "validation", "provenance": prov}
+                  "t": r["key"][1], "target": t, "stage": "validation", "role": "validation",
+                  "world_role": r["id"]["world_role"], "provenance": prov}
             if t not in states:
                 ln.update(available=False, reason=avail[t])
             else:
@@ -531,6 +593,19 @@ def tie_key(cfg, cid):
     return ([p["kind"] for p in cfg["probes"]].index(kind), [s["name"] for s in cfg["sets"]].index(sname), int(k))
 
 
+def by_group(cfg, ls, truth, t, pred, minimum):
+    """Scores per registered group (world role / row role), never pooled across groups."""
+    out = {}
+    for g in sorted({group_of(ln["world_role"], ln["role"]) for ln in ls}):
+        gl = [ln for ln in ls if group_of(ln["world_role"], ln["role"]) == g]
+        if len(gl) < minimum:
+            out[g] = {"available": False, "rows": len(gl)}
+            continue
+        out[g] = dict(scores([truth[(ln["world"], ln["t"])][t] for ln in gl], [pred(ln) for ln in gl],
+                             [ln["nuisance"] for ln in gl]), available=True)
+    return out
+
+
 def score_validation(ctx, lines, truth):
     cfg = ctx["cfg"]
     collect(ctx, lines, truth, "validation")
@@ -554,8 +629,9 @@ def score_validation(ctx, lines, truth):
         best = min(ok, key=lambda c: (-cands[c]["residual_r2"],) + tie_key(cfg, c))
         by_set = {s["name"]: max((v["residual_r2"] for c, v in cands.items() if c.split("/")[1] == s["name"]
                                   and v["residual_r2"] is not None), default=None) for s in cfg["sets"]}
-        out[t] = {"available": True, "selected": best, "validation": cands[best], "candidates": cands,
-                  "best_residual_r2_by_set": by_set}
+        out[t] = {"available": True, "selected": best, "selection_set": cands[best], "candidates": cands,
+                  "best_residual_r2_by_set": by_set,
+                  "groups": by_group(cfg, ls, truth, t, lambda ln: ln["candidates"][best], cfg["min_rows"]["validation"])}
     return out
 
 
@@ -572,7 +648,8 @@ def predict_test(ctx, feat_path, model, model_sha, sel, sel_sha, out):
         for t in cfg["targets"]:
             s = sel["targets"].get(t) or {}
             ln = {"schema": PRED, "target_id": f"probe:{t}:{r['key'][0]}:{r['key'][1]}", "world": r["key"][0],
-                  "t": r["key"][1], "target": t, "stage": "test", "provenance": prov}
+                  "t": r["key"][1], "target": t, "stage": "test", "role": "test", "world_role": r["id"]["world_role"],
+                  "provenance": prov}
             if not s.get("available"):
                 ln.update(available=False, reason=s.get("reason", "not selected"))
             else:
@@ -592,15 +669,20 @@ def evaluate_test(ctx, lines, truth):
     res = {}
     for t in cfg["targets"]:
         ls = [ln for ln in lines if ln["target"] == t and ln["available"] and truth[(ln["world"], ln["t"])][t] is not None]
-        if len(ls) < cfg["min_rows"]["test"]:
-            res[t] = {"available": False, "rows": len(ls)}
+        if not ls:
+            res[t] = {"available": False, "rows": 0}
             continue
-        sc = scores([truth[(ln["world"], ln["t"])][t] for ln in ls], [ln["yhat"] for ln in ls], [ln["nuisance"] for ln in ls])
-        res[t] = dict(sc, available=True, selected=ls[0]["selected"])
+        res[t] = {"available": True, "selected": ls[0]["selected"],
+                  "groups": by_group(cfg, ls, truth, t, lambda ln: ln["yhat"], cfg["min_rows"]["test"])}
     return res
 
 
 # ================================================================== CLI
+def scoring_record(impl):
+    return {"implementation_sha256": rqlib.sha256_bytes(impl), "implementation": json.loads(impl.decode("utf-8")),
+            "environment": staging.environment()}
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -624,6 +706,8 @@ def main(argv=None):
     s.add_argument("--model", required=True)
     s.add_argument("--selection", required=True)
     s.add_argument("--out", required=True)
+    s = sub.add_parser("implementation")
+    s.add_argument("--out", required=True)
     s = sub.add_parser("evaluate-test")
     s.add_argument("--root", required=True)
     s.add_argument("--predictions", required=True)
@@ -638,14 +722,20 @@ def main(argv=None):
         if a.cmd == "register":
             print(f"{os.path.join(a.root, 'config', CFG_NAME)}: sha256 {register(a.root, a.config)}")
             return 0
+        if a.cmd == "implementation":
+            impl = staging.implementation_manifest(os.path.abspath(__file__))
+            rqlib.write_durable(a.out, impl)
+            print(f"{a.out}: sha256 {rqlib.sha256_bytes(impl)} (commit and freeze it as the evaluation script)")
+            return 0
         ctx = load_ctx(a.root)
         cfg = ctx["cfg"]
         if a.cmd == "enrichment":
             _, doc, sha = staging.read_doc(a.pairs)
+            pairs, blocks = founder_pairs(ctx, doc)
             en = cfg["enrichment"]
-            rec = enrichment(doc["pairs"], doc["blocks"], en["permutations"], en["seed_namespace"], en["audit_alpha"],
-                             en["max_block"])
-            rqlib.write_json_durable(a.out, dict(rec, exploratory=True, pairs_sha256=sha, config_sha256=ctx["cfg_sha"]))
+            rec = enrichment(pairs, blocks, en["permutations"], en["seed_namespace"], en["audit_alpha"], en["max_block"])
+            rqlib.write_json_durable(a.out, dict(rec, exploratory=True, pairs_sha256=sha, config_sha256=ctx["cfg_sha"],
+                                                 founder_panel_sha256=rqlib.canonical_sha(cfg["founders"])))
             print({k: rec[k] for k in ("statistic", "p", "audit")})
             return 0
         if a.cmd == "predict-candidates":
@@ -654,13 +744,14 @@ def main(argv=None):
             return 0
         if a.cmd == "score-validation":
             lines, mk = staging.committed_rows(ctx["root"], "validation", a.predictions, ctx["cfg_sha"], {"validation"})
-            truth, tsha = load_targets(ctx, a.targets, {"validation"})
+            truth, _, tsha = load_targets(ctx, a.targets, {"validation"})
             ms = {(ln.get("provenance") or {}).get("model_sha256") for ln in lines}
             if len(ms) != 1:
                 raise ProbeError("the committed lines name several model states")
+            impl = staging.implementation_manifest(os.path.abspath(__file__))
             doc = {"schema": VALSCORES, "exploratory": True, "VAL_PRED_SHA": mk, "config_sha256": ctx["cfg_sha"],
                    "model_sha256": ms.pop(), "targets_sha256": tsha, "metric": "residual_r2 (primary); r2 (supporting)",
-                   "targets": score_validation(ctx, lines, truth)}
+                   "targets": score_validation(ctx, lines, truth), "scoring": scoring_record(impl)}
             rqlib.write_json_durable(a.out, doc)
             print({t: v.get("selected") for t, v in doc["targets"].items()})
             return 0
@@ -672,21 +763,25 @@ def main(argv=None):
             if rqlib.sha256_bytes(mdata) != sel.get("model_sha256"):
                 raise ProbeError(f"{a.model} is not the model state the validation candidates were predicted with")
             lines = predict_test(ctx, a.features, json.loads(mdata.decode("utf-8")), sel["model_sha256"], sel, sel_sha, a.out)
-            print(f"{a.out}: {len(lines)} test lines; commit them (sealing.py commit --stage test --eval-script probes.py), "
-                  "then freeze, before evaluate-test")
+            print(f"{a.out}: {len(lines)} test lines; commit them with the implementation manifest (sealing.py commit "
+                  "--stage test --eval-script IMPL.json), then freeze, before evaluate-test")
             return 0
-        lines, test_sha, freeze_sha = staging.test_gate(ctx["root"], a.predictions, os.path.abspath(__file__))
+        impl = staging.implementation_manifest(os.path.abspath(__file__))
+        g = staging.test_gate(ctx["root"], a.predictions, impl)
+        lines = g["rows"]
         for ln in lines:
             if (ln.get("provenance") or {}).get("config_sha256") != ctx["cfg_sha"] or ln.get("stage") != "test":
                 raise ProbeError(f"{ln.get('target_id')}: not a test line of this analysis configuration")
-        staging.check_selection_record(ctx["root"], lines)
-        truth, tsha = load_targets(ctx, a.targets, {"test"})
+        staging.check_selection_record(g["validation_evaluation"], lines)
+        truth, _, tsha = load_targets(ctx, a.targets, {"test"})
         res = evaluate_test(ctx, lines, truth)
-        rqlib.write_json_durable(a.out, {"schema": EVAL, "exploratory": True, "TEST_PRED_SHA": test_sha,
-                                         "freeze_sha256": freeze_sha, "config_sha256": ctx["cfg_sha"], "targets_sha256": tsha,
+        rqlib.write_json_durable(a.out, {"schema": EVAL, "exploratory": True, "TEST_PRED_SHA": g["TEST_PRED_SHA"],
+                                         "freeze_sha256": g["freeze_sha256"], "config_sha256": ctx["cfg_sha"],
+                                         "targets_sha256": tsha, "scoring": scoring_record(impl),
                                          "metric": "residual_r2 (primary: improvement over the nuisance-only prediction); "
-                                                   "r2 (supporting, original scale)", "targets": res})
-        print({t: v.get("residual_r2") for t, v in res.items()})
+                                                   "r2 (supporting, original scale); per world role / row role group",
+                                         "targets": res})
+        print({t: {g_: v.get("residual_r2") for g_, v in (r.get("groups") or {}).items()} for t, r in res.items()})
         return 0
     except (ProbeError, staging.StageError, sealing.SealError, OSError, ValueError, KeyError, TypeError) as e:
         what = "" if isinstance(e, (ProbeError, staging.StageError, sealing.SealError)) else f"{type(e).__name__}: "
