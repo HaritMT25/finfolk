@@ -39,6 +39,14 @@
 #  14. the engine reads frozen, verified read-only copies in the cell (never an archive path), and a
 #      SIGSTOPped worker whose engine runs dies with a SIGKILLed runner, its engine with it.
 #  (legacy store objects, all-or-nothing leftover cleanup and the torn bio ledger: test_redqueen.py)
+#  Design v3 (plan/2):
+#  15. an age reference from two sentinels, an explicit edge list (families, roles), wor-balanced
+#      sampling, reference ages permuted per prey snapshot x replicate (common manifest /2), one
+#      common checkpoint and reseed per prey snapshot x replicate and one transplant seed per
+#      predator snapshot x replicate across families, short and long horizons (the long subset
+#      exact), bundles /2 with their roles in the chunk index, the actual sharing recorded (group
+#      keys, seeds, the realized common checkpoint, donor draw and placement: one per transplant
+#      group, checked at packing), and a replay.
 set -u
 BIN=${1:?usage: redqueen_tooling.sh EVO_BOIDS WORKDIR}
 W=${2:?usage: redqueen_tooling.sh EVO_BOIDS WORKDIR}
@@ -132,9 +140,11 @@ for i, r in enumerate(ckpt.prey(c)):
     assert r["genes"] == pool[m["slots"]["source_index"][i]]["genes"]
 m4 = json.load(open("c4.manifest.json"))
 s4 = m4["sampling"]
-assert s4["policy"] == "hybrid" and s4["pool"] < 150 and s4["with_replacement"], s4   # the design's law
-assert s4["max_copies"] >= 2 and s4["distinct"] <= s4["pool"] and s4["duplicated_slots"] == 150 - s4["distinct"], s4
-assert m["sampling"]["policy"] == "hybrid"
+# design v3 §3.1: wor-balanced is the default: below the slot count every source individual is kept
+assert s4["policy"] == "wor-balanced" and s4["pool"] < 150 and s4["with_replacement"], s4
+assert s4["distinct"] == s4["distinct_individuals"] == s4["pool"] and s4["max_copies"] == -(-150 // s4["pool"]), s4
+assert s4["duplicated_slots"] == 150 - s4["distinct"] and s4["effective_genomes"] > 1, s4
+assert m["sampling"]["policy"] == "wor-balanced"
 PY
 $PY "$T/common.py" validate --binary "$BIN" --work val1 c1.json > val1.log 2>&1 || fail "common.py validate: $(tail -3 val1.log)"
 $PY "$T/common.py" validate --binary "$BIN" --work val4 c4.json > val4.log 2>&1 || fail "common.py validate (duplicated): $(tail -3 val4.log)"
@@ -470,4 +480,85 @@ for _ in $(seq 1 100); do
 done
 [ -z "$(pgrep -f -- "--root $W/r14 --_cell")" ] || { pkill -KILL -f -- "--root $W/r14"; fail "a stopped worker outlived its SIGKILLed runner"; }
 [ -z "$(pgrep -f "$W/r14/bin/evo_boids")" ] || { pkill -KILL -f "$W/r14/bin/evo_boids"; fail "the stopped worker's engine outlived the runner"; }
+# 15. design v3 (plan/2): an age reference from two sentinels, an explicit edge list with families
+#     and roles, global snapshot x replicate seeds, short and pre-randomized long horizons
+$PY "$T/common.py" ages --source A.3000.json --source B.3000.json --n 100 --out ages.json > ages.log 2>&1 \
+    || fail "common.py ages: $(cat ages.log)"
+$PY - "$W" <<'PY' || fail "building the v3 design"
+import json, sys
+W = sys.argv[1]
+d = json.load(open("design.json"))
+E = lambda fam, role, p, q, **kw: dict({"family": fam, "role": role, "prey": dict(zip(("world", "time"), p)),
+                                        "predators": None if q is None else dict(zip(("world", "time"), q))}, **kw)
+edges = [E("within", "training", ("A", "T1500"), ("A", "T3000")), E("within", "training", ("A", "T3000"), ("A", "T1500")),
+         E("within", "training", ("A", "T3000"), ("A", "T3000")), E("cross", "training", ("A", "T3000"), ("B", "T3000")),
+         E("cross", "validation", ("B", "T3000"), ("A", "T3000")), E("nopred", "training", ("A", "T3000"), None),
+         E("grid", "training", ("B", "T1500"), ("A", "T1500"), horizon="long")]
+with open("edges.jsonl", "w") as f:
+    f.write("".join(json.dumps(e) + "\n" for e in edges))
+v2 = {"schema": "finfolk.redqueen.design/2", "name": "smoke-v3", "seed_namespace": "rq-smoke-v3",
+      "times": d["times"], "worlds": d["worlds"], "templates": d["templates"], "age_reference": W + "/ages.json",
+      "replicates": 2, "long": {"fraction": 0.25, "strata": ["family"]}, "edges": W + "/edges.jsonl",
+      "defaults": {"k": 3, "n_prey": 100, "short_steps": 400, "long_steps": 800, "short_horizons": [400],
+                   "long_horizons": [400, 800], "log_every": 100, "checkpoint_every": 200}}
+json.dump(v2, open("design_v3.json", "w"))
+PY
+$PY "$T/plan.py" design_v3.json --pending --out plan_v3.pending.jsonl 2> /dev/null || fail "plan.py (v3 pending)"
+$PY "$T/plan.py" design_v3.json --against plan_v3.pending.jsonl --out plan_v3.jsonl --long-manifest long_v3.json \
+    2> pv3.log || fail "plan.py (v3 final): $(cat pv3.log)"
+$RUN --plan plan_v3.jsonl --root r15 --binary "$BIN" --workers $NW --chunk-size 5 $GUARD > r15.log 2>&1 \
+    || fail "run.py (v3): $(tail -5 r15.log)"
+$PY - "$T" <<'PY' || fail "the v3 cells"
+import json, sys; sys.path.insert(0, sys.argv[1]); import store, rqlib
+rows = {json.loads(l)["id"]: json.loads(l) for l in open("plan_v3.jsonl")}
+assert len(rows) == 14 and all(r["schema"] == "finfolk.redqueen.plan/2" for r in rows.values())
+_, cells = store.load_index("r15")
+assert sorted(cells) == sorted(rows), sorted(set(cells) ^ set(rows))
+ref = json.load(open("ages.json"))
+lm = json.load(open("long_v3.json"))
+assert lm["units"] == 6 and lm["long"] == 2, lm
+B = {c: json.loads(store.read_member("r15", c, cells=cells)) for c in cells}
+for cid, b in B.items():
+    c = b["cell"]
+    assert b["schema"] == "finfolk.redqueen.bundle/2" and cells[cid][1]["role"] == c["role"]
+    hs = [h["steps"] for h in b["score"]["horizons"]]
+    assert hs == ([400, 800] if c["horizon"] == "long" else [400]), (cid, hs)
+    assert c["sampling"] == "wor-balanced"
+    man = json.loads(store.get_bytes("r15", b["common_manifest_sha256"]))
+    assert man["schema"] == "finfolk.redqueen.common/2" and man["ages"]["sha256"] == rqlib.sha256_file("ages.json")
+    assert abs(man["ages"]["mean"] - sum(ref["ages"]) / len(ref["ages"])) < 1e-9 and man["ages"]["permutation_seed"] == c["seeds"]["ages"]
+    assert man["sampling"]["policy"] == "wor-balanced" and man["sampling"]["distinct_individuals"] > 0
+assert B["B.T1500~A.T1500.common.frozen.k3.r00"]["cell"]["horizon"] == "long"
+# one prey snapshot x replicate: one common checkpoint and one reseed, whatever the family or opponent
+x, y, z = (B[f"A.T3000~{q}.common.frozen.k{k}.r01"] for q, k in (("A.T1500", 3), ("B.T3000", 3), ("none", 0)))
+assert x["files"]["common.json"] == y["files"]["common.json"] == z["files"]["common.json"]
+assert x["cell"]["seeds"]["reseed"] == y["cell"]["seeds"]["reseed"] == z["cell"]["seeds"]["reseed"]
+# one predator snapshot x replicate: one transplant seed, whatever the prey
+p1, p2 = B["A.T3000~A.T3000.common.frozen.k3.r01"], B["B.T3000~A.T3000.common.frozen.k3.r01"]
+assert p1["cell"]["seeds"]["transplant"] == p2["cell"]["seeds"]["transplant"]
+assert p1["cell"]["seeds"]["reseed"] != p2["cell"]["seeds"]["reseed"]
+# the actual sharing (design v4 §3.5): recorded in every bundle and the index; the coupled donor draw
+# and placement of one predator snapshot x replicate are the same whatever the prey
+for cid, b in B.items():
+    s = b["sharing"]
+    assert s["schema"] == "finfolk.redqueen.sharing/1" and s["keys"] == b["cell"]["groups"], cid
+    assert s["realized"]["common_sha256"] == b["files"]["common.json"]
+    e = cells[cid][1]
+    if b["cell"]["kind"] == "assay":
+        assert e["transplant_group"] == f"{b['cell']['groups']['transplant']}|k{b['cell']['k']}", (cid, e)
+        assert e["transplant_realized_sha256"] == s["realized"]["transplant_realized_sha256"]
+        assert len(s["realized"]["transplant"]["picked"]) == 3
+    else:
+        assert e["transplant_group"] is None and s["realized"]["transplant"]["picked"] == []
+assert p1["sharing"]["realized"]["transplant_realized_sha256"] == p2["sharing"]["realized"]["transplant_realized_sha256"]
+assert p1["sharing"]["realized"]["placement_sha256"] == p2["sharing"]["realized"]["placement_sha256"]
+groups = {}
+for cid, b in B.items():
+    if b["cell"]["kind"] == "assay":
+        groups.setdefault(cells[cid][1]["transplant_group"], set()).add(b["sharing"]["realized"]["transplant_realized_sha256"])
+assert all(len(v) == 1 for v in groups.values()) and any(
+    sum(1 for c in B if B[c]["cell"]["kind"] == "assay" and cells[c][1]["transplant_group"] == g) > 1 for g in groups), groups
+PY
+FORKV3=$(grep -o '"id":"A.T3000~none[^"]*r00"' plan_v3.jsonl | cut -d'"' -f4)
+$RUN --root r15 --replay "$FORKV3" --out rp15 > rp15.log 2>&1 || fail "replay of a v3 cell: $(tail -3 rp15.log)"
 echo "redqueen_tooling: ok ($NW workers)"

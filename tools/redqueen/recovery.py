@@ -94,7 +94,33 @@ B_COUNT = 324                     # K [1 + floor(80 s / 1.5 s)]: the 1.5 s coold
 FAMS = list(graphlib.FAMILIES)
 ROLES = ["training", "validation", "test", "support"]
 OPTIONS = ("a", "b", "base")
-REF_TIMES = (0, 20, 60, 100, 120, 140, 180, 200)
+REF_TIMES = (0, 20, 60, 100, 120, 140, 180, 200)   # (ASSUMED slot times: planning only, before references exist)
+REFS_SCHEMA = "finfolk.redqueen.references/1"
+
+
+def reference_times(path):
+    """The ACTUAL reference frames per guild and slot from a references/1 document (refsel.py's selection;
+    Codex #71 r1 P2-5): {"RQ": {k: t_M}, "RP": {k: t_M}} (F1 = frame 1 -> 0), with the file's sha256. The
+    slot -> time map is the selection's, never the assumed REF_TIMES (several references may share a time, and
+    a panel with exactly four early references has its slot 4 late)."""
+    doc = rqlib.read_json(path)
+    if doc.get("schema") != REFS_SCHEMA:
+        raise SystemExit(f"{path}: not a references/1 document")
+    out = {"RQ": {}, "RP": {}}
+    for slot, v in (doc.get("references") or {}).items():
+        g, _, k = slot.partition(":")
+        fr = v.get("frame") if isinstance(v, dict) else None
+        if g not in out or not k.isdigit() or not isinstance(fr, int) or (fr != 1 and fr % 1_000_000):
+            raise SystemExit(f"{path}: {slot} is not a reference slot with a snapshot frame")
+        out[g][int(k)] = 0 if fr == 1 else fr // 1_000_000
+        if not isinstance(v.get("world"), str):
+            raise SystemExit(f"{path}: {slot} needs its sentinel world")
+    for g in ("RQ", "RP"):
+        if sorted(out[g]) != list(range(8)):
+            raise SystemExit(f"{path}: {g} needs exactly the slots 0..7")
+    out["sentinels"] = {g: {int(s_.partition(":")[2]): v["world"] for s_, v in doc["references"].items()
+                            if s_.partition(":")[0] == g} for g in ("RQ", "RP")}
+    return out, rqlib.sha256_file(path)
 LAG_EDGES = (-200, -50, -20, -10, -5, -3, -2, -1, 0, 1, 2, 3, 5, 10, 20, 50, 201)
 
 SC0 = {"r0": dict(rank=0), "r0_twoway": dict(rank=0, kappa=0.25), "r1_017": dict(rank=1, energy=0.017),
@@ -159,8 +185,11 @@ def capture_sd(p, scale=1.0):
 class Data:
     """The graph as arrays: prey / predator node indices of every pair, family, role, lags, worlds."""
 
-    def __init__(self, g):
+    def __init__(self, g, refs=None):
+        """refs: the ACTUAL reference times per guild and slot (reference_times); None: the assumed REF_TIMES
+        (planning before the selection exists, recorded as such)."""
         self.g = g
+        self.ref_times = refs
         split, treat = g["split"], {w["id"]: w["treatment"] for w in g["worlds"]}
         self.worlds = sorted(treat)
         widx = {w: i for i, w in enumerate(self.worlds)}
@@ -175,20 +204,25 @@ class Data:
             qn.setdefault(q, len(qn))
             pn.setdefault(p, len(pn))
 
+        sents = sorted({x for g in ("RQ", "RP") for x in refs["sentinels"][g].values()}) if refs else None
+
         def nodes(d):
             w, t, ref, held = np.zeros(len(d), int), np.zeros(len(d), int), np.zeros(len(d), bool), \
                 np.zeros(len(d), "<U5")
+            sent = np.full(len(d), -1)
             for n, i in d.items():
                 gg, ww, tt = graphlib.parse(n)
                 if ww is None:
-                    w[i], t[i], ref[i], held[i] = -1, REF_TIMES[tt], True, "train"
+                    w[i], t[i], ref[i], held[i] = -1, (refs[gg][tt] if refs else REF_TIMES[tt]), True, "train"
+                    # (#71 r3 P2: the slot's ACTUAL sentinel; planning without references: slot mod 4, assumed)
+                    sent[i] = sents.index(refs["sentinels"][gg][tt]) if refs else tt % 4
                 else:
                     w[i], t[i] = widx[ww], tt
                     held[i] = split[ww] if split[ww] != "train" else holdout.get((ww, tt), "train")
-            return w, t, ref, held
+            return w, t, ref, held, sent
         self.nQ, self.nP = len(qn), len(pn)
-        self.qw, self.qt, self.qref, self.qheld = nodes(qn)
-        self.pw, self.pt, self.pref, self.pheld = nodes(pn)
+        self.qw, self.qt, self.qref, self.qheld, self.qsent = nodes(qn)
+        self.pw, self.pt, self.pref, self.pheld, self.psent = nodes(pn)
         self.qkey = {i: n for n, i in qn.items()}
         self.pkey = {i: n for n, i in pn.items()}
         E = len(g["edges"])
@@ -235,7 +269,11 @@ class Data:
         120M (both endpoints, cross-world) plus every world snapshot's reference pairs against references
         at <= 120M only (their placement); validation targets with both endpoints in 141-160M, test
         targets in 181-200M (no window crossing the 20M separations); test split into the forward transfer
-        (both endpoints in training worlds) and the intersection (an endpoint in a test world)."""
+        (both endpoints in training worlds) and the intersection (an endpoint in a test world).
+        The graph's ACCESS RULES hold alongside the time and world masks (v4 §7.1, the 400 snapshot
+        exclusions): the fit takes training and support pairs only (a non-support pair of a snapshot
+        held out for validation or test never enters it), and validation never takes a test-role pair
+        (a snapshot-test outcome never steers the selection)."""
         QT, PT = self.qt[self.qi], self.pt[self.pj]
         qw, pw = self.qw[self.qi], self.pw[self.pj]
         qr, pr = self.qref[self.qi], self.pref[self.pj]
@@ -246,12 +284,36 @@ class Data:
         reft = np.where(qr, QT, PT)
         both = lambda lo, hi: (QT >= lo) & (QT <= hi) & (PT >= lo) & (PT <= hi)  # noqa: E731
         trainpair = (qs == "train") & (ps == "train")
-        fit = np.flatnonzero((main & trainpair & both(0, 120)) | (oneref & (reft <= 120)))
-        val = np.flatnonzero(main & ((qs != "test") & (ps != "test")) & both(141, 160))
+        fitrole = (self.role == ROLES.index("training")) | (self.role == ROLES.index("support"))
+        notest = self.role != ROLES.index("test")
+        fit = np.flatnonzero(((main & trainpair & both(0, 120)) | (oneref & (reft <= 120))) & fitrole)
+        # the reference support of the forward fit (#71 r1 P2-5), per readout side: every world population's
+        # distinct EARLY (<= 120M) reference slots among its fitted reference pairs, at the actual frames
+        sup = {}
+        er = oneref & (reft <= 120) & fitrole
+        wblock = {i: w.get("block") for i, w in enumerate(sorted(self.g["worlds"], key=lambda w: w["id"]))}
+        for side, node, slot, isref, nw in (("prey", self.qi, self.pj, pr, self.qw), ("pred", self.pj, self.qi, qr, self.pw)):
+            sel = np.flatnonzero(er & isref)
+            per = {}
+            for n_, k_ in zip(node[sel].tolist(), slot[sel].tolist()):
+                per.setdefault(n_, set()).add(k_)
+            pops = np.unique(node[np.flatnonzero(glob & isref & ~(qr if side == "prey" else pr))])
+            counts = [len(per.get(int(x), ())) for x in pops]
+            byb = {}                                   # (#71 r2 P2: per block x readout)
+            for x, c in zip(pops.tolist(), counts):
+                b = str(wblock.get(int(nw[x])))
+                d = byb.setdefault(b, {"populations": 0, "min_early_references": None, "without_early_reference": 0})
+                d["populations"] += 1
+                d["min_early_references"] = c if d["min_early_references"] is None else min(d["min_early_references"], c)
+                d["without_early_reference"] += c == 0
+            sup[side] = {"populations": len(counts), "min_early_references": min(counts) if counts else 0,
+                         "without_early_reference": sum(1 for c in counts if c == 0), "blocks": byb}
+        val = np.flatnonzero(main & ((qs != "test") & (ps != "test")) & both(141, 160) & notest)
         fwd = np.flatnonzero(main & trainpair & both(181, 200))
         inter = np.flatnonzero(main & ((qs == "test") | (ps == "test")) & both(181, 200))
         return {"fit": fit, "val": val, "val_world": np.where(qw[val] >= 0, qw[val], pw[val]),
-                "tests": {"forward_transfer": fwd, "intersection": inter}}
+                "tests": {"forward_transfer": fwd, "intersection": inter},
+                "reference_support": dict(sup, times="actual" if self.ref_times else "assumed")}
 
 
 # ------------------------------------------------------------------ truth
@@ -300,16 +362,16 @@ def simulate(D, sc, seed):
         return out
     emb = {"Q": embed(), "P": embed()}
 
-    def node_vals(g, wv, tv, ref):
-        sent = np.where(ref, nW + (np.arange(len(wv)) % 4), wv)
+    def node_vals(g, wv, tv, ref, sidx):
+        sent = np.where(ref, nW + sidx, wv)              # (a reference's history: its ACTUAL sentinel's)
         x = qual[g][sent, tv] + rng.normal(0.0, s["snap_sd"], len(wv))
         e = None
         if rank:
             e = emb[g][sent, tv] + rng.normal(0.0, 0.3, (len(wv), rank))
             e -= e[ref].mean(axis=0)               # centred on the eight references (v4 §6.3)
         return x, e
-    b, u = node_vals("Q", D.qw, D.qt, D.qref)
-    a, v = node_vals("P", D.pw, D.pt, D.pref)
+    b, u = node_vals("Q", D.qw, D.qt, D.qref, D.qsent)
+    a, v = node_vals("P", D.pw, D.pt, D.pref, D.psent)
     eta0 = s["mu0"] + a[D.pj] - b[D.qi] - s["kappa"] * a[D.pj] * b[D.qi]
     own = np.zeros(len(D.qi))
     if D.within.any():
@@ -740,10 +802,18 @@ CONFIG_SCHEMA = "finfolk.redqueen.recoverycfg/1"
 
 
 def run_config(a, graph_sha):
-    """Everything a recovery result depends on (resume and summary refuse to mix two of them)."""
+    """Everything a recovery result depends on (resume and summary refuse to mix two of them), the reference
+    assignment included (its sha256 and actual times, or the assumed REF_TIMES)."""
     tools = {f: rqlib.sha256_file(os.path.join(HERE, f)) for f in ("recovery.py", "map.py", "graph.py")
              if os.path.isfile(os.path.join(HERE, f))}
-    return {"schema": CONFIG_SCHEMA, "graph_edges_sha256": graph_sha, "namespace": a.namespace,
+    rp = getattr(a, "references", None)
+    if rp:
+        times, sha = reference_times(rp)
+        refs = {"sha256": sha, "times": {g: [times[g][k] for k in range(8)] for g in ("RQ", "RP")},
+                "sentinels": {g: [times["sentinels"][g][k] for k in range(8)] for g in ("RQ", "RP")}}
+    else:
+        refs = {"assumed": list(REF_TIMES)}
+    return {"schema": CONFIG_SCHEMA, "graph_edges_sha256": graph_sha, "namespace": a.namespace, "references": refs,
             "fitter": a.fitter, "options": a.options, "ranks": a.ranks, "lambdas": a.lambdas, "iters": a.iters,
             "ab_cap": a.ab_cap, "start": getattr(a, "start", None), "tools_sha256": tools, "scenarios": SCENARIOS,
             "defaults": DEFAULTS, "lambda_grid": list(REGISTERED_LAMBDAS) if "REGISTERED_LAMBDAS" in globals() else None,
@@ -754,14 +824,15 @@ def graph_sha(path):
     return rqlib.read_json(os.path.join(os.path.dirname(os.path.abspath(path)), "graph.meta.json"))["edges_sha256"]
 
 
-def load_data(path):
-    if path not in _DATA:
-        _DATA[path] = Data(graphlib.load(path))
-    return _DATA[path]
+def load_data(path, refs_path=None):
+    key = (path, refs_path)
+    if key not in _DATA:
+        _DATA[key] = Data(graphlib.load(path), reference_times(refs_path)[0] if refs_path else None)
+    return _DATA[key]
 
 
 def one(a):
-    D = load_data(a.graph)
+    D = load_data(a.graph, getattr(a, "references", None))
     sc = SCENARIOS[a.scenario]
     seed = rqlib.derive_seed(a.namespace, "recovery", a.scenario, a.rep)
     t0 = time.time()
@@ -774,7 +845,10 @@ def one(a):
     res["fitter"] = a.fitter
     res["start"] = a.start
     for opt in a.options.split(","):
-        if sc.get("noiseless"):
+        if sc.get("noiseless") and opt == "fwd":       # (the forward procedure is a noisy-data selection)
+            res["options"][opt] = {"procedure": "forward", "available": False,
+                                   "reason": "the forward-time procedure is not defined for a noiseless scenario"}
+        elif sc.get("noiseless"):
             res["options"][opt] = numerical(D, data, opt, sc["rank"], a.iters, seed, ab_cap=cap, fitter=a.fitter)
         elif opt == "fwd":
             res["options"][opt] = forward_procedure(D, data, a.ranks, [float(x) for x in a.lambdas.split(",")],
@@ -782,6 +856,7 @@ def one(a):
         else:
             res["options"][opt] = procedure(D, data, opt, a.ranks, [float(x) for x in a.lambdas.split(",")],
                                             a.iters, seed, ab_cap=cap, fitter=a.fitter, start=a.start)
+    res["reference_support"] = D.forward["reference_support"]            # (#71 r2 P2: persisted)
     res["seconds"] = round(time.time() - t0, 1)
     rqlib.write_json_durable(a.out, res)
     return 0
@@ -823,7 +898,8 @@ def run(a):
             cmd = [sys.executable, os.path.abspath(__file__), "one", "--graph", a.graph, "--scenario", sc,
                    "--rep", str(rep), "--out", f, "--options", a.options, "--ranks", str(a.ranks),
                    "--lambdas", a.lambdas, "--iters", str(a.iters), "--namespace", a.namespace,
-                   "--ab-cap", str(a.ab_cap), "--fitter", a.fitter, "--start", a.start]
+                   "--ab-cap", str(a.ab_cap), "--fitter", a.fitter, "--start", a.start] + \
+                (["--references", a.references] if getattr(a, "references", None) else [])
             running.append((subprocess.Popen(cmd, env=env, stdin=subprocess.DEVNULL), sc, rep))
         time.sleep(0.5)
         for item in list(running):
@@ -845,6 +921,11 @@ def wilson(k, n, z=1.96):
     return [round(c - h, 3), round(c + h, 3)]
 
 
+def _mean(xs):
+    v = [x for x in xs if x is not None]
+    return float(np.mean(v)) if v else None
+
+
 def summarize(d):
     rows = {}
     cfgs = set()
@@ -858,33 +939,54 @@ def summarize(d):
         for opt, o in r["options"].items():
             rows.setdefault((r["scenario"], opt), []).append(o)
     out = {"schema": "finfolk.redqueen.recoverysummary/1", "config_sha256": next(iter(cfgs), None), "cells": []}
+    sups = []
+    for f in sorted(os.listdir(d)):
+        if f.endswith(".json") and not f.startswith("summary") and f != "config.json":
+            sups.append(rqlib.canonical(rqlib.read_json(os.path.join(d, f)).get("reference_support")))
+    if len(set(sups)) > 1:
+        raise SystemExit(f"{d}: results with different reference support (another reference assignment?)")
+    out["reference_support"] = json.loads(sups[0]) if sups else None
     for (sc, opt), lst in sorted(rows.items()):
         if "success" in lst[0]:
             k = sum(o["success"] for o in lst)
             sel = {}
             for o in lst:
                 sel[o["selected"]["rank"]] = sel.get(o["selected"]["rank"], 0) + 1
-            prim = [o["selected_primary"] for o in lst if "selected_primary" in o]
+            prim = [o["selected_primary"] for o in lst if "selected_primary" in o]       # (#66: the {0,1,2} primary)
             kp = sum(p["success"] for p in prim)
             selp = {}
             for p in prim:
                 selp[p["rank"]] = selp.get(p["rank"], 0) + 1
-            out["cells"].append({"scenario": sc, "option": opt, "datasets": len(lst), "successes": k,
-                                 "rate": round(k / len(lst), 3), "wilson95": wilson(k, len(lst)),
-                                 "selected_ranks": dict(sorted(sel.items())),
-                                 "positive_rank_selected": sum(o["selected"]["rank"] > 0 for o in lst),
-                                 "primary": ({"ranks": prim[0]["ranks"], "datasets": len(prim), "successes": kp,
-                                              "rate": round(kp / len(prim), 3), "wilson95": wilson(kp, len(prim)),
-                                              "selected_ranks": dict(sorted(selp.items())),
-                                              "positive_rank_selected": sum(p["rank"] > 0 for p in prim)}
-                                             if prim else None),
-                                 "start": lst[0].get("start"),
-                                 "mean_test_improvement": float(np.mean([o["test_improvement"] for o in lst])),
-                                 "mean_test_lb": float(np.mean([o["test_lb"] for o in lst])),
-                                 "fit_pairs": lst[0]["fit_pairs"],
-                                 "classes": {k: {f: float(np.mean([o["classes"][k][f] for o in lst]))
-                                                 for f in ("rmse_selected", "rmse_rank0", "interaction_sd")}
-                                             for k in (lst[0].get("classes") or {})}})
+            cell = {"scenario": sc, "option": opt, "datasets": len(lst), "successes": k,
+                    "rate": round(k / len(lst), 3), "wilson95": wilson(k, len(lst)),
+                    "selected_ranks": dict(sorted(sel.items())),
+                    "positive_rank_selected": sum(o["selected"]["rank"] > 0 for o in lst),
+                    "primary": ({"ranks": prim[0]["ranks"], "datasets": len(prim), "successes": kp,
+                                 "rate": round(kp / len(prim), 3), "wilson95": wilson(kp, len(prim)),
+                                 "selected_ranks": dict(sorted(selp.items())),
+                                 "positive_rank_selected": sum(p["rank"] > 0 for p in prim)}
+                                if prim else None),
+                    "start": lst[0].get("start"),
+                    "mean_test_improvement": _mean(o["test_improvement"] for o in lst),
+                    "mean_test_lb": _mean(o["test_lb"] for o in lst),
+                    "fit_pairs": lst[0]["fit_pairs"],
+                    "classes": {k: {f: float(np.mean([o["classes"][k][f] for o in lst]))
+                                    for f in ("rmse_selected", "rmse_rank0", "interaction_sd")}
+                                for k in (lst[0].get("classes") or {})}}
+            if lst[0].get("procedure") == "forward":       # (both branches: the top level is the transfer)
+                cell["branches"] = {}
+                for b in ("forward_transfer", "intersection"):
+                    av = [o[b] for o in lst if (o.get(b) or {}).get("available")]
+                    kb = sum(x["success"] for x in av)
+                    cell["branches"][b] = {"available": len(av), "successes": kb,
+                                           "rate": round(kb / len(av), 3) if av else None,
+                                           "wilson95": wilson(kb, len(av)) if av else None,
+                                           "mean_test_improvement": _mean(x["test_improvement"] for x in av),
+                                           "mean_test_lb": _mean(x["test_lb"] for x in av)}
+            out["cells"].append(cell)
+        elif "relative" not in lst[0]:                       # (unavailable, e.g. fwd on a noiseless scenario)
+            out["cells"].append({"scenario": sc, "option": opt, "datasets": len(lst), "available": False,
+                                 "reasons": sorted({o.get("reason", "") for o in lst})})
         else:
             out["cells"].append({"scenario": sc, "option": opt, "datasets": len(lst),
                                  "relative_test_rmse": [o["relative"] for o in lst],
@@ -900,7 +1002,7 @@ def conditioning(D, rank, option="a", seed=0):
     [-1, v_j] for a prey (the opponents' standard-normal embeddings; [1, u_i] for a predator) ->
     per population class, the condition-number quantiles and the share above 30 or singular."""
     rng = np.random.default_rng(seed)
-    idx = D.fit[option]
+    idx = D.forward["fit"] if option == "fwd" else D.fit[option]       # (#71 r3 P2: the forward panel too)
     out = {}
     for guild, me, other, n_me, n_other, held, wv, ref in (
             ("prey", D.qi, D.pj, D.nQ, D.nP, D.qheld, D.qw, D.qref),
@@ -929,7 +1031,7 @@ def conditioning(D, rank, option="a", seed=0):
 
 
 def bench(a):
-    D = load_data(a.graph)
+    D = load_data(a.graph, getattr(a, "references", None))
     t0 = time.time()
     data = simulate(D, SCENARIOS["r2_034"], 1)
     t1 = time.time()
@@ -948,10 +1050,13 @@ def main(argv=None):
         if name == "conditioning":
             s.add_argument("--graph", required=True)
             s.add_argument("--out")
+            s.add_argument("--references", help="the selected references/1 document (the actual frames)")
             continue
         if name != "summarize":
             s.add_argument("--graph", required=True)
             s.add_argument("--iters", type=int, default=40)
+            s.add_argument("--references", help="the selected references/1 document: the ACTUAL reference "
+                                                "frames per guild (default: the assumed REF_TIMES, planning only)")
         if name in ("run", "one"):
             s.add_argument("--options", default="a,b,base")
             s.add_argument("--ranks", type=int, default=4)
@@ -984,8 +1089,11 @@ def main(argv=None):
     if a.cmd == "bench":
         return bench(a)
     if a.cmd == "conditioning":
-        D = load_data(a.graph)
-        rep = {opt: {f"rank{r}": conditioning(D, r, opt, r) for r in (1, 2, 3, 4)} for opt in OPTIONS}
+        D = load_data(a.graph, a.references)
+        rep = {opt: {f"rank{r}": conditioning(D, r, opt, r) for r in (1, 2, 3, 4)} for opt in OPTIONS + ("fwd",)}
+        rep["references"] = ({"sha256": reference_times(a.references)[1]} if a.references
+                             else {"assumed": list(REF_TIMES)})
+        rep["reference_support"] = D.forward["reference_support"]
         text = json.dumps(rep, indent=1, sort_keys=True)
         if a.out:
             rqlib.write_durable(a.out, text.encode() + b"\n")
