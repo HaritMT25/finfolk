@@ -654,6 +654,57 @@ inline float referenceVolume() {
 // A diagnostic load: gas and fuel as fractions of their capacities, in [0, 1].
 struct Load { float gas = 0.0f, fuel = 0.0f; };
 
+// The expressed development (see the header comment), from the unloaded
+// hull's volume V and wetted area Sw, the shoulder's smaller half-axis (body
+// radii), R, the eye's law scale kE and the alleles (never changed).
+struct Expressed {
+    float gapeFraction, eyeScale, organScale, jaw, eyes;
+    float gas, fatTrait, reserve, storageScale;
+    float armourThickness, shell, shellScale;
+    int limits;
+};
+inline Expressed develop(float V, float Sw, float shoulderMin, float R, float kELaw, const physical::Genes& P) {
+    using namespace detail;
+    Expressed x{};
+    x.limits = 0;
+    x.gapeFraction = mH(P.g[physical::kGape], 0.15f, 0.40f, 0.65f);
+    const float gr = x.gapeFraction / 0.40f;
+    x.jaw = 0.02f * V * (gr * gr * gr);
+    const float kR = kELaw * R;
+    x.eyes = 2.0f * (4.0f / 3.0f) * kPi * (0.24f * kR) * (0.14f * kR) * (0.14f * kR);
+    x.eyeScale = kELaw;
+    x.organScale = 1.0f;
+    if (x.jaw + x.eyes > 0.25f * V) {
+        x.organScale = cbrtf_(0.25f * V / (x.jaw + x.eyes));
+        x.limits |= kLimitOrgans;
+        const float s3 = x.organScale * x.organScale * x.organScale;
+        x.gapeFraction = x.gapeFraction * x.organScale;
+        x.eyeScale = kELaw * x.organScale;
+        x.jaw = x.jaw * s3;
+        x.eyes = x.eyes * s3;
+    }
+    x.gas = 0.15f * P.g[physical::kBladder] * V;
+    x.fatTrait = 0.20f * P.g[physical::kFat] * V;
+    x.storageScale = 1.0f;
+    if (x.gas + x.fatTrait > 0.28f * V) {
+        x.storageScale = 0.28f * V / (x.gas + x.fatTrait);
+        x.gas = x.gas * x.storageScale;
+        x.fatTrait = x.fatTrait * x.storageScale;
+        x.limits |= kLimitStorage;
+    }
+    x.reserve = 0.02f * V + x.fatTrait;
+    x.armourThickness = 0.06f * P.g[physical::kArmour] * shoulderMin * R;
+    x.shell = Sw * x.armourThickness;
+    x.shellScale = 1.0f;
+    if (x.shell > 0.08f * V) {
+        x.shellScale = 0.08f * V / x.shell;
+        x.armourThickness = x.armourThickness * x.shellScale;
+        x.shell = Sw * x.armourThickness;
+        x.limits |= kLimitShell;
+    }
+    return x;
+}
+
 // Everything a compile measured, the coefficients plus (optional) the points.
 // Returns false for an unknown law or non-finite inputs (out left zero).
 inline bool compile(const appearance::Genome& G, float S, float E, const physical::Genes& P, int law,
@@ -674,33 +725,18 @@ inline bool compile(const appearance::Genome& G, float S, float E, const physica
     halfAxes(M, 0.20f, shoulderA, shoulderB);
 
     // ---- development (expressed values) ----
-    int limits = 0;
     const float kELaw = eyeScaleLaw(M);
+    const Expressed X = develop(V, h.wetted, minf(shoulderA, shoulderB), R, kELaw, P);
+    int limits = X.limits;
     if (kELaw < M.eye) limits |= kLimitEyeClip;
-    float gapeFr = mH(P.g[physical::kGape], 0.15f, 0.40f, 0.65f);
-    const float gr = gapeFr / 0.40f;
-    const float jaw0 = 0.02f * V * (gr * gr * gr);
-    const float kR = kELaw * R;
-    const float eyes0 = 2.0f * (4.0f / 3.0f) * kPi * (0.24f * kR) * (0.14f * kR) * (0.14f * kR);
-    float organScale = 1.0f;
-    if (jaw0 + eyes0 > 0.25f * V) { organScale = cbrtf_(0.25f * V / (jaw0 + eyes0)); limits |= kLimitOrgans; }
-    float jaw = jaw0, eyes = eyes0, kE = kELaw;
-    if (organScale != 1.0f) {
-        gapeFr = gapeFr * organScale;
-        kE = kELaw * organScale;
-        const float s3 = organScale * organScale * organScale;
-        jaw = jaw0 * s3; eyes = eyes0 * s3;
-        M.eyeScale = organScale;
+    if (M.cA > 1e-6f && 2.0f * M.cA / (M.span * caudI(M.outline)) > kChordCap) limits |= kLimitChordCap;
+    if (X.organScale != 1.0f) {
+        M.eyeScale = X.organScale;
         restPoints(M, R, pts);   // the eyes at their expressed scale (the hull is unchanged)
     }
-    float gas = 0.15f * P.g[physical::kBladder] * V, fat = 0.20f * P.g[physical::kFat] * V;
-    float storageScale = 1.0f;
-    if (gas + fat > 0.28f * V) { storageScale = 0.28f * V / (gas + fat); gas = gas * storageScale; fat = fat * storageScale; limits |= kLimitStorage; }
-    const float reserve = 0.02f * V + fat;
-    float th = 0.06f * P.g[physical::kArmour] * minf(shoulderA, shoulderB) * R;
-    float shell = h.wetted * th, shellScale = 1.0f;
-    if (shell > 0.08f * V) { shellScale = 0.08f * V / shell; th = th * shellScale; shell = h.wetted * th; limits |= kLimitShell; }
-    if (M.cA > 1e-6f && 2.0f * M.cA / (M.span * caudI(M.outline)) > kChordCap) limits |= kLimitChordCap;
+    const float gapeFr = X.gapeFraction, kE = X.eyeScale, jaw = X.jaw, eyes = X.eyes;
+    const float gas = X.gas, reserve = X.reserve, storageScale = X.storageScale, organScale = X.organScale;
+    const float th = X.armourThickness, shell = X.shell, shellScale = X.shellScale;
 
     // ---- an explicit diagnostic load: the inflated geometry (never at birth) ----
     float k = 1.0f;
@@ -840,11 +876,13 @@ inline bool compile(const appearance::Genome& G, float S, float E, const physica
         const int barb0 = strip0 + 6 * 2 * kFinIntervals + 2 * kEyeRim;
         const float d = maxf(0.0f, (M.bD - 0.2f) / 0.8f);
         for (int j = 0; j < 3; ++j) {
-            m[at(fBarbelActivation) + j] = pS(0.0f, 1.0f, 3.0f * d - (float)j);
-            // the centre line (its two edges' midpoints) of the right barbel, ribbon 0
+            const float wj = pS(0.0f, 1.0f, 3.0f * d - (float)j);
+            m[at(fBarbelActivation) + j] = wj;
+            // the centre line (its two edges' midpoints) of the right barbel, ribbon 0;
+            // an inactive pair is absent (its Bézier's rounding is not a reach)
             const int b0 = barbelRibbon0(j, 0, 0);
             float reach = 0.0f;
-            for (int i = 0; i < kBarbelSegments; ++i) {
+            for (int i = 0; i < kBarbelSegments && wj > 0.0f; ++i) {
                 const Vec3 p0 = mul(add(pts.p[b0 + 2 * i], pts.p[b0 + 2 * i + 1]), 0.5f);
                 const Vec3 p1 = mul(add(pts.p[b0 + 2 * i + 2], pts.p[b0 + 2 * i + 3]), 0.5f);
                 reach += norm(sub(p1, p0));

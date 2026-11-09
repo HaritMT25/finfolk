@@ -4858,6 +4858,7 @@ void testFlowLanes() {
 }  // namespace ot
 
 #include "ocean_appearance_tests.hpp"
+#include "ocean_body_plan_tests.hpp"   // the M2a body-plan preview (diagnostic)
 #include "ocean_sense_tests.hpp"
 #include "ocean_speed_tests.hpp"   // the exact Turbo speed-ups' own checks
 
@@ -4876,8 +4877,17 @@ int main(int argc, char** argv) {
     // --only label_mask: that test alone (tests/label_mask_fault.sh runs it on
     // copies of the engine with a planted fault, each of which must fail it)
     if (argc > 2 && std::strcmp(argv[1], "--only") == 0) {
+        if (std::strcmp(argv[2], "body") == 0) {   // the body-plan preview's checks alone (a quick loop)
+            ot::testBodyDraws(); ot::testBodyGeometry(); ot::testBodyIso(); ot::testBodyEdges(); ot::testBodyDevelop();
+            ot::testBodyOwner(); ot::testBodyNeutral(); ot::testBodyHash(); ot::testBodyNumbers();
+#ifndef OCEAN_TESTS_NO_SHIM
+            ot::testBodyShim();
+#endif
+            std::printf("OCEAN TESTS: %d passed, %d failed\n", ot::g_passed, ot::g_failed);
+            return ot::g_failed ? 1 : 0;
+        }
         if (std::strcmp(argv[2], "label_mask") != 0) {
-            std::fprintf(stderr, "--only: label_mask is the one test it runs\n");
+            std::fprintf(stderr, "--only: label_mask (or body) is the one test it runs\n");
             return 2;
         }
         ot::testLabelMask();
@@ -4974,6 +4984,19 @@ int main(int argc, char** argv) {
     ot::testAppearanceEval();
 #ifndef OCEAN_TESTS_NO_SHIM
     ot::testAppearanceShim();
+#endif
+    // the M2a body-plan preview (diagnostic): tests/ocean_body_plan_tests.hpp
+    ot::testBodyDraws();
+    ot::testBodyGeometry();
+    ot::testBodyIso();
+    ot::testBodyEdges();
+    ot::testBodyDevelop();
+    ot::testBodyOwner();
+    ot::testBodyNeutral();
+    ot::testBodyHash();
+    ot::testBodyNumbers();
+#ifndef OCEAN_TESTS_NO_SHIM
+    ot::testBodyShim();
 #endif
     // the glass walls: tests/ocean_walls_tests.hpp
 #ifndef OCEAN_TESTS_NO_SHIM
