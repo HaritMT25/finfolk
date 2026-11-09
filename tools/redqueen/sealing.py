@@ -63,9 +63,11 @@ records the public registration (OSF URL and/or DOI, and its registration time: 
 in the future, not before the validation evaluation was opened), the
 sha256 of the preregistration, the evaluation script, the split manifest, VAL_PRED_SHA and
 TEST_PRED_SHA. Every marker must equal its record's sha256 (checked by freeze and by the gate).
-require_test_freeze (verify-test) reads the predictions, the script and the manifest ONCE, verifies
-them against the freeze record (itself read ONCE) and returns those verified bytes and the freeze
-record parsed from the checked bytes: scoring consumes them, never the paths again.
+require_test_freeze (verify-test) reads the predictions, the script (or the caller's in-process
+implementation manifest, script_bytes), the manifest and the validation-evaluation record ONCE, verifies
+them against the freeze record (itself read ONCE; the validation-evaluation record must hash to the one
+it recorded) and returns those verified bytes and records parsed from the checked bytes: scoring
+consumes them, never the paths again.
 """
 from __future__ import annotations
 
@@ -579,9 +581,10 @@ def freeze(study, preregistration, eval_script, osf_url=None, doi=None, register
         return rec
 
 
-def test_problems(study, pred_bytes, script_bytes, manifest_bytes, freeze_bytes=None):
-    """Why test scoring may not start on these exact bytes (empty: it may). freeze_bytes: the freeze
-    record as read once by the caller (else read here)."""
+def test_problems(study, pred_bytes, script_bytes, manifest_bytes, freeze_bytes=None, ve_bytes=None):
+    """Why test scoring may not start on these exact bytes (empty: it may). freeze_bytes / ve_bytes: the
+    freeze record and the validation-evaluation record as read once by the caller (else read here); the
+    latter must be the one the test commitment (and so the freeze) recorded."""
     d = reg_dir(study)
     p = os.path.join(d, "freeze.json")
     if freeze_bytes is None:
@@ -599,9 +602,18 @@ def test_problems(study, pred_bytes, script_bytes, manifest_bytes, freeze_bytes=
     if not ((o.get("url") and OSF_URL.match(o["url"])) or (o.get("doi") and DOI.match(o["doi"]))):
         probs.append("the freeze record names no public registration (OSF URL or DOI)")
     ve = os.path.join(d, "validation_evaluation.json")
+    if ve_bytes is None and os.path.isfile(ve):
+        ve_bytes = rqlib.read_bytes(ve)
+    ve_rec = None
+    if ve_bytes is not None:
+        try:
+            ve_rec = json.loads(ve_bytes.decode("utf-8"))
+        except ValueError:
+            probs.append("validation_evaluation.json is not JSON")
+    if ve_bytes is None or rqlib.sha256_bytes(ve_bytes) != f.get("validation_evaluation_sha256"):
+        probs.append("validation_evaluation.json is not the validation evaluation the freeze recorded")
     try:
-        why = registration_time_problem(o.get("registered_utc"),
-                                        rqlib.read_json(ve).get("utc") if os.path.isfile(ve) else None,
+        why = registration_time_problem(o.get("registered_utc"), (ve_rec or {}).get("utc"),
                                         parse_utc(f["utc"]) if f.get("utc") else None)
     except SealError as e:
         why = str(e)
@@ -628,22 +640,27 @@ def test_problems(study, pred_bytes, script_bytes, manifest_bytes, freeze_bytes=
     return probs
 
 
-def require_test_freeze(study, pred_path, eval_script):
-    """The gate a test-scoring script calls first: the predictions, the script and the manifest read ONCE,
-    verified against the freeze record -> {"predictions": bytes, "manifest": bytes, "freeze": record}:
-    scoring consumes these verified bytes, never the paths again."""
+def require_test_freeze(study, pred_path, eval_script, script_bytes=None):
+    """The gate a test-scoring script calls first: the predictions, the script (or script_bytes: the
+    evaluator's implementation manifest, computed in-process), the manifest and the validation-evaluation
+    record read ONCE, verified against the freeze record -> {"predictions", "manifest", "freeze",
+    "freeze_bytes", "validation_evaluation", "validation_evaluation_bytes"}: scoring consumes these verified
+    bytes, never the paths again."""
     fp = os.path.join(reg_dir(study), "freeze.json")
     if not os.path.isfile(fp):
         raise SealError("test evaluation refused: no public freeze record (sealing.py freeze, after the OSF deposit)")
     fb = rqlib.read_bytes(fp)                         # read ONCE: the record checked is the record returned
     pred = rqlib.read_bytes(pred_path)
-    script = rqlib.read_bytes(eval_script)
+    script = script_bytes if script_bytes is not None else rqlib.read_bytes(eval_script)
     mp = os.path.join(study, "config", "splits.json")
     man = rqlib.read_bytes(mp) if os.path.isfile(mp) else None
-    probs = test_problems(study, pred, script, man, fb)
+    vp = os.path.join(reg_dir(study), "validation_evaluation.json")
+    veb = rqlib.read_bytes(vp) if os.path.isfile(vp) else None
+    probs = test_problems(study, pred, script, man, fb, veb)
     if probs:
         raise SealError("test evaluation refused: " + "; ".join(probs))
-    return {"predictions": pred, "manifest": man, "freeze": json.loads(fb.decode("utf-8")), "freeze_bytes": fb}
+    return {"predictions": pred, "manifest": man, "freeze": json.loads(fb.decode("utf-8")), "freeze_bytes": fb,
+            "validation_evaluation": json.loads(veb.decode("utf-8")), "validation_evaluation_bytes": veb}
 
 
 # ================================================================== CLI
