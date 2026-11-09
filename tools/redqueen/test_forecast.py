@@ -1,22 +1,24 @@
 #!/usr/bin/env python3
 """test_forecast.py: the Level-2 linear forecasts (forecast.py, design v4 §10.6, §7.1-7.3).
 
-NUMERICS (known answers): the registered initial-state prior conditions on y(0) exactly once (diffuse: the
-scalar R = Q = 1 posterior variance is 1, not 2/3; a three-step smoother equals direct Gaussian conditioning);
-the penalized EM's M-step is the exact maximizer of its penalized objective (perturbations, and the Q
-update with its penalty term against the one without), equals augmented least squares on fully observed
-data, reaches Theta0 under strong regularization, and the penalized objective never decreases; the
-forecasters' gains are exact; a SHARED measurement error in the inputs and the futures gives the latent MSE
-(Codex's counterexample: observed error 0, corrected MSE tr S, never negative); the evaluation arithmetic
-on futures with known laws (V_fork, REDUCIBLE, one surviving reseed, extinct and unavailable futures).
-PIPELINE against a real split manifest (sealing.manifest with the fork registry), the fork registry and
-sealing's commitments and freeze: register -> predict-candidates -> commit -> score-validation (lambda the
-argmin over the registered selection set) -> open-validation -> predict-test -> commit -> freeze ->
-evaluate-test, every category reported on its own. LEAKAGE GUARDS: fit rows past the cutoff, of held-out
-worlds, held-out snapshots, branches or with labels; map / reference provenance; prefix rows outside the
-registered windows; target rows of another stage, missing or substituted; the commitment (no marker, other
-bytes, no selection record, another model, no freeze, verified bytes consumed); the fork panel (missing,
-unregistered, aliased branches; explicit unavailable; invalid covariances). numpy required.
+NUMERICS (known answers): the registered initial-state prior conditions on y(0) exactly once; the penalized
+EM's M-step is the exact maximizer of its penalized objective, equals augmented least squares on fully
+observed data, reaches Theta0 under strong regularization, never decreases its objective; the numerical-
+failure policy (a non-monotone or unconverged EM is unavailable and never selected); the forecasters' gains
+are exact; SHARED measurement noise: the persistence point metrics (Codex r1: observed error 0, corrected
+MSE tr S), the lss predictive covariance under the source structure (Codex r2: constant scalar state, five
+observations, R = 1, S = 0.5, Q -> 0: 0.6, not the working 0.2; Monte Carlo variance and coverage), and the
+fit's translation equivariance (a shift of every fitting profile moves only c by (I - A) u; the forecast's
+total loading on the shared component is I); the evaluation arithmetic on futures with known laws.
+PIPELINE against a real split manifest (sealing.manifest with the fork registry) and sealing's commitments
+and freeze, with the evaluator's implementation manifest as the frozen evaluation script: the registration
+is TARGET-DISJOINT (no stage reads its own or a later stage's targets); categories and registered roles are
+pooled apart; lambda is the argmin over the selection set; outputs are byte-reproducible. GUARDS: fit rows
+(cutoff, held-out worlds and snapshots, branches, labels, UUIDs, map / reference provenance); prefix and
+target membership checked before any value; a non-disjoint registration; an unsupported measurement-source
+structure; the commitments (marker, bytes, selection record, model, freeze); the implementation (a changed
+helper module, an RQ_PYLIB shadow); the validation-evaluation record substituted before and after the gate;
+the fork registry replaced and read once; the fork panel; contradictory absorbing rows. numpy required.
 
     python3 -I tools/redqueen/test_forecast.py [-v]
 """
@@ -29,6 +31,7 @@ import json
 import math
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -52,15 +55,17 @@ M = 1_000_000
 A_TRUE = [[0.85, 0.10], [-0.05, 0.90]]
 C_TRUE = [0.05, -0.02]
 Q_TRUE = [[0.010, 0.002], [0.002, 0.008]]
-S_SH, R_OWN = 0.001, 0.002                     # shared (per root world) and own measurement variances
+S_SH, R_OWN = 0.001, 0.002                     # shared (per measurement group) and own measurement variances
 TRAIN = [f"T{k:02d}" for k in range(8)]
 VAL, TEST = ["V0", "V1", "V2"], ["S0", "S1", "S2"]
 SPLIT = dict({w: "train" for w in TRAIN}, **{w: "val" for w in VAL}, **{w: "test" for w in TEST}, A1="train")
 FORK, ORIG, SEEDS = ["T00", "V0", "S0", "S1"], [30, 100, 185], 4
 HOLD = {"T00:34": "val", "T01:40": "val", "T02:150": "test", "T03:195": "val"}
+HELD = {(k.split(":")[0], int(k.split(":")[1])) for k in HOLD}
 UUIDS = {w: str(uuid.uuid5(uuid.NAMESPACE_URL, f"finfolk:redqueen:ns-main:{w}")) for w in sorted(SPLIT)}
 MAP = {"cutoff": 120, "fit_sha256": "a" * 64, "references": {"sha256": "b" * 64, "max_frame": 120 * M}}
 COVS = ["abundance_prey", "energy"]
+GROUPS = [f"fit:{w}" for w in TRAIN] + [f"g:{w}" for w in sorted(TRAIN + VAL + TEST)]
 
 
 def bid(w, t0, k):
@@ -80,7 +85,8 @@ def wr(path, data):
 def config(**over):
     cfg = {"schema": fc.CFG_SCHEMA, "channels": ["rq0", "rq1"], "events": ["extinction"], "covariates": COVS,
            "window": 5, "horizons": [1, 4, 10], "primary": 10,
-           "temporal": {"fit_through": 120, "validation": [141, 160], "test": [181, 200], "separation": 20},
+           "temporal": {"fit_through": 120, "validation": [141, 160], "test": [181, 200], "separation": 20,
+                        "inputs_through": {"validation": 150, "test": 190}},
            "map": {"cutoff": 120, "reference_frame_max": None},
            "lss": {"lambdas": [0.1, 100.0], "initial_state": {"kind": "diffuse"}, "em_iters": 400, "em_tol": 1e-7},
            "evaluation": {"bootstrap": 99, "energy_draws": 200, "seed_namespace": "test-forecast"}}
@@ -119,22 +125,29 @@ def make_root(tmp, cfg_over=None, register=True):
     return root, cp
 
 
+def group_of(w, root, t):
+    """The fixture's registered source structure: a training world's fitting rows are measured in their own
+    group (fit:<world>), every other row in its root's evaluation group (g:<root>): independent of the fit."""
+    return f"fit:{w}" if w in TRAIN and t <= 120 and (w, t) not in HELD else f"g:{root}"
+
+
 def simulate(seed=7):
     """Every native row (T, V, S worlds, t = 0 .. 200) and every fork branch's rows (+1, +4, +10) from the known
-    linear system; measured with a shared per-root component (group g:<root>) plus own noise. S2 goes extinct
-    at 190; branch S1.o185M.s2 is extinct at 195; S0.o185M.s3's +4 assay is unavailable."""
+    linear system, measured with the group's shared component plus own noise. S2 goes extinct at 190; branch
+    S1.o185M.s2 is extinct at 195; S0.o185M.s3's +4 assay is unavailable."""
     rng = np.random.default_rng(seed)
     A, c, L = np.array(A_TRUE), np.array(C_TRUE), np.linalg.cholesky(np.array(Q_TRUE))
     zbar = np.linalg.solve(np.eye(2) - A, c)
-    rows, truth, us = {}, {}, {}
+    us = {g: math.sqrt(S_SH) * rng.standard_normal(2) for g in GROUPS}
+    rows, truth = {}, {}
 
     def meas(w, root, t, z):
-        return {"world": w, "t": t, "uuid": UUIDS.get(w) or buuid(w), "z": (z + us[root] + math.sqrt(R_OWN) * rng.standard_normal(2)).tolist(),
-                "cov": ((S_SH + R_OWN) * np.eye(2)).tolist(), "meas_group": f"g:{root}",
+        g = group_of(w, root, t)
+        return {"world": w, "t": t, "uuid": UUIDS.get(w) or buuid(w), "z": (z + us[g] + math.sqrt(R_OWN) * rng.standard_normal(2)).tolist(),
+                "cov": ((S_SH + R_OWN) * np.eye(2)).tolist(), "meas_group": g,
                 "covariates": {"abundance_prey": float(rng.uniform(300, 600)), "energy": float(rng.normal())},
                 "events": {"extinction": False}}
     for w in sorted(TRAIN + VAL + TEST):
-        us[w] = math.sqrt(S_SH) * rng.standard_normal(2)
         z = zbar + 0.2 * rng.standard_normal(2)
         for t in range(0, 201):
             truth[(w, t)] = z
@@ -156,8 +169,7 @@ def simulate(seed=7):
 
 def doc(rows, **over):
     d = {"schema": fc.PROFILES, "channels": ["rq0", "rq1"], "map": MAP,
-         "measurement": {"shared": {f"g:{w}": (S_SH * np.eye(2)).tolist() for w in sorted(TRAIN + VAL + TEST)}},
-         "rows": rows}
+         "measurement": {"shared": {g: (S_SH * np.eye(2)).tolist() for g in GROUPS}}, "rows": rows}
     d.update(over)
     return d
 
@@ -171,6 +183,10 @@ def run(args):
     with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
         rc = fc.main(args)
     return rc, err.getvalue()
+
+
+def row(y, R, g="g"):
+    return {"z": np.asarray(y, float), "R": np.asarray(R, float), "g": g, "events": {}, "unavailable": None}
 
 
 @unittest.skipIf(np is None, "numpy is not installed")
@@ -208,7 +224,7 @@ class TestNumerics(unittest.TestCase):
         want = -0.5 * (r @ np.linalg.solve(Sy, r) + np.linalg.slogdet(Sy)[1] + 2 * math.log(2 * math.pi))
         self.assertAlmostEqual(float(ll[0]), want, places=12)
 
-    def _series(self, n=300, seed=3, R=0.0):
+    def _series(self, n=300, seed=3, R=0.0, shift=None):
         rng = np.random.default_rng(seed)
         A, c, L = np.array(A_TRUE), np.array(C_TRUE), np.linalg.cholesky(np.array(Q_TRUE))
         z = np.zeros(2)
@@ -219,7 +235,8 @@ class TestNumerics(unittest.TestCase):
             z = A @ z + c + L @ rng.standard_normal(2)
         Rm = np.broadcast_to((R if R else 1e-14) * np.eye(2), (n, 2, 2))
         X = np.array(X)
-        return np.array(Z)[None], np.array(Rm)[None], X[None], X.mean(axis=0), X.std(axis=0)
+        Z = np.array(Z) + (0 if shift is None else np.asarray(shift))
+        return Z[None], np.array(Rm)[None], X[None], X.mean(axis=0), X.std(axis=0)
 
     def test_penalized_em(self):
         """P2-8: (a) the M-step maximizes the penalized expected complete-data objective (random
@@ -246,11 +263,9 @@ class TestNumerics(unittest.TestCase):
             dQ = 1e-4 * rng.standard_normal((2, 2))
             self.assertLess(obj(m.Th + dT, m.Q), best)
             self.assertLess(obj(m.Th, m.Q + (dQ + dQ.T) / 2), best)
-        E = m.Th - Th0
         Q_nopen = (S11 - m.Th @ S10.T - S10 @ m.Th.T + m.Th @ S00 @ m.Th.T) / n
         self.assertLess(obj(m.Th, Q_nopen), best - 1e-6)
         self.assertGreater(np.max(np.abs(Q_nopen - m.Q)), 1e-6)
-        # (b) fully observed: augmented least squares
         z, R, x, mu, sd = self._series(R=0.0)
         for lam in (50.0, 1e9):
             f = fc.LSS(2, 2, lam, mu, sd, {"kind": "diffuse"}).fit([(z, R, x)], 20, 1e-10)
@@ -260,7 +275,7 @@ class TestNumerics(unittest.TestCase):
             tgt = np.vstack([Y, math.sqrt(lam) * np.hstack([np.eye(2), np.zeros((2, 3))]).T[:4]])
             Th = np.linalg.lstsq(aug, tgt, rcond=None)[0].T
             res = tgt - aug @ Th.T
-            self.assertTrue(f.converged)
+            self.assertTrue(f.converged and f.usable)
             self.assertTrue(np.allclose(f.Th, Th, atol=1e-7), (lam, f.Th, Th))
             self.assertTrue(np.allclose(f.Q, res.T @ res / len(Y), atol=1e-8), (lam, f.Q))
         self.assertLess(np.max(np.abs(f.Th[:, :2] - np.eye(2))), 1e-6)       # (lambda 1e9: A = I, B = 0)
@@ -268,11 +283,40 @@ class TestNumerics(unittest.TestCase):
         inc = Y - z[0, :-1]
         self.assertTrue(np.allclose(f.Th[:, 4], inc.mean(axis=0), atol=1e-6))
         self.assertTrue(np.allclose(f.Q, np.cov(inc.T, ddof=0), atol=1e-6))
-        # (c) monotone
         z, R, x, mu, sd = self._series(R=0.003, n=200)
         f = fc.LSS(2, 2, 1.0, mu, sd, {"kind": "diffuse"}).fit([(z, R, x)], 60, 1e-15)
         self.assertTrue(f.monotone)
         self.assertGreater(f.trace[-1], f.trace[0])
+
+    def test_em_failure_policy(self):
+        """Codex r2 P2-9: a fit whose penalized objective decreases (here: a sabotaged M-step) is unusable with
+        its diagnostic, even when it then 'converges'; one that does not converge too; select_lambda never
+        picks an unavailable lambda."""
+        z, R, x, mu, sd = self._series(R=0.003, n=200)
+        m = fc.LSS(2, 2, 1.0, mu, sd, {"kind": "diffuse"})
+        real, calls = m.mstep, [0]
+
+        def bad(*a):
+            real(*a)
+            calls[0] += 1
+            if calls[0] == 3:
+                m.Q = m.Q * 50.0                                   # (an objective drop)
+        m.mstep = bad
+        m.fit([(z, R, x)], 200, 1e-7)
+        self.assertTrue(m.converged)
+        self.assertFalse(m.usable)
+        self.assertIn("decreased", m.failure)
+        st = m.state()
+        self.assertEqual((st["usable"], st["monotone"]), (False, False))
+        f = fc.LSS(2, 2, 1.0, mu, sd, {"kind": "diffuse"}).fit([(z, R, x)], 2, 1e-15)
+        self.assertIn("did not converge", f.failure)
+        per = [{"available": True, "stage": "validation", "primary": True, "time_role": "validation",
+                "metrics": {"lss[0.1]": {"forecast_unavailable": "the penalized objective decreased"},
+                            "lss[1.0]": {"mse": 0.5}, "persistence": {"mse": 0.9}, "drift": {"mse": 1.0}}}]
+        ctx = {"cfg": {"lss": {"lambdas": [0.1, 1.0]}}}
+        sel = fc.select_lambda(ctx, per)
+        self.assertEqual(sel["lambda"], 1.0)
+        self.assertIn("decreased", sel["candidates"][0]["reason"])
 
     def test_gains_are_exact(self):
         """The drift is exact on a line; every forecaster is affine in its window measurements with the
@@ -298,21 +342,18 @@ class TestNumerics(unittest.TestCase):
             m1, _, _ = m.forecast((Z + dZ)[None], Rb, X, 4)
             self.assertTrue(np.allclose(m1[0] - m0[0], Mg[0] @ dZ.reshape(-1), atol=1e-10))
 
-    def test_shared_noise_known_answer(self):
-        """P2-10: constant true profile; the same shared measurement error in the persistence input and every
-        future (R = S): the observed squared error is 0, the corrected MSE is tr S (the latent error, positive),
-        V_fork is 0 and REDUCIBLE tr S; without the cross-covariance the MSE would be -tr S. Monte Carlo over
-        origins with shared and own noise: the corrected MSE estimates the latent MSE tr R."""
+    def test_shared_noise_point_metrics(self):
+        """P2-10 (r1): constant true profile; the same shared measurement error in the persistence input and
+        every future (R = S): the observed squared error is 0, the corrected MSE is tr S (positive), V_fork 0
+        and REDUCIBLE tr S; without the cross-covariance it would be -tr S. Monte Carlo with shared and own
+        noise: the corrected MSE estimates the latent MSE tr R."""
         S = 0.01 * np.eye(2)
         meas = {"g": S}
         z, u = np.array([0.3, -0.2]), np.array([0.05, -0.08])
-
-        def row(y, R, g="g"):
-            return {"z": np.asarray(y, float), "R": R, "g": g, "events": {}, "unavailable": None}
         win = [row(z + u, S) for _ in range(5)]
         zh, G = fc.persistence(np.array([r["z"] for r in win]), [S] * 5, [1, 2, 3, 4, 5], 4)
-        f = {"z": zh.tolist(), "cov": np.zeros((2, 2)).tolist(),
-             "cross": {g: c.tolist() for g, c in fc.cross_cov(G, win, meas).items()}}
+        V, cross, _ = fc.measurement_parts(G, win, meas)
+        f = {"z": zh.tolist(), "cov": V.tolist(), "cross": {g: c.tolist() for g, c in cross.items()}}
         futs = [{"kind": "reseed", "row": row(z + u, S)} for _ in range(4)] + [{"kind": "original", "row": row(z + u, S)}]
         rng_of = lambda j: np.random.default_rng(j)  # noqa: E731
         r = fc.origin_metrics(f, futs, meas, [], rng_of, 50)
@@ -328,11 +369,88 @@ class TestNumerics(unittest.TestCase):
             uu = rng.multivariate_normal(np.zeros(2), S)
             win = [row(z + uu + rng.multivariate_normal(np.zeros(2), Rt - S), Rt) for _ in range(5)]
             zh, G = fc.persistence(np.array([w["z"] for w in win]), [Rt] * 5, [1, 2, 3, 4, 5], 1)
-            f = {"z": zh.tolist(), "cov": np.zeros((2, 2)).tolist(),
-                 "cross": {g: c.tolist() for g, c in fc.cross_cov(G, win, meas).items()}}
+            V, cross, _ = fc.measurement_parts(G, win, meas)
+            f = {"z": zh.tolist(), "cov": V.tolist(), "cross": {g: c.tolist() for g, c in cross.items()}}
             fut = [{"kind": "native", "row": row(z + uu + rng.multivariate_normal(np.zeros(2), Rt - S), Rt)}]
             est.append(fc.origin_metrics(f, fut, meas, [], rng_of, 1)["mse"])
         self.assertAlmostEqual(float(np.mean(est)), float(np.trace(Rt)), delta=0.004)
+
+    def test_lss_covariance_under_shared_noise(self):
+        """Codex r2 P2-5: the lss predictive covariance under the registered source structure. Analytic: a
+        constant scalar state (A = 1, c = 0, Q -> 0), diffuse initialization, five observations with R = 1 and
+        a shared S = 0.5: the working filter's P is 0.2, the latent forecast-error variance 0.5 + 0.5 / 5 =
+        0.6. Monte Carlo (the 2-d system, fixed parameters, a shared component per window and target): the
+        recorded covariance matches the latent error covariance, and the PIT coverage is nominal."""
+        m = fc.LSS(1, 0, 1.0, [], [], {"kind": "diffuse"})
+        m.Th, m.Q = np.array([[1.0, 0.0]]), np.array([[1e-14]])
+        Z = np.array([[[0.3], [-0.1], [0.2], [0.5], [0.0]]])
+        R = np.ones((1, 5, 1, 1))
+        mean, Pw, Mg = m.forecast(Z, R, np.zeros((1, 5, 0)), 1)
+        G = [Mg[0][:, s:s + 1] for s in range(5)]
+        win = [row(Z[0, s], [[1.0]]) for s in range(5)]
+        V, cross, own = fc.measurement_parts(G, win, {"g": np.array([[0.5]])})
+        self.assertAlmostEqual(float(Pw[0, 0, 0]), 0.2, places=9)
+        self.assertAlmostEqual(float((Pw[0] - own + V)[0, 0]), 0.6, places=9)
+        self.assertAlmostEqual(float(cross["g"][0, 0]), 0.5, places=9)          # (L = 1: Cov(z_hat, v_f) = S)
+        rng = np.random.default_rng(11)
+        A, c, Qm = np.diag([0.95, 0.9]), np.array([0.01, 0.0]), 0.0005 * np.eye(2)   # (slow states, noisy profiles)
+        Lq = np.linalg.cholesky(Qm)
+        m = fc.LSS(2, 0, 1.0, [], [], {"kind": "diffuse"})
+        m.Th, m.Q = np.hstack([A, c[:, None]]), Qm
+        Sg, Rt = 0.025 * np.eye(2), 0.03 * np.eye(2)
+        n, H = 4000, 1
+        Zs, zf, yf = [], [], []
+        for _ in range(n):
+            z = np.linalg.solve(np.eye(2) - A, c) + 0.3 * rng.standard_normal(2)
+            u = rng.multivariate_normal(np.zeros(2), Sg)
+            ys = []
+            for s in range(5):
+                ys.append(z + u + rng.multivariate_normal(np.zeros(2), Rt - Sg))
+                if s < 4:
+                    z = A @ z + c + Lq @ rng.standard_normal(2)
+            for _ in range(H):
+                z = A @ z + c + Lq @ rng.standard_normal(2)
+            Zs.append(ys)
+            zf.append(z)
+            yf.append(z + u + rng.multivariate_normal(np.zeros(2), Rt - Sg))
+        Zs = np.array(Zs)
+        mean, Pw, Mg = m.forecast(Zs, np.broadcast_to(Rt, (n, 5, 2, 2)).copy(), np.zeros((n, 5, 0)), H)
+        G = [Mg[0][:, 2 * s:2 * s + 2] for s in range(5)]                  # (the gains do not depend on y)
+        win = [row(Zs[0, s], Rt) for s in range(5)]
+        V, cross, own = fc.measurement_parts(G, win, {"g": Sg})
+        cov = Pw[0] - own + V
+        err = mean - np.array(zf)
+        emp = np.cov(err.T)
+        self.assertLess(abs(np.trace(emp) - np.trace(cov)) / np.trace(cov), 0.06, (emp, cov))
+        self.assertGreater(abs(np.trace(cov) - np.trace(Pw[0])) / np.trace(Pw[0]), 0.1)   # (the working P differs)
+        C = cross["g"]
+        Sy = cov + Rt - C - C.T
+        q = np.einsum("bi,ij,bj->b", np.array(yf) - mean, np.linalg.inv(Sy), np.array(yf) - mean)
+        cover = np.mean([fc.chi2_cdf(float(x), 2) <= 0.9 for x in q])
+        self.assertAlmostEqual(cover, 0.9, delta=0.02)
+
+    def test_fit_shift_equivariance(self):
+        """Codex r2 P2-5 (shared fitting sources): one measurement group across the whole fit. Shifting every
+        fitting profile by u leaves A, B, Q and moves c by (I - A) u; the lss forecast of a window shifted by u
+        moves by exactly u; the recorded loading K = (d z_hat / d c)(I - A) makes the total loading on the shared
+        component sum_s G_s + K = I (so Cov(z_hat, v_f) = S for a target in that group)."""
+        u = np.array([0.07, -0.04])
+        z, R, x, mu, sd = self._series(R=0.003, n=250)
+        zs = z + u
+        f0 = fc.LSS(2, 2, 1.0, mu, sd, {"kind": "diffuse"}).fit([(z, R, x)], 400, 1e-12)
+        f1 = fc.LSS(2, 2, 1.0, mu, sd, {"kind": "diffuse"}).fit([(zs, R, x)], 400, 1e-12)
+        A0 = f0.Th[:, :2]
+        self.assertTrue(np.allclose(f1.Th[:, :4], f0.Th[:, :4], atol=1e-6))
+        self.assertTrue(np.allclose(f1.Q, f0.Q, atol=1e-8))
+        self.assertTrue(np.allclose(f1.Th[:, 4] - f0.Th[:, 4], (np.eye(2) - A0) @ u, atol=1e-6))
+        W = z[:, 200:205]
+        Rw, Xw = R[:, 200:205], x[:, 200:205]
+        m0, _, Mg = f0.forecast(W, Rw, Xw, 4)
+        m1, _, _ = f1.forecast(W + u, Rw, Xw, 4)
+        self.assertTrue(np.allclose(m1 - m0, u, atol=1e-6))
+        K = f0.fit_loading(W, Rw, Xw, 4)[0]
+        Gsum = sum(Mg[0][:, 2 * s:2 * s + 2] for s in range(5))
+        self.assertTrue(np.allclose(Gsum + K, np.eye(2), atol=1e-9))
 
     def test_evaluation_arithmetic(self):
         """Futures with KNOWN conditional laws N(mu, Sc), measured independently: pooled V_fork estimates tr Sc;
@@ -364,18 +482,20 @@ class TestNumerics(unittest.TestCase):
             mets = {name: fc.origin_metrics({"z": z.tolist(), "cov": cov.tolist(), "cross": {}}, futs, {}, ["extinction"],
                                             rng_of, 300)
                     for name, z, cov in (("drift", mu, Sc), ("persistence", mu + delta, Sc), ("lss", mu, 4 * Sc))}
-            per.append({"available": True, "stage": "test", "category": "world_transfer", "kind": "fork", "horizon": 10,
+            per.append({"available": True, "stage": "test", "world_role": "test", "target_role": "test",
+                        "time_role": "fit", "category": "world_transfer", "kind": "fork", "horizon": 10,
                         "world": f"w{k % 12:02d}", "metrics": mets})
         ctx = {"cfg": {"primary": 10, "evaluation": {"bootstrap": 199, "seed_namespace": "t"}}}
         P = fc.pool(ctx, per)
-        d0 = P["test/world_transfer/fork/H10/drift"]
+        key = "test/test/test/fit/world_transfer/fork/H10/"
+        d0 = P[key + "drift"]
         self.assertAlmostEqual(d0["v_fork"]["mean"], 0.07, delta=0.008)
         self.assertAlmostEqual(d0["reducible"]["mean"], 0.0, delta=0.008)
         lo, hi = d0["reducible"]["ci95"]
         self.assertTrue(lo <= 0.0 <= hi)
-        self.assertAlmostEqual(P["test/world_transfer/fork/H10/persistence"]["reducible"]["mean"], float(delta @ delta), delta=0.01)
+        self.assertAlmostEqual(P[key + "persistence"]["reducible"]["mean"], float(delta @ delta), delta=0.01)
         o0 = per[0]["metrics"]["drift"]
-        self.assertEqual((o0["events"]["extinction"], o0["reseeds"], o0["unavailable"]), (1, 2, 1))   # (k = 0: both)
+        self.assertEqual((o0["events"]["extinction"], o0["reseeds"], o0["unavailable"]), (1, 2, 1))
         one = fc.origin_metrics({"z": [0.0, 0.0], "cov": Sc.tolist(), "cross": {}},
                                 [{"kind": "reseed", "row": {"z": np.array([0.3, 0.4]), "R": meas_R, "g": None,
                                                             "events": {}, "unavailable": None}}], {}, [],
@@ -385,7 +505,7 @@ class TestNumerics(unittest.TestCase):
         es = {n: np.mean([r["metrics"][n]["energy"] for r in per]) for n in ("drift", "persistence")}
         self.assertLess(es["drift"], es["persistence"])
         self.assertAlmostEqual(d0["cover90"]["mean"], 0.9, delta=0.04)
-        self.assertGreater(P["test/world_transfer/fork/H10/lss"]["cover90"]["mean"], 0.97)
+        self.assertGreater(P[key + "lss"]["cover90"]["mean"], 0.97)
         rqlib.canonical(P)
 
     def test_chi2(self):
@@ -417,14 +537,12 @@ class TestPipeline(unittest.TestCase):
             pre, tgt = fc.stage_rows(cls.ctx, sts)
             put(f"{stage}_prefix.json", [cls.rows[k] for k in sorted(pre)])
             put(f"{stage}_targets.json", [cls.rows[k] for k in sorted(tgt)])
-        cls.base = os.path.join(cls.tmp, "base")              # the root after the validation commitment
+        cls.base = os.path.join(cls.tmp, "base")
         shutil.copytree(cls.root, cls.base)
         f = cls.files
-        cls.val = os.path.join(cls.tmp, "val.jsonl")
-        cls.model = os.path.join(cls.tmp, "model.json")
-        cls.scores = os.path.join(cls.tmp, "val_scores.json")
-        cls.test = os.path.join(cls.tmp, "test.jsonl")
-        cls.eval = os.path.join(cls.tmp, "eval.json")
+        cls.val, cls.model, cls.scores, cls.test, cls.eval, cls.impl = (
+            os.path.join(cls.tmp, n) for n in ("val.jsonl", "model.json", "val_scores.json", "test.jsonl", "eval.json",
+                                               "impl.json"))
         cls.rc = [run(["predict-candidates", "--root", cls.root, "--fit", f["fit.json"], "--prefix", f["val_prefix.json"],
                        "--model-out", cls.model, "--out", cls.val])]
         cls.precommit = os.path.join(cls.tmp, "precommit")
@@ -439,12 +557,13 @@ class TestPipeline(unittest.TestCase):
         shutil.copytree(cls.root, cls.opened)
         cls.rc.append(run(["predict-test", "--root", cls.root, "--prefix", f["test_prefix.json"], "--model", cls.model,
                            "--selection", cls.scores, "--out", cls.test]))
-        sealing.commit(cls.root, "test", cls.test, fc.__file__)
+        cls.rc.append(run(["implementation", "--out", cls.impl]))
+        sealing.commit(cls.root, "test", cls.test, cls.impl)
         cls.prereg = os.path.join(cls.tmp, "prereg.pdf")
         wr(cls.prereg, "the preregistration\n")
         cls.unfrozen = os.path.join(cls.tmp, "unfrozen")
         shutil.copytree(cls.root, cls.unfrozen)
-        sealing.freeze(cls.root, cls.prereg, fc.__file__, osf_url="https://osf.io/abc12", registered_utc=rqlib.now_utc())
+        sealing.freeze(cls.root, cls.prereg, cls.impl, osf_url="https://osf.io/abc12", registered_utc=rqlib.now_utc())
         cls.rc.append(run(["evaluate-test", "--root", cls.root, "--predictions", cls.test, "--targets",
                            f["test_targets.json"], "--out", cls.eval]))
 
@@ -464,65 +583,91 @@ class TestPipeline(unittest.TestCase):
         return p
 
     def test_end_to_end(self):
-        """The staged pipeline runs; categories are reported on their own; lambda is the argmin over the
-        registered selection set; provenance binds every input; the test score records its fingerprint."""
-        self.assertEqual([r[0] for r in self.rc], [0, 0, 0, 0], [r[1] for r in self.rc])
+        """The staged pipeline runs on a TARGET-DISJOINT registration (no stage's prefix row is one of its
+        targets, no validation prefix row a test target, no target a fitting row; in-sample origins
+        excluded); registered roles are pooled apart (validation-root V0 and test-root S0 at 185 never share a
+        pool); lambda is the argmin over the selection set; provenance, the implementation manifest and the
+        scoring environment are recorded."""
+        self.assertEqual([r[0] for r in self.rc], [0, 0, 0, 0, 0], [r[1] for r in self.rc])
+        for sts in ({"validation"}, {"test", "training"}):
+            pre, tgt = fc.stage_rows(self.ctx, sts)
+            self.assertEqual(pre & tgt, set())
+        self.assertEqual(fc.stage_rows(self.ctx, {"validation"})[0] & fc.stage_rows(self.ctx, {"test"})[1], set())
+        self.assertEqual(fc.disjointness_problems(self.ctx, self.ctx["origins"]), [])
+        by = self.ctx["by_id"]
+        self.assertIn("in-sample", by["fork:T00:30:1"]["excluded"])
+        self.assertIn("fork origin's target", by["native:S0:186:10"]["excluded"])      # (its window holds S0@186)
+        self.assertNotIn("native:T05:146:1", by)                                       # (not under the split rule)
+        self.assertEqual(by["fork:T00:30:4"]["category"], "snapshot_transfer")
+        self.assertEqual(by["fork:V0:185:10"]["stage"], "test")
+        self.assertEqual(by["native:T02:150:1"]["stage"], "test")                      # (its window holds T02@150)
         op = os.path.join(self.tmp, "origins.json")
         self.assertEqual(run(["origins", "--root", self.root, "--out", op])[0], 0)
-        od = rqlib.read_json(op)                                                     # (the outcome-free manifest)
+        od = rqlib.read_json(op)
         self.assertEqual(od["origins_sha256"], self.ctx["origins_sha"])
-        self.assertEqual({tuple(x) for x in od["rows"]["validation"]["prefix"]}, fc.stage_rows(self.ctx, {"validation"})[0])
         self.assertFalse(any("z" in o for o in od["origins"]))
-        cats = {(o["category"], o["stage"]) for o in self.ctx["origins"]}
+        cats = {(o["category"], o["stage"]) for o in self.ctx["origins"] if not o["excluded"]}
         for want in (("world_transfer", "validation"), ("world_transfer", "test"), ("forward_time", "validation"),
                      ("forward_time", "test"), ("intersection", "validation"), ("intersection", "test"),
-                     ("snapshot_transfer", "validation"), ("in_sample", "training")):
+                     ("snapshot_transfer", "validation")):
             self.assertIn(want, cats)
-        by = self.ctx["by_id"]
-        self.assertEqual(by["fork:T00:30:4"]["category"], "snapshot_transfer")       # (T00@34 is held out)
-        self.assertEqual(by["fork:V0:185:10"]["stage"], "test")                        # (the test period)
-        self.assertEqual(by["native:T02:146:4"]["stage"], "test")                      # (its target T02@150 is a test holdout)
-        self.assertEqual(by["native:T02:150:1"]["stage"], "test")                      # (... and in this window)
-        self.assertEqual((by["native:T03:191:4"]["stage"], by["native:T03:191:4"]["category"]), ("test", "forward_time"))
         val = [json.loads(ln) for ln in rqlib.read_text(self.val).splitlines()]
         self.assertEqual({ln["stage"] for ln in val}, {"validation"})
-        self.assertTrue(all(sorted(ln["forecasts"]) == ["drift", "lss[0.1]", "lss[100.0]", "persistence"]
-                            for ln in val if ln["available"]))
         prov = val[0]["provenance"]
         self.assertEqual(prov["model_sha256"], rqlib.sha256_file(self.model))
         self.assertEqual(prov["fit_sha256"], rqlib.sha256_file(self.files["fit.json"]))
-        self.assertEqual(prov["prefix_sha256"], rqlib.sha256_file(self.files["val_prefix.json"]))
-        self.assertEqual(prov["config_sha256"], rqlib.sha256_file(os.path.join(self.root, "config", "forecast.json")))
+        self.assertEqual(val[0]["measurement"], {"fit_groups": [f"fit:{w}" for w in TRAIN], "fit_group": None})
         sc = rqlib.read_json(self.scores)
         self.assertEqual(sc["targets_sha256"], rqlib.sha256_file(self.files["val_targets.json"]))
-        rows = [r for r in sc["origins"] if r["available"] and r["primary"] and by[r["target_id"]]["time_role"] == "validation"]
-        self.assertTrue(rows and {by[r["target_id"]]["category"] for r in rows} == {"forward_time", "intersection"})
+        rows = [r for r in sc["origins"] if r["available"] and r["primary"] and r["time_role"] == "validation"
+                and r["stage"] == "validation"]
+        self.assertTrue(rows and {r["category"] for r in rows} == {"forward_time", "intersection"})
         mean = {lam: np.mean([r["metrics"][fc.lss_name(lam)]["mse"] for r in rows]) for lam in (0.1, 100.0)}
         self.assertEqual(sc["selection"]["lambda"], min(mean, key=lambda k: (mean[k], -k)))
         self.assertLess(min(mean.values()), sc["selection"]["reference"]["persistence"])
         mod = rqlib.read_json(self.model)
-        lss01 = next(s for s in mod["lss"] if s["lambda"] == 0.1)                    # (the known system, recovered)
-        self.assertTrue(lss01["converged"] and lss01["monotone"])
+        lss01 = next(s for s in mod["lss"] if s["lambda"] == 0.1)
+        self.assertTrue(lss01["usable"] and lss01["monotone"])
         self.assertLess(np.max(np.abs(np.array(lss01["Theta"])[:, :2] - np.array(A_TRUE))), 0.12)
         self.assertLess(np.max(np.abs(np.array(lss01["Q"]) - np.array(Q_TRUE))), 0.006)
         ev = rqlib.read_json(self.eval)
         self.assertEqual(ev["TEST_PRED_SHA"], rqlib.sha256_file(self.test))
         self.assertEqual(ev["targets_sha256"], rqlib.sha256_file(self.files["test_targets.json"]))
-        self.assertEqual(ev["lambda"], sc["selection"]["lambda"])
+        self.assertEqual(ev["scoring"]["implementation_sha256"], rqlib.sha256_file(self.impl))
+        self.assertIn("environment", ev["scoring"])
         keys = set(ev["pooled"])
-        for k in ("test/intersection/fork/H10/lss", "test/world_transfer/fork/H10/lss", "test/forward_time/native/H10/lss",
-                  "test/intersection/native/H10/lss", "training/in_sample/fork/H10/lss"):
-            self.assertIn(k, keys)
+        v0 = "test/validation/validation/test/intersection/fork/H10/lss"                # (V0: fed the lambda selection)
+        s0 = "test/test/test/test/intersection/fork/H10/lss"                            # (S0, S1: held out throughout)
+        self.assertIn(v0, keys)
+        self.assertIn(s0, keys)
+        self.assertEqual((ev["pooled"][v0]["worlds"], ev["pooled"][s0]["worlds"]), (1, 2))
+        self.assertIn("test/training/training/test/forward_time/fork/H10/lss", keys)
         for v in ev["pooled"].values():
             self.assertIn(v["category"], fc.CATEGORIES)
         s1 = next(r for r in ev["origins"] if r["target_id"] == "fork:S1:185:10")["metrics"]["lss"]
         self.assertEqual((s1["events"]["extinction"], s1["reseeds"]), (1, 3))
-        s0 = next(r for r in ev["origins"] if r["target_id"] == "fork:S0:185:4")["metrics"]["lss"]
-        self.assertEqual((s0["unavailable"], s0["reseeds"]), (1, 3))
-        s2 = {r["target_id"]: r for r in ev["origins"] if r["target_id"] in ("native:S2:188:4", "native:S2:190:1")}
-        self.assertFalse(s2["native:S2:190:1"]["available"])                             # (S2 extinct at 190: its window)
-        m2 = s2["native:S2:188:4"]["metrics"]["lss"]                                      # (... its target: absorbed)
-        self.assertEqual((m2["events"]["extinction"], m2["live"], m2["mse"]), (1, 0, None))
+        s0r = next(r for r in ev["origins"] if r["target_id"] == "fork:S0:185:4")["metrics"]["lss"]
+        self.assertEqual((s0r["unavailable"], s0r["reseeds"]), (1, 3))
+
+    def test_reproducible(self):
+        """The same bytes and environment give byte-identical outputs at every stage."""
+        root = self.copy(self.base)
+        mo, vo = os.path.join(self.tmp, "m2.json"), os.path.join(self.tmp, "v2.jsonl")
+        self.assertEqual(run(["predict-candidates", "--root", root, "--fit", self.files["fit.json"], "--prefix",
+                              self.files["val_prefix.json"], "--model-out", mo, "--out", vo])[0], 0)
+        self.assertEqual((rqlib.read_bytes(mo), rqlib.read_bytes(vo)), (rqlib.read_bytes(self.model), rqlib.read_bytes(self.val)))
+        so = os.path.join(self.tmp, "s2.json")
+        self.assertEqual(run(["score-validation", "--root", self.copy(self.committed), "--predictions", self.val,
+                              "--targets", self.files["val_targets.json"], "--out", so])[0], 0)
+        self.assertEqual(rqlib.read_bytes(so), rqlib.read_bytes(self.scores))
+        to = os.path.join(self.tmp, "t2.jsonl")
+        self.assertEqual(run(["predict-test", "--root", self.copy(self.opened), "--prefix", self.files["test_prefix.json"],
+                              "--model", self.model, "--selection", self.scores, "--out", to])[0], 0)
+        self.assertEqual(rqlib.read_bytes(to), rqlib.read_bytes(self.test))
+        eo = os.path.join(self.tmp, "e2.json")
+        self.assertEqual(run(["evaluate-test", "--root", self.copy(self.root), "--predictions", self.test, "--targets",
+                              self.files["test_targets.json"], "--out", eo])[0], 0)
+        self.assertEqual(rqlib.read_bytes(eo), rqlib.read_bytes(self.eval))
 
     def test_fit_guards(self):
         """P1-1 / P1-2: the fit refuses rows past the cutoff, of held-out worlds, held-out snapshots, fork
@@ -555,25 +700,28 @@ class TestPipeline(unittest.TestCase):
         r120, _ = make_root(d, {"map": {"cutoff": 120, "reference_frame_max": 100 * M}})
         c120 = fc.load_ctx(r120)
         with self.assertRaisesRegex(fc.ForecastError, "references reach"):
-            fc.load_profiles(c120, fit, "x" * 64, "fit")
+            fc.load_profiles(c120, fit, "x" * 64, "fit", fc.fit_admit(c120))
 
     def test_embargo_guards(self):
         """P1-3: predict-candidates takes no targets; a prefix holding any row outside the stage's registered
-        windows (a target, another stage's row) is refused, as is a missing window row; score-validation
-        refuses target rows of another stage, missing targets and substituted futures."""
+        windows is refused on its IDENTITY, before any of its values is read (a target row whose z is not even
+        numeric is refused as a membership violation), as is a missing window row; score-validation refuses
+        target rows of another stage, missing targets and substituted futures."""
         root = self.copy(self.base)
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             fc.main(["predict-candidates", "--root", root, "--fit", "f", "--prefix", "p", "--model-out", "m", "--out", "o",
                      "--targets", "t"])
         pre = rqlib.read_json(self.files["val_prefix.json"])
         out = os.path.join(self.tmp, "y.jsonl")
-        for extra, why in ((self.rows[("T05", 160)], "not registered prefix rows"),       # (a validation target only)
-                           (self.rows[("S0", 182)], "not registered prefix rows")):       # (a test-stage row)
+        for extra, why in ((dict(self.rows[("T05", 160)], z="SECRET"), "may not be read at this stage"),
+                           (self.rows[("T05", 151)], "not a registered prefix row"),        # (a validation target)
+                           (self.rows[("S0", 182)], "not a registered prefix row")):        # (a test-stage row)
             p2 = self.put("prefix.json", dict(pre, rows=pre["rows"] + [extra]))
             rc, err = run(["predict-candidates", "--root", root, "--fit", self.files["fit.json"], "--prefix", p2,
                            "--model-out", os.path.join(self.tmp, "m.json"), "--out", out])
             self.assertEqual(rc, 2)
             self.assertIn(why, err)
+            self.assertNotIn("not numeric", err)
         p2 = self.put("prefix.json", dict(pre, rows=pre["rows"][1:]))
         rc, err = run(["predict-candidates", "--root", root, "--fit", self.files["fit.json"], "--prefix", p2,
                        "--model-out", os.path.join(self.tmp, "m.json"), "--out", out])
@@ -581,8 +729,8 @@ class TestPipeline(unittest.TestCase):
         root = self.copy(self.committed)
         tg = rqlib.read_json(self.files["val_targets.json"])
         sc = os.path.join(self.tmp, "sc.json")
-        for rows, why in ((tg["rows"] + [self.rows[("S1", 195)]], "not targets of the committed"),     # (a test target)
-                          (tg["rows"] + [dict(self.rows[(bid("V0", 30, 1), 34)], t=35)], "not targets"),  # (no such future)
+        for rows, why in ((tg["rows"] + [self.rows[("S1", 195)]], "not a target of the committed"),
+                          (tg["rows"] + [dict(self.rows[(bid("V0", 30, 1), 34)], t=35)], "not a target"),
                           (tg["rows"][:-1], "missing")):
             t2 = self.put("targets.json", dict(tg, rows=rows))
             rc, err = run(["score-validation", "--root", root, "--predictions", self.val, "--targets", t2, "--out", sc])
@@ -590,32 +738,61 @@ class TestPipeline(unittest.TestCase):
             self.assertIn(why, err)
         self.assertFalse(os.path.exists(sc))
 
+    def test_source_structure(self):
+        """Codex r2 P2-5: a measurement group shared with PART of the fit is an unsupported source structure:
+        a window in it makes its origin unavailable with the reason (the fixture's snapshot-transfer fork
+        origin, whose window is fitting rows; here also a training world's later rows put in its fitting
+        group), and a target in it is refused at scoring."""
+        val = {ln["target_id"]: ln for ln in map(json.loads, rqlib.read_text(self.val).splitlines())}
+        self.assertFalse(val["fork:T00:30:4"]["available"])
+        self.assertIn("shared with part of the fit", val["fork:T00:30:4"]["reason"])
+        root = self.copy(self.base)
+        pre = rqlib.read_json(self.files["val_prefix.json"])
+        for r in pre["rows"]:
+            if r["world"] == "T05" and "z" in r:
+                r["meas_group"] = "fit:T05"
+        p2, vo = self.put("prefix.json", pre), os.path.join(self.tmp, "v3.jsonl")
+        rc, err = run(["predict-candidates", "--root", root, "--fit", self.files["fit.json"], "--prefix", p2,
+                       "--model-out", os.path.join(self.tmp, "m3.json"), "--out", vo])
+        self.assertEqual(rc, 0, err)
+        t05 = [json.loads(x) for x in rqlib.read_text(vo).splitlines() if '"world":"T05"' in x]
+        self.assertTrue(t05 and all(not ln["available"] and "shared with part of the fit" in ln["reason"] for ln in t05))
+        root = self.copy(self.committed)
+        tg = rqlib.read_json(self.files["val_targets.json"])
+        for r in tg["rows"]:
+            if r["world"] == "T05" and "z" in r:
+                r["meas_group"] = "fit:T05"
+        rc, err = run(["score-validation", "--root", root, "--predictions", self.val, "--targets",
+                       self.put("t.json", tg), "--out", os.path.join(self.tmp, "s3.json")])
+        self.assertEqual(rc, 2)
+        self.assertIn("shared with part of the fit", err)
+
     def test_commitment_guards(self):
-        """P1-4 / P1-5: scoring needs the committed bytes (no marker; other bytes refused); predict-test needs
-        the scores recorded by open-validation and the model they name; evaluate-test needs the public freeze
-        and the committed test predictions, and scores the verified bytes even if the file changes after the
-        gate. The candidate file is sealing's commit format."""
+        """P1-4 / P1-5: scoring needs the committed bytes; predict-test needs the scores recorded by open-
+        validation and the model they name; evaluate-test needs the public freeze and the committed test
+        predictions, and scores the verified bytes even if the file changes after the gate. Codex r2 P1-3:
+        the validation-evaluation record substituted BEFORE the gate is refused; substituted AFTER it, the
+        verified record is the one checked."""
         sc = os.path.join(self.tmp, "sc2.json")
         rc, err = run(["score-validation", "--root", self.copy(self.precommit), "--predictions", self.val, "--targets",
                        self.files["val_targets.json"], "--out", sc])
         self.assertIn("no VAL_PRED_SHA", err)
         root = self.copy(self.committed)
-        data = rqlib.read_text(self.val)
-        v2 = self.put("val.jsonl", data.replace('"available":true', '"available":true ', 1))
+        v2 = self.put("val.jsonl", rqlib.read_text(self.val).replace('"available":true', '"available":true ', 1))
         rc, err = run(["score-validation", "--root", root, "--predictions", v2, "--targets", self.files["val_targets.json"],
                        "--out", sc])
         self.assertIn("not the committed validation predictions", err)
-        t2 = os.path.join(self.tmp, "t2.jsonl")
+        t2 = os.path.join(self.tmp, "t2x.jsonl")
         rc, err = run(["predict-test", "--root", root, "--prefix", self.files["test_prefix.json"], "--model", self.model,
                        "--selection", self.scores, "--out", t2])
         self.assertIn("not recorded", err)
         root = self.copy(self.opened)
-        s2 = self.put("val_scores.json", dict(rqlib.read_json(self.scores), selection=dict(
-            rqlib.read_json(self.scores)["selection"], **{"lambda": 100.0 if rqlib.read_json(self.scores)["selection"]["lambda"] == 0.1 else 0.1})))
+        s = rqlib.read_json(self.scores)
+        s2 = self.put("val_scores.json", dict(s, selection=dict(s["selection"], **{"lambda": 100.0 if s["selection"]["lambda"] == 0.1 else 0.1})))
         rc, err = run(["predict-test", "--root", root, "--prefix", self.files["test_prefix.json"], "--model", self.model,
                        "--selection", s2, "--out", t2])
         self.assertIn("not the validation scores recorded", err)
-        m2 = self.put("model.json", rqlib.read_text(self.model).replace('"converged":true', '"converged":true ', 1))
+        m2 = self.put("model.json", rqlib.read_text(self.model).replace('"usable":true', '"usable":true ', 1))
         rc, err = run(["predict-test", "--root", root, "--prefix", self.files["test_prefix.json"], "--model", m2,
                        "--selection", self.scores, "--out", t2])
         self.assertIn("not the model state", err)
@@ -627,13 +804,27 @@ class TestPipeline(unittest.TestCase):
         rc, err = run(["evaluate-test", "--root", self.copy(self.root), "--predictions", fresh, "--targets",
                        self.files["test_targets.json"], "--out", ev])
         self.assertIn("not the committed test predictions", err)
+        # the validation-evaluation record, BEFORE the gate
+        root = self.copy(self.root)
+        vp = os.path.join(root, "registration", "validation_evaluation.json")
+        rec = rqlib.read_json(vp)
+        os.chmod(vp, 0o644)
+        rqlib.write_durable(vp, rqlib.canonical(dict(rec, scores_sha256="0" * 64)))
+        rc, err = run(["evaluate-test", "--root", root, "--predictions", self.test, "--targets",
+                       self.files["test_targets.json"], "--out", ev])
+        self.assertEqual(rc, 2)
+        self.assertIn("not the validation evaluation the freeze recorded", err)
+        # ... AFTER the gate (and the predictions file too): the verified bytes are the ones used
         root = self.copy(self.root)
         tp = self.put("test.jsonl", rqlib.read_text(self.test))
         real = sealing.require_test_freeze
 
-        def gate_then_swap(study, pred_path, script):
-            got = real(study, pred_path, script)
-            wr(pred_path, "garbage\n")                                          # (replaced after the gate)
+        def gate_then_swap(study, pred_path, script, script_bytes=None):
+            got = real(study, pred_path, script, script_bytes=script_bytes)
+            wr(pred_path, "garbage\n")
+            v = os.path.join(study, "registration", "validation_evaluation.json")
+            os.chmod(v, 0o644)
+            rqlib.write_durable(v, rqlib.canonical(dict(rqlib.read_json(v), scores_sha256="0" * 64)))
             return got
         sealing.require_test_freeze = gate_then_swap
         try:
@@ -644,43 +835,89 @@ class TestPipeline(unittest.TestCase):
         self.assertEqual(rc, 0, err)
         self.assertEqual(rqlib.read_json(ev)["TEST_PRED_SHA"], rqlib.sha256_file(self.test))
 
+    def _evaluate_subprocess(self, script, env_pylib):
+        env = dict(os.environ)
+        if env_pylib is None:
+            env.pop("RQ_PYLIB", None)
+        else:
+            env["RQ_PYLIB"] = env_pylib
+        ev = os.path.join(tempfile.mkdtemp(dir=self.tmp), "ev.json")
+        p = subprocess.run([sys.executable, "-I", script, "evaluate-test", "--root", self.copy(self.root), "--predictions",
+                            self.test, "--targets", self.files["test_targets.json"], "--out", ev],
+                           env=env, capture_output=True, text=True)
+        return p.returncode, p.stderr
+
+    def test_implementation_freeze(self):
+        """Codex r2 P1-2: the freeze covers the implementation as LOADED: the unchanged tool evaluates in a
+        fresh process; a copy of the tool whose imported helper (staging.py) differs by one comment is
+        refused, as is the original tool with an RQ_PYLIB directory shadowing rqlib.py."""
+        pylib = os.environ.get("RQ_PYLIB")
+        rc, err = self._evaluate_subprocess(os.path.join(HERE, "forecast.py"), pylib)
+        self.assertEqual(rc, 0, err)
+        tools = os.path.join(tempfile.mkdtemp(dir=self.tmp), "tools")
+        os.makedirs(tools)
+        for n in ("forecast.py", "staging.py", "sealing.py", "rqlib.py"):
+            shutil.copy(os.path.join(HERE, n), tools)
+        with open(os.path.join(tools, "staging.py"), "a") as f:
+            f.write("\n# a changed helper\n")
+        rc, err = self._evaluate_subprocess(os.path.join(tools, "forecast.py"), pylib)
+        self.assertEqual(rc, 2)
+        self.assertIn("not the frozen evaluation script", err)
+        shadow = os.path.join(tempfile.mkdtemp(dir=self.tmp), "pylib")
+        os.makedirs(shadow)
+        if pylib:
+            for n in os.listdir(pylib):
+                if n != "rqlib.py":
+                    os.symlink(os.path.join(pylib, n), os.path.join(shadow, n))
+        with open(os.path.join(HERE, "rqlib.py")) as f:
+            src = f.read()
+        wr(os.path.join(shadow, "rqlib.py"), src + "\n# a shadowing copy\n")
+        rc, err = self._evaluate_subprocess(os.path.join(HERE, "forecast.py"), shadow)
+        self.assertEqual(rc, 2)
+        self.assertIn("not the frozen evaluation script", err)
+
     def test_panel_verification(self):
         """P2-13: the registered fork panel: a dropped branch, an unregistered branch, a branch row with
         another branch's identity, a future at an unregistered horizon are refused; invalid covariances
-        (asymmetric, not PSD, non-finite; a shared component larger than the row's) are refused."""
+        are refused; Codex r2 P2-7: contradictory rows (a profile with an absorbing event, an event with an
+        unavailable reason, a profile with an unavailable reason) are refused."""
         root = self.copy(self.root)
         tg = rqlib.read_json(self.files["test_targets.json"])
         ev = os.path.join(self.tmp, "ev3.json")
         b0, b1 = bid("S0", 185, 0), bid("S0", 185, 1)
         k1 = next(i for i, r in enumerate(tg["rows"]) if r["world"] == b1 and r["t"] == 195)
+        ke = next(i for i, r in enumerate(tg["rows"]) if r["world"] == bid("S1", 185, 2) and r["t"] == 195)
 
         def variant(fn):
             rows = json.loads(json.dumps(tg["rows"]))
             fn(rows)
             return self.put("targets.json", dict(tg, rows=rows))
-        bad_cov = [[0.003, 0.001], [0.0, 0.003]]
         cases = [(lambda rs: rs.pop(k1), "missing"),
                  (lambda rs: rs.append(dict(rs[k1], world="S0.o185M.s9", uuid=None)), "not in the split manifest"),
                  (lambda rs: rs[k1].update(uuid=buuid(b0)), "UUID"),
-                 (lambda rs: rs.append(dict(rs[k1], t=190)), "not targets"),
-                 (lambda rs: rs[k1].update(cov=bad_cov), "not symmetric"),
+                 (lambda rs: rs.append(dict(rs[k1], t=190)), "not a target"),
+                 (lambda rs: rs[k1].update(cov=[[0.003, 0.001], [0.0, 0.003]]), "not symmetric"),
                  (lambda rs: rs[k1].update(cov=[[0.003, 0.0], [0.0, -0.001]]), "positive semidefinite"),
                  (lambda rs: rs[k1].update(cov=[[float("nan"), 0.0], [0.0, 0.003]]), "finite"),
                  (lambda rs: rs[k1].update(cov=[[0.0005, 0.0], [0.0, 0.0005]]), "shared component"),
-                 (lambda rs: rs[k1].update(unavailable="assay failed"), "at once")]
+                 (lambda rs: rs[k1].update(unavailable="assay failed"), "a profile and an unavailable reason"),
+                 (lambda rs: rs[k1].update(events={"extinction": True}), "a profile and an absorbing event"),
+                 (lambda rs: rs[ke].update(unavailable="assay failed"), "an absorbing event and an unavailable")]
         for fn, why in cases:
             rc, err = run(["evaluate-test", "--root", root, "--predictions", self.test, "--targets", variant(fn), "--out", ev])
             self.assertEqual(rc, 2, why)
             self.assertIn(why, err)
 
-    def test_config_and_classification(self):
+    def test_config_registry_and_classification(self):
         """P1-7: horizons and the primary come from the registered configuration (bound to the fork registry);
         the separation is checked; counts must be positive; a registered configuration is never replaced and
-        follows no candidate. A forward-time window crossing the separation is excluded."""
+        follows no candidate. Codex r2 P2-6: the fork registry is read once, and a replaced registry is
+        refused. Codex r2 P1-1: a registration that is not target-disjoint is refused."""
         for over, why in (({"primary": 4}, "fork registry's horizon"),
                           ({"temporal": {"validation": [131, 160]}}, "separation"),
                           ({"evaluation": {"bootstrap": 0}}, "bootstrap"),
-                          ({"horizons": [10, 4]}, "ascending")):
+                          ({"horizons": [10, 4]}, "ascending"),
+                          ({"temporal": {"inputs_through": {"validation": 155, "test": 190}}}, "inputs_through")):
             d = tempfile.mkdtemp(dir=self.tmp)
             with self.assertRaisesRegex(fc.ForecastError, why):
                 make_root(d, over)
@@ -689,20 +926,37 @@ class TestPipeline(unittest.TestCase):
         cp = self.put("cfg.json", dict(cfg, window=4))
         with self.assertRaisesRegex(fc.ForecastError, "never replaced"):
             fc.register(root, cp)
-        fc.register(root, self.cfg_path)                                           # (the same bytes: accepted)
+        fc.register(root, self.cfg_path)
         d = tempfile.mkdtemp(dir=self.tmp)
         r2, c2 = make_root(d, register=False)
         os.makedirs(os.path.join(r2, "registration"), exist_ok=True)
         wr(os.path.join(r2, "registration", "VAL_PRED_SHA"), "0" * 64 + "\n")
         with self.assertRaisesRegex(fc.ForecastError, "before the candidates"):
             fc.register(r2, c2)
+        # the fork registry: read exactly once per context; replaced bytes refused
+        reads, real = [], rqlib.read_bytes
+
+        def counting(p):
+            reads.append(os.path.basename(p))
+            return real(p)
+        rqlib.read_bytes = counting
+        try:
+            fc.load_ctx(root)
+        finally:
+            rqlib.read_bytes = real
+        self.assertEqual((reads.count("forks.json"), reads.count("splits.json"), reads.count("forecast.json")), (1, 1, 1))
+        fp = os.path.join(root, "config", "forks.json")
+        forks = rqlib.read_json(fp)
+        forks["worlds"] = [b for b in forks["worlds"] if b["id"] != bid("S0", 185, 3)]
+        wr(fp, rqlib.canonical(forks).decode())
+        with self.assertRaisesRegex(fc.ForecastError, "not the registered fork registry"):
+            fc.load_ctx(root)
+        # a registration whose fork windows hold native targets is not target-disjoint
         d = tempfile.mkdtemp(dir=self.tmp)
-        r3, _ = make_root(d, {"temporal": {"test": [182, 200]}})
-        c3 = fc.load_ctx(r3)
-        self.assertIn("crosses the registered separation", c3["by_id"]["fork:S0:185:10"]["excluded"])
-        pre, tgt = fc.stage_rows(c3, {"test"})
-        self.assertNotIn((bid("S0", 185, 0), 195), tgt)                             # (excluded: its targets never read)
-        self.assertNotIn(("S0", 181), pre)
+        with self.assertRaisesRegex(fc.ForecastError, "not target-disjoint"):
+            make_root(d, {"temporal": {"validation": [141, 160], "test": [176, 200], "separation": 15,
+                                       "inputs_through": {"validation": 150, "test": 182}}})
+            fc.load_ctx(os.path.join(d, "root"))
 
 
 if __name__ == "__main__":

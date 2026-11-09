@@ -8,65 +8,78 @@ Only three forecasters are registered (the neural and nearest-trajectory / nonli
   lss          regularized stochastic LINEAR state-space dynamics z(s+1) = A z(s) + B x(s) + c + w,
                w ~ N(0, Q); y(s) = z(s) + v(s), v ~ N(0, R(s)) (R the profile's posterior covariance, v4 §10.1).
 
-REGISTERED ARTIFACTS (staging.py: one commitment ROOT per analysis). ROOT/config/splits.json (the split
-manifest, built WITH the fork registry), ROOT/config/forks.json (forks.py's registry) and ROOT/config/
-forecast.json, the ANALYSIS CONFIGURATION (finfolk.redqueen.forecastcfg/1, `register`: published once,
-before any candidate): the sha256s of the manifest and the fork registry; the profile "channels" (the
-outcome coordinates, d = their number) and the absorbing "events" (e.g. extinction: counted, never in a
-profile metric; nothing assumes coexistence beyond a row carrying a profile); the "covariates"; the "window"
-(5); the pilot-resolved "horizons" and the "primary" horizon (M; the primary must be the fork registry's
-horizon); the "temporal" policy {fit_through 120, validation [141, 160], test [181, 200], separation 20};
-the "map" provenance limits {cutoff (the time-limited map's last fitted time), reference_frame_max (null,
-or 120M for the references-at-or-before-120M repeat)}; "lss" {lambdas, initial_state, em_iters, em_tol};
-"evaluation" {bootstrap, energy_draws, seed_namespace}.
+REGISTERED ARTIFACTS (staging.py: one commitment ROOT per analysis, each artifact read ONCE and built from
+the verified bytes). ROOT/config/splits.json (the split manifest, built WITH the fork registry), ROOT/config/
+forks.json (forks.py's registry) and ROOT/config/forecast.json, the ANALYSIS CONFIGURATION (finfolk.redqueen.
+forecastcfg/1, `register`: published once, before any candidate): the sha256s of the manifest and the fork
+registry; the profile "channels" (the outcome coordinates, d = their number) and the absorbing "events" (e.g.
+extinction); the "covariates"; the "window" (5); the pilot-resolved "horizons" and the "primary" horizon (M;
+the primary must be the fork registry's horizon); the "temporal" policy {fit_through 120, validation [141,
+160], test [181, 200], separation 20, inputs_through {validation 150, test 190}}; the "map" provenance limits
+{cutoff, reference_frame_max (null, or 120M for the references-at-or-before-120M repeat)}; "lss" {lambdas,
+initial_state, em_iters, em_tol}; "evaluation" {bootstrap, energy_draws, seed_namespace}.
 
-REGISTERED ORIGINS (outcome-free, derived by rule; `origins` prints them). FORK origins: every main fork
-origin of the registry (root, t0) x every registered horizon, its panel the registered branches k = 0 ..
-seeds-1 (identities bound to the manifest) plus the original continuation. NATIVE origins: every native-
-panel world x horizon x t0 whose window and target lie inside the registered validation or test period.
-Each origin is CLASSIFIED: its time role (fit <= fit_through / validation / test / separation), its world
-role (the root's split), its STAGE (the most held-out of the target's role, its window rows' roles -
-holdout snapshots included - and the time role of a forward-time target) and its CATEGORY (v4 §7.3):
-world_transfer (a held-out world, target outside the forward periods), forward_time (a training world,
-target in a forward period), intersection (both), snapshot_transfer (a training world's held-out snapshot),
-in_sample (training: a diagnostic only). A forward-time window crossing the separation into its period, and
-a training world's target inside a separation, are EXCLUDED (recorded, never forecast).
+REGISTERED ORIGINS: TARGET-DISJOINT (outcome-free, derived by rule; `origins` prints them). FORK origins:
+every main fork origin of the registry (root, t0) x every registered horizon, its panel the registered
+branches k = 0 .. seeds-1 (identities bound to the manifest) plus the original continuation. NATIVE origins:
+every native-panel world x horizon x t0 whose window ends at or before the period's inputs_through and whose
+target lies after it, inside the registered validation or test period. EXCLUDED (recorded, never forecast):
+a native origin whose window holds a fork origin's target row (the fork panels take precedence); an
+in-sample origin (its target is a fitting row); a forward-time window crossing the separation; a training
+world's target inside a separation. The registration is then VERIFIED target-disjoint: no stage's prefix row
+is a target of that stage, no validation prefix row is a test target, no target is a fitting row; a
+registration that is not is refused. So no stage ever reads one of its own targets before its commitment.
+Each origin is CLASSIFIED: its time role (fit <= fit_through / validation / test / separation), its WORLD
+role (the root's split), its TARGET role (the most held-out of the target rows' roles, holdouts included),
+its STAGE (the most held-out of the target role, its window rows' roles and the time role of a forward-
+time target) and its CATEGORY (v4 §7.3): world_transfer (a held-out world, target outside the forward
+periods), forward_time (a training world, target in a forward period), intersection (both),
+snapshot_transfer (a training world's held-out snapshot).
 
-STAGES (each refuses what it may not read; sealing.py between them):
+STAGES (each refuses what it may not read, identities checked before any value is used; sealing.py between):
   register            publish ROOT/config/forecast.json (validated; refused after VAL_PRED_SHA).
-  predict-candidates  reads the FIT profiles (only training-role native rows at t <= fit_through: any other
-                      row refuses the document) and the validation stage's PREFIX profiles (exactly the
-                      window rows of its registered origins: any other row refuses the document); never a
-                      target. Fits (standardizer, dynamics, error covariances: fit rows only; every lambda),
-                      writes the fitted model state (--model-out) and the candidate predictions of every
-                      validation-stage origin (persistence, drift, lss at every lambda) as sealing JSONL
-                      (one "target_id" per line).
+  predict-candidates  reads the FIT profiles (only training-role native rows at t <= fit_through) and the
+                      validation stage's PREFIX profiles (exactly its registered window rows); never a target.
+                      Fits (standardizer, dynamics, error covariances: fit rows only; every lambda), writes the
+                      fitted model state (--model-out) and the candidate predictions of every validation-stage
+                      origin (persistence, drift, lss at every lambda) as sealing JSONL (one target_id a line).
   (sealing.py commit --study ROOT --stage validation --predictions VAL.jsonl)
   score-validation    the committed bytes (VAL_PRED_SHA) and ONLY the validation stage's target rows;
                       selects lambda on the registered selection set (validation stage, target in the
                       validation period, primary horizon; ties to the larger lambda), scores everything.
   (sealing.py open-validation --study ROOT --scores VAL_SCORES.json)
   predict-test        the recorded selection, the model state it names (no refit) and the test stage's
-                      prefix rows -> the test (and in-sample training) predictions.
-  (sealing.py commit --stage test --eval-script forecast.py; sealing.py freeze ...)
-  evaluate-test       sealing.require_test_freeze (eval script = this file) and the verified bytes it returns;
-                      the test stage's target rows only.
-ROLLING ORIGINS: inside a forward period a row can be a window row of a later origin and the target of an
-earlier one. Each prediction is a function of its own window alone (the forecasters receive nothing else),
-the fit never sees forward-period rows, and no stage summarizes a prefix row as an outcome before its
-commitment; prefix rows are read only as the registered prediction inputs.
+                      prefix rows -> the test predictions.
+  implementation      the evaluator's implementation manifest (staging.implementation_manifest: this script,
+                      staging, sealing, rqlib as LOADED, the interpreter and numpy): commit and freeze it as
+                      the evaluation script (sealing.py commit --stage test --eval-script IMPL.json; freeze).
+  evaluate-test       sealing.require_test_freeze against the manifest recomputed in-process, then the
+                      verified bytes (predictions and validation-evaluation record) and the test stage's
+                      target rows only; the scoring environment is recorded.
 
 PROFILES (finfolk.redqueen.profiles/2): "channels", "map" {cutoff, fit_sha256, references {sha256,
 max_frame}} (one map for every document of an analysis), "measurement" {"shared": {group: S}} and "rows":
-{world, t (M), uuid?, snapshot?} plus EXACTLY one of: a profile (z, cov; covariates for fit / prefix rows;
-"meas_group"), an absorbing event ("events": {name: true}) or an explicit "unavailable" reason. A fork
-branch's row is its own id at the target time. Split / role labels are refused.
-MEASUREMENT MODEL. A profile's error v has covariance R; two profiles in the same measurement group (shared
-reference panel / donor seeds, plan.py) share the component S_g: Cov(v_a, v_b) = S_g, else 0 (null group:
-independent). Every forecaster is affine in its window measurements with gain G_s, so the prediction-target
-measurement cross-covariance is C = Cov(Z_hat, v_f) = sum_s G_s Cov(v_s, v_f); it is recorded per group.
-(The lss filter's WORKING model takes each profile's error as independent over time, variance R(s); the
-shared component enters the evaluation exactly, through the gains, not the EM likelihood.)
+{world, t (M), uuid?, snapshot?} plus EXACTLY ONE of: a profile (z, cov; covariates for fit / prefix rows;
+"meas_group"; no event true), an absorbing event ("events": {name: true}) or an explicit "unavailable"
+reason. A fork branch's row is its own id at the target time. Split / role labels are refused.
+
+THE MEASUREMENT SOURCE STRUCTURE. A profile's error v = u_g + e has covariance R; u_g is the component it
+shares with every other profile of its measurement group g (covariance S_g: shared reference panel / donor
+seeds, plan.py); e is its own; a null group is independent. Two structures are supported, and VERIFIED on
+every prediction input and every target: (a) the group is absent from the fit (independent of the fitted
+parameters); (b) the group is the fit's ONLY group (every fitting profile shares that one component). Then
+the penalized fit is translation-equivariant: shifting every fitting profile by u moves only the intercept,
+c -> c + (I - A) u, so lss's dependence on u through the fit is K = (d z_hat / d c)(I - A). Any other overlap
+(a group shared with part of the fit) is refused. Every forecaster is affine in its window measurements
+(gains G_s), so with L_g = sum over window rows in g of G_s (+ K for the fit's group, lss):
+  Cov(z_hat, v_f) = L_g S_g for a target in group g (the recorded "cross");
+  the latent forecast-error covariance under that structure (the recorded "cov"): lss: P_work + sum_g
+  (L_g S_g L_g' - sum_{s in g} G_s S_g G_s'), with P_work the working filter's (independent-error)
+  covariance; persistence / drift: P_state + sum_s G_s (R_s - S_g(s)) G_s' + sum_g L_g S_g L_g', with
+  P_state their fit rows' native H-step state-error covariance (the empirical error covariance minus
+  mean(R_T + measurement part - C - C'), PSD-clipped).
+The lss FIT itself is a working model: its EM likelihood takes each profile's error as independent over
+time; the structure above enters the forecast covariance and every scored quantity.
 
 THE STATE-SPACE MODEL. Initial state: the registered prior, "diffuse" (the exact limit: z(0) | y(0) ~
 N(y(0), R(0)); y(0) conditions once and its improper term leaves the likelihood) or "proper" N(m0, P0)
@@ -74,11 +87,10 @@ N(y(0), R(0)); y(0) conditions once and its improper term leaves the likelihood)
 minus lambda/2 tr[Q^-1 (Theta - Theta0) D (Theta - Theta0)'] (Theta = [A B c], Theta0 = [I 0 0], D = diag(1..1,
 0): A toward I, B toward 0, the intercept free), maximized exactly by the M-step Theta = (S10 + lambda Theta0 D)
 (S00 + lambda D)^-1, Q = (S11 - Theta S10' - S10 Theta' + Theta S00 Theta' + lambda (Theta - Theta0) D (Theta -
-Theta0)') / n; convergence and monotonicity are monitored on that penalized objective; a lambda that does
-not converge in em_iters is unavailable. Forecast: filter the window, then H steps with the covariates
-held at their last value.
-PREDICTIVE COVARIANCE: lss its model's; persistence and drift the fit rows' native H-step error covariance
-minus mean(R_f - C_f - C_f'), PSD-clipped (the latent error covariance).
+Theta0)') / n. NUMERICAL-FAILURE POLICY: a lambda whose EM does not converge in em_iters, or whose penalized
+objective DECREASES at any iteration (by more than 1e-9 relative), is UNAVAILABLE (its diagnostic recorded);
+it is never selected or forecast with. Forecast: filter the window, then H steps with the covariates held at
+their last value.
 
 EVALUATION (per origin and forecaster; y_f the measured futures, R_f their covariances, C_f the cross-
 covariance with the forecast, S0 the mean shared covariance between distinct futures):
@@ -87,22 +99,25 @@ covariance with the forecast, S0 the mean shared covariance between distinct fut
   REDUCIBLE  MSE - V_fork: error reducible given the saved state under reseeding (negative values kept;
              never split into representation loss and learning error); the original continuation joins
              the reseeds in the exchangeability-qualified "with_original" sensitivity;
-  supporting the energy score (seeded Monte Carlo from N(z_hat, P + R_f - C_f - C_f')) and calibration (PIT
-             of the Mahalanobis distance through the chi-square CDF; 50% / 90% coverage).
+  supporting the energy score (seeded Monte Carlo from N(z_hat, cov + R_f - C_f - C_f')) and calibration
+             (PIT of the Mahalanobis distance through the chi-square CDF; 50% / 90% coverage).
 Fork panels are verified: every registered branch and the original continuation present exactly once
 (a profile, an absorbing event or an explicit unavailable), identities bound, covariances valid.
-Pooled per STAGE x CATEGORY x KIND x HORIZON x FORECASTER, never across them, with a root-world cluster
-bootstrap (Annex H.0.4 quantiles). Twelve root worlds and 36 origins are not 144 independent replicates;
-ten-million-step forks do not establish long-horizon predictability.
+POOLED per STAGE x WORLD ROLE x TARGET ROLE x TIME ROLE x CATEGORY x KIND x HORIZON x FORECASTER, never
+across them (a validation-root world that fed the lambda selection never pools with a test-root world), with
+a root-world cluster bootstrap (Annex H.0.4 quantiles). Twelve root worlds and 36 origins are not 144
+independent replicates; ten-million-step forks do not establish long-horizon predictability.
 PROVENANCE: every prediction line binds the configuration, manifest, fork registry, origins, map,
-measurement table, fit rows (bytes and identities), prefix, model state (with the implementation and the
-numerical environment) and, for test, the selection; every score records its scoring-input fingerprint.
+measurement table, fit rows (bytes, identities, groups), prefix, model state (with the implementation
+manifest and the fitting environment) and, for test, the selection; every score records its scoring-input
+fingerprint, the implementation manifest and the scoring environment.
 
     forecast.py register --root ROOT --config forecast.json
     forecast.py origins --root ROOT --out origins.json
     forecast.py predict-candidates --root ROOT --fit fit.json --prefix val_prefix.json --model-out model.json --out val.jsonl
     forecast.py score-validation --root ROOT --predictions val.jsonl --targets val_targets.json --out val_scores.json
     forecast.py predict-test --root ROOT --prefix test_prefix.json --model model.json --selection val_scores.json --out test.jsonl
+    forecast.py implementation --out impl.json
     forecast.py evaluate-test --root ROOT --predictions test.jsonl --targets test_targets.json --out eval.json
 """
 from __future__ import annotations
@@ -135,7 +150,9 @@ CATEGORIES = ("world_transfer", "forward_time", "intersection", "snapshot_transf
 PERIODS = ("validation", "test")
 UNIT = staging.UNIT
 LOG2PI = math.log(2 * math.pi)
-TOL = 1e-10
+MONO_TOL = 1e-9
+LINE_KEYS = ("kind", "world", "t0", "horizon", "target_t", "primary", "window", "branches", "stage", "category",
+             "world_role", "target_role", "time_role")
 
 
 class ForecastError(Exception):
@@ -187,7 +204,9 @@ def check_matrix(M, d, what, psd=True):
     return (A + A.T) / 2
 
 
-def validate_config(root, cfg):
+def validate_config(root, cfg, docs):
+    """The configuration's own consistency, and its bindings checked against the registered artifacts as
+    read once (docs: {name: (bytes, doc, sha256)})."""
     _need(cfg.get("schema") == CFG_SCHEMA, f"schema {cfg.get('schema')!r}")
     for k in ("split_manifest_sha256", "forks_sha256"):
         _need(rqlib.is_sha256(cfg.get(k)), f"{k} must be a sha256")
@@ -203,11 +222,13 @@ def validate_config(root, cfg):
     _need(cfg.get("primary") in hz, "primary: one of the horizons")
     tp = cfg.get("temporal") or {}
     _need(_int(tp.get("fit_through"), 0) and _int(tp.get("separation"), 0), "temporal: fit_through, separation")
+    it = tp.get("inputs_through") or {}
     for p in PERIODS:
         v = tp.get(p)
         _need(isinstance(v, list) and len(v) == 2 and all(_int(x, 0) for x in v) and v[0] <= v[1],
               f"temporal.{p}: [first, last] (M)")
-        _need(v[1] - v[0] + 1 >= W + cfg["primary"], f"temporal.{p}: shorter than the window plus the primary horizon")
+        _need(_int(it.get(p), 0) and v[0] + W - 1 <= it[p] and it[p] + cfg["primary"] <= v[1],
+              f"temporal.inputs_through.{p}: a window fits before it and the primary horizon after it")
     ft, (vlo, vhi), (tlo, thi), sep = tp["fit_through"], tp["validation"], tp["test"], tp["separation"]
     _need(ft < vlo and vhi < tlo, "temporal: fit_through < validation < test")
     _need(vlo - ft - 1 >= sep and tlo - vhi - 1 >= sep, f"temporal: the registered {sep}M separation is violated")
@@ -230,13 +251,10 @@ def validate_config(root, cfg):
     ev = cfg.get("evaluation") or {}
     _need(_int(ev.get("bootstrap"), 1) and _int(ev.get("energy_draws"), 1), "evaluation: bootstrap, energy_draws >= 1")
     _need(isinstance(ev.get("seed_namespace"), str) and ev["seed_namespace"], "evaluation.seed_namespace")
-    # the bound artifacts
-    for name, key in (("splits.json", "split_manifest_sha256"), ("forks.json", "forks_sha256")):
-        p = os.path.join(root, "config", name)
-        _need(os.path.isfile(p), f"{p} is missing")
-        _need(rqlib.sha256_file(p) == cfg[key], f"{p} is not the registered one ({key})")
-    man = rqlib.read_json(os.path.join(root, "config", "splits.json"))
-    forks = rqlib.read_json(os.path.join(root, "config", "forks.json"))
+    _, man, msha = docs["splits.json"]
+    _, forks, fsha = docs["forks.json"]
+    _need(msha == cfg["split_manifest_sha256"], "config/splits.json is not the registered split manifest")
+    _need(fsha == cfg["forks_sha256"], "config/forks.json is not the registered fork registry")
     _need(forks.get("schema") == FORKS_SCHEMA, f"forks.json: schema {forks.get('schema')!r}")
     _need(man.get("forks_sha256") == cfg["forks_sha256"],
           "the split manifest was not built with this fork registry (sealing.py manifest --forks)")
@@ -247,18 +265,19 @@ def validate_config(root, cfg):
 def register(root, cfg_path):
     data = rqlib.canonical(rqlib.read_json(cfg_path))
     try:
-        return staging.register_config(root, CFG_NAME, data, validate_config)
+        return staging.register_config(root, CFG_NAME, data, validate_config, files=("forks.json",))
     except staging.StageError as e:
         raise ForecastError(str(e)) from None
 
 
 def load_ctx(root):
-    """The commitment root's registered artifacts and the registered origins."""
+    """The commitment root's registered artifacts (each read once; the fork registry's verified bytes are
+    the ones used) and the registered, verified target-disjoint origins."""
     try:
-        ctx = staging.load_root(root, CFG_NAME, CFG_SCHEMA, validate_config)
+        ctx = staging.load_root(root, CFG_NAME, CFG_SCHEMA, validate_config, files=("forks.json",))
     except staging.StageError as e:
         raise ForecastError(str(e)) from None
-    _, forks, fsha = staging.read_doc(os.path.join(ctx["root"], "config", "forks.json"))
+    _, forks, fsha = ctx["docs"]["forks.json"]
     ctx.update(forks=forks, forks_sha=fsha, d=len(ctx["cfg"]["channels"]))
     ctx["fork_origins"] = fork_origins(ctx)
     ctx["origins"] = registered_origins(ctx)
@@ -330,12 +349,17 @@ def classify(ctx, o):
         cat = "intersection" if forward else "world_transfer"
     else:
         cat = "forward_time" if forward else ("snapshot_transfer" if rr != "training" else "in_sample")
-    o.update(world_role=wr, time_role=tr, stage=stage, category=cat, excluded=excluded)
+    if cat == "in_sample" and not excluded:
+        excluded = "in-sample: its target is a fitting row (a diagnostic, never a committed evaluation)"
+    o.update(world_role=wr, target_role=rr, time_role=tr, stage=stage, category=cat, excluded=excluded)
     return o
 
 
 def registered_origins(ctx):
+    """Fork origins and the native origins of the target-disjoint rule (see the doc), then the fork panels'
+    precedence and the disjointness verification."""
     cfg, man = ctx["cfg"], ctx["manifest"]
+    tp = cfg["temporal"]
     out = []
     for (root, t0), bs in sorted(ctx["fork_origins"].items()):
         for H in cfg["horizons"]:
@@ -345,16 +369,51 @@ def registered_origins(ctx):
         if w not in man["worlds"]:
             raise ForecastError(f"native panel world {w} is not in the split manifest")
         for p in PERIODS:
-            lo, hi = cfg["temporal"][p]
+            lo, hi = tp[p]
+            cut = tp["inputs_through"][p]
             for H in cfg["horizons"]:
-                for t0 in range(lo + cfg["window"] - 1, hi - H + 1):
-                    out.append(classify(ctx, {"target_id": f"native:{w}:{t0}:{H}", "kind": "native", "world": w,
-                                              "t0": t0, "horizon": H, "branches": []}))
+                for t0 in range(lo + cfg["window"] - 1, cut + 1):
+                    if cut < t0 + H <= hi:
+                        out.append(classify(ctx, {"target_id": f"native:{w}:{t0}:{H}", "kind": "native", "world": w,
+                                                  "t0": t0, "horizon": H, "branches": []}))
+    fork_t = {(o["world"], o["target_t"]) for o in out if o["kind"] == "fork" and not o["excluded"]}
+    for o in out:
+        if o["kind"] == "native" and not o["excluded"] and any((o["world"], t) in fork_t for t in o["window"]):
+            o["excluded"] = "its window holds a fork origin's target row (the fork panels take precedence)"
+    probs = disjointness_problems(ctx, out)
+    if probs:
+        raise ForecastError("the registered origins are not target-disjoint: " + "; ".join(probs[:5]))
     return out
 
 
+def disjointness_problems(ctx, origins):
+    """Why the registration would let a stage read its own (or a later stage's) targets before its
+    commitment: a stage's prefix row that is one of its targets, a validation prefix row that is a test
+    target, a target that is a fitting row."""
+    ft = ctx["cfg"]["temporal"]["fit_through"]
+    pre, tgt = {}, {}
+    for o in origins:
+        if o["excluded"]:
+            continue
+        pre.setdefault(o["stage"], set()).update((o["world"], t) for t in o["window"])
+        tgt.setdefault(o["stage"], set()).add((o["world"], o["target_t"]))
+    probs = []
+    for s in sorted(pre):
+        bad = sorted(pre[s] & tgt.get(s, set()))
+        if bad:
+            probs.append(f"{len(bad)} {s} prefix rows are {s} targets ({bad[:3]})")
+    bad = sorted(pre.get("validation", set()) & tgt.get("test", set()))
+    if bad:
+        probs.append(f"{len(bad)} validation prefix rows are test targets ({bad[:3]})")
+    fitrows = sorted((w, t) for s in tgt for (w, t) in tgt[s]
+                     if t <= ft and node_role(ctx["manifest"], w, t) == "training")
+    if fitrows:
+        probs.append(f"{len(fitrows)} targets are fitting rows ({fitrows[:3]})")
+    return probs
+
+
 def stage_rows(ctx, stages):
-    """The prefix rows (window rows of the stages' non-excluded origins) and the target rows (native target
+    """The prefix rows (window rows of the stages' registered origins) and the target rows (native target
     rows; fork branches' and original continuations' rows) -> (prefix {(world, t)}, targets {(world, t)})."""
     pre, tgt = set(), set()
     for o in ctx["origins"]:
@@ -367,14 +426,33 @@ def stage_rows(ctx, stages):
 
 
 # ================================================================== profile documents
-def load_profiles(ctx, doc, sha, name):
-    """Validate a profiles/2 document against the registered configuration -> {"rows": {(world, t): row},
-    "map", "map_sha", "meas" {group: S}, "meas_sha", "sha"}. Identities resolve through the split manifest
-    (labels refused). A row: "id", "z" / "R" (or None), "g", "x", "events", "unavailable"."""
+def load_profiles(ctx, doc, sha, name, admit):
+    """Validate a profiles/2 document -> {"rows": {(world, t): row}, "map", "map_sha", "meas" {group: S},
+    "meas_sha", "sha"}. FIRST every row's identity is resolved through the split manifest (labels refused) and
+    admit(ident, key) -> None | why decides its membership: a row the stage may not read refuses the document
+    before any of its values is converted. A row: "id", "z" / "R" (or None), "g", "x", "events", "unavailable"
+    (exactly one of a profile, an absorbing event and an unavailable)."""
     np = _np()
     cfg, d = ctx["cfg"], ctx["d"]
     if doc.get("schema") != PROFILES:
         raise ForecastError(f"{name}: schema {doc.get('schema')!r}")
+    raw = doc.get("rows") or []
+    idents, seen, probs = [], set(), []
+    for k, r in enumerate(raw):
+        try:
+            ident = staging.resolve_row(ctx["manifest"], r, f"{name} row {k + 1}")
+        except staging.StageError as e:
+            raise ForecastError(str(e)) from None
+        key = (ident["world"], ident["t"])
+        if key in seen:
+            raise ForecastError(f"{name}: {key[0]}@{key[1]} occurs twice")
+        seen.add(key)
+        why = admit(ident, key)
+        if why:
+            probs.append(f"{key[0]}@{key[1]}: {why}")
+        idents.append((ident, key))
+    if probs:
+        raise ForecastError(f"{len(probs)} rows of {name} may not be read at this stage: " + "; ".join(probs[:5]))
     if doc.get("channels") != cfg["channels"]:
         raise ForecastError(f"{name}: channels {doc.get('channels')} are not the registered {cfg['channels']}")
     mp = doc.get("map") or {}
@@ -394,20 +472,16 @@ def load_profiles(ctx, doc, sha, name):
         raise ForecastError(f"{name}: measurement.shared (group -> shared covariance; may be empty) is required")
     meas = {g: check_matrix(S, d, f"{name}: shared measurement covariance {g}") for g, S in sorted(shared.items())}
     rows, ev_names, cv_names = {}, cfg["events"], cfg["covariates"]
-    for k, r in enumerate(doc.get("rows") or []):
-        try:
-            ident = staging.resolve_row(ctx["manifest"], r, f"{name} row {k + 1}")
-        except staging.StageError as e:
-            raise ForecastError(str(e)) from None
-        key = (ident["world"], ident["t"])
-        if key in rows:
-            raise ForecastError(f"{name}: {key[0]}@{key[1]} occurs twice")
+    for r, (ident, key) in zip(raw, idents):
         ev = r.get("events") or {}
         if not isinstance(ev, dict) or any(e not in ev_names or not isinstance(v, bool) for e, v in ev.items()):
             raise ForecastError(f"{name} {key}: events must be registered names ({ev_names}) with booleans")
+        kinds = [n for n, on in (("a profile", "z" in r), ("an absorbing event", any(ev.values())),
+                                 ("an unavailable reason", r.get("unavailable") is not None)) if on]
+        if len(kinds) != 1:
+            raise ForecastError(f"{name} {key}: a row is exactly one of a profile, an absorbing event or an explicit "
+                                f"unavailable, not {' and '.join(kinds) or 'none'}")
         row = {"id": ident, "z": None, "R": None, "g": None, "x": None, "events": ev, "unavailable": None}
-        if "z" in r and r.get("unavailable") is not None:
-            raise ForecastError(f"{name} {key}: a profile and an unavailable reason at once")
         if "z" in r:
             try:
                 z = np.asarray(r["z"], float)
@@ -427,28 +501,26 @@ def load_profiles(ctx, doc, sha, name):
                     raise ForecastError(f"{name} {key}: covariates must be exactly {cv_names}, finite")
                 row["x"] = np.array([float(cv[c]) for c in cv_names], float)
             row.update(z=z, R=R, g=g)
-        elif r.get("unavailable"):
-            if not isinstance(r["unavailable"], str):
+        elif r.get("unavailable") is not None:
+            if not isinstance(r["unavailable"], str) or not r["unavailable"]:
                 raise ForecastError(f"{name} {key}: unavailable is a reason (text)")
             row["unavailable"] = r["unavailable"]
-        elif not any(ev.values()):
-            raise ForecastError(f"{name} {key}: a row is a profile, an absorbing event or an explicit unavailable")
         rows[key] = row
-    by = {}
+    first = {}
     for (w, t), row in sorted(rows.items()):
         for e, v in row["events"].items():
             if v:
-                by.setdefault((w, e), t)
-    for (w, e), t1 in by.items():
+                first.setdefault((w, e), t)
+    for (w, e), t1 in first.items():
         if any(not rows[(w2, t)]["events"].get(e) for (w2, t) in rows if w2 == w and t > t1):
             raise ForecastError(f"{name}: {w}: event {e} is absorbing (a later row without it)")
     return {"rows": rows, "map": mp, "map_sha": rqlib.canonical_sha(mp), "meas": meas,
             "meas_sha": rqlib.canonical_sha({g: S.tolist() for g, S in meas.items()}), "sha": sha}
 
 
-def read_profiles(ctx, path, name):
+def read_profiles(ctx, path, name, admit):
     _, doc, sha = staging.read_doc(path)
-    return load_profiles(ctx, doc, sha, name)
+    return load_profiles(ctx, doc, sha, name, admit)
 
 
 def same_measurement(a, b, what):
@@ -458,39 +530,80 @@ def same_measurement(a, b, what):
         raise ForecastError(f"{what}: another measurement table")
 
 
-def check_fit(ctx, P):
-    """Every row a fit may use: native, training-role (holdouts excluded), t <= fit_through, covariates."""
+def fit_admit(ctx):
     ft = ctx["cfg"]["temporal"]["fit_through"]
-    probs = []
-    for (w, t), r in sorted(P["rows"].items()):
-        i = r["id"]
+
+    def admit(i, key):
         if i["branch"]:
-            probs.append(f"{w}@{t}: a fork branch's row is never a fitting row")
-        elif i["role"] != "training":
-            probs.append(f"{w}@{t}: role {i['role']} (a {i['world_role']} world's snapshot) may not be fitted on")
-        elif t > ft:
-            probs.append(f"{w}@{t}: after the registered fitting cutoff {ft}M")
-        elif r["z"] is not None and r["x"] is None and ctx["cfg"]["covariates"]:
-            probs.append(f"{w}@{t}: a fitting profile needs its covariates")
-    if probs:
-        raise ForecastError(f"{len(probs)} fit rows refused: " + "; ".join(probs[:5]))
+            return "a fork branch's row is never a fitting row"
+        if i["role"] != "training":
+            return f"role {i['role']} (a {i['world_role']} world's snapshot) may not be fitted on"
+        if key[1] > ft:
+            return f"after the registered fitting cutoff {ft}M"
+        return None
+    return admit
 
 
-def check_prefix(ctx, P, stages):
-    """Exactly the stages' registered prefix rows, every one present; covariates on every profile."""
+def read_fit(ctx, path):
+    F = read_profiles(ctx, path, "fit", fit_admit(ctx))
+    bad = [k for k, r in F["rows"].items() if r["z"] is not None and r["x"] is None]
+    if bad:
+        raise ForecastError(f"fitting profiles without covariates: {sorted(bad)[:5]}")
+    return F
+
+
+def read_prefix(ctx, path, stages):
+    """Exactly the stages' registered prefix rows (membership checked first), every one present."""
     want, _ = stage_rows(ctx, stages)
-    have = set(P["rows"])
-    extra = sorted(have - want)
-    if extra:
-        raise ForecastError(f"{len(extra)} rows are not registered prefix rows of the {'/'.join(sorted(stages))} "
-                            f"stage (a target or another stage's row is never a prediction input): {extra[:5]}")
-    missing = sorted(want - have)
+    P = read_profiles(ctx, path, "prefix", lambda i, key: None if key in want else
+                      f"not a registered prefix row of the {'/'.join(sorted(stages))} stage (a target or another "
+                      "stage's row is never a prediction input)")
+    missing = sorted(want - set(P["rows"]))
     if missing:
         raise ForecastError(f"{len(missing)} registered prefix rows are missing (a profile, an absorbing event or an "
                             f"explicit unavailable): {missing[:5]}")
-    bad = [k for k, r in P["rows"].items() if r["z"] is not None and r["x"] is None and ctx["cfg"]["covariates"]]
+    bad = [k for k, r in P["rows"].items() if r["z"] is not None and r["x"] is None]
     if bad:
         raise ForecastError(f"prefix profiles without covariates: {sorted(bad)[:5]}")
+    return P
+
+
+def read_targets(ctx, path, lines):
+    """Exactly the registered targets of the committed lines (membership checked first), every one present,
+    from the predictions' map and measurement table, in a supported measurement-source structure."""
+    want = set()
+    for ln in lines:
+        if ctx["by_id"][ln["target_id"]]["excluded"]:
+            continue
+        want.add((ln["world"], ln["target_t"]))
+        want.update((b, ln["target_t"]) for b in ln["branches"])
+    T = read_profiles(ctx, path, "targets", lambda i, key: None if key in want else
+                      "not a target of the committed predictions (another stage's outcome, or a substituted future)")
+    missing = sorted(want - set(T["rows"]))
+    if missing:
+        raise ForecastError(f"{len(missing)} registered targets are missing (a future is measured, absorbed or "
+                            f"explicitly unavailable, never dropped): {missing[:5]}")
+    prov = {(ln["provenance"]["map_sha256"], ln["provenance"]["measurement_sha256"]) for ln in lines}
+    if len(prov) != 1:
+        raise ForecastError("the predictions mix maps / measurement tables")
+    mp, ms = prov.pop()
+    if T["map_sha"] != mp or T["meas_sha"] != ms:
+        raise ForecastError("the targets come from another map / measurement table than the predictions")
+    fits = {json.dumps(ln.get("measurement"), sort_keys=True) for ln in lines}
+    if len(fits) != 1:
+        raise ForecastError("the predictions disagree on the fit's measurement groups")
+    fm = lines[0]["measurement"] if lines else {"fit_groups": [], "fit_group": None}
+    probs = source_problems(fm, [(k, r["g"]) for k, r in T["rows"].items() if r["z"] is not None])
+    if probs:
+        raise ForecastError("unsupported measurement-source structure: " + "; ".join(probs[:3]))
+    return T
+
+
+def source_problems(fit, keyed_groups):
+    """Rows whose measurement group is shared with PART of the fit (neither absent from it nor its only
+    group): their dependence on the fitted parameters is not identified."""
+    return [f"{k[0]}@{k[1]}: group {g} is shared with part of the fit" for k, g in keyed_groups
+            if g is not None and g in fit["fit_groups"] and g != fit["fit_group"]]
 
 
 # ================================================================== numerics
@@ -529,6 +642,26 @@ def drift(Z, Rs, ts, H):
     L = np.hstack([np.eye(d), (t[-1] + H - t.mean()) * np.eye(d)])
     LM = L @ np.linalg.inv(M)
     return LM @ b, [LM @ xw for xw in XW]
+
+
+def measurement_parts(G, win, meas, extra=None):
+    """Under the registered source structure, for gains G over the window rows (and extra {group: K}: the
+    forecast's loading on a shared component through the fit) -> (V: Var of the forecast's measurement part,
+    cross {g: L_g S_g}, own: sum G_s R_s G_s' as an independent-error filter assumes)."""
+    np = _np()
+    d = G[0].shape[0]
+    V, own, L = np.zeros((d, d)), np.zeros((d, d)), {}
+    for Gs, r in zip(G, win):
+        own += Gs @ r["R"] @ Gs.T
+        S = meas[r["g"]] if r["g"] is not None else 0.0
+        V += Gs @ (r["R"] - S) @ Gs.T
+        if r["g"] is not None:
+            L[r["g"]] = L.get(r["g"], 0.0) + Gs
+    for g, K in (extra or {}).items():
+        L[g] = L.get(g, 0.0) + K
+    for g, Lg in L.items():
+        V += Lg @ meas[g] @ Lg.T
+    return V, {g: Lg @ meas[g] for g, Lg in L.items()}, own
 
 
 class LSS:
@@ -646,7 +779,8 @@ class LSS:
         self.Th, self.Q = Th, (V * np.clip(w, floor, None)) @ V.T
 
     def fit(self, groups, iters, tol):
-        """Penalized EM over the fit segments (groups of equal-length batches) -> self (objective trace)."""
+        """Penalized EM over the fit segments (groups of equal-length batches) -> self (objective trace and
+        the numerical-failure diagnostic)."""
         np = _np()
         d = self.d
         inc = np.vstack([(z[:, 1:] - z[:, :-1]).reshape(-1, d) for z, _, _ in groups])
@@ -667,12 +801,23 @@ class LSS:
             self.mstep(S00, S10, S11, n)
             prev = J
         self.iterations, self.loglik, self.objective, self.trace = it, ll, trace[-1], trace
-        self.monotone = all(b >= a - 1e-9 * max(1.0, abs(a)) for a, b in zip(trace, trace[1:]))
+        drops = [(a - b, i + 1) for i, (a, b) in enumerate(zip(trace, trace[1:])) if b < a - MONO_TOL * max(1.0, abs(a))]
+        self.monotone = not drops
+        self.failure = None
+        if drops:
+            dec, at = max(drops)
+            self.failure = f"the penalized objective decreased by {dec:.3g} at iteration {at} (non-monotone EM)"
+        elif not self.converged:
+            self.failure = f"the EM did not converge in {iters} iterations"
         return self
+
+    @property
+    def usable(self):
+        return self.failure is None
 
     def forecast(self, Z, R, X, H):
         """Filter each window, then H steps with the covariates held at their last value -> (means b x d,
-        covariances b x d x d, gains b x d x (n d))."""
+        working covariances b x d x d, gains b x d x (n d))."""
         np = _np()
         d = self.d
         mf, Pf, _, _, _, M = self.filter(Z, R, X, gains=True)
@@ -683,10 +828,25 @@ class LSS:
             m, P, M = m @ A.T + u, A @ P @ A.T + self.Q, A @ M
         return m, P, M
 
+    def fit_loading(self, Z, R, X, H):
+        """K = (d z_hat / d c)(I - A) per window (b x d x d): the forecast's response to a shift u of EVERY
+        fitting profile (the fit moves c by (I - A) u); exact, the forecast being affine in c."""
+        np = _np()
+        d = self.d
+        m0 = self.forecast(Z, R, X, H)[0]
+        dc = np.empty((len(Z), d, d))
+        keep = self.Th.copy()
+        for j in range(d):
+            self.Th = keep.copy()
+            self.Th[j, -1] += 1.0
+            dc[:, :, j] = self.forecast(Z, R, X, H)[0] - m0
+        self.Th = keep
+        return dc @ (np.eye(d) - keep[:, :d])
+
     def state(self):
         return {"lambda": self.lam, "Theta": self.Th.tolist(), "Q": self.Q.tolist(), "converged": self.converged,
                 "iterations": self.iterations, "objective": self.objective, "loglik": self.loglik,
-                "monotone": self.monotone}
+                "monotone": self.monotone, "usable": self.usable, "failure": self.failure}
 
 
 # ================================================================== fitting (fit rows only)
@@ -734,18 +894,9 @@ def window_rows(rows, w, ts):
     return out, None
 
 
-def cross_cov(G, win, meas):
-    """Cov(z_hat, v_f) for a target in group g -> {g: sum over window rows in g of G_s S_g}."""
-    out = {}
-    for Gs, r in zip(G, win):
-        if r["g"] is not None:
-            out[r["g"]] = out.get(r["g"], 0) + Gs @ meas[r["g"]]
-    return out
-
-
-def error_cov(ctx, P, H, fc):
-    """persistence / drift predictive covariance: the fit rows' native H-step error covariance minus
-    mean(R_f - C_f - C_f'), PSD-clipped."""
+def state_error_cov(ctx, P, H, fc):
+    """persistence / drift: the fit rows' native H-step STATE-error covariance: the empirical error covariance
+    minus mean(R_T + the forecast's measurement part - C_T - C_T'), PSD-clipped."""
     np = _np()
     W, d = ctx["cfg"]["window"], ctx["d"]
     E, corr = [], []
@@ -756,9 +907,10 @@ def error_cov(ctx, P, H, fc):
             if win is None or tg is None or tg["z"] is None:
                 continue
             zh, G = fc(np.array([r["z"] for r in win]), [r["R"] for r in win], list(range(t0 - W + 1, t0 + 1)), H)
-            C = cross_cov(G, win, P["meas"]).get(tg["g"], np.zeros((d, d))) if tg["g"] is not None else np.zeros((d, d))
+            V, cross, _ = measurement_parts(G, win, P["meas"])
+            C = cross.get(tg["g"], np.zeros((d, d))) if tg["g"] is not None else np.zeros((d, d))
             E.append(tg["z"] - zh)
-            corr.append(tg["R"] - C - C.T)
+            corr.append(tg["R"] + V - C - C.T)
     if len(E) < 2:
         raise ForecastError(f"fewer than two fitting native origins at H = {H}")
     E = np.array(E)
@@ -766,14 +918,15 @@ def error_cov(ctx, P, H, fc):
 
 
 def fit_model(ctx, P):
-    """The fit (standardizer, every lambda, the error covariances) -> the model state document."""
+    """The fit (standardizer, every lambda, the state-error covariances, the fit's measurement groups) ->
+    the model state document."""
     np = _np()
     cfg, d = ctx["cfg"], ctx["d"]
     k = len(cfg["covariates"])
-    X = [r["x"] for r in P["rows"].values() if r["z"] is not None]
-    if not X:
+    prof = [r for r in P["rows"].values() if r["z"] is not None]
+    if not prof:
         raise ForecastError("no fitting profiles")
-    X = np.array(X, float).reshape(len(X), k)
+    X = np.array([r["x"] for r in prof], float).reshape(len(prof), k)
     mu, sd = X.mean(axis=0), X.std(axis=0)
     sd = np.where(sd > 0, sd, 1.0)
     groups = fit_segments(P)
@@ -782,14 +935,20 @@ def fit_model(ctx, P):
     ls = cfg["lss"]
     fits = [LSS(d, k, lam, mu, sd, ls["initial_state"]).fit(groups, ls["em_iters"], ls["em_tol"]).state()
             for lam in ls["lambdas"]]
-    covs = {fn.__name__: {str(H): error_cov(ctx, P, H, fn).tolist() for H in cfg["horizons"]} for fn in (persistence, drift)}
+    covs = {fn.__name__: {str(H): state_error_cov(ctx, P, H, fn).tolist() for H in cfg["horizons"]}
+            for fn in (persistence, drift)}
     ids = sorted([w, t] for (w, t), r in P["rows"].items() if r["z"] is not None)
+    gs = {r["g"] for r in prof}
+    fit_groups = sorted(g for g in gs if g is not None)
     return {"schema": MODEL, "config_sha256": ctx["cfg_sha"],
             "fit": {"sha256": P["sha"], "profiles": len(ids), "ids_sha256": rqlib.canonical_sha(ids),
                     "transitions": int(sum(z.shape[0] * (z.shape[1] - 1) for z, _, _ in groups)),
-                    "map_sha256": P["map_sha"], "measurement_sha256": P["meas_sha"]},
-            "standardizer": {"mean": mu.tolist(), "sd": sd.tolist()}, "lss": fits, "covs": covs,
-            "environment": staging.environment(), "implementation": staging.implementation(os.path.abspath(__file__))}
+                    "map_sha256": P["map_sha"], "measurement_sha256": P["meas_sha"],
+                    "measurement": {"fit_groups": fit_groups,
+                                    "fit_group": fit_groups[0] if len(gs) == 1 and fit_groups else None}},
+            "standardizer": {"mean": mu.tolist(), "sd": sd.tolist()}, "lss": fits, "state_covs": covs,
+            "environment": staging.environment(),
+            "implementation": json.loads(staging.implementation_manifest(os.path.abspath(__file__)))}
 
 
 def model_lss(ctx, model, lam):
@@ -799,7 +958,7 @@ def model_lss(ctx, model, lam):
         raise ForecastError(f"the model state has no lambda {lam}")
     m = LSS(ctx["d"], len(ctx["cfg"]["covariates"]), lam, model["standardizer"]["mean"], model["standardizer"]["sd"],
             ctx["cfg"]["lss"]["initial_state"])
-    m.Th, m.Q, m.converged = np.asarray(st["Theta"], float), np.asarray(st["Q"], float), st["converged"]
+    m.Th, m.Q, m.failure = np.asarray(st["Theta"], float), np.asarray(st["Q"], float), st["failure"]
     return m
 
 
@@ -809,6 +968,7 @@ def predict_lines(ctx, P, model, model_sha, stages, names, extra_prov):
     the lss forecaster's name (lss[lambda] for the validation candidates, lss for the selected one)."""
     np = _np()
     cfg, d = ctx["cfg"], ctx["d"]
+    fitm = model["fit"]["measurement"]
     prov = {"config_sha256": ctx["cfg_sha"], "split_manifest_sha256": ctx["manifest_sha"], "forks_sha256": ctx["forks_sha"],
             "origins_sha256": ctx["origins_sha"], "map_sha256": P["map_sha"], "measurement_sha256": P["meas_sha"],
             "prefix_sha256": P["sha"], "fit_sha256": model["fit"]["sha256"], "fit_ids_sha256": model["fit"]["ids_sha256"],
@@ -819,16 +979,20 @@ def predict_lines(ctx, P, model, model_sha, stages, names, extra_prov):
     for o in ctx["origins"]:
         if o["stage"] not in stages:
             continue
-        line = {"schema": PRED, "target_id": o["target_id"], **{k: o[k] for k in (
-            "kind", "world", "t0", "horizon", "target_t", "primary", "window", "branches", "stage", "category",
-            "world_role", "time_role")}, "provenance": prov}
+        line = {"schema": PRED, "target_id": o["target_id"], **{q: o[q] for q in LINE_KEYS},
+                "measurement": fitm, "provenance": prov}
         win, why = (None, o["excluded"]) if o["excluded"] else window_rows(P["rows"], o["world"], o["window"])
+        if win is not None:
+            probs = source_problems(fitm, [((o["world"], t), r["g"]) for t, r in zip(o["window"], win)])
+            if probs:
+                win, why = None, "unsupported measurement-source structure: " + "; ".join(probs[:2])
         if win is None:
             line.update(available=False, reason=why)
         else:
             line["available"] = True
             todo.append((line, win))
         lines.append(line)
+    fg = fitm["fit_group"]
     for H in cfg["horizons"]:
         batch = [(ln, win) for ln, win in todo if ln["horizon"] == H]
         if not batch:
@@ -836,37 +1000,35 @@ def predict_lines(ctx, P, model, model_sha, stages, names, extra_prov):
         Z = np.array([[r["z"] for r in win] for _, win in batch])
         R = np.array([[r["R"] for r in win] for _, win in batch])
         X = np.array([[r["x"] for r in win] for _, win in batch], float).reshape(len(batch), cfg["window"], k)
-        outs = {}
-        for lam, m in lss.items():
-            if m.converged:
-                outs[lam] = m.forecast(Z, R, X, H)
+        outs = {lam: m.forecast(Z, R, X, H) + ((m.fit_loading(Z, R, X, H) if fg else None),)
+                for lam, m in lss.items() if m.usable}
         for j, (ln, win) in enumerate(batch):
             fcs = {}
             for fn in (persistence, drift):
                 zh, G = fn(Z[j], R[j], ln["window"], H)
-                fcs[fn.__name__] = {"z": zh.tolist(), "cov": model["covs"][fn.__name__][str(H)],
-                                    "cross": {g: c.tolist() for g, c in cross_cov(G, win, P["meas"]).items()}}
+                V, cross, _ = measurement_parts(G, win, P["meas"])
+                fcs[fn.__name__] = {"z": zh.tolist(), "cov": psd_clip(np.asarray(model["state_covs"][fn.__name__][str(H)]) + V).tolist(),
+                                    "cross": {g: c.tolist() for g, c in cross.items()}}
             for lam, name in names.items():
                 if lam not in outs:
-                    fcs[name] = {"unavailable": "the EM did not converge"}
+                    fcs[name] = {"unavailable": lss[lam].failure}
                     continue
-                m_, P_, M_ = outs[lam]
+                m_, P_, M_, K_ = outs[lam]
                 G = [M_[j][:, s * d:(s + 1) * d] for s in range(cfg["window"])]
-                fcs[name] = {"z": m_[j].tolist(), "cov": psd_clip(P_[j]).tolist(),
-                             "cross": {g: c.tolist() for g, c in cross_cov(G, win, P["meas"]).items()}}
+                V, cross, own = measurement_parts(G, win, P["meas"], {fg: K_[j]} if fg else None)
+                fcs[name] = {"z": m_[j].tolist(), "cov": psd_clip(P_[j] - own + V).tolist(),
+                             "cross": {g: c.tolist() for g, c in cross.items()}}
             ln["forecasts"] = fcs
     return lines
 
 
 def check_lines(ctx, lines, stages):
     """Committed lines must be the registered origins of the stages, unmodified."""
-    keys = ("kind", "world", "t0", "horizon", "target_t", "primary", "window", "branches", "stage", "category",
-            "world_role", "time_role")
     want = {o["target_id"] for o in ctx["origins"] if o["stage"] in stages}
     have = set()
     for ln in lines:
         o = ctx["by_id"].get(ln.get("target_id"))
-        if o is None or o["stage"] not in stages or any(ln.get(k) != o[k] for k in keys):
+        if o is None or o["stage"] not in stages or any(ln.get(q) != o[q] for q in LINE_KEYS):
             raise ForecastError(f"{ln.get('target_id')}: not a registered {'/'.join(sorted(stages))} origin as registered")
         have.add(o["target_id"])
     if have != want:
@@ -984,40 +1146,18 @@ def origin_metrics(fc, futures, meas, events, rng_of, draws):
     return rec
 
 
-def check_targets(ctx, lines, T):
-    """The target rows: exactly the registered targets of these lines, every one present (a profile, an
-    absorbing event or an explicit unavailable), one map and measurement table with the predictions."""
-    prov = {(ln["provenance"]["map_sha256"], ln["provenance"]["measurement_sha256"]) for ln in lines}
-    if len(prov) != 1:
-        raise ForecastError("the predictions mix maps / measurement tables")
-    mp, ms = prov.pop()
-    if T["map_sha"] != mp or T["meas_sha"] != ms:
-        raise ForecastError("the targets come from another map / measurement table than the predictions")
-    want = set()
-    for ln in lines:
-        if ctx["by_id"][ln["target_id"]]["excluded"]:
-            continue                                     # (a registered exclusion: never scored, its target never read)
-        want.add((ln["world"], ln["target_t"]))
-        want.update((b, ln["target_t"]) for b in ln["branches"])
-    have = set(T["rows"])
-    extra = sorted(have - want)
-    if extra:
-        raise ForecastError(f"{len(extra)} target rows are not targets of the committed predictions (another stage's "
-                            f"outcome, or a substituted future): {extra[:5]}")
-    missing = sorted(want - have)
-    if missing:
-        raise ForecastError(f"{len(missing)} registered targets are missing (a future is measured, absorbed or "
-                            f"explicitly unavailable, never dropped): {missing[:5]}")
-
-
 def quantile(sorted_vals, u):
     """Annex H.0.4: Q(u) = z_(min{B, max[1, ceil((B + 1) u)]})."""
     B = len(sorted_vals)
     return sorted_vals[min(B, max(1, math.ceil((B + 1) * u))) - 1]
 
 
+POOL_KEYS = ("stage", "world_role", "target_role", "time_role", "category", "kind", "horizon")
+
+
 def pool(ctx, per):
-    """Means per STAGE / CATEGORY / KIND / H / FORECASTER (never across them), root-world cluster bootstrap."""
+    """Means per STAGE / WORLD ROLE / TARGET ROLE / TIME ROLE / CATEGORY / KIND / H / FORECASTER (never across
+    them), root-world cluster bootstrap."""
     np = _np()
     ev = ctx["cfg"]["evaluation"]
     groups = {}
@@ -1025,10 +1165,10 @@ def pool(ctx, per):
         if not r["available"]:
             continue
         for fc, m in r["metrics"].items():
-            groups.setdefault((r["stage"], r["category"], r["kind"], r["horizon"], fc), []).append((r["world"], m))
+            groups.setdefault(tuple(r[q] for q in POOL_KEYS) + (fc,), []).append((r["world"], m))
     out = {}
     for key, rows in sorted(groups.items()):
-        name = "/".join([key[0], key[1], key[2], f"H{key[3]}", key[4]])
+        name = "/".join([str(x) if q != "horizon" else f"H{x}" for q, x in zip(POOL_KEYS + ("forecaster",), key)])
         qs = {}
         for q in ("mse", "v_fork", "reducible", "energy", "cover50", "cover90"):
             qs[q] = [(w, m[q]) for w, m in rows if m.get(q) is not None]
@@ -1036,8 +1176,8 @@ def pool(ctx, per):
             qs[q + "_with_original"] = [(w, m["with_original"][q]) for w, m in rows
                                         if (m.get("with_original") or {}).get(q) is not None]
         rng = np.random.default_rng(rqlib.derive_seed(ev["seed_namespace"], "bootstrap", name))
-        rec = {"stage": key[0], "category": key[1], "kind": key[2], "horizon": key[3], "forecaster": key[4],
-               "primary": key[3] == ctx["cfg"]["primary"], "origins": len(rows), "worlds": len({w for w, _ in rows})}
+        rec = dict(zip(POOL_KEYS + ("forecaster",), key), primary=key[6] == ctx["cfg"]["primary"],
+                   origins=len(rows), worlds=len({w for w, _ in rows}))
         ws = sorted({w for w, _ in rows})
         wi = {w: i for i, w in enumerate(ws)}
         picks = rng.integers(0, len(ws), (ev["bootstrap"], len(ws)))      # (whole root worlds, with their origins)
@@ -1059,13 +1199,12 @@ def pool(ctx, per):
 
 
 def score_lines(ctx, lines, T):
-    """Per-line metrics of every forecaster in the lines."""
+    """Per-line metrics of every forecaster in the lines (registered roles and categories kept)."""
     cfg = ctx["cfg"]
     ev = cfg["evaluation"]
     per = []
     for ln in lines:
-        rec = {k: ln[k] for k in ("target_id", "kind", "world", "t0", "horizon", "target_t", "stage", "category",
-                                  "primary", "available")}
+        rec = {q: ln[q] for q in ("target_id", "world", "t0", "target_t", "primary", "available") + POOL_KEYS}
         if not ln["available"]:
             rec["reason"] = ln.get("reason")
             per.append(rec)
@@ -1084,12 +1223,12 @@ def selection_rows(ctx, per):
     """The registered selection set: available validation-stage origins whose target lies in the validation
     period, at the primary horizon."""
     return [r for r in per if r["available"] and r["stage"] == "validation" and r["primary"]
-            and ctx["by_id"][r["target_id"]]["time_role"] == "validation"]
+            and r["time_role"] == "validation"]
 
 
 def select_lambda(ctx, per):
     """lss[lambda]'s mean corrected MSE over the selection set; the minimum, ties to the larger lambda. A
-    lambda whose EM did not converge is unavailable."""
+    lambda the numerical-failure policy made unavailable is never selected."""
     np = _np()
     rows = selection_rows(ctx, per)
 
@@ -1097,8 +1236,9 @@ def select_lambda(ctx, per):
         ms = [r["metrics"][name] for r in rows]
         if not rows:
             return None, 0, "no available validation-period origin at the primary horizon"
-        if any(m.get("forecast_unavailable") for m in ms):
-            return None, 0, "the EM did not converge"
+        bad = next((m["forecast_unavailable"] for m in ms if m.get("forecast_unavailable")), None)
+        if bad:
+            return None, 0, bad
         v = [m["mse"] for m in ms if m.get("mse") is not None]
         return (float(np.mean(v)) if v else None), len(v), None if v else "no live target"
     by = []
@@ -1110,8 +1250,8 @@ def select_lambda(ctx, per):
         raise ForecastError("no lambda can be selected: " + "; ".join(sorted({b.get("reason", "") for b in by})))
     best = min(ok, key=lambda b: (b["mse"], -b["lambda"]))
     return {"rule": "validation stage, target in the validation period, primary horizon; minimum mean corrected "
-                    "MSE, ties to the larger lambda", "candidates": by, "lambda": best["lambda"],
-            "reference": {fc: mean_mse(fc)[0] for fc in BASE}}
+                    "MSE, ties to the larger lambda; unavailable lambdas never selected", "candidates": by,
+            "lambda": best["lambda"], "reference": {fc: mean_mse(fc)[0] for fc in BASE}}
 
 
 # ================================================================== CLI
@@ -1120,6 +1260,11 @@ def uniform(lines, key):
     if len(vals) != 1:
         raise ForecastError(f"the prediction lines disagree on {key}")
     return vals.pop()
+
+
+def scoring_record(impl):
+    return {"implementation_sha256": rqlib.sha256_bytes(impl), "implementation": json.loads(impl.decode("utf-8")),
+            "environment": staging.environment()}
 
 
 def main(argv=None):
@@ -1144,37 +1289,43 @@ def main(argv=None):
     s.add_argument("--out", required=True)
     s = sub.add_parser("predict-test")
     s.add_argument("--root", required=True)
-    s.add_argument("--prefix", required=True, help="exactly the test (and training) stage's registered window rows")
+    s.add_argument("--prefix", required=True, help="exactly the test stage's registered window rows")
     s.add_argument("--model", required=True)
     s.add_argument("--selection", required=True)
+    s.add_argument("--out", required=True)
+    s = sub.add_parser("implementation")
     s.add_argument("--out", required=True)
     s = sub.add_parser("evaluate-test")
     s.add_argument("--root", required=True)
     s.add_argument("--predictions", required=True)
-    s.add_argument("--targets", required=True, help="exactly the test (and training) stage's target rows")
+    s.add_argument("--targets", required=True, help="exactly the test stage's target rows")
     s.add_argument("--out", required=True)
     a = ap.parse_args(argv)
+    test_stages = {"test", "training"}
     try:
         if a.cmd == "register":
             sha = register(a.root, a.config)
             print(f"{os.path.join(a.root, 'config', CFG_NAME)}: sha256 {sha}")
+            return 0
+        if a.cmd == "implementation":
+            impl = staging.implementation_manifest(os.path.abspath(__file__))
+            rqlib.write_durable(a.out, impl)
+            print(f"{a.out}: sha256 {rqlib.sha256_bytes(impl)} (commit and freeze it as the evaluation script)")
             return 0
         ctx = load_ctx(a.root)
         cfg = ctx["cfg"]
         if a.cmd == "origins":
             doc = {"schema": ORIGINS, "config_sha256": ctx["cfg_sha"], "origins_sha256": ctx["origins_sha"],
                    "origins": ctx["origins"], "rows": {}}
-            for name, stages in (("validation", {"validation"}), ("test", {"test", "training"})):
+            for name, stages in (("validation", {"validation"}), ("test", test_stages)):
                 pre, tgt = stage_rows(ctx, stages)
                 doc["rows"][name] = {"prefix": sorted([w, t] for w, t in pre), "targets": sorted([w, t] for w, t in tgt)}
             rqlib.write_json_durable(a.out, doc)
             print(f"{a.out}: {len(ctx['origins'])} registered origins (no outcome)")
             return 0
         if a.cmd == "predict-candidates":
-            F = read_profiles(ctx, a.fit, "fit")
-            check_fit(ctx, F)
-            P = read_profiles(ctx, a.prefix, "prefix")
-            check_prefix(ctx, P, {"validation"})
+            F = read_fit(ctx, a.fit)
+            P = read_prefix(ctx, a.prefix, {"validation"})
             same_measurement(F, P, "the prefix")
             model = fit_model(ctx, F)
             data = rqlib.canonical(model)
@@ -1188,12 +1339,13 @@ def main(argv=None):
         if a.cmd == "score-validation":
             lines, mk = staging.committed_rows(ctx["root"], "validation", a.predictions, ctx["cfg_sha"], {"validation"})
             check_lines(ctx, lines, {"validation"})
-            T = read_profiles(ctx, a.targets, "targets")
-            check_targets(ctx, lines, T)
+            T = read_targets(ctx, a.targets, lines)
             per = score_lines(ctx, lines, T)
+            impl = staging.implementation_manifest(os.path.abspath(__file__))
             doc = {"schema": VALSCORES, "VAL_PRED_SHA": mk, "config_sha256": ctx["cfg_sha"],
                    "model_sha256": uniform(lines, "model_sha256"), "targets_sha256": T["sha"],
-                   "selection": select_lambda(ctx, per), "pooled": pool(ctx, per), "origins": per}
+                   "selection": select_lambda(ctx, per), "pooled": pool(ctx, per), "origins": per,
+                   "scoring": scoring_record(impl)}
             rqlib.write_json_durable(a.out, doc)
             print(f"lambda = {doc['selection']['lambda']}; record the scores (sealing.py open-validation) before predict-test")
             return 0
@@ -1205,33 +1357,36 @@ def main(argv=None):
             if rqlib.sha256_bytes(mdata) != sel.get("model_sha256"):
                 raise ForecastError(f"{a.model} is not the model state the validation candidates were predicted with")
             model = json.loads(mdata.decode("utf-8"))
-            P = read_profiles(ctx, a.prefix, "prefix")
-            check_prefix(ctx, P, {"test", "training"})
+            lam = sel["selection"]["lambda"]
+            if not model_lss(ctx, model, lam).usable:
+                raise ForecastError(f"the selected lambda {lam} is unavailable under the numerical-failure policy")
+            P = read_prefix(ctx, a.prefix, test_stages)
             if P["map_sha"] != model["fit"]["map_sha256"] or P["meas_sha"] != model["fit"]["measurement_sha256"]:
                 raise ForecastError("the prefix comes from another map / measurement table than the fit")
-            lam = sel["selection"]["lambda"]
-            lines = predict_lines(ctx, P, model, sel["model_sha256"], {"test", "training"}, {lam: "lss"},
+            lines = predict_lines(ctx, P, model, sel["model_sha256"], test_stages, {lam: "lss"},
                                   {"selection_sha256": sel_sha, "VAL_PRED_SHA": sel["VAL_PRED_SHA"], "lambda": lam})
             rqlib.write_durable(a.out, staging.jsonl_bytes(lines))
-            print(f"{a.out}: {len(lines)} test-stage predictions (lambda {lam}); commit them (sealing.py commit --stage test "
-                  "--eval-script forecast.py), then freeze, before evaluate-test")
+            print(f"{a.out}: {len(lines)} test-stage predictions (lambda {lam}); commit them with the implementation "
+                  "manifest (sealing.py commit --stage test --eval-script IMPL.json), then freeze, before evaluate-test")
             return 0
-        # evaluate-test: the verified bytes only
-        lines, test_sha, freeze_sha = staging.test_gate(ctx["root"], a.predictions, os.path.abspath(__file__))
+        # evaluate-test: the gate against the implementation as loaded, then the verified bytes only
+        impl = staging.implementation_manifest(os.path.abspath(__file__))
+        g = staging.test_gate(ctx["root"], a.predictions, impl)
+        lines = g["rows"]
         for ln in lines:
             if (ln.get("provenance") or {}).get("config_sha256") != ctx["cfg_sha"]:
                 raise ForecastError(f"{ln.get('target_id')}: predicted under another analysis configuration")
-        staging.check_selection_record(ctx["root"], lines)
-        check_lines(ctx, lines, {"test", "training"})
-        T = read_profiles(ctx, a.targets, "targets")
-        check_targets(ctx, lines, T)
+        staging.check_selection_record(g["validation_evaluation"], lines)
+        check_lines(ctx, lines, test_stages)
+        T = read_targets(ctx, a.targets, lines)
         per = score_lines(ctx, lines, T)
-        doc = {"schema": EVAL, "TEST_PRED_SHA": test_sha, "freeze_sha256": freeze_sha, "config_sha256": ctx["cfg_sha"],
-               "selection_sha256": uniform(lines, "selection_sha256"), "lambda": uniform(lines, "lambda"),
-               "targets_sha256": T["sha"], "pooled": pool(ctx, per), "origins": per,
+        doc = {"schema": EVAL, "TEST_PRED_SHA": g["TEST_PRED_SHA"], "freeze_sha256": g["freeze_sha256"],
+               "config_sha256": ctx["cfg_sha"], "selection_sha256": uniform(lines, "selection_sha256"),
+               "lambda": uniform(lines, "lambda"), "targets_sha256": T["sha"], "pooled": pool(ctx, per), "origins": per,
+               "scoring": scoring_record(impl),
                "note": "reducible = MSE - V_fork: error reducible given the saved state under reseeding; negative "
-                       "finite-sample values retained; not split into representation loss and learning error; each "
-                       "category is reported on its own (v4 §7.3); in_sample is a diagnostic"}
+                       "finite-sample values retained; not split into representation loss and learning error; every "
+                       "stage x world role x target role x time role x category is reported on its own (v4 §7.3)"}
         rqlib.write_json_durable(a.out, doc)
         for k, v in sorted(doc["pooled"].items()):
             if v["primary"]:
