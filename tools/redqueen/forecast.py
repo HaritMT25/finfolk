@@ -400,6 +400,8 @@ def load_profiles(ctx, doc, sha, name):
         if not isinstance(ev, dict) or any(e not in ev_names or not isinstance(v, bool) for e, v in ev.items()):
             raise ForecastError(f"{name} {key}: events must be registered names ({ev_names}) with booleans")
         row = {"id": ident, "z": None, "R": None, "g": None, "x": None, "events": ev, "unavailable": None}
+        if "z" in r and r.get("unavailable") is not None:
+            raise ForecastError(f"{name} {key}: a profile and an unavailable reason at once")
         if "z" in r:
             try:
                 z = np.asarray(r["z"], float)
@@ -769,6 +771,8 @@ def fit_model(ctx, P):
     mu, sd = X.mean(axis=0), X.std(axis=0)
     sd = np.where(sd > 0, sd, 1.0)
     groups = fit_segments(P)
+    if not groups:
+        raise ForecastError("no two consecutive fitting profiles: the state-space model cannot be fitted")
     ls = cfg["lss"]
     fits = [LSS(d, k, lam, mu, sd, ls["initial_state"]).fit(groups, ls["em_iters"], ls["em_tol"]).state()
             for lam in ls["lambdas"]]

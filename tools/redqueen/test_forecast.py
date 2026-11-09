@@ -666,7 +666,8 @@ class TestPipeline(unittest.TestCase):
                  (lambda rs: rs[k1].update(cov=bad_cov), "not symmetric"),
                  (lambda rs: rs[k1].update(cov=[[0.003, 0.0], [0.0, -0.001]]), "positive semidefinite"),
                  (lambda rs: rs[k1].update(cov=[[float("nan"), 0.0], [0.0, 0.003]]), "finite"),
-                 (lambda rs: rs[k1].update(cov=[[0.0005, 0.0], [0.0, 0.0005]]), "shared component")]
+                 (lambda rs: rs[k1].update(cov=[[0.0005, 0.0], [0.0, 0.0005]]), "shared component"),
+                 (lambda rs: rs[k1].update(unavailable="assay failed"), "at once")]
         for fn, why in cases:
             rc, err = run(["evaluate-test", "--root", root, "--predictions", self.test, "--targets", variant(fn), "--out", ev])
             self.assertEqual(rc, 2, why)
