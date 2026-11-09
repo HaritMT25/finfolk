@@ -269,14 +269,16 @@ _NUMPY = {}
 
 def record_problems(site, record_text, digest):
     """The entries of a wheel RECORD (path, sha256=<urlsafe base64>, size; paths relative to `site`) whose
-    installed file is missing or does not hash to its recorded sha256; entries without a hash (the RECORD
-    itself, bytecode) are skipped. digest(path) -> hex sha256."""
+    installed file is missing or does not hash to its recorded sha256. Skipped: entries without a hash (the
+    RECORD itself) and BYTECODE entries (*.pyc): a wheel may ship bytecode that the installer's byte-
+    compilation legitimately rewrites (numpy 2.2's wheel does), so a recorded .pyc hash is not evidence;
+    the bytecode actually present is bound by its own file hash in the manifest. digest(path) -> hex sha256."""
     import base64
     import csv
     import io
     probs = []
     for row in csv.reader(io.StringIO(record_text)):
-        if len(row) < 2 or not row[1]:
+        if len(row) < 2 or not row[1] or row[0].endswith(".pyc"):
             continue
         algo, _, want = row[1].partition("=")
         p = os.path.normpath(os.path.join(site, row[0]))
@@ -292,8 +294,9 @@ def record_problems(site, record_text, digest):
 def numpy_binding():
     """The installed numpy the numerics run on, bound by its EXECUTED artifacts: the sha256 of EVERY file under
     the numpy package directory (sources, extensions and every __pycache__ bytecode it may execute) and of
-    numpy.libs (the bundled BLAS); and its distribution: the version, wheel tags and RECORD, every RECORD entry
-    VERIFIED against the installed file (a mismatch, or a missing distribution, is refused). Cached."""
+    numpy.libs (the bundled BLAS); and its distribution: the version, wheel tags and RECORD, every hashed
+    non-bytecode RECORD entry VERIFIED against the installed file (a mismatch, a missing file or a missing
+    distribution is refused; bytecode is bound by its file hash, see record_problems). Cached."""
     if "b" in _NUMPY:
         return _NUMPY["b"]
     try:
@@ -330,7 +333,8 @@ def numpy_binding():
     if probs:
         raise StageError(f"numpy's installed files do not match its RECORD ({len(probs)}): " + "; ".join(probs[:3]))
     _NUMPY["b"] = {"version": numpy.__version__, "dist_info": infos[0], "record_sha256": rqlib.sha256_bytes(record),
-                   "record_entries_verified": sum(1 for ln in record.decode("utf-8").splitlines() if ",sha256=" in ln),
+                   "record_entries_verified": sum(1 for ln in record.decode("utf-8").splitlines()
+                                                  if ",sha256=" in ln and not ln.split(",", 1)[0].endswith(".pyc")),
                    "wheel_tags": [ln.split(":", 1)[1].strip() for ln in wheel.splitlines() if ln.startswith("Tag:")],
                    "files": files}
     return _NUMPY["b"]

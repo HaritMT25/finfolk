@@ -1065,7 +1065,9 @@ class TestPipeline(unittest.TestCase):
 
     def test_record_verification(self):
         """Codex r4 P2-1: every RECORD entry's sha256 is checked against the installed file: a changed file and
-        a missing one are reported; hashless entries (the RECORD, bytecode) are skipped."""
+        a missing one are reported; hashless entries (the RECORD) and bytecode entries are skipped (a shipped
+        .pyc rewritten by the installer's byte-compilation, as numpy 2.2's wheel for Python 3.10 has, is bound by
+        its own file hash in the manifest instead)."""
         import base64
         d = tempfile.mkdtemp(dir=self.tmp)
         wr(os.path.join(d, "pkg", "a.py"), "a = 1\n")
@@ -1073,8 +1075,10 @@ class TestPipeline(unittest.TestCase):
 
         def b64(text):
             return base64.urlsafe_b64encode(bytes.fromhex(rqlib.sha256_bytes(text.encode()))).rstrip(b"=").decode()
+        wr(os.path.join(d, "pkg", "__pycache__", "d.cpython-310.pyc"), "recompiled by the installer\n")
         rec = (f"pkg/a.py,sha256={b64('a = 1' + chr(10))},6\npkg/b.so,sha256={b64('other' + chr(10))},6\n"
-               f"pkg/c.py,sha256={b64('c' + chr(10))},2\npkg/__pycache__/a.cpython-312.pyc,,\npkg-1.dist-info/RECORD,,\n")
+               f"pkg/c.py,sha256={b64('c' + chr(10))},2\npkg/__pycache__/a.cpython-312.pyc,,\npkg-1.dist-info/RECORD,,\n"
+               f"pkg/__pycache__/d.cpython-310.pyc,sha256={b64('as shipped' + chr(10))},11\n")   # (numpy 2.2's wheel)
         probs = staging.record_problems(d, rec, rqlib.sha256_file)
         self.assertEqual(len(probs), 2, probs)
         self.assertTrue(probs[0].startswith("pkg/b.so: not the installed") and probs[1] == "pkg/c.py: missing")
