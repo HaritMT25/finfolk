@@ -271,8 +271,8 @@ def establishment(a, burn_in=BURN_IN):
       - an evidenced zero (valid_before) before the burn-in frame: NOT established (a restart is due, or the
         restarts are exhausted: an early failure), whatever the status;
       - a first zero at or after the burn-in frame: established (data);
-      - no zero: established when its archives reach the burn-in frame alive (the acceptance chain passed it),
-        else not yet.
+      - no zero: established when its FULL archive (archived_through, recorded before any projection on the
+        candidate times) reaches the burn-in frame alive, else not yet.
     A later technical failure ("failed") keeps an established attempt's valid snapshots."""
     if not burn_in:
         return True, "no burn-in rule"
@@ -281,7 +281,10 @@ def establishment(a, burn_in=BURN_IN):
         return False, f"a zero at frame {vb} before the burn-in frame {burn_in}"
     if vb is not None:
         return True, f"its first zero {vb} is at or after the burn-in frame"
-    if max([f for f in (a.get("archived") or []) if isinstance(f, int)] or [0]) >= burn_in:
+    through = a.get("archived_through")             # (Codex #71 r5: the FULL archive, never its projection on TIMES)
+    if through is None:
+        through = max([f for f in (a.get("archived") or []) if isinstance(f, int)] or [0])
+    if through >= burn_in:
         return True, "alive at the burn-in frame"
     return False, f"not yet alive at the burn-in frame {burn_in}"
 
@@ -324,7 +327,8 @@ def candidates(block, sentinels, reg=None):
             (r["seeds"][k] for r in (reg or {}).get("reserved", []) if r.get("slot") == rw.get("seed_slot")
              and k < len(r.get("seeds", []))), None)
         avail[w] = {"uuid": v.get("uuid"), "attempt": k, "status": v.get("status"), "seed": seed,
-                    "burn_in": int((reg or {}).get("burn_in") or BURN_IN),
+                    "burn_in": BURN_IN if (reg or {}).get("burn_in") is None else int(reg["burn_in"]),   # (0: no rule)
+                    "archived_through": max([f for f in v.get("archived", []) if isinstance(f, int)] or [0]),
                     "pattern": v.get("pattern"), "f1": (v.get("paths") or {}).get("F1"),
                     "valid_before": v.get("valid_before"),
                     "archived": sorted(f for f in v.get("archived", []) if f in {frame_of(t) for t in TIMES})}
