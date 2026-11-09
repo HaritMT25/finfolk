@@ -564,29 +564,35 @@ class TestPipeline(unittest.TestCase):
         cls.val, cls.model, cls.scores, cls.test, cls.eval, cls.impl = (
             os.path.join(cls.tmp, n) for n in ("val.jsonl", "model.json", "val_scores.json", "test.jsonl", "eval.json",
                                                "impl.json"))
-        cls.rc = [run(["predict-candidates", "--root", cls.root, "--fit", f["fit.json"], "--prefix", f["val_prefix.json"],
-                       "--model-out", cls.model, "--out", cls.val])]
+        cls.rc = []
+
+        def step(args):                                          # (a failing stage stops the fixture, with its error)
+            cls.rc.append(run(args))
+            if cls.rc[-1][0] != 0:
+                raise RuntimeError(f"{args[0]} failed: {cls.rc[-1][1]}")
+        step(["predict-candidates", "--root", cls.root, "--fit", f["fit.json"], "--prefix", f["val_prefix.json"],
+              "--model-out", cls.model, "--out", cls.val])
         cls.precommit = os.path.join(cls.tmp, "precommit")
         shutil.copytree(cls.root, cls.precommit)
         sealing.commit(cls.root, "validation", cls.val)
         cls.committed = os.path.join(cls.tmp, "committed")
         shutil.copytree(cls.root, cls.committed)
-        cls.rc.append(run(["score-validation", "--root", cls.root, "--predictions", cls.val, "--targets",
-                           f["val_targets.json"], "--out", cls.scores]))
+        step(["score-validation", "--root", cls.root, "--predictions", cls.val, "--targets", f["val_targets.json"],
+              "--out", cls.scores])
         sealing.open_validation(cls.root, cls.scores)
         cls.opened = os.path.join(cls.tmp, "opened")
         shutil.copytree(cls.root, cls.opened)
-        cls.rc.append(run(["predict-test", "--root", cls.root, "--prefix", f["test_prefix.json"], "--model", cls.model,
-                           "--selection", cls.scores, "--out", cls.test]))
-        cls.rc.append(run(["implementation", "--out", cls.impl]))
+        step(["predict-test", "--root", cls.root, "--prefix", f["test_prefix.json"], "--model", cls.model,
+              "--selection", cls.scores, "--out", cls.test])
+        step(["implementation", "--out", cls.impl])
         sealing.commit(cls.root, "test", cls.test, cls.impl)
         cls.prereg = os.path.join(cls.tmp, "prereg.pdf")
         wr(cls.prereg, "the preregistration\n")
         cls.unfrozen = os.path.join(cls.tmp, "unfrozen")
         shutil.copytree(cls.root, cls.unfrozen)
         sealing.freeze(cls.root, cls.prereg, cls.impl, osf_url="https://osf.io/abc12", registered_utc=rqlib.now_utc())
-        cls.rc.append(run(["evaluate-test", "--selection", cls.scores, "--root", cls.root, "--predictions", cls.test, "--targets",
-                           f["test_targets.json"], "--out", cls.eval]))
+        step(["evaluate-test", "--selection", cls.scores, "--root", cls.root, "--predictions", cls.test, "--targets",
+              f["test_targets.json"], "--out", cls.eval])
 
     @classmethod
     def tearDownClass(cls):
