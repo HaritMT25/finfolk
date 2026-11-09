@@ -41,9 +41,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 if os.environ.get("RQ_PYLIB"):
     sys.path.insert(0, os.environ["RQ_PYLIB"])
-import forecast as fc  # noqa: E402
-import rqlib  # noqa: E402
-import sealing  # noqa: E402
+import forecast as fc  # noqa: E402  (first: its helpers are the verified-loaded ones, used below)
+rqlib, sealing, staging = fc.rqlib, fc.sealing, fc.staging
 try:
     import numpy as np  # noqa: E402
 except ImportError:
@@ -65,7 +64,8 @@ HELD = {(k.split(":")[0], int(k.split(":")[1])) for k in HOLD}
 UUIDS = {w: str(uuid.uuid5(uuid.NAMESPACE_URL, f"finfolk:redqueen:ns-main:{w}")) for w in sorted(SPLIT)}
 MAP = {"cutoff": 120, "fit_sha256": "a" * 64, "references": {"sha256": "b" * 64, "max_frame": 120 * M}}
 COVS = ["abundance_prey", "energy"]
-GROUPS = [f"fit:{w}" for w in TRAIN] + [f"g:{w}" for w in sorted(TRAIN + VAL + TEST)]
+GROUPS = ([f"fit:{w}" for w in TRAIN] + [f"g:{w}" for w in sorted(TRAIN + VAL + TEST)]
+          + [f"test:{w}" for w in sorted(TRAIN + VAL + TEST)])
 
 
 def bid(w, t0, k):
@@ -125,13 +125,17 @@ def make_root(tmp, cfg_over=None, register=True):
     return root, cp
 
 
-def group_of(w, root, t):
-    """The fixture's registered source structure: a training world's fitting rows are measured in their own
-    group (fit:<world>), every other row in its root's evaluation group (g:<root>): independent of the fit."""
-    return f"fit:{w}" if w in TRAIN and t <= 120 and (w, t) not in HELD else f"g:{root}"
+def group_of(w, root, t, test_rows=frozenset()):
+    """The fixture's registered source structure (designed from the outcome-free registration): a training
+    world's fitting rows are measured in their own group (fit:<world>), the test stage's target rows in
+    test:<root>, every other row in g:<root>: independent of the fit, and the test targets independent of the
+    lambda selection's inputs and targets."""
+    if w in TRAIN and t <= 120 and (w, t) not in HELD:
+        return f"fit:{w}"
+    return f"test:{root}" if (w, t) in test_rows else f"g:{root}"
 
 
-def simulate(seed=7):
+def simulate(seed=7, test_rows=frozenset()):
     """Every native row (T, V, S worlds, t = 0 .. 200) and every fork branch's rows (+1, +4, +10) from the known
     linear system, measured with the group's shared component plus own noise. S2 goes extinct at 190; branch
     S1.o185M.s2 is extinct at 195; S0.o185M.s3's +4 assay is unavailable."""
@@ -142,7 +146,7 @@ def simulate(seed=7):
     rows, truth = {}, {}
 
     def meas(w, root, t, z):
-        g = group_of(w, root, t)
+        g = group_of(w, root, t, test_rows)
         return {"world": w, "t": t, "uuid": UUIDS.get(w) or buuid(w), "z": (z + us[g] + math.sqrt(R_OWN) * rng.standard_normal(2)).tolist(),
                 "cov": ((S_SH + R_OWN) * np.eye(2)).tolist(), "meas_group": g,
                 "covariates": {"abundance_prey": float(rng.uniform(300, 600)), "energy": float(rng.normal())},
@@ -452,6 +456,23 @@ class TestNumerics(unittest.TestCase):
         Gsum = sum(Mg[0][:, 2 * s:2 * s + 2] for s in range(5))
         self.assertTrue(np.allclose(Gsum + K, np.eye(2), atol=1e-9))
 
+    def test_proper_prior_breaks_equivariance(self):
+        """Codex r3 P2-3: under a PROPER initial state the shift response fails (the first filtered mean moves
+        by K0 u, not u): the refit's forecast does not move by u, and Sum G_s + K is not I; so the single-fit-
+        group source case is refused under a proper prior (the pipeline test checks the refusal)."""
+        u = np.array([0.7, -0.4])
+        z, R, x, mu, sd = self._series(R=0.003, n=60)
+        init = {"kind": "proper", "mean": [0.0, 0.0], "cov": [[1e-4, 0.0], [0.0, 1e-4]]}
+        f0 = fc.LSS(2, 2, 1.0, mu, sd, init).fit([(z, R, x)], 300, 1e-12)
+        f1 = fc.LSS(2, 2, 1.0, mu, sd, init).fit([(z + u, R, x)], 300, 1e-12)
+        W, Rw, Xw = z[:, 40:45], R[:, 40:45], x[:, 40:45]
+        m0, _, Mg = f0.forecast(W, Rw, Xw, 4)
+        m1, _, _ = f1.forecast(W + u, Rw, Xw, 4)
+        self.assertGreater(float(np.max(np.abs(m1 - m0 - u))), 1e-4)
+        K = f0.fit_loading(W, Rw, Xw, 4)[0]
+        Gsum = sum(Mg[0][:, 2 * s:2 * s + 2] for s in range(5))
+        self.assertGreater(float(np.max(np.abs(Gsum + K - np.eye(2)))), 1e-4)
+
     def test_evaluation_arithmetic(self):
         """Futures with KNOWN conditional laws N(mu, Sc), measured independently: pooled V_fork estimates tr Sc;
         the exact forecast's REDUCIBLE ~ 0 (its CI covering 0), an offset forecast's ~ ||delta||^2; one surviving
@@ -522,8 +543,8 @@ class TestPipeline(unittest.TestCase):
     def setUpClass(cls):
         cls.tmp = tempfile.mkdtemp()
         cls.root, cls.cfg_path = make_root(cls.tmp)
-        cls.rows = simulate()
         cls.ctx = fc.load_ctx(cls.root)
+        cls.rows = simulate(test_rows=frozenset(fc.stage_rows(cls.ctx, {"test", "training"})[1]))
         man = cls.ctx["manifest"]
         cls.files = {}
 
@@ -601,6 +622,11 @@ class TestPipeline(unittest.TestCase):
         self.assertEqual(by["fork:T00:30:4"]["category"], "snapshot_transfer")
         self.assertEqual(by["fork:V0:185:10"]["stage"], "test")
         self.assertEqual(by["native:T02:150:1"]["stage"], "test")                      # (its window holds T02@150)
+        p = by["native:T02:147:4"]                                       # (Codex r3: it shares T02@151 with 150:1)
+        self.assertEqual((p["stage"], p["promoted"]), ("test", "from validation: it shares an outcome with a test-stage origin"))
+        vt = set().union(*[fc.target_rows(o) for o in self.ctx["origins"] if not o["excluded"] and o["stage"] == "validation"])
+        tt = set().union(*[fc.target_rows(o) for o in self.ctx["origins"] if not o["excluded"] and o["stage"] == "test"])
+        self.assertEqual(vt & tt, set())                                 # (complete panels: no outcome in two stages)
         op = os.path.join(self.tmp, "origins.json")
         self.assertEqual(run(["origins", "--root", self.root, "--out", op])[0], 0)
         od = rqlib.read_json(op)
@@ -625,6 +651,9 @@ class TestPipeline(unittest.TestCase):
         mean = {lam: np.mean([r["metrics"][fc.lss_name(lam)]["mse"] for r in rows]) for lam in (0.1, 100.0)}
         self.assertEqual(sc["selection"]["lambda"], min(mean, key=lambda k: (mean[k], -k)))
         self.assertLess(min(mean.values()), sc["selection"]["reference"]["persistence"])
+        self.assertTrue(sc["selection"]["groups"] and all(g.startswith("g:") for g in sc["selection"]["groups"]))
+        tl = [json.loads(x) for x in rqlib.read_text(self.test).splitlines()]
+        self.assertEqual(tl[0]["provenance"]["selection_groups"], sc["selection"]["groups"])
         mod = rqlib.read_json(self.model)
         lss01 = next(s for s in mod["lss"] if s["lambda"] == 0.1)
         self.assertTrue(lss01["usable"] and lss01["monotone"])
@@ -767,6 +796,30 @@ class TestPipeline(unittest.TestCase):
         self.assertEqual(rc, 2)
         self.assertIn("shared with part of the fit", err)
 
+    def test_selection_independence_and_proper_prior(self):
+        """Codex r3 P2-4: a test target in a measurement group of the lambda selection's inputs or targets is
+        refused at evaluate-test (the selected forecast would depend on that noise; a registration
+        requirement). Codex r3 P2-3: under a proper prior, a fit whose profiles all share one group is
+        refused (the K loading needs the diffuse prior's translation equivariance)."""
+        sel = rqlib.read_json(self.scores)["selection"]["groups"]
+        tg = rqlib.read_json(self.files["test_targets.json"])
+        k = next(i for i, r in enumerate(tg["rows"]) if "z" in r and r["world"] == "T05")
+        tg["rows"][k]["meas_group"] = sel[0]
+        rc, err = run(["evaluate-test", "--root", self.copy(self.root), "--predictions", self.test, "--targets",
+                       self.put("targets.json", tg), "--out", os.path.join(self.tmp, "ev5.json")])
+        self.assertEqual(rc, 2)
+        self.assertIn("share measurement group", err)
+        d = tempfile.mkdtemp(dir=self.tmp)
+        rp, _ = make_root(d, {"lss": {"initial_state": {"kind": "proper", "mean": [0.0, 0.0], "cov": [[1.0, 0.0], [0.0, 1.0]]}}})
+        fit = rqlib.read_json(self.files["fit.json"])
+        for r in fit["rows"]:
+            if "z" in r:
+                r["meas_group"] = "fit:T00"
+        rc, err = run(["predict-candidates", "--root", rp, "--fit", self.put("fit.json", fit), "--prefix",
+                       self.files["val_prefix.json"], "--model-out", os.path.join(d, "m.json"), "--out", os.path.join(d, "v.jsonl")])
+        self.assertEqual(rc, 2)
+        self.assertIn("diffuse initial state only", err)
+
     def test_commitment_guards(self):
         """P1-4 / P1-5: scoring needs the committed bytes; predict-test needs the scores recorded by open-
         validation and the model they name; evaluate-test needs the public freeze and the committed test
@@ -875,6 +928,53 @@ class TestPipeline(unittest.TestCase):
         rc, err = self._evaluate_subprocess(os.path.join(HERE, "forecast.py"), shadow)
         self.assertEqual(rc, 2)
         self.assertIn("not the frozen evaluation script", err)
+
+    def test_executed_bytes(self):
+        """Codex r3 P2-2: the hashed bytes ARE the executed code. A copy of the tool whose __pycache__ holds a
+        timestamp-valid, sabotaged staging bytecode (a plain import of staging would run it) evaluates
+        correctly: the helpers are compiled from the source bytes hashed, never from bytecode. The manifest
+        hashes a module's executed bytes, not its file; a helper not loaded from verified bytes is refused;
+        numpy is bound by its distribution (RECORD) and its core / linalg / random / BLAS files."""
+        import importlib._bootstrap_external as be
+        import importlib.util
+        import types
+        tools = os.path.join(tempfile.mkdtemp(dir=self.tmp), "tools")
+        os.makedirs(tools)
+        for n in ("forecast.py", "staging.py", "sealing.py", "rqlib.py"):
+            shutil.copy2(os.path.join(HERE, n), tools)
+        src = os.path.join(tools, "staging.py")
+        with open(src) as f:
+            bad = f.read() + "\nraise RuntimeError('SABOTAGED bytecode executed')\n"
+        st = os.stat(src)
+        pyc = importlib.util.cache_from_source(src)
+        os.makedirs(os.path.dirname(pyc), exist_ok=True)
+        with open(pyc, "wb") as f:
+            f.write(be._code_to_timestamp_pyc(compile(bad, src, "exec"), int(st.st_mtime), st.st_size))
+        env = dict(os.environ)
+        p = subprocess.run([sys.executable, "-I", "-c", f"import sys; sys.path.insert(0, {tools!r}); "
+                            f"sys.path.insert(0, {os.environ.get('RQ_PYLIB') or tools!r}); import staging"],
+                           env=env, capture_output=True, text=True)
+        self.assertIn("SABOTAGED", p.stderr)                               # (a plain import runs the bytecode)
+        rc, err = self._evaluate_subprocess(os.path.join(tools, "forecast.py"), os.environ.get("RQ_PYLIB"))
+        self.assertEqual(rc, 0, err)                                         # (the tool runs the hashed source)
+        fake = types.ModuleType("rqfake")
+        fake.__rq_source__, fake.__file__ = b"x = 1\n", os.path.join(HERE, "rqlib.py")
+        sys.modules["rqfake"] = fake
+        try:
+            doc = json.loads(staging.implementation_manifest(fc, modules=("rqfake",)))
+            self.assertEqual(doc["modules"]["rqfake"], {"sha256": rqlib.sha256_bytes(b"x = 1\n"), "source": "x = 1\n"})
+            del fake.__rq_source__
+            with self.assertRaisesRegex(staging.StageError, "not loaded from verified source bytes"):
+                staging.implementation_manifest(fc, modules=("rqfake",))
+        finally:
+            del sys.modules["rqfake"]
+        impl = rqlib.read_json(self.impl)
+        self.assertEqual(impl["modules"]["staging"]["sha256"], rqlib.sha256_file(os.path.join(HERE, "staging.py")))
+        self.assertIn("def implementation_manifest", impl["modules"]["staging"]["source"])   # (the deposit carries it)
+        b = impl["numpy"]
+        self.assertEqual(b["version"], np.__version__)
+        self.assertTrue(any(k.startswith("linalg/") for k in b["files"]) and any(".so" in k or ".pyd" in k for k in b["files"]))
+        self.assertTrue(rqlib.is_sha256(b["record_sha256"]))
 
     def test_panel_verification(self):
         """P2-13: the registered fork panel: a dropped branch, an unregistered branch, a branch row with

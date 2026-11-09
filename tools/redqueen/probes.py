@@ -53,7 +53,9 @@ world pair values) - mean(cross-world pair values); its null permutes the predat
 BLOCKS, two-sided plus-one p. The design is checked first, exactly (every block's permutations enumerated):
 it must give an own-world AND a cross-world pair under EVERY block-respecting permutation, so no draw is
 undefined; an unsupported design is refused. p < the registered audit level triggers an initializer, seed
-or measurement AUDIT (reported, never a finding).
+or measurement AUDIT (reported, never a finding). It is a PROSPECTIVELY DESIGNATED founder audit (v4 §11.2)
+with fixed outputs and consequence, run before any test evaluation: every test-role founder outcome it reads
+is listed (opened_test_outcomes) and loses its prospective-test designation (v4 §7.2).
 
     probes.py register --root ROOT --config probes.json
     probes.py predict-candidates --root ROOT --features fv.json --fit-targets ft.json --model-out model.json --out val.jsonl
@@ -76,9 +78,51 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 if os.environ.get("RQ_PYLIB"):
     sys.path.insert(0, os.environ["RQ_PYLIB"])
-import rqlib  # noqa: E402
-import sealing  # noqa: E402
-import staging  # noqa: E402
+
+
+def _verified_import(names):
+    """Load each helper module from the exact source BYTES it is identified by (resolved on sys.path like an
+    import, so an RQ_PYLIB copy is the one loaded), compiled from those bytes, never from bytecode; the bytes
+    are kept on the module (__rq_source__) for the implementation manifest."""
+    import importlib.machinery
+    import types
+    sys.dont_write_bytecode = True
+    out = []
+    for name in names:
+        m = sys.modules.get(name)
+        if m is None or getattr(m, "__rq_source__", None) is None:
+            spec = importlib.machinery.PathFinder.find_spec(name, sys.path)
+            if spec is None or not str(spec.origin).endswith(".py"):
+                raise ImportError(f"{name}: no source module on the path")
+            with open(spec.origin, "rb") as f:
+                data = f.read()
+            m = types.ModuleType(name)
+            m.__file__, m.__rq_source__ = spec.origin, data
+            sys.modules[name] = m
+            try:
+                exec(compile(data, spec.origin, "exec", dont_inherit=True), m.__dict__)
+            except BaseException:
+                del sys.modules[name]
+                raise
+        out.append(m)
+    return out
+
+
+def _run_verified(path, name):
+    """The command line runs THIS file's bytes as read here (the bytes the implementation manifest hashes),
+    executed as module `name`; the interpreter's own read only reaches this call."""
+    import types
+    path = os.path.abspath(path)
+    with open(path, "rb") as f:
+        data = f.read()
+    m = types.ModuleType(name)
+    m.__file__, m.__rq_source__ = path, data
+    sys.modules[name] = m
+    exec(compile(data, path, "exec", dont_inherit=True), m.__dict__)
+    return m.main()
+
+
+rqlib, sealing, staging = _verified_import(("rqlib", "sealing", "staging"))
 
 CFG_SCHEMA = "finfolk.redqueen.probecfg/1"
 CFG_NAME = "probes.json"
@@ -489,7 +533,7 @@ def founder_pairs(ctx, doc):
         raise ProbeError(f"pairs: schema {doc.get('schema')!r}")
     if "blocks" in doc:
         raise ProbeError("pairs: blocks come from the registered founder panel, never from the pairs document")
-    out = []
+    out, opened = [], set()
     for k, p in enumerate(doc.get("pairs") or []):
         ends = []
         for side in ("prey", "predators"):
@@ -502,11 +546,13 @@ def founder_pairs(ctx, doc):
                 raise ProbeError(f"pair {k + 1} {side}: {i['world']} is not a registered founder")
             if staging.frame_of(i["t"]) != fd["frame"]:
                 raise ProbeError(f"pair {k + 1} {side}: {i['world']}@{i['t']} is not the founder snapshot (frame {fd['frame']}, F1)")
+            if i["role"] == "test":
+                opened.add(i["world"])
             ends.append(i["world"])
         if not _num(p.get("value")):
             raise ProbeError(f"pair {k + 1}: a finite value is required")
         out.append({"prey_world": ends[0], "pred_world": ends[1], "value": float(p["value"])})
-    return out, {w: v["block"] for w, v in fd["panel"].items()}
+    return out, {w: v["block"] for w, v in fd["panel"].items()}, sorted(opened)
 
 
 # ================================================================== stages
@@ -552,7 +598,7 @@ def predict_candidates(ctx, feat_path, fit_path, model_out, out):
                      "target_ids_sha256": rqlib.canonical_sha(sorted([list(k) for k in yt]))},
              "adjustment": adj, "probes": {t: {cid: p.state() for cid, p in s.items()} for t, s in states.items()},
              "unavailable": avail, "environment": staging.environment(),
-             "implementation": json.loads(staging.implementation_manifest(os.path.abspath(__file__)))}
+             "implementation": json.loads(staging.implementation_manifest(sys.modules[__name__]))}
     data = rqlib.canonical(model)
     rqlib.write_durable(model_out, data)
     prov = {"config_sha256": ctx["cfg_sha"], "split_manifest_sha256": ctx["manifest_sha"], "features_sha256": fsha,
@@ -723,7 +769,7 @@ def main(argv=None):
             print(f"{os.path.join(a.root, 'config', CFG_NAME)}: sha256 {register(a.root, a.config)}")
             return 0
         if a.cmd == "implementation":
-            impl = staging.implementation_manifest(os.path.abspath(__file__))
+            impl = staging.implementation_manifest(sys.modules[__name__])
             rqlib.write_durable(a.out, impl)
             print(f"{a.out}: sha256 {rqlib.sha256_bytes(impl)} (commit and freeze it as the evaluation script)")
             return 0
@@ -731,11 +777,15 @@ def main(argv=None):
         cfg = ctx["cfg"]
         if a.cmd == "enrichment":
             _, doc, sha = staging.read_doc(a.pairs)
-            pairs, blocks = founder_pairs(ctx, doc)
+            pairs, blocks, opened = founder_pairs(ctx, doc)
             en = cfg["enrichment"]
             rec = enrichment(pairs, blocks, en["permutations"], en["seed_namespace"], en["audit_alpha"], en["max_block"])
-            rqlib.write_json_durable(a.out, dict(rec, exploratory=True, pairs_sha256=sha, config_sha256=ctx["cfg_sha"],
-                                                 founder_panel_sha256=rqlib.canonical_sha(cfg["founders"])))
+            rqlib.write_json_durable(a.out, dict(
+                rec, exploratory=True, pairs_sha256=sha, config_sha256=ctx["cfg_sha"],
+                founder_panel_sha256=rqlib.canonical_sha(cfg["founders"]), opened_test_outcomes=opened,
+                designation="a prospectively designated founder audit (v4 §11.2): its outputs and audit consequence are "
+                            "fixed; every test-role founder outcome it reads (opened_test_outcomes) loses its "
+                            "prospective-test designation (v4 §7.2)"))
             print({k: rec[k] for k in ("statistic", "p", "audit")})
             return 0
         if a.cmd == "predict-candidates":
@@ -748,7 +798,7 @@ def main(argv=None):
             ms = {(ln.get("provenance") or {}).get("model_sha256") for ln in lines}
             if len(ms) != 1:
                 raise ProbeError("the committed lines name several model states")
-            impl = staging.implementation_manifest(os.path.abspath(__file__))
+            impl = staging.implementation_manifest(sys.modules[__name__])
             doc = {"schema": VALSCORES, "exploratory": True, "VAL_PRED_SHA": mk, "config_sha256": ctx["cfg_sha"],
                    "model_sha256": ms.pop(), "targets_sha256": tsha, "metric": "residual_r2 (primary); r2 (supporting)",
                    "targets": score_validation(ctx, lines, truth), "scoring": scoring_record(impl)}
@@ -766,7 +816,7 @@ def main(argv=None):
             print(f"{a.out}: {len(lines)} test lines; commit them with the implementation manifest (sealing.py commit "
                   "--stage test --eval-script IMPL.json), then freeze, before evaluate-test")
             return 0
-        impl = staging.implementation_manifest(os.path.abspath(__file__))
+        impl = staging.implementation_manifest(sys.modules[__name__])
         g = staging.test_gate(ctx["root"], a.predictions, impl)
         lines = g["rows"]
         for ln in lines:
@@ -790,4 +840,4 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(_run_verified(__file__, "probes"))

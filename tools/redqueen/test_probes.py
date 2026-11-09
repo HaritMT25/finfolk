@@ -35,9 +35,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 if os.environ.get("RQ_PYLIB"):
     sys.path.insert(0, os.environ["RQ_PYLIB"])
-import probes as pb  # noqa: E402
-import rqlib  # noqa: E402
-import sealing  # noqa: E402
+import probes as pb  # noqa: E402  (first: its helpers are the verified-loaded ones, used below)
+rqlib, sealing = pb.rqlib, pb.sealing
 try:
     import numpy as np  # noqa: E402
 except ImportError:
@@ -382,6 +381,8 @@ class TestPipeline(unittest.TestCase):
         rec = rqlib.read_json(out)
         self.assertFalse(rec["audit"])
         self.assertEqual(rec["founder_panel_sha256"], rqlib.canonical_sha(rqlib.read_json(self.cfg_path)["founders"]))
+        self.assertEqual(rec["opened_test_outcomes"], sorted(w for w in CWORLDS if SPLIT[w] == "test"))   # (Codex r3)
+        self.assertIn("loses its prospective-test designation", rec["designation"])
         bad_cases = [(dict(doc, blocks={w: 0 for w in CWORLDS}), "registered founder panel"),
                      (dict(doc, pairs=pairs + [dict(pairs[0], prey={"world": CWORLDS[0], "t": 10})]), "founder snapshot"),
                      (dict(doc, pairs=pairs + [dict(pairs[0], prey={"world": "w00", "t": 0})]), "not a registered founder"),

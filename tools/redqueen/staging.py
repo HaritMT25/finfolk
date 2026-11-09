@@ -23,9 +23,11 @@ VERIFIED READS. A committed prediction file is read ONCE; its bytes must hash to
 (VAL_PRED_SHA / TEST_PRED_SHA, itself bound to its record) and are parsed from those same bytes. The
 validation selection is read once and must be the scores recorded by open-validation. Test scoring passes
 through sealing.require_test_freeze with the evaluator's IMPLEMENTATION MANIFEST (implementation_manifest:
-the entry script and every module of the tool as actually LOADED, RQ_PYLIB included, the interpreter and
-numpy), frozen as the "evaluation script" of the test commitment; it consumes the verified bytes the gate
-returns, the validation-evaluation record included, never the paths again.
+the entry and the tool modules as EXECUTED - each tool loads staging, sealing and rqlib from the exact
+source bytes it hashes, compiled from those bytes and never from bytecode, and its command line re-executes
+its own verified bytes; the sources are embedded, so the deposited manifest carries the implementation -,
+the interpreter and the numpy distribution), frozen as the "evaluation script" of the test commitment; it
+consumes the verified bytes the gate returns, the validation-evaluation record included, never the paths.
 """
 from __future__ import annotations
 
@@ -42,7 +44,7 @@ import sealing  # noqa: E402
 UNIT = sealing.UNIT
 LABEL_KEYS = ("split", "role", "stage", "holdout")
 STAGE_RANK = {"training": 0, "validation": 1, "test": 2}
-IMPL_SCHEMA = "finfolk.redqueen.implementation/1"
+IMPL_SCHEMA = "finfolk.redqueen.implementation/2"
 TOOL_MODULES = ("staging", "sealing", "rqlib")
 
 
@@ -262,26 +264,82 @@ def environment():
     return env
 
 
-def implementation_manifest(entry_file, modules=TOOL_MODULES):
-    """The implementation that runs, as LOADED (sys.modules: an RQ_PYLIB copy is the one hashed) -> canonical
-    bytes: the entry script, every tool module, the interpreter and numpy (version and its compiled core).
-    Frozen as the test commitment's "evaluation script"; recomputed in-process by the evaluator."""
+_NUMPY = {}
+NUMPY_PARTS = ("", "_core", "core", "linalg", "random")
+
+
+def numpy_binding():
+    """The installed numpy distribution the numerics run on: its version, the sha256 of its RECORD (every
+    installed file's recorded hash) and wheel tags, and the sha256 of every source / extension file of the
+    package root and its _core (core), linalg and random packages and of numpy.libs (the bundled BLAS):
+    the numerical implementation used, independent of which submodules happen to be imported. Cached."""
+    if "b" in _NUMPY:
+        return _NUMPY["b"]
+    try:
+        import numpy
+        import numpy.linalg  # noqa: F401
+        import numpy.random  # noqa: F401
+    except ImportError:
+        _NUMPY["b"] = None
+        return None
+    import importlib.metadata
+    pkg = os.path.dirname(os.path.abspath(numpy.__file__))
+    files = {}
+    for sub in NUMPY_PARTS:
+        d = os.path.join(pkg, sub)
+        if not os.path.isdir(d):
+            continue
+        for n in sorted(os.listdir(d)):
+            p = os.path.join(d, n)
+            if os.path.isfile(p) and (n.endswith((".py", ".pyd")) or ".so" in n):
+                files[f"{sub}/{n}" if sub else n] = rqlib.sha256_file(p)
+    libs = os.path.join(os.path.dirname(pkg), "numpy.libs")
+    if os.path.isdir(libs):
+        for n in sorted(os.listdir(libs)):
+            if os.path.isfile(os.path.join(libs, n)):
+                files[f"../numpy.libs/{n}"] = rqlib.sha256_file(os.path.join(libs, n))
+    record = wheel = None
+    try:
+        dist = importlib.metadata.distribution("numpy")
+        record, wheel = dist.read_text("RECORD"), dist.read_text("WHEEL")
+    except Exception:                        # (an unpackaged numpy: its files still bind it)
+        pass
+    _NUMPY["b"] = {"version": numpy.__version__, "record_sha256": rqlib.sha256_bytes(record.encode()) if record else None,
+                   "wheel_tags": [ln.split(":", 1)[1].strip() for ln in (wheel or "").splitlines() if ln.startswith("Tag:")],
+                   "files": files}
+    return _NUMPY["b"]
+
+
+def source_of(module):
+    """The bytes a module was EXECUTED from (its __rq_source__, set by the verified loader), or, for an
+    entry module imported normally (tests), its file's bytes."""
+    data = getattr(module, "__rq_source__", None)
+    if data is None:
+        f = getattr(module, "__file__", None)
+        if not f:
+            raise StageError(f"{getattr(module, '__name__', module)} has no source")
+        data = rqlib.read_bytes(f)
+    return data
+
+
+def implementation_manifest(entry, modules=TOOL_MODULES):
+    """The implementation that runs -> canonical bytes: the entry module and every tool module as EXECUTED
+    (the source bytes they were compiled from, embedded: the deposited manifest carries the implementation
+    itself), the interpreter, and the numpy distribution (numpy_binding). A tool module not loaded from
+    verified bytes is refused. Frozen as the test commitment's "evaluation script"; recomputed in-process
+    by the evaluator."""
+    def rec(data):
+        return {"sha256": rqlib.sha256_bytes(data), "source": data.decode("utf-8")}
     mods = {}
     for name in modules:
-        f = getattr(sys.modules.get(name), "__file__", None)
-        if not f:
-            raise StageError(f"implementation module {name} is not loaded")
-        mods[name] = rqlib.sha256_file(f)
-    doc = {"schema": IMPL_SCHEMA, "entry": {"name": os.path.basename(entry_file), "sha256": rqlib.sha256_file(entry_file)},
-           "modules": mods, "python": {"version": platform.python_version(),
-                                       "implementation": platform.python_implementation()},
-           "machine": platform.machine(), "numpy": None}
-    try:                                     # (imported here: the manifest never depends on import timing)
-        import numpy as np
-    except ImportError:
-        np = None
-    if np is not None:
-        core = next((m for n, m in sorted(sys.modules.items()) if n.endswith("._multiarray_umath")
-                     and getattr(m, "__file__", None)), None)
-        doc["numpy"] = {"version": np.__version__, "core_sha256": rqlib.sha256_file(core.__file__) if core else None}
+        m = sys.modules.get(name)
+        if m is None or getattr(m, "__rq_source__", None) is None:
+            raise StageError(f"implementation module {name} was not loaded from verified source bytes")
+        mods[name] = rec(m.__rq_source__)
+    doc = {"schema": IMPL_SCHEMA, "entry": dict(rec(source_of(entry)), name=entry.__name__), "modules": mods,
+           "python": {"version": platform.python_version(), "implementation": platform.python_implementation(),
+                      "cache_tag": sys.implementation.cache_tag},
+           "machine": platform.machine(), "numpy": numpy_binding(),
+           "obtain": "the tool modules' sources are embedded; numpy: pip install numpy==<version> for the wheel tags, "
+                     "checked against record_sha256 and files"}
     return rqlib.canonical(doc)
