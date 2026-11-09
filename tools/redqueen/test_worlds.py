@@ -7,6 +7,8 @@ tests/redqueen_worlds.sh).
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import json
 import os
 import shutil
@@ -1497,6 +1499,282 @@ class TestBurnIn(unittest.TestCase):
         reg2 = {k: v for k, v in reg.items() if k not in ("seed_scheme", "reserved")}
         s, msgs = supervisor(root, reg2, ar)
         self.assertEqual(s.burn_in, 0)
+
+
+def tree_state(path):
+    """{relative path: (sha256 or None for a directory, mode)} of everything under path."""
+    out = {}
+    for d, dirs, files in os.walk(path):
+        out[os.path.relpath(d, path)] = (None, os.stat(d).st_mode)
+        for f in files:
+            p = os.path.join(d, f)
+            out[os.path.relpath(p, path)] = (rqlib.sha256_file(p), os.stat(p).st_mode)
+    return out
+
+
+class TestEcology(unittest.TestCase):
+    """Annex H AMENDMENT D6 (rules 22-25, 29-30): the read-only ecological export over EVERY attempt (the
+    first evidenced sampled zero, competing prey-terminal events, technical censoring, restarts kept,
+    exhausted reservations, rolled-back segments, evidence hashes) and the monitoring indicators. Worlds
+    are built through the supervisor's own startup (acceptance, the zero ledger, restarts)."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        worlds.release_archives()
+        rm_tree(self.tmp)
+
+    def world(self, tr="B", pred=lambda f: 8, prey=lambda f: 50, energy=lambda f: 150.0, burn_in=0, max_restarts=8,
+              ckpts=(1000, 2000)):
+        root, reg, ar = make_root(self.tmp, tr, dict(SCHED, total_steps=3000), burn_in=burn_in, max_restarts=max_restarts)
+        w = reg["worlds"][0]
+        wid = w["id"]
+        d = worlds.wdir(root, wid)
+        os.makedirs(os.path.join(d, "seg000"))
+        os.makedirs(os.path.join(d, "ckpt"))
+        cfg = cfg_for(w["flags"])
+        f1p = os.path.join(self.tmp, "F1.json")
+        wr(f1p, ckpt.dumps(mk_cp(frame=1, cfg_extra=cfg)))
+        worlds.archive_one(root, wid, ar, 1, f1p, lambda m: None, extra={"binary_sha256": EXE_SHA})
+        wr(os.path.join(d, "seg000", "run.csv"), "step,population,predator_pop,predator_avg_energy\n" + "".join(
+            f"{f},{prey(f)},{pred(f)},{energy(f)}\n" for f in range(100, 3001, 100)))
+        wr(os.path.join(d, "seg000", "run.wiring.csv"), "step,PREY_FWD\n" + "".join(
+            f"{f},0.5\n" for f in range(100, 3001, 100)))
+        for f in ckpts:
+            wr(os.path.join(d, "ckpt", f"end.{f}.json"), ckpt.dumps(mk_cp(frame=f, cfg_extra=cfg)))
+        worlds.write_state(root, wid, {"schema": worlds.STATE_SCHEMA, "id": wid, "status": "interrupted", "failures": 0,
+                                       "segments": [{"name": "seg000", "start_frame": 0, "resumed_from": None,
+                                                     "resumed_accept": None, "args": []}]})
+        s, msgs = supervisor(root, reg, ar)
+        s.startup()
+        return root, reg, ar, wid, msgs
+
+    def test_predator_extinction_is_the_first_sampled_zero(self):
+        root, reg, ar, wid, msgs = self.world(pred=lambda f: 0 if f >= 2500 else 8, burn_in=2000)
+        self.assertEqual(worlds.read_state(root, wid)["status"], "extinct", msgs)
+        doc = worlds.ecology(root, reg, [1000, 2500, 3000])
+        o = doc["slots"][wid]["attempts"][0]
+        self.assertEqual(o["events"], {"predators": {"frame": 2500, "previous_sample": 2400}, "prey": None})
+        self.assertEqual((o["first_terminal"], o["observation"], o["burn_in"], o["establishment"]),
+                         ({"frame": 2500, "kind": "predators"}, "event", "established", "established"))
+        self.assertEqual((o["accepted_through"], o["frontier"], o["integrity"], o["unsupported_ledger"]), (2000, 2500, [], []))
+        ev = o["evidence"]
+        d = worlds.wdir(root, wid)
+        self.assertEqual(ev["state_sha256"], rqlib.sha256_file(os.path.join(d, "state.json")))
+        self.assertEqual(ev["accept_sha256"], rqlib.sha256_file(os.path.join(d, "accept.jsonl")))
+        raw = rqlib.read_bytes(os.path.join(d, "seg000", "run.csv"))
+        self.assertEqual([(e["segment"], e["through"], e["csv_sha256"]) for e in ev["segments"]],
+                         [("seg000", 2000, rqlib.sha256_bytes(raw[:ev["segments"][0]["csv_bytes"]]))])
+        self.assertEqual(ev["tail"]["csv_sha256"], rqlib.sha256_bytes(raw[:ev["tail"]["csv_bytes"]]))
+        self.assertTrue(raw[:ev["tail"]["csv_bytes"]].endswith(b"2500,50,0,150.0\n"))     # (the prefix through the zero)
+        surv = doc["summary"]["B"]["first_attempt"]["survival"]
+        self.assertEqual((surv["1000"]["estimate"], surv["2500"]["estimate"], surv["3000"]["counts"]["predator_extinct"]),
+                         (1.0, 0.0, 1))                                    # (a zero sampled AT a horizon is extinct there)
+        self.assertEqual(doc["summary"]["B"]["first_attempt"]["extinction_times"]["predators"][0]["frame"], 2500)
+        self.assertEqual(doc["summary"]["B"]["retained_attempt"]["survival"], surv)
+        self.assertEqual(doc["registry_sha256"], rqlib.sha256_file(os.path.join(root, "config", "worlds.json")))
+
+    def test_prey_terminal_is_a_competing_event(self):
+        root, reg, ar, wid, msgs = self.world(prey=lambda f: 0 if f >= 2500 else 50)
+        doc = worlds.ecology(root, reg, [2500, 3000])
+        o = doc["slots"][wid]["attempts"][0]
+        self.assertEqual((o["first_terminal"]["kind"], o["events"]["predators"]), ("prey", None))
+        surv = doc["summary"]["B"]["first_attempt"]["survival"]
+        self.assertEqual(surv["2500"]["estimate"], 1.0)                    # (the predators were seen alive at 2500)
+        self.assertEqual((surv["3000"]["counts"]["prey_terminal"], surv["3000"]["complete"], surv["3000"]["bounds"]),
+                         (1, False, [0.0, 1.0]))                           # (never predator extinction)
+        self.assertNotIn("estimate", surv["3000"])
+        self.assertEqual(doc["summary"]["B"]["first_attempt"]["first_terminal_events"]["prey"], 1)
+        # both guilds at zero in one sample: a joint event (predator extinct; their order unresolved)
+        rm_tree(self.tmp)
+        self.tmp = tempfile.mkdtemp()
+        root, reg, ar, wid, msgs = self.world(prey=lambda f: 0 if f >= 2500 else 50, pred=lambda f: 0 if f >= 2500 else 8)
+        o = worlds.ecology(root, reg, [3000])["slots"][wid]["attempts"][0]
+        self.assertEqual((o["joint"], o["first_terminal"]["kind"], worlds.at_horizon(o, 3000)), (True, "joint", "predator_extinct"))
+
+    def test_first_attempt_kept_across_a_restart(self):
+        root, reg, ar, wid, msgs = self.world(pred=lambda f: 0 if f >= 1500 else 8, burn_in=2000)
+        self.assertEqual(worlds.attempt_of(root, wid), 1, msgs)
+        doc = worlds.ecology(root, reg, [3000])
+        a0, a1 = doc["slots"][wid]["attempts"]
+        seeds = next(x["seeds"] for x in reg["reserved"] if x["slot"] == reg["worlds"][0]["seed_slot"])
+        self.assertEqual((a0["source"], a0["seed"], a0["dir"]),
+                         ("retained", seeds[0], os.path.join(root, "restarts", "worlds", f"{wid}.a0")))
+        self.assertEqual((a0["events"]["predators"]["frame"], a0["burn_in"], a0["establishment"]),
+                         (1500, "early_failure", "restarted"))
+        self.assertEqual((a0["restart_record"]["zero_frame"], a0["integrity"]), (1500, []))
+        self.assertEqual(a0["evidence"]["relocated_sha256"],
+                         rqlib.sha256_file(os.path.join(a0["dir"], "relocated.json")))
+        self.assertEqual((a1["source"], a1["seed"], a1["observation"], a1["establishment"]),
+                         ("current", seeds[1], "ongoing", "unresolved"))
+        s = doc["summary"]["B"]
+        self.assertEqual(s["first_attempt"]["survival"]["3000"]["estimate"], 0.0)     # (the failure is not erased)
+        self.assertEqual(s["retained_attempt"]["survival"]["3000"]["counts"]["not_yet_observed"], 1)
+        self.assertEqual((s["attempts"]["early_failures"], s["attempts"]["resolved"], s["attempts"]["early_failure_rate"]),
+                         (1, 1, 1.0))
+        self.assertEqual((s["establishment_conditional"]["survival"]["3000"]["N"],
+                          s["establishment_conditional"]["excluded_unresolved"]), (0, 1))
+
+    def test_exhausted_reservation_is_an_establishment_failure(self):
+        root, reg, ar, wid, msgs = self.world(pred=lambda f: 0 if f >= 1500 else 8, burn_in=2000, max_restarts=0)
+        self.assertIn("restarts exhausted", worlds.read_state(root, wid)["end_reason"], msgs)
+        doc = worlds.ecology(root, reg, [3000])
+        o = doc["slots"][wid]["attempts"][0]
+        self.assertEqual((o["establishment"], doc["slots"][wid]["exhausted"], o["censor"]), ("exhausted", True, None))
+        self.assertEqual(doc["summary"]["B"]["attempts"]["exhausted_slots"], 1)
+        self.assertEqual(doc["summary"]["B"]["first_attempt"]["survival"]["3000"]["counts"]["predator_extinct"], 1)
+
+    def test_technical_censoring_rollback_and_unsupported_ledger(self):
+        root, reg, ar, wid, msgs = self.world(pred=lambda f: 0 if f >= 2500 else 8, burn_in=2000)
+        d = worlds.wdir(root, wid)
+        p = os.path.join(d, "seg000", "run.csv")
+        raw = rqlib.read_bytes(p)
+        os.chmod(p, 0o644)
+        wr(p, raw.replace(b"1500,50,8,", b"1500,50,9,").decode())        # (an accepted row damaged: same length)
+        o = worlds.ecology(root, reg, [1000, 3000])["slots"][wid]["attempts"][0]
+        self.assertEqual((o["accepted_through"], o["frontier"], o["events"]["predators"]), (1000, 1000, None))
+        self.assertEqual([u["why"][:22] for u in o["unsupported_ledger"]], ["its main-CSV prefix no"])
+        self.assertEqual((o["observation"], o["censor"]), ("technical", {"kind": "technical", "frame": 1000}))
+        self.assertTrue(any("says extinct" in x for x in o["integrity"]), o["integrity"])
+        doc = worlds.ecology(root, reg, [1000, 3000])
+        self.assertEqual((doc["summary"]["B"]["first_attempt"]["survival"]["1000"]["counts"]["alive"],
+                          doc["summary"]["B"]["first_attempt"]["survival"]["3000"]["counts"]["technical"]), (1, 1))
+        # a technically failed world: censored at its last verified observation
+        wr(p, raw.decode())
+        st = worlds.read_state(root, wid)
+        worlds.write_state(root, wid, dict(st, status="failed"))
+        rm = os.path.join(root, "availability.jsonl")
+        os.remove(rm)                                                       # (no zero evidenced any more)
+        o = worlds.ecology(root, reg, [3000])["slots"][wid]["attempts"][0]
+        self.assertEqual((o["observation"], o["censor"], o["frontier"]), ("technical", {"kind": "technical", "frame": 2000}, 2000))
+
+    def test_done_world_alive_through_the_end_and_read_only(self):
+        root, reg, ar, wid, msgs = self.world(ckpts=(1000, 2000, 3000))
+        self.assertEqual(worlds.read_state(root, wid)["status"], "done", msgs)
+        before = tree_state(root)
+        doc = worlds.ecology(root, reg)
+        self.assertEqual(doc["horizons"], [3000])                          # (the registered end within the schedule)
+        o = doc["slots"][wid]["attempts"][0]
+        self.assertEqual((o["observation"], o["censor"]), ("administrative", {"kind": "administrative", "frame": 3000}))
+        row = doc["summary"]["B"]["first_attempt"]["survival"]["3000"]
+        self.assertEqual((row["estimate"], row["complete"]), (1.0, True))
+        self.assertAlmostEqual(row["ci95"][0], 0.025, places=6)
+        out = os.path.join(self.tmp, "eco.json")
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(worlds.main(["ecology", "--root", root, "--out", out, "--horizons", "1000,3000"]), 0)
+            self.assertEqual(worlds.main(["monitor", "--root", root, "--out", out + ".m", "--window", "500",
+                                          "--step", "100"]), 0)
+            self.assertEqual(worlds.main(["monitor", "--root", root, "--out", out + ".x", "--window", "550"]), 2)
+        self.assertEqual(rqlib.read_json(out)["horizons"], [1000, 3000])
+        self.assertEqual(tree_state(root), before)                         # (nothing under the study root changed)
+
+    def test_q200_counts_only_coexisting_c_histories(self):
+        root, reg, ar = make_root(self.tmp, "C", dict(SCHED, total_steps=3000))
+        doc = worlds.ecology(root, reg)
+        self.assertEqual((doc["Q200"]["count"], doc["Q200"]["h_pqft_available"]), (0, False))
+        self.assertEqual(doc["summary"]["C"]["first_attempt"]["survival"]["3000"]["counts"]["not_yet_observed"], 1)
+
+    def test_clopper_pearson(self):
+        cp = worlds.clopper_pearson
+        self.assertAlmostEqual(cp(0, 10)[1], 1 - 0.025 ** 0.1, places=9)
+        self.assertAlmostEqual(cp(10, 10)[0], 0.025 ** 0.1, places=9)
+        lo, hi = cp(5, 10)
+        self.assertAlmostEqual(lo, 0.187086, places=5)
+        self.assertAlmostEqual(hi, 0.812914, places=5)
+        self.assertEqual(cp(0, 10)[0], 0.0)
+
+    def test_monitor_windows_breeders_and_energy(self):
+        samples = [(f, {"predator_pop": 20, "predator_avg_energy": 150.0}) for f in range(100, 3001, 100)]
+        ev = [(1200, "B", 10, False, True), (2300, "S", 1, True, True), (2350, "S", 2, False, True)]
+        rows = worlds.monitor_windows(samples, ev, 500, 100, 100, 2000, lineage_through=3000)
+        self.assertEqual([r["to"] for r in rows], list(range(2500, 3001, 100)))
+        r = rows[0]                                                        # (2000, 2500]
+        self.assertAlmostEqual(r["predator_seconds"], 20 * 500 * 0.016)
+        self.assertEqual((r["starvation"], r["breeder_starvation"], r["nonbreeder_starvation"]), (2, 1, 1))
+        self.assertAlmostEqual(r["breeder_starvation_rate"], 1 / 160 * 1000)
+        self.assertAlmostEqual(r["mean_energy"], 150.0)
+        self.assertEqual([x["deterioration"] for x in rows], [True, True, True, False, False, False])
+        (ep,) = worlds._episodes(rows, 100)
+        self.assertEqual((ep["first_to"], ep["last_to"], ep["windows"]), (2500, 2700, 3))
+        self.assertAlmostEqual(ep["max_rate"], 6.25)
+        self.assertAlmostEqual(ep["min_energy"], 150.0)
+        hi = [(f, {"predator_pop": 20, "predator_avg_energy": 200.0}) for f in range(100, 3001, 100)]
+        self.assertFalse(any(x["deterioration"] for x in worlds.monitor_windows(hi, ev, 500, 100, 100, 2000, 3000)))
+        # a starved predator without known ancestry: the breeder indicator unavailable for its windows
+        bad = worlds.monitor_windows(samples, ev + [(2600, "S", 99, False, False)], 500, 100, 100, 2000, 3000)
+        self.assertEqual([x["breeder_indicator"][:11] for x in bad if x["to"] in (2600, 3000)], ["unavailable"] * 2)
+        self.assertEqual(bad[1]["deterioration"], False)
+        # past the lineage log's accepted frame, and B (no lineage log): unavailable, never a zero
+        late = worlds.monitor_windows(samples, ev, 500, 100, 100, 2000, lineage_through=2600)
+        self.assertEqual((late[1]["breeder_indicator"], late[2]["breeder_starvation_rate"]),
+                         ("available", None))
+        self.assertIsNone(worlds.monitor_windows(samples, None, 500, 100, 100, 2000)[0]["breeder_starvation_rate"])
+
+    def test_monitor_acute_flag_in_b(self):
+        root, reg, ar, wid, msgs = self.world(pred=lambda f: 12 if f >= 2100 else 20, burn_in=2000, ckpts=(1000, 2000, 3000))
+        m = worlds.monitor(root, reg, 500, 100)
+        v = m["worlds"][wid]
+        self.assertEqual(v["acute"], {"first_frame": 2100, "samples": 10, "min_predator_pop": 12})
+        self.assertEqual((v["breeder_indicator"], v["deterioration"]), ("unavailable: no individual lineage log (B)", []))
+        self.assertEqual(v["latest_window"]["to"], 3000)
+        self.assertEqual([s_["to"] for s_ in v["summaries"]], [3000])
+        rm_tree(self.tmp)
+        self.tmp = tempfile.mkdtemp()
+        root, reg, ar, wid, msgs = self.world(tr="A", pred=lambda f: 8, burn_in=2000, ckpts=(1000, 2000, 3000))
+        self.assertFalse(worlds.monitor(root, reg, 500, 100)["worlds"][wid]["monitored"])   # (A: not 12 <= 15)
+
+    def test_monitor_c_breeders_from_the_accepted_lineage_log(self):
+        """A C world accepted through its lineage log: founder 1 buds (a proven breeder) and starves at 1500,
+        founder 2 starves at 1600 without budding; the breeder's death flags its windows (E 150 < 180)."""
+        root, reg, ar = make_root(self.tmp, "C", dict(SCHED, total_steps=3000))
+        w = reg["worlds"][0]
+        wid = w["id"]
+        d = worlds.wdir(root, wid)
+        os.makedirs(os.path.join(d, "seg000"))
+        os.makedirs(os.path.join(d, "ckpt"))
+        cfg = cfg_for(w["flags"])
+        f1p = os.path.join(self.tmp, "F1.json")
+        wr(f1p, ckpt.dumps(mk_cp(frame=1, n_pred=6, cfg_extra=cfg)))
+        worlds.archive_one(root, wid, ar, 1, f1p, lambda m: None, extra={"binary_sha256": EXE_SHA})
+        npred = lambda f: 6 if f < 500 else 7 if f < 1500 else 6 if f < 1600 else 5  # noqa: E731
+        fr = range(100, 3001, 100)
+        s0 = os.path.join(d, "seg000")
+        wr(os.path.join(s0, "run.csv"), "step,population,predator_pop,predator_avg_energy\n"
+           + "".join(f"{f},50,{npred(f)},150.0\n" for f in fr))
+        wr(os.path.join(s0, "run.wiring.csv"), "step,PREY_FWD\n" + "".join(f"{f},0.5\n" for f in fr))
+        wr(os.path.join(s0, "run.predators.csv"), "step,predator_pop\n" + "".join(f"{f},{npred(f)}\n" for f in fr))
+        wr(os.path.join(s0, "run.pwiring.csv"), "step,PREY\n" + "".join(f"{f},0.5\n" for f in fr))
+        wr(os.path.join(s0, "run.predlog.csv"), "frame,event,id,parent,lineage\n"
+           + "".join(f"0,F,{i},0,{i}\n" for i in range(1, 7)) + "500,B,7,1,1\n1500,S,1,0,1\n1600,S,2,0,2\n")
+        for f, n, births, starv in ((1000, 7, 1, 0), (2000, 5, 1, 2)):
+            cp = mk_cp(frame=f, n_pred=n, cfg_extra=cfg)
+            cp["counters"].update(totalPredatorBirths=births, totalPredatorDeathsStarvation=starv)
+            wr(os.path.join(d, "ckpt", f"end.{f}.json"), ckpt.dumps(cp))
+        worlds.write_state(root, wid, {"schema": worlds.STATE_SCHEMA, "id": wid, "status": "interrupted", "failures": 0,
+                                       "segments": [{"name": "seg000", "start_frame": 0, "resumed_from": None,
+                                                     "resumed_accept": None, "args": []}]})
+        s, msgs = supervisor(root, reg, ar)
+        s.startup()
+        self.assertEqual(max(r["frame"] for r in worlds.accept_records(root, wid)), 2000, msgs)
+        v = worlds.monitor(root, reg, 500, 100)["worlds"][wid]
+        self.assertEqual((v["breeder_indicator"], v["lineage_through"]), ("available", 2000))
+        self.assertEqual(v["acute"], {"first_frame": 100, "samples": 20, "min_predator_pop": 5})   # (5-7 <= 15)
+        self.assertEqual([(e["first_to"], e["last_to"], e["windows"]) for e in v["deterioration"]], [(1500, 1900, 5)])
+        self.assertEqual(v["evidence"]["segments"][0]["predlog_sha256"],
+                         rqlib.sha256_file(os.path.join(s0, "run.predlog.csv")))
+        s2k = next(x for x in v["summaries"] if x["to"] == 2000)               # (1000, 2000]: both deaths
+        self.assertEqual((s2k["starvation"], s2k["breeder_starvation"], s2k["nonbreeder_starvation"]), (2, 1, 1))
+        self.assertEqual(s2k["births_minus_deaths"], -2)
+
+    def test_layout_64_note_and_older_bytes(self):
+        arena = os.path.join(self.tmp, "arena.json")
+        wr(arena, json.dumps(ARENA))
+        r64 = worlds.register(arena, "ns-d7", blocks=8, per_block=worlds.LAYOUTS["64"], schedule=SCHED, layout="64")
+        self.assertIn("D7 rule 34", r64["allocation_note"])
+        r48 = worlds.register(arena, "ns-d7", blocks=8, schedule=SCHED)
+        self.assertIn("the 56 layout", r48["allocation_note"])               # (older registries keep their bytes)
+        self.assertEqual(sum(len(x["seeds"]) for x in r64["reserved"]), 576)
 
 
 if __name__ == "__main__":
