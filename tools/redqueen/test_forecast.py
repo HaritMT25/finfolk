@@ -585,7 +585,7 @@ class TestPipeline(unittest.TestCase):
         cls.unfrozen = os.path.join(cls.tmp, "unfrozen")
         shutil.copytree(cls.root, cls.unfrozen)
         sealing.freeze(cls.root, cls.prereg, cls.impl, osf_url="https://osf.io/abc12", registered_utc=rqlib.now_utc())
-        cls.rc.append(run(["evaluate-test", "--root", cls.root, "--predictions", cls.test, "--targets",
+        cls.rc.append(run(["evaluate-test", "--selection", cls.scores, "--root", cls.root, "--predictions", cls.test, "--targets",
                            f["test_targets.json"], "--out", cls.eval]))
 
     @classmethod
@@ -651,7 +651,10 @@ class TestPipeline(unittest.TestCase):
         mean = {lam: np.mean([r["metrics"][fc.lss_name(lam)]["mse"] for r in rows]) for lam in (0.1, 100.0)}
         self.assertEqual(sc["selection"]["lambda"], min(mean, key=lambda k: (mean[k], -k)))
         self.assertLess(min(mean.values()), sc["selection"]["reference"]["persistence"])
-        self.assertTrue(sc["selection"]["groups"] and all(g.startswith("g:") for g in sc["selection"]["groups"]))
+        src = sc["selection"]["group_sources"]
+        self.assertEqual(src["fit"], [f"fit:{w}" for w in TRAIN])                   # (Codex r4: the fit's groups too)
+        self.assertTrue(src["windows"] and all(g.startswith("g:") for g in src["windows"] + src["targets"]))
+        self.assertEqual(sc["selection"]["groups"], sorted(set(src["fit"] + src["windows"] + src["targets"])))
         tl = [json.loads(x) for x in rqlib.read_text(self.test).splitlines()]
         self.assertEqual(tl[0]["provenance"]["selection_groups"], sc["selection"]["groups"])
         mod = rqlib.read_json(self.model)
@@ -694,7 +697,7 @@ class TestPipeline(unittest.TestCase):
                               "--model", self.model, "--selection", self.scores, "--out", to])[0], 0)
         self.assertEqual(rqlib.read_bytes(to), rqlib.read_bytes(self.test))
         eo = os.path.join(self.tmp, "e2.json")
-        self.assertEqual(run(["evaluate-test", "--root", self.copy(self.root), "--predictions", self.test, "--targets",
+        self.assertEqual(run(["evaluate-test", "--selection", self.scores, "--root", self.copy(self.root), "--predictions", self.test, "--targets",
                               self.files["test_targets.json"], "--out", eo])[0], 0)
         self.assertEqual(rqlib.read_bytes(eo), rqlib.read_bytes(self.eval))
 
@@ -801,11 +804,11 @@ class TestPipeline(unittest.TestCase):
         refused at evaluate-test (the selected forecast would depend on that noise; a registration
         requirement). Codex r3 P2-3: under a proper prior, a fit whose profiles all share one group is
         refused (the K loading needs the diffuse prior's translation equivariance)."""
-        sel = rqlib.read_json(self.scores)["selection"]["groups"]
+        sel = rqlib.read_json(self.scores)["selection"]["group_sources"]["windows"]
         tg = rqlib.read_json(self.files["test_targets.json"])
         k = next(i for i, r in enumerate(tg["rows"]) if "z" in r and r["world"] == "T05")
         tg["rows"][k]["meas_group"] = sel[0]
-        rc, err = run(["evaluate-test", "--root", self.copy(self.root), "--predictions", self.test, "--targets",
+        rc, err = run(["evaluate-test", "--selection", self.scores, "--root", self.copy(self.root), "--predictions", self.test, "--targets",
                        self.put("targets.json", tg), "--out", os.path.join(self.tmp, "ev5.json")])
         self.assertEqual(rc, 2)
         self.assertIn("share measurement group", err)
@@ -819,6 +822,77 @@ class TestPipeline(unittest.TestCase):
                        self.files["val_prefix.json"], "--model-out", os.path.join(d, "m.json"), "--out", os.path.join(d, "v.jsonl")])
         self.assertEqual(rc, 2)
         self.assertIn("diffuse initial state only", err)
+
+    def test_fit_group_selection_dependence(self):
+        """Codex r4 P2-2, its configuration: the diffuse prior, EVERY fitting profile in one group g (the
+        supported K-loading structure), validation windows and targets independent of g. The selection depends
+        on u_g through the K_lambda loadings, so g is recorded among the selection's groups (source "fit");
+        the pipeline evaluates when the test targets are independent of g, and refuses when one is in g."""
+        root = self.copy(self.base)
+        tmp = tempfile.mkdtemp(dir=self.tmp)
+
+        def ext(name):                                   # (every fitting measurement, in every document, in glob)
+            d = rqlib.read_json(self.files[name])
+            d["measurement"]["shared"]["glob"] = (S_SH * np.eye(2)).tolist()
+            for r in d["rows"]:
+                if "z" in r and str(r.get("meas_group")).startswith("fit:"):
+                    r["meas_group"] = "glob"
+            p = os.path.join(tmp, name)
+            wr(p, d)
+            return p
+        f = {n: ext(n) for n in ("fit.json", "val_prefix.json", "val_targets.json", "test_prefix.json", "test_targets.json")}
+        val, mo, sc, tst = (os.path.join(tmp, n) for n in ("val.jsonl", "model.json", "scores.json", "test.jsonl"))
+        self.assertEqual(run(["predict-candidates", "--root", root, "--fit", f["fit.json"], "--prefix", f["val_prefix.json"],
+                              "--model-out", mo, "--out", val])[0], 0)
+        self.assertEqual(rqlib.read_json(mo)["fit"]["measurement"], {"fit_groups": ["glob"], "fit_group": "glob"})
+        sealing.commit(root, "validation", val)
+        self.assertEqual(run(["score-validation", "--root", root, "--predictions", val, "--targets", f["val_targets.json"],
+                              "--out", sc])[0], 0)
+        sel = rqlib.read_json(sc)["selection"]
+        self.assertIn("glob", sel["groups"])
+        self.assertEqual(sel["group_sources"]["fit"], ["glob"])
+        self.assertNotIn("glob", sel["group_sources"]["windows"] + sel["group_sources"]["targets"])
+        sealing.open_validation(root, sc)
+        self.assertEqual(run(["predict-test", "--root", root, "--prefix", f["test_prefix.json"], "--model", mo,
+                              "--selection", sc, "--out", tst])[0], 0)
+        sealing.commit(root, "test", tst, self.impl)
+        sealing.freeze(root, self.prereg, self.impl, osf_url="https://osf.io/abc12", registered_utc=rqlib.now_utc())
+        ev = os.path.join(tmp, "ev.json")
+        rc, err = run(["evaluate-test", "--selection", sc, "--root", root, "--predictions", tst, "--targets",
+                       f["test_targets.json"], "--out", ev])
+        self.assertEqual(rc, 0, err)
+        tt = rqlib.read_json(f["test_targets.json"])
+        k = next(i for i, r in enumerate(tt["rows"]) if "z" in r and r["world"] == "T05")
+        tt["rows"][k]["meas_group"] = "glob"
+        rc, err = run(["evaluate-test", "--selection", sc, "--root", root, "--predictions", tst, "--targets",
+                       self.put("targets.json", tt), "--out", ev])
+        self.assertEqual(rc, 2)
+        self.assertIn("share measurement group(s) ['glob'] with the fitting profiles", err)
+
+    def test_selection_metadata(self):
+        """Codex r4 P2-3: evaluate-test takes the selection's groups ONLY from the score document the frozen
+        validation-evaluation record names: committed and frozen test lines whose group metadata is omitted,
+        [] or substituted are refused, as is another score document."""
+        for name, mutate in (("omitted", lambda p: p.pop("selection_groups")),
+                             ("empty", lambda p: p.__setitem__("selection_groups", [])),
+                             ("substituted", lambda p: p.__setitem__("selection_groups", ["g:NOPE"]))):
+            root = self.copy(self.opened)
+            lines = [json.loads(x) for x in rqlib.read_text(self.test).splitlines()]
+            for ln in lines:
+                mutate(ln["provenance"])
+            tp = self.put("test.jsonl", staging.jsonl_bytes(lines).decode())
+            sealing.commit(root, "test", tp, self.impl)
+            sealing.freeze(root, self.prereg, self.impl, osf_url="https://osf.io/abc12", registered_utc=rqlib.now_utc())
+            rc, err = run(["evaluate-test", "--selection", self.scores, "--root", root, "--predictions", tp, "--targets",
+                           self.files["test_targets.json"], "--out", os.path.join(self.tmp, "ev6.json")])
+            self.assertEqual(rc, 2, name)
+            self.assertIn("selection-group metadata that is missing or not the verified selection's", err)
+        s = rqlib.read_json(self.scores)
+        other = self.put("scores.json", dict(s, selection=dict(s["selection"], groups=[])))
+        rc, err = run(["evaluate-test", "--selection", other, "--root", self.copy(self.root), "--predictions", self.test,
+                       "--targets", self.files["test_targets.json"], "--out", os.path.join(self.tmp, "ev7.json")])
+        self.assertEqual(rc, 2)
+        self.assertIn("not the validation scores the frozen validation-evaluation record names", err)
 
     def test_commitment_guards(self):
         """P1-4 / P1-5: scoring needs the committed bytes; predict-test needs the scores recorded by open-
@@ -850,11 +924,11 @@ class TestPipeline(unittest.TestCase):
                        "--selection", self.scores, "--out", t2])
         self.assertIn("not the model state", err)
         ev = os.path.join(self.tmp, "ev2.json")
-        rc, err = run(["evaluate-test", "--root", self.copy(self.unfrozen), "--predictions", self.test, "--targets",
+        rc, err = run(["evaluate-test", "--selection", self.scores, "--root", self.copy(self.unfrozen), "--predictions", self.test, "--targets",
                        self.files["test_targets.json"], "--out", ev])
         self.assertIn("no public freeze record", err)
         fresh = self.put("test.jsonl", rqlib.read_text(self.test).replace('"available":true', '"available":true ', 1))
-        rc, err = run(["evaluate-test", "--root", self.copy(self.root), "--predictions", fresh, "--targets",
+        rc, err = run(["evaluate-test", "--selection", self.scores, "--root", self.copy(self.root), "--predictions", fresh, "--targets",
                        self.files["test_targets.json"], "--out", ev])
         self.assertIn("not the committed test predictions", err)
         # the validation-evaluation record, BEFORE the gate
@@ -863,7 +937,7 @@ class TestPipeline(unittest.TestCase):
         rec = rqlib.read_json(vp)
         os.chmod(vp, 0o644)
         rqlib.write_durable(vp, rqlib.canonical(dict(rec, scores_sha256="0" * 64)))
-        rc, err = run(["evaluate-test", "--root", root, "--predictions", self.test, "--targets",
+        rc, err = run(["evaluate-test", "--selection", self.scores, "--root", root, "--predictions", self.test, "--targets",
                        self.files["test_targets.json"], "--out", ev])
         self.assertEqual(rc, 2)
         self.assertIn("not the validation evaluation the freeze recorded", err)
@@ -881,7 +955,7 @@ class TestPipeline(unittest.TestCase):
             return got
         sealing.require_test_freeze = gate_then_swap
         try:
-            rc, err = run(["evaluate-test", "--root", root, "--predictions", tp, "--targets", self.files["test_targets.json"],
+            rc, err = run(["evaluate-test", "--selection", self.scores, "--root", root, "--predictions", tp, "--targets", self.files["test_targets.json"],
                            "--out", ev])
         finally:
             sealing.require_test_freeze = real
@@ -895,7 +969,7 @@ class TestPipeline(unittest.TestCase):
         else:
             env["RQ_PYLIB"] = env_pylib
         ev = os.path.join(tempfile.mkdtemp(dir=self.tmp), "ev.json")
-        p = subprocess.run([sys.executable, "-I", script, "evaluate-test", "--root", self.copy(self.root), "--predictions",
+        p = subprocess.run([sys.executable, "-I", script, "evaluate-test", "--selection", self.scores, "--root", self.copy(self.root), "--predictions",
                             self.test, "--targets", self.files["test_targets.json"], "--out", ev],
                            env=env, capture_output=True, text=True)
         return p.returncode, p.stderr
@@ -973,8 +1047,31 @@ class TestPipeline(unittest.TestCase):
         self.assertIn("def implementation_manifest", impl["modules"]["staging"]["source"])   # (the deposit carries it)
         b = impl["numpy"]
         self.assertEqual(b["version"], np.__version__)
-        self.assertTrue(any(k.startswith("linalg/") for k in b["files"]) and any(".so" in k or ".pyd" in k for k in b["files"]))
-        self.assertTrue(rqlib.is_sha256(b["record_sha256"]))
+        files = b["files"]
+        for part in ("numpy/lib/", "numpy/linalg/", "numpy/_core/", "numpy/random/"):   # (Codex r4: np.cov's numpy.lib)
+            self.assertTrue(any(k.startswith(part) for k in files), part)
+        self.assertTrue(any(k.startswith("numpy.libs/") for k in files))
+        pkg = os.path.dirname(np.__file__)
+        pycs = [os.path.relpath(os.path.join(d, n), os.path.dirname(pkg)).replace(os.sep, "/")
+                for d, _, ns in os.walk(pkg) for n in ns if n.endswith(".pyc")]
+        self.assertTrue(set(pycs) <= set(files))                          # (every bytecode it may execute is bound)
+        self.assertTrue(rqlib.is_sha256(b["record_sha256"]) and b["record_entries_verified"] > 100)
+
+    def test_record_verification(self):
+        """Codex r4 P2-1: every RECORD entry's sha256 is checked against the installed file: a changed file and
+        a missing one are reported; hashless entries (the RECORD, bytecode) are skipped."""
+        import base64
+        d = tempfile.mkdtemp(dir=self.tmp)
+        wr(os.path.join(d, "pkg", "a.py"), "a = 1\n")
+        wr(os.path.join(d, "pkg", "b.so"), "binary\n")
+
+        def b64(text):
+            return base64.urlsafe_b64encode(bytes.fromhex(rqlib.sha256_bytes(text.encode()))).rstrip(b"=").decode()
+        rec = (f"pkg/a.py,sha256={b64('a = 1' + chr(10))},6\npkg/b.so,sha256={b64('other' + chr(10))},6\n"
+               f"pkg/c.py,sha256={b64('c' + chr(10))},2\npkg/__pycache__/a.cpython-312.pyc,,\npkg-1.dist-info/RECORD,,\n")
+        probs = staging.record_problems(d, rec, rqlib.sha256_file)
+        self.assertEqual(len(probs), 2, probs)
+        self.assertTrue(probs[0].startswith("pkg/b.so: not the installed") and probs[1] == "pkg/c.py: missing")
 
     def test_panel_verification(self):
         """P2-13: the registered fork panel: a dropped branch, an unregistered branch, a branch row with
@@ -1004,7 +1101,7 @@ class TestPipeline(unittest.TestCase):
                  (lambda rs: rs[k1].update(events={"extinction": True}), "a profile and an absorbing event"),
                  (lambda rs: rs[ke].update(unavailable="assay failed"), "an absorbing event and an unavailable")]
         for fn, why in cases:
-            rc, err = run(["evaluate-test", "--root", root, "--predictions", self.test, "--targets", variant(fn), "--out", ev])
+            rc, err = run(["evaluate-test", "--selection", self.scores, "--root", root, "--predictions", self.test, "--targets", variant(fn), "--out", ev])
             self.assertEqual(rc, 2, why)
             self.assertIn(why, err)
 

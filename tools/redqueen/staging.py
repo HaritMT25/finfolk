@@ -265,47 +265,73 @@ def environment():
 
 
 _NUMPY = {}
-NUMPY_PARTS = ("", "_core", "core", "linalg", "random")
+
+
+def record_problems(site, record_text, digest):
+    """The entries of a wheel RECORD (path, sha256=<urlsafe base64>, size; paths relative to `site`) whose
+    installed file is missing or does not hash to its recorded sha256; entries without a hash (the RECORD
+    itself, bytecode) are skipped. digest(path) -> hex sha256."""
+    import base64
+    import csv
+    import io
+    probs = []
+    for row in csv.reader(io.StringIO(record_text)):
+        if len(row) < 2 or not row[1]:
+            continue
+        algo, _, want = row[1].partition("=")
+        p = os.path.normpath(os.path.join(site, row[0]))
+        if algo != "sha256":
+            probs.append(f"{row[0]}: recorded with {algo}, not sha256")
+        elif not os.path.isfile(p):
+            probs.append(f"{row[0]}: missing")
+        elif base64.urlsafe_b64encode(bytes.fromhex(digest(p))).rstrip(b"=").decode() != want:
+            probs.append(f"{row[0]}: not the installed distribution's file (its sha256 differs from RECORD)")
+    return probs
 
 
 def numpy_binding():
-    """The installed numpy distribution the numerics run on: its version, the sha256 of its RECORD (every
-    installed file's recorded hash) and wheel tags, and the sha256 of every source / extension file of the
-    package root and its _core (core), linalg and random packages and of numpy.libs (the bundled BLAS):
-    the numerical implementation used, independent of which submodules happen to be imported. Cached."""
+    """The installed numpy the numerics run on, bound by its EXECUTED artifacts: the sha256 of EVERY file under
+    the numpy package directory (sources, extensions and every __pycache__ bytecode it may execute) and of
+    numpy.libs (the bundled BLAS); and its distribution: the version, wheel tags and RECORD, every RECORD entry
+    VERIFIED against the installed file (a mismatch, or a missing distribution, is refused). Cached."""
     if "b" in _NUMPY:
         return _NUMPY["b"]
     try:
         import numpy
-        import numpy.linalg  # noqa: F401
-        import numpy.random  # noqa: F401
     except ImportError:
         _NUMPY["b"] = None
         return None
-    import importlib.metadata
     pkg = os.path.dirname(os.path.abspath(numpy.__file__))
+    site = os.path.dirname(pkg)
+    digests = {}
+
+    def digest(p):
+        p = os.path.abspath(p)
+        if p not in digests:
+            digests[p] = rqlib.sha256_file(p)
+        return digests[p]
     files = {}
-    for sub in NUMPY_PARTS:
-        d = os.path.join(pkg, sub)
-        if not os.path.isdir(d):
-            continue
-        for n in sorted(os.listdir(d)):
-            p = os.path.join(d, n)
-            if os.path.isfile(p) and (n.endswith((".py", ".pyd")) or ".so" in n):
-                files[f"{sub}/{n}" if sub else n] = rqlib.sha256_file(p)
-    libs = os.path.join(os.path.dirname(pkg), "numpy.libs")
-    if os.path.isdir(libs):
-        for n in sorted(os.listdir(libs)):
-            if os.path.isfile(os.path.join(libs, n)):
-                files[f"../numpy.libs/{n}"] = rqlib.sha256_file(os.path.join(libs, n))
-    record = wheel = None
-    try:
-        dist = importlib.metadata.distribution("numpy")
-        record, wheel = dist.read_text("RECORD"), dist.read_text("WHEEL")
-    except Exception:                        # (an unpackaged numpy: its files still bind it)
-        pass
-    _NUMPY["b"] = {"version": numpy.__version__, "record_sha256": rqlib.sha256_bytes(record.encode()) if record else None,
-                   "wheel_tags": [ln.split(":", 1)[1].strip() for ln in (wheel or "").splitlines() if ln.startswith("Tag:")],
+    for top in (pkg, os.path.join(site, "numpy.libs")):
+        for dirpath, dirnames, filenames in os.walk(top):
+            dirnames.sort()
+            for n in sorted(filenames):
+                p = os.path.join(dirpath, n)
+                if os.path.isfile(p):
+                    files[os.path.relpath(p, site).replace(os.sep, "/")] = digest(p)
+    infos = sorted(d for d in os.listdir(site) if d.startswith("numpy-") and d.endswith(".dist-info"))
+    if len(infos) != 1:
+        raise StageError(f"numpy at {pkg}: {len(infos)} installed distributions (dist-info) beside it; it cannot be bound")
+    di = os.path.join(site, infos[0])
+    with open(os.path.join(di, "RECORD"), "rb") as f:
+        record = f.read()
+    with open(os.path.join(di, "WHEEL"), "rb") as f:
+        wheel = f.read().decode("utf-8")
+    probs = record_problems(site, record.decode("utf-8"), digest)
+    if probs:
+        raise StageError(f"numpy's installed files do not match its RECORD ({len(probs)}): " + "; ".join(probs[:3]))
+    _NUMPY["b"] = {"version": numpy.__version__, "dist_info": infos[0], "record_sha256": rqlib.sha256_bytes(record),
+                   "record_entries_verified": sum(1 for ln in record.decode("utf-8").splitlines() if ",sha256=" in ln),
+                   "wheel_tags": [ln.split(":", 1)[1].strip() for ln in wheel.splitlines() if ln.startswith("Tag:")],
                    "files": files}
     return _NUMPY["b"]
 

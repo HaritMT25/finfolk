@@ -79,9 +79,12 @@ u). Then the penalized fit is translation-equivariant: shifting every fitting pr
 intercept, c -> c + (I - A) u, so lss's dependence on u through the fit is K = (d z_hat / d c)(I - A). Any
 other overlap (a group shared with part of the fit) makes the origin unavailable, or refuses the target.
 REGISTRATION REQUIREMENT (selection independence): no test target may share a measurement group with the
-lambda selection's window rows or targets (the selected forecast would depend on that noise through the
-selection, and no recorded cross term carries it); score-validation records the selection's groups,
-predict-test binds them into the test lines, evaluate-test refuses a test target in one of them. Every forecaster is affine in its window measurements
+FITTING profiles (every candidate depends on them through the fitted model, e.g. its K_lambda loading), the
+lambda selection's window rows or its targets (the selected forecast would depend on that noise through the
+selection, and no recorded cross term carries it). score-validation records those groups (and their
+sources) in the score document; evaluate-test takes them ONLY from that document, read once and accepted as
+the one the frozen validation-evaluation record names (--selection), refuses test lines whose recorded
+groups are missing or differ, and refuses a test target in one of them. Every forecaster is affine in its window measurements
 (gains G_s), so with L_g = sum over window rows in g of G_s (+ K for the fit's group, lss):
   Cov(z_hat, v_f) = L_g S_g for a target in group g (the recorded "cross");
   the latent forecast-error covariance under that structure (the recorded "cov"): lss: P_work + sum_g
@@ -129,7 +132,7 @@ fingerprint, the implementation manifest and the scoring environment.
     forecast.py score-validation --root ROOT --predictions val.jsonl --targets val_targets.json --out val_scores.json
     forecast.py predict-test --root ROOT --prefix test_prefix.json --model model.json --selection val_scores.json --out test.jsonl
     forecast.py implementation --out impl.json
-    forecast.py evaluate-test --root ROOT --predictions test.jsonl --targets test_targets.json --out eval.json
+    forecast.py evaluate-test --root ROOT --predictions test.jsonl --selection val_scores.json --targets test_targets.json --out eval.json
 """
 from __future__ import annotations
 
@@ -608,10 +611,20 @@ def read_profiles(ctx, path, name, admit):
 
 
 def same_measurement(a, b, what):
+    """One map, one measurement table, and a row present in both documents is ONE measurement (identical
+    profile, covariance and measurement group)."""
+    np = _np()
     if a["map_sha"] != b["map_sha"]:
         raise ForecastError(f"{what}: another map (every document of an analysis comes from one time-limited map)")
     if a["meas_sha"] != b["meas_sha"]:
         raise ForecastError(f"{what}: another measurement table")
+    for k in sorted(set(a["rows"]) & set(b["rows"])):
+        ra, rb = a["rows"][k], b["rows"][k]
+        same = (ra["g"] == rb["g"] and ra["unavailable"] == rb["unavailable"] and ra["events"] == rb["events"]
+                and (ra["z"] is None) == (rb["z"] is None)
+                and (ra["z"] is None or (np.array_equal(ra["z"], rb["z"]) and np.array_equal(ra["R"], rb["R"]))))
+        if not same:
+            raise ForecastError(f"{what}: {k[0]}@{k[1]} differs between the documents (one row is one measurement)")
 
 
 def fit_admit(ctx):
@@ -706,31 +719,50 @@ def source_problems(fit, keyed_groups):
 
 
 def selection_groups(ctx, lines, T):
-    """The measurement groups the lambda selection depends on: those of the selection set's window rows and
-    target rows (complete panels)."""
+    """The measurement groups the lambda selection depends on -> {"groups": their union, "sources": {"fit",
+    "windows", "targets"}}: the FITTING profiles' groups (every candidate depends on them through the fitted
+    model, e.g. its K_lambda loading), and the selection set's window rows and target rows (complete panels)."""
     sel = {ln["target_id"] for ln in lines if ln["available"] and ln["stage"] == "validation" and ln["primary"]
            and ln["time_role"] == "validation"}
-    out = set()
+    win, tgt = set(), set()
     for ln in lines:
         if ln["target_id"] in sel:
-            out.update(ln.get("window_groups") or [])
-            out.update(f["row"]["g"] for f in origin_futures(ln, T) if f["row"]["z"] is not None and f["row"]["g"])
-    return sorted(out)
+            win.update(ln.get("window_groups") or [])
+            tgt.update(f["row"]["g"] for f in origin_futures(ln, T) if f["row"]["z"] is not None and f["row"]["g"])
+    fit = set((lines[0]["measurement"]["fit_groups"] if lines else []) or [])
+    return {"groups": sorted(fit | win | tgt), "sources": {"fit": sorted(fit), "windows": sorted(win), "targets": sorted(tgt)}}
 
 
-def selection_independence(lines, T):
-    """REGISTRATION REQUIREMENT: no test target shares a measurement group with the lambda selection's inputs
-    or targets (the selected forecast would depend on that shared noise, and no recorded cross term carries
-    it). Refused otherwise."""
-    sg = {json.dumps((ln.get("provenance") or {}).get("selection_groups")) for ln in lines}
-    if len(sg) != 1:
-        raise ForecastError("the test lines disagree on the selection's measurement groups")
-    groups = set(json.loads(sg.pop()) or [])
-    shared = sorted({r["g"] for r in T["rows"].values() if r["z"] is not None and r["g"] in groups})
+def verified_selection(ctx, gate, path):
+    """The validation scores, read ONCE and accepted only as the document the gate's VERIFIED validation-
+    evaluation record names (its scores_sha256, its VAL_PRED_SHA) under this configuration."""
+    data = rqlib.read_bytes(path)
+    rec = gate["validation_evaluation"] or {}
+    if rqlib.sha256_bytes(data) != rec.get("scores_sha256"):
+        raise ForecastError(f"{path} is not the validation scores the frozen validation-evaluation record names")
+    doc = staging.parse_doc(data, path)
+    if doc.get("VAL_PRED_SHA") != rec.get("VAL_PRED_SHA") or doc.get("config_sha256") != ctx["cfg_sha"]:
+        raise ForecastError(f"{path}: not the validation scores of this commitment and configuration")
+    return doc
+
+
+def selection_independence(lines, T, groups):
+    """REGISTRATION REQUIREMENT: no test target shares a measurement group with the fitting profiles, the
+    lambda selection's windows or its targets (the selected forecast would depend on that shared noise through
+    the selection, and no recorded cross term carries it). `groups` come ONLY from the verified selection
+    payload; every test line must carry exactly them (missing or substituted metadata is refused)."""
+    if not isinstance(groups, list) or not all(isinstance(g, str) for g in groups):
+        raise ForecastError("the verified selection records no measurement groups")
+    bad = [ln.get("target_id") for ln in lines if (ln.get("provenance") or {}).get("selection_groups") != groups]
+    if bad:
+        raise ForecastError(f"{len(bad)} test lines carry selection-group metadata that is missing or not the verified "
+                            f"selection's ({bad[:3]})")
+    shared = sorted({r["g"] for r in T["rows"].values() if r["z"] is not None and r["g"] in set(groups)})
     if shared:
-        raise ForecastError(f"test targets share measurement group(s) {shared[:5]} with the lambda selection's inputs or "
-                            "targets: the selected forecast depends on that shared noise (registration requirement: "
-                            "independent measurement sources for the selection and the test targets)")
+        raise ForecastError(f"test targets share measurement group(s) {shared[:5]} with the fitting profiles or the lambda "
+                            "selection's inputs or targets: the selected forecast depends on that shared noise "
+                            "(registration requirement: independent measurement sources for the fit and the selection "
+                            "on one side and the test targets on the other)")
 
 
 # ================================================================== numerics
@@ -1424,6 +1456,7 @@ def main(argv=None):
     s = sub.add_parser("evaluate-test")
     s.add_argument("--root", required=True)
     s.add_argument("--predictions", required=True)
+    s.add_argument("--selection", required=True, help="the validation scores the freeze's record names")
     s.add_argument("--targets", required=True, help="exactly the test stage's target rows")
     s.add_argument("--out", required=True)
     a = ap.parse_args(argv)
@@ -1468,7 +1501,8 @@ def main(argv=None):
             T = read_targets(ctx, a.targets, lines)
             per = score_lines(ctx, lines, T)
             impl = staging.implementation_manifest(sys.modules[__name__])
-            selection = dict(select_lambda(ctx, per), groups=selection_groups(ctx, lines, T))
+            sg = selection_groups(ctx, lines, T)
+            selection = dict(select_lambda(ctx, per), groups=sg["groups"], group_sources=sg["sources"])
             doc = {"schema": VALSCORES, "VAL_PRED_SHA": mk, "config_sha256": ctx["cfg_sha"],
                    "model_sha256": uniform(lines, "model_sha256"), "targets_sha256": T["sha"],
                    "selection": selection, "pooled": pool(ctx, per), "origins": per,
@@ -1507,7 +1541,8 @@ def main(argv=None):
         staging.check_selection_record(g["validation_evaluation"], lines)
         check_lines(ctx, lines, test_stages)
         T = read_targets(ctx, a.targets, lines)
-        selection_independence(lines, T)
+        sel = verified_selection(ctx, g, a.selection)
+        selection_independence(lines, T, sel["selection"].get("groups"))
         per = score_lines(ctx, lines, T)
         doc = {"schema": EVAL, "TEST_PRED_SHA": g["TEST_PRED_SHA"], "freeze_sha256": g["freeze_sha256"],
                "config_sha256": ctx["cfg_sha"], "selection_sha256": uniform(lines, "selection_sha256"),
