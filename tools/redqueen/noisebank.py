@@ -1289,7 +1289,9 @@ def _strict(x):
 def _interior(objs, x0, mu0=1.0):
     """Maximize sum_g l_g(rho_g) over {three LMIs PD, |rho_g| < RHO_MAX}: log-barrier interior point, damped
     Newton (a positive-definite, regularized model) on the ANALYTIC interpolant derivatives, every evaluation
-    strictly inside -> (x, L, converged, the KKT residual at the final mu, the final mu)."""
+    strictly inside -> (x, L, converged, the KKT residual at the final mu, the final mu). A centring stage ends
+    when its KKT residual meets the stage tolerance, or (an internal exit) when the Newton decrement vanishes
+    (<= 1e-24 |phi|); ACCEPTANCE is decided by the final KKT gate alone, never by the decrement."""
     import numpy as np
     dM = _dmats()
     a2 = RHO_MAX ** 2
@@ -1717,8 +1719,18 @@ def horizon_estimate(A, boot=BOOT, seed=0, m=Z_INTERVALS):
         inserted, worst = validate_grid(tab, fit["rho"])
         shift = 0.0
         if inserted:                                   # (ONE refit on the locally refined table: its shift reported)
-            refit = fit_dependence({g: (tab[g]["z"], tab[g]["T"].sum(axis=0)) for g in GROUPS},
-                                   {g: tab[g]["pairs"] for g in GROUPS})
+            objs = {g: (tab[g]["z"], tab[g]["T"].sum(axis=0)) for g in GROUPS}
+            for g in GROUPS:                           # (Codex #72 r5: identification re-checked on the REFINED table)
+                r_hat, _ = _argmax(*objs[g])
+                ok, per, at_box = identified(*objs[g], r_hat, tab[g]["pairs"])
+                groups[g].update(rho_max=r_hat, curvature_per_pair=per, at_box=at_box)
+                if not ok:
+                    reasons.append(f"{g} is unidentified on the refined grid ({'one-sided slope' if at_box else 'curvature'} "
+                                   f"per pair {per:.3g} < {INFO_MIN})")
+            if reasons:
+                rec.update(status="unavailable", reasons=reasons, components=None, bootstrap=None, groups=groups)
+                return rec
+            refit = fit_dependence(objs, {g: tab[g]["pairs"] for g in GROUPS})
             shift = max(abs(refit["rho"][g] - fit["rho"][g]) for g in GROUPS)
             fit = refit
         for g in GROUPS:

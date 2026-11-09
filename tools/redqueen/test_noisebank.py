@@ -783,6 +783,25 @@ class TestFeasibilityAndRefusals(unittest.TestCase):
         self.assertAlmostEqual(f["rho"]["R_CC"], arg[0], delta=2e-3)
         self.assertAlmostEqual(f["rho"]["D_CC"], arg[1], delta=6e-3)
 
+    def test_refined_table_identification(self):
+        """Codex #72 r5: when the local validation refines a table, identification is re-checked on the
+        REFINED table before the refit is accepted; a group that is unidentified there makes the horizon
+        unavailable (the shift itself never refuses)."""
+        doc = all_horizons(simulate(seed=12, W=4, T=2, R=16, horizons=(5000,))[0])
+        A = nb.arrays(doc["observations"], 5000)
+        real = nb.validate_grid
+
+        def flatten(tab, fitrho):
+            tab["R_CC"]["T"] = np.zeros_like(tab["R_CC"]["T"])        # (a flat objective: no curvature)
+            return True, 0.0
+        nb.validate_grid = flatten
+        try:
+            e = nb.horizon_estimate(A, boot=2, seed=0, m=M)
+        finally:
+            nb.validate_grid = real
+        self.assertEqual(e["status"], "unavailable")
+        self.assertTrue(any("unidentified on the refined grid" in r for r in e["reasons"]), e["reasons"])
+
     def test_unidentified_and_missing_groups_are_refused(self):
         """One time and no crossing: no row-sharing and no donor-sharing pairs, refused with reasons; the
         generator block is unavailable; the CLI exits 2 and still writes canonical JSON. An impossible
