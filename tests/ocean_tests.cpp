@@ -3557,7 +3557,7 @@ void testShimBools() {
         {"deepCurrent", &OceanConfig::deepCurrent}, {"lightEnabled", &OceanConfig::lightEnabled},
         {"depthCostScaled", &OceanConfig::depthCostScaled}, {"sizeDrift", &OceanConfig::sizeDrift},
         {"sizeFight", &OceanConfig::sizeFight}, {"mouthGate", &OceanConfig::mouthGate},
-        {"walls", &OceanConfig::walls},
+        {"walls", &OceanConfig::walls}, {"bodyPlanPreviewEnabled", &OceanConfig::bodyPlanPreviewEnabled},
     };
     t.expect(sizeof sims / sizeof sims[0] == sizeof kSimConfigBoolKeys / sizeof kSimConfigBoolKeys[0] &&
                  sizeof oceans / sizeof oceans[0] == sizeof kOceanBoolKeys / sizeof kOceanBoolKeys[0],

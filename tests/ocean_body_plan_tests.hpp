@@ -803,7 +803,11 @@ inline void testBodyNumbers() {
     for (int i = 0; i < 200; ++i) {
         appearance::Genome G = randomAppearance(g);
         if (i < 60) { G = appearance::neutral(); G.g[appearance::kMorphOffset + i / 2] = (i & 1) ? 1.0f : 0.0f; }
-        const BirthCoefficients b = compiled(G, (float)(0.5 + 1.5 * g.unit()), (float)(0.5 + 1.5 * g.unit()), randomPhysical(g));
+        // (the draws in sequence: an argument list's evaluation order is unspecified, g++ and clang differ)
+        const float S = (float)(0.5 + 1.5 * g.unit());
+        const float E = (float)(0.5 + 1.5 * g.unit());
+        const physical::Genes P = randomPhysical(g);
+        const BirthCoefficients b = compiled(G, S, E, P);
         for (float v : b.m) hs.addf(v);
     }
     {
