@@ -223,6 +223,19 @@
 // (push / erase / reorder without the side array) is detected at the next
 // step: the records are dropped and appearanceBroken() reports it (the shim
 // then exports none); attachFounderAppearance() keeps a direct append in step.
+//
+// The M2a body-plan preview (OceanConfig::bodyPlanPreviewEnabled, OFF by
+// default; DIAGNOSTIC: src/ocean/physical_genome.hpp, body_plan.hpp): with it
+// on, three more dense side arrays follow appearance's ownership exactly —
+// the owner ids, each fish's five physical alleles (its own salted stream,
+// keyed by the appearance key and its id: never `rng`) and its body plan
+// compiled at birth from its appearance genome, bodySize and bodyElong. Built
+// for a founder after its appearance record, for a newborn after its own
+// (its parents read by their indices before compaction, copied before the
+// arrays grow), compacted with the same alive mask, checked at the start of
+// every step (count and owner ids; a broken appearance array breaks it too:
+// dropped, reported by bodyPlanBroken()). Nothing the step reads depends on
+// it: no draw, decision, cost or id moves (the harness's body twins).
 // ----------------------------------------------------------------------------
 #ifndef EVO_WORLD_OCEAN
 #error "ocean_world.hpp needs the Ocean sensor list: compile with -DEVO_WORLD_OCEAN"
@@ -246,6 +259,7 @@
 #include "ocean_math.hpp"
 #include "fish.hpp"
 #include "appearance_model.hpp"
+#include "body_plan.hpp"
 #include "ocean_food_grid.hpp"
 
 // The defensive clamps every Ocean entry point applies to the SimConfig half
@@ -734,6 +748,7 @@ public:
     void init(int w, int h, float depth, int numCreatures) {
         if (ocfg.walls) cfg.toroidal = false;   // glass walls never wrap (the validated paths refuse both)
         appearanceInit();   // first: its key reads a COPY of the engine before any draw
+        bodyPlanInit();     // its key is the appearance key's, salted (no draw)
         width = w;
         height = h;
         D = depth;
@@ -817,6 +832,7 @@ public:
         births = 0;
         deaths = 0;
         appearanceCheck();   // the side array still matches `creatures` (else it is dropped)
+        bodyPlanCheck();     // the body-plan arrays too (and appearance still on)
 
         current_.advance(frame);
         flow_.curAdvanced = true;
@@ -971,11 +987,13 @@ public:
 
         for (auto& baby : newborns) { baby.id = nextId_++; creatures.push_back(std::move(baby)); }
         if (appearanceOn()) appearanceAppendNewborns(newborns.size(), newbornParents);
+        if (bodyPlanOn()) bodyPlanAppendNewborns(newborns.size(), newbornParents);   // (on => appearance on: parents recorded)
 
         updatePredators(dt);
         if (cfg.predatorEconomy && cfg.predatorMinPopulation > 0) refillPredators();
 
         if (appearanceOn()) appearanceCompact();   // keeps records[i] where creatures[i].alive (same order)
+        if (bodyPlanOn()) bodyPlanCompact();       // the same mask
         creatures.erase(std::remove_if(creatures.begin(), creatures.end(),
                                        [this](const Fish& c) { return removedDead(c); }),
                         creatures.end());
@@ -1059,7 +1077,33 @@ public:
     // Call after markFounder. A no-op while appearance is off.
     void attachFounderAppearance() {
         if (appearanceOn() && app_.size() + 1 == creatures.size()) appearanceAppendFounder();
+        if (bodyPlanOn() && bodyOwners_.size() + 1 == creatures.size()) bodyPlanAppendFounder();   // (the body plan too)
     }
+
+    // ---- the M2a body-plan preview (read-only views; see the header comment) ----
+    // Each array is in creature order, element i owned by creatures[i] (owner
+    // id == id) at every step boundary while bodyPlanEnabled().
+    bool bodyPlanInitEnabled() const { return bodyFlag_; }   // OceanConfig::bodyPlanPreviewEnabled at init
+    bool bodyPlanEnabled() const { return bodyPlanOn(); }     // on, and not broken
+    bool bodyPlanBroken() const { return bodyBroken_; }
+    std::uint64_t bodyPlanKey() const { return bodyKey_; }   // the physical stream's world key
+    const std::vector<std::uint64_t>& bodyPlanOwners() const { return bodyOwners_; }
+    const std::vector<physical::Genes>& bodyPlanGenes() const { return bodyGenes_; }
+    const std::vector<bodyplan::BirthCoefficients>& bodyPlanBirth() const { return bodyBirth_; }
+    const physical::Stats& bodyPlanStats() const { return bodyStats_; }
+    // Bumped by every change to the arrays (an append, a compaction that
+    // removed one, init, a break): exports repack only when it moved.
+    std::uint64_t bodyPlanRevision() const { return bodyRevision_; }
+    std::uint64_t bodyPlanUncompiled() const { return bodyUncompiled_; }   // compiles refused (stored as zeros)
+    bool bodyPlanConsistent() const {
+        if (!bodyPlanOn()) return bodyOwners_.empty() && bodyGenes_.empty() && bodyBirth_.empty();
+        const std::size_t n = creatures.size();
+        if (bodyOwners_.size() != n || bodyGenes_.size() != n || bodyBirth_.size() != n) return false;
+        for (std::size_t i = 0; i < n; ++i)
+            if (bodyOwners_[i] != creatures[i].id) return false;
+        return true;
+    }
+    physical::Inheritance bodyPlanInheritance() const { return {ocfg.physicalMutation, ocfg.physicalNovelProbability}; }
     // The inheritance knobs as the next offspring will use them.
     appearance::Inheritance appearanceInheritance() const {
         return {ocfg.patternMutation, ocfg.patternPhaseMutation, ocfg.patternNovelProbability,
@@ -1113,6 +1157,77 @@ private:
             app_.shrink_to_fit();
         }
     }
+
+    // ---- the M2a body-plan preview's maintenance (diagnostic: no rng, nothing the step reads) ----
+    bool bodyPlanOn() const { return bodyFlag_ && !bodyBroken_; }
+    void bodyPlanInit() {   // after appearanceInit (its key)
+        bodyKey_ = physical::worldKey(appKey_);
+        bodyFlag_ = ocfg.bodyPlanPreviewEnabled;
+        bodyBroken_ = false;
+        bodyOwners_.clear(); bodyGenes_.clear(); bodyBirth_.clear();
+        bodyStats_ = physical::Stats{};
+        bodyUncompiled_ = 0;
+        ++bodyRevision_;
+    }
+    // The body of creatures[i]: its appearance record (already appended), its
+    // body parameters and its physical alleles.
+    void bodyPlanPush(std::size_t i, const physical::Genes& G) {
+        bodyplan::BirthCoefficients b;
+        if (!bodyplan::compile(app_[i].genome, creatures[i].bodySize, creatures[i].bodyElong, G, bodyplan::kGeometryLaw, b))
+            ++bodyUncompiled_;   // (zeros: law 0 reads as unavailable)
+        bodyOwners_.push_back(creatures[i].id);
+        bodyGenes_.push_back(G);
+        bodyBirth_.push_back(b);
+    }
+    void bodyPlanAppendFounder() {   // creatures.back(), after its appearance record
+        if (app_.size() != creatures.size()) { bodyPlanBreak(); return; }
+        physical::Genes G;
+        physical::makeFounder(bodyKey_, creatures.back().id, G);
+        bodyPlanPush(creatures.size() - 1, G);
+        ++bodyStats_.founders;
+        ++bodyRevision_;
+    }
+    // The last n creatures are this step's newborns, their appearance records
+    // appended; parents[2k], [2k+1] their parents' indices (unchanged until
+    // the compaction).
+    void bodyPlanAppendNewborns(std::size_t n, const std::vector<std::uint32_t>& parents) {
+        if (n == 0) return;
+        if (app_.size() != creatures.size() || parents.size() != 2 * n) { bodyPlanBreak(); return; }
+        const physical::Inheritance inh = bodyPlanInheritance();
+        const std::size_t first = creatures.size() - n;
+        for (std::size_t k = 0; k < n; ++k) {
+            std::uint8_t modes[physical::kGroups];
+            const physical::Genes A = bodyGenes_[parents[2 * k]], B = bodyGenes_[parents[2 * k + 1]];   // copies: the push may grow
+            physical::Genes Q;
+            physical::makeOffspring(bodyKey_, creatures[first + k].id, A, B, inh, Q, modes);
+            bodyPlanPush(first + k, Q);
+            ++bodyStats_.offspring;
+            for (int g = 0; g < physical::kGroups; ++g) ++bodyStats_.mode[modes[g] & 3];
+        }
+        ++bodyRevision_;
+    }
+    void bodyPlanCompact() {
+        std::size_t k = 0;
+        for (std::size_t i = 0; i < creatures.size(); ++i)
+            if (creatures[i].alive) {
+                bodyOwners_[k] = bodyOwners_[i];
+                bodyGenes_[k] = bodyGenes_[i];
+                bodyBirth_[k] = bodyBirth_[i];
+                ++k;
+            }
+        if (k != bodyOwners_.size()) ++bodyRevision_;
+        bodyOwners_.resize(k); bodyGenes_.resize(k); bodyBirth_.resize(k);
+    }
+    void bodyPlanBreak() {   // never re-bound or rebuilt: reported, and no longer kept
+        bodyBroken_ = true;
+        bodyOwners_.clear(); bodyOwners_.shrink_to_fit();
+        bodyGenes_.clear(); bodyGenes_.shrink_to_fit();
+        bodyBirth_.clear(); bodyBirth_.shrink_to_fit();
+        ++bodyRevision_;
+    }
+    void bodyPlanCheck() {
+        if (bodyPlanOn() && (!appearanceOn() || !bodyPlanConsistent())) bodyPlanBreak();
+    }
     struct FishHot {
         Vec2 pos; Vec2 vel; float depth;
 #ifdef EVO_OCEAN_EYE
@@ -1139,6 +1254,17 @@ private:
     int appFlags_ = 0;                      // OceanConfig::appearance at init
     bool appBroken_ = false;                // the side array lost its owners (dropped)
     appearance::Stats appStats_;            // records built, branches taken (statistics)
+    // The M2a body-plan preview (see the header comment; diagnostic). Hashed
+    // in the harness's own `body` section, outside the simulation's sections.
+    std::vector<std::uint64_t> bodyOwners_;                 // [i] == creatures[i].id
+    std::vector<physical::Genes> bodyGenes_;                // the five physical alleles
+    std::vector<bodyplan::BirthCoefficients> bodyBirth_;    // the body plan compiled at birth
+    std::uint64_t bodyKey_ = 0;                             // the physical stream's world key (init)
+    std::uint64_t bodyRevision_ = 0;                        // the arrays' change counter (exports)
+    std::uint64_t bodyUncompiled_ = 0;                      // compiles refused (statistics)
+    physical::Stats bodyStats_;                             // records built, branches taken (statistics)
+    bool bodyFlag_ = false;                                 // OceanConfig::bodyPlanPreviewEnabled at init
+    bool bodyBroken_ = false;                               // the arrays lost their owners (dropped)
 
     // E1 wave trains: fixed modes over the world (no draws). kx, ky = K
     // (double, for θ); k, q = |K|, K/|K|; phase = the travelled ∫ω dt, kept in
@@ -1988,6 +2114,7 @@ private:
         if (ocfg.walls) containBody(creatures.back());   // its trail laid out behind it stays inside
         markFounder(creatures.back());
         if (appearanceOn()) appearanceAppendFounder();
+        if (bodyPlanOn()) bodyPlanAppendFounder();
     }
 
     OceanPredator makePredator() {

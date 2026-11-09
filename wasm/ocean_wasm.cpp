@@ -126,12 +126,44 @@
 //     `appearance` itself is set by oc_init: the same value is a no-op, a
 //     change is refused (restart to apply).
 //
+//   * The M2a body-plan preview (OceanConfig::bodyPlanPreviewEnabled, OFF by
+//     default; DIAGNOSTIC: src/ocean/physical_genome.hpp, body_plan.hpp),
+//     READ-ONLY, packed by oc_sync only when the world's body arrays changed
+//     (OceanWorld::bodyPlanRevision; never recompiled here):
+//       oc_body_count() rows (0 while off or broken; oc_body_plan_broken() 1
+//         when the arrays lost their owners), in oc_creature_segments' order:
+//       const float* oc_creature_physical() — oc_physical_genes() = 5 floats a
+//         fish (gape, bladderCapacity, armour, fatCapacity, muscleFibre)
+//       const uint32_t* oc_body_owner_ids() — each fish's owner id as two
+//         words (low, high): lossless for every 64-bit id
+//       const float* oc_creature_body_metrics() — oc_body_metrics_stride()
+//         floats a fish, the birth coefficients in the layout
+//         oc_body_metrics_layout() (a JSON: every field's name, offset, count,
+//         units and meaning, the fins' sub-layout, the limit bits)
+//       versions: oc_physical_schema() 1, oc_physical_founder_law() 1,
+//         oc_physical_inheritance_law() 1, oc_physical_stream_law() 1,
+//         oc_body_geometry_law() 1, oc_body_metrics_abi() 1
+//     The fixture viewer's pure functions (no world needed; nothing changes):
+//       oc_body_preview(genes63*, S, E, phys5*, gas, fuel): compile one body
+//         (gas / fuel: a diagnostic load, fractions of the capacities; 0 0 is
+//         the birth compile) into oc_body_preview_metrics() and its canonical
+//         sample points (world units) into oc_body_preview_points();
+//       oc_body_rest(genes63*, lambda): the renderer's rest law at the
+//         canonical samples, in body radii, into oc_body_rest_points();
+//       oc_body_samples() (oc_body_sample_count() x 6 floats: aT, part,
+//         side), oc_body_tris() (oc_body_tri_count() x 4 uint16: three
+//         samples and the part).
+//     oc_set_param takes physicalMutation and physicalNovelProbability live
+//     (each in [0, 0.25]); bodyPlanPreviewEnabled is set by oc_init (the same
+//     value is a no-op). hydrodynamicsEnabled (M2b) is refused unless false.
+//
 // Compiled with Emscripten into web/evo_ocean.{js,wasm} by wasm/build_ocean.sh
 // (-DEVO_WORLD_OCEAN, single-threaded). The page (web/ocean.js) drives it:
 // oc_init once, then per frame oc_step(n) -> oc_sync() -> read the buffers.
 // Every pointer is valid until the next oc_sync / oc_init; memory can grow, so
 // the page re-creates its typed-array views after every sync.
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -163,6 +195,18 @@ std::vector<float>   g_bodyParams; // N*2: bodySize, bodyElong  (= evo_body_para
 std::vector<uint8_t> g_colors;     // N*3: colour, by family or brain (= evo_creature_colors; g_colourMode)
 std::vector<double>  g_ids;        // N                           (= evo_creature_ids)
 std::vector<float>   g_appearance; // N*63: the appearance genome (empty while off / broken)
+// The body-plan preview (empty while off / broken), repacked only when the
+// world's arrays changed: keyed by (g_worldEpoch, bodyPlanRevision).
+std::vector<float>    g_bodyGenes;    // N*5
+std::vector<uint32_t> g_bodyOwners;   // N*2: low, high word
+std::vector<float>    g_bodyMetrics;  // N*kMetrics
+unsigned long long g_worldEpoch = 0, g_bodyPackedEpoch = ~0ull;
+std::uint64_t g_bodyPackedRev = 0;
+// The fixture viewer's scratch (oc_body_preview / oc_body_rest).
+bodyplan::BirthCoefficients g_previewMetrics{};
+std::vector<float> g_previewPoints, g_restPoints, g_bodySamples;
+std::vector<uint16_t> g_bodyTris;
+std::string g_bodyLayout;
 std::vector<float>   g_food;       // F*2: x, y                   (= evo_food_xy)
 std::vector<float>   g_foodDepth;  // F
 std::vector<float>   g_predators;  // P*3: x, y, digestTimer      (= evo_predator_data)
@@ -326,6 +370,7 @@ EVO_EXPORT int oc_init(unsigned seed, int width, int height, double depth, int p
     // that passed them all.
     rng.seed(seed);
     delete g_world;
+    ++g_worldEpoch;   // (the body exports' cache key: a new world may reuse the address)
     g_world = new OceanWorld();
     g_world->cfg = cfg;
     g_world->ocfg = oc;
@@ -395,6 +440,28 @@ EVO_EXPORT void oc_sync() {
         for (size_t i = 0; i < n; ++i)
             std::memcpy(&g_appearance[i * appearance::kStride], recs[i].genome.g, sizeof(float) * appearance::kStride);
     }
+    // The body-plan preview: repacked only when its arrays changed (never recompiled).
+    if (w.bodyPlanEnabled() && w.bodyPlanConsistent()) {
+        if (g_bodyPackedEpoch != g_worldEpoch || g_bodyPackedRev != w.bodyPlanRevision() || g_bodyOwners.size() != 2 * n) {
+            const auto& genes = w.bodyPlanGenes();
+            const auto& owners = w.bodyPlanOwners();
+            const auto& birth = w.bodyPlanBirth();
+            g_bodyGenes.resize(n * physical::kGenes);
+            g_bodyOwners.resize(n * 2);
+            g_bodyMetrics.resize(n * bodyplan::kMetrics);
+            for (size_t i = 0; i < n; ++i) {
+                std::memcpy(&g_bodyGenes[i * physical::kGenes], genes[i].g, sizeof(float) * physical::kGenes);
+                g_bodyOwners[i * 2 + 0] = (uint32_t)(owners[i] & 0xFFFFFFFFull);
+                g_bodyOwners[i * 2 + 1] = (uint32_t)(owners[i] >> 32);
+                std::memcpy(&g_bodyMetrics[i * bodyplan::kMetrics], birth[i].m, sizeof(float) * bodyplan::kMetrics);
+            }
+            g_bodyPackedEpoch = g_worldEpoch;
+            g_bodyPackedRev = w.bodyPlanRevision();
+        }
+    } else {
+        g_bodyGenes.clear(); g_bodyOwners.clear(); g_bodyMetrics.clear();
+        g_bodyPackedEpoch = ~0ull;
+    }
 
     const size_t nf = w.food.size();
     g_food.resize(nf * 2);
@@ -448,6 +515,109 @@ EVO_EXPORT int oc_morphology_law()             { return appearance::kMorphLaw; }
 EVO_EXPORT int oc_morphology_chart_law()       { return appearance::kMorphChart; }
 EVO_EXPORT int oc_appearance_count()           { return (int)(g_appearance.size() / appearance::kStride); }
 EVO_EXPORT const float* oc_creature_appearance() { return g_appearance.empty() ? nullptr : g_appearance.data(); }
+// The M2a body-plan preview (see ADDITIONS): valid until the next oc_sync / oc_init.
+EVO_EXPORT int oc_physical_schema()            { return physical::kSchema; }
+EVO_EXPORT int oc_physical_founder_law()       { return physical::kFounderLaw; }
+EVO_EXPORT int oc_physical_inheritance_law()   { return physical::kInheritanceLaw; }
+EVO_EXPORT int oc_physical_stream_law()        { return physical::kStreamLaw; }
+EVO_EXPORT int oc_physical_genes()             { return physical::kGenes; }
+EVO_EXPORT int oc_body_geometry_law()          { return bodyplan::kGeometryLaw; }
+EVO_EXPORT int oc_body_metrics_abi()           { return bodyplan::kMetricsAbi; }
+EVO_EXPORT int oc_body_metrics_stride()        { return bodyplan::kMetrics; }
+EVO_EXPORT int oc_body_plan_enabled()          { return (g_world && g_world->bodyPlanEnabled()) ? 1 : 0; }
+EVO_EXPORT int oc_body_plan_broken()           { return (g_world && g_world->bodyPlanBroken()) ? 1 : 0; }
+EVO_EXPORT int oc_body_count()                 { return (int)(g_bodyOwners.size() / 2); }
+EVO_EXPORT const float* oc_creature_physical() { return g_bodyGenes.empty() ? nullptr : g_bodyGenes.data(); }
+EVO_EXPORT const uint32_t* oc_body_owner_ids() { return g_bodyOwners.empty() ? nullptr : g_bodyOwners.data(); }
+EVO_EXPORT const float* oc_creature_body_metrics() { return g_bodyMetrics.empty() ? nullptr : g_bodyMetrics.data(); }
+// The coefficient layout as JSON (built once): every field, the fins' sub-layout, the limit bits, the gene names.
+EVO_EXPORT const char* oc_body_metrics_layout() {
+    if (!g_bodyLayout.empty()) return g_bodyLayout.c_str();
+    auto esc = [](const char* s) {
+        std::string o;
+        for (const char* p = s; *p; ++p) { if (*p == '"' || *p == '\\') o += '\\'; o += *p; }
+        return o;
+    };
+    std::string j = "{\"abi\":" + std::to_string(bodyplan::kMetricsAbi) + ",\"law\":" + std::to_string(bodyplan::kGeometryLaw) +
+                    ",\"stride\":" + std::to_string(bodyplan::kMetrics) + ",\"fields\":[";
+    for (int f = 0; f < bodyplan::kFieldCount; ++f) {
+        const bodyplan::FieldInfo& fi = bodyplan::kFields[f];
+        std::string name = fi.name + 1;   // fVolume -> Volume -> volume
+        if (!name.empty()) name[0] = (char)std::tolower((unsigned char)name[0]);
+        j += (f ? "," : "") + std::string("{\"name\":\"") + name + "\",\"offset\":" + std::to_string(bodyplan::at(f)) +
+             ",\"count\":" + std::to_string(fi.count) + ",\"units\":\"" + esc(fi.units) + "\",\"what\":\"" + esc(fi.what) + "\"}";
+    }
+    j += "],\"fins\":{\"names\":[";
+    for (int f = 0; f < bodyplan::kFinCount; ++f) j += (f ? ",\"" : "\"") + std::string(bodyplan::kFinNames[f]) + "\"";
+    j += "],\"stride\":" + std::to_string((int)bodyplan::kFinStride) + ",\"values\":{\"area\":" + std::to_string((int)bodyplan::kFinArea) +
+         ",\"normal\":" + std::to_string((int)bodyplan::kFinNormal) + ",\"centroid\":" + std::to_string((int)bodyplan::kFinCentroid) +
+         ",\"lever\":" + std::to_string((int)bodyplan::kFinLever) + ",\"span\":" + std::to_string((int)bodyplan::kFinSpan) +
+         ",\"rootChord\":" + std::to_string((int)bodyplan::kFinRootChord) + ",\"meanChord\":" + std::to_string((int)bodyplan::kFinMeanChord) +
+         ",\"thickness\":" + std::to_string((int)bodyplan::kFinThickness) + "}},";
+    j += "\"limits\":{\"eyeClip\":1,\"chordCap\":2,\"storage\":4,\"organs\":8,\"shell\":16},\"genes\":[";
+    for (int g = 0; g < physical::kGenes; ++g) j += (g ? ",\"" : "\"") + std::string(physical::kGeneNames[g]) + "\"";
+    j += "],\"samples\":" + std::to_string(bodyplan::kSamples) + ",\"tris\":" + std::to_string(bodyplan::kTris) + "}";
+    g_bodyLayout = j;
+    return g_bodyLayout.c_str();
+}
+// The fixture viewer: one body, compiled as at birth (gas = fuel = 0) or
+// under a diagnostic load. Returns 1, or 0 (bad inputs: metrics zero).
+EVO_EXPORT int oc_body_preview(const float* genes63, float size, float elong, const float* phys5, float gas, float fuel) {
+    if (!genes63 || !phys5) return 0;
+    appearance::Genome G;
+    std::memcpy(G.g, genes63, sizeof G.g);
+    physical::Genes P;
+    std::memcpy(P.g, phys5, sizeof P.g);
+    bodyplan::Load L;
+    L.gas = gas; L.fuel = fuel;
+    bodyplan::Points pts;
+    const bool ok = bodyplan::compile(G, size, elong, P, bodyplan::kGeometryLaw, g_previewMetrics, &L, &pts);
+    g_previewPoints.resize(3 * bodyplan::kSamples);
+    for (int i = 0; i < bodyplan::kSamples; ++i) {
+        g_previewPoints[3 * i] = pts.p[i].x; g_previewPoints[3 * i + 1] = pts.p[i].y; g_previewPoints[3 * i + 2] = pts.p[i].z;
+    }
+    return ok ? 1 : 0;
+}
+EVO_EXPORT const float* oc_body_preview_metrics() { return g_previewMetrics.m; }
+EVO_EXPORT const float* oc_body_preview_points()  { return g_previewPoints.empty() ? nullptr : g_previewPoints.data(); }
+// The renderer's rest law at the canonical samples, in body radii (the GPU check's C++ side).
+EVO_EXPORT int oc_body_rest(const float* genes63, float lambda) {
+    if (!genes63) return 0;
+    const bodyplan::Morph M = bodyplan::decodeMorph(genes63, lambda);
+    bodyplan::Points pts;
+    bodyplan::restPoints(M, 1.0f, pts);
+    g_restPoints.resize(3 * bodyplan::kSamples);
+    for (int i = 0; i < bodyplan::kSamples; ++i) {
+        g_restPoints[3 * i] = pts.p[i].x; g_restPoints[3 * i + 1] = pts.p[i].y; g_restPoints[3 * i + 2] = pts.p[i].z;
+    }
+    return 1;
+}
+EVO_EXPORT const float* oc_body_rest_points() { return g_restPoints.empty() ? nullptr : g_restPoints.data(); }
+EVO_EXPORT int oc_body_sample_count() { return bodyplan::kSamples; }
+EVO_EXPORT int oc_body_tri_count() { return bodyplan::kTris; }
+EVO_EXPORT const float* oc_body_samples() {
+    if (g_bodySamples.empty()) {
+        const bodyplan::Samples& S = bodyplan::sampleCoords();
+        g_bodySamples.resize(6 * bodyplan::kSamples);
+        for (int i = 0; i < bodyplan::kSamples; ++i) {
+            for (int k = 0; k < 4; ++k) g_bodySamples[6 * i + k] = S.s[i].a[k];
+            g_bodySamples[6 * i + 4] = (float)S.s[i].fin;
+            g_bodySamples[6 * i + 5] = S.s[i].side;
+        }
+    }
+    return g_bodySamples.data();
+}
+EVO_EXPORT const uint16_t* oc_body_tris() {
+    if (g_bodyTris.empty()) {
+        const bodyplan::Tris& T = bodyplan::canonicalTris();
+        g_bodyTris.resize(4 * bodyplan::kTris);
+        for (int i = 0; i < bodyplan::kTris; ++i) {
+            g_bodyTris[4 * i] = T.t[i].a; g_bodyTris[4 * i + 1] = T.t[i].b; g_bodyTris[4 * i + 2] = T.t[i].c;
+            g_bodyTris[4 * i + 3] = T.t[i].part;
+        }
+    }
+    return g_bodyTris.data();
+}
 EVO_EXPORT int oc_food_count()                 { return g_world ? (int)g_world->food.size() : 0; }
 EVO_EXPORT const float* oc_food_xy()           { return g_food.data(); }
 EVO_EXPORT const float* oc_food_depth()        { return g_foodDepth.data(); }
@@ -487,9 +657,12 @@ EVO_EXPORT int oc_set_param(const char* name, double value) {
         // the appearance genome (cosmetic): the master key (init only, see below) and its knobs
         "appearance", "patternMutation", "patternPhaseMutation", "patternNovelProbability",
         "morphologyMutation", "morphologyNovelProbability",
+        // the body-plan preview (diagnostic): its switch (init only, see below) and its knobs
+        "bodyPlanPreviewEnabled", "physicalMutation", "physicalNovelProbability",
     };
     static const char* const kOceanBool[] = {
         "deepCurrent", "lightEnabled", "depthCostScaled", "sizeDrift", "sizeFight", "mouthGate",
+        "bodyPlanPreviewEnabled",
     };
     static const char* const kLive[] = {
         "maxPopulation", "minPopulation", "targetFood", "foodSpawnBase", "foodSpawnAmp",
