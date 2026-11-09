@@ -214,6 +214,25 @@ class TestManifest(unittest.TestCase):
                     {"id": "b3", "role": "training", "prey": {"world": "C03", "frame": 9 * M},
                      "predators": {"source": "random", "world": "C04", "frame": 9 * M}}):
             self.assertTrue(sealing.record_problems(m, [bad]), bad)
+        # the scripted Stage A benchmark source (Annex H D7, PR-A): like random, no held-out role of its own,
+        # a predator source only and exactly that dict; a distinct identity from the random source (one prey
+        # with random and with scripted predators is two targets, so their differing roles do not conflict)
+        scr = [{"id": "s1", "role": "test", "prey": {"world": "C06", "frame": 6 * M}, "predators": {"source": "scripted"}},
+               {"id": "s2", "role": "training", "prey": {"world": "C03", "frame": 9 * M}, "predators": {"source": "scripted"}},
+               {"id": "s3", "role": "diagnostic", "prey": {"world": "C03", "frame": 9 * M}, "predators": {"source": "random"}}]
+        self.assertEqual(sealing.record_problems(m, scr), [])
+        self.assertEqual(sealing.resolve(m, {"source": "scripted"}, "P"), ("scripted", None))
+        self.assertEqual(sealing.edge_role(m, scr[0]["prey"], scr[0]["predators"]), "test")
+        self.assertEqual([r["id"] for r in sealing.stage_filter(m, scr + [test_pair], "fit")], ["s2"])
+        for bad, why in (({"id": "c1", "role": "training", "prey": {"world": "C06", "frame": 6 * M},
+                           "predators": {"source": "scripted"}}, "most held-out endpoint makes it test"),
+                         ({"id": "c2", "role": "training", "prey": {"source": "scripted"}, "predators": None}, "only a predator"),
+                         ({"id": "c3", "role": "training", "prey": {"world": "C03", "frame": 9 * M},
+                           "predators": {"source": "scripted", "k": 4}}, "only a predator"),
+                         ({"id": "c4", "role": "training", "prey": {"world": "C03", "frame": 9 * M},
+                           "predators": {"source": "neural"}}, "only a predator")):
+            probs = sealing.record_problems(m, [bad])
+            self.assertTrue(any(why in p for p in probs), (bad, probs))
         # the assignment itself: eight per guild, distinct, from the sentinel namespace, never a study identity
         def refs_file(refs, ns=SENT):
             wr(self.rp, json.dumps({"schema": "finfolk.redqueen.references/1", "namespace": ns, "references": refs}))
