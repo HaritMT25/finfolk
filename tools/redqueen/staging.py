@@ -253,7 +253,7 @@ def environment():
     """The numerical environment of the running stage (fitting, or scoring)."""
     env = {"python": platform.python_version(), "python_implementation": platform.python_implementation(),
            "platform": platform.platform(), "machine": platform.machine(), "byteorder": sys.byteorder,
-           "float_epsilon": sys.float_info.epsilon, "executable": sys.executable,
+           "float_epsilon": sys.float_info.epsilon, "executable": sys.executable, "pycache_prefix": sys.pycache_prefix,
            "modules": {n: os.path.abspath(getattr(sys.modules.get(n), "__file__", "") or "") for n in TOOL_MODULES}}
     try:
         import numpy
@@ -356,8 +356,15 @@ def implementation_manifest(entry, modules=TOOL_MODULES):
     """The implementation that runs -> canonical bytes: the entry module and every tool module as EXECUTED
     (the source bytes they were compiled from, embedded: the deposited manifest carries the implementation
     itself), the interpreter, and the numpy distribution (numpy_binding). A tool module not loaded from
-    verified bytes is refused. Frozen as the test commitment's "evaluation script"; recomputed in-process
+    verified bytes is refused. Refused too when the interpreter reads bytecode from a REDIRECTED cache
+    (sys.pycache_prefix: -X pycache_prefix / PYTHONPYCACHEPREFIX), outside the inventoried trees, so it could
+    run unbound numpy bytecode. Frozen as the test commitment's "evaluation script"; recomputed in-process
     by the evaluator."""
+    if sys.pycache_prefix is not None:
+        raise StageError(f"sys.pycache_prefix is set ({sys.pycache_prefix}): bytecode would be read from a redirected "
+                         "cache that the implementation manifest does not bind; run without -X pycache_prefix / "
+                         "PYTHONPYCACHEPREFIX")
+
     def rec(data):
         return {"sha256": rqlib.sha256_bytes(data), "source": data.decode("utf-8")}
     mods = {}
@@ -368,7 +375,7 @@ def implementation_manifest(entry, modules=TOOL_MODULES):
         mods[name] = rec(m.__rq_source__)
     doc = {"schema": IMPL_SCHEMA, "entry": dict(rec(source_of(entry)), name=entry.__name__), "modules": mods,
            "python": {"version": platform.python_version(), "implementation": platform.python_implementation(),
-                      "cache_tag": sys.implementation.cache_tag},
+                      "cache_tag": sys.implementation.cache_tag, "pycache_prefix": sys.pycache_prefix},
            "machine": platform.machine(), "numpy": numpy_binding(),
            "obtain": "the tool modules' sources are embedded; numpy: pip install numpy==<version> for the wheel tags, "
                      "checked against record_sha256 and files"}

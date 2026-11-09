@@ -1063,6 +1063,23 @@ class TestPipeline(unittest.TestCase):
         self.assertTrue(set(pycs) <= set(files))                          # (every bytecode it may execute is bound)
         self.assertTrue(rqlib.is_sha256(b["record_sha256"]) and b["record_entries_verified"] > 100)
 
+    def test_redirected_bytecode_cache_refused(self):
+        """Codex r5: with a redirected bytecode cache (-X pycache_prefix), the interpreter reads bytecode
+        outside the inventoried trees, so an implementation manifest is neither built nor verified: in a fresh
+        process `implementation` and `evaluate-test` both refuse; the frozen manifest records no prefix."""
+        self.assertIsNone(rqlib.read_json(self.impl)["python"]["pycache_prefix"])
+        env = dict(os.environ)
+        cache = tempfile.mkdtemp(dir=self.tmp)
+        out = os.path.join(cache, "impl.json")
+        for args in (["implementation", "--out", out],
+                     ["evaluate-test", "--selection", self.scores, "--root", self.copy(self.root), "--predictions", self.test,
+                      "--targets", self.files["test_targets.json"], "--out", os.path.join(cache, "ev.json")]):
+            p = subprocess.run([sys.executable, "-I", "-X", f"pycache_prefix={cache}", os.path.join(HERE, "forecast.py")] + args,
+                               env=env, capture_output=True, text=True)
+            self.assertEqual(p.returncode, 2, (args[0], p.stderr))
+            self.assertIn("sys.pycache_prefix is set", p.stderr)
+        self.assertFalse(os.path.exists(out))
+
     def test_record_verification(self):
         """Codex r4 P2-1: every RECORD entry's sha256 is checked against the installed file: a changed file and
         a missing one are reported; hashless entries (the RECORD) and bytecode entries are skipped (a shipped
