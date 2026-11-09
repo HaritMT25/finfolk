@@ -51,6 +51,10 @@ STAGES (each refuses what it may not read; sealing.py between them):
   (sealing.py commit --stage test --eval-script forecast.py; sealing.py freeze ...)
   evaluate-test       sealing.require_test_freeze (eval script = this file) and the verified bytes it returns;
                       the test stage's target rows only.
+ROLLING ORIGINS: inside a forward period a row can be a window row of a later origin and the target of an
+earlier one. Each prediction is a function of its own window alone (the forecasters receive nothing else),
+the fit never sees forward-period rows, and no stage summarizes a prefix row as an outcome before its
+commitment; prefix rows are read only as the registered prediction inputs.
 
 PROFILES (finfolk.redqueen.profiles/2): "channels", "map" {cutoff, fit_sha256, references {sha256,
 max_frame}} (one map for every document of an analysis), "measurement" {"shared": {group: S}} and "rows":
@@ -61,6 +65,8 @@ MEASUREMENT MODEL. A profile's error v has covariance R; two profiles in the sam
 reference panel / donor seeds, plan.py) share the component S_g: Cov(v_a, v_b) = S_g, else 0 (null group:
 independent). Every forecaster is affine in its window measurements with gain G_s, so the prediction-target
 measurement cross-covariance is C = Cov(Z_hat, v_f) = sum_s G_s Cov(v_s, v_f); it is recorded per group.
+(The lss filter's WORKING model takes each profile's error as independent over time, variance R(s); the
+shared component enters the evaluation exactly, through the gains, not the EM likelihood.)
 
 THE STATE-SPACE MODEL. Initial state: the registered prior, "diffuse" (the exact limit: z(0) | y(0) ~
 N(y(0), R(0)); y(0) conditions once and its improper term leaves the likelihood) or "proper" N(m0, P0)
