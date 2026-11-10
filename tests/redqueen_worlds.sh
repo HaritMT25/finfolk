@@ -31,7 +31,9 @@
 #      STOP stops admission (exit 75); design-block lists the archive;
 #   9. two fresh roots claiming one archive root at once: one wins, the other writes nothing;
 #  10. an extinct world whose accepted wiring is damaged between acceptances (its zero evidence
-#      intact, stop): reopened, replayed through the zero, extinct again, its archive untouched.
+#      intact, stop): reopened, replayed through the zero, extinct again, its archive untouched;
+#  11. the burn-in rule: an A world extinct before the burn-in frame restarts from its slot's
+#      reserved seeds (each attempt's F1 by the supervisor) until --max-restarts, then ends extinct.
 set -u
 BIN=${1:?usage: redqueen_worlds.sh EVO_BOIDS WORKDIR}
 W=${2:?usage: redqueen_worlds.sh EVO_BOIDS WORKDIR}
@@ -63,7 +65,7 @@ cat > arena.json <<'JSON'
         "predator-meal": 20, "predator-cooldown": 1.5}}}
 JSON
 REG="register --arena arena.json --namespace rq-test-worlds --blocks 1 --per-block C=1,A=1,B=1
-     --total-steps 24000 --checkpoint-every 4000 --log-every 100"
+     --total-steps 24000 --checkpoint-every 4000 --log-every 100 --burn-in 0"
 
 # 1. the registry
 $WS $REG --out reg1.json 2> /dev/null || fail "register"
@@ -288,7 +290,7 @@ cat > arena_x.json <<'JSON'
  "treatments": {"A": {"predators": 40, "predator-capture-radius": 60}}}
 JSON
 $WS register --arena arena_x.json --namespace rq-test-x --blocks 1 --per-block A=1 --total-steps 24000 \
-    --checkpoint-every 4000 --log-every 100 --out RX/config/worlds.json 2> /dev/null || fail "register (extinction)"
+    --checkpoint-every 4000 --log-every 100 --burn-in 0 --out RX/config/worlds.json 2> /dev/null || fail "register (extinction)"
 $WS f1 --root RX --binary "$BIN" > rxf1.log 2>&1 || fail "f1 RX"
 $WS launch --root RX --binary "$BIN" --workers 1 $GUARD > rx.log 2>&1 || fail "launch (extinction): $(tail -3 rx.log)"
 $PY - "$T" <<'PY' || fail "the extinction was not recorded"
@@ -373,7 +375,7 @@ import sys; sys.path.insert(0, sys.argv[1]); import worlds
 st = worlds.read_state("R1", sys.argv[2])
 assert st["status"] == "done" and len(st["segments"]) == 2 and st["segments"][1]["start_frame"] > 0, st
 PY
-$WS register --arena arena.json --namespace rq-test-other --blocks 1 --per-block C=1,A=1,B=1 \
+$WS register --arena arena.json --namespace rq-test-other --blocks 1 --per-block C=1,A=1,B=1 --burn-in 0 \
     --total-steps 24000 --checkpoint-every 4000 --log-every 100 --out reg_other.json 2> /dev/null || fail "register (other)"
 cp R1/config/worlds.json r1_registry.bak
 chmod u+w R1/config/worlds.json; cp reg_other.json R1/config/worlds.json
@@ -424,7 +426,7 @@ cat > arena_y.json <<'JSON'
  "treatments": {"A": {"predators": 4, "predator-capture-radius": 60}}}
 JSON
 $WS register --arena arena_y.json --namespace rq-test-y --blocks 1 --per-block A=1 --total-steps 24000 \
-    --checkpoint-every 400 --log-every 100 --out RY/config/worlds.json 2> /dev/null || fail "register (RY)"
+    --checkpoint-every 400 --log-every 100 --burn-in 0 --out RY/config/worlds.json 2> /dev/null || fail "register (RY)"
 $WS f1 --root RY --binary "$BIN" > ryf1.log 2>&1 || fail "f1 RY"
 $WS launch --root RY --binary "$BIN" --workers 1 $GUARD > ry.log 2>&1 || fail "launch RY: $(tail -3 ry.log)"
 $PY - "$T" <<'PY' || fail "setting up the damaged extinct world"
@@ -469,4 +471,46 @@ arch = {r["label"]: rqlib.sha256_file(r["path"]) for r in worlds.archive_records
 assert arch == info["arch"], sorted(set(arch) ^ set(info["arch"]))
 assert worlds.audit_archive("RY", wid, json.load(open("RY/study.json"))["archive_root"], "extinct")
 PY
+# 11. the burn-in rule (USER DECISIONS 2): an A world whose prey dies out before the burn-in frame restarts
+#     from its slot's reserved seeds (the supervisor makes each attempt's F1), until --max-restarts; then
+#     it ends extinct. The ledger, the moved attempts, three different F1s, the per-treatment rate.
+$WS register --arena arena_x.json --namespace rq-test-z --blocks 1 --per-block A=1 --total-steps 24000 \
+    --checkpoint-every 4000 --log-every 100 --burn-in 24000 --max-restarts 2 --out RZ/config/worlds.json 2> /dev/null \
+    || fail "register (RZ)"
+$WS f1 --root RZ --binary "$BIN" > rzf1.log 2>&1 || fail "f1 RZ"
+$WS launch --root RZ --binary "$BIN" --workers 1 $GUARD > rz.log 2>&1 || fail "launch (burn-in): $(tail -3 rz.log)"
+grep -q "BURN-IN" rz.log || fail "no burn-in restart was logged: $(tail -3 rz.log)"
+$PY - "$T" <<'PY' || fail "the burn-in restarts"
+import json, os, sys; sys.path.insert(0, sys.argv[1]); import worlds, rqlib
+reg = json.load(open("RZ/config/worlds.json"))
+w = reg["worlds"][0]
+wid = w["id"]
+seeds = next(x["seeds"] for x in reg["reserved"] if x["slot"] == w["seed_slot"])
+led = worlds.restart_records("RZ")
+assert [(r["attempt"], r["failed_seed"], r["seed"]) for r in led] == [(1, seeds[0], seeds[1]), (2, seeds[1], seeds[2])], led
+assert all(r["zero_frame"] < 24000 for r in led), led
+st = worlds.read_state("RZ", wid)
+assert st["status"] == "extinct" and "restarts exhausted" in st["end_reason"], st
+assert worlds.attempt_of("RZ", wid) == 2
+ar = json.load(open("RZ/study.json"))["archive_root"]
+f1s = [rqlib.sha256_file(os.path.join(ar, "restarts", f"{wid}.a{k}", "F1.json")) for k in (0, 1)]
+f1s.append(rqlib.sha256_file(os.path.join(worlds.adir(ar, wid), "F1.json")))
+assert len(set(f1s)) == 3, f1s                         # three seeds, three F1s
+for k in (0, 1):
+    assert os.path.isfile(os.path.join("RZ", "restarts", "worlds", f"{wid}.a{k}", "seg000", "run.csv")), k
+assert os.path.isfile(os.path.join(worlds.adir(ar, wid), "FINALIZED"))
+rep = worlds.burn_in_report("RZ", reg)["per_treatment"]["A"]
+assert rep == {"worlds": 1, "restarts": 2, "attempts_started": 3, "early_failures": 3, "established": 0, "pending": 0,
+               "unresolved": 0, "failed": 0, "failed_before_start": 0, "early_failure_rate": 1.0}, rep
+for k in (0, 1):                                       # each retained attempt resolves to its own bytes
+    assert worlds.audit_attempt("RZ", wid, k) == [], (k, worlds.audit_attempt("RZ", wid, k))
+    assert all(r["path"].startswith(os.path.join(ar, "restarts", f"{wid}.a{k}")) for r in
+               worlds.attempt_archive_records("RZ", wid, k).values())
+av = worlds.read_jsonl("RZ/availability.jsonl")
+assert sum(worlds.zero_supported("RZ", e) for e in av) == 1, av    # only the current attempt's zero counts
+PY
+$WS status --root RZ > rz_status.json 2> /dev/null || fail "status RZ"
+$PY -c 'import json; s = json.load(open("rz_status.json")); assert s["burn_in"]["per_treatment"]["A"]["restarts"] == 2, s["burn_in"]' \
+    || fail "status lacks the burn-in report"
+
 echo "redqueen_worlds: ok"

@@ -75,6 +75,10 @@ class ForkError(Exception):
     pass
 
 
+class OriginRaced(ForkError):
+    """The root restarted between the admission and the copy: nothing frozen; the branch waits."""
+
+
 def froot(study):
     return os.path.join(study, "forks")
 
@@ -91,6 +95,9 @@ def register(study, splits_path, ns, origins=ORIGINS, horizon=HORIZON, seeds=SEE
     # or any JSON / JSONL whose keys contain "seed": archived plans, reservations)
     reserved = {int(w["founder_seed"]): f"the founder seed of history {w['id']}" for w in hreg["worlds"]
                 if isinstance(w.get("founder_seed"), int)}
+    for slot in hreg.get("reserved") or []:             # (every history reservation: restart seeds, unused slots)
+        for k, x in enumerate(slot.get("seeds") or []):
+            reserved.setdefault(int(x), f"history seed slot {slot.get('slot')} attempt {k}")
     avoid_rec = []
     for ap_ in avoid_paths:
         got = worlds.read_avoid(ap_)
@@ -197,19 +204,34 @@ def origin_invalid(study, b, frozen_rec=None):
 
 def branch_invalid(study, b):
     """origin_invalid for an admitted branch, with the record it froze (an origin.rec.json written before
-    the guild counts were recorded falls back to the archive's record)."""
+    the guild counts were recorded falls back to the archive's record); an origin frozen from a root
+    attempt that was since restarted (a discarded attempt) is invalid."""
     rp = os.path.join(worlds.wdir(froot(study), b["id"]), "origin.rec.json")
     frec = rqlib.read_json(rp) if os.path.isfile(rp) else None
+    if frec is not None:
+        cur = worlds.attempt_of(study, b["root"])
+        if int(frec.get("root_attempt", 0)) != cur:
+            return (f"its origin was frozen from attempt {frec.get('root_attempt', 0)} of {b['root']}, a discarded "
+                    f"attempt (the root restarted: attempt {cur})")
     if frec is not None and "prey" not in frec:
         frec = worlds.archive_records(study, b["root"]).get(b["origin"]["label"])
     return origin_invalid(study, b, frec)
 
 
+def root_registry(study):
+    return rqlib.read_json(os.path.join(study, "config", "worlds.json"))
+
+
 def origin_status(study, b):
-    """-> ("available", archive record) | ("waiting", why) | ("unavailable", why). The archive record is
-    fetched ONCE, and that exact record is the one checked (its guild counts, its bytes) and frozen; the
-    availability ledger is read AFTER it was obtained (a zero recorded meanwhile is seen)."""
+    """-> ("available", archive record) | ("waiting", why) | ("unavailable", why). A root whose current
+    attempt may still be REPLACED by the burn-in rule is waiting (its early zeros decide nothing:
+    worlds.burn_in_decided). The archive record is fetched ONCE, and that exact record is the one checked
+    (its guild counts, its bytes) and frozen; the availability ledger is read AFTER it was obtained."""
     root = b["root"]
+    att = worlds.attempt_of(study, root)            # (read BEFORE anything else: the attempt admitted)
+    decided, why = worlds.burn_in_decided(study, root_registry(study), root)
+    if not decided:
+        return "waiting", f"its root {root}: {why} (it may still be restarted)"
     rec = worlds.archive_records(study, root).get(b["origin"]["label"])
     if rec is not None:
         why = record_invalid(b, rec)
@@ -217,6 +239,7 @@ def origin_status(study, b):
             return "unavailable", why
         if not os.path.isfile(rec["path"]) or rqlib.sha256_file(rec["path"]) != rec["sha256"]:
             return "waiting", f"the archived {b['origin']['label']} of {root} does not verify (repaired by its supervisor first)"
+        rec = dict(rec, root_attempt=att)
     why = zero_before(study, b)                 # (read now, after the record was obtained)
     if why:
         return "unavailable", why
@@ -240,6 +263,9 @@ def freeze_origin(fr, b, rec):
         if r["sha256"] != rec["sha256"]:
             raise ForkError(f"{b['id']}: the histories' archived origin changed since it was frozen")
         return p, r["sha256"]
+    att = rec.get("root_attempt")
+    if att is None:                                 # (bound to the attempt admitted: origin_status)
+        att = worlds.attempt_of(os.path.dirname(fr), b["root"])
     raw = rqlib.read_bytes(rec["path"])
     if rqlib.sha256_bytes(raw) != rec["sha256"]:
         raise ForkError(f"{b['id']}: the archived origin does not hash to its record")
@@ -252,11 +278,16 @@ def freeze_origin(fr, b, rec):
         f.flush()
         os.fsync(f.fileno())
     os.chmod(tmp, 0o444)
+    if worlds.attempt_of(os.path.dirname(fr), b["root"]) != att:    # (a restart during the copy)
+        os.chmod(tmp, 0o644)
+        os.remove(tmp)
+        raise OriginRaced(f"{b['id']}: its root {b['root']} restarted while the origin was copied (attempt {att} "
+                          "was admitted): not frozen")
     os.replace(tmp, p)
     rqlib.fsync_dir(d)
     r = {"schema": ORIGIN_SCHEMA, "branch": b["id"], "root": b["root"], "label": b["origin"]["label"],
          "frame": b["origin"]["frame"], "sha256": rec["sha256"], "source": rec["path"], "prey": rec.get("prey"),
-         "predators": rec.get("predators"), "utc": rqlib.now_utc()}
+         "predators": rec.get("predators"), "root_attempt": att, "utc": rqlib.now_utc()}
     rqlib.write_json_durable(rp, r)
     return p, rec["sha256"]
 
@@ -309,11 +340,18 @@ def refresh_origins(study, reg, log):
         if st["status"] in ("pending", "waiting"):
             kind, info = origin_status(study, b)
             if kind == "available":
-                path, sha = freeze_origin(fr, b, info)
-                frozen = (path, sha)
-                if st["status"] == "waiting" or fresh:
-                    st = dict(st, status="pending")
-                    worlds.write_state(fr, bid, st)
+                try:
+                    path, sha = freeze_origin(fr, b, info)
+                except OriginRaced as e:
+                    log(f"{bid}: {e}; it waits")
+                    kind, info = "waiting", str(e)
+                else:
+                    frozen = (path, sha)
+                    if st["status"] == "waiting" or fresh:
+                        st = dict(st, status="pending")
+                        worlds.write_state(fr, bid, st)
+            if kind == "available":
+                pass
             elif kind == "unavailable":
                 st = dict(st, status="unavailable", end_reason=info)
                 worlds.write_state(fr, bid, st)
