@@ -1170,9 +1170,10 @@ def summarize(d):
                     "selected_ranks": dict(sorted(sel.items())),
                     "positive_rank_selected": sum(o["selected"]["rank"] > 0 for o in lst),
                     "decision_unavailable": sum(not (o.get("decision") or {"available": True})["available"] for o in lst),
-                    "integration_unresolved": sum(int((c.get("integration") or {}).get(s, {}).get("eps_unresolved", 0))
+                    "integration_unresolved": sum(int((c.get("integration") or {}).get(s, {}).get(k, 0))
                                                   for o in lst for c in o.get("candidates", ())
-                                                  for s in ("validation", "test")),
+                                                  for s in ("validation", "test")
+                                                  for k in ("grid_unresolved", "eps_unresolved")),
                     "primary": ({"ranks": prim[0]["ranks"], "datasets": len(prim), "successes": kp,
                                  "rate": round(kp / len(prim), 3), "wilson95": wilson(kp, len(prim)),
                                  "selected_ranks": dict(sorted(selp.items())),

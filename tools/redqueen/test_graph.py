@@ -1149,6 +1149,24 @@ class TestMap(unittest.TestCase):
         inf = {}
         self.assertAlmostEqual(float(M.pred_count_lpd(Dx, my, np.array([0]), cnt, N, info=inf)[0]), exact, places=12)
         self.assertEqual(inf["exact"], 1)
+        # the r3 smoke's pair: predictor SD 1.646 with the x1.5 capture-noise variance function (its SD varies
+        # 0.23-0.9 along e). It needs more than 513 nodes; the larger grids resolve it against a dense reference,
+        # where the eps-order (fixed sigma) would be 0.25 nats off
+        vf = self.rec.var_model(self.rec.SCENARIOS["r2_017_cap15"])
+        mz = dict(mx, var_fn=vf, phi=1.0, pair_var=1.646 ** 2)
+        cz = np.array([[75, 111, 125, 137, 49, 87]])
+        inf = {}
+        got = M.pred_count_lpd(Dx, mz, np.array([0]), cz, N, info=inf)
+        x = np.linspace(-9.0, 9.0, 200001)
+        wq = np.exp(-0.5 * x * x)
+        wq /= wq.sum()
+        loc = 1.646 * x
+        P = np.exp(M.count_logp(np.repeat(cz, len(x), axis=0), N, loc, M._rep_var(mz, loc)))
+        ref = float(np.mean(np.log(wq @ P)))
+        self.assertAlmostEqual(float(got[0]), ref, delta=2e-3)
+        self.assertEqual((inf["eps"], inf["grid_unresolved"], inf["grid"]), (0, 0, 1))
+        eps = float(M._eps_pass(mz["link"], mz, cz, np.zeros(1), np.array([1.646]), N, 41).mean())
+        self.assertGreater(abs(eps - ref), 0.05)                               # (why the eps-order is not used here)
 
     def test_pair_variance_safeguarded(self):
         """r3 P2-2: the review's cycle. One cell (s2 0.01, r^2 1.01) and 100 cells (s2 1, r^2 0): the fixed point

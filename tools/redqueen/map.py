@@ -968,7 +968,8 @@ def pred_var(D, m, idx, own=None):
 
 TRAP_H = 0.25                            # (the grid step, in units of the narrowest replicate SD / steepest slope)
 TRAP_SD = 7.0                            # (the grid covers +-TRAP_SD prior SDs)
-TRAP_KS = (15, 23, 33, 49, 65, 97, 129, 193, 257, 385, 513)    # (grid sizes: pairs are bucketed, then vectorized)
+TRAP_KS = (15, 23, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193,
+           12289, 16385)                 # (grid sizes: pairs are bucketed, then vectorized)
 TRAP_CELLS = 1_000_000                   # (pairs x replicates x nodes per vectorized chunk)
 TRAP_TOL = 1e-3                          # (the a-posteriori check, log units: full grid vs every other node)
 EPS_NODES = 41                           # (the eps-order Gauss-Hermite nodes; checked against 21)
@@ -1032,19 +1033,23 @@ def pred_count_lpd(D, m, idx, cnt, N, own=None, info=None):
         the link's slope over the range (Link.max_slope), on the smallest of TRAP_KS that achieves it. Every
         observation is CHECKED a posteriori against the same grid's every other node; above TRAP_TOL its pair
         moves to the next grid;
-      - a pair whose resolution needs more than TRAP_KS[-1] nodes, or still fails the check there, has a
-        replicate SD far below its predictor spread: the eps-order integral (_eps_pass, the inner integral exact
-        through the inverse link), itself checked against half its nodes; a failure there is counted as
-        unresolved (reported, never hidden).
-    info (a dict): the counts per case are added to it (pairs, plain, exact, grid, refined, eps,
+      - a pair whose resolution needs more than TRAP_KS[-1] = 16385 nodes has a replicate SD below 1/290 of
+        its predictor spread on the link's scale, where the count's probability is the predictor mass mapped
+        into its interval up to O((sigma / (sd G'))^2): the eps-order integral (_eps_pass, the inner integral
+        exact through the inverse link), itself checked against half its nodes. The eps-order is NOT used
+        where sigma is comparable to the spread (its fixed sigma would then miss the variance function's
+        change along e: 0.25 nats on a smoke-run pair before the grid went past 513), and a pair failing the
+        check even on the largest grid, or an eps-order failing its own, is counted as unresolved (reported,
+        never hidden).
+    info (a dict): the counts per case are added to it (pairs, plain, exact, grid, refined, grid_unresolved, eps,
     eps_unresolved) with the largest accepted check difference (max_check)."""
     eta, s2 = pred_eta(D, m, idx, own)
     lk = m["link"]
     cnt = np.asarray(cnt)
     out = np.empty(len(eta))
     sd = np.sqrt(s2)
-    st = {"pairs": int(len(eta)), "plain": 0, "exact": 0, "grid": 0, "refined": 0, "eps": 0, "eps_unresolved": 0,
-          "max_check": 0.0}
+    st = {"pairs": int(len(eta)), "plain": 0, "exact": 0, "grid": 0, "refined": 0, "grid_unresolved": 0, "eps": 0,
+          "eps_unresolved": 0, "max_check": 0.0}
     plain = sd <= 1e-9
     if plain.any():
         g0 = lk.G(eta[plain])
@@ -1084,8 +1089,9 @@ def pred_count_lpd(D, m, idx, cnt, N, own=None, info=None):
                             nxt.append(r_[~ok])
                             nb_.append(np.full(int((~ok).sum()), b + 1))
                             st["refined"] += int((~ok).sum())
-                        else:
-                            eps_rows.append(r_[~ok])
+                        else:                           # (the largest grid's value kept, flagged)
+                            out[r_[~ok]] = full[~ok].mean(axis=1)
+                            st["grid_unresolved"] += int((~ok).sum())
             cur = np.concatenate(nxt) if nxt else np.zeros(0, int)
             cb = np.concatenate(nb_) if nb_ else np.zeros(0, int)
         er = np.concatenate(eps_rows)
