@@ -14,6 +14,10 @@
 #                              references. An old Classic link to the root
 #                              (/?view=flat, /?threads=0, ...) is sent here by
 #                              the Ocean page's head (web/ocean.html says which)
+#   dist/bodyplan.html         the M2a body plan's fixture viewer
+#                              (web/ocean_bodyplan.html: the Ocean module's
+#                              body-plan law, its fixture and GPU check), no-cache,
+#                              hashed references; the fish card links to it
 #   dist/assets/NAME.HASH.EXT  every script, wasm and image, content-hashed,
 #                              served with a one-year immutable cache
 #   dist/vercel.json           headers: COOP/COEP (cross-origin isolation for
@@ -39,7 +43,8 @@ SRC=(web/evo_boids.js web/evo_boids.wasm web/evo_boids_mt.js web/evo_boids_mt.wa
      web/evo_ocean.js web/evo_ocean.wasm web/ocean.js web/ocean_scene.js web/ocean.html
      web/ocean_config.js web/ocean_dash.js web/ocean_worker.js web/ocean_appearance.js
      web/ocean_appearance_slots.js web/ocean_handoff.js web/ocean_perf.js web/ocean_shaders.js
-     web/ocean_pose.js web/ocean_materials.js web/ocean_scene_parity.js)
+     web/ocean_pose.js web/ocean_materials.js web/ocean_scene_parity.js
+     web/ocean_bodyplan.html web/ocean_bodyplan.js tests/fixtures/ocean_body_fixture.json)
 for f in "${SRC[@]}"; do
     [ -f "$f" ] || { echo "missing $f — build the modules first (wasm/build_wasm.sh, wasm/build_ocean.sh)" >&2; exit 1; }
 done
@@ -77,6 +82,8 @@ OCHANDOFF=$(publish web/ocean_handoff.js)
 OCPERF=$(publish web/ocean_perf.js);  OCSLOTS=$(publish web/ocean_appearance_slots.js)
 OCSHADERS=$(publish web/ocean_shaders.js); OCPOSE=$(publish web/ocean_pose.js)
 OCPARITY=$(publish web/ocean_scene_parity.js); OCMATS=$(publish web/ocean_materials.js)
+# the body plan's fixture viewer (and its fixture: the native law's digests)
+OCBP=$(publish web/ocean_bodyplan.js); OCBPFIX=$(publish tests/fixtures/ocean_body_fixture.json)
 
 # Classic: rewrite the EVO_ASSETS block, the <script src> tags and the
 # switch's link to the Ocean (now the root). Fails loudly if web/index.html no
@@ -120,7 +127,8 @@ assets = '''window.EVO_ASSETS = {
       ocean: "$OC", oceanWasm: "$OC_WASM",
       worker: "$OCWORKER", handoff: "$OCHANDOFF",
       mock: "ocean_mock.js",
-      three: "$THREE"
+      three: "$THREE",
+      bodyplan: "bodyplan.html"
     };'''
 out, n1 = re.subn(r'window\.EVO_ASSETS = \{.*?\};', lambda m: assets, src, count=1, flags=re.S)
 out, n2 = re.subn(r'<script src="ocean_scene\.js"></script>', '<script src="$OCSCENE"></script>', out, count=1)
@@ -144,6 +152,25 @@ assert counts == (1,) * 17, ("ocean.html changed shape", counts)
 open(sys.argv[1], "w").write(out)
 PY
 cp "$OUT/index.html" "$OUT/ocean.html"
+
+# The body plan's fixture viewer: its EVO_ASSETS block and its five <script src> tags.
+python3 - "$OUT/bodyplan.html" <<PY
+import re, sys
+src = open("web/ocean_bodyplan.html").read()
+assets = '''window.EVO_ASSETS = {
+    ocean: "$OC", oceanWasm: "$OC_WASM",
+    fixture: "$OCBPFIX"
+  };'''
+out, n1 = re.subn(r'window\.EVO_ASSETS = \{.*?\};', lambda m: assets, src, count=1, flags=re.S)
+out, n2 = re.subn(r'<script src="ocean_appearance\.js"></script>', '<script src="$OCAPP"></script>', out, count=1)
+out, n3 = re.subn(r'<script src="ocean_shaders\.js"></script>', '<script src="$OCSHADERS"></script>', out, count=1)
+out, n4 = re.subn(r'<script src="ocean_pose\.js"></script>', '<script src="$OCPOSE"></script>', out, count=1)
+out, n5 = re.subn(r'<script src="ocean_scene_parity\.js"></script>', '<script src="$OCPARITY"></script>', out, count=1)
+out, n6 = re.subn(r'<script src="ocean_bodyplan\.js"></script>', '<script src="$OCBP"></script>', out, count=1)
+counts = (n1, n2, n3, n4, n5, n6)
+assert counts == (1,) * 6, ("ocean_bodyplan.html changed shape", counts)
+open(sys.argv[1], "w").write(out)
+PY
 
 cp web/vercel.json "$OUT/vercel.json"
 

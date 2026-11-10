@@ -894,6 +894,69 @@ class TestFork(unittest.TestCase):
                     score.score(self.d, 0, 200, [200], 100, assay, fork=fork)
 
 
+class TestScripted(unittest.TestCase):
+    """Codex #74 r1 P2-4: score.py --scripted verifies the scripted (Stage A) mode from its inputs: the arena and
+    every horizon checkpoint version 1, brain and economy off, K hunters, no predators.csv; captures are the
+    predation-death counter's difference from a NONZERO loaded baseline."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.arena = mk_cp(n_prey=6, n_pred=3, version=1, frame=100)
+        self.arena["counters"].update(totalDeathsPredation=5, totalDeaths=8, totalPredatorBirths=4,
+                                      totalPredatorDeathsStarvation=3)          # (the loaded world's history)
+        self.end = mk_cp(n_prey=6, n_pred=3, version=1, frame=300)
+        self.end["counters"] = dict(self.arena["counters"], totalDeathsPredation=7, totalDeaths=10)
+        self.end["creatures"]["alive"][0] = self.end["creatures"]["alive"][1] = 0     # (two eaten)
+
+    def tearDown(self):
+        shutil.rmtree(self.d)
+
+    def write(self, arena=None, end=None):
+        for name, cp in (("arena.json", arena or self.arena), ("end.300.json", end or self.end)):
+            with open(os.path.join(self.d, name), "w") as f:
+                f.write(ckpt.dumps(cp))
+
+    def score(self, k=3):
+        import score
+        return score.score(self.d, k, 200, [200], 100, "frozen", scripted=True)
+
+    def test_scripted_inputs_verified(self):
+        import score
+        self.write()
+        s = self.score()
+        h = s["horizons"][0]
+        self.assertEqual((h["captures"], h["deaths_predation"], h["survivors"], h["predators"]), (2, 2, 4, 3))
+        self.assertAlmostEqual(h["predator_seconds"], 3 * 200 * score.DT)
+        self.assertEqual((s["scripted"], s["checks"]["rows"], s["checks"]["predation_deaths_equal_captures"]),
+                         (True, None, "by construction (scripted)"))
+        neural = mk_cp(n_prey=6, n_pred=3, version=2, frame=100)          # (brains: version 2, predatorBrain on)
+        neural["counters"] = dict(self.arena["counters"])
+        neural_end = mk_cp(n_prey=6, n_pred=3, version=2, frame=300)
+        neural_end["counters"] = dict(self.end["counters"])
+        econ = copy.deepcopy(self.arena)
+        econ["config"]["predatorEconomy"] = True
+        for arena, end, msg in ((neural, None, "format version 2"), (neural, None, "predatorBrain on"),
+                                (econ, None, "predatorEconomy on"), (None, neural_end, "end.300.json is format version"),
+                                (None, dict(self.end, config=dict(self.end["config"], predatorEconomy=True)),
+                                 "end.300.json has predatorEconomy on")):
+            self.write(arena, end)
+            with self.assertRaisesRegex(score.ScoreError, msg):
+                self.score()
+        self.write()
+        with self.assertRaisesRegex(score.ScoreError, "K = 4"):
+            self.score(k=4)
+        with open(os.path.join(self.d, "run.predators.csv"), "w") as f:         # (a neural metrics file)
+            f.write("step,predator_pop\n200,3\n300,3\n")
+        with self.assertRaisesRegex(score.ScoreError, "neural metrics file"):
+            self.score()
+        os.remove(os.path.join(self.d, "run.predators.csv"))
+        bud = copy.deepcopy(self.end)                                          # (a predator birth: not fixed)
+        bud["counters"]["totalPredatorBirths"] += 1
+        self.write(end=bud)
+        with self.assertRaisesRegex(score.ScoreError, "predator counter changes"):
+            self.score()
+
+
 class TestProcesses(unittest.TestCase):
     PARENT = ("import os, subprocess, sys, time\n"
               "sys.path.insert(0, sys.argv[1])\n"
@@ -1295,6 +1358,23 @@ class TestPlanV2(unittest.TestCase):
 
     def tearDown(self):
         shutil.rmtree(self.tmp)
+
+    def test_source_endpoints_are_exact(self):
+        """Codex #74 r1 P2-3: a predator source is exactly {source: random} or {source: scripted}: mixed with a
+        world / time (which would fall through to a neural donor and lose the source) or unknown, it is refused;
+        scripted hunters are never live (P3)."""
+        S = lambda p, **kw: dict(E("scripted", "training", "A", "T2"), predators=p, **kw)  # noqa: E731
+        rows, _, _ = plan.expand_v2(design2(self.tmp, [S({"source": "scripted"})]), pending=True)
+        self.assertEqual([r["predators"] for r in rows], [{"source": "scripted"}] * 2)
+        self.assertTrue(all(r["groups"]["transplant"].endswith(f"|scripted-k3|r{r['replicate']:02d}") for r in rows))
+        for p in ({"source": "scripted", "world": "B", "time": "T2"}, {"source": "random", "world": "B", "time": "T2"},
+                  {"source": "neural"}, {"source": "neural", "world": "B", "time": "T2"}, {"source": "scripted", "k": 3}):
+            with self.assertRaisesRegex(plan.DesignError, "exactly"):
+                plan.expand_v2(design2(self.tmp, [S(p)]), pending=True)
+        with self.assertRaisesRegex(plan.DesignError, "never live"):
+            plan.expand_v2(design2(self.tmp, [S({"source": "scripted"}, assay="live")]), pending=True)
+        rows, _, _ = plan.expand_v2(design2(self.tmp, [S({"source": "scripted"}, assay="frozen-newborn")]), pending=True)
+        self.assertEqual({r["assay"] for r in rows}, {"frozen-newborn"})
 
     def test_expand(self):
         rows, _, man = plan.expand_v2(design2(self.tmp, self.edges), pending=True)
