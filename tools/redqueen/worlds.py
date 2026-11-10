@@ -3625,25 +3625,154 @@ def monitor(root, reg, window=MON_WINDOW, step=MON_STEP, reg_sha=None, windows_o
 
 
 # ================================================================== design block, status
+BLOCK_EVIDENCE_SCHEMA = "finfolk.redqueen.blockevidence/1"
+DISPOSITIONS = ("no_rule", "established", "exhausted", "restart_pending", "unresolved", "not_installed")
+SETTLED = ("no_rule", "established", "exhausted")
+ARCHIVE_STATUS = ("verified", "off_chain", "missing", "mismatch")
+
+
+def attempt_uuid(base, k):
+    """A restarted attempt's identity (as val_block.py's, refsel.py's and noisebank.py's): the registry uuid for
+    attempt 0, else uuid5(NAMESPACE_URL, "finfolk:attempt:<registry uuid>:<k>") (another history)."""
+    return base if not k else str(uuid.uuid5(uuid.NAMESPACE_URL, f"finfolk:attempt:{base}:{k}"))
+
+
+def disposition(o, k, maxr, bi):
+    """(decided, why, disposition) of a retained attempt's burn-in from its evidence (attempt_outcome; None: recorded
+    but not installed): settled (no_rule, established: evidenced alive at the burn-in frame or its first zero at or
+    after it, exhausted: an early failure with the restarts used up, the slot's final attempt) or not (a restart is
+    due, unresolved: not yet evidenced alive at the burn-in frame, not_installed)."""
+    if o is None:
+        return False, f"attempt {k} is recorded but not installed (its restart is in progress)", "not_installed"
+    b, first = o["burn_in"], o["first_terminal"]
+    if b == "no rule":
+        return True, "no burn-in rule", "no_rule"
+    if b == "established":
+        return True, (f"its first zero (frame {first['frame']}) is at or after the burn-in frame {bi}" if first else
+                      f"evidenced alive at the burn-in frame {bi}"), "established"
+    if b == "early_failure":
+        if k >= maxr:
+            return True, (f"an early failure (frame {first['frame']}) with its {maxr} restarts exhausted: the slot's "
+                          "final attempt"), "exhausted"
+        return False, (f"an evidenced zero at frame {first['frame']} before the burn-in frame {bi}: it will be "
+                       "restarted"), "restart_pending"
+    return False, (f"not yet evidenced alive at the burn-in frame {bi} (its evidence reaches frame {o['frontier']}, "
+                   f"{o['observation']})"), "unresolved"
+
+
+def archive_evidence(root, wid, k, d, seq):
+    """An attempt's archive index, every object checked against the attempt's NEWEST LINE OF DESCENT and RE-HASHED
+    (Codex #77 r1 P1-1) -> ({frame: {"label", "sha256", "path", "status", "why"}}, a problem or None). status:
+    verified (F1, or a checkpoint whose acceptance record on the line of descent, within its cut, binds this
+    sha256; its bytes hash to it), off_chain (archived, but no acceptance record on the line of descent binds it:
+    a superseded continuation's, or not accepted yet), missing, mismatch (its bytes no longer hash to the record).
+    F1 also records whether its replay verification (f1_verify.json) binds it to the first checkpoint."""
+    if d is None:
+        return {}, f"attempt {k} is recorded but not installed"
+    try:
+        recs = attempt_archive_records(root, wid, k)
+    except (WorldsError, OSError, KeyError) as e:
+        return {}, f"its archive index is unreadable ({e})"
+    chain = {}
+    for f, sha in seq["checkpoints"]:
+        chain.setdefault(f, sha)
+    fv_raw, _ = _read_once(os.path.join(d, "f1_verify.json"))
+    try:
+        fv = json.loads(fv_raw.decode("utf-8")) if fv_raw else {}
+    except (ValueError, UnicodeDecodeError):
+        fv = {}
+    out, probs = {}, []
+    for lab, r in recs.items():
+        f, sha, p = r.get("frame"), r.get("sha256"), r.get("path")
+        if not isinstance(f, int) or label_of(f) != lab or not isinstance(sha, str):
+            probs.append(f"{lab}: a malformed archive record")
+            continue
+        e = {"label": lab, "sha256": sha, "path": p}
+        if f == 1:
+            e["replay"] = ("verified" if fv.get("identical") and fv.get("f1_sha256") == sha
+                           and chain.get(fv.get("first_checkpoint")) == fv.get("first_checkpoint_sha256") else
+                           "not recorded")
+        elif chain.get(f) != sha:
+            e.update(status="off_chain", why=("no acceptance record on the line of descent binds it (a superseded "
+                                              "continuation's, or not accepted yet)" if f not in chain else
+                                              "its record's sha256 is not the accepted checkpoint's"))
+        if "status" not in e:
+            got = None
+            try:
+                got = rqlib.sha256_file(p) if isinstance(p, str) and os.path.isfile(p) else None
+            except OSError:
+                pass
+            if got is None:
+                e.update(status="missing", why=f"{p} is missing")
+            elif got != sha:
+                e.update(status="mismatch", why=f"{p} does not hash to its record")
+            else:
+                e.update(status="verified", why=None)
+        out[f] = e
+    return dict(sorted(out.items())), ("; ".join(probs) if probs else None)
+
+
 def design_block(root, reg, archive_root):
+    """The worlds block (finfolk.redqueen.worldsblock/1, read-only) a design and graph.py mask bind: per registered
+    slot its RETAINED attempt's EVIDENCE under evidence.py's rules (Annex H D6 rules 24 and 27; Codex #77 r1 P1-1;
+    the same sequence as the ecological export): the registry uuid and the attempt's identity (attempt_uuid), the
+    first absorbing terminal boundary (valid_before: the first evidenced sampled guild zero; snapshots at or after
+    it are not valid challengers, design §2.3) and each guild's, the observation's frontier (first terminal,
+    refill, stop), the explicit burn-in disposition (disposition: an unsettled attempt's snapshots are pending),
+    every archived object checked against the line of descent and re-hashed (archive; "archived": the verified
+    frames), and the bytes of the inputs read (registry, restart and availability ledgers, evidence.py)."""
     s = reg["schedule"]
     times = {"F1": 1}
     for f in range(s["checkpoint_every"], s["total_steps"] + 1, s["checkpoint_every"]):
         times[f"{f // 1_000_000}M" if f % 1_000_000 == 0 else f"f{f}"] = f
+    L, bi, maxr = s["log_every"], burn_in_of(reg), int(reg.get("max_restarts") or 0)
+    inputs = {}
+    for name in ("restarts.jsonl", "availability.jsonl"):
+        p = os.path.join(root, name)
+        raw, sha = _read_once(p)
+        inputs[name] = {"bytes": len(raw or b""), "sha256": sha, "records": _jsonl_bytes(raw, p)}
+    restarts, ledger = inputs["restarts.jsonl"]["records"], inputs["availability.jsonl"]["records"]
     ws = {}
-    led = read_jsonl(os.path.join(root, "availability.jsonl"))
     for w in reg["worlds"]:
-        ad = adir(archive_root, w["id"])
-        zeros = first_zeros(led, w["id"], root)
-        st = read_state(root, w["id"])
-        ws[w["id"]] = {"uuid": w["uuid"], "treatment": w["treatment"], "block": w["block"], "status": st["status"],
-                       "attempt": attempt_of(root, w["id"]),
-                       "pattern": os.path.join(ad, "end.{frame}.json"), "paths": {"F1": os.path.join(ad, "F1.json")},
-                       # snapshots at or after a guild's first zero are not valid challengers (design §2.3)
-                       "valid_before": min(zeros.values()) if zeros else None,
-                       "archived": sorted(r["frame"] for r in archive_records(root, w["id"]).values())}
-    return {"schema": "finfolk.redqueen.worldsblock/1", "registry_sha256": rqlib.sha256_file(
-        os.path.join(root, "config", "worlds.json")), "times": times, "worlds": ws}
+        wid = w["id"]
+        idx, marker, msha = attempt_index(root, wid, restarts)
+        k = max(idx)
+        d, src = idx[k]
+        seq = attempt_sequence(root, wid, d, w, k, ledger, L) if d else None
+        o = attempt_outcome(seq, w, total_steps(w, s), bi) if seq else None
+        arch, aprob = archive_evidence(root, wid, k, d, seq) if seq else ({}, f"attempt {k} is recorded but not installed")
+        decided, why, disp = disposition(o, k, maxr, bi)
+        first = o["first_terminal"] if o else None
+        prior = []                                     # (Codex #77 r3: each earlier attempt's OWN evidence)
+        for j in sorted(x for x in idx if x < k):
+            dj, srcj = idx[j]
+            oj = attempt_outcome(attempt_sequence(root, wid, dj, w, j, ledger, L), w, total_steps(w, s), bi) if dj else None
+            prior.append({"attempt": j, "source": srcj, "first_terminal": oj["first_terminal"] if oj else None,
+                          "burn_in": oj["burn_in"] if oj else None})
+        zeros = {g: z["frame"] for g, z in (o["events"] if o else {}).items() if isinstance(z, dict)}
+        ad = adir(archive_root, wid)
+        ws[wid] = {"uuid": w["uuid"], "attempt_uuid": attempt_uuid(w["uuid"], k), "treatment": w["treatment"],
+                   "block": w["block"], "status": o["status"] if o else "pending", "attempt": k, "attempt_source": src,
+                   "attempt_marker": marker, "attempt_json_sha256": msha,
+                   "pattern": os.path.join(ad, "end.{frame}.json"), "paths": {"F1": os.path.join(ad, "F1.json")},
+                   "valid_before": first["frame"] if first else None, "first_zeros": dict(sorted(zeros.items())),
+                   "burn_in": {"decided": decided, "why": why, "disposition": disp}, "prior_attempts": prior,
+                   "archived": [f for f, e in arch.items() if e["status"] == "verified"],
+                   "archive": {str(f): e for f, e in arch.items()}, "archive_problem": aprob,
+                   "evidence": {"frontier": o["frontier"] if o else base_frame(w),
+                                "accepted_through": o["accepted_through"] if o else base_frame(w),
+                                "first_terminal": first, "refill": o["refill"] if o else None,
+                                "stop": o["stop"] if o else None, "observation": o["observation"] if o else "ongoing",
+                                "unsupported_ledger": o["unsupported_ledger"] if o else [],
+                                "sequence": o["evidence"] if o else None}}
+    return {"schema": "finfolk.redqueen.worldsblock/1",
+            "registry_sha256": rqlib.sha256_file(os.path.join(root, "config", "worlds.json")),
+            "namespace": reg.get("namespace"), "times": times, "burn_in_frame": bi, "max_restarts": maxr,
+            "evidence": {"schema": BLOCK_EVIDENCE_SCHEMA,
+                         "evidence_sha256": rqlib.sha256_file(os.path.abspath(evidence.__file__)),
+                         "tool_sha256": rqlib.sha256_file(os.path.abspath(__file__)),
+                         "inputs": {n: {"bytes": v["bytes"], "sha256": v["sha256"]} for n, v in inputs.items()}},
+            "worlds": ws}
 
 
 def burn_in_report(root, reg):
