@@ -63,11 +63,37 @@ jobs:
           cmake -S "$RUNNER_TEMP/base" -B "$RUNNER_TEMP/base/build" -DCMAKE_BUILD_TYPE=Release -DEVO_NO_OPENMP=ON
           cmake --build "$RUNNER_TEMP/base/build" --target evo_boids -j
           sha256sum build/evo_boids "$RUNNER_TEMP/base/build/evo_boids"
-      - name: Compare every scenario's outputs
+      - name: Compare every scenario's outputs (serial; with the registered production configuration)
         if: steps.base.outputs.changed == 'yes'
+        env:
+          ARENA: tests/redqueen_arena_selected.json
+          EXPECT_ARENA_SHA256: 3efeab747a72150c24bcb541f84284691d4b45823cff45e95d71d8563fc8a838
         run: |
           bash tools/identity_base_head.sh "$RUNNER_TEMP/base/build/evo_boids" build/evo_boids "$RUNNER_TEMP/identity"
           sha256sum "$RUNNER_TEMP/identity/identity.json"
+      # (Codex #74 r2) the PINNED production engine: finfolk e90cbf3 built with its recorded recipe, preset
+      # native-serial-fast (the server's ~/finfolk/bin/evo_boids_fast, sha256 8d5cacbe...0d43, from that source and
+      # preset: predC/sweep1 HOST.md), against the head built the same way, on every scenario including the
+      # registered production configuration (arena #1, sha256 3efeab74..., both floors 0)
+      - name: Build the pinned engine's source and the head with its recipe (native-serial-fast)
+        if: steps.base.outputs.changed == 'yes'
+        run: |
+          grep -q -m1 avx2 /proc/cpuinfo && echo "the runner supports x86-64-v3"
+          git worktree add -q --detach "$RUNNER_TEMP/pinned" e90cbf3
+          (cd "$RUNNER_TEMP/pinned" && cmake --preset native-serial-fast > /dev/null && cmake --build --preset native-serial-fast --target evo_boids -j)
+          cmake --preset native-serial-fast > /dev/null && cmake --build --preset native-serial-fast --target evo_boids -j
+          sha256sum build_serial_fast/evo_boids "$RUNNER_TEMP/pinned/build_serial_fast/evo_boids"
+      - name: Compare the pinned engine and the head (native-serial-fast; the production configuration included)
+        if: steps.base.outputs.changed == 'yes'
+        env:
+          ARENA: tests/redqueen_arena_selected.json
+          EXPECT_ARENA_SHA256: 3efeab747a72150c24bcb541f84284691d4b45823cff45e95d71d8563fc8a838
+          PINNED_SOURCE: e90cbf3
+          PINNED_PRESET: native-serial-fast
+          PINNED_SHA256: 8d5cacbeedc506f09d88aeb90709649b58a21b60d201210961975e6e64370d43
+        run: |
+          bash tools/identity_base_head.sh "$RUNNER_TEMP/pinned/build_serial_fast/evo_boids" build_serial_fast/evo_boids "$RUNNER_TEMP/identity_pinned"
+          sha256sum "$RUNNER_TEMP/identity_pinned/identity.json"
 
   # The web front end's type check: tsc --checkJs over tsconfig.json's files (those that
   # carry // @ts-check) with web/types.d.ts. Checking only, nothing is built: the runner

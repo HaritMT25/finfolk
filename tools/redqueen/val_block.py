@@ -117,7 +117,9 @@ def observations(adir, log_every=LOG_EVERY):
     obs = evidence.terminal(samples)                    # (the first absorbing terminal; refills vs the founders' 0)
     if obs["refill"]:
         r = obs["refill"]
-        tech.append(f"a predator refill at frame {r['frame']} (predator_reseeds_cum {r['value']} > {r['baseline']}): "
+        tech.append(f"an unreadable predator refill counter at frame {r['frame']}: the integrity check cannot be made"
+                    if r.get("unreadable") else
+                    f"a predator refill at frame {r['frame']} (predator_reseeds_cum {r['value']} > {r['baseline']}): "
                     "a protocol-integrity event; nothing after it is evidence of natural coexistence")
     zero = obs["first_terminal"]["frame"] if obs["first_terminal"] else None
     return zero, obs["frontier"], tech, ev

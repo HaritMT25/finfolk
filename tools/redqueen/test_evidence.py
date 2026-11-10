@@ -90,6 +90,43 @@ class TestEvidence(unittest.TestCase):
                          ({"frame": 400, "value": 1, "baseline": 0}, 300, None))
         self.assertEqual(ev.terminal(rows, refill_base=None)["first_terminal"]["frame"], 500)  # (no baseline)
         self.assertIsNone(ev.terminal(rows, refill_base=1)["refill"])                       # (a branch's own baseline)
+        # (#74 r2 NEW P2) a present but unreadable refill counter is technical at the sample before it
+        rows, _ = ev.segment_rows(csv(alive(100, 300) + [(400, 50, 8, "nan"), (500, 50, 8, 0)]), 0, 100,
+                                  cols=(ev.REFILL_COL,))
+        o = ev.terminal(rows)
+        self.assertEqual((o["refill"], o["frontier"]), ({"frame": 400, "value": None, "baseline": 0, "unreadable": True}, 300))
+        rows, _ = ev.segment_rows(csv(alive(100, 300)), 0, 100)        # (the column not requested: no check)
+        self.assertIsNone(ev.terminal(rows)["refill"])
+
+    def test_cuts_stop_reading_and_must_be_reached(self):
+        """#74 r2 / #75 r2: reading stops the moment the cut is reached (a malformed superseded row beyond it never
+        matters); a parent that skips its cut, or ends before it, stops the chain (its child is not admitted)."""
+        raw = csv(alive(100, 500) + [(600, "5x", 8, 0)])                # (a malformed row right after the cut)
+        rows, stop = ev.segment_rows(raw, 0, 100, upto=500)
+        self.assertEqual(([f for f, _ in rows][-1], stop), (500, None))
+        rows, stop = ev.segment_rows(raw, 0, 100)                       # (as the newest segment: it stops there)
+        self.assertIn("line 7", stop)
+        bridge = csv(alive(100, 400) + alive(600, 700))                 # (500 missing; the child resumed at 500)
+        rows, stop = ev.segment_rows(bridge, 0, 100, upto=500)
+        self.assertEqual(([f for f, _ in rows][-1], stop[:6]), (400, "line 6"))
+        rows, stop = ev.segment_rows(csv(alive(100, 700)), 0, 100, upto=550)    # (a cut off the sample grid)
+        self.assertIn("pass frame 550", stop)
+        self.assertIn("not after its start", ev.segment_rows(csv(alive(600, 700)), 500, 100, upto=500)[1])
+
+    def test_chain_follows_recorded_links(self):
+        """#75 r2 P2: the newest segment's RECORDED parent, not the start frames: seg002@10 resumed seg000's record,
+        bypassing seg001@5 (which never reached 10)."""
+        segs = [("seg000", 0, None), ("seg001", 5, "seg000"), ("seg002", 10, "seg000")]
+        self.assertEqual(ev.chain_links(segs), ([("seg000", 0, 10), ("seg002", 10, None)], None))
+        self.assertEqual(ev.chain_cuts([(k, s) for k, s, _ in segs])[0][0], ("seg000", 0, 5))   # (inference differs)
+        self.assertEqual(ev.chain_links([("s0", 0, None), ("s1", 6, "s0"), ("s2", 12, "s1")])[0],
+                         [("s0", 0, 6), ("s1", 6, 12), ("s2", 12, None)])
+        self.assertIn("not an earlier segment", ev.chain_links([("s0", 0, None), ("s1", 6, "s9")])[1])
+        self.assertIn("not an earlier segment", ev.chain_links([("s0", 0, None), ("s1", 6, "s2"), ("s2", 8, "s1")])[1])
+        self.assertIn("records no parent", ev.chain_links([("s0", 0, None), ("s1", 6, None)])[1])
+        self.assertIn("cannot be the parent", ev.chain_links([("s0", 8, None), ("s1", 6, "s0")], base=8)[1])
+        self.assertEqual(ev.chain_links([]), ([], "no segment"))
+        self.assertEqual(ev.chain_links([("b0", 3000, None), ("b1", 4000, "b0")], base=3000)[1], None)
 
 
 if __name__ == "__main__":

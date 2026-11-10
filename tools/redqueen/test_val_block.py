@@ -196,6 +196,26 @@ class TestValBlock(unittest.TestCase):
         self.assertTrue(any("refill at frame 50000000" in t for t in v["technical"]), v["technical"])
         self.assertEqual(max(v["archived"]), 49 * M)
 
+    def test_cut_boundaries_r2(self):
+        """Codex #74 r2: a parent that skips the resume frame (60M missing, 61M present) does not admit its child; a
+        malformed superseded row right after the cut never blocks the valid child; an unreadable refill counter
+        is technical."""
+        segment(adir(self.root, "w01"), 0, 0, rows(L, 59 * M) + rows(61 * M, 61 * M))
+        v = self.block()["worlds"]["w01"]
+        self.assertEqual((v["observed_through"], v["valid_before"]), (59 * M, None))
+        self.assertTrue(v["technical"] and "out-of-sequence" in v["technical"][0], v["technical"])
+        self.assertEqual(v["unobserved"][0], 60 * M)
+        segment(adir(self.root, "w03"), 0, 0, rows(L, 60 * M) + "61000000,1.0,5x0,10\n")
+        v = self.block()["worlds"]["w03"]
+        self.assertEqual((v["observed_through"], v["technical"]), (100 * M, []))
+        ad = adir(self.root, "w06")
+        h = "step,elapsed_s,population,predator_pop,predator_reseeds_cum\n"
+        with open(os.path.join(ad, "runs", "seg000.csv"), "w") as f:
+            f.write(h + "".join(f"{x},1.0,500,10,{'nan' if x == 30 * M else 0}\n" for x in range(M, 61 * M, M)))
+        v = self.block()["worlds"]["w06"]
+        self.assertEqual(v["observed_through"], 29 * M)
+        self.assertTrue(any("unreadable predator refill counter at frame 30000000" in t for t in v["technical"]))
+
     def test_refusals_and_cli(self):
         bad = os.path.join(adir(self.root, "w02"), "runs", "seg000.csv")
         with open(bad, "w") as f:
