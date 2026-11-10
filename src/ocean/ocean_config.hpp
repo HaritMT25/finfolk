@@ -422,6 +422,10 @@ inline bool isOceanBoolKey(const std::string& k) {
 }
 // The key M2b's hydrodynamics will take: refused by readOceanJson until then.
 inline constexpr const char* kHydrodynamicsKey = "hydrodynamicsEnabled";
+// The body-plan preview's float knobs: readOceanJson types them (a finite
+// JSON number in [0, kPhysicalKnobMax]) before readOceanConfig narrows them.
+inline constexpr double kPhysicalKnobMax = 0.25;
+inline bool isPhysicalKnobKey(const std::string& k) { return k == "physicalMutation" || k == "physicalNovelProbability"; }
 
 // A flat cfg JSON object (null / empty = nothing to change) into both configs:
 // SimConfig keys through the checkpoint reader, Ocean keys through
@@ -460,6 +464,16 @@ inline bool readOceanJson(const char* json, SimConfig& sc, OceanConfig& oc, std:
                 !((v.type == T::Bool && !v.b) || (v.type == T::Number && v.num == 0.0))) {
                 err = std::string(kHydrodynamicsKey) + " is not available in this engine: body-plan physics is M2b "
                       "(bodyPlanPreviewEnabled is M2a's diagnostic preview, which changes no behaviour)";
+                return false;
+            }
+            // The body-plan preview's knobs, typed at every occurrence and before
+            // narrowing: a JSON number, finite, in [0, 0.25] (the reader's floatOr
+            // would keep the default for a string / bool / null / array / object).
+            if (isPhysicalKnobKey(kv.first) && !(v.type == T::Number && v.num >= 0.0 && v.num <= kPhysicalKnobMax)) {
+                char buf[200];
+                if (v.type == T::Number) std::snprintf(buf, sizeof buf, "%s must be a number in [0, 0.25] (got %.17g)", kv.first.c_str(), v.num);
+                else std::snprintf(buf, sizeof buf, "%s must be a number in [0, 0.25] (got a non-number)", kv.first.c_str());
+                err = buf;
                 return false;
             }
         }

@@ -71,6 +71,8 @@
   function restBody(b) {
     return withFloats([b.genes], function (p) { M._oc_body_rest(p[0], b.lambda); return readF32(M._oc_body_rest_points(), 3 * NS); });
   }
+  /* the fixture's loaded compile (tools/ocean_body_fixture.cpp kLoad: gas .5, fuel .25 of the capacities) */
+  var FIXTURE_LOAD = { gas: 0.5, fuel: 0.25 };
   /* the fixture driver's H32 (tools/ocean_body_fixture.cpp): two 32-bit lanes over the float bits */
   function digest(f32) {
     var u = new Uint32Array(f32.buffer, f32.byteOffset, f32.length), a = 0x811c9dc5, b = 0x01234567;
@@ -204,12 +206,16 @@
     Object.keys(layout.at).forEach(function (name) {
       var f = layout.at[name], tr = document.createElement("tr"), a = document.createElement("th"), b = document.createElement("td"), u = document.createElement("td");
       a.textContent = name; a.title = f.what || "";
-      if (name === "fins") {
-        var F = layout.fins, parts = [];
+      if (name === "fins") {   /* every fin value, each with its own units (the layout's fins.units) */
+        var F = layout.fins, U = F.units || {}, parts = [];
         F.names.forEach(function (nm, fi) {
-          var o = f.offset + F.stride * fi;
-          parts.push(nm + ": area " + mm[o + F.values.area].toPrecision(4) + ", span " + mm[o + F.values.span].toPrecision(4) +
-                     ", root " + mm[o + F.values.rootChord].toPrecision(4) + ", lever (" + [0, 1, 2].map(function (k) { return mm[o + F.values.lever + k].toPrecision(3); }).join(", ") + ")");
+          var o = f.offset + F.stride * fi, vals = [];
+          Object.keys(F.values).forEach(function (k) {
+            var n = k === "normal" || k === "centroid" || k === "lever" ? 3 : 1, xs = [];
+            for (var q = 0; q < n; q++) xs.push(Number(mm[o + F.values[k] + q].toPrecision(4)));
+            vals.push(k + " " + (n > 1 ? "(" + xs.join(", ") + ")" : xs[0]) + (U[k] ? " " + U[k] : ""));
+          });
+          parts.push(nm + ": " + vals.join(", "));
         });
         b.textContent = parts.join("; ");
       } else {
@@ -217,17 +223,30 @@
         for (var k = 0; k < f.count; k++) vals.push(Number(mm[f.offset + k].toPrecision(6)));
         b.textContent = vals.join(", ");
       }
-      u.textContent = f.units;
+      u.textContent = f.units === "" ? "–" : f.units;   /* (– dimensionless; "mixed": per value, in the row) */
       tr.appendChild(a); tr.appendChild(b); tr.appendChild(u); tb.appendChild(tr);
     });
   }
   function redraw() {
     if (!state.body) return;
-    state.compiled = compileBody(state.body, state.load);
+    var c = compileBody(state.body, state.load);
+    var desc = state.body.name + " · S " + state.body.size.toFixed(3) + " E " + state.body.elong.toFixed(3) +
+               (state.load.gas || state.load.fuel ? " · load: gas " + state.load.gas + ", fuel " + state.load.fuel : " · unloaded (birth)");
+    if (!c.ok) {   /* a refused compile: nothing drawn or listed from it (its outputs are zeros) */
+      state.compiled = null;
+      ["side", "dorsal", "frontal", "orbit"].forEach(function (v) {
+        var cv = /** @type {HTMLCanvasElement|null} */ (el("bp_" + v)), g = cv && cv.getContext("2d");
+        if (cv && g) { g.fillStyle = "#08161a"; g.fillRect(0, 0, cv.width, cv.height); g.fillStyle = "#ff8a8a"; g.font = "13px system-ui, sans-serif"; g.fillText("compile refused: inputs outside the law's domain", 12, 22); }
+      });
+      var tb = el("bpmetrics");
+      if (tb) tb.textContent = "";
+      status("COMPILE REFUSED · " + desc);
+      return;
+    }
+    state.compiled = c;
     ["side", "dorsal", "frontal", "orbit"].forEach(function (v) { drawView(/** @type {HTMLCanvasElement} */ (el("bp_" + v)), v); });
     readout();
-    status((state.compiled.ok ? "" : "COMPILE REFUSED · ") + state.body.name + " · S " + state.body.size.toFixed(3) + " E " + state.body.elong.toFixed(3) +
-           (state.load.gas || state.load.fuel ? " · load: gas " + state.load.gas + ", fuel " + state.load.fuel : " · unloaded (birth)"));
+    status(desc);
   }
 
   /* ---------------- the GPU check ---------------- */
@@ -240,15 +259,17 @@
     var cv = document.createElement("canvas"), gl = /** @type {WebGL2RenderingContext|null} */ (cv.getContext("webgl2"));
     if (!gl) { out.error = "no WebGL2"; root.__bodyPlanCheck = out; return Promise.resolve(out); }
     /* native (the fixture's digests) == Wasm (this module), bit for bit */
-    var restBad = [], metricBad = [], bodies = fixture.bodies.map(function (fb) {
+    var restBad = [], metricBad = [], loadBad = [], bodies = fixture.bodies.map(function (fb) {
       var b = makeBody(fb.name, fb.genes, fb.physical, fb.size, fb.elong);
       if (Math.fround(fb.lambda) !== b.lambda) restBad.push(fb.name + " (lambda)");
-      var r = restBody(b), c = compileBody(b, null);
+      var r = restBody(b), c = compileBody(b, null), cl = compileBody(b, FIXTURE_LOAD);
       if (digest(r) !== fb.restDigest) restBad.push(fb.name);
-      if (digest(c.metrics) !== fb.metricsDigest) metricBad.push(fb.name);
+      if (!c.ok || digest(c.metrics) !== fb.metricsDigest) metricBad.push(fb.name);
+      if (!cl.ok || digest(cl.metrics) !== fb.loadedDigest) loadBad.push(fb.name);
       return { name: fb.name, genes: b.genes, lambda: b.lambda, rest: r };
     });
-    out.native = { bodies: bodies.length, restMismatch: restBad, metricsMismatch: metricBad, ok: !restBad.length && !metricBad.length };
+    out.native = { bodies: bodies.length, restMismatch: restBad, metricsMismatch: metricBad, loadedMismatch: loadBad,
+                   ok: !restBad.length && !metricBad.length && !loadBad.length };
     var fx = { samples: fixture.samples, bodies: bodies };
     var runs = ["identity", "permuted", "sparse"].map(function (sm) { return PAR.bodyPlanVertexCheck(gl, EA, fx, { slotMap: sm }); });
     var faults = (PAR.BODY_MUT || []).map(function (mu) { return PAR.bodyPlanVertexCheck(gl, EA, fx, { mutate: mu }); });
@@ -308,7 +329,8 @@
       layout.at = at;
       NS = M._oc_body_sample_count(); NT = M._oc_body_tri_count();
       samples = readF32(M._oc_body_samples(), 6 * NS);
-      tris = new Uint16Array(heap(), M._oc_body_tris(), 4 * NT).slice();
+      var trisPtr = M._oc_body_tris();   /* (first: it allocates, and may grow the memory heap() then views) */
+      tris = new Uint16Array(heap(), trisPtr, 4 * NT).slice();
       if (fixture && (fixture.sampleCount !== NS || fixture.geometryLaw !== layout.law || fixture.metrics !== layout.stride)) {
         status("the fixture is for another law or layout: not used"); fixture = null;
       }

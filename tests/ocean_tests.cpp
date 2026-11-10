@@ -4878,7 +4878,7 @@ int main(int argc, char** argv) {
     // copies of the engine with a planted fault, each of which must fail it)
     if (argc > 2 && std::strcmp(argv[1], "--only") == 0) {
         if (std::strcmp(argv[2], "body") == 0) {   // the body-plan preview's checks alone (a quick loop)
-            ot::testBodyDraws(); ot::testBodyGeometry(); ot::testBodyIso(); ot::testBodyEdges(); ot::testBodyDevelop();
+            ot::testBodyDraws(); ot::testBodyGeometry(); ot::testBodySurface(); ot::testBodyIso(); ot::testBodyEdges(); ot::testBodyDevelop();
             ot::testBodyOwner(); ot::testBodyNeutral(); ot::testBodyHash(); ot::testBodyNumbers();
 #ifndef OCEAN_TESTS_NO_SHIM
             ot::testBodyShim();
@@ -4988,6 +4988,7 @@ int main(int argc, char** argv) {
     // the M2a body-plan preview (diagnostic): tests/ocean_body_plan_tests.hpp
     ot::testBodyDraws();
     ot::testBodyGeometry();
+    ot::testBodySurface();
     ot::testBodyIso();
     ot::testBodyEdges();
     ot::testBodyDevelop();

@@ -177,11 +177,17 @@ interface OceanSnapshot {
   vz: Float32Array | null;
   /** the appearance rows (63 floats a fish), or null when the module has none this layout knows */
   app: Float32Array | null;
+  /** the M2a body-plan preview's rows (diagnostic; web/ocean.js bodyView), or null when the world has none or
+   * the module's layout is not this page's. Never read by the scene: `body` above is what it draws with. */
+  bodyPlan: BodyPlanView | null;
   curActive: boolean;
   curGrid: Float32Array | null;
   curCols: number;
   curRows: number;
 }
+
+/** one sync's body-plan rows: genes 5 a fish, owners 2 uint32 words a fish (low, high), metrics `stride` a fish */
+interface BodyPlanView { genes: Float32Array; owners: Uint32Array; metrics: Float32Array; stride: number }
 
 /* ---------------- web/ocean_handoff.js (window.EvoOceanHandoff; node: module.exports) ---------------- */
 

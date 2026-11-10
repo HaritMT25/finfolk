@@ -18,8 +18,10 @@
 // physical alleles, and two digests (H32, below): of its canonical rest
 // points in body radii (bodyplan::restPoints at R = 1: what the GPU check,
 // web/ocean_scene_parity.js bodyPlanVertexCheck, compares with the renderer's
-// GLSL, and what the page's Wasm module, oc_body_rest, must reproduce) and of
-// its birth coefficients (bodyplan::compile). The canonical samples and the
+// GLSL, and what the page's Wasm module, oc_body_rest, must reproduce), of
+// its birth coefficients (bodyplan::compile) and of its coefficients under the
+// diagnostic load kLoad (gas .5, fuel .25 of the capacities: the inflated
+// geometry). The canonical samples and the
 // coefficient layout's size are in the header. Floats print as %.9g (exact
 // for binary32).
 //
@@ -130,19 +132,24 @@ int main(int argc, char** argv) {
         const bodyplan::Morph M = bodyplan::decodeMorph(b.G.g, lam);
         bodyplan::Points rest;
         bodyplan::restPoints(M, 1.0f, rest);
-        bodyplan::BirthCoefficients c;
+        bodyplan::BirthCoefficients c, cl;
         const bool ok = bodyplan::compile(b.G, b.S, b.E, b.P, bodyplan::kGeometryLaw, c);
-        H32 hr, hm;
+        bodyplan::Load load;
+        load.gas = 0.5f; load.fuel = 0.25f;   // kLoad (web/ocean_bodyplan.js FIXTURE_LOAD)
+        const bool okl = bodyplan::compile(b.G, b.S, b.E, b.P, bodyplan::kGeometryLaw, cl, &load);
+        H32 hr, hm, hl;
         for (const bodyplan::Vec3& p : rest.p) { hr.addf(p.x); hr.addf(p.y); hr.addf(p.z); }
         for (float v : c.m) hm.addf(v);
-        all.add(hr.a); all.add(hr.b); all.add(hm.a); all.add(hm.b);
+        for (float v : cl.m) hl.addf(v);
+        all.add(hr.a); all.add(hr.b); all.add(hm.a); all.add(hm.b); all.add(hl.a); all.add(hl.b);
         std::printf("%s{\"name\":\"%s\",\"genes\":[", k ? ",\n" : "", b.name.c_str());
         printFloats(b.G.g, appearance::kStride);
         std::printf("],\"size\":%.9g,\"elong\":%.9g,\"lambda\":%.9g,\"radius\":%.9g,\"physical\":[", (double)b.S, (double)b.E, (double)lam, (double)R);
         printFloats(b.P.g, physical::kGenes);
-        std::printf("],\"compiled\":%d,\"restDigest\":\"%s\",\"metricsDigest\":\"%s\",\"volume\":%.9g,\"wettedArea\":%.9g",
-                    ok ? 1 : 0, hr.str().c_str(), hm.str().c_str(), (double)c.m[bodyplan::at(bodyplan::fHullVolume)],
-                    (double)c.m[bodyplan::at(bodyplan::fWettedArea)]);
+        std::printf("],\"compiled\":%d,\"restDigest\":\"%s\",\"metricsDigest\":\"%s\",\"loadedDigest\":\"%s\",\"volume\":%.9g,\"wettedArea\":%.9g,"
+                    "\"loadedVolume\":%.9g",
+                    ok && okl ? 1 : 0, hr.str().c_str(), hm.str().c_str(), hl.str().c_str(), (double)c.m[bodyplan::at(bodyplan::fHullVolume)],
+                    (double)c.m[bodyplan::at(bodyplan::fWettedArea)], (double)cl.m[bodyplan::at(bodyplan::fHullVolume)]);
         if (points) {
             std::printf(",\"rest\":[");
             for (int i = 0; i < bodyplan::kSamples; ++i)

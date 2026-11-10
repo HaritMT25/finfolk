@@ -2013,7 +2013,7 @@
       stats: new Float64Array(buf, M._oc_stats(), statsLen),
       vz: HAS_VZ ? new Float32Array(buf, M._oc_creature_vz(), n) : null,
       app: appearanceView(buf, n),
-      body: bodyView(buf, n),
+      bodyPlan: bodyView(buf, n),   /* the M2a body-plan diagnostics (s.body is the size / elongation pairs) */
       curActive: false, curGrid: null, curCols: 0, curRows: 0
     };
   }
@@ -2054,11 +2054,35 @@
         M._oc_body_geometry_law() !== BODY_ABI.geometryLaw || M._oc_body_metrics_abi() !== BODY_ABI.metricsAbi) return;
     var L;
     try { L = JSON.parse(HO.cString(M, M._oc_body_metrics_layout())); } catch (e) { return; }
-    if (!L || L.abi !== BODY_ABI.metricsAbi || L.stride !== M._oc_body_metrics_stride() || !Array.isArray(L.fields)) return;
-    var at = {};
-    L.fields.forEach(function (f) { at[f.name] = f; });
+    var at = bodyLayoutFields(L, M._oc_body_metrics_stride());
+    if (!at) return;
     BODY_LAYOUT = { stride: L.stride, at: at, fins: L.fins, limits: L.limits, genes: L.genes };
     HAS_BODY = true;
+  }
+  /* The layout's fields by name, or null unless it is whole and in bounds: the ABI this page reads, the
+   * module's stride, every field a whole offset and count, laid end to end over exactly the stride, the
+   * fields the card reads present, and the fins' sub-layout (7 names x a stride covering every value it
+   * names) inside its field. */
+  var BODY_NEEDS = ["size", "elong", "gapeDiameter", "bladderCapacity", "reserveEnergy", "armourThickness", "hullLength", "hullVolume",
+                    "wettedArea", "frontalArea", "sideArea", "planArea", "caudalActualAR", "caudalNominalAR", "unloadedMassEstimate", "limits", "fins"];
+  var FIN_VALUES = ["area", "normal", "centroid", "lever", "span", "rootChord", "meanChord", "thickness"];
+  function bodyLayoutFields(L, stride) {
+    function whole(x) { return typeof x === "number" && isFinite(x) && Math.floor(x) === x && x >= 0; }
+    if (!L || L.abi !== BODY_ABI.metricsAbi || L.law !== BODY_ABI.geometryLaw || L.stride !== stride || !whole(stride) || !Array.isArray(L.fields)) return null;
+    var at = {}, end = 0;
+    for (var i = 0; i < L.fields.length; i++) {
+      var f = L.fields[i];
+      if (!f || typeof f.name !== "string" || !whole(f.offset) || !whole(f.count) || f.count < 1 || f.offset !== end || at[f.name]) return null;
+      end = f.offset + f.count;
+      at[f.name] = f;
+    }
+    if (end !== stride || !BODY_NEEDS.every(function (k) { return !!at[k]; })) return null;
+    var F = L.fins;
+    if (!F || !Array.isArray(F.names) || F.names.length !== 7 || !whole(F.stride) || F.stride < 1 || !F.values ||
+        at.fins.count !== F.names.length * F.stride) return null;
+    var span = { normal: 3, centroid: 3, lever: 3 };
+    if (!FIN_VALUES.every(function (k) { var o = F.values[k]; return whole(o) && o + (span[k] || 1) <= F.stride; })) return null;
+    return at;
   }
   /* one sync's body rows (5 alleles, two owner words, the coefficients a fish),
    * when the world has the preview on; null otherwise (or a malformed export) */
@@ -2575,7 +2599,7 @@
   var bodyEl = el("ibody"), bodyTableEl = el("ibodyt"), bodyLinkEl = el("ibodylink"), bodyFor = "";
   function drawBody(s, idx, id) {
     if (!bodyEl) return;
-    var B = s.body;
+    var B = s.bodyPlan;
     if (!B || !BODY_LAYOUT || idx < 0 || idx * 2 + 1 >= B.owners.length) { bodyEl.hidden = true; bodyFor = ""; return; }
     var owner = B.owners[2 * idx] + 4294967296 * B.owners[2 * idx + 1];
     if (owner !== id) { bodyEl.hidden = true; bodyFor = ""; return; }   /* (never a row of another fish) */

@@ -16,6 +16,13 @@
 //            the locked tolerance (EvoOceanSceneParity.BODY_TOL, body radii)
 //   faults   each planted GLSL fault (radius: the depth law; root: a paired fin's root off its facet;
 //            caudalClip: the chord cap raised) must FAIL the same check
+// and then, through the REAL page controller (web/ocean.html, its snapshot -> the scene), with non-unit
+// inherited bodies (bodyModel, bodyMutation .4, 1,500 steps) and the preview off, then on:
+//   page     every drawn fish's radius and lambda (scene.poseOf, as the frame uploaded them) are the ones
+//            its module row gives (oc_body_params: R = 4.6 bodyScale(S), lambda = 20 S E / R), all finite:
+//            the snapshot's `body` stays the size / elongation pairs, never the diagnostics (round 1,
+//            finding 1: a second `body` key in snapshot() overwrote them). With the preview on, the card's
+//            body plan shows; off, it does not
 // Exit 0 = every check passed. Browser-only; not in CI.
 import { createRequire } from "module";
 import fs from "fs";
@@ -54,8 +61,9 @@ try {
   console.log("GPU: " + JSON.stringify(gl) + "\nreport: " + OUT);
   check("the check ran", !r.error, r.error);
   if (!r.error) {
-    check("native == Wasm (every fixture body's rest points and coefficients, bit for bit)", r.native && r.native.ok,
-          r.native && { bodies: r.native.bodies, rest: r.native.restMismatch.slice(0, 5), metrics: r.native.metricsMismatch.slice(0, 5) });
+    check("native == Wasm (every fixture body's rest points, birth and loaded coefficients, bit for bit)", r.native && r.native.ok,
+          r.native && { bodies: r.native.bodies, rest: r.native.restMismatch.slice(0, 5), metrics: r.native.metricsMismatch.slice(0, 5),
+                        loaded: (r.native.loadedMismatch || ["(not compared)"]).slice(0, 5) });
     ["identity", "permuted", "sparse"].forEach((sm) => {
       const x = r.slots[sm] || {};
       check("GPU == C++ at the canonical samples, slots " + sm, x.ok === true,
@@ -66,6 +74,45 @@ try {
     check("three planted faults", Object.keys(r.faults || {}).length === 3);
   }
   check("no page errors", errors.length === 0, errors.slice(0, 5));
+
+  // ---- the real page controller, preview off and on ----
+  for (const preview of [false, true]) {
+    const label = "page, preview " + (preview ? "on" : "off");
+    errors.length = 0;
+    const cfg = Object.assign({ bodyModel: true, bodyMutation: 0.4 }, preview ? { bodyPlanPreviewEnabled: true } : {});
+    await page.goto(BASE + "/web/ocean.html?guide=0&intro=0&seed=11&pop=200&cfg=" + encodeURIComponent(JSON.stringify(cfg)), { waitUntil: "load" });
+    await page.waitForFunction(() => window.EvoOcean && EvoOcean.state && EvoOcean.state() && EvoOcean.state().n > 0, null, { timeout: 60000 });
+    await page.evaluate(() => { EvoOcean.module._oc_step(1500); });   /* births: inherited, non-unit sizes */
+    await page.waitForTimeout(800);   /* the page's own frames step, sync, snapshot and draw */
+    await page.evaluate(() => { const b = document.getElementById("pausebtn"); if (b && !EvoOcean.state().paused) b.click(); });
+    await page.waitForFunction(() => EvoOcean.state().paused === true, null, { timeout: 10000 });
+    await page.waitForTimeout(500);   /* a few paused frames: the last snapshot drawn again */
+    const r = await page.evaluate(() => {
+      const M = EvoOcean.module, n = M._oc_creature_count(), S = EvoOcean.scene;
+      const bp = new Float32Array(M.HEAPU8.buffer, M._oc_body_params(), 2 * n);
+      const f = Math.fround, scale = (b) => (b > 0 ? 1 + 0.4 * Math.tanh(5 * (b - 1)) : 1);
+      let nonUnit = 0, nonFinite = 0, worstR = 0, worstLam = 0, at = -1;
+      for (let i = 0; i < n; i++) {
+        const s = bp[2 * i], e = bp[2 * i + 1], p = S.poseOf(i);
+        if (s !== 1 || e !== 1) nonUnit++;
+        if (!Number.isFinite(p.R) || !Number.isFinite(p.lam)) { nonFinite++; continue; }
+        const R = f(4.6 * scale(s)), lam = f(20 * s * e / R);
+        const eR = Math.abs(p.R - R) / R, eL = Math.abs(p.lam - lam) / lam;
+        if (eR > worstR) { worstR = eR; at = i; }
+        if (eL > worstLam) worstLam = eL;
+      }
+      EvoOcean.select(0);
+      return { n, nonUnit, nonFinite, worstR, worstLam, at, preview: M._oc_body_plan_enabled(), bodyRows: M._oc_body_count() };
+    });
+    await page.waitForTimeout(400);
+    const cardShown = await page.evaluate(() => { const b = document.getElementById("ibody"); return !!b && !b.hidden && /not calibrated/.test(b.innerText); });
+    check(label + ": the module's preview state", r.preview === (preview ? 1 : 0) && r.bodyRows === (preview ? r.n : 0), { preview: r.preview, rows: r.bodyRows, n: r.n });
+    check(label + ": inherited non-unit bodies exist", r.nonUnit > 0, { nonUnit: r.nonUnit, n: r.n });
+    check(label + ": every drawn fish's radius and lambda are its module row's (snapshot body = size / elongation)",
+          r.nonFinite === 0 && r.worstR < 1e-6 && r.worstLam < 1e-5, r);
+    check(label + ": the card's body plan " + (preview ? "shows" : "stays hidden"), cardShown === preview, { cardShown });
+    check(label + ": no page errors", errors.length === 0, errors.slice(0, 5));
+  }
 } catch (e) {
   check("the page ran", false, String(e && e.message || e));
 } finally {

@@ -553,7 +553,8 @@ EVO_EXPORT const char* oc_body_metrics_layout() {
          ",\"normal\":" + std::to_string((int)bodyplan::kFinNormal) + ",\"centroid\":" + std::to_string((int)bodyplan::kFinCentroid) +
          ",\"lever\":" + std::to_string((int)bodyplan::kFinLever) + ",\"span\":" + std::to_string((int)bodyplan::kFinSpan) +
          ",\"rootChord\":" + std::to_string((int)bodyplan::kFinRootChord) + ",\"meanChord\":" + std::to_string((int)bodyplan::kFinMeanChord) +
-         ",\"thickness\":" + std::to_string((int)bodyplan::kFinThickness) + "}},";
+         ",\"thickness\":" + std::to_string((int)bodyplan::kFinThickness) + "}," +
+         "\"units\":{\"area\":\"u2\",\"normal\":\"\",\"centroid\":\"u\",\"lever\":\"u\",\"span\":\"u\",\"rootChord\":\"u\",\"meanChord\":\"u\",\"thickness\":\"u\"}},";
     j += "\"limits\":{\"eyeClip\":1,\"chordCap\":2,\"storage\":4,\"organs\":8,\"shell\":16},\"genes\":[";
     for (int g = 0; g < physical::kGenes; ++g) j += (g ? ",\"" : "\"") + std::string(physical::kGeneNames[g]) + "\"";
     j += "],\"samples\":" + std::to_string(bodyplan::kSamples) + ",\"tris\":" + std::to_string(bodyplan::kTris) + "}";
@@ -561,8 +562,14 @@ EVO_EXPORT const char* oc_body_metrics_layout() {
     return g_bodyLayout.c_str();
 }
 // The fixture viewer: one body, compiled as at birth (gas = fuel = 0) or
-// under a diagnostic load. Returns 1, or 0 (bad inputs: metrics zero).
+// under a diagnostic load. Returns 1, or 0 for inputs outside the decoder's
+// domain (bodyplan::compile: the shape genes and alleles finite in [0, 1], S
+// and E finite in [1e-3, 1e3], the load's fractions in [0, 1]); a refusal
+// leaves the metrics AND the points all zero, never a previous or
+// uninitialized body.
 EVO_EXPORT int oc_body_preview(const float* genes63, float size, float elong, const float* phys5, float gas, float fuel) {
+    g_previewMetrics = bodyplan::BirthCoefficients{};
+    g_previewPoints.assign(3 * bodyplan::kSamples, 0.0f);
     if (!genes63 || !phys5) return 0;
     appearance::Genome G;
     std::memcpy(G.g, genes63, sizeof G.g);
@@ -571,22 +578,23 @@ EVO_EXPORT int oc_body_preview(const float* genes63, float size, float elong, co
     bodyplan::Load L;
     L.gas = gas; L.fuel = fuel;
     bodyplan::Points pts;
-    const bool ok = bodyplan::compile(G, size, elong, P, bodyplan::kGeometryLaw, g_previewMetrics, &L, &pts);
-    g_previewPoints.resize(3 * bodyplan::kSamples);
+    if (!bodyplan::compile(G, size, elong, P, bodyplan::kGeometryLaw, g_previewMetrics, &L, &pts)) return 0;
     for (int i = 0; i < bodyplan::kSamples; ++i) {
         g_previewPoints[3 * i] = pts.p[i].x; g_previewPoints[3 * i + 1] = pts.p[i].y; g_previewPoints[3 * i + 2] = pts.p[i].z;
     }
-    return ok ? 1 : 0;
+    return 1;
 }
 EVO_EXPORT const float* oc_body_preview_metrics() { return g_previewMetrics.m; }
 EVO_EXPORT const float* oc_body_preview_points()  { return g_previewPoints.empty() ? nullptr : g_previewPoints.data(); }
-// The renderer's rest law at the canonical samples, in body radii (the GPU check's C++ side).
+// The renderer's rest law at the canonical samples, in body radii (the GPU
+// check's C++ side). 1, or 0 for shape genes outside [0, 1] or a lambda not
+// finite in (0, 1e4] (every point then zero).
 EVO_EXPORT int oc_body_rest(const float* genes63, float lambda) {
-    if (!genes63) return 0;
+    g_restPoints.assign(3 * bodyplan::kSamples, 0.0f);
+    if (!genes63 || !bodyplan::shapeGenesValid(genes63) || !bodyplan::lambdaValid(lambda)) return 0;
     const bodyplan::Morph M = bodyplan::decodeMorph(genes63, lambda);
     bodyplan::Points pts;
     bodyplan::restPoints(M, 1.0f, pts);
-    g_restPoints.resize(3 * bodyplan::kSamples);
     for (int i = 0; i < bodyplan::kSamples; ++i) {
         g_restPoints[3 * i] = pts.p[i].x; g_restPoints[3 * i + 1] = pts.p[i].y; g_restPoints[3 * i + 2] = pts.p[i].z;
     }

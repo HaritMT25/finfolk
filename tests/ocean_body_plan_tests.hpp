@@ -354,6 +354,139 @@ inline void testBodyGeometry() {
     t.note("%ld random / rail bodies: closed to %.2g, caudal area = nominal to %.2g (uncapped)", n, worstClosed, worstCaud);
 }
 
+// The integration mesh IS the renderer's surface: (1) its 224 triangles, as
+// vertex sets, are exactly buildTemplate's rule mapped to the canonical
+// samples (each half's quads split along (i, h) - (i + 1, h + 1) in half-ring
+// order, the two fans); (2) every attached root and facet() point lies ON the
+// integrated hull (closest-point distance to its triangles), on both sides.
+namespace body {
+struct D3 { double x, y, z; };
+inline D3 d3(const Vec3& v) { return {v.x, v.y, v.z}; }
+inline D3 dsub(D3 a, D3 b) { return {a.x - b.x, a.y - b.y, a.z - b.z}; }
+inline double ddot(D3 a, D3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+// Ericson, Real-Time Collision Detection 5.1.5: the closest point of triangle abc to p.
+inline double pointTriangleDistance(D3 p, D3 a, D3 b, D3 c) {
+    const D3 ab = dsub(b, a), ac = dsub(c, a), ap = dsub(p, a);
+    const double d1 = ddot(ab, ap), d2 = ddot(ac, ap);
+    auto at = [&](double u, double v) { const D3 q{a.x + u * ab.x + v * ac.x, a.y + u * ab.y + v * ac.y, a.z + u * ab.z + v * ac.z};
+                                        const D3 e = dsub(p, q); return std::sqrt(ddot(e, e)); };
+    if (d1 <= 0 && d2 <= 0) return at(0, 0);
+    const D3 bp = dsub(p, b);
+    const double d3v = ddot(ab, bp), d4 = ddot(ac, bp);
+    if (d3v >= 0 && d4 <= d3v) return at(1, 0);
+    const double vc = d1 * d4 - d3v * d2;
+    if (vc <= 0 && d1 >= 0 && d3v <= 0) return at(d1 / (d1 - d3v), 0);
+    const D3 cp = dsub(p, c);
+    const double d5 = ddot(ab, cp), d6 = ddot(ac, cp);
+    if (d6 >= 0 && d5 <= d6) return at(0, 1);
+    const double vb = d5 * d2 - d1 * d6;
+    if (vb <= 0 && d2 >= 0 && d6 <= 0) return at(0, d2 / (d2 - d6));
+    const double va = d3v * d6 - d5 * d4;
+    if (va <= 0 && (d4 - d3v) >= 0 && (d5 - d6) >= 0) { const double w = (d4 - d3v) / ((d4 - d3v) + (d5 - d6)); return at(1 - w, w); }
+    const double den = 1.0 / (va + vb + vc);
+    return at(vb * den, vc * den);
+}
+inline double hullDistance(const Points& P, D3 p) {
+    const Tris& T = canonicalTris();
+    double best = 1e300;
+    for (int k = 0; k < kHullTris; ++k)
+        best = std::min(best, pointTriangleDistance(p, d3(P.p[T.t[k].a]), d3(P.p[T.t[k].b]), d3(P.p[T.t[k].c])));
+    return best;
+}
+// The same distance to the mesh with round 1's mistake (every band split along
+// (i, k) - (i + 1, k + 1) in rotation order: the left half's other diagonal).
+inline double wrongDiagonalDistance(const Points& P, D3 p) {
+    auto ring = [](int i, int k) { return kHullRing0 + kAround * (i - 1) + (k % kAround); };
+    double best = 1e300;
+    for (int i = 1; i + 1 < kRings; ++i)
+        for (int k = 0; k < kAround; ++k) {
+            const D3 A = d3(P.p[ring(i, k)]), B = d3(P.p[ring(i, k + 1)]), C = d3(P.p[ring(i + 1, k + 1)]), D = d3(P.p[ring(i + 1, k)]);
+            best = std::min(best, std::min(pointTriangleDistance(p, A, B, C), pointTriangleDistance(p, A, C, D)));
+        }
+    return best;
+}
+}  // namespace body
+
+inline void testBodySurface() {
+    using namespace body;
+    Test t("body_surface");
+    // (1) the triangle set
+    {
+        auto key = [](int a, int b, int c) { int v[3] = {a, b, c}; std::sort(v, v + 3); return std::to_string(v[0]) + "," + std::to_string(v[1]) + "," + std::to_string(v[2]); };
+        std::multiset<std::string> want, got;
+        auto P = [](int s, int ring, int h) {   // the half's sample h (0 bottom .. 4 top; 0 and 4 shared)
+            const int k = (s == 0 || h == 0 || h == kHalfRing) ? h : kAround - h;
+            return kHullRing0 + kAround * (ring - 1) + k;
+        };
+        for (int s = 0; s < 2; ++s) {
+            for (int i = 1; i + 1 < kRings; ++i)
+                for (int h = 0; h < kHalfRing; ++h) {
+                    want.insert(key(P(s, i, h), P(s, i + 1, h), P(s, i + 1, h + 1)));   // buildTemplate: T(P00, P10, P11)
+                    want.insert(key(P(s, i, h), P(s, i + 1, h + 1), P(s, i, h + 1)));   //                T(P00, P11, P01)
+                }
+            for (int h = 0; h < kHalfRing; ++h) {
+                want.insert(key(kHullTip, P(s, 1, h), P(s, 1, h + 1)));
+                want.insert(key(kHullCap, P(s, kRings - 1, h), P(s, kRings - 1, h + 1)));
+            }
+        }
+        const Tris& T = canonicalTris();
+        for (int k = 0; k < kHullTris; ++k) got.insert(key(T.t[k].a, T.t[k].b, T.t[k].c));
+        t.expect(want.size() == 224 && got == want, "the hull's triangles are not the renderer's surface (%zu vs %zu)", got.size(), want.size());
+    }
+    // (2) roots and facet points on the integrated hull, both sides
+    RandomGen g;
+    g.seed(808);
+    double worstRoot = 0, worstFacet = 0, worstOff = 1e300, wrongWorst = 0;
+    std::string where;
+    long n = 0;
+    for (int i = 0; i < 60; ++i) {
+        appearance::Genome G = i == 0 ? appearance::neutral() : randomAppearance(g);
+        if (i % 5 == 2) for (int j = 0; j < appearance::kMorphGenes; ++j) G.g[appearance::kMorphOffset + j] = (float)(g.unit() < 0.5 ? 0.0 : 1.0);
+        G.g[appearance::kMorphOffset + 26] = 1.0f;   // every barbel pair active
+        const float S = i == 0 ? 1.0f : (float)(0.5 + 1.5 * g.unit());
+        const float E = i == 0 ? 1.0f : (float)(0.5 + 1.5 * g.unit());
+        BirthCoefficients c;
+        Points p;
+        if (!compile(G, S, E, physical::neutral(), kGeometryLaw, c, nullptr, &p)) continue;
+        const double R = metric(c, fRefRadius);
+        auto rootCheck = [&](D3 q, const char* what) {
+            const double d = hullDistance(p, q) / R;
+            if (d > worstRoot) { worstRoot = d; where = what; }
+            ++n;
+        };
+        for (int base : {kDorsal0, kAnal0, kPecR0, kPecL0, kPelR0, kPelL0})
+            for (int q = 0; q <= kFinIntervals; ++q) rootCheck(d3(p.p[base + 2 * q]), base == kPecL0 || base == kPelL0 ? "a left paired root" : "a root");
+        for (int j = 0; j < 3; ++j)
+            for (int si = 0; si < 2; ++si) {   // a barbel's root: the midpoint of its two edges at q = 0
+                const int b0 = barbelRibbon0(j, si, 0);
+                const Vec3 a = p.p[b0], b = p.p[b0 + 1];
+                rootCheck(D3{0.5 * ((double)a.x + b.x), 0.5 * ((double)a.y + b.y), 0.5 * ((double)a.z + b.z)}, si ? "a left barbel root" : "a barbel root");
+            }
+        const Morph M = decodeMorph(G.g, metric(c, fLambda));
+        for (int k = 0; k < 40; ++k) {   // facet() anywhere on the faceted hull, either side
+            const float tt = (float)(-0.16 + 1.16 * g.unit());
+            const float th = (float)(-1.5707963 + 3.1415926 * g.unit());
+            const float side = (k & 1) ? -1.0f : 1.0f;
+            const Vec3 f = facet(M, tt, th, side);
+            const D3 q{(double)f.x * R, (double)f.y * R, (double)f.z * R};
+            worstFacet = std::max(worstFacet, hullDistance(p, q) / R);
+            if (side < 0.0f && tt > -0.03f && tt < 0.92f) wrongWorst = std::max(wrongWorst, wrongDiagonalDistance(p, q) / R);
+        }
+        // the control: a point .01 R off the left flank is seen as off it
+        const Vec3 f = facet(M, 0.40f, 0.0f, -1.0f);
+        worstOff = std::min(worstOff, hullDistance(p, D3{(double)f.x * R, (double)f.y * R - 0.01 * R, (double)f.z * R}) / R);
+    }
+    // Tolerance 1e-5 R: facet() evaluates its corner angles in binary32 (−π/2 + k·π/4),
+    // an ulp from the canonical samples' angles, and a superellipse exponent below 1
+    // amplifies that at the seams to ~6e-6 R. The wrong diagonal is ~100x further off.
+    t.expect(n > 0 && worstRoot <= 1e-5, "%s lies %.3g R off the integrated hull", where.c_str(), worstRoot);
+    t.expect(worstFacet <= 1e-5, "a facet() point lies %.3g R off the integrated hull", worstFacet);
+    t.expect(worstOff > 1e-3, "the distance probe does not see a point .01 R off the surface (%.3g)", worstOff);
+    t.expect(wrongWorst > 1e-4, "the check cannot tell round 1's wrong left diagonal (%.3g R)", wrongWorst);
+    t.note("%ld roots (dorsal, anal, both pectorals and pelvics, all barbels) of 60 bodies: on the hull to %.2g R; 2400 facet() points to %.2g R "
+           "(the other left diagonal: %.2g R off)", n, worstRoot, worstFacet, wrongWorst);
+}
+
 inline void testBodyIso() {
     using namespace body;
     Test t("body_iso");
@@ -378,24 +511,32 @@ inline void testBodyIso() {
     RandomGen g;
     g.seed(99);
     long wrong = 0, checked = 0;
+    double loadedK = 0;
     std::string first;
     for (int i = 0; i < 120; ++i) {
         const appearance::Genome G = i == 0 ? appearance::neutral() : randomAppearance(g);
         const float S = i == 0 ? 1.0f : (float)(0.5 + 0.5 * g.unit()), E = i == 0 ? 1.0f : (float)(0.5 + 1.5 * g.unit());
         const physical::Genes P = i == 0 ? physical::neutral() : randomPhysical(g);
-        BirthCoefficients a, b;
-        compile(G, S, E, P, kGeometryLaw, a);
-        compile(G, 2.0f * S, E, P, kGeometryLaw, b);
-        for (int f = 0; f < kFieldCount; ++f)
-            for (int k = 0; k < kFields[f].count; ++k) {
-                const float x = a.m[at(f) + k], y = b.m[at(f) + k], want = x * factor(f, k);
-                ++checked;
-                if (fb(y) != fb(want)) {
-                    if (!wrong++) { char s[200]; std::snprintf(s, sizeof s, "%s[%d]: %.9g at 2S vs %.9g x %g", kFields[f].name, k, (double)y, (double)x, (double)factor(f, k)); first = s; }
+        // unloaded (the birth compile) and at a fixed nonzero loading fraction (the
+        // inflated geometry: k is a ratio of volumes, so it is the same at 2S)
+        Load load;
+        load.gas = 0.6f; load.fuel = 0.3f;
+        for (const Load* L : {(const Load*)nullptr, (const Load*)&load}) {
+            BirthCoefficients a, b;
+            if (!compile(G, S, E, P, kGeometryLaw, a, L) || !compile(G, 2.0f * S, E, P, kGeometryLaw, b, L)) { ++wrong; continue; }
+            if (L) loadedK = std::max(loadedK, (double)a.m[at(fInflation)]);
+            for (int f = 0; f < kFieldCount; ++f)
+                for (int k = 0; k < kFields[f].count; ++k) {
+                    const float x = a.m[at(f) + k], y = b.m[at(f) + k], want = x * factor(f, k);
+                    ++checked;
+                    if (fb(y) != fb(want)) {
+                        if (!wrong++) { char s[200]; std::snprintf(s, sizeof s, "%s[%d]%s: %.9g at 2S vs %.9g x %g", kFields[f].name, k, L ? " (loaded)" : "", (double)y, (double)x, (double)factor(f, k)); first = s; }
+                    }
                 }
-            }
+        }
     }
     t.expect(wrong == 0, "%ld of %ld metrics do not scale exactly; first %s", wrong, checked, first.c_str());
+    t.expect(loadedK > 1.0, "the loaded pass did not inflate (k %.6g)", loadedK);
     const BirthCoefficients n1 = compiled(appearance::neutral(), 1.0f), n2 = compiled(appearance::neutral(), 2.0f);
     t.note("neutral S 1 -> 2: volume x%.9g, wetted area x%.9g, Izz x%.9g (bit-exact over %ld metrics of 120 bodies)",
            (double)(metric(n2, fHullVolume) / metric(n1, fHullVolume)), (double)(metric(n2, fWettedArea) / metric(n1, fWettedArea)),
@@ -505,12 +646,43 @@ inline void testBodyEdges() {
         t.note("full gas + fuel load on the neutral body: k = %.5g, volume %.5g -> %.5g u³ (x%.4f; k² = %.4f)", (double)k,
                (double)metric(a, fHullVolume), (double)metric(b, fHullVolume), (double)(metric(b, fHullVolume) / metric(a, fHullVolume)), (double)(k * k));
     }
-    // unknown law, bad inputs: refused, zeros
+    // an unknown law or any input outside the domain: refused BEFORE decoding, and
+    // every output (the coefficients and the points) zero, whatever they held
     {
-        BirthCoefficients c;
-        t.expect(!compile(appearance::neutral(), 1.0f, 1.0f, physical::neutral(), 2, c) && c.m[0] == 0.0f &&
-                 !compile(appearance::neutral(), 0.0f, 1.0f, physical::neutral(), 1, c) &&
-                 !compile(appearance::neutral(), NAN, 1.0f, physical::neutral(), 1, c), "a bad compile was accepted");
+        const appearance::Genome N = appearance::neutral();
+        const physical::Genes P = physical::neutral();
+        struct Bad { const char* what; appearance::Genome G; float S, E; physical::Genes P; int law; Load L; bool useLoad; };
+        std::vector<Bad> bad;
+        bad.reserve(32);   // (add's pointers stay valid)
+        auto add = [&](const char* what) { bad.push_back(Bad{what, N, 1.0f, 1.0f, P, kGeometryLaw, Load{}, false}); return &bad.back(); };
+        add("law 2")->law = 2;
+        add("size 0")->S = 0.0f;
+        add("size NaN")->S = NAN;
+        add("size inf")->S = INFINITY;
+        add("size 1e4")->S = 1e4f;
+        add("elong -1")->E = -1.0f;
+        add("outline NaN")->G.g[appearance::kMorphOffset + 9] = NAN;
+        add("shape gene 1.5")->G.g[appearance::kMorphOffset + 3] = 1.5f;
+        add("shape gene -0.1")->G.g[appearance::kMorphOffset + 20] = -0.1f;
+        add("allele NaN")->P.g[physical::kFat] = NAN;
+        add("allele 2")->P.g[physical::kGape] = 2.0f;
+        { Bad* b = add("load NaN"); b->useLoad = true; b->L.gas = NAN; }
+        { Bad* b = add("load 1.5"); b->useLoad = true; b->L.fuel = 1.5f; }
+        { Bad* b = add("load -0.1"); b->useLoad = true; b->L.gas = -0.1f; }
+        long accepted = 0, dirty = 0;
+        for (const Bad& b : bad) {
+            BirthCoefficients c;
+            Points p;
+            std::memset(&c, 0x7f, sizeof c);   // garbage that must not survive
+            std::memset(&p, 0x7f, sizeof p);
+            accepted += compile(b.G, b.S, b.E, b.P, b.law, c, b.useLoad ? &b.L : nullptr, &p);
+            const BirthCoefficients z{};
+            Points zp;
+            std::memset(&zp, 0, sizeof zp);
+            dirty += std::memcmp(&c, &z, sizeof c) != 0 || std::memcmp(&p, &zp, sizeof p) != 0;
+        }
+        t.expect(accepted == 0, "%ld of %zu out-of-domain compiles accepted", accepted, bad.size());
+        t.expect(dirty == 0, "%ld refused compiles left nonzero coefficients or points", dirty);
     }
 }
 
@@ -876,6 +1048,48 @@ inline void testBodyShim() {
                  "oc_body_preview is not the birth compile");
         t.expect(oc_body_rest(G.g, 20.0f * f.bodyElong / 4.6f) == 1 && oc_body_rest_points() && oc_body_sample_count() == kSamples &&
                  oc_body_tri_count() == kTris && oc_body_tris()[4 * 3 + 3] == 0, "the rest / sample / triangle exports");
+    }
+    // the viewer's functions refuse out-of-domain inputs with every output zero (never the last body)
+    {
+        const auto& G = g_world->appearanceRecords()[0].genome;
+        const float* P = g_world->bodyPlanGenes()[0].g;
+        auto allZero = [](const float* v, int n) { for (int i = 0; i < n; ++i) if (fb(v[i]) != 0u) return false; return true; };
+        appearance::Genome Gbad = G;
+        Gbad.g[appearance::kMorphOffset + 9] = NAN;
+        const float Pbad[5] = {0.5f, NAN, 0.0f, 0.4f, 0.5f};
+        struct C { const char* what; const float* g; float S, E; const float* p; float gas, fuel; } cases[] = {
+            {"size 0", G.g, 0.0f, 1.0f, P, 0, 0}, {"size NaN", G.g, NAN, 1.0f, P, 0, 0}, {"elong inf", G.g, 1.0f, INFINITY, P, 0, 0},
+            {"outline NaN", Gbad.g, 1.0f, 1.0f, P, 0, 0}, {"allele NaN", G.g, 1.0f, 1.0f, Pbad, 0, 0},
+            {"gas NaN", G.g, 1.0f, 1.0f, P, NAN, 0}, {"fuel 2", G.g, 1.0f, 1.0f, P, 0, 2.0f}};
+        long bad = 0;
+        for (const C& c : cases) {
+            if (oc_body_preview(G.g, 1.0f, 1.0f, P, 0.3f, 0.3f) != 1) ++bad;   // a good body first: its outputs must not survive
+            if (oc_body_preview(c.g, c.S, c.E, c.p, c.gas, c.fuel) != 0 || !allZero(oc_body_preview_metrics(), kMetrics) ||
+                !allZero(oc_body_preview_points(), 3 * kSamples)) { ++bad; t.note("oc_body_preview %s: not refused, or outputs left", c.what); }
+        }
+        t.expect(bad == 0, "%ld oc_body_preview refusals failed", bad);
+        t.expect(oc_body_rest(G.g, 4.0f) == 1 && oc_body_rest(Gbad.g, 4.0f) == 0 && allZero(oc_body_rest_points(), 3 * kSamples) &&
+                 oc_body_rest(G.g, 4.0f) == 1 && oc_body_rest(G.g, NAN) == 0 && allZero(oc_body_rest_points(), 3 * kSamples) &&
+                 oc_body_rest(G.g, 0.0f) == 0, "oc_body_rest's refusals");
+    }
+    // the knobs typed before narrowing, at every occurrence: a finite JSON number in [0, .25]
+    {
+        const int n0 = oc_creature_count();
+        long acceptedBad = 0;
+        for (const char* bad : {R"({"physicalMutation":"bad"})", R"({"physicalMutation":true})", R"({"physicalNovelProbability":null})",
+                                R"({"physicalNovelProbability":[0.1]})", R"({"physicalMutation":{}})", R"({"physicalMutation":0.2500001})",
+                                R"({"physicalNovelProbability":0.3})", R"({"physicalMutation":0.1,"physicalMutation":"x"})",
+                                R"({"physicalNovelProbability":"0.1","physicalNovelProbability":0.1})", R"({"physicalMutation":1e400})"})
+            acceptedBad += oc_init(11, 1920, 1080, 240.0, 50, bad) == 1;
+        t.expect(acceptedBad == 0, "%ld malformed physical knobs accepted by oc_init", acceptedBad);
+        t.expect(oc_creature_count() == n0 && g_world->bodyPlanEnabled(), "a refused oc_init changed the world");
+        std::string err;
+        SimConfig sc;
+        OceanConfig oc;
+        t.expect(readOceanJson(R"({"physicalMutation":0.25,"physicalNovelProbability":0})", sc, oc, err) && oc.physicalMutation == 0.25f &&
+                 oc.physicalNovelProbability == 0.0f, "the knobs' bounds themselves refused: %s", err.c_str());
+        t.expect(!readOceanJson(R"({"physicalMutation":"0.1"})", sc, oc, err) && err.find("physicalMutation") != std::string::npos,
+                 "a string knob is not named in the refusal (%s)", err.c_str());
     }
     // live keys: the knobs in [0, .25]; the switch only as it is; hydrodynamics refused
     t.expect(oc_set_param("physicalMutation", 0.1) == 1 && g_world->ocfg.physicalMutation == 0.1f, "physicalMutation 0.1 refused: %s", oc_last_error());

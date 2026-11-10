@@ -42,11 +42,13 @@
 // shared index buffers.
 //
 // THE INTEGRATION MESH is NOT the renderer's index buffer (its two mirrored
-// halves share one triangle order, so their signed volumes cancel). It is a
-// closed, consistently outward-wound polyhedron over the hull samples: ring
-// samples in rotation order about +x (right half bottom -> top, then the left
-// half top -> bottom), a fan from the snout tip, quads between rings, a fan to
-// the tail cap; 224 triangles in a fixed order. Volume, centroid, first and
+// halves share one triangle order, so their signed volumes cancel). It is the
+// renderer's SURFACE — the same triangles, each quad split along the same
+// diagonal as buildTemplate and facet() (so every attached root lies on it) —
+// wound consistently outward: ring samples in rotation order about +x (right
+// half bottom -> top, then the left half top -> bottom), a fan from the snout
+// tip, quads between rings, a fan to the tail cap; 224 triangles in a fixed
+// order. Volume, centroid, first and
 // second moments come from its origin tetrahedra (a·(b×c)/6 each); wetted
 // area and the silhouettes (½Σ|n·axis|A) from its triangles; the frontal
 // area Af is the largest ring section (shoelace).
@@ -124,7 +126,7 @@ inline constexpr int kMetricsAbi = 1;
     X(fHullBounds, 6, "u", "hull min x, max x, min y, max y, min z, max z")                                        \
     X(fAllBounds, 6, "u", "hull + fins + eyes + barbels bounds")                                                   \
     X(fTotalLength, 1, "u", "all-parts x extent (with the caudal fin)")                                            \
-    X(fFins, 98, "", "7 fins x 14 (kFin*: caudal, dorsal, anal, pectoral R / L, pelvic R / L)")                    \
+    X(fFins, 98, "mixed", "7 fins x 14 (kFin*: caudal, dorsal, anal, pectoral R / L, pelvic R / L); units per value: the layout's fins.units")                    \
     X(fCaudalNominalArea, 1, "u2", "the caudal genes' nominal area cA R²")                                         \
     X(fCaudalNominalAR, 1, "", "the caudal genes' nominal aspect ratio")                                           \
     X(fCaudalActualAR, 1, "", "span² / measured area, after the chord cap")                                        \
@@ -223,6 +225,15 @@ inline constexpr int kBarbelRibbon = (kBarbelSegments + 1) * 2;          // 14: 
 inline constexpr int kSamples = kBarbel0 + 3 * 2 * 2 * kBarbelRibbon;    // 572
 inline constexpr int barbelRibbon0(int pair, int sideIndex, int rib) { return kBarbel0 + ((pair * 2 + sideIndex) * 2 + rib) * kBarbelRibbon; }
 
+// The eye rim's 16 directions (cos, sin of 2πk/16), frozen as binary32
+// constants (no host libm): cos π/8 = 0x1.d906bcp-1, sin π/8 = 0x1.87de2ap-2,
+// cos π/4 = sin π/4 = 0x1.6a09e6p-1 (each the correctly rounded value), and
+// exactly 0 / ±1 on the axes.
+inline constexpr float kEyeRimDir[16][2] = {
+    {1.0f, 0.0f}, {0x1.d906bcp-1f, 0x1.87de2ap-2f}, {0x1.6a09e6p-1f, 0x1.6a09e6p-1f}, {0x1.87de2ap-2f, 0x1.d906bcp-1f},
+    {0.0f, 1.0f}, {-0x1.87de2ap-2f, 0x1.d906bcp-1f}, {-0x1.6a09e6p-1f, 0x1.6a09e6p-1f}, {-0x1.d906bcp-1f, 0x1.87de2ap-2f},
+    {-1.0f, 0.0f}, {-0x1.d906bcp-1f, -0x1.87de2ap-2f}, {-0x1.6a09e6p-1f, -0x1.6a09e6p-1f}, {-0x1.87de2ap-2f, -0x1.d906bcp-1f},
+    {0.0f, -1.0f}, {0x1.87de2ap-2f, -0x1.d906bcp-1f}, {0x1.6a09e6p-1f, -0x1.6a09e6p-1f}, {0x1.d906bcp-1f, -0x1.87de2ap-2f}};
 // One canonical sample: the renderer's template attributes (aT, and aPattern's
 // part / side), as float32.
 struct Sample { float a[4]; int fin; float side; };
@@ -492,10 +503,7 @@ inline const Samples& sampleCoords() {
             const int base = e ? kEyeL0 : kEyeR0;
             const float sd = e ? -1.0f : 1.0f;
             put(base, 0.0f, 0.0f, sd, 0.0f, 4, sd);
-            for (int k = 0; k < kEyeRim; ++k) {
-                const double ph = 2.0 * PI * k / kEyeRim;
-                put(base + 1 + k, (float)std::cos(ph), (float)std::sin(ph), sd, 0.0f, 4, sd);
-            }
+            for (int k = 0; k < kEyeRim; ++k) put(base + 1 + k, kEyeRimDir[k][0], kEyeRimDir[k][1], sd, 0.0f, 4, sd);
         }
         for (int j = 0; j < 3; ++j)
             for (int si = 0; si < 2; ++si)
@@ -508,9 +516,6 @@ inline const Samples& sampleCoords() {
     }();
     return S;
 }
-// (cos / sin of the rim's 16 directions in std::cos / std::sin: k·π/8 are
-// exact in every libm we build with to well within the float rounding, and
-// the table is only ever rounded to float; tests pin its bits.)
 
 // ---- the canonical triangles (drawing and fin integration) -----------------------
 // Parts: 0 hull, 1 caudal (propulsive), 2 dorsal, 3 pectoral, 4 eye, 5 anal,
@@ -525,12 +530,19 @@ inline const Tris& canonicalTris() {
         Tris o{};
         auto tri = [&](int a, int b, int c, int part) { o.t[o.n++] = Tri{(std::uint16_t)a, (std::uint16_t)b, (std::uint16_t)c, (std::uint8_t)part}; };
         auto ring = [](int i, int k) { return kHullRing0 + kAround * (i - 1) + (k % kAround); };
-        // the closed hull, outward: the snout fan, the bands, the tail fan
+        // the closed hull, outward: the snout fan, the bands, the tail fan. The
+        // SURFACE is the renderer's (buildTemplate) and facet()'s: in each half,
+        // the quad between half-ring samples h, h + 1 (0 bottom .. 4 top) of
+        // rings i, i + 1 is split along (i, h) - (i + 1, h + 1). On the right half
+        // rotation index k is h; on the left it runs the other way (k = 8 − h),
+        // so the same diagonal joins (i, k + 1) and (i + 1, k). Only the winding
+        // differs from the renderer's (outward on both halves here).
         for (int k = 0; k < kAround; ++k) tri(kHullTip, ring(1, k + 1), ring(1, k), 0);
         for (int i = 1; i + 1 < kRings; ++i)
             for (int k = 0; k < kAround; ++k) {
-                tri(ring(i, k), ring(i, k + 1), ring(i + 1, k + 1), 0);
-                tri(ring(i, k), ring(i + 1, k + 1), ring(i + 1, k), 0);
+                const int A = ring(i, k), B = ring(i, k + 1), C = ring(i + 1, k + 1), D = ring(i + 1, k);   // outward A B C D
+                if (k < kHalfRing) { tri(A, B, C, 0); tri(A, C, D, 0); }   // right half: diagonal A - C
+                else               { tri(A, B, D, 0); tri(B, C, D, 0); }   // left half: diagonal B - D
             }
         for (int k = 0; k < kAround; ++k) tri(kHullCap, ring(kRings - 1, k), ring(kRings - 1, k + 1), 0);
         // the caudal fin (the renderer's quad order): the collar strip, then the two propulsive strips
@@ -705,14 +717,36 @@ inline Expressed develop(float V, float Sw, float shoulderMin, float R, float kE
     return x;
 }
 
+// The decoder's input domain, checked before anything is decoded (the
+// outline gene indexes the caudal checkpoints; a NaN would reach an integer
+// conversion): every shape gene of the row, and every physical allele, finite
+// in [0, 1]; S and E finite in [kMinScale, kMaxScale] (the engine keeps them in
+// [.5, 2]); a lambda finite and positive up to kMaxLambda; a load's two
+// fractions finite in [0, 1].
+inline constexpr float kMinScale = 1e-3f, kMaxScale = 1e3f, kMaxLambda = 1e4f;
+inline bool shapeGenesValid(const float* g) {
+    for (int j = 0; j < appearance::kMorphGenes; ++j) {
+        const float v = g[appearance::kMorphOffset + j];
+        if (!(v >= 0.0f && v <= 1.0f)) return false;
+    }
+    return true;
+}
+inline bool scaleValid(float x) { return x >= kMinScale && x <= kMaxScale; }   // (NaN fails)
+inline bool lambdaValid(float lam) { return lam > 0.0f && lam <= kMaxLambda; }
+inline bool loadValid(const Load* load) {
+    return !load || (load->gas >= 0.0f && load->gas <= 1.0f && load->fuel >= 0.0f && load->fuel <= 1.0f);
+}
+
 // Everything a compile measured, the coefficients plus (optional) the points.
-// Returns false for an unknown law or non-finite inputs (out left zero).
+// Returns false, every output zero, for an unknown law or an input outside the
+// domain above (and, as a last guard, a non-finite result).
 inline bool compile(const appearance::Genome& G, float S, float E, const physical::Genes& P, int law,
                     BirthCoefficients& out, const Load* load = nullptr, Points* pointsOut = nullptr) {
     using namespace detail;
     std::memset(&out, 0, sizeof out);
+    if (pointsOut) std::memset(pointsOut, 0, sizeof *pointsOut);
     if (law != kGeometryLaw) return false;
-    if (!(S > 0.0f && E > 0.0f && std::isfinite(S) && std::isfinite(E))) return false;
+    if (!scaleValid(S) || !scaleValid(E) || !shapeGenesValid(G.g) || !physical::genesValid(P) || !loadValid(load)) return false;
     float* m = out.m;
     const float L = 20.0f * S * E, R = 4.6f * S, lam = L / R;
     const float Vref = referenceVolume();
@@ -910,9 +944,9 @@ inline bool compile(const appearance::Genome& G, float S, float E, const physica
         m[at(fRingB) + i] = b * R;
     }
     m[at(fSectionExponent)] = 2.0f / M.n;
-    if (pointsOut) *pointsOut = pts;
     for (int i = 0; i < kMetrics; ++i)
         if (!std::isfinite(m[i])) { std::memset(&out, 0, sizeof out); return false; }
+    if (pointsOut) *pointsOut = pts;
     return true;
 }
 
