@@ -358,7 +358,11 @@ inline bool apply(World& world, const Options& o, const std::string& yText,
     w.endArray();
     w.endObject();
     w.field("assay", o.assay);
-    w.field("assayRules", o.assay == "frozen"
+    w.field("assayRules", fromScripted          // (Codex #74 r1 P3: the scripted arena's own rules)
+        ? "scripted Stage A hunters (the H-C benchmark): no brain, no genome, the economy off: immortal and "
+          "fixed under either frozen label, no buds, no energy or age accounting; no predators.csv: score from "
+          "the checkpoints' predation-death counter (minus the arena's) over K x h x dt"
+        : o.assay == "frozen"
         ? "economy accounting on; no deaths, no buds: at the budding threshold, holding at least the newborn "
           "energy, a virtual bud (pays the newborn energy, no child, counted as virtual_buds in predators.csv "
           "and per predator as virtualBuds in checkpoints); age wraps modulo the max age; energy floored at 0; "

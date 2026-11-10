@@ -638,7 +638,15 @@ def expand_v2(design, pending=False):
         p = e.get("predators")
         if p is None:
             kind, preds, K, ptag = "nopred", None, 0, "none"
-        elif isinstance(p, dict) and p.get("source") in ("random", "scripted") and set(p) == {"source"}:
+        elif isinstance(p, dict) and "source" in p:
+            # (Codex #74 r1 P2-3) a source endpoint is EXACTLY one permitted dict: never mixed with a world or
+            # time (it would fall through to a neural donor and lose its source), never an unknown source
+            if p not in ({"source": "random"}, {"source": "scripted"}):
+                raise DesignError(f"edge {n}: a predator source is exactly {{source: random}} or {{source: scripted}}, "
+                                  f"never mixed with other keys or another source (got {p})")
+            if p["source"] == "scripted" and assay == "live":
+                raise DesignError(f"edge {n}: scripted hunters are fixed Stage A predators: assay frozen or "
+                                  "frozen-newborn, never live (the engine refuses it)")
             K = e.get("k", s["k"])                    # (scripted: K fresh Stage A hunters, the H-C benchmark)
             kind, preds, ptag = "assay", {"source": p["source"]}, p["source"]
         elif isinstance(p, dict):

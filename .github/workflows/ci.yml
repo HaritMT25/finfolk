@@ -29,6 +29,46 @@ jobs:
       - name: Test
         run: ctest --test-dir build --output-on-failure
 
+  # Engine identity (Codex #74 r1): a change to the engine must leave every existing path bit-identical.
+  # The change's serial evo_boids and its base's (the merge base with main) run tools/identity_base_head.sh:
+  # Classic, Stage A / B / C histories with a mid-run resume, and transplants from a Stage C and a Stage B
+  # prey world (checkpoint and random sources, every assay mode), each arena then run; every checkpoint
+  # (its RNG states included), arena, manifest and log must be byte-identical (the main CSV without its two
+  # timing columns). Skipped when neither src/ nor CMakeLists.txt changed.
+  identity:
+    name: engine identity (base vs head, serial)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: The base, and whether the engine changed
+        id: base
+        run: |
+          git fetch -q origin main
+          base=$(git merge-base HEAD origin/main)
+          echo "sha=$base" >> "$GITHUB_OUTPUT"
+          if git diff --quiet "$base" HEAD -- src/ CMakeLists.txt; then c=no; else c=yes; fi
+          echo "changed=$c" >> "$GITHUB_OUTPUT"
+          echo "base $base, head $(git rev-parse HEAD), engine changed: $c"
+      - name: Install SFML (the app target)
+        if: steps.base.outputs.changed == 'yes'
+        run: sudo apt-get update -q && sudo apt-get install -y -q libsfml-dev
+      - name: Build the head and the base (serial, the same flags)
+        if: steps.base.outputs.changed == 'yes'
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DEVO_NO_OPENMP=ON
+          cmake --build build --target evo_boids -j
+          git worktree add -q --detach "$RUNNER_TEMP/base" "${{ steps.base.outputs.sha }}"
+          cmake -S "$RUNNER_TEMP/base" -B "$RUNNER_TEMP/base/build" -DCMAKE_BUILD_TYPE=Release -DEVO_NO_OPENMP=ON
+          cmake --build "$RUNNER_TEMP/base/build" --target evo_boids -j
+          sha256sum build/evo_boids "$RUNNER_TEMP/base/build/evo_boids"
+      - name: Compare every scenario's outputs
+        if: steps.base.outputs.changed == 'yes'
+        run: |
+          bash tools/identity_base_head.sh "$RUNNER_TEMP/base/build/evo_boids" build/evo_boids "$RUNNER_TEMP/identity"
+          sha256sum "$RUNNER_TEMP/identity/identity.json"
+
   # The web front end's type check: tsc --checkJs over tsconfig.json's files (those that
   # carry // @ts-check) with web/types.d.ts. Checking only, nothing is built: the runner
   # image's own node / npm, TypeScript from package.json's pin and package-lock.json's exact

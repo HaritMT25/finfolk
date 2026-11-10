@@ -4234,20 +4234,63 @@ static void test_predator_brain() {
             transplant::Options sc; sc.predatorsFrom = "scripted"; sc.count = 3; sc.seed = 9u; sc.assay = "frozen";
             transplant::Options rr = sc; rr.predatorsFrom = "random";
             World s1 = loadX(), r1 = loadX();
-            std::string ms;
-            CHECK(transplant::apply(s1, sc, "", ms, err) && transplant::apply(r1, rr, "", ms, err));
+            std::string ms, ms1;
+            const std::string gs0 = rng.state();
+            CHECK(transplant::apply(s1, sc, "", ms1, err));
+            CHECK(rng.state() == gs0);                               // (Codex #74 r1) the world's stream untouched
+            CHECK(transplant::apply(r1, rr, "", ms, err));
             bool ok = s1.predators.size() == 3u && !s1.cfg.predatorBrain && !s1.cfg.predatorEconomy &&
                       !s1.cfg.predatorFrozen && s1.cfg.predatorCount == 3 && s1.creatures.size() == X.creatures.size();
-            for (size_t i = 0; ok && i < 3; ++i)
+            for (size_t i = 0; ok && i < 3; ++i)                    // the same spots AND headings as any source
                 ok = bitEq(s1.predators[i].pos.x, r1.predators[i].pos.x) && bitEq(s1.predators[i].pos.y, r1.predators[i].pos.y)
+                     && bitEq(s1.predators[i].vel.x, r1.predators[i].vel.x) && bitEq(s1.predators[i].vel.y, r1.predators[i].vel.y)
                      && s1.predators[i].genome.empty();
             CHECK(ok);
             const std::string sb = checkpoint::serialize(s1, "t");
             CHECK(sb.find("\"formatVersion\":1") != std::string::npos);
+            CHECK(ms1.find("scripted Stage A hunters") != std::string::npos &&
+                  ms1.find("score from predators.csv") == std::string::npos);    // (its own assay rules)
+            // the prey world, its counters and its random state are X's, line by line
+            bool sameX = true;
+            for (const char* k : {",\"counters\"", ",\"rngState\"", ",\"currentVortices\"", ",\"signals\"", ",\"food\"",
+                                  ",\"creatures\""})
+                sameX = sameX && lineOf(sb, k) == lineOf(xBlob, k);
+            CHECK(sameX);
+            // a repeated construction is byte-identical (arena and manifest); another seed moves the hunters
+            {
+                World s1b = loadX();
+                std::string ms1b;
+                CHECK(transplant::apply(s1b, sc, "", ms1b, err) && checkpoint::serialize(s1b, "t") == sb && ms1b == ms1);
+                transplant::Options sc2 = sc; sc2.seed = 10u;
+                World s1c = loadX();
+                CHECK(transplant::apply(s1c, sc2, "", ms1b, err) && checkpoint::serialize(s1c, "t") != sb);
+            }
             World s2;
             CHECK(checkpoint::deserialize(sb, s2, err) && checkpoint::serialize(s2, "t") == sb);
-            for (int i = 0; i < 300; ++i) s2.update(0.016f);
-            CHECK(s2.predators.size() == 3u);                       // immortal, fixed: no deaths, no buds
+            // uninterrupted vs resumed: 300 steps at once, or 150 + save / load + 150, are byte-identical
+            {                                                   // (each load sets the global stream: load, then run)
+                World u, v;
+                CHECK(checkpoint::deserialize(sb, u, err));
+                for (int i = 0; i < 300; ++i) u.update(0.016f);
+                const std::string ub = checkpoint::serialize(u, "t");
+                const std::uint64_t uf = deepFingerprint(u);
+                CHECK(checkpoint::deserialize(sb, v, err));
+                for (int i = 0; i < 150; ++i) v.update(0.016f);
+                World v2;
+                CHECK(checkpoint::deserialize(checkpoint::serialize(v, "t"), v2, err));
+                for (int i = 0; i < 150; ++i) v2.update(0.016f);
+                CHECK(checkpoint::serialize(v2, "t") == ub && deepFingerprint(v2) == uf);
+            }
+            World s2r;
+            CHECK(checkpoint::deserialize(sb, s2r, err));
+            for (int i = 0; i < 300; ++i) s2r.update(0.016f);
+            CHECK(s2r.predators.size() == 3u);                      // immortal, fixed: no deaths, no buds
+            CHECK(s2r.totalPredatorBirths == X.totalPredatorBirths && s2r.totalPredatorDeathsStarvation ==
+                  X.totalPredatorDeathsStarvation && s2r.totalPredatorDeathsAge == X.totalPredatorDeathsAge);
+            transplant::Options nb2 = sc; nb2.assay = "frozen-newborn";     // either frozen label: the same arena
+            World s5 = loadX();
+            std::string ms5;
+            CHECK(transplant::apply(s5, nb2, "", ms5, err) && !s5.cfg.predatorEconomy && s5.predators.size() == 3u);
             transplant::Options lv2 = sc; lv2.assay = "live";
             World s3 = loadX();
             CHECK(!transplant::apply(s3, lv2, "", ms, err) && err.find("scripted") != std::string::npos);
