@@ -13,7 +13,9 @@ the site is static three.js/JS in `web/` (no JS build step). Python tools run ex
 
 - `src/core/` Classic engine (world, genome, kernel, sensors/actions, checkpoint I/O). Shared by Ocean.
 - `src/ocean/` 3-D Ocean: `ocean_world.hpp` (the world), `ocean_config.hpp` (OceanConfig, E1 preset),
-  `ocean_flow.hpp`, `fish.hpp`, `appearance_*.hpp` (cosmetic genome), `plane_data_ocean*.hpp` (generated).
+  `ocean_flow.hpp`, `fish.hpp`, `appearance_*.hpp` (cosmetic genome), `plane_data_ocean*.hpp` (generated),
+  `physical_genome.hpp` + `body_plan.hpp` (M2a: the five physical alleles and the body-plan decoder, diagnostic only,
+  behind `bodyPlanPreviewEnabled`).
 - `src/app/main.cpp` native SFML app; `src/render/` its renderer.
 - `wasm/` module builds and parity scripts: `build_wasm.sh` (Classic), `build_ocean.sh` (Ocean),
   `build_site.sh` (assemble `dist/`), `parity.sh` (Classic), `ocean_parity.sh` (Ocean), `serve.py`,
@@ -26,15 +28,17 @@ the site is static three.js/JS in `web/` (no JS build step). Python tools run ex
   change goes in a slot or a feature, never in a text splice), `ocean_pose.js` (the swim pose on the CPU: size weight, packing, reach),
   `ocean_materials.js` (the fish's materials: one binder, a cache keyed per kind / pass / layout / variant / Look / features,
   the one writer of a fish mesh's `material`; a Look's feature set goes through its `activate`, never a material of its own),
-  `ocean_scene_parity.js` (the scene's diagnostics: the appearance checks against the CPU mirror),
+  `ocean_scene_parity.js` (the scene's diagnostics: the appearance checks against the CPU mirror; the body plan's
+  GPU == C++ check), `ocean_bodyplan.{html,js}` (the M2a body plan's fixture viewer and GPU check page),
   `ocean_config.js`, `ocean_handoff.js`, `ocean_worker.js` (Turbo), `ocean_dash.js`, `dashboard.js`, `charts.js`.
   A new page script is listed in `ocean.html` and published by `wasm/build_site.sh` (its asserted rewrites).
   Plain `<script>` IIFEs, each registering one `window.Evo*` namespace (no bundler); `types.d.ts` declares
   their shared shapes and globals for the type check (`tsconfig.json`), and is never loaded by a page.
 - `tests/` `core_tests.cpp`, `ocean_tests.cpp` (+ `ocean_*_tests.hpp`), `ocean_turbo_handoff.js`,
-  `ocean_shader_slots_tests.cjs`, `ocean_materials_tests.cjs`, `ocean_mock_three_tests.mjs`, `ocean_render_browser.mjs`, `ocean_baseline/` (committed fingerprints), `fixtures/`,
-  `*.sh` end-to-end tests.
-- `tools/` `ocean_parity_driver.cpp` + `ocean_fingerprint.hpp` (the parity harness), `ocean_eye_*`,
+  `ocean_shader_slots_tests.cjs`, `ocean_materials_tests.cjs`, `ocean_mock_three_tests.mjs`, `ocean_render_browser.mjs`,
+  `ocean_body_gpu.mjs` (the body plan's GPU == C++ check in headless Brave), `ocean_baseline/` (committed fingerprints),
+  `fixtures/` (incl. `ocean_body_fixture.json`, written by `tools/ocean_body_fixture.cpp`), `*.sh` end-to-end tests.
+- `tools/` `ocean_parity_driver.cpp` + `ocean_fingerprint.hpp` (the parity harness), `ocean_body_fixture.cpp`, `ocean_eye_*`,
   `gen_planes*.{cpp,sh}` (regenerate plane headers), `invasion/` (invasion-matrix study: plan/run/score/analyze),
   `alife2027/` (ALIFE 2027 study runner: plan/run/analyze), `three_bundle/`.
 - `.github/workflows/` `ci.yml` (every push/PR), `ocean-full.yml` (full Ocean matrix, weekly/on demand).
@@ -120,6 +124,11 @@ Memory is tight on the maintainer's PC: use `JOBS`/`BUILD_JOBS`, `nice -n 19`, a
   should be checked from the start: list it there and give it the comment.
 - `node tests/ocean_render_browser.mjs --base http://localhost:8123` (serve with `python3 wasm/serve.py web 8123`; it appends `/ocean.html`; headless Brave, Playwright; see its header):
   render and shader checks on the real page. Browser-only; not in CI. Cases in `tests/fixtures/ocean_render_cases.json`.
+- `node tests/ocean_body_gpu.mjs --base http://localhost:8123` (serve the repository root: `python3 wasm/serve.py`):
+  the M2a body plan on `web/ocean_bodyplan.html?check=1`: the page's Wasm law == the native fixture digests bit for
+  bit, the renderer's GLSL == the C++ law at the canonical samples within the locked tolerance (three slot maps), and
+  three planted GLSL faults caught. Browser-only; not in CI. (`ocean_parity.sh` holds the preview to its body twins and
+  the fixture driver to native == wasm == `tests/fixtures/ocean_body_fixture.json`.)
 - Classic sha pin: any `src/core` change changes the Classic wasm; the committed `web/evo_boids*.wasm` hashes are
   pinned by the maintainer (a change needs a rebuild and an explicit decision).
 - CI jobs: `native` (3 variants), `wasm` (build, freshness, `parity.sh`, `build_site.sh`), `ocean` (freshness,

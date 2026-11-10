@@ -70,6 +70,42 @@ interface OceanModule {
   _oc_appearance_count(): number;
   /** float32 x stride a fish, or 0 (no rows) */
   _oc_creature_appearance(): number;
+  /* the M2a body-plan preview (DIAGNOSTIC; wasm/ocean_wasm.cpp ADDITIONS): versions, strides, rows */
+  _oc_physical_schema(): number;
+  _oc_physical_founder_law(): number;
+  _oc_physical_inheritance_law(): number;
+  _oc_physical_stream_law(): number;
+  /** the physical alleles a fish (5) */
+  _oc_physical_genes(): number;
+  _oc_body_geometry_law(): number;
+  _oc_body_metrics_abi(): number;
+  /** the coefficients a fish (oc_body_metrics_layout's stride) */
+  _oc_body_metrics_stride(): number;
+  _oc_body_plan_enabled(): number;
+  _oc_body_plan_broken(): number;
+  /** rows this sync (0 while the preview is off or broken) */
+  _oc_body_count(): number;
+  /** float32 x 5 a fish, or 0 */
+  _oc_creature_physical(): number;
+  /** uint32 x 2 a fish (the owner id's low, high word), or 0 */
+  _oc_body_owner_ids(): number;
+  /** float32 x stride a fish, or 0 */
+  _oc_creature_body_metrics(): number;
+  /** a C string: the coefficient layout (JSON: BodyLayout) */
+  _oc_body_metrics_layout(): number;
+  /** the fixture viewer's compile (pointers to 63 and 5 floats); 1 or 0 */
+  _oc_body_preview(genes: number, size: number, elong: number, physical: number, gas: number, fuel: number): number;
+  _oc_body_preview_metrics(): number;
+  _oc_body_preview_points(): number;
+  /** the renderer's rest law at the canonical samples, body radii (genes: a pointer to 63 floats) */
+  _oc_body_rest(genes: number, lambda: number): number;
+  _oc_body_rest_points(): number;
+  _oc_body_sample_count(): number;
+  _oc_body_tri_count(): number;
+  /** float32 x 6 a sample: aT (4), part, side */
+  _oc_body_samples(): number;
+  /** uint16 x 4 a triangle: three samples, the part */
+  _oc_body_tris(): number;
   _oc_food_count(): number;
   _oc_food_xy(): number;
   _oc_food_depth(): number;
@@ -141,11 +177,17 @@ interface OceanSnapshot {
   vz: Float32Array | null;
   /** the appearance rows (63 floats a fish), or null when the module has none this layout knows */
   app: Float32Array | null;
+  /** the M2a body-plan preview's rows (diagnostic; web/ocean.js bodyView), or null when the world has none or
+   * the module's layout is not this page's. Never read by the scene: `body` above is what it draws with. */
+  bodyPlan: BodyPlanView | null;
   curActive: boolean;
   curGrid: Float32Array | null;
   curCols: number;
   curRows: number;
 }
+
+/** one sync's body-plan rows: genes 5 a fish, owners 2 uint32 words a fish (low, high), metrics `stride` a fish */
+interface BodyPlanView { genes: Float32Array; owners: Uint32Array; metrics: Float32Array; stride: number }
 
 /* ---------------- web/ocean_handoff.js (window.EvoOceanHandoff; node: module.exports) ---------------- */
 
@@ -1023,6 +1065,28 @@ interface EvoOceanSceneParityApi {
   appearanceFragmentCheck(gl: WebGL2RenderingContext, EA: EvoAppearanceApi, opts?: ParityCheckOptions): Promise<any>;
   /** the probes on a live scene (web/ocean_scene.js create(), once a scene) */
   attach(port: ParityProbePort): ParityProbes;
+  /** the M2a body plan: the renderer's rest GLSL at the canonical samples against the C++ law's rest points */
+  bodyPlanVertexCheck(gl: WebGL2RenderingContext, EA: EvoAppearanceApi, fixture: BodyPlanFixture, opts?: { slotMap?: "identity" | "permuted" | "sparse"; mutate?: string }): Promise<any>;
+  /** its locked tolerance (body radii) and its planted faults' names */
+  BODY_TOL: { geo: number };
+  BODY_MUT: string[];
+}
+/** bodyPlanVertexCheck's input: the canonical samples ([a0, a1, a2, a3, part, side] each) and the bodies (63
+ * genes, lambda, the C++ rest points: 3 floats a sample) */
+interface BodyPlanFixture {
+  samples: number[][];
+  bodies: Array<{ name?: string; genes: ArrayLike<number>; lambda: number; rest?: ArrayLike<number> }>;
+}
+
+/* ---------------- web/ocean_bodyplan.js (window.EvoBodyPlanViewer) ---------------- */
+
+/** The fixture viewer (web/ocean_bodyplan.html): start (once, as it loads), the GPU check (a Promise of
+ * the report it also leaves in window.__bodyPlanCheck), the fixture driver's digest, a redraw. */
+interface EvoBodyPlanViewerApi {
+  start(): Promise<unknown>;
+  gpuCheck(): Promise<any>;
+  digest(f32: Float32Array): string;
+  redraw(): void;
 }
 
 /* ---------------- not checked yet: declared by what checked files use ---------------- */
@@ -1058,7 +1122,7 @@ interface OceanPageApi {
   perf?: Profiler;
 }
 /** the published asset names (ocean.html's EVO_ASSETS; build_site.sh rewrites them to content-hashed ones) */
-interface EvoAssets { ocean?: string; oceanWasm?: string; worker?: string; handoff?: string; mock?: string; three?: string; [name: string]: string | undefined }
+interface EvoAssets { ocean?: string; oceanWasm?: string; worker?: string; handoff?: string; mock?: string; three?: string; bodyplan?: string; fixture?: string; [name: string]: string | undefined }
 
 declare var EvoOceanHandoff: EvoOceanHandoffApi;
 declare var EvoAppearanceSlots: EvoAppearanceSlotsApi;
@@ -1071,6 +1135,9 @@ declare var EvoOceanShaders: EvoOceanShadersApi | null | undefined;
 declare var EvoOceanPose: EvoOceanPoseApi | null | undefined;
 declare var EvoOceanMaterials: EvoOceanMaterialsApi | null | undefined;
 declare var EvoOceanSceneParity: EvoOceanSceneParityApi | null | undefined;
+declare var EvoBodyPlanViewer: EvoBodyPlanViewerApi | null | undefined;
+/** the fixture viewer's last GPU check (web/ocean_bodyplan.js; the headless test reads it) */
+declare var __bodyPlanCheck: any;
 declare var EvoOceanScene: EvoOceanSceneApi;
 /** set by web/ocean_scene.js when a script it needs did not load or failed to run, in words: "<files>
  * missing", "<files> failed to run" or both, "; " between ("ocean_shaders.js", "ocean_pose.js",
