@@ -30,8 +30,10 @@ refill (predator_reseeds_cum above the founders' 0) ends them at the sample befo
 integrity event, listed in "technical").
 
 THE BLOCK, per world (the current attempt only):
-  uuid       the registry's for attempt 0; for attempt k > 0 a distinct one, uuid5(NAMESPACE_URL,
-             "finfolk:attempt:<registry uuid>:<k>") (another history, so other snapshot identities);
+  uuid       the REGISTRY uuid, for every attempt: the slot is the snapshot identity a registered design
+             binds (as worlds.py design-block's; the restart protocol keeps the slot);
+  attempt_uuid  the attempt's own identity (provenance): the registry uuid for attempt 0; for attempt k > 0
+             uuid5(NAMESPACE_URL, "finfolk:attempt:<registry uuid>:<k>") (another history);
   pattern    <abs a<k>>/end.{frame}.json;
   archived   the frames f (multiples of 1M up to 200M, f <= observed_through) whose end.<f>.json exists
              and parses with world.frame == f (every listed checkpoint is opened), and frame 1 when the
@@ -175,7 +177,8 @@ def block(root, log_every=LOG_EVERY):
         paths = founding(adir)
         zero, through, tech, chain = observations(adir, log_every)
         ck = archived(adir)
-        ws[w["id"]] = {"uuid": attempt_uuid(w["uuid"], k), "treatment": w["treatment"], "block": w["block"],
+        ws[w["id"]] = {"uuid": w["uuid"], "attempt_uuid": attempt_uuid(w["uuid"], k),
+                       "treatment": w["treatment"], "block": w["block"],
                        "status": status, "attempt": k, "pattern": os.path.join(adir, "end.{frame}.json"), "paths": paths,
                        "valid_before": zero, "observed_through": through, "technical": tech, "chain": chain,
                        "archived": ([1] if paths else []) + [f for f in ck if f <= through],

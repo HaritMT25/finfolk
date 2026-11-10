@@ -104,9 +104,15 @@ class TestValBlock(unittest.TestCase):
         v = b["worlds"]
         self.assertEqual(b["schema"], val_block.SCHEMA)
         self.assertEqual(b["registry_sha256"], rqlib.sha256_file(os.path.join(self.root, "config", "worlds.json")))
-        self.assertEqual(v["w05"]["uuid"], str(uuidlib.uuid5(uuidlib.NAMESPACE_URL,
-                                                             "finfolk:attempt:00000000-0000-0000-0000-000000000005:1")))
-        self.assertEqual((v["w05"]["attempt"], v["w01"]["uuid"]), (1, self.ws[0]["uuid"]))
+        # (the snapshot identity across restarts: the slot's REGISTRY uuid is kept for every attempt, as worlds.py
+        #  design-block's; the attempt's own identity is provenance, attempt_uuid)
+        self.assertEqual((v["w05"]["uuid"], v["w05"]["attempt"]), (self.ws[4]["uuid"], 1))
+        self.assertEqual(v["w05"]["attempt_uuid"], str(uuidlib.uuid5(uuidlib.NAMESPACE_URL,
+                                                                     "finfolk:attempt:00000000-0000-0000-0000-000000000005:1")))
+        self.assertEqual(v["w05"]["attempt_uuid"], val_block.attempt_uuid(self.ws[4]["uuid"], 1))
+        self.assertEqual((v["w01"]["uuid"], v["w01"]["attempt_uuid"], v["w01"]["attempt"]),
+                         (self.ws[0]["uuid"], self.ws[0]["uuid"], 0))
+        self.assertTrue(all(x["uuid"] == r["uuid"] for r in self.ws for x in [v[r["id"]]]))
         self.assertEqual(v["w04"]["valid_before"], 63 * M)
         self.assertEqual(v["w04"]["status"], "extinct")
         self.assertIsNone(v["w01"]["valid_before"])
