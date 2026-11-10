@@ -4,7 +4,8 @@
 # run the same scenarios: Classic, Stage A / B / C histories with a mid-run resume, and transplants from a
 # Stage C and a Stage B prey world, checkpoint and random sources, in all three assay modes, each arena then
 # run with periodic checkpoints. Every output file (checkpoints with their RNG states, arenas, manifests, the
-# main CSV without its two timing columns, the predator and lineage logs) is hashed; the two manifests must
+# main CSV without its two timing columns, the run sidecar <stem>.config.txt without its build timestamp
+# "(built __DATE__ __TIME__)", the predator and lineage logs) is hashed; the two manifests must
 # be equal, and within each binary a resumed history must equal the uninterrupted one. Exit 0 = identical.
 set -u
 BASE=$(readlink -f "${1:?usage: identity_base_head.sh BASE_BIN HEAD_BIN WORKDIR}")
@@ -54,7 +55,7 @@ run_all() {   # $1 binary, $2 directory
 ( run_all "$BASE" "$W/base" ) || exit 1
 ( run_all "$HEAD" "$W/head" ) || exit 1
 python3 -I - "$W" <<'PY'
-import csv, hashlib, io, json, os, sys
+import csv, hashlib, io, json, os, re, sys
 W = sys.argv[1]
 TIMING = ("elapsed_s", "steps_per_sec")
 def manifest(root):
@@ -63,6 +64,8 @@ def manifest(root):
         for f in sorted(files):
             p = os.path.join(d, f)
             raw = open(p, "rb").read()
+            if f.endswith(".config.txt"):          # (its first line carries the build's __DATE__ __TIME__ only)
+                raw = re.sub(rb"\(built [^)\n]*\)", b"(built <masked>)", raw, count=1)
             if f.endswith(".csv"):
                 rows = list(csv.reader(io.StringIO(raw.decode())))
                 if rows and any(c in rows[0] for c in TIMING):
