@@ -7,10 +7,12 @@
 # main CSV without its two timing columns, the predator and lineage logs) is hashed; the two manifests must
 # be equal, and within each binary a resumed history must equal the uninterrupted one. Exit 0 = identical.
 set -u
-BASE=${1:?usage: identity_base_head.sh BASE_BIN HEAD_BIN WORKDIR}
-HEAD=${2:?}
+BASE=$(readlink -f "${1:?usage: identity_base_head.sh BASE_BIN HEAD_BIN WORKDIR}")
+HEAD=$(readlink -f "${2:?}")
 W=${3:?}
+[ -x "$BASE" ] && [ -x "$HEAD" ] || { echo "FAIL: $BASE or $HEAD is not an executable" >&2; exit 2; }
 rm -rf "$W"; mkdir -p "$W"
+W=$(readlink -f "$W")
 # (the economy of tests/redqueen_tooling.sh's tiny Stage C worlds; the floor keeps the donor's predators)
 ECON="--predator-economy --predator-meal 14 --predator-max-pop 12 --predator-min-pop 2 --predator-max-age 15"
 run_all() {   # $1 binary, $2 directory

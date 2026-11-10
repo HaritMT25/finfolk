@@ -4268,6 +4268,8 @@ static void test_predator_brain() {
             World s2;
             CHECK(checkpoint::deserialize(sb, s2, err) && checkpoint::serialize(s2, "t") == sb);
             // uninterrupted vs resumed: 300 steps at once, or 150 + save / load + 150, are byte-identical
+            // (a promise of the serial build only: OpenMP and pool builds do not resume bit-exactly)
+#ifdef EVO_DETERMINISTIC
             {                                                   // (each load sets the global stream: load, then run)
                 World u, v;
                 CHECK(checkpoint::deserialize(sb, u, err));
@@ -4281,6 +4283,7 @@ static void test_predator_brain() {
                 for (int i = 0; i < 150; ++i) v2.update(0.016f);
                 CHECK(checkpoint::serialize(v2, "t") == ub && deepFingerprint(v2) == uf);
             }
+#endif
             World s2r;
             CHECK(checkpoint::deserialize(sb, s2r, err));
             for (int i = 0; i < 300; ++i) s2r.update(0.016f);
