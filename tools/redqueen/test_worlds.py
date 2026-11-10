@@ -1952,6 +1952,107 @@ class TestEcology(unittest.TestCase):
         self.assertTrue(any("protocol-integrity" in x for x in o["integrity"]))
         self.assertEqual(len(rows), 31)
 
+    # ---------------------------------------------------------------- Codex #75 r2
+    def synth(self, tr, segs):
+        """A synthetic attempt with exact control of every segment, acceptance part, lineage log and checkpoint:
+        segs [{"name", "start", "parent": (segment, frame) | None, "rows": [(frame, prey, predators)], "events":
+        [(frame, event, id, parent, age)], "accept": [frames]}]; every record's parts are computed from the bytes
+        (run.csv through the row of its frame, run.predlog.csv through its last event at or before it)."""
+        root, reg, ar = make_root(self.tmp, tr, dict(SCHED, total_steps=3000))
+        wid = reg["worlds"][0]["id"]
+        d = worlds.wdir(root, wid)
+        os.makedirs(os.path.join(d, "ckpt"), exist_ok=True)
+        cfg = cfg_for(reg["worlds"][0]["flags"])
+        recs, states, by = [], [], {}
+        for s in segs:
+            sd = os.path.join(d, s["name"])
+            os.makedirs(sd, exist_ok=True)
+            lines = [b"step,population,predator_pop,predator_avg_energy\n"] + [
+                f"{f},{q},{p},150.0\n".encode() for f, q, p in s["rows"]]
+            ev = [b"frame,event,id,parent,lineage,generation,age\n"] + [
+                f"{f},{e},{i},{par},{i},0,{age}\n".encode() for f, e, i, par, age in s.get("events", [])]
+            wr(os.path.join(sd, "run.csv"), b"".join(lines).decode())
+            wr(os.path.join(sd, "run.predlog.csv"), b"".join(ev).decode())
+            prev = {"run.csv": 0, "run.predlog.csv": 0}
+            for F in s.get("accept", []):
+                cp = os.path.join(d, "ckpt", f"end.{F}.json")
+                if not os.path.isfile(cp):
+                    wr(cp, ckpt.dumps(mk_cp(frame=F, n_pred=3, cfg_extra=cfg)))
+                n1 = len(lines[0]) + sum(len(x) for x, (f, _, _) in zip(lines[1:], s["rows"]) if f <= F)
+                n2 = len(ev[0]) + sum(len(x) for x, e in zip(ev[1:], s.get("events", [])) if e[0] <= F)
+                raws = {"run.csv": b"".join(lines), "run.predlog.csv": b"".join(ev)}
+                logs = {k: {"from": prev[k], "bytes": n, "sha256": rqlib.sha256_bytes(raws[k][prev[k]:n])}
+                        for k, n in (("run.csv", n1), ("run.predlog.csv", n2))}
+                prev = {k: v["bytes"] for k, v in logs.items()}
+                r = {"segment": s["name"], "start_frame": s["start"], "frame": F, "sha256": rqlib.sha256_file(cp),
+                     "logs": logs}
+                recs.append(r)
+                by[(s["name"], F)] = r
+            ra = None
+            if s.get("parent"):
+                pn, pf = s["parent"]
+                ra = {"segment": pn, "frame": pf, "sha256": by[(pn, pf)]["sha256"]}
+            states.append({"name": s["name"], "start_frame": s["start"], "resumed_from": None, "resumed_accept": ra,
+                           "args": []})
+        wr(os.path.join(d, "accept.jsonl"), "".join(rqlib.canonical(r).decode() for r in recs))
+        worlds.write_state(root, wid, {"schema": worlds.STATE_SCHEMA, "id": wid, "status": "interrupted", "failures": 0,
+                                       "segments": states})
+        return root, reg, wid
+
+    @staticmethod
+    def alive(lo, hi, step=100, prey=50, pred=8):
+        return [(f, prey, pred) for f in range(lo, hi + 1, step)]
+
+    def test_r2_recorded_ancestry(self):
+        """#75 r2 P2-1: seg002@2000 resumed seg000's 2000 record (recorded), bypassing seg001@1000 (which never reached
+        2000): the line of descent follows the recorded link, so seg001 is superseded and seg000's evidence stands."""
+        root, reg, wid = self.synth("B", [
+            {"name": "seg000", "start": 0, "rows": self.alive(100, 2000), "accept": [1000, 2000]},
+            {"name": "seg001", "start": 1000, "parent": ("seg000", 1000), "rows": self.alive(1100, 1300)},
+            {"name": "seg002", "start": 2000, "parent": ("seg000", 2000), "rows": self.alive(2100, 2500)}])
+        o = worlds.ecology(root, reg, [3000])["slots"][wid]["attempts"][0]
+        self.assertEqual((o["frontier"], o["stop"], o["evidence"]["superseded_segments"]), (2000, None, ["seg001"]))
+
+    def test_r2_malformed_superseded_row(self):
+        """#75 r2 NEW P2-2: seg000 reaches its cut at 2000, its next (hash-bound, accepted) row 2100 is malformed: the
+        cut stops reading there, the row never blocks the valid continuation seg001."""
+        rows = self.alive(100, 2000) + [(2100, "5x", 8)] + self.alive(2200, 3000)
+        root, reg, wid = self.synth("B", [
+            {"name": "seg000", "start": 0, "rows": rows, "accept": [1000, 2000, 3000]},
+            {"name": "seg001", "start": 2000, "parent": ("seg000", 2000), "rows": self.alive(2100, 2400)}])
+        o = worlds.ecology(root, reg, [3000])["slots"][wid]["attempts"][0]
+        self.assertEqual((o["frontier"], o["stop"], o["accepted_through"]), (2000, None, 2000))
+
+    def test_r2_lineage_gap_and_bmd_coverage(self):
+        """#75 r2 NEW P2-3/4: seg000's lineage part (1000, 2000] (founder 1's realized B at 1500) no longer verifies,
+        seg001 (resumed at 2000) is intact and records founder 1's starvation at 2500: the lineage coverage ends at
+        1000 (never carried over the gap), so the breeder indicator is unavailable after it and the 5k series is
+        never a zero for the missing events."""
+        F_ = [(0, "F", i, 0, 0.0) for i in (1, 2, 3)]
+        root, reg, wid = self.synth("C", [
+            {"name": "seg000", "start": 0, "rows": self.alive(100, 2000), "accept": [1000, 2000],
+             "events": F_ + [(1500, "B", 7, 1, 20.0)]},
+            {"name": "seg001", "start": 2000, "parent": ("seg000", 2000), "rows": self.alive(2100, 3000), "accept": [3000],
+             "events": [(2000, "L", i, 0, 30.0) for i in (1, 2, 3, 7)] + [(2500, "S", 1, 0, 40.0)]}])
+        p = os.path.join(worlds.wdir(root, wid), "seg000", "run.predlog.csv")
+        wr(p, rqlib.read_text(p).replace("1500,B,7,1,", "1500,B,7,2,"))       # (the B row's part no longer verifies)
+        seq = worlds.attempt_sequence(root, wid, worlds.wdir(root, wid), reg["worlds"][0], 0, [], 100, lineage=True)
+        self.assertEqual((seq["lineage_through"], len(seq["lineage"]), seq["obs"]["frontier"]), (1000, 1, 3000))
+        v = worlds.monitor(root, reg, 500, 100)["worlds"][wid]
+        self.assertEqual(v["lineage_through"], 1000)
+        self.assertTrue(v["latest_window"]["breeder_indicator"].startswith("unavailable"), v["latest_window"])
+        ev = worlds.lineage_events(seq["lineage"])
+        series = dict(worlds.bmd_5k(seq["samples"], ev, 100, seq["lineage_through"]))
+        self.assertEqual((series[1000], series[1100], series[2500]), (0, None, None))   # (outside coverage: unavailable)
+
+    def test_r2_energy_tail_within_the_observation(self):
+        """#75 r2 NEW P2-5: the prey reach 0 at 2500 and the overshoot was accepted through 3000: the energy tail comes
+        from the latest checkpoint within the observation (2000), never from 3000."""
+        rows = self.alive(100, 2400) + [(f, 0, 8) for f in range(2500, 3001, 100)]
+        root, reg, wid = self.synth("B", [{"name": "seg000", "start": 0, "rows": rows, "accept": [1000, 2000, 3000]}])
+        v = worlds.monitor(root, reg, 500, 100)["worlds"][wid]
+        self.assertEqual((v["frontier"], v["energy_tail"]["frame"]), (2500, 2000))
+
     def test_layout_64_note_and_older_bytes(self):
         arena = os.path.join(self.tmp, "arena.json")
         wr(arena, json.dumps(ARENA))

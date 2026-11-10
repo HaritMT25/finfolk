@@ -2999,9 +2999,12 @@ def attempt_sequence(root, wid, d, w, attempt, ledger, log_every, lineage=False)
         by.setdefault(r["segment"], []).append(r)
     segs = st.get("segments", [])
     segmap = {s["name"]: s for s in segs}
-    chain, stop = evidence.chain_cuts([(s["name"], s["start_frame"]) for s in segs], base) if segs else ([], None)
+    # (#75 r2 P2-1) the newest segment's line of descent through its RECORDED parent links (resumed_accept)
+    chain, stop = evidence.chain_links([(s["name"], s["start_frame"], (s.get("resumed_accept") or {}).get("segment"))
+                                        for s in segs], base) if segs else ([], None)
     mine = [e for e in ledger if e.get("world") == wid and int(e.get("attempt", 0) or 0) == attempt]
     samples, evid, events, accepted, tail_ev = [], [], [], base, None
+    lin_through, lin_open, ckpts = base, lineage, []
     if stop:
         chain = []
     for i, (name, start, upto) in enumerate(chain):
@@ -3032,18 +3035,33 @@ def attempt_sequence(root, wid, d, w, attempt, ledger, log_every, lineage=False)
             rows, why = [], str(ex)
         if cov is not None:
             accepted = max(accepted, min(cov["frame"], upto) if upto is not None else cov["frame"])
+            # (#75 r2 P2-5) the checkpoints on the line of descent: covered, and at or before this segment's cut
+            ckpts += [(r["frame"], r["sha256"]) for r in sorted(by.get(name, []), key=lambda r: r["frame"])
+                      if r["frame"] <= cov["frame"] and (upto is None or r["frame"] <= upto)]
         evid.append({"segment": name, "start_frame": start, "until": upto, "through": rows[-1][0] if rows else start,
                      "csv_bytes": len(use), "csv_sha256": rqlib.sha256_bytes(use),
                      "checkpoint_frame": cov["frame"] if cov else None,
                      "checkpoint_sha256": cov["sha256"] if cov else None})
-        if lineage and cov is not None:
+        if lin_open and cov is not None:
+            # (#75 r2 P2-3) the lineage history must be CONTIGUOUS from the base: a segment's lineage covered short
+            # of its cut (or a segment without it) ends the coverage; nothing after a gap is admitted
             lraw, lcov = _covered(os.path.join(d, name, "run.predlog.csv"), by.get(name, []), "run.predlog.csv")
-            lrows = _lineage_rows(lraw, upto if upto is not None else (lcov or {}).get("frame", start))
+            lc = (lcov or {}).get("frame", start)
+            reach = min(lc, upto) if upto is not None else lc
+            lrows = _lineage_rows(lraw, reach)
             if lrows is None:
                 stop = f"{name}/run.predlog.csv no longer parses"
                 break
-            events.append((name, start, lrows, (lcov or {}).get("frame", start)))
-            evid[-1].update(predlog_bytes=len(lraw), predlog_sha256=rqlib.sha256_bytes(lraw))
+            if start != lin_through:
+                lin_open = False
+            else:
+                events.append((name, start, lrows, reach))
+                lin_through = reach
+                if upto is not None and lc < upto:
+                    lin_open = False
+            evid[-1].update(predlog_bytes=len(lraw), predlog_sha256=rqlib.sha256_bytes(lraw), predlog_through=reach)
+        elif lin_open and not newest:
+            lin_open = False
         samples += rows
         if why:
             stop = f"{name}: {why}"
@@ -3067,7 +3085,7 @@ def attempt_sequence(root, wid, d, w, attempt, ledger, log_every, lineage=False)
         unsupported.append({"guild": g, "first_zero_frame": zf, "segment": e.get("segment"), "why": why})
     used = {e["segment"] for e in evid}
     return {"state": st, "obs": obs, "samples": obs["samples"], "accepted_through": accepted, "stop": stop,
-            "lineage": events,
+            "lineage": events, "lineage_through": lin_through if lineage else None, "checkpoints": ckpts,
             "evidence": {"state_sha256": st_sha, "accept_bytes": len(acc_raw or b""), "accept_sha256": acc_sha,
                          "segments": evid, "tail": tail_ev, "superseded_segments": sorted(set(segmap) - used)},
             "unsupported_ledger": unsupported}
@@ -3454,14 +3472,15 @@ def monitor_windows(samples, events, window, step, log_every, arm, lineage_throu
     return out
 
 
-def bmd_5k(samples, events, log_every):
+def bmd_5k(samples, events, log_every, lineage_through=None):
     """The 5k births-minus-deaths series (D6 rule 29): per sample interval (f - log_every, f], from the lineage
-    events (C) or the corrected main-CSV intervals (B); None where unavailable -> [(frame, value)]."""
+    events within their VERIFIED coverage (f <= lineage_through: #75 r2 P2-4, never a zero for missing events),
+    else the corrected main-CSV intervals, else None (unavailable) -> [(frame, value)]."""
     import bisect
     ef = [e[0] for e in events] if events is not None else []
     out = []
     for f, v in samples:
-        if events is not None:
+        if events is not None and lineage_through is not None and f <= lineage_through:
             ev = events[bisect.bisect_right(ef, f - log_every):bisect.bisect_right(ef, f)]
             out.append((f, sum(1 for e in ev if e[1] == "B") - sum(1 for e in ev if e[1] in ("S", "A"))))
         elif all(v.get(c) is not None for c in ("predator_births_interval", "predator_deaths_starv", "predator_deaths_age")):
@@ -3553,20 +3572,23 @@ def monitor(root, reg, window=MON_WINDOW, step=MON_STEP, reg_sha=None, windows_o
         events, lt = None, None
         if lin and seq["lineage"]:
             events = lineage_events(seq["lineage"])
-            lt = min(seq["accepted_through"], seq["lineage"][-1][3])
+            lt = min(seq["accepted_through"], seq["lineage_through"])    # (the CONTIGUOUS verified lineage coverage)
         max_age = (w.get("flags") or {}).get("predator-max-age")
         rows = monitor_windows(sm, events, window, step, L, arm, lt, max_age=max_age)
         acute = [(f, v.get("predator_pop")) for f, v in sm if f > arm and v.get("predator_pop") is not None
                  and v["predator_pop"] <= MON_ACUTE]
         ce = sched["checkpoint_every"]
         summ = monitor_windows(sm, events, ce, ce, L, arm, lt, max_age=max_age)
-        series = bmd_5k(sm, events, L)
+        series = bmd_5k(sm, events, L, lt)
         for r in summ:                                   # (the 5k births-minus-deaths range inside each 1M)
             vals = [x for f, x in series if r["from"] < f <= r["to"] and x is not None]
             r["bmd_5k"] = {"min": min(vals), "max": max(vals), "n": len(vals)} if vals else None
-        last_acc = next((e for e in reversed(seq["evidence"]["segments"]) if e.get("checkpoint_sha256")), None)
-        tails = (energy_tails(root, wid, last_acc["checkpoint_frame"], last_acc["checkpoint_sha256"])
-                 if (last_acc and d == wdir(root, wid)) else {"unavailable": "no accepted checkpoint of the current attempt"})
+        # (#75 r2 P2-5) the latest checkpoint ELIGIBLE under the line of descent, its cuts and the observation's
+        # frontier (the first terminal, a refill or a stop): never a superseded or overshoot checkpoint
+        fr_ = seq["obs"]["frontier"]
+        elig = [c for c in seq["checkpoints"] if c[0] <= fr_]
+        tails = (energy_tails(root, wid, elig[-1][0], elig[-1][1]) if (elig and d == wdir(root, wid))
+                 else {"unavailable": "no accepted checkpoint of the current attempt within its observation"})
         if windows_out:
             lines += [rqlib.canonical(dict(r, world=wid, kind="window")) for r in rows]
             lines += [rqlib.canonical({"world": wid, "kind": "bmd_5k", "frame": f, "value": x}) for f, x in series]
