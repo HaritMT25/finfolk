@@ -435,6 +435,39 @@ class TestGraph(unittest.TestCase):
         finally:
             shutil.rmtree(tmp)
 
+    def test_exclusive_publication(self):
+        """Codex #77 r2 P2-4: a graph is published EXCLUSIVELY, as one serialized transaction under the directory's
+        lock: the same bytes again are a no-op; other bytes are refused before anything is written (both files
+        checked first); a transaction interrupted after the edges completes with the same bytes; no temporary file
+        is left; another graph never replaces an existing edge file or meta."""
+        tmp = tempfile.mkdtemp()
+        try:
+            d = os.path.join(tmp, "g")
+            meta = graph.write(self.g, d)
+            files = lambda: {f: rqlib.sha256_file(os.path.join(d, f)) for f in sorted(os.listdir(d))}  # noqa: E731
+            before = files()
+            self.assertEqual(sorted(before), [".graph.lock", "graph.jsonl.gz", "graph.meta.json"])
+            self.assertEqual(graph.write(self.g, d), meta)                   # (the same bytes: a no-op)
+            other = dict(self.g, namespace="another")
+            with self.assertRaisesRegex(graph.GraphError, "never replaced"):
+                graph.write(other, d)
+            self.assertEqual(files(), before)
+            os.remove(os.path.join(d, "graph.meta.json"))                  # (interrupted after the edges)
+            graph.write(self.g, d)
+            self.assertEqual(files(), before)
+            rqlib.write_durable(os.path.join(d, "graph.meta.json"), b"{}")
+            with self.assertRaisesRegex(graph.GraphError, "graph.meta.json exists with other bytes"):
+                graph.write(self.g, d)
+            self.assertFalse([f for f in os.listdir(d) if ".tmp." in f])
+            p = os.path.join(d, "x.bin")
+            self.assertTrue(graph._publish_exclusive(p, b"a"))
+            self.assertFalse(graph._publish_exclusive(p, b"a"))
+            with self.assertRaisesRegex(graph.GraphError, "never replaced"):
+                graph._publish_exclusive(p, b"b")
+            self.assertEqual(rqlib.read_bytes(p), b"a")
+        finally:
+            shutil.rmtree(tmp)
+
     def test_mask_refuses_unbound_evidence(self):
         """Codex #77 r1 P1-1, P2-3: nothing is masked from evidence the study's registry does not bind: a block of
         ANOTHER registry with the same ids and allocation, another uuid, an unregistered attempt or another attempt

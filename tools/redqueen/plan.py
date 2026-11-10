@@ -22,12 +22,17 @@ end) gives plan/2 rows.
     archived plan (this tooling's or tools/invasion's).
 --exclusions (design /2, with --against; Annex H D6 rule 27): graph.py mask's availability mask (its
     "snapshots": world x frame -> biological / technical / pending, evidence-bound). The mask must
-    describe the REGISTERED intent (Codex #77 r1 P1-2): the design's "availability" binding names the
-    scheduled graph's edges_sha256, the registry's sha256 and its max restarts; the mask's graph, its
-    registry and its block's registry must be those, every design world covered (by uuid) with the
-    design's uuid, a registered attempt and that attempt's identity, every exclusion's snapshot uuid
-    its world's, and a biological one at or after its world's evidenced first zero (refused
-    otherwise). EVERY registered cell is still generated and checked against the pending plan (seeds,
+    describe the REGISTERED intent (Codex #77 r1 P1-2, r2): the design's "availability" binding names the
+    scheduled graph's edges_sha256, the registry's sha256, its max restarts and, with external
+    (sentinel) references, the registered reference assignment's sha256 (references_sha256, read with
+    --references); the binding is part of EVERY generated row, so --against refuses a substituted one;
+    the mask's own evidence must be consistent (graph.mask_evidence_problems, the validator graph.py and
+    sealing.py share: explicit settled dispositions, valid_before its first terminal and within its
+    frontier, an unsettled attempt all pending, biological exclusions exactly at or after the zero,
+    excluded and available frames disjoint); its graph, registry and block registry the binding's,
+    every design world covered (by uuid) by the mask with the design's uuid, a registered attempt and
+    that attempt's identity, or by a registered reference (whose cells must read the archive bytes the
+    assignment registers); refused otherwise. EVERY registered cell is still generated and checked against the pending plan (seeds,
     groups and long-subset membership from the registered intent: the surviving long pool is never
     re-randomized); the cells with an unavailable prey or predator snapshot, matched by SNAPSHOT UUID
     (an alias display label excludes as its canonical world does, P2-4), are never read and are left
@@ -601,17 +606,61 @@ def _int(x):
     return isinstance(x, int) and not isinstance(x, bool)
 
 
-def mask_binding_problems(design, m):
-    """Why a mask does not describe THIS design's registered intent (Codex #77 r1 P1-2) -> [problem] (see the module
-    doc, --exclusions)."""
+REFS_SCHEMA = "finfolk.redqueen.references/1"
+
+
+def binding_problems(b):
+    """Why a design's "availability" binding is malformed (None: well formed): graph_edges_sha256, registry_sha256,
+    max_restarts and, when the design reads external (sentinel) references, references_sha256."""
+    if not (isinstance(b, dict) and all(isinstance(b.get(k), str) and len(b[k]) == 64
+                                        for k in ("graph_edges_sha256", "registry_sha256")) and _int(b.get("max_restarts"))
+            and set(b) <= {"graph_edges_sha256", "registry_sha256", "max_restarts", "references_sha256"}
+            and (b.get("references_sha256") is None or (isinstance(b["references_sha256"], str)
+                                                         and len(b["references_sha256"]) == 64))):
+        return ("the design registers no well-formed availability binding (availability: graph_edges_sha256, "
+                "registry_sha256, max_restarts[, references_sha256])")
+    return None
+
+
+def references_index(refs_raw, b):
+    """The registered reference assignment (sealing.py's references/1; Codex #77 r2 P2-3) bound by the design's
+    binding (its bytes' sha256 = references_sha256) -> {snapshot uuid: its archive sha256} of every registered
+    reference snapshot, and the set of their uuids (design worlds the main mask does not cover)."""
+    if b.get("references_sha256") is None:
+        if refs_raw is not None:
+            raise DesignError("--references given, but the design's availability binding registers none")
+        return {}, set()
+    if refs_raw is None:
+        raise DesignError("the design's availability binding registers references: give --references (references/1)")
+    if rqlib.sha256_bytes(refs_raw) != b["references_sha256"]:
+        raise DesignError("--references is not the registered reference assignment (references_sha256)")
+    refs = json.loads(refs_raw.decode("utf-8"))
+    if refs.get("schema") != REFS_SCHEMA or not isinstance(refs.get("references"), dict):
+        raise DesignError(f"--references: not a reference assignment ({REFS_SCHEMA})")
+    snaps, uuids = {}, set()
+    for slot, e in sorted(refs["references"].items()):
+        if not (isinstance(e, dict) and isinstance(e.get("uuid"), str) and _int(e.get("frame"))
+                and isinstance(e.get("sha256"), str) and len(e["sha256"]) == 64):
+            raise DesignError(f"--references {slot}: needs its uuid, frame and archive sha256")
+        snaps[snapshot_uuid(e["uuid"], e["frame"])] = e["sha256"]
+        uuids.add(e["uuid"])
+    return snaps, uuids
+
+
+def mask_binding_problems(design, m, ref_uuids=frozenset()):
+    """Why a mask does not describe THIS design's registered intent (Codex #77 r1 P1-2, r2 P1-1 / P1-2 / P2-3) ->
+    [problem] (see the module doc, --exclusions): the binding well formed (and, through the generated rows, the
+    pending plan's: --against), the mask's own evidence consistent (graph.mask_evidence_problems, the validator
+    graph.py and sealing.py share), the mask's graph / registry / block the binding's, every design world covered
+    by the mask or a registered reference (ref_uuids), uuids, registered attempts and their identities."""
+    import graph as graphlib                   # (the shared mask validator)
     if m.get("schema") != MASK_SCHEMA or not isinstance(m.get("snapshots"), dict) or not isinstance(m.get("worlds"), dict):
         return [f"not an availability mask ({MASK_SCHEMA})"]
     b = design.get("availability")
-    if not (isinstance(b, dict) and isinstance(b.get("graph_edges_sha256"), str)
-            and isinstance(b.get("registry_sha256"), str) and _int(b.get("max_restarts"))):
-        return ["the design registers no availability binding (availability: graph_edges_sha256, registry_sha256, "
-                "max_restarts): a mask cannot be checked against its intent"]
-    probs = []
+    why = binding_problems(b)
+    if why:
+        return [why + ": a mask cannot be checked against its intent"]
+    probs = list(graphlib.mask_evidence_problems(m))
     if (m.get("graph") or {}).get("edges_sha256") != b["graph_edges_sha256"]:
         probs.append("the mask was made for another graph than the registered one (edges_sha256)")
     reg, blk = m.get("registry") or {}, m.get("block") or {}
@@ -633,33 +682,21 @@ def mask_binding_problems(design, m):
         elif w.get("attempt_uuid") != attempt_uuid(w.get("uuid"), k):
             probs.append(f"{wn}: its attempt identity is not attempt {k}'s")
         covered.add(w.get("uuid"))
-    miss = sorted(wn for wn, w in dw.items() if w.get("uuid") not in covered)
+    if covered & set(ref_uuids):
+        probs.append("a registered reference's uuid is also a main-study world of the mask")
+    miss = sorted(wn for wn, w in dw.items() if w.get("uuid") not in covered and w.get("uuid") not in ref_uuids)
     if miss:
-        probs.append(f"design worlds the mask does not cover (by uuid): {miss[:5]}")
-    for key, s in sorted(m["snapshots"].items()):
-        w = mw.get(s.get("world")) if isinstance(s, dict) else None
-        if w is None or s.get("status") not in EXCLUSION or not _int(s.get("frame")):
-            probs.append(f"snapshot {key}: malformed, or not a mask world's")
-            continue
-        if (key != f"{s['world']}:{s['frame']}" or (s.get("uuid"), s.get("attempt")) != (w.get("uuid"), w.get("attempt"))
-                or s.get("snapshot") != snapshot_uuid(w.get("uuid"), s["frame"])):
-            probs.append(f"snapshot {key}: its identity (uuid, attempt, snapshot uuid) is not its world's")
-        if s["status"] == "biological":
-            vb = w.get("valid_before")
-            if not _int(vb) or s["frame"] < vb or s.get("valid_before") != vb:
-                probs.append(f"snapshot {key}: a biological exclusion without its world's evidenced first zero at or "
-                             "before it")
-        elif not isinstance(s.get("why"), str) or not s["why"]:
-            probs.append(f"snapshot {key}: an exclusion without its cause")
+        probs.append(f"design worlds neither the mask nor the registered references cover (by uuid): {miss[:5]}")
     return probs
 
 
-def mask_index(m):
+def mask_index(m, ref_snaps=None):
     """A (bound) mask -> ({snapshot uuid: its exclusion}, {snapshot uuid: the verified archive sha256 of an
-    available snapshot})."""
+    available snapshot}, the registered references' snapshots included: ref_snaps, references_index's)."""
     out = {s["snapshot"]: s for s in m["snapshots"].values()}
     avail = {snapshot_uuid(w["uuid"], int(f)): sha for w in m["worlds"].values()
              for f, sha in (w.get("available_sha256") or {}).items()}
+    avail.update(ref_snaps or {})
     return out, avail
 
 
@@ -900,7 +937,10 @@ def expand_v2(design, pending=False, exclusions=None, excluded_out=None):
                 "groups": groups,
                 "expected": {"checkpoint_steps": list(range(s["checkpoint_every"],
                                                             (s["long_steps"] if is_long else s["short_steps"]) + 1,
-                                                            s["checkpoint_every"]))}})
+                                                            s["checkpoint_every"]))},
+                # (Codex #77 r2 P1-1: the registered availability binding is part of every registered row, so
+                #  --against compares it: a substituted registry / graph / restart allowance is refused)
+                **({"availability": design["availability"]} if design.get("availability") is not None else {})})
     assign_seeds(rows, ns, SEED_KINDS_V2, reject_collisions=True)
     for row in rows:
         for role in ("prey", "predators", "template", "ages"):
@@ -937,6 +977,9 @@ def main(argv=None):
                     help="(design /2, with --against and --reconciliation) graph.py mask's availability mask: the "
                          "registered cells it makes unavailable are left out of the executable plan, with a receipt")
     ap.add_argument("--reconciliation", metavar="OUT.json", help="the reconciliation receipt (with --exclusions)")
+    ap.add_argument("--references", metavar="REFS.json",
+                    help="(with --exclusions) the registered reference assignment (references/1) the design's binding "
+                         "names (references_sha256): its sentinel snapshots and their archive sha256")
     a = ap.parse_args(argv)
     if a.pending and a.against:
         ap.error("--pending and --against exclude each other")
@@ -950,10 +993,15 @@ def main(argv=None):
             m = json.loads(mask_raw.decode("utf-8"))
             if design.get("schema") != DESIGN_SCHEMA_V2:
                 raise DesignError("--exclusions needs a design /2")
-            probs = mask_binding_problems(design, m)       # (Codex #77 r1 P1-2: BEFORE any exclusion)
+            why = binding_problems(design.get("availability"))
+            if why:
+                raise DesignError(why)
+            ref_snaps, ref_uuids = references_index(rqlib.read_bytes(a.references) if a.references else None,
+                                                    design["availability"])
+            probs = mask_binding_problems(design, m, ref_uuids)   # (Codex #77 r1 P1-2, r2: BEFORE any exclusion)
             if probs:
                 raise DesignError(f"{a.exclusions} does not describe the registered intent: " + "; ".join(probs[:5]))
-            snaps, avail = mask_index(m)
+            snaps, avail = mask_index(m, ref_snaps)
         if design.get("schema") == DESIGN_SCHEMA_V2:
             rows, warnings, long_man = expand_v2(design, pending=a.pending, exclusions=snaps, excluded_out=excluded)
             if avail is not None:

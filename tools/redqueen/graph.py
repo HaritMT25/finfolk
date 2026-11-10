@@ -596,9 +596,33 @@ def check_quotas(g):
     return probs
 
 
+def _publish_exclusive(p, data):
+    """Publish data at p EXCLUSIVELY: a temporary file, fsync'd, hard-linked to p (os.link fails if any file is
+    there: never a replacement), the temporary removed, the directory fsync'd -> True if this call published."""
+    tmp = f"{p}.tmp.{os.getpid()}.{uuid.uuid4().hex[:16]}"
+    with open(tmp, "wb") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    try:
+        os.link(tmp, p)
+    except FileExistsError:
+        if rqlib.read_bytes(p) != data:
+            raise GraphError(f"{p} exists with other bytes: a published graph is never replaced (write elsewhere)")
+        return False
+    finally:
+        os.unlink(tmp)
+    rqlib.fsync_dir(os.path.dirname(p))
+    return True
+
+
 def write(g, d):
-    """Write a graph into d. A published graph is IMMUTABLE (Codex #77 r1 P2-8): existing files with other bytes
-    are never replaced (GraphError, nothing written); the same bytes again are a no-op."""
+    """Write a graph into d. A published graph is IMMUTABLE (Codex #77 r1 P2-8, r2 P2-4): ONE serialized transaction
+    under d's exclusive lock (d/.graph.lock): both files are checked first (existing other bytes: GraphError,
+    nothing written), then published EXCLUSIVELY (_publish_exclusive: a hard link never replaces a file), the
+    edges before the meta (load reads the meta first); the same bytes again are a no-op. Concurrent writers of
+    other bytes cannot interleave or overwrite one another."""
+    import fcntl
     meta = {k: v for k, v in g.items() if k != "edges"}
     meta["edges"] = len(g["edges"])
     buf = "".join(json.dumps({"prey": e[0], "pred": e[1], "family": e[2], "role": e[3], "horizon": e[4]},
@@ -606,14 +630,19 @@ def write(g, d):
     raw = gzip.compress(buf, mtime=0)
     meta["edges_sha256"] = rqlib.sha256_bytes(buf)
     meta["tool_sha256"] = rqlib.sha256_file(os.path.abspath(__file__))
-    files = {"graph.jsonl.gz": raw, "graph.meta.json": rqlib.canonical(meta)}
-    for name, data in files.items():
-        p = os.path.join(d, name)
-        if os.path.exists(p) and rqlib.read_bytes(p) != data:
-            raise GraphError(f"{p} exists with other bytes: a published graph is never replaced (write elsewhere)")
+    files = (("graph.jsonl.gz", raw), ("graph.meta.json", rqlib.canonical(meta)))     # (the edges first)
     os.makedirs(d, exist_ok=True)
-    for name, data in files.items():
-        rqlib.write_durable(os.path.join(d, name), data)
+    with open(os.path.join(d, ".graph.lock"), "a") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        try:
+            for name, data in files:
+                p = os.path.join(d, name)
+                if os.path.exists(p) and rqlib.read_bytes(p) != data:
+                    raise GraphError(f"{p} exists with other bytes: a published graph is never replaced (write elsewhere)")
+            for name, data in files:
+                _publish_exclusive(os.path.join(d, name), data)
+        finally:
+            fcntl.flock(lk, fcntl.LOCK_UN)
     return meta
 
 
@@ -881,14 +910,84 @@ def mask(g, block, registry, registry_sha256, block_sha256=None, rederived=False
                      "failure never authorizes replacement edges"}
 
 
+def mask_evidence_problems(m):
+    """Why a mask's worlds and snapshots are not consistent with ITS OWN EVIDENCE -> [problem]: THE ONE MASK VALIDATOR
+    graph.py (executable), plan.py (--exclusions) and sealing.py (availability) share (Codex #77 r2 P1-2):
+      per world an explicit burn-in disposition whose "decided" is its own (DISPOSITIONS); valid_before is its
+        first terminal boundary's frame (both or neither), at or before its evidence's frontier;
+      per snapshot its world's identity (uuid, attempt, snapshot uuid) and a cause;
+      the excluded and the available frames of a world DISJOINT;
+      an UNSETTLED attempt: every listed snapshot pending, none available (nothing about it is decided);
+      a SETTLED attempt: every listed frame at or after valid_before biological (with that valid_before), no
+        biological one before it; no available frame at or after valid_before, at or after a refill, or past the
+        frontier (F1, the founder, aside)."""
+    if m.get("schema") != MASK_SCHEMA:
+        return [f"mask schema {m.get('schema')!r}, expected {MASK_SCHEMA}"]
+    W, S = m.get("worlds"), m.get("snapshots")
+    if not isinstance(W, dict) or not isinstance(S, dict):
+        return ["the mask has no worlds / snapshots"]
+    probs, by = [], defaultdict(dict)
+    for key, s in sorted(S.items()):
+        if (not isinstance(s, dict) or s.get("world") not in W or not _int(s.get("frame")) or s.get("status") not in EXCLUSION
+                or key != f"{s['world']}:{s['frame']}"):
+            probs.append(f"snapshot {key}: malformed, or not a mask world's")
+            continue
+        w = W[s["world"]]
+        if ((s.get("uuid"), s.get("attempt")) != (w.get("uuid"), w.get("attempt"))
+                or s.get("snapshot") != snapshot_uuid(w.get("uuid"), s["frame"])):
+            probs.append(f"snapshot {key}: its identity (uuid, attempt, snapshot uuid) is not its world's")
+        if not isinstance(s.get("why"), str) or not s["why"]:
+            probs.append(f"snapshot {key}: an exclusion without its cause")
+        by[s["world"]][s["frame"]] = s
+    for wid, w in sorted(W.items()):
+        b = w.get("burn_in") if isinstance(w, dict) else None
+        if not isinstance(b, dict) or b.get("disposition") not in DISPOSITIONS or b.get("decided") is not DISPOSITIONS[b["disposition"]]:
+            probs.append(f"{wid}: no explicit, self-consistent burn-in disposition")
+            continue
+        ft, vb, fr = w.get("first_terminal"), w.get("valid_before"), w.get("frontier")
+        if not _int(fr):
+            probs.append(f"{wid}: no evidence frontier")
+            continue
+        if (ft is None) != (vb is None) or (ft is not None and (not isinstance(ft, dict) or ft.get("frame") != vb)):
+            probs.append(f"{wid}: valid_before is not its evidenced first terminal boundary's frame")
+            continue
+        if vb is not None and (not _int(vb) or vb > fr):
+            probs.append(f"{wid}: its first terminal boundary lies past its evidence's frontier")
+        av = w.get("available_sha256") or {}
+        if not isinstance(av, dict) or not all(str(f).isdigit() and _sha(x) for f, x in av.items()):
+            probs.append(f"{wid}: malformed available snapshots")
+            continue
+        avf, ex = {int(f) for f in av}, by.get(wid, {})
+        if avf & set(ex):
+            probs.append(f"{wid}: frames both excluded and available ({sorted(avf & set(ex))[:3]})")
+        if not b["decided"]:
+            if avf:
+                probs.append(f"{wid}: an unsettled attempt ({b['disposition']}) with available snapshots")
+            if any(s["status"] != "pending" for s in ex.values()):
+                probs.append(f"{wid}: an unsettled attempt's exclusions are not all pending (nothing about it is decided)")
+            continue
+        rf = (w.get("refill") or {}).get("frame") if isinstance(w.get("refill"), dict) else None
+        for f, s in sorted(ex.items()):
+            if s["status"] == "biological" and (vb is None or f < vb or s.get("valid_before") != vb):
+                probs.append(f"{wid}:{f}: a biological exclusion without its world's evidenced first terminal at or "
+                             "before it")
+            elif vb is not None and f >= vb and s["status"] != "biological":
+                probs.append(f"{wid}:{f}: at or after the evidenced first terminal, but {s['status']}")
+        for f in sorted(avf):
+            if (vb is not None and f >= vb) or (rf is not None and f >= rf) or (f != 1 and f > fr):
+                probs.append(f"{wid}:{f}: available at or after its first terminal / a refill, or past its frontier")
+    return probs
+
+
 def mask_problems(g, m):
     """Why a mask does not describe this graph consistently (Codex #77 r1 P2-5) -> [problem]: its schema, graph
     digest and count, registry (the graph's, if recorded), every snapshot entry well-formed (a graph world, its
-    frame its time's, a cause, its snapshot uuid), and the edge exclusions, totals and family x role counts
-    exactly the ones its snapshots give (recomputed: no missing, extra, duplicate or out-of-range index)."""
+    frame its time's, a cause, its snapshot uuid), its evidence consistent (mask_evidence_problems), and the edge
+    exclusions, totals and family x role counts exactly the ones its snapshots give (recomputed: no missing,
+    extra, duplicate or out-of-range index)."""
     if m.get("schema") != MASK_SCHEMA:
         return [f"mask schema {m.get('schema')!r}, expected {MASK_SCHEMA}"]
-    probs = []
+    probs = list(mask_evidence_problems(m))
     mg = m.get("graph") or {}
     if (mg.get("edges_sha256"), mg.get("edges")) != (g["edges_sha256"], len(g["edges"])):
         return ["the mask was made for another graph (its edges_sha256 or edge count differs)"]
