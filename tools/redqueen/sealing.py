@@ -4,7 +4,8 @@ One split manifest, role-based evaluation filters, plain prediction hashes and a
 record. There is no access-control service, no sealed directory tree and no unlock manager.
 
     sealing.py manifest --graph-meta graph.meta.json --worlds config/worlds.json [--forks config/forks.json]
-                        [--references config/references.json] --out STUDY/config/splits.json
+                        [--references config/references.json] --out STUDY/config/splits.json [--layout 64]
+    sealing.py availability --study STUDY --mask mask.json [--reconciliation RECEIPT.json]
     sealing.py check    --manifest config/splits.json --records RECORDS.jsonl
     sealing.py filter   --manifest config/splits.json --records RECORDS.jsonl
                         --stage fit|nuisance|validation|test|audit|diagnostic --out OUT.jsonl
@@ -17,7 +18,9 @@ record. There is no access-control service, no sealed directory tree and no unlo
 THE SPLIT MANIFEST (config/splits.json, schema finfolk.redqueen.splits/2; deterministic, published
 once, never replaced). Built from graph.py's graph (its meta and edges: their sha256), the histories'
 registry (every world's UUID: endpoints are bound to it) and, when given, the fork registry (every
-branch's root world and UUID). It holds every world's split (C 20/6/6, A and B 5/1/2: training /
+branch's root world and UUID). It holds every world's split (graph.py's: C 20/6/6, A and B 10/2/4 in
+the registered 64-world layout, Annex H D7 rules 34 and 40; "layout" records whether the graph's
+worlds are that layout, and --layout 64, the production manifest, refuses any other: training /
 validation / test), the training C worlds' snapshot holdouts (t in M -> validation | test), the fork
 and intensive sets, the REGISTERED SUPPORT EXCEPTIONS: the graph's support pairs (endpoint keys
 "Q:<world>:<t>", "P:<world>:<t>", references "RQ:<k>" / "RP:<k>"), and the REGISTERED REFERENCE
@@ -28,6 +31,13 @@ that uuid and frame, "archive", "sha256"}); the sentinel namespace differs from 
 and no reference's uuid or snapshot UUID may be any study identity: a main world's, a fork branch's or
 its root's, at any snapshot frame (all identities are loaded before the references are checked);
 without an assignment no endpoint is a reference.
+
+AVAILABILITY (availability; Annex H D6 rule 27). An availability mask (graph.py mask: the unavailable
+snapshots and every excluded pair, with causes) and optionally a plan reconciliation receipt (plan.py
+--reconciliation) are bound to the published manifest: the mask must be of the manifest's graph (its
+edges_sha256), the receipt of that mask (its bytes' sha256); the receipt registration/availability/
+<mask sha256>.json is published exclusively. Neither changes a role: the manifest's endpoint roles
+apply unchanged to every executable and excluded target.
 
 ENDPOINTS. A record's endpoint is {"world", "frame"} and, as the plan carries them, "uuid" (its
 world's) and/or "snapshot" (uuid5(URL, "finfolk:snapshot:<world uuid>:<frame>")); or a REFERENCE
@@ -237,9 +247,32 @@ def load_references(path, uuids, branches=None, main_namespace=None):
     return out
 
 
-def manifest(meta_path, worlds_path, forks_path=None, refs_path=None):
+REGISTERED_LAYOUT = {"C": 4, "A": 2, "B": 2}       # per block, eight blocks (Annex H D7 rule 34)
+AVAIL_RECEIPT_SCHEMA = "finfolk.redqueen.availabilityreceipt/1"
+MASK_SCHEMA = "finfolk.redqueen.graphmask/1"
+
+
+def layout_of(worlds):
+    """The graph's world layout and whether it is the registered one (D7 rule 34: 8 blocks of 4C + 2A + 2B)."""
+    per = {}
+    for w in worlds:
+        c = per.setdefault(str(w.get("block")), {"C": 0, "A": 0, "B": 0})
+        c[w.get("treatment")] = c.get(w.get("treatment"), 0) + 1
+    probs = [] if sorted(per) == [str(b) for b in range(1, 9)] else [f"blocks {sorted(per)}, not 1..8"]
+    probs += [f"block {b}: {c}" for b, c in sorted(per.items()) if c != REGISTERED_LAYOUT]
+    tot = {t: sum(c.get(t, 0) for c in per.values()) for t in ("C", "A", "B")}
+    return {"worlds": len(worlds), "per_treatment": tot, "registered_64": not probs, "problems": probs[:8]}
+
+
+def manifest(meta_path, worlds_path, forks_path=None, refs_path=None, require_layout=False):
+    """The split manifest (see the module doc). Its "layout" records whether the graph's worlds are the
+    registered 64-world layout; require_layout (--layout 64, the production manifest) refuses any other."""
     import gzip
     m = rqlib.read_json(meta_path)
+    lay = layout_of(m.get("worlds") or [])
+    if require_layout and not lay["registered_64"]:
+        raise SealError("the graph's worlds are not the registered 64-world layout (Annex H D7 rule 34): "
+                        + "; ".join(lay["problems"][:4]))
     edges_path = os.path.join(os.path.dirname(os.path.abspath(meta_path)), "graph.jsonl.gz")
     split = {w: SPLIT[s] for w, s in sorted(m["split"].items())}
     hold = {}
@@ -264,7 +297,7 @@ def manifest(meta_path, worlds_path, forks_path=None, refs_path=None):
            "worlds_registry_sha256": rqlib.sha256_file(worlds_path),
            "worlds": split, "uuids": uuids, "snapshot_holdouts": hold, "fork": sorted(m.get("fork", [])),
            "intensive": sorted(m.get("intensive", [])), "support_exceptions": sorted(support), "branches": {},
-           "references": {}}
+           "references": {}, "layout": lay}
     if forks_path:                           # (every study identity first: the references are checked against all)
         fk = rqlib.read_json(forks_path)
         for b in fk["worlds"]:
@@ -283,6 +316,48 @@ def manifest(meta_path, worlds_path, forks_path=None, refs_path=None):
             for k in pair:
                 if REF_SLOT.match(k) and k not in out["references"]:
                     raise SealError(f"support pair {pair}: reference {k} is not registered")
+    return out
+
+
+def availability_receipt(study, mask_path, recon_path=None):
+    """Bind an availability mask (graph.py mask) and optionally a plan reconciliation receipt (plan.py
+    --reconciliation) to the published split manifest (Annex H D6 rule 27): the mask must be of the
+    manifest's graph (its edges_sha256), the reconciliation of that mask (its bytes' sha256). Published
+    EXCLUSIVELY at registration/availability/<mask sha256>.json under the registration lock (the same
+    bytes again accepted, other bytes refused). Neither changes a role: the manifest's endpoint roles
+    apply unchanged to every executable and excluded target. The receipt's name is <mask sha256>.json, or
+    <mask sha256>.<reconciliation sha256>.json with a reconciliation. -> the receipt."""
+    study = os.path.abspath(study)
+    mp = os.path.join(study, "config", "splits.json")
+    m_raw = rqlib.read_bytes(mp)
+    man = json.loads(m_raw.decode("utf-8"))
+    if man.get("schema") != SPLITS_SCHEMA:
+        raise SealError(f"{mp}: not a split manifest")
+    k_raw = rqlib.read_bytes(mask_path)
+    mk = json.loads(k_raw.decode("utf-8"))
+    if mk.get("schema") != MASK_SCHEMA:
+        raise SealError(f"{mask_path}: not an availability mask ({MASK_SCHEMA})")
+    want = (man.get("graph") or {}).get("graph_edges_sha256")
+    if (mk.get("graph") or {}).get("edges_sha256") != want:
+        raise SealError(f"the mask is of another graph (edges {str((mk.get('graph') or {}).get('edges_sha256'))[:12]}, "
+                        f"the manifest's {str(want)[:12]})")
+    ksha = rqlib.sha256_bytes(k_raw)
+    rec = None
+    if recon_path:
+        r_raw = rqlib.read_bytes(recon_path)
+        rc = json.loads(r_raw.decode("utf-8"))
+        if (rc.get("mask") or {}).get("sha256") != ksha:
+            raise SealError("the reconciliation receipt was made with another mask")
+        rec = {"sha256": rqlib.sha256_bytes(r_raw), "plan_sha256": rc.get("plan_sha256"),
+               "pending_plan_sha256": (rc.get("pending_plan") or {}).get("sha256"),
+               "scheduled": rc.get("scheduled"), "executable": rc.get("executable"), "excluded": rc.get("excluded")}
+    out = {"schema": AVAIL_RECEIPT_SCHEMA, "split_manifest_sha256": rqlib.sha256_bytes(m_raw),
+           "mask": {"sha256": ksha, "graph_edges_sha256": want, "block": mk.get("block"), "edges": mk.get("edges")},
+           "reconciliation": rec,
+           "roles": "unchanged: the split manifest's endpoint roles apply to every executable and excluded target"}
+    name = f"{ksha}.{rec['sha256']}.json" if rec else f"{ksha}.json"
+    with transaction(study):
+        publish(os.path.join(reg_dir(study), "availability", name), rqlib.canonical(out), study)
     return out
 
 
@@ -673,6 +748,12 @@ def main(argv=None):
     s.add_argument("--forks")
     s.add_argument("--references")
     s.add_argument("--out", required=True, help="STUDY/config/splits.json (published under STUDY's lock)")
+    s.add_argument("--layout", choices=("64",), help="refuse a graph that is not the registered 64-world layout "
+                                                    "(the production manifest; Annex H D7 rule 34)")
+    s = sub.add_parser("availability", help="bind an availability mask (and a plan reconciliation) to the manifest")
+    s.add_argument("--study", required=True)
+    s.add_argument("--mask", required=True)
+    s.add_argument("--reconciliation")
     for name in ("check", "filter"):
         s = sub.add_parser(name)
         s.add_argument("--manifest", required=True)
@@ -702,7 +783,7 @@ def main(argv=None):
     a = ap.parse_args(argv)
     try:
         if a.cmd == "manifest":
-            data = rqlib.canonical(manifest(a.graph_meta, a.worlds, a.forks, a.references))
+            data = rqlib.canonical(manifest(a.graph_meta, a.worlds, a.forks, a.references, require_layout=bool(a.layout)))
             out = os.path.abspath(a.out)
             if os.path.basename(out) != "splits.json" or os.path.basename(os.path.dirname(out)) != "config":
                 raise SealError("--out: the split manifest lives at STUDY/config/splits.json")
@@ -723,6 +804,11 @@ def main(argv=None):
             print(f"{a.stage}: {len(keep)} of {len(rows)} records", file=sys.stderr)
             return 0
         study = os.path.abspath(a.study)
+        if a.cmd == "availability":
+            rec = availability_receipt(study, a.mask, a.reconciliation)
+            print(f"availability receipt for mask {rec['mask']['sha256'][:16]} (registration/availability/): executable "
+                  f"{(rec['mask']['edges'] or {}).get('executable')} of {(rec['mask']['edges'] or {}).get('scheduled')}")
+            return 0
         if a.cmd == "commit":
             rec = commit(study, a.stage, a.predictions, a.eval_script)
             print(f"{rec['name']} = {rec['sha256']} ({rec['targets']} targets)")

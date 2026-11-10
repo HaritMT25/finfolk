@@ -517,12 +517,29 @@ class TestNumerics(unittest.TestCase):
         self.assertAlmostEqual(P[key + "persistence"]["reducible"]["mean"], float(delta @ delta), delta=0.01)
         o0 = per[0]["metrics"]["drift"]
         self.assertEqual((o0["events"]["extinction"], o0["reseeds"], o0["unavailable"]), (1, 2, 1))
+        # (PR-D, Annex H D6 rule 27 §10.6) explicit denominators and conditioning; conditioned origins are
+        # pooled apart from complete ones, never together
+        self.assertEqual((o0["denominators"], o0["conditioning"], o0["reseeds_registered"]),
+                         ({"registered": 5, "observable": 4, "live": 3, "event": 1}, "survivor-conditioned", 4))
+        self.assertEqual(per[11]["metrics"]["drift"]["conditioning"], "observable-only")     # (k = 11: a gap only)
+        self.assertEqual(per[1]["metrics"]["drift"]["conditioning"], "complete")
+        sc = P[key + "drift/survivor-conditioned"]
+        n_sc = sum(1 for k in range(360) if k % 7 == 0)
+        self.assertEqual((sc["origins"], sc["conditioning"], d0["conditioning"]), (n_sc, "survivor-conditioned", "complete"))
+        self.assertEqual(d0["origins"] + sc["origins"] + P[key + "drift/observable-only"]["origins"], 360)
+        self.assertGreaterEqual(d0["reducible"]["roots"], 2)
         one = fc.origin_metrics({"z": [0.0, 0.0], "cov": Sc.tolist(), "cross": {}},
                                 [{"kind": "reseed", "row": {"z": np.array([0.3, 0.4]), "R": meas_R, "g": None,
                                                             "events": {}, "unavailable": None}}], {}, [],
                                 lambda j: np.random.default_rng(j), 10)
         self.assertAlmostEqual(one["mse"], 0.25 - 0.02, places=12)
         self.assertIsNone(one["v_fork"])
+        self.assertIn("needs two", one["v_fork_unavailable"])
+        # a pool of one root world: the point, never an interval
+        P1 = fc.pool(ctx, [dict(r, world="w00") for r in per[:20]])
+        p1 = P1[key + "drift"]["mse"]
+        self.assertEqual((p1["roots"], p1["ci95"]), (1, None))
+        self.assertIn("two contributing root worlds", p1["ci95_unavailable"])
         es = {n: np.mean([r["metrics"][n]["energy"] for r in per]) for n in ("drift", "persistence")}
         self.assertLess(es["drift"], es["persistence"])
         self.assertAlmostEqual(d0["cover90"]["mean"], 0.9, delta=0.04)
@@ -678,7 +695,11 @@ class TestPipeline(unittest.TestCase):
         s0 = "test/test/test/test/intersection/fork/H10/lss"                            # (S0, S1: held out throughout)
         self.assertIn(v0, keys)
         self.assertIn(s0, keys)
-        self.assertEqual((ev["pooled"][v0]["worlds"], ev["pooled"][s0]["worlds"]), (1, 2))
+        # (PR-D, D6 rule 27 §10.6: S1's origin with an extinct future is survivor-conditioned, pooled apart)
+        self.assertEqual((ev["pooled"][v0]["worlds"], ev["pooled"][s0]["worlds"]), (1, 1))
+        sc0 = ev["pooled"][s0 + "/survivor-conditioned"]
+        self.assertEqual((sc0["worlds"], sc0["conditioning"], ev["pooled"][s0]["conditioning"]),
+                         (1, "survivor-conditioned", "complete"))
         self.assertIn("test/training/training/test/forward_time/fork/H10/lss", keys)
         for v in ev["pooled"].values():
             self.assertIn(v["category"], fc.CATEGORIES)

@@ -10,6 +10,7 @@
     forks.py status --study STUDY
     forks.py stitch --study STUDY --branch ID [--partial]
     forks.py profile-design --study STUDY --references refs.json --out fork_profiles.json [--with-pilot-10m]
+    forks.py outcomes --study STUDY --out fork_outcomes.json
 
 THE REGISTRY (register: STUDY/config/forks.json, schema finfolk.redqueen.forks/1; deterministic, never
 replaced by other bytes). Bound to the histories' registry (config/worlds.json, its sha256) and to the
@@ -43,7 +44,17 @@ against the 8 prey references) plus its prey's predator-free continuation. Famil
 includes the fork roots' original continuations at the primary horizon, never measured twice),
 pilot_branch / pilot_original (+1M, +4M; +10M with --with-pilot-10m). Roles: a branch's or world's
 split (training / validation / test); the pilot's "diagnostic". No (prey, predators) pair is listed
-twice (a repeat is measured once, its first family kept; "deduplicated" counts them).
+twice (a repeat is measured once, its first family kept; "deduplicated" counts them). AVAILABILITY
+(Annex H D6 rule 27, §§10.1-10.4): a scheduled state that will never exist is OMITTED EXPLICITLY, never
+emitted as a path to an absent future: a branch whose origin is unavailable or which was invalidated,
+or a branch or history whose supported first zero (either guild; the branches' and the histories' own
+ledgers) is at or before the target; each omission ("omitted": family, state, its 17 pairs, why) is
+recorded without replacement. A state not reached yet is not absent.
+
+OUTCOMES (outcomes, read-only): every branch's own absorbing ecological outcome from its origin,
+independent of any profile's availability: its origin status, first zeros, verified acceptance
+frontier, and at +1M / +4M / +10M alive, predator_extinct, prey_terminal (prey first: the predators'
+later status unobserved), not_yet_observed, technical or unavailable_origin, counted per kind x split.
 """
 from __future__ import annotations
 
@@ -443,6 +454,37 @@ def merge_role(a, b):
     return a if RANK[a] >= RANK[b] else b
 
 
+OUTCOMES_SCHEMA = "finfolk.redqueen.forkoutcomes/1"
+
+
+def _ledgers(study):
+    """The histories' and the branches' availability ledgers, read once."""
+    return (worlds.read_jsonl(os.path.join(study, "availability.jsonl")),
+            worlds.read_jsonl(os.path.join(froot(study), "availability.jsonl")))
+
+
+def absent(study, led_h, led_f, branches, wid, frame):
+    """Why the joint state (wid, frame) will never exist (Annex H D6 rule 27, §§10.1-10.4: profiles stop at the
+    biological boundary; an unavailable origin is recorded without replacement), else None: a branch whose
+    origin is unavailable or which was invalidated; a branch or history whose supported first zero (either
+    guild) is at or before the frame. A state merely not reached yet is NOT absent (it is pending)."""
+    fr = froot(study)
+    if wid in branches:
+        st = worlds.read_state(fr, wid)
+        if st["status"] in ("unavailable", "invalidated"):
+            return f"the branch is {st['status']} ({st.get('end_reason')}): no state of it exists"
+        why = zero_before(study, branches[wid])        # (before a launch has recorded it unavailable)
+        if why:
+            return f"an unavailable origin: {why}"
+        z = worlds.first_zeros(led_f, wid, fr)
+    else:
+        z = worlds.first_zeros(led_h, wid, study)
+    early = sorted((f, g) for g, f in z.items() if f <= frame)
+    if early:
+        return f"biological: {wid}'s {early[0][1]} reached 0 at frame {early[0][0]}, at or before the target {frame}"
+    return None
+
+
 def profile_design(study, refs, with_pilot_10m=False):
     """The common-profile measurements as a design/2 fragment (worlds, times, edges): see the module doc.
     refs: {"prey": [8 entries], "predators": [8 entries]}, an entry {"world", "frame"} for a main
@@ -463,6 +505,8 @@ def profile_design(study, refs, with_pilot_10m=False):
     pilot_ids = {b["id"] for b in reg["worlds"] if b["kind"] == "pilot"} | (
         {reg["pilot"]["world"]} if reg["pilot"].get("world") else set())    # (diagnostic in pilot families only)
     wmap, times, pairs, dup, external = {}, {}, {}, [0], set()
+    led_h, led_f = _ledgers(study)
+    omitted = []
 
     def world(wid, uid, ad):
         w = {"uuid": uid, "pattern": os.path.join(ad, "end.{frame}.json"), "paths": {"F1": os.path.join(ad, "F1.json")}}
@@ -527,7 +571,13 @@ def profile_design(study, refs, with_pilot_10m=False):
         pairs[key] = {"family": family, "role": role, "prey": {"world": prey[0], "time": prey[1]},
                       "predators": None if pred is None else {"world": pred[0], "time": pred[1]}}
 
+    bdict = {b["id"]: b for b in reg["worlds"]}
+
     def state(family, wid, frame):
+        why = absent(study, led_h, led_f, bdict, wid, frame)
+        if why:                                # (an explicit omission: never a path to an absent state)
+            omitted.append({"family": family, "state": {"world": wid, "frame": int(frame)}, "pairs": 17, "why": why})
+            return
         lab = t(frame)
         for pw, pt in rq:                      # its prey against the 8 predator references
             add(family, (wid, lab), (pw, pt))
@@ -563,7 +613,58 @@ def profile_design(study, refs, with_pilot_10m=False):
             "worlds": wmap, "times": dict(sorted(times.items(), key=lambda kv: kv[1])), "edges": edges,
             "counts": {f: sum(1 for e in edges if e["family"] == f) for f in sorted({e["family"] for e in edges})},
             "roles": {r: sum(1 for e in edges if e["role"] == r) for r in sorted({e["role"] for e in edges})},
-            "deduplicated": dup[0]}
+            "deduplicated": dup[0],
+            # (D6 rule 27: the scheduled states that will never exist, each with its cause; not replaced)
+            "omitted": omitted,
+            "omitted_counts": {f: sum(1 for o in omitted if o["family"] == f) for f in sorted({o["family"] for o in omitted})},
+            "ledgers": {"histories_records": len(led_h), "branches_records": len(led_f)}}
+
+
+def outcomes(study, horizons=None):
+    """THE BRANCHES' ECOLOGICAL OUTCOMES (Annex H D6 rule 27, §§10.1-10.4), independent of any profile's
+    availability: every registered branch, its origin status, its supported first zero of each guild (the
+    branches' own ledger), its verified acceptance frontier, and at each horizon (origin + 1M, 4M, 10M) alive /
+    predator_extinct / prey_terminal (the prey first: later predator status unobserved) / not_yet_observed /
+    technical / unavailable_origin; with counts per kind x split x horizon. Read-only."""
+    reg = runtime_registry(study)
+    fr = froot(study)
+    _, led_f = _ledgers(study)
+    hz = list(horizons or (SHORT + (reg["horizon"],)))
+    rows, counts = {}, {}
+    for b in reg["worlds"]:
+        bid, o = b["id"], b["origin"]["frame"]
+        st = worlds.read_state(fr, bid)
+        z = worlds.first_zeros(led_f, bid, fr)
+        good = worlds.verified_records(fr, bid, st, b["treatment"], o) if st["segments"] else {}
+        ch = worlds.verified_chain(st, good, o)
+        through = ch[-1]["frame"] if ch else o
+        gone = st["status"] == "unavailable" or zero_before(study, b) is not None
+        at = {}
+        for h in hz:
+            H = o + h
+            zp, zq = z.get("predators"), z.get("prey")
+            if gone:
+                s_ = "unavailable_origin"
+            elif zp is not None and zp <= H:
+                s_ = "predator_extinct"
+            elif through >= H:
+                s_ = "alive"
+            elif zq is not None and zq <= H:
+                s_ = "prey_terminal"
+            elif st["status"] in ("failed", "invalidated"):
+                s_ = "technical"
+            else:
+                s_ = "not_yet_observed"
+            at[str(h)] = s_
+            c = counts.setdefault(b["kind"], {}).setdefault(b["split"], {}).setdefault(str(h), {})
+            c[s_] = c.get(s_, 0) + 1
+        rows[bid] = {"root": b["root"], "kind": b["kind"], "split": b["split"], "origin": o, "status": st["status"],
+                     "reason": st.get("end_reason"), "first_zeros": dict(sorted(z.items())), "accepted_through": through,
+                     "at": at}
+    return {"schema": OUTCOMES_SCHEMA, "forks_sha256": rqlib.sha256_file(os.path.join(study, "config", "forks.json")),
+            "horizons": hz, "branches": rows, "counts": counts,
+            "note": "each branch has its own absorbing ecological outcome from its origin (D6 rule 27, §§10.1-10.4); "
+                    "an unavailable origin is recorded, never replaced; profile availability does not enter"}
 
 
 def main(argv=None):
@@ -583,7 +684,7 @@ def main(argv=None):
     r.add_argument("--pilot-horizon", type=int, default=PILOT["horizon"])
     r.add_argument("--avoid", action="append", default=[], metavar="FILE",
                    help="reserved seeds (integers, or JSON / JSONL with seed keys); the founder seeds always")
-    for name in ("launch", "status", "stitch", "profile-design"):
+    for name in ("launch", "status", "stitch", "profile-design", "outcomes"):
         s = sub.add_parser(name)
         s.add_argument("--study", required=True)
         if name == "launch":
@@ -605,6 +706,8 @@ def main(argv=None):
             s.add_argument("--references", required=True)
             s.add_argument("--out", required=True)
             s.add_argument("--with-pilot-10m", action="store_true")
+        if name == "outcomes":
+            s.add_argument("--out", required=True)
     a = ap.parse_args(argv)
     try:
         study = os.path.abspath(a.study)
@@ -626,7 +729,13 @@ def main(argv=None):
         if a.cmd == "profile-design":
             out = profile_design(study, rqlib.read_json(a.references), a.with_pilot_10m)
             rqlib.write_durable(a.out, rqlib.canonical(out))
-            print(json.dumps(out["counts"]), file=sys.stderr)
+            print(json.dumps(out["counts"]) + (f"; omitted {out['omitted_counts']}" if out["omitted"] else ""),
+                  file=sys.stderr)
+            return 0
+        if a.cmd == "outcomes":
+            out = outcomes(study)
+            rqlib.write_durable(a.out, rqlib.canonical(out))
+            print(json.dumps(out["counts"], sort_keys=True), file=sys.stderr)
             return 0
         fr = froot(study)
         worlds.mkdirs_durable(fr)

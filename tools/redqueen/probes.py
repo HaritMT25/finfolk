@@ -72,6 +72,7 @@ import itertools
 import json
 import math
 import os
+import re
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -216,6 +217,8 @@ def validate_config(root, cfg, docs):
               f"founders.panel.{w}: a manifest world with its registered UUID")
         _need(v.get("treatment") == fd["cohort"] and _int(v.get("block"), 0),
               f"founders.panel.{w}: treatment {fd['cohort']} and an integer block")
+    why = availability_problems(cfg.get("availability"))
+    _need(why is None, why or "")
 
 
 def register(root, cfg_path):
@@ -524,6 +527,36 @@ def enrichment(pairs, blocks, n_perm, seed_ns, alpha, max_block=8, seed_parts=("
                     "p < audit_alpha triggers an initializer / seed / measurement audit, never a finding"}
 
 
+HEX64 = re.compile(r"^[0-9a-f]{64}$")
+CONDITIONING = ("probes are exploratory over the AVAILABLE, measured populations (Annex H D6 rule 27, §§11.1-11.3): "
+                "no extinct or unmeasured population receives a profile or residual; unavailable targets and missing "
+                "founders are reported, never imputed")
+
+
+def availability_problems(av):
+    """Why a config's optional "availability" binding is malformed (None if absent or well formed): the adopted
+    Annex H's sha256 (with D6 / D7) and, when the rows were masked, the availability mask's sha256."""
+    if av is None:
+        return None
+    if not isinstance(av, dict) or not HEX64.match(str(av.get("annex_sha256", ""))):
+        return "availability.annex_sha256: the adopted Annex H's sha256 (64 lowercase hex)"
+    if av.get("mask_sha256") is not None and not HEX64.match(str(av["mask_sha256"])):
+        return "availability.mask_sha256: an availability mask's sha256 (64 lowercase hex) or null"
+    extra = sorted(set(av) - {"annex_sha256", "mask_sha256"})
+    return f"availability: unknown keys {extra}" if extra else None
+
+
+def founder_coverage(fd, pairs):
+    """The registered founder panel against the measured F1 pairs (D6 rule 27, §11: the C F1 panel stays its
+    registered size; missing founders are reported): registered, measured per side, and missing."""
+    prey = sorted({p["prey_world"] for p in pairs})
+    pred = sorted({p["pred_world"] for p in pairs})
+    panel = sorted(fd["panel"])
+    return {"registered": len(panel), "measured_prey": len(prey), "measured_predators": len(pred),
+            "missing": [w for w in panel if w not in prey and w not in pred],
+            "missing_as_prey": [w for w in panel if w not in prey], "missing_as_predators": [w for w in panel if w not in pred]}
+
+
 def founder_pairs(ctx, doc):
     """The F1 pairs document bound to the registered founder panel: every endpoint a registered founder at
     the registered frame (identities checked against the manifest); blocks from the panel only -> (pairs
@@ -597,7 +630,8 @@ def predict_candidates(ctx, feat_path, fit_path, model_out, out):
                      "ids_sha256": rqlib.canonical_sha(sorted([list(r["key"]) for r in tr])),
                      "target_ids_sha256": rqlib.canonical_sha(sorted([list(k) for k in yt]))},
              "adjustment": adj, "probes": {t: {cid: p.state() for cid, p in s.items()} for t, s in states.items()},
-             "unavailable": avail, "environment": staging.environment(),
+             "unavailable": avail, "availability": cfg.get("availability"), "conditioning": CONDITIONING,
+             "environment": staging.environment(),
              "implementation": json.loads(staging.implementation_manifest(sys.modules[__name__]))}
     data = rqlib.canonical(model)
     rqlib.write_durable(model_out, data)
@@ -783,6 +817,8 @@ def main(argv=None):
             rqlib.write_json_durable(a.out, dict(
                 rec, exploratory=True, pairs_sha256=sha, config_sha256=ctx["cfg_sha"],
                 founder_panel_sha256=rqlib.canonical_sha(cfg["founders"]), opened_test_outcomes=opened,
+                founders=founder_coverage(cfg["founders"], pairs), availability=cfg.get("availability"),
+                conditioning=CONDITIONING,
                 designation="a prospectively designated founder audit (v4 §11.2): its outputs and audit consequence are "
                             "fixed; every test-role founder outcome it reads (opened_test_outcomes) loses its "
                             "prospective-test designation (v4 §7.2)"))

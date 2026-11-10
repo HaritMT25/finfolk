@@ -117,6 +117,14 @@ covariance with the forecast, S0 the mean shared covariance between distinct fut
              (PIT of the Mahalanobis distance through the chi-square CDF; 50% / 90% coverage).
 Fork panels are verified: every registered branch and the original continuation present exactly once
 (a profile, an absorbing event or an explicit unavailable), identities bound, covariances valid.
+CONDITIONING (Annex H D6 rule 27, §10.6): every origin states its denominators (registered, observable,
+live, event futures) and its conditioning: "complete" (every registered future live), "observable-only"
+(technical gaps, no event) or "survivor-conditioned" (an extinct future: an outcome record, never a
+profile; every summary of the origin is over its live futures, MSE and REDUCIBLE on one set). All the
+forecasters of an origin share its futures, so the biological mask is common to them. A fork variance
+needs two live reseeds (else v_fork_unavailable says so); events are kept even when a forecast is
+unavailable. Origins of different conditioning are never pooled together (a conditioned pool's name ends
+in its label), and a pooled interval needs two contributing root worlds (else the point and the reason).
 POOLED per STAGE x WORLD ROLE x TARGET ROLE x TIME ROLE x CATEGORY x KIND x HORIZON x FORECASTER, never
 across them (a validation-root world that fed the lambda selection never pools with a test-root world), with
 a root-world cluster bootstrap (Annex H.0.4 quantiles). Twelve root worlds and 36 origins are not 144
@@ -1260,6 +1268,13 @@ def origin_metrics(fc, futures, meas, events, rng_of, draws):
            "events": {e: sum(1 for f in futures if f["row"]["events"].get(e)) for e in events}}
     live = [f for f in futures if f["row"]["z"] is not None]
     rec["live"] = len(live)
+    # (Annex H D6 rule 27, §10.6) the explicit denominators and the conditioning of every summary below: an
+    # extinct future is an outcome record, never a profile, so a summary over the live futures is
+    # SURVIVOR-CONDITIONED when any registered future had an event (observable-only with technical gaps)
+    n_ev = sum(1 for f in futures if any((f["row"].get("events") or {}).values()))
+    rec["denominators"] = {"registered": len(futures), "observable": len(futures) - rec["unavailable"],
+                           "live": len(live), "event": n_ev}
+    rec["conditioning"] = "survivor-conditioned" if n_ev else ("observable-only" if rec["unavailable"] else "complete")
     if "z" not in fc:
         return dict(rec, forecast_unavailable=fc.get("unavailable"))
     zh, P = np.asarray(fc["z"], float), np.asarray(fc["cov"], float)
@@ -1290,7 +1305,10 @@ def origin_metrics(fc, futures, meas, events, rng_of, draws):
         mse, V = block(rs)
         m5, V5 = block(live)
         rec.update(reseeds=len(rs), mse=mse, v_fork=V, reducible=(mse - V) if V is not None else None,
-                   with_original={"mse": m5, "v_fork": V5, "reducible": (m5 - V5) if V5 is not None else None})
+                   with_original={"mse": m5, "v_fork": V5, "reducible": (m5 - V5) if V5 is not None else None},
+                   reseeds_registered=sum(1 for f in futures if f["kind"] == "reseed"))
+        if V is None:                          # (a fork variance needs two live reseeds; MSE needs one)
+            rec["v_fork_unavailable"] = f"{len(rs)} live reseed(s): a survivor-conditioned fork variance needs two"
     if live:
         es, pit = [], []
         for j, f in enumerate(live):
@@ -1315,7 +1333,9 @@ POOL_KEYS = ("stage", "world_role", "target_role", "time_role", "category", "kin
 
 def pool(ctx, per):
     """Means per STAGE / WORLD ROLE / TARGET ROLE / TIME ROLE / CATEGORY / KIND / H / FORECASTER (never across
-    them), root-world cluster bootstrap."""
+    them) and per CONDITIONING (Annex H D6 rule 27, §10.6: complete, observable-only or survivor-conditioned
+    origins are never pooled together; a conditioned pool's name ends in its label), root-world cluster
+    bootstrap: a 95% interval only with at least two contributing root worlds (else the point and the reason)."""
     np = _np()
     ev = ctx["cfg"]["evaluation"]
     groups = {}
@@ -1323,10 +1343,13 @@ def pool(ctx, per):
         if not r["available"]:
             continue
         for fc, m in r["metrics"].items():
-            groups.setdefault(tuple(r[q] for q in POOL_KEYS) + (fc,), []).append((r["world"], m))
+            cond = m.get("conditioning", "complete")
+            groups.setdefault(tuple(r[q] for q in POOL_KEYS) + (fc, cond), []).append((r["world"], m))
     out = {}
-    for key, rows in sorted(groups.items()):
+    for gkey, rows in sorted(groups.items()):
+        key, cond = gkey[:-1], gkey[-1]
         name = "/".join([str(x) if q != "horizon" else f"H{x}" for q, x in zip(POOL_KEYS + ("forecaster",), key)])
+        name += "" if cond == "complete" else f"/{cond}"
         qs = {}
         for q in ("mse", "v_fork", "reducible", "energy", "cover50", "cover90"):
             qs[q] = [(w, m[q]) for w, m in rows if m.get(q) is not None]
@@ -1335,7 +1358,7 @@ def pool(ctx, per):
                                         if (m.get("with_original") or {}).get(q) is not None]
         rng = np.random.default_rng(rqlib.derive_seed(ev["seed_namespace"], "bootstrap", name))
         rec = dict(zip(POOL_KEYS + ("forecaster",), key), primary=key[6] == ctx["cfg"]["primary"],
-                   origins=len(rows), worlds=len({w for w, _ in rows}))
+                   origins=len(rows), worlds=len({w for w, _ in rows}), conditioning=cond)
         ws = sorted({w for w, _ in rows})
         wi = {w: i for i, w in enumerate(ws)}
         picks = rng.integers(0, len(ws), (ev["bootstrap"], len(ws)))      # (whole root worlds, with their origins)
@@ -1350,8 +1373,11 @@ def pool(ctx, per):
                 c[wi[w]] += 1
             num, den = s[picks].sum(axis=1), c[picks].sum(axis=1)
             draws = sorted((num[den > 0] / den[den > 0]).tolist())
-            rec[q] = {"mean": float(np.mean(v)), "n": len(vals),
-                      "ci95": [quantile(draws, 0.025), quantile(draws, 0.975)] if draws else None}
+            roots = len({w for w, _ in vals})
+            rec[q] = {"mean": float(np.mean(v)), "n": len(vals), "roots": roots,
+                      "ci95": [quantile(draws, 0.025), quantile(draws, 0.975)] if draws and roots >= 2 else None}
+            if roots < 2:
+                rec[q]["ci95_unavailable"] = "fewer than two contributing root worlds: the point only"
         out[name] = rec
     return out
 

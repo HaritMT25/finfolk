@@ -24,6 +24,17 @@ from test_worlds import ARENA, EXE_SHA, SCHED, cfg_for, make_root, rm_tree, supe
 M = 1_000_000
 
 
+def zero_rec(root, wid, guild, frame):
+    """A supported availability record: the segment's main-CSV prefix through the zero row, bound by sha256."""
+    d = os.path.join(worlds.wdir(root, wid), "seg000")
+    os.makedirs(d, exist_ok=True)
+    text = "step,population,predator_pop\n" + f"{frame},{0 if guild == 'prey' else 50},{0 if guild == 'predators' else 5}\n"
+    wr(os.path.join(d, "run.csv"), text)
+    worlds._append_durable(os.path.join(root, "availability.jsonl"), {
+        "schema": worlds.AVAIL_SCHEMA, "world": wid, "guild": guild, "first_zero_frame": frame, "segment": "seg000",
+        "csv_bytes": len(text), "csv_sha256": rqlib.sha256_bytes(text.encode())})
+
+
 def splits_for(reg):
     """A graph-like split: C worlds 20 / 6 / 6, fork worlds 2 / 4 / 6."""
     cs = sorted(w["id"] for w in reg["worlds"] if w["treatment"] == "C")
@@ -132,6 +143,54 @@ class TestRegister(unittest.TestCase):
             forks.profile_design(self.study, dict(refs, predators=[refs["predators"][0]] * 8))
         out10 = forks.profile_design(self.study, refs, with_pilot_10m=True)
         self.assertEqual(out10["counts"]["pilot_branch"], 6 * 3 * 17)
+        self.assertEqual((out["omitted"], out["omitted_counts"]), ([], {}))
+
+    def test_profile_omissions_and_outcomes(self):
+        """PR-D (Annex H D6 rule 27, §§10.1-10.4): states that will never exist are omitted EXPLICITLY, with
+        their cause, never emitted as paths: a fork root's prey zero at 50M (its 100M and 185M origins are then
+        unavailable, its later native-panel and original targets absent), a branch's own predator zero at 32M,
+        an invalidated branch; the branches' outcomes are exported independently of any profile."""
+        reg = forks.register(self.study, self.splits, "ns-f")
+        worlds.write_registry(os.path.join(self.study, "config", "forks.json"), rqlib.canonical(reg))
+        rqlib.write_json_durable(os.path.join(self.study, "study.json"), {"archive_root": os.path.join(self.tmp, "ar")})
+        cs = sorted(w["id"] for w in self.hreg["worlds"] if w["treatment"] == "C")
+        refs = {"prey": [{"world": cs[i], "frame": 20 * M} for i in range(8)],
+                "predators": [{"world": cs[8 + i], "frame": 60 * M} for i in range(8)]}
+        full = forks.profile_design(self.study, refs)
+        R = sorted(reg["fork_worlds"])[0]
+        other = next(b for b in reg["worlds"] if b["kind"] == "main" and b["root"] != R and b["origin"]["frame"] == 30 * M)
+        inval = next(b for b in reg["worlds"] if b["kind"] == "main" and b["root"] != R and b["id"] != other["id"])
+        fr = forks.froot(self.study)
+        zero_rec(self.study, R, "prey", 50 * M)
+        zero_rec(fr, other["id"], "predators", 32 * M)
+        worlds.write_state(fr, inval["id"], {"schema": worlds.STATE_SCHEMA, "id": inval["id"], "status": "invalidated",
+                                             "end_reason": "its origin changed", "failures": 0, "segments": []})
+        out = forks.profile_design(self.study, refs)
+        om = {(o["family"], o["state"]["world"], o["state"]["frame"]): o["why"] for o in out["omitted"]}
+        gone_r = [b["id"] for b in reg["worlds"] if b["root"] == R and b["origin"]["frame"] in (100 * M, 185 * M)]
+        want = ({("fork_branch", b, f) for b in gone_r for f in
+                 [next(x for x in reg["worlds"] if x["id"] == b)["origin"]["frame"] + h for h in (M, 4 * M, 10 * M)]}
+                | {("fork_original", R, o + h) for o in (100 * M, 185 * M) for h in (M, 4 * M)}
+                | {("native_panel", R, f) for f in (110 * M, 195 * M)}
+                | {("fork_branch", other["id"], 30 * M + h) for h in (4 * M, 10 * M)}
+                | {("fork_branch", inval["id"], inval["origin"]["frame"] + h) for h in (M, 4 * M, 10 * M)})
+        self.assertEqual(set(om), want)
+        self.assertTrue(om[("native_panel", R, 110 * M)].startswith("biological"))
+        self.assertTrue(om[("fork_branch", gone_r[0], next(x for x in reg["worlds"] if x["id"] == gone_r[0])
+                            ["origin"]["frame"] + M)].startswith("an unavailable origin"))
+        self.assertIn("invalidated", om[("fork_branch", inval["id"], inval["origin"]["frame"] + M)])
+        self.assertEqual(len(out["edges"]), len(full["edges"]) - 17 * len(want))       # (nothing else moves)
+        self.assertNotIn(("fork_original", R, 31 * M), om)                 # (before the zero: kept)
+        self.assertTrue(all(o["pairs"] == 17 for o in out["omitted"]))
+        oc = forks.outcomes(self.study)
+        b1 = oc["branches"]
+        self.assertEqual(b1[other["id"]]["at"], {str(M): "not_yet_observed", str(4 * M): "predator_extinct",
+                                                 str(10 * M): "predator_extinct"})
+        self.assertEqual(set(b1[gone_r[0]]["at"].values()), {"unavailable_origin"})
+        self.assertEqual(set(b1[inval["id"]]["at"].values()), {"technical"})
+        self.assertEqual(b1[other["id"]]["first_zeros"], {"predators": 32 * M})
+        self.assertEqual(sum(sum(c.values()) for k in oc["counts"].values() for s in k.values() for c in s.values()),
+                         150 * 3)
 
 
     def test_profile_roles_and_references(self):

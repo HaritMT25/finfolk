@@ -171,6 +171,26 @@ class TestBasics(unittest.TestCase):
         self.assertTrue(np.allclose(B[:, 3], [0.0, 0.0, 1.5 ** 3]))
         self.assertFalse(hasattr(pb, "spline_basis"))
 
+    def test_availability_binding_and_founder_coverage(self):
+        """PR-D (Annex H D6 rule 27, §§11.1-11.3): an optional availability binding (the adopted annex's sha256,
+        the availability mask's) is validated and carried; the founder audit reports missing founders against the
+        registered panel; the conditioning label is explicit."""
+        tmp = tempfile.mkdtemp()
+        try:
+            for k, (av, msg) in enumerate((({"annex_sha256": "x"}, "annex_sha256"),
+                                           ({"annex_sha256": "a" * 64, "mask_sha256": "zz"}, "mask_sha256"),
+                                           ({"annex_sha256": "a" * 64, "rho": 1}, "unknown keys"))):
+                with self.assertRaisesRegex(pb.ProbeError, msg):
+                    make_root(os.path.join(tmp, f"bad{k}"), availability=av)
+            make_root(os.path.join(tmp, "ok"), availability={"annex_sha256": "a" * 64, "mask_sha256": None})
+        finally:
+            shutil.rmtree(tmp)
+        cov = pb.founder_coverage({"panel": {"C01": {}, "C02": {}, "C03": {}}},
+                                  [{"prey_world": "C01", "pred_world": "C02", "value": 1.0}])
+        self.assertEqual(cov, {"registered": 3, "measured_prey": 1, "measured_predators": 1, "missing": ["C03"],
+                               "missing_as_prey": ["C02", "C03"], "missing_as_predators": ["C01", "C03"]})
+        self.assertIn("never imputed", pb.CONDITIONING)
+
 
 @unittest.skipIf(np is None, "numpy is not installed")
 class TestPipeline(unittest.TestCase):

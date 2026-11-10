@@ -115,6 +115,49 @@ class TestManifest(unittest.TestCase):
         with self.assertRaisesRegex(sealing.SealError, "not the registry's"):
             sealing.manifest(self.mp, self.wp)
 
+    def test_layout_and_availability_receipt(self):
+        """PR-D (Annex H D7 rule 34, D6 rule 27): the manifest records whether the graph's worlds are the registered
+        64-world layout (--layout 64 refuses any other); an availability mask of the manifest's graph and a plan
+        reconciliation of that mask are bound by an exclusively published receipt; another graph's mask or another
+        mask's reconciliation is refused."""
+        m = sealing.manifest(self.mp, self.wp, self.fp)
+        self.assertFalse(m["layout"]["registered_64"])
+        with self.assertRaisesRegex(sealing.SealError, "registered 64-world layout"):
+            sealing.manifest(self.mp, self.wp, self.fp, require_layout=True)
+        ws64 = [{"id": f"{t}{b}{i}", "treatment": t, "block": b} for b in range(1, 9)
+                for t, n in (("C", 4), ("A", 2), ("B", 2)) for i in range(n)]
+        lay = sealing.layout_of(ws64)
+        self.assertEqual((lay["registered_64"], lay["per_treatment"], lay["worlds"]), (True, {"C": 32, "A": 16, "B": 16}, 64))
+        old = [w for w in ws64 if not (w["treatment"] in "AB" and w["id"].endswith("1"))]        # (the 48 layout)
+        self.assertFalse(sealing.layout_of(old)["registered_64"])
+        study = os.path.join(self.tmp, "study")
+        sealing.publish_manifest(study, rqlib.canonical(m))
+        mask = {"schema": sealing.MASK_SCHEMA, "graph": {"edges_sha256": "e" * 64, "edges": 3},
+                "block": {"sha256": "b" * 64, "registry_sha256": "r" * 64},
+                "edges": {"scheduled": 3, "executable": 2, "biological": 1, "technical": 0, "pending": 0},
+                "snapshots": {"C06:5000000": {"status": "biological"}}, "excluded_edges": {"biological": [0]}}
+        kp, rp = os.path.join(self.tmp, "mask.json"), os.path.join(self.tmp, "recon.json")
+        wr(kp, json.dumps(mask))
+        recon = {"schema": "finfolk.redqueen.reconciliation/1", "mask": {"sha256": rqlib.sha256_file(kp)},
+                 "plan_sha256": "p" * 64, "pending_plan": {"sha256": "q" * 64}, "scheduled": 6, "executable": 4,
+                 "excluded": {"biological": 2, "technical": 0, "pending": 0}}
+        wr(rp, json.dumps(recon))
+        r = sealing.availability_receipt(study, kp, rp)
+        out = os.path.join(sealing.reg_dir(study), "availability", f"{rqlib.sha256_file(kp)}.{rqlib.sha256_file(rp)}.json")
+        self.assertEqual(rqlib.read_bytes(out), rqlib.canonical(r))
+        self.assertEqual((r["split_manifest_sha256"], r["reconciliation"]["sha256"], r["reconciliation"]["excluded"]["biological"]),
+                         (rqlib.sha256_file(os.path.join(study, "config", "splits.json")), rqlib.sha256_file(rp), 2))
+        self.assertEqual(sealing.availability_receipt(study, kp, rp), r)          # (the same bytes again: accepted)
+        wr(kp + ".x", json.dumps(dict(mask, graph={"edges_sha256": "0" * 64})))
+        with self.assertRaisesRegex(sealing.SealError, "another graph"):
+            sealing.availability_receipt(study, kp + ".x")
+        wr(rp + ".x", json.dumps(dict(recon, mask={"sha256": "0" * 64})))
+        with self.assertRaisesRegex(sealing.SealError, "another mask"):
+            sealing.availability_receipt(study, kp, rp + ".x")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(sealing.main(["availability", "--study", study, "--mask", kp]), 0)
+        self.assertEqual(len(os.listdir(os.path.join(sealing.reg_dir(study), "availability"))), 2)
+
     def test_identity_binding(self):
         """#67 review 2: labels must agree with identities (the world's UUID, the snapshot UUID recipe; a
         branch binds to its own UUID and takes its root's split), refused before any role."""
