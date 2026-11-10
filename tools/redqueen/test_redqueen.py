@@ -1196,7 +1196,11 @@ def plan_mask(tmp, design, snaps, frames=(1, 2000)):
             p = os.path.join(tmp, f"{wn}.F1.json" if f == 1 else f"{wn}.{f}.json")
             if f"{wn}:{f}" not in snaps and os.path.isfile(p):
                 av[str(f)] = rqlib.sha256_file(p)
+        # (the mask's own evidence, as graph.py mask writes it: a settled disposition, the first terminal boundary
+        #  at valid_before, the frontier; Codex #77 r2 P1-2)
         ws[wn] = {"uuid": u, "attempt": 0, "attempt_uuid": plan.attempt_uuid(u, 0), "valid_before": vb,
+                  "first_terminal": {"frame": vb, "kind": "prey"} if vb else None, "frontier": vb or max(frames),
+                  "refill": None, "burn_in": {"decided": True, "disposition": "established", "why": "alive at 5M"},
                   "available_sha256": av}
     for k, (st, why, vb) in snaps.items():
         wn, f = k.split(":")[0], int(k.split(":")[1])
@@ -1580,12 +1584,26 @@ class TestPlanV2(unittest.TestCase):
         self.assertIn("not a registered attempt", refused(dict(mask, worlds=dict(W, B=dict(W["B"], attempt=9))), why="k"))
         self.assertIn("attempt identity", refused(dict(mask, worlds=dict(W, B=dict(W["B"], attempt=1))), why="k uuid"))
         S = mask["snapshots"]
-        self.assertIn("without its world's evidenced first zero",
-                      refused(dict(mask, worlds=dict(W, B=dict(W["B"], valid_before=None))), why="bio"))
+        # (Codex #77 r2 P1-2: the mask's evidence through the SHARED validator, graph.mask_evidence_problems)
+        self.assertIn("first terminal", refused(dict(mask, worlds=dict(W, B=dict(W["B"], valid_before=None))), why="bio"))
+        self.assertIn("first terminal", refused(dict(mask, worlds=dict(W, B=dict(W["B"], first_terminal=None))), why="ft"))
+        self.assertIn("frontier", refused(dict(mask, worlds=dict(W, B=dict(W["B"], frontier=1000))), why="frontier"))
+        unsettled = dict(W["B"], burn_in={"decided": False, "disposition": "restart_pending", "why": "a restart is due"})
+        self.assertIn("unsettled attempt", refused(dict(mask, worlds=dict(W, B=unsettled)), why="unsettled"))
+        self.assertIn("self-consistent burn-in", refused(dict(mask, worlds=dict(W, B=dict(W["B"], burn_in=None))), why="bi"))
+        both = dict(W["B"], available_sha256=dict(W["B"]["available_sha256"], **{"2000": "0" * 64}))
+        self.assertIn("both excluded and available", refused(dict(mask, worlds=dict(W, B=both)), why="both"))
         self.assertIn("identity", refused(dict(mask, snapshots={"B:2000": dict(S["B:2000"], snapshot="x")}), why="snap"))
-        self.assertIn("not cover", refused(dict(mask, worlds={"B": W["B"]}), why="cover"))
+        self.assertIn("cover (by uuid)", refused(dict(mask, worlds={"B": W["B"]}), why="cover"))
         self.assertIn("not a design world", refused(dict(mask, worlds=dict(W, Z=W["B"])), why="Z"))
-        self.assertIn("no availability binding", refused(mask, design={k: v for k, v in dd.items() if k != "availability"}))
+        self.assertIn("no well-formed availability binding",
+                      refused(mask, design={k: v for k, v in dd.items() if k != "availability"}))
+        # (Codex #77 r2 P1-1) a SUBSTITUTED binding (another registry), with a mask that matches it: the binding is
+        # part of every registered row, so --against refuses it
+        sub = dict(BINDING, registry_sha256="s" * 64)
+        msub = dict(mask, registry=dict(mask["registry"], sha256="s" * 64), block=dict(mask["block"], registry_sha256="s" * 64))
+        self.assertIn("availability", refused(msub, design=dict(dd, availability=sub), why="substituted"))
+        self.assertTrue(all(r["availability"] == BINDING for r in prow.values()))
         bad = dict(W["A"], available_sha256=dict(W["A"]["available_sha256"], **{"2000": "0" * 64}))
         self.assertIn("does not hash to the mask's verified", refused(dict(mask, worlds=dict(W, A=bad)), why="bytes"))
         bad = dict(W["A"], available_sha256={"1": W["A"]["available_sha256"]["1"]})
@@ -1629,6 +1647,62 @@ class TestPlanV2(unittest.TestCase):
         sb = plan.snapshot_uuid("uB", 2000)
         self.assertEqual({x["id"] for x in R["rows"]},
                          {i for i, r in prow.items() if any((r.get(k) or {}).get("snapshot") == sb for k in ("prey", "predators"))})
+
+    def test_exclusions_with_registered_references(self):
+        """Codex #77 r2 P2-3: a production plan reads external (sentinel) references, design worlds outside the main
+        mask. They are covered by the REGISTERED reference assignment (references/1, its bytes' sha256 in the
+        design's binding) and every reference cell must read the archive bytes it registers; without the
+        assignment, with another one, or with other bytes the plan is refused."""
+        for name, frame in (("A.F1", 1), ("A.2000", 2000), ("B.F1", 1), ("B.2000", 2000), ("S.2000", 2000), ("T0", 7)):
+            wr(os.path.join(self.tmp, name + ".json"), ckpt.dumps(mk_cp(n_prey=8, frame=frame)))
+        wr(os.path.join(self.tmp, "ages.json"), rqlib.canonical(common.reference_ages([mk_cp(n_prey=8, seed=9)], 4)))
+        sp = os.path.join(self.tmp, "S.2000.json")
+
+        def refs_doc(sha):
+            return rqlib.canonical({"schema": plan.REFS_SCHEMA, "namespace": "sent", "references": {
+                "RP:0": {"world": "s01", "frame": 2000, "uuid": "uS", "archive": sp, "sha256": sha}}})
+
+        def setup(tag, refs_raw):
+            rp = os.path.join(self.tmp, f"refs.{tag}.json")
+            with open(rp, "wb") as f:
+                f.write(refs_raw)
+            dd = design2(self.tmp, self.edges + [E("reference", "training", "A", "T2", "S", "T2")],
+                         availability=dict(BINDING, references_sha256=rqlib.sha256_bytes(refs_raw)))
+            dd["worlds"]["S"] = {"uuid": "uS", "pattern": f"{self.tmp}/S.{{frame}}.json"}
+            d, pend = os.path.join(self.tmp, f"d.{tag}.json"), os.path.join(self.tmp, f"pend.{tag}.jsonl")
+            wr(d, json.dumps(dd))
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(plan.main([d, "--pending", "--out", pend]), 0)
+            mp = os.path.join(self.tmp, f"mask.{tag}.json")
+            wr(mp, json.dumps(plan_mask(self.tmp, dd, {})))
+            return d, pend, mp, rp
+
+        def final(d, pend, mp, *extra):
+            err = io.StringIO()
+            out = os.path.join(self.tmp, f"exec.{os.path.basename(d)}.{len(extra)}.jsonl")
+            with contextlib.redirect_stderr(err):
+                rc = plan.main([d, "--against", pend, "--exclusions", mp, "--reconciliation", out + ".recon",
+                                "--out", out, *extra])
+            return rc, err.getvalue(), out
+        d, pend, mp, rp = setup("ok", refs_doc(rqlib.sha256_file(sp)))
+        rc, err, out = final(d, pend, mp, "--references", rp)
+        self.assertEqual(rc, 0, err)
+        rows = [json.loads(ln) for ln in rqlib.read_text(out).splitlines() if ln]
+        ref = [r for r in rows if (r.get("predators") or {}).get("world") == "S"]
+        self.assertTrue(ref and all(r["predators"]["sha256"] == rqlib.sha256_file(sp) for r in ref))
+        rc, err, _ = final(d, pend, mp)
+        self.assertEqual(rc, 2)
+        self.assertIn("give --references", err)
+        other = os.path.join(self.tmp, "refs.other.json")
+        with open(other, "wb") as f:
+            f.write(refs_doc("0" * 64))
+        rc, err, _ = final(d, pend, mp, "--references", other)
+        self.assertEqual(rc, 2)
+        self.assertIn("not the registered reference assignment", err)
+        d2, pend2, mp2, rp2 = setup("badhash", refs_doc("0" * 64))       # (registered, but not the archive's bytes)
+        rc, err, _ = final(d2, pend2, mp2, "--references", rp2)
+        self.assertEqual(rc, 2)
+        self.assertIn("does not hash", err)
 
     def test_long_fraction_half_unit(self):
         """(Review of d4dc4b7, P3) the default 1/8: floor(N / 8 + 0.5) long units, a half unit rounding up."""
