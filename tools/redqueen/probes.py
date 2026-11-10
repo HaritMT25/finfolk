@@ -129,7 +129,10 @@ def _run_verified(path, name):
     return m.main()
 
 
-rqlib, sealing, staging = _verified_import(("rqlib", "sealing", "staging"))
+rqlib, sealing, staging, graph = _verified_import(("rqlib", "sealing", "staging", "graph"))
+# (Codex #78 r3 P2-5: graph.py's shared mask validator decides production admission, so it is loaded from verified
+#  source bytes and bound into the implementation manifest with the other tool modules)
+IMPL_MODULES = staging.TOOL_MODULES + ("graph",)
 
 CFG_SCHEMA = "finfolk.redqueen.probecfg/1"
 CFG_NAME = "probes.json"
@@ -646,8 +649,7 @@ def availability_binding(root, av, man, msha):
     probs = sealing.mask_binding_problems(man, mk)
     if probs:
         raise ProbeError("configuration: availability: the mask is not this study's: " + "; ".join(probs[:3]))
-    import graph as graphlib                       # (the shared mask validator)
-    probs = graphlib.mask_evidence_problems(mk)
+    probs = graph.mask_evidence_problems(mk)       # (the shared mask validator, verified-loaded)
     if probs:
         raise ProbeError("configuration: availability: the mask is not consistent with its evidence: " + "; ".join(probs[:3]))
     gp = os.path.join(root, "config", REGISTRY_DOC)
@@ -830,7 +832,7 @@ def predict_candidates(ctx, feat_path, fit_path, model_out, out):
              "failed_rows": [{"world": w, "t": t, "reason": why} for (w, t), why in sorted((ctx.get("failures") or {}).items())
                              if staging.resolve_row(ctx["manifest"], {"world": w, "t": t}, "failure")["role"] == "training"],
              "environment": staging.environment(),
-             "implementation": json.loads(staging.implementation_manifest(sys.modules[__name__]))}
+             "implementation": json.loads(staging.implementation_manifest(sys.modules[__name__], IMPL_MODULES))}
     data = rqlib.canonical(model)
     rqlib.write_durable(model_out, data)
     prov = {"config_sha256": ctx["cfg_sha"], "split_manifest_sha256": ctx["manifest_sha"], "features_sha256": fsha,
@@ -1021,7 +1023,7 @@ def main(argv=None):
             print(f"{os.path.join(a.root, 'config', CFG_NAME)}: sha256 {register(a.root, a.config)}")
             return 0
         if a.cmd == "implementation":
-            impl = staging.implementation_manifest(sys.modules[__name__])
+            impl = staging.implementation_manifest(sys.modules[__name__], IMPL_MODULES)
             rqlib.write_durable(a.out, impl)
             print(f"{a.out}: sha256 {rqlib.sha256_bytes(impl)} (commit and freeze it as the evaluation script)")
             return 0
@@ -1052,7 +1054,7 @@ def main(argv=None):
             ms = {(ln.get("provenance") or {}).get("model_sha256") for ln in lines}
             if len(ms) != 1:
                 raise ProbeError("the committed lines name several model states")
-            impl = staging.implementation_manifest(sys.modules[__name__])
+            impl = staging.implementation_manifest(sys.modules[__name__], IMPL_MODULES)
             doc = {"schema": VALSCORES, "exploratory": True, "VAL_PRED_SHA": mk, "config_sha256": ctx["cfg_sha"],
                    "model_sha256": ms.pop(), "targets_sha256": tsha, "metric": "residual_r2 (primary); r2 (supporting)",
                    "targets": score_validation(ctx, lines, truth), "scoring": scoring_record(impl),
@@ -1072,7 +1074,7 @@ def main(argv=None):
             print(f"{a.out}: {len(lines)} test lines; commit them with the implementation manifest (sealing.py commit "
                   "--stage test --eval-script IMPL.json), then freeze, before evaluate-test")
             return 0
-        impl = staging.implementation_manifest(sys.modules[__name__])
+        impl = staging.implementation_manifest(sys.modules[__name__], IMPL_MODULES)
         g = staging.test_gate(ctx["root"], a.predictions, impl)
         lines = g["rows"]
         for ln in lines:

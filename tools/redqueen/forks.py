@@ -502,8 +502,9 @@ def history_evidence(ctx, wid):
 
 def refill_baseline(ctx, b):
     """(baseline, why unbound): a branch's refill baseline is its FROZEN ORIGIN's counter (Codex #78 r2 P2-4, D6 rule
-    24): its root's evidenced predator_reseeds_cum at the origin frame. None, None: the root logs no counter (nothing
-    to bind); None, why: the root's evidence has no readable sample at the origin (the baseline is unbound)."""
+    24): its root's evidenced predator_reseeds_cum at the origin frame. None, why: the baseline is UNBOUND, and the
+    branch's evidence unusable: the root's evidence has no sample at the origin, its counter there is unreadable, or
+    the counter is ABSENT (Codex #78 r3 P2-4: a missing column never disables the refill check)."""
     h = history_evidence(ctx, b["root"])
     o = b["origin"]["frame"]
     smp = h["samples_at"].get(o)
@@ -511,7 +512,7 @@ def refill_baseline(ctx, b):
         return None, f"its refill baseline is unbound: its root {b['root']}'s evidence has no sample at the origin {o}"
     col = worlds.evidence.REFILL_COL
     if col not in smp:
-        return None, None
+        return None, f"its refill baseline is unbound: its root's evidence carries no {col} at the origin {o}"
     if smp[col] is None:
         return None, f"its refill baseline is unbound: its root's {col} at the origin {o} is unreadable"
     return smp[col], None

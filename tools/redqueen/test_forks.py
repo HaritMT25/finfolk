@@ -35,10 +35,11 @@ def zero_rec(root, wid, guild, frame):
         "csv_bytes": len(text), "csv_sha256": rqlib.sha256_bytes(text.encode())})
 
 
-def evidenced(root, wid, start, upto, zero=None, status="interrupted", log_every=5000, reseeds=None):
+def evidenced(root, wid, start, upto, zero=None, status="interrupted", log_every=5000, reseeds=lambda f: 0):
     """A RULE-24 evidence chain (worlds.attempt_sequence's): seg000 from `start`, rows every log_every through `upto`
     (prey 50, predators 5; zero = (guild, frame): that guild 0 in its row, the last one; reseeds: frame -> the
-    predator_reseeds_cum column's value) and one acceptance record whose part covers every row."""
+    predator_reseeds_cum column's value, 0 by default as the engine logs it; None: no such column) and one
+    acceptance record whose part covers every row."""
     d = worlds.wdir(root, wid)
     os.makedirs(os.path.join(d, "seg000"), exist_ok=True)
     rows = ["step,population,predator_pop" + (",predator_reseeds_cum" if reseeds else "") + "\n"]
@@ -262,6 +263,22 @@ class TestRegister(unittest.TestCase):
         u = oc[b100["id"]]
         self.assertEqual(set(u["at"].values()), {"technical"})
         self.assertTrue(any("unbound" in x for x in u["integrity"]))
+
+    def test_branch_refill_baseline_absent_counter(self):
+        """Codex #78 r3 P2-4: a root whose evidence carries NO predator_reseeds_cum at the origin leaves its branches'
+        baseline UNBOUND (their evidence unusable: technical), never refill_base = None (an unchecked counter): a
+        branch whose own counter rises is never certified alive."""
+        reg = forks.register(self.study, self.splits, "ns-f")
+        worlds.write_registry(os.path.join(self.study, "config", "forks.json"), rqlib.canonical(reg))
+        rqlib.write_json_durable(os.path.join(self.study, "study.json"), {"archive_root": os.path.join(self.tmp, "ar")})
+        R = sorted(reg["fork_worlds"])[1]
+        b30 = next(b for b in reg["worlds"] if b["kind"] == "main" and b["root"] == R and b["origin"]["frame"] == 30 * M)
+        fr = forks.froot(self.study)
+        evidenced(self.study, R, 0, 40 * M, reseeds=None)                     # (settled, but no counter column)
+        evidenced(fr, b30["id"], 30 * M, 41 * M, reseeds=lambda f: 1 if f >= 33 * M else 0)
+        r = forks.outcomes(self.study)["branches"][b30["id"]]
+        self.assertEqual(set(r["at"].values()), {"technical"})
+        self.assertTrue(any("carries no predator_reseeds_cum" in x for x in r["integrity"]), r["integrity"])
 
 
     def test_profile_roles_and_references(self):

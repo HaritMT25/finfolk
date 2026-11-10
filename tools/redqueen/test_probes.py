@@ -418,6 +418,10 @@ class TestPipeline(unittest.TestCase):
         for doc in (sc, ev):                    # (Codex #78 r1 P2-7: the binding, conditioning and every unscored row)
             self.assertEqual((doc["availability"]["kind"], doc["conditioning"], doc["unavailable_rows"]),
                              ("legacy", pb.CONDITIONING, []))
+        impl = rqlib.read_json(self.impl)       # (Codex #78 r3 P2-5: graph.py, which decides admission, is bound)
+        self.assertEqual(sorted(impl["modules"]), ["graph", "rqlib", "sealing", "staging"])
+        self.assertEqual(impl["modules"]["graph"]["sha256"], rqlib.sha256_file(os.path.join(HERE, "graph.py")))
+        self.assertIsNotNone(getattr(pb.graph, "__rq_source__", None))
         w = sc["targets"]["wired"]
         self.assertGreater(w["best_residual_r2_by_set"]["wiring"], 0.8)
         self.assertGreater(w["best_residual_r2_by_set"]["combined"], 0.8)
