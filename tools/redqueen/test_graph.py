@@ -435,6 +435,57 @@ class TestGraph(unittest.TestCase):
         finally:
             shutil.rmtree(tmp)
 
+    def test_mask_disposition_support(self):
+        """Codex #77 r3 P1-2: the SHARED validator checks every disposition against the mask's REGISTERED burn-in rule
+        and its evidence (disposition_support). Codex's case, C06's early zero at 3M with eight restarts left
+        relabelled "exhausted" (decided, earlier frames pending, biological from 3M, nothing available), is refused
+        (and executable refuses its mask); "exhausted" passes only at the final permitted attempt with every earlier
+        attempt's early terminal evidenced; "established" with an early zero, a settled disposition under a registry
+        without the rule, and a mask whose registry records no rule are refused."""
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp)
+        graph.write(self.g, tmp)
+        g = graph.load(os.path.join(tmp, "graph.jsonl.gz"))
+        reg, rsha = test_registry(g)
+        m = graph.mask(g, masked_block(g, reg, rsha), reg, rsha)
+        self.assertEqual(graph.mask_evidence_problems(m), [])
+        M, W, S = 1_000_000, m["worlds"], m["snapshots"]
+        u6 = W["C06"]["uuid"]
+
+        def c06(disp, k=0, prior=(), late=False):
+            w = dict(W["C06"], burn_in={"decided": graph.DISPOSITIONS[disp], "why": "relabelled", "disposition": disp},
+                     burn_in_decided=graph.DISPOSITIONS[disp], attempt=k, attempt_uuid=graph.attempt_uuid(u6, k),
+                     prior_attempts=[{"attempt": j, "first_terminal": {"frame": 6 * M if late and j == 3 else 2 * M,
+                                                                       "kind": "prey"}} for j in prior])
+            s = {k_: v for k_, v in S.items() if v["world"] != "C06"}
+            for t in graph.TIMES:
+                f = graph.frame_of(t)
+                st = "biological" if f >= 3 * M else "pending"
+                s[f"C06:{f}"] = dict({"world": "C06", "time": t, "frame": f, "status": st, "why": "relabelled", "uuid": u6,
+                                      "attempt": k, "snapshot": graph.snapshot_uuid(u6, f)},
+                                     **({"valid_before": 3 * M} if st == "biological" else {}))
+            return dict(m, worlds=dict(W, C06=w), snapshots=s)
+        codex = c06("exhausted")
+        probs = graph.mask_evidence_problems(codex)
+        self.assertTrue(any(p.startswith("C06:") and "8 remain" in p for p in probs), probs)
+        with self.assertRaisesRegex(graph.GraphError, "does not describe this graph"):
+            graph.executable(g, codex)
+        self.assertEqual(graph.mask_evidence_problems(c06("exhausted", 8, range(8))), [])     # (earned: all used)
+        probs = graph.mask_evidence_problems(c06("exhausted", 8, range(8), late=True))
+        self.assertTrue(any("early terminals are not all evidenced" in p for p in probs), probs)
+        probs = graph.mask_evidence_problems(c06("exhausted", 8, range(7)))
+        self.assertTrue(any("early terminals are not all evidenced" in p for p in probs), probs)
+        probs = graph.mask_evidence_problems(c06("established"))
+        self.assertTrue(any("established, but its first terminal" in p for p in probs), probs)
+        probs = graph.mask_evidence_problems(dict(m, registry=dict(m["registry"], burn_in_frame=0)))
+        self.assertTrue(any("under no registered burn-in rule" in p for p in probs), probs)
+        probs = graph.mask_evidence_problems(dict(m, registry={k: v for k, v in m["registry"].items() if k != "burn_in_frame"}))
+        self.assertTrue(probs and "no burn-in frame" in probs[0], probs)
+        blk = masked_block(g, reg, rsha)                                     # (the worlds block: the same rule)
+        blk["worlds"]["C06"]["burn_in"] = {"decided": True, "why": "x", "disposition": "exhausted"}
+        with self.assertRaisesRegex(graph.GraphError, "remain"):
+            graph.mask(g, blk, reg, rsha)
+
     def test_exclusive_publication(self):
         """Codex #77 r2 P2-4: a graph is published EXCLUSIVELY, as one serialized transaction under the directory's
         lock: the same bytes again are a no-op; other bytes are refused before anything is written (both files
@@ -541,7 +592,7 @@ def masked_block(g, reg, rsha, pending=()):
         return {"uuid": w["uuid"], "attempt_uuid": graph.attempt_uuid(w["uuid"], 0), "treatment": w["treatment"],
                 "block": w["block"], "status": status, "attempt": 0, "valid_before": first,
                 "first_zeros": {"prey": first} if first else {},
-                "burn_in": {"decided": graph.DISPOSITIONS[disp], "why": disp, "disposition": disp},
+                "burn_in": {"decided": graph.DISPOSITIONS[disp], "why": disp, "disposition": disp}, "prior_attempts": [],
                 "archived": sorted(int(f) for f, a in arch.items() if a["status"] == "verified"), "archive": arch,
                 "evidence": {"frontier": frontier, "accepted_through": frontier,
                              "first_terminal": {"frame": first, "kind": "prey"} if first else None, "refill": refill,

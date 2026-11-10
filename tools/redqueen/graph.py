@@ -698,6 +698,49 @@ def _sha(x):
     return isinstance(x, str) and len(x) == 64 and all(c in "0123456789abcdef" for c in x)
 
 
+def disposition_support(d, k, vb, fr, bi, maxr, prior):
+    """Why a burn-in disposition is NOT supported by the evidence and the REGISTERED rule (None: it is; Codex #77 r3
+    P1-2, the one rule the worlds block's and the mask's validators share): d the disposition, k the attempt, vb its
+    first terminal frame (None: none), fr its frontier, bi the registered burn-in frame (0: no rule), maxr the
+    registered max restarts, prior the earlier attempts' evidence [{"attempt", "first_terminal"}]:
+      no_rule: the registry has no burn-in rule (bi = 0);
+      established: a rule, no terminal before bi, and evidence through bi (a first terminal at or after it, or alive);
+      exhausted: a rule, an evidenced terminal before bi, the FINAL permitted attempt (k = maxr), and every earlier
+        attempt 0..k-1 with ITS OWN evidenced terminal before bi (the restarts it used were earned);
+      restart_pending: a rule, an early terminal, restarts left (k < maxr);
+      unresolved: a rule, no terminal, evidence short of bi;
+      not_installed: anything (nothing is evidenced)."""
+    early = vb is not None and vb < bi
+    if d == "not_installed":
+        return None
+    if d == "no_rule":
+        return None if not bi else f"no_rule, but the registered burn-in frame is {bi}"
+    if not bi:
+        return f"{d} under no registered burn-in rule (the disposition is no_rule)"
+    if d == "established":
+        return None if not early and fr >= bi else (f"established, but its first terminal {vb} is before the burn-in "
+                                                    f"frame {bi} or its evidence ({fr}) does not reach it")
+    if d == "restart_pending":
+        return None if early and k < maxr else f"restart_pending needs an early terminal and restarts left ({k} of {maxr})"
+    if d == "unresolved":
+        return None if vb is None and fr < bi else "unresolved, but its evidence decides it"
+    if d == "exhausted":
+        if not early:
+            return f"exhausted, but no evidenced terminal before the burn-in frame {bi} (first terminal {vb})"
+        if k != maxr:
+            return f"exhausted at attempt {k}, but the registry permits {maxr} restarts: {maxr - k} remain"
+        pa = prior if isinstance(prior, list) else []
+        got = sorted(x.get("attempt") for x in pa if isinstance(x, dict))
+        late = [x.get("attempt") for x in pa if isinstance(x, dict) and not (
+            isinstance(x.get("first_terminal"), dict) and _int(x["first_terminal"].get("frame"))
+            and x["first_terminal"]["frame"] < bi)]
+        if got != list(range(k)) or late:
+            return (f"exhausted, but its earlier attempts' early terminals are not all evidenced (attempts {got}, "
+                    f"without one before {bi}: {late})")
+        return None
+    return f"an unknown disposition {d!r}"
+
+
 def world_problems(bw, r, bi, maxr):
     """Contradictory or unsupported evidence in one world's worlds-block entry against its registry world r (the
     burn-in frame bi and max restarts maxr: the registry's) -> [problem] (Codex #77 r1 P1-1, P2-3)."""
@@ -731,13 +774,11 @@ def world_problems(bw, r, bi, maxr):
         p.append("its first_zeros contradict its first terminal boundary")
     elif vb > fr:
         p.append(f"its first terminal boundary {vb} lies past its evidence's frontier {fr}")
-    early = vb is not None and vb < bi
-    want = {"no_rule": not bi, "established": bool(bi) and not early and fr >= bi,
-            "exhausted": bool(bi) and early and k >= maxr, "restart_pending": bool(bi) and early and k < maxr,
-            "unresolved": bool(bi) and vb is None and fr < bi, "not_installed": True}
-    if not want[d]:
-        p.append(f"its disposition {d} is not supported by its evidence (first terminal {vb}, frontier {fr}, burn-in "
-                 f"frame {bi}, attempt {k} of {maxr} restarts)")
+    why = disposition_support(d, k, vb, fr, bi, maxr, bw.get("prior_attempts"))
+    if why:
+        p.append(f"its disposition {d} is not supported by its evidence: {why}")
+    if not isinstance(bw.get("prior_attempts"), list) or len(bw["prior_attempts"]) != k:
+        p.append(f"its earlier attempts' evidence (prior_attempts) is not recorded for attempts 0..{k - 1}")
     rf = ev.get("refill")
     if rf is not None and (not isinstance(rf, dict) or not _int(rf.get("frame"))):
         p.append("a malformed refill record")
@@ -889,6 +930,7 @@ def mask(g, block, registry, registry_sha256, block_sha256=None, rederived=False
                            "valid_before": bw.get("valid_before"), "first_terminal": ev.get("first_terminal"),
                            "frontier": ev["frontier"], "refill": ev.get("refill"), "stop": ev.get("stop"),
                            "burn_in": bw["burn_in"], "burn_in_decided": bw["burn_in"]["decided"],
+                           "prior_attempts": bw.get("prior_attempts"),
                            "unavailable_snapshots": {k: exc.get(k, 0) for k in EXCLUSION},
                            "first_unavailable_time": first, "available_sha256": shas}
     excluded, by = edge_exclusions(g, snaps)
@@ -913,8 +955,11 @@ def mask(g, block, registry, registry_sha256, block_sha256=None, rederived=False
 def mask_evidence_problems(m):
     """Why a mask's worlds and snapshots are not consistent with ITS OWN EVIDENCE -> [problem]: THE ONE MASK VALIDATOR
     graph.py (executable), plan.py (--exclusions) and sealing.py (availability) share (Codex #77 r2 P1-2):
-      per world an explicit burn-in disposition whose "decided" is its own (DISPOSITIONS); valid_before is its
-        first terminal boundary's frame (both or neither), at or before its evidence's frontier;
+      per world an explicit burn-in disposition whose "decided" is its own (DISPOSITIONS) AND that its evidence and
+        the mask's REGISTERED rule support (disposition_support with the mask's registry burn_in_frame and
+        max_restarts, Codex #77 r3 P1-2: "exhausted" only at the final permitted attempt with every earlier
+        attempt's early terminal evidenced, "established" / "no_rule" agreeing with the burn-in rule); valid_before
+        is its first terminal boundary's frame (both or neither), at or before its evidence's frontier;
       per snapshot its world's identity (uuid, attempt, snapshot uuid) and a cause;
       the excluded and the available frames of a world DISJOINT;
       an UNSETTLED attempt: every listed snapshot pending, none available (nothing about it is decided);
@@ -926,6 +971,10 @@ def mask_evidence_problems(m):
     W, S = m.get("worlds"), m.get("snapshots")
     if not isinstance(W, dict) or not isinstance(S, dict):
         return ["the mask has no worlds / snapshots"]
+    reg = m.get("registry") or {}
+    bi, maxr = reg.get("burn_in_frame"), reg.get("max_restarts")
+    if not (_int(bi) and bi >= 0 and _int(maxr) and maxr >= 0):
+        return ["the mask's registry records no burn-in frame / max restarts (its dispositions cannot be checked)"]
     probs, by = [], defaultdict(dict)
     for key, s in sorted(S.items()):
         if (not isinstance(s, dict) or s.get("world") not in W or not _int(s.get("frame")) or s.get("status") not in EXCLUSION
@@ -953,6 +1002,13 @@ def mask_evidence_problems(m):
             continue
         if vb is not None and (not _int(vb) or vb > fr):
             probs.append(f"{wid}: its first terminal boundary lies past its evidence's frontier")
+        k = w.get("attempt")
+        if not _int(k) or not 0 <= k <= maxr:
+            probs.append(f"{wid}: attempt {k!r} is not a registered attempt (0..{maxr})")
+            continue
+        why = disposition_support(b["disposition"], k, vb, fr, bi, maxr, w.get("prior_attempts"))
+        if why:
+            probs.append(f"{wid}: its disposition is not supported: {why}")
         av = w.get("available_sha256") or {}
         if not isinstance(av, dict) or not all(str(f).isdigit() and _sha(x) for f, x in av.items()):
             probs.append(f"{wid}: malformed available snapshots")

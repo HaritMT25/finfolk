@@ -23,7 +23,8 @@ end) gives plan/2 rows.
 --exclusions (design /2, with --against; Annex H D6 rule 27): graph.py mask's availability mask (its
     "snapshots": world x frame -> biological / technical / pending, evidence-bound). The mask must
     describe the REGISTERED intent (Codex #77 r1 P1-2, r2): the design's "availability" binding names the
-    scheduled graph's edges_sha256, the registry's sha256, its max restarts and, with external
+    scheduled graph's edges_sha256, the registry's sha256, its burn-in rule (max restarts, burn-in
+    frame: every disposition is checked against it) and, with external
     (sentinel) references, the registered reference assignment's sha256 (references_sha256, read with
     --references); the binding is part of EVERY generated row, so --against refuses a substituted one;
     the mask's own evidence must be consistent (graph.mask_evidence_problems, the validator graph.py and
@@ -102,7 +103,8 @@ Design /2 (design v3 §3.5, §4, §4.6, §7.1):
   "long": {"fraction": 0.125, "strata": ["family", "prey_world"],    # (STRATA lists the keys)
            "family_priority": ["reference", "cross", ...]},          # (a merged pair's primary family)
   "edges": "/abs/config/edges.jsonl" | [...],
-  "availability": {"graph_edges_sha256": ..., "registry_sha256": ..., "max_restarts": 8}
+  "availability": {"graph_edges_sha256": ..., "registry_sha256": ..., "max_restarts": 8,
+                   "burn_in_frame": 5000000}
 }                                            # (the registered binding --exclusions verifies)
 An EDGE (one line): {"edge": "e000001", "family": "within", "role": "training" | "validation" |
 "test" | "support" | "audit" | "diagnostic", "prey": {"world", "time"}, "predators": {"world",
@@ -611,14 +613,16 @@ REFS_SCHEMA = "finfolk.redqueen.references/1"
 
 def binding_problems(b):
     """Why a design's "availability" binding is malformed (None: well formed): graph_edges_sha256, registry_sha256,
-    max_restarts and, when the design reads external (sentinel) references, references_sha256."""
+    the registry's burn-in rule (max_restarts, burn_in_frame: 0 for none; Codex #77 r3: the dispositions are checked
+    against them) and, when the design reads external (sentinel) references, references_sha256."""
     if not (isinstance(b, dict) and all(isinstance(b.get(k), str) and len(b[k]) == 64
-                                        for k in ("graph_edges_sha256", "registry_sha256")) and _int(b.get("max_restarts"))
-            and set(b) <= {"graph_edges_sha256", "registry_sha256", "max_restarts", "references_sha256"}
+                                        for k in ("graph_edges_sha256", "registry_sha256"))
+            and _int(b.get("max_restarts")) and _int(b.get("burn_in_frame")) and b["burn_in_frame"] >= 0
+            and set(b) <= {"graph_edges_sha256", "registry_sha256", "max_restarts", "burn_in_frame", "references_sha256"}
             and (b.get("references_sha256") is None or (isinstance(b["references_sha256"], str)
                                                          and len(b["references_sha256"]) == 64))):
         return ("the design registers no well-formed availability binding (availability: graph_edges_sha256, "
-                "registry_sha256, max_restarts[, references_sha256])")
+                "registry_sha256, max_restarts, burn_in_frame[, references_sha256])")
     return None
 
 
@@ -668,6 +672,8 @@ def mask_binding_problems(design, m, ref_uuids=frozenset()):
         probs.append("the mask (or its worlds block) binds another registry than the registered one")
     if reg.get("max_restarts") != b["max_restarts"]:
         probs.append(f"the mask's registry allows {reg.get('max_restarts')} restarts, the design {b['max_restarts']}")
+    if reg.get("burn_in_frame") != b["burn_in_frame"]:
+        probs.append(f"the mask's registry burn-in frame {reg.get('burn_in_frame')} is not the design's {b['burn_in_frame']}")
     dw, mw = design.get("worlds") or {}, m["worlds"]
     covered = set()
     for wn, w in sorted(mw.items()):
