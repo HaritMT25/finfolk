@@ -400,8 +400,11 @@ assert w["pattern"].endswith("end.{frame}.json") and w["paths"]["F1"].endswith("
 for w in b["worlds"].values():
     assert w["archived"] == sorted(b["times"].values()), w["archived"]
     assert {e["status"] for e in w["archive"].values()} == {"verified"}, w["archive"]
-    assert (w["evidence"]["frontier"], w["evidence"]["stop"], w["attempt"], w["attempt_uuid"]) == \
-        (24000, None, 0, w["uuid"]), w["evidence"]
+    ev, ft = w["evidence"], w["evidence"]["first_terminal"]
+    # (the frontier is the first absorbing terminal boundary when one is evidenced: these worlds run on past it)
+    assert (ev["frontier"], ev["stop"], ev["accepted_through"], w["valid_before"]) == \
+        ((ft["frame"] if ft else 24000), None, 24000, (ft["frame"] if ft else None)), ev
+    assert (w["attempt"], w["attempt_uuid"]) == (0, w["uuid"]), w
     assert w["burn_in"]["disposition"] in ("no_rule", "established", "unresolved"), w["burn_in"]
 assert b["evidence"]["schema"] == "finfolk.redqueen.blockevidence/1"
 PY
