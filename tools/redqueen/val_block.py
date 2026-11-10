@@ -23,7 +23,11 @@ integral counts, in exactly the --log-every sequence from the segment's start: s
 not evidence. The chain's observations end (observed_through) at the first gap: a missing runs/ or
 main CSV, a damaged or out-of-sequence row inside a segment's covered span, rows that stop before the
 frame the next segment resumed from, or a chain that does not reach a fresh segment. Every such gap
-is listed in "technical"; what lies past it is TECHNICALLY UNAVAILABLE, never "no zero".
+is listed in "technical"; what lies past it is TECHNICALLY UNAVAILABLE, never "no zero". The rules are
+evidence.py's (the one implementation worlds.py's ecology export shares): also, the first sampled zero of
+either guild ends the observations (later overshoot rows never resolve the other guild), and a predator
+refill (predator_reseeds_cum above the founders' 0) ends them at the sample before it (a protocol-
+integrity event, listed in "technical").
 
 THE BLOCK, per world (the current attempt only):
   uuid       the registry's for attempt 0; for attempt k > 0 a distinct one, uuid5(NAMESPACE_URL,
@@ -55,6 +59,7 @@ import uuid
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+import evidence  # noqa: E402
 import rqlib  # noqa: E402
 
 SCHEMA = "finfolk.redqueen.worldsblock/1"
@@ -63,7 +68,6 @@ LOG_EVERY = 5000                       # (runner_val.py's --log-every)
 CK_RE = re.compile(r"^end\.(\d+)\.json$")
 CMD_RE = re.compile(r"^seg(\d{3})\.cmd$")
 LOAD_RE = re.compile(r"--load-checkpoint\s+end\.(\d+)\.json(\s|$)")
-INT_RE = re.compile(r"^\d+$")
 
 
 class BlockError(Exception):
@@ -83,72 +87,40 @@ def _segments(adir):
     return out
 
 
-def _rows(path, start, upto, log_every):
-    """The validated rows (frame, prey, predators) of a segment's main CSV from `start` through `upto` (None:
-    to its end), the bytes read and why they stop short (None: they reach `upto`, or the file's end)."""
-    with open(path, "rb") as fh:
-        raw = fh.read()
-    raw = raw[: raw.rfind(b"\n") + 1]                     # (an UNTERMINATED trailing record is no record)
-    lines = raw.split(b"\n")[:-1]
-    if not lines:
-        return [], raw, "an empty main CSV"
-    head = lines[0].decode("utf-8", "replace").strip().split(",")
-    if "population" not in head or "predator_pop" not in head:
-        raise BlockError(f"{path}: no population / predator_pop columns")
-    ip, iq = head.index("population"), head.index("predator_pop")
-    out, prev = [], start
-    for n, ln in enumerate(lines[1:], 2):
-        p = ln.decode("utf-8", "replace").strip().split(",")
-        ok = len(p) == len(head) and INT_RE.match(p[0]) and INT_RE.match(p[ip]) and INT_RE.match(p[iq])
-        if ok and upto is not None and int(p[0]) > upto:
-            return out, raw, None                         # (past the frame the next segment resumed from)
-        if not ok or int(p[0]) != prev + log_every:
-            return out, raw, f"line {n}: a damaged or out-of-sequence row after frame {prev}"
-        prev = int(p[0])
-        out.append((prev, int(p[ip]), int(p[iq])))
-    if upto is not None and prev < upto:
-        return out, raw, f"its rows end at frame {prev}, before frame {upto} (where the next segment resumed)"
-    return out, raw, None
-
-
 def observations(adir, log_every=LOG_EVERY):
-    """The attempt's observation chain (see THE OBSERVATION CHAIN) -> (first zero frame or None,
-    observed_through, technical problems, chain evidence)."""
+    """The attempt's observation chain (see THE OBSERVATION CHAIN; the rules are evidence.py's, shared with
+    worlds.py's ecology export) -> (first zero frame or None, observed_through, technical problems, chain
+    evidence)."""
     segs = _segments(adir)
     if not segs:
         return None, 0, ["no segment command lines (segNNN.cmd)"], []
-    chain, upto = [], None
-    for k, s in reversed(segs):                           # (back from the last segment to a fresh one)
-        if upto is not None and s >= upto:
-            continue                                      # (wholly superseded by a resume from an earlier frame)
-        chain.append((k, s, upto))
-        upto = s
-        if s == 0:
-            break
-    chain.reverse()
-    tech, ev, zero, through = [], [], None, 0
-    if chain[0][1] != 0:
-        return None, 0, [f"the chain does not reach a fresh segment (seg{chain[0][0]:03d} resumed from "
-                         f"frame {chain[0][1]})"], []
-    for k, s, upto in chain:
-        p = os.path.join(adir, "runs", f"seg{k:03d}.csv")
+    chain, prob = evidence.chain_cuts([(f"seg{k:03d}", s) for k, s in segs], 0)
+    if prob:
+        return None, 0, [prob], []
+    tech, ev, samples = [], [], []
+    for name, s, upto in chain:
+        p = os.path.join(adir, "runs", f"{name}.csv")
         if not os.path.isfile(p):
-            tech.append(f"seg{k:03d}: no main CSV (runs/seg{k:03d}.csv)")
+            tech.append(f"{name}: no main CSV (runs/{name}.csv)")
             break
-        rows, raw, why = _rows(p, s, upto, log_every)
-        ev.append({"segment": f"seg{k:03d}", "start_frame": s, "until": upto, "rows": len(rows),
-                   "through": rows[-1][0] if rows else s, "csv_sha256": rqlib.sha256_bytes(raw)})
-        for f, q, r in rows:
-            if q == 0 or r == 0:
-                zero = f
-                break
-        through = rows[-1][0] if rows else s
-        if zero is not None:
-            break
+        raw = rqlib.read_bytes(p)
+        try:
+            rows, why = evidence.segment_rows(raw, s, log_every, upto, cols=(evidence.REFILL_COL,))
+        except evidence.EvidenceError as e:
+            raise BlockError(f"{p}: {e}")
+        ev.append({"segment": name, "start_frame": s, "until": upto, "rows": len(rows),
+                   "through": rows[-1][0] if rows else s, "csv_sha256": rqlib.sha256_bytes(evidence.complete(raw))})
+        samples += rows
         if why:
-            tech.append(f"seg{k:03d}: {why}")
+            tech.append(f"{name}: {why}")
             break
-    return zero, through, tech, ev
+    obs = evidence.terminal(samples)                    # (the first absorbing terminal; refills vs the founders' 0)
+    if obs["refill"]:
+        r = obs["refill"]
+        tech.append(f"a predator refill at frame {r['frame']} (predator_reseeds_cum {r['value']} > {r['baseline']}): "
+                    "a protocol-integrity event; nothing after it is evidence of natural coexistence")
+    zero = obs["first_terminal"]["frame"] if obs["first_terminal"] else None
+    return zero, obs["frontier"], tech, ev
 
 
 def archived(adir):

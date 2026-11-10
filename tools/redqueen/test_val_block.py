@@ -178,6 +178,24 @@ class TestValBlock(unittest.TestCase):
             f.write(text.replace("30000000,1.0,500,10\n", ""))
         self.assertEqual(self.block()["worlds"]["w09"]["observed_through"], 29 * M)
 
+    def test_first_terminal_and_refills_as_evidence_py(self):
+        """Codex #75 r1 (shared with the ecology export): the prey's zero at 70M ends the observations, the
+        predators' later zero is overshoot; a refill at 50M ends them at 49M, a protocol-integrity event."""
+        ad = adir(self.root, "w01")
+        with open(os.path.join(ad, "runs", "seg001.csv"), "w") as f:
+            f.write(HEAD + "".join(f"{x},1.0,{0 if x >= 70 * M else 500},{0 if x >= 72 * M else 10}\n"
+                                   for x in range(61 * M, 101 * M, M)))
+        v = self.block()["worlds"]["w01"]
+        self.assertEqual((v["valid_before"], v["observed_through"]), (70 * M, 70 * M))
+        ad = adir(self.root, "w02")
+        h = "step,elapsed_s,population,predator_pop,predator_reseeds_cum\n"
+        with open(os.path.join(ad, "runs", "seg000.csv"), "w") as f:
+            f.write(h + "".join(f"{x},1.0,500,10,{1 if x >= 50 * M else 0}\n" for x in range(M, 61 * M, M)))
+        v = self.block()["worlds"]["w02"]
+        self.assertEqual((v["valid_before"], v["observed_through"]), (None, 49 * M))
+        self.assertTrue(any("refill at frame 50000000" in t for t in v["technical"]), v["technical"])
+        self.assertEqual(max(v["archived"]), 49 * M)
+
     def test_refusals_and_cli(self):
         bad = os.path.join(adir(self.root, "w02"), "runs", "seg000.csv")
         with open(bad, "w") as f:
