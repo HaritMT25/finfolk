@@ -412,29 +412,56 @@ def eco_doc(reg, dead=(), refill=(), q200=None):
             "summary": {t: {"first_attempt": {"survival": {"200000000": {"N": n}}}} for t, n in (("C", 32), ("A", 16), ("B", 16))}}
 
 
-def hc_slopes(reg, missing=(), effect=0.3):
-    """Per world (neural, scripted) slopes: C worlds d = effect (+ a small world term), controls d = 0."""
+def hc_slopes(reg, missing=(), effect=0.3, incomplete=()):
+    """Per world H-C coarse fit records: C worlds d = effect (+ a small world term), controls d = 0, each certified
+    complete; `missing` worlds a failed fit (a nonfinite slope), `incomplete` ones finite but not certified."""
     out = {}
     for k, w in enumerate(reg):
         if w["id"] in missing:
-            out[w["id"]] = {"neural": float("nan"), "scripted": 0.1}
+            out[w["id"]] = {"neural": float("nan"), "scripted": 0.1, "complete": True}
             continue
         d = (effect + 0.01 * (k % 3)) if w["treatment"] == "C" else 0.001 * (k % 2)
-        out[w["id"]] = {"neural": 0.5 + d, "scripted": 0.5}
+        out[w["id"]] = {"neural": 0.5 + d, "scripted": 0.5, "complete": w["id"] not in incomplete}
     return out
+
+
+def mask_doc(reg, gaps):
+    """A graphmask/2 of the registry (every world established at attempt 0, 5M burn-in, 8 restarts) whose snapshots
+    are the given technical gaps {(world, t): why}; its own evidence consistent (graph.mask_evidence_problems)."""
+    est = {"decided": True, "disposition": "established", "why": "alive at the burn-in frame"}
+    W = {w["id"]: {"uuid": f"u-{w['id']}", "attempt": 0, "attempt_uuid": f"u-{w['id']}", "burn_in": est,
+                   "valid_before": None, "first_terminal": None, "frontier": 200_000_000, "refill": None,
+                   "prior_attempts": [], "available_sha256": {}} for w in reg}
+    import uuid
+
+    def snap(u, f):                            # (plan.py's snapshot uuid recipe)
+        return str(uuid.uuid5(uuid.NAMESPACE_URL, f"finfolk:snapshot:{u}:{int(f)}"))
+    S = {f"{w}:{1 if t == 0 else t * 1_000_000}": {
+        "world": w, "time": t, "frame": 1 if t == 0 else t * 1_000_000, "status": "technical", "why": why,
+        "uuid": f"u-{w}", "attempt": 0, "snapshot": snap(f"u-{w}", 1 if t == 0 else t * 1_000_000)}
+        for (w, t), why in gaps.items()}
+    return {"schema": stats.MASK_SCHEMA, "graph": {"edges_sha256": "g" * 64},
+            "registry": {"sha256": "r" * 64, "burn_in_frame": 5_000_000, "max_restarts": 8}, "worlds": W, "snapshots": S}
+
+
+def has_validator():
+    import graph as graphlib
+    return hasattr(graphlib, "mask_evidence_problems")
 
 
 class TestEligibility(unittest.TestCase):
     """THE ELIGIBILITY DISPATCHER (Annex H D6 rules 26-27, 33; D7 rules 36-38): |Q200| >= 24 only for H-P/Q/F/T on the
-    common Q200; H-C independently by usable blocks with count weights; unavailable rows as p = 1 in Holm."""
+    common Q200; H-C independently by usable blocks with count weights; unavailable rows as p = 1 in Holm; technical
+    gaps and failed / incomplete fits pending repair, never dropped (Codex #68 D6)."""
 
     def setUp(self):
         self.reg = {"worlds": layout64()}
 
-    def run_(self, dead=(), refill=(), missing=(), mask=None, results=None):
+    def run_(self, dead=(), refill=(), missing=(), incomplete=(), mask=None, results=None):
         reg = self.reg
-        rec, D, W = stats.eligibility(eco_doc(reg["worlds"], dead, refill), reg, hc_slopes(reg["worlds"], missing),
-                                      registry_sha256="r" * 64, mask=mask, eco_sha256="e" * 64)
+        rec, D, W = stats.eligibility(eco_doc(reg["worlds"], dead, refill), reg,
+                                      hc_slopes(reg["worlds"], missing, incomplete=incomplete), registry_sha256="r" * 64,
+                                      mask=mask, eco_sha256="e" * 64, mask_sha256=None if mask is None else "m" * 64)
         return rec, D, W, stats.decide(rec, results or {}, D, W)
 
     def test_fewer_than_24_survivors_with_usable_hc_blocks(self):
@@ -442,7 +469,7 @@ class TestEligibility(unittest.TestCase):
         never used), while H-C keeps all eight usable blocks (>= 1 C in each), is tested and decided under Holm at
         its reached active level; the ecology is bound, consuming no alpha."""
         dead = [f"C{b}{k}" for b in range(1, 6) for k in (0, 1)]
-        res = {h: {"p": 1e-9, "worlds": []} for h in stats.Q200_FAMILY}
+        res = {h: {"available": True, "p": 1e-9, "worlds": []} for h in stats.Q200_FAMILY}
         rec, D, W, dec = self.run_(dead=dead, results=res)
         self.assertEqual((rec["Q200"]["count"], rec["Q200"]["available"]), (22, False))
         for h in stats.Q200_FAMILY:
@@ -478,34 +505,58 @@ class TestEligibility(unittest.TestCase):
         self.assertTrue(dec["decision"]["H-C"])
 
     def test_block_with_an_ineligible_control(self):
-        """Block 5 loses both B controls (one ended, one without its complete 200M coarse measurements) and is
-        unusable; block 6's refilled A is ineligible (a refill never establishes natural coexistence) but its other
-        A keeps the block usable: 7 usable blocks, floor 1/128; no control is selected or replaced."""
-        rec, D, W, dec = self.run_(dead=["B50"], refill=["A60"], missing=["B51"])
+        """Block 5 loses both B controls (their histories ended) and is unusable; block 6's refilled A is ineligible (a
+        refill never establishes natural coexistence) but its other A keeps the block usable: 7 usable blocks, floor
+        1/128; no control is selected or replaced. (Codex #68 D6 P2-1) A complete-history control whose H-C fit
+        FAILED, or whose finite slopes are not certified complete, is never an exclusion: H-C is pending repair."""
+        rec, D, W, dec = self.run_(dead=["B50", "B51"], refill=["A60"])
         hc = rec["hypotheses"]["H-C"]
         self.assertEqual((hc["n_blocks"], hc["p_floor"], sorted(D)), (7, 1 / 128, [1, 2, 3, 4, 6, 7, 8]))
         self.assertIn("0 B", hc["unusable_blocks"]["5"])
-        self.assertIn("incomplete", rec["ineligible"]["B51"])
         self.assertIn("refill", rec["ineligible"]["A60"])
         self.assertEqual(hc["counts"]["6"], {"C": 4, "A": 1, "B": 2})
         self.assertEqual(dec["pvalues"]["H-C"], 1 / 128)
         self.assertNotIn("A60", rec["eligible"]["A"])
+        for kw, status in (({"missing": ["B51"]}, "failed"), ({"incomplete": ["B51"]}, "incomplete")):
+            rec2, D2, W2, dec2 = self.run_(dead=["B50"], refill=["A60"], **kw)
+            h2 = rec2["hypotheses"]["H-C"]
+            self.assertEqual((h2["available"], h2["fits"]), (False, {"B51": status}))
+            self.assertIn("pending repair", h2["reason"])
+            self.assertIn("pending repair", rec2["ineligible"]["B51"])
+            self.assertIsNone(dec2["pvalues"]["H-C"])
+            self.assertFalse(dec2["decision"]["H-C"])
 
     def test_q200_population_and_holm_rows(self):
-        """With >= 24 survivors H-P / H-Q / H-F / H-T enter with their p-values only when computed on EXACTLY the
-        common Q200 (another population is refused); a missing result is an unavailable row (p = 1); fewer than two
-        usable blocks make H-C unavailable (p = 1), never dropped from the five-row Holm family."""
+        """With >= 24 survivors H-P / H-Q / H-F / H-T enter only through their ANALYSIS RESULTS (Codex #68 D6 P2-4:
+        family_p): available, computed on EXACTLY the common Q200 (another population is refused), H-F with its
+        calibrated critical value (its model p only when S_F exceeds c_F), H-T with its frozen critical value; an
+        unavailable or uncalibrated result is an unavailable row (p = 1); fewer than two usable blocks make H-C
+        unavailable (p = 1), never dropped from the five-row Holm family."""
         rec, D, W = stats.eligibility(eco_doc(self.reg["worlds"]), self.reg, hc_slopes(self.reg["worlds"]),
                                       registry_sha256="r" * 64)
         q = rec["Q200"]["worlds"]
         self.assertEqual(len(q), 32)
-        res = {"H-P": {"p": 0.001, "worlds": q}, "H-Q": {"p": 0.004, "worlds": list(reversed(q))}, "H-F": {"p": None}}
+        res = {"H-P": {"available": True, "p": 0.001, "worlds": q},
+               "H-Q": {"available": True, "p": 0.004, "worlds": list(reversed(q))},
+               "H-F": {"available": True, "S_F": 0.2, "c_F": 0.5, "p_F": 0.001, "worlds": q},
+               "H-T": {"available": False, "p_model": 0.001, "c_T": 1.0, "T_T": 3.0, "worlds": q, "failure": "numerical"}}
         dec = stats.decide(rec, res, D, W)
         self.assertEqual((dec["pvalues"]["H-P"], dec["pvalues"]["H-Q"], dec["pvalues"]["H-F"], dec["pvalues"]["H-T"]),
-                         (0.001, 0.004, None, None))
-        self.assertEqual(sorted(dec["holm"]["unavailable"]), ["H-F", "H-T"])
+                         (0.001, 0.004, 1.0, None))                      # (S_F <= c_F: never a rejection; H-T failed)
+        self.assertIn("unavailable", dec["unavailable"]["H-T"])
+        self.assertEqual(sorted(dec["holm"]["unavailable"]), ["H-T"])
+        self.assertEqual(stats.family_p("H-F", dict(res["H-F"], S_F=0.9)), (0.001, None))
+        self.assertIsNone(stats.family_p("H-F", dict(res["H-F"], c_F=None))[0])
+        self.assertEqual(stats.family_p("H-T", dict(res["H-T"], available=True)), (0.001, None))
+        self.assertEqual(stats.family_p("H-T", dict(res["H-T"], available=True, T_T=0.5)), (1.0, None))
+        self.assertIsNone(stats.family_p("H-T", dict(res["H-T"], available=True, c_T=None))[0])
+        self.assertIsNone(stats.family_p("H-P", {"available": False, "p": 0.001})[0])
         with self.assertRaisesRegex(stats.StatsError, "another population"):
-            stats.decide(rec, {"H-P": {"p": 0.001, "worlds": q[1:]}}, D, W)
+            stats.decide(rec, {"H-P": {"available": True, "p": 0.001, "worlds": q[1:]}}, D, W)
+        stats.require_population(rec, "H-P", q)
+        stats.require_population(rec, "H-C", rec["hypotheses"]["H-C"]["worlds"])
+        with self.assertRaisesRegex(stats.StatsError, "registered population"):
+            stats.require_population(rec, "H-F", q[1:])
         dead = [w["id"] for w in self.reg["worlds"] if w["treatment"] != "C" and w["block"] > 1]
         rec1, D1, W1 = stats.eligibility(eco_doc(self.reg["worlds"], dead), self.reg, hc_slopes(self.reg["worlds"]))
         dec1 = stats.decide(rec1, {}, D1, W1)
@@ -513,27 +564,40 @@ class TestEligibility(unittest.TestCase):
                          (False, None, 1.0))
         self.assertIn("1 usable block", dec1["unavailable"]["H-C"])
         self.assertEqual(sorted(dec1["decision"]), sorted(stats.HYPOTHESES))
+        with self.assertRaisesRegex(stats.StatsError, "is unavailable"):
+            stats.require_population(rec1, "H-C", [])
 
     def test_ecology_export_and_technical_gaps(self):
-        """The ecological export must be this registry's and its Q200 its own slots' (recomputed); a technical gap
-        (a mask's excluded coarse snapshot of an otherwise complete world) is reported and pending repair: the world
-        stays in Q200, the affected decisions are unavailable, nothing is silently dropped."""
+        """The ecological export must be this registry's and its Q200 its own slots' (recomputed). (Codex #68 D6 P2-2)
+        A bound mask needs its bytes' sha256 and #77's shared validator; a technical gap at ANY graph time (here
+        11M: a fine / reference time, not a coarse one) of a Q200 world makes H-P / H-Q / H-F / H-T pending repair
+        (the world stays in Q200), while H-C (its coarse measurements intact) stays available; a coarse gap makes H-C
+        pending repair too."""
         reg = self.reg
         for bad, msg in ((dict(eco_doc(reg["worlds"]), registry_sha256="x" * 64), "another registry"),
                          (eco_doc(reg["worlds"], q200=["C10"]), "Q200 is not its own"),
                          (dict(eco_doc(reg["worlds"]), schema="x"), "ecology schema")):
             with self.assertRaisesRegex(stats.StatsError, msg):
                 stats.eligibility(bad, reg, hc_slopes(reg["worlds"]), registry_sha256="r" * 64)
-        mask = {"schema": stats.MASK_SCHEMA, "sha256": "m" * 64,
-                "snapshots": {"C11:50000000": {"status": "technical", "why": "not archived, and attempt 0 is done"}}}
+        mask = mask_doc(reg["worlds"], {("C11", 11): "not archived, and attempt 0 is done"})
+        with self.assertRaisesRegex(stats.StatsError, "mask_sha256"):
+            stats.eligibility(eco_doc(reg["worlds"]), reg, hc_slopes(reg["worlds"]), mask=mask)
+        if not has_validator():
+            with self.assertRaisesRegex(stats.StatsError, "mask_evidence_problems"):
+                self.run_(mask=mask)
+            self.skipTest("graph.mask_evidence_problems (#77) is not on this branch yet")
         rec, D, W, dec = self.run_(mask=mask)
         self.assertIn("C11", rec["Q200"]["worlds"])
-        self.assertEqual(rec["technical_gaps"], {"C11": [[50, "technical", "not archived, and attempt 0 is done"]]})
-        for h in stats.HYPOTHESES:
+        self.assertEqual(rec["technical_gaps"], {"C11": [[11, "technical", "not archived, and attempt 0 is done"]]})
+        self.assertEqual(rec["mask"]["sha256"], "m" * 64)
+        for h in stats.Q200_FAMILY:
             self.assertFalse(rec["hypotheses"][h]["available"], h)
             self.assertIn("pending repair", rec["hypotheses"][h]["reason"])
             self.assertIsNone(dec["pvalues"][h])
-        self.assertIn("excluded by the mask", rec["ineligible"]["C11"])
+        self.assertTrue(rec["hypotheses"]["H-C"]["available"])
+        rec2, _, _, _ = self.run_(mask=mask_doc(reg["worlds"], {("C11", 50): "not archived"}))
+        self.assertFalse(rec2["hypotheses"]["H-C"]["available"])
+        self.assertIn("excluded by the mask", rec2["ineligible"]["C11"])
 
 
 if __name__ == "__main__":
