@@ -194,6 +194,7 @@ if __name__ == "__main__":                 # one BLAS thread per process: honest
 import numpy as np  # noqa: E402
 
 import backbone  # noqa: E402
+import graph as graphlib  # noqa: E402
 import noisescale  # noqa: E402
 import recurrence  # noqa: E402
 import stats  # noqa: E402
@@ -2928,11 +2929,37 @@ def read_records(paths):
 GRAPH_TIMES = tuple(range(201))          # (graph.TIMES: every graph time, 0..200M)
 
 
-def panel_problems(g):
-    """The REQUIRED panel coverage of one qualifying world (Codex #68 D6 P2-3; graph.py's design): the complete
-    coarse 41 x 41 within-world grid, and its four predator-reference (RQ) and four prey-reference (RP) series,
-    each at EVERY graph time (graph.TIMES, 0..200M) -> [problem]."""
+def registered_fine(intensive=False, lag=None):
+    """graph.build's registered FINE within-world pairs of a C world beyond its coarse grid (Codex #68 D6 r2 P2-3)
+    -> {(prey time, predator time)} in calib's times (0 -> 1e-6): in every fine window (graph.WINDOWS) each time
+    with each registered offset (graph.OFFSETS) inside the window; an INTENSIVE world's complete window grids; a
+    non-intensive world's lag probe (the coarse prey times at +-lag, when the graph registers one)."""
+    req = set()
+    for lo, hi in graphlib.WINDOWS:
+        for s in range(lo, hi + 1):
+            req |= {(s, s + o) for o in graphlib.OFFSETS if lo <= s + o <= hi}
+            if intensive:
+                req |= {(s, t) for t in range(lo, hi + 1)}
+    if lag and not intensive:
+        req |= {(s, s + d) for s in range(0, 201, 5) for d in (lag, -lag) if 0 <= s + d <= 200}
+    req -= {(a, b) for a in range(0, 201, 5) for b in range(0, 201, 5)}
+
+    def tt(x):
+        return 1e-6 if x == 0 else float(x)
+    return {(tt(a), tt(b)) for a, b in req}
+
+
+def panel_problems(g, intensive=False, lag=None):
+    """The REQUIRED panel coverage of one qualifying world (Codex #68 D6 P2-3 and r2; graph.py's design): the
+    complete coarse 41 x 41 within-world grid, its registered FINE within-world pairs (registered_fine: the fine
+    windows, an intensive world's complete window grids, the lag probe), and its four predator-reference (RQ) and
+    four prey-reference (RP) series, each at EVERY graph time (graph.TIMES, 0..200M) -> [problem]."""
     probs = [] if g.coarse else ["its coarse 41 x 41 within-world grid is incomplete"]
+    miss = registered_fine(intensive, lag) - set(zip(g.ti.tolist(), g.tj.tolist()))
+    if miss:
+        a, b = min(miss)
+        probs.append(f"its {'intensive ' if intensive else ''}fine within-world panel misses {len(miss)} registered "
+                     f"pair(s) (e.g. {a:g}M -> {b:g}M)")
     full = {1e-6 if t == 0 else float(t) for t in GRAPH_TIMES}
     for what, T, R in (("predator-reference (RQ)", g.cT, g.cR), ("prey-reference (RP)", g.qT, g.qR)):
         refs = sorted(set(R.tolist()), key=str)
@@ -2949,8 +2976,10 @@ def eligible_graph(path, elig_path, hyp):
     """The ACTUAL QUALIFYING C graph (Annex H D6 §§9.1-9.4; stats.eligibility's record) for hyp (H-F or H-T): the
     dispatcher must have made hyp AVAILABLE (its own flag: |Q200| >= 24 AND no technical gap pending repair; never
     a smaller-n substitute), the record's bound mask must be THIS graph's (graphmask/2 graph.edges_sha256 against
-    the graph's edges), and every world of hyp's population (the common Q200) must carry its REQUIRED panels in the
-    graph (panel_problems) -> (the graph restricted to that population, its source: the graph file's and the
+    the graph's edges; its meta, beside it, those edges' and that namespace's: the intensive worlds re-derived by
+    graph.splits), and every world of hyp's population (the common Q200) must carry its REQUIRED panels in the
+    graph (panel_problems: coarse, fine, intensive and lag-probe within pairs, the reference series) -> (the graph
+    restricted to that population, its source: the graph file's and the
     eligibility record's sha256). The stress24 stratum is drawn from it (stratum_worlds). Codex #68 D6 P2-3."""
     with open(elig_path, "rb") as f:
         raw = f.read()
@@ -2971,11 +3000,25 @@ def eligible_graph(path, elig_path, hyp):
     if m.get("graph_edges_sha256") != esha:
         raise CalibError("the eligibility record's bound mask is not this graph's (its graph.edges_sha256 "
                          f"{str(m.get('graph_edges_sha256'))[:16]}, the graph's edges {esha[:16]})")
+    try:                                       # (graph.write's meta: the registered design of these edges)
+        with open(os.path.join(os.path.dirname(os.path.abspath(path)), "graph.meta.json")) as f:
+            meta = json.load(f)
+    except (OSError, ValueError) as e:
+        raise CalibError(f"the graph's meta (graph.meta.json beside it) is unreadable: {e}") from None
+    if meta.get("edges_sha256") != esha or meta.get("namespace") != m.get("graph_namespace"):
+        raise CalibError("the graph's meta is not these edges' or not the bound mask's graph (edges_sha256 / "
+                         "namespace)")
+    try:
+        intensive = graphlib.splits(meta["namespace"], meta["worlds"])[2]
+    except (graphlib.GraphError, KeyError, TypeError) as e:
+        raise CalibError(f"the graph's registered design cannot be re-derived from its meta: {e}") from None
+    if sorted(meta.get("intensive") or []) != intensive:
+        raise CalibError("the graph's intensive worlds are not its registered design's (graph.splits)")
     g = load_graph(path, q)
     miss = sorted(set(q) - {x.id for x in g})
     if miss:
         raise CalibError(f"{len(miss)} Q200 world(s) without their complete fixed panels in the graph: {miss[:5]}")
-    bad = {x.id: p for x in g for p in [panel_problems(x)] if p}
+    bad = {x.id: p for x in g for p in [panel_problems(x, x.id in intensive, meta.get("lag_probe"))] if p}
     if bad:
         w = sorted(bad)
         raise CalibError(f"{len(w)} Q200 world(s) without their complete fixed panels in the graph: "

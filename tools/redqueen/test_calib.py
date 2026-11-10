@@ -335,68 +335,113 @@ class TestGenerator(unittest.TestCase):
         self.assertAlmostEqual(hi, 0.825, places=12)
 
     def test_eligible_graph(self):
-        """Annex H D6 §§9.1-9.4 (#68 eligibility; Codex #68 D6 P2-3 / P3): H-F / H-T calibrate on the ACTUAL
-        qualifying C graph: the graph restricted to the hypothesis's population under stats.eligibility's record,
-        only when the DISPATCHER made that hypothesis available (its own flag: a pending repair refuses even with
-        |Q200| >= 24; below 24 refused, no smaller-n substitute), only on the graph the record's bound mask names
-        (its graph.edges_sha256), and only when every population world carries its REQUIRED panels (the coarse
-        41 x 41 within grid; four RQ and four RP series at every graph time 0..200M); the source binds both files;
-        the stress24 stratum comes from it; a production calibration needs that binding, and production panel
-        generation refuses a missing --eligibility before any panel."""
+        """Annex H D6 §§9.1-9.4 (#68 eligibility; Codex #68 D6 P2-3 / P3 and r2 P2-3): H-F / H-T calibrate on the
+        ACTUAL qualifying C graph: the graph restricted to the hypothesis's population under stats.eligibility's
+        record, only when the DISPATCHER made that hypothesis available (its own flag: a pending repair refuses even
+        with |Q200| >= 24; below 24 refused, no smaller-n substitute), only on the graph the record's bound mask
+        names (its graph.edges_sha256 and namespace; the meta beside it those edges', its intensive worlds
+        graph.splits'), and only when every population world carries its REQUIRED panels: the coarse 41 x 41
+        within grid, the registered FINE within pairs (the fine windows' offsets, an intensive world's complete
+        window grids, the lag probe; a coarse-only within panel is refused), four RQ and four RP series at every
+        graph time 0..200M; the source binds both files; the stress24 stratum comes from it; a production
+        calibration needs that binding, and production panel generation refuses a missing --eligibility before
+        any panel."""
         import gzip
         import hashlib
         import io
         import shutil
         import tempfile
         from contextlib import redirect_stderr
+        import graph as graphlib
         import stats
         cb = self.cb
+        # registered_fine against graph.py's design counts (each window 21 times: 133 offset pairs, 441 grid
+        # pairs, 5 / 25 of them coarse; the lag probe 78 per non-intensive world, graph.py's own count)
+        self.assertEqual(len(cb.registered_fine(False, None)), 3 * (133 - 5))
+        self.assertEqual(len(cb.registered_fine(False, 7)), 3 * (133 - 5) + 78)
+        self.assertEqual(len(cb.registered_fine(True, 7)), 3 * (441 - 25))
         tmp = tempfile.mkdtemp()
         try:
             gp = os.path.join(tmp, "graph.jsonl.gz")
-            ws = [f"C{k:02d}" for k in range(27)]
+            ns = "rq-test-graph"
+            reg = ([{"id": f"C{k:02d}", "treatment": "C", "block": k // 4 + 1} for k in range(32)]
+                   + [{"id": f"{t}{k:02d}", "treatment": t, "block": k + 1} for t in "AB" for k in range(8)])
+            intensive = graphlib.splits(ns, reg)[2]
+            plain = [w["id"] for w in reg if w["treatment"] == "C" and w["id"] not in intensive]
+            broken = {"noRQ": plain[-1], "rp": plain[-2], "coarse": plain[-3], "coarse_only": plain[-4],
+                      "lag": plain[-5], "intensive": intensive[-1]}
+            good = [w["id"] for w in reg if w["treatment"] == "C" and w["id"] not in broken.values()][:24]
+            self.assertTrue(set(good) & set(intensive))          # (an intensive world among the accepted)
             coarse, times = range(0, 201, 5), range(201)
+
+            def gi(x):
+                return 0 if x < 1 else int(x)
             lines = []
-            for w in ws:                                         # (graph.py's design: integer graph times)
-                lines += [{"prey": f"Q:{w}:{a}", "pred": f"P:{w}:{b}"} for a in coarse for b in coarse
-                          if not (w == "C26" and (a, b) == (0, 200))]          # (C26: a coarse pair missing)
-                if w != "C24":                                   # (C24: no predator-reference panel)
+            for w in good + sorted(broken.values()):              # (graph.py's design: integer graph times)
+                pairs = {(a, b) for a in coarse for b in coarse} - ({(0, 200)} if w == broken["coarse"] else set())
+                if w != broken["coarse_only"]:                   # (Codex's case: a coarse-only within panel)
+                    pairs |= {(gi(a), gi(b)) for a, b in cb.registered_fine(w in intensive, 7)}
+                pairs -= {(5, 12)} if w == broken["lag"] else {(1, 20)} if w == broken["intensive"] else set()
+                lines += [{"prey": f"Q:{w}:{a}", "pred": f"P:{w}:{b}"} for a, b in sorted(pairs)]
+                if w != broken["noRQ"]:
                     lines += [{"prey": f"RQ:{r}", "pred": f"P:{w}:{t}"} for r in range(4) for t in times]
                 lines += [{"prey": f"Q:{w}:{t}", "pred": f"RP:{r}"} for r in range(4, 8) for t in times
-                          if not (w == "C25" and (r, t) == (5, 137))]           # (C25: one RP time missing)
+                          if not (w == broken["rp"] and (r, t) == (5, 137))]
             text = "".join(json.dumps(e) + "\n" for e in lines)
             with gzip.open(gp, "wt") as f:
                 f.write(text)
             edges = hashlib.sha256(text.encode()).hexdigest()
+            meta = {"namespace": ns, "worlds": reg, "intensive": intensive, "lag_probe": 7, "edges_sha256": edges}
+            mp = os.path.join(tmp, "graph.meta.json")
 
-            def elig(q, avail=True, reason=None, hyp="H-F", mask=edges):
+            def put_meta(**kw):
+                with open(mp, "w") as f:
+                    json.dump(dict(meta, **kw), f)
+            put_meta()
+
+            def elig(q, avail=True, reason=None, hyp="H-F", mask=edges, namespace=ns):
                 p = os.path.join(tmp, f"e{len(q)}{int(avail)}{hyp}{len(os.listdir(tmp))}.json")
                 h = {"population": "Q200", "worlds": q, "available": avail, "reason": reason}
                 with open(p, "w") as f:
                     json.dump({"schema": stats.ELIGIBILITY_SCHEMA, "Q200": {"worlds": q, "count": len(q),
                                                                             "available": len(q) >= 24},
-                               "mask": None if mask is None else {"sha256": "m" * 64, "graph_edges_sha256": mask},
+                               "mask": None if mask is None else {"sha256": "m" * 64, "graph_edges_sha256": mask,
+                                                                  "graph_namespace": namespace},
                                "hypotheses": {hyp: h}}, f)
                 return p
-            g, src = cb.eligible_graph(gp, elig(ws[:24]), "H-F")
-            self.assertEqual([x.id for x in g], ws[:24])
-            self.assertEqual(cb.panel_problems(g[0]), [])
+            g, src = cb.eligible_graph(gp, elig(good), "H-F")
+            self.assertEqual([x.id for x in g], sorted(good))
+            self.assertEqual([cb.panel_problems(x, x.id in intensive, 7) for x in g], [[]] * 24)
             self.assertTrue(src.startswith("file:") and "+eligibility:" in src)
             self.assertEqual(len(cb.stratum_worlds(g, "stress24")), 24)
-            self.assertEqual(len(cb.eligible_graph(gp, elig(ws[:24], hyp="H-T"), "H-T")[0]), 24)
+            self.assertEqual(len(cb.eligible_graph(gp, elig(good, hyp="H-T"), "H-T")[0]), 24)
             with self.assertRaisesRegex(cb.CalibError, "H-F is unavailable.*23 < 24"):
-                cb.eligible_graph(gp, elig(ws[:23], False, "|Q200| = 23 < 24"), "H-F")
+                cb.eligible_graph(gp, elig(good[:23], False, "|Q200| = 23 < 24"), "H-F")
             with self.assertRaisesRegex(cb.CalibError, "H-F is unavailable.*pending repair"):
-                cb.eligible_graph(gp, elig(ws[:24], False, "technical gaps: pending repair"), "H-F")   # (|Q200| 24)
+                cb.eligible_graph(gp, elig(good, False, "technical gaps: pending repair"), "H-F")   # (|Q200| 24)
             with self.assertRaisesRegex(cb.CalibError, "H-T is unavailable"):
-                cb.eligible_graph(gp, elig(ws[:24]), "H-T")                    # (the record has no H-T entry)
+                cb.eligible_graph(gp, elig(good), "H-T")                       # (the record has no H-T entry)
             for m in ("0" * 64, None):
                 with self.assertRaisesRegex(cb.CalibError, "bound mask is not this graph's"):
-                    cb.eligible_graph(gp, elig(ws[:24], mask=m), "H-F")
-            for w, why in (("C24", "without their complete fixed panels"), ("C25", "RP:5 misses 1 graph time"),
-                           ("C26", "coarse 41 x 41")):
+                    cb.eligible_graph(gp, elig(good, mask=m), "H-F")
+            with self.assertRaisesRegex(cb.CalibError, "meta is not these edges'"):
+                cb.eligible_graph(gp, elig(good, namespace="another"), "H-F")
+            for kw, why in (({"intensive": intensive[:-1]}, "intensive worlds are not its registered design"),
+                            ({"edges_sha256": "0" * 64}, "meta is not these edges'")):
+                put_meta(**kw)
                 with self.assertRaisesRegex(cb.CalibError, why):
-                    cb.eligible_graph(gp, elig(ws[:23] + [w]), "H-F")
+                    cb.eligible_graph(gp, elig(good), "H-F")
+            os.remove(mp)
+            with self.assertRaisesRegex(cb.CalibError, "meta .* is unreadable"):
+                cb.eligible_graph(gp, elig(good), "H-F")
+            put_meta()
+            for k, why in (("noRQ", "without their complete fixed panels"), ("rp", "RP:5 misses 1 graph time"),
+                           ("coarse", "coarse 41 x 41"),
+                           ("coarse_only", f"fine within-world panel misses {3 * 128 + 78} registered pair"),
+                           ("lag", "fine within-world panel misses 1 registered pair.*5M -> 12M"),
+                           ("intensive", "intensive fine within-world panel misses 1 registered pair.*1M -> 20M")):
+                with self.assertRaisesRegex(cb.CalibError, why):
+                    cb.eligible_graph(gp, elig(good[:23] + [broken[k]]), "H-F")
             probs = []
             cb._manifest([{"manifest": dict(self.man_fixture(), graph_source="file:x")}], True, probs)
             self.assertTrue(probs and "restricted to the common Q200" in probs[0])
