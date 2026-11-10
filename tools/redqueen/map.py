@@ -61,9 +61,10 @@ pairs). pred_eta: an unseen pair's predictor and its variance there (posterior +
 own-world deviation]); pred_count_lpd, the registered score: the capture-count log predictive density under
 the bounded observation model of Annex H.9.2 (a rounded latent logit-normal: normalized over 0..B, no
 Bernoulli capture opportunities) at G(eta + e) with a fresh replicate's variance phi V, e integrated through
-the link (exact for the identity link with a constant variance; otherwise a resolving trapezoid grid, every
-observation checked a posteriori and refined, and beyond the largest grid the eps-order integral with an
-exact inner integral; the cases are reported, never silently capped); pred_var: the first-order moments
+the link (exact for the identity link with a constant variance; otherwise a log-space trapezoid grid with
+the registered heteroscedastic integrand at every node, every observation checked a posteriori for
+resolution and range and refined or extended; unresolved cases are reported, a non-finite score refused,
+nothing silently capped); pred_var: the first-order moments
 (phi V + G'(eta)^2 s2), for the Gaussian diagnostic only. pair_variance solves its likelihood score
 safeguarded (bracketing and bisection); world_deviation_var subtracts each cell's own sampling noise. survival_posterior: q_ij = E[sigma(c_i + eta^S_ij) - sigma(c_i) | data] under the joint (c_i,
 exposed-logit) covariance (2-D Gauss-Hermite), with its SD.
@@ -360,25 +361,6 @@ class Link:
 
     def G(self, eta):
         return self._from_h(self.h(eta))[0]
-
-    def inverse(self, z):
-        """eta with G(eta) = z (G is strictly increasing): -inf / +inf for z at or beyond the link's range."""
-        z = np.asarray(z, float)
-        if self.lo == 0.0 and self.hi == 1.0:
-            hv = z
-        else:
-            s = (_sig(z) - self.lo) / (self.hi - self.lo)
-            with np.errstate(divide="ignore", invalid="ignore"):
-                hv = np.where(s <= 0, -np.inf, np.where(
-                    s >= 1, np.inf, np.log(np.clip(s, 1e-300, 1.0)) - np.log1p(-np.minimum(s, 1.0 - 1e-16))))
-        if self.knots is None:
-            return hv
-        th, kn = self.theta, self.knots
-        fin = np.isfinite(hv)
-        hf = np.where(fin, hv, 0.0)
-        i0 = np.clip(np.searchsorted(th, hf, side="right") - 1, 0, len(th) - 2)
-        t = (hf - th[i0]) / (th[i0 + 1] - th[i0])
-        return np.where(fin, kn[i0] + t * (kn[i0 + 1] - kn[i0]), hv)
 
     def max_slope(self, lo_, hi_):
         """A CONSERVATIVE bound on G' over [lo_, hi_]: the steepest spline interval meeting the range (the
@@ -969,10 +951,11 @@ def pred_var(D, m, idx, own=None):
 TRAP_H = 0.25                            # (the grid step, in units of the narrowest replicate SD / steepest slope)
 TRAP_SD = 7.0                            # (the grid covers +-TRAP_SD prior SDs)
 TRAP_KS = (15, 23, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193,
-           12289, 16385)                 # (grid sizes: pairs are bucketed, then vectorized)
+           12289, 16385, 24577, 32769, 49153, 65537, 98305, 131073, 196609, 262145)   # (grid sizes: bucketed)
 TRAP_CELLS = 1_000_000                   # (pairs x replicates x nodes per vectorized chunk)
 TRAP_TOL = 1e-3                          # (the a-posteriori check, log units: full grid vs every other node)
-EPS_NODES = 41                           # (the eps-order Gauss-Hermite nodes; checked against 21)
+TRAP_SPAN_MAX = 8                        # (the range may double up to +-TRAP_SD x 8 = +-56 prior SDs)
+TRAP_EDGE = math.log(1e-10)              # (an end node's share of the integral above this: the range is extended)
 VMIN_GRID = np.linspace(-20.0, 20.0, 20001)    # (the logit grid on which the variance function's minimum is taken)
 
 
@@ -983,39 +966,22 @@ def _logsumexp(a, axis):
         return np.squeeze(mx, axis=axis) + np.log(np.sum(np.exp(a - mx), axis=axis))
 
 
-def _grid_pass(lk, m, cnt, eta, sd, N, K):
-    """The e-order trapezoid on K nodes over +-TRAP_SD SDs, and the same on every other node (the check) ->
-    (log P, log P on the half grid), pairs x replicates."""
-    x = np.linspace(-TRAP_SD, TRAP_SD, K)
+def _grid_pass(lk, m, cnt, eta, sd, N, K, span):
+    """The e-order trapezoid, in log space, on K nodes over +-TRAP_SD x span prior SDs (span per pair), the same
+    on every other node (the check), and the larger end node's log share of the integral (the range check) ->
+    (log P, log P on the half grid, edge share), pairs x replicates. The integrand is the registered one at every
+    node: the bounded count probability with the replicate variance phi V(G(eta + e)) at that node."""
+    x = np.linspace(-1.0, 1.0, K)[None, :] * (TRAP_SD * span)[:, None]                      # (pairs x nodes, SDs)
     lw = -0.5 * x * x
-    lwh = lw[::2] - _logsumexp(lw[::2], 0)
-    lw = lw - _logsumexp(lw, 0)
-    loc = lk.G(eta[:, None] + sd[:, None] * x[None, :])                                    # (pairs x nodes)
+    lwh = lw[:, ::2] - _logsumexp(lw[:, ::2], 1)[:, None]
+    lw = lw - _logsumexp(lw, 1)[:, None]
+    loc = lk.G(eta[:, None] + sd[:, None] * x)
     lp = _interval_logp(cnt[:, :, None], N, loc[:, None, :], _rep_var(m, loc)[:, None, :])
-    return _logsumexp(lp + lw, 2), _logsumexp(lp[..., ::2] + lwh, 2)
-
-
-def _eps_pass(lk, m, cnt, eta, sd, N, nodes):
-    """The eps-order integral for a replicate SD far below the predictor's spread: P(L < G(eta + e) + sigma eps
-    < U) = E_eps[Phi((G^-1(U - sigma eps) - eta) / sd) - Phi((G^-1(L - sigma eps) - eta) / sd)], the inner
-    e-integral EXACT through the inverse link and the outer one Gauss-Hermite in eps; sigma is the replicate SD
-    at the count's own empirical logit (in this regime the count's probability is the e-mass mapped into its
-    interval, smoothed by sigma) -> log P, pairs x replicates."""
-    import noisebank as nb
-    lo, hi = nb.interval_bounds(cnt, N)
-    y = np.log((cnt + 0.5) / (N - cnt + 0.5))
-    sg = np.sqrt(_rep_var(m, y))
-    x, w = np.polynomial.hermite_e.hermegauss(nodes)
-    w = w / w.sum()
-    acc = None
-    e0, s0 = eta[:, None], sd[:, None]
-    for xk, wk in zip(x, w):
-        with np.errstate(invalid="ignore"):
-            zl = (lk.inverse(lo - sg * xk) - e0) / s0
-            zu = (lk.inverse(hi - sg * xk) - e0) / s0
-        lp = nb._log_iprob(zl, zu) + math.log(wk)
-        acc = lp if acc is None else np.logaddexp(acc, lp)
-    return acc
+    terms = lp + lw[:, None, :]
+    full = _logsumexp(terms, 2)
+    with np.errstate(invalid="ignore"):
+        edge = np.maximum(terms[..., 0], terms[..., -1]) - full
+    return full, _logsumexp(lp[..., ::2] + lwh[:, None, :], 2), edge
 
 
 def pred_count_lpd(D, m, idx, cnt, N, own=None, info=None):
@@ -1025,31 +991,33 @@ def pred_count_lpd(D, m, idx, cnt, N, own=None, info=None):
         P(K = k) = E_e[P(k | G(eta + e), phi V(G(eta + e)))],  e ~ N(0, s2),
     each P from Annex H.9.2's bounded model with the fresh replicate's variance (count_logp). Per observation
     (the marginal score: the mixture is not shared across a pair's replicates). -> one value per pair.
-    THE INTEGRAL, by case (Codex #66 r3 P2-1: never a silently capped grid):
+    THE INTEGRAL, by case (Codex #66 r3 P2-1, r4 P2-1/2: never silently capped, never a frozen variance,
+    never a silent non-finite value):
       - s2 = 0: the plain density;
       - the identity link with a constant replicate variance (no var_fn): EXACT, Y ~ N(eta, phi + s2);
-      - otherwise the e-order trapezoid over +-TRAP_SD prior SDs. Its step is at most one SD and at most TRAP_H
-        x the narrowest replicate SD (the variance function's minimum on VMIN_GRID) / a CONSERVATIVE bound on
-        the link's slope over the range (Link.max_slope), on the smallest of TRAP_KS that achieves it. Every
-        observation is CHECKED a posteriori against the same grid's every other node; above TRAP_TOL its pair
-        moves to the next grid;
-      - a pair whose resolution needs more than TRAP_KS[-1] = 16385 nodes has a replicate SD below 1/290 of
-        its predictor spread on the link's scale, where the count's probability is the predictor mass mapped
-        into its interval up to O((sigma / (sd G'))^2): the eps-order integral (_eps_pass, the inner integral
-        exact through the inverse link), itself checked against half its nodes. The eps-order is NOT used
-        where sigma is comparable to the spread (its fixed sigma would then miss the variance function's
-        change along e: 0.25 nats on a smoke-run pair before the grid went past 513), and a pair failing the
-        check even on the largest grid, or an eps-order failing its own, is counted as unresolved (reported,
-        never hidden).
-    info (a dict): the counts per case are added to it (pairs, plain, exact, grid, refined, grid_unresolved, eps,
-    eps_unresolved) with the largest accepted check difference (max_check)."""
+      - otherwise the e-order trapezoid IN LOG SPACE with the registered integrand at every node (the bounded
+        count probability at the replicate variance phi V(G(eta + e)) of that node; the far tails of the
+        interval probability are log-space continued fractions, so a count beyond the link's reach is a finite,
+        very negative log probability). The grid covers +-TRAP_SD prior SDs; its step is at most one SD and at
+        most TRAP_H x the narrowest replicate SD (the variance function's minimum on VMIN_GRID) / a
+        CONSERVATIVE bound on the link's slope over the range (Link.max_slope), on the smallest of TRAP_KS
+        (15 .. 262,145 nodes) that achieves it. Every observation is CHECKED a posteriori:
+          * resolution: against the same grid's every other node; above TRAP_TOL its pair moves to the next grid;
+          * range: if an end node carries more than 1e-10 of the integral (the integrand still rises at the edge,
+            e.g. a count beyond the link's asymptote), the pair's range doubles, up to +-56 SDs;
+        a pair failing a check on the largest grid or range keeps that value and is counted as grid_unresolved
+        (reported, never hidden); a pair whose rule needs more than the largest grid is computed there, checked,
+        and counted in beyond_rule.
+      - any non-finite result is REFUSED (ValueError): it never reaches a model comparison.
+    info (a dict): the counts per case are added to it (pairs, plain, exact, grid, refined, extended,
+    beyond_rule, grid_unresolved) with the largest accepted check difference (max_check)."""
     eta, s2 = pred_eta(D, m, idx, own)
     lk = m["link"]
     cnt = np.asarray(cnt)
     out = np.empty(len(eta))
     sd = np.sqrt(s2)
-    st = {"pairs": int(len(eta)), "plain": 0, "exact": 0, "grid": 0, "refined": 0, "grid_unresolved": 0, "eps": 0,
-          "eps_unresolved": 0, "max_check": 0.0}
+    st = {"pairs": int(len(eta)), "plain": 0, "exact": 0, "grid": 0, "refined": 0, "extended": 0, "beyond_rule": 0,
+          "grid_unresolved": 0, "max_check": 0.0}
     plain = sd <= 1e-9
     if plain.any():
         g0 = lk.G(eta[plain])
@@ -1065,43 +1033,50 @@ def pred_count_lpd(D, m, idx, cnt, N, own=None, info=None):
         gmax = max(lk.max_slope(lo_, hi_), 1e-12)
         smin = math.sqrt(max(float(_rep_var(m, VMIN_GRID).min()), 1e-300))
         h = np.minimum(sd[q], TRAP_H * smin / gmax)
-        need = np.ceil(2 * TRAP_SD * sd[q] / np.maximum(h, 1e-300)) + 1
-        bucket = np.searchsorted(TRAP_KS, need)                 # (len(TRAP_KS): beyond the largest grid)
-        eps_rows = [q[bucket >= len(TRAP_KS)]]
-        cur, cb = q[bucket < len(TRAP_KS)], bucket[bucket < len(TRAP_KS)]
+        need0 = np.ceil(2 * TRAP_SD * sd[q] / np.maximum(h, 1e-300)) + 1          # (nodes at span 1)
+        top = len(TRAP_KS) - 1
+        bucket = np.searchsorted(TRAP_KS, need0)
+        st["beyond_rule"] = int((bucket > top).sum())
+        cur, cb, cs, n0 = q, np.minimum(bucket, top), np.ones(len(q)), need0
         while len(cur):
-            nxt, nb_ = [], []
-            for b in np.unique(cb):
-                rows = cur[cb == b]
+            nxt = []
+            for b, s_ in sorted(set(zip(cb.tolist(), cs.tolist()))):
+                sel = (cb == b) & (cs == s_)
+                rows, need_r = cur[sel], n0[sel]
                 Kb = TRAP_KS[int(b)]
                 step = max(1, TRAP_CELLS // (R * Kb))
                 for k0 in range(0, len(rows), step):
-                    r_ = rows[k0:k0 + step]
-                    full, half = _grid_pass(lk, m, cnt[r_], eta[r_], sd[r_], N, Kb)
-                    err = np.max(np.abs(full - half), axis=1)
-                    ok = err <= TRAP_TOL
+                    r_, nr_ = rows[k0:k0 + step], need_r[k0:k0 + step]
+                    full, half, edge = _grid_pass(lk, m, cnt[r_], eta[r_], sd[r_], N, Kb, np.full(len(r_), s_))
+                    with np.errstate(invalid="ignore"):
+                        err = np.max(np.abs(full - half), axis=1)
+                        res_ok = err <= TRAP_TOL                                   # (NaN: not ok)
+                        edge_ok = np.all(edge <= TRAP_EDGE, axis=1)
+                    fin = np.isfinite(full).all(axis=1)
+                    ok = res_ok & edge_ok & fin
                     out[r_[ok]] = full[ok].mean(axis=1)
                     st["grid"] += int(ok.sum())
                     if ok.any():
                         st["max_check"] = max(st["max_check"], float(err[ok].max()))
-                    if (~ok).any():
-                        if b + 1 < len(TRAP_KS):
-                            nxt.append(r_[~ok])
-                            nb_.append(np.full(int((~ok).sum()), b + 1))
-                            st["refined"] += int((~ok).sum())
-                        else:                           # (the largest grid's value kept, flagged)
-                            out[r_[~ok]] = full[~ok].mean(axis=1)
-                            st["grid_unresolved"] += int((~ok).sum())
-            cur = np.concatenate(nxt) if nxt else np.zeros(0, int)
-            cb = np.concatenate(nb_) if nb_ else np.zeros(0, int)
-        er = np.concatenate(eps_rows)
-        if len(er):
-            full = _eps_pass(lk, m, cnt[er], eta[er], sd[er], N, EPS_NODES)
-            half = _eps_pass(lk, m, cnt[er], eta[er], sd[er], N, (EPS_NODES + 1) // 2)
-            err = np.max(np.abs(full - half), axis=1)
-            out[er] = full.mean(axis=1)
-            st["eps"] = int(len(er))
-            st["eps_unresolved"] = int((err > TRAP_TOL).sum())
+                    for i in np.flatnonzero(~ok):
+                        if fin[i] and not edge_ok[i] and s_ < TRAP_SPAN_MAX:          # (extend the range)
+                            s2_ = 2 * s_
+                            nb2 = max(int(b), int(np.searchsorted(TRAP_KS, nr_[i] * s2_)))
+                            nxt.append((r_[i], min(nb2, top), s2_, nr_[i]))
+                            st["extended"] += 1
+                        elif fin[i] and not res_ok[i] and b < top:                    # (refine the grid)
+                            nxt.append((r_[i], int(b) + 1, s_, nr_[i]))
+                            st["refined"] += 1
+                        else:                                                        # (kept, flagged)
+                            out[r_[i]] = full[i].mean()
+                            st["grid_unresolved"] += 1
+            cur = np.array([t[0] for t in nxt], int)
+            cb = np.array([t[1] for t in nxt], int)
+            cs = np.array([t[2] for t in nxt], float)
+            n0 = np.array([t[3] for t in nxt], float)
+    bad = ~np.isfinite(out)
+    if bad.any():
+        raise ValueError(f"pred_count_lpd: {int(bad.sum())} non-finite count scores: refused (never compared)")
     if info is not None:
         for k, v in st.items():
             info[k] = max(info.get(k, 0.0), v) if k == "max_check" else info.get(k, 0) + v

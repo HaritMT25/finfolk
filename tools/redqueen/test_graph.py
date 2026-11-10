@@ -1125,8 +1125,15 @@ class TestMap(unittest.TestCase):
     def test_count_integral_never_capped(self):
         """r3 P2-1: the review's case: identity link, eta = 0, s2 = 1, a constant replicate SD 0.003, count 162
         of 324. The exact convolution is P = 0.00493; a 513-node grid (spacing 0.027) gives about 0.0105 (0.75
-        nats off). Above the largest grid the score takes the eps-order integral (exact inner integral) and
-        reports it; with no variance function the identity link's Gaussian convolution is exact."""
+        nats off). The checked grid goes as far as its rule needs (here 24,577 nodes) and matches; with no
+        variance function the identity link's Gaussian convolution is exact.
+        r4 P2-1: no frozen variance. The review's heteroscedastic case (identity link, s2 = 1, replicate SD 0.003
+        below p = .5 and 0.012 above, count 163/324): the registered integrand at every node matches a dense
+        reference, where a variance frozen at the count's 0.012 is about 0.17 nats off.
+        r4 P2-2: no silent -inf. The review's tail case (identity h, lo .02, hi .8, SD 0.003, count 324/324,
+        beyond the link's reach): a finite log probability, the range extended to where the integrand peaks,
+        matching a dense log-space reference; a non-finite score is refused."""
+        import math
         import types
         M, N = self.M, self.rec.B_COUNT
         Dx = types.SimpleNamespace(qi=np.zeros(1, int), pj=np.zeros(1, int))
@@ -1142,16 +1149,45 @@ class TestMap(unittest.TestCase):
         inf = {}
         got = float(M.pred_count_lpd(Dx, mx, np.array([0]), cnt, N, info=inf)[0])
         self.assertAlmostEqual(got, exact, delta=1e-4)
-        self.assertEqual((inf["eps"], inf["eps_unresolved"], inf["grid"]), (1, 0, 0))
-        capped = float(M._grid_pass(mx["link"], mx, cnt, np.zeros(1), np.ones(1), N, 513)[0][0, 0])
+        self.assertEqual((inf["grid"], inf["grid_unresolved"]), (1, 0))
+        capped = float(M._grid_pass(mx["link"], mx, cnt, np.zeros(1), np.ones(1), N, 513, np.ones(1))[0][0, 0])
         self.assertGreater(abs(capped - exact), 0.5)                           # (what a silent cap would score)
+        step_v = lambda p: np.where(p < 0.5, 0.003 ** 2, 0.012 ** 2)          # noqa: E731
+        mh = dict(mx, var_fn=step_v, phi=1.0)
+        c163 = np.array([[163]])
+        inf = {}
+        got = float(M.pred_count_lpd(Dx, mh, np.array([0]), c163, N, info=inf)[0])
+        e = np.linspace(-8.0, 8.0, 1_600_001)                                  # (step 1e-5: the reference)
+        lw = -0.5 * e * e
+        lw -= lw.max() + np.log(np.exp(lw - lw.max()).sum())
+        lp = M.count_logp(np.repeat(c163, len(e), axis=0), N, e, M._rep_var(mh, e))[:, 0]
+        ref = float(np.log(np.exp(lp + lw - (lp + lw).max()).sum()) + (lp + lw).max())
+        self.assertAlmostEqual(got, ref, delta=2e-3)
+        self.assertEqual(inf["grid_unresolved"], 0)
+        frozen = float(M.count_lpd(c163, N, np.zeros(1), np.array([1.0 + 0.012 ** 2]))[0])
+        self.assertGreater(abs(frozen - ref), 0.1)                             # (the frozen variance's error)
+        mt = dict(mx, link=M.Link(None, None, 0.02, 0.8))
+        c324 = np.array([[324]])
+        inf = {}
+        got = float(M.pred_count_lpd(Dx, mt, np.array([0]), c324, N, info=inf)[0])
+        self.assertTrue(np.isfinite(got) and got < -1e5)
+        self.assertGreater(inf["extended"], 0)
+        e = np.linspace(-30.0, 30.0, 600_001)
+        lw = -0.5 * e * e - 0.5 * math.log(2 * math.pi) + math.log(e[1] - e[0])
+        terms = M.count_logp(np.repeat(c324, len(e), axis=0), N, mt["link"].G(e),
+                             M._rep_var(mt, mt["link"].G(e)))[:, 0] + lw
+        ref = float(terms.max() + np.log(np.exp(terms - terms.max()).sum()))
+        self.assertAlmostEqual(got, ref, delta=1e-2)
+        self.assertGreater(float(e[np.argmax(terms)]), 7.0)                    # (beyond the first +-7 SD range)
+        mn = dict(mx, var_fn=lambda p: np.full_like(p, np.nan))
+        with self.assertRaisesRegex(ValueError, "non-finite"):
+            M.pred_count_lpd(Dx, mn, np.array([0]), cnt, N)
         my = dict(mx, var_fn=None)                                             # (the exact convolution case)
         inf = {}
         self.assertAlmostEqual(float(M.pred_count_lpd(Dx, my, np.array([0]), cnt, N, info=inf)[0]), exact, places=12)
         self.assertEqual(inf["exact"], 1)
         # the r3 smoke's pair: predictor SD 1.646 with the x1.5 capture-noise variance function (its SD varies
-        # 0.23-0.9 along e). It needs more than 513 nodes; the larger grids resolve it against a dense reference,
-        # where the eps-order (fixed sigma) would be 0.25 nats off
+        # 0.23-0.9 along e). It needs more than 513 nodes; the larger grids resolve it against a dense reference
         vf = self.rec.var_model(self.rec.SCENARIOS["r2_017_cap15"])
         mz = dict(mx, var_fn=vf, phi=1.0, pair_var=1.646 ** 2)
         cz = np.array([[75, 111, 125, 137, 49, 87]])
@@ -1164,9 +1200,7 @@ class TestMap(unittest.TestCase):
         P = np.exp(M.count_logp(np.repeat(cz, len(x), axis=0), N, loc, M._rep_var(mz, loc)))
         ref = float(np.mean(np.log(wq @ P)))
         self.assertAlmostEqual(float(got[0]), ref, delta=2e-3)
-        self.assertEqual((inf["eps"], inf["grid_unresolved"], inf["grid"]), (0, 0, 1))
-        eps = float(M._eps_pass(mz["link"], mz, cz, np.zeros(1), np.array([1.646]), N, 41).mean())
-        self.assertGreater(abs(eps - ref), 0.05)                               # (why the eps-order is not used here)
+        self.assertEqual((inf["grid_unresolved"], inf["grid"]), (0, 1))
 
     def test_pair_variance_safeguarded(self):
         """r3 P2-2: the review's cycle. One cell (s2 0.01, r^2 1.01) and 100 cells (s2 1, r^2 0): the fixed point
