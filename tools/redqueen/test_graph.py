@@ -743,6 +743,8 @@ class TestMap(unittest.TestCase):
         self.assertEqual((lk.theta[0], lk.theta[-1]), (lk.knots[0], lk.knots[-1]))
         self.assertTrue((np.diff(lk.theta) >= M.LINK_MIN_SLOPE * np.diff(lk.knots) - 1e-9).all())
         self.assertTrue(lk.status["converged"])
+        self.assertEqual(len(lk.statuses), 2 * 2 * M.LINK_STEPS)               # (r2 P3: every GN step's QP)
+        self.assertTrue(all(st["converged"] for st in lk.statuses))
         self.assertLess(lk.hi, 1.0)
         g = np.linspace(-10.0, 10.0, 4001)
         self.assertTrue((np.diff(lk.G(g)) > 0).all() and (lk.dG(g) > 0).all())
@@ -959,11 +961,153 @@ class TestMap(unittest.TestCase):
         ds = M.predict_survival(D, m, idx_w, own=own_s)[1] - M.predict_survival(D, m, idx_w)[1]
         self.assertTrue(np.allclose(ds, own_s["h"][D.lagbin[idx_w]] + own_s["hw"][D.ownw[idx_w], D.lagbin[idx_w]]))
         w0 = D.ownw[idx_w][0]
-        part = M.own_world_stage2(D, m, data, idx_w[D.ownw[idx_w] != w0], folds=5)
+        seen = idx_w[D.ownw[idx_w] != w0]
+        part = M.own_world_stage2(D, m, data, seen, folds=5)
+        self.assertEqual(part["world_var"].shape, (D.nbins,))
         ov = M.own_var(D, part, idx_w)
-        self.assertTrue(np.all(ov[D.ownw[idx_w] == w0] == part["world_var"]) and np.all(ov[D.ownw[idx_w] != w0] == 0))
+        un = D.ownw[idx_w] == w0
+        self.assertTrue(np.array_equal(ov[un], part["world_var"][D.lagbin[idx_w][un]]) and not ov[~un].any())
+        # r2 P2-3: the integration has a predictive path. An unseen world's within pairs carry the lag bin's
+        # deviation variance inside the link (pred_eta, pred_var, pred_count_lpd); a seen world's do not.
+        e0, s0_ = M.pred_eta(D, m, idx_w)
+        e1, s1_ = M.pred_eta(D, m, idx_w, own=part)
+        self.assertTrue(np.allclose(s1_ - s0_, ov) and np.allclose(e1 - e0, M._own_terms(D, part, idx_w)))
+        cnt = data["cnt"][idx_w[un][:200]]
+        lp = M.pred_count_lpd(D, m, idx_w[un][:200], cnt, rec.B_COUNT, own=part)
+        self.assertTrue(np.isfinite(lp).all())
+        with self.assertRaisesRegex(ValueError, "capture stage-2"):
+            M.pred_eta(D, m, idx_w, own=own_s)
+        parts = M.own_world_stage2(D, m, sdat, seen, folds=5, head="survival")
+        sp0, sp1 = M.survival_posterior(D, m, idx_w), M.survival_posterior(D, m, idx_w, own=parts)
+        self.assertTrue(np.allclose(sp1["var1"] - sp0["var1"], M.own_var(D, parts, idx_w)))
+        self.assertTrue(np.array_equal(sp1["var0"], sp0["var0"]) and np.array_equal(sp1["cov01"], sp0["cov01"]))
+        with self.assertRaisesRegex(ValueError, "survival stage-2"):
+            M.survival_posterior(D, m, idx_w, own=part)
         with self.assertRaises(ValueError):
             M.own_world_stage2(D, m, data, idx_w, head="x")
+
+    def test_unseen_world_lag_deviation_variance(self):
+        """r2 P2-3: the variance of the LAG-DEPENDENT world deviations. Four worlds with opposite deviations
+        (+d, -d) at two equally populated lag bins: every world's lag-averaged residual is 0 (the old
+        estimate was 0), and each bin's between-world variance is var(+d, -d, +d, -d) = 4 d^2 / 3."""
+        import types
+        M = self.M
+        nW, per, d = 4, 50, 0.3
+        lw = np.repeat(np.arange(nW), 2 * per)
+        lb = np.tile(np.repeat([0, 1], per), nW)
+        n = len(lw)
+        Dx = types.SimpleNamespace(qi=np.zeros(n, int), pj=np.zeros(n, int), within=np.ones(n, bool), lagbin=lb,
+                                   ownw=lw, nbins=2, worlds=list(range(nW)))
+        kn = np.linspace(-1.0, 1.0, 4)
+        mx = {"surfC": M.Surface(kn, kn, ("inc", "dec")), "a": np.zeros(1), "b": np.zeros(1),
+              "u": np.zeros((1, 0)), "v": np.zeros((1, 0)), "link": M.Link()}
+        zbar = d * np.where(lw % 2 == 0, 1.0, -1.0) * np.where(lb == 0, 1.0, -1.0)
+        for x in range(nW):
+            self.assertAlmostEqual(float(zbar[lw == x].mean()), 0.0)          # (no world-average signal)
+        own = M.own_world_stage2(Dx, mx, {"zbar": zbar}, np.arange(n), folds=5)
+        self.assertTrue(np.allclose(own["world_var"], [4 * d * d / 3] * 2) and own["world_var_supported"].all())
+        part = M.own_world_stage2(Dx, mx, {"zbar": zbar}, np.flatnonzero(lw != 3), folds=5)
+        ov = M.own_var(Dx, part, np.arange(n))
+        self.assertTrue(np.allclose(ov[lw == 3], part["world_var"][lb[lw == 3]]) and not ov[lw != 3].any())
+        self.assertTrue((part["world_var"] > 0).all())
+        one = M.own_world_stage2(Dx, mx, {"zbar": zbar}, np.flatnonzero(lw == 0), folds=5)
+        self.assertFalse(one["world_var_supported"].any())                    # (one world: unsupported)
+
+    def test_noise_scale_known_answer(self):
+        """r2 P2-1: one absolute unit. A scalar linear block (a mean estimated from cells with variances phi V /
+        R, equal numbers at V = 0.36 and 0.0225) has the GLS variance 1 / sum(R / (phi V)); the old scale (the
+        unweighted mean replicate-mean variance) inflated it by mean(V) mean(1/V) = 4.52. In a fit, unit is
+        phi / (R mean(1/V)) at the fitted fractions, every head is weighted in it, and a predator block's
+        covariance equals the inverse of its ABSOLUTE-precision Hessian recomputed here."""
+        D, M = self.D, self.M
+        R, phi, n = 6, 1.3, 400
+        V = np.repeat([0.36, 0.0225], n)
+        w, unit, ph = M.capture_scale(V, phi * V, R)
+        self.assertAlmostEqual(ph, phi)
+        self.assertAlmostEqual(float(w.mean()), 1.0)
+        self.assertTrue(np.allclose(unit / w, phi * V / R))                       # (each cell's absolute variance)
+        cov = M._block_cov(np.zeros(2 * n, int), np.ones((2 * n, 1)), w, np.zeros(1), 1, unit)[0, 0, 0]
+        gls = 1.0 / float(np.sum(R / (phi * V)))
+        self.assertAlmostEqual(cov, gls, delta=1e-12 * gls)
+        old = M._block_cov(np.zeros(2 * n, int), np.ones((2 * n, 1)), w, np.zeros(1), 1,
+                           float(np.mean(phi * V)) / R)[0, 0, 0]
+        self.assertAlmostEqual(old / gls, float(np.mean(V) * np.mean(1 / V)), places=9)
+        self.assertGreater(old / gls, 4.5)
+        w1, u1, p1 = M.capture_scale(None, np.full(5, 0.6), R)                   # (unweighted: unit = phi / R)
+        self.assertTrue(np.array_equal(w1, np.ones(5)) and abs(u1 - 0.1) < 1e-15 and p1 == 0.6)
+        idx, data, lam = D.fit["a"], self.cap, 0.05
+        m = M.fit(D, idx, data, 1, lam, False, 6, 1, var_fn=self.vf)
+        qi, pj = D.qi[idx], D.pj[idx]
+        g = M.predict(D, m, idx)
+        Vp = self.vf(np.clip(1 / (1 + np.exp(-g)), 1e-4, 1 - 1e-4))
+        zrep = data["z"][idx].var(axis=1, ddof=1)
+        phi_f = float(np.mean(zrep / Vp))
+        unit_f = phi_f / (6 * float(np.mean(1 / Vp)))
+        self.assertAlmostEqual(m["unit"], unit_f, delta=1e-12 * unit_f)
+        nS = M._noise(data["s"][idx])
+        self.assertAlmostEqual(m["weights"]["survival"], unit_f / nS, delta=1e-9 * unit_f / nS)
+        j = int(np.bincount(pj, minlength=D.nP).argmax())                       # (a well-connected predator)
+        e = np.flatnonzero(pj == j)
+        eta = m["surfC"].value(m["a"][pj[e]], m["b"][qi[e]]) + (m["u"][qi[e]] * m["v"][pj[e]]).sum(axis=1)
+        _, FCa, _ = m["surfC"].value(m["a"][pj[e]], m["b"][qi[e]], grads=True)
+        dg = m["link"].dG(eta)
+        _, FSa, _ = m["surfS"].value(m["aS"][pj[e]], m["bS"][qi[e]], grads=True)
+        Xc = np.column_stack([dg * FCa, np.zeros(len(e)), dg[:, None] * m["u"][qi[e]]])
+        Xs = np.column_stack([np.zeros(len(e)), FSa, m["u"][qi[e]] @ m["DS"]])
+        prec_c = 6 / (phi_f * Vp[e])                                             # (absolute precisions)
+        H = (Xc.T * prec_c) @ Xc + Xs.T @ Xs / nS + np.diag([1e-3, 1e-3, lam]) / unit_f
+        self.assertTrue(np.allclose(m["covP"][j], np.linalg.inv(H), rtol=1e-6, atol=1e-14))
+
+    def test_pair_residual_inside_link(self):
+        """r2 P2-2: delta_ij sits inside the link. With a NON-identity bounded link, pair_variance recovers
+        tau^2 on the predictor scale (the after-link moment estimates E[G'^2] tau^2 instead); the score
+        integrates G(eta + e) (a dense quadrature reference agrees); pred_var's G'(eta)^2 s2 varies with the
+        location; without predictor-scale uncertainty the score is the plain count density."""
+        D, M, rec = self.D, self.M, self.rec
+        kn = np.linspace(-3.0, 3.0, 6)
+        lk = M.Link(kn, kn + np.array([0.0, 0.5, 0.8, 0.7, 0.4, 0.0]), 0.03, 0.8)
+        rng = np.random.default_rng(12)
+        eta = rng.uniform(-3.0, 3.0, 60000)
+        tau2, v = 0.09, 0.01
+        zbar = lk.G(eta + rng.normal(0.0, np.sqrt(tau2), len(eta))) + rng.normal(0.0, np.sqrt(v), len(eta))
+        dg = lk.dG(eta)
+        est = M.pair_variance((zbar - lk.G(eta)) / dg, v / dg ** 2)
+        self.assertAlmostEqual(est, tau2, delta=0.012)
+        after = float(np.mean((zbar - lk.G(eta)) ** 2 - v))                       # (the residual after G)
+        self.assertGreater(abs(after - tau2), 0.03)
+        self.assertEqual(M.pair_variance(rng.normal(0, 0.1, 1000), np.full(1000, 0.04)), 0.0)   # (floored)
+        m = dict(M.fit(D, D.fit["a"], self.cap, 1, 0.05, False, 4, 1, var_fn=self.vf))
+        m["link"], m["pair_var"] = lk, tau2
+        t = D.test_idx[:300]
+        e_, s2 = M.pred_eta(D, m, t)
+        loc, var = M.pred_var(D, m, t)
+        rep = M._rep_var(m, loc)
+        self.assertTrue(np.allclose(var - rep, lk.dG(e_) ** 2 * s2))
+        self.assertGreater(float(np.std(var - rep)), 0.1 * float(np.mean(var - rep)))   # (location-dependent)
+        n_ = 40
+        cnt = self.cap["cnt"][t[:n_]]
+        x = np.linspace(-9.0, 9.0, 16001)                                         # (the dense reference)
+        wq = np.exp(-0.5 * x * x)
+        wq /= wq.sum()
+        for tv in (tau2, 0.0):                                       # (with the pair residual; posterior only)
+            m["pair_var"] = tv
+            e_, s2 = M.pred_eta(D, m, t[:n_])
+            lp = M.pred_count_lpd(D, m, t[:n_], cnt, rec.B_COUNT)
+            ref = []
+            for i in range(n_):
+                locs = lk.G(e_[i] + np.sqrt(s2[i]) * x)
+                P = np.exp(M.count_logp(np.repeat(cnt[i:i + 1], len(x), axis=0), rec.B_COUNT, locs,
+                                        M._rep_var(m, locs)))
+                ref.append(float(np.mean(np.log(wq @ P))))
+            err = np.abs(lp - np.array(ref))
+            self.assertLess(float(err.max()), 3e-3, tv)
+            self.assertLess(float(np.median(err)), 2e-4, tv)
+            fo = M.count_lpd(cnt, rec.B_COUNT, *M.pred_var(D, m, t[:n_]))       # (first order: not enough)
+            self.assertGreater(float(np.abs(fo - np.array(ref)).max()), 10 * float(err.max()))
+        m0 = dict(m, pair_var=0.0, covQ=0 * m["covQ"], covP=0 * m["covP"])
+        l0, v0 = M.pred_var(D, m0, t[:n_])
+        self.assertTrue(np.allclose(M.pred_count_lpd(D, m0, t[:n_], cnt, rec.B_COUNT),
+                                    M.count_lpd(cnt, rec.B_COUNT, l0, v0)))
 
     def test_sensitivities(self):
         """P2-6: the separate-embedding and four- / eight-basis sensitivity fits run with their own
@@ -978,6 +1122,10 @@ class TestMap(unittest.TestCase):
                 self.assertGreaterEqual(float((M.surface_mats(k, key)[0] @ surf.theta.ravel()).min()), -1e-9)
             self.assertEqual(len(m["link"].knots), k)
             self.assertEqual(m["qp"]["unconverged"], 0)
+            # (r2 P3: EVERY solve counted: the warm start's surfaces, both surfaces each sweep, and each link
+            #  update's 2 x LINK_STEPS Gauss-Newton QPs)
+            want = 6 + 1 + 6 + (1 if kw.get("embedding") else 0) + (6 // M.LINK_EVERY) * 2 * M.LINK_STEPS
+            self.assertEqual(m["qp"]["solves"], want, kw)
             if kw.get("embedding"):
                 self.assertEqual((m["uS"].shape, m["vS"].shape), ((D.nQ, 1), (D.nP, 1)))
                 self.assertFalse(np.abs(m["DS"]).any())
@@ -997,11 +1145,14 @@ class TestMap(unittest.TestCase):
         g = M.predict(D, m, idx)
         w = 1.0 / np.maximum(self.vf(np.clip(1 / (1 + np.exp(-g)), 1e-4, 1 - 1e-4)), 1e-8)
         obj = float(np.sum(w / w.mean() * (z - g) ** 2))
-        nC = m["noise_C"]
+        V = self.vf(np.clip(1 / (1 + np.exp(-g)), 1e-4, 1 - 1e-4))
+        zrep = data["z"][idx].var(axis=1, ddof=1)
+        unit = float(np.mean(zrep / V)) / (data["z"].shape[1] * float(np.mean(1.0 / V)))   # (phi / (R mean 1/V))
+        self.assertAlmostEqual(unit, m["unit"], delta=1e-12 * unit)
         ctrl = M.control_access(D, idx)
-        wS = nC / M._noise(data["s"][idx])
-        wS0 = nC / M._noise(data["s0"][ctrl])
-        wC0 = nC / m["controls"]["prior_var"]
+        wS = unit / M._noise(data["s"][idx])            # (every row's weight in the one absolute unit)
+        wS0 = unit / M._noise(data["s0"][ctrl])
+        wC0 = unit / m["controls"]["prior_var"]
         x0, x1 = M.predict_survival(D, m, idx)
         obj += wS * float(np.sum((data["sbar"][idx] - x1) ** 2))
         obj += wS0 * float(np.sum((data["s0"][ctrl].mean(axis=1) - m["c"][ctrl]) ** 2))
@@ -1042,8 +1193,9 @@ class TestMap(unittest.TestCase):
         self.assertEqual(var.shape, D.val_idx.shape)
         self.assertGreater(float(var.max()) / float(var.min()), 3.0)              # heteroscedastic
         rep = best["phi"] * vf(np.clip(1 / (1 + np.exp(-loc)), 1e-4, 1 - 1e-4))
-        self.assertTrue((var >= rep + best["pair_var"] - 1e-12).all())            # (+ the posterior variance)
-        self.assertGreater(float((var - rep).max()), 0.0)
+        eta, s2 = M.pred_eta(D, best, D.val_idx)
+        self.assertTrue((s2 >= best["pair_var"]).all() and float(s2.max()) > best["pair_var"])
+        self.assertTrue(np.allclose(var, rep + best["link"].dG(eta) ** 2 * s2))   # (s2 enters through the link)
         self.assertTrue(np.allclose(loc, M.predict(D, best, D.val_idx)))
         m0 = rec.fit(D, idx, data["zbar"], 0, 0.0, False, 5, 1)
         c0, g0 = rec.scorer(D, data, m0, idx, "minimal")(D.val_idx)

@@ -36,8 +36,10 @@ CONTROL ACCESS (Codex #66 r1 P1-1): a fit reads the predator-free controls of th
 time bound): the control noise, the prior, the initialization, the fit and the objective never see an
 excluded control.
 Working likelihoods: Gaussian on the empirical logits, capture cells weighted by 1 / V(p) of the registered
-capture-level variance function (var_fn: in production the noise bank's), the survival rows by the
-replicate noise of each head.
+capture-level variance function (var_fn: in production the noise bank's), normalized to mean 1. ONE
+ABSOLUTE UNIT for every row (capture_scale, Codex #66 r2 P2-1): a weight-1 capture row has variance unit =
+phi / (R mean(1/V)), so weight / unit is each row's absolute precision; the exposed survival rows, the
+controls and the c_i prior are weighted in that unit (unit / their variance).
 
 Fitting: alternating, from the additive fit: the capture surface (IRLS through the link), the link, the
 survival surface, the c_i and D_S, then every prey node's (b_i, b^S_i, u_i) and every predator node's
@@ -45,21 +47,23 @@ survival surface, the c_i and D_S, then every prey node's (b_i, b^S_i, u_i) and 
 nodes), the qualities standardized over the fitting nodes; held-out populations are placed by their support
 pairs alone. The embedding starts WARM (q30b: the top-r singular vectors of the degree-normalized residual
 matrix of the rank-0 spline baseline; start="cold": small random normals). Every QP reports its KKT status
-(m["qp"]). Level 1 is placed on the common cross-world support alone (option (b) is dropped: fit refuses
-own_layer); within-world pairs get the cross-fitted STAGE-2 own-world layer for either head
-(own_world_stage2: a shared lag curve plus shrunk per-world deviations; unseen worlds integrate the
-deviation, world_var).
+(m["qp"]: every solve, the warm start's and each link Gauss-Newton step's included). Level 1 is placed on
+the common cross-world support alone (option (b) is dropped: fit refuses own_layer); within-world pairs get
+the cross-fitted STAGE-2 own-world layer for either head (own_world_stage2: a shared lag curve plus shrunk
+per-world deviations; an unseen world integrates its lag-dependent deviation, world_var per lag bin).
 
 THE PREDICTIVE MODEL (v4 §6.2, §7.4, §7.6): after the fit, the node blocks' Laplace covariances (the working
-model's Hessian per prey block (c_i, b_i, b^S_i, u_i) and predator block (a_j, a^S_j, v_j): block-diagonal,
-conditional on the surfaces, the link and D_S), the replicate dispersion phi (within-pair replicate scatter
-/ V) and the pair-residual variance (the strongly shrunk pair residuals delta_ij of the fitting pairs, their
-BLUPs; an unseen pair's is integrated out). pred_var: one FRESH replicate observation has latent location
-G(eta) and variance phi V(p) + pair variance + the location's posterior variance; count_lpd: the registered
-capture-count log predictive density under the bounded observation model of Annex H.9.2 (a rounded latent
-logit-normal: normalized over 0..B, no Bernoulli capture opportunities). survival_posterior: q_ij =
-E[sigma(c_i + eta^S_ij) - sigma(c_i) | data] under the joint (c_i, exposed-logit) covariance (2-D
-Gauss-Hermite), with its SD.
+model's Hessian per prey block (c_i, b_i, b^S_i, u_i) and predator block (a_j, a^S_j, v_j) times the
+absolute unit: block-diagonal, conditional on the surfaces, the link and D_S), the replicate dispersion
+phi (within-pair replicate scatter / V) and the pair-residual variance tau^2 ON THE PREDICTOR SCALE (the
+registered placement: delta_ij inside the link; pair_variance, with the strongly shrunk BLUPs of the fitting
+pairs). pred_eta: an unseen pair's predictor and its variance there (posterior + tau^2 [+ an unseen world's
+own-world deviation]); pred_count_lpd, the registered score: the capture-count log predictive density under
+the bounded observation model of Annex H.9.2 (a rounded latent logit-normal: normalized over 0..B, no
+Bernoulli capture opportunities) at G(eta + e) with a fresh replicate's variance phi V, e integrated through
+the link on a resolving trapezoid grid; pred_var: the first-order moments (phi V + G'(eta)^2 s2), for the
+Gaussian diagnostic only. survival_posterior: q_ij = E[sigma(c_i + eta^S_ij) - sigma(c_i) | data] under the joint (c_i,
+exposed-logit) covariance (2-D Gauss-Hermite), with its SD.
 """
 from __future__ import annotations
 
@@ -211,6 +215,7 @@ class Surface:
         self.theta = np.zeros((self.k, self.k))
         self.pen = 0.0
         self.status = None
+        self.statuses = []                   # (every QP solve's status, in order: Codex #66 r2 P3)
 
     def side_slopes(self, T=None):
         """The extension slopes (a below, a above, b below, b above)."""
@@ -286,6 +291,7 @@ class Surface:
         if (self.C @ x0 < -1e-9).any():
             x0 = np.full(n, float(np.sum(w * y) / np.sum(w)))
         th, self.status = monotone_qp(A, c, self.C, x0)
+        self.statuses.append(self.status)
         self.theta = th.reshape(k, k)
         self.pen = float(SMOOTH * scale * th @ self.P @ th)
 
@@ -313,10 +319,11 @@ class Link:
         self.lo, self.hi = float(lo), float(hi)
         self.pen = 0.0
         self.status = None
+        self.statuses = []                   # (every QP solve's status, carried by copy: Codex #66 r2 P3)
 
     def copy(self):
         lk = Link(self.knots, None if self.theta is None else self.theta.copy(), self.lo, self.hi)
-        lk.pen, lk.status = self.pen, self.status
+        lk.pen, lk.status, lk.statuses = self.pen, self.status, list(self.statuses)
         return lk
 
     def identity(self):
@@ -404,6 +411,7 @@ class Link:
             Af = A[1:-1, 1:-1] + 1e-8 * scale * np.eye(L - 2)
             cf = c[1:-1] - A[1:-1, :] @ fixed
             x, self.status = monotone_qp(Af, cf, C, th[1:-1], d)
+            self.statuses.append(self.status)
             th = np.concatenate([[kn[0]], x, [kn[-1]]])
             self.pen = float(LINK_SMOOTH * scale * th @ P @ th)
         self.theta = th
@@ -501,6 +509,43 @@ def _noise(x):
     return float(np.mean(np.var(x, axis=1, ddof=1)) / x.shape[1])
 
 
+UNIT_FLOOR = 1e-6                       # (the absolute unit's floor: noiseless data)
+
+
+def capture_scale(V, zrep, R):
+    """The capture rows' working weights and their ABSOLUTE scale under the registered predictive model
+    (Codex #66 r2 P2-1). Cell e's replicate-mean variance is v_e = phi V_e / R, with phi = mean(zrep / V)
+    the replicate dispersion of the variance function V (zrep: the cells' replicate variances). The weights
+    are w_e = (1 / V_e) / mean(1 / V) (mean 1, so the penalties keep their meaning), and one weight unit is
+    unit = phi / (R mean(1 / V)), so unit / w_e = v_e exactly: a weighted Hessian times unit is the absolute
+    covariance. V None (unweighted): w = 1, phi = mean(zrep), unit = phi / R. -> (w, unit, phi)."""
+    zrep = np.asarray(zrep, float)
+    if V is None:
+        phi = float(np.mean(zrep))
+        return np.ones(len(zrep)), max(phi / R, UNIT_FLOOR), phi
+    V = np.maximum(np.asarray(V, float), 1e-8)
+    M = float(np.mean(1.0 / V))
+    phi = float(np.mean(zrep / V))
+    return (1.0 / V) / M, max(phi / (R * M), UNIT_FLOOR), phi
+
+
+def pair_variance(r, s2, iters=50):
+    """The pair-residual variance tau^2 on the PREDICTOR scale (v4 §6.2: delta_ij inside the link): r the
+    working residuals (z - G(eta)) / G'(eta) of the fitting pairs, s2 their replicate-mean variances on that
+    scale (v / G'^2). r ~ N(0, tau^2 + s2): the weighted moment equation sum w (r^2 - s2 - tau^2) = 0 with
+    w = 1 / (tau^2 + s2)^2, iterated from 0, floored at 0 (strong shrinkage: no pair residual unless the
+    residuals exceed the replicate noise)."""
+    r, s2 = np.asarray(r, float), np.asarray(s2, float)
+    t = 0.0
+    for _ in range(iters):
+        w = 1.0 / (t + s2) ** 2
+        t_new = max(0.0, float(np.sum(w * (r ** 2 - s2)) / np.sum(w)))
+        if abs(t_new - t) <= 1e-12 * (1.0 + t):
+            return t_new
+        t = t_new
+    return t
+
+
 def top_singular(qi, pj, val, nQ, nP, k, seed=0, iters=12):
     """The top-k singular triplets of the sparse nQ x nP matrix with entries val at (qi, pj):
     randomized subspace iteration on sparse products (k + 6 columns, `iters` power steps) ->
@@ -585,30 +630,32 @@ def fit(D, idx, data, rank, lam, own_layer=False, iters=40, seed=0, survival=Tru
         raise ValueError("ctrl: one flag per prey node")
     s0 = np.zeros(D.nQ)
     s = np.zeros(n)
-    wS = wS0 = wC0 = 0.0
+    nS = n0 = None
     cbar, tau2 = 0.0, 1.0
+    zrep = np.var(data["z"][idx], axis=1, ddof=1) if R > 1 else np.zeros(n)
     if surv:
         s = data["sbar"][idx]
-        wS = noiseC / max(_noise(data["s"][idx]), 1e-6)
+        nS = max(_noise(data["s"][idx]), 1e-6)     # (the exposed survival rows' replicate-mean variance)
         if ctrl.any():
             raw = data["s0"][ctrl]                  # (only the accessible controls are ever read)
             n0 = max(_noise(raw), 1e-6)
             s0[ctrl] = raw.mean(axis=1)
-            wS0 = noiseC / n0
             cbar = float(s0[ctrl].mean())
             tau2 = max(float(s0[ctrl].var()) - n0, C_PRIOR_FLOOR) if ctrl.sum() > 1 else 1.0
         else:
             cbar = float(np.mean(s))
-        wC0 = noiseC / tau2                         # (the c_i prior's precision, in capture-row units)
     c0 = np.where(ctrl, s0, cbar)
 
-    def cap_weights(zfit):
-        if var_fn is None:
-            return np.ones(n)
-        p = np.clip(_sig(zfit), 1e-4, 1.0 - 1e-4)
-        w = 1.0 / np.maximum(var_fn(p), 1e-8)
-        return w / w.mean()
-    wC = cap_weights(z)
+    def scales(zfit):
+        """The capture weights at the fitted capture fraction, their absolute unit (capture_scale) and the
+        other rows' weights IN THAT UNIT (an absolute precision is weight / unit for every row: Codex #66 r2
+        P2-1): exposed survival unit / nS, a control unit / n0, the c_i prior unit / tau_c^2."""
+        V = None if var_fn is None else var_fn(np.clip(_sig(zfit), 1e-4, 1.0 - 1e-4))
+        w, unit, ph = capture_scale(V, zrep, R)
+        if not surv:
+            return w, unit, ph, 0.0, 0.0, 0.0
+        return w, unit, ph, unit / nS, (unit / n0 if n0 else 0.0), unit / tau2
+    wC, unit, phi, wS, wS0, wC0 = scales(z)
     # the additive starts (rank 0, identity link) for each head's own ordered qualities (v4 §6.2:
     # head-specific ordered terms; only the interaction embedding u, v is shared)
     if init is None:
@@ -633,6 +680,7 @@ def fit(D, idx, data, rank, lam, own_layer=False, iters=40, seed=0, survival=Tru
     surfC = Surface(_knots(a[on_p], basis), _knots(b[on_q], basis), ("inc", "dec"))
     surfS = Surface(_knots(aS[on_p], basis), _knots(bS[on_q], basis), ("dec", "inc"))
     lk = init["link"].copy() if (init is not None and init.get("link") is not None and link) else Link()
+    lk.statuses = []                         # (this fit's solves only)
     SQ, SP = center_sets(D, on_q, on_p, center)
     ones, zero = np.ones(n), np.zeros(n)
     uS, vS = np.zeros((D.nQ, 0)), np.zeros((D.nP, 0))
@@ -663,7 +711,6 @@ def fit(D, idx, data, rank, lam, own_layer=False, iters=40, seed=0, survival=Tru
     ridge = np.array([lam_ab, lam_ab] + [lam] * ne)
     ucols = np.arange(2, 2 + ne)
     zr = np.zeros((n, rank))
-    qps = []
 
     def inter_s():
         if not rank:
@@ -682,19 +729,16 @@ def fit(D, idx, data, rank, lam, own_layer=False, iters=40, seed=0, survival=Tru
         FC = surfC.value(a[pj], b[qi])
         eta = FC + inter
         g, dg = lk.G(eta), lk.dG(eta)
-        wC = cap_weights(g)
+        wC, unit, phi, wS, wS0, wC0 = scales(g)
         work = eta + (z - g) / np.maximum(dg, 1e-6)
         surfC.fit(a[pj], b[qi], work - inter, wC * dg ** 2)
-        qps.append(surfC.status)
         FC = surfC.value(a[pj], b[qi])
         if link and it % LINK_EVERY == LINK_EVERY - 1:
             lk = update_link(lk, FC + inter, z, wC, basis)
-            qps.append(lk.status)
         # 2. the survival head: its surface, the predator-free baselines c_i, D_S
         if surv:
             iS = inter_s()
             surfS.fit(aS[pj], bS[qi], s - c[qi] - iS, wS * ones)
-            qps.append(surfS.status)
             FS = surfS.value(aS[pj], bS[qi])
             num = wS0 * s0 + wC0 * cbar + np.bincount(qi, weights=wS * (s - FS - iS), minlength=D.nQ)
             den = wS0 * ctrl + wC0 + wS * np.bincount(qi, minlength=D.nQ)
@@ -738,7 +782,7 @@ def fit(D, idx, data, rank, lam, own_layer=False, iters=40, seed=0, survival=Tru
     FC, FCa, FCb = surfC.value(a[pj], b[qi], grads=True)
     eta = FC + inter
     g, dg = lk.G(eta), lk.dG(eta)
-    wC = cap_weights(g)
+    wC, unit, phi, wS, wS0, wC0 = scales(g)
     obj = float(np.sum(wC * (z - g) ** 2)) + surfC.pen + lk.pen
     iS = inter_s()
     FSa = FSb = zero
@@ -748,18 +792,14 @@ def fit(D, idx, data, rank, lam, own_layer=False, iters=40, seed=0, survival=Tru
                      + wC0 * np.sum((c - cbar) ** 2)) + surfS.pen
     obj += lam * float(np.sum(u ** 2) + np.sum(v ** 2) + np.sum(uS ** 2) + np.sum(vS ** 2)) + lam_ab * float(
         np.sum(a ** 2) + np.sum(b ** 2) + np.sum(aS ** 2) + np.sum(bS ** 2))
-    # the predictive model: the replicate dispersion, the pair residuals, the node blocks' covariances
-    zrep = np.var(data["z"][idx], axis=1, ddof=1) if R > 1 else np.zeros(n)
-    if var_fn is not None:
-        Vp = np.maximum(var_fn(np.clip(_sig(g), 1e-4, 1 - 1e-4)), 1e-8)
-        phi = float(np.mean(zrep / Vp))
-        repv = phi * Vp / R
-    else:
-        phi = float(np.mean(zrep))
-        repv = np.full(n, phi / R)
-    resid = z - g
-    pair_var = max(0.0, float(np.mean(resid ** 2 - repv)))
-    delta = pair_var / np.maximum(pair_var + repv, 1e-12) * resid
+    # the predictive model: the replicate dispersion (in scales), the pair residuals ON THE PREDICTOR SCALE
+    # (v4 §6.2: delta_ij inside the link; Codex #66 r2 P2-2), the node blocks' covariances in the same unit
+    repv = unit / wC                                  # (each cell's replicate-mean variance: phi V / R)
+    dgc = np.maximum(dg, 1e-6)
+    s2e = repv / dgc ** 2                             # (... on the predictor scale)
+    reta = (z - g) / dgc                              # (the working residual on the predictor scale)
+    pair_var = pair_variance(reta, s2e)
+    delta = pair_var / (pair_var + s2e) * reta        # (the shrunk pair residuals of the fitting pairs: BLUPs)
     qrows = [(np.column_stack([zero, dg * FCb, zero, dg[:, None] * v[pj]] + ([zr] if sep else [])), wC)]
     prows = [(np.column_stack([dg * FCa, zero, dg[:, None] * u[qi]] + ([zr] if sep else [])), wC)]
     if surv:
@@ -773,19 +813,20 @@ def fit(D, idx, data, rank, lam, own_layer=False, iters=40, seed=0, survival=Tru
     dq_[:, 3:] = max(lam, 1e-9)
     dp_ = np.array([lam_ab, lam_ab] + [max(lam, 1e-9)] * ne)
     covQ = _block_cov(np.concatenate([qi] * len(qrows)), np.concatenate([r_[0] for r_ in qrows]),
-                      np.concatenate([r_[1] for r_ in qrows]), dq_, D.nQ, noiseC)
+                      np.concatenate([r_[1] for r_ in qrows]), dq_, D.nQ, unit)
     covP = _block_cov(np.concatenate([pj] * len(prows)), np.concatenate([r_[0] for r_ in prows]),
-                      np.concatenate([r_[1] for r_ in prows]), dp_, D.nP, noiseC)
+                      np.concatenate([r_[1] for r_ in prows]), dp_, D.nP, unit)
     return {"a": a, "b": b, "aS": aS, "bS": bS, "u": u, "v": v, "uS": uS if sep else None, "vS": vS if sep else None,
             "DS": DS, "c": c, "surfC": surfC, "surfS": surfS, "link": lk,
             "h": np.zeros(D.nbins), "hw": np.zeros((len(D.worlds), D.nbins)), "own": False, "rank": rank,
             "objective": obj, "start": "init" if init is not None else start, "weighted": var_fn is not None,
-            "var_fn": var_fn, "R": R, "noise_C": noiseC, "phi": phi, "pair_var": pair_var, "delta": delta,
-            "fit_idx": idx, "covQ": covQ, "covP": covP, "survival": surv, "basis": basis, "embedding": embedding,
+            "var_fn": var_fn, "R": R, "noise_C": noiseC, "phi": phi, "unit": unit, "pair_var": pair_var,
+            "delta": delta, "fit_idx": idx, "covQ": covQ, "covP": covP, "survival": surv, "basis": basis,
+            "embedding": embedding, "weights": {"survival": wS, "control": wS0, "c_prior": wC0},
             "center": {"distribution": center, "prey": int(len(SQ)), "pred": int(len(SP))},
             "center_nodes": {"prey": SQ, "pred": SP},
             "controls": {"accessible": int(ctrl.sum()), "cbar": cbar, "prior_var": tau2},
-            "qp": qp_summary(qps)}
+            "qp": qp_summary(surfC.statuses + surfS.statuses + lk.statuses)}
 
 
 def fit_best(D, idx, data, rank, lam, iters=40, seed=0, starts=("warm", "cold"), **kw):
@@ -818,52 +859,136 @@ def predict(D, m, idx, own=None):
     return m["link"].G(eta)
 
 
-def pred_var(D, m, idx):
-    """The capture head's predictive distribution of ONE FRESH replicate observation of each pair of idx
-    (the registered scoring model, v4 §6.2, §7.4, §7.6) -> (location on the logit scale, latent variance):
-    phi V(p) (the registered per-replicate variance at the predicted capture fraction: fresh row, column and
-    cell components) + the pair-residual variance (an unseen pair's residual integrated out) + the posterior
-    variance of the location (the node blocks' Laplace covariances, the delta method through the link)."""
+def pred_eta(D, m, idx, own=None):
+    """The capture predictor of pairs idx ON ITS OWN SCALE (inside the link, v4 §6.2) and its predictive
+    variance there -> (eta, s2): s2 = the location's posterior variance (the node blocks' Laplace covariances,
+    gradients on the predictor scale) + the pair-residual variance (an unseen pair's delta_ij integrated out)
+    [+ with own, a capture stage-2 layer: its lag terms in eta and, for a world the layer never saw, the
+    lag-bin deviation variance own_var]."""
     idx = np.asarray(idx)
     qi, pj = D.qi[idx], D.pj[idx]
     r = m["rank"]
     FC, FCa, FCb = m["surfC"].value(m["a"][pj], m["b"][qi], grads=True)
     eta = FC + (m["u"][qi] * m["v"][pj]).sum(axis=1)
+    gq = np.zeros((len(idx), m["covQ"].shape[1]))
+    gq[:, 1] = FCb
+    gq[:, 3:3 + r] = m["v"][pj]
+    gp = np.zeros((len(idx), m["covP"].shape[1]))
+    gp[:, 0] = FCa
+    gp[:, 2:2 + r] = m["u"][qi]
+    s2 = (np.einsum("ni,nij,nj->n", gq, m["covQ"][qi], gq) + np.einsum("ni,nij,nj->n", gp, m["covP"][pj], gp)
+          + m["pair_var"])
+    if own is not None:
+        if own.get("head") != "capture":
+            raise ValueError("the capture predictor takes a capture stage-2 layer")
+        eta = eta + _own_terms(D, own, idx)
+        s2 = s2 + own_var(D, own, idx)
+    return eta, np.maximum(s2, 0.0)
+
+
+def _rep_var(m, loc):
+    """phi V(p) at the predicted capture fraction: one fresh replicate's row, column and cell variance."""
+    vf = m.get("var_fn")
+    loc = np.asarray(loc, float)
+    if vf is None:
+        return np.full(loc.shape, float(m["phi"]))
+    return m["phi"] * np.maximum(vf(np.clip(_sig(loc), 1e-4, 1 - 1e-4)), 1e-8)
+
+
+def pred_var(D, m, idx, own=None):
+    """The capture head's predictive MOMENTS for one fresh replicate observation of each pair of idx, to first
+    order (the Gaussian diagnostic's; the registered score integrates exactly, pred_count_lpd) -> (location
+    G(eta), latent variance phi V(p) + G'(eta)^2 s2), s2 from pred_eta: the predictor-scale variance enters
+    through the link, so its contribution varies with the location."""
+    eta, s2 = pred_eta(D, m, idx, own)
     lk = m["link"]
     loc, dg = lk.G(eta), lk.dG(eta)
-    gq = np.zeros((len(idx), m["covQ"].shape[1]))
-    gq[:, 1] = dg * FCb
-    gq[:, 3:3 + r] = dg[:, None] * m["v"][pj]
-    gp = np.zeros((len(idx), m["covP"].shape[1]))
-    gp[:, 0] = dg * FCa
-    gp[:, 2:2 + r] = dg[:, None] * m["u"][qi]
-    vpost = (np.einsum("ni,nij,nj->n", gq, m["covQ"][qi], gq) + np.einsum("ni,nij,nj->n", gp, m["covP"][pj], gp))
-    vf = m.get("var_fn")
-    rep = m["phi"] * (np.maximum(vf(np.clip(_sig(loc), 1e-4, 1 - 1e-4)), 1e-8) if vf is not None else 1.0)
-    return loc, np.maximum(rep + m["pair_var"] + vpost, 1e-8)
+    return loc, np.maximum(_rep_var(m, loc) + dg ** 2 * s2, 1e-8)
+
+
+TRAP_H = 0.25                            # (the grid step, in units of the narrowest replicate SD / steepest slope)
+TRAP_SD = 7.0                            # (the grid covers +-TRAP_SD prior SDs)
+TRAP_KS = (15, 23, 33, 49, 65, 97, 129, 193, 257, 385, 513)    # (grid sizes: pairs are bucketed, then vectorized)
+TRAP_CELLS = 1_000_000                   # (pairs x replicates x nodes per vectorized chunk)
+
+
+def pred_count_lpd(D, m, idx, cnt, N, own=None):
+    """THE registered score (v4 §7.6) of the capture head on pairs idx: the capture-count log predictive
+    density per replicate observation, with the predictor-scale uncertainty (pred_eta: the posterior variance
+    of eta and the pair residual delta_ij, both INSIDE the link) integrated through the link:
+        P(K = k) = E_e[P(k | G(eta + e), phi V(G(eta + e)))],  e ~ N(0, s2),
+    each P from Annex H.9.2's bounded model with the fresh replicate's variance (count_logp). The integral is a
+    trapezoid over +-TRAP_SD prior SDs whose step is at most one SD and at most TRAP_H x the narrowest
+    replicate SD / the link's steepest slope over that range, so a count probability far narrower than N(0, s2),
+    a replicate variance that changes along e, and the link's kinks are all resolved (Gaussian quadrature,
+    adaptive or not, is not robust to them: against a 32,001-point reference its error reached 0.03-0.7,
+    the first-order moments' 0.2-4; this rule's is below 3e-3). s2 = 0 gives the plain density. Per
+    observation (the marginal score: the mixture is not shared across a pair's replicates). -> one value per
+    pair."""
+    eta, s2 = pred_eta(D, m, idx, own)
+    lk = m["link"]
+    cnt = np.asarray(cnt)
+    out = np.empty(len(eta))
+    sd = np.sqrt(s2)
+    plain = sd <= 1e-9
+    if plain.any():
+        g0 = lk.G(eta[plain])
+        out[plain] = count_lpd(cnt[plain], N, g0, _rep_var(m, g0))
+    if plain.all():
+        return out
+    q = np.flatnonzero(~plain)
+    lo_, hi_ = float((eta[q] - TRAP_SD * sd[q]).min()), float((eta[q] + TRAP_SD * sd[q]).max())
+    gmax = float(lk.dG(np.linspace(lo_, hi_, 4001)).max())
+    smin = math.sqrt(float(_rep_var(m, np.linspace(-12.0, 12.0, 4001)).min()))
+    h = np.minimum(sd[q], TRAP_H * smin / max(gmax, 1e-12))
+    need = np.minimum(np.ceil(2 * TRAP_SD * sd[q] / np.maximum(h, 1e-12)) + 1, TRAP_KS[-1]).astype(int)
+    K = np.asarray(TRAP_KS)[np.minimum(np.searchsorted(TRAP_KS, need), len(TRAP_KS) - 1)]
+    R = cnt.shape[1]
+    for Kb in np.unique(K):
+        x = np.linspace(-TRAP_SD, TRAP_SD, int(Kb))
+        lw = -0.5 * x * x
+        lw -= lw.max() + math.log(np.exp(lw - lw.max()).sum())          # (normalized log weights)
+        rows = q[K == Kb]
+        step = max(1, TRAP_CELLS // (R * int(Kb)))
+        for k0 in range(0, len(rows), step):
+            r_ = rows[k0:k0 + step]
+            loc = lk.G(eta[r_][:, None] + sd[r_][:, None] * x[None, :])                     # (pairs x nodes)
+            lp = _interval_logp(cnt[r_][:, :, None], N, loc[:, None, :], _rep_var(m, loc)[:, None, :]) + lw
+            mx = lp.max(axis=2, keepdims=True)
+            out[r_] = (mx[..., 0] + np.log(np.exp(lp - mx).sum(axis=2))).mean(axis=1)
+    return out
 
 
 def count_lpd(cnt, N, loc, var):
+    """count_logp's mean over replicates, per pair."""
+    return count_logp(cnt, N, loc, var).mean(axis=1)
+
+
+def count_logp(cnt, N, loc, var):
     """The registered capture-count log predictive density (v4 §7.6) under the bounded observation model of
     Annex H.9.2 (v4 §6.2): a replicate count k of N is a rounded latent logit-normal, K = floor(N sigma(Y) +
     1/2), Y ~ N(loc, var), so P(K = k) = P(logit((k - 1/2)/N) < Y < logit((k + 1/2)/N)), the end intervals
     open at k = 0 and k = N. It is normalized over k = 0..N and assumes no independent Bernoulli capture
-    opportunities. cnt: pairs x replicates; loc, var: one per pair -> the mean log probability per replicate
-    observation, per pair (noisebank's tail-stable interval probabilities). The location is the map's
+    opportunities. cnt: pairs x replicates; loc, var: one per pair -> the log probability of every replicate
+    observation (pairs x replicates; noisebank's tail-stable interval probabilities). The location is the map's
     predicted mean EMPIRICAL logit (what both heads are fitted to): an interior count's empirical logit lies
     in its latent interval, so the latent mean and the mean empirical logit agree up to the rounding (H.9.2's
     exact location solve, matching the expected rounded fraction, is not applied). On narrow interior
     intervals the density is the Gaussian density times the interval width, which is the same for every
     candidate model, so a score DIFFERENCE departs from the Gaussian working score's only where intervals are
     wide: low and high counts and the open ends at 0 and N."""
+    return _interval_logp(cnt, N, np.asarray(loc, float)[:, None], np.asarray(var, float)[:, None])
+
+
+def _interval_logp(cnt, N, loc, var):
+    """log P(K = cnt) of count_logp, loc and var broadcast against cnt (pairs x replicates)."""
     import noisebank as nb
     cnt = np.asarray(cnt)
-    if cnt.ndim != 2 or (cnt < 0).any() or (cnt > N).any():
+    if cnt.ndim < 2 or (cnt < 0).any() or (cnt > N).any():
         raise ValueError(f"counts: pairs x replicates in 0..{N}")
     lo, hi = nb.interval_bounds(cnt, N)
-    loc = np.asarray(loc, float)[:, None]
-    sd = np.sqrt(np.maximum(np.asarray(var, float), 1e-12))[:, None]
-    return nb._log_iprob((lo - loc) / sd, (hi - loc) / sd).mean(axis=1)
+    sd = np.sqrt(np.maximum(var, 1e-12))
+    return nb._log_iprob((lo - loc) / sd, (hi - loc) / sd)
 
 
 def predict_survival(D, m, idx, own=None):
@@ -903,19 +1028,24 @@ def _gh2(mu0, mu1, v00, v01, v11, nodes=GH_NODES, chunk=20000):
     return q, sd
 
 
-def survival_posterior(D, m, idx):
+def survival_posterior(D, m, idx, own=None):
     """v4 §6.2's H-Q mapping: q_ij = E[sigma(c_i + eta^S_ij) - sigma(c_i) | data] over the JOINT fitted
     distribution of (c_i, c_i + eta^S_ij): the prey block's Laplace covariance couples c_i with b^S_i and u_i
     (c_i is estimated from the controls AND the exposed rows), the predator block adds its own; the 2 x 2
-    covariance is propagated (never independent marginal error bars) -> {"q" (the posterior mean), "q_sd",
-    "q_plugin" (sigma at the point estimates), "logit0", "logit1", "var0", "cov01", "var1"}."""
+    covariance is propagated (never independent marginal error bars). With own (a SURVIVAL stage-2 layer):
+    its lag terms enter the exposed logit, and for a world the layer never saw its lag-bin deviation variance
+    (own_var) is added to the exposed logit's variance (the baseline c_i is unaffected) -> {"q" (the
+    posterior mean), "q_sd", "q_plugin" (sigma at the point estimates), "logit0", "logit1", "var0", "cov01",
+    "var1"}."""
     if not m.get("survival"):
         raise ValueError("this fit has no survival head")
+    if own is not None and own.get("head") != "survival":
+        raise ValueError("survival_posterior takes a survival stage-2 layer")
     idx = np.asarray(idx)
     qi, pj = D.qi[idx], D.pj[idx]
     r = m["rank"]
     sep = m["embedding"] == "separate" and r > 0
-    x0, x1 = predict_survival(D, m, idx)
+    x0, x1 = predict_survival(D, m, idx, own)
     _, FSa, FSb = m["surfS"].value(m["aS"][pj], m["bS"][qi], grads=True)
     n = len(idx)
     gq = np.zeros((n, m["covQ"].shape[1]))
@@ -933,6 +1063,8 @@ def survival_posterior(D, m, idx):
     v00 = CQ[:, 0, 0]
     v01 = np.einsum("nj,nj->n", CQ[:, 0, :], gq)
     v11 = np.einsum("ni,nij,nj->n", gq, CQ, gq) + np.einsum("ni,nij,nj->n", gp, CP, gp)
+    if own is not None:
+        v11 = v11 + own_var(D, own, idx)
     q, sd = _gh2(x0, x1, v00, v01, v11)
     return {"q": q, "q_sd": sd, "q_plugin": _sig(x1) - _sig(x0), "logit0": x0, "logit1": x1,
             "var0": v00, "cov01": v01, "var1": v11}
@@ -986,8 +1118,9 @@ def own_world_stage2(D, m, data, idx_w, folds=5, lam_world=10.0, seed=0, sweeps=
     deviation h_w(lag) shrunk by lam_world (backfitting, `sweeps` passes). Cross-fitted: the pairs are dealt
     into `folds` folds (a seeded permutation); each fold's layer is predicted by the layer fitted on the
     others -> {"h", "hw" (fitted on every pair), "oof" (the out-of-fold layer at idx_w), "fold", "world_var"
-    (the moment estimate of the world deviations' variance: an UNSEEN world's deviation is integrated out
-    with it, never estimated from its targets, v4 §6.4), "worlds" (those with pairs), ...}. m is unchanged."""
+    (world_deviation_var: the variance of the LAG-DEPENDENT world deviations, one per lag bin; an UNSEEN
+    world's deviation is integrated out with it, never estimated from its targets, v4 §6.4: own_var,
+    pred_eta, pred_count_lpd, survival_posterior), "worlds" (those with pairs), ...}. m is unchanged."""
     idx_w = np.asarray(idx_w)
     if not D.within[idx_w].all():
         raise ValueError("own_world_stage2 takes within-world pairs only")
@@ -1021,19 +1154,41 @@ def own_world_stage2(D, m, data, idx_w, folds=5, lam_world=10.0, seed=0, sweeps=
         te = fold == k
         oof[te] = h[lb[te]] + hw[lw[te], lb[te]]
     h, hw = layer(np.ones(len(idx_w), bool))
-    e = r - h[lb]                                  # (world-level moments of the residual after the shared curve)
-    ws = np.unique(lw)
-    em = np.array([e[lw == x].mean() for x in ws])
-    ev = np.array([e[lw == x].var() / max(int((lw == x).sum()), 1) for x in ws])
-    world_var = max(0.0, float(np.mean(em ** 2 - ev))) if len(ws) else 0.0
+    world_var, supported = world_deviation_var(r - h[lb], lb, lw, nb)
     return {"h": h, "hw": hw, "oof": oof, "fold": fold, "folds": folds, "lam_world": lam_world, "head": head,
-            "world_var": world_var, "worlds": ws}
+            "world_var": world_var, "world_var_supported": supported, "worlds": np.unique(lw)}
+
+
+def world_deviation_var(e, lb, lw, nb):
+    """The between-world variance of the LAG-DEPENDENT deviations h_w(lag) (Codex #66 r2 P2-3), per lag bin b:
+    e the residuals after the shared curve, cell (w, b) its mean m_wb over n_wb pairs; tau^2_b = max(0,
+    var_w(m_wb, ddof 1) - mean_w(s2_b / n_wb)), s2_b the bin's pooled within-cell variance (the cells' sampling
+    noise). Opposite deviations at two lags (+d, -d) are seen, unlike in world-averaged residuals. A bin with
+    fewer than two worlds takes the mean of the supported bins (0 if none) -> (tau^2 per bin, supported flags)."""
+    out = np.zeros(nb)
+    ok = np.zeros(nb, bool)
+    for b in range(nb):
+        sel = lb == b
+        ws = np.unique(lw[sel])
+        if len(ws) < 2:
+            continue
+        cells = [e[sel & (lw == x)] for x in ws]
+        mw = np.array([c.mean() for c in cells])
+        nwb = np.array([len(c) for c in cells], float)
+        dof = sum(len(c) - 1 for c in cells)
+        s2 = sum(float(((c - c.mean()) ** 2).sum()) for c in cells) / dof if dof > 0 else 0.0
+        out[b] = max(0.0, float(np.var(mw, ddof=1)) - float(np.mean(s2 / nwb)))
+        ok[b] = True
+    if (~ok).any():
+        out[~ok] = float(out[ok].mean()) if ok.any() else 0.0
+    return out, ok
 
 
 def own_var(D, own, idx):
-    """The own-world layer's integrated variance on pairs idx: world_var on the within-world pairs of a world
-    the layer never saw (its deviation is integrated out), 0 elsewhere."""
+    """The own-world layer's integrated variance on pairs idx: the lag bin's world_var on the within-world pairs
+    of a world the layer never saw (its deviation is integrated out), 0 elsewhere (a seen world's shrunk
+    deviation is a plug-in)."""
     idx = np.asarray(idx)
     wi = D.within[idx]
     unseen = wi & ~np.isin(D.ownw[idx], own["worlds"])
-    return np.where(unseen, own["world_var"], 0.0)
+    return np.where(unseen, own["world_var"][np.maximum(D.lagbin[idx], 0)], 0.0)

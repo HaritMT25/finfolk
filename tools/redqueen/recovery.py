@@ -584,24 +584,23 @@ def count_lpd(cnt, loc, var):
 
 def scorer(D, data, m, idx, fitter):
     """A fit's predictive model as a scoring function ix -> (count lpd per pair, Gaussian working lpd per
-    pair). The registered map: map.pred_var (one fresh replicate's location and latent variance: phi V(p) of
-    the registered variance function, the pair-residual variance, the location's posterior variance). The
-    minimal fitter: its predictions with one variance, the training residual mean square. Both densities
-    use the same location and variance; only the count density decides."""
+    pair). The registered map: the count score is map.pred_count_lpd (the predictor-scale uncertainty -- the
+    location's posterior variance and the pair residual, both inside the link -- integrated through the
+    link, with a fresh replicate's phi V(p)); the Gaussian diagnostic uses map.pred_var's first-order
+    moments. The minimal fitter: its predictions with one variance, the training residual mean square, for
+    both. Only the count density decides."""
     if fitter == "registered":
         import map as mapfit
 
-        def pv(ix):
-            return mapfit.pred_var(D, m, ix)
-    else:
-        pf = predict(D, m, idx)
-        s2 = float(((data["z"][idx] - pf[:, None]) ** 2).mean())
-
-        def pv(ix):
-            return predict(D, m, ix), np.full(len(ix), s2)
+        def score(ix):
+            loc, var = mapfit.pred_var(D, m, ix)
+            return mapfit.pred_count_lpd(D, m, ix, data["cnt"][ix], B_COUNT), lpd(data["z"][ix], loc, var)
+        return score
+    pf = predict(D, m, idx)
+    s2 = float(((data["z"][idx] - pf[:, None]) ** 2).mean())
 
     def score(ix):
-        loc, var = pv(ix)
+        loc, var = predict(D, m, ix), np.full(len(ix), s2)
         return count_lpd(data["cnt"][ix], loc, var), lpd(data["z"][ix], loc, var)
     return score
 
@@ -698,9 +697,11 @@ def class_accuracy(D, data, m1, m0):
 PRIMARY_RANKS = 2      # (v4 amendment proposed 2026-11-07: the primary confirmatory rank set is {0, 1, 2})
 MIN_TEST_WORLDS = 2    # (D6 rule 27: a prediction decision needs at least two contributing test-root worlds)
 FORWARD_TMAX = 120     # (v4 §7.3: the forward fit's main outcomes and controls through 120M)
-SCORE = {"decision": "capture-count lpd per replicate observation (map.count_lpd: Annex H.9.2's rounded "
-                     "logit-normal at map.pred_var)", "diagnostic": "Gaussian working lpd of the empirical logits "
-                     "at the same location and variance (*_gauss; the reg1-reg5 score)"}
+SCORE = {"decision": "capture-count lpd per replicate observation (map.pred_count_lpd: Annex H.9.2's rounded "
+                     "logit-normal at G(eta + e), e ~ N(0, posterior + pair-residual variance) integrated inside the "
+                     "link; the minimal fitter: map.count_lpd at its residual variance)",
+         "diagnostic": "Gaussian working lpd of the empirical logits at map.pred_var's first-order moments "
+                       "(*_gauss; the reg1-reg5 score)"}
 
 
 def _cand_record(D, data, m, r, lam, fitter, score, val, val_world, t0, extra=None):
