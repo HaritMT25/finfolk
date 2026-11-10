@@ -142,7 +142,8 @@ order statistic; a decision's critical value is the LARGEST over its applicable 
 gates c_E1..c_E3 (S_e) over F0-F2, c_T = max(log 600, over T0-T4); a capped mode makes it unavailable.
 Every allocation must be COMPLETE: every mode x graph with its registered proposal rounds, no failed
 proposal (a failure is repaired and rerun, H.12), one manifest (graph, parameters, tools, draws, gates),
-production records only (fitted parameters, the real graph, 9,999 draws). Validation (acceptance) is
+production records only (fitted parameters, the real graph restricted to the common Q200 by stats.eligibility's
+record, --eligibility: refused below 24, Annex H D6 §§9.1-9.4; 9,999 draws). Validation (acceptance) is
 INDEPENDENT of the panels it judges: the false positives of the FROZEN critical rules (the model p-value
 can only reduce rejections) on the 1,000-panel validation B stratum (and the calibrated I stratum) per
 mode x graph: H-F detection (F0-F2: the raw reciprocal rule), the nested exceeding-material claim
@@ -721,11 +722,25 @@ def _verify_s_cell(k, N):
     return _SCELL[key]
 
 
-def warm_tables(p, extras=(1.0, 1.5)):
-    """Build (and, with TABLE_CACHE, store) every grid table and cell the parameter set can reach: each
-    channel's s(mu) over (0, 1), unstressed and under validation stress, at the registered noise extras; the
-    logit sample covers [-16, 16] AND every knot of the parameters' s_logit curves (their extremes are at
-    knots). -> {N: [k_lo, k_hi]} (the cells verified)."""
+def s_bounds(p, ch, stress=False, extra=1.0):
+    """A CONSERVATIVE [lo, hi] of s_ch(mu) over (0, 1) from the SERIALIZED scale values (#68 r10 P3: no sampling of
+    mu, which passes through sigmoid and inverse logit, can hide an extreme): a fitted curve is linear in logit
+    between knots and constant beyond (noisescale.evaluate), so its range is exactly [min s, max s] of its values;
+    the registered bins blend consecutive bins (convex combinations). Then validation stress (capture max(1.5 s,
+    the 0.35 .. 0.80 floor): within [max(1.5 lo, 0.35), max(1.5 hi, 0.80)]; survival 1.5 s) and the noise extra."""
+    fn = (p["noise"].get("s_logit") or {}).get(ch)
+    vals = np.asarray(fn["s"] if fn else p["noise"]["s"][ch], float)
+    lo, hi = float(np.min(vals)), float(np.max(vals))
+    if stress:
+        lo, hi = (max(1.5 * lo, 0.35), max(1.5 * hi, 0.80)) if ch == "C" else (1.5 * lo, 1.5 * hi)
+    return lo * extra, hi * extra
+
+
+def s_spans(p, extras=(1.0, 1.5)):
+    """{N: (lo, hi)}: every s the parameter set can reach per trial count (each channel, unstressed and under
+    validation stress, at the registered noise extras): the UNION of the sampled range (the logit sample over
+    [-16, 16] and every serialized knot, through the real evaluator) and s_bounds' bounds from the serialized
+    values (which cover what the sample might miss)."""
     xs = [np.linspace(-16.0, 16.0, 4001)]
     for cv in ((p.get("noise") or {}).get("s_logit") or {}).values():
         xs.append(np.asarray(cv.get("x", []), float))
@@ -735,8 +750,16 @@ def warm_tables(p, extras=(1.0, 1.5)):
         for stress in (False, True):
             for extra in extras:
                 s = noise_scale(p, ch, mu, stress, extra)
+                blo, bhi = s_bounds(p, ch, stress, extra)
                 lo, hi = spans.get(N, (math.inf, -math.inf))
-                spans[N] = (min(lo, float(np.min(s))), max(hi, float(np.max(s))))
+                spans[N] = (min(lo, float(np.min(s)), blo), max(hi, float(np.max(s)), bhi))
+    return spans
+
+
+def warm_tables(p, extras=(1.0, 1.5)):
+    """Build (and, with TABLE_CACHE, store) every grid table and cell the parameter set can reach (s_spans: the
+    sampled range and the bounds from the serialized scale values) -> {N: [k_lo, k_hi]} (the cells verified)."""
+    spans = s_spans(p, extras)
     out = {}
     for N, (lo, hi) in sorted(spans.items()):
         k0, k1 = int(math.floor(lo / S_STEP + 1e-9)), int(math.floor(hi / S_STEP + 1e-9))
@@ -2316,8 +2339,10 @@ def _manifest(rs, production, probs):
         probs.append(f"{len(mans)} different manifests (graph, parameters, tools, draws or gates)")
     man = json.loads(next(iter(mans))) if len(mans) == 1 else None
     if production and (man is None or not man.get("production") or man.get("draws") != stats.B_BOOT
-                       or not man.get("params_fitted") or man.get("graph_source") == "synthetic"):
-        probs.append("not a production calibration (fitted parameters, the real graph, 9,999 draws)")
+                       or not man.get("params_fitted") or man.get("graph_source") == "synthetic"
+                       or "+eligibility:" not in str(man.get("graph_source"))):
+        probs.append("not a production calibration (fitted parameters, the real graph restricted to the common Q200 "
+                     "by its eligibility record, 9,999 draws)")
     return man
 
 
@@ -2899,7 +2924,35 @@ def read_records(paths):
     return out
 
 
+def eligible_graph(path, elig_path):
+    """The ACTUAL QUALIFYING C graph (Annex H D6 §§9.1-9.4; stats.eligibility's record): the graph's worlds restricted
+    to the common Q200 population, each with its complete fixed reference panels; refused below |Q200| = 24 (no
+    smaller-n confirmatory calibration is substituted), or when a Q200 world lacks its panels in the graph ->
+    (graph, its source: the graph file's and the eligibility record's sha256). The stress24 stratum is drawn from
+    it (stratum_worlds)."""
+    with open(elig_path, "rb") as f:
+        raw = f.read()
+    rec = json.loads(raw.decode("utf-8"))
+    if rec.get("schema") != stats.ELIGIBILITY_SCHEMA:
+        raise CalibError(f"{elig_path}: not an eligibility record ({stats.ELIGIBILITY_SCHEMA})")
+    q = (rec.get("Q200") or {}).get("worlds") or []
+    if not (rec.get("Q200") or {}).get("available") or len(q) < stats.MIN_Q200:
+        raise CalibError(f"|Q200| = {len(q)} < {stats.MIN_Q200}: H-F / H-T are unavailable; no smaller-n confirmatory "
+                         "calibration is substituted (Annex H D6 §§9.1-9.4)")
+    g = load_graph(path, q)
+    miss = sorted(set(q) - {x.id for x in g})
+    if miss:
+        raise CalibError(f"{len(miss)} Q200 world(s) without their complete fixed panels in the graph: {miss[:5]}")
+    with open(path, "rb") as f:
+        gsha = hashlib.sha256(f.read()).hexdigest()
+    return g, f"file:{gsha}+eligibility:{hashlib.sha256(raw).hexdigest()}"
+
+
 def get_graph(a):
+    if a.graph and getattr(a, "eligibility", None):
+        return eligible_graph(a.graph, a.eligibility)
+    if getattr(a, "eligibility", None):
+        raise CalibError("--eligibility needs --graph (the qualifying worlds' assay graph)")
     if a.graph:
         return load_graph(a.graph), "file:" + hashlib.sha256(open(a.graph, "rb").read()).hexdigest()
     return synthetic_graph(a.synthetic_worlds), "synthetic"
@@ -2919,6 +2972,8 @@ def main(argv=None):
         s = sub.add_parser(name)
         s.add_argument("--hyp", choices=("H-F", "H-T"), required=True)
         s.add_argument("--graph")
+        s.add_argument("--eligibility", help="stats.eligibility's record: the graph restricted to the common Q200 "
+                                             "(refused below 24; a production calibration requires it)")
         s.add_argument("--synthetic-worlds", type=int, default=32)
         s.add_argument("--params")
         s.add_argument("--gates", help="the frozen epoch-gate artifact (calib.py gates) H-T requires")

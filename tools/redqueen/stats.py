@@ -39,6 +39,14 @@ plateaued adjusted values. family_decision is authoritative (nominal 0.01 flags 
 reciprocal-directional headline needs both H-P and H-Q rejected under Holm; its p is max(adjusted p_P,
 adjusted p_Q). Material claims are nested: only under a rejected parent.
 
+ELIGIBILITY (Annex H D6 rules 26-27, 33; D7 rules 36-38; eligibility / decide): the AUTHORITATIVE dispatcher. Q200
+(every retained C history coexisting through the observed 200M endpoint, recomputed from worlds.py ecology's
+export) with |Q200| >= 24 gates H-P, H-Q, H-F and H-T ONLY, all on that common population (a result computed on
+another is refused); H-C independently by usable blocks (>= 1 eligible C, A and B: complete retained 200M
+histories with complete coarse measurements), count weights, >= 2 blocks; technical gaps pending repair, never
+dropped; unavailable rows enter Holm as p = 1; H-C decided at its reached active level; the ecological family
+bound as primary descriptive (no alpha). calib.py --eligibility restricts H-F / H-T calibration to Q200.
+
 NUMERICAL FAILURES. Every bootstrap draw is validated: a failed or nonfinite estimate or SE makes the
 analysis unavailable (with the failing draw); only a genuine zero SE with a finite estimate takes the
 0 / +inf / -inf convention. A constant sample has se 0 exactly (mean_se).
@@ -493,6 +501,179 @@ def reciprocal_directional(h):
     """The headline needs both H-P and H-Q rejected under Holm; its p is max of their adjusted p."""
     return {"claim": h["reject"]["H-P"] and h["reject"]["H-Q"],
             "p": max(h["adjusted"]["H-P"], h["adjusted"]["H-Q"])}
+
+
+# ================================================================== eligibility (Annex H D6 rules 26-27, 33; D7 36-38)
+MIN_Q200 = 24
+Q200_FAMILY = ("H-P", "H-Q", "H-F", "H-T")
+ECOLOGY_SCHEMA = "finfolk.redqueen.ecology/1"
+ELIGIBILITY_SCHEMA = "finfolk.redqueen.eligibility/1"
+MASK_SCHEMA = "finfolk.redqueen.graphmask/2"
+COARSE_T = tuple(range(0, 201, 5))           # (graph.py's coarse times: H-C's required 200M coarse measurements)
+
+
+def complete_history(slot):
+    """A slot's RETAINED attempt is a complete retained 200M history: evidenced alive through the registered end
+    (observation "administrative" in worlds.py ecology: no terminal boundary, no stop, no technical end) and no
+    predator refill (nothing after a refill establishes natural coexistence)."""
+    o = (slot.get("attempts") or [{}])[-1]
+    return o.get("observation") == "administrative" and not o.get("refill")
+
+
+def ecology_problems(eco, registry, registry_sha256=None):
+    """Why an ecological export (worlds.py ecology, #75) is not this registry's, or its Q200 not its own slots'
+    (recomputed: every retained C history complete through the observed 200M endpoint, D6 rule 26) -> ([problem],
+    the recomputed Q200)."""
+    probs = []
+    if eco.get("schema") != ECOLOGY_SCHEMA:
+        return [f"ecology schema {eco.get('schema')!r}, expected {ECOLOGY_SCHEMA}"], []
+    if registry_sha256 is not None and eco.get("registry_sha256") != registry_sha256:
+        probs.append("the ecological export was made from another registry (registry_sha256)")
+    slots = eco.get("slots") or {}
+    reg = {w["id"]: w for w in registry["worlds"]}
+    if set(slots) != set(reg):
+        probs.append(f"its slots are not the registry's worlds ({sorted(set(slots) ^ set(reg))[:5]})")
+    for w in sorted(set(slots) & set(reg)):
+        if (slots[w].get("treatment"), slots[w].get("block")) != (reg[w]["treatment"], reg[w]["block"]):
+            probs.append(f"{w}: another treatment / block than the registry's")
+    q = sorted(w for w, s in slots.items() if s.get("treatment") == "C" and complete_history(s))
+    if (eco.get("Q200") or {}).get("worlds") != q:
+        probs.append("its Q200 is not its own slots' (recomputed: retained C histories complete through 200M)")
+    return probs, q
+
+
+def mask_gaps(mask, worlds, times=COARSE_T):
+    """{world: [(t, cause, why)]}: the snapshots at the given graph times a graphmask/2 excludes, per world."""
+    out = {}
+    if mask is None:
+        return out
+    if mask.get("schema") != MASK_SCHEMA:
+        raise StatsError(f"mask schema {mask.get('schema')!r}, expected {MASK_SCHEMA}")
+    S = mask.get("snapshots") or {}
+    for w in worlds:
+        g = [(t, S[k]["status"], S[k].get("why")) for t in times
+             for k in [f"{w}:{1 if t == 0 else t * 1_000_000}"] if k in S]
+        if g:
+            out[w] = g
+    return out
+
+
+def eligibility(eco, registry, hc_slopes, registry_sha256=None, mask=None, eco_sha256=None, min_q200=MIN_Q200):
+    """THE AUTHORITATIVE ELIGIBILITY DISPATCHER (Annex H D6 rules 26-27 and 33; D7 rules 36-38) -> (the eligibility
+    record, H-C's usable block deltas, their count weights).
+
+      Q200 (D6 rule 26): every retained C history with continuous coexistence through the observed 200M endpoint
+        (ecology_problems recomputes it from the export's slots). |Q200| >= min_q200 (24) is the availability
+        safeguard of H-P, H-Q, H-F and H-T ONLY: below it their decisions are unavailable (their measurements and
+        estimates stay descriptive); they all use the COMMON Q200 population (H-T in every epoch).
+      H-C (D7 rules 36-38), independently of |Q200|: an ELIGIBLE world (any treatment) has a complete retained 200M
+        history and the complete required 200M coarse measurements (both slopes finite in hc_slopes); a usable
+        block has >= 1 eligible C, A and B (every eligible world averaged within its treatment; no control
+        selected or replaced); the count-based precision weights a_G,b = (1/n_C,b + 1/n_G,b)^-1, normalized per
+        control type (hc_block_deltas, hc_test); >= 2 usable blocks, else unavailable; the lattice floor 2^-m. Its
+        estimand is the weighted contrast conditional on the realized eligibility pattern.
+      Technical gaps (mask: a graphmask/2's excluded coarse snapshots of a world otherwise qualifying) are reported
+        and REPAIRED, never silently dropped (D6 rule 26): the decisions that need those worlds are unavailable
+        ("pending repair") until then; biological ones are the evidence's.
+      The ecological family is a mandatory primary DESCRIPTIVE family (D6 rule 33): its export is bound here
+        (eco_sha256, its 200M first-attempt survival per treatment) and consumes no alpha."""
+    probs, q = ecology_problems(eco, registry, registry_sha256)
+    if probs:
+        raise StatsError("the ecological export is not this registry's: " + "; ".join(probs[:5]))
+    slots = eco["slots"]
+    reg = registry["worlds"]
+    complete = {w["id"] for w in reg if complete_history(slots[w["id"]])}
+    gaps = mask_gaps(mask, sorted(complete))
+    tech = {w: g for w, g in gaps.items() if any(c == "technical" or c == "pending" for _, c, _ in g)}
+
+    def slopes_ok(w):
+        s = hc_slopes.get(w)
+        return isinstance(s, dict) and all(isinstance(s.get(k), (int, float)) and math.isfinite(s[k])
+                                           for k in ("neural", "scripted"))
+    eligible = {w["id"] for w in reg if w["id"] in complete and slopes_ok(w["id"]) and w["id"] not in gaps}
+    why = {}
+    for w in reg:
+        o = (slots[w["id"]].get("attempts") or [{}])[-1]
+        if w["id"] not in complete:
+            why[w["id"]] = f"no complete retained 200M history (observation {o.get('observation')}" + (
+                ", a refill)" if o.get("refill") else ")")
+        elif w["id"] in gaps:
+            why[w["id"]] = "its required coarse measurements are excluded by the mask: " + "; ".join(
+                f"t {t} {c}" for t, c, _ in gaps[w["id"]][:3])
+        elif not slopes_ok(w["id"]):
+            why[w["id"]] = "its required 200M coarse measurements are incomplete (no finite neural and scripted slope)"
+    deltas, unusable, weights = hc_block_deltas({w: hc_slopes[w] for w in eligible}, reg, with_weights=True)
+    counts = {}
+    for w in reg:
+        c = counts.setdefault(w["block"], {"C": 0, "A": 0, "B": 0})
+        c[w["treatment"]] += w["id"] in eligible
+    nq = len(q)
+    q_tech = sorted(set(q) & set(tech))
+    hyp = {}
+    for h in Q200_FAMILY:
+        r = None if nq >= min_q200 else (f"|Q200| = {nq} < {min_q200}: the decision is unavailable (its measurements "
+                                         "and estimates stay descriptive; D6 rule 26)")
+        if r is None and q_tech:
+            r = f"technical gaps in {len(q_tech)} Q200 world(s) ({q_tech[:4]}): pending repair, never dropped"
+        hyp[h] = {"population": "Q200", "available": r is None, "reason": r}
+    hc_tech = sorted(tech)                   # (any treatment: every otherwise complete world counts for H-C)
+    m = len(deltas)
+    r = None if m >= 2 else f"{m} usable block(s): the registered routine needs at least two (D7 rule 38)"
+    if r is None and hc_tech:
+        r = f"technical gaps in {len(hc_tech)} otherwise complete world(s) ({hc_tech[:4]}): pending repair, never dropped"
+    a = {b: {"A": weights[b][0], "B": weights[b][1]} for b in sorted(weights)}
+    norm = {G: {b: a[b][G] / sum(x[G] for x in a.values()) for b in a} for G in ("A", "B")} if a else {}
+    hyp["H-C"] = {"population": "usable blocks", "available": r is None, "reason": r, "usable_blocks": sorted(deltas),
+                  "unusable_blocks": {str(b): v for b, v in sorted(unusable.items())}, "n_blocks": m,
+                  "p_floor": (2.0 ** -m) if m else None, "counts": {str(b): c for b, c in sorted(counts.items())},
+                  "weights_a": {str(b): v for b, v in a.items()},
+                  "weights_normalized": {G: {str(b): v for b, v in d.items()} for G, d in norm.items()},
+                  "estimand": "the count-weighted C - G contrast among eligible complete-history worlds of the usable "
+                              "blocks, conditional on the realized eligibility pattern (D7 rule 37)"}
+    T = eco.get("primary_horizon")
+    eco_rec = {"sha256": eco_sha256, "registry_sha256": eco.get("registry_sha256"), "primary_horizon": T,
+               "first_attempt_200M": {t: (((s.get("first_attempt") or {}).get("survival") or {}).get(str(T)))
+                                      for t, s in sorted((eco.get("summary") or {}).items())},
+               "alpha": "none: the ecological family is primary descriptive (D6 rule 33)"}
+    rec = {"schema": ELIGIBILITY_SCHEMA, "ecology": eco_rec,
+           "Q200": {"worlds": q, "count": nq, "minimum": min_q200, "available": nq >= min_q200},
+           "eligible": {t: sorted(w["id"] for w in reg if w["treatment"] == t and w["id"] in eligible) for t in "CAB"},
+           "ineligible": dict(sorted(why.items())),
+           "technical_gaps": {w: [list(x) for x in g] for w, g in sorted(tech.items())},
+           "mask_sha256": (mask or {}).get("sha256") if mask else None, "hypotheses": hyp}
+    return rec, deltas, weights
+
+
+def decide(elig, results, deltas, weights, alpha=FAMILY_ALPHA):
+    """The five-row confirmatory decision from the dispatcher's record (D6 rule 33): results {h: {"p", "worlds"}}
+    for H-P / H-Q / H-F / H-T enter ONLY when the dispatcher made h available and h was computed on exactly the
+    common Q200 population (StatsError otherwise: a decision on another population is never accepted); every
+    unavailable row keeps its row and enters Holm as p = 1 (holm); H-C's p is the count-weighted intersection-
+    union test's (hc_test), and H-C is then decided at its REACHED ACTIVE Holm level (its bounds at that level
+    beside the fixed 99% ones); family_decision is authoritative."""
+    pv, why = {}, {}
+    for h in Q200_FAMILY:
+        e, r = elig["hypotheses"][h], results.get(h)
+        if not e["available"]:
+            pv[h], why[h] = None, e["reason"]
+        elif r is None or r.get("p") is None:
+            pv[h], why[h] = None, "no result (a numerical failure or an unrun analysis: unavailable)"
+        elif sorted(r.get("worlds") or []) != elig["Q200"]["worlds"]:
+            raise StatsError(f"{h} was computed on another population than the common Q200 ({len(r.get('worlds') or [])} "
+                             f"worlds, Q200 has {elig['Q200']['count']})")
+        else:
+            pv[h] = float(r["p"])
+    e = elig["hypotheses"]["H-C"]
+    hc = hc_test(deltas, DETECT_ALPHA, weights=weights) if e["available"] else {"available": False, "reason": e["reason"]}
+    if not hc.get("available"):
+        pv["H-C"], why["H-C"] = None, hc.get("reason") or e["reason"]
+    else:
+        pv["H-C"] = hc["p"]
+    hl = holm(pv, alpha)
+    if hc.get("available"):
+        hc = dict(hc_test(deltas, active_level(hl, "H-C"), weights=weights), reached=hl["reached"]["H-C"])
+    return {"pvalues": pv, "unavailable": why, "holm": hl, "H-C": hc, "decision": family_decision(hl, hc),
+            "reciprocal": reciprocal_directional(hl), "ecology": elig["ecology"], "Q200": elig["Q200"]}
 
 
 # ================================================================== crossed sources (H.7)

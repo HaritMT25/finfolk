@@ -392,5 +392,149 @@ class TestMultiplicityAndCalibration(unittest.TestCase):
             stats.crossed_mean_draws(recs, undefined="drop")
 
 
+def layout64(blocks=8):
+    """The registered D7 layout: per block 4C + 2A + 2B."""
+    out = []
+    for b in range(1, blocks + 1):
+        out += [{"id": f"C{b}{k}", "treatment": "C", "block": b} for k in range(4)]
+        out += [{"id": f"{t}{b}{k}", "treatment": t, "block": b} for t in "AB" for k in range(2)]
+    return out
+
+
+def eco_doc(reg, dead=(), refill=(), q200=None):
+    """worlds.py ecology's form (#75): per slot its attempts (the retained one last); Q200 recomputed unless given."""
+    slots = {w["id"]: {"treatment": w["treatment"], "block": w["block"],
+                       "attempts": [{"observation": "event" if w["id"] in dead else "administrative",
+                                     "refill": {"frame": 9_000_000} if w["id"] in refill else None}]} for w in reg}
+    q = sorted(w for w, s in slots.items() if s["treatment"] == "C" and w not in dead and w not in refill)
+    return {"schema": stats.ECOLOGY_SCHEMA, "registry_sha256": "r" * 64, "primary_horizon": 200_000_000,
+            "slots": slots, "Q200": {"worlds": q if q200 is None else q200, "count": len(q)},
+            "summary": {t: {"first_attempt": {"survival": {"200000000": {"N": n}}}} for t, n in (("C", 32), ("A", 16), ("B", 16))}}
+
+
+def hc_slopes(reg, missing=(), effect=0.3):
+    """Per world (neural, scripted) slopes: C worlds d = effect (+ a small world term), controls d = 0."""
+    out = {}
+    for k, w in enumerate(reg):
+        if w["id"] in missing:
+            out[w["id"]] = {"neural": float("nan"), "scripted": 0.1}
+            continue
+        d = (effect + 0.01 * (k % 3)) if w["treatment"] == "C" else 0.001 * (k % 2)
+        out[w["id"]] = {"neural": 0.5 + d, "scripted": 0.5}
+    return out
+
+
+class TestEligibility(unittest.TestCase):
+    """THE ELIGIBILITY DISPATCHER (Annex H D6 rules 26-27, 33; D7 rules 36-38): |Q200| >= 24 only for H-P/Q/F/T on the
+    common Q200; H-C independently by usable blocks with count weights; unavailable rows as p = 1 in Holm."""
+
+    def setUp(self):
+        self.reg = {"worlds": layout64()}
+
+    def run_(self, dead=(), refill=(), missing=(), mask=None, results=None):
+        reg = self.reg
+        rec, D, W = stats.eligibility(eco_doc(reg["worlds"], dead, refill), reg, hc_slopes(reg["worlds"], missing),
+                                      registry_sha256="r" * 64, mask=mask, eco_sha256="e" * 64)
+        return rec, D, W, stats.decide(rec, results or {}, D, W)
+
+    def test_fewer_than_24_survivors_with_usable_hc_blocks(self):
+        """Q200 = 22 (ten C histories ended): H-P, H-Q, H-F and H-T are unavailable (p = 1 in Holm, their results
+        never used), while H-C keeps all eight usable blocks (>= 1 C in each), is tested and decided under Holm at
+        its reached active level; the ecology is bound, consuming no alpha."""
+        dead = [f"C{b}{k}" for b in range(1, 6) for k in (0, 1)]
+        res = {h: {"p": 1e-9, "worlds": []} for h in stats.Q200_FAMILY}
+        rec, D, W, dec = self.run_(dead=dead, results=res)
+        self.assertEqual((rec["Q200"]["count"], rec["Q200"]["available"]), (22, False))
+        for h in stats.Q200_FAMILY:
+            self.assertFalse(rec["hypotheses"][h]["available"])
+            self.assertIn("22 < 24", rec["hypotheses"][h]["reason"])
+            self.assertIsNone(dec["pvalues"][h])
+            self.assertEqual(dec["holm"]["raw"][h], 1.0)
+        hc = rec["hypotheses"]["H-C"]
+        self.assertEqual((hc["available"], hc["n_blocks"], hc["p_floor"]), (True, 8, 1 / 256))
+        self.assertEqual(hc["counts"]["1"], {"C": 2, "A": 2, "B": 2})
+        self.assertEqual((dec["pvalues"]["H-C"], dec["H-C"]["alpha"], dec["H-C"]["reached"]), (1 / 256, 0.01, True))
+        self.assertEqual(dec["decision"], {"H-P": False, "H-Q": False, "H-F": False, "H-T": False, "H-C": True})
+        self.assertEqual((rec["ecology"]["sha256"], rec["ecology"]["alpha"][:4]), ("e" * 64, "none"))
+        self.assertEqual(rec["ecology"]["first_attempt_200M"]["C"], {"N": 32})
+
+    def test_one_surviving_control_of_each_type(self):
+        """Block 3 keeps ONE A and ONE B (the others ended): it is usable, its count weights a = (1/n_C + 1/n_G)^-1 =
+        (1/4 + 1)^-1 = 0.8 against 4/3 in intact blocks, normalized per control type; the weighted estimates are
+        the normalized-weight sums (stats.hc_test's normalization, verified, not replaced)."""
+        rec, D, W, dec = self.run_(dead=["A30", "B31"])
+        hc = rec["hypotheses"]["H-C"]
+        self.assertEqual((hc["n_blocks"], hc["counts"]["3"]), (8, {"C": 4, "A": 1, "B": 1}))
+        self.assertAlmostEqual(hc["weights_a"]["3"]["A"], 0.8)
+        self.assertAlmostEqual(hc["weights_a"]["1"]["B"], 4 / 3)
+        for G in "AB":
+            wn = hc["weights_normalized"][G]
+            self.assertAlmostEqual(sum(wn.values()), 1.0)
+            self.assertAlmostEqual(wn["3"], 0.8 / (7 * 4 / 3 + 0.8))
+            est = sum(wn[str(b)] * D[b][0 if G == "A" else 1] for b in D)
+            self.assertAlmostEqual(dec["H-C"][f"estimate_{G}"], est)
+        self.assertNotIn("A31", rec["ineligible"])
+        self.assertIn("no complete retained 200M history", rec["ineligible"]["A30"])
+        self.assertTrue(dec["decision"]["H-C"])
+
+    def test_block_with_an_ineligible_control(self):
+        """Block 5 loses both B controls (one ended, one without its complete 200M coarse measurements) and is
+        unusable; block 6's refilled A is ineligible (a refill never establishes natural coexistence) but its other
+        A keeps the block usable: 7 usable blocks, floor 1/128; no control is selected or replaced."""
+        rec, D, W, dec = self.run_(dead=["B50"], refill=["A60"], missing=["B51"])
+        hc = rec["hypotheses"]["H-C"]
+        self.assertEqual((hc["n_blocks"], hc["p_floor"], sorted(D)), (7, 1 / 128, [1, 2, 3, 4, 6, 7, 8]))
+        self.assertIn("0 B", hc["unusable_blocks"]["5"])
+        self.assertIn("incomplete", rec["ineligible"]["B51"])
+        self.assertIn("refill", rec["ineligible"]["A60"])
+        self.assertEqual(hc["counts"]["6"], {"C": 4, "A": 1, "B": 2})
+        self.assertEqual(dec["pvalues"]["H-C"], 1 / 128)
+        self.assertNotIn("A60", rec["eligible"]["A"])
+
+    def test_q200_population_and_holm_rows(self):
+        """With >= 24 survivors H-P / H-Q / H-F / H-T enter with their p-values only when computed on EXACTLY the
+        common Q200 (another population is refused); a missing result is an unavailable row (p = 1); fewer than two
+        usable blocks make H-C unavailable (p = 1), never dropped from the five-row Holm family."""
+        rec, D, W = stats.eligibility(eco_doc(self.reg["worlds"]), self.reg, hc_slopes(self.reg["worlds"]),
+                                      registry_sha256="r" * 64)
+        q = rec["Q200"]["worlds"]
+        self.assertEqual(len(q), 32)
+        res = {"H-P": {"p": 0.001, "worlds": q}, "H-Q": {"p": 0.004, "worlds": list(reversed(q))}, "H-F": {"p": None}}
+        dec = stats.decide(rec, res, D, W)
+        self.assertEqual((dec["pvalues"]["H-P"], dec["pvalues"]["H-Q"], dec["pvalues"]["H-F"], dec["pvalues"]["H-T"]),
+                         (0.001, 0.004, None, None))
+        self.assertEqual(sorted(dec["holm"]["unavailable"]), ["H-F", "H-T"])
+        with self.assertRaisesRegex(stats.StatsError, "another population"):
+            stats.decide(rec, {"H-P": {"p": 0.001, "worlds": q[1:]}}, D, W)
+        dead = [w["id"] for w in self.reg["worlds"] if w["treatment"] != "C" and w["block"] > 1]
+        rec1, D1, W1 = stats.eligibility(eco_doc(self.reg["worlds"], dead), self.reg, hc_slopes(self.reg["worlds"]))
+        dec1 = stats.decide(rec1, {}, D1, W1)
+        self.assertEqual((rec1["hypotheses"]["H-C"]["available"], dec1["pvalues"]["H-C"], dec1["holm"]["raw"]["H-C"]),
+                         (False, None, 1.0))
+        self.assertIn("1 usable block", dec1["unavailable"]["H-C"])
+        self.assertEqual(sorted(dec1["decision"]), sorted(stats.HYPOTHESES))
+
+    def test_ecology_export_and_technical_gaps(self):
+        """The ecological export must be this registry's and its Q200 its own slots' (recomputed); a technical gap
+        (a mask's excluded coarse snapshot of an otherwise complete world) is reported and pending repair: the world
+        stays in Q200, the affected decisions are unavailable, nothing is silently dropped."""
+        reg = self.reg
+        for bad, msg in ((dict(eco_doc(reg["worlds"]), registry_sha256="x" * 64), "another registry"),
+                         (eco_doc(reg["worlds"], q200=["C10"]), "Q200 is not its own"),
+                         (dict(eco_doc(reg["worlds"]), schema="x"), "ecology schema")):
+            with self.assertRaisesRegex(stats.StatsError, msg):
+                stats.eligibility(bad, reg, hc_slopes(reg["worlds"]), registry_sha256="r" * 64)
+        mask = {"schema": stats.MASK_SCHEMA, "sha256": "m" * 64,
+                "snapshots": {"C11:50000000": {"status": "technical", "why": "not archived, and attempt 0 is done"}}}
+        rec, D, W, dec = self.run_(mask=mask)
+        self.assertIn("C11", rec["Q200"]["worlds"])
+        self.assertEqual(rec["technical_gaps"], {"C11": [[50, "technical", "not archived, and attempt 0 is done"]]})
+        for h in stats.HYPOTHESES:
+            self.assertFalse(rec["hypotheses"][h]["available"], h)
+            self.assertIn("pending repair", rec["hypotheses"][h]["reason"])
+            self.assertIsNone(dec["pvalues"][h])
+        self.assertIn("excluded by the mask", rec["ineligible"]["C11"])
+
+
 if __name__ == "__main__":
     unittest.main()

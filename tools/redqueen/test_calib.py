@@ -280,22 +280,24 @@ class TestGenerator(unittest.TestCase):
             cb._GRID.clear()
             cb._SCELL.clear()
             cb.TABLE_CACHE = None
-            ns = cb.noise_scale                                  # (a narrow s range: a fast test)
+            ns, sb = cb.noise_scale, cb.s_bounds                 # (a narrow s range: a fast test)
             cb.noise_scale = lambda p, ch, mu, stress=False, extra=1.0: np.where(mu < 0.5, 0.2, 0.2 + 0.006 * extra)
+            cb.s_bounds = lambda p, ch, stress=False, extra=1.0: (math.inf, -math.inf)    # (the sample alone here)
             try:
                 span = cb.warm_tables(cb.placeholder_params())
             finally:
-                cb.noise_scale = ns
+                cb.noise_scale, cb.s_bounds = ns, sb
             self.assertEqual(span, {int(cb.placeholder_params()["capture_bound"]): [40, 41], cb.TRIALS: [40, 41]})
             self.assertTrue(all((k, N) in cb._SCELL for N in span for k in (40, 41)))
             # (r9 P3: a curve whose extreme lies at a knot beyond logit +-16 is covered)
             pk = cb.placeholder_params()
             pk["noise"]["s_logit"] = {ch: {"x": [-20.0, 0.0], "s": [0.3, 0.2]} for ch in "CSF"}
             cb.noise_scale = lambda p, ch, mu, stress=False, extra=1.0: np.where(mu < cb.sig(-18.0), 0.2 + 0.006, 0.2)
+            cb.s_bounds = lambda p, ch, stress=False, extra=1.0: (math.inf, -math.inf)
             try:
                 span2 = cb.warm_tables(pk, extras=(1.0,))
             finally:
-                cb.noise_scale = ns
+                cb.noise_scale, cb.s_bounds = ns, sb
             self.assertEqual(span2[cb.TRIALS], [40, 41])
         finally:
             cb.TABLE_CACHE = saved[0]
@@ -303,6 +305,82 @@ class TestGenerator(unittest.TestCase):
             cb._GRID.update(saved[1])
             cb._SCELL.clear()
             cb._SCELL.update(saved[2])
+
+    def test_s_spans_cover_the_serialized_values(self):
+        """#68 r10 P3: the pre-build range comes from the SERIALIZED scale values too, so no sampling of mu (through
+        sigmoid and inverse logit) can hide an extreme. Codex's counterexample x = [19.99999999, 20.0], s = [0.2,
+        0.8]: every s the REAL evaluator returns (noise_scale -> noisescale.evaluate), at representable means up to
+        1, unstressed and under validation stress, at both extras, lies within s_spans; the upper plateau times
+        stress and extra is covered; the registered bins' bounds are their convex blends."""
+        cb = self.cb
+        p = cb.placeholder_params()
+        p["noise"]["s_logit"] = {ch: {"x": [19.99999999, 20.0], "s": [0.2, 0.8]} for ch in "CSF"}
+        sp = cb.s_spans(p)
+        mu = np.concatenate([cb.sig(np.linspace(-40.0, 40.0, 8001)), [0.5, np.nextafter(1.0, 0.0), 1.0 - 1e-12]])
+        for ch, n in (("C", int(p["capture_bound"])), ("S", cb.TRIALS), ("F", cb.TRIALS)):
+            for stress in (False, True):
+                for extra in (1.0, 1.5):
+                    s = cb.noise_scale(p, ch, mu, stress, extra)
+                    self.assertTrue(sp[n][0] <= float(s.min()) and float(s.max()) <= sp[n][1], (ch, stress, extra))
+        self.assertGreaterEqual(sp[cb.TRIALS][1], 0.8 * 1.5 * 1.5 - 1e-12)          # (the plateau, stress x extra)
+        for (ch, stress, extra), want in ((("S", True, 1.5), (0.45, 1.8)), (("C", True, 1.0), (0.35, 1.2)),
+                                          (("F", False, 1.0), (0.2, 0.8))):
+            got = cb.s_bounds(p, ch, stress, extra)
+            self.assertAlmostEqual(got[0], want[0], places=12)
+            self.assertAlmostEqual(got[1], want[1], places=12)
+        q = cb.placeholder_params()                                               # (the registered bins)
+        self.assertEqual(cb.s_bounds(q, "C"), (0.20, 0.55))
+        lo, hi = cb.s_bounds(q, "C", True)
+        self.assertAlmostEqual(lo, 0.35, places=12)
+        self.assertAlmostEqual(hi, 0.825, places=12)
+
+    def test_eligible_graph(self):
+        """Annex H D6 §§9.1-9.4 (#68 eligibility): H-F / H-T calibrate on the ACTUAL qualifying C graph: the graph
+        restricted to the common Q200 of stats.eligibility's record; below 24 refused (no smaller-n substitute); a
+        Q200 world without its complete fixed panels refused; the source binds both files; the stress24 stratum
+        comes from it; a production calibration needs that binding."""
+        import gzip
+        import shutil
+        import tempfile
+        import stats
+        cb = self.cb
+        tmp = tempfile.mkdtemp()
+        try:
+            gp = os.path.join(tmp, "graph.jsonl.gz")
+            ws = [f"C{k:02d}" for k in range(30)]
+            lines = []
+            for w in ws:
+                lines.append({"prey": f"Q:{w}:10", "pred": f"P:{w}:20"})
+                if w != "C29":                                   # (C29: no predator-reference panel)
+                    lines += [{"prey": f"RQ:{r}", "pred": f"P:{w}:{t}"} for r, t in zip(range(4), (10, 20, 30, 40))]
+                lines += [{"prey": f"Q:{w}:{t}", "pred": f"RP:{r}"} for r, t in zip(range(4), (10, 20, 30, 40))]
+            with gzip.open(gp, "wt") as f:
+                f.write("".join(json.dumps(e) + "\n" for e in lines))
+
+            def elig(q, avail=True):
+                p = os.path.join(tmp, f"e{len(q)}{int(avail)}.json")
+                with open(p, "w") as f:
+                    json.dump({"schema": stats.ELIGIBILITY_SCHEMA, "Q200": {"worlds": q, "count": len(q),
+                                                                            "available": avail}}, f)
+                return p
+            g, src = cb.eligible_graph(gp, elig(ws[:24]))
+            self.assertEqual([x.id for x in g], ws[:24])
+            self.assertTrue(src.startswith("file:") and "+eligibility:" in src)
+            self.assertEqual(len(cb.stratum_worlds(g, "stress24")), 24)
+            with self.assertRaisesRegex(cb.CalibError, "23 < 24"):
+                cb.eligible_graph(gp, elig(ws[:23], False))
+            with self.assertRaisesRegex(cb.CalibError, "without their complete fixed panels"):
+                cb.eligible_graph(gp, elig(ws[5:30]))
+            probs = []
+            cb._manifest([{"manifest": dict(self.man_fixture(), graph_source="file:x")}], True, probs)
+            self.assertTrue(probs and "restricted to the common Q200" in probs[0])
+        finally:
+            shutil.rmtree(tmp)
+
+    @staticmethod
+    def man_fixture():
+        return {"graph_sha256": "g", "graph_source": "file:x+eligibility:y", "params_sha256": "p", "params_fitted": True,
+                "tools_sha256": "t", "draws": 9999, "gates_sha256": None, "production": True}
 
     def test_ou_red_variation(self):
         """Codex's counterexample rho = (0, .98) is refused, and so is rho = (.05, .98) with innovations
@@ -404,7 +482,7 @@ class TestHarness(unittest.TestCase):
     def setUpClass(cls):
         import calib
         cls.cb = calib
-        cls.man = {"graph_sha256": "g", "graph_source": "file:x", "params_sha256": "p", "params_fitted": True,
+        cls.man = {"graph_sha256": "g", "graph_source": "file:x+eligibility:y", "params_sha256": "p", "params_fitted": True,
                    "tools_sha256": "t", "draws": 9999, "gates_sha256": None, "production": True}
 
     def allocation(self, hyp, stage, n, score=lambda m, s, k: 0.001 * k, man=None, **kw):
@@ -725,7 +803,7 @@ class TestStrata(unittest.TestCase):
         cls.cb = calib
         cls.graph = calib.synthetic_graph(4)
         cls.params = calib.placeholder_params()
-        cls.man = {"graph_sha256": "g", "graph_source": "file:x", "params_sha256": "p", "params_fitted": True,
+        cls.man = {"graph_sha256": "g", "graph_source": "file:x+eligibility:y", "params_sha256": "p", "params_fitted": True,
                    "tools_sha256": "t", "draws": 9999, "gates_sha256": None, "production": True}
 
     def run_(self, mode, slot, **kw):
