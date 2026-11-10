@@ -1104,10 +1104,89 @@ class TestMap(unittest.TestCase):
             self.assertLess(float(np.median(err)), 2e-4, tv)
             fo = M.count_lpd(cnt, rec.B_COUNT, *M.pred_var(D, m, t[:n_]))       # (first order: not enough)
             self.assertGreater(float(np.abs(fo - np.array(ref)).max()), 10 * float(err.max()))
+            # r3 P2-1: a grid too coarse at the start is caught by the a-posteriori check and refined
+            old, M.TRAP_H = M.TRAP_H, 6.0
+            try:
+                inf = {}
+                lp2 = M.pred_count_lpd(D, m, t[:n_], cnt, rec.B_COUNT, info=inf)
+            finally:
+                M.TRAP_H = old
+            if tv:
+                self.assertGreater(inf["refined"], 0, tv)
+            self.assertLess(float(np.abs(lp2 - np.array(ref)).max()), 3e-3, tv)
+            self.assertLessEqual(inf["max_check"], M.TRAP_TOL)
+        g_ = np.linspace(-6.0, 6.0, 20001)
+        self.assertGreaterEqual(lk.max_slope(-6.0, 6.0), float(lk.dG(g_).max()))   # (a conservative bound)
         m0 = dict(m, pair_var=0.0, covQ=0 * m["covQ"], covP=0 * m["covP"])
         l0, v0 = M.pred_var(D, m0, t[:n_])
         self.assertTrue(np.allclose(M.pred_count_lpd(D, m0, t[:n_], cnt, rec.B_COUNT),
                                     M.count_lpd(cnt, rec.B_COUNT, l0, v0)))
+
+    def test_count_integral_never_capped(self):
+        """r3 P2-1: the review's case: identity link, eta = 0, s2 = 1, a constant replicate SD 0.003, count 162
+        of 324. The exact convolution is P = 0.00493; a 513-node grid (spacing 0.027) gives about 0.0105 (0.75
+        nats off). Above the largest grid the score takes the eps-order integral (exact inner integral) and
+        reports it; with no variance function the identity link's Gaussian convolution is exact."""
+        import types
+        M, N = self.M, self.rec.B_COUNT
+        Dx = types.SimpleNamespace(qi=np.zeros(1, int), pj=np.zeros(1, int))
+        kn = np.linspace(-1.0, 1.0, 4)
+        sig2 = 0.003 ** 2
+        mx = {"surfC": M.Surface(kn, kn, ("inc", "dec")), "a": np.zeros(1), "b": np.zeros(1),
+              "u": np.zeros((1, 0)), "v": np.zeros((1, 0)), "rank": 0, "covQ": np.zeros((1, 3, 3)),
+              "covP": np.zeros((1, 2, 2)), "pair_var": 1.0, "link": M.Link(), "phi": sig2,
+              "var_fn": lambda p: np.ones_like(p)}                         # (constant V, but a variance function)
+        cnt = np.array([[162]])
+        exact = float(M.count_lpd(cnt, N, np.zeros(1), np.array([1.0 + sig2]))[0])
+        self.assertAlmostEqual(float(np.exp(exact)), 0.00493, delta=2e-5)
+        inf = {}
+        got = float(M.pred_count_lpd(Dx, mx, np.array([0]), cnt, N, info=inf)[0])
+        self.assertAlmostEqual(got, exact, delta=1e-4)
+        self.assertEqual((inf["eps"], inf["eps_unresolved"], inf["grid"]), (1, 0, 0))
+        capped = float(M._grid_pass(mx["link"], mx, cnt, np.zeros(1), np.ones(1), N, 513)[0][0, 0])
+        self.assertGreater(abs(capped - exact), 0.5)                           # (what a silent cap would score)
+        my = dict(mx, var_fn=None)                                             # (the exact convolution case)
+        inf = {}
+        self.assertAlmostEqual(float(M.pred_count_lpd(Dx, my, np.array([0]), cnt, N, info=inf)[0]), exact, places=12)
+        self.assertEqual(inf["exact"], 1)
+
+    def test_pair_variance_safeguarded(self):
+        """r3 P2-2: the review's cycle. One cell (s2 0.01, r^2 1.01) and 100 cells (s2 1, r^2 0): the fixed point
+        alternates 0.980 <-> 0 from 0 (it returned 0); the safeguarded solve finds the likelihood root 0.0896."""
+        M = self.M
+        r = np.concatenate([[np.sqrt(1.01)], np.zeros(100)])
+        s2 = np.concatenate([[0.01], np.ones(100)])
+        t, cyc = 0.0, []
+        for _ in range(6):                                                     # (the old fixed point)
+            w = 1.0 / (t + s2) ** 2
+            t = max(0.0, float(np.sum(w * (r ** 2 - s2)) / np.sum(w)))
+            cyc.append(round(t, 4))
+        self.assertEqual(cyc[:4], [0.9802, 0.0, 0.9802, 0.0])
+        out = M.pair_variance(r, s2, full=True)
+        self.assertAlmostEqual(out["tau2"], 0.0896, delta=2e-4)
+        self.assertTrue(out["converged"] and abs(out["score"]) < 1e-4)
+        self.assertEqual(M.pair_variance(r, s2), out["tau2"])
+        self.assertEqual(M.pair_variance(np.zeros(5), np.ones(5)), 0.0)      # (no excess: the floor)
+
+    def test_world_deviation_var_unequal_cells(self):
+        """r3 P2-3: unequal heteroscedastic cells. Two worlds in one lag bin, cells (n 2, variance 0.06) and (n 50,
+        variance 0.00375), means +0.2 / -0.2: var of the means 0.08 minus the cells' own noise mean(0.06/2,
+        0.00375/50) = 0.0150375 gives 0.0649625; the pooled rule (pooled variance x mean(1/n) = 0.0012675) gave
+        0.0787325. Supplied row variances give the same."""
+        M = self.M
+        a = np.sqrt(0.03)
+        z = np.random.default_rng(3).normal(size=50)
+        z = (z - z.mean()) / z.std(ddof=1)
+        e = np.concatenate([[0.2 + a, 0.2 - a], -0.2 + np.sqrt(0.00375) * z])
+        lw = np.concatenate([np.zeros(2, int), np.ones(50, int)])
+        lb = np.zeros(52, int)
+        tau, ok, raw = M.world_deviation_var(e, lb, lw, 1)
+        self.assertAlmostEqual(float(raw[0]), 0.08 - 0.0150375, places=12)
+        self.assertTrue(ok[0] and tau[0] == raw[0])
+        rv = np.concatenate([np.full(2, 0.06), np.full(50, 0.00375)])
+        self.assertAlmostEqual(float(M.world_deviation_var(e, lb, lw, 1, row_var=rv)[2][0]), 0.08 - 0.0150375,
+                               places=12)
+        self.assertGreater(abs(float(raw[0]) - (0.08 - 0.0012675)), 0.01)
 
     def test_sensitivities(self):
         """P2-6: the separate-embedding and four- / eight-basis sensitivity fits run with their own

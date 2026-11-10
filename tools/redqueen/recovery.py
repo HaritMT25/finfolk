@@ -592,15 +592,18 @@ def scorer(D, data, m, idx, fitter):
     if fitter == "registered":
         import map as mapfit
 
-        def score(ix):
+        def score(ix, info=None):
             loc, var = mapfit.pred_var(D, m, ix)
-            return mapfit.pred_count_lpd(D, m, ix, data["cnt"][ix], B_COUNT), lpd(data["z"][ix], loc, var)
+            return (mapfit.pred_count_lpd(D, m, ix, data["cnt"][ix], B_COUNT, info=info),
+                    lpd(data["z"][ix], loc, var))
         return score
     pf = predict(D, m, idx)
     s2 = float(((data["z"][idx] - pf[:, None]) ** 2).mean())
 
-    def score(ix):
+    def score(ix, info=None):
         loc, var = predict(D, m, ix), np.full(len(ix), s2)
+        if info is not None:
+            info["exact"] = info.get("exact", 0) + int(len(ix))          # (one variance: no integral)
         return count_lpd(data["cnt"][ix], loc, var), lpd(data["z"][ix], loc, var)
     return score
 
@@ -705,9 +708,11 @@ SCORE = {"decision": "capture-count lpd per replicate observation (map.pred_coun
 
 
 def _cand_record(D, data, m, r, lam, fitter, score, val, val_world, t0, extra=None):
-    vc, vg = score(val)
+    info = {}
+    vc, vg = score(val, info)
     rec = {"rank": r, "lambda": lam, "val_lpd": world_mean(vc, val_world)[0],
-           "val_lpd_gauss": world_mean(vg, val_world)[0], "start": m.get("start"), "objectives": m.get("objectives")}
+           "val_lpd_gauss": world_mean(vg, val_world)[0], "start": m.get("start"), "objectives": m.get("objectives"),
+           "integration": {"validation": info}}          # (map.pred_count_lpd's cases and checks, reported)
     if fitter == "registered":
         rec.update(qp=m["qp"], link={"lo": m["link"].lo, "hi": m["link"].hi}, phi=m["phi"], pair_var=m["pair_var"])
     rec.update(extra or {})
@@ -741,10 +746,12 @@ def procedure(D, data, option, ranks, lambdas, iters, seed, ab_cap=None, fitter=
         m = any_fit(fitter, D, idx, data, r, lam, own_layer, iters, seed, ab_cap=ab_cap, start=start, basis=basis,
                     embedding=embedding, center=center)
         sc = scorer(D, data, m, idx, fitter)
-        tc, tg = sc(D.test_idx) if len(D.test_idx) else (np.zeros(0), np.zeros(0))
+        tinfo = {}
+        tc, tg = sc(D.test_idx, tinfo) if len(D.test_idx) else (np.zeros(0), np.zeros(0))
         pt = any_predict(D, m, D.test_idx)
         rec = _cand_record(D, data, m, r, lam, fitter, sc, D.val_idx, D.val_world, t0, {
             "test_rmse_truth": float(np.sqrt(np.mean((pt - data["eta"][D.test_idx]) ** 2))) if len(pt) else None})
+        rec["integration"]["test"] = tinfo
         out["candidates"].append(rec)
         models[(r, lam)] = (m, sc, tc, tg)
         if best is None or rec["val_lpd"] > best["val_lpd"]:
@@ -1163,6 +1170,9 @@ def summarize(d):
                     "selected_ranks": dict(sorted(sel.items())),
                     "positive_rank_selected": sum(o["selected"]["rank"] > 0 for o in lst),
                     "decision_unavailable": sum(not (o.get("decision") or {"available": True})["available"] for o in lst),
+                    "integration_unresolved": sum(int((c.get("integration") or {}).get(s, {}).get("eps_unresolved", 0))
+                                                  for o in lst for c in o.get("candidates", ())
+                                                  for s in ("validation", "test")),
                     "primary": ({"ranks": prim[0]["ranks"], "datasets": len(prim), "successes": kp,
                                  "rate": round(kp / len(prim), 3), "wilson95": wilson(kp, len(prim)),
                                  "selected_ranks": dict(sorted(selp.items())),

@@ -61,8 +61,11 @@ pairs). pred_eta: an unseen pair's predictor and its variance there (posterior +
 own-world deviation]); pred_count_lpd, the registered score: the capture-count log predictive density under
 the bounded observation model of Annex H.9.2 (a rounded latent logit-normal: normalized over 0..B, no
 Bernoulli capture opportunities) at G(eta + e) with a fresh replicate's variance phi V, e integrated through
-the link on a resolving trapezoid grid; pred_var: the first-order moments (phi V + G'(eta)^2 s2), for the
-Gaussian diagnostic only. survival_posterior: q_ij = E[sigma(c_i + eta^S_ij) - sigma(c_i) | data] under the joint (c_i,
+the link (exact for the identity link with a constant variance; otherwise a resolving trapezoid grid, every
+observation checked a posteriori and refined, and beyond the largest grid the eps-order integral with an
+exact inner integral; the cases are reported, never silently capped); pred_var: the first-order moments
+(phi V + G'(eta)^2 s2), for the Gaussian diagnostic only. pair_variance solves its likelihood score
+safeguarded (bracketing and bisection); world_deviation_var subtracts each cell's own sampling noise. survival_posterior: q_ij = E[sigma(c_i + eta^S_ij) - sigma(c_i) | data] under the joint (c_i,
 exposed-logit) covariance (2-D Gauss-Hermite), with its SD.
 """
 from __future__ import annotations
@@ -358,6 +361,39 @@ class Link:
     def G(self, eta):
         return self._from_h(self.h(eta))[0]
 
+    def inverse(self, z):
+        """eta with G(eta) = z (G is strictly increasing): -inf / +inf for z at or beyond the link's range."""
+        z = np.asarray(z, float)
+        if self.lo == 0.0 and self.hi == 1.0:
+            hv = z
+        else:
+            s = (_sig(z) - self.lo) / (self.hi - self.lo)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                hv = np.where(s <= 0, -np.inf, np.where(
+                    s >= 1, np.inf, np.log(np.clip(s, 1e-300, 1.0)) - np.log1p(-np.minimum(s, 1.0 - 1e-16))))
+        if self.knots is None:
+            return hv
+        th, kn = self.theta, self.knots
+        fin = np.isfinite(hv)
+        hf = np.where(fin, hv, 0.0)
+        i0 = np.clip(np.searchsorted(th, hf, side="right") - 1, 0, len(th) - 2)
+        t = (hf - th[i0]) / (th[i0 + 1] - th[i0])
+        return np.where(fin, kn[i0] + t * (kn[i0 + 1] - kn[i0]), hv)
+
+    def max_slope(self, lo_, hi_):
+        """A CONSERVATIVE bound on G' over [lo_, hi_]: the steepest spline interval meeting the range (the
+        linear extensions included) times 1 / (hi - lo), which bounds the logistic factor
+        (hi - lo) s (1 - s) / (p (1 - p)) whenever 0 <= lo < hi <= 1 (p >= (hi - lo) s, 1 - p >= (hi - lo)(1 - s))."""
+        if self.knots is None:
+            sl = 1.0
+        else:
+            kn, th = self.knots, self.theta
+            slopes = np.diff(th) / np.diff(kn)
+            a = int(np.clip(np.searchsorted(kn, lo_, side="right") - 1, 0, len(kn) - 2))
+            b = int(np.clip(np.searchsorted(kn, hi_, side="right") - 1, 0, len(kn) - 2))
+            sl = float(slopes[a:b + 1].max())
+        return sl if (self.lo == 0.0 and self.hi == 1.0) else sl / (self.hi - self.lo)
+
     def dG(self, eta):
         hv, hp = self.h(eta, True)
         return self._from_h(hv)[1] * hp
@@ -529,20 +565,44 @@ def capture_scale(V, zrep, R):
     return (1.0 / V) / M, max(phi / (R * M), UNIT_FLOOR), phi
 
 
-def pair_variance(r, s2, iters=50):
+def pair_variance(r, s2, grid=200, iters=200, full=False):
     """The pair-residual variance tau^2 on the PREDICTOR scale (v4 §6.2: delta_ij inside the link): r the
     working residuals (z - G(eta)) / G'(eta) of the fitting pairs, s2 their replicate-mean variances on that
-    scale (v / G'^2). r ~ N(0, tau^2 + s2): the weighted moment equation sum w (r^2 - s2 - tau^2) = 0 with
-    w = 1 / (tau^2 + s2)^2, iterated from 0, floored at 0 (strong shrinkage: no pair residual unless the
-    residuals exceed the replicate noise)."""
-    r, s2 = np.asarray(r, float), np.asarray(s2, float)
-    t = 0.0
-    for _ in range(iters):
-        w = 1.0 / (t + s2) ** 2
-        t_new = max(0.0, float(np.sum(w * (r ** 2 - s2)) / np.sum(w)))
-        if abs(t_new - t) <= 1e-12 * (1.0 + t):
-            return t_new
-        t = t_new
+    scale (v / G'^2), r ~ N(0, tau^2 + s2). The weighted moment equation sum (r^2 - s2 - t) / (t + s2)^2 = 0 is
+    the score of that Gaussian likelihood; a fixed-point iteration of it can cycle (Codex #66 r3 P2-2), so it
+    is solved SAFEGUARDED: every + to - sign change of the score on a log grid over (0, max r^2] (the score is
+    negative beyond: every term is) is bracketed and bisected to convergence, t = 0 (the floor: strong
+    shrinkage) is a candidate, and the candidate of largest likelihood is returned (full: with the score
+    there, the roots and convergence)."""
+    r2, s2 = np.asarray(r, float) ** 2, np.asarray(s2, float)
+    tmax = float(r2.max()) if len(r2) else 0.0
+
+    def score(t):
+        return float(np.sum((r2 - s2 - t) / (t + s2) ** 2))
+
+    def loglik(t):
+        return float(-0.5 * np.sum(np.log(t + s2) + r2 / (t + s2)))
+    roots, ok = [], True
+    if tmax > 0:
+        ts = np.concatenate([[0.0], tmax * np.geomspace(1e-12, 1.0, grid)])
+        gs = np.array([score(t) for t in ts])
+        for k in np.flatnonzero((gs[:-1] > 0) & (gs[1:] <= 0)):
+            a, b = float(ts[k]), float(ts[k + 1])
+            for _ in range(iters):
+                c = 0.5 * (a + b)
+                if score(c) > 0:
+                    a = c
+                else:
+                    b = c
+                if b - a <= 1e-13 * b:
+                    break
+            else:
+                ok = False
+            roots.append(0.5 * (a + b))
+    cands = [0.0] + roots
+    t = max(cands, key=loglik)
+    if full:
+        return {"tau2": t, "score": score(t), "roots": roots, "converged": ok}
     return t
 
 
@@ -910,52 +970,135 @@ TRAP_H = 0.25                            # (the grid step, in units of the narro
 TRAP_SD = 7.0                            # (the grid covers +-TRAP_SD prior SDs)
 TRAP_KS = (15, 23, 33, 49, 65, 97, 129, 193, 257, 385, 513)    # (grid sizes: pairs are bucketed, then vectorized)
 TRAP_CELLS = 1_000_000                   # (pairs x replicates x nodes per vectorized chunk)
+TRAP_TOL = 1e-3                          # (the a-posteriori check, log units: full grid vs every other node)
+EPS_NODES = 41                           # (the eps-order Gauss-Hermite nodes; checked against 21)
+VMIN_GRID = np.linspace(-20.0, 20.0, 20001)    # (the logit grid on which the variance function's minimum is taken)
 
 
-def pred_count_lpd(D, m, idx, cnt, N, own=None):
+def _logsumexp(a, axis):
+    mx = np.max(a, axis=axis, keepdims=True)
+    mx = np.where(np.isfinite(mx), mx, 0.0)
+    with np.errstate(divide="ignore"):
+        return np.squeeze(mx, axis=axis) + np.log(np.sum(np.exp(a - mx), axis=axis))
+
+
+def _grid_pass(lk, m, cnt, eta, sd, N, K):
+    """The e-order trapezoid on K nodes over +-TRAP_SD SDs, and the same on every other node (the check) ->
+    (log P, log P on the half grid), pairs x replicates."""
+    x = np.linspace(-TRAP_SD, TRAP_SD, K)
+    lw = -0.5 * x * x
+    lwh = lw[::2] - _logsumexp(lw[::2], 0)
+    lw = lw - _logsumexp(lw, 0)
+    loc = lk.G(eta[:, None] + sd[:, None] * x[None, :])                                    # (pairs x nodes)
+    lp = _interval_logp(cnt[:, :, None], N, loc[:, None, :], _rep_var(m, loc)[:, None, :])
+    return _logsumexp(lp + lw, 2), _logsumexp(lp[..., ::2] + lwh, 2)
+
+
+def _eps_pass(lk, m, cnt, eta, sd, N, nodes):
+    """The eps-order integral for a replicate SD far below the predictor's spread: P(L < G(eta + e) + sigma eps
+    < U) = E_eps[Phi((G^-1(U - sigma eps) - eta) / sd) - Phi((G^-1(L - sigma eps) - eta) / sd)], the inner
+    e-integral EXACT through the inverse link and the outer one Gauss-Hermite in eps; sigma is the replicate SD
+    at the count's own empirical logit (in this regime the count's probability is the e-mass mapped into its
+    interval, smoothed by sigma) -> log P, pairs x replicates."""
+    import noisebank as nb
+    lo, hi = nb.interval_bounds(cnt, N)
+    y = np.log((cnt + 0.5) / (N - cnt + 0.5))
+    sg = np.sqrt(_rep_var(m, y))
+    x, w = np.polynomial.hermite_e.hermegauss(nodes)
+    w = w / w.sum()
+    acc = None
+    e0, s0 = eta[:, None], sd[:, None]
+    for xk, wk in zip(x, w):
+        with np.errstate(invalid="ignore"):
+            zl = (lk.inverse(lo - sg * xk) - e0) / s0
+            zu = (lk.inverse(hi - sg * xk) - e0) / s0
+        lp = nb._log_iprob(zl, zu) + math.log(wk)
+        acc = lp if acc is None else np.logaddexp(acc, lp)
+    return acc
+
+
+def pred_count_lpd(D, m, idx, cnt, N, own=None, info=None):
     """THE registered score (v4 §7.6) of the capture head on pairs idx: the capture-count log predictive
     density per replicate observation, with the predictor-scale uncertainty (pred_eta: the posterior variance
     of eta and the pair residual delta_ij, both INSIDE the link) integrated through the link:
         P(K = k) = E_e[P(k | G(eta + e), phi V(G(eta + e)))],  e ~ N(0, s2),
-    each P from Annex H.9.2's bounded model with the fresh replicate's variance (count_logp). The integral is a
-    trapezoid over +-TRAP_SD prior SDs whose step is at most one SD and at most TRAP_H x the narrowest
-    replicate SD / the link's steepest slope over that range, so a count probability far narrower than N(0, s2),
-    a replicate variance that changes along e, and the link's kinks are all resolved (Gaussian quadrature,
-    adaptive or not, is not robust to them: against a 32,001-point reference its error reached 0.03-0.7,
-    the first-order moments' 0.2-4; this rule's is below 3e-3). s2 = 0 gives the plain density. Per
-    observation (the marginal score: the mixture is not shared across a pair's replicates). -> one value per
-    pair."""
+    each P from Annex H.9.2's bounded model with the fresh replicate's variance (count_logp). Per observation
+    (the marginal score: the mixture is not shared across a pair's replicates). -> one value per pair.
+    THE INTEGRAL, by case (Codex #66 r3 P2-1: never a silently capped grid):
+      - s2 = 0: the plain density;
+      - the identity link with a constant replicate variance (no var_fn): EXACT, Y ~ N(eta, phi + s2);
+      - otherwise the e-order trapezoid over +-TRAP_SD prior SDs. Its step is at most one SD and at most TRAP_H
+        x the narrowest replicate SD (the variance function's minimum on VMIN_GRID) / a CONSERVATIVE bound on
+        the link's slope over the range (Link.max_slope), on the smallest of TRAP_KS that achieves it. Every
+        observation is CHECKED a posteriori against the same grid's every other node; above TRAP_TOL its pair
+        moves to the next grid;
+      - a pair whose resolution needs more than TRAP_KS[-1] nodes, or still fails the check there, has a
+        replicate SD far below its predictor spread: the eps-order integral (_eps_pass, the inner integral exact
+        through the inverse link), itself checked against half its nodes; a failure there is counted as
+        unresolved (reported, never hidden).
+    info (a dict): the counts per case are added to it (pairs, plain, exact, grid, refined, eps,
+    eps_unresolved) with the largest accepted check difference (max_check)."""
     eta, s2 = pred_eta(D, m, idx, own)
     lk = m["link"]
     cnt = np.asarray(cnt)
     out = np.empty(len(eta))
     sd = np.sqrt(s2)
+    st = {"pairs": int(len(eta)), "plain": 0, "exact": 0, "grid": 0, "refined": 0, "eps": 0, "eps_unresolved": 0,
+          "max_check": 0.0}
     plain = sd <= 1e-9
     if plain.any():
         g0 = lk.G(eta[plain])
         out[plain] = count_lpd(cnt[plain], N, g0, _rep_var(m, g0))
-    if plain.all():
-        return out
+        st["plain"] = int(plain.sum())
     q = np.flatnonzero(~plain)
-    lo_, hi_ = float((eta[q] - TRAP_SD * sd[q]).min()), float((eta[q] + TRAP_SD * sd[q]).max())
-    gmax = float(lk.dG(np.linspace(lo_, hi_, 4001)).max())
-    smin = math.sqrt(float(_rep_var(m, np.linspace(-12.0, 12.0, 4001)).min()))
-    h = np.minimum(sd[q], TRAP_H * smin / max(gmax, 1e-12))
-    need = np.minimum(np.ceil(2 * TRAP_SD * sd[q] / np.maximum(h, 1e-12)) + 1, TRAP_KS[-1]).astype(int)
-    K = np.asarray(TRAP_KS)[np.minimum(np.searchsorted(TRAP_KS, need), len(TRAP_KS) - 1)]
-    R = cnt.shape[1]
-    for Kb in np.unique(K):
-        x = np.linspace(-TRAP_SD, TRAP_SD, int(Kb))
-        lw = -0.5 * x * x
-        lw -= lw.max() + math.log(np.exp(lw - lw.max()).sum())          # (normalized log weights)
-        rows = q[K == Kb]
-        step = max(1, TRAP_CELLS // (R * int(Kb)))
-        for k0 in range(0, len(rows), step):
-            r_ = rows[k0:k0 + step]
-            loc = lk.G(eta[r_][:, None] + sd[r_][:, None] * x[None, :])                     # (pairs x nodes)
-            lp = _interval_logp(cnt[r_][:, :, None], N, loc[:, None, :], _rep_var(m, loc)[:, None, :]) + lw
-            mx = lp.max(axis=2, keepdims=True)
-            out[r_] = (mx[..., 0] + np.log(np.exp(lp - mx).sum(axis=2))).mean(axis=1)
+    if len(q) and lk.identity() and m.get("var_fn") is None:
+        out[q] = count_lpd(cnt[q], N, eta[q], m["phi"] + s2[q])
+        st["exact"] = int(len(q))
+    elif len(q):
+        R = cnt.shape[1]
+        lo_, hi_ = float((eta[q] - TRAP_SD * sd[q]).min()), float((eta[q] + TRAP_SD * sd[q]).max())
+        gmax = max(lk.max_slope(lo_, hi_), 1e-12)
+        smin = math.sqrt(max(float(_rep_var(m, VMIN_GRID).min()), 1e-300))
+        h = np.minimum(sd[q], TRAP_H * smin / gmax)
+        need = np.ceil(2 * TRAP_SD * sd[q] / np.maximum(h, 1e-300)) + 1
+        bucket = np.searchsorted(TRAP_KS, need)                 # (len(TRAP_KS): beyond the largest grid)
+        eps_rows = [q[bucket >= len(TRAP_KS)]]
+        cur, cb = q[bucket < len(TRAP_KS)], bucket[bucket < len(TRAP_KS)]
+        while len(cur):
+            nxt, nb_ = [], []
+            for b in np.unique(cb):
+                rows = cur[cb == b]
+                Kb = TRAP_KS[int(b)]
+                step = max(1, TRAP_CELLS // (R * Kb))
+                for k0 in range(0, len(rows), step):
+                    r_ = rows[k0:k0 + step]
+                    full, half = _grid_pass(lk, m, cnt[r_], eta[r_], sd[r_], N, Kb)
+                    err = np.max(np.abs(full - half), axis=1)
+                    ok = err <= TRAP_TOL
+                    out[r_[ok]] = full[ok].mean(axis=1)
+                    st["grid"] += int(ok.sum())
+                    if ok.any():
+                        st["max_check"] = max(st["max_check"], float(err[ok].max()))
+                    if (~ok).any():
+                        if b + 1 < len(TRAP_KS):
+                            nxt.append(r_[~ok])
+                            nb_.append(np.full(int((~ok).sum()), b + 1))
+                            st["refined"] += int((~ok).sum())
+                        else:
+                            eps_rows.append(r_[~ok])
+            cur = np.concatenate(nxt) if nxt else np.zeros(0, int)
+            cb = np.concatenate(nb_) if nb_ else np.zeros(0, int)
+        er = np.concatenate(eps_rows)
+        if len(er):
+            full = _eps_pass(lk, m, cnt[er], eta[er], sd[er], N, EPS_NODES)
+            half = _eps_pass(lk, m, cnt[er], eta[er], sd[er], N, (EPS_NODES + 1) // 2)
+            err = np.max(np.abs(full - half), axis=1)
+            out[er] = full.mean(axis=1)
+            st["eps"] = int(len(er))
+            st["eps_unresolved"] = int((err > TRAP_TOL).sum())
+    if info is not None:
+        for k, v in st.items():
+            info[k] = max(info.get(k, 0.0), v) if k == "max_check" else info.get(k, 0) + v
     return out
 
 
@@ -1154,34 +1297,45 @@ def own_world_stage2(D, m, data, idx_w, folds=5, lam_world=10.0, seed=0, sweeps=
         te = fold == k
         oof[te] = h[lb[te]] + hw[lw[te], lb[te]]
     h, hw = layer(np.ones(len(idx_w), bool))
-    world_var, supported = world_deviation_var(r - h[lb], lb, lw, nb)
+    world_var, supported, raw = world_deviation_var(r - h[lb], lb, lw, nb)
     return {"h": h, "hw": hw, "oof": oof, "fold": fold, "folds": folds, "lam_world": lam_world, "head": head,
-            "world_var": world_var, "world_var_supported": supported, "worlds": np.unique(lw)}
+            "world_var": world_var, "world_var_supported": supported, "world_var_raw": raw, "worlds": np.unique(lw)}
 
 
-def world_deviation_var(e, lb, lw, nb):
+def world_deviation_var(e, lb, lw, nb, row_var=None):
     """The between-world variance of the LAG-DEPENDENT deviations h_w(lag) (Codex #66 r2 P2-3), per lag bin b:
-    e the residuals after the shared curve, cell (w, b) its mean m_wb over n_wb pairs; tau^2_b = max(0,
-    var_w(m_wb, ddof 1) - mean_w(s2_b / n_wb)), s2_b the bin's pooled within-cell variance (the cells' sampling
-    noise). Opposite deviations at two lags (+d, -d) are seen, unlike in world-averaged residuals. A bin with
-    fewer than two worlds takes the mean of the supported bins (0 if none) -> (tau^2 per bin, supported flags)."""
+    e the residuals after the shared curve, cell (w, b) its mean m_wb over n_wb pairs, and
+        tau^2_b = max(0, var_w(m_wb, ddof 1) - mean_w(noise_wb)),
+    noise_wb the CELL's own sampling variance of its mean (Codex #66 r3 P2-3: with unequal, heteroscedastic
+    cells, a pooled within-variance times mean(1 / n) is not the noise of the world means): row_var given
+    (each residual's variance), sum(row_var) / n^2; otherwise the cell's own variance (ddof 1) / n, and a
+    single-pair cell the bin's pooled within-cell variance. Opposite deviations at two lags (+d, -d) are seen,
+    unlike in world-averaged residuals. A bin with fewer than two worlds takes the mean of the supported bins
+    (0 if none) -> (tau^2 per bin, supported flags, the unfloored estimates (nan where unsupported))."""
     out = np.zeros(nb)
+    raw = np.full(nb, np.nan)
     ok = np.zeros(nb, bool)
     for b in range(nb):
         sel = lb == b
         ws = np.unique(lw[sel])
         if len(ws) < 2:
             continue
-        cells = [e[sel & (lw == x)] for x in ws]
+        masks = [sel & (lw == x) for x in ws]
+        cells = [e[mk] for mk in masks]
         mw = np.array([c.mean() for c in cells])
         nwb = np.array([len(c) for c in cells], float)
         dof = sum(len(c) - 1 for c in cells)
-        s2 = sum(float(((c - c.mean()) ** 2).sum()) for c in cells) / dof if dof > 0 else 0.0
-        out[b] = max(0.0, float(np.var(mw, ddof=1)) - float(np.mean(s2 / nwb)))
+        pooled = sum(float(((c - c.mean()) ** 2).sum()) for c in cells) / dof if dof > 0 else 0.0
+        if row_var is not None:
+            noise = np.array([float(np.sum(row_var[mk])) for mk in masks]) / nwb ** 2
+        else:
+            noise = np.array([(float(np.var(c, ddof=1)) if len(c) > 1 else pooled) for c in cells]) / nwb
+        raw[b] = float(np.var(mw, ddof=1)) - float(np.mean(noise))
+        out[b] = max(0.0, raw[b])
         ok[b] = True
     if (~ok).any():
         out[~ok] = float(out[ok].mean()) if ok.any() else 0.0
-    return out, ok
+    return out, ok, raw
 
 
 def own_var(D, own, idx):
