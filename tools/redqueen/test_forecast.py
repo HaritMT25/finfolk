@@ -657,16 +657,45 @@ class TestPipeline(unittest.TestCase):
         f = S["test/fork/H10/primary"]
         self.assertEqual((f["origins"], f["prefix_unavailable"], f["excluded"], f["futures"]["registered"],
                           f["conditioning"]["survivor-conditioned"]), (2, 1, 1, 4, 1))
-        G = fc.decomposition_gate(per)
-        self.assertEqual(G["status"], "incomplete")
-        for want in ("native panel has 1 worlds", "1 fork origin(s) excluded", "1 fork origin(s) prefix-unavailable",
-                     "1 native origin(s) prefix-unavailable", "survivor-conditioned or observable-only"):
-            self.assertTrue(any(want in w for w in G["reasons"]), (want, G["reasons"]))
-        good = [dict(keys, kind="native", world=f"n{i:02d}", available=True, excluded=False,
-                     outcomes={"conditioning": "complete"}) for i in range(32)]
-        good.append(dict(keys, kind="fork", world="w9", available=True, excluded=False, outcomes={"conditioning": "complete"}))
-        self.assertEqual(fc.decomposition_gate(good), {"status": "complete", "reasons": [], "rule": fc.DECOMPOSITION_RULE})
-        self.assertEqual(fc.decomposition_gate(good[:31] + good[32:])["status"], "incomplete")
+        self.assertFalse(hasattr(fc, "decomposition_gate"))           # (r2: never derived from forecast summaries)
+
+    def test_registered_panel_receipt(self):
+        """Codex #78 r2 P2-1 (D6 rule 27, §10.5): a separate REGISTERED panel receipt from the fork registry: per origin
+        (30, 100, 185M) its primary target (40, 110, 195M), the native component (every native-panel world) and the
+        fork component (every root's branches and original) SEPARATELY, each required row's disposition; the pooled
+        primary only with all three origins complete. Codex's former 'success' fixture (the native panel at one target
+        plus one fork row) FAILS; one absorbed branch makes its origin unavailable; outcomes of a closed stage are
+        'not released'; forecast availability never enters."""
+        def row(z, ev=None, un=None):
+            return {"z": z, "R": None, "g": None, "events": ev or {}, "unavailable": un}
+        req = fc.panel_required(self.ctx)
+        self.assertEqual({o: r["target"] for o, r in req.items()}, {30: 40, 100: 110, 185: 195})
+        nat = len(self.ctx["forks"]["native_panel"])
+        self.assertTrue(all(len(r["native"]) == nat for r in req.values()))
+        self.assertEqual(sorted(len(r["fork"]) for r in req.values()), sorted(
+            sum(1 + len(bs) for (_, t0), bs in self.ctx["fork_origins"].items() if t0 == o) for o in req))
+        roles = {"training", "validation", "test"}
+        full = {k: row([0.1, 0.2]) for r in req.values() for kind in ("native", "fork") for k in r[kind]}
+        P = fc.panel_receipt(self.ctx, full, roles)
+        self.assertEqual((P["pooled_primary"], P["schema"]), ({"available": True, "reasons": []}, fc.PANEL_SCHEMA))
+        k0 = next(k for k in req[30]["fork"] if k not in req[30]["native"])      # (a branch: a root's original is
+        P2 = fc.panel_receipt(self.ctx, {**full, k0: row(None, {"extinction": True})}, roles)   # also its native row)
+        o30 = P2["origins"]["30"]
+        self.assertEqual((P2["pooled_primary"]["available"], o30["available"], o30["native"]["complete"],
+                          o30["fork"]["complete"]), (False, False, True, False))
+        self.assertEqual(o30["fork"]["dispositions"][f"{k0[0]}@{k0[1]}"], "absorbed: extinction")
+        some = {k: row([0.0, 0.0]) for k in req[100]["native"]}
+        some[req[100]["fork"][0]] = row([0.0, 0.0])
+        P3 = fc.panel_receipt(self.ctx, some, roles)                  # (the former success fixture: it must fail)
+        self.assertFalse(P3["pooled_primary"]["available"])
+        self.assertEqual((P3["origins"]["100"]["native"]["complete"], P3["origins"]["100"]["fork"]["complete"]), (True, False))
+        self.assertTrue(any("missing" in v for v in P3["origins"]["30"]["native"]["dispositions"].values()))
+        P4 = fc.panel_receipt(self.ctx, full, {"training", "validation"})
+        self.assertFalse(P4["pooled_primary"]["available"])
+        self.assertTrue(any(v.startswith("not released") for o in P4["origins"].values()
+                            for kind in ("native", "fork") for v in o[kind]["dispositions"].values()))
+        with self.assertRaisesRegex(fc.ForecastError, "VAL_PRED_SHA committed first|public freeze first"):
+            fc.panel_document(dict(self.ctx, root=os.path.join(self.tmp, "nowhere")), self.files["val_targets.json"], "test")
 
     def test_end_to_end(self):
         """The staged pipeline runs on a TARGET-DISJOINT registration (no stage's prefix row is one of its
@@ -749,13 +778,19 @@ class TestPipeline(unittest.TestCase):
         self.assertEqual((s1["events"]["extinction"], s1["reseeds"]), (1, 3))
         s0r = next(r for r in ev["origins"] if r["target_id"] == "fork:S0:185:4")["metrics"]["lss"]
         self.assertEqual((s0r["unavailable"], s0r["reseeds"]), (1, 3))
-        # (Codex #78 r1 P2-5) every non-excluded origin has its outcome receipt; §10.5 is recorded, never certified by
-        # survivor-conditioned data
+        # (Codex #78 r1 P2-5) every non-excluded origin has its outcome receipt; §10.5 is the separate registered panel
+        # receipt (forecast.py panel), never part of the forecast scores (r2 P2-1)
         for doc in (sc, ev):
             self.assertTrue(all((r["outcomes"] is None) == r["excluded"] for r in doc["origins"]))
             self.assertEqual(sum(c["origins"] for c in doc["outcomes"].values()), len(doc["origins"]))
-            self.assertEqual(doc["decomposition_10_5"]["status"], "incomplete")
-            self.assertEqual(doc["decomposition_10_5"]["rule"], fc.DECOMPOSITION_RULE)
+            self.assertNotIn("decomposition_10_5", doc)
+        # (the release-stage gate) before VAL_PRED_SHA is committed the panel receipt is refused at either stage
+        base = self.copy(self.base)
+        for st in ("validation", "test"):
+            rc_, err = run(["panel", "--root", base, "--targets", self.files["val_targets.json"], "--stage", st,
+                            "--out", os.path.join(self.tmp, f"panel.{st}.json")])
+            self.assertEqual(rc_, 2, err)
+            self.assertIn("committed first" if st == "validation" else "public freeze first", err)
 
     def test_reproducible(self):
         """The same bytes and environment give byte-identical outputs at every stage."""

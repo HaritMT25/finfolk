@@ -366,11 +366,15 @@ def manifest(meta_path, worlds_path, forks_path=None, refs_path=None, require_la
     return out
 
 
-def availability_receipt(study, mask_path, recon_path=None):
+def availability_receipt(study, mask_path, recon_path=None, graph_path=None):
     """Bind an availability mask (graph.py mask) and optionally a plan reconciliation receipt (plan.py
     --reconciliation) to the published split manifest (Annex H D6 rule 27): the mask must be of the
     manifest's graph and histories registry, its worlds and attempt identities the registered ones
-    (mask_binding_problems), the reconciliation a reconciliation/1 of that mask (its bytes' sha256) with its
+    (mask_binding_problems), and CONSISTENT (Codex #78 r2 P2-2): graph_path, the manifest's own graph (its meta's
+    and edge file's sha256), is loaded and graph.mask_problems checks the mask's evidence (the shared
+    mask_evidence_problems: dispositions, terminal boundaries, biological / pending exclusions, disjoint available
+    frames) and its excluded edges, totals and counts against that graph (a mask without its snapshots, or with
+    any removed, is refused); the reconciliation a reconciliation/1 of that mask (its bytes' sha256) with its
     plan hashes. Published
     EXCLUSIVELY at registration/availability/<mask sha256>.json under the registration lock (the same
     bytes again accepted, other bytes refused). Neither changes a role: the manifest's endpoint roles
@@ -389,7 +393,20 @@ def availability_receipt(study, mask_path, recon_path=None):
     probs = mask_binding_problems(man, mk)
     if probs:
         raise SealError(f"{mask_path} is not this study's availability mask: " + "; ".join(probs[:5]))
-    want = (man.get("graph") or {}).get("graph_edges_sha256")
+    import graph as graphlib                      # (the shared mask validator and the graph's edges)
+    if not graph_path:
+        raise SealError("availability needs --graph (the manifest's graph: the mask is checked against its edges)")
+    gm = man.get("graph") or {}
+    meta_p = os.path.join(os.path.dirname(os.path.abspath(graph_path)), "graph.meta.json")
+    if (rqlib.sha256_file(graph_path), rqlib.sha256_file(meta_p)) != (gm.get("edges_sha256"), gm.get("meta_sha256")):
+        raise SealError(f"{graph_path} is not the manifest's graph (its edge file's or meta's sha256 differs)")
+    try:
+        probs = graphlib.mask_problems(graphlib.load(graph_path), mk)
+    except graphlib.GraphError as e:
+        raise SealError(f"{graph_path}: {e}")
+    if probs:
+        raise SealError(f"{mask_path} is not a consistent availability mask of this graph: " + "; ".join(probs[:5]))
+    want = gm.get("graph_edges_sha256")
     ksha = rqlib.sha256_bytes(k_raw)
     rec = None
     if recon_path:
@@ -814,6 +831,7 @@ def main(argv=None):
     s = sub.add_parser("availability", help="bind an availability mask (and a plan reconciliation) to the manifest")
     s.add_argument("--study", required=True)
     s.add_argument("--mask", required=True)
+    s.add_argument("--graph", required=True, help="the manifest's graph.jsonl.gz (the mask is checked against it)")
     s.add_argument("--reconciliation")
     for name in ("check", "filter"):
         s = sub.add_parser(name)
@@ -866,7 +884,7 @@ def main(argv=None):
             return 0
         study = os.path.abspath(a.study)
         if a.cmd == "availability":
-            rec = availability_receipt(study, a.mask, a.reconciliation)
+            rec = availability_receipt(study, a.mask, a.reconciliation, a.graph)
             print(f"availability receipt for mask {rec['mask']['sha256'][:16]} (registration/availability/): executable "
                   f"{(rec['mask']['edges'] or {}).get('executable')} of {(rec['mask']['edges'] or {}).get('scheduled')}")
             return 0

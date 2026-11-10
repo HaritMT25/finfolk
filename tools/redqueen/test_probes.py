@@ -79,39 +79,73 @@ def config(**over):
     return cfg
 
 
-def production(excluded, panel=None, tamper=False):
-    """make_root's `before`: a graph.py mask /2 of the fixture's manifest (its graph, registry, every world at attempt 0)
-    with the given exclusions {"<world>:<frame>": (status, why)} registered at config/availability_mask.json, its
-    receipt published by sealing.py availability, and the production binding naming both (panel: a founder panel of
-    that many C worlds; tamper: the registered mask's bytes changed after the receipt)."""
+REG_C = WORLDS[:32]                                                   # (the bound registry's 32 C worlds)
+REG_BLOCK = {w: k // 4 + 1 for k, w in enumerate(WORLDS)}
+
+
+def production(excluded, panel=None, tamper=False, planned=None, founders=None):
+    """make_root's `before`: a graph.py mask /2 of the fixture's manifest (its graph, registry, every world established
+    at attempt 0) whose own evidence supports the given exclusions {"<world>:<frame>": (status, why)} (a biological one
+    is its world's first terminal boundary), registered at config/availability_mask.json; its receipt published by
+    sealing.py availability (checked against the graph's edges); the planned probe-row inventory (planned: [(world,
+    t)], default none) at config/probe_rows.json; the registry at config/worlds.json; the production binding (panel:
+    the registry's C founders with their blocks, or `founders` as given; tamper: the registered mask's bytes
+    changed after the receipt)."""
+    import graph as graphlib
+
     def before(root, m):
+        M = 1_000_000
         rs = m["worlds_registry_sha256"]
-        mk = {"schema": sealing.MASK_SCHEMA, "graph": {"edges_sha256": m["graph"]["graph_edges_sha256"]},
-              "registry": {"sha256": rs}, "block": {"sha256": "b" * 64, "registry_sha256": rs},
-              "worlds": {w: {"uuid": u, "attempt": 0, "attempt_uuid": u} for w, u in m["uuids"].items()},
-              "snapshots": {k: {"status": st, "why": why} for k, (st, why) in excluded.items()}}
+        est = {"decided": True, "disposition": "established", "why": "alive at the burn-in frame"}
+        W = {w: {"uuid": u, "attempt": 0, "attempt_uuid": u, "burn_in": est, "valid_before": None, "first_terminal": None,
+                 "frontier": 200 * M, "refill": None, "available_sha256": {}} for w, u in m["uuids"].items()}
+        S = {}
+        for k, (st, why) in excluded.items():
+            w, f = k.split(":")[0], int(k.split(":")[1])
+            S[k] = {"world": w, "time": f // M, "frame": f, "status": st, "why": why, "uuid": UUIDS[w], "attempt": 0,
+                    "snapshot": sealing.snapshot_uuid(UUIDS[w], f)}
+            if st == "biological":
+                S[k]["valid_before"] = f
+                W[w].update(valid_before=f, first_terminal={"frame": f, "kind": "prey"}, frontier=f)
+        g = graphlib.load(os.path.join(os.path.dirname(root), "graph", "graph.jsonl.gz"))
+        ex, by = graphlib.edge_exclusions(g, S)
+        n, ne = len(g["edges"]), sum(len(v) for v in ex.values())
+        mk = {"schema": sealing.MASK_SCHEMA, "graph": {"edges_sha256": g["edges_sha256"], "namespace": g["namespace"], "edges": n},
+              "registry": {"sha256": rs}, "block": {"sha256": "b" * 64, "registry_sha256": rs}, "worlds": W, "snapshots": S,
+              "edges": {"scheduled": n, "executable": n - ne, **{k: len(v) for k, v in ex.items()}},
+              "by_family_role": by, "excluded_edges": ex}
         mp = os.path.join(root, "config", pb.AVAIL_MASK)
         wr(mp, json.dumps(mk))
-        sealing.availability_receipt(root, mp)
+        sealing.availability_receipt(root, mp, None, os.path.join(os.path.dirname(root), "graph", "graph.jsonl.gz"))
         ksha = rqlib.sha256_file(mp)
         if tamper:
             wr(mp, json.dumps(dict(mk, snapshots={})))
-        out = {"availability": {"annex_sha256": "a" * 64, "mask_sha256": ksha, "receipt": f"{ksha}.json"}}
-        if panel:
+        ip = os.path.join(root, "config", pb.ROWS_DOC)
+        wr(ip, json.dumps({"schema": pb.ROWS_SCHEMA, "rows": [{"world": w, "t": t} for w, t in (planned or [])]}))
+        with open(os.path.join(os.path.dirname(root), "worlds.json"), "rb") as f, \
+                open(os.path.join(root, "config", pb.REGISTRY_DOC), "wb") as g_:
+            g_.write(f.read())
+        out = {"availability": {"annex_sha256": "a" * 64, "mask_sha256": ksha, "receipt": f"{ksha}.json",
+                                "rows_sha256": rqlib.sha256_file(ip)}}
+        if founders is not None:
+            out["founders"] = dict(founders, worlds_registry_sha256=rs)
+        elif panel:
             out["founders"] = {"cohort": "C", "frame": 1, "worlds_registry_sha256": rs, "size": panel,
-                               "panel": {w: {"uuid": UUIDS[w], "treatment": "C", "block": k // 4}
-                                         for k, w in enumerate(WORLDS[:panel])}}
+                               "panel": {w: {"uuid": UUIDS[w], "treatment": "C", "block": REG_BLOCK[w]}
+                                         for w in REG_C[:panel]}}
         return out
     return before
 
 
 def make_root(tmp, before=None, **over):
+    import graph as graphlib
     g = os.path.join(tmp, "graph")
-    wr(os.path.join(g, "graph.meta.json"), {"schema": "finfolk.redqueen.graph/1", "namespace": "ns", "edges_sha256": "e" * 64,
-                                            "split": SPLIT, "holdout": HOLD, "fork": ["w05", "w21"], "intensive": []})
-    with gzip.open(os.path.join(g, "graph.jsonl.gz"), "wt") as f:
-        f.write(json.dumps({"family": "within", "prey": "Q:w03:9", "pred": "P:w04:9", "role": "training"}) + "\n")
-    wr(os.path.join(tmp, "worlds.json"), {"namespace": "ns-main", "worlds": [{"id": w, "uuid": UUIDS[w]} for w in WORLDS]})
+    graphlib.write({"schema": "finfolk.redqueen.graph/1", "namespace": "ns", "split": SPLIT, "holdout": HOLD,
+                    "fork": ["w05", "w21"], "intensive": [],
+                    "worlds": [{"id": w, "treatment": "C" if w in REG_C else "A", "block": REG_BLOCK[w]} for w in WORLDS],
+                    "edges": [("Q:w03:9", "P:w04:9", "within", "training", None)]}, g)
+    wr(os.path.join(tmp, "worlds.json"), {"namespace": "ns-main", "worlds": [
+        {"id": w, "uuid": UUIDS[w], "treatment": "C" if w in REG_C else "A", "block": REG_BLOCK[w]} for w in WORLDS]})
     wr(os.path.join(tmp, "forks.json"), {"worlds": [{"id": b, "uuid": str(uuid.uuid5(uuid.NAMESPACE_URL, b)), "root": r,
                                                      "root_uuid": UUIDS[r]} for b, r in BRANCHES.items()]})
     root = os.path.join(tmp, "root")
@@ -201,48 +235,87 @@ class TestBasics(unittest.TestCase):
         self.assertFalse(hasattr(pb, "spline_basis"))
 
     def test_availability_binding_and_founder_coverage(self):
-        """PR-D (Annex H D6 rule 27, §§11.1-11.3; Codex #78 r1 P2-6, P2-7, P3): the availability binding is REQUIRED:
-        a production one (the adopted annex's sha256, the registered mask and the receipt sealing.py published for
-        this manifest, all verified) or an explicit legacy one; under production, no feature row and no numeric
-        target exists at an excluded snapshot (a null target is retained), every excluded snapshot of a stage's role
-        is reported with its cause, and the founder panel is the full 32; the founder audit reports missing
-        founders against the registered panel; the conditioning label is explicit."""
+        """PR-D (Annex H D6 rule 27, §§11.1-11.3; Codex #78 r1 P2-6 / P2-7 / P3, r2 P2-2 / P2-3 / P3): the availability
+        binding is REQUIRED: a production one (the adopted annex's sha256; the registered mask, consistent with its own
+        evidence, and the receipt sealing.py published for this manifest after checking it against the graph; the
+        registered planned-row inventory; the bound registry, whose 32 C worlds and blocks ARE the founder panel) or
+        an explicit legacy one. Under production: no feature row and no numeric target at an excluded snapshot (an
+        explicit null target is retained, and accepted for an excluded planned row); a fork-branch row and an
+        unplanned row are refused; every planned row of a stage is measured, an explicit measurement failure (its
+        committed unavailable line keeps it in the report) or a mask exclusion, never silently lost."""
         tmp = tempfile.mkdtemp()
         EX = {f"w03:{30 * M}": ("biological", "at or after attempt 0's evidenced first guild zero"),
               f"w22:{40 * M}": ("technical", "not archived, and attempt 0 is done")}
+        PLAN = [("w03", 20), ("w03", 30), ("w22", 40), ("w04", 20), ("w25", 20)]
         try:
+            rows = "b" * 64
             for k, (av, msg) in enumerate(((None, "is required"), ({"legacy": " "}, "the reason"),
-                                           ({"annex_sha256": "a" * 64, "rho": 1}, "exactly annex_sha256"),
-                                           ({"annex_sha256": "x", "mask_sha256": "b" * 64, "receipt": "r"}, "64 lowercase hex"),
-                                           ({"annex_sha256": "a" * 64, "mask_sha256": "b" * 64, "receipt": "c" * 64 + ".json"},
-                                            "availability.receipt"),
-                                           ({"annex_sha256": "a" * 64, "mask_sha256": "b" * 64, "receipt": "b" * 64 + ".json"},
-                                            "no published availability receipt"))):
+                                           ({"annex_sha256": "a" * 64, "rho": 1}, "exactly \\["),
+                                           ({"annex_sha256": "x", "mask_sha256": "b" * 64, "receipt": "r", "rows_sha256": rows},
+                                            "64 lowercase hex"),
+                                           ({"annex_sha256": "a" * 64, "mask_sha256": "b" * 64, "receipt": "c" * 64 + ".json",
+                                             "rows_sha256": rows}, "availability.receipt"),
+                                           ({"annex_sha256": "a" * 64, "mask_sha256": "b" * 64, "receipt": "b" * 64 + ".json",
+                                             "rows_sha256": rows}, "no published availability receipt"))):
                 with self.assertRaisesRegex(pb.ProbeError, msg):
                     make_root(os.path.join(tmp, f"bad{k}"), availability=av)
             with self.assertRaisesRegex(pb.ProbeError, "is not the registered mask"):
                 make_root(os.path.join(tmp, "tampered"), before=production(EX, panel=32, tamper=True))
             with self.assertRaisesRegex(pb.ProbeError, "full panel of 32"):
                 make_root(os.path.join(tmp, "panel30"), before=production(EX))
-            root, _, m = make_root(os.path.join(tmp, "prod"), before=production(EX, panel=32))
+            wrong = {"cohort": "C", "frame": 1, "size": 32,
+                     "panel": {w: {"uuid": UUIDS[w], "treatment": "C", "block": REG_BLOCK[w]} for w in WORLDS[4:36]}}
+            with self.assertRaisesRegex(pb.ProbeError, "exactly the bound registry's C worlds"):
+                make_root(os.path.join(tmp, "notC"), before=production(EX, founders=wrong))
+            blocks = {"cohort": "C", "frame": 1, "size": 32,
+                      "panel": {w: {"uuid": UUIDS[w], "treatment": "C", "block": 1} for w in REG_C}}
+            with self.assertRaisesRegex(pb.ProbeError, "not the bound registry's blocks"):
+                make_root(os.path.join(tmp, "blocks"), before=production(EX, founders=blocks))
+            root, _, m = make_root(os.path.join(tmp, "prod"), before=production(EX, panel=32, planned=PLAN))
             ctx = pb.load_ctx(root)
             rec = pb.availability_record(ctx)
-            self.assertEqual((rec["kind"], rec["excluded_snapshots"], rec["mask_sha256"]),
-                             ("production", 2, rqlib.sha256_file(os.path.join(root, "config", pb.AVAIL_MASK))))
-            row = {"world": "w03", "t": 30, "uuid": UUIDS["w03"], "treatment": "C", "density": 400.0,
-                   "controller_size": 10.0, "f1": False, "values": {f: 0.1 for f in FEATS}}
+            self.assertEqual((rec["kind"], rec["excluded_snapshots"], rec["planned_rows"], rec["mask_sha256"]),
+                             ("production", 2, 5, rqlib.sha256_file(os.path.join(root, "config", pb.AVAIL_MASK))))
+
+            def row(w, t):
+                return {"world": w, "t": t, "uuid": UUIDS[w], "treatment": "C", "density": 400.0,
+                        "controller_size": 10.0, "f1": False, "values": {f: 0.1 for f in FEATS}}
             roles = {"training", "validation", "test"}
-            fp = os.path.join(tmp, "f.json")
-            wr(fp, fdoc([row, dict(row, t=20)]))
+
+            def feats(rs, failures=()):
+                p = os.path.join(tempfile.mkdtemp(dir=tmp), "f.json")
+                wr(p, dict(fdoc(rs), failures=[{"world": w, "t": t, "reason": why} for w, t, why in failures]))
+                return p
             with self.assertRaisesRegex(pb.ProbeError, "excludes this snapshot"):
-                pb.load_features(ctx, fp, roles)
+                pb.load_features(ctx, feats([row("w03", 30)]), roles)
+            with self.assertRaisesRegex(pb.ProbeError, "not a planned probe row"):
+                pb.load_features(ctx, feats([row("w03", 20), row("w04", 20), row("w25", 20), row("w06", 20)]), roles)
+            with self.assertRaisesRegex(pb.ProbeError, "fork-branch row"):
+                pb.load_features(ctx, feats([dict(row("w03", 20), world="w05.o30M.s0", t=31,
+                                                  uuid=str(uuid.uuid5(uuid.NAMESPACE_URL, "w05.o30M.s0")))]), roles)
+            with self.assertRaisesRegex(pb.ProbeError, "neither measured, an explicit measurement failure"):
+                pb.load_features(ctx, feats([row("w03", 20), row("w04", 20)]), roles)          # (w25@20 lost)
+            got, _ = pb.load_features(ctx, feats([row("w03", 20), row("w04", 20)], [("w25", 20, "assay crashed")]), roles)
+            self.assertEqual(([r["key"] for r in got], ctx["failures"]), ([("w03", 20), ("w04", 20)],
+                                                                           {("w25", 20): "assay crashed"}))
+            r25 = sealing.node_role(m, "w25", 20 * M)
+            fl = pb.failure_lines(ctx, r25, r25, {})
+            self.assertEqual({(x["world"], x["t"], x["available"], x["reason"]) for x in fl},
+                             {("w25", 20, False, "measurement failed: assay crashed")})
+            self.assertEqual(len(fl), len(TARGETS))
+            un = pb.unavailable_rows(ctx, fl, {}, {r25})
+            self.assertTrue(all(u["cause"] == "measurement failure" for u in un if u["world"] == "w25"))
             tp = os.path.join(tmp, "t.json")
-            wr(tp, tdoc([row], {("w03", 30): {"wired": 1.0, "density_only": None}}))
+            wr(tp, tdoc([row("w03", 30)], {("w03", 30): {"wired": 1.0, "density_only": None}}))
             with self.assertRaisesRegex(pb.ProbeError, "numeric target"):
                 pb.load_targets(ctx, tp, roles)
-            wr(tp, tdoc([row], {("w03", 30): {"wired": None, "density_only": None}}))
+            wr(tp, tdoc([row("w03", 30)], {("w03", 30): {"wired": None, "density_only": None}}))
             truth, _, _ = pb.load_targets(ctx, tp, roles)                    # (a null target: retained)
             self.assertEqual(truth[("w03", 30)], {"wired": None, "density_only": None})
+            pb.collect(ctx, [], truth, sealing.node_role(m, "w03", 30 * M))  # (an excluded planned row's null target)
+            wr(tp, tdoc([row("w06", 20)], {("w06", 20): {"wired": None, "density_only": None}}))
+            with self.assertRaisesRegex(pb.ProbeError, "not a planned probe row"):
+                pb.load_targets(ctx, tp, roles)
             r03 = sealing.node_role(m, "w03", 30 * M)
             un = pb.unavailable_rows(ctx, [{"world": "w03", "t": 20, "target": "wired", "available": True}], {}, {r03})
             self.assertIn({"world": "w03", "t": 30, "target": None, "cause": "biological",

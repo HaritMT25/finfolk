@@ -127,10 +127,12 @@ unavailable. Origins of different conditioning are never pooled together (a cond
 in its label), and a pooled interval needs two contributing root worlds (else the point and the reason).
 Every non-excluded origin, a prefix-unavailable one too, carries its outcome / denominator receipt
 ("outcomes": its registered futures counted whether or not a forecast exists), pooled per stage x kind x
-horizon in the documents' "outcomes"; every score document records the §10.5 disposition
-("decomposition_10_5": the pooled §10.5 primary is defined on a COMPLETE panel only, the 32-world native
-panel and every fork origin with all its futures live; "incomplete" with every reason otherwise; survivor-
-conditioned §10.6 summaries never certify it).
+horizon in the documents' "outcomes". The §10.5 disposition is a SEPARATE registered panel receipt
+(forecast.py panel; panel_required / panel_receipt): per fork origin its primary target, the native
+component (every native-panel world) and the fork component (every root's branches and original)
+separately, each required row's disposition (measured, absorbed, unavailable, missing, or not released
+under the release-stage gates), the pooled primary only with all three origins complete; it never
+looks at a forecast, and survivor-conditioned §10.6 summaries never stand in for it.
 POOLED per STAGE x WORLD ROLE x TARGET ROLE x TIME ROLE x CATEGORY x KIND x HORIZON x FORECASTER, never
 across them (a validation-root world that fed the lambda selection never pools with a test-root world), with
 a root-world cluster bootstrap (Annex H.0.4 quantiles). Twelve root worlds and 36 origins are not 144
@@ -1422,6 +1424,33 @@ def score_lines(ctx, lines, T):
     return per
 
 
+def panel_document(ctx, path, stage):
+    """The §10.5 panel receipt document under the RELEASE-STAGE GATES: validation (after VAL_PRED_SHA is committed)
+    reads training / validation-role outcomes only; test (after the public freeze) reads every role. The measurement
+    document may hold only registered panel rows of the released roles (load_profiles' admission)."""
+    root = ctx["root"]
+    if stage == "validation":
+        if not sealing._marker(root, "VAL_PRED_SHA"):
+            raise ForecastError("the §10.5 panel at the validation stage needs VAL_PRED_SHA committed first")
+        released = {"training", "validation"}
+    else:
+        if not os.path.isfile(os.path.join(sealing.reg_dir(root), "freeze.json")):
+            raise ForecastError("the §10.5 panel at the test stage needs the public freeze first (test outcomes are "
+                                "opened only after it)")
+        released = {"training", "validation", "test"}
+    want = {k for r in panel_required(ctx).values() for kind in ("native", "fork") for k in r[kind]}
+
+    def admit(i, key):
+        if key not in want:
+            return "not a registered §10.5 panel row"
+        if i["role"] not in released:
+            return f"a {i['role']}-role outcome before its stage is open"
+        return None
+    T = read_profiles(ctx, path, "panel targets", admit)
+    return dict(panel_receipt(ctx, T["rows"], released), stage=stage, config_sha256=ctx["cfg_sha"],
+                targets_sha256=T["sha"], map_sha256=T["map_sha"], measurement_sha256=T["meas_sha"])
+
+
 def outcome_summary(per):
     """The outcome receipts pooled per stage / kind / horizon / primary over EVERY scored origin (Codex #78 r1 P2-5):
     origins (available, prefix-unavailable, excluded), futures (registered, observable, live, event) and the origins
@@ -1442,32 +1471,79 @@ def outcome_summary(per):
     return dict(sorted(out.items()))
 
 
-DECOMPOSITION_RULE = ("§10.5 (the pooled primary and its three components) is defined on a COMPLETE panel only: every "
-                      "registered native-panel origin (the 32 C worlds x the origins) and every fork origin with all "
-                      "its registered futures live (no event, no technical gap) and none excluded or prefix-"
-                      "unavailable. Survivor-conditioned or observable-only origins never certify it: their forecast "
-                      "variances are conditioned on survival (§10.6 reports them as such)")
+PANEL_SCHEMA = "finfolk.redqueen.panel105/1"
+DECOMPOSITION_RULE = ("§10.5 (Annex H D6 rule 27): the registered finite-panel chance/history subtraction needs, at each "
+                      "primary target (each fork origin + the primary horizon: 40M, 110M, 195M), its COMPLETE native "
+                      "panel (every registered native-panel world measured) and its required fork measurements (every "
+                      "fork root's registered branches and original measured); if extinction or a technical loss makes "
+                      "either unavailable, that origin's decomposition is unavailable; the pooled three-origin primary "
+                      "needs all three components. Separately reported survivor-conditioned native or fork variances "
+                      "never recover it, and forecast availability does not enter")
 
 
-def decomposition_gate(per, native_panel=32):
-    """THE §10.5 COMPLETENESS DISPOSITION (Codex #78 r1), recorded explicitly with every score document: "complete"
-    only when the scored origins meet DECOMPOSITION_RULE (the native panel's registered worlds present, every origin
-    available and complete-conditioned), else "incomplete" with every reason; §10.6's survivor-conditioned
-    summaries never stand in for it."""
-    why = []
-    nat = {r["world"] for r in per if r["kind"] == "native"}
-    if len(nat) != native_panel:
-        why.append(f"the native panel has {len(nat)} worlds, the registered one {native_panel}")
-    for kind in ("native", "fork"):
-        rs = [r for r in per if r["kind"] == kind]
-        if not rs:
-            why.append(f"no {kind} origin scored")
-        bad = {"excluded": sum(1 for r in rs if r.get("excluded")),
-               "prefix-unavailable": sum(1 for r in rs if not r.get("excluded") and not r["available"]),
-               "survivor-conditioned or observable-only": sum(
-                   1 for r in rs if (r.get("outcomes") or {}).get("conditioning") not in (None, "complete"))}
-        why += [f"{n} {kind} origin(s) {k}" for k, n in bad.items() if n]
-    return {"status": "incomplete" if why else "complete", "reasons": why, "rule": DECOMPOSITION_RULE}
+def panel_required(ctx):
+    """THE REGISTERED §10.5 PANEL from the fork registry (never from forecasts; Codex #78 r2 P2-1) -> {origin (M):
+    {"target", "native" [(world, t)], "fork" [(world, t)]}}: per fork origin o, the primary target t = o + the primary
+    horizon: every registered native-panel world at t, and every fork root's registered main branches and its
+    original continuation at t."""
+    H = ctx["cfg"]["primary"]
+    out = {}
+    for o in sorted({t0 for _, t0 in ctx["fork_origins"]}):
+        t = o + H
+        fk = set()
+        for (root, t0), bs in ctx["fork_origins"].items():
+            if t0 == o:
+                fk |= {(b["id"], t) for b in bs} | {(root, t)}
+        out[o] = {"target": t, "native": sorted((w, t) for w in (ctx["forks"].get("native_panel") or [])),
+                  "fork": sorted(fk)}
+    return out
+
+
+def disposition_of(row):
+    """A required measurement's disposition from its measurement record: measured, absorbed (an event), unavailable
+    (technical, with its reason) or missing (no record)."""
+    if row is None:
+        return "missing: no measurement record (a required row is never dropped)"
+    if row["z"] is not None:
+        return "measured"
+    ev = sorted(k for k, v in (row.get("events") or {}).items() if v)
+    if ev:
+        return f"absorbed: {', '.join(ev)}"
+    return f"unavailable: {row.get('unavailable') or 'no profile'}"
+
+
+def panel_receipt(ctx, rows, released):
+    """THE REGISTERED §10.5 PANEL RECEIPT (Codex #78 r2 P2-1): per origin, the native and the fork component SEPARATELY,
+    every required row's disposition (disposition_of; a row whose release stage is not open, released: the roles
+    readable now, is "not released"), each component complete only when every row is measured, the origin's
+    decomposition available only when both are, and the POOLED primary only when all three origins are. Independent
+    of forecastability: no forecast line enters."""
+    req = panel_required(ctx)
+    man = ctx["manifest"]
+    out, why = {}, []
+    for o, r in sorted(req.items()):
+        comp = {}
+        for kind in ("native", "fork"):
+            disp = {}
+            for w, t in r[kind]:
+                root = man.get("branches", {}).get(w, {}).get("root", w)
+                role = staging.most_held_out(node_role(man, root, t), None)
+                disp[f"{w}@{t}"] = (disposition_of(rows.get((w, t))) if role in released else
+                                    f"not released (a {role}-role outcome: its stage is not open)")
+            n_ok = sum(1 for v in disp.values() if v == "measured")
+            comp[kind] = {"required": len(disp), "measured": n_ok, "complete": bool(disp) and n_ok == len(disp),
+                          "dispositions": disp}
+            if not comp[kind]["complete"]:
+                why.append(f"origin {o}M: its {kind} component is incomplete ({n_ok} of {len(disp)} measured)")
+        out[str(o)] = dict(comp, target=r["target"], available=comp["native"]["complete"] and comp["fork"]["complete"])
+    pooled = len(out) == 3 and all(v["available"] for v in out.values())
+    if len(out) != 3:
+        why.append(f"{len(out)} registered fork origins, the pooled primary needs three")
+    return {"schema": PANEL_SCHEMA, "rule": DECOMPOSITION_RULE, "origins": out,
+            "pooled_primary": {"available": pooled, "reasons": [] if pooled else why},
+            "released_roles": sorted(released),
+            "independence": "the dispositions come from the registered panel's measurement records only; forecast "
+                            "availability, exclusions and secondary horizons never enter"}
 
 
 def selection_rows(ctx, per):
@@ -1552,6 +1628,12 @@ def main(argv=None):
     s.add_argument("--selection", required=True, help="the validation scores the freeze's record names")
     s.add_argument("--targets", required=True, help="exactly the test stage's target rows")
     s.add_argument("--out", required=True)
+    s = sub.add_parser("panel", help="the registered §10.5 panel receipt (independent of the forecasts)")
+    s.add_argument("--root", required=True)
+    s.add_argument("--targets", required=True, help="the registered §10.5 panel's measurement records (released only)")
+    s.add_argument("--stage", choices=("validation", "test"), required=True,
+                   help="validation: after VAL_PRED_SHA, training / validation roles only; test: after the freeze, all")
+    s.add_argument("--out", required=True)
     a = ap.parse_args(argv)
     test_stages = {"test", "training"}
     try:
@@ -1566,6 +1648,11 @@ def main(argv=None):
             return 0
         ctx = load_ctx(a.root)
         cfg = ctx["cfg"]
+        if a.cmd == "panel":
+            rec = panel_document(ctx, a.targets, a.stage)
+            rqlib.write_json_durable(a.out, rec)
+            print(f"{a.out}: pooled §10.5 primary {'available' if rec['pooled_primary']['available'] else 'unavailable'}")
+            return 0
         if a.cmd == "origins":
             doc = {"schema": ORIGINS, "config_sha256": ctx["cfg_sha"], "origins_sha256": ctx["origins_sha"],
                    "origins": ctx["origins"], "rows": {}}
@@ -1599,8 +1686,7 @@ def main(argv=None):
             doc = {"schema": VALSCORES, "VAL_PRED_SHA": mk, "config_sha256": ctx["cfg_sha"],
                    "model_sha256": uniform(lines, "model_sha256"), "targets_sha256": T["sha"],
                    "selection": selection, "pooled": pool(ctx, per), "origins": per,
-                   "outcomes": outcome_summary(per), "decomposition_10_5": decomposition_gate(per),
-                   "scoring": scoring_record(impl)}
+                   "outcomes": outcome_summary(per), "scoring": scoring_record(impl)}
             rqlib.write_json_durable(a.out, doc)
             print(f"lambda = {doc['selection']['lambda']}; record the scores (sealing.py open-validation) before predict-test")
             return 0
@@ -1641,8 +1727,7 @@ def main(argv=None):
         doc = {"schema": EVAL, "TEST_PRED_SHA": g["TEST_PRED_SHA"], "freeze_sha256": g["freeze_sha256"],
                "config_sha256": ctx["cfg_sha"], "selection_sha256": uniform(lines, "selection_sha256"),
                "lambda": uniform(lines, "lambda"), "targets_sha256": T["sha"], "pooled": pool(ctx, per), "origins": per,
-               "outcomes": outcome_summary(per), "decomposition_10_5": decomposition_gate(per),
-               "scoring": scoring_record(impl),
+               "outcomes": outcome_summary(per), "scoring": scoring_record(impl),
                "note": "reducible = MSE - V_fork: error reducible given the saved state under reseeding, for the "
                        "RETAINED (registered, non-excluded, available) origins only; negative finite-sample values "
                        "retained; not split into representation loss and learning error; every stage x world role x "

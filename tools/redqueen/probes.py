@@ -224,9 +224,16 @@ def validate_config(root, cfg, docs):
         _need(v.get("treatment") == fd["cohort"] and _int(v.get("block"), 0),
               f"founders.panel.{w}: treatment {fd['cohort']} and an integer block")
     b = availability_binding(root, cfg.get("availability"), man, msha)    # (Codex #78 r1 P2-6: validated)
-    # (Codex #78 r1 P3) a production analysis registers the WHOLE founder panel: the 32 C worlds' retained-attempt F1
-    _need(b["kind"] != "production" or (fd["size"] == FOUNDER_PANEL and len(panel) == FOUNDER_PANEL),
-          f"founders: a production binding registers the full panel of {FOUNDER_PANEL} C founders (D6 rule 27, §11)")
+    # (Codex #78 r1 P3, r2 P3) a production analysis registers the WHOLE founder panel: exactly the bound registry's
+    # 32 C worlds (their retained-attempt F1), each with its registered block, cohort C
+    if b["kind"] == "production":
+        rc = b["registry_c"]
+        _need(fd["size"] == FOUNDER_PANEL and len(panel) == FOUNDER_PANEL and len(rc) == FOUNDER_PANEL,
+              f"founders: a production binding registers the full panel of {FOUNDER_PANEL} C founders (D6 rule 27, §11)")
+        _need(fd["cohort"] == "C" and set(panel) == set(rc),
+              "founders: the production panel is exactly the bound registry's C worlds (cohort C)")
+        bad = sorted(w for w, v in panel.items() if v.get("block") != rc[w])
+        _need(not bad, f"founders: {bad[:4]}: not the bound registry's blocks")
 
 
 def register(root, cfg_path):
@@ -260,9 +267,24 @@ def _ident(ctx, r, name, roles):
     return i
 
 
+def production_row(ctx, i, what):
+    """Under a production binding a row must be a PLANNED main-study row (Codex #78 r2 P2-2 / P2-3): a fork-branch row
+    has no bound outcome authority here (refused explicitly), and an unplanned row is refused."""
+    if not production(ctx):
+        return
+    if i["branch"]:
+        raise ProbeError(f"{what} {i['world']}@{i['t']}: a fork-branch row under a production binding has no bound outcome "
+                         "authority (refused)")
+    if (i["world"], i["t"]) not in ctx["availability"]["inventory"]:
+        raise ProbeError(f"{what} {i['world']}@{i['t']}: not a planned probe row (config/{ROWS_DOC})")
+
+
 def load_features(ctx, path, roles, name="features"):
     """Feature rows of the permitted roles only (identities checked before any value) -> (rows sorted by
-    (world, t), sha256)."""
+    (world, t), sha256). The document's explicit MEASUREMENT-FAILURE receipts ("failures": [{world, t, reason}])
+    are kept in ctx["failures"] {(world, t): reason} (Codex #78 r2 P2-3); under a production binding every row and
+    failure is a planned row (production_row) and every planned row of these roles is a feature row, a failure or
+    a mask exclusion: nothing planned disappears."""
     np = _np()
     cfg = ctx["cfg"]
     _, doc, sha = staging.read_doc(path)
@@ -272,12 +294,21 @@ def load_features(ctx, path, roles, name="features"):
     ids = [_ident(ctx, r, f"{name} row {k + 1}", roles) for k, r in enumerate(raw)]
     if rqlib.canonical_sha(doc.get("definition")) != cfg["feature_definition_sha256"]:
         raise ProbeError(f"{name}: its feature definition is not the registered one")
+    fails = {}
+    for k, f in enumerate(doc.get("failures") or []):
+        i = _ident(ctx, {kk: f.get(kk) for kk in ("world", "t", "uuid", "snapshot") if f.get(kk) is not None},
+                   f"{name} failure {k + 1}", roles)
+        production_row(ctx, i, f"{name} failure")
+        if not isinstance(f.get("reason"), str) or not f["reason"].strip() or (i["world"], i["t"]) in fails:
+            raise ProbeError(f"{name} failure {k + 1}: a planned row once, with its reason")
+        fails[(i["world"], i["t"])] = f["reason"]
     out, seen, treat = [], set(), {}
     for r, i in zip(raw, ids):
         key = (i["world"], i["t"])
-        if key in seen:
-            raise ProbeError(f"{name}: {key} occurs twice")
+        if key in seen or key in fails:
+            raise ProbeError(f"{name}: {key} occurs twice (or is both measured and failed)")
         seen.add(key)
+        production_row(ctx, i, name)
         ex = excluded_at(ctx, i)
         if ex:                              # (Codex #78 r1 P2-6: an excluded population has no profile)
             raise ProbeError(f"{name} {key}: the registered availability mask excludes this snapshot ({ex['status']}: "
@@ -291,6 +322,14 @@ def load_features(ctx, path, roles, name="features"):
         out.append({"id": i, "key": key, "treatment": r["treatment"], "density": float(r["density"]),
                     "controller_size": float(r["controller_size"]), "f1": bool(r.get("f1")),
                     "x": np.array([float(v[f]) for f in ctx["names"]])})
+    plan = planned_of(ctx, roles)
+    if plan is not None:
+        lost = sorted(k for k in plan if k not in seen and k not in fails
+                      and f"{k[0]}:{staging.frame_of(k[1])}" not in ctx["availability"]["excluded"])
+        if lost:
+            raise ProbeError(f"{name}: {len(lost)} planned row(s) are neither measured, an explicit measurement failure "
+                             f"nor excluded by the mask: {lost[:5]}")
+    ctx.setdefault("failures", {}).update(fails)
     return sorted(out, key=lambda e: e["key"]), sha
 
 
@@ -313,6 +352,7 @@ def load_targets(ctx, path, roles, name="targets"):
         y = r.get("y")
         if not isinstance(y, dict) or set(y) != set(cfg["targets"]) or not all(y[t] is None or _num(y[t]) for t in y):
             raise ProbeError(f"{name} {key}: y must give every registered target (a number or null)")
+        production_row(ctx, i, name)
         ex = excluded_at(ctx, i)
         if ex and any(y[t] is not None for t in y):
             raise ProbeError(f"{name} {key}: a numeric target at a snapshot the registered availability mask excludes "
@@ -551,20 +591,29 @@ CONDITIONING = ("probes are exploratory over the AVAILABLE, measured populations
 
 
 AVAIL_MASK = "availability_mask.json"        # (registered next to the configuration: config/availability_mask.json)
+ROWS_DOC = "probe_rows.json"                 # (the registered planned probe-row inventory: config/probe_rows.json)
+ROWS_SCHEMA = "finfolk.redqueen.proberows/1"
+REGISTRY_DOC = "worlds.json"                 # (the bound histories registry: config/worlds.json, the manifest's bytes)
 FOUNDER_PANEL = 32                           # (the 32 C worlds of the registered 64-world layout, Annex H D7 rule 34)
+PRODUCTION_KEYS = {"annex_sha256", "mask_sha256", "receipt", "rows_sha256"}
 
 
 def availability_binding(root, av, man, msha):
-    """THE AVAILABILITY BINDING a probe configuration registers (Annex H D6 rule 27, D7; Codex #78 r1 P2-6), validated
-    -> {"kind", ..., "excluded": {"<world>:<frame>": {"status", "why"}}}. Exactly one of:
-      production {"annex_sha256", "mask_sha256", "receipt"}: the adopted Annex H's sha256; the availability mask
-        registered at config/availability_mask.json (its bytes' sha256 = mask_sha256; a graph.py mask /2 of THIS
-        manifest's graph and histories registry, its worlds and attempt identities the registered ones:
-        sealing.mask_binding_problems); the receipt sealing.py published under this root
-        (registration/availability/<receipt>, binding THIS split manifest and that mask). Its unavailable
-        snapshots govern ingestion: no feature row and no numeric target value at one of them;
-      legacy {"legacy": "<why>"}: the explicit, recorded path for fixtures and pre-D6 data (no mask, nothing
-        checked against one).
+    """THE AVAILABILITY BINDING a probe configuration registers (Annex H D6 rule 27, D7; Codex #78 r1 P2-6, r2 P2-2 /
+    P2-3 / P3), validated -> {"kind", ..., "excluded": {"<world>:<frame>": {"status", "why"}}, "inventory",
+    "registry_c"}. Exactly one of:
+      production {"annex_sha256", "mask_sha256", "receipt", "rows_sha256"}: the adopted Annex H's sha256; the
+        availability mask registered at config/availability_mask.json (its bytes' sha256 = mask_sha256; a graph.py
+        mask /2 of THIS manifest's graph and histories registry, its worlds and attempt identities the registered
+        ones, sealing.mask_binding_problems, and consistent with its OWN evidence, graph.mask_evidence_problems);
+        the receipt sealing.py published under this root (registration/availability/<receipt>, binding THIS split
+        manifest and that mask: it was checked against the graph's edges); the PLANNED probe-row inventory
+        registered at config/probe_rows.json (its bytes' sha256 = rows_sha256; main-study snapshots only: a fork
+        branch row has no bound outcome authority here and is refused); the histories registry at
+        config/worlds.json (the manifest's bytes: its C worlds and blocks are the founder panel's). The mask's
+        unavailable snapshots govern ingestion (no feature row, no numeric target at one), the inventory its
+        completeness (every planned row of a stage measured, an explicit measurement failure, or excluded);
+      legacy {"legacy": "<why>"}: the explicit, recorded path for fixtures and pre-D6 data (no mask, no inventory).
     An absent or malformed binding is refused (ProbeError)."""
     if not isinstance(av, dict):
         raise ProbeError("configuration: availability: a production binding {annex_sha256, mask_sha256, receipt} or an "
@@ -572,11 +621,10 @@ def availability_binding(root, av, man, msha):
     if set(av) == {"legacy"}:
         if not isinstance(av["legacy"], str) or not av["legacy"].strip():
             raise ProbeError("configuration: availability.legacy: the reason (a non-empty string)")
-        return {"kind": "legacy", "why": av["legacy"], "excluded": {}}
-    if set(av) != {"annex_sha256", "mask_sha256", "receipt"}:
-        raise ProbeError(f"configuration: availability: exactly annex_sha256, mask_sha256 and receipt (or legacy), "
-                         f"not {sorted(av)}")
-    for k in ("annex_sha256", "mask_sha256"):
+        return {"kind": "legacy", "why": av["legacy"], "excluded": {}, "inventory": None, "registry_c": None}
+    if set(av) != PRODUCTION_KEYS:
+        raise ProbeError(f"configuration: availability: exactly {sorted(PRODUCTION_KEYS)} (or legacy), not {sorted(av)}")
+    for k in ("annex_sha256", "mask_sha256", "rows_sha256"):
         if not HEX64.match(str(av[k])):
             raise ProbeError(f"configuration: availability.{k}: 64 lowercase hex")
     if not re.fullmatch(re.escape(av["mask_sha256"]) + r"(\.[0-9a-f]{64})?\.json", str(av["receipt"])):
@@ -598,15 +646,63 @@ def availability_binding(root, av, man, msha):
     probs = sealing.mask_binding_problems(man, mk)
     if probs:
         raise ProbeError("configuration: availability: the mask is not this study's: " + "; ".join(probs[:3]))
+    import graph as graphlib                       # (the shared mask validator)
+    probs = graphlib.mask_evidence_problems(mk)
+    if probs:
+        raise ProbeError("configuration: availability: the mask is not consistent with its evidence: " + "; ".join(probs[:3]))
+    gp = os.path.join(root, "config", REGISTRY_DOC)
+    if not os.path.isfile(gp):
+        raise ProbeError(f"configuration: availability: the histories registry is not registered at {gp}")
+    _, reg, gsha = staging.read_doc(gp)
+    if gsha != man.get("worlds_registry_sha256"):
+        raise ProbeError(f"configuration: availability: config/{REGISTRY_DOC} is not the manifest's histories registry")
+    ip = os.path.join(root, "config", ROWS_DOC)
+    if not os.path.isfile(ip):
+        raise ProbeError(f"configuration: availability: the planned probe-row inventory is not registered at {ip}")
+    _, inv, isha = staging.read_doc(ip)
+    if isha != av["rows_sha256"] or inv.get("schema") != ROWS_SCHEMA or not isinstance(inv.get("rows"), list):
+        raise ProbeError(f"configuration: availability: config/{ROWS_DOC} is not the registered inventory ({ROWS_SCHEMA})")
+    planned = set()
+    for k, r in enumerate(inv["rows"]):
+        try:
+            i = staging.resolve_row(man, r, f"planned row {k + 1}")
+        except staging.StageError as e:
+            raise ProbeError(f"configuration: availability: {e}") from None
+        if i["branch"]:
+            raise ProbeError(f"configuration: availability: planned row {k + 1} is a fork-branch row ({i['world']}): a "
+                             "production probe has no bound outcome authority for branches (refused)")
+        if (i["world"], i["t"]) in planned:
+            raise ProbeError(f"configuration: availability: planned row {i['world']}@{i['t']} occurs twice")
+        planned.add((i["world"], i["t"]))
     return {"kind": "production", "annex_sha256": av["annex_sha256"], "mask_sha256": ksha, "receipt": av["receipt"],
-            "receipt_sha256": rsha, "excluded": {k: {"status": s.get("status"), "why": s.get("why")}
-                                                 for k, s in sorted((mk.get("snapshots") or {}).items())}}
+            "receipt_sha256": rsha, "rows_sha256": isha, "registry_sha256": gsha, "inventory": planned,
+            "registry_c": {w["id"]: w.get("block") for w in reg.get("worlds", []) if w.get("treatment") == "C"},
+            "excluded": {k: {"status": s.get("status"), "why": s.get("why")}
+                         for k, s in sorted((mk.get("snapshots") or {}).items())}}
 
 
 def availability_record(ctx):
-    """The binding as reported in every document (its exclusions counted, not repeated)."""
+    """The binding as reported in every document (its exclusions and planned rows counted, not repeated)."""
     b = ctx["availability"]
-    return dict({k: v for k, v in b.items() if k != "excluded"}, excluded_snapshots=len(b["excluded"]))
+    return dict({k: v for k, v in b.items() if k not in ("excluded", "inventory", "registry_c")},
+                excluded_snapshots=len(b["excluded"]),
+                planned_rows=None if b["inventory"] is None else len(b["inventory"]))
+
+
+def production(ctx):
+    return ctx["availability"]["kind"] == "production"
+
+
+def planned_of(ctx, roles):
+    """The planned rows of the given roles (production; None under legacy)."""
+    inv = ctx["availability"]["inventory"]
+    if inv is None:
+        return None
+    out = set()
+    for w, t in inv:
+        if staging.resolve_row(ctx["manifest"], {"world": w, "t": t}, "planned row")["role"] in roles:
+            out.add((w, t))
+    return out
 
 
 def excluded_at(ctx, i):
@@ -617,14 +713,18 @@ def excluded_at(ctx, i):
 
 
 def unavailable_rows(ctx, lines, truth, roles):
-    """EVERY row of the stage that has no score, with its reason (Codex #78 r1 P2-7: none is lost): a committed line
-    without a prediction, a committed row whose target value is null (unmeasured or absorbed), and every snapshot of
-    the stage's roles the registered availability mask excludes (with its cause; it has no feature row)."""
+    """EVERY row of the stage that has no score, with its reason (Codex #78 r1 P2-7, r2 P2-3: none is lost): a committed
+    line without a prediction (an explicit measurement failure is such a line), a committed row whose target value
+    is null (unmeasured or absorbed), and every snapshot of the stage's roles the registered availability mask
+    excludes (with its cause; it has no feature row). Under production every planned row of the stage is a
+    committed line or a mask exclusion (load_features refuses anything else)."""
     out = []
     for ln in lines:
         w, t, tg = ln["world"], ln["t"], ln["target"]
         if not ln["available"]:
-            out.append({"world": w, "t": t, "target": tg, "reason": ln.get("reason"), "cause": "no prediction"})
+            out.append({"world": w, "t": t, "target": tg, "reason": ln.get("reason"),
+                        "cause": "measurement failure" if str(ln.get("reason")).startswith("measurement failed")
+                        else "no prediction"})
         elif (truth.get((w, t)) or {}).get(tg) is None:
             out.append({"world": w, "t": t, "target": tg, "reason": "its target value is null (unmeasured or absorbed)",
                         "cause": "null target"})
@@ -727,6 +827,8 @@ def predict_candidates(ctx, feat_path, fit_path, model_out, out):
                      "target_ids_sha256": rqlib.canonical_sha(sorted([list(k) for k in yt]))},
              "adjustment": adj, "probes": {t: {cid: p.state() for cid, p in s.items()} for t, s in states.items()},
              "unavailable": avail, "availability": availability_record(ctx), "conditioning": CONDITIONING,
+             "failed_rows": [{"world": w, "t": t, "reason": why} for (w, t), why in sorted((ctx.get("failures") or {}).items())
+                             if staging.resolve_row(ctx["manifest"], {"world": w, "t": t}, "failure")["role"] == "training"],
              "environment": staging.environment(),
              "implementation": json.loads(staging.implementation_manifest(sys.modules[__name__]))}
     data = rqlib.canonical(model)
@@ -746,16 +848,35 @@ def predict_candidates(ctx, feat_path, fit_path, model_out, out):
                 ln.update(available=True, nuisance=nuis,
                           candidates={cid: nuis + float(p.predict(Xv[k:k + 1])[0]) for cid, p in states[t].items()})
             lines.append(ln)
+    lines += failure_lines(ctx, "validation", "validation", prov)
     if not lines:
         raise ProbeError("no validation rows: nothing to commit")
     rqlib.write_durable(out, staging.jsonl_bytes(lines))
     return lines
 
 
+def failure_lines(ctx, role, stage, prov):
+    """The committed lines of the row role's explicit MEASUREMENT FAILURES (load_features' receipts; Codex #78 r2 P2-3):
+    one unavailable line per registered target, with its reason, so the report keeps every failed row."""
+    out = []
+    for (w, t), why in sorted((ctx.get("failures") or {}).items()):
+        i = staging.resolve_row(ctx["manifest"], {"world": w, "t": t}, "failure")
+        if i["role"] != role:
+            continue
+        for tg in ctx["cfg"]["targets"]:
+            out.append({"schema": PRED, "target_id": f"probe:{tg}:{w}:{t}", "world": w, "t": t, "target": tg,
+                        "stage": stage, "role": role, "world_role": i["world_role"], "provenance": prov,
+                        "available": False, "reason": f"measurement failed: {why}"})
+    return out
+
+
 def collect(ctx, lines, truth, role):
-    """The committed lines joined with exactly their stage's targets (extras and missing rows refused)."""
+    """The committed lines joined with exactly their stage's targets (extras and missing rows refused; an explicit
+    all-null target row of a planned snapshot the mask excludes is accepted: it has no line, Codex #78 r2 P2-3)."""
     want = {line_identity(ctx, ln, role) for ln in lines}
-    extra = sorted(set(truth) - want)
+    ex = ctx["availability"]["excluded"]
+    extra = sorted(k for k in set(truth) - want
+                   if not (f"{k[0]}:{staging.frame_of(k[1])}" in ex and all(v is None for v in truth[k].values())))
     if extra:
         raise ProbeError(f"{len(extra)} target rows are not rows of the committed predictions: {extra[:5]}")
     missing = sorted(want - set(truth))
@@ -833,6 +954,7 @@ def predict_test(ctx, feat_path, model, model_sha, sel, sel_sha, out):
                 nuis = float(D[k] @ np.asarray(adj["By"][t]))
                 ln.update(available=True, selected=s["selected"], nuisance=nuis, yhat=nuis + float(p.predict(X[k:k + 1])[0]))
             lines.append(ln)
+    lines += failure_lines(ctx, "test", "test", prov)
     if not lines:
         raise ProbeError("no test rows: nothing to commit")
     rqlib.write_durable(out, staging.jsonl_bytes(lines))

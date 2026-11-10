@@ -488,26 +488,53 @@ def history_evidence(ctx, wid):
     k = max(idx)
     d, _ = idx[k]
     bi, maxr = worlds.burn_in_of(hreg), int(hreg.get("max_restarts") or 0)
-    o = None
+    o, at = None, {}
     if d:
         seq = worlds.attempt_sequence(study, wid, d, w, k, ctx["led_h"], sched["log_every"])
         o = worlds.attempt_outcome(seq, w, worlds.total_steps(w, sched), bi)
+        at = dict(seq["samples"])                     # (frame -> its validated values: the origins' counters)
     decided, why, disp = worlds.disposition(o, k, maxr, bi)
     ft = o["first_terminal"]["frame"] if o and o["first_terminal"] else None
     ctx["hist"][wid] = rec = {"attempt": k, "outcome": o, "decided": decided, "why": why, "disposition": disp,
-                              "first_terminal": ft}
+                              "first_terminal": ft, "samples_at": at}
     return rec
+
+
+def refill_baseline(ctx, b):
+    """(baseline, why unbound): a branch's refill baseline is its FROZEN ORIGIN's counter (Codex #78 r2 P2-4, D6 rule
+    24): its root's evidenced predator_reseeds_cum at the origin frame. None, None: the root logs no counter (nothing
+    to bind); None, why: the root's evidence has no readable sample at the origin (the baseline is unbound)."""
+    h = history_evidence(ctx, b["root"])
+    o = b["origin"]["frame"]
+    smp = h["samples_at"].get(o)
+    if smp is None:
+        return None, f"its refill baseline is unbound: its root {b['root']}'s evidence has no sample at the origin {o}"
+    col = worlds.evidence.REFILL_COL
+    if col not in smp:
+        return None, None
+    if smp[col] is None:
+        return None, f"its refill baseline is unbound: its root's {col} at the origin {o} is unreadable"
+    return smp[col], None
 
 
 def branch_evidence(ctx, b):
     """A branch's evidence-bound outcome (worlds.attempt_outcome over its own segments from its origin, its own
-    ledger; a branch never restarts; its refill baseline, the origin's counter, is unchecked)."""
+    ledger; a branch never restarts). Its refill baseline is BOUND to the frozen origin's counter (refill_baseline):
+    an increment above it ends the usable evidence at the sample before it (a protocol-integrity event, technical:
+    nothing after it establishes natural coexistence); an unbound baseline makes the branch's evidence unusable
+    (technical) instead of unchecked."""
     if b["id"] not in ctx["branch"]:
         fr = ctx["fr"]
         d = worlds.wdir(fr, b["id"])
-        seq = worlds.attempt_sequence(fr, b["id"], d if os.path.isdir(d) else None, b, 0, ctx["led_f"],
-                                      ctx["reg"]["schedule"]["log_every"])
-        ctx["branch"][b["id"]] = worlds.attempt_outcome(seq, b, int(b["total_steps"]), 0)
+        rb, unbound = refill_baseline(ctx, b)
+        seq = worlds.attempt_sequence(fr, b["id"], d if os.path.isdir(d) and not unbound else None, b, 0,
+                                      ctx["led_f"], ctx["reg"]["schedule"]["log_every"], refill_base=rb)
+        o = worlds.attempt_outcome(seq, b, int(b["total_steps"]), 0)
+        o["refill_baseline"] = rb
+        if unbound and os.path.isdir(d):
+            o.update(observation="technical", censor={"kind": "technical", "frame": o["frontier"]})
+            o["integrity"].append(unbound + " (its evidence is unusable until the origin's counter is evidenced)")
+        ctx["branch"][b["id"]] = o
     return ctx["branch"][b["id"]]
 
 
