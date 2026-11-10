@@ -395,6 +395,15 @@ b = json.load(open("block.json"))
 assert b["times"] == {"F1": 1, "f4000": 4000, "f8000": 8000, "f12000": 12000, "f16000": 16000, "f20000": 20000, "f24000": 24000}
 w = next(iter(b["worlds"].values()))
 assert w["pattern"].endswith("end.{frame}.json") and w["paths"]["F1"].endswith("F1.json")
+# (Codex #77 r1 P1-1) the real engine's archive: every object on the line of descent, re-hashed; the evidence
+# through the final frame; the attempt's identity and an explicit burn-in disposition
+for w in b["worlds"].values():
+    assert w["archived"] == sorted(b["times"].values()), w["archived"]
+    assert {e["status"] for e in w["archive"].values()} == {"verified"}, w["archive"]
+    assert (w["evidence"]["frontier"], w["evidence"]["stop"], w["attempt"], w["attempt_uuid"]) == \
+        (24000, None, 0, w["uuid"]), w["evidence"]
+    assert w["burn_in"]["disposition"] in ("no_rule", "established", "unresolved"), w["burn_in"]
+assert b["evidence"]["schema"] == "finfolk.redqueen.blockevidence/1"
 PY
 
 # 9. (round 3) two fresh study roots claim one archive root at once: one wins, the other is refused
