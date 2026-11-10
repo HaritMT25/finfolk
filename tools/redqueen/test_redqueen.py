@@ -1489,6 +1489,57 @@ class TestPlanV2(unittest.TestCase):
         with self.assertRaises(SystemExit):
             run.load_plan(p)
 
+    def test_exclusions_and_reconciliation(self):
+        """PR-C (Annex H D6 rule 27): the final plan against the registered pending plan with an availability
+        mask: the cells of an unavailable snapshot (B at T2: its world's first zero came before it, and its file
+        is gone) are left out with a receipt; every executable cell is the pending one with its hashes filled
+        (seeds, groups, long-subset membership unchanged); nothing else is omitted; without the mask the missing
+        file is an error, never a silent deletion."""
+        for name, frame in (("A.F1", 1), ("A.2000", 2000), ("B.F1", 1), ("B.2000", 2000), ("T0", 7)):
+            wr(os.path.join(self.tmp, name + ".json"), ckpt.dumps(mk_cp(n_prey=8, frame=frame)))
+        wr(os.path.join(self.tmp, "ages.json"), rqlib.canonical(common.reference_ages([mk_cp(n_prey=8, seed=9)], 4)))
+        d = os.path.join(self.tmp, "d.json")
+        wr(d, json.dumps(design2(self.tmp, self.edges)))
+        pend = os.path.join(self.tmp, "pend.jsonl")
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(plan.main([d, "--pending", "--out", pend]), 0)
+        prow = {json.loads(ln)["id"]: json.loads(ln) for ln in rqlib.read_text(pend).splitlines() if ln}
+        os.remove(os.path.join(self.tmp, "B.2000.json"))
+        mask = {"schema": plan.MASK_SCHEMA, "graph": {"edges_sha256": "g" * 64}, "block": {"sha256": "b" * 64},
+                "snapshots": {"B:2000": {"world": "B", "time": 2, "frame": 2000, "status": "biological",
+                                         "why": "at or after the world's first guild zero (frame 1500)"}}}
+        mp, out, rec = (os.path.join(self.tmp, f) for f in ("mask.json", "exec.jsonl", "recon.json"))
+        wr(mp, json.dumps(mask))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(plan.main([d, "--against", pend, "--exclusions", mp, "--reconciliation", rec, "--out", out]),
+                             0, err.getvalue())
+        R = rqlib.read_json(rec)
+        rows = {json.loads(ln)["id"]: json.loads(ln) for ln in rqlib.read_text(out).splitlines() if ln}
+        hit = {i for i, r in prow.items() if any(isinstance(r.get(k), dict) and r[k].get("world") == "B"
+                                                 and r[k].get("frame") == 2000 for k in ("prey", "predators"))}
+        self.assertEqual(len(hit), 6)                                   # (3 pairs x R = 2)
+        self.assertEqual((R["scheduled"], R["executable"], R["excluded"]),
+                         (len(prow), len(prow) - 6, {"biological": 6, "technical": 0, "pending": 0}))
+        self.assertEqual(set(rows), set(prow) - hit)
+        self.assertEqual({x["id"] for x in R["rows"]}, hit)
+        self.assertTrue(all((x["status"], x["world"], x["frame"]) == ("biological", "B", 2000) for x in R["rows"]))
+        for i, r in rows.items():                                       # (the registered cell, hashes filled)
+            self.assertEqual(plan._masked(r), prow[i])
+            self.assertNotEqual(r["prey"]["sha256"], rqlib.SHA_PENDING)
+        self.assertEqual((R["plan_sha256"], R["mask"]["sha256"], R["pending_plan"]["sha256"]),
+                         (rqlib.sha256_file(out), rqlib.sha256_file(mp), rqlib.sha256_file(pend)))
+        self.assertEqual(R["by_role"]["test"]["biological"], 2)        # (B.T2 x B.T2, the test pair)
+        with contextlib.redirect_stderr(io.StringIO()):                 # (no mask: the missing file is an error)
+            self.assertEqual(plan.main([d, "--against", pend, "--out", out + ".x"]), 2)
+            wr(mp, json.dumps(dict(mask, snapshots={"Z:2000": mask["snapshots"]["B:2000"]})))
+            self.assertEqual(plan.main([d, "--against", pend, "--exclusions", mp, "--reconciliation", rec,
+                                        "--out", out + ".y"]), 2)       # (a mask of another registry)
+            with self.assertRaises(SystemExit):
+                plan.main([d, "--exclusions", mp, "--reconciliation", rec, "--out", out + ".z"])
+        with self.assertRaisesRegex(plan.DesignError, "never to the pending"):
+            plan.expand_v2(design2(self.tmp, self.edges), pending=True, exclusions={})
+
     def test_long_fraction_half_unit(self):
         """(Review of d4dc4b7, P3) the default 1/8: floor(N / 8 + 0.5) long units, a half unit rounding up."""
         for n, want in ((3, 0), (4, 1), (11, 1), (12, 2), (20, 3)):

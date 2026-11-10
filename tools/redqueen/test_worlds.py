@@ -1498,6 +1498,18 @@ class TestBurnIn(unittest.TestCase):
         s, msgs = supervisor(root, reg2, ar)
         self.assertEqual(s.burn_in, 0)
 
+    def test_design_block_binds_the_burn_in_disposition(self):
+        """PR-C (Annex H D6 rule 27): the worlds block carries each guild's evidenced first zero and whether the
+        burn-in rule can still replace the attempt (graph.py mask holds an unsettled attempt's snapshots)."""
+        root, reg, ar, wid = self.world(zero_at=2500, burn_in=2000)
+        b = worlds.design_block(root, reg, ar)["worlds"][wid]
+        self.assertEqual((b["burn_in"]["decided"], b["first_zeros"], b["valid_before"]), (False, {}, None))
+        s, msgs = supervisor(root, reg, ar)
+        s.startup()
+        b = worlds.design_block(root, reg, ar)["worlds"][wid]
+        self.assertEqual((b["burn_in"]["decided"], b["first_zeros"], b["valid_before"], b["status"]),
+                         (True, {"prey": 2500}, 2500, "extinct"), msgs)
+
 
 if __name__ == "__main__":
     unittest.main()

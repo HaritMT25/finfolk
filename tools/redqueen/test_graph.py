@@ -56,14 +56,17 @@ class TestGraph(unittest.TestCase):
 
     def test_quotas_unique_deterministic(self):
         self.assertEqual(graph.check_quotas(self.g), [])
-        self.assertEqual(len(self.g["edges"]), 237_884)
-        self.assertEqual(sum(graph.QUOTAS.values()), 237_884)
+        self.assertEqual(len(self.g["edges"]), 266_024)              # (Annex H D7 rule 40's base graph total)
+        self.assertEqual(sum(graph.QUOTAS.values()), graph.BASE_TOTAL)
+        self.assertEqual(graph.BASE_TOTAL, 266_024)
+        self.assertEqual({f: graph.QUOTAS[f] for f in ("ref_ab", "ab_to_c", "support_ab")},
+                         {"ref_ab": 25_728, "ab_to_c": 25_728, "support_ab": 4_824})   # (D7 rule 40's table)
         again = graph.build(NS, snapshot_topup=0, ab_topup=0, lag_probe=0)
         self.assertEqual(again["edges"], self.g["edges"])
         default = graph.build()          # the default namespace and the approved top-ups (v4 amendment)
         self.assertEqual(Counter(e[2] for e in default["edges"] if e[2] in graph.TOPUPS),
-                         Counter(support_snap=1301, ab_train_c=3877))
-        self.assertEqual(len(default["edges"]), 243_062 + 1_872)     # (+ the lag7_probe amendment)
+                         Counter(support_snap=1301, ab_train_c=8116))   # (recomputed on the 64-world graph)
+        self.assertEqual(len(default["edges"]), 266_024 + 1_301 + 8_116 + 1_872)   # (+ the lag7_probe amendment)
         self.assertEqual(graph.check_quotas(default), [])
         self.check_lag_probe(default)
 
@@ -89,10 +92,22 @@ class TestGraph(unittest.TestCase):
         self.assertNotEqual(full("rq-test-other")["edges"], self.g["edges"])
         no = full(NS, False)
         self.assertEqual(graph.check_quotas(no), [])
-        self.assertEqual(len(no["edges"]), 237_884 - 14_480)
+        self.assertEqual(len(no["edges"]), 266_024 - 14_480)
+
+    def test_registered_layout_only(self):
+        """Annex H D7 rule 34: 8 blocks of 4C + 2A + 2B (64 worlds); any other layout (the withdrawn 48 / 56
+        allocations, a block with three A) is refused."""
+        ws = graph.synthetic_worlds()
+        self.assertEqual((len(ws), graph.layout_problems(ws)), (64, []))
+        self.assertEqual(Counter(w["treatment"] for w in ws), Counter(C=32, A=16, B=16))
+        old48 = [w for w in ws if not (w["treatment"] in "AB" and int(w["id"][1:]) % 2 == 0)]
+        bad = [dict(w, treatment="A") if w["id"] == "B01" else w for w in ws]
+        for lst in (old48, bad, ws[:-8], ws + [dict(ws[0])]):
+            with self.assertRaisesRegex(graph.GraphError, "registered 64-world layout"):
+                graph.build(NS, lst, snapshot_topup=0, ab_topup=0, lag_probe=0)
 
     def test_splits_and_holdouts(self):
-        for t, want in (("C", (20, 6, 6)), ("A", (5, 1, 2)), ("B", (5, 1, 2))):
+        for t, want in (("C", (20, 6, 6)), ("A", (10, 2, 4)), ("B", (10, 2, 4))):   # (D7 rule 40)
             c = Counter(self.split[w] for w in self.treat if self.treat[w] == t)
             self.assertEqual((c["train"], c["val"], c["test"]), want, t)
         self.assertEqual(len(self.hold), 400)
@@ -193,7 +208,7 @@ class TestGraph(unittest.TestCase):
             path = os.path.join(tmp, "graph.jsonl.gz")
             g2 = graph.load(path)
             self.assertEqual(g2["edges"], [tuple(e) for e in self.g["edges"]])
-            self.assertEqual(meta["edges"], 237_884)
+            self.assertEqual(meta["edges"], 266_024)
             rep = graph.report(g2)
             self.assertEqual(rep["quota_problems"], [])
             for rule, a in rep["access"].items():
@@ -207,7 +222,7 @@ class TestGraph(unittest.TestCase):
                 graph.load(path)
             reg = os.path.join(tmp, "worlds.json")         # a registry's ids, treatments and blocks
             ws = [{"id": f"w{i + 1:02d}", "treatment": t, "block": b} for i, (b, t) in enumerate(
-                (b, t) for b in range(1, 9) for t in ("C", "A", "C", "B", "C", "C"))]
+                (b, t) for b in range(1, 9) for t in ("C", "A", "C", "B", "C", "B", "A", "C"))]
             with open(reg, "w") as f:
                 json.dump({"worlds": ws}, f)
             gr = graph.build(NS, graph.registry_worlds(reg))
@@ -219,7 +234,7 @@ class TestGraph(unittest.TestCase):
 
     def test_registered_invocations_and_permuted_registry(self):
         """#64 review 5: the registered two-flag command `--snapshot-topup 0 --ab-topup 0` gives the pure v4
-        graph (237,884 pairs: the lag probe is part of the top-up switch); P3: a permuted registry gives
+        graph (266,024 pairs: the lag probe is part of the top-up switch); P3: a permuted registry gives
         byte-identical artifacts."""
         tmp = tempfile.mkdtemp()
         try:
@@ -229,7 +244,7 @@ class TestGraph(unittest.TestCase):
                 self.assertEqual(graph.main(["build", "--out", d1, "--namespace", NS, "--snapshot-topup", "0",
                                              "--ab-topup", "0"]), 0)
             meta = json.loads(rqlib.read_text(os.path.join(d1, "graph.meta.json")))
-            self.assertEqual((meta["edges"], meta["lag_probe"]), (237_884, 0))
+            self.assertEqual((meta["edges"], meta["lag_probe"]), (266_024, 0))
             self.assertEqual(graph.build(NS, snapshot_topup=6, ab_topup=0)["lag_probe"], graph.LAG_PROBE)
             self.assertEqual(graph.build(NS, snapshot_topup=0, ab_topup=0, lag_probe=7)["lag_probe"], 7)
             ws = graph.synthetic_worlds()
@@ -282,8 +297,86 @@ class TestGraph(unittest.TestCase):
                     copp[q] += graph.parse(p)[1] is not None
             self.assertEqual(len(opp), 800)
             self.assertGreaterEqual(min(opp.values()), 6)
-            self.assertEqual(len(fitp), 10 * 201)
+            self.assertEqual(len(fitp), 20 * 201)                      # (10 training A + 10 training B worlds)
             self.assertGreaterEqual(min((fitp if ab_mode == "fitting" else copp).values()), 8)
+
+    def test_mask_and_executable(self):
+        """Annex H D6 rule 27 (PR-C): the immutable scheduled graph and a separate evidence-bound mask from a
+        worlds block: biological (at or after the first guild zero), technical (not archived in an ended
+        world), pending (an unsettled burn-in, not archived yet); every edge's exclusion is its endpoints' first
+        cause (references never masked); the executable graph keeps every role; mismatched inputs refused."""
+        tmp = tempfile.mkdtemp()
+        try:
+            gdir = os.path.join(tmp, "g")
+            graph.write(self.g, gdir)
+            gp = os.path.join(gdir, "graph.jsonl.gz")
+            g = graph.load(gp)
+            block = masked_block(g)
+            m = graph.mask(g, block, "b" * 64)
+            S, M = m["snapshots"], 1_000_000
+            self.assertEqual(S[f"C01:{101 * M}"]["status"], "biological")
+            self.assertNotIn(f"C01:{100 * M}", S)                           # (before the boundary: available)
+            self.assertEqual(S[f"C02:{50 * M}"]["status"], "technical")
+            self.assertEqual(S["C03:1"]["status"], "pending")               # (the burn-in may still replace it)
+            self.assertEqual(sum(1 for k in S if k.startswith("C03:")), 201)
+            self.assertEqual((S[f"A01:{121 * M}"]["status"], f"A01:{120 * M}" in S), ("pending", False))
+            self.assertEqual(m["worlds"]["C01"]["unavailable_snapshots"], {"biological": 100})
+            self.assertEqual(m["worlds"]["C01"]["first_unavailable_time"], 101)
+            e = m["edges"]
+            self.assertEqual((e["scheduled"], e["executable"] + sum(e[k] for k in graph.EXCLUSION)), (266_024, 266_024))
+            self.assertTrue(all(e[k] > 0 for k in graph.EXCLUSION))
+            self.assertEqual(sum(c["scheduled"] for rs in m["by_family_role"].values() for c in rs.values()), 266_024)
+            # every edge's exclusion recomputed independently: the first cause of its world endpoints
+            unav = {(v["world"], v["time"]): v["status"] for v in S.values()}
+            ex = {i: k for k, v in m["excluded_edges"].items() for i in v}
+            for i, (q, p, *_) in enumerate(g["edges"]):
+                sts = [unav[(w, t)] for _, w, t in map(graph.parse, (q, p)) if w is not None and (w, t) in unav]
+                self.assertEqual(ex.get(i), min(sts, key=graph.EXCLUSION.index) if sts else None, (q, p))
+            self.assertEqual(graph.mask(g, block, "b" * 64), m)               # (deterministic: no clock)
+            x = graph.executable(g, m, "m" * 64)
+            self.assertEqual(x["edges"], [ed for i, ed in enumerate(g["edges"]) if i not in ex])   # (roles kept)
+            xd = os.path.join(tmp, "x")
+            graph.write(x, xd)
+            gx = graph.load(os.path.join(xd, "graph.jsonl.gz"))
+            self.assertEqual((len(gx["edges"]), gx["executable_of"]["edges_sha256"], gx["executable_of"]["mask"]["sha256"]),
+                             (e["executable"], g["edges_sha256"], "m" * 64))
+            rep = graph.report(gx)
+            self.assertEqual((rep["quota_problems"], rep["executable_of"]["edges"]), ([], 266_024))
+            # refused: a block of another registry, a missing world, a mask of another graph
+            for bad, msg in ((dict(block, worlds=dict(block["worlds"], C01=dict(block["worlds"]["C01"], treatment="A"))),
+                              "not this graph's registry"),
+                             (dict(block, worlds={k: v for k, v in block["worlds"].items() if k != "B16"}), "B16: not in")):
+                with self.assertRaisesRegex(graph.GraphError, msg):
+                    graph.mask(g, bad)
+            with self.assertRaisesRegex(graph.GraphError, "another graph"):
+                graph.executable(g, dict(m, graph=dict(m["graph"], edges_sha256="0" * 64)))
+            # the CLI: the same mask bytes, bound to the block file's bytes; the executable graph from it
+            bp, mp = os.path.join(tmp, "block.json"), os.path.join(tmp, "mask.json")
+            rqlib.write_durable(bp, rqlib.canonical(block))
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(graph.main(["mask", "--graph", gp, "--block", bp, "--out", mp]), 0)
+                self.assertEqual(graph.main(["executable", "--graph", gp, "--mask", mp, "--out", os.path.join(tmp, "x2")]), 0)
+            self.assertEqual(rqlib.read_bytes(mp), rqlib.canonical(graph.mask(g, block, rqlib.sha256_file(bp))))
+            self.assertEqual(len(graph.load(os.path.join(tmp, "x2", "graph.jsonl.gz"))["edges"]), e["executable"])
+        finally:
+            shutil.rmtree(tmp)
+
+
+def masked_block(g):
+    """A worlds block for the synthetic graph: every world done and archived at every time, but C01 extinct (its
+    first zero sampled just after 100M), C02 without its 50M archive, C03 with an unsettled burn-in, A01 running
+    (archived to 120M)."""
+    M = 1_000_000
+    allf = [1] + [t * M for t in range(1, 201)]
+    ws = {w["id"]: {"treatment": w["treatment"], "block": w["block"], "status": "done", "attempt": 0,
+                    "valid_before": None, "burn_in": {"decided": True, "why": "ended done"}, "archived": allf}
+          for w in g["worlds"]}
+    ws["C01"].update(status="extinct", valid_before=100 * M + 5000)
+    ws["C02"]["archived"] = [f for f in allf if f != 50 * M]
+    ws["C03"].update(status="running", burn_in={"decided": False, "why": "not past the burn-in frame yet"},
+                     archived=[1, M, 2 * M])
+    ws["A01"].update(status="running", archived=[f for f in allf if f <= 120 * M])
+    return {"schema": "finfolk.redqueen.worldsblock/1", "registry_sha256": "r" * 64, "worlds": ws}
 
 
 @unittest.skipIf(np is None, "numpy is not installed (set RQ_PYLIB, or RQ_REQUIRE_NUMPY=1 to require it)")
@@ -479,7 +572,24 @@ class TestRecovery(unittest.TestCase):
         self.assertIn("prey:world-test", rep)
         self.assertIn("predators:snapshot-val", rep)
         self.assertEqual(rep["prey:world-test"]["singular"], 0)
-        self.assertEqual(rep["prey:train"]["n"], 3620 + 2010)     # eligible C training states + A/B training prey
+        self.assertEqual(rep["prey:train"]["n"], 3620 + 4020)     # eligible C training states + A/B training prey
+
+    def test_executable_graph(self):
+        """PR-C (Annex H D6 rule 27): recovery.py consumes an executable (masked) graph as it consumes a graph:
+        its datasets are the executable pairs only, the scheduled roles intact."""
+        tmp = tempfile.mkdtemp()
+        try:
+            gdir, xdir = os.path.join(tmp, "g"), os.path.join(tmp, "x")
+            graph.write(full(), gdir)
+            g = graph.load(os.path.join(gdir, "graph.jsonl.gz"))
+            m = graph.mask(g, masked_block(g))
+            graph.write(graph.executable(g, m), xdir)
+            D = self.rec.Data(graph.load(os.path.join(xdir, "graph.jsonl.gz")))
+            self.assertEqual(len(D.qi), m["edges"]["executable"])
+            self.assertLess(len(D.qi), len(self.D.qi))
+            self.assertIn("prey:train", self.rec.conditioning(D, 1, "a"))
+        finally:
+            shutil.rmtree(tmp)
 
     def test_ab_cap(self):
         data = self.rec.simulate(self.D, self.rec.SCENARIOS["r2_034"], 15)

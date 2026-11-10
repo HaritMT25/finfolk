@@ -2820,11 +2820,15 @@ def design_block(root, reg, archive_root):
         ad = adir(archive_root, w["id"])
         zeros = first_zeros(led, w["id"], root)
         st = read_state(root, w["id"])
+        decided, why = burn_in_decided(root, reg, w["id"])
         ws[w["id"]] = {"uuid": w["uuid"], "treatment": w["treatment"], "block": w["block"], "status": st["status"],
                        "attempt": attempt_of(root, w["id"]),
                        "pattern": os.path.join(ad, "end.{frame}.json"), "paths": {"F1": os.path.join(ad, "F1.json")},
                        # snapshots at or after a guild's first zero are not valid challengers (design §2.3)
                        "valid_before": min(zeros.values()) if zeros else None,
+                       # (Annex H D6: each guild's evidenced first zero, and whether the burn-in rule can still
+                       #  replace the attempt: performance inputs bind only a settled attempt; graph.py mask)
+                       "first_zeros": dict(sorted(zeros.items())), "burn_in": {"decided": decided, "why": why},
                        "archived": sorted(r["frame"] for r in archive_records(root, w["id"]).values())}
     return {"schema": "finfolk.redqueen.worldsblock/1", "registry_sha256": rqlib.sha256_file(
         os.path.join(root, "config", "worlds.json")), "times": times, "worlds": ws}

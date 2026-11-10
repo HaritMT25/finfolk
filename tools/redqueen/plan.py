@@ -3,7 +3,7 @@
 
     plan.py DESIGN.json --pending --out PLAN.pending.jsonl [--long-manifest LONG.json]
     plan.py DESIGN.json [--against PLAN.pending.jsonl] [--avoid OLD_PLAN.jsonl ...] --out PLAN.jsonl
-            [--long-manifest LONG.json]
+            [--long-manifest LONG.json] [--exclusions MASK.json --reconciliation RECEIPT.json]
 
 A design of schema finfolk.redqueen.design/1 (blocks; below) gives plan/1 rows, as phase A;
 one of schema finfolk.redqueen.design/2 (design v3: an explicit edge list; "Design /2" at the
@@ -20,6 +20,15 @@ end) gives plan/2 rows.
     predator floor (a live arena keeps its prey world's config: a floor would refill predators).
 --avoid: refuse (exit 2) if an engine seed (transplant, reseed) of this plan also occurs in an
     archived plan (this tooling's or tools/invasion's).
+--exclusions (design /2, with --against; Annex H D6 rule 27): graph.py mask's availability mask (its
+    "snapshots": world x frame -> biological / technical / pending, evidence-bound). EVERY registered
+    cell is still generated and checked against the pending plan (seeds, groups and long-subset
+    membership from the registered intent: the surviving long pool is never re-randomized); the cells
+    with an unavailable prey or predator snapshot are never read and are left out of the written
+    (executable) plan, and --reconciliation writes the receipt: the pending plan's and the mask's
+    sha256, the scheduled, executable and excluded counts (by role, primary family, horizon) and every
+    excluded cell with its cause. Without a mask, a missing file stays an error: no cell is ever
+    deleted silently. A mask naming a world the design lacks is refused (another registry).
 Expansion is deterministic: the same design gives the same bytes (rows sorted by id).
 
 DESIGN.json:
@@ -569,8 +578,58 @@ def select_long(units, fraction, strata, ns):
     return chosen, man
 
 
-def expand_v2(design, pending=False):
-    """design /2 -> (rows, warnings, long-subset manifest). See the module doc ("Design /2")."""
+MASK_SCHEMA = "finfolk.redqueen.graphmask/1"
+RECON_SCHEMA = "finfolk.redqueen.reconciliation/1"
+EXCLUSION = ("biological", "technical", "pending")
+
+
+def exclusion_of(row, snaps):
+    """(status, endpoint, world, frame, why) of a row whose prey or predator snapshot a mask's "snapshots"
+    ({"<world>:<frame>": {"status", "why"}}) makes unavailable (its endpoints' first of biological,
+    technical, pending), else None."""
+    best = None
+    for role in ("prey", "predators"):
+        x = row.get(role)
+        if not (isinstance(x, dict) and x.get("world") is not None):
+            continue                          # (a random / scripted source, or the predator-free control)
+        s = snaps.get(f"{x['world']}:{x['frame']}")
+        if s and (best is None or EXCLUSION.index(s["status"]) < EXCLUSION.index(best[0])):
+            best = (s["status"], role, x["world"], x["frame"], s.get("why"))
+    return best
+
+
+def reconciliation(rows, excluded, pending_path, pending_sha, mask_path, mask_raw, m, plan_sha):
+    """The reconciliation receipt (Annex H D6 rule 27): the scheduled cells (the registered pending plan's,
+    every one), the executable ones (written: exactly those rows, hashes filled) and every excluded cell
+    with its evidence-backed cause; counts by role, primary family and horizon."""
+    def tally(key):
+        out = {}
+        for r in rows:
+            c = out.setdefault(str(r.get(key)), {"scheduled": 0, "executable": 0, **{k: 0 for k in EXCLUSION}})
+            c["scheduled"] += 1
+            c[excluded[r["id"]][0] if r["id"] in excluded else "executable"] += 1
+        return out
+    n_ex = {k: sum(1 for v in excluded.values() if v[0] == k) for k in EXCLUSION}
+    return {"schema": RECON_SCHEMA,
+            "pending_plan": {"path": os.path.abspath(pending_path), "sha256": pending_sha},
+            "mask": {"path": os.path.abspath(mask_path), "sha256": rqlib.sha256_bytes(mask_raw),
+                     "graph": m.get("graph"), "block": m.get("block")},
+            "scheduled": len(rows), "executable": len(rows) - len(excluded), "excluded": n_ex,
+            "by_role": tally("role"), "by_primary_family": tally("primary_family"), "by_horizon": tally("horizon"),
+            "rows": [{"id": r["id"], "unit": r["unit"], "role": r["role"], "primary_family": r["primary_family"],
+                      "horizon": r["horizon"], "status": e[0], "endpoint": e[1], "world": e[2], "frame": e[3],
+                      "why": e[4]} for r in rows for e in [excluded.get(r["id"])] if e],
+            "plan_sha256": plan_sha,
+            "rules": "every executable cell is the registered pending cell with its hashes filled (seeds, groups, "
+                     "long-subset membership and every other field unchanged: the surviving long pool is never "
+                     "re-randomized); every other scheduled cell is listed with its cause; nothing else is omitted. "
+                     "A technical exclusion is to be repaired where possible; none is a biological exclusion"}
+
+
+def expand_v2(design, pending=False, exclusions=None, excluded_out=None):
+    """design /2 -> (rows, warnings, long-subset manifest). See the module doc ("Design /2").
+    exclusions (final plans only): a mask's "snapshots"; the rows it makes unavailable are generated as
+    registered (pending hashes) but never read, and recorded in excluded_out {row id: exclusion_of}."""
     ns = design.get("seed_namespace")
     if not isinstance(ns, str) or not ns:
         raise DesignError("seed_namespace is required")
@@ -741,7 +800,19 @@ def expand_v2(design, pending=False):
             x = row.get(role)
             if isinstance(x, dict) and x.get("path"):
                 x["sha256"] = rqlib.SHA_PENDING
-    warnings = [] if pending else fill_hashes(rows)
+    excluded = {} if excluded_out is None else excluded_out
+    if exclusions is not None:
+        if pending:
+            raise DesignError("exclusions apply to a final plan, never to the pending (registered) one")
+        names = {k.rsplit(":", 1)[0] for k in exclusions}
+        unknown = sorted(names - set(design.get("worlds") or {}))
+        if unknown:
+            raise DesignError(f"the mask names worlds this design does not have ({unknown[:5]}): another registry")
+        for row in rows:
+            e = exclusion_of(row, exclusions)
+            if e:
+                excluded[row["id"]] = e
+    warnings = [] if pending else fill_hashes([r for r in rows if r["id"] not in excluded])
     long_man["design"] = design.get("name", "")
     return rows, warnings, long_man
 
@@ -759,14 +830,28 @@ def main(argv=None):
                     help="(design /2) another plan (an audit's, production's) checked jointly: no seed value "
                          "shared by two different groups, no group with two seeds (repeatable: the generated "
                          "rows and every --joint plan form ONE seed universe, checked once)")
+    ap.add_argument("--exclusions", metavar="MASK.json",
+                    help="(design /2, with --against and --reconciliation) graph.py mask's availability mask: the "
+                         "registered cells it makes unavailable are left out of the executable plan, with a receipt")
+    ap.add_argument("--reconciliation", metavar="OUT.json", help="the reconciliation receipt (with --exclusions)")
     a = ap.parse_args(argv)
     if a.pending and a.against:
         ap.error("--pending and --against exclude each other")
-    long_man = None
+    if (a.exclusions is None) != (a.reconciliation is None) or (a.exclusions and not a.against):
+        ap.error("--exclusions needs --against and --reconciliation (and --reconciliation needs --exclusions)")
+    long_man, excluded, mask_raw, m = None, {}, None, None
     try:
         design = json.loads(rqlib.read_text(a.design))
+        if a.exclusions:
+            mask_raw = rqlib.read_bytes(a.exclusions)
+            m = json.loads(mask_raw.decode("utf-8"))
+            if m.get("schema") != MASK_SCHEMA or not isinstance(m.get("snapshots"), dict):
+                raise DesignError(f"{a.exclusions}: not an availability mask ({MASK_SCHEMA})")
+            if design.get("schema") != DESIGN_SCHEMA_V2:
+                raise DesignError("--exclusions needs a design /2")
         if design.get("schema") == DESIGN_SCHEMA_V2:
-            rows, warnings, long_man = expand_v2(design, pending=a.pending)
+            rows, warnings, long_man = expand_v2(design, pending=a.pending,
+                                                 exclusions=m["snapshots"] if m else None, excluded_out=excluded)
         else:
             rows, warnings = expand(design, pending=a.pending)
         if a.joint:           # ONE seed universe: the generated rows and every --joint plan together
@@ -782,14 +867,17 @@ def main(argv=None):
     for w in warnings:
         print(f"warning: {w}", file=sys.stderr)
     if a.against:
-        reg = [json.loads(ln) for ln in rqlib.read_text(a.against).split("\n") if ln.strip()]
-        probs = pending_problems(rows, reg)
+        reg_raw = rqlib.read_bytes(a.against)
+        reg = [json.loads(ln) for ln in reg_raw.decode("utf-8").split("\n") if ln.strip()]
+        probs = pending_problems(rows, reg)        # (EVERY scheduled cell, the excluded ones included)
         if probs:
             print(f"not the registered pending plan {a.against}:", file=sys.stderr)
             for p in probs:
                 print(f"  {p}", file=sys.stderr)
             return 2
-        print(f"the registered pending plan {a.against} with its {len(rows)} cells' hashes filled in", file=sys.stderr)
+        print(f"the registered pending plan {a.against} with its {len(rows) - len(excluded)} executable cells' "
+              f"hashes filled in" + (f" ({len(excluded)} excluded by {a.exclusions})" if a.exclusions else ""),
+              file=sys.stderr)
     if a.avoid:
         old = set()
         for p in a.avoid:
@@ -799,7 +887,11 @@ def main(argv=None):
             print(f"{len(hit)} engine seed(s) also used by {a.avoid}: {hit[:10]}", file=sys.stderr)
             return 2
         print(f"engine seeds checked against {len(a.avoid)} archived plan(s): no overlap", file=sys.stderr)
-    sha = write_plan(rows, a.out)
+    sha = write_plan([r for r in rows if r["id"] not in excluded], a.out)
+    if a.exclusions:
+        rqlib.write_durable(a.reconciliation, rqlib.canonical(reconciliation(
+            rows, excluded, a.against, rqlib.sha256_bytes(reg_raw), a.exclusions, mask_raw, m, sha)))
+        rows = [r for r in rows if r["id"] not in excluded]
     if a.long_manifest and long_man is not None:      # (only for a plan that passed every check)
         rqlib.write_durable(a.long_manifest, rqlib.canonical(dict(long_man, plan_sha256=sha, plan=os.path.abspath(a.out))))
     kinds = {}

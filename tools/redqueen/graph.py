@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""graph.py: the Red Queen map graph of design v4 (§4.1-4.5, §5.1, §7.1) and its pre-seal reports.
+"""graph.py: the Red Queen map graph of design v4 (§4.1-4.5, §5.1, §7.1; Annex H D7 rules 34, 40) and its
+pre-seal reports, availability masks and executable graphs (Annex H D6 rule 27).
 
     graph.py build --out DIR [--namespace NS] [--registry STUDY/config/worlds.json]
                    [--no-train-matchings] [--snapshot-topup 6] [--ab-topup 8 [--ab-topup-mode fitting|c]]
     graph.py report --graph DIR/graph.jsonl.gz [--out report.json]
+    graph.py mask --graph DIR/graph.jsonl.gz --block worlds_block.json --out mask.json
+    graph.py executable --graph DIR/graph.jsonl.gz --mask mask.json --out DIR2
 
 The graph is the set of (prey population, predator population) pairs the assays measure for the
 map, with each pair's family, split role (the roles of plan.py's design /2 edges: training,
@@ -11,41 +14,46 @@ validation, test, support) and horizon class. Populations are snapshots "Q:<worl
 "P:<world>:<t>" (predators; C worlds only), t = 0 (F1) .. 200 (200M steps), and the external
 references "RQ:<k>", "RP:<k>" (eight per guild: registered reference slots; the selected sentinel
 snapshots are a deterministic relabelling, §4.2). Worlds: a registry's (worlds.json: ids,
-treatments, blocks) or the registered layout's synthetic ids (8 blocks of C x4, A, B). Everything is
-derived from --namespace: the same inputs give the same bytes.
+treatments, blocks; its sha256 is recorded) or the registered layout's synthetic ids. THE LAYOUT is
+the registered one only (D7 rule 34): eight blocks of 4C + 2A + 2B (64 worlds: 32 C, 16 A, 16 B);
+any other is refused. Everything is derived from --namespace: the same inputs give the same bytes.
 
-SPLITS (§7.1, §5.1). C worlds 20 training / 6 validation / 6 test; A and B 5/1/2 each. In every
+SPLITS (§7.1, §5.1; D7 rule 40). C worlds 20 training / 6 validation / 6 test; A and B 10/2/4 each
+(the same frozen, outcome-independent permutation per treatment). In every
 training C world 20 joint snapshot times are held out (10 snapshot-validation, 10 snapshot-test;
 two per 20M bin, residues mod 5 balanced, F1 never). 12 fork worlds (2 training, 4 validation, all
 6 test) and among them 8 intensive worlds (2, 2, 4).
 
-FAMILIES (v4 §4.5; quotas checked; no pair twice).
+FAMILIES (v4 §4.5 with D7 rule 40's 64-world quotas; quotas checked; no pair twice).
   within      every C world's coarse matrix (F1, 5M, ..., 200M: 41 x 41), its fine windows (F1-20M,
               90-110M, 180-200M: offsets 0, +-1, +-2, +-4) and the intensive worlds' complete fine
               windows: 72,992
   ref_prey    C prey x the four predator references of its block: 25,728
   ref_pred    C predators x the four prey references of its block: 25,728
-  ref_ab      A/B prey x the block's four predator references: 12,864
+  ref_ab      A/B prey x the block's four predator references: 25,728
   ref_grid    the 8 x 8 reference grid: 64
   cross       eight edge-disjoint C matchings (prey world w -> predator world w + s_m, a distinct
               shift per matching; two at the same time, six at a per-world random time permutation):
               51,456
   ab_to_c     A/B prey x four C predators (distinct worlds; held-out A/B worlds: training C
-              predators outside the snapshot holdouts): 12,864
+              predators outside the snapshot holdouts): 25,728
   support_c   four more training opponents (eligible training states) for every held-out-world C
               population, both guilds: 19,296
-  support_ab  two more training C predators for every held-out A/B prey snapshot: 2,412
+  support_ab  two more training C predators for every held-out A/B prey snapshot: 4,824
   train_match four edge-disjoint matchings of the 3,620 eligible training states (20 training C
               worlds x 201 - 400 snapshot holdouts), across worlds, new pairs only (v4 §4.4): 14,480
-  total 237,884 (223,404 with --no-train-matchings), and the default top-ups (no fixed quota):
+  total 266,024 (251,544 with --no-train-matchings; D7 rule 40's base graph total), and the default
+  top-ups (no fixed quota: their counts are what the generated graph gives):
   support_snap every snapshot-holdout population up to six training opponents in its support,
               new support pairs to eligible training states of other worlds: 1,301
   ab_train_c  every training A/B prey snapshot up to eight fitting pairs (its four references
               included; --ab-topup-mode c: eight training C opponents) with new training pairs to
-              eligible training C predators: 3,877
-  The top-ups are the recovery comparison's choice (rank 4 identifiable for every population, the
-  noisy A/B and snapshot-test errors down; +5,178 pairs, about 0.24 production days at 5k);
-  --snapshot-topup 0 --ab-topup 0 gives the v4 graph alone (237,884 pairs: the lag7 probe below is
+              eligible training C predators: 8,116 (20 training A/B worlds; 3,877 on the former 48)
+  The top-ups are the recovery comparison's choice on the former 48-world graph (rank 4 identifiable
+  for every population, the noisy A/B and snapshot-test errors down; there +5,178 pairs); on the 64-world
+  graph they add 9,417 pairs (about 0.44 production days at 5k), and its exact-graph recovery is to be
+  re-run (D7 rule 40: recompute the top-ups and support reports on the generated graph);
+  --snapshot-topup 0 --ab-topup 0 gives the v4 graph alone (266,024 pairs: the lag7 probe below is
   part of the registered top-up switch). They come after every registered family, which they leave
   unchanged.
   lag7_probe  (v4 amendment, 2026-11-07) every NON-intensive C world's coarse prey snapshots (F1, 5M,
@@ -69,6 +77,20 @@ test before validation before training (references count as training).
 HORIZONS (§4.6): the reference grid "long"; support_c, support_ab, train_match and the top-ups
 "short"; every other family is in the randomized 1/8 long pool (no horizon: plan.py's
 pre-randomized long subset).
+
+AVAILABILITY (mask, executable; Annex H D6 rule 27). The built graph is the IMMUTABLE scheduled
+topology. `mask` reads it (verified against its edges_sha256) and a worlds block (worlds.py design-block:
+per world its first-guild-zero boundary valid_before, archived frames, status, attempt and burn-in
+disposition; its world ids, treatments and blocks must be the graph's) and writes a separate,
+deterministic mask: every unavailable snapshot (world x time; F1 = frame 1, t = t x 1M) with its cause:
+biological (at or after the world's first guild zero), pending (an unsettled burn-in disposition, or
+not archived yet in a running world) or technical (not archived in an ended world: repair it if
+possible); every edge's exclusion (its endpoints' first of biological, technical, pending; references
+are refsel.py's business, never masked here); counts by family x role (scheduled, executable,
+biological, technical, pending) and the attrition by world. `executable` writes the graph minus the
+exclusions, roles, families and horizons unchanged, its meta bound to the source graph and the mask
+(recovery.py, report and plans consume it as they consume a graph). No endpoint is ever replaced by
+another world or time, and a recovery or support failure never authorizes replacement edges.
 
 The report (graph.py report) gives: family quotas, role x family counts, uniqueness, the support
 counts of every held-out population, the fitting degree of every population and the connected
@@ -94,8 +116,13 @@ TIMES = tuple(range(201))
 COARSE = tuple(range(0, 201, 5))
 WINDOWS = ((0, 20), (90, 110), (180, 200))
 OFFSETS = (0, 1, -1, 2, -2, 4, -4)
-QUOTAS = {"within": 72_992, "ref_prey": 25_728, "ref_pred": 25_728, "ref_ab": 12_864, "ref_grid": 64,
-          "cross": 51_456, "ab_to_c": 12_864, "support_c": 19_296, "support_ab": 2_412, "train_match": 14_480}
+# (D7 rule 40: the 64-world quotas; ref_ab, ab_to_c and support_ab doubled with 16 A and 16 B worlds)
+QUOTAS = {"within": 72_992, "ref_prey": 25_728, "ref_pred": 25_728, "ref_ab": 25_728, "ref_grid": 64,
+          "cross": 51_456, "ab_to_c": 25_728, "support_c": 19_296, "support_ab": 4_824, "train_match": 14_480}
+BASE_TOTAL = 266_024                # D7 rule 40's base graph total (with the training matchings)
+LAYOUT = {"C": 4, "A": 2, "B": 2}   # per block, eight blocks (D7 rule 34)
+BLOCKS = 8
+SPLIT_SIZES = {"C": (20, 6, 6), "A": (10, 2, 4), "B": (10, 2, 4)}   # training / validation / test (D7 rule 40)
 # optional top-ups (no registered quota: their counts are what the options generate)
 TOPUPS = ("support_snap", "ab_train_c")
 LAG_PROBE = 7                       # (v4 amendment: the lag7_probe family; 0 = none)
@@ -141,10 +168,12 @@ class Rng:
 
 
 def synthetic_worlds():
+    """The registered layout's synthetic ids: per block b, C worlds C01.., A worlds A01.., B worlds B01.."""
     out = []
-    for b in range(1, 9):
-        out += [{"id": f"C{4 * (b - 1) + i + 1:02d}", "treatment": "C", "block": b} for i in range(4)]
-        out += [{"id": f"A{b}", "treatment": "A", "block": b}, {"id": f"B{b}", "treatment": "B", "block": b}]
+    for b in range(1, BLOCKS + 1):
+        for t in ("C", "A", "B"):
+            n = LAYOUT[t]
+            out += [{"id": f"{t}{n * (b - 1) + i + 1:02d}", "treatment": t, "block": b} for i in range(n)]
     return out
 
 
@@ -153,15 +182,33 @@ def registry_worlds(path):
     return [{"id": w["id"], "treatment": w["treatment"], "block": w["block"]} for w in reg["worlds"]]
 
 
+def layout_problems(worlds):
+    """Why a world list is not the registered 64-world layout (D7 rule 34): 8 blocks of 4C + 2A + 2B."""
+    per = defaultdict(Counter)
+    for w in worlds:
+        per[w["block"]][w["treatment"]] += 1
+    probs = []
+    if sorted(per) != list(range(1, BLOCKS + 1)):
+        probs.append(f"blocks {sorted(per)}, the registered layout has 1..{BLOCKS}")
+    for b, c in sorted(per.items()):
+        if dict(c) != LAYOUT:
+            probs.append(f"block {b}: {dict(sorted(c.items()))}, the registered layout has {LAYOUT}")
+    if len({w["id"] for w in worlds}) != len(worlds):
+        probs.append("a world id twice")
+    return probs
+
+
 def splits(ns, worlds):
     """{world: "train" | "val" | "test"}, the fork and intensive sets, the snapshot holdouts."""
+    probs = layout_problems(worlds)
+    if probs:
+        raise GraphError("not the registered 64-world layout (Annex H D7 rule 34): " + "; ".join(probs[:4]))
     by_t = defaultdict(list)
     for w in worlds:
         by_t[w["treatment"]].append(w["id"])
-    want = {"C": (20, 6, 6), "A": (5, 1, 2), "B": (5, 1, 2)}
     split = {}
     for t, ids in sorted(by_t.items()):
-        n = want[t]
+        n = SPLIT_SIZES[t]
         if len(ids) != sum(n):
             raise GraphError(f"{len(ids)} {t} worlds, the layout needs {sum(n)}")
         ids = Rng(ns, "split", t).perm(sorted(ids))
@@ -535,6 +582,116 @@ def load(path):
     return g
 
 
+# ------------------------------------------------------------------ availability (Annex H D6 rule 27)
+MASK_SCHEMA = "finfolk.redqueen.graphmask/1"
+EXCLUSION = ("biological", "technical", "pending")      # an edge takes its endpoints' first in this order
+ENDED = ("done", "extinct", "failed", "invalidated")
+
+
+def frame_of(t):
+    """A graph time (0 = F1, else t x 1M) -> its archive frame."""
+    return 1 if t == 0 else t * 1_000_000
+
+
+def snapshot_status(bw, t):
+    """(status, why) of a world's snapshot at graph time t from its worlds-block entry: available; biological
+    (at or after its first guild zero: no valid population, design §2.3); pending (the burn-in may still
+    replace the attempt, or not yet archived in a running world); technical (not archived in an ended world)."""
+    f = frame_of(t)
+    vb = bw.get("valid_before")
+    if vb is not None and f >= vb:
+        return "biological", f"at or after the world's first guild zero (frame {vb})"
+    bi = bw.get("burn_in")
+    if isinstance(bi, dict) and not bi.get("decided"):
+        return "pending", f"its attempt's burn-in disposition is not settled ({bi.get('why')})"
+    if f in set(bw.get("archived") or ()):
+        return "available", None
+    if bw.get("status") in ENDED:
+        return "technical", f"not archived, and the world is {bw.get('status')} (repair it if possible)"
+    return "pending", f"not archived yet (the world is {bw.get('status')})"
+
+
+def mask(g, block, block_sha256=None):
+    """The evidence-bound availability mask of an IMMUTABLE graph (its edges and roles never change) from a
+    worlds block (worlds.py design-block: per world valid_before, archived frames, status, attempt, burn-in):
+    every unavailable snapshot (world x time) with its cause, every edge's exclusion (its endpoints' first
+    of biological, technical, pending; references are not masked here: refsel.py's candidate pool decides
+    them), counts by family x role, and the attrition by world. Deterministic: no clock."""
+    ws = block.get("worlds") or {}
+    probs = []
+    for w in g["worlds"]:
+        bw = ws.get(w["id"])
+        if bw is None:
+            probs.append(f"{w['id']}: not in the worlds block")
+        elif (bw.get("treatment"), bw.get("block")) not in ((w["treatment"], w["block"]), (None, None)):
+            probs.append(f"{w['id']}: the block has {bw.get('treatment')} in block {bw.get('block')}, the graph "
+                         f"{w['treatment']} in block {w['block']}")
+    if probs:
+        raise GraphError("the worlds block is not this graph's registry: " + "; ".join(probs[:5]))
+    snaps, worlds = {}, {}
+    for w in g["worlds"]:
+        bw = ws[w["id"]]
+        exc = Counter()
+        first = None
+        for t in TIMES:
+            st, why = snapshot_status(bw, t)
+            if st != "available":
+                snaps[f"{w['id']}:{frame_of(t)}"] = {"world": w["id"], "time": t, "frame": frame_of(t),
+                                                    "status": st, "why": why}
+                exc[st] += 1
+                first = t if first is None else first
+        worlds[w["id"]] = {"treatment": w["treatment"], "block": w["block"], "status": bw.get("status"),
+                           "attempt": bw.get("attempt"), "valid_before": bw.get("valid_before"),
+                           "burn_in_decided": (bw["burn_in"].get("decided") if isinstance(bw.get("burn_in"), dict)
+                                               else None),
+                           "unavailable_snapshots": dict(exc), "first_unavailable_time": first}
+    by = defaultdict(lambda: defaultdict(Counter))
+    excluded = {k: [] for k in EXCLUSION}
+    for i, (q, p, fam, role, _) in enumerate(g["edges"]):
+        st = "available"
+        for x in (q, p):
+            _, w, t = parse(x)
+            if w is None:
+                continue
+            s_ = snaps.get(f"{w}:{frame_of(t)}", {}).get("status", "available")
+            if s_ != "available" and (st == "available" or EXCLUSION.index(s_) < EXCLUSION.index(st)):
+                st = s_
+        c = by[fam][role]
+        c["scheduled"] += 1
+        c["executable" if st == "available" else st] += 1
+        if st != "available":
+            excluded[st].append(i)
+    n = len(g["edges"])
+    ne = sum(len(v) for v in excluded.values())
+    return {"schema": MASK_SCHEMA,
+            "graph": {"edges_sha256": g.get("edges_sha256"), "namespace": g.get("namespace"), "edges": n},
+            "block": {"schema": block.get("schema"), "sha256": block_sha256, "registry_sha256": block.get("registry_sha256")},
+            "snapshots": snaps, "worlds": worlds,
+            "edges": {"scheduled": n, "executable": n - ne, **{k: len(v) for k, v in excluded.items()}},
+            "by_family_role": {f: {r: dict(c) for r, c in sorted(rs.items())} for f, rs in sorted(by.items())},
+            "excluded_edges": excluded,
+            "rules": "Annex H D6 rule 27: the scheduled graph and its roles are preserved; only pairs whose source "
+                     "snapshots are valid before the first guild-zero boundary (and archived, from a settled attempt) "
+                     "execute; every excluded pair keeps its cause; no endpoint is replaced by another world or time, "
+                     "and recovery or support failure never authorizes replacement edges"}
+
+
+def executable(g, m, mask_sha256=None):
+    """The executable graph: the immutable graph's edges minus the mask's exclusions, roles, families and
+    horizons unchanged, its meta bound to the source graph and the mask (mask_sha256: its file's bytes)."""
+    if m.get("schema") != MASK_SCHEMA:
+        raise GraphError(f"mask schema {m.get('schema')!r}, expected {MASK_SCHEMA}")
+    if (m["graph"]["edges_sha256"], m["graph"]["edges"]) != (g["edges_sha256"], len(g["edges"])):
+        raise GraphError("the mask was made for another graph (its edges_sha256 or edge count differs)")
+    out = {i for v in m["excluded_edges"].values() for i in v}
+    meta = {k: v for k, v in g.items() if k not in ("edges", "edges_sha256", "tool_sha256")}
+    meta["executable_of"] = {"edges_sha256": g["edges_sha256"], "edges": len(g["edges"]),
+                             "mask": {"sha256": mask_sha256, "block": m["block"],
+                                      "excluded": {k: len(v) for k, v in m["excluded_edges"].items()}}}
+    meta["edges"] = [e for i, e in enumerate(g["edges"]) if i not in out]
+    return meta
+
+
 # ------------------------------------------------------------------ report
 ACCESS = {
     "v4": "training and support pairs of the global families (the new matchings included)",
@@ -600,8 +757,10 @@ def report(g):
         if split[w] != "train":
             return f"{kind}-{split[w]}-world"
         return f"{kind}-snapshot-{holdout[(w, t)]}" if (w, t) in holdout else f"{kind}-train"
+    ex = g.get("executable_of")             # (an executable graph: its attrition is the mask's, not a quota error)
     out = {"schema": "finfolk.redqueen.graphreport/1", "namespace": g["namespace"],
-           "quota_problems": check_quotas(g), "pairs": len(g["edges"]),
+           "quota_problems": [] if ex else check_quotas(g), "pairs": len(g["edges"]),
+           "executable_of": ex,
            "families": dict(Counter(e[2] for e in g["edges"])),
            "roles": {f: dict(Counter(e[3] for e in g["edges"] if e[2] == f)) for f in FAMILIES
                      if f in QUOTAS or any(e[2] == f for e in g["edges"])}}
@@ -655,8 +814,28 @@ def main(argv=None):
     r = sub.add_parser("report")
     r.add_argument("--graph", required=True)
     r.add_argument("--out")
+    mk = sub.add_parser("mask", help="the availability mask of a graph from a worlds block (read-only on both)")
+    mk.add_argument("--graph", required=True)
+    mk.add_argument("--block", required=True, help="worlds.py design-block's (or val_block.py's) worlds block")
+    mk.add_argument("--out", required=True)
+    ex = sub.add_parser("executable", help="the graph minus a mask's exclusions (roles unchanged)")
+    ex.add_argument("--graph", required=True)
+    ex.add_argument("--mask", required=True)
+    ex.add_argument("--out", required=True)
     a = ap.parse_args(argv)
     try:
+        if a.cmd == "mask":
+            raw = rqlib.read_bytes(a.block)
+            m = mask(load(a.graph), json.loads(raw.decode("utf-8")), rqlib.sha256_bytes(raw))
+            rqlib.write_durable(a.out, rqlib.canonical(m))
+            print(f"{m['edges']['executable']} of {m['edges']['scheduled']} pairs executable; excluded "
+                  f"{ {k: m['edges'][k] for k in EXCLUSION} } -> {a.out}", file=sys.stderr)
+            return 0
+        if a.cmd == "executable":
+            raw = rqlib.read_bytes(a.mask)
+            meta = write(executable(load(a.graph), json.loads(raw.decode("utf-8")), rqlib.sha256_bytes(raw)), a.out)
+            print(f"{meta['edges']} executable pairs -> {a.out}/graph.jsonl.gz", file=sys.stderr)
+            return 0
         if a.cmd == "build":
             g = build(a.namespace, registry_worlds(a.registry) if a.registry else None, not a.no_train_matchings,
                       a.snapshot_topup, a.ab_topup, a.ab_topup_mode, a.lag_probe)
