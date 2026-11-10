@@ -694,8 +694,18 @@ class TestPipeline(unittest.TestCase):
         self.assertFalse(P4["pooled_primary"]["available"])
         self.assertTrue(any(v.startswith("not released") for o in P4["origins"].values()
                             for kind in ("native", "fork") for v in o[kind]["dispositions"].values()))
-        with self.assertRaisesRegex(fc.ForecastError, "VAL_PRED_SHA committed first|public freeze first"):
-            fc.panel_document(dict(self.ctx, root=os.path.join(self.tmp, "nowhere")), self.files["val_targets.json"], "test")
+        # (Codex #78 r3 P2-1) the MOST RESTRICTIVE registered use: the validation root V0's 185M -> 195M target is
+        # read by a test-stage origin (the forward-time test period), so it is not released at the validation stage
+        st = fc.panel_row_stages(self.ctx)
+        self.assertEqual((fc.node_role(self.ctx["manifest"], "V0", 195), st[("V0", 195)]), ("validation", "test"))
+        self.assertEqual(fc.row_stage(self.ctx, st, "V0", 195), "test")
+        self.assertTrue(P4["origins"]["185"]["native"]["dispositions"]["V0@195"].startswith("not released (a test-stage"))
+        self.assertEqual(P4["origins"]["185"]["fork"]["dispositions"]["V0@195"], P4["origins"]["185"]["native"]["dispositions"]["V0@195"])
+        # (Codex #78 r3 P2-2) the release gates are #73's VALIDATED path, never a marker or a file's presence
+        nowhere = dict(self.ctx, root=os.path.join(self.tmp, "nowhere"))
+        for stage in ("validation", "test"):
+            with self.assertRaises((fc.ForecastError, fc.staging.StageError)):
+                fc.panel_document(nowhere, self.files["val_targets.json"], stage, self.val)
 
     def test_end_to_end(self):
         """The staged pipeline runs on a TARGET-DISJOINT registration (no stage's prefix row is one of its
@@ -784,13 +794,18 @@ class TestPipeline(unittest.TestCase):
             self.assertTrue(all((r["outcomes"] is None) == r["excluded"] for r in doc["origins"]))
             self.assertEqual(sum(c["origins"] for c in doc["outcomes"].values()), len(doc["origins"]))
             self.assertNotIn("decomposition_10_5", doc)
-        # (the release-stage gate) before VAL_PRED_SHA is committed the panel receipt is refused at either stage
+        # (the release-stage gates, Codex #78 r3 P2-2) before VAL_PRED_SHA is committed the panel receipt is refused at
+        # either stage (the validated commitment / freeze chain, not a marker's presence); on the committed root the
+        # validation gate opens, and the test gate needs the frozen test commitment
         base = self.copy(self.base)
         for st in ("validation", "test"):
             rc_, err = run(["panel", "--root", base, "--targets", self.files["val_targets.json"], "--stage", st,
-                            "--out", os.path.join(self.tmp, f"panel.{st}.json")])
+                            "--predictions", self.val, "--out", os.path.join(self.tmp, f"panel.{st}.json")])
             self.assertEqual(rc_, 2, err)
-            self.assertIn("committed first" if st == "validation" else "public freeze first", err)
+        self.assertIn("not a registered §10.5 panel row", run(["panel", "--root", self.root, "--targets",
+                                                               self.files["val_targets.json"], "--stage", "validation",
+                                                               "--predictions", self.val, "--out",
+                                                               os.path.join(self.tmp, "panel.v.json")])[1])
 
     def test_reproducible(self):
         """The same bytes and environment give byte-identical outputs at every stage."""

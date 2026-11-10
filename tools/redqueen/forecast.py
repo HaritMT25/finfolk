@@ -130,8 +130,10 @@ Every non-excluded origin, a prefix-unavailable one too, carries its outcome / d
 horizon in the documents' "outcomes". The §10.5 disposition is a SEPARATE registered panel receipt
 (forecast.py panel; panel_required / panel_receipt): per fork origin its primary target, the native
 component (every native-panel world) and the fork component (every root's branches and original)
-separately, each required row's disposition (measured, absorbed, unavailable, missing, or not released
-under the release-stage gates), the pooled primary only with all three origins complete; it never
+separately, each required row's disposition (measured, absorbed, unavailable, missing, or not released:
+a row's stage is the most restrictive registered use of it, forward-time stages and promotions
+included, and the gates are #73's validated release path, the committed validation predictions or the
+test gate), the pooled primary only with all three origins complete; it never
 looks at a forecast, and survivor-conditioned §10.6 summaries never stand in for it.
 POOLED per STAGE x WORLD ROLE x TARGET ROLE x TIME ROLE x CATEGORY x KIND x HORIZON x FORECASTER, never
 across them (a validation-root world that fed the lambda selection never pools with a test-root world), with
@@ -1424,27 +1426,52 @@ def score_lines(ctx, lines, T):
     return per
 
 
-def panel_document(ctx, path, stage):
-    """The §10.5 panel receipt document under the RELEASE-STAGE GATES: validation (after VAL_PRED_SHA is committed)
-    reads training / validation-role outcomes only; test (after the public freeze) reads every role. The measurement
-    document may hold only registered panel rows of the released roles (load_profiles' admission)."""
+def panel_row_stages(ctx):
+    """{(world, t): the MOST RESTRICTIVE registered stage that reads it as an outcome} (Codex #78 r3 P2-1): every
+    registered origin's (post-promotion, forward-time) stage over its target rows (target_rows; excluded origins
+    included: conservative)."""
+    out = {}
+    for o in ctx["origins"]:
+        for k in target_rows(o):
+            out[k] = staging.most_held_out(out.get(k), o["stage"])
+    return out
+
+
+def row_stage(ctx, stages, w, t):
+    """A panel row's release stage: the most restrictive of its snapshot's role (a branch: its root's) and every
+    registered origin's stage that reads it (panel_row_stages)."""
+    man = ctx["manifest"]
+    root = man.get("branches", {}).get(w, {}).get("root", w)
+    return staging.most_held_out(node_role(man, root, t), stages.get((w, t)))
+
+
+def panel_document(ctx, path, stage, predictions):
+    """The §10.5 panel receipt document under the RELEASE-STAGE GATES (Codex #78 r3 P2-2: #73's VALIDATED release path,
+    never a marker's or a file's presence): validation needs the committed validation predictions (staging.
+    committed_rows: VAL_PRED_SHA bound to its record, the bytes the marker, this configuration) and releases training /
+    validation-stage rows; test needs staging.test_gate (the freeze's schema and public registration, the prediction
+    commitments, the manifest and THIS implementation) and releases every row. A row's stage is the most restrictive
+    registered use of it (row_stage: forward-time stages and promotions included). The measurement document may hold
+    only registered panel rows of released stages (load_profiles' admission)."""
     root = ctx["root"]
     if stage == "validation":
-        if not sealing._marker(root, "VAL_PRED_SHA"):
-            raise ForecastError("the §10.5 panel at the validation stage needs VAL_PRED_SHA committed first")
+        staging.committed_rows(root, "validation", predictions, ctx["cfg_sha"], {"validation"})
         released = {"training", "validation"}
     else:
-        if not os.path.isfile(os.path.join(sealing.reg_dir(root), "freeze.json")):
-            raise ForecastError("the §10.5 panel at the test stage needs the public freeze first (test outcomes are "
-                                "opened only after it)")
+        g = staging.test_gate(root, predictions, staging.implementation_manifest(sys.modules[__name__]))
+        for ln in g["rows"]:
+            if (ln.get("provenance") or {}).get("config_sha256") != ctx["cfg_sha"]:
+                raise ForecastError(f"{ln.get('target_id')}: predicted under another analysis configuration")
         released = {"training", "validation", "test"}
     want = {k for r in panel_required(ctx).values() for kind in ("native", "fork") for k in r[kind]}
+    stages = panel_row_stages(ctx)
 
     def admit(i, key):
         if key not in want:
             return "not a registered §10.5 panel row"
-        if i["role"] not in released:
-            return f"a {i['role']}-role outcome before its stage is open"
+        st = row_stage(ctx, stages, key[0], key[1])
+        if st not in released:
+            return f"a {st}-stage outcome before its stage is open"
         return None
     T = read_profiles(ctx, path, "panel targets", admit)
     return dict(panel_receipt(ctx, T["rows"], released), stage=stage, config_sha256=ctx["cfg_sha"],
@@ -1514,22 +1541,21 @@ def disposition_of(row):
 
 def panel_receipt(ctx, rows, released):
     """THE REGISTERED §10.5 PANEL RECEIPT (Codex #78 r2 P2-1): per origin, the native and the fork component SEPARATELY,
-    every required row's disposition (disposition_of; a row whose release stage is not open, released: the roles
-    readable now, is "not released"), each component complete only when every row is measured, the origin's
-    decomposition available only when both are, and the POOLED primary only when all three origins are. Independent
-    of forecastability: no forecast line enters."""
+    every required row's disposition (disposition_of; a row whose release stage, row_stage: the most restrictive
+    registered use of it, is not among the released STAGES is "not released"), each component complete only when
+    every row is measured, the origin's decomposition available only when both are, and the POOLED primary only when
+    all three origins are. Independent of forecastability: no forecast line enters."""
     req = panel_required(ctx)
-    man = ctx["manifest"]
+    stages = panel_row_stages(ctx)
     out, why = {}, []
     for o, r in sorted(req.items()):
         comp = {}
         for kind in ("native", "fork"):
             disp = {}
             for w, t in r[kind]:
-                root = man.get("branches", {}).get(w, {}).get("root", w)
-                role = staging.most_held_out(node_role(man, root, t), None)
-                disp[f"{w}@{t}"] = (disposition_of(rows.get((w, t))) if role in released else
-                                    f"not released (a {role}-role outcome: its stage is not open)")
+                st = row_stage(ctx, stages, w, t)
+                disp[f"{w}@{t}"] = (disposition_of(rows.get((w, t))) if st in released else
+                                    f"not released (a {st}-stage outcome: its stage is not open)")
             n_ok = sum(1 for v in disp.values() if v == "measured")
             comp[kind] = {"required": len(disp), "measured": n_ok, "complete": bool(disp) and n_ok == len(disp),
                           "dispositions": disp}
@@ -1632,7 +1658,9 @@ def main(argv=None):
     s.add_argument("--root", required=True)
     s.add_argument("--targets", required=True, help="the registered §10.5 panel's measurement records (released only)")
     s.add_argument("--stage", choices=("validation", "test"), required=True,
-                   help="validation: after VAL_PRED_SHA, training / validation roles only; test: after the freeze, all")
+                   help="validation: the committed validation predictions, training / validation-stage rows only; "
+                        "test: through the test gate (the freeze), every row")
+    s.add_argument("--predictions", required=True, help="the stage's committed predictions (its release gate)")
     s.add_argument("--out", required=True)
     a = ap.parse_args(argv)
     test_stages = {"test", "training"}
@@ -1649,7 +1677,7 @@ def main(argv=None):
         ctx = load_ctx(a.root)
         cfg = ctx["cfg"]
         if a.cmd == "panel":
-            rec = panel_document(ctx, a.targets, a.stage)
+            rec = panel_document(ctx, a.targets, a.stage, a.predictions)
             rqlib.write_json_durable(a.out, rec)
             print(f"{a.out}: pooled §10.5 primary {'available' if rec['pooled_primary']['available'] else 'unavailable'}")
             return 0
