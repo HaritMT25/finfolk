@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import itertools
+import json
 import math
 import os
 import sys
@@ -459,9 +460,11 @@ class TestEligibility(unittest.TestCase):
 
     def run_(self, dead=(), refill=(), missing=(), incomplete=(), mask=None, results=None):
         reg = self.reg
-        rec, D, W = stats.eligibility(eco_doc(reg["worlds"], dead, refill), reg,
-                                      hc_slopes(reg["worlds"], missing, incomplete=incomplete), registry_sha256="r" * 64,
-                                      mask=mask, eco_sha256="e" * 64, mask_sha256=None if mask is None else "m" * 64)
+        hc = hc_slopes(reg["worlds"], missing, incomplete=incomplete)
+        rec, D, W = stats.eligibility(eco_doc(reg["worlds"], dead, refill), reg, hc, registry_sha256="r" * 64,
+                                      mask=mask, eco_sha256="e" * 64, mask_sha256=None if mask is None else "m" * 64,
+                                      hc_provenance=None if mask is None else
+                                      stats.observation_provenance(mask, "m" * 64, sorted(hc)))
         return rec, D, W, stats.decide(rec, results or {}, D, W)
 
     def test_fewer_than_24_survivors_with_usable_hc_blocks(self):
@@ -536,10 +539,11 @@ class TestEligibility(unittest.TestCase):
                                       registry_sha256="r" * 64)
         q = rec["Q200"]["worlds"]
         self.assertEqual(len(q), 32)
-        res = {"H-P": {"available": True, "p": 0.001, "worlds": q},
-               "H-Q": {"available": True, "p": 0.004, "worlds": list(reversed(q))},
-               "H-F": {"available": True, "S_F": 0.2, "c_F": 0.5, "p_F": 0.001, "worlds": q},
-               "H-T": {"available": False, "p_model": 0.001, "c_T": 1.0, "T_T": 3.0, "worlds": q, "failure": "numerical"}}
+        bind = {h: stats.result_binding(rec, h) for h in stats.Q200_FAMILY}
+        res = {"H-P": {"available": True, "p": 0.001, "worlds": q, "binding": bind["H-P"]},
+               "H-Q": {"available": True, "p": 0.004, "worlds": list(reversed(q)), "binding": bind["H-Q"]},
+               "H-F": {"available": True, "S_F": 0.2, "c_F": 0.5, "p_F": 0.001, "worlds": q, "binding": bind["H-F"]},
+               "H-T": {"available": False, "p_model": 0.001, "c_T": 7.0, "T_T": 8.0, "worlds": q, "failure": "numerical"}}
         dec = stats.decide(rec, res, D, W)
         self.assertEqual((dec["pvalues"]["H-P"], dec["pvalues"]["H-Q"], dec["pvalues"]["H-F"], dec["pvalues"]["H-T"]),
                          (0.001, 0.004, 1.0, None))                      # (S_F <= c_F: never a rejection; H-T failed)
@@ -550,11 +554,29 @@ class TestEligibility(unittest.TestCase):
         self.assertEqual(stats.family_p("H-T", dict(res["H-T"], available=True)), (0.001, None))
         self.assertEqual(stats.family_p("H-T", dict(res["H-T"], available=True, T_T=0.5)), (1.0, None))
         self.assertIsNone(stats.family_p("H-T", dict(res["H-T"], available=True, c_T=None))[0])
+        p, why = stats.family_p("H-T", dict(res["H-T"], available=True, c_T=1.0, T_T=3.0))   # (Codex #68 D6 r2 P2-4)
+        self.assertIsNone(p)
+        self.assertIn("below the registered guard", why)
+        self.assertEqual(stats.family_p("H-T", dict(res["H-T"], available=True, c_T=stats.HT_GUARD)), (0.001, None))
+        self.assertAlmostEqual(stats.HT_GUARD, math.log(600), places=12)
         self.assertIsNone(stats.family_p("H-P", {"available": False, "p": 0.001})[0])
         with self.assertRaisesRegex(stats.StatsError, "another population"):
             stats.decide(rec, {"H-P": {"available": True, "p": 0.001, "worlds": q[1:]}}, D, W)
-        stats.require_population(rec, "H-P", q)
+        # (Codex #68 D6 r2 P2-2: only results BOUND to this record enter: unbound, another record's, another
+        # hypothesis's binding are refused; the record's identity survives a file round trip)
+        for b in (None, dict(bind["H-P"], eligibility_sha256="0" * 64), bind["H-Q"]):
+            with self.assertRaisesRegex(stats.StatsError, "not bound to this eligibility record"):
+                stats.decide(rec, {"H-P": {"available": True, "p": 0.001, "worlds": q, "binding": b}}, D, W)
+        self.assertEqual(stats.record_sha256(json.loads(json.dumps(rec))), bind["H-P"]["eligibility_sha256"])
+        self.assertEqual(stats.require_population(rec, "H-P", q), bind["H-P"])
         stats.require_population(rec, "H-C", rec["hypotheses"]["H-C"]["worlds"])
+        recb = json.loads(json.dumps(rec))
+        prov = {"graph_edges_sha256": "g" * 64, "mask_sha256": "m" * 64, "snapshots_sha256": "s" * 64}
+        recb["hypotheses"]["H-P"]["binding"] = prov
+        self.assertEqual(stats.require_population(recb, "H-P", q, dict(prov))["provenance"], prov)
+        for bad in (None, dict(prov, graph_edges_sha256="h" * 64), dict(prov, snapshots_sha256="t" * 64)):
+            with self.assertRaisesRegex(stats.StatsError, "provenance"):
+                stats.require_population(recb, "H-P", q, bad)
         with self.assertRaisesRegex(stats.StatsError, "registered population"):
             stats.require_population(rec, "H-F", q[1:])
         dead = [w["id"] for w in self.reg["worlds"] if w["treatment"] != "C" and w["block"] > 1]
@@ -598,6 +620,27 @@ class TestEligibility(unittest.TestCase):
         rec2, _, _, _ = self.run_(mask=mask_doc(reg["worlds"], {("C11", 50): "not archived"}))
         self.assertFalse(rec2["hypotheses"]["H-C"]["available"])
         self.assertIn("excluded by the mask", rec2["ineligible"]["C11"])
+        # (Codex #68 D6 r2 P2-2: observations are bound to the mask's graph, digest and snapshot identities)
+        clean, hc = mask_doc(reg["worlds"], {}), hc_slopes(reg["worlds"])
+        for prov in (None, stats.observation_provenance(dict(clean, graph={"edges_sha256": "h" * 64}), "m" * 64,
+                                                        sorted(hc))):
+            with self.assertRaisesRegex(stats.StatsError, "H-C fits' provenance"):
+                stats.eligibility(eco_doc(reg["worlds"]), reg, hc, registry_sha256="r" * 64, mask=clean,
+                                  eco_sha256="e" * 64, mask_sha256="m" * 64, hc_provenance=prov)
+        rec3, D3, W3, _ = self.run_(mask=clean)
+        q = rec3["Q200"]["worlds"]
+        prov = stats.observation_provenance(clean, "m" * 64, q)
+        self.assertEqual(rec3["hypotheses"]["H-P"]["binding"], prov)
+        self.assertEqual(rec3["mask"]["graph_edges_sha256"], "g" * 64)
+        other = json.loads(json.dumps(clean))
+        other["worlds"][q[0]]["available_sha256"] = {"5000000": "a" * 64}          # (another snapshot's bytes)
+        for bad in (stats.observation_provenance(other, "m" * 64, q), stats.observation_provenance(clean, "n" * 64, q),
+                    stats.observation_provenance(clean, "m" * 64, sorted(hc))):
+            with self.assertRaisesRegex(stats.StatsError, "provenance"):
+                stats.require_population(rec3, "H-P", q, bad)
+        b = stats.require_population(rec3, "H-P", q, prov)
+        dec3 = stats.decide(rec3, {"H-P": {"available": True, "p": 0.001, "worlds": q, "binding": b}}, D3, W3)
+        self.assertEqual(dec3["pvalues"]["H-P"], 0.001)
 
 
 if __name__ == "__main__":

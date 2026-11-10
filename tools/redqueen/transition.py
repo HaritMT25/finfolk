@@ -572,7 +572,7 @@ def classify(obs_e, draws_e, gate, a=LEVEL):
 
 
 def ht(epochs, betas, gates, loads=None, k=0, analysis="main", draws=stats.B_BOOT, c_T=GUARD, p_model=None,
-       report=True, redesign=None, eligibility=None):
+       report=True, redesign=None, eligibility=None, provenance=None):
     """The complete H-T analysis. epochs: {e: [(WorldDesign for e, responses y)]} (the same unique world
     ids in every epoch, any order); betas: {e: {"P": {world id: slope}, "Q": {world id: slope}}}; gates:
     {e: the epoch's calibrated recurrence-detection gate (bool)}; loads: {world id: {"C": L, "Q": L}}
@@ -587,32 +587,37 @@ def ht(epochs, betas, gates, loads=None, k=0, analysis="main", draws=stats.B_BOO
     calibrated = c_T is not None
     c_T = max(GUARD, c_T) if calibrated else GUARD
     ids = canonical_ids(epochs, betas, loads)
-    if eligibility is not None:                # (Annex H D6 rules 26-27: the common Q200 in EVERY epoch)
-        stats.require_population(eligibility, "H-T", ids)
+    hb = None                                # (the binding; not `b`: the redesign loop below uses b)
+    if eligibility is not None:                # (Annex H D6 rules 26-27: the common Q200 in EVERY epoch, bound)
+        hb = stats.require_population(eligibility, "H-T", ids, provenance)
+
+    def bound(r):                            # (Codex #68 D6 r2 P2-2: every result carries its binding)
+        return r if hb is None else dict(r, binding=hb)
     grid = tuple(recurrence.EPOCH_PERIODS)
     off = sorted({(e, wd.id) for e in EPOCHS for wd, _ in epochs[e] if tuple(wd.periods) != grid})
     if off:                                  # (#68 round 5 P2-2: the registered domain, never a supplied list)
-        return {"available": False, "reject": False, "T_T": None, "winner": None, "candidates": [], "worlds": ids,
-                "error": f"epoch designs off the registered period domain {list(grid)}: {off[:4]}",
-                "failure": "domain", "c_T": None if not calibrated else c_T, "p_model": p_model, "phase_support": {},
-                "EU_unsupported": {}}
+        return bound({"available": False, "reject": False, "T_T": None, "winner": None, "candidates": [], "worlds": ids,
+                      "error": f"epoch designs off the registered period domain {list(grid)}: {off[:4]}",
+                      "failure": "domain", "c_T": None if not calibrated else c_T, "p_model": p_model,
+                      "phase_support": {},
+                      "EU_unsupported": {}})
     n = len(ids)
     missing = [e for e in EPOCHS if gates.get(e) is None]
     if missing:                                        # (H.12: every gate H-T requires needs a passing calibration)
-        return {"available": False, "reject": False, "T_T": None, "winner": None, "candidates": [], "worlds": ids,
-                "error": f"the recurrence gate of {missing} lacks a passing frozen calibration", "failure": None,
-                "c_T": max(GUARD, c_T),
-                "p_model": p_model, "phase_support": {}, "EU_unsupported": {}}
+        return bound({"available": False, "reject": False, "T_T": None, "winner": None, "candidates": [], "worlds": ids,
+                      "error": f"the recurrence gate of {missing} lacks a passing frozen calibration", "failure": None,
+                      "c_T": max(GUARD, c_T),
+                      "p_model": p_model, "phase_support": {}, "EU_unsupported": {}})
     for e in EPOCHS:                                   # (canonical order: one index = one world everywhere)
         by = {wd.id: (wd, y) for wd, y in epochs[e]}
         epochs = dict(epochs, **{e: [by[w] for w in ids]})
     bet = {e: {h: [float(betas[e][h][w]) for w in ids] for h in ("P", "Q")} for e in EPOCHS}
     bad = [f"{e}/{h}/{w}" for e in EPOCHS for h in ("P", "Q") for w, v in zip(ids, bet[e][h]) if not math.isfinite(v)]
     if bad:
-        return {"available": False, "reject": False, "T_T": None, "error": f"nonfinite slopes: {bad[:5]}",
-                "failure": "numerical",
-                "winner": None, "candidates": [], "worlds": ids, "c_T": max(GUARD, c_T), "p_model": p_model,
-                "phase_support": {}, "EU_unsupported": {}}
+        return bound({"available": False, "reject": False, "T_T": None, "error": f"nonfinite slopes: {bad[:5]}",
+                      "failure": "numerical",
+                      "winner": None, "candidates": [], "worlds": ids, "c_T": max(GUARD, c_T), "p_model": p_model,
+                      "phase_support": {}, "EU_unsupported": {}})
     idx, xi = draw_streams(analysis, n, k, draws)
     obs, dr, res = {}, {}, {}
     try:
@@ -633,10 +638,10 @@ def ht(epochs, betas, gates, loads=None, k=0, analysis="main", draws=stats.B_BOO
         stat = ht_statistic(obs, dr, gates)
         coverage = {e: epoch_coverage(epochs[e], per[e], grid) for e in EPOCHS}
     except TransitionError as err:          # (a numerical failure anywhere: unavailable, never a rejection)
-        return {"available": False, "reject": False, "T_T": None, "error": str(err), "failure": "numerical",
-                "winner": None,
-                "candidates": [], "components": obs, "c_T": max(GUARD, c_T), "p_model": p_model, "worlds": ids,
-                "phase_support": {e: res[e]["phase_support"] for e in res}, "EU_unsupported": {}}
+        return bound({"available": False, "reject": False, "T_T": None, "error": str(err), "failure": "numerical",
+                      "winner": None,
+                      "candidates": [], "components": obs, "c_T": max(GUARD, c_T), "p_model": p_model, "worlds": ids,
+                      "phase_support": {e: res[e]["phase_support"] for e in res}, "EU_unsupported": {}})
     c_T = max(GUARD, c_T)
     out = {"T_T": stat["T_T"], "c_T": c_T, "p_model": p_model, "winner": stat["winner"], "worlds": ids,
            "candidates": stat["candidates"], "components": obs, "available": all(res[e]["available"] for e in EPOCHS),
@@ -657,4 +662,4 @@ def ht(epochs, betas, gates, loads=None, k=0, analysis="main", draws=stats.B_BOO
     if not calibrated:
         out.update(available=False, reject=False, c_T=None)
         out.setdefault("reasons", {})["calibration"] = "c_T unavailable (a capped mode): p = 1 in Holm"
-    return out
+    return bound(out)

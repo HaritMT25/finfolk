@@ -510,6 +510,7 @@ ECOLOGY_SCHEMA = "finfolk.redqueen.ecology/1"
 ELIGIBILITY_SCHEMA = "finfolk.redqueen.eligibility/1"
 MASK_SCHEMA = "finfolk.redqueen.graphmask/2"
 COARSE_T = tuple(range(0, 201, 5))           # (graph.py's coarse times: H-C's required 200M coarse measurements)
+HT_GUARD = math.log(6 / 0.01)                # (H-T's registered guard log 600: transition.GUARD, its minimum c_T)
 
 
 def complete_history(slot):
@@ -545,6 +546,31 @@ def ecology_problems(eco, registry, registry_sha256=None):
 ALL_T = tuple(range(0, 201))                 # (every graph time: the fine and reference observations H-F / H-T use)
 
 
+def snapshots_sha256(mask, worlds):
+    """The digest of the given worlds' SNAPSHOT IDENTITIES in a graphmask/2 (Codex #68 D6 r2 P2-2): per world its
+    slot uuid and attempt uuid, every unavailable snapshot (its snapshot uuid and cause) and every available
+    snapshot's verified archive sha256 (the bytes the observations were measured from)."""
+    W, S = mask.get("worlds") or {}, mask.get("snapshots") or {}
+    miss = sorted(set(worlds) - set(W))
+    if miss:
+        raise StatsError(f"{len(miss)} world(s) not in the mask: {miss[:4]}")
+    un = {}
+    for k, s in S.items():
+        un.setdefault(s.get("world"), {})[k] = [s.get("snapshot"), s.get("status")]
+    return rqlib.canonical_sha({w: {"uuid": W[w].get("uuid"), "attempt_uuid": W[w].get("attempt_uuid"),
+                                    "available_sha256": W[w].get("available_sha256"), "unavailable": un.get(w, {})}
+                                for w in sorted(worlds)})
+
+
+def observation_provenance(mask, mask_sha256, worlds):
+    """THE PROVENANCE a producer of observations (slopes, per-world recurrence analyses, epoch designs) stamps on
+    them, for the worlds it measured (Codex #68 D6 r2 P2-2): the graph (the mask's graph.edges_sha256), the mask
+    (its bytes' sha256) and those worlds' snapshot identities (snapshots_sha256). The eligibility record carries the
+    same for each hypothesis's population (its "binding"); require_population compares them."""
+    return {"graph_edges_sha256": (mask.get("graph") or {}).get("edges_sha256"), "mask_sha256": mask_sha256,
+            "snapshots_sha256": snapshots_sha256(mask, worlds)}
+
+
 def mask_gaps(mask, worlds, times=ALL_T):
     """{world: [(t, cause, why)]}: the snapshots at the given graph times a graphmask/2 excludes, per world."""
     out = {}
@@ -577,7 +603,7 @@ def hc_fit_status(s):
 
 
 def eligibility(eco, registry, hc_slopes, registry_sha256=None, mask=None, eco_sha256=None, min_q200=MIN_Q200,
-                mask_sha256=None):
+                mask_sha256=None, hc_provenance=None):
     """THE AUTHORITATIVE ELIGIBILITY DISPATCHER (Annex H D6 rules 26-27 and 33; D7 rules 36-38) -> (the eligibility
     record, H-C's usable block deltas, their count weights).
 
@@ -597,7 +623,11 @@ def eligibility(eco, registry, hc_slopes, registry_sha256=None, mask=None, eco_s
         excludes (H-C: at its coarse times; H-P/H-Q/H-F/H-T: at ANY graph time, the fine and reference
         observations included) makes the decisions that need it unavailable ("pending repair") until then.
       The MASK, when given, is bound by its bytes' sha256 (mask_sha256, required) and checked against its own
-        evidence (graph.mask_evidence_problems) and the export's registry.
+        evidence (graph.mask_evidence_problems) and the export's registry. Each hypothesis then carries its
+        BINDING (observation_provenance of its population: the graph, the mask, the snapshot identities); the H-C
+        fits must carry theirs (hc_provenance, required with a mask: observations of another graph, mask or
+        snapshots with the same world ids are refused; Codex #68 D6 r2 P2-2), and every analysis result must be
+        bound to the record (require_population; decide refuses an unbound result).
       The ecological family is a mandatory primary DESCRIPTIVE family (D6 rule 33): its export is bound here
         (eco_sha256, its 200M first-attempt survival per treatment) and consumes no alpha."""
     probs, q = ecology_problems(eco, registry, registry_sha256)
@@ -617,7 +647,11 @@ def eligibility(eco, registry, hc_slopes, registry_sha256=None, mask=None, eco_s
         if (mask.get("registry") or {}).get("sha256") != eco.get("registry_sha256"):
             raise StatsError("the mask binds another registry than the ecological export")
         mrec = {"sha256": mask_sha256, "graph_edges_sha256": (mask.get("graph") or {}).get("edges_sha256"),
+                "graph_namespace": (mask.get("graph") or {}).get("namespace"),
                 "registry_sha256": (mask.get("registry") or {}).get("sha256")}
+        if hc_provenance != observation_provenance(mask, mask_sha256, sorted(hc_slopes)):
+            raise StatsError("the H-C fits' provenance is not the bound graph / mask / snapshot identities "
+                             "(hc_provenance: observation_provenance of the fitted worlds)")
     slots = eco["slots"]
     reg = registry["worlds"]
     complete = {w["id"] for w in reg if complete_history(slots[w["id"]])}
@@ -650,7 +684,8 @@ def eligibility(eco, registry, hc_slopes, registry_sha256=None, mask=None, eco_s
                                          "and estimates stay descriptive; D6 rule 26)")
         if r is None and q_tech:
             r = f"technical gaps in {len(q_tech)} Q200 world(s) ({q_tech[:4]}): pending repair, never dropped"
-        hyp[h] = {"population": "Q200", "worlds": q, "available": r is None, "reason": r}
+        hyp[h] = {"population": "Q200", "worlds": q, "available": r is None, "reason": r,
+                  "binding": None if mask is None else observation_provenance(mask, mask_sha256, q)}
     hc_tech = sorted(set(w for w, g in gaps.items() if any(c in ("technical", "pending") for _, c, _ in g))
                      | {w for w in complete if fit[w][0] != "ok"})
     m = len(deltas)
@@ -661,6 +696,7 @@ def eligibility(eco, registry, hc_slopes, registry_sha256=None, mask=None, eco_s
     a = {b: {"A": weights[b][0], "B": weights[b][1]} for b in sorted(weights)}
     norm = {G: {b: a[b][G] / sum(x[G] for x in a.values()) for b in a} for G in ("A", "B")} if a else {}
     hyp["H-C"] = {"population": "usable blocks", "worlds": sorted(eligible), "available": r is None, "reason": r,
+                  "binding": None if mask is None else observation_provenance(mask, mask_sha256, sorted(eligible)),
                   "usable_blocks": sorted(deltas),
                   "unusable_blocks": {str(b): v for b, v in sorted(unusable.items())}, "n_blocks": m,
                   "p_floor": (2.0 ** -m) if m else None, "counts": {str(b): c for b, c in sorted(counts.items())},
@@ -683,12 +719,27 @@ def eligibility(eco, registry, hc_slopes, registry_sha256=None, mask=None, eco_s
     return rec, deltas, weights
 
 
-def require_population(elig, hyp, worlds):
-    """The analysis-side binding (Codex #68 D6 P2-2): an analysis of `hyp` runs only when the dispatcher made it
-    available, on EXACTLY its population (Q200 for H-P / H-Q / H-F / H-T, the eligible worlds for H-C): its
-    observations are then the bound mask's available ones (an available hypothesis has no technical gap in any of
-    its worlds, at any graph time). StatsError otherwise. backbone.directional_test, recurrence.hf and
-    transition.ht call it when given the eligibility record."""
+def record_sha256(elig):
+    """The eligibility record's identity: the sha256 of its canonical JSON (the same after a file round trip)."""
+    return rqlib.canonical_sha(elig)
+
+
+def result_binding(elig, hyp):
+    """The binding an analysis result of hyp must carry to enter decide: the record's identity, the hypothesis and
+    its population's provenance (the graph, the mask, the snapshot identities; None without a bound mask)."""
+    return {"eligibility_sha256": record_sha256(elig), "hypothesis": hyp,
+            "provenance": ((elig.get("hypotheses") or {}).get(hyp) or {}).get("binding")}
+
+
+def require_population(elig, hyp, worlds, provenance=None):
+    """The analysis-side binding (Codex #68 D6 P2-2; r2): an analysis of `hyp` runs only when the dispatcher made it
+    available, on EXACTLY its population (Q200 for H-P / H-Q / H-F / H-T, the eligible worlds for H-C), from
+    observations whose PROVENANCE (observation_provenance: the graph, the mask, the population's snapshot
+    identities) is the record's binding of hyp: observations of another graph, mask or snapshots with the same world
+    ids are refused. An available hypothesis has no technical gap in any of its worlds at any graph time, so its
+    observations are the bound mask's available ones. -> the result binding (result_binding) the analysis stamps on
+    its result; StatsError otherwise. backbone.directional_test, recurrence.hf and transition.ht call it when given
+    the eligibility record; decide refuses a result without it."""
     if elig.get("schema") != ELIGIBILITY_SCHEMA:
         raise StatsError("not an eligibility record (stats.eligibility)")
     e = (elig.get("hypotheses") or {}).get(hyp)
@@ -697,6 +748,10 @@ def require_population(elig, hyp, worlds):
     if sorted(worlds) != sorted(e.get("worlds") or []):
         raise StatsError(f"{hyp}: the analysis's worlds are not its registered population ({len(worlds)} vs "
                          f"{len(e.get('worlds') or [])})")
+    if provenance != e.get("binding"):
+        raise StatsError(f"{hyp}: the observations' provenance is not the record's bound graph / mask / snapshot "
+                         "identities (observation_provenance)")
+    return result_binding(elig, hyp)
 
 
 def family_p(h, r):
@@ -704,7 +759,8 @@ def family_p(h, r):
     the result must be available; H-P / H-Q: the cluster test's p (stats.cluster_test via backbone); H-F: hf_decision's
     calibrated result (c_F and p_F present), its p the model p-value p_F only when S_F exceeds the development
     critical value c_F (else 1: the critical-value requirement is preserved); H-T: transition.ht's result with its
-    frozen critical value c_T (calibrated, at least the guard) and p_model, its p p_model only when T_T exceeds c_T."""
+    frozen critical value c_T (calibrated, AT LEAST the registered guard HT_GUARD = log 600: a smaller c_T is refused,
+    Codex #68 D6 r2 P2-4) and p_model, its p p_model only when T_T exceeds c_T."""
     def num(x):
         return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
     if not isinstance(r, dict):
@@ -721,13 +777,17 @@ def family_p(h, r):
     if h == "H-T":
         if not (num(r.get("c_T")) and num(r.get("p_model")) and num(r.get("T_T"))):
             return None, "the H-T result carries no frozen critical value / model p-value (p = 1 in Holm)"
+        if r["c_T"] < HT_GUARD:
+            return None, f"the H-T critical value {r['c_T']:g} is below the registered guard log 600 (p = 1 in Holm)"
         return (float(r["p_model"]) if r["T_T"] > r["c_T"] else 1.0), None
     return None, f"unknown hypothesis {h}"
 
 
 def decide(elig, results, deltas, weights, alpha=FAMILY_ALPHA):
     """The five-row confirmatory decision from the dispatcher's record (D6 rule 33): results {h: the analysis's own
-    result + "worlds"} for H-P / H-Q / H-F / H-T enter ONLY when the dispatcher made h available, the result is
+    result + "worlds" + "binding"} for H-P / H-Q / H-F / H-T enter ONLY when the dispatcher made h available, the
+    result is BOUND to this record (its "binding" is result_binding: computed through require_population from
+    observations of the bound graph / mask / snapshots; an unbound result is refused, Codex #68 D6 r2 P2-2), it is
     available with its calibration (family_p: H-F's critical value, H-T's frozen critical value and guard) and h
     was computed on exactly the common Q200 population (StatsError otherwise: a decision on another population is
     never accepted); every unavailable row keeps its row and enters Holm as p = 1 (holm); H-C's p is the
@@ -742,6 +802,9 @@ def decide(elig, results, deltas, weights, alpha=FAMILY_ALPHA):
         if isinstance(r, dict) and r.get("available") is True and sorted(r.get("worlds") or []) != elig["Q200"]["worlds"]:
             raise StatsError(f"{h} was computed on another population than the common Q200 ({len(r.get('worlds') or [])} "
                              f"worlds, Q200 has {elig['Q200']['count']})")
+        if isinstance(r, dict) and r.get("available") is True and r.get("binding") != result_binding(elig, h):
+            raise StatsError(f"{h}'s result is not bound to this eligibility record (computed without it, or from "
+                             "another graph / mask / snapshot identities): require_population")
         pv[h], why_h = family_p(h, r)
         if why_h:
             why[h] = why_h

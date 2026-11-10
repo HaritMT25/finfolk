@@ -720,15 +720,20 @@ def select(world):
     return bP, best, int(bP is not None)
 
 
-def hf(worlds, eligibility=None):
+def hf(worlds, eligibility=None, provenance=None):
     """S_F and the material quantities over all n qualifying worlds' analyses (analyze_world). eligibility
-    (stats.eligibility's record; Annex H D6 rules 26-27): H-F runs only when available, on exactly the common Q200
-    (stats.require_population; StatsError otherwise)."""
+    (stats.eligibility's record; Annex H D6 rules 26-27; REQUIRED for a result that enters stats.decide): H-F runs
+    only when available, on exactly the common Q200, from analyses whose provenance (stats.observation_provenance)
+    is the record's binding (stats.require_population; StatsError otherwise); the result then carries its binding,
+    which hf_decision keeps (Codex #68 D6 r2 P2-2)."""
+    b = None
     if eligibility is not None:
         import stats
-        stats.require_population(eligibility, "H-F", [w["id"] for w in worlds])
+        b = stats.require_population(eligibility, "H-F", [w["id"] for w in worlds], provenance)
     n = len(worlds)
     out = {"n": n, "worlds": {}, "available": True, "reasons": []}
+    if b is not None:
+        out["binding"] = b
     if n == 0:
         return dict(out, available=False, reasons=["no qualifying worlds"])
     S, EC, EQ, pos = 0.0, 0.0, 0.0, 0
@@ -763,18 +768,21 @@ def hf(worlds, eligibility=None):
 
 def hf_decision(res, c_F, p_F=None, c_M=None, p_M=None, alpha=0.01):
     """H.3.7's three results from a hf() result and its calibration (critical values from the
-    development panels, model p-values from the validation tables; None: not calibrated yet)."""
+    development panels, model p-values from the validation tables; None: not calibrated yet). The hf() result's
+    worlds and binding (when bound to an eligibility record) are kept: stats.decide needs them."""
+    keep = {"worlds": sorted(res.get("worlds") or {}), **({"binding": res["binding"]} if "binding" in res else {})}
     if not res["available"]:
-        return {"available": False, "reasons": res["reasons"]}
+        return {"available": False, "reasons": res["reasons"], **keep}
     if c_F is None:                      # (#68 round 4 P3: an unavailable calibration never enters a comparison)
-        return {"available": False, "reasons": ["the H-F calibration is unavailable (a capped mode): p = 1 in Holm"]}
+        return {"available": False, "reasons": ["the H-F calibration is unavailable (a capped mode): p = 1 in Holm"],
+                **keep}
     det = res["S_F"] > c_F and (p_F is not None and p_F <= alpha)
     op = det and res["material_point"]
     ex = (op and c_M is not None and res["M_F"] > c_M and p_M is not None and p_M <= alpha
           and res["R_C"] > D_C and res["R_Q"] > D_Q)
     return {"available": True, "detection": det, "operational": op, "exceeds_material": ex,
             "S_F": res["S_F"], "c_F": c_F, "p_F": p_F, "M_F": res["M_F"], "c_M": c_M, "p_M": p_M,
-            "R_C": res["R_C"], "R_Q": res["R_Q"]}
+            "R_C": res["R_C"], "R_Q": res["R_Q"], **keep}
 
 
 def responses_capture(C, B):

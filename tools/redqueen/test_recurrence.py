@@ -124,8 +124,9 @@ class TestRecurrence(unittest.TestCase):
 
     # ------------------------------------------------------------ H.14 14-17
     def test_hf_binds_the_population(self):
-        """Codex #68 D6 P2-2: given the eligibility record (stats.eligibility) H-F runs only when it is available, on
-        exactly its registered population (the common Q200); otherwise StatsError, before any analysis."""
+        """Codex #68 D6 P2-2 (r2): given the eligibility record (stats.eligibility) H-F runs only when it is available,
+        on exactly its registered population (the common Q200), from analyses of the bound graph / mask / snapshots
+        (their provenance); otherwise StatsError, before any analysis; the result carries its binding."""
         import stats
         ws = [dict(self.rc.analyze_world(self.wd, self.data(k=i)), id=f"w{i}") for i in range(3)]
         ids = [w["id"] for w in ws]
@@ -138,6 +139,18 @@ class TestRecurrence(unittest.TestCase):
                "hypotheses": {"H-F": {"available": False, "reason": "|Q200| = 20 < 24", "worlds": ids}}}
         with self.assertRaisesRegex(stats.StatsError, "is unavailable"):
             self.rc.hf(ws, eligibility=off)
+        # (Codex #68 D6 r2 P2-2: the analyses' provenance must be the record's binding; hf_decision keeps it)
+        prov = {"graph_edges_sha256": "g" * 64, "mask_sha256": "m" * 64, "snapshots_sha256": "s" * 64}
+        bound = {"schema": stats.ELIGIBILITY_SCHEMA, "hypotheses": {"H-F": {"available": True, "worlds": ids,
+                                                                            "binding": prov}}}
+        r = self.rc.hf(ws, eligibility=bound, provenance=dict(prov))
+        self.assertEqual(r["binding"], stats.result_binding(bound, "H-F"))
+        d = self.rc.hf_decision(r, c_F=0.0, p_F=0.001)
+        self.assertEqual((d["worlds"], d["binding"]), (ids, r["binding"]))
+        self.assertEqual(self.rc.hf_decision(r, c_F=None)["binding"], r["binding"])
+        with self.assertRaisesRegex(stats.StatsError, "provenance"):
+            self.rc.hf(ws, eligibility=bound, provenance=dict(prov, mask_sha256="n" * 64))
+        self.assertNotIn("binding", self.rc.hf_decision(a, c_F=0.0, p_F=0.001))
 
     def hfw(self, datas):
         return self.rc.hf([dict(self.rc.analyze_world(self.wd, d), id=f"w{i}") for i, d in enumerate(datas)])

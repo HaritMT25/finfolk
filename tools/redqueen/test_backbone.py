@@ -172,6 +172,17 @@ class TestBackbone(unittest.TestCase):
             self.bb.directional_test(slopes, "H-Q", self.st.DELTA_Q, draws=999, eligibility=elig)
         with self.assertRaisesRegex(self.st.StatsError, "not an eligibility record"):
             self.bb.directional_test(slopes, "H-P", self.st.DELTA_P, draws=999, eligibility={"hypotheses": {}})
+        # (Codex #68 D6 r2 P2-2: the slopes' provenance must be the record's binding; the result carries it)
+        prov = {"graph_edges_sha256": "g" * 64, "mask_sha256": "m" * 64, "snapshots_sha256": "s" * 64}
+        bound = {"schema": self.st.ELIGIBILITY_SCHEMA,
+                 "hypotheses": {"H-P": {"available": True, "worlds": ids, "binding": prov}}}
+        rp = self.bb.directional_test(slopes, "H-P", self.st.DELTA_P, draws=999, eligibility=bound, provenance=dict(prov))
+        self.assertEqual((rp["worlds"], rp["binding"]), (ids, self.st.result_binding(bound, "H-P")))
+        self.assertEqual(rp["binding"]["provenance"], prov)
+        for bad in (None, dict(prov, graph_edges_sha256="h" * 64), dict(prov, snapshots_sha256="t" * 64)):
+            with self.assertRaisesRegex(self.st.StatsError, "provenance"):         # (another graph / snapshots)
+                self.bb.directional_test(slopes, "H-P", self.st.DELTA_P, draws=999, eligibility=bound, provenance=bad)
+        self.assertNotIn("binding", r)                                    # (unbound: never enters stats.decide)
 
 
 if __name__ == "__main__":

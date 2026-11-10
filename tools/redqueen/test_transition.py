@@ -193,6 +193,16 @@ class TestTransition(unittest.TestCase):
             tr.ht(*inputs(ids), c_T=None, report=False, eligibility=off)
         r = tr.ht(*inputs(ids), c_T=None, report=False, eligibility=elig)   # (bound: the analysis proceeds,
         self.assertEqual((r["failure"], r["worlds"]), ("domain", ids))          # here to its domain check)
+        self.assertEqual(r["binding"], st.result_binding(elig, "H-T"))          # (every result carries its binding)
+        prov = {"graph_edges_sha256": "g" * 64, "mask_sha256": "m" * 64, "snapshots_sha256": "s" * 64}
+        bound = {"schema": st.ELIGIBILITY_SCHEMA, "hypotheses": {"H-T": {"available": True, "worlds": ids,
+                                                                         "binding": prov}}}
+        with self.assertRaisesRegex(st.StatsError, "provenance"):              # (Codex #68 D6 r2 P2-2)
+            tr.ht(*inputs(ids), c_T=None, report=False, eligibility=bound)
+        r = tr.ht(*inputs(ids), c_T=None, report=False, eligibility=bound, provenance=dict(prov))
+        self.assertEqual(r["binding"]["provenance"], prov)
+        self.assertNotIn("binding", tr.ht(*inputs(ids), c_T=None, report=False))
+        self.assertEqual(tr.GUARD, st.HT_GUARD)                                 # (the guard family_p enforces)
 
     def test_guard_and_decision(self):
         tr = self.tr
