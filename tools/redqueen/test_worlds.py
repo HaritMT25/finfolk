@@ -1563,6 +1563,9 @@ class TestBurnIn(unittest.TestCase):
         self.assertNotEqual(b["attempt_uuid"], b["uuid"])
         self.assertEqual((b["burn_in"]["decided"], b["burn_in"]["disposition"], b["archived"], b["valid_before"]),
                          (False, "unresolved", [], None))
+        # (Codex #77 r3) the earlier attempt's OWN evidence: its early terminal, from its retained directory
+        self.assertEqual([(p["attempt"], p["source"], p["first_terminal"], p["burn_in"]) for p in b["prior_attempts"]],
+                         [(0, "retained", {"frame": 2500, "kind": "prey"}, "early_failure")])
 
 
 def tree_state(path):

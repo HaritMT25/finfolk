@@ -1180,7 +1180,7 @@ def design2(tmp, edges, **kw):
     return d
 
 
-BINDING = {"graph_edges_sha256": "g" * 64, "registry_sha256": "r" * 64, "max_restarts": 8}
+BINDING = {"graph_edges_sha256": "g" * 64, "registry_sha256": "r" * 64, "max_restarts": 8, "burn_in_frame": 0}
 
 
 def plan_mask(tmp, design, snaps, frames=(1, 2000)):
@@ -1200,14 +1200,16 @@ def plan_mask(tmp, design, snaps, frames=(1, 2000)):
         #  at valid_before, the frontier; Codex #77 r2 P1-2)
         ws[wn] = {"uuid": u, "attempt": 0, "attempt_uuid": plan.attempt_uuid(u, 0), "valid_before": vb,
                   "first_terminal": {"frame": vb, "kind": "prey"} if vb else None, "frontier": vb or max(frames),
-                  "refill": None, "burn_in": {"decided": True, "disposition": "established", "why": "alive at 5M"},
+                  "refill": None, "burn_in": {"decided": True, "disposition": "no_rule", "why": "no burn-in rule"},
+                  "prior_attempts": [],
                   "available_sha256": av}
     for k, (st, why, vb) in snaps.items():
         wn, f = k.split(":")[0], int(k.split(":")[1])
         S[k] = {"world": wn, "frame": f, "status": st, "why": why, "uuid": ws[wn]["uuid"], "attempt": 0,
                 "snapshot": plan.snapshot_uuid(ws[wn]["uuid"], f), "valid_before": vb}
     return {"schema": plan.MASK_SCHEMA, "graph": {"edges_sha256": b["graph_edges_sha256"]},
-            "registry": {"sha256": b["registry_sha256"], "max_restarts": b["max_restarts"]},
+            "registry": {"sha256": b["registry_sha256"], "max_restarts": b["max_restarts"],
+                         "burn_in_frame": b["burn_in_frame"]},
             "block": {"sha256": "b" * 64, "registry_sha256": b["registry_sha256"]}, "worlds": ws, "snapshots": S}
 
 
@@ -1588,6 +1590,12 @@ class TestPlanV2(unittest.TestCase):
         self.assertIn("first terminal", refused(dict(mask, worlds=dict(W, B=dict(W["B"], valid_before=None))), why="bio"))
         self.assertIn("first terminal", refused(dict(mask, worlds=dict(W, B=dict(W["B"], first_terminal=None))), why="ft"))
         self.assertIn("frontier", refused(dict(mask, worlds=dict(W, B=dict(W["B"], frontier=1000))), why="frontier"))
+        # (Codex #77 r3 P1-2) a disposition the registered burn-in rule does not support: a mask claiming a 5M rule
+        # (the design registers none), or an "exhausted" attempt 0 with every restart left
+        self.assertIn("burn-in frame", refused(dict(mask, registry=dict(mask["registry"], burn_in_frame=5_000_000)),
+                                               why="burn-in"))
+        exh = dict(W["B"], burn_in={"decided": True, "disposition": "exhausted", "why": "restarts used up"})
+        self.assertIn("not supported", refused(dict(mask, worlds=dict(W, B=exh)), why="exhausted"))
         unsettled = dict(W["B"], burn_in={"decided": False, "disposition": "restart_pending", "why": "a restart is due"})
         self.assertIn("unsettled attempt", refused(dict(mask, worlds=dict(W, B=unsettled)), why="unsettled"))
         self.assertIn("self-consistent burn-in", refused(dict(mask, worlds=dict(W, B=dict(W["B"], burn_in=None))), why="bi"))

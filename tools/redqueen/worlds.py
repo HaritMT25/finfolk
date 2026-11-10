@@ -3747,6 +3747,12 @@ def design_block(root, reg, archive_root):
         arch, aprob = archive_evidence(root, wid, k, d, seq) if seq else ({}, f"attempt {k} is recorded but not installed")
         decided, why, disp = disposition(o, k, maxr, bi)
         first = o["first_terminal"] if o else None
+        prior = []                                     # (Codex #77 r3: each earlier attempt's OWN evidence)
+        for j in sorted(x for x in idx if x < k):
+            dj, srcj = idx[j]
+            oj = attempt_outcome(attempt_sequence(root, wid, dj, w, j, ledger, L), w, total_steps(w, s), bi) if dj else None
+            prior.append({"attempt": j, "source": srcj, "first_terminal": oj["first_terminal"] if oj else None,
+                          "burn_in": oj["burn_in"] if oj else None})
         zeros = {g: z["frame"] for g, z in (o["events"] if o else {}).items() if isinstance(z, dict)}
         ad = adir(archive_root, wid)
         ws[wid] = {"uuid": w["uuid"], "attempt_uuid": attempt_uuid(w["uuid"], k), "treatment": w["treatment"],
@@ -3754,7 +3760,7 @@ def design_block(root, reg, archive_root):
                    "attempt_marker": marker, "attempt_json_sha256": msha,
                    "pattern": os.path.join(ad, "end.{frame}.json"), "paths": {"F1": os.path.join(ad, "F1.json")},
                    "valid_before": first["frame"] if first else None, "first_zeros": dict(sorted(zeros.items())),
-                   "burn_in": {"decided": decided, "why": why, "disposition": disp},
+                   "burn_in": {"decided": decided, "why": why, "disposition": disp}, "prior_attempts": prior,
                    "archived": [f for f, e in arch.items() if e["status"] == "verified"],
                    "archive": {str(f): e for f, e in arch.items()}, "archive_problem": aprob,
                    "evidence": {"frontier": o["frontier"] if o else base_frame(w),
