@@ -335,45 +335,79 @@ class TestGenerator(unittest.TestCase):
         self.assertAlmostEqual(hi, 0.825, places=12)
 
     def test_eligible_graph(self):
-        """Annex H D6 §§9.1-9.4 (#68 eligibility): H-F / H-T calibrate on the ACTUAL qualifying C graph: the graph
-        restricted to the common Q200 of stats.eligibility's record; below 24 refused (no smaller-n substitute); a
-        Q200 world without its complete fixed panels refused; the source binds both files; the stress24 stratum
-        comes from it; a production calibration needs that binding."""
+        """Annex H D6 §§9.1-9.4 (#68 eligibility; Codex #68 D6 P2-3 / P3): H-F / H-T calibrate on the ACTUAL
+        qualifying C graph: the graph restricted to the hypothesis's population under stats.eligibility's record,
+        only when the DISPATCHER made that hypothesis available (its own flag: a pending repair refuses even with
+        |Q200| >= 24; below 24 refused, no smaller-n substitute), only on the graph the record's bound mask names
+        (its graph.edges_sha256), and only when every population world carries its REQUIRED panels (the coarse
+        41 x 41 within grid; four RQ and four RP series at every graph time 0..200M); the source binds both files;
+        the stress24 stratum comes from it; a production calibration needs that binding, and production panel
+        generation refuses a missing --eligibility before any panel."""
         import gzip
+        import hashlib
+        import io
         import shutil
         import tempfile
+        from contextlib import redirect_stderr
         import stats
         cb = self.cb
         tmp = tempfile.mkdtemp()
         try:
             gp = os.path.join(tmp, "graph.jsonl.gz")
-            ws = [f"C{k:02d}" for k in range(30)]
+            ws = [f"C{k:02d}" for k in range(27)]
+            coarse, times = range(0, 201, 5), range(201)
             lines = []
-            for w in ws:
-                lines.append({"prey": f"Q:{w}:10", "pred": f"P:{w}:20"})
-                if w != "C29":                                   # (C29: no predator-reference panel)
-                    lines += [{"prey": f"RQ:{r}", "pred": f"P:{w}:{t}"} for r, t in zip(range(4), (10, 20, 30, 40))]
-                lines += [{"prey": f"Q:{w}:{t}", "pred": f"RP:{r}"} for r, t in zip(range(4), (10, 20, 30, 40))]
+            for w in ws:                                         # (graph.py's design: integer graph times)
+                lines += [{"prey": f"Q:{w}:{a}", "pred": f"P:{w}:{b}"} for a in coarse for b in coarse
+                          if not (w == "C26" and (a, b) == (0, 200))]          # (C26: a coarse pair missing)
+                if w != "C24":                                   # (C24: no predator-reference panel)
+                    lines += [{"prey": f"RQ:{r}", "pred": f"P:{w}:{t}"} for r in range(4) for t in times]
+                lines += [{"prey": f"Q:{w}:{t}", "pred": f"RP:{r}"} for r in range(4, 8) for t in times
+                          if not (w == "C25" and (r, t) == (5, 137))]           # (C25: one RP time missing)
+            text = "".join(json.dumps(e) + "\n" for e in lines)
             with gzip.open(gp, "wt") as f:
-                f.write("".join(json.dumps(e) + "\n" for e in lines))
+                f.write(text)
+            edges = hashlib.sha256(text.encode()).hexdigest()
 
-            def elig(q, avail=True):
-                p = os.path.join(tmp, f"e{len(q)}{int(avail)}.json")
+            def elig(q, avail=True, reason=None, hyp="H-F", mask=edges):
+                p = os.path.join(tmp, f"e{len(q)}{int(avail)}{hyp}{len(os.listdir(tmp))}.json")
+                h = {"population": "Q200", "worlds": q, "available": avail, "reason": reason}
                 with open(p, "w") as f:
                     json.dump({"schema": stats.ELIGIBILITY_SCHEMA, "Q200": {"worlds": q, "count": len(q),
-                                                                            "available": avail}}, f)
+                                                                            "available": len(q) >= 24},
+                               "mask": None if mask is None else {"sha256": "m" * 64, "graph_edges_sha256": mask},
+                               "hypotheses": {hyp: h}}, f)
                 return p
-            g, src = cb.eligible_graph(gp, elig(ws[:24]))
+            g, src = cb.eligible_graph(gp, elig(ws[:24]), "H-F")
             self.assertEqual([x.id for x in g], ws[:24])
+            self.assertEqual(cb.panel_problems(g[0]), [])
             self.assertTrue(src.startswith("file:") and "+eligibility:" in src)
             self.assertEqual(len(cb.stratum_worlds(g, "stress24")), 24)
-            with self.assertRaisesRegex(cb.CalibError, "23 < 24"):
-                cb.eligible_graph(gp, elig(ws[:23], False))
-            with self.assertRaisesRegex(cb.CalibError, "without their complete fixed panels"):
-                cb.eligible_graph(gp, elig(ws[5:30]))
+            self.assertEqual(len(cb.eligible_graph(gp, elig(ws[:24], hyp="H-T"), "H-T")[0]), 24)
+            with self.assertRaisesRegex(cb.CalibError, "H-F is unavailable.*23 < 24"):
+                cb.eligible_graph(gp, elig(ws[:23], False, "|Q200| = 23 < 24"), "H-F")
+            with self.assertRaisesRegex(cb.CalibError, "H-F is unavailable.*pending repair"):
+                cb.eligible_graph(gp, elig(ws[:24], False, "technical gaps: pending repair"), "H-F")   # (|Q200| 24)
+            with self.assertRaisesRegex(cb.CalibError, "H-T is unavailable"):
+                cb.eligible_graph(gp, elig(ws[:24]), "H-T")                    # (the record has no H-T entry)
+            for m in ("0" * 64, None):
+                with self.assertRaisesRegex(cb.CalibError, "bound mask is not this graph's"):
+                    cb.eligible_graph(gp, elig(ws[:24], mask=m), "H-F")
+            for w, why in (("C24", "without their complete fixed panels"), ("C25", "RP:5 misses 1 graph time"),
+                           ("C26", "coarse 41 x 41")):
+                with self.assertRaisesRegex(cb.CalibError, why):
+                    cb.eligible_graph(gp, elig(ws[:23] + [w]), "H-F")
             probs = []
             cb._manifest([{"manifest": dict(self.man_fixture(), graph_source="file:x")}], True, probs)
             self.assertTrue(probs and "restricted to the common Q200" in probs[0])
+            out = os.path.join(tmp, "panels.jsonl")
+            err = io.StringIO()
+            with redirect_stderr(err):                           # (P3: refused before the graph, any panel)
+                rc = cb.main(["panels", "--hyp", "H-F", "--graph", gp, "--stage", "dev", "--mode", "F0",
+                              "--stratum", "actual", "--out", out])
+            self.assertEqual(rc, 2)
+            self.assertIn("production panels need --eligibility", err.getvalue())
+            self.assertFalse(os.path.exists(out))
         finally:
             shutil.rmtree(tmp)
 

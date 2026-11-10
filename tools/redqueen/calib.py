@@ -338,7 +338,8 @@ class WorldGraph:
         self.prey = np.array(sorted(set(self.ti.tolist()) | set(self.qT.tolist())))
         self.pred = np.array(sorted(set(self.tj.tolist()) | set(self.cT.tolist())))
         self.times = np.array(sorted(set(self.prey.tolist()) | set(self.pred.tolist())))
-        self.coarse = all((a, b) in set(w) for a in COARSE for b in COARSE)
+        ws = set(w)
+        self.coarse = all((a, b) in ws for a in COARSE for b in COARSE)
 
 
 def synthetic_graph(n=32, centres=(30.0, 100.0, 170.0), offsets=(1.0, 2.0, 4.0)):
@@ -2924,33 +2925,67 @@ def read_records(paths):
     return out
 
 
-def eligible_graph(path, elig_path):
-    """The ACTUAL QUALIFYING C graph (Annex H D6 §§9.1-9.4; stats.eligibility's record): the graph's worlds restricted
-    to the common Q200 population, each with its complete fixed reference panels; refused below |Q200| = 24 (no
-    smaller-n confirmatory calibration is substituted), or when a Q200 world lacks its panels in the graph ->
-    (graph, its source: the graph file's and the eligibility record's sha256). The stress24 stratum is drawn from
-    it (stratum_worlds)."""
+GRAPH_TIMES = tuple(range(201))          # (graph.TIMES: every graph time, 0..200M)
+
+
+def panel_problems(g):
+    """The REQUIRED panel coverage of one qualifying world (Codex #68 D6 P2-3; graph.py's design): the complete
+    coarse 41 x 41 within-world grid, and its four predator-reference (RQ) and four prey-reference (RP) series,
+    each at EVERY graph time (graph.TIMES, 0..200M) -> [problem]."""
+    probs = [] if g.coarse else ["its coarse 41 x 41 within-world grid is incomplete"]
+    full = {1e-6 if t == 0 else float(t) for t in GRAPH_TIMES}
+    for what, T, R in (("predator-reference (RQ)", g.cT, g.cR), ("prey-reference (RP)", g.qT, g.qR)):
+        refs = sorted(set(R.tolist()), key=str)
+        if len(refs) != 4:
+            probs.append(f"{len(refs)} {what} series, not 4")
+        for r in refs:
+            miss = full - {float(t) for t, x in zip(T.tolist(), R.tolist()) if x == r}
+            if miss:
+                probs.append(f"its {what} series {r} misses {len(miss)} graph time(s) (e.g. {min(miss):g}M)")
+    return probs
+
+
+def eligible_graph(path, elig_path, hyp):
+    """The ACTUAL QUALIFYING C graph (Annex H D6 §§9.1-9.4; stats.eligibility's record) for hyp (H-F or H-T): the
+    dispatcher must have made hyp AVAILABLE (its own flag: |Q200| >= 24 AND no technical gap pending repair; never
+    a smaller-n substitute), the record's bound mask must be THIS graph's (graphmask/2 graph.edges_sha256 against
+    the graph's edges), and every world of hyp's population (the common Q200) must carry its REQUIRED panels in the
+    graph (panel_problems) -> (the graph restricted to that population, its source: the graph file's and the
+    eligibility record's sha256). The stress24 stratum is drawn from it (stratum_worlds). Codex #68 D6 P2-3."""
     with open(elig_path, "rb") as f:
         raw = f.read()
     rec = json.loads(raw.decode("utf-8"))
     if rec.get("schema") != stats.ELIGIBILITY_SCHEMA:
         raise CalibError(f"{elig_path}: not an eligibility record ({stats.ELIGIBILITY_SCHEMA})")
-    q = (rec.get("Q200") or {}).get("worlds") or []
-    if not (rec.get("Q200") or {}).get("available") or len(q) < stats.MIN_Q200:
-        raise CalibError(f"|Q200| = {len(q)} < {stats.MIN_Q200}: H-F / H-T are unavailable; no smaller-n confirmatory "
-                         "calibration is substituted (Annex H D6 §§9.1-9.4)")
+    h = (rec.get("hypotheses") or {}).get(hyp) or {}
+    if h.get("available") is not True:
+        raise CalibError(f"{hyp} is unavailable under the eligibility record ({h.get('reason') or 'no entry'}): no "
+                         "calibration (no smaller-n confirmatory calibration is substituted; Annex H D6 §§9.1-9.4)")
+    q = h.get("worlds") or []
+    if h.get("population") != "Q200" or q != (rec.get("Q200") or {}).get("worlds") or len(q) < stats.MIN_Q200:
+        raise CalibError(f"{hyp}'s population is not the common Q200 of at least {stats.MIN_Q200} worlds")
+    with open(path, "rb") as f:
+        graw = f.read()
+    gsha, esha = hashlib.sha256(graw).hexdigest(), hashlib.sha256(gzip.decompress(graw)).hexdigest()
+    m = rec.get("mask") or {}
+    if m.get("graph_edges_sha256") != esha:
+        raise CalibError("the eligibility record's bound mask is not this graph's (its graph.edges_sha256 "
+                         f"{str(m.get('graph_edges_sha256'))[:16]}, the graph's edges {esha[:16]})")
     g = load_graph(path, q)
     miss = sorted(set(q) - {x.id for x in g})
     if miss:
         raise CalibError(f"{len(miss)} Q200 world(s) without their complete fixed panels in the graph: {miss[:5]}")
-    with open(path, "rb") as f:
-        gsha = hashlib.sha256(f.read()).hexdigest()
+    bad = {x.id: p for x in g for p in [panel_problems(x)] if p}
+    if bad:
+        w = sorted(bad)
+        raise CalibError(f"{len(w)} Q200 world(s) without their complete fixed panels in the graph: "
+                         + "; ".join(f"{x}: {bad[x][0]}" for x in w[:3]))
     return g, f"file:{gsha}+eligibility:{hashlib.sha256(raw).hexdigest()}"
 
 
 def get_graph(a):
     if a.graph and getattr(a, "eligibility", None):
-        return eligible_graph(a.graph, a.eligibility)
+        return eligible_graph(a.graph, a.eligibility, a.hyp)
     if getattr(a, "eligibility", None):
         raise CalibError("--eligibility needs --graph (the qualifying worlds' assay graph)")
     if a.graph:
@@ -3034,6 +3069,9 @@ def main(argv=None):
             print(json.dumps({"identity": tables_identity(), "cells": span, "cpu_s": round(time.process_time() - c0, 1)}))
             return 0
         if a.cmd in ("panels", "bench"):
+            if a.cmd == "panels" and not a.smoke and not a.eligibility:     # (Codex #68 D6 P3: before any panel)
+                raise CalibError("production panels need --eligibility (stats.eligibility's record: the graph "
+                                 "restricted to the common Q200; --smoke for a test run)")
             graph, src = get_graph(a)
             params = get_params(a)
             production = a.cmd == "panels" and not a.smoke
