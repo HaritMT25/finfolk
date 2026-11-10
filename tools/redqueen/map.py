@@ -849,7 +849,13 @@ def count_lpd(cnt, N, loc, var):
     1/2), Y ~ N(loc, var), so P(K = k) = P(logit((k - 1/2)/N) < Y < logit((k + 1/2)/N)), the end intervals
     open at k = 0 and k = N. It is normalized over k = 0..N and assumes no independent Bernoulli capture
     opportunities. cnt: pairs x replicates; loc, var: one per pair -> the mean log probability per replicate
-    observation, per pair (noisebank's tail-stable interval probabilities)."""
+    observation, per pair (noisebank's tail-stable interval probabilities). The location is the map's
+    predicted mean EMPIRICAL logit (what both heads are fitted to): an interior count's empirical logit lies
+    in its latent interval, so the latent mean and the mean empirical logit agree up to the rounding (H.9.2's
+    exact location solve, matching the expected rounded fraction, is not applied). On narrow interior
+    intervals the density is the Gaussian density times the interval width, which is the same for every
+    candidate model, so a score DIFFERENCE departs from the Gaussian working score's only where intervals are
+    wide: low and high counts and the open ends at 0 and N."""
     import noisebank as nb
     cnt = np.asarray(cnt)
     if cnt.ndim != 2 or (cnt < 0).any() or (cnt > N).any():
