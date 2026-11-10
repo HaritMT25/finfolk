@@ -108,7 +108,9 @@ Design /2 (design v3 §3.5, §4, §4.6, §7.1):
 }                                            # (the registered binding --exclusions verifies)
 An EDGE (one line): {"edge": "e000001", "family": "within", "role": "training" | "validation" |
 "test" | "support" | "audit" | "diagnostic", "prey": {"world", "time"}, "predators": {"world",
-"time"} | {"source": "random"} | null (the predator-free continuation), and optionally "assay",
+"time"} | {"source": "random"} | {"source": "scripted"} (K fresh scripted Stage A hunters: the H-C
+scripted benchmark; the engine's --predators-from scripted) | null (the predator-free continuation),
+and optionally "assay",
 "k", "prey_policy", "horizon": "short" | "long" (absent: the pre-randomized long subset decides),
 "namespace": "main" | "audit" | ... (an independently seeded re-measurement; an audit edge, its
 controls included, defaults to "audit" and may not use "main"), "support_exception": true (a
@@ -845,15 +847,23 @@ def expand_v2(design, pending=False, exclusions=None, excluded_out=None):
         p = e.get("predators")
         if p is None:
             kind, preds, K, ptag = "nopred", None, 0, "none"
-        elif isinstance(p, dict) and p.get("source") == "random":
-            K = e.get("k", s["k"])
-            kind, preds, ptag = "assay", {"source": "random"}, "random"
+        elif isinstance(p, dict) and "source" in p:
+            # (Codex #74 r1 P2-3) a source endpoint is EXACTLY one permitted dict: never mixed with a world or
+            # time (it would fall through to a neural donor and lose its source), never an unknown source
+            if p not in ({"source": "random"}, {"source": "scripted"}):
+                raise DesignError(f"edge {n}: a predator source is exactly {{source: random}} or {{source: scripted}}, "
+                                  f"never mixed with other keys or another source (got {p})")
+            if p["source"] == "scripted" and assay == "live":
+                raise DesignError(f"edge {n}: scripted hunters are fixed Stage A predators: assay frozen or "
+                                  "frozen-newborn, never live (the engine refuses it)")
+            K = e.get("k", s["k"])                    # (scripted: K fresh Stage A hunters, the H-C benchmark)
+            kind, preds, ptag = "assay", {"source": p["source"]}, p["source"]
         elif isinstance(p, dict):
             K = e.get("k", s["k"])
             kind, preds = "assay", ref(p.get("world"), p.get("time"))
             ptag = f"{preds['world']}.{preds['time']}"
         else:
-            raise DesignError(f"edge {n}: predators must be {{world, time}}, {{source: random}} or null")
+            raise DesignError(f"edge {n}: predators must be {{world, time}}, {{source: random | scripted}} or null")
         if kind == "assay" and (not isinstance(K, int) or K < 1):
             raise DesignError(f"edge {n}: k must be >= 1")
         hz = e.get("horizon")
@@ -918,8 +928,8 @@ def expand_v2(design, pending=False, exclusions=None, excluded_out=None):
             pk = f"{c['space']}|{c['prey']['snapshot']}|r{r:02d}"
             if c["kind"] == "nopred":
                 qk = f"{pk}|none"
-            elif c["predators"].get("source") == "random":
-                qk = f"{c['space']}|random-k{c['k']}|r{r:02d}"
+            elif c["predators"].get("source") in ("random", "scripted"):
+                qk = f"{c['space']}|{c['predators']['source']}-k{c['k']}|r{r:02d}"
             else:
                 qk = f"{c['space']}|{c['predators']['snapshot']}|r{r:02d}"
             common = c["policy"] == "common"

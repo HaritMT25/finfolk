@@ -93,6 +93,17 @@
 # defaults do not: patterns only / shapes only, every inheritance knob at 0
 # and at its maximum, live knob changes, a long run.
 #
+# The M2a body-plan preview (OceanConfig::bodyPlanPreviewEnabled, OFF in every
+# case above, so their outputs are what they were before it existed) is
+# diagnostic, and proven so on every run: each case in BODY_TWINS runs again
+# with the preview on (natively AND in wasm; a third of them with every
+# physical inheritance knob at its maximum, a third at 0), and (1) the two
+# builds' outputs must be byte-identical, body sections included, and (2) the
+# native one minus its body* fields must be the case's own output, byte for
+# byte. BODY_TWINS=all twins every selected case. And the body-plan fixture
+# driver (tools/ocean_body_fixture.cpp) must print the same document natively
+# and in wasm, equal to the committed tests/fixtures/ocean_body_fixture.json.
+#
 # Bisecting a FAIL: the table names the first differing line (step and
 # sections; `chain` alone = the states differed at some step since the last
 # print and agree again). Re-run the case with --trace (every step) to find the
@@ -209,6 +220,10 @@ for v in $VARIANTS; do
         bgbuild tests_wasm$S   em++ $F $EMFLAGS tests/ocean_tests.cpp -o "$OUT/ocean_tests_wasm$S.js"
     fi
 done
+# the body-plan fixture driver (no world: small), native and wasm
+# shellcheck disable=SC2086
+bgbuild body_fixture_native g++ $CXXFLAGS ${NATIVE_CXXFLAGS:-} tools/ocean_body_fixture.cpp -o "$OUT/obf_native"
+bgbuild body_fixture_wasm   em++ $CXXFLAGS $EMFLAGS tools/ocean_body_fixture.cpp -o "$OUT/obf_wasm.js"
 wait
 BUILD_OK=1
 for l in "${EXPECT[@]}"; do   # a build that never wrote its rc (killed wrapper) fails the run
@@ -664,6 +679,25 @@ radd r_app_live_off '1 10 --set appearance=0@5'
 radd r_app_live_two '1 10 --set appearance=2@5'
 radd r_app_live_mut '1 10 --set patternMutation=0.3@5'
 radd r_app_live_nov '1 10 --set morphologyNovelProbability=0.26@5'
+# The body-plan preview: it needs the shapes bit; its switch strict and init
+# only; each physical knob in [0, 0.25]; and no hydrodynamics key yet (M2b).
+radd r_body_noshapes '1 10 --cfg {"bodyPlanPreviewEnabled":true,"appearance":1}'
+radd r_body_noapp   '1 10 --cfg {"bodyPlanPreviewEnabled":true,"appearance":0}'
+radd r_body_two     '1 10 --cfg {"bodyPlanPreviewEnabled":2}'
+radd r_body_str     '1 10 --cfg {"bodyPlanPreviewEnabled":"on"}'
+radd r_body_mut     '1 10 --cfg {"physicalMutation":0.26}'
+radd r_body_novel   '1 10 --cfg {"physicalNovelProbability":-0.01}'
+radd r_body_nan     '1 10 --cfg {"physicalMutation":1e39}'
+radd r_body_mut_str '1 10 --cfg {"physicalMutation":"bad"}'
+radd r_body_novel_bool '1 10 --cfg {"physicalNovelProbability":true}'
+radd r_body_mut_null '1 10 --cfg {"physicalMutation":null}'
+radd r_body_mut_dup '1 10 --cfg {"physicalMutation":0.1,"physicalMutation":"x"}'
+radd r_hydro        '1 10 --cfg {"hydrodynamicsEnabled":true}'
+radd r_hydro_one    '1 10 --cfg {"bodyPlanPreviewEnabled":true,"hydrodynamicsEnabled":1}'
+radd r_live_body_on '1 10 --set bodyPlanPreviewEnabled=1@5'
+radd r_live_body_off '1 10 --cfg {"bodyPlanPreviewEnabled":true} --set bodyPlanPreviewEnabled=0@5'
+radd r_live_body_mut '1 10 --cfg {"bodyPlanPreviewEnabled":true} --set physicalMutation=0.3@5'
+radd r_live_hydro   '1 10 --set hydrodynamicsEnabled=1@5'
 # Glass walls: never with toroidal (either order), the bool strict, the side
 # knobs in [0, 1e5] / [0, 1000], every walls key restart-only (oc_set_param
 # refuses it, on or off, the same value too), the world-size / grid checks too.
@@ -1007,6 +1041,73 @@ if [ ${#TWIN_IDX[@]} -gt 0 ]; then
     else
         echo "== appearance CHANGED THE SIMULATION in:$TWIN_BAD (diff <(sed -E 's/ app[A-Za-z]*=[^ ]*//g' X.native.txt) X.off.txt in $OUT)"; FAILED=1
     fi
+fi
+
+# ---- the body-plan preview is diagnostic: each twin with the preview on,
+# native and wasm, must be byte-identical across the builds, and the native
+# one minus its body* fields must be the case's own output (line 1, the
+# header, names the cfg and so differs). A third of the twins run every
+# physical knob at its maximum, a third at 0. ----
+DEFAULT_BODY_TWINS="def_s1 gate_s29 econ_s42 rich_s5 pred_age_s23 live_s21 capture_s17 big_toro_s9 long_s42 x_tri_body_s9 e1_preset_s42 e1_size_s9 e1_live_s21 life_live_s21 eye_def_s1 eye_e1_capture_s17 eye_only_exp_s3 eye_cloak_live_s21 walls_e1_s42 walls_econ_s42 app_max_mut_s8 app_live_s21"
+FAST_BODY_TWINS="def_s1 econ_s42 live_s21 e1_live_s21 eye_def_s1 walls_e1_s42 app_max_mut_s8"
+if [ -n "${BODY_TWINS:-}" ]; then BTWINS=$BODY_TWINS; elif [ -n "${FAST:-}" ]; then BTWINS=$FAST_BODY_TWINS; else BTWINS=$DEFAULT_BODY_TWINS; fi
+[ "$BTWINS" = all ] && BTWINS="${NAMES[*]}"
+body_strip () { sed -E '/^expect body/d; s/ body[A-Za-z]*=[^ ]*//g' "$1" | tail -n +2; }
+BODY_KNOBS=('' ',"physicalMutation":0.25,"physicalNovelProbability":0.25' ',"physicalMutation":0,"physicalNovelProbability":0')
+body_args () {  # body_args ARGS KNOBS -> the same with the preview on (and the knobs) in its cfg, expecting founders
+    local a=$1 add="\"bodyPlanPreviewEnabled\":true$2"
+    if [[ $a == *"--cfg {"* ]]; then a=$(printf '%s\n' "$a" | sed "s/--cfg {/--cfg {$add,/")
+    else a="$a --cfg {$add}"; fi
+    printf '%s --expect bodyFounders>0\n' "$a"
+}
+BTWIN_IDX=()
+for i in "${!NAMES[@]}"; do
+    [ -n "${ISSEL[$i]:-}" ] || continue
+    [[ ${ARGS[$i]} == *'"appearance":0'* || ${ARGS[$i]} == *'"appearance":1'* ]] && continue   # (the preview needs the shapes bit)
+    for t in $BTWINS; do [ "$t" = "${NAMES[$i]}" ] && BTWIN_IDX+=("$i") && break; done
+done
+body_one () {  # body_one INDEX KNOBS
+    local i=$1 name=${NAMES[$1]} s
+    s=$(sfx "$name")
+    local -a A
+    read -r -a A <<< "$(body_args "${ARGS[$i]}" "$2")"
+    ( "$OUT/opd_native$s" "${A[@]}" > "$OUT/$name.body.native.txt" 2> "$OUT/$name.body.native.log"; echo $? > "$OUT/$name.body.native.rc" ) &
+    ( $NODE "$OUT/opd_wasm$s.js" "${A[@]}" > "$OUT/$name.body.wasm.txt" 2> "$OUT/$name.body.wasm.log"; echo $? > "$OUT/$name.body.wasm.rc" ) &
+    wait
+}
+k=0
+for i in "${BTWIN_IDX[@]}"; do
+    while [ "$(jobs -rp | wc -l)" -ge "$JOBS" ]; do wait -n; done
+    body_one "$i" "${BODY_KNOBS[$((k % 3))]}" &
+    k=$((k + 1))
+done
+wait
+NBTWIN=0; BTWIN_BAD=""
+for i in "${BTWIN_IDX[@]}"; do
+    name=${NAMES[$i]}
+    rn=$(cat "$OUT/$name.body.native.rc" 2>/dev/null); rw=$(cat "$OUT/$name.body.wasm.rc" 2>/dev/null)
+    if [ "$rn" != "$(cat "$OUT/$name.native.rc" 2>/dev/null)" ] || [ "$rw" != "$rn" ]; then BTWIN_BAD="$BTWIN_BAD $name(exit $rn/$rw)"
+    elif ! cmp -s "$OUT/$name.body.native.txt" "$OUT/$name.body.wasm.txt"; then BTWIN_BAD="$BTWIN_BAD $name(native!=wasm)"
+    elif ! grep -q ' body=' "$OUT/$name.body.native.txt"; then BTWIN_BAD="$BTWIN_BAD $name(no body section)"
+    elif ! cmp -s <(body_strip "$OUT/$name.body.native.txt") <(tail -n +2 "$OUT/$name.native.txt"); then BTWIN_BAD="$BTWIN_BAD $name"
+    else NBTWIN=$((NBTWIN + 1)); fi
+done
+if [ ${#BTWIN_IDX[@]} -gt 0 ]; then
+    if [ -z "$BTWIN_BAD" ]; then
+        echo "== the body-plan preview is diagnostic: $NBTWIN of ${#BTWIN_IDX[@]} case(s) with it on: native == wasm (body sections included), and minus their body* fields == the case (every section, all, chain, counters, final line)"
+    else
+        echo "== the body-plan preview CHANGED THE SIMULATION or differs native / wasm in:$BTWIN_BAD (X.body.native.txt, X.body.wasm.txt in $OUT)"; FAILED=1
+    fi
+fi
+# The fixture driver: native == wasm == the committed fixture.
+"$OUT/obf_native" > "$OUT/body_fixture.native.json" 2> "$OUT/body_fixture.native.log"; rbn=$?
+$NODE "$OUT/obf_wasm.js" > "$OUT/body_fixture.wasm.json" 2> "$OUT/body_fixture.wasm.log"; rbw=$?
+if [ "$rbn" = 0 ] && [ "$rbw" = 0 ] && cmp -s "$OUT/body_fixture.native.json" "$OUT/body_fixture.wasm.json" &&
+   cmp -s "$OUT/body_fixture.native.json" tests/fixtures/ocean_body_fixture.json; then
+    echo "== body-plan fixture: native == wasm == tests/fixtures/ocean_body_fixture.json ($(cat "$OUT/body_fixture.native.log"))"
+else
+    echo "== body-plan fixture DIFFERS (rc native $rbn wasm $rbw; native vs wasm: $(cmp "$OUT/body_fixture.native.json" "$OUT/body_fixture.wasm.json" 2>&1 | head -1);" \
+         "vs the committed file: $(cmp "$OUT/body_fixture.native.json" tests/fixtures/ocean_body_fixture.json 2>&1 | head -1))"; FAILED=1
 fi
 
 TESTS_OK=1

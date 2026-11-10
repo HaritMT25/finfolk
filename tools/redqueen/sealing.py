@@ -33,8 +33,10 @@ ENDPOINTS. A record's endpoint is {"world", "frame"} and, as the plan carries th
 world's) and/or "snapshot" (uuid5(URL, "finfolk:snapshot:<world uuid>:<frame>")); or a REFERENCE
 {"ref": "RP:<k>"} (optionally its "uuid" / "snapshot", which must be the registered reference's), granted
 only for a registered slot of the endpoint's guild and refused when mixed with any world, frame or
-other identity key; or, for predators, the documented random-founder source {"source": "random"}
-(no held-out role: the edge's role is its prey's). The labels must agree with the identities: a world's UUID is the registry's;
+other identity key; or, for predators, the documented random-founder source {"source": "random"} or
+the scripted Stage A benchmark {"source": "scripted"} (K fresh scripted hunters, the engine's
+--predators-from scripted; Annex H D7), exactly that dict (no held-out role: the edge's role is its
+prey's; the two sources are distinct identities). The labels must agree with the identities: a world's UUID is the registry's;
 a fork branch (or a technical segment of one) resolves to its ROOT world (its own UUID binds its
 snapshots) and takes the root's split; a contradiction is refused before any role is computed.
 A snapshot's role is its world's split, or its holdout role in a training world. An EDGE's role is
@@ -323,9 +325,10 @@ def resolve(m, e, guild):
                 raise SealError(f"reference {ref}: its {k} {e[k]} is not the registered reference's")
         return ref, "training"
     if "source" in e:
-        if guild != "P" or e != {"source": "random"}:
-            raise SealError(f"endpoint {e}: only a predator endpoint may be exactly {{'source': 'random'}}")
-        return "random", None
+        if guild != "P" or e not in ({"source": "random"}, {"source": "scripted"}):
+            raise SealError(f"endpoint {e}: only a predator endpoint may be a source, exactly "
+                            "{'source': 'random'} or {'source': 'scripted'}")
+        return e["source"], None
     w, frame = e.get("world"), e.get("frame")
     if frame is None:
         raise SealError(f"endpoint {w}: no frame")
@@ -390,7 +393,7 @@ def record_problems(m, rows):
             continue
         if role in DECLARED:
             continue
-        want = max([rq] + ([rp] if rp else []), key=RANK.__getitem__)      # (a random source has no role)
+        want = max([rq] + ([rp] if rp else []), key=RANK.__getitem__)      # (a random / scripted source has no role)
         if want != role:
             probs.append(f"{rid}: role {role}, but its most held-out endpoint makes it {want}")
     return probs
