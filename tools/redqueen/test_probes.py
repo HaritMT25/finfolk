@@ -111,7 +111,8 @@ def production(excluded, panel=None, tamper=False, planned=None, founders=None):
         ex, by = graphlib.edge_exclusions(g, S)
         n, ne = len(g["edges"]), sum(len(v) for v in ex.values())
         mk = {"schema": sealing.MASK_SCHEMA, "graph": {"edges_sha256": g["edges_sha256"], "namespace": g["namespace"], "edges": n},
-              "registry": {"sha256": rs}, "block": {"sha256": "b" * 64, "registry_sha256": rs}, "worlds": W, "snapshots": S,
+              "registry": {"sha256": rs, "burn_in_frame": 5 * M, "max_restarts": 8},
+              "block": {"sha256": "b" * 64, "registry_sha256": rs}, "worlds": W, "snapshots": S,
               "edges": {"scheduled": n, "executable": n - ne, **{k: len(v) for k, v in ex.items()}},
               "by_family_role": by, "excluded_edges": ex}
         mp = os.path.join(root, "config", pb.AVAIL_MASK)
