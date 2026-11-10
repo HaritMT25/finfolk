@@ -170,7 +170,13 @@ assert all(o["why"].startswith(("the branch is", "an unavailable origin", "biolo
 assert out["counts"].get("fork_branch", 0) + 17 * len(om) == 4 * 3 * 17, out["counts"]
 assert out["counts"]["pilot_branch"] == 2 * 2 * 17, out["counts"]
 oc = forks.outcomes("R")
-assert all(set(oc["branches"][b]["at"].values()) == {"unavailable_origin"} for b in gone), oc["branches"]
+# (Codex #78 r1 P1, P2-3) from the rule-24 evidence: an origin past its root's registered end is unavailable, an
+# invalidated branch is rejected first; every other branch has an evidence-bound outcome of the registered kinds
+for b in gone:
+    want = {"invalidated"} if worlds.read_state("R/forks", b)["status"] == "invalidated" else {"unavailable_origin"}
+    assert set(oc["branches"][b]["at"].values()) == want, (b, oc["branches"][b])
+assert all(set(r["at"].values()) <= set(oc["kinds"]) for r in oc["branches"].values()), oc["branches"]
+assert all(o["cause"] in ("unavailable_origin", "technical", "biological") for o in out["omitted"]), out["omitted"]
 print("pilot ok; profile design", out["counts"], "omitted", out["omitted_counts"], "deduplicated", out["deduplicated"])
 PY
 $FK status --study R > st.json || fail "status"

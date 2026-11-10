@@ -454,7 +454,8 @@ def merge_role(a, b):
     return a if RANK[a] >= RANK[b] else b
 
 
-OUTCOMES_SCHEMA = "finfolk.redqueen.forkoutcomes/1"
+OUTCOMES_SCHEMA = "finfolk.redqueen.forkoutcomes/2"
+BRANCH_AT = worlds.AT_HORIZON + ("invalidated", "pending_origin", "unavailable_origin")
 
 
 def _ledgers(study):
@@ -463,25 +464,115 @@ def _ledgers(study):
             worlds.read_jsonl(os.path.join(froot(study), "availability.jsonl")))
 
 
-def absent(study, led_h, led_f, branches, wid, frame):
-    """Why the joint state (wid, frame) will never exist (Annex H D6 rule 27, §§10.1-10.4: profiles stop at the
-    biological boundary; an unavailable origin is recorded without replacement), else None: a branch whose
-    origin is unavailable or which was invalidated; a branch or history whose supported first zero (either
-    guild) is at or before the frame. A state merely not reached yet is NOT absent (it is pending)."""
+def evidence_ctx(study):
+    """What every evidence-bound decision below reads ONCE (the registries, both availability ledgers, the restart
+    records) and the caches of each world's evidence sequence."""
     fr = froot(study)
+    hreg = root_registry(study)
+    led_h, led_f = _ledgers(study)
+    return {"study": study, "fr": fr, "hreg": hreg, "reg": runtime_registry(study),
+            "hworlds": {w["id"]: w for w in hreg["worlds"]}, "led_h": led_h, "led_f": led_f,
+            "restarts": worlds.restart_records(study), "hist": {}, "branch": {}}
+
+
+def history_evidence(ctx, wid):
+    """A history's RETAINED attempt under the rule-24 evidence sequence (worlds.attempt_sequence / attempt_outcome
+    over evidence.py: the newest line of descent, validated rows, the first absorbing terminal boundary; Codex
+    #78 r1 P1) and its burn-in disposition (worlds.disposition) -> {"attempt", "outcome" (None: recorded, not
+    installed), "decided", "why", "disposition", "first_terminal" (its frame or None)}."""
+    if wid in ctx["hist"]:
+        return ctx["hist"][wid]
+    study, hreg = ctx["study"], ctx["hreg"]
+    w, sched = ctx["hworlds"][wid], hreg["schedule"]
+    idx, _, _ = worlds.attempt_index(study, wid, ctx["restarts"])
+    k = max(idx)
+    d, _ = idx[k]
+    bi, maxr = worlds.burn_in_of(hreg), int(hreg.get("max_restarts") or 0)
+    o = None
+    if d:
+        seq = worlds.attempt_sequence(study, wid, d, w, k, ctx["led_h"], sched["log_every"])
+        o = worlds.attempt_outcome(seq, w, worlds.total_steps(w, sched), bi)
+    decided, why, disp = worlds.disposition(o, k, maxr, bi)
+    ft = o["first_terminal"]["frame"] if o and o["first_terminal"] else None
+    ctx["hist"][wid] = rec = {"attempt": k, "outcome": o, "decided": decided, "why": why, "disposition": disp,
+                              "first_terminal": ft}
+    return rec
+
+
+def branch_evidence(ctx, b):
+    """A branch's evidence-bound outcome (worlds.attempt_outcome over its own segments from its origin, its own
+    ledger; a branch never restarts; its refill baseline, the origin's counter, is unchecked)."""
+    if b["id"] not in ctx["branch"]:
+        fr = ctx["fr"]
+        d = worlds.wdir(fr, b["id"])
+        seq = worlds.attempt_sequence(fr, b["id"], d if os.path.isdir(d) else None, b, 0, ctx["led_f"],
+                                      ctx["reg"]["schedule"]["log_every"])
+        ctx["branch"][b["id"]] = worlds.attempt_outcome(seq, b, int(b["total_steps"]), 0)
+    return ctx["branch"][b["id"]]
+
+
+def origin_disposition(ctx, b):
+    """(state, why) of a branch's origin on its ROOT's rule-24 evidence, in this order (Codex #78 r1 P2-2, P2-3):
+    invalidated (the branch's state says so, or its origin was frozen from a discarded root attempt: rejected
+    before any outcome is classified); pending (the root's retained attempt is not settled: it may still be
+    restarted, so nothing is decided and every scheduled target is kept); unavailable (the root's evidenced
+    first terminal boundary at or before the origin, the frozen record holds no prey / predators, or the root
+    reached its registered end before the origin: recorded, never replaced); technical (the branch's state says
+    unavailable, but the root's evidence does not support it: repair it); available."""
+    fr = ctx["fr"]
+    st = worlds.read_state(fr, b["id"])
+    if st["status"] == "invalidated":
+        return "invalidated", f"the branch is invalidated ({st.get('end_reason')})"
+    h = history_evidence(ctx, b["root"])
+    rp = os.path.join(worlds.wdir(fr, b["id"]), "origin.rec.json")
+    frec = rqlib.read_json(rp) if os.path.isfile(rp) else None
+    if frec is not None and int(frec.get("root_attempt", 0)) != h["attempt"]:
+        return "invalidated", (f"its origin was frozen from attempt {frec.get('root_attempt', 0)} of {b['root']}, a "
+                               f"discarded attempt (attempt {h['attempt']} is retained)")
+    if not h["decided"]:
+        return "pending", f"its root {b['root']}: {h['why']} (it may still be restarted: nothing is decided)"
+    o, f = h["outcome"], b["origin"]["frame"]
+    if h["first_terminal"] is not None and h["first_terminal"] <= f:
+        return "unavailable", (f"its root {b['root']}'s evidenced first terminal boundary (frame {h['first_terminal']}) "
+                               "is at or before the origin")
+    why = record_invalid(b, frec)
+    if why:
+        return "unavailable", why
+    if o and o["observation"] == "administrative" and o["frontier"] < f:
+        return "unavailable", f"its root {b['root']} reached its registered end (frame {o['frontier']}) before the origin"
+    if st["status"] == "unavailable":
+        return "technical", (f"its state says unavailable ({st.get('end_reason')}), but its root's evidence does not "
+                             "support it: repair it")
+    return "available", None
+
+
+def absent(ctx, branches, wid, frame):
+    """(cause, why) when the joint state (wid, frame) will never exist (Annex H D6 rule 27, §§10.1-10.4: profiles
+    stop at the biological boundary; an unavailable origin is recorded without replacement), else None, on the
+    rule-24 evidence: a branch that is invalidated or whose origin is unavailable (origin_disposition); a branch or
+    history whose evidenced first terminal boundary is at or before the frame. A root or history whose retained
+    attempt is NOT settled decides nothing (Codex #78 r1 P2-2): its states stay scheduled, as does a state merely
+    not reached yet."""
     if wid in branches:
-        st = worlds.read_state(fr, wid)
-        if st["status"] in ("unavailable", "invalidated"):
-            return f"the branch is {st['status']} ({st.get('end_reason')}): no state of it exists"
-        why = zero_before(study, branches[wid])        # (before a launch has recorded it unavailable)
-        if why:
-            return f"an unavailable origin: {why}"
-        z = worlds.first_zeros(led_f, wid, fr)
+        s, why = origin_disposition(ctx, branches[wid])
+        if s == "pending":
+            return None
+        if s == "invalidated":
+            return "technical", f"the branch is invalidated: {why}"
+        if s == "technical":
+            return "technical", f"the branch is technically unavailable: {why}"
+        if s == "unavailable":
+            return "unavailable_origin", f"an unavailable origin: {why}"
+        o = branch_evidence(ctx, branches[wid])
     else:
-        z = worlds.first_zeros(led_h, wid, study)
-    early = sorted((f, g) for g, f in z.items() if f <= frame)
-    if early:
-        return f"biological: {wid}'s {early[0][1]} reached 0 at frame {early[0][0]}, at or before the target {frame}"
+        h = history_evidence(ctx, wid)
+        if not h["decided"]:
+            return None
+        o = h["outcome"]
+    ft = (o or {}).get("first_terminal")
+    if ft and ft["frame"] <= frame:
+        return "biological", (f"biological: {wid}'s first terminal boundary ({ft['kind']}) at frame {ft['frame']}, at "
+                              f"or before the target {frame}")
     return None
 
 
@@ -505,7 +596,8 @@ def profile_design(study, refs, with_pilot_10m=False):
     pilot_ids = {b["id"] for b in reg["worlds"] if b["kind"] == "pilot"} | (
         {reg["pilot"]["world"]} if reg["pilot"].get("world") else set())    # (diagnostic in pilot families only)
     wmap, times, pairs, dup, external = {}, {}, {}, [0], set()
-    led_h, led_f = _ledgers(study)
+    ctx = evidence_ctx(study)
+    led_h, led_f = ctx["led_h"], ctx["led_f"]
     omitted = []
 
     def world(wid, uid, ad):
@@ -574,9 +666,10 @@ def profile_design(study, refs, with_pilot_10m=False):
     bdict = {b["id"]: b for b in reg["worlds"]}
 
     def state(family, wid, frame):
-        why = absent(study, led_h, led_f, bdict, wid, frame)
-        if why:                                # (an explicit omission: never a path to an absent state)
-            omitted.append({"family": family, "state": {"world": wid, "frame": int(frame)}, "pairs": 17, "why": why})
+        ab = absent(ctx, bdict, wid, frame)
+        if ab:                                 # (an explicit omission: never a path to an absent state)
+            omitted.append({"family": family, "state": {"world": wid, "frame": int(frame)}, "pairs": 17,
+                            "cause": ab[0], "why": ab[1]})
             return
         lab = t(frame)
         for pw, pt in rq:                      # its prey against the 8 predator references
@@ -622,49 +715,48 @@ def profile_design(study, refs, with_pilot_10m=False):
 
 def outcomes(study, horizons=None):
     """THE BRANCHES' ECOLOGICAL OUTCOMES (Annex H D6 rule 27, §§10.1-10.4), independent of any profile's
-    availability: every registered branch, its origin status, its supported first zero of each guild (the
-    branches' own ledger), its verified acceptance frontier, and at each horizon (origin + 1M, 4M, 10M) alive /
-    predator_extinct / prey_terminal (the prey first: later predator status unobserved) / not_yet_observed /
-    technical / unavailable_origin; with counts per kind x split x horizon. Read-only."""
-    reg = runtime_registry(study)
-    fr = froot(study)
-    _, led_f = _ledgers(study)
+    availability: every registered branch, its origin's disposition, its evidenced first zero of each guild and
+    first terminal boundary, its frontier and accepted-through, the evidence's hashes and unsupported ledger
+    entries, and at each horizon (origin + 1M, 4M, 10M) one of BRANCH_AT: alive / predator_extinct /
+    prey_terminal (the prey first: later predator status unobserved) / not_yet_observed / technical /
+    invalidated / pending_origin / unavailable_origin; with counts per kind x split x horizon. Read-only.
+    (Codex #78 r1 P1, P2-3) Every outcome comes from the RULE-24 EVIDENCE SEQUENCE (branch_evidence: the newest
+    line of descent, validated rows, the first absorbing terminal; a ledger zero outside it is listed as
+    unsupported, never an extinction), after the origin's disposition (origin_disposition): an invalidated
+    branch is "invalidated" and a technically unavailable one "technical" before anything else, an unsettled root
+    "pending_origin", an unavailable origin "unavailable_origin"; a done / extinct state its evidence does not
+    support is technical (worlds.at_horizon)."""
+    ctx = evidence_ctx(study)
+    reg = ctx["reg"]
     hz = list(horizons or (SHORT + (reg["horizon"],)))
     rows, counts = {}, {}
+    pre = {"invalidated": "invalidated", "pending": "pending_origin", "unavailable": "unavailable_origin",
+           "technical": "technical"}
     for b in reg["worlds"]:
         bid, o = b["id"], b["origin"]["frame"]
-        st = worlds.read_state(fr, bid)
-        z = worlds.first_zeros(led_f, bid, fr)
-        good = worlds.verified_records(fr, bid, st, b["treatment"], o) if st["segments"] else {}
-        ch = worlds.verified_chain(st, good, o)
-        through = ch[-1]["frame"] if ch else o
-        gone = st["status"] == "unavailable" or zero_before(study, b) is not None
+        s, why = origin_disposition(ctx, b)
+        ob = branch_evidence(ctx, b)
+        h_ = history_evidence(ctx, b["root"])
         at = {}
         for h in hz:
-            H = o + h
-            zp, zq = z.get("predators"), z.get("prey")
-            if gone:
-                s_ = "unavailable_origin"
-            elif zp is not None and zp <= H:
-                s_ = "predator_extinct"
-            elif through >= H:
-                s_ = "alive"
-            elif zq is not None and zq <= H:
-                s_ = "prey_terminal"
-            elif st["status"] in ("failed", "invalidated"):
-                s_ = "technical"
-            else:
-                s_ = "not_yet_observed"
+            s_ = pre.get(s) or worlds.at_horizon(ob, o + h)
             at[str(h)] = s_
             c = counts.setdefault(b["kind"], {}).setdefault(b["split"], {}).setdefault(str(h), {})
             c[s_] = c.get(s_, 0) + 1
-        rows[bid] = {"root": b["root"], "kind": b["kind"], "split": b["split"], "origin": o, "status": st["status"],
-                     "reason": st.get("end_reason"), "first_zeros": dict(sorted(z.items())), "accepted_through": through,
-                     "at": at}
+        rows[bid] = {"root": b["root"], "kind": b["kind"], "split": b["split"], "origin": o,
+                     "origin_state": s, "origin_why": why, "root_attempt": h_["attempt"],
+                     "root_disposition": h_["disposition"], "status": ob["status"], "reason": ob["end_reason"],
+                     "first_zeros": {g: z["frame"] for g, z in sorted(ob["events"].items()) if isinstance(z, dict)},
+                     "first_terminal": ob["first_terminal"], "frontier": ob["frontier"],
+                     "accepted_through": ob["accepted_through"], "observation": ob["observation"],
+                     "integrity": ob["integrity"], "unsupported_ledger": ob["unsupported_ledger"],
+                     "evidence": ob["evidence"], "at": at}
     return {"schema": OUTCOMES_SCHEMA, "forks_sha256": rqlib.sha256_file(os.path.join(study, "config", "forks.json")),
-            "horizons": hz, "branches": rows, "counts": counts,
-            "note": "each branch has its own absorbing ecological outcome from its origin (D6 rule 27, §§10.1-10.4); "
-                    "an unavailable origin is recorded, never replaced; profile availability does not enter"}
+            "horizons": hz, "kinds": list(BRANCH_AT), "branches": rows, "counts": counts,
+            "evidence_sha256": rqlib.sha256_file(os.path.abspath(worlds.evidence.__file__)),
+            "note": "each branch has its own absorbing ecological outcome from its origin (D6 rule 27, §§10.1-10.4), from "
+                    "the rule-24 evidence sequence; an unavailable origin is recorded, never replaced; an unsettled "
+                    "root decides nothing; profile availability does not enter"}
 
 
 def main(argv=None):

@@ -35,6 +35,27 @@ def zero_rec(root, wid, guild, frame):
         "csv_bytes": len(text), "csv_sha256": rqlib.sha256_bytes(text.encode())})
 
 
+def evidenced(root, wid, start, upto, zero=None, status="interrupted", log_every=5000):
+    """A RULE-24 evidence chain (worlds.attempt_sequence's): seg000 from `start`, rows every log_every through `upto`
+    (prey 50, predators 5; zero = (guild, frame): that guild 0 in its row, the last one) and one acceptance record
+    whose part covers every row."""
+    d = worlds.wdir(root, wid)
+    os.makedirs(os.path.join(d, "seg000"), exist_ok=True)
+    rows = ["step,population,predator_pop\n"]
+    for f in range(start + log_every, upto + 1, log_every):
+        z = zero[0] if zero and f == zero[1] else None
+        rows.append(f"{f},{0 if z == 'prey' else 50},{0 if z == 'predators' else 5}\n")
+    raw = "".join(rows).encode()
+    wr(os.path.join(d, "seg000", "run.csv"), raw.decode())
+    rec = {"schema": worlds.ACCEPT_SCHEMA, "world": wid, "segment": "seg000", "start_frame": start, "frame": upto,
+           "label": worlds.label_of(upto), "sha256": "c" * 64,
+           "logs": {"run.csv": {"from": 0, "bytes": len(raw), "sha256": rqlib.sha256_bytes(raw)}}}
+    wr(os.path.join(d, "accept.jsonl"), rqlib.canonical(rec).decode())
+    worlds.write_state(root, wid, {"schema": worlds.STATE_SCHEMA, "id": wid, "status": status, "failures": 0,
+                                   "segments": [{"name": "seg000", "start_frame": start, "resumed_from": None,
+                                                 "resumed_accept": None, "args": []}]})
+
+
 def splits_for(reg):
     """A graph-like split: C worlds 20 / 6 / 6, fork worlds 2 / 4 / 6."""
     cs = sorted(w["id"] for w in reg["worlds"] if w["treatment"] == "C")
@@ -146,10 +167,13 @@ class TestRegister(unittest.TestCase):
         self.assertEqual((out["omitted"], out["omitted_counts"]), ([], {}))
 
     def test_profile_omissions_and_outcomes(self):
-        """PR-D (Annex H D6 rule 27, §§10.1-10.4): states that will never exist are omitted EXPLICITLY, with
-        their cause, never emitted as paths: a fork root's prey zero at 50M (its 100M and 185M origins are then
-        unavailable, its later native-panel and original targets absent), a branch's own predator zero at 32M,
-        an invalidated branch; the branches' outcomes are exported independently of any profile."""
+        """PR-D (Annex H D6 rule 27, §§10.1-10.4; Codex #78 r1 P1, P2-2, P2-3): states that will never exist are
+        omitted EXPLICITLY, with their cause, never emitted as paths, on the RULE-24 EVIDENCE: a fork root's evidenced
+        prey zero at 50M (its 100M and 185M origins are then unavailable, its later native-panel and original
+        targets absent), a branch's own evidenced predator zero at 32M, an invalidated branch. A root with an early
+        zero at 4M awaiting its burn-in restart decides NOTHING (its targets stay scheduled, its branches
+        pending_origin); a ledger zero outside the line of descent is unsupported, never an extinction; a done state
+        its evidence does not support is technical. The outcomes are exported independently of any profile."""
         reg = forks.register(self.study, self.splits, "ns-f")
         worlds.write_registry(os.path.join(self.study, "config", "forks.json"), rqlib.canonical(reg))
         rqlib.write_json_durable(os.path.join(self.study, "study.json"), {"archive_root": os.path.join(self.tmp, "ar")})
@@ -157,40 +181,59 @@ class TestRegister(unittest.TestCase):
         refs = {"prey": [{"world": cs[i], "frame": 20 * M} for i in range(8)],
                 "predators": [{"world": cs[8 + i], "frame": 60 * M} for i in range(8)]}
         full = forks.profile_design(self.study, refs)
-        R = sorted(reg["fork_worlds"])[0]
-        other = next(b for b in reg["worlds"] if b["kind"] == "main" and b["root"] != R and b["origin"]["frame"] == 30 * M)
-        inval = next(b for b in reg["worlds"] if b["kind"] == "main" and b["root"] != R and b["id"] != other["id"])
+        fw = sorted(reg["fork_worlds"])
+        R, O, R2 = fw[0], fw[1], fw[2]
+        main = [b for b in reg["worlds"] if b["kind"] == "main"]
+        other, sb = [b for b in main if b["root"] == O and b["origin"]["frame"] == 30 * M][:2]
+        db = next(b for b in main if b["root"] == O and b["origin"]["frame"] == 100 * M)
+        inval = next(b for b in main if b["root"] not in (R, O, R2))
         fr = forks.froot(self.study)
-        zero_rec(self.study, R, "prey", 50 * M)
-        zero_rec(fr, other["id"], "predators", 32 * M)
+        evidenced(self.study, R, 0, 50 * M, zero=("prey", 50 * M), status="extinct")
+        evidenced(self.study, O, 0, 30 * M)                              # (established: alive past the burn-in)
+        evidenced(self.study, R2, 0, 4 * M, zero=("prey", 4 * M), status="extinct")   # (an early zero: restart due)
+        evidenced(fr, other["id"], 30 * M, 32 * M, zero=("predators", 32 * M), status="extinct")
+        zero_rec(fr, sb["id"], "predators", 31 * M)                     # (a ledger zero without its evidence chain)
+        worlds.write_state(fr, db["id"], {"schema": worlds.STATE_SCHEMA, "id": db["id"], "status": "done",
+                                          "end_reason": "x", "failures": 0, "segments": []})
         worlds.write_state(fr, inval["id"], {"schema": worlds.STATE_SCHEMA, "id": inval["id"], "status": "invalidated",
                                              "end_reason": "its origin changed", "failures": 0, "segments": []})
         out = forks.profile_design(self.study, refs)
-        om = {(o["family"], o["state"]["world"], o["state"]["frame"]): o["why"] for o in out["omitted"]}
+        om = {(o["family"], o["state"]["world"], o["state"]["frame"]): o for o in out["omitted"]}
         gone_r = [b["id"] for b in reg["worlds"] if b["root"] == R and b["origin"]["frame"] in (100 * M, 185 * M)]
-        want = ({("fork_branch", b, f) for b in gone_r for f in
-                 [next(x for x in reg["worlds"] if x["id"] == b)["origin"]["frame"] + h for h in (M, 4 * M, 10 * M)]}
+        origin_of = {b["id"]: b["origin"]["frame"] for b in reg["worlds"]}
+        want = ({("fork_branch", b, origin_of[b] + h) for b in gone_r for h in (M, 4 * M, 10 * M)}
                 | {("fork_original", R, o + h) for o in (100 * M, 185 * M) for h in (M, 4 * M)}
                 | {("native_panel", R, f) for f in (110 * M, 195 * M)}
                 | {("fork_branch", other["id"], 30 * M + h) for h in (4 * M, 10 * M)}
                 | {("fork_branch", inval["id"], inval["origin"]["frame"] + h) for h in (M, 4 * M, 10 * M)})
         self.assertEqual(set(om), want)
-        self.assertTrue(om[("native_panel", R, 110 * M)].startswith("biological"))
-        self.assertTrue(om[("fork_branch", gone_r[0], next(x for x in reg["worlds"] if x["id"] == gone_r[0])
-                            ["origin"]["frame"] + M)].startswith("an unavailable origin"))
-        self.assertIn("invalidated", om[("fork_branch", inval["id"], inval["origin"]["frame"] + M)])
+        self.assertEqual(om[("native_panel", R, 110 * M)]["cause"], "biological")
+        self.assertTrue(om[("native_panel", R, 110 * M)]["why"].startswith("biological"))
+        g0 = om[("fork_branch", gone_r[0], origin_of[gone_r[0]] + M)]
+        self.assertEqual((g0["cause"], g0["why"].startswith("an unavailable origin")), ("unavailable_origin", True))
+        iv = om[("fork_branch", inval["id"], inval["origin"]["frame"] + M)]
+        self.assertEqual((iv["cause"], "invalidated" in iv["why"]), ("technical", True))
         self.assertEqual(len(out["edges"]), len(full["edges"]) - 17 * len(want))       # (nothing else moves)
         self.assertNotIn(("fork_original", R, 31 * M), om)                 # (before the zero: kept)
+        self.assertFalse([k for k in om if R2 in k[1]])                    # (P2-2: an unsettled root decides nothing)
         self.assertTrue(all(o["pairs"] == 17 for o in out["omitted"]))
         oc = forks.outcomes(self.study)
         b1 = oc["branches"]
-        self.assertEqual(b1[other["id"]]["at"], {str(M): "not_yet_observed", str(4 * M): "predator_extinct",
+        self.assertEqual(b1[other["id"]]["at"], {str(M): "alive", str(4 * M): "predator_extinct",
                                                  str(10 * M): "predator_extinct"})
+        self.assertEqual((b1[other["id"]]["first_zeros"], b1[other["id"]]["first_terminal"]),
+                         ({"predators": 32 * M}, {"frame": 32 * M, "kind": "predators"}))
         self.assertEqual(set(b1[gone_r[0]]["at"].values()), {"unavailable_origin"})
-        self.assertEqual(set(b1[inval["id"]]["at"].values()), {"technical"})
-        self.assertEqual(b1[other["id"]]["first_zeros"], {"predators": 32 * M})
+        self.assertEqual(set(b1[inval["id"]]["at"].values()), {"invalidated"})          # (P2-3: rejected first)
+        self.assertEqual(set(b1[db["id"]]["at"].values()), {"technical"})               # (done, no evidence)
+        self.assertEqual(set(b1[sb["id"]]["at"].values()), {"not_yet_observed"})        # (P1: never extinct)
+        self.assertEqual([u["guild"] for u in b1[sb["id"]]["unsupported_ledger"]], ["predators"])
+        r2b = [b["id"] for b in reg["worlds"] if b["root"] == R2]
+        self.assertTrue(r2b and all(set(b1[b]["at"].values()) == {"pending_origin"} for b in r2b))
+        self.assertEqual({b1[b]["root_disposition"] for b in r2b}, {"restart_pending"})
         self.assertEqual(sum(sum(c.values()) for k in oc["counts"].values() for s in k.values() for c in s.values()),
                          150 * 3)
+        self.assertEqual(oc["schema"], forks.OUTCOMES_SCHEMA)
 
 
     def test_profile_roles_and_references(self):

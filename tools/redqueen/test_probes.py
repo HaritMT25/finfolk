@@ -73,12 +73,39 @@ def config(**over):
                       {"kind": "enet", "alpha": 0.5, "lambda_rel": [1.0, 0.3, 0.1, 0.03, 0.01]},
                       {"kind": "additive", "lambdas": [100.0, 10.0, 1.0, 0.1], "knots": [0.25, 0.5, 0.75]}],
            "min_rows": {"training": 5, "validation": 3, "test": 3}, "cd": {"iters": 2000, "tol": 1e-9},
-           "enrichment": {"permutations": 999, "audit_alpha": 0.01, "seed_namespace": "test-probes", "max_block": 8}}
+           "enrichment": {"permutations": 999, "audit_alpha": 0.01, "seed_namespace": "test-probes", "max_block": 8},
+           "availability": {"legacy": "unit fixture: synthetic rows, no availability mask"}}
     cfg.update(over)
     return cfg
 
 
-def make_root(tmp, **over):
+def production(excluded, panel=None, tamper=False):
+    """make_root's `before`: a graph.py mask /2 of the fixture's manifest (its graph, registry, every world at attempt 0)
+    with the given exclusions {"<world>:<frame>": (status, why)} registered at config/availability_mask.json, its
+    receipt published by sealing.py availability, and the production binding naming both (panel: a founder panel of
+    that many C worlds; tamper: the registered mask's bytes changed after the receipt)."""
+    def before(root, m):
+        rs = m["worlds_registry_sha256"]
+        mk = {"schema": sealing.MASK_SCHEMA, "graph": {"edges_sha256": m["graph"]["graph_edges_sha256"]},
+              "registry": {"sha256": rs}, "block": {"sha256": "b" * 64, "registry_sha256": rs},
+              "worlds": {w: {"uuid": u, "attempt": 0, "attempt_uuid": u} for w, u in m["uuids"].items()},
+              "snapshots": {k: {"status": st, "why": why} for k, (st, why) in excluded.items()}}
+        mp = os.path.join(root, "config", pb.AVAIL_MASK)
+        wr(mp, json.dumps(mk))
+        sealing.availability_receipt(root, mp)
+        ksha = rqlib.sha256_file(mp)
+        if tamper:
+            wr(mp, json.dumps(dict(mk, snapshots={})))
+        out = {"availability": {"annex_sha256": "a" * 64, "mask_sha256": ksha, "receipt": f"{ksha}.json"}}
+        if panel:
+            out["founders"] = {"cohort": "C", "frame": 1, "worlds_registry_sha256": rs, "size": panel,
+                               "panel": {w: {"uuid": UUIDS[w], "treatment": "C", "block": k // 4}
+                                         for k, w in enumerate(WORLDS[:panel])}}
+        return out
+    return before
+
+
+def make_root(tmp, before=None, **over):
     g = os.path.join(tmp, "graph")
     wr(os.path.join(g, "graph.meta.json"), {"schema": "finfolk.redqueen.graph/1", "namespace": "ns", "edges_sha256": "e" * 64,
                                             "split": SPLIT, "holdout": HOLD, "fork": ["w05", "w21"], "intensive": []})
@@ -92,6 +119,8 @@ def make_root(tmp, **over):
                                            os.path.join(tmp, "forks.json")))
     sealing.publish_manifest(root, man)
     m = json.loads(man)
+    if before:
+        over = dict(over, **before(root, m))
     founders = {"cohort": "C", "frame": 1, "worlds_registry_sha256": m["worlds_registry_sha256"], "size": len(CWORLDS),
                 "panel": {w: {"uuid": UUIDS[w], "treatment": "C", "block": BLOCK[w]} for w in CWORLDS}}
     cp = os.path.join(tmp, "probes_cfg.json")
@@ -172,17 +201,56 @@ class TestBasics(unittest.TestCase):
         self.assertFalse(hasattr(pb, "spline_basis"))
 
     def test_availability_binding_and_founder_coverage(self):
-        """PR-D (Annex H D6 rule 27, §§11.1-11.3): an optional availability binding (the adopted annex's sha256,
-        the availability mask's) is validated and carried; the founder audit reports missing founders against the
-        registered panel; the conditioning label is explicit."""
+        """PR-D (Annex H D6 rule 27, §§11.1-11.3; Codex #78 r1 P2-6, P2-7, P3): the availability binding is REQUIRED:
+        a production one (the adopted annex's sha256, the registered mask and the receipt sealing.py published for
+        this manifest, all verified) or an explicit legacy one; under production, no feature row and no numeric
+        target exists at an excluded snapshot (a null target is retained), every excluded snapshot of a stage's role
+        is reported with its cause, and the founder panel is the full 32; the founder audit reports missing
+        founders against the registered panel; the conditioning label is explicit."""
         tmp = tempfile.mkdtemp()
+        EX = {f"w03:{30 * M}": ("biological", "at or after attempt 0's evidenced first guild zero"),
+              f"w22:{40 * M}": ("technical", "not archived, and attempt 0 is done")}
         try:
-            for k, (av, msg) in enumerate((({"annex_sha256": "x"}, "annex_sha256"),
-                                           ({"annex_sha256": "a" * 64, "mask_sha256": "zz"}, "mask_sha256"),
-                                           ({"annex_sha256": "a" * 64, "rho": 1}, "unknown keys"))):
+            for k, (av, msg) in enumerate(((None, "is required"), ({"legacy": " "}, "the reason"),
+                                           ({"annex_sha256": "a" * 64, "rho": 1}, "exactly annex_sha256"),
+                                           ({"annex_sha256": "x", "mask_sha256": "b" * 64, "receipt": "r"}, "64 lowercase hex"),
+                                           ({"annex_sha256": "a" * 64, "mask_sha256": "b" * 64, "receipt": "c" * 64 + ".json"},
+                                            "availability.receipt"),
+                                           ({"annex_sha256": "a" * 64, "mask_sha256": "b" * 64, "receipt": "b" * 64 + ".json"},
+                                            "no published availability receipt"))):
                 with self.assertRaisesRegex(pb.ProbeError, msg):
                     make_root(os.path.join(tmp, f"bad{k}"), availability=av)
-            make_root(os.path.join(tmp, "ok"), availability={"annex_sha256": "a" * 64, "mask_sha256": None})
+            with self.assertRaisesRegex(pb.ProbeError, "is not the registered mask"):
+                make_root(os.path.join(tmp, "tampered"), before=production(EX, panel=32, tamper=True))
+            with self.assertRaisesRegex(pb.ProbeError, "full panel of 32"):
+                make_root(os.path.join(tmp, "panel30"), before=production(EX))
+            root, _, m = make_root(os.path.join(tmp, "prod"), before=production(EX, panel=32))
+            ctx = pb.load_ctx(root)
+            rec = pb.availability_record(ctx)
+            self.assertEqual((rec["kind"], rec["excluded_snapshots"], rec["mask_sha256"]),
+                             ("production", 2, rqlib.sha256_file(os.path.join(root, "config", pb.AVAIL_MASK))))
+            row = {"world": "w03", "t": 30, "uuid": UUIDS["w03"], "treatment": "C", "density": 400.0,
+                   "controller_size": 10.0, "f1": False, "values": {f: 0.1 for f in FEATS}}
+            roles = {"training", "validation", "test"}
+            fp = os.path.join(tmp, "f.json")
+            wr(fp, fdoc([row, dict(row, t=20)]))
+            with self.assertRaisesRegex(pb.ProbeError, "excludes this snapshot"):
+                pb.load_features(ctx, fp, roles)
+            tp = os.path.join(tmp, "t.json")
+            wr(tp, tdoc([row], {("w03", 30): {"wired": 1.0, "density_only": None}}))
+            with self.assertRaisesRegex(pb.ProbeError, "numeric target"):
+                pb.load_targets(ctx, tp, roles)
+            wr(tp, tdoc([row], {("w03", 30): {"wired": None, "density_only": None}}))
+            truth, _, _ = pb.load_targets(ctx, tp, roles)                    # (a null target: retained)
+            self.assertEqual(truth[("w03", 30)], {"wired": None, "density_only": None})
+            r03 = sealing.node_role(m, "w03", 30 * M)
+            un = pb.unavailable_rows(ctx, [{"world": "w03", "t": 20, "target": "wired", "available": True}], {}, {r03})
+            self.assertIn({"world": "w03", "t": 30, "target": None, "cause": "biological",
+                           "reason": "excluded by the availability mask: " + EX[f"w03:{30 * M}"][1]}, un)
+            self.assertIn({"world": "w03", "t": 20, "target": "wired", "cause": "null target",
+                           "reason": "its target value is null (unmeasured or absorbed)"}, un)
+            legacy = pb.load_ctx(make_root(os.path.join(tmp, "legacy"))[0])
+            self.assertEqual(pb.availability_record(legacy)["kind"], "legacy")
         finally:
             shutil.rmtree(tmp)
         cov = pb.founder_coverage({"panel": {"C01": {}, "C02": {}, "C03": {}}},
@@ -272,6 +340,10 @@ class TestPipeline(unittest.TestCase):
         self.assertEqual(val[0]["provenance"]["fit_targets_sha256"], rqlib.sha256_file(self.t_fit))
         sc = rqlib.read_json(self.scores)
         self.assertEqual(sc["targets_sha256"], rqlib.sha256_file(self.t_val))
+        ev = rqlib.read_json(self.eval)
+        for doc in (sc, ev):                    # (Codex #78 r1 P2-7: the binding, conditioning and every unscored row)
+            self.assertEqual((doc["availability"]["kind"], doc["conditioning"], doc["unavailable_rows"]),
+                             ("legacy", pb.CONDITIONING, []))
         w = sc["targets"]["wired"]
         self.assertGreater(w["best_residual_r2_by_set"]["wiring"], 0.8)
         self.assertGreater(w["best_residual_r2_by_set"]["combined"], 0.8)

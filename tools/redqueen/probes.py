@@ -42,6 +42,12 @@ STAGES (sealing.py between them):
   implementation      the evaluator's implementation manifest (frozen as the test commitment's script).
   evaluate-test       sealing.require_test_freeze against the manifest recomputed in-process, its verified
                       bytes (predictions, validation-evaluation record), TEST targets only.
+AVAILABILITY (Annex H D6 rule 27; availability_binding): the configuration REQUIRES a binding, either production
+(the adopted annex's sha256, the availability mask registered at config/availability_mask.json and the receipt
+sealing.py availability published for this split manifest and that mask, all verified; no feature row and no
+numeric target at a snapshot the mask excludes; the full 32-founder panel) or an explicit {"legacy": why} for
+fixtures and pre-D6 data. Every score document carries the binding, the conditioning label and every row of
+its stage without a score, with its reason (no prediction, a null target, a mask exclusion and its cause).
 REPORTING by registered role: every score is given per GROUP of world role x row role, never pooled across
 them: e.g. test/test (held-out test-root worlds: world transfer) apart from training/test (training worlds'
 snapshot-test holdouts: snapshot transfer); validation/validation apart from training/validation.
@@ -217,8 +223,10 @@ def validate_config(root, cfg, docs):
               f"founders.panel.{w}: a manifest world with its registered UUID")
         _need(v.get("treatment") == fd["cohort"] and _int(v.get("block"), 0),
               f"founders.panel.{w}: treatment {fd['cohort']} and an integer block")
-    why = availability_problems(cfg.get("availability"))
-    _need(why is None, why or "")
+    b = availability_binding(root, cfg.get("availability"), man, msha)    # (Codex #78 r1 P2-6: validated)
+    # (Codex #78 r1 P3) a production analysis registers the WHOLE founder panel: the 32 C worlds' retained-attempt F1
+    _need(b["kind"] != "production" or (fd["size"] == FOUNDER_PANEL and len(panel) == FOUNDER_PANEL),
+          f"founders: a production binding registers the full panel of {FOUNDER_PANEL} C founders (D6 rule 27, §11)")
 
 
 def register(root, cfg_path):
@@ -237,6 +245,7 @@ def load_ctx(root):
     cfg = ctx["cfg"]
     ctx["names"] = sorted(cfg["features"])
     ctx["groups"] = [cfg["features"][k] for k in ctx["names"]]
+    ctx["availability"] = availability_binding(ctx["root"], cfg.get("availability"), ctx["manifest"], ctx["manifest_sha"])
     return ctx
 
 
@@ -269,6 +278,10 @@ def load_features(ctx, path, roles, name="features"):
         if key in seen:
             raise ProbeError(f"{name}: {key} occurs twice")
         seen.add(key)
+        ex = excluded_at(ctx, i)
+        if ex:                              # (Codex #78 r1 P2-6: an excluded population has no profile)
+            raise ProbeError(f"{name} {key}: the registered availability mask excludes this snapshot ({ex['status']}: "
+                             f"{ex['why']}); it has no feature row")
         v = r.get("values") or {}
         if (r.get("treatment") not in cfg["treatments"] or not _num(r.get("density")) or not _num(r.get("controller_size"))
                 or set(v) != set(ctx["names"]) or not all(_num(v[f]) for f in ctx["names"])):
@@ -300,6 +313,10 @@ def load_targets(ctx, path, roles, name="targets"):
         y = r.get("y")
         if not isinstance(y, dict) or set(y) != set(cfg["targets"]) or not all(y[t] is None or _num(y[t]) for t in y):
             raise ProbeError(f"{name} {key}: y must give every registered target (a number or null)")
+        ex = excluded_at(ctx, i)
+        if ex and any(y[t] is not None for t in y):
+            raise ProbeError(f"{name} {key}: a numeric target at a snapshot the registered availability mask excludes "
+                             f"({ex['status']}: {ex['why']})")
         out[key] = {t: (None if y[t] is None else float(y[t])) for t in cfg["targets"]}
         idents[key] = i
     return out, idents, sha
@@ -533,17 +550,96 @@ CONDITIONING = ("probes are exploratory over the AVAILABLE, measured populations
                 "founders are reported, never imputed")
 
 
-def availability_problems(av):
-    """Why a config's optional "availability" binding is malformed (None if absent or well formed): the adopted
-    Annex H's sha256 (with D6 / D7) and, when the rows were masked, the availability mask's sha256."""
-    if av is None:
+AVAIL_MASK = "availability_mask.json"        # (registered next to the configuration: config/availability_mask.json)
+FOUNDER_PANEL = 32                           # (the 32 C worlds of the registered 64-world layout, Annex H D7 rule 34)
+
+
+def availability_binding(root, av, man, msha):
+    """THE AVAILABILITY BINDING a probe configuration registers (Annex H D6 rule 27, D7; Codex #78 r1 P2-6), validated
+    -> {"kind", ..., "excluded": {"<world>:<frame>": {"status", "why"}}}. Exactly one of:
+      production {"annex_sha256", "mask_sha256", "receipt"}: the adopted Annex H's sha256; the availability mask
+        registered at config/availability_mask.json (its bytes' sha256 = mask_sha256; a graph.py mask /2 of THIS
+        manifest's graph and histories registry, its worlds and attempt identities the registered ones:
+        sealing.mask_binding_problems); the receipt sealing.py published under this root
+        (registration/availability/<receipt>, binding THIS split manifest and that mask). Its unavailable
+        snapshots govern ingestion: no feature row and no numeric target value at one of them;
+      legacy {"legacy": "<why>"}: the explicit, recorded path for fixtures and pre-D6 data (no mask, nothing
+        checked against one).
+    An absent or malformed binding is refused (ProbeError)."""
+    if not isinstance(av, dict):
+        raise ProbeError("configuration: availability: a production binding {annex_sha256, mask_sha256, receipt} or an "
+                         "explicit {legacy: <why>} is required")
+    if set(av) == {"legacy"}:
+        if not isinstance(av["legacy"], str) or not av["legacy"].strip():
+            raise ProbeError("configuration: availability.legacy: the reason (a non-empty string)")
+        return {"kind": "legacy", "why": av["legacy"], "excluded": {}}
+    if set(av) != {"annex_sha256", "mask_sha256", "receipt"}:
+        raise ProbeError(f"configuration: availability: exactly annex_sha256, mask_sha256 and receipt (or legacy), "
+                         f"not {sorted(av)}")
+    for k in ("annex_sha256", "mask_sha256"):
+        if not HEX64.match(str(av[k])):
+            raise ProbeError(f"configuration: availability.{k}: 64 lowercase hex")
+    if not re.fullmatch(re.escape(av["mask_sha256"]) + r"(\.[0-9a-f]{64})?\.json", str(av["receipt"])):
+        raise ProbeError("configuration: availability.receipt: <mask sha256>[.<reconciliation sha256>].json, the name "
+                         "sealing.py availability published")
+    rp = os.path.join(sealing.reg_dir(root), "availability", av["receipt"])
+    if not os.path.isfile(rp):
+        raise ProbeError(f"configuration: availability: no published availability receipt {rp}")
+    _, rc, rsha = staging.read_doc(rp)
+    if (rc.get("schema") != sealing.AVAIL_RECEIPT_SCHEMA or rc.get("split_manifest_sha256") != msha
+            or (rc.get("mask") or {}).get("sha256") != av["mask_sha256"]):
+        raise ProbeError("configuration: availability: the receipt does not bind this split manifest and the mask")
+    mp = os.path.join(root, "config", AVAIL_MASK)
+    if not os.path.isfile(mp):
+        raise ProbeError(f"configuration: availability: the mask is not registered at {mp}")
+    _, mk, ksha = staging.read_doc(mp)
+    if ksha != av["mask_sha256"]:
+        raise ProbeError(f"configuration: availability: config/{AVAIL_MASK} is not the registered mask (its sha256)")
+    probs = sealing.mask_binding_problems(man, mk)
+    if probs:
+        raise ProbeError("configuration: availability: the mask is not this study's: " + "; ".join(probs[:3]))
+    return {"kind": "production", "annex_sha256": av["annex_sha256"], "mask_sha256": ksha, "receipt": av["receipt"],
+            "receipt_sha256": rsha, "excluded": {k: {"status": s.get("status"), "why": s.get("why")}
+                                                 for k, s in sorted((mk.get("snapshots") or {}).items())}}
+
+
+def availability_record(ctx):
+    """The binding as reported in every document (its exclusions counted, not repeated)."""
+    b = ctx["availability"]
+    return dict({k: v for k, v in b.items() if k != "excluded"}, excluded_snapshots=len(b["excluded"]))
+
+
+def excluded_at(ctx, i):
+    """The registered mask's exclusion of a row's snapshot ({"status", "why"}) or None (a branch row: none)."""
+    if i["branch"]:
         return None
-    if not isinstance(av, dict) or not HEX64.match(str(av.get("annex_sha256", ""))):
-        return "availability.annex_sha256: the adopted Annex H's sha256 (64 lowercase hex)"
-    if av.get("mask_sha256") is not None and not HEX64.match(str(av["mask_sha256"])):
-        return "availability.mask_sha256: an availability mask's sha256 (64 lowercase hex) or null"
-    extra = sorted(set(av) - {"annex_sha256", "mask_sha256"})
-    return f"availability: unknown keys {extra}" if extra else None
+    return ctx["availability"]["excluded"].get(f"{i['world']}:{staging.frame_of(i['t'])}")
+
+
+def unavailable_rows(ctx, lines, truth, roles):
+    """EVERY row of the stage that has no score, with its reason (Codex #78 r1 P2-7: none is lost): a committed line
+    without a prediction, a committed row whose target value is null (unmeasured or absorbed), and every snapshot of
+    the stage's roles the registered availability mask excludes (with its cause; it has no feature row)."""
+    out = []
+    for ln in lines:
+        w, t, tg = ln["world"], ln["t"], ln["target"]
+        if not ln["available"]:
+            out.append({"world": w, "t": t, "target": tg, "reason": ln.get("reason"), "cause": "no prediction"})
+        elif (truth.get((w, t)) or {}).get(tg) is None:
+            out.append({"world": w, "t": t, "target": tg, "reason": "its target value is null (unmeasured or absorbed)",
+                        "cause": "null target"})
+    for key, s in ctx["availability"]["excluded"].items():
+        w, _, f = key.rpartition(":")
+        f = int(f)
+        t = 0 if f == 1 else f // 1_000_000
+        try:
+            i = staging.resolve_row(ctx["manifest"], {"world": w, "t": t}, "mask snapshot")
+        except staging.StageError:
+            continue
+        if i["role"] in roles:
+            out.append({"world": w, "t": t, "target": None, "reason": f"excluded by the availability mask: {s['why']}",
+                        "cause": s["status"]})
+    return sorted(out, key=lambda r: (r["world"], r["t"], str(r["target"])))
 
 
 def founder_coverage(fd, pairs):
@@ -630,7 +726,7 @@ def predict_candidates(ctx, feat_path, fit_path, model_out, out):
                      "ids_sha256": rqlib.canonical_sha(sorted([list(r["key"]) for r in tr])),
                      "target_ids_sha256": rqlib.canonical_sha(sorted([list(k) for k in yt]))},
              "adjustment": adj, "probes": {t: {cid: p.state() for cid, p in s.items()} for t, s in states.items()},
-             "unavailable": avail, "availability": cfg.get("availability"), "conditioning": CONDITIONING,
+             "unavailable": avail, "availability": availability_record(ctx), "conditioning": CONDITIONING,
              "environment": staging.environment(),
              "implementation": json.loads(staging.implementation_manifest(sys.modules[__name__]))}
     data = rqlib.canonical(model)
@@ -817,7 +913,7 @@ def main(argv=None):
             rqlib.write_json_durable(a.out, dict(
                 rec, exploratory=True, pairs_sha256=sha, config_sha256=ctx["cfg_sha"],
                 founder_panel_sha256=rqlib.canonical_sha(cfg["founders"]), opened_test_outcomes=opened,
-                founders=founder_coverage(cfg["founders"], pairs), availability=cfg.get("availability"),
+                founders=founder_coverage(cfg["founders"], pairs), availability=availability_record(ctx),
                 conditioning=CONDITIONING,
                 designation="a prospectively designated founder audit (v4 §11.2): its outputs and audit consequence are "
                             "fixed; every test-role founder outcome it reads (opened_test_outcomes) loses its "
@@ -837,7 +933,9 @@ def main(argv=None):
             impl = staging.implementation_manifest(sys.modules[__name__])
             doc = {"schema": VALSCORES, "exploratory": True, "VAL_PRED_SHA": mk, "config_sha256": ctx["cfg_sha"],
                    "model_sha256": ms.pop(), "targets_sha256": tsha, "metric": "residual_r2 (primary); r2 (supporting)",
-                   "targets": score_validation(ctx, lines, truth), "scoring": scoring_record(impl)}
+                   "targets": score_validation(ctx, lines, truth), "scoring": scoring_record(impl),
+                   "availability": availability_record(ctx), "conditioning": CONDITIONING,
+                   "unavailable_rows": unavailable_rows(ctx, lines, truth, {"validation"})}
             rqlib.write_json_durable(a.out, doc)
             print({t: v.get("selected") for t, v in doc["targets"].items()})
             return 0
@@ -866,7 +964,9 @@ def main(argv=None):
                                          "targets_sha256": tsha, "scoring": scoring_record(impl),
                                          "metric": "residual_r2 (primary: improvement over the nuisance-only prediction); "
                                                    "r2 (supporting, original scale); per world role / row role group",
-                                         "targets": res})
+                                         "targets": res, "availability": availability_record(ctx),
+                                         "conditioning": CONDITIONING,
+                                         "unavailable_rows": unavailable_rows(ctx, lines, truth, {"test"})})
         print({t: {g_: v.get("residual_r2") for g_, v in (r.get("groups") or {}).items()} for t, r in res.items()})
         return 0
     except (ProbeError, staging.StageError, sealing.SealError, OSError, ValueError, KeyError, TypeError) as e:

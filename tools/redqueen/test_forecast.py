@@ -626,6 +626,48 @@ class TestPipeline(unittest.TestCase):
         wr(p, obj if isinstance(obj, str) else json.dumps(obj))
         return p
 
+    def test_prefix_unavailable_origin_keeps_its_outcomes(self):
+        """Codex #78 r1 P2-5 and the §10.5 disposition: an origin WITHOUT a continuous forecast (its prefix extinct or
+        technically unavailable) still carries its outcome / denominator receipt from its registered futures; an
+        excluded origin is marked (its futures unread); the summary counts every origin; the §10.5 completeness
+        gate is incomplete with every reason, and complete only on a complete 32-world native panel."""
+        keys = {"stage": "test", "world_role": "test", "target_role": "test", "time_role": "fit",
+                "category": "world_transfer", "horizon": 10, "t0": 10, "target_t": 20, "primary": True}
+
+        def row(z, ev=None, un=None):
+            return {"z": z, "R": None, "g": None, "events": ev or {}, "unavailable": un}
+        T = {"rows": {("w1", 20): row(None, {"extinction": True}), ("b1", 20): row(None, {"extinction": True}),
+                      ("b2", 20): row([0.1, 0.2]), ("b3", 20): row(None, None, "assay failed"), ("n1", 20): row([0.0, 0.0])},
+             "meas": {}}
+        lines = [dict(keys, target_id="fork:w1", kind="fork", world="w1", available=False, reason="its prefix is extinct",
+                      branches=["b1", "b2", "b3"]),
+                 dict(keys, target_id="fork:w2", kind="fork", world="w2", available=False, reason="in-sample", branches=[]),
+                 dict(keys, target_id="native:n1", kind="native", world="n1", available=False, reason="a technical gap",
+                      branches=[])]
+        ctx = {"cfg": {"events": ["extinction"], "evaluation": {"seed_namespace": "t", "energy_draws": 10}, "primary": 10},
+               "by_id": {"fork:w1": {"excluded": None}, "fork:w2": {"excluded": "in-sample"}, "native:n1": {"excluded": None}}}
+        per = fc.score_lines(ctx, lines, T)
+        o = per[0]["outcomes"]
+        self.assertEqual((o["denominators"], o["conditioning"], o["events"]),
+                         ({"registered": 4, "observable": 3, "live": 1, "event": 2}, "survivor-conditioned", {"extinction": 2}))
+        self.assertEqual((per[0]["available"], per[0]["reason"], "metrics" in per[0]), (False, "its prefix is extinct", False))
+        self.assertEqual((per[1]["excluded"], per[1]["outcomes"]), (True, None))
+        self.assertEqual((per[2]["outcomes"]["denominators"]["live"], per[2]["outcomes"]["conditioning"]), (1, "complete"))
+        S = fc.outcome_summary(per)
+        f = S["test/fork/H10/primary"]
+        self.assertEqual((f["origins"], f["prefix_unavailable"], f["excluded"], f["futures"]["registered"],
+                          f["conditioning"]["survivor-conditioned"]), (2, 1, 1, 4, 1))
+        G = fc.decomposition_gate(per)
+        self.assertEqual(G["status"], "incomplete")
+        for want in ("native panel has 1 worlds", "1 fork origin(s) excluded", "1 fork origin(s) prefix-unavailable",
+                     "1 native origin(s) prefix-unavailable", "survivor-conditioned or observable-only"):
+            self.assertTrue(any(want in w for w in G["reasons"]), (want, G["reasons"]))
+        good = [dict(keys, kind="native", world=f"n{i:02d}", available=True, excluded=False,
+                     outcomes={"conditioning": "complete"}) for i in range(32)]
+        good.append(dict(keys, kind="fork", world="w9", available=True, excluded=False, outcomes={"conditioning": "complete"}))
+        self.assertEqual(fc.decomposition_gate(good), {"status": "complete", "reasons": [], "rule": fc.DECOMPOSITION_RULE})
+        self.assertEqual(fc.decomposition_gate(good[:31] + good[32:])["status"], "incomplete")
+
     def test_end_to_end(self):
         """The staged pipeline runs on a TARGET-DISJOINT registration (no stage's prefix row is one of its
         targets, no validation prefix row a test target, no target a fitting row; in-sample origins
@@ -707,6 +749,13 @@ class TestPipeline(unittest.TestCase):
         self.assertEqual((s1["events"]["extinction"], s1["reseeds"]), (1, 3))
         s0r = next(r for r in ev["origins"] if r["target_id"] == "fork:S0:185:4")["metrics"]["lss"]
         self.assertEqual((s0r["unavailable"], s0r["reseeds"]), (1, 3))
+        # (Codex #78 r1 P2-5) every non-excluded origin has its outcome receipt; §10.5 is recorded, never certified by
+        # survivor-conditioned data
+        for doc in (sc, ev):
+            self.assertTrue(all((r["outcomes"] is None) == r["excluded"] for r in doc["origins"]))
+            self.assertEqual(sum(c["origins"] for c in doc["outcomes"].values()), len(doc["origins"]))
+            self.assertEqual(doc["decomposition_10_5"]["status"], "incomplete")
+            self.assertEqual(doc["decomposition_10_5"]["rule"], fc.DECOMPOSITION_RULE)
 
     def test_reproducible(self):
         """The same bytes and environment give byte-identical outputs at every stage."""
