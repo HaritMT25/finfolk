@@ -1512,6 +1512,58 @@ class TestBurnIn(unittest.TestCase):
         self.assertEqual((b["burn_in"]["decided"], b["first_zeros"], b["valid_before"], b["status"]),
                          (True, {"prey": 2500}, 2500, "extinct"), msgs)
 
+    def test_design_block_exports_verified_evidence(self):
+        """Codex #77 r1 P1-1 (and the identity across restarts): the worlds block carries the retained attempt's
+        evidence under evidence.py's rules (the first terminal boundary, the frontier, the explicit disposition),
+        its identity (attempt, attempt_uuid), every archived object checked against the line of descent and
+        RE-HASHED (a damaged one is a mismatch, never available), and the bytes of its inputs; graph.py's
+        re-derivation from the root gives the same block, and sees the damage."""
+        import graph
+        root, reg, ar, wid = self.world(zero_at=2500, burn_in=2000)
+        s, msgs = supervisor(root, reg, ar)
+        s.startup()
+        blk = worlds.design_block(root, reg, ar)
+        b = blk["worlds"][wid]
+        self.assertEqual((b["attempt"], b["attempt_uuid"], b["burn_in"]["disposition"]), (0, b["uuid"], "established"), msgs)
+        self.assertEqual((b["archived"], {f: e["status"] for f, e in b["archive"].items()}),
+                         ([1, 1000, 2000], {"1": "verified", "1000": "verified", "2000": "verified"}))
+        recs = worlds.archive_records(root, wid)
+        self.assertEqual(b["archive"]["1000"]["sha256"], recs["end.1000"]["sha256"])
+        ev = b["evidence"]
+        self.assertEqual((ev["frontier"], ev["first_terminal"], ev["refill"], ev["stop"]),
+                         (2500, {"frame": 2500, "kind": "prey"}, None, None))
+        self.assertEqual((blk["evidence"]["schema"], blk["burn_in_frame"], blk["max_restarts"]),
+                         (worlds.BLOCK_EVIDENCE_SCHEMA, 2000, 8))
+        self.assertEqual(blk["evidence"]["evidence_sha256"], rqlib.sha256_file(os.path.join(HERE, "evidence.py")))
+        rp = os.path.join(root, "config", "worlds.json")
+        g = {"worlds": [{"id": w["id"], "treatment": w["treatment"], "block": w["block"]} for w in reg["worlds"]]}
+        self.assertEqual(graph.block_problems(g, json.loads(rqlib.canonical(blk)), rqlib.read_json(rp),
+                                              rqlib.sha256_file(rp)), [])
+        fresh, _, _ = graph.rederive_block(root, ar, rp)
+        self.assertEqual(fresh, json.loads(rqlib.canonical(blk)))
+        p = recs["end.1000"]["path"]                                     # (damage an archived object)
+        os.chmod(p, 0o644)
+        wr(p, rqlib.read_text(p) + " ")
+        b2 = worlds.design_block(root, reg, ar)["worlds"][wid]
+        self.assertEqual((b2["archive"]["1000"]["status"], b2["archived"]), ("mismatch", [1, 2000]))
+        self.assertNotEqual(graph.rederive_block(root, ar, rp)[0], fresh)
+        with self.assertRaisesRegex(graph.GraphError, "not .*'s registry"):
+            graph.rederive_block(root, ar, os.path.join(self.tmp, "arena.json"))
+
+    def test_design_block_identity_after_a_restart(self):
+        """(Item 6) a burn-in restart keeps the slot's registry uuid (the snapshot key a registered plan binds) and
+        exports the retained attempt's own identity: attempt 1, attempt_uuid uuid5(...:<uuid>:1) (val_block.py's);
+        a fresh attempt is unresolved (pending), with nothing of the failed attempt's archive."""
+        root, reg, ar, wid = self.world(zero_at=2500, burn_in=3000)
+        s, msgs = supervisor(root, reg, ar)
+        s.startup()
+        b = worlds.design_block(root, reg, ar)["worlds"][wid]
+        self.assertEqual((b["uuid"], b["attempt"], b["attempt_uuid"]),
+                         (reg["worlds"][0]["uuid"], 1, worlds.attempt_uuid(reg["worlds"][0]["uuid"], 1)), msgs)
+        self.assertNotEqual(b["attempt_uuid"], b["uuid"])
+        self.assertEqual((b["burn_in"]["decided"], b["burn_in"]["disposition"], b["archived"], b["valid_before"]),
+                         (False, "unresolved", [], None))
+
 
 def tree_state(path):
     """{relative path: (sha256 or None for a directory, mode)} of everything under path."""
