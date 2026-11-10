@@ -804,7 +804,7 @@ def predict_candidates(ctx, feat_path, fit_path, model_out, out):
     rows, fsha = load_features(ctx, feat_path, {"training", "validation"})
     yt, _, tsha = load_targets(ctx, fit_path, {"training"}, "fit targets")
     keys = {r["key"] for r in rows}
-    extra = sorted(set(yt) - keys)
+    extra = fit_target_extras(ctx, yt, keys)
     if extra:
         raise ProbeError(f"fit targets without a feature row: {extra[:5]}")
     tr = [r for r in rows if r["id"]["role"] == "training"]
@@ -872,19 +872,45 @@ def failure_lines(ctx, role, stage, prov):
     return out
 
 
+def null_row_ok(ctx, k, y):
+    """An explicit ALL-NULL target row with no feature / prediction row is accepted for a planned row the mask
+    excludes or whose measurement failed (Codex #78 r2 / r3 P2-3); any other is an extra row."""
+    return (all(v is None for v in y.values())
+            and (k in (ctx.get("failures") or {}) or f"{k[0]}:{staging.frame_of(k[1])}" in ctx["availability"]["excluded"]))
+
+
+def fit_target_extras(ctx, yt, keys):
+    """The fit targets without a feature row that are NOT explicit all-null rows of excluded / failed planned rows."""
+    return sorted(k for k in set(yt) - keys if not null_row_ok(ctx, k, yt[k]))
+
+
 def collect(ctx, lines, truth, role):
     """The committed lines joined with exactly their stage's targets (extras and missing rows refused; an explicit
-    all-null target row of a planned snapshot the mask excludes is accepted: it has no line, Codex #78 r2 P2-3)."""
+    all-null target row of an excluded / failed planned snapshot is accepted: null_row_ok). Under a production
+    binding the committed rows are RECONCILED against the registered inventory (Codex #78 r3 P2-3): every planned row
+    of the stage role has a committed line for EVERY registered target (an explicit unavailable line included) or
+    is excluded by the bound mask; no planned row disappears before commitment."""
     want = {line_identity(ctx, ln, role) for ln in lines}
-    ex = ctx["availability"]["excluded"]
-    extra = sorted(k for k in set(truth) - want
-                   if not (f"{k[0]}:{staging.frame_of(k[1])}" in ex and all(v is None for v in truth[k].values())))
+    extra = sorted(k for k in set(truth) - want if not null_row_ok(ctx, k, truth[k]))
     if extra:
         raise ProbeError(f"{len(extra)} target rows are not rows of the committed predictions: {extra[:5]}")
     missing = sorted(want - set(truth))
     if missing:
         raise ProbeError(f"{len(missing)} rows of the committed predictions have no target row (null values are "
                          f"explicit): {missing[:5]}")
+    plan = planned_of(ctx, {role})
+    if plan is not None:
+        ex = ctx["availability"]["excluded"]
+        tg = {}
+        for ln in lines:
+            tg.setdefault((ln["world"], ln["t"]), set()).add(ln["target"])
+        lost = sorted(k for k in plan if k not in tg and f"{k[0]}:{staging.frame_of(k[1])}" not in ex)
+        if lost:
+            raise ProbeError(f"{len(lost)} planned {role} row(s) have neither a committed line nor a mask exclusion "
+                             f"(a planned row never disappears): {lost[:5]}")
+        part = sorted(k for k, ts in tg.items() if ts != set(ctx["cfg"]["targets"]))
+        if part:
+            raise ProbeError(f"{len(part)} committed row(s) lack a line for every registered target: {part[:5]}")
 
 
 def tie_key(cfg, cid):

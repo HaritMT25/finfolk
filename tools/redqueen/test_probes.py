@@ -313,7 +313,27 @@ class TestBasics(unittest.TestCase):
             wr(tp, tdoc([row("w03", 30)], {("w03", 30): {"wired": None, "density_only": None}}))
             truth, _, _ = pb.load_targets(ctx, tp, roles)                    # (a null target: retained)
             self.assertEqual(truth[("w03", 30)], {"wired": None, "density_only": None})
-            pb.collect(ctx, [], truth, sealing.node_role(m, "w03", 30 * M))  # (an excluded planned row's null target)
+            # (Codex #78 r3 P2-3) scoring reconciles the committed rows against the registered inventory: the planned
+            # training rows w03@20 and w04@20 have no line here, so the excluded row's null target alone is refused
+            rtr = sealing.node_role(m, "w03", 30 * M)
+            with self.assertRaisesRegex(pb.ProbeError, "neither a committed line nor a mask exclusion"):
+                pb.collect(ctx, [], truth, rtr)
+            tl = [{"world": w, "t": t, "target": tg, "available": True, "role": rtr, "target_id": f"probe:{tg}:{w}:{t}",
+                   "world_role": pb.staging.resolve_row(m, {"world": w, "t": t})["world_role"]}
+                  for w, t in (("w03", 20), ("w04", 20)) for tg in TARGETS]
+            nulls = {k: {"wired": None, "density_only": None} for k in (("w03", 20), ("w04", 20))}
+            pb.collect(ctx, tl, dict(truth) | nulls, rtr)             # (every planned row: lines + the mask)
+            with self.assertRaisesRegex(pb.ProbeError, "lack a line for every registered target"):
+                pb.collect(ctx, tl[1:], dict(truth) | nulls, rtr)
+            vf = pb.failure_lines(ctx, r25, r25, {})                          # (the validation stage: w25@20 failed)
+            pb.collect(ctx, vf, {("w25", 20): {"wired": None, "density_only": None}}, r25)
+            with self.assertRaisesRegex(pb.ProbeError, "neither a committed line"):
+                pb.collect(ctx, [], {}, r25)
+            # the fit-target join accepts an excluded / failed planned row's explicit all-null target, nothing else
+            self.assertEqual(pb.fit_target_extras(ctx, {("w03", 30): {"wired": None, "density_only": None},
+                                                         ("w25", 20): {"wired": None, "density_only": None}}, set()), [])
+            self.assertEqual(pb.fit_target_extras(ctx, {("w04", 20): {"wired": None, "density_only": None}}, set()),
+                             [("w04", 20)])
             wr(tp, tdoc([row("w06", 20)], {("w06", 20): {"wired": None, "density_only": None}}))
             with self.assertRaisesRegex(pb.ProbeError, "not a planned probe row"):
                 pb.load_targets(ctx, tp, roles)
