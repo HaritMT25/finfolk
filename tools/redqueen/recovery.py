@@ -2,7 +2,8 @@
 """recovery.py: the exact-graph recovery simulation of design v4 §6.5, with a minimal map fitter.
 
     recovery.py run --graph G/graph.jsonl.gz --out DIR [--set main|stress|numerical|all]
-                    [--reps 20] [--jobs 2] [--ranks 4] [--lambdas 0.02,0.1,0.5] [--iters 40]
+                    [--reps 20] [--jobs 2] [--fitter minimal|registered] [--ranks 4] [--lambdas L,..]
+                    [--options a,..] [--iters N] [--start both|warm|cold] [--basis 6] [--embedding shared]
     recovery.py one --graph G/graph.jsonl.gz --scenario NAME --rep N --out FILE.json [...]
     recovery.py summarize --dir DIR [--out summary.json]
     recovery.py conditioning --graph G/graph.jsonl.gz [--out conditioning.json]
@@ -10,7 +11,22 @@
 
 Needs numpy (RQ_PYLIB, when set, is put on sys.path first: an unpacked wheel on a host without pip).
 `run` starts `one` jobs as subprocesses (never multiprocessing), each with one BLAS thread, and
-skips datasets already written (resumable).
+skips datasets already written (resumable: every kept result is checked against its filename, its
+derived seed and the run's configuration first; Codex #66 r1 P2-9).
+
+DEFAULTS PER FITTER (FITTER_DEFAULTS; Codex #66 r1 P2-7): minimal: --options a,b,base --lambdas
+0.02,0.1,0.5 --iters 40; registered: --options a --lambdas REGISTERED_LAMBDAS (0.01,0.02,0.05,0.2)
+--iters 30 --start both --basis 6 --embedding shared. Incompatible choices (option b or --ab-cap with
+the registered map; --start / --basis / --embedding / --center with the minimal fitter) are refused
+before any worker starts.
+
+THE SCORE (v4 §7.6; Codex #66 r1 P1-3): every candidate is scored by the registered CAPTURE-COUNT log
+predictive density per replicate observation (map.count_lpd: the bounded rounded logit-normal of Annex
+H.9.2 at the fit's predictive location and latent variance, map.pred_var; the minimal fitter: its
+training residual variance). Validation selection and the test decision use it; the Gaussian working
+density at the empirical logits (the reg1-reg5 score) is kept per candidate as a labelled diagnostic
+(*_gauss). A decision needs at least two contributing test-root worlds (D6 rule 27), else it is
+recorded unavailable.
 
 THE QUESTION (v4 §6.5, the review's must-fix 1): on the exact post-split graph (graph.py), with
 shared row / column / cell noise, is rank > 0 specificity recoverable by the registered selection
@@ -36,13 +52,13 @@ THE FITTER (minimal; the production map, item 7, replaces it). Ridge alternating
     z = mu + a_j - b_i + u_i.v_j [+ h(lag) + h_w(lag) on within pairs, option b]
 on the replicate means of the fitting pairs, ranks 0..--ranks, penalty on u, v from --lambdas.
 Held-out populations are placed only by their support pairs. The procedure: every candidate's
-validation score (mean log predictive density per replicate observation on the validation pairs
-that are not support, with a Gaussian working likelihood whose variance is the fit's replicate
-residual variance; equal validation-world weights) selects rank and penalty; the selected map and
-the rank-0 baseline then score the world-transfer test pairs (non-support test pairs of the global
-families with an endpoint in a test world); success = a selected rank > 0 and the 95% lower bound of
-a test-world cluster bootstrap of the mean score improvement > 0 (v4 §7.6). The 80/10/10
-interpolation is not part of this fit (a separate secondary fit).
+validation score (THE SCORE above, on the validation pairs that are not support; equal
+validation-world weights) selects rank and penalty; the selected map and the rank-0 baseline then
+score the world-transfer test pairs (non-support test pairs of the global families with an endpoint
+in a test world); success = a selected rank > 0 and the 95% lower bound of the crossed source-world
+bootstrap of the mean score improvement > 0 (v4 §7.6). The 80/10/10 interpolation is not part of
+this fit (a separate secondary fit). The forward-time fit (option fwd) reads the predator-free
+controls of prey at <= 120M only (map.control_access).
 
 SETS. main: rank 0, rank 1 and rank 2 at 1.7% and 3.4% (--reps each; v4 proposes 20: 100 noisy
 datasets). stress (--reps // 2 each): saturation (asym), a two-way monotone surface (a misfit for
@@ -389,6 +405,7 @@ def simulate(D, sc, seed):
             c = math.sqrt(s["energy"] * np.var(base + c * raw) / np.var(res))
         inter = c * raw
     eta = eta0 + own + inter
+    cnt = None
     if s["noiseless"]:
         z = np.repeat(eta[:, None], R_REPS, axis=1)
     elif s["noise_model"] == "capture":
@@ -420,6 +437,8 @@ def simulate(D, sc, seed):
         z = np.log((cnt + 0.5) / (B_COUNT - cnt + 0.5))
     energy = float(np.var(c * (inter / c - additive_projection(D, inter / c))) / np.var(eta)) if rank else 0.0
     out = {"eta": eta, "inter": inter, "z": z, "zbar": z.mean(axis=1), "c": c, "energy": energy, "settings": s}
+    if cnt is not None:
+        out["cnt"] = cnt.astype(np.int16)         # (the capture counts: the registered count score's data)
     out.update(simulate_survival(D, s, seed, a, b, u, v, c, rank))
     return out
 
@@ -548,27 +567,43 @@ def predict(D, m, idx):
 
 
 def lpd(z, pred, s2):
-    """Mean log predictive density per replicate observation, per pair (Gaussian working model); s2 a
-    scalar or one variance per pair."""
+    """DIAGNOSTIC ONLY (the Gaussian working score of reg1-reg5): the mean Gaussian log density of the
+    empirical logits per replicate observation, per pair; s2 a scalar or one variance per pair."""
     s2 = np.asarray(s2, dtype=float)
     if s2.ndim:
         s2 = s2[:, None]
     return (-0.5 * np.log(2 * math.pi * s2) - ((z - pred[:, None]) ** 2) / (2 * s2)).mean(axis=1)
 
 
-def predictive_var(D, data, m, idx, fitter, weighted=True):
-    """The predictive variance model of a fit: the registered map with a variance function scores with
-    phi V(p_ij) (V the scenario's capture-level variance at the predicted capture fraction, phi the
-    dispersion fitted on the training pairs); otherwise one variance (the training residual mean
-    square) -> a function idx -> s2 (an array, or a scalar)."""
-    vf = var_model(data.get("settings")) if (fitter == "registered" and weighted) else None
-    pf = any_predict(D, m, idx)
-    if vf is None:
+def count_lpd(cnt, loc, var):
+    """THE registered score: the capture-count log predictive density per replicate observation, per pair
+    (map.count_lpd: Annex H.9.2's bounded observation model, B = B_COUNT)."""
+    import map as mapfit
+    return mapfit.count_lpd(cnt, B_COUNT, loc, var)
+
+
+def scorer(D, data, m, idx, fitter):
+    """A fit's predictive model as a scoring function ix -> (count lpd per pair, Gaussian working lpd per
+    pair). The registered map: map.pred_var (one fresh replicate's location and latent variance: phi V(p) of
+    the registered variance function, the pair-residual variance, the location's posterior variance). The
+    minimal fitter: its predictions with one variance, the training residual mean square. Both densities
+    use the same location and variance; only the count density decides."""
+    if fitter == "registered":
+        import map as mapfit
+
+        def pv(ix):
+            return mapfit.pred_var(D, m, ix)
+    else:
+        pf = predict(D, m, idx)
         s2 = float(((data["z"][idx] - pf[:, None]) ** 2).mean())
-        return lambda ix: s2
-    V = lambda pr: np.maximum(vf(1.0 / (1.0 + np.exp(-pr))), 1e-8)          # noqa: E731
-    phi = float((((data["z"][idx] - pf[:, None]) ** 2) / V(pf)[:, None]).mean())
-    return lambda ix: phi * V(any_predict(D, m, ix))
+
+        def pv(ix):
+            return predict(D, m, ix), np.full(len(ix), s2)
+
+    def score(ix):
+        loc, var = pv(ix)
+        return count_lpd(data["cnt"][ix], loc, var), lpd(data["z"][ix], loc, var)
+    return score
 
 
 def world_mean(vals, worlds):
@@ -621,10 +656,11 @@ FITTERS = ("minimal", "registered")
 
 
 def any_fit(fitter, D, idx, data, rank, lam, own_layer, iters, seed, ab_cap=None, init=None, balance=False,
-            start="both", weighted=True):
-    """The minimal fitter (fit) or the registered map (map.py: monotone 6 x 6 tensor baseline,
-    bounded link, the joint survival head, heteroscedastic capture weights from the scenario's
-    variance function; start "both": warm and cold, the lower penalized training objective kept)."""
+            start="both", weighted=True, ctrl=None, basis=6, embedding="shared", center="references"):
+    """The minimal fitter (fit) or the registered map (map.py: the monotone 6 x 6 tensor baseline, the
+    monotone-spline bounded link, the joint survival head, heteroscedastic capture weights from the
+    scenario's variance function; start "both": warm and cold, the lower penalized training objective
+    kept; ctrl: the accessible predator-free controls, None = map.control_access(D, idx))."""
     if fitter == "registered":
         try:
             import map as mapfit
@@ -634,7 +670,8 @@ def any_fit(fitter, D, idx, data, rank, lam, own_layer, iters, seed, ab_cap=None
             return mapfit.fit(D, idx, data, rank, lam, own_layer, iters, seed)     # (refused: option b)
         vf = var_model(data.get("settings")) if weighted else None
         starts = ("warm", "cold") if start == "both" else (start,)
-        return mapfit.fit_best(D, idx, data, rank, lam, iters, seed, starts=starts, init=init, var_fn=vf)
+        return mapfit.fit_best(D, idx, data, rank, lam, iters, seed, starts=starts, init=init, var_fn=vf,
+                               ctrl=ctrl, basis=basis, embedding=embedding, center=center)
     return fit(D, idx, data["zbar"], rank, lam, own_layer, iters, seed, ab_cap=ab_cap, init=init, balance=balance)
 
 
@@ -659,53 +696,83 @@ def class_accuracy(D, data, m1, m0):
 
 
 PRIMARY_RANKS = 2      # (v4 amendment proposed 2026-11-07: the primary confirmatory rank set is {0, 1, 2})
+MIN_TEST_WORLDS = 2    # (D6 rule 27: a prediction decision needs at least two contributing test-root worlds)
+FORWARD_TMAX = 120     # (v4 §7.3: the forward fit's main outcomes and controls through 120M)
+SCORE = {"decision": "capture-count lpd per replicate observation (map.count_lpd: Annex H.9.2's rounded "
+                     "logit-normal at map.pred_var)", "diagnostic": "Gaussian working lpd of the empirical logits "
+                     "at the same location and variance (*_gauss; the reg1-reg5 score)"}
 
 
-def procedure(D, data, option, ranks, lambdas, iters, seed, ab_cap=None, fitter="minimal", start="both"):
-    """The registered selection and prediction procedure on one dataset for one fitting option.
-    Every candidate also records its test improvement over rank 0 and the world-cluster lower
-    bound, and the selection restricted to ranks <= PRIMARY_RANKS is reported beside the full one
-    (selected_primary)."""
+def _cand_record(D, data, m, r, lam, fitter, score, val, val_world, t0, extra=None):
+    vc, vg = score(val)
+    rec = {"rank": r, "lambda": lam, "val_lpd": world_mean(vc, val_world)[0],
+           "val_lpd_gauss": world_mean(vg, val_world)[0], "start": m.get("start"), "objectives": m.get("objectives")}
+    if fitter == "registered":
+        rec.update(qp=m["qp"], link={"lo": m["link"].lo, "hi": m["link"].hi}, phi=m["phi"], pair_var=m["pair_var"])
+    rec.update(extra or {})
+    rec["seconds"] = round(time.time() - t0, 2)
+    return rec
+
+
+def _bounded(diff, tw, qw, pw, seed):
+    """crossed_lb, or (None, None, []) without targets."""
+    if not len(diff):
+        return None, None, []
+    return crossed_lb(diff, tw, qw, pw, np.random.default_rng(seed))
+
+
+def procedure(D, data, option, ranks, lambdas, iters, seed, ab_cap=None, fitter="minimal", start="both",
+              basis=6, embedding="shared", center="references"):
+    """The registered selection and prediction procedure on one dataset for one fitting option, under THE
+    SCORE (the capture-count lpd; the Gaussian working score beside it as *_gauss, diagnostic only).
+    Every candidate also records its test improvement over rank 0 and the crossed lower bound, and the
+    selection restricted to ranks <= PRIMARY_RANKS is reported beside the full one (selected_primary).
+    With fewer than MIN_TEST_WORLDS contributing test worlds the decision is unavailable (D6 rule 27)."""
     idx = D.fit[option]
     own_layer = option == "b"
     cands = [(0, 0.0)] + [(r, lam) for r in range(1, ranks + 1) for lam in lambdas]
-    out = {"candidates": [], "fitter": fitter, "start": start if fitter == "registered" else None}
+    out = {"candidates": [], "fitter": fitter, "start": start if fitter == "registered" else None, "score": SCORE}
+    if fitter == "registered":
+        out.update(basis=basis, embedding=embedding, center=center)
     best, models = None, {}
-    predict = any_predict              # noqa: F811 (the procedure scores whichever fitter it ran)
     for r, lam in cands:
         t0 = time.time()
-        m = any_fit(fitter, D, idx, data, r, lam, own_layer, iters, seed, ab_cap=ab_cap, start=start)
-        s2 = predictive_var(D, data, m, idx, fitter)
-        pv = predict(D, m, D.val_idx)
-        vscore, _ = world_mean(lpd(data["z"][D.val_idx], pv, s2(D.val_idx)), D.val_world)
-        pt = predict(D, m, D.test_idx)
-        rec = {"rank": r, "lambda": lam, "val_lpd": vscore, "start": m.get("start"),
-               "objectives": m.get("objectives"),
-               "test_rmse_truth": float(np.sqrt(np.mean((pt - data["eta"][D.test_idx]) ** 2))),
-               "seconds": round(time.time() - t0, 2)}
+        m = any_fit(fitter, D, idx, data, r, lam, own_layer, iters, seed, ab_cap=ab_cap, start=start, basis=basis,
+                    embedding=embedding, center=center)
+        sc = scorer(D, data, m, idx, fitter)
+        tc, tg = sc(D.test_idx) if len(D.test_idx) else (np.zeros(0), np.zeros(0))
+        pt = any_predict(D, m, D.test_idx)
+        rec = _cand_record(D, data, m, r, lam, fitter, sc, D.val_idx, D.val_world, t0, {
+            "test_rmse_truth": float(np.sqrt(np.mean((pt - data["eta"][D.test_idx]) ** 2))) if len(pt) else None})
         out["candidates"].append(rec)
-        models[(r, lam)] = (m, s2)
-        if best is None or vscore > best["val_lpd"]:
+        models[(r, lam)] = (m, sc, tc, tg)
+        if best is None or rec["val_lpd"] > best["val_lpd"]:
             best = rec
     sel = (best["rank"], best["lambda"])
-    m1, s21 = models[sel]
-    m0, s20 = models[(0, 0.0)]
-    zt = data["z"][D.test_idx]
-    base = lpd(zt, predict(D, m0, D.test_idx), s20(D.test_idx))
+    m1, sc1, tc1, tg1 = models[sel]
+    m0, sc0, tc0, tg0 = models[(0, 0.0)]
+    nw = int(len(np.unique(D.test_world)))
+    avail = nw >= MIN_TEST_WORLDS
+    tw = (D.test_world, D.test_qworld, D.test_pworld)
     for rec in out["candidates"]:      # (every candidate against rank 0: any restricted selection, post hoc)
-        mk, sk = models[(rec["rank"], rec["lambda"])]
-        rec["test_improvement"], rec["test_lb"], _ = crossed_lb(
-            lpd(zt, predict(D, mk, D.test_idx), sk(D.test_idx)) - base, D.test_world, D.test_qworld, D.test_pworld,
-            np.random.default_rng(seed + 7))
+        _, _, tck, tgk = models[(rec["rank"], rec["lambda"])]
+        rec["test_improvement"], rec["test_lb"], _ = _bounded(tck - tc0, *tw, seed + 7)
+        rec["test_improvement_gauss"], rec["test_lb_gauss"], _ = _bounded(tgk - tg0, *tw, seed + 7)
+
+    def ok(rank, lb):
+        return bool(avail and rank > 0 and lb is not None and lb > 0)
     prim = max((c for c in out["candidates"] if c["rank"] <= PRIMARY_RANKS), key=lambda c: c["val_lpd"])
     out["selected_primary"] = {"ranks": list(range(PRIMARY_RANKS + 1)), "rank": prim["rank"],
-                               "lambda": prim["lambda"], "test_improvement": prim["test_improvement"],
-                               "test_lb": prim["test_lb"], "success": bool(prim["rank"] > 0 and prim["test_lb"] > 0)}
-    diff = lpd(zt, predict(D, m1, D.test_idx), s21(D.test_idx)) - base
-    mean, lb, per = crossed_lb(diff, D.test_world, D.test_qworld, D.test_pworld, np.random.default_rng(seed + 7))
-    zs = data["z"][D.stest_idx]
-    sdiff = lpd(zs, predict(D, m1, D.stest_idx), s21(D.stest_idx)) - lpd(zs, predict(D, m0, D.stest_idx),
-                                                                          s20(D.stest_idx))
+                               "lambda": prim["lambda"], "start": prim["start"],
+                               "test_improvement": prim["test_improvement"],
+                               "test_lb": prim["test_lb"], "success": ok(prim["rank"], prim["test_lb"])}
+    mean, lb, per = _bounded(tc1 - tc0, *tw, seed + 7)
+    gbest = max(out["candidates"], key=lambda c: c["val_lpd_gauss"])
+    if len(D.stest_idx):
+        (s1c, s1g), (s0c, s0g) = sc1(D.stest_idx), sc0(D.stest_idx)
+        snap, snap_g = float((s1c - s0c).mean()), float((s1g - s0g).mean())
+    else:
+        snap = snap_g = None
     if sel[0] > 0:
         trn = D.fit[option]
         qn = np.unique(D.qi[trn])
@@ -713,49 +780,66 @@ def procedure(D, data, option, ranks, lambdas, iters, seed, ab_cap=None, fitter=
         align = float(abs(np.corrcoef(lead, m1["b"][qn])[0, 1])) if lead.std() > 0 else 0.0
     else:
         align = None
-    out.update(selected={"rank": sel[0], "lambda": sel[1]}, test_improvement=mean, test_lb=lb,
-               per_test_world=per, success=bool(sel[0] > 0 and lb > 0),
-               snapshot_test_improvement=float(sdiff.mean()), alignment_u1_b=align,
+    out.update(selected={"rank": sel[0], "lambda": sel[1], "start": best["start"]}, test_improvement=mean,
+               test_lb=lb, per_test_world=per, success=ok(sel[0], lb),
+               decision={"available": avail, "test_worlds": nw,
+                         "reason": None if avail else f"fewer than {MIN_TEST_WORLDS} contributing test worlds"},
+               gauss_diagnostic={"selected": {"rank": gbest["rank"], "lambda": gbest["lambda"]},
+                                 "test_improvement": gbest["test_improvement_gauss"],
+                                 "test_lb": gbest["test_lb_gauss"], "success": ok(gbest["rank"], gbest["test_lb_gauss"])},
+               snapshot_test_improvement=snap, snapshot_test_improvement_gauss=snap_g, alignment_u1_b=align,
                fit_pairs=int(len(idx)), classes=class_accuracy(D, data, m1, m0), ab_cap=ab_cap)
     return out
 
 
-def forward_procedure(D, data, ranks, lambdas, iters, seed, ab_cap=None, fitter="minimal", start="both"):
+def forward_procedure(D, data, ranks, lambdas, iters, seed, ab_cap=None, fitter="minimal", start="both",
+                      basis=6, embedding="shared", center="references"):
     """The SEPARATE forward-time recovery (v4 §7.3): the same selection-and-prediction procedure on
     D.forward's sets (fit through 120M plus references <= 120M; validation 141-160M; test 181-200M),
     reported separately for the forward transfer and its intersection with the test worlds (each with
-    the crossed bootstrap)."""
+    the crossed bootstrap). The registered map reads the predator-free controls of prey at <= 120M only
+    (map.control_access(D, fit, FORWARD_TMAX): Codex #66 r1 P1-1) and centres on the early references
+    it places."""
     F = D.forward
     idx = F["fit"]
+    ctrl = None
+    if fitter == "registered":
+        import map as mapfit
+        ctrl = mapfit.control_access(D, idx, FORWARD_TMAX)
     cands = [(0, 0.0)] + [(r, lam) for r in range(1, ranks + 1) for lam in lambdas]
-    out = {"procedure": "forward", "candidates": [], "fitter": fitter, "fit_pairs": int(len(idx)),
-           "val_pairs": int(len(F["val"])), "test_pairs": {k: int(len(v)) for k, v in F["tests"].items()}}
+    out = {"procedure": "forward", "candidates": [], "fitter": fitter, "fit_pairs": int(len(idx)), "score": SCORE,
+           "val_pairs": int(len(F["val"])), "test_pairs": {k: int(len(v)) for k, v in F["tests"].items()},
+           "controls": int(ctrl.sum()) if ctrl is not None else None}
     best, models = None, {}
     for r, lam in cands:
-        m = any_fit(fitter, D, idx, data, r, lam, False, iters, seed, ab_cap=ab_cap, start=start)
-        s2 = predictive_var(D, data, m, idx, fitter)
-        vscore, _ = world_mean(lpd(data["z"][F["val"]], any_predict(D, m, F["val"]), s2(F["val"])), F["val_world"])
-        rec = {"rank": r, "lambda": lam, "val_lpd": vscore, "start": m.get("start")}
+        t0 = time.time()
+        m = any_fit(fitter, D, idx, data, r, lam, False, iters, seed, ab_cap=ab_cap, start=start, ctrl=ctrl,
+                    basis=basis, embedding=embedding, center=center)
+        sc = scorer(D, data, m, idx, fitter)
+        rec = _cand_record(D, data, m, r, lam, fitter, sc, F["val"], F["val_world"], t0)
         out["candidates"].append(rec)
-        models[(r, lam)] = (m, s2)
-        if best is None or vscore > best["val_lpd"]:
+        models[(r, lam)] = (m, sc)
+        if best is None or rec["val_lpd"] > best["val_lpd"]:
             best = rec
     sel = (best["rank"], best["lambda"])
-    m1, s21 = models[sel]
-    m0, s20 = models[(0, 0.0)]
-    out["selected"] = {"rank": sel[0], "lambda": sel[1]}
+    m1, sc1 = models[sel]
+    m0, sc0 = models[(0, 0.0)]
+    out["selected"] = {"rank": sel[0], "lambda": sel[1], "start": best["start"]}
     for name, t in F["tests"].items():
         if not len(t):
             out[name] = {"available": False, "reason": "no targets"}
             continue
-        zt = data["z"][t]
-        diff = lpd(zt, any_predict(D, m1, t), s21(t)) - lpd(zt, any_predict(D, m0, t), s20(t))
+        (c1, g1), (c0, g0) = sc1(t), sc0(t)
         qw, pw = D.qw[D.qi[t]], D.pw[D.pj[t]]
         tw = np.where((qw >= 0) & (D.wsplit[np.maximum(qw, 0)] == ("test" if name == "intersection" else "train")),
                       qw, pw)
-        mean, lb, per = crossed_lb(diff, tw, qw, pw, np.random.default_rng(seed + 11 + len(name)))
+        nw = int(len(np.unique(tw)))
+        mean, lb, per = crossed_lb(c1 - c0, tw, qw, pw, np.random.default_rng(seed + 11 + len(name)))
+        gmean, glb, _ = crossed_lb(g1 - g0, tw, qw, pw, np.random.default_rng(seed + 11 + len(name)))
         out[name] = {"available": True, "test_improvement": mean, "test_lb": lb, "per_world": per,
-                     "success": bool(sel[0] > 0 and lb > 0), "targets": int(len(t))}
+                     "success": bool(nw >= MIN_TEST_WORLDS and sel[0] > 0 and lb > 0), "targets": int(len(t)),
+                     "worlds": nw, "decision_available": nw >= MIN_TEST_WORLDS,
+                     "test_improvement_gauss": gmean, "test_lb_gauss": glb}
     out["success"] = out["forward_transfer"].get("success", False)
     out["test_improvement"] = out["forward_transfer"].get("test_improvement")
     out["test_lb"] = out["forward_transfer"].get("test_lb")
@@ -770,9 +854,11 @@ REG_CONTINUATION = (0.3, 0.1, 0.03, 0.01)
 REGISTERED_LAMBDAS = (0.01, 0.02, 0.05, 0.2)
 
 
-def numerical(D, data, option, rank, iters, seed, ab_cap=None, fitter="minimal"):
+def numerical(D, data, option, rank, iters, seed, ab_cap=None, fitter="minimal", basis=6, embedding="shared",
+              center="references"):
     """Noiseless data fitted at the true rank (the penalty continued down to 0.001, warm-started and
-    balanced, 100 sweeps per step: a cold nearly unpenalized ALS stalls short of the exact fit): the
+    balanced, 100 sweeps per step: a cold nearly unpenalized ALS stalls short of the exact fit; the
+    registered map: REG_CONTINUATION, 30 sweeps per step, each step started from the last): the
     test targets' errors relative to the interaction's SD, overall and without the targets that have
     an endpoint with fewer fitting pairs than the rank's parameters (rank + 1: not identifiable)."""
     idx = D.fit[option]
@@ -780,7 +866,8 @@ def numerical(D, data, option, rank, iters, seed, ab_cap=None, fitter="minimal")
     predict = any_predict              # noqa: F811
     for lam in CONTINUATION if fitter == "minimal" else REG_CONTINUATION:
         m = any_fit(fitter, D, idx, data, rank, lam, option == "b", 100 if fitter == "minimal" else 30, seed,
-                    ab_cap=ab_cap, init=m, balance=True, start="warm" if m is None else "both", weighted=False)
+                    ab_cap=ab_cap, init=m, balance=True, start="warm" if m is None else "both", weighted=False,
+                    basis=basis, embedding=embedding, center=center)
     t = D.test_idx
     err = predict(D, m, t) - data["eta"][t]
     sd = float(np.std(data["inter"][t]))
@@ -801,11 +888,71 @@ _DATA = {}
 CONFIG_SCHEMA = "finfolk.redqueen.recoverycfg/1"
 
 
-def run_config(a, graph_sha):
-    """Everything a recovery result depends on (resume and summary refuse to mix two of them), the reference
-    assignment included (its sha256 and actual times, or the assumed REF_TIMES)."""
-    tools = {f: rqlib.sha256_file(os.path.join(HERE, f)) for f in ("recovery.py", "map.py", "graph.py")
-             if os.path.isfile(os.path.join(HERE, f))}
+FITTER_DEFAULTS = {     # (Codex #66 r1 P2-7: each fitter's registered command-line defaults)
+    "minimal": {"options": "a,b,base", "lambdas": "0.02,0.1,0.5", "iters": 40, "start": "both", "basis": 6,
+                "embedding": "shared", "center": "references"},
+    "registered": {"options": "a", "lambdas": ",".join(repr(x) for x in REGISTERED_LAMBDAS), "iters": 30,
+                   "start": "both", "basis": 6, "embedding": "shared", "center": "references"},
+}
+TOOLS = ("recovery.py", "map.py", "graph.py", "rqlib.py", "noisebank.py")   # (every computational dependency)
+
+
+def resolve(a):
+    """Fill the fitter's registered defaults into the arguments a (None: not given) and refuse incompatible
+    choices BEFORE any worker starts (Codex #66 r1 P2-7) -> a."""
+    fitter = getattr(a, "fitter", None) or "minimal"
+    if fitter not in FITTERS:
+        raise SystemExit(f"--fitter {fitter}: one of {FITTERS}")
+    a.fitter = fitter
+    d = FITTER_DEFAULTS[fitter]
+    for k, v in d.items():
+        if getattr(a, k, None) is None:
+            setattr(a, k, v)
+    if getattr(a, "ab_cap", None) is None:
+        a.ab_cap = -1
+    opts = a.options.split(",")
+    if not opts or len(set(opts)) != len(opts) or any(o not in OPTIONS + ("fwd",) for o in opts):
+        raise SystemExit(f"--options {a.options}: distinct options of {OPTIONS + ('fwd',)}")
+    try:
+        lams = [float(x) for x in a.lambdas.split(",")]
+    except ValueError:
+        raise SystemExit(f"--lambdas {a.lambdas}: a comma list of numbers")
+    if not lams or any(not (math.isfinite(x) and x > 0) for x in lams):
+        raise SystemExit(f"--lambdas {a.lambdas}: positive finite penalties")
+    if getattr(a, "ranks", 0) < 0 or a.iters < 1:
+        raise SystemExit("--ranks >= 0 and --iters >= 1")
+    if fitter == "registered":
+        if "b" in opts:
+            raise SystemExit("--options b: option (b), the own-world layer inside the Level-1 fit, is dropped for the "
+                             "registered map (q30b; map.fit refuses it): use a, base or fwd")
+        if a.ab_cap >= 0:
+            raise SystemExit("--ab-cap: a minimal-fitter comparison only (the registered map has no A/B cap)")
+        if a.start not in ("both", "warm", "cold"):
+            raise SystemExit(f"--start {a.start}: both, warm or cold")
+        if a.basis not in (4, 6, 8) or a.embedding not in ("shared", "separate") or a.center not in ("references",
+                                                                                                        "train_c"):
+            raise SystemExit("--basis 4|6|8, --embedding shared|separate, --center references|train_c")
+    else:
+        for k in ("start", "basis", "embedding", "center"):
+            if getattr(a, k) != d[k]:
+                raise SystemExit(f"--{k}: the registered map's option (the minimal fitter has none)")
+    return a
+
+
+def graph_identity(meta):
+    """The graph a run consumes (Codex #66 r1 P2-8): its edges' sha256 and the canonical sha256 of all of its
+    metadata (worlds and treatments, splits, snapshot holdouts, the settings: everything Data reads besides
+    the edges)."""
+    m = {k: v for k, v in meta.items() if k != "edges"}
+    return {"edges_sha256": m["edges_sha256"], "meta_sha256": rqlib.canonical_sha(m)}
+
+
+def run_config(a, graph):
+    """Everything a recovery result depends on (resume and summary refuse to mix two of them): the graph's
+    identity (edges and metadata), the reference assignment (its sha256 and actual times, or the assumed
+    REF_TIMES), the resolved arguments, and the sha256 of every computational source (TOOLS: the seed
+    derivation in rqlib and the count density's numerics in noisebank included)."""
+    tools = {f: rqlib.sha256_file(os.path.join(HERE, f)) for f in TOOLS if os.path.isfile(os.path.join(HERE, f))}
     rp = getattr(a, "references", None)
     if rp:
         times, sha = reference_times(rp)
@@ -813,15 +960,16 @@ def run_config(a, graph_sha):
                 "sentinels": {g: [times["sentinels"][g][k] for k in range(8)] for g in ("RQ", "RP")}}
     else:
         refs = {"assumed": list(REF_TIMES)}
-    return {"schema": CONFIG_SCHEMA, "graph_edges_sha256": graph_sha, "namespace": a.namespace, "references": refs,
-            "fitter": a.fitter, "options": a.options, "ranks": a.ranks, "lambdas": a.lambdas, "iters": a.iters,
-            "ab_cap": a.ab_cap, "start": getattr(a, "start", None), "tools_sha256": tools, "scenarios": SCENARIOS,
-            "defaults": DEFAULTS, "lambda_grid": list(REGISTERED_LAMBDAS) if "REGISTERED_LAMBDAS" in globals() else None,
-            "bootstrap": "crossed/1"}
+    return {"schema": CONFIG_SCHEMA, "graph_edges_sha256": graph["edges_sha256"], "graph": graph,
+            "namespace": a.namespace, "references": refs, "fitter": a.fitter, "options": a.options, "ranks": a.ranks,
+            "lambdas": a.lambdas, "iters": a.iters, "ab_cap": a.ab_cap, "start": a.start, "basis": a.basis,
+            "embedding": a.embedding, "center": a.center, "tools_sha256": tools, "scenarios": SCENARIOS,
+            "defaults": DEFAULTS, "lambda_grid": list(REGISTERED_LAMBDAS), "bootstrap": "crossed/1", "score": SCORE,
+            "min_test_worlds": MIN_TEST_WORLDS}
 
 
-def graph_sha(path):
-    return rqlib.read_json(os.path.join(os.path.dirname(os.path.abspath(path)), "graph.meta.json"))["edges_sha256"]
+def graph_meta(path):
+    return graph_identity(rqlib.read_json(os.path.join(os.path.dirname(os.path.abspath(path)), "graph.meta.json")))
 
 
 def load_data(path, refs_path=None):
@@ -832,39 +980,69 @@ def load_data(path, refs_path=None):
 
 
 def one(a):
+    resolve(a)
+    if a.scenario not in SCENARIOS:
+        raise SystemExit(f"--scenario {a.scenario}: not a registered scenario")
     D = load_data(a.graph, getattr(a, "references", None))
     sc = SCENARIOS[a.scenario]
     seed = rqlib.derive_seed(a.namespace, "recovery", a.scenario, a.rep)
     t0 = time.time()
     data = simulate(D, sc, seed)
+    gid = graph_identity(D.g)
     res = {"schema": RESULT_SCHEMA, "scenario": a.scenario, "rep": a.rep, "seed": seed,
            "settings": data["settings"], "interaction_scale": data["c"], "energy_check": data["energy"],
-           "graph_edges_sha256": D.g["edges_sha256"], "options": {},
-           "config_sha256": rqlib.canonical_sha(run_config(a, D.g["edges_sha256"]))}
+           "graph_edges_sha256": gid["edges_sha256"], "graph": gid, "options": {},
+           "config_sha256": rqlib.canonical_sha(run_config(a, gid))}
     cap = a.ab_cap if a.ab_cap >= 0 else None
     res["fitter"] = a.fitter
     res["start"] = a.start
+    lams = [float(x) for x in a.lambdas.split(",")]
+    reg = dict(basis=a.basis, embedding=a.embedding, center=a.center)
     for opt in a.options.split(","):
         if sc.get("noiseless") and opt == "fwd":       # (the forward procedure is a noisy-data selection)
             res["options"][opt] = {"procedure": "forward", "available": False,
                                    "reason": "the forward-time procedure is not defined for a noiseless scenario"}
         elif sc.get("noiseless"):
-            res["options"][opt] = numerical(D, data, opt, sc["rank"], a.iters, seed, ab_cap=cap, fitter=a.fitter)
+            res["options"][opt] = numerical(D, data, opt, sc["rank"], a.iters, seed, ab_cap=cap, fitter=a.fitter, **reg)
         elif opt == "fwd":
-            res["options"][opt] = forward_procedure(D, data, a.ranks, [float(x) for x in a.lambdas.split(",")],
-                                                    a.iters, seed, ab_cap=cap, fitter=a.fitter, start=a.start)
+            res["options"][opt] = forward_procedure(D, data, a.ranks, lams, a.iters, seed, ab_cap=cap,
+                                                    fitter=a.fitter, start=a.start, **reg)
         else:
-            res["options"][opt] = procedure(D, data, opt, a.ranks, [float(x) for x in a.lambdas.split(",")],
-                                            a.iters, seed, ab_cap=cap, fitter=a.fitter, start=a.start)
+            res["options"][opt] = procedure(D, data, opt, a.ranks, lams, a.iters, seed, ab_cap=cap, fitter=a.fitter,
+                                            start=a.start, **reg)
     res["reference_support"] = D.forward["reference_support"]            # (#71 r2 P2: persisted)
     res["seconds"] = round(time.time() - t0, 1)
     rqlib.write_json_durable(a.out, res)
     return 0
 
 
-def run(a):
+def _result_files(d):
+    """The result files of a run directory: every .json but config.json and summary*."""
+    return sorted(f for f in os.listdir(d) if f.endswith(".json") and f != "config.json" and not f.startswith("summary"))
+
+
+def check_result(d, f, r, want, namespace, refusing):
+    """A kept result's identity (Codex #66 r1 P2-9): its name is exactly <scenario>.<rep:03d>.json of its
+    recorded scenario and rep, the scenario is registered, the seed is the derived seed of (namespace,
+    scenario, rep), and it carries the run's configuration -> (scenario, rep)."""
+    if not isinstance(r, dict) or r.get("schema") != RESULT_SCHEMA:
+        raise SystemExit(f"{d}/{f}: not a recovery result: {refusing}")
+    if r.get("config_sha256") != want:
+        raise SystemExit(f"{f}: a result of another configuration in {d}: {refusing}")
+    sc, rep = r.get("scenario"), r.get("rep")
+    if sc not in SCENARIOS or not isinstance(rep, int) or rep < 0 or f != f"{sc}.{rep:03d}.json":
+        raise SystemExit(f"{d}/{f}: its identity ({sc!r}, {rep!r}) does not match its file name: {refusing}")
+    if r.get("seed") != rqlib.derive_seed(namespace, "recovery", sc, rep):
+        raise SystemExit(f"{d}/{f}: its seed is not the derived seed of ({namespace}, {sc}, {rep}): {refusing}")
+    return sc, rep
+
+
+def prepare_run(a):
+    """Resolve the arguments, write the run's config.json (or check it against an existing one) and check every
+    kept result's configuration and identity -> the configuration's sha256."""
+    resolve(a)
     os.makedirs(a.out, exist_ok=True)
-    cfg = rqlib.canonical(run_config(a, graph_sha(a.graph)))
+    cfg = rqlib.canonical(run_config(a, graph_meta(a.graph)))
     cp = os.path.join(a.out, "config.json")
     if os.path.isfile(cp):
         if rqlib.read_bytes(cp) != cfg:
@@ -873,15 +1051,20 @@ def run(a):
             raise SystemExit(f"{a.out} holds a recovery run of another configuration ({diff}): refusing to resume")
     else:
         rqlib.write_durable(cp, cfg)
-    want = rqlib.sha256_bytes(cfg)
-    for f in os.listdir(a.out):
-        if f.endswith(".json") and f != "config.json" and not f.startswith("summary"):
-            if rqlib.read_json(os.path.join(a.out, f)).get("config_sha256") != rqlib.canonical_sha(json.loads(cfg)):
-                raise SystemExit(f"{f}: a result of another configuration in {a.out}: refusing to resume")
-    del want
+    want = rqlib.canonical_sha(json.loads(cfg))
+    for f in _result_files(a.out):
+        check_result(a.out, f, rqlib.read_json(os.path.join(a.out, f)), want, a.namespace, "refusing to resume")
+    return want
+
+
+def run(a):
+    prepare_run(a)
     names = SETS[a.set] if a.set != "all" else [n for s in ("main", "stress", "power", "numerical") for n in SETS[s]]
     if a.scenarios:
         names = a.scenarios.split(",")
+    unknown = [n for n in names if n not in SCENARIOS]
+    if unknown:
+        raise SystemExit(f"unknown scenarios {unknown}")
     jobs = []
     for sc in names:
         reps = 1 if sc in SETS["numerical"] else a.reps if (sc in SETS["main"] or a.scenarios) else max(2, a.reps // 2)
@@ -898,7 +1081,8 @@ def run(a):
             cmd = [sys.executable, os.path.abspath(__file__), "one", "--graph", a.graph, "--scenario", sc,
                    "--rep", str(rep), "--out", f, "--options", a.options, "--ranks", str(a.ranks),
                    "--lambdas", a.lambdas, "--iters", str(a.iters), "--namespace", a.namespace,
-                   "--ab-cap", str(a.ab_cap), "--fitter", a.fitter, "--start", a.start] + \
+                   "--ab-cap", str(a.ab_cap), "--fitter", a.fitter, "--start", a.start, "--basis", str(a.basis),
+                   "--embedding", a.embedding, "--center", a.center] + \
                 (["--references", a.references] if getattr(a, "references", None) else [])
             running.append((subprocess.Popen(cmd, env=env, stdin=subprocess.DEVNULL), sc, rep))
         time.sleep(0.5)
@@ -926,23 +1110,38 @@ def _mean(xs):
     return float(np.mean(v)) if v else None
 
 
+def _median(xs):
+    v = [x for x in xs if x is not None]
+    return float(np.median(v)) if v else None
+
+
+def _counts(xs):
+    out = {}
+    for x in xs:
+        out[str(x)] = out.get(str(x), 0) + 1
+    return dict(sorted(out.items()))
+
+
 def summarize(d):
-    rows = {}
-    cfgs = set()
-    for f in sorted(os.listdir(d)):
-        if not f.endswith(".json") or f.startswith("summary") or f == "config.json":
-            continue
+    """The run directory's cells. Refused (Codex #66 r1 P2-9): a directory without its config.json, a result
+    of another configuration, a result whose name, recorded identity and derived seed disagree, and a second
+    result of one (scenario, rep)."""
+    cp = os.path.join(d, "config.json")
+    if not os.path.isfile(cp):
+        raise SystemExit(f"{d}: no config.json (a run directory is written by run / prepare_run): refusing a summary")
+    cfg = rqlib.read_json(cp)
+    want = rqlib.canonical_sha(cfg)
+    rows, seen, sups = {}, {}, []
+    for f in _result_files(d):
         r = rqlib.read_json(os.path.join(d, f))
-        cfgs.add(r.get("config_sha256"))
-        if len(cfgs) > 1 or None in cfgs:
-            raise SystemExit(f"{d}: results of different (or unrecorded) configurations: refusing a mixed summary")
+        key = check_result(d, f, r, want, cfg.get("namespace"), "refusing a mixed summary")
+        if key in seen or r["seed"] in {s for _, s in seen.values()}:
+            raise SystemExit(f"{d}: {f} duplicates {seen.get(key, ('another result',))[0]}: refusing a summary")
+        seen[key] = (f, r["seed"])
+        sups.append(rqlib.canonical(r.get("reference_support")))
         for opt, o in r["options"].items():
             rows.setdefault((r["scenario"], opt), []).append(o)
-    out = {"schema": "finfolk.redqueen.recoverysummary/1", "config_sha256": next(iter(cfgs), None), "cells": []}
-    sups = []
-    for f in sorted(os.listdir(d)):
-        if f.endswith(".json") and not f.startswith("summary") and f != "config.json":
-            sups.append(rqlib.canonical(rqlib.read_json(os.path.join(d, f)).get("reference_support")))
+    out = {"schema": "finfolk.redqueen.recoverysummary/2", "config_sha256": want, "datasets": len(seen), "cells": []}
     if len(set(sups)) > 1:
         raise SystemExit(f"{d}: results with different reference support (another reference assignment?)")
     out["reference_support"] = json.loads(sups[0]) if sups else None
@@ -957,18 +1156,30 @@ def summarize(d):
             selp = {}
             for p in prim:
                 selp[p["rank"]] = selp.get(p["rank"], 0) + 1
+            gd = [o["gauss_diagnostic"] for o in lst if o.get("gauss_diagnostic")]
             cell = {"scenario": sc, "option": opt, "datasets": len(lst), "successes": k,
                     "rate": round(k / len(lst), 3), "wilson95": wilson(k, len(lst)),
                     "selected_ranks": dict(sorted(sel.items())),
                     "positive_rank_selected": sum(o["selected"]["rank"] > 0 for o in lst),
+                    "decision_unavailable": sum(not (o.get("decision") or {"available": True})["available"] for o in lst),
                     "primary": ({"ranks": prim[0]["ranks"], "datasets": len(prim), "successes": kp,
                                  "rate": round(kp / len(prim), 3), "wilson95": wilson(kp, len(prim)),
                                  "selected_ranks": dict(sorted(selp.items())),
-                                 "positive_rank_selected": sum(p["rank"] > 0 for p in prim)}
+                                 "positive_rank_selected": sum(p["rank"] > 0 for p in prim),
+                                 "median_test_lb": _median(p["test_lb"] for p in prim)}
                                 if prim else None),
                     "start": lst[0].get("start"),
+                    # (the winning start of the SELECTED candidate: over every dataset, a rank-0 selection
+                    #  counted under its single warm fit, the reg5 table's convention; and over rank > 0 only)
+                    "selected_start": _counts(o["selected"].get("start") for o in lst),
+                    "selected_start_positive": _counts(o["selected"].get("start") for o in lst
+                                                       if o["selected"]["rank"] > 0),
                     "mean_test_improvement": _mean(o["test_improvement"] for o in lst),
                     "mean_test_lb": _mean(o["test_lb"] for o in lst),
+                    "median_test_lb": _median(o["test_lb"] for o in lst),
+                    "gauss_diagnostic": ({"successes": sum(g["success"] for g in gd),
+                                          "selected_ranks": _counts(g["selected"]["rank"] for g in gd),
+                                          "median_test_lb": _median(g["test_lb"] for g in gd)} if gd else None),
                     "fit_pairs": lst[0]["fit_pairs"],
                     "classes": {k: {f: float(np.mean([o["classes"][k][f] for o in lst]))
                                     for f in ("rmse_selected", "rmse_rank0", "interaction_sd")}
@@ -1035,10 +1246,11 @@ def bench(a):
     t0 = time.time()
     data = simulate(D, SCENARIOS["r2_034"], 1)
     t1 = time.time()
-    m = fit(D, D.fit["a"], data["zbar"], 2, 0.1, False, a.iters, 1)
+    iters = a.iters or 40
+    m = fit(D, D.fit["a"], data["zbar"], 2, 0.1, False, iters, 1)
     t2 = time.time()
     print(json.dumps({"pairs": len(D.qi), "simulate_s": round(t1 - t0, 2), "fit_rank2_s": round(t2 - t1, 2),
-                      "iters": a.iters, "mu": m["mu"]}))
+                      "iters": iters, "mu": m["mu"]}))
     return 0
 
 
@@ -1054,22 +1266,29 @@ def main(argv=None):
             continue
         if name != "summarize":
             s.add_argument("--graph", required=True)
-            s.add_argument("--iters", type=int, default=40)
+            s.add_argument("--iters", type=int, default=None, help="sweeps (default: the fitter's, FITTER_DEFAULTS)")
             s.add_argument("--references", help="the selected references/1 document: the ACTUAL reference "
                                                 "frames per guild (default: the assumed REF_TIMES, planning only)")
         if name in ("run", "one"):
-            s.add_argument("--options", default="a,b,base")
+            s.add_argument("--options", default=None, help="default: the fitter's (minimal a,b,base; registered a)")
             s.add_argument("--ranks", type=int, default=4)
-            s.add_argument("--lambdas", default="0.02,0.1,0.5")
+            s.add_argument("--lambdas", default=None,
+                           help="default: the fitter's (minimal 0.02,0.1,0.5; registered REGISTERED_LAMBDAS)")
             s.add_argument("--namespace", default="rq2026-recovery")
             s.add_argument("--out", required=True)
             s.add_argument("--ab-cap", type=int, default=-1, metavar="R",
-                           help="hold the A/B prey's interaction to rank <= R in every fit (-1: no cap)")
+                           help="hold the A/B prey's interaction to rank <= R in every fit (-1: no cap; minimal only)")
             s.add_argument("--fitter", choices=FITTERS, default="minimal",
                            help="minimal (ridge ALS) or registered (map.py, item 7: the v4 §6 map)")
-            s.add_argument("--start", choices=("both", "warm", "cold"), default="both",
+            s.add_argument("--start", choices=("both", "warm", "cold"), default=None,
                            help="the registered map's embedding start: both (registered: the lower penalized "
                                 "training objective kept), or one")
+            s.add_argument("--basis", type=int, choices=(4, 6, 8), default=None,
+                           help="the registered map's basis functions per axis (6; 4 and 8: the sensitivities)")
+            s.add_argument("--embedding", choices=("shared", "separate"), default=None,
+                           help="the registered map's survival embedding (separate: the sensitivity)")
+            s.add_argument("--center", choices=("references", "train_c"), default=None,
+                           help="the registered map's fixed centring distribution (train_c: the sensitivity)")
         if name == "run":
             s.add_argument("--set", choices=("main", "stress", "power", "numerical", "all"), default="main")
             s.add_argument("--scenarios", help="a comma list instead of --set (--reps each; numerical: 1)")
