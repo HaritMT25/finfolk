@@ -158,6 +158,20 @@ class TestBackbone(unittest.TestCase):
         self.assertTrue(r["material_point"])
         r0 = self.bb.directional_test({k: v - 0.12 for k, v in slopes.items()}, "H-P", self.st.DELTA_P, draws=999)
         self.assertFalse(r0["detected"])
+        # (Codex #68 D6 P2-2: given the eligibility record the test runs only when the hypothesis is available, on
+        # exactly its registered population)
+        ids = sorted(slopes)
+        elig = {"schema": self.st.ELIGIBILITY_SCHEMA,
+                "hypotheses": {"H-P": {"available": True, "worlds": ids},
+                               "H-Q": {"available": False, "reason": "pending repair", "worlds": ids}}}
+        rb = self.bb.directional_test(slopes, "H-P", self.st.DELTA_P, draws=999, eligibility=elig)
+        self.assertEqual((rb["detected"], rb["p"]), (r["detected"], r["p"]))
+        with self.assertRaisesRegex(self.st.StatsError, "registered population"):
+            self.bb.directional_test({k: slopes[k] for k in ids[1:]}, "H-P", self.st.DELTA_P, draws=999, eligibility=elig)
+        with self.assertRaisesRegex(self.st.StatsError, "is unavailable"):
+            self.bb.directional_test(slopes, "H-Q", self.st.DELTA_Q, draws=999, eligibility=elig)
+        with self.assertRaisesRegex(self.st.StatsError, "not an eligibility record"):
+            self.bb.directional_test(slopes, "H-P", self.st.DELTA_P, draws=999, eligibility={"hypotheses": {}})
 
 
 if __name__ == "__main__":

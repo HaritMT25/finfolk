@@ -123,6 +123,22 @@ class TestRecurrence(unittest.TestCase):
         self.assertAlmostEqual(math.sqrt(2) * 0.10 * 0.45 / math.sqrt(2) / 0.45, 0.10, places=15)
 
     # ------------------------------------------------------------ H.14 14-17
+    def test_hf_binds_the_population(self):
+        """Codex #68 D6 P2-2: given the eligibility record (stats.eligibility) H-F runs only when it is available, on
+        exactly its registered population (the common Q200); otherwise StatsError, before any analysis."""
+        import stats
+        ws = [dict(self.rc.analyze_world(self.wd, self.data(k=i)), id=f"w{i}") for i in range(3)]
+        ids = [w["id"] for w in ws]
+        elig = {"schema": stats.ELIGIBILITY_SCHEMA, "hypotheses": {"H-F": {"available": True, "worlds": ids}}}
+        a, b = self.rc.hf(ws), self.rc.hf(list(reversed(ws)), eligibility=elig)
+        self.assertEqual((a["n"], a["S_F"]), (b["n"], b["S_F"]))
+        with self.assertRaisesRegex(stats.StatsError, "registered population"):
+            self.rc.hf(ws[1:], eligibility=elig)
+        off = {"schema": stats.ELIGIBILITY_SCHEMA,
+               "hypotheses": {"H-F": {"available": False, "reason": "|Q200| = 20 < 24", "worlds": ids}}}
+        with self.assertRaisesRegex(stats.StatsError, "is unavailable"):
+            self.rc.hf(ws, eligibility=off)
+
     def hfw(self, datas):
         return self.rc.hf([dict(self.rc.analyze_world(self.wd, d), id=f"w{i}") for i, d in enumerate(datas)])
 

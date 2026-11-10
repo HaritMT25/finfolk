@@ -411,9 +411,13 @@ def hc_world(free, neural, scripted, focal_times, interval=FULL):
     return {"beta_N": bn, "beta_S": bs, "d": bn - bs}
 
 
-def directional_test(world_slopes, hypothesis, delta, draws=stats.B_BOOT):
+def directional_test(world_slopes, hypothesis, delta, draws=stats.B_BOOT, eligibility=None):
     """The H.2 test of a mean of per-world slopes {world id: slope} (unpooled fits: cached), with the
-    registered bootstrap stream and material scale."""
+    registered bootstrap stream and material scale. eligibility (stats.eligibility's record; Annex H D6 rules
+    26-27): the analysis runs only when the hypothesis is available, on exactly its registered population (the
+    common Q200: stats.require_population; StatsError otherwise)."""
+    if eligibility is not None:
+        stats.require_population(eligibility, hypothesis, list(world_slopes))
     ids = sorted(world_slopes)
     vals = [float(world_slopes[w]) for w in ids]
     if not all(math.isfinite(v) for v in vals):

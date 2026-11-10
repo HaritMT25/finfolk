@@ -174,6 +174,26 @@ class TestTransition(unittest.TestCase):
         d2 = tr.epoch_components(dummy, betas["E2"], idx2)[1]
         self.assertGreater(np.std(d["E1"]["beta_P"] - d2["beta_P"]), 0.05)
 
+    def test_ht_binds_the_population(self):
+        """Codex #68 D6 P2-2: given the eligibility record H-T runs only when available, on exactly the common Q200
+        in every epoch; otherwise StatsError, before any analysis."""
+        from types import SimpleNamespace
+        tr, st = self.tr, self.st
+        ids = ["a", "b", "c"]
+        def inputs(ws):
+            return ({e: [(SimpleNamespace(id=w, periods=()), None) for w in ws] for e in tr.EPOCHS},
+                    {e: {"P": {w: 0.0 for w in ws}, "Q": {w: 0.0 for w in ws}} for e in tr.EPOCHS},
+                    {e: True for e in tr.EPOCHS})
+        elig = {"schema": st.ELIGIBILITY_SCHEMA, "hypotheses": {"H-T": {"available": True, "worlds": ids}}}
+        with self.assertRaisesRegex(st.StatsError, "registered population"):
+            tr.ht(*inputs(ids[1:]), c_T=None, report=False, eligibility=elig)
+        off = {"schema": st.ELIGIBILITY_SCHEMA,
+               "hypotheses": {"H-T": {"available": False, "reason": "pending repair", "worlds": ids}}}
+        with self.assertRaisesRegex(st.StatsError, "is unavailable"):
+            tr.ht(*inputs(ids), c_T=None, report=False, eligibility=off)
+        r = tr.ht(*inputs(ids), c_T=None, report=False, eligibility=elig)   # (bound: the analysis proceeds,
+        self.assertEqual((r["failure"], r["worlds"]), ("domain", ids))          # here to its domain check)
+
     def test_guard_and_decision(self):
         tr = self.tr
         self.assertAlmostEqual(tr.GUARD, 6.396929655, places=8)

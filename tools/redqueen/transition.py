@@ -572,7 +572,7 @@ def classify(obs_e, draws_e, gate, a=LEVEL):
 
 
 def ht(epochs, betas, gates, loads=None, k=0, analysis="main", draws=stats.B_BOOT, c_T=GUARD, p_model=None,
-       report=True, redesign=None):
+       report=True, redesign=None, eligibility=None):
     """The complete H-T analysis. epochs: {e: [(WorldDesign for e, responses y)]} (the same unique world
     ids in every epoch, any order); betas: {e: {"P": {world id: slope}, "Q": {world id: slope}}}; gates:
     {e: the epoch's calibrated recurrence-detection gate (bool)}; loads: {world id: {"C": L, "Q": L}}
@@ -587,6 +587,8 @@ def ht(epochs, betas, gates, loads=None, k=0, analysis="main", draws=stats.B_BOO
     calibrated = c_T is not None
     c_T = max(GUARD, c_T) if calibrated else GUARD
     ids = canonical_ids(epochs, betas, loads)
+    if eligibility is not None:                # (Annex H D6 rules 26-27: the common Q200 in EVERY epoch)
+        stats.require_population(eligibility, "H-T", ids)
     grid = tuple(recurrence.EPOCH_PERIODS)
     off = sorted({(e, wd.id) for e in EPOCHS for wd, _ in epochs[e] if tuple(wd.periods) != grid})
     if off:                                  # (#68 round 5 P2-2: the registered domain, never a supplied list)

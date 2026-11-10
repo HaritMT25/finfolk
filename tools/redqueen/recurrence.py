@@ -720,8 +720,13 @@ def select(world):
     return bP, best, int(bP is not None)
 
 
-def hf(worlds):
-    """S_F and the material quantities over all n qualifying worlds' analyses (analyze_world)."""
+def hf(worlds, eligibility=None):
+    """S_F and the material quantities over all n qualifying worlds' analyses (analyze_world). eligibility
+    (stats.eligibility's record; Annex H D6 rules 26-27): H-F runs only when available, on exactly the common Q200
+    (stats.require_population; StatsError otherwise)."""
+    if eligibility is not None:
+        import stats
+        stats.require_population(eligibility, "H-F", [w["id"] for w in worlds])
     n = len(worlds)
     out = {"n": n, "worlds": {}, "available": True, "reasons": []}
     if n == 0:
