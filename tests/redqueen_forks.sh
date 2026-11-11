@@ -160,8 +160,24 @@ for b in [x for x in reg["worlds"] if x["kind"] == "pilot"]:
 refs = {"prey": [{"world": b, "frame": f} for b in sorted({x["root"] for x in reg["worlds"]}) for f in (4000, 8000, 12000, 16000)],
         "predators": [{"world": b, "frame": f} for b in sorted({x["root"] for x in reg["worlds"]}) for f in (20000, 24000, 4000, 12000)]}
 out = forks.profile_design("R", refs)
-assert out["counts"]["fork_branch"] == 4 * 3 * 17 and out["counts"]["pilot_branch"] == 2 * 2 * 17, out["counts"]
-print("pilot ok; profile design", out["counts"], "deduplicated", out["deduplicated"])
+# (Annex H D6 rule 27, PR-D) every scheduled state is measured or omitted EXPLICITLY with its cause: the
+# branches whose origins are unavailable here have no state, so none of their 3 x 17 pairs is emitted
+om = [o for o in out["omitted"] if o["family"] == "fork_branch"]
+gone = {b["id"] for b in reg["worlds"] if b["kind"] == "main" and worlds.read_state("R/forks", b["id"])["status"] in
+        ("unavailable", "invalidated")}
+assert {o["state"]["world"] for o in om} == gone and len(om) == 3 * len(gone), (om, gone)
+assert all(o["why"].startswith(("the branch is", "an unavailable origin", "biological")) for o in om), om
+assert out["counts"].get("fork_branch", 0) + 17 * len(om) == 4 * 3 * 17, out["counts"]
+assert out["counts"]["pilot_branch"] == 2 * 2 * 17, out["counts"]
+oc = forks.outcomes("R")
+# (Codex #78 r1 P1, P2-3) from the rule-24 evidence: an origin past its root's registered end is unavailable, an
+# invalidated branch is rejected first; every other branch has an evidence-bound outcome of the registered kinds
+for b in gone:
+    want = {"invalidated"} if worlds.read_state("R/forks", b)["status"] == "invalidated" else {"unavailable_origin"}
+    assert set(oc["branches"][b]["at"].values()) == want, (b, oc["branches"][b])
+assert all(set(r["at"].values()) <= set(oc["kinds"]) for r in oc["branches"].values()), oc["branches"]
+assert all(o["cause"] in ("unavailable_origin", "technical", "biological") for o in out["omitted"]), out["omitted"]
+print("pilot ok; profile design", out["counts"], "omitted", out["omitted_counts"], "deduplicated", out["deduplicated"])
 PY
 $FK status --study R > st.json || fail "status"
 echo "redqueen_forks: ok"

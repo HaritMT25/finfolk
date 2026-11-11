@@ -2974,7 +2974,7 @@ def _lineage_rows(raw, upto):
     return out
 
 
-def attempt_sequence(root, wid, d, w, attempt, ledger, log_every, lineage=False):
+def attempt_sequence(root, wid, d, w, attempt, ledger, log_every, lineage=False, refill_base="founders"):
     """One attempt's EVIDENCE-BOUND sample sequence under evidence.py's rules (shared with val_block.py; Annex H D6
     rule 24): the chain is the NEWEST line of descent of the attempt's segments (each chain segment after the
     first must resume its predecessor's acceptance record at its start); each chain segment's main-CSV bytes are
@@ -3067,7 +3067,10 @@ def attempt_sequence(root, wid, d, w, attempt, ledger, log_every, lineage=False)
             stop = f"{name}: {why}"
             break
     guilds = tuple(gc for gc in evidence.GUILD_COLS if not (gc[0] == "predators" and tr == "A"))
-    obs = evidence.terminal(samples, guilds, base, refill_base=0 if base == 0 else None)
+    # the refill baseline: the founders' 0 for a founder history; a fork branch's is its frozen origin's counter,
+    # passed by its caller (forks.branch_evidence; Codex #78 r2 P2-4), else unchecked (None)
+    rb = (0 if base == 0 else None) if refill_base == "founders" else refill_base
+    obs = evidence.terminal(samples, guilds, base, refill_base=rb)
     names = {c[0] for c in chain}
     unsupported = []
     for e in mine:
@@ -3085,6 +3088,7 @@ def attempt_sequence(root, wid, d, w, attempt, ledger, log_every, lineage=False)
         unsupported.append({"guild": g, "first_zero_frame": zf, "segment": e.get("segment"), "why": why})
     used = {e["segment"] for e in evid}
     return {"state": st, "obs": obs, "samples": obs["samples"], "accepted_through": accepted, "stop": stop,
+            "refill_base": rb,
             "lineage": events, "lineage_through": lin_through if lineage else None, "checkpoints": ckpts,
             "evidence": {"state_sha256": st_sha, "accept_bytes": len(acc_raw or b""), "accept_sha256": acc_sha,
                          "segments": evid, "tail": tail_ev, "superseded_segments": sorted(set(segmap) - used)},
@@ -3111,7 +3115,7 @@ def attempt_outcome(seq, w, total, burn_in):
         r = obs["refill"]
         integrity.append(f"a predator refill at frame {r['frame']} (predator_reseeds_cum {r['value']} > the founders' "
                          f"{r['baseline']}): a protocol-integrity event to investigate; the observation ends at {frontier}")
-    if base and seq["samples"] is not None:
+    if base and seq["samples"] is not None and seq.get("refill_base") is None:
         integrity.append("a fork branch: its refill baseline (the origin's counter) is not checked here")
     if first:
         kind = "event"

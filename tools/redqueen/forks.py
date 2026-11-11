@@ -10,6 +10,7 @@
     forks.py status --study STUDY
     forks.py stitch --study STUDY --branch ID [--partial]
     forks.py profile-design --study STUDY --references refs.json --out fork_profiles.json [--with-pilot-10m]
+    forks.py outcomes --study STUDY --out fork_outcomes.json
 
 THE REGISTRY (register: STUDY/config/forks.json, schema finfolk.redqueen.forks/1; deterministic, never
 replaced by other bytes). Bound to the histories' registry (config/worlds.json, its sha256) and to the
@@ -43,7 +44,17 @@ against the 8 prey references) plus its prey's predator-free continuation. Famil
 includes the fork roots' original continuations at the primary horizon, never measured twice),
 pilot_branch / pilot_original (+1M, +4M; +10M with --with-pilot-10m). Roles: a branch's or world's
 split (training / validation / test); the pilot's "diagnostic". No (prey, predators) pair is listed
-twice (a repeat is measured once, its first family kept; "deduplicated" counts them).
+twice (a repeat is measured once, its first family kept; "deduplicated" counts them). AVAILABILITY
+(Annex H D6 rule 27, §§10.1-10.4): a scheduled state that will never exist is OMITTED EXPLICITLY, never
+emitted as a path to an absent future: a branch whose origin is unavailable or which was invalidated,
+or a branch or history whose supported first zero (either guild; the branches' and the histories' own
+ledgers) is at or before the target; each omission ("omitted": family, state, its 17 pairs, why) is
+recorded without replacement. A state not reached yet is not absent.
+
+OUTCOMES (outcomes, read-only): every branch's own absorbing ecological outcome from its origin,
+independent of any profile's availability: its origin status, first zeros, verified acceptance
+frontier, and at +1M / +4M / +10M alive, predator_extinct, prey_terminal (prey first: the predators'
+later status unobserved), not_yet_observed, technical or unavailable_origin, counted per kind x split.
 """
 from __future__ import annotations
 
@@ -443,6 +454,156 @@ def merge_role(a, b):
     return a if RANK[a] >= RANK[b] else b
 
 
+OUTCOMES_SCHEMA = "finfolk.redqueen.forkoutcomes/2"
+BRANCH_AT = worlds.AT_HORIZON + ("invalidated", "pending_origin", "unavailable_origin")
+
+
+def _ledgers(study):
+    """The histories' and the branches' availability ledgers, read once."""
+    return (worlds.read_jsonl(os.path.join(study, "availability.jsonl")),
+            worlds.read_jsonl(os.path.join(froot(study), "availability.jsonl")))
+
+
+def evidence_ctx(study):
+    """What every evidence-bound decision below reads ONCE (the registries, both availability ledgers, the restart
+    records) and the caches of each world's evidence sequence."""
+    fr = froot(study)
+    hreg = root_registry(study)
+    led_h, led_f = _ledgers(study)
+    return {"study": study, "fr": fr, "hreg": hreg, "reg": runtime_registry(study),
+            "hworlds": {w["id"]: w for w in hreg["worlds"]}, "led_h": led_h, "led_f": led_f,
+            "restarts": worlds.restart_records(study), "hist": {}, "branch": {}}
+
+
+def history_evidence(ctx, wid):
+    """A history's RETAINED attempt under the rule-24 evidence sequence (worlds.attempt_sequence / attempt_outcome
+    over evidence.py: the newest line of descent, validated rows, the first absorbing terminal boundary; Codex
+    #78 r1 P1) and its burn-in disposition (worlds.disposition) -> {"attempt", "outcome" (None: recorded, not
+    installed), "decided", "why", "disposition", "first_terminal" (its frame or None)}."""
+    if wid in ctx["hist"]:
+        return ctx["hist"][wid]
+    study, hreg = ctx["study"], ctx["hreg"]
+    w, sched = ctx["hworlds"][wid], hreg["schedule"]
+    idx, _, _ = worlds.attempt_index(study, wid, ctx["restarts"])
+    k = max(idx)
+    d, _ = idx[k]
+    bi, maxr = worlds.burn_in_of(hreg), int(hreg.get("max_restarts") or 0)
+    o, at = None, {}
+    if d:
+        seq = worlds.attempt_sequence(study, wid, d, w, k, ctx["led_h"], sched["log_every"])
+        o = worlds.attempt_outcome(seq, w, worlds.total_steps(w, sched), bi)
+        at = dict(seq["samples"])                     # (frame -> its validated values: the origins' counters)
+    decided, why, disp = worlds.disposition(o, k, maxr, bi)
+    ft = o["first_terminal"]["frame"] if o and o["first_terminal"] else None
+    ctx["hist"][wid] = rec = {"attempt": k, "outcome": o, "decided": decided, "why": why, "disposition": disp,
+                              "first_terminal": ft, "samples_at": at}
+    return rec
+
+
+def refill_baseline(ctx, b):
+    """(baseline, why unbound): a branch's refill baseline is its FROZEN ORIGIN's counter (Codex #78 r2 P2-4, D6 rule
+    24): its root's evidenced predator_reseeds_cum at the origin frame. None, why: the baseline is UNBOUND, and the
+    branch's evidence unusable: the root's evidence has no sample at the origin, its counter there is unreadable, or
+    the counter is ABSENT (Codex #78 r3 P2-4: a missing column never disables the refill check)."""
+    h = history_evidence(ctx, b["root"])
+    o = b["origin"]["frame"]
+    smp = h["samples_at"].get(o)
+    if smp is None:
+        return None, f"its refill baseline is unbound: its root {b['root']}'s evidence has no sample at the origin {o}"
+    col = worlds.evidence.REFILL_COL
+    if col not in smp:
+        return None, f"its refill baseline is unbound: its root's evidence carries no {col} at the origin {o}"
+    if smp[col] is None:
+        return None, f"its refill baseline is unbound: its root's {col} at the origin {o} is unreadable"
+    return smp[col], None
+
+
+def branch_evidence(ctx, b):
+    """A branch's evidence-bound outcome (worlds.attempt_outcome over its own segments from its origin, its own
+    ledger; a branch never restarts). Its refill baseline is BOUND to the frozen origin's counter (refill_baseline):
+    an increment above it ends the usable evidence at the sample before it (a protocol-integrity event, technical:
+    nothing after it establishes natural coexistence); an unbound baseline makes the branch's evidence unusable
+    (technical) instead of unchecked."""
+    if b["id"] not in ctx["branch"]:
+        fr = ctx["fr"]
+        d = worlds.wdir(fr, b["id"])
+        rb, unbound = refill_baseline(ctx, b)
+        seq = worlds.attempt_sequence(fr, b["id"], d if os.path.isdir(d) and not unbound else None, b, 0,
+                                      ctx["led_f"], ctx["reg"]["schedule"]["log_every"], refill_base=rb)
+        o = worlds.attempt_outcome(seq, b, int(b["total_steps"]), 0)
+        o["refill_baseline"] = rb
+        if unbound and os.path.isdir(d):
+            o.update(observation="technical", censor={"kind": "technical", "frame": o["frontier"]})
+            o["integrity"].append(unbound + " (its evidence is unusable until the origin's counter is evidenced)")
+        ctx["branch"][b["id"]] = o
+    return ctx["branch"][b["id"]]
+
+
+def origin_disposition(ctx, b):
+    """(state, why) of a branch's origin on its ROOT's rule-24 evidence, in this order (Codex #78 r1 P2-2, P2-3):
+    invalidated (the branch's state says so, or its origin was frozen from a discarded root attempt: rejected
+    before any outcome is classified); pending (the root's retained attempt is not settled: it may still be
+    restarted, so nothing is decided and every scheduled target is kept); unavailable (the root's evidenced
+    first terminal boundary at or before the origin, the frozen record holds no prey / predators, or the root
+    reached its registered end before the origin: recorded, never replaced); technical (the branch's state says
+    unavailable, but the root's evidence does not support it: repair it); available."""
+    fr = ctx["fr"]
+    st = worlds.read_state(fr, b["id"])
+    if st["status"] == "invalidated":
+        return "invalidated", f"the branch is invalidated ({st.get('end_reason')})"
+    h = history_evidence(ctx, b["root"])
+    rp = os.path.join(worlds.wdir(fr, b["id"]), "origin.rec.json")
+    frec = rqlib.read_json(rp) if os.path.isfile(rp) else None
+    if frec is not None and int(frec.get("root_attempt", 0)) != h["attempt"]:
+        return "invalidated", (f"its origin was frozen from attempt {frec.get('root_attempt', 0)} of {b['root']}, a "
+                               f"discarded attempt (attempt {h['attempt']} is retained)")
+    if not h["decided"]:
+        return "pending", f"its root {b['root']}: {h['why']} (it may still be restarted: nothing is decided)"
+    o, f = h["outcome"], b["origin"]["frame"]
+    if h["first_terminal"] is not None and h["first_terminal"] <= f:
+        return "unavailable", (f"its root {b['root']}'s evidenced first terminal boundary (frame {h['first_terminal']}) "
+                               "is at or before the origin")
+    why = record_invalid(b, frec)
+    if why:
+        return "unavailable", why
+    if o and o["observation"] == "administrative" and o["frontier"] < f:
+        return "unavailable", f"its root {b['root']} reached its registered end (frame {o['frontier']}) before the origin"
+    if st["status"] == "unavailable":
+        return "technical", (f"its state says unavailable ({st.get('end_reason')}), but its root's evidence does not "
+                             "support it: repair it")
+    return "available", None
+
+
+def absent(ctx, branches, wid, frame):
+    """(cause, why) when the joint state (wid, frame) will never exist (Annex H D6 rule 27, §§10.1-10.4: profiles
+    stop at the biological boundary; an unavailable origin is recorded without replacement), else None, on the
+    rule-24 evidence: a branch that is invalidated or whose origin is unavailable (origin_disposition); a branch or
+    history whose evidenced first terminal boundary is at or before the frame. A root or history whose retained
+    attempt is NOT settled decides nothing (Codex #78 r1 P2-2): its states stay scheduled, as does a state merely
+    not reached yet."""
+    if wid in branches:
+        s, why = origin_disposition(ctx, branches[wid])
+        if s == "pending":
+            return None
+        if s == "invalidated":
+            return "technical", f"the branch is invalidated: {why}"
+        if s == "technical":
+            return "technical", f"the branch is technically unavailable: {why}"
+        if s == "unavailable":
+            return "unavailable_origin", f"an unavailable origin: {why}"
+        o = branch_evidence(ctx, branches[wid])
+    else:
+        h = history_evidence(ctx, wid)
+        if not h["decided"]:
+            return None
+        o = h["outcome"]
+    ft = (o or {}).get("first_terminal")
+    if ft and ft["frame"] <= frame:
+        return "biological", (f"biological: {wid}'s first terminal boundary ({ft['kind']}) at frame {ft['frame']}, at "
+                              f"or before the target {frame}")
+    return None
+
+
 def profile_design(study, refs, with_pilot_10m=False):
     """The common-profile measurements as a design/2 fragment (worlds, times, edges): see the module doc.
     refs: {"prey": [8 entries], "predators": [8 entries]}, an entry {"world", "frame"} for a main
@@ -463,6 +624,9 @@ def profile_design(study, refs, with_pilot_10m=False):
     pilot_ids = {b["id"] for b in reg["worlds"] if b["kind"] == "pilot"} | (
         {reg["pilot"]["world"]} if reg["pilot"].get("world") else set())    # (diagnostic in pilot families only)
     wmap, times, pairs, dup, external = {}, {}, {}, [0], set()
+    ctx = evidence_ctx(study)
+    led_h, led_f = ctx["led_h"], ctx["led_f"]
+    omitted = []
 
     def world(wid, uid, ad):
         w = {"uuid": uid, "pattern": os.path.join(ad, "end.{frame}.json"), "paths": {"F1": os.path.join(ad, "F1.json")}}
@@ -527,7 +691,14 @@ def profile_design(study, refs, with_pilot_10m=False):
         pairs[key] = {"family": family, "role": role, "prey": {"world": prey[0], "time": prey[1]},
                       "predators": None if pred is None else {"world": pred[0], "time": pred[1]}}
 
+    bdict = {b["id"]: b for b in reg["worlds"]}
+
     def state(family, wid, frame):
+        ab = absent(ctx, bdict, wid, frame)
+        if ab:                                 # (an explicit omission: never a path to an absent state)
+            omitted.append({"family": family, "state": {"world": wid, "frame": int(frame)}, "pairs": 17,
+                            "cause": ab[0], "why": ab[1]})
+            return
         lab = t(frame)
         for pw, pt in rq:                      # its prey against the 8 predator references
             add(family, (wid, lab), (pw, pt))
@@ -563,7 +734,57 @@ def profile_design(study, refs, with_pilot_10m=False):
             "worlds": wmap, "times": dict(sorted(times.items(), key=lambda kv: kv[1])), "edges": edges,
             "counts": {f: sum(1 for e in edges if e["family"] == f) for f in sorted({e["family"] for e in edges})},
             "roles": {r: sum(1 for e in edges if e["role"] == r) for r in sorted({e["role"] for e in edges})},
-            "deduplicated": dup[0]}
+            "deduplicated": dup[0],
+            # (D6 rule 27: the scheduled states that will never exist, each with its cause; not replaced)
+            "omitted": omitted,
+            "omitted_counts": {f: sum(1 for o in omitted if o["family"] == f) for f in sorted({o["family"] for o in omitted})},
+            "ledgers": {"histories_records": len(led_h), "branches_records": len(led_f)}}
+
+
+def outcomes(study, horizons=None):
+    """THE BRANCHES' ECOLOGICAL OUTCOMES (Annex H D6 rule 27, §§10.1-10.4), independent of any profile's
+    availability: every registered branch, its origin's disposition, its evidenced first zero of each guild and
+    first terminal boundary, its frontier and accepted-through, the evidence's hashes and unsupported ledger
+    entries, and at each horizon (origin + 1M, 4M, 10M) one of BRANCH_AT: alive / predator_extinct /
+    prey_terminal (the prey first: later predator status unobserved) / not_yet_observed / technical /
+    invalidated / pending_origin / unavailable_origin; with counts per kind x split x horizon. Read-only.
+    (Codex #78 r1 P1, P2-3) Every outcome comes from the RULE-24 EVIDENCE SEQUENCE (branch_evidence: the newest
+    line of descent, validated rows, the first absorbing terminal; a ledger zero outside it is listed as
+    unsupported, never an extinction), after the origin's disposition (origin_disposition): an invalidated
+    branch is "invalidated" and a technically unavailable one "technical" before anything else, an unsettled root
+    "pending_origin", an unavailable origin "unavailable_origin"; a done / extinct state its evidence does not
+    support is technical (worlds.at_horizon)."""
+    ctx = evidence_ctx(study)
+    reg = ctx["reg"]
+    hz = list(horizons or (SHORT + (reg["horizon"],)))
+    rows, counts = {}, {}
+    pre = {"invalidated": "invalidated", "pending": "pending_origin", "unavailable": "unavailable_origin",
+           "technical": "technical"}
+    for b in reg["worlds"]:
+        bid, o = b["id"], b["origin"]["frame"]
+        s, why = origin_disposition(ctx, b)
+        ob = branch_evidence(ctx, b)
+        h_ = history_evidence(ctx, b["root"])
+        at = {}
+        for h in hz:
+            s_ = pre.get(s) or worlds.at_horizon(ob, o + h)
+            at[str(h)] = s_
+            c = counts.setdefault(b["kind"], {}).setdefault(b["split"], {}).setdefault(str(h), {})
+            c[s_] = c.get(s_, 0) + 1
+        rows[bid] = {"root": b["root"], "kind": b["kind"], "split": b["split"], "origin": o,
+                     "origin_state": s, "origin_why": why, "root_attempt": h_["attempt"],
+                     "root_disposition": h_["disposition"], "status": ob["status"], "reason": ob["end_reason"],
+                     "first_zeros": {g: z["frame"] for g, z in sorted(ob["events"].items()) if isinstance(z, dict)},
+                     "first_terminal": ob["first_terminal"], "frontier": ob["frontier"],
+                     "accepted_through": ob["accepted_through"], "observation": ob["observation"],
+                     "integrity": ob["integrity"], "unsupported_ledger": ob["unsupported_ledger"],
+                     "evidence": ob["evidence"], "at": at}
+    return {"schema": OUTCOMES_SCHEMA, "forks_sha256": rqlib.sha256_file(os.path.join(study, "config", "forks.json")),
+            "horizons": hz, "kinds": list(BRANCH_AT), "branches": rows, "counts": counts,
+            "evidence_sha256": rqlib.sha256_file(os.path.abspath(worlds.evidence.__file__)),
+            "note": "each branch has its own absorbing ecological outcome from its origin (D6 rule 27, §§10.1-10.4), from "
+                    "the rule-24 evidence sequence; an unavailable origin is recorded, never replaced; an unsettled "
+                    "root decides nothing; profile availability does not enter"}
 
 
 def main(argv=None):
@@ -583,7 +804,7 @@ def main(argv=None):
     r.add_argument("--pilot-horizon", type=int, default=PILOT["horizon"])
     r.add_argument("--avoid", action="append", default=[], metavar="FILE",
                    help="reserved seeds (integers, or JSON / JSONL with seed keys); the founder seeds always")
-    for name in ("launch", "status", "stitch", "profile-design"):
+    for name in ("launch", "status", "stitch", "profile-design", "outcomes"):
         s = sub.add_parser(name)
         s.add_argument("--study", required=True)
         if name == "launch":
@@ -605,6 +826,8 @@ def main(argv=None):
             s.add_argument("--references", required=True)
             s.add_argument("--out", required=True)
             s.add_argument("--with-pilot-10m", action="store_true")
+        if name == "outcomes":
+            s.add_argument("--out", required=True)
     a = ap.parse_args(argv)
     try:
         study = os.path.abspath(a.study)
@@ -626,7 +849,13 @@ def main(argv=None):
         if a.cmd == "profile-design":
             out = profile_design(study, rqlib.read_json(a.references), a.with_pilot_10m)
             rqlib.write_durable(a.out, rqlib.canonical(out))
-            print(json.dumps(out["counts"]), file=sys.stderr)
+            print(json.dumps(out["counts"]) + (f"; omitted {out['omitted_counts']}" if out["omitted"] else ""),
+                  file=sys.stderr)
+            return 0
+        if a.cmd == "outcomes":
+            out = outcomes(study)
+            rqlib.write_durable(a.out, rqlib.canonical(out))
+            print(json.dumps(out["counts"], sort_keys=True), file=sys.stderr)
             return 0
         fr = froot(study)
         worlds.mkdirs_durable(fr)
