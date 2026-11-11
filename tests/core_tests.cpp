@@ -4629,12 +4629,535 @@ static void test_fused_scan_exactness() {
             evomath::tanhfArray(in, out, 8);
             for (int i = 0; i < 8; ++i) {
                 const float s = evomath::tanhf(in[i]);
+                // Bit equality, except that a NaN result matches any NaN: the sign and payload of a NaN
+                // are unspecified by IEEE 754 (wasm leaves them to the host), the engine's tanh sensors
+                // are always finite, and the 2^32 sweep found no payload difference anyway; what the
+                // contract (and the engine) needs is "NaN in -> NaN out".
                 if (floatBits(s) != floatBits(out[i]) && !(s != s && out[i] != out[i])) ++differ;
             }
         }
         CHECK(differ == 0);
     }
+
+    // --- rebuilding ONE net in place after the genome shrank or changed: the gene-type masks must be
+    //     CLEARED, not just set (buildNeuralNet only ORs the 1-bits in, so a stale 1 below the new length
+    //     survives unless the words are zeroed first). Fresh nets, as above, cannot show that. ---
+    {
+        rng.seed(8642u);
+        auto mk = [](int len) { Genome g; for (int i = 0; i < len; ++i) g.push_back(Gene::makeRandom()); return g; };
+        int staleMask = 0, staleSim = 0, rebuilds = 0;
+        for (int t = 0; t < 600; ++t) {
+            const int la = rng.intRange(0, 200);
+            const int lb = (t % 2 == 0) ? rng.intRange(0, la) : rng.intRange(0, 200);   // shrink, or any length
+            const Genome a = mk(la);
+            Genome b = mk(lb);
+            if (t % 4 == 1 && !a.empty()) {                       // a mutation of a: a prefix with flipped types
+                b.assign(a.begin(), a.begin() + (std::ptrdiff_t)rng.intRange(0, (int)a.size()));
+                for (Gene& g : b) { if (rng.unit() < 0.2f) g.sourceType = !g.sourceType; if (rng.unit() < 0.2f) g.sinkType = !g.sinkType; }
+            }
+            NeuralNet reused, fresh;
+            buildNeuralNet(a, reused);
+            buildNeuralNet(b, reused);                              // the same object, rebuilt
+            buildNeuralNet(b, fresh);
+            ++rebuilds;
+            for (int k = 0; k < 2; ++k)
+                if (reused.srcTypeBits[k] != fresh.srcTypeBits[k] || reused.sinkTypeBits[k] != fresh.sinkTypeBits[k]) ++staleMask;
+            const Genome other = mk(rng.intRange(1, 130));
+            NeuralNet no;
+            buildNeuralNet(other, no);
+            if (floatBits(genomeSimilarityMasked(b, reused, other, no)) != floatBits(genomeSimilarity(b, other))) ++staleSim;
+        }
+        CHECK(rebuilds == 600);
+        CHECK(staleMask == 0);
+        CHECK(staleSim == 0);
+    }
 }
+
+#if !defined(USE_OPENMP) && !defined(EVO_POOL_THREADS)
+// Serial builds only: the base algorithm below reproduces the serial engine's creature order (a creature
+// sees the already-moved state of lower indices); the OpenMP and thread-pool builds step creatures in
+// parallel, are not seed-reproducible by contract, and have no such order to reproduce.
+// ---------------------------------------------------------------------------------------------------
+// The fused scans on their PRODUCTION paths, against the base algorithm (review of #81, P3). A hand-built
+// world takes one real World::update (cfg.captureActivations keeps each creature's sensor vector); the
+// same sensors are then recomputed from the PRE-step state by refSense below, the algorithm as it stood
+// before the fused scans (queryRadius lists, a sqrt per candidate, scalar tanhf, the genomeSimilarity
+// loop, the branching predator scan), and every compared sensor must agree bit for bit. The scenes are
+// the places an optimisation of these scans could go wrong: distinct d^2 whose sqrt rounds to the same
+// float (the first scanned must win), points exactly on the radius, coincident points, empty scans,
+// two predators at the same minimum distance (the first must win), the torus seam, random crowds, and
+// a net rebuilt in place after the genome shrank. The eat scan (contested food, exact pickup radius,
+// coincident food) and pending_'s reuse across a step with a death and a birth are checked the same way.
+// ---------------------------------------------------------------------------------------------------
+namespace fxscan {
+constexpr int W = 640, H = 480;
+
+struct Scene {
+    std::vector<Creature> cs;
+    std::vector<Vec2> food;
+    std::vector<Vec2> preds;
+};
+
+static Creature mk(Vec2 pos, Vec2 dir, float age, float reserves, int glen) {
+    Creature c = makeRandomCreature(pos, glen, glen);
+    c.vel = dir; c.lastMoveDir = dir;
+    c.age = age; c.foodReserves = reserves;
+    c.speed = 20.0f;
+    c.interactTimer = 1e9f;        // no social interaction: the step only senses, moves and eats
+    return c;
+}
+
+static void configure(World& w, bool toroidal, int npred) {
+    w.cfg.captureActivations = true;
+    w.cfg.minPopulation = 0;
+    w.cfg.targetFood = 0;
+    w.cfg.maxAge = 1e9f;
+    w.cfg.metabolicRate = 0.0f;    // reserves stay as set: the base algorithm below reads them at their pre-step value
+    w.cfg.toroidal = toroidal;
+    w.cfg.predatorCount = npred;
+}
+
+// The base algorithm for every sensor the fused scans touch (and the tanh batch): from the PRE-step
+// creatures, food and predators, with the same grids built the same way World::update builds them.
+// The serial engine moves creatures in index order and publishes each one's final pos/vel in hot_ at once
+// (age and reserves are read live), so a creature sees the ALREADY-MOVED state of every lower index and
+// the pre-step state of every higher one; the grid itself holds the pre-step positions. `post` is the
+// world after the step: its lower-index creatures supply those moved values (pos, vel, age).
+static void refSense(const SimConfig& cfg, const std::vector<Creature>& cs, const std::vector<Creature>& post,
+                     const std::vector<Food>& food, const std::vector<Vec2>& preds, int self, float* s) {
+    const bool tor = cfg.toroidal;
+    const float R = cfg.perceptionRadius;
+    auto wrap = [&](float d, float span) { return World::wrapDelta(d, span); };
+    SpatialGrid cg, fg;
+    cg.init(W, H, R);
+    fg.init(W, H, R);
+    for (int i = 0; i < (int)cs.size(); ++i) if (cs[(size_t)i].alive) cg.insert(cs[(size_t)i].pos, i);
+    for (int i = 0; i < (int)food.size(); ++i) if (food[(size_t)i].alive) fg.insert(food[(size_t)i].pos, i);
+    cg.build();
+    fg.build();
+
+    const Creature& c = cs[(size_t)self];
+    const Vec2 fwd = c.forward();
+    const Vec2 rht = {-fwd.y, fwd.x};
+    s[LOC_X] = c.pos.x / W;
+    s[LOC_Y] = c.pos.y / H;
+    if (tor) {
+        s[BOUNDARY_DIST_X] = 1.0f; s[BOUNDARY_DIST_Y] = 1.0f; s[BOUNDARY_DIST] = 1.0f;
+    } else {
+        const float bx = std::min(c.pos.x, (float)W - c.pos.x);
+        const float by = std::min(c.pos.y, (float)H - c.pos.y);
+        s[BOUNDARY_DIST_X] = evomath::tanhf(bx / 100.0f);
+        s[BOUNDARY_DIST_Y] = evomath::tanhf(by / 100.0f);
+        s[BOUNDARY_DIST] = std::min(s[BOUNDARY_DIST_X], s[BOUNDARY_DIST_Y]);
+    }
+    s[OWN_VEL_X] = c.vel.x; s[OWN_VEL_Y] = c.vel.y;
+    s[LAST_MOVE_DIR_X] = c.lastMoveDir.x; s[LAST_MOVE_DIR_Y] = c.lastMoveDir.y;
+    s[OWN_SPEED] = c.speed / cfg.maxSpeed;
+    s[AGE] = evomath::tanhf(c.age / 60.0f);
+    s[FOOD_RESERVES] = evomath::tanhf((c.foodReserves - 25.0f) / 25.0f);
+    s[OSCILLATOR] = c.getOscillator();
+    s[RESPONSIVENESS] = c.responsiveness;
+
+    // neighbours: queryRadius's list, one sqrt per candidate, the strict nearest test
+    float avgDx = 0, avgDy = 0, avgHx = 0, avgHy = 0, nearestDist = R;
+    int nearestIdx = -1, count = 0, popFwd = 0, popLR = 0;
+    std::vector<int> nb;
+    if (tor) cg.queryRadiusWrapped(c.pos, R, nb); else cg.queryRadius(c.pos, R, nb);
+    auto hot = [&](int j) -> const Creature& { return j < self ? post[(size_t)j] : cs[(size_t)j]; };
+    for (int ni : nb) {
+        if (ni == self) continue;
+        const Creature& o = hot(ni);
+        float dx = o.pos.x - c.pos.x, dy = o.pos.y - c.pos.y;
+        if (tor) { dx = wrap(dx, (float)W); dy = wrap(dy, (float)H); }
+        const float dist = std::sqrt(dx * dx + dy * dy);
+        avgDx += dx; avgDy += dy; avgHx += o.vel.x; avgHy += o.vel.y;
+        const float dotFwd = dx * fwd.x + dy * fwd.y, dotLR = dx * rht.x + dy * rht.y;
+        popFwd += (dotFwd > 0) ? 1 : -1;
+        popLR += (dotLR > 0) ? 1 : -1;
+        if (dist < nearestDist) { nearestDist = dist; nearestIdx = ni; }
+        ++count;
+    }
+    if (count > 0) { avgDx /= count; avgDy /= count; avgHx /= count; avgHy /= count; }
+    s[NEIGHBOR_COUNT] = tanhCountOver10(count);
+    s[AVG_NEIGHBOR_DX] = evomath::tanhf(avgDx / R);
+    s[AVG_NEIGHBOR_DY] = evomath::tanhf(avgDy / R);
+    s[AVG_NEIGHBOR_HEADING_X] = avgHx; s[AVG_NEIGHBOR_HEADING_Y] = avgHy;
+    s[NEAREST_NEIGHBOR_DIST] = nearestDist / R;
+    s[POPULATION_DENSITY] = tanhCountOver15(count);
+    s[POPULATION_FWD] = tanhCountOver5(popFwd);
+    s[POPULATION_LR] = tanhCountOver5(popLR);
+    if (nearestIdx >= 0) {
+        const Creature& n = hot(nearestIdx);                              // age: live, so moved for a lower index
+        s[NEAREST_NEIGHBOR_AGE] = evomath::tanhf((n.age - 50.0f) / 50.0f);
+        s[NEAREST_NEIGHBOR_FOOD] = evomath::tanhf((cs[(size_t)nearestIdx].foodReserves - 25.0f) / 25.0f);   // (no metabolism here)
+        const float sim = genomeSimilarity(c.genome, n.genome);          // the loop, not the masks
+        s[GENETIC_SIM_NEAREST] = sim;
+        float dx = n.pos.x - c.pos.x, dy = n.pos.y - c.pos.y;
+        if (tor) { dx = wrap(dx, (float)W); dy = wrap(dy, (float)H); }
+        s[GENETIC_SIM_FWD] = ((dx * fwd.x + dy * fwd.y) > 0) ? sim : 0.5f;
+    } else {
+        s[NEAREST_NEIGHBOR_AGE] = 0.0f; s[NEAREST_NEIGHBOR_FOOD] = 0.0f;
+        s[GENETIC_SIM_NEAREST] = 0.0f;  s[GENETIC_SIM_FWD] = 0.5f;
+    }
+
+    // food: forEachInRadius's visits, a sqrt per hit, the strict nearest test
+    float foodDx = 0, foodDy = 0, foodDist = R;
+    int foodCount = 0;
+    auto smell = [&](int, Vec2 fp) {
+        ++foodCount;
+        float dx = fp.x - c.pos.x, dy = fp.y - c.pos.y;
+        if (tor) { dx = wrap(dx, (float)W); dy = wrap(dy, (float)H); }
+        const float dist = std::sqrt(dx * dx + dy * dy);
+        if (dist < foodDist) {
+            foodDist = dist;
+            const float invD = (dist > 0.001f) ? 1.0f / dist : 0.0f;
+            foodDx = dx * invD; foodDy = dy * invD;
+        }
+    };
+    if (tor) fg.forEachInRadiusWrapped(c.pos, R, smell); else fg.forEachInRadius(c.pos, R, smell);
+    s[NEAREST_FOOD_DX] = foodDx; s[NEAREST_FOOD_DY] = foodDy;
+    s[NEAREST_FOOD_DIST] = foodDist / R;
+    s[FOOD_DENSITY] = tanhCountOver10(foodCount);
+
+    // nearest predator: the branching scan, the first strict minimum below R^2
+    float bestD2 = R * R;
+    Vec2 off = {0.0f, 0.0f};
+    bool seen = false;
+    for (const Vec2& p : preds) {
+        float dx = p.x - c.pos.x, dy = p.y - c.pos.y;
+        if (tor) { dx = wrap(dx, (float)W); dy = wrap(dy, (float)H); }
+        const float d2 = dx * dx + dy * dy;
+        if (d2 < bestD2) { bestD2 = d2; off = {dx, dy}; seen = true; }
+    }
+    if (seen) {
+        const float d = std::sqrt(bestD2);
+        const float invD = (d > 1e-3f) ? 1.0f / d : 0.0f;
+        const Vec2 u = {off.x * invD, off.y * invD};
+        s[PREDATOR_FWD] = u.x * fwd.x + u.y * fwd.y;
+        s[PREDATOR_LR] = u.x * rht.x + u.y * rht.y;
+        s[PREDATOR_PROX] = 1.0f - d / R;
+    } else {
+        s[PREDATOR_FWD] = 0.0f; s[PREDATOR_LR] = 0.0f; s[PREDATOR_PROX] = 0.0f;
+    }
+}
+
+static const int kCompared[] = {
+    LOC_X, LOC_Y, BOUNDARY_DIST_X, BOUNDARY_DIST_Y, BOUNDARY_DIST, OWN_VEL_X, OWN_VEL_Y, LAST_MOVE_DIR_X,
+    LAST_MOVE_DIR_Y, OWN_SPEED, AGE, FOOD_RESERVES, OSCILLATOR, RESPONSIVENESS, NEIGHBOR_COUNT,
+    AVG_NEIGHBOR_DX, AVG_NEIGHBOR_DY, AVG_NEIGHBOR_HEADING_X, AVG_NEIGHBOR_HEADING_Y, NEAREST_NEIGHBOR_DIST,
+    POPULATION_DENSITY, POPULATION_FWD, POPULATION_LR, NEAREST_NEIGHBOR_AGE, NEAREST_NEIGHBOR_FOOD,
+    GENETIC_SIM_NEAREST, GENETIC_SIM_FWD, NEAREST_FOOD_DX, NEAREST_FOOD_DY, NEAREST_FOOD_DIST,
+    FOOD_DENSITY, PREDATOR_FWD, PREDATOR_LR, PREDATOR_PROX};
+
+// One real update of `sc`; returns the number of (creature, sensor) pairs that differ from the base
+// algorithm's, or -1 when the step was not clean (a creature died or was added: indices would shift).
+// `first` (optional) receives creature 0's production sensors.
+static int senseDiffs(const Scene& sc, bool toroidal, float* first = nullptr) {
+    World w;
+    configure(w, toroidal, (int)sc.preds.size());
+    w.init(W, H, 0);
+    w.creatures = sc.cs;
+    w.food.clear();
+    for (const Vec2& f : sc.food) w.food.push_back(Food{f, true});
+    for (size_t i = 0; i < sc.preds.size(); ++i) w.predators[i].pos = sc.preds[i];
+    const std::vector<Creature> preC = w.creatures;
+    const std::vector<Food> preF = w.food;
+    std::vector<Vec2> preP;
+    for (const Predator& p : w.predators) preP.push_back(p.pos);
+    w.update(0.016f);
+    if (w.creatures.size() != sc.cs.size()) return -1;
+    int diffs = 0;
+    for (int i = 0; i < (int)sc.cs.size(); ++i) {
+        float ref[NUM_SENSES] = {};
+        refSense(w.cfg, preC, w.creatures, preF, preP, i, ref);
+        for (int k : kCompared)
+            if (floatBits(w.creatures[(size_t)i].lastSensors[k]) != floatBits(ref[k])) {
+                if (++diffs <= 3)
+                    std::printf("    creature %d sensor %d: production %.9g, base algorithm %.9g\n", i, k,
+                                (double)w.creatures[(size_t)i].lastSensors[k], (double)ref[k]);
+            }
+    }
+    if (first) std::memcpy(first, w.creatures[0].lastSensors, sizeof(float) * NUM_SENSES);
+    return diffs;
+}
+
+// Two points near S = (10, 10), both 60 below it, whose squared distances differ while their float
+// square roots are equal (found by search, so the scene proves it exercises the case).
+static bool findSqrtTie(float& xa, float& xb) {
+    float lastD2 = -1.0f, lastX = 0.0f;
+    for (int k = 0; k < 3000000; ++k) {
+        const float x = 13.0f + (float)k * (1.0f / 1048576.0f);
+        const float dx = x - 10.0f, dy = 70.0f - 10.0f;
+        const float d2 = dx * dx + dy * dy;
+        if (d2 != lastD2) {
+            if (lastD2 > 0.0f && std::sqrt(d2) == std::sqrt(lastD2)) { xa = lastX; xb = x; return true; }
+            lastD2 = d2; lastX = x;
+        }
+    }
+    return false;
+}
+
+// The base algorithm's eat scan: creatures in index order, queryRadius (queryRadiusWrapped on the torus) over a
+// food grid built from `food`, and an alive-flag claim per item. Returns how many items each creature claims;
+// `gone` marks the claimed items.
+static std::vector<int> baseClaims(const SimConfig& cfg, const std::vector<Food>& food,
+                                   const std::vector<Creature>& cs, std::vector<char>& gone) {
+    SpatialGrid fg;
+    fg.init(W, H, cfg.perceptionRadius);
+    for (int i = 0; i < (int)food.size(); ++i) fg.insert(food[(size_t)i].pos, i);
+    fg.build();
+    gone.assign(food.size(), 0);
+    std::vector<int> ate(cs.size(), 0);
+    for (size_t i = 0; i < cs.size(); ++i) {
+        std::vector<int> hits;
+        if (cfg.toroidal) fg.queryRadiusWrapped(cs[i].pos, cfg.pickupRadius, hits);
+        else              fg.queryRadius(cs[i].pos, cfg.pickupRadius, hits);
+        for (int fi : hits) if (!gone[(size_t)fi]) { gone[(size_t)fi] = 1; ++ate[i]; }
+    }
+    return ate;
+}
+}  // namespace fxscan
+
+static void test_fused_scan_production_paths() {
+    std::printf("fused scans on the production paths vs the base algorithm (ties, radius, empty, predators, eat, pending)...\n");
+    using namespace fxscan;
+    rng.seed(97531u);
+    const float R = 80.0f;
+    const Vec2 dirA = {0.6f, 0.8f};
+
+    // --- rounded-sqrt ties: d^2 differ, sqrt equal; the FIRST scanned must stay the nearest (strict <) ---
+    float xa = 0, xb = 0;
+    const bool haveTie = findSqrtTie(xa, xb);
+    CHECK(haveTie);
+    if (haveTie) {
+        CHECK(xa < xb);
+        for (int tor = 0; tor < 2; ++tor)
+            for (int order = 0; order < 2; ++order) {
+                // order 0: the larger-d^2 point is scanned first (a `<=` would hand the nearest to the later one)
+                const float x1 = order == 0 ? xb : xa, x2 = order == 0 ? xa : xb;
+                Scene sc;
+                sc.cs.push_back(mk({10.0f, 10.0f}, dirA, 10.0f, 30.0f, 60));
+                sc.cs.push_back(mk({x1, 70.0f}, {1.0f, 0.0f}, 20.0f, 40.0f, 30));
+                sc.cs.push_back(mk({x2, 70.0f}, {0.0f, 1.0f}, 90.0f, 12.0f, 70));
+                sc.cs.push_back(mk({10.0f, 85.0f}, {0.0f, -1.0f}, 55.0f, 25.0f, 45));   // farther, next cell row
+                sc.food = {{x1, 70.0f}, {x2, 70.0f}, {10.0f, 85.0f}};
+                float prod[NUM_SENSES];
+                CHECK(senseDiffs(sc, tor != 0, prod) == 0);
+                // independent of the reference: the first scanned wins, in age (and food) of the nearest
+                const float firstAge = 20.0f;      // creature 1, the first of the pair in scan order, in both orders
+                CHECK(floatBits(prod[NEAREST_NEIGHBOR_AGE]) == floatBits(evomath::tanhf((firstAge - 50.0f) / 50.0f)));
+                const float fdx = x1 - 10.0f, fdy = 60.0f;
+                const float fd = std::sqrt(fdx * fdx + fdy * fdy);
+                const float invD = 1.0f / fd;
+                CHECK(floatBits(prod[NEAREST_FOOD_DX]) == floatBits(fdx * invD));
+            }
+    }
+
+    // --- points exactly on the radius, coincident points, a point just outside; the predator on the radius
+    //     (unseen) and the predator just inside it (seen) in scenes of their own, so that neither can hide the
+    //     other: a closer predator would win the selection and mask a wrongly inclusive boundary ---
+    const float yInside = std::nextafter(180.0f, 100.0f);          // (100 + nextafter(80, 0) would round back to 180)
+    {
+        const float dyIn = yInside - 100.0f;
+        CHECK(yInside < 180.0f);
+        CHECK(dyIn * dyIn < R * R);                                 // really inside R, by a few ulps of d^2
+    }
+    for (int tor = 0; tor < 2; ++tor)
+        for (int which = 0; which < 3; ++which) {                   // 0: no predator, 1: exactly on R, 2: just inside R
+            Scene sc;
+            sc.cs.push_back(mk({100.0f, 100.0f}, dirA, 30.0f, 33.0f, 50));
+            sc.cs.push_back(mk({180.0f, 100.0f}, {1.0f, 0.0f}, 20.0f, 40.0f, 30));           // exactly R away: a hit
+            sc.cs.push_back(mk({100.0f, 100.0f}, {0.0f, 1.0f}, 70.0f, 15.0f, 66));           // coincident with S
+            sc.cs.push_back(mk({100.0f, 100.0f}, {0.0f, -1.0f}, 5.0f, 45.0f, 20));           // coincident with both
+            sc.cs.push_back(mk({std::nextafter(180.0f, 1e9f), 100.0f}, {1.0f, 0.0f}, 8.0f, 9.0f, 40));   // just outside
+            sc.cs.push_back(mk({100.0f, 20.0f}, {0.0f, 1.0f}, 44.0f, 31.0f, 52));            // exactly R above
+            sc.food = {{180.0f, 100.0f}, {100.0f, 100.0f}, {100.0f, 100.0f}, {std::nextafter(180.0f, 1e9f), 100.0f},
+                       {100.0f, 20.0f}};
+            if (which == 1) sc.preds = {Vec2{20.0f, 100.0f}};        // exactly R from S, and the only one: unseen
+            if (which == 2) sc.preds = {Vec2{100.0f, yInside}};      // just inside R, and the only one: seen
+            float prod[NUM_SENSES];
+            CHECK(senseDiffs(sc, tor != 0, prod) == 0);
+            // independent of the reference: seen or not
+            if (which == 2) CHECK(prod[PREDATOR_PROX] > 0.0f);
+            else            CHECK(prod[PREDATOR_PROX] == 0.0f && prod[PREDATOR_FWD] == 0.0f && prod[PREDATOR_LR] == 0.0f);
+        }
+
+    // --- empty scans: nothing in range, no food, no predator; and an edge creature ---
+    for (int tor = 0; tor < 2; ++tor) {
+        Scene sc;
+        sc.cs.push_back(mk({500.0f, 400.0f}, dirA, 12.0f, 28.0f, 40));
+        sc.cs.push_back(mk({0.5f, 240.0f}, {-1.0f, 0.0f}, 12.0f, 28.0f, 40));
+        sc.food = {{100.0f, 100.0f}};
+        sc.preds = {{250.0f, 100.0f}};
+        CHECK(senseDiffs(sc, tor != 0) == 0);
+        Scene none;                                                                       // a lone creature, nothing else
+        none.cs.push_back(mk({320.0f, 240.0f}, dirA, 0.0f, 30.0f, 35));
+        CHECK(senseDiffs(none, tor != 0) == 0);
+    }
+
+    // --- two (and four) predators at the same minimum distance: the FIRST must win ---
+    for (int tor = 0; tor < 2; ++tor) {
+        Scene sc;
+        sc.cs.push_back(mk({300.0f, 300.0f}, {1.0f, 0.0f}, 30.0f, 33.0f, 50));
+        sc.preds = {{330.0f, 300.0f}, {270.0f, 300.0f}, {300.0f, 330.0f}, {300.0f, 270.0f}};   // all 30 away
+        float prod[NUM_SENSES];
+        CHECK(senseDiffs(sc, tor != 0, prod) == 0);
+        CHECK(prod[PREDATOR_FWD] > 0.99f);       // toward the first (+x), not the second (-x)
+        Scene seam;                              // across the torus seam the tie is between a wrapped and a direct one
+        seam.cs.push_back(mk({5.0f, 300.0f}, {1.0f, 0.0f}, 30.0f, 33.0f, 50));
+        seam.preds = {{(float)W - 25.0f, 300.0f}, {35.0f, 300.0f}};    // wrapped dx = -30, direct dx = +30
+        float prod2[NUM_SENSES];
+        CHECK(senseDiffs(seam, tor != 0, prod2) == 0);
+        if (tor) CHECK(prod2[PREDATOR_FWD] < -0.99f);   // the first (wrapped, behind) wins on the torus
+        else     CHECK(prod2[PREDATOR_FWD] > 0.99f);    // bounded: the first is out of range, the second is seen
+    }
+
+    // --- random crowds, bounded and toroidal; every tenth creature has its net rebuilt IN PLACE from a
+    //     shortened, mutated genome (stale masks would change its similarity sensors) ---
+    for (int tor = 0; tor < 2; ++tor)
+        for (int rep = 0; rep < 3; ++rep) {
+            Scene sc;
+            for (int i = 0; i < 300; ++i) {
+                const Vec2 p = {rng.range(0.0f, (float)W - 0.001f), rng.range(0.0f, (float)H - 0.001f)};
+                const float a = rng.range(0.0f, 6.28f);
+                Creature c = mk(p, {std::cos(a), std::sin(a)}, rng.range(0.0f, 100.0f), rng.range(5.0f, 60.0f),
+                                rng.intRange(0, 100));
+                if (i % 10 == 3 && c.genome.size() > 4) {
+                    c.genome.resize(c.genome.size() / 2);
+                    for (Gene& g : c.genome) { if (rng.unit() < 0.3f) g.sourceType = !g.sourceType; if (rng.unit() < 0.3f) g.sinkType = !g.sinkType; }
+                    buildNeuralNet(c.genome, c.nnet);          // the same net object, rebuilt
+                }
+                sc.cs.push_back(c);
+            }
+            for (int i = 0; i < 400; ++i) sc.food.push_back({rng.range(0.0f, (float)W - 0.001f), rng.range(0.0f, (float)H - 0.001f)});
+            for (int i = 0; i < 3; ++i) sc.preds.push_back({rng.range(0.0f, (float)W), rng.range(0.0f, (float)H)});
+            // (a predator may land within capture range of a prey: that is a death, and the scene is then not clean)
+            int d = senseDiffs(sc, tor != 0);
+            if (d < 0) { sc.preds.clear(); d = senseDiffs(sc, tor != 0); }
+            CHECK(d == 0);
+        }
+
+    // --- the eat scan: same items eaten, by the same creature (index order), as the base's queryRadius list ---
+    for (int tor = 0; tor < 2; ++tor) {
+        World w;
+        configure(w, tor != 0, 0);
+        w.cfg.minSpeed = w.cfg.maxSpeed = 1e-30f;          // nobody moves: the eat scan sees these exact positions
+        w.cfg.metabolicRate = 0.0f; w.cfg.geneCost = 0.0f; w.cfg.moveCost = 0.0f;
+        w.cfg.foodEnergy = 4.0f;                           // 30 + 4k is exact: k is read back from the reserves
+        w.cfg.pickupRadius = 10.0f;
+        w.init(W, H, 0);
+        auto bare = [&](Vec2 p) { Creature c = mk(p, {1.0f, 0.0f}, 5.0f, 30.0f, 0); return c; };
+        w.creatures = {bare({100.0f, 100.0f}), bare({112.0f, 100.0f}), bare({400.0f, 300.0f}), bare({5.0f, 5.0f}),
+                       bare({3.0f, 240.0f}), bare({100.0f, 100.0f})};
+        const float px = std::nextafter(110.0f, 1e9f);
+        w.food.clear();
+        for (Vec2 f : std::vector<Vec2>{
+                 {110.0f, 100.0f},        // exactly pickupRadius from creature 0, 2 from creature 1: creature 0 (first) takes it
+                 {100.0f, 100.0f},        // on creature 0 (and creature 5, which sits on it)
+                 {px, 100.0f},            // just outside creature 0's reach, inside creature 1's
+                 {100.0f, 90.0f},         // exactly pickupRadius below... above creature 0 (and creature 5)
+                 {100.0f, 100.0f},        // a coincident twin of the second
+                 {106.0f, 100.0f},        // contested: 6 from creature 0, 6 from creature 1
+                 {121.0f, 100.0f},        // only creature 1
+                 {250.0f, 250.0f},        // nobody
+                 {5.0f, 12.0f},           // creature 3
+                 {(float)W - 5.0f, 240.0f}})   // creature 4, across the seam: eaten only on the torus
+            w.food.push_back(Food{f, true});
+        const std::vector<Vec2> preCreatures = [&] { std::vector<Vec2> v; for (auto& c : w.creatures) v.push_back(c.pos); return v; }();
+        const std::vector<Food> preFood = w.food;
+        w.update(0.016f);
+        CHECK(w.creatures.size() == 6);
+        // the base algorithm: creatures in index order, queryRadius / queryRadiusWrapped over the food grid, alive-flag claim
+        std::vector<char> gone;
+        const std::vector<int> ate = baseClaims(w.cfg, preFood, w.creatures, gone);
+        int badAte = 0, total = 0;
+        for (int i = 0; i < 6; ++i) {
+            const int got = (int)std::lround((w.creatures[(size_t)i].foodReserves - 30.0f) / 4.0f);
+            if (got != ate[(size_t)i] || w.creatures[(size_t)i].foodReserves != 30.0f + 4.0f * (float)ate[(size_t)i]) ++badAte;
+            total += ate[(size_t)i];
+        }
+        int badLeft = 0;
+        std::vector<Vec2> want;
+        for (int i = 0; i < (int)preFood.size(); ++i) if (!gone[(size_t)i]) want.push_back(preFood[(size_t)i].pos);
+        if (want.size() != w.food.size()) ++badLeft;
+        else for (size_t i = 0; i < want.size(); ++i)
+            if (floatBits(want[i].x) != floatBits(w.food[i].pos.x) || floatBits(want[i].y) != floatBits(w.food[i].pos.y)) ++badLeft;
+        CHECK(badAte == 0);
+        CHECK(badLeft == 0);
+        CHECK(total >= 8 && total < (int)preFood.size());      // it ate, and left some: the scene is not vacuous
+        CHECK(ate[0] >= 3 && ate[1] >= 1);                       // creature 0 (first in index order) took the contested items
+        (void)preCreatures;
+    }
+
+    // --- the eat scan's ENERGY, bit for bit. The block above uses foodEnergy 4 (30 + 4k is exact, so the meal count
+    //     can be read back); that makes one `count * foodEnergy` addition pass as well. Production adds foodEnergy
+    //     once PER CLAIMED ITEM (c.foodReserves += cfg.foodEnergy), and with foodEnergy = 0.1f (not a power of two)
+    //     the float sum differs from a single addition of count * 0.1f, so the reference below does one addition
+    //     per claim and the reserve bits are compared. The scene is checked to be rounding-sensitive. ---
+    for (int tor = 0; tor < 2; ++tor) {
+        World w;
+        configure(w, tor != 0, 0);
+        w.cfg.minSpeed = w.cfg.maxSpeed = 1e-30f;
+        w.cfg.metabolicRate = 0.0f; w.cfg.geneCost = 0.0f; w.cfg.moveCost = 0.0f;
+        w.cfg.foodEnergy = 0.1f;
+        w.cfg.pickupRadius = 10.0f;
+        w.init(W, H, 0);
+        const float start[4] = {30.0f, 17.3f, 25.7f, 21.9f};
+        const Vec2 where[4] = {{100.0f, 100.0f}, {400.0f, 300.0f}, {5.0f, 240.0f}, {300.0f, 60.0f}};
+        for (int i = 0; i < 4; ++i) w.creatures.push_back(mk(where[i], {1.0f, 0.0f}, 5.0f, start[i], 0));
+        w.food.clear();
+        for (int j = 0; j < 13; ++j) w.food.push_back(Food{{100.0f + 0.5f * (float)j, 100.0f}, true});   // 13 for creature 0
+        for (int j = 0; j < 9; ++j)  w.food.push_back(Food{{400.0f, 300.0f + 0.75f * (float)j}, true});  // 9 for creature 1
+        for (int j = 0; j < 6; ++j)  w.food.push_back(Food{{5.0f, 240.0f + (float)j}, true});            // 6 for creature 2
+        for (int j = 2; j <= 4; ++j) w.food.push_back(Food{{(float)W - (float)j, 240.0f}, true});        // 3 more, across the seam
+        for (int j = 0; j < 4; ++j)  w.food.push_back(Food{{300.0f - (float)j, 60.0f}, true});           // 4 for creature 3
+        const std::vector<Food> preFood = w.food;
+        w.update(0.016f);
+        CHECK(w.creatures.size() == 4);
+        std::vector<char> gone;
+        const std::vector<int> ate = baseClaims(w.cfg, preFood, w.creatures, gone);
+        int badBits = 0, sensitive = 0, meals = 0;
+        for (int i = 0; i < 4; ++i) {
+            float seq = start[i];
+            for (int k = 0; k < ate[(size_t)i]; ++k) seq += w.cfg.foodEnergy;           // one addition per claimed item
+            const float once = start[i] + (float)ate[(size_t)i] * w.cfg.foodEnergy;      // what a single addition would give
+            if (floatBits(w.creatures[(size_t)i].foodReserves) != floatBits(seq)) ++badBits;
+            if (floatBits(seq) != floatBits(once)) ++sensitive;
+            meals += ate[(size_t)i];
+        }
+        CHECK(badBits == 0);
+        CHECK(meals == (tor ? 35 : 32));                         // the scene eats what it was built to eat
+        CHECK(sensitive >= 2);                                   // and one addition per item is distinguishable from one per creature
+    }
+
+    // --- pending_ is a member reused every step: a creature's deferred signal must not leak into the next
+    //     step after a death and a birth reshuffled the indices ---
+    {
+        World w;
+        configure(w, false, 0);
+        w.cfg.metabolicRate = 1.5f;       // the emitter's 0.0001 of reserves is gone after one step
+        w.init(W, H, 0);
+        Creature emitter = mk({100.0f, 100.0f}, {1.0f, 0.0f}, 5.0f, 0.0001f, 0);   // dies this step, after emitting
+        Gene g;
+        g.sourceType = SOURCE_SENSOR; g.sourceNum = LOC_X; g.sinkType = SINK_ACTION; g.sinkNum = EMIT_SIGNAL0;
+        g.weight = 20000;
+        emitter.genome = {g};
+        buildNeuralNet(emitter.genome, emitter.nnet);
+        w.creatures = {emitter, mk({300.0f, 300.0f}, {1.0f, 0.0f}, 5.0f, 30.0f, 0), mk({500.0f, 100.0f}, {1.0f, 0.0f}, 5.0f, 30.0f, 0)};
+        w.update(0.016f);                                            // step 1: slot 0 requests a signal, then dies
+        CHECK(w.creatures.size() == 2);                              // the death
+        const std::vector<std::uint8_t> s1 = w.signals.data();
+        int deposited = 0;
+        for (std::uint8_t v : s1) deposited += v != 0;
+        CHECK(deposited > 0);                                        // the emission happened (not vacuous)
+        w.creatures.push_back(mk({200.0f, 400.0f}, {1.0f, 0.0f}, 5.0f, 30.0f, 0));   // births: the next step has MORE creatures
+        w.creatures.push_back(mk({550.0f, 400.0f}, {1.0f, 0.0f}, 5.0f, 30.0f, 0));
+        w.update(0.016f);                                            // step 2 (frame 2: no decay): nobody requests a signal
+        CHECK(w.creatures.size() == 4);
+        CHECK(w.signals.data() == s1);                               // a stale slot 0 would have emitted again
+    }
+}
+#endif  // serial builds only
 
 int main() {
     std::printf("=== evo_boids core tests (no SFML linked) ===\n");
@@ -4645,6 +5168,9 @@ int main() {
     test_spatial_grid_matches_quadtree();
     test_exact_shortcuts();
     test_fused_scan_exactness();
+#if !defined(USE_OPENMP) && !defined(EVO_POOL_THREADS)
+    test_fused_scan_production_paths();
+#endif
     test_genome_and_net();
     test_feedforward_equivalence();
     test_fast_tanh();
