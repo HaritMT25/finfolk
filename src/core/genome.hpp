@@ -280,12 +280,12 @@ inline void feedForward(NeuralNet& nnet, const float sensors[], float actions[],
         // evomath::tanhf's bits, as two branch-free batches the compiler
         // vectorises (portable_math.hpp: tanhfArray). An undriven neuron's
         // accumulator is 0 and its value is dropped: it keeps its fixed output.
-        evomath::tanhfArray(accum, actions, NUM_ACTIONS);
-        float hidden[MAX_INTERNAL_NEURONS];
-        evomath::tanhfArray(accum + NUM_ACTIONS, hidden, MAX_INTERNAL_NEURONS);
+        float act[NUM_ACTIONS + MAX_INTERNAL_NEURONS];
+        evomath::tanhfArray(accum, act, NUM_ACTIONS + MAX_INTERNAL_NEURONS);
+        std::memcpy(actions, act, NUM_ACTIONS * sizeof(float));
         for (int i = 0; i < MAX_INTERNAL_NEURONS; ++i) {
             NeuralNet::Neuron& n = nnet.neurons[i];
-            n.output = n.driven ? hidden[i] : n.output;
+            n.output = n.driven ? act[NUM_ACTIONS + i] : n.output;
         }
     }
 }
