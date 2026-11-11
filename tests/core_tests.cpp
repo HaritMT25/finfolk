@@ -321,6 +321,95 @@ static void test_exact_shortcuts() {
         CHECK(differ == 0);
     }
 
+    // --- genomeSimilarityMasked (the nets' gene-type masks) == genomeSimilarity, by bit ---
+    {
+        rng.seed(4242u);
+        int differ = 0;
+        for (int t = 0; t < 3000; ++t) {
+            // Lengths around the mask words (0, 1, 63..65, 127..129, past 128) and random.
+            static const int edges[] = {0, 1, 2, 63, 64, 65, 127, 128, 129, 140, 160};
+            auto len = [&]() { return rng.intRange(0, 2) == 0 ? edges[rng.intRange(0, 10)] : rng.intRange(16, 80); };
+            Genome a = makeRandomGenome(len(), 160), b = makeRandomGenome(len(), 160);
+            a.resize((size_t)std::min<int>((int)a.size(), len())); b.resize((size_t)std::min<int>((int)b.size(), len()));
+            NeuralNet na, nb;
+            buildNeuralNet(a, na); buildNeuralNet(b, nb);
+            if (t % 7 == 0) {   // a reused net, rebuilt after its genome changed (shrunk, mutated)
+                mutateGenome(a, 0.5f, 0, 160); if (a.size() > 3) a.resize(a.size() / 2);
+                buildNeuralNet(a, na);
+            }
+            if (floatBits(genomeSimilarityMasked(a, na, b, nb)) != floatBits(genomeSimilarity(a, b))) ++differ;
+            if (floatBits(genomeSimilarityMasked(b, nb, a, na)) != floatBits(genomeSimilarity(b, a))) ++differ;
+            if (floatBits(genomeSimilarityMasked(a, na, a, na)) != floatBits(genomeSimilarity(a, a))) ++differ;
+        }
+        CHECK(differ == 0);
+    }
+
+    // --- SpatialGrid::forEachCandidate: its hits, in order, are queryRadius' list and
+    //     forEachInRadius' visit; its dx, dy, d2 are the visitor's expressions ---
+    {
+        rng.seed(777u);
+        bool same = true;
+        for (int trial = 0; trial < 40 && same; ++trial) {
+            const int W = rng.intRange(100, 900), H = rng.intRange(100, 700);
+            const float cell = (float)rng.intRange(20, 120);
+            SpatialGrid grid; grid.init(W, H, cell);
+            const int n = rng.intRange(0, 400);
+            std::vector<Vec2> pts;
+            for (int i = 0; i < n; ++i) { Vec2 p{rng.range(0.0f, (float)W), rng.range(0.0f, (float)H)}; pts.push_back(p); grid.insert(p, i); }
+            grid.build();
+            for (int q = 0; q < 30; ++q) {
+                const Vec2 c{rng.range(-20.0f, (float)W + 20.0f), rng.range(-20.0f, (float)H + 20.0f)};
+                const float r = rng.range(0.0f, 3.0f * cell);
+                std::vector<int> list; grid.queryRadius(c, r, list);
+                std::vector<int> hits, visited; int bad = 0;
+                grid.forEachCandidate(c, r, [&](int idx, float dx, float dy, float d2, bool hit) {
+                    const Vec2 p = pts[(size_t)idx];
+                    const float edx = p.x - c.x, edy = p.y - c.y, ed2 = edx * edx + edy * edy;
+                    if (floatBits(dx) != floatBits(edx) || floatBits(dy) != floatBits(edy) || floatBits(d2) != floatBits(ed2)) ++bad;
+                    if (hit != (ed2 <= r * r)) ++bad;
+                    if (hit) hits.push_back(idx);
+                });
+                grid.forEachInRadius(c, r, [&](int idx, Vec2) { visited.push_back(idx); });
+                if (bad != 0 || hits != list || hits != visited) same = false;
+            }
+        }
+        CHECK(same);
+    }
+
+    // --- feedForward (one tanh batch over actions + neurons) == the two-batch form, by bit,
+    //     with undriven neurons carrying non-default outputs ---
+    {
+        rng.seed(90210u);
+        auto reference = [](NeuralNet& nnet, const float sensors[], float actions[]) {
+            float vals[NUM_SENSES + MAX_INTERNAL_NEURONS];
+            std::memcpy(vals, sensors, NUM_SENSES * sizeof(float));
+            for (int i = 0; i < MAX_INTERNAL_NEURONS; ++i) vals[NUM_SENSES + i] = nnet.neurons[i].output;
+            float accum[NUM_ACTIONS + MAX_INTERNAL_NEURONS] = {};
+            for (const auto& conn : nnet.flat) accum[conn.sink()] += vals[conn.src()] * conn.w();
+            evomath::tanhfArray(accum, actions, NUM_ACTIONS);
+            float hidden[MAX_INTERNAL_NEURONS];
+            evomath::tanhfArray(accum + NUM_ACTIONS, hidden, MAX_INTERNAL_NEURONS);
+            for (int i = 0; i < MAX_INTERNAL_NEURONS; ++i) {
+                NeuralNet::Neuron& nr = nnet.neurons[i];
+                nr.output = nr.driven ? hidden[i] : nr.output;
+            }
+        };
+        int differ = 0;
+        for (int t = 0; t < 500; ++t) {
+            const Genome g = makeRandomGenome(rng.intRange(0, 3) == 0 ? 2 : 16, 80);
+            NeuralNet x, y; buildNeuralNet(g, x); buildNeuralNet(g, y);
+            for (int i = 0; i < MAX_INTERNAL_NEURONS; ++i) { const float o = rng.range(-1.0f, 1.0f); x.neurons[i].output = o; y.neurons[i].output = o; }
+            for (int step = 0; step < 3; ++step) {
+                float s[NUM_SENSES]; for (float& v : s) v = rng.range(-3.0f, 3.0f);
+                float ax[NUM_ACTIONS] = {}, ay[NUM_ACTIONS] = {};
+                feedForward(x, s, ax); reference(y, s, ay);
+                for (int i = 0; i < NUM_ACTIONS; ++i) if (floatBits(ax[i]) != floatBits(ay[i])) ++differ;
+                for (int i = 0; i < MAX_INTERNAL_NEURONS; ++i) if (floatBits(x.neurons[i].output) != floatBits(y.neurons[i].output)) ++differ;
+            }
+        }
+        CHECK(differ == 0);
+    }
+
     // --- Still water: the signed zero the current sensors used to compute ---
     {
         const float comps[] = {1.0f, -1.0f, 0.0f, -0.0f, 0.6f, -0.8f, 1e-30f, -1e-30f};

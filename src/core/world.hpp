@@ -1466,20 +1466,20 @@ private:
                 }
             });
         } else {
-        auto smell = [&](int, Vec2 fp) {
-            ++foodCount;
-            float dx = fp.x - c.pos.x;
-            float dy = fp.y - c.pos.y;
-            if (cfg.toroidal) { dx = wrapDx(dx); dy = wrapDy(dy); }
-            float dist = std::sqrt(dx * dx + dy * dy);
-            if (dist < foodDist) {
-                foodDist = dist;
-                float invD = (dist > 0.001f) ? 1.0f / dist : 0.0f;
-                foodDx = dx * invD;
-                foodDy = dy * invD;
-            }
-        };
-        foodGrid.forEachInRadiusWrapped(c.pos, cfg.perceptionRadius, smell);
+            auto smell = [&](int, Vec2 fp) {
+                ++foodCount;
+                float dx = fp.x - c.pos.x;
+                float dy = fp.y - c.pos.y;
+                if (cfg.toroidal) { dx = wrapDx(dx); dy = wrapDy(dy); }
+                float dist = std::sqrt(dx * dx + dy * dy);
+                if (dist < foodDist) {
+                    foodDist = dist;
+                    float invD = (dist > 0.001f) ? 1.0f / dist : 0.0f;
+                    foodDx = dx * invD;
+                    foodDy = dy * invD;
+                }
+            };
+            foodGrid.forEachInRadiusWrapped(c.pos, cfg.perceptionRadius, smell);
         }
         sensors[NEAREST_FOOD_DX] = foodDx;
         sensors[NEAREST_FOOD_DY] = foodDy;

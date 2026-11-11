@@ -118,13 +118,15 @@ struct NeuralNet {
 
     // Gene-type bit masks: bit i of srcTypeBits / sinkTypeBits is gene i's
     // sourceType / sinkType, for genes 0..127 (two 64-bit words each), written
-    // by buildNeuralNet from the genome in GENOME order (not flat's). They let
-    // genomeSimilarityMasked count the positional type matches with a popcount
-    // over the net's own bytes instead of a loop over both genomes' heap
-    // buffers: the same integer count, so the same float. Derived state, like
-    // the rest of the net: rebuilt wherever the net is (birth, checkpoint load),
-    // never serialized. Genes past 127 are not covered (no configurable genome
-    // is that long today); the masked compare falls back to the loop.
+    // by buildNeuralNet (the prey's builder; predbrain::buildNet does not fill
+    // them, and nothing reads a predator's) from the genome in GENOME order
+    // (not flat's). They let genomeSimilarityMasked count the positional type
+    // matches with a popcount over the net's own bytes instead of a loop over
+    // both genomes' heap buffers: the same integer count, so the same float.
+    // Derived state, like the rest of the net: rebuilt wherever the net is
+    // (birth, checkpoint load), never serialized. Genes past 127 (a
+    // --genome-max above 128) are not covered: the masked compare takes the
+    // loop whenever the shorter genome is longer than that.
     uint64_t srcTypeBits[2]  = {0, 0};
     uint64_t sinkTypeBits[2] = {0, 0};
 };
@@ -277,9 +279,12 @@ inline void feedForward(NeuralNet& nnet, const float sensors[], float actions[],
             }
         }
     } else {
-        // evomath::tanhf's bits, as two branch-free batches the compiler
-        // vectorises (portable_math.hpp: tanhfArray). An undriven neuron's
-        // accumulator is 0 and its value is dropped: it keeps its fixed output.
+        // evomath::tanhf's bits, as one branch-free batch over both sink kinds
+        // (the accumulators are contiguous: the actions, then the neurons) that
+        // the compiler vectorises with no scalar tail (portable_math.hpp:
+        // tanhfArray; per element the same function, so the same bits). An
+        // undriven neuron's accumulator is 0 and its value is dropped: it keeps
+        // its fixed output.
         float act[NUM_ACTIONS + MAX_INTERNAL_NEURONS];
         evomath::tanhfArray(accum, act, NUM_ACTIONS + MAX_INTERNAL_NEURONS);
         std::memcpy(actions, act, NUM_ACTIONS * sizeof(float));
