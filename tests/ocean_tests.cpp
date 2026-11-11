@@ -4915,6 +4915,7 @@ int main(int argc, char** argv) {
     ot::testFoodGrid();
     ot::testSenseMask();   // tests/ocean_speed_tests.hpp: the dead-sensor skip's mask,
     ot::testSenseDce();    // and what the speed-ups must keep
+    ot::testTypeMasks();   // the nets' gene-type masks are their genomes' (and the fingerprint's marker)
     ot::testCaptureToggle();
     ot::testLabelMask();   // tests/ocean_exp_tests.hpp: the skip under own-frame labels (labelFrame 1)
     ot::testFoodScan();

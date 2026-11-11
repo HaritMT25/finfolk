@@ -163,6 +163,23 @@ inline Genome makeRandomGenome(int initMin = GENOME_INITIAL_MIN,
     return makeRandomGenome(initMin, initMax, rng);
 }
 
+// The gene-type masks of a genome (NeuralNet::srcTypeBits / sinkTypeBits):
+// bit i of src / sink is gene i's sourceType / sinkType, genes 0..127, genome
+// order. buildNeuralNet writes them into the net it builds; a net wired from
+// another gene list on purpose (a test fixture) restores them from the genome
+// it keeps, and typeMasksMatch checks a net against its genome.
+inline void genomeTypeMasks(const Genome& genome, uint64_t src[2], uint64_t sink[2]) {
+    src[0] = src[1] = 0;
+    sink[0] = sink[1] = 0;
+    for (size_t i = 0; i < genome.size() && i < 128; ++i) {
+        const uint64_t bit = 1ull << (i & 63);
+        if (genome[i].sourceType) src[i >> 6]  |= bit;
+        if (genome[i].sinkType)   sink[i >> 6] |= bit;
+    }
+}
+struct NeuralNet;
+inline bool typeMasksMatch(const Genome& genome, const NeuralNet& nnet);
+
 // Build neural net wiring from genome
 // Adapted from biosim4's createWiringFromGenome
 inline void buildNeuralNet(const Genome& genome, NeuralNet& nnet) {
@@ -194,13 +211,7 @@ inline void buildNeuralNet(const Genome& genome, NeuralNet& nnet) {
     }
 
     // The gene-type masks (see NeuralNet): genome order, genes 0..127.
-    nnet.srcTypeBits[0] = nnet.srcTypeBits[1] = 0;
-    nnet.sinkTypeBits[0] = nnet.sinkTypeBits[1] = 0;
-    for (size_t i = 0; i < genome.size() && i < 128; ++i) {
-        const uint64_t bit = 1ull << (i & 63);
-        if (genome[i].sourceType) nnet.srcTypeBits[i >> 6]  |= bit;
-        if (genome[i].sinkType)   nnet.sinkTypeBits[i >> 6] |= bit;
-    }
+    genomeTypeMasks(genome, nnet.srcTypeBits, nnet.sinkTypeBits);
 
     // Stable counting sort by sink slot. Stability is what preserves
     // bit-exactness: within one accumulator the contributions keep their genome
@@ -281,7 +292,7 @@ inline void feedForward(NeuralNet& nnet, const float sensors[], float actions[],
     } else {
         // evomath::tanhf's bits, as one branch-free batch over both sink kinds
         // (the accumulators are contiguous: the actions, then the neurons) that
-        // the compiler vectorises with no scalar tail (portable_math.hpp:
+        // the compiler vectorises (24 values in Classic, 25 in the Ocean; portable_math.hpp:
         // tanhfArray; per element the same function, so the same bits). An
         // undriven neuron's accumulator is 0 and its value is dropped: it keeps
         // its fixed output.
@@ -372,6 +383,13 @@ inline float genomeSimilarity(const Genome& g1, const Genome& g2) {
                    (g1[i].sinkType == g2[i].sinkType);
     }
     return static_cast<float>(matches) / static_cast<float>(minLen);
+}
+
+inline bool typeMasksMatch(const Genome& genome, const NeuralNet& nnet) {
+    uint64_t src[2], sink[2];
+    genomeTypeMasks(genome, src, sink);
+    return src[0] == nnet.srcTypeBits[0] && src[1] == nnet.srcTypeBits[1] &&
+           sink[0] == nnet.sinkTypeBits[0] && sink[1] == nnet.sinkTypeBits[1];
 }
 
 // genomeSimilarity, from the nets' gene-type masks (NeuralNet::srcTypeBits /

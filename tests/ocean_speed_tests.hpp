@@ -98,6 +98,9 @@ inline void readOnly(Fish& f, int s) {
     pair = fight;
     pair.sourceNum = 1;                  pair.sinkNum = INTERACT_REPRODUCE;
     buildNeuralNet(Genome{toHidden, toSteer, fight, pair}, f.nnet);
+    // The net's gene-type masks describe the genome the fish KEEPS (the masked
+    // nearest-neighbour similarity reads them), not the four wires above.
+    genomeTypeMasks(f.genome, f.nnet.srcTypeBits, f.nnet.sinkTypeBits);
 }
 
 inline bool sameArrays(const Fish& a, const Fish& b) {
@@ -252,6 +255,35 @@ void testSenseDce() {
     t.note("%ld single-sensor worlds x steps: capture off == capture on (each world's own rng stream); %ld fish's own-state "
            "inputs == the kernel's; the 40-step worlds: %lld fish-contacts, %lld births", compared, ownChecked, longContacts,
            longBirths);
+}
+
+// The gene-type masks (genome.hpp) every fish's net carries are its genome's:
+// on a stepped world (births, deaths, the loaded founders), on the readOnly
+// fixture (a net wired from other genes, its masks restored), and the
+// fingerprint marks a fish whose masks are not (tools/ocean_fingerprint.hpp).
+void testTypeMasks() {
+    Test t("type_masks");
+    OceanWorld w;
+    std::string err;
+    if (t.expect(ofp::initWorld(w, 4242, 1920, 1080, 240.0f, 300, "{}", err), "init: %s", err.c_str())) {
+        for (int i = 0; i < 300; ++i) w.update(0.016f);
+        long bad = 0, n = 0;
+        for (const Fish& f : w.creatures) { ++n; if (!typeMasksMatch(f.genome, f.nnet)) ++bad; }
+        t.expect(bad == 0 && n > 0, "%ld of %ld fish carry masks that are not their genome's", bad, n);
+        for (Fish& f : w.creatures) speed::readOnly(f, (int)AGE);
+        bad = 0;
+        for (const Fish& f : w.creatures) if (!typeMasksMatch(f.genome, f.nnet)) ++bad;
+        t.expect(bad == 0, "%ld readOnly fish lost their genome's masks", bad);
+        // A broken mask changes the fingerprint (the marker), nothing else touched.
+        const ofp::Fingerprint before = ofp::fingerprint(w, false);
+        Fish& f0 = w.creatures[0];
+        const uint64_t keep = f0.nnet.srcTypeBits[0];
+        f0.nnet.srcTypeBits[0] ^= 1ull;
+        const ofp::Fingerprint broken = ofp::fingerprint(w, false);
+        f0.nnet.srcTypeBits[0] = keep;
+        const ofp::Fingerprint after = ofp::fingerprint(w, false);
+        t.expect(!(before == broken) && before == after, "the fingerprint must mark a foreign mask and only that");
+    }
 }
 
 void testCaptureToggle() {

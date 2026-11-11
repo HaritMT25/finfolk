@@ -576,6 +576,12 @@ inline void hashFish(Hasher& h, const Fish& c, bool withActivations = true) {
     };
     h.u64(fl.size());
     for (std::size_t i = 0; i < fl.size(); i += 2) h.u64(flatWord(fl[i]) | (i + 1 < fl.size() ? flatWord(fl[i + 1]) << 32 : 0));
+    // The net's gene-type masks (genome.hpp) are derived from the genome hashed
+    // above, so they are not hashed; the INVARIANT is: a net's masks are its
+    // genome's. A fish that breaks it hashes a marker word, so a stale or
+    // foreign mask changes every fingerprint from that step on (the parity
+    // gate catches it) while the format and every baseline stay as they are.
+    if (!typeMasksMatch(c.genome, c.nnet)) h.u64(0x4d41534b5f424144ull);   // "MASK_BAD"
     if (withActivations) {
         float io[(int)NUM_SENSES + (int)NUM_ACTIONS + 1] = {};
         std::memcpy(io, c.lastSensors, sizeof c.lastSensors);
