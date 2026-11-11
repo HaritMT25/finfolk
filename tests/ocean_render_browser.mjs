@@ -6,6 +6,7 @@
 //        [--cameras whole,dense,follow,fit] [--colours appearance,family,brain]   (perf; default whole, appearance)
 //        [--modes off,frame,spans,spansGpu] [--viewport 1920x1080[@1]]       (perf; the default: all four, 1920 x 1080 at DPR 1)
 //        [--arms main,off,on,ungated --main-base URL]   (perf by arms, below; offimage needs --main-base)
+//        [--query renderOpt=0]   (added to this site's links: offimage's pixel identity with main is the reference pipeline's)
 //   --counts takes "big" too: the Big tank (EvoOceanConfig.BIG_TANK: its size, population and set-up)
 //   --cameras fit: the page's own fit of the whole tank (scene.resetView), where whole is a fixed camera
 //   --arms: instead of profiler modes, the swim polish's arms, each capture spansGpu (cpu spans, GPU frame
@@ -106,6 +107,10 @@ const DUR = Number(arg("dur", 15000)), WARM = Number(arg("warm", 10000)), ROUNDS
 const CAMERAS = String(arg("cameras", "whole")).split(","), COLOURS = String(arg("colours", "appearance")).split(",");
 const PERF_MODES = String(arg("modes", "off,frame,spans,spansGpu")).split(",");
 const MAIN_BASE = arg("main-base", null) ? String(arg("main-base")).replace(/\/$/, "") : null;
+/* --query "renderOpt=0": query parameters added to this site's links (not --main-base's): offimage compares this site's polish-off image with
+ * main's, pixel for pixel, which is the reference pipeline's property (?renderOpt=0); the optimized pipeline's image is compared with the
+ * reference by tools/ocean_render_perf/shots.mjs, where its intended differences (the coarse bodies of small fish) are measured */
+const QUERY = arg("query", "") ? String(arg("query")) : "";
 const ARMS = arg("arms", null) ? String(arg("arms")).split(",") : null;
 const VIEWPORT = (() => { const m = /^(\d+)x(\d+)(?:@([\d.]+))?$/.exec(String(arg("viewport", "1920x1080@1")));
   if (!m) throw new Error("--viewport WxH[@dpr]"); return { width: +m[1], height: +m[2], dpr: m[3] ? +m[3] : 1 }; })();
@@ -142,7 +147,7 @@ function benchUrl(c, extra = {}, base = BASE) {
   const q = new URLSearchParams(Object.assign({ renderBench: "1", guide: "0", intro: "0", seed: String(c.worldSeed), pop: String(c.population),
     w: String(c.world[0]), h: String(c.world[1]), depth: String(c.world[2]), speed: String(c.speed), colour: c.colourMode || "appearance",
     walls: c.config.walls ? "1" : "0", cfg: JSON.stringify(Object.assign({}, c.config, { walls: undefined })) }, extra));
-  return base + "/ocean.html?" + q.toString();
+  return base + "/ocean.html?" + q.toString() + (QUERY && base === BASE ? "&" + QUERY : "");
 }
 /* The swim polish's size weights against an independent projection (in the
  * page): for every fish as the last frame uploaded it (scene.poseOf: its

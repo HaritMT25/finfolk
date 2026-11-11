@@ -20,7 +20,8 @@ const PAGES = [
     return await p.evaluate(() => ({ policy: EvoOcean.scene.renderOptimization(), n: EvoOcean.state().n })); }],
   ["ocean (family colours)", WEB + "/ocean.html?guide=0&intro=0&seed=7&pop=400&colour=family", async (p) => { await p.waitForFunction(() => window.EvoApp && window.EvoApp.ready === true && window.EvoOcean && EvoOcean.state() && EvoOcean.state().frame > 30, null, { timeout: 90000, polling: 250 }); await p.waitForTimeout(5000);
     return await p.evaluate(() => ({ policy: EvoOcean.scene.renderOptimization().effective, mode: EvoOcean.state().colourMode })); }],
-  ["classic", WEB + "/index.html", async (p) => { await p.waitForFunction(() => window.EvoApp && window.EvoApp.ready === true, null, { timeout: 90000, polling: 250 }).catch(() => {}); await p.waitForTimeout(5000); return {}; }]
+  /* (Classic's background is ../img/rocks.jpg: served from the repository root, as the built site does; under a web/ root it is a 404 on any commit) */
+  ["classic", (ROOT ? ROOT + "/web" : WEB) + "/index.html", async (p) => { await p.waitForFunction(() => window.EvoApp && window.EvoApp.ready === true, null, { timeout: 90000, polling: 250 }).catch(() => {}); await p.waitForTimeout(5000); return {}; }]
 ];
 if (ROOT) PAGES.push(["body plan (check page)", ROOT + "/web/ocean_bodyplan.html?check=1", async (p) => { await p.waitForTimeout(15000); return await p.evaluate(() => ({ title: document.title, status: (document.getElementById("status") || {}).textContent || "" })); }]);
 

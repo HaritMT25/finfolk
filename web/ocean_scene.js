@@ -81,7 +81,16 @@
  * while they hunt, and ocean currents (when the snapshot has them) show as
  * drifting streaks.
  *
- * Cost model: one instanced draw for all fish, one for their shadows, one each
+ * The appearance fish's draws are the render optimization's (setRenderOptimization;
+ * docs/ocean_render_perf.md; ?renderOpt=0 draws through the reference pipeline
+ * described next): two body draws by projected size (the medium template for the
+ * fish at least 7 px across, the coarse one for the rest), the barbel strips only
+ * for the fish that have them and are 6 px or more across, and every fish's
+ * decoded gene constants computed once, at its birth, into a second texture
+ * instead of in every vertex; the one whole shadow draw and everything that
+ * reads a fish by its place in the snapshot are unchanged.
+ *
+ * Cost model (the reference pipeline's): one instanced draw for all fish, one for their shadows, one each
  * for predators, food, currents and the floor. Per frame the CPU only packs
  * the spine points (20 floats per fish) into instance buffers (the appearance
  * genes only of the fish new to the renderer, into their gene slots, and

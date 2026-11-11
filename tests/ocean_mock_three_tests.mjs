@@ -393,12 +393,6 @@ async function side(web, tag, opts) {
       const wantB = st.buckets.barbels > 0 ? [st.buckets.barbels, RING.medium[0], RING.medium[1]].join("|") : "";
       if (barbs !== wantB) P.push("the barbel draw " + barbs + " is not " + wantB);
       res.nb = nb; res.medium = Array.from(b.medium.drawIdx); res.barbels = st.buckets.barbels;
-      if (process.env.MOCK_DEBUG) {
-        const pc = scene.poseCamera(), G = { view: pc.view, focal: pc.focalCss, near: pc.near, halfW: pc.halfW, halfH: pc.halfH }, pxs = [];
-        for (let i = 0; i < N; i++) { const p = scene.poseOf(i), xs = [], ys = []; for (let k = 0; k < 6; k++) { xs.push(p.spine[2 * k]); ys.push(p.spine[2 * k + 1]); } pxs.push(S0.posePx(xs, ys, p.R, p.y, G)); }
-        pxs.sort((a, b) => a - b);
-        console.log("    [debug] " + tag + ": focal " + pc.focalCss.toFixed(1) + ", px min " + pxs[0].toFixed(2) + " median " + pxs[150].toFixed(2) + " max " + pxs[299].toFixed(2) + "; " + pxs.filter((x) => x >= 7).length + " >= 7");
-      }
       return res;
     }
     const run = async (tag, k, w, sel, camera, o) => { for (let i = 0; i < k; i++) { if (camera) camera(); await frame(w, sel); } const r = inspect(tag, o); rep.push(r); return r; };
