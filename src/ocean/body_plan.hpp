@@ -466,6 +466,35 @@ inline Vec3 restVertex(const Morph& M, const float* a, int fin, float side) {
     return geo;
 }
 
+// The hull point a fin template vertex hangs from, in body radii (added for
+// M2b's inflation-update bases; nothing in geometry law 1 reads it): the
+// dorsal / anal root facet(M, t, ±½π, 1) and the paired fins' root
+// facet(M, t, θ, side), each by restVertex's own expressions; {0, 0, 0} for
+// the hull itself, the caudal fin (not hull-rooted), the eyes and the
+// barbels. restVertex of a root-row sample (dorsal / anal q = 0, paired r =
+// 0) is this point bit for bit except that the median fins' y is 0 (body
+// tests: hydro_material). Under the torso inflation k every root is
+// (x, k y, k z): what the fin's application point follows.
+inline Vec3 restRoot(const Morph& M, const float* a, int fin, float side) {
+    using namespace detail;
+    if (fin == 2 || fin == 5) {
+        const bool dors = fin == 2;
+        const float up = dors ? 1.0f : -1.0f;
+        const float ell = dors ? M.dL : M.aL;
+        const float start = 0.04f + (0.92f - ell) * (dors ? M.dS : M.aS);
+        const float t = start + ell * a[0];
+        return facet(M, t, up * 0.5f * kPi, 1.0f);
+    }
+    if (fin == 3 || fin == 6) {
+        const bool pec = fin == 3;
+        const float chord = pec ? 0.80f : 0.55f, tc = pec ? M.pT : M.vT, thr = pec ? kPecTheta : kPelTheta;
+        const float X = M.lam * warp(M, tc) + chord * (a[0] - 0.5f);
+        const float t = invWarp(M, X / M.lam);
+        return facet(M, t, thr, side);
+    }
+    return Vec3{0.0f, 0.0f, 0.0f};
+}
+
 // ---- the canonical samples (frozen with the law) ---------------------------------
 struct Samples { Sample s[kSamples]; };
 inline const Samples& sampleCoords() {
