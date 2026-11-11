@@ -264,7 +264,9 @@ async function side(web, tag, opts) {
   const K = new Proxy({}, { get: (t, p) => p });
   const profiler = { active: true, SPAN: K, K, beginCpu: () => 0, lap: () => 0, endCpu() {}, count(k, v) { counts[k] = v; }, add(k, v) { counts["+" + k] = (counts["+" + k] || 0) + v; },
                      markDiagnostic() {}, attachGL() {}, watch: (o, l) => R.label(o, l), beginSubmission() {}, endSubmission() {}, suspend: (f) => f() };
-  const scene = S0.create(canvas, { profiler, visualRandom: rng(99), tankDepth: D });
+  /* the recording is of the reference pipeline (renderOptimization: false: main's draws, byte for byte); the render
+   * optimization has its own session below (opts.optimized), checked by assertions, never by a new recorded hash */
+  const scene = S0.create(canvas, { profiler, visualRandom: rng(99), tankDepth: D, renderOptimization: opts.optimized ? undefined : false });
   if (!scene) throw new Error(tag + ": no scene");
   scene.setWorld(W, HH, D, { walls: false });
   const frames = [];
@@ -293,6 +295,17 @@ async function side(web, tag, opts) {
   const close = (w, i) => { const f = w.fish[i]; scene.lookFrom([f.x - W / 2 + 60, -f.d + 25, f.y - HH / 2 + 60], [f.x - W / 2, -f.d, f.y - HH / 2]); };
   const closeP = (w, i) => { const p = w.preds[i]; scene.lookFrom([p.x - W / 2 + 70, -p.d + 30, p.y - HH / 2 + 70], [p.x - W / 2, -p.d, p.y - HH / 2]); };
   const out = { frames, early: rec.early, logs, bad, binds: () => checked };
+  if (opts.session === "policy") {
+    /* the render optimization's policy API (scene.setRenderOptimization / renderOptimization): validation, refusal, the lock */
+    const s0 = scene.renderOptimization();
+    const refused = await scene.setRenderOptimization({ lod: "nonsense" });
+    const refusedD = await scene.setRenderOptimization({ decoded: "yes" });
+    const refusedB = await scene.setRenderOptimization({ barbels: 7 });
+    const after = scene.renderOptimization();
+    const refOk = await scene.setRenderOptimization({ lod: "quality", decoded: false, barbels: "body" });
+    Object.assign(out, { s0, refused, refusedD, refusedB, after, refOk, final: scene.renderOptimization() });
+    return out;
+  }
   if (opts.session === "contextLoss") {
     /* check 4: the legacy fish close up (lit) with every compile held: the prewarm asks, and is pending; the context is lost
      * (frames go on: the page skips drawing), 6 s pass (main's prewarm marked itself ready at 5 s, compiled or not), the
@@ -428,6 +441,17 @@ async function planted(mutant, session) {
   const B = await planted("planesOnce");
   const fa = A.frames.map((f) => JSON.stringify(f)), n = B.error ? 0 : fa.filter((x, i) => x !== JSON.stringify(B.frames[i])).length;
   ok(n > 0, "   planted: the side planes never recomputed (the review of #59, P3-3): " + (B.error || n + " frames differ from the recording (the inset steps)"));
+}
+console.log("== the render optimization's policy (scene.setRenderOptimization)");
+{
+  const lockedS = await side(WEB, "policyRef", { session: "policy" });                       /* the reference scene: renderOptimization: false */
+  const P = await side(WEB, "policy", { session: "policy", optimized: true });
+  const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+  ok(lockedS.s0.enabled === false && same(lockedS.s0.effective, { lod: "quality", decoded: false, barbels: "body" }) && lockedS.refOk.ok === false && /renderOptimization: false/.test(lockedS.refOk.error),
+     "renderOptimization: false: the reference pipeline, its policy locked (setRenderOptimization refuses)", { s0: lockedS.s0, refOk: lockedS.refOk });
+  ok(P.s0.enabled === true && P.refused.ok === false && P.refusedD.ok === false && P.refusedB.ok === false && same(P.after.requested, P.s0.requested) && same(P.after.effective, P.s0.effective),
+     "a bad policy value is refused, naming it, and changes nothing", { refused: P.refused.error, refusedD: P.refusedD.error, refusedB: P.refusedB.error });
+  ok(P.refOk.ok === true && same(P.refOk.effective, { lod: "quality", decoded: false, barbels: "body" }) && P.final.failures.length === 0, "the reference policy can always be set", P.refOk);
 }
 console.log("== a WebGL context loss during the prewarm (#50's review, P2)");
 {

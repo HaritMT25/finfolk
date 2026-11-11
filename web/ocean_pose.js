@@ -176,8 +176,40 @@
   /** @param {number} a @param {number} b @param {number} x */
   function smoothCPU(a, b, x) { var t = Math.max(0, Math.min(1, (x - a) / (b - a))); return t * t * (3 - 2 * t); }
 
+  /* The appearance fish's body LOD by projected size (the render optimization; the scene's `lod: "screen"`
+   * policy). A fish's projected body radius in CSS px (posePx: the cheap size every fish gets, whatever the
+   * polish; DPR plays no part) picks its template: the medium one (190 vertices) from LOD_MEDIUM_ENTER_CSS
+   * px up, the coarse one (89) below LOD_MEDIUM_EXIT_CSS; between them a fish keeps the one it had (a
+   * hysteresis, so a fish near a threshold does not flip between the two templates on every frame's jitter).
+   * pinned (the selected or hovered fish, detail 3 only) is always medium: an inspected fish keeps its detail.
+   * Detail below 3 draws every body coarse, as before. The thresholds are the measured ones
+   * (docs/ocean_render_perf.md: where the two templates' pictures stop differing); previous 0 / LOD_COARSE /
+   * LOD_MEDIUM is the fish's last bucket (0: new). */
+  var LOD_COARSE = 1, LOD_MEDIUM = 2;
+  var LOD_MEDIUM_ENTER_CSS = 7.0, LOD_MEDIUM_EXIT_CSS = 5.0;
+  /** @param {number} px @param {number} previous @param {number} quality @param {boolean} pinned @returns {number} */
+  function bodyLod(px, previous, quality, pinned) {
+    if (quality < 3) return LOD_COARSE;
+    if (pinned) return LOD_MEDIUM;
+    if (previous === LOD_MEDIUM) return px <= LOD_MEDIUM_EXIT_CSS ? LOD_COARSE : LOD_MEDIUM;
+    return px >= LOD_MEDIUM_ENTER_CSS ? LOD_MEDIUM : LOD_COARSE;
+  }
+  /* The barbel strips' gate (the scene's `barbels: "gated"` policy): drawn only for a fish that has barbels (the
+   * barbel gene above the shader's own 0.2, as a float32: mBuild's `(M.bD - 0.2)` weights vanish at 0.2), in the
+   * medium body bucket, at detail 3, and big enough on screen (BARBEL_ENTER_CSS up; a fish that had them keeps them
+   * down to BARBEL_EXIT_CSS). Selection never bypasses the size threshold. previous: it drew them last frame */
+  var BARBEL_GENE_MIN = Math.fround(0.2), BARBEL_ENTER_CSS = 6.0, BARBEL_EXIT_CSS = 4.5;
+  /** @param {number} bD @param {number} px @param {boolean} previous @param {number} quality @param {number} lod @returns {boolean} */
+  function barbelVisible(bD, px, previous, quality, lod) {
+    if (quality < 3 || lod !== LOD_MEDIUM || !(bD > BARBEL_GENE_MIN)) return false;
+    return previous ? px > BARBEL_EXIT_CSS : px >= BARBEL_ENTER_CSS;
+  }
+
   /** @type {EvoOceanPoseApi} */
   var API = {
+    LOD_COARSE: LOD_COARSE, LOD_MEDIUM: LOD_MEDIUM, LOD_MEDIUM_ENTER_CSS: LOD_MEDIUM_ENTER_CSS, LOD_MEDIUM_EXIT_CSS: LOD_MEDIUM_EXIT_CSS,
+    BARBEL_GENE_MIN: BARBEL_GENE_MIN, BARBEL_ENTER_CSS: BARBEL_ENTER_CSS, BARBEL_EXIT_CSS: BARBEL_EXIT_CSS,
+    bodyLod: bodyLod, barbelVisible: barbelVisible,
     REACH_APP: REACH_APP, WAG_MAX: WAG_MAX, POSE0: POSE0,
     reachOfTemplate: reachOfTemplate, reachRadius: reachRadius,
     posePx: posePx, poseVisibleQ: poseVisibleQ, poseQ: poseQ, posePack: posePack, swimPose: swimPose,

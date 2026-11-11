@@ -744,6 +744,52 @@
      * or the lit fish moved out of the main draw) would be its next form. The
      * look is the same either way (0 differing pixels) */
     var litSplit = false;
+    /* The render optimization (render-LOD PR; render-only, the simulation and every hash untouched): three
+     * independent, individually switchable policies for the appearance fish's draws, and the reference path they
+     * are measured against, which is main's pipeline as it was (opts.renderOptimization === false locks the scene
+     * to it: no bucket meshes, decoded texture, extra programs, uniforms or counters are made):
+     *   lod      "quality" (the detail setting's template for every fish, as before), "screen" (two instanced
+     *            body draws, the medium template for the fish big enough on screen and the coarse one for the
+     *            rest, bucketed by projected radius with hysteresis; detail below 3 is all coarse), or "medium" /
+     *            "coarse" (every fish in that bucket: measurements and forced-equivalence checks)
+     *   decoded  false (every vertex fetches the 16 gene texels and decodes them), or true (the decoded
+     *            appearance constants of a fish are cached once, at its birth, in a second texture)
+     *   barbels  "body" (the barbel strips for every fish of a body draw whenever any fish has barbels, as before),
+     *            "gated" (only fish that have barbels and are big enough on screen), "off"
+     * setRenderOptimization(policy) -> Promise of {ok, requested, effective, ...} (a change that needs programs
+     * resolves once they compiled and the policy took effect; a refused or failed one leaves the previous policy);
+     * renderOptimization() the requested and effective policy and what the last frame drew. Display only. */
+    var RENDER_REFERENCE = Object.freeze({ lod: "quality", decoded: false, barbels: "body" });
+    var RENDER_DEFAULT = Object.freeze({ lod: "quality", decoded: false, barbels: "body" });
+    var renderOn = opts.renderOptimization !== false;
+    var renderWant = Object.assign({}, renderOn ? RENDER_DEFAULT : RENDER_REFERENCE);   /* requested */
+    var renderNow = Object.assign({}, renderWant);                                       /* in effect */
+    var renderFail = [];                                                                 /* what could not take effect, and why */
+    var RENDER_LODS = ["quality"], RENDER_DECODED = [false], RENDER_BARBELS = ["body"];   /* what this build implements */
+    function renderPolicyOf(p) {
+      var q = Object.assign({}, renderWant);
+      if (p && typeof p === "object") {
+        if (p.lod !== undefined) q.lod = p.lod;
+        if (p.decoded !== undefined) q.decoded = p.decoded;
+        if (p.barbels !== undefined) q.barbels = p.barbels;
+      }
+      if (RENDER_LODS.indexOf(q.lod) < 0) return "lod must be " + RENDER_LODS.join(", ");
+      if (RENDER_DECODED.indexOf(q.decoded) < 0) return "decoded must be " + RENDER_DECODED.join(" or ");
+      if (RENDER_BARBELS.indexOf(q.barbels) < 0) return "barbels must be " + RENDER_BARBELS.join(", ");
+      return q;
+    }
+    function setRenderOptimization(p) {
+      if (!renderOn) return Promise.resolve({ ok: false, error: "the scene was made with renderOptimization: false (the reference pipeline)", requested: Object.assign({}, renderWant), effective: Object.assign({}, renderNow) });
+      var q = renderPolicyOf(p);
+      if (typeof q === "string") return Promise.resolve({ ok: false, error: q, requested: Object.assign({}, renderWant), effective: Object.assign({}, renderNow) });
+      renderWant = q;
+      renderNow = Object.assign({}, q);
+      renderFail.length = 0;
+      return Promise.resolve({ ok: true, requested: Object.assign({}, renderWant), effective: Object.assign({}, renderNow) });
+    }
+    function renderState() {
+      return { enabled: renderOn, requested: Object.assign({}, renderWant), effective: Object.assign({}, renderNow), failures: renderFail.slice() };
+    }
     function AppKind() {
       if (!SLOTS) throw new Error("web/ocean_appearance_slots.js not loaded");
       var gl0 = renderer.getContext(), maxTex = gl0.getParameter(gl0.MAX_TEXTURE_SIZE);
@@ -2252,6 +2298,9 @@
        * rest plain (AppKind's split); false (the default: see litSplit), the
        * whole kind on the full programs while any is lit, as before */
       setLitSplit: function (on) { litSplit = on === true; },
+      /* the render optimization's policy (above): a Promise of the outcome; and its state */
+      setRenderOptimization: setRenderOptimization,
+      renderOptimization: renderState,
       /* the fish's materials (web/ocean_materials.js): the binder's state
        * (its Look, every cached material by key: reserved, ready or failed);
        * setFeatures(set): a feature set (a Look's: web/ocean_materials.js says

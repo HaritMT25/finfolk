@@ -125,6 +125,7 @@ jobs:
           node-version: "20.x"
       - run: node tests/ocean_shader_slots_tests.cjs
       - run: node tests/ocean_materials_tests.cjs
+      - run: node tests/ocean_render_opt_tests.cjs
       - run: node tests/ocean_mock_three_tests.mjs
 
   # tools/redqueen (the Red Queen tournament tooling) on the Python versions it must run on: the

@@ -320,6 +320,14 @@ interface SlotStoreOptions {
   /** most texSubImage2D ranges in one plan (32) */
   maxRanges?: number;
   initialCapacity?: number;
+  /** the owner hooks (render-only caches keyed by slot; none: the store behaves as before). They run inside prepare() and
+   * must not throw or call the store: onGrow(capacity) after the storage grew (the old data kept), onReset(epoch) when
+   * every owner is forgotten, onRelease(slot) when an owner's slot is freed, onInstall(slot, data, offset, id) after a new
+   * owner's row (63 floats and the zero padding) was written at data[offset ..] */
+  onGrow?: (capacity: number) => void;
+  onReset?: (epoch: unknown) => void;
+  onRelease?: (slot: number) => void;
+  onInstall?: (slot: number, data: Float32Array, offset: number, id: number) => void;
 }
 /** prepare()'s answer: one object, reused (copy what you keep) */
 interface SlotPrepareResult {
@@ -972,6 +980,19 @@ interface EvoOceanPoseApi {
   unpackPose(p: number): number[];
   /** GLSL's smoothstep */
   smoothCPU(a: number, b: number, x: number): number;
+  /** the render optimization's body buckets (1 coarse, 2 medium), their thresholds (CSS px of body radius: up to
+   * medium from ENTER, back to coarse at EXIT or below) and the barbels' (gene above BARBEL_GENE_MIN, px) */
+  LOD_COARSE: number;
+  LOD_MEDIUM: number;
+  LOD_MEDIUM_ENTER_CSS: number;
+  LOD_MEDIUM_EXIT_CSS: number;
+  BARBEL_GENE_MIN: number;
+  BARBEL_ENTER_CSS: number;
+  BARBEL_EXIT_CSS: number;
+  /** a fish's body bucket from its projected radius, its last bucket (0 new), the detail and whether it is selected / hovered */
+  bodyLod(px: number, previous: number, quality: number, pinned: boolean): number;
+  /** whether a fish draws its barbels (gene bD, projected radius, drew them last frame, detail, its body bucket) */
+  barbelVisible(bD: number, px: number, previous: boolean, quality: number, lod: number): boolean;
 }
 
 /* ---------------- web/ocean_scene_parity.js (window.EvoOceanSceneParity) ---------------- */

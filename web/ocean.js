@@ -54,6 +54,9 @@
  *      (a JS stand-in for page development, not part of web/).
  *      ?renderBench=1 the render benchmark (web/ocean_perf.js: EvoOcean.bench,
  *      paused from the first frame, Hold 60 fps off); ?perf=1 its profiler only.
+ *      ?renderOpt=0 draws the fish through the reference pipeline (one body draw
+ *      of the detail's template, every gene decoded in every vertex), as before the
+ *      render optimization (web/ocean_scene.js setRenderOptimization); an A/B link.
  *      The link's setup goes to oc_init as it is; one it refuses stops the
  *      page with the engine's reason (and a link without it).
  *      A Restart writes seed / pop / depth / w / h / cfg back, so a reload, or
@@ -4009,6 +4012,8 @@
       coarse: coarseMQ.matches,
       reducedMotion: reducedMQ.matches,
       bodyScale: bodyScale, onFollowChange: onFollowChange,
+      /* ?renderOpt=0: the reference drawing pipeline, as before the render optimization (an A/B link; display only) */
+      renderOptimization: P.get("renderOpt") !== "0",
       profiler: PERF ? PROF : null, visualRandom: BENCH ? PERF.visualRandom(2463534242) : null
     });
     if (!scene) throw new Error("This browser could not start WebGL2, which the 3-D tank needs. 2-D Classic draws its world without it.");
