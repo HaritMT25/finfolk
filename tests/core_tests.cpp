@@ -333,8 +333,9 @@ static void test_exact_shortcuts() {
             a.resize((size_t)std::min<int>((int)a.size(), len())); b.resize((size_t)std::min<int>((int)b.size(), len()));
             NeuralNet na, nb;
             buildNeuralNet(a, na); buildNeuralNet(b, nb);
-            if (t % 7 == 0) {   // a reused net, rebuilt after its genome changed (shrunk, mutated)
-                mutateGenome(a, 0.5f, 0, 160); if (a.size() > 3) a.resize(a.size() / 2);
+            if (t % 7 == 0 && !a.empty()) {   // a reused net, rebuilt after its genome changed (mutated, shrunk)
+                mutateGenome(a, 0.5f, 1, 160);   // (mutateGenome's duplication indexes an empty genome: never called on one)
+                if (a.size() > 3) a.resize(a.size() / 2);
                 buildNeuralNet(a, na);
             }
             if (floatBits(genomeSimilarityMasked(a, na, b, nb)) != floatBits(genomeSimilarity(a, b))) ++differ;
