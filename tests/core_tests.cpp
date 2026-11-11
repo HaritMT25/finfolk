@@ -4524,6 +4524,118 @@ static void test_predator_brain() {
     }
 }
 
+// The Classic step's fused scans and their exactness arguments, pinned piece by piece (the whole-run
+// evidence is the identity runs against the pinned engine and the parity suites):
+//   * SpatialGrid::forEachCandidate: the hits, in order, are queryRadius's list; dx, dy, d2 are the
+//     expressions queryRadius tests; `hit` is its test; a branch-free count of hits is countRadius.
+//   * genomeSimilarityMasked (a popcount over NeuralNet's gene-type masks) is genomeSimilarity's float,
+//     bit for bit, at every length including the mask word boundaries and past the 128 the masks cover.
+//   * the batch of eight tanh sensors (tanhfArray with n = 8) is eight tanhf calls.
+static void test_fused_scan_exactness() {
+    std::printf("fused scans (forEachCandidate, masked similarity, tanh batch of 8)...\n");
+
+    // --- forEachCandidate against queryRadius / countRadius ---
+    {
+        rng.seed(777u);
+        const int W = 1920, H = 1080;
+        int badHits = 0, badValues = 0, badCount = 0, badRect = 0;
+        for (int trial = 0; trial < 10; ++trial) {
+            SpatialGrid grid;
+            grid.init(W, H, 80.0f);
+            const int n = rng.intRange(50, 3000);
+            std::vector<Vec2> pos;
+            for (int i = 0; i < n; ++i) {
+                const Vec2 p{rng.range(0.0f, (float)W - 0.001f), rng.range(0.0f, (float)H - 0.001f)};
+                grid.insert(p, i);
+                pos.push_back(p);
+            }
+            grid.build();
+            const float radii[] = {10.f, 20.f, 30.f, 80.f, 160.f};
+            for (int q = 0; q < 100; ++q) {
+                const Vec2 c{rng.range(-20.f, (float)W + 20.f), rng.range(-20.f, (float)H + 20.f)};
+                const float r = radii[q % 5], r2 = r * r;
+                std::vector<int> want;
+                grid.queryRadius(c, r, want);
+                std::vector<int> got;
+                int count = 0, candidates = 0;
+                grid.forEachCandidate(c, r, [&](int idx, float dx, float dy, float d2, bool hit) {
+                    ++candidates;
+                    const float ex = pos[(size_t)idx].x - c.x, ey = pos[(size_t)idx].y - c.y;
+                    if (floatBits(dx) != floatBits(ex) || floatBits(dy) != floatBits(ey) ||
+                        floatBits(d2) != floatBits(ex * ex + ey * ey) || hit != (d2 <= r2))
+                        ++badValues;
+                    if (hit) got.push_back(idx);
+                    count += hit;
+                });
+                if (got != want) ++badHits;
+                if (count != (int)want.size() || count != grid.countRadius(c, r)) ++badCount;
+                if (candidates < (int)want.size()) ++badRect;
+            }
+        }
+        CHECK(badHits == 0);
+        CHECK(badValues == 0);
+        CHECK(badCount == 0);
+        CHECK(badRect == 0);
+    }
+
+    // --- genomeSimilarityMasked == genomeSimilarity ---
+    {
+        rng.seed(2468u);
+        auto mk = [](int len) { Genome g; for (int i = 0; i < len; ++i) g.push_back(Gene::makeRandom()); return g; };
+        int differ = 0, pairs = 0;
+        auto check = [&](const Genome& a, const Genome& b) {
+            NeuralNet na, nb;
+            buildNeuralNet(a, na);
+            buildNeuralNet(b, nb);
+            if (floatBits(genomeSimilarityMasked(a, na, b, nb)) != floatBits(genomeSimilarity(a, b))) ++differ;
+            ++pairs;
+        };
+        const int lens[] = {0, 1, 2, 31, 32, 33, 63, 64, 65, 80, 100, 127, 128, 129, 130, 200};
+        for (int la : lens)
+            for (int lb : lens)
+                for (int t = 0; t < 12; ++t) check(mk(la), mk(lb));
+        // near-copies: a high match count (all of it, and a few flipped type bits) rather than the ~1/4 of
+        // random pairs; lengths up to 140 so the second mask word and the beyond-128 fallback are both hit
+        for (int t = 0; t < 600; ++t) {
+            const Genome a = mk(rng.intRange(1, 140));
+            Genome b = a;
+            const float p = (t % 3 == 0) ? 0.0f : (t % 3 == 1) ? 0.02f : 0.15f;
+            for (Gene& g : b) {
+                if (rng.unit() < p) g.sourceType = !g.sourceType;
+                if (rng.unit() < p) g.sinkType = !g.sinkType;
+            }
+            if (t % 5 == 0) b.resize((size_t)rng.intRange(1, (int)b.size()));
+            check(a, b);
+            check(b, a);
+        }
+        CHECK(pairs > 3000);
+        CHECK(differ == 0);
+    }
+
+    // --- eight tanh sensors in one tanhfArray call == eight tanhf calls (every bit pattern class; NaN: both NaN) ---
+    {
+        rng.seed(1357u);
+        int differ = 0;
+        float in[8], out[8];
+        for (int t = 0; t < 100000; ++t) {
+            for (int i = 0; i < 8; ++i) {
+                if (t % 2 == 0) {
+                    const std::uint32_t u = (rng.uint(0xFFFFu) << 16) | rng.uint(0xFFFFu);
+                    std::memcpy(&in[i], &u, sizeof u);
+                } else {
+                    in[i] = rng.range(-30.0f, 30.0f);
+                }
+            }
+            evomath::tanhfArray(in, out, 8);
+            for (int i = 0; i < 8; ++i) {
+                const float s = evomath::tanhf(in[i]);
+                if (floatBits(s) != floatBits(out[i]) && !(s != s && out[i] != out[i])) ++differ;
+            }
+        }
+        CHECK(differ == 0);
+    }
+}
+
 int main() {
     std::printf("=== evo_boids core tests (no SFML linked) ===\n");
     test_portable_mt19937();
@@ -4532,6 +4644,7 @@ int main() {
     test_quadtree();
     test_spatial_grid_matches_quadtree();
     test_exact_shortcuts();
+    test_fused_scan_exactness();
     test_genome_and_net();
     test_feedforward_equivalence();
     test_fast_tanh();
