@@ -88,26 +88,26 @@ Generations overlap: a fish's generation records its ancestry depth. A configura
 
 ### From genome to executable network
 
-At birth, connection endpoints are flattened into shared index spaces and grouped by destination with a stable counting sort. Keeping the contributions in genome order preserves the floating-point accumulation order. The final packing loop in [`src/core/genome.hpp`](src/core/genome.hpp):
+At birth, connection endpoints are flattened into shared index spaces and grouped by destination with a stable counting sort. Keeping the contributions in genome order preserves the floating-point accumulation order. The final packing loop in [`src/core/genome.hpp`](src/core/genome.hpp) (the excerpts on this page are copied from the source with their indentation trimmed):
 
 ```cpp
-    nnet.flat.assign(genome.size(), NeuralNet::FlatConn{});
-    for (const Gene& gene : genome) {
-        const int sink = sinkIndex(gene);
-        nnet.flat[offsets[sink]++] = {
-            (uint16_t)(sourceIndex(gene) | (sink << NeuralNet::FlatConn::SRC_BITS)),
-            gene.weight
-        };
-    }
+nnet.flat.assign(genome.size(), NeuralNet::FlatConn{});
+for (const Gene& gene : genome) {
+    const int sink = sinkIndex(gene);
+    nnet.flat[offsets[sink]++] = {
+        (uint16_t)(sourceIndex(gene) | (sink << NeuralNet::FlatConn::SRC_BITS)),
+        gene.weight
+    };
+}
 ```
 
 That leaves a compact evaluation loop, where `vals` holds the sensors followed by the previous hidden-neuron outputs:
 
 ```cpp
-    float accum[NUM_ACTIONS + MAX_INTERNAL_NEURONS] = {};
-    for (const auto& conn : nnet.flat) {
-        accum[conn.sink()] += vals[conn.src()] * conn.w();
-    }
+float accum[NUM_ACTIONS + MAX_INTERNAL_NEURONS] = {};
+for (const auto& conn : nnet.flat) {
+    accum[conn.sink()] += vals[conn.src()] * conn.w();
+}
 ```
 
 ### Predators can evolve too
@@ -123,9 +123,9 @@ Scripted predators chase nearby prey and capture on contact. Their optional ener
 Prey receive a bearing and proximity to nearby hunters. This excerpt from [`src/core/world.hpp`](src/core/world.hpp) expresses the threat in the fish's own frame, where `u` points toward the nearest visible predator:
 
 ```cpp
-                sensors[PREDATOR_FWD]  = u.x * fwd.x + u.y * fwd.y;
-                sensors[PREDATOR_LR]   = u.x * rht.x + u.y * rht.y;
-                sensors[PREDATOR_PROX] = 1.0f - d / cfg.perceptionRadius;
+sensors[PREDATOR_FWD]  = u.x * fwd.x + u.y * fwd.y;
+sensors[PREDATOR_LR]   = u.x * rht.x + u.y * rht.y;
+sensors[PREDATOR_PROX] = 1.0f - d / cfg.perceptionRadius;
 ```
 
 ### The Ocean has depth and moving water
@@ -135,12 +135,12 @@ Ocean fish sense and steer in depth. Food searches, interactions and captures us
 The water combines streamfunction currents with **three tapered wave trains**. The flow is constructed to be divergence-free, including its cached evaluation. With food drift enabled, food rides the water, and fish and predators are carried by it too. The end of the wave reference evaluator in [`src/ocean/ocean_world.hpp`](src/ocean/ocean_world.hpp) (`A` is amplitude, `E` the depth decay, `B` and `Bp` the boundary taper and its derivative, `cs` and `sn` the phase cosine and sine; the runtime normally uses the derived cache):
 
 ```cpp
-        const float uh = A * E * (B - Bp / t.k) * cs;
-        Flow u;
-        u.x = t.qx * uh;
-        u.y = t.qy * uh;
-        u.d = -A * E * B * sn;
-        return u;
+const float uh = A * E * (B - Bp / t.k) * cs;
+Flow u;
+u.x = t.qx * uh;
+u.y = t.qy * uh;
+u.d = -A * E * B * sn;
+return u;
 ```
 
 **Living water** enables the tuned waves, a deep current, depth costs and light attenuation; the light setting controls the rendering only. Optional size laws also affect drift, fighting and which food a fish can swallow.
