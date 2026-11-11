@@ -237,7 +237,7 @@
    * (web/ocean_pose.js): swimPose and its parts (posePx, poseVisibleQ, posePack;
    * POSE0 unlit), the float's layout (packPose, unpackPose) and the reach
    * (REACH_APP, reachOfTemplate, reachRadius) */
-  var swimPose = POSE.swimPose, posePx = POSE.posePx, poseVisibleQ = POSE.poseVisibleQ, posePack = POSE.posePack, POSE0 = POSE.POSE0;
+  var swimPose = POSE.swimPose, posePx = POSE.posePx, poseVisible = POSE.poseVisible, poseVisibleQ = POSE.poseVisibleQ, posePack = POSE.posePack, POSE0 = POSE.POSE0;
   var packPose = POSE.packPose, unpackPose = POSE.unpackPose;
   var REACH_APP = POSE.REACH_APP, reachOfTemplate = POSE.reachOfTemplate, reachRadius = POSE.reachRadius;
   /* the render optimization's body buckets and the decision that picks one (ocean_pose.js) */
@@ -1282,13 +1282,16 @@
         ensureDecodedTexture();
         return "";
       };
-      /* the decoded programs are in use (the binder's feature in effect): both textures uploaded here, before the draws, instead of by
-       * the draws that sample them: the raw gene texture is no longer sampled, so nothing else would consume its upload, and both
-       * uploads then count in the frame's GPU time. The decoded one first: the raw upload's acknowledgement (onGeneUpload) must not
-       * precede it for the same plan */
+      /* The textures' uploads, made here before the draws instead of by the draws that sample them (every frame, once the policy asks for
+       * the cache). The decoded texture's queued update is uploaded whether or not the decoded programs are the ones drawing (a Look
+       * that did not declare appearanceCache keeps the raw programs, which never sample uDecoded: three would not upload it), always
+       * before the raw upload's acknowledgement (onGeneUpload, by the raw programs' draws or by the flush below) for the same plan; so
+       * the decoded copy is never behind the raw plan, and a later birth never replaces a queued range nobody uploaded (commit: an
+       * unconsumed queue is followed by a whole upload). With the decoded programs drawing, the raw gene texture is not sampled either,
+       * so its upload is flushed here too; both uploads then count in the frame's GPU time. */
       self.flush = function () {
         if (dec.queued && dec.tex) renderer.initTexture(dec.tex);
-        if (self.pending && self.tex) renderer.initTexture(self.tex);
+        if (renderNow.decoded && self.pending && self.tex) renderer.initTexture(self.tex);
       };
       self.decodedStats = function () {
         return { live: dec.live, ready: !!dec.tex && !dec.needFull, capacity: dec.cap, decodes: dec.decodes, uploads: dec.uploads, calls: dec.calls, bytes: dec.bytes,
@@ -1381,11 +1384,13 @@
           self.pending = plan;
         }
         /* the decoded cache's upload (policy decoded), from the same plan: both textures are laid out in 32-slot rows, so a run of slots is
-         * the same slots in both (64 floats a slot there, 72 here). While the cache is not asked for, a birth makes its GPU copy stale
-         * (a whole upload once it is asked for again) */
+         * the same slots in both (64 floats a slot there, 72 here). An update still queued from an earlier frame (flush did not consume
+         * it: a frame not drawn, a lost context) is never replaced by a partial one (its ranges would be lost): a whole upload follows.
+         * While the cache is not asked for, a birth, or an update left queued, makes its GPU copy stale (a whole upload once it is asked
+         * for again) */
         if (dec.live && dec.tex) {
           if (renderWant.decoded) {
-            var dfull = dec.needFull || !!(plan && plan.full);
+            var dfull = dec.needFull || dec.queued || !!(plan && plan.full);
             if (dfull || plan) {
               var dt = dec.tex, db = 0;
               dt.clearUpdateRanges();
@@ -1400,7 +1405,10 @@
               }
               dt.needsUpdate = true; dec.queued = true; dec.fullQueued = dfull; dec.qBytes = db;
             }
-          } else if (plan) dec.needFull = true;
+          } else {
+            if (plan || dec.queued) dec.needFull = true;
+            dec.queued = false; dec.fullQueued = false;
+          }
         }
         profiler.endCpu(SP.geneRanges, tg);
         if (profiler.active) {
@@ -1959,9 +1967,11 @@
           else if (lodMode === "screen") {
             var sl = SLOT[c], pin = c === selIdx || c === hovIdx, bl = bodyLod(pxl, LST[sl], quality, pin);
             /* a fish wholly out of view (behind the camera, or outside a side plane: its px is the clamped near-plane figure, huge) is
-             * drawn coarse: nothing of it shows, and its vertices are the cost (the polish's own visibility test, poseVisibleQ, which is 0
-             * only then for a size over 6 px); it keeps the bucket it gets here, so one entering the view starts from its true size */
-            if (bl === LOD_MEDIUM && !pin && poseVisibleQ(xs, ys, BODY[o], hgt, G, X[o], X[o + 2], REACH_APP, pxl) === 0) bl = LOD_COARSE;
+             * drawn coarse: nothing of it shows, and its vertices are the cost. The test is the polish's frustum / reach test
+             * (poseVisible), not its size weight (poseVisibleQ is 0 for any fish under about 6 px too, which would end the
+             * medium body's 7 / 5 px hysteresis at 6 px); it keeps the bucket it gets here, so one entering the view starts
+             * from its true size */
+            if (bl === LOD_MEDIUM && !pin && !poseVisible(xs, ys, BODY[o], hgt, G, X[o], X[o + 2], REACH_APP)) bl = LOD_COARSE;
             LST[sl] = bl; LODOF[c] = bl;
           } else LODOF[c] = lodMode === "medium" ? LOD_MEDIUM : LOD_COARSE;
         }
@@ -2370,7 +2380,7 @@
       var submitT = profiler.beginCpu(), ok = false;
       profiler.beginSubmission();
       try {
-        if (renderNow.decoded && appKind) appKind.flush();   /* (the decoded programs sample no raw genes: both gene textures uploaded here) */
+        if (renderOn && appKind) appKind.flush();   /* (the decoded cache's queued upload, and the raw genes' when the decoded programs draw: AppKind.flush) */
         renderer.render(scene, camera);
         ok = true;
       } finally {

@@ -61,6 +61,28 @@ section("body LOD (bodyLod)");
   ok(seq.join() === [LOD_MEDIUM, LOD_COARSE, LOD_COARSE, LOD_MEDIUM].join(), "detail 3 -> 2 -> 1 -> 3 for a big fish: medium, coarse, coarse, medium again", seq);
 }
 
+section("visibility (poseVisible: the body LOD's out-of-view test, no size in it)");
+{
+  /* a 90 degree camera at the origin looking down -z (the view matrix the identity): the centre's depth is -z, side planes at 45 degrees */
+  const s = Math.SQRT1_2, I = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
+  const G = { view: I, proj: I, focal: 500, near: 0.1, halfW: 0, halfH: 0, gate: true, zero: false, planes: [s, -s, -s, -s, s, -s, -s, -s] };
+  const K = POSE.REACH_APP, spine = (x, z) => [[x, x + 1, x + 2, x + 3, x + 4, x + 5], [z, z, z, z, z, z]];
+  const vis = (x, z, y) => { const [xs, ys] = spine(x, z); return POSE.poseVisible(xs, ys, 0.3, y || 0, G, 0, 3, K); };
+  const visQ = (x, z, px) => { const [xs, ys] = spine(x, z); return POSE.poseVisibleQ(xs, ys, 0.3, 0, G, 0, 3, K, px); };
+  ok(vis(0, -50) === true, "a fish in front of the camera, on its axis: visible");
+  ok(vis(0, 50) === false, "a fish behind the camera: not visible");
+  ok(vis(1000, -50) === false && vis(-1000, -50) === false, "a fish wholly outside a side plane (either side): not visible");
+  ok(vis(0, -50, 900) === false && vis(0, -50, -900) === false, "a fish wholly above or below the view: not visible");
+  const rv = POSE.reachRadius(spine(0, -50)[0], spine(0, -50)[1], 0.3, 0, 3, K), xAt = (m) => 50 + m / s - 2.5;   /* the x whose centre is m outside the right plane */
+  ok(rv > 1 && vis(xAt(0.5 * rv), -50) === true && vis(xAt(2 * rv), -50) === false,
+     "a fish whose centre is outside a side plane by half its reach: visible (its sphere comes back in); by twice its reach: not", { rv });
+  /* the weight (poseVisibleQ) is the same test and the size ramp: zero up to about 6 px for a fish in view, the ramp's own value above;
+   * poseVisible does not look at the size */
+  ok(visQ(0, -50, 5.5) === 0 && vis(0, -50) === true, "a fish in view at 5.5 px: weight 0 (the polish's ramp) but visible (the LOD must keep its body)");
+  ok(visQ(0, -50, 12) === 127 && visQ(0, -50, 8.5) > 0 && visQ(0, -50, 8.5) < 127, "in view: weight 127 from 11 px, a ramp between 6 and 11");
+  ok(visQ(0, 50, 12) === 0 && visQ(1000, -50, 12) === 0, "out of view: weight 0 whatever the size (poseVisibleQ is poseVisible and the ramp)");
+}
+
 section("barbels' gate (barbelVisible)");
 {
   const G = POSE.BARBEL_GENE_MIN, up = new Float32Array(new Uint32Array([new Uint32Array(new Float32Array([G]).buffer)[0] + 1]).buffer)[0];

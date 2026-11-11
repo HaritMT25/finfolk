@@ -11,8 +11,9 @@
  *     the appearance fish's; reachOfTemplate, a legacy template's) and the
  *     sphere that holds everything drawn for a fish (reachRadius)
  *   - the size weight: posePx (a fish's body radius in CSS px at its nearest
- *     depth), poseVisibleQ (0 for a fish wholly out of view, else the weight
- *     in 7 bits), poseQ (the two, as swimPose takes them)
+ *     depth), poseVisible (false for a fish wholly out of view: its own test,
+ *     no size in it), poseVisibleQ (0 for a fish wholly out of view, else the
+ *     weight in 7 bits), poseQ (the two, as swimPose takes them)
  *   - the pose: posePack (the roll into the turn and the paired fins' fold),
  *     swimPose (one fish's whole pose; POSE0 unlit), packPose / unpackPose
  *     (the float's layout, both ways)
@@ -102,8 +103,12 @@
     var dn = -(V[2] * cx + V[6] * y + V[10] * cz + V[14]) - 0.5 * Math.sqrt(ex * ex + ey * ey) - 2 * R;   /* the body's nearest depth */
     return R * G.focal / (dn > G.near ? dn : G.near);
   }
-  /** @param {ArrayLike<number>} xs @param {ArrayLike<number>} ys @param {number} R @param {number} y @param {PoseCamera} G @param {number} vz @param {number} lam @param {PoseReach} K @param {number} px */
-  function poseVisibleQ(xs, ys, R, y, G, vz, lam, K, px) {
+  /* Whether any of a fish's reach can be in view: false only when the whole reach (reachRadius) lies behind the near
+   * plane or wholly outside a side plane of the view frustum, the polish's own visibility test (poseVisibleQ below
+   * adds the size weight to it) and the body LOD's "wholly out of view" rule (the scene's fillApp): the size plays
+   * no part, so a small fish that is in view is visible. */
+  /** @param {ArrayLike<number>} xs @param {ArrayLike<number>} ys @param {number} R @param {number} y @param {PoseCamera} G @param {number} vz @param {number} lam @param {PoseReach} K @returns {boolean} */
+  function poseVisible(xs, ys, R, y, G, vz, lam, K) {
     var V = G.view, F = G.planes;
     var cx = 0.5 * (xs[0] + xs[5]) - G.halfW, cz = 0.5 * (ys[0] + ys[5]) - G.halfH;
     var vx = V[0] * cx + V[4] * y + V[8] * cz + V[12], vy = V[1] * cx + V[5] * y + V[9] * cz + V[13];
@@ -115,9 +120,13 @@
     if (m3 > m) m = m3;
     if (m > 0 || dz <= G.near) {   /* the centre is out of view: does the reach come back in? */
       var rv = reachRadius(xs, ys, R, vz, lam, K);
-      if (dz + rv <= G.near || m > rv) return 0;
+      if (dz + rv <= G.near || m > rv) return false;
     }
-    return (127 * smoothCPU(6, 11, px) + 0.5) | 0;
+    return true;
+  }
+  /** @param {ArrayLike<number>} xs @param {ArrayLike<number>} ys @param {number} R @param {number} y @param {PoseCamera} G @param {number} vz @param {number} lam @param {PoseReach} K @param {number} px */
+  function poseVisibleQ(xs, ys, R, y, G, vz, lam, K, px) {
+    return poseVisible(xs, ys, R, y, G, vz, lam, K) ? (127 * smoothCPU(6, 11, px) + 0.5) | 0 : 0;
   }
   /* the swim pose packed (packPose) of a fish of size weight qw / 127 > 0:
    * the roll into its turn (scaled by the weight, so a fish fading out of
@@ -212,7 +221,7 @@
     bodyLod: bodyLod, barbelVisible: barbelVisible,
     REACH_APP: REACH_APP, WAG_MAX: WAG_MAX, POSE0: POSE0,
     reachOfTemplate: reachOfTemplate, reachRadius: reachRadius,
-    posePx: posePx, poseVisibleQ: poseVisibleQ, poseQ: poseQ, posePack: posePack, swimPose: swimPose,
+    posePx: posePx, poseVisible: poseVisible, poseVisibleQ: poseVisibleQ, poseQ: poseQ, posePack: posePack, swimPose: swimPose,
     packPose: packPose, unpackPose: unpackPose, smoothCPU: smoothCPU
   };
   root.EvoOceanPose = API;

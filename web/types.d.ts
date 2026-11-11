@@ -992,6 +992,8 @@ interface EvoOceanPoseApi {
   reachRadius(xs: ArrayLike<number>, ys: ArrayLike<number>, R: number, vz: number, lam: number, K: PoseReach): number;
   /** the body radius in CSS px at its nearest depth */
   posePx(xs: ArrayLike<number>, ys: ArrayLike<number>, R: number, y: number, G: PoseCamera): number;
+  /** false for a fish whose whole reach is behind the near plane or outside a side plane of the view (no size in it) */
+  poseVisible(xs: ArrayLike<number>, ys: ArrayLike<number>, R: number, y: number, G: PoseCamera, vz: number, lam: number, K: PoseReach): boolean;
   /** the size weight in 7 bits, 0 for a fish whose whole reach is out of view (px: posePx's, over 6) */
   poseVisibleQ(xs: ArrayLike<number>, ys: ArrayLike<number>, R: number, y: number, G: PoseCamera, vz: number, lam: number, K: PoseReach, px: number): number;
   /** the size weight in 7 bits (G.gate false: 127; G.zero: 0; K absent: REACH_APP) */
