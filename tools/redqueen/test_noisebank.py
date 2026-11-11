@@ -27,6 +27,7 @@ numpy required for the estimator (RQ_REQUIRE_NUMPY=1 makes a missing numpy a fai
 from __future__ import annotations
 
 import contextlib
+import copy
 import io
 import json
 import math
@@ -35,6 +36,8 @@ import shutil
 import sys
 import tempfile
 import unittest
+from pathlib import Path
+from unittest import mock
 import uuid
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -89,7 +92,7 @@ def block(root, valid_before=None, n=12, style="design_block"):
 
 def files(tmp):
     out = {}
-    for name, txt in (("t.json", "{}"), ("ages.json", "{}"), ("prod.json", json.dumps({"reserved": []}))):
+    for name, txt in (("t.json", "{}"), ("ages.json", "{}"), ("prod.json", json.dumps({"reserved_seeds": [101]}))):
         out[name] = os.path.join(tmp, name)
         with open(out[name], "w") as f:
             f.write(txt)
@@ -115,6 +118,7 @@ class TestPlan(unittest.TestCase):
     def test_the_registered_crossed_design(self):
         d = self.design()
         meta = d["noisebank"]
+        self.assertEqual(meta["avoid"], [rqlib.load_reservations(self.f["prod.json"])[1]])
         self.assertEqual(len(meta["worlds"]), nb.N_WORLDS)
         self.assertEqual((meta["arena"], meta["validation_dir"]), ("arena-7", os.path.abspath(self.root)))
         self.assertEqual(meta["validation"]["namespace"], NS)
@@ -608,7 +612,7 @@ class TestEstimator(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.doc, cls.lat = simulate()
-        cls.bank = nb.estimate(cls.doc, boot=29, m=M)
+        cls.bank = nb.estimate(cls.doc, descriptive=True, boot=29, m=M)
 
     def test_groups_track_the_true_latent_correlations(self):
         """The machinery check: at every horizon each group's composite-likelihood maximum equals the realized
@@ -665,7 +669,8 @@ class TestEstimator(unittest.TestCase):
                 mu = float(sigm(x))
                 self.assertLess(abs(float(noisescale.evaluate(cv, mu)) / float(s_true(ch, mu)) - 1), 0.2, (ch, mu))
         g = self.bank["generator_noise"]
-        self.assertTrue(g["available"])
+        self.assertFalse(g["available"])
+        self.assertEqual(self.bank["purpose"], "descriptive")
         noisescale.check_set(g["s_logit"])
         self.assertEqual((g["horizon"], g["capture_bound"]), (5000, 324))
         rqlib.canonical(self.bank)                                              # (allow_nan=False: no Inf / NaN)
@@ -807,7 +812,7 @@ class TestFeasibilityAndRefusals(unittest.TestCase):
         generator block is unavailable; the CLI exits 2 and still writes canonical JSON. An impossible
         curvature floor makes every group unidentified. Bad counts, schemas and draw counts are refused."""
         doc, _ = simulate(seed=7, W=4, T=1, R=16, cross=False)
-        bank = nb.estimate(doc, boot=3, m=M)
+        bank = nb.estimate(doc, descriptive=True, boot=3, m=M)
         e = bank["horizons"]["5000"]
         self.assertEqual(e["status"], "unavailable")
         self.assertIn("no R_CC pairs", e["reasons"])
@@ -822,7 +827,7 @@ class TestFeasibilityAndRefusals(unittest.TestCase):
                 json.dump(doc, f)
             nb.REPLICATES = 16
             with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-                self.assertEqual(nb.main(["estimate", "--obs", p, "--boot", "2", "--out", out]), 2)
+                self.assertEqual(nb.main(["estimate", "--descriptive", "--obs", p, "--boot", "2", "--out", out]), 2)
             self.assertFalse(rqlib.read_json(out)["generator_noise"]["available"])
         finally:
             nb.REPLICATES = old
@@ -831,28 +836,28 @@ class TestFeasibilityAndRefusals(unittest.TestCase):
         old = nb.INFO_MIN
         nb.INFO_MIN = 1e9
         try:
-            e2 = nb.estimate(doc2, boot=2, m=M)["horizons"]["5000"]
+            e2 = nb.estimate(doc2, descriptive=True, boot=2, m=M)["horizons"]["5000"]
         finally:
             nb.INFO_MIN = old
         self.assertEqual(e2["status"], "unavailable")
         self.assertTrue(any("unidentified" in r for r in e2["reasons"]))
         with self.assertRaises(nb.NoiseBankError):
-            nb.estimate(doc2, boot=0)
+            nb.estimate(doc2, descriptive=True, boot=0)
         with self.assertRaises(nb.NoiseBankError):
-            nb.estimate(doc2, boot=2, m=M, replicates=64)
+            nb.estimate(doc2, descriptive=True, boot=2, m=M, replicates=64)
         bad = json.loads(json.dumps(doc2))
         bad["observations"][-1]["horizons"]["5000"]["survivors"] = 10 ** 6
         with self.assertRaises(nb.NoiseBankError):
-            nb.estimate(bad, boot=2, m=M)
+            nb.estimate(bad, descriptive=True, boot=2, m=M)
         bad["observations"][-1]["horizons"]["5000"]["survivors"] = 1.5
         with self.assertRaises(nb.NoiseBankError):
-            nb.estimate(bad, boot=2, m=M)
+            nb.estimate(bad, descriptive=True, boot=2, m=M)
         bad["observations"][-1]["horizons"]["5000"]["survivors"] = 1
         bad["observations"][-1]["replicate"] = 99
         with self.assertRaises(nb.NoiseBankError):
-            nb.estimate(bad, boot=2, m=M)
+            nb.estimate(bad, descriptive=True, boot=2, m=M)
         with self.assertRaises(nb.NoiseBankError):
-            nb.estimate(dict(doc2, schema="x"), boot=2)
+            nb.estimate(dict(doc2, schema="x"), descriptive=True, boot=2)
 
 
 # ================================================================== s(mu), nu0, bootstrap
@@ -1106,6 +1111,146 @@ class TestCollect(unittest.TestCase):
         bad["score"] = {"n_start": 600, "horizons": [{"steps": 5000, "survivors": 1, "captures": 1}]}
         with self.assertRaises(nb.NoiseBankError):
             nb.collect(study({pick[0]["id"]: bad}), d, pp, sorted(set(rest) | {r["id"] for r in pick[1:]}))
+
+
+
+@unittest.skipIf(np is None, "numpy is not installed")
+class TestBankCoverage(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        fixture = TestPlan()
+        fixture.setUp()
+        try:
+            Path(fixture.f['prod.json']).write_text('{"reserved_seeds":[101]}')
+            cls.design = fixture.design()
+        finally:
+            fixture.tearDown()
+        rows, _, _ = plan.expand_v2(cls.design, pending=True)
+        cls.doc = {
+            'schema': nb.OBS_SCHEMA, 'design': cls.design,
+            'design_sha256': rqlib.canonical_sha(cls.design), 'plan_sha256': 'b' * 64, 'missing': [],
+            'observations': [
+                {'cell': row['id'], 'prey': [row['prey']['world'], row['prey']['time']],
+                 'pred': None if row['predators'] is None else
+                         [row['predators']['world'], row['predators']['time']],
+                 'replicate': row['replicate'],
+                 'horizons': {str(h): {'captures': 50, 'survivors': 400} for h in nb.HORIZONS}}
+                for row in rows]
+        }
+
+    def fitted(self, doc, **kw):
+        curve = {'x': [-1.0, 1.0], 's': [0.2, 0.3], 'direction': 'increasing'}
+        h = {'status': 'ok', 'reasons': [], 'scales': {c: curve for c in 'CSF'}, 'nu0': {},
+             'components': {c: [[1.0, 0.0], [0.0, 1.0]] for c in ('SigmaR', 'SigmaD', 'SigmaE')}}
+        with mock.patch.object(nb, 'horizon_estimate', return_value=h):
+            return nb.estimate(doc, boot=1, **kw)
+
+    def test_complete_registered_bank_available_and_provenance(self):
+        self.assertEqual(len(self.doc['observations']), 18432)
+        bank = self.fitted(self.doc)
+        self.assertTrue(bank['generator_noise']['available'])
+        import numpy as np
+        self.assertEqual(bank['provenance']['numpy_version'], np.__version__)
+        self.assertEqual(bank['provenance']['estimator_sha256'], rqlib.sha256_file(nb.__file__))
+        self.assertEqual(bank['provenance']['observations_sha256'], rqlib.canonical_sha(self.doc))
+
+    def test_missing_and_duplicate_coverage(self):
+        mutations = ('declared',
+         'whole_pair',
+         'one_rep',
+         'whole_free',
+         'whole_replicate',
+         'duplicate_free',
+         'duplicate_exposed',
+         'wrong_endpoint',
+         'no_design',
+         'wrong_design_hash',
+         'reduced_design')
+        for mutate in mutations:
+            doc = copy.deepcopy(self.doc)
+            obs = doc['observations']
+            free = next((o for o in obs if o['pred'] is None))
+            exposed = next((o for o in obs if o['pred'] is not None))
+            if mutate == 'declared':
+                doc['missing'] = ['lost-cell']
+            if mutate == 'whole_pair':
+                doc['observations'] = [o for o in obs if (o['prey'], o['pred']) != (exposed['prey'], exposed['pred'])]
+            if mutate == 'one_rep':
+                obs.remove(exposed)
+            if mutate == 'whole_free':
+                doc['observations'] = [o for o in obs if (o['prey'], o['pred']) != (free['prey'], None)]
+            if mutate == 'whole_replicate':
+                doc['observations'] = [o for o in obs if o['replicate'] != 63]
+            if mutate.startswith('duplicate'):
+                obs.append(copy.deepcopy(free if mutate == 'duplicate_free' else exposed))
+            if mutate == 'wrong_endpoint':
+                exposed['pred'] = ['wrong', '20M']
+            if mutate == 'no_design':
+                doc.pop('design')
+            if mutate == 'wrong_design_hash':
+                doc['design_sha256'] = '0' * 64
+            if mutate == 'reduced_design':
+                doc['design']['edges'].pop()
+                doc['design_sha256'] = rqlib.canonical_sha(doc['design'])
+            with self.subTest(mutate=mutate):
+                with self.assertRaises(nb.NoiseBankError):
+                    self.fitted(doc)
+
+    def test_descriptive_cannot_be_production_available(self):
+        doc = copy.deepcopy(self.doc)
+        doc['observations'].pop()
+        doc['missing'] = ['lost']
+        bank = self.fitted(doc, descriptive=True)
+        self.assertFalse(bank['generator_noise']['available'])
+        self.assertEqual(bank['purpose'], 'descriptive')
+        for pred in (None, 'exposed'):
+            o = next((o for o in doc['observations'] if (o['pred'] is None) == (pred is None)))
+            duplicate = copy.deepcopy(o)
+            duplicate['cell'] += '.duplicate'
+            doc['observations'].append(duplicate)
+            with self.assertRaises(nb.NoiseBankError):
+                self.fitted(doc, descriptive=True)
+            doc['observations'].pop()
+
+    def test_cli_requires_descriptive_flag_for_partial_bank(self):
+        doc = copy.deepcopy(self.doc)
+        doc['observations'].pop()
+        doc['missing'] = ['lost']
+        with tempfile.TemporaryDirectory() as directory:
+            source, output = (Path(directory) / 'obs.json', Path(directory) / 'bank.json')
+            source.write_bytes(rqlib.canonical(doc))
+            args = ['estimate', '--obs', str(source), '--out', str(output), '--boot', '1']
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                with mock.patch.object(nb, 'horizon_estimate', return_value={'reasons': ['test unavailable'], 'scales': dict.fromkeys('CSF'), 'nu0': {}}):
+                    self.assertEqual(nb.main(args), 2)
+                    self.assertFalse(output.exists())
+                    self.assertEqual(nb.main(args + ['--descriptive']), 2)
+            result = rqlib.read_json(output)
+            self.assertEqual(result['purpose'], 'descriptive')
+            self.assertFalse(result['generator_noise']['available'])
+
+    def test_older_observations_can_bind_explicit_design(self):
+        doc = copy.deepcopy(self.doc)
+        doc.pop('design')
+        bank = self.fitted(doc, design=self.design)
+        self.assertTrue(bank['generator_noise']['available'])
+
+    def test_arrays_refuse_duplicate_free_control(self):
+        free = next((o for o in self.doc['observations'] if o['pred'] is None))
+        with self.assertRaises(nb.NoiseBankError):
+            nb.arrays([free, copy.deepcopy(free)], 5000)
+
+    def test_cli_hashes_exact_input_bytes(self):
+        with tempfile.TemporaryDirectory() as d:
+            p, out = (Path(d) / 'obs.json', Path(d) / 'bank.json')
+            p.write_text(json.dumps(self.doc, indent=1))
+            with mock.patch.object(nb, 'horizon_estimate', return_value={'reasons': ['test unavailable'], 'scales': dict.fromkeys('CSF'), 'nu0': {}}):
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(nb.main(['estimate', '--obs', str(p), '--out', str(out), '--boot', '1']), 2)
+            result = rqlib.read_json(out)
+            self.assertEqual(result['provenance']['observations_sha256'], rqlib.sha256_file(p))
+            self.assertNotEqual(rqlib.sha256_file(p), rqlib.canonical_sha(self.doc))
 
 
 if __name__ == "__main__":

@@ -11,6 +11,7 @@ import errno
 import hashlib
 import json
 import os
+import re
 
 SHA_PENDING = "pending"   # a plan registered before its snapshots exist (plan.py --pending)
 MASK64 = (1 << 64) - 1
@@ -110,6 +111,23 @@ def fsync_file(p):
         os.close(fd)
 
 
+def mkdirs_durable(path):
+    """Create a directory chain and fsync each new entry's parent before returning.
+
+    Call before launching workers: syncing files inside a cell does not persist
+    the cell's own entry in work/, or a new study's entry in its parent.
+    """
+    path = os.path.abspath(path)
+    missing = []
+    parent = path
+    while not os.path.isdir(parent):
+        missing.append(parent)
+        parent = os.path.dirname(parent)
+    os.makedirs(path, exist_ok=True)
+    for directory in reversed(missing):
+        fsync_dir(os.path.dirname(directory))
+
+
 def write_durable(path, data):
     """bytes or str -> a temporary file, fsync'd, renamed over path, then the directory fsync'd
     AFTER the rename (the rename itself is then durable)."""
@@ -139,6 +157,97 @@ def read_text(path):
 
 def read_json(path):
     return json.loads(read_text(path))
+
+
+# ---------------------------------------------------------- seed reservations
+class ReservationError(ValueError):
+    """An inventory cannot establish a nonempty, validated reservation set."""
+
+
+def load_reservations(path):
+    """Return (distinct seeds, {path, sha256, seeds: distinct count}) from one byte read.
+
+    Formats: seed-keyed JSON documents (including canonical worlds reservations),
+    JSONL objects, archived-seeds/1 numeric-key inventories, plain decimal
+    integers per line, a JSON integer list, or a flat
+    label-to-integer map. JSON seed values must be integers, never strings/bools.
+    Empty inventories are refused. The historical recursive seed-key policy is
+    retained, including conservative reservations from seed-named metadata.
+    Canonical seed_slot fields and assay groups (including groups.reseed) contain
+    source labels, not seed values. Their strings are ignored, just as in the old
+    integer-only traversal; integers beneath seed-bearing keys remain reserved.
+    """
+    def fail(message):
+        raise ReservationError(f"{path}: {message}")
+
+    def unique_object(pairs):
+        obj = {}
+        for key, value in pairs:
+            if key in obj:
+                fail(f"duplicate JSON key {key!r}")
+            obj[key] = value
+        return obj
+
+    try:
+        raw = read_bytes(path)
+        text = raw.decode("utf-8")
+    except (OSError, UnicodeError) as exc:
+        fail(str(exc))
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    seeds = set()
+
+    def walk(obj, hint=False, strict=False, group_labels=False):
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                label = key.lower()
+                seed_hint = "seed" in label
+                metadata = any(token in label for token in ("scheme", "namespace", "sha256", "hash", "rule", "note", "path"))
+                labels = group_labels or label in ("groups", "seed_slot")
+                seed_value = seed_hint and not metadata and not labels
+                walk(value, hint or seed_hint, strict or seed_value, labels)
+        elif isinstance(obj, list):
+            for value in obj:
+                walk(value, hint, strict, group_labels)
+        elif type(obj) is int:
+            if hint:
+                if obj < 0:
+                    fail("negative seed reservation")
+                seeds.add(obj)
+        elif strict and obj is not None:
+            fail(f"seed reservations must be JSON integers (got {obj!r})")
+
+    if lines and all(re.fullmatch(r"[0-9]+", line) for line in lines):
+        seeds = {int(line) for line in lines}
+    else:
+        try:
+            doc = json.loads(text, object_pairs_hook=unique_object)
+            docs = [doc]
+        except json.JSONDecodeError:
+            try:
+                docs = [json.loads(line, object_pairs_hook=unique_object) for line in lines]
+            except json.JSONDecodeError as exc:
+                fail(f"unsupported reservation format ({exc})")
+        for doc in docs:
+            if isinstance(doc, list):
+                if not doc or any(type(value) is not int or value < 0 for value in doc):
+                    fail("expected a nonempty JSON integer list")
+                seeds.update(doc)
+            elif isinstance(doc, dict):
+                if doc and all(type(value) is int and value >= 0 for value in doc.values()):
+                    seeds.update(doc.values())
+                else:
+                    if doc.get("schema") == "finfolk.invasion.archived-seeds/1":
+                        inventory = doc.get("all")
+                        if (not isinstance(inventory, dict) or not inventory
+                                or any(not re.fullmatch(r"[0-9]+", key) for key in inventory)):
+                            fail("archived-seeds/1 requires nonempty numeric seed keys under 'all'")
+                        seeds.update(int(key) for key in inventory)
+                    walk(doc)
+            else:
+                fail("expected seed-keyed JSON, JSONL objects, or decimal integers per line")
+    if not seeds:
+        fail("no seed reservations extracted; empty or unsupported inventory")
+    return seeds, {"path": os.path.abspath(path), "sha256": sha256_bytes(raw), "seeds": len(seeds)}
 
 
 # ------------------------------------------------------------------- seeds

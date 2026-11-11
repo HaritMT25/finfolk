@@ -17,6 +17,8 @@ import shutil
 import sys
 import tempfile
 import unittest
+from pathlib import Path
+from unittest import mock
 import zipfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -28,6 +30,8 @@ import rqlib  # noqa: E402
 import run  # noqa: E402
 import store  # noqa: E402
 import cell  # noqa: E402
+import worlds  # noqa: E402
+import noisebank as nb  # noqa: E402
 
 REPO = os.path.dirname(os.path.dirname(HERE))
 NPC, BLEN = 3, 2
@@ -1809,6 +1813,168 @@ class TestPlanV2(unittest.TestCase):
         out, lm = os.path.join(self.tmp, "p.jsonl"), os.path.join(self.tmp, "long.json")
         self.assertEqual(plan.main([p, "--pending", "--out", out, "--long-manifest", lm]), 0)
         self.assertEqual(rqlib.read_json(lm)["long"], int(0.25 * 9 + 0.5))
+
+
+
+class TestReservations(unittest.TestCase):
+
+    def test_canonical_registry_and_plan_seed_sets(self):
+        """Canonical slot/group labels are not seeds; pin the old integer-only extraction."""
+        from test_worlds import ARENA
+
+        with tempfile.TemporaryDirectory() as d:
+            arena = Path(d) / "arena.json"
+            arena.write_bytes(rqlib.canonical(ARENA))
+            registry = worlds.register(str(arena), "reservation-compat", blocks=1,
+                                       per_block={"C": 1, "A": 1, "B": 1})
+            self.assertTrue(all(isinstance(w["seed_slot"], str) for w in registry["worlds"]))
+            registry_seeds = {seed for slot in registry["reserved"] for seed in slot["seeds"]}
+            # Legacy extraction also reserved integer metadata beneath seed-bearing keys.
+            registry_seeds.update(w["seed_rederived"] for w in registry["worlds"])
+            self.assertEqual(len(registry_seeds), 73)  # eight slots x nine seeds, plus rederived=0
+            rows, _, _ = plan.expand_v2(design2(d, [E("within", "training", "A", "T2", "B", "T2"),
+                                                   E("nopred", "training", "A", "T2")]), pending=True)
+            plan_seeds = {seed for row in rows for seed in row["seeds"].values() if type(seed) is int}
+            self.assertTrue(all(isinstance(row["groups"]["reseed"], str) for row in rows))
+            self.assertEqual(len(plan_seeds), 10)  # three prey kinds + two donor groups, x two replicates
+            for name, raw, expected in (("worlds.json", rqlib.canonical(registry), registry_seeds),
+                                        ("plan.jsonl", b"".join(map(rqlib.canonical, rows)), plan_seeds)):
+                p = Path(d) / name
+                p.write_bytes(raw)
+                for loader in (worlds.read_avoid, plan.avoid_seeds, nb.avoid_seeds):
+                    with self.subTest(file=name, loader=loader.__module__):
+                        self.assertEqual(loader(p), expected)
+                seeds, record = rqlib.load_reservations(p)
+                self.assertEqual(seeds, expected)
+                self.assertEqual(record["seeds"], len(expected))
+
+    def test_shared_formats_and_rejections(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / 'inventory'
+            cases = [('101\n102\n101\n', {101, 102}),
+             ('{"worlds":[{"founder_seed":101,"reserved_seeds":[102]}]}', {101, 102}),
+             ('{"seeds":{"reseed":101,"transplant":102}}\n{"seed":103}', {101, 102, 103}),
+             ('[101,102]', {101, 102}),
+             ('{"w01":101,"w02":102}', {101, 102}),
+             ('{"schema":"finfolk.invasion.archived-seeds/1","all":{"101":["source"],"102":["source"]}}',
+              {101, 102})]
+            for text, expected in cases:
+                p.write_text(text)
+                for loader in (worlds.read_avoid, plan.avoid_seeds, nb.avoid_seeds):
+                    self.assertEqual(loader(str(p)), expected)
+                got, rec = rqlib.load_reservations(p)
+                self.assertEqual(got, expected)
+                self.assertEqual(rec, {'path': str(p), 'sha256': rqlib.sha256_file(p), 'seeds': len(expected)})
+            invalid = ('',
+             '{}',
+             '{"reserved":[]}',
+             '{"seed":"101"}',
+             '{"seed":false}',
+             '{"seed":1.5}',
+             '{"seed":101,"other_seed":"bad"}',
+             '{"seed":101,"otherSeed":"bad"}',
+             '{"seed":101,"seed":102}',
+             'not json',
+             '[101,"102"]')
+            for text in invalid:
+                p.write_text(text)
+                for loader in (worlds.read_avoid, plan.avoid_seeds, nb.avoid_seeds):
+                    with self.subTest(text=text, loader=loader.__module__):
+                        with self.assertRaisesRegex(Exception, str(p)):
+                            loader(str(p))
+
+    def test_joint_refuses_registry_and_malformed_rows(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / 'worlds.json'
+            for doc in ({'schema': 'finfolk.redqueen.worlds/1', 'reserved': [{'seed': 101}]}, {'schema': plan.PLAN_SCHEMA_V2, 'seeds': {'reseed': 101}}):
+                p.write_bytes(rqlib.canonical(doc))
+                with self.assertRaisesRegex(plan.DesignError, str(p)):
+                    plan.read_joint_plan(p)
+
+    def test_joint_accepts_canonical_optional_seed_pairs(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "plan.jsonl"
+            edge = E("within", "training", "A", "T2", "B", "T2")
+            for overrides in ({}, {"age_reference": None}):
+                for policy in ("common", "native"):
+                    rows, _, _ = plan.expand_v2(design2(d, [dict(edge, prey_policy=policy)], **overrides),
+                                                pending=True)
+                    plan.write_plan(rows, p)
+                    self.assertEqual(plan.read_joint_plan(p), rows)
+                    # Null is allowed only as an explicit seed/group pair, never
+                    # as a missing field silently skipped by the joint checker.
+                    for field in ("seeds", "groups"):
+                        broken = copy.deepcopy(rows)
+                        del broken[0][field]["ages"]
+                        plan.write_plan(broken, p)
+                        with self.assertRaisesRegex(plan.DesignError, str(p)):
+                            plan.read_joint_plan(p)
+
+    def test_legacy_seed_sets(self):
+        """Pin the old recursive policy, including conservative seed-named metadata values."""
+        fixtures = [({'founder_seed': 101, 'seed_rederived': 0, 'reserved': [{'seeds': [102, 103]}]},
+          {0, 101, 102, 103}),
+         ({'schema': 'finfolk.redqueen.worlds/1',
+           'reserved': [{'seeds': [101, 102]}],
+           'avoid': [{'seeds': 2}],
+           'seed_scheme': {'base': 900, 'type': 'indexed'}},
+          {2, 900, 101, 102}),
+         ({'seeds': {'sample': 10000000000000000000, 'ages': 202, 'reseed': 303, 'transplant': None},
+           'replicate': 4},
+          {202, 10000000000000000000, 303}),
+                    ({'schema': 'finfolk.redqueen.plan/2',
+                      'groups': {'sample': 'q|r00', 'reseed': 'q|r00', 'transplant': 'p|r00'},
+                      'seeds': {'sample': 101, 'ages': 102, 'reseed': 103, 'transplant': 104}},
+                     {101, 102, 103, 104})]
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / 'seeds.json'
+            for obj, expected in fixtures:
+                p.write_bytes(rqlib.canonical(obj))
+                for loader in (worlds.read_avoid, plan.avoid_seeds, nb.avoid_seeds):
+                    self.assertEqual(loader(p), expected)
+
+class TestAdmissionDurability(unittest.TestCase):
+
+    def test_directory_chain_parent_barriers(self):
+        with tempfile.TemporaryDirectory() as d:
+            target = Path(d) / 'study' / 'work' / 'cell'
+            calls = []
+            with mock.patch.object(rqlib, 'fsync_dir', side_effect=lambda p: calls.append(Path(p))):
+                rqlib.mkdirs_durable(target)
+            self.assertEqual(calls, [Path(d), Path(d) / 'study', Path(d) / 'study' / 'work'])
+
+    def test_runner_barriers_precede_worker_launch(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / 'new' / 'study'
+            planfile = Path(d) / 'plan.jsonl'
+            planfile.write_text('{}\n')
+            barriers = []
+            launched = {}
+            real = rqlib.fsync_dir
+
+            def sync(path):
+                barriers.append(Path(path))
+                real(path)
+
+            def launch(*args, **kw):
+                launched['cell_exists'] = (root / 'work' / 'cell').is_dir()
+                launched['barriers'] = list(barriers)
+                raise OSError('injected launch failure after checking durability')
+            with contextlib.ExitStack() as stack:
+                for name in ('pin_binary', 'pin_tools', 'pin_env'):
+                    stack.enter_context(mock.patch.object(run, name))
+                stack.enter_context(mock.patch.object(run, 'load_plan', return_value=[{'schema': run.PLAN_SCHEMA, 'id': 'cell'}]))
+                stack.enter_context(mock.patch.object(run, 'resolve_sources', return_value=(None, [])))
+                stack.enter_context(mock.patch.object(run, 'mem_headroom_mb', return_value=100000))
+                stack.enter_context(mock.patch.object(run, 'disk_problem', return_value=None))
+                stack.enter_context(mock.patch.object(rqlib, 'fsync_dir', side_effect=sync))
+                proc = stack.enter_context(mock.patch.object(run.subprocess, 'Popen', side_effect=launch))
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(run.main(['--root', str(root), '--plan', str(planfile), '--binary', 'fake']), 1)
+                proc.assert_called_once()
+            self.assertTrue(launched['cell_exists'])
+            for parent in (Path(d), root.parent, root / 'work'):
+                self.assertIn(parent, launched['barriers'])
 
 
 if __name__ == "__main__":

@@ -561,33 +561,12 @@ def arena_problems(arena, treatments_used, allow_placeholder=False, c_founders=C
     return probs, unresolved
 
 
-def collect_seeds(obj, out=None, key_hint=False):
-    """Every integer at or below a key containing "seed" (recursively: {"seeds": {"x": 5}} counts 5)."""
-    out = set() if out is None else out
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            collect_seeds(v, out, key_hint or "seed" in str(k).lower())
-    elif isinstance(obj, list):
-        for v in obj:
-            collect_seeds(v, out, key_hint)
-    elif isinstance(obj, int) and not isinstance(obj, bool) and key_hint:
-        out.add(obj)
-    return out
-
-
 def read_avoid(path):
-    """Seeds reserved elsewhere: a file of integers (one per line), a JSON document or JSONL lines."""
-    text = rqlib.read_text(path)
-    seeds = set()
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    if lines and all(re.fullmatch(r"\d+", ln) for ln in lines):
-        return {int(ln) for ln in lines}
+    """Validated reservations shared with the assay planner and noise bank."""
     try:
-        collect_seeds(json.loads(text), seeds)
-    except ValueError:
-        for ln in lines:
-            collect_seeds(json.loads(ln), seeds)
-    return seeds
+        return rqlib.load_reservations(path)[0]
+    except rqlib.ReservationError as exc:
+        raise WorldsError(str(exc)) from exc
 
 
 def parse_per_block(spec):
@@ -630,9 +609,12 @@ def register(arena_path, namespace, blocks=8, per_block=None, avoid_paths=(), sc
         raise WorldsError("arena refused: " + "; ".join(probs))
     avoid, avoid_rec = set(), []
     for p in avoid_paths:
-        a = read_avoid(p)
+        try:
+            a, record = rqlib.load_reservations(p)
+        except rqlib.ReservationError as exc:
+            raise WorldsError(str(exc)) from exc
         avoid |= a
-        avoid_rec.append({"path": os.path.abspath(p), "sha256": rqlib.sha256_file(p), "seeds": len(a)})
+        avoid_rec.append(record)
     # every reserved slot's seeds first (block, treatment, k, attempt order): a slot's seeds never depend
     # on the allocation actually registered
     reserve = {t: max([RESERVE[t]] + [al[t] for al in allocs]) for t in TREATMENTS}
@@ -1494,16 +1476,8 @@ def local_ckpts(root, wid):
 
 
 def mkdirs_durable(path):
-    """os.makedirs, then every directory it created is made durable (its parent fsync'd)."""
-    path = os.path.abspath(path)
-    missing = []
-    p = path
-    while not os.path.isdir(p):
-        missing.append(p)
-        p = os.path.dirname(p)
-    os.makedirs(path, exist_ok=True)
-    for d in reversed(missing):
-        rqlib.fsync_dir(os.path.dirname(d))
+    """Shared durable directory creation (also used by the assay runner)."""
+    rqlib.mkdirs_durable(path)
 
 
 def _copy_verified(raw, dst, sha):
