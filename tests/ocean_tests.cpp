@@ -4859,6 +4859,7 @@ void testFlowLanes() {
 
 #include "ocean_appearance_tests.hpp"
 #include "ocean_body_plan_tests.hpp"   // the M2a body-plan preview (diagnostic)
+#include "ocean_hydro_tests.hpp"       // M2b1 PR 1: the birth physics foundation (no world)
 #include "ocean_sense_tests.hpp"
 #include "ocean_speed_tests.hpp"   // the exact Turbo speed-ups' own checks
 
@@ -4886,8 +4887,14 @@ int main(int argc, char** argv) {
             std::printf("OCEAN TESTS: %d passed, %d failed\n", ot::g_passed, ot::g_failed);
             return ot::g_failed ? 1 : 0;
         }
+        if (std::strcmp(argv[2], "hydro") == 0) {   // M2b1 PR 1's checks alone (a quick loop)
+            ot::testHydroMath(); ot::testHydroFrame(); ot::testHydroMaterial(); ot::testHydroIso(); ot::testHydroLoad(); ot::testHydroTensors();
+            ot::testHydroStage(); ot::testHydroRefs(); ot::testHydroRefuse(); ot::testHydroState(); ot::testHydroNumbers();
+            std::printf("OCEAN TESTS: %d passed, %d failed\n", ot::g_passed, ot::g_failed);
+            return ot::g_failed ? 1 : 0;
+        }
         if (std::strcmp(argv[2], "label_mask") != 0) {
-            std::fprintf(stderr, "--only: label_mask (or body) is the one test it runs\n");
+            std::fprintf(stderr, "--only: label_mask (or body, hydro) is the one test it runs\n");
             return 2;
         }
         ot::testLabelMask();
@@ -4999,6 +5006,18 @@ int main(int argc, char** argv) {
 #ifndef OCEAN_TESTS_NO_SHIM
     ot::testBodyShim();
 #endif
+    // M2b1 PR 1, the birth physics foundation: tests/ocean_hydro_tests.hpp
+    ot::testHydroMath();
+    ot::testHydroFrame();
+    ot::testHydroMaterial();
+    ot::testHydroIso();
+    ot::testHydroLoad();
+    ot::testHydroTensors();
+    ot::testHydroStage();
+    ot::testHydroRefs();
+    ot::testHydroRefuse();
+    ot::testHydroState();
+    ot::testHydroNumbers();
     // the glass walls: tests/ocean_walls_tests.hpp
 #ifndef OCEAN_TESTS_NO_SHIM
     ot::testWallsConfig();
