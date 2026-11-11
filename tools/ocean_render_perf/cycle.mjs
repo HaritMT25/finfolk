@@ -29,6 +29,7 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { acquire } from "./lock.mjs";
+import { leanOpt } from "./lean.mjs";
 const require = createRequire(import.meta.url);
 const args = process.argv.slice(2);
 function arg(name, def) { const i = args.indexOf("--" + name); return i >= 0 && i + 1 < args.length && !args[i + 1].startsWith("--") ? args[i + 1] : (i >= 0 ? true : def); }
@@ -134,6 +135,7 @@ async function launch(opts) {
   const ctx = await chromium.launchPersistentContext("", {
     executablePath: BRAVE, headless: true, viewport: opts.viewport, deviceScaleFactor: opts.dpr, reducedMotion: "no-preference", args: LAUNCH_ARGS });
   await ctx.addInitScript(INIT);
+  await ctx.addInitScript({ content: "window.__leanOpt = " + leanOpt.toString() + ";" });
   const page = ctx.pages()[0] || await ctx.newPage();
   const errors = [];
   page.on("pageerror", (e) => errors.push("pageerror: " + String(e)));
@@ -197,7 +199,7 @@ const result = { started: new Date().toISOString(), viewport: VIEWPORT, colour: 
             const census = { tally: W.census.t, calls: W.census.calls, frames: W.renders - rc0 }; W.census = null;
             const ci = S.contextInfo();
             return { raf, cap, renders, census, polRes: polRes && polRes.ok !== undefined ? polRes : null,
-                     opt: S.renderOptimization ? S.renderOptimization() : null,
+                     opt: S.renderOptimization ? window.__leanOpt(S.renderOptimization()) : null,   /* (lean.mjs: not the live buffers and textures) */
                      state: { quality: S.quality(), dpr: devicePixelRatio, pixelRatio: ci.pixelRatio, drawingBuffer: ci.drawingBuffer,
                               polish: S.polish(), appearance: S.appearance(), n: EvoOcean.state().n, hide: A.hide, sc: A.sc, colour: EvoOcean.bench ? null : null } };
           }, [A, pol, DUR, SETTLE, EVERY]);
