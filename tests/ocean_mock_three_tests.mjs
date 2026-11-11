@@ -367,6 +367,10 @@ async function side(web, tag, opts) {
         const bodies = (by.fishBody || []).map((r) => [r[1], r[2], r[4]].join("|"));
         if (bodies.indexOf([N, RING[wantTpl][0], RING[wantTpl][1]].join("|")) < 0 || (bodies.length > 1 && !o.split)) P.push("the canonical body draw: " + bodies.join(";"));
         res.barbels = (by.barbels || []).reduce((s, r) => s + r[1], 0);
+        if (o.gated) {   /* the gated barbel draw under the canonical body draw: medium rings, its own instance count */
+          if ((by.barbels || []).some((r) => r[2] !== RING.medium[0] || r[4] !== RING.medium[1])) P.push("a barbel draw is not on the medium template's rings");
+          if (res.barbels !== st.barbels) P.push("the barbel draws hold " + res.barbels + " instances, the scene says " + st.barbels);
+        }
         return res;
       }
       const seen = new Uint8Array(N), nb = { coarse: b.coarse.n, medium: b.medium.n };
@@ -399,6 +403,7 @@ async function side(web, tag, opts) {
     }
     const run = async (tag, k, w, sel, camera, o) => { for (let i = 0; i < k; i++) { if (camera) camera(); await frame(w, sel); } const r = inspect(tag, o); rep.push(r); return r; };
     scene.setAppearance(true);
+    await scene.setRenderOptimization({ lod: "screen", decoded: false, barbels: "body" });   /* (the barbels' gate has its own states, below) */
     await run("whole, screen, q3", 4, app);
     await run("close to fish 5, screen, q3", 6, app, 5, () => close(app, 5));
     scene.resetView(false);
@@ -422,7 +427,42 @@ async function side(web, tag, opts) {
     await run("barbels off", 4, app, 5, () => close(app, 5));
     await scene.setRenderOptimization({ lod: "quality", barbels: "off" });
     await run("barbels off, quality", 3, app, 5, () => close(app, 5));
-    Object.assign(out, { rep, logs: logs.slice() });
+    /* the barbels' gate: only fish that have barbels (gene above float32 0.2), in the medium template, big enough on screen */
+    const gated = [], POSEAPI = S0, fi = app.fish.findIndex((f, i) => i >= 5 && Math.fround(f.genes[59]) > 0.2);
+    function gatedCheck(tag) {
+      const st = scene.renderOptimization(), b = st.batches, q = scene.quality(), pc = scene.poseCamera();
+      const G = { view: pc.view, focal: pc.focalCss, near: pc.near, halfW: pc.halfW, halfH: pc.halfH };
+      const med = st.buckets ? new Set(b.medium.drawIdx) : null, enter = new Set(), keep = new Set(), P = [];
+      for (let c = 0; c < N; c++) {
+        const inMed = q >= 3 && (med ? med.has(c) : true), bD = Math.fround(app.fish[c].genes[59]);
+        if (!inMed || !(bD > Math.fround(0.2))) continue;
+        const p = scene.poseOf(c), xs = [], ys = [];
+        for (let k = 0; k < 6; k++) { xs.push(p.spine[2 * k]); ys.push(p.spine[2 * k + 1]); }
+        const px = POSEAPI.posePx(xs, ys, p.R, p.y, G);
+        if (px >= 6) enter.add(c);
+        if (px > 4.5) keep.add(c);
+      }
+      const got = new Set(b && b.barbels ? Array.from(b.barbels.drawIdx) : []), n = b && b.barbels ? b.barbels.n : 0;
+      for (const c of enter) if (!got.has(c)) P.push("fish " + c + " (barbels, 6 px or more, medium) has no barbel strips");
+      for (const c of got) if (!keep.has(c)) P.push("fish " + c + " has barbel strips but is not eligible (gene, template or under 4.5 px)");
+      if (n !== got.size) P.push("the barbel draw's count " + n + " is not its fish list's " + got.size);
+      gated.push({ tag, enter: enter.size, keep: keep.size, got: got.size, problems: P, quality: q, own: scene.renderOptimization().barbels });
+    }
+    await scene.setRenderOptimization({ lod: "screen", barbels: "gated" });
+    await run("gated barbels, screen LOD, close to a fish with barbels", 6, app, fi, () => close(app, fi));
+    gatedCheck("gated, screen LOD, close");
+    await scene.setRenderOptimization({ lod: "quality" });
+    await run("gated barbels, quality LOD, close", 6, app, fi, () => close(app, fi), { gated: true });
+    gatedCheck("gated, quality LOD, close");
+    scene.resetView(false);
+    await run("gated barbels, whole tank", 4, app, undefined, undefined, { gated: true });
+    gatedCheck("gated, whole tank");
+    scene.setQuality(2);
+    await scene.setRenderOptimization({ lod: "screen" });
+    await run("gated barbels, q2", 4, app, fi, () => close(app, fi));
+    gatedCheck("gated, q2");
+    scene.setQuality(3);
+    Object.assign(out, { rep, gated, fi, logs: logs.slice() });
     return out;
   }
   if (opts.session === "decoded") {
@@ -690,17 +730,26 @@ console.log("== the optimized body draws (policy lod) through the real scene");
   ok(pin.buckets && pin.medium.join() === "7", "a selected fish is medium wherever it is (pinned), the rest of the whole view coarse", pin.medium);
   ok(by("lit split on: the reference draws").buckets === null && by("lit split off again: buckets").buckets !== null, "the lit split is drawn by the reference pipeline: no buckets while it is on, buckets again once off");
   ok(by("barbels off").buckets && by("barbels off").buckets.barbels === 0 && by("barbels off, quality").barbels === 0, "barbels \"off\": no barbel draw, under buckets or the canonical draws");
+  const g = (t) => B.gated.find((x) => x.tag === t) || { problems: ["no such state " + t] };
+  ok(B.gated.length === 4 && B.gated.every((x) => x.problems.length === 0), "gated barbels: every fish with barbels (gene above float32 0.2), in the medium template and 6 px or more across has strips; none that is not eligible (4.5 px to keep them)", B.gated.filter((x) => x.problems.length).map((x) => [x.tag, x.problems.slice(0, 2)]));
+  ok(g("gated, screen LOD, close").enter >= 1 && g("gated, screen LOD, close").got >= 1 && g("gated, screen LOD, close").got < by("gated barbels, screen LOD, close to a fish with barbels").buckets.medium,
+     "close to a fish with barbels: its strips are drawn, and fewer than the body bucket has fish (the reference draws the strips of every fish of the draw)", g("gated, screen LOD, close"));
+  ok(g("gated, quality LOD, close").got >= 1 && g("gated, quality LOD, close").own === g("gated, quality LOD, close").got, "gated under the canonical body draw (lod \"quality\"): the barbel draw is compacted too", g("gated, quality LOD, close"));
+  ok(g("gated, whole tank").got === 0 && g("gated, q2").got === 0, "a whole-tank view (every fish a few pixels): no barbel strip at all; detail 2: none", [g("gated, whole tank").got, g("gated, q2").got]);
   /* planted faults: each must be seen */
   const BF = {
     "every bucket on the medium template's rings": ["ocean_scene.js", "bindRings(S.mesh, function () { return S.rings; });", "bindRings(S.mesh, function () { return ringsOfLod.medium; });"],
     "the shadow left on the last body draw's rings (no per-mesh rings)": ["ocean_scene.js", "if (renderOn) { bindRings(self.mesh, canonRings); bindRings(self.shadow, canonRings); }", "if (renderOn) { bindRings(self.mesh, canonRings); }"],
+    "the barbels' gene threshold too low (a fish without barbels gets strips)": ["ocean_pose.js", "var BARBEL_GENE_MIN = Math.fround(0.2),", "var BARBEL_GENE_MIN = 0.1,"],
+    "the barbel gate ignoring the size": ["ocean_pose.js", "return previous ? px > BARBEL_EXIT_CSS : px >= BARBEL_ENTER_CSS;", "return true;"],
     "a fish dropped from its bucket": ["ocean_scene.js", "for (c = 0; c < n; c++) { if (lodOf[c] === LOD_MEDIUM) M.idx[jm++] = c; else C.idx[jc++] = c; }", "for (c = 0; c < n; c++) { if (lodOf[c] === LOD_MEDIUM) M.idx[jm++] = c; else if (c !== 7) C.idx[jc++] = c; }"],
     "a bucket's gene slot off by one for a fish": ["ocean_scene.js", "dS[j] = sS[c];", "dS[j] = c === 3 ? j + 1 : sS[c];"]
   };
   for (const k of Object.keys(BF)) {
     let M;
     try { M = await side(WEB, "bk-fault", { session: "buckets", optimized: true, edits: [BF[k]] }); } catch (e) { M = { error: String(e && e.message || e) }; }
-    ok(!M.error && M.rep.some((r) => r.problems.length > 0), "planted: " + k + ": the session sees it" + (M.error ? " (" + M.error + ")" : ""), M.rep && M.rep.filter((r) => r.problems.length).slice(0, 1).map((r) => [r.tag, r.problems.slice(0, 2)]));
+    const seen = !M.error && (M.rep.some((r) => r.problems.length > 0) || M.gated.some((r) => r.problems.length > 0));
+    ok(seen, "planted: " + k + ": the session sees it" + (M.error ? " (" + M.error + ")" : ""), M.rep && M.rep.concat(M.gated).filter((r) => r.problems.length).slice(0, 1).map((r) => [r.tag, r.problems.slice(0, 2)]));
   }
 }
 console.log("== the decoded constants' cache (policy decoded) through the real scene");

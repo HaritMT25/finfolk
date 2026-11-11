@@ -232,7 +232,7 @@
   var packPose = POSE.packPose, unpackPose = POSE.unpackPose;
   var REACH_APP = POSE.REACH_APP, reachOfTemplate = POSE.reachOfTemplate, reachRadius = POSE.reachRadius;
   /* the render optimization's body buckets and the decision that picks one (ocean_pose.js) */
-  var LOD_COARSE = POSE.LOD_COARSE, LOD_MEDIUM = POSE.LOD_MEDIUM, bodyLod = POSE.bodyLod;
+  var LOD_COARSE = POSE.LOD_COARSE, LOD_MEDIUM = POSE.LOD_MEDIUM, bodyLod = POSE.bodyLod, barbelVisible = POSE.barbelVisible;
 
   /* The genes' GPU layout (EvoAppearance GENES fetchGenes): a fish's 63
    * floats and one zero in 16 RGBA32F texels at its slot, 512 texels a
@@ -762,13 +762,13 @@
      * resolves once they compiled and the policy took effect; a refused or failed one leaves the previous policy);
      * renderOptimization() the requested and effective policy and what the last frame drew. Display only. */
     var RENDER_REFERENCE = Object.freeze({ lod: "quality", decoded: false, barbels: "body" });
-    var RENDER_DEFAULT = Object.freeze({ lod: "screen", decoded: true, barbels: "body" });
+    var RENDER_DEFAULT = Object.freeze({ lod: "screen", decoded: true, barbels: "gated" });
     var renderOn = opts.renderOptimization !== false;
     var renderWant = Object.assign({}, renderOn ? RENDER_DEFAULT : RENDER_REFERENCE);   /* requested */
     /* in effect: the decoded programs only once they compiled (syncDecoded), so the first frames draw the raw programs */
     var renderNow = Object.assign({}, renderWant, { decoded: false });
     var renderFail = [];                                                                 /* what could not take effect, and why */
-    var RENDER_LODS = ["quality", "screen", "medium", "coarse"], RENDER_DECODED = [false, true], RENDER_BARBELS = ["body", "off"];   /* what this build implements */
+    var RENDER_LODS = ["quality", "screen", "medium", "coarse"], RENDER_DECODED = [false, true], RENDER_BARBELS = ["body", "gated", "off"];
     function renderPolicyOf(p) {
       var q = Object.assign({}, renderWant);
       if (p && typeof p === "object") {
@@ -831,6 +831,7 @@
       var bt = appKind ? appKind.bat : null;
       return { enabled: renderOn, requested: Object.assign({}, renderWant), effective: Object.assign({}, renderNow), failures: renderFail.slice(),
                buckets: bt && bt.on ? { coarse: bt.coarse, medium: bt.medium, barbels: bt.barbels, bodyVerts: bt.bodyVerts, bodyTris: bt.bodyTris } : null,
+               barbels: bt && bt.own ? bt.barbels : null,
                batches: appKind ? appKind.batches() : null, decoded: appKind ? appKind.decodedStats() : null,
                features: renderOn ? binder.render() : null };
     }
@@ -943,7 +944,7 @@
       var lit = self.lit;
       /* the render optimization's per-frame inputs, in snapshot order (fillApp writes them, commit reads them): each
        * fish's body bucket (LOD_COARSE / LOD_MEDIUM) and its projected body radius in CSS px */
-      self.lodOf = new Uint8Array(0); self.pxOf = new Float32Array(0);
+      self.lodOf = new Uint8Array(0); self.pxOf = new Float32Array(0); self.barbOk = new Uint8Array(0);
       /* its polished programs and the split's plain body one with the skip (warmUp) */
       self.warm = Warm("app", function () { return binder.warm(["app"]); }, function () { return self.geo; });
       var INST = ["iA", "iB", "iC", "iBody", "iX", "iGeneSlot"];
@@ -1015,7 +1016,7 @@
         setRings(tpls[lod]);
         self.geo = g; self.bgeo = bg; self.attrs = at; self.cap = cap; self.lod = lod;
         if (self.litIdx.length < cap) self.litIdx = new Int32Array(cap);
-        if (renderOn && self.lodOf.length < cap) { self.lodOf = new Uint8Array(cap); self.pxOf = new Float32Array(cap); }
+        if (renderOn && self.lodOf.length < cap) { self.lodOf = new Uint8Array(cap); self.pxOf = new Float32Array(cap); self.barbOk = new Uint8Array(cap); }
         self.slotAttrFresh = true;   /* the slots are written into the new iGeneSlot: upload it */
       }
       /* the lit draw's instance buffers (cap fish) and geometries (body, barbels; their shadows stay in the main draw) */
@@ -1144,14 +1145,11 @@
         S.mesh.visible = S.n > 0;
         return S.bytes;
       }
-      self.bat = { on: false, coarse: 0, medium: 0, barbels: 0, bodyVerts: 0, bodyTris: 0, bytes: 0 };
-      /* this frame's bucketed draws (n fish; lodOf from fillApp; w the variant due; barbels: some fish has barbels) */
-      function drawBuckets(n, w, barbels) {
+      self.bat = { on: false, own: false, coarse: 0, medium: 0, barbels: 0, bodyVerts: 0, bodyTris: 0, bytes: 0, barbBytes: 0 };
+      /* this frame's bucketed body draws (n fish; lodOf from fillApp; w the variant due) */
+      function drawBuckets(n, w) {
         var lodOf = self.lodOf, c, nM = 0, bytes = 0;
-        if (!bodyBat) {
-          bodyBat = { coarse: Bat("fishBody", tpls.coarse, ringsOfLod.coarse), medium: Bat("fishBody", tpls.medium, ringsOfLod.medium) };
-          if (barbTpl) barbBat = Bat("barbels", barbTpl, ringsOfLod.medium);
-        }
+        if (!bodyBat) bodyBat = { coarse: Bat("fishBody", tpls.coarse, ringsOfLod.coarse), medium: Bat("fishBody", tpls.medium, ringsOfLod.medium) };
         var C = bodyBat.coarse, M = bodyBat.medium;
         for (c = 0; c < n; c++) if (lodOf[c] === LOD_MEDIUM) nM++;
         var nC = n - nM;
@@ -1162,23 +1160,51 @@
         C.n = nC; M.n = nM;
         if (nC > 0) { fillBat(C); bytes += showBat(C, w); } else if (C.mesh) { C.n = 0; C.mesh.visible = false; }
         if (nM > 0) { fillBat(M); bytes += showBat(M, w); } else if (M.mesh) { M.n = 0; M.mesh.visible = false; }
-        /* the barbels: the medium bucket's fish (every one, while any fish in the tank has barbels: as the reference draws them) */
-        var nb = 0;
-        if (barbBat) {
-          if (barbels && renderNow.barbels === "body" && nM > 0) { growBat(barbBat, nM); for (var j = 0; j < nM; j++) barbBat.idx[nb++] = M.idx[j]; }
-          barbBat.n = nb;
-          if (nb > 0) { fillBat(barbBat); bytes += showBat(barbBat, w); } else if (barbBat.mesh) barbBat.mesh.visible = false;
-        }
         var B = self.bat;
-        B.on = true; B.coarse = nC; B.medium = nM; B.barbels = nb; B.bytes = bytes;
+        B.on = true; B.coarse = nC; B.medium = nM; B.bytes = bytes;
         B.bodyVerts = nC * tpls.coarse.verts + nM * tpls.medium.verts; B.bodyTris = nC * tpls.coarse.tris + nM * tpls.medium.tris;
         return bytes;
       }
       function hideBuckets() {
         if (bodyBat) { bodyBat.coarse.n = bodyBat.medium.n = 0; if (bodyBat.coarse.mesh) bodyBat.coarse.mesh.visible = false; if (bodyBat.medium.mesh) bodyBat.medium.mesh.visible = false; }
-        if (barbBat) { barbBat.n = 0; if (barbBat.mesh) barbBat.mesh.visible = false; }
         var B = self.bat;
-        B.on = false; B.coarse = B.medium = B.barbels = B.bodyVerts = B.bodyTris = B.bytes = 0;
+        B.on = false; B.coarse = B.medium = B.bodyVerts = B.bodyTris = 0; B.bytes = B.barbBytes;
+      }
+      /* The barbel strips' draw over buffers of their own (policy barbels "body" with buckets, or "gated"). "body": the medium bucket's
+       * fish, every one while some fish in the tank has barbels (as the reference draws them). "gated": only the fish that have
+       * barbels (the gene, read from the slot's raw row, above the shader's float32 0.2), are in the medium template (the body
+       * bucket's, or at detail 3 under lod "quality") and are big enough on screen (barbelVisible: 6 px to start, 4.5 to stop, kept by
+       * slot): the others submit no barbel vertex at all. buckets: the body buckets are drawn (lodOf is this frame's) */
+      function drawBarbels(n, w, anyBarbels, buckets, mode) {
+        var nb = 0, bytes = 0, c, s, lodOf = self.lodOf, BS = barbSt;
+        if (barbTpl && mode !== "off" && n > 0 && anyBarbels) {
+          if (!barbBat) barbBat = Bat("barbels", barbTpl, ringsOfLod.medium);
+          var SL = self.attrs.iGeneSlot.array, ok = self.barbOk;
+          if (mode === "body") {
+            for (c = 0; c < n; c++) { ok[c] = lodOf[c] === LOD_MEDIUM ? 1 : 0; nb += ok[c]; }
+          } else {
+            var D = slots.data, GB = EA.MO + 26, PX = self.pxOf, lodQ = quality >= 3 ? LOD_MEDIUM : LOD_COARSE;
+            for (c = 0; c < n; c++) {
+              s = SL[c];
+              var v = barbelVisible(D[64 * s + GB], PX[c], BS[s] === 1, quality, buckets ? lodOf[c] : lodQ);
+              BS[s] = v ? 1 : 0; ok[c] = v ? 1 : 0; nb += ok[c];
+            }
+          }
+          if (nb > 0) {
+            growBat(barbBat, nb);
+            var j = 0;
+            for (c = 0; c < n; c++) if (ok[c]) barbBat.idx[j++] = c;
+            barbBat.n = nb; fillBat(barbBat); bytes = showBat(barbBat, w);
+          }
+        }
+        if (nb === 0 && barbBat) { barbBat.n = 0; if (barbBat.mesh) barbBat.mesh.visible = false; }
+        var B = self.bat;
+        B.barbels = nb; B.barbBytes = bytes; B.bytes += bytes;
+        return bytes;
+      }
+      function hideBarbels() {
+        if (barbBat) { barbBat.n = 0; if (barbBat.mesh) barbBat.mesh.visible = false; }
+        self.bat.barbels = 0; self.bat.barbBytes = 0;
       }
       /* the buckets are drawn instead of the canonical body draw: the policy asks for them and the lit split (reference-drawn) is off */
       self.bucketsOn = function () { return renderOn && renderNow.lod !== "quality" && !litSplit; };
@@ -1324,8 +1350,10 @@
         binder.bind(self.mesh, "app", split ? "litSkip" : "body", split ? 0 : w); binder.bind(self.shadow, "app", "shadow", w);
         if (self.bmesh) binder.bind(self.bmesh, "app", split ? "litSkip" : "body", split ? 0 : w);
         /* the render optimization's bucketed draws, instead of the canonical body and barbel draws (the shadow draw stays) */
-        var buckets = self.bucketsOn();
-        if (buckets) self.bytes += drawBuckets(n, w, barbels); else if (renderOn) hideBuckets();
+        var buckets = self.bucketsOn(), bmode = renderOn ? renderNow.barbels : "body", own = renderOn && (buckets || bmode !== "body");
+        self.bat.own = own;
+        if (buckets) self.bytes += drawBuckets(n, w); else if (renderOn) hideBuckets();
+        if (own) self.bytes += drawBarbels(n, w, barbels, buckets, bmode); else if (renderOn) hideBarbels();
         /* the gene texture's upload: the slots' plan, if any (none: the
          * texture's version stays, three uploads nothing); "full" policy: the
          * whole texture every frame */
@@ -1369,9 +1397,9 @@
         }
         self.mesh.visible = n > 0 && !buckets;
         self.shadow.visible = n > 0 && quality >= 2;
-        if (self.bmesh) self.bmesh.visible = n > 0 && !!barbels && self.lod === "medium" && !buckets && !(renderOn && renderNow.barbels === "off");
+        if (self.bmesh) self.bmesh.visible = n > 0 && !!barbels && self.lod === "medium" && !own;
       };
-      self.hide = function () { if (self.mesh) { self.mesh.visible = self.shadow.visible = false; if (self.bmesh) self.bmesh.visible = false; } hideLit(); if (renderOn) hideBuckets(); };
+      self.hide = function () { if (self.mesh) { self.mesh.visible = self.shadow.visible = false; if (self.bmesh) self.bmesh.visible = false; } hideLit(); if (renderOn) { hideBuckets(); hideBarbels(); } };
       /* 1: the full programs drawn (all the fish, or the lit ones apart: lit.on); 0 plain, or the plain
        * ones a failed assembly fell back to */
       self.variant = function () { return self.mesh ? binder.variantOf(lit.on ? lit.mesh : self.mesh) : 0; };
@@ -1870,9 +1898,10 @@
        * formula, kept bit for bit: the size weight below reuses it) picks its bucket (bodyLod, with the hysteresis kept by
        * gene slot); the buckets themselves are made in commit, from this canonical staging */
       var bucketing = appKind.bucketsOn(), lodMode = renderNow.lod, LODOF = appKind.lodOf, PXOF = appKind.pxOf;
+      var needPx = bucketing || (renderOn && renderNow.barbels === "gated");   /* (the barbels' gate needs the size too) */
       var LST = bucketing ? appKind.lodState() : null, SLOT = at.iGeneSlot.array;
       if (pose) { G = poseCamera(); posing = gateStart(gt, s, G); warmUp(appKind.warm); }
-      else if (bucketing) G = poseCamera();
+      else if (needPx) G = poseCamera();
       if (posing) {
         SP1 = swimB.ids.length >= n ? swimB : (swimB = swimBufs(Math.max(2048, 2 * n)));
         tick = s.stats ? s.stats[1] : 0;
@@ -1907,13 +1936,14 @@
         X[o] = t === t ? t : 0; X[o + 1] = hash01(id);
         X[o + 2] = 20 * size * elong / BODY[o];   /* lambda: body length / radius */
         X[o + 3] = cols ? cols[3 * c] * 65536 + cols[3 * c + 1] * 256 + cols[3 * c + 2] : 0;   /* the family / brain colour */
-        var pxl = -1;   /* its projected body radius, CSS px (posePx), when the buckets need it */
-        if (bucketing) {
+        var pxl = -1;   /* its projected body radius, CSS px (posePx), when the buckets or the barbels' gate need it */
+        if (needPx) {
           var cxl = 0.5 * (xs[0] + xs[5]) - G.halfW, czl = 0.5 * (ys[0] + ys[5]) - G.halfH, exl = xs[0] - xs[5], eyl = ys[0] - ys[5], GVl = G.view;
           var dnl = -(GVl[2] * cxl + GVl[6] * hgt + GVl[10] * czl + GVl[14]) - 0.5 * Math.sqrt(exl * exl + eyl * eyl) - 2 * BODY[o];
           pxl = BODY[o] * G.focal / (dnl > G.near ? dnl : G.near);
           PXOF[c] = pxl;
-          if (lodMode === "screen") {
+          if (!bucketing) { /* (the canonical body draw: no bucket) */ }
+          else if (lodMode === "screen") {
             var sl = SLOT[c], pin = c === selIdx || c === hovIdx, bl = bodyLod(pxl, LST[sl], quality, pin);
             /* a fish wholly out of view (behind the camera, or outside a side plane: its px is the clamped near-plane figure, huge) is
              * drawn coarse: nothing of it shows, and its vertices are the cost (the polish's own visibility test, poseVisibleQ, which is 0
@@ -1966,15 +1996,13 @@
       appKind.commit(n, rec.hasBarbels, settle(gt, pose, lit, warm(appKind.warm)), rec.changed, lit);
       if (profiler.active) {
         var tp = appKind.tpls[appKind.lod], ST = EA.STRIDE, bt = appKind.bat;
-        if (bt.on) {   /* the buckets: the body templates' mean over the fish, the barbels actually submitted */
-          profiler.count(PK.lod, bt.medium > 0 ? 2 : 1); profiler.count(PK.bodyInst, n);
-          profiler.count(PK.shadowInst, appKind.shadow.visible ? n : 0); profiler.count(PK.barbelInst, bt.barbels);
-          profiler.count(PK.tplVerts, n > 0 ? bt.bodyVerts / n : 0); profiler.count(PK.tplTris, n > 0 ? bt.bodyTris / n : 0);
-        } else {
-          profiler.count(PK.lod, appKind.lod === "medium" ? 2 : 1); profiler.count(PK.bodyInst, n);
-          profiler.count(PK.shadowInst, appKind.shadow.visible ? n : 0); profiler.count(PK.barbelInst, appKind.bmesh && appKind.bmesh.visible ? n : 0);
-          profiler.count(PK.tplVerts, tp.verts); profiler.count(PK.tplTris, tp.idx.length / 3);
-        }
+        /* (the reference path's counters in main's order: the recording of a reference session is committed) */
+        profiler.count(PK.lod, bt.on ? (bt.medium > 0 ? 2 : 1) : appKind.lod === "medium" ? 2 : 1); profiler.count(PK.bodyInst, n);
+        profiler.count(PK.shadowInst, appKind.shadow.visible ? n : 0);
+        /* the barbel instances actually submitted (the compacted draw's, else the canonical draw's: every fish) */
+        profiler.count(PK.barbelInst, bt.own ? bt.barbels : (appKind.bmesh && appKind.bmesh.visible ? n : 0));
+        /* the body templates' size: with the buckets the mean over the fish */
+        profiler.count(PK.tplVerts, bt.on ? (n > 0 ? bt.bodyVerts / n : 0) : tp.verts); profiler.count(PK.tplTris, bt.on ? (n > 0 ? bt.bodyTris / n : 0) : tp.idx.length / 3);
         profiler.count(PK.geneSrcBytes, rec.newRows * ST * 4); profiler.count(PK.genePadBytes, rec.newRows * (64 - ST) * 4);
         profiler.count(PK.litInst, appKind.lit.n);
       }
@@ -2593,7 +2621,7 @@
         var verts = !appKind ? 0 : bk && nb > 0 ? Math.round(bt.bodyVerts / nb) : appKind.tpls[appKind.lod || "medium"].verts;
         return { want: appSkin, skin: appSkin, shapes: shapes, drawing: appSkin && shapes,
                  status: appStatus, lod: lod, verts: verts,
-                 barbels: !!(appKind && ((appKind.bmesh && appKind.bmesh.visible) || (bk && bt.barbels > 0))) };
+                 barbels: !!(appKind && ((appKind.bmesh && appKind.bmesh.visible) || (bt.own && bt.barbels > 0))) };
       },
       appearanceParity: function (rows, lams, cellW, cellH) { return appearanceParity(rows, lams, cellW, cellH); },
       /* GPU == CPU through the production programs (appearancePathCheck: the
