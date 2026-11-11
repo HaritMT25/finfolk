@@ -517,12 +517,29 @@ class TestNumerics(unittest.TestCase):
         self.assertAlmostEqual(P[key + "persistence"]["reducible"]["mean"], float(delta @ delta), delta=0.01)
         o0 = per[0]["metrics"]["drift"]
         self.assertEqual((o0["events"]["extinction"], o0["reseeds"], o0["unavailable"]), (1, 2, 1))
+        # (PR-D, Annex H D6 rule 27 §10.6) explicit denominators and conditioning; conditioned origins are
+        # pooled apart from complete ones, never together
+        self.assertEqual((o0["denominators"], o0["conditioning"], o0["reseeds_registered"]),
+                         ({"registered": 5, "observable": 4, "live": 3, "event": 1}, "survivor-conditioned", 4))
+        self.assertEqual(per[11]["metrics"]["drift"]["conditioning"], "observable-only")     # (k = 11: a gap only)
+        self.assertEqual(per[1]["metrics"]["drift"]["conditioning"], "complete")
+        sc = P[key + "drift/survivor-conditioned"]
+        n_sc = sum(1 for k in range(360) if k % 7 == 0)
+        self.assertEqual((sc["origins"], sc["conditioning"], d0["conditioning"]), (n_sc, "survivor-conditioned", "complete"))
+        self.assertEqual(d0["origins"] + sc["origins"] + P[key + "drift/observable-only"]["origins"], 360)
+        self.assertGreaterEqual(d0["reducible"]["roots"], 2)
         one = fc.origin_metrics({"z": [0.0, 0.0], "cov": Sc.tolist(), "cross": {}},
                                 [{"kind": "reseed", "row": {"z": np.array([0.3, 0.4]), "R": meas_R, "g": None,
                                                             "events": {}, "unavailable": None}}], {}, [],
                                 lambda j: np.random.default_rng(j), 10)
         self.assertAlmostEqual(one["mse"], 0.25 - 0.02, places=12)
         self.assertIsNone(one["v_fork"])
+        self.assertIn("needs two", one["v_fork_unavailable"])
+        # a pool of one root world: the point, never an interval
+        P1 = fc.pool(ctx, [dict(r, world="w00") for r in per[:20]])
+        p1 = P1[key + "drift"]["mse"]
+        self.assertEqual((p1["roots"], p1["ci95"]), (1, None))
+        self.assertIn("two contributing root worlds", p1["ci95_unavailable"])
         es = {n: np.mean([r["metrics"][n]["energy"] for r in per]) for n in ("drift", "persistence")}
         self.assertLess(es["drift"], es["persistence"])
         self.assertAlmostEqual(d0["cover90"]["mean"], 0.9, delta=0.04)
@@ -609,6 +626,87 @@ class TestPipeline(unittest.TestCase):
         wr(p, obj if isinstance(obj, str) else json.dumps(obj))
         return p
 
+    def test_prefix_unavailable_origin_keeps_its_outcomes(self):
+        """Codex #78 r1 P2-5 and the §10.5 disposition: an origin WITHOUT a continuous forecast (its prefix extinct or
+        technically unavailable) still carries its outcome / denominator receipt from its registered futures; an
+        excluded origin is marked (its futures unread); the summary counts every origin; the §10.5 completeness
+        gate is incomplete with every reason, and complete only on a complete 32-world native panel."""
+        keys = {"stage": "test", "world_role": "test", "target_role": "test", "time_role": "fit",
+                "category": "world_transfer", "horizon": 10, "t0": 10, "target_t": 20, "primary": True}
+
+        def row(z, ev=None, un=None):
+            return {"z": z, "R": None, "g": None, "events": ev or {}, "unavailable": un}
+        T = {"rows": {("w1", 20): row(None, {"extinction": True}), ("b1", 20): row(None, {"extinction": True}),
+                      ("b2", 20): row([0.1, 0.2]), ("b3", 20): row(None, None, "assay failed"), ("n1", 20): row([0.0, 0.0])},
+             "meas": {}}
+        lines = [dict(keys, target_id="fork:w1", kind="fork", world="w1", available=False, reason="its prefix is extinct",
+                      branches=["b1", "b2", "b3"]),
+                 dict(keys, target_id="fork:w2", kind="fork", world="w2", available=False, reason="in-sample", branches=[]),
+                 dict(keys, target_id="native:n1", kind="native", world="n1", available=False, reason="a technical gap",
+                      branches=[])]
+        ctx = {"cfg": {"events": ["extinction"], "evaluation": {"seed_namespace": "t", "energy_draws": 10}, "primary": 10},
+               "by_id": {"fork:w1": {"excluded": None}, "fork:w2": {"excluded": "in-sample"}, "native:n1": {"excluded": None}}}
+        per = fc.score_lines(ctx, lines, T)
+        o = per[0]["outcomes"]
+        self.assertEqual((o["denominators"], o["conditioning"], o["events"]),
+                         ({"registered": 4, "observable": 3, "live": 1, "event": 2}, "survivor-conditioned", {"extinction": 2}))
+        self.assertEqual((per[0]["available"], per[0]["reason"], "metrics" in per[0]), (False, "its prefix is extinct", False))
+        self.assertEqual((per[1]["excluded"], per[1]["outcomes"]), (True, None))
+        self.assertEqual((per[2]["outcomes"]["denominators"]["live"], per[2]["outcomes"]["conditioning"]), (1, "complete"))
+        S = fc.outcome_summary(per)
+        f = S["test/fork/H10/primary"]
+        self.assertEqual((f["origins"], f["prefix_unavailable"], f["excluded"], f["futures"]["registered"],
+                          f["conditioning"]["survivor-conditioned"]), (2, 1, 1, 4, 1))
+        self.assertFalse(hasattr(fc, "decomposition_gate"))           # (r2: never derived from forecast summaries)
+
+    def test_registered_panel_receipt(self):
+        """Codex #78 r2 P2-1 (D6 rule 27, §10.5): a separate REGISTERED panel receipt from the fork registry: per origin
+        (30, 100, 185M) its primary target (40, 110, 195M), the native component (every native-panel world) and the
+        fork component (every root's branches and original) SEPARATELY, each required row's disposition; the pooled
+        primary only with all three origins complete. Codex's former 'success' fixture (the native panel at one target
+        plus one fork row) FAILS; one absorbed branch makes its origin unavailable; outcomes of a closed stage are
+        'not released'; forecast availability never enters."""
+        def row(z, ev=None, un=None):
+            return {"z": z, "R": None, "g": None, "events": ev or {}, "unavailable": un}
+        req = fc.panel_required(self.ctx)
+        self.assertEqual({o: r["target"] for o, r in req.items()}, {30: 40, 100: 110, 185: 195})
+        nat = len(self.ctx["forks"]["native_panel"])
+        self.assertTrue(all(len(r["native"]) == nat for r in req.values()))
+        self.assertEqual(sorted(len(r["fork"]) for r in req.values()), sorted(
+            sum(1 + len(bs) for (_, t0), bs in self.ctx["fork_origins"].items() if t0 == o) for o in req))
+        roles = {"training", "validation", "test"}
+        full = {k: row([0.1, 0.2]) for r in req.values() for kind in ("native", "fork") for k in r[kind]}
+        P = fc.panel_receipt(self.ctx, full, roles)
+        self.assertEqual((P["pooled_primary"], P["schema"]), ({"available": True, "reasons": []}, fc.PANEL_SCHEMA))
+        k0 = next(k for k in req[30]["fork"] if k not in req[30]["native"])      # (a branch: a root's original is
+        P2 = fc.panel_receipt(self.ctx, {**full, k0: row(None, {"extinction": True})}, roles)   # also its native row)
+        o30 = P2["origins"]["30"]
+        self.assertEqual((P2["pooled_primary"]["available"], o30["available"], o30["native"]["complete"],
+                          o30["fork"]["complete"]), (False, False, True, False))
+        self.assertEqual(o30["fork"]["dispositions"][f"{k0[0]}@{k0[1]}"], "absorbed: extinction")
+        some = {k: row([0.0, 0.0]) for k in req[100]["native"]}
+        some[req[100]["fork"][0]] = row([0.0, 0.0])
+        P3 = fc.panel_receipt(self.ctx, some, roles)                  # (the former success fixture: it must fail)
+        self.assertFalse(P3["pooled_primary"]["available"])
+        self.assertEqual((P3["origins"]["100"]["native"]["complete"], P3["origins"]["100"]["fork"]["complete"]), (True, False))
+        self.assertTrue(any("missing" in v for v in P3["origins"]["30"]["native"]["dispositions"].values()))
+        P4 = fc.panel_receipt(self.ctx, full, {"training", "validation"})
+        self.assertFalse(P4["pooled_primary"]["available"])
+        self.assertTrue(any(v.startswith("not released") for o in P4["origins"].values()
+                            for kind in ("native", "fork") for v in o[kind]["dispositions"].values()))
+        # (Codex #78 r3 P2-1) the MOST RESTRICTIVE registered use: the validation root V0's 185M -> 195M target is
+        # read by a test-stage origin (the forward-time test period), so it is not released at the validation stage
+        st = fc.panel_row_stages(self.ctx)
+        self.assertEqual((fc.node_role(self.ctx["manifest"], "V0", 195), st[("V0", 195)]), ("validation", "test"))
+        self.assertEqual(fc.row_stage(self.ctx, st, "V0", 195), "test")
+        self.assertTrue(P4["origins"]["185"]["native"]["dispositions"]["V0@195"].startswith("not released (a test-stage"))
+        self.assertEqual(P4["origins"]["185"]["fork"]["dispositions"]["V0@195"], P4["origins"]["185"]["native"]["dispositions"]["V0@195"])
+        # (Codex #78 r3 P2-2) the release gates are #73's VALIDATED path, never a marker or a file's presence
+        nowhere = dict(self.ctx, root=os.path.join(self.tmp, "nowhere"))
+        for stage in ("validation", "test"):
+            with self.assertRaises((fc.ForecastError, fc.staging.StageError)):
+                fc.panel_document(nowhere, self.files["val_targets.json"], stage, self.val)
+
     def test_end_to_end(self):
         """The staged pipeline runs on a TARGET-DISJOINT registration (no stage's prefix row is one of its
         targets, no validation prefix row a test target, no target a fitting row; in-sample origins
@@ -678,7 +776,11 @@ class TestPipeline(unittest.TestCase):
         s0 = "test/test/test/test/intersection/fork/H10/lss"                            # (S0, S1: held out throughout)
         self.assertIn(v0, keys)
         self.assertIn(s0, keys)
-        self.assertEqual((ev["pooled"][v0]["worlds"], ev["pooled"][s0]["worlds"]), (1, 2))
+        # (PR-D, D6 rule 27 §10.6: S1's origin with an extinct future is survivor-conditioned, pooled apart)
+        self.assertEqual((ev["pooled"][v0]["worlds"], ev["pooled"][s0]["worlds"]), (1, 1))
+        sc0 = ev["pooled"][s0 + "/survivor-conditioned"]
+        self.assertEqual((sc0["worlds"], sc0["conditioning"], ev["pooled"][s0]["conditioning"]),
+                         (1, "survivor-conditioned", "complete"))
         self.assertIn("test/training/training/test/forward_time/fork/H10/lss", keys)
         for v in ev["pooled"].values():
             self.assertIn(v["category"], fc.CATEGORIES)
@@ -686,6 +788,24 @@ class TestPipeline(unittest.TestCase):
         self.assertEqual((s1["events"]["extinction"], s1["reseeds"]), (1, 3))
         s0r = next(r for r in ev["origins"] if r["target_id"] == "fork:S0:185:4")["metrics"]["lss"]
         self.assertEqual((s0r["unavailable"], s0r["reseeds"]), (1, 3))
+        # (Codex #78 r1 P2-5) every non-excluded origin has its outcome receipt; §10.5 is the separate registered panel
+        # receipt (forecast.py panel), never part of the forecast scores (r2 P2-1)
+        for doc in (sc, ev):
+            self.assertTrue(all((r["outcomes"] is None) == r["excluded"] for r in doc["origins"]))
+            self.assertEqual(sum(c["origins"] for c in doc["outcomes"].values()), len(doc["origins"]))
+            self.assertNotIn("decomposition_10_5", doc)
+        # (the release-stage gates, Codex #78 r3 P2-2) before VAL_PRED_SHA is committed the panel receipt is refused at
+        # either stage (the validated commitment / freeze chain, not a marker's presence); on the committed root the
+        # validation gate opens, and the test gate needs the frozen test commitment
+        base = self.copy(self.base)
+        for st in ("validation", "test"):
+            rc_, err = run(["panel", "--root", base, "--targets", self.files["val_targets.json"], "--stage", st,
+                            "--predictions", self.val, "--out", os.path.join(self.tmp, f"panel.{st}.json")])
+            self.assertEqual(rc_, 2, err)
+        self.assertIn("not a registered §10.5 panel row", run(["panel", "--root", self.root, "--targets",
+                                                               self.files["val_targets.json"], "--stage", "validation",
+                                                               "--predictions", self.val, "--out",
+                                                               os.path.join(self.tmp, "panel.v.json")])[1])
 
     def test_reproducible(self):
         """The same bytes and environment give byte-identical outputs at every stage."""

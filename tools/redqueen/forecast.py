@@ -117,6 +117,24 @@ covariance with the forecast, S0 the mean shared covariance between distinct fut
              (PIT of the Mahalanobis distance through the chi-square CDF; 50% / 90% coverage).
 Fork panels are verified: every registered branch and the original continuation present exactly once
 (a profile, an absorbing event or an explicit unavailable), identities bound, covariances valid.
+CONDITIONING (Annex H D6 rule 27, §10.6): every origin states its denominators (registered, observable,
+live, event futures) and its conditioning: "complete" (every registered future live), "observable-only"
+(technical gaps, no event) or "survivor-conditioned" (an extinct future: an outcome record, never a
+profile; every summary of the origin is over its live futures, MSE and REDUCIBLE on one set). All the
+forecasters of an origin share its futures, so the biological mask is common to them. A fork variance
+needs two live reseeds (else v_fork_unavailable says so); events are kept even when a forecast is
+unavailable. Origins of different conditioning are never pooled together (a conditioned pool's name ends
+in its label), and a pooled interval needs two contributing root worlds (else the point and the reason).
+Every non-excluded origin, a prefix-unavailable one too, carries its outcome / denominator receipt
+("outcomes": its registered futures counted whether or not a forecast exists), pooled per stage x kind x
+horizon in the documents' "outcomes". The §10.5 disposition is a SEPARATE registered panel receipt
+(forecast.py panel; panel_required / panel_receipt): per fork origin its primary target, the native
+component (every native-panel world) and the fork component (every root's branches and original)
+separately, each required row's disposition (measured, absorbed, unavailable, missing, or not released:
+a row's stage is the most restrictive registered use of it, forward-time stages and promotions
+included, and the gates are #73's validated release path, the committed validation predictions or the
+test gate), the pooled primary only with all three origins complete; it never
+looks at a forecast, and survivor-conditioned §10.6 summaries never stand in for it.
 POOLED per STAGE x WORLD ROLE x TARGET ROLE x TIME ROLE x CATEGORY x KIND x HORIZON x FORECASTER, never
 across them (a validation-root world that fed the lambda selection never pools with a test-root world), with
 a root-world cluster bootstrap (Annex H.0.4 quantiles). Twelve root worlds and 36 origins are not 144
@@ -1253,13 +1271,28 @@ def shared_between(a, b, meas):
     return meas[a["g"]] if a["g"] is not None and a["g"] == b["g"] else None
 
 
+def outcome_receipt(futures, events):
+    """An origin's ECOLOGICAL OUTCOME / DENOMINATOR receipt over its registered futures (Annex H D6 rule 27, §10.6),
+    independent of whether a continuous forecast exists for it (Codex #78 r1 P2-5: a prefix-unavailable origin keeps
+    it): the futures, the unavailable ones, the event counts, the live ones, the explicit denominators and the
+    conditioning every summary over them carries (an extinct future is an outcome record, never a profile, so a
+    summary over the live futures is SURVIVOR-CONDITIONED when any registered future had an event;
+    observable-only with technical gaps; complete otherwise)."""
+    rec = {"futures": len(futures), "unavailable": sum(1 for f in futures if f["row"]["unavailable"]),
+           "events": {e: sum(1 for f in futures if f["row"]["events"].get(e)) for e in events}}
+    rec["live"] = sum(1 for f in futures if f["row"]["z"] is not None)
+    n_ev = sum(1 for f in futures if any((f["row"].get("events") or {}).values()))
+    rec["denominators"] = {"registered": len(futures), "observable": len(futures) - rec["unavailable"],
+                           "live": rec["live"], "event": n_ev}
+    rec["conditioning"] = "survivor-conditioned" if n_ev else ("observable-only" if rec["unavailable"] else "complete")
+    return rec
+
+
 def origin_metrics(fc, futures, meas, events, rng_of, draws):
     """One origin x forecaster (see the module docstring); None values where unavailable."""
     np = _np()
-    rec = {"futures": len(futures), "unavailable": sum(1 for f in futures if f["row"]["unavailable"]),
-           "events": {e: sum(1 for f in futures if f["row"]["events"].get(e)) for e in events}}
+    rec = outcome_receipt(futures, events)
     live = [f for f in futures if f["row"]["z"] is not None]
-    rec["live"] = len(live)
     if "z" not in fc:
         return dict(rec, forecast_unavailable=fc.get("unavailable"))
     zh, P = np.asarray(fc["z"], float), np.asarray(fc["cov"], float)
@@ -1290,7 +1323,10 @@ def origin_metrics(fc, futures, meas, events, rng_of, draws):
         mse, V = block(rs)
         m5, V5 = block(live)
         rec.update(reseeds=len(rs), mse=mse, v_fork=V, reducible=(mse - V) if V is not None else None,
-                   with_original={"mse": m5, "v_fork": V5, "reducible": (m5 - V5) if V5 is not None else None})
+                   with_original={"mse": m5, "v_fork": V5, "reducible": (m5 - V5) if V5 is not None else None},
+                   reseeds_registered=sum(1 for f in futures if f["kind"] == "reseed"))
+        if V is None:                          # (a fork variance needs two live reseeds; MSE needs one)
+            rec["v_fork_unavailable"] = f"{len(rs)} live reseed(s): a survivor-conditioned fork variance needs two"
     if live:
         es, pit = [], []
         for j, f in enumerate(live):
@@ -1315,7 +1351,9 @@ POOL_KEYS = ("stage", "world_role", "target_role", "time_role", "category", "kin
 
 def pool(ctx, per):
     """Means per STAGE / WORLD ROLE / TARGET ROLE / TIME ROLE / CATEGORY / KIND / H / FORECASTER (never across
-    them), root-world cluster bootstrap."""
+    them) and per CONDITIONING (Annex H D6 rule 27, §10.6: complete, observable-only or survivor-conditioned
+    origins are never pooled together; a conditioned pool's name ends in its label), root-world cluster
+    bootstrap: a 95% interval only with at least two contributing root worlds (else the point and the reason)."""
     np = _np()
     ev = ctx["cfg"]["evaluation"]
     groups = {}
@@ -1323,10 +1361,13 @@ def pool(ctx, per):
         if not r["available"]:
             continue
         for fc, m in r["metrics"].items():
-            groups.setdefault(tuple(r[q] for q in POOL_KEYS) + (fc,), []).append((r["world"], m))
+            cond = m.get("conditioning", "complete")
+            groups.setdefault(tuple(r[q] for q in POOL_KEYS) + (fc, cond), []).append((r["world"], m))
     out = {}
-    for key, rows in sorted(groups.items()):
+    for gkey, rows in sorted(groups.items()):
+        key, cond = gkey[:-1], gkey[-1]
         name = "/".join([str(x) if q != "horizon" else f"H{x}" for q, x in zip(POOL_KEYS + ("forecaster",), key)])
+        name += "" if cond == "complete" else f"/{cond}"
         qs = {}
         for q in ("mse", "v_fork", "reducible", "energy", "cover50", "cover90"):
             qs[q] = [(w, m[q]) for w, m in rows if m.get(q) is not None]
@@ -1335,7 +1376,7 @@ def pool(ctx, per):
                                         if (m.get("with_original") or {}).get(q) is not None]
         rng = np.random.default_rng(rqlib.derive_seed(ev["seed_namespace"], "bootstrap", name))
         rec = dict(zip(POOL_KEYS + ("forecaster",), key), primary=key[6] == ctx["cfg"]["primary"],
-                   origins=len(rows), worlds=len({w for w, _ in rows}))
+                   origins=len(rows), worlds=len({w for w, _ in rows}), conditioning=cond)
         ws = sorted({w for w, _ in rows})
         wi = {w: i for i, w in enumerate(ws)}
         picks = rng.integers(0, len(ws), (ev["bootstrap"], len(ws)))      # (whole root worlds, with their origins)
@@ -1350,24 +1391,32 @@ def pool(ctx, per):
                 c[wi[w]] += 1
             num, den = s[picks].sum(axis=1), c[picks].sum(axis=1)
             draws = sorted((num[den > 0] / den[den > 0]).tolist())
-            rec[q] = {"mean": float(np.mean(v)), "n": len(vals),
-                      "ci95": [quantile(draws, 0.025), quantile(draws, 0.975)] if draws else None}
+            roots = len({w for w, _ in vals})
+            rec[q] = {"mean": float(np.mean(v)), "n": len(vals), "roots": roots,
+                      "ci95": [quantile(draws, 0.025), quantile(draws, 0.975)] if draws and roots >= 2 else None}
+            if roots < 2:
+                rec[q]["ci95_unavailable"] = "fewer than two contributing root worlds: the point only"
         out[name] = rec
     return out
 
 
 def score_lines(ctx, lines, T):
-    """Per-line metrics of every forecaster in the lines (registered roles and categories kept)."""
+    """Per-line metrics of every forecaster in the lines (registered roles and categories kept). EVERY non-excluded
+    origin carries its outcome / denominator receipt ("outcomes", outcome_receipt), a prefix-unavailable one too
+    (Codex #78 r1 P2-5: its registered futures are read and counted whether or not a forecast exists); an excluded
+    origin is marked so (its futures are not read)."""
     cfg = ctx["cfg"]
     ev = cfg["evaluation"]
     per = []
     for ln in lines:
         rec = {q: ln[q] for q in ("target_id", "world", "t0", "target_t", "primary", "available") + POOL_KEYS}
+        excluded = bool(ctx["by_id"][ln["target_id"]]["excluded"])
+        futs = None if excluded else origin_futures(ln, T)
+        rec.update(excluded=excluded, outcomes=outcome_receipt(futs, cfg["events"]) if futs is not None else None)
         if not ln["available"]:
             rec["reason"] = ln.get("reason")
             per.append(rec)
             continue
-        futs = origin_futures(ln, T)
         rec["metrics"] = {}
         for fc, f in sorted(ln["forecasts"].items()):
             def rng_of(j, fc=fc):
@@ -1375,6 +1424,152 @@ def score_lines(ctx, lines, T):
             rec["metrics"][fc] = origin_metrics(f, futs, T["meas"], cfg["events"], rng_of, ev["energy_draws"])
         per.append(rec)
     return per
+
+
+def panel_row_stages(ctx):
+    """{(world, t): the MOST RESTRICTIVE registered stage that reads it as an outcome} (Codex #78 r3 P2-1): every
+    registered origin's (post-promotion, forward-time) stage over its target rows (target_rows; excluded origins
+    included: conservative)."""
+    out = {}
+    for o in ctx["origins"]:
+        for k in target_rows(o):
+            out[k] = staging.most_held_out(out.get(k), o["stage"])
+    return out
+
+
+def row_stage(ctx, stages, w, t):
+    """A panel row's release stage: the most restrictive of its snapshot's role (a branch: its root's) and every
+    registered origin's stage that reads it (panel_row_stages)."""
+    man = ctx["manifest"]
+    root = man.get("branches", {}).get(w, {}).get("root", w)
+    return staging.most_held_out(node_role(man, root, t), stages.get((w, t)))
+
+
+def panel_document(ctx, path, stage, predictions):
+    """The §10.5 panel receipt document under the RELEASE-STAGE GATES (Codex #78 r3 P2-2: #73's VALIDATED release path,
+    never a marker's or a file's presence): validation needs the committed validation predictions (staging.
+    committed_rows: VAL_PRED_SHA bound to its record, the bytes the marker, this configuration) and releases training /
+    validation-stage rows; test needs staging.test_gate (the freeze's schema and public registration, the prediction
+    commitments, the manifest and THIS implementation) and releases every row. A row's stage is the most restrictive
+    registered use of it (row_stage: forward-time stages and promotions included). The measurement document may hold
+    only registered panel rows of released stages (load_profiles' admission)."""
+    root = ctx["root"]
+    if stage == "validation":
+        staging.committed_rows(root, "validation", predictions, ctx["cfg_sha"], {"validation"})
+        released = {"training", "validation"}
+    else:
+        g = staging.test_gate(root, predictions, staging.implementation_manifest(sys.modules[__name__]))
+        for ln in g["rows"]:
+            if (ln.get("provenance") or {}).get("config_sha256") != ctx["cfg_sha"]:
+                raise ForecastError(f"{ln.get('target_id')}: predicted under another analysis configuration")
+        released = {"training", "validation", "test"}
+    want = {k for r in panel_required(ctx).values() for kind in ("native", "fork") for k in r[kind]}
+    stages = panel_row_stages(ctx)
+
+    def admit(i, key):
+        if key not in want:
+            return "not a registered §10.5 panel row"
+        st = row_stage(ctx, stages, key[0], key[1])
+        if st not in released:
+            return f"a {st}-stage outcome before its stage is open"
+        return None
+    T = read_profiles(ctx, path, "panel targets", admit)
+    return dict(panel_receipt(ctx, T["rows"], released), stage=stage, config_sha256=ctx["cfg_sha"],
+                targets_sha256=T["sha"], map_sha256=T["map_sha"], measurement_sha256=T["meas_sha"])
+
+
+def outcome_summary(per):
+    """The outcome receipts pooled per stage / kind / horizon / primary over EVERY scored origin (Codex #78 r1 P2-5):
+    origins (available, prefix-unavailable, excluded), futures (registered, observable, live, event) and the origins
+    by conditioning; never conditioned on a forecast's availability."""
+    out = {}
+    for r in per:
+        k = f"{r['stage']}/{r['kind']}/H{r['horizon']}" + ("/primary" if r["primary"] else "")
+        c = out.setdefault(k, {"origins": 0, "available": 0, "prefix_unavailable": 0, "excluded": 0,
+                               "futures": {"registered": 0, "observable": 0, "live": 0, "event": 0},
+                               "conditioning": {"complete": 0, "observable-only": 0, "survivor-conditioned": 0}})
+        c["origins"] += 1
+        c["excluded" if r.get("excluded") else "available" if r["available"] else "prefix_unavailable"] += 1
+        o = r.get("outcomes")
+        if o:
+            for q in c["futures"]:
+                c["futures"][q] += o["denominators"][q]
+            c["conditioning"][o["conditioning"]] += 1
+    return dict(sorted(out.items()))
+
+
+PANEL_SCHEMA = "finfolk.redqueen.panel105/1"
+DECOMPOSITION_RULE = ("§10.5 (Annex H D6 rule 27): the registered finite-panel chance/history subtraction needs, at each "
+                      "primary target (each fork origin + the primary horizon: 40M, 110M, 195M), its COMPLETE native "
+                      "panel (every registered native-panel world measured) and its required fork measurements (every "
+                      "fork root's registered branches and original measured); if extinction or a technical loss makes "
+                      "either unavailable, that origin's decomposition is unavailable; the pooled three-origin primary "
+                      "needs all three components. Separately reported survivor-conditioned native or fork variances "
+                      "never recover it, and forecast availability does not enter")
+
+
+def panel_required(ctx):
+    """THE REGISTERED §10.5 PANEL from the fork registry (never from forecasts; Codex #78 r2 P2-1) -> {origin (M):
+    {"target", "native" [(world, t)], "fork" [(world, t)]}}: per fork origin o, the primary target t = o + the primary
+    horizon: every registered native-panel world at t, and every fork root's registered main branches and its
+    original continuation at t."""
+    H = ctx["cfg"]["primary"]
+    out = {}
+    for o in sorted({t0 for _, t0 in ctx["fork_origins"]}):
+        t = o + H
+        fk = set()
+        for (root, t0), bs in ctx["fork_origins"].items():
+            if t0 == o:
+                fk |= {(b["id"], t) for b in bs} | {(root, t)}
+        out[o] = {"target": t, "native": sorted((w, t) for w in (ctx["forks"].get("native_panel") or [])),
+                  "fork": sorted(fk)}
+    return out
+
+
+def disposition_of(row):
+    """A required measurement's disposition from its measurement record: measured, absorbed (an event), unavailable
+    (technical, with its reason) or missing (no record)."""
+    if row is None:
+        return "missing: no measurement record (a required row is never dropped)"
+    if row["z"] is not None:
+        return "measured"
+    ev = sorted(k for k, v in (row.get("events") or {}).items() if v)
+    if ev:
+        return f"absorbed: {', '.join(ev)}"
+    return f"unavailable: {row.get('unavailable') or 'no profile'}"
+
+
+def panel_receipt(ctx, rows, released):
+    """THE REGISTERED §10.5 PANEL RECEIPT (Codex #78 r2 P2-1): per origin, the native and the fork component SEPARATELY,
+    every required row's disposition (disposition_of; a row whose release stage, row_stage: the most restrictive
+    registered use of it, is not among the released STAGES is "not released"), each component complete only when
+    every row is measured, the origin's decomposition available only when both are, and the POOLED primary only when
+    all three origins are. Independent of forecastability: no forecast line enters."""
+    req = panel_required(ctx)
+    stages = panel_row_stages(ctx)
+    out, why = {}, []
+    for o, r in sorted(req.items()):
+        comp = {}
+        for kind in ("native", "fork"):
+            disp = {}
+            for w, t in r[kind]:
+                st = row_stage(ctx, stages, w, t)
+                disp[f"{w}@{t}"] = (disposition_of(rows.get((w, t))) if st in released else
+                                    f"not released (a {st}-stage outcome: its stage is not open)")
+            n_ok = sum(1 for v in disp.values() if v == "measured")
+            comp[kind] = {"required": len(disp), "measured": n_ok, "complete": bool(disp) and n_ok == len(disp),
+                          "dispositions": disp}
+            if not comp[kind]["complete"]:
+                why.append(f"origin {o}M: its {kind} component is incomplete ({n_ok} of {len(disp)} measured)")
+        out[str(o)] = dict(comp, target=r["target"], available=comp["native"]["complete"] and comp["fork"]["complete"])
+    pooled = len(out) == 3 and all(v["available"] for v in out.values())
+    if len(out) != 3:
+        why.append(f"{len(out)} registered fork origins, the pooled primary needs three")
+    return {"schema": PANEL_SCHEMA, "rule": DECOMPOSITION_RULE, "origins": out,
+            "pooled_primary": {"available": pooled, "reasons": [] if pooled else why},
+            "released_roles": sorted(released),
+            "independence": "the dispositions come from the registered panel's measurement records only; forecast "
+                            "availability, exclusions and secondary horizons never enter"}
 
 
 def selection_rows(ctx, per):
@@ -1459,6 +1654,14 @@ def main(argv=None):
     s.add_argument("--selection", required=True, help="the validation scores the freeze's record names")
     s.add_argument("--targets", required=True, help="exactly the test stage's target rows")
     s.add_argument("--out", required=True)
+    s = sub.add_parser("panel", help="the registered §10.5 panel receipt (independent of the forecasts)")
+    s.add_argument("--root", required=True)
+    s.add_argument("--targets", required=True, help="the registered §10.5 panel's measurement records (released only)")
+    s.add_argument("--stage", choices=("validation", "test"), required=True,
+                   help="validation: the committed validation predictions, training / validation-stage rows only; "
+                        "test: through the test gate (the freeze), every row")
+    s.add_argument("--predictions", required=True, help="the stage's committed predictions (its release gate)")
+    s.add_argument("--out", required=True)
     a = ap.parse_args(argv)
     test_stages = {"test", "training"}
     try:
@@ -1473,6 +1676,11 @@ def main(argv=None):
             return 0
         ctx = load_ctx(a.root)
         cfg = ctx["cfg"]
+        if a.cmd == "panel":
+            rec = panel_document(ctx, a.targets, a.stage, a.predictions)
+            rqlib.write_json_durable(a.out, rec)
+            print(f"{a.out}: pooled §10.5 primary {'available' if rec['pooled_primary']['available'] else 'unavailable'}")
+            return 0
         if a.cmd == "origins":
             doc = {"schema": ORIGINS, "config_sha256": ctx["cfg_sha"], "origins_sha256": ctx["origins_sha"],
                    "origins": ctx["origins"], "rows": {}}
@@ -1506,7 +1714,7 @@ def main(argv=None):
             doc = {"schema": VALSCORES, "VAL_PRED_SHA": mk, "config_sha256": ctx["cfg_sha"],
                    "model_sha256": uniform(lines, "model_sha256"), "targets_sha256": T["sha"],
                    "selection": selection, "pooled": pool(ctx, per), "origins": per,
-                   "scoring": scoring_record(impl)}
+                   "outcomes": outcome_summary(per), "scoring": scoring_record(impl)}
             rqlib.write_json_durable(a.out, doc)
             print(f"lambda = {doc['selection']['lambda']}; record the scores (sealing.py open-validation) before predict-test")
             return 0
@@ -1547,7 +1755,7 @@ def main(argv=None):
         doc = {"schema": EVAL, "TEST_PRED_SHA": g["TEST_PRED_SHA"], "freeze_sha256": g["freeze_sha256"],
                "config_sha256": ctx["cfg_sha"], "selection_sha256": uniform(lines, "selection_sha256"),
                "lambda": uniform(lines, "lambda"), "targets_sha256": T["sha"], "pooled": pool(ctx, per), "origins": per,
-               "scoring": scoring_record(impl),
+               "outcomes": outcome_summary(per), "scoring": scoring_record(impl),
                "note": "reducible = MSE - V_fork: error reducible given the saved state under reseeding, for the "
                        "RETAINED (registered, non-excluded, available) origins only; negative finite-sample values "
                        "retained; not split into representation loss and learning error; every stage x world role x "

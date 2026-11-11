@@ -221,6 +221,11 @@
   function takeMemory(src, full) { HO.take(M, src, "the page's", full); }
 
   var W = 0, H = 0, D = 0, statsLen = 0, HAS_VZ = false, HAS_EYE = false, HAS_APP = false;
+  /* the M2a body-plan preview (DIAGNOSTIC): the exports in a layout this page
+   * knows (BODY_ABI below), its parsed coefficient layout (BODY_LAYOUT: the
+   * module's oc_body_metrics_layout JSON, field name -> offset), else null */
+  var HAS_BODY = false, BODY_LAYOUT = null;
+  var BODY_ABI = { physicalSchema: 1, genes: 5, geometryLaw: 1, metricsAbi: 1 };
   var WALLS = false;   /* the running world has glass walls (oc_walls_enabled) */
   var LIGHT = { on: false, L0: 1, k: 0 };
   function readLight() {
@@ -2008,6 +2013,7 @@
       stats: new Float64Array(buf, M._oc_stats(), statsLen),
       vz: HAS_VZ ? new Float32Array(buf, M._oc_creature_vz(), n) : null,
       app: appearanceView(buf, n),
+      bodyPlan: bodyView(buf, n),   /* the M2a body-plan diagnostics (s.body is the size / elongation pairs) */
       curActive: false, curGrid: null, curCols: 0, curRows: 0
     };
   }
@@ -2035,6 +2041,57 @@
     var p = M._oc_creature_appearance();
     if (!p || (p & 3) || p + n * 63 * 4 > buf.byteLength) return null;
     return new Float32Array(buf, p, n * 63);
+  }
+  /* The M2a body-plan preview (DIAGNOSTIC; src/ocean/body_plan.hpp): its
+   * exports in the versions and strides this page knows, and their layout
+   * (oc_body_metrics_layout, parsed once). Read-only: no world changes. */
+  function bodyDetect() {
+    HAS_BODY = false; BODY_LAYOUT = null;
+    var need = ["oc_body_count", "oc_creature_physical", "oc_body_owner_ids", "oc_creature_body_metrics", "oc_body_metrics_layout",
+                "oc_body_metrics_stride", "oc_physical_schema", "oc_physical_genes", "oc_body_geometry_law", "oc_body_metrics_abi"];
+    if (!need.every(has) || !HO) return;
+    if (M._oc_physical_schema() !== BODY_ABI.physicalSchema || M._oc_physical_genes() !== BODY_ABI.genes ||
+        M._oc_body_geometry_law() !== BODY_ABI.geometryLaw || M._oc_body_metrics_abi() !== BODY_ABI.metricsAbi) return;
+    var L;
+    try { L = JSON.parse(HO.cString(M, M._oc_body_metrics_layout())); } catch (e) { return; }
+    var at = bodyLayoutFields(L, M._oc_body_metrics_stride());
+    if (!at) return;
+    BODY_LAYOUT = { stride: L.stride, at: at, fins: L.fins, limits: L.limits, genes: L.genes };
+    HAS_BODY = true;
+  }
+  /* The layout's fields by name, or null unless it is whole and in bounds: the ABI this page reads, the
+   * module's stride, every field a whole offset and count, laid end to end over exactly the stride, the
+   * fields the card reads present, and the fins' sub-layout (7 names x a stride covering every value it
+   * names) inside its field. */
+  var BODY_NEEDS = ["size", "elong", "gapeDiameter", "bladderCapacity", "reserveEnergy", "armourThickness", "hullLength", "hullVolume",
+                    "wettedArea", "frontalArea", "sideArea", "planArea", "caudalActualAR", "caudalNominalAR", "unloadedMassEstimate", "limits", "fins"];
+  var FIN_VALUES = ["area", "normal", "centroid", "lever", "span", "rootChord", "meanChord", "thickness"];
+  function bodyLayoutFields(L, stride) {
+    function whole(x) { return typeof x === "number" && isFinite(x) && Math.floor(x) === x && x >= 0; }
+    if (!L || L.abi !== BODY_ABI.metricsAbi || L.law !== BODY_ABI.geometryLaw || L.stride !== stride || !whole(stride) || !Array.isArray(L.fields)) return null;
+    var at = {}, end = 0;
+    for (var i = 0; i < L.fields.length; i++) {
+      var f = L.fields[i];
+      if (!f || typeof f.name !== "string" || !whole(f.offset) || !whole(f.count) || f.count < 1 || f.offset !== end || at[f.name]) return null;
+      end = f.offset + f.count;
+      at[f.name] = f;
+    }
+    if (end !== stride || !BODY_NEEDS.every(function (k) { return !!at[k]; })) return null;
+    var F = L.fins;
+    if (!F || !Array.isArray(F.names) || F.names.length !== 7 || !whole(F.stride) || F.stride < 1 || !F.values ||
+        at.fins.count !== F.names.length * F.stride) return null;
+    var span = { normal: 3, centroid: 3, lever: 3 };
+    if (!FIN_VALUES.every(function (k) { var o = F.values[k]; return whole(o) && o + (span[k] || 1) <= F.stride; })) return null;
+    return at;
+  }
+  /* one sync's body rows (5 alleles, two owner words, the coefficients a fish),
+   * when the world has the preview on; null otherwise (or a malformed export) */
+  function bodyView(buf, n) {
+    if (!HAS_BODY || n <= 0 || M._oc_body_count() !== n) return null;
+    var g = M._oc_creature_physical(), o = M._oc_body_owner_ids(), m = M._oc_creature_body_metrics(), st = BODY_LAYOUT.stride;
+    if (!g || !o || !m || (g & 3) || (o & 3) || (m & 3)) return null;
+    if (g + n * 20 > buf.byteLength || o + n * 8 > buf.byteLength || m + n * st * 4 > buf.byteLength) return null;
+    return { genes: new Float32Array(buf, g, n * 5), owners: new Uint32Array(buf, o, n * 2), metrics: new Float32Array(buf, m, n * st), stride: st };
   }
   /* Without oc_creature_vz: each fish's pitch from how its depth changed over
    * the distance its head swam since the last frame, smoothed, keyed by id. */
@@ -2529,8 +2586,68 @@
     var deg = Math.atan(info[10]) * 180 / Math.PI;
     cardText("ipitchv", Math.abs(deg) < 0.5 ? "level" : Math.abs(deg).toFixed(0) + "° " + (deg > 0 ? "down" : "up"));
     setBar("ipitch", 0.5 + 0.5 * Math.max(-1, Math.min(1, info[10] / (pitchMax || 0.5))), 0.5);
+    drawBody(s, idx, id);
     if (cardExpanded) drawBrain(f);
     return s;
+  }
+  /* The card's body plan (the M2a preview, DIAGNOSTIC): what the fish
+   * inherited (its five physical alleles), what it developed (expressed
+   * values, with any developmental limit), what its body measures (the C++
+   * law's closed-mesh geometry) and the unloaded material ESTIMATE; speed and
+   * turning are not predicted until M2b calibrates them. Built once per fish
+   * (its body never changes); hidden when the world has no preview. */
+  var bodyEl = el("ibody"), bodyTableEl = el("ibodyt"), bodyLinkEl = el("ibodylink"), bodyFor = "";
+  function drawBody(s, idx, id) {
+    if (!bodyEl) return;
+    var B = s.bodyPlan;
+    if (!B || !BODY_LAYOUT || idx < 0 || idx * 2 + 1 >= B.owners.length) { bodyEl.hidden = true; bodyFor = ""; return; }
+    var owner = B.owners[2 * idx] + 4294967296 * B.owners[2 * idx + 1];
+    if (owner !== id) { bodyEl.hidden = true; bodyFor = ""; return; }   /* (never a row of another fish) */
+    bodyEl.hidden = false;
+    var key = s.worldEpoch + ":" + id;   /* (a new world reuses ids) */
+    if (bodyFor === key) return;
+    bodyFor = key;
+    var at = BODY_LAYOUT.at, st = B.stride, base = idx * st, mm = B.metrics, g = B.genes;
+    function v(name, k) { var f = at[name]; return f ? mm[base + f.offset + (k || 0)] : NaN; }
+    function fin(i, k) { var f = at.fins; return f ? mm[base + f.offset + BODY_LAYOUT.fins.stride * i + BODY_LAYOUT.fins.values[k]] : NaN; }
+    function num(x, d) { return isFinite(x) ? x.toFixed(d === undefined ? 2 : d) : "–"; }
+    var lim = v("limits"), why = [];
+    if (lim & 1) why.push("eye clipped to the head");
+    if (lim & 2) why.push("tail chord capped");
+    if (lim & 4) why.push("storage bounded");
+    if (lim & 8) why.push("organs bounded");
+    if (lim & 16) why.push("shell capped");
+    var rows = [
+      ["Inherited", "gape " + num(g[5 * idx]) + " · bladder " + num(g[5 * idx + 1]) + " · armour " + num(g[5 * idx + 2]) +
+                    " · fat " + num(g[5 * idx + 3]) + " · fibre " + num(g[5 * idx + 4])],
+      ["Developed", "mouth " + num(v("gapeDiameter")) + " u · bladder " + num(v("bladderCapacity"), 1) + " u³ · reserve " +
+                    num(v("reserveEnergy"), 0) + " E · shell " + num(v("armourThickness")) + " u" + (why.length ? " (" + why.join(", ") + ")" : "")],
+      ["Body", num(v("hullLength"), 1) + " u long · " + num(v("hullVolume"), 0) + " u³ · skin " + num(v("wettedArea"), 0) + " u²"],
+      ["Silhouette", "front " + num(v("frontalArea"), 1) + " · side " + num(v("sideArea"), 1) + " · plan " + num(v("planArea"), 1) + " u²"],
+      ["Tail", num(fin(0, "area"), 1) + " u² · aspect " + num(v("caudalActualAR")) + (lim & 2 ? " (genes ask " + num(v("caudalNominalAR")) + ")" : "")],
+      ["Fins", "dorsal " + num(fin(1, "area"), 1) + " · anal " + num(fin(2, "area"), 1) + " · pectorals 2×" + num(fin(3, "area"), 1) +
+               " · pelvics 2×" + num(fin(5, "area"), 1) + " u²"],
+      ["Mass (est.)", num(v("unloadedMassEstimate")) + " × the neutral body, unloaded (an estimate, not the M2b law)"],
+      ["Cruise speed", "not calibrated — M2b"],
+      ["Turning radius", "not calibrated — M2b"]
+    ];
+    bodyTableEl.textContent = "";
+    rows.forEach(function (r) {
+      var tr = document.createElement("tr"), th = document.createElement("th"), td = document.createElement("td");
+      th.textContent = r[0]; td.textContent = r[1];
+      if (r[1].indexOf("not calibrated") === 0) td.className = "pending";
+      tr.appendChild(th); tr.appendChild(td); bodyTableEl.appendChild(tr);
+    });
+    if (bodyLinkEl && s.app) {   /* the fixture viewer, with this fish's genes (float bits, hex) */
+      var words = [], f32 = new Float32Array(1), u32 = new Uint32Array(f32.buffer), k;
+      for (k = 0; k < 63; k++) { f32[0] = s.app[63 * idx + k]; words.push(("00000000" + u32[0].toString(16)).slice(-8)); }
+      for (k = 0; k < 5; k++) { f32[0] = g[5 * idx + k]; words.push(("00000000" + u32[0].toString(16)).slice(-8)); }
+      f32[0] = v("size"); words.push(("00000000" + u32[0].toString(16)).slice(-8));
+      f32[0] = v("elong"); words.push(("00000000" + u32[0].toString(16)).slice(-8));
+      var page = (window.EVO_ASSETS && window.EVO_ASSETS.bodyplan) || "ocean_bodyplan.html";
+      bodyLinkEl.href = page + "#fish=" + id + ":" + words.join("");
+      bodyLinkEl.hidden = false;
+    } else if (bodyLinkEl) bodyLinkEl.hidden = true;
   }
   function brainColor(v, a) {
     var m = Math.min(1, Math.abs(v));
@@ -3821,6 +3938,7 @@
                "oc_pattern_law", "oc_morphology_law"].every(has) && !!window.EvoAppearance &&
               M._oc_appearance_abi() === EvoAppearance.LAWS.abi && M._oc_appearance_stride() === EvoAppearance.STRIDE &&
               M._oc_pattern_law() === EvoAppearance.LAWS.patternLaw && M._oc_morphology_law() === EvoAppearance.LAWS.morphLaw;
+    bodyDetect();
     HAS_EYE = has("oc_has_eye") && !!M._oc_has_eye();
     if (!HAS_EYE) ["eye", "eyeOnly", "eyeCode"].forEach(function (k) {
       var i = el("o_" + k); if (i) i.disabled = true;

@@ -282,6 +282,13 @@ struct Coverage {
             {"appShapeMean", (long long)w.appearanceStats().morph[0]}, {"appShapeCopyA", (long long)w.appearanceStats().morph[1]},
             {"appShapeCopyB", (long long)w.appearanceStats().morph[2]}, {"appShapeNovel", (long long)w.appearanceStats().morph[3]},
             {"appBroken", (long long)w.appearanceBroken()},
+            // the body-plan preview's construction (statistics; never read by the step)
+            {"bodyFounders", (long long)w.bodyPlanStats().founders},
+            {"bodyOffspring", (long long)w.bodyPlanStats().offspring},
+            {"bodyMean", (long long)w.bodyPlanStats().mode[0]}, {"bodyCopyA", (long long)w.bodyPlanStats().mode[1]},
+            {"bodyCopyB", (long long)w.bodyPlanStats().mode[2]}, {"bodyNovel", (long long)w.bodyPlanStats().mode[3]},
+            {"bodyRecords", (long long)w.bodyPlanOwners().size()},
+            {"bodyBroken", (long long)w.bodyPlanBroken()}, {"bodyUncompiled", (long long)w.bodyPlanUncompiled()},
         };
     }
     // The counters the `cover` line leaves out while they are 0 (see above;
@@ -293,7 +300,9 @@ struct Coverage {
                                                      "appOffspring", "appMean", "appCopyA", "appCopyB", "appNovel",
                                                      "appShapeMean", "appShapeCopyA", "appShapeCopyB", "appShapeNovel",
                                                      "appBroken", "wallSteps", "wallTouch", "predWallTouch",
-                                                     "foodNearGlass", "outside"};
+                                                     "foodNearGlass", "outside", "bodyFounders", "bodyOffspring",
+                                                     "bodyMean", "bodyCopyA", "bodyCopyB", "bodyNovel", "bodyRecords",
+                                                     "bodyBroken", "bodyUncompiled"};
         for (const char* q : kQuietWhenZero) if (k == q) return true;
         return false;
     }
@@ -423,12 +432,14 @@ int main(int argc, char** argv) {
     long long removedSeen = 0;   // w.totalNonFiniteRemoved at the last scan
     ofp::Hasher chain;   // every step's full fingerprint, in order
     ofp::Hasher appchain;   // every step's appearance section (kept apart from `chain`: cosmetic)
+    ofp::Hasher bodychain;  // every step's body-plan section (apart too: diagnostic)
     Coverage cover;
     auto observe = [&](long step, bool printIt) {
         if (sparse && !printIt) return;
         const ofp::Fingerprint fp = ofp::fingerprint(w);
         chain.u64(fp.all);
         if (fp.appShown) appchain.u64(fp.app);
+        if (fp.bodyShown) bodychain.u64(fp.body);
         const long nf = ofp::countNonFinite(w) + (long)(w.totalNonFiniteRemoved - removedSeen);
         removedSeen = w.totalNonFiniteRemoved;
         if (nf > 0 && nonFiniteFirst < 0) nonFiniteFirst = step;
@@ -437,6 +448,7 @@ int main(int argc, char** argv) {
             std::fputs(ofp::fingerprintLine("fp", step, w, fp).c_str(), stdout);
             if (!sparse) std::printf(" chain=%016llx", (unsigned long long)chain.value());
             if (!sparse && fp.appShown) std::printf(" appchain=%016llx", (unsigned long long)appchain.value());
+            if (!sparse && fp.bodyShown) std::printf(" bodychain=%016llx", (unsigned long long)bodychain.value());
             std::fputc('\n', stdout);
         }
     };

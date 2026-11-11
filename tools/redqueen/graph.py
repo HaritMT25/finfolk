@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
-"""graph.py: the Red Queen map graph of design v4 (§4.1-4.5, §5.1, §7.1) and its pre-seal reports.
+"""graph.py: the Red Queen map graph of design v4 (§4.1-4.5, §5.1, §7.1; Annex H D7 rules 34, 40) and its
+pre-seal reports, availability masks and executable graphs (Annex H D6 rule 27).
 
     graph.py build --out DIR [--namespace NS] [--registry STUDY/config/worlds.json]
                    [--no-train-matchings] [--snapshot-topup 6] [--ab-topup 8 [--ab-topup-mode fitting|c]]
     graph.py report --graph DIR/graph.jsonl.gz [--out report.json]
+    graph.py mask --graph DIR/graph.jsonl.gz --block worlds_block.json --registry STUDY/config/worlds.json
+                  (--root STUDY [--archive-root AR] | --no-rederive) --out mask.json
+    graph.py executable --graph DIR/graph.jsonl.gz --mask mask.json --out DIR2   (DIR2 != DIR)
 
 The graph is the set of (prey population, predator population) pairs the assays measure for the
 map, with each pair's family, split role (the roles of plan.py's design /2 edges: training,
@@ -11,41 +15,46 @@ validation, test, support) and horizon class. Populations are snapshots "Q:<worl
 "P:<world>:<t>" (predators; C worlds only), t = 0 (F1) .. 200 (200M steps), and the external
 references "RQ:<k>", "RP:<k>" (eight per guild: registered reference slots; the selected sentinel
 snapshots are a deterministic relabelling, §4.2). Worlds: a registry's (worlds.json: ids,
-treatments, blocks) or the registered layout's synthetic ids (8 blocks of C x4, A, B). Everything is
-derived from --namespace: the same inputs give the same bytes.
+treatments, blocks; its sha256 is recorded) or the registered layout's synthetic ids. THE LAYOUT is
+the registered one only (D7 rule 34): eight blocks of 4C + 2A + 2B (64 worlds: 32 C, 16 A, 16 B);
+any other is refused. Everything is derived from --namespace: the same inputs give the same bytes.
 
-SPLITS (§7.1, §5.1). C worlds 20 training / 6 validation / 6 test; A and B 5/1/2 each. In every
+SPLITS (§7.1, §5.1; D7 rule 40). C worlds 20 training / 6 validation / 6 test; A and B 10/2/4 each
+(the same frozen, outcome-independent permutation per treatment). In every
 training C world 20 joint snapshot times are held out (10 snapshot-validation, 10 snapshot-test;
 two per 20M bin, residues mod 5 balanced, F1 never). 12 fork worlds (2 training, 4 validation, all
 6 test) and among them 8 intensive worlds (2, 2, 4).
 
-FAMILIES (v4 §4.5; quotas checked; no pair twice).
+FAMILIES (v4 §4.5 with D7 rule 40's 64-world quotas; quotas checked; no pair twice).
   within      every C world's coarse matrix (F1, 5M, ..., 200M: 41 x 41), its fine windows (F1-20M,
               90-110M, 180-200M: offsets 0, +-1, +-2, +-4) and the intensive worlds' complete fine
               windows: 72,992
   ref_prey    C prey x the four predator references of its block: 25,728
   ref_pred    C predators x the four prey references of its block: 25,728
-  ref_ab      A/B prey x the block's four predator references: 12,864
+  ref_ab      A/B prey x the block's four predator references: 25,728
   ref_grid    the 8 x 8 reference grid: 64
   cross       eight edge-disjoint C matchings (prey world w -> predator world w + s_m, a distinct
               shift per matching; two at the same time, six at a per-world random time permutation):
               51,456
   ab_to_c     A/B prey x four C predators (distinct worlds; held-out A/B worlds: training C
-              predators outside the snapshot holdouts): 12,864
+              predators outside the snapshot holdouts): 25,728
   support_c   four more training opponents (eligible training states) for every held-out-world C
               population, both guilds: 19,296
-  support_ab  two more training C predators for every held-out A/B prey snapshot: 2,412
+  support_ab  two more training C predators for every held-out A/B prey snapshot: 4,824
   train_match four edge-disjoint matchings of the 3,620 eligible training states (20 training C
               worlds x 201 - 400 snapshot holdouts), across worlds, new pairs only (v4 §4.4): 14,480
-  total 237,884 (223,404 with --no-train-matchings), and the default top-ups (no fixed quota):
+  total 266,024 (251,544 with --no-train-matchings; D7 rule 40's base graph total), and the default
+  top-ups (no fixed quota: their counts are what the generated graph gives):
   support_snap every snapshot-holdout population up to six training opponents in its support,
               new support pairs to eligible training states of other worlds: 1,301
   ab_train_c  every training A/B prey snapshot up to eight fitting pairs (its four references
               included; --ab-topup-mode c: eight training C opponents) with new training pairs to
-              eligible training C predators: 3,877
-  The top-ups are the recovery comparison's choice (rank 4 identifiable for every population, the
-  noisy A/B and snapshot-test errors down; +5,178 pairs, about 0.24 production days at 5k);
-  --snapshot-topup 0 --ab-topup 0 gives the v4 graph alone (237,884 pairs: the lag7 probe below is
+              eligible training C predators: 8,116 (20 training A/B worlds; 3,877 on the former 48)
+  The top-ups are the recovery comparison's choice on the former 48-world graph (rank 4 identifiable
+  for every population, the noisy A/B and snapshot-test errors down; there +5,178 pairs); on the 64-world
+  graph they add 9,417 pairs (about 0.44 production days at 5k), and its exact-graph recovery is to be
+  re-run (D7 rule 40: recompute the top-ups and support reports on the generated graph);
+  --snapshot-topup 0 --ab-topup 0 gives the v4 graph alone (266,024 pairs: the lag7 probe below is
   part of the registered top-up switch). They come after every registered family, which they leave
   unchanged.
   lag7_probe  (v4 amendment, 2026-11-07) every NON-intensive C world's coarse prey snapshots (F1, 5M,
@@ -70,6 +79,28 @@ HORIZONS (§4.6): the reference grid "long"; support_c, support_ab, train_match 
 "short"; every other family is in the randomized 1/8 long pool (no horizon: plan.py's
 pre-randomized long subset).
 
+AVAILABILITY (mask, executable; Annex H D6 rule 27). The built graph is the IMMUTABLE scheduled
+topology (a graph built with --registry records the registry's namespace and uuids, order-independent;
+write never replaces a published graph's bytes). `mask` reads it (verified against its edges_sha256), the
+study's REGISTRY and a worlds block (worlds.py design-block: per world its retained attempt's evidence
+under evidence.py's rules, the first terminal boundary valid_before, the frontier, the explicit burn-in
+disposition and every archived object checked against the line of descent and re-hashed). The block
+must be the registry's (its hash; the graph's, registry's and block's world ids, treatments, blocks and
+uuids equal; every attempt registered and its identity attempt_uuid; its evidence consistent: refused
+otherwise), and with --root it is RE-DERIVED from the study's evidence and must be the same. The mask
+is separate and deterministic: every unavailable snapshot (world x time; F1 = frame 1, t = t x 1M) with
+its cause, uuid, attempt and snapshot uuid: pending FIRST for an unsettled burn-in disposition, then
+biological (at or after the attempt's evidenced first guild zero), technical (at or after a refill, a
+missing or damaged archive, or not archived / not evidenced in an ended attempt: repair it if possible)
+or pending (not archived yet in a running one); every edge's exclusion (its endpoints' first of
+biological, technical, pending; references are refsel.py's business, never masked here); counts by
+family x role (scheduled, executable, biological, technical, pending), the attrition by world and the
+verified sha256 of every available snapshot. `executable` RECOMPUTES the edge exclusions from the
+mask's snapshots (refused if they differ) and writes the graph minus them into a new directory, roles,
+families and horizons unchanged, its meta bound to the source graph and the mask (recovery.py, report
+and plans consume it as they consume a graph). No endpoint is ever replaced by another world or time,
+and a recovery or support failure never authorizes replacement edges.
+
 The report (graph.py report) gives: family quotas, role x family counts, uniqueness, the support
 counts of every held-out population, the fitting degree of every population and the connected
 components of the fitting graph under four access rules (v4 with the new matchings; without them;
@@ -83,6 +114,7 @@ import gzip
 import json
 import os
 import sys
+import uuid
 from collections import Counter, defaultdict
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -94,8 +126,19 @@ TIMES = tuple(range(201))
 COARSE = tuple(range(0, 201, 5))
 WINDOWS = ((0, 20), (90, 110), (180, 200))
 OFFSETS = (0, 1, -1, 2, -2, 4, -4)
-QUOTAS = {"within": 72_992, "ref_prey": 25_728, "ref_pred": 25_728, "ref_ab": 12_864, "ref_grid": 64,
-          "cross": 51_456, "ab_to_c": 12_864, "support_c": 19_296, "support_ab": 2_412, "train_match": 14_480}
+# (D7 rule 40: the 64-world quotas; ref_ab, ab_to_c and support_ab doubled with 16 A and 16 B worlds)
+QUOTAS = {"within": 72_992, "ref_prey": 25_728, "ref_pred": 25_728, "ref_ab": 25_728, "ref_grid": 64,
+          "cross": 51_456, "ab_to_c": 25_728, "support_c": 19_296, "support_ab": 4_824, "train_match": 14_480}
+BASE_TOTAL = 266_024                # D7 rule 40's base graph total (with the training matchings)
+LAYOUT = {"C": 4, "A": 2, "B": 2}   # per block, eight blocks (D7 rule 34)
+BLOCKS = 8
+SPLIT_SIZES = {"C": (20, 6, 6), "A": (10, 2, 4), "B": (10, 2, 4)}   # training / validation / test (D7 rule 40)
+# (Codex #77 r1 P2-7) the HISTORICAL registered layouts an existing artifact may have, for re-validating frozen
+# graphs (build makes the 64-world layout only): the 48-world graph of main 99b1e94, 8 x (4C + 1A + 1B)
+HISTORICAL_LAYOUTS = {"48": {"C": 4, "A": 1, "B": 1}}
+HISTORICAL_QUOTAS = {"48": {"within": 72_992, "ref_prey": 25_728, "ref_pred": 25_728, "ref_ab": 12_864, "ref_grid": 64,
+                            "cross": 51_456, "ab_to_c": 12_864, "support_c": 19_296, "support_ab": 2_412,
+                            "train_match": 14_480}}
 # optional top-ups (no registered quota: their counts are what the options generate)
 TOPUPS = ("support_snap", "ab_train_c")
 LAG_PROBE = 7                       # (v4 amendment: the lag7_probe family; 0 = none)
@@ -141,10 +184,12 @@ class Rng:
 
 
 def synthetic_worlds():
+    """The registered layout's synthetic ids: per block b, C worlds C01.., A worlds A01.., B worlds B01.."""
     out = []
-    for b in range(1, 9):
-        out += [{"id": f"C{4 * (b - 1) + i + 1:02d}", "treatment": "C", "block": b} for i in range(4)]
-        out += [{"id": f"A{b}", "treatment": "A", "block": b}, {"id": f"B{b}", "treatment": "B", "block": b}]
+    for b in range(1, BLOCKS + 1):
+        for t in ("C", "A", "B"):
+            n = LAYOUT[t]
+            out += [{"id": f"{t}{n * (b - 1) + i + 1:02d}", "treatment": t, "block": b} for i in range(n)]
     return out
 
 
@@ -153,15 +198,50 @@ def registry_worlds(path):
     return [{"id": w["id"], "treatment": w["treatment"], "block": w["block"]} for w in reg["worlds"]]
 
 
+def registry_binding(path):
+    """The identity a graph built from a registry records (Codex #77 r1 P1-1): its namespace and every world's uuid,
+    ORDER-INDEPENDENT (a permuted registry still gives byte-identical artifacts); mask() checks the study's
+    registry against it (the registry's bytes bind the worlds block and the mask)."""
+    reg = rqlib.read_json(path)
+    return {"namespace": reg.get("namespace"), "uuids": {w["id"]: w.get("uuid") for w in reg["worlds"]}}
+
+
+def layout_problems(worlds, layout=None):
+    """Why a world list is not the registered 64-world layout (D7 rule 34): 8 blocks of 4C + 2A + 2B (layout: another
+    per-block allocation, a historical one)."""
+    layout = layout or LAYOUT
+    per = defaultdict(Counter)
+    for w in worlds:
+        per[w["block"]][w["treatment"]] += 1
+    probs = []
+    if sorted(per) != list(range(1, BLOCKS + 1)):
+        probs.append(f"blocks {sorted(per)}, the registered layout has 1..{BLOCKS}")
+    for b, c in sorted(per.items()):
+        if dict(c) != layout:
+            probs.append(f"block {b}: {dict(sorted(c.items()))}, the registered layout has {layout}")
+    if len({w["id"] for w in worlds}) != len(worlds):
+        probs.append("a world id twice")
+    return probs
+
+
+def layout_of(worlds):
+    """"64" (the registered layout), a HISTORICAL_LAYOUTS name, or None."""
+    if not layout_problems(worlds):
+        return "64"
+    return next((n for n, lay in HISTORICAL_LAYOUTS.items() if not layout_problems(worlds, lay)), None)
+
+
 def splits(ns, worlds):
     """{world: "train" | "val" | "test"}, the fork and intensive sets, the snapshot holdouts."""
+    probs = layout_problems(worlds)
+    if probs:
+        raise GraphError("not the registered 64-world layout (Annex H D7 rule 34): " + "; ".join(probs[:4]))
     by_t = defaultdict(list)
     for w in worlds:
         by_t[w["treatment"]].append(w["id"])
-    want = {"C": (20, 6, 6), "A": (5, 1, 2), "B": (5, 1, 2)}
     split = {}
     for t, ids in sorted(by_t.items()):
-        n = want[t]
+        n = SPLIT_SIZES[t]
         if len(ids) != sum(n):
             raise GraphError(f"{len(ids)} {t} worlds, the layout needs {sum(n)}")
         ids = Rng(ns, "split", t).perm(sorted(ids))
@@ -496,8 +576,15 @@ def build(ns="rq2026-graph", worlds=None, train_matchings=True, snapshot_topup=S
 
 
 def check_quotas(g):
+    """The registered quotas of the graph's OWN layout (Codex #77 r1 P2-7: a frozen historical 48-world graph is
+    checked against its layout's, the 64-world one against D7 rule 40's)."""
+    lay = layout_of(g["worlds"])
+    if lay is None:
+        return ["not a registered layout (64, or a historical " + ", ".join(HISTORICAL_LAYOUTS) + "): "
+                + "; ".join(layout_problems(g["worlds"])[:3])]
+    table = QUOTAS if lay == "64" else HISTORICAL_QUOTAS[lay]
     c = Counter(e[2] for e in g["edges"])
-    probs = [f"{f}: {c.get(f, 0)} pairs, the design has {n}" for f, n in QUOTAS.items()
+    probs = [f"{f}: {c.get(f, 0)} pairs, the design has {n}" for f, n in table.items()
              if (f != "train_match" or g["train_matchings"]) and c.get(f, 0) != n]
     if len({(e[0], e[1]) for e in g["edges"]}) != len(g["edges"]):
         probs.append("a pair occurs twice")
@@ -509,17 +596,53 @@ def check_quotas(g):
     return probs
 
 
+def _publish_exclusive(p, data):
+    """Publish data at p EXCLUSIVELY: a temporary file, fsync'd, hard-linked to p (os.link fails if any file is
+    there: never a replacement), the temporary removed, the directory fsync'd -> True if this call published."""
+    tmp = f"{p}.tmp.{os.getpid()}.{uuid.uuid4().hex[:16]}"
+    with open(tmp, "wb") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    try:
+        os.link(tmp, p)
+    except FileExistsError:
+        if rqlib.read_bytes(p) != data:
+            raise GraphError(f"{p} exists with other bytes: a published graph is never replaced (write elsewhere)")
+        return False
+    finally:
+        os.unlink(tmp)
+    rqlib.fsync_dir(os.path.dirname(p))
+    return True
+
+
 def write(g, d):
-    os.makedirs(d, exist_ok=True)
+    """Write a graph into d. A published graph is IMMUTABLE (Codex #77 r1 P2-8, r2 P2-4): ONE serialized transaction
+    under d's exclusive lock (d/.graph.lock): both files are checked first (existing other bytes: GraphError,
+    nothing written), then published EXCLUSIVELY (_publish_exclusive: a hard link never replaces a file), the
+    edges before the meta (load reads the meta first); the same bytes again are a no-op. Concurrent writers of
+    other bytes cannot interleave or overwrite one another."""
+    import fcntl
     meta = {k: v for k, v in g.items() if k != "edges"}
     meta["edges"] = len(g["edges"])
     buf = "".join(json.dumps({"prey": e[0], "pred": e[1], "family": e[2], "role": e[3], "horizon": e[4]},
                              sort_keys=True, separators=(",", ":")) + "\n" for e in g["edges"]).encode()
     raw = gzip.compress(buf, mtime=0)
-    rqlib.write_durable(os.path.join(d, "graph.jsonl.gz"), raw)
     meta["edges_sha256"] = rqlib.sha256_bytes(buf)
     meta["tool_sha256"] = rqlib.sha256_file(os.path.abspath(__file__))
-    rqlib.write_durable(os.path.join(d, "graph.meta.json"), rqlib.canonical(meta))
+    files = (("graph.jsonl.gz", raw), ("graph.meta.json", rqlib.canonical(meta)))     # (the edges first)
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, ".graph.lock"), "a") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        try:
+            for name, data in files:
+                p = os.path.join(d, name)
+                if os.path.exists(p) and rqlib.read_bytes(p) != data:
+                    raise GraphError(f"{p} exists with other bytes: a published graph is never replaced (write elsewhere)")
+            for name, data in files:
+                _publish_exclusive(os.path.join(d, name), data)
+        finally:
+            fcntl.flock(lk, fcntl.LOCK_UN)
     return meta
 
 
@@ -533,6 +656,448 @@ def load(path):
     g["edges"] = [(r["prey"], r["pred"], r["family"], r["role"], r["horizon"])
                   for r in map(json.loads, buf.decode().splitlines())]
     return g
+
+
+# ------------------------------------------------------------------ availability (Annex H D6 rule 27)
+MASK_SCHEMA = "finfolk.redqueen.graphmask/2"        # (/2: registry-, identity- and evidence-bound; Codex #77 r1 P1)
+BLOCK_SCHEMA = "finfolk.redqueen.worldsblock/1"
+BLOCK_EVIDENCE_SCHEMA = "finfolk.redqueen.blockevidence/1"
+EXCLUSION = ("biological", "technical", "pending")      # an edge takes its endpoints' first in this order
+ENDED = ("done", "extinct", "failed", "invalidated")
+DISPOSITIONS = {"no_rule": True, "established": True, "exhausted": True,      # disposition -> settled
+                "restart_pending": False, "unresolved": False, "not_installed": False}
+ARCHIVE_STATUS = ("verified", "off_chain", "missing", "mismatch")
+SEED_SCHEME = "slot/1"              # (worlds.py's: its burn-in rule applies to registries of this seed scheme)
+
+
+def frame_of(t):
+    """A graph time (0 = F1, else t x 1M) -> its archive frame."""
+    return 1 if t == 0 else t * 1_000_000
+
+
+def attempt_uuid(base, k):
+    """worlds.py's (and val_block.py's) identity of attempt k: the registry uuid for 0, else uuid5(NAMESPACE_URL,
+    "finfolk:attempt:<registry uuid>:<k>")."""
+    return base if not k else str(uuid.uuid5(uuid.NAMESPACE_URL, f"finfolk:attempt:{base}:{k}"))
+
+
+def snapshot_uuid(world_uuid, frame):
+    """plan.py's global key of one archived snapshot: uuid5(NAMESPACE_URL, "finfolk:snapshot:<world uuid>:<frame>")."""
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"finfolk:snapshot:{world_uuid}:{int(frame)}"))
+
+
+def registry_burn_in(reg):
+    return int(reg.get("burn_in") or 0) if reg.get("seed_scheme") == SEED_SCHEME else 0
+
+
+def _int(x):
+    return isinstance(x, int) and not isinstance(x, bool)
+
+
+def _sha(x):
+    return isinstance(x, str) and len(x) == 64 and all(c in "0123456789abcdef" for c in x)
+
+
+def disposition_support(d, k, vb, fr, bi, maxr, prior):
+    """Why a burn-in disposition is NOT supported by the evidence and the REGISTERED rule (None: it is; Codex #77 r3
+    P1-2, the one rule the worlds block's and the mask's validators share): d the disposition, k the attempt, vb its
+    first terminal frame (None: none), fr its frontier, bi the registered burn-in frame (0: no rule), maxr the
+    registered max restarts, prior the earlier attempts' evidence [{"attempt", "first_terminal"}]:
+      no_rule: the registry has no burn-in rule (bi = 0);
+      established: a rule, no terminal before bi, and evidence through bi (a first terminal at or after it, or alive);
+      exhausted: a rule, an evidenced terminal before bi, the FINAL permitted attempt (k = maxr), and every earlier
+        attempt 0..k-1 with ITS OWN evidenced terminal before bi (the restarts it used were earned);
+      restart_pending: a rule, an early terminal, restarts left (k < maxr);
+      unresolved: a rule, no terminal, evidence short of bi;
+      not_installed: anything (nothing is evidenced)."""
+    early = vb is not None and vb < bi
+    if d == "not_installed":
+        return None
+    if d == "no_rule":
+        return None if not bi else f"no_rule, but the registered burn-in frame is {bi}"
+    if not bi:
+        return f"{d} under no registered burn-in rule (the disposition is no_rule)"
+    if d == "established":
+        return None if not early and fr >= bi else (f"established, but its first terminal {vb} is before the burn-in "
+                                                    f"frame {bi} or its evidence ({fr}) does not reach it")
+    if d == "restart_pending":
+        return None if early and k < maxr else f"restart_pending needs an early terminal and restarts left ({k} of {maxr})"
+    if d == "unresolved":
+        return None if vb is None and fr < bi else "unresolved, but its evidence decides it"
+    if d == "exhausted":
+        if not early:
+            return f"exhausted, but no evidenced terminal before the burn-in frame {bi} (first terminal {vb})"
+        if k != maxr:
+            return f"exhausted at attempt {k}, but the registry permits {maxr} restarts: {maxr - k} remain"
+        pa = prior if isinstance(prior, list) else []
+        got = sorted(x.get("attempt") for x in pa if isinstance(x, dict))
+        late = [x.get("attempt") for x in pa if isinstance(x, dict) and not (
+            isinstance(x.get("first_terminal"), dict) and _int(x["first_terminal"].get("frame"))
+            and x["first_terminal"]["frame"] < bi)]
+        if got != list(range(k)) or late:
+            return (f"exhausted, but its earlier attempts' early terminals are not all evidenced (attempts {got}, "
+                    f"without one before {bi}: {late})")
+        return None
+    return f"an unknown disposition {d!r}"
+
+
+def world_problems(bw, r, bi, maxr):
+    """Contradictory or unsupported evidence in one world's worlds-block entry against its registry world r (the
+    burn-in frame bi and max restarts maxr: the registry's) -> [problem] (Codex #77 r1 P1-1, P2-3)."""
+    p = []
+    if bw.get("uuid") != r.get("uuid"):
+        p.append(f"its uuid {bw.get('uuid')!r} is not the registry's")
+    if (bw.get("treatment"), bw.get("block")) != (r.get("treatment"), r.get("block")):
+        p.append(f"{bw.get('treatment')} in block {bw.get('block')}, the registry has {r.get('treatment')} in block "
+                 f"{r.get('block')}")
+    k = bw.get("attempt")
+    if not _int(k) or not 0 <= k <= maxr:
+        return p + [f"attempt {k!r}: the registry reserves attempts 0..{maxr}"]
+    if bw.get("attempt_uuid") != attempt_uuid(r.get("uuid"), k):
+        p.append(f"its attempt identity is not attempt {k}'s")
+    b = bw.get("burn_in")
+    if not isinstance(b, dict) or b.get("disposition") not in DISPOSITIONS:
+        return p + ["no explicit burn-in disposition (a legacy entry: regenerate the block)"]
+    d = b["disposition"]
+    if b.get("decided") is not DISPOSITIONS[d]:
+        p.append(f"decided {b.get('decided')!r} contradicts its disposition {d}")
+    ev = bw.get("evidence")
+    if not isinstance(ev, dict) or not _int(ev.get("frontier")):
+        return p + ["no evidence record (frontier)"]
+    fr, ft, vb, zeros = ev["frontier"], ev.get("first_terminal"), bw.get("valid_before"), bw.get("first_zeros") or {}
+    if ft is None:
+        if vb is not None or zeros:
+            p.append("valid_before / first_zeros without an evidenced first terminal boundary")
+    elif not isinstance(ft, dict) or not _int(ft.get("frame")) or vb != ft["frame"]:
+        p.append("valid_before is not its evidenced first terminal boundary's frame")
+    elif not zeros or min(zeros.values()) != vb or any(not _int(z) or z < vb for z in zeros.values()):
+        p.append("its first_zeros contradict its first terminal boundary")
+    elif vb > fr:
+        p.append(f"its first terminal boundary {vb} lies past its evidence's frontier {fr}")
+    why = disposition_support(d, k, vb, fr, bi, maxr, bw.get("prior_attempts"))
+    if why:
+        p.append(f"its disposition {d} is not supported by its evidence: {why}")
+    if not isinstance(bw.get("prior_attempts"), list) or len(bw["prior_attempts"]) != k:
+        p.append(f"its earlier attempts' evidence (prior_attempts) is not recorded for attempts 0..{k - 1}")
+    rf = ev.get("refill")
+    if rf is not None and (not isinstance(rf, dict) or not _int(rf.get("frame"))):
+        p.append("a malformed refill record")
+    arch = bw.get("archive")
+    if not isinstance(arch, dict):
+        return p + ["no archive evidence"]
+    for fs, e in arch.items():
+        if not isinstance(e, dict) or e.get("status") not in ARCHIVE_STATUS or not fs.isdigit():
+            p.append(f"archive {fs}: a malformed entry")
+        elif e["status"] == "verified" and not _sha(e.get("sha256")):
+            p.append(f"archive {fs}: verified without its sha256")
+    ver = sorted(int(f) for f, e in arch.items() if isinstance(e, dict) and e.get("status") == "verified" and f.isdigit())
+    if sorted(bw.get("archived") or []) != ver:
+        p.append("its archived frames are not its verified archive objects")
+    return p
+
+
+def block_problems(g, block, registry, registry_sha256):
+    """Why a worlds block is not THIS graph's registered study's evidence (Codex #77 r1 P1-1) -> [problem]: the
+    block's registry hash must be the registry's bytes (and the graph's, when it recorded one), the graph's,
+    the registry's and the block's worlds must be the same (ids, treatments, blocks, uuids), each entry's attempt
+    and identity registered, and its evidence consistent (world_problems)."""
+    probs = []
+    if block.get("schema") != BLOCK_SCHEMA:
+        probs.append(f"block schema {block.get('schema')!r}, expected {BLOCK_SCHEMA}")
+    if block.get("registry_sha256") != registry_sha256:
+        probs.append("the block was made from another registry (its registry_sha256 is not the registry's)")
+    gr = g.get("registry")
+    if gr is not None and gr.get("namespace") != registry.get("namespace"):
+        probs.append("the graph was built from another registry (its namespace)")
+    ev = block.get("evidence")
+    if not isinstance(ev, dict) or ev.get("schema") != BLOCK_EVIDENCE_SCHEMA:
+        return probs + [f"a legacy worlds block without its evidence record ({BLOCK_EVIDENCE_SCHEMA}): regenerate it "
+                        "with worlds.py design-block"]
+    bi, maxr = registry_burn_in(registry), int(registry.get("max_restarts") or 0)
+    if (block.get("burn_in_frame"), block.get("max_restarts")) != (bi, maxr):
+        probs.append(f"the block's burn-in frame / max restarts ({block.get('burn_in_frame')}, "
+                     f"{block.get('max_restarts')}) are not the registry's ({bi}, {maxr})")
+    regw = {w["id"]: w for w in registry.get("worlds", [])}
+    gw = {w["id"]: w for w in g["worlds"]}
+    ws = block.get("worlds") or {}
+    for what, ids in (("graph", gw), ("block", ws)):
+        if set(ids) != set(regw):
+            extra, miss = sorted(set(ids) - set(regw)), sorted(set(regw) - set(ids))
+            probs.append(f"the {what}'s worlds are not the registry's (extra {extra[:3]}, missing {miss[:3]})")
+    for wid in sorted(set(gw) & set(regw)):
+        r, w = regw[wid], gw[wid]
+        if (r.get("treatment"), r.get("block")) != (w["treatment"], w["block"]):
+            probs.append(f"{wid}: the graph has {w['treatment']} in block {w['block']}, the registry {r.get('treatment')} "
+                         f"in block {r.get('block')}")
+        if gr is not None and (gr.get("uuids") or {}).get(wid) != r.get("uuid"):
+            probs.append(f"{wid}: the graph recorded another uuid")
+        if wid in ws:
+            probs += [f"{wid}: {x}" for x in world_problems(ws[wid], r, bi, maxr)]
+    return probs
+
+
+def snapshot_status(bw, t):
+    """(status, why) of a world's snapshot at graph time t from its (validated) worlds-block entry, in this order
+    (Codex #77 r1 P2-3: an unsettled attempt is pending FIRST, whatever its zeros): pending (the burn-in rule may
+    still replace the attempt); biological (at or after its evidenced first guild zero: no valid population, design
+    §2.3); technical (at or after a predator refill: a protocol-integrity event); available (archived on the line
+    of descent, re-hashed, within the evidence's frontier; F1 the founder); technical (a missing or damaged
+    archived object, or not archived / not evidenced in an ended attempt or a broken evidence chain: repair it if
+    possible); pending (not archived or not evidenced yet in a running attempt)."""
+    f, b, ev, k = frame_of(t), bw["burn_in"], bw["evidence"], bw["attempt"]
+    if not b["decided"]:
+        return "pending", f"attempt {k}'s burn-in disposition is not settled ({b.get('disposition')}: {b.get('why')})"
+    vb = bw.get("valid_before")
+    if vb is not None and f >= vb:
+        return "biological", f"at or after attempt {k}'s evidenced first guild zero (frame {vb})"
+    rf = ev.get("refill")
+    if rf and f >= rf["frame"]:
+        return "technical", (f"at or after a predator refill (frame {rf['frame']}): a protocol-integrity event, no "
+                             "natural coexistence after it")
+    a = bw["archive"].get(str(f))
+    stop = ev.get("stop")
+    ended = bw.get("status") in ENDED or bool(stop)
+    tail = f" ({stop})" if stop else ""
+    if a and a["status"] == "verified":
+        if f == 1 or f <= ev["frontier"]:
+            return "available", None
+        return ("technical" if ended else "pending"), f"archived, but its evidence reaches frame {ev['frontier']}{tail}"
+    if a and a["status"] in ("missing", "mismatch"):
+        return "technical", f"its archived object is {a['status']} ({a.get('why')}): repair it"
+    what = "not archived on its line of descent" if a else "not archived"
+    if ended:
+        return "technical", f"{what}, and attempt {k} is {bw.get('status')}{tail} (repair it if possible)"
+    return "pending", f"{what} yet (attempt {k} is {bw.get('status')})"
+
+
+def edge_exclusions(g, snaps):
+    """Every edge's exclusion from a mask's snapshots (its endpoints' first of biological, technical, pending;
+    references are not masked here: refsel.py's candidate pool decides them) -> ({cause: [edge index]},
+    {family: {role: {scheduled, executable, biological, technical, pending}}}). The ONE derivation both mask and
+    executable use (Codex #77 r1 P2-5)."""
+    by = defaultdict(dict)
+    excluded = {k: [] for k in EXCLUSION}
+    for i, (q, p, fam, role, _) in enumerate(g["edges"]):
+        st = "available"
+        for x in (q, p):
+            _, w, t = parse(x)
+            if w is None:
+                continue
+            s_ = snaps.get(f"{w}:{frame_of(t)}", {}).get("status", "available")
+            if s_ != "available" and (st == "available" or EXCLUSION.index(s_) < EXCLUSION.index(st)):
+                st = s_
+        c = by[fam].setdefault(role, {"scheduled": 0, "executable": 0, **{k: 0 for k in EXCLUSION}})
+        c["scheduled"] += 1
+        c["executable" if st == "available" else st] += 1
+        if st != "available":
+            excluded[st].append(i)
+    return excluded, {f: dict(sorted(rs.items())) for f, rs in sorted(by.items())}
+
+
+def mask(g, block, registry, registry_sha256, block_sha256=None, rederived=False):
+    """The evidence-bound availability mask of an IMMUTABLE graph (its edges and roles never change) from a worlds
+    block (worlds.py design-block) bound to the study's REGISTRY (its bytes' sha256; Codex #77 r1 P1-1): the block
+    is refused unless it is this registry's (block_problems: identities, attempts, the burn-in disposition and the
+    evidence consistent); then every unavailable snapshot (world x time) with its cause, the world's slot uuid,
+    attempt and snapshot uuid (plan.py's key), every edge's exclusion, counts by family x role, the attrition by
+    world and every AVAILABLE snapshot's verified archive sha256 (plan.py checks the bytes it reads against them).
+    rederived: the CLI re-derived the block from the study root. Deterministic: no clock."""
+    probs = block_problems(g, block, registry, registry_sha256)
+    if probs:
+        raise GraphError(f"the worlds block is not this graph's registered evidence ({len(probs)} problems): "
+                         + "; ".join(probs[:6]))
+    ws = block["worlds"]
+    snaps, worlds = {}, {}
+    for w in g["worlds"]:
+        bw = ws[w["id"]]
+        exc, first, shas = Counter(), None, {}
+        for t in TIMES:
+            st, why = snapshot_status(bw, t)
+            f = frame_of(t)
+            if st == "available":
+                shas[str(f)] = bw["archive"][str(f)]["sha256"]
+                continue
+            s = {"world": w["id"], "time": t, "frame": f, "status": st, "why": why, "uuid": bw["uuid"],
+                 "attempt": bw["attempt"], "snapshot": snapshot_uuid(bw["uuid"], f)}
+            if st == "biological":
+                s["valid_before"] = bw["valid_before"]
+            snaps[f"{w['id']}:{f}"] = s
+            exc[st] += 1
+            first = t if first is None else first
+        ev = bw["evidence"]
+        worlds[w["id"]] = {"treatment": w["treatment"], "block": w["block"], "status": bw.get("status"),
+                           "uuid": bw["uuid"], "attempt": bw["attempt"], "attempt_uuid": bw["attempt_uuid"],
+                           "valid_before": bw.get("valid_before"), "first_terminal": ev.get("first_terminal"),
+                           "frontier": ev["frontier"], "refill": ev.get("refill"), "stop": ev.get("stop"),
+                           "burn_in": bw["burn_in"], "burn_in_decided": bw["burn_in"]["decided"],
+                           "prior_attempts": bw.get("prior_attempts"),
+                           "unavailable_snapshots": {k: exc.get(k, 0) for k in EXCLUSION},
+                           "first_unavailable_time": first, "available_sha256": shas}
+    excluded, by = edge_exclusions(g, snaps)
+    n = len(g["edges"])
+    ne = sum(len(v) for v in excluded.values())
+    return {"schema": MASK_SCHEMA,
+            "graph": {"edges_sha256": g.get("edges_sha256"), "namespace": g.get("namespace"), "edges": n},
+            "registry": {"sha256": registry_sha256, "namespace": registry.get("namespace"),
+                         "burn_in_frame": registry_burn_in(registry), "max_restarts": int(registry.get("max_restarts") or 0)},
+            "block": {"schema": block.get("schema"), "sha256": block_sha256, "registry_sha256": block.get("registry_sha256"),
+                      "evidence": block["evidence"], "rederived": bool(rederived)},
+            "snapshots": snaps, "worlds": worlds,
+            "edges": {"scheduled": n, "executable": n - ne, **{k: len(v) for k, v in excluded.items()}},
+            "by_family_role": by, "excluded_edges": excluded,
+            "rules": "Annex H D6 rule 27: the scheduled graph and its roles are preserved; only pairs whose source "
+                     "snapshots are valid before the first guild-zero boundary (archived on the line of descent and "
+                     "re-hashed, within the evidence's frontier, from a settled attempt) execute; every excluded pair "
+                     "keeps its cause; no endpoint is replaced by another world or time, and recovery or support "
+                     "failure never authorizes replacement edges"}
+
+
+def mask_evidence_problems(m):
+    """Why a mask's worlds and snapshots are not consistent with ITS OWN EVIDENCE -> [problem]: THE ONE MASK VALIDATOR
+    graph.py (executable), plan.py (--exclusions) and sealing.py (availability) share (Codex #77 r2 P1-2):
+      per world an explicit burn-in disposition whose "decided" is its own (DISPOSITIONS) AND that its evidence and
+        the mask's REGISTERED rule support (disposition_support with the mask's registry burn_in_frame and
+        max_restarts, Codex #77 r3 P1-2: "exhausted" only at the final permitted attempt with every earlier
+        attempt's early terminal evidenced, "established" / "no_rule" agreeing with the burn-in rule); valid_before
+        is its first terminal boundary's frame (both or neither), at or before its evidence's frontier;
+      per snapshot its world's identity (uuid, attempt, snapshot uuid) and a cause;
+      the excluded and the available frames of a world DISJOINT;
+      an UNSETTLED attempt: every listed snapshot pending, none available (nothing about it is decided);
+      a SETTLED attempt: every listed frame at or after valid_before biological (with that valid_before), no
+        biological one before it; no available frame at or after valid_before, at or after a refill, or past the
+        frontier (F1, the founder, aside)."""
+    if m.get("schema") != MASK_SCHEMA:
+        return [f"mask schema {m.get('schema')!r}, expected {MASK_SCHEMA}"]
+    W, S = m.get("worlds"), m.get("snapshots")
+    if not isinstance(W, dict) or not isinstance(S, dict):
+        return ["the mask has no worlds / snapshots"]
+    reg = m.get("registry") or {}
+    bi, maxr = reg.get("burn_in_frame"), reg.get("max_restarts")
+    if not (_int(bi) and bi >= 0 and _int(maxr) and maxr >= 0):
+        return ["the mask's registry records no burn-in frame / max restarts (its dispositions cannot be checked)"]
+    probs, by = [], defaultdict(dict)
+    for key, s in sorted(S.items()):
+        if (not isinstance(s, dict) or s.get("world") not in W or not _int(s.get("frame")) or s.get("status") not in EXCLUSION
+                or key != f"{s['world']}:{s['frame']}"):
+            probs.append(f"snapshot {key}: malformed, or not a mask world's")
+            continue
+        w = W[s["world"]]
+        if ((s.get("uuid"), s.get("attempt")) != (w.get("uuid"), w.get("attempt"))
+                or s.get("snapshot") != snapshot_uuid(w.get("uuid"), s["frame"])):
+            probs.append(f"snapshot {key}: its identity (uuid, attempt, snapshot uuid) is not its world's")
+        if not isinstance(s.get("why"), str) or not s["why"]:
+            probs.append(f"snapshot {key}: an exclusion without its cause")
+        by[s["world"]][s["frame"]] = s
+    for wid, w in sorted(W.items()):
+        b = w.get("burn_in") if isinstance(w, dict) else None
+        if not isinstance(b, dict) or b.get("disposition") not in DISPOSITIONS or b.get("decided") is not DISPOSITIONS[b["disposition"]]:
+            probs.append(f"{wid}: no explicit, self-consistent burn-in disposition")
+            continue
+        ft, vb, fr = w.get("first_terminal"), w.get("valid_before"), w.get("frontier")
+        if not _int(fr):
+            probs.append(f"{wid}: no evidence frontier")
+            continue
+        if (ft is None) != (vb is None) or (ft is not None and (not isinstance(ft, dict) or ft.get("frame") != vb)):
+            probs.append(f"{wid}: valid_before is not its evidenced first terminal boundary's frame")
+            continue
+        if vb is not None and (not _int(vb) or vb > fr):
+            probs.append(f"{wid}: its first terminal boundary lies past its evidence's frontier")
+        k = w.get("attempt")
+        if not _int(k) or not 0 <= k <= maxr:
+            probs.append(f"{wid}: attempt {k!r} is not a registered attempt (0..{maxr})")
+            continue
+        why = disposition_support(b["disposition"], k, vb, fr, bi, maxr, w.get("prior_attempts"))
+        if why:
+            probs.append(f"{wid}: its disposition is not supported: {why}")
+        av = w.get("available_sha256") or {}
+        if not isinstance(av, dict) or not all(str(f).isdigit() and _sha(x) for f, x in av.items()):
+            probs.append(f"{wid}: malformed available snapshots")
+            continue
+        avf, ex = {int(f) for f in av}, by.get(wid, {})
+        if avf & set(ex):
+            probs.append(f"{wid}: frames both excluded and available ({sorted(avf & set(ex))[:3]})")
+        if not b["decided"]:
+            if avf:
+                probs.append(f"{wid}: an unsettled attempt ({b['disposition']}) with available snapshots")
+            if any(s["status"] != "pending" for s in ex.values()):
+                probs.append(f"{wid}: an unsettled attempt's exclusions are not all pending (nothing about it is decided)")
+            continue
+        rf = (w.get("refill") or {}).get("frame") if isinstance(w.get("refill"), dict) else None
+        for f, s in sorted(ex.items()):
+            if s["status"] == "biological" and (vb is None or f < vb or s.get("valid_before") != vb):
+                probs.append(f"{wid}:{f}: a biological exclusion without its world's evidenced first terminal at or "
+                             "before it")
+            elif vb is not None and f >= vb and s["status"] != "biological":
+                probs.append(f"{wid}:{f}: at or after the evidenced first terminal, but {s['status']}")
+        for f in sorted(avf):
+            if (vb is not None and f >= vb) or (rf is not None and f >= rf) or (f != 1 and f > fr):
+                probs.append(f"{wid}:{f}: available at or after its first terminal / a refill, or past its frontier")
+    return probs
+
+
+def mask_problems(g, m):
+    """Why a mask does not describe this graph consistently (Codex #77 r1 P2-5) -> [problem]: its schema, graph
+    digest and count, registry (the graph's, if recorded), every snapshot entry well-formed (a graph world, its
+    frame its time's, a cause, its snapshot uuid), its evidence consistent (mask_evidence_problems), and the edge
+    exclusions, totals and family x role counts exactly the ones its snapshots give (recomputed: no missing,
+    extra, duplicate or out-of-range index)."""
+    if m.get("schema") != MASK_SCHEMA:
+        return [f"mask schema {m.get('schema')!r}, expected {MASK_SCHEMA}"]
+    probs = list(mask_evidence_problems(m))
+    mg = m.get("graph") or {}
+    if (mg.get("edges_sha256"), mg.get("edges")) != (g["edges_sha256"], len(g["edges"])):
+        return ["the mask was made for another graph (its edges_sha256 or edge count differs)"]
+    gr = g.get("registry")
+    if gr is not None and gr.get("namespace") != (m.get("registry") or {}).get("namespace"):
+        probs.append("the mask binds another registry than the graph's (namespace)")
+    gw = {w["id"] for w in g["worlds"]}
+    snaps = m.get("snapshots")
+    if not isinstance(snaps, dict):
+        return probs + ["no snapshots"]
+    for key, s in snaps.items():
+        if not (isinstance(s, dict) and s.get("world") in gw and _int(s.get("time")) and s["time"] in TIMES
+                and s.get("frame") == frame_of(s["time"]) and key == f"{s['world']}:{s['frame']}"
+                and s.get("status") in EXCLUSION and s.get("snapshot") == snapshot_uuid(s.get("uuid"), s["frame"])):
+            probs.append(f"snapshot {key}: malformed (world, time, frame, cause or snapshot uuid)")
+    if probs:
+        return probs
+    excluded, by = edge_exclusions(g, snaps)
+    n, ne = len(g["edges"]), sum(len(v) for v in excluded.values())
+    if m.get("excluded_edges") != excluded:
+        probs.append("its excluded edges are not the ones its snapshots give (recomputed from the graph)")
+    if m.get("by_family_role") != by:
+        probs.append("its family x role counts are not its snapshots'")
+    if m.get("edges") != {"scheduled": n, "executable": n - ne, **{k: len(v) for k, v in excluded.items()}}:
+        probs.append("its edge totals are not its snapshots'")
+    return probs
+
+
+def executable(g, m, mask_sha256=None):
+    """The executable graph: the immutable graph's edges minus the mask's exclusions, roles, families and
+    horizons unchanged, its meta bound to the source graph and the mask (mask_sha256: its file's bytes). The mask
+    is validated first (mask_problems: its exclusions RECOMPUTED from its snapshots)."""
+    probs = mask_problems(g, m)
+    if probs:
+        raise GraphError("the mask does not describe this graph: " + "; ".join(probs[:5]))
+    out = {i for v in m["excluded_edges"].values() for i in v}
+    meta = {k: v for k, v in g.items() if k not in ("edges", "edges_sha256", "tool_sha256")}
+    meta["executable_of"] = {"edges_sha256": g["edges_sha256"], "edges": len(g["edges"]),
+                             "mask": {"sha256": mask_sha256, "block": m["block"], "registry": m.get("registry"),
+                                      "excluded": {k: len(v) for k, v in m["excluded_edges"].items()}}}
+    meta["edges"] = [e for i, e in enumerate(g["edges"]) if i not in out]
+    return meta
+
+
+def rederive_block(root, archive_root, registry_path):
+    """The worlds block RE-DERIVED from a study root's evidence (worlds.py design-block, read-only) -> (block,
+    registry, its sha256); the registry must be the root's own config/worlds.json (the same bytes)."""
+    import worlds as worldslib                         # (lazy: worlds.py's evidence stack, only for this command)
+    root = os.path.abspath(root)
+    reg, sha = worldslib.load_registry(root, allow_placeholder=True)
+    if rqlib.sha256_file(registry_path) != sha:
+        raise GraphError(f"--registry {registry_path} is not {root}'s registry (other bytes)")
+    blk = worldslib.design_block(root, reg, worldslib.bind_root(root, sha, archive_root, readonly=True))
+    return json.loads(rqlib.canonical(blk).decode("utf-8")), reg, sha
 
 
 # ------------------------------------------------------------------ report
@@ -600,11 +1165,14 @@ def report(g):
         if split[w] != "train":
             return f"{kind}-{split[w]}-world"
         return f"{kind}-snapshot-{holdout[(w, t)]}" if (w, t) in holdout else f"{kind}-train"
+    ex = g.get("executable_of")             # (an executable graph: its attrition is the mask's, not a quota error)
     out = {"schema": "finfolk.redqueen.graphreport/1", "namespace": g["namespace"],
-           "quota_problems": check_quotas(g), "pairs": len(g["edges"]),
+           "quota_problems": [] if ex else check_quotas(g), "pairs": len(g["edges"]),
            "families": dict(Counter(e[2] for e in g["edges"])),
            "roles": {f: dict(Counter(e[3] for e in g["edges"] if e[2] == f)) for f in FAMILIES
                      if f in QUOTAS or any(e[2] == f for e in g["edges"])}}
+    if ex:                                  # (only an executable graph's: a scheduled report keeps its bytes, P3)
+        out["executable_of"] = ex
     # support of held-out populations: references and training opponents among their support pairs
     sup = defaultdict(lambda: [0, 0])
     for q, p, fam, role, _ in g["edges"]:
@@ -655,11 +1223,53 @@ def main(argv=None):
     r = sub.add_parser("report")
     r.add_argument("--graph", required=True)
     r.add_argument("--out")
+    mk = sub.add_parser("mask", help="the availability mask of a graph from a worlds block (read-only on both)")
+    mk.add_argument("--graph", required=True)
+    mk.add_argument("--block", required=True, help="worlds.py design-block's worlds block")
+    mk.add_argument("--registry", required=True, help="the study's registry (config/worlds.json): the block, the graph "
+                                                      "and every world's identity and attempt are bound to its bytes")
+    src = mk.add_mutually_exclusive_group(required=True)
+    src.add_argument("--root", help="the study root: the block is RE-DERIVED from its evidence (worlds.py design-block, "
+                                    "read-only) and must be exactly --block")
+    src.add_argument("--no-rederive", action="store_true",
+                     help="check the block's bindings and consistency only (recorded in the mask: block.rederived false)")
+    mk.add_argument("--archive-root", help="(with --root) the archive root, as worlds.py design-block's")
+    mk.add_argument("--out", required=True)
+    ex = sub.add_parser("executable", help="the graph minus a mask's exclusions (roles unchanged)")
+    ex.add_argument("--graph", required=True)
+    ex.add_argument("--mask", required=True)
+    ex.add_argument("--out", required=True, help="a NEW directory (never the scheduled graph's)")
     a = ap.parse_args(argv)
     try:
+        if a.cmd == "mask":
+            raw = rqlib.read_bytes(a.block)
+            blk = json.loads(raw.decode("utf-8"))
+            rraw = rqlib.read_bytes(a.registry)
+            reg, rsha = json.loads(rraw.decode("utf-8")), rqlib.sha256_bytes(rraw)
+            if a.root:
+                fresh, _, _ = rederive_block(a.root, a.archive_root, a.registry)
+                if fresh != blk:
+                    raise GraphError(f"{a.block} is not {a.root}'s current evidence (re-derived: it differs); make the "
+                                     "block again with worlds.py design-block")
+            m = mask(load(a.graph), blk, reg, rsha, rqlib.sha256_bytes(raw), rederived=bool(a.root))
+            rqlib.write_durable(a.out, rqlib.canonical(m))
+            print(f"{m['edges']['executable']} of {m['edges']['scheduled']} pairs executable; excluded "
+                  f"{ {k: m['edges'][k] for k in EXCLUSION} } -> {a.out}", file=sys.stderr)
+            return 0
+        if a.cmd == "executable":
+            gd = os.path.dirname(os.path.abspath(a.graph))
+            if os.path.realpath(os.path.abspath(a.out)) == os.path.realpath(gd):
+                raise GraphError(f"--out {a.out} is the scheduled graph's own directory: the immutable input is never "
+                                 "overwritten (Codex #77 r1 P2-8)")
+            raw = rqlib.read_bytes(a.mask)
+            meta = write(executable(load(a.graph), json.loads(raw.decode("utf-8")), rqlib.sha256_bytes(raw)), a.out)
+            print(f"{meta['edges']} executable pairs -> {a.out}/graph.jsonl.gz", file=sys.stderr)
+            return 0
         if a.cmd == "build":
             g = build(a.namespace, registry_worlds(a.registry) if a.registry else None, not a.no_train_matchings,
                       a.snapshot_topup, a.ab_topup, a.ab_topup_mode, a.lag_probe)
+            if a.registry:                     # (Codex #77 r1 P1-1: the registry's provenance, for mask's binding)
+                g["registry"] = registry_binding(a.registry)
             probs = check_quotas(g)
             if probs:
                 raise GraphError("; ".join(probs))

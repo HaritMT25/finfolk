@@ -3,7 +3,7 @@
 
     plan.py DESIGN.json --pending --out PLAN.pending.jsonl [--long-manifest LONG.json]
     plan.py DESIGN.json [--against PLAN.pending.jsonl] [--avoid OLD_PLAN.jsonl ...] --out PLAN.jsonl
-            [--long-manifest LONG.json]
+            [--long-manifest LONG.json] [--exclusions MASK.json --reconciliation RECEIPT.json]
 
 A design of schema finfolk.redqueen.design/1 (blocks; below) gives plan/1 rows, as phase A;
 one of schema finfolk.redqueen.design/2 (design v3: an explicit edge list; "Design /2" at the
@@ -20,6 +20,28 @@ end) gives plan/2 rows.
     predator floor (a live arena keeps its prey world's config: a floor would refill predators).
 --avoid: refuse (exit 2) if an engine seed (transplant, reseed) of this plan also occurs in an
     archived plan (this tooling's or tools/invasion's).
+--exclusions (design /2, with --against; Annex H D6 rule 27): graph.py mask's availability mask (its
+    "snapshots": world x frame -> biological / technical / pending, evidence-bound). The mask must
+    describe the REGISTERED intent (Codex #77 r1 P1-2, r2): the design's "availability" binding names the
+    scheduled graph's edges_sha256, the registry's sha256, its burn-in rule (max restarts, burn-in
+    frame: every disposition is checked against it) and, with external
+    (sentinel) references, the registered reference assignment's sha256 (references_sha256, read with
+    --references); the binding is part of EVERY generated row, so --against refuses a substituted one;
+    the mask's own evidence must be consistent (graph.mask_evidence_problems, the validator graph.py and
+    sealing.py share: explicit settled dispositions, valid_before its first terminal and within its
+    frontier, an unsettled attempt all pending, biological exclusions exactly at or after the zero,
+    excluded and available frames disjoint); its graph, registry and block registry the binding's,
+    every design world covered (by uuid) by the mask with the design's uuid, a registered attempt and
+    that attempt's identity, or by a registered reference (whose cells must read the archive bytes the
+    assignment registers); refused otherwise. EVERY registered cell is still generated and checked against the pending plan (seeds,
+    groups and long-subset membership from the registered intent: the surviving long pool is never
+    re-randomized); the cells with an unavailable prey or predator snapshot, matched by SNAPSHOT UUID
+    (an alias display label excludes as its canonical world does, P2-4), are never read and are left
+    out of the written (executable) plan; every snapshot an executable cell reads must hash to the
+    mask's verified archive sha256 for it; and --reconciliation writes the receipt: the pending plan's
+    and the mask's sha256, the binding, the scheduled, executable and excluded counts (by role,
+    primary family, horizon) and every excluded cell with its cause. Without a mask, a missing file
+    stays an error: no cell is ever deleted silently.
 Expansion is deterministic: the same design gives the same bytes (rows sorted by id).
 
 DESIGN.json:
@@ -80,11 +102,15 @@ Design /2 (design v3 §3.5, §4, §4.6, §7.1):
                "log_every": 500, "checkpoint_every": 5000},
   "long": {"fraction": 0.125, "strata": ["family", "prey_world"],    # (STRATA lists the keys)
            "family_priority": ["reference", "cross", ...]},          # (a merged pair's primary family)
-  "edges": "/abs/config/edges.jsonl" | [...]
-}
+  "edges": "/abs/config/edges.jsonl" | [...],
+  "availability": {"graph_edges_sha256": ..., "registry_sha256": ..., "max_restarts": 8,
+                   "burn_in_frame": 5000000}
+}                                            # (the registered binding --exclusions verifies)
 An EDGE (one line): {"edge": "e000001", "family": "within", "role": "training" | "validation" |
 "test" | "support" | "audit" | "diagnostic", "prey": {"world", "time"}, "predators": {"world",
-"time"} | {"source": "random"} | null (the predator-free continuation), and optionally "assay",
+"time"} | {"source": "random"} | {"source": "scripted"} (K fresh scripted Stage A hunters: the H-C
+scripted benchmark; the engine's --predators-from scripted) | null (the predator-free continuation),
+and optionally "assay",
 "k", "prey_policy", "horizon": "short" | "long" (absent: the pre-randomized long subset decides),
 "namespace": "main" | "audit" | ... (an independently seeded re-measurement; an audit edge, its
 controls included, defaults to "audit" and may not use "main"), "support_exception": true (a
@@ -569,8 +595,193 @@ def select_long(units, fraction, strata, ns):
     return chosen, man
 
 
-def expand_v2(design, pending=False):
-    """design /2 -> (rows, warnings, long-subset manifest). See the module doc ("Design /2")."""
+MASK_SCHEMA = "finfolk.redqueen.graphmask/2"
+RECON_SCHEMA = "finfolk.redqueen.reconciliation/1"
+EXCLUSION = ("biological", "technical", "pending")
+
+
+def attempt_uuid(base, k):
+    """worlds.py's (graph.py's, val_block.py's) identity of attempt k of a registry world."""
+    import uuid
+    return base if not k else str(uuid.uuid5(uuid.NAMESPACE_URL, f"finfolk:attempt:{base}:{k}"))
+
+
+def _int(x):
+    return isinstance(x, int) and not isinstance(x, bool)
+
+
+REFS_SCHEMA = "finfolk.redqueen.references/1"
+
+
+def binding_problems(b):
+    """Why a design's "availability" binding is malformed (None: well formed): graph_edges_sha256, registry_sha256,
+    the registry's burn-in rule (max_restarts, burn_in_frame: 0 for none; Codex #77 r3: the dispositions are checked
+    against them) and, when the design reads external (sentinel) references, references_sha256."""
+    if not (isinstance(b, dict) and all(isinstance(b.get(k), str) and len(b[k]) == 64
+                                        for k in ("graph_edges_sha256", "registry_sha256"))
+            and _int(b.get("max_restarts")) and _int(b.get("burn_in_frame")) and b["burn_in_frame"] >= 0
+            and set(b) <= {"graph_edges_sha256", "registry_sha256", "max_restarts", "burn_in_frame", "references_sha256"}
+            and (b.get("references_sha256") is None or (isinstance(b["references_sha256"], str)
+                                                         and len(b["references_sha256"]) == 64))):
+        return ("the design registers no well-formed availability binding (availability: graph_edges_sha256, "
+                "registry_sha256, max_restarts, burn_in_frame[, references_sha256])")
+    return None
+
+
+def references_index(refs_raw, b):
+    """The registered reference assignment (sealing.py's references/1; Codex #77 r2 P2-3) bound by the design's
+    binding (its bytes' sha256 = references_sha256) -> {snapshot uuid: its archive sha256} of every registered
+    reference snapshot, and the set of their uuids (design worlds the main mask does not cover)."""
+    if b.get("references_sha256") is None:
+        if refs_raw is not None:
+            raise DesignError("--references given, but the design's availability binding registers none")
+        return {}, set()
+    if refs_raw is None:
+        raise DesignError("the design's availability binding registers references: give --references (references/1)")
+    if rqlib.sha256_bytes(refs_raw) != b["references_sha256"]:
+        raise DesignError("--references is not the registered reference assignment (references_sha256)")
+    refs = json.loads(refs_raw.decode("utf-8"))
+    if refs.get("schema") != REFS_SCHEMA or not isinstance(refs.get("references"), dict):
+        raise DesignError(f"--references: not a reference assignment ({REFS_SCHEMA})")
+    snaps, uuids = {}, set()
+    for slot, e in sorted(refs["references"].items()):
+        if not (isinstance(e, dict) and isinstance(e.get("uuid"), str) and _int(e.get("frame"))
+                and isinstance(e.get("sha256"), str) and len(e["sha256"]) == 64):
+            raise DesignError(f"--references {slot}: needs its uuid, frame and archive sha256")
+        snaps[snapshot_uuid(e["uuid"], e["frame"])] = e["sha256"]
+        uuids.add(e["uuid"])
+    return snaps, uuids
+
+
+def mask_binding_problems(design, m, ref_uuids=frozenset()):
+    """Why a mask does not describe THIS design's registered intent (Codex #77 r1 P1-2, r2 P1-1 / P1-2 / P2-3) ->
+    [problem] (see the module doc, --exclusions): the binding well formed (and, through the generated rows, the
+    pending plan's: --against), the mask's own evidence consistent (graph.mask_evidence_problems, the validator
+    graph.py and sealing.py share), the mask's graph / registry / block the binding's, every design world covered
+    by the mask or a registered reference (ref_uuids), uuids, registered attempts and their identities."""
+    import graph as graphlib                   # (the shared mask validator)
+    if m.get("schema") != MASK_SCHEMA or not isinstance(m.get("snapshots"), dict) or not isinstance(m.get("worlds"), dict):
+        return [f"not an availability mask ({MASK_SCHEMA})"]
+    b = design.get("availability")
+    why = binding_problems(b)
+    if why:
+        return [why + ": a mask cannot be checked against its intent"]
+    probs = list(graphlib.mask_evidence_problems(m))
+    if (m.get("graph") or {}).get("edges_sha256") != b["graph_edges_sha256"]:
+        probs.append("the mask was made for another graph than the registered one (edges_sha256)")
+    reg, blk = m.get("registry") or {}, m.get("block") or {}
+    if reg.get("sha256") != b["registry_sha256"] or blk.get("registry_sha256") != b["registry_sha256"]:
+        probs.append("the mask (or its worlds block) binds another registry than the registered one")
+    if reg.get("max_restarts") != b["max_restarts"]:
+        probs.append(f"the mask's registry allows {reg.get('max_restarts')} restarts, the design {b['max_restarts']}")
+    if reg.get("burn_in_frame") != b["burn_in_frame"]:
+        probs.append(f"the mask's registry burn-in frame {reg.get('burn_in_frame')} is not the design's {b['burn_in_frame']}")
+    dw, mw = design.get("worlds") or {}, m["worlds"]
+    covered = set()
+    for wn, w in sorted(mw.items()):
+        if wn not in dw:
+            probs.append(f"the mask's world {wn} is not a design world (another registry)")
+            continue
+        if w.get("uuid") != dw[wn].get("uuid"):
+            probs.append(f"{wn}: the mask's uuid is not the design's")
+        k = w.get("attempt")
+        if not _int(k) or not 0 <= k <= b["max_restarts"]:
+            probs.append(f"{wn}: attempt {k!r} is not a registered attempt (0..{b['max_restarts']})")
+        elif w.get("attempt_uuid") != attempt_uuid(w.get("uuid"), k):
+            probs.append(f"{wn}: its attempt identity is not attempt {k}'s")
+        covered.add(w.get("uuid"))
+    if covered & set(ref_uuids):
+        probs.append("a registered reference's uuid is also a main-study world of the mask")
+    miss = sorted(wn for wn, w in dw.items() if w.get("uuid") not in covered and w.get("uuid") not in ref_uuids)
+    if miss:
+        probs.append(f"design worlds neither the mask nor the registered references cover (by uuid): {miss[:5]}")
+    return probs
+
+
+def mask_index(m, ref_snaps=None):
+    """A (bound) mask -> ({snapshot uuid: its exclusion}, {snapshot uuid: the verified archive sha256 of an
+    available snapshot}, the registered references' snapshots included: ref_snaps, references_index's)."""
+    out = {s["snapshot"]: s for s in m["snapshots"].values()}
+    avail = {snapshot_uuid(w["uuid"], int(f)): sha for w in m["worlds"].values()
+             for f, sha in (w.get("available_sha256") or {}).items()}
+    avail.update(ref_snaps or {})
+    return out, avail
+
+
+def exclusion_of(row, snaps):
+    """(status, endpoint, world, frame, why) of a row whose prey or predator snapshot a mask makes unavailable
+    (snaps: {snapshot uuid: {"status", "why"}}, mask_index's; its endpoints' first of biological, technical,
+    pending), else None. Matched by the CANONICAL snapshot identity, never the display label (Codex #77 r1 P2-4:
+    an alias's rows are excluded as its world's)."""
+    best = None
+    for role in ("prey", "predators"):
+        x = row.get(role)
+        if not (isinstance(x, dict) and x.get("world") is not None):
+            continue                          # (a random / scripted source, or the predator-free control)
+        s = snaps.get(x.get("snapshot"))
+        if s and (best is None or EXCLUSION.index(s["status"]) < EXCLUSION.index(best[0])):
+            best = (s["status"], role, x["world"], x["frame"], s.get("why"))
+    return best
+
+
+def available_problems(rows, excluded, avail):
+    """Every snapshot an EXECUTABLE row reads must be one the mask verified, with the bytes it verified (its
+    archive sha256) -> [problem]."""
+    probs = []
+    for r in rows:
+        if r["id"] in excluded:
+            continue
+        for role in ("prey", "predators"):
+            x = r.get(role)
+            if not (isinstance(x, dict) and x.get("world") is not None):
+                continue
+            want = avail.get(x.get("snapshot"))
+            if want is None:
+                probs.append(f"{r['id']}: its {role} snapshot {x['world']}:{x['frame']} is neither available nor "
+                             "excluded in the mask (unsupported)")
+            elif x.get("sha256") != want:
+                probs.append(f"{r['id']}: its {role} snapshot {x['world']}:{x['frame']} does not hash to the mask's "
+                             "verified archive object")
+    return probs
+
+
+def reconciliation(rows, excluded, pending_path, pending_sha, mask_path, mask_raw, m, plan_sha, design_binding=None):
+    """The reconciliation receipt (Annex H D6 rule 27): the scheduled cells (the registered pending plan's,
+    every one), the executable ones (written: exactly those rows, hashes filled) and every excluded cell
+    with its evidence-backed cause; counts by role, primary family and horizon; the design's registered
+    availability binding and the mask's graph, registry, block and every world's attempt identity."""
+    def tally(key):
+        out = {}
+        for r in rows:
+            c = out.setdefault(str(r.get(key)), {"scheduled": 0, "executable": 0, **{k: 0 for k in EXCLUSION}})
+            c["scheduled"] += 1
+            c[excluded[r["id"]][0] if r["id"] in excluded else "executable"] += 1
+        return out
+    n_ex = {k: sum(1 for v in excluded.values() if v[0] == k) for k in EXCLUSION}
+    return {"schema": RECON_SCHEMA,
+            "pending_plan": {"path": os.path.abspath(pending_path), "sha256": pending_sha},
+            "mask": {"path": os.path.abspath(mask_path), "sha256": rqlib.sha256_bytes(mask_raw),
+                     "graph": m.get("graph"), "registry": m.get("registry"), "block": m.get("block"),
+                     "attempts": {w: {"uuid": v.get("uuid"), "attempt": v.get("attempt"),
+                                      "attempt_uuid": v.get("attempt_uuid")} for w, v in sorted(m["worlds"].items())}},
+            "binding": design_binding,
+            "scheduled": len(rows), "executable": len(rows) - len(excluded), "excluded": n_ex,
+            "by_role": tally("role"), "by_primary_family": tally("primary_family"), "by_horizon": tally("horizon"),
+            "rows": [{"id": r["id"], "unit": r["unit"], "role": r["role"], "primary_family": r["primary_family"],
+                      "horizon": r["horizon"], "status": e[0], "endpoint": e[1], "world": e[2], "frame": e[3],
+                      "why": e[4]} for r in rows for e in [excluded.get(r["id"])] if e],
+            "plan_sha256": plan_sha,
+            "rules": "every executable cell is the registered pending cell with its hashes filled (seeds, groups, "
+                     "long-subset membership and every other field unchanged: the surviving long pool is never "
+                     "re-randomized); every other scheduled cell is listed with its cause; nothing else is omitted. "
+                     "A technical exclusion is to be repaired where possible; none is a biological exclusion"}
+
+
+def expand_v2(design, pending=False, exclusions=None, excluded_out=None):
+    """design /2 -> (rows, warnings, long-subset manifest). See the module doc ("Design /2").
+    exclusions (final plans only): a bound mask's exclusions by snapshot uuid (mask_index); the rows it makes
+    unavailable are generated as registered (pending hashes) but never read, and recorded in excluded_out
+    {row id: exclusion_of}."""
     ns = design.get("seed_namespace")
     if not isinstance(ns, str) or not ns:
         raise DesignError("seed_namespace is required")
@@ -636,15 +847,23 @@ def expand_v2(design, pending=False):
         p = e.get("predators")
         if p is None:
             kind, preds, K, ptag = "nopred", None, 0, "none"
-        elif isinstance(p, dict) and p.get("source") == "random":
-            K = e.get("k", s["k"])
-            kind, preds, ptag = "assay", {"source": "random"}, "random"
+        elif isinstance(p, dict) and "source" in p:
+            # (Codex #74 r1 P2-3) a source endpoint is EXACTLY one permitted dict: never mixed with a world or
+            # time (it would fall through to a neural donor and lose its source), never an unknown source
+            if p not in ({"source": "random"}, {"source": "scripted"}):
+                raise DesignError(f"edge {n}: a predator source is exactly {{source: random}} or {{source: scripted}}, "
+                                  f"never mixed with other keys or another source (got {p})")
+            if p["source"] == "scripted" and assay == "live":
+                raise DesignError(f"edge {n}: scripted hunters are fixed Stage A predators: assay frozen or "
+                                  "frozen-newborn, never live (the engine refuses it)")
+            K = e.get("k", s["k"])                    # (scripted: K fresh Stage A hunters, the H-C benchmark)
+            kind, preds, ptag = "assay", {"source": p["source"]}, p["source"]
         elif isinstance(p, dict):
             K = e.get("k", s["k"])
             kind, preds = "assay", ref(p.get("world"), p.get("time"))
             ptag = f"{preds['world']}.{preds['time']}"
         else:
-            raise DesignError(f"edge {n}: predators must be {{world, time}}, {{source: random}} or null")
+            raise DesignError(f"edge {n}: predators must be {{world, time}}, {{source: random | scripted}} or null")
         if kind == "assay" and (not isinstance(K, int) or K < 1):
             raise DesignError(f"edge {n}: k must be >= 1")
         hz = e.get("horizon")
@@ -709,8 +928,8 @@ def expand_v2(design, pending=False):
             pk = f"{c['space']}|{c['prey']['snapshot']}|r{r:02d}"
             if c["kind"] == "nopred":
                 qk = f"{pk}|none"
-            elif c["predators"].get("source") == "random":
-                qk = f"{c['space']}|random-k{c['k']}|r{r:02d}"
+            elif c["predators"].get("source") in ("random", "scripted"):
+                qk = f"{c['space']}|{c['predators']['source']}-k{c['k']}|r{r:02d}"
             else:
                 qk = f"{c['space']}|{c['predators']['snapshot']}|r{r:02d}"
             common = c["policy"] == "common"
@@ -734,14 +953,25 @@ def expand_v2(design, pending=False):
                 "groups": groups,
                 "expected": {"checkpoint_steps": list(range(s["checkpoint_every"],
                                                             (s["long_steps"] if is_long else s["short_steps"]) + 1,
-                                                            s["checkpoint_every"]))}})
+                                                            s["checkpoint_every"]))},
+                # (Codex #77 r2 P1-1: the registered availability binding is part of every registered row, so
+                #  --against compares it: a substituted registry / graph / restart allowance is refused)
+                **({"availability": design["availability"]} if design.get("availability") is not None else {})})
     assign_seeds(rows, ns, SEED_KINDS_V2, reject_collisions=True)
     for row in rows:
         for role in ("prey", "predators", "template", "ages"):
             x = row.get(role)
             if isinstance(x, dict) and x.get("path"):
                 x["sha256"] = rqlib.SHA_PENDING
-    warnings = [] if pending else fill_hashes(rows)
+    excluded = {} if excluded_out is None else excluded_out
+    if exclusions is not None:
+        if pending:
+            raise DesignError("exclusions apply to a final plan, never to the pending (registered) one")
+        for row in rows:                    # (exclusions: mask_index's, by snapshot uuid: aliases included)
+            e = exclusion_of(row, exclusions)
+            if e:
+                excluded[row["id"]] = e
+    warnings = [] if pending else fill_hashes([r for r in rows if r["id"] not in excluded])
     long_man["design"] = design.get("name", "")
     return rows, warnings, long_man
 
@@ -759,14 +989,42 @@ def main(argv=None):
                     help="(design /2) another plan (an audit's, production's) checked jointly: no seed value "
                          "shared by two different groups, no group with two seeds (repeatable: the generated "
                          "rows and every --joint plan form ONE seed universe, checked once)")
+    ap.add_argument("--exclusions", metavar="MASK.json",
+                    help="(design /2, with --against and --reconciliation) graph.py mask's availability mask: the "
+                         "registered cells it makes unavailable are left out of the executable plan, with a receipt")
+    ap.add_argument("--reconciliation", metavar="OUT.json", help="the reconciliation receipt (with --exclusions)")
+    ap.add_argument("--references", metavar="REFS.json",
+                    help="(with --exclusions) the registered reference assignment (references/1) the design's binding "
+                         "names (references_sha256): its sentinel snapshots and their archive sha256")
     a = ap.parse_args(argv)
     if a.pending and a.against:
         ap.error("--pending and --against exclude each other")
-    long_man = None
+    if (a.exclusions is None) != (a.reconciliation is None) or (a.exclusions and not a.against):
+        ap.error("--exclusions needs --against and --reconciliation (and --reconciliation needs --exclusions)")
+    long_man, excluded, mask_raw, m, snaps, avail = None, {}, None, None, None, None
     try:
         design = json.loads(rqlib.read_text(a.design))
+        if a.exclusions:
+            mask_raw = rqlib.read_bytes(a.exclusions)
+            m = json.loads(mask_raw.decode("utf-8"))
+            if design.get("schema") != DESIGN_SCHEMA_V2:
+                raise DesignError("--exclusions needs a design /2")
+            why = binding_problems(design.get("availability"))
+            if why:
+                raise DesignError(why)
+            ref_snaps, ref_uuids = references_index(rqlib.read_bytes(a.references) if a.references else None,
+                                                    design["availability"])
+            probs = mask_binding_problems(design, m, ref_uuids)   # (Codex #77 r1 P1-2, r2: BEFORE any exclusion)
+            if probs:
+                raise DesignError(f"{a.exclusions} does not describe the registered intent: " + "; ".join(probs[:5]))
+            snaps, avail = mask_index(m, ref_snaps)
         if design.get("schema") == DESIGN_SCHEMA_V2:
-            rows, warnings, long_man = expand_v2(design, pending=a.pending)
+            rows, warnings, long_man = expand_v2(design, pending=a.pending, exclusions=snaps, excluded_out=excluded)
+            if avail is not None:
+                probs = available_problems(rows, excluded, avail)
+                if probs:
+                    raise DesignError(f"{len(probs)} executable cells read snapshots the mask does not verify: "
+                                      + "; ".join(probs[:5]))
         else:
             rows, warnings = expand(design, pending=a.pending)
         if a.joint:           # ONE seed universe: the generated rows and every --joint plan together
@@ -782,14 +1040,17 @@ def main(argv=None):
     for w in warnings:
         print(f"warning: {w}", file=sys.stderr)
     if a.against:
-        reg = [json.loads(ln) for ln in rqlib.read_text(a.against).split("\n") if ln.strip()]
-        probs = pending_problems(rows, reg)
+        reg_raw = rqlib.read_bytes(a.against)
+        reg = [json.loads(ln) for ln in reg_raw.decode("utf-8").split("\n") if ln.strip()]
+        probs = pending_problems(rows, reg)        # (EVERY scheduled cell, the excluded ones included)
         if probs:
             print(f"not the registered pending plan {a.against}:", file=sys.stderr)
             for p in probs:
                 print(f"  {p}", file=sys.stderr)
             return 2
-        print(f"the registered pending plan {a.against} with its {len(rows)} cells' hashes filled in", file=sys.stderr)
+        print(f"the registered pending plan {a.against} with its {len(rows) - len(excluded)} executable cells' "
+              f"hashes filled in" + (f" ({len(excluded)} excluded by {a.exclusions})" if a.exclusions else ""),
+              file=sys.stderr)
     if a.avoid:
         old = set()
         for p in a.avoid:
@@ -799,7 +1060,12 @@ def main(argv=None):
             print(f"{len(hit)} engine seed(s) also used by {a.avoid}: {hit[:10]}", file=sys.stderr)
             return 2
         print(f"engine seeds checked against {len(a.avoid)} archived plan(s): no overlap", file=sys.stderr)
-    sha = write_plan(rows, a.out)
+    sha = write_plan([r for r in rows if r["id"] not in excluded], a.out)
+    if a.exclusions:
+        rqlib.write_durable(a.reconciliation, rqlib.canonical(reconciliation(
+            rows, excluded, a.against, rqlib.sha256_bytes(reg_raw), a.exclusions, mask_raw, m, sha,
+            design.get("availability"))))
+        rows = [r for r in rows if r["id"] not in excluded]
     if a.long_manifest and long_man is not None:      # (only for a plan that passed every check)
         rqlib.write_durable(a.long_manifest, rqlib.canonical(dict(long_man, plan_sha256=sha, plan=os.path.abspath(a.out))))
     kinds = {}

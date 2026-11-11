@@ -581,9 +581,32 @@ def class_accuracy(D, data, m1, m0):
     return out
 
 
+MIN_TEST_ROOTS = 2                  # (Annex H D6: the crossed bound needs at least two contributing test roots)
+
+
+def unavailable(fit, val, test, test_world, val_world):
+    """(why, test roots): why the selection-and-prediction procedure is UNDEFINED on a (masked) graph's sets (Codex
+    #77 r1 P2-6; None: defined): no fitting pairs, no validation targets (nothing selects), or fewer than
+    MIN_TEST_ROOTS contributing test roots (test worlds; none: the bootstrap would have no source)."""
+    roots = int(len(np.unique(test_world))) if len(test) else 0
+    if not len(fit):
+        return "no fitting pairs (every one excluded by the mask)", roots
+    if not len(val) or not len(np.unique(val_world)):
+        return "no validation targets under the mask: the selection is undefined", roots
+    if roots < MIN_TEST_ROOTS:
+        return (f"{roots} contributing test root(s) under the mask: the crossed bound needs at least "
+                f"{MIN_TEST_ROOTS}"), roots
+    return None, roots
+
+
 def procedure(D, data, option, ranks, lambdas, iters, seed, ab_cap=None, fitter="minimal"):
-    """The registered selection and prediction procedure on one dataset for one fitting option."""
+    """The registered selection and prediction procedure on one dataset for one fitting option (UNAVAILABLE, with
+    its reason and no success, when its sets cannot support it: unavailable())."""
     idx = D.fit[option]
+    why, roots = unavailable(idx, D.val_idx, D.test_idx, D.test_world, D.val_world)
+    if why:
+        return {"available": False, "reason": why, "fitter": fitter, "fit_pairs": int(len(idx)),
+                "validation_targets": int(len(D.val_idx)), "test_targets": int(len(D.test_idx)), "test_roots": roots}
     own_layer = option == "b"
     cands = [(0, 0.0)] + [(r, lam) for r in range(1, ranks + 1) for lam in lambdas]
     out = {"candidates": [], "fitter": fitter}
@@ -610,7 +633,8 @@ def procedure(D, data, option, ranks, lambdas, iters, seed, ab_cap=None, fitter=
     diff = lpd(zt, predict(D, m1, D.test_idx), s21) - lpd(zt, predict(D, m0, D.test_idx), s20)
     mean, lb, per = crossed_lb(diff, D.test_world, D.test_qworld, D.test_pworld, np.random.default_rng(seed + 7))
     zs = data["z"][D.stest_idx]
-    sdiff = lpd(zs, predict(D, m1, D.stest_idx), s21) - lpd(zs, predict(D, m0, D.stest_idx), s20)
+    sdiff = (lpd(zs, predict(D, m1, D.stest_idx), s21) - lpd(zs, predict(D, m0, D.stest_idx), s20)
+             if len(D.stest_idx) else None)
     if sel[0] > 0:
         trn = D.fit[option]
         qn = np.unique(D.qi[trn])
@@ -620,7 +644,8 @@ def procedure(D, data, option, ranks, lambdas, iters, seed, ab_cap=None, fitter=
         align = None
     out.update(selected={"rank": sel[0], "lambda": sel[1]}, test_improvement=mean, test_lb=lb,
                per_test_world=per, success=bool(sel[0] > 0 and lb > 0),
-               snapshot_test_improvement=float(sdiff.mean()), alignment_u1_b=align,
+               snapshot_test_improvement=float(sdiff.mean()) if sdiff is not None else None, alignment_u1_b=align,
+               available=True, test_roots=roots,
                fit_pairs=int(len(idx)), classes=class_accuracy(D, data, m1, m0), ab_cap=ab_cap)
     return out
 
@@ -635,6 +660,9 @@ def forward_procedure(D, data, ranks, lambdas, iters, seed, ab_cap=None, fitter=
     cands = [(0, 0.0)] + [(r, lam) for r in range(1, ranks + 1) for lam in lambdas]
     out = {"procedure": "forward", "candidates": [], "fitter": fitter, "fit_pairs": int(len(idx)),
            "val_pairs": int(len(F["val"])), "test_pairs": {k: int(len(v)) for k, v in F["tests"].items()}}
+    if not len(idx) or not len(F["val"]):              # (Codex #77 r1 P2-6: nothing to fit or select under the mask)
+        return dict(out, available=False, reason="no fitting pairs" if not len(idx) else
+                    "no validation targets under the mask: the selection is undefined")
     best, models = None, {}
     for r, lam in cands:
         m = any_fit(fitter, D, idx, data, r, lam, False, iters, seed, ab_cap=ab_cap)
@@ -658,6 +686,10 @@ def forward_procedure(D, data, ranks, lambdas, iters, seed, ab_cap=None, fitter=
         qw, pw = D.qw[D.qi[t]], D.pw[D.pj[t]]
         tw = np.where((qw >= 0) & (D.wsplit[np.maximum(qw, 0)] == ("test" if name == "intersection" else "train")),
                       qw, pw)
+        if len(np.unique(tw)) < MIN_TEST_ROOTS:         # (Codex #77 r1 P2-6: the D6 minimum, never a one-root bound)
+            out[name] = {"available": False, "targets": int(len(t)), "test_roots": int(len(np.unique(tw))),
+                         "reason": f"fewer than {MIN_TEST_ROOTS} contributing test roots"}
+            continue
         mean, lb, per = crossed_lb(diff, tw, qw, pw, np.random.default_rng(seed + 11 + len(name)))
         out[name] = {"available": True, "test_improvement": mean, "test_lb": lb, "per_world": per,
                      "success": bool(sel[0] > 0 and lb > 0), "targets": int(len(t))}

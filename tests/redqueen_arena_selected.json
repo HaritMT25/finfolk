@@ -1,0 +1,74 @@
+{
+ "schema": "finfolk.redqueen.arena/1",
+ "status": "selected",
+ "common": {
+  "population": 600,
+  "min-pop": 0,
+  "predator-min-pop": 0,
+  "max-pop": 600,
+  "food-patches": 0,
+  "target-food": 2000,
+  "food-spawn": 12,
+  "food-amp": 0,
+  "current": 0,
+  "move-cost": 7e-05,
+  "gene-cost": 0,
+  "predator-speed": 110,
+  "predator-perception": 150,
+  "predator-capture-radius": 14,
+  "predator-cooldown": 1.5
+ },
+ "treatments": {
+  "C": {
+   "predators": 6,
+   "predator-economy": true,
+   "predator-brain": true,
+   "predator-max-pop": 20,
+   "predator-max-age": 240,
+   "predator-meal": 25.62,
+   "predator-metabolism": 2,
+   "predator-repro-energy": 60,
+   "predator-newborn-energy": 30,
+   "predator-mutation": 1,
+   "predator-turn-rate": 4,
+   "predator-min-speed": 0
+  },
+  "B": {
+   "predators": 6,
+   "predator-economy": true,
+   "predator-max-pop": 20,
+   "predator-max-age": 240,
+   "predator-meal": 25.62,
+   "predator-metabolism": 2,
+   "predator-repro-energy": 60,
+   "predator-newborn-energy": 30
+  },
+  "A": {
+   "predators": 12
+  }
+ },
+ "provenance": {
+  "selected_utc": "2026-11-08T18:04:32Z",
+  "selected_by": "predator/arena builder, sweep 2 (floor-free, v4's exact environment; ~/finfolk/sweep2/PLAN.md)",
+  "sweep_config": "cd1.5_age240_meal25.62_cap20",
+  "rule": "USER decision 2026-11-08 18:05Z (switch): arena #1 replaces #2 (cd1.5_age480_meal17.08_cap20), whose validation was stopped at ~25-30M and archived in ~/finfolk/validation_arena2. #2: w11 lost its predators to a starvation cascade at 6.885M, w01 fell to 6 predators at 21.9M, and live C margins above the energetic break-even (0.153 captures/pred-s) were only 0.035-0.05. #1: break-even 0.105 [0.100, 0.109], a flat late capture trajectory in sweep 2, 6/6 seeds passed every criterion, twice the predator generation turnover. Recommended by the coordinator and an independent Codex analysis (codex_reviews/2026-11-08_arena_check_server_codex.md). New pilot namespace finfolk-rq-validation-pilot-2026-11-a1.",
+  "sweep2_passers": [
+   "cd1.5_age240_meal25.62_cap20",
+   "cd1.5_age480_meal17.08_cap20",
+   "cd3_age480_meal25.62_cap32"
+  ],
+  "sweep2_decision_json": {
+   "clear": false,
+   "reason": "#1 cd1.5_age240_meal25.62_cap20 and #2 cd1.5_age480_meal17.08_cap20 are not separated by the fixed margins",
+   "winner": null,
+   "passers": [
+    "cd1.5_age240_meal25.62_cap20",
+    "cd1.5_age480_meal17.08_cap20",
+    "cd3_age480_meal25.62_cap32"
+   ]
+  },
+  "evidence": "clean 6/6, C4 5/6, reached 5M 6/6, extinct 0; contemporary C/B median 0.361; vs-F1 C/B median 0.677, largest seed 0.728; minimum prey after 100k 414; minimum predators after 500k 18",
+  "A_count": "A calibrated at 1.5 s cooldown (acal2): 12 scripted predators give 5.62 catches/s vs C 5.39/s for this arena (A/C 1.04); counts of 28 or more wiped out the prey",
+  "sweep1_file": "arena.selected.sweep1.json (sweep 1's provisional primary, cd3_age240_m2_cap40)"
+ }
+}

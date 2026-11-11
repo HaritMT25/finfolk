@@ -173,6 +173,24 @@ struct OceanConfig {
     float morphologyMutation         = 0.025f;   // ± jitter on every shape gene
     float morphologyNovelProbability = 0.050f;   // per shape group: a new founder allele
 
+    // ---- the M2a body-plan preview (src/ocean/body_plan.hpp): DIAGNOSTIC ----
+    // bodyPlanPreviewEnabled: every fish also carries M2's five physical
+    // alleles (src/ocean/physical_genome.hpp: gape, bladder, armour, fat,
+    // fibre; their own salted stream, never the rng) and its body plan
+    // compiled at birth (closed-mesh geometry, moments, fins, expressed
+    // development), in side arrays the page and the harness read. Nothing the
+    // step computes reads them: every trajectory, draw and counter is the one
+    // the preview off gives (the harness's body twins). Needs appearance's
+    // shapes bit (the body is built from the M1 shape genes). Set at init
+    // only (a live change is refused; the same value is a no-op). There is
+    // no hydrodynamics key yet (M2b): readOceanJson refuses
+    // "hydrodynamicsEnabled" unless it is false.
+    // The inheritance knobs apply to offspring constructed from then on (live),
+    // each in [0, 0.25]:
+    bool  bodyPlanPreviewEnabled   = false;
+    float physicalMutation         = 0.025f;   // ± jitter on every physical allele
+    float physicalNovelProbability = 0.050f;   // per physical group: a new founder allele
+
     // ---- glass walls (walls_bigtank design): default OFF ---------------------
     // walls: the four side faces x = 0, W and y = 0, H are glass. Off (the
     // default), x / y wrap as they always did and every result is the one
@@ -298,6 +316,8 @@ inline bool readOceanConfig(const jsonm::Value& o, OceanConfig& c, std::string* 
     c.morphologyNovelProbability = o.floatOr("morphologyNovelProbability", c.morphologyNovelProbability);
     c.sideWallBand     = o.floatOr("sideWallBand", c.sideWallBand);
     c.sideWallTurnRate = o.floatOr("sideWallTurnRate", c.sideWallTurnRate);
+    c.physicalMutation         = o.floatOr("physicalMutation", c.physicalMutation);
+    c.physicalNovelProbability = o.floatOr("physicalNovelProbability", c.physicalNovelProbability);
     using ocean_cfg_detail::readBool;
     return readBool(o, "deepCurrent", c.deepCurrent, err) &&
            readBool(o, "lightEnabled", c.lightEnabled, err) &&
@@ -305,7 +325,19 @@ inline bool readOceanConfig(const jsonm::Value& o, OceanConfig& c, std::string* 
            readBool(o, "sizeDrift", c.sizeDrift, err) &&
            readBool(o, "sizeFight", c.sizeFight, err) &&
            readBool(o, "mouthGate", c.mouthGate, err) &&
-           readBool(o, "walls", c.walls, err);
+           readBool(o, "walls", c.walls, err) &&
+           readBool(o, "bodyPlanPreviewEnabled", c.bodyPlanPreviewEnabled, err);
+}
+
+// True when the body-plan preview's keys hold their defaults (preview off,
+// both knobs bit for bit at .025 / .05): the harness shows its `body`
+// section only otherwise (or while the world built one), so a config without
+// them hashes and prints exactly as before they existed.
+inline bool oceanBodyPlanAtDefaults(const OceanConfig& c) {
+    const OceanConfig d;
+    auto same = [](float a, float b) { return std::memcmp(&a, &b, sizeof a) == 0; };
+    return c.bodyPlanPreviewEnabled == d.bodyPlanPreviewEnabled && same(c.physicalMutation, d.physicalMutation) &&
+           same(c.physicalNovelProbability, d.physicalNovelProbability);
 }
 
 // True when the glass-wall keys hold their defaults (walls off, both side
@@ -378,7 +410,8 @@ inline constexpr const char* kSimConfigBoolKeys[] = {"toroidal", "bodyModel", "t
                                                      "predatorEconomy", "predatorInheritance", "predatorBrain",
                                                      "predatorPrimer", "predatorFrozen", "fastTanh"};
 inline constexpr const char* kOceanBoolKeys[] = {"deepCurrent", "lightEnabled", "depthCostScaled",
-                                                 "sizeDrift", "sizeFight", "mouthGate", "walls"};
+                                                 "sizeDrift", "sizeFight", "mouthGate", "walls",
+                                                 "bodyPlanPreviewEnabled"};
 inline bool isSimConfigBoolKey(const std::string& k) {
     for (const char* i : kSimConfigBoolKeys) if (k == i) return true;
     return false;
@@ -387,6 +420,12 @@ inline bool isOceanBoolKey(const std::string& k) {
     for (const char* i : kOceanBoolKeys) if (k == i) return true;
     return false;
 }
+// The key M2b's hydrodynamics will take: refused by readOceanJson until then.
+inline constexpr const char* kHydrodynamicsKey = "hydrodynamicsEnabled";
+// The body-plan preview's float knobs: readOceanJson types them (a finite
+// JSON number in [0, kPhysicalKnobMax]) before readOceanConfig narrows them.
+inline constexpr double kPhysicalKnobMax = 0.25;
+inline bool isPhysicalKnobKey(const std::string& k) { return k == "physicalMutation" || k == "physicalNovelProbability"; }
 
 // A flat cfg JSON object (null / empty = nothing to change) into both configs:
 // SimConfig keys through the checkpoint reader, Ocean keys through
@@ -419,6 +458,24 @@ inline bool readOceanJson(const char* json, SimConfig& sc, OceanConfig& oc, std:
                 err = kv.first + " must be true / false (or 0 / 1)";
                 return false;
             }
+            // M2's body physics does not exist yet (M2b): a request for it is
+            // refused, never silently run as the legacy model. false / 0 is a no-op.
+            if (kv.first == kHydrodynamicsKey &&
+                !((v.type == T::Bool && !v.b) || (v.type == T::Number && v.num == 0.0))) {
+                err = std::string(kHydrodynamicsKey) + " is not available in this engine: body-plan physics is M2b "
+                      "(bodyPlanPreviewEnabled is M2a's diagnostic preview, which changes no behaviour)";
+                return false;
+            }
+            // The body-plan preview's knobs, typed at every occurrence and before
+            // narrowing: a JSON number, finite, in [0, 0.25] (the reader's floatOr
+            // would keep the default for a string / bool / null / array / object).
+            if (isPhysicalKnobKey(kv.first) && !(v.type == T::Number && v.num >= 0.0 && v.num <= kPhysicalKnobMax)) {
+                char buf[200];
+                if (v.type == T::Number) std::snprintf(buf, sizeof buf, "%s must be a number in [0, 0.25] (got %.17g)", kv.first.c_str(), v.num);
+                else std::snprintf(buf, sizeof buf, "%s must be a number in [0, 0.25] (got a non-number)", kv.first.c_str());
+                err = buf;
+                return false;
+            }
         }
     checkpoint::readConfig(root, sc);
     if (const jsonm::Value* o = root.find("config"))
@@ -445,6 +502,24 @@ inline std::string oceanAppearanceConfigError(const OceanConfig& c) {
         {"patternMutation", c.patternMutation}, {"patternPhaseMutation", c.patternPhaseMutation},
         {"patternNovelProbability", c.patternNovelProbability}, {"morphologyMutation", c.morphologyMutation},
         {"morphologyNovelProbability", c.morphologyNovelProbability},
+    };
+    for (const auto& e : k)
+        if (!(e.v >= 0.0f && e.v <= 0.25f)) {
+            char buf[160];
+            std::snprintf(buf, sizeof buf, "%s must be in [0, 0.25] (got %g)", e.name, (double)e.v);
+            return buf;
+        }
+    return "";
+}
+
+// The body-plan preview's keys (diagnostic; body_plan.hpp): the preview needs
+// appearance's shapes bit (its body is built from the M1 shape genes); each
+// physical inheritance knob in [0, 0.25] (NaN fails).
+inline std::string oceanBodyPlanConfigError(const OceanConfig& c) {
+    if (c.bodyPlanPreviewEnabled && !(c.appearance >= 0 && (c.appearance & 2)))
+        return "bodyPlanPreviewEnabled needs appearance's body-shape bit (appearance 2 or 3): the body plan is built from the shape genes";
+    const struct { const char* name; float v; } k[] = {
+        {"physicalMutation", c.physicalMutation}, {"physicalNovelProbability", c.physicalNovelProbability},
     };
     for (const auto& e : k)
         if (!(e.v >= 0.0f && e.v <= 0.25f)) {
@@ -514,6 +589,7 @@ inline std::string oceanConfigError(const OceanConfig& c) {
     if (c.steerFrame != 0 && c.steerFrame != 1) return "steerFrame must be 0 or 1";
     if (c.labelFrame != 0 && c.labelFrame != 1) return "labelFrame must be 0 or 1";
     if (const std::string a = oceanAppearanceConfigError(c); !a.empty()) return a;
+    if (const std::string b = oceanBodyPlanConfigError(c); !b.empty()) return b;
     return "";
 }
 
@@ -547,6 +623,9 @@ inline std::string oceanRestartOnlyError(const std::string& key, double value, c
         if (key == k) return key + " is set by oc_init (restart to change it)";
     if (key == "appearance" && !(value == (double)now.appearance))
         return "appearance is set by oc_init (restart to change it)";
+    // the body-plan preview (its side arrays are built with the world), as appearance
+    if (key == "bodyPlanPreviewEnabled" && !(value == (now.bodyPlanPreviewEnabled ? 1.0 : 0.0)))
+        return "bodyPlanPreviewEnabled is set by oc_init (restart to change it)";
     return "";
 }
 
