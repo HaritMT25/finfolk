@@ -27,6 +27,13 @@ predator at any sample or horizon, no capture, predator birth or refill in any r
 change of the predator-birth, refill or predation-death counters; and in every cell, no prey
 replenishment (a prey floor's injected founders): at each horizon the living prey are exactly
 the start plus births minus deaths, and no prey outside the initial cohort is a founder.
+
+--scripted (K fresh scripted Stage A hunters, the H-C benchmark: no brain, so no predators.csv). The
+mode is VERIFIED from the inputs, never taken from the flag (Codex #74 r1 P2-4): the arena and every
+horizon checkpoint must be format version 1 with the brain and the economy off and K hunters, and
+there must be no run.predators.csv (a neural metrics file); a neural or economy-enabled input is
+refused. Captures are then the predation-death counter's difference from the arena's (a loaded
+baseline subtracted), the exposure K x h x dt, and no predator birth, refill or death may occur.
 """
 from __future__ import annotations
 
@@ -60,10 +67,27 @@ def _ratio(a, b):
     return a / b if b > 0 else None
 
 
-def score(d, k, steps, horizons, log_every, assay, fork=False):
+def scripted_problems(cp, k, what):
+    """Why a checkpoint is not a scripted (Stage A) arena of K hunters: version 1, brain and economy off."""
+    cfg = cp.get("config") or {}
+    probs = []
+    if int(cp.get("formatVersion", 0)) != ckpt.V1:
+        probs.append(f"{what} is format version {cp.get('formatVersion')} (a scripted arena is version 1: no brains)")
+    if cfg.get("predatorBrain"):
+        probs.append(f"{what} has predatorBrain on (neural predators)")
+    if cfg.get("predatorEconomy"):
+        probs.append(f"{what} has predatorEconomy on (scripted hunters are immortal and fixed)")
+    if int((cp.get("predators") or {}).get("count", -1)) != k:
+        probs.append(f"{what} has {(cp.get('predators') or {}).get('count')} predators, not K = {k}")
+    return probs
+
+
+def score(d, k, steps, horizons, log_every, assay, fork=False, scripted=False):
     """fork: the predator-free continuation (K = 0). Any predator at any sample or horizon, any
     capture, predator birth or refill, or any predation death refuses it (review round 2: a live
-    control could otherwise be refilled by a predator floor and still pass)."""
+    control could otherwise be refilled by a predator floor and still pass). scripted: K fixed,
+    immortal Stage A hunters (no brain: no predators.csv): captures are the predation-death counter's
+    difference (exact), the exposure K x h x dt; K and no predator birth or refill at every horizon."""
     arena = ckpt.load(os.path.join(d, "arena.json"))
     f0 = int(arena["world"]["frame"])
     start_ids = {int(i) for i, a in zip(arena["creatures"]["id"], arena["creatures"]["alive"]) if int(a)}
@@ -72,14 +96,24 @@ def score(d, k, steps, horizons, log_every, assay, fork=False):
     if k_arena != k:
         raise ScoreError(f"the arena has {k_arena} predators, the cell asked for K = {k}")
     base = arena["counters"]
-    with open(os.path.join(d, "run.predators.csv")) as f:
-        prow = read_predators_csv(f.read())
-    steps_seen = [int(r["step"]) for r in prow]
-    want = [f0 + m * log_every for m in range(1, steps // log_every + 1)]
-    if steps_seen != want:
-        raise ScoreError(f"predators.csv rows at {steps_seen[:3]}..., expected every {log_every} from {f0 + log_every} "
-                         f"to {f0 + steps}")
-    frozen = assay in FROZEN
+    if scripted:
+        if fork or k < 1:
+            raise ScoreError("a scripted assay has K >= 1 hunters and is not a fork")
+        probs = scripted_problems(arena, k, "arena.json")
+        if os.path.exists(os.path.join(d, "run.predators.csv")):
+            probs.append("run.predators.csv exists (a neural metrics file: not a scripted assay)")
+        if probs:
+            raise ScoreError("not a scripted (Stage A) assay: " + "; ".join(probs))
+        prow = []                                   # (no predator readout: the counters are the evidence)
+    else:
+        with open(os.path.join(d, "run.predators.csv")) as f:
+            prow = read_predators_csv(f.read())
+        steps_seen = [int(r["step"]) for r in prow]
+        want = [f0 + m * log_every for m in range(1, steps // log_every + 1)]
+        if steps_seen != want:
+            raise ScoreError(f"predators.csv rows at {steps_seen[:3]}..., expected every {log_every} from "
+                             f"{f0 + log_every} to {f0 + steps}")
+    frozen = assay in FROZEN or scripted
     if fork:
         if k != 0:
             raise ScoreError(f"a predator-free fork with K = {k}")
@@ -88,7 +122,7 @@ def score(d, k, steps, horizons, log_every, assay, fork=False):
                    if int(r[c]) != 0}
             if bad:
                 raise ScoreError(f"the predator-free fork has predators at step {r['step']}: {bad}")
-    if frozen:
+    if frozen and not scripted:
         for r in prow:
             if int(r["predator_pop"]) != k:
                 raise ScoreError(f"predator count {r['predator_pop']} at step {r['step']} in a frozen assay (K = {k})")
@@ -111,10 +145,22 @@ def score(d, k, steps, horizons, log_every, assay, fork=False):
                 raise ScoreError(f"the predator-free fork at frame {f0 + h}: {cp['predators']['count']} predators, "
                                  f"counter changes {moved}")
         rows = [r for r in prow if int(r["step"]) <= f0 + h]
-        captures = sum(int(r["captures_interval"]) for r in rows)
-        pred_s = sum(int(r["predator_pop"]) * log_every * DT for r in rows)
-        pursuit_s = sum(float(r["pursuit_frac"]) * int(r["predator_pop"]) * log_every * DT for r in rows)
-        vbuds = sum(int(r["virtual_buds_interval"]) for r in rows)
+        if scripted:
+            probs = scripted_problems(cp, k, f"end.{f0 + h}.json")
+            if probs:
+                raise ScoreError("not a scripted (Stage A) assay: " + "; ".join(probs))
+            moved = {c: int(cp["counters"].get(c, 0)) - int(base.get(c, 0)) for c in
+                     ("totalPredatorBirths", "totalPredatorReseeds", "totalPredatorDeathsStarvation",
+                      "totalPredatorDeathsAge")}
+            if any(moved.values()):
+                raise ScoreError(f"scripted hunters at frame {f0 + h}: predator counter changes {moved}")
+            captures = int(cp["counters"].get("totalDeathsPredation", 0)) - int(base.get("totalDeathsPredation", 0))
+            pred_s, pursuit_s, vbuds = k * h * DT, None, 0
+        else:
+            captures = sum(int(r["captures_interval"]) for r in rows)
+            pred_s = sum(int(r["predator_pop"]) * log_every * DT for r in rows)
+            pursuit_s = sum(float(r["pursuit_frac"]) * int(r["predator_pop"]) * log_every * DT for r in rows)
+            vbuds = sum(int(r["virtual_buds_interval"]) for r in rows)
         cs = cp["creatures"]
         survivors = sum(1 for i, a in zip(cs["id"], cs["alive"]) if int(a) and int(i) in start_ids)
         ctr = cp["counters"]
@@ -138,7 +184,7 @@ def score(d, k, steps, horizons, log_every, assay, fork=False):
             "exposure": "exact (fixed K)" if frozen else "sampled (count at each log row)",
             "capture_rate": _ratio(captures, pred_s), "virtual_buds": vbuds,
             "virtual_bud_rate": _ratio(vbuds, pred_s), "pursuit_seconds": pursuit_s,
-            "captures_per_pursuit_s": _ratio(captures, pursuit_s),
+            "captures_per_pursuit_s": _ratio(captures, pursuit_s) if pursuit_s is not None else None,
             "survivors": survivors, "survival": _ratio(survivors, n0),
             "prey": int(cs["count"]), "predators": int(cp["predators"]["count"]),
             "births": dc["totalBirths"], "deaths": dc["totalDeaths"],
@@ -147,7 +193,13 @@ def score(d, k, steps, horizons, log_every, assay, fork=False):
         })
     return {"schema": SCHEMA, "f0": f0, "k": k, "assay": assay, "n_start": n0, "dt": DT, "log_every": log_every,
             "steps": steps, "horizons": out,
-            "checks": {"rows": len(prow), "frozen_k_constant": frozen, "predation_deaths_equal_captures": True,
+            "scripted": scripted,
+            "checks": {"rows": None if scripted else len(prow), "frozen_k_constant": frozen,
+                       # (scripted: captures ARE the counter difference, so the equality holds by construction)
+                       "predation_deaths_equal_captures": "by construction (scripted)" if scripted else True,
+                       "scripted_inputs": ("arena and every horizon checkpoint: version 1, brain and economy off, "
+                                           "K hunters; no predators.csv; no predator birth, refill or death")
+                       if scripted else None,
                        "fork_predator_free": fork, "no_prey_replenishment": True}}
 
 
@@ -160,9 +212,11 @@ def main(argv=None):
     ap.add_argument("--log-every", type=int, required=True)
     ap.add_argument("--assay", default="frozen")
     ap.add_argument("--fork", action="store_true", help="the predator-free continuation (K = 0)")
+    ap.add_argument("--scripted", action="store_true", help="K scripted Stage A hunters (no predators.csv)")
     a = ap.parse_args(argv)
     try:
-        res = score(a.dir, a.k, a.steps, [int(x) for x in a.horizons.split(",")], a.log_every, a.assay, a.fork)
+        res = score(a.dir, a.k, a.steps, [int(x) for x in a.horizons.split(",")], a.log_every, a.assay, a.fork,
+                    a.scripted)
     except (ScoreError, ckpt.CheckpointError, OSError, KeyError, ValueError) as e:
         print(f"score.py: {e}", file=sys.stderr)
         return 1

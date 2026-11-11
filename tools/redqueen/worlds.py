@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""worlds.py: register the Red Queen study's 48 evolutionary histories and run them (design v3 §2, §13).
+"""worlds.py: register the Red Queen study's 64 evolutionary histories and run them (design v3 §2, §13;
+Annex H AMENDMENTS D6 / D7).
 
     worlds.py register --arena config/arena.selected.json --namespace NS --out STUDY/config/worlds.json
-                       [--blocks 8] [--per-block C=4,A=1,B=1] [--c-founders 6] [--avoid FILE ...]
+                       [--blocks 8] [--layout 64 | --per-block C=4,A=2,B=2] [--c-founders 6] [--avoid FILE ...]
                        [--burn-in 5000000] [--max-restarts 8]
                        [--total-steps N] [--checkpoint-every N] [--log-every N] [--allow-placeholder]
     worlds.py f1 --root STUDY --binary EVO_BOIDS [--archive-root DIR] [--world ID ...]
@@ -13,11 +14,15 @@
     worlds.py stitch --root STUDY --world ID [--partial]
     worlds.py status --root STUDY
     worlds.py design-block --root STUDY --out worlds_block.json
+    worlds.py ecology --root STUDY --out ecology.json [--horizons F,F,...]
+    worlds.py monitor --root STUDY --out monitor.json [--window 25000] [--step 5000] [--windows-out W.jsonl.gz]
 
 THE REGISTRY (register; deterministic: the same inputs give the same bytes; an existing registry
 is never replaced by other bytes: changed seeds, treatments or schedule need a new study root).
-Eight randomized blocks of four C, one A and one B history (48 worlds; --per-block, up to 4C + 2A + 2B
-per block: the 56 / 64-world allocations of the H-C pilot rule; any count for tests). Within each
+The registered allocation is FIXED (Annex H D7 rule 34): --layout 64, eight randomized blocks of 4C +
+2A + 2B (64 worlds: 32 C, 16 A, 16 B); both A (both B) controls of a block keep A's (B's) definition and
+neither is a technical replicate or another block. The default --per-block C=4,A=1,B=1 (48) and any
+other count remain for tests and older registries only. Within each
 block the treatment order is a seeded permutation (namespace, "block-order", block), so a world's id
 does not reveal its treatment by position. Each world has an id (w01..), a UUID (uuid5 of the
 namespace and id) and a SEED SLOT "b<block>:<treatment>:<k>" (k: its index among its block's
@@ -26,7 +31,17 @@ per block (more if --per-block asks) reserves 1 + --max-restarts seeds, derived 
 "founder", "b<b>", treatment, "k<k>"[, "a<attempt>"]), unique and refused if they occur in any --avoid
 file (integers, or any JSON / JSONL whose keys contain "seed": the archived plans and reservations of
 other streams); a world's founder seed is its slot's first, so a slot keeps its seeds whatever the
-allocation (48, 56 or 64 worlds need no re-registration logic).
+allocation. Every --avoid file is recorded (path, sha256, seed count) in the registry.
+
+THE PRODUCTION REGISTRATION (Annex H D6/D7 checklist item 6; the operator's step, after the builder
+changes): --layout 64 --blocks 8 --c-founders 6 --total-steps 200000000 --checkpoint-every 1000000
+--log-every 5000 --burn-in 5000000 --max-restarts 8 (576 reserved founder / restart seeds) under the
+production namespace (finfolk-rq-production-2026-11-d6d7-v1), with --avoid naming BOTH arenas' pilot
+seed reservations (arena #1's, sha256 fd538f03...; arena #2's, sha256 8293f579...) and every other
+existing plan or reservation of the seed inventory: the validation run's reservations/seeds.json,
+reservations/home_seeds_used.json, reservations/reserved_pilot_seeds.txt and config/seeds.json, and
+validation_arena2's config/seeds.json. One --avoid per file (the option repeats); the registry
+records each file's sha256, and the operator hashes the complete avoidance inventory with it.
 
 THE BURN-IN RULE (USER DECISIONS 2, item 6; registries of seed scheme slot/1, --burn-in frames, 0
 disables). A world (C, A or B) that goes extinct BEFORE the burn-in frame (5M) is not ended: it is
@@ -54,8 +69,10 @@ the fork registry whether a root's current attempt can still be replaced (forks.
 only from a decided attempt and binds each frozen origin to its root's attempt).
 
 ALLOCATION. --per-block takes one allocation (every block) or a ';'-separated list cycled over the
-blocks; --layout 48 | 56 | 64 names the H-C pilot rule's allocations: 48 = 8 x (4C+1A+1B); 56 =
-blocks alternating 4C+2A+1B (odd) and 4C+1A+2B (even): 32C, 12A, 12B; 64 = 8 x (4C+2A+2B).
+blocks; --layout names one: 64 = 8 x (4C+2A+2B), the registered allocation (D7 rule 34). The 48 (8 x
+(4C+1A+1B)) and 56 (4C+2A+1B and 4C+1A+2B alternating) layouts belonged to USER DECISIONS 2 item 5's
+rule of choosing the allocation from an estimate, WITHDRAWN by D7 rule 35 before any estimate existed;
+they remain only so older registries and tests keep their bytes.
 
 THE ARENA (config/arena.selected.json, schema finfolk.redqueen.arena/1: {"status": "selected" |
 "placeholder", "common": {...}, "treatments": {"C": {...}, "A": {...}, "B": {...}}}, engine flag
@@ -165,6 +182,72 @@ replays from its latest verified record through the zero, which stops it again; 
 did not repair them, it fails (exit 1). Such a replay's checkpoints past the zero are not
 published into a finalized archive (not part of the history).
 
+ECOLOGY (ecology; Annex H D6 rules 22-26; READ-ONLY: no lock, nothing written but --out). Every
+attempt of every registered slot, DISCOVERED read-only from the restart ledger, the retained
+(relocated) directories STUDY/restarts/worlds/<id>.a<k> and the current attempt.json (its bytes
+bound), so an interrupted restart never loses a recorded failure; each with its (slot, attempt,
+seed) identity and its own frame-zero origin (time is never concatenated across attempts). An
+attempt's EVIDENCE-BOUND sequence follows evidence.py's rules (the one implementation val_block.py
+shares): the chain is the NEWEST line of descent of its segments (a rollback supersedes a segment
+wholly; each later chain segment must resume its predecessor's acceptance record at its start); each
+chain segment's main-CSV bytes are those its acceptance records cover (re-verified part by part, a
+part that no longer verifies ending the coverage there, the earlier parts kept); only the newest
+segment may extend past its last acceptance, by its own availability-ledger prefix that binds a zero
+and extends the covered bytes (a continuation is never chosen by its length); rows are complete
+records of the header's width, integral counts, on the log_every sequence, the evidence stopping at
+the first bad row with the earlier rows kept (technical censoring at the last verified
+observation); the FIRST sampled zero of either guild ends the observation (later overshoot rows
+never resolve the other guild: a prey-terminal stop stays unresolved for the predators); a predator
+refill above the founders' baseline (predator_reseeds_cum > 0) ends it at the sample before it (a
+protocol-integrity event: no later row establishes natural coexistence; such a history is never in
+Q200). Every other ledger entry is listed as unsupported, with why, and superseded segments are
+listed. Per attempt: each guild's FIRST EVIDENCED SAMPLED ZERO and the sample before it (the
+extinction lies in between; A's predators are structural), a joint event when both guilds' first
+zeros are one sample, the first terminal event, the observation (event; administrative: alive
+through the registered end; ongoing; technical: failed, invalidated, broken evidence, a refill, or a
+done / extinct state its evidence does not support), the burn-in disposition (a zero AT the burn-in
+frame is data, not an early failure) and establishment (established; restarted; exhausted: an
+establishment failure, not censoring; restart pending; unresolved), coexistence THROUGH the burn-in
+frame, integrity events, and the evidence hashes (state, acceptance ledger, each segment's verified
+main-CSV prefix, the tail, the relocation manifest, attempt.json). At each
+horizon (5, 20, 30, 50, 100, 150, 200M within the schedule; the end is primary) and per treatment,
+with the registered slots as the FIXED denominator: known alive, predator extinct (a zero sampled
+at the horizon counts), prey-terminal (prey first, the run stopped: a competing event, later predator
+status unobserved), technical, not yet observed; with complete ascertainment the proportion and its
+exact (Clopper-Pearson) pointwise 95% interval, otherwise the identification bounds [alive / N,
+(alive + unresolved) / N]. Three estimands, separately labelled: the PRIMARY first founder attempt of
+every slot (establishment failures included), the retained attempt, and survival conditional on
+evidenced coexistence THROUGH the burn-in frame (its own denominator: a zero exactly at the burn-in
+frame is excluded here, though data elsewhere). The registered end is always a horizon (a custom
+--horizons keeps it). Also the observed event times, the
+first-terminal-event frequencies, the attempt accounting (early failures / resolved attempts,
+established and exhausted slots, unresolved technical cases) and Q200: the retained C histories
+coexisting through the registered end (>= 24 is H-P/H-Q/H-F/H-T's availability safeguard only).
+
+MONITORING (monitor; Annex H D6 rules 29-30; READ-ONLY). Every C and B world's current attempt over
+its evidence-bound sequence, armed after the burn-in frame: rolling --window (25,000-frame) windows
+every --step (5,000) frames and complete non-overlapping checkpoint_every (1M) summaries, each with
+its predator-seconds (the trapezoid of the sampled predator abundance x 0.016 s per frame), the
+exposure-weighted mean energy (predator_avg_energy), and for C (its lineage logs along the accepted
+chain, through the last accepted frame) the starvation deaths of PROVEN BREEDERS (the parent of at
+least one realized B event before the death, carried across segments), of the others and in total
+per 1,000 predator-seconds, their mean age at death, the lifespan-normalized starvation hazard
+(starvation per predator-second x the registered predator max age), and births minus deaths; every
+window has the captures (the corrected kills_interval) and captures per predator-second, and
+expenditure is explicitly unavailable (not logged); a starved predator without lineage ancestry
+makes the breeder indicator unavailable for its window, and B has no breeder indicator or age at
+death (no individual lineage log; its births and deaths are the main CSV's intervals, a resumed
+segment's first row corrected by its checkpoint's counters). Each 1M summary has the range of the 5k
+births-minus-deaths series; the latest accepted checkpoint's individual-energy lower tail (min,
+p05, p10) is reported; --windows-out writes EVERY rolling window and the full 5k series (gzipped
+JSON lines, bound by sha256 in the document). The windows are a chronological sweep. The document
+binds the tool's and evidence.py's sha256 and each world's attempt.json. Flags: DETERIORATION (breeder starvation > 0.1
+per 1,000 predator-s AND mean energy < 180 in one window; consecutive windows merged into
+episodes) and ACUTE (any sampled predator population <= 15 in C or B after the burn-in; not A,
+whose count is 12). Flags are diagnostics: they are recorded, verified and notified, and never
+trigger rescue, reseeding, treatment, horizon or allocation changes, extra worlds or selective assay
+omission.
+
 F1 (f1, verify-f1). F1 is the first step of an identically seeded founder replay (the same flags,
 --headless 1) by the pinned engine, with the registered configuration, archived as F1.json (its
 record names the engine's sha256). verify-f1 resumes it for checkpoint_every - 1 steps and
@@ -204,6 +287,7 @@ import uuid
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import ckpt  # noqa: E402
+import evidence  # noqa: E402
 import rqlib  # noqa: E402
 import run as runlib  # noqa: E402
 
@@ -591,7 +675,11 @@ def register(arena_path, namespace, blocks=8, per_block=None, avoid_paths=(), sc
             "c_founders": c_founders, "schedule": schedule, "seed_scheme": SEED_SCHEME, "burn_in": burn_in,
             "max_restarts": max_restarts, "reserve_per_block": reserve, "reserved": reserved,
             "layout": layout, "block_allocations": {str(b): allocs[b - 1] for b in range(1, blocks + 1)},
-            "allocation_note": ("blocks are randomized and exchangeable: which blocks take which allocation is "
+            # (the registered 64 layout's note is D7's; any other keeps its earlier note, and so its bytes)
+            "allocation_note": ("Annex H D7 rule 34: the fixed allocation, eight randomized blocks of 4C + 2A + 2B "
+                                "(32 C, 16 A, 16 B); both A and both B controls of a block keep their treatment's "
+                                "definition, neither a technical replicate nor another block" if layout == "64" else
+                                "blocks are randomized and exchangeable: which blocks take which allocation is "
                                 "immaterial (the 56 layout: odd blocks 4C+2A+1B, even blocks 4C+1A+2B)"),
             "arena": {"path": os.path.abspath(arena_path), "sha256": rqlib.sha256_bytes(raw),
                       "status": arena.get("status")},
@@ -1611,12 +1699,14 @@ def good_copy(root, wid, frame, sha, arecs=None):
     return None
 
 
-def verified_records(root, wid, st, treatment, base=0):
+def verified_records(root, wid, st, treatment, base=0, d=None, recs=None):
     """{(segment, frame): acceptance record} of the records whose log parts still verify (each
     segment's parts in order, without a gap), in segments whose start is itself such a record
-    (back to the founder segment)."""
+    (back to the founder segment). d: the attempt's directory (default the world's current one; a
+    retained attempt's for the ecology export); recs: its acceptance records already read."""
+    d = d or wdir(root, wid)
     by_seg = {}
-    for r in accept_records(root, wid):
+    for r in (accept_records(root, wid) if recs is None else recs):
         by_seg.setdefault(r["segment"], []).append(r)
     segs = {s["name"]: s for s in st["segments"]}
     kinds = log_kinds(treatment)
@@ -1628,7 +1718,7 @@ def verified_records(root, wid, st, treatment, base=0):
         for r in sorted(rs, key=lambda x: x["frame"]):
             ok = r["start_frame"] == segs[name]["start_frame"] and all(
                 f in r["logs"] and r["logs"][f]["from"] == ends[f]
-                and verify_delta(os.path.join(wdir(root, wid), name, f), r["logs"][f]) for f, _ in kinds)
+                and verify_delta(os.path.join(d, name, f), r["logs"][f]) for f, _ in kinds)
             if not ok:
                 break
             good[(name, r["frame"])] = r
@@ -2808,26 +2898,885 @@ def stitch(root, wid, reg, partial=False):
     return man
 
 
+# ================================================================== ecology and monitoring (Annex H D6)
+ECOLOGY_SCHEMA = "finfolk.redqueen.ecology/1"
+MONITOR_SCHEMA = "finfolk.redqueen.monitor/1"
+ECO_HORIZONS_M = (5, 20, 30, 50, 100, 150, 200)    # D6 rule 22 (200M primary; the others secondary)
+FRAME_DT = 0.016                                   # seconds per frame (D6 rule 29's exposure)
+MON_WINDOW, MON_STEP = 25_000, 5_000               # D6 rule 29: rolling windows, evaluated every 5k
+MON_BREEDER_RATE, MON_ENERGY, MON_ACUTE = 0.1, 180.0, 15
+SEQ_COLS = ("predator_avg_energy", "predator_reseeds_cum", "predator_births_interval", "predator_deaths_starv",
+            "predator_deaths_age", "kills_interval")
+AT_HORIZON = ("alive", "predator_extinct", "prey_terminal", "technical", "not_yet_observed")
+UNRESOLVED = ("prey_terminal", "technical", "not_yet_observed")
+ATTEMPT_DIR_RE = re.compile(r"^(?P<w>.+)\.a(?P<k>\d+)$")
+
+
+def _read_once(path, n=None):
+    """(bytes, sha256) of a file (its first n bytes), read once; (None, None) when it cannot be read."""
+    try:
+        with open(path, "rb") as f:
+            raw = f.read() if n is None else f.read(n)
+    except OSError:
+        return None, None
+    return raw, rqlib.sha256_bytes(raw)
+
+
+def _jsonl_bytes(raw, path):
+    """read_jsonl's records from bytes already read (a torn tail ignored; a malformed interior line refused)."""
+    out = []
+    if not raw:
+        return out
+    for k, ln in enumerate(raw[: raw.rfind(b"\n") + 1].split(b"\n")[:-1], 1):
+        try:
+            out.append(json.loads(ln.decode("utf-8")))
+        except (ValueError, UnicodeDecodeError):
+            raise WorldsError(f"{path}: line {k} is malformed (not a torn tail)")
+    return out
+
+
+def _covered(path, recs, log):
+    """The bytes of a segment's log its acceptance records cover, read ONCE and re-verified part by part
+    (parts {from, bytes, sha256} contiguous from 0, in frame order) -> (bytes, the last covered record): the
+    verification stops at the first part that no longer verifies, keeping the earlier parts (Codex #75 r1 P2-5)."""
+    recs = sorted(recs, key=lambda r: r["frame"])
+    if not recs:
+        return b"", None
+    raw, _ = _read_once(path, recs[-1]["logs"][log]["bytes"])
+    raw = raw or b""
+    pos, last = 0, None
+    for r in recs:
+        p = r["logs"][log]
+        if p["from"] != pos or len(raw) < p["bytes"] or rqlib.sha256_bytes(raw[p["from"]:p["bytes"]]) != p["sha256"]:
+            break
+        pos, last = p["bytes"], r
+    return raw[:pos], last
+
+
+def _lineage_rows(raw, upto):
+    """[(frame, event, id, parent, age)] of a lineage-log prefix (bytes), through frame `upto` (age None if absent)."""
+    lines = evidence.complete(raw).split(b"\n")[:-1]
+    if not lines:
+        return []
+    hdr = lines[0].decode("ascii", "replace").strip().split(",")
+    ia = hdr.index("age") if "age" in hdr else None
+    out = []
+    for ln in lines[1:]:
+        p = ln.split(b",")
+        try:
+            f, ev, i, par = int(p[0]), p[1].decode("ascii"), int(p[2]), int(p[3])
+            age = float(p[ia]) if ia is not None else None
+        except (IndexError, ValueError, UnicodeDecodeError):
+            return None                                   # (the acceptance validated it: damage)
+        if f > upto:
+            break
+        out.append((f, ev, i, par, age))
+    return out
+
+
+def attempt_sequence(root, wid, d, w, attempt, ledger, log_every, lineage=False, refill_base="founders"):
+    """One attempt's EVIDENCE-BOUND sample sequence under evidence.py's rules (shared with val_block.py; Annex H D6
+    rule 24): the chain is the NEWEST line of descent of the attempt's segments (each chain segment after the
+    first must resume its predecessor's acceptance record at its start); each chain segment's main-CSV bytes are
+    those its acceptance records cover (re-verified part by part; a part that no longer verifies ends the
+    coverage there, the earlier parts kept); the newest chain segment may extend past its last acceptance by the
+    availability-ledger prefix of THAT segment that binds a zero (its bytes hashing to the record and extending
+    the covered bytes; a continuation is never chosen by its length). Rows are validated as evidence.py's, the
+    first absorbing terminal ends the observation, and a refill above the founders' baseline (0; a branch's is
+    unknown here: unchecked) ends it before. Every other ledger entry of the attempt is listed as unsupported,
+    with why. With lineage (C), the chain's lineage events (acceptance-covered, through each segment's cut)."""
+    base = base_frame(w)
+    tr = w["treatment"]
+    st_raw, st_sha = _read_once(os.path.join(d, "state.json")) if d else (None, None)
+    try:
+        st = json.loads(st_raw.decode("utf-8")) if st_raw else {"status": "pending", "segments": []}
+    except (ValueError, UnicodeDecodeError):
+        st = {"status": "unreadable", "segments": []}
+    acc_raw, acc_sha = _read_once(os.path.join(d, "accept.jsonl")) if d else (None, None)
+    recs = _jsonl_bytes(acc_raw, os.path.join(d or "", "accept.jsonl"))
+    by = {}
+    for r in recs:
+        by.setdefault(r["segment"], []).append(r)
+    segs = st.get("segments", [])
+    segmap = {s["name"]: s for s in segs}
+    # (#75 r2 P2-1) the newest segment's line of descent through its RECORDED parent links (resumed_accept)
+    chain, stop = evidence.chain_links([(s["name"], s["start_frame"], (s.get("resumed_accept") or {}).get("segment"))
+                                        for s in segs], base) if segs else ([], None)
+    mine = [e for e in ledger if e.get("world") == wid and int(e.get("attempt", 0) or 0) == attempt]
+    samples, evid, events, accepted, tail_ev = [], [], [], base, None
+    lin_through, lin_open, ckpts = base, lineage, []
+    if stop:
+        chain = []
+    for i, (name, start, upto) in enumerate(chain):
+        s = segmap[name]
+        if i:                                          # (its ancestry: the predecessor's record at its start)
+            prev = chain[i - 1][0]
+            ra = s.get("resumed_accept") or {}
+            rec = next((r for r in by.get(prev, []) if r["frame"] == start), None)
+            if (ra.get("segment"), ra.get("frame")) != (prev, start) or rec is None or ra.get("sha256") != rec["sha256"]:
+                stop = f"{name} does not resume {prev}'s acceptance record at frame {start}"
+                break
+        raw, cov = _covered(os.path.join(d, name, "run.csv"), by.get(name, []), "run.csv")
+        use, newest = raw, i == len(chain) - 1
+        if newest:
+            for e in mine:                             # (this segment's ledger prefix extending the covered bytes)
+                n = e.get("csv_bytes")
+                if e.get("segment") != name or not isinstance(n, int) or n <= len(raw):
+                    continue
+                pre, sha = _read_once(os.path.join(d, name, "run.csv"), n)
+                if pre and len(pre) == n and sha == e.get("csv_sha256") and pre[:len(raw)] == raw and len(pre) > len(use):
+                    use, tail_ev = pre, {"segment": name, "csv_bytes": n, "csv_sha256": sha, "ledger_guild": e.get("guild")}
+        try:
+            if not use and newest:                     # (a newest segment with nothing covered yet: still running)
+                rows, why = [], None
+            else:
+                rows, why = evidence.segment_rows(use, start, log_every, upto, cols=SEQ_COLS)
+        except evidence.EvidenceError as ex:
+            rows, why = [], str(ex)
+        if cov is not None:
+            accepted = max(accepted, min(cov["frame"], upto) if upto is not None else cov["frame"])
+            # (#75 r2 P2-5) the checkpoints on the line of descent: covered, and at or before this segment's cut
+            ckpts += [(r["frame"], r["sha256"]) for r in sorted(by.get(name, []), key=lambda r: r["frame"])
+                      if r["frame"] <= cov["frame"] and (upto is None or r["frame"] <= upto)]
+        evid.append({"segment": name, "start_frame": start, "until": upto, "through": rows[-1][0] if rows else start,
+                     "csv_bytes": len(use), "csv_sha256": rqlib.sha256_bytes(use),
+                     "checkpoint_frame": cov["frame"] if cov else None,
+                     "checkpoint_sha256": cov["sha256"] if cov else None})
+        if lin_open and cov is not None:
+            # (#75 r2 P2-3) the lineage history must be CONTIGUOUS from the base: a segment's lineage covered short
+            # of its cut (or a segment without it) ends the coverage; nothing after a gap is admitted
+            lraw, lcov = _covered(os.path.join(d, name, "run.predlog.csv"), by.get(name, []), "run.predlog.csv")
+            lc = (lcov or {}).get("frame", start)
+            reach = min(lc, upto) if upto is not None else lc
+            lrows = _lineage_rows(lraw, reach)
+            if lrows is None:
+                stop = f"{name}/run.predlog.csv no longer parses"
+                break
+            if start != lin_through:
+                lin_open = False
+            else:
+                events.append((name, start, lrows, reach))
+                lin_through = reach
+                if upto is not None and lc < upto:
+                    lin_open = False
+            evid[-1].update(predlog_bytes=len(lraw), predlog_sha256=rqlib.sha256_bytes(lraw), predlog_through=reach)
+        elif lin_open and not newest:
+            lin_open = False
+        samples += rows
+        if why:
+            stop = f"{name}: {why}"
+            break
+    guilds = tuple(gc for gc in evidence.GUILD_COLS if not (gc[0] == "predators" and tr == "A"))
+    # the refill baseline: the founders' 0 for a founder history; a fork branch's is its frozen origin's counter,
+    # passed by its caller (forks.branch_evidence; Codex #78 r2 P2-4), else unchecked (None)
+    rb = (0 if base == 0 else None) if refill_base == "founders" else refill_base
+    obs = evidence.terminal(samples, guilds, base, refill_base=rb)
+    names = {c[0] for c in chain}
+    unsupported = []
+    for e in mine:
+        g, zf = e.get("guild"), e.get("first_zero_frame")
+        z = (obs["events"].get(g) or {}).get("frame") if g in dict(guilds) else None
+        if e.get("segment") not in names:
+            why = "its segment is not on the newest line of descent (a superseded continuation)"
+        elif z == zf:
+            continue
+        elif obs["first_terminal"] and isinstance(zf, int) and zf > obs["first_terminal"]["frame"]:
+            why = (f"after the first absorbing terminal boundary (frame {obs['first_terminal']['frame']}): it does not "
+                   "resolve the competing outcome")
+        else:
+            why = "not the evidenced first sampled zero of its guild (its prefix does not hash, or it is not first)"
+        unsupported.append({"guild": g, "first_zero_frame": zf, "segment": e.get("segment"), "why": why})
+    used = {e["segment"] for e in evid}
+    return {"state": st, "obs": obs, "samples": obs["samples"], "accepted_through": accepted, "stop": stop,
+            "refill_base": rb,
+            "lineage": events, "lineage_through": lin_through if lineage else None, "checkpoints": ckpts,
+            "evidence": {"state_sha256": st_sha, "accept_bytes": len(acc_raw or b""), "accept_sha256": acc_sha,
+                         "segments": evid, "tail": tail_ev, "superseded_segments": sorted(set(segmap) - used)},
+            "unsupported_ledger": unsupported}
+
+
+def attempt_outcome(seq, w, total, burn_in):
+    """An attempt's ecological record from its evidence-bound sequence (D6 rules 23-25): each guild's first evidenced
+    sampled zero and the sample before it (A's predators are structural), the joint flag and the first terminal
+    event (the first absorbing boundary: later overshoot rows never resolve the other guild), the observation
+    (event; administrative: alive through the registered end; ongoing; technical: failed, invalidated, broken
+    evidence, a refill, or a done / extinct state the evidence does not support), the censor record, the burn-in
+    disposition (a zero AT the burn-in frame is data: not an early failure), coexistence THROUGH the burn-in frame
+    (the establishment-conditional set: evidenced alive at it, no terminal event at or before it), protocol-
+    integrity events (a refill above the founders' baseline: nothing after it establishes natural coexistence)."""
+    base, tr = base_frame(w), w["treatment"]
+    obs = seq["obs"]
+    status = seq["state"].get("status", "pending")
+    events = dict(obs["events"])
+    if tr == "A":
+        events["predators"] = "structural"
+    first, frontier, integrity = obs["first_terminal"], obs["frontier"], []
+    if obs["refill"]:
+        r = obs["refill"]
+        integrity.append(f"a predator refill at frame {r['frame']} (predator_reseeds_cum {r['value']} > the founders' "
+                         f"{r['baseline']}): a protocol-integrity event to investigate; the observation ends at {frontier}")
+    if base and seq["samples"] is not None and seq.get("refill_base") is None:
+        integrity.append("a fork branch: its refill baseline (the origin's counter) is not checked here")
+    if first:
+        kind = "event"
+    elif obs["refill"]:
+        kind = "technical"
+    elif frontier >= total and not seq["stop"]:
+        kind = "administrative"
+    elif status in ("failed", "invalidated", "unreadable", "done", "extinct") or seq["stop"]:
+        kind = "technical"
+        if status == "extinct":
+            integrity.append("its state says extinct, but no zero is evidenced (recover it from its evidence)")
+        elif status == "done":
+            integrity.append(f"its state says done, but its evidence ends at frame {frontier}")
+    else:
+        kind = "ongoing"
+    if not burn_in:
+        bi = "no rule"
+    elif first and first["frame"] < burn_in:
+        bi = "early_failure"
+    elif first or frontier >= burn_in:
+        bi = "established"
+    else:
+        bi = "unresolved"
+    through_bi = bool(burn_in) and frontier >= burn_in and (first is None or first["frame"] > burn_in)
+    censor = None
+    if kind == "administrative":
+        censor = {"kind": "administrative", "frame": total}
+    elif kind in ("technical", "ongoing"):
+        censor = {"kind": kind, "frame": frontier}
+    return {"status": status, "end_reason": seq["state"].get("end_reason"), "frontier": frontier,
+            "accepted_through": seq["accepted_through"], "samples": len(seq["samples"]), "events": events,
+            "joint": obs["joint"], "first_terminal": first, "observation": kind, "censor": censor, "burn_in": bi,
+            "coexisting_through_burn_in": through_bi, "refill": obs["refill"], "integrity": integrity,
+            "stop": seq["stop"], "evidence": seq["evidence"], "unsupported_ledger": seq["unsupported_ledger"]}
+
+
+def at_horizon(o, H):
+    """An attempt's predator status at horizon H (frames; D6 rule 25): predator_extinct (its first zero at or before
+    H: a zero sampled exactly at H counts), alive (evidenced through H), prey_terminal (the prey's zero first, the
+    observation ended before H: later predator status unobserved, a competing event, not predator extinction),
+    not_yet_observed (still running) or technical."""
+    zp = o["events"].get("predators")
+    if isinstance(zp, dict) and zp["frame"] <= H:
+        return "predator_extinct"
+    if o["frontier"] >= H:
+        return "alive"
+    zq = o["events"].get("prey")
+    if isinstance(zq, dict) and zq["frame"] <= H:
+        return "prey_terminal"
+    return "not_yet_observed" if o["observation"] == "ongoing" else "technical"
+
+
+def clopper_pearson(x, n, alpha=0.05):
+    """The exact (Clopper-Pearson) two-sided 1 - alpha binomial interval for x of n (bisection on the tails)."""
+    def cdf(k, p):
+        return sum(math.comb(n, i) * p ** i * (1 - p) ** (n - i) for i in range(k + 1))
+
+    def solve(g):                                         # g increasing in p, root in [0, 1]
+        lo, hi = 0.0, 1.0
+        for _ in range(200):
+            mid = (lo + hi) / 2
+            lo, hi = (mid, hi) if g(mid) < 0 else (lo, mid)
+        return (lo + hi) / 2
+    lower = 0.0 if x == 0 else solve(lambda p: (1 - cdf(x - 1, p)) - alpha / 2)
+    upper = 1.0 if x == n else solve(lambda p: alpha / 2 - cdf(x, p))
+    return [lower, upper]
+
+
+def survival_table(outcomes, N, horizons):
+    """Per horizon: the counts (AT_HORIZON) over a FIXED denominator N, and either the empirical proportion with
+    its pointwise exact 95% interval (complete ascertainment) or the identification bounds [alive / N, (alive +
+    unresolved) / N] (D6 rule 25; never a complete-case proportion or an independence-assuming Kaplan-Meier)."""
+    out = {}
+    for H in horizons:
+        c = {k: 0 for k in AT_HORIZON}
+        for o in outcomes:
+            c[at_horizon(o, H)] += 1
+        c["unlisted"] = N - len(outcomes)                # (a registered slot without a record: unresolved)
+        unres = sum(c[k] for k in UNRESOLVED) + c["unlisted"]
+        row = {"N": N, "counts": c, "unresolved": unres, "complete": unres == 0 and N > 0}
+        if N and unres == 0:
+            row.update(estimate=c["alive"] / N, ci95=clopper_pearson(c["alive"], N))
+        elif N:
+            row["bounds"] = [c["alive"] / N, (c["alive"] + unres) / N]
+        out[str(H)] = row
+    return out
+
+
+def _times(outcomes):
+    """Observed event times and first-terminal-event frequencies (reported separately from survival)."""
+    ext = {"predators": [], "prey": []}
+    freq = {"predators": 0, "prey": 0, "joint": 0, "none": 0}
+    for o in outcomes:
+        for g in ext:
+            z = o["events"].get(g)
+            if isinstance(z, dict):
+                ext[g].append({"world": o["world"], "attempt": o["attempt"], "frame": z["frame"],
+                               "previous_sample": z["previous_sample"], "joint": o["joint"]})
+        freq[o["first_terminal"]["kind"] if o["first_terminal"] else "none"] += 1
+    for g in ext:
+        ext[g].sort(key=lambda x: (x["frame"], x["world"]))
+    return {"extinction_times": ext, "first_terminal_events": freq}
+
+
+def attempt_index(root, wid, restarts):
+    """Every attempt of a world, discovered READ-ONLY (Codex #75 r1 P2-4) from the restart ledger (each record: its
+    failed attempt and its new one), the retained (relocated) directories restarts/worlds/<id>.a<k> and the
+    current directory's attempt.json (its bytes bound) -> ({k: (directory or None, source)}, the current marker's
+    attempt or None, its sha256). A restart recorded but interrupted before its new attempt was installed leaves
+    the new attempt "not installed" and the failed one wherever it is (current, awaiting relocation, or moved)."""
+    cur = wdir(root, wid)
+    raw, sha = _read_once(os.path.join(cur, "attempt.json"))
+    marker = None
+    if raw:
+        try:
+            marker = int(json.loads(raw.decode("utf-8"))["attempt"])
+        except (ValueError, KeyError, TypeError, UnicodeDecodeError):
+            marker = None
+    elif os.path.isdir(cur):
+        marker = 0                                        # (a first attempt has no attempt.json)
+    recs = [r for r in restarts if r.get("world") == wid]
+    ks = {int(r["failed_attempt"]) for r in recs if "failed_attempt" in r} | {int(r["attempt"]) for r in recs}
+    rd = os.path.join(root, "restarts", "worlds")
+    try:
+        for name in os.listdir(rd):
+            m = ATTEMPT_DIR_RE.match(name)
+            if m and m.group("w") == wid:
+                ks.add(int(m.group("k")))
+    except OSError:
+        pass
+    if marker is not None:
+        ks.add(marker)
+    if not ks:
+        return {0: (cur, "current")}, None, sha
+    newest = max(ks)
+    out = {}
+    for k in sorted(ks):
+        moved = os.path.join(rd, f"{wid}.a{k}")
+        if marker == k:
+            out[k] = (cur, "current" if k == newest else "awaiting relocation (its restart is recorded)")
+        elif os.path.isdir(moved):
+            out[k] = (moved, "retained")
+        else:
+            out[k] = (None, "not installed (its restart is recorded)" if k == newest else "missing")
+    return out, marker, sha
+
+
+def ecology(root, reg, horizons=None, reg_sha=None):
+    """The read-only ecological export (Annex H D6 rules 22-26) over EVERY attempt of every registered slot (see
+    the module doc). reg_sha: the sha256 of the registry bytes the caller loaded. -> the document."""
+    sched = reg["schedule"]
+    T, L = sched["total_steps"], sched["log_every"]
+    bi = burn_in_of(reg)
+    maxr = int(reg.get("max_restarts") or 0)
+    if horizons is None:
+        horizons = [h * 1_000_000 for h in ECO_HORIZONS_M if h * 1_000_000 <= T]
+    horizons = sorted(set(int(h) for h in horizons) | {T})       # (the registered end is always the primary)
+    inputs = {}
+    for name in ("restarts.jsonl", "availability.jsonl"):
+        p = os.path.join(root, name)
+        raw, sha = _read_once(p)
+        inputs[name] = {"bytes": len(raw or b""), "sha256": sha, "records": _jsonl_bytes(raw, p)}
+    restarts, ledger = inputs["restarts.jsonl"]["records"], inputs["availability.jsonl"]["records"]
+    slots = {}
+    for w in reg["worlds"]:
+        wid = w["id"]
+        idx, marker, msha = attempt_index(root, wid, restarts)
+        newest = max(idx)
+        seeds = next((x["seeds"] for x in reg.get("reserved", []) if x["slot"] == w.get("seed_slot")), [w["founder_seed"]])
+        atts = []
+        for k in sorted(idx):
+            d, src = idx[k]
+            seq = attempt_sequence(root, wid, d, w, k, ledger, L)
+            o = attempt_outcome(seq, w, total_steps(w, sched), bi)
+            o.update(world=wid, attempt=k, seed=seeds[k] if k < len(seeds) else None, source=src, dir=d)
+            rs = [r for r in restarts if r.get("world") == wid and int(r.get("failed_attempt", -1)) == k]
+            if d is None and k == newest:                # (recorded, not yet installed: it will start)
+                o.update(observation="ongoing", censor={"kind": "ongoing", "frame": base_frame(w)})
+            if k < newest:
+                rp = os.path.join(d, "relocated.json") if d else None
+                rraw, rsha = _read_once(rp) if rp else (None, None)
+                rel = {}
+                try:
+                    rel = json.loads(rraw.decode("utf-8")) if rraw else {}
+                except (ValueError, UnicodeDecodeError):
+                    pass
+                o["evidence"]["relocated_sha256"] = rsha
+                if src == "retained" and (rel.get("world") != wid or int(rel.get("attempt", -1)) != k):
+                    o["integrity"].append(f"retained attempt {k}: its relocation manifest is missing or names another attempt")
+                if d is None:
+                    o["integrity"].append(f"attempt {k}: its directory is missing (neither current nor relocated)")
+                o["restart_record"] = rs[0] if rs else None
+                if not rs:
+                    o["integrity"].append(f"attempt {k} was superseded without a restart record")
+                if o["burn_in"] == "early_failure":
+                    o["establishment"] = "restarted"
+                    if rs and int(rs[0].get("zero_frame", -1)) != o["first_terminal"]["frame"]:
+                        o["integrity"].append(f"its restart record's zero {rs[0].get('zero_frame')} is not the evidenced "
+                                              f"first zero {o['first_terminal']['frame']}")
+                else:
+                    o["establishment"] = "restarted (no evidenced early zero)"
+                    o["integrity"].append("restarted, but its evidence shows no zero before the burn-in frame")
+                    if o["observation"] != "event":
+                        o.update(observation="technical", censor={"kind": "technical", "frame": o["frontier"]})
+            elif o["burn_in"] == "early_failure":
+                o["establishment"] = "exhausted" if k >= maxr else "restart_pending"
+            else:
+                o["establishment"] = o["burn_in"]
+            atts.append(o)
+        slots[wid] = {"uuid": w["uuid"], "treatment": w["treatment"], "block": w.get("block"),
+                      "seed_slot": w.get("seed_slot"), "retained_attempt": newest, "attempt_marker": marker,
+                      "attempt_json_sha256": msha, "attempts": atts,
+                      "exhausted": atts[-1]["establishment"] == "exhausted"}
+    summary = {}
+    for t in TREATMENTS:
+        ws = [s for s in slots.values() if s["treatment"] == t]
+        if not ws:
+            continue
+        N = len(ws)
+        first = [s["attempts"][0] for s in ws]
+        kept = [s["attempts"][-1] for s in ws]
+        est = [o for o in kept if o["coexisting_through_burn_in"]]
+        allatt = [o for s in ws for o in s["attempts"]]
+        early = sum(1 for o in allatt if o["burn_in"] == "early_failure")
+        resolved = early + sum(1 for o in allatt if o["burn_in"] == "established")
+        summary[t] = {
+            "registered_slots": N,
+            "first_attempt": dict(survival=survival_table(first, N, horizons), **_times(first),
+                                  label="PRIMARY: closed-population survival of every slot's first founder attempt "
+                                        "(establishment failures included)"),
+            "retained_attempt": dict(survival=survival_table(kept, N, horizons), **_times(kept),
+                                     label="secondary: the retained attempt under the registered restart protocol"),
+            "establishment_conditional": (None if not bi else dict(
+                survival=survival_table(est, len(est), horizons), **_times(est),
+                excluded=sum(1 for o in kept if not o["coexisting_through_burn_in"]),
+                label="secondary: retained attempts evidenced coexisting THROUGH the burn-in frame (alive at it, no "
+                      "terminal event at or before it; a zero exactly at it is data elsewhere, excluded here); "
+                      "denominator: those attempts")),
+            "attempts": {"started": sum(1 for o in allatt if o["samples"] or o["status"] != "pending"),
+                         "early_failures": early, "resolved": resolved,
+                         "early_failure_rate": early / resolved if resolved else None,
+                         "established_slots": sum(1 for o in kept if o["establishment"] == "established"),
+                         "exhausted_slots": sum(1 for s in ws if s["exhausted"]),
+                         "unresolved_technical": sum(1 for o in allatt if o["observation"] == "technical"),
+                         "unresolved_establishment": sum(1 for o in kept if o["burn_in"] == "unresolved"),
+                         "refills": sum(1 for o in allatt if o["refill"])}}
+        if t == "A":
+            summary[t]["note"] = ("A's predators are fixed and immortal: their survival is structural, not evidence of "
+                                  "demographic resilience comparable to C or B (D6 rule 22)")
+    q200 = sorted(wid for wid, s in slots.items() if s["treatment"] == "C"
+                  and s["attempts"][-1]["observation"] == "administrative" and not s["attempts"][-1]["refill"])
+    return {"schema": ECOLOGY_SCHEMA,
+            "registry_sha256": reg_sha or rqlib.sha256_file(os.path.join(root, "config", "worlds.json")),
+            "tool_sha256": rqlib.sha256_file(os.path.abspath(__file__)),
+            "evidence_sha256": rqlib.sha256_file(os.path.abspath(evidence.__file__)),
+            "inputs": {k: {"bytes": v["bytes"], "sha256": v["sha256"]} for k, v in inputs.items()},
+            "schedule": sched, "burn_in": bi or None, "max_restarts": maxr, "horizons": horizons, "primary_horizon": T,
+            "slots": slots, "summary": summary,
+            "Q200": {"worlds": q200, "count": len(q200), "h_pqft_available": len(q200) >= 24,
+                     "note": "retained C histories coexisting through the observed registered end, without a refill; "
+                             ">= 24 is the availability safeguard for H-P, H-Q, H-F and H-T only, not for H-C (D6 rule 26)"},
+            "definitions": {
+                "event": "the first evidenced SAMPLED zero (every log_every frames) over the newest line of descent's "
+                         "validated, contiguous main-CSV samples (evidence.py); the extinction lies after previous_sample; "
+                         "the first such zero is the first absorbing terminal boundary",
+                "censoring": "administrative at the registered end; technical at the last verified observation; a "
+                             "prey-terminal stop is a competing event, never predator extinction",
+                "attempts": "each (slot, attempt, seed) has its own frame-zero origin; time is never concatenated across "
+                            "attempts; an exhausted reservation is an establishment failure, not censoring"}}
+
+
+def lineage_events(segments):
+    """The chain's lineage events in order (evidence for C's breeder indicator; Annex H D6 rule 29), the breeder
+    history CARRIED ACROSS SEGMENTS: segments [(name, start, rows [(frame, event, id, parent, age)], through)] ->
+    [(frame, event, id, proven_breeder_at_the_event, ancestry_known, age)]. A proven breeder is the parent of at
+    least one realized B event before the event; ancestry is known for a founder (F), a loaded (L), a refilled
+    (R) or a born (B) id."""
+    known, breeders, out = set(), set(), []
+    for _, _, rows, _ in segments:
+        for fr, ev, i, par, age in rows:
+            if ev in ("F", "L", "R"):
+                known.add(i)
+            elif ev == "B":
+                known.add(i)
+                if par:
+                    breeders.add(par)
+            out.append((fr, ev, i, i in breeders, i in known, age))
+    return out
+
+
+def monitor_windows(samples, events, window, step, log_every, arm, lineage_through=None, dt=FRAME_DT, max_age=None):
+    """D6 rule 29's rolling windows (a, b], b every `step`, a = b - window >= arm, by a chronological sweep: predator-
+    seconds (the trapezoid of the sampled predator abundance x dt), exposure-weighted mean energy, captures (the
+    corrected main-CSV kills_interval) and per predator-second, starvation deaths (C: from the lineage events, of
+    PROVEN BREEDERS and of the others, per 1,000 predator-seconds; their mean age at death; the lifespan-
+    normalized starvation hazard: starvation per predator-second x the registered max age), births minus deaths
+    (C: lineage; B: the corrected main-CSV intervals), and the deterioration flag (breeder starvation > 0.1 per
+    1,000 predator-s AND mean energy < 180). events: lineage_events or None (no lineage: the breeder indicator
+    unavailable); lineage_through: the last frame they cover. -> [window rows]."""
+    import bisect
+    byf = {f: v for f, v in samples}
+    out = []
+    if not samples:
+        return out
+    ef = [e[0] for e in events] if events is not None else []
+    first, last = samples[0][0], samples[-1][0]
+    b = max(arm + window, first + window)
+    b += (-b) % step                                      # (window ends on the step grid from frame 0)
+    while b <= last:
+        a = b - window
+        pts = [byf.get(f) for f in range(a, b + 1, log_every)]
+        if any(p is None for p in pts):
+            b += step
+            continue
+        N = [p.get("predator_pop") or 0 for p in pts]
+        E = [p.get("predator_avg_energy") for p in pts]
+        expo = sum((N[i] + N[i + 1]) / 2 for i in range(len(N) - 1)) * log_every * dt
+        ne = [N[i] * (E[i] if E[i] is not None else 0) for i in range(len(N))]
+        energy = (sum((ne[i] + ne[i + 1]) / 2 for i in range(len(ne) - 1)) * log_every * dt / expo) if expo else None
+        if any(E[i] is None and N[i] for i in range(len(N))):
+            energy = None
+        iv = pts[1:]
+        caps = (sum(p["kills_interval"] for p in iv) if all(p.get("kills_interval") is not None for p in iv) else None)
+        row = {"from": a, "to": b, "predator_seconds": expo, "mean_energy": energy, "captures": caps,
+               "captures_per_predator_s": (caps / expo) if (caps is not None and expo) else None,
+               "expenditure": None}
+        if events is not None and lineage_through is not None and b <= lineage_through:
+            ev = events[bisect.bisect_right(ef, a):bisect.bisect_right(ef, b)]
+            starv = [e for e in ev if e[1] == "S"]
+            unknown = any(not e[4] for e in starv)
+            br = sum(1 for e in starv if e[3])
+            ages = [e[5] for e in ev if e[1] in ("S", "A") and e[5] is not None]
+            row.update(starvation=len(starv), breeder_starvation=None if unknown else br,
+                       nonbreeder_starvation=None if unknown else len(starv) - br,
+                       births_minus_deaths=sum(1 for e in ev if e[1] == "B") - sum(1 for e in ev if e[1] in ("S", "A")),
+                       mean_age_at_death=(sum(ages) / len(ages)) if ages else None, deaths_with_age=len(ages))
+            rate = (br / expo * 1000) if (expo and not unknown) else None
+            row.update(breeder_starvation_rate=rate,
+                       starvation_rate=(len(starv) / expo * 1000) if expo else None,
+                       breeder_indicator="available" if rate is not None else
+                       ("unavailable: a starved predator without lineage ancestry" if unknown else "unavailable: no exposure"))
+            row["deterioration"] = bool(rate is not None and energy is not None and rate > MON_BREEDER_RATE
+                                        and energy < MON_ENERGY)
+        else:
+            if all(p.get("predator_births_interval") is not None and p.get("predator_deaths_starv") is not None
+                   and p.get("predator_deaths_age") is not None for p in iv):
+                st_ = sum(p["predator_deaths_starv"] for p in iv)
+                row.update(starvation=st_, starvation_rate=(st_ / expo * 1000) if expo else None,
+                           births_minus_deaths=sum(p["predator_births_interval"] - p["predator_deaths_starv"]
+                                                   - p["predator_deaths_age"] for p in iv))
+            row.update(breeder_starvation_rate=None, deterioration=None, mean_age_at_death=None,
+                       breeder_indicator="unavailable: no individual lineage log" if events is None
+                       else "unavailable: past the lineage log's accepted frame")
+        sr = row.get("starvation_rate")
+        row["lifespan_normalized_starvation"] = (sr / 1000 * max_age) if (sr is not None and max_age) else None
+        out.append(row)
+        b += step
+    return out
+
+
+def bmd_5k(samples, events, log_every, lineage_through=None):
+    """The 5k births-minus-deaths series (D6 rule 29): per sample interval (f - log_every, f], from the lineage
+    events within their VERIFIED coverage (f <= lineage_through: #75 r2 P2-4, never a zero for missing events),
+    else the corrected main-CSV intervals, else None (unavailable) -> [(frame, value)]."""
+    import bisect
+    ef = [e[0] for e in events] if events is not None else []
+    out = []
+    for f, v in samples:
+        if events is not None and lineage_through is not None and f <= lineage_through:
+            ev = events[bisect.bisect_right(ef, f - log_every):bisect.bisect_right(ef, f)]
+            out.append((f, sum(1 for e in ev if e[1] == "B") - sum(1 for e in ev if e[1] in ("S", "A"))))
+        elif all(v.get(c) is not None for c in ("predator_births_interval", "predator_deaths_starv", "predator_deaths_age")):
+            out.append((f, v["predator_births_interval"] - v["predator_deaths_starv"] - v["predator_deaths_age"]))
+        else:
+            out.append((f, None))
+    return out
+
+
+def _episodes(rows, step):
+    """Consecutive flagged windows merged: [{"first_to", "last_to", "windows", "max_rate", "min_energy"}]."""
+    eps = []
+    for r in rows:
+        if not r.get("deterioration"):
+            continue
+        if eps and r["to"] - eps[-1]["last_to"] <= step:
+            e = eps[-1]
+            e.update(last_to=r["to"], windows=e["windows"] + 1, max_rate=max(e["max_rate"], r["breeder_starvation_rate"]),
+                     min_energy=min(e["min_energy"], r["mean_energy"]))
+        else:
+            eps.append({"first_to": r["to"], "last_to": r["to"], "windows": 1, "max_rate": r["breeder_starvation_rate"],
+                        "min_energy": r["mean_energy"]})
+    return eps
+
+
+def energy_tails(root, wid, frame, sha):
+    """The archived individual predator energies' lower tail (D6 rule 29) at an accepted checkpoint (its bytes
+    verified against its acceptance sha256) -> {"frame", "n", "min", "p05", "p10", "sha256"} or the reason."""
+    p = good_copy(root, wid, frame, sha) if frame else None
+    if not p:
+        return {"frame": frame, "unavailable": "no verified copy of the latest accepted checkpoint"}
+    try:
+        cp = ckpt.load(p)
+    except (ckpt.CheckpointError, OSError, ValueError) as e:
+        return {"frame": frame, "unavailable": f"the checkpoint does not load: {e}"}
+    en = sorted(float(x) for x, a in zip((cp.get("predators") or {}).get("energy") or [],
+                                         (cp.get("predators") or {}).get("alive") or []) if int(a))
+    if not en:
+        return {"frame": frame, "unavailable": "no living predators", "sha256": sha}
+    q = lambda u: en[min(len(en) - 1, int(u * len(en)))]  # noqa: E731
+    return {"frame": frame, "n": len(en), "min": en[0], "p05": q(0.05), "p10": q(0.10), "sha256": sha}
+
+
+def monitor(root, reg, window=MON_WINDOW, step=MON_STEP, reg_sha=None, windows_out=None):
+    """The read-only production monitoring indicators (Annex H D6 rules 29-30) of every C and B world's current
+    attempt over its evidence-bound sequence (see the module doc). windows_out: every rolling window and the 5k
+    births-minus-deaths series of every world, as gzipped JSON lines (bound by sha256 in the document). -> doc."""
+    import gzip
+    sched = reg["schedule"]
+    L = sched["log_every"]
+    if window % L or step % L or window <= 0 or step <= 0:
+        raise WorldsError(f"--window {window} and --step {step} must be positive multiples of log_every {L}")
+    arm = burn_in_of(reg)
+    p = os.path.join(root, "availability.jsonl")
+    raw, sha = _read_once(p)
+    ledger = _jsonl_bytes(raw, p)
+    rraw, _ = _read_once(os.path.join(root, "restarts.jsonl"))
+    restarts = _jsonl_bytes(rraw, os.path.join(root, "restarts.jsonl"))
+    out, lines = {}, []
+    for w in reg["worlds"]:
+        wid, tr = w["id"], w["treatment"]
+        if tr == "A":
+            out[wid] = {"treatment": "A", "monitored": False,
+                        "why": "A's predators are fixed (12, immortal): the <= 15 rule and the breeder indicator do not apply"}
+            continue
+        idx, marker, msha = attempt_index(root, wid, restarts)
+        k = max(idx)
+        d = idx[k][0]
+        lin = tr == "C"
+        seq = attempt_sequence(root, wid, d, w, k, ledger, L, lineage=lin)
+        sm = [(f, dict(v)) for f, v in seq["samples"]]
+        segs = {s["name"]: s for s in seq["state"].get("segments", [])}
+        fixed = {}
+        for e in seq["evidence"]["segments"]:            # (a resumed segment's first row: its loaded counters)
+            s = segs.get(e["segment"])
+            if s and s["start_frame"] > base_frame(w):
+                ra = s.get("resumed_accept") or {}
+                src = good_copy(root, wid, ra.get("frame"), ra.get("sha256")) if (ra and d == wdir(root, wid)) else None
+                try:
+                    fixed[s["start_frame"] + L] = ckpt.load(src)["counters"] if src else None
+                except (ckpt.CheckpointError, OSError, ValueError):
+                    fixed[s["start_frame"] + L] = None
+        for i, (f, v) in enumerate(sm):
+            if f in fixed:
+                ctr = fixed[f]
+                for col, key in INTERVAL_FIX:
+                    if col in v:
+                        v[col] = (v[col] - int(ctr.get(key, 0))) if (ctr and v[col] is not None) else None
+        events, lt = None, None
+        if lin and seq["lineage"]:
+            events = lineage_events(seq["lineage"])
+            lt = min(seq["accepted_through"], seq["lineage_through"])    # (the CONTIGUOUS verified lineage coverage)
+        max_age = (w.get("flags") or {}).get("predator-max-age")
+        rows = monitor_windows(sm, events, window, step, L, arm, lt, max_age=max_age)
+        acute = [(f, v.get("predator_pop")) for f, v in sm if f > arm and v.get("predator_pop") is not None
+                 and v["predator_pop"] <= MON_ACUTE]
+        ce = sched["checkpoint_every"]
+        summ = monitor_windows(sm, events, ce, ce, L, arm, lt, max_age=max_age)
+        series = bmd_5k(sm, events, L, lt)
+        for r in summ:                                   # (the 5k births-minus-deaths range inside each 1M)
+            vals = [x for f, x in series if r["from"] < f <= r["to"] and x is not None]
+            r["bmd_5k"] = {"min": min(vals), "max": max(vals), "n": len(vals)} if vals else None
+        # (#75 r2 P2-5) the latest checkpoint ELIGIBLE under the line of descent, its cuts and the observation's
+        # frontier (the first terminal, a refill or a stop): never a superseded or overshoot checkpoint
+        fr_ = seq["obs"]["frontier"]
+        elig = [c for c in seq["checkpoints"] if c[0] <= fr_]
+        tails = (energy_tails(root, wid, elig[-1][0], elig[-1][1]) if (elig and d == wdir(root, wid))
+                 else {"unavailable": "no accepted checkpoint of the current attempt within its observation"})
+        if windows_out:
+            lines += [rqlib.canonical(dict(r, world=wid, kind="window")) for r in rows]
+            lines += [rqlib.canonical({"world": wid, "kind": "bmd_5k", "frame": f, "value": x}) for f, x in series]
+        out[wid] = {"treatment": tr, "monitored": True, "attempt": k, "attempt_json_sha256": msha,
+                    "frontier": seq["obs"]["frontier"], "lineage_through": lt,
+                    "breeder_indicator": ("available" if lin and lt else
+                                          ("unavailable: no accepted lineage log yet" if lin else
+                                           "unavailable: no individual lineage log (B)")),
+                    "acute": ({"first_frame": acute[0][0], "samples": len(acute), "min_predator_pop": min(x for _, x in acute)}
+                              if acute else None),
+                    "deterioration": _episodes(rows, step), "windows": len(rows),
+                    "latest_window": rows[-1] if rows else None, "summaries": summ, "energy_tail": tails,
+                    "expenditure": "unavailable: the engine does not log predator energy expenditure",
+                    "age_at_death": "lineage events (C): mean_age_at_death per window" if lin else
+                                    "unavailable: no individual lineage log (B)",
+                    "refill": seq["obs"]["refill"], "evidence": seq["evidence"], "unsupported_ledger": seq["unsupported_ledger"]}
+    wrec = None
+    if windows_out:
+        data = gzip.compress(b"".join(lines), mtime=0)
+        rqlib.write_durable(windows_out, data)
+        wrec = {"path": os.path.abspath(windows_out), "sha256": rqlib.sha256_bytes(data), "lines": len(lines)}
+    return {"schema": MONITOR_SCHEMA,
+            "registry_sha256": reg_sha or rqlib.sha256_file(os.path.join(root, "config", "worlds.json")),
+            "tool_sha256": rqlib.sha256_file(os.path.abspath(__file__)),
+            "evidence_sha256": rqlib.sha256_file(os.path.abspath(evidence.__file__)),
+            "availability_sha256": sha, "window": window, "step": step, "armed_after": arm, "dt": FRAME_DT,
+            "thresholds": {"breeder_starvation_per_1000_predator_s": MON_BREEDER_RATE, "mean_energy_below": MON_ENERGY,
+                           "acute_predator_pop_at_most": MON_ACUTE},
+            "windows_out": wrec,
+            "consequences": "diagnostics, not calibrated extinction probabilities: a flag is recorded, verified and "
+                            "notified; it never triggers rescue, reseeding, treatment, horizon or allocation changes, "
+                            "extra worlds or selective assay omission (D6 rule 30)",
+            "worlds": out}
+
+
 # ================================================================== design block, status
+BLOCK_EVIDENCE_SCHEMA = "finfolk.redqueen.blockevidence/1"
+DISPOSITIONS = ("no_rule", "established", "exhausted", "restart_pending", "unresolved", "not_installed")
+SETTLED = ("no_rule", "established", "exhausted")
+ARCHIVE_STATUS = ("verified", "off_chain", "missing", "mismatch")
+
+
+def attempt_uuid(base, k):
+    """A restarted attempt's identity (as val_block.py's, refsel.py's and noisebank.py's): the registry uuid for
+    attempt 0, else uuid5(NAMESPACE_URL, "finfolk:attempt:<registry uuid>:<k>") (another history)."""
+    return base if not k else str(uuid.uuid5(uuid.NAMESPACE_URL, f"finfolk:attempt:{base}:{k}"))
+
+
+def disposition(o, k, maxr, bi):
+    """(decided, why, disposition) of a retained attempt's burn-in from its evidence (attempt_outcome; None: recorded
+    but not installed): settled (no_rule, established: evidenced alive at the burn-in frame or its first zero at or
+    after it, exhausted: an early failure with the restarts used up, the slot's final attempt) or not (a restart is
+    due, unresolved: not yet evidenced alive at the burn-in frame, not_installed)."""
+    if o is None:
+        return False, f"attempt {k} is recorded but not installed (its restart is in progress)", "not_installed"
+    b, first = o["burn_in"], o["first_terminal"]
+    if b == "no rule":
+        return True, "no burn-in rule", "no_rule"
+    if b == "established":
+        return True, (f"its first zero (frame {first['frame']}) is at or after the burn-in frame {bi}" if first else
+                      f"evidenced alive at the burn-in frame {bi}"), "established"
+    if b == "early_failure":
+        if k >= maxr:
+            return True, (f"an early failure (frame {first['frame']}) with its {maxr} restarts exhausted: the slot's "
+                          "final attempt"), "exhausted"
+        return False, (f"an evidenced zero at frame {first['frame']} before the burn-in frame {bi}: it will be "
+                       "restarted"), "restart_pending"
+    return False, (f"not yet evidenced alive at the burn-in frame {bi} (its evidence reaches frame {o['frontier']}, "
+                   f"{o['observation']})"), "unresolved"
+
+
+def archive_evidence(root, wid, k, d, seq):
+    """An attempt's archive index, every object checked against the attempt's NEWEST LINE OF DESCENT and RE-HASHED
+    (Codex #77 r1 P1-1) -> ({frame: {"label", "sha256", "path", "status", "why"}}, a problem or None). status:
+    verified (F1, or a checkpoint whose acceptance record on the line of descent, within its cut, binds this
+    sha256; its bytes hash to it), off_chain (archived, but no acceptance record on the line of descent binds it:
+    a superseded continuation's, or not accepted yet), missing, mismatch (its bytes no longer hash to the record).
+    F1 also records whether its replay verification (f1_verify.json) binds it to the first checkpoint."""
+    if d is None:
+        return {}, f"attempt {k} is recorded but not installed"
+    try:
+        recs = attempt_archive_records(root, wid, k)
+    except (WorldsError, OSError, KeyError) as e:
+        return {}, f"its archive index is unreadable ({e})"
+    chain = {}
+    for f, sha in seq["checkpoints"]:
+        chain.setdefault(f, sha)
+    fv_raw, _ = _read_once(os.path.join(d, "f1_verify.json"))
+    try:
+        fv = json.loads(fv_raw.decode("utf-8")) if fv_raw else {}
+    except (ValueError, UnicodeDecodeError):
+        fv = {}
+    out, probs = {}, []
+    for lab, r in recs.items():
+        f, sha, p = r.get("frame"), r.get("sha256"), r.get("path")
+        if not isinstance(f, int) or label_of(f) != lab or not isinstance(sha, str):
+            probs.append(f"{lab}: a malformed archive record")
+            continue
+        e = {"label": lab, "sha256": sha, "path": p}
+        if f == 1:
+            e["replay"] = ("verified" if fv.get("identical") and fv.get("f1_sha256") == sha
+                           and chain.get(fv.get("first_checkpoint")) == fv.get("first_checkpoint_sha256") else
+                           "not recorded")
+        elif chain.get(f) != sha:
+            e.update(status="off_chain", why=("no acceptance record on the line of descent binds it (a superseded "
+                                              "continuation's, or not accepted yet)" if f not in chain else
+                                              "its record's sha256 is not the accepted checkpoint's"))
+        if "status" not in e:
+            got = None
+            try:
+                got = rqlib.sha256_file(p) if isinstance(p, str) and os.path.isfile(p) else None
+            except OSError:
+                pass
+            if got is None:
+                e.update(status="missing", why=f"{p} is missing")
+            elif got != sha:
+                e.update(status="mismatch", why=f"{p} does not hash to its record")
+            else:
+                e.update(status="verified", why=None)
+        out[f] = e
+    return dict(sorted(out.items())), ("; ".join(probs) if probs else None)
+
+
 def design_block(root, reg, archive_root):
+    """The worlds block (finfolk.redqueen.worldsblock/1, read-only) a design and graph.py mask bind: per registered
+    slot its RETAINED attempt's EVIDENCE under evidence.py's rules (Annex H D6 rules 24 and 27; Codex #77 r1 P1-1;
+    the same sequence as the ecological export): the registry uuid and the attempt's identity (attempt_uuid), the
+    first absorbing terminal boundary (valid_before: the first evidenced sampled guild zero; snapshots at or after
+    it are not valid challengers, design §2.3) and each guild's, the observation's frontier (first terminal,
+    refill, stop), the explicit burn-in disposition (disposition: an unsettled attempt's snapshots are pending),
+    every archived object checked against the line of descent and re-hashed (archive; "archived": the verified
+    frames), and the bytes of the inputs read (registry, restart and availability ledgers, evidence.py)."""
     s = reg["schedule"]
     times = {"F1": 1}
     for f in range(s["checkpoint_every"], s["total_steps"] + 1, s["checkpoint_every"]):
         times[f"{f // 1_000_000}M" if f % 1_000_000 == 0 else f"f{f}"] = f
+    L, bi, maxr = s["log_every"], burn_in_of(reg), int(reg.get("max_restarts") or 0)
+    inputs = {}
+    for name in ("restarts.jsonl", "availability.jsonl"):
+        p = os.path.join(root, name)
+        raw, sha = _read_once(p)
+        inputs[name] = {"bytes": len(raw or b""), "sha256": sha, "records": _jsonl_bytes(raw, p)}
+    restarts, ledger = inputs["restarts.jsonl"]["records"], inputs["availability.jsonl"]["records"]
     ws = {}
-    led = read_jsonl(os.path.join(root, "availability.jsonl"))
     for w in reg["worlds"]:
-        ad = adir(archive_root, w["id"])
-        zeros = first_zeros(led, w["id"], root)
-        st = read_state(root, w["id"])
-        ws[w["id"]] = {"uuid": w["uuid"], "treatment": w["treatment"], "block": w["block"], "status": st["status"],
-                       "attempt": attempt_of(root, w["id"]),
-                       "pattern": os.path.join(ad, "end.{frame}.json"), "paths": {"F1": os.path.join(ad, "F1.json")},
-                       # snapshots at or after a guild's first zero are not valid challengers (design §2.3)
-                       "valid_before": min(zeros.values()) if zeros else None,
-                       "archived": sorted(r["frame"] for r in archive_records(root, w["id"]).values())}
-    return {"schema": "finfolk.redqueen.worldsblock/1", "registry_sha256": rqlib.sha256_file(
-        os.path.join(root, "config", "worlds.json")), "times": times, "worlds": ws}
+        wid = w["id"]
+        idx, marker, msha = attempt_index(root, wid, restarts)
+        k = max(idx)
+        d, src = idx[k]
+        seq = attempt_sequence(root, wid, d, w, k, ledger, L) if d else None
+        o = attempt_outcome(seq, w, total_steps(w, s), bi) if seq else None
+        arch, aprob = archive_evidence(root, wid, k, d, seq) if seq else ({}, f"attempt {k} is recorded but not installed")
+        decided, why, disp = disposition(o, k, maxr, bi)
+        first = o["first_terminal"] if o else None
+        prior = []                                     # (Codex #77 r3: each earlier attempt's OWN evidence)
+        for j in sorted(x for x in idx if x < k):
+            dj, srcj = idx[j]
+            oj = attempt_outcome(attempt_sequence(root, wid, dj, w, j, ledger, L), w, total_steps(w, s), bi) if dj else None
+            prior.append({"attempt": j, "source": srcj, "first_terminal": oj["first_terminal"] if oj else None,
+                          "burn_in": oj["burn_in"] if oj else None})
+        zeros = {g: z["frame"] for g, z in (o["events"] if o else {}).items() if isinstance(z, dict)}
+        ad = adir(archive_root, wid)
+        ws[wid] = {"uuid": w["uuid"], "attempt_uuid": attempt_uuid(w["uuid"], k), "treatment": w["treatment"],
+                   "block": w["block"], "status": o["status"] if o else "pending", "attempt": k, "attempt_source": src,
+                   "attempt_marker": marker, "attempt_json_sha256": msha,
+                   "pattern": os.path.join(ad, "end.{frame}.json"), "paths": {"F1": os.path.join(ad, "F1.json")},
+                   "valid_before": first["frame"] if first else None, "first_zeros": dict(sorted(zeros.items())),
+                   "burn_in": {"decided": decided, "why": why, "disposition": disp}, "prior_attempts": prior,
+                   "archived": [f for f, e in arch.items() if e["status"] == "verified"],
+                   "archive": {str(f): e for f, e in arch.items()}, "archive_problem": aprob,
+                   "evidence": {"frontier": o["frontier"] if o else base_frame(w),
+                                "accepted_through": o["accepted_through"] if o else base_frame(w),
+                                "first_terminal": first, "refill": o["refill"] if o else None,
+                                "stop": o["stop"] if o else None, "observation": o["observation"] if o else "ongoing",
+                                "unsupported_ledger": o["unsupported_ledger"] if o else [],
+                                "sequence": o["evidence"] if o else None}}
+    return {"schema": "finfolk.redqueen.worldsblock/1",
+            "registry_sha256": rqlib.sha256_file(os.path.join(root, "config", "worlds.json")),
+            "namespace": reg.get("namespace"), "times": times, "burn_in_frame": bi, "max_restarts": maxr,
+            "evidence": {"schema": BLOCK_EVIDENCE_SCHEMA,
+                         "evidence_sha256": rqlib.sha256_file(os.path.abspath(evidence.__file__)),
+                         "tool_sha256": rqlib.sha256_file(os.path.abspath(__file__)),
+                         "inputs": {n: {"bytes": v["bytes"], "sha256": v["sha256"]} for n, v in inputs.items()}},
+            "worlds": ws}
 
 
 def burn_in_report(root, reg):
@@ -2917,9 +3866,10 @@ def main(argv=None):
     r.add_argument("--log-every", type=int, default=DEFAULT_SCHEDULE["log_every"])
     r.add_argument("--allow-placeholder", action="store_true")
     r.add_argument("--burn-in", type=int, default=BURN_IN, help="frames (0: no burn-in restarts)")
-    r.add_argument("--layout", choices=sorted(LAYOUTS), help="the H-C pilot rule's allocation (overrides --per-block)")
+    r.add_argument("--layout", choices=sorted(LAYOUTS),
+                   help="a named allocation (overrides --per-block): 64 is the registered one (Annex H D7 rule 34)")
     r.add_argument("--max-restarts", type=int, default=MAX_RESTARTS)
-    for name in ("f1", "launch", "verify-f1", "stitch", "status", "design-block"):
+    for name in ("f1", "launch", "verify-f1", "stitch", "status", "design-block", "ecology", "monitor"):
         s = sub.add_parser(name)
         s.add_argument("--root", required=True)
         s.add_argument("--allow-placeholder", action="store_true")
@@ -2931,8 +3881,16 @@ def main(argv=None):
         if name == "stitch":
             s.add_argument("--world", required=True)
             s.add_argument("--partial", action="store_true")
-        if name == "design-block":
+        if name in ("design-block", "ecology", "monitor"):
             s.add_argument("--out", required=True)
+        if name == "ecology":
+            s.add_argument("--horizons", help="comma-separated frames (default: 5,20,30,50,100,150,200M within the "
+                                              "schedule, and its end)")
+        if name == "monitor":
+            s.add_argument("--window", type=int, default=MON_WINDOW)
+            s.add_argument("--step", type=int, default=MON_STEP)
+            s.add_argument("--windows-out", help="every rolling window and the 5k births-minus-deaths series "
+                                                 "(gzipped JSON lines; bound by sha256 in the document)")
         if name == "launch":
             s.add_argument("--workers", type=int, default=10)
             s.add_argument("--mem-min-mb", type=int, default=8192)
@@ -2964,6 +3922,24 @@ def main(argv=None):
             reg, sha = load_registry(root, allow_placeholder=True)
             blk = design_block(root, reg, bind_root(root, sha, a.archive_root, readonly=True))
             rqlib.write_durable(a.out, rqlib.canonical(blk))
+            return 0
+        if a.cmd in ("ecology", "monitor"):              # (read-only: no lock; only --out is written)
+            reg, sha = load_registry(root, allow_placeholder=a.allow_placeholder)
+            if a.cmd == "ecology":
+                hz = [int(x) for x in a.horizons.split(",")] if a.horizons else None
+                doc = ecology(root, reg, hz, sha)
+                for t, s in sorted(doc["summary"].items()):
+                    prim = s["first_attempt"]["survival"][str(doc["primary_horizon"])]
+                    print(f"{t}: {s['registered_slots']} slots; first-attempt predator survival at {doc['primary_horizon']}: "
+                          + (f"{prim['estimate']:.3f}" if "estimate" in prim else f"bounds {prim['bounds']}")
+                          + f" (counts {prim['counts']})", file=sys.stderr)
+            else:
+                doc = monitor(root, reg, a.window, a.step, sha, a.windows_out)
+                for wid, v in sorted(doc["worlds"].items()):
+                    if v.get("monitored") and (v["acute"] or v["deterioration"]):
+                        print(f"FLAG {wid} ({v['treatment']}): acute {v['acute']}; deterioration episodes "
+                              f"{len(v['deterioration'])}", file=sys.stderr)
+            rqlib.write_durable(a.out, rqlib.canonical(doc))
             return 0
         if a.cmd == "stitch":
             reg, sha = load_registry(root, a.allow_placeholder)

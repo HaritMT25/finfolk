@@ -1135,10 +1135,151 @@
              appearanceParity: appearanceParity, appearanceTextureParity: appearanceTextureParity };
   }
 
+  /* ---------------- the M2a body plan: the renderer's rest law (GPU) == C++ ----------------
+   * bodyPlanVertexCheck(gl, EA, fixture, opts): the production GLSL of the
+   * deformable template (EA.GLSL.COMMON + GENES + MORPH: mDecode, mBuild),
+   * through transform feedback, at the body plan's CANONICAL samples
+   * (src/ocean/body_plan.hpp sampleCoords: the full rings, 12 caudal and 16
+   * fin intervals, 16 rim points an eye, 6 barbel segments; fixture.samples:
+   * [a0, a1, a2, a3, part, side] each) and at the renderer's rest settings
+   * (time 0, no wag, no width floor), for every fixture body (its 63 genes and
+   * lambda), against the C++ law's rest points in body radii (body.rest: 3
+   * floats a sample, from the Ocean module's oc_body_rest: the Wasm build of
+   * the law, which the caller also holds to the native digest). The genes go
+   * into a 512-wide RGBA32F texture, 16 texels a body, at slots from slotMap
+   * (identity, permuted, sparse: the texture's row crossings 31 / 32, 63 / 64,
+   * 2047 / 2048), the layout GENES' fetchGenes reads. Every output must be
+   * finite, then within BODY_TOL of the C++ point (per part, the worst
+   * reported). GPU outputs never reach the simulation. opts.mutate plants a
+   * fault in the GLSL that the check must catch: "radius" (the depth law),
+   * "root" (a paired fin's root moved off its facet), "caudalClip" (the chord
+   * cap raised to 4 R). */
+  var BODY_TOL = { geo: 0.002 };   /* body radii; locked before any fixture was recorded */
+  var BODY_MUT = {
+    radius: ["M.depth * 0.84 * mPw(", "M.depth * 0.80 * mPw("],
+    root: ["vec3 root = mFacet(M, t, thr, side);", "vec3 root = mFacet(M, t + 0.03, thr, side);"],
+    caudalClip: ["min(3.00000000, 2.0 * M.cA", "min(4.00000000, 2.0 * M.cA"]
+  };
+  var BODY_PARTS = ["body", "caudal", "dorsal", "pectoral", "eye", "anal", "pelvic", "barbel"];
+  /** @returns {Promise<any>} */
+  function bodyPlanVertexCheck(gl, EA, fixture, opts) {
+    opts = opts || {};
+    if (!EA || !EA.GLSL || !EA.GLSL.MORPH) return Promise.resolve({ error: "web/ocean_appearance.js not loaded" });
+    if (!fixture || !fixture.samples || !fixture.bodies || !fixture.bodies.length) return Promise.resolve({ error: "no fixture" });
+    var morph = EA.GLSL.MORPH;
+    if (opts.mutate) {
+      var pm = plant(morph, opts.mutate, BODY_MUT);
+      if (pm.error) return Promise.resolve({ error: pm.error });
+      morph = pm.src;
+    }
+    var vs = VS3 + EA.GLSL.COMMON + "\n" + EA.GLSL.GENES + "\n" + morph + "\n" + [
+      "attribute vec4 aT;", "attribute vec4 aPat;", "attribute float aLam;", "attribute float aSlot;",
+      "out vec3 vGeo;",
+      "void main() {",
+      "  fetchGenes(int(aSlot + 0.5));",
+      "  Morph M = mDecode(aLam);",
+      "  vec3 geo, mat; float mar;",
+      "  mBuild(M, aT, aPat, 0.0, 0.0, 0.0, geo, mat, mar);",
+      "  vGeo = geo;",
+      "  gl_Position = vec4(0.0, 0.0, 0.0, 1.0); gl_PointSize = 1.0;",
+      "}"].join("\n");
+    var fs = "#version 300 es\nprecision highp float;\nout vec4 pcOut;\nvoid main() { pcOut = vec4(0.0); }\n";
+    var prog;
+    try { prog = compileProgram(gl, vs, fs, ["vGeo"]); }
+    catch (e) { return Promise.resolve({ error: e.message || String(e) }); }
+    var S = fixture.samples, ns = S.length, bodies = fixture.bodies, nb = bodies.length, N = ns * nb;
+    var slots = slotMap(opts.slotMap, nb), top = 0, c, i, k;
+    for (c = 0; c < nb; c++) if (slots[c] > top) top = slots[c];
+    var W = 512, rowsTex = Math.ceil(16 * (top + 1) / W), T = new Float32Array(W * rowsTex * 4);
+    for (c = 0; c < nb; c++) {
+      var g = bodies[c].genes;
+      if (!g || g.length !== EA.STRIDE) { gl.deleteProgram(prog); return Promise.resolve({ error: "fixture body " + c + " has no 63 genes" }); }
+      for (k = 0; k < EA.STRIDE; k++) T[4 * 16 * slots[c] + k] = g[k];
+    }
+    var aT = new Float32Array(4 * N), aPat = new Float32Array(4 * N), aLam = new Float32Array(N), aSlot = new Float32Array(N);
+    for (c = 0; c < nb; c++) for (i = 0; i < ns; i++) {
+      var v = c * ns + i, s = S[i];
+      aT[4 * v] = s[0]; aT[4 * v + 1] = s[1]; aT[4 * v + 2] = s[2]; aT[4 * v + 3] = s[3];
+      aPat[4 * v] = s[4]; aPat[4 * v + 2] = s[5];
+      aLam[v] = bodies[c].lambda; aSlot[v] = slots[c];
+    }
+    var tex = gl.createTexture();
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, W, rowsTex, 0, gl.RGBA, gl.FLOAT, T);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.useProgram(prog);
+    var ringT = new Float32Array(16), RINGS = EA.LODS.full.rings;
+    for (k = 0; k < 16; k++) ringT[k] = k < RINGS.length ? RINGS[k] : 0;
+    gl.uniform1fv(gl.getUniformLocation(prog, "uRingT[0]") || gl.getUniformLocation(prog, "uRingT"), ringT);
+    gl.uniform1i(gl.getUniformLocation(prog, "uRingN"), RINGS.length);
+    gl.uniform1f(gl.getUniformLocation(prog, "uHalfRing"), EA.LODS.full.half);
+    gl.uniform1i(gl.getUniformLocation(prog, "uGenes"), 0);
+    var bufs = [], vao = gl.createVertexArray();
+    gl.bindVertexArray(vao);
+    function attr(name, data, size) {
+      var loc = gl.getAttribLocation(prog, name);
+      if (loc < 0) return;
+      var b = gl.createBuffer(); bufs.push(b);
+      gl.bindBuffer(gl.ARRAY_BUFFER, b); gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
+      gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, size, gl.FLOAT, false, 0, 0);
+    }
+    attr("aT", aT, 4); attr("aPat", aPat, 4); attr("aLam", aLam, 1); attr("aSlot", aSlot, 1);
+    var out = gl.createBuffer(); bufs.push(out);
+    gl.bindBuffer(gl.TRANSFORM_FEEDBACK_BUFFER, out);
+    gl.bufferData(gl.TRANSFORM_FEEDBACK_BUFFER, N * 3 * 4, gl.STREAM_READ);
+    gl.bindBuffer(gl.TRANSFORM_FEEDBACK_BUFFER, null);
+    var tfo = gl.createTransformFeedback();
+    gl.enable(gl.RASTERIZER_DISCARD);
+    gl.bindTransformFeedback(gl.TRANSFORM_FEEDBACK, tfo);
+    gl.bindBufferBase(gl.TRANSFORM_FEEDBACK_BUFFER, 0, out);
+    gl.beginTransformFeedback(gl.POINTS);
+    gl.drawArrays(gl.POINTS, 0, N);
+    gl.endTransformFeedback();
+    gl.bindBufferBase(gl.TRANSFORM_FEEDBACK_BUFFER, 0, null);
+    gl.bindTransformFeedback(gl.TRANSFORM_FEEDBACK, null);
+    gl.disable(gl.RASTERIZER_DISCARD);
+    gl.bindVertexArray(null);
+    var sync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
+    gl.flush();
+    gl.useProgram(null); gl.bindBuffer(gl.ARRAY_BUFFER, null); gl.bindTexture(gl.TEXTURE_2D, null);
+    function cleanup() {
+      gl.bindBuffer(gl.COPY_READ_BUFFER, null);
+      gl.deleteSync(sync); gl.deleteTransformFeedback(tfo); gl.deleteTexture(tex); gl.deleteProgram(prog); gl.deleteVertexArray(vao);
+      bufs.forEach(function (b) { gl.deleteBuffer(b); });
+    }
+    return fenceDone(gl, sync, 10000).then(function (why) {
+      if (why) { cleanup(); return { error: why }; }
+      var data = new Float32Array(N * 3);
+      gl.bindBuffer(gl.COPY_READ_BUFFER, out);
+      gl.getBufferSubData(gl.COPY_READ_BUFFER, 0, data);
+      cleanup();
+      var res = { bodies: nb, samples: ns, vertices: N, slotMap: opts.slotMap || "identity", maxSlot: top, texRows: rowsTex, mutate: opts.mutate || "",
+                  tol: BODY_TOL, nonFinite: 0, missing: 0, worst: 0, worstAt: "", parts: {}, ok: true };
+      BODY_PARTS.forEach(function (p) { res.parts[p] = { n: 0, worst: 0 }; });
+      for (c = 0; c < nb; c++) {
+        var rest = bodies[c].rest;
+        if (!rest || rest.length !== 3 * ns) { res.missing++; continue; }
+        for (i = 0; i < ns; i++) {
+          var o = 3 * (c * ns + i), part = BODY_PARTS[S[i][4]] || "?", P = res.parts[part] || (res.parts[part] = { n: 0, worst: 0 });
+          var gx = data[o], gy = data[o + 1], gz = data[o + 2];
+          P.n++;
+          if (!isFinite(gx) || !isFinite(gy) || !isFinite(gz)) { res.nonFinite++; continue; }
+          var e = Math.max(Math.abs(gx - rest[3 * i]), Math.abs(gy - rest[3 * i + 1]), Math.abs(gz - rest[3 * i + 2]));
+          if (e > P.worst) P.worst = e;
+          if (e > res.worst) { res.worst = e; res.worstAt = (bodies[c].name || "body " + c) + " sample " + i + " (" + part + ")"; }
+        }
+      }
+      res.ok = res.nonFinite === 0 && res.missing === 0 && res.worst <= BODY_TOL.geo;
+      return res;
+    });
+  }
+
   /** @type {EvoOceanSceneParityApi} */
   var API = {
     bind: bind, attach: attach,
-    appearancePathCheck: appearancePathCheck, appearanceVertexCheck: appearanceVertexCheck, appearanceFragmentCheck: appearanceFragmentCheck
+    appearancePathCheck: appearancePathCheck, appearanceVertexCheck: appearanceVertexCheck, appearanceFragmentCheck: appearanceFragmentCheck,
+    bodyPlanVertexCheck: bodyPlanVertexCheck, BODY_TOL: BODY_TOL, BODY_MUT: Object.keys(BODY_MUT)
   };
   root.EvoOceanSceneParity = API;
 })(typeof window !== "undefined" ? window : globalThis);

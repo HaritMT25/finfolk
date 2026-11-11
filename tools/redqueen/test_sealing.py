@@ -78,6 +78,29 @@ def E(role, pw, pf, qw=None, qf=None, rid=None, pe=None, qe=None, pref=None):
     return r
 
 
+def bound_mask(m, g):
+    """A graph.py mask /2 of manifest m's graph g that its own evidence supports (graph.mask_problems passes): every
+    world established (C02 at attempt 1), C06's prey zero at 5M (its 5M snapshot biological), the edge exclusions
+    computed from the snapshots."""
+    import graph as graphlib
+    rs = m["worlds_registry_sha256"]
+    est = {"decided": True, "disposition": "established", "why": "alive at the burn-in frame"}
+    W = {w: {"uuid": u, "attempt": 0, "attempt_uuid": u, "burn_in": est, "valid_before": None, "first_terminal": None,
+             "frontier": 200 * M, "refill": None, "available_sha256": {}} for w, u in m["uuids"].items()}
+    W["C02"] = dict(W["C02"], attempt=1, attempt_uuid=sealing.attempt_uuid(UUIDS["C02"], 1))
+    W["C06"] = dict(W["C06"], valid_before=5 * M, first_terminal={"frame": 5 * M, "kind": "prey"}, frontier=5 * M)
+    S = {f"C06:{5 * M}": {"world": "C06", "time": 5, "frame": 5 * M, "status": "biological", "why": "at or after its zero",
+                         "uuid": UUIDS["C06"], "attempt": 0, "snapshot": sealing.snapshot_uuid(UUIDS["C06"], 5 * M),
+                         "valid_before": 5 * M}}
+    ex, by = graphlib.edge_exclusions(g, S)
+    n, ne = len(g["edges"]), sum(len(v) for v in ex.values())
+    return {"schema": sealing.MASK_SCHEMA, "graph": {"edges_sha256": g["edges_sha256"], "namespace": g["namespace"], "edges": n},
+            "registry": {"sha256": rs, "burn_in_frame": 5 * M, "max_restarts": 8},
+            "block": {"sha256": "b" * 64, "registry_sha256": rs, "rederived": True},
+            "worlds": W, "snapshots": S, "edges": {"scheduled": n, "executable": n - ne, **{k: len(v) for k, v in ex.items()}},
+            "by_family_role": by, "excluded_edges": ex}
+
+
 class TestManifest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
@@ -114,6 +137,99 @@ class TestManifest(unittest.TestCase):
         wr(self.mp, json.dumps(dict(bad, holdout={})))
         with self.assertRaisesRegex(sealing.SealError, "not the registry's"):
             sealing.manifest(self.mp, self.wp)
+
+    def test_layout_and_availability_receipt(self):
+        """PR-D (Annex H D7 rule 34, D6 rule 27): the manifest records whether the graph's worlds are the registered
+        64-world layout (--layout 64 refuses any other); an availability mask of the manifest's graph and a plan
+        reconciliation of that mask are bound by an exclusively published receipt; another graph's mask or another
+        mask's reconciliation is refused."""
+        m = sealing.manifest(self.mp, self.wp, self.fp)
+        self.assertFalse(m["layout"]["registered_64"])
+        with self.assertRaisesRegex(sealing.SealError, "registered 64-world layout"):
+            sealing.manifest(self.mp, self.wp, self.fp, require_layout=True)
+        ws64 = [{"id": f"{t}{b}{i}", "treatment": t, "block": b} for b in range(1, 9)
+                for t, n in (("C", 4), ("A", 2), ("B", 2)) for i in range(n)]
+        lay = sealing.layout_of(ws64)
+        self.assertEqual((lay["registered_64"], lay["per_treatment"], lay["worlds"]), (True, {"C": 32, "A": 16, "B": 16}, 64))
+        old = [w for w in ws64 if not (w["treatment"] in "AB" and w["id"].endswith("1"))]        # (the 48 layout)
+        self.assertFalse(sealing.layout_of(old)["registered_64"])
+        # (a real graph.py graph, so the mask is checked against its edges; Codex #78 r2 P2-2)
+        import graph as graphlib
+        cg = os.path.join(self.tmp, "cg")
+        graphlib.write({"schema": "finfolk.redqueen.graph/1", "namespace": "ns", "split": SPLIT, "holdout": {},
+                        "worlds": [{"id": w, "treatment": w[0], "block": 1} for w in sorted(SPLIT)],
+                        "fork": ["C06"], "intensive": [],
+                        "edges": [("Q:C06:5", "P:C03:9", "support_c", "support", "short"),
+                                  ("Q:C03:9", "P:C04:9", "within", "training", None),
+                                  ("Q:C05:2", "P:C01:2", "cross", "training", None)]}, cg)
+        gp = os.path.join(cg, "graph.jsonl.gz")
+        g = graphlib.load(gp)
+        m = sealing.manifest(os.path.join(cg, "graph.meta.json"), self.wp, self.fp)
+        study = os.path.join(self.tmp, "study")
+        sealing.publish_manifest(study, rqlib.canonical(m))
+        rs, ge = m["worlds_registry_sha256"], m["graph"]["graph_edges_sha256"]
+        mask = bound_mask(m, g)
+        kp, rp = os.path.join(self.tmp, "mask.json"), os.path.join(self.tmp, "recon.json")
+        wr(kp, json.dumps(mask))
+        recon = {"schema": "finfolk.redqueen.reconciliation/1", "mask": {"sha256": rqlib.sha256_file(kp), "registry": {"sha256": rs}},
+                 "plan_sha256": "a" * 64, "pending_plan": {"sha256": "c" * 64}, "scheduled": 6, "executable": 4,
+                 "excluded": {"biological": 2, "technical": 0, "pending": 0}}
+        wr(rp, json.dumps(recon))
+        r = sealing.availability_receipt(study, kp, rp, gp)
+        out = os.path.join(sealing.reg_dir(study), "availability", f"{rqlib.sha256_file(kp)}.{rqlib.sha256_file(rp)}.json")
+        self.assertEqual(rqlib.read_bytes(out), rqlib.canonical(r))
+        self.assertEqual((r["split_manifest_sha256"], r["reconciliation"]["sha256"], r["reconciliation"]["excluded"]["biological"]),
+                         (rqlib.sha256_file(os.path.join(study, "config", "splits.json")), rqlib.sha256_file(rp), 2))
+        self.assertEqual((r["worlds_registry_sha256"], r["attempts"]["C02"]["attempt"], r["mask"]["rederived"]), (rs, 1, True))
+        self.assertEqual(sealing.availability_receipt(study, kp, rp, gp), r)      # (the same bytes again: accepted)
+        # (Codex #78 r2 P2-2) the mask must be CONSISTENT with its own evidence and the graph's edges
+        S, W0 = mask["snapshots"], mask["worlds"]
+        for bad, msg in (({k: v for k, v in mask.items() if k != "snapshots"}, "consistent availability mask"),
+                         (dict(mask, snapshots={}), "excluded edges"),
+                         (dict(mask, worlds=dict(W0, C06=dict(W0["C06"], first_terminal=None))), "first terminal"),
+                         (dict(mask, snapshots={k: dict(v, status="technical") for k, v in S.items()}), "but technical"),
+                         (dict(mask, excluded_edges={"biological": [], "technical": [], "pending": []}), "excluded edges")):
+            wr(kp + ".y", json.dumps(bad))
+            with self.assertRaisesRegex(sealing.SealError, msg):
+                sealing.availability_receipt(study, kp + ".y", None, gp)
+        with self.assertRaisesRegex(sealing.SealError, "needs --graph"):
+            sealing.availability_receipt(study, kp, rp)
+        with self.assertRaisesRegex(sealing.SealError, "not the manifest's graph"):
+            sealing.availability_receipt(study, kp, rp, os.path.join(os.path.dirname(self.mp), "graph.jsonl.gz"))
+        # (Codex #78 r1 P2-4) the same graph ids and topology, another study's registry / identities: refused
+        W = mask["worlds"]
+        for bad, msg in ((dict(mask, graph={"edges_sha256": "0" * 64}), "another graph"),
+                         (dict(mask, registry={"sha256": "r" * 64}), "another histories registry"),
+                         (dict(mask, block=dict(mask["block"], registry_sha256="r" * 64)), "another histories registry"),
+                         (dict(mask, worlds=dict(W, C01=dict(W["C01"], uuid="u-other"))), "not the registered one"),
+                         (dict(mask, worlds=dict(W, C02=dict(W["C02"], attempt=2))), "attempt identity"),
+                         (dict(mask, worlds={k: v for k, v in W.items() if k != "C03"}), "not the manifest's"),
+                         (dict(mask, schema="finfolk.redqueen.graphmask/1"), "not an availability mask")):
+            wr(kp + ".x", json.dumps(bad))
+            with self.assertRaisesRegex(sealing.SealError, msg):
+                sealing.availability_receipt(study, kp + ".x", None, gp)
+        for bad, msg in ((dict(recon, mask={"sha256": "0" * 64}), "another mask"),
+                         (dict(recon, schema="x"), "not a plan reconciliation"),
+                         (dict(recon, plan_sha256=None), "plan's and its pending plan's"),
+                         (dict(recon, mask=dict(recon["mask"], registry={"sha256": "r" * 64})), "another histories registry")):
+            wr(rp + ".x", json.dumps(bad))
+            with self.assertRaisesRegex(sealing.SealError, msg):
+                sealing.availability_receipt(study, kp, rp + ".x", gp)
+        self.assertEqual(len(os.listdir(os.path.join(sealing.reg_dir(study), "availability"))), 1)   # (nothing else)
+        # (P3) the production manifest needs its fork registry and reference assignment
+        g64 = os.path.join(self.tmp, "g64")
+        wr(os.path.join(g64, "graph.meta.json"), json.dumps({"worlds": ws64, "split": {w["id"]: "train" for w in ws64},
+                                                            "holdout": {}, "edges_sha256": "e" * 64}))
+        with open(os.path.join(g64, "graph.jsonl.gz"), "wb") as f:
+            f.write(gzip.compress(b"", mtime=0))
+        wp64 = os.path.join(self.tmp, "worlds64.json")
+        wr(wp64, json.dumps({"worlds": [{"id": w["id"], "uuid": f"u-{w['id']}"} for w in ws64]}))
+        self.assertTrue(sealing.manifest(os.path.join(g64, "graph.meta.json"), wp64)["layout"]["registered_64"])
+        with self.assertRaisesRegex(sealing.SealError, "needs the fork registry"):
+            sealing.manifest(os.path.join(g64, "graph.meta.json"), wp64, require_layout=True)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(sealing.main(["availability", "--study", study, "--mask", kp, "--graph", gp]), 0)
+        self.assertEqual(len(os.listdir(os.path.join(sealing.reg_dir(study), "availability"))), 2)
 
     def test_identity_binding(self):
         """#67 review 2: labels must agree with identities (the world's UUID, the snapshot UUID recipe; a
@@ -214,6 +330,25 @@ class TestManifest(unittest.TestCase):
                     {"id": "b3", "role": "training", "prey": {"world": "C03", "frame": 9 * M},
                      "predators": {"source": "random", "world": "C04", "frame": 9 * M}}):
             self.assertTrue(sealing.record_problems(m, [bad]), bad)
+        # the scripted Stage A benchmark source (Annex H D7, PR-A): like random, no held-out role of its own,
+        # a predator source only and exactly that dict; a distinct identity from the random source (one prey
+        # with random and with scripted predators is two targets, so their differing roles do not conflict)
+        scr = [{"id": "s1", "role": "test", "prey": {"world": "C06", "frame": 6 * M}, "predators": {"source": "scripted"}},
+               {"id": "s2", "role": "training", "prey": {"world": "C03", "frame": 9 * M}, "predators": {"source": "scripted"}},
+               {"id": "s3", "role": "diagnostic", "prey": {"world": "C03", "frame": 9 * M}, "predators": {"source": "random"}}]
+        self.assertEqual(sealing.record_problems(m, scr), [])
+        self.assertEqual(sealing.resolve(m, {"source": "scripted"}, "P"), ("scripted", None))
+        self.assertEqual(sealing.edge_role(m, scr[0]["prey"], scr[0]["predators"]), "test")
+        self.assertEqual([r["id"] for r in sealing.stage_filter(m, scr + [test_pair], "fit")], ["s2"])
+        for bad, why in (({"id": "c1", "role": "training", "prey": {"world": "C06", "frame": 6 * M},
+                           "predators": {"source": "scripted"}}, "most held-out endpoint makes it test"),
+                         ({"id": "c2", "role": "training", "prey": {"source": "scripted"}, "predators": None}, "only a predator"),
+                         ({"id": "c3", "role": "training", "prey": {"world": "C03", "frame": 9 * M},
+                           "predators": {"source": "scripted", "k": 4}}, "only a predator"),
+                         ({"id": "c4", "role": "training", "prey": {"world": "C03", "frame": 9 * M},
+                           "predators": {"source": "neural"}}, "only a predator")):
+            probs = sealing.record_problems(m, [bad])
+            self.assertTrue(any(why in p for p in probs), (bad, probs))
         # the assignment itself: eight per guild, distinct, from the sentinel namespace, never a study identity
         def refs_file(refs, ns=SENT):
             wr(self.rp, json.dumps({"schema": "finfolk.redqueen.references/1", "namespace": ns, "references": refs}))

@@ -152,7 +152,7 @@ def tie_key(guild, world, frame, crit=CRITERION):
     return hashlib.sha256(f"{crit['tie_namespace']}|refsel|{guild}|{world}|{frame}".encode()).hexdigest()
 
 
-# ================================================================== seeds (as rho_pilot.py)
+# ================================================================== seeds (as worlds.py's --avoid reader)
 def _collect_seeds(obj, out, hint=False):
     if isinstance(obj, dict):
         for k, v in obj.items():

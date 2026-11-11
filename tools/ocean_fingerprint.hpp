@@ -60,6 +60,23 @@
 //         simulation sections, `all` and `chain` of a run with appearance on
 //         are byte for byte those of the same run with it off — the harness's
 //         app_off_* twins check exactly that (wasm/ocean_parity.sh).
+//   body  the M2a body-plan preview (src/ocean/physical_genome.hpp,
+//         body_plan.hpp: diagnostic, read by nothing the step computes): the
+//         physical schema / founder / inheritance / stream versions, the
+//         geometry law and metrics ABI with the layout's size, the preview's
+//         config keys (bodyPlanPreviewEnabled and its two inheritance knobs),
+//         the world's flag as of init, the broken flag, the stream key, the
+//         construction counters and refused compiles, the record count, then
+//         per record (creature order) the creature's id, the stored owner id,
+//         the five physical alleles, the creature's 30 M1 shape genes (as its
+//         appearance record holds them) and every coefficient, all by bit
+//         pattern (the coefficients are packed floats: no padding exists to
+//         hash). Printed (`body=`, the driver's `bodychain=`) only when the
+//         preview is on, was on at init, broke, or a knob is off its default
+//         (a conditional extension like the walls': the format stays 4, and a
+//         world without it prints exactly what it did). Never in `all`: the
+//         harness's body twins check that a case with the preview on is the
+//         case without it, minus its body* fields.
 //
 // Not hashed, by design: scratch the step rebuilds from hashed state before
 // reading it (the grids' entries — the food grid's copies of each item's depth /
@@ -210,8 +227,10 @@ constexpr std::size_t fieldCount() {
 #define OFP_FIELDS(T, N) \
     static_assert(detail::fieldCount<T>() == (N), #T " gained or lost a field: hash it in tools/ocean_fingerprint.hpp, then update this count")
 OFP_FIELDS(SimConfig, 78);   // 71 + the seven Stage C keys (visitSimConfigBrain)
-OFP_FIELDS(OceanConfig, 37);
+OFP_FIELDS(OceanConfig, 40);   // 37 + the body-plan preview's three (visitOceanConfigBodyPlan, hashed in `body`)
 OFP_FIELDS(appearance::Stats, 10);   // founders, offspring, pattern[4], morph[4]
+OFP_FIELDS(physical::Stats, 6);      // founders, offspring, mode[4]
+OFP_FIELDS(physical::Genes, physical::kGenes);
 OFP_FIELDS(AgentCore, 16 + NUM_SENSES + NUM_ACTIONS + 1);   // 14 scalars + genome + nnet, the two arrays, colour
 OFP_FIELDS(Fish, 1 + 6 + Fish::BODY_LEN);                   // base, pos .. bodyBuoy, body[]
 OFP_FIELDS(Predator, 18);   // 9 + the Stage C brain (genome .. virtualBuds): hashPredator's tagged block
@@ -262,6 +281,10 @@ struct OceanWorld_ : WorldCommon {
     std::vector<int> foodSeen;   // scratch (see above)
     CurrentField current; std::vector<Vec2> patches; std::vector<float> patchDepth;
     std::vector<appearance::Record> app; std::uint64_t appKey; int appFlags; bool appBroken; appearance::Stats appStats;
+    std::vector<std::uint64_t> bodyOwners; std::vector<physical::Genes> bodyGenes;
+    std::vector<bodyplan::BirthCoefficients> bodyBirth;
+    std::uint64_t bodyKey, bodyRevision, bodyUncompiled;   // bodyRevision: the exports' change counter (not hashed)
+    physical::Stats bodyStats; bool bodyFlag, bodyBroken;
     WaveTrain_ waves[OceanWorld::kWaveTrains];
     oceanflow::FlowCache flow;   // scratch (see above)
 #ifdef EVO_OCEAN_EYE
@@ -336,9 +359,12 @@ struct Fingerprint {
     std::uint64_t all = 0, cfg = 0, ctr = 0, fish = 0, food = 0, pred = 0, sig = 0, cur = 0, geo = 0, rng = 0;
     std::uint64_t app = 0;   // the appearance section: NOT in `all` (see the top)
     bool appShown = false;   // printed: appearance on, or an appearance knob off its default
+    std::uint64_t body = 0;  // the body-plan preview's section: NOT in `all` either
+    bool bodyShown = false;  // printed: the preview on (or built, or broken), or a knob off its default
     bool operator==(const Fingerprint& o) const {
         return all == o.all && cfg == o.cfg && ctr == o.ctr && fish == o.fish && food == o.food && pred == o.pred &&
-               sig == o.sig && cur == o.cur && geo == o.geo && rng == o.rng && app == o.app && appShown == o.appShown;
+               sig == o.sig && cur == o.cur && geo == o.geo && rng == o.rng && app == o.app && appShown == o.appShown &&
+               body == o.body && bodyShown == o.bodyShown;
     }
     bool operator!=(const Fingerprint& o) const { return !(*this == o); }
 };
@@ -410,6 +436,11 @@ template <class V>
 void visitOceanConfigAppearance(const OceanConfig& c, V& v) {
     OFP_I(appearance); OFP_F(patternMutation); OFP_F(patternPhaseMutation); OFP_F(patternNovelProbability);
     OFP_F(morphologyMutation); OFP_F(morphologyNovelProbability);
+}
+// The body-plan preview's keys (hashed in `body`, not `cfg`: diagnostic; see the top).
+template <class V>
+void visitOceanConfigBodyPlan(const OceanConfig& c, V& v) {
+    OFP_B(bodyPlanPreviewEnabled); OFP_F(physicalMutation); OFP_F(physicalNovelProbability);
 }
 // The glass-wall keys (walls, sideWallBand, sideWallTurnRate): dumped and
 // scanned like the rest, hashed in `cfg` as one tagged block only when they
@@ -702,6 +733,44 @@ inline void hashAppearance(Hasher& h, const OceanWorld& w) {
     }
 }
 
+// The body-plan preview's section (see the top).
+inline bool bodyPlanShown(const OceanWorld& w) {
+    return !oceanBodyPlanAtDefaults(w.ocfg) || w.bodyPlanInitEnabled() || w.bodyPlanBroken();
+}
+inline void hashBodyPlan(Hasher& h, const OceanWorld& w) {
+    h.u64((std::uint64_t)physical::kSchema | (std::uint64_t)physical::kFounderLaw << 8 |
+          (std::uint64_t)physical::kInheritanceLaw << 16 | (std::uint64_t)physical::kStreamLaw << 24 |
+          (std::uint64_t)bodyplan::kGeometryLaw << 32 | (std::uint64_t)bodyplan::kMetricsAbi << 40);
+    h.u64((std::uint64_t)physical::kGenes | (std::uint64_t)bodyplan::kMetrics << 8 | (std::uint64_t)bodyplan::kSamples << 24);
+    visitOceanConfigBodyPlan(w.ocfg, h);
+    h.b(w.bodyPlanInitEnabled()); h.b(w.bodyPlanBroken()); h.u64(w.bodyPlanKey());
+    const physical::Stats& st = w.bodyPlanStats();
+    h.u64(st.founders); h.u64(st.offspring);
+    for (std::uint64_t x : st.mode) h.u64(x);
+    h.u64(w.bodyPlanUncompiled());
+    const auto& owners = w.bodyPlanOwners();
+    const auto& genes = w.bodyPlanGenes();
+    const auto& birth = w.bodyPlanBirth();
+    const auto& recs = w.appearanceRecords();
+    h.u64(owners.size()); h.u64(genes.size()); h.u64(birth.size());
+    for (std::size_t i = 0; i < owners.size(); ++i) {
+        h.u64(i < w.creatures.size() ? w.creatures[i].id : ~0ull);
+        h.u64(owners[i]);
+        if (i < genes.size()) for (float g : genes[i].g) h.f32(g);
+        if (i < recs.size()) {   // the M1 shape genes the body was built from
+            const float* g = recs[i].genome.g + appearance::kMorphOffset;
+            for (int j = 0; j < appearance::kMorphGenes; j += 2) h.f32x2(g[j], g[j + 1]);
+        } else {
+            h.u64(0xB0D7A11E5EED0001ull);   // (no appearance record: a tagged gap)
+        }
+        if (i < birth.size()) {
+            const float* m = birth[i].m;
+            for (int k = 0; k + 1 < bodyplan::kMetrics; k += 2) h.f32x2(m[k], m[k + 1]);
+            if (bodyplan::kMetrics % 2) h.f32(m[bodyplan::kMetrics - 1]);
+        }
+    }
+}
+
 inline Fingerprint fingerprint(const OceanWorld& w, bool withActivations = true) {
     Fingerprint fp;
     { Hasher h; hashConfig(h, w.cfg, w.ocfg); fp.cfg = h.value(); }
@@ -725,6 +794,8 @@ inline Fingerprint fingerprint(const OceanWorld& w, bool withActivations = true)
     fp.all = a.value();
     fp.appShown = appearanceShown(w);
     { Hasher h; hashAppearance(h, w); fp.app = h.value(); }
+    fp.bodyShown = bodyPlanShown(w);
+    if (fp.bodyShown) { Hasher h; hashBodyPlan(h, w); fp.body = h.value(); }   // (only then: its cost stays off the OFF runs)
     return fp;
 }
 
@@ -774,8 +845,13 @@ inline long countNonFinite(const OceanWorld& w) {
     visitOceanConfigVision(w.ocfg, nf);
     visitOceanConfigAppearance(w.ocfg, nf);
     visitOceanConfigWalls(w.ocfg, nf);
+    visitOceanConfigBodyPlan(w.ocfg, nf);
     for (const auto& r : w.appearanceRecords())
         for (float v : r.genome.g) f(v);
+    for (const auto& g : w.bodyPlanGenes())
+        for (float v : g.g) f(v);
+    for (const auto& b : w.bodyPlanBirth())
+        for (float v : b.m) f(v);
     const CurrentField& cf = field<peek::OwCurrent>(w);
     for (float v : cf.vortexState()) f(v);
     for (const Vec2& c : field<peek::CfCenters>(cf)) { f(c.x); f(c.y); }
@@ -817,6 +893,10 @@ inline std::string fingerprintLine(const char* tag, long long step, const OceanW
         std::snprintf(buf, sizeof buf, " app=%016llx", (unsigned long long)fp.app);
         line += buf;
     }
+    if (fp.bodyShown) {   // then the body-plan preview's (outside `all` too)
+        std::snprintf(buf, sizeof buf, " body=%016llx", (unsigned long long)fp.body);
+        line += buf;
+    }
     return line;
 }
 
@@ -854,6 +934,7 @@ inline void dumpState(const OceanWorld& w, std::FILE* out) {
     visitOceanConfigVision(w.ocfg, d);
     visitOceanConfigAppearance(w.ocfg, d);
     visitOceanConfigWalls(w.ocfg, d);
+    if (bodyPlanShown(w)) visitOceanConfigBodyPlan(w.ocfg, d);   // (as hashed: a preview-off dump is the one before the keys)
     std::fprintf(out, "\nwaves");
     for (const auto& t : field<peek::OwWaves>(w)) {
         d.db("kx", t.kx); d.db("ky", t.ky); d.db("phase", t.phase); d.db("phi", t.phi);
@@ -972,6 +1053,22 @@ inline void dumpState(const OceanWorld& w, std::FILE* out) {
         for (std::size_t i = 0; i < recs.size(); ++i) {
             std::fprintf(out, "app %zu owner=%llu", i, (unsigned long long)recs[i].ownerId);
             for (float v : recs[i].genome.g) std::fprintf(out, " %08x", (unsigned)bits(v));
+            std::fprintf(out, "\n");
+        }
+    }
+    if (bodyPlanShown(w)) {   // the body-plan preview (its own section, `body`)
+        const physical::Stats& st = w.bodyPlanStats();
+        std::fprintf(out, "bodyplan init=%d broken=%d key=%016llx records=%zu founders=%llu offspring=%llu modes=%llu/%llu/%llu/%llu uncompiled=%llu\n",
+                     (int)w.bodyPlanInitEnabled(), (int)w.bodyPlanBroken(), (unsigned long long)w.bodyPlanKey(),
+                     w.bodyPlanOwners().size(), (unsigned long long)st.founders, (unsigned long long)st.offspring,
+                     (unsigned long long)st.mode[0], (unsigned long long)st.mode[1], (unsigned long long)st.mode[2],
+                     (unsigned long long)st.mode[3], (unsigned long long)w.bodyPlanUncompiled());
+        const auto& owners = w.bodyPlanOwners();
+        for (std::size_t i = 0; i < owners.size(); ++i) {
+            std::fprintf(out, "body %zu owner=%llu genes", i, (unsigned long long)owners[i]);
+            if (i < w.bodyPlanGenes().size()) for (float v : w.bodyPlanGenes()[i].g) std::fprintf(out, " %08x", (unsigned)bits(v));
+            std::fprintf(out, " birth");
+            if (i < w.bodyPlanBirth().size()) for (float v : w.bodyPlanBirth()[i].m) std::fprintf(out, " %08x", (unsigned)bits(v));
             std::fprintf(out, "\n");
         }
     }

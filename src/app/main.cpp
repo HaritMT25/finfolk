@@ -154,6 +154,8 @@ void printUsage(const char* prog) {
         "Transplant (Stage C time-shift assays; needs --load-checkpoint X and --transplant-out):\n"
         "  --predators-from Y|random  replace X's predators with K of checkpoint Y's (their genomes,\n"
         "                            lineages and traits; everything else reset) or K random founders\n"
+        "  --predators-from scripted K scripted (Stage A) hunters: no brain, immortal and fixed; the\n"
+        "                            arena is a version-1 checkpoint (the H-C scripted benchmark)\n"
         "  --transplant-count K      how many (default: all of Y's; required with 'random')\n"
         "  --transplant-seed S       the transplant's own stream: sample, placement (default 1)\n"
         "  --assay frozen|frozen-newborn|live\n"
@@ -580,7 +582,7 @@ int main(int argc, char** argv) {
         // Stage C transplant: the loaded world is X; write the arena and stop.
         if (transplantMode) {
             std::string yText;
-            if (transplantOpt.predatorsFrom != "random") {
+            if (transplantOpt.predatorsFrom != "random" && transplantOpt.predatorsFrom != "scripted") {
                 std::ifstream yf(transplantOpt.predatorsFrom, std::ios::binary);
                 if (!yf) {
                     std::cerr << "!! cannot read '" << transplantOpt.predatorsFrom << "'\n";
