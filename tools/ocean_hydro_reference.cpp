@@ -7,16 +7,18 @@
 //   partition   the 112 cells and the hull integrated again in double from
 //               the same canonical points: Σ cells = hull, every cell
 //               positive, the float cells' moments vs double
-//   compound    the lean compound assembled again in double (the brief's
-//               parallel-axis formula over the parts' float volume moments)
-//               vs evalLoad's unloaded origin-moment assembly
+//   compound    independent double cell allocation and fin-lamina integration,
+//               transformed parts + lipid, full parallel-axis assembly at all
+//               three loads, vs evalLoad mass/COM/inertia
+//   body tensors degree-two exact quadrature of local hull velocity levers:
+//               Abody and Jbody, including a reversed-TR-block fault check
 //   inflation   geometry law 1 recompiled at the inflation k (its inflated
 //               points), the hull's moments integrated in double, vs the
 //               analytic T(k) update
 //   tensors     Dfin / Afin by a direct traversal of the fins at k (levers
 //               from the loaded COM, in double) vs the birth bases + the
 //               spatial congruence
-//   solve       the passive solve (Meff + h D) z' = Meff z in double
+//   solve       independently constructed passive (Meff + h D) z' = Meff z in double
 //               (Gaussian elimination, partial pivoting) vs the fixed
 //               unpivoted binary32 LDLᵀ
 //   patch model the sequential fin-patch model's passive force — each fin
@@ -32,8 +34,11 @@
 // Exits 1 when a gated check exceeds its tolerance. Native only:
 //   g++ -O3 -std=c++20 -ffp-contract=off -DEVO_WORLD_OCEAN -I src tools/ocean_hydro_reference.cpp -o ohr && ./ohr
 #include <cmath>
+#include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <string>
 #include <vector>
 #include "ocean/hydro_coefficients.hpp"
@@ -66,6 +71,240 @@ DM hullD(const bodyplan::Points& P) {   // the origin tetrahedra over the hull (
     for (int k = 0; k < bodyplan::kHullTris; ++k) tet(m, d3(P.p[T.t[k].a]), d3(P.p[T.t[k].b]), d3(P.p[T.t[k].c]));
     return m;
 }
+// Independent material construction. Only law-1 geometry/development is shared:
+// no bodymat allocation, material moments, compact load bases or Loaded values.
+// Cell topology is integrated above; allocate in stable nearest-cell order here.
+void add(DM& a, const DM& b, double scale = 1) {
+    a.v += scale * b.v;
+    for (int i = 0; i < 3; ++i) a.f[i] += scale * b.f[i];
+    for (int i = 0; i < 6; ++i) a.s[i] += scale * b.s[i];
+}
+DM take(const std::array<DM, 112>& full, std::array<DM, 112>& rem,
+        double need, D3 centre, bool eyes) {
+    std::vector<int> order;
+    for (int i = 0; i < 112; ++i) if (!eyes || i % 8 < 4) order.push_back(i);
+    auto distance = [&](int i) {
+        const DM& m = full[i];
+        return ddot(dsub(D3{m.f[0] / m.v, m.f[1] / m.v, m.f[2] / m.v}, centre),
+                    dsub(D3{m.f[0] / m.v, m.f[1] / m.v, m.f[2] / m.v}, centre));
+    };
+    std::sort(order.begin(), order.end(), [&](int a, int b) {
+        return distance(a) < distance(b) || (distance(a) == distance(b) && a < b);
+    });
+    DM result;
+    for (int i : order) {
+        if (need <= 0 || rem[i].v <= 0) continue;
+        const double fraction = std::min(1.0, need / rem[i].v);
+        const DM piece = rem[i];
+        add(result, piece, fraction);
+        add(rem[i], piece, -fraction);
+        need -= fraction * piece.v;
+        if (eyes) {
+            const int mirror = 8 * (i / 8) + 7 - i % 8;
+            const DM left = rem[mirror];
+            add(rem[mirror], left, -fraction);
+        }
+    }
+    if (need > 1e-10 * full[0].v) { std::fprintf(stderr, "double allocation shortfall\n"); std::exit(1); }
+    if (eyes) {
+        DM left = result;
+        left.f[1] *= -1; left.s[3] *= -1; left.s[5] *= -1;
+        add(result, left);
+    }
+    return result;
+}
+struct DPart { double mass, centre[3], cov[3][3]; };
+DPart part(const DM& m, double density, const double stretch[3], const double shift[3]) {
+    DPart p{};
+    p.mass = density * m.v;
+    if (!(m.v > 0)) return p;
+    for (int i = 0; i < 3; ++i) {
+        p.centre[i] = stretch[i] * m.f[i] / m.v + shift[i];
+        for (int j = 0; j < 3; ++j)
+            p.cov[i][j] = density * stretch[i] * stretch[j] *
+                (m.s[s3(i, j)] - m.f[i] * m.f[j] / m.v);
+    }
+    return p;
+}
+struct DCompound { double mass = 0, com[3]{}, inertia[3][3]{}; };
+DCompound compound(const std::vector<DPart>& parts) {
+    DCompound out;
+    for (const auto& p : parts) {
+        out.mass += p.mass;
+        for (int i = 0; i < 3; ++i) out.com[i] += p.mass * p.centre[i];
+    }
+    for (double& x : out.com) x /= out.mass;
+    // Central part inertia plus parallel-axis contribution, part by part.
+    for (const auto& p : parts) {
+        double d[3], d2 = 0, trace = 0;
+        for (int i = 0; i < 3; ++i) { d[i] = p.centre[i] - out.com[i]; d2 += d[i] * d[i]; trace += p.cov[i][i]; }
+        for (int i = 0; i < 3; ++i) for (int j = 0; j < 3; ++j)
+            out.inertia[i][j] += (i == j ? trace + p.mass * d2 : 0) - p.cov[i][j] - p.mass * d[i] * d[j];
+    }
+    return out;
+}
+// Reintegrate each fin's triangles and root bases in double, rather than
+// reading the production Material's lamina moments / finBasis.
+struct DFin { DM moments; double basis[3]{}; };
+std::array<DFin, 7> finParts(const bodyplan::Points& pts, const bodyplan::BirthCoefficients& bc) {
+    std::array<DFin, 7> out{};
+    const auto& tris = bodyplan::canonicalTris();
+    const int caudEnd = bodyplan::kHullTris + 2 * bodyplan::kCaudalIntervals * (bodyplan::kCaudalRows - 1);
+    for (int f = 0; f < 7; ++f) {
+        const int first = f == 0 ? bodyplan::kHullTris : caudEnd + (f - 1) * 2 * bodyplan::kFinIntervals;
+        const int end = f == 0 ? caudEnd : first + 2 * bodyplan::kFinIntervals;
+        auto root = [&](int id) {
+            const int base = bodyplan::kDorsal0 + (f - 1) * bodyplan::kStripSamples;
+            D3 r = d3(pts.p[base + 2 * ((id - base) / 2)]);
+            return D3{0, f < 3 ? 0 : r.y, r.z};
+        };
+        for (int t = first; t < end; ++t) {
+            const auto& tri = tris.t[t];
+            if (f == 0 && tri.part != 1) continue;
+            const D3 vertices[] = {d3(pts.p[tri.a]), d3(pts.p[tri.b]), d3(pts.p[tri.c])};
+            const D3 n = dcross(dsub(vertices[1], vertices[0]), dsub(vertices[2], vertices[0]));
+            const double area = std::sqrt(ddot(n, n)) / 2;
+            const double v[3][3] = {{vertices[0].x, vertices[0].y, vertices[0].z},
+                {vertices[1].x, vertices[1].y, vertices[1].z}, {vertices[2].x, vertices[2].y, vertices[2].z}};
+            double sum[3]{};
+            for (int i = 0; i < 3; ++i) for (int a = 0; a < 3; ++a) sum[i] += v[a][i];
+            out[f].moments.v += area;
+            for (int i = 0; i < 3; ++i) {
+                out[f].moments.f[i] += area * sum[i] / 3;
+                for (int j = i; j < 3; ++j) {
+                    double ss = sum[i] * sum[j];
+                    for (int a = 0; a < 3; ++a) ss += v[a][i] * v[a][j];
+                    out[f].moments.s[s3(i, j)] += area * ss / 12;
+                }
+            }
+            if (f != 0) for (int id : {tri.a, tri.b, tri.c}) {
+                const D3 r = root(id);
+                out[f].basis[1] += area * r.y / 3; out[f].basis[2] += area * r.z / 3;
+            }
+        }
+        if (out[f].moments.v > 0) for (double& x : out[f].basis) x /= out[f].moments.v;
+        const DM lamina = out[f].moments;
+        out[f].moments = DM{};
+        add(out[f].moments, lamina, bc.m[bodyplan::finAt(f, bodyplan::kFinThickness)]);
+    }
+    return out;
+}
+// Degree-two exact tetrahedral quadrature. Evaluate local velocity levers at
+// four interior samples of every signed hull tetrahedron. This independently
+// integrates Abody and Jbody without reproducing their moment expansions.
+void bodyTensors(const bodyplan::Points& pts, double k, const double com[3], double rw,
+                 const double added[3], const double Khull[3], double Abody[6][6], double J[3][3]) {
+    const auto& tris = bodyplan::canonicalTris();
+    const double hi = (5 + 3 * std::sqrt(5.0)) / 20, lo = (5 - std::sqrt(5.0)) / 20;
+    double volume = 0;
+    for (int t = 0; t < bodyplan::kHullTris; ++t) {
+        const auto& tri = tris.t[t];
+        D3 v[] = {{0, 0, 0}, d3(pts.p[tri.a]), d3(pts.p[tri.b]), d3(pts.p[tri.c])};
+        for (auto& p : v) { p.y *= k; p.z *= k; }
+        const double weight = ddot(v[1], dcross(v[2], v[3])) / 24;
+        volume += 4 * weight;
+        for (int q = 0; q < 4; ++q) {
+            D3 r{-com[0], -com[1], -com[2]};
+            for (int a = 0; a < 4; ++a) {
+                const double w = a == q ? hi : lo;
+                r.x += w * v[a].x; r.y += w * v[a].y; r.z += w * v[a].z;
+            }
+            for (int axis = 0; axis < 3; ++axis) {
+                const D3 e{double(axis == 0), double(axis == 1), double(axis == 2)};
+                const D3 lever = dcross(r, e);
+                const double w[] = {e.x, e.y, e.z, lever.x, lever.y, lever.z};
+                for (int i = 0; i < 6; ++i) for (int j = 0; j < 6; ++j)
+                    Abody[i][j] += weight * rw * added[axis] * w[i] * w[j];
+                for (int i = 0; i < 3; ++i) for (int j = 0; j < 3; ++j)
+                    J[i][j] += weight * Khull[axis] * w[3 + i] * w[3 + j];
+            }
+        }
+    }
+    for (int i = 0; i < 3; ++i) for (int j = 0; j < 3; ++j) J[i][j] /= volume;
+}
+// Diagnostic controls preserve geometry: split each exact quadrature weight
+// into repeats equal terms, changing accumulation length without changing law.
+// Float accumulation deliberately isolates summation from integrand rounding.
+void momentTensors(const DM& H, double k, const double com[3], double rw,
+                   const double added[3], const double K[3], double ad[6][6], double jd[3][3]) {
+    const double stretch[] = {1, k, k};
+    double centre[3], cov[3][3];
+    for (int i = 0; i < 3; ++i) centre[i] = stretch[i] * H.f[i] / H.v;
+    for (int i = 0; i < 3; ++i) for (int j = 0; j < 3; ++j)
+        cov[i][j] = stretch[i] * stretch[j] * (H.s[s3(i,j)] / H.v - H.f[i] * H.f[j] / (H.v * H.v))
+            + (centre[i] - com[i]) * (centre[j] - com[j]);
+    const double V = k * k * H.v;
+    // Production moment expansion, promoted throughout to double, versus
+    // the independent local-lever quadrature. No production moments as inputs.
+    for (int axis = 0; axis < 3; ++axis) {
+        D3 e{double(axis == 0), double(axis == 1), double(axis == 2)};
+        const D3 r{centre[0] - com[0], centre[1] - com[1], centre[2] - com[2]}, l = dcross(r, e);
+        const double lever[] = {l.x, l.y, l.z};
+        ad[axis][axis] = rw * added[axis] * V;
+        for (int i = 0; i < 3; ++i) ad[axis][3+i] = ad[3+i][axis] = rw * added[axis] * V * lever[i];
+    }
+    const double cx=added[0], cy=added[1], cz=added[2];
+    const double rot[3][3] = {{cy*cov[2][2]+cz*cov[1][1], -cz*cov[0][1], -cy*cov[0][2]},
+        {-cz*cov[0][1], cx*cov[2][2]+cz*cov[0][0], -cx*cov[1][2]},
+        {-cy*cov[0][2], -cx*cov[1][2], cx*cov[1][1]+cy*cov[0][0]}};
+    const double resistance[3][3] = {{K[1]*cov[2][2]+K[2]*cov[1][1], -K[2]*cov[0][1], -K[1]*cov[0][2]},
+        {-K[2]*cov[0][1], K[0]*cov[2][2]+K[2]*cov[0][0], -K[0]*cov[1][2]},
+        {-K[1]*cov[0][2], -K[0]*cov[1][2], K[0]*cov[1][1]+K[1]*cov[0][0]}};
+    for (int i=0;i<3;++i) for(int j=0;j<3;++j) {ad[3+i][3+j]=rw*V*rot[i][j]; jd[i][j]=resistance[i][j];}
+}
+void roundoffReport(const bodyplan::Points& pts, const DM& H, const Coefficients& c,
+                    const Loaded& L, double k, const double com[3], double rw,
+                    const double added[3], const double K[3], const double A[6][6],
+                    const double J[3][3], const std::string& name) {
+    double ad[6][6]{}, jd[3][3]{};
+    momentTensors(H, k, com, rw, added, K, ad, jd);
+    const double V = k * k * H.v;
+    double sa=0, sj=0;
+    for(int i=0;i<6;++i) for(int j=0;j<6;++j) sa=std::max(sa,std::fabs(A[i][j]));
+    for(int i=0;i<3;++i) sj+=J[i][i];
+    for(int i=0;i<6;++i) for(int j=i;j<6;++j)
+        std::printf("ENTRY,%s,%.9g,%.9g,A,%d,%d,%.12g,%.12g,%.12g,%.12g,%.12g\n",name.c_str(),double(c.size),double(c.elong),i,j,
+            double(at6(L.Abody,i,j)), A[i][j], at6(L.Abody,i,j)-A[i][j], (at6(L.Abody,i,j)-A[i][j])/sa,(ad[i][j]-A[i][j])/sa);
+    for(int i=0;i<3;++i) for(int j=i;j<3;++j)
+        std::printf("ENTRY,%s,%.9g,%.9g,J,%d,%d,%.12g,%.12g,%.12g,%.12g,%.12g\n",name.c_str(),double(c.size),double(c.elong),i,j,
+            double(at3(L.Jbody,i,j)),J[i][j],at3(L.Jbody,i,j)-J[i][j],(at3(L.Jbody,i,j)-J[i][j])/sj,(jd[i][j]-J[i][j])/sj);
+    const auto& tris=bodyplan::canonicalTris();
+    const double hi=(5+3*std::sqrt(5.0))/20, lo=(5-std::sqrt(5.0))/20;
+    for(int repeats : {1,2,4,8}) {
+        float af[6][6]{}, jf[3][3]{};
+        double aq[6][6]{}, jq[3][3]{};
+        for(int t=0;t<bodyplan::kHullTris;++t) {
+            const auto& tri=tris.t[t];
+            D3 v[]={{0,0,0},d3(pts.p[tri.a]),d3(pts.p[tri.b]),d3(pts.p[tri.c])};
+            for(auto& p:v){p.y*=k;p.z*=k;}
+            const double weight=ddot(v[1],dcross(v[2],v[3]))/(24*repeats);
+            for(int q=0;q<4;++q) {
+                D3 r{-com[0],-com[1],-com[2]};
+                for(int a=0;a<4;++a){const double w=a==q?hi:lo;r.x+=w*v[a].x;r.y+=w*v[a].y;r.z+=w*v[a].z;}
+                for(int axis=0;axis<3;++axis){
+                    const D3 e{double(axis==0),double(axis==1),double(axis==2)}, l=dcross(r,e);
+                    const double w[]={e.x,e.y,e.z,l.x,l.y,l.z};
+                    for(int rep=0;rep<repeats;++rep){
+                        for(int i=0;i<6;++i)for(int j=0;j<6;++j){const double term=weight*rw*added[axis]*w[i]*w[j];af[i][j]+=float(term);aq[i][j]+=term;}
+                        for(int i=0;i<3;++i)for(int j=0;j<3;++j){const double term=weight*K[axis]*w[3+i]*w[3+j]/V;jf[i][j]+=float(term);jq[i][j]+=term;}
+                    }
+                }
+            }
+        }
+        double ea=0,ej=0,ed=0;
+        for(int i=0;i<6;++i)for(int j=0;j<6;++j){ea=std::max(ea,std::fabs(af[i][j]-A[i][j])/sa);ed=std::max(ed,std::fabs(aq[i][j]-A[i][j])/sa);}
+        for(int i=0;i<3;++i)for(int j=0;j<3;++j){ej=std::max(ej,std::fabs(jf[i][j]-J[i][j])/sj);ed=std::max(ed,std::fabs(jq[i][j]-J[i][j])/sj);}
+        std::printf("TERMS,%s,%.9g,%.9g,%d,%.12g,%.12g,%.12g\n",name.c_str(),double(c.size),double(c.elong),bodyplan::kHullTris*4*3*repeats,ea,ej,ed);
+    }
+}
+double tensorError(const S6& actual, const double expected[6][6]) {
+    double scale = 0, error = 0;
+    for (int i = 0; i < 6; ++i) for (int j = 0; j < 6; ++j) {
+        scale = std::max(scale, std::fabs(expected[i][j]));
+        error = std::max(error, std::fabs(at6(actual, i, j) - expected[i][j]));
+    }
+    return error / (scale > 0 ? scale : 1);
+}
 struct Worst {
     const char* name; double tol; bool gated; double v = 0; std::string where;
     Worst(const char* n, double t, bool g) : name(n), tol(t), gated(g) {}
@@ -93,11 +332,44 @@ bool gauss(double A[6][7], double x[6]) {
 }
 }  // namespace
 
-int main() {
-    const std::vector<hydrofix::Body> B = hydrofix::bodies();
+int main(int argc, char** argv) {
+    const bool characterize = argc == 2 && std::string(argv[1]) == "--roundoff";
+    std::vector<hydrofix::Body> B = hydrofix::bodies();
+    if (characterize) {
+        const auto originals = B;
+        for (const auto& b : originals) if (b.name == "neutral" || b.name == "random19")
+            for (float size : {.5f, 1.f, 2.f}) for (float elong : {.5f, 1.f, 2.f}) {
+                auto copy = b; copy.S = size; copy.E = elong;
+                copy.name += "_sweep"; B.push_back(copy);
+            }
+    }
     Worst wCells{"partition: |Σ cells − hull| / hull (double)", 1e-12, true}, wCellF{"partition: float cells vs double cells (of V)", 2e-6, true};
     Worst wNeg{"partition: smallest cell / V (must be > 0)", 0, false};
-    Worst wComp{"compound: double parallel-axis vs evalLoad (unloaded)", 2e-6, true};
+    Worst wComp{"compound: independent loaded parts vs evalLoad (3 loads)", 2e-6, true};
+    // Roundoff budget, established by --roundoff (no fitted tolerance):
+    // each raw moment accumulates kHullTris=224 tetrahedra; allow 32 more
+    // rounded operations for each integrand and the loaded tensor assembly.
+    // gamma_n = n*u/(1-n*u), u=2^-24 (binary32 unit roundoff, 5.96e-8).
+    // For covariance s/V-(f/V)^2, first-order propagation amplifies gamma_n
+    // by (|s/V|+3*(f/V)^2)/variance. Enforce that condition <=16 below
+    // (observed maximum 12.143); another factor 2 covers material COM,
+    // inflation and products, and bounds higher-order gamma terms here.
+    // Thus rel <= c*n*u/(1-n*u), c=2*16, n=224+32. Abody uses max-entry
+    // normalization, Jbody its trace; both are normwise, not entrywise.
+    // This conservative bound is accompanied by a TR-block-normalized sign
+    // mutation (>1000 times this bound) and a tight double formula check.
+    constexpr double kUnitRoundoff32 = 0x1p-24;
+    constexpr int kMomentTerms = bodyplan::kHullTris, kAssemblyOps = 32;
+    constexpr double kMaxMomentCondition = 16, kPropagationFactor = 2;
+    constexpr double kN = kMomentTerms + kAssemblyOps;
+    constexpr double kBodyTolerance = kPropagationFactor * kMaxMomentCondition *
+        kN * kUnitRoundoff32 / (1 - kN * kUnitRoundoff32);
+    Worst wAbody{"Abody: double hull quadrature vs evalLoad", kBodyTolerance, true};
+    Worst wJbody{"Jbody: double hull quadrature vs evalLoad", kBodyTolerance, true};
+    Worst wDouble{"body laws: double moment formula vs quadrature", 1e-12, true};
+    Worst wCondition{"raw-to-central moment condition", kMaxMomentCondition, true};
+    double minMutationRatio = 1e30;
+    int reversedBlockChecks = 0, reversedBlockMisses = 0;
     Worst wInfl{"inflation: law-1 inflated hull (double) vs analytic T(k)", 1e-5, true};
     Worst wTen{"tensors: direct traversal at k (double) vs bases + congruence", 2e-6, true};
     Worst wSolve{"solve: double Gauss vs binary32 LDLᵀ (|Δz| / |z|)", 2e-5, true};
@@ -119,16 +391,22 @@ int main() {
     for (const hydrofix::Body& b : B) {
         Coefficients c;
         Support s;
-        Diagnostics d;
-        if (compile(b.G, b.S, b.E, b.P, Params{}, c, s, &d) != kOk) { ++failed; continue; }
+        if (compile(b.G, b.S, b.E, b.P, Params{}, c, s) != kOk) { ++failed; continue; }
         ++compiled;
-        const double rw = rhoWater();
+        const double rw = 1.0 / bodyplan::referenceVolume();
         // ---- partition, in double ----
         bodyplan::BirthCoefficients bc;
         bodyplan::Points pts;
         bodyplan::compile(expressAppearance(b.G), b.S, b.E, expressPhysical(b.P), bodyplan::kGeometryLaw, bc, nullptr, &pts);
+        const DM birthHull = hullD(pts);
+        for (int i = 0; i < 3; ++i) {
+            const double raw = birthHull.s[s3(i,i)] / birthHull.v;
+            const double mean = birthHull.f[i] / birthHull.v;
+            wCondition.see((std::fabs(raw) + 3 * mean * mean) / (raw - mean * mean), b.name);
+        }
+        std::array<DM, 112> cells{};
         {
-            const DM H = hullD(pts);
+            const DM H = birthHull;
             bodymat::Cells cf;
             bodymat::cellMoments(pts, cf);
             DM sum;
@@ -146,6 +424,7 @@ int main() {
                     tet(m, P, Bv, A);                 // the near sector (outward −x)
                     tet(m, P, A, D); tet(m, P, D, Q); // the lower radial face
                     tet(m, P, C, Bv); tet(m, P, Q, C); // the upper radial face
+                    cells[8 * i + k] = m;
                     sum.v += m.v;
                     for (int q = 0; q < 3; ++q) sum.f[q] += m.f[q];
                     for (int q = 0; q < 6; ++q) sum.s[q] += m.s[q];
@@ -160,35 +439,96 @@ int main() {
             for (int q = 0; q < 3; ++q) wCells.see(rel(sum.f[q], H.f[q], H.v * c.hullLength), b.name + " first");
             for (int q = 0; q < 6; ++q) wCells.see(rel(sum.s[q], H.s[q], H.v * c.hullLength * c.hullLength), b.name + " second");
         }
-        // ---- the compound, in double ----
-        {
-            const bodymat::Material& m = d.material;
-            struct P { const bodymat::Moments* v; double rho; } parts[4 + 7] = {{&m.tissue, 1.04}, {&m.jaw, 1.04}, {&m.eyes, 1.10}, {&m.walls, 1.04}};
-            for (int f = 0; f < 7; ++f) parts[4 + f] = P{&m.fin[f], 1.10};
-            double M = 0, F[3] = {0, 0, 0}, S[6] = {0, 0, 0, 0, 0, 0};
-            for (const P& p : parts) {
-                const double sc = p.rho * rw;
-                M += sc * p.v->v;
-                for (int q = 0; q < 3; ++q) F[q] += sc * p.v->f[q];
-                for (int q = 0; q < 6; ++q) S[q] += sc * p.v->s[q];
-            }
-            const double cx = F[0] / M, cy = F[1] / M, cz = F[2] / M;
-            const double C[6] = {S[0] - M * cx * cx, S[1] - M * cy * cy, S[2] - M * cz * cz, S[3] - M * cx * cy, S[4] - M * cx * cz, S[5] - M * cy * cz};
-            const double I[6] = {C[1] + C[2], C[0] + C[2], C[0] + C[1], -C[3], -C[4], -C[5]};
-            Loaded L;
-            evalLoad(c, 0.0f, 0.0f, L);
-            const double Is = I[0] + I[1] + I[2];
-            wComp.see(rel(L.mass, M, M), b.name + " mass");
-            wComp.see(rel(L.com.x, cx, c.hullLength), b.name + " com");
-            wComp.see(rel(L.com.z, cz, c.hullLength), b.name + " com z");
-            for (int q = 0; q < 6; ++q) wComp.see(rel(L.inertia.m[q], I[q], Is), b.name + " inertia " + std::to_string(q));
-        }
+        auto remaining = cells;
+        const auto px = expressPhysical(b.P);
+        const double storage = bc.m[bodyplan::at(bodyplan::fStorageScale)];
+        const DM eyes = take(cells, remaining, bc.m[bodyplan::at(bodyplan::fEyeOrganVolume)] / 2,
+                             d3(pts.p[bodyplan::kEyeR0]), true);
+        const float* mouth = bc.m + bodyplan::at(bodyplan::fMouthCentre);
+        const DM jaw = take(cells, remaining, bc.m[bodyplan::at(bodyplan::fJawVolume)], {mouth[0], mouth[1], mouth[2]}, false);
+        const DM walls = take(cells, remaining, .02 * storage *
+            (px.g[physical::kBladder] + double(px.g[physical::kFat])) * birthHull.v,
+            {birthHull.f[0] / birthHull.v, birthHull.f[1] / birthHull.v, birthHull.f[2] / birthHull.v}, false);
+        DM tissue = birthHull;
+        add(tissue, eyes, -1); add(tissue, jaw, -1); add(tissue, walls, -1);
+        const auto finMaterial = finParts(pts, bc);
         // ---- loads: inflation, tensors, solve, the patch model ----
         const float loads[3][2] = {{0.0f, 0.0f}, {0.5f, 0.25f}, {1.0f, 1.0f}};
         for (const auto& ld : loads) {
             const float Vg = ld[0] * c.gasCapacity, Mf = ld[1] * c.reserveCapacity * (bodymat::kRhoLipid * rhoWater());
             Loaded L;
-            evalLoad(c, Vg, Mf, L);
+            if (!evalLoad(c, Vg, Mf, L)) { ++failed; continue; }
+            const std::string loadName = b.name + " gas=" + std::to_string(ld[0]) + " fuel=" + std::to_string(ld[1]);
+            const double fuelVolume = Mf / (.90 * rw);
+            const double kd = std::sqrt(1 + (Vg + fuelVolume) / birthHull.v), td = kd - 1;
+            const double stretch[] = {1, kd, kd}, identity[] = {1, 1, 1}, zeroShift[] = {0, 0, 0};
+            std::vector<DPart> parts;
+            parts.push_back(part(tissue, 1.04 * rw, stretch, zeroShift));
+            parts.push_back(part(jaw, 1.04 * rw, stretch, zeroShift));
+            parts.push_back(part(eyes, 1.10 * rw, stretch, zeroShift));
+            parts.push_back(part(walls, 1.04 * rw, stretch, zeroShift));
+
+            for (const auto& fin : finMaterial) {
+                const double shift[] = {td * fin.basis[0], td * fin.basis[1], td * fin.basis[2]};
+                parts.push_back(part(fin.moments, 1.10 * rw, identity, shift));
+            }
+            parts.push_back(part(birthHull, Mf / birthHull.v, stretch, zeroShift));
+            const DCompound material = compound(parts);
+            wComp.see(rel(L.mass, material.mass, material.mass), loadName + " mass");
+            const double actualCom[] = {L.com.x, L.com.y, L.com.z};
+            const double traceI = material.inertia[0][0] + material.inertia[1][1] + material.inertia[2][2];
+            for (int i = 0; i < 3; ++i) {
+                wComp.see(rel(actualCom[i], material.com[i], c.hullLength), loadName + " COM " + std::to_string(i));
+                for (int j = i; j < 3; ++j)
+                    wComp.see(rel(at3(L.inertia, i, j), material.inertia[i][j], traceI), loadName + " inertia");
+            }
+            // Independent body laws and quadrature, checked before the solver.
+            const auto geometry = [&](int offset) { return double(bc.m[offset]); };
+            double profileArea = 0;
+            for (int f = 0; f < 7; ++f) profileArea += bc.m[bodyplan::finAt(f, bodyplan::kFinArea)];
+            const double frontal = kd * kd * geometry(bodyplan::at(bodyplan::fFrontalArea)), wetted = kd * kd * geometry(bodyplan::at(bodyplan::fWettedArea));
+            const double fineness = geometry(bodyplan::at(bodyplan::fHullLength)) / std::sqrt(4 * frontal / double(bodyplan::detail::kPi));
+            const double fc = std::clamp(fineness, 1.0, 30.0);
+            const double cf = .008 * std::pow(geometry(bodyplan::at(bodyplan::fRefLength)) / 20, -.2);
+            const double Khull[] = {(.08 + .90 / (fc * fc) + .25 * geometry(bodyplan::at(bodyplan::fForeAft))) * frontal + cf * wetted,
+                1.10 * kd * geometry(bodyplan::at(bodyplan::fSideArea)) + cf * wetted, 1.10 * kd * geometry(bodyplan::at(bodyplan::fPlanArea)) + cf * wetted};
+            const double added[] = {.05, geometry(bodyplan::at(bodyplan::fMaxHalfDepth)) / geometry(bodyplan::at(bodyplan::fMaxHalfWidth)),
+                geometry(bodyplan::at(bodyplan::fMaxHalfWidth)) / geometry(bodyplan::at(bodyplan::fMaxHalfDepth))};
+            double Abody[6][6]{}, Jbody[3][3]{};
+            bodyTensors(pts, kd, material.com, rw, added, Khull, Abody, Jbody);
+            if (characterize) roundoffReport(pts, birthHull, c, L, kd, material.com, rw, added, Khull, Abody, Jbody, loadName);
+            wAbody.see(tensorError(L.Abody, Abody), loadName);
+            double scaleJ = 0;
+            for (int i = 0; i < 3; ++i) scaleJ += Jbody[i][i];
+            for (int i = 0; i < 3; ++i) for (int j = 0; j < 3; ++j)
+                wJbody.see(rel(at3(L.Jbody, i, j), Jbody[i][j], scaleJ), loadName);
+            double momentA[6][6]{}, momentJ[3][3]{};
+            momentTensors(birthHull, kd, material.com, rw, added, Khull, momentA, momentJ);
+            double scaleA = 0, scaleTR = 0, cleanTR = 0, reversedTR = 0, maxTR = 0;
+            for (int i = 0; i < 6; ++i) for (int j = 0; j < 6; ++j)
+                scaleA = std::max(scaleA, std::fabs(Abody[i][j]));
+            for (int i = 0; i < 6; ++i) for (int j = 0; j < 6; ++j)
+                wDouble.see(rel(momentA[i][j], Abody[i][j], scaleA), loadName + " A");
+            for (int i = 0; i < 3; ++i) for (int j = 0; j < 3; ++j)
+                wDouble.see(rel(momentJ[i][j], Jbody[i][j], scaleJ), loadName + " J");
+            // Normalize this structural control by its own TR block, so
+            // small coupling cannot be hidden by the rotational diagonals.
+            S6 reversed = L.Abody;
+            for (int i = 0; i < 3; ++i) for (int j = 3; j < 6; ++j) {
+                reversed.m[s6u(i,j)] *= -1;
+                scaleTR = std::max(scaleTR, std::fabs(Abody[i][j]));
+                maxTR = std::max(maxTR, std::fabs(double(at6(L.Abody,i,j))));
+                cleanTR = std::max(cleanTR, std::fabs(at6(L.Abody,i,j) - Abody[i][j]));
+                reversedTR = std::max(reversedTR, std::fabs(at6(reversed,i,j) - Abody[i][j]));
+            }
+            // Exactly zero TR is physically unable to expose a sign reversal.
+            // Still require it to remain zero within the normwise budget.
+            if (scaleTR > 1e-12 * scaleA) {
+                ++reversedBlockChecks;
+                const double ratio = reversedTR / scaleTR / kBodyTolerance;
+                minMutationRatio = std::min(minMutationRatio, ratio);
+                if (!(cleanTR <= kBodyTolerance * scaleA && ratio > 1000)) ++reversedBlockMisses;
+            } else if (maxTR > kBodyTolerance * scaleA) ++reversedBlockMisses;
             // inflation: law 1 at this k
             {
                 bodyplan::Morph M = bodyplan::decodeMorph(expressAppearance(b.G).g, c.refLength / c.radius);
@@ -212,16 +552,16 @@ int main() {
             struct FinW { double d, w[6]; };
             std::vector<FinW> fins;
             for (int f = 0; f < bodyplan::kFinCount; ++f) {
-                const float A = d.body.m[bodyplan::finAt(f, bodyplan::kFinArea)];
+                const float A = bc.m[bodyplan::finAt(f, bodyplan::kFinArea)];
                 if (!(A > 0.0f)) continue;
-                const float* n = d.body.m + bodyplan::finAt(f, bodyplan::kFinNormal);
-                const float* p0 = d.body.m + bodyplan::finAt(f, bodyplan::kFinCentroid);
-                const V3 bb = d.material.finBasis[f];
-                const D3 r{p0[0] + (double)L.t * bb.x - L.com.x, p0[1] + (double)L.t * bb.y - L.com.y, p0[2] + (double)L.t * bb.z - L.com.z};
+                const float* n = bc.m + bodyplan::finAt(f, bodyplan::kFinNormal);
+                const float* p0 = bc.m + bodyplan::finAt(f, bodyplan::kFinCentroid);
+                const auto& bb = finMaterial[f].basis;
+                const D3 r{p0[0] + td * bb[0] - material.com[0], p0[1] + td * bb[1] - material.com[1], p0[2] + td * bb[2] - material.com[2]};
                 const D3 nn{n[0], n[1], n[2]}, rn = dcross(r, nn);
                 FinW fw;
                 fw.d = 0.5 * rw * kCn * A;
-                const double ma = kFinAddedCoef * rw * A * d.body.m[bodyplan::finAt(f, bodyplan::kFinMeanChord)];
+                const double ma = kFinAddedCoef * rw * A * bc.m[bodyplan::finAt(f, bodyplan::kFinMeanChord)];
                 const double w[6] = {nn.x, nn.y, nn.z, rn.x, rn.y, rn.z};
                 std::memcpy(fw.w, w, sizeof w);
                 fins.push_back(fw);
@@ -244,9 +584,22 @@ int main() {
                 const V6 rhs = mulS6(L.Meff, z);
                 V6 x;
                 if (!solveScaled(A, rhs, c.halfLength, x)) { wSolve.see(1e30, b.name + " LDL refused"); continue; }
-                double G[6][7], xd[6];
-                for (int i = 0; i < 6; ++i) { for (int j = 0; j < 6; ++j) G[i][j] = at6(A, i, j); G[i][6] = rhs.v[i]; }
-                if (!gauss(G, xd)) continue;
+                const double Lcd = c.halfLength;
+                const double speed = std::sqrt(states[si].z[0] * states[si].z[0] + states[si].z[1] * states[si].z[1] +
+                    states[si].z[2] * states[si].z[2] + Lcd * Lcd * (states[si].z[3] * states[si].z[3] +
+                    states[si].z[4] * states[si].z[4] + states[si].z[5] * states[si].z[5]));
+                double G[6][7]{}, xd[6]{};
+                for (int i = 0; i < 6; ++i) for (int j = 0; j < 6; ++j) {
+                    const double rigid = i < 3 && j < 3 ? (i == j ? material.mass : 0) :
+                        (i >= 3 && j >= 3 ? material.inertia[i - 3][j - 3] : 0);
+                    const double mass = rigid + Abody[i][j] + Ad[i][j];
+                    double damp = speed * Dd[i][j];
+                    if (i < 3 && i == j) damp += .5 * rw * (Khull[i] + .025 * profileArea) * std::fabs(states[si].z[i]);
+                    if (i >= 3 && j >= 3) damp += .5 * rw * speed * Jbody[i - 3][j - 3];
+                    G[i][j] = mass + .008 * damp;
+                    G[i][6] += mass * states[si].z[j];
+                }
+                if (!gauss(G, xd)) { wSolve.see(1e30, loadName + " double Gauss refused"); continue; }
                 // compare in the scaled coordinates (u, Lc ω)
                 const double Lc = c.halfLength;
                 double dn = 0, xn = 0;
@@ -282,14 +635,15 @@ int main() {
     }
     std::printf("ocean_hydro_reference: %d bodies compiled, %d failed (law versions: geometry %d, material %d, expression %d, reference %d)\n",
                 compiled, failed, kGeometryLaw, kMaterialLaw, kExpressionStage, kReferenceLaw);
-    bool ok = failed == 0 && minCellFrac > 0;
-    for (const Worst* w : {&wCells, &wCellF, &wComp, &wInfl, &wTen, &wSolve}) {
+    bool ok = failed == 0 && minCellFrac > 0 && reversedBlockChecks > 0 && reversedBlockMisses == 0;
+    for (const Worst* w : {&wCells, &wCellF, &wComp, &wInfl, &wTen, &wAbody, &wJbody, &wDouble, &wCondition, &wSolve}) {
         const bool pass = !(w->v > w->tol) && !std::isnan(w->v);
         ok = ok && pass;
-        std::printf("  %-62s worst %.3e (tol %.0e) %s%s%s\n", w->name, w->v, w->tol, pass ? "ok" : "FAIL", w->where.empty() ? "" : " at ",
+        std::printf("  %-62s worst %.3e (tol %.3e) %s%s%s\n", w->name, w->v, w->tol, pass ? "ok" : "FAIL", w->where.empty() ? "" : " at ",
                     w->where.c_str());
     }
     std::printf("  %-62s %.3e %s\n", wNeg.name, minCellFrac, minCellFrac > 0 ? "ok" : "FAIL");
+    std::printf("  reversed Abody TR block: %d checked, %d missed; minimum fault/tolerance %.1f\n", reversedBlockChecks, reversedBlockMisses, minMutationRatio);
     std::printf("  patch model vs tensor law (fins only; load gas .5 / fuel .25; |Q| in force and torque/Lc units; reported, not gated):\n");
     std::printf("    %-22s %10s %10s %10s %10s\n", "state", "mean |Qt|/|Qp|", "min", "max", "mean cos");
     for (int si = 0; si < nStates; ++si)

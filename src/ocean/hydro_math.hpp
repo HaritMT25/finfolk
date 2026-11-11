@@ -66,16 +66,20 @@ inline V3 mulS3(const S3& A, V3 v) {
     return {a[0] * v.x + a[3] * v.y + a[4] * v.z, a[3] * v.x + a[1] * v.y + a[5] * v.z, a[4] * v.x + a[5] * v.y + a[2] * v.z};
 }
 // The inverse of a symmetric positive-definite 3x3 by cofactors (fixed order).
-// Returns false (and leaves out untouched) when the determinant is not
-// positive and finite: a physics failure for the callers, never repaired.
+// Returns false (out untouched) unless the leading principal minors are
+// positive and finite (Sylvester), and the inverse is finite; never repaired.
 inline bool invS3(const S3& A, S3& out) {
     const float xx = A.m[0], yy = A.m[1], zz = A.m[2], xy = A.m[3], xz = A.m[4], yz = A.m[5];
     const float cxx = yy * zz - yz * yz, cyy = xx * zz - xz * xz, czz = xx * yy - xy * xy;
     const float cxy = xz * yz - xy * zz, cxz = xy * yz - xz * yy, cyz = xy * xz - xx * yz;
     const float det = xx * cxx + xy * cxy + xz * cxz;
-    if (!(det > 0.0f) || !std::isfinite(det)) return false;
-    out.m[0] = cxx / det; out.m[1] = cyy / det; out.m[2] = czz / det;
-    out.m[3] = cxy / det; out.m[4] = cxz / det; out.m[5] = cyz / det;
+    if (!(xx > 0.0f) || !std::isfinite(xx) || !(czz > 0.0f) || !std::isfinite(czz) ||
+        !(det > 0.0f) || !std::isfinite(det)) return false;
+    S3 next;
+    next.m[0] = cxx / det; next.m[1] = cyy / det; next.m[2] = czz / det;
+    next.m[3] = cxy / det; next.m[4] = cxz / det; next.m[5] = cyz / det;
+    for (float x : next.m) if (!std::isfinite(x)) return false;
+    out = next;
     return true;
 }
 // T S T for T = diag(1, k, k) (the transverse inflation's action on a second
@@ -188,6 +192,7 @@ inline bool factorLDL(const S6& A, LDL6& f) {
         if (!(d > 0.0f) || !std::isfinite(d)) { f.failedPivot = i; return false; }
         f.D[i] = d;
         const float inv = 1.0f / d;
+        if (!std::isfinite(inv)) { f.failedPivot = i; return false; }
         f.invD[i] = inv;
         for (int j = i + 1; j < 6; ++j) {
             float s = A.m[s6u(i, j)];
@@ -216,18 +221,24 @@ inline V6 solveLDL(const LDL6& f, const V6& b) {
 // The production solve: angular coordinates scaled by the half length Lc
 // before factorization (z' = (u, Lc ω): every scaled entry has mass units),
 //   A' = D A D, b' = D b, x = D y,   D = diag(1, 1, 1, 1/Lc, 1/Lc, 1/Lc)
-// with 1/Lc formed once. Returns false on a pivot failure (x untouched).
+// with 1/Lc formed once. Refuses invalid scales, RHS, factors or solutions
+// (x untouched); a finite positive pivot with an infinite reciprocal fails too.
 inline bool solveScaled(const S6& A, const V6& b, float Lc, V6& x, LDL6* factorOut = nullptr) {
+    if (!(Lc > 0.0f) || !std::isfinite(Lc)) return false;
     const float s = 1.0f / Lc;
+    if (!std::isfinite(s)) return false;
+    for (float v : b.v) if (!std::isfinite(v)) return false;
     // tt entries unchanged, tr entries x s, rr entries (x s) x s; the packed upper triangle in order
     static constexpr int kScale[21] = {0, 0, 0, 1, 1, 1, 0, 0, 1, 1, 1, 0, 1, 1, 1, 2, 2, 2, 2, 2, 2};
     S6 As;
     for (int q = 0; q < 21; ++q) As.m[q] = kScale[q] == 0 ? A.m[q] : (kScale[q] == 1 ? A.m[q] * s : (A.m[q] * s) * s);
     V6 bs{{b.v[0], b.v[1], b.v[2], b.v[3] * s, b.v[4] * s, b.v[5] * s}};
-    LDL6 f;
+    LDL6 f{};
     if (!factorLDL(As, f)) { if (factorOut) *factorOut = f; return false; }
     const V6 y = solveLDL(f, bs);
-    x = V6{{y.v[0], y.v[1], y.v[2], y.v[3] * s, y.v[4] * s, y.v[5] * s}};
+    const V6 next{{y.v[0], y.v[1], y.v[2], y.v[3] * s, y.v[4] * s, y.v[5] * s}};
+    for (float v : next.v) if (!std::isfinite(v)) return false;
+    x = next;
     if (factorOut) *factorOut = f;
     return true;
 }

@@ -43,6 +43,7 @@
 //                   harness's unit-output comparison)
 #include <string>
 #include <vector>
+#include <limits>
 #include "../src/ocean/hydro_coefficients.hpp"
 #include "../src/ocean/hydro_state.hpp"
 
@@ -228,6 +229,21 @@ inline void testHydroMath() {
         t.expect(!factorLDL(A, f) && f.failedPivot == 1, "an indefinite matrix was not refused");
         V6 x{{9, 9, 9, 9, 9, 9}};
         t.expect(!solveScaled(A, V6{{1, 1, 1, 1, 1, 1}}, 3.0f, x) && x.v[0] == 9.0f, "a refused solve changed its output");
+        zero(A);
+        for (int i = 0; i < 6; ++i) A.m[s6u(i, i)] = 1.0f;
+        const float delta = std::numeric_limits<float>::denorm_min();
+        A.m[s6u(5, 5)] = delta;
+        const V6 subnormalRhs{{1, 1, 1, 1, 1, delta}}; // exact solution: all ones
+        t.expect(!factorLDL(A, f) && f.failedPivot == 5, "subnormal pivot reciprocal overflow accepted");
+        t.expect(!solveScaled(A, subnormalRhs, 1.0f, x) && x.v[5] == 9.0f, "subnormal solve was published");
+        A.m[s6u(5, 5)] = 1.0f;
+        for (float bad : {INFINITY, NAN}) {
+            V6 rhs{{1, 1, 1, 1, 1, bad}};
+            t.expect(!solveScaled(A, rhs, 1.0f, x) && x.v[5] == 9.0f, "nonfinite RHS was published");
+        }
+        A.m[s6u(5, 5)] = 0.5f;
+        t.expect(!solveScaled(A, V6{{1, 1, 1, 1, 1, std::numeric_limits<float>::max()}}, 1.0f, x) && x.v[5] == 9.0f,
+                 "overflowed finite RHS solution was published");
     }
     // S3 inverse
     {
@@ -238,6 +254,11 @@ inline void testHydroMath() {
         t.expect(ok && std::fabs(back.x - v.x) < 1e-5f && std::fabs(back.y - v.y) < 1e-5f && std::fabs(back.z - v.z) < 1e-5f, "S3 inverse");
         S3 junk = A;
         t.expect(!invS3(Z, junk) && junk.m[0] == A.m[0], "a singular S3 was inverted");
+        t.expect(!invS3(S3{{-1, -1, 1, 0, 0, 0}}, junk) && junk.m[0] == A.m[0], "indefinite S3 with positive determinant accepted");
+        S6 M{};
+        M.m[s6u(0, 0)] = -1; M.m[s6u(1, 1)] = -1; M.m[s6u(2, 2)] = 1;
+        V3 u{1, 2, 3}, w{4, 5, 6};
+        t.expect(!railProject(M, u, w, 0.5f) && u.x == 1 && w.x == 4, "rail accepted indefinite TT block");
     }
     // quaternions
     {
@@ -469,8 +490,8 @@ inline void testHydroIso() {
         Coefficients c1, c2;
         Support s1, s2;
         if (compileBody(b1, c1, s1) != kOk || compileBody(b2, c2, s2) != kOk) { ++bad; continue; }
-        const float* x1 = floats(c1);
-        const float* x2 = floats(c2);
+        const auto x1 = floats(c1);
+        const auto x2 = floats(c2);
         for (int i = 0; i < kCoefficientFloats; ++i) {
             if (pw[i] == -99) continue;
             ++compared;
@@ -697,6 +718,26 @@ inline void testHydroTensors() {
         t.note("sway-yaw D: lone front dorsal %.4g, lone rear dorsal %.4g, neutral %.4g (m/u·u)", (double)at6(front.Dfin, 1, 5),
                (double)at6(back.Dfin, 1, 5), (double)at6(L.Dfin, 1, 5));
     }
+    // Body sway-yaw coupling follows integral(r_x) for w=(e_y,r cross e_y).
+    // A reversed TR block can remain PSD: explicitly reject its sign against
+    // the first-moment law, rather than relying on factorization to catch it.
+    {
+        Coefficients c;
+        Support support;
+        compileBody(neutralBody("neutral"), c, support);
+        Loaded L;
+        evalLoad(c, c.gasCapacity, c.reserveCapacity * (bodymat::kRhoLipid * rhoWater()), L);
+        const double expected = double(rhoWater()) * c.addedMass[1] * L.hullVolume *
+            (double(L.hullCentroid.x) - L.com.x);
+        const double actual = at6(L.Abody, 1, 5);
+        const double scale = std::fabs(expected);
+        t.expect(scale > 1e-4 && std::fabs(actual - expected) <= 2e-5 * scale,
+                 "body sway-yaw first-moment law mismatch");
+        S6 reversed = L.Abody;
+        for (int i = 0; i < 3; ++i) for (int j = 3; j < 6; ++j) reversed.m[s6u(i,j)] *= -1;
+        t.expect(std::fabs(at6(reversed, 1, 5) - expected) > 1000 * 2e-5 * scale,
+                 "reversed body TR block escaped the coupling-sign check");
+    }
     // zero-area fins contribute exactly zero
     {
         appearance::Genome G = appearance::neutral();
@@ -892,6 +933,27 @@ inline void testHydroRefuse() {
     Support s;
     compileBody(nb, c, s);
     t.expect(!evalLoad(c, -1.0f, 0.0f, L) && !evalLoad(c, 0.0f, NAN, L) && !evalLoad(c, INFINITY, 0.0f, L), "evalLoad accepted a bad load");
+    auto cleared = [](const Loaded& a) {
+        if (a.k != 1.0f) return false;
+        const float values[] = {a.t, a.fuelVolume, a.mass, a.com.x, a.com.y, a.com.z, a.hullVolume, a.displaced, a.halfDepth,
+            a.hullCentroid.x, a.hullCentroid.y, a.hullCentroid.z, a.frontal, a.side, a.plan, a.wetted, a.fineness, a.cdForward,
+            a.mouth.x, a.mouth.y, a.mouth.z};
+        for (float v : values) if (v != 0) return false;
+        for (const S3* m : {&a.inertia, &a.hullCov, &a.Jbody}) for (float v : m->m) if (v != 0) return false;
+        for (const S6* m : {&a.Dfin, &a.Afin, &a.Abody, &a.Meff}) for (float v : m->m) if (v != 0) return false;
+        for (int i = 0; i < 3; ++i) if (a.K[i] != 0 || a.Khull[i] != 0) return false;
+        return true;
+    };
+    const float maxFuel = c.reserveCapacity * (bodymat::kRhoLipid * rhoWater());
+    for (const auto load : {std::array<float, 2>{1e38f, 0}, {std::nextafter(c.gasCapacity, INFINITY), 0},
+                            {0, std::nextafter(maxFuel, INFINITY)}, {-1, 0}, {0, NAN}, {INFINITY, 0}}) {
+        t.expect(evalLoad(c, 0.5f * c.gasCapacity, 0.25f * maxFuel, L), "valid load refused before refusal test");
+        t.expect(!evalLoad(c, load[0], load[1], L) && cleared(L), "bad load accepted or refusal left partial output");
+    }
+    t.expect(evalLoad(c, c.gasCapacity, maxFuel, L), "capacity endpoints refused");
+    Coefficients bad = c;
+    bad.skinFriction = std::numeric_limits<float>::max(); // late overflow, after mass/COM calculation
+    t.expect(!evalLoad(bad, 0, 0, L) && cleared(L), "late overflow accepted or left partial output");
     t.expect(versionsSupported(1, 1, 1, 1) && !versionsSupported(2, 1, 1, 1) && !versionsSupported(1, 2, 1, 1) && !versionsSupported(1, 1, 0, 1) &&
              !versionsSupported(1, 1, 1, 2), "version support");
 }

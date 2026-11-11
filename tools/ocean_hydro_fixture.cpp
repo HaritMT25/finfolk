@@ -196,9 +196,9 @@ int main(int argc, char** argv) {
         Support s;
         compile(appearance::neutral(), 1.0f, 1.0f, physical::neutral(), Params{}, c, s);
         std::printf("\"neutralRecord\":[");
-        printFloats(floats(c), kCoefficientFloats);
+        printFloats(floats(c).data(), kCoefficientFloats);
         std::printf("],\n\"neutralSupport\":[");
-        printFloats(floats(s), kSupportFloats);
+        printFloats(floats(s).data(), kSupportFloats);
         std::printf("],\n");
     }
     std::printf("\"bodyCount\":%zu,\"digest\":\"%s\"}\n", B.size(), hex64(all.h).c_str());

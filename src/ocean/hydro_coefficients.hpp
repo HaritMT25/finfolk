@@ -83,6 +83,8 @@
 // the analytic force-balance values: assay 2 (PR 2) measures and freezes the
 // real ones (a reference-law version step, recompiling every record).
 // ----------------------------------------------------------------------------
+#include <array>
+#include <bit>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -178,12 +180,12 @@ template <> struct FieldT<1> { using type = float; };
     X(finSecond1, 6, "m u2", "per unit t")                                                                           \
     X(finSecond2, 6, "m u2", "per unit t²")                                                                          \
     X(addedMass, 3, "", "body added mass per displaced water mass: x, y, z")                                        \
-    X(dampD0, 21, "m/u", "fin damping tensor (per unit s) about the origin, constant (S6 packing)")                 \
-    X(dampD1, 15, "m/u", "per unit t: the cross block (3x3 row-major) then the rotational upper triangle")          \
-    X(dampD2, 6, "m/u", "per unit t²: the rotational upper triangle")                                               \
-    X(addedA0, 21, "m", "fin added-mass tensor about the origin, constant")                                         \
-    X(addedA1, 15, "m", "per unit t (as dampD1)")                                                                    \
-    X(addedA2, 6, "m", "per unit t² (as dampD2)")                                                                    \
+    X(dampD0, 21, "TT:m/u TR:m RR:m u", "fin damping per unit speed: TT m/u, TR m, RR m u; origin, constant (S6 packing)") \
+    X(dampD1, 15, "TR:m RR:m u", "per unit t: TR m (3x3 row-major), then RR m u (upper triangle)")                         \
+    X(dampD2, 6, "RR:m u", "per unit t²: RR m u (rotational upper triangle)")                                              \
+    X(addedA0, 21, "TT:m TR:m u RR:m u2", "fin added mass: TT m, TR m u, RR m u2; origin, constant")                       \
+    X(addedA1, 15, "TR:m u RR:m u2", "per unit t: TR m u, then RR m u2 (as dampD1)")                                       \
+    X(addedA2, 6, "RR:m u2", "per unit t²: RR m u2 (as dampD2)")                                                           \
     X(caudalArea, 1, "u2", "caudal planform area (propulsive strips)")                                              \
     X(caudalNormal, 3, "", "caudal unit normal (+y)")                                                                \
     X(caudalCentroid, 3, "u", "caudal centroid, canonical")                                                          \
@@ -228,7 +230,8 @@ struct FieldInfo { const char* name; int count; const char* units; const char* w
 inline const FieldInfo kCoefficientFields[] = {HYDRO_COEFFICIENT_FIELDS(HYDRO_INFO)};
 #undef HYDRO_INFO
 inline constexpr int kCoefficientFieldCount = sizeof(kCoefficientFields) / sizeof(kCoefficientFields[0]);
-inline const float* floats(const Coefficients& c) { return reinterpret_cast<const float*>(&c); }
+// Copy into an actual array object; packed members do not form a float array.
+inline auto floats(const Coefficients& c) { return std::bit_cast<std::array<float, kCoefficientFloats>>(c); }
 
 // ---- the canonical support cache (support ABI 1) --------------------------------------------
 // The hull's 114 vertices (body_plan.hpp's sample ids: 0 the snout tip, 1 +
@@ -252,7 +255,7 @@ static_assert(sizeof(Support) <= 256, "the support column's ceiling is 256 B a f
 #undef HYDRO_MEMBER
 #undef HYDRO_COUNT
 inline constexpr int kSupportVertices = bodyplan::kHullSamples;   // 114
-inline const float* floats(const Support& s) { return reinterpret_cast<const float*>(&s); }
+inline auto floats(const Support& s) { return std::bit_cast<std::array<float, kSupportFloats>>(s); }
 
 inline V3 supportVertex(const Support& s, int id, float k) {
     if (id <= 0) return V3{s.ringX[0] * s.radius, 0.0f, 0.0f};
@@ -606,13 +609,20 @@ struct Loaded {
     S6 Dfin{}, Afin{}, Abody{}, Meff{};   // about the COM
     V3 mouth{0, 0, 0};            // loaded canonical mouth centre
 };
-// Every field is written on success (no clearing pass); on a refusal L is cleared.
-inline bool evalLoad(const Coefficients& c, float gasVolume, float fuelMass, Loaded& L) {
+// Admissible compressed gas volume is [0, gasCapacity] (surface pressure is
+// the minimum); lipid mass is [0, reserveCapacity * .90 rhoWater]. Refuse
+// out-of-capacity loads without clamping. Publish only a complete finite result;
+// every refusal restores the default Loaded value, including k = 1.
+inline bool evalLoad(const Coefficients& c, float gasVolume, float fuelMass, Loaded& out) {
+    Loaded L;
+    const auto refuse = [&]() { out = Loaded{}; return false; };
     if (!(gasVolume >= 0.0f) || !(fuelMass >= 0.0f) || !std::isfinite(gasVolume) || !std::isfinite(fuelMass) || !(c.hullVolume > 0.0f)) {
-        L = Loaded{};
-        return false;
+        return refuse();
     }
     const float rw = rhoWater();
+    const float maxFuel = c.reserveCapacity * (bodymat::kRhoLipid * rw);
+    if (!std::isfinite(c.gasCapacity) || !std::isfinite(maxFuel) ||
+        !(gasVolume <= c.gasCapacity) || !(fuelMass <= maxFuel)) return refuse();
     const float V0 = c.hullVolume;
     L.fuelVolume = fuelMass / (bodymat::kRhoLipid * rw);
     L.k = std::sqrt(1.0f + (gasVolume + L.fuelVolume) / V0);
@@ -638,7 +648,7 @@ inline bool evalLoad(const Coefficients& c, float gasVolume, float fuelMass, Loa
     M = M + c.finMass;
     F = add(F, V3{c.finFirst0[0] + t * c.finFirst1[0], c.finFirst0[1] + t * c.finFirst1[1], c.finFirst0[2] + t * c.finFirst1[2]});
     for (int j = 0; j < 6; ++j) S[j] = S[j] + (c.finSecond0[j] + t * (c.finSecond1[j] + t * c.finSecond2[j]));
-    if (!(M > 0.0f)) { L = Loaded{}; return false; }
+    if (!(M > 0.0f)) return refuse();
     L.mass = M;
     L.com = V3{F.x / M, F.y / M, F.z / M};
     const V3 cm = L.com;
@@ -719,7 +729,18 @@ inline bool evalLoad(const Coefficients& c, float gasVolume, float fuelMass, Loa
         addTo(Me, L.Afin);
     }
     L.mouth = V3{c.mouth[0] + t * c.mouthBasis[0], c.mouth[1] + t * c.mouthBasis[1], c.mouth[2] + t * c.mouthBasis[2]};
-    return std::isfinite(L.k) && std::isfinite(L.mass);
+    const float scalars[] = {L.k, L.t, L.fuelVolume, L.mass, L.com.x, L.com.y, L.com.z,
+        L.hullVolume, L.displaced, L.halfDepth, L.hullCentroid.x, L.hullCentroid.y, L.hullCentroid.z,
+        L.frontal, L.side, L.plan, L.wetted, L.fineness, L.cdForward, L.mouth.x, L.mouth.y, L.mouth.z};
+    for (float x : scalars) if (!std::isfinite(x)) return refuse();
+    for (const S3* a : {&L.inertia, &L.hullCov, &L.Jbody})
+        for (float x : a->m) if (!std::isfinite(x)) return refuse();
+    for (const S6* a : {&L.Dfin, &L.Afin, &L.Abody, &L.Meff})
+        for (float x : a->m) if (!std::isfinite(x)) return refuse();
+    for (int i = 0; i < 3; ++i)
+        if (!std::isfinite(L.K[i]) || !std::isfinite(L.Khull[i])) return refuse();
+    out = L;
+    return true;
 }
 
 // The passive damping tensor at the water-relative state z = (u, ω) (body
@@ -818,10 +839,10 @@ inline int compile(const appearance::Genome& G, float S, float E, const physical
     c.sustainedPower = a * c.motorP0;
     c.peakPower = (a + 2.0f * (1.0f - c.fibre)) * c.motorP0;
     c.fatigueCapacity = kTauBurst * (c.peakPower - c.sustainedPower);
-    const float* cf = floats(c);
+    const auto cf = floats(c);
     for (int i = 0; i < kCoefficientFloats; ++i)
         if (!std::isfinite(cf[i])) return fail(kErrNonFinite);
-    const float* sf = floats(sup);
+    const auto sf = floats(sup);
     for (int i = 0; i < kSupportFloats; ++i)
         if (!std::isfinite(sf[i])) return fail(kErrNonFinite);
     if (diag) diag->error = kOk;
@@ -835,8 +856,8 @@ struct Digest {
     void addf(float f) { std::uint32_t u; std::memcpy(&u, &f, 4); add(u); }
     void addFloats(const float* p, int n) { for (int i = 0; i < n; ++i) addf(p[i]); }
 };
-inline std::uint64_t digest(const Coefficients& c) { Digest d; d.addFloats(floats(c), kCoefficientFloats); return d.h; }
-inline std::uint64_t digest(const Support& s) { Digest d; d.addFloats(floats(s), kSupportFloats); return d.h; }
+inline std::uint64_t digest(const Coefficients& c) { Digest d; d.addFloats(floats(c).data(), kCoefficientFloats); return d.h; }
+inline std::uint64_t digest(const Support& s) { Digest d; d.addFloats(floats(s).data(), kSupportFloats); return d.h; }
 inline std::uint64_t digest(const References& r) {
     Digest d;
     d.add((std::uint32_t)kReferenceLaw);
