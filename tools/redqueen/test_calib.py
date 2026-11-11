@@ -364,8 +364,11 @@ class TestGenerator(unittest.TestCase):
         try:
             gp = os.path.join(tmp, "graph.jsonl.gz")
             ns = "rq-test-graph"
+            # (graph.splits refuses any layout but its registered one: with #77's graph.py the 64-world layout, 8 blocks
+            # x 4 C, 2 A, 2 B; before it the older 48-world one, 8 C-blocks of 4 and 8 A, 8 B)
+            n_ctl = 16 if hasattr(graphlib, "mask_evidence_problems") else 8
             reg = ([{"id": f"C{k:02d}", "treatment": "C", "block": k // 4 + 1} for k in range(32)]
-                   + [{"id": f"{t}{k:02d}", "treatment": t, "block": k + 1} for t in "AB" for k in range(8)])
+                   + [{"id": f"{t}{k:02d}", "treatment": t, "block": k * 8 // n_ctl + 1} for t in "AB" for k in range(n_ctl)])
             intensive = graphlib.splits(ns, reg)[2]
             plain = [w["id"] for w in reg if w["treatment"] == "C" and w["id"] not in intensive]
             broken = {"noRQ": plain[-1], "rp": plain[-2], "coarse": plain[-3], "coarse_only": plain[-4],
