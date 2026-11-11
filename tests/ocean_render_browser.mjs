@@ -322,6 +322,20 @@ async function partCorrectness() {
         pp.fragment && pp.fragment.ok && ["recolour", "recolourW0", "recolourBack"].every((m) => pp.fragment.modes[m] && pp.fragment.modes[m].cases === 240) &&
         ["appearance", "appearanceW0", "appearanceBack"].every((m) => pp.fragment.modes[m] && pp.fragment.modes[m].cases === 9) && pp.fragment.nonFinite === 0,
         pp.fragment && { modes: pp.fragment.modes, worst: pp.fragment.worst, nonFinite: pp.fragment.nonFinite });
+  /* the render optimization's decoded programs (render.decoded): the body plan from the decoded texture (geometry through every template
+   * vertex), the decoded texels as the GPU reads them against the CPU's decode, permuted and sparse slots, and the fragment stages */
+  const dd = pathRes.decoded || {};
+  const dsum = (x) => x && (x.error ? { error: x.error } : { ok: x.ok, fish: x.fish, components: x.components, decoded: x.decoded, allParts: x.allParts,
+    templates: Object.fromEntries(Object.entries(x.templates || {}).map(([k, t]) => [k, { pass: t.pass, world: +t.maxWorld.toExponential(2), mat: +t.maxMat.toExponential(2), mar: +t.maxMar.toExponential(2), worst: t.pass ? undefined : t.worst }])) });
+  parity.decoded = { vertex: dsum(dd.vertex), polish: dsum(dd.polish), lite: dsum(dd.lite), permuted: dsum(dd.permuted), sparse: dsum(dd.sparse),
+                     fragment: dd.fragment && { ok: dd.fragment.ok, failures: dd.fragment.failures, maxErr: dd.fragment.maxErr }, polishFragment: dd.polishFragment && { ok: dd.polishFragment.ok, failures: dd.polishFragment.failures, maxErr: dd.polishFragment.maxErr } };
+  check("the decoded programs (render.decoded): plain vertex stage, 11 components, every part, with the body plan read from the decoded texture; its texels as the GPU reads them (18 a fish, 72 floats) == the CPU's decode, bit for bit",
+        dd.ok === true && dd.vertex && dd.vertex.ok && dd.vertex.components === 11 && dd.vertex.allParts && dd.vertex.decoded && dd.vertex.decoded.ok && dd.vertex.decoded.floats === 65 * 72 && dd.vertex.decoded.mismatches === 0, parity.decoded.vertex);
+  check("  polished and lite vertex stages (animated, walled, posed, 71 fish) and the permuted and sparse slot maps (31 / 32, 63 / 64, 2047 / 2048)",
+        dd.polish && dd.polish.ok && dd.polish.fish === 71 && dd.lite && dd.lite.ok && dd.permuted && dd.permuted.ok && dd.permuted.slotMap === "permuted" && dd.sparse && dd.sparse.ok && dd.sparse.slotMap === "sparse" && dd.sparse.maxSlot >= 2048 &&
+        [dd.permuted, dd.sparse, dd.polish, dd.lite].every((x) => x.decoded && x.decoded.ok && x.decoded.mismatches === 0), { polish: parity.decoded.polish, sparse: parity.decoded.sparse });
+  check("  fragment stages (the pattern's constants loaded per fragment from the decoded texture): the skin within .003, plain and polished, every case as the raw stage's",
+        dd.fragment && dd.fragment.ok && dd.fragment.cases === pathRes.fragment.cases && dd.polishFragment && dd.polishFragment.ok && dd.polishFragment.cases === pp.fragment.cases && dd.fragment.nonFinite === 0, parity.decoded);
   /* the plain programs are the ones before the polish: no pose attribute, no polish terms */
   const src = await L.page.evaluate(() => { const a = EvoOceanScene.shaderSources(false), b = EvoOceanScene.shaderSources(true), l = EvoOceanScene.shaderSources("lite");
     const all = (x) => [x.fishVs, x.fishFs, x.shadowVs, x.app.vs, x.app.fs, x.app.shadowVs].join("\n");
@@ -833,6 +847,25 @@ async function partFaults() {
     check("fragment mutation " + m + ": compiles, runs, fails, plain and polished",
           !r.error && r.fragment.ok === false && r.polish.fragment.ok === false && r.appearance.ok && r.recolour.ok && r.polish.appearance.ok && r.polish.recolour.ok && r.slots.ok, pf["fragment_" + m]);
   }
+  /* the decoded programs' own faults (render.decoded): a texel index, a row, a body-plan field in the reader (vertex stage and the texel
+   * read-back), the pattern's first texel (fragment stage): the decoded checks must see each; run directly on a context of their own */
+  const df = await L.page.evaluate(async () => {
+    const EA = EvoAppearance, gl = document.createElement("canvas").getContext("webgl2"), rows = [], lams = [];
+    for (let c = 0; c < 65; c++) { const g = []; for (let j = 0; j < EA.STRIDE; j++) g.push(Math.fround(0.05 + 0.90 * ((37 * c + 17 * j + 13) % 251) / 250)); g[EA.MO + 26] = Math.fround(0.75); rows.push(g); lams.push(Math.fround(3.5 + 0.05 * c)); }
+    const short = (r) => r.error ? { error: r.error } : { ok: r.ok, texels: r.decoded && r.decoded.mismatches, worst: r.templates && r.templates.medium.worst, texelWorst: r.decoded && r.decoded.worst };
+    const out = { clean: short(await EvoOceanScene.appearanceVertexCheck(gl, rows, lams, { decoded: true, slotMap: "sparse" })) };
+    for (const m of ["dtexel", "drow", "dfield", "drawIndex"]) out[m] = short(await EvoOceanScene.appearanceVertexCheck(gl, rows, lams, { decoded: true, slotMap: "sparse", mutate: m }));
+    const f = await EvoOceanScene.appearanceFragmentCheck(gl, { decoded: true }), fm = await EvoOceanScene.appearanceFragmentCheck(gl, { decoded: true, fsMutate: "dswap" });
+    out.fragment = f.error ? { error: f.error } : { ok: f.ok, failures: f.failures };
+    out.dswap = fm.error ? { error: fm.error } : { ok: fm.ok, failures: fm.failures, worst: fm.worst };
+    return out;
+  });
+  pf.decoded = df;
+  check("decoded programs unmutated: the vertex stage (sparse slots) and its texel read-back pass", df.clean.ok === true && df.clean.texels === 0 && df.fragment.ok === true, df);
+  check("  the texel index off by one (dtexel) and the row wrong (drow): the geometry fails and the texels read back fail", [df.dtexel, df.drow].every((x) => !x.error && x.ok === false && x.texels > 0), { dtexel: df.dtexel, drow: df.drow });
+  check("  a body-plan field read from the wrong component (dfield): the geometry fails", !df.dfield.error && df.dfield.ok === false && df.dfield.texels === 0, df.dfield);
+  check("  the slot selector on the draw index (drawIndex, in the decoded reader): the sparse slot map fails", !df.drawIndex.error && df.drawIndex.ok === false, df.drawIndex);
+  check("  the pattern's first texel read from the second (dswap): the decoded fragment stage fails", !df.dswap.error && df.dswap.ok === false && df.dswap.failures > 0, df.dswap);
   const sw = await L.page.evaluate(() => EvoOcean.scene.appearancePathCheck(null, null, { injectSweep: true }));
   pf.injectSweep = { appearance: sw.appearance.sweep, recolour: sw.recolour.sweep };
   check("NaN / +Inf / -Inf in each of the 51 appearance-mode components (2 fish): every one fails, naming it",

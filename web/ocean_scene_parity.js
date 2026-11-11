@@ -43,8 +43,9 @@
   var SHADERS = root.EvoOceanShaders, POSE = root.EvoOceanPose;
   if (!SHADERS || !POSE) return;   /* (the scene names the file missing, or failed to run, not this one) */
   var lines = SHADERS.lines, occurrences = SHADERS.occurrences;
-  /** @type {(EA: EvoAppearanceApi, P?: any) => AppearancePrograms} (P: false, true or "lite", read off opts) */
+  /** @type {(EA: EvoAppearanceApi, P?: any, more?: string[]) => AppearancePrograms} (P: false, true or "lite", read off opts; more: feature ids) */
   var appearanceShaders = SHADERS.appearanceShaders;
+  var DECODED = SHADERS.DECODED;   /* the render optimization's decoded constants (feature id) */
   var GENE_SLOT_GLSL = SHADERS.GENE_SLOT_GLSL, GENE_SLOT_RET = SHADERS.GENE_SLOT_RET;
   var packPose = POSE.packPose, unpackPose = POSE.unpackPose, smoothCPU = POSE.smoothCPU;
   /** @type {(xs: ArrayLike<number>, ys: ArrayLike<number>, R: number, y: number, v: number, G: any) => number} (G: {gate: false}, ungated) */
@@ -207,6 +208,13 @@
     partW: ["vPart = vec4(aPattern.x, aPattern.z, iBody.z, iX.w);", "vPart = vec4(aPattern.x, aPattern.z, iBody.z, 0.0);"],
     drawIndex: [GENE_SLOT_RET, "return gl_InstanceID;"]
   };
+  /* planted faults in the decoded programs' reader (appearanceVertexCheck / appearanceFragmentCheck with opts.decoded): the texel index,
+   * the row, a body-plan field */
+  var DEC_MUT = {
+    dtexel: ["ivec2(18 * (slot % 32) + k, slot / 32)", "ivec2(18 * (slot % 32) + (k ^ 1), slot / 32)"],
+    drow: ["ivec2(18 * (slot % 32) + k, slot / 32)", "ivec2(18 * (slot % 32) + k, 0)"],
+    dfield: ["  M.depth = d0.x;", "  M.depth = d0.y;"]
+  };
   function gcd(a, b) { while (b) { var t = a % b; a = b; b = t; } return a; }
   /* the check's gene slots for n fish (opts.slotMap above) */
   function slotMap(kind, n) {
@@ -236,11 +244,18 @@
     if (!BOUND) return Promise.resolve({ error: UNBOUND });
     if (!EA || !EA.morphBuild) return Promise.resolve({ error: "web/ocean_appearance.js (with its CPU mirror) not loaded" });
     var colourBy = opts.colourBy === 1 ? 1 : 0, P = opts.polish === "lite" ? "lite" : !!opts.polish;
-    var feedback = colourBy ? TF_OUT.slice(0, 3) : TF_OUT, names = componentNames(feedback);
-    var vsrc = appearanceShaders(EA, P).vs;
+    /* opts.decoded: the render optimization's decoded programs (render.decoded): the body plan from the decoded texture, not the raw genes.
+     * They write no pattern varyings (the fragment stage loads the pattern's constants), so only the geometry, the material site and the
+     * part are captured and compared (as in recolour mode: the body plan decoded on the GPU from the CPU's decode is tested through every
+     * template vertex it places); the decoded texture's own texels, 18 a fish, are read back through the same slot selector and compared
+     * with the CPU's decode (the pattern's constants through their texels, the layout, the upload and the sampling) */
+    var D = !!opts.decoded;
+    if (D && (!EA.writeDecoded || !DECODED)) return Promise.resolve({ error: "the decoded constants (EvoAppearance.writeDecoded) are not loaded" });
+    var feedback = colourBy || D ? TF_OUT.slice(0, 3) : TF_OUT, names = componentNames(feedback);
+    var vsrc = appearanceShaders(EA, P, D ? [DECODED] : []).vs;
     if (vsrc.indexOf(PATH_FETCH) < 0) return Promise.resolve({ error: "the gene fetch is not where the check expects it" });
     if (opts.mutate) {
-      var pm = plant(vsrc, opts.mutate, PATH_MUT);
+      var pm = plant(vsrc, opts.mutate, D ? Object.assign({}, PATH_MUT, DEC_MUT) : PATH_MUT);
       if (pm.error) return Promise.resolve({ error: pm.error });
       vsrc = pm.src;
     }
@@ -250,6 +265,16 @@
     var prog;
     try { prog = compileProgram(gl, VS3 + vsrc, fsrc, feedback.map(function (v) { return v[0]; })); }
     catch (e) { return Promise.resolve({ error: e.message || String(e) }); }
+    /* the decoded texels' reader: texel k (gl_VertexID, 0 .. 17) of the fish's slot (iGeneSlot), one vec4 a point, through the production
+     * reader's own address (decodedTexel: here as its text, with the same mutation sites) */
+    var dprog = null;
+    if (D) {
+      var rsrc = EA.GLSL.DECODED_READ;
+      if (opts.mutate && DEC_MUT[opts.mutate]) { var rm = plant(rsrc, opts.mutate, DEC_MUT); if (!rm.error) rsrc = rm.src; }
+      try {
+        dprog = compileProgram(gl, VS3 + "attribute float iGeneSlot;\n" + rsrc + "\nvarying vec4 vT;\nvoid main() { vT = decodedTexel(int(iGeneSlot), gl_VertexID); gl_Position = vec4(0.0); }", fsrc, ["vT"]);
+      } catch (e2) { gl.deleteProgram(prog); return Promise.resolve({ error: "the decoded texel reader: " + (e2.message || String(e2)) }); }
+    }
 
     /* the fish: their genes in the renderer's texture, a bent spine each, a packed colour each */
     var nBase = rows.length;
@@ -264,7 +289,7 @@
     var cap = capFor(top + 1), texRows = genesRows(cap);
     var T = new Float32Array(GENES_W * texRows * 4), R = new Float32Array(n * ST);
     for (var c = 0; c < n; c++) { for (var j = 0; j < ST; j++) R[c * ST + j] = rows[c][j]; packGenes(T, R, c * ST, slots[c], ST); }
-    var U = { half: [960, 540], px: 500, cam: [120, 380, 900], colourBy: colourBy,
+    var U = { half: [960, 540], px: 500, cam: [120, 380, 900], colourBy: colourBy || (D ? 1 : 0),   /* (the decoded programs write no pattern: not compared) */
               polish: !!P, lite: P === "lite", time: P ? 0.7 : 0, wag: P ? 1 : 0, walls: !!P };
     var inst = { iA: new Float32Array(4 * n), iB: new Float32Array(4 * n), iC: new Float32Array(4 * n), iBody: new Float32Array(4 * n), iX: new Float32Array(4 * n),
                  iGeneSlot: slots };
@@ -293,8 +318,22 @@
     gl.bindTexture(gl.TEXTURE_2D, tex);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, GENES_W, texRows, 0, gl.RGBA, gl.FLOAT, T);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    /* the decoded cache's texture, packed as the renderer packs it (writeDecoded at each fish's slot), on unit 1 */
+    var dtex = null, dData = null, dRows = 0;
+    if (D) {
+      dRows = genesRows(cap);
+      dData = new Float32Array(EA.DECODED_WIDTH * dRows * 4);
+      for (c = 0; c < n; c++) EA.writeDecoded(rows[c], dData, slots[c]);
+      dtex = gl.createTexture();
+      gl.activeTexture(gl.TEXTURE1);
+      gl.bindTexture(gl.TEXTURE_2D, dtex);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, EA.DECODED_WIDTH, dRows, 0, gl.RGBA, gl.FLOAT, dData);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+      gl.activeTexture(gl.TEXTURE0);
+    }
     gl.useProgram(prog);
     function uni(name) { return gl.getUniformLocation(prog, name); }
+    if (D) gl.uniform1i(uni("uDecoded"), 1);
     var I4 = new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
     gl.uniformMatrix4fv(uni("projectionMatrix"), false, I4); gl.uniformMatrix4fv(uni("viewMatrix"), false, I4);
     gl.uniform3fv(uni("cameraPosition"), U.cam); gl.uniform2fv(uni("uHalf"), U.half);
@@ -338,15 +377,43 @@
       gl.deleteVertexArray(vao);
       jobs.push({ name: tp[0], tpl: tpl, ringT: ringT, buf: out });
     });
+    /* the decoded texels, 18 a fish (one point each, per instance): the GPU's reading of what was uploaded */
+    var texelBuf = null;
+    if (D) {
+      gl.useProgram(dprog);
+      gl.uniform1i(gl.getUniformLocation(dprog, "uDecoded"), 1);
+      var dvao = gl.createVertexArray();
+      gl.bindVertexArray(dvao);
+      var sbuf = gl.createBuffer(); bufs.push(sbuf);
+      gl.bindBuffer(gl.ARRAY_BUFFER, sbuf); gl.bufferData(gl.ARRAY_BUFFER, slots, gl.STATIC_DRAW);
+      var sloc = gl.getAttribLocation(dprog, "iGeneSlot");
+      gl.enableVertexAttribArray(sloc); gl.vertexAttribPointer(sloc, 1, gl.FLOAT, false, 0, 0); gl.vertexAttribDivisor(sloc, 1);
+      texelBuf = gl.createBuffer(); bufs.push(texelBuf);
+      gl.bindBuffer(gl.TRANSFORM_FEEDBACK_BUFFER, texelBuf);
+      gl.bufferData(gl.TRANSFORM_FEEDBACK_BUFFER, n * EA.DECODED_TEXELS * 16, gl.STREAM_READ);
+      gl.bindBuffer(gl.TRANSFORM_FEEDBACK_BUFFER, null);
+      gl.bindTransformFeedback(gl.TRANSFORM_FEEDBACK, tfo);
+      gl.bindBufferBase(gl.TRANSFORM_FEEDBACK_BUFFER, 0, texelBuf);
+      gl.beginTransformFeedback(gl.POINTS);
+      gl.drawArraysInstanced(gl.POINTS, 0, EA.DECODED_TEXELS, n);
+      gl.endTransformFeedback();
+      gl.bindBufferBase(gl.TRANSFORM_FEEDBACK_BUFFER, 0, null);
+      gl.bindTransformFeedback(gl.TRANSFORM_FEEDBACK, null);
+      gl.bindVertexArray(null);
+      gl.deleteVertexArray(dvao);
+    }
     gl.disable(gl.RASTERIZER_DISCARD);
     var sync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
     gl.flush();
     /* leave nothing bound (a renderer resets its own state after this);
      * the read-back later binds only COPY_READ_BUFFER, which three never uses */
     gl.useProgram(null); gl.bindBuffer(gl.ARRAY_BUFFER, null); gl.bindTexture(gl.TEXTURE_2D, null);
+    if (D) { gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, null); gl.activeTexture(gl.TEXTURE0); }
     function cleanup() {
       gl.bindBuffer(gl.COPY_READ_BUFFER, null);
       gl.deleteSync(sync); gl.deleteTransformFeedback(tfo); gl.deleteTexture(tex); gl.deleteProgram(prog);
+      if (dtex) gl.deleteTexture(dtex);
+      if (dprog) gl.deleteProgram(dprog);
       bufs.forEach(function (b) { gl.deleteBuffer(b); });
     }
     return fenceDone(gl, sync, 10000).then(function (why) {
@@ -363,6 +430,21 @@
         res.templates[jb.name].reach = reachCheck(jb, data, n, NC, inst, U);
         if (res.templates[jb.name].reach.outside) res.ok = false;
       });
+      if (D && texelBuf) {
+        /* every fish's 72 decoded floats as the GPU read them (texel k, component j: float 4k + j) against the CPU's decode of its row, bit for bit */
+        var td = new Float32Array(n * EA.DECODED_FLOATS), tmp = new Float32Array(EA.DECODED_FLOATS), bad = 0, worstT = "";
+        gl.bindBuffer(gl.COPY_READ_BUFFER, texelBuf);
+        gl.getBufferSubData(gl.COPY_READ_BUFFER, 0, td);
+        for (var cc = 0; cc < n; cc++) {
+          EA.writeDecoded(rows[cc], tmp, 0);
+          for (var q = 0; q < EA.DECODED_FLOATS; q++) {
+            var gv = td[cc * EA.DECODED_FLOATS + q];
+            if (!(gv === tmp[q] || (gv !== gv && tmp[q] !== tmp[q]))) { bad++; if (!worstT) worstT = "fish " + cc + " texel " + (q >> 2) + "." + "xyzw"[q & 3] + ": the GPU read " + gv + ", the CPU decoded " + tmp[q]; }
+          }
+        }
+        res.decoded = { fish: n, texels: n * EA.DECODED_TEXELS, floats: n * EA.DECODED_FLOATS, mismatches: bad, worst: worstT, ok: bad === 0 };
+        if (bad) res.ok = false;
+      }
       cleanup();
       var fins = {};
       Object.keys(res.templates).forEach(function (k) {
@@ -459,7 +541,9 @@
   var FRAG_PALETTES = { family: PATH_COLOURS, brain: [0xff0000, 0x00ff00, 0x0000ff, 0x808080, 0x3c9ae1] };
   var FRAG_MUT = {
     swapRB: ["vec3 base = vec3(r, g, c - 65536.0 * r - 256.0 * g) / 255.0;", "vec3 base = vec3(c - 65536.0 * r - 256.0 * g, g, r) / 255.0;"],
-    branch: ["if (uColourBy > 0.5) base = colourBase(fin, oyL, uBack);", "if (uColourBy < 0.5) base = colourBase(fin, oyL, uBack);"]
+    branch: ["if (uColourBy > 0.5) base = colourBase(fin, oyL, uBack);", "if (uColourBy < 0.5) base = colourBase(fin, oyL, uBack);"],
+    /* (the decoded fragment stage only: the pattern's first texel read from the second) */
+    dswap: ["vG0 = decodedTexel(slot, 8);", "vG0 = decodedTexel(slot, 9);"]
   };
   function recolourBase(rgb, fin, v) {
     var base = [(rgb >>> 16) & 255, (rgb >>> 8) & 255, rgb & 255].map(function (x) { return x / 255; });
@@ -476,8 +560,12 @@
     opts = opts || {};
     if (!BOUND) return Promise.resolve({ error: UNBOUND });
     if (!EA || !EA.flankAt) return Promise.resolve({ error: "web/ocean_appearance.js not loaded" });
-    var P = !!opts.polish;
-    var fsrc = appearanceShaders(EA, P).fs;
+    /* opts.decoded: the render optimization's decoded fragment stage (render.decoded): the pattern's constants loaded per fragment from a
+     * decoded texture (the case's row, decoded by writeDecoded and packed at its case number as its slot) instead of the flat varyings
+     * the diagnostic vertex stage hands over; the expectations are the same as the raw stage's */
+    var P = !!opts.polish, D = !!opts.decoded;
+    if (D && (!EA.writeDecoded || !DECODED)) return Promise.resolve({ error: "the decoded constants (EvoAppearance.writeDecoded) are not loaded" });
+    var fsrc = appearanceShaders(EA, P, D ? [DECODED] : []).fs;
     if (opts.fsMutate) {
       var pm = plant(fsrc, opts.fsMutate, FRAG_MUT);
       if (pm.error) return Promise.resolve({ error: pm.error });
@@ -485,7 +573,21 @@
     }
     if (!gl.getExtension("EXT_color_buffer_float")) return Promise.resolve({ error: "no float render targets (EXT_color_buffer_float)" });
     var G = EA.GLSL;
-    var vsrc = lines([
+    var vsrc = lines(D ? [
+      "attribute vec2 aXY;",
+      "uniform float uSlot; uniform float uLam;",
+      "uniform vec4 uMaterial; uniform float uFin; uniform float uPacked;",
+      "varying vec3 vWorld; varying vec4 vMatV; flat varying vec4 vPart; flat varying vec2 vDecoded;",
+      P ? "uniform float uPw; flat varying float vPw; varying float vCaus;" : null,
+      "void main() {",
+      "  vDecoded = vec2(uSlot, uLam);",
+      "  vWorld = vec3(aXY.x, 0.0, aXY.y);",
+      "  vMatV = uMaterial;",
+      "  vPart = vec4(uFin, 1.0, 0.0, uPacked);",
+      P ? "  vPw = uPw; vCaus = 0.0;" : null,
+      "  gl_Position = vec4(aXY, 0.0, 1.0);",
+      "}"
+    ] : [
       G.COMMON, G.VARY, G.DECODE,
       "attribute vec2 aXY;",
       "uniform vec4 uG[9]; uniform float uLam;",
@@ -548,10 +650,11 @@
       });
     });
 
-    var S = 17, tex = gl.createTexture(), fb = gl.createFramebuffer(), vao = gl.createVertexArray(), quad = gl.createBuffer(), pbo = gl.createBuffer();
+    var S = 17, tex = gl.createTexture(), fb = gl.createFramebuffer(), vao = gl.createVertexArray(), quad = gl.createBuffer(), pbo = gl.createBuffer(), dtex = null;
     function cleanup() {
       gl.bindBuffer(gl.COPY_READ_BUFFER, null);
       gl.deleteTexture(tex); gl.deleteFramebuffer(fb); gl.deleteVertexArray(vao); gl.deleteBuffer(quad); gl.deleteBuffer(pbo); gl.deleteProgram(prog);
+      if (dtex) gl.deleteTexture(dtex);
     }
     gl.bindTexture(gl.TEXTURE_2D, tex);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, S, S, 0, gl.RGBA, gl.FLOAT, null);
@@ -568,6 +671,16 @@
     gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
     gl.useProgram(prog);
     function uni(name) { return gl.getUniformLocation(prog, name); }
+    if (D) {   /* the cases' rows decoded and packed as the renderer packs them: case i at slot i */
+      var dRows = Math.ceil(cases.length / EA.DECODED_ROW_SLOTS), dData = new Float32Array(EA.DECODED_WIDTH * dRows * 4);
+      cases.forEach(function (cs, i) { EA.writeDecoded(cs.row, dData, i); });
+      dtex = gl.createTexture();
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, dtex);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, EA.DECODED_WIDTH, dRows, 0, gl.RGBA, gl.FLOAT, dData);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+      gl.uniform1i(uni("uDecoded"), 0);
+    }
     var W = CLARITY;   /* realistic water: the [0] column */
     gl.uniform3fv(uni("uLight"), [0, 1, 0]); gl.uniform1f(uni("uTime"), 0); gl.uniform3fv(uni("uSelect"), C.select);
     gl.uniform3fv(uni("uFog"), W.fog[0]); gl.uniform1f(uni("uFogDensity"), 0);
@@ -587,6 +700,7 @@
       gl.uniform4fv(uni("uG[0]") || uni("uG"), uG); gl.uniform1f(uni("uLam"), cs.lam);
       gl.uniform4fv(uni("uMaterial"), cs.m); gl.uniform1f(uni("uFin"), cs.fin); gl.uniform1f(uni("uPacked"), cs.packed);
       gl.uniform1f(uni("uColourBy"), cs.colourBy);
+      if (D) gl.uniform1f(uni("uSlot"), i);
       if (P) { gl.uniform3fv(uni("uLight"), cs.light); gl.uniform1f(uni("uPw"), cs.pw); }
       gl.clearBufferfv(gl.COLOR, 0, [-9, -9, -9, -9]);
       gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
@@ -597,6 +711,7 @@
     var sync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
     gl.flush();
     gl.useProgram(null); gl.bindVertexArray(null); gl.bindBuffer(gl.ARRAY_BUFFER, null); gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    if (D) gl.bindTexture(gl.TEXTURE_2D, null);
     if (glErr !== gl.NO_ERROR) { gl.deleteSync(sync); cleanup(); return Promise.resolve({ error: "GL error " + glErr }); }
     return fenceDone(gl, sync, 10000).then(function (why) {
       gl.deleteSync(sync);
@@ -651,16 +766,28 @@
                         appearanceVertexCheck(gl, EA, R, L, o({ colourBy: 0, polish: "lite", injectSweep: false })),
                         appearanceVertexCheck(gl, EA, R, L, o({ colourBy: 1, polish: "lite", injectSweep: false })),
                         appearanceVertexCheck(gl, EA, R, L, o({ colourBy: 0, slotMap: "permuted", injectSweep: false })),
-                        appearanceVertexCheck(gl, EA, R, L, o({ colourBy: 0, slotMap: "sparse", injectSweep: false }))])
+                        appearanceVertexCheck(gl, EA, R, L, o({ colourBy: 0, slotMap: "sparse", injectSweep: false })),
+                        /* the render optimization's decoded programs (render.decoded): plain, full and lite polish, permuted and sparse slots,
+                         * and their fragment stages (plain, polished); the raw checks above stay the production reference they are held to */
+                        appearanceVertexCheck(gl, EA, R, L, o({ decoded: true, injectSweep: false })),
+                        appearanceVertexCheck(gl, EA, R, L, o({ decoded: true, polish: true, injectSweep: false })),
+                        appearanceVertexCheck(gl, EA, R, L, o({ decoded: true, polish: "lite", injectSweep: false })),
+                        appearanceVertexCheck(gl, EA, R, L, o({ decoded: true, slotMap: "permuted", injectSweep: false })),
+                        appearanceVertexCheck(gl, EA, R, L, o({ decoded: true, slotMap: "sparse", injectSweep: false })),
+                        appearanceFragmentCheck(gl, EA, o({ decoded: true })),
+                        appearanceFragmentCheck(gl, EA, o({ decoded: true, polish: true }))])
       .then(function (r) {
         var errs = [];
         ["appearance", "recolour", "fragment", "polish.appearance", "polish.recolour", "polish.fragment", "polish.lite.appearance", "polish.lite.recolour",
-         "slots.permuted", "slots.sparse"].forEach(function (k, i) { if (r[i].error) errs.push(k + ": " + r[i].error); });
+         "slots.permuted", "slots.sparse", "decoded.vertex", "decoded.polish", "decoded.lite", "decoded.permuted", "decoded.sparse", "decoded.fragment",
+         "decoded.polish.fragment"].forEach(function (k, i) { if (r[i].error) errs.push(k + ": " + r[i].error); });
         var out = { ok: errs.length === 0 && r.every(function (x) { return x.ok === true; }), fixture: fx.rows.length, fish: R.length,
                     appearance: r[0], recolour: r[1], fragment: r[2],
                     polish: { ok: r[3].ok === true && r[4].ok === true && r[5].ok === true && r[6].ok === true && r[7].ok === true,
                               appearance: r[3], recolour: r[4], fragment: r[5], lite: { appearance: r[6], recolour: r[7] } },
-                    slots: { ok: r[8].ok === true && r[9].ok === true, permuted: r[8], sparse: r[9] } };
+                    slots: { ok: r[8].ok === true && r[9].ok === true, permuted: r[8], sparse: r[9] },
+                    decoded: { ok: r.slice(10).every(function (x) { return x.ok === true; }), vertex: r[10], polish: r[11], lite: r[12], permuted: r[13], sparse: r[14],
+                               fragment: r[15], polishFragment: r[16] } };
         if (errs.length) out.error = errs.join("; ");
         return out;
       });
@@ -934,7 +1061,7 @@
     }
     function runProbes(s) {
       var appKind = port.appKind(), appDrawn = port.drawn(), appStatus = port.status();
-      if (!appDrawn || !appKind || !appKind.mesh.visible) { failProbes("the appearance fish were not drawn this frame (" + appStatus + ")"); return; }
+      if (!appDrawn || !appKind || !appKind.drawing()) { failProbes("the appearance fish were not drawn this frame (" + appStatus + ")"); return; }
       var list = probes.splice(0);   /* (in place: the scene reads this array) */
       list.forEach(function (rq) {
         clearTimeout(rq.timer);

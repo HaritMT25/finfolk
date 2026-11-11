@@ -1047,6 +1047,8 @@ interface ParityScene {
 interface ParityCheckOptions {
   colourBy?: number; polish?: FishVariant; mutate?: string; fsMutate?: string;
   slotMap?: "identity" | "permuted" | "sparse"; injectSweep?: boolean;
+  /** the render optimization's decoded programs (render.decoded) instead of the raw ones */
+  decoded?: boolean;
 }
 /** What the probes use of the scene's three.js renderer (its WebGL2 context untyped here, as the checks'
  * gl): their own render targets, three's state restored after, the shader-error hook. */
@@ -1075,6 +1077,8 @@ interface ParityAppKind {
   shaders: AppearancePrograms;
   mat: { uniforms: { uGenes: unknown } };
   mesh: { visible: boolean };
+  /** the appearance fish were drawn this frame: the canonical body draw, or (the render optimization) the body buckets */
+  drawing(): boolean;
 }
 /** The scene's port for the probes (attach, once a scene): fixed parts and live getters, read at each
  * probe, never copied (web/ocean_scene_parity.js attach says what each is). */

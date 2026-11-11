@@ -1209,6 +1209,8 @@
       /* the buckets are drawn instead of the canonical body draw: the policy asks for them and the lit split (reference-drawn) is off */
       self.bucketsOn = function () { return renderOn && renderNow.lod !== "quality" && !litSplit; };
       self.lodState = function () { return lodSt; };
+      /* this frame drew the fish: the canonical body draw, or the buckets (the probes read what production drew) */
+      self.drawing = function () { return !!(self.mesh && self.mesh.visible) || (self.bat.on && self.bat.coarse + self.bat.medium > 0); };
       /* each draw's state for the diagnostics and tests: n fish, buffer capacity, drawIdx (its place -> the fish's snapshot place), the
        * live instance attributes, and the canonical staging they were copied from */
       self.batches = function () {
@@ -1350,7 +1352,9 @@
         binder.bind(self.mesh, "app", split ? "litSkip" : "body", split ? 0 : w); binder.bind(self.shadow, "app", "shadow", w);
         if (self.bmesh) binder.bind(self.bmesh, "app", split ? "litSkip" : "body", split ? 0 : w);
         /* the render optimization's bucketed draws, instead of the canonical body and barbel draws (the shadow draw stays) */
-        var buckets = self.bucketsOn(), bmode = renderOn ? renderNow.barbels : "body", own = renderOn && (buckets || bmode !== "body");
+        /* (the lit split, off by default, is drawn by the reference pipeline: its lit draw has the lit fish's barbels, so the canonical
+         * barbel draw stays too, as the buckets do) */
+        var buckets = self.bucketsOn(), bmode = renderOn ? renderNow.barbels : "body", own = renderOn && !litSplit && (buckets || bmode !== "body");
         self.bat.own = own;
         if (buckets) self.bytes += drawBuckets(n, w); else if (renderOn) hideBuckets();
         if (own) self.bytes += drawBarbels(n, w, barbels, buckets, bmode); else if (renderOn) hideBarbels();
