@@ -605,7 +605,8 @@ def hc_fit_status(s):
 def eligibility(eco, registry, hc_slopes, registry_sha256=None, mask=None, eco_sha256=None, min_q200=MIN_Q200,
                 mask_sha256=None, hc_provenance=None):
     """THE AUTHORITATIVE ELIGIBILITY DISPATCHER (Annex H D6 rules 26-27 and 33; D7 rules 36-38) -> (the eligibility
-    record, H-C's usable block deltas, their count weights).
+    record, H-C's usable block deltas, their count weights), the last two STAMPED with the record's H-C binding
+    (HCContrasts: decide refuses contrasts of another record, graph, mask or snapshots; Codex #68 D6 r3 P2-2).
 
       Q200 (D6 rule 26): every retained C history with continuous coexistence through the observed 200M endpoint
         (ecology_problems recomputes it from the export's slots). |Q200| >= min_q200 (24) is the availability
@@ -716,12 +717,60 @@ def eligibility(eco, registry, hc_slopes, registry_sha256=None, mask=None, eco_s
            "ineligible": dict(sorted(why.items())),
            "technical_gaps": {w: [list(x) for x in g] for w, g in sorted(tech.items())},
            "mask": mrec, "hypotheses": hyp}
-    return rec, deltas, weights
+    return rec, stamp_contrasts(rec, deltas), stamp_contrasts(rec, weights)
 
 
 def record_sha256(elig):
     """The eligibility record's identity: the sha256 of its canonical JSON (the same after a file round trip)."""
     return rqlib.canonical_sha(elig)
+
+
+class HCContrasts(dict):
+    """H-C's block contrasts {block: (delta_A, delta_B)} or count weights {block: (a_A, a_B)} STAMPED at production
+    (Codex #68 D6 r3 P2-2): `binding` is the record's result_binding for H-C (the record's identity, the hypothesis
+    and the bound graph / mask / snapshot provenance of its eligible worlds), `digest` the content's sha256 as
+    produced. A plain dict, a copy (dict(x)) or a JSON round trip carries no stamp, so decide refuses it; the stamp is
+    restored only through bind_hc_contrasts, which checks the provenance like require_population."""
+    binding = None
+    digest = None
+
+
+def contrasts_sha256(x):
+    """The sha256 of H-C block contrasts or weights: their canonical JSON ({block: [A, B]})."""
+    return rqlib.canonical_sha({str(b): list(v) for b, v in x.items()})
+
+
+def stamp_contrasts(elig, x):
+    """-> HCContrasts: the block contrasts / weights x stamped with elig's H-C binding and their own digest."""
+    out = HCContrasts(x)
+    out.binding = result_binding(elig, "H-C")
+    out.digest = contrasts_sha256(x)
+    return out
+
+
+def require_contrasts(elig, deltas, weights):
+    """The decision-side check of H-C's contrasts (Codex #68 D6 r3 P2-2): both the block deltas and the count weights
+    must be stamped with THIS record's H-C binding (not another record's, graph's, mask's or snapshots'), unchanged
+    since they were produced, and over exactly the record's usable blocks; StatsError otherwise. decide calls it
+    before either hc_test."""
+    e = (elig.get("hypotheses") or {}).get("H-C") or {}
+    want = result_binding(elig, "H-C")
+    for name, x in (("deltas", deltas), ("weights", weights)):
+        if not isinstance(x, HCContrasts) or x.binding != want:
+            raise StatsError(f"H-C's {name} are not bound to this eligibility record (computed without it, or from "
+                             "another graph / mask / snapshot identities): stats.eligibility / bind_hc_contrasts")
+        if x.digest != contrasts_sha256(x):
+            raise StatsError(f"H-C's {name} changed after they were produced")
+        if sorted(x) != e.get("usable_blocks"):
+            raise StatsError(f"H-C's {name} are not over the record's usable blocks")
+
+
+def bind_hc_contrasts(elig, deltas, weights, worlds, provenance=None):
+    """Re-stamp H-C contrasts that lost their stamp (cached, JSON round-tripped) for a record: allowed only when
+    require_population accepts them, i.e. H-C is available, `worlds` are exactly its eligible worlds and `provenance`
+    (observation_provenance of those worlds' observations) is the record's binding -> (deltas, weights) stamped."""
+    require_population(elig, "H-C", worlds, provenance)
+    return stamp_contrasts(elig, deltas), stamp_contrasts(elig, weights)
 
 
 def result_binding(elig, hyp):
@@ -791,8 +840,10 @@ def decide(elig, results, deltas, weights, alpha=FAMILY_ALPHA):
     available with its calibration (family_p: H-F's critical value, H-T's frozen critical value and guard) and h
     was computed on exactly the common Q200 population (StatsError otherwise: a decision on another population is
     never accepted); every unavailable row keeps its row and enters Holm as p = 1 (holm); H-C's p is the
-    count-weighted intersection-union test's (hc_test), and H-C is then decided at its REACHED ACTIVE Holm level
-    (its bounds at that level beside the fixed 99% ones); family_decision is authoritative."""
+    count-weighted intersection-union test's (hc_test) of the block deltas and weights, which must be this record's
+    stamped contrasts (require_contrasts, before either hc_test: contrasts of another graph / mask / snapshots, or
+    unstamped or altered ones, are refused; Codex #68 D6 r3 P2-2), and H-C is then decided at its REACHED ACTIVE
+    Holm level (its bounds at that level beside the fixed 99% ones); family_decision is authoritative."""
     pv, why = {}, {}
     for h in Q200_FAMILY:
         e, r = elig["hypotheses"][h], results.get(h)
@@ -809,6 +860,8 @@ def decide(elig, results, deltas, weights, alpha=FAMILY_ALPHA):
         if why_h:
             why[h] = why_h
     e = elig["hypotheses"]["H-C"]
+    if e["available"]:
+        require_contrasts(elig, deltas, weights)        # (Codex #68 D6 r3 P2-2: before either hc_test)
     hc = hc_test(deltas, DETECT_ALPHA, weights=weights) if e["available"] else {"available": False, "reason": e["reason"]}
     if not hc.get("available"):
         pv["H-C"], why["H-C"] = None, hc.get("reason") or e["reason"]

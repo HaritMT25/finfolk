@@ -2136,7 +2136,9 @@ def _dist(xs):
     return {"n": len(xs), "mean": sum(xs) / len(xs), "median": xs[len(xs) // 2], "min": xs[0], "max": xs[-1]}
 
 
-TOOLS = ("calib.py", "recurrence.py", "transition.py", "backbone.py", "stats.py", "noisescale.py")
+# (Codex #68 D6 r3 P2: graph.py is part of the calibration identity: eligible_graph / panel_problems execute its
+# WINDOWS, OFFSETS and splits() to authorize production inputs, so a change to those checks is a new identity)
+TOOLS = ("calib.py", "recurrence.py", "transition.py", "backbone.py", "stats.py", "noisescale.py", "graph.py")
 GATES_SCHEMA = "finfolk.redqueen.annexH.gates/1"
 IDENT = ("graph_sha256", "graph_source", "params_sha256", "params_fitted", "tools_sha256", "solver_sha256", "draws",
          "production")

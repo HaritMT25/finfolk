@@ -845,6 +845,29 @@ class TestRound3(unittest.TestCase):
         self.assertEqual(man["solver_sha256"], cb.doc_sha(cb.solver_identity()))
         self.assertIn("solver_sha256", cb.IDENT)
 
+    def test_tools_hash_covers_the_registration_checks(self):
+        """Codex #68 D6 r3 P2: calibration executes graph.py's WINDOWS / OFFSETS / splits() to authorize production
+        inputs, so graph.py is part of tools_sha256 (the manifest's calibration identity) and its bytes change it."""
+        import shutil
+        import tempfile
+        cb = self.cb
+        self.assertIn("graph.py", cb.TOOLS)
+        for mod in (cb.graphlib, cb.stats, cb.backbone, cb.recurrence, cb.transition, cb.noisescale):
+            self.assertIn(os.path.basename(mod.__file__), cb.TOOLS, mod.__name__)
+        base = cb.tools_sha()
+        self.assertEqual(cb.manifest(self.graph, self.params, 19)["tools_sha256"], base)
+        with tempfile.TemporaryDirectory() as d:
+            for f in cb.TOOLS:
+                shutil.copy(os.path.join(cb.HERE, f), d)
+            here, cb.HERE = cb.HERE, d
+            try:
+                self.assertEqual(cb.tools_sha(), base)
+                with open(os.path.join(d, "graph.py"), "ab") as fh:
+                    fh.write(b"\n# a changed registration check\n")
+                self.assertNotEqual(cb.tools_sha(), base)
+            finally:
+                cb.HERE = here
+
     def test_verify_enforces_the_declared_tolerance(self):
         """The completed noise-free panel must meet each declared RMS target to AMP_TOL on both sides."""
         cb = self.cb

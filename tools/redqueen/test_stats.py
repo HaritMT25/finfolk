@@ -642,6 +642,70 @@ class TestEligibility(unittest.TestCase):
         dec3 = stats.decide(rec3, {"H-P": {"available": True, "p": 0.001, "worlds": q, "binding": b}}, D3, W3)
         self.assertEqual(dec3["pvalues"]["H-P"], 0.001)
 
+    def test_hc_contrasts_are_bound_to_their_record(self):
+        """Codex #68 D6 r3 P2-2: H-C's block deltas and count weights are STAMPED at production with the record's H-C
+        binding (its identity, the graph / mask / snapshot provenance of its eligible worlds) and decide refuses, before
+        either hc_test, contrasts of another record: one produced from graph / mask A never enters B's decision, even
+        with identical world and block ids and identical values. The matching case is unchanged."""
+        recA, DA, WA, decA = self.run_(dead=["A30"])
+        recB, DB, WB, _ = self.run_(dead=["B31"])
+        self.assertEqual(decA["pvalues"]["H-C"], stats.decide(recA, {}, DA, WA)["pvalues"]["H-C"])   # (matching: passes)
+        self.assertEqual((DA.binding, WA.binding), (stats.result_binding(recA, "H-C"),) * 2)
+        self.assertEqual(DA.binding["provenance"], recA["hypotheses"]["H-C"]["binding"])
+        msg = "not bound to this eligibility record"
+        for d, w in ((DA, WA), (DA, WB), (DB, WA)):                      # (A's, or half of A's, into B)
+            with self.assertRaisesRegex(stats.StatsError, msg):
+                stats.decide(recB, {}, d, w)
+        # (an unstamped copy, a JSON round trip, a plain dict: refused; an altered stamped one; other blocks)
+        for d, w in ((dict(DB), dict(WB)), (json.loads(json.dumps(DB)), WB), (DB, {}), ({}, {})):
+            with self.assertRaisesRegex(stats.StatsError, msg):
+                stats.decide(recB, {}, d, w)
+        altered = stats.stamp_contrasts(recB, DB)
+        altered[next(iter(altered))] = (9.0, 9.0)
+        with self.assertRaisesRegex(stats.StatsError, "changed after they were produced"):
+            stats.decide(recB, {}, altered, WB)
+        fewer = stats.stamp_contrasts(recB, {b: v for b, v in list(DB.items())[1:]})
+        with self.assertRaisesRegex(stats.StatsError, "usable blocks"):
+            stats.decide(recB, {}, fewer, WB)
+        # (restamping a cache needs the record's population and provenance, like any analysis: require_population)
+        eligible = recB["hypotheses"]["H-C"]["worlds"]
+        d2, w2 = stats.bind_hc_contrasts(recB, dict(DB), dict(WB), eligible)
+        self.assertEqual(stats.decide(recB, {}, d2, w2)["pvalues"], stats.decide(recB, {}, DB, WB)["pvalues"])
+        with self.assertRaisesRegex(stats.StatsError, "registered population"):
+            stats.bind_hc_contrasts(recB, dict(DB), dict(WB), eligible[1:])
+        with self.assertRaisesRegex(stats.StatsError, "provenance"):
+            stats.bind_hc_contrasts(recB, dict(DB), dict(WB), eligible, {"graph_edges_sha256": "g" * 64})
+        # (an unavailable H-C uses no contrasts: nothing to validate)
+        dead = [w["id"] for w in self.reg["worlds"] if w["treatment"] != "C" and w["block"] > 1]
+        rec1, _, _, dec1 = self.run_(dead=dead)
+        self.assertFalse(rec1["hypotheses"]["H-C"]["available"])
+        self.assertIsNone(stats.decide(rec1, {}, {}, {})["pvalues"]["H-C"])
+        if not has_validator():
+            self.skipTest("graph.mask_evidence_problems (#77) is not on this branch yet")
+        # (graph / mask A into B: the same worlds, blocks and values, other graph edges / mask bytes / snapshot bytes)
+        reg = self.reg
+        clean = mask_doc(reg["worlds"], {})
+        snaps = json.loads(json.dumps(clean))
+        snaps["worlds"][reg["worlds"][0]["id"]]["available_sha256"] = {"5000000": "a" * 64}
+        hc = hc_slopes(reg["worlds"])
+        mA, mB = (clean, "m" * 64), (dict(clean, graph={"edges_sha256": "h" * 64}), "m" * 64)
+        for other in (mB, (clean, "n" * 64), (snaps, "m" * 64)):
+            recs = []
+            for mask, sha in (mA, other):
+                recs.append(stats.eligibility(eco_doc(reg["worlds"]), reg, hc, registry_sha256="r" * 64, mask=mask,
+                                              eco_sha256="e" * 64, mask_sha256=sha,
+                                              hc_provenance=stats.observation_provenance(mask, sha, sorted(hc))))
+            (rA, dA, wA), (rB, dB, wB) = recs
+            self.assertNotEqual(rA["hypotheses"]["H-C"]["binding"], rB["hypotheses"]["H-C"]["binding"])
+            self.assertEqual((dict(dA), dict(wA)), (dict(dB), dict(wB)))         # (the same numbers: only provenance differs)
+            self.assertIsNotNone(stats.decide(rA, {}, dA, wA)["pvalues"]["H-C"])
+            self.assertIsNotNone(stats.decide(rB, {}, dB, wB)["pvalues"]["H-C"])
+            with self.assertRaisesRegex(stats.StatsError, msg):
+                stats.decide(rB, {}, dA, wA)
+            with self.assertRaisesRegex(stats.StatsError, "provenance"):          # (a re-stamp claiming A's provenance)
+                stats.bind_hc_contrasts(rB, dict(dA), dict(wA), rB["hypotheses"]["H-C"]["worlds"],
+                                        rA["hypotheses"]["H-C"]["binding"])
+
 
 if __name__ == "__main__":
     unittest.main()
