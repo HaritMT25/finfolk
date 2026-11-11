@@ -4896,6 +4896,26 @@ static bool findSqrtTie(float& xa, float& xb) {
     }
     return false;
 }
+
+// The base algorithm's eat scan: creatures in index order, queryRadius (queryRadiusWrapped on the torus) over a
+// food grid built from `food`, and an alive-flag claim per item. Returns how many items each creature claims;
+// `gone` marks the claimed items.
+static std::vector<int> baseClaims(const SimConfig& cfg, const std::vector<Food>& food,
+                                   const std::vector<Creature>& cs, std::vector<char>& gone) {
+    SpatialGrid fg;
+    fg.init(W, H, cfg.perceptionRadius);
+    for (int i = 0; i < (int)food.size(); ++i) fg.insert(food[(size_t)i].pos, i);
+    fg.build();
+    gone.assign(food.size(), 0);
+    std::vector<int> ate(cs.size(), 0);
+    for (size_t i = 0; i < cs.size(); ++i) {
+        std::vector<int> hits;
+        if (cfg.toroidal) fg.queryRadiusWrapped(cs[i].pos, cfg.pickupRadius, hits);
+        else              fg.queryRadius(cs[i].pos, cfg.pickupRadius, hits);
+        for (int fi : hits) if (!gone[(size_t)fi]) { gone[(size_t)fi] = 1; ++ate[i]; }
+    }
+    return ate;
+}
 }  // namespace fxscan
 
 static void test_fused_scan_production_paths() {
@@ -4933,21 +4953,34 @@ static void test_fused_scan_production_paths() {
             }
     }
 
-    // --- points exactly on the radius, coincident points, a point just outside ---
-    for (int tor = 0; tor < 2; ++tor) {
-        Scene sc;
-        sc.cs.push_back(mk({100.0f, 100.0f}, dirA, 30.0f, 33.0f, 50));
-        sc.cs.push_back(mk({180.0f, 100.0f}, {1.0f, 0.0f}, 20.0f, 40.0f, 30));           // exactly R away: a hit
-        sc.cs.push_back(mk({100.0f, 100.0f}, {0.0f, 1.0f}, 70.0f, 15.0f, 66));           // coincident with S
-        sc.cs.push_back(mk({100.0f, 100.0f}, {0.0f, -1.0f}, 5.0f, 45.0f, 20));           // coincident with both
-        sc.cs.push_back(mk({std::nextafter(180.0f, 1e9f), 100.0f}, {1.0f, 0.0f}, 8.0f, 9.0f, 40));   // just outside
-        sc.cs.push_back(mk({100.0f, 20.0f}, {0.0f, 1.0f}, 44.0f, 31.0f, 52));            // exactly R above
-        sc.food = {{180.0f, 100.0f}, {100.0f, 100.0f}, {100.0f, 100.0f}, {std::nextafter(180.0f, 1e9f), 100.0f},
-                   {100.0f, 20.0f}};
-        sc.preds = {{20.0f, 100.0f},                                                      // exactly R from S: unseen
-                    {100.0f, 100.0f + std::nextafter(80.0f, 0.0f)}};                      // just inside R: seen
-        CHECK(senseDiffs(sc, tor != 0) == 0);
+    // --- points exactly on the radius, coincident points, a point just outside; the predator on the radius
+    //     (unseen) and the predator just inside it (seen) in scenes of their own, so that neither can hide the
+    //     other: a closer predator would win the selection and mask a wrongly inclusive boundary ---
+    const float yInside = std::nextafter(180.0f, 100.0f);          // (100 + nextafter(80, 0) would round back to 180)
+    {
+        const float dyIn = yInside - 100.0f;
+        CHECK(yInside < 180.0f);
+        CHECK(dyIn * dyIn < R * R);                                 // really inside R, by a few ulps of d^2
     }
+    for (int tor = 0; tor < 2; ++tor)
+        for (int which = 0; which < 3; ++which) {                   // 0: no predator, 1: exactly on R, 2: just inside R
+            Scene sc;
+            sc.cs.push_back(mk({100.0f, 100.0f}, dirA, 30.0f, 33.0f, 50));
+            sc.cs.push_back(mk({180.0f, 100.0f}, {1.0f, 0.0f}, 20.0f, 40.0f, 30));           // exactly R away: a hit
+            sc.cs.push_back(mk({100.0f, 100.0f}, {0.0f, 1.0f}, 70.0f, 15.0f, 66));           // coincident with S
+            sc.cs.push_back(mk({100.0f, 100.0f}, {0.0f, -1.0f}, 5.0f, 45.0f, 20));           // coincident with both
+            sc.cs.push_back(mk({std::nextafter(180.0f, 1e9f), 100.0f}, {1.0f, 0.0f}, 8.0f, 9.0f, 40));   // just outside
+            sc.cs.push_back(mk({100.0f, 20.0f}, {0.0f, 1.0f}, 44.0f, 31.0f, 52));            // exactly R above
+            sc.food = {{180.0f, 100.0f}, {100.0f, 100.0f}, {100.0f, 100.0f}, {std::nextafter(180.0f, 1e9f), 100.0f},
+                       {100.0f, 20.0f}};
+            if (which == 1) sc.preds = {Vec2{20.0f, 100.0f}};        // exactly R from S, and the only one: unseen
+            if (which == 2) sc.preds = {Vec2{100.0f, yInside}};      // just inside R, and the only one: seen
+            float prod[NUM_SENSES];
+            CHECK(senseDiffs(sc, tor != 0, prod) == 0);
+            // independent of the reference: seen or not
+            if (which == 2) CHECK(prod[PREDATOR_PROX] > 0.0f);
+            else            CHECK(prod[PREDATOR_PROX] == 0.0f && prod[PREDATOR_FWD] == 0.0f && prod[PREDATOR_LR] == 0.0f);
+        }
 
     // --- empty scans: nothing in range, no food, no predator; and an edge creature ---
     for (int tor = 0; tor < 2; ++tor) {
@@ -5035,18 +5068,8 @@ static void test_fused_scan_production_paths() {
         w.update(0.016f);
         CHECK(w.creatures.size() == 6);
         // the base algorithm: creatures in index order, queryRadius / queryRadiusWrapped over the food grid, alive-flag claim
-        SpatialGrid fg;
-        fg.init(W, H, w.cfg.perceptionRadius);
-        for (int i = 0; i < (int)preFood.size(); ++i) fg.insert(preFood[(size_t)i].pos, i);
-        fg.build();
-        std::vector<char> gone(preFood.size(), 0);
-        std::vector<int> ate(6, 0);
-        for (int i = 0; i < 6; ++i) {
-            std::vector<int> hits;
-            if (tor) fg.queryRadiusWrapped(w.creatures[(size_t)i].pos, 10.0f, hits);
-            else     fg.queryRadius(w.creatures[(size_t)i].pos, 10.0f, hits);
-            for (int fi : hits) if (!gone[(size_t)fi]) { gone[(size_t)fi] = 1; ++ate[(size_t)i]; }
-        }
+        std::vector<char> gone;
+        const std::vector<int> ate = baseClaims(w.cfg, preFood, w.creatures, gone);
         int badAte = 0, total = 0;
         for (int i = 0; i < 6; ++i) {
             const int got = (int)std::lround((w.creatures[(size_t)i].foodReserves - 30.0f) / 4.0f);
@@ -5064,6 +5087,47 @@ static void test_fused_scan_production_paths() {
         CHECK(total >= 8 && total < (int)preFood.size());      // it ate, and left some: the scene is not vacuous
         CHECK(ate[0] >= 3 && ate[1] >= 1);                       // creature 0 (first in index order) took the contested items
         (void)preCreatures;
+    }
+
+    // --- the eat scan's ENERGY, bit for bit. The block above uses foodEnergy 4 (30 + 4k is exact, so the meal count
+    //     can be read back); that makes one `count * foodEnergy` addition pass as well. Production adds foodEnergy
+    //     once PER CLAIMED ITEM (c.foodReserves += cfg.foodEnergy), and with foodEnergy = 0.1f (not a power of two)
+    //     the float sum differs from a single addition of count * 0.1f, so the reference below does one addition
+    //     per claim and the reserve bits are compared. The scene is checked to be rounding-sensitive. ---
+    for (int tor = 0; tor < 2; ++tor) {
+        World w;
+        configure(w, tor != 0, 0);
+        w.cfg.minSpeed = w.cfg.maxSpeed = 1e-30f;
+        w.cfg.metabolicRate = 0.0f; w.cfg.geneCost = 0.0f; w.cfg.moveCost = 0.0f;
+        w.cfg.foodEnergy = 0.1f;
+        w.cfg.pickupRadius = 10.0f;
+        w.init(W, H, 0);
+        const float start[4] = {30.0f, 17.3f, 25.7f, 21.9f};
+        const Vec2 where[4] = {{100.0f, 100.0f}, {400.0f, 300.0f}, {5.0f, 240.0f}, {300.0f, 60.0f}};
+        for (int i = 0; i < 4; ++i) w.creatures.push_back(mk(where[i], {1.0f, 0.0f}, 5.0f, start[i], 0));
+        w.food.clear();
+        for (int j = 0; j < 13; ++j) w.food.push_back(Food{{100.0f + 0.5f * (float)j, 100.0f}, true});   // 13 for creature 0
+        for (int j = 0; j < 9; ++j)  w.food.push_back(Food{{400.0f, 300.0f + 0.75f * (float)j}, true});  // 9 for creature 1
+        for (int j = 0; j < 6; ++j)  w.food.push_back(Food{{5.0f, 240.0f + (float)j}, true});            // 6 for creature 2
+        for (int j = 2; j <= 4; ++j) w.food.push_back(Food{{(float)W - (float)j, 240.0f}, true});        // 3 more, across the seam
+        for (int j = 0; j < 4; ++j)  w.food.push_back(Food{{300.0f - (float)j, 60.0f}, true});           // 4 for creature 3
+        const std::vector<Food> preFood = w.food;
+        w.update(0.016f);
+        CHECK(w.creatures.size() == 4);
+        std::vector<char> gone;
+        const std::vector<int> ate = baseClaims(w.cfg, preFood, w.creatures, gone);
+        int badBits = 0, sensitive = 0, meals = 0;
+        for (int i = 0; i < 4; ++i) {
+            float seq = start[i];
+            for (int k = 0; k < ate[(size_t)i]; ++k) seq += w.cfg.foodEnergy;           // one addition per claimed item
+            const float once = start[i] + (float)ate[(size_t)i] * w.cfg.foodEnergy;      // what a single addition would give
+            if (floatBits(w.creatures[(size_t)i].foodReserves) != floatBits(seq)) ++badBits;
+            if (floatBits(seq) != floatBits(once)) ++sensitive;
+            meals += ate[(size_t)i];
+        }
+        CHECK(badBits == 0);
+        CHECK(meals == (tor ? 35 : 32));                         // the scene eats what it was built to eat
+        CHECK(sensitive >= 2);                                   // and one addition per item is distinguishable from one per creature
     }
 
     // --- pending_ is a member reused every step: a creature's deferred signal must not leak into the next
