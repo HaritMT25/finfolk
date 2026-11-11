@@ -820,9 +820,10 @@ class TestRecovery(unittest.TestCase):
         self.assertIn(out0["selected"]["rank"], (0, 1))
         self.assertIsInstance(out0["success"], bool)
 
-    def flag_scores(self, where):
-        """recovery.scorer wrapped so that a score of a set for which where(ix) holds ALSO reports one finite
-        UNRESOLVED pair (map.pred_count_lpd's grid_unresolved) in its integration diagnostics."""
+    def flag_scores(self, where, model=None):
+        """recovery.scorer wrapped so that a score of a set for which where(ix) holds (and, with model, of a model
+        for which model(m) holds) ALSO reports one finite UNRESOLVED pair (map.pred_count_lpd's grid_unresolved)
+        in its integration diagnostics."""
         import unittest.mock as mock
         real = self.rec.scorer
 
@@ -831,7 +832,7 @@ class TestRecovery(unittest.TestCase):
 
             def score(ix, info=None):
                 out = sc(ix, info)
-                if info is not None and where(ix):
+                if info is not None and where(ix) and (model is None or model(m)):
                     info["grid_unresolved"] = info.get("grid_unresolved", 0) + 1
                 return out
             return score
@@ -894,6 +895,30 @@ class TestRecovery(unittest.TestCase):
         self.assertIsNone(sp["test_lb"])
         self.assertEqual({k: out["selected"][k] for k in ("rank", "lambda")},
                          {k: base["selected"][k] for k in ("rank", "lambda")})           # (the nominal pick, flagged)
+
+    def test_primary_has_its_own_availability(self):
+        """r7 P2-2: the primary result reads the validation scores of its rank <= PRIMARY_RANKS candidates only. A
+        flag in a rank-3 candidate's validation leaves the FULL selection unresolved but the primary decided."""
+        D, R = self.D, self.rec
+        data = R.simulate(D, dict(rank=1, energy=0.10), 13)
+        run = lambda: R.procedure(D, data, "a", 3, [0.1], 8, 13)        # noqa: E731
+        base = run()
+        with self.flag_scores(lambda ix: ix is D.val_idx, model=lambda m: m["u"].shape[1] >= 3):
+            out = run()
+        self.assertFalse(out["decision"]["available"])
+        self.assertTrue(out["decision"]["selection_unresolved"] and out["selected"]["selection_unresolved"])
+        self.assertIsNone(out["test_lb"])
+        sp = out["selected_primary"]
+        self.assertTrue(sp["available"])
+        self.assertNotIn("selection_unresolved", sp)
+        self.assertLessEqual(sp["rank"], R.PRIMARY_RANKS)
+        for k in ("rank", "lambda", "test_improvement", "test_lb", "success"):
+            self.assertEqual(sp[k], base["selected_primary"][k], k)                   # (the unflagged primary, kept)
+        self.assertIsNotNone(sp["test_lb"])
+        with self.flag_scores(lambda ix: ix is D.val_idx, model=lambda m: m["u"].shape[1] == 1):   # (a primary rank)
+            out = run()
+        self.assertFalse(out["selected_primary"]["available"])
+        self.assertTrue(out["selected_primary"]["selection_unresolved"])
 
     def test_unresolved_scores_never_decide_forward(self):
         """r5 P2-1, the forward tests: a flagged score in a test set's two models (or in the validation
@@ -1080,33 +1105,42 @@ class TestRecoveryRuns(unittest.TestCase):
         finally:
             shutil.rmtree(tmp)
 
+    def flag_validation(self, model=None):
+        """recovery.scorer patched so that the VALIDATION scores (the second scoring of a model in procedure(): the
+        test set is scored first) of a model with model(m) report one finite unresolved pair."""
+        import unittest.mock as mock
+        real = self.rec.scorer
+
+        def scorer(D, data, m, idx, fitter):
+            sc, calls = real(D, data, m, idx, fitter), []
+
+            def score(ix, info=None):
+                res = sc(ix, info)
+                calls.append(1)
+                if info is not None and len(calls) == 2 and (model is None or model(m)):
+                    info["grid_unresolved"] = 1
+                return res
+            return score
+        return mock.patch.object(self.rec, "scorer", scorer)
+
     def test_summary_excludes_unresolved_selections(self):
         """r6 P2-1: summarize() keeps a result whose selection or comparison is UNRESOLVED (a finite score that
         failed its integration check) out of every numeric aggregate and rank histogram, and counts it by itself.
-        Dataset 0 is an ordinary result; dataset 1 is a real run whose validation scores are injected as flagged."""
-        import unittest.mock as mock
+        r7 P2-1: the acceptance rate (rate, wilson95) is successes / datasets, an unavailable dataset being
+        unsuccessful; the conditional successes / decided rate is reported beside it, labelled. r7 P2-2: the primary
+        block aggregates every dataset on the primary's own availability. Dataset 0 is an ordinary result; dataset 1
+        is a real run whose validation scores are injected as flagged."""
         R = self.rec
         out = os.path.join(self.tmp, "unres")
         R.prepare_run(self.ns(options="a", lambdas="0.1", iters=3, out=out))
         for rep in (0, 1):
             f = os.path.join(out, f"r0.{rep:03d}.json")
+            args = self.ns(options="a", lambdas="0.1", iters=3, scenario="r0", rep=rep, out=f)
             if rep == 0:
-                self.assertEqual(R.one(self.ns(options="a", lambdas="0.1", iters=3, scenario="r0", rep=0, out=f)), 0)
+                self.assertEqual(R.one(args), 0)
                 continue
-            real = R.scorer
-
-            def scorer(D, data, m, idx, fitter):
-                sc, calls = real(D, data, m, idx, fitter), []
-
-                def score(ix, info=None):
-                    res = sc(ix, info)
-                    calls.append(1)
-                    if info is not None and len(calls) == 2:      # (procedure: the test set first, then validation)
-                        info["grid_unresolved"] = 1
-                    return res
-                return score
-            with mock.patch.object(R, "scorer", scorer):
-                self.assertEqual(R.one(self.ns(options="a", lambdas="0.1", iters=3, scenario="r0", rep=1, out=f)), 0)
+            with self.flag_validation():
+                self.assertEqual(R.one(args), 0)
         o0 = rqlib.read_json(os.path.join(out, "r0.000.json"))["options"]["a"]
         o1 = rqlib.read_json(os.path.join(out, "r0.001.json"))["options"]["a"]
         self.assertTrue(o0["decision"]["available"])
@@ -1122,13 +1156,90 @@ class TestRecoveryRuns(unittest.TestCase):
         self.assertEqual(cell["selected_ranks"], {o0["selected"]["rank"]: 1})
         self.assertEqual(sum(cell["selected_start"].values()), 1)
         self.assertEqual(cell["successes"], int(o0["success"]))
-        self.assertEqual(cell["rate"], float(o0["success"]))
+        self.assertEqual(cell["rate"], round(int(o0["success"]) / 2, 3))              # (acceptance: / datasets)
+        self.assertEqual(cell["wilson95"], R.wilson(int(o0["success"]), 2))
+        self.assertEqual(cell["conditional"]["rate"], float(o0["success"]))           # (conditional: / decided)
+        self.assertEqual(cell["conditional"]["wilson95"], R.wilson(int(o0["success"]), 1))
+        self.assertEqual((cell["unavailable"], cell["decided_fraction"]), (1, 0.5))
+        self.assertIn("acceptance", cell["rate_basis"])
+        self.assertIn("NOT the acceptance", cell["conditional"]["basis"])
         self.assertEqual(cell["mean_test_lb"], o0["test_lb"])
         self.assertEqual(cell["mean_test_improvement"], o0["test_improvement"])
-        self.assertEqual(cell["primary"]["datasets"], 1)
-        self.assertEqual(cell["primary"]["unavailable"], 0)
+        pr = cell["primary"]
+        self.assertEqual((pr["datasets"], pr["decided"], pr["unavailable"]), (2, 1, 1))   # (the unavailable one, counted)
+        self.assertEqual(sum(pr["selected_ranks"].values()), 1)
+        self.assertEqual(pr["rate"], round(int(o0["selected_primary"]["success"]) / 2, 3))
+        self.assertEqual(pr["conditional"]["rate"], float(o0["selected_primary"]["success"]))
         self.assertEqual(cell["classes"], {k: {f: float(v[f]) for f in ("rmse_selected", "rmse_rank0", "interaction_sd")}
                                            for k, v in o0["classes"].items()})
+
+    def test_acceptance_rate_counts_unavailable_datasets(self):
+        """r7 P2-1: four successes, one decided failure and fifteen unavailable datasets are a 20% acceptance rate
+        (Wilson interval over 20), and a conditional 80% over the 5 decided ones, labelled as such."""
+        import copy
+        R = self.rec
+        out = os.path.join(self.tmp, "accept")
+        R.prepare_run(self.ns(options="a", lambdas="0.1", iters=3, out=out))
+        f0 = os.path.join(out, "r0.000.json")
+        self.assertEqual(R.one(self.ns(options="a", lambdas="0.1", iters=3, scenario="r0", rep=0, out=f0)), 0)
+        r0 = rqlib.read_json(f0)
+
+        def make(rep, kind):
+            r = copy.deepcopy(r0)
+            r["rep"], r["seed"] = rep, rqlib.derive_seed("ns", "recovery", "r0", rep)
+            o = r["options"]["a"]
+            o["success"] = kind == "success"
+            o["selected_primary"]["success"] = kind == "success"
+            if kind == "unavailable":
+                o["decision"] = {"available": False, "selection_unresolved": True, "integration_unresolved": 1,
+                                 "test_worlds": 6, "reason": "unresolved"}
+                o["selected_primary"]["available"] = False
+            else:
+                o["decision"] = {"available": True, "test_worlds": 6, "reason": None}
+                o["selected_primary"]["available"] = True
+            rqlib.write_durable(os.path.join(out, f"r0.{rep:03d}.json"), rqlib.canonical(r))
+        kinds = ["success"] * 4 + ["failure"] + ["unavailable"] * 15
+        for rep, kind in enumerate(kinds):
+            make(rep, kind)
+        cell = R.summarize(out)["cells"][0]
+        self.assertEqual((cell["datasets"], cell["successes"], cell["decided"], cell["unavailable"]), (20, 4, 5, 15))
+        self.assertEqual(cell["rate"], 0.2)
+        self.assertEqual(cell["wilson95"], R.wilson(4, 20))
+        self.assertEqual(cell["conditional"]["rate"], 0.8)
+        self.assertEqual(cell["conditional"]["wilson95"], R.wilson(4, 5))
+        self.assertEqual(cell["decided_fraction"], 0.25)
+        self.assertEqual(cell["decision_unavailable"], 15)
+        pr = cell["primary"]                                           # (the same on the primary result)
+        self.assertEqual((pr["datasets"], pr["successes"], pr["decided"], pr["unavailable"]), (20, 4, 5, 15))
+        self.assertEqual((pr["rate"], pr["conditional"]["rate"]), (0.2, 0.8))
+        for rep in range(20):                                          # (none decides: the counts stay)
+            make(rep, "unavailable")
+        cell = R.summarize(out)["cells"][0]
+        self.assertEqual((cell["decided"], cell["rate"], cell["conditional"]["rate"]), (0, 0.0, None))
+        self.assertEqual((cell["primary"]["datasets"], cell["primary"]["unavailable"], cell["primary"]["decided"]),
+                         (20, 20, 0))
+
+    def test_summary_primary_independent_of_full_selection(self):
+        """r7 P2-2: a rank-3-only validation flag leaves the full selection unavailable but the primary decided, and
+        the summary keeps the primary result (success count, rank histogram) and counts the full one unavailable."""
+        R = self.rec
+        out = os.path.join(self.tmp, "prim")
+        R.prepare_run(self.ns(options="a", ranks=3, lambdas="0.1", iters=3, out=out))
+        f = os.path.join(out, "r0.000.json")
+        with self.flag_validation(model=lambda m: m["u"].shape[1] >= 3):
+            self.assertEqual(R.one(self.ns(options="a", ranks=3, lambdas="0.1", iters=3, scenario="r0", rep=0,
+                                           out=f)), 0)
+        o = rqlib.read_json(f)["options"]["a"]
+        self.assertFalse(o["decision"]["available"])
+        self.assertTrue(o["selected_primary"]["available"])
+        cell = R.summarize(out)["cells"][0]
+        self.assertEqual((cell["datasets"], cell["decided"], cell["unavailable"], cell["successes"]), (1, 0, 1, 0))
+        self.assertEqual(cell["selected_ranks"], {})
+        pr = cell["primary"]
+        self.assertEqual((pr["datasets"], pr["decided"], pr["unavailable"]), (1, 1, 0))
+        self.assertEqual(pr["selected_ranks"], {o["selected_primary"]["rank"]: 1})
+        self.assertEqual(pr["successes"], int(o["selected_primary"]["success"]))
+        self.assertEqual(pr["conditional"]["rate"], float(o["selected_primary"]["success"]))
 
     def test_result_identity_on_resume_and_summary(self):
         """P2-9: a result copied under another name, one with a wrong seed, or a stray file is refused by the

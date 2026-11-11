@@ -1233,10 +1233,28 @@ def _counts(xs):
 
 
 def _decided(o):
-    """A result that DECIDED (decision.available, absent: yes). An unavailable one (fewer than two test worlds, or a
-    finite but UNRESOLVED count score in its selection or comparison: Codex #66 r5/r6 P2-1) is counted by itself and
-    kept out of every numeric aggregate and rank histogram of summarize()."""
-    return bool((o.get("decision") or {"available": True})["available"])
+    """A result that DECIDED (decision.available, absent: yes). An unavailable one (the procedure undefined on the
+    masked sets, fewer than two test worlds, or a finite but UNRESOLVED count score in its selection or comparison:
+    Codex #66 r5/r6 P2-1) is counted by itself and kept out of every numeric aggregate and rank histogram of
+    summarize(); for ACCEPTANCE it is still an unsuccessful dataset (_rates)."""
+    return o.get("available") is not False and bool((o.get("decision") or {"available": True})["available"])
+
+
+def _ratio(k, n):
+    return round(k / n, 3) if n else None
+
+
+def _rates(k, total, decided):
+    """A success count on its two denominators (Codex #66 r7 P2-1). "rate" / "wilson95" are the ACCEPTANCE rate,
+    successes / datasets: the registered §6.5 criterion evaluates the full selection-and-prediction procedure over
+    every noise realization with no exemption for unavailable results, so an unavailable dataset counts as an
+    unsuccessful one (and keeps its own status in the availability counts). "conditional" is successes / decided,
+    descriptive only: it is NOT the acceptance rate (a conditional criterion would need a frozen amendment)."""
+    return {"rate": _ratio(k, total), "wilson95": wilson(k, total),
+            "rate_basis": "successes / datasets: the acceptance rate (an unavailable dataset is unsuccessful)",
+            "decided": decided, "unavailable": total - decided, "decided_fraction": _ratio(decided, total),
+            "conditional": {"basis": "successes / decided: conditional on availability, descriptive, NOT the "
+                                     "acceptance rate", "rate": _ratio(k, decided), "wilson95": wilson(k, decided)}}
 
 
 def summarize(d):
@@ -1268,19 +1286,22 @@ def summarize(d):
             #  counted by themselves: decision_unavailable, and unresolved_decisions for those whose count integral
             #  left a score unresolved)
             dec = [o for o in lst if _decided(o)]
-            k = sum(o["success"] for o in dec)
+            k = sum(bool(o.get("success")) for o in lst)
             sel = {}
             for o in dec:
                 sel[o["selected"]["rank"]] = sel.get(o["selected"]["rank"], 0) + 1
-            prim_all = [o["selected_primary"] for o in dec if "selected_primary" in o]       # (#66: the {0,1,2} primary)
+            # (Codex #66 r7 P2-2: the primary result has its OWN availability -- it reads only the validation scores of
+            #  its rank <= PRIMARY_RANKS candidates -- so it is aggregated over EVERY dataset, not over the full
+            #  selection's decided ones; its counts stay even when none decides)
+            prim_all = [o["selected_primary"] for o in lst if "selected_primary" in o]       # (#66: the {0,1,2} primary)
             prim = [p for p in prim_all if p.get("available", True)]
-            kp = sum(p["success"] for p in prim)
+            kp = sum(bool(p["success"]) for p in prim_all)
             selp = {}
             for p in prim:
                 selp[p["rank"]] = selp.get(p["rank"], 0) + 1
             gd = [o["gauss_diagnostic"] for o in dec if o.get("gauss_diagnostic")]
-            cell = {"scenario": sc, "option": opt, "datasets": len(lst), "decided": len(dec), "successes": k,
-                    "rate": round(k / len(dec), 3) if dec else None, "wilson95": wilson(k, len(dec)) if dec else None,
+            cell = {"scenario": sc, "option": opt, "datasets": len(lst), "successes": k,
+                    **_rates(k, len(lst), len(dec)),
                     "selected_ranks": dict(sorted(sel.items())),
                     "positive_rank_selected": sum(o["selected"]["rank"] > 0 for o in dec),
                     "decision_unavailable": len(lst) - len(dec),
@@ -1291,13 +1312,12 @@ def summarize(d):
                                                   for o in lst for c in o.get("candidates", ())
                                                   for s in ("validation", "test")
                                                   for k in ("grid_unresolved", "eps_unresolved")),
-                    "primary": ({"ranks": prim[0]["ranks"], "datasets": len(prim), "successes": kp,
-                                 "rate": round(kp / len(prim), 3), "wilson95": wilson(kp, len(prim)),
-                                 "unavailable": len(prim_all) - len(prim),
+                    "primary": ({"ranks": prim_all[0]["ranks"], "datasets": len(prim_all), "successes": kp,
+                                 **_rates(kp, len(prim_all), len(prim)),
                                  "selected_ranks": dict(sorted(selp.items())),
                                  "positive_rank_selected": sum(p["rank"] > 0 for p in prim),
                                  "median_test_lb": _median(p["test_lb"] for p in prim)}
-                                if prim else None),
+                                if prim_all else None),
                     "start": lst[0].get("start"),
                     # (the winning start of the SELECTED candidate: over every decided dataset, a rank-0 selection
                     #  counted under its single warm fit, the reg5 table's convention; and over rank > 0 only)
@@ -1319,11 +1339,10 @@ def summarize(d):
                 for b in ("forward_transfer", "intersection"):
                     av = [o[b] for o in lst if (o.get(b) or {}).get("available")]
                     kb = sum(x["success"] for x in av)
-                    cell["branches"][b] = {"available": len(av), "successes": kb,
+                    cell["branches"][b] = {"datasets": len(lst), "available": len(av), "successes": kb,
                                            "integration_unresolved": sum(
                                                1 for o in lst if (o.get(b) or {}).get("integration_unresolved")),
-                                           "rate": round(kb / len(av), 3) if av else None,
-                                           "wilson95": wilson(kb, len(av)) if av else None,
+                                           **_rates(kb, len(lst), len(av)),
                                            "mean_test_improvement": _mean(x["test_improvement"] for x in av),
                                            "mean_test_lb": _mean(x["test_lb"] for x in av)}
             out["cells"].append(cell)
