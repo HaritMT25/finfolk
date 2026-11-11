@@ -4673,6 +4673,10 @@ static void test_fused_scan_exactness() {
     }
 }
 
+#if !defined(USE_OPENMP) && !defined(EVO_POOL_THREADS)
+// Serial builds only: the base algorithm below reproduces the serial engine's creature order (a creature
+// sees the already-moved state of lower indices); the OpenMP and thread-pool builds step creatures in
+// parallel, are not seed-reproducible by contract, and have no such order to reproduce.
 // ---------------------------------------------------------------------------------------------------
 // The fused scans on their PRODUCTION paths, against the base algorithm (review of #81, P3). A hand-built
 // world takes one real World::update (cfg.captureActivations keeps each creature's sensor vector); the
@@ -5089,6 +5093,7 @@ static void test_fused_scan_production_paths() {
         CHECK(w.signals.data() == s1);                               // a stale slot 0 would have emitted again
     }
 }
+#endif  // serial builds only
 
 int main() {
     std::printf("=== evo_boids core tests (no SFML linked) ===\n");
@@ -5099,7 +5104,9 @@ int main() {
     test_spatial_grid_matches_quadtree();
     test_exact_shortcuts();
     test_fused_scan_exactness();
+#if !defined(USE_OPENMP) && !defined(EVO_POOL_THREADS)
     test_fused_scan_production_paths();
+#endif
     test_genome_and_net();
     test_feedforward_equivalence();
     test_fast_tanh();
