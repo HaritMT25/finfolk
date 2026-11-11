@@ -97,7 +97,9 @@ function recorder(rec, expect) {
   const seenProg = new Set(), versions = new WeakMap(), labels = new WeakMap();
   let frame = null;
   const MAXTEX = 0x0D33, LINK = 0x8B82;
-  const gl = { MAX_TEXTURE_SIZE: MAXTEX, LINK_STATUS: LINK, getParameter: (p) => (p === MAXTEX ? 16384 : 0), getExtension: () => null, getSupportedExtensions: () => [],
+  const TEXUNITS = 0x8872, VTEXUNITS = 0x8B4C;
+  const gl = { MAX_TEXTURE_SIZE: MAXTEX, MAX_TEXTURE_IMAGE_UNITS: TEXUNITS, MAX_VERTEX_TEXTURE_IMAGE_UNITS: VTEXUNITS, LINK_STATUS: LINK,
+               getParameter: (p) => (p === MAXTEX ? 16384 : p === TEXUNITS || p === VTEXUNITS ? 16 : 0), getExtension: () => null, getSupportedExtensions: () => [],
                getContextAttributes: () => ({}), drawingBufferWidth: 1280, drawingBufferHeight: 720, isContextLost: () => !!rec.lost,
                getProgramParameter: (p, k) => (k === LINK ? !!(p && p.linked) : null) };
   function progOf(m) { return H(m.vertexShader) + "/" + H(m.fragmentShader); }
@@ -110,6 +112,16 @@ function recorder(rec, expect) {
     if (ArrayBuffer.isView(v)) return "arr" + v.length + ":" + H(Buffer.from(v.buffer, v.byteOffset, v.byteLength));
     return "obj";
   }
+  /* the GPU's copy of a data texture, as the uploads three performed leave it: the named update ranges (floats), or the whole image */
+  const gpuTex = new WeakMap();
+  function model(t) {
+    const d = t.image && t.image.data;
+    if (!d || !d.length) return;
+    let g = gpuTex.get(t);
+    if (!g || g.length !== d.length) { g = new Float32Array(d.length); gpuTex.set(t, g); }
+    const rr = t.updateRanges || [];
+    if (!rr.length) g.set(d); else for (const r of rr) g.set(d.subarray(r.start, r.start + r.count), r.start);
+  }
   function upload(obj, name, a) {
     if (!a) return;
     const was = versions.get(a);
@@ -121,8 +133,19 @@ function recorder(rec, expect) {
   function renderer() {
     return {
       toneMapping: 0, info: { render: { calls: 0, triangles: 0, points: 0, lines: 0 }, programs: [] }, debug: { checkShaderErrors: true, onShaderError: null },
-      properties: { get: () => ({ currentProgram: { program: { linked: true }, getUniforms() {}, diagnostics: null } }) },
+      /* (rec.failCached: the decoded programs fail to link, as a driver's compile error would: the binder must keep the raw ones) */
+      properties: { get: (m) => ({ currentProgram: { program: { linked: !(rec.failCached && m && typeof m.vertexShader === "string" && m.vertexShader.indexOf("Morph M = mLoad(") >= 0) }, getUniforms() {}, diagnostics: null } }) },
       getContext: () => gl, setClearColor() {}, setPixelRatio(p) { this.pr = p; }, getPixelRatio() { return this.pr || 1; }, setSize() {}, resetState() {},
+      /* three's initTexture: the texture uploaded now if its version moved (the decoded programs sample no raw genes, so the scene uploads
+       * the textures itself); only the optimized session calls it */
+      initTexture(t) {
+        if (versions.get(t) === t.version) return;
+        versions.set(t, t.version);
+        frame.uploads.push(["init", "tex", ser(t), JSON.stringify(t.updateRanges || [])]);
+        model(t);
+        if (t.onUpdate) t.onUpdate(t);
+        if (t.clearUpdateRanges) t.clearUpdateRanges();
+      },
       compile(scene) { scene.children.forEach((o) => o.material && compileMat(o.material, "warm")); return new Set(); },
       compileAsync(scene, cam, target) {
         this.compile(scene, cam, target);
@@ -170,15 +193,18 @@ function recorder(rec, expect) {
                             H(JSON.stringify(un.map((k) => [k, ser(m.uniforms[k].value)])))]);
           if (g.index) upload(label, "index", g.index);
           Object.keys(g.attributes).forEach((k) => upload(label, k, g.attributes[k]));
-          un.forEach((k) => { const v = m.uniforms[k].value; if (v && v.isTexture && versions.get(v) !== v.version) {
+          /* the raw gene texture is an inactive uniform in the decoded programs (never fetched): three would not upload it at the draw */
+          const decodedProg = m.vertexShader.indexOf("Morph M = mLoad(") >= 0;
+          un.forEach((k) => { const v = m.uniforms[k].value; if (v && v.isTexture && !(decodedProg && k === "uGenes") && versions.get(v) !== v.version) {
             versions.set(v, v.version); frame.uploads.push([label, "tex " + k, ser(v), JSON.stringify(v.updateRanges || [])]);
+            model(v);
             if (v.onUpdate) v.onUpdate(v); if (v.clearUpdateRanges) v.clearUpdateRanges(); } });
         }
         this.info.render.calls = calls; this.info.render.triangles = tris;
       }
     };
   }
-  return { renderer, begin(f) { frame = f; }, label(o, l) { labels.set(o, l); } };
+  return { renderer, begin(f) { frame = f; }, label(o, l) { labels.set(o, l); }, gpuOf: (t) => gpuTex.get(t) };
 }
 
 /* ---- one side: the page's scripts in a vm context, the scene, a session ---- */
@@ -193,9 +219,11 @@ async function side(web, tag, opts) {
   let checked = 0, ctx = null;
   const want = {};
   function programsOf(kind, pass, v) {
-    const k = kind + "|" + pass + "|" + v;
+    /* the appearance fish's programs under the render features in effect (the decoded constants), else the raw ones */
+    const rf = kind === "app" && binder && binder.render ? binder.render() : null, cached = !!(rf && rf.ids.length && rf.applies);
+    const k = kind + "|" + pass + "|" + v + "|" + cached;
     if (!want[k]) {
-      const SH = ctx.EvoOceanShaders, EA = ctx.EvoAppearance, app = (P) => SH.appearanceShaders(EA, P);
+      const SH = ctx.EvoOceanShaders, EA = ctx.EvoAppearance, app = (P) => SH.appearanceShaders(EA, P, cached ? rf.ids : []);
       want[k] = kind === "app"
         ? (pass === "body" ? [app(v === 1).vs, app(v === 1).fs] : pass === "shadow" ? [app(v === 1).shadowVs, SH.SHADOW_FS] : [SH.litSkip(app(false).vs), app(false).fs])
         : (pass === "body" ? [SH.FISH_VS[v], SH.FISH_FS[v]] : [SH.SHADOW_VS[v], SH.SHADOW_FS]);
@@ -221,6 +249,11 @@ async function side(web, tag, opts) {
   ctx.document = { addEventListener() {}, removeEventListener() {}, body: {} };   /* (ocean_appearance_slots.js registers on a page: root.document) */
   for (const f of SCRIPTS) {
     let src = fs.readFileSync(path.join(web, f), "utf8");
+    for (const [ef, a, b] of (opts.edits || [])) {   /* planted faults in any page script: each anchor occurs exactly once */
+      if (ef !== f) continue;
+      if (src.split(a).length !== 2) throw new Error("planted fault: its anchor is not once in " + f + ": " + a.slice(0, 60));
+      src = src.replace(a, b);
+    }
     if (f === "ocean_scene.js") {
       const a0 = "var THREE = null;";
       if (src.split(a0).length !== 2) throw new Error("hook: var THREE");
@@ -392,6 +425,103 @@ async function side(web, tag, opts) {
     Object.assign(out, { rep, logs: logs.slice() });
     return out;
   }
+  if (opts.session === "decoded") {
+    /* the decoded constants' cache (policy decoded) through the real scene: its programs compiled before they take effect, the
+     * cache made once at each fish's birth and kept in step through deaths, slot reuse, growth, a new epoch, the policy off and on, a
+     * lost context, a Look that does not declare the contract, and a planted compile failure; after each state, the GPU's copy of
+     * both gene textures (as the uploads three performed leave it) against a fresh decode of every owner's raw row */
+    rec.callBefore = true;
+    const EA = ctx.EvoAppearance, SH = ctx.EvoOceanShaders, w0 = World(300, 0, true, 1), checks2 = [];
+    const decoded = () => scene.renderOptimization().decoded;
+    const eff = () => scene.renderOptimization().effective;
+    let nextId = 100000;
+    const born = (k, seed) => { const W2 = World(k, 0, true, 1); return W2.fish.map((f, i) => Object.assign(f, { id: nextId++ })); };
+    /* the owners' decoded floats (CPU and GPU model) against writeDecoded of their raw rows; the raw texture's GPU copy against its rows */
+    function check(tag, o) {
+      o = o || {};
+      const g = scene.geneTexture(), d = decoded(), slots = scene.geneSlots(), P = [], tmp = new Float32Array(EA.DECODED_FLOATS);
+      const gpuD = d && d.texture ? R.gpuOf(d.texture) : null, gpuR = R.gpuOf(g.texture);
+      let owners = 0;
+      for (const s of slots) {
+        owners++;
+        EA.writeDecoded(g.data.subarray(64 * s, 64 * s + 63), tmp, 0);
+        for (let j = 0; j < EA.DECODED_FLOATS; j++) {
+          if (!Object.is(tmp[j], d.data[EA.DECODED_FLOATS * s + j])) { P.push("cpu slot " + s + " float " + j); break; }
+          if (o.gpu !== false && (!gpuD || !Object.is(tmp[j], gpuD[EA.DECODED_FLOATS * s + j]))) { P.push("gpu slot " + s + " float " + j); break; }
+        }
+        for (let j = 0; j < 63; j++) if (!gpuR || !Object.is(g.data[64 * s + j], gpuR[64 * s + j])) { P.push("raw gpu slot " + s + " gene " + j); break; }
+        if (P.length > 4) break;
+      }
+      const r = { tag, owners, problems: P, eff: Object.assign({}, eff()), stats: { uploads: d.uploads, calls: d.calls, bytes: d.bytes, allocs: d.allocs, fullUploads: d.fullUploads, decodes: d.decodes, capacity: d.capacity } };
+      checks2.push(r);
+      return r;
+    }
+    const go = async (k, w, sel) => { for (let i = 0; i < k; i++) await frame(w, sel); };
+    scene.setAppearance(true);
+    await go(2, w0);
+    const early = { eff: Object.assign({}, eff()), decoded: decoded() };
+    await go(4, w0);
+    check("compiled and in effect, the first fish decoded and uploaded whole");
+    const base = decoded();
+    await go(10, w0);
+    const steady = decoded(); checks2.push({ tag: "steady frames", problems: steady.uploads === base.uploads && steady.decodes === base.decodes ? [] : ["uploads/decodes moved on unchanged frames"] });
+    /* births and deaths: ten fish gone, twenty born (their slots: the lowest free ones first) */
+    w0.fish.splice(5, 10); w0.fish.push(...born(20));
+    await go(1, w0); const afterBirth = check("ten die, twenty are born: only their slots decoded and uploaded");
+    checks2.push({ tag: "births: decoded once each, in ranges (no whole upload)", problems: decoded().decodes === base.decodes + 20 && decoded().fullUploads === base.fullUploads && afterBirth.stats.calls - base.calls <= 3 ? [] : ["decodes " + (decoded().decodes - base.decodes) + ", whole " + (decoded().fullUploads - base.fullUploads) + ", calls " + (afterBirth.stats.calls - base.calls)] });
+    await go(3, w0);
+    check("a few frames later");
+    /* growth past 256 owners: new storage, a whole upload of both */
+    const cap0 = decoded().capacity;
+    w0.fish.push(...born(300));
+    await go(2, w0); const grown = check("growth to " + w0.fish.length + " fish: both textures whole on new storage");
+    checks2.push({ tag: "growth: the decoded storage grew with the slots", problems: grown.stats.capacity > cap0 && grown.stats.allocs >= 2 ? [] : ["capacity " + cap0 + " -> " + grown.stats.capacity + ", allocs " + grown.stats.allocs] });
+    /* a new epoch with the same ids: every owner installed again, decoded again */
+    const dBefore = decoded().decodes;
+    w0.epoch = 2; await go(2, w0); const ep = check("a new world (epoch 2, the same ids)");
+    checks2.push({ tag: "a new epoch decodes every fish again", problems: decoded().decodes - dBefore === w0.fish.length ? [] : ["decoded " + (decoded().decodes - dBefore) + " of " + w0.fish.length] });
+    /* the policy off: the raw programs, births while off, then on again (a stale copy: whole upload) */
+    const off = await scene.setRenderOptimization({ decoded: false });
+    await go(3, w0);
+    const offState = { ok: off.ok, eff: Object.assign({}, eff()) };
+    w0.fish.splice(0, 12); w0.fish.push(...born(15));
+    await go(3, w0);
+    const on = await scene.setRenderOptimization({ decoded: true });
+    await go(3, w0);
+    check("off (births while off), then on again");
+    checks2.push({ tag: "the policy off: the raw programs (effective.decoded false), then back on", problems: off.ok && offState.eff.decoded === false && on.ok && eff().decoded === true ? [] : ["off " + JSON.stringify(offState) + ", on " + JSON.stringify(on)] });
+    /* a lost context and its restore: both textures uploaded whole again */
+    const fullsBefore = decoded().fullUploads;
+    fire("webglcontextlost"); await go(2, w0); fire("webglcontextrestored"); await go(3, w0);
+    check("after a lost and restored context");
+    checks2.push({ tag: "a restored context: the decoded texture uploaded whole again", problems: decoded().fullUploads > fullsBefore ? [] : ["no whole upload after the restore"] });
+    /* a Look that did not declare the contract: raw programs; no Look: decoded again */
+    const lk = await scene.setFeatures({ look: "mock2", features: (q) => q.base });
+    await go(3, w0);
+    const underLook = { ok: lk.ok, eff: Object.assign({}, eff()) };
+    const lk2 = await scene.setFeatures(null);
+    await go(3, w0);
+    checks2.push({ tag: "a Look without appearanceCache keeps the raw programs; none again: decoded", problems: lk.ok && underLook.eff.decoded === false && lk2.ok && eff().decoded === true ? [] : ["under the Look " + JSON.stringify(underLook) + ", after " + JSON.stringify(eff())] });
+    check("after the Look");
+    /* a planted compile failure: the raw programs stay, said once, the failure kept */
+    await scene.setRenderOptimization({ decoded: false });
+    rec.failCached = true; logs.length = 0;
+    const bad = await scene.setRenderOptimization({ decoded: true });
+    await go(3, w0);
+    const failed = { ok: bad.ok, error: bad.error, eff: Object.assign({}, eff()), failures: scene.renderOptimization().failures.slice(), logs: logs.slice() };
+    rec.failCached = false;
+    const retry = await scene.setRenderOptimization({ decoded: true });
+    await go(3, w0);
+    checks2.push({ tag: "a compile that fails: the raw programs stay, the failure is kept and said once; the next try works", problems:
+      !failed.ok && failed.eff.decoded === false && failed.failures.length === 1 && /^decoded: /.test(failed.failures[0]) && failed.logs.length === 1 && /decoded appearance constants could not be used/.test(failed.logs[0]) && retry.ok && eff().decoded === true
+        ? [] : [JSON.stringify(failed), JSON.stringify(retry.ok)] });
+    check("after the retry");
+    /* the decoded programs really drew (a frame's body draw with the decoded vertex stage), and the raw ones before and between */
+    const dvs = H(SH.appearanceShaders(EA, false, [SH.DECODED]).vs), dvsP = H(SH.appearanceShaders(EA, true, [SH.DECODED]).vs), rvs = H(SH.appearanceShaders(EA, false).vs);
+    const drew = (h) => frames.filter((f) => f.draws.some((d) => d[1] === h)).length;
+    Object.assign(out, { checks2, early, drewDecoded: drew(dvs) + drew(dvsP), drewRaw: drew(rvs) });
+    return out;
+  }
   if (opts.session === "contextLoss") {
     /* check 4: the legacy fish close up (lit) with every compile held: the prewarm asks, and is pending; the context is lost
      * (frames go on: the page skips drawing), 6 s pass (main's prewarm marked itself ready at 5 s, compiled or not), the
@@ -560,6 +690,41 @@ console.log("== the optimized body draws (policy lod) through the real scene");
   ok(pin.buckets && pin.medium.join() === "7", "a selected fish is medium wherever it is (pinned), the rest of the whole view coarse", pin.medium);
   ok(by("lit split on: the reference draws").buckets === null && by("lit split off again: buckets").buckets !== null, "the lit split is drawn by the reference pipeline: no buckets while it is on, buckets again once off");
   ok(by("barbels off").buckets && by("barbels off").buckets.barbels === 0 && by("barbels off, quality").barbels === 0, "barbels \"off\": no barbel draw, under buckets or the canonical draws");
+  /* planted faults: each must be seen */
+  const BF = {
+    "every bucket on the medium template's rings": ["ocean_scene.js", "bindRings(S.mesh, function () { return S.rings; });", "bindRings(S.mesh, function () { return ringsOfLod.medium; });"],
+    "the shadow left on the last body draw's rings (no per-mesh rings)": ["ocean_scene.js", "if (renderOn) { bindRings(self.mesh, canonRings); bindRings(self.shadow, canonRings); }", "if (renderOn) { bindRings(self.mesh, canonRings); }"],
+    "a fish dropped from its bucket": ["ocean_scene.js", "for (c = 0; c < n; c++) { if (lodOf[c] === LOD_MEDIUM) M.idx[jm++] = c; else C.idx[jc++] = c; }", "for (c = 0; c < n; c++) { if (lodOf[c] === LOD_MEDIUM) M.idx[jm++] = c; else if (c !== 7) C.idx[jc++] = c; }"],
+    "a bucket's gene slot off by one for a fish": ["ocean_scene.js", "dS[j] = sS[c];", "dS[j] = c === 3 ? j + 1 : sS[c];"]
+  };
+  for (const k of Object.keys(BF)) {
+    let M;
+    try { M = await side(WEB, "bk-fault", { session: "buckets", optimized: true, edits: [BF[k]] }); } catch (e) { M = { error: String(e && e.message || e) }; }
+    ok(!M.error && M.rep.some((r) => r.problems.length > 0), "planted: " + k + ": the session sees it" + (M.error ? " (" + M.error + ")" : ""), M.rep && M.rep.filter((r) => r.problems.length).slice(0, 1).map((r) => [r.tag, r.problems.slice(0, 2)]));
+  }
+}
+console.log("== the decoded constants' cache (policy decoded) through the real scene");
+{
+  const D = await side(WEB, "decoded", { session: "decoded", optimized: true });
+  ok(D.checks2.length >= 14 && D.checks2.every((c) => c.problems.length === 0), "every state: the cache decoded once per birth and kept through deaths, slot reuse, growth, a new epoch, the policy off and on, a restored context and a Look; both textures' GPU copies equal a fresh decode / the raw rows (" + D.checks2.length + " states)",
+     D.checks2.filter((c) => c.problems.length).map((c) => [c.tag, c.problems.slice(0, 3)]));
+  ok(D.checks2[0].eff.decoded === true && D.drewDecoded > 20 && D.drewRaw > 0, "its programs compiled first, then drew (" + D.drewDecoded + " frames of decoded body draws; the raw programs " + D.drewRaw + " frames: before it, while off, under the Look, after the failure)");
+  ok(D.bad.length === 0 && D.binds() > 0, "  every fish mesh drew the programs of its variant, decoded or raw as the binder had them in effect (" + D.binds() + " fish draws)", D.bad.slice(0, 2));
+  ok(D.logs.length === 1 && /decoded appearance constants could not be used/.test(D.logs[0]), "  the console said only the planted failure, once", D.logs.slice(0, 3));
+  /* planted faults: each must be seen by the session's checks */
+  const FAULTS = {
+    "a slot never decoded (its owner's constants stale)": ["ocean_scene.js", "if (dec.live) decodeSlot(s, data, off); }", "if (dec.live && s % 5 !== 3) decodeSlot(s, data, off); }"],
+    "the decoded upload's ranges shifted a slot": ["ocean_scene.js", "dt.addUpdateRange(dr.start / 64 * EA.DECODED_FLOATS, dr.count / 64 * EA.DECODED_FLOATS);", "dt.addUpdateRange(dr.start / 64 * EA.DECODED_FLOATS + 72, dr.count / 64 * EA.DECODED_FLOATS);"],
+    "a decoded upload never queued": ["ocean_scene.js", "dt.needsUpdate = true; dec.queued = true;", "dt.needsUpdate = false; dec.queued = true;"],
+    "a released slot's owner left in the cache after a new epoch": ["ocean_scene.js", "onReset: function () { lodSt.fill(0); barbSt.fill(0); },", "onReset: function () { lodSt.fill(0); barbSt.fill(0); dec.live = false; },"],
+    "the decoded cache not grown with the slots": ["ocean_scene.js", "if (dec.live) growDec(cap); },", "},"]
+  };
+  for (const k of Object.keys(FAULTS)) {
+    let M;
+    try { M = await side(WEB, "dec-fault", { session: "decoded", optimized: true, edits: [FAULTS[k]] }); } catch (e) { M = { error: String(e && e.message || e) }; }
+    ok(!M.error && M.checks2.some((c) => c.problems.length > 0), "planted: " + k + ": the session sees it" + (M.error ? " (" + M.error + ")" : ""),
+       M.checks2 && M.checks2.filter((c) => c.problems.length).slice(0, 1).map((c) => [c.tag, c.problems.slice(0, 2)]));
+  }
 }
 console.log("== a WebGL context loss during the prewarm (#50's review, P2)");
 {

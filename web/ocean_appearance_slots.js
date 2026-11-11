@@ -267,6 +267,8 @@
     S.invalidate = function () { resetOwnership(undefined); S.epoch = {}; };   /* (an epoch no snapshot has: the next one installs all) */
     if (/** @type {number} (undefined: not > 0) */ (opts.initialCapacity) > 0) grow(opts.initialCapacity);
     S.slotOf = function (id) { var s = byId.get(id); return s === undefined ? -1 : s; };
+    /* every owner, in slot order: fn(slot, data, offset, id) (a render cache made after the owners were: the decoded constants' backfill) */
+    S.eachOwner = function (fn) { for (var s = 0; s < S.nextSlot; s++) if (owned[s]) fn(s, S.data, s * SLOT_FLOATS, slotId[s]); };
     S.isDirty = function (s) { return !!dirty[s]; };
     S.stats = function () {
       return { epoch: S.epoch, capacity: S.capacity, owners: S.size, nextSlot: S.nextSlot, free: freeN, dirty: S.dirtyCount,

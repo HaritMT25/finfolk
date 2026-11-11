@@ -452,6 +452,13 @@ section("owner hooks (onGrow / onReset / onRelease / onInstall): a render cache 
     if (o1.join() !== o2.join() || plain.stats().dirty !== hooked.stats().dirty) same = false;
   }
   ok(same, "with hooks the slots and the dirty set are the same as without");
+  /* eachOwner: the backfill of a cache made after the owners were */
+  const eo = make(), so = snap([4, 5, 6, 7, 8]), oo = new Float32Array(16);
+  eo.prepare(1, so.ids, so.rows, so.n, oo);
+  eo.prepare(1, Float64Array.from([4, 6, 8, 9]), snap([4, 6, 8, 9]).rows, 4, oo);
+  const seenO = [];
+  eo.eachOwner((s, d, o, id) => { let same2 = true; const row = rowOf(id, 0); for (let j = 0; j < ST; j++) if (d[o + j] !== row[j]) same2 = false; seenO.push(s + "=" + id + (same2 ? "" : "!")); });
+  ok(seenO.join() === "0=4,1=9,2=6,4=8", "eachOwner visits exactly the owners (slot, id), in slot order, with their rows at data[offset ..]", seenO);
 }
 
 console.log((fails ? "FAILED " + fails + " of " : "all ") + checks + " checks" + (fails ? "" : " passed"));

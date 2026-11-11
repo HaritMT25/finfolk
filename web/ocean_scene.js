@@ -420,7 +420,7 @@
     canvas.addEventListener("webglcontextrestored", function () {
       lost = false; ctxGen++;
       /* three made new GPU storage for the gene texture: one whole upload (the slots keep their owners and data) */
-      if (appKind) { appKind.slots.requireFull(); appKind.pending = null; }
+      if (appKind) { appKind.slots.requireFull(); appKind.pending = null; appKind.restoreDecoded(); }
     });
 
     var scene = new THREE.Scene();
@@ -762,12 +762,13 @@
      * resolves once they compiled and the policy took effect; a refused or failed one leaves the previous policy);
      * renderOptimization() the requested and effective policy and what the last frame drew. Display only. */
     var RENDER_REFERENCE = Object.freeze({ lod: "quality", decoded: false, barbels: "body" });
-    var RENDER_DEFAULT = Object.freeze({ lod: "screen", decoded: false, barbels: "body" });
+    var RENDER_DEFAULT = Object.freeze({ lod: "screen", decoded: true, barbels: "body" });
     var renderOn = opts.renderOptimization !== false;
     var renderWant = Object.assign({}, renderOn ? RENDER_DEFAULT : RENDER_REFERENCE);   /* requested */
-    var renderNow = Object.assign({}, renderWant);                                       /* in effect */
+    /* in effect: the decoded programs only once they compiled (syncDecoded), so the first frames draw the raw programs */
+    var renderNow = Object.assign({}, renderWant, { decoded: false });
     var renderFail = [];                                                                 /* what could not take effect, and why */
-    var RENDER_LODS = ["quality", "screen", "medium", "coarse"], RENDER_DECODED = [false], RENDER_BARBELS = ["body", "off"];   /* what this build implements */
+    var RENDER_LODS = ["quality", "screen", "medium", "coarse"], RENDER_DECODED = [false, true], RENDER_BARBELS = ["body", "off"];   /* what this build implements */
     function renderPolicyOf(p) {
       var q = Object.assign({}, renderWant);
       if (p && typeof p === "object") {
@@ -780,14 +781,48 @@
       if (RENDER_BARBELS.indexOf(q.barbels) < 0) return "barbels must be " + RENDER_BARBELS.join(", ");
       return q;
     }
+    function renderResult(ok, error) {
+      var r = { ok: ok, requested: Object.assign({}, renderWant), effective: Object.assign({}, renderNow) };
+      if (error) r.error = error;
+      return r;
+    }
+    /* the decoded programs in effect (the binder's render feature, under a Look that lets it apply): renderNow.decoded follows the binder */
+    var DEC_ID = SHADERS.DECODED, decWarned = false;
+    function refreshDecoded() {
+      if (!renderOn) return;
+      var r = binder.render();
+      renderNow.decoded = r.ids.indexOf(DEC_ID) >= 0 && r.applies;
+    }
+    function failDecoded(why) {
+      renderFail.push("decoded: " + why);
+      if (!decWarned) { decWarned = true; console.warn("evo_boids: the decoded appearance constants could not be used (" + why + "): the raw programs draw"); }
+      refreshDecoded();
+      return { ok: false, error: why };
+    }
+    /* The binder's render features aligned with the policy's decoded: the cache made live (its storage, every owner decoded once, its
+     * texture), then the decoded programs of every reachable variant assembled and compiled (the binder's atomic activation, as a Look's),
+     * and only then in effect; on any failure (no room for the texture, a compile error) the raw programs stay, and why is kept and said
+     * once. Without the appearance fish (no snapshot yet) it waits: the kind's first frame asks (appearanceDrawn). A Promise of {ok, error} */
+    function syncDecoded() {
+      var want = renderWant.decoded, have = binder.render().ids.indexOf(DEC_ID) >= 0;
+      if (want === have || !appKind) { refreshDecoded(); return Promise.resolve({ ok: true }); }
+      if (want) {
+        var why = appKind.enableDecoded();
+        if (why) return Promise.resolve(failDecoded(why));
+      }
+      return binder.setRender(want ? [DEC_ID] : []).then(function (r) {
+        refreshDecoded();
+        return r.ok ? { ok: true } : failDecoded(r.error || "the programs did not compile");
+      }, function (e) { return failDecoded(String(e && e.message || e)); });
+    }
     function setRenderOptimization(p) {
-      if (!renderOn) return Promise.resolve({ ok: false, error: "the scene was made with renderOptimization: false (the reference pipeline)", requested: Object.assign({}, renderWant), effective: Object.assign({}, renderNow) });
+      if (!renderOn) return Promise.resolve(Object.assign(renderResult(false, "the scene was made with renderOptimization: false (the reference pipeline)")));
       var q = renderPolicyOf(p);
-      if (typeof q === "string") return Promise.resolve({ ok: false, error: q, requested: Object.assign({}, renderWant), effective: Object.assign({}, renderNow) });
+      if (typeof q === "string") return Promise.resolve(renderResult(false, q));
       renderWant = q;
-      renderNow = Object.assign({}, q);
+      renderNow.lod = q.lod; renderNow.barbels = q.barbels;   /* (CPU-side: in effect at once; decoded, once its programs compiled) */
       renderFail.length = 0;
-      return Promise.resolve({ ok: true, requested: Object.assign({}, renderWant), effective: Object.assign({}, renderNow) });
+      return syncDecoded().then(function (r) { return renderResult(r.ok, r.error); });
     }
     /* the policy, and what the last frame drew under it: buckets (null: the canonical draws): the fish in each body bucket, the
      * barbel instances submitted, the body vertices and triangles a frame; batches: each draw's instance count, capacity and
@@ -796,7 +831,8 @@
       var bt = appKind ? appKind.bat : null;
       return { enabled: renderOn, requested: Object.assign({}, renderWant), effective: Object.assign({}, renderNow), failures: renderFail.slice(),
                buckets: bt && bt.on ? { coarse: bt.coarse, medium: bt.medium, barbels: bt.barbels, bodyVerts: bt.bodyVerts, bodyTris: bt.bodyTris } : null,
-               batches: appKind ? appKind.batches() : null };
+               batches: appKind ? appKind.batches() : null, decoded: appKind ? appKind.decodedStats() : null,
+               features: renderOn ? binder.render() : null };
     }
     function AppKind() {
       if (!SLOTS) throw new Error("web/ocean_appearance_slots.js not loaded");
@@ -807,11 +843,29 @@
        * LOD_COARSE / LOD_MEDIUM: the hysteresis) and whether it drew its barbels (barbelVisible's hysteresis);
        * none of it in a reference scene */
       var lodSt = new Uint8Array(256), barbSt = new Uint8Array(256);
+      /* the decoded constants' cache (policy decoded; web/ocean_appearance.js writeDecoded: 18 RGBA32F texels a slot at the fish's own
+       * gene slot, in a texture of its own, uDecoded): kept in step with the slots by the same hooks once it is live (the policy asked
+       * for it once; after that it is kept, so a policy flipped off and on again costs one upload), made at the fish's birth and never
+       * again. live: the CPU cache is kept; data / cap: its storage (floats, slots); tex / texData: the GPU's; needFull: the GPU copy
+       * must be uploaded whole (new storage, a growth, a restored context, a stale copy); fullQueued: this frame's upload is whole;
+       * the rest counts (decodes, uploads, calls, bytes, allocs, whole uploads) for renderOptimization() */
+      var dec = { live: false, data: new Float32Array(0), cap: 0, tex: null, texData: null, needFull: true, fullQueued: false, queued: false, qBytes: 0, qCalls: 0,
+                  decodes: 0, uploads: 0, calls: 0, bytes: 0, allocs: 0, full: 0, enabledAt: 0 };
+      function growDec(cap) {
+        var d = new Float32Array(cap * EA.DECODED_FLOATS);
+        d.set(dec.data); dec.data = d; dec.cap = cap; dec.needFull = true;
+      }
+      function decodeSlot(s, data, off) { EA.writeDecoded(data.subarray(off, off + EA.STRIDE), dec.data, s); dec.decodes++; }
+      /* the cache's storage needs: a texture 576 texels wide, and units for it (the programs sample one more texture) */
+      function decodedSupported() {
+        return !!EA.writeDecoded && maxTex >= EA.DECODED_WIDTH && gl0.getParameter(gl0.MAX_TEXTURE_IMAGE_UNITS) >= 2 && gl0.getParameter(gl0.MAX_VERTEX_TEXTURE_IMAGE_UNITS) >= 2;
+      }
+      if (renderOn && renderWant.decoded && decodedSupported()) dec.live = true;
       var hooks = renderOn ? {
-        onGrow: function (cap) { var a = new Uint8Array(cap), b = new Uint8Array(cap); a.set(lodSt); b.set(barbSt); lodSt = a; barbSt = b; },
+        onGrow: function (cap) { var a = new Uint8Array(cap), b = new Uint8Array(cap); a.set(lodSt); b.set(barbSt); lodSt = a; barbSt = b; if (dec.live) growDec(cap); },
         onReset: function () { lodSt.fill(0); barbSt.fill(0); },
         onRelease: function (s) { lodSt[s] = 0; barbSt[s] = 0; },
-        onInstall: function (s) { lodSt[s] = 0; barbSt[s] = 0; }
+        onInstall: function (s, data, off) { lodSt[s] = 0; barbSt[s] = 0; if (dec.live) decodeSlot(s, data, off); }
       } : {};
       /* at most MAX_TEXTURE_SIZE rows of 32 slots (and 2^24: a slot is exact in a float) */
       var slots = SLOTS.create(Object.assign({ stride: EA.STRIDE, barbelGene: EA.MO + 26, barbelMin: 0.2, initialCapacity: 256,
@@ -853,6 +907,9 @@
                       uFloorY: common.uFloorY, uDepth: common.uDepth, uFog: common.uFog, uFogDensity: common.uFogDensity,
                       uAlpha: shadowMat.uniforms.uAlpha, uPxPerUnit: U.uPxPerUnit,
                       uGenes: U.uGenes, uRingT: U.uRingT, uRingN: U.uRingN, uHalfRing: U.uHalfRing, uWalls: common.uWalls };
+      /* the decoded constants' texture (uDecoded: the render optimization), shared by the body and shadow programs that read it; a
+       * reference scene has no such uniform */
+      if (renderOn) { U.uDecoded = { value: null }; shadowU.uDecoded = U.uDecoded; }
       /* its materials (the binder's): the body's plain and full programs (settle), the shadow's plain and
        * polished (the roll only: the lite polish), sharing their uniforms (the water's clarity's among them,
        * added first: a Look's materials merge them in when they are made), and the split's main draw
@@ -1154,6 +1211,53 @@
         geneIO.allocs++;
         profiler.add(PK.texAllocs, 1);
       }
+      /* the decoded cache's texture over its storage (the gene texture's way: new GPU storage, one whole upload, the first time and
+       * whenever the storage grew; the uniform names the new one before the old is disposed). RGBA32F, nearest, no mipmaps; it needs
+       * neither float-linear filtering nor float render targets (it is only uploaded and fetched) */
+      function ensureDecodedTexture() {
+        if (!dec.live || (dec.tex && dec.texData === dec.data)) return;
+        var old = dec.tex;
+        var tex = new THREE.DataTexture(dec.data, EA.DECODED_WIDTH, genesRows(slots.capacity), 1023, 1015);
+        tex.magFilter = tex.minFilter = 1003;
+        tex.generateMipmaps = false;
+        tex.onUpdate = onDecodedUpload;
+        U.uDecoded.value = tex;
+        dec.tex = tex; dec.texData = dec.data; dec.needFull = true; dec.fullQueued = false; dec.queued = false;
+        if (old) old.dispose();
+        dec.allocs++;
+        profiler.add(PK.texAllocs, 1);
+      }
+      /* three uploaded the decoded texture (a queued upload, or the first draw that sampled it): whole uploads end the stale GPU copy */
+      function onDecodedUpload(t) {
+        if (t && t !== dec.tex) return;   /* (a texture replaced on growth) */
+        dec.uploads++; dec.calls += dec.queued ? dec.qCalls : 1; dec.bytes += dec.queued ? dec.qBytes : dec.data.byteLength;
+        if (dec.fullQueued || !dec.queued) { dec.needFull = false; dec.full++; }
+        dec.fullQueued = false; dec.queued = false;
+      }
+      /* the cache live (the policy asked for it): its storage made, every owner decoded once from its raw row in the slot store; false
+       * and why when this context cannot hold it */
+      self.enableDecoded = function () {
+        if (dec.live) return "";
+        if (!decodedSupported()) return "the decoded constants need a " + EA.DECODED_WIDTH + "-texel texture and two texture units (MAX_TEXTURE_SIZE " + maxTex + ")";
+        dec.live = true; dec.enabledAt = slots.size;
+        growDec(Math.max(slots.capacity, 256));
+        slots.eachOwner(decodeSlot);
+        ensureDecodedTexture();
+        return "";
+      };
+      /* the decoded programs are in use (the binder's feature in effect): both textures uploaded here, before the draws, instead of by
+       * the draws that sample them: the raw gene texture is no longer sampled, so nothing else would consume its upload, and both
+       * uploads then count in the frame's GPU time. The decoded one first: the raw upload's acknowledgement (onGeneUpload) must not
+       * precede it for the same plan */
+      self.flush = function () {
+        if (dec.queued && dec.tex) renderer.initTexture(dec.tex);
+        if (self.pending && self.tex) renderer.initTexture(self.tex);
+      };
+      self.decodedStats = function () {
+        return { live: dec.live, ready: !!dec.tex && !dec.needFull, capacity: dec.cap, decodes: dec.decodes, uploads: dec.uploads, calls: dec.calls, bytes: dec.bytes,
+                 allocs: dec.allocs, fullUploads: dec.full, needFull: dec.needFull, texture: dec.tex, data: dec.data, bytesStored: dec.data.byteLength };
+      };
+      self.restoreDecoded = function () { dec.needFull = true; dec.fullQueued = false; dec.queued = false; };
       self.ensure = function (n, lod) {
         if (n <= self.cap && lod === self.lod) return;
         var cap = Math.max(256, self.cap);
@@ -1187,6 +1291,7 @@
         self.last = r;
         if (!r.ok) { slots.invalidate(); return r; }
         ensureGeneTexture();
+        ensureDecodedTexture();
         return r;
       };
       /* v: the programs due (settle; fillApp packed the swim pose in iBody.w
@@ -1233,6 +1338,28 @@
           for (var i = 0; i < plan.ranges.length; i++) tex.addUpdateRange(plan.ranges[i].start, plan.ranges[i].count);
           tex.needsUpdate = true;
           self.pending = plan;
+        }
+        /* the decoded cache's upload (policy decoded), from the same plan: both textures are laid out in 32-slot rows, so a run of slots is
+         * the same slots in both (64 floats a slot there, 72 here). While the cache is not asked for, a birth makes its GPU copy stale
+         * (a whole upload once it is asked for again) */
+        if (dec.live && dec.tex) {
+          if (renderWant.decoded) {
+            var dfull = dec.needFull || !!(plan && plan.full);
+            if (dfull || plan) {
+              var dt = dec.tex, db = 0;
+              dt.clearUpdateRanges();
+              if (dfull) { dec.qCalls = 1; db = dec.data.byteLength; }
+              else {
+                for (var di = 0; di < plan.ranges.length; di++) {
+                  var dr = plan.ranges[di];
+                  dt.addUpdateRange(dr.start / 64 * EA.DECODED_FLOATS, dr.count / 64 * EA.DECODED_FLOATS);
+                  db += dr.count / 64 * EA.DECODED_FLOATS * 4;
+                }
+                dec.qCalls = plan.ranges.length;
+              }
+              dt.needsUpdate = true; dec.queued = true; dec.fullQueued = dfull; dec.qBytes = db;
+            }
+          } else if (plan) dec.needFull = true;
         }
         profiler.endCpu(SP.geneRanges, tg);
         if (profiler.active) {
@@ -1661,6 +1788,8 @@
       if (!appKind) {
         try { appKind = AppKind(); appStatus = "drawing"; }   /* (its clarity uniforms: AppKind's own, before the binder's) */
         catch (e) { appStatus = "unavailable: " + (e && e.message || e); EA = null; console.warn("evo_boids: appearance renderer", e); return null; }
+        /* the render optimization's decoded programs, now there is a kind to compile them for (the first frames draw the raw ones) */
+        if (renderOn && renderWant.decoded) { try { syncDecoded(); } catch (e) { failDecoded(String(e && e.message || e)); } }
       }
       var r = appKind.reconcile(s, quality >= 3 ? "medium" : "coarse");
       if (!r.ok) {
@@ -2200,6 +2329,7 @@
       var submitT = profiler.beginCpu(), ok = false;
       profiler.beginSubmission();
       try {
+        if (renderNow.decoded && appKind) appKind.flush();   /* (the decoded programs sample no raw genes: both gene textures uploaded here) */
         renderer.render(scene, camera);
         ok = true;
       } finally {
@@ -2505,7 +2635,7 @@
        * once every reachable variant assembled and compiled, else the previous
        * set stays */
       materials: function () { return binder.state(); },
-      setFeatures: function (set) { return binder.activate(set); },
+      setFeatures: function (set) { return binder.activate(set).then(function (r) { refreshDecoded(); return r; }); },
       testFaults: testFaults,
       /* the drawing context: renderer strings, extensions, attributes, drawing buffer */
       contextInfo: contextInfo,

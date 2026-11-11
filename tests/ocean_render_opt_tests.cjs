@@ -78,5 +78,44 @@ section("barbels' gate (barbelVisible)");
   ok(!barbelVisible(0.9, (EN2 + EX2) / 2, false, 3, LOD_MEDIUM) && barbelVisible(0.9, (EN2 + EX2) / 2, true, 3, LOD_MEDIUM), "inside the band: they stay as they were");
 }
 
+section("the decoded constants' packer (EvoAppearance.writeDecoded)");
+{
+  const ctx = vm.createContext({ console, Math, JSON, Float32Array, Float64Array, Int32Array, Uint8Array, Array, Object, Error, Number, String, isFinite, Infinity, NaN });
+  ctx.window = ctx; ctx.globalThis = ctx;
+  vm.runInContext(fs.readFileSync(path.join(WEB, "ocean_appearance.js"), "utf8"), ctx, { filename: "ocean_appearance.js" });
+  const EA = ctx.EvoAppearance, FL = EA.DECODED_FLOATS, ST = EA.STRIDE;
+  let seed = 12345;
+  const rnd = () => { seed = (Math.imul(seed, 1664525) + 1013904223) | 0; return (seed >>> 0) / 4294967296; };
+  const rowOf = (f) => Float32Array.from({ length: ST }, (_, j) => Math.fround(f(j)));
+  const rows = [rowOf(() => 0), rowOf(() => 1), rowOf(() => 0.5), rowOf((j) => (j % 2 ? 1 : 0)), rowOf((j) => (j === 0 || j === 1 ? 0.5 : 0.5)), rowOf((j) => (j === 9 || j === 10 ? 0.5 : rnd()))];
+  for (let i = 0; i < 400; i++) rows.push(rowOf(() => rnd()));
+  ok(FL === 72 && EA.DECODED_TEXELS === 18 && EA.DECODED_WIDTH === 576 && EA.DECODED_ROW_SLOTS === 32 && EA.DECODED_MORPH_FIELDS.length === 32, "the layout constants: 18 texels = 72 floats a slot, 32 slots a row, 576 wide, 32 body-plan fields");
+  const out = new Float32Array(FL * 8);
+  let bad = [], nonFinite = 0;
+  rows.forEach((row, i) => {
+    out.fill(7);
+    const slot = i % 8;
+    EA.writeDecoded(row, out, slot);
+    const M = EA.morphDecode(row, 1), P = EA.patternVaryings(row, 1), o = slot * FL, want = [];
+    EA.DECODED_MORPH_FIELDS.forEach((n) => want.push(M[n]));
+    for (let k = 0; k < 8; k++) want.push(...P["vG" + k]);
+    want.push(P.vAux[0], P.vAux[1], P.vAux[2], 0, P.vMeta[0], P.vMeta[1], 0, 0);
+    for (let j = 0; j < FL; j++) {
+      if (!Object.is(out[o + j], Math.fround(want[j]))) { bad.push("row " + i + " float " + j + ": " + out[o + j] + " vs " + Math.fround(want[j])); break; }
+      if (!isFinite(out[o + j])) nonFinite++;
+    }
+    for (let s = 0; s < 8; s++) if (s !== slot) for (let j = 0; j < FL; j++) if (out[s * FL + j] !== 7) { bad.push("row " + i + " wrote outside its slot (" + s + ")"); s = 8; break; }
+  });
+  ok(bad.length === 0, "every row (" + rows.length + ": all 0, all 1, neutral, striped, random): the 72 floats are the CPU mirrors' (morphDecode, patternVaryings) rounded to float32, in the layout; no other slot touched", bad.slice(0, 3));
+  ok(nonFinite === 0, "every decoded float finite, for neutral and extreme genes alike (zero chroma and orientation included)", nonFinite);
+  /* lambda is not cached: vAux.w and Morph.lam come from the fish's current size, every frame */
+  const a = new Float32Array(FL), b = new Float32Array(FL);
+  EA.writeDecoded(rows[10], a, 0); EA.writeDecoded(rows[10], b, 0);
+  ok(a.every((x, j) => Object.is(x, b[j])) && a[67] === 0 && a[70] === 0 && a[71] === 0, "deterministic; the padding (texel 16 w, texel 17 zw) is zero, lambda is not stored");
+  /* the GLSL readers match the layout (also asserted by the shader-slot tests, against the assembled programs) */
+  ok(EA.GLSL.DECODED_READ.includes("ivec2(18 * (slot % 32) + k, slot / 32)") && /decodedTexel\(s, 7\)/.test(EA.GLSL.DECODED_MORPH) && /decodedTexel\(slot, 17\)/.test(EA.GLSL.DECODED_PATTERN),
+     "the readers' address math is the layout's");
+}
+
 console.log((fails ? "FAILED " + fails + " of " : "all ") + checks + " checks" + (fails ? "" : " passed"));
 process.exit(fails ? 1 : 0);

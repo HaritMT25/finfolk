@@ -631,13 +631,23 @@
     "fish.emissive": S("append", "fs", "after the fog and the flashlight's blend, before the output: light the fish emits (bioluminescence)",
       EMISSIVE_READS.concat([FISH_VARY]), ["murky (light added)"]),
     /* the appearance fish's vertex stages */
+    "app.cache.vs": S("append", "vs", "the vertex stages' common part, right after the appearance law's MORPH and the gene slot (before seg()): the decoded constants' readers",
+      ["the appearance law's COMMON, GENES, MORPH (Morph)", "appearanceSlot()"], ["uniforms and functions: the render optimization's decoded constants (render.decoded: decodedTexel, mLoad)"]),
     "app.world": S("replace", "vs", "the vertex stages' common part, after seg() and spine(), before minWidth(): the world position",
       APP_CORE_READS, ["vec3 appWorld(vec3 geo): the deformed rest point (body radii; x = lambda u) in the world",
         "before and after it, the functions and globals it and main() call"], ["appWorld"]),
+    "app.pattern.vs": S("replace", "vs", "the body's vertex stage, after the world position (and before app.vs.decl): the pattern law's VARY and DECODE",
+      APP_CORE_READS, ["the pattern law's flat varyings (VARY) and patternDecode (DECODE); or, with the decoded constants, the one flat varying that hands the fragment stage the fish's slot and lambda"]),
     "app.vs.decl": S("append", "vs", "the body's vertex stage, after the pattern law's VARY, DECODE and its varyings, before main()",
       APP_CORE_READS.concat(["appWorld(), minWidth()", APP_VARY]), ["uniforms, varyings, functions"]),
     "app.pose": S("append", "vs", "first in main()",
       APP_CORE_READS.concat(["the world slot's globals"]), ["the globals the world position reads (the polish: iPose)"]),
+    "app.fetch.body": S("replace", "vs", "the body's main(), after the pose read: the gene fetch and, in Appearance colour, the pattern decode",
+      APP_CORE_READS, ["GT (the fetched genes) and the pattern varyings; or, with the decoded constants, the varying that names the fish's slot"]),
+    "app.fetch.shadow": S("replace", "vs", "the shadow's main(), after the pose read: the gene fetch",
+      APP_CORE_READS, ["GT (the fetched genes); or nothing, with the decoded constants"]),
+    "app.morph": S("replace", "vs", "main(), the body plan, after the fetch: Morph M (body and shadow)",
+      APP_CORE_READS.concat(["GT (fetched), or the decoded constants"]), ["Morph M (the decoded shape, at the fish's lambda iX.z)"], ["M"]),
     "app.rest": S("append", "vs", "main(), after mBuild, before appWorld(geo)",
       ["M (Morph: the decoded shape)", "geo, mat, mar (the rest point, the material site, its margin)", "aT, aPattern", "GT (the fetched genes)"].concat(APP_CORE_READS),
       ["geo", "the feature's own varyings"]),
@@ -646,8 +656,12 @@
     /* the appearance fish's fragment stage */
     "app.fs.lib": S("append", "fs", "after the scene's light chunks (FOG_FN, DEPTH_FN, CLARITY_FN, BEAM_FN), before the pattern law's COMMON",
       LIGHT_READS.concat(["uColourBy"]), ["functions and constants of the light model"]),
+    "app.pattern.fs": S("replace", "fs", "after the pattern law's COMMON (before SKIN): the pattern law's VARY",
+      LIGHT_READS.concat(["uColourBy"]), ["the pattern law's flat varyings (VARY: vG0 .. vG7, vAux, vMeta); or, with the decoded constants, the same names as globals, loadPattern() and the flat varying vDecoded"]),
     "app.fs.decl": S("append", "fs", "after the pattern law's COMMON, VARY, SKIN and the stage's varyings, before colourBase()",
       LIGHT_READS.concat(["uColourBy", APP_VARY, "the pattern law's functions (patternSkinM, patternBase, pProfileH, pS, pHSV)"]), ["uniforms, varyings, functions"]),
+    "app.pattern.load": S("append", "fs", "main(), the first statement of the skin-from-the-genes branch (uColourBy < 0.5), before patternSkinM",
+      ["uColourBy", APP_VARY, "fin, u, v, zL, base"], ["the pattern globals (with the decoded constants: loadPattern)"]),
     "app.surface": S("append", "fs", "main(), after the skin's colour, before the facet's normal",
       ["fin (0 body, 1-3, 5, 6 fins, 4 eye, 7 barbel)", "u, v, zL, oyL (the material site)", "base", APP_VARY, "colourBase()"],
       ["base (the skin's colour before the light)"]),
@@ -680,11 +694,12 @@
     "fish.shadow.vs": C("vs", "their shadow (shadowVs; SHADOW_VS, with SHADOW_FS)", ["fish.world", "fish.pose"]),
     "fish.attach.vs": C("vs", "a pass a look owns on their instances (parts.fishAttach(decl, body): the common part, the look's " +
       "declarations, main() with the pose read first, then the look's body, which calls fishWorld(); #47's predator faces)", ["fish.world", "fish.pose"]),
-    "app.body.vs": C("vs", "the appearance fish's body and barbels (appearanceShaders: vs)", ["app.world", "app.vs.decl", "app.pose", "app.rest", "app.varyings"]),
+    "app.body.vs": C("vs", "the appearance fish's body and barbels (appearanceShaders: vs)",
+      ["app.cache.vs", "app.world", "app.pattern.vs", "app.vs.decl", "app.pose", "app.fetch.body", "app.morph", "app.rest", "app.varyings"]),
     "app.body.fs": C("fs", "their fragment stage (appearanceShaders: fs)",
-      ["app.fs.lib", "app.fs.decl", "app.surface", "app.lighting", "app.lightTerms", "app.water", "app.lightMods", "app.eyes", "app.highlights",
-       "app.fog", "app.emissive"]),
-    "app.shadow.vs": C("vs", "their shadow (appearanceShaders: shadowVs, with SHADOW_FS)", ["app.world", "app.pose", "app.rest"])
+      ["app.fs.lib", "app.pattern.fs", "app.fs.decl", "app.pattern.load", "app.surface", "app.lighting", "app.lightTerms", "app.water", "app.lightMods", "app.eyes",
+       "app.highlights", "app.fog", "app.emissive"]),
+    "app.shadow.vs": C("vs", "their shadow (appearanceShaders: shadowVs, with SHADOW_FS)", ["app.cache.vs", "app.world", "app.pose", "app.fetch.shadow", "app.morph", "app.rest"])
   };
   Object.keys(PROGRAMS).forEach(function (p) {   /* the contracts agree with the slots (a typo here throws as the module loads) */
     PROGRAMS[p].slots.forEach(function (s) {
@@ -1178,6 +1193,7 @@
       G.GENES,
       GENE_SLOT_GLSL,
       G.MORPH,
+      slot("app.cache.vs", null),   /* (the render optimization's decoded constants' readers; nothing without its feature) */
       "vec2 seg(int i) {",
       "  if (i <= 0) return iA.xy; if (i == 1) return iA.zw; if (i == 2) return iB.xy;",
       "  if (i == 3) return iB.zw; if (i == 4) return iC.xy; return iC.zw;",
@@ -1201,23 +1217,25 @@
   }
   /* the rest point: the genes fetched, the shape decoded and built (mBuild:
    * geo, the material site mat and its margin mar) */
-  var APP_REST = [
-    "  Morph M = mDecode(iX.z);",
-    "  vec3 geo, mat; float mar;",
-    "  mBuild(M, aT, aPattern, uTime, uWag, minWidth(), geo, mat, mar);"
-  ];
+  /** the body plan and the rest point (shared by the body and the shadow): the body plan is a slot (the decoded constants replace it) @returns {ShaderPart[]} */
+  function appRest() {
+    return [
+      slot("app.morph", "  Morph M = mDecode(iX.z);"),
+      "  vec3 geo, mat; float mar;",
+      "  mBuild(M, aT, aPattern, uTime, uWag, minWidth(), geo, mat, mar);"
+    ];
+  }
   /** the body's (and barbels') vertex stage @param {EvoAppearanceApi} EA @returns {ShaderPart[]} */
   function appBodyVsParts(EA) {
     var G = EA.GLSL;
     return appCoreParts(EA).concat([
-      G.VARY, G.DECODE,
+      slot("app.pattern.vs", G.VARY + "\n" + G.DECODE),
       "varying vec3 vWorld; varying vec4 vMatV; flat varying vec4 vPart;",
       slot("app.vs.decl", null),
       "void main() {",
       slot("app.pose", null),
-      "  fetchGenes(appearanceSlot());",
-      "  if (uColourBy < 0.5) " + DECODE_CALL
-    ], APP_REST, [
+      slot("app.fetch.body", "  fetchGenes(appearanceSlot());\n  if (uColourBy < 0.5) " + DECODE_CALL)
+    ], appRest(), [
       slot("app.rest", null),
       "  vec3 w = appWorld(geo);",
       /* vPart: fin, side, highlight, the packed family / brain colour (the FS reads x, z, w) */
@@ -1234,8 +1252,8 @@
       "varying vec3 vWorld; varying float vLift;",
       "void main() {",
       slot("app.pose", null),
-      "  fetchGenes(appearanceSlot());"
-    ], APP_REST, [
+      slot("app.fetch.shadow", "  fetchGenes(appearanceSlot());")
+    ], appRest(), [
       slot("app.rest", null),
       "  vec3 w = appWorld(geo);",
       "  vec3 s = w - uLight * ((w.y - uFloorY) / uLight.y);",
@@ -1268,7 +1286,7 @@
       "uniform vec3 uLight; uniform float uTime; uniform vec3 uSelect; uniform float uColourBy;",
       FOG_FN, DEPTH_FN, CLARITY_FN, BEAM_FN,
       slot("app.fs.lib", null),
-      G.COMMON, G.VARY, G.SKIN,
+      G.COMMON, slot("app.pattern.fs", G.VARY), G.SKIN,
       "varying vec3 vWorld; varying vec4 vMatV; flat varying vec4 vPart;",
       slot("app.fs.decl", null),
       /* the family / brain colour (vPart.w = 0xRRGGBB) through FISH_FS's base
@@ -1295,6 +1313,7 @@
       "  float oyL = (1.0 - 2.0 * v) * pProfileH(u);",
       "  if (uColourBy > 0.5) base = colourBase(fin, oyL, uBack);",
       "  else {",
+      slot("app.pattern.load", null),
       "    base = patternSkinM(u, v, zL, fin == 7 ? 0 : fin, vMatV.w);",
       "    if (fin == 7) base = mix(base, patternBase(u, v), pS(0.0, 1.0, vMatV.z));",
       "  }",
@@ -1447,6 +1466,46 @@
   A0.feature(polishFeature("lite"));
   A0.feature(polishFeature("full"));
 
+  /* ---- the render optimization's decoded constants, a feature ----
+   * The appearance fish's vertex stages fetched a fish's 16 gene texels and ran mDecode (and, in Appearance colour,
+   * patternDecode and its ten flat varyings) in every vertex of every draw, for constants that never change under
+   * its id. With this feature (the scene's `decoded` policy) they are decoded once, at the fish's birth, into a second
+   * texture (uDecoded: web/ocean_appearance.js, the layout and writeDecoded): the vertex stage's Morph comes from it
+   * (mLoad: eight texel reads, no raw gene fetch, no pattern decode, no pattern varyings), the shadow's too, and the
+   * fragment stage loads the pattern's constants itself (loadPattern, the Appearance skin only) from the slot and
+   * lambda the vertex stage hands over in the one flat varying vDecoded. It replaces only what the named slots hold
+   * (app.cache.vs, app.pattern.vs, app.fetch.body, app.fetch.shadow, app.morph, app.pattern.fs, app.pattern.load),
+   * each of which is the program's own text when the feature is off, so a program without it is byte for byte the
+   * plain one; the polish's slots (pose, finPose, world, lighting) are untouched and compose with it. The decoded
+   * values are mDecode's / patternDecode's own (float32 rounding, the CPU mirrors are line-for-line); lambda is not
+   * cached: the fish's size, length and radius change. A look that reads raw genes (GT) or the pattern varyings in a
+   * vertex slot must not run under it: the binder applies it only where nothing does (web/ocean_materials.js). */
+  var DECODED = "render.decoded";
+  /** @returns {ShaderFeatureSpec} */
+  function decodedFeature() {
+    /** @param {ShaderEnv} env @returns {EvoAppearanceApi["GLSL"]} */
+    function GL(env) {
+      if (!env || !env.EA) throw err(DECODED + ": the decoded constants need the appearance law (env.EA)");
+      return env.EA.GLSL;
+    }
+    return {
+      id: DECODED, abi: ABI, version: 1,
+      targets: ["app.body.vs", "app.shadow.vs", "app.body.fs"],
+      append: {
+        "app.cache.vs": function (env) { var g = GL(env); return g.DECODED_READ + "\n" + g.DECODED_MORPH; },
+        "app.pattern.load": "    loadPattern(int(vDecoded.x), vDecoded.y);"
+      },
+      replace: {
+        "app.pattern.vs": "flat varying vec2 vDecoded;",
+        "app.fetch.body": "  vDecoded = vec2(iGeneSlot, iX.z);",
+        "app.fetch.shadow": "",
+        "app.morph": "  Morph M = mLoad(iX.z);",
+        "app.pattern.fs": function (env) { var g = GL(env); return g.DECODED_READ + "\n" + g.DECODED_PATTERN; }
+      }
+    };
+  }
+  A0.feature(decodedFeature());
+
   /* ---- the fish programs, built: a variant P -> the swim polish's feature ---- */
   /** The polish's feature for a variant P (plain: none; lite, full): for a fragment stage ("fs") any
    * polished P is the full one (as before the slots: the lite fish draws fishFs(false), FISH_FS[2]); for
@@ -1574,7 +1633,7 @@
     feature: A0.feature, program: A0.program, core: A0.core, features: A0.features, featureOf: A0.get, assembler: assembler,
     parts: Object.freeze({ fishCore: fishCoreParts, fishVs: fishVsParts, fishFs: fishFsParts, shadowVs: shadowVsParts, fishAttach: fishAttachParts,
                            appCore: appCoreParts, appBodyVs: appBodyVsParts, appBodyFs: appBodyFsParts, appShadowVs: appShadowVsParts }),
-    POLISH: POLISH, polishFeature: polishFeature
+    POLISH: POLISH, polishFeature: polishFeature, DECODED: DECODED, decodedFeature: decodedFeature
   };
   root.EvoOceanShaders = API;
 })(typeof window !== "undefined" ? window : globalThis);

@@ -104,7 +104,8 @@ ok(Object.keys(SH.SLOTS).every((s) => { const x = SH.SLOTS[s]; return x.at && x.
 }
 
 section("the swim polish as a feature");
-ok(SH.features().join() === [F, L].join(), "the module registers the polish's two modes: " + SH.features().join(", "));
+const DEC = SH.DECODED;
+ok(SH.features().join() === [DEC, F, L].join(), "the module registers the polish's two modes and the render optimization's decoded constants: " + SH.features().join(", "));
 for (const name of NAMES) for (const P of [true, "lite"]) {
   if (name === "app.shadow.vs" && P === true) continue;   /* (the builders give a shadow the lite polish) */
   ok(SH.program(name, PARTS[name](), idsOf(P), env) === built(name, P), name + " [" + idsOf(P) + "]: the " + (P === true ? "full" : "lite") + " variant");
@@ -360,6 +361,55 @@ section("the rest of the review's checks (P3)");
   ok(A.program("fish.fs", PT.fishFs(), ["glow.emit"]).includes("    murky = mix(murky, clear, bk);\n  }\n  murky += vec3(0.0, 0.1, 0.2) * vEmber;\n  gl_FragColor = vec4(murky, 1.0);") &&
      A.program("app.body.fs", PT.appBodyFs(EA), ["glow.emit"], env).includes("  }\n  murky += vec3(0.0);\n  gl_FragColor"),
      "the emissive slot: after the fog and the flashlight's blend, before the output");
+}
+
+section("the render optimization's decoded constants (render.decoded)");
+{
+  const f = SH.featureOf(DEC);
+  ok(DEC === "render.decoded" && f && f.version === 1 && f.targets.join() === "app.body.vs,app.shadow.vs,app.body.fs" && f.order === 0,
+     "a registered feature: render.decoded, version 1, the appearance fish's body and shadow vertex stages and body fragment stage", f && f.targets);
+  ok(Object.keys(f.replace).sort().join() === "app.fetch.body,app.fetch.shadow,app.morph,app.pattern.fs,app.pattern.vs" && Object.keys(f.append).sort().join() === "app.cache.vs,app.pattern.load",
+     "it replaces the five slots that hold the raw fetch, the body plan decode and the pattern law's varyings, and appends the readers and the fragment load");
+  /* with it, each program: the raw fetch and decode gone, the readers in, the polish's variants composing with it */
+  const vs = (P) => SH.program("app.body.vs", PT.appBodyVs(EA), idsOf(P).concat([DEC]), env);
+  const sh = (P) => SH.program("app.shadow.vs", PT.appShadowVs(EA), idsOf(P === true ? "lite" : P).concat([DEC]), env);
+  const fs = (P) => SH.program("app.body.fs", PT.appBodyFs(EA), idsOf(P).concat([DEC]), env);
+  const mainOf = (s) => s.slice(s.lastIndexOf("void main() {"));
+  for (const P of [false, "lite", true]) {
+    const a = vs(P), m = mainOf(a), tag = "[" + idsOf(P).concat([DEC]) + "]";
+    ok(m.includes("  vDecoded = vec2(iGeneSlot, iX.z);") && m.includes("  Morph M = mLoad(iX.z);") && !m.includes("fetchGenes(") && !m.includes("patternDecode(") && !m.includes("mDecode("),
+       "app.body.vs " + tag + ": main reads the decoded constants, no raw fetch, no pattern decode, no mDecode");
+    ok(a.includes("Morph mLoad(float lam)") && a.includes("vec4 decodedTexel(int slot, int k)") && a.includes("flat varying vec2 vDecoded;") && !/flat varying vec4 vG0/.test(a) && !a.includes("void patternDecode("),
+       "app.body.vs " + tag + ": the readers and the one flat varying; none of the pattern law's ten flat vec4s, no patternDecode");
+    ok(P !== true || (m.includes("geo = finPose(M, geo);") && a.includes("vec3 finPose(Morph M, vec3 geo)") && m.indexOf("iPose = poseOf(iBody.w);") < m.indexOf("vDecoded =")),
+       "app.body.vs " + tag + ": the polish composes with it (the pose read first, finPose on the loaded M)");
+    const s = sh(P), ms = mainOf(s);
+    ok(ms.includes("  Morph M = mLoad(iX.z);") && !ms.includes("fetchGenes(") && !ms.includes("vDecoded") && s.includes("Morph mLoad(float lam)"),
+       "app.shadow.vs " + tag.replace("[swimPolish.full", "[swimPolish.lite") + ": mLoad, no raw fetch, and no varying");
+    const q = fs(P), mq = mainOf(q);
+    ok(q.includes("flat varying vec2 vDecoded;") && q.includes("void loadPattern(int slot, float lam)") && !/flat varying vec4 vG0/.test(q) && /\nvec4 vG0; vec4 vG1;/.test(q) &&
+       /\n  else \{\n    loadPattern\(int\(vDecoded.x\), vDecoded.y\);\n    base = patternSkinM\(/.test(mq),
+       "app.body.fs " + tag + ": the pattern's constants are globals loaded in the skin-from-genes branch, before patternSkinM (Family / Brain read none)");
+  }
+  /* the layout the three readers share: Morph's fields in the texel order mLoad reads, then the pattern's texels */
+  const G = EA.GLSL, st = /struct Morph \{([\s\S]*?)\};/.exec(G.MORPH)[1].replace(/;/g, ",").split(",").map((x) => x.trim().split(/\s+/).pop()).filter(Boolean);
+  ok(st.length === 33 && st[32] === "lam" && st.slice(0, 32).join() === EA.DECODED_MORPH_FIELDS.join(), "DECODED_MORPH_FIELDS are Morph's 32 fields (all but lambda) in the struct's order", st);
+  const reads = EA.DECODED_MORPH_FIELDS.map((n, j) => "  M." + n + " = d" + (j >> 2) + "." + "xyzw"[j & 3] + ";");
+  ok(reads.every((r) => G.DECODED_MORPH.includes(r)) && G.DECODED_MORPH.includes("  M.lam = lam;") && /decodedTexel\(s, 7\)/.test(G.DECODED_MORPH) && !/decodedTexel\(s, 8\)/.test(G.DECODED_MORPH),
+     "mLoad reads field j from texel j / 4, component j % 4, from texels 0 .. 7 only, and takes lambda from the caller");
+  ok(EA.DECODED_TEXELS === 18 && EA.DECODED_FLOATS === 72 && EA.DECODED_ROW_SLOTS === 32 && EA.DECODED_WIDTH === 576 && G.DECODED_READ.includes("18 * (slot % 32) + k, slot / 32"),
+     "the texture's layout: 18 texels, 72 floats a slot, 32 slots a row, 576 wide; the reader's address matches");
+  ok([8, 9, 10, 11, 12, 13, 14, 15, 16, 17].every((k) => G.DECODED_PATTERN.includes("decodedTexel(slot, " + k + ")")) && G.DECODED_PATTERN.includes("vAux = vec4(aux.xyz, lam);"),
+     "loadPattern reads texels 8 .. 17 (vG0 .. vG7, vAux.xyz, vMeta) and sets vAux.w to the caller's lambda");
+  /* without the law, the feature is refused (a text function that throws names itself) */
+  throws(() => SH.program("app.body.vs", PT.appBodyVs(EA), [DEC], {}), ["render.decoded", "env.EA"], "the feature without the appearance law (env.EA): refused, naming itself");
+  /* a feature that reads raw genes or the pattern varyings in a vertex slot does not compose: the declaration check names the collision or the missing name */
+  const A = SH.assembler();
+  A.feature(SH.polishFeature("lite")); A.feature(SH.polishFeature("full")); A.feature(SH.decodedFeature());
+  ok(A.program("app.body.vs", PT.appBodyVs(EA), [F, DEC], env) === vs(true), "a fresh assembler gives the same program (registration order changes nothing)");
+  A.feature({ id: "mock.rawgenes", abi: SH.ABI, targets: ["app.body.vs"], append: { "app.rest": "  float rawGene = GT[0].x;" } });
+  ok(A.program("app.body.vs", PT.appBodyVs(EA), ["mock.rawgenes"], env).includes("GT[0].x") && A.program("app.body.vs", PT.appBodyVs(EA), ["mock.rawgenes", DEC], env).includes("GT[0].x"),
+     "a look reading raw genes still assembles (GT stays declared): the binder, not the assembler, keeps the cache from running under it");
 }
 
 section("declarations(), the checks' scan");

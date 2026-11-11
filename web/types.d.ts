@@ -382,6 +382,8 @@ interface SlotStore {
   resetOwnership(epoch: unknown): void;
   invalidate(): void;
   slotOf(id: number): number;
+  /** every owner in slot order: fn(slot, data, offset, id) */
+  eachOwner(fn: (slot: number, data: Float32Array, offset: number, id: number) => void): void;
   isDirty(s: number): boolean;
   stats(): SlotStats;
 }
@@ -620,7 +622,16 @@ interface EvoAppearanceApi {
   NM: number;
   STRIDE: number;
   PHI_I: number;
-  GLSL: { COMMON: string; VARY: string; DECODE: string; SKIN: string; GENES: string; MORPH: string };
+  GLSL: { COMMON: string; VARY: string; DECODE: string; SKIN: string; GENES: string; MORPH: string;
+          DECODED_READ: string; DECODED_MORPH: string; DECODED_PATTERN: string };
+  /** a fish's decoded constants (the render optimization's cache): the body-plan fields in their texel order, 18 texels /
+   * 72 floats a slot, 32 slots a texture row (576 texels wide); writeDecoded(row, out, slot) decodes a row into out[72 * slot ..] */
+  DECODED_MORPH_FIELDS: string[];
+  DECODED_TEXELS: number;
+  DECODED_FLOATS: number;
+  DECODED_ROW_SLOTS: number;
+  DECODED_WIDTH: number;
+  writeDecoded(row: ArrayLike<number>, out: Float32Array, slot: number): void;
   LODS: Record<string, AppearanceLod>;
   buildTemplate(lodName: string): any;
   buildBarbels(lodName: string): any;
@@ -726,6 +737,9 @@ interface EvoOceanShadersApi {
   /** the swim polish's two features (plain is neither), and its spec in a mode (to register elsewhere) */
   POLISH: { readonly lite: string; readonly full: string };
   polishFeature(mode: "lite" | "full"): ShaderFeatureSpec;
+  /** the render optimization's decoded constants (feature id "render.decoded"; decodedFeature() its spec, for a fresh assembler) */
+  DECODED: string;
+  decodedFeature(): ShaderFeatureSpec;
 }
 
 /** A named slot in a fish program's parts (EvoOceanShaders.slot). */
@@ -844,10 +858,13 @@ interface MaterialSetSpec {
   attach?: { face?: MaterialAttach };
   uniforms?: { [kind: string]: { [name: string]: { value: any } } };
   claims?: { [kind: string]: { [component: string]: string } };
+  /** 1: the Look reads no raw gene or pattern varying in a vertex slot, so the scene's render features (the decoded cache) may run under it */
+  appearanceCache?: number;
 }
 /** A feature set, normalized (frozen), with its layouts by kind. */
 interface MaterialSet {
   readonly look: string;
+  readonly appearanceCache: boolean;
   readonly features: ((q: MaterialFeatureQuery) => string[]) | null;
   readonly attach: { face: MaterialAttach } | null;
   readonly uniforms: { [kind: string]: { [name: string]: { value: any } } } | null;
@@ -897,8 +914,12 @@ interface MaterialBinderDeps {
 }
 interface MaterialBinderState {
   look: string; version: number; pending: boolean; kinds: string[]; covered: string[]; materials: number;
+  /** the scene's render features in effect (setRender) */
+  render: string[];
   entries: { key: string; state: string; error: string }[]; failed: string[];
 }
+/** setRender's outcome: the activation's, and the render features in effect after it */
+interface MaterialRenderResult extends MaterialActivation { ids?: string[] }
 /** The scene's material binder (EvoOceanMaterials.create): web/ocean_materials.js says what each does. */
 interface MaterialBinder {
   define(kind: string, def: MaterialKindDef): void;
@@ -913,6 +934,10 @@ interface MaterialBinder {
   key(kind: string, pass: string, variant: number): string;
   programs(kind: string, pass: string, variant: number): { key: string; own: boolean; vs: string; fs: string; material: any };
   activate(spec: MaterialSetSpec | null): Promise<MaterialActivation>;
+  /** the scene's render features (feature ids, e.g. "render.decoded") for the appearance fish, compiled before they take effect */
+  setRender(ids: string[]): Promise<MaterialRenderResult>;
+  /** the render features in effect, whether they apply under the active Look, and whether a change is compiling */
+  render(): { ids: string[]; applies: boolean; pending: boolean };
   state(): MaterialBinderState;
 }
 interface EvoOceanMaterialsApi {
