@@ -334,12 +334,10 @@ public:
         foodGrid_.build();
         if (prof_) prof.buildNs += std::chrono::duration<double, std::nano>(clk::now() - tBuild0).count();
 
-        // Per-creature pending actions (for thread safety)
-        struct PendingActions {
-            bool wantsSignal = false;
-            Vec2 signalPos;
-        };
-        std::vector<PendingActions> pending(numCreatures);
+        // Per-creature pending actions (for thread safety). A member, reset
+        // here, so the steady state allocates nothing for it.
+        std::vector<PendingActions>& pending = pending_;
+        pending.assign((size_t)numCreatures, PendingActions{});
 
         // Thread-summed CPU time for the three sub-steps inside the parallel loop
         // (reduction => safe across OpenMP threads; plain accumulation when serial).
@@ -551,14 +549,25 @@ public:
                 continue;
             }
 
-            // Eat nearby food (modifies food[].alive)
-            nearbyFood.clear();
-            if (cfg.toroidal) foodGrid_.queryRadiusWrapped(c.pos, cfg.pickupRadius, nearbyFood);
-            else              foodGrid_.queryRadius(c.pos, cfg.pickupRadius, nearbyFood);
-            for (int fi : nearbyFood) {
-                if (food[fi].alive) {
-                    food[fi].alive = false;
-                    c.foodReserves += cfg.foodEnergy;
+            // Eat nearby food (modifies food[].alive). Bounded world: the
+            // grid's hits in place (forEachCandidate), in the order queryRadius
+            // listed them, so the same items are eaten and the same additions
+            // made in the same order; the index list is not written.
+            if (!cfg.toroidal) {
+                foodGrid_.forEachCandidate(c.pos, cfg.pickupRadius, [&](int fi, float, float, float, bool hit) {
+                    if (hit && food[fi].alive) {
+                        food[fi].alive = false;
+                        c.foodReserves += cfg.foodEnergy;
+                    }
+                });
+            } else {
+                nearbyFood.clear();
+                foodGrid_.queryRadiusWrapped(c.pos, cfg.pickupRadius, nearbyFood);
+                for (int fi : nearbyFood) {
+                    if (food[fi].alive) {
+                        food[fi].alive = false;
+                        c.foodReserves += cfg.foodEnergy;
+                    }
                 }
             }
 
@@ -640,6 +649,11 @@ private:
     SpatialGrid creatureGrid_;
     SpatialGrid foodGrid_;
     std::vector<CreatureHot> hot_;  // pos/vel per creature index (see CreatureHot)
+    struct PendingActions {
+        bool wantsSignal = false;
+        Vec2 signalPos;
+    };
+    std::vector<PendingActions> pending_;   // update()'s per-creature deferred actions, reused
     CurrentField current_;          // ocean flow (off unless cfg.currentStrength>0)
     std::vector<Vec2> foodPatches_; // patch centres (empty => uniform food spawn)
 #ifdef EVO_POOL_THREADS
@@ -1497,15 +1511,31 @@ private:
         // asymmetry, handled on the predator side). Bearing is relative to heading;
         // proximity ramps 0 (at the perception edge / none) -> 1 (on contact).
         {
+            // The strict `d2 < bestD2` in vector order keeps the FIRST predator
+            // at the minimum d² below R²; written as selects (no data-dependent
+            // branch per predator), with the winner's offset recomputed from
+            // its position afterwards: the same subtractions, so the same bits.
             float bestD2 = cfg.perceptionRadius * cfg.perceptionRadius;
-            Vec2  off    = {0.0f, 0.0f};
-            bool  seen   = false;
-            for (const Predator& p : predators) {
+            int   bestPi = -1;
+            const int np = (int)predators.size();
+            for (int pi = 0; pi < np; ++pi) {
+                const Predator& p = predators[(size_t)pi];
                 float dx = p.pos.x - c.pos.x;
                 float dy = p.pos.y - c.pos.y;
                 if (cfg.toroidal) { dx = wrapDx(dx); dy = wrapDy(dy); }
                 const float d2 = dx * dx + dy * dy;
-                if (d2 < bestD2) { bestD2 = d2; off = {dx, dy}; seen = true; }
+                const bool better = d2 < bestD2;
+                bestD2 = better ? d2 : bestD2;
+                bestPi = better ? pi : bestPi;
+            }
+            const bool seen = bestPi >= 0;
+            Vec2 off = {0.0f, 0.0f};
+            if (seen) {
+                const Predator& p = predators[(size_t)bestPi];
+                float dx = p.pos.x - c.pos.x;
+                float dy = p.pos.y - c.pos.y;
+                if (cfg.toroidal) { dx = wrapDx(dx); dy = wrapDy(dy); }
+                off = {dx, dy};
             }
             if (seen) {
                 const float d    = std::sqrt(bestD2);
