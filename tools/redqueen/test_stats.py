@@ -646,7 +646,8 @@ class TestEligibility(unittest.TestCase):
         """Codex #68 D6 r3 P2-2: H-C's block deltas and count weights are STAMPED at production with the record's H-C
         binding (its identity, the graph / mask / snapshot provenance of its eligible worlds) and decide refuses, before
         either hc_test, contrasts of another record: one produced from graph / mask A never enters B's decision, even
-        with identical world and block ids and identical values. The matching case is unchanged."""
+        with identical world and block ids and identical values. The matching case is unchanged. Restoring a cache
+        (Codex r4) retains and validates the producer's stamp (check_restoration), through a real JSON round trip."""
         recA, DA, WA, decA = self.run_(dead=["A30"])
         recB, DB, WB, _ = self.run_(dead=["B31"])
         self.assertEqual(decA["pvalues"]["H-C"], stats.decide(recA, {}, DA, WA)["pvalues"]["H-C"])   # (matching: passes)
@@ -660,21 +661,20 @@ class TestEligibility(unittest.TestCase):
         for d, w in ((dict(DB), dict(WB)), (json.loads(json.dumps(DB)), WB), (DB, {}), ({}, {})):
             with self.assertRaisesRegex(stats.StatsError, msg):
                 stats.decide(recB, {}, d, w)
-        altered = stats.stamp_contrasts(recB, DB)
+        altered = stats.HCContrasts(DB)                                  # (edited after production, its stamp kept)
+        altered.binding, altered.digest = DB.binding, DB.digest
         altered[next(iter(altered))] = (9.0, 9.0)
         with self.assertRaisesRegex(stats.StatsError, "changed after they were produced"):
             stats.decide(recB, {}, altered, WB)
-        fewer = stats.stamp_contrasts(recB, {b: v for b, v in list(DB.items())[1:]})
+        fewer = stats._stamp_contrasts(recB, {b: v for b, v in list(DB.items())[1:]})
         with self.assertRaisesRegex(stats.StatsError, "usable blocks"):
             stats.decide(recB, {}, fewer, WB)
-        # (restamping a cache needs the record's population and provenance, like any analysis: require_population)
-        eligible = recB["hypotheses"]["H-C"]["worlds"]
-        d2, w2 = stats.bind_hc_contrasts(recB, dict(DB), dict(WB), eligible)
-        self.assertEqual(stats.decide(recB, {}, d2, w2)["pvalues"], stats.decide(recB, {}, DB, WB)["pvalues"])
-        with self.assertRaisesRegex(stats.StatsError, "registered population"):
-            stats.bind_hc_contrasts(recB, dict(DB), dict(WB), eligible[1:])
-        with self.assertRaisesRegex(stats.StatsError, "provenance"):
-            stats.bind_hc_contrasts(recB, dict(DB), dict(WB), eligible, {"graph_edges_sha256": "g" * 64})
+        relabel = stats.HCContrasts(DA)                                  # (A's content under B's binding, A's digest)
+        relabel.binding, relabel.digest = DB.binding, DA.digest
+        with self.assertRaisesRegex(stats.StatsError, "changed after they were produced"):
+            stats.decide(recB, {}, relabel, WB)
+        self.assertFalse(hasattr(stats, "stamp_contrasts") or hasattr(stats, "bind_hc_contrasts"))   # (no re-stamping)
+        self.check_restoration(recB, DB, WB, DA, WA, msg)
         # (an unavailable H-C uses no contrasts: nothing to validate)
         dead = [w["id"] for w in self.reg["worlds"] if w["treatment"] != "C" and w["block"] > 1]
         rec1, _, _, dec1 = self.run_(dead=dead)
@@ -702,9 +702,51 @@ class TestEligibility(unittest.TestCase):
             self.assertIsNotNone(stats.decide(rB, {}, dB, wB)["pvalues"]["H-C"])
             with self.assertRaisesRegex(stats.StatsError, msg):
                 stats.decide(rB, {}, dA, wA)
-            with self.assertRaisesRegex(stats.StatsError, "provenance"):          # (a re-stamp claiming A's provenance)
-                stats.bind_hc_contrasts(rB, dict(dA), dict(wA), rB["hypotheses"]["H-C"]["worlds"],
-                                        rA["hypotheses"]["H-C"]["binding"])
+            self.check_restoration(rB, dB, wB, dA, wA, msg)         # (A's stamped contrasts never restore as B's)
+
+    def check_restoration(self, rec, D, W, otherD, otherW, msg):
+        """Codex #68 D6 r4 P2-2: restore_hc_contrasts RETAINS the producer's stamp (binding and digest, serialized by
+        to_json) and validates it against the record; it never issues a stamp from the record's own metadata. `D, W`
+        are the record's own stamped contrasts, `otherD, otherW` another record's."""
+        def wire(x):                                      # (a real JSON round trip: the block keys become strings)
+            return json.loads(json.dumps(x.to_json()))
+        first = next(iter(wire(D)["blocks"]))
+        self.assertIsInstance(first, str)
+        # (a legitimate restore of the record's own stamped contrasts: JSON round trip, in memory, and a record
+        # loaded from its file; the block keys are ints again, the stamps are the producer's)
+        for rec_, d, w in ((rec, wire(D), wire(W)), (rec, D, W), (json.loads(json.dumps(rec)), wire(D), wire(W))):
+            d2, w2 = stats.restore_hc_contrasts(rec_, d, w)
+            self.assertEqual((dict(d2), dict(w2)), (dict(D), dict(W)))
+            self.assertEqual((d2.binding, d2.digest, w2.binding, w2.digest), (D.binding, D.digest, W.binding, W.digest))
+            self.assertEqual(stats.decide(rec, {}, d2, w2)["pvalues"], stats.decide(rec, {}, D, W)["pvalues"])
+        self.assertTrue(all(isinstance(b, int) for b in d2))
+        # (the exact counterexample: the other record's stamped contrasts, restored for this record, in memory or
+        # serialized, are refused, whatever the record's own metadata says)
+        for d, w in ((otherD, otherW), (wire(otherD), wire(otherW)), (otherD, W), (wire(D), wire(otherW))):
+            with self.assertRaisesRegex(stats.StatsError, msg):
+                stats.restore_hc_contrasts(rec, d, w)
+        # (edited, relabelled or stripped stamps are refused: no fresh digest or binding is issued)
+        edited = wire(D)
+        edited["blocks"][first][0] += 1.0
+        relabelled = wire(otherD)
+        relabelled["binding"] = D.binding
+        stripped = wire(D)
+        stripped["digest"] = None
+        for doc in (edited, relabelled, stripped):
+            with self.assertRaisesRegex(stats.StatsError, "changed after they were produced"):
+                stats.restore_hc_contrasts(rec, doc, wire(W))
+        unbound = wire(D)
+        unbound["binding"] = None
+        with self.assertRaisesRegex(stats.StatsError, msg):
+            stats.restore_hc_contrasts(rec, unbound, wire(W))
+        # (bare dicts, json.dumps of one, another schema, bad or repeated block keys, non-finite values)
+        bad_blocks = [{"01": [1.0, 2.0]}, {"x": [1.0, 2.0]}, {1: [1.0, 2.0], "1": [1.0, 2.0]}, {first: [float("nan"), 0.0]},
+                      {first: [True, 0.0]}, {first: [1.0]}]
+        for bad, why in ([(dict(D), "stamped contrasts document"), (json.loads(json.dumps(D)), "stamped contrasts document"),
+                          (None, "stamped contrasts document"), (dict(wire(D), schema="x"), "stamped contrasts document")]
+                         + [(dict(wire(D), blocks=b), "not a block id") for b in bad_blocks]):
+            with self.assertRaisesRegex(stats.StatsError, why):
+                stats.restore_hc_contrasts(rec, bad, wire(W))
 
 
 if __name__ == "__main__":
