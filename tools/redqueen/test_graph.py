@@ -736,9 +736,9 @@ class TestRecovery(unittest.TestCase):
             gdir = os.path.join(tmp, "g")
             graph.write(full(), gdir)
             out = os.path.join(tmp, "o")
-            os.makedirs(out)
             base = dict(graph=os.path.join(gdir, "graph.jsonl.gz"), namespace="ns", fitter="minimal", ranks=1,
-                        lambdas="0.1", iters=4, ab_cap=-1, set="main", jobs=1, start="registered")
+                        lambdas="0.1", iters=4, ab_cap=-1, set="main", jobs=1)
+            self.rec.prepare_run(ap_.Namespace(**base, options="fwd", out=out))     # (the run's config.json)
             nl = next(k for k, s in self.rec.SCENARIOS.items() if s.get("noiseless"))
             for sc, rep in ((nl, 0), ("r1_017", 0), ("r1_017", 1)):
                 a = ap_.Namespace(**base, options="fwd", scenario=sc, rep=rep,
@@ -786,6 +786,22 @@ class TestRecovery(unittest.TestCase):
         again = self.rec.simulate(self.D, self.rec.SCENARIOS["r1_034"], 11)
         self.assertTrue(np.array_equal(again["z"], data["z"]) and np.array_equal(again["s0"], data["s0"]))
 
+    def test_capture_noise(self):
+        """The measured 5k noise model: the per-replicate logit SD (binomial included) follows the capture
+        level: about 0.6 below C/B 0.25, 0.15 above 0.45; x1.5 in _cap15; the flat scenarios unchanged."""
+        for name, k in (("r0_cap", 1.0), ("r0_cap15", 1.5)):
+            data = self.rec.simulate(self.D, self.rec.SCENARIOS[name], 31)
+            p = 1.0 / (1.0 + np.exp(-data["eta"]))
+            sd2 = data["z"].var(axis=1, ddof=1)
+            lo, hi = (p > 0.18) & (p < 0.25), p > 0.47
+            self.assertGreater(lo.sum(), 500)
+            self.assertGreater(hi.sum(), 500)
+            self.assertAlmostEqual(float(np.sqrt(sd2[lo].mean())), 0.6 * k, delta=0.1 * k)
+            self.assertAlmostEqual(float(np.sqrt(sd2[hi].mean())), 0.15 * k, delta=0.05 * k)
+        a = self.rec.simulate(self.D, self.rec.SCENARIOS["r0"], 31)
+        self.assertEqual(self.rec.SCENARIOS["r0"].get("noise_model", "flat"), "flat")
+        self.assertTrue(np.array_equal(a["z"], self.rec.simulate(self.D, dict(rank=0, noise_model="flat"), 31)["z"]))
+
     def test_noiseless_identification(self):
         data = self.rec.simulate(self.D, self.rec.SCENARIOS["num_r2"], 12)
         out = self.rec.numerical(self.D, data, "a", 2, 60, 12)
@@ -803,6 +819,141 @@ class TestRecovery(unittest.TestCase):
         out0 = self.rec.procedure(self.D, data0, "base", 1, [0.5], 15, 14)
         self.assertIn(out0["selected"]["rank"], (0, 1))
         self.assertIsInstance(out0["success"], bool)
+
+    def flag_scores(self, where, model=None):
+        """recovery.scorer wrapped so that a score of a set for which where(ix) holds (and, with model, of a model
+        for which model(m) holds) ALSO reports one finite UNRESOLVED pair (map.pred_count_lpd's grid_unresolved)
+        in its integration diagnostics."""
+        import unittest.mock as mock
+        real = self.rec.scorer
+
+        def scorer(D, data, m, idx, fitter):
+            sc = real(D, data, m, idx, fitter)
+
+            def score(ix, info=None):
+                out = sc(ix, info)
+                if info is not None and where(ix) and (model is None or model(m)):
+                    info["grid_unresolved"] = info.get("grid_unresolved", 0) + 1
+                return out
+            return score
+        return mock.patch.object(self.rec, "scorer", scorer)
+
+    def test_unresolved_scores_never_decide_procedure(self):
+        """r5 P2-1: a finite but unresolved score (grid_unresolved) in a selection (validation), a test or a
+        snapshot comparison is reported, and the comparison is not decided on it: unavailable with its reason,
+        no improvement or bound, success False; both models' diagnostics are kept beside the comparison."""
+        D, R = self.D, self.rec
+        data = R.simulate(D, dict(rank=1, energy=0.10), 13)
+        run = lambda: R.procedure(D, data, "a", 1, [0.1], 8, 13)        # noqa: E731
+        base = run()
+        self.assertTrue(base["decision"]["available"] and base["success"] and base["selected"]["rank"] == 1)
+        self.assertEqual(base["integration_comparison"]["unresolved"], {"validation": 0, "test": 0, "snapshot": 0})
+        self.assertEqual(set(base["integration_comparison"]), {"selected", "rank0", "snapshot", "unresolved"})
+        self.assertIsNotNone(base["snapshot_test_improvement"])
+        with self.flag_scores(lambda ix: ix is D.test_idx):
+            out = run()
+        self.assertFalse(out["decision"]["available"])
+        self.assertRegex(out["decision"]["reason"], "UNRESOLVED")
+        self.assertFalse(out["success"])
+        self.assertIsNone(out["test_improvement"])
+        self.assertIsNone(out["test_lb"])
+        self.assertFalse(out["selected_primary"]["success"])
+        self.assertEqual(out["integration_comparison"]["unresolved"]["test"], 2)       # (selected and rank 0)
+        self.assertEqual(out["integration_comparison"]["selected"]["grid_unresolved"], 1)
+        self.assertEqual(out["integration_comparison"]["rank0"]["grid_unresolved"], 1)
+        self.assertEqual(out["selected"], base["selected"])
+        for c in out["candidates"]:
+            self.assertIsNone(c["test_lb"])
+        with self.flag_scores(lambda ix: ix is D.stest_idx):                            # (the snapshot only)
+            out = run()
+        self.assertTrue(out["decision"]["available"] and out["success"])
+        self.assertIsNone(out["snapshot_test_improvement"])
+        self.assertEqual(out["integration_comparison"]["unresolved"]["snapshot"], 2)
+        self.assertEqual(out["integration_comparison"]["snapshot"]["selected"]["grid_unresolved"], 1)
+        self.assertIsNotNone(out["snapshot_test_improvement_gauss"])
+        self.assertTrue(base["selected_primary"]["available"] and base["selected_primary"]["test_lb"] > 0)
+        self.assertIsNotNone(base["alignment_u1_b"])
+        self.assertIsNotNone(base["classes"])
+        with self.flag_scores(lambda ix: ix is D.val_idx):                              # (the selection)
+            out = run()
+        self.assertFalse(out["decision"]["available"])
+        self.assertFalse(out["success"])
+        self.assertGreater(out["integration_comparison"]["unresolved"]["validation"], 0)
+        self.assertIn("in validation", out["decision"]["reason"])
+        # r6 P2-1: an unresolved VALIDATION selection leaves every selection-dependent reported metric withheld, not
+        # only the decision (the score arrays are untouched, so these were positive / present before the fix)
+        self.assertTrue(out["decision"]["selection_unresolved"] and out["selected"]["selection_unresolved"])
+        self.assertGreater(out["decision"]["integration_unresolved"], 0)
+        for k in ("test_improvement", "test_lb", "snapshot_test_improvement", "snapshot_test_improvement_gauss",
+                  "alignment_u1_b", "classes"):
+            self.assertIsNone(out[k], k)
+        self.assertEqual(out["per_test_world"], [])
+        sp = out["selected_primary"]
+        self.assertFalse(sp["available"] or sp["success"])
+        self.assertTrue(sp["selection_unresolved"])
+        self.assertIsNone(sp["test_improvement"])
+        self.assertIsNone(sp["test_lb"])
+        self.assertEqual({k: out["selected"][k] for k in ("rank", "lambda")},
+                         {k: base["selected"][k] for k in ("rank", "lambda")})           # (the nominal pick, flagged)
+
+    def test_primary_has_its_own_availability(self):
+        """r7 P2-2: the primary result reads the validation scores of its rank <= PRIMARY_RANKS candidates only. A
+        flag in a rank-3 candidate's validation leaves the FULL selection unresolved but the primary decided."""
+        D, R = self.D, self.rec
+        data = R.simulate(D, dict(rank=1, energy=0.10), 13)
+        run = lambda: R.procedure(D, data, "a", 3, [0.1], 8, 13)        # noqa: E731
+        base = run()
+        with self.flag_scores(lambda ix: ix is D.val_idx, model=lambda m: m["u"].shape[1] >= 3):
+            out = run()
+        self.assertFalse(out["decision"]["available"])
+        self.assertTrue(out["decision"]["selection_unresolved"] and out["selected"]["selection_unresolved"])
+        self.assertIsNone(out["test_lb"])
+        sp = out["selected_primary"]
+        self.assertTrue(sp["available"])
+        self.assertNotIn("selection_unresolved", sp)
+        self.assertLessEqual(sp["rank"], R.PRIMARY_RANKS)
+        for k in ("rank", "lambda", "test_improvement", "test_lb", "success"):
+            self.assertEqual(sp[k], base["selected_primary"][k], k)                   # (the unflagged primary, kept)
+        self.assertIsNotNone(sp["test_lb"])
+        with self.flag_scores(lambda ix: ix is D.val_idx, model=lambda m: m["u"].shape[1] == 1):   # (a primary rank)
+            out = run()
+        self.assertFalse(out["selected_primary"]["available"])
+        self.assertTrue(out["selected_primary"]["selection_unresolved"])
+
+    def test_unresolved_scores_never_decide_forward(self):
+        """r5 P2-1, the forward tests: a flagged score in a test set's two models (or in the validation
+        selection) makes that branch unavailable (reason, counts, both diagnostics), never a success."""
+        D, R = self.D, self.rec
+        data = R.simulate(D, dict(rank=1, energy=0.10), 17)
+        F = D.forward
+        run = lambda: R.forward_procedure(D, data, 1, [0.1], 6, 17)     # noqa: E731
+        base = run()
+        for k in ("forward_transfer", "intersection"):
+            self.assertTrue(base[k]["available"] and base[k]["integration_unresolved"] == 0, base[k])
+            self.assertEqual(set(base[k]["integration"]), {"selected", "rank0"})
+        self.assertTrue(base["decision"]["available"])
+        with self.flag_scores(lambda ix: ix is F["tests"]["forward_transfer"]):
+            out = run()
+        ft = out["forward_transfer"]
+        self.assertFalse(ft["available"])
+        self.assertRegex(ft["reason"], "UNRESOLVED")
+        self.assertEqual(ft["integration_unresolved"], 2 if base["selected"]["rank"] else 1)
+        self.assertEqual(ft["integration"]["selected"]["grid_unresolved"], 1)
+        self.assertTrue(out["intersection"]["available"])                               # (its own scores: fine)
+        self.assertFalse(out["success"])
+        self.assertFalse(out["decision"]["available"])
+        self.assertIsNone(out["test_lb"])
+        with self.flag_scores(lambda ix: ix is F["val"]):
+            out = run()
+        self.assertGreater(out["integration_unresolved"]["validation"], 0)
+        for k in ("forward_transfer", "intersection"):
+            self.assertFalse(out[k]["available"], k)
+            self.assertIn("in validation", out[k]["reason"])
+        self.assertFalse(out["success"])
+        self.assertTrue(out["decision"]["selection_unresolved"] and out["selected"]["selection_unresolved"])
+        self.assertEqual(out["decision"]["integration_unresolved"], out["integration_unresolved"]["validation"])
+        self.assertIsNone(out["test_improvement"])
+        self.assertIsNone(out["test_lb"])
 
     def test_conditioning(self):
         rep = self.rec.conditioning(self.D, 2, "a")
@@ -869,6 +1020,1028 @@ class TestRecovery(unittest.TestCase):
         self.assertEqual(self.rec.wilson(0, 0), None)
         lo, hi = self.rec.wilson(16, 20)
         self.assertTrue(lo < 0.8 < hi)
+
+
+@unittest.skipIf(np is None, "numpy is not installed (set RQ_PYLIB, or RQ_REQUIRE_NUMPY=1 to require it)")
+class TestRecoveryRuns(unittest.TestCase):
+    """#66 Codex r1 P2-7..9: each fitter's registered command-line defaults (incompatible choices refused
+    before any worker starts), the configuration's binding of the graph metadata and every computational
+    source, and the identity of every kept result on resume and in the summary."""
+
+    @classmethod
+    def setUpClass(cls):
+        import recovery
+        cls.rec = recovery
+        cls.tmp = tempfile.mkdtemp()
+        cls.gdir = os.path.join(cls.tmp, "g")
+        graph.write(full(), cls.gdir)
+        cls.gpath = os.path.join(cls.gdir, "graph.jsonl.gz")
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp)
+
+    def ns(self, **kw):
+        import argparse as ap_
+        base = dict(graph=self.gpath, namespace="ns", fitter="minimal", options=None, ranks=1, lambdas=None,
+                    iters=None, ab_cap=-1, start=None, basis=None, embedding=None, center=None, set="main",
+                    scenarios="r0", reps=0, jobs=1)
+        base.update(kw)
+        return ap_.Namespace(**base)
+
+    def test_fitter_defaults_and_refusals(self):
+        R = self.rec
+        a = R.resolve(self.ns(fitter="registered"))
+        self.assertEqual((a.options, a.lambdas, a.iters, a.start, a.basis, a.embedding, a.center),
+                         ("a", "0.01,0.02,0.05,0.2", 30, "both", 6, "shared", "references"))
+        self.assertEqual(tuple(float(x) for x in a.lambdas.split(",")), R.REGISTERED_LAMBDAS)
+        m = R.resolve(self.ns())
+        self.assertEqual((m.options, m.lambdas, m.iters), ("a,b,base", "0.02,0.1,0.5", 40))
+        for bad in (dict(options="a,b"), dict(ab_cap=1), dict(lambdas="0,0.1"), dict(options="a,z"),
+                    dict(options="a,a"), dict(basis=5)):
+            with self.assertRaises(SystemExit, msg=bad):
+                R.resolve(self.ns(fitter="registered", **bad))
+        for bad in (dict(start="cold"), dict(basis=8), dict(embedding="separate"), dict(center="train_c")):
+            with self.assertRaises(SystemExit, msg=bad):
+                R.resolve(self.ns(**bad))
+        # refused BEFORE any worker or file: the run directory stays empty
+        out = os.path.join(self.tmp, "refused")
+        with self.assertRaisesRegex(SystemExit, "option .b."):
+            R.run(self.ns(fitter="registered", options="a,b", out=out))
+        self.assertFalse(os.path.exists(out))
+        with self.assertRaisesRegex(SystemExit, "option .b."):
+            R.main(["run", "--graph", self.gpath, "--out", out, "--fitter", "registered", "--options", "a,b",
+                    "--scenarios", "r0", "--reps", "1"])
+        self.assertFalse(os.path.exists(out))
+        # the command line's defaults are the fitter's (no datasets: the configuration only)
+        out = os.path.join(self.tmp, "cli")
+        self.assertEqual(R.main(["run", "--graph", self.gpath, "--out", out, "--fitter", "registered",
+                                 "--scenarios", "r0", "--reps", "0"]), 0)
+        cfg = rqlib.read_json(os.path.join(out, "config.json"))
+        self.assertEqual((cfg["options"], cfg["lambdas"], cfg["iters"], cfg["start"]),
+                         ("a", "0.01,0.02,0.05,0.2", 30, "both"))
+
+    def test_config_binds_graph_metadata_and_sources(self):
+        """P2-8: a change of the graph metadata alone (the edges unchanged) is another configuration; rqlib
+        (the seed derivation) and noisebank (the count density's numerics) are bound sources."""
+        R = self.rec
+        tmp = tempfile.mkdtemp()
+        try:
+            gdir = os.path.join(tmp, "g")
+            shutil.copytree(self.gdir, gdir)
+            a = self.ns(graph=os.path.join(gdir, "graph.jsonl.gz"), out=os.path.join(tmp, "o"))
+            R.prepare_run(a)
+            cfg = rqlib.read_json(os.path.join(a.out, "config.json"))
+            self.assertTrue({"rqlib.py", "noisebank.py", "map.py", "recovery.py", "graph.py"} <= set(cfg["tools_sha256"]))
+            self.assertEqual(set(cfg["graph"]), {"edges_sha256", "meta_sha256"})
+            mp = os.path.join(gdir, "graph.meta.json")
+            meta = rqlib.read_json(mp)
+            w = next(w for w in meta["worlds"] if w["treatment"] == "A")
+            w["treatment"] = "B"                       # (a world treatment changed; the edges are the same)
+            rqlib.write_durable(mp, rqlib.canonical(meta))
+            self.assertEqual(R.graph_meta(a.graph)["edges_sha256"], cfg["graph"]["edges_sha256"])
+            with self.assertRaisesRegex(SystemExit, "another configuration"):
+                R.prepare_run(self.ns(graph=a.graph, out=a.out))
+        finally:
+            shutil.rmtree(tmp)
+
+    def flag_validation(self, model=None):
+        """recovery.scorer patched so that the VALIDATION scores (the second scoring of a model in procedure(): the
+        test set is scored first) of a model with model(m) report one finite unresolved pair."""
+        import unittest.mock as mock
+        real = self.rec.scorer
+
+        def scorer(D, data, m, idx, fitter):
+            sc, calls = real(D, data, m, idx, fitter), []
+
+            def score(ix, info=None):
+                res = sc(ix, info)
+                calls.append(1)
+                if info is not None and len(calls) == 2 and (model is None or model(m)):
+                    info["grid_unresolved"] = 1
+                return res
+            return score
+        return mock.patch.object(self.rec, "scorer", scorer)
+
+    def test_summary_excludes_unresolved_selections(self):
+        """r6 P2-1: summarize() keeps a result whose selection or comparison is UNRESOLVED (a finite score that
+        failed its integration check) out of every numeric aggregate and rank histogram, and counts it by itself.
+        r7 P2-1: the acceptance rate (rate, wilson95) is successes / datasets, an unavailable dataset being
+        unsuccessful; the conditional successes / decided rate is reported beside it, labelled. r7 P2-2: the primary
+        block aggregates every dataset on the primary's own availability. Dataset 0 is an ordinary result; dataset 1
+        is a real run whose validation scores are injected as flagged."""
+        R = self.rec
+        out = os.path.join(self.tmp, "unres")
+        R.prepare_run(self.ns(options="a", lambdas="0.1", iters=3, out=out))
+        for rep in (0, 1):
+            f = os.path.join(out, f"r0.{rep:03d}.json")
+            args = self.ns(options="a", lambdas="0.1", iters=3, scenario="r0", rep=rep, out=f)
+            if rep == 0:
+                self.assertEqual(R.one(args), 0)
+                continue
+            with self.flag_validation():
+                self.assertEqual(R.one(args), 0)
+        o0 = rqlib.read_json(os.path.join(out, "r0.000.json"))["options"]["a"]
+        o1 = rqlib.read_json(os.path.join(out, "r0.001.json"))["options"]["a"]
+        self.assertTrue(o0["decision"]["available"])
+        self.assertFalse(o1["decision"]["available"])
+        self.assertTrue(o1["decision"]["selection_unresolved"])
+        for k in ("test_improvement", "test_lb", "snapshot_test_improvement", "alignment_u1_b", "classes"):
+            self.assertIsNone(o1[k], k)
+        self.assertFalse(o1["selected_primary"]["available"])
+        cell = R.summarize(out)["cells"][0]
+        self.assertEqual((cell["datasets"], cell["decided"], cell["decision_unavailable"]), (2, 1, 1))
+        self.assertEqual((cell["unresolved_decisions"], cell["unresolved_selections"]), (1, 1))
+        self.assertEqual(sum(cell["selected_ranks"].values()), 1)                     # (the decided one only)
+        self.assertEqual(cell["selected_ranks"], {o0["selected"]["rank"]: 1})
+        self.assertEqual(sum(cell["selected_start"].values()), 1)
+        self.assertEqual(cell["successes"], int(o0["success"]))
+        self.assertEqual(cell["rate"], round(int(o0["success"]) / 2, 3))              # (acceptance: / datasets)
+        self.assertEqual(cell["wilson95"], R.wilson(int(o0["success"]), 2))
+        self.assertEqual(cell["conditional"]["rate"], float(o0["success"]))           # (conditional: / decided)
+        self.assertEqual(cell["conditional"]["wilson95"], R.wilson(int(o0["success"]), 1))
+        self.assertEqual((cell["unavailable"], cell["decided_fraction"]), (1, 0.5))
+        self.assertIn("acceptance", cell["rate_basis"])
+        self.assertIn("NOT the acceptance", cell["conditional"]["basis"])
+        self.assertEqual(cell["mean_test_lb"], o0["test_lb"])
+        self.assertEqual(cell["mean_test_improvement"], o0["test_improvement"])
+        pr = cell["primary"]
+        self.assertEqual((pr["datasets"], pr["decided"], pr["unavailable"]), (2, 1, 1))   # (the unavailable one, counted)
+        self.assertEqual(sum(pr["selected_ranks"].values()), 1)
+        self.assertEqual(pr["rate"], round(int(o0["selected_primary"]["success"]) / 2, 3))
+        self.assertEqual(pr["conditional"]["rate"], float(o0["selected_primary"]["success"]))
+        self.assertEqual(cell["classes"], {k: {f: float(v[f]) for f in ("rmse_selected", "rmse_rank0", "interaction_sd")}
+                                           for k, v in o0["classes"].items()})
+
+    def test_acceptance_rate_counts_unavailable_datasets(self):
+        """r7 P2-1: four successes, one decided failure and fifteen unavailable datasets are a 20% acceptance rate
+        (Wilson interval over 20), and a conditional 80% over the 5 decided ones, labelled as such."""
+        import copy
+        R = self.rec
+        out = os.path.join(self.tmp, "accept")
+        R.prepare_run(self.ns(options="a", lambdas="0.1", iters=3, out=out))
+        f0 = os.path.join(out, "r0.000.json")
+        self.assertEqual(R.one(self.ns(options="a", lambdas="0.1", iters=3, scenario="r0", rep=0, out=f0)), 0)
+        r0 = rqlib.read_json(f0)
+
+        def make(rep, kind):
+            r = copy.deepcopy(r0)
+            r["rep"], r["seed"] = rep, rqlib.derive_seed("ns", "recovery", "r0", rep)
+            o = r["options"]["a"]
+            o["success"] = kind == "success"
+            o["selected_primary"]["success"] = kind == "success"
+            if kind == "unavailable":
+                o["decision"] = {"available": False, "selection_unresolved": True, "integration_unresolved": 1,
+                                 "test_worlds": 6, "reason": "unresolved"}
+                o["selected_primary"]["available"] = False
+            else:
+                o["decision"] = {"available": True, "test_worlds": 6, "reason": None}
+                o["selected_primary"]["available"] = True
+            rqlib.write_durable(os.path.join(out, f"r0.{rep:03d}.json"), rqlib.canonical(r))
+        kinds = ["success"] * 4 + ["failure"] + ["unavailable"] * 15
+        for rep, kind in enumerate(kinds):
+            make(rep, kind)
+        cell = R.summarize(out)["cells"][0]
+        self.assertEqual((cell["datasets"], cell["successes"], cell["decided"], cell["unavailable"]), (20, 4, 5, 15))
+        self.assertEqual(cell["rate"], 0.2)
+        self.assertEqual(cell["wilson95"], R.wilson(4, 20))
+        self.assertEqual(cell["conditional"]["rate"], 0.8)
+        self.assertEqual(cell["conditional"]["wilson95"], R.wilson(4, 5))
+        self.assertEqual(cell["decided_fraction"], 0.25)
+        self.assertEqual(cell["decision_unavailable"], 15)
+        pr = cell["primary"]                                           # (the same on the primary result)
+        self.assertEqual((pr["datasets"], pr["successes"], pr["decided"], pr["unavailable"]), (20, 4, 5, 15))
+        self.assertEqual((pr["rate"], pr["conditional"]["rate"]), (0.2, 0.8))
+        for rep in range(20):                                          # (none decides: the counts stay)
+            make(rep, "unavailable")
+        cell = R.summarize(out)["cells"][0]
+        self.assertEqual((cell["decided"], cell["rate"], cell["conditional"]["rate"]), (0, 0.0, None))
+        self.assertEqual((cell["primary"]["datasets"], cell["primary"]["unavailable"], cell["primary"]["decided"]),
+                         (20, 20, 0))
+
+    def test_summary_primary_independent_of_full_selection(self):
+        """r7 P2-2: a rank-3-only validation flag leaves the full selection unavailable but the primary decided, and
+        the summary keeps the primary result (success count, rank histogram) and counts the full one unavailable."""
+        R = self.rec
+        out = os.path.join(self.tmp, "prim")
+        R.prepare_run(self.ns(options="a", ranks=3, lambdas="0.1", iters=3, out=out))
+        f = os.path.join(out, "r0.000.json")
+        with self.flag_validation(model=lambda m: m["u"].shape[1] >= 3):
+            self.assertEqual(R.one(self.ns(options="a", ranks=3, lambdas="0.1", iters=3, scenario="r0", rep=0,
+                                           out=f)), 0)
+        o = rqlib.read_json(f)["options"]["a"]
+        self.assertFalse(o["decision"]["available"])
+        self.assertTrue(o["selected_primary"]["available"])
+        cell = R.summarize(out)["cells"][0]
+        self.assertEqual((cell["datasets"], cell["decided"], cell["unavailable"], cell["successes"]), (1, 0, 1, 0))
+        self.assertEqual(cell["selected_ranks"], {})
+        pr = cell["primary"]
+        self.assertEqual((pr["datasets"], pr["decided"], pr["unavailable"]), (1, 1, 0))
+        self.assertEqual(pr["selected_ranks"], {o["selected_primary"]["rank"]: 1})
+        self.assertEqual(pr["successes"], int(o["selected_primary"]["success"]))
+        self.assertEqual(pr["conditional"]["rate"], float(o["selected_primary"]["success"]))
+
+    def test_result_identity_on_resume_and_summary(self):
+        """P2-9: a result copied under another name, one with a wrong seed, or a stray file is refused by the
+        resume and the summary; a clean directory summarizes."""
+        R = self.rec
+        out = os.path.join(self.tmp, "ident")
+        a = self.ns(options="a", lambdas="0.1", iters=3, out=out)
+        R.prepare_run(a)
+        f0 = os.path.join(out, "r0.000.json")
+        self.assertEqual(R.one(self.ns(options="a", lambdas="0.1", iters=3, scenario="r0", rep=0, out=f0)), 0)
+        self.assertEqual(R.summarize(out)["datasets"], 1)
+        good = rqlib.read_bytes(f0)
+        f1 = os.path.join(out, "r0.001.json")
+        shutil.copy(f0, f1)                             # (a copy under another name: n would be inflated)
+        for fn in (lambda: R.summarize(out), lambda: R.prepare_run(self.ns(options="a", lambdas="0.1", iters=3,
+                                                                           out=out))):
+            with self.assertRaisesRegex(SystemExit, "does not match its file name"):
+                fn()
+        os.remove(f1)
+        r = json.loads(good)
+        r["seed"] += 1
+        rqlib.write_durable(f0, rqlib.canonical(r))
+        with self.assertRaisesRegex(SystemExit, "derived seed"):
+            R.summarize(out)
+        rqlib.write_durable(f0, good)
+        with open(os.path.join(out, "notes.json"), "w") as f:
+            json.dump({}, f)
+        with self.assertRaisesRegex(SystemExit, "not a recovery result"):
+            R.summarize(out)
+        os.remove(os.path.join(out, "notes.json"))
+        cell = R.summarize(out)["cells"][0]
+        self.assertIn("median_test_lb", cell)
+        self.assertIn("selected_start", cell)
+        self.assertEqual(cell["decision_unavailable"], 0)
+        os.remove(os.path.join(out, "config.json"))
+        with self.assertRaisesRegex(SystemExit, "no config.json"):
+            R.summarize(out)
+
+
+@unittest.skipIf(np is None, "numpy is not installed (set RQ_PYLIB, or RQ_REQUIRE_NUMPY=1 to require it)")
+class TestMap(unittest.TestCase):
+    """map.py, the registered map (item 7): the QP and its status, the monotone surface and its extension, the
+    monotone-spline link, the count density, control access, reference centring, the SVD warm start, the
+    joint fit (its rank-0 false-positive regression), the survival posterior, stage 2 for both heads, the
+    sensitivities, and start selection against an independently recomputed objective."""
+
+    @classmethod
+    def setUpClass(cls):
+        import map as mapfit
+        import recovery
+        cls.M, cls.rec = mapfit, recovery
+        cls.D = recovery.Data(full())
+        cls.cap = recovery.simulate(cls.D, recovery.SCENARIOS["r1_017_cap"], 41)
+        cls.vf = staticmethod(recovery.var_model(cls.cap["settings"]))
+
+    def test_monotone_qp(self):
+        M = self.M
+        A, c = np.eye(2), np.array([2.0, 1.0])
+        C = np.array([[-1.0, 1.0]])                                # x1 >= x0
+        x, st = M.monotone_qp(A, c, C, np.zeros(2))
+        self.assertTrue(np.allclose(x, [1.5, 1.5]), x)            # the isotonic projection
+        self.assertTrue(st["converged"] and st["stationarity"] < 1e-12 and st["min_multiplier"] >= 0, st)
+        x, st = M.monotone_qp(A, np.array([1.0, 2.0]), C, np.zeros(2))
+        self.assertTrue(np.allclose(x, [1.0, 2.0]) and st["converged"], x)    # feasible: unconstrained
+        x, st = M.monotone_qp(A, c, C, np.array([0.0, 1.0]), d=np.array([1.0]))   # x1 - x0 >= 1
+        self.assertTrue(np.allclose(x, [1.0, 2.0]) and st["converged"] and st["violation"] < 1e-12, x)
+        x, st = M.monotone_qp(A, c, C, np.zeros(2), iters=1)      # (P3: the cap is reported, never silent)
+        self.assertFalse(st["converged"])
+        self.assertEqual(st["iterations"], 1)
+        self.assertEqual(M.qp_summary([st, None])["unconverged"], 1)
+
+    def test_surface_monotone(self):
+        M = self.M
+        rng = np.random.default_rng(3)
+        a, b = rng.normal(size=4000), rng.normal(size=4000)
+        y = np.tanh(a) - 0.5 * b + rng.normal(0, 0.3, 4000)         # nondecreasing in a, nonincreasing in b
+        y[:200] = -y[:200]                                           # some contrary data
+        for k in M.BASES:
+            s = M.Surface(M._knots(a, k), M._knots(b, k), ("inc", "dec"))
+            s.fit(a, b, y, np.ones(4000))
+            self.assertTrue(s.status["converged"], s.status)
+            self.assertGreaterEqual(float((M.surface_mats(k, ("inc", "dec"))[0] @ s.theta.ravel()).min()), -1e-9)
+            grid = np.linspace(-6, 6, 49)                            # (well beyond the knots)
+            va = s.value(grid, np.zeros(49))
+            vb = s.value(np.zeros(49), grid)
+            self.assertTrue((np.diff(va) >= -1e-9).all() and (np.diff(vb) <= 1e-9).all())
+        with self.assertRaises(ValueError):
+            M.Surface(np.arange(5.0), np.arange(5.0), ("inc", "dec"))
+
+    def test_surface_extension_preserves_monotonicity(self):
+        """P2-5: the review's terminal tile [[0, -2], [1, -1.9]] (both coefficient orders hold): bilinear
+        extrapolation at prey-axis fraction 2 gives a predator-axis slope of -0.8; the registered extension
+        keeps every slope's sign on a grid far outside the knots, is continuous at the box, and a fit with
+        rows beyond the box reproduces a linear truth exactly (the extension's design rows)."""
+        M = self.M
+        kn = np.linspace(-1.0, 1.0, 4)
+        s = M.Surface(kn, kn, ("inc", "dec"))
+        s.theta = np.array([[0.0, -1.0, -2.5, -4.0], [0.2, -0.5, -1.0, -3.0], [0.5, 0.2, 0.0, -2.0],
+                            [2.0, 1.5, 1.0, -1.9]])
+        self.assertGreaterEqual(float((s.C @ s.theta.ravel()).min()), 0.0)
+        t00, t10, t01, t11 = 0.0, 1.0, -2.0, -1.9                   # (the corner tile; tb = 2: the old rule)
+        self.assertAlmostEqual((t10 - t00) * (1 - 2) + (t11 - t01) * 2, -0.8)
+        g = np.linspace(-6.0, 6.0, 121)
+        A_, B_ = np.meshgrid(g, g, indexing="ij")
+        F = s.value(A_.ravel(), B_.ravel()).reshape(A_.shape)
+        self.assertGreaterEqual(float(np.diff(F, axis=0).min()), -1e-12)    # nondecreasing in a everywhere
+        self.assertLessEqual(float(np.diff(F, axis=1).max()), 1e-12)        # nonincreasing in b everywhere
+        _, fa, fb = s.value(A_.ravel(), B_.ravel(), grads=True)
+        self.assertTrue((fa >= -1e-12).all() and (fb <= 1e-12).all())
+        a0 = np.full(9, 0.5)
+        bs = np.linspace(-0.5, 0.5, 9)
+        for e in (1e-9, -1e-9):                                       # continuous at the box's edges
+            self.assertTrue(np.allclose(s.value(kn[-1] + abs(e) * np.sign(e) + 0 * bs, bs),
+                                        s.value(np.full(9, kn[-1]), bs), atol=1e-8))
+            self.assertTrue(np.allclose(s.value(a0, kn[0] + e + 0 * bs), s.value(a0, np.full(9, kn[0])), atol=1e-8))
+        rng = np.random.default_rng(9)
+        a, b = rng.normal(0, 2, 3000), rng.normal(0, 2, 3000)
+        kn6 = np.linspace(-1.5, 1.5, 6)                              # (uniform: a plane has no 2nd differences)
+        s2 = M.Surface(kn6, kn6, ("inc", "dec"))
+        y = 2.0 * a - b
+        self.assertGreater(int(((np.abs(a) > 1.6) | (np.abs(b) > 1.6)).sum()), 500)
+        s2.fit(a, b, y, np.ones(3000))
+        self.assertLess(float(np.max(np.abs(s2.value(a, b) - y))), 1e-5)
+        self.assertTrue(np.allclose(s2.side_slopes(), (2.0, 2.0, -1.0, -1.0), atol=1e-6))
+
+    def test_link_spline(self):
+        """P1-2: the registered monotone-spline link: the identity at the start; fitted, it is strictly
+        increasing everywhere (the minimum slope, the linear end extension), pinned at the end knots, bounded
+        by the grid's asymptotes, and fits a bounded nonlogistic truth better than the logistic family alone;
+        dG is G's derivative."""
+        M = self.M
+        rng = np.random.default_rng(7)
+        base = rng.normal(0.0, 1.2, 20000)
+        lk0 = M.Link()
+        self.assertTrue(lk0.identity() and np.array_equal(lk0.G(base), base))
+        w = np.ones(len(base))
+        same = M.update_link(M.Link(), base, base.copy(), w)         # (an identity truth stays the identity)
+        self.assertEqual((same.lo, same.hi), (0.0, 1.0))
+        self.assertLess(float(np.max(np.abs(same.G(base) - base))), 1e-6)
+        p = 0.03 + 0.77 / (1.0 + np.exp(-(base + 0.6 * np.tanh(2.0 * base))))
+        z = np.log(p / (1 - p)) + rng.normal(0.0, 0.05, len(base))
+        lk = M.update_link(M.update_link(M.Link(), base, z, w), base, z, w)
+        self.assertEqual(len(lk.knots), M.K)
+        self.assertEqual((lk.theta[0], lk.theta[-1]), (lk.knots[0], lk.knots[-1]))
+        self.assertTrue((np.diff(lk.theta) >= M.LINK_MIN_SLOPE * np.diff(lk.knots) - 1e-9).all())
+        self.assertTrue(lk.status["converged"])
+        self.assertEqual(len(lk.statuses), 2 * 2 * M.LINK_STEPS)               # (r2 P3: every GN step's QP)
+        self.assertTrue(all(st["converged"] for st in lk.statuses))
+        self.assertLess(lk.hi, 1.0)
+        g = np.linspace(-10.0, 10.0, 4001)
+        self.assertTrue((np.diff(lk.G(g)) > 0).all() and (lk.dG(g) > 0).all())
+        lo_g, hi_g = M.Link(None, None, lk.lo, lk.hi).G(np.array([-50.0, 50.0]))
+        self.assertTrue(lo_g < lk.G(g).min() and lk.G(g).max() < hi_g)
+        sse = float(np.sum((z - lk.G(base)) ** 2))
+        logistic = min(float(np.sum((z - M.Link(None, None, lo, hi).G(base)) ** 2)) for lo in M.LINK_LO for hi in M.LINK_HI)
+        self.assertLess(sse, 0.8 * logistic)
+        x = np.linspace(-3, 3, 301)
+        x = x[np.min(np.abs(x[:, None] - lk.knots[None, :]), axis=1) > 1e-3]
+        fd = (lk.G(x + 1e-6) - lk.G(x - 1e-6)) / 2e-6
+        self.assertTrue(np.allclose(fd, lk.dG(x), rtol=1e-5, atol=1e-7))
+
+    def test_count_lpd(self):
+        """P1-3: the registered capture-count density (Annex H.9.2's rounded logit-normal): normalized over
+        0..B in every regime, equal to a direct erfc computation, a mean over replicates, counts checked."""
+        import math as m_
+        M, N = self.M, self.rec.B_COUNT
+        k = np.arange(N + 1)[:, None]
+        for loc, var in ((-1.0, 0.36), (0.3, 0.0225), (-4.5, 0.5), (3.0, 0.1), (0.0, 1e-4)):
+            lp = M.count_lpd(k, N, np.full(N + 1, loc), np.full(N + 1, var))
+            self.assertAlmostEqual(float(np.exp(lp).sum()), 1.0, places=9)
+
+        def ref(kk, loc, sd):
+            Phi = lambda x: 0.5 * m_.erfc(-x / m_.sqrt(2.0))           # noqa: E731
+            lo = -m_.inf if kk == 0 else m_.log((kk - 0.5) / (N - kk + 0.5))
+            hi = m_.inf if kk == N else m_.log((kk + 0.5) / (N - kk - 0.5))
+            if lo > loc:                                               # (the upper tail, by the upper tails)
+                return m_.log(0.5 * m_.erfc((lo - loc) / sd / m_.sqrt(2)) - 0.5 * m_.erfc((hi - loc) / sd / m_.sqrt(2)))
+            return m_.log(Phi((hi - loc) / sd) - Phi((lo - loc) / sd))
+        for kk in (0, 3, 40, 87, 150, 300, 324):
+            got = float(M.count_lpd(np.array([[kk]]), N, np.array([-1.0]), np.array([0.36]))[0])
+            self.assertAlmostEqual(got, ref(kk, -1.0, 0.6), places=7)
+        cnt = np.array([[10, 12, 9], [100, 90, 95]])
+        lp = M.count_lpd(cnt, N, np.array([-3.4, -0.8]), np.array([0.2, 0.05]))
+        one = [float(M.count_lpd(cnt[i][:, None], N, np.full(3, [-3.4, -0.8][i]), np.full(3, [0.2, 0.05][i])).mean())
+               for i in range(2)]
+        self.assertTrue(np.allclose(lp, one))
+        for bad in (np.array([[N + 1]]), np.array([[-1]]), np.array([3])):
+            with self.assertRaises(ValueError):
+                M.count_lpd(bad, N, np.zeros(1), np.ones(1))
+
+    def test_control_access_and_invariance(self):
+        """P1-1: the controls a fit may read: none of a held-out snapshot's, none past the forward fit's 120M
+        (the late references included); perturbing every excluded control, and every outcome outside the
+        forward fit's pairs, leaves the fit bit-identical, while an accessible control moves it."""
+        D, M, rec = self.D, self.M, self.rec
+        prim = M.control_access(D, D.fit["a"])
+        self.assertFalse(prim[D.qheld != "train"].any())
+        self.assertTrue(prim[(D.qheld == "train") & (np.bincount(D.qi[D.fit["a"]], minlength=D.nQ) > 0)].any())
+        idx = D.forward["fit"]
+        ctrl = M.control_access(D, idx, rec.FORWARD_TMAX)
+        self.assertFalse(ctrl[D.qt > rec.FORWARD_TMAX].any())
+        late_ref = D.qref & (D.qt > rec.FORWARD_TMAX)
+        self.assertTrue(late_ref.any() and ctrl.any())
+        data = self.cap
+        rng = np.random.default_rng(2)
+        bad = dict(data)
+        s0 = data["s0"].copy()
+        s0[~ctrl] += rng.normal(0.0, 3.0, s0[~ctrl].shape)
+        bad["s0"], bad["s0bar"] = s0, s0.mean(axis=1)
+        out = np.ones(len(D.qi), bool)
+        out[idx] = False                              # (and every outcome outside the forward fit's pairs)
+        for key, bar in (("z", "zbar"), ("s", "sbar")):
+            x = data[key].copy()
+            x[out] += rng.normal(0.0, 2.0, x[out].shape)
+            bad[key], bad[bar] = x, x.mean(axis=1)
+        fits = [M.fit(D, idx, d_, 1, 0.05, False, 6, 1, var_fn=self.vf, ctrl=ctrl) for d_ in (data, bad)]
+        self.assertEqual(fits[0]["objective"], fits[1]["objective"])
+        for k in ("a", "b", "aS", "bS", "u", "v", "c", "DS", "covQ", "covP"):
+            self.assertTrue(np.array_equal(fits[0][k], fits[1][k]), k)
+        self.assertEqual(fits[0]["controls"]["accessible"], int(ctrl.sum()))
+        moved = dict(data)
+        s0 = data["s0"].copy()
+        s0[ctrl] += 0.5                               # (non-vacuous: an accessible control moves it)
+        moved["s0"], moved["s0bar"] = s0, s0.mean(axis=1)
+        self.assertNotEqual(M.fit(D, idx, moved, 1, 0.05, False, 6, 1, var_fn=self.vf, ctrl=ctrl)["objective"],
+                            fits[0]["objective"])
+
+    def test_reference_centring(self):
+        """P2-4: E_muQ[u] = 0 and E_muP[v] = 0 over the eight references hold for the FITTED embedding (both
+        starts, the separate embedding); the forward fit centres on the early references it places; the
+        second distribution centres on the training-C snapshots; the ladder against the references is the
+        ordered part."""
+        D, M, rec = self.D, self.M, self.rec
+        data = rec.simulate(D, rec.SCENARIOS["r2_034"], 61)
+        refq, refp = np.flatnonzero(D.qref), np.flatnonzero(D.pref)
+        self.assertEqual((len(refq), len(refp)), (8, 8))
+        for kw in (dict(), dict(start="cold"), dict(embedding="separate")):
+            m = M.fit(D, D.fit["a"], data, 2, 0.05, False, 6, 1, **kw)
+            self.assertEqual(m["center"], {"distribution": "references", "prey": 8, "pred": 8})
+            embs = [("u", refq), ("v", refp)] + ([("uS", refq), ("vS", refp)] if kw.get("embedding") else [])
+            for key, S in embs:
+                self.assertLess(float(np.abs(m[key][S].mean(axis=0)).max()), 1e-10, (kw, key))
+                self.assertGreater(float(np.abs(m[key][S]).max()), 1e-3)          # (not trivially zero)
+        L = M.ladder(D, m, "prey")
+        self.assertEqual(L["opponents"], 8)
+        i = np.flatnonzero(np.bincount(D.qi[D.fit["a"]], minlength=D.nQ) > 0)[:5]
+        for x in i:
+            self.assertAlmostEqual(L["eta"][x], float(m["surfC"].value(m["a"][refp], np.full(8, m["b"][x])).mean()))
+        F = D.forward
+        mf = M.fit(D, F["fit"], data, 1, 0.05, False, 4, 1, ctrl=M.control_access(D, F["fit"], rec.FORWARD_TMAX))
+        early = np.flatnonzero(D.qref & (D.qt <= rec.FORWARD_TMAX))
+        self.assertEqual(mf["center"]["prey"], len(early))
+        self.assertTrue(0 < len(early) < 8)
+        self.assertLess(float(np.abs(mf["u"][early].mean(axis=0)).max()), 1e-10)
+        mt = M.fit(D, D.fit["a"], data, 1, 0.05, False, 4, 1, center="train_c")
+        self.assertGreater(mt["center"]["prey"], 8)
+        self.assertLess(float(np.abs(mt["u"][mt["center_nodes"]["prey"]].mean(axis=0)).max()), 1e-10)
+        with self.assertRaises(ValueError):
+            M.fit(D, D.fit["a"], data, 1, 0.05, False, 1, 1, center="x")
+
+    def test_svd_warm_start(self):
+        M = self.M
+        rng = np.random.default_rng(1)
+        nQ, nP = 60, 50
+        U0, V0 = rng.normal(size=(nQ, 2)), rng.normal(size=(nP, 2))
+        mask = rng.random((nQ, nP)) < 0.3
+        mask[7, :] = False                                           # a prey node without fitting pairs
+        qi, pj = np.nonzero(mask)
+        val = (U0 @ V0.T)[qi, pj]
+        U, s, V = M.top_singular(qi, pj, val, nQ, nP, 2, seed=0, iters=30)
+        Z = np.zeros((nQ, nP))
+        Z[qi, pj] = val
+        self.assertTrue(np.allclose(s, np.linalg.svd(Z, compute_uv=False)[:2], rtol=1e-6))
+        u, v = M.svd_start(qi, pj, val, nQ, nP, 2, seed=0)
+        self.assertEqual((u.shape, v.shape), ((nQ, 2), (nP, 2)))
+        self.assertEqual(float(np.abs(u[7]).max()), 0.0)
+        self.assertGreater(float(np.corrcoef((u[qi] * v[pj]).sum(axis=1), val)[0, 1]), 0.6)
+
+    def test_fit_smoke_and_rank0_regression(self):
+        """Both starts run and keep the surfaces monotone; on a noisy rank-0 two-way truth the joint
+        fit does not prefer rank 1 under the registered count score (the false positive that head-specific
+        survival qualities fixed)."""
+        D, M, rec = self.D, self.M, self.rec
+        idx = D.fit["a"]
+        data = rec.simulate(D, rec.SCENARIOS["r0_twoway"], 101)
+        with self.assertRaisesRegex(ValueError, "warm or cold"):
+            M.fit(D, idx, data, 1, 0.1, False, 1, 1, start="hot")
+        scores = {}
+        for rank, start in ((0, "warm"), (1, "warm"), (1, "cold")):
+            m = M.fit(D, idx, data, rank, 0.1, False, 30, 1, start=start)
+            for surf, key in ((m["surfC"], ("inc", "dec")), (m["surfS"], ("dec", "inc"))):
+                self.assertGreaterEqual(float((M.CONS[key] @ surf.theta.ravel()).min()), -1e-9)
+            self.assertEqual(m["qp"]["unconverged"], 0)
+            p = M.predict(D, m, idx)
+            self.assertTrue(np.isfinite(p).all())
+            c, g = rec.scorer(D, data, m, idx, "registered")(D.val_idx)
+            self.assertTrue(np.isfinite(c).all() and np.isfinite(g).all())
+            scores[(rank, start)] = rec.world_mean(c, D.val_world)[0]
+        self.assertGreaterEqual(scores[(0, "warm")], scores[(1, "warm")], scores)
+        self.assertGreaterEqual(scores[(0, "warm")], scores[(1, "cold")], scores)
+
+    def test_survival_posterior(self):
+        """P2-6: q_ij = E[sigma(c_i + eta^S) - sigma(c_i) | data] under the joint covariance: the 2-D
+        quadrature matches Monte Carlo, reduces to the plug-in without uncertainty, the c_i covariance with
+        the exposed logit is positive and shrinks the SD below the independent-error SD, and a prey without
+        accessible controls has a wider c_i."""
+        D, M = self.D, self.M
+        m = M.fit(D, D.fit["a"], self.cap, 1, 0.05, False, 8, 1, var_fn=self.vf)
+        t = D.test_idx[:4000]
+        sp = M.survival_posterior(D, m, t)
+        self.assertTrue(np.array_equal(M.survival_penalty(D, m, t), sp["q"]))
+        self.assertTrue((sp["q_sd"] > 0).all() and (sp["var0"] > 0).all())
+        self.assertGreater(float(np.abs(sp["cov01"]).min()), 0.0)                # (c_i enters both logits)
+        self.assertTrue((sp["var0"] * sp["var1"] - sp["cov01"] ** 2 >= -1e-12).all())   # (a joint covariance)
+        _, sd_ind = M._gh2(sp["logit0"], sp["logit1"], sp["var0"], np.zeros(len(t)), sp["var1"])
+        self.assertGreater(float(np.max(np.abs(sp["q_sd"] - sd_ind))), 1e-4)     # (never independent bars)
+        q0, sd0 = M._gh2(sp["logit0"], sp["logit1"], 0 * sp["var0"], 0 * sp["var0"], 0 * sp["var0"])
+        # (the quadrature SD at zero variance is the sqrt of rounding noise ~1e-16: up to ~1e-8 on the merged graph)
+        self.assertTrue(np.allclose(q0, sp["q_plugin"]) and np.allclose(sd0, 0.0, atol=1e-6))
+        rng = np.random.default_rng(4)
+        mu, V = np.array([1.2, 0.4]), np.array([[0.3, 0.2], [0.2, 0.5]])
+        x = rng.multivariate_normal(mu, V, 400000)
+        sg = lambda y: 1 / (1 + np.exp(-y))                           # noqa: E731
+        q, sd = M._gh2(mu[:1], mu[1:], V[:1, 0], V[:1, 1], V[1:, 1])
+        mc = sg(x[:, 1]) - sg(x[:, 0])
+        self.assertAlmostEqual(float(q[0]), float(mc.mean()), delta=2e-3)
+        self.assertAlmostEqual(float(sd[0]), float(mc.std()), delta=2e-3)
+        ctrl = M.control_access(D, D.fit["a"])
+        qi = D.qi[t]
+        self.assertGreater(float(np.median(m["covQ"][~ctrl, 0, 0])), 2 * float(np.median(m["covQ"][ctrl, 0, 0])))
+        self.assertTrue((~ctrl[qi]).any())
+
+    def test_own_world_stage2(self):
+        """q30b: option (b) is refused inside the Level-1 fit; the cross-fitted stage-2 layer recovers a
+        strong own-world lag effect on the within-world pairs out of fold (Level 1 untouched), for the
+        capture head and (P2-6) the survival head; a world the layer never saw integrates its deviation."""
+        D, M, rec = self.D, self.M, self.rec
+        data = rec.simulate(D, rec.SCENARIOS["r0_ownworld"], 21)
+        with self.assertRaisesRegex(ValueError, "option .b. is dropped"):
+            M.fit(D, D.fit["a"], data, 0, 0.1, True, 1, 1)
+        m = M.fit(D, D.fit["a"], data, 0, 0.1, False, 15, 1)
+        idx_w = np.flatnonzero(D.within & (D.role == rec.ROLES.index("training")))
+        before = {k: v.copy() for k, v in m.items() if isinstance(v, np.ndarray)}
+        own = M.own_world_stage2(D, m, data, idx_w, folds=5)
+        self.assertTrue(all(np.array_equal(before[k], m[k]) for k in before))
+        truth = data["eta"][idx_w] - M.predict(D, m, idx_w)               # what Level 1 leaves out there
+        self.assertGreater(float(np.corrcoef(own["oof"], truth)[0, 1]), 0.5)
+        self.assertLess(float(np.mean((truth - own["oof"]) ** 2)), 0.5 * float(np.mean(truth ** 2)))
+        self.assertEqual(sorted(np.unique(own["fold"]).tolist()), [0, 1, 2, 3, 4])
+        p = M.predict(D, m, idx_w, own=own)
+        terms = own["h"][D.lagbin[idx_w]] + own["hw"][D.ownw[idx_w], D.lagbin[idx_w]]
+        self.assertTrue(np.allclose(p, m["link"].G(M._eta(D, m, idx_w) + terms)))
+        with self.assertRaisesRegex(ValueError, "within-world pairs only"):
+            M.own_world_stage2(D, m, data, D.fit["a"][:10])
+        lag = (D.pt[D.pj] - D.qt[D.qi])[idx_w]
+        eff = -0.5 * np.exp(-np.abs(lag) / 8.0)
+        sdat = dict(data)
+        s = data["s"].copy()
+        s[idx_w] += eff[:, None]                      # (within pairs: outside the Level-1 fit, m unchanged)
+        sdat["s"], sdat["sbar"] = s, s.mean(axis=1)
+        own_s = M.own_world_stage2(D, m, sdat, idx_w, folds=5, head="survival")
+        self.assertGreater(float(np.corrcoef(own_s["oof"], eff)[0, 1]), 0.5)
+        ds = M.predict_survival(D, m, idx_w, own=own_s)[1] - M.predict_survival(D, m, idx_w)[1]
+        self.assertTrue(np.allclose(ds, own_s["h"][D.lagbin[idx_w]] + own_s["hw"][D.ownw[idx_w], D.lagbin[idx_w]]))
+        w0 = D.ownw[idx_w][0]
+        seen = idx_w[D.ownw[idx_w] != w0]
+        part = M.own_world_stage2(D, m, data, seen, folds=5)
+        self.assertEqual(part["world_var"].shape, (D.nbins,))
+        ov = M.own_var(D, part, idx_w)
+        un = D.ownw[idx_w] == w0
+        self.assertTrue(np.array_equal(ov[un], part["world_var"][D.lagbin[idx_w][un]]) and not ov[~un].any())
+        # r2 P2-3: the integration has a predictive path. An unseen world's within pairs carry the lag bin's
+        # deviation variance inside the link (pred_eta, pred_var, pred_count_lpd); a seen world's do not.
+        e0, s0_ = M.pred_eta(D, m, idx_w)
+        e1, s1_ = M.pred_eta(D, m, idx_w, own=part)
+        self.assertTrue(np.allclose(s1_ - s0_, ov) and np.allclose(e1 - e0, M._own_terms(D, part, idx_w)))
+        cnt = data["cnt"][idx_w[un][:200]]
+        lp = M.pred_count_lpd(D, m, idx_w[un][:200], cnt, rec.B_COUNT, own=part)
+        self.assertTrue(np.isfinite(lp).all())
+        with self.assertRaisesRegex(ValueError, "capture stage-2"):
+            M.pred_eta(D, m, idx_w, own=own_s)
+        parts = M.own_world_stage2(D, m, sdat, seen, folds=5, head="survival")
+        sp0, sp1 = M.survival_posterior(D, m, idx_w), M.survival_posterior(D, m, idx_w, own=parts)
+        self.assertTrue(np.allclose(sp1["var1"] - sp0["var1"], M.own_var(D, parts, idx_w)))
+        self.assertTrue(np.array_equal(sp1["var0"], sp0["var0"]) and np.array_equal(sp1["cov01"], sp0["cov01"]))
+        with self.assertRaisesRegex(ValueError, "survival stage-2"):
+            M.survival_posterior(D, m, idx_w, own=part)
+        with self.assertRaises(ValueError):
+            M.own_world_stage2(D, m, data, idx_w, head="x")
+
+    def test_unseen_world_lag_deviation_variance(self):
+        """r2 P2-3: the variance of the LAG-DEPENDENT world deviations. Four worlds with opposite deviations
+        (+d, -d) at two equally populated lag bins: every world's lag-averaged residual is 0 (the old
+        estimate was 0), and each bin's between-world variance is var(+d, -d, +d, -d) = 4 d^2 / 3."""
+        import types
+        M = self.M
+        nW, per, d = 4, 50, 0.3
+        lw = np.repeat(np.arange(nW), 2 * per)
+        lb = np.tile(np.repeat([0, 1], per), nW)
+        n = len(lw)
+        Dx = types.SimpleNamespace(qi=np.zeros(n, int), pj=np.zeros(n, int), within=np.ones(n, bool), lagbin=lb,
+                                   ownw=lw, nbins=2, worlds=list(range(nW)))
+        kn = np.linspace(-1.0, 1.0, 4)
+        mx = {"surfC": M.Surface(kn, kn, ("inc", "dec")), "a": np.zeros(1), "b": np.zeros(1),
+              "u": np.zeros((1, 0)), "v": np.zeros((1, 0)), "link": M.Link()}
+        zbar = d * np.where(lw % 2 == 0, 1.0, -1.0) * np.where(lb == 0, 1.0, -1.0)
+        for x in range(nW):
+            self.assertAlmostEqual(float(zbar[lw == x].mean()), 0.0)          # (no world-average signal)
+        own = M.own_world_stage2(Dx, mx, {"zbar": zbar}, np.arange(n), folds=5)
+        self.assertTrue(np.allclose(own["world_var"], [4 * d * d / 3] * 2) and own["world_var_supported"].all())
+        part = M.own_world_stage2(Dx, mx, {"zbar": zbar}, np.flatnonzero(lw != 3), folds=5)
+        ov = M.own_var(Dx, part, np.arange(n))
+        self.assertTrue(np.allclose(ov[lw == 3], part["world_var"][lb[lw == 3]]) and not ov[lw != 3].any())
+        self.assertTrue((part["world_var"] > 0).all())
+        one = M.own_world_stage2(Dx, mx, {"zbar": zbar}, np.flatnonzero(lw == 0), folds=5)
+        self.assertFalse(one["world_var_supported"].any())                    # (one world: unsupported)
+
+    def test_noise_scale_known_answer(self):
+        """r2 P2-1: one absolute unit. A scalar linear block (a mean estimated from cells with variances phi V /
+        R, equal numbers at V = 0.36 and 0.0225) has the GLS variance 1 / sum(R / (phi V)); the old scale (the
+        unweighted mean replicate-mean variance) inflated it by mean(V) mean(1/V) = 4.52. In a fit, unit is
+        phi / (R mean(1/V)) at the fitted fractions, every head is weighted in it, and a predator block's
+        covariance equals the inverse of its ABSOLUTE-precision Hessian recomputed here."""
+        D, M = self.D, self.M
+        R, phi, n = 6, 1.3, 400
+        V = np.repeat([0.36, 0.0225], n)
+        w, unit, ph = M.capture_scale(V, phi * V, R)
+        self.assertAlmostEqual(ph, phi)
+        self.assertAlmostEqual(float(w.mean()), 1.0)
+        self.assertTrue(np.allclose(unit / w, phi * V / R))                       # (each cell's absolute variance)
+        cov = M._block_cov(np.zeros(2 * n, int), np.ones((2 * n, 1)), w, np.zeros(1), 1, unit)[0, 0, 0]
+        gls = 1.0 / float(np.sum(R / (phi * V)))
+        self.assertAlmostEqual(cov, gls, delta=1e-12 * gls)
+        old = M._block_cov(np.zeros(2 * n, int), np.ones((2 * n, 1)), w, np.zeros(1), 1,
+                           float(np.mean(phi * V)) / R)[0, 0, 0]
+        self.assertAlmostEqual(old / gls, float(np.mean(V) * np.mean(1 / V)), places=9)
+        self.assertGreater(old / gls, 4.5)
+        w1, u1, p1 = M.capture_scale(None, np.full(5, 0.6), R)                   # (unweighted: unit = phi / R)
+        self.assertTrue(np.array_equal(w1, np.ones(5)) and abs(u1 - 0.1) < 1e-15 and p1 == 0.6)
+        idx, data, lam = D.fit["a"], self.cap, 0.05
+        m = M.fit(D, idx, data, 1, lam, False, 6, 1, var_fn=self.vf)
+        qi, pj = D.qi[idx], D.pj[idx]
+        g = M.predict(D, m, idx)
+        Vp = self.vf(np.clip(1 / (1 + np.exp(-g)), 1e-4, 1 - 1e-4))
+        zrep = data["z"][idx].var(axis=1, ddof=1)
+        phi_f = float(np.mean(zrep / Vp))
+        unit_f = phi_f / (6 * float(np.mean(1 / Vp)))
+        self.assertAlmostEqual(m["unit"], unit_f, delta=1e-12 * unit_f)
+        nS = M._noise(data["s"][idx])
+        self.assertAlmostEqual(m["weights"]["survival"], unit_f / nS, delta=1e-9 * unit_f / nS)
+        j = int(np.bincount(pj, minlength=D.nP).argmax())                       # (a well-connected predator)
+        e = np.flatnonzero(pj == j)
+        eta = m["surfC"].value(m["a"][pj[e]], m["b"][qi[e]]) + (m["u"][qi[e]] * m["v"][pj[e]]).sum(axis=1)
+        _, FCa, _ = m["surfC"].value(m["a"][pj[e]], m["b"][qi[e]], grads=True)
+        dg = m["link"].dG(eta)
+        _, FSa, _ = m["surfS"].value(m["aS"][pj[e]], m["bS"][qi[e]], grads=True)
+        Xc = np.column_stack([dg * FCa, np.zeros(len(e)), dg[:, None] * m["u"][qi[e]]])
+        Xs = np.column_stack([np.zeros(len(e)), FSa, m["u"][qi[e]] @ m["DS"]])
+        prec_c = 6 / (phi_f * Vp[e])                                             # (absolute precisions)
+        H = (Xc.T * prec_c) @ Xc + Xs.T @ Xs / nS + np.diag([1e-3, 1e-3, lam]) / unit_f
+        self.assertTrue(np.allclose(m["covP"][j], np.linalg.inv(H), rtol=1e-6, atol=1e-14))
+
+    def test_pair_residual_inside_link(self):
+        """r2 P2-2: delta_ij sits inside the link. With a NON-identity bounded link, pair_variance recovers
+        tau^2 on the predictor scale (the after-link moment estimates E[G'^2] tau^2 instead); the score
+        integrates G(eta + e) (a dense quadrature reference agrees); pred_var's G'(eta)^2 s2 varies with the
+        location; without predictor-scale uncertainty the score is the plain count density."""
+        D, M, rec = self.D, self.M, self.rec
+        kn = np.linspace(-3.0, 3.0, 6)
+        lk = M.Link(kn, kn + np.array([0.0, 0.5, 0.8, 0.7, 0.4, 0.0]), 0.03, 0.8)
+        rng = np.random.default_rng(12)
+        eta = rng.uniform(-3.0, 3.0, 60000)
+        tau2, v = 0.09, 0.01
+        zbar = lk.G(eta + rng.normal(0.0, np.sqrt(tau2), len(eta))) + rng.normal(0.0, np.sqrt(v), len(eta))
+        dg = lk.dG(eta)
+        est = M.pair_variance((zbar - lk.G(eta)) / dg, v / dg ** 2)
+        self.assertAlmostEqual(est, tau2, delta=0.012)
+        after = float(np.mean((zbar - lk.G(eta)) ** 2 - v))                       # (the residual after G)
+        self.assertGreater(abs(after - tau2), 0.03)
+        self.assertEqual(M.pair_variance(rng.normal(0, 0.1, 1000), np.full(1000, 0.04)), 0.0)   # (floored)
+        m = dict(M.fit(D, D.fit["a"], self.cap, 1, 0.05, False, 4, 1, var_fn=self.vf))
+        m["link"], m["pair_var"] = lk, tau2
+        t = D.test_idx[:300]
+        e_, s2 = M.pred_eta(D, m, t)
+        loc, var = M.pred_var(D, m, t)
+        rep = M._rep_var(m, loc)
+        self.assertTrue(np.allclose(var - rep, lk.dG(e_) ** 2 * s2))
+        self.assertGreater(float(np.std(var - rep)), 0.1 * float(np.mean(var - rep)))   # (location-dependent)
+        n_ = 40
+        cnt = self.cap["cnt"][t[:n_]]
+        x = np.linspace(-9.0, 9.0, 16001)                                         # (the dense reference)
+        wq = np.exp(-0.5 * x * x)
+        wq /= wq.sum()
+        for tv in (tau2, 0.0):                                       # (with the pair residual; posterior only)
+            m["pair_var"] = tv
+            e_, s2 = M.pred_eta(D, m, t[:n_])
+            lp = M.pred_count_lpd(D, m, t[:n_], cnt, rec.B_COUNT)
+            ref = []
+            for i in range(n_):
+                locs = lk.G(e_[i] + np.sqrt(s2[i]) * x)
+                P = np.exp(M.count_logp(np.repeat(cnt[i:i + 1], len(x), axis=0), rec.B_COUNT, locs,
+                                        M._rep_var(m, locs)))
+                ref.append(float(np.mean(np.log(wq @ P))))
+            err = np.abs(lp - np.array(ref))
+            self.assertLess(float(err.max()), 3e-3, tv)
+            self.assertLess(float(np.median(err)), 2e-4, tv)
+            fo = M.count_lpd(cnt, rec.B_COUNT, *M.pred_var(D, m, t[:n_]))       # (first order: not enough)
+            self.assertGreater(float(np.abs(fo - np.array(ref)).max()), 10 * float(err.max()))
+            # r3 P2-1: a grid too coarse at the start is caught by the a-posteriori check and refined
+            old, M.TRAP_H = M.TRAP_H, 6.0
+            try:
+                inf = {}
+                lp2 = M.pred_count_lpd(D, m, t[:n_], cnt, rec.B_COUNT, info=inf)
+            finally:
+                M.TRAP_H = old
+            if tv:
+                self.assertGreater(inf["refined"], 0, tv)
+            self.assertLess(float(np.abs(lp2 - np.array(ref)).max()), 3e-3, tv)
+            self.assertLessEqual(inf["max_check"], M.TRAP_TOL)
+        g_ = np.linspace(-6.0, 6.0, 20001)
+        self.assertGreaterEqual(lk.max_slope(-6.0, 6.0), float(lk.dG(g_).max()))   # (a conservative bound)
+        m0 = dict(m, pair_var=0.0, covQ=0 * m["covQ"], covP=0 * m["covP"])
+        l0, v0 = M.pred_var(D, m0, t[:n_])
+        self.assertTrue(np.allclose(M.pred_count_lpd(D, m0, t[:n_], cnt, rec.B_COUNT),
+                                    M.count_lpd(cnt, rec.B_COUNT, l0, v0)))
+
+    def test_count_integral_never_capped(self):
+        """r3 P2-1: the review's case: identity link, eta = 0, s2 = 1, a constant replicate SD 0.003, count 162
+        of 324. The exact convolution is P = 0.00493; a 513-node grid (spacing 0.027) gives about 0.0105 (0.75
+        nats off). The checked grid goes as far as its rule needs (here 24,577 nodes) and matches; with no
+        variance function the identity link's Gaussian convolution is exact.
+        r4 P2-1: no frozen variance. The review's heteroscedastic case (identity link, s2 = 1, replicate SD 0.003
+        below p = .5 and 0.012 above, count 163/324): the registered integrand at every node matches a dense
+        reference, where a variance frozen at the count's 0.012 is about 0.17 nats off.
+        r4 P2-2: no silent -inf. The review's tail case (identity h, lo .02, hi .8, SD 0.003, count 324/324,
+        beyond the link's reach): a finite log probability, the range extended to where the integrand peaks,
+        matching a dense log-space reference; a non-finite score is refused."""
+        import math
+        import types
+        M, N = self.M, self.rec.B_COUNT
+        Dx = types.SimpleNamespace(qi=np.zeros(1, int), pj=np.zeros(1, int))
+        kn = np.linspace(-1.0, 1.0, 4)
+        sig2 = 0.003 ** 2
+        mx = {"surfC": M.Surface(kn, kn, ("inc", "dec")), "a": np.zeros(1), "b": np.zeros(1),
+              "u": np.zeros((1, 0)), "v": np.zeros((1, 0)), "rank": 0, "covQ": np.zeros((1, 3, 3)),
+              "covP": np.zeros((1, 2, 2)), "pair_var": 1.0, "link": M.Link(), "phi": sig2,
+              "var_fn": lambda p: np.ones_like(p)}                         # (constant V, but a variance function)
+        cnt = np.array([[162]])
+        exact = float(M.count_lpd(cnt, N, np.zeros(1), np.array([1.0 + sig2]))[0])
+        self.assertAlmostEqual(float(np.exp(exact)), 0.00493, delta=2e-5)
+        inf = {}
+        got = float(M.pred_count_lpd(Dx, mx, np.array([0]), cnt, N, info=inf)[0])
+        self.assertAlmostEqual(got, exact, delta=1e-4)
+        self.assertEqual((inf["grid"], inf["grid_unresolved"]), (1, 0))
+        capped = float(M._grid_pass(mx["link"], mx, cnt, np.zeros(1), np.ones(1), N, 513, np.ones(1))[0][0, 0])
+        self.assertGreater(abs(capped - exact), 0.5)                           # (what a silent cap would score)
+        step_v = lambda p: np.where(p < 0.5, 0.003 ** 2, 0.012 ** 2)          # noqa: E731
+        mh = dict(mx, var_fn=step_v, phi=1.0)
+        c163 = np.array([[163]])
+        inf = {}
+        got = float(M.pred_count_lpd(Dx, mh, np.array([0]), c163, N, info=inf)[0])
+        e = np.linspace(-8.0, 8.0, 1_600_001)                                  # (step 1e-5: the reference)
+        lw = -0.5 * e * e
+        lw -= lw.max() + np.log(np.exp(lw - lw.max()).sum())
+        lp = M.count_logp(np.repeat(c163, len(e), axis=0), N, e, M._rep_var(mh, e))[:, 0]
+        ref = float(np.log(np.exp(lp + lw - (lp + lw).max()).sum()) + (lp + lw).max())
+        self.assertAlmostEqual(got, ref, delta=2e-3)
+        self.assertEqual(inf["grid_unresolved"], 0)
+        frozen = float(M.count_lpd(c163, N, np.zeros(1), np.array([1.0 + 0.012 ** 2]))[0])
+        self.assertGreater(abs(frozen - ref), 0.1)                             # (the frozen variance's error)
+        mt = dict(mx, link=M.Link(None, None, 0.02, 0.8))
+        c324 = np.array([[324]])
+        inf = {}
+        got = float(M.pred_count_lpd(Dx, mt, np.array([0]), c324, N, info=inf)[0])
+        self.assertTrue(np.isfinite(got) and got < -1e5)
+        self.assertGreater(inf["extended"], 0)
+        e = np.linspace(-30.0, 30.0, 600_001)
+        lw = -0.5 * e * e - 0.5 * math.log(2 * math.pi) + math.log(e[1] - e[0])
+        terms = M.count_logp(np.repeat(c324, len(e), axis=0), N, mt["link"].G(e),
+                             M._rep_var(mt, mt["link"].G(e)))[:, 0] + lw
+        ref = float(terms.max() + np.log(np.exp(terms - terms.max()).sum()))
+        self.assertAlmostEqual(got, ref, delta=1e-2)
+        self.assertGreater(float(e[np.argmax(terms)]), 7.0)                    # (beyond the first +-7 SD range)
+        mn = dict(mx, var_fn=lambda p: np.full_like(p, np.nan))
+        with self.assertRaisesRegex(ValueError, "non-finite"):
+            M.pred_count_lpd(Dx, mn, np.array([0]), cnt, N)
+        my = dict(mx, var_fn=None)                                             # (the exact convolution case)
+        inf = {}
+        self.assertAlmostEqual(float(M.pred_count_lpd(Dx, my, np.array([0]), cnt, N, info=inf)[0]), exact, places=12)
+        self.assertEqual(inf["exact"], 1)
+        # the r3 smoke's pair: predictor SD 1.646 with the x1.5 capture-noise variance function (its SD varies
+        # 0.23-0.9 along e). It needs more than 513 nodes; the larger grids resolve it against a dense reference
+        vf = self.rec.var_model(self.rec.SCENARIOS["r2_017_cap15"])
+        mz = dict(mx, var_fn=vf, phi=1.0, pair_var=1.646 ** 2)
+        cz = np.array([[75, 111, 125, 137, 49, 87]])
+        inf = {}
+        got = M.pred_count_lpd(Dx, mz, np.array([0]), cz, N, info=inf)
+        x = np.linspace(-9.0, 9.0, 200001)
+        wq = np.exp(-0.5 * x * x)
+        wq /= wq.sum()
+        loc = 1.646 * x
+        P = np.exp(M.count_logp(np.repeat(cz, len(x), axis=0), N, loc, M._rep_var(mz, loc)))
+        ref = float(np.mean(np.log(wq @ P)))
+        self.assertAlmostEqual(float(got[0]), ref, delta=2e-3)
+        self.assertEqual((inf["grid_unresolved"], inf["grid"]), (0, 1))
+
+    def test_unresolved_scores_flagged_and_beyond_rule_extended(self):
+        """r5 P2-1: the review's case (identity G, eta = 0, predictor SD 1000, a constant callable replicate SD
+        0.003, count 162/324): unresolved at the largest grid (spacing ~0.053, only the central node counts), yet
+        FINITE and about 1.4 nats above the exact convolution -- so it is flagged (grid_unresolved), and the
+        recovery scorer reports the flag to its callers. r5 P2-2: the bounded-link tail case with replicate SD
+        0.0003: the initial rule needs 239,318 nodes (within the cap), the extended range more than 478,000:
+        beyond_rule counts the pair once."""
+        import math
+        import types
+        M, N = self.M, self.rec.B_COUNT
+        Dx = types.SimpleNamespace(qi=np.zeros(1, int), pj=np.zeros(1, int))
+        kn = np.linspace(-1.0, 1.0, 4)
+
+        def model(sd_rep, sd_pred, link=None):
+            return {"surfC": M.Surface(kn, kn, ("inc", "dec")), "a": np.zeros(1), "b": np.zeros(1),
+                    "u": np.zeros((1, 0)), "v": np.zeros((1, 0)), "rank": 0, "covQ": np.zeros((1, 3, 3)),
+                    "covP": np.zeros((1, 2, 2)), "pair_var": sd_pred ** 2, "link": link or M.Link(),
+                    "phi": sd_rep ** 2, "var_fn": lambda p: np.ones_like(p)}
+        cnt = np.array([[162]])
+        mu = model(0.003, 1000.0)
+        exact = float(M.count_lpd(cnt, N, np.zeros(1), np.array([1000.0 ** 2 + 0.003 ** 2]))[0])
+        inf = {}
+        got = float(M.pred_count_lpd(Dx, mu, np.array([0]), cnt, N, info=inf)[0])
+        self.assertTrue(np.isfinite(got))
+        self.assertGreater(got - exact, 1.0)                                   # (about 1.4 nats too high)
+        self.assertLess(got - exact, 1.8)
+        self.assertEqual((inf["grid_unresolved"], inf["grid"]), (1, 0))
+        z = np.zeros((1, 1))
+        info = {}
+        self.rec.scorer(Dx, {"cnt": cnt, "z": z}, mu, np.array([0]), "registered")(np.array([0]), info)
+        self.assertEqual(info["grid_unresolved"], 1)                           # (the scorer surfaces it)
+        lk = M.Link(None, None, 0.02, 0.8)
+        mt = model(0.0003, 1.0, lk)
+        gmax = max(lk.max_slope(-M.TRAP_SD, M.TRAP_SD), 1e-12)
+        smin = math.sqrt(float(M._rep_var(mt, M.VMIN_GRID).min()))
+        need0 = math.ceil(2 * M.TRAP_SD / min(1.0, M.TRAP_H * smin / gmax)) + 1
+        self.assertEqual(need0, 239318)
+        self.assertLessEqual(need0, M.TRAP_KS[-1])                             # (the initial rule is within the cap)
+        self.assertGreater(2 * need0, M.TRAP_KS[-1])                           # (the extended range's rule is not)
+        inf = {}
+        got = float(M.pred_count_lpd(Dx, mt, np.array([0]), np.array([[324]]), N, info=inf)[0])
+        self.assertTrue(np.isfinite(got))
+        self.assertGreater(inf["extended"], 0)
+        self.assertEqual(inf["beyond_rule"], 1)                                # (once, not per extension)
+        self.assertEqual(inf["grid_unresolved"], 0)
+        ms = model(0.003, 1.0, lk)                                             # (rule within the cap in every range)
+        inf = {}
+        M.pred_count_lpd(Dx, ms, np.array([0]), np.array([[324]]), N, info=inf)
+        self.assertEqual((inf["beyond_rule"], inf["grid_unresolved"]), (0, 0))
+        self.assertGreater(inf["extended"], 0)
+
+    def test_pair_variance_safeguarded(self):
+        """r3 P2-2: the review's cycle. One cell (s2 0.01, r^2 1.01) and 100 cells (s2 1, r^2 0): the fixed point
+        alternates 0.980 <-> 0 from 0 (it returned 0); the safeguarded solve finds the likelihood root 0.0896."""
+        M = self.M
+        r = np.concatenate([[np.sqrt(1.01)], np.zeros(100)])
+        s2 = np.concatenate([[0.01], np.ones(100)])
+        t, cyc = 0.0, []
+        for _ in range(6):                                                     # (the old fixed point)
+            w = 1.0 / (t + s2) ** 2
+            t = max(0.0, float(np.sum(w * (r ** 2 - s2)) / np.sum(w)))
+            cyc.append(round(t, 4))
+        self.assertEqual(cyc[:4], [0.9802, 0.0, 0.9802, 0.0])
+        out = M.pair_variance(r, s2, full=True)
+        self.assertAlmostEqual(out["tau2"], 0.0896, delta=2e-4)
+        self.assertTrue(out["converged"] and abs(out["score"]) < 1e-4)
+        self.assertEqual(M.pair_variance(r, s2), out["tau2"])
+        self.assertEqual(M.pair_variance(np.zeros(5), np.ones(5)), 0.0)      # (no excess: the floor)
+
+    def test_world_deviation_var_unequal_cells(self):
+        """r3 P2-3: unequal heteroscedastic cells. Two worlds in one lag bin, cells (n 2, variance 0.06) and (n 50,
+        variance 0.00375), means +0.2 / -0.2: var of the means 0.08 minus the cells' own noise mean(0.06/2,
+        0.00375/50) = 0.0150375 gives 0.0649625; the pooled rule (pooled variance x mean(1/n) = 0.0012675) gave
+        0.0787325. Supplied row variances give the same."""
+        M = self.M
+        a = np.sqrt(0.03)
+        z = np.random.default_rng(3).normal(size=50)
+        z = (z - z.mean()) / z.std(ddof=1)
+        e = np.concatenate([[0.2 + a, 0.2 - a], -0.2 + np.sqrt(0.00375) * z])
+        lw = np.concatenate([np.zeros(2, int), np.ones(50, int)])
+        lb = np.zeros(52, int)
+        tau, ok, raw = M.world_deviation_var(e, lb, lw, 1)
+        self.assertAlmostEqual(float(raw[0]), 0.08 - 0.0150375, places=12)
+        self.assertTrue(ok[0] and tau[0] == raw[0])
+        rv = np.concatenate([np.full(2, 0.06), np.full(50, 0.00375)])
+        self.assertAlmostEqual(float(M.world_deviation_var(e, lb, lw, 1, row_var=rv)[2][0]), 0.08 - 0.0150375,
+                               places=12)
+        self.assertGreater(abs(float(raw[0]) - (0.08 - 0.0012675)), 0.01)
+
+    def test_sensitivities(self):
+        """P2-6: the separate-embedding and four- / eight-basis sensitivity fits run with their own
+        constraints, bases and embeddings."""
+        D, M = self.D, self.M
+        idx = D.fit["a"]
+        for kw in (dict(embedding="separate"), dict(basis=4), dict(basis=8)):
+            m = M.fit(D, idx, self.cap, 1, 0.05, False, 6, 1, var_fn=self.vf, **kw)
+            k = kw.get("basis", 6)
+            for surf, key in ((m["surfC"], ("inc", "dec")), (m["surfS"], ("dec", "inc"))):
+                self.assertEqual(surf.k, k)
+                self.assertGreaterEqual(float((M.surface_mats(k, key)[0] @ surf.theta.ravel()).min()), -1e-9)
+            self.assertEqual(len(m["link"].knots), k)
+            self.assertEqual(m["qp"]["unconverged"], 0)
+            # (r2 P3: EVERY solve counted: the warm start's surfaces, both surfaces each sweep, and each link
+            #  update's 2 x LINK_STEPS Gauss-Newton QPs)
+            want = 6 + 1 + 6 + (1 if kw.get("embedding") else 0) + (6 // M.LINK_EVERY) * 2 * M.LINK_STEPS
+            self.assertEqual(m["qp"]["solves"], want, kw)
+            if kw.get("embedding"):
+                self.assertEqual((m["uS"].shape, m["vS"].shape), ((D.nQ, 1), (D.nP, 1)))
+                self.assertFalse(np.abs(m["DS"]).any())
+                x0, x1 = M.predict_survival(D, m, idx[:50])
+                self.assertTrue(np.allclose(x1 - x0, m["surfS"].value(m["aS"][D.pj[idx[:50]]], m["bS"][D.qi[idx[:50]]])
+                                            + (m["uS"][D.qi[idx[:50]]] * m["vS"][D.pj[idx[:50]]]).sum(axis=1)))
+                self.assertEqual(M.survival_posterior(D, m, idx[:50])["q"].shape, (50,))
+        for bad in (dict(basis=5), dict(embedding="x")):
+            with self.assertRaises(ValueError):
+                M.fit(D, idx, self.cap, 1, 0.05, False, 1, 1, **bad)
+
+    def objective_of(self, m, data, idx, lam, lam_ab=1e-3):
+        """The penalized training objective recomputed from a fit's returned parameters (independently of
+        the fitter's own bookkeeping)."""
+        D, M = self.D, self.M
+        z = data["zbar"][idx]
+        g = M.predict(D, m, idx)
+        w = 1.0 / np.maximum(self.vf(np.clip(1 / (1 + np.exp(-g)), 1e-4, 1 - 1e-4)), 1e-8)
+        obj = float(np.sum(w / w.mean() * (z - g) ** 2))
+        V = self.vf(np.clip(1 / (1 + np.exp(-g)), 1e-4, 1 - 1e-4))
+        zrep = data["z"][idx].var(axis=1, ddof=1)
+        unit = float(np.mean(zrep / V)) / (data["z"].shape[1] * float(np.mean(1.0 / V)))   # (phi / (R mean 1/V))
+        self.assertAlmostEqual(unit, m["unit"], delta=1e-12 * unit)
+        ctrl = M.control_access(D, idx)
+        wS = unit / M._noise(data["s"][idx])            # (every row's weight in the one absolute unit)
+        wS0 = unit / M._noise(data["s0"][ctrl])
+        wC0 = unit / m["controls"]["prior_var"]
+        x0, x1 = M.predict_survival(D, m, idx)
+        obj += wS * float(np.sum((data["sbar"][idx] - x1) ** 2))
+        obj += wS0 * float(np.sum((data["s0"][ctrl].mean(axis=1) - m["c"][ctrl]) ** 2))
+        obj += wC0 * float(np.sum((m["c"] - m["controls"]["cbar"]) ** 2))
+        obj += m["surfC"].pen + m["surfS"].pen + m["link"].pen
+        obj += lam * float(np.sum(m["u"] ** 2) + np.sum(m["v"] ** 2))
+        obj += lam_ab * float(sum(np.sum(m[k] ** 2) for k in ("a", "b", "aS", "bS")))
+        return obj
+
+    def test_weights_starts_and_scoring(self):
+        """The coordinator's item-7 decisions: capture cells weighted by 1 / V(p) from the registered
+        variance function (the generator's in recovery); both starts run, the lower penalized training
+        objective kept (never validation), checked against objectives recomputed from the returned
+        parameters; the registered predictive variance phi V(p) + pair + posterior variance is
+        heteroscedastic; the procedure decides by the count score."""
+        D, M, rec = self.D, self.M, self.rec
+        idx = D.fit["a"]
+        data, vf = self.cap, self.vf
+        self.assertAlmostEqual(float(vf(np.array([0.2]))[0]), 0.36)
+        self.assertAlmostEqual(float(vf(np.array([0.5]))[0]), 0.0225)
+        self.assertIsNone(rec.var_model(dict(rank=2, noiseless=True)))
+        flat = rec.var_model(rec.SCENARIOS["r0"])
+        self.assertAlmostEqual(float(flat(np.array([0.5]))[0]), 0.15 ** 2 + 0.15 ** 2 + 0.2 ** 2 + 1 / (rec.B_COUNT * 0.25))
+        mw = M.fit(D, idx, data, 1, 0.05, False, 10, 1, var_fn=vf)
+        mu = M.fit(D, idx, data, 1, 0.05, False, 10, 1)
+        self.assertTrue(mw["weighted"] and not mu["weighted"])
+        self.assertFalse(np.allclose(M.predict(D, mw, idx), M.predict(D, mu, idx)))
+        single = {st: M.fit(D, idx, data, 1, 0.05, False, 10, 1, var_fn=vf, start=st) for st in ("warm", "cold")}
+        recomputed = {st: self.objective_of(f, data, idx, 0.05) for st, f in single.items()}
+        for st in single:
+            self.assertAlmostEqual(recomputed[st], single[st]["objective"], delta=1e-8 * abs(recomputed[st]))
+        best = M.fit_best(D, idx, data, 1, 0.05, 10, 1, var_fn=vf)
+        want = min(recomputed, key=recomputed.get)
+        self.assertEqual(best["start"], want)
+        self.assertTrue(np.array_equal(best["u"], single[want]["u"]))
+        self.assertEqual(set(M.fit_best(D, idx, data, 0, 0.0, 5, 1)["objectives"]), {"warm"})   # rank 0: one fit
+        loc, var = M.pred_var(D, best, D.val_idx)
+        self.assertEqual(var.shape, D.val_idx.shape)
+        self.assertGreater(float(var.max()) / float(var.min()), 3.0)              # heteroscedastic
+        rep = best["phi"] * vf(np.clip(1 / (1 + np.exp(-loc)), 1e-4, 1 - 1e-4))
+        eta, s2 = M.pred_eta(D, best, D.val_idx)
+        self.assertTrue((s2 >= best["pair_var"]).all() and float(s2.max()) > best["pair_var"])
+        self.assertTrue(np.allclose(var, rep + best["link"].dG(eta) ** 2 * s2))   # (s2 enters through the link)
+        self.assertTrue(np.allclose(loc, M.predict(D, best, D.val_idx)))
+        m0 = rec.fit(D, idx, data["zbar"], 0, 0.0, False, 5, 1)
+        c0, g0 = rec.scorer(D, data, m0, idx, "minimal")(D.val_idx)
+        self.assertTrue(np.isfinite(c0).all() and np.isfinite(g0).all())
+        z = data["z"][D.val_idx[:5]]
+        pr = M.predict(D, best, D.val_idx[:5])
+        self.assertTrue(np.allclose(rec.lpd(z, pr, np.full(5, 0.3)), rec.lpd(z, pr, 0.3)))
+        out = rec.procedure(D, data, "a", 1, [0.05], 8, 41, fitter="registered")
+        self.assertEqual({c["start"] for c in out["candidates"] if c["rank"]} <= {"warm", "cold"}, True)
+        self.assertEqual(out["score"], rec.SCORE)
+        self.assertTrue(out["decision"]["available"])
+        for c in out["candidates"]:
+            self.assertTrue({"val_lpd", "val_lpd_gauss", "test_lb", "test_lb_gauss", "qp"} <= set(c))
+            self.assertEqual(c["qp"]["unconverged"], 0)
+        best_c = max(out["candidates"], key=lambda c: c["val_lpd"])
+        self.assertEqual(out["selected"]["rank"], best_c["rank"])
+        self.assertEqual(out["test_lb"], best_c["test_lb"])
+        self.assertIn("selected_primary", out)
+        self.assertIn("gauss_diagnostic", out)
+        self.assertEqual(rec.REGISTERED_LAMBDAS, (0.01, 0.02, 0.05, 0.2))
 
 
 if __name__ == "__main__":
