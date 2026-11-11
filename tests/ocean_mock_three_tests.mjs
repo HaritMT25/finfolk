@@ -161,6 +161,10 @@ function recorder(rec, expect) {
           calls++;
           if (g.index) tris += g.index.count / 3 * inst;
           if (expect) expect(o, m, label);
+          /* the optimized session only: three calls a mesh's onBeforeRender just before its draw (the per-draw ring uniforms are set
+           * there); the reference session's recording does not, and keeps its committed digest */
+          if (rec.callBefore && o.onBeforeRender) o.onBeforeRender(this, scene, camera, g, m, null);
+          if (rec.callBefore && m.uniforms.uRingN) frame.rings.push([label, inst, m.uniforms.uRingN.value, m.uniforms.uHalfRing.value, Array.from(m.uniforms.uRingT.value).slice(0, m.uniforms.uRingN.value).join()]);
           const un = Object.keys(m.uniforms).sort();
           frame.draws.push([label, H(m.vertexShader), H(m.fragmentShader), m.transparent, m.depthWrite, m.depthFunc, m.side, m.blending, inst, range,
                             H(JSON.stringify(un.map((k) => [k, ser(m.uniforms[k].value)])))]);
@@ -281,6 +285,7 @@ async function side(web, tag, opts) {
   }
   async function frame(w, sel) {
     const f = { n: fr, draws: [], uploads: [], programs: [] };
+    if (rec.callBefore) f.rings = [];
     R.begin(f);
     for (const k of Object.keys(counts)) delete counts[k];
     scene.render(snap(w), { animT: fr * 0.016, selIdx: sel === undefined ? -1 : sel, dtSim: 0.032 });
@@ -304,6 +309,87 @@ async function side(web, tag, opts) {
     const after = scene.renderOptimization();
     const refOk = await scene.setRenderOptimization({ lod: "quality", decoded: false, barbels: "body" });
     Object.assign(out, { s0, refused, refusedD, refusedB, after, refOk, final: scene.renderOptimization() });
+    return out;
+  }
+  if (opts.session === "buckets") {
+    /* the optimized body draws (policy lod: screen / medium / coarse) through the real scene: after each scripted state, the last
+     * frame's batches and draws against the canonical staging and the snapshot (every fish in exactly one body draw, the fish's own
+     * 21 floats in the batch, the shadow draw whole and in snapshot order, each draw's ring uniforms its own template's) */
+    rec.callBefore = true;
+    const app = World(300, 0, true, 1), N = 300, rep = [];
+    const EA = ctx.EvoAppearance, ringStr = (lod) => Array.from(new Float32Array(EA.buildTemplate(lod).ringT)).join();
+    const RING = { coarse: [EA.buildTemplate("coarse").ringT.length, ringStr("coarse")], medium: [EA.buildTemplate("medium").ringT.length, ringStr("medium")] };
+    function inspect(tag, o) {
+      o = o || {};
+      const f = frames[frames.length - 1], st = scene.renderOptimization(), b = st.batches, q = scene.quality(), P = [];
+      const res = { tag, quality: q, eff: st.effective, buckets: st.buckets, problems: P, rings: f.rings };
+      const by = {};
+      f.rings.forEach((r) => { (by[r[0].split("#")[0]] = by[r[0].split("#")[0]] || []).push(r); });
+      const canonSlots = scene.geneSlots();
+      if (!canonSlots || canonSlots.length !== N || canonSlots.some((s, i) => s !== i)) P.push("the canonical gene slots are not the snapshot's (identity): " + String(canonSlots && canonSlots.slice(0, 5)));
+      const shadow = (by.fishShadow || []).map((r) => [r[1], r[2], r[4]].join("|")).join(";"), wantTpl = q >= 3 ? "medium" : "coarse";
+      if (shadow !== [N, RING[wantTpl][0], RING[wantTpl][1]].join("|")) P.push("the shadow draw is not one draw of every fish on the " + wantTpl + " template's rings: " + shadow);
+      if (!st.buckets) {   /* the canonical body draw: one draw of every fish (and the barbels) on the quality's template */
+        /* one draw of every fish on the quality's template (with the lit split on, also the lit fish's own draw, on the same rings) */
+        const bodies = (by.fishBody || []).map((r) => [r[1], r[2], r[4]].join("|"));
+        if (bodies.indexOf([N, RING[wantTpl][0], RING[wantTpl][1]].join("|")) < 0 || (bodies.length > 1 && !o.split)) P.push("the canonical body draw: " + bodies.join(";"));
+        res.barbels = (by.barbels || []).reduce((s, r) => s + r[1], 0);
+        return res;
+      }
+      const seen = new Uint8Array(N), nb = { coarse: b.coarse.n, medium: b.medium.n };
+      if (nb.coarse + nb.medium !== N) P.push("the buckets hold " + (nb.coarse + nb.medium) + " fish, not " + N);
+      for (const k of ["coarse", "medium"]) {
+        const B = b[k];
+        for (let j = 0; j < B.n; j++) {
+          const c = B.drawIdx[j];
+          if (seen[c]) P.push("fish " + c + " is in two buckets"); seen[c] = 1;
+          if (j && B.drawIdx[j - 1] >= c) P.push(k + " bucket is not in snapshot order at " + j);
+          for (const a of ["iA", "iB", "iC", "iBody", "iX"]) for (let t = 0; t < 4; t++) if (B.attrs[a].array[4 * j + t] !== b.canon[a].array[4 * c + t]) P.push(k + "[" + j + "]." + a + "[" + t + "] differs from fish " + c);
+          if (B.attrs.iGeneSlot.array[j] !== b.canon.iGeneSlot.array[c]) P.push(k + "[" + j + "] has the wrong gene slot");
+        }
+      }
+      if (seen.some((x) => !x)) P.push("a fish is in no bucket");
+      const bodies = (by.fishBody || []).map((r) => [r[1], r[2], r[4]].join("|")).sort().join(";");
+      const want = ["coarse", "medium"].filter((k) => nb[k] > 0).map((k) => [nb[k], RING[k][0], RING[k][1]].join("|")).sort().join(";");
+      if (bodies !== want) P.push("the body draws " + bodies + " are not the buckets' " + want);
+      const barbs = (by.barbels || []).map((r) => [r[1], r[2], r[4]].join("|")).join(";");
+      const wantB = st.buckets.barbels > 0 ? [st.buckets.barbels, RING.medium[0], RING.medium[1]].join("|") : "";
+      if (barbs !== wantB) P.push("the barbel draw " + barbs + " is not " + wantB);
+      res.nb = nb; res.medium = Array.from(b.medium.drawIdx); res.barbels = st.buckets.barbels;
+      if (process.env.MOCK_DEBUG) {
+        const pc = scene.poseCamera(), G = { view: pc.view, focal: pc.focalCss, near: pc.near, halfW: pc.halfW, halfH: pc.halfH }, pxs = [];
+        for (let i = 0; i < N; i++) { const p = scene.poseOf(i), xs = [], ys = []; for (let k = 0; k < 6; k++) { xs.push(p.spine[2 * k]); ys.push(p.spine[2 * k + 1]); } pxs.push(S0.posePx(xs, ys, p.R, p.y, G)); }
+        pxs.sort((a, b) => a - b);
+        console.log("    [debug] " + tag + ": focal " + pc.focalCss.toFixed(1) + ", px min " + pxs[0].toFixed(2) + " median " + pxs[150].toFixed(2) + " max " + pxs[299].toFixed(2) + "; " + pxs.filter((x) => x >= 7).length + " >= 7");
+      }
+      return res;
+    }
+    const run = async (tag, k, w, sel, camera, o) => { for (let i = 0; i < k; i++) { if (camera) camera(); await frame(w, sel); } const r = inspect(tag, o); rep.push(r); return r; };
+    scene.setAppearance(true);
+    await run("whole, screen, q3", 4, app);
+    await run("close to fish 5, screen, q3", 6, app, 5, () => close(app, 5));
+    scene.resetView(false);
+    await scene.setRenderOptimization({ lod: "quality" });
+    await run("whole, quality (canonical)", 3, app);
+    await scene.setRenderOptimization({ lod: "medium" });
+    await run("forced medium", 3, app);
+    await scene.setRenderOptimization({ lod: "coarse" });
+    await run("forced coarse", 3, app);
+    await scene.setRenderOptimization({ lod: "screen" });
+    scene.setQuality(2);
+    await run("close, screen, q2 (all coarse)", 4, app, 5, () => close(app, 5));
+    scene.setQuality(3);
+    scene.resetView(false);
+    await run("whole, fish 7 selected (pinned medium)", 4, app, 7);
+    scene.setLitSplit(true);
+    await run("lit split on: the reference draws", 4, app, 5, () => close(app, 5), { split: true });
+    scene.setLitSplit(false);
+    await run("lit split off again: buckets", 4, app, 5, () => close(app, 5));
+    await scene.setRenderOptimization({ barbels: "off" });
+    await run("barbels off", 4, app, 5, () => close(app, 5));
+    await scene.setRenderOptimization({ lod: "quality", barbels: "off" });
+    await run("barbels off, quality", 3, app, 5, () => close(app, 5));
+    Object.assign(out, { rep, logs: logs.slice() });
     return out;
   }
   if (opts.session === "contextLoss") {
@@ -452,6 +538,28 @@ console.log("== the render optimization's policy (scene.setRenderOptimization)")
   ok(P.s0.enabled === true && P.refused.ok === false && P.refusedD.ok === false && P.refusedB.ok === false && same(P.after.requested, P.s0.requested) && same(P.after.effective, P.s0.effective),
      "a bad policy value is refused, naming it, and changes nothing", { refused: P.refused.error, refusedD: P.refusedD.error, refusedB: P.refusedB.error });
   ok(P.refOk.ok === true && same(P.refOk.effective, { lod: "quality", decoded: false, barbels: "body" }) && P.final.failures.length === 0, "the reference policy can always be set", P.refOk);
+}
+console.log("== the optimized body draws (policy lod) through the real scene");
+{
+  const B = await side(WEB, "buckets", { session: "buckets", optimized: true });
+  const rep = B.rep, by = (t) => rep.find((r) => r.tag === t) || { problems: ["no such state " + t] };
+  ok(rep.length >= 10 && rep.every((r) => r.problems.length === 0), "every scripted state: every fish in exactly one body draw (snapshot order within it), the batch holds the fish's own 21 floats, the shadow is one whole draw, every draw's rings are its template's (" + rep.length + " states)", rep.filter((r) => r.problems.length).map((r) => [r.tag, r.problems.slice(0, 3)]));
+  ok(B.bad.length === 0 && B.binds() > 0, "  every bucket mesh drew the programs of the variant it was bound (" + B.binds() + " fish draws)", B.bad.slice(0, 2));
+  ok(B.logs.length === 0, "  and the console said nothing", B.logs.slice(0, 3));
+  const w = by("whole, screen, q3"), c = by("close to fish 5, screen, q3");
+  ok(w.buckets && w.buckets.medium === 0 && w.buckets.coarse === 300 && w.buckets.barbels === 0, "a whole-tank view: every fish coarse, no barbel draw (no medium fish)", w.buckets);
+  ok(c.buckets && c.medium.indexOf(5) >= 0 && c.buckets.medium >= 1 && c.buckets.medium < 150 && c.buckets.coarse + c.buckets.medium === 300 && c.buckets.barbels === c.buckets.medium,
+     "close to one fish: it is medium, most of the tank coarse (" + (c.buckets && c.buckets.medium) + " medium); barbel strips for the medium fish (reference policy)", c.buckets);
+  ok(by("whole, quality (canonical)").buckets === null && by("whole, quality (canonical)").barbels === 300, "lod \"quality\": the canonical body and barbel draws of every fish, as the reference draws them", by("whole, quality (canonical)").barbels);
+  const fm = by("forced medium"), fc = by("forced coarse");
+  ok(fm.buckets && fm.buckets.medium === 300 && fm.buckets.coarse === 0 && fm.buckets.barbels === 300, "lod \"medium\": every fish in the medium bucket (and its barbels)", fm.buckets);
+  ok(fc.buckets && fc.buckets.coarse === 300 && fc.buckets.medium === 0 && fc.buckets.barbels === 0, "lod \"coarse\": every fish in the coarse bucket, no barbels", fc.buckets);
+  const q2 = by("close, screen, q2 (all coarse)");
+  ok(q2.buckets && q2.buckets.medium === 0 && q2.buckets.coarse === 300, "detail 2 close to a fish: every body coarse (the screen LOD never raises detail past the setting)", q2.buckets);
+  const pin = by("whole, fish 7 selected (pinned medium)");
+  ok(pin.buckets && pin.medium.join() === "7", "a selected fish is medium wherever it is (pinned), the rest of the whole view coarse", pin.medium);
+  ok(by("lit split on: the reference draws").buckets === null && by("lit split off again: buckets").buckets !== null, "the lit split is drawn by the reference pipeline: no buckets while it is on, buckets again once off");
+  ok(by("barbels off").buckets && by("barbels off").buckets.barbels === 0 && by("barbels off, quality").barbels === 0, "barbels \"off\": no barbel draw, under buckets or the canonical draws");
 }
 console.log("== a WebGL context loss during the prewarm (#50's review, P2)");
 {
