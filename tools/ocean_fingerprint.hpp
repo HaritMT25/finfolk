@@ -276,7 +276,9 @@ struct OceanWorld_ : WorldCommon {
 #ifdef EVO_OCEAN_PROF
     OceanWorld::OceanProf oprof;   // wall clock
 #endif
-    SpatialGrid creatureGrid; OceanFoodGrid foodGrid; std::vector<FishHot_> hot; std::vector<Pending_> pending;
+    SpatialGrid creatureGrid; OceanFoodGrid foodGrid; std::vector<FishHot_> hot;
+    std::vector<int> advectIdx;   // scratch: wallTransportFood's live-item list, rebuilt every call
+    std::vector<Pending_> pending;
     std::vector<int> neighbors, nearbyFood, nearby, near;
     std::vector<int> foodSeen;   // scratch (see above)
     CurrentField current; std::vector<Vec2> patches; std::vector<float> patchDepth;

@@ -1241,6 +1241,7 @@ private:
     SpatialGrid creatureGrid_;
     OceanFoodGrid foodGrid_;   // SpatialGrid's layout and queries + each item's depth / size / eyeCon
     std::vector<FishHot> hot_;
+    std::vector<int> advectIdx_;   // wallTransportFood's live items, reused
     std::vector<PendingSignal> pending_;
     std::vector<int> neighbors_, nearbyFood_, nearby_, near_;
     std::vector<FoodSeen> foodSeen_;   // foodWithin's list (scratch, one fish at a time)
@@ -1830,6 +1831,107 @@ private:
         return U;
     }
 
+    // ---- glass walls, four points at once (wallAdvect4) -----------------------
+    typedef int v4i __attribute__((vector_size(16)));
+    static oceanflow::v4f sel4(v4i m, oceanflow::v4f a, oceanflow::v4f b) {   // m's lane all ones: a, else b (on the bits)
+        return (oceanflow::v4f)((m & (v4i)a) | (~m & (v4i)b));
+    }
+    // mirrorFold per lane; every lane already in [0, L] is returned as it is.
+    static oceanflow::v4f fold4(oceanflow::v4f q, float L) {
+        using oceanflow::v4f;
+        const v4i in = (q >= splat4(0.0f)) & (q <= splat4(L));
+        if (in[0] & in[1] & in[2] & in[3]) return q;
+        v4f r;
+        for (int l = 0; l < 4; ++l) r[l] = mirrorFold(q[l], L);
+        return r;
+    }
+    static oceanflow::v4f splat4(float x) { return oceanflow::v4f{x, x, x, x}; }
+    // smooth01 / smooth01d, per lane (std::clamp's own two comparisons).
+    static oceanflow::v4f smooth01v(oceanflow::v4f r) {
+        using oceanflow::v4f;
+        r = sel4(r < splat4(0.0f), splat4(0.0f), sel4(splat4(1.0f) < r, splat4(1.0f), r));
+        return r * r * (splat4(3.0f) - splat4(2.0f) * r);
+    }
+    static oceanflow::v4f smooth01dv(oceanflow::v4f r) {
+        using oceanflow::v4f;
+        r = sel4(r < splat4(0.0f), splat4(0.0f), sel4(splat4(1.0f) < r, splat4(1.0f), r));
+        return splat4(6.0f) * r * (splat4(1.0f) - r);
+    }
+    static void wallTaper4(oceanflow::v4f q, float L, float b, oceanflow::v4f& chi, oceanflow::v4f& dchi) {
+        using oceanflow::v4f;
+        const v4f r1 = q / splat4(b), r2 = (splat4(L) - q) / splat4(b);
+        const v4f s1 = smooth01v(r1), s2 = smooth01v(r2);
+        chi = s1 * s2;
+        dchi = (smooth01dv(r1) * s2 - s1 * smooth01dv(r2)) / splat4(b);
+    }
+    // wallCurrent for four points: (x, y) per lane.
+    void wallCurrent4(oceanflow::v4f px, oceanflow::v4f py, oceanflow::v4f& outx, oceanflow::v4f& outy) const {
+        using oceanflow::v4f;
+        if (!current_.active()) { outx = splat4(0.0f); outy = splat4(0.0f); return; }
+        v4f Cx = splat4(0.0f), Cy = splat4(0.0f), psi = splat4(0.0f);
+        if (flow_.curOn) {
+            const float inv2c2 = flow_.inv2c2;
+            const float* E = oceanflow::radialTable().E;
+            const float* G = oceanflow::radialIntTable().G;
+            const v4f EN = splat4(E[oceanflow::kRadialCells]);
+            for (std::size_t k = 0; k < flow_.eddies.size(); ++k) {
+                const oceanflow::Eddy& e = flow_.eddies[k];
+                const v4f dx = px - splat4(e.cx);
+                const v4f dy = py - splat4(e.cy);
+                const v4f u = (dx * dx + dy * dy) * splat4(inv2c2);
+                // radialPsi per lane: a lane it refuses keeps its sums (the scalar's continue)
+                const v4i ok = (u >= splat4(0.0f)) & (u < splat4(oceanflow::kRadialCut));
+                const v4f s = sel4(ok, u * splat4(oceanflow::kRadialPerUnit), splat4(0.0f));
+                const v4i i = __builtin_convertvector(s, v4i);
+                const v4f t = s - __builtin_convertvector(i, v4f);
+                const v4f Ei = {E[i[0]], E[i[1]], E[i[2]], E[i[3]]};
+                const v4f Ei1 = {E[i[0] + 1], E[i[1] + 1], E[i[2] + 1], E[i[3] + 1]};
+                const v4f Gi = {G[i[0]], G[i[1]], G[i[2]], G[i[3]]};
+                const v4f de = Ei1 - Ei;
+                const v4f g = (Ei + t * de) - EN;
+                const v4f Gu = Gi + (t * ((Ei - EN) + (splat4(0.5f) * t) * de)) * splat4(1.0f / oceanflow::kRadialPerUnit);
+                const v4f f = splat4(e.signScale) * g;
+                Cx = sel4(ok, Cx + f * (-dy), Cx);
+                Cy = sel4(ok, Cy + f * dx, Cy);
+                psi = sel4(ok, psi + splat4(flow_.psiScale[k]) * Gu, psi);
+            }
+        } else {   // the double gyre: CurrentField's own evaluators, per lane
+            for (int l = 0; l < 4; ++l) {
+                const Vec2 c = current_.velocityAt({px[l], py[l]});
+                Cx[l] = c.x; Cy[l] = c.y;
+                psi[l] = current_.gyreStreamAt({px[l], py[l]});
+            }
+        }
+        v4f cx, dcx, cy, dcy;
+        wallTaper4(px, (float)width, flow_.wallBc, cx, dcx);
+        wallTaper4(py, (float)height, flow_.wallBc, cy, dcy);
+        const v4f Q = cx * cy, Qx = dcx * cy, Qy = cx * dcy;
+        outx = Q * Cx - psi * Qy;
+        outy = Q * Cy + psi * Qx;
+    }
+    // wallFlowFast for four points.
+    void wallFlowFast4(oceanflow::v4f px, oceanflow::v4f py, oceanflow::v4f pd,
+                       oceanflow::v4f& ux, oceanflow::v4f& uy, oceanflow::v4f& ud) const {
+        using oceanflow::v4f;
+        // wallCurrentFlow: the current × the deep factor (1 exactly without deepCurrent)
+        v4f cx, cy;
+        wallCurrent4(px, py, cx, cy);
+        const v4f f = ocfg.deepCurrent ? smooth01v(splat4(2.0f) * pd / splat4(D)) : splat4(1.0f);
+        ux = f * cx; uy = f * cy; ud = splat4(0.0f);
+        if (!current_.active()) { ux = splat4(0.0f); uy = splat4(0.0f); }
+        if (wavesOn()) {
+            for (int l = 0; l < 4; ++l) {
+                const Vec2 pl = {px[l], py[l]};
+                Flow u[kWaveTrains];
+                if (!wallWavesTable(pl, pd[l], u))
+                    for (int i = 0; i < kWaveTrains; ++i) u[i] = wallTrainExactAt(i, pl, pd[l]);
+                float x = ux[l], y = uy[l], z = ud[l];
+                for (int i = 0; i < kWaveTrains; ++i) { x += u[i].x; y += u[i].y; z += u[i].d; }
+                ux[l] = x; uy[l] = y; ud[l] = z;
+            }
+        }
+    }
+
     // ---- glass walls: movement, contact, placement (no draws) --------------
     // The side-wall soft turn (fish and predators): inside sideWallBand of a
     // side face (each band capped at half the side), a heading h that points
@@ -1947,8 +2049,31 @@ private:
     static constexpr int kWallFoodMaxSubsteps = 16;
     void wallTransportFood(float dt) {
         const FoodSteps fs = wallFoodSteps(dt);
-        for (auto& f : food) {
-            if (!f.alive) continue;
+        // Four live items at a time through wallAdvect4 (each item's transport
+        // is its own: the flow is frozen for the step and nothing else is read,
+        // so the grouping and the order change no item's bits), the rest one
+        // by one through wallAdvect.
+        std::vector<int>& idx = advectIdx_;
+        idx.clear();
+        for (int i = 0; i < (int)food.size(); ++i) if (food[i].alive) idx.push_back(i);
+        const int n4 = (int)idx.size() & ~3;
+        for (int j = 0; j < n4; j += 4) {
+            Vec2 p[4]; float d[4];
+            for (int l = 0; l < 4; ++l) { p[l] = food[idx[j + l]].pos; d[l] = food[idx[j + l]].depth; }
+            wallAdvect4(p, d, fs.dt, fs.n);
+            for (int l = 0; l < 4; ++l) {
+                OceanFood& f = food[idx[j + l]];
+#ifdef EVO_OCEAN_EYE
+                const float z0 = f.depth;
+#endif
+                f.pos = p[l]; f.depth = d[l];
+#ifdef EVO_OCEAN_EYE
+                if (f.depth != z0) f.eyeCon = ocean::eyeContrast(ocean::kEyeFoodBright, f.depth);   // no draws
+#endif
+            }
+        }
+        for (int j = n4; j < (int)idx.size(); ++j) {
+            OceanFood& f = food[idx[j]];
 #ifdef EVO_OCEAN_EYE
             const float z0 = f.depth;
 #endif
@@ -1991,6 +2116,32 @@ public:
             p = {mirrorFold(p.x + h * U2.x, W), mirrorFold(p.y + h * U2.y, H)};
             d = mirrorFold(d + h * U2.d, D);
         }
+    }
+    // Four particles through wallAdvect's midpoint step at once, each lane
+    // wallAdvect's result bit for bit (tests "wall_advect4"): the current (the
+    // eddy sum, the wall tapers, the deep factor), the half and full steps and
+    // the folds are evaluated lane-wise (oceanflow::v4f: the same IEEE
+    // operation per lane as the scalar expression, a select where the scalar
+    // branches, a lane's table index clamped where the scalar would have
+    // skipped it), the wave trains per item by the very wallWavesTable /
+    // wallTrainExactAt, and the sums U = current + train 0 + train 1 + train 2
+    // in that order. A fold outside [0, L] takes the scalar mirrorFold per lane.
+    void wallAdvect4(Vec2 p[4], float d[4], float dt, int n) const {
+        using oceanflow::v4f;
+        using oceanflow::splat;
+        const float W = (float)width, H = (float)height;
+        const float h = dt / (float)n, hh = 0.5f * h;
+        v4f px = {p[0].x, p[1].x, p[2].x, p[3].x}, py = {p[0].y, p[1].y, p[2].y, p[3].y};
+        v4f pd = {d[0], d[1], d[2], d[3]};
+        for (int k = 0; k < n; ++k) {
+            v4f u1x, u1y, u1d;
+            wallFlowFast4(px, py, pd, u1x, u1y, u1d);
+            const v4f mx = fold4(px + splat(hh) * u1x, W), my = fold4(py + splat(hh) * u1y, H), md = fold4(pd + splat(hh) * u1d, D);
+            v4f u2x, u2y, u2d;
+            wallFlowFast4(mx, my, md, u2x, u2y, u2d);
+            px = fold4(px + splat(h) * u2x, W); py = fold4(py + splat(h) * u2y, H); pd = fold4(pd + splat(h) * u2d, D);
+        }
+        for (int l = 0; l < 4; ++l) { p[l] = {px[l], py[l]}; d[l] = pd[l]; }
     }
     bool wallFlowOn() const { return ocfg.walls && (current_.active() || wavesOn()); }
     int wallFoodSubstepsNow(float dt) const { return wallFoodSteps(dt).n; }   // (tests)

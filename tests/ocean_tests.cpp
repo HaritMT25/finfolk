@@ -5008,6 +5008,7 @@ int main(int argc, char** argv) {
     ot::testWallContainment();
     ot::testWallPlacement();
     ot::testWallTransport();
+    ot::testWallAdvect4();
     ot::testWallWavesOff();
     ot::testWallEddy();
     ot::testWallSensing();
