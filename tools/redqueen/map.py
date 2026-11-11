@@ -1006,8 +1006,9 @@ def pred_count_lpd(D, m, idx, cnt, N, own=None, info=None):
           * range: if an end node carries more than 1e-10 of the integral (the integrand still rises at the edge,
             e.g. a count beyond the link's asymptote), the pair's range doubles, up to +-56 SDs;
         a pair failing a check on the largest grid or range keeps that value and is counted as grid_unresolved
-        (reported, never hidden); a pair whose rule needs more than the largest grid is computed there, checked,
-        and counted in beyond_rule.
+        (a finite but UNRESOLVED score: reported, never hidden, and the callers' comparisons (recovery.py) refuse
+        to decide on it); a pair whose rule needs more than the largest grid, in its initial range or in an
+        extended one (Codex #66 r5 P2-2), is computed there, checked, and counted ONCE in beyond_rule.
       - any non-finite result is REFUSED (ValueError): it never reaches a model comparison.
     info (a dict): the counts per case are added to it (pairs, plain, exact, grid, refined, extended,
     beyond_rule, grid_unresolved) with the largest accepted check difference (max_check)."""
@@ -1036,7 +1037,8 @@ def pred_count_lpd(D, m, idx, cnt, N, own=None, info=None):
         need0 = np.ceil(2 * TRAP_SD * sd[q] / np.maximum(h, 1e-300)) + 1          # (nodes at span 1)
         top = len(TRAP_KS) - 1
         bucket = np.searchsorted(TRAP_KS, need0)
-        st["beyond_rule"] = int((bucket > top).sum())
+        beyond = np.zeros(len(eta), bool)                         # (pairs whose rule exceeded the largest grid, once)
+        beyond[q[bucket > top]] = True
         cur, cb, cs, n0 = q, np.minimum(bucket, top), np.ones(len(q)), need0
         while len(cur):
             nxt = []
@@ -1062,6 +1064,8 @@ def pred_count_lpd(D, m, idx, cnt, N, own=None, info=None):
                         if fin[i] and not edge_ok[i] and s_ < TRAP_SPAN_MAX:          # (extend the range)
                             s2_ = 2 * s_
                             nb2 = max(int(b), int(np.searchsorted(TRAP_KS, nr_[i] * s2_)))
+                            if nb2 > top:                                     # (the extended range's rule is beyond
+                                beyond[r_[i]] = True                          #  the cap: counted, Codex #66 r5 P2-2)
                             nxt.append((r_[i], min(nb2, top), s2_, nr_[i]))
                             st["extended"] += 1
                         elif fin[i] and not res_ok[i] and b < top:                    # (refine the grid)
@@ -1074,6 +1078,7 @@ def pred_count_lpd(D, m, idx, cnt, N, own=None, info=None):
             cb = np.array([t[1] for t in nxt], int)
             cs = np.array([t[2] for t in nxt], float)
             n0 = np.array([t[3] for t in nxt], float)
+        st["beyond_rule"] = int(beyond.sum())
     bad = ~np.isfinite(out)
     if bad.any():
         raise ValueError(f"pred_count_lpd: {int(bad.sum())} non-finite count scores: refused (never compared)")

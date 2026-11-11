@@ -26,7 +26,9 @@ H.9.2 at the fit's predictive location and latent variance, map.pred_var; the mi
 training residual variance). Validation selection and the test decision use it; the Gaussian working
 density at the empirical logits (the reg1-reg5 score) is kept per candidate as a labelled diagnostic
 (*_gauss). A decision needs at least two contributing test-root worlds (D6 rule 27), else it is
-recorded unavailable.
+recorded unavailable; so is a comparison (the selection, the test, the snapshot, the forward tests) that contains a
+finite but UNRESOLVED count score (map.pred_count_lpd's grid_unresolved; Codex #66 r5 P2-1): both models'
+integration diagnostics are kept beside it and it never silently decides.
 
 THE QUESTION (v4 §6.5, the review's must-fix 1): on the exact post-split graph (graph.py), with
 shared row / column / cell noise, is rank > 0 specificity recoverable by the registered selection
@@ -700,6 +702,18 @@ def class_accuracy(D, data, m1, m0):
 PRIMARY_RANKS = 2      # (v4 amendment proposed 2026-11-07: the primary confirmatory rank set is {0, 1, 2})
 MIN_TEST_ROOTS = 2     # (Annex H D6 rule 27: the crossed bound / a prediction decision needs at least two contributing test roots)
 MIN_TEST_WORLDS = MIN_TEST_ROOTS
+
+
+def _flagged(*infos):
+    """Pairs whose count score is FINITE BUT UNRESOLVED (map.pred_count_lpd's grid_unresolved: a check failed on
+    the largest grid or range), summed over integration diagnostics (None / {}: none). A comparison that
+    contains one is never decided on it (Codex #66 r5 P2-1)."""
+    return int(sum(int((i or {}).get("grid_unresolved", 0)) for i in infos))
+
+
+def _unresolved_why(n, where):
+    return (f"{n} pair score(s) UNRESOLVED by the count integral (grid_unresolved; {where}): finite but not "
+            "checked to tolerance, so the comparison is not decided")
 FORWARD_TMAX = 120     # (v4 §7.3: the forward fit's main outcomes and controls through 120M)
 SCORE = {"decision": "capture-count lpd per replicate observation (map.pred_count_lpd: Annex H.9.2's rounded "
                      "logit-normal at G(eta + e), e ~ N(0, posterior + pair-residual variance) integrated inside the "
@@ -781,11 +795,22 @@ def procedure(D, data, option, ranks, lambdas, iters, seed, ab_cap=None, fitter=
     m1, sc1, tc1, tg1 = models[sel]
     m0, sc0, tc0, tg0 = models[(0, 0.0)]
     nw = int(len(np.unique(D.test_world)))
-    avail = nw >= MIN_TEST_WORLDS
+    rec0 = out["candidates"][0]
+    # Codex #66 r5 P2-1: a finite UNRESOLVED score (grid_unresolved) never silently decides. The selection reads every
+    # candidate's validation scores; a comparison reads its two models' test (or snapshot) scores. Each flagged
+    # comparison is reported unresolved: its improvement and bound are withheld and its success is False.
+    unres_val = _flagged(*(c["integration"]["validation"] for c in out["candidates"]))
+    pair_inf = [best["integration"]["test"]] + ([rec0["integration"]["test"]] if best is not rec0 else [])
+    unres_test = _flagged(*pair_inf)
+    avail = nw >= MIN_TEST_WORLDS and not (unres_val or unres_test)
     tw = (D.test_world, D.test_qworld, D.test_pworld)
     for rec in out["candidates"]:      # (every candidate against rank 0: any restricted selection, post hoc)
         _, _, tck, tgk = models[(rec["rank"], rec["lambda"])]
         rec["test_improvement"], rec["test_lb"], _ = _bounded(tck - tc0, *tw, seed + 7)
+        rec["integration_unresolved"] = _flagged(rec["integration"]["test"],
+                                                 *([rec0["integration"]["test"]] if rec is not rec0 else []))
+        if rec["integration_unresolved"]:
+            rec["test_improvement"] = rec["test_lb"] = None
         rec["test_improvement_gauss"], rec["test_lb_gauss"], _ = _bounded(tgk - tg0, *tw, seed + 7)
 
     def ok(rank, lb):
@@ -796,12 +821,19 @@ def procedure(D, data, option, ranks, lambdas, iters, seed, ab_cap=None, fitter=
                                "test_improvement": prim["test_improvement"],
                                "test_lb": prim["test_lb"], "success": ok(prim["rank"], prim["test_lb"])}
     mean, lb, per = _bounded(tc1 - tc0, *tw, seed + 7)
+    if unres_test:
+        mean = lb = None
+        per = []
     gbest = max(out["candidates"], key=lambda c: c["val_lpd_gauss"])
+    si1, si0 = {}, {}
     if len(D.stest_idx):
-        (s1c, s1g), (s0c, s0g) = sc1(D.stest_idx), sc0(D.stest_idx)
+        (s1c, s1g), (s0c, s0g) = sc1(D.stest_idx, si1), sc0(D.stest_idx, si0)
         snap, snap_g = float((s1c - s0c).mean()), float((s1g - s0g).mean())
     else:
         snap = snap_g = None
+    unres_snap = _flagged(si1, *([si0] if sel != (0, 0.0) else []))
+    if unres_snap:
+        snap = None
     if sel[0] > 0:
         trn = D.fit[option]
         qn = np.unique(D.qi[trn])
@@ -812,7 +844,14 @@ def procedure(D, data, option, ranks, lambdas, iters, seed, ab_cap=None, fitter=
     out.update(selected={"rank": sel[0], "lambda": sel[1], "start": best["start"]}, test_improvement=mean,
                test_lb=lb, per_test_world=per, success=ok(sel[0], lb),
                decision={"available": avail, "test_worlds": nw,
-                         "reason": None if avail else f"fewer than {MIN_TEST_WORLDS} contributing test worlds"},
+                         "reason": (None if avail else
+                                    f"fewer than {MIN_TEST_WORLDS} contributing test worlds" if nw < MIN_TEST_WORLDS else
+                                    _unresolved_why(unres_val + unres_test,
+                                                    f"{unres_val} in validation, {unres_test} in the test comparison"))},
+               integration_comparison={"selected": best["integration"]["test"], "rank0": rec0["integration"]["test"],
+                                       "snapshot": {"selected": si1, "rank0": si0},
+                                       "unresolved": {"validation": unres_val, "test": unres_test,
+                                                      "snapshot": unres_snap}},
                gauss_diagnostic={"selected": {"rank": gbest["rank"], "lambda": gbest["lambda"]},
                                  "test_improvement": gbest["test_improvement_gauss"],
                                  "test_lb": gbest["test_lb_gauss"], "success": ok(gbest["rank"], gbest["test_lb_gauss"])},
@@ -857,11 +896,14 @@ def forward_procedure(D, data, ranks, lambdas, iters, seed, ab_cap=None, fitter=
     m1, sc1 = models[sel]
     m0, sc0 = models[(0, 0.0)]
     out["selected"] = {"rank": sel[0], "lambda": sel[1], "start": best["start"]}
+    unres_val = _flagged(*(c["integration"]["validation"] for c in out["candidates"]))      # (Codex #66 r5 P2-1)
+    out["integration_unresolved"] = {"validation": unres_val}
     for name, t in F["tests"].items():
         if not len(t):
             out[name] = {"available": False, "reason": "no targets"}
             continue
-        (c1, g1), (c0, g0) = sc1(t), sc0(t)
+        i1, i0 = {}, {}                                  # (the two models' integration diagnostics, kept)
+        (c1, g1), (c0, g0) = sc1(t, i1), sc0(t, i0)
         qw, pw = D.qw[D.qi[t]], D.pw[D.pj[t]]
         tw = np.where((qw >= 0) & (D.wsplit[np.maximum(qw, 0)] == ("test" if name == "intersection" else "train")),
                       qw, pw)
@@ -870,12 +912,24 @@ def forward_procedure(D, data, ranks, lambdas, iters, seed, ab_cap=None, fitter=
             out[name] = {"available": False, "targets": int(len(t)), "test_roots": nw,
                          "reason": f"fewer than {MIN_TEST_ROOTS} contributing test roots"}
             continue
+        unres_t = _flagged(i1, *([i0] if sel != (0, 0.0) else []))      # (Codex #66 r5 P2-1: finite but unresolved:
+                                                                         #  never decided)
+        if unres_t or unres_val:
+            out[name] = {"available": False, "integration_unresolved": unres_t + unres_val, "targets": int(len(t)),
+                         "worlds": nw, "integration": {"selected": i1, "rank0": i0},
+                         "reason": _unresolved_why(unres_t + unres_val,
+                                                   f"{unres_val} in validation, {unres_t} in this comparison")}
+            continue
         mean, lb, per = crossed_lb(c1 - c0, tw, qw, pw, np.random.default_rng(seed + 11 + len(name)))
         gmean, glb, _ = crossed_lb(g1 - g0, tw, qw, pw, np.random.default_rng(seed + 11 + len(name)))
         out[name] = {"available": True, "test_improvement": mean, "test_lb": lb, "per_world": per,
                      "success": bool(nw >= MIN_TEST_WORLDS and sel[0] > 0 and lb > 0), "targets": int(len(t)),
                      "worlds": nw, "decision_available": nw >= MIN_TEST_WORLDS,
+                     "integration": {"selected": i1, "rank0": i0}, "integration_unresolved": 0,
                      "test_improvement_gauss": gmean, "test_lb_gauss": glb}
+    ft = out["forward_transfer"]
+    out["decision"] = {"available": bool(ft.get("available") and ft.get("decision_available")),
+                       "reason": ft.get("reason")}
     out["success"] = out["forward_transfer"].get("success", False)
     out["test_improvement"] = out["forward_transfer"].get("test_improvement")
     out["test_lb"] = out["forward_transfer"].get("test_lb")
@@ -1230,6 +1284,8 @@ def summarize(d):
                     av = [o[b] for o in lst if (o.get(b) or {}).get("available")]
                     kb = sum(x["success"] for x in av)
                     cell["branches"][b] = {"available": len(av), "successes": kb,
+                                           "integration_unresolved": sum(
+                                               1 for o in lst if (o.get(b) or {}).get("integration_unresolved")),
                                            "rate": round(kb / len(av), 3) if av else None,
                                            "wilson95": wilson(kb, len(av)) if av else None,
                                            "mean_test_improvement": _mean(x["test_improvement"] for x in av),

@@ -820,6 +820,94 @@ class TestRecovery(unittest.TestCase):
         self.assertIn(out0["selected"]["rank"], (0, 1))
         self.assertIsInstance(out0["success"], bool)
 
+    def flag_scores(self, where):
+        """recovery.scorer wrapped so that a score of a set for which where(ix) holds ALSO reports one finite
+        UNRESOLVED pair (map.pred_count_lpd's grid_unresolved) in its integration diagnostics."""
+        import unittest.mock as mock
+        real = self.rec.scorer
+
+        def scorer(D, data, m, idx, fitter):
+            sc = real(D, data, m, idx, fitter)
+
+            def score(ix, info=None):
+                out = sc(ix, info)
+                if info is not None and where(ix):
+                    info["grid_unresolved"] = info.get("grid_unresolved", 0) + 1
+                return out
+            return score
+        return mock.patch.object(self.rec, "scorer", scorer)
+
+    def test_unresolved_scores_never_decide_procedure(self):
+        """r5 P2-1: a finite but unresolved score (grid_unresolved) in a selection (validation), a test or a
+        snapshot comparison is reported, and the comparison is not decided on it: unavailable with its reason,
+        no improvement or bound, success False; both models' diagnostics are kept beside the comparison."""
+        D, R = self.D, self.rec
+        data = R.simulate(D, dict(rank=1, energy=0.10), 13)
+        run = lambda: R.procedure(D, data, "a", 1, [0.1], 8, 13)        # noqa: E731
+        base = run()
+        self.assertTrue(base["decision"]["available"] and base["success"] and base["selected"]["rank"] == 1)
+        self.assertEqual(base["integration_comparison"]["unresolved"], {"validation": 0, "test": 0, "snapshot": 0})
+        self.assertEqual(set(base["integration_comparison"]), {"selected", "rank0", "snapshot", "unresolved"})
+        self.assertIsNotNone(base["snapshot_test_improvement"])
+        with self.flag_scores(lambda ix: ix is D.test_idx):
+            out = run()
+        self.assertFalse(out["decision"]["available"])
+        self.assertRegex(out["decision"]["reason"], "UNRESOLVED")
+        self.assertFalse(out["success"])
+        self.assertIsNone(out["test_improvement"])
+        self.assertIsNone(out["test_lb"])
+        self.assertFalse(out["selected_primary"]["success"])
+        self.assertEqual(out["integration_comparison"]["unresolved"]["test"], 2)       # (selected and rank 0)
+        self.assertEqual(out["integration_comparison"]["selected"]["grid_unresolved"], 1)
+        self.assertEqual(out["integration_comparison"]["rank0"]["grid_unresolved"], 1)
+        self.assertEqual(out["selected"], base["selected"])
+        for c in out["candidates"]:
+            self.assertIsNone(c["test_lb"])
+        with self.flag_scores(lambda ix: ix is D.stest_idx):                            # (the snapshot only)
+            out = run()
+        self.assertTrue(out["decision"]["available"] and out["success"])
+        self.assertIsNone(out["snapshot_test_improvement"])
+        self.assertEqual(out["integration_comparison"]["unresolved"]["snapshot"], 2)
+        self.assertEqual(out["integration_comparison"]["snapshot"]["selected"]["grid_unresolved"], 1)
+        self.assertIsNotNone(out["snapshot_test_improvement_gauss"])
+        with self.flag_scores(lambda ix: ix is D.val_idx):                              # (the selection)
+            out = run()
+        self.assertFalse(out["decision"]["available"])
+        self.assertFalse(out["success"])
+        self.assertGreater(out["integration_comparison"]["unresolved"]["validation"], 0)
+        self.assertIn("in validation", out["decision"]["reason"])
+
+    def test_unresolved_scores_never_decide_forward(self):
+        """r5 P2-1, the forward tests: a flagged score in a test set's two models (or in the validation
+        selection) makes that branch unavailable (reason, counts, both diagnostics), never a success."""
+        D, R = self.D, self.rec
+        data = R.simulate(D, dict(rank=1, energy=0.10), 17)
+        F = D.forward
+        run = lambda: R.forward_procedure(D, data, 1, [0.1], 6, 17)     # noqa: E731
+        base = run()
+        for k in ("forward_transfer", "intersection"):
+            self.assertTrue(base[k]["available"] and base[k]["integration_unresolved"] == 0, base[k])
+            self.assertEqual(set(base[k]["integration"]), {"selected", "rank0"})
+        self.assertTrue(base["decision"]["available"])
+        with self.flag_scores(lambda ix: ix is F["tests"]["forward_transfer"]):
+            out = run()
+        ft = out["forward_transfer"]
+        self.assertFalse(ft["available"])
+        self.assertRegex(ft["reason"], "UNRESOLVED")
+        self.assertEqual(ft["integration_unresolved"], 2 if base["selected"]["rank"] else 1)
+        self.assertEqual(ft["integration"]["selected"]["grid_unresolved"], 1)
+        self.assertTrue(out["intersection"]["available"])                               # (its own scores: fine)
+        self.assertFalse(out["success"])
+        self.assertFalse(out["decision"]["available"])
+        self.assertIsNone(out["test_lb"])
+        with self.flag_scores(lambda ix: ix is F["val"]):
+            out = run()
+        self.assertGreater(out["integration_unresolved"]["validation"], 0)
+        for k in ("forward_transfer", "intersection"):
+            self.assertFalse(out[k]["available"], k)
+            self.assertIn("in validation", out[k]["reason"])
+        self.assertFalse(out["success"])
+
     def test_conditioning(self):
         rep = self.rec.conditioning(self.D, 2, "a")
         self.assertIn("prey:world-test", rep)
@@ -1573,6 +1661,57 @@ class TestMap(unittest.TestCase):
         ref = float(np.mean(np.log(wq @ P)))
         self.assertAlmostEqual(float(got[0]), ref, delta=2e-3)
         self.assertEqual((inf["grid_unresolved"], inf["grid"]), (0, 1))
+
+    def test_unresolved_scores_flagged_and_beyond_rule_extended(self):
+        """r5 P2-1: the review's case (identity G, eta = 0, predictor SD 1000, a constant callable replicate SD
+        0.003, count 162/324): unresolved at the largest grid (spacing ~0.053, only the central node counts), yet
+        FINITE and about 1.4 nats above the exact convolution -- so it is flagged (grid_unresolved), and the
+        recovery scorer reports the flag to its callers. r5 P2-2: the bounded-link tail case with replicate SD
+        0.0003: the initial rule needs 239,318 nodes (within the cap), the extended range more than 478,000:
+        beyond_rule counts the pair once."""
+        import math
+        import types
+        M, N = self.M, self.rec.B_COUNT
+        Dx = types.SimpleNamespace(qi=np.zeros(1, int), pj=np.zeros(1, int))
+        kn = np.linspace(-1.0, 1.0, 4)
+
+        def model(sd_rep, sd_pred, link=None):
+            return {"surfC": M.Surface(kn, kn, ("inc", "dec")), "a": np.zeros(1), "b": np.zeros(1),
+                    "u": np.zeros((1, 0)), "v": np.zeros((1, 0)), "rank": 0, "covQ": np.zeros((1, 3, 3)),
+                    "covP": np.zeros((1, 2, 2)), "pair_var": sd_pred ** 2, "link": link or M.Link(),
+                    "phi": sd_rep ** 2, "var_fn": lambda p: np.ones_like(p)}
+        cnt = np.array([[162]])
+        mu = model(0.003, 1000.0)
+        exact = float(M.count_lpd(cnt, N, np.zeros(1), np.array([1000.0 ** 2 + 0.003 ** 2]))[0])
+        inf = {}
+        got = float(M.pred_count_lpd(Dx, mu, np.array([0]), cnt, N, info=inf)[0])
+        self.assertTrue(np.isfinite(got))
+        self.assertGreater(got - exact, 1.0)                                   # (about 1.4 nats too high)
+        self.assertLess(got - exact, 1.8)
+        self.assertEqual((inf["grid_unresolved"], inf["grid"]), (1, 0))
+        z = np.zeros((1, 1))
+        info = {}
+        self.rec.scorer(Dx, {"cnt": cnt, "z": z}, mu, np.array([0]), "registered")(np.array([0]), info)
+        self.assertEqual(info["grid_unresolved"], 1)                           # (the scorer surfaces it)
+        lk = M.Link(None, None, 0.02, 0.8)
+        mt = model(0.0003, 1.0, lk)
+        gmax = max(lk.max_slope(-M.TRAP_SD, M.TRAP_SD), 1e-12)
+        smin = math.sqrt(float(M._rep_var(mt, M.VMIN_GRID).min()))
+        need0 = math.ceil(2 * M.TRAP_SD / min(1.0, M.TRAP_H * smin / gmax)) + 1
+        self.assertEqual(need0, 239318)
+        self.assertLessEqual(need0, M.TRAP_KS[-1])                             # (the initial rule is within the cap)
+        self.assertGreater(2 * need0, M.TRAP_KS[-1])                           # (the extended range's rule is not)
+        inf = {}
+        got = float(M.pred_count_lpd(Dx, mt, np.array([0]), np.array([[324]]), N, info=inf)[0])
+        self.assertTrue(np.isfinite(got))
+        self.assertGreater(inf["extended"], 0)
+        self.assertEqual(inf["beyond_rule"], 1)                                # (once, not per extension)
+        self.assertEqual(inf["grid_unresolved"], 0)
+        ms = model(0.003, 1.0, lk)                                             # (rule within the cap in every range)
+        inf = {}
+        M.pred_count_lpd(Dx, ms, np.array([0]), np.array([[324]]), N, info=inf)
+        self.assertEqual((inf["beyond_rule"], inf["grid_unresolved"]), (0, 0))
+        self.assertGreater(inf["extended"], 0)
 
     def test_pair_variance_safeguarded(self):
         """r3 P2-2: the review's cycle. One cell (s2 0.01, r^2 1.01) and 100 cells (s2 1, r^2 0): the fixed point
