@@ -815,13 +815,23 @@ def procedure(D, data, option, ranks, lambdas, iters, seed, ab_cap=None, fitter=
 
     def ok(rank, lb):
         return bool(avail and rank > 0 and lb is not None and lb > 0)
+    # Codex #66 r6 P2-1: an unresolved VALIDATION score leaves the selection itself unresolved, so EVERY selection-
+    # dependent reported metric (the selected and primary improvements and bounds, the snapshot comparison, the
+    # alignment, the class accuracy of the selected map) is withheld (None), not only the decision and success; the
+    # primary selection reads the validation scores of its own candidates (rank <= PRIMARY_RANKS) only.
     prim = max((c for c in out["candidates"] if c["rank"] <= PRIMARY_RANKS), key=lambda c: c["val_lpd"])
+    unres_val_prim = _flagged(*(c["integration"]["validation"] for c in out["candidates"]
+                                if c["rank"] <= PRIMARY_RANKS))
+    avail_prim = bool(nw >= MIN_TEST_WORLDS and not unres_val_prim and not prim["integration_unresolved"])
+    pimp, plb = (prim["test_improvement"], prim["test_lb"]) if not unres_val_prim else (None, None)
     out["selected_primary"] = {"ranks": list(range(PRIMARY_RANKS + 1)), "rank": prim["rank"],
-                               "lambda": prim["lambda"], "start": prim["start"],
-                               "test_improvement": prim["test_improvement"],
-                               "test_lb": prim["test_lb"], "success": ok(prim["rank"], prim["test_lb"])}
+                               "lambda": prim["lambda"], "start": prim["start"], "available": avail_prim,
+                               "test_improvement": pimp, "test_lb": plb,
+                               "success": bool(avail_prim and prim["rank"] > 0 and plb is not None and plb > 0)}
+    if unres_val_prim:
+        out["selected_primary"]["selection_unresolved"] = True
     mean, lb, per = _bounded(tc1 - tc0, *tw, seed + 7)
-    if unres_test:
+    if unres_test or unres_val:
         mean = lb = None
         per = []
     gbest = max(out["candidates"], key=lambda c: c["val_lpd_gauss"])
@@ -832,18 +842,24 @@ def procedure(D, data, option, ranks, lambdas, iters, seed, ab_cap=None, fitter=
     else:
         snap = snap_g = None
     unres_snap = _flagged(si1, *([si0] if sel != (0, 0.0) else []))
-    if unres_snap:
+    if unres_snap or unres_val:
         snap = None
-    if sel[0] > 0:
+    if unres_val:
+        snap_g = None
+    if sel[0] > 0 and not unres_val:
         trn = D.fit[option]
         qn = np.unique(D.qi[trn])
         lead = m1["u"][qn, 0]
         align = float(abs(np.corrcoef(lead, m1["b"][qn])[0, 1])) if lead.std() > 0 else 0.0
     else:
         align = None
-    out.update(selected={"rank": sel[0], "lambda": sel[1], "start": best["start"]}, test_improvement=mean,
+    selected = {"rank": sel[0], "lambda": sel[1], "start": best["start"]}
+    if unres_val:
+        selected["selection_unresolved"] = True        # (the nominal pick: not a result; summarize() leaves it out)
+    out.update(selected=selected, test_improvement=mean,
                test_lb=lb, per_test_world=per, success=ok(sel[0], lb),
-               decision={"available": avail, "test_worlds": nw,
+               decision={"available": avail, "test_worlds": nw, "selection_unresolved": bool(unres_val),
+                         "integration_unresolved": unres_val + unres_test,
                          "reason": (None if avail else
                                     f"fewer than {MIN_TEST_WORLDS} contributing test worlds" if nw < MIN_TEST_WORLDS else
                                     _unresolved_why(unres_val + unres_test,
@@ -856,7 +872,8 @@ def procedure(D, data, option, ranks, lambdas, iters, seed, ab_cap=None, fitter=
                                  "test_improvement": gbest["test_improvement_gauss"],
                                  "test_lb": gbest["test_lb_gauss"], "success": ok(gbest["rank"], gbest["test_lb_gauss"])},
                snapshot_test_improvement=snap, snapshot_test_improvement_gauss=snap_g, alignment_u1_b=align,
-               fit_pairs=int(len(idx)), classes=class_accuracy(D, data, m1, m0), ab_cap=ab_cap)
+               fit_pairs=int(len(idx)), classes=None if unres_val else class_accuracy(D, data, m1, m0),
+               ab_cap=ab_cap)
     return out
 
 
@@ -929,7 +946,10 @@ def forward_procedure(D, data, ranks, lambdas, iters, seed, ab_cap=None, fitter=
                      "test_improvement_gauss": gmean, "test_lb_gauss": glb}
     ft = out["forward_transfer"]
     out["decision"] = {"available": bool(ft.get("available") and ft.get("decision_available")),
-                       "reason": ft.get("reason")}
+                       "reason": ft.get("reason"), "selection_unresolved": bool(unres_val),
+                       "integration_unresolved": max(unres_val, int(ft.get("integration_unresolved", 0)))}
+    if unres_val:
+        out["selected"]["selection_unresolved"] = True
     out["success"] = out["forward_transfer"].get("success", False)
     out["test_improvement"] = out["forward_transfer"].get("test_improvement")
     out["test_lb"] = out["forward_transfer"].get("test_lb")
@@ -1212,6 +1232,13 @@ def _counts(xs):
     return dict(sorted(out.items()))
 
 
+def _decided(o):
+    """A result that DECIDED (decision.available, absent: yes). An unavailable one (fewer than two test worlds, or a
+    finite but UNRESOLVED count score in its selection or comparison: Codex #66 r5/r6 P2-1) is counted by itself and
+    kept out of every numeric aggregate and rank histogram of summarize()."""
+    return bool((o.get("decision") or {"available": True})["available"])
+
+
 def summarize(d):
     """The run directory's cells. Refused (Codex #66 r1 P2-9): a directory without its config.json, a result
     of another configuration, a result whose name, recorded identity and derived seed disagree, and a second
@@ -1237,47 +1264,56 @@ def summarize(d):
     out["reference_support"] = json.loads(sups[0]) if sups else None
     for (sc, opt), lst in sorted(rows.items()):
         if "success" in lst[0]:
-            k = sum(o["success"] for o in lst)
+            # (Codex #66 r6 P2-1: the aggregates and rank histograms read the DECIDED results only; the others are
+            #  counted by themselves: decision_unavailable, and unresolved_decisions for those whose count integral
+            #  left a score unresolved)
+            dec = [o for o in lst if _decided(o)]
+            k = sum(o["success"] for o in dec)
             sel = {}
-            for o in lst:
+            for o in dec:
                 sel[o["selected"]["rank"]] = sel.get(o["selected"]["rank"], 0) + 1
-            prim = [o["selected_primary"] for o in lst if "selected_primary" in o]       # (#66: the {0,1,2} primary)
+            prim_all = [o["selected_primary"] for o in dec if "selected_primary" in o]       # (#66: the {0,1,2} primary)
+            prim = [p for p in prim_all if p.get("available", True)]
             kp = sum(p["success"] for p in prim)
             selp = {}
             for p in prim:
                 selp[p["rank"]] = selp.get(p["rank"], 0) + 1
-            gd = [o["gauss_diagnostic"] for o in lst if o.get("gauss_diagnostic")]
-            cell = {"scenario": sc, "option": opt, "datasets": len(lst), "successes": k,
-                    "rate": round(k / len(lst), 3), "wilson95": wilson(k, len(lst)),
+            gd = [o["gauss_diagnostic"] for o in dec if o.get("gauss_diagnostic")]
+            cell = {"scenario": sc, "option": opt, "datasets": len(lst), "decided": len(dec), "successes": k,
+                    "rate": round(k / len(dec), 3) if dec else None, "wilson95": wilson(k, len(dec)) if dec else None,
                     "selected_ranks": dict(sorted(sel.items())),
-                    "positive_rank_selected": sum(o["selected"]["rank"] > 0 for o in lst),
-                    "decision_unavailable": sum(not (o.get("decision") or {"available": True})["available"] for o in lst),
+                    "positive_rank_selected": sum(o["selected"]["rank"] > 0 for o in dec),
+                    "decision_unavailable": len(lst) - len(dec),
+                    "unresolved_decisions": sum(1 for o in lst
+                                                if (o.get("decision") or {}).get("integration_unresolved")),
+                    "unresolved_selections": sum(1 for o in lst if (o.get("decision") or {}).get("selection_unresolved")),
                     "integration_unresolved": sum(int((c.get("integration") or {}).get(s, {}).get(k, 0))
                                                   for o in lst for c in o.get("candidates", ())
                                                   for s in ("validation", "test")
                                                   for k in ("grid_unresolved", "eps_unresolved")),
                     "primary": ({"ranks": prim[0]["ranks"], "datasets": len(prim), "successes": kp,
                                  "rate": round(kp / len(prim), 3), "wilson95": wilson(kp, len(prim)),
+                                 "unavailable": len(prim_all) - len(prim),
                                  "selected_ranks": dict(sorted(selp.items())),
                                  "positive_rank_selected": sum(p["rank"] > 0 for p in prim),
                                  "median_test_lb": _median(p["test_lb"] for p in prim)}
                                 if prim else None),
                     "start": lst[0].get("start"),
-                    # (the winning start of the SELECTED candidate: over every dataset, a rank-0 selection
+                    # (the winning start of the SELECTED candidate: over every decided dataset, a rank-0 selection
                     #  counted under its single warm fit, the reg5 table's convention; and over rank > 0 only)
-                    "selected_start": _counts(o["selected"].get("start") for o in lst),
-                    "selected_start_positive": _counts(o["selected"].get("start") for o in lst
+                    "selected_start": _counts(o["selected"].get("start") for o in dec),
+                    "selected_start_positive": _counts(o["selected"].get("start") for o in dec
                                                        if o["selected"]["rank"] > 0),
-                    "mean_test_improvement": _mean(o["test_improvement"] for o in lst),
-                    "mean_test_lb": _mean(o["test_lb"] for o in lst),
-                    "median_test_lb": _median(o["test_lb"] for o in lst),
+                    "mean_test_improvement": _mean(o["test_improvement"] for o in dec),
+                    "mean_test_lb": _mean(o["test_lb"] for o in dec),
+                    "median_test_lb": _median(o["test_lb"] for o in dec),
                     "gauss_diagnostic": ({"successes": sum(g["success"] for g in gd),
                                           "selected_ranks": _counts(g["selected"]["rank"] for g in gd),
                                           "median_test_lb": _median(g["test_lb"] for g in gd)} if gd else None),
                     "fit_pairs": lst[0]["fit_pairs"],
-                    "classes": {k: {f: float(np.mean([o["classes"][k][f] for o in lst]))
+                    "classes": {k: {f: float(np.mean([o["classes"][k][f] for o in dec]))
                                     for f in ("rmse_selected", "rmse_rank0", "interaction_sd")}
-                                for k in (lst[0].get("classes") or {})}}
+                                for k in ((dec[0].get("classes") or {}) if dec else {})}}
             if lst[0].get("procedure") == "forward":       # (both branches: the top level is the transfer)
                 cell["branches"] = {}
                 for b in ("forward_transfer", "intersection"):

@@ -870,12 +870,30 @@ class TestRecovery(unittest.TestCase):
         self.assertEqual(out["integration_comparison"]["unresolved"]["snapshot"], 2)
         self.assertEqual(out["integration_comparison"]["snapshot"]["selected"]["grid_unresolved"], 1)
         self.assertIsNotNone(out["snapshot_test_improvement_gauss"])
+        self.assertTrue(base["selected_primary"]["available"] and base["selected_primary"]["test_lb"] > 0)
+        self.assertIsNotNone(base["alignment_u1_b"])
+        self.assertIsNotNone(base["classes"])
         with self.flag_scores(lambda ix: ix is D.val_idx):                              # (the selection)
             out = run()
         self.assertFalse(out["decision"]["available"])
         self.assertFalse(out["success"])
         self.assertGreater(out["integration_comparison"]["unresolved"]["validation"], 0)
         self.assertIn("in validation", out["decision"]["reason"])
+        # r6 P2-1: an unresolved VALIDATION selection leaves every selection-dependent reported metric withheld, not
+        # only the decision (the score arrays are untouched, so these were positive / present before the fix)
+        self.assertTrue(out["decision"]["selection_unresolved"] and out["selected"]["selection_unresolved"])
+        self.assertGreater(out["decision"]["integration_unresolved"], 0)
+        for k in ("test_improvement", "test_lb", "snapshot_test_improvement", "snapshot_test_improvement_gauss",
+                  "alignment_u1_b", "classes"):
+            self.assertIsNone(out[k], k)
+        self.assertEqual(out["per_test_world"], [])
+        sp = out["selected_primary"]
+        self.assertFalse(sp["available"] or sp["success"])
+        self.assertTrue(sp["selection_unresolved"])
+        self.assertIsNone(sp["test_improvement"])
+        self.assertIsNone(sp["test_lb"])
+        self.assertEqual({k: out["selected"][k] for k in ("rank", "lambda")},
+                         {k: base["selected"][k] for k in ("rank", "lambda")})           # (the nominal pick, flagged)
 
     def test_unresolved_scores_never_decide_forward(self):
         """r5 P2-1, the forward tests: a flagged score in a test set's two models (or in the validation
@@ -907,6 +925,10 @@ class TestRecovery(unittest.TestCase):
             self.assertFalse(out[k]["available"], k)
             self.assertIn("in validation", out[k]["reason"])
         self.assertFalse(out["success"])
+        self.assertTrue(out["decision"]["selection_unresolved"] and out["selected"]["selection_unresolved"])
+        self.assertEqual(out["decision"]["integration_unresolved"], out["integration_unresolved"]["validation"])
+        self.assertIsNone(out["test_improvement"])
+        self.assertIsNone(out["test_lb"])
 
     def test_conditioning(self):
         rep = self.rec.conditioning(self.D, 2, "a")
@@ -1057,6 +1079,56 @@ class TestRecoveryRuns(unittest.TestCase):
                 R.prepare_run(self.ns(graph=a.graph, out=a.out))
         finally:
             shutil.rmtree(tmp)
+
+    def test_summary_excludes_unresolved_selections(self):
+        """r6 P2-1: summarize() keeps a result whose selection or comparison is UNRESOLVED (a finite score that
+        failed its integration check) out of every numeric aggregate and rank histogram, and counts it by itself.
+        Dataset 0 is an ordinary result; dataset 1 is a real run whose validation scores are injected as flagged."""
+        import unittest.mock as mock
+        R = self.rec
+        out = os.path.join(self.tmp, "unres")
+        R.prepare_run(self.ns(options="a", lambdas="0.1", iters=3, out=out))
+        for rep in (0, 1):
+            f = os.path.join(out, f"r0.{rep:03d}.json")
+            if rep == 0:
+                self.assertEqual(R.one(self.ns(options="a", lambdas="0.1", iters=3, scenario="r0", rep=0, out=f)), 0)
+                continue
+            real = R.scorer
+
+            def scorer(D, data, m, idx, fitter):
+                sc, calls = real(D, data, m, idx, fitter), []
+
+                def score(ix, info=None):
+                    res = sc(ix, info)
+                    calls.append(1)
+                    if info is not None and len(calls) == 2:      # (procedure: the test set first, then validation)
+                        info["grid_unresolved"] = 1
+                    return res
+                return score
+            with mock.patch.object(R, "scorer", scorer):
+                self.assertEqual(R.one(self.ns(options="a", lambdas="0.1", iters=3, scenario="r0", rep=1, out=f)), 0)
+        o0 = rqlib.read_json(os.path.join(out, "r0.000.json"))["options"]["a"]
+        o1 = rqlib.read_json(os.path.join(out, "r0.001.json"))["options"]["a"]
+        self.assertTrue(o0["decision"]["available"])
+        self.assertFalse(o1["decision"]["available"])
+        self.assertTrue(o1["decision"]["selection_unresolved"])
+        for k in ("test_improvement", "test_lb", "snapshot_test_improvement", "alignment_u1_b", "classes"):
+            self.assertIsNone(o1[k], k)
+        self.assertFalse(o1["selected_primary"]["available"])
+        cell = R.summarize(out)["cells"][0]
+        self.assertEqual((cell["datasets"], cell["decided"], cell["decision_unavailable"]), (2, 1, 1))
+        self.assertEqual((cell["unresolved_decisions"], cell["unresolved_selections"]), (1, 1))
+        self.assertEqual(sum(cell["selected_ranks"].values()), 1)                     # (the decided one only)
+        self.assertEqual(cell["selected_ranks"], {o0["selected"]["rank"]: 1})
+        self.assertEqual(sum(cell["selected_start"].values()), 1)
+        self.assertEqual(cell["successes"], int(o0["success"]))
+        self.assertEqual(cell["rate"], float(o0["success"]))
+        self.assertEqual(cell["mean_test_lb"], o0["test_lb"])
+        self.assertEqual(cell["mean_test_improvement"], o0["test_improvement"])
+        self.assertEqual(cell["primary"]["datasets"], 1)
+        self.assertEqual(cell["primary"]["unavailable"], 0)
+        self.assertEqual(cell["classes"], {k: {f: float(v[f]) for f in ("rmse_selected", "rmse_rank0", "interaction_sd")}
+                                           for k, v in o0["classes"].items()})
 
     def test_result_identity_on_resume_and_summary(self):
         """P2-9: a result copied under another name, one with a wrong seed, or a stray file is refused by the
