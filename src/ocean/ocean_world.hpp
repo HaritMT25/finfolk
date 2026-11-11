@@ -2697,16 +2697,25 @@ private:
 
             float avgDx = 0, avgDy = 0, avgDz = 0, avgHx = 0, avgHy = 0;
             float nearestDist = R;
+            // The nearest's d² (+inf before one): sqrt is monotone, so a
+            // neighbour whose d² is not below it has sqrt(d²) >= nearestDist and
+            // cannot pass the strict test; only a smaller d² takes the sqrt and
+            // that test (which still decides: distinct d² can share a sqrt).
+            // As the food scan's foodD2 gate.
+            float nearestD2 = std::numeric_limits<float>::infinity();
             int nearestIdx = -1, neighborCount = 0, popFwd = 0, popLR = 0, inRadiusCount = 0;
 
-            auto attendTo = [&](int ni, const FishHot& other, float dx, float dy, float dz, float dist) {
+            auto attendTo = [&](int ni, const FishHot& other, float dx, float dy, float dz, float d2) {
                 avgDx += dx; avgDy += dy; avgDz += dz;
                 avgHx += other.vel.x; avgHy += other.vel.y;
                 const float dotFwd = dx * fwd.x + dy * fwd.y;
                 const float dotLR = dx * rht.x + dy * rht.y;
                 popFwd += (dotFwd > 0) ? 1 : -1;
                 popLR  += (dotLR > 0) ? 1 : -1;
-                if (dist < nearestDist) { nearestDist = dist; nearestIdx = ni; }
+                if (d2 < nearestD2) {
+                    const float dist = std::sqrt(d2);
+                    if (dist < nearestDist) { nearestDist = dist; nearestIdx = ni; nearestD2 = d2; }
+                }
                 neighborCount++;
             };
 
@@ -2737,7 +2746,7 @@ private:
 #ifdef EVO_OCEAN_EYE
                     if constexpr (Eye) { if (eyeFish) eyeSee(eye, fwd, rht, dx, dy, dz, d2, other.eyeSize, other.eyeCon, R); }
 #endif
-                    attendTo(ni, other, dx, dy, dz, std::sqrt(d2));
+                    attendTo(ni, other, dx, dy, dz, d2);
                 }
                 inRadiusCount = neighborCount;
             } else {
@@ -2769,7 +2778,7 @@ private:
                 }
                 for (int j = 0; j < have; ++j)
                     attendTo(best[j].index, hot_[best[j].index], best[j].dx, best[j].dy, best[j].dz,
-                             std::sqrt(best[j].distSq));
+                             best[j].distSq);
             }
 
             if (neighborCount > 0) {
@@ -2810,7 +2819,9 @@ private:
                 if (need & senseBit(NEAREST_NEIGHBOR_FOOD))
                     sensors[NEAREST_NEIGHBOR_FOOD] = evomath::tanhf((nearest.foodReserves - 25.0f) / 25.0f);
                 if (need & ocean::kSenseGeneticSim) {
-                    const float sim = genomeSimilarity(c.genome, nearest.genome);
+                    // genomeSimilarity's count from the nets' gene-type masks
+                    // (genome.hpp genomeSimilarityMasked): the same float.
+                    const float sim = genomeSimilarityMasked(c.genome, c.nnet, nearest.genome, nearest.nnet);
                     sensors[GENETIC_SIM_NEAREST] = sim;
                     float dx = nearest.pos.x - c.pos.x;
                     float dy = nearest.pos.y - c.pos.y;
