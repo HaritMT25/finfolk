@@ -605,8 +605,9 @@ def hc_fit_status(s):
 def eligibility(eco, registry, hc_slopes, registry_sha256=None, mask=None, eco_sha256=None, min_q200=MIN_Q200,
                 mask_sha256=None, hc_provenance=None):
     """THE AUTHORITATIVE ELIGIBILITY DISPATCHER (Annex H D6 rules 26-27 and 33; D7 rules 36-38) -> (the eligibility
-    record, H-C's usable block deltas, their count weights), the last two STAMPED with the record's H-C binding
-    (HCContrasts: decide refuses contrasts of another record, graph, mask or snapshots; Codex #68 D6 r3 P2-2).
+    record, H-C's usable block deltas, their count weights). The record ANCHORS the two payloads: its H-C entry stores
+    their role-tagged digests (contrast_digest: role, H-C binding, blocks) and decide / restore_hc_contrasts accept only
+    payloads that hash to them (Codex #68 D6 r3 P2-2, r5); the returned HCContrasts also carry a refusal-only stamp.
 
       Q200 (D6 rule 26): every retained C history with continuous coexistence through the observed 200M endpoint
         (ecology_problems recomputes it from the export's slots). |Q200| >= min_q200 (24) is the availability
@@ -696,9 +697,12 @@ def eligibility(eco, registry, hc_slopes, registry_sha256=None, mask=None, eco_s
              f"({hc_tech[:4]}): pending repair, never dropped")
     a = {b: {"A": weights[b][0], "B": weights[b][1]} for b in sorted(weights)}
     norm = {G: {b: a[b][G] / sum(x[G] for x in a.values()) for b in a} for G in ("A", "B")} if a else {}
+    hc_binding = None if mask is None else observation_provenance(mask, mask_sha256, sorted(eligible))
     hyp["H-C"] = {"population": "usable blocks", "worlds": sorted(eligible), "available": r is None, "reason": r,
-                  "binding": None if mask is None else observation_provenance(mask, mask_sha256, sorted(eligible)),
+                  "binding": hc_binding,
                   "usable_blocks": sorted(deltas),
+                  "contrast_digests": {"deltas": contrast_digest("deltas", deltas, hc_binding),
+                                       "weights": contrast_digest("weights", weights, hc_binding)},
                   "unusable_blocks": {str(b): v for b, v in sorted(unusable.items())}, "n_blocks": m,
                   "p_floor": (2.0 ** -m) if m else None, "counts": {str(b): c for b, c in sorted(counts.items())},
                   "fits": {w: s for w, (s, _) in sorted(fit.items()) if s != "ok"},
@@ -717,7 +721,7 @@ def eligibility(eco, registry, hc_slopes, registry_sha256=None, mask=None, eco_s
            "ineligible": dict(sorted(why.items())),
            "technical_gaps": {w: [list(x) for x in g] for w, g in sorted(tech.items())},
            "mask": mrec, "hypotheses": hyp}
-    return rec, _stamp_contrasts(rec, deltas), _stamp_contrasts(rec, weights)
+    return rec, _stamp_contrasts(rec, deltas, "deltas"), _stamp_contrasts(rec, weights, "weights")
 
 
 def record_sha256(elig):
@@ -726,62 +730,89 @@ def record_sha256(elig):
 
 
 CONTRASTS_SCHEMA = "finfolk.redqueen.annexH.hc_contrasts/1"
+CONTRAST_ROLES = ("deltas", "weights")
+
+
+def contrast_digest(role, x, binding):
+    """THE ANCHOR (Codex #68 D6 r5 P2-2): the sha256 of the canonical JSON of {"role", "binding", "blocks"}: the
+    payload's role ("deltas" or "weights"), the record's H-C binding (observation_provenance of the eligible worlds, or
+    None without a mask) and the content ({block: [A, B]}). stats.eligibility writes the two digests it produced into
+    the eligibility record (hypotheses["H-C"]["contrast_digests"]); decide and restore_hc_contrasts recompute the
+    digest of what they are given and require it to equal the RECORD's. The role is in the digest, so authentic weights
+    never pass as deltas."""
+    return rqlib.canonical_sha({"role": role, "binding": binding, "blocks": {str(b): list(v) for b, v in x.items()}})
 
 
 class HCContrasts(dict):
-    """H-C's block contrasts {block: (delta_A, delta_B)} or count weights {block: (a_A, a_B)} STAMPED at production
-    (Codex #68 D6 r3 P2-2; r4): `binding` is the record's result_binding for H-C (the record's identity, the hypothesis
-    and the bound graph / mask / snapshot provenance of its eligible worlds), `digest` the sha256 of the binding and
-    the content as produced. Only stats.eligibility issues a stamp (_stamp_contrasts). A plain dict, a copy (dict(x))
-    or json.dumps(x) carries none, so decide refuses it. to_json() is the serializable form: the content (string
-    block keys) with the producer's stamp unchanged; restore_hc_contrasts validates it and returns it stamped."""
+    """H-C's block contrasts {block: (delta_A, delta_B)} or count weights {block: (a_A, a_B)} as stats.eligibility
+    returns them. What decides acceptance is the RECORD's anchor (contrast_digest), never this object. The carried
+    `role`, `binding` (the record's result_binding) and `digest` (contrasts_sha256, a publicly recomputable checksum)
+    are a convenience that can only REFUSE: a stamp for another record, role or content is caught early with a clear
+    message; a matching stamp accepts nothing by itself (a fabricated one passes no further than the anchor). Plain
+    dicts, copies and pickles of an object with the producer's values match the record and pass. to_json() is the
+    serializable form (string block keys); restore_hc_contrasts is its validated inverse."""
+    role = None
     binding = None
     digest = None
 
     def to_json(self):
-        return {"schema": CONTRASTS_SCHEMA, "blocks": {str(b): list(v) for b, v in self.items()},
+        return {"schema": CONTRASTS_SCHEMA, "role": self.role, "blocks": {str(b): list(v) for b, v in self.items()},
                 "binding": self.binding, "digest": self.digest}
 
 
 def contrasts_sha256(x, binding):
-    """The digest of a stamped contrast set: the sha256 of the canonical JSON of its binding and its content
-    ({block: [A, B]}), so a changed binding or changed values no longer match the stamp's digest."""
+    """The checksum of an object's own stamp: sha256 of the canonical JSON of its binding and content. Publicly
+    recomputable, so it proves only that the stamp was not edited apart from the content, never who produced it."""
     return rqlib.canonical_sha({"binding": binding, "blocks": {str(b): list(v) for b, v in x.items()}})
 
 
-def _stamp_contrasts(elig, x):
-    """The PRODUCER's stamp (stats.eligibility only, for the record it has just built): x as HCContrasts stamped with
-    elig's H-C binding and the digest of that binding and x. Private: a restoration never issues a stamp."""
+def _stamp_contrasts(elig, x, role):
+    """stats.eligibility's convenience stamp of the `role` payload x for the record it has just built."""
     out = HCContrasts(x)
+    out.role = role
     out.binding = result_binding(elig, "H-C")
     out.digest = contrasts_sha256(x, out.binding)
     return out
 
 
-def _check_contrasts(elig, name, x):
-    """StatsError unless x (H-C's `name`) is an HCContrasts stamped with THIS record's H-C binding, whose digest still
-    matches its binding and content, over exactly the record's usable blocks."""
+def _check_contrasts(elig, role, x):
+    """StatsError unless x is H-C's `role` payload as stats.eligibility produced it for THIS record: its content hashes
+    (contrast_digest: role, the record's H-C binding, the blocks) to the digest the RECORD stores for that role, over
+    exactly the record's usable blocks. A stamp the object carries (HCContrasts) may only refuse, never accept."""
     e = (elig.get("hypotheses") or {}).get("H-C") or {}
-    if not isinstance(x, HCContrasts) or x.binding != result_binding(elig, "H-C"):
-        raise StatsError(f"H-C's {name} are not bound to this eligibility record (computed without it, or from "
-                         "another graph / mask / snapshot identities): stats.eligibility / restore_hc_contrasts")
-    try:
-        ok = x.digest == contrasts_sha256(x, x.binding)
-    except (TypeError, ValueError):
-        ok = False
-    if not ok:
-        raise StatsError(f"H-C's {name} changed after they were produced (the stamp's digest does not match)")
+    anchor = (e.get("contrast_digests") or {}).get(role)
+    if not (isinstance(anchor, str) and isinstance(x, dict)):
+        raise StatsError(f"H-C's {role}: the record stores no producer digest for them, or they are not a mapping")
+    if isinstance(x, HCContrasts):
+        if x.role not in (None, role):
+            raise StatsError(f"H-C's {role} carry the role {x.role!r}: a role mismatch (weights are not deltas)")
+        if x.binding is not None or x.digest is not None:
+            if x.binding != result_binding(elig, "H-C"):
+                raise StatsError(f"H-C's {role} are not bound to this eligibility record (computed without it, or "
+                                 "from another graph / mask / snapshot identities): stats.eligibility")
+            try:
+                ok = x.digest == contrasts_sha256(x, x.binding)
+            except (TypeError, ValueError):
+                ok = False
+            if not ok:
+                raise StatsError(f"H-C's {role} changed after they were produced (the stamp's checksum does not match)")
     if set(x) != set(e.get("usable_blocks") or []):
-        raise StatsError(f"H-C's {name} are not over the record's usable blocks")
+        raise StatsError(f"H-C's {role} are not over the record's usable blocks")
+    try:
+        got = contrast_digest(role, x, e.get("binding"))
+    except (TypeError, ValueError):
+        got = None
+    if got != anchor:
+        raise StatsError(f"H-C's {role} are not the values stats.eligibility produced for this record (their role-tagged "
+                         "digest differs from the one the record stores)")
 
 
 def require_contrasts(elig, deltas, weights):
-    """The decision-side check of H-C's contrasts (Codex #68 D6 r3 P2-2): both the block deltas and the count weights
-    must be stamped with THIS record's H-C binding (not another record's, graph's, mask's or snapshots'), unchanged
-    since they were produced, and over exactly the record's usable blocks; StatsError otherwise. decide calls it
-    before either hc_test."""
-    for name, x in (("deltas", deltas), ("weights", weights)):
-        _check_contrasts(elig, name, x)
+    """The decision-side check of H-C's contrasts (Codex #68 D6 r3 P2-2; r5): the block deltas and the count weights
+    must each hash (contrast_digest, with its role) to the digest the eligibility record stores for that role, over
+    exactly the record's usable blocks; StatsError otherwise. decide calls it before either hc_test."""
+    _check_contrasts(elig, "deltas", deltas)
+    _check_contrasts(elig, "weights", weights)
 
 
 def _block_key(k):
@@ -793,32 +824,37 @@ def _block_key(k):
     return int(k) if isinstance(k, str) and k.isascii() and k.isdigit() and str(int(k)) == k else None
 
 
-def _restore_contrasts(elig, name, saved):
+def _restore_contrasts(elig, role, saved):
     if isinstance(saved, HCContrasts):
-        saved = saved.to_json()
-    if not (isinstance(saved, dict) and saved.get("schema") == CONTRASTS_SCHEMA and isinstance(saved.get("blocks"), dict)):
-        raise StatsError(f"H-C's {name} are not a stamped contrasts document (HCContrasts.to_json): a bare dict, or "
-                         "json.dumps of one, carries no producer stamp")
+        _check_contrasts(elig, role, saved)
+        return saved
+    if not isinstance(saved, dict):
+        raise StatsError(f"H-C's {role} are not a mapping or a contrasts document (HCContrasts.to_json)")
+    doc = "schema" in saved or "blocks" in saved
+    if doc and not (saved.get("schema") == CONTRASTS_SCHEMA and isinstance(saved.get("blocks"), dict)):
+        raise StatsError(f"H-C's {role} are not a contrasts document (schema {CONTRASTS_SCHEMA})")
     blocks = {}
-    for k, v in saved["blocks"].items():
+    for k, v in (saved["blocks"] if doc else saved).items():
         b = _block_key(k)
         if b is None or b in blocks or not (isinstance(v, (list, tuple)) and len(v) == 2 and all(
                 isinstance(y, (int, float)) and not isinstance(y, bool) and math.isfinite(y) for y in v)):
-            raise StatsError(f"H-C's {name}: block {k!r} is not a block id with a finite (A, B) pair, or is repeated")
+            raise StatsError(f"H-C's {role}: block {k!r} is not a block id with a finite (A, B) pair, or is a repeated id")
         blocks[b] = tuple(v)
     out = HCContrasts(blocks)
-    out.binding, out.digest = saved.get("binding"), saved.get("digest")      # (the PRODUCER's stamp, retained)
-    _check_contrasts(elig, name, out)
+    if doc:                                      # (a carried stamp is kept, and can only refuse)
+        out.role, out.binding, out.digest = saved.get("role"), saved.get("binding"), saved.get("digest")
+    _check_contrasts(elig, role, out)
     return out
 
 
 def restore_hc_contrasts(elig, deltas, weights):
-    """Restore H-C contrasts from a cache -> (deltas, weights) as HCContrasts (Codex #68 D6 r4 P2-2). Each input is
-    an HCContrasts or its serialized to_json() document, which carries the PRODUCER's binding and digest; the
-    restoration RETAINS them and validates them against the record: the binding must be this record's H-C binding,
-    the digest must still match the binding and the content (string block keys from a JSON round trip are
-    normalized to ints first), the blocks must be the record's usable blocks. A conflicting or altered stamp, a bare
-    dict or another record's contrasts is refused; no stamp is ever issued from the record's metadata."""
+    """Restore H-C contrasts from a cache -> (deltas, weights) as HCContrasts (Codex #68 D6 r4 P2-2, r5). Each input is
+    an HCContrasts, its to_json() document or a bare {block: (A, B)} mapping (string block keys from a JSON round
+    trip are normalized to ints; a key that is not a canonical block id, or a second spelling of one, is refused).
+    The restored payload must be what stats.eligibility produced for THIS record: its role-tagged digest
+    (contrast_digest) must equal the one the record stores for that role, so another record's contrasts, edited
+    values, fabricated stamps and weights restored as deltas (or the reverse) are all refused, and a stamp the input
+    carries can only refuse. No stamp is ever issued here."""
     return _restore_contrasts(elig, "deltas", deltas), _restore_contrasts(elig, "weights", weights)
 
 
@@ -889,10 +925,10 @@ def decide(elig, results, deltas, weights, alpha=FAMILY_ALPHA):
     available with its calibration (family_p: H-F's critical value, H-T's frozen critical value and guard) and h
     was computed on exactly the common Q200 population (StatsError otherwise: a decision on another population is
     never accepted); every unavailable row keeps its row and enters Holm as p = 1 (holm); H-C's p is the
-    count-weighted intersection-union test's (hc_test) of the block deltas and weights, which must be this record's
-    stamped contrasts (require_contrasts, before either hc_test: contrasts of another graph / mask / snapshots, or
-    unstamped or altered ones, are refused; Codex #68 D6 r3 P2-2), and H-C is then decided at its REACHED ACTIVE
-    Holm level (its bounds at that level beside the fixed 99% ones); family_decision is authoritative."""
+    count-weighted intersection-union test's (hc_test) of the block deltas and weights, which must hash, each with its
+    role, to the digests THIS record stores (require_contrasts, before either hc_test: another record's, edited,
+    fabricated or role-swapped contrasts are refused; Codex #68 D6 r3 P2-2, r5), and H-C is then decided at its REACHED
+    ACTIVE Holm level (its bounds at that level beside the fixed 99% ones); family_decision is authoritative."""
     pv, why = {}, {}
     for h in Q200_FAMILY:
         e, r = elig["hypotheses"][h], results.get(h)

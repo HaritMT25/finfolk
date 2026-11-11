@@ -642,39 +642,80 @@ class TestEligibility(unittest.TestCase):
         dec3 = stats.decide(rec3, {"H-P": {"available": True, "p": 0.001, "worlds": q, "binding": b}}, D3, W3)
         self.assertEqual(dec3["pvalues"]["H-P"], 0.001)
 
-    def test_hc_contrasts_are_bound_to_their_record(self):
-        """Codex #68 D6 r3 P2-2: H-C's block deltas and count weights are STAMPED at production with the record's H-C
-        binding (its identity, the graph / mask / snapshot provenance of its eligible worlds) and decide refuses, before
-        either hc_test, contrasts of another record: one produced from graph / mask A never enters B's decision, even
-        with identical world and block ids and identical values. The matching case is unchanged. Restoring a cache
-        (Codex r4) retains and validates the producer's stamp (check_restoration), through a real JSON round trip."""
+    def test_hc_contrasts_are_anchored_in_their_record(self):
+        """Codex #68 D6 r3 P2-2, r5: the eligibility record ANCHORS H-C's two payloads: its H-C entry stores their
+        role-tagged digests (contrast_digest: role, H-C binding, blocks), and decide refuses, before either hc_test,
+        anything that does not hash to them: another record's contrasts, edited values, a fabricated stamp, weights
+        passed as deltas. The stamp an HCContrasts carries can only refuse, never accept. The matching case, plain
+        copies and pickles of the producer's values, and a validated restore (check_restoration) pass."""
+        import copy
+        import pickle
         recA, DA, WA, decA = self.run_(dead=["A30"])
-        recB, DB, WB, _ = self.run_(dead=["B31"])
+        recB, DB, WB, decB = self.run_(dead=["B31"])
+        self.assertNotEqual((dict(DA), dict(WA)), (dict(DB), dict(WB)))     # (the two records' numbers differ)
+        cd = recB["hypotheses"]["H-C"]["contrast_digests"]
+        self.assertEqual(cd, {"deltas": stats.contrast_digest("deltas", DB, None),
+                              "weights": stats.contrast_digest("weights", WB, None)})
+        self.assertNotEqual(cd["deltas"], stats.contrast_digest("weights", DB, None))      # (the role is in the digest)
+        self.assertEqual(stats.record_sha256(json.loads(json.dumps(recB))), DB.binding["eligibility_sha256"])
         self.assertEqual(decA["pvalues"]["H-C"], stats.decide(recA, {}, DA, WA)["pvalues"]["H-C"])   # (matching: passes)
-        self.assertEqual((DA.binding, WA.binding), (stats.result_binding(recA, "H-C"),) * 2)
+        bindA = stats.result_binding(recA, "H-C")
+        self.assertEqual((DA.role, WA.role, DA.binding, WA.binding), ("deltas", "weights", bindA, bindA))
         self.assertEqual(DA.binding["provenance"], recA["hypotheses"]["H-C"]["binding"])
         msg = "not bound to this eligibility record"
-        for d, w in ((DA, WA), (DA, WB), (DB, WA)):                      # (A's, or half of A's, into B)
+        for d, w in ((DA, WA), (DA, WB), (DB, WA)):                      # (A's stamped contrasts, or half, into B)
             with self.assertRaisesRegex(stats.StatsError, msg):
                 stats.decide(recB, {}, d, w)
-        # (an unstamped copy, a JSON round trip, a plain dict: refused; an altered stamped one; other blocks)
-        for d, w in ((dict(DB), dict(WB)), (json.loads(json.dumps(DB)), WB), (DB, {}), ({}, {})):
-            with self.assertRaisesRegex(stats.StatsError, msg):
+        produced = "not the values stats.eligibility produced for this record"
+        # (A's values without their stamp, and Codex's fabricated stamp of B on A's values, hash to A's digests, not B's)
+        def fabricated(elig, values):                                    # (Codex r5's construction, verbatim)
+            x = stats.HCContrasts(values)
+            x.binding = stats.result_binding(elig, "H-C")
+            x.digest = stats.contrasts_sha256(x, x.binding)
+            return x
+        for d, w in ((dict(DA), dict(WA)), (fabricated(recB, DA), fabricated(recB, WA)), (DB, fabricated(recB, WA)),
+                     (fabricated(recB, DA), WB)):
+            with self.assertRaisesRegex(stats.StatsError, produced):
+                stats.decide(recB, {}, d, w)
+        # (weights passed as deltas, authentic, copied or fabricated; the reverse: the role is in the digest)
+        with self.assertRaisesRegex(stats.StatsError, "role mismatch"):
+            stats.decide(recB, {}, WB, WB)
+        for d, w in ((dict(WB), dict(WB)), (fabricated(recB, WB), fabricated(recB, WB)), (dict(DB), dict(DB))):
+            with self.assertRaisesRegex(stats.StatsError, produced):
+                stats.decide(recB, {}, d, w)
+        with self.assertRaisesRegex(stats.StatsError, "role mismatch"):      # (Codex r5's second snippet, verbatim)
+            stats.restore_hc_contrasts(recB, WB.to_json(), WB.to_json())
+        # (the producer's own values pass in any carrier: plain copies, deepcopies, pickles; they match the record)
+        for d, w in ((dict(DB), dict(WB)), (copy.deepcopy(DB), copy.deepcopy(WB)), (stats.HCContrasts(DB), stats.HCContrasts(WB)),
+                     (pickle.loads(pickle.dumps(DB)), pickle.loads(pickle.dumps(WB)))):
+            self.assertEqual(stats.decide(recB, {}, d, w)["pvalues"], decB["pvalues"])
+        # (string block keys, a missing block, nothing: decide wants the record's blocks; restore normalizes keys)
+        for d, w in ((json.loads(json.dumps(DB)), WB), (DB, {}), ({}, {})):
+            with self.assertRaisesRegex(stats.StatsError, "usable blocks"):
                 stats.decide(recB, {}, d, w)
         altered = stats.HCContrasts(DB)                                  # (edited after production, its stamp kept)
-        altered.binding, altered.digest = DB.binding, DB.digest
+        altered.role, altered.binding, altered.digest = DB.role, DB.binding, DB.digest
         altered[next(iter(altered))] = (9.0, 9.0)
         with self.assertRaisesRegex(stats.StatsError, "changed after they were produced"):
             stats.decide(recB, {}, altered, WB)
-        fewer = stats._stamp_contrasts(recB, {b: v for b, v in list(DB.items())[1:]})
-        with self.assertRaisesRegex(stats.StatsError, "usable blocks"):
-            stats.decide(recB, {}, fewer, WB)
-        relabel = stats.HCContrasts(DA)                                  # (A's content under B's binding, A's digest)
-        relabel.binding, relabel.digest = DB.binding, DA.digest
+        relabel = stats.HCContrasts(DA)                                  # (A's content under B's binding, A's checksum)
+        relabel.role, relabel.binding, relabel.digest = "deltas", DB.binding, DA.digest
         with self.assertRaisesRegex(stats.StatsError, "changed after they were produced"):
             stats.decide(recB, {}, relabel, WB)
+        edited = dict(DB)                                                # (edited, no stamp: the anchor refuses)
+        edited[next(iter(edited))] = (9.0, 9.0)
+        with self.assertRaisesRegex(stats.StatsError, produced):
+            stats.decide(recB, {}, edited, WB)
+        fewer = stats._stamp_contrasts(recB, {b: v for b, v in list(DB.items())[1:]}, "deltas")
+        with self.assertRaisesRegex(stats.StatsError, "usable blocks"):
+            stats.decide(recB, {}, fewer, WB)
         self.assertFalse(hasattr(stats, "stamp_contrasts") or hasattr(stats, "bind_hc_contrasts"))   # (no re-stamping)
         self.check_restoration(recB, DB, WB, DA, WA, msg)
+        # (a record without the producer's digests, an older record: refused, never trusted)
+        old = json.loads(json.dumps(recB))
+        del old["hypotheses"]["H-C"]["contrast_digests"]
+        with self.assertRaisesRegex(stats.StatsError, "stores no producer digest"):
+            stats.decide(old, {}, DB, WB)
         # (an unavailable H-C uses no contrasts: nothing to validate)
         dead = [w["id"] for w in self.reg["worlds"] if w["treatment"] != "C" and w["block"] > 1]
         rec1, _, _, dec1 = self.run_(dead=dead)
@@ -697,35 +738,49 @@ class TestEligibility(unittest.TestCase):
                                               hc_provenance=stats.observation_provenance(mask, sha, sorted(hc))))
             (rA, dA, wA), (rB, dB, wB) = recs
             self.assertNotEqual(rA["hypotheses"]["H-C"]["binding"], rB["hypotheses"]["H-C"]["binding"])
+            self.assertNotEqual(rA["hypotheses"]["H-C"]["contrast_digests"], rB["hypotheses"]["H-C"]["contrast_digests"])
             self.assertEqual((dict(dA), dict(wA)), (dict(dB), dict(wB)))         # (the same numbers: only provenance differs)
             self.assertIsNotNone(stats.decide(rA, {}, dA, wA)["pvalues"]["H-C"])
             self.assertIsNotNone(stats.decide(rB, {}, dB, wB)["pvalues"]["H-C"])
-            with self.assertRaisesRegex(stats.StatsError, msg):
+            with self.assertRaisesRegex(stats.StatsError, msg):                  # (A's stamped contrasts: refused)
                 stats.decide(rB, {}, dA, wA)
             self.check_restoration(rB, dB, wB, dA, wA, msg)         # (A's stamped contrasts never restore as B's)
 
     def check_restoration(self, rec, D, W, otherD, otherW, msg):
-        """Codex #68 D6 r4 P2-2: restore_hc_contrasts RETAINS the producer's stamp (binding and digest, serialized by
-        to_json) and validates it against the record; it never issues a stamp from the record's own metadata. `D, W`
-        are the record's own stamped contrasts, `otherD, otherW` another record's."""
+        """Codex #68 D6 r4 P2-2, r5: restore_hc_contrasts accepts a payload only if its role-tagged digest is the one
+        the RECORD stores (a carried stamp can only refuse); string block keys are normalized first. `D, W` are the
+        record's own contrasts (stats.eligibility's), `otherD, otherW` another record's."""
+        import pickle
+        produced = "not the values stats.eligibility produced for this record"
+
         def wire(x):                                      # (a real JSON round trip: the block keys become strings)
             return json.loads(json.dumps(x.to_json()))
+
+        def bare(x):                                      # (json.dumps of the mapping itself: string keys, no stamp)
+            return json.loads(json.dumps(x))
         first = next(iter(wire(D)["blocks"]))
         self.assertIsInstance(first, str)
-        # (a legitimate restore of the record's own stamped contrasts: JSON round trip, in memory, and a record
-        # loaded from its file; the block keys are ints again, the stamps are the producer's)
-        for rec_, d, w in ((rec, wire(D), wire(W)), (rec, D, W), (json.loads(json.dumps(rec)), wire(D), wire(W))):
+        distinct = (dict(otherD), dict(otherW)) != (dict(D), dict(W))
+        # (the record's own contrasts restore from a JSON document, in memory, a bare JSON mapping, a plain dict or a
+        # pickle, also against a record loaded from its file; the int keys are back, the document's stamp is kept)
+        loaded = json.loads(json.dumps(rec))
+        for rec_, d, w in ((rec, wire(D), wire(W)), (rec, D, W), (loaded, wire(D), wire(W)), (rec, bare(D), bare(W)),
+                           (rec, dict(D), dict(W)), (rec, pickle.loads(pickle.dumps(D)), pickle.loads(pickle.dumps(W)))):
             d2, w2 = stats.restore_hc_contrasts(rec_, d, w)
             self.assertEqual((dict(d2), dict(w2)), (dict(D), dict(W)))
-            self.assertEqual((d2.binding, d2.digest, w2.binding, w2.digest), (D.binding, D.digest, W.binding, W.digest))
+            self.assertTrue(all(isinstance(b, int) for b in d2) and all(isinstance(b, int) for b in w2))
             self.assertEqual(stats.decide(rec, {}, d2, w2)["pvalues"], stats.decide(rec, {}, D, W)["pvalues"])
-        self.assertTrue(all(isinstance(b, int) for b in d2))
-        # (the exact counterexample: the other record's stamped contrasts, restored for this record, in memory or
-        # serialized, are refused, whatever the record's own metadata says)
+        d2, w2 = stats.restore_hc_contrasts(rec, wire(D), wire(W))
+        self.assertEqual((d2.role, d2.binding, d2.digest, w2.role), (D.role, D.binding, D.digest, W.role))
+        # (the other record's stamped contrasts, restored for this record, in memory or serialized, whole or half)
         for d, w in ((otherD, otherW), (wire(otherD), wire(otherW)), (otherD, W), (wire(D), wire(otherW))):
             with self.assertRaisesRegex(stats.StatsError, msg):
                 stats.restore_hc_contrasts(rec, d, w)
-        # (edited, relabelled or stripped stamps are refused: no fresh digest or binding is issued)
+        if distinct:                                      # (the other record's values without a stamp: the anchor)
+            for d, w in ((dict(otherD), dict(otherW)), (bare(otherD), bare(otherW)), (D, dict(otherW))):
+                with self.assertRaisesRegex(stats.StatsError, produced):
+                    stats.restore_hc_contrasts(rec, d, w)
+        # (edited, relabelled or stripped stamps, and edited values without any stamp, are refused)
         edited = wire(D)
         edited["blocks"][first][0] += 1.0
         relabelled = wire(otherD)
@@ -735,15 +790,28 @@ class TestEligibility(unittest.TestCase):
         for doc in (edited, relabelled, stripped):
             with self.assertRaisesRegex(stats.StatsError, "changed after they were produced"):
                 stats.restore_hc_contrasts(rec, doc, wire(W))
+        unstamped = dict(edited, binding=None, digest=None, role=None)
+        with self.assertRaisesRegex(stats.StatsError, produced):
+            stats.restore_hc_contrasts(rec, unstamped, wire(W))
         unbound = wire(D)
         unbound["binding"] = None
         with self.assertRaisesRegex(stats.StatsError, msg):
             stats.restore_hc_contrasts(rec, unbound, wire(W))
-        # (bare dicts, json.dumps of one, another schema, bad or repeated block keys, non-finite values)
-        bad_blocks = [{"01": [1.0, 2.0]}, {"x": [1.0, 2.0]}, {1: [1.0, 2.0], "1": [1.0, 2.0]}, {first: [float("nan"), 0.0]},
-                      {first: [True, 0.0]}, {first: [1.0]}]
-        for bad, why in ([(dict(D), "stamped contrasts document"), (json.loads(json.dumps(D)), "stamped contrasts document"),
-                          (None, "stamped contrasts document"), (dict(wire(D), schema="x"), "stamped contrasts document")]
+        # (weights restored as deltas and the reverse: the stamp's role refuses it; with the role erased, the
+        # anchor's role-tagged digest does)
+        for d, w in ((wire(W), wire(W)), (wire(D), wire(D)), (W, W), (D, D)):
+            with self.assertRaisesRegex(stats.StatsError, "role mismatch"):
+                stats.restore_hc_contrasts(rec, d, w)
+        for d, w in ((dict(wire(W), role=None), wire(W)), (bare(W), bare(W)), (dict(W), dict(W))):
+            with self.assertRaisesRegex(stats.StatsError, produced):
+                stats.restore_hc_contrasts(rec, d, w)
+        # (malformed: not a mapping, another schema, a block key that is not a canonical block id or a second spelling of
+        # one (json.loads drops duplicate members before this API sees them, so only duplicate normalized ids are
+        # claimed), non-finite or bool values, a pair of the wrong length)
+        bad_blocks = [{"01": [1.0, 2.0]}, {"x": [1.0, 2.0]}, {1: [1.0, 2.0], "1": [1.0, 2.0]},
+                      {first: [float("nan"), 0.0]}, {first: [True, 0.0]}, {first: [1.0]}]
+        for bad, why in ([(None, "not a mapping"), (dict(wire(D), schema="x"), "not a contrasts document"),
+                          ({"blocks": 5}, "not a contrasts document"), ({"01": [1.0, 2.0]}, "not a block id")]
                          + [(dict(wire(D), blocks=b), "not a block id") for b in bad_blocks]):
             with self.assertRaisesRegex(stats.StatsError, why):
                 stats.restore_hc_contrasts(rec, bad, wire(W))
