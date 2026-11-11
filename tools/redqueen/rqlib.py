@@ -111,11 +111,12 @@ def fsync_file(p):
         os.close(fd)
 
 
-def mkdirs_durable(path):
+def mkdirs_durable(path, *, ancestors=False):
     """Create a directory chain and fsync each new entry's parent before returning.
 
     Call before launching workers: syncing files inside a cell does not persist
-    the cell's own entry in work/, or a new study's entry in its parent.
+    the cell's own entry in work/, or a new study's entry in its parent. Startup
+    uses ancestors=True to repair barriers left unfinished by an earlier attempt.
     """
     path = os.path.abspath(path)
     missing = []
@@ -124,6 +125,14 @@ def mkdirs_durable(path):
         missing.append(parent)
         parent = os.path.dirname(parent)
     os.makedirs(path, exist_ok=True)
+    if ancestors:
+        directory = path
+        while True:
+            fsync_dir(directory)
+            parent = os.path.dirname(directory)
+            if parent == directory:
+                return
+            directory = parent
     for directory in reversed(missing):
         fsync_dir(os.path.dirname(directory))
 
@@ -169,13 +178,15 @@ def load_reservations(path):
 
     Formats: seed-keyed JSON documents (including canonical worlds reservations),
     JSONL objects, archived-seeds/1 numeric-key inventories, plain decimal
-    integers per line, a JSON integer list, or a flat
+    integers per line, JSON arrays of integers or seed-bearing objects, or a flat
     label-to-integer map. JSON seed values must be integers, never strings/bools.
     Empty inventories are refused. The historical recursive seed-key policy is
     retained, including conservative reservations from seed-named metadata.
     Canonical seed_slot fields and assay groups (including groups.reseed) contain
     source labels, not seed values. Their strings are ignored, just as in the old
     integer-only traversal; integers beneath seed-bearing keys remain reserved.
+    Argument arrays also reserve the engine's --seed, --transplant-seed and
+    --reseed-after-load values, including the redundant seed in registry config_args.
     """
     def fail(message):
         raise ReservationError(f"{path}: {message}")
@@ -195,6 +206,27 @@ def load_reservations(path):
         fail(str(exc))
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     seeds = set()
+    seed_flags = {"--seed", "--transplant-seed", "--reseed-after-load"}
+
+    def argv_seeds(args):
+        consumed = set()
+        for index, arg in enumerate(args):
+            if not isinstance(arg, str):
+                continue
+            flag = arg.split("=", 1)[0]
+            if flag not in seed_flags:
+                continue
+            if arg != flag:
+                fail(f"{flag} requires a separate decimal integer argument")
+            if index + 1 == len(args):
+                fail(f"{flag} is missing its seed argument")
+            value = args[index + 1]
+            if not ((type(value) is int and value >= 0)
+                    or (isinstance(value, str) and re.fullmatch(r"[0-9]+", value))):
+                fail(f"{flag} requires a nonnegative decimal integer (got {value!r})")
+            seeds.add(int(value))
+            consumed.update((index, index + 1))
+        return consumed
 
     def walk(obj, hint=False, strict=False, group_labels=False):
         if isinstance(obj, dict):
@@ -206,8 +238,10 @@ def load_reservations(path):
                 seed_value = seed_hint and not metadata and not labels
                 walk(value, hint or seed_hint, strict or seed_value, labels)
         elif isinstance(obj, list):
-            for value in obj:
-                walk(value, hint, strict, group_labels)
+            consumed = argv_seeds(obj)
+            for index, value in enumerate(obj):
+                if index not in consumed:
+                    walk(value, hint, strict, group_labels)
         elif type(obj) is int:
             if hint:
                 if obj < 0:
@@ -227,11 +261,15 @@ def load_reservations(path):
                 docs = [json.loads(line, object_pairs_hook=unique_object) for line in lines]
             except json.JSONDecodeError as exc:
                 fail(f"unsupported reservation format ({exc})")
-        for doc in docs:
+        def document(doc):
             if isinstance(doc, list):
-                if not doc or any(type(value) is not int or value < 0 for value in doc):
-                    fail("expected a nonempty JSON integer list")
-                seeds.update(doc)
+                if argv_seeds(doc):
+                    walk(doc)
+                    return
+                for value in doc:
+                    document(value)
+            elif type(doc) is int and doc >= 0:
+                seeds.add(doc)
             elif isinstance(doc, dict):
                 if doc and all(type(value) is int and value >= 0 for value in doc.values()):
                     seeds.update(doc.values())
@@ -244,7 +282,9 @@ def load_reservations(path):
                         seeds.update(int(key) for key in inventory)
                     walk(doc)
             else:
-                fail("expected seed-keyed JSON, JSONL objects, or decimal integers per line")
+                fail("expected seed-keyed JSON, arrays of objects/integers, or decimal integers per line")
+        for doc in docs:
+            document(doc)
     if not seeds:
         fail("no seed reservations extracted; empty or unsupported inventory")
     return seeds, {"path": os.path.abspath(path), "sha256": sha256_bytes(raw), "seeds": len(seeds)}

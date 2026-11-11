@@ -1891,6 +1891,63 @@ class TestReservations(unittest.TestCase):
                 with self.assertRaisesRegex(plan.DesignError, str(p)):
                     plan.read_joint_plan(p)
 
+    def test_mixed_argument_reservations(self):
+        """Every engine seed flag counts even beside a recognized structural seed."""
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / 'inventory'
+            for flag in ('--seed', '--transplant-seed', '--reseed-after-load'):
+                for text in (
+                        json.dumps({'seed': 101, 'argv': ['engine', flag, '102']}),
+                        json.dumps({'seed': 101}) + '\n' + json.dumps({'argv': [flag, '102']}),
+                        json.dumps({'seed': 101, 'nested': {'command': [flag, 102]}}),
+                        json.dumps({'founder_seed': 101, 'config_args': ['--seed', '101', flag, '102']})):
+                    p.write_text(text)
+                    for loader in (worlds.read_avoid, plan.avoid_seeds, nb.avoid_seeds):
+                        with self.subTest(flag=flag, text=text, loader=loader.__module__):
+                            self.assertEqual(loader(p), {101, 102})
+            p.write_text(json.dumps({'seed': 101, 'argv': [
+                '--seed', '102', '--transplant-seed', '103', '--reseed-after-load', '104']}))
+            for loader in (worlds.read_avoid, plan.avoid_seeds, nb.avoid_seeds):
+                self.assertEqual(loader(p), {101, 102, 103, 104})
+
+    def test_malformed_argument_reservations(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / 'inventory'
+            for flag in ('--seed', '--transplant-seed', '--reseed-after-load'):
+                for args in ([flag], [flag, 'bad'], [flag, '-1'], [flag, True],
+                             [flag, 1.5], [flag, None], [flag + '=102']):
+                    # A valid reservation in a separate JSONL row must not mask the error.
+                    p.write_text(json.dumps({'seed': 101}) + '\n' + json.dumps({'argv': args}))
+                    for loader in (worlds.read_avoid, plan.avoid_seeds, nb.avoid_seeds):
+                        with self.subTest(args=args, loader=loader.__module__):
+                            with self.assertRaisesRegex(Exception, str(p)):
+                                loader(p)
+
+    def test_object_array_worlds_compatibility(self):
+        """This exact public API/fixture worked before the shared loader existed."""
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / 'inventory.json'
+            p.write_text('[{"seed":101},{"seed":102}]')
+            self.assertEqual(worlds.read_avoid(p), {101, 102})
+
+    def test_recursive_object_arrays_all_loaders(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / 'inventory.json'
+            for text in ('[{"seed":101},{"seed":102}]',
+                         '[101,[{"seed":102},{"reserved_seeds":[103]}]]',
+                         '[{"seed":101},{"argv":["--reseed-after-load","102"]}]'):
+                p.write_text(text)
+                expected = {101, 102, 103} if '103' in text else {101, 102}
+                for loader in (worlds.read_avoid, plan.avoid_seeds, nb.avoid_seeds):
+                    with self.subTest(text=text, loader=loader.__module__):
+                        self.assertEqual(loader(p), expected)
+            for value in ('102', False, 1.5):
+                p.write_text(json.dumps([{'seed': 101}, {'seed': value}]))
+                for loader in (worlds.read_avoid, plan.avoid_seeds, nb.avoid_seeds):
+                    with self.subTest(value=value, loader=loader.__module__):
+                        with self.assertRaisesRegex(Exception, str(p)):
+                            loader(p)
+
     def test_joint_accepts_canonical_optional_seed_pairs(self):
         with tempfile.TemporaryDirectory() as d:
             p = Path(d) / "plan.jsonl"
@@ -1934,6 +1991,53 @@ class TestReservations(unittest.TestCase):
                     self.assertEqual(loader(p), expected)
 
 class TestAdmissionDurability(unittest.TestCase):
+
+    def test_initialization_barrier_failure_then_same_path_retry(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / 'new' / 'study'
+            work = root / 'work'
+            planfile = Path(d) / 'plan.jsonl'
+            planfile.write_text('{}\n')
+            barriers = []
+            real = rqlib.fsync_dir
+
+            def interrupted_sync(path):
+                real(path)
+                if Path(path) == root.parent:
+                    raise OSError('injected startup barrier failure')
+
+            def sync(path):
+                barriers.append(Path(path))
+                real(path)
+
+            def launch(*args, **kw):
+                ancestors = [work, root, root.parent, Path(d)]
+                while ancestors[-1].parent != ancestors[-1]:
+                    ancestors.append(ancestors[-1].parent)
+                self.assertEqual(barriers[:len(ancestors)], ancestors)
+                # One startup work/ barrier and exactly one for the new cell entry.
+                self.assertEqual(barriers.count(work), 2)
+                self.assertTrue((work / 'cell').is_dir())
+                raise OSError('injected launch failure after checking repaired barriers')
+
+            args = ['--root', str(root), '--plan', str(planfile), '--binary', 'fake']
+            with contextlib.ExitStack() as stack:
+                for name in ('pin_binary', 'pin_tools', 'pin_env'):
+                    stack.enter_context(mock.patch.object(run, name))
+                stack.enter_context(mock.patch.object(run, 'load_plan', return_value=[{'schema': run.PLAN_SCHEMA, 'id': 'cell'}]))
+                stack.enter_context(mock.patch.object(run, 'resolve_sources', return_value=(None, [])))
+                stack.enter_context(mock.patch.object(run, 'mem_headroom_mb', return_value=100000))
+                stack.enter_context(mock.patch.object(run, 'disk_problem', return_value=None))
+                proc = stack.enter_context(mock.patch.object(run.subprocess, 'Popen', side_effect=launch))
+                with mock.patch.object(rqlib, 'fsync_dir', side_effect=interrupted_sync):
+                    with self.assertRaisesRegex(OSError, 'injected startup barrier failure'):
+                        run.main(args)
+                self.assertTrue(work.is_dir())
+                proc.assert_not_called()
+                with mock.patch.object(rqlib, 'fsync_dir', side_effect=sync):
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        self.assertEqual(run.main(args), 1)
+                proc.assert_called_once()
 
     def test_directory_chain_parent_barriers(self):
         with tempfile.TemporaryDirectory() as d:

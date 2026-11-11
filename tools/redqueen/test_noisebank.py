@@ -1213,6 +1213,23 @@ class TestBankCoverage(unittest.TestCase):
                 self.fitted(doc, descriptive=True)
             doc['observations'].pop()
 
+    def test_empty_expanded_bank_design(self):
+        doc = copy.deepcopy(self.doc)
+        doc['design']['edges'] = []
+        doc['design_sha256'] = rqlib.canonical_sha(doc['design'])
+        rows, _, _ = plan.expand_v2(doc['design'], pending=True)
+        self.assertEqual(rows, [])
+        with self.assertRaisesRegex(nb.NoiseBankError, 'empty.*allocation'):
+            self.fitted(doc)
+
+    def test_exactly_one_missing_free_control(self):
+        doc = copy.deepcopy(self.doc)
+        free = next(o for o in doc['observations'] if o['pred'] is None)
+        doc['observations'].remove(free)
+        self.assertEqual(len(doc['observations']), 18431)
+        with self.assertRaisesRegex(nb.NoiseBankError, r'1 missing, 0 extra'):
+            self.fitted(doc)
+
     def test_cli_requires_descriptive_flag_for_partial_bank(self):
         doc = copy.deepcopy(self.doc)
         doc['observations'].pop()

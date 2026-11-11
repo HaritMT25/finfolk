@@ -771,7 +771,7 @@ def _main(argv, files):
     if a.chunk_size < 1 or a.retries < 0:
         ap.error("--chunk-size >= 1 and --retries >= 0")
 
-    rqlib.mkdirs_durable(os.path.join(root, store.WORK))
+    rqlib.mkdirs_durable(os.path.join(root, store.WORK), ancestors=True)
     lock = files.enter_context(open(os.path.join(root, ".runner.lock"), "w"))
     try:
         import fcntl
