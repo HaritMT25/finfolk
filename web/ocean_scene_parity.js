@@ -1028,6 +1028,10 @@
      *     32-slot rows and of slot 2048 (draws and slots reported),
      *     against EvoAppearance.decode / flankAt of the original rows (p99.9
      *     <= .002, nothing non-finite)
+     *   decoded (the render optimization's cache, when the policy asks for it): the production decoded
+     *     texture itself, read back from the GPU as it is (three's own upload of it), every drawn fish's 72
+     *     floats at its own slot bit for bit against a fresh EvoAppearance.writeDecoded of its owned row;
+     *     asked for but not uploaded fails (res.decoded; o.mutate "decoded": the read at a wrong slot)
      * The probe must upload nothing: one that did would have repaired a
      * missed production upload, and that fails. expected: owned copies
      * {worldEpoch, n, ids, app, body} (EvoOcean.bench.snapshotCopy), which
@@ -1106,6 +1110,7 @@
       if (why) { res.error = "the expected snapshot is not the one drawn: " + why; return Promise.resolve(res); }
       var app = exp.app instanceof Float32Array ? exp.app : Float32Array.from(exp.app), body = exp.body;
       var tex = appKind.tex, slotOf = appKind.attrs.iGeneSlot.array;
+      var slotNow = Float32Array.from(slotOf.subarray(0, n));   /* each draw's slot as drawn (the attribute changes in later frames) */
       res.texture = { width: tex.image.width, height: tex.image.height, type: tex.type, format: tex.format,
                       internalFormat: tex.internalFormat || "RGBA32F (three: RGBAFormat + FloatType)", capacity: appKind.slots.capacity,
                       drawCapacity: appKind.cap, minFilter: tex.minFilter, magFilter: tex.magFilter, mipmaps: tex.generateMipmaps };
@@ -1114,7 +1119,8 @@
       if (o.mutate === "slot") {   /* the slot each fish really has, xor 1 (a permutation could equal gl_InstanceID ^ 1) */
         var wrong = GENE_SLOT_GLSL.split(GENE_SLOT_RET).join("return int(iGeneSlot) ^ 1;");
         rawVs = rawVs.split(GENE_SLOT_GLSL).join(wrong); chartVs = chartVs.split(GENE_SLOT_GLSL).join(wrong);
-      } else if (o.mutate) { res.error = "unknown mutation " + o.mutate; return Promise.resolve(res); }
+      } else if (o.mutate && o.mutate !== "decoded") { res.error = "unknown mutation " + o.mutate; return Promise.resolve(res); }
+      var dmut = o.mutate === "decoded" ? 1 : 0;   /* "decoded": only the decoded cache's read is at the wrong slot (xor 1) */
       var picks = chartPicks(n, o.charts || 24, slotOf), pickSlots = picks.map(function (c) { return slotOf[c]; }), CW = 96, CH = 48, PER = 64, COLS = 8;
       var geos = [], mats = [], rts = [], reads = [], batches = [], err = null, shaderErr = null;
       var keepRT = renderer.getRenderTarget(), keepClear = renderer.autoClear, keepOnErr = renderer.debug.onShaderError;
@@ -1189,6 +1195,38 @@
         renderer.autoClear = keepClear;
         renderer.debug.onShaderError = keepOnErr;
       }
+      /* the decoded cache's production texture (the render optimization's policy decoded: appKind.decodedStats().texture, three's own upload
+       * of it), as the GPU holds it now: read into a pixel-pack buffer here, right after the production draw and every upload it made,
+       * and compared below, bit for bit, with a fresh EvoAppearance.writeDecoded of each drawn fish's owned row at the fish's own slot
+       * (the texture's floats are slot x 72, row-major). Asked for but not uploaded fails; not asked for (the reference pipeline, the
+       * policy off) is not checked. A diagnostic: nothing here uploads. */
+      var dread = null, dst = appKind.decodedStats();
+      res.decoded = { checked: false, reason: dst.live && dst.wanted ? "" : "the decoded cache is not asked for" };
+      if (!err && !shaderErr && dst.live && dst.wanted) {
+        try {
+          var dpr = renderer.properties.get(dst.texture), dgl = dpr && dpr.__webglTexture;
+          if (!dst.ready || !dgl) { res.decoded.reason = !dst.ready ? "the decoded cache is asked for but not uploaded (needFull)" : "the decoded texture has no GPU copy"; res.failures.push(res.decoded.reason); }
+          else {
+            var dW = dst.texture.image.width, dH = dst.texture.image.height, keepFB = gl.getParameter(gl.FRAMEBUFFER_BINDING), dfb = gl.createFramebuffer();
+            try {
+              gl.bindFramebuffer(gl.FRAMEBUFFER, dfb);
+              gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, dgl, 0);
+              var dfs = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+              if (dfs !== gl.FRAMEBUFFER_COMPLETE) throw new Error("the decoded texture's framebuffer is incomplete (" + dfs + ")");
+              var db = gl.createBuffer();
+              gl.bindBuffer(gl.PIXEL_PACK_BUFFER, db);
+              gl.bufferData(gl.PIXEL_PACK_BUFFER, dW * dH * 16, gl.STREAM_READ);
+              gl.readPixels(0, 0, dW, dH, gl.RGBA, gl.FLOAT, 0);
+              reads.push(db);
+              dread = { buf: db, w: dW, h: dH };
+            } finally {
+              gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+              gl.bindFramebuffer(gl.FRAMEBUFFER, keepFB);
+              gl.deleteFramebuffer(dfb);
+            }
+          }
+        } catch (e) { res.decoded.reason = "decoded readback: " + (e && e.message || e); res.failures.push(res.decoded.reason); }
+      }
       res.extraUploads = geneIO.uploads - up0;
       var sync = err || shaderErr ? null : gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
       if (sync) gl.flush();
@@ -1223,6 +1261,23 @@
           } else if (gotU[gi] !== 0) R.paddingMismatches++;
         }
         res.rawGenes = R;
+        if (dread) {   /* the decoded cache's texture as the GPU held it: each drawn fish's 72 floats against a fresh decode of its row */
+          var dp = fetch(dread), dU = new Uint32Array(dp.buffer), DF = EA.DECODED_FLOATS, tmp = new Float32Array(DF), tU = new Uint32Array(tmp.buffer);
+          /** @type {{checked: boolean, fish: number, floats: number, mismatches: number, nonFinite: number, texels: string, mutate: string, examples: object[], reason?: string}} */
+          var DR = { checked: true, fish: n, floats: n * DF, mismatches: 0, nonFinite: 0, texels: dread.w + "x" + dread.h, mutate: dmut ? "decoded" : "", examples: [] };
+          for (var cd = 0; cd < n; cd++) {
+            EA.writeDecoded(app.subarray(ST * cd, ST * cd + ST), tmp, 0);
+            var base = (slotNow[cd] ^ dmut) * DF;
+            if (base + DF > dp.length) { DR.mismatches += DF; if (DR.examples.length < 6) DR.examples.push({ draw: cd, slot: slotNow[cd], why: "past the texture" }); continue; }
+            for (var jd = 0; jd < DF; jd++) {
+              if (!Number.isFinite(dp[base + jd])) DR.nonFinite++;
+              if (dU[base + jd] !== tU[jd]) { DR.mismatches++; if (DR.examples.length < 6) DR.examples.push({ draw: cd, id: exp.ids[cd], slot: slotNow[cd], float: jd, want: tmp[jd], got: dp[base + jd] }); }
+            }
+          }
+          res.decoded = DR;
+          if (DR.mismatches) res.failures.push(DR.mismatches + " decoded cache mismatches (the GPU copy against a fresh decode)");
+          if (DR.nonFinite) res.failures.push(DR.nonFinite + " non-finite decoded cache floats");
+        }
         if (o.rawWords) res.rawWords = gotU.slice(0, n * 64);   /* (tests: the words as read, in draw order; dirty vs full) */
         /* the charts against the CPU mirror of the original rows */
         var errs = [], nonFinite = 0, over = 0, maxErr = 0, worst = "", out = [0, 0, 0];

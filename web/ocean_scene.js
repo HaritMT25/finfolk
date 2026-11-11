@@ -1294,7 +1294,7 @@
         if (renderNow.decoded && self.pending && self.tex) renderer.initTexture(self.tex);
       };
       self.decodedStats = function () {
-        return { live: dec.live, ready: !!dec.tex && !dec.needFull, capacity: dec.cap, decodes: dec.decodes, uploads: dec.uploads, calls: dec.calls, bytes: dec.bytes,
+        return { live: dec.live, wanted: renderWant.decoded, ready: !!dec.tex && !dec.needFull, capacity: dec.cap, decodes: dec.decodes, uploads: dec.uploads, calls: dec.calls, bytes: dec.bytes,
                  allocs: dec.allocs, fullUploads: dec.full, needFull: dec.needFull, texture: dec.tex, data: dec.data, bytesStored: dec.data.byteLength };
       };
       self.restoreDecoded = function () { dec.needFull = true; dec.fullQueued = false; dec.queued = false; };

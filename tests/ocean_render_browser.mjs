@@ -228,8 +228,11 @@ function texSummary(r) {
   if (!r) return r;
   return { ok: r.ok, error: r.error, failures: r.failures, fish: r.fish, worldEpoch: r.worldEpoch, tick: r.tick, extraUploads: r.extraUploads,
            rawGenes: r.rawGenes, intrinsic: r.intrinsic && Object.assign({}, r.intrinsic, { draws: undefined, ids: undefined, charted: r.intrinsic.draws }),
-           texture: r.texture, slots: r.slots, mutate: r.mutate, pendingUpload: r.pendingUpload };
+           decoded: r.decoded, texture: r.texture, slots: r.slots, mutate: r.mutate, pendingUpload: r.pendingUpload };
 }
+/* the decoded cache's production texture as the GPU holds it, against a fresh decode of each drawn fish's row (the live probe's `decoded`;
+ * the review of #85: the probe read only the raw genes, so a wrong production decoded upload was invisible to it) */
+const decodedOk = (r, n) => !!(r && r.decoded && r.decoded.checked === true && r.decoded.mismatches === 0 && r.decoded.nonFinite === 0 && (n === undefined || r.decoded.fish === n));
 
 /* the upload interceptor, while __up.on: texImage2D / texSubImage2D calls whose
  * pixels are the gene texture's storage (the scene's current one, asked at the
@@ -459,6 +462,8 @@ async function partCorrectness() {
     parity["texture_" + mode] = texSummary(t);
     check("live gene texture, " + mode + " colours: raw genes bit-exact, charts p99.9 <= .002, no probe upload",
           t.ok === true && t.rawGenes.mismatches === 0 && t.rawGenes.paddingMismatches === 0 && t.extraUploads === 0, texSummary(t));
+    check("live decoded texture, " + mode + " colours (the production upload, read back from the GPU): every drawn fish's 72 floats bit-exact against a fresh decode of its row",
+          decodedOk(t, t.fish) && t.decoded.floats === 72 * t.fish, t.decoded);
   }
   /* bench.info().dashboardOpen against the charts' own state (finding 12): closed, open, a capture with them open, closed */
   const dsh = await L.page.evaluate(async () => {
@@ -602,7 +607,8 @@ async function partSlots() {
                    intercepted: { calls: window.__up.n, bytes: window.__up.bytes, allocs: window.__up.allocs, rects: window.__up.rects.slice(0, 12) },
                    drawn: S.appearance().shapes, status: S.appearance().status,
                    probe: t && { ok: t.ok, error: t.error, failures: t.failures, mismatches: t.rawGenes && t.rawGenes.mismatches, padding: t.rawGenes && t.rawGenes.paddingMismatches,
-                                 extraUploads: t.extraUploads, p999: t.intrinsic && t.intrinsic.p999, chartedSlots: t.intrinsic && t.intrinsic.slots } };
+                                 extraUploads: t.extraUploads, p999: t.intrinsic && t.intrinsic.p999, chartedSlots: t.intrinsic && t.intrinsic.slots,
+                                 decoded: t.decoded && { checked: t.decoded.checked, fish: t.decoded.fish, mismatches: t.decoded.mismatches, nonFinite: t.decoded.nonFinite, error: t.decoded.error, reason: t.decoded.reason } } };
       out.steps[name] = st;
       return { st, slots };
     }
@@ -684,7 +690,9 @@ async function partSlots() {
     return out;
   });
   report.parts.slots = r;
-  const st = r.steps, P = (x) => x.probe && x.probe.ok === true && x.probe.mismatches === 0 && x.probe.padding === 0 && x.probe.extraUploads === 0;
+  /* P: the raw genes exact and, new in the review of #85, the decoded cache's production texture exact on the GPU (every drawn fish's 72 floats) */
+  const st = r.steps, P = (x) => x.probe && x.probe.ok === true && x.probe.mismatches === 0 && x.probe.padding === 0 && x.probe.extraUploads === 0 &&
+    !!x.probe.decoded && x.probe.decoded.checked === true && x.probe.decoded.mismatches === 0 && x.probe.decoded.nonFinite === 0 && x.probe.decoded.fish === x.n;
   const none = (x) => x.uploads === 0 && x.calls === 0 && x.bytes === 0 && x.allocs === 0 && x.intercepted.calls === 0 && x.intercepted.allocs === 0;
   check("the real world (2,048 fish, a new epoch): identity slots, then nothing uploaded frame after frame; exact", r.identity && st.same.n === 2048 && none(st.same) && P(st.same), st.same);
   check("reversed draw order: every fish keeps its slot, no gene upload, exact", r.reversedKeeps && none(st.reversed) && P(st.reversed), st.reversed);
@@ -879,6 +887,11 @@ async function partFaults() {
 
   const good = await L.page.evaluate(() => EvoOcean.bench.textureParity());
   check("live texture, unplanted: passes", good.ok === true, texSummary(good));
+  check("  and its decoded cache's GPU copy is checked and exact", decodedOk(good, good.fish), good.decoded);
+  const dmut = await L.page.evaluate(() => EvoOcean.bench.textureParity({ mutate: "decoded" }));
+  pf.texture_decodedSlot = texSummary(dmut);
+  check("live texture, the decoded read at a wrong slot: fails on the decoded copy alone (the raw genes still match)",
+        !dmut.error && dmut.ok === false && dmut.rawGenes.mismatches === 0 && dmut.decoded.checked === true && dmut.decoded.mismatches > 0, pf.texture_decodedSlot);
   const slot = await L.page.evaluate(() => EvoOcean.bench.textureParity({ mutate: "slot" }));
   pf.texture_slot = texSummary(slot);
   check("live texture, a wrong slot in the probes: fails (raw mismatches)", !slot.error && slot.ok === false && slot.rawGenes.mismatches > 0, pf.texture_slot);
@@ -898,6 +911,8 @@ async function partFaults() {
   pf.texture_heldUpload = texSummary(stale.held);
   check("live texture, a new world's uploads held back: fails against the new world's genes", !stale.held.error && stale.held.ok === false && stale.held.rawGenes.mismatches > 0, pf.texture_heldUpload);
   check("  released, the next frame's upload passes (epoch " + stale.epoch + ")", stale.after.ok === true, texSummary(stale.after));
+  check("  the decoded cache's GPU copy is stale with it (its upload follows the raw plan, which was held): fails against a fresh decode of the new world's rows; released, exact",
+        !stale.held.error && stale.held.decoded.checked === true && stale.held.decoded.mismatches > 0 && decodedOk(stale.after, stale.after.fish), { held: stale.held.decoded, after: stale.after.decoded });
   check("no console / page / network errors", L.errors.length === 0, L.errors.slice(0, 5));
   await L.ctx.close();
 }
@@ -1076,7 +1091,7 @@ async function partIframe() {
     return out;
   }, GATE_CHECK.toString());
   r.parentCoi = await L.page.evaluate(() => self.crossOriginIsolated);
-  const brief = (t) => ({ ok: t.ok, error: t.error, failures: t.failures, fish: t.fish });
+  const brief = (t) => ({ ok: t.ok, error: t.error, failures: t.failures, fish: t.fish, decoded: t.decoded && { checked: t.decoded.checked, mismatches: t.decoded.mismatches, fish: t.decoded.fish } });
   report.parts.iframe = Object.assign({}, r, { texFollow: brief(r.texFollow), texAfterTurbo: brief(r.texAfterTurbo) });
   check("the child is not cross-origin isolated, at 890 x 453", r.coi === false && r.parentCoi === false && r.size[0] === 890 && r.size[1] === 453, { coi: r.coi, size: r.size });
   check("the colour buttons in the embed: each mode, its pressed button, colourBrain, the scene's skin",
@@ -1085,7 +1100,8 @@ async function partIframe() {
   check("colours, select + follow, restart (new epoch), Turbo there and back (same epoch)",
         r.colour === "appearance" && r.following && r.epochAfterRestart[1] === r.epochAfterRestart[0] + 1 && r.turbo === "turbo" && r.back === "live" &&
         r.epochAcrossTurbo[0] === r.epochAcrossTurbo[1], report.parts.iframe);
-  check("live texture check in the embed, following and after Turbo", r.texFollow.ok && r.texAfterTurbo.ok, { a: brief(r.texFollow), b: brief(r.texAfterTurbo) });
+  check("live texture check in the embed, following and after Turbo (the decoded cache's GPU copy exact too)", r.texFollow.ok && r.texAfterTurbo.ok &&
+        decodedOk(r.texFollow, r.texFollow.fish) && decodedOk(r.texAfterTurbo, r.texAfterTurbo.fish), { a: brief(r.texFollow), b: brief(r.texAfterTurbo) });
   check("Stop Turbo & start in the embed: asked first (Turbo used), then exactly one new world, live",
         r.replaceAsked === true && r.replace.turbo === "live" && r.replace.epoch[1] === r.replace.epoch[0] + 1, r.replace);
   if (r.gate) check("the swim polish's size weights in the embed (890 x 453 canvas rectangle, following) == the independent projection",

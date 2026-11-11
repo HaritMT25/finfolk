@@ -1056,6 +1056,8 @@ interface ParityCheckOptions {
  * gl): their own render targets, three's state restored after, the shader-error hook. */
 interface ParityRenderer {
   getContext(): any;
+  /** three's per-object GPU state (the decoded texture's __webglTexture, read back by the probe) */
+  properties: { get(o: unknown): any };
   resetState(): void;
   getRenderTarget(): unknown;
   setRenderTarget(rt: unknown): void;
@@ -1081,6 +1083,8 @@ interface ParityAppKind {
   mesh: { visible: boolean };
   /** the appearance fish were drawn this frame: the canonical body draw, or (the render optimization) the body buckets */
   drawing(): boolean;
+  /** the decoded cache (the render optimization): kept (live), asked for by the policy (wanted), uploaded (ready), and its three DataTexture */
+  decodedStats(): { live: boolean; wanted: boolean; ready: boolean; texture: any };
 }
 /** The scene's port for the probes (attach, once a scene): fixed parts and live getters, read at each
  * probe, never copied (web/ocean_scene_parity.js attach says what each is). */
