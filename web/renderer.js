@@ -186,8 +186,18 @@
 
   /* Hover info per parameter: d = what it is, t = suggested values (docs/evo_boids_flags.md). */
   var TIPS = {
-    seed: { d: "RNG seed — same seed + same settings replays the run bit-for-bit.", t: "try: any uint32; keep it to reproduce a run" },
-    population: { d: "Starting creature count (the world reseeds below a floor of 50).", t: "try: 200-800; >2000 gets slow in-browser" },
+    seed: { get d() {
+      return "RNG seed — on the single-threaded module the same seed and the same settings replay a run step for step, as long as no " +
+        "live setting changes during it and Hold 60 fps removes no fish. " + (threaded
+          ? "This page runs the threaded module: fast, but its runs do not replay from the seed."
+          : "This page runs the single-threaded module" + (threadWhy ? " (" + threadWhy + ")" : "") + ".");
+    }, t: "try: any uint32; keep it to reproduce a run" },
+    population: { get d() {
+      var floor = intVal("adv_minPopulation", 50);
+      return "Starting creature count. " + (floor > 0
+        ? "Whenever fewer than the reseed floor (now " + floor + ", under World → Population limits) are alive, random founders are added."
+        : "The reseed floor is 0 (World → Population limits): no founders are added, so the population can die out.");
+    }, t: "try: 200-800; >2000 gets slow in-browser" },
     predators: { d: "Number of scripted hunters chasing prey (0 = none).", t: "try: 3-4 with predator economy on" },
     foodPatches: { d: "Cluster food into N spatial patches (0 = uniform scatter).", t: "try: 5-6; patchy food makes currents matter" },
     currentStrength: { d: "Peak ocean-flow speed in world units/sec (0 = still water).", t: "try: 80 with eddies = a lively ocean" },
@@ -433,10 +443,10 @@
     if (!Module || turboState !== "live") return;
     var v = parseFloat(input.value);
     if (!Number.isFinite(v)) v = def;
-    if (key === "maxPopulation") { userCap = Math.max(0, Math.round(v)); applyCap(); return; }
+    if (key === "maxPopulation") { userCap = Math.max(0, Math.round(v)); applyCap(); liveEdited = true; updateModeline(); return; }
     if (!Module._evo_set_param) return;
     var ok = withCString(key, function (ptr) { return Module._evo_set_param(ptr, v); });
-    if (ok) { runCfg[key] = v; showNote((LABELS[key] || key) + " is now " + v + " (live)"); }
+    if (ok) { runCfg[key] = v; liveEdited = true; updateModeline(); showNote((LABELS[key] || key) + " is now " + v + " (live)"); }
     else showError(Module.UTF8ToString(Module._evo_last_error()));
   }
   var tabsEl = el("tabs"), panelsEl = el("panels"), currentTab = "run";
@@ -658,7 +668,7 @@
     autoCap = 0;
     resetGovernor();
     if (!ok) showError("evo_init failed: " + Module.UTF8ToString(Module._evo_last_error()));
-    else { runCfg = cfg; if (dash()) dash().reset(); }   /* a new run: new charts */
+    else { runCfg = cfg; liveEdited = false; loadedRun = false; updateModeline(); if (dash()) dash().reset(); }   /* a new run: new charts */
     return !!ok;
   }
 
@@ -1156,7 +1166,7 @@
     ctx.fillStyle = "rgba(200,200,200,0.78)";
     ctx.fillText(
       "pop " + fmt(st[0]) + "  food " + fmt(st[1]) + "  pred " + fmt(st[2]) +
-      "  frame " + fmt(st[3]) + "  births " + fmt(st[4]) + "  deaths " + fmt(st[5]) +
+      "  frame " + fmt(st[3]) + "  total births " + fmt(st[6]) + "  total deaths " + fmt(st[7]) +
       "  gLen " + st[8].toFixed(1) +
       (STATS_LEN > 10 ? "  gen " + fmt(st[10]) + " (avg " + st[9].toFixed(1) + ")" : "") +
       "  speed " + simSpeed + "x" + (paused ? " [PAUSED]" : ""),
@@ -1189,6 +1199,19 @@
   var governorOn = true;
   var govNote = "";
   var governed = false;   /* the governor has changed this run */
+  var liveEdited = false;  /* a live setting changed this run (applyLive) */
+  var loadedRun = false;   /* this run carries on from a loaded checkpoint */
+  /* what the seed replays on the single-threaded module, for this run's history (the modeline, the numbers' notes) */
+  function replayClaim() {
+    var not = [];
+    if (governed) not.push("the frame budget removed fish from it");
+    if (liveEdited) not.push("a live setting changed during it");
+    if (loadedRun) not.push("it carries on from a loaded world");
+    return "the same seed and settings replay a run step for step" + (not.length ? ", but not this one: " + not.join("; ") : "");
+  }
+  function replayNote() {
+    return threaded ? "Threaded runs are fast but do not replay from the seed." : "Single-threaded (" + threadWhy + "): " + replayClaim() + ".";
+  }
   /* Time ignored after a (re)start: JIT warm-up and buffer growth would
    * otherwise read as "this machine is too slow". Measured in time, not
    * frames — an overloaded page draws few frames, and waiting for N of them
@@ -1269,6 +1292,7 @@
           var removed = Module._evo_cull_to ? Module._evo_cull_to(autoCap) : 0;
           selectedId = null;  /* the inspected creature may be gone */
           governed = true;
+          updateModeline();
           setGovNote((removed ? "removed " + removed + " fish at random, " : "") +
                      "capped at " + autoCap + " to hold 60 fps; this run no longer replays from its seed");
         }
@@ -1308,7 +1332,7 @@
     var cap = userCap > 0 && autoCap > 0 ? Math.min(userCap, autoCap) : (userCap || autoCap);
     var rows = [
       ["Fish", fmtNum(st[0])], ["Food", fmtNum(st[1])], ["Predators", fmtNum(st[2])],
-      ["Births", fmtNum(st[4])], ["Deaths", fmtNum(st[5])],
+      ["Births (total)", fmtNum(st[6])], ["Deaths (total)", fmtNum(st[7])],
       ["Generation", STATS_LEN > 10 ? fmtNum(st[10]) + " (avg " + st[9].toFixed(1) + ")" : "–"],
       ["Genes per fish", st[8].toFixed(1)],
       ["Frame", fmtNum(st[3])],
@@ -1322,9 +1346,7 @@
     var html = "<dl>" + rows.map(function (r) { return "<dt>" + r[0] + "</dt><dd>" + r[1] + "</dd>"; }).join("") + "</dl>";
     var notes = [];
     if (govNote) notes.push(govNote.charAt(0).toUpperCase() + govNote.slice(1) + ".");
-    if (governed) notes.push("The frame budget changed this run, so it no longer replays from its seed.");
-    notes.push(threaded ? "Threaded runs are fast but not reproducible from the seed."
-                        : "Single-threaded (" + threadWhy + "): reproducible from the seed.");
+    notes.push(replayNote());
     html += "<div class='notes'>" + notes.map(function () { return "<p></p>"; }).join("") + "</div>";
     p.innerHTML = html;
     p.querySelectorAll(".notes p").forEach(function (node, i) { node.textContent = notes[i]; });
@@ -1526,6 +1548,7 @@
       return;
     }
     if (!fromTurbo) {
+      liveEdited = false; loadedRun = true;   /* (updateModeline: below, after the governor's reset) */
       try { runCfg = JSON.parse(text).config || {}; } catch (e) { runCfg = {}; }
       if (dash()) dash().reset();
       if (Module._evo_rec_reset) Module._evo_rec_reset(1);   /* the loaded fish, as the tree's roots */
@@ -2104,6 +2127,7 @@
       autoCap = 0;
       el("adv_maxPopulation").value = String(cap);
       resetGovernor();
+      updateModeline();
       updateNeeds();
       updateTabDots();
     }, function (err) { showError("Couldn't read that file: " + err); });
@@ -2181,6 +2205,9 @@
       runConfig: function () { return runCfg; },
       /* fish drawn by brain (genome colour) instead of by family line */
       colourByBrain: function () { return colourBrain; },
+      /* what the fish wear now ("family" or "brain"), and the charts' way to show their family colours in the tank */
+      colourMode: function () { return colourBrain ? "brain" : "family"; },
+      showFamilyColours: function () { setColourBrain(false, true); },
       /* the sampling interval, here and in a running Turbo worker */
       setRecEvery: function (every) {
         Module._evo_rec_config(every, -1);
@@ -2228,7 +2255,7 @@
   function updateModeline() {
     el("modeline").textContent = (threaded
       ? "Running the threaded module (" + Module._evo_threads() + " threads): fast, not reproducible from the seed."
-      : "Running the single-threaded module, reproducible from the seed (" + threadWhy + ").") +
+      : "Running the single-threaded module (" + threadWhy + "): " + replayClaim() + ".") +
       " Drawing: " + drawingName() + ".";
   }
   function start() {
