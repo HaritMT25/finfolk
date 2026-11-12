@@ -193,10 +193,12 @@
           : "This page runs the single-threaded module" + (threadWhy ? " (" + threadWhy + ")" : "") + ".");
     }, t: "try: any uint32; keep it to reproduce a run" },
     population: { get d() {
-      var floor = intVal("adv_minPopulation", 50);
+      /* the floor the running world took (runCfg: a start's, a loaded world's, an applied live edit's), not the form's */
+      var floor = runFloor(), form = intVal("adv_minPopulation", floor);
       return "Starting creature count. " + (floor > 0
-        ? "Whenever fewer than the reseed floor (now " + floor + ", under World → Population limits) are alive, random founders are added."
-        : "The reseed floor is 0 (World → Population limits): no founders are added, so the population can die out.");
+        ? "Whenever fewer than the reseed floor (" + floor + " in this run, under World → Population limits) are alive, random founders are added."
+        : "This run's reseed floor is 0 (World → Population limits): no founders are added, so the population can die out.") +
+        (form !== floor ? " The form's " + form + " is not in this run: Restart starts a world with it." : "");
     }, t: "try: 200-800; >2000 gets slow in-browser" },
     predators: { d: "Number of scripted hunters chasing prey (0 = none).", t: "try: 3-4 with predator economy on" },
     foodPatches: { d: "Cluster food into N spatial patches (0 = uniform scatter).", t: "try: 5-6; patchy food makes currents matter" },
@@ -443,10 +445,18 @@
     if (!Module || turboState !== "live") return;
     var v = parseFloat(input.value);
     if (!Number.isFinite(v)) v = def;
-    if (key === "maxPopulation") { userCap = Math.max(0, Math.round(v)); applyCap(); liveEdited = true; updateModeline(); return; }
+    /* (the run's history changes only with a value: a stepper clamped at its bound still fires change) */
+    if (key === "maxPopulation") {
+      var cap = Math.max(0, Math.round(v));
+      if (cap !== userCap) liveEdited = true;
+      userCap = cap; applyCap(); updateModeline(); return;
+    }
     if (!Module._evo_set_param) return;
     var ok = withCString(key, function (ptr) { return Module._evo_set_param(ptr, v); });
-    if (ok) { runCfg[key] = v; liveEdited = true; updateModeline(); showNote((LABELS[key] || key) + " is now " + v + " (live)"); }
+    if (ok) {
+      if (v !== (key in runCfg ? runCfg[key] : def)) liveEdited = true;
+      runCfg[key] = v; updateModeline(); showNote((LABELS[key] || key) + " is now " + v + " (live)");
+    }
     else showError(Module.UTF8ToString(Module._evo_last_error()));
   }
   var tabsEl = el("tabs"), panelsEl = el("panels"), currentTab = "run";
@@ -668,7 +678,7 @@
     autoCap = 0;
     resetGovernor();
     if (!ok) showError("evo_init failed: " + Module.UTF8ToString(Module._evo_last_error()));
-    else { runCfg = cfg; liveEdited = false; loadedRun = false; updateModeline(); if (dash()) dash().reset(); }   /* a new run: new charts */
+    else { runCfg = cfg; governed = false; liveEdited = false; loadedRun = false; updateModeline(); if (dash()) dash().reset(); }   /* a new run: new charts */
     return !!ok;
   }
 
@@ -1198,16 +1208,31 @@
   var userCap = 0, autoCap = 0;
   var governorOn = true;
   var govNote = "";
-  var governed = false;   /* the governor has changed this run */
-  var liveEdited = false;  /* a live setting changed this run (applyLive) */
+  /* This run's history, for what its seed replays. Set as it happens; cleared only when a new world is
+   * accepted (initWorld's evo_init, a loaded file): a refused Restart or file leaves the run, and them, as they were. */
+  var governed = false;   /* the governor has changed this run (its cap and cull) */
+  var liveEdited = false;  /* a live setting's value changed during this run (applyLive) */
   var loadedRun = false;   /* this run carries on from a loaded checkpoint */
-  /* what the seed replays on the single-threaded module, for this run's history (the modeline, the numbers' notes) */
-  function replayClaim() {
+  /* the reasons this single-threaded run does not replay from its seed: [key, words] */
+  function replayReasons() {
     var not = [];
-    if (governed) not.push("the frame budget removed fish from it");
-    if (liveEdited) not.push("a live setting changed during it");
-    if (loadedRun) not.push("it carries on from a loaded world");
-    return "the same seed and settings replay a run step for step" + (not.length ? ", but not this one: " + not.join("; ") : "");
+    if (governed) not.push(["governed", "the frame budget removed fish from it"]);
+    if (liveEdited) not.push(["live", "a live setting changed during it"]);
+    if (loadedRun) not.push(["loaded", "it carries on from a loaded world"]);
+    return not;
+  }
+  /* the reseed floor the running world took: runCfg's (a start's non-default keys, a loaded world's config,
+   * an applied live edit), else the default */
+  function runFloor() {
+    var v = runCfg ? runCfg.minPopulation : undefined;
+    if (typeof v === "number" && Number.isFinite(v)) return v;
+    for (var i = 0; i < ADV.length; i++) if (ADV[i][0] === "minPopulation") return ADV[i][1];
+    return 50;
+  }
+  function replayClaim() {
+    var not = replayReasons();
+    return "the same seed and settings replay a run step for step" +
+      (not.length ? ", but not this one: " + not.map(function (r) { return r[1]; }).join("; ") : "");
   }
   function replayNote() {
     return threaded ? "Threaded runs are fast but do not replay from the seed." : "Single-threaded (" + threadWhy + "): " + replayClaim() + ".";
@@ -1238,8 +1263,9 @@
     lastFrameAt = now;
   }
   function framesLate() { return intervalEma > displayMs * 1.2; }
+  /* the governor's timing and note start over (`governed`, the run's history, stays: an accepted new world clears it) */
   function resetGovernor() {
-    workEma = 0; overFrames = 0; underFrames = 0; govNote = ""; governed = false;
+    workEma = 0; overFrames = 0; underFrames = 0; govNote = "";
     intervalEma = 0;
     warmupUntil = performance.now() + WARMUP_MS;
     restoreDetail();
@@ -1540,15 +1566,16 @@
     toast("Saved the world at frame " + frameNo.toLocaleString() + ".");
   }
   /* fromTurbo: the Turbo worker handing the same run back, so the dashboards
-   * carry on; a file is a new run, so they start over */
+   * carry on; a file is a new run, so they start over. Returns whether the
+   * module took it (a refusal leaves the running world, and its history, as they were). */
   function loadCheckpointText(text, fromTurbo) {
     var ok = withCString(text, function (ptr) { return Module._evo_load_checkpoint(ptr); });
     if (!ok) {
       showError("Couldn't load that checkpoint: " + Module.UTF8ToString(Module._evo_last_error()));
-      return;
+      return false;
     }
     if (!fromTurbo) {
-      liveEdited = false; loadedRun = true;   /* (updateModeline: below, after the governor's reset) */
+      governed = false; liveEdited = false; loadedRun = true;   /* (updateModeline: the caller's, after the governor's reset) */
       try { runCfg = JSON.parse(text).config || {}; } catch (e) { runCfg = {}; }
       if (dash()) dash().reset();
       if (Module._evo_rec_reset) Module._evo_rec_reset(1);   /* the loaded fish, as the tree's roots */
@@ -1566,6 +1593,7 @@
     updateFitButton();
     el("randnote").textContent = "";  /* the Randomize pick no longer describes this world */
     if (!fromTurbo) showNote("Checkpoint loaded.");
+    return true;
   }
 
   /* ---- TURBO (headless worker) mode ----
@@ -2119,7 +2147,7 @@
     this.value = "";
     if (!file || !Module || guardTurbo()) return;
     file.text().then(function (text) {
-      loadCheckpointText(text);
+      if (!loadCheckpointText(text)) return;   /* refused: the running world, its cap and its governor stay */
       /* the file's own cap becomes the user cap; the governor starts fresh */
       var cap = 0;
       try { cap = (JSON.parse(text).config || {}).maxPopulation || 0; } catch (e) { /* load reported it */ }
@@ -2253,7 +2281,11 @@
     showError("failed to load wasm module: " + err);
   });
   function updateModeline() {
-    el("modeline").textContent = (threaded
+    /* the claim as data too (data-replay "yes" / "no", data-why: the reasons' keys) */
+    var ml = el("modeline"), why = threaded ? ["threaded"] : replayReasons().map(function (r) { return r[0]; });
+    ml.dataset.replay = why.length ? "no" : "yes";
+    ml.dataset.why = why.join(" ");
+    ml.textContent = (threaded
       ? "Running the threaded module (" + Module._evo_threads() + " threads): fast, not reproducible from the seed."
       : "Running the single-threaded module (" + threadWhy + "): " + replayClaim() + ".") +
       " Drawing: " + drawingName() + ".";
