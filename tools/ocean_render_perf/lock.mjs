@@ -130,9 +130,20 @@ export function createLock(o = {}) {
     const release0 = r.release;
     const keep = setInterval(r.refresh, 5 * 60 * 1000);
     keep.unref();
-    function release() { clearInterval(keep); release0(); }
+    /* the process's exit and signals release it too; a release takes these listeners off again, so a process that takes and
+       releases the lock many times (one browser after another) does not pile them up (MaxListenersExceededWarning: the review
+       of PR #89) */
+    const onSignal = () => { release(); process.exit(130); };
+    function release() {
+      clearInterval(keep);
+      process.removeListener("exit", release);
+      process.removeListener("SIGINT", onSignal);
+      process.removeListener("SIGTERM", onSignal);
+      release0();
+    }
     process.once("exit", release);
-    for (const s of ["SIGINT", "SIGTERM"]) process.once(s, () => { release(); process.exit(130); });
+    process.once("SIGINT", onSignal);
+    process.once("SIGTERM", onSignal);
     log("browser lock taken: " + name);
     return release;
   }
