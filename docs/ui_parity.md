@@ -126,9 +126,12 @@ picture that differs at all is listed (`noise` within the policy, `DIFF` beyond 
 result). The expectations BEFORE missed are listed (`unmet`: what the PR brings); AFTER may miss only what BEFORE missed too, the
 same way (two runs of main), else the comparison is INVALID.
 
-The default policy, tolerance 1 and at most 8 pixels beyond it, comes from two runs of one commit: the compositor's anti-aliasing of
-rounded edges over the canvas moves a channel by 1 in up to ~21 pixels of a picture, and once 3 pixels at a rounded bar's end
-differed by up to 17. A case that needs another policy says so, with its why.
+The default policy, tolerance 1 and at most 8 pixels beyond it, comes from two runs of one commit with the first version of the
+harness (PR #89 at 729b5ba): the compositor's anti-aliasing of rounded edges over the canvas moved a channel by 1 in up to ~21
+pixels of a picture, and once 3 pixels at a rounded bar's end differed by up to 17. Since the renderer barrier, the queued idle
+callbacks and the sRGB / no-partial-raster flags, two runs of one commit have been identical, every pixel (41 of 41 pictures, main
+and the branch, PR #89's fix round); the tolerance stays as a margin for other GPUs and drivers. A case that needs another policy
+says so, with its why.
 
 ### The state: what is controlled
 
