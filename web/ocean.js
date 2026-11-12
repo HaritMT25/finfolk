@@ -403,9 +403,10 @@
       return { ok: false, why: lastError() };
     }
     /* committed: the page's bookkeeping, once */
-    var hist0 = changedLive;
+    var hist0 = { changed: changedLive, unknown: historyUnknown, console: consoleSet };
     try {
-      changedLive = {};   /* a new world: no live change yet (a saved world's own tweaks: liveTweaks) */
+      changedLive = {}; consoleSet = {};   /* a new world: no live change yet (a saved world's own tweaks: liveTweaks) */
+      historyUnknown = plan.op === "open";   /* (its file has no history: unknown until a start or Replay) */
       clearFieldNotes();
       afterNewWorld();
       stepOnce = false; summary = null; usedTurbo = false; turboReturn = null;
@@ -418,7 +419,7 @@
       hideAsk();
       renderStartBar();
     } catch (err) {
-      changedLive = hist0;   /* (the run that stays: restoreRun puts its page back, this with it) */
+      changedLive = hist0.changed; historyUnknown = hist0.unknown; consoleSet = hist0.console;   /* (the run that stays: restoreRun puts its page back, these with it) */
       if (!undo) throw err;
       return restoreRun(undo, err);
     }
@@ -451,12 +452,13 @@
              selectedId: selectedId, wantFollow: wantFollow, following: !!(scene && scene.following()), draft: draft, draftGen: draftGen,
              fields: fields, extraCfg: Object.assign({}, extraCfg), nextOnly: Object.assign({}, nextOnly), paused: paused, url: location.href,
              dash: dash() && dash().save ? dash().save() : null, sampleBucket: sampleBucket, rates: rates.q.slice(),
-             usedTurbo: usedTurbo, turboReturn: turboReturn, stepOnce: stepOnce, summary: summary, changedLive: Object.assign({}, changedLive) };
+             usedTurbo: usedTurbo, turboReturn: turboReturn, stepOnce: stepOnce, summary: summary, changedLive: Object.assign({}, changedLive),
+             historyUnknown: historyUnknown, consoleSet: Object.assign({}, consoleSet) };
   }
   /* the page's side of a run put back (its memory is in the module again) */
   function pageBack(u) {
     initArgs = u.initArgs; runCfg = u.runCfg; worldEpoch = u.epoch; draft = u.draft; draftGen = u.draftGen;
-    changedLive = Object.assign({}, u.changedLive);
+    changedLive = Object.assign({}, u.changedLive); historyUnknown = !!u.historyUnknown; consoleSet = Object.assign({}, u.consoleSet);
     selectedId = null; wantFollow = false;
     afterNewWorld(true);   /* this world read again: no new epoch (the charts: below) */
     if (u.dash && dash() && dash().restore) dash().restore(u.dash);
@@ -877,7 +879,8 @@
    * key on its way, the field shows what now runs (a refusal in between may
    * have set it back), unless the visitor is in it. */
   function liveApplied(key, v, quiet, seq) {
-    if (v !== (key in runCfg ? runCfg[key] : KEYS[key][0])) changedLive[key] = true;   /* (the run's history: changedKeys) */
+    if (v !== historyVal(key)) changedLive[key] = true;   /* (the run's history: changedKeys) */
+    delete consoleSet[key];   /* (runCfg has it now) */
     if (v === KEYS[key][0]) delete runCfg[key]; else runCfg[key] = v;
     /* the light the picture is drawn in: this module's, or while Turbo owns
      * the world, what the worker acknowledged (this page's copy is the world
@@ -1350,6 +1353,18 @@
    * comparison of settings forgets (a floor raised for a step and set back has added its founders). Set by
    * an accepted change (liveApplied, EvoOcean.set); cleared only when a new world is committed (startWorld). */
   var changedLive = {};
+  /* A world opened from a file (Save world's): the file keeps its setup and its settings, not what changed live before
+   * it was saved, so with no setting differing whether Replay repeats it is unknown, not "yes" (review of #88, round 2).
+   * Set when an open commits; a start or Replay (a new world from its setup) clears it. */
+  var historyUnknown = false;
+  /* EvoOcean.set's own last values (it changes the world around the sheet, so runCfg does not have them) */
+  var consoleSet = {};
+  /* for the history: the value the running world has for k, as far as the page knows, EvoOcean.set's included
+   * (undefined: a key the sheet does not know). Not runningVal (above), the sheet's view, which reads the size too. */
+  function historyVal(k) {
+    if (Object.prototype.hasOwnProperty.call(consoleSet, k)) return consoleSet[k];
+    return KEYS[k] ? cfgVal(k) : undefined;
+  }
   /* what makes this run differ from its setup's replay: history, and a saved world's own tweaks (liveTweaks) */
   function changedKeys() {
     var o = Object.assign({}, changedLive);
@@ -3783,15 +3798,18 @@
                : ", coloured by family (" + (HAS_APP ? "the appearance genes are off in this world" : "this module has no appearance genes") + ")")
       : (flags & 2 ? ", each fish in its inherited body shape" : "") + (colourBrain ? ", coloured by brain" : ", coloured by family");
     /* what replays: the module is serial and Hold 60 fps never changes the run; a live change is not part of the setup,
-     * set back or not (changedKeys: the run's history). As data too: data-replay "yes" / "no", data-why "live". */
+     * set back or not (changedKeys: the run's history); a world opened from a file, its history unknown (historyUnknown).
+     * As data too: data-replay "yes" / "no" / "unknown", data-why "live" and / or "opened". */
     var tw = changedKeys().length, ml = el("modeline");
     modelineDetail = scene ? scene.quality() : 0;
-    ml.dataset.replay = tw ? "no" : "yes";
-    ml.dataset.why = tw ? "live" : "";
+    ml.dataset.replay = tw ? "no" : historyUnknown ? "unknown" : "yes";
+    ml.dataset.why = [tw ? "live" : "", historyUnknown ? "opened" : ""].filter(Boolean).join(" ");
     ml.textContent = "Running the single-threaded Ocean module" + (HAS_EYE ? " (the eye build)" : "") +
       ": the same seed and setup replay a run step for step" +
       (tw ? "; " + (tw === 1 ? "a setting was" : tw + " settings were") + " changed live during this run, which is not part of its setup" +
-            " (even if set back), so Replay starts it again without " + (tw === 1 ? "that change" : "those changes") : "") +
+            " (even if set back), so Replay starts it again without " + (tw === 1 ? "that change" : "those changes")
+          : historyUnknown ? "; this world was opened from a file, which does not record what changed live before it was saved, so whether" +
+            " Replay repeats this run is unknown (Start or Replay begins one that does)" : "") +
       ". The tank: " + W + " × " + H + " × " + D +
       (WALLS ? ", glass walls" : ", the sides wrap around") +
       ". Drawing: the 3D tank" + (scene ? ", detail " + scene.quality() + " of 3" : "") +
@@ -4103,9 +4121,17 @@
       set: function (name, v) {
         return engineCall(function () {
           if (!has("oc_set_param")) return false;
-          var ok = withCString(String(name), function (p) { return M._oc_set_param(p, +v); });
+          var key = String(name), was = historyVal(key);
+          var ok = withCString(key, function (p) { return M._oc_set_param(p, +v); });
           if (!ok) console.warn("oc_set_param(" + name + "): " + lastError());
-          else { changedLive[String(name)] = true; updateModeline(); }   /* (around the sheet: the run's history all the same) */
+          else {
+            /* around the sheet: the run's history all the same, by value as liveApplied's (the engine reads a whole-number
+             * key as an int: truncated); a key the sheet does not know has no known value, so it counts */
+            var now = KEYS[key] ? valOf(key, wholeKey(key) ? Math.trunc(+v) : +v) : +v;
+            if (was === undefined || now !== was) changedLive[key] = true;
+            consoleSet[key] = now;
+            updateModeline();
+          }
           readLight();
           return !!ok;
         }, false);

@@ -3011,7 +3011,61 @@ async function pageReplayHistory() {
        'a fresh world replays (' + c0 + '); its floor edited to the value it runs (' + floor0 + '): still (' + cSame + '); raised to ' + (n0 + 40) +
        ' for a step (' + n0 + ' -> ' + n1 + ' fish): not (' + cRaised + '); set back (' + tweaksBack + ' settings differ from the setup): still not (' +
        cBack + '); after Replay (' + cReplay + ')');
+    /* EvoOcean.set, around the sheet (review of #88, round 2, P3): by value too, its own repeated writes included */
+    const set = (k, v) => { const r = p.ctx.EvoOcean.set(k, v); frames(1); return r && claim(); };
+    const sSame = set('minPopulation', floor0), sSame2 = set('minPopulation', floor0);
+    const sUp = set('minPopulation', floor0 + 20), sUp2 = set('minPopulation', floor0 + 20), sBack = set('minPopulation', floor0);
+    p.click('replay');
+    if (p.T.asking) p.click('startconfirm');
+    frames(1);
+    const sClean = claim(), sAgain = set('minPopulation', floor0);
+    ok(sSame === 'yes' && sSame2 === 'yes' && sUp === 'no:live' && sUp2 === 'no:live' && sBack === 'no:live' && sClean === 'yes' && sAgain === 'yes',
+       'EvoOcean.set: the floor it runs (' + floor0 + '), twice: no change (' + sSame + ', ' + sSame2 + '); ' + (floor0 + 20) + ', twice: a change (' + sUp +
+       ', ' + sUp2 + '), set back: still (' + sBack + '); after Replay (' + sClean + '), ' + floor0 + ' again: no change (' + sAgain + ')');
     ok(p.uncaught.length === 0, 'no exception escaped the page\'s handlers' + (p.uncaught.length ? ' (' + p.uncaught[0] + ')' : ''));
+}
+
+/* A saved world's file keeps its setup and settings, not what changed live before it was saved (review of #88, round 2,
+ * P2): the floor raised for a step and set back, saved and opened on a fresh page, is "unknown", never "yes", until a
+ * Replay or a start begins a run with a clean history; a file whose settings still differ from its setup says "no". */
+async function pageReplayReopen() {
+    section('A world opened from a file: whether Replay repeats it is unknown (its history is not in the file), until Replay');
+    const p = await bootPage(PAGE_Q7);
+    const claimOf = (x) => { const d = x.el('modeline').dataset; return (d.replay || '?') + (d.why ? ':' + d.why : ''); };
+    let now = performance.now();
+    const frames = (x, k) => { for (let i = 0; i < k; i++) { const cb = x.raf; x.raf = null; if (cb) cb(now += 17); } };
+    frames(p, 3);
+    const floor0 = p.T.getVal('minPopulation'), n0 = p.ctx.EvoOcean.state().n;
+    p.edit('minPopulation', n0 + 40);
+    frames(p, 3);
+    p.edit('minPopulation', floor0);
+    frames(p, 2);
+    if (!p.T.paused) p.key(' ');
+    const n1 = p.ctx.EvoOcean.state().n, cSaved = claimOf(p);
+    const s = await savedWorld(p);
+    const q = await bootPage(PAGE_Q7);
+    const said = await openWorld(q, s.bytes, s.name);
+    frames(q, 1);
+    const nq = q.ctx.EvoOcean.state().n, cOpened = claimOf(q), tq = q.T.liveTweaks().length;
+    q.click('replay');
+    if (q.T.asking) q.click('startconfirm');
+    frames(q, 1);
+    const cReplayed = claimOf(q);
+    ok(n1 >= n0 + 40 && cSaved === 'no:live' && /Opened the saved world/.test(said) && nq === n1 && tq === 0 && cOpened === 'unknown:opened' &&
+       cReplayed === 'yes',
+       'floor raised for a step (' + n0 + ' -> ' + n1 + ' fish) and set back: ' + cSaved + '; saved and opened on a fresh page ("' + said.slice(0, 40) +
+       '…", ' + nq + ' fish, ' + tq + ' settings differ): ' + cOpened + ', not yes; after Replay: ' + cReplayed);
+    /* a file whose settings differ from its setup: "no" (its own tweak), and still opened */
+    p.edit('minPopulation', floor0 + 10);
+    frames(p, 1);
+    const s2 = await savedWorld(p);
+    const r = await bootPage(PAGE_Q7);
+    await openWorld(r, s2.bytes, s2.name);
+    frames(r, 1);
+    const cTweaked = claimOf(r);
+    ok(cTweaked === 'no:live opened', 'a saved world still carrying a live tweak (floor ' + (floor0 + 10) + '): ' + cTweaked);
+    ok(p.uncaught.length + q.uncaught.length + r.uncaught.length === 0, 'no exception escaped the pages\' handlers' +
+       (p.uncaught.concat(q.uncaught, r.uncaught).length ? ' (' + p.uncaught.concat(q.uncaught, r.uncaught)[0] + ')' : ''));
 }
 
 /* UI-3: Start from. Every scenario (and Surprise me's draws) starts in
@@ -5169,7 +5223,7 @@ const SECTIONS = {
     pageWallsOverride, pageFreshVisit, pageSizeFields, pageRoundTrip,
     pageColourBench, pageLayers, pageResize, pageKeys, pageStartupFailures, pageTourEscape, pageWholeFields,
     pageTurboFraction, pageCardNumbers, pageMixedRecovery, pageEscOwner, pageTabKeys, pageIntegralFloats,
-    pageTurboMode, pageStartDoor, pageFollowBack, pageDraft, pageModelineDetail, pageReplayHistory, pageScenarios,
+    pageTurboMode, pageStartDoor, pageFollowBack, pageDraft, pageModelineDetail, pageReplayHistory, pageReplayReopen, pageScenarios,
     pageCancelQueued, pageQueuedFile, pageNextBehindLive, pageEditedFile, pageReplayStaleRead, pageAskTarget, pagePendingAsk,
     pageKeyboardAsk,
     worldCodec, pageWorldFile, pageWorldTurbo, pageWorldRefusals,
