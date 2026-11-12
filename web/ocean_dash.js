@@ -215,7 +215,8 @@
         } },
       { id: "pitch", title: "Climbing and diving", draw: C.lines,
         cap: "How steeply the fish swim up or down: the angle equivalent of their mean absolute vertical slope (climb or dive speed over forward speed, averaged, as an angle; 0° = level). It rises when depth starts to matter to them.",
-        data: function () { return { t: view.t, yFmt: fmtDeg, valFmt: fmtDeg, series: [line("angle equivalent of mean absolute vertical slope", su(21).map(function (v) { return Math.atan(v) * 180 / Math.PI; }), S[4])] }; } }
+        /* (the tooltip's row does not wrap, in a box at most 300 px wide: the short name; the caption has the long one) */
+        data: function () { return { t: view.t, yFmt: fmtDeg, valFmt: fmtDeg, series: [line("angle of mean |slope|", su(21).map(function (v) { return Math.atan(v) * 180 / Math.PI; }), S[4])] }; } }
     ] },
     { id: "families", name: "Family lines", cards: [
       { id: "muller", title: "Family lines over time", wide: true, tall: true, draw: C.stack,
