@@ -241,6 +241,14 @@ inline void testHydroMath() {
             V6 rhs{{1, 1, 1, 1, 1, bad}};
             t.expect(!solveScaled(A, rhs, 1.0f, x) && x.v[5] == 9.0f, "nonfinite RHS was published");
         }
+        // Refuse the bad column immediately, before a later pivot consumes L.
+        for (float bad : {INFINITY, NAN, std::numeric_limits<float>::max()}) {
+            S6 badL{};
+            for (int i = 0; i < 6; ++i) badL.m[s6u(i,i)] = 1;
+            badL.m[s6u(0,0)] = .5f;
+            badL.m[s6u(0,5)] = bad;
+            t.expect(!factorLDL(badL,f) && f.failedPivot == 0, "nonfinite L entry was not refused at its column");
+        }
         A.m[s6u(5, 5)] = 0.5f;
         t.expect(!solveScaled(A, V6{{1, 1, 1, 1, 1, std::numeric_limits<float>::max()}}, 1.0f, x) && x.v[5] == 9.0f,
                  "overflowed finite RHS solution was published");
@@ -259,6 +267,29 @@ inline void testHydroMath() {
         M.m[s6u(0, 0)] = -1; M.m[s6u(1, 1)] = -1; M.m[s6u(2, 2)] = 1;
         V3 u{1, 2, 3}, w{4, 5, 6};
         t.expect(!railProject(M, u, w, 0.5f) && u.x == 1 && w.x == 4, "rail accepted indefinite TT block");
+    }
+    // Independent rail geometry: a mass at (2,3,4), unit yaw, no translation.
+    // Its point velocity is (-3,2,0); halving yaw must add (-1.5,1,0)
+    // translation to preserve its linear momentum. Assemble M from point
+    // velocities, without using the production TR block/first-moment formula.
+    {
+        const double position[] = {2,3,4};
+        S6 M{};
+        double velocity[6][3]{};
+        for (int dof = 0; dof < 6; ++dof) {
+            if (dof < 3) velocity[dof][dof] = 1;
+            else {
+                double spin[3]{}; spin[dof-3] = 1;
+                velocity[dof][0] = spin[1]*position[2]-spin[2]*position[1];
+                velocity[dof][1] = spin[2]*position[0]-spin[0]*position[2];
+                velocity[dof][2] = spin[0]*position[1]-spin[1]*position[0];
+            }
+        }
+        for (int i = 0; i < 6; ++i) for (int j = i; j < 6; ++j)
+            for (int k = 0; k < 3; ++k) M.m[s6u(i,j)] += float(velocity[i][k]*velocity[j][k]);
+        V3 u{0,0,0}, w{0,0,1};
+        t.expect(railProject(M,u,w,.5f) && u.x == -1.5f && u.y == 1.f && u.z == 0 && w.z == .5f,
+                 "rail point-mass geometry: expected translation (-1.5,1,0)");
     }
     // quaternions
     {
@@ -727,15 +758,37 @@ inline void testHydroTensors() {
         compileBody(neutralBody("neutral"), c, support);
         Loaded L;
         evalLoad(c, c.gasCapacity, c.reserveCapacity * (bodymat::kRhoLipid * rhoWater()), L);
-        const double expected = double(rhoWater()) * c.addedMass[1] * L.hullVolume *
-            (double(L.hullCentroid.x) - L.com.x);
+        bodyplan::BirthCoefficients bc;
+        bodyplan::Points points;
+        bodyplan::compile(expressAppearance(appearance::neutral()),1.f,1.f,expressPhysical(physical::neutral()),bodyplan::kGeometryLaw,bc,nullptr,&points);
+        const auto& triangles = bodyplan::canonicalTris();
+        double expected = 0;
+        // Degree-one tetrahedral quadrature of e_y dot (e_z cross r),
+        // evaluated at each tetrahedron's centroid relative to loaded COM.
+        for (int i = 0; i < bodyplan::kHullTris; ++i) {
+            const auto tri = triangles.t[i];
+            auto loadedPoint = [&](int id) {
+                const auto p = points.p[id];
+                return std::array<double,3>{p.x,double(L.k)*p.y,double(L.k)*p.z};
+            };
+            const auto a = loadedPoint(tri.a), b = loadedPoint(tri.b), d = loadedPoint(tri.c);
+            const double volume = (a[0]*(b[1]*d[2]-b[2]*d[1]) + a[1]*(b[2]*d[0]-b[0]*d[2]) +
+                                   a[2]*(b[0]*d[1]-b[1]*d[0]))/6;
+            const double rx = (a[0]+b[0]+d[0])/4-L.com.x;
+            expected += volume*rx*double(rhoWater())*c.addedMass[1];
+        }
         const double actual = at6(L.Abody, 1, 5);
         const double scale = std::fabs(expected);
-        t.expect(scale > 1e-4 && std::fabs(actual - expected) <= 2e-5 * scale,
-                 "body sway-yaw first-moment law mismatch");
+        // Geometry integration rounds the raw centroid before subtracting COM;
+        // its relative TR error is 4.1e-5 here. Allow 1e-4 for this geometry
+        // check; the reference's input-matched per-entry gate separately checks
+        // tensor assembly at gamma_19 (1.13e-6), including tiny couplings.
+        constexpr double geometryTolerance = 1e-4;
+        t.expect(scale > 1e-4 && std::fabs(actual - expected) <= geometryTolerance * scale,
+                 "body sway-yaw geometry mismatch: actual %.12g, expected %.12g",actual,expected);
         S6 reversed = L.Abody;
         for (int i = 0; i < 3; ++i) for (int j = 3; j < 6; ++j) reversed.m[s6u(i,j)] *= -1;
-        t.expect(std::fabs(at6(reversed, 1, 5) - expected) > 1000 * 2e-5 * scale,
+        t.expect(std::fabs(at6(reversed, 1, 5) - expected) > 1000 * geometryTolerance * scale,
                  "reversed body TR block escaped the coupling-sign check");
     }
     // zero-area fins contribute exactly zero

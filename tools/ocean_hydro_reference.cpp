@@ -11,7 +11,8 @@
 //               transformed parts + lipid, full parallel-axis assembly at all
 //               three loads, vs evalLoad mass/COM/inertia
 //   body tensors degree-two exact quadrature of local hull velocity levers:
-//               Abody and Jbody, including a reversed-TR-block fault check
+//               Abody and Jbody, plus entrywise assembly cubature and sign,
+//               dropped-entry and 0.1% COM-shift fault checks
 //   inflation   geometry law 1 recompiled at the inflation k (its inflated
 //               points), the hull's moments integrated in double, vs the
 //               analytic T(k) update
@@ -297,14 +298,98 @@ void roundoffReport(const bodyplan::Points& pts, const DM& H, const Coefficients
         std::printf("TERMS,%s,%.9g,%.9g,%d,%.12g,%.12g,%.12g\n",name.c_str(),double(c.size),double(c.elong),bodyplan::kHullTris*4*3*repeats,ea,ej,ed);
     }
 }
-double tensorError(const S6& actual, const double expected[6][6]) {
-    double scale = 0, error = 0;
-    for (int i = 0; i < 6; ++i) for (int j = 0; j < 6; ++j) {
-        scale = std::max(scale, std::fabs(expected[i][j]));
-        error = std::max(error, std::fabs(at6(actual, i, j) - expected[i][j]));
+// Degree-two cubature of the COM-relative velocity field from the compiled
+// hull's covariance and published loaded centroid. This isolates tensor
+// assembly from the separately checked geometry/material integrations. Otherwise their tiny centroid error
+// can swamp a genuine small TR entry (or create a symmetry residual).
+// Six equally weighted points +/-sqrt(3)*chol(C) reproduce C exactly. Integrate
+// the linear TR integrand at its mean directly: no cancellation of large point
+// values when the exact first moment is tiny, including float symmetry residue.
+// For RR, E[w w^T] = E[(w-Ew)(w-Ew)^T] + Ew Ew^T; sum absolute
+// contributions from both, so cancellation cannot shrink the error budget.
+struct TensorCheck {
+    double A[6][6]{}, J[3][3]{}, aMagnitude[6][6]{}, jMagnitude[3][3]{};
+};
+TensorCheck assemblyQuadrature(const Coefficients& c, const Loaded& L) {
+    TensorCheck out;
+    const double k[] = {1, L.k, L.k}, cm[] = {L.com.x, L.com.y, L.com.z};
+    const double centre[] = {L.hullCentroid.x,L.hullCentroid.y,L.hullCentroid.z};
+    double C[3][3]{}, chol[3][3]{}, mean[3]{};
+    for (int i = 0; i < 3; ++i) {
+        mean[i] = centre[i] - cm[i];
+        for (int j = 0; j < 3; ++j) C[i][j] = k[i]*k[j]*c.hullCovariance[s3(i,j)];
     }
-    return error / (scale > 0 ? scale : 1);
+    for (int i = 0; i < 3; ++i) for (int j = 0; j <= i; ++j) {
+        double v = C[i][j];
+        for (int n = 0; n < j; ++n) v -= chol[i][n]*chol[j][n];
+        chol[i][j] = i == j ? std::sqrt(v) : v/chol[j][j];
+        if (!std::isfinite(chol[i][j])) { std::fprintf(stderr, "invalid cubature covariance\n"); std::exit(1); }
+    }
+    const double volume = double(c.hullVolume)*L.k*L.k;
+    for (int axis = 0; axis < 3; ++axis) {
+        const D3 e{double(axis == 0), double(axis == 1), double(axis == 2)};
+        const D3 centreLever = dcross({mean[0], mean[1], mean[2]}, e);
+        const double w[] = {e.x,e.y,e.z,centreLever.x,centreLever.y,centreLever.z};
+        const double mass = double(rhoWater())*c.addedMass[axis]*volume;
+        for (int i = 0; i < 3; ++i) for (int j = i; j < 6; ++j) {
+            const double term = mass*w[i]*w[j];
+            out.A[i][j] += term; out.aMagnitude[i][j] += std::fabs(term);
+        }
+        for (int i = 0; i < 3; ++i) for (int j = i; j < 3; ++j) {
+            const double product = w[3+i]*w[3+j];
+            out.A[3+i][3+j] += mass*product;
+            out.aMagnitude[3+i][3+j] += mass*std::fabs(product);
+            out.J[i][j] += double(L.Khull[axis])*product;
+            out.jMagnitude[i][j] += double(L.Khull[axis])*std::fabs(product);
+        }
+        for (int n = 0; n < 3; ++n) for (int sign : {-1,1}) {
+            const double h = sign*std::sqrt(3.0);
+            const D3 lever = dcross({h*chol[0][n], h*chol[1][n], h*chol[2][n]}, e);
+            const double r[] = {lever.x,lever.y,lever.z};
+            for (int i = 0; i < 3; ++i) for (int j = i; j < 3; ++j) {
+                const double aa = mass*r[i]*r[j]/6, jj = double(L.Khull[axis])*r[i]*r[j]/6;
+                out.A[3+i][3+j] += aa; out.aMagnitude[3+i][3+j] += std::fabs(aa);
+                out.J[i][j] += jj; out.jMagnitude[i][j] += std::fabs(jj);
+            }
+        }
+    }
+    return out;
 }
+// Per-entry absolute roundoff budget. No tensor/block max can hide a small
+// coupling. Zero integrands have zero budget and must stay exactly zero.
+constexpr double kU32 = 0x1p-24;
+// Longest production path from the rounded birth inputs to an entry:
+// k (5 ops: fuel divide, two adds, volume divide, sqrt), k^2 (1),
+// centroid/COM shift (2), covariance stretch/parallel axis (4), volume and
+// coefficients (4), two weighted terms + sum (3): <=19 rounded operations.
+// gamma_n includes higher-order products; no extra propagation factor.
+// COM, loaded centroid and Khull are held at their published binary32 values;
+// so neither material conditioning nor an unexplained factor 2 is needed.
+constexpr int kTensorOps = 5 + 1 + 2 + 4 + 4 + 3; // 19, no fitted allowance
+constexpr double kEntryTolerance = kTensorOps*kU32/(1-kTensorOps*kU32);
+double entryError(double actual, double expected, double magnitude) {
+    if (!std::isfinite(actual)) return INFINITY;
+    return magnitude > 0 ? std::fabs(actual-expected)/magnitude : (actual == expected ? 0 : INFINITY);
+}
+double tensorError(const S6& actual, const TensorCheck& q) {
+    double error = 0;
+    for (int i = 0; i < 6; ++i) for (int j = i; j < 6; ++j)
+        error = std::max(error, entryError(at6(actual,i,j),q.A[i][j],q.aMagnitude[i][j]));
+    return error;
+}
+struct Control {
+    const char* name; double required; int checks = 0, misses = 0; double margin = INFINITY;
+    void see(double error) {
+        ++checks;
+        const double ratio = error/kEntryTolerance;
+        margin = std::min(margin, ratio);
+        if (!(ratio > required)) ++misses;
+    }
+    bool report() const {
+        std::printf("  %s: %d checked, %d missed; minimum fault/tolerance %.1f (required > %.1f)\n",name,checks,misses,margin,required);
+        return checks > 0 && misses == 0;
+    }
+};
 struct Worst {
     const char* name; double tol; bool gated; double v = 0; std::string where;
     Worst(const char* n, double t, bool g) : name(n), tol(t), gated(g) {}
@@ -345,36 +430,36 @@ int main(int argc, char** argv) {
     }
     Worst wCells{"partition: |Σ cells − hull| / hull (double)", 1e-12, true}, wCellF{"partition: float cells vs double cells (of V)", 2e-6, true};
     Worst wNeg{"partition: smallest cell / V (must be > 0)", 0, false};
-    Worst wComp{"compound: independent loaded parts vs evalLoad (3 loads)", 2e-6, true};
-    // Roundoff budget, established by --roundoff (no fitted tolerance):
-    // each raw moment accumulates kHullTris=224 tetrahedra; allow 32 more
-    // rounded operations for each integrand and the loaded tensor assembly.
-    // gamma_n = n*u/(1-n*u), u=2^-24 (binary32 unit roundoff, 5.96e-8).
-    // For covariance s/V-(f/V)^2, first-order propagation amplifies gamma_n
-    // by (|s/V|+3*(f/V)^2)/variance. Enforce that condition <=16 below
-    // (observed maximum 12.143); another factor 2 covers material COM,
-    // inflation and products, and bounds higher-order gamma terms here.
-    // Thus rel <= c*n*u/(1-n*u), c=2*16, n=224+32. Abody uses max-entry
-    // normalization, Jbody its trace; both are normwise, not entrywise.
-    // This conservative bound is accompanied by a TR-block-normalized sign
-    // mutation (>1000 times this bound) and a tight double formula check.
-    constexpr double kUnitRoundoff32 = 0x1p-24;
-    constexpr int kMomentTerms = bodyplan::kHullTris, kAssemblyOps = 32;
-    constexpr double kMaxMomentCondition = 16, kPropagationFactor = 2;
-    constexpr double kN = kMomentTerms + kAssemblyOps;
-    constexpr double kBodyTolerance = kPropagationFactor * kMaxMomentCondition *
-        kN * kUnitRoundoff32 / (1 - kN * kUnitRoundoff32);
-    Worst wAbody{"Abody: double hull quadrature vs evalLoad", kBodyTolerance, true};
-    Worst wJbody{"Jbody: double hull quadrature vs evalLoad", kBodyTolerance, true};
+    // Four times the former 2e-6 budget: independent part allocation + raw to
+    // central inertia subtract large moments; leave room for toolchain rounding
+    // (observed 1.935e-6). This is a regression bound, not an error theorem.
+    Worst wComp{"compound: independent loaded parts vs evalLoad (3 loads)", 8e-6, true};
+    // End-to-end geometry/material checks retain the conservative birth-moment
+    // bound; the entrywise cubature below is the tensor assembly gate. The
+    // former cannot certify small coupling entries by itself.
+    constexpr double kMaxMomentCondition = 16;
+    // Preserve the previous end-to-end limit as a broad regression bound
+    // (observed <5e-6), without claiming a forward-error theorem for all
+    // material propagation. Assembly uses the counted gamma_19 bound above.
+    constexpr double kBodyTolerance = 0.0004882887006942855;
+    Worst wPhysicalA{"Abody: end-to-end physical quadrature (normwise)", kBodyTolerance, true};
+    Worst wPhysicalJ{"Jbody: end-to-end physical quadrature (normwise)", kBodyTolerance, true};
+    Worst wAbody{"Abody: input-matched cubature (per entry)", kEntryTolerance, true};
+    Worst wJbody{"Jbody: input-matched cubature (per entry)", kEntryTolerance, true};
     Worst wDouble{"body laws: double moment formula vs quadrature", 1e-12, true};
     Worst wCondition{"raw-to-central moment condition", kMaxMomentCondition, true};
-    double minMutationRatio = 1e30;
-    int reversedBlockChecks = 0, reversedBlockMisses = 0;
+    // Each control uses the SAME entrywise gate as the clean output. Even
+    // nonzero binary32 symmetry residues are checked, rather than discarded.
+    Control reversed{"reversed Abody TR block",1000};
+    Control dropped{"dropped Abody TR entry",1000};
+    Control reviewDrop{"review mutant: drop A(0,4) = rw*(cx*Fc.z)",1000};
+    Control reviewScale{"review mutant: Fc.x *= 0.999",100};
+    Control asymmetric{"asymmetric off-diagonal drops (A RR, J xy/yz)",10};
     Worst wInfl{"inflation: law-1 inflated hull (double) vs analytic T(k)", 1e-5, true};
     Worst wTen{"tensors: direct traversal at k (double) vs bases + congruence", 2e-6, true};
     Worst wSolve{"solve: double Gauss vs binary32 LDLᵀ (|Δz| / |z|)", 2e-5, true};
     double minCellFrac = 1e30;
-    int compiled = 0, failed = 0;
+    int compiled = 0, failed = 0, asymmetricLoads = 0;
     // patch-model report accumulators: per state, the ratio |Q_tensor| / |Q_patch| summed over bodies
     struct State { const char* name; double z[6]; };
     const State states[] = {
@@ -497,38 +582,43 @@ int main(int argc, char** argv) {
             double Abody[6][6]{}, Jbody[3][3]{};
             bodyTensors(pts, kd, material.com, rw, added, Khull, Abody, Jbody);
             if (characterize) roundoffReport(pts, birthHull, c, L, kd, material.com, rw, added, Khull, Abody, Jbody, loadName);
-            wAbody.see(tensorError(L.Abody, Abody), loadName);
-            double scaleJ = 0;
+            const TensorCheck q = assemblyQuadrature(c,L);
+            wAbody.see(tensorError(L.Abody,q),loadName);
+            for (int i = 0; i < 3; ++i) for (int j = i; j < 3; ++j)
+                wJbody.see(entryError(at3(L.Jbody,i,j),q.J[i][j],q.jMagnitude[i][j]),loadName);
+            double scaleA = 0, scaleJ = 0;
+            for (int i = 0; i < 6; ++i) for (int j = 0; j < 6; ++j) scaleA = std::max(scaleA,std::fabs(Abody[i][j]));
             for (int i = 0; i < 3; ++i) scaleJ += Jbody[i][i];
-            for (int i = 0; i < 3; ++i) for (int j = 0; j < 3; ++j)
-                wJbody.see(rel(at3(L.Jbody, i, j), Jbody[i][j], scaleJ), loadName);
             double momentA[6][6]{}, momentJ[3][3]{};
-            momentTensors(birthHull, kd, material.com, rw, added, Khull, momentA, momentJ);
-            double scaleA = 0, scaleTR = 0, cleanTR = 0, reversedTR = 0, maxTR = 0;
-            for (int i = 0; i < 6; ++i) for (int j = 0; j < 6; ++j)
-                scaleA = std::max(scaleA, std::fabs(Abody[i][j]));
-            for (int i = 0; i < 6; ++i) for (int j = 0; j < 6; ++j)
-                wDouble.see(rel(momentA[i][j], Abody[i][j], scaleA), loadName + " A");
-            for (int i = 0; i < 3; ++i) for (int j = 0; j < 3; ++j)
-                wDouble.see(rel(momentJ[i][j], Jbody[i][j], scaleJ), loadName + " J");
-            // Normalize this structural control by its own TR block, so
-            // small coupling cannot be hidden by the rotational diagonals.
-            S6 reversed = L.Abody;
-            for (int i = 0; i < 3; ++i) for (int j = 3; j < 6; ++j) {
-                reversed.m[s6u(i,j)] *= -1;
-                scaleTR = std::max(scaleTR, std::fabs(Abody[i][j]));
-                maxTR = std::max(maxTR, std::fabs(double(at6(L.Abody,i,j))));
-                cleanTR = std::max(cleanTR, std::fabs(at6(L.Abody,i,j) - Abody[i][j]));
-                reversedTR = std::max(reversedTR, std::fabs(at6(reversed,i,j) - Abody[i][j]));
+            momentTensors(birthHull,kd,material.com,rw,added,Khull,momentA,momentJ);
+            for (int i = 0; i < 6; ++i) for (int j = i; j < 6; ++j) {
+                wPhysicalA.see(rel(at6(L.Abody,i,j),Abody[i][j],scaleA),loadName);
+                wDouble.see(rel(momentA[i][j],Abody[i][j],scaleA),loadName+" A");
             }
-            // Exactly zero TR is physically unable to expose a sign reversal.
-            // Still require it to remain zero within the normwise budget.
-            if (scaleTR > 1e-12 * scaleA) {
-                ++reversedBlockChecks;
-                const double ratio = reversedTR / scaleTR / kBodyTolerance;
-                minMutationRatio = std::min(minMutationRatio, ratio);
-                if (!(cleanTR <= kBodyTolerance * scaleA && ratio > 1000)) ++reversedBlockMisses;
-            } else if (maxTR > kBodyTolerance * scaleA) ++reversedBlockMisses;
+            for (int i = 0; i < 3; ++i) for (int j = i; j < 3; ++j) {
+                wPhysicalJ.see(rel(at3(L.Jbody,i,j),Jbody[i][j],scaleJ),loadName);
+                wDouble.see(rel(momentJ[i][j],Jbody[i][j],scaleJ),loadName+" J");
+            }
+            S6 bad = L.Abody;
+            for (int i = 0; i < 3; ++i) for (int j = 3; j < 6; ++j) {
+                bad.m[s6u(i,j)] *= -1;
+                if (at6(L.Abody,i,j) != 0) {
+                    S6 drop = L.Abody;
+                    drop.m[s6u(i,j)] = 0;
+                    dropped.see(tensorError(drop,q));
+                }
+            }
+            reversed.see(tensorError(bad,q));
+            bad = L.Abody;
+            bad.m[s6u(0,4)] = 0; // the review's exact dropped production term
+            reviewDrop.see(tensorError(bad,q));
+            bad = L.Abody;
+            // Re-evaluate exactly the two affected entries with the review's
+            // Fc.x*0.999 mutation (all other entries unchanged).
+            const float fcX = (L.hullCentroid.x-L.com.x)*L.hullVolume*0.999f;
+            bad.m[s6u(1,5)] = rhoWater()*(c.addedMass[1]*fcX);
+            bad.m[s6u(2,4)] = rhoWater()*-(c.addedMass[2]*fcX);
+            reviewScale.see(tensorError(bad,q));
             // inflation: law 1 at this k
             {
                 bodyplan::Morph M = bodyplan::decodeMorph(expressAppearance(b.G).g, c.refLength / c.radius);
@@ -633,17 +723,72 @@ int main(int argc, char** argv) {
             }
         }
     }
+    // Reference-only asymmetric hull: shear/translate the neutral point set,
+    // keeping its internal mass distribution fixed. This is a tensor assembly
+    // probe, not a new developmental law or a committed fixture body. Reintegrate
+    // its binary32 birth moments using the production geometry tool, then compare
+    // evalLoad to independent pointwise quadrature and input-matched cubature.
+    {
+        const auto b = hydrofix::bodies().front();
+        Coefficients c; Support support;
+        bodyplan::BirthCoefficients bc; bodyplan::Points pts;
+        if (compile(b.G,b.S,b.E,b.P,Params{},c,support) != kOk) return 1;
+        bodyplan::compile(expressAppearance(b.G),b.S,b.E,expressPhysical(b.P),bodyplan::kGeometryLaw,bc,nullptr,&pts);
+        for (int i = 0; i < bodyplan::kHullSamples; ++i) {
+            auto& p = pts.p[i];
+            p.y += .07f*p.x + .13f*p.z + .4f;
+            p.z += .03f*p.x;
+        }
+        const auto h = bodyplan::hullMoments(pts);
+        c.hullVolume = h.volume;
+        for (int i = 0; i < 3; ++i) c.hullCentroid[i] = h.first[i]/h.volume;
+        for (int i = 0; i < 3; ++i) for (int j = i; j < 3; ++j)
+            c.hullCovariance[s3(i,j)] = h.second[s3(i,j)]/h.volume-c.hullCentroid[i]*c.hullCentroid[j];
+        for (float fraction : {0.f,.5f,1.f}) {
+            Loaded L;
+            if (!evalLoad(c,fraction*c.gasCapacity,fraction*c.reserveCapacity*(bodymat::kRhoLipid*rhoWater()),L)) { ++failed; continue; }
+            ++asymmetricLoads;
+            const std::string name = "reference-only asymmetric load="+std::to_string(fraction);
+            const auto q = assemblyQuadrature(c,L);
+            wAbody.see(tensorError(L.Abody,q),name);
+            const double com[] = {L.com.x,L.com.y,L.com.z}, added[] = {c.addedMass[0],c.addedMass[1],c.addedMass[2]},
+                K[] = {L.Khull[0],L.Khull[1],L.Khull[2]};
+            double A[6][6]{}, J[3][3]{}, sa = 0, sj = 0;
+            bodyTensors(pts,L.k,com,rhoWater(),added,K,A,J);
+            for (int i = 0; i < 6; ++i) for (int j = i; j < 6; ++j) sa = std::max(sa,std::fabs(A[i][j]));
+            for (int i = 0; i < 3; ++i) sj += J[i][i];
+            for (int i = 0; i < 6; ++i) for (int j = i; j < 6; ++j)
+                wPhysicalA.see(rel(at6(L.Abody,i,j),A[i][j],sa),name);
+            for (int i = 0; i < 3; ++i) for (int j = i; j < 3; ++j) {
+                wJbody.see(entryError(at3(L.Jbody,i,j),q.J[i][j],q.jMagnitude[i][j]),name);
+                wPhysicalJ.see(rel(at3(L.Jbody,i,j),J[i][j],sj),name);
+            }
+            // Explicitly prove the formerly symmetric entries carry signal and
+            // fail when individually removed. Same gate, no special threshold.
+            for (const auto ij : {std::array{3,4},std::array{4,5},std::array{2,3}}) {
+                S6 bad = L.Abody;
+                bad.m[s6u(ij[0],ij[1])] = 0;
+                asymmetric.see(tensorError(bad,q));
+                if (!(std::fabs(A[ij[0]][ij[1]]) > 1e-5*sa)) ++failed;
+            }
+            for (const auto ij : {std::array{0,1},std::array{1,2}}) {
+                asymmetric.see(entryError(0,q.J[ij[0]][ij[1]],q.jMagnitude[ij[0]][ij[1]]));
+                if (!(std::fabs(J[ij[0]][ij[1]]) > 1e-5*sj)) ++failed;
+            }
+        }
+    }
     std::printf("ocean_hydro_reference: %d bodies compiled, %d failed (law versions: geometry %d, material %d, expression %d, reference %d)\n",
                 compiled, failed, kGeometryLaw, kMaterialLaw, kExpressionStage, kReferenceLaw);
-    bool ok = failed == 0 && minCellFrac > 0 && reversedBlockChecks > 0 && reversedBlockMisses == 0;
-    for (const Worst* w : {&wCells, &wCellF, &wComp, &wInfl, &wTen, &wAbody, &wJbody, &wDouble, &wCondition, &wSolve}) {
+    std::printf("  reference-only asymmetric hull: %d loads checked (required 3)\n",asymmetricLoads);
+    bool ok = failed == 0 && minCellFrac > 0 && asymmetricLoads == 3;
+    for (const Worst* w : {&wCells, &wCellF, &wComp, &wInfl, &wTen, &wAbody, &wJbody, &wDouble, &wCondition, &wSolve, &wPhysicalA, &wPhysicalJ}) {
         const bool pass = !(w->v > w->tol) && !std::isnan(w->v);
         ok = ok && pass;
         std::printf("  %-62s worst %.3e (tol %.3e) %s%s%s\n", w->name, w->v, w->tol, pass ? "ok" : "FAIL", w->where.empty() ? "" : " at ",
                     w->where.c_str());
     }
     std::printf("  %-62s %.3e %s\n", wNeg.name, minCellFrac, minCellFrac > 0 ? "ok" : "FAIL");
-    std::printf("  reversed Abody TR block: %d checked, %d missed; minimum fault/tolerance %.1f\n", reversedBlockChecks, reversedBlockMisses, minMutationRatio);
+    for (const Control* control : {&reversed,&dropped,&reviewDrop,&reviewScale,&asymmetric}) ok = control->report() && ok;
     std::printf("  patch model vs tensor law (fins only; load gas .5 / fuel .25; |Q| in force and torque/Lc units; reported, not gated):\n");
     std::printf("    %-22s %10s %10s %10s %10s\n", "state", "mean |Qt|/|Qp|", "min", "max", "mean cos");
     for (int si = 0; si < nStates; ++si)

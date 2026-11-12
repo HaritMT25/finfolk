@@ -175,8 +175,8 @@ inline S6 congruence(const S6& A, V3 c) {
 //   D_ii = A_ii − Σ_{k<i} L_ik (L_ik D_kk)
 //   L_ji = (A_ji − Σ_{k<i} L_jk (L_ik D_kk)) · (1 / D_ii)   (j > i)
 // k ascending; each pivot's reciprocal formed once (six divisions in all).
-// A non-positive or non-finite pivot is a FAILURE (the caller's physics
-// failure), reported as its index; nothing is clamped or repaired.
+// A non-positive/non-finite pivot or non-finite L entry is a FAILURE,
+// reported as the current column index; nothing is clamped or repaired.
 struct LDL6 {
     float L[6][6];   // unit lower triangle (strictly lower part used)
     float D[6];
@@ -197,7 +197,9 @@ inline bool factorLDL(const S6& A, LDL6& f) {
         for (int j = i + 1; j < 6; ++j) {
             float s = A.m[s6u(i, j)];
             for (int k = 0; k < i; ++k) s = s - f.L[j][k] * LD[k];
-            f.L[j][i] = s * inv;
+            const float l = s * inv;
+            if (!std::isfinite(l)) { f.failedPivot = i; return false; }
+            f.L[j][i] = l;
         }
     }
     return true;
