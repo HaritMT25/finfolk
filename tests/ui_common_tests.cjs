@@ -285,8 +285,10 @@ for (const kind of ["classic", "ocean"]) {
   section("the dashboards' tabs: " + (kind === "classic" ? "Classic (web/dashboard.js)" : "the Ocean (web/ocean_dash.js)"));
   const { D, api, tl } = bootDash(kind);
   ok(!!api, (kind === "classic" ? "EvoDash" : "EvoOceanDash") + " registers with EvoUI loaded first");
-  api.open();
   const tabs = tl.children, n = tabs.length;
+  ok(n >= 4 && tabs.every((b, i) => b.tabIndex === (i === 0 ? 0 : -1)) && tabs[0].getAttribute("aria-selected") === "true",
+     "before the first open: the tabs built, the first selected, only it in the Tab order");
+  api.open();
   const sel = () => tabs.findIndex((b) => b.getAttribute("aria-selected") === "true");
   const roving = () => tabs.every((b, i) => b.tabIndex === (i === sel() ? 0 : -1));
   ok(n >= 4 && sel() === 0 && roving() && tabs.every((b) => b.getAttribute("role") === "tab" && b.type === "button"),

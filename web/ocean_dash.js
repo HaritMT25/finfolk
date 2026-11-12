@@ -300,6 +300,7 @@
     dtabs.bind(b, tb.id);
     tabsEl.appendChild(b);
   });
+  dtabs.mark(tab);   /* (closed too: one tab in the Tab order from the start) */
   function showTab(id) {
     tab = id;
     dtabs.mark(id);
