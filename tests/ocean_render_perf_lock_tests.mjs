@@ -47,6 +47,7 @@ let seq = 0;
 const fresh = () => path.join(TMP, "case" + (++seq), "browser.lock");
 function mk(file) { fs.mkdirSync(path.dirname(file), { recursive: true }); return file; }
 const setAge = (file, ms) => { const t = new Date(Date.now() - ms); fs.utimesSync(file, t, t); };
+const sleepSync = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 const first = (file) => { try { return fs.readFileSync(file, "utf8").split("\n")[0]; } catch (e) { return null; } };
 const MIN = 60 * 1000;
 /* fs with a hook: onCall(method, args) runs just before the call is made */
@@ -189,6 +190,36 @@ console.log("== the lock, deterministic interleavings");
   ok(r.held && first(f) === "job R" && !fs.existsSync(M), "  R resumes, removes H's stale lock and takes it: one holder (R), R's mutex gone", { r: r.held, first: first(f) });
   r.release();
   ok(!fs.existsSync(f), "  R's release removes it");
+}
+{
+  /* the third re-review's interleaving: H's heartbeat checks that the lock is its own, takes the time, and stalls before touching the
+     file; meanwhile H's lease expires and R reclaims and takes the lock; H's touch then lands on R's file with H's old time, so R's live
+     lock looks stale and B can reclaim it. Now the check, the time and the touch are one step under the mutex: R cannot replace H's file
+     in between (the mutex is busy; once old, ELOCKMUTEX), and the touch lands on H's own file. */
+  const f = mk(fresh());
+  const R = createLock({ path: f, mutexWaitMs: 50 });
+  let r = null, er = null, fired = false;
+  const H = createLock({ path: f, fs: hooked((m, args) => {
+    if (m === "utimesSync" && args[0] === f && !fired) {
+      fired = true;
+      sleepSync(30);                                            /* H stalls between taking the time and touching the file */
+      setAge(f, 41 * MIN);                                      /* (long enough for its lease to expire) */
+      try { r = R.tryAcquire("job R"); } catch (e) { er = e; }
+    }
+  }) });
+  const h = H.tryAcquire("job H");
+  const touched = h.refresh();
+  ok(fired && !(r && r.held) && first(f) === "job H", "H's heartbeat stalls between its check and its touch, its lease expires: R cannot replace H's lock meanwhile",
+     { fired, r: r && r.held, er: er && er.code, first: first(f) });
+  const age = Date.now() - fs.statSync(f).mtimeMs;
+  ok(touched && age < 5000 && !fs.existsSync(f + ".reclaim"), "  and the touch lands on H's own file (fresh again), the mutex released", { touched, age });
+  /* a refresh with no mutex to be had is skipped, never done unserialised; one on a lock that is no longer ours touches nothing */
+  fs.writeFileSync(f + ".reclaim", "pid 1\n"); setAge(f + ".reclaim", 5 * MIN); setAge(f, 10 * MIN);
+  ok(h.refresh() === false && Date.now() - fs.statSync(f).mtimeMs > 9 * MIN, "  a refresh with an old mutex there is skipped (the file is not touched)");
+  fs.rmSync(f + ".reclaim");
+  fs.writeFileSync(f, "someone else\n"); setAge(f, 10 * MIN);
+  ok(h.refresh() === false && Date.now() - fs.statSync(f).mtimeMs > 9 * MIN && !fs.existsSync(f + ".reclaim"), "  a refresh of a lock that is no longer H's touches nothing");
+  fs.rmSync(f);
 }
 {
   /* EACCES/EPERM with no lock file: a permission problem fails after deniedMs instead of waiting forever; a brief EPERM (a Windows

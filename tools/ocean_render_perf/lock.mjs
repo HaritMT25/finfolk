@@ -15,8 +15,9 @@
 // older than 30 s is POSSIBLY ABANDONED (its process died inside it, or is still alive but was descheduled that long: age cannot tell);
 // clearing it by age would be the same look-then-delete race one level down (A and B both see it old, A clears it and takes its own,
 // B's delete removes A's, both reclaim and both run: the re-review of PR #85). Such a mutex FAILS CLOSED: acquire throws an error
-// (code ELOCKMUTEX) naming the file, which a person deletes once no browser job is running. Every deletion of the lock file happens
-// under the mutex (a release that cannot get it leaves the lock to go stale: see releaser). A create refused with EACCES/EPERM while
+// (code ELOCKMUTEX) naming the file, which a person deletes once no browser job is running. Every deletion AND every refresh of the
+// lock file happens under the mutex, as one check-then-act step (a release that cannot get it leaves the lock to go stale; a refresh
+// that cannot is skipped: see releaser and refresher). A create refused with EACCES/EPERM while
 // no lock file is there, for longer than a minute (a persistent create denial: permissions, or a delete held pending by an open
 // handle), throws ELOCKDENIED instead of waiting forever.
 import fs from "node:fs";
@@ -68,13 +69,13 @@ export function createLock(o = {}) {
     return withMutex(() => { const a = ageOf(LOCK); if (a !== null && a > STALE) { F.rmSync(LOCK, { force: true }); return true; } return false; });
   }
 
-  /** one attempt: { held: true, release } or { held: false, age, code } (age in ms of the lock in the way, null if unknown; code: the
-   * last create's error code). Throws ELOCKMUTEX when a stale lock's reclaim finds an abandoned mutex. */
+  /** one attempt: { held: true, text, release, refresh } or { held: false, age, code } (age in ms of the lock in the way, null if
+   * unknown; code: the last create's error code). Throws ELOCKMUTEX when a stale lock's reclaim finds an abandoned mutex. */
   function tryAcquire(name) {
     const text = name + "\n" + new Date().toISOString() + "\npid " + process.pid + " " + crypto.randomBytes(6).toString("hex") + "\n";
     let age = null, code = null;
     for (let attempt = 0; attempt < 4; attempt++) {
-      try { F.writeFileSync(LOCK, text, { flag: "wx" }); return { held: true, text, release: releaser(text) }; }
+      try { F.writeFileSync(LOCK, text, { flag: "wx" }); return { held: true, text, release: releaser(text), refresh: refresher(text) }; }
       catch (e) { if (!e || !CONTENDED.has(e.code)) throw e; code = e.code; }
       age = ageOf(LOCK);
       if (age !== null && age <= STALE) break;   /* held by a live job: wait */
@@ -86,7 +87,7 @@ export function createLock(o = {}) {
    * reclaimStale) is a check-then-delete, and only the mutex keeps the file from changing hands between the two. Without the mutex
    * (busy past MUTEX_WAIT, or ELOCKMUTEX), the lock is LEFT: it goes stale in 40 minutes and is reclaimed then (or, with an abandoned
    * mutex, removed by hand). Deleting it anyway let a reclaimer paused under an old mutex delete the next holder's fresh lock (the
-   * second re-review of PR #85). A refresh touches the lock only while it is this holder's. */
+   * second re-review of PR #85). */
   function releaser(text) {
     let done = false;
     return function release() {
@@ -95,6 +96,18 @@ export function createLock(o = {}) {
       let r, why = "the reclaim mutex stayed busy";
       try { r = withMutex(mine); } catch (e) { r = { ran: false }; why = e && e.code === "ELOCKMUTEX" ? "the reclaim mutex is old (possibly abandoned)" : String(e && e.message || e); }
       if (!r.ran) { try { console.error("browser lock: not released (" + why + "); " + LOCK + " is left to go stale in 40 minutes or to be removed by hand"); } catch (e) { /* no stderr */ } }
+    };
+  }
+  /** the heartbeat: the ownership check, the timestamp and the touch are ONE step under the mutex, so the file cannot change hands
+   * between them. Unserialised, a holder stalled after its check could touch a replacement holder's file with its old timestamp,
+   * making that live lock look stale to the next reclaimer (the third re-review of PR #85). Without the mutex (busy, or old), this
+   * refresh is skipped; the next comes 5 minutes later, far inside the 40-minute lease. */
+  function refresher(text) {
+    return function refresh() {
+      try {
+        const r = withMutex(() => { if (F.readFileSync(LOCK, "utf8") !== text) return false; const t = new Date(); F.utimesSync(LOCK, t, t); return true; });
+        return r.ran && r.value === true;
+      } catch (e) { return false; /* not ours any more, gone, or the mutex is old: skipped */ }
     };
   }
 
@@ -114,8 +127,8 @@ export function createLock(o = {}) {
       if (Date.now() - said > 60000) { said = Date.now(); log("waiting for the browser lock (" + (r.age === null ? "?" : Math.round(r.age / 1000) + " s old") + ")"); }
       await new Promise((res) => setTimeout(res, POLL));
     }
-    const text = r.text, release0 = r.release;
-    const keep = setInterval(() => { try { if (F.readFileSync(LOCK, "utf8") === text) { const t = new Date(); F.utimesSync(LOCK, t, t); } } catch (e) { /* gone */ } }, 5 * 60 * 1000);
+    const release0 = r.release;
+    const keep = setInterval(r.refresh, 5 * 60 * 1000);
     keep.unref();
     function release() { clearInterval(keep); release0(); }
     process.once("exit", release);
