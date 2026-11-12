@@ -253,7 +253,7 @@ const isType = (t) => (m) => m.type === t;
 const statsAt = (f) => (m) => m.type === 'stats' && m.frame >= f;
 
 /* ---------------------------------------------------------------------
- * The page itself. web/ocean_handoff.js, web/ocean_config.js,
+ * The page itself. web/ui_common.js, web/ocean_handoff.js, web/ocean_config.js,
  * web/ocean_dash.js and web/ocean.js, as they are and in ocean.html's order,
  * in one vm context over a small DOM: the elements ocean.html declares (made
  * on first use) and the ones the page makes, events that bubble, listeners
@@ -671,7 +671,7 @@ async function bootPage(query, opts) {
         return sh;
     };
     const run = (name, src) => vm.runInContext(src !== undefined ? src : fs.readFileSync(path.join(WEB, name), 'utf8'), ctx, { filename: path.join(WEB, name) });
-    run('ocean_handoff.js');
+    run('ui_common.js'); run('ocean_handoff.js');
     if (opts.perf) run('ocean_perf.js');
     run('ocean_scene_stub.js', opts.nogl ? SCENE_NOGL : SCENE_STUB); run('ocean_config.js');
     run('charts_stub.js', CHARTS_STUB); run('ocean_dash.js'); run('ocean.js', PAGE_SRC);
