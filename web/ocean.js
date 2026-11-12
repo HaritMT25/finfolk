@@ -403,7 +403,9 @@
       return { ok: false, why: lastError() };
     }
     /* committed: the page's bookkeeping, once */
+    var hist0 = changedLive;
     try {
+      changedLive = {};   /* a new world: no live change yet (a saved world's own tweaks: liveTweaks) */
       clearFieldNotes();
       afterNewWorld();
       stepOnce = false; summary = null; usedTurbo = false; turboReturn = null;
@@ -416,6 +418,7 @@
       hideAsk();
       renderStartBar();
     } catch (err) {
+      changedLive = hist0;   /* (the run that stays: restoreRun puts its page back, this with it) */
       if (!undo) throw err;
       return restoreRun(undo, err);
     }
@@ -448,11 +451,12 @@
              selectedId: selectedId, wantFollow: wantFollow, following: !!(scene && scene.following()), draft: draft, draftGen: draftGen,
              fields: fields, extraCfg: Object.assign({}, extraCfg), nextOnly: Object.assign({}, nextOnly), paused: paused, url: location.href,
              dash: dash() && dash().save ? dash().save() : null, sampleBucket: sampleBucket, rates: rates.q.slice(),
-             usedTurbo: usedTurbo, turboReturn: turboReturn, stepOnce: stepOnce, summary: summary };
+             usedTurbo: usedTurbo, turboReturn: turboReturn, stepOnce: stepOnce, summary: summary, changedLive: Object.assign({}, changedLive) };
   }
   /* the page's side of a run put back (its memory is in the module again) */
   function pageBack(u) {
     initArgs = u.initArgs; runCfg = u.runCfg; worldEpoch = u.epoch; draft = u.draft; draftGen = u.draftGen;
+    changedLive = Object.assign({}, u.changedLive);
     selectedId = null; wantFollow = false;
     afterNewWorld(true);   /* this world read again: no new epoch (the charts: below) */
     if (u.dash && dash() && dash().restore) dash().restore(u.dash);
@@ -873,6 +877,7 @@
    * key on its way, the field shows what now runs (a refusal in between may
    * have set it back), unless the visitor is in it. */
   function liveApplied(key, v, quiet, seq) {
+    if (v !== (key in runCfg ? runCfg[key] : KEYS[key][0])) changedLive[key] = true;   /* (the run's history: changedKeys) */
     if (v === KEYS[key][0]) delete runCfg[key]; else runCfg[key] = v;
     /* the light the picture is drawn in: this module's, or while Turbo owns
      * the world, what the worker acknowledged (this page's copy is the world
@@ -1340,6 +1345,16 @@
       if (a !== b) out.push(k);
     });
     return out;
+  }
+  /* The live settings whose value changed during this world, set back or not: the run's history, which a
+   * comparison of settings forgets (a floor raised for a step and set back has added its founders). Set by
+   * an accepted change (liveApplied, EvoOcean.set); cleared only when a new world is committed (startWorld). */
+  var changedLive = {};
+  /* what makes this run differ from its setup's replay: history, and a saved world's own tweaks (liveTweaks) */
+  function changedKeys() {
+    var o = Object.assign({}, changedLive);
+    liveTweaks().forEach(function (k) { o[k] = true; });
+    return Object.keys(o);
   }
   /* Edits waiting for the next start (the approved rule's fourth reason to
    * ask): a field changed (Fit and the E1 water too), a staged recipe
@@ -3767,13 +3782,16 @@
       ? (flags ? ", each fish drawn from its appearance genes (skin pattern and body shape)"
                : ", coloured by family (" + (HAS_APP ? "the appearance genes are off in this world" : "this module has no appearance genes") + ")")
       : (flags & 2 ? ", each fish in its inherited body shape" : "") + (colourBrain ? ", coloured by brain" : ", coloured by family");
-    /* what replays: the module is serial and Hold 60 fps never changes the run; a live tweak is not part of the setup */
-    var tw = liveTweaks().length;
+    /* what replays: the module is serial and Hold 60 fps never changes the run; a live change is not part of the setup,
+     * set back or not (changedKeys: the run's history). As data too: data-replay "yes" / "no", data-why "live". */
+    var tw = changedKeys().length, ml = el("modeline");
     modelineDetail = scene ? scene.quality() : 0;
-    el("modeline").textContent = "Running the single-threaded Ocean module" + (HAS_EYE ? " (the eye build)" : "") +
+    ml.dataset.replay = tw ? "no" : "yes";
+    ml.dataset.why = tw ? "live" : "";
+    ml.textContent = "Running the single-threaded Ocean module" + (HAS_EYE ? " (the eye build)" : "") +
       ": the same seed and setup replay a run step for step" +
-      (tw ? "; this run has " + (tw === 1 ? "a live tweak" : tw + " live tweaks") + ", not part of its setup, so Replay starts it again without " +
-            (tw === 1 ? "it" : "them") : "") +
+      (tw ? "; " + (tw === 1 ? "a setting was" : tw + " settings were") + " changed live during this run, which is not part of its setup" +
+            " (even if set back), so Replay starts it again without " + (tw === 1 ? "that change" : "those changes") : "") +
       ". The tank: " + W + " × " + H + " × " + D +
       (WALLS ? ", glass walls" : ", the sides wrap around") +
       ". Drawing: the 3D tank" + (scene ? ", detail " + scene.quality() + " of 3" : "") +
@@ -4087,6 +4105,7 @@
           if (!has("oc_set_param")) return false;
           var ok = withCString(String(name), function (p) { return M._oc_set_param(p, +v); });
           if (!ok) console.warn("oc_set_param(" + name + "): " + lastError());
+          else { changedLive[String(name)] = true; updateModeline(); }   /* (around the sheet: the run's history all the same) */
           readLight();
           return !!ok;
         }, false);

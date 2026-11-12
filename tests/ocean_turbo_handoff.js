@@ -306,6 +306,7 @@ const PAGE_SRC = (() => {
         '    get lastS() { return fresh(lastS); }, inspect: inspect,\n' +
         '    get draft() { return typeof draft === "undefined" ? null : draft; }, get draftGen() { return typeof draftGen === "undefined" ? 0 : draftGen; },\n' +
         '    pendingDiff: typeof pendingDiff === "function" ? pendingDiff : function () { return []; }, readForm: readForm,\n' +
+        '    liveTweaks: typeof liveTweaks === "function" ? liveTweaks : function () { return []; },\n' +
         '    getVal: getVal, importWorld: importWorld, wiringNow: wiringNow, frame: frame,\n' +
         '    get worldSave() { return typeof worldSave === "undefined" ? null : worldSave; }, get selectedId() { return selectedId; },\n' +
         '    get engineState() { return typeof engineState === "undefined" ? null : engineState; },\n' +
@@ -2981,6 +2982,38 @@ async function pageModelineDetail() {
     ok(p.uncaught.length === 0, 'no exception escaped the page\'s handlers' + (p.uncaught.length ? ' (' + p.uncaught[0] + ')' : ''));
 }
 
+/* What the modeline says replays is the run's history, not a comparison of settings (review of #88, P2-1): a reseed floor
+ * raised for a step adds founders that Replay never makes, so setting it back leaves the run changed; an edit to the value
+ * the world already runs changes nothing; Replay (a new world) starts clean. Read from the modeline's data-replay / data-why. */
+async function pageReplayHistory() {
+    section('The modeline\'s replay claim is the run\'s history: a live change set back still counts, a no-op edit and Replay do not');
+    const p = await bootPage(PAGE_Q7);
+    const claim = () => { const d = p.el('modeline').dataset; return (d.replay || '?') + (d.why ? ':' + d.why : ''); };
+    const fish = () => p.ctx.EvoOcean.state().n;
+    let now = performance.now();
+    const frames = (k) => { for (let i = 0; i < k; i++) { const cb = p.raf; p.raf = null; if (cb) cb(now += 17); } };
+    frames(3);
+    const c0 = claim(), floor0 = p.T.getVal('minPopulation');
+    p.edit('minPopulation', floor0);   /* the value it runs: nothing changes */
+    const cSame = claim();
+    const n0 = fish();
+    p.edit('minPopulation', n0 + 40);   /* live: founders below it at the next step */
+    frames(3);
+    const n1 = fish(), cRaised = claim();
+    p.edit('minPopulation', floor0);    /* set back: the settings equal the setup's again */
+    frames(2);
+    const tweaksBack = p.T.liveTweaks().length, cBack = claim();
+    p.click('replay');
+    if (p.T.asking) p.click('startconfirm');
+    frames(1);
+    const cReplay = claim();
+    ok(c0 === 'yes' && cSame === 'yes' && n1 >= n0 + 40 && cRaised === 'no:live' && tweaksBack === 0 && cBack === 'no:live' && cReplay === 'yes',
+       'a fresh world replays (' + c0 + '); its floor edited to the value it runs (' + floor0 + '): still (' + cSame + '); raised to ' + (n0 + 40) +
+       ' for a step (' + n0 + ' -> ' + n1 + ' fish): not (' + cRaised + '); set back (' + tweaksBack + ' settings differ from the setup): still not (' +
+       cBack + '); after Replay (' + cReplay + ')');
+    ok(p.uncaught.length === 0, 'no exception escaped the page\'s handlers' + (p.uncaught.length ? ' (' + p.uncaught[0] + ')' : ''));
+}
+
 /* UI-3: Start from. Every scenario (and Surprise me's draws) starts in
  * oc_init on ordinary, portrait, small and large tanks; Surprise me's
  * labels are written after its one volume scaling; picking a card only
@@ -5136,7 +5169,7 @@ const SECTIONS = {
     pageWallsOverride, pageFreshVisit, pageSizeFields, pageRoundTrip,
     pageColourBench, pageLayers, pageResize, pageKeys, pageStartupFailures, pageTourEscape, pageWholeFields,
     pageTurboFraction, pageCardNumbers, pageMixedRecovery, pageEscOwner, pageTabKeys, pageIntegralFloats,
-    pageTurboMode, pageStartDoor, pageFollowBack, pageDraft, pageModelineDetail, pageScenarios,
+    pageTurboMode, pageStartDoor, pageFollowBack, pageDraft, pageModelineDetail, pageReplayHistory, pageScenarios,
     pageCancelQueued, pageQueuedFile, pageNextBehindLive, pageEditedFile, pageReplayStaleRead, pageAskTarget, pagePendingAsk,
     pageKeyboardAsk,
     worldCodec, pageWorldFile, pageWorldTurbo, pageWorldRefusals,
