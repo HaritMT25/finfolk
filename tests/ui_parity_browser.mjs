@@ -1,43 +1,76 @@
 // tests/ui_parity_browser.mjs: the UI parity plan's paired browser harness (docs/ui_parity.md). Classic and the Ocean in the same
 // state, one case at a time, each world in a fresh headless Brave (a temporary profile: clean storage) under the machine-wide
 // browser lock (tools/ocean_render_perf/lock.mjs), with full-page screenshots that include the DOM chrome (not the WebGL
-// framebuffer alone). A local tool, not a CI job (CI has no browser); the cases are tests/fixtures/ui_parity_cases.json.
+// framebuffer alone). A local tool, not a CI job (CI has no browser); the cases are tests/fixtures/ui_parity_cases.json. The
+// selection checks (--plan) and the comparison gate (--compare) need no browser: tests/ui_parity_harness_tests.mjs runs them in CI.
 //
-//   node tests/ui_parity_browser.mjs --base http://localhost:8123 --out DIR [--layout source|site] [--sets S0,S2]
-//        [--cases s0_shell,...] [--worlds classic,ocean] [--name WHO] [--smoke] [--headed] [--list]
-//   node tests/ui_parity_browser.mjs --compare BEFORE_DIR AFTER_DIR [--out DIFF_DIR]
+//   node tests/ui_parity_browser.mjs --base http://localhost:8123 --out DIR [--clean] [--layout source|site] [--sets S0,S2]
+//        [--cases s0_shell,...] [--worlds classic,ocean] [--name WHO] [--smoke] [--headed]
+//   node tests/ui_parity_browser.mjs --plan [the same selection]          what a run would take (no browser), or why it is refused
+//   node tests/ui_parity_browser.mjs --list                               the cases
+//   node tests/ui_parity_browser.mjs --compare BEFORE_DIR AFTER_DIR [--report] [--sets ..] [--cases ..] [--worlds ..]
+//        [--out DIFF_DIR [--clean]]
 //
 // --layout source (the default): --base serves the repository root (python3 wasm/serve.py, its default root), so Classic is
 //          /web/index.html and the Ocean /web/ocean.html (and Classic's ../img/rocks.jpg resolves). --layout site: --base serves
 //          a built site (bash wasm/build_site.sh; SITE_DIR=/x), so Classic is /classic.html and the Ocean /; --smoke there also
 //          loads the Ocean's old name /ocean.html. Never /index.html for Classic: on the site that is the Ocean.
 // --smoke (alone: only these; with --sets / --cases: those cases too): each route loaded as a visitor would (no held clock), its
-//          ready state, no console error / warning, page error,
-//          failed request or HTTP error; one picture each.
-// --compare: the same-named PNGs of two runs (before / after), pixel for pixel: pixels differing, the largest channel
-//          difference, the box of the differences; a x16 difference picture for each that differs (into --out). Exit 0.
+//          ready state, no console error / warning, page error, failed request or HTTP error; one picture each (not compared).
+// The selection: every world named must be one (classic, ocean), every set and case must exist, and the case x world list it
+//          gives must not be empty (also with --smoke); the fixture itself is checked first (unique case ids, unique shot names in
+//          each case and world, known steps and expectations, a selector for every world a step runs on). Exit 2 otherwise.
+// --out:   must be new or empty: a run never mixes with an older one's pictures. --clean empties it first, of the harness's own
+//          files only (*.png, manifest.json, summary.json, index.md); anything else there and it refuses.
+// The run writes DIR/manifest.json (kept current after every case): the harness's and the fixture's sha256, the selection,
+//          every capture it was to take, and every one it took (sha256, size, case, set, world, shot, the fixture's difference
+//          policy for it); "complete" only once every run passed and every capture was taken. Exit 1 on any failed run.
+// --compare: a gate on two runs' manifests (before, after), never on whatever PNGs happen to be in two directories. Refused
+//          (exit 1, INVALID): a directory without a manifest, a run that is not complete, a capture missing or changed since its
+//          run (its sha256), a PNG the run did not write (stale), different harness or fixture files, a capture on one side and
+//          not the other, nothing left to compare. Then pixel for pixel, each picture under its policy (the fixture's
+//          defaults.compare, a case's or shot's "compare"): a pixel differs when a channel differs by more than "tolerance";
+//          a picture passes with at most "maxPixels" such pixels. Exit 1 (FAIL) on a picture beyond its policy or a size change;
+//          exit 0 (PASS) otherwise. --report: the same checks of the evidence, but differences and size changes are listed, not
+//          failed (a PR that changes the UI on purpose); exit 0 when the evidence is valid. --sets / --cases / --worlds narrow
+//          the comparison (e.g. --sets S0: the shell must not change). --out: a x16 difference picture for each picture that
+//          differs at all, and compare.json.
 //
 // The state (the plan's capture rules): seed 42 and 300 founders on both pages (Classic ignores setup URL parameters: its own
 // form's seed and population fields and its Restart; the Ocean: its link's seed= and pop=), Classic's single-threaded module
 // (?threads=0: the reproducible one), no tour (?guide=0&intro=0). The page's animation frames are held from the start, so the
 // new world waits at tick 0; a case's "run" step lets the page's own frame loop go at speed 1 (one step a frame) and, after the
 // frame that reaches the tick, presses the page's own Pause button ("pause") or holds the frames there ("freeze": the live UI).
-// Then the same pictures are possible on any commit:
+// What is controlled, so that the same picture comes out on any run of a commit:
 //   - the clock: performance.now() and the frames' timestamps advance exactly 1/60 s per animation frame (a frame-locked clock):
 //     the frame rate reads 60, no governor (Hold 60 fps, Classic's detail / cap) ever acts, camera eases end the same way
 //   - the frames: held between steps; a step that needs the page to draw lets an exact number run (settle), so every run of a
-//     case draws the same frames (the live numbers' half-second refresh included)
+//     case draws the same frames; a shot taken while the frames run free (release) is refused
+//   - idle callbacks (requestIdleCallback: both scenes' caustic texture) are queued, never run by the browser's idle time: the
+//     harness runs them before any frame (the barrier, and every settle), so the caustics fade in over the same frames
+//   - the renderer barrier, before the first step: Classic's background image decoded; the Ocean's polished fish programs
+//     compiled ahead (its swim polish ungated for one frame, so the warm-up is asked at once, then its setting back) and its
+//     decoded programs in effect (or the run fails, naming why); then a fixed number of frames (barrierFrames). After it,
+//     nothing a picture shows waits on a compile; each shot checks it still holds
+//   - the page's own timers stay real time but are waited out: before frames run, until no one-shot timer of up to 1 s is
+//     pending (the setup sheet's insets 320 ms after its slide, a tip's 200 ms, a resize's 250 ms), so each one lands before
+//     the frames, not among them; before a shot, every one-shot timer of up to 10 s (a toast's life) as well. The page's
+//     one-time "click a fish" hint (9 s after ready) is waited out in the barrier, before any step, so it always shows with
+//     nothing selected and is gone before the first shot. #toasts must be empty at each shot (a shot's toasts: "keep" is the
+//     one exception), else the run fails. Intervals are not waited on: the charts' 500 ms redraw draws the same paused data
 //   - the animation time: each scene's render gets a fixed animT (both scenes' create(), wrapped as they register)
 //   - the visual RNG: Math.random is a seeded xorshift32 (snow, streaks; nothing in a case draws a seed from it)
 //   - fonts loaded (document.fonts.ready), the CSS animations and transitions finished (the screenshot's animations: disabled),
-//     the caret hidden, the 9 s "click a fish" hint and every toast gone before a picture (a shot's toasts: "keep" keeps them)
-//   - locale en-US, timezone UTC, DPR and viewport from the case (1440 x 900 at 1 by default), prefers-reduced-motion off
+//     the caret hidden; locale en-US, timezone UTC, the sRGB colour profile, no partial raster, DPR and viewport from the case
+//     (1440 x 900 at 1 by default), prefers-reduced-motion off
+// Not controlled, and so the compare policy's tolerance: the GPU's and the compositor's anti-aliasing of rounded edges over the
+// canvas (a channel off by 1 in a few pixels between two runs of one commit), and rarely a few pixels of a rounded bar's edge.
 // Numerical claims belong in node tests, not in these pictures.
 //
 // Steps (a case's "steps"; "world" limits a step to one world; "sel" is a selector or {classic, ocean}):
 //   run {tick, then: pause|freeze}   the frame loop to the tick, as above
 //   pause                            the page's Pause pressed (if it runs), then settle
-//   release / freeze                 the frames let go with no count (not reproducible: not before a shot) / held
+//   release / freeze                 the frames let go with no count (no shot until a settle) / held
 //   settle {frames}                  exactly that many frames (the default's settleFrames), then held
 //   select                           a fish selected through the page: Classic's EvoApp.inspectSomeFish (the fish nearest
 //                                    (0.4 W, 0.45 H)), the Ocean's EvoOcean.select of the fish nearest the same point (plan view)
@@ -46,31 +79,57 @@
 //   key {key, times}                 a key pressed where the focus is (Playwright's keyboard)
 //   tabTo {sel, max}                 Tab pressed until the focus is on the element (the keyboard's way there: its ring shows)
 //   focus {sel} / blur               element.focus() / the focused element's blur()
-//   wait {ms}                        real time (a CSS transition)
-//   shot {name, toasts}              the picture, CASE__WORLD__NAME.png, and the page's state then (summary.json)
-// Output: DIR/*.png, DIR/summary.json (per case and world: the URL, the build's asset names, every shot's state, the page's
-// errors), DIR/index.md (case -> world -> shot -> file -> state).
+//   wait {ms}                        real time
+//   shot {name, toasts, expect, compare}  the picture, CASE__WORLD__NAME.png, and the page's state then (summary.json);
+//                                    expect: what the state must be ({tick, paused, held, speed, dashOpen, sheetOpen, toasts,
+//                                    focus: null | {id, role, text, ring}, dash / setup: {selected, tabbable}}, and per world
+//                                    under "classic" / "ocean"), else the run fails; compare: this picture's policy
+// Output: DIR/*.png, DIR/manifest.json, DIR/summary.json (per case and world: the URL, the build's asset names, the renderer's
+// state after the barrier, every shot's state, the page's errors), DIR/index.md (case -> world -> shot -> file -> state).
 //
 //   env: PLAYWRIGHT  the playwright module (default C:/Users/harit/gemini_bridge/node_modules/playwright)
 //        BRAVE_EXE   the browser (default C:/Program Files/BraveSoftware/Brave-Browser/Application/brave.exe)
-//        BROWSER_LOCK the lock file (lock.mjs; default: the machine-wide one)
+//        BROWSER_LOCK the lock file (lock.mjs; default: the machine-wide one), BROWSER_LOCK_POLL_MS its poll
+// The lock is taken for each case and world (one browser), so other jobs can run between them; an interrupted run leaves a
+// manifest that is not complete (and Playwright closes its browser as the process exits).
 import { createRequire } from "node:module";
 import fs from "node:fs";
 import path from "node:path";
-import os from "node:os";
 import zlib from "node:zlib";
+import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { acquire } from "../tools/ocean_render_perf/lock.mjs";
 
 const require = createRequire(import.meta.url);
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-const args = process.argv.slice(2);
-function arg(name, def) {
-  const i = args.indexOf("--" + name);
-  if (i < 0) return def;
-  return i + 1 < args.length && !args[i + 1].startsWith("--") ? args[i + 1] : true;
+const SELF = fileURLToPath(import.meta.url);
+const WORLD_NAMES = ["classic", "ocean"];
+const FORMAT = "ui-parity-run", FORMAT_VERSION = 1;
+
+/* ---------------- arguments: every flag known, a value where one is wanted ---------------- */
+const FLAGS = { base: 1, out: 1, layout: 1, sets: 1, cases: 1, worlds: 1, name: 1, "cases-file": 1,
+                smoke: 0, headed: 0, list: 0, plan: 0, clean: 0, report: 0, compare: 2 };
+function usage(msg) { console.error("ui_parity_browser: " + msg + "\n(the header of tests/ui_parity_browser.mjs lists the flags)"); process.exit(2); }
+function parseArgs(argv) {
+  const o = {};
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (!a.startsWith("--")) usage("unexpected argument " + JSON.stringify(a));
+    const k = a.slice(2);
+    if (!(k in FLAGS)) usage("unknown flag --" + k);
+    if (k in o) usage("--" + k + " given twice");
+    const n = FLAGS[k];
+    if (n === 0) { o[k] = true; continue; }
+    const vals = argv.slice(i + 1, i + 1 + n);
+    if (vals.length < n || vals.some((v) => v.startsWith("--"))) usage("--" + k + " needs " + (n === 1 ? "a value" : n + " values"));
+    o[k] = n === 1 ? vals[0] : vals;
+    i += n;
+  }
+  return o;
 }
-const list = (v) => (v === undefined || v === true ? null : String(v).split(",").map((x) => x.trim()).filter(Boolean));
+const ARGS = parseArgs(process.argv.slice(2));
+const listOf = (v) => (v === undefined ? null : String(v).split(",").map((x) => x.trim()).filter(Boolean));
+const sha256 = (buf) => crypto.createHash("sha256").update(buf).digest("hex");
 
 /* ---------------- PNG (8-bit RGB / RGBA, not interlaced: what the browser writes) ---------------- */
 const CRC = (() => { const t = new Uint32Array(256); for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; } return t; })();
@@ -81,6 +140,10 @@ function encodePng(w, h, rgba) {
   for (let y = 0; y < h; y++) { raw[y * (w * 4 + 1)] = 0; Buffer.from(rgba.buffer, rgba.byteOffset + y * w * 4, w * 4).copy(raw, y * (w * 4 + 1) + 1); }
   const ihdr = Buffer.alloc(13); ihdr.writeUInt32BE(w, 0); ihdr.writeUInt32BE(h, 4); ihdr[8] = 8; ihdr[9] = 6;
   return Buffer.concat([Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]), chunk("IHDR", ihdr), chunk("IDAT", zlib.deflateSync(raw, { level: 6 })), chunk("IEND", Buffer.alloc(0))]);
+}
+function pngSize(buf) {
+  if (buf.length < 24 || buf.readUInt32BE(0) !== 0x89504e47 || buf.toString("ascii", 12, 16) !== "IHDR") throw new Error("not a PNG");
+  return [buf.readUInt32BE(16), buf.readUInt32BE(20)];
 }
 function decodePng(buf) {
   if (buf.readUInt32BE(0) !== 0x89504e47) throw new Error("not a PNG");
@@ -114,64 +177,264 @@ function decodePng(buf) {
   }
   return { w, h, px };
 }
-function diffImages(a, b) {
+/* the difference of two pictures: every pixel that differs at all (any: within the tolerance too), those beyond it (differing),
+ * the largest channel difference, the box of the pixels beyond the tolerance, and a x16 picture of every difference */
+function diffImages(a, b, tolerance) {
   if (a.w !== b.w || a.h !== b.h) return { sizeDiffers: true, a: [a.w, a.h], b: [b.w, b.h] };
-  let n = 0, max = 0, x0 = 1e9, y0 = 1e9, x1 = -1, y1 = -1;
+  let any = 0, n = 0, max = 0, x0 = 1e9, y0 = 1e9, x1 = -1, y1 = -1;
   const img = new Uint8Array(a.px.length);
   for (let i = 0; i < a.px.length; i += 4) {
-    const d = Math.max(Math.abs(a.px[i] - b.px[i]), Math.abs(a.px[i + 1] - b.px[i + 1]), Math.abs(a.px[i + 2] - b.px[i + 2]));
-    if (d) { n++; if (d > max) max = d; const p = i / 4, x = p % a.w, y = (p / a.w) | 0; if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y; }
+    const d = Math.max(Math.abs(a.px[i] - b.px[i]), Math.abs(a.px[i + 1] - b.px[i + 1]), Math.abs(a.px[i + 2] - b.px[i + 2]), Math.abs(a.px[i + 3] - b.px[i + 3]));
+    if (d) {
+      any++; if (d > max) max = d;
+      if (d > tolerance) { n++; const p = i / 4, x = p % a.w, y = (p / a.w) | 0; if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y; }
+    }
     const v = Math.min(255, d * 16); img[i] = v; img[i + 1] = v; img[i + 2] = v; img[i + 3] = 255;
   }
-  return { pixels: a.px.length / 4, differing: n, maxDiff: max, box: n ? [x0, y0, x1 - x0 + 1, y1 - y0 + 1] : null, img, w: a.w, h: a.h };
+  return { pixels: a.px.length / 4, any, differing: n, maxDiff: max, box: n ? [x0, y0, x1 - x0 + 1, y1 - y0 + 1] : null, img, w: a.w, h: a.h };
 }
 
-/* ---------------- --compare ---------------- */
-if (arg("compare") !== undefined) {
-  const i = args.indexOf("--compare"), A = args[i + 1], B = args[i + 2], OUTD = arg("out", null);
-  if (!A || !B || A.startsWith("--") || B.startsWith("--")) { console.error("usage: --compare BEFORE_DIR AFTER_DIR [--out DIFF_DIR]"); process.exit(2); }
-  if (OUTD && OUTD !== true) fs.mkdirSync(OUTD, { recursive: true });
-  const names = fs.readdirSync(A).filter((f) => f.endsWith(".png") && fs.existsSync(path.join(B, f))).sort();
-  const only = (d, e) => fs.readdirSync(d).filter((f) => f.endsWith(".png") && !fs.existsSync(path.join(e, f)));
-  const rows = [];
-  for (const f of names) {
-    const d = diffImages(decodePng(fs.readFileSync(path.join(A, f))), decodePng(fs.readFileSync(path.join(B, f))));
-    rows.push({ file: f, ...d, img: undefined });
-    console.log((d.sizeDiffers ? "  SIZE " : d.differing ? "  diff " : "  same ") + f + (d.sizeDiffers ? "  " + d.a.join("x") + " vs " + d.b.join("x")
-      : d.differing ? "  " + d.differing + " px (" + (100 * d.differing / d.pixels).toFixed(3) + " %), max " + d.maxDiff + ", box " + d.box.join(",") : ""));
-    if (OUTD && OUTD !== true && d.differing) fs.writeFileSync(path.join(OUTD, f.replace(/\.png$/, "_diff16x.png")), encodePng(d.w, d.h, d.img));
+/* ---------------- an output directory: new, empty, or emptied of the harness's own files (--clean) ---------------- */
+function prepareDir(dir, clean, owned, what) {
+  if (!fs.existsSync(dir)) { fs.mkdirSync(dir, { recursive: true }); return; }
+  if (!fs.statSync(dir).isDirectory()) usage(what + " " + dir + " is not a directory");
+  const entries = fs.readdirSync(dir);
+  if (!entries.length) return;
+  if (!clean) usage(what + " " + dir + " is not empty (" + entries.length + " entries, e.g. " + entries.slice(0, 3).join(", ") + "): pictures of " +
+                    "two runs must never mix. Use a new directory, or --clean to remove the harness's own files there first");
+  const other = entries.filter((f) => !owned(f));
+  if (other.length) usage("--clean: " + what + " " + dir + " holds files the harness does not write (" + other.slice(0, 5).join(", ") + "): not removing anything");
+  for (const f of entries) fs.rmSync(path.join(dir, f), { force: true });
+}
+const RUN_OWNED = (f) => /\.png$/i.test(f) || f === "manifest.json" || f === "summary.json" || f === "index.md";
+const DIFF_OWNED = (f) => /_diff16x\.png$/i.test(f) || f === "compare.json";
+
+/* ---------------- the fixture: checked before anything runs ---------------- */
+const STEP_NAMES = ["run", "pause", "release", "freeze", "settle", "select", "click", "press", "key", "tabTo", "focus", "blur", "wait", "shot"];
+const SEL_STEPS = ["click", "press", "tabTo", "focus"];
+const STEP_KEYS = { run: ["tick", "then"], settle: ["frames"], click: ["sel"], press: ["sel"], key: ["key", "times"], tabTo: ["sel", "max"],
+                    focus: ["sel"], wait: ["ms"], shot: ["name", "toasts", "expect", "compare"] };
+const EXPECT_KEYS = ["tick", "paused", "held", "speed", "dashOpen", "sheetOpen", "toasts", "focus", "dash", "setup"];
+const NAME_RE = /^[a-z0-9][a-z0-9_]*$/;
+const worldsOfStep = (c, st) => (st.world ? [st.world] : c.worlds);
+function checkPolicy(p, where, bad) {
+  if (!p || typeof p !== "object") { bad.push(where + ": a compare policy is an object {tolerance, maxPixels, why}"); return; }
+  if (!Number.isInteger(p.tolerance) || p.tolerance < 0 || p.tolerance > 255) bad.push(where + ": tolerance is a whole number 0..255");
+  if (!Number.isInteger(p.maxPixels) || p.maxPixels < 0) bad.push(where + ": maxPixels is a whole number >= 0");
+  if (typeof p.why !== "string" || !p.why.trim()) bad.push(where + ": a policy says why (\"why\")");
+}
+function checkExpectSpec(e, where, bad) {
+  if (!e || typeof e !== "object" || Array.isArray(e)) { bad.push(where + ": expect is an object"); return; }
+  for (const k of Object.keys(e)) {
+    if (WORLD_NAMES.indexOf(k) >= 0) { checkExpectSpec(e[k], where + "." + k, bad); continue; }
+    if (EXPECT_KEYS.indexOf(k) < 0) { bad.push(where + ": unknown expectation " + k + " (one of " + EXPECT_KEYS.join(", ") + ")"); continue; }
+    const v = e[k];
+    if (k === "focus" && v !== null && (typeof v !== "object" || Object.keys(v).some((x) => ["id", "role", "text", "ring", "tag"].indexOf(x) < 0)))
+      bad.push(where + ": focus is null or {id, role, text, tag, ring}");
+    if ((k === "dash" || k === "setup") && (typeof v !== "object" || Object.keys(v).some((x) => ["selected", "tabbable"].indexOf(x) < 0)))
+      bad.push(where + ": " + k + " is {selected, tabbable}");
   }
-  for (const f of only(A, B)) console.log("  only in " + A + ": " + f);
-  for (const f of only(B, A)) console.log("  only in " + B + ": " + f);
-  if (OUTD && OUTD !== true) fs.writeFileSync(path.join(OUTD, "compare.json"), JSON.stringify({ before: A, after: B, files: rows, onlyBefore: only(A, B), onlyAfter: only(B, A) }, null, 1));
-  console.log(rows.filter((r) => !r.differing && !r.sizeDiffers).length + " of " + rows.length + " pictures identical");
-  process.exit(0);
+}
+function validateFixture(fix) {
+  const bad = [];
+  if (!fix || typeof fix !== "object") return ["the fixture is not a JSON object"];
+  const D = fix.defaults || {};
+  for (const k of ["seed", "founders", "tick", "viewport", "dpr", "animT", "visualSeed", "settleFrames", "barrierFrames", "locale", "timezone"])
+    if (!(k in D)) bad.push("defaults." + k + " is missing");
+  checkPolicy(D.compare, "defaults.compare", bad);
+  for (const lay of ["source", "site"]) for (const w of WORLD_NAMES) if (!fix.routes || !fix.routes[lay] || typeof fix.routes[lay][w] !== "string") bad.push("routes." + lay + "." + w + " is missing");
+  for (const w of WORLD_NAMES) if (!fix.query || typeof fix.query[w] !== "string") bad.push("query." + w + " is missing");
+  if (!Array.isArray(fix.cases) || !fix.cases.length) { bad.push("cases: none"); return bad; }
+  const ids = new Set();
+  for (const [ci, c] of fix.cases.entries()) {
+    const at = "case " + (c && c.id ? c.id : "#" + ci);
+    if (!c || typeof c.id !== "string" || !NAME_RE.test(c.id)) { bad.push(at + ": id is a lower-case name (a-z, 0-9, _)"); continue; }
+    if (ids.has(c.id)) bad.push(at + ": the id is used twice (its pictures would overwrite each other)");
+    ids.add(c.id);
+    if (typeof c.set !== "string" || !/^S\d$/.test(c.set)) bad.push(at + ": set is S0..S9");
+    if (!Array.isArray(c.worlds) || !c.worlds.length || c.worlds.some((w) => WORLD_NAMES.indexOf(w) < 0) || new Set(c.worlds).size !== c.worlds.length)
+      { bad.push(at + ": worlds is a list of distinct names from " + WORLD_NAMES.join(", ")); continue; }
+    if (c.query !== undefined && typeof c.query !== "string" && (typeof c.query !== "object" || Object.keys(c.query).some((w) => WORLD_NAMES.indexOf(w) < 0)))
+      bad.push(at + ": query is a string or {classic, ocean}");
+    if (c.compare !== undefined) checkPolicy(c.compare, at + ".compare", bad);
+    if (!Array.isArray(c.steps) || !c.steps.length) { bad.push(at + ": no steps"); continue; }
+    const shots = {};
+    for (const w of c.worlds) shots[w] = new Set();
+    for (const [si, st] of c.steps.entries()) {
+      const sat = at + " step " + (si + 1) + " (" + (st && st.do) + ")";
+      if (!st || STEP_NAMES.indexOf(st.do) < 0) { bad.push(sat + ": unknown step (one of " + STEP_NAMES.join(", ") + ")"); continue; }
+      for (const k of Object.keys(st)) if (k !== "do" && k !== "world" && (STEP_KEYS[st.do] || []).indexOf(k) < 0) bad.push(sat + ": unknown key " + k);
+      if (st.world !== undefined && c.worlds.indexOf(st.world) < 0) { bad.push(sat + ": world " + st.world + " is not one of the case's"); continue; }
+      const ws = worldsOfStep(c, st);
+      if (SEL_STEPS.indexOf(st.do) >= 0) {
+        if (typeof st.sel === "string") { if (!st.sel) bad.push(sat + ": empty selector"); }
+        else if (!st.sel || typeof st.sel !== "object") bad.push(sat + ": sel is a selector or {classic, ocean}");
+        else for (const w of ws) if (typeof st.sel[w] !== "string" || !st.sel[w]) bad.push(sat + ": no selector for " + w + " (the step runs there)");
+      }
+      if (st.do === "run" && ((st.tick !== undefined && !(Number.isInteger(st.tick) && st.tick >= 0)) || (st.then !== undefined && ["pause", "freeze"].indexOf(st.then) < 0)))
+        bad.push(sat + ": tick is a whole number, then pause or freeze");
+      if (st.do === "settle" && st.frames !== undefined && !(Number.isInteger(st.frames) && st.frames > 0)) bad.push(sat + ": frames is a whole number > 0");
+      if (st.do === "key" && (typeof st.key !== "string" || !st.key)) bad.push(sat + ": no key");
+      if (st.do === "wait" && !(st.ms > 0)) bad.push(sat + ": ms > 0");
+      if (st.do === "shot") {
+        if (typeof st.name !== "string" || !NAME_RE.test(st.name)) bad.push(sat + ": name is a lower-case name (a-z, 0-9, _)");
+        else for (const w of ws) { if (shots[w].has(st.name)) bad.push(sat + ": shot " + st.name + " twice on " + w + " (the second would overwrite the first)"); shots[w].add(st.name); }
+        if (st.toasts !== undefined && st.toasts !== "keep") bad.push(sat + ": toasts is \"keep\" or absent");
+        if (st.expect !== undefined) checkExpectSpec(st.expect, sat + ".expect", bad);
+        if (st.compare !== undefined) checkPolicy(st.compare, sat + ".compare", bad);
+      }
+    }
+    for (const w of c.worlds) if (!shots[w].size) bad.push(at + ": no shot on " + w + " (a run must leave a picture)");
+  }
+  return bad;
+}
+function loadFixture(file) {
+  let text, fix;
+  try { text = fs.readFileSync(file, "utf8"); } catch (e) { usage("cannot read the cases file " + file + ": " + e.message); }
+  try { fix = JSON.parse(text); } catch (e) { usage("the cases file " + file + " is not JSON: " + e.message); }
+  const bad = validateFixture(fix);
+  if (bad.length) usage("the cases file " + file + " is not valid:\n  " + bad.join("\n  "));
+  return { fix, sha: sha256(Buffer.from(text, "utf8")), file };
+}
+const policyOf = (fix, c, st) => Object.assign({}, fix.defaults.compare, c.compare || {}, st.compare || {});
+const fileOf = (caseId, world, shot) => caseId + "__" + world + "__" + shot + ".png";
+/* the selection: validated, then the case x world list; never empty when cases are asked for (or no --smoke) */
+function makePlan(fix, o) {
+  const sets = listOf(o.sets), ids = listOf(o.cases), worlds = listOf(o.worlds) || WORLD_NAMES.slice(), smoke = !!o.smoke, layout = o.layout || "source";
+  const bad = [];
+  if (!fix.routes[layout]) bad.push("--layout is source or site, not " + JSON.stringify(layout));
+  if (!worlds.length) bad.push("--worlds names no world");
+  for (const w of worlds) if (WORLD_NAMES.indexOf(w) < 0) bad.push("--worlds: no world " + JSON.stringify(w) + " (" + WORLD_NAMES.join(", ") + ")");
+  if (new Set(worlds).size !== worlds.length) bad.push("--worlds names a world twice");
+  const knownSets = new Set(fix.cases.map((c) => c.set));
+  if (sets) for (const s of sets) if (!knownSets.has(s)) bad.push("--sets: no case is in set " + JSON.stringify(s) + " (sets: " + Array.from(knownSets).join(", ") + ")");
+  if (ids) for (const id of ids) if (!fix.cases.some((c) => c.id === id)) bad.push("--cases: no case " + JSON.stringify(id) + " (--list)");
+  if (bad.length) return { bad };
+  const wantCases = !smoke || !!sets || !!ids;
+  const runs = [];
+  if (wantCases) for (const c of fix.cases) {
+    if ((sets && sets.indexOf(c.set) < 0) || (ids && ids.indexOf(c.id) < 0)) continue;
+    for (const w of c.worlds) {
+      if (worlds.indexOf(w) < 0) continue;
+      const shots = c.steps.filter((st) => st.do === "shot" && (!st.world || st.world === w));
+      runs.push({ c, world: w, captures: shots.map((st) => ({ file: fileOf(c.id, w, st.name), shot: st.name, policy: policyOf(fix, c, st) })) });
+    }
+  }
+  if (wantCases && !runs.length)
+    bad.push("the selection runs no case (" + [sets && "--sets " + sets.join(","), ids && "--cases " + ids.join(","), "--worlds " + worlds.join(",")].filter(Boolean).join(" ") +
+             "): its cases are not on those worlds. Nothing would be tested");
+  const smokes = [];
+  if (smoke) {
+    const R = fix.routes[layout];
+    for (const w of worlds) smokes.push({ world: w, route: R[w], label: w + (layout === "site" ? "_site" : "_source") });
+    if (layout === "site" && R.oceanAlias && worlds.indexOf("ocean") >= 0) smokes.push({ world: "ocean", route: R.oceanAlias, label: "ocean_alias_site" });
+  }
+  if (!runs.length && !smokes.length && !bad.length) bad.push("nothing selected");
+  return { bad, runs, smokes, selection: { sets, cases: ids, worlds, smoke, layout } };
 }
 
-/* ---------------- the cases ---------------- */
-const CASES_FILE = path.resolve(String(arg("cases-file", path.join(HERE, "fixtures", "ui_parity_cases.json"))));
-const FIX = JSON.parse(fs.readFileSync(CASES_FILE, "utf8"));
+/* ---------------- --compare: the gate ---------------- */
+function readRun(dir, label) {
+  const problems = [];
+  if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) return { problems: [label + ": " + dir + " is not a directory"] };
+  const mp = path.join(dir, "manifest.json");
+  if (!fs.existsSync(mp)) return { problems: [label + ": no manifest.json in " + dir + " (not a run of this harness, or one interrupted before it began)"] };
+  let m;
+  try { m = JSON.parse(fs.readFileSync(mp, "utf8")); } catch (e) { return { problems: [label + ": its manifest.json is not JSON (" + e.message + ")"] }; }
+  if (!m || m.format !== FORMAT || m.version !== FORMAT_VERSION || !Array.isArray(m.expected) || !m.captures || typeof m.captures !== "object")
+    return { problems: [label + ": manifest.json is not a " + FORMAT + " v" + FORMAT_VERSION + " manifest"] };
+  if (m.complete !== true) {
+    const failed = (m.runs || []).filter((r) => !r.ok).map((r) => r.case + " on " + r.world + ": " + String(r.error || "").split("\n")[0]);
+    problems.push(label + ": the run is not complete (status " + m.status + (failed.length ? "; " + failed.slice(0, 3).join("; ") : "") + ")");
+  }
+  for (const f of m.expected) if (!m.captures[f]) problems.push(label + ": " + f + " was to be taken and was not");
+  for (const [f, c] of Object.entries(m.captures)) {
+    const p = path.join(dir, f);
+    if (!fs.existsSync(p)) { problems.push(label + ": " + f + " is in the manifest but not in " + dir); continue; }
+    if (sha256(fs.readFileSync(p)) !== c.sha256) problems.push(label + ": " + f + " is not the picture its run took (its sha256 changed since: stale or edited)");
+  }
+  for (const f of fs.readdirSync(dir)) if (/\.png$/i.test(f) && !m.captures[f]) problems.push(label + ": " + f + " is not a capture of this run (stale, or a failed step's picture)");
+  return { m, problems };
+}
+function compareMain(o) {
+  const [A, B] = o.compare, report = !!o.report;
+  const sets = listOf(o.sets), ids = listOf(o.cases), worlds = listOf(o.worlds);
+  if (worlds) for (const w of worlds) if (WORLD_NAMES.indexOf(w) < 0) usage("--worlds: no world " + JSON.stringify(w));
+  const OUTD = o.out ? path.resolve(o.out) : null;
+  if (OUTD) prepareDir(OUTD, !!o.clean, DIFF_OWNED, "--out");
+  const ra = readRun(A, "BEFORE " + A), rb = readRun(B, "AFTER " + B), problems = ra.problems.concat(rb.problems);
+  const pick = (m) => Object.keys(m.captures).filter((f) => {
+    const c = m.captures[f];
+    return c.kind === "case" && (!sets || sets.indexOf(c.set) >= 0) && (!ids || ids.indexOf(c.case) >= 0) && (!worlds || worlds.indexOf(c.world) >= 0);
+  }).sort();
+  let files = [];
+  if (ra.m && rb.m) {
+    if (ra.m.harness !== rb.m.harness) problems.push("the two runs were taken by different harness files (sha256 " + String(ra.m.harness).slice(0, 12) + " vs " + String(rb.m.harness).slice(0, 12) + "): run both with one");
+    if (ra.m.fixture !== rb.m.fixture) problems.push("the two runs used different cases files (sha256 " + String(ra.m.fixture).slice(0, 12) + " vs " + String(rb.m.fixture).slice(0, 12) + "): run both with one");
+    const fa = pick(ra.m), fb = pick(rb.m), sb = new Set(fb), sa = new Set(fa);
+    for (const f of fa) if (!sb.has(f)) problems.push(f + ": in BEFORE, not in AFTER");
+    for (const f of fb) if (!sa.has(f)) problems.push(f + ": in AFTER, not in BEFORE");
+    files = fa.filter((f) => sb.has(f));
+    if (!files.length) problems.push("nothing to compare" + (sets || ids || worlds ? " in the selection" : "") + " (no case capture on both sides)");
+  }
+  const rows = [];
+  if (!problems.length) for (const f of files) {
+    const ca = ra.m.captures[f], cb = rb.m.captures[f], pol = cb.policy || ra.m.policy;
+    const d = diffImages(decodePng(fs.readFileSync(path.join(A, f))), decodePng(fs.readFileSync(path.join(B, f))), pol.tolerance);
+    const row = { file: f, case: cb.case, set: cb.set, world: cb.world, shot: cb.shot, policy: pol, beforeSha: ca.sha256, afterSha: cb.sha256 };
+    if (d.sizeDiffers) Object.assign(row, { verdict: "size", before: d.a, after: d.b });
+    else Object.assign(row, { verdict: !d.any ? "same" : d.differing <= pol.maxPixels ? "within" : "differs", pixels: d.pixels, any: d.any, differing: d.differing, maxDiff: d.maxDiff, box: d.box });
+    rows.push(row);
+    const tag = { same: "  same   ", within: "  noise  ", differs: "  DIFF   ", size: "  SIZE   " }[row.verdict];
+    console.log(tag + f + (row.verdict === "size" ? "  " + row.before.join("x") + " -> " + row.after.join("x")
+      : row.verdict === "same" ? "" : "  " + row.any + " px differ, " + row.differing + " beyond tolerance " + pol.tolerance + " (policy: at most " + pol.maxPixels + "), max " +
+        row.maxDiff + (row.box ? ", box " + row.box.join(",") : "")));
+    if (OUTD && !d.sizeDiffers && d.any) fs.writeFileSync(path.join(OUTD, f.replace(/\.png$/, "_diff16x.png")), encodePng(d.w, d.h, d.img));
+  }
+  const beyond = rows.filter((r) => r.verdict === "differs" || r.verdict === "size");
+  const verdict = problems.length ? "INVALID" : report ? "REPORT" : beyond.length ? "FAIL" : "PASS";
+  for (const p of problems) console.log("  INVALID " + p);
+  const counts = ["same", "within", "differs", "size"].map((v) => rows.filter((r) => r.verdict === v).length);
+  console.log(verdict + ": " + (problems.length ? problems.length + " problems with the evidence; nothing compared" :
+              rows.length + " pictures: " + counts[0] + " identical, " + counts[1] + " within their policy, " + counts[2] + " beyond it, " + counts[3] + " of another size" +
+              (report ? " (--report: differences listed, not failed)" : "")));
+  if (OUTD) fs.writeFileSync(path.join(OUTD, "compare.json"), JSON.stringify({ before: path.resolve(A), after: path.resolve(B), mode: report ? "report" : "check",
+    selection: { sets, cases: ids, worlds }, verdict, problems, counts: { same: counts[0], within: counts[1], differs: counts[2], size: counts[3] }, files: rows }, null, 1));
+  process.exit(verdict === "PASS" || verdict === "REPORT" ? 0 : 1);
+}
+
+/* ---------------- dispatch: compare, list, plan (no browser), then a run ---------------- */
+if (ARGS.compare) {
+  for (const k of Object.keys(ARGS)) if (["compare", "report", "sets", "cases", "worlds", "out", "clean"].indexOf(k) < 0) usage("--" + k + " is not a --compare flag");
+  compareMain(ARGS);
+}
+if (ARGS.report) usage("--report goes with --compare");
+const CASES_FILE = path.resolve(String(ARGS["cases-file"] || path.join(HERE, "fixtures", "ui_parity_cases.json")));
+const { fix: FIX, sha: FIX_SHA } = loadFixture(CASES_FILE);
 const DEF = FIX.defaults;
-const LAYOUT = String(arg("layout", "source"));
-if (!FIX.routes[LAYOUT]) { console.error("--layout source|site"); process.exit(2); }
-const ROUTES = FIX.routes[LAYOUT];
-const SETS = list(arg("sets")), IDS = list(arg("cases")), WORLDS = list(arg("worlds")) || ["classic", "ocean"];
-const SMOKE = arg("smoke") !== undefined;   /* (alone: the smoke runs only; with --sets / --cases: those cases too) */
-const SELECTED = SMOKE && !SETS && !IDS ? [] : FIX.cases.filter((c) => (!SETS || SETS.indexOf(c.set) >= 0) && (!IDS || IDS.indexOf(c.id) >= 0));
-if (arg("list") !== undefined) {
+if (ARGS.list) {
   for (const c of FIX.cases) console.log(c.id.padEnd(20) + c.set.padEnd(4) + c.worlds.join("+").padEnd(15) + c.title);
   process.exit(0);
 }
-if (IDS) for (const id of IDS) if (!FIX.cases.some((c) => c.id === id)) { console.error("no case " + id + " (--list)"); process.exit(2); }
-if (!SELECTED.length && !SMOKE) { console.error("no case selected (--list)"); process.exit(2); }
-const BASE = String(arg("base", "http://localhost:8123")).replace(/\/$/, "");
-const OUT = path.resolve(String(arg("out", path.join(os.tmpdir(), "ui_parity_" + Date.now()))));
-const NAME = String(arg("name", "ui-parity harness"));
-const HEADED = arg("headed") !== undefined;
+const PLAN = makePlan(FIX, ARGS);
+if (PLAN.bad.length) usage(PLAN.bad.join("\n  "));
+const EXPECTED = PLAN.runs.flatMap((r) => r.captures.map((x) => x.file));
+if (ARGS.plan) {
+  for (const r of PLAN.runs) console.log("run   " + r.c.id + " on " + r.world + ": " + r.captures.length + " captures");
+  for (const s of PLAN.smokes) console.log("smoke " + s.label + " " + s.route);
+  console.log("plan: " + PLAN.runs.length + " case runs, " + EXPECTED.length + " captures, " + PLAN.smokes.length + " smoke runs");
+  process.exit(0);
+}
+const LAYOUT = PLAN.selection.layout, ROUTES = FIX.routes[LAYOUT];
+const BASE = String(ARGS.base || "http://localhost:8123").replace(/\/$/, "");
+if (!ARGS.out) usage("--out DIR is needed for a run");
+const OUT = path.resolve(String(ARGS.out));
+const NAME = String(ARGS.name || "ui-parity harness");
+const HEADED = !!ARGS.headed;
 const PW = process.env.PLAYWRIGHT || "C:/Users/harit/gemini_bridge/node_modules/playwright";
 const BRAVE = process.env.BRAVE_EXE || "C:/Program Files/BraveSoftware/Brave-Browser/Application/brave.exe";
+prepareDir(OUT, !!ARGS.clean, RUN_OWNED, "--out");
 const { chromium } = require(PW);
-fs.mkdirSync(OUT, { recursive: true });
 
 const fill = (s) => String(s).replace(/\{(\w+)\}/g, (m, k) => (k in DEF ? String(DEF[k]) : m));
 function urlOf(world, c, route) {
@@ -186,7 +449,7 @@ const selOf = (sel, world) => (sel && typeof sel === "object" ? sel[world] : sel
 const INIT = (cfg) => {
   if (window.__ui || window.top !== window) return;
   const U = window.__ui = { cfg, vt: 1000, hold: !!cfg.hold, frames: 0, pending: new Map(), nextId: 1, after: [], module: null,
-                            animT: cfg.animT, scheduled: false, stopAt: null, budget: null };
+                            animT: cfg.animT, scheduled: false, stopAt: null, budget: null, scenes: [], images: [], idle: [], idleRun: 0, timers: new Map() };
   /* the visual RNG: a seeded xorshift32 */
   let x = (cfg.visualSeed >>> 0) || 2463534242;
   Math.random = function () { x ^= x << 13; x >>>= 0; x ^= x >>> 17; x ^= x << 5; x >>>= 0; return x / 4294967296; };
@@ -212,7 +475,35 @@ const INIT = (cfg) => {
     U.release = () => { U.budget = null; U.hold = false; schedule(); };
     U.freeze = () => { U.budget = null; U.hold = true; };
     U.runFrames = (k) => { U.budget = k > 0 ? k : null; U.hold = !(k > 0); schedule(); };
-  } else { U.release = () => {}; U.freeze = () => {}; U.runFrames = () => {}; }
+    /* idle callbacks: queued, run only by the harness (flushIdle: before frames), never by the browser's idle time */
+    let idleId = 1;
+    window.requestIdleCallback = function (cb) { const id = idleId++; U.idle.push({ id, cb }); return id; };
+    window.cancelIdleCallback = function (id) { U.idle = U.idle.filter((q) => q.id !== id); };
+    U.flushIdle = () => {
+      let n = 0;
+      while (U.idle.length) {
+        const q = U.idle; U.idle = [];
+        for (const it of q) { n++; U.idleRun++; try { it.cb({ didTimeout: true, timeRemaining: () => 0 }); } catch (e) { setTimeout(() => { throw e; }); } }
+      }
+      return n;
+    };
+    /* the page's one-shot timers, real time, but known: pendingTimers(maxMs) lists those of up to maxMs not yet fired */
+    const rST = window.setTimeout.bind(window), rCT = window.clearTimeout.bind(window);
+    window.setTimeout = function (fn, ms, ...rest) {
+      const d = Math.max(0, +ms || 0);
+      if (typeof fn !== "function") return rST(fn, d, ...rest);
+      let id = 0;
+      id = rST(function () { U.timers.delete(id); return fn.apply(this, rest); }, d);
+      U.timers.set(id, { ms: d, due: Date.now() + d });
+      return id;
+    };
+    window.clearTimeout = function (id) { U.timers.delete(id); return rCT(id); };
+    U.pendingTimers = (maxMs) => Array.from(U.timers.values()).filter((t) => t.ms <= maxMs).map((t) => ({ ms: t.ms, dueInMs: t.due - Date.now() }));
+    /* images loaded by script (Classic's background, img/rocks.jpg): the barrier decodes them */
+    const src = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, "src");
+    if (src && src.set) Object.defineProperty(HTMLImageElement.prototype, "src", { configurable: true, enumerable: src.enumerable,
+      get() { return src.get.call(this); }, set(v) { if (U.images.indexOf(this) < 0) U.images.push(this); src.set.call(this, v); } });
+  } else { U.release = () => {}; U.freeze = () => {}; U.runFrames = () => {}; U.flushIdle = () => 0; U.pendingTimers = () => []; }
   /* Classic's module: as EvoLoader.load() hands it to the page (web/loader.js) */
   let loader;
   Object.defineProperty(window, "EvoLoader", { configurable: true, get: () => loader, set: (v) => {
@@ -223,7 +514,8 @@ const INIT = (cfg) => {
     }
     loader = v;
   } });
-  /* each scene's render at the fixed animation time (web/scene3d.js EvoScene, web/ocean_scene.js EvoOceanScene) */
+  /* each scene as it is made (the barrier asks it), its render at the fixed animation time (web/scene3d.js EvoScene,
+   * web/ocean_scene.js EvoOceanScene) */
   for (const name of ["EvoScene", "EvoOceanScene"]) {
     let api;
     Object.defineProperty(window, name, { configurable: true, get: () => api, set: (v) => {
@@ -235,6 +527,7 @@ const INIT = (cfg) => {
             const render = sc.render;
             sc.render = function (s, info) { return render.call(this, s, U.animT === null || !info ? info : Object.assign({}, info, { animT: U.animT })); };
           }
+          if (sc) U.scenes.push({ name, sc });
           return sc;
         };
         v.__ui = true;
@@ -242,6 +535,47 @@ const INIT = (cfg) => {
       api = v;
     } });
   }
+  /* the Ocean's renderer: its polished programs compiled ahead (prewarmStart: the polish ungated so the next frame asks for
+   * the warm-up; prewarmEnd: its setting back), its decoded programs settled, and what it is drawing with */
+  const oceans = () => U.scenes.filter((s) => s.name === "EvoOceanScene").map((s) => s.sc);
+  U.prewarmStart = () => oceans().map((sc) => {
+    const p = sc.polish ? sc.polish() : null;
+    if (!p || p.want === "off" || !(p.quality >= 2) || p.ready) return null;
+    sc.setPolish("ungated");
+    return p.want;
+  });
+  U.prewarmReady = (wants) => oceans().every((sc, i) => !wants[i] || sc.polish().ready);
+  U.prewarmEnd = (wants) => oceans().forEach((sc, i) => { if (wants[i]) sc.setPolish(wants[i]); });
+  U.decodedSettled = () => oceans().every((sc) => {
+    if (!sc.renderOptimization) return true;
+    const r = sc.renderOptimization(), m = sc.materials ? sc.materials() : null;
+    if (!r.enabled) return true;
+    if (r.failures && r.failures.length) return true;
+    return !(r.features && r.features.pending) && !(m && m.pending) && r.effective.decoded === r.requested.decoded;
+  });
+  U.rendererState = () => {
+    const out = { scenes: [], failures: [] };
+    for (const { name, sc } of U.scenes) {
+      const e = { name };
+      if (name === "EvoOceanScene") {
+        const p = sc.polish(), r = sc.renderOptimization(), m = sc.materials();
+        e.polish = { want: p.want, quality: p.quality, ready: p.ready, variant: p.variant };
+        e.optimization = { enabled: r.enabled, requested: r.requested, effective: r.effective, failures: r.failures, pending: !!(r.features && r.features.pending) };
+        e.materials = { pending: m.pending, failed: m.failed, look: m.look };
+        e.lost = sc.contextInfo ? sc.contextInfo().lost : null;
+        if (p.want !== "off" && p.quality >= 2 && !p.ready) out.failures.push(name + ": the polished programs are not compiled");
+        if (r.enabled && r.effective.decoded !== r.requested.decoded) out.failures.push(name + ": the decoded programs are not in effect (" + (r.failures || []).join("; ") + ")");
+        if (r.failures && r.failures.length) out.failures.push(name + ": " + r.failures.join("; "));
+        if (m.failed && m.failed.length) out.failures.push(name + ": materials failed: " + m.failed.join(", "));
+        if (e.lost) out.failures.push(name + ": the WebGL context is lost");
+      }
+      out.scenes.push(e);
+    }
+    out.images = U.images.map((i) => ({ src: i.currentSrc || i.src, complete: i.complete, width: i.naturalWidth }));
+    for (const i of out.images) if (!i.complete || !(i.width > 0)) out.failures.push("the image " + i.src + " is not loaded");
+    out.idlePending = U.idle.length; out.idleRun = U.idleRun;
+    return out;
+  };
   /* the world's tick and state, either page */
   U.isOcean = () => !!(window.EvoOcean && window.EvoOcean.state);
   U.tick = () => {
@@ -280,20 +614,40 @@ const STATE = () => {
              tabbable: t.filter((b) => b.tabIndex >= 0).map((b) => (b.dataset.tab || b.id)), n: t.length };
   };
   const speed = document.getElementById("speedlabel");
-  return { tick: U.tick(), fish: U.fish(), paused: U.paused(), frames: U.frames, held: U.hold, focus: desc(a),
-           dashTabs: tabsOf("dtabs"), setupTabs: tabsOf("tabs"), speed: speed ? speed.textContent : null,
+  return { tick: U.tick(), fish: U.fish(), paused: U.paused(), frames: U.frames, held: U.hold, freeRunning: !U.hold && U.budget === null,
+           focus: desc(a), dashTabs: tabsOf("dtabs"), setupTabs: tabsOf("tabs"), speed: speed ? speed.textContent : null,
            dashOpen: !!(document.getElementById("dash") && !document.getElementById("dash").hidden),
            sheetOpen: !!(document.getElementById("drawer") && document.getElementById("drawer").classList.contains("open")),
            toasts: Array.from((document.getElementById("toasts") || { children: [] }).children).map((t) => t.textContent),
            ui: !!window.EvoUI };
 };
+/* a shot's expectations against its state: the mismatches */
+function checkExpect(state, exp, world) {
+  if (!exp) return [];
+  const e = Object.assign({}, exp, exp[world] || {});
+  for (const w of WORLD_NAMES) delete e[w];
+  const bad = [], same = (a, b) => JSON.stringify(a) === JSON.stringify(b), say = (k, got, want) => bad.push(k + " is " + JSON.stringify(got) + ", expected " + JSON.stringify(want));
+  for (const [k, v] of Object.entries(e)) {
+    if (k === "focus") {
+      if (v === null) { if (state.focus) say("focus", state.focus, null); continue; }
+      if (!state.focus) { say("focus", null, v); continue; }
+      for (const [fk, fv] of Object.entries(v)) { const got = fk === "ring" ? state.focus.focusVisible : state.focus[fk]; if (!same(got, fv)) say("focus." + fk, got, fv); }
+    } else if (k === "dash" || k === "setup") {
+      const t = k === "dash" ? state.dashTabs : state.setupTabs;
+      for (const [tk, tv] of Object.entries(v)) if (!same(t && t[tk], tv)) say(k + "." + tk, t && t[tk], tv);
+    } else if (k === "toasts") { if (state.toasts.length !== v) say("toasts", state.toasts, v); }
+    else if (!same(state[k], v)) say(k, state[k], v);
+  }
+  return bad;
+}
 
 /* ---------------- one case on one world ---------------- */
 async function launch(viewport, dpr) {
   const ctx = await chromium.launchPersistentContext("", {
     executablePath: BRAVE, headless: !HEADED, viewport: { width: viewport[0], height: viewport[1] }, deviceScaleFactor: dpr,
     locale: DEF.locale, timezoneId: DEF.timezone, reducedMotion: "no-preference",
-    args: ["--no-first-run", "--no-default-browser-check", "--disable-background-timer-throttling", "--disable-renderer-backgrounding"]
+    args: ["--no-first-run", "--no-default-browser-check", "--disable-background-timer-throttling", "--disable-renderer-backgrounding",
+           "--force-color-profile=srgb", "--disable-partial-raster"]
   });
   const page = ctx.pages()[0] || await ctx.newPage();
   const errors = [];
@@ -304,11 +658,29 @@ async function launch(viewport, dpr) {
   return { ctx, page, errors };
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-/* exactly k frames, then held (with the clock: every run of a case draws the same frames) */
+/* a condition in the page, polled from here (no page timer or frame of its own), or an error saying what was waited for */
+async function waitFor(page, fn, arg, timeoutMs, what, detail) {
+  const until = Date.now() + timeoutMs;
+  for (;;) {
+    if (await page.evaluate(fn, arg)) return;
+    if (Date.now() > until) throw new Error(what + ": not reached in " + Math.round(timeoutMs / 1000) + " s" + (detail ? " (" + JSON.stringify(await page.evaluate(detail, arg)).slice(0, 400) + ")" : ""));
+    await sleep(50);
+  }
+}
+/* the page's one-shot timers of up to maxMs: every one fired (a timer they schedule in turn included) */
+async function waitTimers(page, maxMs, what, timeoutMs) {
+  await waitFor(page, (m) => window.__ui.pendingTimers(m).length === 0, maxMs, timeoutMs || 3 * maxMs + 5000,
+                what + ": the page's timers of up to " + maxMs + " ms still pending", (m) => window.__ui.pendingTimers(m));
+}
+/* exactly k frames, then held (with the clock: every run of a case draws the same frames); first the idle callbacks run and the
+ * short timers land, so neither falls among the frames */
 async function frames(page, k) {
-  const clock = await page.evaluate((n) => { const U = window.__ui; if (!U.cfg.clock) return false; U.runFrames(n); return true; }, k);
-  if (clock) await page.waitForFunction(() => window.__ui.hold && window.__ui.budget === null, null, { timeout: 120000, polling: 50 });
-  else await sleep(k * 17);
+  const clock = await page.evaluate(() => !!window.__ui.cfg.clock);
+  if (!clock) { await sleep(k * 17); return; }
+  await page.evaluate(() => window.__ui.flushIdle());
+  await waitTimers(page, 1000, "before " + k + " frames");
+  await page.evaluate((n) => window.__ui.runFrames(n), k);
+  await waitFor(page, () => window.__ui.hold && window.__ui.budget === null, null, 120000, k + " frames");
 }
 async function tabTo(page, sel, max) {
   for (let i = 0; i <= max; i++) {
@@ -321,8 +693,7 @@ async function tabTo(page, sel, max) {
 /* the world: seed and founders, at tick 0, paused, then let go (paused) to check it */
 async function setupWorld(L, world) {
   const p = L.page;
-  await p.waitForFunction(() => window.EvoApp && window.EvoApp.ready === true, null, { timeout: 120000, polling: 100 });
-  L.readyAt = Date.now();
+  await waitFor(p, () => !!(window.EvoApp && window.EvoApp.ready === true), null, 120000, "the page's ready state");
   if (world === "classic") {
     await p.evaluate(([seed, n]) => {
       const s = document.getElementById("seed"), q = document.getElementById("population");
@@ -340,16 +711,40 @@ async function setupWorld(L, world) {
     throw new Error("the world is not seed " + DEF.seed + " with " + DEF.founders + " founders at tick 0, paused: " + JSON.stringify(w));
   return w;
 }
+/* the renderer barrier (the header): nothing a picture shows waits on a compile, an image or an idle callback, and the page's
+ * one-time hint has come and gone; then a fixed number of frames */
+async function barrier(L) {
+  const p = L.page, t0 = Date.now();
+  await p.evaluate(() => window.__ui.flushIdle());
+  await p.evaluate(() => Promise.all(window.__ui.images.map((i) => (i.decode ? i.decode().catch(() => null) : null))).then(() => true));
+  const wants = await p.evaluate(() => window.__ui.prewarmStart());
+  if (wants.some(Boolean)) {
+    await p.evaluate(() => window.__ui.runFrames(1));
+    await waitFor(p, () => window.__ui.hold && window.__ui.budget === null, null, 60000, "the prewarm frame");
+    await waitFor(p, (w) => window.__ui.prewarmReady(w), wants, 120000, "the barrier: the Ocean's polished programs compiled", () => window.__ui.rendererState());
+    await p.evaluate((w) => window.__ui.prewarmEnd(w), wants);
+  }
+  await waitFor(p, () => window.__ui.decodedSettled(), null, 120000, "the barrier: the Ocean's decoded programs settled", () => window.__ui.rendererState());
+  await waitTimers(p, 10000, "the barrier (the page's one-time hint and its toast)", 45000);
+  await waitFor(p, () => { const t = document.getElementById("toasts"); return !t || t.children.length === 0; }, null, 15000, "the barrier: #toasts empty",
+                () => Array.from((document.getElementById("toasts") || { children: [] }).children).map((t) => t.textContent));
+  await frames(p, DEF.barrierFrames);
+  const st = await p.evaluate(() => window.__ui.rendererState());
+  if (st.failures.length) throw new Error("the barrier: the renderer is not in its full state: " + st.failures.join("; "));
+  return Object.assign(st, { prewarmed: wants.some(Boolean), ms: Date.now() - t0 });
+}
 const STEPS = {
   async run(L, st) {
     const p = L.page, tick = st.tick === undefined ? DEF.tick : st.tick;
+    await p.evaluate(() => window.__ui.flushIdle());
+    await waitTimers(p, 1000, "before the run");
     await p.evaluate(([t, then]) => {
       const U = window.__ui;
       U.stopAt = { tick: t, then, done: false };
       if (U.paused()) document.getElementById("pausebtn").click();
       U.release();
     }, [tick, st.then || "pause"]);
-    await p.waitForFunction(() => window.__ui.stopAt.done, null, { timeout: 300000, polling: 50 });
+    await waitFor(p, () => window.__ui.stopAt.done, null, 300000, "run to tick " + tick);
     const r = await p.evaluate(() => window.__ui.stopAt);
     if (r.at !== tick) throw new Error("run: the frame loop stopped at tick " + r.at + ", not " + tick);
     if ((st.then || "pause") === "pause") await frames(p, DEF.settleFrames);
@@ -384,41 +779,55 @@ const STEPS = {
   async focus(L, st, world) { await L.page.evaluate((s) => { const e = document.querySelector(s); if (!e) throw new Error("no " + s); e.focus(); }, selOf(st.sel, world)); },
   async blur(L) { await L.page.evaluate(() => { const a = document.activeElement; if (a && a.blur) a.blur(); }); },
   async wait(L, st) { await sleep(st.ms || 300); },
-  async shot(L, st, world, c) {
-    const p = L.page;
+  async shot(L, st, world, c, cap) {
+    const p = L.page, keep = st.toasts === "keep", at = c.id + " on " + world + ", shot " + st.name;
+    if (await p.evaluate(() => !window.__ui.hold && window.__ui.budget === null))
+      throw new Error(at + ": the frames run free (a release step with no settle after it): such a picture is not reproducible");
     await p.evaluate(() => document.fonts.ready.then(() => true));
-    if (st.toasts !== "keep") {
-      await sleep(Math.max(0, L.readyAt + DEF.hintMs - Date.now()));   /* the page's one-time hint comes at 9 s */
-      await p.waitForFunction(() => { const t = document.getElementById("toasts"); return !t || t.children.length === 0; }, null, { timeout: 12000, polling: 100 })
-        .catch(() => {});
-    }
+    await waitTimers(p, keep ? 1000 : 10000, at, 45000);
     if (await p.evaluate(() => window.__ui.paused())) await frames(p, 2);   /* (a frozen live page stays at its tick) */
-    const file = c.id + "__" + world + "__" + st.name + ".png";
+    const rs = await p.evaluate(() => window.__ui.rendererState());
+    if (rs.failures.length) throw new Error(at + ": the renderer left its full state: " + rs.failures.join("; "));
+    if (!keep) {
+      const t = await p.evaluate(() => Array.from((document.getElementById("toasts") || { children: [] }).children).map((x) => x.textContent));
+      if (t.length) throw new Error(at + ": #toasts is not empty at the picture (" + JSON.stringify(t) + "); a shot keeps its toasts only with toasts: \"keep\"");
+    }
+    const file = cap.file;
     await p.screenshot({ path: path.join(OUT, file), fullPage: true, animations: "disabled", caret: "hide" });
     const state = await p.evaluate(STATE);
+    const buf = fs.readFileSync(path.join(OUT, file));
     L.shots.push({ name: st.name, file, state });
+    L.captured.push({ file, kind: "case", case: c.id, set: c.set, world, shot: st.name, sha256: sha256(buf), size: pngSize(buf), bytes: buf.length, policy: cap.policy });
     console.log("    shot " + file + "  tick " + state.tick + (state.paused ? " paused" : " live") + (state.held ? " (held)" : "") +
                 "  focus " + (state.focus ? state.focus.tag + (state.focus.id ? "#" + state.focus.id : "") + (state.focus.role ? "[" + state.focus.role + "]" : "") +
                 (state.focus.focusVisible ? " ring" : "") : "none") + (state.dashOpen ? "  dash " + JSON.stringify(state.dashTabs.selected) : "") +
-                (state.sheetOpen ? "  setup " + JSON.stringify(state.setupTabs.selected) : "") + (state.toasts.length ? "  toasts " + JSON.stringify(state.toasts) : ""));
+                (state.sheetOpen ? "  setup " + JSON.stringify(state.setupTabs.selected) : "") + "  speed " + state.speed + (state.toasts.length ? "  toasts " + JSON.stringify(state.toasts) : ""));
+    const bad = checkExpect(state, st.expect, world);
+    if (bad.length) throw new Error(at + ": the state is not what the case expects: " + bad.join("; "));
   }
 };
-async function runCase(c, world) {
+async function runCase(run, onCapture) {
+  const c = run.c, world = run.world;
   const vp = c.viewport || DEF.viewport, dpr = c.dpr || DEF.dpr, url = urlOf(world, c);
   const rec = { case: c.id, set: c.set, world, url, viewport: vp, dpr, shots: [], errors: [], ok: false };
+  const caps = new Map(run.captures.map((x) => [x.shot, x]));
   const release = await acquire(NAME + " " + c.id + " " + world);
   let L = null;
   try {
     L = await launch(vp, dpr);
-    L.shots = rec.shots; L.tabs = [];
+    L.shots = rec.shots; L.tabs = []; L.captured = [];
     await L.ctx.addInitScript(INIT, { hold: true, clock: true, animT: DEF.animT, visualSeed: DEF.visualSeed });
     await L.page.goto(url, { waitUntil: "load", timeout: 120000 });
     rec.assets = await L.page.evaluate(() => Array.from(document.scripts).map((s) => s.getAttribute("src")).filter(Boolean));
     rec.world0 = await setupWorld(L, world);
+    rec.renderer = await barrier(L);
+    console.log("    barrier: " + rec.renderer.ms + " ms, idle callbacks run (all before a frame) " + rec.renderer.idleRun + ", prewarmed " + rec.renderer.prewarmed +
+                ", scenes " + JSON.stringify(rec.renderer.scenes.map((s) => s.name + (s.polish ? " polish " + s.polish.variant + (s.polish.ready ? " ready" : "") : "") +
+                (s.optimization ? " decoded " + s.optimization.effective.decoded : ""))));
     for (const st of c.steps) {
       if (st.world && st.world !== world) continue;
-      if (!STEPS[st.do]) throw new Error("unknown step " + st.do);
-      await STEPS[st.do](L, st, world, c);
+      try { await STEPS[st.do](L, st, world, c, st.do === "shot" ? caps.get(st.name) : null); }
+      finally { while (L.captured.length) onCapture(L.captured.shift()); }
     }
     rec.tabPresses = L.tabs;
     rec.ok = true;
@@ -434,21 +843,23 @@ async function runCase(c, world) {
   return rec;
 }
 /* a route loaded as a visitor would: its ready state and a few seconds of frames, without a console message */
-async function smoke(world, route, label) {
-  const url = urlOf(world, null, route), rec = { smoke: label, world, url, errors: [], ok: false };
+async function smoke(s, onCapture) {
+  const { world, route, label } = s, url = urlOf(world, null, route), rec = { smoke: label, world, url, errors: [], ok: false };
   const release = await acquire(NAME + " smoke " + label);
   let L = null;
   try {
     L = await launch(DEF.viewport, DEF.dpr);
     await L.ctx.addInitScript(INIT, { hold: false, clock: false, animT: null, visualSeed: DEF.visualSeed });
     await L.page.goto(url, { waitUntil: "load", timeout: 120000 });
-    await L.page.waitForFunction(() => window.EvoApp && window.EvoApp.ready === true, null, { timeout: 120000, polling: 100 });
+    await waitFor(L.page, () => !!(window.EvoApp && window.EvoApp.ready === true), null, 120000, "the page's ready state");
     await sleep(5000);
     rec.title = await L.page.title();
     rec.page = await L.page.evaluate(() => ({ ocean: !!window.EvoOcean, classic: !window.EvoOcean && !!window.EvoApp, tick: window.__ui.tick(), ui: !!window.EvoUI }));
     if ((world === "ocean") !== rec.page.ocean) L.errors.push("route " + route + " opened the " + (rec.page.ocean ? "Ocean" : "Classic") + " page, not " + world);
     const file = "smoke__" + label + ".png";
     await L.page.screenshot({ path: path.join(OUT, file), fullPage: true, animations: "disabled", caret: "hide" });
+    const buf = fs.readFileSync(path.join(OUT, file));
+    onCapture({ file, kind: "smoke", world, smoke: label, sha256: sha256(buf), size: pngSize(buf), bytes: buf.length });
     rec.file = file;
     rec.ok = true;
   } catch (e) { rec.threw = String(e && e.stack || e); }
@@ -461,37 +872,52 @@ async function smoke(world, route, label) {
   return rec;
 }
 
+/* ---------------- the run: manifest first (not complete), kept current, complete only at a clean end ---------------- */
 const summary = { started: new Date().toISOString(), base: BASE, layout: LAYOUT, routes: ROUTES, defaults: DEF, cases: [], smoke: [] };
-const save = () => fs.writeFileSync(path.join(OUT, "summary.json"), JSON.stringify(summary, null, 1));
+const manifest = { format: FORMAT, version: FORMAT_VERSION, harness: sha256(fs.readFileSync(SELF)), fixture: FIX_SHA, fixtureFile: CASES_FILE,
+                   base: BASE, layout: LAYOUT, selection: PLAN.selection, started: summary.started, finished: null, status: "running", complete: false,
+                   policy: DEF.compare, expected: EXPECTED.concat(PLAN.smokes.map((s) => "smoke__" + s.label + ".png")), captures: {}, runs: [], smoke: [] };
+const save = () => {
+  fs.writeFileSync(path.join(OUT, "summary.json"), JSON.stringify(summary, null, 1));
+  fs.writeFileSync(path.join(OUT, "manifest.json"), JSON.stringify(manifest, null, 1));
+};
+const onCapture = (cap) => { manifest.captures[cap.file] = cap; save(); };
+save();
+let threw = null;
 try {
-  if (SMOKE) {
-    for (const w of WORLDS) summary.smoke.push(await smoke(w, ROUTES[w], w + (LAYOUT === "site" ? "_site" : "_source")));
-    if (LAYOUT === "site" && ROUTES.oceanAlias && WORLDS.indexOf("ocean") >= 0) summary.smoke.push(await smoke("ocean", ROUTES.oceanAlias, "ocean_alias_site"));
+  for (const s of PLAN.smokes) {
+    const r = await smoke(s, onCapture);
+    summary.smoke.push(r); manifest.smoke.push({ label: r.smoke, ok: r.ok, error: r.threw || r.errors[0] || null });
     save();
   }
-  for (const c of SELECTED) {
-    for (const w of c.worlds) {
-      if (WORLDS.indexOf(w) < 0) continue;
-      console.log("== " + c.id + " (" + c.set + ") on " + w + ": " + urlOf(w, c));
-      summary.cases.push(await runCase(c, w));
-      save();
-    }
+  for (const run of PLAN.runs) {
+    console.log("== " + run.c.id + " (" + run.c.set + ") on " + run.world + ": " + urlOf(run.world, run.c));
+    const r = await runCase(run, onCapture);
+    summary.cases.push(r); manifest.runs.push({ case: r.case, world: r.world, ok: r.ok, error: r.threw ? r.threw.split("\n")[0] : r.errors[0] || null });
+    save();
   }
-} finally {
-  summary.finished = new Date().toISOString();
+} catch (e) { threw = e; }
+finally {
+  summary.finished = manifest.finished = new Date().toISOString();
+  const missing = manifest.expected.filter((f) => !manifest.captures[f]);
+  const failed = manifest.runs.filter((r) => !r.ok).length + manifest.smoke.filter((r) => !r.ok).length;
+  manifest.complete = !threw && !failed && !missing.length && manifest.runs.length === PLAN.runs.length && manifest.smoke.length === PLAN.smokes.length;
+  manifest.status = manifest.complete ? "complete" : threw ? "aborted: " + String(threw && threw.message || threw) : "failed: " + failed + " runs, " + missing.length + " captures missing";
   save();
   const md = ["# UI parity pictures", "", "Base " + BASE + " (" + LAYOUT + " layout), " + summary.started + ". Seed " + DEF.seed + ", " + DEF.founders +
-              " founders, " + DEF.viewport.join(" x ") + " at DPR " + DEF.dpr + ". From tests/ui_parity_browser.mjs; the state of each picture is in summary.json.", "",
-              "| case | world | shot | file | tick | paused | focus | tabs (dash / setup) |", "|---|---|---|---|---|---|---|---|"];
+              " founders, " + DEF.viewport.join(" x ") + " at DPR " + DEF.dpr + ". From tests/ui_parity_browser.mjs; the state of each picture is in summary.json, " +
+              "the run's evidence in manifest.json (" + manifest.status + ").", "",
+              "| case | world | shot | file | tick | paused | focus | tabs (dash / setup) | speed |", "|---|---|---|---|---|---|---|---|---|"];
   for (const r of summary.cases) for (const s of r.shots) {
     const f = s.state.focus;
     md.push("| " + r.case + " | " + r.world + " | " + s.name + " | " + s.file + " | " + s.state.tick + " | " + (s.state.paused ? "yes" : "no") + " | " +
             (f ? f.tag + (f.id ? "#" + f.id : "") + (f.role ? "[" + f.role + "]" : "") + (f.focusVisible ? " (ring)" : "") : "-") + " | " +
-            (s.state.dashOpen ? (s.state.dashTabs.selected || []).join(",") : "-") + " / " + (s.state.sheetOpen ? (s.state.setupTabs.selected || []).join(",") : "-") + " |");
+            (s.state.dashOpen ? (s.state.dashTabs.selected || []).join(",") : "-") + " / " + (s.state.sheetOpen ? (s.state.setupTabs.selected || []).join(",") : "-") + " | " + s.state.speed + " |");
   }
   for (const r of summary.cases) if (!r.ok) md.push("", "**" + r.case + " on " + r.world + ": " + (r.threw ? r.threw.split("\n")[0] : "page messages: " + r.errors.slice(0, 3).join("; ")) + "**");
   fs.writeFileSync(path.join(OUT, "index.md"), md.join("\n") + "\n");
 }
-const bad = summary.cases.filter((r) => !r.ok).length + summary.smoke.filter((r) => !r.ok).length;
-console.log((bad ? "FAIL: " + bad + " runs" : "ok: " + summary.cases.length + " case runs" + (SMOKE ? ", " + summary.smoke.length + " smoke runs" : "")) + "; output in " + OUT);
-process.exit(bad ? 1 : 0);
+if (threw) throw threw;
+console.log((manifest.complete ? "ok: " : "FAIL (" + manifest.status + "): ") + summary.cases.length + " case runs, " + Object.values(manifest.captures).filter((x) => x.kind === "case").length +
+            " captures" + (PLAN.smokes.length ? ", " + summary.smoke.length + " smoke runs" : "") + "; output in " + OUT);
+process.exit(manifest.complete ? 0 : 1);

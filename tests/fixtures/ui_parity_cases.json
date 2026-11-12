@@ -1,6 +1,6 @@
 {
-  "about": "tests/ui_parity_browser.mjs's cases (docs/ui_parity.md): both worlds in the same state, one fresh headless Brave per case and world, full-page pictures with the DOM chrome. Every case starts from the defaults' world (seed, founders) held at tick 0, so a 'run' step reaches the same tick on both pages. A step with 'world' runs on that world only; a 'sel' may be one selector or {classic, ocean}.",
-  "version": 1,
+  "about": "tests/ui_parity_browser.mjs's cases (docs/ui_parity.md): both worlds in the same state, one fresh headless Brave per case and world, full-page pictures with the DOM chrome. Every case starts from the defaults' world (seed, founders) held at tick 0, past the renderer barrier, so a 'run' step reaches the same tick on both pages. A step with 'world' runs on that world only; a 'sel' may be one selector or {classic, ocean}; a shot's 'expect' is the state it must find (per world under 'classic' / 'ocean'), its 'compare' its own difference policy. Case ids and each case's shot names are unique (the harness refuses the file otherwise).",
+  "version": 2,
   "defaults": {
     "seed": 42,
     "founders": 300,
@@ -10,9 +10,14 @@
     "animT": 20.0,
     "visualSeed": 2463534242,
     "settleFrames": 45,
-    "hintMs": 9600,
+    "barrierFrames": 90,
     "locale": "en-US",
-    "timezone": "UTC"
+    "timezone": "UTC",
+    "compare": {
+      "tolerance": 1,
+      "maxPixels": 8,
+      "why": "two runs of one commit (PR #89's repeats): the compositor's anti-aliasing of rounded edges over the canvas moves a channel by 1 in up to ~21 px of a picture (within the tolerance); once, 3 px at a rounded bar's end differed by up to 17 (within maxPixels). Anything larger is a change."
+    }
   },
   "routes": {
     "source": { "classic": "/web/index.html", "ocean": "/web/ocean.html" },
@@ -30,15 +35,15 @@
       "worlds": ["classic", "ocean"],
       "steps": [
         { "do": "run", "tick": 600, "then": "freeze" },
-        { "do": "shot", "name": "live" },
+        { "do": "shot", "name": "live", "expect": { "tick": 600, "paused": false, "held": true, "speed": "1×", "toasts": 0 } },
         { "do": "pause" },
-        { "do": "shot", "name": "paused" },
+        { "do": "shot", "name": "paused", "expect": { "tick": 600, "paused": true, "focus": null } },
         { "do": "select" },
-        { "do": "shot", "name": "selected" },
+        { "do": "shot", "name": "selected", "expect": { "tick": 600, "paused": true } },
         { "do": "click", "sel": "#iexpand" },
         { "do": "click", "sel": "#readout" },
         { "do": "settle" },
-        { "do": "shot", "name": "expanded_numbers" }
+        { "do": "shot", "name": "expanded_numbers", "expect": { "tick": 600, "paused": true } }
       ]
     },
     {
@@ -50,7 +55,7 @@
       "steps": [
         { "do": "run", "tick": 600, "then": "pause" },
         { "do": "select" },
-        { "do": "shot", "name": "family_selected" }
+        { "do": "shot", "name": "family_selected", "expect": { "tick": 600, "paused": true } }
       ]
     },
     {
@@ -62,10 +67,10 @@
       "steps": [
         { "do": "run", "tick": 600, "then": "pause" },
         { "do": "select" },
-        { "do": "shot", "name": "flat_selected" },
+        { "do": "shot", "name": "flat_selected", "expect": { "tick": 600, "paused": true } },
         { "do": "click", "sel": "#readout" },
         { "do": "settle" },
-        { "do": "shot", "name": "flat_numbers" }
+        { "do": "shot", "name": "flat_numbers", "expect": { "tick": 600, "paused": true } }
       ]
     },
     {
@@ -77,7 +82,7 @@
       "steps": [
         { "do": "run", "tick": 600, "then": "pause" },
         { "do": "select" },
-        { "do": "shot", "name": "canvas_selected" }
+        { "do": "shot", "name": "canvas_selected", "expect": { "tick": 600, "paused": true } }
       ]
     },
     {
@@ -88,35 +93,47 @@
       "steps": [
         { "do": "run", "tick": 600, "then": "pause" },
         { "do": "tabTo", "sel": "#dashbtn" },
-        { "do": "shot", "name": "dashbtn_focus" },
+        { "do": "shot", "name": "dashbtn_focus", "expect": { "focus": { "id": "dashbtn", "ring": true }, "dashOpen": false } },
         { "do": "key", "key": "Enter" },
         { "do": "settle" },
         { "do": "tabTo", "sel": "#dtabs [role=tab][aria-selected=true]" },
-        { "do": "shot", "name": "dash_tab_focus" },
+        { "do": "shot", "name": "dash_tab_focus", "expect": { "dashOpen": true, "focus": { "role": "tab", "text": "Population", "ring": true },
+                                                             "dash": { "selected": ["pop"], "tabbable": ["pop"] } } },
         { "do": "key", "key": "ArrowRight" },
-        { "do": "shot", "name": "dash_tab_right" },
+        { "do": "shot", "name": "dash_tab_right", "expect": {
+            "classic": { "focus": { "role": "tab", "text": "Evolution", "ring": true }, "dash": { "selected": ["evo"], "tabbable": ["evo"] } },
+            "ocean": { "focus": { "role": "tab", "text": "Depth", "ring": true }, "dash": { "selected": ["depth"], "tabbable": ["depth"] } } } },
         { "do": "key", "key": "End" },
-        { "do": "shot", "name": "dash_tab_end" },
+        { "do": "shot", "name": "dash_tab_end", "expect": {
+            "classic": { "focus": { "role": "tab", "text": "Behaviour", "ring": true }, "dash": { "selected": ["behave"], "tabbable": ["behave"] } },
+            "ocean": { "focus": { "role": "tab", "text": "Brains", "ring": true }, "dash": { "selected": ["brains"], "tabbable": ["brains"] } } } },
         { "do": "key", "key": "Home" },
         { "do": "key", "key": "ArrowLeft" },
-        { "do": "shot", "name": "dash_tab_home_left" },
+        { "do": "shot", "name": "dash_tab_home_left", "expect": {
+            "classic": { "focus": { "role": "tab", "text": "Behaviour", "ring": true }, "dash": { "selected": ["behave"], "tabbable": ["behave"] } },
+            "ocean": { "focus": { "role": "tab", "text": "Brains", "ring": true }, "dash": { "selected": ["brains"], "tabbable": ["brains"] } } } },
         { "do": "click", "sel": "#dtabs [role=tab]:nth-child(2)" },
-        { "do": "shot", "name": "dash_tab_pointer" },
+        { "do": "shot", "name": "dash_tab_pointer", "expect": { "focus": null,
+            "classic": { "dash": { "selected": ["evo"], "tabbable": ["evo"] } }, "ocean": { "dash": { "selected": ["depth"], "tabbable": ["depth"] } } } },
         { "do": "key", "key": "Escape" },
         { "do": "settle" },
         { "do": "tabTo", "sel": "#menubtn" },
         { "do": "key", "key": "Enter" },
         { "do": "wait", "ms": 450 },
         { "do": "tabTo", "sel": "#tabs [role=tab][aria-selected=true]" },
-        { "do": "shot", "name": "setup_tab_focus" },
+        { "do": "shot", "name": "setup_tab_focus", "expect": { "dashOpen": false, "sheetOpen": true, "focus": { "id": "tab-run", "ring": true },
+                                                              "setup": { "selected": ["tab-run"], "tabbable": ["tab-run"] } } },
         { "do": "key", "key": "End" },
-        { "do": "shot", "name": "setup_tab_end" },
+        { "do": "shot", "name": "setup_tab_end", "expect": {
+            "classic": { "focus": { "id": "tab-ocean", "ring": true }, "setup": { "selected": ["tab-ocean"], "tabbable": ["tab-ocean"] } },
+            "ocean": { "focus": { "id": "tab-senses", "ring": true }, "setup": { "selected": ["tab-senses"], "tabbable": ["tab-senses"] } } } },
         { "do": "key", "key": "ArrowRight" },
-        { "do": "shot", "name": "setup_tab_right_wrap" },
+        { "do": "shot", "name": "setup_tab_right_wrap", "expect": { "focus": { "id": "tab-run", "ring": true }, "setup": { "selected": ["tab-run"], "tabbable": ["tab-run"] } } },
         { "do": "click", "sel": "#tabs [role=tab]:nth-child(2)" },
         { "do": "key", "key": "ArrowUp" },
         { "do": "settle" },
-        { "do": "shot", "name": "setup_tab_pointer_arrowup" }
+        { "do": "shot", "name": "setup_tab_pointer_arrowup", "expect": { "focus": null, "speed": "2×", "paused": true,
+                                                                        "setup": { "selected": ["tab-world"], "tabbable": ["tab-world"] } } }
       ]
     },
     {
@@ -127,7 +144,7 @@
       "steps": [
         { "do": "run", "tick": 600, "then": "pause" },
         { "do": "tabTo", "sel": "#pausebtn" },
-        { "do": "shot", "name": "pausebtn_focus" },
+        { "do": "shot", "name": "pausebtn_focus", "expect": { "focus": { "id": "pausebtn", "ring": true }, "paused": true } },
         { "do": "key", "key": "Escape" },
         { "do": "tabTo", "sel": "#menubtn" },
         { "do": "key", "key": "Enter" },
@@ -136,21 +153,22 @@
         { "do": "tabTo", "sel": { "classic": "#seed", "ocean": "#o_seed" } },
         { "do": "key", "key": " " },
         { "do": "settle" },
-        { "do": "shot", "name": "field_focus_space" },
+        { "do": "shot", "name": "field_focus_space", "expect": { "paused": true, "sheetOpen": true, "setup": { "selected": ["tab-world"] },
+            "classic": { "focus": { "id": "seed", "ring": true } }, "ocean": { "focus": { "id": "o_seed", "ring": true } } } },
         { "do": "key", "key": "Escape" },
         { "do": "settle" },
         { "do": "tabTo", "sel": "#viewmenubtn", "world": "ocean" },
         { "do": "key", "key": "Enter", "world": "ocean" },
         { "do": "wait", "ms": 300, "world": "ocean" },
-        { "do": "shot", "name": "view_kb_open", "world": "ocean" },
+        { "do": "shot", "name": "view_kb_open", "world": "ocean", "expect": { "focus": { "id": "lightnow", "ring": true } } },
         { "do": "key", "key": "Escape", "world": "ocean" },
-        { "do": "shot", "name": "view_kb_closed", "world": "ocean" },
+        { "do": "shot", "name": "view_kb_closed", "world": "ocean", "expect": { "focus": { "id": "viewmenubtn", "ring": true } } },
         { "do": "key", "key": "Escape", "world": "ocean" },
         { "do": "key", "key": "?", "world": "ocean" },
         { "do": "wait", "ms": 300, "world": "ocean" },
-        { "do": "shot", "name": "help_legend", "world": "ocean" },
+        { "do": "shot", "name": "help_legend", "world": "ocean", "expect": { "focus": { "id": "tourbtn", "ring": true } } },
         { "do": "key", "key": "Escape", "world": "ocean" },
-        { "do": "shot", "name": "help_kb_closed", "world": "ocean" }
+        { "do": "shot", "name": "help_kb_closed", "world": "ocean", "expect": { "focus": { "id": "helpbtn", "ring": true } } }
       ]
     }
   ]
