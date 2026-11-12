@@ -1955,6 +1955,192 @@ class TestReservations(unittest.TestCase):
                 for loader in (worlds.read_avoid, plan.avoid_seeds, nb.avoid_seeds):
                     self.assertEqual(loader(p), {101})
 
+    def test_flat_inventory_labels_do_not_select_structural_precedence(self):
+        """Both round-4 flat-map counterexamples reserve every inventory entry."""
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / 'inventory'
+            for inventory, expected in (
+                    ({'w01_seed': 101, 'w02': 102}, {101, 102}),
+                    ({'sample': 101, 'ages': 102, 'reseed': 103, 'transplant': 104},
+                     {101, 102, 103, 104})):
+                for obj in (inventory, [inventory], {'worlds': [inventory]}):
+                    p.write_text(json.dumps(obj))
+                    for loader in (worlds.read_avoid, plan.avoid_seeds, nb.avoid_seeds):
+                        with self.subTest(obj=obj, loader=loader.__module__):
+                            self.assertEqual(loader(p), expected)
+                    seeds, receipt = rqlib.load_reservations(p)
+                    self.assertEqual(seeds, expected)
+                    self.assertEqual(receipt['seeds'], len(expected))
+
+    def test_wrapped_inventory_records_are_independent(self):
+        """Every wrapper depth uses the same grammar and per-record validation."""
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / 'inventory'
+            for second in ({'w02': 102}, {'w02': '102'}, {}, [], {'reserved': []}):
+                for obj in (
+                        {'worlds': [{'seed': 101}, second]},
+                        {'outer': {'worlds': [{'seed': 101}, second]}},
+                        {'worlds': {'w01_seed': {'seed': 101}, 'w02': second}},
+                        {'seed': 101, 'records': [{'seed': 101}, [second]]},
+                        {'outer': [{'worlds': [{'seed': 101}, second]}]}):
+                    p.write_text(json.dumps(obj))
+                    for loader in (worlds.read_avoid, plan.avoid_seeds, nb.avoid_seeds):
+                        with self.subTest(obj=obj, loader=loader.__module__):
+                            if second == {'w02': 102}:
+                                self.assertEqual(loader(p), {101, 102})
+                            else:
+                                with self.assertRaises(Exception) as caught:
+                                    loader(p)
+                                self.assertIn(str(p), str(caught.exception))
+                                self.assertIn("record['w02']" if isinstance(obj.get('worlds'), dict)
+                                              else 'record[2]', str(caught.exception))
+                    if second == {'w02': 102}:
+                        seeds, receipt = rqlib.load_reservations(p)
+                        self.assertEqual(seeds, {101, 102})
+                        self.assertEqual(receipt['seeds'], 2)
+
+    def test_reservation_grammar_boundaries(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / 'inventory'
+            accepted = (
+                ({'seed': 101, 'attempt': 102}, {101}),
+                ({'founder_seed': 101, 'steps': 102}, {101}),
+                ({'worlds': [101, 102]}, {101, 102}),
+                ({'worlds': {'w01': {'seed': 101}, 'w02': {'w02': 102}}}, {101, 102}),
+                ({'seed': 101, 'metadata': [102, 103]}, {101}),
+                ({'seed': 101, 'metadata': {'steps': 102}}, {101}),
+                ({'seeds': [{'steps': 102}, None], 'steps': 103}, {102}),
+                ({'worlds': {'seeds': {'steps': 102}, 'steps': 103}}, {102}),
+                ({'seeds': {'worlds': 102}, 'steps': 103}, {102}),
+                ({'seed_scheme': {'base': 102, 'note': 'legacy'}, 'seed': 101}, {101, 102}),
+                ({'schema': 'finfolk.invasion.archived-seeds/1',
+                  'all': {'101': ['source', {'steps': 102}]}}, {101}))
+            for obj, expected in accepted:
+                p.write_text(json.dumps(obj))
+                for loader in (worlds.read_avoid, plan.avoid_seeds, nb.avoid_seeds):
+                    with self.subTest(obj=obj, loader=loader.__module__):
+                        self.assertEqual(loader(p), expected)
+            refused = (
+                {'seed': 101, 'w02': 102},
+                {'w01_seed': 101, 'w02': '102'},
+                {'seed': 101, 'worlds': []},
+                {'seed': 101, 'worlds': [102, '103']},
+                {'seed': 101, 'metadata': [{'steps': 102}, {}]},
+                {'seed': 101, 'metadata': [{'steps': 102}]},
+                {'seed': 101, 'metadata': [{'length': 102}]},
+                {'seed': 101, 'metadata': [102, {'seed': 103}]},
+                {'worlds': {'w01': {'seed': 101}, 'w02': {'w02': '102'}}},
+                {'seed': 101, 'worlds': {}},
+                {'worlds': 102},
+                {'schema': 'structured', 'seed': 101, 'worlds': 102},
+                {'seed': 101, 'argv': ['--seed', '+102']},
+                {'seed': 101, 'argv': ['--seed', '102tail']})
+            for obj in refused:
+                p.write_text(json.dumps(obj))
+                for loader in (worlds.read_avoid, plan.avoid_seeds, nb.avoid_seeds):
+                    with self.subTest(obj=obj, loader=loader.__module__):
+                        with self.assertRaisesRegex(Exception, str(p)):
+                            loader(p)
+
+            for constant in ('NaN', 'Infinity', '-Infinity'):
+                p.write_text('{"seed":101,"metadata":' + constant + '}')
+                for loader in (worlds.read_avoid, plan.avoid_seeds, nb.avoid_seeds):
+                    with self.assertRaisesRegex(Exception, 'invalid JSON constant'):
+                        loader(p)
+
+    def test_inventory_discriminators_are_never_flat_labels(self):
+        loaders = ((worlds.read_avoid, worlds.WorldsError),
+                   (plan.avoid_seeds, plan.DesignError),
+                   (nb.avoid_seeds, nb.NoiseBankError))
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / 'inventory'
+            for name in ('worlds', 'reserved', 'reservations', 'records', 'inventory',
+                         'steps', 'attempt', 'replicate', 'frame', 'index'):
+                for label in (name, name.upper()):
+                    inventory = name in ('worlds', 'reserved', 'reservations', 'records', 'inventory')
+                    message = ('inventory containers must be arrays or objects, not metadata scalars'
+                               if inventory else 'ambiguous or unsupported scalar reservation map')
+                    suffix = '.' + label if inventory else ''
+                    for record in ({label: 102}, {'w01': 101, label: 102}):
+                        for obj, context in (
+                                (record, 'document 1'),
+                                ([record], 'document 1 record[1]'),
+                                ({'worlds': [record]}, 'document 1.worlds record[1]'),
+                                ({'outer': {'records': {'r': record}}},
+                                 "document 1.outer.records record['r']")):
+                            p.write_text(json.dumps(obj))
+                            for loader, error in loaders:
+                                with self.subTest(obj=obj, loader=loader.__module__):
+                                    with self.assertRaises(error) as caught:
+                                        loader(p)
+                                    self.assertEqual(str(caught.exception),
+                                                     f'{p}: {context}{suffix}: {message}')
+                        p.write_text('{"seed":101}\n' + json.dumps(record))
+                        for loader, error in loaders:
+                            with self.subTest(record=record, loader=loader.__module__, format='JSONL'):
+                                with self.assertRaises(error) as caught:
+                                    loader(p)
+                                self.assertEqual(str(caught.exception),
+                                                 f'{p}: JSONL line 2{suffix}: {message}')
+
+    def test_schema_discriminator_is_not_a_flat_label(self):
+        loaders = ((worlds.read_avoid, worlds.WorldsError),
+                   (plan.avoid_seeds, plan.DesignError),
+                   (nb.avoid_seeds, nb.NoiseBankError))
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / 'inventory'
+            for schema in (102, None, True, [], {}):
+                for record in ({'schema': schema, 'w01': 101},
+                               {'schema': schema, 'seed': 101}):
+                    for obj, context in (
+                            (record, 'document 1'),
+                            ([record], 'document 1 record[1]'),
+                            ({'worlds': {'r': record}}, "document 1.worlds record['r']")):
+                        for text, where in ((json.dumps(obj), context),
+                                            ('{"seed":101}\n' + json.dumps(obj),
+                                             context.replace('document 1', 'JSONL line 2'))):
+                            p.write_text(text)
+                            for loader, error in loaders:
+                                with self.subTest(obj=obj, loader=loader.__module__, context=where):
+                                    with self.assertRaises(error) as caught:
+                                        loader(p)
+                                    self.assertEqual(str(caught.exception),
+                                                     f'{p}: {where}.schema: schema must be a string, '
+                                                     'not a flat-inventory label')
+
+    def test_overlapping_reservation_shapes_are_refused(self):
+        """Mixed structural/inventory and metadata/record shapes cannot borrow seeds."""
+        cases = (
+            ({'seed': 101, 'w02': 102}, 'document 1',
+             'ambiguous or unsupported scalar reservation map'),
+            ({'w01_seed': 101, 'w02': '102'}, 'document 1',
+             'ambiguous or unsupported scalar reservation map'),
+            ({'seed': 101, 'metadata': [102, {'seed': 103}]},
+             'document 1.metadata record[1]', 'ambiguous scalar in a metadata collection'),
+            ({'seed': 101, 'metadata': [{'w01': 102}]},
+             'document 1.metadata record[1]', 'ambiguous or unsupported scalar reservation map'),
+            ({'worlds': {'w01_seed': {'seed': 101}, 'w02': {}}},
+             "document 1.worlds record['w02']", 'ambiguous or unsupported scalar reservation map'),
+            ({'seed': 101, 'argv': ['--seed', '102', {'worlds': 103}]},
+             'document 1.argv record[3].worlds', 'inventory containers must be arrays or objects'),
+            ({'schema': 'finfolk.invasion.archived-seeds/1', 'all': {'101': []},
+              'worlds': 102}, 'document 1.worlds', 'inventory containers must be arrays or objects'))
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / 'inventory'
+            for obj, context, message in cases:
+                for text, where in ((json.dumps(obj), context),
+                                    ('{"seed":101}\n' + json.dumps(obj),
+                                     context.replace('document 1', 'JSONL line 2'))):
+                    p.write_text(text)
+                    for loader, error in ((worlds.read_avoid, worlds.WorldsError),
+                                          (plan.avoid_seeds, plan.DesignError),
+                                          (nb.avoid_seeds, nb.NoiseBankError)):
+                        with self.subTest(obj=obj, context=where, loader=loader.__module__):
+                            with self.assertRaises(error) as caught:
+                                loader(p)
+                            self.assertTrue(str(caught.exception).startswith(f'{p}: {where}: '))
+                            self.assertIn(message, str(caught.exception))
+
     def test_object_array_metadata_is_not_reserved(self):
         with tempfile.TemporaryDirectory() as d:
             p = Path(d) / 'inventory'

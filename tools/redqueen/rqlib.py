@@ -176,20 +176,11 @@ class ReservationError(ValueError):
 def load_reservations(path):
     """Return (distinct seeds, {path, sha256, seeds: distinct count}) from one byte read.
 
-    Formats: seed-keyed JSON documents (including canonical worlds reservations),
-    JSONL objects, archived-seeds/1 numeric-key inventories, plain decimal
-    integers per line, JSON arrays of integers or seed-bearing objects, or a flat
-    label-to-integer map. JSON seed values must be integers, never strings/bools.
-    Empty inventories are refused. The historical recursive seed-key policy is
-    retained, including conservative reservations from seed-named metadata.
-    Canonical seed_slot fields and assay groups (including groups.reseed) contain
-    source labels, not seed values. Their strings are ignored, just as in the old
-    integer-only traversal; integers beneath seed-bearing keys remain reserved.
-    Argument arrays also reserve the engine's --seed, --transplant-seed and
-    --reseed-after-load values, including the redundant seed in registry config_args.
-    Each JSONL document and inventory-array record must independently yield seeds.
-    Structured seed-bearing objects take precedence over flat integer maps; only
-    argv seeds are limited to the engine's unsigned 32-bit range.
+    See docs/redqueen_reservations.md for the complete input grammar. Flat
+    inventories use all labels, not just seed-named ones. Structural records and
+    every inventory-array record are interpreted independently; metadata integers
+    are reserved only under the historical recursive seed-key policy. Argv seeds
+    additionally obey the engine's unsigned 32-bit range.
     """
     context = "document 1"
 
@@ -238,23 +229,59 @@ def load_reservations(path):
             consumed.update((index, index + 1))
         return consumed
 
-    def walk(obj, found, where, hint=False, strict=False, group_labels=False):
-        structured = False
+    # These fields identify records, unlike arbitrary inventory labels such as
+    # w01_seed or the seed-kind label reseed. Keep the distinction explicit.
+    record_fields = {"seed", "seeds", "founder_seed", "seed_rederived", "transplant_seed", "reseed_after_load"}
+    scalar_metadata = {"steps", "attempt", "replicate", "frame", "index"}
+    inventory_fields = {"worlds", "reserved", "reservations", "records", "inventory"}
+
+    def walk(obj, found, where, hint=False, strict=False, group_labels=False,
+             inventory=False, provenance=False):
+        if inventory and not hint and not group_labels and not provenance and not isinstance(obj, list):
+            if not isinstance(obj, dict):
+                fail("inventory containers must be arrays or objects, not metadata scalars", where)
+            if (isinstance(obj, dict) and obj
+                    and "schema" not in obj
+                    and not {key.lower() for key in obj} & record_fields
+                    and not all(type(value) is int for value in obj.values())):
+                for key, value in obj.items():
+                    found.update(document(value, f"{where} record[{key!r}]"))
+            else:
+                found.update(document(obj, where))
+            return
         if isinstance(obj, dict):
+            archive = obj.get("schema") == "finfolk.invasion.archived-seeds/1"
+            if archive:
+                entries = obj.get("all")
+                if (not isinstance(entries, dict) or not entries
+                        or any(not re.fullmatch(r"[0-9]+", key) for key in entries)):
+                    fail("archived-seeds/1 requires nonempty numeric seed keys under 'all'", where)
+                found.update(int(key) for key in entries)
             for key, value in obj.items():
                 label = key.lower()
                 seed_hint = "seed" in label
                 metadata = any(token in label for token in ("scheme", "namespace", "sha256", "hash", "rule", "note", "path"))
                 labels = group_labels or label in ("groups", "seed_slot")
                 seed_value = seed_hint and not metadata and not labels
-                nested = walk(value, found, f"{where}.{key}", hint or seed_hint, strict or seed_value, labels)
-                structured |= seed_hint or nested
+                walk(value, found, f"{where}.{key}", hint or seed_hint,
+                     strict or seed_value, labels, label in inventory_fields,
+                     provenance or (archive and key == "all"))
         elif isinstance(obj, list):
             consumed = argv_seeds(obj, found, where)
-            structured = bool(consumed)
-            for index, value in enumerate(obj):
-                if index not in consumed:
-                    structured |= walk(value, found, f"{where}[{index + 1}]", hint, strict, group_labels)
+            # A seed container retains the old conservative integer traversal;
+            # ordinary object collections are independent inventory records.
+            records = (not hint and not group_labels and not provenance
+                       and (inventory or any(isinstance(v, (dict, list)) for v in obj)))
+            if records and not consumed:
+                found.update(document(obj, where, flat=inventory))
+            else:
+                for index, value in enumerate(obj):
+                    if index not in consumed:
+                        if records and isinstance(value, (dict, list)):
+                            found.update(document(value, f"{where} record[{index + 1}]", flat=inventory))
+                        else:
+                            walk(value, found, f"{where}[{index + 1}]", hint, strict,
+                                 group_labels, provenance=provenance)
         elif type(obj) is int:
             if hint:
                 if obj < 0:
@@ -262,50 +289,68 @@ def load_reservations(path):
                 found.add(obj)
         elif strict and obj is not None:
             fail(f"seed reservations must be JSON integers (got {obj!r})", where)
-        return structured
+
+    def document(doc, where, flat=True):
+        # Validation must use a fresh set, including at dictionary-wrapped array
+        # boundaries: a valid or repeated sibling cannot mask an invalid record.
+        found = set()
+        if isinstance(doc, list):
+            if argv_seeds(doc, found, where):
+                walk(doc, found, where)
+            else:
+                for index, value in enumerate(doc, 1):
+                    if not flat and not isinstance(value, (dict, list)):
+                        fail("ambiguous scalar in a metadata collection; use an explicit inventory container", f"{where} record[{index}]")
+                    found.update(document(value, f"{where} record[{index}]", flat=flat))
+        elif type(doc) is int and doc >= 0:
+            found.add(doc)
+        elif isinstance(doc, dict):
+            labels = {key.lower() for key in doc}
+            record = bool(labels & record_fields)
+            # Discriminators cannot double as arbitrary flat-inventory labels.
+            # Check before shape classification, including dictionary records.
+            for key, value in doc.items():
+                if key.lower() in inventory_fields and not isinstance(value, (dict, list)):
+                    fail("inventory containers must be arrays or objects, not metadata scalars", f"{where}.{key}")
+            if "schema" in doc and not isinstance(doc["schema"], str):
+                fail("schema must be a string, not a flat-inventory label", f"{where}.schema")
+            integers = bool(doc) and all(type(v) is int and v >= 0 for v in doc.values())
+            if flat and integers and not record and not labels & (scalar_metadata | inventory_fields) and "schema" not in doc:
+                found.update(doc.values())
+            else:
+                # Scalar-only maps without a schema cannot silently become
+                # partial inventories. Structural field names plus known record
+                # metadata establish the interpretation; other shapes must be
+                # explicit wrappers or schema-bearing structured documents.
+                scalar = all(not isinstance(v, (dict, list)) for v in doc.values())
+                if scalar and "schema" not in doc:
+                    unknown = [key for key in doc if "seed" not in key.lower()
+                               and key.lower() not in scalar_metadata]
+                    if not any("seed" in label for label in labels) or unknown:
+                        fail("ambiguous or unsupported scalar reservation map", where)
+                walk(doc, found, where)
+        else:
+            fail("expected seed-keyed JSON, arrays of objects/integers, or decimal integers per line", where)
+        if not found:
+            fail("no seed reservations extracted; empty or unsupported inventory record", where)
+        return found
 
     if lines and all(re.fullmatch(r"[0-9]+", line) for _, line in lines):
         seeds = {int(line) for _, line in lines}
     else:
         try:
-            doc = json.loads(text, object_pairs_hook=unique_object)
+            doc = json.loads(text, object_pairs_hook=unique_object,
+                             parse_constant=lambda value: fail(f"invalid JSON constant {value}"))
             docs = [(context, doc)]
         except json.JSONDecodeError:
             try:
                 docs = []
                 for number, line in lines:
                     context = f"JSONL line {number}"
-                    docs.append((context, json.loads(line, object_pairs_hook=unique_object)))
+                    docs.append((context, json.loads(line, object_pairs_hook=unique_object,
+                                                    parse_constant=lambda value: fail(f"invalid JSON constant {value}"))))
             except json.JSONDecodeError as exc:
                 fail(f"unsupported reservation format ({exc})")
-        def document(doc, where):
-            # Never use the aggregate set to validate a record: a repeated valid
-            # reservation must pass, while an unsupported sibling must fail.
-            found = set()
-            if isinstance(doc, list):
-                if argv_seeds(doc, found, where):
-                    walk(doc, found, where)
-                else:
-                    for index, value in enumerate(doc, 1):
-                        found.update(document(value, f"{where} record[{index}]"))
-            elif type(doc) is int and doc >= 0:
-                found.add(doc)
-            elif isinstance(doc, dict):
-                structured = walk(doc, found, where)
-                if doc.get("schema") == "finfolk.invasion.archived-seeds/1":
-                    inventory = doc.get("all")
-                    if (not isinstance(inventory, dict) or not inventory
-                            or any(not re.fullmatch(r"[0-9]+", key) for key in inventory)):
-                        fail("archived-seeds/1 requires nonempty numeric seed keys under 'all'", where)
-                    found.update(int(key) for key in inventory)
-                elif not structured and doc and all(type(value) is int and value >= 0 for value in doc.values()):
-                    found.update(doc.values())
-            else:
-                fail("expected seed-keyed JSON, arrays of objects/integers, or decimal integers per line", where)
-            if not found:
-                fail("no seed reservations extracted; empty or unsupported inventory record", where)
-            return found
-
         for context, doc in docs:
             seeds.update(document(doc, context))
     if not seeds:
