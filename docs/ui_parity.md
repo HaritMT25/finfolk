@@ -80,8 +80,10 @@ node tests\ui_parity_browser.mjs --base http://localhost:8262 --out OUT\after --
   ocean` is refused: it would test nothing). The cases file is checked first: unique case ids, unique shot names in each case and
   world (a duplicate would overwrite a picture), known steps, step keys and expectations, a selector for every world a step runs on,
   a shot on every world of a case, a policy with its why. Unknown flags are refused.
-- **`--out` must be new or empty**: a run never mixes with an older run's pictures. `--clean` empties it first, of the harness's own
-  files only (`*.png`, `manifest.json`, `summary.json`, `index.md`); with anything else there it refuses and removes nothing.
+- **`--out` must be new or empty**: a run never mixes with an older run's pictures. `--clean` empties it first, but only of the files
+  an earlier run's `manifest.json` lists (its captures, the captures it was to take, a failed step's picture) and `manifest.json`,
+  `summary.json`, `index.md`: a folder without such a manifest (say, one of your own PNGs) or with any file it does not list is
+  refused, and nothing is removed. A comparison's `--out --clean` likewise removes only what its `compare.json` says it wrote.
 - Memory: one browser at a time (the lock already enforces it), closed after each case and world.
 
 ### What a run writes, and when it fails
@@ -117,8 +119,10 @@ node tests\ui_parity_browser.mjs --compare OUT\after OUT\after_repeat           
 nothing compared): a directory without a manifest, a run that is not complete, a capture missing or changed since its run (its
 sha256), a PNG the run did not write (stale), runs of different harness or cases files, a capture on one side only, or nothing left
 to compare (after `--sets` / `--cases` / `--worlds`). Then each picture under its policy: the cases file's `defaults.compare`,
-overridden by a case's or a shot's `compare` (`{tolerance, maxPixels, why}`): a pixel differs when a channel differs by more than
-`tolerance`; the picture passes with at most `maxPixels` such pixels. In check mode (the default) a picture beyond its policy or of
+overridden by a case's or a shot's `compare` (a whole policy: `{tolerance, maxPixels, maxNoisePixels, why}`): a pixel differs when a
+channel differs by more than `tolerance`; the picture passes with at most `maxPixels` such pixels **and** at most `maxNoisePixels`
+pixels that differ by no more than the tolerance, so a shift of one level over the whole picture (every pixel off by 1, none beyond
+the tolerance) is a change, not noise. In check mode (the default) a picture beyond its policy or of
 another size is a **FAIL** (exit 1); otherwise **PASS** (exit 0). `--report` is for a PR that changes the UI on purpose: the evidence
 is checked the same way, differences and size changes are listed, and it exits 0 (**REPORT**) when the evidence is valid. Every
 picture that differs at all is listed (`noise` within the policy, `DIFF` beyond it, `SIZE`), and `--out` (new or empty, or
@@ -126,12 +130,12 @@ picture that differs at all is listed (`noise` within the policy, `DIFF` beyond 
 result). The expectations BEFORE missed are listed (`unmet`: what the PR brings); AFTER may miss only what BEFORE missed too, the
 same way (two runs of main), else the comparison is INVALID.
 
-The default policy, tolerance 1 and at most 8 pixels beyond it, comes from two runs of one commit with the first version of the
-harness (PR #89 at 729b5ba): the compositor's anti-aliasing of rounded edges over the canvas moved a channel by 1 in up to ~21
+The default policy, tolerance 1, at most 8 pixels beyond it and at most 32 within it, comes from two runs of one commit with the
+first version of the harness (PR #89 at 729b5ba): the compositor's anti-aliasing of rounded edges over the canvas moved a channel by 1 in up to ~21
 pixels of a picture, and once 3 pixels at a rounded bar's end differed by up to 17. Since the renderer barrier, the queued idle
 callbacks and the sRGB / no-partial-raster flags, two runs of one commit have been identical, every pixel (41 of 41 pictures, main
-and the branch, PR #89's fix round); the tolerance stays as a margin for other GPUs and drivers. A case that needs another policy
-says so, with its why.
+and the branch, PR #89's fix round); the margins stay small for other GPUs and drivers. A case that needs another policy says so,
+with its why.
 
 ### The state: what is controlled
 
@@ -161,8 +165,13 @@ The plan's capture rules, so that the same picture comes out of every run of a c
 - **The page's own timers stay real time but are waited out**: before frames run, until no one-shot `setTimeout` of up to 1 s is
   pending (the setup sheet's insets 320 ms after its slide, a tip's 200 ms, a resize's 250 ms), so each lands before the frames and
   never among them; before a shot, every one-shot timer of up to 10 s (a toast's life) as well, then `#toasts` must be empty.
-  Intervals are not waited on: the charts' 500 ms redraw draws the same paused data, and the tour's and the Turbo coach's are off
-  (`?guide=0`). A future case that depends on an interval or a longer timer must wait for it explicitly.
+  Intervals (`setInterval`) stay real time and are not waited on, because no S0 / S2 picture depends on one: the charts draw when
+  they open and at each tab change (`showTab` calls `update(true)` at once, in both `dashboard.js` and `ocean_dash.js`), and their
+  500 ms interval's `update()` redraws only when the recorded data, the tab or the grid's width changed, or (Classic's Similarity,
+  either page's Brains) when the page's clock has moved 10 s / 3 s past that analysis's cache; with the world paused and the frames held, none of these happens, so a tick of it
+  before or after a picture changes nothing. The tour's and the Turbo coach's intervals are off (`?guide=0`); the Ocean's 50 ms one
+  runs only while a Turbo start can be cancelled. A future case that depends on an interval or a longer timer (a running world
+  with the charts open, the tour, Turbo) must wait for it explicitly, or the harness must control intervals as it does frames.
 - **Animation time**: each scene's `render` gets a fixed `animT` (both scenes' `create()` are wrapped as they register, as
   `tools/ocean_render_perf/shots.mjs` freezes the Ocean's).
 - **Visual randomness**: `Math.random` is a seeded xorshift32 (snow, streaks).

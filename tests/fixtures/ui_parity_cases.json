@@ -16,7 +16,8 @@
     "compare": {
       "tolerance": 1,
       "maxPixels": 8,
-      "why": "two runs of one commit (PR #89's repeats): the compositor's anti-aliasing of rounded edges over the canvas moves a channel by 1 in up to ~21 px of a picture (within the tolerance); once, 3 px at a rounded bar's end differed by up to 17 (within maxPixels). Anything larger is a change."
+      "maxNoisePixels": 32,
+      "why": "two runs of one commit: with PR #89's first harness (729b5ba) the compositor's anti-aliasing of rounded edges over the canvas moved a channel by 1 in up to ~21 px of a picture and once 3 px at a rounded bar's end by up to 17; since the fix round's renderer barrier, queued idle callbacks and sRGB / no-partial-raster flags, two runs gave identical pictures (41 of 41, main and the branch). So at most 8 px may differ by more than 1 and at most 32 px by 1: a shift of one level over any larger area is a change, not noise."
     }
   },
   "routes": {

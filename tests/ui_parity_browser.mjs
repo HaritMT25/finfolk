@@ -20,8 +20,9 @@
 // The selection: every world named must be one (classic, ocean), every set and case must exist, and the case x world list it
 //          gives must not be empty (also with --smoke); the fixture itself is checked first (unique case ids, unique shot names in
 //          each case and world, known steps and expectations, a selector for every world a step runs on). Exit 2 otherwise.
-// --out:   must be new or empty: a run never mixes with an older one's pictures. --clean empties it first, of the harness's own
-//          files only (*.png, manifest.json, summary.json, index.md); anything else there and it refuses.
+// --out:   must be new or empty: a run never mixes with an older one's pictures. --clean empties it first, but only of the files
+//          an earlier run's manifest.json lists (its captures, expected captures and failed steps' pictures, plus manifest.json,
+//          summary.json, index.md): without such a manifest, or with any other file there, it refuses and removes nothing.
 // --expect: check (the default): a shot whose state is not its case's "expect" fails the run. record: it is kept in the
 //          manifest (the capture's "unmet") and the run goes on: main's run before a PR that brings the behaviour. --compare
 //          lists BEFORE's unmet expectations; AFTER may miss only what BEFORE missed too, the same way (else INVALID).
@@ -33,11 +34,13 @@
 //          run (its sha256), a PNG the run did not write (stale), different harness or fixture files, a capture on one side and
 //          not the other, nothing left to compare. Then pixel for pixel, each picture under its policy (the fixture's
 //          defaults.compare, a case's or shot's "compare"): a pixel differs when a channel differs by more than "tolerance";
-//          a picture passes with at most "maxPixels" such pixels. Exit 1 (FAIL) on a picture beyond its policy or a size change;
+//          a picture passes with at most "maxPixels" such pixels and at most "maxNoisePixels" pixels that differ within the
+//          tolerance (so a shift of one level over the whole picture is a change, not noise). Exit 1 (FAIL) on a picture
+//          beyond its policy or a size change;
 //          exit 0 (PASS) otherwise. --report: the same checks of the evidence, but differences and size changes are listed, not
 //          failed (a PR that changes the UI on purpose); exit 0 when the evidence is valid. --sets / --cases / --worlds narrow
 //          the comparison (e.g. --sets S0: the shell must not change). --out: a x16 difference picture for each picture that
-//          differs at all, and compare.json.
+//          differs at all, and compare.json (which lists them: --clean there removes only those and itself).
 //
 // The state (the plan's capture rules): seed 42 and 300 founders on both pages (Classic ignores setup URL parameters: its own
 // form's seed and population fields and its Restart; the Ocean: its link's seed= and pop=), Classic's single-threaded module
@@ -60,7 +63,9 @@
 //     the frames, not among them; before a shot, every one-shot timer of up to 10 s (a toast's life) as well. The page's
 //     one-time "click a fish" hint (9 s after ready) is waited out in the barrier, before any step, so it always shows with
 //     nothing selected and is gone before the first shot. #toasts must be empty at each shot (a shot's toasts: "keep" is the
-//     one exception), else the run fails. Intervals are not waited on: the charts' 500 ms redraw draws the same paused data
+//     one exception), else the run fails. Intervals (setInterval) stay real time: no S0 / S2 picture depends on one (the charts
+//     draw at once when shown; their 500 ms update() redraws only on new data, another tab or width, or Similarity / Brains' page clock,
+//     none of which moves while paused and held: docs/ui_parity.md). A case that does depend on one must wait for it
 //   - the animation time: each scene's render gets a fixed animT (both scenes' create(), wrapped as they register)
 //   - the visual RNG: Math.random is a seeded xorshift32 (snow, streaks; nothing in a case draws a seed from it)
 //   - fonts loaded (document.fonts.ready), the CSS animations and transitions finished (the screenshot's animations: disabled),
@@ -198,19 +203,41 @@ function diffImages(a, b, tolerance) {
 }
 
 /* ---------------- an output directory: new, empty, or emptied of the harness's own files (--clean) ---------------- */
-function prepareDir(dir, clean, owned, what) {
+function prepareDir(dir, clean, ownedBy, what) {
   if (!fs.existsSync(dir)) { fs.mkdirSync(dir, { recursive: true }); return; }
   if (!fs.statSync(dir).isDirectory()) usage(what + " " + dir + " is not a directory");
   const entries = fs.readdirSync(dir);
   if (!entries.length) return;
   if (!clean) usage(what + " " + dir + " is not empty (" + entries.length + " entries, e.g. " + entries.slice(0, 3).join(", ") + "): pictures of " +
-                    "two runs must never mix. Use a new directory, or --clean to remove the harness's own files there first");
-  const other = entries.filter((f) => !owned(f));
-  if (other.length) usage("--clean: " + what + " " + dir + " holds files the harness does not write (" + other.slice(0, 5).join(", ") + "): not removing anything");
+                    "two runs must never mix. Use a new directory, or --clean to remove an earlier run's own files there first");
+  const owned = ownedBy(dir);
+  if (!owned.files) usage("--clean: " + what + " " + dir + " has no " + owned.record + " of an earlier " + owned.kind + " (" + owned.why + "): only files such a record " +
+                         "lists are ever removed, so nothing is");
+  const other = entries.filter((f) => !owned.files.has(f));
+  if (other.length) usage("--clean: " + what + " " + dir + " holds files its " + owned.record + " does not list (" + other.slice(0, 5).join(", ") + "): not removing anything");
   for (const f of entries) fs.rmSync(path.join(dir, f), { force: true });
 }
-const RUN_OWNED = (f) => /\.png$/i.test(f) || f === "manifest.json" || f === "summary.json" || f === "index.md";
-const DIFF_OWNED = (f) => /_diff16x\.png$/i.test(f) || f === "compare.json";
+const readJson = (p) => { try { return JSON.parse(fs.readFileSync(p, "utf8")); } catch (e) { return null; } };
+/* a run's files, as its manifest lists them (null: no manifest of this harness) */
+function RUN_OWNED(dir) {
+  const o = { record: "manifest.json", kind: "run", files: null, why: "" };
+  const p = path.join(dir, "manifest.json");
+  if (!fs.existsSync(p)) { o.why = "none there"; return o; }
+  const m = readJson(p);
+  if (!m || m.format !== FORMAT) { o.why = "it is not a " + FORMAT + " manifest"; return o; }
+  o.files = new Set(["manifest.json", "summary.json", "index.md"].concat(Object.keys(m.captures || {}), m.expected || [], m.extra || []));
+  return o;
+}
+/* a comparison's files, as its compare.json lists them */
+function DIFF_OWNED(dir) {
+  const o = { record: "compare.json", kind: "comparison", files: null, why: "" };
+  const p = path.join(dir, "compare.json");
+  if (!fs.existsSync(p)) { o.why = "none there"; return o; }
+  const m = readJson(p);
+  if (!m || m.format !== "ui-parity-compare" || !Array.isArray(m.written)) { o.why = "it is not a ui-parity-compare record listing what it wrote"; return o; }
+  o.files = new Set(["compare.json"].concat(m.written));
+  return o;
+}
 
 /* ---------------- the fixture: checked before anything runs ---------------- */
 const STEP_NAMES = ["run", "pause", "release", "freeze", "settle", "select", "click", "press", "key", "tabTo", "focus", "blur", "wait", "shot"];
@@ -221,9 +248,10 @@ const EXPECT_KEYS = ["tick", "paused", "held", "speed", "dashOpen", "sheetOpen",
 const NAME_RE = /^[a-z0-9][a-z0-9_]*$/;
 const worldsOfStep = (c, st) => (st.world ? [st.world] : c.worlds);
 function checkPolicy(p, where, bad) {
-  if (!p || typeof p !== "object") { bad.push(where + ": a compare policy is an object {tolerance, maxPixels, why}"); return; }
+  if (!p || typeof p !== "object") { bad.push(where + ": a compare policy is an object {tolerance, maxPixels, maxNoisePixels, why}"); return; }
   if (!Number.isInteger(p.tolerance) || p.tolerance < 0 || p.tolerance > 255) bad.push(where + ": tolerance is a whole number 0..255");
   if (!Number.isInteger(p.maxPixels) || p.maxPixels < 0) bad.push(where + ": maxPixels is a whole number >= 0");
+  if (!Number.isInteger(p.maxNoisePixels) || p.maxNoisePixels < 0) bad.push(where + ": maxNoisePixels (the pixels that may differ within the tolerance) is a whole number >= 0");
   if (typeof p.why !== "string" || !p.why.trim()) bad.push(where + ": a policy says why (\"why\")");
 }
 function checkExpectSpec(e, where, bad) {
@@ -388,19 +416,28 @@ function compareMain(o) {
       for (const u of ua) unmet.push({ file: f, side: ub.indexOf(u) >= 0 ? "both" : "before", what: u });
     }
   }
-  const rows = [];
   if (!problems.length) for (const f of files) {
-    const ca = ra.m.captures[f], cb = rb.m.captures[f], pol = cb.policy || ra.m.policy;
+    const pol = rb.m.captures[f].policy;
+    if (!pol || !Number.isInteger(pol.tolerance) || !Number.isInteger(pol.maxPixels) || !Number.isInteger(pol.maxNoisePixels))
+      problems.push(f + ": its policy " + JSON.stringify(pol) + " has no bound for the pixels within the tolerance (maxNoisePixels): a run of an older harness; take both runs again");
+  }
+  const rows = [], written = [];
+  if (!problems.length) for (const f of files) {
+    const ca = ra.m.captures[f], cb = rb.m.captures[f], pol = cb.policy;
     const d = diffImages(decodePng(fs.readFileSync(path.join(A, f))), decodePng(fs.readFileSync(path.join(B, f))), pol.tolerance);
     const row = { file: f, case: cb.case, set: cb.set, world: cb.world, shot: cb.shot, policy: pol, beforeSha: ca.sha256, afterSha: cb.sha256 };
     if (d.sizeDiffers) Object.assign(row, { verdict: "size", before: d.a, after: d.b });
-    else Object.assign(row, { verdict: !d.any ? "same" : d.differing <= pol.maxPixels ? "within" : "differs", pixels: d.pixels, any: d.any, differing: d.differing, maxDiff: d.maxDiff, box: d.box });
+    else {
+      const noise = d.any - d.differing;   /* differ, but by no more than the tolerance */
+      Object.assign(row, { verdict: !d.any ? "same" : d.differing <= pol.maxPixels && noise <= pol.maxNoisePixels ? "within" : "differs",
+                           pixels: d.pixels, any: d.any, differing: d.differing, noise, maxDiff: d.maxDiff, box: d.box });
+    }
     rows.push(row);
     const tag = { same: "  same   ", within: "  noise  ", differs: "  DIFF   ", size: "  SIZE   " }[row.verdict];
     console.log(tag + f + (row.verdict === "size" ? "  " + row.before.join("x") + " -> " + row.after.join("x")
-      : row.verdict === "same" ? "" : "  " + row.any + " px differ, " + row.differing + " beyond tolerance " + pol.tolerance + " (policy: at most " + pol.maxPixels + "), max " +
-        row.maxDiff + (row.box ? ", box " + row.box.join(",") : "")));
-    if (OUTD && !d.sizeDiffers && d.any) fs.writeFileSync(path.join(OUTD, f.replace(/\.png$/, "_diff16x.png")), encodePng(d.w, d.h, d.img));
+      : row.verdict === "same" ? "" : "  " + row.any + " px differ: " + row.differing + " beyond tolerance " + pol.tolerance + " (policy: at most " + pol.maxPixels + "), " +
+        row.noise + " within it (policy: at most " + pol.maxNoisePixels + "), max " + row.maxDiff + (row.box ? ", box " + row.box.join(",") : "")));
+    if (OUTD && !d.sizeDiffers && d.any) { const w = f.replace(/\.png$/, "_diff16x.png"); fs.writeFileSync(path.join(OUTD, w), encodePng(d.w, d.h, d.img)); written.push(w); }
   }
   const beyond = rows.filter((r) => r.verdict === "differs" || r.verdict === "size");
   const verdict = problems.length ? "INVALID" : report ? "REPORT" : beyond.length ? "FAIL" : "PASS";
@@ -410,7 +447,7 @@ function compareMain(o) {
   console.log(verdict + ": " + (problems.length ? problems.length + " problems with the evidence; nothing compared" :
               rows.length + " pictures: " + counts[0] + " identical, " + counts[1] + " within their policy, " + counts[2] + " beyond it, " + counts[3] + " of another size" +
               (report ? " (--report: differences listed, not failed)" : "") + (unmet.length ? "; " + unmet.length + " expectations BEFORE did not meet" + (unmet.some((u) => u.side === "both") ? " (some neither run met)" : "") : "")));
-  if (OUTD) fs.writeFileSync(path.join(OUTD, "compare.json"), JSON.stringify({ before: path.resolve(A), after: path.resolve(B), mode: report ? "report" : "check",
+  if (OUTD) fs.writeFileSync(path.join(OUTD, "compare.json"), JSON.stringify({ format: "ui-parity-compare", written, before: path.resolve(A), after: path.resolve(B), mode: report ? "report" : "check",
     selection: { sets, cases: ids, worlds }, verdict, problems, unmet, expectModes: { before: ra.m && ra.m.expectMode, after: rb.m && rb.m.expectMode }, counts: { same: counts[0], within: counts[1], differs: counts[2], size: counts[3] }, files: rows }, null, 1));
   process.exit(verdict === "PASS" || verdict === "REPORT" ? 0 : 1);
 }
@@ -821,7 +858,7 @@ const STEPS = {
     if (bad.length) console.log("    expectation not met (--expect record: kept in the manifest): " + bad.join("; "));
   }
 };
-async function runCase(run, onCapture) {
+async function runCase(run, onCapture, onExtra) {
   const c = run.c, world = run.world;
   const vp = c.viewport || DEF.viewport, dpr = c.dpr || DEF.dpr, url = urlOf(world, c);
   const rec = { case: c.id, set: c.set, world, url, viewport: vp, dpr, shots: [], errors: [], ok: false };
@@ -849,7 +886,7 @@ async function runCase(run, onCapture) {
   } catch (e) {
     rec.threw = String(e && e.stack || e);
     console.log("    THREW " + String(e && e.message || e));
-    if (L) { try { await L.page.screenshot({ path: path.join(OUT, c.id + "__" + world + "__THREW.png") }); } catch (e2) { /* closed */ } }
+    if (L) { try { const t = c.id + "__" + world + "__THREW.png"; await L.page.screenshot({ path: path.join(OUT, t) }); onExtra(t); } catch (e2) { /* closed */ } }
   } finally {
     if (L) { rec.errors = L.errors.slice(0, 40); try { await L.ctx.close(); } catch (e) { /* closed */ } }
     release();
@@ -891,12 +928,13 @@ async function smoke(s, onCapture) {
 const summary = { started: new Date().toISOString(), base: BASE, layout: LAYOUT, routes: ROUTES, defaults: DEF, cases: [], smoke: [] };
 const manifest = { format: FORMAT, version: FORMAT_VERSION, harness: sha256(fs.readFileSync(SELF)), fixture: FIX_SHA, fixtureFile: CASES_FILE,
                    base: BASE, layout: LAYOUT, selection: PLAN.selection, started: summary.started, finished: null, status: "running", complete: false,
-                   expectMode: EXPECT_MODE, policy: DEF.compare, expected: EXPECTED.concat(PLAN.smokes.map((s) => "smoke__" + s.label + ".png")), captures: {}, runs: [], smoke: [] };
+                   expectMode: EXPECT_MODE, policy: DEF.compare, expected: EXPECTED.concat(PLAN.smokes.map((s) => "smoke__" + s.label + ".png")), captures: {}, extra: [], runs: [], smoke: [] };
 const save = () => {
   fs.writeFileSync(path.join(OUT, "summary.json"), JSON.stringify(summary, null, 1));
   fs.writeFileSync(path.join(OUT, "manifest.json"), JSON.stringify(manifest, null, 1));
 };
 const onCapture = (cap) => { manifest.captures[cap.file] = cap; save(); };
+const onExtra = (file) => { if (manifest.extra.indexOf(file) < 0) manifest.extra.push(file); save(); };
 save();
 let threw = null;
 try {
@@ -907,7 +945,7 @@ try {
   }
   for (const run of PLAN.runs) {
     console.log("== " + run.c.id + " (" + run.c.set + ") on " + run.world + ": " + urlOf(run.world, run.c));
-    const r = await runCase(run, onCapture);
+    const r = await runCase(run, onCapture, onExtra);
     summary.cases.push(r); manifest.runs.push({ case: r.case, world: r.world, ok: r.ok, error: r.threw ? r.threw.split("\n")[0] : r.errors[0] || null });
     save();
   }

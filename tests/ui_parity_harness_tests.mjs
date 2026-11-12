@@ -4,9 +4,10 @@
 //     --worlds filter leaves out), with or without --smoke, are refused (exit 2) before any browser; the real fixture's plan
 //   - the fixture's own checks: a case id used twice, a shot name used twice in a case and world, an unknown step or
 //     expectation, a selector missing for a world the step runs on, a world without a shot, a policy without its why
-//   - --out: a run never writes into a directory with older pictures; --clean refuses a directory with files it did not write
+//   - --out: a run never writes into a directory with older pictures; --clean removes only what an earlier run's manifest (or a
+//     comparison's compare.json) lists, and refuses a folder without one or with any other file (the review of b408e60)
 //   - --compare as a gate, on synthetic runs: identical and noise-only pictures pass; a picture beyond its policy and a size
-//     change fail (and are only listed with --report); a missing manifest, an incomplete run, a capture missing or changed
+//     change fail (and are only listed with --report), and so does a one-level shift of the whole picture (maxNoisePixels); a missing manifest, an incomplete run, a capture missing or changed
 //     since its run, a stale PNG, captures on one side only, different harness or fixture files and an empty comparison are
 //     INVALID in both modes; --sets / --cases / --worlds narrow it; a shot's own policy is honoured; AFTER may miss only the
 //     expectations BEFORE missed too (--expect record: main's run before a PR that brings the behaviour)
@@ -101,8 +102,12 @@ section("the fixture's own checks");
   ok(r.code === 2 && /unknown expectation focused/.test(r.out), "an unknown expectation: refused", r.out);
   r = tryFix("no_shot", (f) => { const c = f.cases.find((x) => x.id === "s0_family"); c.steps = c.steps.filter((s) => s.do !== "shot"); c.steps.push({ do: "shot", name: "x", world: "ocean" }); });
   ok(r.code === 2 && /no shot on classic/.test(r.out), "a world of a case without a shot: refused", r.out);
-  r = tryFix("policy_why", (f) => { f.defaults.compare = { tolerance: 1, maxPixels: 8 }; });
+  r = tryFix("policy_why", (f) => { f.defaults.compare = { tolerance: 1, maxPixels: 8, maxNoisePixels: 32 }; });
   ok(r.code === 2 && /says why/.test(r.out), "a difference policy without its why: refused", r.out);
+  r = tryFix("policy_noise", (f) => { delete f.defaults.compare.maxNoisePixels; });
+  ok(r.code === 2 && /maxNoisePixels/.test(r.out), "a difference policy without a bound for the pixels within the tolerance: refused (the review of b408e60)", r.out);
+  r = tryFix("policy_override", (f) => { f.cases[0].compare = { tolerance: 2, maxPixels: 8 }; });
+  ok(r.code === 2 && /maxNoisePixels/.test(r.out) && /says why/.test(r.out), "  a case's own policy: the same fields, and its why", r.out);
   r = tryFix("step_world", (f) => f.cases.find((x) => x.id === "s0_classic_flat").steps.push({ do: "settle", world: "ocean" }));
   ok(r.code === 2 && /not one of the case's/.test(r.out), "a step limited to a world the case does not run: refused", r.out);
 }
@@ -114,10 +119,27 @@ section("--out: never a directory with an older run's pictures");
   fs.writeFileSync(path.join(d, "s0_shell__classic__live.png"), "old");
   let r = harness("--base", "http://localhost:1", "--cases", "s0_classic_canvas", "--out", d);
   ok(r.code === 2 && /is not empty/.test(r.out) && fs.existsSync(path.join(d, "s0_shell__classic__live.png")), "a run into a directory with an older picture: refused, the picture left", r.out);
-  fs.writeFileSync(path.join(d, "notes.txt"), "mine");
   r = harness("--base", "http://localhost:1", "--cases", "s0_classic_canvas", "--out", d, "--clean");
-  ok(r.code === 2 && /does not write/.test(r.out) && fs.existsSync(path.join(d, "notes.txt")) && fs.existsSync(path.join(d, "s0_shell__classic__live.png")),
-     "--clean with a file the harness did not write: refused, nothing removed", r.out);
+  ok(r.code === 2 && /has no manifest\.json/.test(r.out) && fs.existsSync(path.join(d, "s0_shell__classic__live.png")),
+     "--clean on a directory of PNGs with no run's manifest: refused, nothing removed (it took any .png as the harness's before)", r.out);
+  const art = path.join(TMP, "artwork");
+  fs.mkdirSync(art);
+  for (const n of ["icon.png", "logo.png", "summary.json"]) fs.writeFileSync(path.join(art, n), "user's");
+  r = harness("--base", "http://localhost:1", "--cases", "s0_classic_canvas", "--out", art, "--clean");
+  ok(r.code === 2 && ["icon.png", "logo.png", "summary.json"].every((n) => fs.existsSync(path.join(art, n))), "  a folder of unrelated PNGs (and a summary.json): refused, all kept", r.out);
+  /* an earlier run's directory: its manifest lists what it wrote */
+  const prev = path.join(TMP, "prev_run");
+  fs.mkdirSync(prev);
+  const listed = ["s0_classic_canvas__classic__canvas_selected.png", "s0_classic_canvas__classic__THREW.png"];
+  for (const n of listed.concat(["summary.json", "index.md"])) fs.writeFileSync(path.join(prev, n), "x");
+  fs.writeFileSync(path.join(prev, "manifest.json"), JSON.stringify({ format: "ui-parity-run", version: 1, captures: { [listed[0]]: {} }, expected: [listed[0]], extra: [listed[1]] }));
+  fs.writeFileSync(path.join(prev, "holiday.png"), "user's");
+  r = harness("--base", "http://localhost:1", "--cases", "s0_classic_canvas", "--out", prev, "--clean");
+  ok(r.code === 2 && /does not list \(holiday\.png\)/.test(r.out) && fs.readdirSync(prev).length === 6, "  an earlier run's directory with a PNG its manifest does not list: refused, nothing removed", r.out);
+  fs.rmSync(path.join(prev, "holiday.png"), { force: true });
+  r = harness("--base", "http://localhost:1", "--cases", "s0_classic_canvas", "--out", prev, "--clean");
+  ok(fs.readdirSync(prev).length === 0 && /no-playwright-here/.test(r.out),
+     "  an earlier run's own files only (captures, a failed step's picture, manifest, summary, index): removed (the run then stops at the missing browser module here)", r.out);
 }
 
 /* ---------------- synthetic runs for --compare ---------------- */
@@ -125,8 +147,8 @@ const CRC = (() => { const t = new Uint32Array(256); for (let n = 0; n < 256; n+
 function crc32(b) { let c = 0xFFFFFFFF; for (let i = 0; i < b.length; i++) c = CRC[(c ^ b[i]) & 255] ^ (c >>> 8); return (c ^ 0xFFFFFFFF) >>> 0; }
 function chunk(type, data) { const b = Buffer.alloc(12 + data.length); b.writeUInt32BE(data.length, 0); b.write(type, 4, "ascii"); data.copy(b, 8); b.writeUInt32BE(crc32(b.subarray(4, 8 + data.length)), 8 + data.length); return b; }
 /* a w x h picture, grey 100, with edits: [[x, y, value], ...] */
-function png(w, h, edits) {
-  const px = Buffer.alloc(w * h * 4, 100);
+function png(w, h, edits, grey) {
+  const px = Buffer.alloc(w * h * 4, grey === undefined ? 100 : grey);
   for (let i = 3; i < px.length; i += 4) px[i] = 255;
   for (const [x, y, v] of edits || []) { const o = (y * w + x) * 4; px[o] = px[o + 1] = px[o + 2] = v; }
   const raw = Buffer.alloc((w * 4 + 1) * h);
@@ -135,7 +157,7 @@ function png(w, h, edits) {
   return Buffer.concat([Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]), chunk("IHDR", ihdr), chunk("IDAT", zlib.deflateSync(raw)), chunk("IEND", Buffer.alloc(0))]);
 }
 const sha = (b) => crypto.createHash("sha256").update(b).digest("hex");
-const POLICY = { tolerance: 1, maxPixels: 8, why: "test" };
+const POLICY = { tolerance: 1, maxPixels: 8, maxNoisePixels: 32, why: "test" };
 /* a run directory as the harness writes it: pictures {file: {set, buf, policy}} and its manifest */
 let runN = 0;
 function makeRun(pics, o) {
@@ -166,6 +188,21 @@ section("--compare: a gate on two complete runs");
   ok(r.code === 0 && /PASS: 3 pictures: 3 identical/.test(r.out), "two runs, the same pictures: PASS", r.out);
   r = cmp(A, makeRun(withPic("s0_shell__classic__live.png", png(20, 10, [[1, 1, 101], [2, 2, 99], [3, 3, 101]]))));
   ok(r.code === 0 && /noise  s0_shell__classic__live\.png/.test(r.out) && /1 within their policy/.test(r.out), "3 pixels a channel off by 1 (the tolerance): PASS, listed as noise", r.out);
+  r = cmp(A, makeRun(withPic("s0_shell__classic__live.png", png(20, 10, [], 101))));
+  ok(r.code === 1 && /DIFF   s0_shell__classic__live\.png  200 px differ: 0 beyond tolerance 1 \(policy: at most 8\), 200 within it \(policy: at most 32\)/.test(r.out),
+     "the whole picture one level lighter (every pixel off by 1, none beyond the tolerance): FAIL (it passed as noise in b408e60)", r.out);
+  r = cmp(A, makeRun(withPic("s0_shell__classic__live.png", png(20, 10, Array.from({ length: 33 }, (_, i) => [i % 20, (i / 20) | 0, 101])))));
+  ok(r.code === 1 && /33 within it \(policy: at most 32\)/.test(r.out), "  33 pixels off by 1 (one more than maxNoisePixels): FAIL", r.out);
+  r = cmp(A, makeRun(withPic("s0_shell__classic__live.png", png(20, 10, Array.from({ length: 32 }, (_, i) => [i % 20, (i / 20) | 0, 99])))));
+  ok(r.code === 0 && /32 within it/.test(r.out), "  32 pixels off by 1 (maxNoisePixels): PASS, listed as noise", r.out);
+  r = cmp(A, makeRun(withPic("s0_shell__classic__live.png", png(20, 10, [], 101))), "--report");
+  ok(r.code === 0 && /DIFF   s0_shell__classic__live\.png/.test(r.out), "  the one-level shift with --report: listed, exit 0", r.out);
+  const loose = makeRun(withPic("s0_shell__classic__live.png", png(20, 10, [], 101), { policy: { tolerance: 1, maxPixels: 8, maxNoisePixels: 200, why: "a shot that may shift" } }));
+  r = cmp(makeRun(base()), loose);
+  ok(r.code === 0 && /policy: at most 200/.test(r.out), "  a shot whose own policy allows it (maxNoisePixels 200, with its why): PASS", r.out);
+  const old = makeRun(base(), { mutate: (m) => { for (const c of Object.values(m.captures)) c.policy = { tolerance: 1, maxPixels: 8, why: "b408e60" }; } });
+  r = cmp(makeRun(base(), { mutate: (m) => { for (const c of Object.values(m.captures)) c.policy = { tolerance: 1, maxPixels: 8, why: "b408e60" }; } }), old);
+  ok(r.code === 1 && /no bound for the pixels within the tolerance/.test(r.out), "runs whose policy has no maxNoisePixels (an older harness): INVALID", r.out);
   r = cmp(A, makeRun(withPic("s0_shell__classic__live.png", png(20, 10, [[1, 1, 117], [2, 1, 117], [3, 1, 117]]))));
   ok(r.code === 0 && /PASS/.test(r.out), "3 pixels off by 17 (at most maxPixels 8 beyond the tolerance): PASS", r.out);
   const big = png(20, 10, Array.from({ length: 10 }, (_, i) => [i, 5, 200]));
@@ -184,7 +221,7 @@ section("--compare: a gate on two complete runs");
   ok(r.code === 2, "  --worlds with a misspelt world: refused", r.out);
   r = cmp(A, B, "--sets", "S9");
   ok(r.code === 1 && /INVALID nothing to compare/.test(r.out), "  a filter that leaves nothing: INVALID, exit 1", r.out);
-  const own = makeRun(withPic("s2_tabs__classic__tab.png", big, { policy: { tolerance: 1, maxPixels: 20, why: "this shot's own" } }));
+  const own = makeRun(withPic("s2_tabs__classic__tab.png", big, { policy: { tolerance: 1, maxPixels: 20, maxNoisePixels: 32, why: "this shot's own" } }));
   r = cmp(makeRun(base()), own);
   ok(r.code === 0 && /policy: at most 20/.test(r.out), "a shot's own policy (maxPixels 20): honoured, PASS", r.out);
   const S = makeRun(withPic("s0_shell__ocean__live.png", png(22, 10)));
@@ -257,8 +294,15 @@ section("--compare --out: never into older output");
   ok(j.verdict === "PASS" && j.mode === "check" && j.files.length === 3 && j.counts.within === 1, "  compare.json: the verdict, the mode, each file's result", j);
   r = cmp(A, B, "--out", d);
   ok(r.code === 2 && /is not empty/.test(r.out), "the same directory again: refused", r.out);
+  ok(Array.isArray(j.written) && j.written.join() === "s2_tabs__classic__tab_diff16x.png" && j.format === "ui-parity-compare", "  compare.json lists the pictures it wrote", j.written);
   r = cmp(A, B, "--out", d, "--clean");
   ok(r.code === 0, "  --clean: its own files removed, written again", r.out);
+  fs.writeFileSync(path.join(d, "someone_else_diff16x.png"), "x");
+  r = cmp(A, B, "--out", d, "--clean");
+  ok(r.code === 2 && /does not list \(someone_else_diff16x\.png\)/.test(r.out) && fs.existsSync(path.join(d, "compare.json")), "  a difference picture compare.json does not list: refused, nothing removed", r.out);
+  const pics = path.join(TMP, "pics"); fs.mkdirSync(pics); fs.writeFileSync(path.join(pics, "a_diff16x.png"), "x");
+  r = cmp(A, B, "--out", pics, "--clean");
+  ok(r.code === 2 && /has no compare\.json/.test(r.out) && fs.existsSync(path.join(pics, "a_diff16x.png")), "  a folder with no compare.json: refused, nothing removed", r.out);
 }
 
 fs.rmSync(TMP, { recursive: true, force: true });
