@@ -8,9 +8,13 @@
 //   - returnPoint(): the focus back to a keyboard opener, only when the keyboard closes
 //   - both pages' dashboards (web/dashboard.js: Classic; web/ocean_dash.js: the Ocean) on a small DOM, the same assertions for
 //     both: the UI parity plan's U37 (Classic's tabs had no keys and blurred on every press)
+//   - Classic's setup sheet as web/renderer.js builds and selects it (the page's script run whole on an auto DOM, up to its
+//     module's load): built with one tab in the Tab order and only its panel shown, the keyboard's keys, a focused tab's Up not
+//     a speed key, a pointer's press letting the focus go (then Up is), the stored tab at load (the review of PR #89)
 //   - both pages load ui_common.js (and its stylesheet) before the scripts that use it
-// The browser's own behaviour (the ring itself, real focus heuristics, the setup sheets' tabs on the real pages) is in
-// tests/ui_parity_browser.mjs's S2 cases; the Ocean page's tab keys with its whole key router in tests/ocean_turbo_handoff.js.
+// The browser's own behaviour (the ring itself, real focus heuristics, both setup sheets' tabs on the real pages) is in
+// tests/ui_parity_browser.mjs's S2 cases (their shots' expectations); the Ocean page's setup sheet and tab keys with its
+// whole key router in tests/ocean_turbo_handoff.js (pageSetupTabs, pageTabKeys).
 "use strict";
 const fs = require("fs");
 const path = require("path");
@@ -25,8 +29,11 @@ function ok(cond, what, info) {
 }
 function section(name) { console.log("== " + name); }
 
-/* ---------------- a small DOM: elements, bubbling events, focus with a keyboard / pointer modality ---------------- */
-function makeDom() {
+/* ---------------- a small DOM: elements, bubbling events, focus with a keyboard / pointer modality ----------------
+ * auto (a whole page's script, web/renderer.js): an id asked for is made on first use, as the page's HTML would have it, and
+ * so is an element's child asked for by a simple selector; a selector the DOM does not know matches nothing; a canvas gives a context that takes every call */
+function makeDom(opts) {
+  opts = opts || {};
   const byId = new Map(), errors = [];
   const doc = { activeElement: null, modality: "pointer", _ls: {} };
   function fire(n, ev) {
@@ -40,13 +47,17 @@ function makeDom() {
   }
   const parse = (s) => { const m = /^([a-z0-9]*)((?:[.#][\w-]+)*)$/i.exec(s.trim()); if (!m) throw new Error("the test DOM has no selector " + s);
     return { tag: m[1].toUpperCase(), cls: (m[2].match(/\.[\w-]+/g) || []).map((x) => x.slice(1)), id: ((m[2].match(/#[\w-]+/) || ["#"])[0]).slice(1) }; };
-  const hit = (e, p) => (!p.tag || e.tagName === p.tag) && (!p.id || e.id === p.id) && p.cls.every((c) => e._cls.has(c));
+  const hit0 = (e, p) => (!p.tag || e.tagName === p.tag) && (!p.id || e.id === p.id) && p.cls.every((c) => e._cls.has(c));
+  const hit = (e, p) => (p ? hit0(e, p) : false);
+  const parseQ = (s) => { try { return parse(s); } catch (x) { if (opts.auto) return null; throw x; } };
+  const any = () => new Proxy(function () {}, { get: (t, k) => (k === Symbol.toPrimitive ? () => 0 : k === "width" ? 0 : any()), apply: () => any(), set: () => true });
   function* walk(e) { for (const c of e.children) { yield c; yield* walk(c); } }
   class El {
     constructor(tag) {
       this.tagName = String(tag).toUpperCase(); this.children = []; this.parentNode = null; this.attrs = {}; this.dataset = {}; this._ls = {};
       this._cls = new Set(); this._id = ""; this._text = ""; this.hidden = false; this.type = ""; this.tabIndex = this.tagName === "BUTTON" ? 0 : -1;
-      this.style = {}; this.scrollTop = 0; this.clientWidth = 800; this.clientHeight = 600; this.isContentEditable = false;
+      this.style = { setProperty() {}, removeProperty() {} }; this.scrollTop = 0; this.clientWidth = 800; this.clientHeight = 600; this.isContentEditable = false;
+      this.value = ""; this.checked = false; this.disabled = false; this.options = []; this.offsetWidth = 0; this.offsetHeight = 0; this.title = "";
     }
     get id() { return this._id; } set id(v) { this._id = String(v); byId.set(this._id, this); }
     get className() { return Array.from(this._cls).join(" "); } set className(v) { this._cls = new Set(String(v).split(/\s+/).filter(Boolean)); }
@@ -64,6 +75,15 @@ function makeDom() {
     removeChild(c) { const i = this.children.indexOf(c); if (i >= 0) this.children.splice(i, 1); c.parentNode = null; return c; }
     remove() { if (this.parentNode) this.parentNode.removeChild(this); }
     setAttribute(k, v) { this.attrs[k] = String(v); if (k === "id") this.id = v; }
+    removeAttribute(k) { delete this.attrs[k]; }
+    hasAttribute(k) { return Object.prototype.hasOwnProperty.call(this.attrs, k); }
+    append(...cs) { for (const c of cs) if (typeof c === "object") this.appendChild(c); else this._text += String(c); }
+    insertBefore(c, ref) { if (!ref) return this.appendChild(c); if (c.parentNode) c.parentNode.removeChild(c); c.parentNode = this; this.children.splice(Math.max(0, this.children.indexOf(ref)), 0, c); return c; }
+    get firstElementChild() { return this.children[0] || null; }
+    get lastChild() { return this.children[this.children.length - 1] || null; }
+    get nextElementSibling() { const p = this.parentNode; return p ? p.children[p.children.indexOf(this) + 1] || null : null; }
+    scrollIntoView() {}
+    insertAdjacentHTML() {}
     getAttribute(k) { return Object.prototype.hasOwnProperty.call(this.attrs, k) ? this.attrs[k] : null; }
     addEventListener(t, f) { (this._ls[t] = this._ls[t] || []).push(f); }
     removeEventListener(t, f) { const l = this._ls[t] || [], i = l.indexOf(f); if (i >= 0) l.splice(i, 1); }
@@ -77,19 +97,27 @@ function makeDom() {
     blur() { if (doc.activeElement === this) doc.activeElement = null; }
     matches(sel) {
       if (sel === ":focus-visible") return doc.activeElement === this && doc.modality === "keyboard";
-      return sel.split(",").some((s) => hit(this, parse(s)));
+      return sel.split(",").some((s) => hit(this, parseQ(s)));
     }
-    querySelector(sel) { const p = parse(sel); for (const e of walk(this)) if (hit(e, p)) return e; return null; }
-    querySelectorAll(sel) { const p = parse(sel), o = []; for (const e of walk(this)) if (hit(e, p)) o.push(e); return o; }
+    querySelector(sel) {
+      const p = parseQ(sel); for (const e of walk(this)) if (hit(e, p)) return e;
+      if (!opts.auto || !p) return null;
+      const c = new El(p.tag || "div"); if (p.cls.length) c.className = p.cls.join(" "); if (p.id) c.id = p.id;   /* (auto: the page's own child, made on use) */
+      return this.appendChild(c);
+    }
+    querySelectorAll(sel) { const p = parseQ(sel), o = []; for (const e of walk(this)) if (hit(e, p)) o.push(e); return o; }
     closest(sel) { for (let n = this; n; n = n.parentNode) if (n.matches && n.matches(sel)) return n; return null; }
     contains(n) { for (; n; n = n.parentNode) if (n === this) return true; return false; }
     getBoundingClientRect() { return { left: 0, top: 0, right: 0, bottom: 0, width: 0, height: 0 }; }
-    getContext() { return null; }
+    getContext() { return opts.auto ? any() : null; }
     click(detail) { this.dispatchEvent(new Ev("click", { bubbles: true, detail: detail === undefined ? 0 : detail })); }
   }
   const body = new El("body"), win = { _ls: {} };
-  Object.assign(doc, { body, documentElement: body, createElement: (t) => new El(t), getElementById: (id) => byId.get(id) || null,
-                       addEventListener: (t, f) => { (doc._ls[t] = doc._ls[t] || []).push(f); }, removeEventListener() {} });
+  const madeOnUse = (id) => { const e = new El(/^(seed|population|cpfile)$/.test(id) ? "input" : /canvas|scene3d|inetc|iportrait/.test(id) ? "canvas" : "div"); e.id = id; body.appendChild(e); return e; };
+  Object.assign(doc, { body, documentElement: body, head: new El("head"), createElement: (t) => new El(t), createTextNode: (t) => { const e = new El("#text"); e._text = String(t); return e; },
+                       getElementById: (id) => byId.get(id) || (opts.auto ? madeOnUse(id) : null),
+                       querySelector: (s) => body.querySelector(s), querySelectorAll: (s) => body.querySelectorAll(s),
+                       addEventListener: (t, f) => { (doc._ls[t] = doc._ls[t] || []).push(f); }, removeEventListener() {}, hidden: false, fonts: { ready: Promise.resolve() } });
   win.addEventListener = (t, f) => { (win._ls[t] = win._ls[t] || []).push(f); };
   win.removeEventListener = () => {};
   /* the keyboard: a key where the focus is (else the body), bubbling to the window; a pointer: a press on the element */
@@ -313,6 +341,78 @@ for (const kind of ["classic", "ocean"]) {
   ok(sel() === 3 && D.doc.activeElement === null && roving(), "a pointer's press: selected, the focus let go");
   api.close();
   ok(D.errors.length === 0, "no listener threw (the charts of every tab visited drew)", D.errors.slice(0, 2));
+}
+
+/* ---------------- Classic's setup sheet as web/renderer.js builds and selects it (the review of PR #89: the integration) ----------------
+ * renderer.js run whole on the auto DOM, up to its module's load (EvoLoader.load never settles here): buildSettings() and the
+ * sheet's EvoUI.tabs are top-level, so the tabs, their panels and the key router are the page's own. */
+function bootClassic(storage) {
+  const D = makeDom({ auto: true });
+  const ls = new Map(Object.entries(storage || {}));
+  const mq = (q) => ({ matches: false, media: q, addEventListener() {}, removeEventListener() {}, addListener() {}, removeListener() {} });
+  const ctx = { console, Math, JSON, Object, Array, Number, String, Boolean, Date, RegExp, Error, TypeError, RangeError, Map, Set, WeakMap, Promise, Proxy, Symbol, Reflect,
+                Float64Array, Float32Array, Int32Array, Uint8Array, Uint8ClampedArray, Uint16Array, Uint32Array, Int8Array, Int16Array, ArrayBuffer, DataView,
+                isFinite, isNaN, parseInt, parseFloat, Infinity, NaN, URL, URLSearchParams, encodeURIComponent, decodeURIComponent,
+                document: D.doc,
+                location: { search: "?guide=0&intro=0", href: "http://classic.test/web/index.html?guide=0&intro=0", pathname: "/web/index.html", origin: "http://classic.test" },
+                localStorage: { getItem: (k) => (ls.has(k) ? ls.get(k) : null), setItem: (k, v) => ls.set(k, String(v)), removeItem: (k) => ls.delete(k) },
+                matchMedia: mq, Image: function () { this.complete = false; }, requestAnimationFrame: () => 0, cancelAnimationFrame() {},
+                setTimeout: () => 0, clearTimeout() {}, setInterval: () => 0, clearInterval() {}, performance: { now: () => 0 },
+                navigator: { hardwareConcurrency: 4, userAgent: "node", maxTouchPoints: 0 }, devicePixelRatio: 1, innerWidth: 1440, innerHeight: 900,
+                crossOriginIsolated: false, Blob: function () {}, Event: D.Ev, CustomEvent: D.Ev,
+                EVO_ASSETS: { st: "evo_boids.js", stWasm: "evo_boids.wasm", mt: "evo_boids_mt.js", mtWasm: "evo_boids_mt.wasm", worker: "worker.js", background: "rocks.jpg", three: "three.js" },
+                EvoLoader: { load: () => new Promise(() => {}) } };
+  ctx.addEventListener = D.win.addEventListener; ctx.removeEventListener = D.win.removeEventListener; ctx.dispatchEvent = () => true;
+  ctx.window = ctx; ctx.self = ctx; ctx.globalThis = ctx;
+  let threw = null;
+  try { load(["ui_common.js", "renderer.js"], ctx); } catch (e) { threw = e; }
+  return { D, ctx, ls, threw, el: (id) => D.doc.getElementById(id) };
+}
+section("Classic's setup sheet through web/renderer.js: built, the keyboard's keys, a pointer's press, the stored tab");
+{
+  const P = bootClassic();
+  ok(!P.threw, "renderer.js runs on the small DOM up to its module's load", P.threw && String(P.threw.stack || P.threw).split("\n").slice(0, 4));
+  if (!P.threw) {
+    const tabs = () => P.el("tabs").children.filter((b) => b.getAttribute("role") === "tab");
+    const sel = () => tabs().findIndex((b) => b.getAttribute("aria-selected") === "true");
+    const roving = () => tabs().every((b, i) => b.tabIndex === (i === sel() ? 0 : -1));
+    const shown = (b) => !P.el(b.getAttribute("aria-controls")).hidden;
+    const n = tabs().length, speed = () => P.el("speedlabel").textContent;
+    ok(n >= 5 && tabs()[0].id === "tab-run" && tabs().every((b) => b.type === "button" && /^panel-/.test(b.getAttribute("aria-controls") || "")),
+       "built: " + n + " tabs (buttons, role tab, each controlling its panel), Run first", tabs().map((b) => [b.id, b.type, b.getAttribute("aria-controls")]));
+    ok(sel() === 0 && roving() && tabs().filter(shown).length === 1 && shown(tabs()[0]),
+       "  no stored tab: Run selected, only it in the Tab order, only its panel shown", tabs().map((b) => [b.id, b.getAttribute("aria-selected"), b.tabIndex, shown(b)]));
+    P.D.tabTo(tabs()[0]);
+    const spd0 = speed();
+    let ev = P.D.key("ArrowRight");
+    ok(sel() === 1 && P.D.doc.activeElement === tabs()[1] && ev.defaultPrevented && roving() && shown(tabs()[1]) && !shown(tabs()[0]) &&
+       P.ls.get("evo_boids.tab") === tabs()[1].id.slice(4),
+       "Right: the next tab selected, focused, its panel shown, stored; the roving tabindex follows", [sel(), P.ls.get("evo_boids.tab")]);
+    P.D.key("End");
+    ok(sel() === n - 1 && P.D.doc.activeElement === tabs()[n - 1] && roving() && shown(tabs()[n - 1]), "End: the last (it had Left / Right only before)");
+    P.D.key("ArrowRight");
+    ok(sel() === 0 && P.D.doc.activeElement === tabs()[0], "Right on the last: round to Run");
+    P.D.key("ArrowLeft");
+    ok(sel() === n - 1 && P.D.doc.activeElement === tabs()[n - 1], "Left on the first: round to the last");
+    P.D.key("Home");
+    ok(sel() === 0 && roving() && shown(tabs()[0]), "Home: the first");
+    ev = P.D.key("ArrowUp");
+    ok(sel() === 0 && speed() === spd0 && !ev.defaultPrevented, "Up on a focused tab: no tab move, and not the page's speed key (" + spd0 + ")");
+    P.D.key("Enter");
+    ok(sel() === 0 && P.D.doc.activeElement === tabs()[0], "Enter on a focused tab: it stays selected and keeps the focus");
+    P.D.pointer(tabs()[2]);
+    ok(sel() === 2 && P.D.doc.activeElement === null && roving() && shown(tabs()[2]), "a pointer's press: selected, its panel shown, the focus let go (it kept it before)");
+    P.D.key("ArrowUp");
+    ok(speed() !== spd0, "  then ArrowUp: the page's speed key, as the focus is nobody's (" + spd0 + " -> " + speed() + ")");
+    ok(P.D.errors.length === 0, "no listener threw", P.D.errors.slice(0, 2));
+  }
+  const Q = bootClassic({ "evo_boids.tab": "food" });
+  if (!Q.threw) {
+    const tabs = Q.el("tabs").children.filter((b) => b.getAttribute("role") === "tab");
+    ok(tabs.filter((b) => b.getAttribute("aria-selected") === "true").map((b) => b.id).join() === "tab-food" &&
+       tabs.every((b) => b.tabIndex === (b.id === "tab-food" ? 0 : -1)) && !Q.el("panel-food").hidden && Q.el("panel-run").hidden,
+       "the stored tab (food): selected at load, the only one in the Tab order, its panel shown");
+  }
 }
 
 section("both pages load ui_common.js and its stylesheet before the scripts that use it");
