@@ -112,6 +112,13 @@
                maxAge: 1, reproEnergy: 1, newbornEnergy: 1, mutationMultiplier: 1,
                minSpeed: 1, maxSpeed: 1,
                predatorMinPopulation: 1, predatorMaxPopulation: 1, predatorTraitMutation: 1 };
+  /* The keys the engine reads as whole numbers (src/core/checkpoint_io.hpp readConfig: intOr, an (int) cast), so a
+   * fractional value would run truncated: 0.5 fish as a reseed floor of 0. A live edit refuses one (applyLive); what a
+   * start or a file took is read as the engine reads it (runFloor). */
+  var INT_KEYS = { reproWindow: 1, reproMinCluster: 1, minPopulation: 1, maxPopulation: 1, targetFood: 1, maxNeighbors: 1,
+                   genomeMinLength: 1, genomeMaxLength: 1, genomeInitMin: 1, genomeInitMax: 1, currentMode: 1, currentEddies: 1,
+                   foodPatches: 1, predatorCount: 1, predatorMinPopulation: 1, predatorMaxPopulation: 1, sensorSet: 1,
+                   neuronsPerPredator: 1, neuronsPerCreature: 1 };
 
   /* The settings: tabs, then groups of keys ("b:" = a basic setting). */
   var SETTINGS_TABS = [
@@ -445,6 +452,12 @@
     if (!Module || turboState !== "live") return;
     var v = parseFloat(input.value);
     if (!Number.isFinite(v)) v = def;
+    if (INT_KEYS[key] && !Number.isInteger(v)) {   /* (the engine would run it truncated: refused, the field back to what runs) */
+      var back = key === "maxPopulation" ? userCap : (key in runCfg ? runCfg[key] : def);
+      input.value = String(back);
+      showError((LABELS[key] || key) + " must be a whole number (the running world keeps " + back + ").");
+      return;
+    }
     /* (the run's history changes only with a value: a stepper clamped at its bound still fires change) */
     if (key === "maxPopulation") {
       var cap = Math.max(0, Math.round(v));
@@ -1222,10 +1235,10 @@
     return not;
   }
   /* the reseed floor the running world took: runCfg's (a start's non-default keys, a loaded world's config,
-   * an applied live edit), else the default */
+   * an applied live edit), else the default; as the engine reads it, a whole number (an (int) cast: 0.5 runs as 0) */
   function runFloor() {
     var v = runCfg ? runCfg.minPopulation : undefined;
-    if (typeof v === "number" && Number.isFinite(v)) return v;
+    if (typeof v === "number" && Number.isFinite(v)) return Math.trunc(v);
     for (var i = 0; i < ADV.length; i++) if (ADV[i][0] === "minPopulation") return ADV[i][1];
     return 50;
   }

@@ -4,7 +4,7 @@
 // a refused Restart and a stepper clamped at its bound, and the reseed floor's tip for a loaded world and for an edit
 // Turbo did not take. A local check: it needs a browser and a served tree, so it is not a CI step.
 //   python3 wasm/serve.py . 8191            (from the repository root: COOP/COEP, the root's ../img for Classic)
-//   node tests/classic_replay_claims_browser.mjs [--base http://localhost:8191] [--only totals,stepper,refusals,floor,turbo]
+//   node tests/classic_replay_claims_browser.mjs [--base http://localhost:8191] [--only totals,stepper,refusals,floor,fractional,turbo]
 import { createRequire } from "node:module";
 import fs from "node:fs";
 const require = createRequire(import.meta.url);
@@ -193,6 +193,46 @@ const CASES = {
         errsOk(p, "floor (load)");
       } finally { await ctx.close(); }
     }
+  },
+  /* review of #88, round 2: the floor is a whole number to the engine (an (int) cast): a fractional live edit is refused,
+   * and one that reaches a start (typed during Turbo, which takes no edit, then Restart) is said as the engine runs it */
+  async fractional() {
+    section("A fractional reseed floor: refused live; a start takes it as the engine reads it (0.5 runs as 0)");
+    const ctx = await launch();
+    try {
+      const p = await open(ctx, "&threads=0");
+      await drawer(p, "world");
+      const tries = [];
+      for (const typed of ["0.5", "49.9"]) {
+        await p.evaluate(() => { document.getElementById("err").textContent = ""; });
+        await setField(p, "adv_minPopulation", typed);
+        await p.waitForTimeout(200);
+        tries.push({ typed, said: await say(p), field: await p.inputValue("#adv_minPopulation"), tip: floorSaid(await tipOf(p, "f_population")), claim: await claim(p) });
+      }
+      ok(tries.every((t) => /whole number/.test(t.said) && t.field === "50" && t.tip.run === 50 && t.tip.form === null && t.claim === "yes"),
+         "typed live: " + tries.map((t) => t.typed + " refused (\"" + t.said.slice(0, 45) + "…\"), the field back to " + t.field + ", the tip " +
+         JSON.stringify(t.tip) + ", " + t.claim).join("; "));
+      await closeDrawer(p);
+      await p.click("#turbobtn");
+      await p.waitForFunction(() => !document.getElementById("turboexit").disabled, null, { timeout: 60000, polling: 100 });
+      await drawer(p, "world");
+      await setField(p, "adv_minPopulation", "0.5");   /* (Turbo takes no live edit: it stays in the form) */
+      await closeDrawer(p);
+      await p.click("#turboexit");
+      await p.waitForFunction(() => document.getElementById("turbobtn").getAttribute("aria-pressed") === "false" &&
+                                    !document.getElementById("turbobtn").disabled, null, { timeout: 60000, polling: 100 });
+      await drawer(p, "world");
+      await p.click("#restart");
+      await p.waitForTimeout(300);
+      const tip = floorSaid(await tipOf(p, "f_population")), field = await p.inputValue("#adv_minPopulation");
+      await drawer(p, "run");
+      const [dl] = await Promise.all([p.waitForEvent("download"), p.click("#savecp")]);
+      const engine = (JSON.parse(fs.readFileSync(await dl.path(), "utf8")).config || {}).minPopulation;
+      ok(field === "0.5" && engine === 0 && tip.run === 0 && tip.form === null,
+         "0.5 typed during Turbo, then Restart: the engine runs floor " + engine + " (its saved world); the tip says " + JSON.stringify(tip) +
+         " (the form's " + field + " is what runs, as a whole number), not 0.5");
+      errsOk(p, "fractional");
+    } finally { await ctx.close(); }
   },
   /* review of #88, P2-3: Classic's Turbo takes no live edit, so the form's value is not the run's */
   async turbo() {
