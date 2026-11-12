@@ -333,6 +333,14 @@ const SCENE_STUB = `window.EvoOceanScene = { load: function () { return Promise.
     return function () { return fixed[k]; };
   } });
 } };`;
+/* the same scene with a detail level that changes, as ocean_scene.js's setQuality / degrade (1..3; true when it changed) */
+const SCENE_DETAIL = (() => {
+    const marker = '    if (k === "setFlashlight")';
+    onceIn(SCENE_STUB, marker, 'SCENE_STUB');
+    return SCENE_STUB.replace(marker,
+        '    if (k === "setQuality") return function (q) { q = Math.max(1, Math.min(3, q | 0)); if (q === fixed.quality) return false; fixed.quality = q; return true; };\n' +
+        '    if (k === "degrade") return function () { if (fixed.quality <= 1) return false; fixed.quality--; return true; };\n' + marker);
+})();
 /* a browser whose WebGL2 context can't be made: ocean_scene.js's create() returns null */
 const SCENE_NOGL = `window.EvoOceanScene = { load: function () { return Promise.resolve(); }, create: function () { return null; } };`;
 const CHARTS_STUB = `(function () {
@@ -518,7 +526,7 @@ const unref = (t) => { if (t && t.unref) t.unref(); return t; };
 
 /* A page at ocean.html?query, started (or refused: page.failed). opts: perf
  * (web/ocean_perf.js loaded, as ocean.html loads it), guide (web/guide.js
- * after ocean.js, as ocean.html), nogl (no WebGL2: the scene can't be made),
+ * after ocean.js, as ocean.html), nogl (no WebGL2: the scene can't be made), scene (the scene stub's source),
  * nosimd (WebAssembly without SIMD), media {query: true} (matchMedia; every
  * other query false; page.setMedia changes one and tells its listeners). */
 /* every page booted (the runner stops their Turbo workers when their section ends: in node a worker shares the
@@ -673,7 +681,7 @@ async function bootPage(query, opts) {
     const run = (name, src) => vm.runInContext(src !== undefined ? src : fs.readFileSync(path.join(WEB, name), 'utf8'), ctx, { filename: path.join(WEB, name) });
     run('ocean_handoff.js');
     if (opts.perf) run('ocean_perf.js');
-    run('ocean_scene_stub.js', opts.nogl ? SCENE_NOGL : SCENE_STUB); run('ocean_config.js');
+    run('ocean_scene_stub.js', opts.nogl ? SCENE_NOGL : opts.scene || SCENE_STUB); run('ocean_config.js');
     run('charts_stub.js', CHARTS_STUB); run('ocean_dash.js'); run('ocean.js', PAGE_SRC);
     if (opts.guide) run('guide.js');
     page.ctx = ctx; page.doc = doc; page.Ev = Ev; page.T = ctx.__oceanPage; page.KEYS = ctx.EvoOceanConfig.KEYS;
@@ -2926,6 +2934,51 @@ async function pageDraft() {
            'the next world\'s own settings dim');
         ok(p.uncaught.length === 0, 'no exception escaped the page\'s handlers' + (p.uncaught.length ? ' (' + p.uncaught[0] + ')' : ''));
     }
+    {   /* the water's rules: food drifts with waves alone (the engine carries it in any flow: flowE1, wallFlowOn); the eddy
+         * count needs eddies; the eddy radius also sets the walled current's fade at the glass, in the gyre too (wallBc) */
+        const p = await bootPage(PAGE_Q7);   /* no current, no waves, wrapping sides */
+        const inert = (k) => p.el('f_' + k).classList.contains('inert');
+        const st = () => ['foodDrift', 'currentMode', 'deepCurrent', 'currentEddies', 'currentCore'].filter(inert).join(' ') || 'none';
+        const still = st();
+        p.edit('waveSpeed', 6);   /* live: the running world's waves and the next one's */
+        const waves = st();
+        p.edit('waveSpeed', 0);
+        const calm = st();
+        p.edit('currentStrength', 5);
+        const eddies = st();
+        p.edit('currentMode', 1);
+        const gyreWrap = st();
+        p.edit('walls', true);
+        const gyreWalls = st();
+        p.edit('currentMode', 0);
+        const eddiesWalls = st();
+        ok(still === 'foodDrift currentMode deepCurrent currentEddies currentCore' && waves === 'currentMode deepCurrent currentEddies currentCore' &&
+           calm === still && eddies === 'none' && gyreWrap === 'currentEddies currentCore' && gyreWalls === 'currentEddies' && eddiesWalls === 'none',
+           'the water\'s settings dim by what moves the water: still (' + still + '), waves only: food drift usable (' + waves + '), calm again (' + calm +
+           '); a current in eddies (' + eddies + '); a gyre with wrapping sides: no eddies, no radius (' + gyreWrap + '); a gyre in glass walls: ' +
+           'the radius sets the fade at the glass (' + gyreWalls + '); eddies in walls (' + eddiesWalls + ')');
+        ok(p.uncaught.length === 0, 'no exception escaped the page\'s handlers' + (p.uncaught.length ? ' (' + p.uncaught[0] + ')' : ''));
+    }
+}
+
+/* The Setup modeline says the detail the tank is drawn at, after every change of it: Hold 60 fps lowering it (one frame a
+ * second: slow frames at one step), then switched off (restoreDetail: the full detail again) */
+async function pageModelineDetail() {
+    section('The Setup modeline follows the tank\'s drawing detail: Hold 60 fps lowers it, switching it off restores it');
+    const p = await bootPage(PAGE_Q7, { scene: SCENE_DETAIL });
+    const sc = p.ctx.EvoOcean.scene;
+    const said = () => { const m = /detail (\d) of 3/.exec(p.el('modeline').textContent); return m ? +m[1] : null; };
+    const d0 = said(), q0 = sc.quality();
+    let now = performance.now();
+    for (let i = 0; i < 12 && sc.quality() === q0; i++) { now += 1000; p.raf(now); }
+    const q1 = sc.quality(), d1 = said();
+    const g = p.el('governor');
+    g.checked = false; g.dispatchEvent(new p.Ev('change', { bubbles: true }));
+    const q2 = sc.quality(), d2 = said();
+    ok(q0 === 3 && d0 === 3 && q1 === 2 && d1 === 2 && q2 === 3 && d2 === 3,
+       'the modeline\'s detail follows the scene\'s: ' + d0 + ' of 3 at ' + q0 + ', ' + d1 + ' after Hold 60 fps lowered it to ' + q1 + ', ' + d2 +
+       ' once it is off (' + q2 + ')');
+    ok(p.uncaught.length === 0, 'no exception escaped the page\'s handlers' + (p.uncaught.length ? ' (' + p.uncaught[0] + ')' : ''));
 }
 
 /* UI-3: Start from. Every scenario (and Surprise me's draws) starts in
@@ -5083,7 +5136,7 @@ const SECTIONS = {
     pageWallsOverride, pageFreshVisit, pageSizeFields, pageRoundTrip,
     pageColourBench, pageLayers, pageResize, pageKeys, pageStartupFailures, pageTourEscape, pageWholeFields,
     pageTurboFraction, pageCardNumbers, pageMixedRecovery, pageEscOwner, pageTabKeys, pageIntegralFloats,
-    pageTurboMode, pageStartDoor, pageFollowBack, pageDraft, pageScenarios,
+    pageTurboMode, pageStartDoor, pageFollowBack, pageDraft, pageModelineDetail, pageScenarios,
     pageCancelQueued, pageQueuedFile, pageNextBehindLive, pageEditedFile, pageReplayStaleRead, pageAskTarget, pagePendingAsk,
     pageKeyboardAsk,
     worldCodec, pageWorldFile, pageWorldTurbo, pageWorldRefusals,

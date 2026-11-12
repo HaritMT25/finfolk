@@ -883,6 +883,7 @@
       setVal(key, v); updateNeeds(); updateTabDots();
     }
     renderStartBar();
+    engineCall(updateModeline);   /* (its live tweaks) */
     if (!quiet) showNote((LABELS[key] || key) + " is now " + shown(v) + " (live)");
   }
   /* a refused live value: the field goes back to the newest edit of it still
@@ -980,6 +981,11 @@
    * pressed: two presses in one place. Surprise me draws again with Reroll.
    * Picking one over edits that wait asks first (Replace / Keep editing). */
   var CARD_IDS = { standard: "advreset", bigtank: "bigbtn", e1: "e1btn", hunters: "huntersbtn", currents: "currentsbtn", surprise: "randombig", file: "loadcp" };
+  /* each card's line is its recipe's (SCENARIOS: Big tank's is written from BIG_TANK) */
+  CFG.SCENARIOS.forEach(function (sc) {
+    var card = el(CARD_IDS[sc.id]), line = card && card.querySelector("span");
+    if (line) line.textContent = sc.blurb;
+  });
   function newSeed() { return (Math.random() * 0x100000000) >>> 0; }
   /* the seed the sheet shows (a scenario keeps it; Surprise me draws its own) */
   function shownSeed() { var s = formNum("seed"); return wholeIn(s, [0, 4294967295]) ? s : initArgs ? initArgs.seed : KEYS.seed[0]; }
@@ -1067,8 +1073,15 @@
     [["toroidal"], function () { return nv("walls") ? "off with glass walls: a walled tank has no seam to sense across" : ""; }],
     [["foodPatchRadius", "foodDepthMode"], function () { return nv("foodPatches") > 0 ? "" : "needs food patches above 0"; }],
     [["foodDepthSpread"], function () { return nv("foodPatches") > 0 && nv("foodDepthMode") === 1 ? "" : "needs food patches, each at its own depth"; }],
-    [["foodDrift", "currentMode", "currentDrift", "deepCurrent"], function () { return hasCurrent() ? "" : "needs a current (strength above 0)"; }],
-    [["currentEddies", "currentCore"], function () { return hasCurrent() && nv("currentMode") === 0 ? "" : "needs a current in the eddies shape"; }],
+    /* food rides the whole flow: the current and the waves (src/ocean/ocean_world.hpp: flowE1, wallFlowOn) */
+    [["foodDrift"], function () { return hasCurrent() || nv("waveSpeed") > 0 ? "" : "needs a current or waves to carry it"; }],
+    [["currentMode", "currentDrift", "deepCurrent"], function () { return hasCurrent() ? "" : "needs a current (strength above 0)"; }],
+    [["currentEddies"], function () { return hasCurrent() && nv("currentMode") === 0 ? "" : "needs a current in the eddies shape"; }],
+    /* the eddies' radius, and with glass walls the current's fade at the glass in either shape (initFlowCache: wallBc) */
+    [["currentCore"], function () {
+      if (!hasCurrent()) return "needs a current (strength above 0)";
+      return nv("currentMode") === 0 || nv("walls") ? "" : "needs the eddies shape, or glass walls (where it sets the current's fade at the glass)";
+    }],
     [["predatorEconomy", "predatorSpeed", "predatorPerception", "predatorCaptureRadius", "predatorCooldown"],
       function () { return hasPredators() ? "" : "needs predators above 0"; }],
     [["predatorMeal", "predatorMetabolism", "predatorReproEnergy", "predatorMaxAge", "predatorMinPopulation",
@@ -3174,7 +3187,7 @@
       }
     } else slowSince = 0;
   }
-  function restoreDetail() { if (scene && detail0) scene.setQuality(detail0); }
+  function restoreDetail() { if (scene && detail0 && scene.setQuality(detail0)) engineCall(updateModeline); }
 
   /* ---------------- the loop ---------------- */
   var splashDone = false;
@@ -3233,7 +3246,10 @@
     s = updateCard(s);
     pt = PROF.lap(SP.card, pt);
     fpsFrames++;
-    if (now - fpsT >= 1000) { fps = Math.round(fpsFrames * 1000 / (now - fpsT)); fpsFrames = 0; fpsT = now; dirtyHud = true; govern(now); }
+    if (now - fpsT >= 1000) {
+      fps = Math.round(fpsFrames * 1000 / (now - fpsT)); fpsFrames = 0; fpsT = now; dirtyHud = true; govern(now);
+      if (scene.quality() !== modelineDetail) updateModeline();   /* (the detail changed: Hold 60 fps, or a benchmark's case) */
+    }
     updateHud(s, now);
     PROF.lap(SP.hud, pt);
     if (!splashDone) { splashDone = true; el("splash").classList.add("done"); }
@@ -3738,6 +3754,12 @@
     applyClarity();
   });
   el("clarity").addEventListener("pointerup", function () { this.blur(); });   /* the keys go back to the tank; arrow keys keep it */
+  /* the tank draws family colours: Family, or Appearance where the world has no appearance genes (updateModeline's rule) */
+  function tankShowsFamily() {
+    if (colourMode !== "appearance") return colourMode === "family";
+    return !engineCall(function () { return HAS_APP ? (has("oc_appearance_flags") ? M._oc_appearance_flags() : 3) : 0; }, 3);
+  }
+  var modelineDetail = 0;   /* the detail level the modeline says */
   function updateModeline() {
     /* the world's appearance genes (bit 1 patterns, bit 2 shapes; 0 = off, or a module without them) */
     var flags = HAS_APP ? (has("oc_appearance_flags") ? M._oc_appearance_flags() : 3) : 0;
@@ -3745,8 +3767,14 @@
       ? (flags ? ", each fish drawn from its appearance genes (skin pattern and body shape)"
                : ", coloured by family (" + (HAS_APP ? "the appearance genes are off in this world" : "this module has no appearance genes") + ")")
       : (flags & 2 ? ", each fish in its inherited body shape" : "") + (colourBrain ? ", coloured by brain" : ", coloured by family");
-    el("modeline").textContent = "Running the single-threaded Ocean module, reproducible from the seed" +
-      (HAS_EYE ? " (the eye build)" : "") + ". The tank: " + W + " × " + H + " × " + D +
+    /* what replays: the module is serial and Hold 60 fps never changes the run; a live tweak is not part of the setup */
+    var tw = liveTweaks().length;
+    modelineDetail = scene ? scene.quality() : 0;
+    el("modeline").textContent = "Running the single-threaded Ocean module" + (HAS_EYE ? " (the eye build)" : "") +
+      ": the same seed and setup replay a run step for step" +
+      (tw ? "; this run has " + (tw === 1 ? "a live tweak" : tw + " live tweaks") + ", not part of its setup, so Replay starts it again without " +
+            (tw === 1 ? "it" : "them") : "") +
+      ". The tank: " + W + " × " + H + " × " + D +
       (WALLS ? ", glass walls" : ", the sides wrap around") +
       ". Drawing: the 3D tank" + (scene ? ", detail " + scene.quality() + " of 3" : "") +
       what + ".";
@@ -4031,6 +4059,10 @@
       depth: function () { return D; },
       /* (the charts' timer: never into a stopped or restarting engine; a trap here stops it once) */
       familyColor: function (id) { return engineCall(function () { return has("oc_family_color") ? M._oc_family_color(id) : 0x3b5957; }, 0x3b5957); },
+      /* what the tank's fish wear now: "family" (Family, or Appearance in a world without appearance genes), "appearance" or
+       * "brain"; and the charts' way to show their family colours in the tank */
+      colourMode: function () { return tankShowsFamily() ? "family" : colourMode; },
+      showFamilyColours: function () { setColourMode("family"); },
       wiring: function () { return turboState !== "live" ? wiringNow() : engineCall(wiringNow, null); },
       setDrawer: setDrawer,
       /* the charts cover the page: no popover left open under them, and the coach mark goes */
