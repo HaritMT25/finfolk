@@ -11,12 +11,14 @@
 // stale, so a lock another contender created in between is left alone; the exclusive create after it decides who wins. The jobs
 // that are PowerShell scripts check then create without exclusion (theirs to fix); this keeps this tool's side race-free.
 //
-// The mutex itself is never reclaimed. Its critical section is a few synchronous calls, so a mutex older than 30 s means a process
-// died inside it; clearing it by age would be the same look-then-delete race one level down (A and B both see it old, A clears it
-// and takes its own, B's delete removes A's, both reclaim and both run: the re-review of PR #85). Such a mutex FAILS CLOSED:
-// acquire throws an error (code ELOCKMUTEX) naming the file, which a person deletes once no browser job is running. Likewise a
-// create refused with EACCES/EPERM while no lock file is there, for longer than a minute, is a permission problem, not
-// contention: acquire throws (code ELOCKDENIED) instead of waiting forever.
+// The mutex itself is never reclaimed, and only its creator deletes it. Its critical section is a few synchronous calls, so a mutex
+// older than 30 s is POSSIBLY ABANDONED (its process died inside it, or is still alive but was descheduled that long: age cannot tell);
+// clearing it by age would be the same look-then-delete race one level down (A and B both see it old, A clears it and takes its own,
+// B's delete removes A's, both reclaim and both run: the re-review of PR #85). Such a mutex FAILS CLOSED: acquire throws an error
+// (code ELOCKMUTEX) naming the file, which a person deletes once no browser job is running. Every deletion of the lock file happens
+// under the mutex (a release that cannot get it leaves the lock to go stale: see releaser). A create refused with EACCES/EPERM while
+// no lock file is there, for longer than a minute (a persistent create denial: permissions, or a delete held pending by an open
+// handle), throws ELOCKDENIED instead of waiting forever.
 import fs from "node:fs";
 import crypto from "node:crypto";
 
@@ -40,9 +42,9 @@ export function createLock(o = {}) {
   function ageOf(p) {
     try { return Date.now() - F.statSync(p).mtimeMs; } catch (e) { if (e && e.code === "ENOENT") return null; throw e; }
   }
-  /** fn() with the reclaim mutex held: the mutex is created exclusively; busy for longer than MUTEX_WAIT: fn is not run; one left by a
-   * process that died inside it (older than MUTEX_STALE: its critical section is a few synchronous calls) is NOT cleared (see the
-   * header): it throws ELOCKMUTEX and nothing is deleted */
+  /** fn() with the reclaim mutex held: the mutex is created exclusively; busy for longer than MUTEX_WAIT: fn is not run; one older than
+   * MUTEX_STALE (possibly abandoned: its critical section is a few synchronous calls) is NOT cleared (see the header): it throws
+   * ELOCKMUTEX and nothing is deleted */
   function withMutex(fn) {
     const until = Date.now() + MUTEX_WAIT;
     for (;;) {
@@ -51,9 +53,9 @@ export function createLock(o = {}) {
         if (!e || !CONTENDED.has(e.code)) throw e;
         const a = ageOf(MUTEX);
         if (a !== null && a > MUTEX_STALE)
-          throw fail("ELOCKMUTEX", "browser lock: the reclaim mutex " + MUTEX + " is " + Math.round(a / 1000) + " s old: a process died while " +
-                     "reclaiming or releasing the lock. It is not cleared automatically (two contenders clearing it could both run a browser); " +
-                     "delete it by hand once no browser job is running.");
+          throw fail("ELOCKMUTEX", "browser lock: the reclaim mutex " + MUTEX + " is " + Math.round(a / 1000) + " s old: possibly abandoned " +
+                     "by a process that died (or stalled) while reclaiming or releasing the lock. It is not cleared automatically (two contenders " +
+                     "clearing it could both run a browser); delete it by hand once no browser job is running.");
         if (Date.now() >= until) return { ran: false };
         sleepSync(5);
       }
@@ -80,15 +82,19 @@ export function createLock(o = {}) {
     }
     return { held: false, age, code };
   }
-  /** the lock is deleted only if its content is still this holder's (and with the mutex, so a reclaimer cannot be deleting it at that
-   * moment); a refresh touches it only while it is this holder's */
+  /** the lock is deleted only if its content is still this holder's, and ONLY with the mutex held: every deletion of the lock (this and
+   * reclaimStale) is a check-then-delete, and only the mutex keeps the file from changing hands between the two. Without the mutex
+   * (busy past MUTEX_WAIT, or ELOCKMUTEX), the lock is LEFT: it goes stale in 40 minutes and is reclaimed then (or, with an abandoned
+   * mutex, removed by hand). Deleting it anyway let a reclaimer paused under an old mutex delete the next holder's fresh lock (the
+   * second re-review of PR #85). A refresh touches the lock only while it is this holder's. */
   function releaser(text) {
     let done = false;
     return function release() {
       if (done) return; done = true;
       const mine = () => { try { if (F.readFileSync(LOCK, "utf8") === text) F.rmSync(LOCK, { force: true }); } catch (e) { /* gone already */ } };
-      let r; try { r = withMutex(mine); } catch (e) { r = { ran: false }; }
-      if (!r.ran) mine();   /* (the mutex is busy or unusable and the process is going: the plain check) */
+      let r, why = "the reclaim mutex stayed busy";
+      try { r = withMutex(mine); } catch (e) { r = { ran: false }; why = e && e.code === "ELOCKMUTEX" ? "the reclaim mutex is old (possibly abandoned)" : String(e && e.message || e); }
+      if (!r.ran) { try { console.error("browser lock: not released (" + why + "); " + LOCK + " is left to go stale in 40 minutes or to be removed by hand"); } catch (e) { /* no stderr */ } }
     };
   }
 
@@ -97,13 +103,13 @@ export function createLock(o = {}) {
     for (;;) {
       r = tryAcquire(name);
       if (r.held) break;
-      /* refused with no lock file there (EACCES/EPERM): a Windows pending delete clears in moments; for longer than DENIED it is a
-         permission problem, which waiting would never end */
+      /* refused with no lock file there (EACCES/EPERM): usually a Windows pending delete, which ends when the last handle closes; a
+         denial that persists longer than DENIED (permissions, or a handle held open) is reported rather than waited on forever */
       if (r.age === null && (r.code === "EACCES" || r.code === "EPERM")) {
         if (!deniedSince) deniedSince = Date.now();
         else if (Date.now() - deniedSince > DENIED)
           throw fail("ELOCKDENIED", "browser lock: creating " + LOCK + " has been refused (" + r.code + ") for " + Math.round((Date.now() - deniedSince) / 1000) +
-                     " s with no lock file there: a permission problem, not another job holding it.");
+                     " s with no lock file there: a persistent create denial (permissions, or a delete held pending by an open handle), not another job holding it.");
       } else deniedSince = 0;
       if (Date.now() - said > 60000) { said = Date.now(); log("waiting for the browser lock (" + (r.age === null ? "?" : Math.round(r.age / 1000) + " s old") + ")"); }
       await new Promise((res) => setTimeout(res, POLL));

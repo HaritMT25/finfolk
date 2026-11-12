@@ -288,9 +288,11 @@ The first review found three P2s and a P3, each fixed with a regression that goe
    `tests/ocean_render_perf_lock_tests.mjs` runs the interleavings deterministically and eight real processes at the same instant, from nothing and
    from a stale lock; the old `lock.mjs` fails it (its processes overlapped in every round). The delta re-review found the same race one level
    down: a reclaim mutex left by a process that died inside it was cleared by age, so two contenders could both clear it and both reclaim. The mutex
-   is now never cleared automatically: an abandoned one fails closed (`ELOCKMUTEX`, naming the file for a person to delete), tested with the
-   re-review's two-contender interleaving and eight real processes. A create refused with EACCES/EPERM and no lock file for over a minute fails
-   (`ELOCKDENIED`) instead of waiting forever.
+   is now never cleared automatically: one older than 30 s (possibly abandoned) fails closed (`ELOCKMUTEX`, naming the file for a person to delete),
+   tested with the re-review's two-contender case and eight real processes. The second re-review found a release that could not get the mutex still
+   deleted its lock without it, so a reclaimer paused under an old mutex could then delete the next holder's fresh lock; now every deletion of the lock
+   is under the mutex, and a release without it leaves the lock to go stale (tested with that exact sequence: the previous code lets B in). A create
+   refused with EACCES/EPERM and no lock file for over a minute (a persistent create denial) fails (`ELOCKDENIED`) instead of waiting forever.
 4. **Measurement records kept the live buffers** (426 MB for a 2,000-fish cell). `lean.mjs` keeps the policy, the counters and the draws' counts;
    the mock-three test checks it on the real scene, and that `cycle.mjs` records nothing else.
 
@@ -318,7 +320,9 @@ node tests/ocean_render_perf_lock_tests.mjs                # the browser lock's 
 
 Every browser job takes the machine-wide lock (`tools/ocean_render_perf/lock.mjs`), one headless browser at a time: the lock file is created
 exclusively and a contender waits while it exists and is younger than 40 minutes (the convention the other jobs use); a staler one is reclaimed under
-a mutex file that re-checks its age, so no contender can delete a lock another has just taken. A mutex left by a crash inside that step is never cleared
-by age (that would race again): the job stops with `ELOCKMUTEX` and the file's path, to be deleted by hand once no browser job runs. A measurement record keeps the policy, the counters and each
+a mutex file that re-checks its age. Every deletion of the lock (a reclaim, a release) is a check-then-delete under that mutex, so among these tools
+none deletes a lock another has just taken; a release that cannot get the mutex leaves its lock to go stale. (The 40-minute convention itself
+treats a holder that misses its 5-minute refreshes for 40 minutes as dead.) A mutex older than 30 s (possibly abandoned by a crash inside that step)
+is never cleared by age (that would race again): the job stops with `ELOCKMUTEX` and the file's path, to be deleted by hand once no browser job runs. A measurement record keeps the policy, the counters and each
 draw's counts (`lean.mjs`), not the live buffers: a 2,000-fish cell's `result.json` is 0.3 MB (`render_perf/a3`; the first runs of this branch stored whole
 `renderOptimization()` objects, 426 MB a cell; their tables were computed from the timing summaries, which are the same).

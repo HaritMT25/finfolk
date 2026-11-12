@@ -152,12 +152,43 @@ console.log("== the lock, deterministic interleavings");
   c.release();
 }
 {
-  /* a holder releasing while an abandoned mutex is there: its own lock is still removed (the plain content check), the mutex stays */
+  /* a holder releasing without the mutex (an old one, or a live one busy past mutexWaitMs): the lock is LEFT, never deleted unserialised */
   const f = mk(fresh()), A = createLock({ path: f });
   const a = A.tryAcquire("job A");
   fs.writeFileSync(f + ".reclaim", "pid 1\n"); setAge(f + ".reclaim", 5 * MIN);
   a.release();
-  ok(!fs.existsSync(f) && fs.existsSync(f + ".reclaim"), "a holder's release with an abandoned mutex there: its lock is removed, the mutex is left for a person");
+  ok(first(f) === "job A" && fs.existsSync(f + ".reclaim"), "a holder's release with an old mutex there: its lock is left (to go stale or be removed by hand), the mutex too");
+  const g = mk(fresh()), B = createLock({ path: g, mutexWaitMs: 50 });
+  const b = B.tryAcquire("job B");
+  fs.writeFileSync(g + ".reclaim", "pid 1\n");
+  b.release();
+  ok(first(g) === "job B", "a holder's release with a live mutex busy past mutexWaitMs: its lock is left");
+}
+{
+  /* the second re-review's interleaving: reclaimer R holds the mutex, has seen H's lock stale and is paused just before deleting it;
+     R's mutex ages past 30 s; H releases; B tries to take the lock; then R resumes. Before, H's release fell back to deleting its lock
+     without the mutex, B created a fresh lock and started, and R's resumed delete removed B's lock: R and B both ran. Now H's release
+     leaves its lock (it cannot get the mutex), so B cannot take it, and R's delete removes only H's lock. */
+  const f = mk(fresh()), M = f + ".reclaim";
+  const H = createLock({ path: f }), B = createLock({ path: f });
+  const h = H.tryAcquire("job H");
+  setAge(f, 41 * MIN);                                          /* (H missed its refreshes: the lock is stale) */
+  let b = null, eb = null, paused = false, hLeft = null;
+  const R = createLock({ path: f, fs: hooked((m, args) => {
+    if (m === "rmSync" && args[0] === f && !paused) {
+      paused = true;
+      setAge(M, 5 * MIN);                                       /* R stalls under its mutex for minutes */
+      h.release();
+      hLeft = first(f);
+      try { b = B.tryAcquire("job B"); } catch (e) { eb = e; }
+    }
+  }) });
+  const r = R.tryAcquire("job R");
+  ok(paused && hLeft === "job H", "H releases while R is paused under an old mutex before its delete: H's lock is left in place", { paused, hLeft });
+  ok(!(b && b.held), "  B does not get the lock meanwhile (" + (eb ? eb.code : "held by H") + ")", { b: b && b.held, eb: eb && eb.code });
+  ok(r.held && first(f) === "job R" && !fs.existsSync(M), "  R resumes, removes H's stale lock and takes it: one holder (R), R's mutex gone", { r: r.held, first: first(f) });
+  r.release();
+  ok(!fs.existsSync(f), "  R's release removes it");
 }
 {
   /* EACCES/EPERM with no lock file: a permission problem fails after deniedMs instead of waiting forever; a brief EPERM (a Windows
