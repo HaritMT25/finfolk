@@ -440,6 +440,15 @@
     else showError(Module.UTF8ToString(Module._evo_last_error()));
   }
   var tabsEl = el("tabs"), panelsEl = el("panels"), currentTab = "run";
+  /* the settings' tabs (web/ui_common.js tabs, as the Ocean's): Left / Right
+   * round the ends, Home / End, the focus going with the selection; a
+   * pointer's press lets the focus go, the keyboard's keeps it */
+  var sheetTabs = EvoUI.tabs(tabsEl, {
+    ids: function () { return SETTINGS_TABS.map(function (t) { return t.id; }); },
+    current: function () { return currentTab; },
+    button: function (id) { return el("tab-" + id); },
+    select: setSheetTab
+  });
   function buildSettings() {
     SETTINGS_TABS.forEach(function (tab) {
       var b = document.createElement("button");
@@ -448,7 +457,7 @@
       b.setAttribute("role", "tab");
       b.setAttribute("aria-controls", "panel-" + tab.id);
       b.textContent = tab.title;
-      b.addEventListener("click", function () { setSheetTab(tab.id); });
+      sheetTabs.bind(b, tab.id);
       tabsEl.appendChild(b);
       if (!tab.groups) return;   /* "run" is static HTML */
       var panel = document.createElement("section");
@@ -483,25 +492,12 @@
   }
   function setSheetTab(id) {
     currentTab = id;
-    SETTINGS_TABS.forEach(function (tab) {
-      var on = tab.id === id;
-      el("tab-" + tab.id).setAttribute("aria-selected", on ? "true" : "false");
-      el("tab-" + tab.id).tabIndex = on ? 0 : -1;
-      el("panel-" + tab.id).hidden = !on;
-    });
+    sheetTabs.mark(id);
+    SETTINGS_TABS.forEach(function (tab) { el("panel-" + tab.id).hidden = tab.id !== id; });
     panelsEl.scrollTop = 0;
     hideTip();
     try { localStorage.setItem("evo_boids.tab", id); } catch (e) { /* private mode */ }
   }
-  tabsEl.addEventListener("keydown", function (e) {
-    if (e.key !== "ArrowRight" && e.key !== "ArrowLeft") return;
-    var ids = SETTINGS_TABS.map(function (t) { return t.id; });
-    var i = ids.indexOf(currentTab) + (e.key === "ArrowRight" ? 1 : -1);
-    i = (i + ids.length) % ids.length;
-    setSheetTab(ids[i]);
-    el("tab-" + ids[i]).focus();
-    e.preventDefault();
-  });
   /* a dot on each tab that holds a setting changed from its default */
   function updateTabDots() {
     SETTINGS_TABS.forEach(function (tab) {

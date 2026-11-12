@@ -21,8 +21,8 @@
  * close() / isOpen(). Charts redraw at most twice a second, only while
  * open. */
 (function () {
-  var C = window.EvoCharts;
-  if (!C) return;
+  var C = window.EvoCharts, UI = window.EvoUI;
+  if (!C || !UI) return;
   var T = C.T, S = T.series, DT = 0.016, MAX_ROWS = 1200, FAM_K = 8;
   var host = null, rows = [], every = 60, version = 0;
   var isOpen = false, tab = "pop", timer = 0, lastKey = "", cards = {}, view = {};
@@ -282,33 +282,27 @@
 
   /* ---- DOM ---- */
   var tabsEl = el("dtabs"), gridEl = el("dgrid"), noteEl = el("dnote");
+  /* the tabs (web/ui_common.js tabs, as Classic's): a pointer's press lets the
+   * focus go (Space pauses again), the keyboard's keeps it; Left / Right the
+   * next one round, Home / End the first and last, the focus going with the
+   * selection (the page leaves a focused tab those keys); Tab lands on the
+   * selected one */
+  var tabIds = TABS.map(function (t) { return t.id; }), tabBtn = {};
+  var dtabs = UI.tabs(tabsEl, { ids: function () { return tabIds; }, current: function () { return tab; },
+                                button: function (id) { return tabBtn[id] || null; }, select: showTab });
   TABS.forEach(function (tb) {
     var b = document.createElement("button");
     b.type = "button";
     b.textContent = tb.name;
     b.setAttribute("role", "tab");
     b.dataset.tab = tb.id;
-    /* a pointer's press lets the focus go (Space pauses again); the keyboard's keeps it */
-    b.addEventListener("click", function () { showTab(tb.id); if (!this.matches(":focus-visible")) this.blur(); });
+    tabBtn[tb.id] = b;
+    dtabs.bind(b, tb.id);
     tabsEl.appendChild(b);
-  });
-  /* the tabs from the keyboard (the page leaves a focused tab its arrows):
-   * Left / Right the next one round, Home / End the first and last; the
-   * focus goes with the selection, and Tab lands on the selected one */
-  tabsEl.addEventListener("keydown", function (e) {
-    var ids = TABS.map(function (t) { return t.id; }), i = ids.indexOf(tab), n = ids.length;
-    var j = e.key === "ArrowRight" ? (i + 1) % n : e.key === "ArrowLeft" ? (i - 1 + n) % n : e.key === "Home" ? 0 : e.key === "End" ? n - 1 : -1;
-    if (j < 0) return;
-    showTab(ids[j]);
-    tabsEl.children[j].focus();
-    e.preventDefault();
   });
   function showTab(id) {
     tab = id;
-    Array.prototype.forEach.call(tabsEl.children, function (b) {
-      b.setAttribute("aria-selected", b.dataset.tab === id ? "true" : "false");
-      b.tabIndex = b.dataset.tab === id ? 0 : -1;
-    });
+    dtabs.mark(id);
     C.tip(null);
     gridEl.innerHTML = "";
     cards = {};
