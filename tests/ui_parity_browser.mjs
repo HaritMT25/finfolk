@@ -5,7 +5,7 @@
 // selection checks (--plan) and the comparison gate (--compare) need no browser: tests/ui_parity_harness_tests.mjs runs them in CI.
 //
 //   node tests/ui_parity_browser.mjs --base http://localhost:8123 --out DIR [--clean] [--layout source|site] [--sets S0,S2]
-//        [--cases s0_shell,...] [--worlds classic,ocean] [--name WHO] [--smoke] [--headed]
+//        [--cases s0_shell,...] [--worlds classic,ocean] [--expect check|record] [--name WHO] [--smoke] [--headed]
 //   node tests/ui_parity_browser.mjs --plan [the same selection]          what a run would take (no browser), or why it is refused
 //   node tests/ui_parity_browser.mjs --list                               the cases
 //   node tests/ui_parity_browser.mjs --compare BEFORE_DIR AFTER_DIR [--report] [--sets ..] [--cases ..] [--worlds ..]
@@ -22,6 +22,9 @@
 //          each case and world, known steps and expectations, a selector for every world a step runs on). Exit 2 otherwise.
 // --out:   must be new or empty: a run never mixes with an older one's pictures. --clean empties it first, of the harness's own
 //          files only (*.png, manifest.json, summary.json, index.md); anything else there and it refuses.
+// --expect: check (the default): a shot whose state is not its case's "expect" fails the run. record: it is kept in the
+//          manifest (the capture's "unmet") and the run goes on: main's run before a PR that brings the behaviour. --compare
+//          lists BEFORE's unmet expectations; AFTER may miss only what BEFORE missed too, the same way (else INVALID).
 // The run writes DIR/manifest.json (kept current after every case): the harness's and the fixture's sha256, the selection,
 //          every capture it was to take, and every one it took (sha256, size, case, set, world, shot, the fixture's difference
 //          policy for it); "complete" only once every run passed and every capture was taken. Exit 1 on any failed run.
@@ -108,7 +111,7 @@ const FORMAT = "ui-parity-run", FORMAT_VERSION = 1;
 
 /* ---------------- arguments: every flag known, a value where one is wanted ---------------- */
 const FLAGS = { base: 1, out: 1, layout: 1, sets: 1, cases: 1, worlds: 1, name: 1, "cases-file": 1,
-                smoke: 0, headed: 0, list: 0, plan: 0, clean: 0, report: 0, compare: 2 };
+                expect: 1, smoke: 0, headed: 0, list: 0, plan: 0, clean: 0, report: 0, compare: 2 };
 function usage(msg) { console.error("ui_parity_browser: " + msg + "\n(the header of tests/ui_parity_browser.mjs lists the flags)"); process.exit(2); }
 function parseArgs(argv) {
   const o = {};
@@ -368,6 +371,7 @@ function compareMain(o) {
     return c.kind === "case" && (!sets || sets.indexOf(c.set) >= 0) && (!ids || ids.indexOf(c.case) >= 0) && (!worlds || worlds.indexOf(c.world) >= 0);
   }).sort();
   let files = [];
+  const unmet = [];
   if (ra.m && rb.m) {
     if (ra.m.harness !== rb.m.harness) problems.push("the two runs were taken by different harness files (sha256 " + String(ra.m.harness).slice(0, 12) + " vs " + String(rb.m.harness).slice(0, 12) + "): run both with one");
     if (ra.m.fixture !== rb.m.fixture) problems.push("the two runs used different cases files (sha256 " + String(ra.m.fixture).slice(0, 12) + " vs " + String(rb.m.fixture).slice(0, 12) + "): run both with one");
@@ -376,6 +380,13 @@ function compareMain(o) {
     for (const f of fb) if (!sa.has(f)) problems.push(f + ": in AFTER, not in BEFORE");
     files = fa.filter((f) => sb.has(f));
     if (!files.length) problems.push("nothing to compare" + (sets || ids || worlds ? " in the selection" : "") + " (no case capture on both sides)");
+    /* the cases' expectations: a run with --expect record keeps the ones it did not meet (main, before a PR that brings the
+       behaviour). AFTER may miss only what BEFORE missed too, the same way (two runs of one commit); anything else is INVALID */
+    for (const f of files) {
+      const ua = ra.m.captures[f].unmet || [], ub = rb.m.captures[f].unmet || [];
+      for (const u of ub) if (ua.indexOf(u) < 0) problems.push("AFTER: " + f + " does not meet its case's expectation (" + u + ") and BEFORE did");
+      for (const u of ua) unmet.push({ file: f, side: ub.indexOf(u) >= 0 ? "both" : "before", what: u });
+    }
   }
   const rows = [];
   if (!problems.length) for (const f of files) {
@@ -393,13 +404,14 @@ function compareMain(o) {
   }
   const beyond = rows.filter((r) => r.verdict === "differs" || r.verdict === "size");
   const verdict = problems.length ? "INVALID" : report ? "REPORT" : beyond.length ? "FAIL" : "PASS";
+  for (const u of unmet) console.log("  unmet  " + u.file + " (" + (u.side === "both" ? "both runs" : "BEFORE only") + "): " + u.what);
   for (const p of problems) console.log("  INVALID " + p);
   const counts = ["same", "within", "differs", "size"].map((v) => rows.filter((r) => r.verdict === v).length);
   console.log(verdict + ": " + (problems.length ? problems.length + " problems with the evidence; nothing compared" :
               rows.length + " pictures: " + counts[0] + " identical, " + counts[1] + " within their policy, " + counts[2] + " beyond it, " + counts[3] + " of another size" +
-              (report ? " (--report: differences listed, not failed)" : "")));
+              (report ? " (--report: differences listed, not failed)" : "") + (unmet.length ? "; " + unmet.length + " expectations BEFORE did not meet" + (unmet.some((u) => u.side === "both") ? " (some neither run met)" : "") : "")));
   if (OUTD) fs.writeFileSync(path.join(OUTD, "compare.json"), JSON.stringify({ before: path.resolve(A), after: path.resolve(B), mode: report ? "report" : "check",
-    selection: { sets, cases: ids, worlds }, verdict, problems, counts: { same: counts[0], within: counts[1], differs: counts[2], size: counts[3] }, files: rows }, null, 1));
+    selection: { sets, cases: ids, worlds }, verdict, problems, unmet, expectModes: { before: ra.m && ra.m.expectMode, after: rb.m && rb.m.expectMode }, counts: { same: counts[0], within: counts[1], differs: counts[2], size: counts[3] }, files: rows }, null, 1));
   process.exit(verdict === "PASS" || verdict === "REPORT" ? 0 : 1);
 }
 
@@ -418,6 +430,8 @@ if (ARGS.list) {
 }
 const PLAN = makePlan(FIX, ARGS);
 if (PLAN.bad.length) usage(PLAN.bad.join("\n  "));
+const EXPECT_MODE = ARGS.expect === undefined ? "check" : String(ARGS.expect);
+if (EXPECT_MODE !== "check" && EXPECT_MODE !== "record") usage("--expect is check (the default: a shot that does not meet its case's expect fails the run) or record (kept in the manifest: main's run before a PR that brings the behaviour)");
 const EXPECTED = PLAN.runs.flatMap((r) => r.captures.map((x) => x.file));
 if (ARGS.plan) {
   for (const r of PLAN.runs) console.log("run   " + r.c.id + " on " + r.world + ": " + r.captures.length + " captures");
@@ -796,14 +810,15 @@ const STEPS = {
     await p.screenshot({ path: path.join(OUT, file), fullPage: true, animations: "disabled", caret: "hide" });
     const state = await p.evaluate(STATE);
     const buf = fs.readFileSync(path.join(OUT, file));
-    L.shots.push({ name: st.name, file, state });
-    L.captured.push({ file, kind: "case", case: c.id, set: c.set, world, shot: st.name, sha256: sha256(buf), size: pngSize(buf), bytes: buf.length, policy: cap.policy });
+    const bad = checkExpect(state, st.expect, world);
+    L.shots.push({ name: st.name, file, state, unmet: bad });
+    L.captured.push({ file, kind: "case", case: c.id, set: c.set, world, shot: st.name, sha256: sha256(buf), size: pngSize(buf), bytes: buf.length, policy: cap.policy, unmet: bad });
     console.log("    shot " + file + "  tick " + state.tick + (state.paused ? " paused" : " live") + (state.held ? " (held)" : "") +
                 "  focus " + (state.focus ? state.focus.tag + (state.focus.id ? "#" + state.focus.id : "") + (state.focus.role ? "[" + state.focus.role + "]" : "") +
                 (state.focus.focusVisible ? " ring" : "") : "none") + (state.dashOpen ? "  dash " + JSON.stringify(state.dashTabs.selected) : "") +
                 (state.sheetOpen ? "  setup " + JSON.stringify(state.setupTabs.selected) : "") + "  speed " + state.speed + (state.toasts.length ? "  toasts " + JSON.stringify(state.toasts) : ""));
-    const bad = checkExpect(state, st.expect, world);
-    if (bad.length) throw new Error(at + ": the state is not what the case expects: " + bad.join("; "));
+    if (bad.length && EXPECT_MODE === "check") throw new Error(at + ": the state is not what the case expects: " + bad.join("; "));
+    if (bad.length) console.log("    expectation not met (--expect record: kept in the manifest): " + bad.join("; "));
   }
 };
 async function runCase(run, onCapture) {
@@ -876,7 +891,7 @@ async function smoke(s, onCapture) {
 const summary = { started: new Date().toISOString(), base: BASE, layout: LAYOUT, routes: ROUTES, defaults: DEF, cases: [], smoke: [] };
 const manifest = { format: FORMAT, version: FORMAT_VERSION, harness: sha256(fs.readFileSync(SELF)), fixture: FIX_SHA, fixtureFile: CASES_FILE,
                    base: BASE, layout: LAYOUT, selection: PLAN.selection, started: summary.started, finished: null, status: "running", complete: false,
-                   policy: DEF.compare, expected: EXPECTED.concat(PLAN.smokes.map((s) => "smoke__" + s.label + ".png")), captures: {}, runs: [], smoke: [] };
+                   expectMode: EXPECT_MODE, policy: DEF.compare, expected: EXPECTED.concat(PLAN.smokes.map((s) => "smoke__" + s.label + ".png")), captures: {}, runs: [], smoke: [] };
 const save = () => {
   fs.writeFileSync(path.join(OUT, "summary.json"), JSON.stringify(summary, null, 1));
   fs.writeFileSync(path.join(OUT, "manifest.json"), JSON.stringify(manifest, null, 1));

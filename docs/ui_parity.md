@@ -102,9 +102,12 @@ node tests\ui_parity_browser.mjs --base http://localhost:8262 --out OUT\after --
 ### Before / after: the comparison gate
 
 Serve a copy of main (`git archive origin/main web img | tar -x -C DIR`, then `serve.py DIR PORT`) and the branch on another port,
-run the same harness file with the same cases file against each into new directories, then:
+run the same harness file with the same cases file against each into new directories (main with `--expect record`: the branch's
+cases claim the behaviour the PR brings, which main does not have; the run keeps what it missed instead of stopping), then:
 
 ```powershell
+node tests\ui_parity_browser.mjs --base http://localhost:8261 --sets S0,S2 --expect record --out OUT\before   # main
+node tests\ui_parity_browser.mjs --base http://localhost:8262 --sets S0,S2 --out OUT\after                    # the branch: expectations checked
 node tests\ui_parity_browser.mjs --compare OUT\before OUT\after --sets S0 --out OUT\diff_s0           # must PASS: unchanged by the PR
 node tests\ui_parity_browser.mjs --compare OUT\before OUT\after --sets S2 --report --out OUT\diff_s2  # the PR's intended changes, listed
 node tests\ui_parity_browser.mjs --compare OUT\after OUT\after_repeat                                # two runs of one commit: must PASS
@@ -119,7 +122,9 @@ overridden by a case's or a shot's `compare` (`{tolerance, maxPixels, why}`): a 
 another size is a **FAIL** (exit 1); otherwise **PASS** (exit 0). `--report` is for a PR that changes the UI on purpose: the evidence
 is checked the same way, differences and size changes are listed, and it exits 0 (**REPORT**) when the evidence is valid. Every
 picture that differs at all is listed (`noise` within the policy, `DIFF` beyond it, `SIZE`), and `--out` (new or empty, or
-`--clean`) gets a x16 difference picture of each and `compare.json` (mode, verdict, problems, each file's result).
+`--clean`) gets a x16 difference picture of each and `compare.json` (mode, verdict, problems, unmet expectations, each file's
+result). The expectations BEFORE missed are listed (`unmet`: what the PR brings); AFTER may miss only what BEFORE missed too, the
+same way (two runs of main), else the comparison is INVALID.
 
 The default policy, tolerance 1 and at most 8 pixels beyond it, comes from two runs of one commit: the compositor's anti-aliasing of
 rounded edges over the canvas moves a channel by 1 in up to ~21 pixels of a picture, and once 3 pixels at a rounded bar's end
@@ -188,7 +193,9 @@ or `{classic, ocean}`.
 A shot's `expect` is the state it must find, else the run fails: `tick`, `paused`, `held`, `speed` (the dock's label, e.g. `"2×"`),
 `dashOpen`, `sheetOpen`, `toasts` (a count), `focus` (`null`: nothing focused, or `{id, role, text, tag, ring}`: `ring` is whether
 `:focus-visible` matches), `dash` / `setup` (`{selected, tabbable}`: the tab ids); per world under `"classic"` / `"ocean"`. A case
-that claims a focus, a selected tab or a speed says so here, so the pictures cannot drift from the claim unnoticed.
+that claims a focus, a selected tab or a speed says so here, so the pictures cannot drift from the claim unnoticed. With `--expect
+record` a missed expectation is kept with its capture (`unmet` in the manifest and summary) and the run goes on: for main's run
+before a PR that brings the behaviour; a PR's own run checks them (the default).
 
 A later PR appends its sets' cases here (for example S1's setup states or S3's sizes with a case `viewport` and `dpr`), runs the
 harness on main and on its branch, gates the sets it must not change with `--compare` and reports the ones it changes with

@@ -8,7 +8,8 @@
 //   - --compare as a gate, on synthetic runs: identical and noise-only pictures pass; a picture beyond its policy and a size
 //     change fail (and are only listed with --report); a missing manifest, an incomplete run, a capture missing or changed
 //     since its run, a stale PNG, captures on one side only, different harness or fixture files and an empty comparison are
-//     INVALID in both modes; --sets / --cases / --worlds narrow it; a shot's own policy is honoured
+//     INVALID in both modes; --sets / --cases / --worlds narrow it; a shot's own policy is honoured; AFTER may miss only the
+//     expectations BEFORE missed too (--expect record: main's run before a PR that brings the behaviour)
 // The review of PR #89 (729b5ba): --compare compared whatever PNG names two directories shared and always exited 0; a world
 // filter could leave nothing to run and still succeed.
 import fs from "node:fs";
@@ -145,7 +146,7 @@ function makeRun(pics, o) {
   for (const [file, p] of Object.entries(pics)) {
     const [c, world, shot] = file.replace(/\.png$/, "").split("__");
     fs.writeFileSync(path.join(dir, file), p.buf);
-    captures[file] = { file, kind: "case", case: c, set: p.set || "S0", world, shot, sha256: sha(p.buf), size: [p.buf.readUInt32BE(16), p.buf.readUInt32BE(20)], bytes: p.buf.length, policy: p.policy || POLICY };
+    captures[file] = { file, kind: "case", case: c, set: p.set || "S0", world, shot, sha256: sha(p.buf), size: [p.buf.readUInt32BE(16), p.buf.readUInt32BE(20)], bytes: p.buf.length, policy: p.policy || POLICY, unmet: p.unmet || [] };
   }
   const m = { format: "ui-parity-run", version: 1, harness: o.harness || "h1", fixture: o.fixture || "f1", status: o.complete === false ? "failed: 1 runs" : "complete",
               complete: o.complete !== false, policy: POLICY, expected: o.expected || Object.keys(pics), captures, runs: [{ case: "x", world: "classic", ok: o.complete !== false }], smoke: [] };
@@ -224,6 +225,25 @@ section("--compare: evidence that is not a complete run is INVALID (both modes)"
   const junk = path.join(TMP, "junk"); fs.mkdirSync(junk); fs.writeFileSync(path.join(junk, "manifest.json"), "{\"format\":\"other\"}");
   r = cmp(A, junk);
   ok(r.code === 1 && /not a ui-parity-run v1 manifest/.test(r.out), "a manifest of something else: INVALID", r.out);
+}
+
+section("--compare and the cases' expectations (a run with --expect record keeps the ones it missed)");
+{
+  const miss = "dash.tabbable is [\"pop\",\"evo\"], expected [\"pop\"]";
+  const before = makeRun(withPic("s2_tabs__classic__tab.png", png(20, 10), { unmet: [miss] }));
+  let r = cmp(before, makeRun(base()));
+  ok(r.code === 0 && /unmet  s2_tabs__classic__tab\.png \(BEFORE only\)/.test(r.out) && /1 expectations BEFORE did not meet/.test(r.out),
+     "BEFORE (main) missed an expectation AFTER meets: PASS, and the miss is listed (what the PR brings)", r.out);
+  r = cmp(before, makeRun(withPic("s2_tabs__classic__tab.png", png(20, 10), { unmet: [miss] })));
+  ok(r.code === 0 && /both runs/.test(r.out), "two runs of main missing the same expectation the same way: PASS (a same-commit repeat)", r.out);
+  r = cmp(makeRun(base()), makeRun(withPic("s2_tabs__classic__tab.png", png(20, 10), { unmet: [miss] })));
+  ok(r.code === 1 && /does not meet its case's expectation/.test(r.out), "AFTER missing an expectation BEFORE met: INVALID", r.out);
+  r = cmp(makeRun(base()), makeRun(withPic("s2_tabs__classic__tab.png", png(20, 10), { unmet: [miss] })), "--report");
+  ok(r.code === 1 && /INVALID/.test(r.out), "  --report as well", r.out);
+  r = harness("--plan", "--sets", "S0", "--expect", "loose");
+  ok(r.code === 2 && /--expect is check/.test(r.out), "--expect other than check or record: refused", r.out);
+  r = harness("--plan", "--sets", "S0", "--expect", "record");
+  ok(r.code === 0, "--expect record: accepted", r.out);
 }
 
 section("--compare --out: never into older output");
