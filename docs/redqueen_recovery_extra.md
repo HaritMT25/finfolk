@@ -59,6 +59,9 @@ identities. Actual panels require a `refsel.py` selection receipt and its
 accessible validation registry and selection-time main/fork registries recorded
 in `studies_checked`, including supported selector overrides. It preserves the
 planning binding as historical provenance; registry record order is immaterial.
+Selection-time paths are explicit rebinding overrides; omitting a fork record
+retains the selector's historical fork-registry fallback and is refused when
+the recomputed checks do not match the recorded checks.
 The companion rechecks registered
 sentinel identities and study exclusion, available candidate times, unique
 snapshots within each guild, at least three sentinels, at least four early

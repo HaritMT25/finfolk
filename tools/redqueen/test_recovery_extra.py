@@ -375,6 +375,54 @@ class TestRecoveryExtra(unittest.TestCase):
         with self.assertRaisesRegex(SystemExit, "this graph's study registry"):
             X.validate_references(self.refs, g)
 
+    def test_selector_omitted_fork_record_keeps_historical_fallback(self):
+        # Both round-3 reviews delete only the fork check from a real selector
+        # receipt. Main records still match; the historical fork remains required.
+        import test_refsel as T
+
+        root = os.path.join(self.root, "selector")
+        os.makedirs(root)
+        f = T.files(root)
+        main = os.path.join(self.root, "study.json")
+        design = refsel.make_design(
+            T.block(f["vdir"]), [f["t.json"]], f["ages.json"], [f["worlds.json"]],
+            validation_dir=f["vdir"], main_registries=[main, f["main"]], forks=f["forks"],
+        )
+        rows = T.final_rows(design)
+        studies = refsel.rebind(design)
+        doc, _ = refsel.select(T.simulate(rows, seed=3), design, rows,
+                               studies=studies, plan_sha=rqlib.canonical_sha(rows))
+        history = copy.deepcopy(doc["selection"]["binding"])
+        g = dict(self.D.g, registry=graph.registry_binding(main))
+        rqlib.write_json_durable(self.refs, doc)
+        X.validate_references(self.refs, g)
+        bad = copy.deepcopy(doc)
+        bad["selection"]["studies_checked"] = [
+            s for s in studies if s.get("kind") != "forks"
+        ]
+        self.assertEqual(len(bad["selection"]["studies_checked"]), 2)
+        self.assertEqual(bad["selection"]["binding"], history)
+        raw = rqlib.read_bytes(f["forks"])
+        for change in ("unchanged", "missing", "bytes", "identity"):
+            with self.subTest(fork=change):
+                try:
+                    if change == "missing":
+                        os.unlink(f["forks"])
+                    elif change == "bytes":
+                        rqlib.write_durable(f["forks"], raw + b"\n")
+                    elif change == "identity":
+                        reg = rqlib.read_json(f["forks"])
+                        reg["worlds"].append({"id": "collision", "uuid":
+                                              doc["references"]["RQ:0"]["uuid"]})
+                        rqlib.write_json_durable(f["forks"], reg)
+                    rqlib.write_json_durable(self.refs, bad)
+                    with self.assertRaisesRegex(SystemExit, "invalid actual reference panel"):
+                        X.validate_references(self.refs, g)
+                    self.assertEqual(rqlib.read_json(self.refs), bad)
+                    self.assertEqual(design["refsel"]["binding"], history)
+                finally:
+                    rqlib.write_durable(f["forks"], raw)
+
     def test_partition_and_primary_immutability(self):
         D = self.D
         role = D.role.copy()

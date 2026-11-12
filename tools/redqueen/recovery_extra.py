@@ -495,8 +495,8 @@ def validate_references(path, g):
             raise ValueError("reference selection study registries missing or changed")
         # Reconstruct the candidate membership from the recorded availability, then use
         # the protected selector's binding checks (including all main/fork identities).
-        # Selection permits registry overrides. Recheck the selection-time records;
-        # the original planning binding remains historical provenance in the receipt.
+        # Selection permits registry overrides. Keep the original binding so an
+        # omitted fork override retains the protected selector's historical fallback.
         sent = binding.get("sentinels", [])
         avail = receipt.get("availability") or {}
         candidates = [(w, t) for w in sent for t in refsel.TIMES
@@ -505,10 +505,11 @@ def validate_references(path, g):
             "times": {t: refsel.frame_of(t) for t in refsel.TIMES},
             "worlds": {w: {"uuid": refsel.recipe(doc["namespace"], w)} for w in sent},
             "refsel": dict(receipt, sentinel_namespace=doc["namespace"],
-                           sentinels=sent, candidates=candidates,
-                           binding=dict(binding, studies=checked)),
+                           sentinels=sent, candidates=candidates),
         }
-        studies = refsel.rebind(design)
+        mains = [s["path"] for s in checked if s.get("kind") != "forks"]
+        forks = next((s["path"] for s in checked if s.get("kind") == "forks"), None)
+        studies = refsel.rebind(design, mains, forks)
         if sorted(checked, key=rqlib.canonical) != sorted(studies, key=rqlib.canonical):
             raise ValueError("reference selection study registries missing or changed")
         if registry and not any(
