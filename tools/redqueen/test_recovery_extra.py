@@ -292,6 +292,89 @@ class TestRecoveryExtra(unittest.TestCase):
         with self.assertRaisesRegex(SystemExit, "this graph's study registry"):
             X.validate_references(self.refs, g)
 
+    def test_selector_registry_overrides_and_integrity(self):
+        # Use the unchanged selector's full plan, bound rows, observations and
+        # selection path: synthetic receipts alone missed the review counterexample.
+        import test_refsel as T
+
+        root = os.path.join(self.root, "selector")
+        os.makedirs(root)
+        f = T.files(root)
+        main = os.path.join(self.root, "study.json")
+        design = refsel.make_design(
+            T.block(f["vdir"]), [f["t.json"]], f["ages.json"], [f["worlds.json"]],
+            validation_dir=f["vdir"], main_registries=[main, f["main"]], forks=f["forks"],
+        )
+        rows = T.final_rows(design)
+        obs = T.simulate(rows, seed=3)
+        main_copy, fork_copy = (os.path.join(root, n) for n in ("main-copy.json", "fork-copy.json"))
+        shutil.copyfile(main, main_copy)
+        shutil.copyfile(f["forks"], fork_copy)
+        history = copy.deepcopy(design["refsel"]["binding"])
+        g = dict(self.D.g, registry=graph.registry_binding(main))
+        for label, mains, forks in (
+            ("unchanged", [main, f["main"]], f["forks"]),
+            ("reordered mains", [f["main"], main], f["forks"]),
+            ("copied main", [main_copy, f["main"]], f["forks"]),
+            ("copied main and forks", [main_copy, f["main"]], fork_copy),
+        ):
+            with self.subTest(override=label):
+                studies = refsel.rebind(design, mains, forks)
+                doc, _ = refsel.select(obs, design, rows, studies=studies,
+                                       plan_sha=rqlib.canonical_sha(rows))
+                self.assertEqual(doc["selection"]["binding"], history)
+                self.assertEqual(doc["selection"]["studies_checked"], studies)
+                if label != "unchanged":
+                    self.assertNotEqual(history["studies"], studies)
+                raw = rqlib.canonical(doc)
+                rqlib.write_durable(self.refs, raw)
+                X.validate_references(self.refs, g)  # includes graph-registry exclusion
+                D = X.data_from(self.gpath, self.refs)
+                X.make_plan(D, self.gpath, self.refs, "rq-selected-panel", self.fit,
+                            ["r0"], 1, ["a"], ["intact"], True)
+                self.assertEqual(rqlib.canonical(doc), raw)
+                self.assertEqual(rqlib.read_bytes(self.refs), raw)
+                self.assertEqual(design["refsel"]["binding"], history)
+
+        # Historical study paths need not stay accessible after a supported override.
+        os.unlink(main)
+        os.unlink(f["forks"])
+        X.validate_references(self.refs, g)
+        # Reordering all recorded checks, including forks, changes no binding.
+        doc["selection"]["studies_checked"].reverse()
+        rqlib.write_json_durable(self.refs, doc)
+        X.validate_references(self.refs, g)
+
+        # Current selection records must still be accessible, byte-bound and disjoint.
+        for path in (main_copy, fork_copy):
+            raw = rqlib.read_bytes(path)
+            for change in ("missing", "bytes", "identity"):
+                with self.subTest(registry=path, change=change):
+                    if change == "missing":
+                        os.unlink(path)
+                    elif change == "bytes":
+                        rqlib.write_durable(path, raw + b"\n")
+                    else:
+                        reg = rqlib.read_json(path)
+                        reg["worlds"].append({"id": "collision", "uuid":
+                                              doc["references"]["RQ:0"]["uuid"]})
+                        rqlib.write_json_durable(path, reg)
+                    with self.assertRaisesRegex(SystemExit, "invalid actual reference panel"):
+                        X.validate_references(self.refs, g)
+                    rqlib.write_durable(path, raw)
+        for checked in (None, [], [None], [{"sha256": "a" * 64}]):
+            bad = copy.deepcopy(doc)
+            bad["selection"]["studies_checked"] = checked
+            rqlib.write_json_durable(self.refs, bad)
+            with self.assertRaisesRegex(SystemExit, "study registries missing or changed"):
+                X.validate_references(self.refs, g)
+        # Excluding only unrelated registries cannot replace the graph's study check.
+        bad = copy.deepcopy(doc)
+        bad["selection"]["studies_checked"] = refsel.study_exclusion([f["main"]], fork_copy)[2]
+        rqlib.write_json_durable(self.refs, bad)
+        with self.assertRaisesRegex(SystemExit, "this graph's study registry"):
+            X.validate_references(self.refs, g)
+
     def test_partition_and_primary_immutability(self):
         D = self.D
         role = D.role.copy()

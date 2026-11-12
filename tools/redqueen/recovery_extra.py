@@ -488,8 +488,15 @@ def validate_references(path, g):
                 or receipt["observations"] <= 0):
             raise ValueError("reference selection implementation/observation provenance required")
         binding = receipt.get("binding") or {}
+        checked = receipt.get("studies_checked")
+        if (not isinstance(checked, list) or not checked
+                or any(not isinstance(s, dict) or not isinstance(s.get("path"), str)
+                       or not s["path"] for s in checked)):
+            raise ValueError("reference selection study registries missing or changed")
         # Reconstruct the candidate membership from the recorded availability, then use
         # the protected selector's binding checks (including all main/fork identities).
+        # Selection permits registry overrides. Recheck the selection-time records;
+        # the original planning binding remains historical provenance in the receipt.
         sent = binding.get("sentinels", [])
         avail = receipt.get("availability") or {}
         candidates = [(w, t) for w in sent for t in refsel.TIMES
@@ -498,10 +505,11 @@ def validate_references(path, g):
             "times": {t: refsel.frame_of(t) for t in refsel.TIMES},
             "worlds": {w: {"uuid": refsel.recipe(doc["namespace"], w)} for w in sent},
             "refsel": dict(receipt, sentinel_namespace=doc["namespace"],
-                           sentinels=sent, candidates=candidates),
+                           sentinels=sent, candidates=candidates,
+                           binding=dict(binding, studies=checked)),
         }
         studies = refsel.rebind(design)
-        if receipt.get("studies_checked") != studies or binding.get("studies") != studies:
+        if sorted(checked, key=rqlib.canonical) != sorted(studies, key=rqlib.canonical):
             raise ValueError("reference selection study registries missing or changed")
         if registry and not any(
             graph.registry_binding(s["path"]) == registry

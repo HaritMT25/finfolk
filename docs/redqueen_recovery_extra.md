@@ -56,7 +56,10 @@ slot times, with the same prelaunch qualification and deterministic later
 relabelling requirement. The plan binds actual reference bytes and times when
 supplied; identities must be sentinel references, separate from main/fork
 identities. Actual panels require a `refsel.py` selection receipt and its
-accessible validation/main/fork registries. The companion rechecks registered
+accessible validation registry and selection-time main/fork registries recorded
+in `studies_checked`, including supported selector overrides. It preserves the
+planning binding as historical provenance; registry record order is immaterial.
+The companion rechecks registered
 sentinel identities and study exclusion, available candidate times, unique
 snapshots within each guild, at least three sentinels, at least four early
 references (through 120M), and at least two late references (from 140M).
