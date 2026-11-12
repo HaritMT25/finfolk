@@ -187,9 +187,14 @@ def load_reservations(path):
     integer-only traversal; integers beneath seed-bearing keys remain reserved.
     Argument arrays also reserve the engine's --seed, --transplant-seed and
     --reseed-after-load values, including the redundant seed in registry config_args.
+    Each JSONL document and inventory-array record must independently yield seeds.
+    Structured seed-bearing objects take precedence over flat integer maps; only
+    argv seeds are limited to the engine's unsigned 32-bit range.
     """
-    def fail(message):
-        raise ReservationError(f"{path}: {message}")
+    context = "document 1"
+
+    def fail(message, where=None):
+        raise ReservationError(f"{path}: {where or context}: {message}")
 
     def unique_object(pairs):
         obj = {}
@@ -204,11 +209,11 @@ def load_reservations(path):
         text = raw.decode("utf-8")
     except (OSError, UnicodeError) as exc:
         fail(str(exc))
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    lines = [(number, line.strip()) for number, line in enumerate(text.splitlines(), 1) if line.strip()]
     seeds = set()
     seed_flags = {"--seed", "--transplant-seed", "--reseed-after-load"}
 
-    def argv_seeds(args):
+    def argv_seeds(args, found, where):
         consumed = set()
         for index, arg in enumerate(args):
             if not isinstance(arg, str):
@@ -217,18 +222,24 @@ def load_reservations(path):
             if flag not in seed_flags:
                 continue
             if arg != flag:
-                fail(f"{flag} requires a separate decimal integer argument")
+                fail(f"{flag} requires a separate decimal integer argument", where)
             if index + 1 == len(args):
-                fail(f"{flag} is missing its seed argument")
+                fail(f"{flag} is missing its seed argument", where)
             value = args[index + 1]
             if not ((type(value) is int and value >= 0)
                     or (isinstance(value, str) and re.fullmatch(r"[0-9]+", value))):
-                fail(f"{flag} requires a nonnegative decimal integer (got {value!r})")
-            seeds.add(int(value))
+                fail(f"{flag} requires a nonnegative decimal integer (got {value!r})", where)
+            # Bound the decimal text before conversion, including arbitrarily
+            # long argv strings that strtoul would overflow or zero-pad.
+            digits = str(value).lstrip("0") or "0"
+            if len(digits) > 10 or (len(digits) == 10 and digits > "4294967295"):
+                fail(f"{flag} seed must be in 0..4294967295 (got {value!r})", where)
+            found.add(int(digits))
             consumed.update((index, index + 1))
         return consumed
 
-    def walk(obj, hint=False, strict=False, group_labels=False):
+    def walk(obj, found, where, hint=False, strict=False, group_labels=False):
+        structured = False
         if isinstance(obj, dict):
             for key, value in obj.items():
                 label = key.lower()
@@ -236,55 +247,67 @@ def load_reservations(path):
                 metadata = any(token in label for token in ("scheme", "namespace", "sha256", "hash", "rule", "note", "path"))
                 labels = group_labels or label in ("groups", "seed_slot")
                 seed_value = seed_hint and not metadata and not labels
-                walk(value, hint or seed_hint, strict or seed_value, labels)
+                nested = walk(value, found, f"{where}.{key}", hint or seed_hint, strict or seed_value, labels)
+                structured |= seed_hint or nested
         elif isinstance(obj, list):
-            consumed = argv_seeds(obj)
+            consumed = argv_seeds(obj, found, where)
+            structured = bool(consumed)
             for index, value in enumerate(obj):
                 if index not in consumed:
-                    walk(value, hint, strict, group_labels)
+                    structured |= walk(value, found, f"{where}[{index + 1}]", hint, strict, group_labels)
         elif type(obj) is int:
             if hint:
                 if obj < 0:
-                    fail("negative seed reservation")
-                seeds.add(obj)
+                    fail("negative seed reservation", where)
+                found.add(obj)
         elif strict and obj is not None:
-            fail(f"seed reservations must be JSON integers (got {obj!r})")
+            fail(f"seed reservations must be JSON integers (got {obj!r})", where)
+        return structured
 
-    if lines and all(re.fullmatch(r"[0-9]+", line) for line in lines):
-        seeds = {int(line) for line in lines}
+    if lines and all(re.fullmatch(r"[0-9]+", line) for _, line in lines):
+        seeds = {int(line) for _, line in lines}
     else:
         try:
             doc = json.loads(text, object_pairs_hook=unique_object)
-            docs = [doc]
+            docs = [(context, doc)]
         except json.JSONDecodeError:
             try:
-                docs = [json.loads(line, object_pairs_hook=unique_object) for line in lines]
+                docs = []
+                for number, line in lines:
+                    context = f"JSONL line {number}"
+                    docs.append((context, json.loads(line, object_pairs_hook=unique_object)))
             except json.JSONDecodeError as exc:
                 fail(f"unsupported reservation format ({exc})")
-        def document(doc):
+        def document(doc, where):
+            # Never use the aggregate set to validate a record: a repeated valid
+            # reservation must pass, while an unsupported sibling must fail.
+            found = set()
             if isinstance(doc, list):
-                if argv_seeds(doc):
-                    walk(doc)
-                    return
-                for value in doc:
-                    document(value)
-            elif type(doc) is int and doc >= 0:
-                seeds.add(doc)
-            elif isinstance(doc, dict):
-                if doc and all(type(value) is int and value >= 0 for value in doc.values()):
-                    seeds.update(doc.values())
+                if argv_seeds(doc, found, where):
+                    walk(doc, found, where)
                 else:
-                    if doc.get("schema") == "finfolk.invasion.archived-seeds/1":
-                        inventory = doc.get("all")
-                        if (not isinstance(inventory, dict) or not inventory
-                                or any(not re.fullmatch(r"[0-9]+", key) for key in inventory)):
-                            fail("archived-seeds/1 requires nonempty numeric seed keys under 'all'")
-                        seeds.update(int(key) for key in inventory)
-                    walk(doc)
+                    for index, value in enumerate(doc, 1):
+                        found.update(document(value, f"{where} record[{index}]"))
+            elif type(doc) is int and doc >= 0:
+                found.add(doc)
+            elif isinstance(doc, dict):
+                structured = walk(doc, found, where)
+                if doc.get("schema") == "finfolk.invasion.archived-seeds/1":
+                    inventory = doc.get("all")
+                    if (not isinstance(inventory, dict) or not inventory
+                            or any(not re.fullmatch(r"[0-9]+", key) for key in inventory)):
+                        fail("archived-seeds/1 requires nonempty numeric seed keys under 'all'", where)
+                    found.update(int(key) for key in inventory)
+                elif not structured and doc and all(type(value) is int and value >= 0 for value in doc.values()):
+                    found.update(doc.values())
             else:
-                fail("expected seed-keyed JSON, arrays of objects/integers, or decimal integers per line")
-        for doc in docs:
-            document(doc)
+                fail("expected seed-keyed JSON, arrays of objects/integers, or decimal integers per line", where)
+            if not found:
+                fail("no seed reservations extracted; empty or unsupported inventory record", where)
+            return found
+
+        for context, doc in docs:
+            seeds.update(document(doc, context))
     if not seeds:
         fail("no seed reservations extracted; empty or unsupported inventory")
     return seeds, {"path": os.path.abspath(path), "sha256": sha256_bytes(raw), "seeds": len(seeds)}

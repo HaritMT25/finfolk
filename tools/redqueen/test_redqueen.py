@@ -1930,6 +1930,94 @@ class TestReservations(unittest.TestCase):
             p.write_text('[{"seed":101},{"seed":102}]')
             self.assertEqual(worlds.read_avoid(p), {101, 102})
 
+    def test_each_inventory_record_is_validated(self):
+        """A supported record must never hide an unsupported JSONL/array sibling."""
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / 'inventory'
+            for invalid in ({'w02': '102'}, {}, [], {'reserved': []}):
+                for text, context in (
+                        (json.dumps({'w01': 101}) + '\n' + json.dumps(invalid), 'JSONL line 2'),
+                        (json.dumps({'w01': 101}) + '\n\n' + json.dumps(invalid), 'JSONL line 3'),
+                        (json.dumps([{'w01': 101}, invalid]), 'record[2]'),
+                        (json.dumps([{'seed': 101}, [invalid]]), 'record[2] record[1]')):
+                    p.write_text(text)
+                    for loader in (worlds.read_avoid, plan.avoid_seeds, nb.avoid_seeds):
+                        with self.subTest(text=text, loader=loader.__module__):
+                            with self.assertRaises(Exception) as caught:
+                                loader(p)
+                            self.assertIn(str(p), str(caught.exception))
+                            self.assertIn(context, str(caught.exception))
+            # Valid repeated records have independent sets, even if their union
+            # gains no new seed; keep flat label inventories supported too.
+            for text in ('{"w01":101}\n{"w02":101}',
+                         '[{"w01":101},{"w02":101}]', '[{"seed":101},{"seed":101}]'):
+                p.write_text(text)
+                for loader in (worlds.read_avoid, plan.avoid_seeds, nb.avoid_seeds):
+                    self.assertEqual(loader(p), {101})
+
+    def test_object_array_metadata_is_not_reserved(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / 'inventory'
+            for steps in (102, 200000000):
+                for obj in ([{'seed': 101, 'steps': steps}],
+                            {'seed': 101, 'steps': steps},
+                            [[{'seed': 101, 'steps': steps}]],
+                            {'worlds': [{'seed': 101, 'steps': steps}]}):
+                    p.write_text(json.dumps(obj))
+                    for loader in (worlds.read_avoid, plan.avoid_seeds, nb.avoid_seeds):
+                        with self.subTest(obj=obj, loader=loader.__module__):
+                            self.assertEqual(loader(p), {101})
+                    seeds, receipt = rqlib.load_reservations(p)
+                    self.assertEqual(seeds, {101})
+                    self.assertEqual(receipt['seeds'], 1)
+            # Retain precisely the old conservative policy below seed containers.
+            p.write_text('[{"seeds":{"sample":101,"steps":102},"steps":103}]')
+            for loader in (worlds.read_avoid, plan.avoid_seeds, nb.avoid_seeds):
+                self.assertEqual(loader(p), {101, 102})
+
+    def test_metadata_does_not_rederive_registered_founders(self):
+        """The review's steps=S counterexample must preserve registered output."""
+        from test_worlds import ARENA
+
+        with tempfile.TemporaryDirectory() as d:
+            arena, inventory = Path(d) / 'arena.json', Path(d) / 'inventory.json'
+            arena.write_bytes(rqlib.canonical(ARENA))
+            kwargs = dict(blocks=1, per_block={'C': 1, 'A': 1, 'B': 1})
+            baseline = worlds.register(str(arena), 'metadata-regression', **kwargs)
+            candidate = baseline['worlds'][0]['founder_seed']
+            inventory.write_text(json.dumps([{'seed': 0, 'steps': candidate}]))
+            registered = worlds.register(str(arena), 'metadata-regression',
+                                         avoid_paths=[inventory], **kwargs)
+            self.assertEqual(registered['avoid'], [{
+                'path': str(inventory), 'sha256': rqlib.sha256_file(inventory), 'seeds': 1}])
+            # Everything other than the added avoidance receipt stays byte-identical.
+            registered['avoid'] = []
+            self.assertEqual(rqlib.canonical(registered), rqlib.canonical(baseline))
+
+    def test_argument_seed_uint32_bounds(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / 'inventory'
+            for flag in ('--seed', '--transplant-seed', '--reseed-after-load'):
+                for value in (0, 4294967295, '0', '4294967295', '0' * 5000 + '102'):
+                    p.write_text(json.dumps({'seed': 101, 'argv': ['engine', flag, value]}))
+                    for loader in (worlds.read_avoid, plan.avoid_seeds, nb.avoid_seeds):
+                        with self.subTest(flag=flag, value=value, loader=loader.__module__):
+                            self.assertEqual(loader(p), {101, int(str(value).lstrip('0') or '0')})
+                for value in (4294967296, '4294967296', 4294967398, '4294967398',
+                              18446744073709551616, '18446744073709551616', '9' * 5000):
+                    p.write_text(json.dumps({'seed': 101, 'argv': ['engine', flag, value]}))
+                    for loader in (worlds.read_avoid, plan.avoid_seeds, nb.avoid_seeds):
+                        with self.subTest(flag=flag, value=value, loader=loader.__module__):
+                            with self.assertRaises(Exception) as caught:
+                                loader(p)
+                            self.assertIn(str(p), str(caught.exception))
+                            self.assertIn('document 1.argv', str(caught.exception))
+                            self.assertIn('0..4294967295', str(caught.exception))
+            # Sampling seeds are structural uint64 values, outside the CLI restriction.
+            p.write_text('{"seeds":{"sample":18446744073709551615}}')
+            for loader in (worlds.read_avoid, plan.avoid_seeds, nb.avoid_seeds):
+                self.assertEqual(loader(p), {18446744073709551615})
+
     def test_recursive_object_arrays_all_loaders(self):
         with tempfile.TemporaryDirectory() as d:
             p = Path(d) / 'inventory.json'
