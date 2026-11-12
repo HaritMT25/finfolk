@@ -12,6 +12,7 @@ import contextlib
 import copy
 import math
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -396,6 +397,8 @@ def make_plan(D, graph_path, refs_path, namespace, fit, scenarios,
     if toy and not allow_toy:
         raise SystemExit("toy graph requires --allow-toy")
     if not toy:
+        if D.g.get("train_matchings") is not True:
+            raise SystemExit("registered recovery requires training-only matchings")
         problems = graph.check_quotas(D.g)
         if problems:
             raise SystemExit("scheduled graph quota failure: " + "; ".join(problems))
@@ -447,9 +450,83 @@ def make_plan(D, graph_path, refs_path, namespace, fit, scenarios,
     }
 
 
+def validate_references(path, g):
+    """Validate actual panels and refsel provenance; hashes alone are not admissibility."""
+    import refsel
+    import sealing
+
+    doc = rqlib.read_json(path)
+    try:
+        registry = g.get("registry") or {}
+        refs = sealing.load_references(
+            path, registry.get("uuids", {}),
+            main_namespace=registry.get("namespace", g["namespace"]),
+        )
+        frames = {refsel.frame_of(t) for t in refsel.TIMES}
+        for guild in ("RQ", "RP"):
+            panel = [refs[f"{guild}:{k}"] for k in range(8)]
+            if any(type(v["frame"]) is not int or v["frame"] not in frames for v in panel):
+                raise ValueError("reference frame is not a registered candidate time")
+            if len({v["world"] for v in panel}) < 3:
+                raise ValueError("at least three distinct registered sentinels per guild required")
+            if sum(v["frame"] <= 120_000_000 for v in panel) < 4:
+                raise ValueError("at least four early references per guild required")
+            if sum(v["frame"] >= 140_000_000 for v in panel) < 2:
+                raise ValueError("at least two late references per guild required")
+        receipt = doc.get("selection") or {}
+        if (doc.get("namespace") != refsel.VALIDATION_NAMESPACE
+                or receipt.get("refsel_schema") != refsel.SCHEMA
+                or receipt.get("criterion_sha256") != rqlib.canonical_sha(refsel.CRITERION)):
+            raise ValueError("registered reference selection provenance required")
+        for key in ("design_sha256", "plan_sha256", "observations_sha256", "block_sha256"):
+            if not sealing.SHA.fullmatch(str(receipt.get(key, ""))):
+                raise ValueError(f"reference selection needs {key}")
+        implementation = receipt.get("implementation") or {}
+        if (not sealing.SHA.fullmatch(str(implementation.get("refsel_sha256", "")))
+                or not isinstance(implementation.get("numpy"), str)
+                or type(receipt.get("observations")) is not int
+                or receipt["observations"] <= 0):
+            raise ValueError("reference selection implementation/observation provenance required")
+        binding = receipt.get("binding") or {}
+        # Reconstruct the candidate membership from the recorded availability, then use
+        # the protected selector's binding checks (including all main/fork identities).
+        sent = binding.get("sentinels", [])
+        avail = receipt.get("availability") or {}
+        candidates = [(w, t) for w in sent for t in refsel.TIMES
+                      if refsel.availability_reason(avail[w], w, t) is None]
+        design = {
+            "times": {t: refsel.frame_of(t) for t in refsel.TIMES},
+            "worlds": {w: {"uuid": refsel.recipe(doc["namespace"], w)} for w in sent},
+            "refsel": dict(receipt, sentinel_namespace=doc["namespace"],
+                           sentinels=sent, candidates=candidates),
+        }
+        studies = refsel.rebind(design)
+        if receipt.get("studies_checked") != studies or binding.get("studies") != studies:
+            raise ValueError("reference selection study registries missing or changed")
+        if registry and not any(
+            graph.registry_binding(s["path"]) == registry
+            for s in studies if s.get("kind") != "forks"
+        ):
+            raise ValueError("reference selection did not exclude this graph's study registry")
+        allowed = {(w, refsel.frame_of(t)) for w, t in candidates}
+        for slot, v in refs.items():
+            if (v["world"], v["frame"]) not in allowed:
+                raise ValueError(f"{slot}: not an available registered sentinel candidate")
+            raw = doc["references"][slot]
+            if raw.get("attempt") != (avail[v["world"]].get("attempt") or 0):
+                raise ValueError(f"{slot}: selection attempt differs from availability")
+            if not isinstance(v["archive"], str) or not v["archive"]:
+                raise ValueError(f"{slot}: archive provenance required")
+    except (sealing.SealError, refsel.RefselError, ValueError, KeyError, TypeError, OSError) as e:
+        raise SystemExit(f"{path}: invalid actual reference panel: {e}") from e
+
+
 def data_from(graph_path, refs_path):
+    g = graph.load(graph_path)
+    if refs_path:
+        validate_references(refs_path, g)
     refs = rec.reference_times(refs_path)[0] if refs_path else None
-    return rec.Data(graph.load(graph_path), refs)
+    return rec.Data(g, refs)
 
 
 @contextlib.contextmanager
@@ -536,7 +613,10 @@ def verified(directory, graph_path, refs_path):
 
 def forward(v, data, fit, seed, option):
     """Registered fitter/score on the paired all/early reference access masks."""
-    F = v.forward
+    F = v.forward if option.startswith("fwd_") else {
+        "fit": v.fit["a"], "val": v.val_idx, "val_world": v.val_world,
+        "ctrl": mapfit.control_access(v, v.fit["a"]),
+    }
     idx, val = F["fit"], F["val"]
     out = {
         "procedure": "forward", "reference_policy": option,
@@ -584,9 +664,9 @@ def forward(v, data, fit, seed, option):
     for name, (ix, tw) in branches(v, option).items():
         roots = len(np.unique(tw))
         base = {"targets": len(ix), "test_roots": roots, "worlds": roots}
-        if roots < rec.MIN_TEST_ROOTS:
+        if not len(ix):
             out[name] = dict(
-                base, available=False, success=False,
+                base, available=False, decision_available=False, success=False,
                 reason=f"fewer than {rec.MIN_TEST_ROOTS} contributing test roots",
             )
             continue
@@ -609,6 +689,20 @@ def forward(v, data, fit, seed, option):
                 reason=rec._unresolved_why(unresolved, name),
             )
             continue
+        if roots < rec.MIN_TEST_ROOTS:
+            ws = np.unique(tw)
+            per = [float((c1 - c0)[tw == w].mean()) for w in ws]
+            gper = [float((g1 - g0)[tw == w].mean()) for w in ws]
+            out[name] = dict(
+                base, available=False, decision_available=False, success=False,
+                descriptive=True, test_improvement=float(np.mean(per)),
+                per_world=per, per_world_ids=[v.worlds[int(w)] for w in ws],
+                test_improvement_gauss=float(np.mean(gper)),
+                integration={"selected": i1, "rank0": i0},
+                integration_unresolved=0,
+                reason=f"fewer than {rec.MIN_TEST_ROOTS} contributing test roots",
+            )
+            continue
         qw, pw = v.qw[v.qi[ix]], v.pw[v.pj[ix]]
         bseed = seed + 11 + len(name)
         mean, lb, per = rec.crossed_lb(
@@ -625,7 +719,7 @@ def forward(v, data, fit, seed, option):
             integration_unresolved=0,
             test_improvement_gauss=gmean, test_lb_gauss=glb,
         )
-    ft = out["forward_transfer"]
+    ft = out["forward_transfer"] if option.startswith("fwd_") else out[next(iter(branches(v, option)))]
     out["decision"] = {
         "available": bool(ft.get("available")),
         "reason": ft.get("reason"),
@@ -644,6 +738,13 @@ def evaluate(v, data, plan, seed, option):
     fit = plan["fit"]
     if option.startswith("fwd_"):
         return forward(v, data, fit, seed, option)
+    if (len(np.unique(v.test_world)) == 1
+            and len(v.fit["a"]) and len(v.val_idx)):
+        out = forward(v, data, fit, seed, option)
+        branch = out[next(iter(branches(v, option)))]
+        out.update(branch, procedure=option)
+        out["per_test_world"] = branch.get("per_world", [])
+        return out
     return rec.procedure(
         v, data, "a", fit["ranks"],
         list(map(float, fit["lambdas"].split(","))),
@@ -765,10 +866,30 @@ def artifact_index(directory):
     )
 
 
+@contextlib.contextmanager
+def termination_signals():
+    """Unwind through worker reaping while the directory lock is still held."""
+    signals = (signal.SIGTERM, signal.SIGINT)
+    previous = {s: signal.getsignal(s) for s in signals}
+
+    def terminate(signum, _frame):
+        for s in signals:
+            signal.signal(s, signal.SIG_IGN)
+        raise SystemExit(128 + signum)
+
+    try:
+        for s in signals:
+            signal.signal(s, terminate)
+        yield
+    finally:
+        for s, handler in previous.items():
+            signal.signal(s, handler)
+
+
 def run(a):
     if a.jobs not in (1, 2):
         raise SystemExit("--jobs must be 1 or 2")
-    with locked(a.dir):
+    with locked(a.dir), termination_signals():
         _, plan = verified(a.dir, a.graph, a.references)
         found = read_results(a.dir, plan)
         pending = [task_name(t) for t in tasks(plan) if task_name(t) not in found]
@@ -789,11 +910,32 @@ def run(a):
                     if a.references:
                         cmd += ["--references", a.references]
                     with open(os.path.join(logdir, task[:-5] + ".log"), "ab") as log:
-                        process = subprocess.Popen(
-                            cmd, env=env, stdin=subprocess.DEVNULL,
-                            stdout=log, stderr=subprocess.STDOUT,
+                        # Do not deliver termination between spawning and tracking a child.
+                        blocked = signal.pthread_sigmask(
+                            signal.SIG_BLOCK, {signal.SIGTERM, signal.SIGINT}
                         )
-                    running.append((process, task))
+                        try:
+                            if sys.platform.startswith("linux") and rqlib._LIBC is None:
+                                raise SystemExit("Linux worker parent-death protection unavailable")
+                            death_guard = rqlib.death_signal()
+
+                            def worker_guard():
+                                death_guard()
+                                signal.pthread_sigmask(signal.SIG_SETMASK, blocked)
+
+                            process = subprocess.Popen(
+                                cmd, env=env, stdin=subprocess.DEVNULL,
+                                stdout=log, stderr=subprocess.STDOUT,
+                                preexec_fn=worker_guard,
+                                restore_signals=True,
+                            )
+                            running.append((process, task))
+                            # Popen returns only after preexec installed PDEATHSIG
+                            # and exec succeeded. A child appearing in /proc can
+                            # still be stopped before either has happened.
+                            print(f"started {task}: guarded pid {process.pid}", flush=True)
+                        finally:
+                            signal.pthread_sigmask(signal.SIG_SETMASK, blocked)
                 time.sleep(0.1)
                 for item in list(running):
                     rc = item[0].poll()

@@ -6,9 +6,11 @@ import argparse
 import copy
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -30,6 +32,54 @@ if np is not None:
     import graph
     import map as M
     import rqlib
+    import refsel
+    import sealing
+
+
+def reference_panel(root):
+    """Synthetic selection receipt with real registry/identity validation, no grid claim."""
+    ns = refsel.VALIDATION_NAMESPACE
+    sent = [f"sentinel-{k}" for k in range(4)]
+    vp = os.path.join(root, "validation.json")
+    mp = os.path.join(root, "study.json")
+    fp = os.path.join(root, "forks.json")
+    rqlib.write_json_durable(vp, {
+        "schema": refsel.WORLDS_SCHEMA, "namespace": ns,
+        "worlds": [{"id": w, "uuid": refsel.recipe(ns, w), "treatment": "C"} for w in sent],
+    })
+    rqlib.write_json_durable(mp, {
+        "namespace": "rq-extra-study", "worlds": [
+            dict(w, uuid=refsel.recipe("rq-extra-study", w["id"])) for w in graph.synthetic_worlds()
+        ],
+    })
+    rqlib.write_json_durable(fp, {"worlds": []})
+    studies = refsel.study_exclusion([mp], fp)[2]
+    avail = {w: {
+        "uuid": refsel.recipe(ns, w), "attempt": 0, "burn_in": 0,
+        "archived": [refsel.frame_of(t) for t in refsel.TIMES],
+    } for w in sent}
+    ts = (0, 20, 60, 100, 140, 140, 180, 200)
+    return {
+        "schema": R.REFS_SCHEMA, "namespace": ns,
+        "references": {
+            f"{guild}:{k}": {
+                "world": sent[k % 4], "frame": 1 if t == 0 else t * 1_000_000,
+                "uuid": refsel.recipe(ns, sent[k % 4]),
+                "snapshot": sealing.snapshot_uuid(refsel.recipe(ns, sent[k % 4]), 1 if t == 0 else t * 1_000_000),
+                "archive": "synthetic-not-an-engine-archive", "sha256": "a" * 64, "attempt": 0,
+            } for guild in ("RQ", "RP") for k, t in enumerate(ts)
+        },
+        "selection": {
+            "refsel_schema": refsel.SCHEMA,
+            "criterion_sha256": rqlib.canonical_sha(refsel.CRITERION),
+            **{k: "b" * 64 for k in ("design_sha256", "plan_sha256", "observations_sha256", "block_sha256")},
+            "observations": 1, "availability": avail,
+            "availability_sha256": rqlib.canonical_sha(avail), "omitted": [],
+            "implementation": refsel.implementation(), "studies_checked": studies,
+            "binding": {"namespace": ns, "sentinels": sent, "registry": vp,
+                        "registry_sha256": rqlib.sha256_file(vp), "studies": studies},
+        },
+    }
 
 
 def toy():
@@ -99,18 +149,7 @@ class TestRecoveryExtra(unittest.TestCase):
         self.gpath = os.path.join(self.gdir, "graph.jsonl.gz")
         self.refs = os.path.join(self.root, "references.json")
         # Exactly four early references; slot 4 is late.
-        ts = (0, 20, 60, 100, 140, 140, 180, 200)
-        rqlib.write_json_durable(self.refs, {
-            "schema": R.REFS_SCHEMA,
-            "namespace": "rq-extra-toy-sentinels",
-            "references": {
-                f"{guild}:{k}": {
-                    "world": f"sentinel-{k % 4}",
-                    "frame": 1 if t == 0 else t * 1_000_000,
-                }
-                for guild in ("RQ", "RP") for k, t in enumerate(ts)
-            },
-        })
+        rqlib.write_json_durable(self.refs, reference_panel(self.root))
         self.D = X.data_from(self.gpath, self.refs)
         self.fit = {
             "ranks": 1, "lambdas": "0.05", "iters": 2, "start": "warm",
@@ -147,6 +186,111 @@ class TestRecoveryExtra(unittest.TestCase):
         if options:
             args += ["--options", options]
         self.command(*args)
+
+    def test_production_requires_training_matchings(self):
+        # The supported legacy configuration really passes the legacy quota check.
+        g = graph.build("rq-no-matchings", train_matchings=False,
+                        snapshot_topup=0, ab_topup=0, lag_probe=0)
+        self.assertEqual(graph.check_quotas(g), [])
+        self.assertFalse(any(e[2] == "train_match" for e in g["edges"]))
+        directory = os.path.join(self.root, "no-matchings")
+        graph.write(g, directory)
+        with self.assertRaisesRegex(SystemExit, "requires training-only matchings"):
+            X.make_plan(R.Data(g), os.path.join(directory, "graph.jsonl.gz"), None,
+                        "rq-refusal", self.fit, ["r0"], 20, ["a"], ["intact"])
+        # A true flag alone does not bypass the existing quota check.
+        g["train_matchings"] = True
+        with self.assertRaisesRegex(SystemExit, "train_match"):
+            X.make_plan(R.Data(g), self.gpath, None, "rq-refusal", self.fit,
+                        ["r0"], 20, ["a"], ["intact"])
+
+    def test_actual_reference_panel_constraints_and_provenance(self):
+        original = rqlib.read_json(self.refs)
+
+        def assign(doc, slot, world=None, frame=None):
+            v = doc["references"][slot]
+            if world is not None:
+                v["world"] = world
+                v["uuid"] = refsel.recipe(doc["namespace"], world)
+            if frame is not None:
+                v["frame"] = frame
+            v["snapshot"] = sealing.snapshot_uuid(v["uuid"], v["frame"])
+
+        bad = []
+        for fr in (1, 100_000_000):
+            doc = copy.deepcopy(original)
+            for slot in doc["references"]:
+                assign(doc, slot, "sentinel-0", fr)
+            # Reproduce the review: these assignments pass the protected reader.
+            rqlib.write_json_durable(self.refs, doc)
+            self.assertEqual(len(R.reference_times(self.refs)[0]["RQ"]), 8)
+            bad.append(("same snapshot in one guild", doc))
+        doc = copy.deepcopy(original)
+        for k, fr in enumerate((1, 20, 60, 100, 140, 140, 180, 200)):
+            assign(doc, f"RQ:{k}", f"sentinel-{k % 2}", fr if fr == 1 else fr * 1_000_000)
+        bad.append(("three distinct", doc))
+        for label, k, fr in (("four early", 3, 180_000_000), ("two late", 5, 120_000_000)):
+            doc = copy.deepcopy(original)
+            if label == "two late":
+                for j in (4, 6):
+                    assign(doc, f"RQ:{j}", frame=120_000_000)
+            assign(doc, f"RQ:{k}", frame=fr)
+            bad.append((label, doc))
+        doc = copy.deepcopy(original)
+        assign(doc, "RQ:0", frame=30_000_000)
+        bad.append(("candidate time", doc))
+        doc = copy.deepcopy(original)
+        doc.pop("selection")
+        bad.append(("selection provenance", doc))
+        doc = copy.deepcopy(original)
+        assign(doc, "RQ:0", "not-a-sentinel")
+        bad.append(("registered sentinel candidate", doc))
+        doc = copy.deepcopy(original)
+        doc["references"]["RQ:0"]["uuid"] = refsel.recipe("rq-extra-study", "C01")
+        bad.append(("uuid is not sentinel", doc))
+        doc = copy.deepcopy(original)
+        doc["selection"]["plan_sha256"] = None
+        bad.append(("plan_sha256", doc))
+        doc = copy.deepcopy(original)
+        doc["selection"]["availability"]["sentinel-0"]["archived"].remove(1)
+        doc["selection"]["availability_sha256"] = rqlib.canonical_sha(doc["selection"]["availability"])
+        doc["selection"]["omitted"] = [{"world": "sentinel-0", "time": "F1", "reason": "not archived"}]
+        bad.append(("registered sentinel candidate", doc))
+        for why, doc in bad:
+            with self.subTest(why=why):
+                rqlib.write_json_durable(self.refs, doc)
+                with self.assertRaisesRegex(SystemExit, why):
+                    X.data_from(self.gpath, self.refs)
+        # 120M is an allowed early boundary, and assumed-slot planning stays available.
+        assign(original, "RQ:3", frame=120_000_000)
+        rqlib.write_json_durable(self.refs, original)
+        D = X.data_from(self.gpath, self.refs)
+        self.assertEqual(D.ref_times["RQ"][3], 120)
+        self.assertIsNotNone(X.data_from(self.gpath, None))
+
+    def test_reference_study_exclusion_and_registry_binding(self):
+        doc = rqlib.read_json(self.refs)
+        binding = doc["selection"]["binding"]
+        for kind in ("main", "forks", "namespace", "changed"):
+            with self.subTest(kind=kind):
+                path = next(s["path"] for s in binding["studies"]
+                            if (s.get("kind") == "forks") == (kind == "forks"))
+                raw = rqlib.read_bytes(path)
+                reg = rqlib.read_json(path)
+                if kind == "namespace":
+                    reg["namespace"] = refsel.VALIDATION_NAMESPACE
+                else:
+                    reg["worlds"].append({"id": "collision", "uuid": (
+                        doc["references"]["RQ:0"]["uuid"] if kind != "changed" else "changed"
+                    )})
+                rqlib.write_json_durable(path, reg)
+                with self.assertRaisesRegex(SystemExit, "study identity|validation namespace|registries missing or changed"):
+                    X.data_from(self.gpath, self.refs)
+                rqlib.write_durable(path, raw)
+        g = copy.deepcopy(self.D.g)
+        g["registry"] = {"namespace": "another-study", "uuids": {}}
+        with self.assertRaisesRegex(SystemExit, "this graph's study registry"):
+            X.validate_references(self.refs, g)
 
     def test_partition_and_primary_immutability(self):
         D = self.D
@@ -291,6 +435,184 @@ class TestRecoveryExtra(unittest.TestCase):
             rqlib.canonical(X.clean(actual)),
         )
 
+    def test_one_root_descriptive_scores_without_crossed_decision(self):
+        seed = 41
+        data = R.simulate(self.D, R.SCENARIOS["r0"], seed)
+        keep, _, _ = X.mask_for(self.D, self.plan, "roots1")
+        # Keep real fits and validation selection. A resolved scorer isolates the
+        # root-count rule from the count-integral tolerance, with known scores.
+        def resolved(v, _data, model, _idx, _fitter):
+            def score(ix, info=None):
+                if info is not None:
+                    info["grid_unresolved"] = 0
+                values = np.full(len(ix), 0.25 * model["u"].shape[1])
+                return values, values * 2
+            return score
+
+        for op in ("a", "interp", "fwd_all", "fwd_early"):
+            v = X.view_for(self.D, self.plan, op, keep)
+            if op == "interp":
+                # Interpolation repartitions training pairs independently of the
+                # primary roots1 mask; retain one actual interpolation test root.
+                chosen = v.test_world == v.test_world[0]
+                v.test_idx, v.test_world = v.test_idx[chosen], v.test_world[chosen]
+            if op.startswith("fwd_"):
+                # Both forward branches get exactly one contributing root.
+                v.forward["tests"] = {
+                    name: ix[tw == tw[0]] for name, (ix, tw) in X.branches(v, op).items()
+                }
+            for _, tw in X.branches(v, op).values():
+                self.assertEqual(len(np.unique(tw)), 1, op)
+            with self.subTest(option=op), mock.patch.object(R, "scorer", side_effect=resolved), \
+                    mock.patch.object(R, "crossed_lb", side_effect=AssertionError("one-root bootstrap")):
+                out = X.evaluate(v, data, self.plan, seed, op)
+                rows = [out[n] for n in X.branches(v, op)] if op.startswith("fwd_") else [out]
+                for row in rows:
+                    self.assertEqual(row["test_roots"], 1)
+                    self.assertFalse(row["available"])
+                    self.assertFalse(row["success"])
+                    self.assertTrue(row["descriptive"])
+                    self.assertAlmostEqual(row["test_improvement"], 0.25)
+                    self.assertEqual(row["per_world"], [0.25])
+                    self.assertEqual(len(row["per_world_ids"]), 1)
+                    self.assertIsNone(row.get("test_lb"))
+                self.assertFalse(out["decision"]["available"])
+
+    def test_companion_attrition_masks_and_nominal_forward_availability(self):
+        seed = 41
+        data = R.simulate(self.D, R.SCENARIOS["r0"], seed)
+        for op in ("interp", "fwd_all", "fwd_early"):
+            keep, _, _ = X.mask_for(self.D, self.plan, "mixed")
+            v = X.view_for(self.D, self.plan, op, keep)
+            bad = dict(data)
+            # No evaluation target or calibration row may read an attrited pair.
+            for key, bar in (("z", "zbar"), ("s", "sbar")):
+                x = data[key].copy()
+                x[~keep] += 17
+                bad[key], bad[bar] = x, x.mean(axis=1)
+            ctrl = v.forward["ctrl"] if op.startswith("fwd_") else M.control_access(v, v.fit["a"])
+            s0 = data["s0"].copy()
+            s0[~ctrl] += 19
+            bad["s0"], bad["s0bar"] = s0, s0.mean(axis=1)
+            actual = [X.clean(X.evaluate(v, d, self.plan, seed, op)) for d in (data, bad)]
+            self.assertEqual(actual[0], actual[1], op)
+            if op.startswith("fwd_"):
+                for branch in ("forward_transfer", "intersection"):
+                    self.assertTrue(actual[0][branch]["available"], (op, branch, actual[0][branch]))
+
+    def test_new_forward_test_only_unresolved_withholds_scores(self):
+        seed = 41
+        data = R.simulate(self.D, R.SCENARIOS["r0"], seed)
+        v = X.view_for(self.D, self.plan, "fwd_all", np.ones(len(self.D.qi), bool))
+        original = R.scorer
+
+        def flagged(*args, **kwargs):
+            score = original(*args, **kwargs)
+
+            def wrapped(ix, info=None):
+                result = score(ix, info)
+                if np.array_equal(ix, v.forward["tests"]["intersection"]) and info is not None:
+                    info["grid_unresolved"] = 1
+                return result
+            return wrapped
+
+        with mock.patch.object(R, "scorer", side_effect=flagged):
+            out = X.evaluate(v, data, self.plan, seed, "fwd_all")
+        self.assertTrue(out["forward_transfer"]["available"])
+        self.assertFalse(out["intersection"]["available"])
+        self.assertNotIn("test_improvement", out["intersection"])
+        self.assertNotIn("test_lb", out["intersection"])
+
+    def test_supervisor_termination_reaps_workers_before_unlock_and_resumes(self):
+        import fcntl
+
+        directory = os.path.join(self.root, "termination")
+        self.prepared(directory, cases="intact,roots1", options="a")
+        argv = ["run", "--dir", directory, "--graph", self.gpath,
+                "--references", self.refs, "--jobs", "2"]
+
+        def children(pid):
+            with open(f"/proc/{pid}/task/{pid}/children") as handle:
+                return [int(p) for p in handle.read().split()]
+
+        def active(pid):
+            try:
+                with open(f"/proc/{pid}/stat") as handle:
+                    return handle.read().split()[2] != "Z"
+            except FileNotFoundError:
+                return False
+
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            launch_log = os.path.join(self.root, f"supervisor-{sig}.log")
+            with self.subTest(signal=sig), open(launch_log, "wb") as output, subprocess.Popen(
+                [sys.executable, "-I", "-B", X.__file__, *argv],
+                stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT,
+            ) as supervisor:
+                workers = []
+                try:
+                    deadline = time.monotonic() + 15
+                    while time.monotonic() < deadline:
+                        # A fork appears in /proc before its preexec guard runs.
+                        # Only the post-exec acknowledgment identifies a worker
+                        # that has completed guarded launch.
+                        lines = rqlib.read_bytes(launch_log).decode().splitlines()
+                        workers = [int(line.rsplit(" ", 1)[1]) for line in lines
+                                   if line.startswith("started ") and ": guarded pid " in line]
+                        if len(workers) == 2:
+                            break
+                        self.assertIsNone(supervisor.poll())
+                        time.sleep(0.01)
+                    self.assertEqual(len(workers), 2)
+                    self.assertEqual(set(workers), set(children(supervisor.pid)))
+                    for pid in workers:
+                        with open(f"/proc/{pid}/cmdline", "rb") as handle:
+                            self.assertIn(b"\0one\0", handle.read())
+                        os.kill(pid, signal.SIGSTOP)
+                    supervisor.send_signal(sig)
+                    if sig == signal.SIGTERM:
+                        # Stopped workers force the bounded-kill path. During reaping,
+                        # a restart must still be refused by the supervisor's lock.
+                        time.sleep(0.2)
+                        with open(os.path.join(directory, ".lock"), "a") as lock:
+                            with self.assertRaises(BlockingIOError):
+                                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        supervisor.send_signal(signal.SIGTERM)  # repeated termination cannot skip cleanup
+                    self.assertNotEqual(supervisor.wait(timeout=15), 0)
+                    deadline = time.monotonic() + 5
+                    while any(active(pid) for pid in workers) and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    self.assertFalse(any(active(pid) for pid in workers))
+                    with X.locked(directory):
+                        pass  # lock becomes available only once cleanup finishes
+                finally:
+                    if supervisor.poll() is None:
+                        supervisor.kill()
+                        supervisor.wait()
+                    for pid in workers:
+                        if active(pid):
+                            os.kill(pid, signal.SIGKILL)
+        self.command(*argv)
+        plan = X.read_frozen(directory)
+        found = X.read_results(directory, plan)
+        self.assertEqual(len(found), 2)
+        before = {n: rqlib.read_bytes(os.path.join(directory, "results", n)) for n in found}
+        self.command(*argv)
+        self.assertEqual(before, {n: rqlib.read_bytes(os.path.join(directory, "results", n)) for n in found})
+
+    def test_fork_suite_refuses_one_worker_before_workdir_changes(self):
+        directory = os.path.join(self.root, "keep")
+        os.mkdir(directory)
+        marker = os.path.join(directory, "marker")
+        rqlib.write_durable(marker, b"keep")
+        env = dict(os.environ, RQ_TEST_WORKERS="1")
+        cp = subprocess.run(
+            ["bash", os.path.join(HERE, "../../tests/redqueen_forks.sh"), "/unused/engine", directory],
+            env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        )
+        self.assertEqual(cp.returncode, 2, cp.stdout)
+        self.assertIn("at least 2", cp.stdout)
+        self.assertEqual(rqlib.read_bytes(marker), b"keep")
+
     def test_unresolved_validation_never_decides_new_forward(self):
         D = self.D
         keep = np.ones(len(D.qi), bool)
@@ -375,6 +697,10 @@ class TestRecoveryExtra(unittest.TestCase):
         partial = X.summarize(first)
         self.assertFalse(partial["complete"])
         self.assertEqual(partial["scheduled_tasks"] - partial["completed_tasks"], 1)
+        missing_case, missing_scenario, _ = (a[missing][k] for k in ("case", "scenario", "rep"))
+        for cell in partial["cells"]:
+            if (cell["case"], cell["scenario"]) == (missing_case, missing_scenario):
+                self.assertEqual((cell["datasets"], cell["missing"], cell["unavailable"]), (1, 1, 1))
         # A copied result under another name is refused.
         shutil.copyfile(
             os.path.join(second, "results", missing),
@@ -382,6 +708,41 @@ class TestRecoveryExtra(unittest.TestCase):
         )
         with self.assertRaisesRegex(SystemExit, "stray"):
             X.summarize(first)
+
+    def test_acceptance_boundary_separate_effects_and_fixed_denominators(self):
+        plan = dict(self.plan, toy=False, reps=20, cases=["intact"], options=["a"],
+                    scenarios=list(R.SETS["main"]), fit={
+                        "ranks": 4, "lambdas": "0.01,0.02,0.05,0.2", "iters": 30,
+                        "start": "both", "basis": 6, "embedding": "shared", "center": "references",
+                    })
+        for successes in ((15, 20), (20, 15), (16, 16)):
+            found = {}
+            for case, sc, rep in X.tasks(plan):
+                n = successes[X.CRITERION["scenarios"].index(sc)] if sc in X.CRITERION["scenarios"] else 0
+                found[X.task_name((case, sc, rep))] = {"options": {"a": {
+                    "decision": {"available": rep != 19}, "success": rep < n,
+                }}}
+            # Keep failures and unavailable realizations in the 20-dataset denominator.
+            with mock.patch.object(X, "read_frozen", return_value=plan), \
+                    mock.patch.object(X, "read_results", return_value=found):
+                summary = X.summarize(self.root)
+            self.assertTrue(summary["criterion"]["applicable"])
+            self.assertEqual(summary["criterion"]["core_pass"], successes == (16, 16))
+            for sc, n in zip(X.CRITERION["scenarios"], successes):
+                cell = next(c for c in summary["cells"] if c["scenario"] == sc)
+                self.assertEqual(cell["datasets"], 20)
+                self.assertEqual(cell["successes"], min(n, 19))
+                self.assertEqual(cell["unavailable"], 1)
+                self.assertEqual(cell["rate"], min(n, 19) / 20)
+            # A missing realization is not silently removed, even with 16 successes.
+            if successes == (16, 16):
+                del found[X.task_name(("intact", "r1_034", 19))]
+                with mock.patch.object(X, "read_frozen", return_value=plan), \
+                        mock.patch.object(X, "read_results", return_value=found):
+                    missing = X.summarize(self.root)
+                self.assertFalse(missing["criterion"]["core_pass"])
+                cell = next(c for c in missing["cells"] if c["scenario"] == "r1_034")
+                self.assertEqual((cell["datasets"], cell["missing"], cell["successes"]), (20, 1, 16))
 
     def test_freeze_refuses_tampering_and_changed_references(self):
         directory = os.path.join(self.root, "frozen")
@@ -400,8 +761,30 @@ class TestRecoveryExtra(unittest.TestCase):
         refs = rqlib.read_json(self.refs)
         refs["references"]["RQ:4"]["frame"] = 120_000_000
         rqlib.write_json_durable(self.refs, refs)
+        with self.assertRaises(SystemExit) as refused:
+            X.verified(directory, self.gpath, self.refs)
+        self.assertEqual(str(refused.exception),
+                         f"{self.refs}: invalid actual reference panel: {self.refs}: "
+                         "RQ:4's snapshot UUID is not sentinel-0@120000000's")
+        refs["references"]["RQ:4"]["snapshot"] = sealing.snapshot_uuid(
+            refs["references"]["RQ:4"]["uuid"], 120_000_000)
+        rqlib.write_json_durable(self.refs, refs)
         with self.assertRaisesRegex(SystemExit, "changed"):
             X.verified(directory, self.gpath, self.refs)
+
+    def test_completed_result_body_tampering_is_refused(self):
+        directory = os.path.join(self.root, "corrupt-result")
+        self.prepared(directory, cases="roots0", options="a")
+        args = ["run", "--dir", directory, "--graph", self.gpath, "--references", self.refs]
+        self.command(*args)
+        plan = X.read_frozen(directory)
+        path = os.path.join(directory, "results", X.task_name(X.tasks(plan)[0]))
+        result = rqlib.read_json(path)
+        result["options"]["a"]["success"] = True
+        rqlib.write_json_durable(path, result)
+        with self.assertRaisesRegex(SystemExit, "body hash"):
+            X.read_results(directory, plan)
+        self.assertIn("body hash", self.command(*args, ok=False).stdout)
 
 
 if __name__ == "__main__":

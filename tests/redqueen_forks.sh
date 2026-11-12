@@ -21,7 +21,7 @@ T=$(cd "$(dirname "${BASH_SOURCE[0]}")/../tools/redqueen" && pwd)
 PY="${PYTHON:-python3} -I"
 NW=${RQ_TEST_WORKERS:-4}
 case "$NW" in ''|*[!0-9]*) echo "invalid RQ_TEST_WORKERS: $NW" >&2; exit 2 ;; esac
-[ "$NW" -ge 1 ] || { echo "RQ_TEST_WORKERS must be positive" >&2; exit 2; }
+[ "$NW" -ge 2 ] || { echo "RQ_TEST_WORKERS must be at least 2 for the concurrent branch crash test" >&2; exit 2; }
 WS="$PY $T/worlds.py"
 FK="$PY $T/forks.py"
 [ -d "$W" ] && chmod -R u+w "$W" 2> /dev/null

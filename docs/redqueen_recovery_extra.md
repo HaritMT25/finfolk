@@ -55,13 +55,22 @@ assignments are available. Otherwise the legacy configuration records assumed
 slot times, with the same prelaunch qualification and deterministic later
 relabelling requirement. The plan binds actual reference bytes and times when
 supplied; identities must be sentinel references, separate from main/fork
-identities.
+identities. Actual panels require a `refsel.py` selection receipt and its
+accessible validation/main/fork registries. The companion rechecks registered
+sentinel identities and study exclusion, available candidate times, unique
+snapshots within each guild, at least three sentinels, at least four early
+references (through 120M), and at least two late references (from 140M).
+Malformed or inadmissible panels are refused before freezing. This validates
+the receipt's bindings and panel constraints; it does not rerun selection or
+certify the underlying assays. Assumed-slot planning remains explicitly qualified.
 
 `prepare` generates no observations. It freezes scientific settings, the pair
 partition, attrition recipes, graph and reference identities, production Python
 source hashes, runtime versions, resolved legacy configuration, and scheduled
 task identities. A registered 64-world layout and production graph quotas are
-required. A graph explicitly marked `recovery_toy` additionally requires
+required, including `train_matchings=true` and the training-only matching quota.
+The supported legacy `--no-train-matchings` graph is refused for registered
+recovery. A graph explicitly marked `recovery_toy` additionally requires
 `--allow-toy`; its reduced topology cannot supply production recovery evidence.
 
 `run` accepts no scientific overrides. It verifies graph, metadata, references,
@@ -72,6 +81,13 @@ results are retained byte-for-byte, missing tasks are run, and changed inputs,
 stray results, or mismatched result identities/body hashes are refused. Existing
 conflicting frozen/output bytes require a new directory. Operational timing
 stays in logs; legacy elapsed-time behavior is unchanged.
+SIGTERM and SIGINT terminate and reap workers before releasing the lock;
+repeated termination signals cannot bypass cleanup. Workers receive the
+repository's Linux parent-death SIGKILL protection against abrupt supervisor
+loss. The supervisor logs each guarded PID after guard installation and exec;
+a newly forked child listed in `/proc` may still be awaiting guard installation.
+Linux launches are refused if the guard is unavailable. The fork integration suite requires at least two workers for its
+concurrent branch crash test.
 
 `summarize` retains missing and unavailable realizations in scheduled
 acceptance denominators, reports Wilson 95% intervals, availability, selected
@@ -81,7 +97,8 @@ It may summarize incomplete runs, which are explicitly marked incomplete.
 ## Procedures and access
 
 - `a` calls the existing registered `recovery.procedure` on retained indices.
-  The intact case is the existing procedure.
+  The intact case is the existing procedure. For one contributing test root,
+  the companion fits and selects models to retain available descriptive scores.
 - `interp` is a separate 80/10/10 fit over ordinary global non-support ordered
   population pairs. SHA-256 identity ordering assigns floor(0.8N) to training,
   floor(0.1N) to validation, and the remainder to test. All replicates, horizons,
@@ -100,7 +117,9 @@ It may summarize incomplete runs, which are explicitly marked incomplete.
 - Existing guards and unresolved-integral handling remain in force. Zero or
   one contributing test root cannot succeed. Two roots meet only the count
   guard; they do not establish identifiability or power. Unresolved validation
-  or selected/rank-zero test integrals withhold a decision.
+  or selected/rank-zero test integrals withhold a decision. A resolved one-root
+  comparison reports its improvement and identified per-world score, without
+  a crossed interval or prediction decision. Zero-root cases have no score.
 
 ## Frozen synthetic attrition
 
