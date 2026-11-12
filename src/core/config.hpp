@@ -180,6 +180,7 @@ struct SimConfig {
     int   genomeInitMin   = GENOME_INITIAL_MIN;  // initial gene-count range (low)
     int   genomeInitMax   = GENOME_INITIAL_MAX;  // initial gene-count range (high)
     float mutationMultiplier = 1.0f;             // scales the per-birth mutation rate
+    WeightMutationMode weightMutationMode = WeightMutationMode::Legacy;
 
     // --- Currents (ocean flow; off by default) ---
     float currentStrength = 0.0f;   // peak flow speed, world units/sec (0 = off)
@@ -458,6 +459,9 @@ struct SimConfig {
               << " predatorPrimer="   << (predatorPrimer ? "on" : "off")
               << " predatorFrozen="   << (predatorFrozen ? "on (no deaths, no buds)" : "off")
               << " predatorLog="      << (predatorLog ? "on" : "off");
+        if (weightMutationMode != WeightMutationMode::Legacy)
+            o << "\nweightMutationMode="
+              << weightMutationModeName(weightMutationMode);
         return o.str();
     }
 };
@@ -467,7 +471,70 @@ struct SimConfig {
 // because NaN compares false to everything). Checked whatever predatorBrain
 // says, so a value is never accepted now and refused once the brain goes on.
 // nullptr when the config is fine.
+inline const char* brainPolicyConfigError(const SimConfig& c) {
+    if (c.weightMutationMode != WeightMutationMode::Legacy &&
+        c.weightMutationMode != WeightMutationMode::Saturating)
+        return "weightMutationMode must be legacy or saturating";
+
+    if (c.weightMutationMode == WeightMutationMode::Saturating) {
+        if (!(c.genomeMinLength > 0 &&
+              c.genomeMinLength <= c.genomeInitMin &&
+              c.genomeInitMin <= c.genomeInitMax &&
+              c.genomeInitMax <= c.genomeMaxLength))
+            return "saturating mutation requires coherent positive genome lengths";
+        // Format 3 persists these floats: accepted configurations must remain
+        // readable after narrowing from frontend doubles to stored floats.
+        if (!std::isfinite(c.reproMaxDistance)) return "reproMaxDistance must be finite";
+        if (!std::isfinite(c.reproSoftWidth)) return "reproSoftWidth must be finite";
+        if (!std::isfinite(c.reproGracePeriod)) return "reproGracePeriod must be finite";
+        if (!std::isfinite(c.bodyMutation)) return "bodyMutation must be finite";
+        if (!std::isfinite(c.foodSpawnBase)) return "foodSpawnBase must be finite";
+        if (!std::isfinite(c.foodSpawnAmp)) return "foodSpawnAmp must be finite";
+        if (!std::isfinite(c.foodEnergy)) return "foodEnergy must be finite";
+        if (!std::isfinite(c.pickupRadius)) return "pickupRadius must be finite";
+        if (!std::isfinite(c.metabolicRate)) return "metabolicRate must be finite";
+        if (!std::isfinite(c.geneCost)) return "geneCost must be finite";
+        if (!std::isfinite(c.moveCost)) return "moveCost must be finite";
+        if (!std::isfinite(c.maxAge)) return "maxAge must be finite";
+        if (!std::isfinite(c.reproEnergy)) return "reproEnergy must be finite";
+        if (!std::isfinite(c.newbornEnergy)) return "newbornEnergy must be finite";
+        if (!std::isfinite(c.perceptionRadius)) return "perceptionRadius must be finite";
+        if (!std::isfinite(c.interactRadius)) return "interactRadius must be finite";
+        if (!std::isfinite(c.reproCooldown)) return "reproCooldown must be finite";
+        if (!std::isfinite(c.interactCooldown)) return "interactCooldown must be finite";
+        if (!std::isfinite(c.minSpeed)) return "minSpeed must be finite";
+        if (!std::isfinite(c.maxSpeed)) return "maxSpeed must be finite";
+        if (!std::isfinite(c.maxTurnRate)) return "maxTurnRate must be finite";
+        if (!std::isfinite(c.mutationMultiplier)) return "mutationMultiplier must be finite";
+        if (!std::isfinite(c.currentStrength)) return "currentStrength must be finite";
+        if (!std::isfinite(c.currentCore)) return "currentCore must be finite";
+        if (!std::isfinite(c.currentDrift)) return "currentDrift must be finite";
+        if (!std::isfinite(c.currentGyreEps)) return "currentGyreEps must be finite";
+        if (!std::isfinite(c.foodPatchRadius)) return "foodPatchRadius must be finite";
+        if (!std::isfinite(c.predatorPerception)) return "predatorPerception must be finite";
+        if (!std::isfinite(c.predatorSpeed)) return "predatorSpeed must be finite";
+        if (!std::isfinite(c.predatorCaptureRadius)) return "predatorCaptureRadius must be finite";
+        if (!std::isfinite(c.predatorCooldown)) return "predatorCooldown must be finite";
+        if (!std::isfinite(c.predatorMetabolism)) return "predatorMetabolism must be finite";
+        if (!std::isfinite(c.predatorMoveCost)) return "predatorMoveCost must be finite";
+        if (!std::isfinite(c.predatorReproEnergy)) return "predatorReproEnergy must be finite";
+        if (!std::isfinite(c.predatorNewbornEnergy)) return "predatorNewbornEnergy must be finite";
+        if (!std::isfinite(c.predatorMeal)) return "predatorMeal must be finite";
+        if (!std::isfinite(c.predatorMaxAge)) return "predatorMaxAge must be finite";
+        if (!std::isfinite(c.predatorTraitMutation)) return "predatorTraitMutation must be finite";
+        if (c.predatorBrain) {
+            if (!std::isfinite(c.predatorMutation)) return "predatorMutation must be finite";
+            if (!std::isfinite(c.predatorTurnRate)) return "predatorTurnRate must be finite";
+            if (!std::isfinite(c.predatorMinSpeed)) return "predatorMinSpeed must be finite";
+        }
+        if (c.predatorBrain && c.predatorPrimer && c.genomeMaxLength < 2)
+            return "saturating neural predator primer requires genomeMaxLength >= 2";
+    }
+    return nullptr;
+}
+
 inline const char* predatorBrainConfigError(const SimConfig& c) {
+    if (const char* why = brainPolicyConfigError(c)) return why;
     if (!(c.predatorMutation >= 0.0f) || !std::isfinite(c.predatorMutation))
         return "predatorMutation must be finite and >= 0";
     if (!(c.predatorTurnRate >= 0.0f) || !std::isfinite(c.predatorTurnRate))

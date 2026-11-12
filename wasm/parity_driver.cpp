@@ -128,6 +128,7 @@ int main(int argc, char** argv) {
     const unsigned seed = (unsigned)std::strtoul(argv[1], nullptr, 10);
     const long steps = std::strtol(argv[2], nullptr, 10);
     bool rich = false, tri = false, tor = false, bodyModel = false;
+    WeightMutationMode weightMode = WeightMutationMode::Legacy;
     float reproMaxDistance = -1.0f;
     float reproSoftWidth = 0.0f, reproGracePeriod = 0.0f;
     int predFloor = 0, predCap = 0, predCount = -1;
@@ -165,6 +166,13 @@ int main(int argc, char** argv) {
             predMaxAge = (float)std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "--engine-version") && i + 1 < argc) engineVersion = argv[++i];
         else if (!std::strcmp(argv[i], "--trace") && i + 1 < argc) traceEvery = std::strtol(argv[++i], nullptr, 10);
+        else if (!std::strcmp(argv[i], "--weight-mutation-mode") &&
+                 i + 1 < argc) {
+            if (!parseWeightMutationMode(argv[++i], weightMode)) {
+                std::fprintf(stderr, "invalid weight mutation mode\n");
+                return 2;
+            }
+        }
         else { std::fprintf(stderr, "unknown arg %s\n", argv[i]); return 2; }
     }
 
@@ -200,6 +208,7 @@ int main(int argc, char** argv) {
     if (predPrimer) world.cfg.predatorPrimer = true;
     if (predFrozen) world.cfg.predatorFrozen = true;         // the frozen assay's accounting
     if (predMaxAge > 0.0f) world.cfg.predatorMaxAge = predMaxAge;
+    world.cfg.weightMutationMode = weightMode;
     world.init(1920, 1080, 300);
 
     const auto t0 = std::chrono::steady_clock::now();

@@ -72,11 +72,12 @@ inline float birthMutationRate(float u) {
 // that picks the mutation rate, then the mutation draws. Called before the
 // world places the child, as makeChild always did. Draws (serial phase).
 inline void inheritGenome(AgentCore& child, const AgentCore& p1, const AgentCore& p2,
-                          int minLen, int maxLen, float mutMultiplier) {
+                          int minLen, int maxLen, float mutMultiplier,
+                          WeightMutationMode mode = WeightMutationMode::Legacy) {
     child.genome = crossover(p1.genome, p2.genome);
 
     const float rate = birthMutationRate(rng.unit());
-    mutateGenome(child.genome, rate * mutMultiplier, minLen, maxLen);
+    mutateGenome(child.genome, rate * mutMultiplier, minLen, maxLen, mode);
 }
 
 // Internal state actions: the oscillator period and responsiveness follow the

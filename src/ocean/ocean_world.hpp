@@ -2328,7 +2328,8 @@ private:
                 newborns.push_back(makeChildFish(c1, c2, cfg.genomeMinLength,
                                                  cfg.genomeMaxLength,
                                                  cfg.mutationMultiplier,
-                                                 cfg.newbornEnergy));
+                                                 cfg.newbornEnergy,
+                                                 cfg.weightMutationMode));
                 if (appearanceOn()) {   // c1, c2 are elements of `creatures` (update's serial loop)
                     newbornParents.push_back((std::uint32_t)(&c1 - creatures.data()));
                     newbornParents.push_back((std::uint32_t)(&c2 - creatures.data()));

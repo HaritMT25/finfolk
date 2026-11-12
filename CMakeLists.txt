@@ -153,6 +153,10 @@ add_executable(core_tests tests/core_tests.cpp)
 target_link_libraries(core_tests PRIVATE evo_core)
 add_test(NAME core_tests COMMAND core_tests)
 
+add_executable(weight_policy_frontend tests/weight_policy_frontend.cpp)
+target_link_libraries(weight_policy_frontend PRIVATE evo_core)
+add_test(NAME weight_policy_frontend COMMAND weight_policy_frontend)
+
 # predator_smoke — a longer no-SFML integration run with predators ON, asserting
 # the run-level invariants (pop floor, finite positions, predation occurs,
 # predator_align in range, deaths == predation+starvation+age, fixed predator
@@ -176,6 +180,9 @@ if(SFML_FOUND AND EVO_NO_OPENMP AND NOT EVO_POOL_THREADS)
     add_test(NAME stagec_cli
              COMMAND bash ${CMAKE_SOURCE_DIR}/tests/stagec_cli.sh
                      $<TARGET_FILE:evo_boids> ${CMAKE_CURRENT_BINARY_DIR}/stagec_cli_work)
+    add_test(NAME weight_policy_cli
+             COMMAND bash ${CMAKE_SOURCE_DIR}/tests/weight_policy_cli.sh
+                     $<TARGET_FILE:evo_boids> ${CMAKE_CURRENT_BINARY_DIR}/weight_policy_cli_work)
     # invasion_tooling — tools/invasion (arena, score, run, hodge) against the
     # real engine; pins the child-id derivation the invasion scores rely on.
     find_package(Python3 COMPONENTS Interpreter QUIET)

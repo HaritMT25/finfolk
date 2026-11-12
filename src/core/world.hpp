@@ -1169,7 +1169,8 @@ private:
                 newborns.push_back(makeChild(c1, c2, cfg.genomeMinLength,
                                              cfg.genomeMaxLength,
                                              cfg.mutationMultiplier,
-                                             cfg.newbornEnergy));
+                                             cfg.newbornEnergy,
+                                             cfg.weightMutationMode));
                 if (cfg.toroidal) {
                     // makeChild placed the newborn at the raw parent midpoint;
                     // for a seam-crossing pair that is mid-world. Re-place at

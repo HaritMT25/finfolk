@@ -4673,6 +4673,112 @@ int acceptsMain(int argc, char** argv) {
 // first) it is refused; changes in one step keep their argument order; a
 // change at or after STEPS is not applied and so not asked; a malformed or
 // negative-step --set is an argument error.
+void testWeightMutationPolicy() {
+    Test t("weight_policy");
+    SimConfig sc;
+    OceanConfig oc;
+    std::string error;
+    t.expect(readOceanJson(R"({"weightMutationMode":"saturating"})",
+                           sc, oc, error),
+             "saturation config refused: %s", error.c_str());
+    t.expect(sc.weightMutationMode == WeightMutationMode::Saturating,
+             "saturation config was not stored");
+
+    for (const char* bad : {
+             R"({"weightMutationMode":"wrap"})",
+             R"({"weightMutationMode":1})",
+             R"({"weightMutationMode":true})",
+             R"({"weightMutationMode":null})",
+             R"({"weightMutationMode":"saturating","weightMutationMode":"legacy"})"
+         }) {
+        SimConfig badSc;
+        OceanConfig badOc;
+        t.expect(!readOceanJson(bad, badSc, badOc, error),
+                 "accepted invalid policy: %s", bad);
+    }
+
+    ofp::Hasher legacyHash, saturationHash;
+    SimConfig legacy, saturation;
+    saturation.weightMutationMode = WeightMutationMode::Saturating;
+    ofp::hashConfig(legacyHash, legacy, oc);
+    ofp::hashConfig(saturationHash, saturation, oc);
+    t.expect(legacyHash.value() != saturationHash.value(),
+             "policy absent from config fingerprint");
+
+    bool different = false;
+    Fish p1, p2;
+    p1.pos = {100, 100};
+    p2.pos = {110, 100};
+    p1.depth = p2.depth = 120;
+    p1.genome.assign(16, Gene{});
+    for (Gene& g : p1.genome) g.weight = 32767;
+    p2.genome = p1.genome;
+    for (unsigned seed = 0; seed < 512; ++seed) {
+        rng.seed(seed);
+        const Fish a = makeChildFish(p1, p2, 16, 80, 1, 25,
+                                     WeightMutationMode::Legacy);
+        const std::string state = rng.state();
+        rng.seed(seed);
+        const Fish b = makeChildFish(p1, p2, 16, 80, 1, 25,
+                                     WeightMutationMode::Saturating);
+        t.expect(rng.state() == state, "fish birth changed RNG ordering");
+        bool same = a.genome.size() == b.genome.size();
+        for (size_t i = 0; same && i < a.genome.size(); ++i)
+            same = checkpoint::packGene(a.genome[i]) ==
+                       checkpoint::packGene(b.genome[i]) &&
+                   a.genome[i].weight == b.genome[i].weight;
+        different = different || !same;
+    }
+    t.expect(different, "fish birth did not forward saturation");
+
+    // Real OceanWorld::update pairing must reach the saturating operator.
+    bool clipped = false;
+    for (unsigned seed = 0; seed < 256 && !clipped; ++seed) {
+        Genome children[2];
+        std::string states[2];
+        for (int mode = 0; mode < 2; ++mode) {
+            OceanWorld w;
+            initQuiet(w, seed, 240, OceanConfig{});
+            w.cfg.weightMutationMode = mode ? WeightMutationMode::Saturating : WeightMutationMode::Legacy;
+            w.cfg.genomeMinLength = w.cfg.genomeMaxLength = 16;
+            w.cfg.genomeInitMin = w.cfg.genomeInitMax = 16;
+            const Genome genes(16, mkGene(false, 0, INTERACT_REPRODUCE, 32767));
+            const int a = addFish(w, {960, 540}, 100, genes, 0.4f);
+            const int b = addFish(w, {961, 541}, 100, genes, 0.4f);
+            for (int i : {a, b}) {
+                auto& f = w.creatures[i];
+                f.age = 10; f.foodReserves = 100;
+                f.reproTimer = f.interactTimer = 0;
+            }
+            w.update(0.016f);
+            t.expect(w.creatures.size() == 3, "update-path policy test had no birth");
+            if (w.creatures.size() == 3) children[mode] = w.creatures.back().genome;
+            states[mode] = rng.state();
+        }
+        t.expect(states[0] == states[1], "update birth changed RNG ordering");
+        t.expect(children[0].size() == children[1].size(), "update child lengths differ");
+        for (size_t i = 0; i < std::min(children[0].size(), children[1].size()); ++i)
+            if (children[0][i].weight != children[1][i].weight) {
+                t.expect(children[1][i].weight == 32767 && children[0][i].weight < 0 &&
+                         checkpoint::packGene(children[0][i]) == checkpoint::packGene(children[1][i]),
+                         "update birth difference was not clipped boundary arithmetic");
+                clipped = true;
+            }
+    }
+    t.expect(clipped, "Ocean update birth never clipped a boundary weight");
+
+#ifndef OCEAN_TESTS_NO_SHIM
+    t.expect(oc_init(42, 640, 480, 240, 3,
+                    R"({"weightMutationMode":"saturating"})") == 1,
+             "oc_init rejected saturation: %s", oc_last_error());
+    const auto before = ofp::fingerprint(*g_world);
+    t.expect(oc_set_param("weightMutationMode", 1) == 0,
+             "accepted live policy mutation");
+    t.expect(ofp::fingerprint(*g_world) == before,
+             "refused live policy changed world");
+#endif
+}
+
 void testPreflight() {
     Test t("preflight");
     struct C { std::vector<std::string> args; int rc; const char* what; };
@@ -4963,6 +5069,7 @@ int main(int argc, char** argv) {
     // E1 with the eye build's features, and their keys through the shim
 #ifndef OCEAN_TESTS_NO_SHIM
     ot::testVisionKeys();
+    ot::testWeightMutationPolicy();
     ot::testPreflight();
 #endif
     ot::testEyeE1();
