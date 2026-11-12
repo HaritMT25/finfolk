@@ -109,15 +109,72 @@ console.log("== the lock, deterministic interleavings");
   ok(!fs.existsSync(f), "  the owner's release removes it");
 }
 {
-  /* the mutex: one a dead reclaimer left is cleared; a live one is waited for (the stale lock stays, nothing is taken) */
+  /* the mutex: one a dead reclaimer left FAILS CLOSED (the re-review of PR #85: clearing it by age let two contenders both reclaim);
+     a live one is waited for (the stale lock stays, nothing is taken) */
   const f = mk(fresh()); fs.writeFileSync(f, "dead job\n"); setAge(f, 3 * 60 * MIN);
   fs.writeFileSync(f + ".reclaim", "pid 1\n"); setAge(f + ".reclaim", 5 * MIN);
   const A = createLock({ path: f });
-  ok(A.tryAcquire("job A").held && !fs.existsSync(f + ".reclaim"), "a reclaim mutex a dead process left (older than 30 s) is cleared; the stale lock is then taken");
+  let ea = null; try { A.tryAcquire("job A"); } catch (e) { ea = e; }
+  ok(ea && ea.code === "ELOCKMUTEX" && ea.message.includes(f + ".reclaim") && first(f) === "dead job" && fs.readFileSync(f + ".reclaim", "utf8") === "pid 1\n",
+     "a reclaim mutex a dead process left (older than 30 s) is not cleared: ELOCKMUTEX naming the file; the stale lock and the mutex are untouched",
+     { code: ea && ea.code, msg: ea && ea.message });
   const g = mk(fresh()); fs.writeFileSync(g, "dead job\n"); setAge(g, 3 * 60 * MIN); fs.writeFileSync(g + ".reclaim", "pid 1\n");
   const B = createLock({ path: g, mutexWaitMs: 50 });
   const t0 = Date.now(), b = B.tryAcquire("job B");
   ok(!b.held && first(g) === "dead job" && fs.existsSync(g + ".reclaim") && Date.now() - t0 < 5000, "a live reclaimer's mutex: not taken over, the stale lock not deleted under it; the attempt gives up (waits at its next poll)", { held: b.held, ms: Date.now() - t0 });
+}
+{
+  /* the re-review's interleaving: a crash left a stale lock AND a stale mutex; A and B both look at the mutex's age. Before, A cleared
+     it and took its own, B's earlier-authorised delete removed A's mutex, and both went on to reclaim and run. Here: B is started at the
+     moment A looks at the mutex's age; neither deletes anything (no rmSync of the lock or the mutex at all), both get ELOCKMUTEX. */
+  const f = mk(fresh()), M = f + ".reclaim";
+  fs.writeFileSync(f, "dead job\n2026-01-01T00:00:00.000Z\n"); setAge(f, 3 * 60 * MIN);
+  fs.writeFileSync(M, "pid 1\n"); setAge(M, 5 * MIN);
+  const rms = [];
+  let eb = null, started = false;
+  const rec = (m, args) => { if (m === "rmSync") rms.push(String(args[0])); };
+  const B = createLock({ path: f, fs: hooked(rec) });
+  const A = createLock({ path: f, fs: hooked((m, args) => {
+    rec(m, args);
+    if (m === "statSync" && args[0] === M && !started) { started = true; try { B.tryAcquire("job B"); } catch (e) { eb = e; } }
+  }) });
+  let ea = null; try { A.tryAcquire("job A"); } catch (e) { ea = e; }
+  ok(started && ea && ea.code === "ELOCKMUTEX" && eb && eb.code === "ELOCKMUTEX", "two contenders, a stale lock and a stale mutex (B started while A looks at the mutex): both fail closed with ELOCKMUTEX",
+     { started, a: ea && ea.code, b: eb && eb.code });
+  ok(rms.length === 0 && first(f) === "dead job" && fs.readFileSync(M, "utf8") === "pid 1\n", "  and nothing was deleted: the stale lock and the mutex are as the crash left them", { rms });
+  /* acquire fails closed too (it does not wait forever); once a person deletes the mutex, the stale lock is reclaimed and taken */
+  const C = createLock({ path: f, pollMs: 10 });
+  let ec = null; try { await C.acquire("job C", () => {}); } catch (e) { ec = e; }
+  ok(ec && ec.code === "ELOCKMUTEX", "  acquire() rejects with ELOCKMUTEX", { code: ec && ec.code });
+  fs.rmSync(M);
+  const c = C.tryAcquire("job C");
+  ok(c.held && first(f) === "job C" && !fs.existsSync(M), "  after the mutex is deleted by hand, the stale lock is reclaimed and taken");
+  c.release();
+}
+{
+  /* a holder releasing while an abandoned mutex is there: its own lock is still removed (the plain content check), the mutex stays */
+  const f = mk(fresh()), A = createLock({ path: f });
+  const a = A.tryAcquire("job A");
+  fs.writeFileSync(f + ".reclaim", "pid 1\n"); setAge(f + ".reclaim", 5 * MIN);
+  a.release();
+  ok(!fs.existsSync(f) && fs.existsSync(f + ".reclaim"), "a holder's release with an abandoned mutex there: its lock is removed, the mutex is left for a person");
+}
+{
+  /* EACCES/EPERM with no lock file: a permission problem fails after deniedMs instead of waiting forever; a brief EPERM (a Windows
+     pending delete) is waited through */
+  const f = mk(fresh());
+  const denied = (m, args) => { if (m === "writeFileSync" && args[0] === f) throw Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" }); };
+  const A = createLock({ path: f, pollMs: 10, deniedMs: 100, fs: hooked(denied) });
+  const t0 = Date.now();
+  let ea = null; try { await A.acquire("job A", () => {}); } catch (e) { ea = e; }
+  ok(ea && ea.code === "ELOCKDENIED" && Date.now() - t0 < 5000 && !fs.existsSync(f), "a create refused with EACCES and no lock file there: acquire rejects with ELOCKDENIED after deniedMs, not waiting forever",
+     { code: ea && ea.code, ms: Date.now() - t0 });
+  let n = 0;
+  const brief = (m, args) => { if (m === "writeFileSync" && args[0] === f && n++ < 6) throw Object.assign(new Error("EPERM: operation not permitted"), { code: "EPERM" }); };
+  const B = createLock({ path: f, pollMs: 10, deniedMs: 2000, fs: hooked(brief) });
+  const rel = await B.acquire("job B", () => {});
+  ok(first(f) === "job B", "a brief EPERM (six refused creates) is waited through and the lock is then taken");
+  rel();
 }
 {
   const f = mk(fresh()), A = createLock({ path: f, pollMs: 10 });
@@ -158,6 +215,15 @@ async function round(label, n, pre) {
      "8 processes at the lock at once, three rounds from nothing and three from a stale lock: each one was alone in its critical section, every one got through",
      rs.map((r) => [r.label, r.rows.length + "/" + r.n, "alone " + r.alone, r.bad.slice(0, 1).map((x) => x.err.slice(0, 200))]));
   ok(rs.every((r) => r.left.length === 0), "  and no lock, mutex or marker file left behind", rs.filter((r) => r.left.length).map((r) => r.left));
+  /* a stale lock and an abandoned mutex: every process fails closed; none runs; the files stay for a person */
+  const z = await round("from a stale lock and an abandoned mutex", 8, (f) => {
+    fs.writeFileSync(f, "dead job\n2026-01-01T00:00:00.000Z\n"); setAge(f, 2 * 60 * MIN);
+    fs.writeFileSync(f + ".reclaim", "pid 1\n"); setAge(f + ".reclaim", 5 * MIN);
+  });
+  ok(z.rows.length === 0 && z.bad.length === z.n && z.bad.every((x) => /ELOCKMUTEX|reclaim mutex/.test(x.err)),
+     "8 processes at a stale lock with an abandoned mutex: none got the lock, every one stopped with the mutex error",
+     { rows: z.rows.length, bad: z.bad.length, err: z.bad.slice(0, 1).map((x) => x.err.slice(0, 300)) });
+  ok(z.left.length === 2 && z.left.every((p) => !p.endsWith(".inside")), "  the stale lock and the mutex are left as they were (no marker: nobody was inside)", z.left);
 }
 
 fs.rmSync(TMP, { recursive: true, force: true });
