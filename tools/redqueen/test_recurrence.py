@@ -109,13 +109,13 @@ class TestRecurrence(unittest.TestCase):
 
     def test_rms_conversion(self):
         """13: intercept-only nuisance, complete uniform cycles: RMS{a cos + b sin} = sqrt((a^2 + b^2) / 2);
-        a cosine of amplitude sqrt(2) 0.10 m is a 10% relative RMS, sqrt(2) 0.04 an RMS of 0.04."""
+        a cosine of amplitude sqrt(2) 0.10 m is a 10% relative RMS, sqrt(2) D_Q an RMS of D_Q (D8)."""
         rc = self.rc
         P = 10.0
         t = np.arange(0, 3 * P, P / 16)
         proj = rc.Projector(np.ones((len(t), 1)), rc.Cov(np.ones(len(t))))
         hm = proj.harmonic(rc.harmonic_matrix(t, P))
-        for a, b in ((0.3, 0.4), (math.sqrt(2) * 0.10 * 0.45, 0.0), (math.sqrt(2) * 0.04, 0.0)):
+        for a, b in ((0.3, 0.4), (math.sqrt(2) * 0.10 * 0.45, 0.0), (math.sqrt(2) * rc.D_Q, 0.0)):
             y = 0.45 + a * np.cos(2 * math.pi * t / P) + b * np.sin(2 * math.pi * t / P)
             D = hm.fit(y)[2]
             rms = math.sqrt(np.mean(D ** 2))
@@ -462,7 +462,7 @@ class TestRecurrence(unittest.TestCase):
         res = self.hfw([self.data(8.0, 0.3, 0.3, 0.05, 0.02, 0.06, 0.03)])
         d = rc.hf_decision(res, c_F=res["S_F"] / 2, p_F=0.005, c_M=1.0, p_M=0.004)
         self.assertTrue(d["detection"])
-        self.assertEqual(d["operational"], res["R_C"] >= 0.10 and res["R_Q"] >= 0.04)
+        self.assertEqual(d["operational"], res["R_C"] >= 0.10 and res["R_Q"] >= rc.D_Q)
         self.assertFalse(rc.hf_decision(res, c_F=res["S_F"], p_F=0.005)["detection"])   # strictly greater
         self.assertFalse(rc.hf_decision(res, c_F=0.0, p_F=0.02)["detection"])
         empty = {"id": "z", "periods": [{"P": 8.0, "fails": ["1-span"], "supported": False, "s": 0.0,

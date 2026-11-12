@@ -25,7 +25,7 @@ equal for balanced intact blocks, where the test is H.5's). For each G, over eve
 p_G = #{sum e_b w_G,b D_G,b >= sum w_G,b D_G,b} / 2^n; p_C = max(p_A, p_B); reject iff p_C is at most
 H-C's ACTIVE Holm level and both weighted estimates > 0. One-sided floor 2^-n: 8 blocks 0.0039, 7 blocks
 0.0078, 6 blocks 0.0156 (6 blocks cannot reject at 0.01, but can at an active Holm level >= 1/64, e.g.
-0.05/3). Material: p computed on D - 0.02. Ties are exact (signflip_p). The REPORTED 99% lower bounds
+0.05/3). Material (D8): p computed on D - DELTA_C. Ties are exact (signflip_p). The REPORTED 99% lower bounds
 (fixed 0.01, whatever the decision level) by exact inversion: L_G = the (k+1)-th smallest nonempty-subset
 mean, k = floor(0.01 2^n) - 1 (-inf if k < 0); min(L_A, L_B) bounds min(Delta_A, Delta_B); the bounds at
 the active decision level are reported beside them with their confidence. t_A, t_B are reported, never
@@ -79,8 +79,9 @@ HYPOTHESES = ("H-P", "H-Q", "H-F", "H-T", "H-C")
 FAMILY_ALPHA = 0.05
 DETECT_ALPHA = 0.01
 DELTA_P = math.log(1.10)
-DELTA_Q = 0.02
-DELTA_C = 0.02
+import material
+DELTA_Q = material.DELTA_Q
+DELTA_C = material.DELTA_HC
 BOUND_ALPHA = 0.01           # H.5's reported one-sided 99% lower bounds (fixed, not the decision level)
 CPU_CEILING_H = 240.0         # (Annex amendment D5: was 96)
 CPU_RESERVE_H = 6.0
@@ -909,7 +910,8 @@ def family_p(h, r):
             return None, "the H-F result carries no calibrated critical value / model p-value (p = 1 in Holm)"
         return (float(r["p_F"]) if r["S_F"] > r["c_F"] else 1.0), None
     if h == "H-T":
-        if not (num(r.get("c_T")) and num(r.get("p_model")) and num(r.get("T_T"))):
+        if not (num(r.get("c_T")) and num(r.get("p_model")) and 0 <= r["p_model"] <= 1
+                and (num(r.get("T_T")) or r.get("T_T") == -math.inf) and not r.get("failure")):
             return None, "the H-T result carries no frozen critical value / model p-value (p = 1 in Holm)"
         if r["c_T"] < HT_GUARD:
             return None, f"the H-T critical value {r['c_T']:g} is below the registered guard log 600 (p = 1 in Holm)"
@@ -955,7 +957,7 @@ def decide(elig, results, deltas, weights, alpha=FAMILY_ALPHA):
     hl = holm(pv, alpha)
     if hc.get("available"):
         hc = dict(hc_test(deltas, active_level(hl, "H-C"), weights=weights), reached=hl["reached"]["H-C"])
-    return {"pvalues": pv, "unavailable": why, "holm": hl, "H-C": hc, "decision": family_decision(hl, hc),
+    return {"material_spec": material.specification(), "pvalues": pv, "unavailable": why, "holm": hl, "H-C": hc, "decision": family_decision(hl, hc),
             "reciprocal": reciprocal_directional(hl), "ecology": elig["ecology"], "Q200": elig["Q200"]}
 
 

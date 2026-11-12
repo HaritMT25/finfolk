@@ -182,6 +182,7 @@ class TestGenerator(unittest.TestCase):
         cb = self.cb
         p = cb.placeholder_params()
         p["fitted"] = True
+        p.pop("cohort")          # D8: production uses the registered corrected-age cohort
         with self.assertRaises(cb.CalibError):
             cb.check_params(p, production=True)                    # (bins only)
         cb.check_params(p)                                         # (fine for a synthetic run)
@@ -459,8 +460,10 @@ class TestGenerator(unittest.TestCase):
 
     @staticmethod
     def man_fixture():
+        import calib
         return {"graph_sha256": "g", "graph_source": "file:x+eligibility:y", "params_sha256": "p", "params_fitted": True,
-                "tools_sha256": "t", "draws": 9999, "gates_sha256": None, "production": True}
+                "tools_sha256": "t", "draws": 9999, "gates_sha256": None, "production": True,
+                   "material_spec_sha256": calib.doc_sha(calib.stats.material.specification())}
 
     def test_ou_red_variation(self):
         """Codex's counterexample rho = (0, .98) is refused, and so is rho = (.05, .98) with innovations
@@ -563,7 +566,8 @@ class TestHarness(unittest.TestCase):
         import calib
         cls.cb = calib
         cls.man = {"graph_sha256": "g", "graph_source": "file:x+eligibility:y", "params_sha256": "p", "params_fitted": True,
-                   "tools_sha256": "t", "draws": 9999, "gates_sha256": None, "production": True}
+                   "tools_sha256": "t", "draws": 9999, "gates_sha256": None, "production": True,
+                   "material_spec_sha256": calib.doc_sha(calib.stats.material.specification())}
 
     def allocation(self, hyp, stage, n, score=lambda m, s, k: 0.001 * k, man=None, **kw):
         cb = self.cb
@@ -859,7 +863,9 @@ class TestRound3(unittest.TestCase):
         self.assertEqual(cb.manifest(self.graph, self.params, 19)["tools_sha256"], base)
         with tempfile.TemporaryDirectory() as d:
             for f in cb.TOOLS:
-                shutil.copy(os.path.join(cb.HERE, f), d)
+                dest = os.path.join(d, f)
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                shutil.copy(os.path.join(cb.HERE, f), dest)
             here, cb.HERE = cb.HERE, d
             try:
                 self.assertEqual(cb.tools_sha(), base)
@@ -907,7 +913,8 @@ class TestStrata(unittest.TestCase):
         cls.graph = calib.synthetic_graph(4)
         cls.params = calib.placeholder_params()
         cls.man = {"graph_sha256": "g", "graph_source": "file:x+eligibility:y", "params_sha256": "p", "params_fitted": True,
-                   "tools_sha256": "t", "draws": 9999, "gates_sha256": None, "production": True}
+                   "tools_sha256": "t", "draws": 9999, "gates_sha256": None, "production": True,
+                   "material_spec_sha256": calib.doc_sha(calib.stats.material.specification())}
 
     def run_(self, mode, slot, **kw):
         cb = self.cb
@@ -1187,7 +1194,7 @@ class TestStrata(unittest.TestCase):
 
     def test_ht_membership_has_no_scientific_slack(self):
         """#68 round 4 P2-5: a member iff EVERY one of the six candidates has a margin <= TAU_NUM x its scale
-        (1e-3: the solver accuracy); Codex's +0.025 scaled candidate is a genuine transition (not a member)."""
+        (scaled solver accuracy); Codex's +0.025 scaled candidate is a genuine transition (not a member)."""
         cb = self.cb
         self.assertAlmostEqual(cb.TAU_NUM, 2 * cb.DIR_TOL / cb.stats.DELTA_Q)
         cands = [f"{a}->{f}" for a, f, _ in cb.transition.candidates()]

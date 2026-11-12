@@ -24,12 +24,14 @@ except ImportError:
 if np is None and os.environ.get("RQ_REQUIRE_NUMPY"):
     raise SystemExit("RQ_REQUIRE_NUMPY is set, but numpy cannot be imported")
 
+import material
+
 B = 999
-ARD = dict(beta_P=0.20, beta_Q=0.05, EU_C=0.002, EU_Q=0.0002, EF_C=0.0, EF_Q=0.0)
+ARD = dict(beta_P=0.20, beta_Q=0.05, EU_C=0.002, EU_Q=material.D_Q ** 2 / 8, EF_C=0.0, EF_Q=0.0)
 FSD = dict(beta_P=0.0, beta_Q=0.0, EU_C=0.05, EU_Q=0.01, EF_C=0.04, EF_Q=0.008)
 MIXED = dict(beta_P=0.20, beta_Q=0.05, EU_C=0.05, EU_Q=0.01, EF_C=0.04, EF_Q=0.008)
 NONE = dict(beta_P=0.0, beta_Q=0.0, EU_C=0.05, EU_Q=0.01, EF_C=0.0, EF_Q=0.0)
-SD = dict(beta_P=0.004, beta_Q=0.001, EU_C=0.0002, EU_Q=0.00003, EF_C=0.002, EF_Q=0.0002)
+SD = dict(beta_P=0.004, beta_Q=material.DELTA_Q / 20, EU_C=0.0002, EU_Q=material.D_Q ** 2 / 50, EF_C=0.002, EF_Q=0.0002)
 
 
 @unittest.skipIf(np is None, "numpy is not installed")

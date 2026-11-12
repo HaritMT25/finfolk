@@ -215,12 +215,12 @@ class TestHC(unittest.TestCase):
         self.assertEqual((old, new), (4, 2))
 
     def test_material_and_inversion(self):
-        """H.16 33-34: material = detection on D - 0.02, then max; the exact lower bound's breakpoints are
+        """H.16 33-34: material = detection on D - DELTA_C, then max; the exact lower bound's breakpoints are
         the nonempty-subset means: at 7 blocks the minimum block delta, at 6 blocks -inf."""
         d = {b: (0.03 + 0.001 * b, 0.05 + 0.002 * b) for b in range(8)}
         r = stats.hc_test(d)
-        pa = stats.signflip_p([v[0] - 0.02 for v in d.values()])[2]
-        pb = stats.signflip_p([v[1] - 0.02 for v in d.values()])[2]
+        pa = stats.signflip_p([v[0] - stats.DELTA_C for v in d.values()])[2]
+        pb = stats.signflip_p([v[1] - stats.DELTA_C for v in d.values()])[2]
         self.assertEqual(r["p_material"], max(pa, pb))
         D7 = [0.4, -0.1, 0.3, 0.25, 0.6, 0.05, 0.2]
         self.assertEqual(stats.signflip_lower(D7), min(D7))
@@ -543,7 +543,7 @@ class TestEligibility(unittest.TestCase):
         res = {"H-P": {"available": True, "p": 0.001, "worlds": q, "binding": bind["H-P"]},
                "H-Q": {"available": True, "p": 0.004, "worlds": list(reversed(q)), "binding": bind["H-Q"]},
                "H-F": {"available": True, "S_F": 0.2, "c_F": 0.5, "p_F": 0.001, "worlds": q, "binding": bind["H-F"]},
-               "H-T": {"available": False, "p_model": 0.001, "c_T": 7.0, "T_T": 8.0, "worlds": q, "failure": "numerical"}}
+               "H-T": {"available": False, "p_model": 0.001, "c_T": 7.0, "T_T": 8.0, "worlds": q, "failure": None}}
         dec = stats.decide(rec, res, D, W)
         self.assertEqual((dec["pvalues"]["H-P"], dec["pvalues"]["H-Q"], dec["pvalues"]["H-F"], dec["pvalues"]["H-T"]),
                          (0.001, 0.004, 1.0, None))                      # (S_F <= c_F: never a rejection; H-T failed)

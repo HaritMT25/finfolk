@@ -54,12 +54,12 @@ four-reference average Delta. G = 1 exactly when all pass.
 
 MATERIAL (H.3.6). r_C = RMS_t(avg Delta_C) / mean_{t,r} Y^C (relative), r_Q = RMS_t(avg Delta_Q)
 (absolute); E_h = (1/n) sum_w g_w r_hw(P_w)^2, R_h = sqrt(E_h) over all n worlds; operational
-materiality R_C >= 0.10 and R_Q >= 0.04. The material-boundary statistic (calibrated under F0-F4, H.11)
-is M_F = min(R_C / 0.10, R_Q / 0.04) (> 1 exactly when both estimates exceed their thresholds).
+materiality R_C >= 0.10 and R_Q >= D_Q (D8). The material-boundary statistic (calibrated under F0-F4, H.11)
+is M_F = min(R_C / 0.10, R_Q / D_Q) (> 1 exactly when both estimates exceed their thresholds).
 
 DECISIONS (H.3.7). Detection S_F > c_F and p_F <= 0.01; operational success = detection and both
 materiality estimates; exceeding material = operational and M_F > c_M, p_M <= 0.01, R_C > 0.10,
-R_Q > 0.04.
+R_Q > D_Q (D8).
 """
 from __future__ import annotations
 
@@ -94,7 +94,8 @@ CLAMP_TOL = 1e-10
 WIN_EPS = 1e-9           # closed windows |t - c| <= P/8 (M; float safety only)
 BP_TOL = 1e-7            # a phase this close (in M of window centre) to a window-boundary crossing: scalar chain()
 RIDGE = 1e-8
-D_C, D_Q = 0.10, 0.04
+import material
+D_C, D_Q = 0.10, material.D_Q
 TRIALS = 600
 
 

@@ -20,13 +20,17 @@ is a documented synthetic stand-in ("fitted": false) for the tests and the bench
   must be PSD (check_params refuses parameters without that OU form), so every gap's transition
   covariance Gamma o (1 - (rho_i rho_j)^D) (Gamma = S / (1 - rho rho'), the stationary start) is PSD.
   Validation stress: rho = 0.98, innovation SD x 1.5.
-  Observation (H.9.2): K = floor(N sigma(a + eps) + 1/2), N = the capture bound or 600; eps = s(mu) (R +
+  Observation (H.9.2; age-support correction): K = floor(N sigma(a + eps) + 1/2). Capture N is its
+  registered bound; survival N is the age-eligible ceiling derived from the registered ages, horizon
+  and max age (the survival denominator remains 600). The location solves E[K/600] = mu for survival,
+  equivalently E[K/N] = mu*600/N; an infeasible mean is refused, never censored. eps = s(mu) (R +
   D + E) with the row (prey snapshot: C, S, F channels), donor (predator snapshot: C, S) and cell
   (SigmaE: capture and exposed survival of one assay cell JOINTLY, their cross-channel covariance kept)
   components by the ACTUAL sharing keys (a reference is one snapshot shared by its block's worlds; a
   free control is generated once per prey snapshot and replicate and reused), unit total latent
   variance per channel; s(mu) by the mean bins [0,.35), [.35,.70), [.70,1] (capture) and [0,.25),
-  [.25,.75), [.75,1] (survival); a(mu) solves E[K/N] = mu over the FULL intended range (no clipping):
+  [.25,.75), [.75,1] (survival); a solves E[K/N] = the requested fraction over its FULL feasible range
+  (no clipping):
   E[K] = sum_k Phi((a - logit((k - 1/2)/N)) / s) exactly, tabulated on a 0.004 logit grid per (s, N)
   and inverted by linear interpolation whose error is verified at every grid midpoint (<= 2e-7).
   Validation stress: s_C = max(1.5 s_bank, 0.80 below 0.35 else 0.35), survival 1.5 s_bank. No second
@@ -116,7 +120,7 @@ noise draw; solving under it would couple the truth to the noise). A numerical e
 check is a failed proposal; one in the reported final-metric value is recorded with the panel.
 H-F F3 / F4 BOUNDARIES ARE FUNCTIONAL (the coordinator's decision (a), 2026-11-08): E_C = d_C^2 (F3) or
 E_Q = d_Q^2 (F4) of the noise-free panel (the triage metric) is met by ONE panel multiplier lambda on the
-declared component's per-world targets (lambda x 0.10 / 0.04; the other readout's "max" unchanged):
+declared component's per-world targets (lambda x D_C / D_Q (D8); the other readout's "max" unchanged):
 the actual searched functional (selection, gates, projections, the all-n denominator); lambda in [0,
 LAMBDA_MAX = 10], from lambda = 1 by the scaling step lambda sqrt(b / E) until bracketed, then a
 safeguarded Illinois / bisection hybrid accepting the NULL-SIDE point E in [b (1 - LAMBDA_TOL), b]; at most
@@ -126,10 +130,10 @@ bracket; none: UNREACHED on the registered search, retained at the attained null
 (an evaluated point, never a limit), the shortfall recorded.
 T4's boundaries stay construction-level (labelled) pending the E^U support decision.
 
-MODES (H.10).MODES (H.10). H-F (full history): F0 none; F1 capture only (RMS 0.10 / 0.20 by panel parity); F2
-survival only (0.04 / 0.08); F3 capture 0.10 + survival max; F4 survival 0.04 + capture max;
-alternatives FA1 (0.10, 0.04), FA2 (0.20, 0.08). H-T (epochs; one period per world across epochs): T0
-stable material directional (1.5 delta), no recurrence; T1 stable recurrence (0.15, 0.06), no
+MODES (H.10). H-F (full history): F0 none; F1 capture only (RMS 0.10 / 0.20 by panel parity); F2
+survival only (D_Q / 2 D_Q; D8); F3 capture 0.10 + survival max; F4 survival D_Q (D8) + capture max;
+alternatives FA1 (D_C, D_Q), FA2 (2 D_C, 2 D_Q). H-T (epochs; one period per world across epochs): T0
+stable material directional (1.5 delta), no recurrence; T1 stable recurrence (1.5 D_C, 1.5 D_Q; D8), no
 directional change; T2 both; T3 none, stressed red variation, half the worlds saturated (+2.5 logit
 capture), noise x 1.5; T4 cycles 32 subtypes ((14 boundary components + a capture-only + a survival-only
 transition) x 2 directions) over the three epoch pairs; alternatives TA1 / TA2 (material / doubled,
@@ -231,7 +235,7 @@ LAMBDA_FROZEN_METRIC = False   # the frozen-metric lambda proposals (Codex round
                                  # OFF as registered, 2026-11-08: on g4 its bracket handoff took more true evaluations)
 FROZEN_ROUNDS = 4        # re-anchorings of the frozen metric before the true-metric search takes over
 BOUNDARY_TOL = 0.05      # the ONE-SIDED boundary window, energy scale [b (1 - 0.05), b] (RMS: [0.9747, 1] x d)
-TAU_NUM = 2 * DIR_TOL / min(stats.DELTA_P, stats.DELTA_Q)    # = 1e-3: null membership's NUMERICAL allowance
+TAU_NUM = 2 * DIR_TOL / min(stats.DELTA_P, stats.DELTA_Q)    # null membership's NUMERICAL allowance (D8 scales)
 METRIC_MEANS = "null_fit"    # D4 (provisional, 2026-11-08): V at the null-model fitted means ("raw": the means)
 V_PER_DRAW = False           # D4: V once per observed panel, held fixed across the bootstrap draws (registered:
                              # a conditional approximation); True re-fits m0 and V per draw (a slow exact path)
@@ -433,7 +437,9 @@ def placeholder_params(n_train=20, seed=11, capture_bound=324):
                       "SigmaR": [[0.25, 0.05, 0.05], [0.05, 0.25, 0.15], [0.05, 0.15, 0.5]],
                       "SigmaD": [[0.25, 0.05], [0.05, 0.25]],
                       "SigmaE": [[0.5, 0.1], [0.1, 0.5]]},
-            "capture_bound": capture_bound, "replicates": R_REP}
+            "capture_bound": capture_bound, "replicates": R_REP,
+            "cohort": {"ages": [0.0] * TRIALS, "n": TRIALS, "max_age": 120.0},
+            "horizon": 5000, "dt": 0.016}
 
 
 def ou_matrices(rho, S):
@@ -464,6 +470,13 @@ def check_params(p, production=False):
     if production and p.get("fitted") is not True:
         raise CalibError("generator parameters: production calibration needs FITTED parameters (H.9.1-H.9.2), "
                          "not the synthetic placeholder")
+    cohort = p.get("cohort", stats.material.registered_ages())
+    if len(cohort.get("ages", [])) != TRIALS:
+        raise CalibError("generator parameters: initial cohort must contain 600 registered ages")
+    if production and (cohort != stats.material.registered_ages() or p.get("horizon", 5000) != 5000
+                       or p.get("dt", 0.016) != 0.016):
+        raise CalibError("production requires the registered ages, 5k horizon and dt=0.016")
+    stats.material.cohort_ceiling(cohort, p.get("horizon", 5000), p.get("dt", 0.016))
     th = np.asarray(p["theta"], float)
     if th.ndim != 2 or th.shape[1] != NTHETA or len(th) < 2:
         raise CalibError("generator parameters: theta must be (training worlds >= 2) x 98")
@@ -748,7 +761,9 @@ def s_spans(p, extras=(1.0, 1.5)):
         xs.append(np.asarray(cv.get("x", []), float))
     mu = sig(np.concatenate(xs))
     spans = {}
-    for ch, N in (("C", int(p["capture_bound"])), ("S", TRIALS), ("F", TRIALS)):
+    ceiling = stats.material.cohort_ceiling(p.get("cohort", stats.material.registered_ages()),
+                                           p.get("horizon", 5000), p.get("dt", 0.016))
+    for ch, N in (("C", int(p["capture_bound"])), ("S", ceiling), ("F", ceiling)):
         for stress in (False, True):
             for extra in extras:
                 s = noise_scale(p, ch, mu, stress, extra)
@@ -794,9 +809,17 @@ def location(mu, s, N):
     return out
 
 
-def counts(mu, s, eps, N):
-    """K = floor(N sigma(a(mu) + eps) + 1/2) (eps already scaled by s(mu))."""
-    return np.floor(N * sig(location(mu, s, N) + eps) + 0.5)
+def counts(mu, s, eps, N, ceiling=None):
+    """Rounded logistic-normal counts on 0..ceiling, preserving feasible means as fractions of N.
+
+    Survival's ceiling is the age-eligible cohort, NOT the binomial denominator (still 600).
+    Infeasible means are refused, never silently censored into a different boundary functional.
+    """
+    limit = N if ceiling is None else ceiling
+    mu = np.asarray(mu, float)
+    if not 0 < limit <= N or np.any(~np.isfinite(mu)) or np.any(mu <= 0) or np.any(mu >= limit / N):
+        raise CalibError("rounded-count mean outside age-bounded support (boundary infeasible)")
+    return np.floor(limit * sig(location(mu * N / limit, s, limit) + eps) + 0.5)
 
 
 # ================================================================== D4: the null-model fitted means
@@ -885,18 +908,18 @@ def plan_world(hyp, mode, panel, k, rng):
     dP, dQ = stats.DELTA_P, stats.DELTA_Q
     if hyp == "H-F":
         m = 1 if panel % 2 == 0 else 2
-        pl["rec"]["full"] = {"F0": (None, None), "F1": (0.10 * m, None), "F2": (None, 0.04 * m),
-                             "F3": (0.10, "max"), "F4": ("max", 0.04), "FA1": (0.10, 0.04),
-                             "FA2": (0.20, 0.08)}[mode]
+        pl["rec"]["full"] = {"F0": (None, None), "F1": (0.10 * m, None), "F2": (None, D_Q * m),
+                             "F3": (0.10, "max"), "F4": ("max", D_Q), "FA1": (0.10, D_Q),
+                             "FA2": (0.20, (2 * D_Q))}[mode]
         return pl
     E = transition.EPOCHS
     zero = {e: (0.0, 0.0) for e in E}
     if mode == "T0":
         pl["dir"] = {e: (1.5 * dP, 1.5 * dQ) for e in E}
     elif mode == "T1":
-        pl["dir"], pl["rec"] = dict(zero), {e: (0.15, 0.06) for e in E}
+        pl["dir"], pl["rec"] = dict(zero), {e: (0.15, (1.5 * D_Q)) for e in E}
     elif mode == "T2":
-        pl["dir"], pl["rec"] = {e: (1.5 * dP, 1.5 * dQ) for e in E}, {e: (0.15, 0.06) for e in E}
+        pl["dir"], pl["rec"] = {e: (1.5 * dP, 1.5 * dQ) for e in E}, {e: (0.15, (1.5 * D_Q)) for e in E}
     elif mode == "T3":
         pl["dir"] = dict(zero)
         pl.update(sat=2.5 if k % 2 == 0 else 0.0, extra=1.5, stress_ar=True)
@@ -905,8 +928,8 @@ def plan_world(hyp, mode, panel, k, rng):
         sub = panel % 32 if mode == "T4" else None
         forward = (sub % 2 == 0) if mode == "T4" else (panel % 2 == 0)
         a, f = (pair[0], pair[1]) if forward else (pair[1], pair[0])
-        ard_dir, fsd_rec = {"T4": ((1.5 * dP, 1.5 * dQ), (0.15, 0.06)), "TA1": ((dP, dQ), (0.10, 0.04)),
-                            "TA2": ((2 * dP, 2 * dQ), (0.20, 0.08))}[mode]
+        ard_dir, fsd_rec = {"T4": ((1.5 * dP, 1.5 * dQ), (0.15, (1.5 * D_Q))), "TA1": ((dP, dQ), (0.10, D_Q)),
+                            "TA2": ((2 * dP, 2 * dQ), (0.20, (2 * D_Q)))}[mode]
         d = {e: (0.0, 0.0) for e in E}
         r = {e: (None, None) for e in E}
         d[a] = ard_dir
@@ -920,11 +943,11 @@ def plan_world(hyp, mode, panel, k, rng):
             elif comp == 2:
                 r[a] = (0.10, r[a][1])
             elif comp == 3:
-                r[a] = (r[a][0], 0.04)
+                r[a] = (r[a][0], D_Q)
             elif comp == 4:
                 r[f] = (0.10, r[f][1])
             elif comp == 5:
-                r[f] = (r[f][0], 0.04)
+                r[f] = (r[f][0], D_Q)
             elif comp in (6, 7):
                 d[f] = ((dP if comp == 6 else -dP), d[f][1])
             elif comp in (8, 9):
@@ -937,7 +960,7 @@ def plan_world(hyp, mode, panel, k, rng):
             elif comp == 12:
                 r[a], r[f] = (0.10, r[a][1]), (0.10, r[f][1])
             elif comp == 13:
-                r[a], r[f] = (r[a][0], 0.04), (r[f][0], 0.04)
+                r[a], r[f] = (r[a][0], D_Q), (r[f][0], D_Q)
             elif comp == 14:                    # only capture changes
                 d = {e: (d[e][0], 0.0) for e in E}
                 r = {e: (r[e][0], None) for e in E}
@@ -984,6 +1007,8 @@ class Panel:
 
     def __init__(self, graph, params, hyp, stage, stratum, mode, panel, stress=None, stream=None):
         self.g, self.p = graph, check_params(params)
+        self.survivor_ceiling = stats.material.cohort_ceiling(
+            params.get("cohort", stats.material.registered_ages()), params.get("horizon", 5000), params.get("dt", 0.016))
         self.hyp, self.stage, self.stratum, self.mode, self.panel = hyp, stage, stratum, mode, panel
         self.stress = (stage == "val") if stress is None else stress
         # (the slot's original streams for the audit; a quota cell's continuation "<cell>/<k>" its own)
@@ -1933,8 +1958,8 @@ class Panel:
         Ecs = z.normals(len(I) * R * 2).reshape(len(I), R, 2) @ LE.T
         EC, ES = Ecs[:, :, 0], Ecs[:, :, 1]
         KC = counts(mu["C"][:, None], sC[:, None], sC[:, None] * (Rw[I, :, 0] + Dw[J, :, 0] + EC), N)
-        KS = counts(mu["S"][:, None], sS[:, None], sS[:, None] * (Rw[I, :, 1] + Dw[J, :, 1] + ES), TRIALS)
-        KF = counts(mu["F"][:, None], sF[:, None], sF[:, None] * (Rw[:, :, 2] + EF), TRIALS)
+        KS = counts(mu["S"][:, None], sS[:, None], sS[:, None] * (Rw[I, :, 1] + Dw[J, :, 1] + ES), TRIALS, self.survivor_ceiling)
+        KF = counts(mu["F"][:, None], sF[:, None], sF[:, None] * (Rw[:, :, 2] + EF), TRIALS, self.survivor_ceiling)
         # references: capture (prey reference shared, the world's predator donor), survival (the world's
         # prey row and free control, the predator reference's donor)
         Jc = np.array([pj[t] for t in wg.cT.tolist()])
@@ -1946,7 +1971,7 @@ class Panel:
         sRS = noise_scale(p, "S", mu["RS"], stress, extra)
         ERS = z.normals(len(Iq) * R).reshape(len(Iq), R) * math.sqrt(eS)
         RSd = np.array([ref_comp[("RP", r)][:, 1] for r in wg.qR])
-        KRS = counts(mu["RS"][:, None], sRS[:, None], sRS[:, None] * (Rw[Iq, :, 1] + RSd + ERS), TRIALS)
+        KRS = counts(mu["RS"][:, None], sRS[:, None], sRS[:, None] * (Rw[Iq, :, 1] + RSd + ERS), TRIALS, self.survivor_ceiling)
         fmean = KF.mean(axis=1) / TRIALS
         y = {"within": {"C": KC.mean(axis=1) / N, "Q": KS.mean(axis=1) / TRIALS - fmean[I]},
              "ref": {"C": KRC.mean(axis=1) / N, "Q": KRS.mean(axis=1) / TRIALS - fmean[Iq]}}
@@ -2138,9 +2163,9 @@ def _dist(xs):
 
 # (Codex #68 D6 r3 P2: graph.py is part of the calibration identity: eligible_graph / panel_problems execute its
 # WINDOWS, OFFSETS and splits() to authorize production inputs, so a change to those checks is a new identity)
-TOOLS = ("calib.py", "recurrence.py", "transition.py", "backbone.py", "stats.py", "noisescale.py", "graph.py")
+TOOLS = ("calib.py", "recurrence.py", "transition.py", "backbone.py", "stats.py", "noisescale.py", "graph.py", "material.py", "fixtures/registered_ages.json")
 GATES_SCHEMA = "finfolk.redqueen.annexH.gates/1"
-IDENT = ("graph_sha256", "graph_source", "params_sha256", "params_fitted", "tools_sha256", "solver_sha256", "draws",
+IDENT = ("material_spec_sha256", "graph_sha256", "graph_source", "params_sha256", "params_fitted", "tools_sha256", "solver_sha256", "draws",
          "production")
 
 
@@ -2190,6 +2215,7 @@ def m0_basis():
 def manifest(graph, params, draws, gates=None, production=False, graph_source="synthetic"):
     """Everything a panel record depends on: crit / accept refuse to mix two of them (#68 round 2 P1-3)."""
     return {"graph_sha256": graph_sha(graph), "graph_source": graph_source, "worlds": len(graph),
+            "material_spec": stats.material.specification(), "material_spec_sha256": doc_sha(stats.material.specification()),
             "solver": solver_identity(), "solver_sha256": doc_sha(solver_identity()),
             "params_sha256": hashlib.sha256(json.dumps(params, sort_keys=True).encode()).hexdigest(),
             "params_fitted": params.get("fitted") is True, "tools_sha256": tools_sha(), "draws": int(draws),
@@ -2236,6 +2262,8 @@ def check_gates(art, man=None, production=False):
     hm = art.get("hf_manifest") or {}
     if production and not (art.get("production") is True and hm.get("production") is True):
         raise CalibError("production H-T needs gates from a production H-F calibration")
+    if production and hm.get("material_spec_sha256") != doc_sha(stats.material.specification()):
+        raise CalibError("production H-T needs epoch gates calibrated under D8")
     if man is not None:
         diff = [k for k in IDENT if hm.get(k) != man.get(k)]
         if diff:
@@ -2342,7 +2370,8 @@ def _manifest(rs, production, probs):
     if len(mans) > 1:
         probs.append(f"{len(mans)} different manifests (graph, parameters, tools, draws or gates)")
     man = json.loads(next(iter(mans))) if len(mans) == 1 else None
-    if production and (man is None or not man.get("production") or man.get("draws") != stats.B_BOOT
+    if production and (man is None or man.get("material_spec_sha256") != doc_sha(stats.material.specification())
+                       or not man.get("production") or man.get("draws") != stats.B_BOOT
                        or not man.get("params_fitted") or man.get("graph_source") == "synthetic"
                        or "+eligibility:" not in str(man.get("graph_source"))):
         probs.append("not a production calibration (fitted parameters, the real graph restricted to the common Q200 "
@@ -2573,7 +2602,7 @@ def p_model(s, tables):
 def hf_rejects(r, crit):
     """The locked H-F rules on one record (the critical part; the p-table requirement can only reduce
     rejections, so validating it is conservative): detection, and the complete nested exceeding-material
-    claim (detection, both material points, M_F > c_M, R_C > 0.10, R_Q > 0.04). An unavailable (None)
+    claim (detection, both material points, M_F > c_M, R_C > 0.10, R_Q > D_Q (D8)). An unavailable (None)
     critical value is never a rejection here: the decision itself is unavailable (reported separately)."""
     if not r["available"] or crit.get("c_F") is None:
         return False, False
@@ -2827,7 +2856,7 @@ def report(records):
         if r.get("direction"):
             groups.setdefault(f"{key}|{r['direction']}", []).append(r)
     fitted = {bool((r.get("manifest") or {}).get("params_fitted")) for r in records}
-    out = {"rules": {"K_c": "ROUNDS x n_c per quota cell", "ROUNDS": ROUNDS, "N_MIN": N_MIN, "n_I": "n (per cell n_c)",
+    out = {"material_spec": stats.material.specification(), "rules": {"K_c": "ROUNDS x n_c per quota cell", "ROUNDS": ROUNDS, "N_MIN": N_MIN, "n_I": "n (per cell n_c)",
                      "BOUNDARY_TOL": BOUNDARY_TOL, "TAU_NUM": TAU_NUM, "AMP_TOL": AMP_TOL, "DIR_TOL": DIR_TOL,
                      "A_SUP": A_SUP, "AMP_GRID": AMP_GRID, "KNOB_GRID": [KNOB_GRID[0], KNOB_GRID[-1], len(KNOB_GRID)],
                      "LAMBDA_GRID": [LAMBDA_GRID[0], LAMBDA_GRID[-1], len(LAMBDA_GRID)], "LAMBDA_TOL": LAMBDA_TOL,

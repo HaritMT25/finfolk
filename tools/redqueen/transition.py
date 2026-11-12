@@ -28,7 +28,7 @@ then FSD->ARD: the FSD epoch's calibrated recurrence gate, and all fourteen marg
   beta_{P,a}, beta_{Q,a}; d_C^2 - E^U_{C,a}, d_Q^2 - E^U_{Q,a}; E^F_{C,f} - d_C^2, E^F_{Q,f} - d_Q^2;
   delta_P -+ beta_{P,f} (two), delta_Q -+ beta_{Q,f} (two); beta_{P,a} - beta_{P,f},
   beta_{Q,a} - beta_{Q,f}; E^F_{C,f} - E^U_{C,a}, E^F_{Q,f} - E^U_{Q,a}
-(d_C = 0.10, d_Q = 0.04, delta_P = log 1.10, delta_Q = 0.02); T_{a,f} = -log max_j p_j, else -inf.
+(d_C = 0.10, d_Q = 0.20 b, delta_P = log 1.10, delta_Q = 0.10 b; D8); T_{a,f} = -log max_j p_j, else -inf.
 T_T = the maximum over the six (ties: the earlier pair, then ARD->FSD). Reject iff T_T > c_T and the
 model p-value <= 0.01, c_T = max(log 600, the development critical value).
 
