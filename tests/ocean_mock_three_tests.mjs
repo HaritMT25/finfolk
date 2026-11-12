@@ -32,6 +32,7 @@ import path from "node:path";
 import vm from "node:vm";
 import crypto from "node:crypto";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { leanOpt } from "../tools/ocean_render_perf/lean.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const argv = process.argv.slice(2);
@@ -59,6 +60,21 @@ function ok(cond, what, info) {
   else console.log("  ok   " + what);
 }
 
+/* the measurement records' slice of scene.renderOptimization() (tools/ocean_render_perf/lean.mjs; the review of #85, P3): the policy, the
+ * counters and each draw's counts, none of the live buffers and textures the full state hands out (426 MB for a 2,000-fish cell) */
+function leanCheck(st) {
+  const lean = leanOpt(st), P = [];
+  const live = (v, p, out) => { if (v && typeof v === "object") { if (ArrayBuffer.isView(v) || v.isTexture || v.isBufferAttribute) out.push(p); else for (const k of Object.keys(v)) live(v[k], p + "." + k, out); } return out; };
+  const kept = live(lean, "lean", []), full = live(st, "state", []).length, bytes = JSON.stringify(lean).length;
+  if (kept.length) P.push("the record keeps live buffers: " + kept.slice(0, 3));
+  if (bytes > 4096) P.push("the record is " + bytes + " bytes");
+  if (!full) P.push("the full state holds no live buffers (the check means nothing)");
+  if (st.batches) for (const k of ["coarse", "medium", "barbels"]) if (st.batches[k] && !(lean.batches && lean.batches[k] && lean.batches[k].n === st.batches[k].n && lean.batches[k].cap === st.batches[k].cap)) P.push("draw " + k + "'s counts are not kept");
+  if (st.decoded && !(lean.decoded && lean.decoded.decodes === st.decoded.decodes && lean.decoded.uploads === st.decoded.uploads && lean.decoded.capacity === st.decoded.capacity)) P.push("the decoded cache's counters are not kept");
+  if (JSON.stringify(lean.effective) !== JSON.stringify(st.effective) || JSON.stringify(lean.requested) !== JSON.stringify(st.requested) || JSON.stringify(lean.buckets) !== JSON.stringify(st.buckets)) P.push("the policy or the buckets are not kept");
+  return { bytes, full, problems: P };
+}
+
 /* ---- a deterministic world ---- */
 function rng(seed) { return function () { seed |= 0; seed = seed + 0x6D2B79F5 | 0; let t = Math.imul(seed ^ seed >>> 15, 1 | seed); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
 const W = 1600, HH = 900, D = 240;
@@ -70,6 +86,7 @@ function World(n, pc, withApp, epoch) {
   return { fish, preds, tick: 0, epoch, withApp };
 }
 function step(w) {
+  if (w.frozen) return;   /* (a still world: the same snapshot every frame, for the scripted camera states) */
   w.tick += 2;
   for (const f of w.fish) { f.a += 0.05 * Math.sin(w.tick * 0.03 + f.id); f.x = (f.x + 2.2 * Math.cos(f.a) + W) % W; f.y = (f.y + 2.2 * Math.sin(f.a) + HH) % HH; }
   for (const p of w.preds) { p.a += 0.04; p.x = (p.x + 3 * Math.cos(p.a) + W) % W; p.y = (p.y + 3 * Math.sin(p.a) + HH) % HH; }
@@ -97,7 +114,9 @@ function recorder(rec, expect) {
   const seenProg = new Set(), versions = new WeakMap(), labels = new WeakMap();
   let frame = null;
   const MAXTEX = 0x0D33, LINK = 0x8B82;
-  const gl = { MAX_TEXTURE_SIZE: MAXTEX, LINK_STATUS: LINK, getParameter: (p) => (p === MAXTEX ? 16384 : 0), getExtension: () => null, getSupportedExtensions: () => [],
+  const TEXUNITS = 0x8872, VTEXUNITS = 0x8B4C;
+  const gl = { MAX_TEXTURE_SIZE: MAXTEX, MAX_TEXTURE_IMAGE_UNITS: TEXUNITS, MAX_VERTEX_TEXTURE_IMAGE_UNITS: VTEXUNITS, LINK_STATUS: LINK,
+               getParameter: (p) => (p === MAXTEX ? 16384 : p === TEXUNITS || p === VTEXUNITS ? 16 : 0), getExtension: () => null, getSupportedExtensions: () => [],
                getContextAttributes: () => ({}), drawingBufferWidth: 1280, drawingBufferHeight: 720, isContextLost: () => !!rec.lost,
                getProgramParameter: (p, k) => (k === LINK ? !!(p && p.linked) : null) };
   function progOf(m) { return H(m.vertexShader) + "/" + H(m.fragmentShader); }
@@ -110,6 +129,16 @@ function recorder(rec, expect) {
     if (ArrayBuffer.isView(v)) return "arr" + v.length + ":" + H(Buffer.from(v.buffer, v.byteOffset, v.byteLength));
     return "obj";
   }
+  /* the GPU's copy of a data texture, as the uploads three performed leave it: the named update ranges (floats), or the whole image */
+  const gpuTex = new WeakMap();
+  function model(t) {
+    const d = t.image && t.image.data;
+    if (!d || !d.length) return;
+    let g = gpuTex.get(t);
+    if (!g || g.length !== d.length) { g = new Float32Array(d.length); gpuTex.set(t, g); }
+    const rr = t.updateRanges || [];
+    if (!rr.length) g.set(d); else for (const r of rr) g.set(d.subarray(r.start, r.start + r.count), r.start);
+  }
   function upload(obj, name, a) {
     if (!a) return;
     const was = versions.get(a);
@@ -121,8 +150,19 @@ function recorder(rec, expect) {
   function renderer() {
     return {
       toneMapping: 0, info: { render: { calls: 0, triangles: 0, points: 0, lines: 0 }, programs: [] }, debug: { checkShaderErrors: true, onShaderError: null },
-      properties: { get: () => ({ currentProgram: { program: { linked: true }, getUniforms() {}, diagnostics: null } }) },
+      /* (rec.failCached: the decoded programs fail to link, as a driver's compile error would: the binder must keep the raw ones) */
+      properties: { get: (m) => ({ currentProgram: { program: { linked: !(rec.failCached && m && typeof m.vertexShader === "string" && m.vertexShader.indexOf("Morph M = mLoad(") >= 0) }, getUniforms() {}, diagnostics: null } }) },
       getContext: () => gl, setClearColor() {}, setPixelRatio(p) { this.pr = p; }, getPixelRatio() { return this.pr || 1; }, setSize() {}, resetState() {},
+      /* three's initTexture: the texture uploaded now if its version moved (the decoded programs sample no raw genes, so the scene uploads
+       * the textures itself); only the optimized session calls it */
+      initTexture(t) {
+        if (versions.get(t) === t.version) return;
+        versions.set(t, t.version);
+        frame.uploads.push(["init", "tex", ser(t), JSON.stringify(t.updateRanges || [])]);
+        model(t);
+        if (t.onUpdate) t.onUpdate(t);
+        if (t.clearUpdateRanges) t.clearUpdateRanges();
+      },
       compile(scene) { scene.children.forEach((o) => o.material && compileMat(o.material, "warm")); return new Set(); },
       compileAsync(scene, cam, target) {
         this.compile(scene, cam, target);
@@ -161,20 +201,29 @@ function recorder(rec, expect) {
           calls++;
           if (g.index) tris += g.index.count / 3 * inst;
           if (expect) expect(o, m, label);
+          /* the optimized session only: three calls a mesh's onBeforeRender just before its draw (the per-draw ring uniforms are set
+           * there); the reference session's recording does not, and keeps its committed digest */
+          if (rec.callBefore && o.onBeforeRender) o.onBeforeRender(this, scene, camera, g, m, null);
+          if (rec.callBefore && m.uniforms.uRingN) frame.rings.push([label, inst, m.uniforms.uRingN.value, m.uniforms.uHalfRing.value, Array.from(m.uniforms.uRingT.value).slice(0, m.uniforms.uRingN.value).join()]);
           const un = Object.keys(m.uniforms).sort();
           frame.draws.push([label, H(m.vertexShader), H(m.fragmentShader), m.transparent, m.depthWrite, m.depthFunc, m.side, m.blending, inst, range,
                             H(JSON.stringify(un.map((k) => [k, ser(m.uniforms[k].value)])))]);
           if (g.index) upload(label, "index", g.index);
           Object.keys(g.attributes).forEach((k) => upload(label, k, g.attributes[k]));
-          un.forEach((k) => { const v = m.uniforms[k].value; if (v && v.isTexture && versions.get(v) !== v.version) {
+          /* three uploads a texture at a draw only if the program uses its sampler: the raw gene texture is inactive in the decoded programs
+           * (never fetched), and the decoded texture in every program without the feature (not even declared there: a raw Look's, the raw
+           * programs drawn before the decoded ones compiled) */
+          const decodedProg = m.vertexShader.indexOf("Morph M = mLoad(") >= 0, usesDecoded = /sampler2D uDecoded/.test(m.vertexShader + m.fragmentShader);
+          un.forEach((k) => { const v = m.uniforms[k].value; if (v && v.isTexture && !(decodedProg && k === "uGenes") && !(k === "uDecoded" && !usesDecoded) && versions.get(v) !== v.version) {
             versions.set(v, v.version); frame.uploads.push([label, "tex " + k, ser(v), JSON.stringify(v.updateRanges || [])]);
+            model(v);
             if (v.onUpdate) v.onUpdate(v); if (v.clearUpdateRanges) v.clearUpdateRanges(); } });
         }
         this.info.render.calls = calls; this.info.render.triangles = tris;
       }
     };
   }
-  return { renderer, begin(f) { frame = f; }, label(o, l) { labels.set(o, l); } };
+  return { renderer, begin(f) { frame = f; }, label(o, l) { labels.set(o, l); }, gpuOf: (t) => gpuTex.get(t) };
 }
 
 /* ---- one side: the page's scripts in a vm context, the scene, a session ---- */
@@ -189,9 +238,11 @@ async function side(web, tag, opts) {
   let checked = 0, ctx = null;
   const want = {};
   function programsOf(kind, pass, v) {
-    const k = kind + "|" + pass + "|" + v;
+    /* the appearance fish's programs under the render features in effect (the decoded constants), else the raw ones */
+    const rf = kind === "app" && binder && binder.render ? binder.render() : null, cached = !!(rf && rf.ids.length && rf.applies);
+    const k = kind + "|" + pass + "|" + v + "|" + cached;
     if (!want[k]) {
-      const SH = ctx.EvoOceanShaders, EA = ctx.EvoAppearance, app = (P) => SH.appearanceShaders(EA, P);
+      const SH = ctx.EvoOceanShaders, EA = ctx.EvoAppearance, app = (P) => SH.appearanceShaders(EA, P, cached ? rf.ids : []);
       want[k] = kind === "app"
         ? (pass === "body" ? [app(v === 1).vs, app(v === 1).fs] : pass === "shadow" ? [app(v === 1).shadowVs, SH.SHADOW_FS] : [SH.litSkip(app(false).vs), app(false).fs])
         : (pass === "body" ? [SH.FISH_VS[v], SH.FISH_FS[v]] : [SH.SHADOW_VS[v], SH.SHADOW_FS]);
@@ -217,6 +268,11 @@ async function side(web, tag, opts) {
   ctx.document = { addEventListener() {}, removeEventListener() {}, body: {} };   /* (ocean_appearance_slots.js registers on a page: root.document) */
   for (const f of SCRIPTS) {
     let src = fs.readFileSync(path.join(web, f), "utf8");
+    for (const [ef, a, b] of (opts.edits || [])) {   /* planted faults in any page script: each anchor occurs exactly once */
+      if (ef !== f) continue;
+      if (src.split(a).length !== 2) throw new Error("planted fault: its anchor is not once in " + f + ": " + a.slice(0, 60));
+      src = src.replace(a, b);
+    }
     if (f === "ocean_scene.js") {
       const a0 = "var THREE = null;";
       if (src.split(a0).length !== 2) throw new Error("hook: var THREE");
@@ -264,7 +320,9 @@ async function side(web, tag, opts) {
   const K = new Proxy({}, { get: (t, p) => p });
   const profiler = { active: true, SPAN: K, K, beginCpu: () => 0, lap: () => 0, endCpu() {}, count(k, v) { counts[k] = v; }, add(k, v) { counts["+" + k] = (counts["+" + k] || 0) + v; },
                      markDiagnostic() {}, attachGL() {}, watch: (o, l) => R.label(o, l), beginSubmission() {}, endSubmission() {}, suspend: (f) => f() };
-  const scene = S0.create(canvas, { profiler, visualRandom: rng(99), tankDepth: D });
+  /* the recording is of the reference pipeline (renderOptimization: false: main's draws, byte for byte); the render
+   * optimization has its own session below (opts.optimized), checked by assertions, never by a new recorded hash */
+  const scene = S0.create(canvas, { profiler, visualRandom: rng(99), tankDepth: D, renderOptimization: opts.optimized ? undefined : false });
   if (!scene) throw new Error(tag + ": no scene");
   scene.setWorld(W, HH, D, { walls: false });
   const frames = [];
@@ -279,6 +337,7 @@ async function side(web, tag, opts) {
   }
   async function frame(w, sel) {
     const f = { n: fr, draws: [], uploads: [], programs: [] };
+    if (rec.callBefore) f.rings = [];
     R.begin(f);
     for (const k of Object.keys(counts)) delete counts[k];
     scene.render(snap(w), { animT: fr * 0.016, selIdx: sel === undefined ? -1 : sel, dtSim: 0.032 });
@@ -293,6 +352,278 @@ async function side(web, tag, opts) {
   const close = (w, i) => { const f = w.fish[i]; scene.lookFrom([f.x - W / 2 + 60, -f.d + 25, f.y - HH / 2 + 60], [f.x - W / 2, -f.d, f.y - HH / 2]); };
   const closeP = (w, i) => { const p = w.preds[i]; scene.lookFrom([p.x - W / 2 + 70, -p.d + 30, p.y - HH / 2 + 70], [p.x - W / 2, -p.d, p.y - HH / 2]); };
   const out = { frames, early: rec.early, logs, bad, binds: () => checked };
+  if (opts.session === "policy") {
+    /* the render optimization's policy API (scene.setRenderOptimization / renderOptimization): validation, refusal, the lock */
+    const s0 = scene.renderOptimization();
+    const refused = await scene.setRenderOptimization({ lod: "nonsense" });
+    const refusedD = await scene.setRenderOptimization({ decoded: "yes" });
+    const refusedB = await scene.setRenderOptimization({ barbels: 7 });
+    const after = scene.renderOptimization();
+    const refOk = await scene.setRenderOptimization({ lod: "quality", decoded: false, barbels: "body" });
+    Object.assign(out, { s0, refused, refusedD, refusedB, after, refOk, final: scene.renderOptimization() });
+    return out;
+  }
+  if (opts.session === "buckets") {
+    /* the optimized body draws (policy lod: screen / medium / coarse) through the real scene: after each scripted state, the last
+     * frame's batches and draws against the canonical staging and the snapshot (every fish in exactly one body draw, the fish's own
+     * 21 floats in the batch, the shadow draw whole and in snapshot order, each draw's ring uniforms its own template's) */
+    rec.callBefore = true;
+    const app = World(300, 0, true, 1), N = 300, rep = [];
+    const EA = ctx.EvoAppearance, ringStr = (lod) => Array.from(new Float32Array(EA.buildTemplate(lod).ringT)).join();
+    const RING = { coarse: [EA.buildTemplate("coarse").ringT.length, ringStr("coarse")], medium: [EA.buildTemplate("medium").ringT.length, ringStr("medium")] };
+    function inspect(tag, o) {
+      o = o || {};
+      const f = frames[frames.length - 1], st = scene.renderOptimization(), b = st.batches, q = scene.quality(), P = [];
+      const res = { tag, quality: q, eff: st.effective, buckets: st.buckets, problems: P, rings: f.rings };
+      const by = {};
+      f.rings.forEach((r) => { (by[r[0].split("#")[0]] = by[r[0].split("#")[0]] || []).push(r); });
+      const canonSlots = scene.geneSlots();
+      if (!canonSlots || canonSlots.length !== N || canonSlots.some((s, i) => s !== i)) P.push("the canonical gene slots are not the snapshot's (identity): " + String(canonSlots && canonSlots.slice(0, 5)));
+      const shadow = (by.fishShadow || []).map((r) => [r[1], r[2], r[4]].join("|")).join(";"), wantTpl = q >= 3 ? "medium" : "coarse";
+      if (shadow !== [N, RING[wantTpl][0], RING[wantTpl][1]].join("|")) P.push("the shadow draw is not one draw of every fish on the " + wantTpl + " template's rings: " + shadow);
+      if (!st.buckets) {   /* the canonical body draw: one draw of every fish (and the barbels) on the quality's template */
+        /* one draw of every fish on the quality's template (with the lit split on, also the lit fish's own draw, on the same rings) */
+        const bodies = (by.fishBody || []).map((r) => [r[1], r[2], r[4]].join("|"));
+        if (bodies.indexOf([N, RING[wantTpl][0], RING[wantTpl][1]].join("|")) < 0 || (bodies.length > 1 && !o.split)) P.push("the canonical body draw: " + bodies.join(";"));
+        res.barbels = (by.barbels || []).reduce((s, r) => s + r[1], 0);
+        if (o.gated) {   /* the gated barbel draw under the canonical body draw: medium rings, its own instance count */
+          if ((by.barbels || []).some((r) => r[2] !== RING.medium[0] || r[4] !== RING.medium[1])) P.push("a barbel draw is not on the medium template's rings");
+          if (res.barbels !== st.barbels) P.push("the barbel draws hold " + res.barbels + " instances, the scene says " + st.barbels);
+        }
+        return res;
+      }
+      const seen = new Uint8Array(N), nb = { coarse: b.coarse.n, medium: b.medium.n };
+      if (nb.coarse + nb.medium !== N) P.push("the buckets hold " + (nb.coarse + nb.medium) + " fish, not " + N);
+      for (const k of ["coarse", "medium"]) {
+        const B = b[k];
+        for (let j = 0; j < B.n; j++) {
+          const c = B.drawIdx[j];
+          if (seen[c]) P.push("fish " + c + " is in two buckets"); seen[c] = 1;
+          if (j && B.drawIdx[j - 1] >= c) P.push(k + " bucket is not in snapshot order at " + j);
+          for (const a of ["iA", "iB", "iC", "iBody", "iX"]) for (let t = 0; t < 4; t++) if (B.attrs[a].array[4 * j + t] !== b.canon[a].array[4 * c + t]) P.push(k + "[" + j + "]." + a + "[" + t + "] differs from fish " + c);
+          if (B.attrs.iGeneSlot.array[j] !== b.canon.iGeneSlot.array[c]) P.push(k + "[" + j + "] has the wrong gene slot");
+        }
+      }
+      if (seen.some((x) => !x)) P.push("a fish is in no bucket");
+      const bodies = (by.fishBody || []).map((r) => [r[1], r[2], r[4]].join("|")).sort().join(";");
+      const want = ["coarse", "medium"].filter((k) => nb[k] > 0).map((k) => [nb[k], RING[k][0], RING[k][1]].join("|")).sort().join(";");
+      if (bodies !== want) P.push("the body draws " + bodies + " are not the buckets' " + want);
+      const barbs = (by.barbels || []).map((r) => [r[1], r[2], r[4]].join("|")).join(";");
+      const wantB = st.buckets.barbels > 0 ? [st.buckets.barbels, RING.medium[0], RING.medium[1]].join("|") : "";
+      if (barbs !== wantB) P.push("the barbel draw " + barbs + " is not " + wantB);
+      res.nb = nb; res.medium = Array.from(b.medium.drawIdx); res.barbels = st.buckets.barbels;
+      return res;
+    }
+    const run = async (tag, k, w, sel, camera, o) => { for (let i = 0; i < k; i++) { if (camera) camera(); await frame(w, sel); } const r = inspect(tag, o); rep.push(r); return r; };
+    scene.setAppearance(true);
+    await scene.setRenderOptimization({ lod: "screen", decoded: false, barbels: "body" });   /* (the barbels' gate has its own states, below) */
+    await run("whole, screen, q3", 4, app);
+    await run("close to fish 5, screen, q3", 6, app, 5, () => close(app, 5));
+    scene.resetView(false);
+    await scene.setRenderOptimization({ lod: "quality" });
+    await run("whole, quality (canonical)", 3, app);
+    await scene.setRenderOptimization({ lod: "medium" });
+    await run("forced medium", 3, app);
+    await scene.setRenderOptimization({ lod: "coarse" });
+    await run("forced coarse", 3, app);
+    await scene.setRenderOptimization({ lod: "screen" });
+    scene.setQuality(2);
+    await run("close, screen, q2 (all coarse)", 4, app, 5, () => close(app, 5));
+    scene.setQuality(3);
+    scene.resetView(false);
+    await run("whole, fish 7 selected (pinned medium)", 4, app, 7);
+    scene.setLitSplit(true);
+    await run("lit split on: the reference draws", 4, app, 5, () => close(app, 5), { split: true });
+    scene.setLitSplit(false);
+    await run("lit split off again: buckets", 4, app, 5, () => close(app, 5));
+    await scene.setRenderOptimization({ barbels: "off" });
+    await run("barbels off", 4, app, 5, () => close(app, 5));
+    await scene.setRenderOptimization({ lod: "quality", barbels: "off" });
+    await run("barbels off, quality", 3, app, 5, () => close(app, 5));
+    /* the barbels' gate: only fish that have barbels (gene above float32 0.2), in the medium template, big enough on screen */
+    const gated = [], POSEAPI = S0, fi = app.fish.findIndex((f, i) => i >= 5 && Math.fround(f.genes[59]) > 0.2);
+    function gatedCheck(tag) {
+      const st = scene.renderOptimization(), b = st.batches, q = scene.quality(), pc = scene.poseCamera();
+      const G = { view: pc.view, focal: pc.focalCss, near: pc.near, halfW: pc.halfW, halfH: pc.halfH };
+      const med = st.buckets ? new Set(b.medium.drawIdx) : null, enter = new Set(), keep = new Set(), P = [];
+      for (let c = 0; c < N; c++) {
+        const inMed = q >= 3 && (med ? med.has(c) : true), bD = Math.fround(app.fish[c].genes[59]);
+        if (!inMed || !(bD > Math.fround(0.2))) continue;
+        const p = scene.poseOf(c), xs = [], ys = [];
+        for (let k = 0; k < 6; k++) { xs.push(p.spine[2 * k]); ys.push(p.spine[2 * k + 1]); }
+        const px = POSEAPI.posePx(xs, ys, p.R, p.y, G);
+        if (px >= 6) enter.add(c);
+        if (px > 4.5) keep.add(c);
+      }
+      const got = new Set(b && b.barbels ? Array.from(b.barbels.drawIdx) : []), n = b && b.barbels ? b.barbels.n : 0;
+      for (const c of enter) if (!got.has(c)) P.push("fish " + c + " (barbels, 6 px or more, medium) has no barbel strips");
+      for (const c of got) if (!keep.has(c)) P.push("fish " + c + " has barbel strips but is not eligible (gene, template or under 4.5 px)");
+      if (n !== got.size) P.push("the barbel draw's count " + n + " is not its fish list's " + got.size);
+      gated.push({ tag, enter: enter.size, keep: keep.size, got: got.size, problems: P, quality: q, own: scene.renderOptimization().barbels });
+    }
+    await scene.setRenderOptimization({ lod: "screen", barbels: "gated" });
+    await run("gated barbels, screen LOD, close to a fish with barbels", 6, app, fi, () => close(app, fi));
+    gatedCheck("gated, screen LOD, close");
+    await scene.setRenderOptimization({ lod: "quality" });
+    await run("gated barbels, quality LOD, close", 6, app, fi, () => close(app, fi), { gated: true });
+    gatedCheck("gated, quality LOD, close");
+    scene.resetView(false);
+    await run("gated barbels, whole tank", 4, app, undefined, undefined, { gated: true });
+    gatedCheck("gated, whole tank");
+    scene.setQuality(2);
+    await scene.setRenderOptimization({ lod: "screen" });
+    await run("gated barbels, q2", 4, app, fi, () => close(app, fi));
+    gatedCheck("gated, q2");
+    scene.setQuality(3);
+    /* the screen LOD's hysteresis through the scene (the review of #85, P2): one fish with barbels (fi) of a frozen world, the camera
+     * set (lookFrom) so that its projected body radius is each scripted size: from a fresh coarse fish up through the 7 px enter, down
+     * through the band to the 5 px exit, and back up. The fish is in view throughout: only its size decides its bucket and its
+     * barbels (the helper-level tests of bodyLod / barbelVisible never meet the scene's own out-of-view rule) */
+    await scene.setRenderOptimization({ lod: "screen", barbels: "gated" });
+    app.frozen = true;
+    scene.resetView(false);
+    for (let i = 0; i < 3; i++) await frame(app);
+    const shr = [], sn = snap(app), sc = fi, s0 = 12 * sc;
+    const xm = 0.5 * (sn.segs[s0] + sn.segs[s0 + 10]), ym = 0.5 * (sn.segs[s0 + 1] + sn.segs[s0 + 11]);
+    const hg = -sn.depth[sc], len = Math.hypot(sn.segs[s0] - sn.segs[s0 + 10], sn.segs[s0 + 1] - sn.segs[s0 + 11]);
+    const tgt = [xm - W / 2, hg, ym - HH / 2], Rb = scene.poseOf(sc).R, focal = scene.poseCamera().focalCss;
+    const U = [0.55, 0.45, 0.70], un = Math.hypot(U[0], U[1], U[2]);
+    const lookPx = (T) => { const d = Rb * focal / T + 0.5 * len + 2 * Rb; scene.lookFrom([tgt[0] + U[0] / un * d, tgt[1] + U[1] / un * d, tgt[2] + U[2] / un * d], tgt); };
+    const measure = () => {
+      const pc = scene.poseCamera(), p = scene.poseOf(sc), xs = [], ys = [];
+      for (let k = 0; k < 6; k++) { xs.push(p.spine[2 * k]); ys.push(p.spine[2 * k + 1]); }
+      return POSEAPI.posePx(xs, ys, p.R, p.y, { view: pc.view, focal: pc.focalCss, near: pc.near, halfW: pc.halfW, halfH: pc.halfH });
+    };
+    for (const [T, wantMed] of [[6.5, false], [8, true], [7.2, true], [6.4, true], [5.6, true], [5.05, true], [4.95, false], [5.05, false], [6.9, false], [7.1, true], [5.6, true]]) {
+      const r = await run("shrink: " + T + " px", 2, app, undefined, () => lookPx(T));
+      const px = measure(), inMed = r.medium.indexOf(sc) >= 0, bb = scene.renderOptimization().batches.barbels, hasB = !!bb && Array.from(bb.drawIdx).indexOf(sc) >= 0, P = [];
+      if (!(Math.abs(px - T) < 0.02)) P.push("the scripted size " + T + " px is " + px + " px");
+      if (inMed !== wantMed) P.push("at " + T + " px the fish is " + (inMed ? "medium" : "coarse") + ", expected " + (wantMed ? "medium" : "coarse"));
+      if (hasB !== wantMed) P.push("at " + T + " px the fish has" + (hasB ? "" : " no") + " barbel strips, expected " + (wantMed ? "some" : "none"));
+      shr.push({ tag: "shrink: " + T + " px", T, px, inMed, hasB, problems: P });
+    }
+    app.frozen = false;
+    Object.assign(out, { rep, gated, shr, fi, lean: leanCheck(scene.renderOptimization()), logs: logs.slice() });
+    return out;
+  }
+  if (opts.session === "decoded") {
+    /* the decoded constants' cache (policy decoded) through the real scene: its programs compiled before they take effect, the
+     * cache made once at each fish's birth and kept in step through deaths, slot reuse, growth, a new epoch, the policy off and on, a
+     * lost context, a Look that does not declare the contract, and a planted compile failure; after each state, the GPU's copy of
+     * both gene textures (as the uploads three performed leave it) against a fresh decode of every owner's raw row */
+    rec.callBefore = true;
+    const EA = ctx.EvoAppearance, SH = ctx.EvoOceanShaders, w0 = World(300, 0, true, 1), checks2 = [];
+    const decoded = () => scene.renderOptimization().decoded;
+    const eff = () => scene.renderOptimization().effective;
+    let nextId = 100000;
+    const born = (k, seed) => { const W2 = World(k, 0, true, 1); return W2.fish.map((f, i) => Object.assign(f, { id: nextId++ })); };
+    /* the owners' decoded floats (CPU and GPU model) against writeDecoded of their raw rows; the raw texture's GPU copy against its rows */
+    function check(tag, o) {
+      o = o || {};
+      const g = scene.geneTexture(), d = decoded(), slots = scene.geneSlots(), P = [], tmp = new Float32Array(EA.DECODED_FLOATS);
+      const gpuD = d && d.texture ? R.gpuOf(d.texture) : null, gpuR = R.gpuOf(g.texture);
+      let owners = 0;
+      for (const s of slots) {
+        owners++;
+        EA.writeDecoded(g.data.subarray(64 * s, 64 * s + 63), tmp, 0);
+        for (let j = 0; j < EA.DECODED_FLOATS; j++) {
+          if (!Object.is(tmp[j], d.data[EA.DECODED_FLOATS * s + j])) { P.push("cpu slot " + s + " float " + j); break; }
+          if (o.gpu !== false && (!gpuD || !Object.is(tmp[j], gpuD[EA.DECODED_FLOATS * s + j]))) { P.push("gpu slot " + s + " float " + j); break; }
+        }
+        for (let j = 0; j < 63; j++) if (!gpuR || !Object.is(g.data[64 * s + j], gpuR[64 * s + j])) { P.push("raw gpu slot " + s + " gene " + j); break; }
+        if (P.length > 4) break;
+      }
+      const r = { tag, owners, problems: P, eff: Object.assign({}, eff()), stats: { uploads: d.uploads, calls: d.calls, bytes: d.bytes, allocs: d.allocs, fullUploads: d.fullUploads, decodes: d.decodes, capacity: d.capacity } };
+      checks2.push(r);
+      return r;
+    }
+    const go = async (k, w, sel) => { for (let i = 0; i < k; i++) await frame(w, sel); };
+    scene.setAppearance(true);
+    await go(2, w0);
+    const early = { eff: Object.assign({}, eff()), decoded: decoded() };
+    await go(4, w0);
+    check("compiled and in effect, the first fish decoded and uploaded whole");
+    const base = decoded();
+    await go(10, w0);
+    const steady = decoded(); checks2.push({ tag: "steady frames", problems: steady.uploads === base.uploads && steady.decodes === base.decodes ? [] : ["uploads/decodes moved on unchanged frames"] });
+    /* births and deaths: ten fish gone, twenty born (their slots: the lowest free ones first) */
+    w0.fish.splice(5, 10); w0.fish.push(...born(20));
+    await go(1, w0); const afterBirth = check("ten die, twenty are born: only their slots decoded and uploaded");
+    checks2.push({ tag: "births: decoded once each, in ranges (no whole upload)", problems: decoded().decodes === base.decodes + 20 && decoded().fullUploads === base.fullUploads && afterBirth.stats.calls - base.calls <= 3 ? [] : ["decodes " + (decoded().decodes - base.decodes) + ", whole " + (decoded().fullUploads - base.fullUploads) + ", calls " + (afterBirth.stats.calls - base.calls)] });
+    await go(3, w0);
+    check("a few frames later");
+    /* growth past 256 owners: new storage, a whole upload of both */
+    const cap0 = decoded().capacity;
+    w0.fish.push(...born(300));
+    await go(2, w0); const grown = check("growth to " + w0.fish.length + " fish: both textures whole on new storage");
+    checks2.push({ tag: "growth: the decoded storage grew with the slots", problems: grown.stats.capacity > cap0 && grown.stats.allocs >= 2 ? [] : ["capacity " + cap0 + " -> " + grown.stats.capacity + ", allocs " + grown.stats.allocs] });
+    /* a new epoch with the same ids: every owner installed again, decoded again */
+    const dBefore = decoded().decodes;
+    w0.epoch = 2; await go(2, w0); const ep = check("a new world (epoch 2, the same ids)");
+    checks2.push({ tag: "a new epoch decodes every fish again", problems: decoded().decodes - dBefore === w0.fish.length ? [] : ["decoded " + (decoded().decodes - dBefore) + " of " + w0.fish.length] });
+    /* the policy off: the raw programs, births while off, then on again (a stale copy: whole upload) */
+    const off = await scene.setRenderOptimization({ decoded: false });
+    await go(3, w0);
+    const offState = { ok: off.ok, eff: Object.assign({}, eff()) };
+    w0.fish.splice(0, 12); w0.fish.push(...born(15));
+    await go(3, w0);
+    const on = await scene.setRenderOptimization({ decoded: true });
+    await go(3, w0);
+    check("off (births while off), then on again");
+    checks2.push({ tag: "the policy off: the raw programs (effective.decoded false), then back on", problems: off.ok && offState.eff.decoded === false && on.ok && eff().decoded === true ? [] : ["off " + JSON.stringify(offState) + ", on " + JSON.stringify(on)] });
+    /* a lost context and its restore: both textures uploaded whole again */
+    const fullsBefore = decoded().fullUploads;
+    fire("webglcontextlost"); await go(2, w0); fire("webglcontextrestored"); await go(3, w0);
+    check("after a lost and restored context");
+    checks2.push({ tag: "a restored context: the decoded texture uploaded whole again", problems: decoded().fullUploads > fullsBefore ? [] : ["no whole upload after the restore"] });
+    /* a Look that did not declare the contract: raw programs; no Look: decoded again */
+    const lk = await scene.setFeatures({ look: "mock2", features: (q) => q.base });
+    await go(3, w0);
+    const underLook = { ok: lk.ok, eff: Object.assign({}, eff()) };
+    const lk2 = await scene.setFeatures(null);
+    await go(3, w0);
+    checks2.push({ tag: "a Look without appearanceCache keeps the raw programs; none again: decoded", problems: lk.ok && underLook.eff.decoded === false && lk2.ok && eff().decoded === true ? [] : ["under the Look " + JSON.stringify(underLook) + ", after " + JSON.stringify(eff())] });
+    check("after the Look");
+    /* turnover under a raw Look (the review of #85, P2): the raw programs never sample uDecoded, so nothing but the scene's own flush uploads
+     * it. A birth reuses one slot in one frame and another slot in a later frame, the survivors keep theirs, and then the Look is removed:
+     * every owner's decoded constants on the GPU must be its own (the first birth's slot once held the update a later birth's replaced) */
+    {
+      const lk3 = await scene.setFeatures({ look: "mock3", features: (q) => q.base });
+      await go(2, w0);
+      w0.fish.splice(3, 1); w0.fish.push(...born(1));            /* the born fish is the snapshot's last: its slot is the last of geneSlots() */
+      await go(1, w0);
+      const slotA = scene.geneSlots().slice(-1)[0];
+      w0.fish.splice(31, 1); w0.fish.push(...born(1));
+      await go(1, w0);
+      const slotB = scene.geneSlots().slice(-1)[0];
+      await go(2, w0);
+      const mid = check("a raw Look, a birth in one frame and another in a later one: the GPU's decoded copy is current for every owner (under the Look)");
+      const lk4 = await scene.setFeatures(null);
+      await go(3, w0);
+      const fin = check("the Look removed: every owner's decoded constants on the GPU are its own");
+      checks2.push({ tag: "turnover under a raw Look: two births in two frames take two different slots; decoded again once the Look is gone", problems:
+        lk3.ok && lk4.ok && mid.eff.decoded === false && fin.eff.decoded === true && slotA !== slotB && slotA < decoded().capacity && slotB < decoded().capacity ? [] :
+        ["look " + lk3.ok + "/" + lk4.ok + ", eff " + JSON.stringify([mid.eff, fin.eff]) + ", slots " + slotA + " " + slotB] });
+    }
+    /* a planted compile failure: the raw programs stay, said once, the failure kept */
+    await scene.setRenderOptimization({ decoded: false });
+    rec.failCached = true; logs.length = 0;
+    const bad = await scene.setRenderOptimization({ decoded: true });
+    await go(3, w0);
+    const failed = { ok: bad.ok, error: bad.error, eff: Object.assign({}, eff()), failures: scene.renderOptimization().failures.slice(), logs: logs.slice() };
+    rec.failCached = false;
+    const retry = await scene.setRenderOptimization({ decoded: true });
+    await go(3, w0);
+    checks2.push({ tag: "a compile that fails: the raw programs stay, the failure is kept and said once; the next try works", problems:
+      !failed.ok && failed.eff.decoded === false && failed.failures.length === 1 && /^decoded: /.test(failed.failures[0]) && failed.logs.length === 1 && /decoded appearance constants could not be used/.test(failed.logs[0]) && retry.ok && eff().decoded === true
+        ? [] : [JSON.stringify(failed), JSON.stringify(retry.ok)] });
+    check("after the retry");
+    /* the decoded programs really drew (a frame's body draw with the decoded vertex stage), and the raw ones before and between */
+    const dvs = H(SH.appearanceShaders(EA, false, [SH.DECODED]).vs), dvsP = H(SH.appearanceShaders(EA, true, [SH.DECODED]).vs), rvs = H(SH.appearanceShaders(EA, false).vs);
+    const drew = (h) => frames.filter((f) => f.draws.some((d) => d[1] === h)).length;
+    Object.assign(out, { checks2, early, drewDecoded: drew(dvs) + drew(dvsP), drewRaw: drew(rvs), lean: leanCheck(scene.renderOptimization()) });
+    return out;
+  }
   if (opts.session === "contextLoss") {
     /* check 4: the legacy fish close up (lit) with every compile held: the prewarm asks, and is pending; the context is lost
      * (frames go on: the page skips drawing), 6 s pass (main's prewarm marked itself ready at 5 s, compiled or not), the
@@ -428,6 +759,94 @@ async function planted(mutant, session) {
   const B = await planted("planesOnce");
   const fa = A.frames.map((f) => JSON.stringify(f)), n = B.error ? 0 : fa.filter((x, i) => x !== JSON.stringify(B.frames[i])).length;
   ok(n > 0, "   planted: the side planes never recomputed (the review of #59, P3-3): " + (B.error || n + " frames differ from the recording (the inset steps)"));
+}
+console.log("== the render optimization's policy (scene.setRenderOptimization)");
+{
+  const lockedS = await side(WEB, "policyRef", { session: "policy" });                       /* the reference scene: renderOptimization: false */
+  const P = await side(WEB, "policy", { session: "policy", optimized: true });
+  const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+  ok(lockedS.s0.enabled === false && same(lockedS.s0.effective, { lod: "quality", decoded: false, barbels: "body" }) && lockedS.refOk.ok === false && /renderOptimization: false/.test(lockedS.refOk.error),
+     "renderOptimization: false: the reference pipeline, its policy locked (setRenderOptimization refuses)", { s0: lockedS.s0, refOk: lockedS.refOk });
+  ok(P.s0.enabled === true && P.refused.ok === false && P.refusedD.ok === false && P.refusedB.ok === false && same(P.after.requested, P.s0.requested) && same(P.after.effective, P.s0.effective),
+     "a bad policy value is refused, naming it, and changes nothing", { refused: P.refused.error, refusedD: P.refusedD.error, refusedB: P.refusedB.error });
+  ok(P.refOk.ok === true && same(P.refOk.effective, { lod: "quality", decoded: false, barbels: "body" }) && P.final.failures.length === 0, "the reference policy can always be set", P.refOk);
+}
+console.log("== the optimized body draws (policy lod) through the real scene");
+{
+  const B = await side(WEB, "buckets", { session: "buckets", optimized: true });
+  const rep = B.rep, by = (t) => rep.find((r) => r.tag === t) || { problems: ["no such state " + t] };
+  ok(rep.length >= 10 && rep.every((r) => r.problems.length === 0), "every scripted state: every fish in exactly one body draw (snapshot order within it), the batch holds the fish's own 21 floats, the shadow is one whole draw, every draw's rings are its template's (" + rep.length + " states)", rep.filter((r) => r.problems.length).map((r) => [r.tag, r.problems.slice(0, 3)]));
+  ok(B.bad.length === 0 && B.binds() > 0, "  every bucket mesh drew the programs of the variant it was bound (" + B.binds() + " fish draws)", B.bad.slice(0, 2));
+  ok(B.logs.length === 0, "  and the console said nothing", B.logs.slice(0, 3));
+  const w = by("whole, screen, q3"), c = by("close to fish 5, screen, q3");
+  ok(w.buckets && w.buckets.medium === 0 && w.buckets.coarse === 300 && w.buckets.barbels === 0, "a whole-tank view: every fish coarse, no barbel draw (no medium fish)", w.buckets);
+  ok(c.buckets && c.medium.indexOf(5) >= 0 && c.buckets.medium >= 1 && c.buckets.medium < 150 && c.buckets.coarse + c.buckets.medium === 300 && c.buckets.barbels === c.buckets.medium,
+     "close to one fish: it is medium, most of the tank coarse (" + (c.buckets && c.buckets.medium) + " medium); barbel strips for the medium fish (reference policy)", c.buckets);
+  ok(by("whole, quality (canonical)").buckets === null && by("whole, quality (canonical)").barbels === 300, "lod \"quality\": the canonical body and barbel draws of every fish, as the reference draws them", by("whole, quality (canonical)").barbels);
+  const fm = by("forced medium"), fc = by("forced coarse");
+  ok(fm.buckets && fm.buckets.medium === 300 && fm.buckets.coarse === 0 && fm.buckets.barbels === 300, "lod \"medium\": every fish in the medium bucket (and its barbels)", fm.buckets);
+  ok(fc.buckets && fc.buckets.coarse === 300 && fc.buckets.medium === 0 && fc.buckets.barbels === 0, "lod \"coarse\": every fish in the coarse bucket, no barbels", fc.buckets);
+  const q2 = by("close, screen, q2 (all coarse)");
+  ok(q2.buckets && q2.buckets.medium === 0 && q2.buckets.coarse === 300, "detail 2 close to a fish: every body coarse (the screen LOD never raises detail past the setting)", q2.buckets);
+  const pin = by("whole, fish 7 selected (pinned medium)");
+  ok(pin.buckets && pin.medium.join() === "7", "a selected fish is medium wherever it is (pinned), the rest of the whole view coarse", pin.medium);
+  ok(by("lit split on: the reference draws").buckets === null && by("lit split off again: buckets").buckets !== null, "the lit split is drawn by the reference pipeline: no buckets while it is on, buckets again once off");
+  ok(by("barbels off").buckets && by("barbels off").buckets.barbels === 0 && by("barbels off, quality").barbels === 0, "barbels \"off\": no barbel draw, under buckets or the canonical draws");
+  const g = (t) => B.gated.find((x) => x.tag === t) || { problems: ["no such state " + t] };
+  ok(B.gated.length === 4 && B.gated.every((x) => x.problems.length === 0), "gated barbels: every fish with barbels (gene above float32 0.2), in the medium template and 6 px or more across has strips; none that is not eligible (4.5 px to keep them)", B.gated.filter((x) => x.problems.length).map((x) => [x.tag, x.problems.slice(0, 2)]));
+  ok(g("gated, screen LOD, close").enter >= 1 && g("gated, screen LOD, close").got >= 1 && g("gated, screen LOD, close").got < by("gated barbels, screen LOD, close to a fish with barbels").buckets.medium,
+     "close to a fish with barbels: its strips are drawn, and fewer than the body bucket has fish (the reference draws the strips of every fish of the draw)", g("gated, screen LOD, close"));
+  ok(g("gated, quality LOD, close").got >= 1 && g("gated, quality LOD, close").own === g("gated, quality LOD, close").got, "gated under the canonical body draw (lod \"quality\"): the barbel draw is compacted too", g("gated, quality LOD, close"));
+  ok(g("gated, whole tank").got === 0 && g("gated, q2").got === 0, "a whole-tank view (every fish a few pixels): no barbel strip at all; detail 2: none", [g("gated, whole tank").got, g("gated, q2").got]);
+  ok(B.shr.length === 11 && B.shr.every((x) => x.problems.length === 0), "the 7 px / 5 px hysteresis through the scene: a fish shrinking 8, 7.2, 6.4, 5.6, 5.05 px stays medium with its barbels, 4.95 px drops to coarse (none), which it keeps at 5.05 and 6.9 px, medium again at 7.1 px", B.shr.filter((x) => x.problems.length).map((x) => [x.tag, x.problems.slice(0, 2)]));
+  ok(B.lean.problems.length === 0, "a measurement record's slice of the state (leanOpt): the policy, the counters, each draw's counts; no live buffer or texture (" + B.lean.bytes + " bytes)", B.lean);
+  const cyc = fs.readFileSync(path.join(HERE, "..", "tools", "ocean_render_perf", "cycle.mjs"), "utf8");
+  ok(/window\.__leanOpt = " \+ leanOpt\.toString\(\)/.test(cyc) && (cyc.match(/renderOptimization\(\)/g) || []).length === (cyc.match(/__leanOpt\(S\.renderOptimization\(\)\)/g) || []).length,
+     "  the cycled harness records leanOpt(renderOptimization()) and nothing else of the live state (cycle.mjs: no other call keeps the buffers)");
+  /* planted faults: each must be seen */
+  const BF = {
+    "the out-of-view rule using the polish's size weight (poseVisibleQ is 0 under about 6 px: the review of #85, P2)": ["ocean_scene.js", "!poseVisible(xs, ys, BODY[o], hgt, G, X[o], X[o + 2], REACH_APP)", "poseVisibleQ(xs, ys, BODY[o], hgt, G, X[o], X[o + 2], REACH_APP, pxl) === 0"],
+    "every bucket on the medium template's rings": ["ocean_scene.js", "bindRings(S.mesh, function () { return S.rings; });", "bindRings(S.mesh, function () { return ringsOfLod.medium; });"],
+    "the shadow left on the last body draw's rings (no per-mesh rings)": ["ocean_scene.js", "if (renderOn) { bindRings(self.mesh, canonRings); bindRings(self.shadow, canonRings); }", "if (renderOn) { bindRings(self.mesh, canonRings); }"],
+    "the barbels' gene threshold too low (a fish without barbels gets strips)": ["ocean_pose.js", "var BARBEL_GENE_MIN = Math.fround(0.2),", "var BARBEL_GENE_MIN = 0.1,"],
+    "the barbel gate ignoring the size": ["ocean_pose.js", "return previous ? px > BARBEL_EXIT_CSS : px >= BARBEL_ENTER_CSS;", "return true;"],
+    "a fish dropped from its bucket": ["ocean_scene.js", "for (c = 0; c < n; c++) { if (lodOf[c] === LOD_MEDIUM) M.idx[jm++] = c; else C.idx[jc++] = c; }", "for (c = 0; c < n; c++) { if (lodOf[c] === LOD_MEDIUM) M.idx[jm++] = c; else if (c !== 7) C.idx[jc++] = c; }"],
+    "a bucket's gene slot off by one for a fish": ["ocean_scene.js", "dS[j] = sS[c];", "dS[j] = c === 3 ? j + 1 : sS[c];"]
+  };
+  for (const k of Object.keys(BF)) {
+    let M;
+    try { M = await side(WEB, "bk-fault", { session: "buckets", optimized: true, edits: [BF[k]] }); } catch (e) { M = { error: String(e && e.message || e) }; }
+    const seen = !M.error && (M.rep.some((r) => r.problems.length > 0) || M.gated.some((r) => r.problems.length > 0) || M.shr.some((r) => r.problems.length > 0));
+    ok(seen, "planted: " + k + ": the session sees it" + (M.error ? " (" + M.error + ")" : ""), M.rep && M.rep.concat(M.gated, M.shr).filter((r) => r.problems.length).slice(0, 1).map((r) => [r.tag, r.problems.slice(0, 2)]));
+  }
+}
+console.log("== the decoded constants' cache (policy decoded) through the real scene");
+{
+  const D = await side(WEB, "decoded", { session: "decoded", optimized: true });
+  ok(D.checks2.length >= 14 && D.checks2.every((c) => c.problems.length === 0), "every state: the cache decoded once per birth and kept through deaths, slot reuse, growth, a new epoch, the policy off and on, a restored context and a Look; both textures' GPU copies equal a fresh decode / the raw rows (" + D.checks2.length + " states)",
+     D.checks2.filter((c) => c.problems.length).map((c) => [c.tag, c.problems.slice(0, 3)]));
+  ok(D.checks2[0].eff.decoded === true && D.drewDecoded > 20 && D.drewRaw > 0, "its programs compiled first, then drew (" + D.drewDecoded + " frames of decoded body draws; the raw programs " + D.drewRaw + " frames: before it, while off, under the Look, after the failure)");
+  ok(D.lean.problems.length === 0, "  the measurement record's slice keeps the decoded cache's counters, not its array or texture (" + D.lean.bytes + " bytes)", D.lean);
+  ok(D.bad.length === 0 && D.binds() > 0, "  every fish mesh drew the programs of its variant, decoded or raw as the binder had them in effect (" + D.binds() + " fish draws)", D.bad.slice(0, 2));
+  ok(D.logs.length === 1 && /decoded appearance constants could not be used/.test(D.logs[0]), "  the console said only the planted failure, once", D.logs.slice(0, 3));
+  /* planted faults: each must be seen by the session's checks */
+  const FAULTS = {
+    "a slot never decoded (its owner's constants stale)": ["ocean_scene.js", "if (dec.live) decodeSlot(s, data, off); }", "if (dec.live && s % 5 !== 3) decodeSlot(s, data, off); }"],
+    "the decoded upload's ranges shifted a slot": ["ocean_scene.js", "dt.addUpdateRange(dr.start / 64 * EA.DECODED_FLOATS, dr.count / 64 * EA.DECODED_FLOATS);", "dt.addUpdateRange(dr.start / 64 * EA.DECODED_FLOATS + 72, dr.count / 64 * EA.DECODED_FLOATS);"],
+    "a decoded upload never queued": ["ocean_scene.js", "dt.needsUpdate = true; dec.queued = true;", "dt.needsUpdate = false; dec.queued = true;"],
+    "a released slot's owner left in the cache after a new epoch": ["ocean_scene.js", "onReset: function () { lodSt.fill(0); barbSt.fill(0); },", "onReset: function () { lodSt.fill(0); barbSt.fill(0); dec.live = false; },"],
+    "the decoded cache not grown with the slots": ["ocean_scene.js", "if (dec.live) growDec(cap); },", "},"],
+    /* (PR #85's head 60aaa67, the review's P2: the queued upload flushed only while the decoded programs draw, a later birth replacing a queued update) */
+    "the decoded update flushed only under the decoded programs, a later birth replacing an unflushed one (60aaa67)": [
+      ["ocean_scene.js", "if (renderOn && appKind) appKind.flush();", "if (renderNow.decoded && appKind) appKind.flush();"],
+      ["ocean_scene.js", "var dfull = dec.needFull || dec.queued || !!(plan && plan.full);", "var dfull = dec.needFull || !!(plan && plan.full);"]]
+  };
+  for (const k of Object.keys(FAULTS)) {
+    let M;
+    try { M = await side(WEB, "dec-fault", { session: "decoded", optimized: true, edits: Array.isArray(FAULTS[k][0]) ? FAULTS[k] : [FAULTS[k]] }); } catch (e) { M = { error: String(e && e.message || e) }; }
+    ok(!M.error && M.checks2.some((c) => c.problems.length > 0), "planted: " + k + ": the session sees it" + (M.error ? " (" + M.error + ")" : ""),
+       M.checks2 && M.checks2.filter((c) => c.problems.length).slice(0, 1).map((c) => [c.tag, c.problems.slice(0, 2)]));
+  }
 }
 console.log("== a WebGL context loss during the prewarm (#50's review, P2)");
 {
