@@ -1163,12 +1163,14 @@ interface UiReturnPoint { set(n: HTMLElement | null | undefined): void; get(): H
 /** the fish card's common subtitle (EvoUI.cardSubtitle): body is [size, elongation] when the body model is on */
 interface UiCardFields { generation: number; family: number; genes: number; body?: [number, number] | null }
 /** whether the card's live brain is this tick's (EvoUI.activationClock): reset at a world the page has not seen step,
- * capture(on, tick) when the world's capture switches, at(tick) the tick its kept activations are from (null: none) */
+ * capture(on, tick) when the world's capture switches, at(tick) the tick its kept activations are from (null: none),
+ * stamp(tick, age) the tick of the activations the card shows (its data-activations-at; null while it waits) */
 interface UiActivationClock {
   reset(tick: number, on: boolean): void;
   capture(on: boolean, tick: number): void;
   at(tick: number): number | null;
   state(tick: number, age: number): "current" | "waiting";
+  stamp(tick: number, age: number): number | null;
 }
 /** one fish's brain as the inspect exports give it (K links of 5: source is a sensor, its index, sink is an action, its index, weight) */
 interface UiBrainNet { sensors: ArrayLike<number>; hidden: ArrayLike<number>; actions: ArrayLike<number>; conns: ArrayLike<number>; connCount: number }

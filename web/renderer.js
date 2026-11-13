@@ -854,8 +854,9 @@
     setBar("iage", info[3] / maxAge);
     setText("ispeedv", String(Math.round(info[1])));
     setBar("ispeed", info[1] / maxSpd);
-    /* its live brain: the last step's, or (a new or loaded world, a fish born in the last step) waiting for a step */
-    var tick = s.stats[3], state = brainClock.state(tick, info[3]), at = brainClock.at(tick);
+    /* its live brain: the last step's, or (a new or loaded world, a fish born in the last step) waiting for a step;
+     * data-activations-at: the tick of the activations it shows, empty while it waits (EvoUI.activationClock's stamp) */
+    var tick = s.stats[3], state = brainClock.state(tick, info[3]), at = brainClock.stamp(tick, info[3]);
     cardFresh = state === "current";
     if (cardCache.acts !== state + "|" + at) {
       cardCache.acts = state + "|" + at;

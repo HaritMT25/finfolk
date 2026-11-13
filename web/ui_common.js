@@ -198,6 +198,10 @@
    *   capture(on, tick)  the capture switched at that tick (the Ocean: a fish picked, or let go)
    *   at(tick)           the tick the kept activations are from (null: none since the reset)
    *   state(tick, age)   "current" (the last step's, this tick's) or "waiting"
+   *   stamp(tick, age)   the tick of the activations the card shows (the card's data-activations-at): this
+   *                      tick when current, null while it waits. A fish of age 0 has none (review of #91, P3),
+   *                      and what an older step kept is not shown, nor is it every fish's (one born since
+   *                      was not in that step; its age, float seconds, cannot say so exactly)
    * @returns {UiActivationClock}
    */
   function activationClock() {
@@ -206,6 +210,8 @@
     var kept = null;   /* the last step with the capture on before it was last switched off (null: none since the reset) */
     /** @param {number} tick @returns {number | null} */
     function at(tick) { return on && tick > from ? tick : kept; }
+    /** @param {number} tick @param {number} age @returns {boolean} */
+    function current(tick, age) { return at(tick) === tick && age > 0; }
     return {
       reset: function (tick, v) { on = !!v; from = tick; kept = null; },
       capture: function (v, tick) {
@@ -215,7 +221,8 @@
         on = v; from = tick;
       },
       at: at,
-      state: function (tick, age) { return at(tick) === tick && age > 0 ? "current" : "waiting"; }
+      state: function (tick, age) { return current(tick, age) ? "current" : "waiting"; },
+      stamp: function (tick, age) { return current(tick, age) ? tick : null; }
     };
   }
   /* a node's colour: lime for excited, orange for inhibited, brighter the stronger; a value the card does not

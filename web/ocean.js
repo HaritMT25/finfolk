@@ -624,6 +624,9 @@
       if (scene && scene.following()) scene.setFollow(false);
     }
     applyDisplaySwitches();
+    /* the card's clock starts over here, and only here (never at a display switch: review of #91, P2): a world the
+     * page has not seen step, so its fish's kept activations, if any, are no step the card can vouch for */
+    brainClock.reset(syncedFrame(), has("oc_set_capture") && selectedId !== null);
     updateModeline();     /* the world's appearance genes may differ */
     estPrev.n = 0;
     stepMs = 0;
@@ -637,13 +640,18 @@
   }
   /* the shim's display switches: the colour mode is the shim's (memory), the
    * capture flag the world's, so both are set again after every new world and
-   * every Turbo hand-off */
+   * every Turbo hand-off, and whenever the colour mode changes (setColourMode).
+   * None changes a step's activations: the card's clock hears only of a capture
+   * that switched (none, when the selection already set it); a new world resets
+   * it (afterNewWorld) */
   function applyDisplaySwitches() {
     if (has("oc_set_colour_mode")) M._oc_set_colour_mode(colourBrain ? 0 : 1);
     if (scene && scene.setAppearance) scene.setAppearance(colourMode === "appearance");
-    if (has("oc_set_capture")) M._oc_set_capture(selectedId !== null ? 1 : 0);
-    /* (a world the page has not seen step: its fish's kept activations, if any, are no step the card can vouch for) */
-    brainClock.reset(syncedFrame(), has("oc_set_capture") && selectedId !== null);
+    if (has("oc_set_capture")) {
+      var cap = selectedId !== null;
+      M._oc_set_capture(cap ? 1 : 0);
+      brainClock.capture(cap, syncedFrame());
+    }
   }
 
   /* ---- the sheet (built from EvoOceanConfig.TABS) ---- */
@@ -2627,8 +2635,9 @@
     cardText("isub", EvoUI.cardSubtitle({ generation: info[6], family: info[7], genes: info[11],
                                           body: cfgVal("bodyModel") ? [info[4], info[5]] : null }));
     /* its live brain: the last step's, or waiting for one (a fish just picked in a world that stepped without the
-     * capture, a new or handed-back world, a fish born in the last step; EvoUI.activationClock) */
-    var tick = s.stats[STATS.frame], state = brainClock.state(tick, info[3]), at = brainClock.at(tick);
+     * capture, a new or handed-back world, a fish born in the last step; EvoUI.activationClock). data-activations:
+     * current or waiting; data-activations-at: the tick of the activations it shows, empty while it waits (stamp) */
+    var tick = s.stats[STATS.frame], state = brainClock.state(tick, info[3]), at = brainClock.stamp(tick, info[3]);
     cardFresh = state === "current";
     if (cardCache.acts !== state + "|" + at) {
       cardCache.acts = state + "|" + at;

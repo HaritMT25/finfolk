@@ -288,6 +288,17 @@ async function main() {
     ok(c.at(81) === 81, "  off and on at the tick it went on (no step between): kept stays the last captured step");
     c.reset(500, false);
     ok(c.at(500) === null && st(500) === "waiting", "a world handed back (reset): nothing kept");
+    /* the card's data-activations-at: the tick of the activations it shows, none while it waits (review of #91, P3) */
+    const s = UI.activationClock(), sp = [];
+    if (typeof s.stamp === "function") {
+      s.reset(0, true); sp.push(s.stamp(0, 0), s.stamp(0, 1));
+      sp.push(s.stamp(7, 1), s.stamp(7, 0), s.stamp(7, 0.016));
+      s.capture(false, 7); sp.push(s.stamp(9, 1));
+      s.capture(true, 9); sp.push(s.stamp(9, 1), s.stamp(10, 1));
+    }
+    ok(JSON.stringify(sp) === JSON.stringify([null, null, 7, null, 7, null, null, 10]),
+       "stamp: none at tick 0; this tick when current; none for a fish of age 0 (born in that step, though the world's capture ran: " +
+       "it was not in it); none while it waits on what an older step kept (7's, at 9: a fish born since was not in it either)", sp);
   }
 
   /* brainColor */
@@ -739,6 +750,16 @@ async function classicPage(mkClassic, buf) {
   ok(/^Senses on one side/.test(el("isense").textContent), "  its line: how to read a current brain");
   const fills = ctxs.get("inetc").__log.filter((c, i, L) => c[0] === "=" && c[1] === "fillStyle" && L[i + 1] && L[i + 1][0] === "beginPath" && L[i + 2] && L[i + 2][0] === "arc");
   ok(fills.length >= 65 && fills.slice(-65).some((f) => f[2] !== UI.brainColor(NaN, 1)), "  and its brain drawn with its activations (not neutral)");
+  /* display switches change no step's activations (review of #91, P2, on this page too): colour by brain, fish shapes, each on and off */
+  {
+    const seen = [], id0 = idOf();
+    for (const id of ["colourBrain", "colourBrain", "fishShape", "fishShape"]) {
+      const e = el(id); e.checked = !e.checked; e.dispatchEvent(new D.Ev("change", { bubbles: true })); P.frame();
+      seen.push(id + " " + e.checked + ":" + card.dataset.activations + "@" + card.dataset.activationsAt);
+    }
+    ok(tick() === 1 && idOf() === id0 && seen.every((x) => x.endsWith(":current@1")),
+       "  display switches (colour by brain, fish shapes, each on and off): no step, the same fish, its brain still current at tick 1 after each", seen);
+  }
   /* folding the brain (the card's own hide): the fish stays */
   const id1 = idOf();
   el("iexpand").click(); P.frame();
@@ -770,6 +791,35 @@ async function classicPage(mkClassic, buf) {
      "the tank: the card shows; F follows; folding the brain neither lets the fish go nor stops the follow", [tankCard, followed, tank.following, card.dataset.activations]);
   P.key("Escape"); P.frame();
   ok(!tank.following && card.hidden && tank.follows[tank.follows.length - 1] === false, "  Esc lets the fish go: its card goes and the follow stops with it");
+  /* a fish born in the last step (age 0) on the card, picked with a click in the flat view: it waits, with no tick on it, though
+   * Classic captures every step; an older fish picked at that tick is current, stamped with it (review of #91, P3) */
+  el("view3d").checked = false; el("view3d").dispatchEvent(new D.Ev("change", { bubbles: true }));
+  await new Promise((r) => setTimeout(r, 20));
+  P.frame();
+  {
+    const cv = el("canvas"); cv._rect = { left: 0, top: 0, right: cv.width, bottom: cv.height };   /* (CSS px = world px) */
+    const ageOf = (i) => { M._evo_inspect(i); return new Float64Array(buf(M), M._evo_inspect_info(), 8)[3]; };
+    const idAt = (i) => new Float64Array(buf(M), M._evo_creature_ids(), i + 1)[i];
+    const pick = (i) => { const segs = new Float32Array(buf(M), M._evo_creature_segments(), M._evo_creature_count() * 12);
+                          cv.dispatchEvent(new D.Ev("click", { bubbles: true, clientX: segs[12 * i], clientY: segs[12 * i + 1] })); P.frame(); };
+    let nb = -1, steps = 0;
+    for (; steps < 4000 && nb < 0; steps++) {   /* (the world, a step at a time; the paused page reads it at its next frame) */
+      M._evo_step(1); M._evo_sync();
+      if (new Float64Array(buf(M), M._evo_stats(), 5)[4] > 0) for (let i = M._evo_creature_count() - 1; i >= 0 && nb < 0; i--) if (ageOf(i) === 0) nb = i;
+    }
+    P.frame();
+    const tN = tick(), idN = nb >= 0 ? idAt(nb) : NaN;
+    if (!card.classList.contains("expanded")) el("iexpand").click();   /* (the brain unfolded: the tank left it folded, and its line is in it) */
+    if (nb >= 0) pick(nb);
+    const born = [idOf() === idN, card.hidden, card.dataset.activations, card.dataset.activationsAt, el("isense").textContent];
+    ok(nb >= 0 && cv.width > 0 && born[0] && !born[1] && born[2] === "waiting" && born[3] === "" && /^Waiting for a step/.test(born[4]) && tick() === tN,
+       "a fish born in the last step (tick " + tN + "), picked in the flat view: its card waits, data-activations-at empty (it was not in that step)", [nb, idN].concat(born));
+    let old = -1;
+    for (let i = 0; i < M._evo_creature_count() && old < 0; i++) if (ageOf(i) > 0) old = i;
+    if (old >= 0) pick(old);
+    ok(old >= 0 && tick() === tN && idOf() === idAt(old) && card.dataset.activations === "current" && card.dataset.activationsAt === String(tN),
+       "  an older fish picked at the same tick: current, at " + tN, [old, idOf(), card.dataset.activations, card.dataset.activationsAt]);
+  }
   ok(D.errors.length === 0 && P.logs.filter((l) => l[0] === "error").length === 0, "no handler threw, nothing logged as an error", D.errors.slice(0, 2).concat(P.logs.filter((l) => l[0] === "error").slice(0, 2)));
 }
 
@@ -838,6 +888,29 @@ async function oceanPage(mkOcean, HO) {
   P.key("."); P.frame(); P.frame();
   ok(st().frame === tB + 1 && st().paused && card.dataset.activations === "current" && card.dataset.activationsAt === String(tB + 1),
      ". : exactly one step, still paused, and the brain is current (kept at " + (tB + 1) + ")", [st().frame, st().paused, card.dataset.activations, card.dataset.activationsAt]);
+  /* display switches change no step's activations (review of #91, P2): the View menu's colour mode (each of the three, and
+   * back), the water's clarity, the light and its follow, Hold 60 fps; after each, the brain is still current at that tick */
+  {
+    const nS = M._oc_num_senses(), nA = M._oc_num_actions();
+    const acts = () => { M._oc_inspect(st().selIdx); const b = HO.buffer(M);
+      return JSON.stringify([Array.from(new Float32Array(b, M._oc_inspect_sensors(), nS)), Array.from(new Float32Array(b, M._oc_inspect_actions(), nA))]); };
+    const cm = el("colourMode"), was = st().colourMode, id1 = st().selectedId, a0 = acts(), c0 = captures.length, seen = [];
+    for (const c of ["appearance", "family", "brain"]) { const b = D.doc.createElement("button"); b.type = "button"; b.dataset.c = c; cm.appendChild(b); }
+    const note = (what) => { P.frame(); seen.push(what + ":" + card.dataset.activations + "@" + card.dataset.activationsAt); };
+    const colour = (c) => { cm.children.find((b) => b.dataset.c === c).click(); note("colour " + c + " (" + st().colourMode + ")"); };
+    const flip = (id) => { const e = el(id); e.checked = !e.checked; e.dispatchEvent(new D.Ev("change", { bubbles: true })); note(id + " " + e.checked); };
+    colour("family"); colour("brain"); colour("appearance"); if (was !== "appearance") colour(was);
+    el("clarity").value = "40"; el("clarity").dispatchEvent(new D.Ev("input", { bubbles: true })); note("clarity 40");
+    for (const id of ["lightnow", "followLight", "governor"]) { flip(id); flip(id); }
+    const want = ":current@" + (tB + 1), bad = seen.filter((x) => !x.endsWith(want));
+    ok(seen.length === (was !== "appearance" ? 11 : 10) && bad.length === 0 && st().colourMode === was,
+       "  display switches (the colour mode: Family, Brain, Appearance; clarity; the light, its follow, Hold 60 fps, each on and off): after each the brain is still current at " + (tB + 1),
+       bad.length ? bad : seen);
+    ok(st().frame === tB + 1 && st().paused && st().selectedId === id1 && captures.length > c0 && captures.slice(c0).every((v) => v === 1) && acts() === a0 &&
+       card.dataset.activations === "current" && card.dataset.activationsAt === String(tB + 1) && !/^Waiting for a step/.test(el("isense").textContent),
+       "  and none took a step, let the fish go or switched the capture off (set again, on: " + (captures.length - c0) + " times); its senses and actions are the same, bit for bit",
+       [st().frame, st().paused, captures.slice(c0), acts() === a0, card.dataset.activations, card.dataset.activationsAt, el("isense").textContent]);
+  }
   /* hiding the card without letting the fish go: the live numbers opened over it (where they overlap) */
   const box = (l, t, r, b) => ({ left: l, top: t, right: r, bottom: b });
   el("statpanel")._rect = box(10, 64, 350, 654); card._rect = box(10, 64, 380, 520);
@@ -854,7 +927,8 @@ async function oceanPage(mkOcean, HO) {
   const off = captures[captures.length - 1];
   el("pausebtn").click(); for (let i = 0; i < 10; i++) P.frame(); el("pausebtn").click(); P.frame();
   O.select(0); P.frame();
-  ok(off === 0 && card.dataset.activations === "waiting", "Close (the capture off), 10 steps, a fish picked while paused: waiting again (what it kept is 10 steps old)",
+  ok(off === 0 && card.dataset.activations === "waiting" && card.dataset.activationsAt === "",
+     "Close (the capture off), 10 steps, a fish picked while paused: waiting again (what it kept is 10 steps old), no tick on it",
      [off, card.dataset.activations, card.dataset.activationsAt]);
   /* a new world: zero steps */
   el("restart").click();
@@ -867,6 +941,49 @@ async function oceanPage(mkOcean, HO) {
   ok(t0 === 0 && card.dataset.activations === "waiting", "a new world (Start), a fish picked at tick 0 (zero steps): waiting", [t0, card.dataset.activations]);
   P.key("."); P.frame();
   ok(st().frame === 1 && card.dataset.activations === "current", "  . : current at tick 1", [st().frame, card.dataset.activations]);
+  /* a fish born in the last step (age 0) on the card: it waits, with no tick on it, though the world's capture ran in that step;
+   * an older fish picked at that tick is current, stamped with it (review of #91, P3) */
+  {
+    const Mn = O.module;
+    const infoOf = (i) => { Mn._oc_inspect(i); return new Float64Array(HO.buffer(Mn), Mn._oc_inspect_info(), Mn._oc_inspect_len()); };
+    const firstAged = (pred) => { for (let i = 0; i < Mn._oc_creature_count(); i++) if (pred(infoOf(i)[3])) return i; return -1; };
+    let nb = -1, steps = 0;
+    for (; steps < 3000 && nb < 0; steps++) {
+      if (st().selectedId === null) O.select(0);   /* (a fish picked, so every step runs with the capture on) */
+      P.key("."); P.frame();
+      nb = firstAged((a) => a === 0);
+    }
+    const tN = st().frame, idN = nb >= 0 ? infoOf(nb)[0] : NaN;
+    O.select(nb); P.frame();
+    const born = [st().selectedId === idN, card.hidden, card.dataset.activations, card.dataset.activationsAt, el("isense").textContent];
+    ok(nb >= 0 && born[0] && !born[1] && born[2] === "waiting" && born[3] === "" && /^Waiting for a step/.test(born[4]) && st().frame === tN && captures[captures.length - 1] === 1,
+       "a fish born in the last step (tick " + tN + ", " + steps + " steps of .), picked: its card waits, data-activations-at empty (it was not in the step the capture ran)", born);
+    const old = firstAged((a) => a > 0);
+    O.select(old); P.frame();
+    ok(old >= 0 && st().frame === tN && card.dataset.activations === "current" && card.dataset.activationsAt === String(tN),
+       "  an older fish picked at the same tick: current, at " + tN, [old, card.dataset.activations, card.dataset.activationsAt]);
+  }
+  /* a new world starts the clock over (afterNewWorld, the one place it resets): what the old world kept is no step of the new
+   * one's, even at the same tick. Let go at tick K (the capture off: K's kept), a new world, K steps with nothing picked (the
+   * capture off), a fish picked at tick K: it waits (the new world's step K ran without the capture) */
+  {
+    el("iclose").click(); P.frame();
+    const K = st().frame;
+    el("restart").click();
+    if (!el("startask").hidden) el("startconfirm").click();
+    await new Promise((r) => setTimeout(r, 30));
+    if (!st().paused) el("pausebtn").click();
+    P.frame();
+    const t0b = st().frame, sel0 = st().selectedId;
+    while (st().frame < K && st().selectedId === null) { P.key("."); P.frame(); }
+    O.select(0); P.frame();
+    ok(t0b === 0 && sel0 === null && st().frame === K && card.dataset.activations === "waiting" && card.dataset.activationsAt === "",
+       "a new world after a fish was let go at tick " + K + ": " + K + " steps with nothing picked, a fish picked at tick " + K + ": it waits (the old world's tick " + K + " is not this one's)",
+       [K, t0b, sel0, st().frame, card.dataset.activations, card.dataset.activationsAt]);
+    P.key("."); P.frame();
+    ok(st().frame === K + 1 && card.dataset.activations === "current" && card.dataset.activationsAt === String(K + 1), "  . : current at " + (K + 1),
+       [st().frame, card.dataset.activations, card.dataset.activationsAt]);
+  }
   ok(D.errors.length === 0 && P.logs.filter((l) => l[0] === "error").length === 0, "no handler threw, nothing logged as an error",
      D.errors.slice(0, 2).concat(P.logs.filter((l) => l[0] === "error").slice(0, 2)));
 }
