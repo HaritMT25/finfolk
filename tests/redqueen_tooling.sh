@@ -67,6 +67,10 @@ grep -q ResourceWarning unit.log && { grep -m 5 ResourceWarning unit.log; fail "
 # the map graph (stdlib) and the recovery simulation (numpy: skipped without it, unless RQ_REQUIRE_NUMPY=1)
 $PY -W error::ResourceWarning "$T/test_graph.py" > graph_unit.log 2>&1 || { tail -30 graph_unit.log; fail "graph unit tests"; }
 grep -q ResourceWarning graph_unit.log && fail "the graph unit tests leak file handles"
+# additive recovery partitions, forward reference access, and frozen synthetic attrition
+$PY -W error::ResourceWarning "$T/test_recovery_extra.py" > recovery_extra_unit.log 2>&1 \
+    || { tail -40 recovery_extra_unit.log; fail "recovery extension unit tests"; }
+grep -q ResourceWarning recovery_extra_unit.log && fail "the recovery extension tests leak file handles"
 
 # --- tiny Stage C worlds: A and B (periodic checkpoints at 1500 and 3000, a one-step F1 replay), a template
 STAGEC="--population 200 --predators 6 --predator-economy --predator-brain --predator-meal 14

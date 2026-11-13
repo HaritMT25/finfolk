@@ -1145,6 +1145,32 @@ interface EvoBodyPlanViewerApi {
   redraw(): void;
 }
 
+/* ---------------- the shared focus primitives: web/ui_common.js (window.EvoUI, both pages) ---------------- */
+
+/** a tablist's page side (EvoUI.tabs): the tabs' ids in order (asked each time), the selected one, a tab's
+ * element, and the page's own selection (its panel, charts, storage; it calls UiTabs.mark) */
+interface UiTabsOptions {
+  ids(): string[];
+  current(): string;
+  button(id: string): HTMLElement | null;
+  select(id: string): void;
+}
+/** mark(id): aria-selected and the roving tabindex on every tab; bind(button, id): a tab's press (select, then pointerBlur) */
+interface UiTabs { mark(id: string): void; bind(button: HTMLElement, id: string): void }
+/** set(opener): remember the keyboard's opener (null: a pointer opened it); restore(keyboard): forget it, and when the
+ * keyboard closed it, give it the focus back; returns the opener it had */
+interface UiReturnPoint { set(n: HTMLElement | null | undefined): void; get(): HTMLElement | null; restore(keyboard: boolean): HTMLElement | null }
+interface EvoUIApi {
+  keyboardFocused(n: Element | null | undefined): boolean;
+  pressedByKeyboard(n: Element | null | undefined, e?: { detail?: number } | null): boolean;
+  pointerBlur(n: Element | null | undefined): void;
+  typingIn(t: EventTarget | null | undefined): boolean;
+  ownsKey(t: EventTarget | null | undefined, key: string): boolean;
+  tabIndexFor(key: string, i: number, n: number): number;
+  tabs(list: HTMLElement, o: UiTabsOptions): UiTabs;
+  returnPoint(): UiReturnPoint;
+}
+
 /* ---------------- not checked yet: declared by what checked files use ---------------- */
 
 /** the scene (web/ocean_scene.js create()): what the benchmark and the page's API use of it */
@@ -1180,6 +1206,7 @@ interface OceanPageApi {
 /** the published asset names (ocean.html's EVO_ASSETS; build_site.sh rewrites them to content-hashed ones) */
 interface EvoAssets { ocean?: string; oceanWasm?: string; worker?: string; handoff?: string; mock?: string; three?: string; bodyplan?: string; fixture?: string; [name: string]: string | undefined }
 
+declare var EvoUI: EvoUIApi;
 declare var EvoOceanHandoff: EvoOceanHandoffApi;
 declare var EvoAppearanceSlots: EvoAppearanceSlotsApi;
 declare var EvoOceanPerf: EvoOceanPerfApi;

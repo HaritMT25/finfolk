@@ -130,6 +130,22 @@ jobs:
       # the render-perf tools' browser lock: interleavings of two contenders, then real processes at the same instant
       - run: node tests/ocean_render_perf_lock_tests.mjs
 
+  # Both pages' shared UI (the UI parity plan, docs/ui_parity.md): web/ui_common.js's focus primitives
+  # (key ownership, typing, keyboard / pointer presses, the tablists' roving focus, focus return), both
+  # dashboards' tabs and Classic's setup sheet (web/renderer.js run whole) on a small DOM; then the paired
+  # browser harness's parts that need no browser (tests/ui_parity_browser.mjs: the selection and fixture
+  # checks, --compare as a gate on synthetic runs). The harness's browser runs are a local tool.
+  web-ui:
+    name: web ui (node)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "20.x"
+      - run: node tests/ui_common_tests.cjs
+      - run: node tests/ui_parity_harness_tests.mjs
+
   # tools/redqueen (the Red Queen tournament tooling) on the Python versions it must run on: the
   # serial job's ctest runs it on the runner image's python3 (3.12); this job builds the serial app
   # only and runs the same unit + end-to-end tests on 3.14 (the study server's: its multiprocessing

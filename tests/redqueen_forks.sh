@@ -20,6 +20,8 @@ W=$(readlink -m "${2:?usage: redqueen_forks.sh EVO_BOIDS WORKDIR}")
 T=$(cd "$(dirname "${BASH_SOURCE[0]}")/../tools/redqueen" && pwd)
 PY="${PYTHON:-python3} -I"
 NW=${RQ_TEST_WORKERS:-4}
+case "$NW" in ''|*[!0-9]*) echo "invalid RQ_TEST_WORKERS: $NW" >&2; exit 2 ;; esac
+[ "$NW" -ge 2 ] || { echo "RQ_TEST_WORKERS must be at least 2 for the concurrent branch crash test" >&2; exit 2; }
 WS="$PY $T/worlds.py"
 FK="$PY $T/forks.py"
 [ -d "$W" ] && chmod -R u+w "$W" 2> /dev/null
@@ -64,7 +66,7 @@ grep -q "never replaced" ow.log || fail "the overwrite refusal does not say why:
 read B0 S0 B1 S1 < <($PY -c 'import json
 bs = [b for b in json.load(open("R/config/forks.json"))["worlds"] if b["kind"] == "main" and b["origin"]["frame"] == 8000]
 print(bs[0]["id"], bs[0]["origin"]["seed"], bs[1]["id"], bs[1]["origin"]["seed"])')
-$FK launch --study R --binary "$BIN" --workers $NW $GUARD > fl.log 2>&1 &
+$FK launch --study R --binary "$BIN" --workers "$NW" $GUARD > fl.log 2>&1 &
 sp=$!
 for _ in $(seq 1 3000); do pgrep -f "reseed-after-load $S1 " > /dev/null && break; sleep 0.01; done
 pkill -KILL -f "reseed-after-load $S1 " || { kill $sp; fail "no engine of $B1 to kill before its first acceptance"; }
