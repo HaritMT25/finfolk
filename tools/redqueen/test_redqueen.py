@@ -816,12 +816,12 @@ class TestStore(unittest.TestCase):
                                      ["chunk_000001.zip", "index.jsonl"])
                     self.assertEqual(len([a for a in acts if "deleted the packed cell" in a]), 1, acts)
 
-    def runner_refuses(self, argv):
-        """run.main on each packed_v3_roots(leftovers) root: a bad one exits 2, the operator told why on
-        stderr and the cell named in runner.log, every byte of work/ and chunks/ kept; a complete one
-        exits 0 with the leftovers cleaned and the disjoint cell packed."""
-        for cid, root, bad, snap in self.packed_v3_roots(leftovers=True):
-            with self.subTest(cid=cid):
+    def runner_refuses(self, argv, roots=None, **label):
+        """run.main on each packed_v3_roots(leftovers) root (or each of `roots`, same shape): a bad one
+        exits 2, the operator told why on stderr and the cell named in runner.log, every byte of work/
+        and chunks/ kept; a complete one exits 0 with the leftovers cleaned and the disjoint cell packed."""
+        for cid, root, bad, snap in roots if roots is not None else self.packed_v3_roots(leftovers=True):
+            with self.subTest(cid=cid, **label):
                 before = snap()
                 err = io.StringIO()
                 with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
@@ -919,6 +919,213 @@ class TestStore(unittest.TestCase):
         finally:
             os.rename(chunk + ".away", chunk)
         self.assertEqual(store.index_problems(self.root), [])
+
+    # (Codex re-review of e82ed4e, P2: the stamp must bind the validation result to the bundle checked)
+    STAMP_COPIED = ("copied", "marker")                 # the index edited: a stamp that is not this entry's
+    STAMP_CHANGED = ("resized", "samesize", "bitflip")  # the chunk's bytes changed after pack() stamped them
+
+    def donor_stamp(self):
+        """The stamp pack() itself writes on a complete /3 entry (packed in a scratch root): what a stamp
+        copied from a valid entry carries."""
+        base = self.root
+        self.root = tempfile.mkdtemp(dir=base)
+        try:
+            self.mk_cell("donor", group="g-donor")
+            self.as_v3("donor", mk_age_score((5000, 10000), alive={5000: {7}, 10000: set()}), (5000, 10000))
+            store.pack(self.root, log=lambda m: None)
+            return store.load_index(self.root)[1]["donor"][1][store.AGE_SUMMARY_KEY]
+        finally:
+            self.root = base
+
+    @staticmethod
+    def rewrite_chunk(root, cid, raw, same_size):
+        """chunk_000001.zip rewritten with cid's bundle.json replaced by `raw`, the index untouched (every
+        other member and the member order kept, every CRC right: only a hash can tell). same_size: written
+        at the highest compression and padded to exactly the old size with an archive comment (a change a
+        size check cannot see); otherwise of another size (a one-byte comment if it came out the same)."""
+        p = os.path.join(root, store.CHUNKS, "chunk_000001.zip")
+        size = os.path.getsize(p)
+        with zipfile.ZipFile(p) as z:
+            members = [(i.filename, z.read(i.filename)) for i in z.infolist()]
+
+        def build(comment=b""):
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w") as z:
+                for name, data in members:
+                    zi = zipfile.ZipInfo(name, date_time=store.ZIP_TIME)
+                    zi.compress_type = zipfile.ZIP_DEFLATED
+                    zi.external_attr = 0o644 << 16
+                    z.writestr(zi, raw if name == f"{cid}/bundle.json" else data,
+                               compresslevel=9 if same_size else 6)
+                z.comment = comment
+            return buf.getvalue()
+        out = build()
+        if same_size:
+            assert len(out) <= size, (len(out), size)
+            out = build(b" " * (size - len(out)))
+        elif len(out) == size:
+            out = build(b" ")
+        assert (len(out) == size) == same_size, (len(out), size, same_size)
+        wr(p, out)
+
+    @staticmethod
+    def flip_packed_bundle(root, cid):
+        """One byte in the middle of cid's packed bundle's compressed data flipped in place (bit rot: the
+        same size; the member no longer inflates to its CRC)."""
+        p = os.path.join(root, store.CHUNKS, "chunk_000001.zip")
+        with zipfile.ZipFile(p) as z:
+            i = z.getinfo(f"{cid}/bundle.json")
+        raw = bytearray(rqlib.read_bytes(p))
+        n, x = struct.unpack("<HH", raw[i.header_offset + 26:i.header_offset + 30])
+        raw[i.header_offset + 30 + n + x + i.compress_size // 2] ^= 0x55
+        wr(p, bytes(raw))
+
+    def stamped_v3_roots(self, attack, leftovers=None):
+        """(Codex re-review of e82ed4e, P2) One root per plan version x case, each holding one /3 completion
+        (cid = case-p<plan>) that a stamp no longer vouches for. STAMP_COPIED, the index edited: its
+        bundle (PACKED_V3: a registered horizon's summary omitted, one stratum corrupted, or complete)
+        packed unchecked (pack_unchecked), then "copied": the stamp pack() wrote on a valid entry
+        (donor_stamp) copied onto its index entry; "marker": e82ed4e's bare marker (the constant alone)
+        written there. STAMP_CHANGED, the index untouched: a complete bundle packed and stamped by pack()
+        itself, then its packed bytes changed: "resized" / "samesize": replaced by the omitted or the
+        corrupted bundle (rewrite_chunk: the chunk of another size, or padded to the very same size);
+        "bitflip": one byte flipped in place (flip_packed_bundle); "complete": untouched. leftovers:
+        "packed" adds an interrupted pack's state (the packed cell's working directory back, byte for
+        byte; an uncommitted chunk and its temporary; a torn index tail) and a disjoint finished cell
+        "new"; "unpacked", the same without the packed cell's directory (so nothing else makes a quick
+        recovery verify that chunk in full) -> [(cid, root, bad, snapshot)] as packed_v3_roots."""
+        two = mk_age_score((5000, 10000), alive={5000: {7}, 10000: set()})
+        stamp = self.donor_stamp() if attack == "copied" else store.AGE_SUMMARY_CHECKED
+        cases = dict(self.PACKED_V3) if attack != "bitflip" else {"bitflip": None, "complete": None}
+        base, out = self.root, []
+        try:
+            for plan2 in (False, True):
+                for name, mutate in cases.items():
+                    cid = f"{name}-p{int(plan2) + 1}"
+                    self.root = root = tempfile.mkdtemp(dir=base, prefix=f"{attack}-{leftovers}-{cid}-")
+                    self.mk_cell(cid, group=cid, transplant=(cid, "d" * 64) if plan2 else None)
+                    bundle, _ = self.as_v3(cid, copy.deepcopy(two), (5000, 10000))
+                    wdir = os.path.join(root, store.WORK, cid)
+                    chunk = os.path.join(root, store.CHUNKS, "chunk_000001.zip")
+                    if attack in self.STAMP_COPIED:
+                        mutate(bundle)
+                        self.rewrite(cid, bundle)
+                        left = {m: rqlib.read_bytes(os.path.join(wdir, m)) for m in ("bundle.json", "done.json")}
+                        self.pack_unchecked()
+                        ip = os.path.join(root, store.INDEX)
+                        recs = [json.loads(ln) for ln in rqlib.read_text(ip).splitlines() if ln.strip()]
+                        recs[0]["cells"][cid][store.AGE_SUMMARY_KEY] = copy.deepcopy(stamp)
+                        rqlib.write_durable(ip, b"".join(rqlib.canonical(r) for r in recs))
+                    else:
+                        left = {m: rqlib.read_bytes(os.path.join(wdir, m)) for m in ("bundle.json", "done.json")}
+                        self.assertEqual(store.pack(root, log=lambda m: None), ("chunk_000001.zip", 1))
+                        self.assertIn(store.AGE_SUMMARY_KEY, store.load_index(root)[1][cid][1])
+                        size = os.path.getsize(chunk)
+                        if name == "bitflip":
+                            self.flip_packed_bundle(root, cid)
+                        elif name != "complete":
+                            mutate(bundle)
+                            self.rewrite_chunk(root, cid, rqlib.canonical(bundle), attack == "samesize")
+                        self.assertEqual(os.path.getsize(chunk) == size, attack != "resized" or name == "complete")
+                    if leftovers:
+                        if leftovers == "packed":
+                            os.makedirs(wdir)
+                            for m, raw in left.items():
+                                wr(os.path.join(wdir, m), raw)
+                        cdir = os.path.join(root, store.CHUNKS)
+                        wr(os.path.join(cdir, "chunk_000009.zip"), b"uncommitted")
+                        wr(os.path.join(cdir, "chunk_000010.zip.tmp"), b"partial")
+                        wr(os.path.join(root, store.INDEX), b'{"chunk": "chunk_000009.zip"', "ab")
+                        self.mk_cell("new", group="g-new", csha="b" * 64)
+
+                    def snapshot(root=root):
+                        return {os.path.relpath(os.path.join(dp, f), root): rqlib.read_bytes(os.path.join(dp, f))
+                                for sub in (store.WORK, store.CHUNKS)
+                                for dp, _, fs in os.walk(os.path.join(root, sub)) for f in fs}
+                    out.append((cid, root, name != "complete", snapshot))
+        finally:
+            self.root = base
+        return out
+
+    def test_stamp_unbound_index_problems_and_pack(self):
+        """Codex re-review of e82ed4e, P2: a /3 entry whose stamp is not this entry's (copied from a valid
+        entry, or e82ed4e's bare marker) or whose packed bytes changed after stamping (of another size,
+        the same size with right CRCs, or a flipped byte) is unchecked: index_problems reads its bundle
+        and refuses the bad ones, so pack() extends no such root (nothing packed or deleted); the
+        complete controls pass, and pack."""
+        for attack in self.STAMP_COPIED + self.STAMP_CHANGED:
+            for cid, root, bad, snap in self.stamped_v3_roots(attack):
+                with self.subTest(attack=attack, cid=cid):
+                    self.assert_age_refused(cid, bad, store.index_problems(root), "index_problems")
+                    self.root, base = root, self.root
+                    try:
+                        self.mk_cell("new", group="g-new", csha="b" * 64)
+                        if bad:
+                            with self.assertRaisesRegex(store.StoreError, "cannot be extended"):
+                                store.pack(root, ids=["new"], log=lambda m: None)
+                            self.assertTrue(os.path.exists(os.path.join(root, store.WORK, "new", "bundle.json")))
+                            self.assertEqual(sorted(os.listdir(os.path.join(root, store.CHUNKS))),
+                                             ["chunk_000001.zip", "index.jsonl"])
+                        else:
+                            self.assertEqual(store.pack(root, ids=["new"], log=lambda m: None)[1], 1)
+                    finally:
+                        self.root = base
+
+    def test_stamp_unbound_verify_all(self):
+        """Codex re-review of e82ed4e, P2: verify_all, deep or not, reports such an entry's age summary
+        (and, for changed bytes, the chunk: deep or not, a chunk holding a stamped entry is hashed, so
+        the same-size change is seen too); the complete controls verify clean."""
+        for attack in self.STAMP_COPIED + self.STAMP_CHANGED:
+            for cid, root, bad, snap in self.stamped_v3_roots(attack):
+                for deep in (True, False):
+                    with self.subTest(attack=attack, cid=cid, deep=deep):
+                        probs = store.verify_all(root, deep=deep)
+                        self.assert_age_refused(cid, bad, probs, f"verify_all deep={deep}")
+                        if bad and attack in self.STAMP_CHANGED:
+                            self.assertTrue(any(p.startswith("chunk_000001.zip ") for p in probs), probs)
+
+    def test_stamp_unbound_recover_changes_nothing(self):
+        """Codex re-review of e82ed4e, P2: recover() checks the chunks' bytes and every age summary BEFORE
+        it repairs, removes or deletes anything. With such an entry, recover (deep or not; with the
+        packed cell's working directory back, or without it, so that only the stamp makes a quick
+        recovery hash the chunk) returns the problem, takes no action and leaves every byte of work/ and
+        chunks/ as it was: the torn index tail, the uncommitted chunk and its temporary, every working
+        directory. The complete controls are recovered and cleaned as before."""
+        for attack in self.STAMP_COPIED + self.STAMP_CHANGED:
+            for leftovers in ("packed", "unpacked"):
+                for cid, root, bad, snap in self.stamped_v3_roots(attack, leftovers):
+                    with self.subTest(attack=attack, leftovers=leftovers, cid=cid):
+                        before = snap()
+                        for deep in (False, True):
+                            acts, probs = store.recover(root, log=lambda m: None, deep=deep)
+                            if not bad:
+                                self.assertEqual(probs, [], f"recover deep={deep}")
+                                break
+                            after = snap()
+                            changed = sorted(k for k in set(before) | set(after) if before.get(k) != after.get(k))
+                            self.assertEqual((acts, changed), ([], []), (f"recover deep={deep}", probs))
+                            self.assert_age_refused(cid, bad, probs, f"recover deep={deep}")
+                        if not bad:
+                            self.assertFalse(os.path.exists(os.path.join(root, store.WORK, cid)))
+                            self.assertEqual(sorted(os.listdir(os.path.join(root, store.CHUNKS))),
+                                             ["chunk_000001.zip", "index.jsonl"])
+                            self.assertTrue(rqlib.read_bytes(os.path.join(root, store.INDEX)).endswith(b"}\n"))
+                            self.assertEqual(len([a for a in acts if "deleted the packed cell" in a]),
+                                             int(leftovers == "packed"), acts)
+
+    def test_stamp_unbound_runner_refused(self):
+        """Codex re-review of e82ed4e, P2: run.py --pack, a resume (a plan, a binary, no disk floor) and a
+        --quick-resume refuse such a root: exit 2 with the operator's message, the cell named in
+        runner.log, every byte of work/ and chunks/ kept (runner_refuses); the controls run."""
+        plan_p = os.path.join(self.root, "disjoint.jsonl")
+        wr(plan_p, "")
+        stub = os.path.join(self.root, "evo_boids_stub")
+        wr(stub, "#!/bin/sh\nexit 9\n")
+        resume = ["--plan", plan_p, "--binary", stub, "--disk-min", "none"]
+        for attack in self.STAMP_COPIED + self.STAMP_CHANGED:
+            for how, argv, leftovers in (("pack", ["--pack"], "packed"), ("resume", resume, "packed"),
+                                         ("quick-resume", resume + ["--quick-resume"], "unpacked")):
+                self.runner_refuses(argv, self.stamped_v3_roots(attack, leftovers), attack=attack, how=how)
 
     def test_v2_completions_checked(self):
         """Review of 03a608b, P2 1: packing (and resume) require a /2 completion's sharing record and
