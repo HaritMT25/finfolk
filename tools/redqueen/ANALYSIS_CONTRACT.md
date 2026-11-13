@@ -69,12 +69,14 @@ NaN, numerical failures, missing calibration or absent qualifying populations ca
 Critical values and acceptance are the real `calib.py crit/accept` artifacts, not supplied p-values.
 The adapter checks the acceptance's critical-artifact digest, development/validation identities, D8
 specification, fitted parameters, tools, draws and realized graph. Model p-values come from the
-acceptance artifact's stratified `ptables`. Frozen epoch gates must pass the existing count-based checks and match the exact gate-artifact digest used in H-T calibration.
+acceptance artifact's stratified `ptables`, read only for an available claim of an available statistic:
+below the Q200 minimum, for a claim whose calibration did not pass, or when the raw statistic is
+unavailable, no p-table is read, so an unusable table cannot abort the report. Frozen epoch gates must pass the existing count-based checks and match the exact gate-artifact digest used in H-T calibration.
 There is no synthetic calibration fallback in production. A stale artifact is refused.
 
 The five rows always remain in Holm; an unavailable row has `available=false`, a reason, and p=1.
-Below the Q200 minimum, no confirmatory calibration artifact is consumed; missing or stale calibration
-cannot suppress descriptive estimation. Measured world slopes, epoch slopes and recurrence estimates appear
+Below the Q200 minimum, no confirmatory calibration artifact is consumed (not even a p-table); missing,
+stale or unusable calibration cannot suppress descriptive estimation. Measured world slopes, epoch slopes and recurrence estimates appear
 under `descriptive`; they cannot enable a confirmatory decision. With one qualifying world, retain its
 slope but do not attempt world resampling. With no qualifying worlds there are no such estimates.
 `detection` is the authoritative family decision. `material_point`, `operational_success` and

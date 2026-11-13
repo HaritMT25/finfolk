@@ -446,6 +446,81 @@ class AnalysisTests(unittest.TestCase):
         self.assertTrue(math.isfinite(report['results']['H-Q']['estimate']))
         self.assertTrue(all(row['p'] == 1. for row in report['rows'] if row['hypothesis'] != 'H-C'))
 
+    def assert_descriptive(self, report, q):
+        d = report['descriptive']
+        self.assertEqual(set(d['world_slopes']['H-P']), set(q))
+        self.assertTrue(all(math.isfinite(v) for v in d['world_slopes']['H-Q'].values()))
+        self.assertEqual((d['H_F']['n'], len(d['H_F_worlds'])), (len(q), len(q)))
+        self.assertTrue(math.isfinite(d['H_F']['S_F']))
+        self.assertEqual(set(d['epoch_betas']), set(transition.EPOCHS))
+        self.assertEqual(set(d['epoch_H_F']), set(transition.EPOCHS))
+        self.assertTrue(d['H_T']['components'])
+        json.dumps(analysis.json_safe(report), allow_nan=False)
+
+    def test_below_minimum_never_reads_a_p_table(self):
+        """r12 review P2: one qualifying world below the population minimum (the analogue of 23 < 24), valid
+        parameters, crit = {}, gates = None and an unusable acceptance p-table. The descriptive estimates are
+        reported, every confirmatory row but H-C is unavailable with p = 1, and stats.model_p is never called.
+        Also with unusable material / H-T tables, and with a valid calibration (which is not consumed)."""
+        q = self.args['ecology']['Q200']['worlds']
+        below = dict(self.args, min_q200=len(q) + 1)
+        nan = {'old': [float('nan')]}
+        for label, artifacts in (
+                ('review scenario', dict(crit={}, acceptance={'ptables': {'H-F detection': nan}}, gates=None)),
+                ('material and H-T tables', dict(crit={}, acceptance={'ptables': {'H-F material': nan, 'H-T': nan}},
+                                                 gates=None)),
+                ('valid calibration', {k: self.run_args[k] for k in ('crit', 'acceptance', 'gates')})):
+            with self.subTest(label), patch.object(stats, 'model_p', wraps=stats.model_p) as model_p:
+                report = analysis.analyze(**dict(below, **artifacts))
+                self.assertEqual(model_p.call_count, 0, [call.args[0] for call in model_p.call_args_list])
+                self.assertFalse(any(report['eligibility']['hypotheses'][h]['available'] for h in stats.Q200_FAMILY))
+                for row in report['rows']:
+                    if row['hypothesis'] != 'H-C':
+                        self.assertEqual((row['available'], row['p'], row['detection']), (False, 1., False), row)
+                self.assertEqual(report['results']['H-F']['reason'], 'Q200 below confirmatory minimum')
+                self.assert_descriptive(report, q)
+
+    def test_unavailable_claim_or_statistic_never_reads_its_p_table(self):
+        """The same audit inside the confirmatory population: a p-table is read only for an AVAILABLE claim of an
+        AVAILABLE statistic. (a) H-F detection fails its acceptance (so the nested material claim is unavailable
+        too); (b) only the material claim fails; (c) the raw H-F statistic is unavailable (forced, as hf() reports
+        a world without a supported candidate). The unusable H-F tables are never read; H-T's still is."""
+        q = self.args['ecology']['Q200']['worlds']
+        real_hf = recurrence.hf
+        def unavailable_hf(worlds, eligibility=None, provenance=None):
+            res = real_hf(worlds, eligibility=eligibility, provenance=provenance)
+            # Only the population statistic carries the eligibility record (the epoch functionals do not).
+            return res if eligibility is None else dict(res, available=False, reasons=['synthetic: no support'])
+        for label, failed, unusable, hf in (('detection fails', 'H-F detection', ('H-F detection', 'H-F material'), None),
+                                            ('material fails', 'H-F material', ('H-F material',), None),
+                                            ('statistic unavailable', None, ('H-F detection', 'H-F material'), unavailable_hf)):
+            acc = copy.deepcopy(self.run_args['acceptance'])
+            if failed:
+                acc['pass'][failed] = False
+            nan = {'old': [float('nan')]}
+            acc['ptables'].update({claim: nan for claim in unusable})
+            with self.subTest(label), patch.object(stats, 'model_p', wraps=stats.model_p) as model_p, \
+                    patch.object(recurrence, 'hf', side_effect=hf or real_hf):
+                report = analysis.analyze(**dict(self.run_args, acceptance=acc))
+                read = [call.args[1] for call in model_p.call_args_list]
+                self.assertFalse(any(t is nan for t in read), label)
+                self.assertTrue(any(t is acc['ptables']['H-T'] for t in read), label)
+                self.assertTrue(all(report['eligibility']['hypotheses'][h]['available'] for h in stats.Q200_FAMILY))
+                rows = {row['hypothesis']: row for row in report['rows']}
+                self.assertTrue(rows['H-T']['available'])
+                hfres = report['results']['H-F']
+                if label == 'material fails':
+                    self.assertTrue(rows['H-F']['available'])
+                    # The valid detection table was read: 1000 null scores of 1e9 >= S_F, p = 1001 / 1001.
+                    self.assertEqual(hfres['p_F'], 1.)
+                    self.assertTrue(any(t is acc['ptables']['H-F detection'] for t in read))
+                    self.assertEqual((hfres['c_M'], hfres['p_M'], hfres['exceeds_material']), (None, None, False))
+                else:
+                    self.assertFalse(hfres['available'])
+                    self.assertEqual((rows['H-F']['available'], rows['H-F']['p'], rows['H-F']['detection']),
+                                     (False, 1., False))
+                self.assert_descriptive(report, q)
+
     def test_stale_d8_calibration_refused(self):
         crit = copy.deepcopy(self.run_args['crit'])
         crit['manifest']['H-F']['material_spec_sha256'] = 'old'

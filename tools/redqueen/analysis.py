@@ -385,9 +385,15 @@ def analyze(roots, rows, registry, ecology, mask, params, crit, acceptance, gate
             tables = acceptance.get('ptables', {}).get(claim)
             return stats.model_p(value, tables) if tables else None
         det, mat = inputs.get('H-F detection', {}), inputs.get('H-F material', {})
+        # A p-table is read only for an AVAILABLE claim of an AVAILABLE statistic (#68 r12 review P2): below the
+        # Q200 minimum (inputs is empty), for a claim whose calibration did not pass, or when the raw H-F
+        # statistic is unavailable, hf_decision never uses the p-value, so an unusable table cannot abort the
+        # descriptive report. The H-T p-value below is likewise read only for an available claim and result.
+        def claim_p(claim, record, value):
+            return model_p(claim, value) if record.get('available') and rawhf['available'] else None
         results['H-F'] = recurrence.hf_decision(rawhf, crit.get('c_F') if det.get('available') else None,
-            model_p('H-F detection', rawhf['S_F']), crit.get('c_M') if mat.get('available') else None,
-            model_p('H-F material', rawhf['M_F']))
+            claim_p('H-F detection', det, rawhf.get('S_F')), crit.get('c_M') if mat.get('available') else None,
+            claim_p('H-F material', mat, rawhf.get('M_F')))
         if len(q) >= 2 and inputs.get('H-T', {}).get('available') and gates is not None:
             man = crit['manifest']['H-T']
             calib.check_gates(gates, man, production=production)
