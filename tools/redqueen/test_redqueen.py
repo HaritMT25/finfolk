@@ -686,6 +686,213 @@ class TestStore(unittest.TestCase):
         self.as_v3("v3", copy.deepcopy(two), (5000, 10000))
         self.assertEqual(store.pack(self.root, log=lambda m: None)[1], 3)
 
+    def pack_unchecked(self):
+        """Pack every finished cell as the packers before the age-summary contract did (b83a029..870daa6:
+        the Codex re-review of 5ecffb5's scenario): no age-summary check at packing and no stamp in the
+        index entry; done.json, the chunk and its index line stay hash-consistent."""
+        real = store.completion_problems, store.age_summary_problems
+        store.completion_problems = lambda done, bundle: []
+        store.age_summary_problems = lambda bundle: []
+        try:
+            store.pack(self.root, log=lambda m: None)
+        finally:
+            store.completion_problems, store.age_summary_problems = real
+        ip = os.path.join(self.root, store.INDEX)
+        recs = [json.loads(ln) for ln in rqlib.read_text(ip).splitlines() if ln.strip()]
+        for r in recs:
+            for e in r["cells"].values():
+                e.pop("age_summary", None)
+        rqlib.write_durable(ip, b"".join(rqlib.canonical(r) for r in recs))
+
+    # (Codex re-review of 5ecffb5, P2: D8 v2 rule 48 for PACKED /3 completions)
+    PACKED_V3 = {
+        "omitted": lambda b: b["score"]["horizons"][1].pop("age_strata"),
+        "badstratum": lambda b: b["score"]["horizons"][0]["age_strata"]["bins"][0]["feasible"].update(n_start=0),
+        "complete": lambda b: None,
+    }
+
+    def packed_v3_roots(self, leftovers=False):
+        """One root per plan version x PACKED_V3 case, each holding one /3 completion (cid = case-p<plan>)
+        whose bundle (a registered horizon's summary omitted, one stratum corrupted, or complete) is
+        packed by pack_unchecked with done.json, chunk and index hash-consistent. leftovers: plus an
+        interrupted pack's state (the packed cell's working directory back, byte for byte; an
+        uncommitted chunk and its temporary; a torn index tail) and a disjoint finished cell "new"
+        -> [(cid, root, bad, snapshot)], snapshot() -> the bytes of every file in the root's work/ and
+        chunks/ (everything recover or packing may touch)."""
+        two = mk_age_score((5000, 10000), alive={5000: {7}, 10000: set()})
+        base, out = self.root, []
+        try:
+            for plan2 in (False, True):
+                for name, mutate in self.PACKED_V3.items():
+                    cid = f"{name}-p{int(plan2) + 1}"
+                    self.root = root = os.path.join(base, cid)
+                    os.makedirs(root)
+                    self.mk_cell(cid, group=cid, transplant=(cid, "d" * 64) if plan2 else None)
+                    bundle, _ = self.as_v3(cid, copy.deepcopy(two), (5000, 10000))
+                    mutate(bundle)
+                    bundle, done = self.rewrite(cid, bundle)
+                    wdir = os.path.join(root, store.WORK, cid)
+                    left = {m: rqlib.read_bytes(os.path.join(wdir, m)) for m in ("bundle.json", "done.json")}
+                    self.pack_unchecked()
+                    _, cells = store.load_index(root)
+                    e = cells[cid][1]
+                    self.assertEqual((e["bundle_schema"], e["plan_schema"], "age_summary" in e),
+                                     (store.BUNDLE_V3, bundle["cell"]["schema"], False))
+                    self.assertEqual(store.read_member(root, cid, cells=cells), left["bundle.json"])
+                    self.assertFalse(os.path.exists(wdir))
+                    if leftovers:
+                        os.makedirs(wdir)
+                        for m, raw in left.items():
+                            wr(os.path.join(wdir, m), raw)
+                        cdir = os.path.join(root, store.CHUNKS)
+                        wr(os.path.join(cdir, "chunk_000009.zip"), b"uncommitted")
+                        wr(os.path.join(cdir, "chunk_000010.zip.tmp"), b"partial")
+                        wr(os.path.join(root, store.INDEX), b'{"chunk": "chunk_000009.zip"', "ab")
+                        self.mk_cell("new", group="g-new", csha="b" * 64)
+
+                    def snapshot(root=root):
+                        return {os.path.relpath(os.path.join(dp, f), root): rqlib.read_bytes(os.path.join(dp, f))
+                                for sub in (store.WORK, store.CHUNKS)
+                                for dp, _, fs in os.walk(os.path.join(root, sub)) for f in fs}
+                    out.append((cid, root, name != "complete", snapshot))
+        finally:
+            self.root = base
+        return out
+
+    def assert_age_refused(self, cid, bad, probs, what):
+        if bad:
+            self.assertTrue(probs and any(cid in p and "age summary" in p for p in probs), (what, probs))
+        else:
+            self.assertEqual(probs, [], what)
+
+    def test_packed_v3_age_summary_index_problems(self):
+        """Codex re-review of 5ecffb5, P2 (D8 v2 rule 48): a /3 completion of either plan version PACKED
+        without the age-summary check (packed_v3_roots: a registered horizon's summary omitted, or one
+        stratum corrupted, every hash consistent) is refused by index_problems, and so no cell is packed
+        beside it (nothing deleted); the complete one, packed the same way (unstamped), passes."""
+        for cid, root, bad, snap in self.packed_v3_roots():
+            with self.subTest(cid=cid):
+                self.assert_age_refused(cid, bad, store.index_problems(root), "index_problems")
+                self.root, base = root, self.root
+                try:
+                    self.mk_cell("new", group="g-new", csha="b" * 64)
+                    if bad:
+                        with self.assertRaisesRegex(store.StoreError, "cannot be extended"):
+                            store.pack(root, ids=["new"], log=lambda m: None)
+                        self.assertTrue(os.path.exists(os.path.join(root, store.WORK, "new", "bundle.json")))
+                    else:
+                        self.assertEqual(store.pack(root, ids=["new"], log=lambda m: None)[1], 1)
+                finally:
+                    self.root = base
+
+    def test_packed_v3_age_summary_verify_all(self):
+        """Codex re-review of 5ecffb5, P2: verify_all, deep or not, reports such a packed completion (the
+        chunk's size and SHA-256 are right: only the age-summary contract can see it); the complete one
+        verifies clean."""
+        for cid, root, bad, snap in self.packed_v3_roots():
+            with self.subTest(cid=cid):
+                for deep in (True, False):
+                    self.assert_age_refused(cid, bad, store.verify_all(root, deep=deep), f"verify_all deep={deep}")
+
+    def test_packed_v3_age_summary_recover_deletes_nothing(self):
+        """Codex re-review of 5ecffb5, P2: recover() checks every indexed /3 age summary BEFORE any repair,
+        cleanup or deletion. With a packed completion that fails it, recover (deep or not) returns the
+        problem, takes no action, and leaves every byte of work/ and chunks/ as it was: the packed cell's
+        leftover working directory, the uncommitted chunk and its temporary, and the torn index tail.
+        The complete one is recovered and cleaned as before."""
+        for cid, root, bad, snap in self.packed_v3_roots(leftovers=True):
+            with self.subTest(cid=cid):
+                before = snap()
+                for deep in (False, True):
+                    acts, probs = store.recover(root, log=lambda m: None, deep=deep)
+                    self.assert_age_refused(cid, bad, probs, f"recover deep={deep}")
+                    if not bad:
+                        break
+                    self.assertEqual(acts, [], deep)
+                    self.assertEqual(snap(), before, deep)
+                if not bad:
+                    self.assertFalse(os.path.exists(os.path.join(root, store.WORK, cid)))
+                    self.assertEqual(sorted(os.listdir(os.path.join(root, store.CHUNKS))),
+                                     ["chunk_000001.zip", "index.jsonl"])
+                    self.assertEqual(len([a for a in acts if "deleted the packed cell" in a]), 1, acts)
+
+    def runner_refuses(self, argv):
+        """run.main on each packed_v3_roots(leftovers) root: a bad one exits 2, the operator told why on
+        stderr and the cell named in runner.log, every byte of work/ and chunks/ kept; a complete one
+        exits 0 with the leftovers cleaned and the disjoint cell packed."""
+        for cid, root, bad, snap in self.packed_v3_roots(leftovers=True):
+            with self.subTest(cid=cid):
+                before = snap()
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                    rc = run.main(["--root", root] + argv)
+                if not bad:
+                    self.assertEqual(rc, 0, err.getvalue())
+                    self.assertEqual(os.listdir(os.path.join(root, store.WORK)), [])
+                    self.assertIn("new", store.load_index(root)[1])
+                    continue
+                self.assertEqual(rc, 2, (argv, err.getvalue()))
+                self.assertIn("age summary", err.getvalue())
+                self.assertIn("repair or an explicit deviation record", err.getvalue())
+                self.assertEqual(snap(), before, argv)
+                self.assertIn(f"index: {cid} (packed in chunk_000001.zip)",
+                              rqlib.read_text(os.path.join(root, "runner.log")))
+
+    def test_packed_v3_age_summary_runner_pack_refused(self):
+        """Codex re-review of 5ecffb5, P2: run.py --pack refuses such a root (runner_refuses)."""
+        self.runner_refuses(["--pack"])
+
+    def test_packed_v3_age_summary_runner_resume_refused(self):
+        """Codex re-review of 5ecffb5, P2: resuming such a root (a plan, a binary, no disk floor) is refused
+        at the start, before anything is pinned or run (runner_refuses)."""
+        plan_p = os.path.join(self.root, "disjoint.jsonl")
+        wr(plan_p, "")
+        stub = os.path.join(self.root, "evo_boids_stub")
+        wr(stub, "#!/bin/sh\nexit 9\n")
+        self.runner_refuses(["--plan", plan_p, "--binary", stub, "--disk-min", "none"])
+
+    def test_indexed_v3_age_summary_stamp(self):
+        """(Scale, with the re-review of 5ecffb5) pack() stamps each /3 entry whose age summary it checked
+        (store.AGE_SUMMARY_CHECKED): index_problems, which pack() runs over the whole index before every
+        chunk, accepts a stamped entry without opening its chunk. An unstamped or differently stamped /3
+        entry (an older packer's, or an older contract's) is read from its chunk; /1 and /2 entries get no
+        stamp (their index entries are as before) and are never read for it."""
+        two = mk_age_score((5000, 10000), alive={5000: {7}, 10000: set()})
+        for cid, transplant, v3 in (("v1", None, False), ("v2", ("v2", "d" * 64), False),
+                                    ("v3-p1", None, True), ("v3-p2", ("v3-p2", "d" * 64), True)):
+            self.mk_cell(cid, group=cid, transplant=transplant)
+            if v3:
+                self.as_v3(cid, copy.deepcopy(two), (5000, 10000))
+        self.assertEqual(store.pack(self.root, log=lambda m: None), ("chunk_000001.zip", 4))
+        recs, cells = store.load_index(self.root)
+        keys = {"bundle_sha256", "done_sha256", "row_sha256", "common_group", "common_sha256", "pair_group",
+                "prey_config_sha256", "kind", "role", "transplant_group", "transplant_realized_sha256",
+                "bundle_schema"}
+        for cid in ("v1", "v2"):
+            self.assertEqual(set(cells[cid][1]), keys, cid)
+        for cid in ("v3-p1", "v3-p2"):
+            self.assertEqual(set(cells[cid][1]), keys | {"plan_schema", store.AGE_SUMMARY_KEY}, cid)
+            self.assertEqual(cells[cid][1][store.AGE_SUMMARY_KEY], store.AGE_SUMMARY_CHECKED)
+        chunk = os.path.join(self.root, store.CHUNKS, "chunk_000001.zip")
+        self.assertEqual(store.index_problems(self.root), [])
+        self.assertEqual(store.verify_all(self.root), [])
+        os.rename(chunk, chunk + ".away")                 # stamped /3, /1 and /2: the index alone
+        try:
+            self.assertEqual(store.index_problems(self.root), [])
+            self.assertEqual(store.indexed_age_problems(self.root), [])
+            for stamp in (None, "finfolk.redqueen.agesummary/0"):     # unstamped, or an older contract's
+                for cid in ("v3-p1", "v3-p2"):
+                    e = cells[cid][1]
+                    e.pop(store.AGE_SUMMARY_KEY, None)
+                    if stamp:
+                        e[store.AGE_SUMMARY_KEY] = stamp
+                probs = store.index_problems(self.root, cells)
+                self.assertEqual(sorted(p.split(" ")[0] for p in probs), ["v3-p1", "v3-p2"], probs)
+                self.assertTrue(all("cannot be checked" in p and store.AGE_SUMMARY_TAG in p for p in probs), probs)
+        finally:
+            os.rename(chunk + ".away", chunk)
+        self.assertEqual(store.index_problems(self.root, cells), [])   # read and checked: complete
+
     def test_v2_completions_checked(self):
         """Review of 03a608b, P2 1: packing (and resume) require a /2 completion's sharing record and
         cross-check done.json's role and transplant summary against the hash-valid bundle; a /2 bundle
