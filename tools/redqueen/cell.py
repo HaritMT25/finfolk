@@ -44,7 +44,9 @@ config.maxAge, dt_s score.dt; steps and frame name the horizon. Missing / invali
 beyond the fixed bins, totals that do not reconcile with the score's n_start and survivors, and
 any age-infeasible survivor refuse scoring. score.age_strata_problems is the contract: execute
 checks it against the cell's horizons before the bundle is bound (so before any checkpoint is
-deleted), store.completion_problems at completion verification, packing and resume, and the
+deleted), store.completion_problems at completion verification, packing and resume,
+store.indexed_age_problems for packed cells (index_problems, verify_all, recover: pack()'s index
+stamp, or else the packed bundle), and the
 collectors at ingestion: a /3 bundle without a complete summary is refused (a recording omission,
 never zero survival). Readers accept old /1 and /2 bundles without age_strata (explicitly
 unavailable, never inferred or rewritten) and /3 for either plan version; plan/2 still requires

@@ -71,7 +71,9 @@ subprocesses, never multiprocessing, so Python 3.10 to 3.14 behave the same):
   * packing: whenever --chunk-size finished cells are waiting, and at every exit, they are packed
     (store.pack: written, verified, committed, then deleted; a challenge and its predator-free
     control must show the same arena prey settings, and one common group one common checkpoint);
-    at start store.recover() repairs and fsyncs the index, verifies the committed chunks (in full
+    at start store.recover() first refuses an index holding a /3 completion without its complete
+    age summary (store.indexed_age_problems, D8 v2 rule 48: exit 2, nothing repaired or deleted),
+    then repairs and fsyncs the index, verifies the committed chunks (in full
     where a packed cell's working directory remains; --quick-resume: the others by size), checks
     every leftover bundle, and only then deletes those leftovers; any failure keeps them all and
     exits 1;
@@ -789,6 +791,17 @@ def _main(argv, files):
         log(f"recover failed: {e}")
         return 1
     if probs:
+        # (Codex re-review of 5ecffb5, P2) an indexed /3 completion without its complete age summary:
+        # recover() repaired and deleted nothing; the operator is told why, and nothing is resumed
+        age = [p for p in probs if store.AGE_SUMMARY_TAG in p]
+        if age:
+            for p in age[:10]:
+                log(f"index: {p}")
+            n = len({p.split(" ", 1)[0] for p in age})
+            print(f"{root}: {n} packed /3 completions without a verifiable complete age summary (D8 v2 rule 48; "
+                  f"{age[0]}): a recording omission requiring repair or an explicit deviation record, not zero "
+                  "survival; nothing was repaired, deleted or resumed", file=sys.stderr)
+            return 2
         log(f"committed chunks damaged or inconsistent (working copies kept): {probs[:5]}")
         return 1
     # (review of d4dc4b7, P2 1) EVERY indexed cell, whatever plan extends the root: a /2 completion
@@ -850,7 +863,7 @@ def _main(argv, files):
                 print(f"cell {r['id']}: packed without the /2 sharing records or with another role (a completion "
                       "before 03a608b): a /2 study is rerun in a new root, not resumed", file=sys.stderr)
                 return 2
-            continue
+            continue      # (a packed /3: its age summary was checked at start: store.recover, index_problems)
         if r["id"] in fin:
             dn = fin[r["id"]]
             if dn.get("row_sha256") != rs:
