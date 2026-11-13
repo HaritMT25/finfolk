@@ -124,6 +124,19 @@ def _oracle_clock(start, steps, max_age=120.0, stop=False):
     return float(a), death
 
 
+def mk_age_score(horizons=(5000,), ages=(0.0,), alive=None, f0=100):
+    """A synthetic score (no engine) whose horizons carry complete age summaries (score.age_strata):
+    the initial cohort ids 7, 8, ... with start `ages`, all alive at every horizon unless alive =
+    {horizon: set of ids}."""
+    start = {7 + i: a for i, a in enumerate(ages)}
+    hs = []
+    for h in horizons:
+        live = set(start) if alive is None else set(alive.get(h, ()))
+        hs.append({"steps": h, "frame": f0 + h, "survivors": len(live),
+                   "age_strata": score.age_strata(start, live, 120.0, h, f0 + h, score.DT, len(start), len(live))})
+    return {"schema": score.SCHEMA, "n_start": len(start), "dt": score.DT, "horizons": hs}
+
+
 class TestRng(unittest.TestCase):
     def test_splitmix_reference_vector(self):
         # the reference splitmix64.c (Vigna) from state 1234567
@@ -579,27 +592,43 @@ class TestStore(unittest.TestCase):
             store.pack(self.root, log=lambda m: None)
         self.assertTrue(os.path.exists(os.path.join(self.root, store.WORK, "t4", "bundle.json")))
 
+    def rewrite(self, cid, bundle):
+        """Replace cid's finished bundle, its done.json summaries and bundle hash recomputed as run.py
+        writes them (so only checks of the bundle's own content can refuse it) -> (bundle, done)."""
+        d = os.path.join(self.root, store.WORK, cid)
+        done = rqlib.read_json(os.path.join(d, "done.json"))
+        done.update(store.summary_of(bundle))
+        raw = rqlib.canonical(bundle)
+        done["bundle_sha256"] = rqlib.sha256_bytes(raw)
+        wr(os.path.join(d, "bundle.json"), raw)
+        rqlib.write_json_durable(os.path.join(d, "done.json"), done)
+        return bundle, done
+
+    def as_v3(self, cid, sc=None, horizons=(5000,)):
+        """cid's finished bundle (mk_cell) as a /3 completion: the cell names its registered horizons and
+        the score carries complete synthetic age summaries (mk_age_score) -> (bundle, done)."""
+        bundle = json.loads(rqlib.read_bytes(os.path.join(self.root, store.WORK, cid, "bundle.json")))
+        bundle["schema"] = store.BUNDLE_V3
+        bundle["cell"]["horizons"] = list(horizons)
+        bundle["score"] = sc or mk_age_score(horizons)
+        return self.rewrite(cid, bundle)
+
     def test_age_bundle_versions_pack_and_read_unchanged(self):
         """Old /1 and /2 bytes remain readable beside /3, with or without plan/2 sharing."""
         expected = {}
         for version, plan2 in ((1, False), (2, True), (3, False), (3, True)):
             cid = f"v{version}-p{int(plan2) + 1}"
             raw = self.mk_cell(cid, group=cid, transplant=(cid, "d" * 64) if plan2 else None)
-            bundle = json.loads(raw)
-            bundle["schema"] = f"finfolk.redqueen.bundle/{version}"
-            bundle["score"] = {"schema": score.SCHEMA, "n_start": 1,
-                               "horizons": [{"steps": 5000, "survivors": 1}]}
             if version == 3:
-                bundle["score"]["horizons"][0]["age_strata"] = score._age_strata(
-                    {7: 0}, {7}, 120, 5000, score.DT, 1, 1)
-            d = os.path.join(self.root, store.WORK, cid)
-            raw = rqlib.canonical(bundle)
-            done = rqlib.read_json(os.path.join(d, "done.json"))
-            done["bundle_sha256"] = rqlib.sha256_bytes(raw)
-            wr(os.path.join(d, "bundle.json"), raw)
-            rqlib.write_json_durable(os.path.join(d, "done.json"), done)
+                bundle, done = self.as_v3(cid)
+            else:
+                bundle = json.loads(raw)
+                bundle["schema"] = f"finfolk.redqueen.bundle/{version}"
+                bundle["score"] = {"schema": score.SCHEMA, "n_start": 1,
+                                   "horizons": [{"steps": 5000, "survivors": 1}]}
+                bundle, done = self.rewrite(cid, bundle)
             self.assertEqual(store.completion_problems(done, bundle), [])
-            expected[cid] = raw
+            expected[cid] = rqlib.canonical(bundle)
         store.pack(self.root, log=lambda m: None)
         _, cells = store.load_index(self.root)
         self.assertEqual(store.index_problems(self.root, cells), [])
@@ -1040,33 +1069,75 @@ class TestAgeStrata(unittest.TestCase):
     def scored(self, horizons=(5000,), assay="frozen", fork=True):
         return score.score(self.d, 0, max(horizons), list(horizons), 100, assay, fork=fork)
 
-    def test_bins_and_structural_split_by_start_id(self):
+    @staticmethod
+    def st(n, s):
+        return {"n_start": n, "survivors": s, "survival": s / n if n else None}
+
+    def cross(self, n, nf, s, sf=None):
+        """Expected bins: per bin its count n, feasible count nf, survivors s (sf of them feasible)."""
+        sf = s if sf is None else sf
+        return [dict(self.st(n[j], s[j]), feasible=self.st(nf[j], sf[j]), infeasible=self.st(n[j] - nf[j], s[j] - sf[j]))
+                for j in range(len(n))]
+
+    def test_bins_crossed_with_feasibility_by_start_id(self):
+        """Codex review of 870daa6, P2-2 (D8 v2 rule 48): every bin x feasibility stratum with its counts
+        and survival fraction (None for an empty denominator), the bin, feasibility and cohort totals,
+        and the identities. Feasibility is the engine's binary32 clock (P2-1): at 5k the 36-48 s bin's
+        40.001 is feasible, not only starts <= 40, and 47.999 is not."""
         self.write()
+        bins = self.cross([2, 2, 2, 4, 2, 2, 2, 2, 2, 3], [2, 2, 2, 3, 0, 0, 0, 0, 0, 0],
+                          [1, 1, 1, 2, 0, 0, 0, 0, 0, 0])
         for assay in ("frozen", "frozen-newborn", "live"):
             for fork in (True, False):
                 with self.subTest(assay=assay, fork=fork):
                     sc = self.scored(assay=assay, fork=fork)
                     h = sc["horizons"][0]
                     a = h["age_strata"]
-                    self.assertEqual(a["bin_edges_s"], list(range(0, 121, 12)))
-                    self.assertEqual([b["n_start"] for b in a["bins"]], [2, 2, 2, 4, 2, 2, 2, 2, 2, 3])
-                    self.assertEqual([b["survivors"] for b in a["bins"]], [1, 1, 1, 2, 0, 0, 0, 0, 0, 0])
-                    self.assertEqual(a["feasible"], {"n_start": 8, "survivors": 5})
-                    self.assertEqual(a["infeasible"], {"n_start": 15, "survivors": 0})
-                    self.assertEqual(a["max_age_s"], self.arena["config"]["maxAge"])
-                    self.assertEqual(a["feasible_start_age_max_s"], 40)
+                    self.assertEqual(a["bins"], bins)
+                    self.assertEqual((a["feasible"], a["infeasible"]), (self.st(9, 5), self.st(14, 0)))
+                    self.assertEqual({k: a[k] for k in ("n_start", "survivors", "survival")}, self.st(23, 5))
+                    self.assertEqual({k: a[k] for k in ("schema", "steps", "frame", "max_age_s", "dt_s", "age_clock",
+                                                        "bin_edges_s", "bin_convention")},
+                                     {"schema": score.AGE_STRATA_SCHEMA, "steps": 5000, "frame": 5100,
+                                      "max_age_s": self.arena["config"]["maxAge"], "dt_s": score.DT,
+                                      "age_clock": common.AGE_CLOCK, "bin_edges_s": list(range(0, 121, 12)),
+                                      "bin_convention": score.AGE_BINS})
+                    self.assertEqual(score.age_strata_problems(sc, [5000]), [])
                     self.assertEqual((sc["n_start"], h["survivors"], h["prey"]), (23, 5, 24))
+
+    def test_boundary_survivor_on_the_engine_clock(self):
+        """Codex review of 870daa6, P2-1 (D8 v2 rule 46): prey that start just over 40 s and are alive at
+        5k are age-feasible on the engine's binary32 clock; the exact-arithmetic cutoff refused the cell."""
+        self.write(survive_ages=(0, 12, 24, 36, 40, 40.001))
+        a = self.scored()["horizons"][0]["age_strata"]
+        self.assertEqual(a["bins"][3], dict(self.st(4, 3), feasible=self.st(3, 3), infeasible=self.st(1, 0)))
+        self.assertEqual((a["feasible"], a["infeasible"]), (self.st(9, 6), self.st(14, 0)))
+        # rule 46's own example as a scored start age
+        self.ages = [36.0, 40.00001907348633, 44.0]
+        self.arena = mk_cp(n_prey=3, n_pred=0, frame=100)
+        self.arena["creatures"]["age"] = list(self.ages)
+        self.write(survive_ages=(36.0, 40.00001907348633))
+        a = self.scored()["horizons"][0]["age_strata"]
+        self.assertEqual(a["bins"][3], dict(self.st(3, 2), feasible=self.st(2, 2), infeasible=self.st(1, 0)))
+
+    def test_review_example_bin_crossing(self):
+        """The review's example: start ages 36, 40, 44 at 5k, only 36 alive: the 36-48 s bin's feasible
+        stratum is 2 / 1 / 0.5 and its infeasible one 1 / 0 / 0.0; empty strata have survival None."""
+        a = score.age_strata({1: 36.0, 2: 40.0, 3: 44.0}, {1}, 120.0, 5000, 5100, score.DT, 3, 1)
+        self.assertEqual(a["bins"][3], dict(self.st(3, 1), feasible=self.st(2, 1), infeasible=self.st(1, 0)))
+        empty = dict(self.st(0, 0), feasible=self.st(0, 0), infeasible=self.st(0, 0))
+        self.assertEqual(a["bins"][:3] + a["bins"][4:], [empty] * 9)
+        self.assertEqual((a["feasible"], a["infeasible"]), (self.st(2, 1), self.st(1, 0)))
 
     def test_horizon_specific_feasibility_and_empty_strata(self):
         self.write(horizons=(7500, 10000, 20000), survive_ages=())
         sc = self.scored((7500, 10000, 20000))
         for h, n in zip(sc["horizons"], (1, 0, 0)):
             a = h["age_strata"]
-            self.assertEqual(a["feasible"], {"n_start": n, "survivors": 0})
-            self.assertEqual(a["infeasible"], {"n_start": 23 - n, "survivors": 0})
-            self.assertEqual(sum(b["n_start"] for b in a["bins"]), sc["n_start"])
-            self.assertEqual(sum(b["survivors"] for b in a["bins"]), h["survivors"])
-        # Empty initial cohort remains a complete ten-bin partition with zero counts.
+            self.assertEqual((a["feasible"], a["infeasible"]), (self.st(n, 0), self.st(23 - n, 0)))
+            self.assertEqual(a["bins"], self.cross([2, 2, 2, 4, 2, 2, 2, 2, 2, 3], [n] + [0] * 9, [0] * 10))
+        self.assertEqual(score.age_strata_problems(sc, [7500, 10000, 20000]), [])
+        # Empty initial cohort remains a complete ten-bin partition with zero counts and no fractions.
         self.arena["creatures"]["alive"] = [0] * len(self.arena["creatures"]["alive"])
         wr(os.path.join(self.d, "arena.json"), ckpt.dumps(self.arena))
         end = copy.deepcopy(self.arena)
@@ -1075,21 +1146,27 @@ class TestAgeStrata(unittest.TestCase):
         p = os.path.join(self.d, "run.predators.csv")
         wr(p, "\n".join(rqlib.read_text(p).splitlines()[:51]) + "\n")
         h = self.scored()["horizons"][0]
+        a = h["age_strata"]
         self.assertEqual(h["survivors"], 0)
-        self.assertTrue(all(b == {"n_start": 0, "survivors": 0} for b in h["age_strata"]["bins"]))
+        self.assertEqual(a["bins"], self.cross([0] * 10, [0] * 10, [0] * 10))
+        self.assertEqual((a["n_start"], a["survival"], a["feasible"], a["infeasible"]),
+                         (0, None, self.st(0, 0), self.st(0, 0)))
 
     def test_actual_max_age_and_step_constant(self):
+        """The clock uses the arena's maxAge and score.DT: with maxAge 60 and a 0.024 s step, 1,000 frames
+        leave 35.9 feasible and 40 infeasible (at 0.016 s, 40 would be feasible; at maxAge 120, both)."""
         from unittest.mock import patch
-        self.ages = [0, 12, 24, 36, 48, 60]
+        self.ages = [0, 12, 24, 35.9, 40, 60]
         self.arena = mk_cp(n_prey=6, n_pred=0, frame=100, cfg_extra={"maxAge": 60})
         self.arena["creatures"]["age"] = self.ages
-        self.write(horizons=(1000,), survive_ages=(0, 12, 24, 36))
+        self.write(horizons=(1000,), survive_ages=(0, 12, 24, 35.9))
         with patch.object(score, "DT", 0.024):
             sc = self.scored((1000,))
+            self.assertEqual(score.age_strata_problems(sc, [1000]), [])
         a = sc["horizons"][0]["age_strata"]
-        self.assertEqual((sc["dt"], a["max_age_s"], a["feasible_start_age_max_s"]), (0.024, 60, 36))
-        self.assertEqual(a["feasible"], {"n_start": 4, "survivors": 4})
-        self.assertEqual(a["infeasible"], {"n_start": 2, "survivors": 0})
+        self.assertEqual((sc["dt"], a["dt_s"], a["max_age_s"]), (0.024, 0.024, 60))
+        self.assertEqual((a["feasible"], a["infeasible"]), (self.st(4, 4), self.st(2, 0)))
+        self.assertEqual(a["bins"][3]["infeasible"], self.st(1, 0))                     # 40
         self.assertTrue(all(b["n_start"] == 0 for b in a["bins"][6:]))
 
     def test_missing_invalid_or_out_of_range_start_age_refused(self):
@@ -1127,11 +1204,68 @@ class TestAgeStrata(unittest.TestCase):
                 with self.assertRaisesRegex(score.ScoreError, "age-infeasible"):
                     self.scored((h,))
 
-    def test_partition_invariants_refuse_incorrect_totals(self):
-        # Independently wrong expected totals must exercise both scorer guards.
+    def test_strata_must_reconcile_with_the_scorer(self):
         for n, s in ((2, 1), (1, 0)):
-            with self.subTest(n=n, s=s), self.assertRaisesRegex(score.ScoreError, "do not sum"):
-                score._age_strata({7: 0}, {7}, 120, 5000, score.DT, n, s)
+            with self.subTest(n=n, s=s), self.assertRaisesRegex(score.ScoreError, "not the scorer's"):
+                score.age_strata({7: 0.0}, {7}, 120.0, 5000, 5100, score.DT, n, s)
+
+    def test_contract_guards_refuse_independently(self):
+        """Codex review of 870daa6 (test effectiveness, P2-2, P2-3): each guard of the age-summary
+        contract (the one completion verification and ingestion apply) refuses its own corruption of an
+        otherwise complete summary; most corruptions trip that guard alone."""
+        good = mk_age_score((5000, 10000), ages=(0.0, 36.0, 44.0, 119.0), alive={5000: {7, 8}, 10000: set()})
+        self.assertEqual(score.age_strata_problems(good, [5000, 10000]), [])
+        a0 = lambda s: s["horizons"][0]["age_strata"]  # noqa: E731
+
+        def infeasible_survivor(s):          # consistent counts everywhere, but an age-infeasible prey alive
+            a = a0(s)
+            a["bins"][9]["infeasible"].update(survivors=1, survival=1.0)
+            a["bins"][9].update(survivors=1, survival=1.0)
+            a["infeasible"].update(survivors=1, survival=0.5)
+            a.update(survivors=3, survival=0.75)
+            s["horizons"][0]["survivors"] = 3
+
+        def moved_between_bins(s):           # bin totals still sum to the cohort, not to their own strata
+            a = a0(s)
+            a["bins"][3].update(n_start=1, survival=1.0)
+            a["bins"][9].update(n_start=2, survival=0.0)
+
+        cases = [  # (message, corruption, the only problem?)
+            ("the score has no horizon records", lambda s: s["horizons"].clear(), True),
+            ("no age_strata", lambda s: s["horizons"][1].pop("age_strata"), True),
+            ("registered horizons", lambda s: s["horizons"].pop(), True),
+            ("keys differ", lambda s: a0(s).pop("bin_convention"), True),
+            ("keys differ", lambda s: a0(s).update(feasible_start_age_max_s=40.0), True),
+            ("schema", lambda s: a0(s).update(schema="finfolk.redqueen.agestrata/0"), True),
+            ("age predicate", lambda s: a0(s).update(age_clock="exact a + H dt"), True),
+            ("steps / frame", lambda s: a0(s).update(frame=1), True),
+            ("dt", lambda s: a0(s).update(dt_s=0.017), True),
+            ("not a finite age", lambda s: a0(s).update(max_age_s=float("nan")), True),
+            ("fixed 12-second", lambda s: a0(s)["bin_edges_s"].append(132), True),
+            ("ten bins", lambda s: a0(s)["bins"].pop(), True),
+            ("not a bin x feasibility record", lambda s: a0(s)["bins"][0].pop("infeasible"), False),
+            ("is not survivors / n_start", lambda s: a0(s)["bins"][3]["feasible"].update(survival=0.5), True),
+            ("None when n_start is 0", lambda s: a0(s)["bins"][1].update(survival=0.0), True),
+            ("is not survivors / n_start", lambda s: a0(s)["bins"][0]["feasible"].update(survival=True), True),
+            ("0 <= survivors <= n_start", lambda s: a0(s)["bins"][0]["feasible"].update(survivors=2), False),
+            ("0 <= survivors <= n_start", lambda s: a0(s)["bins"][0].update(n_start=True), False),
+            ("feasible + infeasible n_start is not the bin's", moved_between_bins, False),
+            ("is not the sum of its bins", lambda s: a0(s).update(feasible={"n_start": 1, "survivors": 1,
+                                                                             "survival": 1.0}), True),
+            ("not the scorer's", lambda s: s["horizons"][0].update(survivors=1), False),
+            ("not the scorer's", lambda s: s.update(n_start=5), False),
+            ("age-infeasible initial prey survived", infeasible_survivor, True),
+        ]
+        for msg, corrupt, alone in cases:
+            with self.subTest(msg=msg):
+                s = copy.deepcopy(good)
+                corrupt(s)
+                probs = score.age_strata_problems(s, [5000, 10000])
+                self.assertTrue(any(msg in p for p in probs), probs)
+                if alone:
+                    self.assertEqual(len(probs), 1, probs)
+        self.assertEqual(score.age_strata_problems(None), ["the score has no horizon records"])
+        self.assertTrue(any("not an object" in p for p in score.age_strata_problems({"horizons": [3]})))
 
 
 class TestFork(unittest.TestCase):
@@ -1237,7 +1371,8 @@ class TestScripted(unittest.TestCase):
         s = self.score()
         h = s["horizons"][0]
         self.assertEqual((h["captures"], h["deaths_predation"], h["survivors"], h["predators"]), (2, 2, 4, 3))
-        self.assertEqual(h["age_strata"]["feasible"], {"n_start": 6, "survivors": 4})
+        self.assertEqual(h["age_strata"]["feasible"], {"n_start": 6, "survivors": 4, "survival": 4 / 6})
+        self.assertEqual(score.age_strata_problems(s, [200]), [])
         self.assertAlmostEqual(h["predator_seconds"], 3 * 200 * score.DT)
         self.assertEqual((s["scripted"], s["checks"]["rows"], s["checks"]["predation_deaths_equal_captures"]),
                          (True, None, "by construction (scripted)"))

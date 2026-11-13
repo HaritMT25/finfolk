@@ -1102,14 +1102,19 @@ class TestCollect(unittest.TestCase):
         self.assertEqual(sorted(doc["observations"][0]["horizons"]), ["10000", "20000", "5000"])
         # Collection reads legacy bundles without diagnostics and /3 bundles identically.
         import score
-        newer = {r["id"]: bundle(r) for r in pick}
-        for b in newer.values():
+
+        def v3(r):
+            b = bundle(r)
             b["schema"] = "finfolk.redqueen.bundle/3"
+            b["score"]["dt"] = score.DT
+            start = dict.fromkeys(range(600), 0.0)
             for h in b["score"]["horizons"]:
-                h["age_strata"] = score._age_strata(dict.fromkeys(range(600), 0),
-                                                    set(range(400)) if h["steps"] == 5000 else set(),
-                                                    120, h["steps"], score.DT, 600,
-                                                    400 if h["steps"] == 5000 else 0)
+                alive = set(range(400)) if h["steps"] == 5000 else set()
+                h["frame"] = 1000 + h["steps"]
+                h["age_strata"] = score.age_strata(start, alive, 120.0, h["steps"], h["frame"], score.DT, 600,
+                                                   len(alive))
+            return b
+        newer = {r["id"]: v3(r) for r in pick}
         self.assertEqual(nb.collect(study(newer), d, pp, rest), doc)
         with self.assertRaises(nb.NoiseBankError):
             nb.collect(study({r["id"]: bundle(r) for r in pick}), d, pp)                      # (undeclared missing)

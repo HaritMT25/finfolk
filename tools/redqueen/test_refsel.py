@@ -625,11 +625,17 @@ class TestCollectAndCli(Base):
         doc = rs.collect(self.study({r["id"]: bundle(r) for r in pick}), d, pp, rest)
         self.assertEqual(len(doc["observations"]), 33)
         import score
-        newer = {r["id"]: bundle(r) for r in pick}
-        for b in newer.values():
+
+        def v3(r):
+            b = bundle(r)
             b["schema"] = "finfolk.redqueen.bundle/3"
-            b["score"]["horizons"][0]["age_strata"] = score._age_strata(
-                dict.fromkeys(range(600), 0), set(range(400)), 120, 5000, score.DT, 600, 400)
+            b["score"]["dt"] = score.DT
+            h = b["score"]["horizons"][0]
+            h["frame"] = 6000
+            h["age_strata"] = score.age_strata(dict.fromkeys(range(600), 0.0), set(range(400)), 120.0, 5000, 6000,
+                                               score.DT, 600, 400)
+            return b
+        newer = {r["id"]: v3(r) for r in pick}
         self.assertEqual(rs.collect(self.study(newer), d, pp, rest), doc)
         with self.assertRaises(rs.RefselError):
             rs.collect(self.study({r["id"]: bundle(r) for r in pick}), d, pp)

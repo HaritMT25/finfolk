@@ -30,16 +30,21 @@ execute(cell, d, exe, paths) runs, in the empty directory d:
      and the source contents: the same row gives the same bytes (tested), and a replay compares
      them. What is not (wall times, host) goes into done.json, outside the bundle.
 
-Age diagnostics (bundle /3; the nested score's existing fields and schema stay unchanged):
-each score.horizons entry adds age_strata. bin_edges_s and bins describe ten START-age bins
-[0,12), [12,24), ..., [108,120] seconds (the last closed); each bin has n_start and survivors.
-feasible and infeasible carry the same counts for start age <= max_age_s - horizon * score.dt
-and its complement; feasible_start_age_max_s records that threshold. Ages come from arena.json
-at f0, keyed by the initial prey IDs, never the horizon's ages. max_age_s is config.maxAge;
-dt is score.py's engine fixed-step constant. Missing / invalid ages, ages beyond the fixed bins,
-partition-total mismatches and any infeasible survivor refuse scoring. Empty strata remain zero.
-Readers accept old /1 and /2 bundles without age_strata (unavailable, never inferred or rewritten)
-and /3 for either plan version; plan/2 still requires its sharing record in /2 and /3 bundles.
+Age diagnostics (bundle /3, D8 v2 rule 48; the nested score's existing fields and schema stay
+unchanged): each score.horizons entry adds age_strata (schema finfolk.redqueen.agestrata/1,
+score.age_strata). Ten START-age bins [0,12), [12,24), ..., [108,120] seconds (bin_edges_s; the
+last closed), each crossed with rule 46's age feasibility at that horizon: F_i(H) from
+common.age_feasible, the engine's binary32 age clock (start age rounded to binary32, then
+H additions of binary32(0.016), age death when the age exceeds binary32(maxAge); age_clock names
+it). Not the exact-arithmetic start age <= maxAge - H x dt, which rounding contradicts near the
+boundary. Every bin, each bin's feasible and infeasible stratum, the two feasibility totals and
+the cohort total carry n_start, survivors and survival (null for an empty denominator). Ages come
+from arena.json at f0, keyed by the initial prey IDs, never the horizon's ages; max_age_s is
+config.maxAge, dt_s score.dt; steps and frame name the horizon. Missing / invalid ages, ages
+beyond the fixed bins, totals that do not reconcile with the score's n_start and survivors, and
+any age-infeasible survivor refuse scoring (score.age_strata_problems is the contract). Readers
+accept old /1 and /2 bundles without age_strata (unavailable, never inferred or rewritten) and /3
+for either plan version; plan/2 still requires its sharing record in /2 and /3 bundles.
 
 Exit codes (also the worker's): 0 ok, 2 the engine is not a serial build, 3 an engine call
 failed, 4 a score check failed, 5 a source is missing or not its registered content (hashed
