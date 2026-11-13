@@ -6,11 +6,19 @@
 //     expectation, a selector missing for a world the step runs on, a world without a shot, a policy without its why
 //   - --out: a run never writes into a directory with older pictures; --clean removes only what an earlier run's manifest (or a
 //     comparison's compare.json) lists, and refuses a folder without one or with any other file (the review of b408e60)
-//   - --compare as a gate, on synthetic runs: identical and noise-only pictures pass; a picture beyond its policy and a size
-//     change fail (and are only listed with --report), and so does a one-level shift of the whole picture (maxNoisePixels); a missing manifest, an incomplete run, a capture missing or changed
-//     since its run, a stale PNG, captures on one side only, different harness or fixture files and an empty comparison are
-//     INVALID in both modes; --sets / --cases / --worlds narrow it; a shot's own policy is honoured; AFTER may miss only the
-//     expectations BEFORE missed too (--expect record: main's run before a PR that brings the behaviour)
+//   - --compare as a gate, on synthetic runs of a synthetic cases file: identical and noise-only pictures pass; a picture beyond
+//     its policy and a size change fail (and are only listed with --report), and so does a one-level shift of the whole picture
+//     (maxNoisePixels); evidence that is not a complete run (a missing manifest, an incomplete run, a capture missing or changed
+//     since its run, a stale PNG, a capture the comparison plans on one side only) is INVALID in both modes; --sets / --cases /
+//     --worlds narrow it; AFTER may miss only the expectations BEFORE missed too (--expect record: main's run before a PR that
+//     brings the behaviour)
+//   - the binding (the review of b442a92): a manifest without valid harness / cases-file identities, a run of another harness
+//     file or another cases file than the comparison's, a run whose recorded selection does not give its expected captures
+//     under that cases file (a later PR's new shot among them), a capture recorded with another case / set / policy, and a
+//     comparison whose planned captures a run did not take are INVALID in both modes; --report --archival compares two runs of
+//     an older harness as a record only; the saved policies: each checked (checkPolicy), BEFORE's and AFTER's the same and
+//     the cases file's (a loose AFTER policy without its why passed before), while a cases file's own override, recorded
+//     consistently by both runs, is honoured
 // The review of PR #89 (729b5ba): --compare compared whatever PNG names two directories shared and always exited 0; a world
 // filter could leave nothing to run and still succeed.
 import fs from "node:fs";
@@ -68,6 +76,8 @@ section("the selection (--plan): refused before any browser when it is not valid
   ok(r.code === 2 && /needs a value/.test(r.out), "a flag without its value: refused", r.out);
   r = harness("--report", "--sets", "S0");
   ok(r.code === 2 && /--report goes with --compare/.test(r.out), "--report without --compare: refused", r.out);
+  r = harness("--archival", "--sets", "S0");
+  ok(r.code === 2 && /--archival goes with --compare --report/.test(r.out), "--archival without --compare: refused", r.out);
   r = harness("--sets", "S0");
   ok(r.code === 2 && /--out DIR is needed/.test(r.out), "a run without --out: refused", r.out);
 }
@@ -142,7 +152,7 @@ section("--out: never a directory with an older run's pictures");
      "  an earlier run's own files only (captures, a failed step's picture, manifest, summary, index): removed (the run then stops at the missing browser module here)", r.out);
 }
 
-/* ---------------- synthetic runs for --compare ---------------- */
+/* ---------------- synthetic runs for --compare, of a synthetic cases file ---------------- */
 const CRC = (() => { const t = new Uint32Array(256); for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; } return t; })();
 function crc32(b) { let c = 0xFFFFFFFF; for (let i = 0; i < b.length; i++) c = CRC[(c ^ b[i]) & 255] ^ (c >>> 8); return (c ^ 0xFFFFFFFF) >>> 0; }
 function chunk(type, data) { const b = Buffer.alloc(12 + data.length); b.writeUInt32BE(data.length, 0); b.write(type, 4, "ascii"); data.copy(b, 8); b.writeUInt32BE(crc32(b.subarray(4, 8 + data.length)), 8 + data.length); return b; }
@@ -157,35 +167,80 @@ function png(w, h, edits, grey) {
   return Buffer.concat([Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]), chunk("IHDR", ihdr), chunk("IDAT", zlib.deflateSync(raw)), chunk("IEND", Buffer.alloc(0))]);
 }
 const sha = (b) => crypto.createHash("sha256").update(b).digest("hex");
+const HARNESS_SHA = sha(fs.readFileSync(HARNESS));
 const POLICY = { tolerance: 1, maxPixels: 8, maxNoisePixels: 32, why: "test" };
-/* a run directory as the harness writes it: pictures {file: {set, buf, policy}} and its manifest */
+/* a small cases file the comparison reads (--cases-file): s0_shell (S0: shot live, both worlds), s2_tabs (S2: shot tab, Classic) */
+let fixN = 0;
+function synFixture(mutate) {
+  const f = { about: "synthetic", version: 2,
+              defaults: { seed: 42, founders: 300, tick: 600, viewport: [20, 10], dpr: 1, animT: 20, visualSeed: 1, settleFrames: 1, barrierFrames: 1,
+                          locale: "en-US", timezone: "UTC", compare: POLICY },
+              routes: { source: { classic: "/web/index.html", ocean: "/web/ocean.html" }, site: { classic: "/classic.html", ocean: "/" } },
+              query: { classic: "", ocean: "" },
+              cases: [{ id: "s0_shell", set: "S0", title: "t", worlds: ["classic", "ocean"], steps: [{ do: "shot", name: "live" }] },
+                      { id: "s2_tabs", set: "S2", title: "t", worlds: ["classic"], steps: [{ do: "shot", name: "tab" }] }] };
+  if (mutate) mutate(f);
+  const text = JSON.stringify(f, null, 1), file = path.join(TMP, "cases_" + (++fixN) + ".json");
+  fs.writeFileSync(file, text);
+  return { fix: f, file, sha: sha(Buffer.from(text, "utf8")) };
+}
+const SYN = synFixture();
+const FULL = { sets: null, cases: null, worlds: ["classic", "ocean"], smoke: false, layout: "source" };
+/* what a selection takes from a cases file, as the harness plans it: file -> {case, set, world, shot, policy} */
+function planOf(F, sel) {
+  const out = {};
+  for (const c of F.fix.cases) {
+    if ((sel.sets && sel.sets.indexOf(c.set) < 0) || (sel.cases && sel.cases.indexOf(c.id) < 0)) continue;
+    for (const w of c.worlds) {
+      if (sel.worlds.indexOf(w) < 0) continue;
+      for (const st of c.steps) if (st.do === "shot" && (!st.world || st.world === w))
+        out[c.id + "__" + w + "__" + st.name + ".png"] = { case: c.id, set: c.set, world: w, shot: st.name, policy: Object.assign({}, F.fix.defaults.compare, c.compare || {}, st.compare || {}) };
+    }
+  }
+  return out;
+}
+/* a run directory as the harness writes it: pictures {file: {buf, policy, unmet}} and its manifest, of cases file o.F (SYN) and
+ * selection o.selection (everything), by this harness file; o.harness / o.fixture / o.expected / o.mutate to make it otherwise */
 let runN = 0;
 function makeRun(pics, o) {
   o = o || {};
+  const F = o.F || SYN, sel = o.selection || FULL, plan = planOf(F, sel);
   const dir = path.join(TMP, "run" + (++runN));
   fs.mkdirSync(dir);
   const captures = {};
   for (const [file, p] of Object.entries(pics)) {
-    const [c, world, shot] = file.replace(/\.png$/, "").split("__");
+    const [c, world, shot] = file.replace(/\.png$/, "").split("__"), pl = plan[file];
     fs.writeFileSync(path.join(dir, file), p.buf);
-    captures[file] = { file, kind: "case", case: c, set: p.set || "S0", world, shot, sha256: sha(p.buf), size: [p.buf.readUInt32BE(16), p.buf.readUInt32BE(20)], bytes: p.buf.length, policy: p.policy || POLICY, unmet: p.unmet || [] };
+    captures[file] = { file, kind: "case", case: c, set: pl ? pl.set : "S0", world, shot, sha256: sha(p.buf), size: [p.buf.readUInt32BE(16), p.buf.readUInt32BE(20)], bytes: p.buf.length,
+                       policy: p.policy || (pl ? pl.policy : POLICY), unmet: p.unmet || [] };
   }
-  const m = { format: "ui-parity-run", version: 1, harness: o.harness || "h1", fixture: o.fixture || "f1", status: o.complete === false ? "failed: 1 runs" : "complete",
-              complete: o.complete !== false, policy: POLICY, expected: o.expected || Object.keys(pics), captures, runs: [{ case: "x", world: "classic", ok: o.complete !== false }], smoke: [] };
+  const m = { format: "ui-parity-run", version: 1, harness: "harness" in o ? o.harness : HARNESS_SHA, fixture: "fixture" in o ? o.fixture : F.sha, fixtureFile: F.file,
+              selection: sel, status: o.complete === false ? "failed: 1 runs" : "complete", complete: o.complete !== false, expectMode: "check", barrierTiming: "as-it-comes",
+              policy: F.fix.defaults.compare, expected: o.expected || Object.keys(plan), captures, runs: [{ case: "x", world: "classic", ok: o.complete !== false }], smoke: [] };
   if (o.mutate) o.mutate(m, dir);
   fs.writeFileSync(path.join(dir, "manifest.json"), JSON.stringify(m));
   return dir;
 }
-const base = () => ({ "s0_shell__classic__live.png": { set: "S0", buf: png(20, 10) }, "s0_shell__ocean__live.png": { set: "S0", buf: png(20, 10) },
-                      "s2_tabs__classic__tab.png": { set: "S2", buf: png(20, 10) } });
+const base = () => ({ "s0_shell__classic__live.png": { buf: png(20, 10) }, "s0_shell__ocean__live.png": { buf: png(20, 10) }, "s2_tabs__classic__tab.png": { buf: png(20, 10) } });
 const withPic = (file, buf, o) => { const p = base(); p[file] = Object.assign({}, p[file], { buf }, o || {}); return p; };
-const cmp = (...a) => harness("--compare", ...a);
+/* the comparison of SYN's runs (cmp), or of another cases file's (cmpF) */
+const cmpF = (F, A, B, ...rest) => harness("--compare", A, B, "--cases-file", F.file, ...rest);
+const cmp = (A, B, ...rest) => cmpF(SYN, A, B, ...rest);
+/* INVALID in both modes: exit 1, the verdict INVALID, the problem named */
+function invalid(what, run, re) {
+  for (const mode of [[], ["--report"]]) {
+    const r = run(...mode);
+    ok(r.code === 1 && /^INVALID: /m.test(r.out) && re.test(r.out) && !/^(PASS|REPORT|FAIL)/m.test(r.out), what + (mode.length ? " (--report too)" : ""), r.out);
+  }
+}
 
 section("--compare: a gate on two complete runs");
 {
   const A = makeRun(base());
   let r = cmp(A, makeRun(base()));
   ok(r.code === 0 && /PASS: 3 pictures: 3 identical/.test(r.out), "two runs, the same pictures: PASS", r.out);
+  ok(/compare: 3 pictures planned by .*cases_1\.json/.test(r.out) && r.out.indexOf("this harness file " + HARNESS_SHA.slice(0, 12)) >= 0,
+     "  it names the cases file it read and this harness file", r.out);
   r = cmp(A, makeRun(withPic("s0_shell__classic__live.png", png(20, 10, [[1, 1, 101], [2, 2, 99], [3, 3, 101]]))));
   ok(r.code === 0 && /noise  s0_shell__classic__live\.png/.test(r.out) && /1 within their policy/.test(r.out), "3 pixels a channel off by 1 (the tolerance): PASS, listed as noise", r.out);
   r = cmp(A, makeRun(withPic("s0_shell__classic__live.png", png(20, 10, [], 101))));
@@ -197,12 +252,6 @@ section("--compare: a gate on two complete runs");
   ok(r.code === 0 && /32 within it/.test(r.out), "  32 pixels off by 1 (maxNoisePixels): PASS, listed as noise", r.out);
   r = cmp(A, makeRun(withPic("s0_shell__classic__live.png", png(20, 10, [], 101))), "--report");
   ok(r.code === 0 && /DIFF   s0_shell__classic__live\.png/.test(r.out), "  the one-level shift with --report: listed, exit 0", r.out);
-  const loose = makeRun(withPic("s0_shell__classic__live.png", png(20, 10, [], 101), { policy: { tolerance: 1, maxPixels: 8, maxNoisePixels: 200, why: "a shot that may shift" } }));
-  r = cmp(makeRun(base()), loose);
-  ok(r.code === 0 && /policy: at most 200/.test(r.out), "  a shot whose own policy allows it (maxNoisePixels 200, with its why): PASS", r.out);
-  const old = makeRun(base(), { mutate: (m) => { for (const c of Object.values(m.captures)) c.policy = { tolerance: 1, maxPixels: 8, why: "b408e60" }; } });
-  r = cmp(makeRun(base(), { mutate: (m) => { for (const c of Object.values(m.captures)) c.policy = { tolerance: 1, maxPixels: 8, why: "b408e60" }; } }), old);
-  ok(r.code === 1 && /no bound for the pixels within the tolerance/.test(r.out), "runs whose policy has no maxNoisePixels (an older harness): INVALID", r.out);
   r = cmp(A, makeRun(withPic("s0_shell__classic__live.png", png(20, 10, [[1, 1, 117], [2, 1, 117], [3, 1, 117]]))));
   ok(r.code === 0 && /PASS/.test(r.out), "3 pixels off by 17 (at most maxPixels 8 beyond the tolerance): PASS", r.out);
   const big = png(20, 10, Array.from({ length: 10 }, (_, i) => [i, 5, 200]));
@@ -218,12 +267,11 @@ section("--compare: a gate on two complete runs");
   r = cmp(A, B, "--worlds", "ocean");
   ok(r.code === 0 && /PASS: 1 pictures/.test(r.out), "  --worlds ocean: the Ocean's only, PASS", r.out);
   r = cmp(A, B, "--worlds", "ocen");
-  ok(r.code === 2, "  --worlds with a misspelt world: refused", r.out);
+  ok(r.code === 2 && /no world "ocen"/.test(r.out), "  --worlds with a misspelt world: refused (exit 2)", r.out);
   r = cmp(A, B, "--sets", "S9");
-  ok(r.code === 1 && /INVALID nothing to compare/.test(r.out), "  a filter that leaves nothing: INVALID, exit 1", r.out);
-  const own = makeRun(withPic("s2_tabs__classic__tab.png", big, { policy: { tolerance: 1, maxPixels: 20, maxNoisePixels: 32, why: "this shot's own" } }));
-  r = cmp(makeRun(base()), own);
-  ok(r.code === 0 && /policy: at most 20/.test(r.out), "a shot's own policy (maxPixels 20): honoured, PASS", r.out);
+  ok(r.code === 2 && /no case is in set "S9"/.test(r.out), "  a set the cases file has no case in: refused (exit 2, as a run's selection)", r.out);
+  r = cmp(A, B, "--cases", "s2_tabs", "--worlds", "ocean");
+  ok(r.code === 2 && /runs no case/.test(r.out), "  a filter that leaves nothing to compare: refused (exit 2)", r.out);
   const S = makeRun(withPic("s0_shell__ocean__live.png", png(22, 10)));
   r = cmp(A, S);
   ok(r.code === 1 && /SIZE   s0_shell__ocean__live\.png  20x10 -> 22x10/.test(r.out), "a picture of another size: FAIL", r.out);
@@ -231,37 +279,116 @@ section("--compare: a gate on two complete runs");
   ok(r.code === 0 && /SIZE/.test(r.out), "  --report: listed, exit 0", r.out);
 }
 
-section("--compare: evidence that is not a complete run is INVALID (both modes)");
+section("--compare: evidence that is not a complete run is INVALID (each in both modes)");
 {
   const A = makeRun(base());
   const empty = path.join(TMP, "empty");
   fs.mkdirSync(empty);
-  let r = cmp(A, empty);
-  ok(r.code === 1 && /INVALID AFTER .*no manifest\.json/.test(r.out) && !/PASS/.test(r.out), "a complete BEFORE against an empty AFTER: INVALID (it said \"0 of 0 identical\" and exited 0)", r.out);
-  r = cmp(A, empty, "--report");
-  ok(r.code === 1 && /INVALID/.test(r.out), "  --report as well", r.out);
-  r = cmp(A, path.join(TMP, "nowhere"));
-  ok(r.code === 1 && /is not a directory/.test(r.out), "an AFTER that does not exist: INVALID", r.out);
-  r = cmp(A, makeRun(base(), { complete: false }));
-  ok(r.code === 1 && /the run is not complete/.test(r.out), "an AFTER whose run did not complete (a failed or interrupted case): INVALID", r.out);
-  r = cmp(A, makeRun(base(), { expected: Object.keys(base()).concat(["s2_tabs__ocean__tab.png"]) }));
-  ok(r.code === 1 && /s2_tabs__ocean__tab\.png was to be taken and was not/.test(r.out), "a capture the run was to take and did not: INVALID", r.out);
-  r = cmp(A, makeRun(base(), { mutate: (m, d) => fs.rmSync(path.join(d, "s0_shell__ocean__live.png")) }));
-  ok(r.code === 1 && /in the manifest but not in/.test(r.out), "a capture deleted after its run: INVALID", r.out);
-  r = cmp(A, makeRun(base(), { mutate: (m, d) => fs.writeFileSync(path.join(d, "s0_shell__classic__live.png"), png(20, 10, [[0, 0, 0]])) }));
-  ok(r.code === 1 && /not the picture its run took/.test(r.out), "a capture replaced after its run (its sha256): INVALID", r.out);
-  r = cmp(A, makeRun(base(), { mutate: (m, d) => fs.writeFileSync(path.join(d, "s2_old__classic__x.png"), png(20, 10)) }));
-  ok(r.code === 1 && /s2_old__classic__x\.png is not a capture of this run/.test(r.out), "a stale PNG of an older run in the directory: INVALID", r.out);
+  invalid("a complete BEFORE against an empty AFTER (it said \"0 of 0 identical\" and exited 0)", (...m) => cmp(A, empty, ...m), /INVALID AFTER .*no manifest\.json/);
+  invalid("an AFTER that does not exist", (...m) => cmp(A, path.join(TMP, "nowhere"), ...m), /is not a directory/);
+  const incomplete = makeRun(base(), { complete: false });
+  invalid("an AFTER whose run did not complete (a failed or interrupted case)", (...m) => cmp(A, incomplete, ...m), /the run is not complete/);
+  const notTaken = makeRun((() => { const p = base(); delete p["s2_tabs__classic__tab.png"]; return p; })());
+  invalid("a capture the run was to take and did not", (...m) => cmp(A, notTaken, ...m), /s2_tabs__classic__tab\.png was to be taken and was not/);
+  const deleted = makeRun(base(), { mutate: (m, d) => fs.rmSync(path.join(d, "s0_shell__ocean__live.png")) });
+  invalid("a capture deleted after its run", (...m) => cmp(A, deleted, ...m), /in the manifest but not in/);
+  const replaced = makeRun(base(), { mutate: (m, d) => fs.writeFileSync(path.join(d, "s0_shell__classic__live.png"), png(20, 10, [[0, 0, 0]])) });
+  invalid("a capture replaced after its run (its sha256)", (...m) => cmp(A, replaced, ...m), /not the picture its run took/);
+  const stale = makeRun(base(), { mutate: (m, d) => fs.writeFileSync(path.join(d, "s2_old__classic__x.png"), png(20, 10)) });
+  invalid("a stale PNG of an older run in the directory", (...m) => cmp(A, stale, ...m), /s2_old__classic__x\.png is not a capture of this run/);
   const fewer = base(); delete fewer["s2_tabs__classic__tab.png"];
-  r = cmp(A, makeRun(fewer));
-  ok(r.code === 1 && /s2_tabs__classic__tab\.png: in BEFORE, not in AFTER/.test(r.out), "a capture on one side only: INVALID (it was skipped before)", r.out);
-  r = cmp(A, makeRun(base(), { fixture: "f2" }));
-  ok(r.code === 1 && /different cases files/.test(r.out), "runs of different cases files: INVALID", r.out);
-  r = cmp(A, makeRun(base(), { harness: "h2" }));
-  ok(r.code === 1 && /different harness files/.test(r.out), "runs of different harness files: INVALID", r.out);
+  const oneSide = makeRun(fewer, { selection: Object.assign({}, FULL, { cases: ["s0_shell"] }) });
+  invalid("a capture the comparison plans on one side only (AFTER's own selection left it out)", (...m) => cmp(A, oneSide, ...m),
+          /s2_tabs__classic__tab\.png: the comparison plans it, AFTER did not take it \(its selection: --cases s0_shell/);
   const junk = path.join(TMP, "junk"); fs.mkdirSync(junk); fs.writeFileSync(path.join(junk, "manifest.json"), "{\"format\":\"other\"}");
-  r = cmp(A, junk);
-  ok(r.code === 1 && /not a ui-parity-run v1 manifest/.test(r.out), "a manifest of something else: INVALID", r.out);
+  invalid("a manifest of something else", (...m) => cmp(A, junk, ...m), /not a ui-parity-run v1 manifest/);
+}
+
+section("--compare is bound to this harness file and the cases file it reads, not to what two manifests agree on (the review of b442a92)");
+{
+  const A = makeRun(base());
+  const noIds = () => makeRun(base(), { mutate: (m) => { delete m.harness; delete m.fixture; } });
+  invalid("two manifests without harness and cases-file identities (both undefined: they agreed, and it PASSED in b442a92)", (...m) => cmp(noIds(), noIds(), ...m),
+          /BEFORE .*no valid harness identity[\s\S]*BEFORE .*no valid cases-file identity[\s\S]*AFTER .*no valid harness identity/);
+  invalid("  identities that are not sha256s (\"h1\", \"f1\": the old tests' own)", (...m) => cmp(makeRun(base(), { harness: "h1", fixture: "f1" }), makeRun(base(), { harness: "h1", fixture: "f1" }), ...m),
+          /no valid harness identity \(harness "h1"[\s\S]*no valid cases-file identity \(fixture "f1"/);
+  const oldH = "a".repeat(64), oldA = makeRun(base(), { harness: oldH }), oldB = makeRun(base(), { harness: oldH });
+  invalid("two runs of another harness file, agreeing with each other", (...m) => cmp(oldA, oldB, ...m), /BEFORE .*taken by another harness file \(sha256 aaaaaaaaaaaa\), not this one/);
+  let r = cmp(oldA, oldB, "--report", "--archival");
+  ok(r.code === 0 && /^REPORT: 3 pictures: 3 identical/m.test(r.out) && /--archival: runs of harness aaaaaaaaaaaa, a record, not a gate/.test(r.out),
+     "  --report --archival --cases-file (their cases file): compared as a record, REPORT", r.out);
+  r = cmp(oldA, oldB, "--archival");
+  ok(r.code === 2 && /--archival goes with --report/.test(r.out), "  --archival without --report: refused (never a gate)", r.out);
+  r = harness("--compare", oldA, oldB, "--report", "--archival");
+  ok(r.code === 2 && /--archival needs --cases-file/.test(r.out), "  --archival without --cases-file: refused", r.out);
+  r = cmp(oldA, makeRun(base(), { harness: "b".repeat(64) }), "--report", "--archival");
+  ok(r.code === 1 && /^INVALID: /m.test(r.out) && /different harness files/.test(r.out), "  --archival of runs of two different harness files: INVALID", r.out);
+  r = cmp(oldA, makeRun(base(), { harness: oldH, mutate: (mm) => { mm.captures["s2_tabs__classic__tab.png"].policy = { tolerance: 255, maxPixels: 0, maxNoisePixels: 200 }; } }), "--report", "--archival");
+  ok(r.code === 1 && /^INVALID: /m.test(r.out) && /s2_tabs__classic__tab\.png's recorded policy: a policy says why/.test(r.out), "  --archival checks the rest as ever (an AFTER with a policy of its own, no why): INVALID", r.out);
+  /* a later PR adds a shot (s2_tabs's tab2): two retained runs of the earlier cases file must not PASS against it */
+  const V2 = synFixture((f) => f.cases[1].steps.push({ do: "shot", name: "tab2" }));
+  invalid("two retained runs of an earlier cases file, against the cases file now (a later PR's new shot)", (...m) => cmpF(V2, A, makeRun(base()), ...m),
+          /BEFORE .*used another cases file .* than this comparison's[\s\S]*AFTER .*used another cases file/);
+  r = cmp(A, makeRun(base()));
+  ok(r.code === 0 && /PASS/.test(r.out), "  the same runs against their own cases file: PASS", r.out);
+  const forged = () => makeRun(base(), { fixture: V2.sha });
+  invalid("  runs claiming the new cases file's sha256 with the old inventory: the new shot is in no expected list",
+          (...m) => cmpF(V2, forged(), forged(), ...m), /s2_tabs__classic__tab2\.png is taken by its selection \(everything\) but not in its expected list[\s\S]*the comparison plans it, BEFORE did not take it/);
+  invalid("a comparison without --cases-file is bound to the committed cases file (these synthetic runs are not its)", (...m) => harness("--compare", A, makeRun(base()), ...m),
+          /used another cases file .*ui_parity_cases\.json/);
+  /* each run's selection, run through the cases file, gives exactly its expected list */
+  const S0 = Object.assign({}, FULL, { sets: ["S0"] }), s0pics = () => { const p = base(); delete p["s2_tabs__classic__tab.png"]; return p; };
+  const a0 = makeRun(s0pics(), { selection: S0 }), b0 = makeRun(s0pics(), { selection: S0 });
+  invalid("two consistent --sets S0 runs, compared with nothing narrowed (the cases file plans S2 too)", (...m) => cmp(a0, b0, ...m),
+          /s2_tabs__classic__tab\.png: the comparison plans it, BEFORE did not take it \(its selection: --sets S0/);
+  r = cmp(a0, b0, "--sets", "S0");
+  ok(r.code === 0 && /PASS: 2 pictures/.test(r.out), "  the same with --sets S0: PASS, 2 pictures", r.out);
+  invalid("a run whose recorded selection (--sets S0) does not take what it lists", (...m) => cmp(A, makeRun(base(), { selection: S0, expected: Object.keys(base()) }), ...m),
+          /s2_tabs__classic__tab\.png is in its expected list, but its selection \(--sets S0.*\) does not take it[\s\S]*s2_tabs__classic__tab\.png is not a capture its selection/);
+  invalid("a run whose selection the cases file cannot run (an unknown case)", (...m) => cmp(A, makeRun(base(), { selection: Object.assign({}, FULL, { cases: ["s9_gone"] }), expected: Object.keys(base()) }), ...m),
+          /is not one this cases file runs: --cases: no case "s9_gone"/);
+  invalid("a run that records no selection", (...m) => cmp(A, makeRun(base(), { mutate: (m) => { delete m.selection; } }), ...m), /records no selection/);
+  invalid("a capture recorded with another set than its case's", (...m) => cmp(A, makeRun(base(), { mutate: (m) => { m.captures["s0_shell__ocean__live.png"].set = "S2"; } }), ...m),
+          /s0_shell__ocean__live\.png is recorded with set "S2"; the cases file has "S0"/);
+}
+
+section("--compare: the saved policies are the cases file's, the same on both sides (the review of b442a92)");
+{
+  const A = makeRun(base());
+  const lavish = { tolerance: 255, maxPixels: 0, maxNoisePixels: 1296000 };
+  const changed = png(20, 10, [], 200);
+  invalid("AFTER recording {tolerance 255, maxPixels 0, maxNoisePixels 1296000} and no why for a changed picture (it PASSED in b442a92)",
+          (...m) => cmp(A, makeRun(withPic("s2_tabs__classic__tab.png", changed, { policy: lavish })), ...m),
+          /AFTER .*s2_tabs__classic__tab\.png's recorded policy: a policy says why[\s\S]*is not the one the cases file gives it[\s\S]*BEFORE and AFTER record different policies/);
+  invalid("  an AFTER policy of its own with every field and a why: not the cases file's, not BEFORE's",
+          (...m) => cmp(A, makeRun(withPic("s2_tabs__classic__tab.png", changed, { policy: Object.assign({ why: "mine" }, lavish, { tolerance: 200 }) })), ...m),
+          /AFTER .*s2_tabs__classic__tab\.png's recorded policy \{tolerance 200, maxPixels 0, maxNoisePixels 1296000, why "mine"\} is not the one the cases file gives it/);
+  const same = { tolerance: 1, maxPixels: 8, maxNoisePixels: 999, why: "both" };
+  invalid("  BEFORE and AFTER agreeing on a policy the cases file does not give",
+          (...m) => cmp(makeRun(withPic("s2_tabs__classic__tab.png", png(20, 10), { policy: same })), makeRun(withPic("s2_tabs__classic__tab.png", png(20, 10), { policy: same })), ...m),
+          /BEFORE .*s2_tabs__classic__tab\.png's recorded policy .* is not the one the cases file gives it/);
+  invalid("  a recorded tolerance out of range (checkPolicy)", (...m) => cmp(A, makeRun(withPic("s2_tabs__classic__tab.png", png(20, 10), { policy: Object.assign({}, POLICY, { tolerance: 256 }) })), ...m),
+          /tolerance is a whole number 0\.\.255/);
+  const noNoise = { tolerance: 1, maxPixels: 8, why: "b408e60" };
+  invalid("  runs whose policy has no maxNoisePixels (an older harness)", (...m) => cmp(makeRun(withPic("s0_shell__ocean__live.png", png(20, 10), { policy: noNoise })), makeRun(withPic("s0_shell__ocean__live.png", png(20, 10), { policy: noNoise })), ...m),
+          /maxNoisePixels \(the pixels that may differ within the tolerance\) is a whole number/);
+  invalid("  a run whose recorded default policy is not the cases file's", (...m) => cmp(A, makeRun(base(), { mutate: (m) => { m.policy = lavish; } }), ...m), /recorded default policy/);
+  /* a legitimate override: the cases file's own, recorded alike by both runs */
+  const LOOSE = synFixture((f) => { f.cases[0].steps[0].compare = { tolerance: 1, maxPixels: 8, maxNoisePixels: 200, why: "a shot that may shift" }; });
+  const shifted = withPic("s0_shell__classic__live.png", png(20, 10, [], 101));
+  let r = cmpF(LOOSE, makeRun(base(), { F: LOOSE }), makeRun(shifted, { F: LOOSE }));
+  ok(r.code === 0 && /noise  s0_shell__classic__live\.png .*policy: at most 200/.test(r.out), "a shot's own policy in the cases file (maxNoisePixels 200, its why), recorded by both runs: honoured, PASS", r.out);
+  r = cmp(makeRun(base()), makeRun(shifted));
+  ok(r.code === 1 && /DIFF   s0_shell__classic__live\.png/.test(r.out), "  the same pictures under the cases file without it: FAIL", r.out);
+  invalid("  BEFORE of the cases file with the override, AFTER claiming it with the default policy", (...m) => cmpF(LOOSE, makeRun(base(), { F: LOOSE }), makeRun(withPic("s0_shell__classic__live.png", png(20, 10, [], 101), { policy: POLICY }), { F: LOOSE }), ...m),
+          /AFTER .*s0_shell__classic__live\.png's recorded policy .* is not the one the cases file gives it/);
+  const CASEPOL = synFixture((f) => { f.cases[1].compare = { tolerance: 1, maxPixels: 20, maxNoisePixels: 32, why: "this case's own" }; });
+  const big = png(20, 10, Array.from({ length: 10 }, (_, i) => [i, 5, 200]));
+  r = cmpF(CASEPOL, makeRun(base(), { F: CASEPOL }), makeRun(withPic("s2_tabs__classic__tab.png", big), { F: CASEPOL }));
+  ok(r.code === 0 && /policy: at most 20/.test(r.out), "a case's own policy (maxPixels 20): honoured, PASS", r.out);
+  const NOWHY = synFixture((f) => { f.cases[1].compare = { tolerance: 1, maxPixels: 20, maxNoisePixels: 32 }; });
+  r = cmpF(NOWHY, makeRun(base(), { F: NOWHY }), makeRun(base(), { F: NOWHY }));
+  ok(r.code === 2 && /says why/.test(r.out), "  a cases file whose override has no why: refused before anything is compared (exit 2)", r.out);
 }
 
 section("--compare and the cases' expectations (a run with --expect record keeps the ones it missed)");
@@ -273,10 +400,8 @@ section("--compare and the cases' expectations (a run with --expect record keeps
      "BEFORE (main) missed an expectation AFTER meets: PASS, and the miss is listed (what the PR brings)", r.out);
   r = cmp(before, makeRun(withPic("s2_tabs__classic__tab.png", png(20, 10), { unmet: [miss] })));
   ok(r.code === 0 && /both runs/.test(r.out), "two runs of main missing the same expectation the same way: PASS (a same-commit repeat)", r.out);
-  r = cmp(makeRun(base()), makeRun(withPic("s2_tabs__classic__tab.png", png(20, 10), { unmet: [miss] })));
-  ok(r.code === 1 && /does not meet its case's expectation/.test(r.out), "AFTER missing an expectation BEFORE met: INVALID", r.out);
-  r = cmp(makeRun(base()), makeRun(withPic("s2_tabs__classic__tab.png", png(20, 10), { unmet: [miss] })), "--report");
-  ok(r.code === 1 && /INVALID/.test(r.out), "  --report as well", r.out);
+  invalid("AFTER missing an expectation BEFORE met", (...m) => cmp(makeRun(base()), makeRun(withPic("s2_tabs__classic__tab.png", png(20, 10), { unmet: [miss] })), ...m),
+          /does not meet its case's expectation/);
   r = harness("--plan", "--sets", "S0", "--expect", "loose");
   ok(r.code === 2 && /--expect is check/.test(r.out), "--expect other than check or record: refused", r.out);
   r = harness("--plan", "--sets", "S0", "--expect", "record");
@@ -290,8 +415,10 @@ section("--compare --out: never into older output");
   let r = cmp(A, B, "--out", d);
   ok(r.code === 0 && fs.existsSync(path.join(d, "compare.json")) && fs.existsSync(path.join(d, "s2_tabs__classic__tab_diff16x.png")),
      "a new directory: compare.json and the difference picture written", r.out);
-  const j = JSON.parse(fs.readFileSync(path.join(d, "compare.json"), "utf8"));
-  ok(j.verdict === "PASS" && j.mode === "check" && j.files.length === 3 && j.counts.within === 1, "  compare.json: the verdict, the mode, each file's result", j);
+  let j = {};
+  try { j = JSON.parse(fs.readFileSync(path.join(d, "compare.json"), "utf8")); } catch (e) { /* not written: the checks below fail */ }
+  ok(j.verdict === "PASS" && j.mode === "check" && j.files.length === 3 && j.counts.within === 1 && j.planned === 3, "  compare.json: the verdict, the mode, each file's result", j);
+  ok(j.harness === HARNESS_SHA && j.fixture === SYN.sha && j.casesFile === SYN.file, "  compare.json: the harness file and the cases file it was bound to", j);
   r = cmp(A, B, "--out", d);
   ok(r.code === 2 && /is not empty/.test(r.out), "the same directory again: refused", r.out);
   ok(Array.isArray(j.written) && j.written.join() === "s2_tabs__classic__tab_diff16x.png" && j.format === "ui-parity-compare", "  compare.json lists the pictures it wrote", j.written);

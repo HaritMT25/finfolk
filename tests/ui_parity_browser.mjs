@@ -8,8 +8,8 @@
 //        [--cases s0_shell,...] [--worlds classic,ocean] [--expect check|record] [--name WHO] [--smoke] [--headed]
 //   node tests/ui_parity_browser.mjs --plan [the same selection]          what a run would take (no browser), or why it is refused
 //   node tests/ui_parity_browser.mjs --list                               the cases
-//   node tests/ui_parity_browser.mjs --compare BEFORE_DIR AFTER_DIR [--report] [--sets ..] [--cases ..] [--worlds ..]
-//        [--out DIFF_DIR [--clean]]
+//   node tests/ui_parity_browser.mjs --compare BEFORE_DIR AFTER_DIR [--report [--archival]] [--cases-file F] [--sets ..] [--cases ..]
+//        [--worlds ..] [--out DIFF_DIR [--clean]]
 //
 // --layout source (the default): --base serves the repository root (python3 wasm/serve.py, its default root), so Classic is
 //          /web/index.html and the Ocean /web/ocean.html (and Classic's ../img/rocks.jpg resolves). --layout site: --base serves
@@ -29,18 +29,28 @@
 // The run writes DIR/manifest.json (kept current after every case): the harness's and the fixture's sha256, the selection,
 //          every capture it was to take, and every one it took (sha256, size, case, set, world, shot, the fixture's difference
 //          policy for it); "complete" only once every run passed and every capture was taken. Exit 1 on any failed run.
-// --compare: a gate on two runs' manifests (before, after), never on whatever PNGs happen to be in two directories. Refused
-//          (exit 1, INVALID): a directory without a manifest, a run that is not complete, a capture missing or changed since its
-//          run (its sha256), a PNG the run did not write (stale), different harness or fixture files, a capture on one side and
-//          not the other, nothing left to compare. Then pixel for pixel, each picture under its policy (the fixture's
+// --compare: a gate on two runs' manifests (before, after), never on whatever PNGs happen to be in two directories. It is bound
+//          to this harness file and to a cases file it reads itself (--cases-file, or the committed one, as a run): never to
+//          what the two manifests say of each other. The comparison's selection (--sets / --cases / --worlds; none: every case
+//          of the cases file) is checked against that cases file (exit 2 as a run's), and every capture it plans must be in
+//          both runs. Refused (exit 1, INVALID): a directory without a manifest, a run that is not complete, a capture missing
+//          or changed since its run (its sha256), a PNG the run did not write (stale); a manifest without a valid harness or
+//          cases-file identity (sha256), a run of another harness file or another cases file than this comparison's; a run
+//          whose recorded selection, run through the cases file, does not give exactly its expected captures, or whose
+//          captures are not recorded with their case, set, world, shot and the policy the cases file gives them (checkPolicy:
+//          every field in range and its why); BEFORE and AFTER recording different policies for a picture; a capture the
+//          comparison plans that one run did not take. Then pixel for pixel, each picture under its policy (the fixture's
 //          defaults.compare, a case's or shot's "compare"): a pixel differs when a channel differs by more than "tolerance";
 //          a picture passes with at most "maxPixels" such pixels and at most "maxNoisePixels" pixels that differ within the
 //          tolerance (so a shift of one level over the whole picture is a change, not noise). Exit 1 (FAIL) on a picture
 //          beyond its policy or a size change;
 //          exit 0 (PASS) otherwise. --report: the same checks of the evidence, but differences and size changes are listed, not
-//          failed (a PR that changes the UI on purpose); exit 0 when the evidence is valid. --sets / --cases / --worlds narrow
-//          the comparison (e.g. --sets S0: the shell must not change). --out: a x16 difference picture for each picture that
-//          differs at all, and compare.json (which lists them: --clean there removes only those and itself).
+//          failed (a PR that changes the UI on purpose); exit 0 when the evidence is valid. --report --archival --cases-file F:
+//          two runs of an older harness (both of one harness file, and of F, the cases file they used: e.g. git show
+//          COMMIT:tests/fixtures/ui_parity_cases.json): every check but the binding to this harness file; a record, never a
+//          gate (REPORT at best). --sets / --cases / --worlds narrow the comparison (e.g. --sets S0: the shell must not
+//          change). --out: a x16 difference picture for each picture that differs at all, and compare.json (which lists them:
+//          --clean there removes only those and itself).
 //
 // The state (the plan's capture rules): seed 42 and 300 founders on both pages (Classic ignores setup URL parameters: its own
 // form's seed and population fields and its Restart; the Ocean: its link's seed= and pop=), Classic's single-threaded module
@@ -116,7 +126,9 @@ const FORMAT = "ui-parity-run", FORMAT_VERSION = 1;
 
 /* ---------------- arguments: every flag known, a value where one is wanted ---------------- */
 const FLAGS = { base: 1, out: 1, layout: 1, sets: 1, cases: 1, worlds: 1, name: 1, "cases-file": 1,
-                expect: 1, smoke: 0, headed: 0, list: 0, plan: 0, clean: 0, report: 0, compare: 2 };
+                expect: 1, smoke: 0, headed: 0, list: 0, plan: 0, clean: 0, report: 0, archival: 0, compare: 2 };
+const DEFAULT_CASES = path.join(HERE, "fixtures", "ui_parity_cases.json");
+const SHA_RE = /^[0-9a-f]{64}$/;
 function usage(msg) { console.error("ui_parity_browser: " + msg + "\n(the header of tests/ui_parity_browser.mjs lists the flags)"); process.exit(2); }
 function parseArgs(argv) {
   const o = {};
@@ -365,7 +377,29 @@ function makePlan(fix, o) {
 }
 
 /* ---------------- --compare: the gate ---------------- */
-function readRun(dir, label) {
+/* a policy as text (its why shortened), and one key-order-free form of it to compare two by */
+const polText = (p) => (p && typeof p === "object" ? "{tolerance " + p.tolerance + ", maxPixels " + p.maxPixels + ", maxNoisePixels " + p.maxNoisePixels +
+  (typeof p.why === "string" && p.why.trim() ? ", why " + JSON.stringify(p.why.length > 40 ? p.why.slice(0, 40) + "..." : p.why) : ", no why") + "}" : JSON.stringify(p));
+const polKey = (p) => JSON.stringify(p && typeof p === "object" && !Array.isArray(p) ? Object.keys(p).sort().map((k) => [k, p[k]]) : p);
+const selText = (s) => (s && typeof s === "object" ? [s.sets && "--sets " + [].concat(s.sets).join(","), s.cases && "--cases " + [].concat(s.cases).join(","),
+  s.worlds && [].concat(s.worlds).join(",") !== WORLD_NAMES.join(",") && "--worlds " + [].concat(s.worlds).join(","), s.smoke && "--smoke",
+  s.layout && s.layout !== "source" && "--layout " + s.layout].filter(Boolean).join(" ") || "everything" : JSON.stringify(s));
+/* what a run of this recorded selection takes, by this cases file (makePlan, as the run itself): {bad} or {files: file -> what it is} */
+function inventory(fix, sel) {
+  const names = (v) => (v === null || v === undefined ? undefined : Array.isArray(v) && v.every((x) => typeof x === "string" && x && x.indexOf(",") < 0) ? v.join(",") : false);
+  if (!sel || typeof sel !== "object" || Array.isArray(sel)) return { bad: ["it records no selection {sets, cases, worlds, smoke, layout}"] };
+  const o = { sets: names(sel.sets), cases: names(sel.cases), worlds: names(sel.worlds), smoke: sel.smoke, layout: sel.layout };
+  if (o.sets === false || o.cases === false || !Array.isArray(sel.worlds) || o.worlds === false || typeof sel.smoke !== "boolean" || typeof sel.layout !== "string")
+    return { bad: ["its selection " + JSON.stringify(sel) + " is not one a run records ({sets, cases: null or names; worlds: names; smoke; layout})"] };
+  const plan = makePlan(fix, o);
+  if (plan.bad.length) return { bad: ["its selection (" + selText(sel) + ") is not one this cases file runs: " + plan.bad.join("; ")] };
+  const files = new Map();
+  for (const r of plan.runs) for (const x of r.captures) files.set(x.file, { kind: "case", case: r.c.id, set: r.c.set, world: r.world, shot: x.shot, policy: x.policy });
+  for (const s of plan.smokes) files.set("smoke__" + s.label + ".png", { kind: "smoke", world: s.world, smoke: s.label });
+  return { bad: [], files };
+}
+/* one run's evidence, checked on its own and against this comparison (K: this harness's sha256, the cases file, archival) */
+function readRun(dir, label, K) {
   const problems = [];
   if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) return { problems: [label + ": " + dir + " is not a directory"] };
   const mp = path.join(dir, "manifest.json");
@@ -385,29 +419,75 @@ function readRun(dir, label) {
     if (sha256(fs.readFileSync(p)) !== c.sha256) problems.push(label + ": " + f + " is not the picture its run took (its sha256 changed since: stale or edited)");
   }
   for (const f of fs.readdirSync(dir)) if (/\.png$/i.test(f) && !m.captures[f]) problems.push(label + ": " + f + " is not a capture of this run (stale, or a failed step's picture)");
+  /* its identities: valid, this harness file (unless archival) and this comparison's cases file (the review of b442a92: two
+     manifests agreeing with each other, or both without one, said nothing of what they were taken with) */
+  const hasH = typeof m.harness === "string" && SHA_RE.test(m.harness), hasF = typeof m.fixture === "string" && SHA_RE.test(m.fixture);
+  if (!hasH) problems.push(label + ": its manifest has no valid harness identity (harness " + JSON.stringify(m.harness) + "; a sha256 is 64 hex digits)");
+  if (!hasF) problems.push(label + ": its manifest has no valid cases-file identity (fixture " + JSON.stringify(m.fixture) + "; a sha256 is 64 hex digits)");
+  if (hasH && !K.archival && m.harness !== K.harnessSha)
+    problems.push(label + ": taken by another harness file (sha256 " + m.harness.slice(0, 12) + "), not this one (" + K.harnessSha.slice(0, 12) + "): take it again with this " +
+                  "harness, or keep the two runs as a record (--report --archival --cases-file THEIR_CASES_FILE)");
+  if (hasF && m.fixture !== K.fixSha)
+    problems.push(label + ": it used another cases file (sha256 " + m.fixture.slice(0, 12) + ") than this comparison's, " + K.casesFile + " (" + K.fixSha.slice(0, 12) + "): " +
+                  "what it was to take is not what this cases file plans");
+  /* its inventory: the selection it recorded, run through this cases file, gives exactly its expected captures, and each capture
+     is recorded as that file's (case, set, world, shot) with the policy it gives it */
+  const inv = hasF && m.fixture === K.fixSha ? inventory(K.fix, m.selection) : null;
+  if (inv && inv.bad.length) for (const b of inv.bad) problems.push(label + ": " + b);
+  if (inv && !inv.bad.length) {
+    const exp = new Set(m.expected);
+    for (const f of inv.files.keys()) if (!exp.has(f)) problems.push(label + ": " + f + " is taken by its selection (" + selText(m.selection) + ") but not in its expected list");
+    for (const f of m.expected) if (!inv.files.has(f)) problems.push(label + ": " + f + " is in its expected list, but its selection (" + selText(m.selection) + ") does not take it");
+    if (polKey(m.policy) !== polKey(K.fix.defaults.compare)) problems.push(label + ": its recorded default policy " + polText(m.policy) + " is not the cases file's defaults.compare " + polText(K.fix.defaults.compare));
+  }
+  const checked = !!inv && !inv.bad.length;
+  for (const [f, c] of Object.entries(m.captures)) {
+    const want = checked ? inv.files.get(f) : undefined;
+    if (checked && !want) { problems.push(label + ": " + f + " is not a capture its selection (" + selText(m.selection) + ") takes"); continue; }
+    if (want) {
+      const off = (want.kind === "case" ? ["kind", "case", "set", "world", "shot"] : ["kind", "world", "smoke"]).filter((k) => c[k] !== want[k]);
+      if (off.length) problems.push(label + ": " + f + " is recorded with " + off.map((k) => k + " " + JSON.stringify(c[k])).join(", ") + "; the cases file has " + off.map((k) => JSON.stringify(want[k])).join(", "));
+    }
+    if ((want ? want.kind : c.kind) !== "case") continue;   /* a smoke picture: never compared, no policy */
+    const pb = [];
+    checkPolicy(c.policy, label + ": " + f + "'s recorded policy", pb);
+    for (const b of pb) problems.push(b);
+    if (want && polKey(c.policy) !== polKey(want.policy))
+      problems.push(label + ": " + f + "'s recorded policy " + polText(c.policy) + " is not the one the cases file gives it, " + polText(want.policy));
+  }
   return { m, problems };
 }
 function compareMain(o) {
-  const [A, B] = o.compare, report = !!o.report;
-  const sets = listOf(o.sets), ids = listOf(o.cases), worlds = listOf(o.worlds);
-  if (worlds) for (const w of worlds) if (WORLD_NAMES.indexOf(w) < 0) usage("--worlds: no world " + JSON.stringify(w));
+  const [A, B] = o.compare, report = !!o.report, archival = !!o.archival;
+  if (archival && !report) usage("--archival goes with --report: two runs of another harness file are a record, never a gate");
+  if (archival && o["cases-file"] === undefined) usage("--archival needs --cases-file: the cases file both runs used (e.g. git show COMMIT:tests/fixtures/ui_parity_cases.json > F)");
+  /* bound to this harness file and to the cases file read here, not to what the manifests say of each other */
+  const L = loadFixture(path.resolve(String(o["cases-file"] || DEFAULT_CASES)));
+  const K = { archival, harnessSha: sha256(fs.readFileSync(SELF)), fix: L.fix, fixSha: L.sha, casesFile: L.file };
+  /* the comparison's selection, checked as a run's; every capture it plans must be in both runs */
+  const scope = makePlan(K.fix, { sets: o.sets, cases: o.cases, worlds: o.worlds });
+  if (scope.bad.length) usage("the comparison's selection: " + scope.bad.join("\n  "));
+  const sets = scope.selection.sets, ids = scope.selection.cases, worlds = listOf(o.worlds);
+  const planned = scope.runs.flatMap((r) => r.captures.map((x) => x.file)).sort();
   const OUTD = o.out ? path.resolve(o.out) : null;
   if (OUTD) prepareDir(OUTD, !!o.clean, DIFF_OWNED, "--out");
-  const ra = readRun(A, "BEFORE " + A), rb = readRun(B, "AFTER " + B), problems = ra.problems.concat(rb.problems);
-  const pick = (m) => Object.keys(m.captures).filter((f) => {
-    const c = m.captures[f];
-    return c.kind === "case" && (!sets || sets.indexOf(c.set) >= 0) && (!ids || ids.indexOf(c.case) >= 0) && (!worlds || worlds.indexOf(c.world) >= 0);
-  }).sort();
+  console.log("compare: " + planned.length + " pictures planned by " + K.casesFile + " (sha256 " + K.fixSha.slice(0, 12) + ") for " +
+              selText({ sets, cases: ids, worlds }) + "; " + (archival ? "--archival: a record, not bound to this harness file (" + K.harnessSha.slice(0, 12) + ")" :
+              "this harness file " + K.harnessSha.slice(0, 12)));
+  const ra = readRun(A, "BEFORE " + A, K), rb = readRun(B, "AFTER " + B, K), problems = ra.problems.concat(rb.problems);
   let files = [];
   const unmet = [];
   if (ra.m && rb.m) {
-    if (ra.m.harness !== rb.m.harness) problems.push("the two runs were taken by different harness files (sha256 " + String(ra.m.harness).slice(0, 12) + " vs " + String(rb.m.harness).slice(0, 12) + "): run both with one");
-    if (ra.m.fixture !== rb.m.fixture) problems.push("the two runs used different cases files (sha256 " + String(ra.m.fixture).slice(0, 12) + " vs " + String(rb.m.fixture).slice(0, 12) + "): run both with one");
-    const fa = pick(ra.m), fb = pick(rb.m), sb = new Set(fb), sa = new Set(fa);
-    for (const f of fa) if (!sb.has(f)) problems.push(f + ": in BEFORE, not in AFTER");
-    for (const f of fb) if (!sa.has(f)) problems.push(f + ": in AFTER, not in BEFORE");
-    files = fa.filter((f) => sb.has(f));
+    if (archival && ra.m.harness !== rb.m.harness)
+      problems.push("the two runs were taken by different harness files (sha256 " + String(ra.m.harness).slice(0, 12) + " vs " + String(rb.m.harness).slice(0, 12) + "): a record compares two runs of one");
+    for (const f of planned) for (const [r, side] of [[ra, "BEFORE"], [rb, "AFTER"]])
+      if (!r.m.captures[f]) problems.push(f + ": the comparison plans it, " + side + " did not take it (its selection: " + selText(r.m.selection) + "); narrow the comparison or take the run again");
+    files = planned.filter((f) => ra.m.captures[f] && rb.m.captures[f]);
     if (!files.length) problems.push("nothing to compare" + (sets || ids || worlds ? " in the selection" : "") + " (no case capture on both sides)");
+    for (const f of files) {
+      const pa = ra.m.captures[f].policy, pb = rb.m.captures[f].policy;
+      if (polKey(pa) !== polKey(pb)) problems.push(f + ": BEFORE and AFTER record different policies, " + polText(pa) + " and " + polText(pb));
+    }
     /* the cases' expectations: a run with --expect record keeps the ones it did not meet (main, before a PR that brings the
        behaviour). AFTER may miss only what BEFORE missed too, the same way (two runs of one commit); anything else is INVALID */
     for (const f of files) {
@@ -415,11 +495,6 @@ function compareMain(o) {
       for (const u of ub) if (ua.indexOf(u) < 0) problems.push("AFTER: " + f + " does not meet its case's expectation (" + u + ") and BEFORE did");
       for (const u of ua) unmet.push({ file: f, side: ub.indexOf(u) >= 0 ? "both" : "before", what: u });
     }
-  }
-  if (!problems.length) for (const f of files) {
-    const pol = rb.m.captures[f].policy;
-    if (!pol || !Number.isInteger(pol.tolerance) || !Number.isInteger(pol.maxPixels) || !Number.isInteger(pol.maxNoisePixels))
-      problems.push(f + ": its policy " + JSON.stringify(pol) + " has no bound for the pixels within the tolerance (maxNoisePixels): a run of an older harness; take both runs again");
   }
   const rows = [], written = [];
   if (!problems.length) for (const f of files) {
@@ -446,19 +521,22 @@ function compareMain(o) {
   const counts = ["same", "within", "differs", "size"].map((v) => rows.filter((r) => r.verdict === v).length);
   console.log(verdict + ": " + (problems.length ? problems.length + " problems with the evidence; nothing compared" :
               rows.length + " pictures: " + counts[0] + " identical, " + counts[1] + " within their policy, " + counts[2] + " beyond it, " + counts[3] + " of another size" +
-              (report ? " (--report: differences listed, not failed)" : "") + (unmet.length ? "; " + unmet.length + " expectations BEFORE did not meet" + (unmet.some((u) => u.side === "both") ? " (some neither run met)" : "") : "")));
-  if (OUTD) fs.writeFileSync(path.join(OUTD, "compare.json"), JSON.stringify({ format: "ui-parity-compare", written, before: path.resolve(A), after: path.resolve(B), mode: report ? "report" : "check",
-    selection: { sets, cases: ids, worlds }, verdict, problems, unmet, expectModes: { before: ra.m && ra.m.expectMode, after: rb.m && rb.m.expectMode }, counts: { same: counts[0], within: counts[1], differs: counts[2], size: counts[3] }, files: rows }, null, 1));
+              (report ? " (--report: differences listed, not failed)" : "") + (archival ? " (--archival: runs of harness " + String(ra.m.harness).slice(0, 12) + ", a record, not a gate)" : "") +
+              (unmet.length ? "; " + unmet.length + " expectations BEFORE did not meet" + (unmet.some((u) => u.side === "both") ? " (some neither run met)" : "") : "")));
+  if (OUTD) fs.writeFileSync(path.join(OUTD, "compare.json"), JSON.stringify({ format: "ui-parity-compare", written, before: path.resolve(A), after: path.resolve(B),
+    mode: report ? (archival ? "report-archival" : "report") : "check", harness: K.harnessSha, fixture: K.fixSha, casesFile: K.casesFile,
+    selection: { sets, cases: ids, worlds }, planned: planned.length, verdict, problems, unmet, expectModes: { before: ra.m && ra.m.expectMode, after: rb.m && rb.m.expectMode }, counts: { same: counts[0], within: counts[1], differs: counts[2], size: counts[3] }, files: rows }, null, 1));
   process.exit(verdict === "PASS" || verdict === "REPORT" ? 0 : 1);
 }
 
 /* ---------------- dispatch: compare, list, plan (no browser), then a run ---------------- */
 if (ARGS.compare) {
-  for (const k of Object.keys(ARGS)) if (["compare", "report", "sets", "cases", "worlds", "out", "clean"].indexOf(k) < 0) usage("--" + k + " is not a --compare flag");
+  for (const k of Object.keys(ARGS)) if (["compare", "report", "archival", "cases-file", "sets", "cases", "worlds", "out", "clean"].indexOf(k) < 0) usage("--" + k + " is not a --compare flag");
   compareMain(ARGS);
 }
 if (ARGS.report) usage("--report goes with --compare");
-const CASES_FILE = path.resolve(String(ARGS["cases-file"] || path.join(HERE, "fixtures", "ui_parity_cases.json")));
+if (ARGS.archival) usage("--archival goes with --compare --report");
+const CASES_FILE = path.resolve(String(ARGS["cases-file"] || DEFAULT_CASES));
 const { fix: FIX, sha: FIX_SHA } = loadFixture(CASES_FILE);
 const DEF = FIX.defaults;
 if (ARGS.list) {

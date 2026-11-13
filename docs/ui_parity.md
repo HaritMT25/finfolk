@@ -115,10 +115,26 @@ node tests\ui_parity_browser.mjs --compare OUT\before OUT\after --sets S2 --repo
 node tests\ui_parity_browser.mjs --compare OUT\after OUT\after_repeat                                # two runs of one commit: must PASS
 ```
 
-`--compare` reads the two runs' manifests, never just the PNGs two directories happen to share. **INVALID** (exit 1, both modes,
-nothing compared): a directory without a manifest, a run that is not complete, a capture missing or changed since its run (its
-sha256), a PNG the run did not write (stale), runs of different harness or cases files, a capture on one side only, or nothing left
-to compare (after `--sets` / `--cases` / `--worlds`). Then each picture under its policy: the cases file's `defaults.compare`,
+`--compare` reads the two runs' manifests, never just the PNGs two directories happen to share, and it is bound to **this harness
+file and the cases file it reads itself** (`--cases-file F`, or the committed `tests/fixtures/ui_parity_cases.json`, as for a run),
+never to what the two manifests say of each other. The comparison's own selection (`--sets` / `--cases` / `--worlds`; none: every
+case of that cases file) is checked as a run's is (exit 2: an unknown set or case, or a selection that compares nothing), and every
+capture it plans must be in both runs. **INVALID** (exit 1, both modes, nothing compared):
+
+- the evidence: a directory without a manifest, a run that is not complete, a capture missing or changed since its run (its
+  sha256), a PNG the run did not write (stale);
+- the identities: a manifest without a valid harness or cases-file sha256, a run taken by another harness file than the one
+  comparing, a run of another cases file than the comparison's (so two retained runs of P02's cases file cannot pass against a later
+  PR's, which plans a new shot);
+- the inventory: the selection a run recorded, run through the cases file, must give exactly its expected captures, and each
+  capture must be recorded with its case, set, world and shot and with the policy the cases file gives it (every field in range and
+  its why, as the cases file's own policies are checked); BEFORE and AFTER must record the same policy for a picture;
+- the coverage: a capture the comparison plans that one run did not take (its selection left it out: narrow the comparison, or take
+  the run again).
+
+To look at two runs of an older harness (say, a PR's earlier pictures), `--report --archival --cases-file F` (F the cases file both
+used, e.g. `git show COMMIT:tests/fixtures/ui_parity_cases.json > F`) runs every check but the binding to this harness file; the two
+runs must still share one. It is a record, never a gate: REPORT at best. Then each picture under its policy: the cases file's `defaults.compare`,
 overridden by a case's or a shot's `compare` (a whole policy: `{tolerance, maxPixels, maxNoisePixels, why}`): a pixel differs when a
 channel differs by more than `tolerance`; the picture passes with at most `maxPixels` such pixels **and** at most `maxNoisePixels`
 pixels that differ by no more than the tolerance, so a shift of one level over the whole picture (every pixel off by 1, none beyond
@@ -134,8 +150,10 @@ The default policy, tolerance 1, at most 8 pixels beyond it and at most 32 withi
 first version of the harness (PR #89 at 729b5ba): the compositor's anti-aliasing of rounded edges over the canvas moved a channel by 1 in up to ~21
 pixels of a picture, and once 3 pixels at a rounded bar's end differed by up to 17. Since the renderer barrier, the queued idle
 callbacks and the sRGB / no-partial-raster flags, two runs of one commit have been identical, every pixel (41 of 41 pictures, main
-and the branch, PR #89's fix round); the margins stay small for other GPUs and drivers. A case that needs another policy says so,
-with its why.
+and the branch, PR #89's fix rounds). These are one machine's measurements (its GPU, driver and compositor); they do not show
+that another machine repeats as well. On a new machine, compare two runs of one commit first (`--compare OUT\after
+OUT\after_repeat`) before trusting a gate there. A case that needs another policy says so in the cases file, with its why; both
+runs then record it, and the comparison checks that they do.
 
 ### The state: what is controlled
 
