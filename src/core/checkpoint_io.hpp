@@ -306,7 +306,8 @@ inline bool integer(const Value* v, double lo, double hi) {
 
 inline bool finiteFloat(const Value& v) {
     return v.type == Type::Number && std::isfinite(v.num) &&
-           std::isfinite(static_cast<float>(v.num));
+           v.num >= -double(std::numeric_limits<float>::max()) &&
+           v.num <= double(std::numeric_limits<float>::max());
 }
 
 inline bool uniqueKeys(const Value& v) {
@@ -464,16 +465,24 @@ inline bool config(const Value& root, SimConfig& c, std::string& error) {
           c.genomeInitMin <= c.genomeInitMax &&
           c.genomeInitMax <= c.genomeMaxLength))
         return fail(error, "incoherent genome lengths");
+    if (!(c.bodyMutation >= 0.0f) || !(c.predatorTraitMutation >= 0.0f))
+        return fail(error, "negative trait mutation");
+    for (int n : {c.predatorCount, c.targetFood, c.foodPatches, c.currentEddies})
+        if (n < 0) return fail(error, "negative startup allocation count");
     return true;
 }
 
 inline bool rngState(const Value* v) {
     if (!v || v->type != Type::String) return false;
     std::istringstream in(v->str);
+    bool nonzero = false;
     for (int i = 0; i < 624; ++i) {
         unsigned long long word;
         if (!(in >> word) || word > UINT32_MAX) return false;
+        // The low 31 bits of state[0] are discarded by the next twist.
+        nonzero = nonzero || (i == 0 ? (word & 0x80000000ULL) != 0 : word != 0);
     }
+    if (!nonzero) return false;
     long long position;
     if (!(in >> position) || position < 0 || position > 624) return false;
     in >> std::ws;
@@ -568,6 +577,132 @@ inline bool geometry(int width, int height, const SimConfig& c,
     return true;
 }
 
+// JSON stores doubles. Restrict integral state to its exact integer range,
+// before any llOr/ullOr cast in the shared legacy restoration code.
+inline constexpr double MAX_EXACT_INTEGER = 9007199254740991.0;
+
+inline bool floatColumn(const Value& block, const char* key, size_t n,
+                        double lo = -std::numeric_limits<float>::max(),
+                        double hi = std::numeric_limits<float>::max()) {
+    const Value* a = block.find(key);
+    if (!a || !a->isArray() || a->arr.size() != n) return false;
+    for (const Value& v : a->arr)
+        if (!finiteFloat(v) || v.num < lo || v.num > hi) return false;
+    return true;
+}
+
+inline bool intColumn(const Value& block, const char* key, size_t n,
+                      double lo, double hi) {
+    const Value* a = block.find(key);
+    if (!a || !a->isArray() || a->arr.size() != n) return false;
+    for (const Value& v : a->arr)
+        if (!integer(&v, lo, hi)) return false;
+    return true;
+}
+
+inline bool ids(const Value& block, size_t n, double next, bool predator) {
+    if (!intColumn(block, "id", n, 1, next - 1) ||
+        !intColumn(block, "lineageId", n, 1, next - 1)) return false;
+    std::vector<double> sorted;
+    sorted.reserve(n);
+    for (const Value& v : block.find("id")->arr) sorted.push_back(v.num);
+    std::sort(sorted.begin(), sorted.end());
+    if (std::adjacent_find(sorted.begin(), sorted.end()) != sorted.end()) return false;
+    if (!predator) return true;
+    return intColumn(block, "parentId", n, 0, MAX_EXACT_INTEGER) &&
+           intColumn(block, "captures", n, 0, UINT32_MAX) &&
+           (!block.find("sourceId") || intColumn(block, "sourceId", n, 0, MAX_EXACT_INTEGER)) &&
+           (!block.find("virtualBuds") || intColumn(block, "virtualBuds", n, 0, UINT32_MAX));
+}
+
+inline bool ordinaryState(const Value& root, const SimConfig& c,
+                          std::string& error) {
+    const Value& world = *root.find("world");
+    if (!integer(world.find("frame"), 0, MAX_EXACT_INTEGER) ||
+        !integer(world.find("nextId"), 1, MAX_EXACT_INTEGER) ||
+        (world.find("arena") && world.find("arena")->type != Type::Bool))
+        return fail(error, "invalid world state");
+    const Value* counters = root.find("counters");
+    if (!counters || !counters->isObject()) return fail(error, "missing counters");
+    for (const char* key : {"totalBirths", "totalGraceBirths", "totalSoftBirths",
+             "totalDeaths", "totalDeathsPredation", "totalDeathsStarvation",
+             "totalDeathsAge", "totalPredatorBirths", "totalPredatorDeathsStarvation",
+             "totalPredatorDeathsAge", "totalPredatorReseeds", "totalDeathsLogged",
+             "clusterStride", "totalBirthsLogged", "reproStride"}) {
+        const bool stride = std::string(key) == "clusterStride" || std::string(key) == "reproStride";
+        if (!integer(counters->find(key), stride ? 1 : 0, MAX_EXACT_INTEGER))
+            return fail(error, "invalid counter");
+    }
+    // Require the complete v3 environment; never regenerate missing state.
+    for (const char* key : {"currentVortices", "foodPatchCenters"}) {
+        const Value* a = root.find(key);
+        const size_t stride = std::string(key) == "currentVortices" ? CurrentField::VORTEX_FLOATS : 2;
+        if (!a || !a->isArray() || a->arr.size() % stride ||
+            !floatColumn(root, key, a->arr.size()))
+            return fail(error, "invalid environment column");
+    }
+    const int width = int(world.find("width")->num), height = int(world.find("height")->num);
+    const size_t cols = size_t(width / 8) + 1, rows = size_t(height / 8) + 1;
+    const Value* signals = root.find("signals");
+    if (!signals || !signals->isObject() ||
+        !integer(signals->find("cols"), double(cols), double(cols)) ||
+        !integer(signals->find("rows"), double(rows), double(rows)) ||
+        !integer(signals->find("cellSize"), 8, 8))
+        return fail(error, "invalid signal geometry");
+    const Value* rle = signals->find("rle");
+    if (!rle || !rle->isArray() || rle->arr.size() % 2)
+        return fail(error, "invalid signal RLE");
+    size_t remaining = cols * rows;
+    for (size_t i = 0; i < rle->arr.size(); i += 2) {
+        if (!integer(&rle->arr[i], 0, 255) ||
+            !integer(&rle->arr[i + 1], 0, double(remaining)))
+            return fail(error, "invalid signal run");
+        remaining -= size_t(rle->arr[i + 1].num);
+    }
+    if (remaining) return fail(error, "incomplete signal grid");
+
+    for (const char* key : {"creatures", "predators", "food"}) {
+        const Value& b = *root.find(key);
+        size_t n;
+        if (!count(b, n) || !intColumn(b, "alive", n, 0, 1))
+            return fail(error, "invalid alive column");
+        if (std::string(key) == "food") {
+            if (!floatColumn(b, "x", n) || !floatColumn(b, "y", n))
+                return fail(error, "invalid food position");
+            continue;
+        }
+        const bool pred = std::string(key) == "predators";
+        for (const char* col : {"posX", "posY", "velX", "velY", "age"})
+            if (!floatColumn(b, col, n)) return fail(error, "invalid population float column");
+        if (!intColumn(b, "generation", n, 0, UINT32_MAX))
+            return fail(error, "invalid generation");
+        if (pred) {
+            for (const char* col : {"digestTimer", "energy"})
+                if (!floatColumn(b, col, n)) return fail(error, "invalid predator state");
+            for (const char* col : {"speedFactor", "buddingFactor"})
+                if (!floatColumn(b, col, n, PRED_TRAIT_MIN, PRED_TRAIT_MAX))
+                    return fail(error, "invalid predator trait");
+            if (c.predatorBrain &&
+                (!ids(b, n, world.find("nextPredatorId")->num, true) ||
+                 !floatColumn(b, "speed", n, 0)))
+                return fail(error, "invalid predator identity or speed");
+        } else {
+            if (!integer(b.find("bodyLen"), Creature::BODY_LEN, Creature::BODY_LEN) ||
+                n > std::numeric_limits<size_t>::max() / (Creature::BODY_LEN * 2) ||
+                !floatColumn(b, "body", n * Creature::BODY_LEN * 2) ||
+                !ids(b, n, world.find("nextId")->num, false))
+                return fail(error, "invalid creature body or identity");
+            for (const char* col : {"lastMoveDirX", "lastMoveDirY", "speed", "foodReserves",
+                     "reproTimer", "interactTimer", "responsiveness", "oscPeriod", "oscPhase"})
+                if (!floatColumn(b, col, n)) return fail(error, "invalid creature state");
+            for (const char* col : {"bodySize", "bodyElong"})
+                if (!floatColumn(b, col, n, BODY_PARAM_MIN, BODY_PARAM_MAX))
+                    return fail(error, "invalid creature trait");
+        }
+    }
+    return true;
+}
+
 inline bool preflight(const Value& root, SimConfig& c,
                       std::string& error) {
     if (!integer(root.find("formatVersion"), 3, 3))
@@ -624,6 +759,7 @@ inline bool preflight(const Value& root, SimConfig& c,
                 return fail(error, "scripted predators carry brain columns");
     }
 
+    if (!ordinaryState(root, c, error)) return false;
     if (!rngState(root.find("rngState")) ||
         !rngState(root.find("predatorRngState")))
         return fail(error, "missing or malformed RNG state");
@@ -1023,8 +1159,8 @@ inline bool readPredators(const jsonm::Value& jp, bool brain, std::uint64_t next
 
 // -------------------------------------------------------------------- load --
 // Restores `world` in place. On failure returns false with `error` set and
-// leaves the world untouched-but-unusable, so callers should treat a failed
-// load as fatal rather than continuing with a half-built world.
+// format-3 validation failures leave the destination and RNG untouched. Legacy
+// failures may leave partial state; callers must discard that destination.
 inline bool deserialize(const std::string& text, World& world, std::string& error) {
     jsonm::Value j;
     if (!jsonm::Parser::parse(text, j, error)) return false;
@@ -1113,7 +1249,12 @@ inline bool deserialize(const std::string& text, World& world, std::string& erro
     // Build an empty world of the right geometry, then overwrite every piece of
     // state. init() draws from the rng (vortices, food patches), which is
     // exactly why the rng state is restored LAST, below.
-    world.init(width, height, 0);
+    if (policy) {
+        world.cfg = policyConfig;
+        world.initForCheckpoint(width, height);
+    } else {
+        world.init(width, height, 0);
+    }
     world.food.clear();
     world.predators.clear();
     world.creatures.clear();

@@ -255,6 +255,25 @@ public:
         }
     }
 
+    // Format-3 restoration supplies all stochastic state from its validated
+    // payload. Prepare only geometry and deterministic current parameters;
+    // startup population/patch/eddy counts must never drive throwaway work.
+    void initForCheckpoint(int w, int h) {
+        width = w;
+        height = h;
+        signals.init(w, h, 8, cfg.toroidal);
+        creatureGrid_.init(w, h, cfg.perceptionRadius);
+        foodGrid_.init(w, h, cfg.perceptionRadius);
+        const CurrentField::Mode mode = cfg.currentMode == 1
+            ? CurrentField::Mode::Gyre : CurrentField::Mode::Eddies;
+        current_.init(mode, w, h, 0, cfg.currentStrength,
+                      cfg.currentCore, cfg.currentDrift, cfg.currentGyreEps);
+        creatures.clear();
+        predators.clear();
+        food.clear();
+        foodPatches_.clear();
+    }
+
     void spawnFood() {
         Food f;
         if (!foodPatches_.empty()) {

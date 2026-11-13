@@ -157,6 +157,10 @@ add_executable(weight_policy_frontend tests/weight_policy_frontend.cpp)
 target_link_libraries(weight_policy_frontend PRIVATE evo_core)
 add_test(NAME weight_policy_frontend COMMAND weight_policy_frontend)
 
+add_executable(checkpoint_v3_validation tests/checkpoint_v3_validation.cpp)
+target_link_libraries(checkpoint_v3_validation PRIVATE evo_core)
+add_test(NAME checkpoint_v3_validation COMMAND checkpoint_v3_validation)
+
 # predator_smoke — a longer no-SFML integration run with predators ON, asserting
 # the run-level invariants (pop floor, finite positions, predation occurs,
 # predator_align in range, deaths == predation+starvation+age, fixed predator
