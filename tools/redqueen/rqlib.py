@@ -178,7 +178,8 @@ def load_reservations(path):
 
     See docs/redqueen_reservations.md for the complete input grammar. Flat
     inventories use all labels, not just seed-named ones. Structural records and
-    every inventory-array record are interpreted independently; metadata integers
+    every inventory-array record are interpreted independently; known metadata
+    collections are traversed without requiring seeds in each element. Metadata integers
     are reserved only under the historical recursive seed-key policy. Argv seeds
     additionally obey the engine's unsigned 32-bit range.
     """
@@ -231,12 +232,54 @@ def load_reservations(path):
 
     # These fields identify records, unlike arbitrary inventory labels such as
     # w01_seed or the seed-kind label reseed. Keep the distinction explicit.
-    record_fields = {"seed", "seeds", "founder_seed", "seed_rederived", "transplant_seed", "reseed_after_load"}
+    record_fields = {"seed", "seeds", "founder_seed", "seed_rederived", "transplant_seed", "reseed_after_load",
+                     "slot_seed", "donor_seed", "pred_seed"}
     scalar_metadata = {"steps", "attempt", "replicate", "frame", "index"}
     inventory_fields = {"worlds", "reserved", "reservations", "records", "inventory"}
+    # These are structural collections emitted by the study tools, not lists of
+    # independent reservations. Still traverse their seed fields and argv: e.g.
+    # receipt.seeds is historically reserved even when it is a count.
+    metadata_fields = {
+        "avoid", "avoided", "per_block", "block_allocations", "containers", "sources",
+        "ages", "cores", "acceptance", "picked", "configchanges", "swapped", "state",
+        "candidates", "segments", "pairs", "replicates", "rows", "results", "args",
+        "schedule", "block_order", "horizons",
+        "availability", "burn_in",
+    }
+    legacy_metadata = {
+        "id", "design", "resident", "resident_name", "resident_sha256", "invader",
+        "invader_name", "invader_sha256", "mode", "fraction", "state", "condition",
+        "predators", "replicate", "steps", "checkpoint_every", "log_every",
+        "keep_intermediate", "seed_namespace", "core", "assay", "h", "i", "j", "r",
+        "_invader_read_sha256", "_resident_read_sha256",
+    }
+    world_metadata = {"id", "treatment", "sentinel", "attempt", "total", "frame",
+                      "prey", "predators", "status", "block", "total_steps",
+                      "world", "extinct_row", "guild", "utc"}
+    metadata_schemas = {"finfolk.redqueen.recovery/1", "finfolk.redqueen.recoveryextra.result/1",
+                        "finfolk.redqueen.noisebank.bank/2"}
+    status_fields = {"archive_root", "availability", "burn_in", "counts", "root", "worlds"}
+    seed_audit_fields = {"all_four_classes_disjoint", "avoid_count", "avoid_sha256",
+                         "historical_retained", "historical_sha256", "new_distinct_seeds"}
+    identity_fields = {"base", "head", "seed", "steps", "base_exit", "identical",
+                       "base_sha256", "head_sha256", "elapsed_seconds", "head_artifact"}
+
+    def metadata_keys(obj):
+        """Resolve the few field names whose emitted metadata role is contextual."""
+        keys = set(metadata_fields)
+        schema = obj.get("schema")
+        if schema in ("finfolk.redqueen.noisebank-reservations/1",
+                      "finfolk.invasion.gate-protocol/1", *metadata_schemas) or status_fields <= obj.keys():
+            keys.add("worlds")  # world labels / construction descriptions
+        # The registry audit has a world COUNT, not a reservation collection.
+        if {"registry_sha256", "registry_avoid_loader_count", "reserved_seeds", "ok"} <= obj.keys():
+            keys.add("worlds")
+        return keys
 
     def walk(obj, found, where, hint=False, strict=False, group_labels=False,
-             inventory=False, provenance=False):
+             inventory=False, provenance=False, metadata_tree=False, world_labels=False):
+        if inventory and not hint and not group_labels and not provenance:
+            metadata_tree = world_labels = False
         if inventory and not hint and not group_labels and not provenance and not isinstance(obj, list):
             if not isinstance(obj, dict):
                 fail("inventory containers must be arrays or objects, not metadata scalars", where)
@@ -250,6 +293,10 @@ def load_reservations(path):
                 found.update(document(obj, where))
             return
         if isinstance(obj, dict):
+            known_metadata = metadata_keys(obj)
+            report = obj.get("schema") in tuple(metadata_schemas) or status_fields <= obj.keys()
+            metadata_tree |= report
+            world_labels |= report
             archive = obj.get("schema") == "finfolk.invasion.archived-seeds/1"
             if archive:
                 entries = obj.get("all")
@@ -264,13 +311,17 @@ def load_reservations(path):
                 labels = group_labels or label in ("groups", "seed_slot")
                 seed_value = seed_hint and not metadata and not labels
                 walk(value, found, f"{where}.{key}", hint or seed_hint,
-                     strict or seed_value, labels, label in inventory_fields,
-                     provenance or (archive and key == "all"))
+                     strict or seed_value, labels,
+                     label in inventory_fields and label not in known_metadata
+                     and not (world_labels and label == "worlds"),
+                     provenance or (archive and key == "all"),
+                     metadata_tree or label in known_metadata,
+                     world_labels or label == "args")
         elif isinstance(obj, list):
             consumed = argv_seeds(obj, found, where)
-            # A seed container retains the old conservative integer traversal;
-            # ordinary object collections are independent inventory records.
-            records = (not hint and not group_labels and not provenance
+            # Only known metadata collections bypass per-record admission.
+            # An actual inventory starts each record with a fresh context/set.
+            records = (not hint and not group_labels and not provenance and not metadata_tree
                        and (inventory or any(isinstance(v, (dict, list)) for v in obj)))
             if records and not consumed:
                 found.update(document(obj, where, flat=inventory))
@@ -281,7 +332,8 @@ def load_reservations(path):
                             found.update(document(value, f"{where} record[{index + 1}]", flat=inventory))
                         else:
                             walk(value, found, f"{where}[{index + 1}]", hint, strict,
-                                 group_labels, provenance=provenance)
+                                 group_labels, provenance=provenance, metadata_tree=metadata_tree,
+                                 world_labels=world_labels)
         elif type(obj) is int:
             if hint:
                 if obj < 0:
@@ -306,11 +358,21 @@ def load_reservations(path):
             found.add(doc)
         elif isinstance(doc, dict):
             labels = {key.lower() for key in doc}
+            legacy = bool(labels & {"slot_seed", "donor_seed", "pred_seed"})
             record = bool(labels & record_fields)
+            known_metadata = metadata_keys(doc)
+            if legacy and any(key.lower() in {"slot_seed", "donor_seed", "pred_seed", "reseed"}
+                              and value is not None and type(value) is not int
+                              for key, value in doc.items()):
+                fail("legacy plan seeds must be integers or null; ambiguous with inventory labels", where)
+            if legacy and any(key.lower() == "id" and not isinstance(value, str)
+                              for key, value in doc.items()):
+                fail("legacy plan id must be a string; ambiguous with a flat inventory label", where)
             # Discriminators cannot double as arbitrary flat-inventory labels.
             # Check before shape classification, including dictionary records.
             for key, value in doc.items():
-                if key.lower() in inventory_fields and not isinstance(value, (dict, list)):
+                if (key.lower() in inventory_fields and key.lower() not in known_metadata
+                        and not isinstance(value, (dict, list))):
                     fail("inventory containers must be arrays or objects, not metadata scalars", f"{where}.{key}")
             if "schema" in doc and not isinstance(doc["schema"], str):
                 fail("schema must be a string, not a flat-inventory label", f"{where}.schema")
@@ -324,8 +386,21 @@ def load_reservations(path):
                 # explicit wrappers or schema-bearing structured documents.
                 scalar = all(not isinstance(v, (dict, list)) for v in doc.values())
                 if scalar and "schema" not in doc:
+                    allowed = scalar_metadata | (legacy_metadata if legacy else set())
+                    if "seed" in labels or "reserved_seeds" in labels:
+                        allowed |= world_metadata
+                    if seed_audit_fields <= labels:
+                        allowed |= seed_audit_fields
+                    if identity_fields <= labels:
+                        allowed |= identity_fields
+                    # Named parameter records and analysis rows identify a run
+                    # with strings, unlike an arbitrary mixed scalar inventory.
+                    if ("seed" in labels and (isinstance(doc.get("name"), str)
+                            or (isinstance(doc.get("run"), str)
+                                and isinstance(doc.get("config"), str)))):
+                        allowed |= labels
                     unknown = [key for key in doc if "seed" not in key.lower()
-                               and key.lower() not in scalar_metadata]
+                               and key.lower() not in allowed]
                     if not any("seed" in label for label in labels) or unknown:
                         fail("ambiguous or unsupported scalar reservation map", where)
                 walk(doc, found, where)

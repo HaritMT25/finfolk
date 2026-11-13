@@ -1818,6 +1818,136 @@ class TestPlanV2(unittest.TestCase):
 
 class TestReservations(unittest.TestCase):
 
+    def test_real_reservation_layouts_exact_sets(self):
+        """Synthetic seeds in the unchanged audited files' actual field layouts."""
+        receipt = {'path': 'old.json', 'sha256': 'a' * 64, 'seeds': 2}
+        legacy = {'id': 'c1', 'slot_seed': 101, 'donor_seed': 102,
+                  'pred_seed': None, 'reseed': 103}
+        cases = (
+            ('worlds', {'schema': 'finfolk.redqueen.worlds/1',
+                        'avoid': [receipt, {'path': 'older.json', 'sha256': 'b' * 64}],
+                        'per_block': [{'A': 2, 'B': 2, 'C': 4}],
+                        'block_allocations': {'1': {'A': 2, 'B': 2, 'C': 4}},
+                        'reserved': [{'block': 1, 'slot': 'b1.C.k0', 'seeds': [101, 102]}],
+                        'worlds': [{'id': 'w01', 'founder_seed': 101, 'seed_rederived': 0,
+                                    'seed_slot': 'b1.C.k0', 'config_args': ['--seed', '101']}]},
+             {0, 2, 101, 102}),
+            ('registry.verify', {'avoid': [receipt], 'worlds': 64, 'ok': True,
+                                 'registry_sha256': 'c' * 64, 'registry_avoid_loader_count': 583,
+                                 'reserved_seeds': 576, 'block_order': [['w01', 'w02']]},
+             {2, 576}),
+            ('confirm1', {'schema': 'finfolk.invasion.confirm-seeds/1',
+                          'avoid': [{'path': 'plan.jsonl', 'sha256': 'a' * 64}],
+                          'cells': [dict(legacy, assay='off', h=1, i=2, j=3, r=0)],
+                          'home_seeds_used': [104], 'collisions': []}, {101, 102, 103, 104}),
+            ('noisebank', {'schema': 'finfolk.redqueen.noisebank-reservations/1',
+                           'seed_namespace': 'synthetic', 'seeds': [101, 102],
+                           'worlds': ['w01', 'w02']}, {101, 102}),
+            ('seed_inventory', {'schema': 'finfolk.redqueen.seed-inventory/1',
+                                'containers': [{'path': 'old.json', 'sha256': 'a' * 64,
+                                                'loader_error': 'unsupported'}],
+                                'sources': [{'path': 'a.json', 'loader_count': None,
+                                             'missed': [999], 'seeds': [101, 102]},
+                                            {'path': 'b.json', 'loader_error': 'empty'}]}, {101, 102}),
+            ('template', {'avoided': [{'path': 'old.json', 'sha256': 'a' * 64}],
+                          'seed_namespace': 'synthetic', 'seeds': [101, 102]}, {101, 102}),
+            ('validation_arena', {'avoid': [receipt], 'namespace': 'synthetic',
+                                  'worlds': {'w01': {'treatment': 'C', 'block': 1,
+                                                     'sentinel': False, 'total_steps': 999,
+                                                     'reserved_seeds': [101, 102]}}}, {2, 101, 102}),
+            ('input_sources', {'ages': [{'path': 'a.json', 'sha256': 'a' * 64},
+                                        {'path': 'b.json', 'sha256': 'b' * 64, 'seeds': [101, 102]}]},
+             {101, 102}),
+            ('legacy_plan', legacy, {101, 102, 103}),
+            ('wrapped_legacy_plan', {'worlds': legacy}, {101, 102, 103}),
+            ('legacy_plan_records', {'records': [legacy]}, {101, 102, 103}),
+            ('legacy_self', dict(legacy, donor_seed=None, pred_seed=104), {101, 103, 104}),
+            ('named_parameters', {'name': 'synthetic', 'seed': 101, 'age': 102,
+                                   'rate': 0.5, 'baseline': False}, {101}),
+            ('named_analysis', {'run': 'synthetic', 'config': 'config.json',
+                                 'seed': 101, 'measurement': 0.5}, {101}),
+            ('restart', {'world': 'w01', 'treatment': 'C', 'attempt': 2,
+                          'seed': 101, 'extinct_row': 999, 'guild': 'synthetic',
+                          'utc': '2026-01-01T00:00:00Z'}, {101}),
+            ('seed_check', {'all_four_classes_disjoint': True, 'avoid_count': 999,
+                             'avoid_sha256': 'a' * 64, 'historical_retained': True,
+                             'historical_sha256': 'b' * 64, 'new_distinct_seeds': 101}, {101}),
+            ('identity_check', {'base': 'old', 'head': 'new', 'seed': 101, 'steps': 102,
+                                'base_exit': 0, 'identical': True, 'base_sha256': 'a' * 64,
+                                'head_sha256': 'a' * 64, 'elapsed_seconds': 0.5,
+                                'head_artifact': 'checkpoint.json'}, {101}),
+        )
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / 'inventory.json'
+            for name, obj, expected in cases:
+                p.write_text(json.dumps(obj))
+                for loader in (worlds.read_avoid, plan.avoid_seeds, nb.avoid_seeds):
+                    with self.subTest(layout=name, loader=loader.__module__):
+                        self.assertEqual(loader(p), expected)
+                self.assertEqual(rqlib.load_reservations(p)[0], expected)
+
+    def test_structural_metadata_collections_preserve_only_seed_leaves(self):
+        cases = (
+            {'schema': 'finfolk.predc.transplant/2', 'predators': {'seed': 101,
+             'picked': [{'id': 102, 'lineageId': 103, 'generation': 104, 'genomeLength': 105}]},
+             'configChanges': [{'key': 'count', 'from': '6', 'to': '0'}]},
+            {'seed': 101, 'options': {'a': {'candidates': [{'rank': 102, 'lambda': 0.5}, {}]}}},
+            {'seed': 101, 'segments': [{'frame': 102}, {}], 'results': [{'steps': 103}]},
+            {'seed': 101, 'args': {'worlds': 'w01,w02'},
+             'protocol': {'schema': 'finfolk.invasion.gate-protocol/1',
+                          'worlds': {'E': 'description'}, 'acceptance': [{'rule': 'synthetic'}]},
+             'schedule': [[102, 103]]},
+            {'schema': 'finfolk.redqueen.recoveryextra.result/1', 'seed': 101,
+             'options': {'fit': {'worlds': 102, 'forward_transfer': {'worlds': 103}}}},
+            {'schema': 'finfolk.redqueen.noisebank.bank/2', 'estimator': {'seed': 101},
+             'generator_noise': {'SigmaD': [[0.5, 0.0], [0.0, 0.5]]},
+             'horizons': {'10': {'worlds': ['w01'], 'components': {'SigmaE': [[0.5]]}}}},
+            {'archive_root': 'archive', 'root': 'run', 'counts': {'done': 1},
+             'availability': [{'frame': 102}], 'burn_in': {'per_treatment': {'C': {'worlds': 103}}},
+             'worlds': {'w01': {'status': 'done', 'attempt': 104}}, 'seed': 101},
+        )
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / 'inventory'
+            for obj in cases:
+                p.write_text(json.dumps(obj))
+                for loader in (worlds.read_avoid, plan.avoid_seeds, nb.avoid_seeds):
+                    with self.subTest(obj=obj, loader=loader.__module__):
+                        self.assertEqual(loader(p), {101})
+            # Metadata traversal must still discover and validate real seeds/argv.
+            for obj, expected in (
+                    ({'seed': 101, 'avoid': [{'path': 'x', 'seeds': 102}, {}]}, {101, 102}),
+                    ({'seed': 101, 'picked': [{'argv': ['--seed', '102']}, {}]}, {101, 102}),
+                    ({'seed': 101, 'sources': [{'records': [{'seed': 102}]}]}, {101, 102})):
+                p.write_text(json.dumps(obj))
+                self.assertEqual(rqlib.load_reservations(p)[0], expected)
+
+    def test_metadata_roles_cannot_mask_invalid_inventory_or_ambiguous_plan(self):
+        cases = (
+            {'seed': 101, 'sources': [{'records': [{'seed': 102}, {}]}]},
+            {'seed': 101, 'avoid': [{'seeds': '102', 'path': 'x'}]},
+            {'seed': 101, 'picked': [{'argv': ['--seed', '4294967296']}]},
+            {'seed': 101, 'records': [{'path': 'x', 'sha256': 'a' * 64}]},
+            {'id': 104, 'slot_seed': 101, 'donor_seed': 102, 'reseed': 103},
+            {'ID': 104, 'SLOT_SEED': 101, 'DONOR_SEED': 102, 'reseed': 103},
+            {'worlds': {'slot_seed': {'seed': 101}, 'w02': {'w02': '102'}}},
+            {'records': {'donor_seed': {'seed': 101}, 'w02': {}}},
+            {'id': 'c1', 'slot_seed': 101, 'donor_seed': '102', 'reseed': 103},
+            {'id': 'c1', 'slot_seed': 101, 'w02': 102},
+            {'schema': 'finfolk.redqueen.recoveryextra.result/1', 'seed': 101,
+             'records': [{'seed': 102}, {}]},
+        )
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / 'inventory'
+            for obj in cases:
+                for raw in (json.dumps(obj), '{"seed":101}\n' + json.dumps(obj)):
+                    p.write_text(raw)
+                    for loader, error in ((worlds.read_avoid, worlds.WorldsError),
+                                          (plan.avoid_seeds, plan.DesignError),
+                                          (nb.avoid_seeds, nb.NoiseBankError)):
+                        with self.subTest(obj=obj, loader=loader.__module__):
+                            with self.assertRaisesRegex(error, str(p)):
+                                loader(p)
+
     def test_canonical_registry_and_plan_seed_sets(self):
         """Canonical slot/group labels are not seeds; pin the old integer-only extraction."""
         from test_worlds import ARENA
