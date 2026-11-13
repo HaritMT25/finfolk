@@ -407,6 +407,8 @@ section("Classic's setup sheet through web/renderer.js: built, the keyboard's ke
     ok(P.D.errors.length === 0, "no listener threw", P.D.errors.slice(0, 2));
   }
   const Q = bootClassic({ "evo_boids.tab": "food" });
+  /* (the review of b442a92: a start-up that threw only with a stored tab skipped the check below and left the suite green) */
+  ok(!Q.threw, "renderer.js runs with a stored tab (food) too", Q.threw && String(Q.threw.stack || Q.threw).split("\n").slice(0, 4));
   if (!Q.threw) {
     const tabs = Q.el("tabs").children.filter((b) => b.getAttribute("role") === "tab");
     ok(tabs.filter((b) => b.getAttribute("aria-selected") === "true").map((b) => b.id).join() === "tab-food" &&
