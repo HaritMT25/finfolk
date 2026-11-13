@@ -4,6 +4,7 @@
 #include <vector>
 #include <cmath>
 #include <algorithm>
+#include <bit>
 #include "sensors_actions.hpp"
 #include "portable_math.hpp"
 #include "random.hpp"
@@ -114,6 +115,18 @@ struct NeuralNet {
     };
     static_assert(sizeof(FlatConn) == 4, "flat connection must stay 4 bytes");
     std::vector<FlatConn> flat;
+
+    // Gene-type bit masks: bit i of srcTypeBits / sinkTypeBits is gene i's
+    // sourceType / sinkType, for genes 0..127 (two 64-bit words each), written
+    // by buildNeuralNet from the genome in GENOME order (not flat's). They let
+    // genomeSimilarityMasked count the positional type matches with a popcount
+    // over the net's own bytes instead of a loop over both genomes' heap
+    // buffers: the same integer count, so the same float. Derived state, like
+    // the rest of the net: rebuilt wherever the net is (birth, checkpoint load),
+    // never serialized. Genes past 127 are not covered (no configurable genome
+    // is that long today); the masked compare falls back to the loop.
+    uint64_t srcTypeBits[2]  = {0, 0};
+    uint64_t sinkTypeBits[2] = {0, 0};
 };
 
 // Decode a wired connection back into Gene form (post-remapping, i.e. the
@@ -176,6 +189,15 @@ inline void buildNeuralNet(const Genome& genome, NeuralNet& nnet) {
     for (const Gene& gene : genome) {
         const int sink = sinkIndex(gene);
         if (sink >= NUM_ACTIONS) nnet.neurons[sink - NUM_ACTIONS].driven = true;
+    }
+
+    // The gene-type masks (see NeuralNet): genome order, genes 0..127.
+    nnet.srcTypeBits[0] = nnet.srcTypeBits[1] = 0;
+    nnet.sinkTypeBits[0] = nnet.sinkTypeBits[1] = 0;
+    for (size_t i = 0; i < genome.size() && i < 128; ++i) {
+        const uint64_t bit = 1ull << (i & 63);
+        if (genome[i].sourceType) nnet.srcTypeBits[i >> 6]  |= bit;
+        if (genome[i].sinkType)   nnet.sinkTypeBits[i >> 6] |= bit;
     }
 
     // Stable counting sort by sink slot. Stability is what preserves
@@ -344,5 +366,26 @@ inline float genomeSimilarity(const Genome& g1, const Genome& g2) {
         matches += (g1[i].sourceType == g2[i].sourceType) &
                    (g1[i].sinkType == g2[i].sinkType);
     }
+    return static_cast<float>(matches) / static_cast<float>(minLen);
+}
+
+// genomeSimilarity, from the nets' gene-type masks (NeuralNet::srcTypeBits /
+// sinkTypeBits, built by buildNeuralNet from these same genomes): a gene slot
+// matches when both type bits agree, ~(a ^ b) is set exactly there, and the
+// popcount over the first minLen slots is genomeSimilarity's `matches`, so the
+// quotient is its float bit for bit. Genomes longer than the masks cover take
+// the loop. For the hot per-step compare (the nearest neighbour); the nets
+// must be the ones built from g1 and g2.
+inline float genomeSimilarityMasked(const Genome& g1, const NeuralNet& n1,
+                                    const Genome& g2, const NeuralNet& n2) {
+    const size_t minLen = std::min(g1.size(), g2.size());
+    if (minLen == 0) return 0.0f;
+    if (minLen > 128) return genomeSimilarity(g1, g2);
+    const uint64_t m0 = ~(n1.srcTypeBits[0] ^ n2.srcTypeBits[0]) & ~(n1.sinkTypeBits[0] ^ n2.sinkTypeBits[0]);
+    const uint64_t m1 = ~(n1.srcTypeBits[1] ^ n2.srcTypeBits[1]) & ~(n1.sinkTypeBits[1] ^ n2.sinkTypeBits[1]);
+    const uint64_t lo = (minLen >= 64) ? ~0ull : ((1ull << minLen) - 1ull);
+    const uint64_t hi = (minLen <= 64) ? 0ull
+                      : (minLen >= 128) ? ~0ull : ((1ull << (minLen - 64)) - 1ull);
+    const int matches = std::popcount(m0 & lo) + std::popcount(m1 & hi);
     return static_cast<float>(matches) / static_cast<float>(minLen);
 }

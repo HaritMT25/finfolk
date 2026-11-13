@@ -728,14 +728,70 @@
     return { geo: geo, mat: mat, mar: mar };
   }
 
+  /* ---------------- a fish's decoded constants (the render optimization's cache) ----------------
+   * A fish's genes never change under its id, yet the vertex stage fetched all 16 gene texels and ran mDecode (the 30
+   * shape genes -> the body plan) and, in Appearance colour, patternDecode (the 33 pattern floats -> ten flat vec4s) in
+   * EVERY vertex of every draw. The renderer decodes them once, when the fish is born (CPU: morphDecode and
+   * patternVaryings above, the line-for-line mirrors of those GLSL functions, with their float32 constants), into 18
+   * RGBA32F texels in a second texture at the fish's gene slot (the slot store's onInstall):
+   *   texels 0 .. 7   the 32 body-plan values (DECODED_MORPH_FIELDS, four to a texel, Morph's order): mLoad
+   *   texels 8 .. 15  the pattern's vG0 .. vG7;  16: vAux.xyz;  17: vMeta.xy   (the pattern floats: loadPattern)
+   * and the shaders read them: mLoad in the vertex stage (body, barbels, shadow), loadPattern in the fragment stage
+   * (the Appearance skin only: Family / Brain colours read none). Not stored: lambda (Morph.lam, vAux.w), which comes from
+   * the fish's current size, length and radius every frame. 32 slots a texture row, 18 texels a slot: 576 texels wide.
+   * writeDecoded(row, out, slot): the row's 63 floats -> out[72 * slot ..] (out is a Float32Array: its assignment is
+   * the float32 rounding); the GLSL (GLSL.DECODED_READ / _MORPH / _PATTERN) is made from the same field list. */
+  var DECODED_MORPH_FIELDS = ["depth", "width", "n", "fexp", "sh", "hbulk", "sn", "nexp", "ped", "outline", "AR", "cA", "span", "cx", "dH", "dL",
+                              "dS", "dSplit", "aH", "aL", "aS", "pA", "pT", "pSweep", "pDih", "vA", "vT", "vSweep", "bD", "bReach", "bBeta", "eye"];
+  var DECODED_TEXELS = 18, DECODED_FLOATS = 4 * DECODED_TEXELS, DECODED_ROW_SLOTS = 32, DECODED_WIDTH = DECODED_TEXELS * DECODED_ROW_SLOTS;
+  /** @param {ArrayLike<number>} row @param {Float32Array} out @param {number} slot */
+  function writeDecoded(row, out, slot) {
+    var M = morphDecode(row, 1), P = patternVaryings(row, 1), o = slot * DECODED_FLOATS, j, k;
+    for (j = 0; j < 32; j++) out[o + j] = M[DECODED_MORPH_FIELDS[j]];
+    for (k = 0; k < 8; k++) { var v = P["vG" + k]; out[o + 32 + 4 * k] = v[0]; out[o + 33 + 4 * k] = v[1]; out[o + 34 + 4 * k] = v[2]; out[o + 35 + 4 * k] = v[3]; }
+    out[o + 64] = P.vAux[0]; out[o + 65] = P.vAux[1]; out[o + 66] = P.vAux[2]; out[o + 67] = 0;
+    out[o + 68] = P.vMeta[0]; out[o + 69] = P.vMeta[1]; out[o + 70] = 0; out[o + 71] = 0;
+  }
+  /* the vertex stage's and fragment stage's readers (GLSL), from the layout above */
+  var DECODED_READ = [
+    "uniform highp sampler2D uDecoded;",
+    "vec4 decodedTexel(int slot, int k) {",
+    "  return texelFetch(uDecoded, ivec2(" + DECODED_TEXELS + " * (slot % " + DECODED_ROW_SLOTS + ") + k, slot / " + DECODED_ROW_SLOTS + "), 0);",
+    "}"
+  ].join("\n");
+  var DECODED_MORPH = (function () {
+    var L = ["Morph mLoad(float lam) {", "  int s = appearanceSlot();"], t, j;
+    for (t = 0; t < 8; t++) L.push("  vec4 d" + t + " = decodedTexel(s, " + t + ");");
+    L.push("  Morph M;");
+    for (j = 0; j < 32; j++) L.push("  M." + DECODED_MORPH_FIELDS[j] + " = d" + (j >> 2) + "." + "xyzw".charAt(j & 3) + ";");
+    L.push("  M.lam = lam;", "  return M;", "}");
+    return L.join("\n");
+  })();
+  /* the pattern's globals (as VARY declares them, but not varyings: the fragment stage loads them per fragment from the
+   * fish's slot, which the vertex stage hands over in the flat varying vDecoded with lambda) */
+  var DECODED_PATTERN = [
+    "flat varying vec2 vDecoded;",
+    "vec4 vG0; vec4 vG1; vec4 vG2; vec4 vG3; vec4 vG4; vec4 vG5; vec4 vG6; vec4 vG7; vec4 vAux; vec4 vMeta;",
+    "void loadPattern(int slot, float lam) {",
+    "  vG0 = decodedTexel(slot, 8); vG1 = decodedTexel(slot, 9); vG2 = decodedTexel(slot, 10); vG3 = decodedTexel(slot, 11);",
+    "  vG4 = decodedTexel(slot, 12); vG5 = decodedTexel(slot, 13); vG6 = decodedTexel(slot, 14); vG7 = decodedTexel(slot, 15);",
+    "  vec4 aux = decodedTexel(slot, 16);",
+    "  vAux = vec4(aux.xyz, lam);",
+    "  vMeta = decodedTexel(slot, 17);",
+    "}"
+  ].join("\n");
+
   window.EvoAppearance = {
     LAWS: LAWS, NG: NG, MO: MO, NM: NM, STRIDE: STRIDE,
     /* the paired fins' span law's constant (mBuild: span = area / (chord PHI_I)),
      * for the renderer's fin pose (web/ocean_scene.js finPose: the fold keeps the root) */
     PHI_I: PHI_I,
-    GLSL: { COMMON: COMMON, VARY: VARY, DECODE: DECODE, SKIN: SKIN, GENES: GENES, MORPH: MORPH },
+    GLSL: { COMMON: COMMON, VARY: VARY, DECODE: DECODE, SKIN: SKIN, GENES: GENES, MORPH: MORPH,
+            DECODED_READ: DECODED_READ, DECODED_MORPH: DECODED_MORPH, DECODED_PATTERN: DECODED_PATTERN },
     LODS: LODS, buildTemplate: buildTemplate, buildBarbels: buildBarbels,
     decode: decode, flankAt: flankAt, flankImage: flankImage, lambdaOf: lambdaOf,
-    patternVaryings: patternVaryings, morphDecode: morphDecode, morphBuild: morphBuild
+    patternVaryings: patternVaryings, morphDecode: morphDecode, morphBuild: morphBuild,
+    DECODED_MORPH_FIELDS: DECODED_MORPH_FIELDS, DECODED_TEXELS: DECODED_TEXELS, DECODED_FLOATS: DECODED_FLOATS,
+    DECODED_ROW_SLOTS: DECODED_ROW_SLOTS, DECODED_WIDTH: DECODED_WIDTH, writeDecoded: writeDecoded
   };
 })();

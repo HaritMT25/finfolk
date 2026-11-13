@@ -62,6 +62,13 @@
  *       any full upload due stay)
  *   slotOf(id), stats(), and the storage itself: data (capacity x 64 floats),
  *       capacity.
+ * Owner hooks (opts.onGrow / onReset / onRelease / onInstall; none given: nothing is called): the render
+ * caches that are keyed by slot (the LOD's hysteresis, the decoded gene constants of render-LOD PR) are kept
+ * in step with the owners here and nowhere else: onInstall(slot, data, offset, id) once per new owner, after its
+ * row and padding were written (never for a fish that stays, nor on a reordered or repeated snapshot),
+ * onRelease(slot) when its slot is freed, onReset(epoch) when every owner is forgotten (a new epoch, invalidate),
+ * onGrow(capacity) after the storage grew (the survivors' data kept). They run inside prepare(), must not throw
+ * and must not call the store.
  * Pure JS (no WebGL): node's tests/ocean_appearance_slots_tests.cjs. Display
  * only: the simulation never reads any of it. */
 (function (root) {
@@ -76,6 +83,8 @@
     if (STRIDE > SLOT_FLOATS) throw new Error("a row of " + STRIDE + " floats does not fit a 64-float slot");
     var BARB = opts.barbelGene === undefined ? -1 : opts.barbelGene, BARB_MIN = opts.barbelMin === undefined ? 0.2 : opts.barbelMin;
     var maxCap = Math.min(MAX_CAP, opts.maxCapacity || MAX_CAP), MAX_RANGES = opts.maxRanges || 32;
+    /* the owner hooks (render caches keyed by slot): absent, nothing is called */
+    var onGrow = opts.onGrow, onReset = opts.onReset, onRelease = opts.onRelease, onInstall = opts.onInstall;
 
     var S = /** @type {SlotStore} (its methods are added below) */ ({
       epoch: undefined, capacity: 0, data: new Float32Array(0),
@@ -122,6 +131,7 @@
       if (dirty[s]) { dirty[s] = 0; S.dirtyCount--; }   /* its upload is not needed any more */
       freePush(s);
       S.size--;
+      if (onRelease) onRelease(s);
     }
     function capFor(need) { var cap = Math.max(MIN_CAP, S.capacity); while (cap < need) cap *= 2; return cap; }
     function grow(need) {
@@ -134,6 +144,7 @@
       slotId = grown(slotId, cap); owned = grown(owned, cap); mark = grown(mark, cap);
       barb = grown(barb, cap); dirty = grown(dirty, cap); wtime = grown(wtime, cap); free = grown(free, cap);
       S.capacity = cap; S.needFull = true; S.allocs++;
+      if (onGrow) onGrow(cap);
       return true;
     }
     function resetOwnership(epoch) {
@@ -142,6 +153,7 @@
       owned.fill(0); barb.fill(0); dirty.fill(0);
       S.dirtyCount = 0; S.size = 0; S.nextSlot = 0; freeN = 0; barbCount = 0;
       outStale = true;   /* every outSlots entry is to be written again */
+      if (onReset) onReset(epoch);
     }
     function fail(why) {
       res.ok = false; res.error = why; outStale = true;
@@ -191,6 +203,7 @@
         var o = s * SLOT_FLOATS, r = c * STRIDE;
         for (var j = 0; j < STRIDE; j++) D[o + j] = rows[r + j];
         for (j = STRIDE; j < SLOT_FLOATS; j++) D[o + j] = 0;   /* +0: the padding */
+        if (onInstall) onInstall(s, D, o, id);
         var b = BARB >= 0 && rows[r + BARB] > BARB_MIN ? 1 : 0;
         barb[s] = b; barbCount += b;
         setDirty(s);
@@ -254,6 +267,8 @@
     S.invalidate = function () { resetOwnership(undefined); S.epoch = {}; };   /* (an epoch no snapshot has: the next one installs all) */
     if (/** @type {number} (undefined: not > 0) */ (opts.initialCapacity) > 0) grow(opts.initialCapacity);
     S.slotOf = function (id) { var s = byId.get(id); return s === undefined ? -1 : s; };
+    /* every owner, in slot order: fn(slot, data, offset, id) (a render cache made after the owners were: the decoded constants' backfill) */
+    S.eachOwner = function (fn) { for (var s = 0; s < S.nextSlot; s++) if (owned[s]) fn(s, S.data, s * SLOT_FLOATS, slotId[s]); };
     S.isDirty = function (s) { return !!dirty[s]; };
     S.stats = function () {
       return { epoch: S.epoch, capacity: S.capacity, owners: S.size, nextSlot: S.nextSlot, free: freeN, dirty: S.dirtyCount,

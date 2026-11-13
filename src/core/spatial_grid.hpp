@@ -176,6 +176,33 @@ public:
         }
     }
 
+    // Every entry of the cell rectangle covering the disk, in scan order, hit
+    // or not: f(index, dx, dy, d2, hit) with dx, dy the entry's STORED position
+    // minus the centre, d2 = dx * dx + dy * dy and hit = (d2 <= r2), the very
+    // test and expressions queryRadius / forEachInRadius apply, so the hits, in
+    // order, are exactly their result and a caller that acts on `hit` without
+    // branching (a count, a gated minimum) sees what it would have seen from
+    // them. Bounded world only (the wrapped queries shift the centre per image).
+    template <class F>
+    void forEachCandidate(Vec2 center, float radius, F&& f) const {
+        const float r2 = radius * radius;
+        const int minCx = clampCol(static_cast<int>((center.x - radius) * invCell_));
+        const int maxCx = clampCol(static_cast<int>((center.x + radius) * invCell_));
+        const int minCy = clampRow(static_cast<int>((center.y - radius) * invCell_));
+        const int maxCy = clampRow(static_cast<int>((center.y + radius) * invCell_));
+        for (int cy = minCy; cy <= maxCy; ++cy) {
+            const std::size_t rowBase = static_cast<std::size_t>(cy) * cols_;
+            const Entry* e   = entries_.data() + start_[rowBase + minCx];
+            const Entry* end = entries_.data() + start_[rowBase + maxCx + 1];
+            for (; e != end; ++e) {
+                const float dx = e->pos.x - center.x;
+                const float dy = e->pos.y - center.y;
+                const float d2 = dx * dx + dy * dy;
+                f(e->index, dx, dy, d2, d2 <= r2);
+            }
+        }
+    }
+
     // How many indices queryRadius / queryRadiusWrapped would return.
     int countRadius(Vec2 center, float radius) const {
         int n = 0;

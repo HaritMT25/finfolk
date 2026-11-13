@@ -320,6 +320,14 @@ interface SlotStoreOptions {
   /** most texSubImage2D ranges in one plan (32) */
   maxRanges?: number;
   initialCapacity?: number;
+  /** the owner hooks (render-only caches keyed by slot; none: the store behaves as before). They run inside prepare() and
+   * must not throw or call the store: onGrow(capacity) after the storage grew (the old data kept), onReset(epoch) when
+   * every owner is forgotten, onRelease(slot) when an owner's slot is freed, onInstall(slot, data, offset, id) after a new
+   * owner's row (63 floats and the zero padding) was written at data[offset ..] */
+  onGrow?: (capacity: number) => void;
+  onReset?: (epoch: unknown) => void;
+  onRelease?: (slot: number) => void;
+  onInstall?: (slot: number, data: Float32Array, offset: number, id: number) => void;
 }
 /** prepare()'s answer: one object, reused (copy what you keep) */
 interface SlotPrepareResult {
@@ -374,6 +382,8 @@ interface SlotStore {
   resetOwnership(epoch: unknown): void;
   invalidate(): void;
   slotOf(id: number): number;
+  /** every owner in slot order: fn(slot, data, offset, id) */
+  eachOwner(fn: (slot: number, data: Float32Array, offset: number, id: number) => void): void;
   isDirty(s: number): boolean;
   stats(): SlotStats;
 }
@@ -612,7 +622,16 @@ interface EvoAppearanceApi {
   NM: number;
   STRIDE: number;
   PHI_I: number;
-  GLSL: { COMMON: string; VARY: string; DECODE: string; SKIN: string; GENES: string; MORPH: string };
+  GLSL: { COMMON: string; VARY: string; DECODE: string; SKIN: string; GENES: string; MORPH: string;
+          DECODED_READ: string; DECODED_MORPH: string; DECODED_PATTERN: string };
+  /** a fish's decoded constants (the render optimization's cache): the body-plan fields in their texel order, 18 texels /
+   * 72 floats a slot, 32 slots a texture row (576 texels wide); writeDecoded(row, out, slot) decodes a row into out[72 * slot ..] */
+  DECODED_MORPH_FIELDS: string[];
+  DECODED_TEXELS: number;
+  DECODED_FLOATS: number;
+  DECODED_ROW_SLOTS: number;
+  DECODED_WIDTH: number;
+  writeDecoded(row: ArrayLike<number>, out: Float32Array, slot: number): void;
   LODS: Record<string, AppearanceLod>;
   buildTemplate(lodName: string): any;
   buildBarbels(lodName: string): any;
@@ -718,6 +737,9 @@ interface EvoOceanShadersApi {
   /** the swim polish's two features (plain is neither), and its spec in a mode (to register elsewhere) */
   POLISH: { readonly lite: string; readonly full: string };
   polishFeature(mode: "lite" | "full"): ShaderFeatureSpec;
+  /** the render optimization's decoded constants (feature id "render.decoded"; decodedFeature() its spec, for a fresh assembler) */
+  DECODED: string;
+  decodedFeature(): ShaderFeatureSpec;
 }
 
 /** A named slot in a fish program's parts (EvoOceanShaders.slot). */
@@ -836,10 +858,13 @@ interface MaterialSetSpec {
   attach?: { face?: MaterialAttach };
   uniforms?: { [kind: string]: { [name: string]: { value: any } } };
   claims?: { [kind: string]: { [component: string]: string } };
+  /** 1: the Look reads no raw gene or pattern varying in a vertex slot, so the scene's render features (the decoded cache) may run under it */
+  appearanceCache?: number;
 }
 /** A feature set, normalized (frozen), with its layouts by kind. */
 interface MaterialSet {
   readonly look: string;
+  readonly appearanceCache: boolean;
   readonly features: ((q: MaterialFeatureQuery) => string[]) | null;
   readonly attach: { face: MaterialAttach } | null;
   readonly uniforms: { [kind: string]: { [name: string]: { value: any } } } | null;
@@ -889,8 +914,12 @@ interface MaterialBinderDeps {
 }
 interface MaterialBinderState {
   look: string; version: number; pending: boolean; kinds: string[]; covered: string[]; materials: number;
+  /** the scene's render features in effect (setRender) */
+  render: string[];
   entries: { key: string; state: string; error: string }[]; failed: string[];
 }
+/** setRender's outcome: the activation's, and the render features in effect after it */
+interface MaterialRenderResult extends MaterialActivation { ids?: string[] }
 /** The scene's material binder (EvoOceanMaterials.create): web/ocean_materials.js says what each does. */
 interface MaterialBinder {
   define(kind: string, def: MaterialKindDef): void;
@@ -905,6 +934,10 @@ interface MaterialBinder {
   key(kind: string, pass: string, variant: number): string;
   programs(kind: string, pass: string, variant: number): { key: string; own: boolean; vs: string; fs: string; material: any };
   activate(spec: MaterialSetSpec | null): Promise<MaterialActivation>;
+  /** the scene's render features (feature ids, e.g. "render.decoded") for the appearance fish, compiled before they take effect */
+  setRender(ids: string[]): Promise<MaterialRenderResult>;
+  /** the render features in effect, whether they apply under the active Look, and whether a change is compiling */
+  render(): { ids: string[]; applies: boolean; pending: boolean };
   state(): MaterialBinderState;
 }
 interface EvoOceanMaterialsApi {
@@ -959,6 +992,8 @@ interface EvoOceanPoseApi {
   reachRadius(xs: ArrayLike<number>, ys: ArrayLike<number>, R: number, vz: number, lam: number, K: PoseReach): number;
   /** the body radius in CSS px at its nearest depth */
   posePx(xs: ArrayLike<number>, ys: ArrayLike<number>, R: number, y: number, G: PoseCamera): number;
+  /** false for a fish whose whole reach is behind the near plane or outside a side plane of the view (no size in it) */
+  poseVisible(xs: ArrayLike<number>, ys: ArrayLike<number>, R: number, y: number, G: PoseCamera, vz: number, lam: number, K: PoseReach): boolean;
   /** the size weight in 7 bits, 0 for a fish whose whole reach is out of view (px: posePx's, over 6) */
   poseVisibleQ(xs: ArrayLike<number>, ys: ArrayLike<number>, R: number, y: number, G: PoseCamera, vz: number, lam: number, K: PoseReach, px: number): number;
   /** the size weight in 7 bits (G.gate false: 127; G.zero: 0; K absent: REACH_APP) */
@@ -972,6 +1007,19 @@ interface EvoOceanPoseApi {
   unpackPose(p: number): number[];
   /** GLSL's smoothstep */
   smoothCPU(a: number, b: number, x: number): number;
+  /** the render optimization's body buckets (1 coarse, 2 medium), their thresholds (CSS px of body radius: up to
+   * medium from ENTER, back to coarse at EXIT or below) and the barbels' (gene above BARBEL_GENE_MIN, px) */
+  LOD_COARSE: number;
+  LOD_MEDIUM: number;
+  LOD_MEDIUM_ENTER_CSS: number;
+  LOD_MEDIUM_EXIT_CSS: number;
+  BARBEL_GENE_MIN: number;
+  BARBEL_ENTER_CSS: number;
+  BARBEL_EXIT_CSS: number;
+  /** a fish's body bucket from its projected radius, its last bucket (0 new), the detail and whether it is selected / hovered */
+  bodyLod(px: number, previous: number, quality: number, pinned: boolean): number;
+  /** whether a fish draws its barbels (gene bD, projected radius, drew them last frame, detail, its body bucket) */
+  barbelVisible(bD: number, px: number, previous: boolean, quality: number, lod: number): boolean;
 }
 
 /* ---------------- web/ocean_scene_parity.js (window.EvoOceanSceneParity) ---------------- */
@@ -1001,11 +1049,15 @@ interface ParityScene {
 interface ParityCheckOptions {
   colourBy?: number; polish?: FishVariant; mutate?: string; fsMutate?: string;
   slotMap?: "identity" | "permuted" | "sparse"; injectSweep?: boolean;
+  /** the render optimization's decoded programs (render.decoded) instead of the raw ones */
+  decoded?: boolean;
 }
 /** What the probes use of the scene's three.js renderer (its WebGL2 context untyped here, as the checks'
  * gl): their own render targets, three's state restored after, the shader-error hook. */
 interface ParityRenderer {
   getContext(): any;
+  /** three's per-object GPU state (the decoded texture's __webglTexture, read back by the probe) */
+  properties: { get(o: unknown): any };
   resetState(): void;
   getRenderTarget(): unknown;
   setRenderTarget(rt: unknown): void;
@@ -1029,6 +1081,10 @@ interface ParityAppKind {
   shaders: AppearancePrograms;
   mat: { uniforms: { uGenes: unknown } };
   mesh: { visible: boolean };
+  /** the appearance fish were drawn this frame: the canonical body draw, or (the render optimization) the body buckets */
+  drawing(): boolean;
+  /** the decoded cache (the render optimization): kept (live), asked for by the policy (wanted), uploaded (ready), and its three DataTexture */
+  decodedStats(): { live: boolean; wanted: boolean; ready: boolean; texture: any };
 }
 /** The scene's port for the probes (attach, once a scene): fixed parts and live getters, read at each
  * probe, never copied (web/ocean_scene_parity.js attach says what each is). */
@@ -1089,6 +1145,32 @@ interface EvoBodyPlanViewerApi {
   redraw(): void;
 }
 
+/* ---------------- the shared focus primitives: web/ui_common.js (window.EvoUI, both pages) ---------------- */
+
+/** a tablist's page side (EvoUI.tabs): the tabs' ids in order (asked each time), the selected one, a tab's
+ * element, and the page's own selection (its panel, charts, storage; it calls UiTabs.mark) */
+interface UiTabsOptions {
+  ids(): string[];
+  current(): string;
+  button(id: string): HTMLElement | null;
+  select(id: string): void;
+}
+/** mark(id): aria-selected and the roving tabindex on every tab; bind(button, id): a tab's press (select, then pointerBlur) */
+interface UiTabs { mark(id: string): void; bind(button: HTMLElement, id: string): void }
+/** set(opener): remember the keyboard's opener (null: a pointer opened it); restore(keyboard): forget it, and when the
+ * keyboard closed it, give it the focus back; returns the opener it had */
+interface UiReturnPoint { set(n: HTMLElement | null | undefined): void; get(): HTMLElement | null; restore(keyboard: boolean): HTMLElement | null }
+interface EvoUIApi {
+  keyboardFocused(n: Element | null | undefined): boolean;
+  pressedByKeyboard(n: Element | null | undefined, e?: { detail?: number } | null): boolean;
+  pointerBlur(n: Element | null | undefined): void;
+  typingIn(t: EventTarget | null | undefined): boolean;
+  ownsKey(t: EventTarget | null | undefined, key: string): boolean;
+  tabIndexFor(key: string, i: number, n: number): number;
+  tabs(list: HTMLElement, o: UiTabsOptions): UiTabs;
+  returnPoint(): UiReturnPoint;
+}
+
 /* ---------------- not checked yet: declared by what checked files use ---------------- */
 
 /** the scene (web/ocean_scene.js create()): what the benchmark and the page's API use of it */
@@ -1124,6 +1206,7 @@ interface OceanPageApi {
 /** the published asset names (ocean.html's EVO_ASSETS; build_site.sh rewrites them to content-hashed ones) */
 interface EvoAssets { ocean?: string; oceanWasm?: string; worker?: string; handoff?: string; mock?: string; three?: string; bodyplan?: string; fixture?: string; [name: string]: string | undefined }
 
+declare var EvoUI: EvoUIApi;
 declare var EvoOceanHandoff: EvoOceanHandoffApi;
 declare var EvoAppearanceSlots: EvoAppearanceSlotsApi;
 declare var EvoOceanPerf: EvoOceanPerfApi;

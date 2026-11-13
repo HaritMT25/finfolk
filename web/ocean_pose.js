@@ -11,8 +11,9 @@
  *     the appearance fish's; reachOfTemplate, a legacy template's) and the
  *     sphere that holds everything drawn for a fish (reachRadius)
  *   - the size weight: posePx (a fish's body radius in CSS px at its nearest
- *     depth), poseVisibleQ (0 for a fish wholly out of view, else the weight
- *     in 7 bits), poseQ (the two, as swimPose takes them)
+ *     depth), poseVisible (false for a fish wholly out of view: its own test,
+ *     no size in it), poseVisibleQ (0 for a fish wholly out of view, else the
+ *     weight in 7 bits), poseQ (the two, as swimPose takes them)
  *   - the pose: posePack (the roll into the turn and the paired fins' fold),
  *     swimPose (one fish's whole pose; POSE0 unlit), packPose / unpackPose
  *     (the float's layout, both ways)
@@ -102,8 +103,12 @@
     var dn = -(V[2] * cx + V[6] * y + V[10] * cz + V[14]) - 0.5 * Math.sqrt(ex * ex + ey * ey) - 2 * R;   /* the body's nearest depth */
     return R * G.focal / (dn > G.near ? dn : G.near);
   }
-  /** @param {ArrayLike<number>} xs @param {ArrayLike<number>} ys @param {number} R @param {number} y @param {PoseCamera} G @param {number} vz @param {number} lam @param {PoseReach} K @param {number} px */
-  function poseVisibleQ(xs, ys, R, y, G, vz, lam, K, px) {
+  /* Whether any of a fish's reach can be in view: false only when the whole reach (reachRadius) lies behind the near
+   * plane or wholly outside a side plane of the view frustum, the polish's own visibility test (poseVisibleQ below
+   * adds the size weight to it) and the body LOD's "wholly out of view" rule (the scene's fillApp): the size plays
+   * no part, so a small fish that is in view is visible. */
+  /** @param {ArrayLike<number>} xs @param {ArrayLike<number>} ys @param {number} R @param {number} y @param {PoseCamera} G @param {number} vz @param {number} lam @param {PoseReach} K @returns {boolean} */
+  function poseVisible(xs, ys, R, y, G, vz, lam, K) {
     var V = G.view, F = G.planes;
     var cx = 0.5 * (xs[0] + xs[5]) - G.halfW, cz = 0.5 * (ys[0] + ys[5]) - G.halfH;
     var vx = V[0] * cx + V[4] * y + V[8] * cz + V[12], vy = V[1] * cx + V[5] * y + V[9] * cz + V[13];
@@ -115,9 +120,13 @@
     if (m3 > m) m = m3;
     if (m > 0 || dz <= G.near) {   /* the centre is out of view: does the reach come back in? */
       var rv = reachRadius(xs, ys, R, vz, lam, K);
-      if (dz + rv <= G.near || m > rv) return 0;
+      if (dz + rv <= G.near || m > rv) return false;
     }
-    return (127 * smoothCPU(6, 11, px) + 0.5) | 0;
+    return true;
+  }
+  /** @param {ArrayLike<number>} xs @param {ArrayLike<number>} ys @param {number} R @param {number} y @param {PoseCamera} G @param {number} vz @param {number} lam @param {PoseReach} K @param {number} px */
+  function poseVisibleQ(xs, ys, R, y, G, vz, lam, K, px) {
+    return poseVisible(xs, ys, R, y, G, vz, lam, K) ? (127 * smoothCPU(6, 11, px) + 0.5) | 0 : 0;
   }
   /* the swim pose packed (packPose) of a fish of size weight qw / 127 > 0:
    * the roll into its turn (scaled by the weight, so a fish fading out of
@@ -176,11 +185,43 @@
   /** @param {number} a @param {number} b @param {number} x */
   function smoothCPU(a, b, x) { var t = Math.max(0, Math.min(1, (x - a) / (b - a))); return t * t * (3 - 2 * t); }
 
+  /* The appearance fish's body LOD by projected size (the render optimization; the scene's `lod: "screen"`
+   * policy). A fish's projected body radius in CSS px (posePx: the cheap size every fish gets, whatever the
+   * polish; DPR plays no part) picks its template: the medium one (190 vertices) from LOD_MEDIUM_ENTER_CSS
+   * px up, the coarse one (89) below LOD_MEDIUM_EXIT_CSS; between them a fish keeps the one it had (a
+   * hysteresis, so a fish near a threshold does not flip between the two templates on every frame's jitter).
+   * pinned (the selected or hovered fish, detail 3 only) is always medium: an inspected fish keeps its detail.
+   * Detail below 3 draws every body coarse, as before. The thresholds are the measured ones
+   * (docs/ocean_render_perf.md: where the two templates' pictures stop differing); previous 0 / LOD_COARSE /
+   * LOD_MEDIUM is the fish's last bucket (0: new). */
+  var LOD_COARSE = 1, LOD_MEDIUM = 2;
+  var LOD_MEDIUM_ENTER_CSS = 7.0, LOD_MEDIUM_EXIT_CSS = 5.0;
+  /** @param {number} px @param {number} previous @param {number} quality @param {boolean} pinned @returns {number} */
+  function bodyLod(px, previous, quality, pinned) {
+    if (quality < 3) return LOD_COARSE;
+    if (pinned) return LOD_MEDIUM;
+    if (previous === LOD_MEDIUM) return px <= LOD_MEDIUM_EXIT_CSS ? LOD_COARSE : LOD_MEDIUM;
+    return px >= LOD_MEDIUM_ENTER_CSS ? LOD_MEDIUM : LOD_COARSE;
+  }
+  /* The barbel strips' gate (the scene's `barbels: "gated"` policy): drawn only for a fish that has barbels (the
+   * barbel gene above the shader's own 0.2, as a float32: mBuild's `(M.bD - 0.2)` weights vanish at 0.2), in the
+   * medium body bucket, at detail 3, and big enough on screen (BARBEL_ENTER_CSS up; a fish that had them keeps them
+   * down to BARBEL_EXIT_CSS). Selection never bypasses the size threshold. previous: it drew them last frame */
+  var BARBEL_GENE_MIN = Math.fround(0.2), BARBEL_ENTER_CSS = 6.0, BARBEL_EXIT_CSS = 4.5;
+  /** @param {number} bD @param {number} px @param {boolean} previous @param {number} quality @param {number} lod @returns {boolean} */
+  function barbelVisible(bD, px, previous, quality, lod) {
+    if (quality < 3 || lod !== LOD_MEDIUM || !(bD > BARBEL_GENE_MIN)) return false;
+    return previous ? px > BARBEL_EXIT_CSS : px >= BARBEL_ENTER_CSS;
+  }
+
   /** @type {EvoOceanPoseApi} */
   var API = {
+    LOD_COARSE: LOD_COARSE, LOD_MEDIUM: LOD_MEDIUM, LOD_MEDIUM_ENTER_CSS: LOD_MEDIUM_ENTER_CSS, LOD_MEDIUM_EXIT_CSS: LOD_MEDIUM_EXIT_CSS,
+    BARBEL_GENE_MIN: BARBEL_GENE_MIN, BARBEL_ENTER_CSS: BARBEL_ENTER_CSS, BARBEL_EXIT_CSS: BARBEL_EXIT_CSS,
+    bodyLod: bodyLod, barbelVisible: barbelVisible,
     REACH_APP: REACH_APP, WAG_MAX: WAG_MAX, POSE0: POSE0,
     reachOfTemplate: reachOfTemplate, reachRadius: reachRadius,
-    posePx: posePx, poseVisibleQ: poseVisibleQ, poseQ: poseQ, posePack: posePack, swimPose: swimPose,
+    posePx: posePx, poseVisible: poseVisible, poseVisibleQ: poseVisibleQ, poseQ: poseQ, posePack: posePack, swimPose: swimPose,
     packPose: packPose, unpackPose: unpackPose, smoothCPU: smoothCPU
   };
   root.EvoOceanPose = API;

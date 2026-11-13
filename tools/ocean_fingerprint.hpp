@@ -237,7 +237,7 @@ OFP_FIELDS(Predator, 18);   // 9 + the Stage C brain (genome .. virtualBuds): ha
 OFP_FIELDS(OceanPredator, 3);                               // base, depth, pitch
 OFP_FIELDS(OceanFood, 5 + (kOceanHasEye ? 1 : 0));   // pos, depth, alive, size, age (+ eyeCon)
 OFP_FIELDS(Gene, 5);
-OFP_FIELDS(NeuralNet, 2);
+OFP_FIELDS(NeuralNet, 6);   // neurons, flat + srcTypeBits[2], sinkTypeBits[2]: the gene-type masks, derived from the genome (which is hashed) by buildNeuralNet, so not hashed
 OFP_FIELDS(NeuralNet::Neuron, 2);
 OFP_FIELDS(NeuralNet::FlatConn, 2);
 OFP_FIELDS(WorldCommon, 30);   // 25 + Stage C: predRng_, nextPredatorId_, arenaFresh_ (ctr's tagged block), predLog_, predTally_ (statistics, not hashed)

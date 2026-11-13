@@ -391,5 +391,75 @@ section("random lives against the GPU model");
   ok(st.capacity <= cap, "storage bounded by the peak population (" + peak + " -> at most " + cap + "), not by the births (" + next + ")", st.stats());
 }
 
+section("owner hooks (onGrow / onReset / onRelease / onInstall): a render cache keyed by slot");
+{
+  /* a model of a cache keyed by slot, kept only through the hooks: slot -> the id whose row it was made from */
+  const log = [];
+  const cache = new Map();
+  const grown = [];
+  const hooks = {
+    onGrow: (cap) => { grown.push(cap); log.push("grow " + cap); },
+    onReset: () => { cache.clear(); log.push("reset"); },
+    onRelease: (s) => { cache.delete(s); log.push("release " + s); },
+    onInstall: (s, data, off, id) => {
+      /* the row and its padding are already in place at install time */
+      const row = rowOf(id, 0);
+      let exactRow = true;
+      for (let j = 0; j < ST; j++) if (data[off + j] !== row[j]) exactRow = false;
+      if (data[off + 63] !== 0 || !exactRow) log.push("BAD install " + s);
+      cache.set(s, id); log.push("install " + s + "=" + id);
+    }
+  };
+  const st = make(Object.assign({ initialCapacity: 256 }, hooks)), out = new Float32Array(600);
+  ok(grown.join() === "256", "the initial storage calls onGrow(256) once", grown);
+  let s = snap([10, 11, 12, 13, 14]);
+  log.length = 0;
+  st.prepare(1, s.ids, s.rows, s.n, out);
+  ok(log.join("|") === "reset|install 0=10|install 1=11|install 2=12|install 3=13|install 4=14", "the first snapshot (epoch 1 on a store of none): onReset, then 5 births: onInstall once each, in slot order", log);
+  log.length = 0;
+  st.prepare(1, s.ids, s.rows, s.n, out);
+  ok(log.length === 0, "an unchanged snapshot calls no hook");
+  s = snap([14, 13, 12, 11, 10]);
+  st.prepare(1, s.ids, s.rows, s.n, out);
+  ok(log.length === 0, "a reordered snapshot calls no hook (the owners keep their slots)", log);
+  s = snap([14, 12, 10, 20, 21]);
+  st.prepare(1, s.ids, s.rows, s.n, out);
+  ok(log.join("|") === "release 1|release 3|install 1=20|install 3=21", "deaths release before births are installed; the lowest free slots are reused", log);
+  ok(Array.from(cache.entries()).sort((a, b) => a[0] - b[0]).map((e) => e.join("=")).join() === "0=10,1=20,2=12,3=21,4=14", "the cache matches the owners", Array.from(cache.entries()));
+  log.length = 0;
+  s = snap(range(100, 100 + 300));
+  st.prepare(1, s.ids, s.rows, s.n, new Float32Array(600));
+  ok(grown.join() === "256,512" && log.filter((x) => x.startsWith("grow")).join() === "grow 512", "growth past 256 calls onGrow(512) once", { grown, log: log.slice(0, 8) });
+  ok(log.indexOf("grow 512") > log.findIndex((x) => x.startsWith("release")) && log.indexOf("grow 512") < log.findIndex((x) => x.startsWith("install")), "the owners gone are released, then the storage grows, then the births are installed", log.slice(0, 12));
+  /* a new epoch with the same ids: every owner forgotten, then installed again */
+  log.length = 0;
+  s = snap([100, 101, 102]);
+  st.prepare(2, s.ids, s.rows, s.n, out);
+  ok(log[0] === "reset" && log.slice(1).join("|") === "install 0=100|install 1=101|install 2=102", "a new epoch: onReset first, then every fish installed again (even with the same ids)", log);
+  log.length = 0;
+  st.invalidate();
+  ok(log.join() === "reset", "invalidate() resets", log);
+  /* a refused snapshot installs nothing and releases nothing */
+  log.length = 0;
+  const bad = st.prepare(5, Float64Array.from([1, 1]), new Float32Array(2 * ST), 2, out);
+  ok(!bad.ok && log.filter((x) => x.startsWith("install") || x.startsWith("release")).length === 0, "a refused snapshot (a repeated id) calls no install / release", log);
+  /* a store with hooks behaves as one without: the same slots and dirty sets for the same session */
+  const plain = make(), hooked = make(Object.assign({}, hooks));
+  let same = true;
+  for (const ids of [[3, 4, 5, 6, 7, 8], [3, 5, 7, 9, 10, 11, 12], [12, 11, 10, 9, 3], range(0, 40)]) {
+    const sn = snap(ids), o1 = new Float32Array(64), o2 = new Float32Array(64);
+    plain.prepare(1, sn.ids, sn.rows, sn.n, o1); hooked.prepare(1, sn.ids, sn.rows, sn.n, o2);
+    if (o1.join() !== o2.join() || plain.stats().dirty !== hooked.stats().dirty) same = false;
+  }
+  ok(same, "with hooks the slots and the dirty set are the same as without");
+  /* eachOwner: the backfill of a cache made after the owners were */
+  const eo = make(), so = snap([4, 5, 6, 7, 8]), oo = new Float32Array(16);
+  eo.prepare(1, so.ids, so.rows, so.n, oo);
+  eo.prepare(1, Float64Array.from([4, 6, 8, 9]), snap([4, 6, 8, 9]).rows, 4, oo);
+  const seenO = [];
+  eo.eachOwner((s, d, o, id) => { let same2 = true; const row = rowOf(id, 0); for (let j = 0; j < ST; j++) if (d[o + j] !== row[j]) same2 = false; seenO.push(s + "=" + id + (same2 ? "" : "!")); });
+  ok(seenO.join() === "0=4,1=9,2=6,4=8", "eachOwner visits exactly the owners (slot, id), in slot order, with their rows at data[offset ..]", seenO);
+}
+
 console.log((fails ? "FAILED " + fails + " of " : "all ") + checks + " checks" + (fails ? "" : " passed"));
 process.exit(fails ? 1 : 0);
