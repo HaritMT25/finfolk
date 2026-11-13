@@ -5068,7 +5068,39 @@ async function review6BenchImport() {
 }
 
 /* Every section, in order; `node tests/ocean_turbo_handoff.js NAME...` runs only those. */
+async function weightPolicyWorld() {
+    section('Saturation policy survives setup and saved-world metadata');
+    const cfg = { weightMutationMode: 'saturating' };
+    const query = '?seed=4242&population=60&width=1920&height=1080&depth=240&cfg=' +
+                  encodeURIComponent(JSON.stringify(cfg));
+    const p = await bootPage(query);
+    ok(p.T.initArgs.cfg.weightMutationMode === 'saturating',
+       'the raw setup keeps the string policy');
+    runPage(p, 400);
+    const s = await savedWorld(p);
+    const h = HO.worldHeader(s.bytes).header;
+    ok(h.start.cfg.weightMutationMode === 'saturating' &&
+       h.runCfg.weightMutationMode === 'saturating' &&
+       h.setup.config.weightMutationMode === 'saturating',
+       'saved-world header records the policy in start, run and setup');
+
+    const q = await bootPage(PAGE_Q7);
+    const epoch = q.T.worldEpoch;
+    await openWorld(q, s.bytes, s.name);
+    if (q.T.asking) q.click('startconfirm');
+    await until(() => q.T.worldEpoch !== epoch, 'saturation world opened');
+    ok(q.T.initArgs.cfg.weightMutationMode === 'saturating' &&
+       q.T.runCfg.weightMutationMode === 'saturating',
+       'opening the world restores the policy metadata');
+    ok(!sameFor(p.M, q.M, 60),
+       'the saved saturation world continues bit-identically');
+}
+
 const SECTIONS = {
+    weightPolicyWorld,
+    roundTripSaturating: () =>
+        roundTrip('saturating legacy weights',
+                  { weightMutationMode: 'saturating' }),
     repeatedKeys, liveLedger, growthPage, randomize, imports,
     roundTripDefault: () => roundTrip('the default world', {}),
     roundTripE1: async () => {

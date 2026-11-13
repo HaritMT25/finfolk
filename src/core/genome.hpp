@@ -5,9 +5,43 @@
 #include <cmath>
 #include <algorithm>
 #include <bit>
+#include <string_view>
 #include "sensors_actions.hpp"
 #include "portable_math.hpp"
 #include "random.hpp"
+
+enum class WeightMutationMode : uint8_t {
+    Legacy = 0,
+    Saturating = 1,
+    Invalid = 255
+};
+
+inline constexpr const char* weightMutationModeName(WeightMutationMode mode) {
+    switch (mode) {
+    case WeightMutationMode::Legacy: return "legacy";
+    case WeightMutationMode::Saturating: return "saturating";
+    default: return "invalid";
+    }
+}
+
+inline bool parseWeightMutationMode(std::string_view text,
+                                    WeightMutationMode& mode) {
+    if (text == "legacy") {
+        mode = WeightMutationMode::Legacy;
+        return true;
+    }
+    if (text == "saturating") {
+        mode = WeightMutationMode::Saturating;
+        return true;
+    }
+    return false;
+}
+
+inline int16_t saturatingWeightAdd(int16_t weight, int32_t delta) {
+    const int32_t sum = static_cast<int32_t>(weight) + delta;
+    return static_cast<int16_t>(
+        std::clamp(sum, int32_t{-32768}, int32_t{32767}));
+}
 
 // Max number of internal (hidden) neurons per creature
 constexpr int MAX_INTERNAL_NEURONS = 12;
@@ -313,44 +347,52 @@ inline Genome crossover(const Genome& parent1, const Genome& parent2) {
     return child;
 }
 
-inline void mutateGenome(Genome& genome, float rate, int minLen, int maxLen, RandomGen& r) {
-    // Weight mutations and rewiring
+inline void mutateGenome(Genome& genome, float rate, int minLen, int maxLen,
+                         RandomGen& r,
+                         WeightMutationMode mode = WeightMutationMode::Legacy) {
+    // Preserve the legacy gates, payloads and random-stream ordering.
     for (auto& gene : genome) {
         if (r.unit() < rate) {
-            // Mutate the weight
-            gene.weight += static_cast<int16_t>(r.intRange(-1000, 1000));
+            if (mode == WeightMutationMode::Saturating) {
+                const int32_t delta = r.intRange(-1000, 1000);
+                gene.weight = saturatingWeightAdd(gene.weight, delta);
+            } else {
+                gene.weight += static_cast<int16_t>(r.intRange(-1000, 1000));
+            }
         }
         if (r.unit() < rate * 0.5f) {
-            // Rarely rewire a connection entirely
             gene = Gene::makeRandom(r);
         }
     }
 
-    // Gene insertion — genome can grow
     if (r.unit() < rate * 2.0f && (int)genome.size() < maxLen) {
         int pos = r.intRange(0, (int)genome.size());
         genome.insert(genome.begin() + pos, Gene::makeRandom(r));
     }
 
-    // Gene deletion — genome can shrink
     if (r.unit() < rate * 2.0f && (int)genome.size() > minLen) {
         int pos = r.intRange(0, (int)genome.size() - 1);
         genome.erase(genome.begin() + pos);
     }
 
-    // Gene duplication — copy an existing gene to a new position (rare)
     if (r.unit() < rate * 0.5f && (int)genome.size() < maxLen) {
         int src = r.intRange(0, (int)genome.size() - 1);
         Gene dup = genome[src];
-        // Slightly mutate the duplicate's weight
-        dup.weight += static_cast<int16_t>(r.intRange(-500, 500));
+        if (mode == WeightMutationMode::Saturating) {
+            const int32_t delta = r.intRange(-500, 500);
+            dup.weight = saturatingWeightAdd(dup.weight, delta);
+        } else {
+            dup.weight += static_cast<int16_t>(r.intRange(-500, 500));
+        }
         genome.push_back(dup);
     }
 }
+
 inline void mutateGenome(Genome& genome, float rate = 0.01f,
                          int minLen = GENOME_MIN_LENGTH,
-                         int maxLen = GENOME_MAX_LENGTH) {
-    mutateGenome(genome, rate, minLen, maxLen, rng);
+                         int maxLen = GENOME_MAX_LENGTH,
+                         WeightMutationMode mode = WeightMutationMode::Legacy) {
+    mutateGenome(genome, rate, minLen, maxLen, rng, mode);
 }
 
 inline float genomeSimilarity(const Genome& g1, const Genome& g2) {

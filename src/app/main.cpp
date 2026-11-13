@@ -102,6 +102,7 @@ void printUsage(const char* prog) {
         "  --genome-min N        (default 16)  --genome-max N (default 80)\n"
         "  --genome-init-min N   (default 24)  --genome-init-max N (default 48)\n"
         "  --mutation F          mutation-rate multiplier (default 1.0)\n"
+        "  --weight-mutation-mode M  legacy or saturating (default legacy)\n"
         "  --current F           ocean-current peak speed, 0=off (default 0)\n"
         "  --current-mode M      'eddies' (moving vortices) or 'gyre' (double-gyre) (default eddies)\n"
         "  --current-eddies N    [eddies] number of vortices / 'eyes' (default 5)\n"
@@ -299,6 +300,13 @@ int main(int argc, char** argv) {
         else if (arg == "--genome-init-min")  cfg.genomeInitMin     = std::atoi(next("--genome-init-min"));
         else if (arg == "--genome-init-max")  cfg.genomeInitMax     = std::atoi(next("--genome-init-max"));
         else if (arg == "--mutation")         cfg.mutationMultiplier= std::atof(next("--mutation"));
+        else if (arg == "--weight-mutation-mode") {
+            const std::string mode = next("--weight-mutation-mode");
+            if (!parseWeightMutationMode(mode, cfg.weightMutationMode)) {
+                std::cerr << "Error: --weight-mutation-mode must be legacy or saturating.\n";
+                return 1;
+            }
+        }
         // --- currents / spatial food (environment) ---
         else if (arg == "--current")           cfg.currentStrength   = std::atof(next("--current"));
         else if (arg == "--current-mode")    { std::string m = next("--current-mode"); cfg.currentMode = (m == "gyre") ? 1 : 0; }

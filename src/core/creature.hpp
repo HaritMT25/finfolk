@@ -81,9 +81,10 @@ inline Creature makeChild(const Creature& p1, const Creature& p2,
                           int   minLen        = GENOME_MIN_LENGTH,
                           int   maxLen        = GENOME_MAX_LENGTH,
                           float mutMultiplier = 1.0f,
-                          float newbornEnergy = 25.0f) {
+                          float newbornEnergy = 25.0f,
+                          WeightMutationMode mode = WeightMutationMode::Legacy) {
     Creature child;
-    kernel::inheritGenome(child, p1, p2, minLen, maxLen, mutMultiplier);
+    kernel::inheritGenome(child, p1, p2, minLen, maxLen, mutMultiplier, mode);
 
     Vec2 midpoint = {
         (p1.pos.x + p2.pos.x) * 0.5f,

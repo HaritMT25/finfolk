@@ -193,7 +193,9 @@ inline Genome founderGenome(const SimConfig& cfg, RandomGen& r) {
 inline void inheritGenome(Predator& child, const Predator& parent, const SimConfig& cfg, RandomGen& r) {
     child.genome = parent.genome;
     const float rate = kernel::birthMutationRate(r.unit());
-    mutateGenome(child.genome, rate * cfg.predatorMutation, cfg.genomeMinLength, cfg.genomeMaxLength, r);
+    mutateGenome(child.genome, rate * cfg.predatorMutation,
+                 cfg.genomeMinLength, cfg.genomeMaxLength, r,
+                 cfg.weightMutationMode);
 }
 
 // The own-state inputs (no geometry, no draws).

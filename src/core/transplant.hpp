@@ -155,12 +155,34 @@ inline bool apply(World& world, const Options& o, const std::string& yText,
         jsonm::Value y;
         if (!jsonm::Parser::parse(yText, y, error)) { error = "predator source: " + error; return false; }
         if (y.stringOr("format", "") != checkpoint::FORMAT_ID) { error = "predator source is not an evo_boids checkpoint"; return false; }
-        if (y.intOr("formatVersion", -1) != checkpoint::FORMAT_VERSION_BRAIN) {
-            error = "predator source has no predator brains (format version 2 required)"; return false;
+        const jsonm::Value* donorVersion = y.find("formatVersion");
+        if (checkpoint::v3::integer(donorVersion, 3, 3)) {
+            if (!checkpoint::v3::preflight(y, yc, error)) {
+                error = "predator source: " + error;
+                return false;
+            }
+        } else if (checkpoint::v3::integer(donorVersion, 2, 2)) {
+            checkpoint::readConfig(y, yc);
+            if (yc.weightMutationMode != WeightMutationMode::Legacy) {
+                error = "predator source formats 1/2 require legacy weight mutation";
+                return false;
+            }
+        } else {
+            error = "predator source has no predator brains (format version 2 or neural format 3 required)";
+            return false;
         }
-        checkpoint::readConfig(y, yc);
-        if (!yc.predatorBrain) { error = "predator source's config has predatorBrain off"; return false; }
-        if (const char* why = predatorBrainConfigError(yc)) { error = std::string("predator source config: ") + why; return false; }
+        if (!yc.predatorBrain) {
+            error = "predator source's config has predatorBrain off";
+            return false;
+        }
+        if (const char* why = predatorBrainConfigError(yc)) {
+            error = std::string("predator source config: ") + why;
+            return false;
+        }
+        if (yc.weightMutationMode != cfg.weightMutationMode) {
+            error = "predator source and prey world have different weight mutation policies";
+            return false;
+        }
         const jsonm::Value* yw = y.find("world");
         if (!yw) { error = "predator source has no 'world'"; return false; }
         yFrame = yw->ullOr("frame", 0);
@@ -205,6 +227,19 @@ inline bool apply(World& world, const Options& o, const std::string& yText,
             picks.assign(idx.begin(), idx.begin() + K);
         } else {
             for (int i = 0; i < K; ++i) picks.push_back((int)pickRng.uint((uint32_t)(np - 1)));
+        }
+    }
+
+    // Check selected imports against the receiving policy before mutating X.
+    // Legacy transplants retain their historical bounds/acceptance behavior.
+    if (!fromRandom && cfg.weightMutationMode == WeightMutationMode::Saturating) {
+        for (int pick : picks) {
+            const size_t length = pool[(size_t)pick].genome.size();
+            if (length < (size_t)cfg.genomeMinLength ||
+                length > (size_t)cfg.genomeMaxLength) {
+                error = "predator source genome length outside receiving bounds";
+                return false;
+            }
         }
     }
 

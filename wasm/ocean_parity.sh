@@ -538,6 +538,10 @@ FAST_CASES="def_s1 pred_s7 econ_s42 rich_s5 rich_toro_s7 x_steep_s3 x_deep_s8 x_
 # must exit 1): every Ocean knob has a finite range, so none of these can run.
 RNAMES=(); RARGS=()
 radd () { RNAMES+=("$1"); RARGS+=("$2"); }
+radd r_weight_mode_unknown '1 10 --cfg {"weightMutationMode":"wrap"}'
+radd r_weight_mode_number  '1 10 --cfg {"weightMutationMode":1}'
+radd r_weight_mode_bool    '1 10 --cfg {"weightMutationMode":true}'
+radd r_weight_mode_repeat  '1 10 --cfg {"weightMutationMode":"saturating","weightMutationMode":"legacy"}'
 radd r_kbuoy_hole   '1 10 --cfg {"kBuoy":-1e37}'
 radd r_kbuoy_big    '1 10 --cfg {"kBuoy":1001}'
 radd r_vdrag        '1 10 --cfg {"vDrag":1e30}'
