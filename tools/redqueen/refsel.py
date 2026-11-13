@@ -79,7 +79,8 @@ implementation (refsel.py's sha256, numpy's version).
     refsel.py plan --block worlds_block.json --validation-dir ~/finfolk/validation \\
         --main-registry STUDY/config/worlds.json [--forks STUDY/config/forks.json] --templates /abs/t.json ... \\
         --age-reference /abs/ages.json --avoid PRODUCTION/config/worlds.json [--avoid ...] --out grid.json
-    refsel.py collect --study GRID_STUDY --design grid.json --plan FINAL_PLAN.jsonl --out obs.json
+    refsel.py collect --study GRID_STUDY --design grid.json --plan FINAL_PLAN.jsonl --out obs.json \\
+        [--age-diagnostics age_diagnostics.json]
     refsel.py select obs.json --design grid.json --plan FINAL_PLAN.jsonl --out config/references.json \\
         --report refsel_report.json
 """
@@ -531,10 +532,17 @@ def bind_plan(design, plan_path):
 
 
 def collect(study, design, plan_path, declared_missing=()):
+    return collect_with_age_diagnostics(study, design, plan_path, declared_missing)[0]
+
+
+def collect_with_age_diagnostics(study, design, plan_path, declared_missing=()):
+    """collect's observations (the same bytes) and, separately versioned, the collected cells'
+    age-stratified diagnostics (D8 v2 rule 48; store.age_diagnostics_doc). A /3 bundle without its
+    complete age summary is refused; a /1 or /2 bundle's diagnostics are explicitly unavailable."""
     import store
     rows, plan_sha = bind_plan(design, plan_path)
     _, cells = store.load_index(study)
-    obs = []
+    obs, ages = [], []
     for cid in sorted(cells):
         b = json.loads(store.read_member(study, cid, cells=cells))
         c = b["cell"]
@@ -545,6 +553,10 @@ def collect(study, design, plan_path, declared_missing=()):
             raise RefselError(f"{cid}: not exactly a cell of the final plan")
         if b["score"].get("n_start") != N_PREY:
             raise RefselError(f"{cid}: cohort {b['score'].get('n_start')}, not {N_PREY}")
+        try:
+            ages.append(store.age_diagnostics_entry(cid, b))
+        except store.StoreError as e:
+            raise RefselError(str(e))
         h = [x for x in b["score"]["horizons"] if x["steps"] == HORIZON]
         if len(h) != 1:
             raise RefselError(f"{cid}: no single {HORIZON}-step horizon")
@@ -555,8 +567,9 @@ def collect(study, design, plan_path, declared_missing=()):
     missing = sorted(set(rows) - {o["cell"] for o in obs})
     if missing != sorted(set(declared_missing)):
         raise RefselError(f"{len(missing)} plan cells are not collected; a missing cell must be declared exactly")
-    return {"schema": OBS_SCHEMA, "design_sha256": rqlib.canonical_sha(design), "plan_sha256": plan_sha,
-            "missing": missing, "observations": obs}
+    doc = {"schema": OBS_SCHEMA, "design_sha256": rqlib.canonical_sha(design), "plan_sha256": plan_sha,
+           "missing": missing, "observations": obs}
+    return doc, store.age_diagnostics_doc(doc, ages)
 
 
 # ================================================================== the criterion
@@ -859,6 +872,8 @@ def main(argv=None):
     s.add_argument("--plan", required=True)
     s.add_argument("--declare-missing")
     s.add_argument("--out", required=True)
+    s.add_argument("--age-diagnostics", help="also write the collected cells' age-stratified diagnostics "
+                   "(finfolk.redqueen.agediagnostics/1, D8 rule 48) to this path")
     s = sub.add_parser("select")
     s.add_argument("obs")
     s.add_argument("--design", required=True)
@@ -880,8 +895,10 @@ def main(argv=None):
         if a.cmd == "collect":
             miss = ([x.strip() for x in rqlib.read_text(a.declare_missing).split("\n") if x.strip()]
                     if a.declare_missing else [])
-            doc = collect(a.study, design, a.plan, miss)
+            doc, ages = collect_with_age_diagnostics(a.study, design, a.plan, miss)
             rqlib.write_json_durable(a.out, doc)
+            if a.age_diagnostics:
+                rqlib.write_json_durable(a.age_diagnostics, ages)
             print(f"{len(doc['observations'])} observations; missing {len(doc['missing'])}")
             return 0
         doc = rqlib.read_json(a.obs)

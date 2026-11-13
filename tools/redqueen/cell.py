@@ -42,9 +42,13 @@ the cohort total carry n_start, survivors and survival (null for an empty denomi
 from arena.json at f0, keyed by the initial prey IDs, never the horizon's ages; max_age_s is
 config.maxAge, dt_s score.dt; steps and frame name the horizon. Missing / invalid ages, ages
 beyond the fixed bins, totals that do not reconcile with the score's n_start and survivors, and
-any age-infeasible survivor refuse scoring (score.age_strata_problems is the contract). Readers
-accept old /1 and /2 bundles without age_strata (unavailable, never inferred or rewritten) and /3
-for either plan version; plan/2 still requires its sharing record in /2 and /3 bundles.
+any age-infeasible survivor refuse scoring. score.age_strata_problems is the contract: execute
+checks it against the cell's horizons before the bundle is bound (so before any checkpoint is
+deleted), store.completion_problems at completion verification, packing and resume, and the
+collectors at ingestion: a /3 bundle without a complete summary is refused (a recording omission,
+never zero survival). Readers accept old /1 and /2 bundles without age_strata (explicitly
+unavailable, never inferred or rewritten) and /3 for either plan version; plan/2 still requires
+its sharing record in /2 and /3 bundles.
 
 Exit codes (also the worker's): 0 ok, 2 the engine is not a serial build, 3 an engine call
 failed, 4 a score check failed, 5 a source is missing or not its registered content (hashed
@@ -343,6 +347,10 @@ def execute(cell, d, exe, paths, procs=None):
                              int(cell["log_every"]), cell["assay"], fork=cell["kind"] == "nopred", scripted=scripted)
     except (score_mod.ScoreError, ckpt.CheckpointError, KeyError, ValueError) as e:
         raise CellFailure(4, f"score check failed: {e}")
+    # (D8 v2 rule 48) the bundle binds a complete age summary for every registered horizon
+    probs = score_mod.age_strata_problems(sc, list(cell["horizons"]))
+    if probs:
+        raise CellFailure(4, "score check failed: incomplete age summary: " + "; ".join(probs[:3]))
     info["t_score"] = time.time() - t2
     pred_csv = ""
     if not scripted:

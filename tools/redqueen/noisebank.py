@@ -148,7 +148,8 @@ counts, not their exact native-scale covariance (checked against simulation at s
     noisebank.py plan --block val_block.json --validation-dir ~/finfolk/validation --arena ARENA_ID \\
         --main-registry ~/finfolk/study/config/worlds.json --templates t.json ... \\
         --age-reference ages.json --avoid production_plan.jsonl ... --out nb_design.json
-    noisebank.py collect --study STUDY --design noisebank_design.json --plan plan.jsonl [--declare-missing ...]
+    noisebank.py collect --study STUDY --design noisebank_design.json --plan plan.jsonl [--declare-missing ...] \\
+        --out obs.json [--age-diagnostics age_diagnostics.json]
     noisebank.py estimate --obs noisebank_obs.json --out bank.json [--boot 999]
 """
 from __future__ import annotations
@@ -433,10 +434,17 @@ def bind_plan(design, plan_path):
 def collect(study, design, plan_path, declared_missing=()):
     """The bank's observations, bound to the final plan: per cell the prey and predator snapshots, the
     replicate and, per horizon, the captures and survivors of the 600 cohort."""
+    return collect_with_age_diagnostics(study, design, plan_path, declared_missing)[0]
+
+
+def collect_with_age_diagnostics(study, design, plan_path, declared_missing=()):
+    """collect's observations (the same bytes) and, separately versioned, the collected cells'
+    age-stratified diagnostics (D8 v2 rule 48; store.age_diagnostics_doc). A /3 bundle without its
+    complete age summary is refused; a /1 or /2 bundle's diagnostics are explicitly unavailable."""
     import store
     rows, plan_sha = bind_plan(design, plan_path)
     _, cells = store.load_index(study)
-    obs = []
+    obs, ages = [], []
     for cid in sorted(cells):
         b = json.loads(store.read_member(study, cid, cells=cells))
         c = b["cell"]
@@ -447,6 +455,10 @@ def collect(study, design, plan_path, declared_missing=()):
             raise NoiseBankError(f"{cid}: not exactly a cell of the final plan")
         if b["score"].get("n_start") != N_PREY:
             raise NoiseBankError(f"{cid}: cohort {b['score'].get('n_start')}, not {N_PREY}")
+        try:
+            ages.append(store.age_diagnostics_entry(cid, b))
+        except store.StoreError as e:
+            raise NoiseBankError(str(e))
         hz = {}
         for h in HORIZONS:
             x = [y for y in b["score"]["horizons"] if y["steps"] == h]
@@ -460,8 +472,9 @@ def collect(study, design, plan_path, declared_missing=()):
     missing = sorted(set(rows) - {o["cell"] for o in obs})
     if missing != sorted(set(declared_missing)):
         raise NoiseBankError(f"{len(missing)} plan cells are not collected; a missing cell must be declared exactly")
-    return {"schema": OBS_SCHEMA, "design_sha256": rqlib.canonical_sha(design), "plan_sha256": plan_sha,
-            "missing": missing, "observations": obs}
+    doc = {"schema": OBS_SCHEMA, "design_sha256": rqlib.canonical_sha(design), "plan_sha256": plan_sha,
+           "missing": missing, "observations": obs}
+    return doc, store.age_diagnostics_doc(doc, ages)
 
 
 # ================================================================== numerics: normal tails, BVN
@@ -1887,6 +1900,8 @@ def main(argv=None):
     s.add_argument("--plan", required=True)
     s.add_argument("--declare-missing", nargs="*", default=[])
     s.add_argument("--out", required=True)
+    s.add_argument("--age-diagnostics", help="also write the collected cells' age-stratified diagnostics "
+                   "(finfolk.redqueen.agediagnostics/1, D8 rule 48) to this path")
     s = sub.add_parser("estimate")
     s.add_argument("--obs", required=True)
     s.add_argument("--boot", type=int, default=BOOT)
@@ -1901,8 +1916,10 @@ def main(argv=None):
             print(json.dumps({k: d["noisebank"][k] for k in ("worlds", "cells", "predator_trajectories",
                                                             "free_trajectories")}))
         elif a.cmd == "collect":
-            doc = collect(a.study, rqlib.read_json(a.design), a.plan, a.declare_missing)
+            doc, ages = collect_with_age_diagnostics(a.study, rqlib.read_json(a.design), a.plan, a.declare_missing)
             rqlib.write_json_durable(a.out, doc)
+            if a.age_diagnostics:
+                rqlib.write_json_durable(a.age_diagnostics, ages)
             print(f"{len(doc['observations'])} observations, {len(doc['missing'])} declared missing")
         else:
             bank = estimate(rqlib.read_json(a.obs), boot=a.boot, replicates=REPLICATES)

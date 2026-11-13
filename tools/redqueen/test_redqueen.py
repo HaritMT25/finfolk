@@ -651,6 +651,41 @@ class TestStore(unittest.TestCase):
         del e["plan_schema"]
         self.assertTrue(any("plan schema" in p for p in store.index_problems(self.root, cells)))
 
+    def test_v3_completion_requires_its_age_summary(self):
+        """Codex review of 870daa6, P2-3 (D8 v2 rule 48): a /3 completion of either plan version whose age
+        summary is missing, misses a registered horizon, or does not reconcile with its counts, its bundle
+        hash updated in done.json (so integrity checks cannot see it), is refused at completion
+        verification and at packing, nothing deleted; complete /3 and summary-less /1 and /2 pack."""
+        two = mk_age_score((5000, 10000), alive={5000: {7}, 10000: set()})
+        mutations = {
+            "nostrata": lambda b: b["score"]["horizons"][1].pop("age_strata"),
+            "nohorizon": lambda b: b["score"]["horizons"].pop(),
+            "unreconciled": lambda b: b["score"]["horizons"][0].update(survivors=0),
+            "badbin": lambda b: b["score"]["horizons"][0]["age_strata"]["bins"][0]["feasible"].update(n_start=0),
+            "noregistered": lambda b: b["cell"].pop("horizons"),
+            "noscore": lambda b: b.pop("score"),
+        }
+        for plan2 in (False, True):
+            for name, mutate in mutations.items():
+                cid = f"{name}-p{int(plan2) + 1}"
+                with self.subTest(cid=cid):
+                    self.mk_cell(cid, group=cid, transplant=(cid, "d" * 64) if plan2 else None)
+                    bundle, done = self.as_v3(cid, copy.deepcopy(two), (5000, 10000))
+                    self.assertEqual(store.completion_problems(done, bundle), [])
+                    mutate(bundle)
+                    bundle, done = self.rewrite(cid, bundle)
+                    probs = store.completion_problems(done, bundle)
+                    self.assertTrue(probs and all("age summary" in p for p in probs), probs)
+                    with self.assertRaisesRegex(store.StoreError, "age summary"):
+                        store.pack(self.root, ids=[cid], log=lambda m: None)
+                    self.assertTrue(os.path.exists(os.path.join(self.root, store.WORK, cid, "bundle.json")))
+                    shutil.rmtree(os.path.join(self.root, store.WORK, cid))
+        for cid, transplant in (("v1", None), ("v2", ("v2", "d" * 64))):      # (mk_cell: no score at all)
+            self.mk_cell(cid, group=cid, transplant=transplant)
+        self.mk_cell("v3", group="v3")
+        self.as_v3("v3", copy.deepcopy(two), (5000, 10000))
+        self.assertEqual(store.pack(self.root, log=lambda m: None)[1], 3)
+
     def test_v2_completions_checked(self):
         """Review of 03a608b, P2 1: packing (and resume) require a /2 completion's sharing record and
         cross-check done.json's role and transplant summary against the hash-valid bundle; a /2 bundle

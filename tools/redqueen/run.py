@@ -861,8 +861,9 @@ def _main(argv, files):
             if rqlib.sha256_bytes(raw) != dn["bundle_sha256"]:
                 print(f"cell {r['id']}: its bundle.json no longer matches done.json", file=sys.stderr)
                 return 1
-            if v2:
-                probs = store.completion_problems(dn, json.loads(raw))
+            b = json.loads(raw)
+            if v2 or b.get("schema") == store.BUNDLE_V3:     # (/3: its age summary, D8 v2 rule 48)
+                probs = store.completion_problems(dn, b)
                 if probs:
                     print(f"cell {r['id']}: {'; '.join(probs)}", file=sys.stderr)
                     return 2

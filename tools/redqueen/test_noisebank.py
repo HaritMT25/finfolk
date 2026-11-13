@@ -1100,7 +1100,10 @@ class TestCollect(unittest.TestCase):
         doc = nb.collect(study({r["id"]: bundle(r) for r in pick}), d, pp, rest)
         self.assertEqual(len(doc["observations"]), 3)
         self.assertEqual(sorted(doc["observations"][0]["horizons"]), ["10000", "20000", "5000"])
-        # Collection reads legacy bundles without diagnostics and /3 bundles identically.
+        # Collection reads legacy bundles without diagnostics and /3 bundles identically (the same
+        # observation bytes); D8 v2 rule 48 at ingestion (Codex review of 870daa6, P2-3): the /3 age
+        # summaries go to the separately versioned diagnostics output, where /1 and /2 bundles are
+        # explicitly unavailable, and a /3 bundle without a complete summary is refused.
         import score
 
         def v3(r):
@@ -1115,7 +1118,35 @@ class TestCollect(unittest.TestCase):
                                                    len(alive))
             return b
         newer = {r["id"]: v3(r) for r in pick}
+        got, ages = nb.collect_with_age_diagnostics(study(newer), d, pp, rest)
+        self.assertEqual(rqlib.canonical(got), rqlib.canonical(doc))
         self.assertEqual(nb.collect(study(newer), d, pp, rest), doc)
+        self.assertEqual((ages["schema"], ages["observations_sha256"], ages["missing"], ages["available"],
+                          ages["unavailable"]), (store.AGE_DIAGNOSTICS_SCHEMA, rqlib.canonical_sha(doc), rest, 3, 0))
+        for c in ages["cells"]:
+            self.assertEqual(c["horizons"], {str(h["steps"]): h["age_strata"]
+                                             for h in newer[c["cell"]]["score"]["horizons"]})
+        _, old = nb.collect_with_age_diagnostics(study({r["id"]: bundle(r) for r in pick}), d, pp, rest)
+        self.assertEqual((old["available"], old["unavailable"]), (0, 3))
+        self.assertTrue(all(not c["available"] and "predates" in c["reason"] and "horizons" not in c
+                            for c in old["cells"]))
+        for corrupt in (lambda b: b["score"]["horizons"][2].pop("age_strata"),       # a missing summary
+                        lambda b: b["score"]["horizons"].pop(),                        # a registered horizon
+                        lambda b: b["score"]["horizons"][0].update(survivors=399)):    # unreconciled
+            broken = {r["id"]: v3(r) for r in pick}
+            corrupt(broken[pick[1]["id"]])
+            with self.assertRaisesRegex(nb.NoiseBankError, "age summary"):
+                nb.collect(study(broken), d, pp, rest)
+        # the CLI writes the diagnostics only where asked, beside the unchanged observations
+        dp, op, ap = (os.path.join(self.tmp, x) for x in ("design.json", "obs.json", "age_diagnostics.json"))
+        rqlib.write_json_durable(dp, d)
+        args = ["collect", "--study", study(newer), "--design", dp, "--plan", pp, "--declare-missing", *rest,
+                "--out", op]
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(nb.main(args), 0)
+            self.assertFalse(os.path.exists(ap))
+            self.assertEqual(nb.main(args + ["--age-diagnostics", ap]), 0)
+        self.assertEqual((rqlib.read_json(op), rqlib.read_json(ap)), (doc, ages))
         with self.assertRaises(nb.NoiseBankError):
             nb.collect(study({r["id"]: bundle(r) for r in pick}), d, pp)                      # (undeclared missing)
         with self.assertRaises(nb.NoiseBankError):

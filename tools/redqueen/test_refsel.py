@@ -624,7 +624,11 @@ class TestCollectAndCli(Base):
         rest = sorted(set(rows) - {r["id"] for r in pick})
         doc = rs.collect(self.study({r["id"]: bundle(r) for r in pick}), d, pp, rest)
         self.assertEqual(len(doc["observations"]), 33)
+        # /3 bundles give the same observation bytes; D8 v2 rule 48 at ingestion (Codex review of 870daa6,
+        # P2-3): their summaries go to the separately versioned diagnostics output, /1 and /2 bundles are
+        # explicitly unavailable there, and a /3 bundle without a complete summary is refused.
         import score
+        import store
 
         def v3(r):
             b = bundle(r)
@@ -636,7 +640,22 @@ class TestCollectAndCli(Base):
                                                score.DT, 600, 400)
             return b
         newer = {r["id"]: v3(r) for r in pick}
+        got, ages = rs.collect_with_age_diagnostics(self.study(newer), d, pp, rest)
+        self.assertEqual(rqlib.canonical(got), rqlib.canonical(doc))
         self.assertEqual(rs.collect(self.study(newer), d, pp, rest), doc)
+        self.assertEqual((ages["schema"], ages["observations_sha256"], ages["available"], ages["unavailable"]),
+                         (store.AGE_DIAGNOSTICS_SCHEMA, rqlib.canonical_sha(doc), 33, 0))
+        self.assertTrue(all(c["horizons"] == {"5000": newer[c["cell"]]["score"]["horizons"][0]["age_strata"]}
+                            for c in ages["cells"]))
+        _, old = rs.collect_with_age_diagnostics(self.study({r["id"]: bundle(r) for r in pick}), d, pp, rest)
+        self.assertEqual((old["available"], old["unavailable"]), (0, 33))
+        self.assertTrue(all(not c["available"] and "predates" in c["reason"] for c in old["cells"]))
+        for corrupt in (lambda b: b["score"]["horizons"][0].pop("age_strata"),
+                        lambda b: b["score"]["horizons"][0]["age_strata"]["bins"][0].update(survival=None)):
+            broken = {r["id"]: v3(r) for r in pick}
+            corrupt(broken[pick[5]["id"]])
+            with self.assertRaisesRegex(rs.RefselError, "age summary"):
+                rs.collect(self.study(broken), d, pp, rest)
         with self.assertRaises(rs.RefselError):
             rs.collect(self.study({r["id"]: bundle(r) for r in pick}), d, pp)
         with self.assertRaises(rs.RefselError):

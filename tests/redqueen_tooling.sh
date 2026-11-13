@@ -202,6 +202,9 @@ groups = {}
 for cid, b in B.items():
     sc, cl = b["score"], b["cell"]
     assert sc["schema"] == "finfolk.redqueen.score/1" and [h["steps"] for h in sc["horizons"]] == [200, 600]
+    # (D8 v2 rule 48) the age summary bound before the checkpoints went, through completion and packing
+    assert b["schema"] == "finfolk.redqueen.bundle/3" and store.age_summary_problems(b) == [], \
+        (cid, store.age_summary_problems(b))
     h5 = sc["horizons"][-1]
     assert 0 <= h5["survival"] <= 1 and h5["deaths_predation"] == h5["captures"], (cid, h5)
     if cl["kind"] == "nopred":
@@ -528,6 +531,7 @@ B = {c: json.loads(store.read_member("r15", c, cells=cells)) for c in cells}
 for cid, b in B.items():
     c = b["cell"]
     assert b["schema"] == "finfolk.redqueen.bundle/3" and cells[cid][1]["role"] == c["role"]
+    assert store.age_summary_problems(b) == [], (cid, store.age_summary_problems(b))   # (D8 v2 rule 48)
     hs = [h["steps"] for h in b["score"]["horizons"]]
     assert hs == ([400, 800] if c["horizon"] == "long" else [400]), (cid, hs)
     assert c["sampling"] == "wor-balanced"

@@ -349,10 +349,56 @@ BUNDLE_V2 = "finfolk.redqueen.bundle/2"
 BUNDLE_V3 = "finfolk.redqueen.bundle/3"
 
 
+AGE_DIAGNOSTICS_SCHEMA = "finfolk.redqueen.agediagnostics/1"
+
+
 def sharing_required(bundle_schema, plan_schema):
     """/2 always used plan/2; /3 adds age diagnostics for both plan/1 and plan/2."""
     return bundle_schema == BUNDLE_V2 or (bundle_schema == BUNDLE_V3 and
                                         plan_schema == "finfolk.redqueen.plan/2")
+
+
+def age_summary_problems(bundle):
+    """(D8 v2 rule 48) Why a /3 bundle lacks its complete age-stratified summary -> problems: its
+    score must cover exactly its cell's registered horizons, each with an age_strata that meets
+    score.py's contract (score.age_strata_problems). /1 and /2 bundles predate the summary: no
+    problem here; ingestion lists them as explicitly unavailable (age_diagnostics_entry)."""
+    if bundle.get("schema") != BUNDLE_V3:
+        return []
+    import score
+    hs = (bundle.get("cell") or {}).get("horizons")
+    if not isinstance(hs, list) or not hs:
+        return ["the age summary (D8 rule 48): the cell names no registered horizons to cover"]
+    return [f"the age summary (D8 rule 48): {p}" for p in score.age_strata_problems(bundle.get("score"), hs)]
+
+
+def age_diagnostics_entry(cid, bundle):
+    """One collected cell's age-stratified diagnostics (D8 v2 rule 48) at ingestion -> entry. A /3
+    bundle gives its summary per horizon; one without a complete summary raises StoreError (a
+    recording omission to repair or record as a deviation, never zero survival). An older bundle's
+    are explicitly unavailable, with the reason (never inferred from its totals)."""
+    schema = bundle.get("schema")
+    if schema == BUNDLE_V3:
+        probs = age_summary_problems(bundle)
+        if probs:
+            raise StoreError(f"{cid}: a bundle/3 without its complete age summary: " + "; ".join(probs[:3]))
+        return {"cell": cid, "bundle_schema": schema, "available": True,
+                "horizons": {str(h["steps"]): h["age_strata"] for h in bundle["score"]["horizons"]}}
+    return {"cell": cid, "bundle_schema": schema, "available": False,
+            "reason": f"bundle schema {schema!r} predates the age-stratified summary (D8 rule 48)"}
+
+
+def age_diagnostics_doc(obs, entries):
+    """The separately versioned age-diagnostics output of a collection, beside its observations
+    `obs` (whose bytes it leaves unchanged): bound to them by hash and to their design and plan,
+    with every collected cell's entry (age_diagnostics_entry), how many are available and
+    unavailable, and the plan cells the observations declare missing."""
+    return {"schema": AGE_DIAGNOSTICS_SCHEMA, "observations_schema": obs.get("schema"),
+            "observations_sha256": rqlib.canonical_sha(obs), "design_sha256": obs.get("design_sha256"),
+            "plan_sha256": obs.get("plan_sha256"), "missing": obs.get("missing"),
+            "available": sum(1 for e in entries if e["available"]),
+            "unavailable": sum(1 for e in entries if not e["available"]),
+            "cells": sorted(entries, key=lambda e: e["cell"])}
 
 
 def summary_of(bundle):
@@ -374,7 +420,8 @@ def completion_problems(done, bundle):
     prey settings), whatever the schema. A plan/2 bundle (/2 or /3) must carry its sharing record
     (one completed before 03a608b: refused, never mixed in) whose keys, seeds and realized common checkpoint are
     the cell's and the bundle's; done.json's role, families, transplant group and realized draw
-    must be the bundle's (an assay's realized draw is required)."""
+    must be the bundle's (an assay's realized draw is required). A /3 bundle, of either plan
+    version, must carry its complete age summary (age_summary_problems: D8 v2 rule 48)."""
     if not isinstance(bundle.get("cell"), dict):
         return ["the bundle carries no cell"]
     want = summary_of(bundle)
@@ -383,6 +430,7 @@ def completion_problems(done, bundle):
     if bundle.get("schema") == BUNDLE_V3 and bundle["cell"].get("schema") not in (
             "finfolk.redqueen.plan/1", "finfolk.redqueen.plan/2"):
         return probs + ["a /3 bundle without a supported plan schema"]
+    probs += age_summary_problems(bundle)
     if not sharing_required(bundle.get("schema"), bundle["cell"].get("schema")):
         return probs + (["a plan/1 bundle with a plan/2 transplant group"] if done.get("transplant_group") else [])
     c, sh = bundle.get("cell") or {}, bundle.get("sharing")
