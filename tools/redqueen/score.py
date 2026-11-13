@@ -38,9 +38,11 @@ baseline subtracted), the exposure K x h x dt, and no predator birth, refill or 
 from __future__ import annotations
 
 import argparse
+from bisect import bisect_right
 import csv
 import io
 import json
+import math
 import os
 import sys
 
@@ -50,6 +52,7 @@ import ckpt  # noqa: E402
 SCHEMA = "finfolk.redqueen.score/1"
 DT = 0.016          # main.cpp fixedDt
 FROZEN = ("frozen", "frozen-newborn")
+START_AGE_EDGES_S = tuple(range(0, 121, 12))  # fixed diagnostic bins; not the cell's maxAge
 
 
 class ScoreError(Exception):
@@ -65,6 +68,53 @@ def read_predators_csv(text):
 
 def _ratio(a, b):
     return a / b if b > 0 else None
+
+
+def _start_ages(arena, start_ids):
+    """The initial cohort's ages at f0, keyed by the same IDs as the survival readout."""
+    max_age = (arena.get("config") or {}).get("maxAge")
+    if (isinstance(max_age, bool) or not isinstance(max_age, (int, float)) or
+            not math.isfinite(max_age) or max_age < 0):
+        raise ScoreError("arena.json: missing or invalid config.maxAge")
+    cs = arena["creatures"]
+    ages = cs.get("age")
+    if not isinstance(ages, list) or len(ages) != len(cs["id"]):
+        raise ScoreError("arena.json: missing start age (creature age column incomplete)")
+    by_id = {}
+    for i, age in zip(cs["id"], ages):
+        if int(i) not in start_ids:
+            continue
+        if (isinstance(age, bool) or not isinstance(age, (int, float)) or
+                not math.isfinite(age) or not 0 <= age <= max_age):
+            raise ScoreError(f"arena.json: start age {age!r} for prey {i} outside [0, maxAge={max_age}]")
+        if age > START_AGE_EDGES_S[-1]:
+            raise ScoreError(f"arena.json: start age {age} for prey {i} outside fixed diagnostic bins "
+                             f"[0, {START_AGE_EDGES_S[-1]}] s")
+        by_id[int(i)] = age
+    if set(by_id) != start_ids:
+        raise ScoreError("arena.json: missing start age for an initial-cohort ID")
+    return by_id, max_age
+
+
+def _age_strata(start_ages, alive_ids, max_age, h, dt, n_start, survivors):
+    """Partition by START age, independently by fixed seconds bins and age-only feasibility."""
+    bins = [{"n_start": 0, "survivors": 0} for _ in START_AGE_EDGES_S[1:]]
+    structural = {k: {"n_start": 0, "survivors": 0} for k in ("feasible", "infeasible")}
+    limit = max_age - h * dt
+    for i, age in start_ages.items():
+        # bisect puts interior edges in the bin on their right; the final edge is closed.
+        b = min(bisect_right(START_AGE_EDGES_S, age) - 1, len(bins) - 1)
+        for stratum in (bins[b], structural["feasible" if age <= limit else "infeasible"]):
+            stratum["n_start"] += 1
+            stratum["survivors"] += int(i in alive_ids)
+    for label, strata in (("bins", bins), ("feasibility", structural.values())):
+        if (sum(s["n_start"] for s in strata) != n_start or
+                sum(s["survivors"] for s in strata) != survivors):
+            raise ScoreError(f"horizon {h}: age strata {label} do not sum to n_start / survivors")
+    if structural["infeasible"]["survivors"] != 0:
+        raise ScoreError(f"horizon {h}: age-infeasible initial prey survived")
+    return {"bin_edges_s": list(START_AGE_EDGES_S), "bins": bins,
+            "max_age_s": max_age, "feasible_start_age_max_s": limit, **structural}
 
 
 def scripted_problems(cp, k, what):
@@ -88,10 +138,15 @@ def score(d, k, steps, horizons, log_every, assay, fork=False, scripted=False):
     control could otherwise be refilled by a predator floor and still pass). scripted: K fixed,
     immortal Stage A hunters (no brain: no predators.csv): captures are the predation-death counter's
     difference (exact), the exposure K x h x dt; K and no predator birth or refill at every horizon."""
-    arena = ckpt.load(os.path.join(d, "arena.json"))
+    # Read ages before the adapter's general validation so missing / non-finite ages are
+    # reported as scoring failures, just like out-of-range ages and the partition invariants.
+    arena_path = os.path.join(d, "arena.json")
+    arena = ckpt.load(arena_path, check=False)
     f0 = int(arena["world"]["frame"])
     start_ids = {int(i) for i, a in zip(arena["creatures"]["id"], arena["creatures"]["alive"]) if int(a)}
     n0 = len(start_ids)
+    start_ages, max_age = _start_ages(arena, start_ids)
+    ckpt.validate(arena, arena_path)
     k_arena = int(arena["predators"]["count"])
     if k_arena != k:
         raise ScoreError(f"the arena has {k_arena} predators, the cell asked for K = {k}")
@@ -163,6 +218,8 @@ def score(d, k, steps, horizons, log_every, assay, fork=False, scripted=False):
             vbuds = sum(int(r["virtual_buds_interval"]) for r in rows)
         cs = cp["creatures"]
         survivors = sum(1 for i, a in zip(cs["id"], cs["alive"]) if int(a) and int(i) in start_ids)
+        alive_ids = {int(i) for i, a in zip(cs["id"], cs["alive"]) if int(a)}
+        age_strata = _age_strata(start_ages, alive_ids, max_age, h, DT, n0, survivors)
         ctr = cp["counters"]
         dc = {key: int(ctr[key]) - int(base.get(key, 0)) for key in
               ("totalBirths", "totalDeaths", "totalDeathsPredation", "totalDeathsStarvation", "totalDeathsAge")}
@@ -186,6 +243,7 @@ def score(d, k, steps, horizons, log_every, assay, fork=False, scripted=False):
             "virtual_bud_rate": _ratio(vbuds, pred_s), "pursuit_seconds": pursuit_s,
             "captures_per_pursuit_s": _ratio(captures, pursuit_s) if pursuit_s is not None else None,
             "survivors": survivors, "survival": _ratio(survivors, n0),
+            "age_strata": age_strata,
             "prey": int(cs["count"]), "predators": int(cp["predators"]["count"]),
             "births": dc["totalBirths"], "deaths": dc["totalDeaths"],
             "deaths_predation": dc["totalDeathsPredation"], "deaths_starvation": dc["totalDeathsStarvation"],

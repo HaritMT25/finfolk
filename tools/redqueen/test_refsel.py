@@ -619,10 +619,18 @@ class TestCollectAndCli(Base):
         self.assertEqual(len(pick), 33)
 
         def bundle(r, n=600):
-            return {"cell": r, "score": {"n_start": n, "horizons": [{"steps": 5000, "survivors": 400, "captures": 50}]}}
+            return {"schema": "finfolk.redqueen.bundle/2", "cell": r,
+                    "score": {"n_start": n, "horizons": [{"steps": 5000, "survivors": 400, "captures": 50}]}}
         rest = sorted(set(rows) - {r["id"] for r in pick})
         doc = rs.collect(self.study({r["id"]: bundle(r) for r in pick}), d, pp, rest)
         self.assertEqual(len(doc["observations"]), 33)
+        import score
+        newer = {r["id"]: bundle(r) for r in pick}
+        for b in newer.values():
+            b["schema"] = "finfolk.redqueen.bundle/3"
+            b["score"]["horizons"][0]["age_strata"] = score._age_strata(
+                dict.fromkeys(range(600), 0), set(range(400)), 120, 5000, score.DT, 600, 400)
+        self.assertEqual(rs.collect(self.study(newer), d, pp, rest), doc)
         with self.assertRaises(rs.RefselError):
             rs.collect(self.study({r["id"]: bundle(r) for r in pick}), d, pp)
         with self.assertRaises(rs.RefselError):

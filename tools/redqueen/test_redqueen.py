@@ -28,6 +28,7 @@ import rqlib  # noqa: E402
 import run  # noqa: E402
 import store  # noqa: E402
 import cell  # noqa: E402
+import score  # noqa: E402
 
 REPO = os.path.dirname(os.path.dirname(HERE))
 NPC, BLEN = 3, 2
@@ -46,7 +47,7 @@ def mk_cp(n_prey=8, n_pred=3, version=2, frame=100, seed=1, cfg_extra=None):
     rng = rqlib.SplitMix64(seed)
     u = lambda: rng.below(10 ** 6) / 10 ** 6  # noqa: E731
     cfg = {"genomeMinLength": 1, "genomeMaxLength": 12, "minPopulation": 0, "maxPopulation": 50,
-           "fastTanh": False, "bodyModel": False, "predatorCount": n_pred, "predatorSpeed": 110}
+           "fastTanh": False, "bodyModel": False, "predatorCount": n_pred, "predatorSpeed": 110, "maxAge": 120.0}
     if version == 2:
         cfg.update(predatorBrain=True, predatorMutation=1, predatorTurnRate=4, predatorMinSpeed=0,
                    predatorPrimer=False, predatorFrozen=False)
@@ -446,6 +447,49 @@ class TestStore(unittest.TestCase):
             store.pack(self.root, log=lambda m: None)
         self.assertTrue(os.path.exists(os.path.join(self.root, store.WORK, "t4", "bundle.json")))
 
+    def test_age_bundle_versions_pack_and_read_unchanged(self):
+        """Old /1 and /2 bytes remain readable beside /3, with or without plan/2 sharing."""
+        expected = {}
+        for version, plan2 in ((1, False), (2, True), (3, False), (3, True)):
+            cid = f"v{version}-p{int(plan2) + 1}"
+            raw = self.mk_cell(cid, group=cid, transplant=(cid, "d" * 64) if plan2 else None)
+            bundle = json.loads(raw)
+            bundle["schema"] = f"finfolk.redqueen.bundle/{version}"
+            bundle["score"] = {"schema": score.SCHEMA, "n_start": 1,
+                               "horizons": [{"steps": 5000, "survivors": 1}]}
+            if version == 3:
+                bundle["score"]["horizons"][0]["age_strata"] = score._age_strata(
+                    {7: 0}, {7}, 120, 5000, score.DT, 1, 1)
+            d = os.path.join(self.root, store.WORK, cid)
+            raw = rqlib.canonical(bundle)
+            done = rqlib.read_json(os.path.join(d, "done.json"))
+            done["bundle_sha256"] = rqlib.sha256_bytes(raw)
+            wr(os.path.join(d, "bundle.json"), raw)
+            rqlib.write_json_durable(os.path.join(d, "done.json"), done)
+            self.assertEqual(store.completion_problems(done, bundle), [])
+            expected[cid] = raw
+        store.pack(self.root, log=lambda m: None)
+        _, cells = store.load_index(self.root)
+        self.assertEqual(store.index_problems(self.root, cells), [])
+        for cid, raw in expected.items():
+            self.assertEqual(store.read_member(self.root, cid, cells=cells), raw)
+            self.assertEqual(run.find_bundle(self.root, cid), (raw, "chunk"))
+        # /3 plan/2 retains every sharing check, including the fast indexed checks.
+        b = json.loads(expected["v3-p2"])
+        done = json.loads(store.read_member(self.root, "v3-p2", "done.json", cells))
+        del b["sharing"]
+        self.assertTrue(any("sharing record" in p for p in store.completion_problems(done, b)))
+        b["cell"].pop("schema")
+        self.assertTrue(any("plan schema" in p for p in store.completion_problems(done, b)))
+        e = cells["v3-p2"][1]
+        e.pop("role")
+        self.assertTrue(any("sharing summary" in p for p in store.index_problems(self.root, cells)))
+        e["transplant_group"] = e["transplant_realized_sha256"] = None
+        with self.assertRaisesRegex(store.StoreError, "without its group"):
+            store.transplant_groups(cells)
+        del e["plan_schema"]
+        self.assertTrue(any("plan schema" in p for p in store.index_problems(self.root, cells)))
+
     def test_v2_completions_checked(self):
         """Review of 03a608b, P2 1: packing (and resume) require a /2 completion's sharing record and
         cross-check done.json's role and transplant summary against the hash-valid bundle; a /2 bundle
@@ -823,6 +867,141 @@ class TestSharing(unittest.TestCase):
         self.assertEqual(cell.sharing_record(c, mk_cp(n_pred=0), {}, files)["realized"]["transplant"]["picked"], [])
 
 
+class TestAgeStrata(unittest.TestCase):
+    """Synthetic checkpoints only: start ages survive slot changes and births at the horizon."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.d = self.tmp.name
+        self.ages = [0, 11.999, 12, 23.999, 24, 35.999, 36, 40, 40.001, 47.999,
+                     48, 59.999, 60, 71.999, 72, 83.999, 84, 95.999, 96, 107.999,
+                     108, 119.999, 120]
+        self.arena = mk_cp(n_prey=len(self.ages) + 1, n_pred=0, frame=100)
+        self.arena["creatures"]["age"] = self.ages + [-1]  # a dead slot is outside the initial cohort
+        self.arena["creatures"]["alive"][-1] = 0
+
+    def write(self, horizons=(5000,), survive_ages=(0, 12, 24, 36, 40)):
+        wr(os.path.join(self.d, "arena.json"), ckpt.dumps(self.arena))
+        f0 = self.arena["world"]["frame"]
+        rows = []
+        for h in horizons:
+            cp = copy.deepcopy(self.arena)
+            cp["world"].update(frame=f0 + h, nextId=100000)
+            prey = ckpt.prey(cp, alive_only=True)
+            for r in prey:
+                r["alive"] = int(r["age"] in survive_ages)
+                r["age"] = 1.0                      # deliberately different from START ages
+            n_dead = sum(not r["alive"] for r in prey)
+            child = dict(prey[0], id=99999, lineageId=prey[0]["id"], generation=1, age=0, alive=1)
+            ckpt.set_prey(cp, list(reversed(prey + [child])))
+            cp["counters"]["totalBirths"] += 1
+            cp["counters"]["totalDeaths"] += n_dead
+            cp["counters"]["totalDeathsAge"] += n_dead
+            wr(os.path.join(self.d, f"end.{f0 + h}.json"), ckpt.dumps(cp))
+        for h in range(100, max(horizons) + 1, 100):
+            rows.append(f"{f0+h},0,0,0,0,0,0,0,0\n")
+        wr(os.path.join(self.d, "run.predators.csv"),
+           "step,predator_pop,captures_interval,births_interval,deaths_starv_interval,"
+           "deaths_age_interval,reseeds_interval,pursuit_frac,virtual_buds_interval\n" + "".join(rows))
+
+    def scored(self, horizons=(5000,), assay="frozen", fork=True):
+        return score.score(self.d, 0, max(horizons), list(horizons), 100, assay, fork=fork)
+
+    def test_bins_and_structural_split_by_start_id(self):
+        self.write()
+        for assay in ("frozen", "frozen-newborn", "live"):
+            for fork in (True, False):
+                with self.subTest(assay=assay, fork=fork):
+                    sc = self.scored(assay=assay, fork=fork)
+                    h = sc["horizons"][0]
+                    a = h["age_strata"]
+                    self.assertEqual(a["bin_edges_s"], list(range(0, 121, 12)))
+                    self.assertEqual([b["n_start"] for b in a["bins"]], [2, 2, 2, 4, 2, 2, 2, 2, 2, 3])
+                    self.assertEqual([b["survivors"] for b in a["bins"]], [1, 1, 1, 2, 0, 0, 0, 0, 0, 0])
+                    self.assertEqual(a["feasible"], {"n_start": 8, "survivors": 5})
+                    self.assertEqual(a["infeasible"], {"n_start": 15, "survivors": 0})
+                    self.assertEqual(a["max_age_s"], self.arena["config"]["maxAge"])
+                    self.assertEqual(a["feasible_start_age_max_s"], 40)
+                    self.assertEqual((sc["n_start"], h["survivors"], h["prey"]), (23, 5, 24))
+
+    def test_horizon_specific_feasibility_and_empty_strata(self):
+        self.write(horizons=(7500, 10000, 20000), survive_ages=())
+        sc = self.scored((7500, 10000, 20000))
+        for h, n in zip(sc["horizons"], (1, 0, 0)):
+            a = h["age_strata"]
+            self.assertEqual(a["feasible"], {"n_start": n, "survivors": 0})
+            self.assertEqual(a["infeasible"], {"n_start": 23 - n, "survivors": 0})
+            self.assertEqual(sum(b["n_start"] for b in a["bins"]), sc["n_start"])
+            self.assertEqual(sum(b["survivors"] for b in a["bins"]), h["survivors"])
+        # Empty initial cohort remains a complete ten-bin partition with zero counts.
+        self.arena["creatures"]["alive"] = [0] * len(self.arena["creatures"]["alive"])
+        wr(os.path.join(self.d, "arena.json"), ckpt.dumps(self.arena))
+        end = copy.deepcopy(self.arena)
+        end["world"]["frame"] += 5000
+        wr(os.path.join(self.d, "end.5100.json"), ckpt.dumps(end))
+        p = os.path.join(self.d, "run.predators.csv")
+        wr(p, "\n".join(rqlib.read_text(p).splitlines()[:51]) + "\n")
+        h = self.scored()["horizons"][0]
+        self.assertEqual(h["survivors"], 0)
+        self.assertTrue(all(b == {"n_start": 0, "survivors": 0} for b in h["age_strata"]["bins"]))
+
+    def test_actual_max_age_and_step_constant(self):
+        from unittest.mock import patch
+        self.ages = [0, 12, 24, 36, 48, 60]
+        self.arena = mk_cp(n_prey=6, n_pred=0, frame=100, cfg_extra={"maxAge": 60})
+        self.arena["creatures"]["age"] = self.ages
+        self.write(horizons=(1000,), survive_ages=(0, 12, 24, 36))
+        with patch.object(score, "DT", 0.024):
+            sc = self.scored((1000,))
+        a = sc["horizons"][0]["age_strata"]
+        self.assertEqual((sc["dt"], a["max_age_s"], a["feasible_start_age_max_s"]), (0.024, 60, 36))
+        self.assertEqual(a["feasible"], {"n_start": 4, "survivors": 4})
+        self.assertEqual(a["infeasible"], {"n_start": 2, "survivors": 0})
+        self.assertTrue(all(b["n_start"] == 0 for b in a["bins"][6:]))
+
+    def test_missing_invalid_or_out_of_range_start_age_refused(self):
+        original = copy.deepcopy(self.arena)
+        for ages in (None, [], self.ages[:-1], [None] + self.ages[1:] + [-1],
+                     [-0.001] + self.ages[1:] + [-1], [120.001] + self.ages[1:] + [-1],
+                     [float("nan")] + self.ages[1:] + [-1], [float("inf")] + self.ages[1:] + [-1],
+                     [True] + self.ages[1:] + [-1]):
+            with self.subTest(ages=ages):
+                self.arena = copy.deepcopy(original)
+                if ages is None:
+                    del self.arena["creatures"]["age"]
+                else:
+                    self.arena["creatures"]["age"] = ages
+                wr(os.path.join(self.d, "arena.json"), json.dumps(self.arena))
+                with self.assertRaisesRegex(score.ScoreError, "start age"):
+                    self.scored()
+        self.arena = original
+        for max_age in (None, -1, True, "120", float("nan"), float("inf")):
+            with self.subTest(max_age=max_age):
+                self.arena["config"]["maxAge"] = max_age
+                wr(os.path.join(self.d, "arena.json"), json.dumps(self.arena))
+                with self.assertRaisesRegex(score.ScoreError, "config.maxAge"):
+                    self.scored()
+        self.arena["config"]["maxAge"] = 240
+        self.arena["creatures"]["age"][0] = 121
+        wr(os.path.join(self.d, "arena.json"), ckpt.dumps(self.arena))
+        with self.assertRaisesRegex(score.ScoreError, "fixed diagnostic bins"):
+            self.scored()
+
+    def test_infeasible_survivor_refused_at_each_horizon(self):
+        for h in (5000, 10000, 20000):
+            with self.subTest(h=h):
+                self.write(horizons=(h,), survive_ages=(120,))
+                with self.assertRaisesRegex(score.ScoreError, "age-infeasible"):
+                    self.scored((h,))
+
+    def test_partition_invariants_refuse_incorrect_totals(self):
+        # Independently wrong expected totals must exercise both scorer guards.
+        for n, s in ((2, 1), (1, 0)):
+            with self.subTest(n=n, s=s), self.assertRaisesRegex(score.ScoreError, "do not sum"):
+                score._age_strata({7: 0}, {7}, 120, 5000, score.DT, n, s)
+
+
 class TestFork(unittest.TestCase):
     """Review round 2, P2-5: a predator-free continuation with predators, captures, births or refills
     at any time is refused."""
@@ -926,6 +1105,7 @@ class TestScripted(unittest.TestCase):
         s = self.score()
         h = s["horizons"][0]
         self.assertEqual((h["captures"], h["deaths_predation"], h["survivors"], h["predators"]), (2, 2, 4, 3))
+        self.assertEqual(h["age_strata"]["feasible"], {"n_start": 6, "survivors": 4})
         self.assertAlmostEqual(h["predator_seconds"], 3 * 200 * score.DT)
         self.assertEqual((s["scripted"], s["checks"]["rows"], s["checks"]["predation_deaths_equal_captures"]),
                          (True, None, "by construction (scripted)"))

@@ -30,6 +30,17 @@ execute(cell, d, exe, paths) runs, in the empty directory d:
      and the source contents: the same row gives the same bytes (tested), and a replay compares
      them. What is not (wall times, host) goes into done.json, outside the bundle.
 
+Age diagnostics (bundle /3; the nested score's existing fields and schema stay unchanged):
+each score.horizons entry adds age_strata. bin_edges_s and bins describe ten START-age bins
+[0,12), [12,24), ..., [108,120] seconds (the last closed); each bin has n_start and survivors.
+feasible and infeasible carry the same counts for start age <= max_age_s - horizon * score.dt
+and its complement; feasible_start_age_max_s records that threshold. Ages come from arena.json
+at f0, keyed by the initial prey IDs, never the horizon's ages. max_age_s is config.maxAge;
+dt is score.py's engine fixed-step constant. Missing / invalid ages, ages beyond the fixed bins,
+partition-total mismatches and any infeasible survivor refuse scoring. Empty strata remain zero.
+Readers accept old /1 and /2 bundles without age_strata (unavailable, never inferred or rewritten)
+and /3 for either plan version; plan/2 still requires its sharing record in /2 and /3 bundles.
+
 Exit codes (also the worker's): 0 ok, 2 the engine is not a serial build, 3 an engine call
 failed, 4 a score check failed, 5 a source is missing or not its registered content (hashed
 from the very bytes parsed), 6 the checkpoint schedule is incomplete, 7 (the worker) the
@@ -54,6 +65,7 @@ import score as score_mod  # noqa: E402
 
 BUNDLE_SCHEMA = "finfolk.redqueen.bundle/1"
 BUNDLE_SCHEMA_V2 = "finfolk.redqueen.bundle/2"   # a plan/2 row's (reference ages, roles, global seeds)
+BUNDLE_SCHEMA_V3 = "finfolk.redqueen.bundle/3"   # start-age diagnostics, either plan version
 SHARING_SCHEMA = "finfolk.redqueen.sharing/1"
 OUTPUT_TOOLS = ("rqlib.py", "ckpt.py", "common.py", "score.py", "cell.py")   # what a bundle depends on
 TIMING_COLS = ("elapsed_s", "steps_per_sec")   # run.csv columns that depend on the machine, not the run
@@ -337,7 +349,7 @@ def execute(cell, d, exe, paths, procs=None):
     arena_manifest = rqlib.read_json(os.path.join(d, "arena.manifest.json"))
     plan2 = cell.get("schema") == "finfolk.redqueen.plan/2"
     bundle = {
-        "schema": BUNDLE_SCHEMA_V2 if plan2 else BUNDLE_SCHEMA,
+        "schema": BUNDLE_SCHEMA_V3,
         "cell": cell,
         "binary_sha256": rqlib.sha256_file(exe), "tools_sha256": tools_sha256(),
         "engine_args": {"transplant": targs, "assay": aargs},

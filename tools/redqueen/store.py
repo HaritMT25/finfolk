@@ -346,6 +346,13 @@ def pair_groups(cells):
 
 SHARING_SCHEMA = "finfolk.redqueen.sharing/1"
 BUNDLE_V2 = "finfolk.redqueen.bundle/2"
+BUNDLE_V3 = "finfolk.redqueen.bundle/3"
+
+
+def sharing_required(bundle_schema, plan_schema):
+    """/2 always used plan/2; /3 adds age diagnostics for both plan/1 and plan/2."""
+    return bundle_schema == BUNDLE_V2 or (bundle_schema == BUNDLE_V3 and
+                                        plan_schema == "finfolk.redqueen.plan/2")
 
 
 def summary_of(bundle):
@@ -364,8 +371,8 @@ def summary_of(bundle):
 def completion_problems(done, bundle):
     """How a completion's done.json disagrees with its (hash-valid) bundle. Every summary the store
     indexes is the bundle's (summary_of: kind, row hash, common group and checkpoint, pair group,
-    prey settings), whatever the schema. A /2 bundle must carry its sharing record (one completed
-    before 03a608b: refused, never mixed in) whose keys, seeds and realized common checkpoint are
+    prey settings), whatever the schema. A plan/2 bundle (/2 or /3) must carry its sharing record
+    (one completed before 03a608b: refused, never mixed in) whose keys, seeds and realized common checkpoint are
     the cell's and the bundle's; done.json's role, families, transplant group and realized draw
     must be the bundle's (an assay's realized draw is required)."""
     if not isinstance(bundle.get("cell"), dict):
@@ -373,11 +380,14 @@ def completion_problems(done, bundle):
     want = summary_of(bundle)
     probs = [f"done.json's {k} ({str(done.get(k))[:24]}) is not the bundle's ({str(v)[:24]})"
              for k, v in want.items() if done.get(k) != v]
-    if bundle.get("schema") != BUNDLE_V2:
-        return probs + (["a /1 bundle with a /2 transplant group"] if done.get("transplant_group") else [])
+    if bundle.get("schema") == BUNDLE_V3 and bundle["cell"].get("schema") not in (
+            "finfolk.redqueen.plan/1", "finfolk.redqueen.plan/2"):
+        return probs + ["a /3 bundle without a supported plan schema"]
+    if not sharing_required(bundle.get("schema"), bundle["cell"].get("schema")):
+        return probs + (["a plan/1 bundle with a plan/2 transplant group"] if done.get("transplant_group") else [])
     c, sh = bundle.get("cell") or {}, bundle.get("sharing")
     if not isinstance(sh, dict) or sh.get("schema") != SHARING_SCHEMA:
-        return probs + ["a /2 bundle without its sharing record (completed before 03a608b): rerun it in a new root"]
+        return probs + ["a plan/2 bundle without its sharing record (completed before 03a608b): rerun it in a new root"]
     if sh.get("keys") != c.get("groups") or sh.get("seeds") != c.get("seeds"):
         probs.append("the sharing record's keys or seeds are not the cell's")
     if (sh.get("realized") or {}).get("common_sha256") != want["common_sha256"]:
@@ -388,7 +398,7 @@ def completion_problems(done, bundle):
     tg = f"{(c.get('groups') or {}).get('transplant')}|k{c.get('k')}" if c.get("kind") == "assay" else None
     th = (sh.get("realized") or {}).get("transplant_realized_sha256") if tg else None
     if tg and not th:
-        probs.append("a /2 assay whose sharing record lacks its realized transplant draw")
+        probs.append("a plan/2 assay whose sharing record lacks its realized transplant draw")
     if done.get("transplant_group") != tg or done.get("transplant_realized_sha256") != th:
         probs.append(f"done.json's transplant group / realized draw ({done.get('transplant_group')}) are not the "
                      f"bundle's ({tg})")
@@ -397,8 +407,8 @@ def completion_problems(done, bundle):
 
 def index_problems(root, cells=None):
     """(Review of d4dc4b7, P2 1) Every indexed cell, not only those of the plan being run or packed:
-    an entry packed with its bundle's schema recorded must, if /2, carry its sharing summary (role,
-    transplant group); an older entry (no "bundle_schema") is checked against its chunk's bundle and
+    a plan/2 entry (/2 or /3 bundle) must carry its sharing summary (role, transplant group);
+    /3 entries record the plan schema too. An older entry (no "bundle_schema") is checked against its chunk's bundle and
     done.json (completion_problems): a root holding a /2 completion without sharing records, or with
     summaries its bundle contradicts, is refused (a /2 study is rerun in a new root) -> problems."""
     if cells is None:
@@ -406,8 +416,12 @@ def index_problems(root, cells=None):
     probs = []
     for cid, (rec, e) in sorted(cells.items()):
         if "bundle_schema" in e:
-            if e["bundle_schema"] == BUNDLE_V2 and ("transplant_group" not in e or not e.get("role")):
-                probs.append(f"{cid}: a /2 completion indexed without its sharing summary")
+            if e["bundle_schema"] == BUNDLE_V3 and e.get("plan_schema") not in (
+                    "finfolk.redqueen.plan/1", "finfolk.redqueen.plan/2"):
+                probs.append(f"{cid}: a /3 completion indexed without its plan schema")
+            if sharing_required(e["bundle_schema"], e.get("plan_schema")) and (
+                    "transplant_group" not in e or not e.get("role")):
+                probs.append(f"{cid}: a plan/2 completion indexed without its sharing summary")
             continue
         try:
             b = json.loads(read_member(root, cid, "bundle.json", cells))
@@ -419,8 +433,8 @@ def index_problems(root, cells=None):
             probs.append(f"{cid}: its packed bundle or done.json is not a JSON object")
             continue
         probs += [f"{cid} (packed in {rec['chunk']}): {p}" for p in completion_problems(d, b)]
-        if b.get("schema") == BUNDLE_V2 and "transplant_group" not in e:
-            probs.append(f"{cid} (packed in {rec['chunk']}): a /2 completion indexed without its sharing summary")
+        if sharing_required(b.get("schema"), (b.get("cell") or {}).get("schema")) and "transplant_group" not in e:
+            probs.append(f"{cid} (packed in {rec['chunk']}): a plan/2 completion indexed without its sharing summary")
     return probs
 
 
@@ -432,7 +446,8 @@ def transplant_groups(cells):
     out = {}
     for cid, (_, e) in cells.items():
         g, h = e.get("transplant_group"), e.get("transplant_realized_sha256")
-        if bool(g) != bool(h) or (not g and e.get("bundle_schema") == BUNDLE_V2 and e.get("kind") == "assay"):
+        if bool(g) != bool(h) or (not g and sharing_required(e.get("bundle_schema"), e.get("plan_schema")) and
+                                  e.get("kind") == "assay"):
             raise StoreError(f"cell {cid}: an indexed transplant summary without its group or realized draw "
                              f"({g}, {h})")
         if g:
@@ -510,6 +525,8 @@ def pack(root, ids=None, log=print):
                         "pair_group": pg, "prey_config_sha256": ph, "kind": done.get("kind"),
                         "role": done.get("role"), "transplant_group": tg, "transplant_realized_sha256": th,
                         "bundle_schema": bjson.get("schema")}
+        if bjson.get("schema") == BUNDLE_V3:
+            entries[cid]["plan_schema"] = bjson["cell"].get("schema")
     cdir = os.path.join(root, CHUNKS)
     if not os.path.isdir(cdir):
         os.makedirs(cdir, exist_ok=True)

@@ -1078,7 +1078,9 @@ class TestCollect(unittest.TestCase):
         pick = rows[:3]
 
         def bundle(r, n=600):
-            return {"cell": r, "score": {"n_start": n, "horizons": [{"steps": h, "survivors": 400, "captures": 50}
+            return {"schema": "finfolk.redqueen.bundle/2", "cell": r,
+                    "score": {"n_start": n, "horizons": [{"steps": h, "survivors": 400 if h == 5000 else 0,
+                                                         "captures": 50}
                                                                      for h in nb.HORIZONS]}}
 
         def study(bundles):
@@ -1098,6 +1100,17 @@ class TestCollect(unittest.TestCase):
         doc = nb.collect(study({r["id"]: bundle(r) for r in pick}), d, pp, rest)
         self.assertEqual(len(doc["observations"]), 3)
         self.assertEqual(sorted(doc["observations"][0]["horizons"]), ["10000", "20000", "5000"])
+        # Collection reads legacy bundles without diagnostics and /3 bundles identically.
+        import score
+        newer = {r["id"]: bundle(r) for r in pick}
+        for b in newer.values():
+            b["schema"] = "finfolk.redqueen.bundle/3"
+            for h in b["score"]["horizons"]:
+                h["age_strata"] = score._age_strata(dict.fromkeys(range(600), 0),
+                                                    set(range(400)) if h["steps"] == 5000 else set(),
+                                                    120, h["steps"], score.DT, 600,
+                                                    400 if h["steps"] == 5000 else 0)
+        self.assertEqual(nb.collect(study(newer), d, pp, rest), doc)
         with self.assertRaises(nb.NoiseBankError):
             nb.collect(study({r["id"]: bundle(r) for r in pick}), d, pp)                      # (undeclared missing)
         with self.assertRaises(nb.NoiseBankError):

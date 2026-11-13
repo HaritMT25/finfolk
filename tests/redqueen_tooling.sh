@@ -44,7 +44,7 @@
 #      sampling, reference ages permuted per prey snapshot x replicate (common manifest /2), one
 #      common checkpoint and reseed per prey snapshot x replicate and one transplant seed per
 #      predator snapshot x replicate across families, short and long horizons (the long subset
-#      exact), bundles /2 with their roles in the chunk index, the actual sharing recorded (group
+#      exact), bundles /3 with their roles in the chunk index, the actual sharing recorded (group
 #      keys, seeds, the realized common checkpoint, donor draw and placement: one per transplant
 #      group, checked at packing), and a replay.
 set -u
@@ -523,7 +523,7 @@ assert lm["units"] == 6 and lm["long"] == 2, lm          # (the scripted edge's 
 B = {c: json.loads(store.read_member("r15", c, cells=cells)) for c in cells}
 for cid, b in B.items():
     c = b["cell"]
-    assert b["schema"] == "finfolk.redqueen.bundle/2" and cells[cid][1]["role"] == c["role"]
+    assert b["schema"] == "finfolk.redqueen.bundle/3" and cells[cid][1]["role"] == c["role"]
     hs = [h["steps"] for h in b["score"]["horizons"]]
     assert hs == ([400, 800] if c["horizon"] == "long" else [400]), (cid, hs)
     assert c["sampling"] == "wor-balanced"
