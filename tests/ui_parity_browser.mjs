@@ -66,8 +66,11 @@
 //     harness runs them before any frame (the barrier, and every settle), so the caustics fade in over the same frames
 //   - the renderer barrier, before the first step: Classic's background image decoded; the Ocean's polished fish programs
 //     compiled ahead (its swim polish ungated for one frame, so the warm-up is asked at once, then its setting back) and its
-//     decoded programs in effect (or the run fails, naming why); then a fixed number of frames (barrierFrames). After it,
-//     nothing a picture shows waits on a compile; each shot checks it still holds
+//     decoded programs in effect (or the run fails, naming why); then a fixed number of frames (barrierFrames). The frames
+//     it runs depend on the page's settings only, never on how fast the GPU compiles: the Ocean's polish frame runs whenever
+//     the polish is drawn (its want not off, detail 2 up), whether the programs were compiled already or not, so the clock
+//     and every frame count after it are the same (it checks its own count: 1 + barrierFrames, or barrierFrames with no
+//     polish). After it, nothing a picture shows waits on a compile; each shot checks it still holds
 //   - the page's own timers stay real time but are waited out: before frames run, until no one-shot timer of up to 1 s is
 //     pending (the setup sheet's insets 320 ms after its slide, a tip's 200 ms, a resize's 250 ms), so each one lands before
 //     the frames, not among them; before a shot, every one-shot timer of up to 10 s (a toast's life) as well. The page's
@@ -108,6 +111,9 @@
 //   env: PLAYWRIGHT  the playwright module (default C:/Users/harit/gemini_bridge/node_modules/playwright)
 //        BRAVE_EXE   the browser (default C:/Program Files/BraveSoftware/Brave-Browser/Application/brave.exe)
 //        BROWSER_LOCK the lock file (lock.mjs; default: the machine-wide one), BROWSER_LOCK_POLL_MS its poll
+//        UI_PARITY_READY_FIRST=1  a check of the barrier: wait (frames held) until the Ocean's polished programs are compiled
+//                     before it starts (the fast GPU's timing); its pictures must equal a run without it (the manifest's
+//                     barrierTiming says which run this was)
 // The lock is taken for each case and world (one browser), so other jobs can run between them; an interrupted run leaves a
 // manifest that is not complete (and Playwright closes its browser as the process exits).
 import { createRequire } from "node:module";
@@ -129,6 +135,7 @@ const FLAGS = { base: 1, out: 1, layout: 1, sets: 1, cases: 1, worlds: 1, name: 
                 expect: 1, smoke: 0, headed: 0, list: 0, plan: 0, clean: 0, report: 0, archival: 0, compare: 2 };
 const DEFAULT_CASES = path.join(HERE, "fixtures", "ui_parity_cases.json");
 const SHA_RE = /^[0-9a-f]{64}$/;
+const READY_FIRST = process.env.UI_PARITY_READY_FIRST === "1";
 function usage(msg) { console.error("ui_parity_browser: " + msg + "\n(the header of tests/ui_parity_browser.mjs lists the flags)"); process.exit(2); }
 function parseArgs(argv) {
   const o = {};
@@ -665,11 +672,16 @@ const INIT = (cfg) => {
     } });
   }
   /* the Ocean's renderer: its polished programs compiled ahead (prewarmStart: the polish ungated so the next frame asks for
-   * the warm-up; prewarmEnd: its setting back), its decoded programs settled, and what it is drawing with */
+   * the warm-up; prewarmEnd: its setting back), its decoded programs settled, and what it is drawing with. Whether a scene
+   * takes the polish frame is its settings' (the polish drawn: want not off, detail 2 up), never whether its programs happen
+   * to be compiled already (the review of b442a92: a fast compile skipped the frame and moved every later frame count and
+   * timestamp by one). polishReady: per scene, null (no polish drawn) or whether its programs are compiled */
   const oceans = () => U.scenes.filter((s) => s.name === "EvoOceanScene").map((s) => s.sc);
+  const polishDrawn = (p) => !!p && p.want !== "off" && p.quality >= 2;
+  U.polishReady = () => oceans().map((sc) => { const p = sc.polish ? sc.polish() : null; return polishDrawn(p) ? !!p.ready : null; });
   U.prewarmStart = () => oceans().map((sc) => {
     const p = sc.polish ? sc.polish() : null;
-    if (!p || p.want === "off" || !(p.quality >= 2) || p.ready) return null;
+    if (!polishDrawn(p)) return null;
     sc.setPolish("ungated");
     return p.want;
   });
@@ -841,13 +853,20 @@ async function setupWorld(L, world) {
   return w;
 }
 /* the renderer barrier (the header): nothing a picture shows waits on a compile, an image or an idle callback, and the page's
- * one-time hint has come and gone; then a fixed number of frames */
+ * one-time hint has come and gone; then a fixed number of frames. The frames it runs are the page's settings' alone (the polish
+ * frame whenever the polish is drawn, compiled already or not), and it checks that count */
 async function barrier(L) {
   const p = L.page, t0 = Date.now();
   await p.evaluate(() => window.__ui.flushIdle());
   await p.evaluate(() => Promise.all(window.__ui.images.map((i) => (i.decode ? i.decode().catch(() => null) : null))).then(() => true));
+  if (READY_FIRST)   /* the fast GPU's timing, on purpose: the programs the setup's frames asked for, compiled before the barrier (no frame runs) */
+    await waitFor(p, () => window.__ui.polishReady().every((r) => r !== false), null, 120000,
+                  "UI_PARITY_READY_FIRST: the Ocean's polished programs compiled before the barrier, with the frames held", () => window.__ui.rendererState());
+  const readyAtStart = await p.evaluate(() => window.__ui.polishReady());
+  const f0 = await p.evaluate(() => window.__ui.frames);
   const wants = await p.evaluate(() => window.__ui.prewarmStart());
-  if (wants.some(Boolean)) {
+  const polishFrame = wants.some(Boolean);
+  if (polishFrame) {
     await p.evaluate(() => window.__ui.runFrames(1));
     await waitFor(p, () => window.__ui.hold && window.__ui.budget === null, null, 60000, "the prewarm frame");
     await waitFor(p, (w) => window.__ui.prewarmReady(w), wants, 120000, "the barrier: the Ocean's polished programs compiled", () => window.__ui.rendererState());
@@ -858,9 +877,12 @@ async function barrier(L) {
   await waitFor(p, () => { const t = document.getElementById("toasts"); return !t || t.children.length === 0; }, null, 15000, "the barrier: #toasts empty",
                 () => Array.from((document.getElementById("toasts") || { children: [] }).children).map((t) => t.textContent));
   await frames(p, DEF.barrierFrames);
+  const spent = (await p.evaluate(() => window.__ui.frames)) - f0, budget = (polishFrame ? 1 : 0) + DEF.barrierFrames;
+  if (spent !== budget) throw new Error("the barrier ran " + spent + " frames, not its " + budget + " (" + (polishFrame ? "the polish frame + " : "") + "barrierFrames): " +
+                                        "a picture's frame count and clock would depend on more than the page's settings");
   const st = await p.evaluate(() => window.__ui.rendererState());
   if (st.failures.length) throw new Error("the barrier: the renderer is not in its full state: " + st.failures.join("; "));
-  return Object.assign(st, { prewarmed: wants.some(Boolean), ms: Date.now() - t0 });
+  return Object.assign(st, { prewarmed: polishFrame, readyAtStart, frames: spent, timing: READY_FIRST ? "ready-first" : "as-it-comes", ms: Date.now() - t0 });
 }
 const STEPS = {
   async run(L, st) {
@@ -951,7 +973,8 @@ async function runCase(run, onCapture, onExtra) {
     rec.assets = await L.page.evaluate(() => Array.from(document.scripts).map((s) => s.getAttribute("src")).filter(Boolean));
     rec.world0 = await setupWorld(L, world);
     rec.renderer = await barrier(L);
-    console.log("    barrier: " + rec.renderer.ms + " ms, idle callbacks run (all before a frame) " + rec.renderer.idleRun + ", prewarmed " + rec.renderer.prewarmed +
+    console.log("    barrier: " + rec.renderer.ms + " ms, " + rec.renderer.frames + " frames, idle callbacks run (all before a frame) " + rec.renderer.idleRun +
+                ", polish frame " + rec.renderer.prewarmed + " (programs compiled at its start: " + JSON.stringify(rec.renderer.readyAtStart) + ", " + rec.renderer.timing + ")" +
                 ", scenes " + JSON.stringify(rec.renderer.scenes.map((s) => s.name + (s.polish ? " polish " + s.polish.variant + (s.polish.ready ? " ready" : "") : "") +
                 (s.optimization ? " decoded " + s.optimization.effective.decoded : ""))));
     for (const st of c.steps) {
@@ -1006,7 +1029,7 @@ async function smoke(s, onCapture) {
 const summary = { started: new Date().toISOString(), base: BASE, layout: LAYOUT, routes: ROUTES, defaults: DEF, cases: [], smoke: [] };
 const manifest = { format: FORMAT, version: FORMAT_VERSION, harness: sha256(fs.readFileSync(SELF)), fixture: FIX_SHA, fixtureFile: CASES_FILE,
                    base: BASE, layout: LAYOUT, selection: PLAN.selection, started: summary.started, finished: null, status: "running", complete: false,
-                   expectMode: EXPECT_MODE, policy: DEF.compare, expected: EXPECTED.concat(PLAN.smokes.map((s) => "smoke__" + s.label + ".png")), captures: {}, extra: [], runs: [], smoke: [] };
+                   expectMode: EXPECT_MODE, barrierTiming: READY_FIRST ? "ready-first" : "as-it-comes", policy: DEF.compare, expected: EXPECTED.concat(PLAN.smokes.map((s) => "smoke__" + s.label + ".png")), captures: {}, extra: [], runs: [], smoke: [] };
 const save = () => {
   fs.writeFileSync(path.join(OUT, "summary.json"), JSON.stringify(summary, null, 1));
   fs.writeFileSync(path.join(OUT, "manifest.json"), JSON.stringify(manifest, null, 1));

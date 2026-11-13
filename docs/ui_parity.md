@@ -90,13 +90,15 @@ node tests\ui_parity_browser.mjs --base http://localhost:8262 --out OUT\after --
 
 - The PNGs, `CASE__WORLD__SHOT.png`.
 - **`manifest.json`**, the run's evidence, written before the first case and kept current after each: the harness's and the cases
-  file's sha256, the selection, every capture the run was to take (`expected`), every one it took (`captures`: its sha256, size,
-  case, set, world, shot, and the difference policy the cases file gives it), each run's outcome. `complete` is true only at a clean
+  file's sha256, the selection, the barrier's timing (`barrierTiming`), every capture the run was to take (`expected`), every one it
+  took (`captures`: its sha256, size, case, set, world, shot, and the difference policy the cases file gives it), each run's
+  outcome. `complete` is true only at a clean
   end with every run passed and every expected capture taken; an interrupted run (Ctrl+C: the lock is released and Playwright
   closes its browser as the process exits) leaves `complete: false`.
-- `summary.json` (per case and world: the URL, the page's script names, the renderer's state after the barrier, each shot's state:
-  tick, paused, held, the focused element and whether its ring shows, the dashboards' and the setup's selected and tabbable tabs, the
-  speed label, toasts; every page error) and `index.md` (case, world, shot, file, state).
+- `summary.json` (per case and world: the URL, the page's script names, the renderer's state after the barrier and the frames it
+  ran, each shot's state: tick, the page's frame count, paused, held, the focused element and whether its ring shows, the
+  dashboards' and the setup's selected and tabbable tabs, the speed label, toasts; every page error) and `index.md` (case, world,
+  shot, file, state).
 - A run fails (exit 1) on any page error or warning, a step that cannot be done, a shot whose state is not its `expect`, a shot with
   a toast showing (unless `"toasts": "keep"`), a shot while the frames run free, the renderer not in its full state, or timers that
   never settle; each failure names the case, world and shot.
@@ -179,7 +181,13 @@ The plan's capture rules, so that the same picture comes out of every run of a c
   "click a fish" hint (9 s after ready) waited out, so it always shows with nothing selected and is gone before any step; then a fixed
   number of frames (`barrierFrames`, 90: the caustics' 1.4 s fade and the polish's 30-frame hold end inside it). Each shot checks the
   renderer is still in that state. So no picture is taken while a shader compiles, whatever the GPU's speed: a normal visit draws a
-  newly lit fish plain until its programs compile; the harness's pictures always have them compiled.
+  newly lit fish plain until its programs compile; the harness's pictures always have them compiled. The frames the barrier runs
+  depend on the page's settings only: the polish frame runs whenever the polish is drawn (its setting not off, detail 2 up),
+  whether the programs were compiled during the world's set-up already (a fast GPU) or not yet, so the clock and every frame
+  count after it are the same either way; the barrier checks its own count (1 + `barrierFrames` on the Ocean, `barrierFrames` on
+  Classic). `UI_PARITY_READY_FIRST=1` makes a run wait, with the frames held, until the programs are compiled before the barrier
+  starts (the fast GPU's timing, on purpose; the manifest's `barrierTiming` says `ready-first`): its pictures must equal a run
+  without it.
 - **The page's own timers stay real time but are waited out**: before frames run, until no one-shot `setTimeout` of up to 1 s is
   pending (the setup sheet's insets 320 ms after its slide, a tip's 200 ms, a resize's 250 ms), so each lands before the frames and
   never among them; before a shot, every one-shot timer of up to 10 s (a toast's life) as well, then `#toasts` must be empty.
