@@ -270,11 +270,13 @@
   .toast.out { opacity: 0; transform: translateY(6px); transition: opacity 200ms, transform 200ms; }
   @keyframes toast-in { from { opacity: 0; transform: translateY(8px); } }
 
-  /* ---------- the selected fish (compact screens) ----------
-   * Desktop draws the inspector on the canvas, matching the native window
-   * (renderer.js drawInspector). Compact screens get this card instead, laid
-   * out in CSS px; it moves to the other side when the fish swims under it
-   * (.flip: the top on narrow screens, the left on wider ones). */
+  /* ---------- the selected fish ----------
+   * The fish card, in every view (the tank, the flat view in WebGL or canvas
+   * 2D) and on every screen, laid out in CSS px: both pages' card (its colour
+   * key, short-screen rules and touch targets are web/ui_common.css's). The
+   * native window keeps its own canvas panel. It moves to the other side when
+   * the fish swims under it (.flip: the top on narrow screens, the left on
+   * wider ones). */
   #fishcard {
     position: fixed; z-index: var(--z-card);
     left: 10px; right: 10px;
@@ -701,7 +703,9 @@
 
   <section id="fishcard" class="chip-surface" hidden aria-label="the selected fish">
     <div class="fc-head">
-      <canvas id="iportrait" aria-hidden="true"></canvas>
+      <figure id="ikey" class="fc-key" title="A colour key, not a likeness: the colour of its family line, as the charts show it.">
+        <canvas id="iportrait" aria-hidden="true"></canvas><figcaption>colour key</figcaption>
+      </figure>
       <div class="fc-title"><div id="ititle">Fish</div><div id="isub"></div></div>
       <button id="followbtn" class="icon-btn only-3d" aria-pressed="false" title="Follow this fish (F)"><svg class="i"><use href="#i-follow"/></svg><span class="sr">follow</span></button>
       <button id="iexpand" class="icon-btn" aria-expanded="false" title="Show its brain"><svg class="i"><use href="#i-chevron"/></svg><span class="sr">brain</span></button>
