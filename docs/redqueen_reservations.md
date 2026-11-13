@@ -144,6 +144,17 @@ JSONL uses exactly this record grammar, not a union-level validity check. No uns
 record can be rescued by a valid sibling or an already-seen seed. Receipts hash the
 complete input bytes and count the distinct validated seed set.
 
+The admission matrix in `tools/redqueen/test_redqueen.py` (`MATRIX_*`,
+`run_reservation_matrix`) checks this grammar systematically rather than one counterexample
+at a time: every supported record shape above, valid and malformed, wrapped as an array,
+dictionary collection, dictionary of arrays or bare object, under every inventory name,
+in every container context named here (the top level, beside seeds, inside an inventory
+record, two levels deep, avoidance receipts, `per_block`, `args` and argv `args`, each
+report, status, reservation, protocol and audit role, `groups`, archive provenance), as one
+JSON document and as a JSONL row after a valid row: 33,134 combinations, each through
+`rqlib.load_reservations` and all three public loaders. A valid combination must yield
+exactly its expected set, a malformed one must be refused; a strict subset never passes.
+
 The public entry points `worlds.read_avoid`, `plan.avoid_seeds`, and
 `noisebank.avoid_seeds` raise `WorldsError`, `DesignError`, and `NoiseBankError`,
 respectively, for refused reservations. Each preserves the loader's message,

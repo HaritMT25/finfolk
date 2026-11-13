@@ -1816,7 +1816,175 @@ class TestPlanV2(unittest.TestCase):
 
 
 
+# ----------------------------------------------------------- the reservation admission matrix
+# (PR #84 fix round 6: Codex re-review of 915a7a0, P1) A systematic cross product instead of one
+# counterexample per round: every supported record shape, valid and malformed, wrapped as an
+# inventory (array, dictionary collection, dictionary of arrays, or the bare object/array itself)
+# under every inventory name, inside every container context (the top level, beside seeds, inside
+# an inventory record, two levels deep, avoidance receipts, per_block, args and argv args, every
+# report / status / reservation / protocol / audit role, label subtrees, archive provenance), as
+# one JSON document and as a JSONL row after a valid row. Every combination goes through rqlib and
+# all three public loaders: a valid one yields EXACTLY its context's seeds plus the record's, a
+# malformed one is refused. A strict subset is the failure this guards against. Synthetic seeds only.
+MATRIX_RECORDS = (
+    # (shape, a valid record, its seeds, malformed variants: each refuses the whole file)
+    ("integer", 101, {101}, ("101", -1, True, 1.5, None)),
+    ("flat_map", {"sample": 101, "ages": 102, "reseed": 103, "transplant": 104}, {101, 102, 103, 104},
+     ({"sample": 101, "ages": 102, "reseed": 103, "transplant": "104"},
+      {"sample": 101, "ages": 102, "reseed": 103, "transplant": None})),
+    ("seed_label_map", {"w01_seed": 101, "w02": 102}, {101, 102},
+     ({"w01_seed": 101, "w02": "102"}, {"w01_seed": 101, "w02": -102})),
+    ("nested_seeds", {"seeds": {"sample": 101, "ages": 102, "transplant": None}}, {101, 102},
+     ({"seeds": {"sample": 101, "ages": "102"}}, {"seeds": {"sample": 101, "ages": 1.5}},
+      {"seeds": {"sample": 101, "ages": -1}})),
+    ("structural", {"seed": 101, "steps": 5}, {101},
+     ({"seed": "101"}, {"seed": False}, {"seed": 101, "w02": 102})),
+    ("world_row", {"founder_seed": 101, "reserved_seeds": [102], "treatment": "C"}, {101, 102},
+     ({"founder_seed": 101, "reserved_seeds": [102, "103"]},)),
+    ("wrapped_inventory", {"reserved": [101, 102]}, {101, 102},
+     ({"reserved": [101, "102"]}, {"reserved": []}, {"reserved": 101})),
+    ("wrapped_records", {"records": [{"seed": 101}, {"w02": 102}]}, {101, 102},
+     ({"records": [{"seed": 101}, {"w02": "102"}]}, {"records": [{"seed": 101}, {}]})),
+    ("legacy_plan_row", {"id": "c1", "slot_seed": 101, "donor_seed": 102, "pred_seed": None, "reseed": 103,
+                         "mode": "frozen"}, {101, 102, 103},
+     ({"id": "c1", "slot_seed": 101, "donor_seed": "102", "reseed": 103},
+      {"id": 104, "slot_seed": 101, "donor_seed": 102, "reseed": 103},
+      {"id": "c1", "slot_seed": 101, "w02": 102})),
+    ("argv", {"argv": ["engine", "--seed", "101"]}, {101},
+     ({"argv": ["--seed", "+101"]}, {"argv": ["--seed"]}, {"argv": ["--seed", "4294967296"]})),
+    ("record_array", [101, {"seed": 102}], {101, 102}, ([101, "102"], [101, {}], [])),
+)
+MATRIX_FIELDS = ("worlds", "records", "reserved", "reservations", "inventory")
+MATRIX_WRAPPERS = (
+    ("array", lambda r: [r]),
+    ("dict", lambda r: {"r1": r}),
+    ("dict_of_arrays", lambda r: {"r1": [r]}),
+    # the record as the inventory value itself (a bare scalar under an inventory name is a count,
+    # never a record, and an empty container holds no record: those have no bare form)
+    ("bare", lambda r: r if isinstance(r, (dict, list)) and r else None),
+)
+MATRIX_RECEIPT = {"path": "old.json", "sha256": "a" * 64, "seeds": 2}
+MATRIX_STATUS = {"archive_root": "archive", "availability": [{"frame": 5}], "counts": {"done": 1},
+                 "burn_in": {"per_treatment": {"C": {"worlds": 1}}}, "root": "run", "seed": 99,
+                 "worlds": {"w01": {"treatment": "C", "status": "done", "attempt": 1}}}
+
+
+def _put(base, field, value):
+    out = dict(base)
+    out[field] = value          # (replaces the context's own metadata field of that name)
+    return out
+
+
+MATRIX_CONTEXTS = (
+    # (name, (inventory name, inventory) -> (document, the context's own seeds))
+    ("top_level", lambda f, v: ({f: v}, set())),
+    ("beside_seed", lambda f, v: ({"seed": 99, f: v}, {99})),
+    ("inside_inventory_record", lambda f, v: ({"worlds": [{"seed": 99, f: v}]}, {99})),
+    ("two_levels", lambda f, v: ({"seed": 99, "outer": {"inner": {f: v}}}, {99})),
+    ("avoid_receipt", lambda f, v: ({"seed": 99, "avoid": [_put(MATRIX_RECEIPT, f, v)]}, {2, 99})),
+    ("per_block", lambda f, v: ({"seed": 99, "per_block": [{"A": 2, "C": 4, f: v}]}, {99})),
+    ("args", lambda f, v: ({"seed": 99, "args": {f: v}}, {99})),
+    ("args_two_levels", lambda f, v: ({"seed": 99, "args": {"fit": {"options": {f: v}}}}, {99})),
+    ("argv_args", lambda f, v: ({"args": ["--seed", "99", {f: v}]}, {99})),
+    ("recovery_report", lambda f, v: (_put({"schema": "finfolk.redqueen.recovery/1", "seed": 99, "worlds": 3},
+                                           f, v), {99})),
+    ("recovery_report_two_levels", lambda f, v: ({"schema": "finfolk.redqueen.recovery/1", "seed": 99,
+                                                  "forward_transfer": {"per": _put({"worlds": 3}, f, v)}}, {99})),
+    ("recoveryextra_result", lambda f, v: ({"schema": "finfolk.redqueen.recoveryextra.result/1", "seed": 99,
+                                            "options": {"fit": _put({"worlds": 3}, f, v)}}, {99})),
+    ("noisebank_bank", lambda f, v: ({"schema": "finfolk.redqueen.noisebank.bank/2", "estimator": {"seed": 99},
+                                      "horizons": {"10": _put({"worlds": ["w01"]}, f, v)}}, {99})),
+    ("supervisor_status", lambda f, v: (_put(MATRIX_STATUS, f, v), {99})),
+    ("supervisor_status_nested", lambda f, v: (_put(MATRIX_STATUS, "burn_in", {"per_treatment": {"C": {f: v}}}),
+                                               {99})),
+    ("noisebank_reservations", lambda f, v: (_put({"schema": "finfolk.redqueen.noisebank-reservations/1",
+                                                   "seed_namespace": "synthetic", "seeds": [99],
+                                                   "worlds": ["w01"]}, f, v), {99})),
+    ("gate_protocol", lambda f, v: (_put({"schema": "finfolk.invasion.gate-protocol/1", "master_seed": 99,
+                                          "worlds": {"E": "description"}}, f, v), {99})),
+    ("gate_protocol_nested", lambda f, v: ({"seed": 99, "protocol": _put({
+        "schema": "finfolk.invasion.gate-protocol/1", "worlds": {"E": "description"}}, f, v)}, {99})),
+    ("registry_audit", lambda f, v: (_put({"avoid": [MATRIX_RECEIPT], "worlds": 64, "ok": True,
+                                           "registry_sha256": "c" * 64, "registry_avoid_loader_count": 583,
+                                           "reserved_seeds": 99}, f, v), {2, 99})),
+    ("group_labels", lambda f, v: ({"seed": 99, "groups": {"sample": "q|r00", f: v}}, {99})),
+    ("archive_provenance", lambda f, v: ({"schema": "finfolk.invasion.archived-seeds/1",
+                                          "all": {"99": ["source", {f: v}]}}, {99})),
+)
+# the matrix's size, pinned so that a review can check the claim (records x wrappers x names x
+# contexts, plus each record as the document and as its only array record, each in both formats)
+RESERVATION_MATRIX_SIZE = 33134
+
+
+def reservation_matrix():
+    """-> [(combination id, file text, expected seed set, or None for a refusal)]."""
+    out = []
+
+    def add(cid, doc, expected):
+        text = json.dumps(doc)
+        out.append((f"{cid}/json", text, expected))
+        out.append((f"{cid}/jsonl", '{"seed":98}\n' + text, None if expected is None else expected | {98}))
+    for shape, valid, seeds, malformed in MATRIX_RECORDS:
+        variants = [("valid", valid, seeds)] + [(f"malformed{k}", bad, None) for k, bad in enumerate(malformed, 1)]
+        for variant, record, rseeds in variants:
+            add(f"{shape}/{variant}/document", record, rseeds)
+            add(f"{shape}/{variant}/document_array", [record], rseeds)
+            for wrapper, wrap in MATRIX_WRAPPERS:
+                inventory = wrap(record)
+                if inventory is None:
+                    continue
+                for field in MATRIX_FIELDS:
+                    for context, place in MATRIX_CONTEXTS:
+                        doc, cseeds = place(field, copy.deepcopy(inventory))
+                        add(f"{shape}/{variant}/{wrapper}/{field}/{context}", doc,
+                            None if rseeds is None else cseeds | rseeds)
+    return out
+
+
+def run_reservation_matrix(directory):
+    """Every combination through rqlib.load_reservations and the three public loaders, each of which
+    must return exactly the expected set (and rqlib a matching receipt count) or refuse with its own
+    error naming the file -> (size, [(combination, loader, got, wanted)])."""
+    loaders = ((rqlib.load_reservations, rqlib.ReservationError), (worlds.read_avoid, worlds.WorldsError),
+               (plan.avoid_seeds, plan.DesignError), (nb.avoid_seeds, nb.NoiseBankError))
+    p = os.path.join(directory, "inventory.json")
+    combos = reservation_matrix()
+    failures = []
+    for cid, text, expected in combos:
+        wr(p, text)
+        want = "refusal" if expected is None else sorted(expected)
+        for loader, error in loaders:
+            name = loader.__module__
+            try:
+                got = loader(p)
+            except error as exc:
+                if expected is not None or p not in str(exc):
+                    failures.append((cid, name, f"refused: {str(exc)[len(p) + 2:][:100]}", want))
+                continue
+            except Exception as exc:       # (a crash is a failure too, never a pass)
+                failures.append((cid, name, f"crashed: {exc!r}"[:120], want))
+                continue
+            if name == "rqlib":
+                got, receipt = got
+                if expected is not None and receipt["seeds"] != len(expected):
+                    failures.append((cid, name, f"receipt count {receipt['seeds']}", want))
+            if got != expected:
+                failures.append((cid, name, sorted(got), want))
+    return len(combos), failures
+
+
 class TestReservations(unittest.TestCase):
+
+    def test_admission_matrix_is_exact_or_refused(self):
+        """(Re-review of 915a7a0, P1) Every shape x wrapper x name x context x format combination:
+        exactly the expected set, or a refusal for a malformed record. Never a strict subset."""
+        with tempfile.TemporaryDirectory() as d:
+            size, failures = run_reservation_matrix(d)
+        self.assertEqual(size, RESERVATION_MATRIX_SIZE)
+        if failures:
+            failed = {f[0] for f in failures}
+            self.fail(f"{len(failed)} of {size} combinations wrong ({len(failures)} loader results), "
+                      f"e.g. {failures[:8]}")
 
     def test_review_counterexamples_inherited_metadata_context(self):
         """(Re-review of 915a7a0, P1) The review's three counterexamples, verbatim: an explicit worlds
