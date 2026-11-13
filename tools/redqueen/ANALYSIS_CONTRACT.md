@@ -94,22 +94,27 @@ searches. Draw `min(M_H, floor(600 * sigmoid(a + epsilon) + 0.5))`; solve its lo
 inside the expectation. The upper category includes the entire upper latent tail. Means zero and
 `c_H` give deterministic counts zero and `M_H`; `M_H=0` gives only zeros. Capture retains its own bound.
 The internal table key records both count scale and ceiling; cache identities bind the support law,
-engine age-clock sources and material specification. Capped tables refine their location grid until
-they meet the existing interpolation tolerance. The calibration generator and its H-T resampling use
-`AnnexH/D8/1`, bound into manifests. Other stream namespaces and reservations are unchanged.
+the age-clock identity and the material specification. Capped tables refine their location grid until
+they meet the existing interpolation tolerance. The calibration generator (`Panel.rng`) and its H-T
+resampling (`transition.ht(..., stream_namespace=)`) replace only the registered prefix `AnnexH/1/` by
+`AnnexH/D8/1/`; every other stream key is unchanged, and the namespace is bound into the manifests.
+Production analysis, history, bank and assay streams and reservations keep their namespaces.
 
-`material.age_feasible` is the common age-only support predicate. It rounds the starting age, timestep
-and maximum age to binary32, adds the binary32 timestep with binary32 rounding at each frame, and
-tests strict `age > max_age`. A cached binary search finds the largest feasible binary32 starting age;
-monotonicity makes its predicate equivalent to executing the clock for every individual. It supports
-actual registered physiology, including construction-specific maximum ages. For the frozen 600 ages,
-ceilings are 247, 0 and 0 at 5k, 10k and 20k; survival denominators remain 600.
+Age feasibility has ONE definition: `common.age_feasible` / `common.age_feasible_count` (#90's helper,
+copied byte-identical): the engine's binary32 age clock, `A_0 = binary32(a)`, `A_{k+1} = round32(A_k +
+0.016f)`, age death when the updated age is strictly greater than binary32(max_age). It is never the
+exact-arithmetic `a + H dt <= max_age`. `material.cohort_ceiling` (M_H) calls it for every decision the
+statistics make: the generator's ceiling (`Panel.survivor_ceiling`, `s_spans`), `check_params` and the
+adapter's survivor bound. `material.age_clock_identity()` (`common.AGE_CLOCK`, the engine step and the
+SHA-256 of the helper's source) enters the material specification, and through it the manifests and the
+location-table identity. It supports actual registered physiology, including construction-specific maximum
+ages. For the frozen 600 ages, ceilings are 247, 0 and 0 at 5k, 10k and 20k; survival denominators remain 600.
 
 Production parameter artifacts must explicitly contain `cohort`, `cohort_sha256`, `horizon`, `dt`,
 `support_law`, `age_clock`, `engine_sha256`, `survivor_ceiling`, and `fit`, as well as the existing fitted flag and curves.
 Use the exact authenticated registered cohort, its D8 source hash, horizon 5000, timestep 0.016,
 `material.SUPPORT_LAW`, `material.age_clock_identity()`, the actual fitting-source engine executable
-SHA-256, and ceiling 247. `fit.mean_head` must be
+SHA-256, and the ceiling M_5000 the common clock gives for the registered ages (247). `fit.mean_head` must be
 `c_H*sigmoid(eta)` and `fit.noise_likelihood` must be `600-rounded-capped-upper-infinity`.
 Both `fit.mean` and `fit.noise` must identify `implementation_sha256`, `inputs_sha256` and
 `receipt_sha256`. These fields attest the fitting procedure and bind its independent receipts; they
