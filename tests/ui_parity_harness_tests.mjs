@@ -424,6 +424,7 @@ section("--compare --out: never into older output");
   ok(Array.isArray(j.written) && j.written.join() === "s2_tabs__classic__tab_diff16x.png" && j.format === "ui-parity-compare", "  compare.json lists the pictures it wrote", j.written);
   r = cmp(A, B, "--out", d, "--clean");
   ok(r.code === 0, "  --clean: its own files removed, written again", r.out);
+  fs.mkdirSync(d, { recursive: true });   /* (there already, unless the comparison above failed) */
   fs.writeFileSync(path.join(d, "someone_else_diff16x.png"), "x");
   r = cmp(A, B, "--out", d, "--clean");
   ok(r.code === 2 && /does not list \(someone_else_diff16x\.png\)/.test(r.out) && fs.existsSync(path.join(d, "compare.json")), "  a difference picture compare.json does not list: refused, nothing removed", r.out);
