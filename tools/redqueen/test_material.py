@@ -10,6 +10,7 @@ import unittest
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
+import common
 import material
 import stats
 import recurrence
@@ -107,15 +108,31 @@ class MaterialTests(unittest.TestCase):
                 clocks += np.float32(0.016)
             self.assertEqual(int(np.count_nonzero(clocks <= np.float32(120.))), expected)
             self.assertEqual(material.cohort_ceiling(ages, H), expected)
-        # Also compare cached cutoff with direct clocks for a supporting physiology and nearby floats.
+        # The one helper (#90's common.age_feasible) against direct NumPy binary32 clocks, for a supporting
+        # physiology too, and for nearby floats.
         for H, dt, maximum in ((5000, .016, 120.), (800, .031, 30.)):
             starts = np.linspace(0, maximum, 101, dtype=np.float32)
             starts = np.r_[starts, np.float32(start)] if maximum == 120 else starts
             clocks = starts.copy()
             for _ in range(H):
                 clocks += np.float32(dt)
-            got = [material.age_feasible(float(a), H, dt, maximum) for a in starts]
+            got = [common.age_feasible(float(a), H, maximum, dt) for a in starts]
             self.assertEqual(got, (clocks <= np.float32(maximum)).tolist())
+            self.assertEqual(material.cohort_ceiling({'ages': starts.tolist(), 'n': len(starts), 'max_age': maximum}, H, dt),
+                             sum(got))
+
+    def test_ceiling_is_the_common_age_clock_for_every_registered_age(self):
+        """Every feasibility decision of the statistics is #90's helper: the ceiling equals the per-individual
+        age_death_frame count for all 600 frozen start ages (config, not outcomes) at 5k / 10k / 20k."""
+        ages = material.registered_ages()
+        for H, expected in ((5000, 247), (10000, 0), (20000, 0)):
+            per = [common.age_death_frame(a, ages['max_age'], H) is None for a in ages['ages']]
+            self.assertEqual(sum(per), expected)
+            self.assertEqual(material.cohort_ceiling(ages, H), expected)
+        self.assertEqual(material.age_clock_identity()['age_clock'], common.AGE_CLOCK)
+        self.assertEqual(material.specification()['age_clock'], material.age_clock_identity())
+        with self.assertRaises(ValueError):
+            material.cohort_ceiling(ages, 5000.0)        # (a frame count, never a float horizon)
 
     def test_capped_law_independent_categories_and_draws(self):
         from statistics import NormalDist
@@ -162,7 +179,8 @@ class MaterialTests(unittest.TestCase):
                     second = calib.location(mu, sd, 600, ceiling=247)
                 np.testing.assert_array_equal(first, second)
                 raw = json.dumps(material.specification())
-                self.assertIn('binary32-add-before-strict-age-death/1', raw)
+                self.assertIn(common.AGE_CLOCK, raw)
+                self.assertIn(material.age_clock_identity()['helper_sha256'], raw)
                 self.assertIn('600-rounded-logistic-normal-capped/1', raw)
         finally:
             calib.TABLE_CACHE = saved[0]
@@ -216,6 +234,30 @@ class MaterialTests(unittest.TestCase):
         c = transition.draw_streams('calib/val', 4, 2, 19, namespace='AnnexH/D8/1')
         self.assertFalse(np.array_equal(a[1], b[1]))
         self.assertFalse(np.array_equal(b[1], c[1]))
+
+    def test_ht_calibration_stream_is_the_registered_key_under_the_d8_prefix(self):
+        """D8 rule 51: the calibration H-T resampling replaces ONLY the prefix AnnexH/1/ by AnnexH/D8/1/; the
+        remaining keys (H-T, calib/<tag>, bootstrap / reference-source) are the registered ones."""
+        import hashlib
+        import transition
+        from unittest.mock import patch
+        panel = calib.Panel(calib.synthetic_graph(2), calib.placeholder_params(), 'H-T', 'dev', 'actual', 'T1', 3)
+        panel.worlds = []
+        seen = {}
+
+        def fake_ht(*a, **kw):
+            seen.update(kw)
+            return {'T_T': -math.inf, 'available': True, 'winner': None, 'phase_support': {}, 'EU_unsupported': {}}
+        with patch.object(calib.recurrence, 'hf', return_value={'available': True, 'S_F': 0.}), \
+                patch.object(calib.transition, 'ht', side_effect=fake_ht):
+            panel.analyze_ht({e: 1. for e in transition.EPOCHS}, draws=3)
+        self.assertEqual((seen['analysis'], seen['stream_namespace']), ('calib/H-T/dev:actual/T1/3', 'AnnexH/D8/1'))
+        for purpose in ('bootstrap', 'reference-source'):
+            text = f'AnnexH/D8/1/H-T/calib/H-T/dev:actual/T1/3/{purpose}'.encode()
+            self.assertEqual(stats.stream_seed('H-T', seen['analysis'], purpose, namespace=seen['stream_namespace']),
+                             int.from_bytes(hashlib.sha256(text).digest()[:8], 'little'))
+            self.assertNotEqual(stats.stream_seed('H-T', seen['analysis'], purpose), stats.stream_seed(
+                'H-T', seen['analysis'], purpose, namespace=seen['stream_namespace']))
 
     def test_rule_two_on_registered_reference_schedule(self):
         # graph.build measures EACH reference at graph.TIMES, independent of intensive status / fine offsets.

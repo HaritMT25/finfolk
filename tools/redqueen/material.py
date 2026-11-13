@@ -6,12 +6,14 @@ The observations hash fixes the complete registered allocation, including positi
 from __future__ import annotations
 
 from fractions import Fraction
-import hashlib
-import json
-from pathlib import Path
 from functools import lru_cache
+import hashlib
+import inspect
+import json
 import math
-import struct
+from pathlib import Path
+
+import common  # the ONE binary32 age clock (#90's helper, D8 v2 rule 46): never re-derived here
 
 OBSERVATIONS_SHA256 = '64b113ce30bf76c52cda19efcde227becc2b9c00de0e2a5bbbe2892630f5cf84'
 AGES_SHA256 = '6ffb99ec4062801b68c462ab08208e8367d128ca820e0a9e84752f4403a717d5'
@@ -19,56 +21,18 @@ B = 0.0469305419921875
 DELTA_Q = DELTA_HC = 0.10 * B
 D_Q = 0.20 * B
 SUPPORT_LAW = 'D8/600-rounded-logistic-normal-capped/1'
-AGE_PREDICATE = 'binary32-add-before-strict-age-death/1'
+AGE_CLOCK = common.AGE_CLOCK
+_CLOCK_HELPER = (common.binary32, common.age_death_frame, common.age_feasible, common.age_feasible_count)
 
 
 @lru_cache(maxsize=1)
 def age_clock_identity():
-    root = Path(__file__).resolve().parents[2]
-    sources = ('src/core/agent_core.hpp', 'src/core/kernel.hpp', 'src/app/main.cpp')
-    return {'predicate': AGE_PREDICATE, 'arithmetic': 'IEEE-754 binary32 round-to-nearest ties-to-even',
-            'update': 'age = binary32(age + binary32(dt)); dead iff age > binary32(max_age)',
-            'engine_sources_sha256': {p: hashlib.sha256((root / p).read_bytes()).hexdigest() for p in sources}}
-
-
-def binary32(x):
-    return struct.unpack('f', struct.pack('f', x))[0]
-
-
-@lru_cache(maxsize=128)
-def _age_cutoff(horizon, dt, maximum):
-    """Largest feasible nonnegative binary32 starting age, by monotonic clock search.
-
-    Positive float bit patterns are ordered. Each search probe executes the engine's additions;
-    monotonicity makes comparison with this cached cutoff exactly equivalent for every starting age.
-    No exact-arithmetic elapsed-time approximation is used.
-    """
-    def feasible(bits):
-        age = struct.unpack('f', struct.pack('I', bits))[0]
-        for _ in range(horizon):
-            age = binary32(age + dt)
-            if age > maximum:
-                return False
-        return True
-    lo, hi = -1, struct.unpack('I', struct.pack('f', maximum))[0] + 1
-    while hi - lo > 1:
-        mid = (lo + hi) // 2
-        if feasible(mid):
-            lo = mid
-        else:
-            hi = mid
-    return -1.0 if lo < 0 else struct.unpack('f', struct.pack('I', lo))[0]
-
-
-def age_feasible(age, horizon=5000, dt=0.016, max_age=120.0):
-    """Age-only survival support under the actual binary32 engine clock (D8 v2 rule 46)."""
-    if (type(horizon) is not int or horizon < 0 or not math.isfinite(dt) or dt <= 0 or
-            not math.isfinite(max_age) or max_age <= 0 or not math.isfinite(age) or not 0 <= age <= max_age):
-        raise ValueError('invalid registered cohort / horizon / age law')
-    dt32, maximum = binary32(dt), binary32(max_age)
-    if dt32 <= 0 or not math.isfinite(dt32) or not math.isfinite(maximum):
-        raise ValueError('invalid binary32 age clock')
-    return binary32(age) <= _age_cutoff(horizon, dt32, maximum)
+    """The age predicate's identity (rule 46: bound in the metadata and cache identities): #90's clock name,
+    the engine's fixed step and the SHA-256 of the helper's source (common.binary32, age_death_frame,
+    age_feasible, age_feasible_count), so a changed predicate is a new identity."""
+    source = ''.join(inspect.getsource(f) for f in _CLOCK_HELPER)
+    return {'age_clock': common.AGE_CLOCK, 'engine_dt': common.ENGINE_DT, 'helper': 'common.age_feasible_count',
+            'helper_sha256': hashlib.sha256(source.encode()).hexdigest()}
 
 
 def specification():
@@ -112,15 +76,16 @@ def derive_b(path):
     return float(total / 256)
 
 
-def cohort_ceiling(ages, horizon=5000, dt=0.016, max_age=None):
-    """Initial prey capable of surviving the engine's float32 age clock."""
+def cohort_ceiling(ages, horizon=5000, dt=common.ENGINE_DT, max_age=None):
+    """M_H (rule 46): the initial prey that are age-feasible at the horizon on the engine's binary32 age clock
+    (common.age_feasible_count, #90's helper), never the exact-arithmetic a + H dt <= max_age."""
     values = ages['ages']
     maximum = ages['max_age'] if max_age is None else max_age
-    if (not values or len(values) != ages['n'] or horizon < 0 or dt <= 0 or
-            not math.isfinite(maximum) or maximum <= 0 or
+    if (not values or len(values) != ages['n'] or type(horizon) is not int or horizon < 0 or
+            not math.isfinite(dt) or dt <= 0 or not math.isfinite(maximum) or maximum <= 0 or
             any(not math.isfinite(a) or a < 0 or a > maximum for a in values)):
         raise ValueError('invalid registered cohort / horizon / age law')
-    return sum(age_feasible(a, horizon, dt, maximum) for a in values)
+    return common.age_feasible_count(values, horizon, maximum, dt)
 
 
 def registered_ages():

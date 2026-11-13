@@ -21,8 +21,9 @@ is a documented synthetic stand-in ("fitted": false) for the tests and the bench
   covariance Gamma o (1 - (rho_i rho_j)^D) (Gamma = S / (1 - rho rho'), the stationary start) is PSD.
   Validation stress: rho = 0.98, innovation SD x 1.5.
   Observation (H.9.2; age-support correction): K = floor(N sigma(a + eps) + 1/2). Capture N is its
-  registered bound; survival is min(M_H, floor(600 sigma(a + eps) + 1/2)), with M_H from
-  the binary32 age clock. Survival heads are (M_H/600) sigma(eta). The location solves E[K/600] = mu
+  registered bound; survival is min(M_H, floor(600 sigma(a + eps) + 1/2)), with M_H =
+  material.cohort_ceiling (#90's common.age_feasible_count: the engine's binary32 age clock, D8 v2
+  rule 46). Survival heads are (M_H/600) sigma(eta). The location solves E[K/600] = mu
   under that capped law; endpoint distributions are deterministic. eps = s(mu) (R +
   D + E) with the row (prey snapshot: C, S, F channels), donor (predator snapshot: C, S) and cell
   (SigmaE: capture and exposed survival of one assay cell JOINTLY, their cross-channel covariance kept)
@@ -472,14 +473,18 @@ def check_params(p, production=False):
         raise CalibError("generator parameters: production calibration needs FITTED parameters (H.9.1-H.9.2), "
                          "not the synthetic placeholder")
     if production:
+        # D8 v2 rules 46 / 51: a fitted mean/noise artifact states its support law, ceiling and age-predicate
+        # identity, horizon, timestep and cohort hash; none is defaulted, and a pre-D8 (legacy) fit is refused.
         required = ("cohort", "cohort_sha256", "horizon", "dt", "support_law", "age_clock", "engine_sha256", "survivor_ceiling", "fit")
         missing = [k for k in required if k not in p]
         if missing:
             raise CalibError(f"D8 production fit provenance missing: {missing}; legacy fits must be regenerated")
         expected = {"support_law": stats.material.SUPPORT_LAW, "cohort_sha256": stats.material.AGES_SHA256,
-                    "age_clock": stats.material.age_clock_identity(), "survivor_ceiling": 247}
-        if any(p[k] != v for k, v in expected.items()):
-            raise CalibError("D8 production fit support-law / age-clock provenance mismatch; refit required")
+                    "age_clock": stats.material.age_clock_identity(),
+                    "survivor_ceiling": stats.material.cohort_ceiling(stats.material.registered_ages(), 5000, 0.016)}
+        wrong = sorted(k for k, v in expected.items() if p[k] != v)
+        if wrong:
+            raise CalibError(f"D8 production fit support-law / age-clock provenance mismatch {wrong}; refit required")
         if not rqlib.is_sha256(p["engine_sha256"]):
             raise CalibError("D8 production fit needs the engine executable sha256")
         fit = p["fit"]
@@ -2118,7 +2123,8 @@ class Panel:
                  for e in transition.EPOCHS}
         loads = {w["graph"].id: w["loads"] for w in self.worlds}           # (by world id: #68 review 11)
         k = self.worlds[0]["nref"] if self.worlds else 0
-        res = transition.ht(epochs, betas, gates, loads=loads, k=k, analysis=f"{CALIBRATION_NAMESPACE}/calib/{'/'.join(map(str, self.tag))}",
+        # (D8 rule 51: only the prefix AnnexH/1/ becomes AnnexH/D8/1/; the remaining keys are the registered ones)
+        res = transition.ht(epochs, betas, gates, loads=loads, k=k, analysis=f"calib/{'/'.join(map(str, self.tag))}",
                             draws=draws, report=False, stream_namespace=CALIBRATION_NAMESPACE, redesign=self.redesign if V_PER_DRAW else None)
         return {"T": res["T_T"], "S_e": S, "gates": gates, "available": res["available"],
                 "winner": None if not res["winner"] else [res["winner"]["ARD"], res["winner"]["FSD"]],
