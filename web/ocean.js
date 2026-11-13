@@ -642,6 +642,8 @@
     if (has("oc_set_colour_mode")) M._oc_set_colour_mode(colourBrain ? 0 : 1);
     if (scene && scene.setAppearance) scene.setAppearance(colourMode === "appearance");
     if (has("oc_set_capture")) M._oc_set_capture(selectedId !== null ? 1 : 0);
+    /* (a world the page has not seen step: its fish's kept activations, if any, are no step the card can vouch for) */
+    brainClock.reset(syncedFrame(), has("oc_set_capture") && selectedId !== null);
   }
 
   /* ---- the sheet (built from EvoOceanConfig.TABS) ---- */
@@ -2219,6 +2221,15 @@
     if (s.n > 1 && s.ids[i] === notId) i = (i + 1 + Math.floor(Math.random() * (s.n - 1))) % s.n;
     return i;
   }
+  /* The fish card's live brain (EvoUI.activationClock): the senses and actions
+   * the last step kept, which it keeps only while a fish is picked (the
+   * capture, oc_set_capture: lazy, as it costs every fish its whole sensing).
+   * A fish picked in a world that stepped without it waits for the next step,
+   * which a paused world takes only when asked (Space, or . for one). */
+  var brainClock = EvoUI.activationClock();
+  /* the world's frame as the shim's last oc_sync left it: every step the page takes is synced at once (the
+   * frame loop, EvoOcean.step), so this is the world's tick between them (no sync here: it allocates) */
+  function syncedFrame() { return HO.f64(M, M._oc_stats(), statsLen)[1]; }
   /* handover: a followed fish died and another takes its place (the frame
    * loop), not a fish the visitor picked */
   function select(id, handover) {
@@ -2228,7 +2239,10 @@
     if (id !== null && id !== was && !handover) { cardNewer = true; cardHeld = false; }   /* its card, over the live numbers (updateCard) */
     /* the capture, only into a running engine (Close, Esc and the tour let go of a fish while it is stopped or
      * restarting too: review of #44, round 3, finding 3; a restarted one gets it with its run, applyDisplaySwitches) */
-    if ((was === null) !== (id === null) && M && engineState === "ok" && has("oc_set_capture")) M._oc_set_capture(id !== null ? 1 : 0);
+    if ((was === null) !== (id === null) && M && engineState === "ok" && has("oc_set_capture")) {
+      M._oc_set_capture(id !== null ? 1 : 0);
+      brainClock.capture(id !== null, syncedFrame());
+    }
     dirtyHud = true;
   }
   /* F: follow the selected fish; again (or with none): a random one */
@@ -2498,10 +2512,10 @@
 
   /* ---------------- the fish card ---------------- */
   var cardEl = el("fishcard"), inetCanvas = el("inetc"), inetCtx = inetCanvas.getContext("2d");
-  var portraitEl = el("iportrait"), portraitCtx = portraitEl.getContext("2d");
+  var portraitEl = el("iportrait");
   var cardExpanded = window.innerWidth >= 600, cardCache = {}, cardFor = null, cardFlip = false;
   el("iexpand").setAttribute("aria-expanded", cardExpanded ? "true" : "false");
-  var sensorNames = null, actionNames = null, netNodes = [], netHover = -1, uiFont = "";
+  var sensorNames = null, actionNames = null, netNodes = [], netHover = -1, uiFont = "", cardFresh = false;
   function prettyName(n) { return String(n).replace(/_/g, " ").toLowerCase(); }
   function brainShape() {
     if (!sensorNames) {
@@ -2545,37 +2559,29 @@
     cardFlip = flip;
     cardEl.classList.toggle("flip", flip);
   }
-  function drawPortrait(rgb, size, elong) {
-    var dpr = window.devicePixelRatio || 1, w = 56, h = 40;
-    if (portraitEl.width !== w * dpr) { portraitEl.width = w * dpr; portraitEl.height = h * dpr; }
-    var g = portraitCtx;
-    g.setTransform(dpr, 0, 0, dpr, 0, 0);
-    g.clearRect(0, 0, w, h);
-    var k = 3.0 * bodyScale(size), len = 1 + 0.35 * Math.tanh(4 * (elong - 1));
-    g.translate(w / 2 + 4, h / 2);
-    g.scale(len, 1);
-    g.fillStyle = "rgb(" + rgb.join(",") + ")";
-    g.beginPath();
-    g.moveTo(-9 * k / 1.2, 0);
-    g.bezierCurveTo(-7 * k / 1.2, -4.2 * k / 1.2, 2, -4.4 * k / 1.2, 6, -1.4);
-    g.lineTo(11, -5.5); g.lineTo(9.5, 0); g.lineTo(11, 5.5); g.lineTo(6, 1.4);
-    g.bezierCurveTo(2, 4.4 * k / 1.2, -7 * k / 1.2, 4.2 * k / 1.2, -9 * k / 1.2, 0);
-    g.fill();
-    g.fillStyle = "rgba(4,14,15,0.9)";
-    g.beginPath(); g.arc(-6.2 * k / 1.2, -1.2, 1.1, 0, Math.PI * 2); g.fill();
-    g.setTransform(1, 0, 0, 1, 0, 0);
-  }
-  /* The card's swatch: the fish's skin pattern on its flank (unlit, from its
-   * appearance genes; web/ocean_appearance.js), when the module exports it. */
-  var swatchEl = el("iswatch");
+  /* The card's two pictures of the fish (the UI parity plan's U45): the
+   * colour key (EvoUI.drawPortrait), a generic silhouette in the colour the
+   * charts and the colour modes give it, which is not its likeness (the tank
+   * draws the shape and skin it inherited); and, under it, its skin itself:
+   * the pattern on its flank, unlit, from its appearance genes
+   * (web/ocean_appearance.js), when the module exports them. Both captioned
+   * (ocean.html #ikey, #iskin). */
+  var swatchEl = el("iswatch"), skinEl = el("iskin");
   function drawSwatch(s, idx, size, elong) {
     var EA = window.EvoAppearance;
-    if (!swatchEl || !EA || !s.app) { if (swatchEl) swatchEl.hidden = true; return; }
+    if (!swatchEl || !EA || !s.app) { if (swatchEl) swatchEl.hidden = true; if (skinEl) skinEl.hidden = true; return; }
     var W = 96, H = 24, row = s.app.subarray(63 * idx, 63 * idx + 63);
     swatchEl.width = W; swatchEl.height = H;
     var ctx = swatchEl.getContext("2d");
     ctx.putImageData(new ImageData(EA.flankImage(row, EA.lambdaOf(size, elong), W, H), W, H), 0, 0);
     swatchEl.hidden = false;
+    if (skinEl) skinEl.hidden = false;
+  }
+  /* what the colour key's colour is, in this colour mode (its title) */
+  function keyTitle() {
+    return "A colour key, not a likeness: " + (colourMode === "brain" ? "the colour of its brain (similar wiring, similar colour)"
+      : colourMode === "appearance" ? "the colour of its family line, as the charts show it; in the tank it wears its own skin (below)"
+      : "the colour of its family line, as the charts show it") + ".";
   }
   /* oc_inspect(idx) right after the sync: its numbers, then the card */
   function inspect(idx) {
@@ -2609,11 +2615,26 @@
     }
     var info = f.info, id = Math.round(info[0]);
     var rgb = [s.colors[3 * idx], s.colors[3 * idx + 1], s.colors[3 * idx + 2]];
-    var pkey = id + "|" + rgb.join() + "|" + info[4].toFixed(2) + "|" + info[5].toFixed(2);
-    if (cardFor !== pkey) { cardFor = pkey; drawPortrait(rgb, info[4], info[5]); drawSwatch(s, idx, info[4], info[5]); }
+    var pkey = id + "|" + rgb.join() + "|" + info[4].toFixed(2) + "|" + info[5].toFixed(2) + "|" + colourMode;
+    if (cardFor !== pkey) {
+      cardFor = pkey;
+      EvoUI.drawPortrait(portraitEl, rgb, info[4], info[5], window.devicePixelRatio || 1);
+      drawSwatch(s, idx, info[4], info[5]);
+      el("ikey").title = keyTitle();
+    }
     cardText("ititle", "Fish #" + id);
-    cardText("isub", "Generation " + Math.round(info[6]) + " · family #" + Math.round(info[7]) + " · " + Math.round(info[11]) + " genes" +
-             (cfgVal("bodyModel") ? " · body " + info[4].toFixed(2) + " × " + info[5].toFixed(2) : ""));
+    /* the common fields, in their order (both pages: EvoUI.cardSubtitle); genes: its genome's length (oc_inspect), one link of its brain each */
+    cardText("isub", EvoUI.cardSubtitle({ generation: info[6], family: info[7], genes: info[11],
+                                          body: cfgVal("bodyModel") ? [info[4], info[5]] : null }));
+    /* its live brain: the last step's, or waiting for one (a fish just picked in a world that stepped without the
+     * capture, a new or handed-back world, a fish born in the last step; EvoUI.activationClock) */
+    var tick = s.stats[STATS.frame], state = brainClock.state(tick, info[3]), at = brainClock.at(tick);
+    cardFresh = state === "current";
+    if (cardCache.acts !== state + "|" + at) {
+      cardCache.acts = state + "|" + at;
+      cardEl.dataset.activations = state;
+      cardEl.dataset.activationsAt = at === null ? "" : String(at);
+    }
     var reproE = cfgVal("reproEnergy"), maxAge = cfgVal("maxAge"), maxSpd = cfgVal("maxSpeed"), pitchMax = cfgVal("pitchMax");
     cardText("ienergyv", info[2].toFixed(1));
     setBar("ienergy", info[2] / (reproE * 2), 0.5);
@@ -2693,105 +2714,32 @@
       bodyLinkEl.hidden = false;
     } else if (bodyLinkEl) bodyLinkEl.hidden = true;
   }
-  function brainColor(v, a) {
-    var m = Math.min(1, Math.abs(v));
-    return v >= 0 ? "rgba(" + Math.round(70 + 130 * m) + "," + Math.round(90 + 150 * m) + "," + Math.round(60 + 10 * m) + "," + a + ")"
-                  : "rgba(" + Math.round(80 + 175 * m) + "," + Math.round(90 + 20 * m) + "," + Math.round(70 + 10 * m) + "," + a + ")";
-  }
-  /* senses -> hidden -> actions (renderer.js drawBrain, the Ocean's shape) */
+  /* senses -> hidden -> actions (EvoUI.drawBrain, both pages' network; the Ocean's shape, its depth senses and steer z) */
   function drawBrain(f) {
     var box = inetCanvas.parentNode, w = box.clientWidth, h = box.clientHeight;
     if (w < 60 || h < 60) return;
-    var sh = f.shape, nS = sh.nS, nH = sh.nH, nA = sh.nA;
+    var sh = f.shape;
     var dpr = window.devicePixelRatio || 1, bw = Math.round(w * dpr), bh = Math.round(h * dpr);
     if (inetCanvas.width !== bw) inetCanvas.width = bw;
     if (inetCanvas.height !== bh) inetCanvas.height = bh;
-    var g = inetCtx, i;
-    g.setTransform(dpr, 0, 0, dpr, 0, 0);
-    g.clearRect(0, 0, w, h);
-    var wide = w > h * 1.15, pos = { sen: [], hid: [], act: [] }, m = 14;
-    if (wide) {
-      var yIn = 26, yOut = h - 40, yHid = (yIn + yOut) / 2;
-      for (i = 0; i < nS; i++) pos.sen.push([m + (w - 2 * m) * i / (nS - 1), yIn]);
-      for (i = 0; i < nH; i++) pos.hid.push([m + 18 + (w - 2 * m - 36) * i / (nH - 1), yHid]);
-      for (i = 0; i < nA; i++) pos.act.push([m + 18 + (w - 2 * m - 36) * i / (nA - 1), yOut]);
-    } else {
-      var yTop = 26, yBot = h - 12, xS = 18, xA = w - 100, xH = (xS + xA) / 2;
-      for (i = 0; i < nS; i++) pos.sen.push([xS, yTop + (yBot - yTop) * i / (nS - 1)]);
-      for (i = 0; i < nH; i++) pos.hid.push([xH, yTop + (yBot - yTop) * i / (nH - 1)]);
-      for (i = 0; i < nA; i++) pos.act.push([xA, yTop + (yBot - yTop) * i / (nA - 1)]);
-    }
-    var hoverKey = netHover >= 0 && netNodes[netHover] ? netNodes[netHover].kind + netNodes[netHover].i : null;
-    for (var k = 0; k < f.connCount; k++) {
-      var o = k * 5;
-      var srcSen = f.conns[o] !== 0, srcNum = f.conns[o + 1] | 0, sinkAct = f.conns[o + 2] !== 0, sinkNum = f.conns[o + 3] | 0, wgt = f.conns[o + 4];
-      var a = srcSen ? pos.sen[srcNum] : pos.hid[srcNum], b = sinkAct ? pos.act[sinkNum] : pos.hid[sinkNum];
-      if (!a || !b) continue;
-      var srcAct = srcSen ? f.sensors[srcNum] : f.hidden[srcNum];
-      var mag = Math.min(1, Math.abs(wgt) * Math.abs(srcAct) * 1.5);
-      var hl = hoverKey !== null && ((srcSen ? "Sense" : "Hidden neuron") + srcNum === hoverKey ||
-                                     (sinkAct ? "Action" : "Hidden neuron") + sinkNum === hoverKey);
-      g.strokeStyle = (wgt >= 0 ? "rgba(180,235,80," : "rgba(255,120,80,") + (hl ? 0.9 : (0.10 + 0.7 * mag)).toFixed(3) + ")";
-      g.lineWidth = hl ? 2 : 0.8 + 1.6 * mag;
-      g.beginPath();
-      g.moveTo(a[0], a[1]);
-      if (wide) g.bezierCurveTo(a[0], (a[1] + b[1]) / 2, b[0], (a[1] + b[1]) / 2, b[0], b[1]);
-      else g.bezierCurveTo((a[0] + b[0]) / 2, a[1], (a[0] + b[0]) / 2, b[1], b[0], b[1]);
-      g.stroke();
-    }
-    netNodes = [];
-    function node(p, r, v, kind, idx) {
-      g.fillStyle = brainColor(v, 1);
-      g.beginPath(); g.arc(p[0], p[1], r, 0, Math.PI * 2); g.fill();
-      g.strokeStyle = "rgba(4,14,16,0.85)"; g.lineWidth = 1; g.stroke();
-      netNodes.push({ x: p[0], y: p[1], kind: kind, i: idx, v: v });
-    }
-    var rs = Math.max(2, Math.min(3.2, (wide ? w : h) / nS * 0.36));
-    for (i = 0; i < nS; i++) node(pos.sen[i], rs, f.sensors[i], "Sense", i);
-    for (i = 0; i < nH; i++) node(pos.hid[i], 5, f.hidden[i], "Hidden neuron", i);
-    for (i = 0; i < nA; i++) node(pos.act[i], 5.5, f.actions[i], "Action", i);
-    if (netHover >= 0 && netNodes[netHover]) {
-      var hn = netNodes[netHover];
-      g.strokeStyle = "rgba(230,255,160,0.95)"; g.lineWidth = 2;
-      g.beginPath(); g.arc(hn.x, hn.y, 8, 0, Math.PI * 2); g.stroke();
-    }
     if (!uiFont) uiFont = getComputedStyle(document.body).fontFamily;
-    g.font = "11px " + uiFont;
-    function tag(text, x, y) {
-      var tw = g.measureText(text).width;
-      g.fillStyle = "rgba(15,39,39,0.92)"; g.fillRect(x - 3, y - 10, tw + 6, 14);
-      g.fillStyle = "rgba(190,210,205,0.95)"; g.fillText(text, x, y);
-    }
-    g.fillStyle = "rgba(190,210,205,0.9)";
-    if (wide) {
-      tag("senses", m, 13);
-      tag("hidden", m, (26 + h - 40) / 2 - 9);
-      g.fillStyle = "rgba(190,210,205,0.9)";
-      g.textAlign = "center";
-      for (i = 0; i < nA; i++) g.fillText(ACTION_SHORT[i] || "", pos.act[i][0], h - 40 + (i % 2 ? 30 : 18));
-      g.textAlign = "left";
-    } else {
-      g.fillText("senses", 6, 13);
-      g.fillText("hidden", (18 + w - 100) / 2 - 18, 13);
-      g.fillText("actions", w - 106, 13);
-      for (i = 0; i < nA; i++) g.fillText(ACTION_LABELS[i] || "", pos.act[i][0] + 10, pos.act[i][1] + 4);
-    }
+    netNodes = EvoUI.drawBrain(inetCtx, w, h, f, { nS: sh.nS, nH: sh.nH, nA: sh.nA, gutter: 100, actShort: ACTION_SHORT, actLabels: ACTION_LABELS,
+                                                   font: uiFont, dpr: dpr, fresh: cardFresh, prev: netNodes, hover: netHover });
     updateSenseLine();
   }
-  var DEFAULT_SENSE = "Senses on one side, actions on the other. Lime links excite, orange ones inhibit; brighter = stronger right now. Tap a dot to name it.";
   function updateSenseLine() {
     if (netHover >= 0 && netNodes[netHover]) {
       var n = netNodes[netHover];
       var label = n.kind === "Sense" ? (sensorNames[n.i] || "sense " + (n.i + 1)) : n.kind === "Action" ? (ACTION_LABELS[n.i] || actionNames[n.i]) : "neuron " + (n.i + 1);
-      var html = n.kind + ": <b></b> " + (n.v >= 0 ? "+" : "") + n.v.toFixed(2);
+      var html = EvoUI.senseHtml(n, cardFresh);
       if (cardCache.sense !== html + label) {
         cardCache.sense = html + label;
         el("isense").innerHTML = html;
         el("isense").querySelector("b").textContent = label;
       }
-    } else if (cardCache.sense !== "default") {
-      cardCache.sense = "default";
-      el("isense").textContent = coarseMQ.matches ? DEFAULT_SENSE : DEFAULT_SENSE.replace("Tap", "Point at");
+    } else {
+      var t = EvoUI.senseIdle(cardFresh, coarseMQ.matches, paused, "Space runs it; . steps once");
+      if (cardCache.sense !== t) { cardCache.sense = t; el("isense").textContent = t; }
     }
   }
   function nearestNode(e) {

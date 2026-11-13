@@ -423,8 +423,6 @@
   @keyframes card-in { from { opacity: 0; transform: translateY(12px); } }
   .fc-head { display: flex; align-items: center; gap: 12px; padding: 10px 6px 6px 12px; }
   #iportrait { width: 56px; height: 40px; flex: none; }
-  #iswatch { display: block; width: 100%; height: 22px; margin: 6px 0 2px; border-radius: 4px; image-rendering: auto; }
-  #iswatch[hidden] { display: none; }
   .fc-title { flex: 1; min-width: 0; }
   #ititle { font-size: 16px; font-weight: 650; line-height: 1.2; }
   #isub { font-size: 13px; color: var(--ink-3); }
@@ -882,41 +880,14 @@
     body.sheet-open.turbo-on .ts-nums .ts-pop, body.sheet-open.turbo-on #viewmenubtn span, body.sheet-open.turbo-on #viewmenubtn .caret { display: none; }
     body.sheet-open.turbo-on #viewmenubtn { width: 44px; padding: 0; justify-content: center; }
   }
-  /* A short window (a landscape phone; an embed, such as the portfolio's
-   * 890 x 453), as Classic's compact layout: the fish card, its brain open,
-   * fits between the top bar and the dock instead of scrolling, the brain
-   * taking what height is left (the Turbo card and the keys have their own
-   * rules above). After the wide rules, which it overrides. */
-  @media (max-height: 560px) {
-    #fishcard { max-height: calc(100dvh - 64px - var(--dock-h) - 22px - var(--safe-t) - var(--safe-b)); }
-    .fc-head { gap: 10px; padding: 4px 4px 2px 10px; }
-    #ititle { font-size: 15px; }
-    #isub { font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    .fc-stats { gap: 6px 12px; padding: 2px 12px 8px; }
-    .stat .k { font-size: 11px; }
-    .stat .v { font-size: 13px; }
-    .fc-stats .bar { display: none; }   /* the numbers stay; the brain gets the room */
-    #fishcard .fc-brain .inet, #fishcard.expanded .fc-brain .inet { height: clamp(96px, calc(100dvh - 346px), 170px); }
-    #isense { min-height: 2.8em; padding: 4px 12px 8px; font-size: 12px; }
-  }
-  @media (max-height: 560px) and (pointer: fine) {
-    .fc-head .icon-btn { width: 36px; height: 36px; }
-  }
-  @media (max-height: 560px) and (min-width: 960px) {
-    #fishcard, #fishcard.flip { top: calc(64px + var(--safe-t));
-                                max-height: calc(100dvh - 64px - var(--dock-h) - 24px - var(--safe-t) - var(--safe-b)); }
-  }
+  /* A short window's fish card (a landscape phone; an embed, such as the
+   * portfolio's 890 x 453) and a switch's 44 px touch target: both pages'
+   * rules, web/ui_common.css (linked after this style, so they override the
+   * wide rules above as they did here). */
   @media (pointer: coarse) {
     .stepper { height: 44px; }
     .stepper button { width: 44px; }
     .stepper input, select { font-size: 16px; }
-    /* a switch's 48 x 28 track in a 64 x 44 target: a transparent border the
-     * background stays inside (its 1 px edge an inset shadow), the margin
-     * keeping the layout's 48 x 28 */
-    input.switch { width: 64px; height: 44px; margin: -8px; border: 8px solid transparent;
-                   background-clip: padding-box; box-shadow: inset 0 0 0 1px var(--line); }
-    input.switch:checked { background-clip: padding-box; box-shadow: none; border-color: transparent; }
-    input.switch:focus-visible { outline-offset: -6px; }
   }
   @media (prefers-reduced-motion: reduce) {
     *, *::before, *::after { animation-duration: 1ms !important; transition-duration: 1ms !important; }
@@ -995,20 +966,26 @@
 
   <section id="fishcard" class="chip-surface" hidden aria-label="the selected fish">
     <div class="fc-head">
-      <canvas id="iportrait" aria-hidden="true"></canvas>
+      <figure id="ikey" class="fc-key" title="A colour key, not a likeness: the colour of its family line, as the charts show it.">
+        <canvas id="iportrait" aria-hidden="true"></canvas><figcaption>colour key</figcaption>
+      </figure>
       <div class="fc-title"><div id="ititle">Fish</div><div id="isub"></div></div>
       <button id="followbtn" class="icon-btn" aria-pressed="false" title="Follow this fish (F)"><svg class="i"><use href="#i-follow"/></svg><span class="sr">follow</span></button>
       <button id="iexpand" class="icon-btn" aria-expanded="false" title="Show its brain"><svg class="i"><use href="#i-chevron"/></svg><span class="sr">brain</span></button>
       <button id="iclose" class="icon-btn" aria-label="close"><svg class="i"><use href="#i-close"/></svg></button>
     </div>
-    <canvas id="iswatch" hidden title="its skin pattern: the flank, head on the left, back on top (unlit)"></canvas>
+    <!-- the Ocean's own fields after the common ones (web/ui_common.js CARD_STATS): its skin, its depth readings -->
+    <div id="iskin" class="fc-skin" data-ext="ocean" hidden>
+      <span class="fc-cap">skin, unlit</span>
+      <canvas id="iswatch" hidden title="its skin pattern: the flank, head on the left, back on top (unlit)"></canvas>
+    </div>
     <div class="fc-stats">
       <div class="stat"><div class="k">Energy</div><div class="v" id="ienergyv">–</div><div class="bar" id="ienergy"><i></i><span class="tick"></span></div></div>
       <div class="stat"><div class="k">Age</div><div class="v" id="iagev">–</div><div class="bar" id="iage"><i></i></div></div>
       <div class="stat"><div class="k">Speed</div><div class="v" id="ispeedv">–</div><div class="bar" id="ispeed"><i></i></div></div>
-      <div class="stat"><div class="k">Depth</div><div class="v" id="idepthv">–</div><div class="bar" id="idepth"><i></i><span class="tick"></span></div></div>
-      <div class="stat"><div class="k" title="where it floats without effort (inherited)">Neutral depth</div><div class="v" id="ibuoyv">–</div><div class="bar" id="ibuoy"><i></i></div></div>
-      <div class="stat"><div class="k">Pitch</div><div class="v" id="ipitchv">–</div><div class="bar" id="ipitch"><i></i><span class="tick"></span></div></div>
+      <div class="stat" data-ext="ocean"><div class="k">Depth</div><div class="v" id="idepthv">–</div><div class="bar" id="idepth"><i></i><span class="tick"></span></div></div>
+      <div class="stat" data-ext="ocean"><div class="k" title="where it floats without effort (inherited)">Neutral depth</div><div class="v" id="ibuoyv">–</div><div class="bar" id="ibuoy"><i></i></div></div>
+      <div class="stat" data-ext="ocean"><div class="k">Pitch</div><div class="v" id="ipitchv">–</div><div class="bar" id="ipitch"><i></i><span class="tick"></span></div></div>
     </div>
     <div id="ibody" class="fc-body" hidden>
       <div class="fc-body-h"><b>Body plan</b> <span class="fc-body-note" title="the M2a body-plan preview: measured from the fish's genes, read by nothing it does yet">preview · not physics yet</span> <a id="ibodylink" href="ocean_bodyplan.html" target="_blank" rel="noopener" hidden>viewer</a></div>
