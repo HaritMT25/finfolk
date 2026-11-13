@@ -82,12 +82,31 @@ archive provenance follow their own rules below. A document/record is one of:
   must hold an array or object: a bare scalar is ambiguous with metadata counts and
   is refused, before flat-map classification. There are explicit metadata roles for
   `worlds`: labels under schema `finfolk.redqueen.noisebank-reservations/1`, construction
-  descriptions under `finfolk.invasion.gate-protocol/1`, command options beneath `args`,
-  and the count in registry audits identified by all four fields `registry_sha256`,
-  `registry_avoid_loader_count`, `reserved_seeds`, `ok`. Those roles use metadata traversal;
-  arbitrary schemas do not waive inventory validation. Under an already established historical
-  seed container, group-label subtree or archive provenance subtree, traversal instead
-  retains that context; these subtrees are not independent flat-inventory records.
+  descriptions under `finfolk.invasion.gate-protocol/1`, command options anywhere beneath
+  `args`, the count in registry audits identified by all four fields `registry_sha256`,
+  `registry_avoid_loader_count`, `reserved_seeds`, `ok`, and the report and status trees
+  below. A role waives inventory admission only for a validated metadata shape, never by
+  inheritance alone: a scalar (a count, label or flag); an array whose elements are all
+  label strings; or an object whose values are all label strings or per-world descriptions.
+  A label string is any string that is not ASCII decimal digits only (a decimal string is a
+  malformed seed, not a label). A per-world description is an object with at least one
+  direct label/description string value and no seed-named key (a key containing `seed`,
+  case insensitive) at any depth: supervisor status rows, recovery tables, gate-protocol
+  construction records. The inventory grammar can read no seed from these shapes that
+  metadata traversal does not also find, and they use metadata traversal (seed-named
+  fields and argv are still reserved and validated; explicit inventories nested inside
+  them are still admitted). Any other value of a role's `worlds` (integers, records, flat
+  maps, seed-bearing objects, mixed arrays) is an explicit inventory, at any depth: it is
+  validated independently with a fresh record context, exactly as at the top level, so
+  `{"seed":99,"args":{"worlds":[{"sample":101,"ages":102,"reseed":103,"transplant":104}]}}`
+  reserves all five seeds and the same record with `"transplant":"104"` is refused.
+  Arbitrary schemas do not waive inventory validation. Under an already established
+  historical seed container (any seed-named ancestor, including `seed_slot`), every integer
+  leaf is reserved recursively, so inventory names there add no admission. In a `groups`
+  label subtree outside seed containers and in archive provenance (`all` values), every
+  inventory name follows the same metadata-shape rule: a metadata shape keeps the subtree's
+  traversal, anything else is an independently validated inventory; otherwise these subtrees
+  are not independent flat-inventory records.
   In such a dictionary inventory,
   the exact key `schema` or a case-insensitive exact reserved record field identifies
   a structural object. Otherwise an all-integer dictionary is classified as a single
@@ -100,13 +119,17 @@ archive provenance follow their own rules below. A document/record is one of:
   The declared report schemas `finfolk.redqueen.recovery/1`,
   `finfolk.redqueen.recoveryextra.result/1`, `finfolk.redqueen.noisebank.bank/2`, and
   supervisor status objects with all six keys `archive_root`, `availability`, `burn_in`,
-  `counts`, `root`, `worlds`, identify metadata trees whose `worlds` fields are counts,
-  labels or status descriptions. Their ordinary arrays (including matrices) use metadata
-  traversal. Other explicit inventory names still validate every record independently.
+  `counts`, `root`, `worlds`, identify metadata trees whose `worlds` fields, at any depth,
+  are counts, labels or status descriptions, validated as the metadata shapes above (an
+  inventory-shaped `worlds` in these trees is an inventory). Their ordinary arrays
+  (including matrices) use metadata traversal. Other explicit inventory names still
+  validate every record independently.
 * An object with exact schema `finfolk.invasion.archived-seeds/1`: requires a nonempty
   `all` object whose keys are ASCII decimal seeds. These keys are reserved. `all` values
   are source provenance, not inventory records; they still receive the historical
-  seed-key/argv traversal. Other seed-bearing fields are processed normally.
+  seed-key/argv traversal, and an inventory name in them holding anything but a metadata
+  shape is an independently validated inventory. Other seed-bearing fields are processed
+  normally.
 
 Every array is scanned for the exact separate-token flags `--seed`, `--transplant-seed`,
 and `--reseed-after-load`. Values are nonnegative JSON integers or ASCII decimal strings

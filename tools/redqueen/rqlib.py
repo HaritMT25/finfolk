@@ -179,7 +179,10 @@ def load_reservations(path):
     See docs/redqueen_reservations.md for the complete input grammar. Flat
     inventories use all labels, not just seed-named ones. Structural records and
     every inventory-array record are interpreted independently; known metadata
-    collections are traversed without requiring seeds in each element. Metadata integers
+    collections are traversed without requiring seeds in each element. An inventory name
+    is an inventory wherever it appears outside a seed container: a metadata role (args,
+    reports, status, labels, audit counts) or a label / provenance subtree waives that only
+    for a validated metadata shape, never by inheritance. Metadata integers
     are reserved only under the historical recursive seed-key policy. Argv seeds
     additionally obey the engine's unsigned 32-bit range.
     """
@@ -276,11 +279,37 @@ def load_reservations(path):
             keys.add("worlds")
         return keys
 
+    def label_text(value):
+        # A label or description, never a decimal seed spelling such as a malformed "104".
+        return isinstance(value, str) and not re.fullmatch(r"[0-9]+", value)
+
+    def seed_named(value):
+        if isinstance(value, dict):
+            return any("seed" in key.lower() or seed_named(item) for key, item in value.items())
+        return isinstance(value, list) and any(seed_named(item) for item in value)
+
+    def metadata_shape(value):
+        """The emitted metadata shapes an inventory name may hold where a metadata role or label /
+        provenance subtree waives inventory admission: a scalar count, label or flag; an array of
+        labels; or an object of labels and per-world descriptions (status, tables, construction):
+        objects with a direct label/description string and no seed-named field at any depth. The
+        inventory grammar can read no seed from these that metadata traversal does not also find.
+        Anything else (integers, records, flat maps, seed fields) is an inventory."""
+        if isinstance(value, list):
+            return all(label_text(item) for item in value)
+        if isinstance(value, dict):
+            return all(label_text(item) or (isinstance(item, dict) and not seed_named(item)
+                                            and any(label_text(v) for v in item.values()))
+                       for item in value.values())
+        return True
+
     def walk(obj, found, where, hint=False, strict=False, group_labels=False,
              inventory=False, provenance=False, metadata_tree=False, world_labels=False):
-        if inventory and not hint and not group_labels and not provenance:
+        if inventory:
+            # (the caller admits an inventory only outside seed containers, with fresh label and
+            # provenance context: it starts a fresh record context too)
             metadata_tree = world_labels = False
-        if inventory and not hint and not group_labels and not provenance and not isinstance(obj, list):
+        if inventory and not isinstance(obj, list):
             if not isinstance(obj, dict):
                 fail("inventory containers must be arrays or objects, not metadata scalars", where)
             if (isinstance(obj, dict) and obj
@@ -310,11 +339,19 @@ def load_reservations(path):
                 metadata = any(token in label for token in ("scheme", "namespace", "sha256", "hash", "rule", "note", "path"))
                 labels = group_labels or label in ("groups", "seed_slot")
                 seed_value = seed_hint and not metadata and not labels
+                # An inventory name holds an independent inventory, except beneath a seed container
+                # (whose every integer leaf is already reserved). A metadata role for worlds (args,
+                # reports, status, labels, construction, audit counts) or a label / provenance
+                # subtree waives that only for a validated metadata shape, never by inheritance:
+                # an inventory-shaped value there is admitted with a fresh context (review of 915a7a0).
+                inventory = False
+                if label in inventory_fields and not hint:
+                    waived = (group_labels or provenance
+                              or (label == "worlds" and (world_labels or label in known_metadata)))
+                    inventory = not (waived and metadata_shape(value))
                 walk(value, found, f"{where}.{key}", hint or seed_hint,
-                     strict or seed_value, labels,
-                     label in inventory_fields and label not in known_metadata
-                     and not (world_labels and label == "worlds"),
-                     provenance or (archive and key == "all"),
+                     strict or seed_value, labels and not inventory, inventory,
+                     (provenance or (archive and key == "all")) and not inventory,
                      metadata_tree or label in known_metadata,
                      world_labels or label == "args")
         elif isinstance(obj, list):

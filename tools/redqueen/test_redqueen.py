@@ -1818,6 +1818,66 @@ class TestPlanV2(unittest.TestCase):
 
 class TestReservations(unittest.TestCase):
 
+    def test_review_counterexamples_inherited_metadata_context(self):
+        """(Re-review of 915a7a0, P1) The review's three counterexamples, verbatim: an explicit worlds
+        inventory beneath args is an inventory (the full set, as 767acc5 returned), never metadata."""
+        loaders = ((rqlib.load_reservations, rqlib.ReservationError), (worlds.read_avoid, worlds.WorldsError),
+                   (plan.avoid_seeds, plan.DesignError), (nb.avoid_seeds, nb.NoiseBankError))
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / 'inventory.json'
+            for text, expected in (
+                    ('{"seed":99,"args":{"worlds":[{"sample":101,"ages":102,"reseed":103,"transplant":104}]}}',
+                     {99, 101, 102, 103, 104}),
+                    ('{"seed":99,"args":{"worlds":[{"w01_seed":101,"w02":102}]}}', {99, 101, 102}),
+                    ('{"seed":99,"args":{"worlds":[{"sample":101,"ages":102,"reseed":103,"transplant":"104"}]}}',
+                     None)):
+                p.write_text(text)
+                for loader, error in loaders:
+                    with self.subTest(text=text, loader=loader.__module__):
+                        if expected is None:
+                            with self.assertRaises(error) as caught:
+                                loader(p)
+                            self.assertEqual(str(caught.exception), f'{p}: document 1.args.worlds record[1]: '
+                                             'ambiguous or unsupported scalar reservation map')
+                        else:
+                            got = loader(p)
+                            self.assertEqual(got[0] if loader is rqlib.load_reservations else got, expected)
+
+    def test_args_worlds_inventory_is_avoided_by_register(self):
+        """(Re-review of 915a7a0, P1, failure mode) A founder seed listed only in an args.worlds
+        inventory is avoided by worlds.register --avoid: that founder is re-derived."""
+        from test_worlds import ARENA
+
+        with tempfile.TemporaryDirectory() as d:
+            arena, inventory = Path(d) / 'arena.json', Path(d) / 'inventory.json'
+            arena.write_bytes(rqlib.canonical(ARENA))
+            kwargs = dict(blocks=1, per_block={'C': 1, 'A': 1, 'B': 1})
+            baseline = worlds.register(str(arena), 'args-inventory', **kwargs)
+            candidate = baseline['worlds'][0]['founder_seed']
+            inventory.write_text(json.dumps({'seed': 0, 'args': {'worlds': [{'sample': candidate, 'ages': 7}]}}))
+            registered = worlds.register(str(arena), 'args-inventory', avoid_paths=[inventory], **kwargs)
+            self.assertNotIn(candidate, {w['founder_seed'] for w in registered['worlds']})
+            self.assertNotIn(candidate, {s for slot in registered['reserved'] for s in slot['seeds']})
+            self.assertEqual(registered['avoid'], [{
+                'path': str(inventory), 'sha256': rqlib.sha256_file(inventory), 'seeds': 3}])
+
+    def test_args_worlds_inventory_is_refused_by_plan_avoid(self):
+        """(Re-review of 915a7a0, P1, failure mode: plan.py --avoid) One of a plan's own engine seeds,
+        listed only in an args.worlds inventory, is a collision: no plan is written."""
+        with tempfile.TemporaryDirectory() as d:
+            edges = [E("within", "training", "A", "T2", "B", "T2")]
+            design, inventory, out = Path(d) / 'design.json', Path(d) / 'inventory.json', Path(d) / 'plan.jsonl'
+            design.write_text(json.dumps(design2(d, edges)))
+            rows, _, _ = plan.expand_v2(design2(d, edges), pending=True)
+            seed = min(plan.plan_seeds(rows))
+            inventory.write_text(json.dumps({'seed': 0, 'args': {'worlds': [{'sample': seed, 'ages': 7}]}}))
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = plan.main([str(design), '--pending', '--out', str(out), '--avoid', str(inventory)])
+            self.assertEqual(rc, 2, err.getvalue())
+            self.assertIn('engine seed(s) also used by', err.getvalue())
+            self.assertFalse(out.exists())
+
     def test_real_reservation_layouts_exact_sets(self):
         """Synthetic seeds in the unchanged audited files' actual field layouts."""
         receipt = {'path': 'old.json', 'sha256': 'a' * 64, 'seeds': 2}
