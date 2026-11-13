@@ -116,10 +116,10 @@ class VecSplitMix64:
         return np.sqrt(-2.0 * np.log(u1)) * np.cos(2 * math.pi * u2)
 
 
-def draw_streams(analysis, n, k, draws):
+def draw_streams(analysis, n, k, draws, namespace='AnnexH/1'):
     """-> (world indices (draws, n), reference-source vectors (draws, k)): the paired resampling."""
-    idx = VecSplitMix64(stats.stream_seed("H-T", analysis, "bootstrap")).below(n, draws * n).reshape(draws, n)
-    xi = (VecSplitMix64(stats.stream_seed("H-T", analysis, "reference-source")).normals(draws * k).reshape(draws, k)
+    idx = VecSplitMix64(stats.stream_seed("H-T", analysis, "bootstrap", namespace=namespace)).below(n, draws * n).reshape(draws, n)
+    xi = (VecSplitMix64(stats.stream_seed("H-T", analysis, "reference-source", namespace=namespace)).normals(draws * k).reshape(draws, k)
           if k else np.zeros((draws, 0)))
     return idx, xi
 
@@ -572,7 +572,7 @@ def classify(obs_e, draws_e, gate, a=LEVEL):
 
 
 def ht(epochs, betas, gates, loads=None, k=0, analysis="main", draws=stats.B_BOOT, c_T=GUARD, p_model=None,
-       report=True, redesign=None, eligibility=None, provenance=None):
+       report=True, redesign=None, eligibility=None, provenance=None, stream_namespace='AnnexH/1'):
     """The complete H-T analysis. epochs: {e: [(WorldDesign for e, responses y)]} (the same unique world
     ids in every epoch, any order); betas: {e: {"P": {world id: slope}, "Q": {world id: slope}}}; gates:
     {e: the epoch's calibrated recurrence-detection gate (bool)}; loads: {world id: {"C": L, "Q": L}}
@@ -618,7 +618,7 @@ def ht(epochs, betas, gates, loads=None, k=0, analysis="main", draws=stats.B_BOO
                       "failure": "numerical",
                       "winner": None, "candidates": [], "worlds": ids, "c_T": max(GUARD, c_T), "p_model": p_model,
                       "phase_support": {}, "EU_unsupported": {}})
-    idx, xi = draw_streams(analysis, n, k, draws)
+    idx, xi = draw_streams(analysis, n, k, draws, namespace=stream_namespace)
     obs, dr, res = {}, {}, {}
     try:
         per = {e: [world_epoch(wd, y, (loads or {}).get(w), xi) for w, (wd, y) in zip(ids, epochs[e])]

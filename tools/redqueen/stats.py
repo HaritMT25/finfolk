@@ -102,9 +102,9 @@ def x_of_frame(frame):
     return t_of_frame(frame) / 50.0
 
 
-def stream_seed(*parts):
-    """The first eight SHA-256 bytes, little-endian, of "AnnexH/1/<parts...>"."""
-    text = "AnnexH/1/" + "/".join(str(p) for p in parts)
+def stream_seed(*parts, namespace='AnnexH/1'):
+    """The first eight SHA-256 bytes, little-endian, of "<namespace>/<parts...>" (default AnnexH/1)."""
+    text = namespace + "/" + "/".join(str(p) for p in parts)
     return int.from_bytes(hashlib.sha256(text.encode()).digest()[:8], "little")
 
 

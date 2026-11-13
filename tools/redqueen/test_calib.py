@@ -182,7 +182,12 @@ class TestGenerator(unittest.TestCase):
         cb = self.cb
         p = cb.placeholder_params()
         p["fitted"] = True
-        p.pop("cohort")          # D8: production uses the registered corrected-age cohort
+        p.update(cohort=cb.stats.material.registered_ages(), cohort_sha256=cb.stats.material.AGES_SHA256,
+                 support_law=cb.stats.material.SUPPORT_LAW, age_clock=cb.stats.material.age_clock_identity(),
+                 survivor_ceiling=247, engine_sha256="b" * 64, fit={"mean_head": "c_H*sigmoid(eta)",
+                    "noise_likelihood": "600-rounded-capped-upper-infinity",
+                    **{kind: {k: "a" * 64 for k in ("implementation_sha256", "inputs_sha256", "receipt_sha256")}
+                       for kind in ("mean", "noise")}})
         with self.assertRaises(cb.CalibError):
             cb.check_params(p, production=True)                    # (bins only)
         cb.check_params(p)                                         # (fine for a synthetic run)
@@ -190,6 +195,18 @@ class TestGenerator(unittest.TestCase):
                 "S": {"x": [0.0], "s": [0.2]}, "F": {"x": [-1.0, 2.0], "s": [0.2, 0.3]}}
         p["noise"]["s_logit"] = good
         cb.check_params(p, production=True)
+        for key in ("cohort", "cohort_sha256", "horizon", "dt", "support_law", "age_clock", "engine_sha256", "survivor_ceiling", "fit"):
+            legacy = dict(p); legacy.pop(key)
+            with self.assertRaisesRegex(cb.CalibError, 'D8.*provenance'):
+                cb.check_params(legacy, production=True)
+        import copy
+        for key, value in (("support_law", "pre-D8"), ("survivor_ceiling", 600), ("age_clock", {})):
+            with self.assertRaises(cb.CalibError):
+                cb.check_params(dict(p, **{key: value}), production=True)
+        for key in ("mean_head", "noise_likelihood", "mean", "noise"):
+            legacy = copy.deepcopy(p); legacy["fit"].pop(key)
+            with self.assertRaises(cb.CalibError):
+                cb.check_params(legacy, production=True)
         mu = np.array([1e-6, 0.1, 0.5, 0.7, 0.99])
         self.assertEqual(cb.noise_scale(p, "C", mu).tobytes(), cb.noisescale.evaluate(good["C"], mu).tobytes())
         self.assertTrue(np.all(np.diff(cb.noise_scale(p, "C", mu)) <= 0))
@@ -206,6 +223,14 @@ class TestGenerator(unittest.TestCase):
         with self.assertRaises(cb.CalibError):
             cb.check_params(p)                                     # (F missing)
         self.assertEqual(len(cb.solver_identity()["m0_basis"]), 64)
+
+    def test_legacy_fit_rejected_without_D8_provenance(self):
+        p = self.cb.placeholder_params()
+        p['fitted'] = True
+        p.pop('cohort')
+        p['noise']['s_logit'] = {ch: {'x': [0.], 's': [.2]} for ch in 'CSF'}
+        with self.assertRaises(self.cb.CalibError):
+            self.cb.check_params(p, production=True)
 
     def test_d4_grid_table_cache(self):
         """The D4 warm-up fix: the grid tables and cell checks are built once and, with TABLE_CACHE, stored and
@@ -463,7 +488,8 @@ class TestGenerator(unittest.TestCase):
         import calib
         return {"graph_sha256": "g", "graph_source": "file:x+eligibility:y", "params_sha256": "p", "params_fitted": True,
                 "tools_sha256": "t", "draws": 9999, "gates_sha256": None, "production": True,
-                   "material_spec_sha256": calib.doc_sha(calib.stats.material.specification())}
+                   "material_spec_sha256": calib.doc_sha(calib.stats.material.specification()),
+                   "calibration_stream_namespace": "AnnexH/D8/1"}
 
     def test_ou_red_variation(self):
         """Codex's counterexample rho = (0, .98) is refused, and so is rho = (.05, .98) with innovations
@@ -567,7 +593,8 @@ class TestHarness(unittest.TestCase):
         cls.cb = calib
         cls.man = {"graph_sha256": "g", "graph_source": "file:x+eligibility:y", "params_sha256": "p", "params_fitted": True,
                    "tools_sha256": "t", "draws": 9999, "gates_sha256": None, "production": True,
-                   "material_spec_sha256": calib.doc_sha(calib.stats.material.specification())}
+                   "material_spec_sha256": calib.doc_sha(calib.stats.material.specification()),
+                   "calibration_stream_namespace": "AnnexH/D8/1"}
 
     def allocation(self, hyp, stage, n, score=lambda m, s, k: 0.001 * k, man=None, **kw):
         cb = self.cb
@@ -914,13 +941,21 @@ class TestStrata(unittest.TestCase):
         cls.params = calib.placeholder_params()
         cls.man = {"graph_sha256": "g", "graph_source": "file:x+eligibility:y", "params_sha256": "p", "params_fitted": True,
                    "tools_sha256": "t", "draws": 9999, "gates_sha256": None, "production": True,
-                   "material_spec_sha256": calib.doc_sha(calib.stats.material.specification())}
+                   "material_spec_sha256": calib.doc_sha(calib.stats.material.specification()),
+                   "calibration_stream_namespace": "AnnexH/D8/1"}
 
     def run_(self, mode, slot, **kw):
         cb = self.cb
         c = cb.quota_cell("H-F", mode, slot)
-        return cb.run_panel(self.graph, self.params, "H-F", "dev", "actual", mode, slot, cell=c,
-                            k=cb.cells_of("H-F", mode, cb.N_DEV)[c].index(slot), **kw)
+        # These boundary-geometry fixtures were constructed on this fixed synthetic stream.
+        # Preserve their jump / smooth-bracket geometry when the production stream version changes.
+        # The unpatched D8 stream and stage separation are independently tested in test_material.
+        from unittest.mock import patch
+        def fixture_rng(panel, purpose):
+            return cb.VecSplitMix64(cb.stats.stream_seed(*panel.tag, purpose, namespace="AnnexH/1"))
+        with patch.object(cb.Panel, "rng", fixture_rng):
+            return cb.run_panel(self.graph, self.params, "H-F", "dev", "actual", mode, slot, cell=c,
+                                k=cb.cells_of("H-F", mode, cb.N_DEV)[c].index(slot), **kw)
 
     def test_feasible_panel_goes_to_B_and_is_verified(self):
         """F4 slot 0: the panel multiplier lambda puts the noise-free FUNCTIONAL E_Q in the one-sided window

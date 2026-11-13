@@ -16,6 +16,10 @@ import zipfile
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import analysis
+import backbone
+import numpy as np
+import recurrence
+import transition
 import calib
 import cell
 import ckpt
@@ -70,7 +74,7 @@ class SyntheticScorer:
         return copy.deepcopy(self.cache[key])
 
 
-def fixture(d):
+def fixture(d, shared_reference=False):
     """64 registry slots; one retained C/A/B per block, all other slots biologically unavailable.
 
     A real plan/2 expansion, 41x41 panels plus fine pairs, four shared references measured at EVERY 1M.
@@ -84,6 +88,9 @@ def fixture(d):
     refs = {'schema': plan.REFS_SCHEMA, 'references': {f'R{g}:{k}': {
         'world': f's{g}{k}', 'uuid': f'ref-{g}-{k}', 'frame': 1, 'sha256': sha(['reference', g, k])}
         for g in 'QP' for k in range(4)}}
+    if shared_reference:
+        # sealing.py permits uniqueness within each guild, and this cross-guild alias.
+        refs['references']['RP:3'].update({k: refs['references']['RQ:0'][k] for k in ('uuid', 'frame', 'sha256')})
     refs_raw = rqlib.canonical(refs)
     binding = {'graph_edges_sha256': 'g' * 64, 'registry_sha256': 'r' * 64,
                'burn_in_frame': 5_000_000, 'max_restarts': 8, 'references_sha256': rqlib.sha256_bytes(refs_raw)}
@@ -270,11 +277,56 @@ class AnalysisTests(unittest.TestCase):
                 if endpoint.get('world') == 'C10':
                     endpoint['world'] = 'display-alias-C10'
         refs = json.loads(self.args['references_raw'])['references']
-        slots = {plan.snapshot_uuid(v['uuid'], v['frame']): k for k, v in refs.items()}
+        slots = {(k.split(':')[0], plan.snapshot_uuid(v['uuid'], v['frame'])): k for k, v in refs.items()}
         ids = {v['uuid']: w for w, v in self.args['mask']['worlds'].items()}
         assays = analysis.Assays(bundles, {w['id']: w for w in self.args['registry']['worlds']}, 1, 600, slots, ids)
         self.assertTrue(math.isfinite(assays.hc('C10')['neural']))
         self.assertTrue(assays.within['C10'])
+
+    def test_raw_hf_diagnostics_survive_strict_json(self):
+        d = json.loads(json.dumps(analysis.json_safe(self.report['descriptive']), allow_nan=False))
+        hf = d['H_F']
+        self.assertEqual(hf['n'], 8)
+        self.assertEqual(hf['positive'], sum(w['P'] is not None for w in hf['worlds'].values()))
+        self.assertEqual(hf['S_F'], sum(w['contribution'] for w in hf['worlds'].values())/8)
+        for w in d['H_F_worlds']:
+            selected = hf['worlds'][w['id']]
+            self.assertIn('P', selected)
+            self.assertEqual(selected['support_failures'], {str(r['P']): r['fails'] for r in w['periods'] if not r['supported']})
+            self.assertEqual(selected['phase_support'], w['phase_support'])
+            for r in w['periods']:
+                if 'readout' in r:
+                    for ch in ('C', 'Q'):
+                        self.assertIn('phase', r['readout'][ch])
+                        self.assertIn('chain', r['readout'][ch])
+                        self.assertIn('G', r['readout'][ch])
+            if selected['P'] is not None:
+                r = next(r for r in w['periods'] if r['P'] == selected['P'])
+                self.assertEqual(selected['phase_C'], r['phase_C'])
+                self.assertEqual(selected['phase_Q'], r['phase_Q'])
+        self.assertEqual(set(d['epoch_worlds']), {'E1', 'E2', 'E3'})
+
+    def test_reference_snapshot_in_both_guilds(self):
+        with tempfile.TemporaryDirectory() as d:
+            args, graphs = fixture(d, shared_reference=True)
+            report = analysis.analyze(**calibrated(args, graphs))
+            self.assertTrue(all(r['available'] for r in report['rows']))
+            refs = json.loads(args['references_raw'])['references']
+            self.assertEqual(refs['RQ:0']['uuid'], refs['RP:3']['uuid'])
+            slots = {(k.split(':')[0], plan.snapshot_uuid(v['uuid'], v['frame'])): k for k, v in refs.items()}
+            ids = {v['uuid']: w for w, v in args['mask']['worlds'].items()}
+            assays = analysis.Assays(analysis.load_packed(args['roots'], args['rows']),
+                                    {w['id']: w for w in args['registry']['worlds']}, 1, 600, slots, ids)
+            self.assertEqual({r for _, r in assays.refc['C10']}, {f'RQ:{k}' for k in range(4)})
+            self.assertEqual({r for _, r in assays.refq['C10']}, {f'RP:{k}' for k in range(4)})
+            # A free-control identity remains the snapshot, never a guild slot.
+            shared = plan.snapshot_uuid(refs['RQ:0']['uuid'], refs['RQ:0']['frame'])
+            self.assertEqual(sum(qid == shared for qid, _ in assays.free), 1)
+
+    def test_epoch_gate_unavailable_never_passes(self):
+        epoch = {e: {'available': e != 'E2', 'S_F': 100.} for e in transition.EPOCHS}
+        self.assertEqual(analysis.epoch_gate_flags(epoch, {e: 1. for e in epoch}),
+                         {'E1': True, 'E2': False, 'E3': True})
 
     def test_missing_bundle_refused(self):
         args = dict(self.args)
@@ -294,7 +346,9 @@ class AnalysisTests(unittest.TestCase):
                                          if slot['treatment'] == 'C' and stats.complete_history(slot))
             eco['Q200']['count'] = len(eco['Q200']['worlds'])
             args.update(ecology=eco, ecology_sha256=sha(eco), min_q200=24)
-            report = analysis.analyze(**calibrated(args, self.graphs))
+            # A population below 24 cannot require a passing, matching confirmatory calibration
+            # merely to retain its descriptive estimates. Deliberately supply unusable artifacts.
+            report = analysis.analyze(**dict(args, crit={}, acceptance={}, gates=None))
             hc = next(x for x in report['rows'] if x['hypothesis'] == 'H-C')
             self.assertTrue(hc['available'])
             self.assertEqual(hc['detection'], expected)
@@ -303,17 +357,92 @@ class AnalysisTests(unittest.TestCase):
             for row in report['rows']:
                 if row['hypothesis'] != 'H-C':
                     self.assertFalse(row['available']); self.assertEqual(row['p'], 1.)
-                    self.assertIsNone(row['material_point'])
+            self.assertEqual(set(report['descriptive']['world_slopes']['H-P']), set(eco['Q200']['worlds']))
+            self.assertEqual(report['descriptive']['H_F']['n'], blocks)
+            self.assertEqual(set(report['descriptive']['epoch_betas']), {'E1', 'E2', 'E3'})
+            self.assertTrue(report['descriptive']['H_T']['components'])
+            self.assertTrue(all(math.isfinite(v) for v in report['descriptive']['world_slopes']['H-Q'].values()))
+
+    def test_single_qualifying_world_retains_descriptive_slope(self):
+        args = dict(self.args)
+        eco = copy.deepcopy(args['ecology'])
+        for wid, slot in eco['slots'].items():
+            if slot['treatment'] == 'C' and wid != 'C10':
+                slot['attempts'][-1]['observation'] = 'event'
+        eco['Q200'].update(worlds=['C10'], count=1)
+        args.update(ecology=eco, ecology_sha256=sha(eco), min_q200=24)
+        report = analysis.analyze(**calibrated(args, self.graphs))
+        self.assertEqual(report['descriptive']['H_F']['n'], 1)
+        self.assertEqual(set(report['descriptive']['world_slopes']['H-P']), {'C10'})
+        self.assertTrue(math.isfinite(report['results']['H-Q']['estimate']))
+        self.assertTrue(all(row['p'] == 1. for row in report['rows'] if row['hypothesis'] != 'H-C'))
 
     def test_stale_d8_calibration_refused(self):
         crit = copy.deepcopy(self.run_args['crit'])
         crit['manifest']['H-F']['material_spec_sha256'] = 'old'
-        with self.assertRaisesRegex(analysis.AnalysisError, 'stale|another critical'):
-            analysis._check_calibration(crit, self.run_args['acceptance'], self.graphs, self.args['params'], 19, False)
+        acc = copy.deepcopy(self.run_args['acceptance'])
+        acc['crit_sha256'] = calib.doc_sha(crit)  # get past the digest check, exercise the SPEC comparison
+        with self.assertRaisesRegex(analysis.AnalysisError, 'stale / mismatched calibration:.*material_spec_sha256'):
+            analysis._check_calibration(crit, acc, self.graphs, self.args['params'], 19, False)
 
     def test_production_cannot_use_synthetic_shortcuts(self):
         with self.assertRaisesRegex(analysis.AnalysisError, 'production requires registered'):
             analysis.analyze(**dict(self.run_args, production=True))
+
+
+class DirectionalPanelsTests(unittest.TestCase):
+    def assays(self):
+        a = analysis.Assays.__new__(analysis.Assays)
+        a.reps = calib.R_REP
+        a.world_ids_by_uuid = {}
+        coarse = list(calib.COARSE)
+        coords = [(i, j) for i in coarse for j in coarse] + [(10., 11.), (11., 10.)]
+        a.within, a.pairs, a.free = {'C1': {}}, {}, {}
+        for i, j in coords:
+            qid, pid = str(i), str(j)
+            C = 324 * float(calib.sig(np.array([-.7 + .12*j/50]))[0])
+            S = 600 * (.3 + .005*i/50)
+            a.within['C1'][i, j] = {'C': C*a.reps, 'S': S*a.reps, 'F': 210*a.reps, 'qid': qid, 'pid': pid}
+            a.pairs[qid, pid] = {r: ({}, {}, C, S) for r in range(a.reps)}
+            for r in range(a.reps):
+                a.free[qid, r] = ({'prey': {'world': 'C1', 'frame': round(i*1e6)}}, {}, 210.)
+        return a
+
+    def slopes(self, a, interval=backbone.FULL):
+        cap, exp = a.panels('C1')
+        free = a.free_series('C1', {t for ts, _ in exp.values() for t in ts})
+        focal = [t for t in calib.COARSE if interval[0] <= t <= interval[1]]
+        return (backbone.hp_world(cap, focal, interval)[0], backbone.hq_world(free, exp, focal, interval)[0])
+
+    def test_fine_outcomes_cannot_change_directional_inputs_or_epoch_slopes(self):
+        a = self.assays()
+        inputs = copy.deepcopy(a.panels('C1'))
+        slopes = {e: self.slopes(a, interval) for e, interval in recurrence.SCOPES.items()}
+        for i, j in ((10., 11.), (11., 10.)):
+            o = a.within['C1'][i, j]
+            o['C'] = 0.; o['S'] = 247.*a.reps
+            a.pairs[o['qid'], o['pid']] = {r: ({}, {}, 0., 247.) for r in range(a.reps)}
+        for r in range(a.reps):
+            a.free[str(11.), r] = (a.free[str(11.), r][0], {}, 0.)
+        self.assertEqual(a.panels('C1'), inputs)
+        self.assertIn((10., 11.), a.within['C1'])  # recurrence keeps the fine measurement
+        self.assertEqual({e: self.slopes(a, interval) for e, interval in recurrence.SCOPES.items()}, slopes)
+
+    def test_known_directional_slopes_and_calibration_epoch_identity(self):
+        a = self.assays()
+        bp, bq = self.slopes(a)
+        self.assertAlmostEqual(bp, .12, delta=1e-6)
+        self.assertAlmostEqual(bq, .005, delta=1e-6)
+        coords = list(a.within['C1'])
+        refs = [(t, f'RQ:{r}') for t in calib.COARSE for r in range(4)]
+        wg = calib.WorldGraph('C1', 0, coords, refs, [(t, f'RP:{r}') for t, r in refs])
+        panel = calib.Panel([wg], calib.placeholder_params(), 'H-T', 'dev', 'actual', 'T1', 0)
+        K = {'C': np.array([a.within['C1'][i,j]['C'] for i,j in zip(wg.ti, wg.tj)]),
+             'S': np.array([a.within['C1'][i,j]['S'] for i,j in zip(wg.ti, wg.tj)]),
+             'F': np.full(len(wg.prey), 210.*a.reps)}
+        expected = panel.betas(wg, K)
+        for e in transition.EPOCHS:
+            np.testing.assert_allclose(self.slopes(a, recurrence.SCOPES[e]), expected[e], rtol=0, atol=1e-10)
 
 
 if __name__ == '__main__':

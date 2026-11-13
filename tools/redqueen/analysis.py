@@ -168,9 +168,9 @@ class Assays:
             elif qw in worlds and p.get('source') == 'scripted':
                 self._put(self.script[qw], ti, obs)
             elif qw in worlds and pw not in worlds and 'source' not in p:
-                self._put(self.refq[qw], (ti, reference_slots[pair[1]]), obs)
+                self._put(self.refq[qw], (ti, reference_slots['RP', pair[1]]), obs)
             elif pw in worlds and qw not in worlds:
-                self._put(self.refc[pw], (tj, reference_slots[pair[0]]), obs)
+                self._put(self.refc[pw], (tj, reference_slots['RQ', pair[0]]), obs)
             else:
                 self.ignored['cross-world / reference-grid pair'] += 1
 
@@ -206,13 +206,13 @@ class Assays:
             capture[t] = ([], [], [])
             exposed[t] = ([], [])
         for (a, b), o in sorted(grid.items()):
-            if a in coarse:
-                capture[a][0].append(b); capture[a][1].append(o['C']); capture[a][2].append(noisebank.capture_bound(5000) * self.reps)
-            if b in coarse:
-                # Binomial joint likelihood retains its 600 denominator per replicate.
-                for r in range(self.reps):
-                    exposed[b][0].append(a)
-                    exposed[b][1].append(self.pairs[o['qid'], o['pid']][r][3])
+            if a not in coarse or b not in coarse:
+                continue
+            capture[a][0].append(b); capture[a][1].append(o['C']); capture[a][2].append(noisebank.capture_bound(5000) * self.reps)
+            # Binomial joint likelihood retains its 600 denominator per replicate.
+            for r in range(self.reps):
+                exposed[b][0].append(a)
+                exposed[b][1].append(self.pairs[o['qid'], o['pid']][r][3])
         return capture, exposed
 
     def hc(self, wid):
@@ -281,7 +281,7 @@ def analyze(roots, rows, registry, ecology, mask, params, crit, acceptance, gate
     worlds = {w['id']: w for w in registry['worlds']}
     ceiling = material.cohort_ceiling(params.get('cohort', material.registered_ages()),
                                       params.get('horizon', 5000), params.get('dt', score.DT))
-    reference_slots = {plan.snapshot_uuid(v['uuid'], v['frame']): k
+    reference_slots = {(k.split(':')[0], plan.snapshot_uuid(v['uuid'], v['frame'])): k
                        for k, v in json.loads(references_raw)['references'].items()}
     world_ids_by_uuid = {u: w for w, info in mask['worlds'].items()
                          for u in (info.get('uuid'), info.get('attempt_uuid')) if u is not None}
@@ -308,9 +308,11 @@ def analyze(roots, rows, registry, ecology, mask, params, crit, acceptance, gate
         mask=mask, eco_sha256=ecology_sha256, mask_sha256=mask_sha256,
         min_q200=min_q200, hc_provenance=provenance(hc_slopes))
     q = elig['Q200']['worlds']
+    descriptive = {}
     results, betas = {}, {e: {'P': {}, 'Q': {}} for e in transition.EPOCHS}
     can_q = any(elig['hypotheses'][h]['available'] for h in stats.Q200_FAMILY)
-    if can_q:
+    if q:
+        confirmatory = elig if can_q else None
         psl, qsl = {}, {}
         for w in q:
             cap, exp = assays.panels(w)
@@ -323,7 +325,10 @@ def analyze(roots, rows, registry, ecology, mask, params, crit, acceptance, gate
                 betas[e]['P'][w] = backbone.hp_world(cap, focal, interval)[0]
                 betas[e]['Q'][w] = backbone.hq_world(free, exp, focal, interval)[0]
         for h, slopes, delta in (('H-P', psl, stats.DELTA_P), ('H-Q', qsl, stats.DELTA_Q)):
-            results[h] = backbone.directional_test(slopes, h, delta, draws=draws, eligibility=elig, provenance=provenance(q))
+            results[h] = (backbone.directional_test(slopes, h, delta, draws=draws, eligibility=confirmatory, provenance=provenance(q))
+                          if len(slopes) >= 2 else {'available': False, 'estimate': next(iter(slopes.values())),
+                                                    'reason': 'world resampling needs at least two worlds'})
+        descriptive.update(world_slopes={'H-P': psl, 'H-Q': qsl}, epoch_betas=betas)
         refs, graph, measured = {}, [], {}
         for w in q:
             refset = tuple(sorted({r for _, r in assays.refc[w]} | {r for _, r in assays.refq[w]}))
@@ -357,9 +362,15 @@ def analyze(roots, rows, registry, ecology, mask, params, crit, acceptance, gate
             loads[wg.id] = model.ref_loads(wg, model.loading_means(wg, m), refkeys)
             if reps != calib.R_REP:
                 loads[wg.id] = {k: v * math.sqrt(calib.R_REP / reps) for k, v in loads[wg.id].items()}
-        _check_calibration(crit, acceptance, graph, params, draws, production)
-        inputs = calib.decision_inputs(crit, acceptance)
-        rawhf = recurrence.hf(hfworlds, eligibility=elig, provenance=provenance(q))
+        # No confirmatory calibration is consumed below the population safeguard. In particular,
+        # a missing or differently sized calibration must not suppress valid descriptive estimates.
+        if can_q:
+            _check_calibration(crit, acceptance, graph, params, draws, production)
+        inputs = calib.decision_inputs(crit, acceptance) if can_q else {}
+        rawhf = recurrence.hf(hfworlds, eligibility=confirmatory, provenance=provenance(q))
+        descriptive.update(H_F=rawhf, H_F_worlds=hfworlds,
+                           epoch_H_F={e: recurrence.hf(epoch_results[e]) for e in transition.EPOCHS},
+                           epoch_worlds=dict(epoch_results))
         def model_p(claim, value):
             tables = acceptance.get('ptables', {}).get(claim)
             return stats.model_p(value, tables) if tables else None
@@ -367,20 +378,32 @@ def analyze(roots, rows, registry, ecology, mask, params, crit, acceptance, gate
         results['H-F'] = recurrence.hf_decision(rawhf, crit.get('c_F') if det.get('available') else None,
             model_p('H-F detection', rawhf['S_F']), crit.get('c_M') if mat.get('available') else None,
             model_p('H-F material', rawhf['M_F']))
-        if inputs.get('H-T', {}).get('available') and gates is not None:
+        if len(q) >= 2 and inputs.get('H-T', {}).get('available') and gates is not None:
             man = crit['manifest']['H-T']
             calib.check_gates(gates, man, production=production)
             if man.get('gates_sha256') != calib.doc_sha(gates):
                 raise AnalysisError('H-T was calibrated with another frozen epoch-gate artifact')
-            gate_flags = {e: recurrence.hf(epoch_results[e])['S_F'] > gates['c_E'][e] for e in transition.EPOCHS}
+            gate_flags = epoch_gate_flags(descriptive['epoch_H_F'], gates['c_E'])
+            descriptive['gate_flags'] = gate_flags
             rawht = transition.ht(epochs, betas, gate_flags, loads=loads, k=len(refkeys), draws=draws,
-                c_T=crit.get('c_T'), p_model=1.0, eligibility=elig, provenance=provenance(q))
+                c_T=crit.get('c_T'), p_model=1.0, eligibility=confirmatory, provenance=provenance(q))
             rawht['p_model'] = model_p('H-T', rawht.get('T_T')) if rawht.get('available') else None
             rawht['reject'] = bool(rawht.get('available') and rawht['p_model'] is not None and
                                   rawht['T_T'] > rawht['c_T'] and rawht['p_model'] <= stats.DETECT_ALPHA)
             results['H-T'] = rawht
+            descriptive['H_T'] = rawht
         else:
             results['H-T'] = {'available': False, 'reason': 'no passing H-T / epoch gate calibration'}
+            if len(q) >= 2:
+                # Uncalibrated descriptive epoch components only: no transition statistic or decision.
+                desc_ht = transition.ht(epochs, betas, {e: False for e in transition.EPOCHS},
+                    loads=loads, k=len(refkeys), draws=draws, c_T=None, report=False)
+                descriptive['H_T'] = {k: desc_ht.get(k) for k in
+                    ('components', 'phase_support', 'coverage', 'EU_unsupported', 'error', 'failure')}
+        if not can_q:
+            for h in stats.Q200_FAMILY:
+                if h in results:
+                    results[h] = dict(results[h], available=False, reason='Q200 below confirmatory minimum')
     decision = stats.decide(elig, results, deltas, weights)
     report_rows = []
     for h in stats.HYPOTHESES:
@@ -393,7 +416,7 @@ def analyze(roots, rows, registry, ecology, mask, params, crit, acceptance, gate
             exceed = detection and r.get('material_evidence', False)
         elif h == 'H-F':
             point = (bool(r['R_C'] >= recurrence.D_C and r['R_Q'] >= recurrence.D_Q)
-                     if 'R_C' in r and 'R_Q' in r else None)
+                     if 'R_C' in r and 'R_Q' in r else descriptive.get('H_F', {}).get('material_point'))
             operational = detection and bool(point)
             exceed = detection and bool(r.get('exceeds_material'))
         elif h == 'H-C':
@@ -406,7 +429,7 @@ def analyze(roots, rows, registry, ecology, mask, params, crit, acceptance, gate
             'detection': detection, 'material_point': point, 'operational_success': bool(operational),
             'material_exceedance': exceed})
     return {'schema': 'finfolk.redqueen.analysis/1', 'production': production, 'material_spec': material.specification(),
-            'rows': report_rows, 'decision': decision, 'eligibility': elig, 'results': results,
+            'descriptive': descriptive, 'rows': report_rows, 'decision': decision, 'eligibility': elig, 'results': results,
             'input_provenance': {'adapter_sha256': rqlib.sha256_file(__file__),
                 'registry_sha256': registry_sha256, 'ecology_sha256': ecology_sha256,
                 'mask_sha256': mask_sha256, 'references_sha256': rqlib.sha256_bytes(references_raw),
@@ -414,6 +437,11 @@ def analyze(roots, rows, registry, ecology, mask, params, crit, acceptance, gate
                 'acceptance_sha256': calib.doc_sha(acceptance), 'gates_sha256': calib.doc_sha(gates)},
             'input_summary': {'packed_bundles': len(bundles), 'free_controls': len(assays.free),
                               'measured_pairs': len(assays.pairs), 'ignored': dict(assays.ignored)}}
+
+
+def epoch_gate_flags(epoch_hf, critical):
+    return {e: bool(epoch_hf[e]['available'] and critical.get(e) is not None and
+                    epoch_hf[e]['S_F'] > critical[e]) for e in transition.EPOCHS}
 
 
 def _check_calibration(crit, acc, graph, params, draws, production):

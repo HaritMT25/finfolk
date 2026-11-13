@@ -21,9 +21,9 @@ is a documented synthetic stand-in ("fitted": false) for the tests and the bench
   covariance Gamma o (1 - (rho_i rho_j)^D) (Gamma = S / (1 - rho rho'), the stationary start) is PSD.
   Validation stress: rho = 0.98, innovation SD x 1.5.
   Observation (H.9.2; age-support correction): K = floor(N sigma(a + eps) + 1/2). Capture N is its
-  registered bound; survival N is the age-eligible ceiling derived from the registered ages, horizon
-  and max age (the survival denominator remains 600). The location solves E[K/600] = mu for survival,
-  equivalently E[K/N] = mu*600/N; an infeasible mean is refused, never censored. eps = s(mu) (R +
+  registered bound; survival is min(M_H, floor(600 sigma(a + eps) + 1/2)), with M_H from
+  the binary32 age clock. Survival heads are (M_H/600) sigma(eta). The location solves E[K/600] = mu
+  under that capped law; endpoint distributions are deterministic. eps = s(mu) (R +
   D + E) with the row (prey snapshot: C, S, F channels), donor (predator snapshot: C, S) and cell
   (SigmaE: capture and exposed survival of one assay cell JOINTLY, their cross-channel covariance kept)
   components by the ACTUAL sharing keys (a reference is one snapshot shared by its block's worlds; a
@@ -202,6 +202,7 @@ import graph as graphlib  # noqa: E402
 import noisescale  # noqa: E402
 import recurrence  # noqa: E402
 import stats  # noqa: E402
+import rqlib  # noqa: E402
 import transition  # noqa: E402
 from transition import VecSplitMix64  # noqa: E402
 
@@ -470,11 +471,29 @@ def check_params(p, production=False):
     if production and p.get("fitted") is not True:
         raise CalibError("generator parameters: production calibration needs FITTED parameters (H.9.1-H.9.2), "
                          "not the synthetic placeholder")
+    if production:
+        required = ("cohort", "cohort_sha256", "horizon", "dt", "support_law", "age_clock", "engine_sha256", "survivor_ceiling", "fit")
+        missing = [k for k in required if k not in p]
+        if missing:
+            raise CalibError(f"D8 production fit provenance missing: {missing}; legacy fits must be regenerated")
+        expected = {"support_law": stats.material.SUPPORT_LAW, "cohort_sha256": stats.material.AGES_SHA256,
+                    "age_clock": stats.material.age_clock_identity(), "survivor_ceiling": 247}
+        if any(p[k] != v for k, v in expected.items()):
+            raise CalibError("D8 production fit support-law / age-clock provenance mismatch; refit required")
+        if not rqlib.is_sha256(p["engine_sha256"]):
+            raise CalibError("D8 production fit needs the engine executable sha256")
+        fit = p["fit"]
+        if not isinstance(fit, dict) or fit.get("mean_head") != "c_H*sigmoid(eta)" or fit.get("noise_likelihood") != "600-rounded-capped-upper-infinity":
+            raise CalibError("D8 production fitting identities must describe bounded means and capped interval likelihood")
+        for kind in ("mean", "noise"):
+            record = fit.get(kind, {})
+            if not isinstance(record, dict) or not all(rqlib.is_sha256(record.get(k)) for k in ("implementation_sha256", "inputs_sha256", "receipt_sha256")):
+                raise CalibError(f"D8 production {kind} fit needs implementation, inputs and receipt sha256 identities")
     cohort = p.get("cohort", stats.material.registered_ages())
     if len(cohort.get("ages", [])) != TRIALS:
         raise CalibError("generator parameters: initial cohort must contain 600 registered ages")
-    if production and (cohort != stats.material.registered_ages() or p.get("horizon", 5000) != 5000
-                       or p.get("dt", 0.016) != 0.016):
+    if production and (cohort != stats.material.registered_ages() or p.get("horizon") != 5000
+                       or p.get("dt") != 0.016):
         raise CalibError("production requires the registered ages, 5k horizon and dt=0.016")
     stats.material.cohort_ceiling(cohort, p.get("horizon", 5000), p.get("dt", 0.016))
     th = np.asarray(p["theta"], float)
@@ -583,11 +602,23 @@ def erfc(x):
     return out
 
 
-def expected_fraction(a, s, N):
+def count_law(N, ceiling=None):
+    """Cache key: retain the count scale separately from the upper capped category."""
+    if isinstance(N, tuple):
+        return N
+    return int(N) if ceiling is None or ceiling == N else (int(N), int(ceiling))
+
+
+def law_support(N):
+    return N if isinstance(N, tuple) else (N, N)
+
+
+def expected_fraction(a, s, N, ceiling=None):
     """E[floor(N sigma(a + s Z) + 1/2)] / N EXACTLY (no quadrature, #68 round 2 P2-6): K >= k iff
-    sigma(a + sZ) >= (k - 1/2) / N, so E[K] = sum_{k=1..N} Phi((a - logit((k - 1/2)/N)) / s)."""
+    sigma(a + sZ) >= (k - 1/2) / N, so for cap M, E[K] = sum_{k=1..M} Phi((a - logit((k - 1/2)/N)) / s)."""
+    N, M = law_support(count_law(N, ceiling))
     a = np.atleast_1d(np.asarray(a, float))
-    lk = logit((np.arange(1, N + 1) - 0.5) / N)
+    lk = logit((np.arange(1, M + 1) - 0.5) / N)
     res = np.empty(len(a))
     for c0 in range(0, len(a), 256):                          # (chunks: bounded memory)
         z = (a[c0:c0 + 256, None] - lk[None, :]) / s
@@ -601,13 +632,19 @@ def expected_fraction(a, s, N):
 def _build_table(s, N):
     """a on a uniform grid and E[K/N](a) (exact), over the range where the expectation leaves (1e-12,
     1 - 1e-12); the linear interpolation's error is VERIFIED at every grid midpoint (<= LOC_TOL)."""
-    lo, hi = float(logit(0.5 / N)) - 9.0 * s - 2.0, float(logit(1 - 0.5 / N)) + 9.0 * s + 2.0
-    a = np.arange(lo, hi + LOC_STEP, LOC_STEP)
-    f = expected_fraction(a, s, N)
-    if np.any(np.diff(f) < 0):
-        raise CalibError(f"the rounded-count expectation is not monotone (s {s}, N {N})")
-    fm = expected_fraction((a[1:] + a[:-1]) / 2, s, N)
-    err = float(np.max(np.abs(fm - (f[1:] + f[:-1]) / 2)))
+    scale, limit = law_support(N)
+    lo, hi = float(logit(0.5 / scale)) - 9.0 * s - 2.0, float(logit((limit - 0.5) / scale)) + 9.0 * s + 2.0
+    step = LOC_STEP
+    for _ in range(5):
+        a = np.arange(lo, hi + step, step)
+        f = expected_fraction(a, s, N)
+        if np.any(np.diff(f) < 0):
+            raise CalibError(f"the rounded-count expectation is not monotone (s {s}, N {N})")
+        fm = expected_fraction((a[1:] + a[:-1]) / 2, s, N)
+        err = float(np.max(np.abs(fm - (f[1:] + f[:-1]) / 2)))
+        if err <= LOC_TOL or limit == scale:
+            break
+        step /= 2  # The capped category has greater curvature; keep the same verified tolerance.
     if err > LOC_TOL:
         raise CalibError(f"the location table's interpolation error {err:.2e} exceeds {LOC_TOL} (s {s}, N {N})")
     return a, f, err
@@ -615,7 +652,7 @@ def _build_table(s, N):
 
 def location_table(s, N):
     """The verified location table at any s (in-memory cache; the generator itself uses grid_table)."""
-    key = (float(s), int(N))
+    key = (float(s), count_law(N))
     if key not in _LOC:
         _LOC[key] = _build_table(s, N)
     return _LOC[key]
@@ -630,7 +667,7 @@ def tables_identity():
     """The grid tables' identity (Codex r9 P2-2): the registered grid constants and tools_sha256, the whole
     implementation (every numerical helper included); a cached entry is reused only under the same identity."""
     if not _IDENT:
-        _IDENT.append(hashlib.sha256(json.dumps([LOC_STEP, LOC_TOL, S_STEP, LOC_S_TOL, tools_sha()]).encode())
+        _IDENT.append(hashlib.sha256(json.dumps([LOC_STEP, LOC_TOL, S_STEP, LOC_S_TOL, tools_sha(), stats.material.specification()]).encode())
                       .hexdigest()[:20])
     return _IDENT[0]
 
@@ -651,8 +688,9 @@ def _disk(kind, k, N, arrays=None):
     if not TABLE_CACHE:
         return None
     ident = tables_identity()
-    path = os.path.join(TABLE_CACHE, f"{kind}-{ident}-N{int(N)}-k{int(k)}.npz")
-    me = {"kind": np.array(kind), "identity": np.array(ident), "N": np.array(int(N)), "k": np.array(int(k))}
+    law_tag = str(N).replace(' ', '_')
+    path = os.path.join(TABLE_CACHE, f"{kind}-{ident}-N{law_tag}-k{int(k)}.npz")
+    me = {"kind": np.array(kind), "identity": np.array(ident), "N": np.array(str(N)), "k": np.array(int(k))}
     if arrays is None:
         if not os.path.isfile(path):
             return None
@@ -680,7 +718,7 @@ def _disk(kind, k, N, arrays=None):
 
 def grid_table(k, N):
     """The verified location table at s = k S_STEP: from memory, else the disk cache, else built (and stored)."""
-    key = (int(k), int(N))
+    key = (int(k), count_law(N))
     if key not in _GRID:
         d = _disk("loc", k, N)
         if d is None:
@@ -694,7 +732,7 @@ def grid_table(k, N):
 def _location_grid(mu, k, N):
     a, f, _ = grid_table(k, N)
     if np.any(mu <= f[0]) or np.any(mu >= f[-1]) or not np.all(np.isfinite(mu)):
-        raise CalibError(f"an intended mean outside ({f[0]:.3g}, {1 - f[-1]:.3g} from 1): the bounded model "
+        raise CalibError(f"an intended mean outside table interior ({f[0]:.3g}, {f[-1]:.3g}), count law {N}: "
                          "cannot attain it")
     return np.interp(mu, f, a)
 
@@ -705,7 +743,8 @@ def _cell_error(k, N):
     grid, within (1e-9, 1 - 1e-9)."""
     sm = (k + 0.5) * S_STEP
     mu = expected_fraction(grid_table(k, N)[0][::7], sm, N)
-    mu = mu[(mu > 1e-9) & (mu < 1 - 1e-9)]
+    scale, limit = law_support(N)
+    mu = mu[(mu > 1e-9) & (mu < limit / scale - 1e-9)]
     if not len(mu):
         return 0.0
     a = 0.5 * (_location_grid(mu, k, N) + _location_grid(mu, k + 1, N))
@@ -720,7 +759,7 @@ def _ends(k, N):
 def _verify_s_cell(k, N):
     """The grid cell [k, k + 1] S_STEP verified once (|E[K/N] - mu| <= LOC_S_TOL; memory, then the disk cache,
     whose entry must name the content of the endpoint tables in use)."""
-    key = (int(k), int(N))
+    key = (int(k), count_law(N))
     if key not in _SCELL:
         d = _disk("cell", k, N)
         ends = _ends(k, N)
@@ -752,7 +791,7 @@ def s_bounds(p, ch, stress=False, extra=1.0):
 
 
 def s_spans(p, extras=(1.0, 1.5)):
-    """{N: (lo, hi)}: every s the parameter set can reach per trial count (each channel, unstressed and under
+    """{law: (lo, hi)}, law=N or (N, ceiling): every s the parameter set can reach per trial count (each channel, unstressed and under
     validation stress, at the registered noise extras): the UNION of the sampled range (the logit sample over
     [-16, 16] and every serialized knot, through the real evaluator) and s_bounds' bounds from the serialized
     values (which cover what the sample might miss)."""
@@ -763,7 +802,9 @@ def s_spans(p, extras=(1.0, 1.5)):
     spans = {}
     ceiling = stats.material.cohort_ceiling(p.get("cohort", stats.material.registered_ages()),
                                            p.get("horizon", 5000), p.get("dt", 0.016))
-    for ch, N in (("C", int(p["capture_bound"])), ("S", ceiling), ("F", ceiling)):
+    for ch, N in (("C", int(p["capture_bound"])), ("S", count_law(TRIALS, ceiling)), ("F", count_law(TRIALS, ceiling))):
+        if law_support(N)[1] == 0:
+            continue
         for stress in (False, True):
             for extra in extras:
                 s = noise_scale(p, ch, mu, stress, extra)
@@ -778,7 +819,7 @@ def warm_tables(p, extras=(1.0, 1.5)):
     sampled range and the bounds from the serialized scale values) -> {N: [k_lo, k_hi]} (the cells verified)."""
     spans = s_spans(p, extras)
     out = {}
-    for N, (lo, hi) in sorted(spans.items()):
+    for N, (lo, hi) in sorted(spans.items(), key=lambda kv: str(kv[0])):
         k0, k1 = int(math.floor(lo / S_STEP + 1e-9)), int(math.floor(hi / S_STEP + 1e-9))
         for k in range(k0, k1 + 1):
             _verify_s_cell(k, N)
@@ -786,12 +827,13 @@ def warm_tables(p, extras=(1.0, 1.5)):
     return out
 
 
-def location(mu, s, N):
+def location(mu, s, N, ceiling=None):
     """a(mu) with E[floor(N sigma(a + s Z) + 1/2)] / N = mu, Z ~ N(0, 1) (vectorized over cells), over the
-    FULL intended range (0, 1): no clipping, so distinct intended means keep distinct expected fractions
+    FULL interior support (0, ceiling/N): no clipping, so distinct means keep distinct expected fractions
     (#68 round 2 P2-6); a mean outside the table's range is refused. A continuous s (D4) interpolates
     linearly between the tables of the registered s grid (S_STEP), each grid cell verified (LOC_S_TOL)."""
-    mu, s = np.asarray(mu, float), np.asarray(s, float)
+    N = count_law(N, ceiling)
+    mu, s = np.broadcast_arrays(np.asarray(mu, float), np.asarray(s, float))
     out = np.empty_like(mu)
     k = np.floor(s / S_STEP + 1e-9).astype(np.int64)
     t = s / S_STEP - k
@@ -816,10 +858,16 @@ def counts(mu, s, eps, N, ceiling=None):
     Infeasible means are refused, never silently censored into a different boundary functional.
     """
     limit = N if ceiling is None else ceiling
-    mu = np.asarray(mu, float)
-    if not 0 < limit <= N or np.any(~np.isfinite(mu)) or np.any(mu <= 0) or np.any(mu >= limit / N):
+    mu, s, eps = np.broadcast_arrays(np.asarray(mu, float), s, eps)
+    if (type(limit) is not int or not 0 <= limit <= N or np.any(~np.isfinite(mu)) or
+            np.any(mu < 0) or np.any(mu > limit / N)):
         raise CalibError("rounded-count mean outside age-bounded support (boundary infeasible)")
-    return np.floor(limit * sig(location(mu * N / limit, s, limit) + eps) + 0.5)
+    out = np.where(mu == 0, 0., float(limit))
+    interior = (mu > 0) & (mu < limit / N)
+    if np.any(interior):
+        a = location(mu[interior], s[interior], N, limit)
+        out[interior] = np.minimum(limit, np.floor(N * sig(a + eps[interior]) + 0.5))
+    return out
 
 
 # ================================================================== D4: the null-model fitted means
@@ -1017,7 +1065,7 @@ class Panel:
         self._metric = {}
 
     def rng(self, purpose):
-        return VecSplitMix64(stats.stream_seed(*self.tag, purpose))
+        return VecSplitMix64(stats.stream_seed(*self.tag, purpose, namespace=CALIBRATION_NAMESPACE))
 
     # -------------------------------------------------------- means
     def latent(self, wg, th, pl, u, amp, dirC, dirQ, refs_only=False):
@@ -1069,13 +1117,19 @@ class Panel:
         aQ = self._amp_t(ti, amp, 1)            # survival: by the prey time's epoch
         return aC, aQ
 
+    def means(self, lat):
+        """D8 mean heads on the feasible support, including every boundary-search proposal."""
+        c = self.survivor_ceiling / TRIALS
+        return {ch: sig(eta) * (1.0 if ch in ("C", "RC") else c) for ch, eta in lat.items()}
+
     # -------------------------------------------------------- native means and covariance
     def native(self, wg, lat):
         """Native expected responses (noise-free): within C, within Q, ref C, ref Q."""
-        free = dict(zip(wg.prey.tolist(), sig(lat["F"]).tolist()))
-        out = {"RC": sig(lat["RC"]), "RQ": sig(lat["RS"]) - np.array([free[t] for t in wg.qT])}
+        m = self.means(lat)
+        free = dict(zip(wg.prey.tolist(), m["F"].tolist()))
+        out = {"RC": m["RC"], "RQ": m["RS"] - np.array([free[t] for t in wg.qT])}
         if "C" in lat:
-            out.update(C=sig(lat["C"]), Q=sig(lat["S"]) - np.array([free[t] for t in wg.ti]))
+            out.update(C=m["C"], Q=m["S"] - np.array([free[t] for t in wg.ti]))
         return out
 
     def cov(self, wg, m, kind):
@@ -1197,7 +1251,8 @@ class Panel:
         if ok not in self._metric:
             z0 = lambda t_: 0.0 * np.asarray(t_, float)  # noqa: E731
             lat0 = self.latent(wg, th, pl, u, {}, z0, z0, refs_only=True)
-            cv = self.cov(wg, {"C": sig(lat0["RC"]), "S": sig(lat0["RS"]), "F": sig(lat0["F"])}, key)
+            m0 = self.means(lat0)
+            cv = self.cov(wg, {"C": m0["RC"], "S": m0["RS"], "F": m0["F"]}, key)
             # (q33: the readout's RMS alone, on the cached graph geometry; = RefDesign.readout's rms / den)
             self._metric[ok] = recurrence.ref_rms_op(t, r, cv, scope, pl["P"])
         op = self._metric[ok]
@@ -1289,7 +1344,7 @@ class Panel:
             nat = self.native(wg, lat)
             w = {"id": wg.id, "plan": pl, "amp": {sc: list(v) for sc, v in amp.items()}, "graph": wg, "k": k,
                  "_ctx": (th, u, dirC, dirQ),
-                 "mu": {ch: sig(lat[ch]) for ch in lat},
+                 "mu": self.means(lat),
                  "y_true": {"within": {"C": nat["C"], "Q": nat["Q"]}, "ref": {"C": nat["RC"], "Q": nat["RQ"]}}}
             if pl["dir"] is not None:
                 w["betas_true"] = {e: (ver["dir"][f"{e}/beta_P"], ver["dir"][f"{e}/beta_Q"]) for e in transition.EPOCHS}
@@ -1361,7 +1416,7 @@ class Panel:
         amp["full"] = tuple(cur)
         lat = self.latent(wg, th, pl, u, amp, dirC, dirQ)
         nat = self.native(wg, lat)
-        w.update(amp={sc: list(v) for sc, v in amp.items()}, mu={ch: sig(lat[ch]) for ch in lat},
+        w.update(amp={sc: list(v) for sc, v in amp.items()}, mu=self.means(lat),
                  y_true={"within": {"C": nat["C"], "Q": nat["Q"]}, "ref": {"C": nat["RC"], "Q": nat["RQ"]}})
         self._reset_nf(w)
         return clips
@@ -1903,8 +1958,9 @@ class Panel:
 
     def noiseless_betas(self, wg, th, pl, u, dirC, dirQ, only=None, which="PQ", amp=None):
         lat = self.latent(wg, th, pl, u, amp or {}, dirC, dirQ)
-        return self.betas(wg, {"C": sig(lat["C"]) * self.p["capture_bound"] * R_REP,
-                               "S": sig(lat["S"]) * TRIALS * R_REP, "F": sig(lat["F"]) * TRIALS * R_REP}, only, which)
+        m = self.means(lat)
+        return self.betas(wg, {"C": m["C"] * self.p["capture_bound"] * R_REP,
+                               "S": m["S"] * TRIALS * R_REP, "F": m["F"] * TRIALS * R_REP}, only, which)
 
     def betas(self, wg, K, only=None, which="PQ"):
         """Per-epoch backbone slopes (H.1-H.2 restricted to the epoch's focal times, the complete coarse
@@ -2062,8 +2118,8 @@ class Panel:
                  for e in transition.EPOCHS}
         loads = {w["graph"].id: w["loads"] for w in self.worlds}           # (by world id: #68 review 11)
         k = self.worlds[0]["nref"] if self.worlds else 0
-        res = transition.ht(epochs, betas, gates, loads=loads, k=k, analysis=f"calib/{'/'.join(map(str, self.tag))}",
-                            draws=draws, report=False, redesign=self.redesign if V_PER_DRAW else None)
+        res = transition.ht(epochs, betas, gates, loads=loads, k=k, analysis=f"{CALIBRATION_NAMESPACE}/calib/{'/'.join(map(str, self.tag))}",
+                            draws=draws, report=False, stream_namespace=CALIBRATION_NAMESPACE, redesign=self.redesign if V_PER_DRAW else None)
         return {"T": res["T_T"], "S_e": S, "gates": gates, "available": res["available"],
                 "winner": None if not res["winner"] else [res["winner"]["ARD"], res["winner"]["FSD"]],
                 "phase_support": res["phase_support"], "EU_unsupported": res["EU_unsupported"],
@@ -2165,7 +2221,8 @@ def _dist(xs):
 # WINDOWS, OFFSETS and splits() to authorize production inputs, so a change to those checks is a new identity)
 TOOLS = ("calib.py", "recurrence.py", "transition.py", "backbone.py", "stats.py", "noisescale.py", "graph.py", "material.py", "fixtures/registered_ages.json")
 GATES_SCHEMA = "finfolk.redqueen.annexH.gates/1"
-IDENT = ("material_spec_sha256", "graph_sha256", "graph_source", "params_sha256", "params_fitted", "tools_sha256", "solver_sha256", "draws",
+CALIBRATION_NAMESPACE = "AnnexH/D8/1"
+IDENT = ("calibration_stream_namespace", "material_spec_sha256", "graph_sha256", "graph_source", "params_sha256", "params_fitted", "tools_sha256", "solver_sha256", "draws",
          "production")
 
 
@@ -2214,7 +2271,7 @@ def m0_basis():
 
 def manifest(graph, params, draws, gates=None, production=False, graph_source="synthetic"):
     """Everything a panel record depends on: crit / accept refuse to mix two of them (#68 round 2 P1-3)."""
-    return {"graph_sha256": graph_sha(graph), "graph_source": graph_source, "worlds": len(graph),
+    return {"calibration_stream_namespace": CALIBRATION_NAMESPACE, "graph_sha256": graph_sha(graph), "graph_source": graph_source, "worlds": len(graph),
             "material_spec": stats.material.specification(), "material_spec_sha256": doc_sha(stats.material.specification()),
             "solver": solver_identity(), "solver_sha256": doc_sha(solver_identity()),
             "params_sha256": hashlib.sha256(json.dumps(params, sort_keys=True).encode()).hexdigest(),
@@ -2264,6 +2321,8 @@ def check_gates(art, man=None, production=False):
         raise CalibError("production H-T needs gates from a production H-F calibration")
     if production and hm.get("material_spec_sha256") != doc_sha(stats.material.specification()):
         raise CalibError("production H-T needs epoch gates calibrated under D8")
+    if production and hm.get("calibration_stream_namespace") != CALIBRATION_NAMESPACE:
+        raise CalibError("production H-T needs the D8 calibration stream namespace")
     if man is not None:
         diff = [k for k in IDENT if hm.get(k) != man.get(k)]
         if diff:
@@ -2371,6 +2430,7 @@ def _manifest(rs, production, probs):
         probs.append(f"{len(mans)} different manifests (graph, parameters, tools, draws or gates)")
     man = json.loads(next(iter(mans))) if len(mans) == 1 else None
     if production and (man is None or man.get("material_spec_sha256") != doc_sha(stats.material.specification())
+                       or man.get("calibration_stream_namespace") != CALIBRATION_NAMESPACE
                        or not man.get("production") or man.get("draws") != stats.B_BOOT
                        or not man.get("params_fitted") or man.get("graph_source") == "synthetic"
                        or "+eligibility:" not in str(man.get("graph_source"))):
@@ -3140,7 +3200,7 @@ def main(argv=None):
         if a.cmd == "tables":
             c0 = time.process_time()
             span = warm_tables(get_params(a))
-            print(json.dumps({"identity": tables_identity(), "cells": span, "cpu_s": round(time.process_time() - c0, 1)}))
+            print(json.dumps({"identity": tables_identity(), "cells": {str(law): bounds for law, bounds in span.items()}, "cpu_s": round(time.process_time() - c0, 1)}))
             return 0
         if a.cmd in ("panels", "bench"):
             if a.cmd == "panels" and not a.smoke and not a.eligibility:     # (Codex #68 D6 P3: before any panel)

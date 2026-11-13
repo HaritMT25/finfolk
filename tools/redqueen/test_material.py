@@ -81,14 +81,141 @@ class MaterialTests(unittest.TestCase):
         mu, s = np.array([0.25]), np.array([0.20])
         K = calib.counts(mu, s, np.array([-1000., 1000.]), 600, limit)
         self.assertEqual(K.tolist(), [0., float(limit)])
-        loc = calib.location(mu * 600 / limit, s, limit)
-        expected = calib.expected_fraction(loc, 0.20, limit) * limit / 600
-        self.assertAlmostEqual(float(expected[0]), float(mu[0]), delta=calib.LOC_S_TOL)
-        for bad in (limit / 600, 0.8, -0.1, math.nan):
+        for mean, want in ((0., 0.), (limit / 600, float(limit))):
+            self.assertEqual(calib.counts(np.array([mean]), s, np.array([100.]), 600, limit).tolist(), [want])
+        self.assertEqual(calib.counts(np.zeros(2), s, np.array([-100., 100.]), 600, 0).tolist(), [0., 0.])
+        for bad in (0.8, -0.1, math.nan):
             with self.assertRaisesRegex(calib.CalibError, 'age-bounded support'):
                 calib.counts(np.array([bad]), s, np.array([0.]), 600, limit)
         # Capture remains supported on its full bound.
         self.assertEqual(float(calib.counts(np.array([0.8]), s, np.array([1000.]), 324)[0]), 324.)
+
+    def test_float32_age_clock_boundary_and_registered_horizons(self):
+        # Independent literal engine loop; the exact-arithmetic cutoff gives the WRONG answer here.
+        start = 40.00001907348633
+        end = np.float32(start)
+        for _ in range(5000):
+            end = np.float32(end + np.float32(0.016))
+        self.assertEqual(float(end), 119.99422454833984)
+        self.assertGreater(start + 5000 * 0.016, 120.)
+        cohort = {'ages': [start], 'n': 1, 'max_age': 120.}
+        self.assertEqual(material.cohort_ceiling(cohort), 1)
+        for H, expected in ((5000, 247), (10000, 0), (20000, 0)):
+            ages = material.registered_ages()
+            clocks = np.array(ages['ages'], dtype=np.float32)
+            for _ in range(H):
+                clocks += np.float32(0.016)
+            self.assertEqual(int(np.count_nonzero(clocks <= np.float32(120.))), expected)
+            self.assertEqual(material.cohort_ceiling(ages, H), expected)
+        # Also compare cached cutoff with direct clocks for a supporting physiology and nearby floats.
+        for H, dt, maximum in ((5000, .016, 120.), (800, .031, 30.)):
+            starts = np.linspace(0, maximum, 101, dtype=np.float32)
+            starts = np.r_[starts, np.float32(start)] if maximum == 120 else starts
+            clocks = starts.copy()
+            for _ in range(H):
+                clocks += np.float32(dt)
+            got = [material.age_feasible(float(a), H, dt, maximum) for a in starts]
+            self.assertEqual(got, (clocks <= np.float32(maximum)).tolist())
+
+    def test_capped_law_independent_categories_and_draws(self):
+        from statistics import NormalDist
+        normal = NormalDist()
+        N, M = 600, 247
+        # Independent category probabilities: category M includes the entire upper tail.
+        def categories(a, sd):
+            cuts = [-math.inf] + [math.log((k-.5)/(N-k+.5)) for k in range(1, M+1)] + [math.inf]
+            return np.array([normal.cdf((hi-a)/sd) - normal.cdf((lo-a)/sd)
+                             for lo, hi in zip(cuts, cuts[1:])])
+        for mu, sd in ((.25, .2), (.40, .37), (M/N-1e-5, .4)):
+            lo, hi = -20., 20.
+            for _ in range(70):
+                mid = (lo+hi)/2
+                if float(np.dot(np.arange(M+1), categories(mid, sd)))/N < mu:
+                    lo = mid
+                else:
+                    hi = mid
+            independent_location = (lo+hi)/2
+            actual = float(calib.location(np.array([mu]), np.array([sd]), N, ceiling=M)[0])
+            probs = categories(actual, sd)
+            self.assertAlmostEqual(float(np.dot(np.arange(M+1), probs))/N, mu, delta=calib.LOC_S_TOL)
+            self.assertAlmostEqual(actual, independent_location, delta=.002)
+            z = np.array([normal.inv_cdf((i+.5)/20000) for i in range(20000)])
+            raw = np.floor(N/(1+np.exp(-(actual + sd*z)))+.5)
+            self.assertTrue(np.any(raw > M))
+            got = calib.counts(np.full(len(z), mu), np.full(len(z), sd), sd*z, N, M)
+            np.testing.assert_array_equal(got, np.minimum(M, raw))
+            hist = np.bincount(got.astype(int), minlength=M+1)/len(z)
+            self.assertLessEqual(float(np.max(np.abs(hist-probs))), 1/len(z)+1e-12)
+
+    def test_capped_location_cache_identity_and_reload(self):
+        saved = (calib.TABLE_CACHE, dict(calib._GRID), dict(calib._SCELL))
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                calib.TABLE_CACHE = d
+                calib._GRID.clear(); calib._SCELL.clear()
+                mu, sd = np.array([.25, .40]), np.array([.2025, .2025])
+                first = calib.location(mu, sd, 600, ceiling=247)
+                self.assertTrue(any('(600,_247)' in p.name for p in Path(d).glob('loc-*')))
+                calib._GRID.clear(); calib._SCELL.clear()
+                from unittest.mock import patch
+                with patch.object(calib, '_build_table', side_effect=AssertionError('cache miss')):
+                    second = calib.location(mu, sd, 600, ceiling=247)
+                np.testing.assert_array_equal(first, second)
+                raw = json.dumps(material.specification())
+                self.assertIn('binary32-add-before-strict-age-death/1', raw)
+                self.assertIn('600-rounded-logistic-normal-capped/1', raw)
+        finally:
+            calib.TABLE_CACHE = saved[0]
+            calib._GRID.clear(); calib._GRID.update(saved[1])
+            calib._SCELL.clear(); calib._SCELL.update(saved[2])
+
+    def test_complete_registered_age_generator_pass(self):
+        p = calib.placeholder_params()
+        p['cohort'] = material.registered_ages()
+        panel = calib.Panel(calib.synthetic_graph(2), p, 'H-F', 'dev', 'actual', 'F1', 12).simulate()
+        self.assertEqual(len(panel.worlds), 2)
+        result = panel.analyze_hf()
+        self.assertTrue(result['full']['available'], result)
+        self.assertTrue(math.isfinite(result['full']['S']))
+        for w in panel.worlds:
+            for ch in ('S', 'F', 'RS'):
+                self.assertTrue(np.all((w['mu'][ch] >= 0) & (w['mu'][ch] <= 247/600)), ch)
+            for ch in ('S', 'F'):
+                self.assertTrue(np.all((w['K'][ch] >= 0) & (w['K'][ch] <= 247 * calib.R_REP)), ch)
+        lat = {ch: np.array([0.]) for ch in ('C', 'RC', 'S', 'RS', 'F')}
+        m = panel.means(lat)
+        for ch in ('S', 'RS', 'F'):
+            self.assertEqual(m[ch].tolist(), [247/1200])
+        # Search/native means must use the same head, at extreme predictors as well.
+        for eta in (-1000., 0., 1000.):
+            wg = panel.g[0]
+            lat = {ch: np.full(n, eta) for ch, n in
+                   (('C', len(wg.ti)), ('S', len(wg.ti)), ('RC', len(wg.cT)), ('RS', len(wg.qT)), ('F', len(wg.prey)))}
+            native = panel.native(wg, lat)
+            self.assertTrue(np.all(np.abs(native['Q']) <= 247/600))
+            self.assertTrue(np.all(np.abs(native['RQ']) <= 247/600))
+            self.assertEqual(panel.means(lat)['F'][0], 247/600 * float(calib.sig(np.array([eta]))[0]))
+
+    def test_calibration_streams_are_versioned_and_separated(self):
+        import hashlib
+        import transition
+        tag = ('H-F', 'dev:actual', 'F1', 3, 'worlds')
+        old = stats.stream_seed(*tag)
+        new = stats.stream_seed(*tag, namespace='AnnexH/D8/1')
+        independent = int.from_bytes(hashlib.sha256(('AnnexH/D8/1/'+'/'.join(map(str, tag))).encode()).digest()[:8], 'little')
+        self.assertEqual(new, independent)
+        self.assertNotEqual(old, new)
+        p = calib.placeholder_params(); graph = calib.synthetic_graph(2)
+        dev = calib.Panel(graph, p, 'H-F', 'dev', 'actual', 'F1', 3)
+        val = calib.Panel(graph, p, 'H-F', 'val', 'actual', 'F1', 3)
+        self.assertEqual(dev.rng('worlds').s, new)
+        self.assertNotEqual(dev.rng('worlds').s, val.rng('worlds').s)
+        self.assertEqual(calib.manifest(graph, p, 19)['calibration_stream_namespace'], 'AnnexH/D8/1')
+        a = transition.draw_streams('calib/dev', 4, 2, 19)
+        b = transition.draw_streams('calib/dev', 4, 2, 19, namespace='AnnexH/D8/1')
+        c = transition.draw_streams('calib/val', 4, 2, 19, namespace='AnnexH/D8/1')
+        self.assertFalse(np.array_equal(a[1], b[1]))
+        self.assertFalse(np.array_equal(b[1], c[1]))
 
     def test_rule_two_on_registered_reference_schedule(self):
         # graph.build measures EACH reference at graph.TIMES, independent of intensive status / fine offsets.
