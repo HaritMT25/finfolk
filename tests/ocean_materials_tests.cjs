@@ -125,7 +125,7 @@ const SCENE_SHA256 = {
 };
 
 section("the module");
-ok(SH.features().join() === [SKIP, F, L].join(), "it registers the split's skip as a feature, beside the polish's two modes: " + SH.features().join(", "));
+ok(SH.features().join() === [SH.DECODED, SKIP, F, L].join(), "it registers the split's skip as a feature, beside the polish's two modes and the shader module's decoded constants: " + SH.features().join(", "));
 const skipF = SH.featureOf(SKIP);
 ok(skipF && skipF.order === -1 && skipF.targets.join() === "app.body.vs" && Object.keys(skipF.append).join() === "app.pose" && skipF.append["app.pose"] === SH.LIT_SKIP_GLSL && skipF.version === 1,
    "scene.litSkip: app.body.vs's app.pose, order -1, the skip's line (LIT_SKIP_GLSL), version 1");
@@ -692,6 +692,86 @@ section("review P3: the plain fallback, the split's skip, features() once, freei
     ok(good ? rq.ok && Q.programs("app", "litSkip", 0).vs.includes(SH.LIT_SKIP_GLSL + "\n  // z") : !rq.ok && /ahead of the split's skip/.test(rq.error),
        "P3-8: " + id + (good ? " (order -1, its id after scene.litSkip): after the skip" : ": refused (it would run ahead of the skip)"), rq);
   }
+}
+
+section("the render features (setRender: the decoded constants as a policy beside the Look's set)");
+{
+  const DEC = SH.DECODED, app = (B, p, v) => B.programs("app", p, v);
+  /* a binder with its own recording compile (the items it was asked to compile) */
+  function rb(compile) { const compiled = []; const r = sceneBinder(ctx, compile ? compile(compiled) : (items) => { compiled.push(items.map((x) => x.key)); return { ok: true }; }); r.compiled = compiled; return r; }
+  const { B, compiled } = rb();
+  const plain0 = [app(B, "body", 0), app(B, "body", 1), app(B, "shadow", 0), app(B, "shadow", 1), app(B, "litSkip", 0)];
+  ok(B.render().ids.length === 0 && B.render().applies === true && B.state().render.length === 0, "no render features at first: the raw programs, the policy applies under no Look");
+  const r1 = await B.setRender([DEC]);
+  ok(r1.ok && r1.ids.join() === DEC && B.render().ids.join() === DEC && compiled.length === 1 && compiled[0].length >= 5,
+     "setRender([decoded]): every reachable variant of the appearance fish compiled first (" + (compiled[0] || []).length + " materials), then in effect", r1);
+  const on = [app(B, "body", 0), app(B, "body", 1), app(B, "shadow", 0), app(B, "shadow", 1), app(B, "litSkip", 0)];
+  const wantOn = (v, P, pass) => pass === "shadow" ? SH.appearanceShaders(EA, P === 1 ? "lite" : false, [DEC]).shadowVs : pass === "litSkip" ? SH.litSkip(SH.appearanceShaders(EA, false, [DEC]).vs) : SH.appearanceShaders(EA, P === 1, [DEC])[v];
+  ok(on[0].vs === wantOn("vs", 0, "body") && on[0].fs === wantOn("fs", 0, "body") && on[1].vs === wantOn("vs", 1, "body") && on[1].fs === wantOn("fs", 1, "body"),
+     "the bodies draw the decoded programs: vertex and fragment stages as the shader module assembles them with the feature (plain and polished)");
+  ok(on[2].vs === wantOn("", 0, "shadow") && on[3].vs === wantOn("", 1, "shadow") && on[2].fs === SH.SHADOW_FS, "the shadows' vertex stages decoded (the polished one the lite polish), their fragment stage unchanged");
+  ok(on[4].vs === wantOn("", 0, "litSkip") && on[4].vs.includes("void main() {\n" + SH.LIT_SKIP_GLSL + "\n") && on[4].vs.includes("mLoad("),
+     "the split's skip pass: the decoded body with the skip first in main()");
+  ok(on.every((p, i) => p.key !== plain0[i].key && p.key.includes(DEC + "@1") && p.own), "their keys hold the feature's id and version; they are the binder's own programs (no fallback)");
+  ok(app(B, "body", 0).key.split("|").filter((x) => x.startsWith("fs:")).join() === "fs:" + DEC + "@1" && app(B, "shadow", 0).key.includes("fs:(SHADOW_FS)"), "the key's stage parts: the body's fragment stage has it, the shadow's has none (SHADOW_FS)");
+  /* the other kinds never see it */
+  ok(B.programs("fish", "body", 0).vs === SH.FISH_VS[0] && B.programs("pred", "body", 1).fs === SH.FISH_FS[1], "the legacy fish and the predators are untouched");
+  /* off again: the raw programs, and the cache kept (its materials are not freed: a policy flip back is cheap) */
+  const nC = compiled.length, r2 = await B.setRender([]);
+  ok(r2.ok && B.render().ids.length === 0 && app(B, "body", 0).vs === plain0[0].vs && app(B, "body", 1).fs === plain0[1].fs && app(B, "litSkip", 0).vs === plain0[4].vs && compiled.length === nC + 1,
+     "setRender([]): the raw programs again, byte for byte, after a compile of them", r2);
+  const r3 = await B.setRender([DEC]);
+  ok(r3.ok && app(B, "body", 0).vs === on[0].vs && app(B, "body", 0).key === on[0].key, "and on again: the same materials (the cache's keys)");
+  const same = await B.setRender([DEC]);
+  ok(same.ok && same.materials === 0 && compiled.length === nC + 2, "setRender with the ids already in effect: nothing compiled");
+  /* refusals: a bad list, an unknown id: the policy in effect stays */
+  const bad = await B.setRender("render.decoded"), unk = await B.setRender(["render.nope"]);
+  ok(!bad.ok && bad.stage === "spec" && !unk.ok && /unknown feature render.nope/.test(unk.error) && B.render().ids.join() === DEC, "a list that is not one, an unknown id: refused, naming it; the ids in effect stay", { bad, unk });
+}
+{
+  /* a planted compile failure: the previous ids stay, what it made is dropped; an assembly error likewise; a change while another compiles is refused */
+  const { B, warned } = sceneBinder(ctx, () => ({ ok: false, error: "planted compile failure" }));
+  const r = await B.setRender([SH.DECODED]);
+  ok(!r.ok && r.stage === "compile" && /planted/.test(r.error) && B.render().ids.length === 0 && B.programs("app", "body", 0).vs === SH.appearanceShaders(EA, false).vs && B.state().failed.length === 0,
+     "a compile that fails keeps the raw programs (and the binder's state shows no failed entry)", r);
+  let release; const gate = new Promise((res) => { release = res; });
+  const { B: C } = sceneBinder(ctx, () => gate.then(() => ({ ok: true })));
+  const p1 = C.setRender([SH.DECODED]), p2 = C.setRender([]), p3 = C.activate(null);
+  const [q2, q3] = [await p2, await p3];
+  ok(!q2.ok && /in progress/.test(q2.error) && !q3.ok && /in progress/.test(q3.error) && C.render().pending === true && C.render().ids.length === 0,
+     "while one compiles: another setRender and an activation are refused, the ids in effect not yet changed");
+  release({}); const q1 = await p1;
+  ok(q1.ok && C.render().pending === false && C.render().ids.join() === SH.DECODED, "once it compiled: in effect");
+  /* a feature with an assembly error (a planted collision) under the render features: refused at assembly, the ids stay */
+  const pc = load({ "ocean_shaders.js": (s) => s.replace('"app.fetch.body": "  vDecoded = vec2(iGeneSlot, iX.z);"', '"app.fetch.body": "  vDecoded = vec2(iGeneSlot, iX.z); float M = 1.0;"') });
+  const { B: D } = sceneBinder(pc, () => ({ ok: true }));
+  const rd = await D.setRender([pc.EvoOceanShaders.DECODED]);
+  ok(!rd.ok && rd.stage === "assembly" && D.render().ids.length === 0 && D.programs("app", "body", 0).vs === pc.EvoOceanShaders.appearanceShaders(pc.EvoAppearance, false).vs,
+     "an assembly error under the feature (a planted declaration collision): refused at assembly, the raw programs stay", rd);
+}
+{
+  /* under a Look: the cache applies only where the Look declared it keeps to the contract */
+  const DEC = SH.DECODED;
+  const look = (extra) => Object.assign({ look: "reef", features: (q) => q.base }, extra || {});
+  const { B } = sceneBinder(ctx, () => ({ ok: true }));
+  await B.setRender([DEC]);
+  const ra = await B.activate(look());
+  ok(ra.ok && B.render().applies === false && B.render().ids.join() === DEC && B.programs("app", "body", 0).vs === SH.appearanceShaders(EA, false).vs,
+     "a Look that did not declare appearanceCache: the raw programs (the policy does not apply under it), the ids kept", ra);
+  const rb2 = await B.activate(look({ appearanceCache: 1 }));
+  ok(rb2.ok && B.render().applies === true && B.programs("app", "body", 0).vs === SH.appearanceShaders(EA, false, [DEC]).vs, "a Look with appearanceCache: 1: the decoded programs under it");
+  const rc = await B.activate(null);
+  ok(rc.ok && B.render().applies === true && B.programs("app", "body", 0).vs === SH.appearanceShaders(EA, false, [DEC]).vs, "no Look again: decoded");
+}
+{
+  /* before the appearance fish is defined: the ids are taken as they are, and its first materials are made under them (the scene's startup) */
+  const M2 = ctx.EvoOceanMaterials, compiled = [];
+  const B = M2.create({ THREE: fakeThree(), compile: (items) => { compiled.push(items.length); return { ok: true }; } });
+  const r = await B.setRender([SH.DECODED]);
+  ok(r.ok && compiled.length === 0 && B.render().ids.join() === SH.DECODED, "no appearance fish defined yet: nothing to compile, the ids in effect", r);
+  B.define("app", { uniforms: { body: { uGenes: { value: null } }, shadow: { uAlpha: { value: 0.4 } } }, env: { EA } });
+  B.prepare(["app"]);
+  ok(B.programs("app", "body", 0).vs === SH.appearanceShaders(EA, false, [SH.DECODED]).vs, "its first materials are the decoded programs");
 }
 
 section("review P3-9: one writer of .material in web/ (a source scan)");

@@ -104,6 +104,14 @@
 # driver (tools/ocean_body_fixture.cpp) must print the same document natively
 # and in wasm, equal to the committed tests/fixtures/ocean_body_fixture.json.
 #
+# M2b1's birth physics (src/ocean/body_material.hpp, hydro_coefficients.hpp,
+# hydro_math.hpp, hydro_state.hpp: no world reads them yet, and public
+# hydrodynamics requests stay refused): the fixture driver
+# tools/ocean_hydro_fixture.cpp must print the same document natively and in
+# wasm, equal to the committed tests/fixtures/ocean_hydro_fixture.json, and the
+# offline native reference tools/ocean_hydro_reference.cpp (double precision)
+# must pass its tolerances.
+#
 # Bisecting a FAIL: the table names the first differing line (step and
 # sections; `chain` alone = the states differed at some step since the last
 # print and agree again). Re-run the case with --trace (every step) to find the
@@ -224,6 +232,12 @@ done
 # shellcheck disable=SC2086
 bgbuild body_fixture_native g++ $CXXFLAGS ${NATIVE_CXXFLAGS:-} tools/ocean_body_fixture.cpp -o "$OUT/obf_native"
 bgbuild body_fixture_wasm   em++ $CXXFLAGS $EMFLAGS tools/ocean_body_fixture.cpp -o "$OUT/obf_wasm.js"
+# M2b1 PR 1: the birth-physics fixture driver (native and wasm) and the offline native reference
+# shellcheck disable=SC2086
+bgbuild hydro_fixture_native g++ $CXXFLAGS ${NATIVE_CXXFLAGS:-} tools/ocean_hydro_fixture.cpp -o "$OUT/ohf_native"
+bgbuild hydro_fixture_wasm   em++ $CXXFLAGS $EMFLAGS tools/ocean_hydro_fixture.cpp -o "$OUT/ohf_wasm.js"
+# shellcheck disable=SC2086
+bgbuild hydro_reference     g++ $CXXFLAGS ${NATIVE_CXXFLAGS:-} tools/ocean_hydro_reference.cpp -o "$OUT/ohr_native"
 wait
 BUILD_OK=1
 for l in "${EXPECT[@]}"; do   # a build that never wrote its rc (killed wrapper) fails the run
@@ -1108,6 +1122,21 @@ if [ "$rbn" = 0 ] && [ "$rbw" = 0 ] && cmp -s "$OUT/body_fixture.native.json" "$
 else
     echo "== body-plan fixture DIFFERS (rc native $rbn wasm $rbw; native vs wasm: $(cmp "$OUT/body_fixture.native.json" "$OUT/body_fixture.wasm.json" 2>&1 | head -1);" \
          "vs the committed file: $(cmp "$OUT/body_fixture.native.json" tests/fixtures/ocean_body_fixture.json 2>&1 | head -1))"; FAILED=1
+fi
+# M2b1 PR 1: the birth-physics fixture (native == wasm == committed) and the offline reference (native, double).
+"$OUT/ohf_native" > "$OUT/hydro_fixture.native.json" 2> "$OUT/hydro_fixture.native.log"; rhn=$?
+$NODE "$OUT/ohf_wasm.js" > "$OUT/hydro_fixture.wasm.json" 2> "$OUT/hydro_fixture.wasm.log"; rhw=$?
+if [ "$rhn" = 0 ] && [ "$rhw" = 0 ] && cmp -s "$OUT/hydro_fixture.native.json" "$OUT/hydro_fixture.wasm.json" &&
+   cmp -s "$OUT/hydro_fixture.native.json" tests/fixtures/ocean_hydro_fixture.json; then
+    echo "== birth-physics fixture: native == wasm == tests/fixtures/ocean_hydro_fixture.json ($(cat "$OUT/hydro_fixture.native.log"))"
+else
+    echo "== birth-physics fixture DIFFERS (rc native $rhn wasm $rhw; native vs wasm: $(cmp "$OUT/hydro_fixture.native.json" "$OUT/hydro_fixture.wasm.json" 2>&1 | head -1);" \
+         "vs the committed file: $(cmp "$OUT/hydro_fixture.native.json" tests/fixtures/ocean_hydro_fixture.json 2>&1 | head -1))"; FAILED=1
+fi
+if "$OUT/ohr_native" > "$OUT/hydro_reference.txt" 2>&1; then
+    echo "== offline reference (tools/ocean_hydro_reference.cpp): $(tail -1 "$OUT/hydro_reference.txt")"
+else
+    echo "== offline reference FAILED:"; cat "$OUT/hydro_reference.txt"; FAILED=1
 fi
 
 TESTS_OK=1

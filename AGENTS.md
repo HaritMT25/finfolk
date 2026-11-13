@@ -35,10 +35,12 @@ the site is static three.js/JS in `web/` (no JS build step). Python tools run ex
   Plain `<script>` IIFEs, each registering one `window.Evo*` namespace (no bundler); `types.d.ts` declares
   their shared shapes and globals for the type check (`tsconfig.json`), and is never loaded by a page.
 - `tests/` `core_tests.cpp`, `ocean_tests.cpp` (+ `ocean_*_tests.hpp`), `ocean_turbo_handoff.js`,
-  `ocean_shader_slots_tests.cjs`, `ocean_materials_tests.cjs`, `ocean_mock_three_tests.mjs`, `ocean_render_browser.mjs`,
+  `ocean_shader_slots_tests.cjs`, `ocean_materials_tests.cjs`, `ocean_render_opt_tests.cjs`, `ocean_mock_three_tests.mjs`, `ocean_render_browser.mjs`,
   `ocean_body_gpu.mjs` (the body plan's GPU == C++ check in headless Brave), `ocean_baseline/` (committed fingerprints),
   `fixtures/` (incl. `ocean_body_fixture.json`, written by `tools/ocean_body_fixture.cpp`), `*.sh` end-to-end tests.
 - `tools/` `ocean_parity_driver.cpp` + `ocean_fingerprint.hpp` (the parity harness), `ocean_body_fixture.cpp`, `ocean_eye_*`,
+  `ocean_render_perf/` (the Ocean page's cycled GPU-frame harness, before/after pictures and page smoke: headless Brave under the
+  machine-wide browser lock; `docs/ocean_render_perf.md` says how to run them and what they measured),
   `gen_planes*.{cpp,sh}` (regenerate plane headers), `invasion/` (invasion-matrix study: plan/run/score/analyze),
   `alife2027/` (ALIFE 2027 study runner: plan/run/analyze), `three_bundle/`.
 - `.github/workflows/` `ci.yml` (every push/PR), `ocean-full.yml` (full Ocean matrix, weekly/on demand).
@@ -112,12 +114,18 @@ Memory is tight on the maintainer's PC: use `JOBS`/`BUILD_JOBS`, `nice -n 19`, a
   drawn program against the scene digests, the split's skip as a feature, the shadow's lite polish, the faces on the
   predators' vertex features, the layouts, atomic activation (a planted compile failure) and the plain fallback (a
   planted assembly error); its compile fenced by the WebGL context's generation.
+- `node tests/ocean_render_opt_tests.cjs`: the render optimization's pure parts (`web/ocean_pose.js` bodyLod / barbelVisible:
+  thresholds, hysteresis, the float32 0.2; `EvoAppearance.writeDecoded`: the decoded constants' packer against the CPU
+  mirrors, and its layout).
 - `node tests/ocean_mock_three_tests.mjs`: the scene itself (all its page scripts, the real three bundle, a recording
   stand-in for the renderer) through a scripted session: every frame each fish mesh draws its bound variant's programs;
   the whole recording (draws in three's order, uploads, programs, counters) against its committed sha256 (`GOLDEN`:
   an intended change to what the scene draws updates it, with the reason); a context loss during the polish's prewarm.
-  `--against OLD_WEB` compares two `web/` trees frame by frame (a refactor's identity proof). Node 20.19 or later (it
-  imports the ES-module three bundle by syntax detection; CI pins 20.x).
+  The recording is of the reference pipeline (`renderOptimization: false`, main's draws byte for byte); the render
+  optimization (screen LOD buckets, the decoded constants, gated barbels) has sessions of its own, checked by assertions
+  (every fish in one body draw, batch attributes, ring uniforms, a model of the GPU's copy of both gene textures) and
+  planted faults, never by a recorded hash. `--against OLD_WEB` compares two `web/` trees frame by frame (a refactor's
+  identity proof). Node 20.19 or later (it imports the ES-module three bundle by syntax detection; CI pins 20.x).
 - `npm ci && npx tsc -p tsconfig.json`: the web type check (exit 0 = pass; `package.json` pins TypeScript,
   `package-lock.json` the exact tree, development only): `tsc --checkJs` over the
   files `tsconfig.json` lists that carry `// @ts-check`, against `web/types.d.ts`. A new or extracted web module
@@ -133,7 +141,10 @@ Memory is tight on the maintainer's PC: use `JOBS`/`BUILD_JOBS`, `nice -n 19`, a
   pinned by the maintainer (a change needs a rebuild and an explicit decision).
 - CI jobs: `native` (3 variants), `wasm` (build, freshness, `parity.sh`, `build_site.sh`), `ocean` (freshness,
   turbo hand-off, FAST parity, `app_live_s21` twin), `web-types` (the type check), `web-shader-slots` (the slot
-  contract), `receipts`.
+  contract, the binder, the render optimization's pure parts, the scene on a recording renderer), `receipts`.
+- The Ocean page's render policy (`scene.setRenderOptimization`, `?renderOpt=0` for the reference pipeline) is display only:
+  no simulation module, hash or baseline is involved. `node tools/ocean_render_perf/{cycle,shots,smoke}.mjs` measure and
+  picture it in headless Brave under the machine-wide lock (`docs/ocean_render_perf.md`).
 
 - Gate receipts (`tools/gate_receipts.sh`, `docs/gate_receipts.md`): a local, never-CI speed-up that skips re-running a
   gate whose whole tracked tree, command, environment and toolchain are unchanged. Receipts never replace a gate in CI,

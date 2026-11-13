@@ -169,7 +169,7 @@
   }
   /** @param {MaterialSetSpec | null | undefined} spec @returns {MaterialSet} */
   function normalize(spec) {
-    if (spec === null || spec === undefined) return Object.freeze({ look: "", features: null, attach: null, uniforms: null, layouts: LAYOUTS, faceDigest: "" });
+    if (spec === null || spec === undefined) return Object.freeze({ look: "", features: null, attach: null, uniforms: null, layouts: LAYOUTS, faceDigest: "", appearanceCache: false });
     if (typeof spec !== "object") throw err("a feature set is an object: {look, features, attach, uniforms, claims}");
     var look = spec.look;
     if (typeof look !== "string" || !/^[A-Za-z_][\w.-]*$/.test(look)) throw err("a feature set needs its Look's id (look: \"reef\")");
@@ -192,7 +192,10 @@
       var o = /** @type {Object<string, any>} */ (attach.face.options || {});
       fd = digest(JSON.stringify([attach.face.decl, attach.face.body, attach.face.fs, Object.keys(o).sort().map(function (k) { return [k, o[k]]; })]));
     }
-    return Object.freeze({ look: look, features: spec.features || null, attach: attach, uniforms: spec.uniforms || null, layouts: Object.freeze(layouts), faceDigest: fd });
+    /* appearanceCache: 1 declares that the Look keeps to the decoded constants' contract (it reads no raw gene or pattern varying in a
+     * vertex slot), so the scene's render features (the decoded cache) may run under it; any other Look keeps the raw programs */
+    return Object.freeze({ look: look, features: spec.features || null, attach: attach, uniforms: spec.uniforms || null, layouts: Object.freeze(layouts), faceDigest: fd,
+                           appearanceCache: spec.appearanceCache === 1 });
   }
   /** @param {string[]} ids @returns {string[]} one of each, sorted (the assembler's order is (order, id) whatever the list's) */
   function canon(ids) {
@@ -204,8 +207,9 @@
   /** a stage's feature ids under a set: the swim polish's for the variant (base), the set's choice (noSet: not asked), then the
    * pass's own (the skip)
    * @param {MaterialSet} set @param {string} kind @param {string} pass @param {"vs" | "fs"} stage @param {number} variant
-   * @param {boolean} [noSet] @returns {string[]} */
-  function featuresOf(set, kind, pass, stage, variant, noSet) {
+   * @param {boolean} [noSet] @param {string[]} [rx] the scene's render features (setRender), added to the appearance fish's stages
+   * under no Look, or one that declared appearanceCache: 1 @returns {string[]} */
+  function featuresOf(set, kind, pass, stage, variant, noSet, rx) {
     if (kind === "face") {
       /* the faces: the predators' vertex features, whatever the set says of the faces */
       var vs = featuresOf(set, "pred", "body", "vs", variant, noSet);
@@ -226,6 +230,7 @@
     if (!Array.isArray(ids) || ids.some(function (x) { return typeof x !== "string" || !x; }))
       throw err(set.look + ": its features for " + kind + " " + pass + " " + stage + " variant " + variant + " are not a list of feature ids");
     ids = ids.slice();
+    if (rx && rx.length && kind === "app" && !noSet && (!set.look || set.appearanceCache)) ids = ids.concat(rx);
     if (pass === "litSkip" && stage === "vs") {
       /* the skip first in main(), before any gene fetch: no feature may append to app.pose ahead of it (order -1, then id) */
       ids.forEach(function (id) {
@@ -275,6 +280,12 @@
     var THREE = deps.THREE, warn = deps.warn || function (/** @type {string} */ m) { console.warn(m); };
     var BASE = normalize(null);
     var active = BASE, version = 0, pending = false;
+    /* the scene's render features in effect (setRender: the decoded constants), a policy beside the Look's set: their ids are added to the
+     * appearance fish's stages under no Look (or one that declared appearanceCache: 1), and are in its materials' keys; pendingRender:
+     * a change is compiling */
+    /** @type {string[]} */
+    var renderIds = [];
+    var pendingRender = false;
     /** @type {Object<string, MaterialKindDef>} */
     var defs = {};
     /** @type {Object<string, BinderEntry>} */
@@ -340,11 +351,12 @@
     }
     /** what a (kind, pass, variant) draws under a set: its features stage by stage (mode "set"; "polish": the swim polish's
      * only, the faces' fallback; "plain": none), its layout, its key and its share key. The (kind, pass, variant) is one the
-     * set has: its callers asked (use, key, has) or took it from reachable() (prepare, run), or from one asked (fallback)
-     * @param {MaterialSet} set @param {string} kind @param {string} pass @param {number} variant @param {string} mode @returns {Described} */
-    function describe(set, kind, pass, variant, mode) {
+     * set has: its callers asked (use, key, has) or took it from reachable() (prepare, run), or from one asked (fallback).
+     * rx: the render features in effect (or a candidate's, in a setRender's run)
+     * @param {MaterialSet} set @param {string} kind @param {string} pass @param {number} variant @param {string} mode @param {string[]} rx @returns {Described} */
+    function describe(set, kind, pass, variant, mode, rx) {
       var plain = mode === "plain", noSet = mode === "polish";
-      var vs = plain ? [] : featuresOf(set, kind, pass, "vs", variant, noSet), fs = plain ? [] : featuresOf(set, kind, pass, "fs", variant, noSet);
+      var vs = plain ? [] : featuresOf(set, kind, pass, "vs", variant, noSet, rx), fs = plain ? [] : featuresOf(set, kind, pass, "fs", variant, noSet, rx);
       var lay = set.layouts[KINDS[kind].layout];
       var fsKey = pass === "shadow" ? "(SHADOW_FS)" : kind === "face" ? "(" + set.look + ":" + set.faceDigest + ")" : idsKey(fs);
       var rest = ["v" + variant, "look:" + (set.look || "-"), "vs:" + idsKey(vs), "fs:" + fsKey];
@@ -355,13 +367,14 @@
                share: ["abi" + SH.ABI, KINDS[kind].family, pass, "claims" + lay.id.slice(lay.id.indexOf("/"))].concat(rest).join("|") };
     }
     /** a set's description of a (kind, pass, variant), made once (an error too: features() runs once a set per stage, not a
-     * frame) @param {MaterialSet} set @param {string} kind @param {string} pass @param {number} variant @param {string} mode */
-    function resolve(set, kind, pass, variant, mode) {
-      var m = descs.get(set);
+     * frame) @param {MaterialSet} set @param {string} kind @param {string} pass @param {number} variant @param {string} mode
+     * @param {string[]} [rx] the render features asked about (the ones in effect: renderIds) */
+    function resolve(set, kind, pass, variant, mode, rx) {
+      var m = descs.get(set), ids = rx || renderIds;
       if (!m) { m = {}; descs.set(set, m); }
-      var k = mode + "|" + kind + "|" + pass + "|" + variant;
+      var k = mode + "|" + kind + "|" + pass + "|" + variant + "|" + ids.join("+");
       if (!hasOwn.call(m, k)) {
-        try { m[k] = { d: describe(set, kind, pass, variant, mode) }; } catch (x) { m[k] = { error: msg(x) }; }
+        try { m[k] = { d: describe(set, kind, pass, variant, mode, ids) }; } catch (x) { m[k] = { error: msg(x) }; }
       }
       return m[k];
     }
@@ -450,8 +463,9 @@
     }
     /** assemble and compile every reachable variant of these kinds under a set; a Promise of the outcome, what it made dropped
      * on a failure (but what a newer activation has taken up since: live) @param {MaterialSet} set @param {string[]} kinds
+     * @param {string[]} [rx] the render features to assemble them under (a setRender's candidate; else the ones in effect)
      * @returns {Promise<MaterialActivation>} */
-    function run(set, kinds) {
+    function run(set, kinds, rx) {
       /** @type {BinderEntry[]} */
       var made = [], used = [];
       /** @type {MaterialCompileItem[]} */
@@ -459,7 +473,7 @@
       function drop() { made.forEach(function (e) { if (!live[e.key]) remove(e); }); }
       try {
         reachable(set, kinds).forEach(function (r) {
-          var rr = resolve(set, r.kind, r.pass, r.variant, "set");   /* (worked out once: the binds then look it up) */
+          var rr = resolve(set, r.kind, r.pass, r.variant, "set", rx);   /* (worked out once: the binds then look it up) */
           if (!rr.d) throw err(rr.error || "no key");
           var d = rr.d, had = hasOwn.call(cache, d.key), e = entry(d);
           if (!had) made.push(e);
@@ -556,7 +570,7 @@
                  material: u.e ? u.e.rec.material : null };
       },
       activate: function (spec) {
-        if (pending) return Promise.resolve({ ok: false, look: "", stage: "spec", error: "an activation is in progress" });
+        if (pending || pendingRender) return Promise.resolve({ ok: false, look: "", stage: "spec", error: "an activation is in progress" });
         /** @type {MaterialSet} */
         var set;
         try { set = normalize(spec); } catch (x) { return Promise.resolve({ ok: false, look: "", stage: "spec", error: msg(x) }); }
@@ -579,8 +593,33 @@
           return r;
         });
       },
+      /* The scene's render features (the decoded constants: ids of features the shader module registered) as a policy beside the Look's
+       * set: setRender(ids) assembles every reachable variant of the appearance fish under them and compiles it (compiler(): as an
+       * activation does) before they take effect; a refusal, an assembly or compile failure keeps the ones in effect and drops what it made.
+       * They apply under no Look, or one that declared appearanceCache: 1 (a Look that may read raw genes keeps the raw programs); with
+       * the appearance fish not defined yet there is nothing to compile: the ids are taken as they are, and its first materials are
+       * made under them. render(): the ids in effect and whether they apply under the active Look. A Promise of {ok, ids, ...} */
+      setRender: function (ids) {
+        if (pending || pendingRender) return Promise.resolve({ ok: false, look: active.look, stage: "spec", error: "an activation is in progress" });
+        /** @type {string[]} */
+        var want;
+        try {
+          if (!Array.isArray(ids)) throw err("setRender(ids): a list of feature ids");
+          ids.forEach(function (id) { if (typeof id !== "string" || !SH.featureOf(id)) throw err("setRender: unknown feature " + id); });
+          want = canon(ids);
+        } catch (x) { return Promise.resolve({ ok: false, look: active.look, stage: "spec", error: msg(x) }); }
+        if (want.join() === renderIds.join()) return Promise.resolve({ ok: true, look: active.look, ids: want.slice(), keys: [], materials: 0 });
+        if (!hasOwn.call(defs, "app")) { renderIds = want; version++; return Promise.resolve({ ok: true, look: active.look, ids: want.slice(), keys: [], materials: 0 }); }
+        pendingRender = true;
+        return run(active, ["app"], want).then(function (r) {
+          pendingRender = false;
+          if (r.ok) { renderIds = want; version++; }
+          return Object.assign({ ids: renderIds.slice() }, r);
+        });
+      },
+      render: function () { return { ids: renderIds.slice(), applies: !active.look || active.appearanceCache, pending: pendingRender }; },
       state: function () {
-        return { look: active.look, version: version, pending: pending, kinds: Object.keys(defs), covered: Object.keys(covered),
+        return { look: active.look, version: version, pending: pending, kinds: Object.keys(defs), covered: Object.keys(covered), render: renderIds.slice(),
                  materials: Object.keys(shares).length,
                  entries: order.map(function (k) { return { key: k, state: cache[k].rec.state, error: cache[k].rec.error }; }),
                  failed: order.filter(function (k) { return cache[k].rec.state === "failed"; }) };
