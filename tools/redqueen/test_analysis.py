@@ -364,12 +364,19 @@ class AnalysisTests(unittest.TestCase):
             A, F, m = comps[c['ARD']], comps[c['FSD']], c['margins']
             self.assertEqual(len(m), 14)
             self.assertEqual(c['gate'], flags[c['FSD']])
-            for name, want in (('beta_P[a]', A['beta_P']), ('beta_Q[a]', A['beta_Q']),
-                               ('dC2-EU_C[a]', dC ** 2 - A['EU_C']), ('dQ2-EU_Q[a]', dQ ** 2 - A['EU_Q']),
-                               ('EF_C[f]-dC2', F['EF_C'] - dC ** 2), ('EF_Q[f]-dQ2', F['EF_Q'] - dQ ** 2),
-                               ('dQ-beta_Q[f]', deltaQ - F['beta_Q']), ('dQ+beta_Q[f]', deltaQ + F['beta_Q']),
-                               ('dP-beta_P[f]', deltaP - F['beta_P']), ('beta_Q[a]-beta_Q[f]', A['beta_Q'] - F['beta_Q'])):
-                self.assertAlmostEqual(m[name], want, delta=1e-12, msg=name)
+            # D8 rule 47's fourteen margins, each computed here from the components and the pinned constants
+            # (r12 review P3: the list had ten; the four contrasts below were only sign/length-checked).
+            want = (('beta_P[a]', A['beta_P']), ('beta_Q[a]', A['beta_Q']),
+                    ('dC2-EU_C[a]', dC ** 2 - A['EU_C']), ('dQ2-EU_Q[a]', dQ ** 2 - A['EU_Q']),
+                    ('EF_C[f]-dC2', F['EF_C'] - dC ** 2), ('EF_Q[f]-dQ2', F['EF_Q'] - dQ ** 2),
+                    ('dP-beta_P[f]', deltaP - F['beta_P']), ('dP+beta_P[f]', deltaP + F['beta_P']),
+                    ('dQ-beta_Q[f]', deltaQ - F['beta_Q']), ('dQ+beta_Q[f]', deltaQ + F['beta_Q']),
+                    ('beta_P[a]-beta_P[f]', A['beta_P'] - F['beta_P']), ('beta_Q[a]-beta_Q[f]', A['beta_Q'] - F['beta_Q']),
+                    ('EF_C[f]-EU_C[a]', F['EF_C'] - A['EU_C']), ('EF_Q[f]-EU_Q[a]', F['EF_Q'] - A['EU_Q']))
+            self.assertEqual(len(want), 14)
+            self.assertEqual(set(m), {name for name, _ in want})
+            for name, value in want:
+                self.assertAlmostEqual(m[name], value, delta=1e-12, msg=name)
             self.assertEqual(math.isfinite(c['T']), c['gate'] and all(v > 0 for v in m.values()))
         self.assertEqual(ht['T_T'], max(c['T'] for c in ht['candidates']))
         row = next(x for x in report['rows'] if x['hypothesis'] == 'H-T')
