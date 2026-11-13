@@ -71,12 +71,13 @@ subprocesses, never multiprocessing, so Python 3.10 to 3.14 behave the same):
   * packing: whenever --chunk-size finished cells are waiting, and at every exit, they are packed
     (store.pack: written, verified, committed, then deleted; a challenge and its predator-free
     control must show the same arena prey settings, and one common group one common checkpoint);
-    at start store.recover() first refuses an index holding a /3 completion without its complete
-    age summary (store.indexed_age_problems, D8 v2 rule 48: exit 2, nothing repaired or deleted),
-    then repairs and fsyncs the index, verifies the committed chunks (in full
-    where a packed cell's working directory remains; --quick-resume: the others by size), checks
-    every leftover bundle, and only then deletes those leftovers; any failure keeps them all and
-    exits 1;
+    at start store.recover() checks, read-only and before it repairs, removes or deletes anything:
+    the committed chunks (in full where a packed cell's working directory remains; by SHA-256,
+    and with --quick-resume by size only for chunks without a stamped /3 entry), every indexed /3
+    completion's complete age summary (store.indexed_age_problems, D8 v2 rule 48) and every
+    leftover bundle; only then does it repair and fsync the index, delete uncommitted chunks and
+    delete those leftovers. A failure repairs and deletes nothing: exit 2 for a /3 completion
+    without a verifiable complete age summary, otherwise exit 1;
   * signals: SIGINT / SIGTERM to the runner stop every worker's process group: SIGTERM, bounded
     polling for RQ_KILL_GRACE seconds (20), then SIGKILL (which also ends a SIGSTOPped worker),
     then bounded reaps; exit 130. Workers forward signals to their engine. Every child (worker or
@@ -797,6 +798,9 @@ def _main(argv, files):
         if age:
             for p in age[:10]:
                 log(f"index: {p}")
+            other = [p for p in probs if store.AGE_SUMMARY_TAG not in p]
+            if other:      # (Codex re-review of e82ed4e) e.g. the chunk whose changed bytes unbound the stamps
+                log(f"committed chunks damaged or inconsistent (working copies kept): {other[:5]}")
             n = len({p.split(" ", 1)[0] for p in age})
             print(f"{root}: {n} packed /3 completions without a verifiable complete age summary (D8 v2 rule 48; "
                   f"{age[0]}): a recording omission requiring repair or an explicit deviation record, not zero "
@@ -863,7 +867,8 @@ def _main(argv, files):
                 print(f"cell {r['id']}: packed without the /2 sharing records or with another role (a completion "
                       "before 03a608b): a /2 study is rerun in a new root, not resumed", file=sys.stderr)
                 return 2
-            continue      # (a packed /3: its age summary was checked at start: store.recover, index_problems)
+            continue      # (a packed /3: its age summary was checked at start: store.recover, index_problems,
+            #              each matching the bytes behind a bound stamp or reading the bundle in full)
         if r["id"] in fin:
             dn = fin[r["id"]]
             if dn.get("row_sha256") != rs:

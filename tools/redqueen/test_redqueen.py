@@ -852,11 +852,17 @@ class TestStore(unittest.TestCase):
         self.runner_refuses(["--plan", plan_p, "--binary", stub, "--disk-min", "none"])
 
     def test_indexed_v3_age_summary_stamp(self):
-        """(Scale, with the re-review of 5ecffb5) pack() stamps each /3 entry whose age summary it checked
-        (store.AGE_SUMMARY_CHECKED): index_problems, which pack() runs over the whole index before every
-        chunk, accepts a stamped entry without opening its chunk. An unstamped or differently stamped /3
-        entry (an older packer's, or an older contract's) is read from its chunk; /1 and /2 entries get no
-        stamp (their index entries are as before) and are never read for it."""
+        """(Scale; Codex re-reviews of 5ecffb5 and e82ed4e) pack() stamps each /3 entry whose age summary
+        it checked with the contract AND the SHA-256 of the exact bundle bytes checked (store.age_stamp:
+        "<contract>:<digest>"); /1 and /2 entries get no stamp (their index entries are as before) and are
+        never read for it. index_problems, which pack() runs over the whole index before every chunk, and
+        verify_all, deep or not, accept a bound stamp WITHOUT decoding its bundle, once the chunk's bytes
+        match their recorded SHA-256. An unbound stamp sends its entry to the full read (decoded and
+        checked): none, e82ed4e's bare marker, an older contract's, another entry's, the right contract
+        and digest in another shape, a suffix. With the chunk
+        moved away the stamped entries are NOT accepted from the index alone (e82ed4e accepted them: its
+        stamp vouched for bytes nobody read): only the /3 entries are reported, the /1 and /2 stay
+        index-only."""
         two = mk_age_score((5000, 10000), alive={5000: {7}, 10000: set()})
         for cid, transplant, v3 in (("v1", None, False), ("v2", ("v2", "d" * 64), False),
                                     ("v3-p1", None, True), ("v3-p2", ("v3-p2", "d" * 64), True)):
@@ -871,27 +877,48 @@ class TestStore(unittest.TestCase):
         for cid in ("v1", "v2"):
             self.assertEqual(set(cells[cid][1]), keys, cid)
         for cid in ("v3-p1", "v3-p2"):
-            self.assertEqual(set(cells[cid][1]), keys | {"plan_schema", store.AGE_SUMMARY_KEY}, cid)
-            self.assertEqual(cells[cid][1][store.AGE_SUMMARY_KEY], store.AGE_SUMMARY_CHECKED)
-        chunk = os.path.join(self.root, store.CHUNKS, "chunk_000001.zip")
-        self.assertEqual(store.index_problems(self.root), [])
-        self.assertEqual(store.verify_all(self.root), [])
-        os.rename(chunk, chunk + ".away")                 # stamped /3, /1 and /2: the index alone
+            e = cells[cid][1]
+            self.assertEqual(set(e), keys | {"plan_schema", store.AGE_SUMMARY_KEY}, cid)
+            packed = store.read_member(self.root, cid, cells=cells)
+            self.assertEqual(e[store.AGE_SUMMARY_KEY], f"{store.AGE_SUMMARY_CHECKED}:{rqlib.sha256_bytes(packed)}", cid)
+        decoded = []
+        real = store.age_summary_problems
+        store.age_summary_problems = lambda b: decoded.append(b["cell"]["id"]) or real(b)
         try:
             self.assertEqual(store.index_problems(self.root), [])
-            self.assertEqual(store.indexed_age_problems(self.root), [])
-            for stamp in (None, "finfolk.redqueen.agesummary/0"):     # unstamped, or an older contract's
-                for cid in ("v3-p1", "v3-p2"):
-                    e = cells[cid][1]
-                    e.pop(store.AGE_SUMMARY_KEY, None)
-                    if stamp:
-                        e[store.AGE_SUMMARY_KEY] = stamp
-                probs = store.index_problems(self.root, cells)
+            for deep in (True, False):
+                self.assertEqual(store.verify_all(self.root, deep=deep), [])
+            self.assertEqual(decoded, [])                         # the fast path decodes nothing
+            own = {cid: cells[cid][1][store.AGE_SUMMARY_KEY] for cid in ("v3-p1", "v3-p2")}
+            digest = {cid: cells[cid][1]["bundle_sha256"] for cid in ("v3-p1", "v3-p2")}
+            unbound = {"none": lambda cid: None, "e82ed4e marker": lambda cid: store.AGE_SUMMARY_CHECKED,
+                       "older contract": lambda cid: f"finfolk.redqueen.agesummary/0:{digest[cid]}",
+                       "another entry's": lambda cid: own["v3-p2" if cid == "v3-p1" else "v3-p1"],
+                       "another shape": lambda cid: {"contract": store.AGE_SUMMARY_CHECKED, "bundle_sha256": digest[cid]},
+                       "a suffix": lambda cid: own[cid] + ":x"}
+            for what, stamp in unbound.items():
+                with self.subTest(stamp=what):
+                    for cid in ("v3-p1", "v3-p2"):
+                        cells[cid][1].pop(store.AGE_SUMMARY_KEY, None)
+                        if stamp(cid) is not None:
+                            cells[cid][1][store.AGE_SUMMARY_KEY] = stamp(cid)
+                    del decoded[:]
+                    self.assertEqual(store.index_problems(self.root, cells), [])   # read and checked: complete
+                    self.assertEqual(sorted(decoded), ["v3-p1", "v3-p2"])
+            for cid in ("v3-p1", "v3-p2"):
+                cells[cid][1][store.AGE_SUMMARY_KEY] = own[cid]
+        finally:
+            store.age_summary_problems = real
+        chunk = os.path.join(self.root, store.CHUNKS, "chunk_000001.zip")
+        os.rename(chunk, chunk + ".away")         # the stamped bytes cannot be matched: no longer accepted
+        try:
+            for probs in (store.index_problems(self.root), store.index_problems(self.root, cells),
+                          store.indexed_age_problems(self.root)):
                 self.assertEqual(sorted(p.split(" ")[0] for p in probs), ["v3-p1", "v3-p2"], probs)
                 self.assertTrue(all("cannot be checked" in p and store.AGE_SUMMARY_TAG in p for p in probs), probs)
         finally:
             os.rename(chunk + ".away", chunk)
-        self.assertEqual(store.index_problems(self.root, cells), [])   # read and checked: complete
+        self.assertEqual(store.index_problems(self.root), [])
 
     def test_v2_completions_checked(self):
         """Review of 03a608b, P2 1: packing (and resume) require a /2 completion's sharing record and

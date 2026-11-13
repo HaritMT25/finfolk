@@ -16,20 +16,21 @@ STUDY/chunks/chunk_<NNNNNN>.zip         members <id>/bundle.json and <id>/done.j
 STUDY/chunks/index.jsonl                one line per COMMITTED chunk: its file, SHA-256, size and,
                                         per cell, the bundle's and done record's SHA-256, its common
                                         group and the common checkpoint's SHA-256 (and, for a /3
-                                        bundle, the stamp that pack() verified its complete age
-                                        summary: AGE_SUMMARY_CHECKED, D8 v2 rule 48)
+                                        bundle, pack()'s stamp that its complete age summary was
+                                        verified, bound to the digest of the bytes checked:
+                                        age_stamp, D8 v2 rule 48)
 
 Pack protocol (pack()): (1) every candidate cell's bundle.json re-hashed against its done.json;
 (2) the chunk written as a temporary file, fsync'd, renamed, the directory fsync'd; (3) the chunk
 re-read: zip CRCs, and every member's SHA-256 against its record; (4) the index line appended
 and fsync'd (the commit point); (5) only then the cells' working directories deleted and
-work/ fsync'd. recover() (at every runner start) first checks every indexed /3 completion's age
-summary (indexed_age_problems; a failure repairs and deletes nothing), then undoes a crash at
-any point: a truncated last
-index line is dropped and the index fsync'd, a chunk file without an index line is deleted (its
-cells still have their working directories), the committed chunks are verified (in full where a
-packed cell's working directory is still there), and only then are those leftover directories
-deleted; a chunk that fails verification keeps them and stops the runner.
+work/ fsync'd. recover() (at every runner start) undoes a crash at any point, but first checks,
+read-only: the committed chunks (in full where a packed cell's working directory is still there;
+by SHA-256 when deep or when they hold a stamped /3 entry), every indexed /3 completion's age
+summary (indexed_age_problems) and every leftover bundle. Any failure repairs, removes and
+deletes nothing and stops the runner. Only then is a truncated last index line dropped and the
+index fsync'd, a chunk file without an index line deleted (its cells still have their working
+directories), and the leftover directories deleted.
 Common-group consistency: every cell of one common group (prey world, time, replicate) must have
 built the same common checkpoint (SHA-256); a disagreement is nondeterminism, and pack() refuses.
 """
@@ -40,6 +41,7 @@ import json
 import os
 import shutil
 import zipfile
+import zlib
 
 import rqlib
 
@@ -296,6 +298,11 @@ def sync_objects(root, shas):
 def load_index(root, repair=False):
     """-> (records list, {cell id: (chunk record, cell entry)}). A truncated last line (a crash while
     appending) is dropped; with repair the index is rewritten without it."""
+    return _load_index(root, repair)[:2]
+
+
+def _load_index(root, repair=False):
+    """load_index -> (records, cells, whether a truncated last line was dropped)."""
     p = os.path.join(root, INDEX)
     recs, cells, dropped = [], {}, False
     if os.path.isfile(p):
@@ -322,7 +329,7 @@ def load_index(root, repair=False):
             if cid in cells:
                 raise StoreError(f"cell {cid} is in two chunks ({cells[cid][0]['chunk']}, {rec['chunk']})")
             cells[cid] = (rec, e)
-    return recs, cells
+    return recs, cells, dropped
 
 
 def common_groups(cells):
@@ -355,12 +362,21 @@ BUNDLE_V3 = "finfolk.redqueen.bundle/3"
 
 AGE_DIAGNOSTICS_SCHEMA = "finfolk.redqueen.agediagnostics/1"
 AGE_SUMMARY_TAG = "the age summary (D8 rule 48)"    # in every age-summary problem (run.py tells the operator)
-# (Codex re-review of 5ecffb5, P2) the index entry's stamp that pack() verified the /3 bundle's
-# complete age summary under THIS contract (age_summary_problems) before the commit point. A /3
-# entry without it (packed by b83a029..870daa6, which did not check; by 5ecffb5; or under an older
-# contract once this one is versioned up) is checked against its packed bundle instead.
+# (Codex re-reviews of 5ecffb5 and e82ed4e, P2) the index entry's stamp that pack() verified the /3
+# bundle's complete age summary under THIS contract (age_summary_problems) before the commit point,
+# bound to the bytes it checked: age_stamp = "<AGE_SUMMARY_CHECKED>:<the SHA-256 of exactly those
+# bundle bytes>". It counts only when it names this contract and the entry's
+# OWN bundle digest (age_stamp_bound), and only once the chunk holding the entry still matches the
+# SHA-256 its index line records (indexed_age_problems). Anything else is unchecked and its packed
+# bundle is read and checked in full: no stamp (packed by b83a029..870daa6, which did not check, or
+# by 5ecffb5), e82ed4e's bare marker (the constant alone: it bound nothing), a stamp copied from
+# another entry, an older contract's once this one is versioned up, or a chunk changed since.
 AGE_SUMMARY_KEY = "age_summary"
-AGE_SUMMARY_CHECKED = "finfolk.redqueen.agesummary/1"
+AGE_SUMMARY_CHECKED = "finfolk.redqueen.agesummary/1"     # the contract's version (age_summary_problems)
+# reading damaged chunk bytes can raise any of these (zlib.error: a corrupt deflate stream; EOFError: a
+# short member; NotImplementedError / RuntimeError: a damaged method or flag): never accepted, never a crash
+UNREADABLE = (KeyError, ValueError, OSError, EOFError, RuntimeError, NotImplementedError, zipfile.BadZipFile,
+              zlib.error)
 
 
 def sharing_required(bundle_schema, plan_schema):
@@ -383,30 +399,64 @@ def age_summary_problems(bundle):
     return [f"{AGE_SUMMARY_TAG}: {p}" for p in score.age_strata_problems(bundle.get("score"), hs)]
 
 
-def age_unchecked(e):
-    """Whether an index entry is a /3 completion whose age summary pack() did not stamp as verified
-    under the current contract (AGE_SUMMARY_CHECKED). /1 and /2 entries predate the summary."""
-    return e.get("bundle_schema") == BUNDLE_V3 and e.get(AGE_SUMMARY_KEY) != AGE_SUMMARY_CHECKED
+def age_stamp(bundle_sha256):
+    """pack()'s stamp on a /3 index entry whose bundle bytes (SHA-256 `bundle_sha256`) passed
+    age_summary_problems under this contract (D8 v2 rule 48): "<contract>:<that digest>" (one string:
+    a 2-key object costs about 300 more bytes per parsed index entry, at 900k entries per parse)."""
+    return f"{AGE_SUMMARY_CHECKED}:{bundle_sha256}"
 
 
-def indexed_age_problems(root, cells=None):
-    """(Codex re-review of 5ecffb5, P2; D8 v2 rule 48) INDEXED completions keep the age-summary
-    contract too: every /3 entry (either plan version) must carry pack()'s stamp, or its packed
-    bundle must pass age_summary_problems -> problems (each naming AGE_SUMMARY_TAG). A stamped entry
-    is accepted from the index alone (its bundle's bytes are bound by the SHA-256 the same entry
-    records, so the check made before the commit point stands): pack() runs this over the whole
-    index before every chunk, and decoding every bundle each time would grow with the square of the
-    study. An unstamped /3 entry's bundle is read from its chunk (each chunk opened once) and checked
+def age_stamp_bound(e):
+    """Whether an index entry is a /3 completion whose stamp names this contract and the entry's OWN
+    bundle digest (index level: the bytes are matched by indexed_age_problems). /1 and /2 entries
+    predate the summary and carry no stamp."""
+    d = e.get("bundle_sha256")
+    return (e.get("bundle_schema") == BUNDLE_V3 and type(d) is str and len(d) == 64
+            and e.get(AGE_SUMMARY_KEY) == age_stamp(d))
+
+
+def age_stamped_chunks(cells):
+    """The chunks holding a /3 entry with a bound stamp: their bytes vouch for those stamps, so they
+    are matched against their recorded SHA-256 even by a verification that is not deep."""
+    return {rec["chunk"] for rec, e in cells.values() if age_stamp_bound(e)}
+
+
+def chunk_matches(root, rec):
+    """Whether a committed chunk's file exists with the size and SHA-256 its index line records."""
+    p = os.path.join(root, CHUNKS, rec["chunk"])
+    try:
+        return (os.path.isfile(p) and os.path.getsize(p) == rec.get("bytes")
+                and rqlib.sha256_file(p) == rec.get("sha256"))
+    except OSError:
+        return False
+
+
+def indexed_age_problems(root, cells=None, sound=None):
+    """(Codex re-reviews of 5ecffb5 and e82ed4e, P2; D8 v2 rule 48) INDEXED completions keep the
+    age-summary contract too: every /3 entry (either plan version) -> problems (each naming
+    AGE_SUMMARY_TAG). An entry with a bound stamp (age_stamp_bound) is accepted WITHOUT decoding its
+    bundle once the chunk holding it matches the size and SHA-256 its index line records: pack()
+    matched every member against its entry (so the stamped bytes) before writing that line, so the
+    chunk's current bytes are the bytes checked. `sound`: the chunks the caller has just matched
+    (verify_all, recover), not hashed again, and a stamped entry in any other chunk is unchecked;
+    without it, each chunk holding a bound stamp is hashed here, once. pack() runs this over the whole
+    index before every chunk: hashing a chunk costs about as much per cell as parsing its index
+    entries, while decoding every bundle each time would grow with the square of the study. Every
+    other /3 entry (no stamp, a stamp not bound to it, or a chunk missing or changed since, of the
+    same size or not) has its packed bundle read from its chunk (each chunk opened once) and checked
     against the index hash and the contract; an unreadable one is a problem, never accepted."""
     if cells is None:
         _, cells = load_index(root)
-    todo = {}
+    stamped, todo = {}, {}
     for cid, (rec, e) in cells.items():
-        if age_unchecked(e):
-            todo.setdefault(rec["chunk"], []).append(cid)
+        if e.get("bundle_schema") == BUNDLE_V3:
+            (stamped if age_stamp_bound(e) else todo).setdefault(rec["chunk"], [rec, []])[1].append(cid)
+    for chunk, (rec, ids) in stamped.items():
+        if not (chunk in sound if sound is not None else chunk_matches(root, rec)):
+            todo.setdefault(chunk, [rec, []])[1].extend(ids)
     probs = []
     for chunk in sorted(todo):
-        ids = sorted(todo[chunk])
+        ids = sorted(todo[chunk][1])
         try:
             with zipfile.ZipFile(os.path.join(root, CHUNKS, chunk)) as z:
                 for cid in ids:
@@ -418,7 +468,7 @@ def indexed_age_problems(root, cells=None):
                                          "does not match the index)")
                             continue
                         b = json.loads(data)
-                    except (KeyError, ValueError, OSError, zipfile.BadZipFile) as x:
+                    except UNREADABLE as x:
                         probs.append(f"{where}: {AGE_SUMMARY_TAG} cannot be checked ({x})")
                         continue
                     if not isinstance(b, dict) or b.get("schema") != BUNDLE_V3:
@@ -426,7 +476,7 @@ def indexed_age_problems(root, cells=None):
                                      "the /3 bundle its index entry names)")
                         continue
                     probs += [f"{where}: {p}" for p in age_summary_problems(b)]
-        except (OSError, zipfile.BadZipFile) as x:
+        except UNREADABLE as x:
             probs += [f"{cid} (packed in {chunk}): {AGE_SUMMARY_TAG} cannot be checked ({x})" for cid in ids]
     return probs
 
@@ -516,7 +566,8 @@ def index_problems(root, cells=None):
     """(Review of d4dc4b7, P2 1) Every indexed cell, not only those of the plan being run or packed:
     a plan/2 entry (/2 or /3 bundle) must carry its sharing summary (role, transplant group);
     /3 entries record the plan schema too, and keep their complete age summary (indexed_age_problems:
-    pack()'s stamp, or else the packed bundle; Codex re-review of 5ecffb5). An older entry (no
+    pack()'s bound stamp over a chunk whose bytes still match, or else the packed bundle; Codex
+    re-reviews of 5ecffb5 and e82ed4e). An older entry (no
     "bundle_schema") is checked against its chunk's bundle and
     done.json (completion_problems): a root holding a /2 completion without sharing records, or with
     summaries its bundle contradicts, is refused (a /2 study is rerun in a new root) -> problems."""
@@ -605,7 +656,8 @@ def pack(root, ids=None, log=print):
         d = os.path.join(root, WORK, cid)
         done = fin[cid]
         b = rqlib.read_bytes(os.path.join(d, "bundle.json"))
-        if rqlib.sha256_bytes(b) != done.get("bundle_sha256"):
+        bsha = rqlib.sha256_bytes(b)
+        if bsha != done.get("bundle_sha256"):
             raise StoreError(f"{cid}: bundle.json does not match its done.json")
         dn = rqlib.read_bytes(os.path.join(d, "done.json"))
         try:
@@ -639,7 +691,8 @@ def pack(root, ids=None, log=print):
             aprobs = age_summary_problems(bjson)    # (completion_problems refused it above; the stamp is THIS check's)
             if aprobs:
                 raise StoreError(f"{cid}: " + "; ".join(aprobs))
-            entries[cid][AGE_SUMMARY_KEY] = AGE_SUMMARY_CHECKED
+            # bound to the very bytes checked, which verify_chunk below matches in the chunk before the commit
+            entries[cid][AGE_SUMMARY_KEY] = age_stamp(bsha)
     cdir = os.path.join(root, CHUNKS)
     if not os.path.isdir(cdir):
         os.makedirs(cdir, exist_ok=True)
@@ -714,80 +767,101 @@ def read_member(root, cid, member="bundle.json", cells=None):
 
 
 def verify_all(root, deep=True):
-    """Every committed chunk exists with its recorded size (and, deep, SHA-256), and every indexed /3
-    completion keeps its complete age summary (indexed_age_problems, whatever `deep`) -> problems."""
+    """Every committed chunk exists with its recorded size and (deep) SHA-256, and every indexed /3
+    completion keeps its complete age summary (indexed_age_problems over the chunks matched here)
+    -> problems. Not deep, a chunk holding a /3 entry with a bound age stamp is still matched by
+    SHA-256 (Codex re-review of e82ed4e: the stamp vouches for its bytes, and a size cannot); chunks
+    of /1 and /2 entries only, by size as before."""
     recs, cells = load_index(root)
-    probs = []
+    hashed = None if deep else age_stamped_chunks(cells)
+    probs, sound = [], set()
     for r in recs:
         p = os.path.join(root, CHUNKS, r["chunk"])
         if not os.path.isfile(p) or os.path.getsize(p) != r["bytes"]:
             probs.append(f"{r['chunk']} missing or of the wrong size")
-        elif deep and rqlib.sha256_file(p) != r["sha256"]:
-            probs.append(f"{r['chunk']} does not match its SHA-256")
-    return probs + indexed_age_problems(root, cells)
+        elif hashed is None or r["chunk"] in hashed:
+            if rqlib.sha256_file(p) != r["sha256"]:
+                probs.append(f"{r['chunk']} does not match its SHA-256")
+            else:
+                sound.add(r["chunk"])
+    return probs + indexed_age_problems(root, cells, sound=sound)
 
 
 def recover(root, log=print, deep=True):
-    """Finish or undo whatever a crash interrupted -> (actions taken, problems). Review round 2,
-    P1-2: the order is (1) repair a torn index tail and fsync the index and its directory WHATEVER
-    (a record written but not yet fsync'd when the runner died is made durable before anything
-    relies on it); (2) delete uncommitted chunk files and temporaries (their cells still have
-    their working directories); (3) verify the committed chunks: every chunk holding a cell whose
-    working directory is still there in full (its SHA-256, CRCs and every member against the
-    index), the others by SHA-256 (deep) or by size; (4) check EVERY leftover bundle against the
-    index (round 3: all of them before any deletion); (5) only if all of that passed, delete those
-    leftover working directories. Any problem keeps every working directory and is returned for
-    the caller to stop on. (Codex re-review of 5ecffb5, P2) Before all of it, (0): every indexed /3
-    completion's age summary (indexed_age_problems, D8 v2 rule 48); a failure is returned with
-    NOTHING repaired, removed or deleted (not the torn tail, not an uncommitted chunk, not a
-    leftover working directory): a recording omission to repair or record as a deviation."""
+    """Finish or undo whatever a crash interrupted -> (actions taken, problems). (Codex re-review of
+    e82ed4e, P2) EVERY check runs first, read-only, on one parse of the index (a torn last line is
+    dropped in memory only), and a problem is returned with NOTHING repaired, removed or deleted
+    (not the torn tail, not an uncommitted chunk or temporary, not a leftover working directory):
+    (1) the committed chunks: each exists with its recorded size; its SHA-256 is matched when deep,
+    when it holds a cell whose working directory is still there (and then, in full, its CRCs and
+    every member against the index: review round 2, P1-2), and when it holds a /3 entry with a bound
+    age stamp, deep or not (the stamp vouches for those bytes; a size cannot);
+    (2) every indexed /3 completion's age summary (indexed_age_problems over the chunks matched in
+    (1); D8 v2 rule 48, Codex re-review of 5ecffb5): a failure is a recording omission to repair or
+    record as a deviation (the runner exits 2);
+    (3) EVERY leftover bundle against the index (review round 3: all of them before any deletion).
+    Only if all of that passed, in review round 2's order (P1-2): (4) the torn index tail repaired
+    and the index and its directory fsync'd (the index is fsync'd as it stands before (1) too,
+    whatever follows: a record written but not yet fsync'd when the runner died is made durable
+    before anything relies on it; an fsync changes no byte); (5) uncommitted chunk files and
+    temporaries deleted (their cells still have their working directories); (6) the leftover
+    working directories deleted; (7) the store's temporary files removed."""
     acts, probs = [], []
     cdir = os.path.join(root, CHUNKS)
-    cells = load_index(root)[1]            # (0) read-only: the torn tail is dropped in memory only
-    probs = indexed_age_problems(root, cells)
-    del cells                              # (one parsed index in memory at a time)
-    if probs:
-        wd = os.path.join(root, WORK)
-        n = len(os.listdir(wd)) if os.path.isdir(wd) else 0
-        log(f"recover: {len({p.split(' ', 1)[0] for p in probs})} indexed /3 completions without a verifiable "
-            f"complete age summary (D8 v2 rule 48): nothing repaired or deleted ({n} working directories kept)")
-        return acts, probs
-    recs, cells = load_index(root, repair=True)
     ip = os.path.join(root, INDEX)
+    wd = os.path.join(root, WORK)
+    if os.path.isfile(ip):
+        rqlib.fsync_file(ip)
+        rqlib.fsync_dir(cdir)
+    recs, cells, torn = _load_index(root)         # read-only: ONE parse, the torn tail dropped in memory
+    leftovers = [x for x in (sorted(os.listdir(wd)) if os.path.isdir(wd) else []) if x in cells]
+    need_full = {cells[x][0]["chunk"] for x in leftovers}
+    hashed = need_full | age_stamped_chunks(cells)
+    sound = set()
+    for r in recs:                                                       # (1)
+        p = os.path.join(cdir, r["chunk"])
+        if not os.path.isfile(p) or os.path.getsize(p) != r["bytes"]:
+            probs.append(f"{r['chunk']} missing or of the wrong size")
+        elif deep or r["chunk"] in hashed:
+            if rqlib.sha256_file(p) != r["sha256"]:
+                probs.append(f"{r['chunk']} does not match its SHA-256")
+                continue
+            bad = verify_chunk(p, r["cells"]) if r["chunk"] in need_full else []
+            probs += [f"{r['chunk']}: {x}" for x in bad]
+            if not bad:
+                sound.add(r["chunk"])
+    aprobs = indexed_age_problems(root, cells, sound=sound)              # (2)
+    if aprobs or probs:
+        n = len(os.listdir(wd)) if os.path.isdir(wd) else 0
+        if aprobs:
+            log(f"recover: {len({p.split(' ', 1)[0] for p in aprobs})} indexed /3 completions without a verifiable "
+                f"complete age summary (D8 v2 rule 48): nothing repaired or deleted ({n} working directories kept)")
+        if probs:
+            log(f"recover: the committed chunks failed verification: nothing repaired or deleted ({n} working "
+                f"directories kept, {len(leftovers)} of them packed cells')")
+        return acts, aprobs + probs
+    for x in leftovers:     # (3) (review round 3) every bundle checked first: one mismatch keeps them all
+        bp = os.path.join(wd, x, "bundle.json")
+        if os.path.isfile(bp) and rqlib.sha256_file(bp) != cells[x][1]["bundle_sha256"]:
+            probs.append(f"work/{x} is packed, but its bundle.json differs from the packed one")
+    if probs:
+        log(f"recover: {len(leftovers)} packed cells' working directories KEPT (a bundle differs from its chunk): "
+            "nothing repaired or deleted")
+        return acts, probs
+    if torn:                                                             # (4)
+        rqlib.write_durable(ip, b"".join(rqlib.canonical(r) for r in recs))
     if os.path.isfile(ip):
         rqlib.fsync_file(ip)
         rqlib.fsync_dir(cdir)
     committed = {r["chunk"] for r in recs}
-    if os.path.isdir(cdir):
+    if os.path.isdir(cdir):                                              # (5)
         for f in sorted(os.listdir(cdir)):
             p = os.path.join(cdir, f)
             if f.endswith(".tmp") or (f.startswith("chunk_") and f.endswith(".zip") and f not in committed):
                 os.remove(p)
                 acts.append(f"removed uncommitted {f}")
         rqlib.fsync_dir(cdir)
-    wd = os.path.join(root, WORK)
-    leftovers = [x for x in (sorted(os.listdir(wd)) if os.path.isdir(wd) else []) if x in cells]
-    need_full = {cells[x][0]["chunk"] for x in leftovers}
-    for r in recs:
-        p = os.path.join(cdir, r["chunk"])
-        if not os.path.isfile(p) or os.path.getsize(p) != r["bytes"]:
-            probs.append(f"{r['chunk']} missing or of the wrong size")
-        elif (deep or r["chunk"] in need_full) and rqlib.sha256_file(p) != r["sha256"]:
-            probs.append(f"{r['chunk']} does not match its SHA-256")
-        elif r["chunk"] in need_full:
-            probs += [f"{r['chunk']}: {x}" for x in verify_chunk(p, r["cells"])]
-    if probs:
-        if leftovers:
-            log(f"recover: {len(leftovers)} packed cells' working directories KEPT (the chunks failed verification)")
-        return acts, probs
-    for x in leftovers:     # (review round 3) every bundle checked first: one mismatch keeps them all
-        bp = os.path.join(wd, x, "bundle.json")
-        if os.path.isfile(bp) and rqlib.sha256_file(bp) != cells[x][1]["bundle_sha256"]:
-            probs.append(f"work/{x} is packed, but its bundle.json differs from the packed one")
-    if probs:
-        log(f"recover: {len(leftovers)} packed cells' working directories KEPT (a bundle differs from its chunk)")
-        return acts, probs
-    for x in leftovers:
+    for x in leftovers:                                                  # (6)
         shutil.rmtree(os.path.join(wd, x))
         acts.append(f"deleted the packed cell's working directory {x}")
     if leftovers and os.path.isdir(wd):

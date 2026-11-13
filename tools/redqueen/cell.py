@@ -46,7 +46,8 @@ any age-infeasible survivor refuse scoring. score.age_strata_problems is the con
 checks it against the cell's horizons before the bundle is bound (so before any checkpoint is
 deleted), store.completion_problems at completion verification, packing and resume,
 store.indexed_age_problems for packed cells (index_problems, verify_all, recover: pack()'s index
-stamp, or else the packed bundle), and the
+stamp bound to the bundle's digest, over a chunk whose bytes still match, or else the packed
+bundle), and the
 collectors at ingestion: a /3 bundle without a complete summary is refused (a recording omission,
 never zero survival). Readers accept old /1 and /2 bundles without age_strata (explicitly
 unavailable, never inferred or rewritten) and /3 for either plan version; plan/2 still requires
