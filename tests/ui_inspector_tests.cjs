@@ -253,9 +253,10 @@ async function main() {
   ok(UI && ["cardSubtitle", "bodyScale", "drawPortrait", "activationClock", "brainColor", "drawBrain", "senseHtml", "senseIdle"].every((k) => typeof UI[k] === "function") &&
      Array.isArray(UI.CARD_STATS), "EvoUI has the card's parts (and keeps the focus primitives)", Object.keys(UI));
   ok(JSON.stringify(UI.CARD_STATS) === '["energy","age","speed"]', "the common stats, in their order: energy, age, speed");
-  ok(UI.cardSubtitle({ generation: 3, family: 12, genes: 41 }) === "Generation 3 · family #12 · 41 genes" &&
-     UI.cardSubtitle({ generation: 0.4, family: 7.6, genes: 1, body: [1.0249, 0.981] }) === "Generation 0 · family #8 · 1 gene · body 1.02 × 0.98",
-     "the subtitle: generation, family, genes, then the body (with the body model), in this order",
+  const NB = "\u00a0";
+  ok(UI.cardSubtitle({ generation: 3, family: 12, genes: 41 }) === "Generation" + NB + "3 · family" + NB + "#12 · 41" + NB + "genes" &&
+     UI.cardSubtitle({ generation: 0.4, family: 7.6, genes: 1, body: [1.0249, 0.981] }) === "Generation" + NB + "0 · family" + NB + "#8 · 1" + NB + "gene · body" + NB + "1.02" + NB + "×" + NB + "0.98",
+     "the subtitle: generation, family, genes, then the body (with the body model), in this order; a line breaks only between them (no-break spaces within)",
      [UI.cardSubtitle({ generation: 3, family: 12, genes: 41 }), UI.cardSubtitle({ generation: 0.4, family: 7.6, genes: 1, body: [1.0249, 0.981] })]);
   ok([0, 0.5, 0.9, 1, 1.07, 1.5, 2, NaN, -1].every((b) => UI.bodyScale(b) === (b > 0 ? 1 + 0.4 * Math.tanh(5 * (b - 1)) : 1)),
      "bodyScale: the pages' formula (renderer.js, ocean.js)");
@@ -733,7 +734,7 @@ async function classicPage(mkClassic, buf) {
   const conn = M._evo_inspect_conn_count(), info = new Float64Array(buf(M), M._evo_inspect_info(), 8);
   ok(t1 === 1 && card.dataset.activations === "current" && card.dataset.activationsAt === "1",
      "one frame running (one step), paused again: the brain is current, kept at tick 1", [t1, card.dataset.activations, card.dataset.activationsAt]);
-  ok(el("isub").textContent === "Generation " + Math.round(info[6]) + " · family #" + Math.round(info[7]) + " · " + conn + " genes",
+  ok(el("isub").textContent === "Generation\u00a0" + Math.round(info[6]) + " · family\u00a0#" + Math.round(info[7]) + " · " + conn + "\u00a0genes",
      "  the subtitle, the common fields in their order, with its genes (evo_inspect_conn_count: " + conn + ")", el("isub").textContent);
   ok(/^Senses on one side/.test(el("isense").textContent), "  its line: how to read a current brain");
   const fills = ctxs.get("inetc").__log.filter((c, i, L) => c[0] === "=" && c[1] === "fillStyle" && L[i + 1] && L[i + 1][0] === "beginPath" && L[i + 2] && L[i + 2][0] === "arc");
@@ -831,7 +832,7 @@ async function oceanPage(mkOcean, HO) {
   const M = O.module, idx = st().selIdx;
   M._oc_inspect(idx);
   const info = new Float64Array(HO.buffer(M), M._oc_inspect_info(), M._oc_inspect_len()), conn = M._oc_inspect_conn_count();
-  ok(el("isub").textContent.indexOf(" · " + Math.round(info[11]) + " genes") > 0 && Math.round(info[11]) === conn && /^Generation \d+ · family #\d+ · \d+ genes/.test(el("isub").textContent),
+  ok(el("isub").textContent.indexOf(" · " + Math.round(info[11]) + "\u00a0genes") > 0 && Math.round(info[11]) === conn && /^Generation\u00a0\d+ · family\u00a0#\d+ · \d+\u00a0genes/.test(el("isub").textContent),
      "  its subtitle: the common fields in their order, its genes the genome's length (" + Math.round(info[11]) + ", its links " + conn + ")", el("isub").textContent);
   ok(/colour key/.test(el("ikey").title) || /A colour key, not a likeness/.test(el("ikey").title), "  the colour key's title says what its colour is", el("ikey").title);
   P.key("."); P.frame(); P.frame();

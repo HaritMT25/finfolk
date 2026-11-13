@@ -147,11 +147,12 @@
 
   /* ---------------- the fish card ---------------- */
   var CARD_STATS = ["energy", "age", "speed"];
+  /* (each field's words joined by no-break spaces: a narrow card wraps the line between its fields, never inside "38 genes") */
   /** @param {UiCardFields} f @returns {string} */
   function cardSubtitle(f) {
-    var genes = Math.round(f.genes);
-    var parts = ["Generation " + Math.round(f.generation), "family #" + Math.round(f.family), genes + (genes === 1 ? " gene" : " genes")];
-    if (f.body) parts.push("body " + f.body[0].toFixed(2) + " × " + f.body[1].toFixed(2));
+    var genes = Math.round(f.genes), nb = "\u00a0";
+    var parts = ["Generation" + nb + Math.round(f.generation), "family" + nb + "#" + Math.round(f.family), genes + nb + (genes === 1 ? "gene" : "genes")];
+    if (f.body) parts.push("body" + nb + f.body[0].toFixed(2) + nb + "×" + nb + f.body[1].toFixed(2));
     return parts.join(" · ");
   }
   /* a body's drawn scale: 1 at the default 1.0, steepest where the population sits, saturating at
