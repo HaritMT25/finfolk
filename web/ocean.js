@@ -80,7 +80,7 @@
 (function () {
   /* the page is on its way to Classic (an old Classic link: ocean.html's head) */
   if (window.EVO_REDIRECT) return;
-  var A = window.EVO_ASSETS, CFG = window.EvoOceanConfig;
+  var A = window.EVO_ASSETS, CFG = window.EvoOceanConfig, UI = window.EvoUI;
   var P = new URLSearchParams(location.search);
   var MOCK = P.get("mock") === "1";
   var E1 = P.get("e1") === "1";
@@ -933,6 +933,15 @@
   function flushHeld(quiet) { return replayEdits(live.takeHeld(), quiet); }
 
   var tabsEl = el("tabs"), panelsEl = el("panels"), currentTab = "run";
+  /* the setup's tabs (web/ui_common.js tabs, as Classic's): Left / Right round
+   * the ends, Home / End, the focus going with the selection; a pointer's
+   * press lets the focus go (Space pauses again), the keyboard's keeps it */
+  var sheetTabs = UI.tabs(tabsEl, {
+    ids: function () { return CFG.TABS.map(function (t) { return t.id; }); },
+    current: function () { return currentTab; },
+    button: function (id) { return el("tab-" + id); },
+    select: setSheetTab
+  });
   function buildSettings() {
     CFG.TABS.forEach(function (tab) {
       var b = document.createElement("button");
@@ -941,7 +950,7 @@
       b.setAttribute("role", "tab");
       b.setAttribute("aria-controls", "panel-" + tab.id);
       b.textContent = tab.title;
-      b.addEventListener("click", function () { setSheetTab(tab.id); });
+      sheetTabs.bind(b, tab.id);
       tabsEl.appendChild(b);
       if (!tab.groups) return;
       var panel = document.createElement("section");
@@ -1030,24 +1039,12 @@
   function startStaged() { restart(); }
   function setSheetTab(id) {
     currentTab = id;
-    CFG.TABS.forEach(function (tab) {
-      var on = tab.id === id;
-      el("tab-" + tab.id).setAttribute("aria-selected", on ? "true" : "false");
-      el("tab-" + tab.id).tabIndex = on ? 0 : -1;
-      el("panel-" + tab.id).hidden = !on;
-    });
+    sheetTabs.mark(id);
+    CFG.TABS.forEach(function (tab) { el("panel-" + tab.id).hidden = tab.id !== id; });
     panelsEl.scrollTop = 0;
     hideTip();
     store("evo_boids.ocean.tab", id);
   }
-  tabsEl.addEventListener("keydown", function (e) {
-    if (e.key !== "ArrowRight" && e.key !== "ArrowLeft") return;
-    var ids = CFG.TABS.map(function (t) { return t.id; });
-    var i = (ids.indexOf(currentTab) + (e.key === "ArrowRight" ? 1 : -1) + ids.length) % ids.length;
-    setSheetTab(ids[i]);
-    el("tab-" + ids[i]).focus();
-    e.preventDefault();
-  });
   function updateTabDots() {
     CFG.TABS.forEach(function (tab) {
       if (!tab.groups) return;
@@ -2302,15 +2299,17 @@
 
   /* ---- the View menu and Help: one popover at a time; ×, Esc, its key or a
    * press outside closes it. [popover, trigger, its first control] ---- */
-  var POPS = { view: ["viewpop", "viewmenubtn", "lightnow"], help: ["helppop", "helpbtn", "tourbtn"] }, openPop = null, popOpener = null;
+  var POPS = { view: ["viewpop", "viewmenubtn", "lightnow"], help: ["helppop", "helpbtn", "tourbtn"] }, openPop = null, popOpener = UI.returnPoint();
   /* A press by the keyboard (its focus ring showing) keeps the focus; a
-   * pointer's lets it go, so Space goes back to pausing. */
-  function pointerBlur(n) { if (!n.matches(":focus-visible")) n.blur(); }
-  /* opener: the trigger, when the keyboard pressed it: the focus goes to the
-   * popover's first control, and back to the trigger when the keyboard closes it */
+   * pointer's lets it go, so Space goes back to pausing (web/ui_common.js). */
+  function pointerBlur(n) { UI.pointerBlur(n); }
+  /* opener: the trigger, when the keyboard pressed it (else null): the focus
+   * goes to the popover's first control, and back to the trigger when the
+   * keyboard closes it (closePop: the return point, web/ui_common.js). Each
+   * opening replaces it, so only the open popover's is ever restored. */
   function setPop(name, opener) {
     openPop = POPS[name] ? name : null;
-    popOpener = openPop && opener || null;
+    if (openPop) popOpener.set(opener);
     Object.keys(POPS).forEach(function (n) {
       el(POPS[n][0]).hidden = n !== openPop;
       el(POPS[n][1]).setAttribute("aria-expanded", n === openPop ? "true" : "false");
@@ -2321,13 +2320,12 @@
       if (dash() && dash().isOpen()) dash().close();
       if (!wideMQ.matches && drawerEl.classList.contains("open")) setDrawer(false);
       setStatPanel(false); hideCoach(); placePop();
-      if (popOpener) el(POPS[openPop][2]).focus();
+      if (popOpener.get()) el(POPS[openPop][2]).focus();
     }
   }
   function closePop(keyboard) {
-    var back = popOpener;
     setPop(null);
-    if (keyboard && back) back.focus();
+    popOpener.restore(keyboard);
   }
   function togglePop(name, opener, keyboard) { if (openPop === name) closePop(keyboard); else setPop(name, opener); }
   /* the View menu over its button, left of a wide screen's settings panel (a
@@ -3297,24 +3295,13 @@
   function releaseMoveKeys() { heldMoveKeys = {}; shiftHeld = false; }
   /* a focused field takes the keys: the text inputs, selects, text areas and
    * editable text (the settings' number fields among them). A switch or a
-   * slider is not one: letters are shortcuts there too (ownKey keeps theirs). */
-  function typingIn(t) {
-    if (!t || !t.tagName) return false;
-    if (t.tagName === "INPUT") return !/^(checkbox|radio|range|button|submit|reset|color|file|image)$/i.test(t.type || "text");
-    return t.tagName === "TEXTAREA" || t.tagName === "SELECT" || !!t.isContentEditable;
-  }
-  /* the keys a focused control acts on itself: Space and Enter press a button
-   * or turn a switch (Enter follows a link), a slider takes the arrows, Home,
-   * End and Page Up / Down, a tab the arrows. Every other key stays a shortcut. */
-  function ownKey(t, k) {
-    if (!t || !t.tagName) return false;
-    var press = k === " " || k === "Spacebar" || k === "Enter";
-    if (t.tagName === "BUTTON") return press || (/^Arrow/.test(k) && t.getAttribute("role") === "tab");
-    if (t.tagName === "A") return k === "Enter";
-    if (t.tagName !== "INPUT") return false;
-    if (t.type === "range") return /^(Arrow|Page)/.test(k) || k === "Home" || k === "End";
-    return press && (t.type === "checkbox" || t.type === "radio");
-  }
+   * slider is not one: letters are shortcuts there too (ownKey keeps theirs).
+   * And the keys a focused control acts on itself: Space and Enter press a
+   * button or turn a switch (Enter follows a link), a slider takes the arrows,
+   * Home, End and Page Up / Down, a tab its arrows, Home and End. Every other
+   * key stays a shortcut. (web/ui_common.js: both pages' rule) */
+  function typingIn(t) { return UI.typingIn(t); }
+  function ownKey(t, k) { return UI.ownsKey(t, k); }
   /* One owner for each Esc, the top layer: the tour (web/guide.js), then the
    * charts (web/ocean_dash.js: it leaves an Esc to the tour), then this
    * page's own (a popover, the settings, the live numbers, the fish). Seen
@@ -3566,7 +3553,7 @@
    * question is answered Keep; a pointer's press blurs it, as btn's. */
   function askBtn(id, fn, back) {
     el(id).addEventListener("click", fenced(function (e) {
-      var kb = this.matches(":focus-visible") || (!!e && e.detail === 0);
+      var kb = UI.pressedByKeyboard(this, e);
       fn();
       if (kb && asking) { asking.opener = back ? el(back) : this; el("startconfirm").focus(); }
       else this.blur();
@@ -3600,11 +3587,11 @@
   btn("lightbtn", toggleLight);
   ["view", "help"].forEach(function (n) {   /* the triggers; × closes (pointerBlur, setPop: the focus) */
     el(POPS[n][1]).addEventListener("click", function () {
-      var kb = this.matches(":focus-visible");
+      var kb = UI.keyboardFocused(this);
       togglePop(n, kb ? this : null, kb);
       if (!kb) this.blur();
     });
-    el(n + "close").addEventListener("click", function () { closePop(this.matches(":focus-visible")); });
+    el(n + "close").addEventListener("click", function () { closePop(UI.keyboardFocused(this)); });
   });
   btn("tourbtn", function () { setPop(null); if (window.EvoGuide) EvoGuide.start(); });
   btn("whatturbo", function () { setPop(null); if (window.EvoGuide && EvoGuide.turbo) EvoGuide.turbo(); });
@@ -3639,7 +3626,7 @@
    * the file dialog comes between, so it is remembered here) */
   var fileOpener = null;
   el("loadcp").addEventListener("click", function (e) {
-    fileOpener = this.matches(":focus-visible") || (!!e && e.detail === 0) ? this : null;
+    fileOpener = UI.pressedByKeyboard(this, e) ? this : null;
     if (!fileOpener) this.blur();
     el("cpfile").click();
   });

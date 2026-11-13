@@ -9,8 +9,8 @@
  * file, ingest() for what the Turbo worker recorded, every() for the worker's
  * sampling interval. Charts redraw at most twice a second, only while open. */
 (function () {
-  var D = window.EvoDashData, C = window.EvoCharts;
-  if (!D || !C) return;
+  var D = window.EvoDashData, C = window.EvoCharts, UI = window.EvoUI;
+  if (!D || !C || !UI) return;
   var COL = D.COL, DT = D.DT, T = C.T, S = T.series;
   /* one colour per quantity, the same in every chart it appears in; the
    * causes of death stack as orange, blue, red, violet, an order validated
@@ -475,19 +475,27 @@
 
   /* ---- DOM ---- */
   var tabsEl = el("dtabs"), gridEl = el("dgrid"), noteEl = el("dnote");
+  /* the tabs (web/ui_common.js tabs, as the Ocean's): a pointer's press lets
+   * the focus go (the shortcuts work again), the keyboard's keeps it; Left /
+   * Right the next one round, Home / End the first and last, the focus going
+   * with the selection; Tab lands on the selected one */
+  var tabIds = TABS.map(function (t) { return t.id; }), tabBtn = {};
+  var dtabs = UI.tabs(tabsEl, { ids: function () { return tabIds; }, current: function () { return tab; },
+                                button: function (id) { return tabBtn[id] || null; }, select: showTab });
   TABS.forEach(function (tb) {
     var b = document.createElement("button");
+    b.type = "button";
     b.textContent = tb.name;
     b.setAttribute("role", "tab");
     b.dataset.tab = tb.id;
-    b.addEventListener("click", function () { showTab(tb.id); this.blur(); });
+    tabBtn[tb.id] = b;
+    dtabs.bind(b, tb.id);
     tabsEl.appendChild(b);
   });
+  dtabs.mark(tab);   /* (closed too: one tab in the Tab order from the start) */
   function showTab(id) {
     tab = id;
-    Array.prototype.forEach.call(tabsEl.children, function (b) {
-      b.setAttribute("aria-selected", b.dataset.tab === id ? "true" : "false");
-    });
+    dtabs.mark(id);
     C.tip(null);
     gridEl.innerHTML = "";
     cards = {};

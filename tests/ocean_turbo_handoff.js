@@ -253,7 +253,7 @@ const isType = (t) => (m) => m.type === t;
 const statsAt = (f) => (m) => m.type === 'stats' && m.frame >= f;
 
 /* ---------------------------------------------------------------------
- * The page itself. web/ocean_handoff.js, web/ocean_config.js,
+ * The page itself. web/ui_common.js, web/ocean_handoff.js, web/ocean_config.js,
  * web/ocean_dash.js and web/ocean.js, as they are and in ocean.html's order,
  * in one vm context over a small DOM: the elements ocean.html declares (made
  * on first use) and the ones the page makes, events that bubble, listeners
@@ -680,7 +680,7 @@ async function bootPage(query, opts) {
         return sh;
     };
     const run = (name, src) => vm.runInContext(src !== undefined ? src : fs.readFileSync(path.join(WEB, name), 'utf8'), ctx, { filename: path.join(WEB, name) });
-    run('ocean_handoff.js');
+    run('ui_common.js'); run('ocean_handoff.js');
     if (opts.perf) run('ocean_perf.js');
     run('ocean_scene_stub.js', opts.nogl ? SCENE_NOGL : opts.scene || SCENE_STUB); run('ocean_config.js');
     run('charts_stub.js', CHARTS_STUB); run('ocean_dash.js'); run('ocean.js', PAGE_SRC);
@@ -2382,6 +2382,47 @@ async function pageTabKeys() {
     p.doc.activeElement = null;
     p.key('ArrowRight');
     ok(title() === 'You\'re set', '  with nothing focused, Right pages the tour (' + title() + ')');
+    ok(p.uncaught.length === 0, 'no exception escaped the page\'s handlers' + (p.uncaught.length ? ' (' + p.uncaught[0] + ')' : ''));
+}
+
+/* The review of PR #89: the setup sheet's tabs as ocean.js builds and selects
+ * them (EvoUI.tabs, web/ui_common.js), not only the shared helper: built with
+ * one tab in the Tab order, the keyboard's keys with the focus going along,
+ * a focused tab's Up not a speed key, and a pointer's press letting the focus
+ * go, so the page's keys work again. */
+async function pageSetupTabs() {
+    section('The page: the setup sheet\'s tabs through EvoUI.tabs, as ocean.js builds and selects them (review of PR #89)');
+    const p = await bootPage(PAGE_Q);
+    const tabs = () => p.el('tabs').children.filter(b => b.getAttribute('role') === 'tab');
+    const sel = () => tabs().findIndex(b => b.getAttribute('aria-selected') === 'true');
+    const roving = () => tabs().every((b, i) => b.tabIndex === (i === sel() ? 0 : -1));
+    const shown = (b) => !p.el(b.getAttribute('aria-controls')).hidden;
+    const n = tabs().length, speed = () => p.el('speedlabel').textContent;
+    ok(n >= 6 && tabs()[0].id === 'tab-run' && sel() === 0 && roving() && tabs().every(b => /^panel-/.test(b.getAttribute('aria-controls') || '')) &&
+       tabs().filter(shown).length === 1 && shown(tabs()[0]),
+       'built: ' + n + ' tabs, each controlling its panel; Run selected, only it in the Tab order, only its panel shown');
+    p.tabTo('tab-run');
+    const spd0 = speed();
+    p.key('ArrowRight');
+    ok(sel() === 1 && p.doc.activeElement === tabs()[1] && roving() && shown(tabs()[1]) && !shown(tabs()[0]) &&
+       p.ctx.localStorage.getItem('evo_boids.ocean.tab') === tabs()[1].id.slice(4),
+       '  Right: the next tab selected, focused, its panel shown, stored (' + p.ctx.localStorage.getItem('evo_boids.ocean.tab') + ')');
+    p.key('End');
+    ok(sel() === n - 1 && p.doc.activeElement === tabs()[n - 1] && roving(), '  End: the last (the sheet had Left / Right only before)');
+    p.key('ArrowRight');
+    ok(sel() === 0 && p.doc.activeElement === tabs()[0], '  Right on the last: round to Run');
+    p.key('ArrowLeft');
+    ok(sel() === n - 1 && p.doc.activeElement === tabs()[n - 1], '  Left on the first: round to the last');
+    p.key('Home');
+    ok(sel() === 0 && roving() && shown(tabs()[0]), '  Home: the first');
+    p.key('ArrowUp');
+    ok(sel() === 0 && speed() === spd0, '  Up on a focused tab: no tab move, not a speed key (' + spd0 + ')');
+    p.key('Enter');
+    ok(sel() === 0 && p.doc.activeElement === tabs()[0], '  Enter on a focused tab: it stays selected and keeps the focus');
+    p.pointer(); tabs()[2].focus(); tabs()[2].click();
+    ok(sel() === 2 && p.doc.activeElement !== tabs()[2] && roving() && shown(tabs()[2]), 'a pointer\'s press: selected, its panel shown, the focus let go (it kept it before)');
+    p.key('ArrowUp');
+    ok(speed() !== spd0, '  then ArrowUp: the page\'s speed key again (' + spd0 + ' -> ' + speed() + ')');
     ok(p.uncaught.length === 0, 'no exception escaped the page\'s handlers' + (p.uncaught.length ? ' (' + p.uncaught[0] + ')' : ''));
 }
 
@@ -5222,7 +5263,7 @@ const SECTIONS = {
     pageHeld, pageRefusal, pageAsyncSetup, pageStartFailures, pageOverflow, pageBools, pageDashboards,
     pageWallsOverride, pageFreshVisit, pageSizeFields, pageRoundTrip,
     pageColourBench, pageLayers, pageResize, pageKeys, pageStartupFailures, pageTourEscape, pageWholeFields,
-    pageTurboFraction, pageCardNumbers, pageMixedRecovery, pageEscOwner, pageTabKeys, pageIntegralFloats,
+    pageTurboFraction, pageCardNumbers, pageMixedRecovery, pageEscOwner, pageTabKeys, pageSetupTabs, pageIntegralFloats,
     pageTurboMode, pageStartDoor, pageFollowBack, pageDraft, pageModelineDetail, pageReplayHistory, pageReplayReopen, pageScenarios,
     pageCancelQueued, pageQueuedFile, pageNextBehindLive, pageEditedFile, pageReplayStaleRead, pageAskTarget, pagePendingAsk,
     pageKeyboardAsk,

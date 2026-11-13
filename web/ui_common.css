@@ -1,0 +1,7 @@
+/* web/ui_common.css: the styles that go with web/ui_common.js's focus primitives, on both pages (web/index.html,
+ * web/ocean.html; after each page's own <style>). Display only. */
+
+/* A tablist (EvoUI.tabs marks it .ui-tablist) scrolls sideways (overflow-x: auto, which clips on both axes), and
+ * its tabs fill its height: the page's ring, drawn 2 px outside the element, would be cut away there. A tab's ring
+ * goes just inside its edge instead, whole on every side. */
+.ui-tablist [role="tab"]:focus-visible { outline-offset: -2px; }
