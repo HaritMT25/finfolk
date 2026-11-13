@@ -1160,6 +1160,31 @@ interface UiTabs { mark(id: string): void; bind(button: HTMLElement, id: string)
 /** set(opener): remember the keyboard's opener (null: a pointer opened it); restore(keyboard): forget it, and when the
  * keyboard closed it, give it the focus back; returns the opener it had */
 interface UiReturnPoint { set(n: HTMLElement | null | undefined): void; get(): HTMLElement | null; restore(keyboard: boolean): HTMLElement | null }
+/** the fish card's common subtitle (EvoUI.cardSubtitle): body is [size, elongation] when the body model is on */
+interface UiCardFields { generation: number; family: number; genes: number; body?: [number, number] | null }
+/** whether the card's live brain is this tick's (EvoUI.activationClock): reset at a world the page has not seen step,
+ * capture(on, tick) when the world's capture switches, at(tick) the tick its kept activations are from (null: none) */
+interface UiActivationClock {
+  reset(tick: number, on: boolean): void;
+  capture(on: boolean, tick: number): void;
+  at(tick: number): number | null;
+  state(tick: number, age: number): "current" | "waiting";
+}
+/** one fish's brain as the inspect exports give it (K links of 5: source is a sensor, its index, sink is an action, its index, weight) */
+interface UiBrainNet { sensors: ArrayLike<number>; hidden: ArrayLike<number>; actions: ArrayLike<number>; conns: ArrayLike<number>; connCount: number }
+/** a drawn node (EvoUI.drawBrain's result): its place in CSS px, its kind ("Sense", "Hidden neuron", "Action"), index and value */
+interface UiBrainNode { x: number; y: number; kind: string; i: number; v: number }
+interface UiBrainOptions {
+  nS: number; nH: number; nA: number;
+  /** a tall box's action column, this many CSS px from the right edge (the names' room) */
+  gutter: number;
+  /** the actions' short names (a wide box) and long ones (a tall box) */
+  actShort: string[]; actLabels: string[];
+  font: string; dpr?: number;
+  /** false: waiting for a step (no activation shown) */
+  fresh?: boolean;
+  prev?: UiBrainNode[]; hover?: number;
+}
 interface EvoUIApi {
   keyboardFocused(n: Element | null | undefined): boolean;
   pressedByKeyboard(n: Element | null | undefined, e?: { detail?: number } | null): boolean;
@@ -1169,6 +1194,16 @@ interface EvoUIApi {
   tabIndexFor(key: string, i: number, n: number): number;
   tabs(list: HTMLElement, o: UiTabsOptions): UiTabs;
   returnPoint(): UiReturnPoint;
+  /** the fish card (P03): the common stats in their order, the subtitle, the colour key, the brain and its freshness */
+  CARD_STATS: string[];
+  cardSubtitle(f: UiCardFields): string;
+  bodyScale(b: number): number;
+  drawPortrait(c: HTMLCanvasElement, rgb: number[], size: number, elong: number, dpr?: number): void;
+  activationClock(): UiActivationClock;
+  brainColor(v: number | null | undefined, a: number): string;
+  drawBrain(g: CanvasRenderingContext2D, w: number, h: number, f: UiBrainNet, o: UiBrainOptions): UiBrainNode[];
+  senseHtml(n: UiBrainNode, fresh: boolean): string;
+  senseIdle(fresh: boolean, touch: boolean, paused: boolean, keys: string): string;
 }
 
 /* ---------------- not checked yet: declared by what checked files use ---------------- */
