@@ -168,14 +168,24 @@ class Assays:
             elif qw in worlds and p.get('source') == 'scripted':
                 self._put(self.script[qw], ti, obs)
             elif qw in worlds and pw not in worlds and 'source' not in p:
-                self._put(self.refq[qw], (ti, reference_slots['RP', pair[1]]), obs)
+                self._put(self.refq[qw], (ti, self._slot(reference_slots, 'RP', pair[1])), obs)
             elif pw in worlds and qw not in worlds:
-                self._put(self.refc[pw], (tj, reference_slots['RQ', pair[0]]), obs)
+                self._put(self.refc[pw], (tj, self._slot(reference_slots, 'RQ', pair[0])), obs)
             else:
                 self.ignored['cross-world / reference-grid pair'] += 1
 
     def world_of(self, endpoint):
         return self.world_ids_by_uuid.get(endpoint.get('uuid'), endpoint.get('world'))
+
+    @staticmethod
+    def _slot(reference_slots, guild, snapshot):
+        """The registered slot of a reference in ITS guild (RQ: reference prey, RP: reference predators); the
+        same snapshot may hold one slot in each guild (sealing's uniqueness is per guild)."""
+        slot = reference_slots.get((guild, snapshot))
+        if slot is None:
+            raise AnalysisError(f'{snapshot}: measured as a reference {"prey" if guild == "RQ" else "predator"} '
+                                f'but not registered in guild {guild}')
+        return slot
 
     @staticmethod
     def _put(dest, key, obs):

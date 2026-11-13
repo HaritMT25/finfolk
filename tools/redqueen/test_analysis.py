@@ -213,12 +213,12 @@ def fixture(d, shared_reference=False):
                 references_raw=refs_raw, production=False, draws=19, min_q200=2, reps=1), graphs
 
 
-def calibrated(args, graphs):
+def calibrated(args, graphs, c_E=1e9):
     q = set(args['ecology']['Q200']['worlds'])
     graph = [g for g in graphs if g.id in q]
     man = calib.manifest(graph, args['params'], args['draws'], production=False, graph_source='synthetic-fixture')
     crit = {'manifest': {'H-F': man, 'H-T': man}, 'c_F': 0., 'c_M': 1.1,
-            'c_E': {e: 1e9 for e in ('E1', 'E2', 'E3')}, 'c_T': stats.HT_GUARD}
+            'c_E': {e: c_E for e in ('E1', 'E2', 'E3')}, 'c_T': stats.HT_GUARD}
     rates = {f'gate_{e}|{m}|{s}|B': {'fp': 0, 'n': 1000} for e in ('E1', 'E2', 'E3')
              for m in ('F0', 'F1', 'F2') for s in calib.STRATA}
     acc = {'manifest': crit['manifest'], 'crit_sha256': calib.doc_sha(crit), 'production': False,
@@ -305,6 +305,75 @@ class AnalysisTests(unittest.TestCase):
                 self.assertEqual(selected['phase_C'], r['phase_C'])
                 self.assertEqual(selected['phase_Q'], r['phase_Q'])
         self.assertEqual(set(d['epoch_worlds']), {'E1', 'E2', 'E3'})
+
+    def test_epoch_directional_components_equal_calibration_coarse_betas(self):
+        """P1 (Codex review of 03d8813): H-T's epoch directional components (and the per-world epoch slopes) use
+        ONLY the coarse 41 x 41 panel: they are calibration's Panel.betas on the same counts. The fixture also
+        measures the registered fine pairs, whose cos(t / 7) term the backbone does not model, so admitting them
+        moves the estimates. The counts are read from the packed bundles, independently of the adapter."""
+        bundles = analysis.load_packed(self.args['roots'], self.args['rows'])
+        q = set(self.args['ecology']['Q200']['worlds'])
+        within, free = {}, {}
+        for b in bundles.values():
+            c, h = b['cell'], b['score']['horizons'][0]
+            qw, pw = c['prey'].get('world'), (c.get('predators') or {}).get('world')
+            ti = stats.t_of_frame(c['prey']['frame'])
+            if c['kind'] == 'nopred' and qw in q:
+                free[qw, ti] = free.get((qw, ti), 0) + h['survivors']
+            elif qw in q and pw == qw:
+                key = (qw, ti, stats.t_of_frame(c['predators']['frame']))
+                C, S = within.get(key, (0, 0))
+                within[key] = (C + h['captures'], S + h['survivors'])
+        scale = calib.R_REP / self.args['reps']          # (Panel.betas takes R_REP-replicate sums)
+        panel = calib.Panel(self.graphs, self.args['params'], 'H-T', 'dev', 'actual', 'T1', 0)
+        expected = {e: {'P': {}, 'Q': {}} for e in transition.EPOCHS}
+        for wg in self.graphs:
+            if wg.id not in q:
+                continue
+            cells = list(zip(wg.ti.tolist(), wg.tj.tolist()))
+            self.assertTrue(set(cells) - {(a, b) for a in calib.COARSE for b in calib.COARSE})  # (fine pairs measured)
+            K = {'C': np.array([within[wg.id, a, b][0] for a, b in cells], float) * scale,
+                 'S': np.array([within[wg.id, a, b][1] for a, b in cells], float) * scale,
+                 'F': np.array([free[wg.id, t] for t in wg.prey.tolist()], float) * scale}
+            for e, (bP, bQ) in panel.betas(wg, K).items():
+                expected[e]['P'][wg.id], expected[e]['Q'][wg.id] = bP, bQ
+        comps = self.report['results']['H-T']['components']
+        for e in transition.EPOCHS:
+            self.assertEqual(set(expected[e]['P']), q)
+            self.assertAlmostEqual(comps[e]['beta_P'], float(np.mean(list(expected[e]['P'].values()))), delta=1e-8)
+            self.assertAlmostEqual(comps[e]['beta_Q'], float(np.mean(list(expected[e]['Q'].values()))), delta=1e-8)
+            for h in 'PQ':
+                for w, v in expected[e][h].items():
+                    self.assertAlmostEqual(self.report['descriptive']['epoch_betas'][e][h][w], v, delta=1e-8)
+
+    def test_ht_with_passing_epoch_gates(self):
+        """The default fixture's epoch critical values (1e9) switch every gate off, so H-T only ever meets -inf
+        (Codex r11 claims check). With c_E = -1 every AVAILABLE epoch's gate passes (S_F >= 0): all six
+        candidates' fourteen margins are evaluated on the measured components, with D8's constants (pinned
+        here independently of the implementation's)."""
+        report = analysis.analyze(**calibrated(self.args, self.graphs, c_E=-1.))
+        d, ht = report['descriptive'], report['results']['H-T']
+        flags = {e: bool(d['epoch_H_F'][e]['available']) for e in transition.EPOCHS}
+        self.assertEqual(d['gate_flags'], flags)
+        self.assertTrue(any(flags.values()))
+        self.assertTrue(ht['available'], ht.get('reasons'))
+        b, comps = 0.0469305419921875, ht['components']
+        dQ, deltaQ, dC, deltaP = 0.20 * b, 0.10 * b, 0.10, math.log(1.10)
+        self.assertEqual(len(ht['candidates']), 6)
+        for c in ht['candidates']:
+            A, F, m = comps[c['ARD']], comps[c['FSD']], c['margins']
+            self.assertEqual(len(m), 14)
+            self.assertEqual(c['gate'], flags[c['FSD']])
+            for name, want in (('beta_P[a]', A['beta_P']), ('beta_Q[a]', A['beta_Q']),
+                               ('dC2-EU_C[a]', dC ** 2 - A['EU_C']), ('dQ2-EU_Q[a]', dQ ** 2 - A['EU_Q']),
+                               ('EF_C[f]-dC2', F['EF_C'] - dC ** 2), ('EF_Q[f]-dQ2', F['EF_Q'] - dQ ** 2),
+                               ('dQ-beta_Q[f]', deltaQ - F['beta_Q']), ('dQ+beta_Q[f]', deltaQ + F['beta_Q']),
+                               ('dP-beta_P[f]', deltaP - F['beta_P']), ('beta_Q[a]-beta_Q[f]', A['beta_Q'] - F['beta_Q'])):
+                self.assertAlmostEqual(m[name], want, delta=1e-12, msg=name)
+            self.assertEqual(math.isfinite(c['T']), c['gate'] and all(v > 0 for v in m.values()))
+        self.assertEqual(ht['T_T'], max(c['T'] for c in ht['candidates']))
+        row = next(x for x in report['rows'] if x['hypothesis'] == 'H-T')
+        self.assertTrue(row['available'])
 
     def test_reference_snapshot_in_both_guilds(self):
         with tempfile.TemporaryDirectory() as d:
@@ -418,18 +487,25 @@ class DirectionalPanelsTests(unittest.TestCase):
         a = self.assays()
         inputs = copy.deepcopy(a.panels('C1'))
         slopes = {e: self.slopes(a, interval) for e, interval in recurrence.SCOPES.items()}
+        self.perturb_fine(a)
+        self.assertEqual(a.panels('C1'), inputs)
+        self.assertIn((10., 11.), a.within['C1'])  # recurrence keeps the fine measurement
+        self.assertEqual({e: self.slopes(a, interval) for e, interval in recurrence.SCOPES.items()}, slopes)
+
+    @staticmethod
+    def perturb_fine(a):
+        """Off-law outcomes at the two fine pairs (and the fine prey time's free control): an estimator that
+        admitted them could not recover the generating slopes."""
         for i, j in ((10., 11.), (11., 10.)):
             o = a.within['C1'][i, j]
             o['C'] = 0.; o['S'] = 247.*a.reps
             a.pairs[o['qid'], o['pid']] = {r: ({}, {}, 0., 247.) for r in range(a.reps)}
         for r in range(a.reps):
             a.free[str(11.), r] = (a.free[str(11.), r][0], {}, 0.)
-        self.assertEqual(a.panels('C1'), inputs)
-        self.assertIn((10., 11.), a.within['C1'])  # recurrence keeps the fine measurement
-        self.assertEqual({e: self.slopes(a, interval) for e, interval in recurrence.SCOPES.items()}, slopes)
 
     def test_known_directional_slopes_and_calibration_epoch_identity(self):
         a = self.assays()
+        self.perturb_fine(a)
         bp, bq = self.slopes(a)
         self.assertAlmostEqual(bp, .12, delta=1e-6)
         self.assertAlmostEqual(bq, .005, delta=1e-6)
