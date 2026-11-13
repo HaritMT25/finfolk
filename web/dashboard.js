@@ -360,8 +360,8 @@
     ] },
     { id: "lines", name: "Family lines", cards: [
       { id: "muller", title: "Family lines over time (Muller plot)", wide: true, tall: true, draw: C.stack,
-        cap: "Every fish belongs to the family line of its first parent's line, back to a starting fish. Each colour is one line's share of all fish, in the colour its fish have in the ocean; a colour spreading over the chart is a line taking over. Grey is all the smaller lines.",
-        data: mullerData,
+        cap: "Every fish belongs to the family line of its first parent's line, back to a starting fish. Each colour is one line's share of all fish, in its family colour: the colour its fish have in the ocean unless Colour by brain similarity is on. A colour spreading over the chart is a line taking over. Grey is all the smaller lines.",
+        famColours: true, data: mullerData,
         legend: function () {
           var last = hist.n - 1, top = last >= 0 ? hist.top(last) : [], pop = last >= 0 ? hist.get(last, COL.pop) || 1 : 1;
           var share = new Map(top.map(function (p) { return [p[0], p[1] / pop]; }));
@@ -509,16 +509,35 @@
       box.className = "cbox" + (cd.tall ? " tall" : "") + (cd.huge ? " huge" : "") + (cd.xtall ? " xtall" : "");
       gridEl.appendChild(sec);
       cards[cd.id] = { def: cd, el: sec, box: box, legend: sec.querySelector(".legend"),
-                       note: sec.querySelector(".cnote"), chart: new C.Chart(box, cd.draw) };
+                       note: sec.querySelector(".cnote"), chart: new C.Chart(box, cd.draw), fam: cd.famColours ? famSwitch(sec) : null };
     });
     gridEl.scrollTop = 0;
     update(true);
   }
 
+  /* A chart in family colours, while the fish wear their brain colours (host.colourMode): a line saying so,
+   * and a button that colours them by family again (host.showFamilyColours: Run → Colour by brain similarity off) */
+  function tankColours() { return host && host.colourMode ? host.colourMode() : "family"; }
+  function famSwitch(sec) {
+    var p = document.createElement("p"), t = document.createElement("span"), b = document.createElement("button");
+    p.className = "cnote famswitch";
+    t.textContent = "The fish in the ocean wear colours from their brains now, not these family colours. ";
+    b.type = "button"; b.className = "btn"; b.textContent = "Show family colours in the ocean";
+    b.addEventListener("click", function () {
+      if (host && host.showFamilyColours) host.showFamilyColours();
+      this.blur();
+      update(true);
+    });
+    p.appendChild(t); p.appendChild(b);
+    sec.appendChild(p);
+    return p;
+  }
+
   function update(force) {
     if (!isOpen) return;
     lines.update(hist);
-    var key = tab + "|" + hist.version + "|" + fam.version + "|" + gridEl.clientWidth;
+    var mode = tankColours();
+    var key = tab + "|" + hist.version + "|" + fam.version + "|" + gridEl.clientWidth + "|" + mode;
     var ondemandDue = (tab === "sim" && (!simCache || performance.now() - simCache.at >= SIM_EVERY_MS)) ||
                       (tab === "brains" && (!wireCache || performance.now() - wireCache.at >= WIRE_EVERY_MS));
     if (!force && key === lastKey && !ondemandDue) return;
@@ -528,6 +547,7 @@
       var c = cards[id], cd = c.def;
       var on = !cd.when || cd.when();
       c.el.classList.toggle("off", !on);
+      if (c.fam) c.fam.hidden = mode === "family";
       if (!on) { c.note.textContent = cd.needs || ""; c.legend.innerHTML = ""; c.legend.__html = ""; return; }
       var data = cd.data();
       c.chart.draw(data || null);
