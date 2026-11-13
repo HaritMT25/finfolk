@@ -2,7 +2,7 @@
 # redqueen_forks.sh — tools/redqueen/forks.py end to end against the real engine (serial build), on
 # tiny worlds (200 prey, 24,000 steps, a checkpoint every 4,000), plus its unit tests.
 #
-#   tests/redqueen_forks.sh PATH/TO/evo_boids WORKDIR        (env: PYTHON, default python3)
+#   tests/redqueen_forks.sh PATH/TO/evo_boids WORKDIR        (env: PYTHON; RQ_TEST_WORKERS, default 4)
 #
 #   1. two C histories run to the end (one a fork world, one the pilot's validation world);
 #   2. register: 2 main origins (8,000 archived; 28,000 past the histories' end: unavailable,
@@ -19,6 +19,7 @@ BIN=$(readlink -f "${1:?usage: redqueen_forks.sh EVO_BOIDS WORKDIR}")
 W=$(readlink -m "${2:?usage: redqueen_forks.sh EVO_BOIDS WORKDIR}")
 T=$(cd "$(dirname "${BASH_SOURCE[0]}")/../tools/redqueen" && pwd)
 PY="${PYTHON:-python3} -I"
+NW=${RQ_TEST_WORKERS:-4}
 WS="$PY $T/worlds.py"
 FK="$PY $T/forks.py"
 [ -d "$W" ] && chmod -R u+w "$W" 2> /dev/null
@@ -63,7 +64,7 @@ grep -q "never replaced" ow.log || fail "the overwrite refusal does not say why:
 read B0 S0 B1 S1 < <($PY -c 'import json
 bs = [b for b in json.load(open("R/config/forks.json"))["worlds"] if b["kind"] == "main" and b["origin"]["frame"] == 8000]
 print(bs[0]["id"], bs[0]["origin"]["seed"], bs[1]["id"], bs[1]["origin"]["seed"])')
-$FK launch --study R --binary "$BIN" --workers 4 $GUARD > fl.log 2>&1 &
+$FK launch --study R --binary "$BIN" --workers $NW $GUARD > fl.log 2>&1 &
 sp=$!
 for _ in $(seq 1 3000); do pgrep -f "reseed-after-load $S1 " > /dev/null && break; sleep 0.01; done
 pkill -KILL -f "reseed-after-load $S1 " || { kill $sp; fail "no engine of $B1 to kill before its first acceptance"; }

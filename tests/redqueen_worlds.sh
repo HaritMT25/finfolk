@@ -2,7 +2,7 @@
 # redqueen_worlds.sh — tools/redqueen/worlds.py end to end against the real engine (serial build),
 # on tiny worlds (200 prey, 24,000 steps, a checkpoint every 4,000), plus its unit tests.
 #
-#   tests/redqueen_worlds.sh PATH/TO/evo_boids WORKDIR        (env: PYTHON, default python3)
+#   tests/redqueen_worlds.sh PATH/TO/evo_boids WORKDIR        (env: PYTHON; RQ_TEST_WORKERS, default 3)
 #
 #   1. register: deterministic bytes; one block of C, A and B; both floors passed as explicit
 #      zeros; refusals (placeholder, a floor, an omitted floor); an existing registry is never
@@ -40,6 +40,7 @@ W=${2:?usage: redqueen_worlds.sh EVO_BOIDS WORKDIR}
 case "$BIN" in /*) ;; *) BIN="$PWD/$BIN" ;; esac
 T=$(cd "$(dirname "${BASH_SOURCE[0]}")/../tools/redqueen" && pwd)
 PY="${PYTHON:-python3} -I"
+NW=${RQ_TEST_WORKERS:-3}
 WS="$PY $T/worlds.py"
 [ -d "$W" ] && chmod -R u+w "$W" 2> /dev/null
 rm -rf "$W"; mkdir -p "$W"; cd "$W" || exit 2
@@ -98,7 +99,7 @@ CW=$($PY -c 'import json; print([w["id"] for w in json.load(open("reg1.json"))["
 # 2. f1 + launch, uninterrupted
 mkroot R1
 $WS f1 --root R1 --binary "$BIN" --archive-root "$W/arch1" > r1f1.log 2>&1 || fail "f1: $(tail -3 r1f1.log)"
-$WS launch --root R1 --binary "$BIN" --workers 3 --on-extinction continue $GUARD > r1.log 2>&1 \
+$WS launch --root R1 --binary "$BIN" --workers $NW --on-extinction continue $GUARD > r1.log 2>&1 \
     || fail "launch: $(tail -5 r1.log)"
 $WS verify-f1 --root R1 > r1v.log 2>&1 || fail "verify-f1: $(tail -3 r1v.log)"
 for w in $($PY -c 'import json; print(" ".join(w["id"] for w in json.load(open("reg1.json"))["worlds"]))'); do
@@ -144,7 +145,7 @@ cmp -s arch1.before arch1.after || fail "the refused study changed R1's archive"
 # 3. a SIGKILLed C engine: F1 verified, resume, identical archive, stitched logs = the uninterrupted logs
 mkroot R2
 $WS f1 --root R2 --binary "$BIN" --archive-root "$W/arch2" > r2f1.log 2>&1 || fail "f1 R2"
-$WS launch --root R2 --binary "$BIN" --workers 3 --on-extinction continue $GUARD > r2.log 2>&1 &
+$WS launch --root R2 --binary "$BIN" --workers $NW --on-extinction continue $GUARD > r2.log 2>&1 &
 sp=$!
 # (late enough that the unflushed predator wiring log has reached disk past a checkpoint, so the
 #  resume starts from a checkpoint, not from the founder seed)
@@ -186,7 +187,7 @@ grep -q "verifying F1 with the pinned engine" r2.log || fail "the supervisor did
 # 4. lineage-log loss after a SIGKILLed supervisor: back to the last checkpoint the log covers
 mkroot R5
 $WS f1 --root R5 --binary "$BIN" --archive-root "$W/arch5" > r5f1.log 2>&1 || fail "f1 R5"
-$WS launch --root R5 --binary "$BIN" --workers 3 --on-extinction continue --prune-local $GUARD > r5a.log 2>&1 &
+$WS launch --root R5 --binary "$BIN" --workers $NW --on-extinction continue --prune-local $GUARD > r5a.log 2>&1 &
 sp=$!
 for _ in $(seq 1 3000); do grep -qs '"label":"end.16000"' "R5/worlds/$CW/accept.jsonl" && break; sleep 0.01; done
 kill -KILL $sp; wait $sp 2> /dev/null
@@ -203,7 +204,7 @@ with open(f"R5/worlds/{cw}/seg000/run.predlog.csv", "r+b") as f:
     f.truncate(cut)
 open("r5_expect", "w").write(str(recs[k - 1]["frame"] if k else 0))
 PY
-$WS launch --root R5 --binary "$BIN" --workers 3 --on-extinction continue --prune-local $GUARD > r5b.log 2>&1 \
+$WS launch --root R5 --binary "$BIN" --workers $NW --on-extinction continue --prune-local $GUARD > r5b.log 2>&1 \
     || fail "the restart after the lineage-log loss (--prune-local, N2): $(tail -5 r5b.log)"
 $WS stitch --root R5 --world "$CW" > /dev/null || fail "stitch R5"
 $PY cmp_stitch.py "$T" R5 "$CW" || fail "R5 differs from the uninterrupted history"
@@ -231,7 +232,7 @@ sed -i "s|@BIN@|$BIN|; s|@W@|$W|g" wrap.sh
 chmod +x wrap.sh
 mkroot R6; touch trunc_once
 $WS f1 --root R6 --binary "$W/wrap.sh" --archive-root "$W/arch6" > r6f1.log 2>&1 || fail "f1 R6"
-$WS launch --root R6 --binary "$W/wrap.sh" --workers 3 --on-extinction continue $GUARD > r6.log 2>&1 \
+$WS launch --root R6 --binary "$W/wrap.sh" --workers $NW --on-extinction continue $GUARD > r6.log 2>&1 \
     || fail "launch R6: $(tail -5 r6.log)"
 [ -f trunc_once ] && fail "the wrapper never truncated the main CSV"
 $WS stitch --root R6 --world "$CW" > /dev/null || fail "stitch R6"
@@ -246,7 +247,7 @@ PY
 # 6. a SIGKILLed supervisor, a torn checkpoint, a damaged archive copy
 mkroot R3
 $WS f1 --root R3 --binary "$BIN" --archive-root "$W/arch3" > r3f1.log 2>&1 || fail "f1 R3"
-$WS launch --root R3 --binary "$BIN" --workers 3 --on-extinction continue $GUARD > r3a.log 2>&1 &
+$WS launch --root R3 --binary "$BIN" --workers $NW --on-extinction continue $GUARD > r3a.log 2>&1 &
 sp=$!
 for _ in $(seq 1 3000); do grep -qs '"label":"end.8000"' "R3/worlds/$CW/accept.jsonl" && break; sleep 0.01; done
 kill -KILL $sp; wait $sp 2> /dev/null
@@ -265,7 +266,7 @@ assert 4000 in loc
 os.chmod(rec["path"], 0o644)
 open(rec["path"], "wb").write(b"lost")                                            # a damaged archive copy
 PY
-$WS launch --root R3 --binary "$BIN" --workers 3 --on-extinction continue $GUARD > r3b.log 2>&1 \
+$WS launch --root R3 --binary "$BIN" --workers $NW --on-extinction continue $GUARD > r3b.log 2>&1 \
     || fail "the restart: $(tail -5 r3b.log)"
 $PY - "$T" "$CW" <<'PY' || fail "the restarted root"
 import json, os, sys; sys.path.insert(0, sys.argv[1]); import worlds, rqlib
@@ -345,7 +346,7 @@ st = worlds.read_state("R1", ws["A"])
 st["status"] = "interrupted"            # died after the engine's last checkpoint, before marking it done
 worlds.write_state("R1", ws["A"], st)
 PY
-$WS launch --root R1 --binary "$BIN" --workers 3 --on-extinction continue $GUARD > r1c.log 2>&1 || fail "the reconciling launch: $(tail -3 r1c.log)"
+$WS launch --root R1 --binary "$BIN" --workers $NW --on-extinction continue $GUARD > r1c.log 2>&1 || fail "the reconciling launch: $(tail -3 r1c.log)"
 grep -q "already at its end (done" r1c.log || fail "the world at its final frame was not recognized"
 grep -q " seg001 " r1c.log && fail "a world at its final frame got another segment"
 $PY - "$T" <<'PY' || fail "the reconciled finalization"
@@ -365,7 +366,7 @@ p = f"R1/worlds/{sys.argv[1]}/seg000/run.predlog.csv"
 with open(p, "r+b") as f:
     f.truncate(os.path.getsize(p) - 300)
 PY
-$WS launch --root R1 --binary "$BIN" --workers 3 --on-extinction continue $GUARD > r1e.log 2>&1 || fail "the reopening launch: $(tail -3 r1e.log)"
+$WS launch --root R1 --binary "$BIN" --workers $NW --on-extinction continue $GUARD > r1e.log 2>&1 || fail "the reopening launch: $(tail -3 r1e.log)"
 grep -q "$CW: REOPENED (done" r1e.log || fail "the damaged done world was not reopened: $(tail -3 r1e.log)"
 $WS stitch --root R1 --world "$CW" > /dev/null || fail "stitch after the reopening"
 cmp -s predlog.orig "R1/worlds/$CW/stitched/run.predlog.csv" || fail "the replayed lineage log differs"
