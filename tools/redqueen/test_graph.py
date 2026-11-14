@@ -2050,17 +2050,20 @@ class TestMap(unittest.TestCase):
 import math  # noqa: E402
 from unittest import mock  # noqa: E402
 
-# The T6-10 REFERENCE INTEGRATOR (A_design_v5 T6-10 and PC-25, frozen). It shares no code with the scorer
-# (map.pred_count_lpd, _grid_pass, _score_law, _interval_logp, noisebank): its own upper-tail function, interval
-# probabilities, thresholds, link and table interpolation (numpy's interp). Budget: tail <= 1e-10 relative
-# (rigorous), quadrature <= 1e-9 in log (the halving certificate: evidence, not a bound), total about 1.1e-9.
+# The T6-10 REFERENCE INTEGRATOR (A_design_v5 T6-10 and PC-25, frozen; its refinement amended by A_design_v5
+# clarification 2, D2). It shares no code with the scorer (map.pred_count_lpd, _grid_pass, _score_law, _tail_ok,
+# _log_2sf, _interval_logp, noisebank): its own upper-tail function, interval probabilities, thresholds, link and table
+# interpolation (numpy's interp). Budget: tail <= 1e-10 relative (rigorous), quadrature <= 1e-9 in log (the halving
+# certificate: evidence, not a bound), total about 1.1e-9.
 REF_TAIL = 1e-10            # the tail budget (v5; v4's 1e-6 is the negative control of T6-11)
 REF_TAIL_V4 = 1e-6
-REF_SPACING = 5e-5          # node spacing in prior SDs (400,001 nodes over +-10 SD, more as the range extends)
+REF_SPACING = 5e-5          # the first node spacing, prior SDs (400,001 nodes over +-10 SD, more as the range extends)
 REF_START = 10.0            # the first range: +-10 SD
 REF_STEP = 2.0              # each extension: 2 SD per side
 REF_CAP = 60.0              # beyond +-60 SD a case is refused as unrepresentable
-REF_CERT = 1e-9             # the halving certificate's allowance (log units)
+REF_CERT = 1e-9             # the certificate: two consecutive estimates within this (log units)
+REF_HALVINGS = 4            # clarification 2 D2: at most four halvings (final spacing >= 3.125e-6 SD)
+REF_CHUNK = 1 << 21         # (nodes evaluated per chunk when the spacing is halved)
 REF_SF_SWITCH = 25.0        # the log upper tail: math.erfc below, the Laplace continued fraction at and above
 REF_CF_TERMS = 60
 _REF_LOG_SQRT2PI = 0.5 * math.log(2.0 * math.pi)
@@ -2118,14 +2121,19 @@ def ref_count_logp(k, loc, var, B):
     return ref_log_iprob((lo - loc) / sd, (hi - loc) / sd)
 
 
-def ref_log_integral(loglik, sigma, tail=REF_TAIL, start=REF_START, cap=REF_CAP):
+def ref_log_integral(loglik, sigma, tail=REF_TAIL, start=REF_START, cap=REF_CAP, halvings=REF_HALVINGS):
     """log of the integral of N(e; 0, sigma^2) L(e) de for a likelihood 0 <= L <= 1 given as loglik(e) = log L(e)
     (vectorized), by the frozen rule of A_design_v5 T6-10: the log-sum-exp trapezoid on nodes e = i h, exact integer
     multiples of h = 5e-5 sigma, over [-b, b], b = 10 sigma at first and extended symmetrically by 2 sigma until
     log(2 S(b / sigma)) <= log(tail) + log I^ (I^ the integral over the current range; rigorous because L <= 1: the
-    omitted part is at most 2 S(b / sigma)); refused (ValueError) beyond +-60 sigma; then the spacing halved once,
-    the finer value being the reference and |fine - coarse| the certificate.
-    -> {log_I, coarse, certificate, b (in SD), trace [(b, log bound, log I^, stopped) per step], fine_bound_ok}."""
+    omitted part is at most 2 S(b / sigma)); refused (ValueError) beyond +-60 sigma. Then (A_design_v5 clarification 2,
+    D2, which replaces v5's single halving) the spacing is halved until two consecutive estimates differ by at most
+    REF_CERT in log, at most `halvings` times (four: final spacing >= 3.125e-6 sigma); the finer of the last two is the
+    reference and their |difference| its certificate (certified: <= REF_CERT); the tail criterion is re-asserted with
+    the final estimate (fine_bound_ok). A case not certified is returned with certified False, for the caller to fail.
+    -> {log_I, coarse (the estimate at 5e-5 sigma), estimates [(spacing in sigma units, log I^) per spacing],
+    halvings, spacing (the final one, in sigma units), certificate, certified, b (in SD), trace [(b, log bound, log I^,
+    stopped) per range step], fine_bound_ok}."""
     h = REF_SPACING * sigma
     lnorm = -math.log(sigma) - _REF_LOG_SQRT2PI
 
@@ -2156,13 +2164,25 @@ def ref_log_integral(loglik, sigma, tail=REF_TAIL, start=REF_START, cap=REF_CAP)
             raise ValueError(f"reference: the tail bound still fails at +-{b:g} SD (cap {cap:g}): unrepresentable")
         lf = np.concatenate([logf(np.arange(-n - step, -n) * h), lf, logf(np.arange(n + 1, n + step + 1) * h)])
         n += step
-    i2 = np.arange(-2 * n, 2 * n + 1)
-    lf2 = np.empty(len(i2))
-    lf2[0::2] = lf
-    lf2[1::2] = logf(i2[1::2] * (h / 2.0))
-    fine = trap(lf2, h / 2.0)
-    return {"log_I": fine, "coarse": log_i, "certificate": abs(fine - log_i), "b": b, "trace": trace,
-            "fine_bound_ok": bool(trace[-1][1] <= math.log(tail) + fine)}
+    ests = [(REF_SPACING, log_i)]
+    for j in range(1, halvings + 1):          # (halve: the old nodes stay, the midpoints are new; all exact multiples)
+        hj = h / 2.0 ** j
+        nj = n * 2 ** j
+        lf2 = np.empty(2 * nj + 1)
+        lf2[0::2] = lf
+        odd = np.arange(-nj + 1, nj, 2)
+        new = np.empty(len(odd))
+        for k in range(0, len(odd), REF_CHUNK):
+            new[k:k + REF_CHUNK] = logf(odd[k:k + REF_CHUNK] * hj)
+        lf2[1::2] = new
+        lf = lf2
+        ests.append((REF_SPACING / 2.0 ** j, trap(lf, hj)))
+        if abs(ests[-1][1] - ests[-2][1]) <= REF_CERT:
+            break
+    final, cert = ests[-1][1], abs(ests[-1][1] - ests[-2][1])
+    return {"log_I": final, "coarse": log_i, "estimates": ests, "halvings": len(ests) - 1, "spacing": ests[-1][0],
+            "certificate": cert, "certified": bool(cert <= REF_CERT), "b": b, "trace": trace,
+            "fine_bound_ok": bool(trace[-1][1] <= math.log(tail) + final)}
 
 
 def ref_link(knots=None, theta=None, lo=0.0, hi=1.0):
@@ -2369,30 +2389,35 @@ T610_FRACS = (0.002, 0.01, 0.1, 0.5, 0.9, 0.99, 0.998)          # predicted capt
 T610_SDS = (0.05, 0.3, 0.5, 1.0)                                # predictor SDs (T6-10: 0.05-1.0)
 # Unrepresentable by v5's rule (the reference's tail bound still fails at +-60 SD): not T6-10 cases.
 T610_UNREPRESENTABLE = {("val", 0.998, 0.05, 0), ("const", 0.998, 0.05, 0), ("const", 0.002, 0.05, 324)}
-# STOPPED, NOT DECIDED (reported to the coordinator): the steep curve's k = B at low predicted fractions. The
-# integrand is bimodal -- an interior mode inside the first +-7 SD range, the dominant mode at +10..+15 SD -- and
-# main's range check (TRAP_EDGE, an end node's share of the integral over the CURRENT range), which v5 3.3 keeps,
-# never extends the range: the score is silently wrong by 9.6-83 nats with no grid_unresolved flag. The scorer's own
-# integrand, integrated densely, matches the reference (test_T6_10_gap_diagnosis); only the range rule fails. A fix
-# changes the registered range check and is not v5's to make here (test_T6_10_gap_cases_agree: expected to fail).
+# The RANGE GAP (Codex WP2 review P1; closed by A_design_v5 clarification 2, D1): the steep curve's k = B at low
+# predicted fractions. The integrand is bimodal -- an interior mode inside the first +-7 SD range, the dominant mode at
+# +10..+15 SD -- and main's end-node check alone (TRAP_EDGE, an end node's share of the integral over the CURRENT range)
+# never extends the range: at a4227b6 the score was wrong by 9.6-83 nats with no grid_unresolved flag. With the score
+# law the tail bound (map._tail_ok) extends these ranges; the cases are part of T6-10's ordinary agreement set
+# (t610_cases) and must record an extension (test_T6_10_gap_diagnosis, test_T6_10_gap_cases_agree).
 T610_GAP = {("val", 0.002, 1.0, 324), ("val", 0.01, 1.0, 324), ("val", 0.1, 0.5, 324)}
-# STOPPED, NOT DECIDED (reported): the reference's halving certificate (<= 1e-9, PC-25) is not met on some T6-10
-# cases: the score-law integrand is only piecewise smooth (the fitter table's kinks, segment slopes up to ~79), so the
-# frozen spacing 5e-5 SD halved once leaves O(h^2) differences of up to ~2.4e-8 on rare counts (the mandatory case
-# 4.5e-9); halving further converges (below 1e-9 at 1.25e-5 SD). v5 does not say what an uncertified case does, so
-# test_T6_10 records the certificates and test_T6_10_reference_certificates_meet_v5 (expected to fail) holds v5's
-# allowance; the agreement tolerance 2 x TRAP_TOL = 2e-3 is five orders above these differences.
+# The reference's certificate (Codex WP2 review P2; clarification 2, D2): the score-law integrand is only piecewise
+# smooth (the fitter table's kinks, segment slopes up to ~79), so one halving of 5e-5 SD left O(h^2) differences up to
+# ~2.4e-8 on rare counts (the mandatory case 4.5e-9); the reference now halves until two consecutive estimates agree
+# within 1e-9, at most four times, and a case not certified fails T6-10 with its diagnostics (never excluded).
+# Codex's coverage gap (the controller's recomputation on a SECOND extension, with a changing non-identity link slope):
+# (link knots, values, lo, hi), predicted fraction, SD, count -- two cases needing two range extensions on the steep
+# curve (test_T6_10_second_extension_recomputes_on_a_nonidentity_link).
+T610_TWO_EXT = [(((-8.0, -4.0, 4.0, 8.0), (-8.0, -6.0, -2.0, 8.0), 0.0, 1.0), 0.01, 0.2, 324),   # (slope 0.5, then 2.5)
+                (((-12.0, -3.0, 3.0, 12.0), (-12.0, -1.0, 1.0, 12.0), 0.0, 1.0), 0.1, 0.2, 324)]
 _BANK = {}
 _T610_REF = {}
 
 
 @unittest.skipIf(np is None, "numpy is not installed (set RQ_PYLIB, or RQ_REQUIRE_NUMPY=1 to require it)")
 class TestMapBankMode(unittest.TestCase):
-    """map.py in bank mode (Red Queen recovery option A, A_design_v5.md section 3.3): the nu0 shrinkage of
-    capture_scale (T6-2), the working coordinate and nu0 in it (T6-7), the score law (T6-8), the integrated score
-    with the hook and its grid rule (per-pair H^max, recomputed on every range extension) against the frozen
-    reference integrator (T6-10), the reference's self-test (T6-11), and the refusal of a variance model without a
-    var_fn (T6-1's map.fit clause). With the hooks unset, capture_scale and the scorer are main's byte for byte."""
+    """map.py in bank mode (Red Queen recovery option A, A_design_v5.md section 3.3, with clarification 2): the nu0
+    shrinkage of capture_scale (T6-2) and its domain (overflow-safe form, refusals: D3), the working coordinate and nu0
+    in it (T6-7), the score law (T6-8), the integrated score with the hook, its grid rule (per-pair H^max, recomputed
+    on every range extension) and its range rule (the end-node check and the tail bound: D1) against the reference
+    integrator, which halves until certified (T6-10, D2), the reference's self-test (T6-11), and the refusal of a
+    variance model without a var_fn (T6-1's map.fit clause). With the hooks unset, capture_scale and the scorer are
+    main's byte for byte."""
 
     @classmethod
     def setUpClass(cls):
@@ -2508,6 +2533,49 @@ class TestMapBankMode(unittest.TestCase):
                 self.assertEqual(got[0].tobytes(), want[0].tobytes())
                 self.assertEqual((type(got[1]), got[1], type(got[2]), got[2]),
                                  (type(want[1]), want[1], type(want[2]), want[2]))
+
+    def test_T6_2_nu0_overflow_safe_and_domain(self):
+        """T6-2 with A_design_v5 clarification 2 (D3 and its implementation note; Codex WP2 review P2): every positive
+        finite nu0 gives the formula's value -- Codex's known answer nu0 = 1e308, V = [0.5, 0.25], zrep = [2, 1], R = 6
+        (phi = 4): v~ = [2, 1], w = [2/3, 4/3], unit = 2/9 (at a4227b6 nu0 phi V overflowed: v~ = inf, unit 1/0) -- and
+        the formula against exact rational arithmetic for nu0 from 1e-300 to the largest float; a non-finite V or
+        zrep is refused with that context; no replicate variance in any cell (phi = 0, every v~ = 0) is refused with
+        that context, never floored; a v~ that underflows to 0 is refused by the positivity check, never divided."""
+        from fractions import Fraction as F
+        import sys as sys_
+        M = self.M
+        R = 6
+        with self.subTest("Codex's known answer, nu0 = 1e308"):
+            w, unit, phi = M.capture_scale(np.array([0.5, 0.25]), np.array([2.0, 1.0]), R, nu0=1e308)
+            self.assertEqual(phi, 4.0)
+            self.assertTrue(np.allclose(w, [2.0 / 3.0, 4.0 / 3.0], rtol=1e-15, atol=0), w)
+            self.assertAlmostEqual(unit, 2.0 / 9.0, delta=1e-16)
+            self.assertTrue(np.allclose(R * unit / w, [2.0, 1.0], rtol=1e-15, atol=0))          # (v~ = R unit / w)
+        V = np.array([0.5, 0.25, 0.1, 0.04, 0.3, 0.0123])
+        zrep = np.array([0.6, 0.2, 0.15, 0.01, 0.0, 0.031])
+        for nu0 in (1e-300, 1e-12, 0.37, 4.0, 1e12, 1e200, 1e300, 1e308, sys_.float_info.max):
+            with self.subTest("the formula against exact rationals", nu0=nu0):
+                w, unit, phi = M.capture_scale(V, zrep, R, nu0=nu0)
+                fv, fz, fn = [F(float(v)) for v in V], [F(float(v)) for v in zrep], F(nu0)
+                fphi = sum(z / v for z, v in zip(fz, fv)) / len(fv)
+                vt = [(fn * fphi * v + (R - 1) * z) / (fn + R - 1) for z, v in zip(fz, fv)]
+                mt = sum(1 / x for x in vt) / len(vt)
+                self.assertTrue(np.allclose(w, [float((1 / x) / mt) for x in vt], rtol=1e-13, atol=0), (nu0, w))
+                self.assertAlmostEqual(unit, float(1 / (R * mt)), delta=1e-13 * float(1 / (R * mt)))
+                self.assertTrue(np.allclose(R * unit / w, [float(x) for x in vt], rtol=1e-13, atol=0))
+        for label, Vb, zb in (("zrep inf", V, np.r_[np.inf, zrep[1:]]), ("zrep nan", V, np.r_[zrep[:-1], np.nan]),
+                              ("V inf", np.r_[V[:-1], np.inf], zrep), ("V nan", np.r_[np.nan, V[1:]], zrep),
+                              ("zrep -inf", V, np.r_[zrep[:2], -np.inf, zrep[3:]])):
+            with self.subTest("a non-finite input is refused", input=label):
+                with self.assertRaisesRegex(ValueError, "non-finite value in V or zrep"):
+                    M.capture_scale(Vb, zb, R, nu0=4.0)
+        for nu0 in (4.0, 1e308, 1e-300):
+            with self.subTest("phi = 0 is refused with that context", nu0=nu0):
+                with self.assertRaisesRegex(ValueError, r"every replicate variance is zero \(phi = 0\).*not floored"):
+                    M.capture_scale(V, np.zeros(len(V)), R, nu0=nu0)
+        with self.subTest("a shrunk variance that underflows to 0 is refused (positivity), never divided"):
+            with self.assertRaisesRegex(ValueError, "not finite and positive"):
+                M.capture_scale(V, zrep, R, nu0=5e-324)                  # (the zero-variance cell's v~ underflows)
 
     # ---------------------------------------------------------------- T6-7
     def bank_data(self, D, idx, seed, quantum=None, nu0_het=None):
@@ -2672,8 +2740,9 @@ class TestMapBankMode(unittest.TestCase):
     # ---------------------------------------------------------------- T6-10
     def t610_cases(self):
         """(group key, table name, link spec, phi, predicted fraction, SD, count) for T6-10: identity G on both
-        tables over T610_FRACS x T610_SDS x counts {0, the modal count, B} (unrepresentable and STOPPED cases
-        excluded), plus a spline link, a bounded link and phi = 1.5 on the steep curve."""
+        tables over T610_FRACS x T610_SDS x counts {0, the modal count, B} (the unrepresentable cases excluded; the
+        three range-gap cases T610_GAP included since clarification 2), plus a spline link, a bounded link and
+        phi = 1.5 on the steep curve: 195 observations."""
         B = self.B
         out = []
         for tname in ("val", "const"):
@@ -2681,7 +2750,7 @@ class TestMapBankMode(unittest.TestCase):
                 for sd in T610_SDS:
                     for k in sorted({0, int(round(B * mu)), B}):
                         key = (tname, mu, sd, k)
-                        if key not in T610_UNREPRESENTABLE and key not in T610_GAP:
+                        if key not in T610_UNREPRESENTABLE:
                             out.append(((tname, None, 1.0), tname, None, 1.0, mu, sd, k))
         spline = ((-4.0, -1.0, 1.0, 4.0), (-4.0, -1.6, 0.4, 4.0), 0.0, 1.0)
         bounded = ((-3.0, 0.0, 3.0), (-3.0, 0.5, 3.0), 0.02, 0.9)
@@ -2759,30 +2828,86 @@ class TestMapBankMode(unittest.TestCase):
             infos[g], models[g] = info, (m, eta, s2, cnt)
         return out, infos, models
 
+    def mandatory(self):
+        """T6-10's mandatory rare-count case (S_C = 0.2, phi 1, identity G, fraction 0.998, SD 1, k = 0, location
+        m_z(0.998) from the exact location solve) -> (location, its reference; cached)."""
+        if "mandatory" not in _T610_REF:
+            B, ol = self.B, self.ol
+            a, _ = ol.solve_location(np.array([0.998]), np.array([0.2]), B, B)
+            loc = float(ol.logit_moments(a, np.array([0.2]))[0][0])
+            _T610_REF["mandatory"] = (loc, self.t610_reference(self.tabs["const"], None, 1.0, loc, 1.0, 0))
+        return _T610_REF["mandatory"]
+
+    def assert_certified(self, labelled):
+        """Every reference of labelled [(label, reference)] is certified within REF_HALVINGS halvings (A_design_v5
+        clarification 2, D2): the halving stopped at the first two consecutive estimates within REF_CERT in log, the
+        finer of them is the reference and their |difference| its certificate, the final spacing is 5e-5 / 2^halvings
+        SD, and the tail criterion holds with the final estimate. Otherwise T6-10 fails with each such case's spacings,
+        estimates and certificate (no case is excluded or given an allowance)."""
+        bad = []
+        for label, r in labelled:
+            est = r["estimates"]
+            ok = (r["certified"] and r["fine_bound_ok"] and 1 <= r["halvings"] == len(est) - 1 <= REF_HALVINGS
+                  and r["spacing"] == est[-1][0] == REF_SPACING / 2.0 ** r["halvings"] and r["log_I"] == est[-1][1]
+                  and r["certificate"] == abs(est[-1][1] - est[-2][1]) <= REF_CERT
+                  and all(abs(y[1] - x[1]) > REF_CERT for x, y in zip(est[:-2], est[1:-1])))
+            if not ok:
+                bad.append((label, est, r["certificate"], r["fine_bound_ok"]))
+        self.assertEqual(bad, [], "references not certified within four halvings (A_design_v5 clarification 2, D2): "
+                                  "(case, [(spacing in SD, log I^), ...], certificate, tail criterion with the final)")
+
+    @staticmethod
+    def tail_holds(full, span):
+        """The bank-mode tail bound of A_design_v5 clarification 2, D1, computed here independently of map (from the
+        reference's ref_log_sf; TRAP_SD = 7, TRAP_TAIL = 1e-4): log(2 PhiBar(b)) <= log(1e-4) + full + log(1 - 2
+        PhiBar(b)), b = 7 span, elementwise on a pass's normalized estimates full."""
+        lt = math.log(2.0) + float(ref_log_sf(np.array([7.0 * span]))[0])
+        return np.asarray(full, float) >= lt - math.log(1e-4) - math.log1p(-math.exp(lt))
+
+    def brute_need(self, tab, lk, phi, eta, sd, span):
+        """The grid rule's node requirement (A_design_v5 3.3, PC-24) computed independently of map._score_need: H^max
+        by brute force over every table segment meeting [G(eta - Delta), G(eta + Delta)] (clipped like the score law's
+        argument), Delta = TRAP_SD span sd, g_max = Link.max_slope over [eta - Delta, eta + Delta], s_lat = sqrt(phi
+        min L), h = min(sd, TRAP_H s_lat / (g_max max(H^max, 1e-12))) -> (ceil(2 TRAP_SD span sd / h) + 1, H^max,
+        g_max)."""
+        M = self.M
+        kappa = np.abs(np.diff(tab.A) / np.diff(tab.m))
+        d_ = M.TRAP_SD * span * sd
+        pz = np.clip(M._sig(lk.G(np.array([eta - d_, eta + d_]))), 1e-4, 1 - 1e-4)
+        zlo, zhi = (np.log(pz) - np.log1p(-pz)).tolist()
+        hit = (tab.m[:-1] <= zhi) & (tab.m[1:] >= zlo)
+        hmax = float(kappa[hit].max()) if hit.any() else 0.0
+        gmax = max(lk.max_slope(eta - d_, eta + d_), 1e-12)
+        h = min(sd, M.TRAP_H * math.sqrt(max(phi * float(tab.L.min()), 1e-300)) / (gmax * max(hmax, 1e-12)))
+        return math.ceil(2 * M.TRAP_SD * span * sd / max(h, 1e-300)) + 1, hmax, gmax
+
     def test_T6_10_integrated_score_with_the_hook(self):
-        """T6-10 (A_design_v5 3.3, PC-24, PC-25): pred_count_lpd with the score law equals the frozen reference within
-        2 x TRAP_TOL per observation, with no grid_unresolved pair, for predicted capture fractions 0.002-0.998
-        (the saturated ones, where the table's slopes kappa_j are largest, included), predictor SDs 0.05-1.0 and
-        counts 0, modal and B (the rarest at the extreme predictions), on the steep validation curve and S_C = 0.2,
-        with identity, spline and bounded links and phi 1 and 1.5 -- except the cases the reference refuses as
-        unrepresentable (+-60 SD) and the STOPPED gap (T610_GAP); the reference's halving certificates are recorded
-        (v5's 1e-9 allowance is STOPPED: test_T6_10_reference_certificates_meet_v5). The mandatory rare-count case
-        (S_C = 0.2, phi 1, identity G, fraction 0.998, SD 1, k = 0, location m_z(0.998)): the reference extends
-        beyond 10 SD and the scorer records a range extension and agrees. The v2 rule (main's step, no H^max) runs
-        as the negative control and its misses are reported; with score_law unset the scores are main's byte for
-        byte."""
+        """T6-10 (A_design_v5 3.3, PC-24, PC-25, with clarification 2): pred_count_lpd with the score law equals the
+        reference within 2 x TRAP_TOL per observation, with no grid_unresolved pair, for predicted capture fractions
+        0.002-0.998 (the saturated ones, where the table's slopes kappa_j are largest, included), predictor SDs
+        0.05-1.0 and counts 0, modal and B (the rarest at the extreme predictions), on the steep validation curve and
+        S_C = 0.2, with identity, spline and bounded links and phi 1 and 1.5: 195 observations (every case but the
+        three the reference refuses as unrepresentable at +-60 SD; the three range-gap cases T610_GAP included, which
+        the tail bound of D1 now extends); every reference is certified within four halvings (D2: the case fails
+        otherwise). The mandatory rare-count case (S_C = 0.2, phi 1, identity G, fraction 0.998, SD 1, k = 0,
+        location m_z(0.998)): the reference extends beyond 10 SD and the scorer records a range extension and agrees.
+        The v2 rule (main's step, no H^max) runs as the negative control and its misses are reported; with score_law
+        unset the scores are main's byte for byte."""
         import sys as sys_
-        M, ol, B = self.M, self.ol, self.B
+        M = self.M
         tol = 2 * M.TRAP_TOL
         for key in T610_UNREPRESENTABLE:
             tab = self.tabs[key[0]]
             with self.assertRaisesRegex(ValueError, "unrepresentable"):
                 self.t610_reference(tab, None, 1.0, self.zmu(tab, key[1]), key[2], key[3])
         cases = self.t610_cases()
+        self.assertEqual(len(cases), 195)
+        self.assertTrue(T610_GAP <= {(c[1], c[4], c[5], c[6]) for c in cases if c[2] is None and c[3] == 1.0})
         got, infos, models = self.t610_run(cases)
         worst, misses = 0.0, []
         refs = {}
         rr = self.t610_refs(cases)
+        self.assert_certified([(c[1:], r) for c, r in zip(cases, rr)])
         for i, r in enumerate(rr):
             refs[i] = r["log_I"]
             d = abs(got[i] - r["log_I"])
@@ -2795,16 +2920,15 @@ class TestMapBankMode(unittest.TestCase):
         ext = sum(info["extended"] for info in infos.values())
         certs = [r["certificate"] for r in rr]
         print(f"T6-10: {len(cases)} observations, worst |score - reference| {worst:.2e} (tolerance {tol}), {ext} range "
-              f"extensions, misses {misses}; reference certificates: worst {max(certs):.2e}, "
-              f"{sum(c > REF_CERT for c in certs)} above v5's {REF_CERT} (STOPPED; see T610_GAP's note)",
+              f"extensions, misses {misses}; reference certificates: worst {max(certs):.2e}, all certified within "
+              f"four halvings (halvings used: {sorted(Counter(r['halvings'] for r in rr).items())})",
               file=sys_.stderr)
         self.assertEqual(misses, [])
         self.assertGreater(ext, 10)
         # the mandatory rare-count case
         tabc = self.tabs["const"]
-        a, _ = ol.solve_location(np.array([0.998]), np.array([0.2]), B, B)
-        loc = float(ol.logit_moments(a, np.array([0.2]))[0][0])
-        r = self.t610_reference(tabc, None, 1.0, loc, 1.0, 0)
+        loc, r = self.mandatory()
+        self.assert_certified([("mandatory", r)])
         self.assertGreater(r["b"], REF_START)
         self.assertTrue(all(not t[3] for t in r["trace"][:-1]) and r["trace"][-1][3])
         W, SL = self.hooks(tabc)
@@ -2898,10 +3022,13 @@ class TestMapBankMode(unittest.TestCase):
         self.assertGreater(int(np.searchsorted(M.TRAP_KS, n2)), int(np.searchsorted(M.TRAP_KS, n1 * 2.0)))
 
     def test_T6_10_gap_diagnosis(self):
-        """The STOPPED T6-10 gap (T610_GAP; reported, not decided): for each case the scorer's own integrand
-        (_score_law and the interval probability), integrated densely over +-25 SD, matches the reference within
-        1e-6, while pred_count_lpd neither extends the range nor flags the pair -- the miss is the range rule's
-        (main's TRAP_EDGE check, kept by v5 3.3), not the score law's or the grid step's."""
+        """The T6-10 range gap (T610_GAP; Codex WP2 review P1), closed by the tail bound (A_design_v5 clarification 2,
+        D1): for each case the scorer's own integrand (_score_law and the interval probability), integrated densely
+        over +-25 SD, matches the reference within 1e-6 and peaks beyond +-TRAP_SD prior SDs (the dominant mode lies
+        outside the first range); the first pass (span 1) passes main's end-node check but fails the tail bound
+        (computed here independently, from the reference's tail function), so pred_count_lpd EXTENDS the range and
+        the score agrees with the certified reference within 2 x TRAP_TOL, with no grid_unresolved pair (at a4227b6
+        it extended nothing and missed by 9.6-83 nats, unflagged)."""
         import sys as sys_
         M, B = self.M, self.B
         for tname, mu, sd, k in sorted(T610_GAP):
@@ -2909,52 +3036,198 @@ class TestMapBankMode(unittest.TestCase):
             W, SL = self.hooks(tab)
             m = {"link": M.Link(), "phi": 1.0, "var_fn": W, "score_law": SL}
             eta = self.zmu(tab, mu)
-            r = self.t610_reference(tab, None, 1.0, eta, sd, k)
-            sc, info = self.score(m, [eta], [sd * sd], [[k]])
+            r = self.t610_refs([((tname, None, 1.0), tname, None, 1.0, mu, sd, k)])[0]
+            passes = []
+            real = M._grid_pass
+
+            def spy(lk, m_, cnt, e_, s_, N, K, span, passes=passes, real=real):
+                res = real(lk, m_, cnt, e_, s_, N, K, span)
+                passes.append((float(span[0]), res[0].copy(), res[2].copy()))
+                return res
+            with mock.patch.object(M, "_grid_pass", spy):
+                sc, info = self.score(m, [eta], [sd * sd], [[k]])
             x = np.linspace(-25.0, 25.0, 2_000_001)
             loc, var = M._score_law(m, eta + sd * x)
             t = (M._interval_logp(np.full((len(x), 1), k), B, loc[:, None], var[:, None])[:, 0] - 0.5 * x * x
                  - 0.5 * math.log(2 * math.pi) + math.log(x[1] - x[0]))
             dense = float(t.max() + math.log(float(np.exp(t - t.max()).sum())))
-            print(f"T6-10 STOPPED gap {tname} mu^ {mu} SD {sd} k {k}: scorer {float(sc[0]):.4f}, reference "
-                  f"{r['log_I']:.4f}, the scorer's integrand densely {dense:.4f} (peak at e = "
-                  f"{float(x[np.argmax(t)]):+.2f} SD); info {info}", file=sys_.stderr)
+            span1, full1, edge1 = passes[0]
+            print(f"T6-10 range gap {tname} mu^ {mu} SD {sd} k {k}: scorer {float(sc[0]):.6f}, reference "
+                  f"{r['log_I']:.6f}, the scorer's integrand densely {dense:.6f} (peak at e = "
+                  f"{float(x[np.argmax(t)]):+.2f} SD); first pass (span {span1:g}) {float(full1[0, 0]):.4f}, spans "
+                  f"used {sorted({p[0] for p in passes})}; info {info}", file=sys_.stderr)
             self.assertLessEqual(abs(dense - r["log_I"]), 1e-6)
-            self.assertEqual((info["extended"], info["grid_unresolved"]), (0, 0))
             self.assertGreater(float(x[np.argmax(t)]), M.TRAP_SD)
+            self.assertEqual(span1, 1.0)
+            self.assertTrue(np.all(edge1 <= M.TRAP_EDGE))                      # (main's end-node check passes ...)
+            self.assertFalse(np.all(self.tail_holds(full1, 1.0)))              # (... the tail bound does not)
+            self.assertGreaterEqual(info["extended"], 1)
+            self.assertEqual(info["grid_unresolved"], 0)
+            self.assertLessEqual(abs(float(sc[0]) - r["log_I"]), 2 * M.TRAP_TOL)
+            self.assert_certified([((tname, mu, sd, k), r)])
 
-    @unittest.expectedFailure
     def test_T6_10_gap_cases_agree(self):
-        """T6-10's requirement on the STOPPED gap cases (T610_GAP): the scorer agrees with the reference within
-        2 x TRAP_TOL. It fails under v5 3.3's retained range check (expected failure, reported to the coordinator);
-        a fix to the registered range rule turns it into an unexpected success, which fails the suite."""
+        """T6-10's requirement on the range-gap cases (T610_GAP), each scored alone: the scorer records a range
+        extension and agrees with the certified reference within 2 x TRAP_TOL, with no grid_unresolved pair (an
+        expected failure at a4227b6; A_design_v5 clarification 2, D1)."""
         cases = [((t, None, 1.0), t, None, 1.0, mu, sd, k) for t, mu, sd, k in sorted(T610_GAP)]
-        got, _, _ = self.t610_run(cases)
-        for i, c in enumerate(cases):
-            tab = self.tabs[c[1]]
-            r = self.t610_reference(tab, None, 1.0, self.t610_eta(tab, None, c[4]), c[5], c[6])
-            self.assertLessEqual(abs(got[i] - r["log_I"]), 2 * self.M.TRAP_TOL, c)
+        refs = self.t610_refs(cases)
+        self.assert_certified([(c[1:], r) for c, r in zip(cases, refs)])
+        for c, r in zip(cases, refs):
+            got, infos, _ = self.t610_run([c])
+            self.assertGreaterEqual(infos[c[0]]["extended"], 1, c)
+            self.assertEqual(infos[c[0]]["grid_unresolved"], 0, c)
+            self.assertLessEqual(abs(got[0] - r["log_I"]), 2 * self.M.TRAP_TOL, c)
 
-    @unittest.expectedFailure
-    def test_T6_10_reference_certificates_meet_v5(self):
-        """T6-10's reference requirement (PC-25): every case's halving certificate <= 1e-9, the mandatory case's
-        included. It fails under the frozen spacing on rare counts (the STOPPED certificate note above; expected
-        failure, reported to the coordinator)."""
+    def test_T6_10_reference_certificates(self):
+        """T6-10's reference (A_design_v5 PC-25 with clarification 2, D2): every one of the 195 observations (v5's 192
+        and the three range-gap cases) and the mandatory rare-count case certifies within four halvings of 5e-5 SD --
+        the halving stops at the first two consecutive estimates within 1e-9 in log, the finer of them is the
+        reference, and the tail criterion holds with it. Each case's final spacing and certificate are recorded, with
+        the spacings' distribution. (At a4227b6 the reference halved once and 22 of 192 exceeded 1e-9, the mandatory
+        case 4.5e-9: the halve-once mutation reproduces that.)"""
+        import sys as sys_
         cases = self.t610_cases()
-        B, ol = self.B, self.ol
-        a, _ = ol.solve_location(np.array([0.998]), np.array([0.2]), B, B)
-        loc = float(ol.logit_moments(a, np.array([0.2]))[0][0])
-        certs = [r["certificate"] for r in self.t610_refs(cases)]
-        certs.append(self.t610_reference(self.tabs["const"], None, 1.0, loc, 1.0, 0)["certificate"])
-        self.assertLessEqual(max(certs), REF_CERT)
+        labelled = [(c[1:], r) for c, r in zip(cases, self.t610_refs(cases))]
+        labelled.append(("mandatory (S_C 0.2, 0.998, SD 1, k 0)", self.mandatory()[1]))
+        self.assertEqual(len(labelled), 196)
+        for label, r in labelled:
+            print(f"T6-10 reference {label}: b = {r['b']:g} SD, {r['halvings']} halving(s), final spacing "
+                  f"{r['spacing']:.4g} SD, certificate {r['certificate']:.3e}, log I^ {r['log_I']:.12f}",
+                  file=sys_.stderr)
+        dist = sorted(Counter(r["spacing"] for _, r in labelled).items(), reverse=True)
+        worst = max(labelled, key=lambda x: x[1]["certificate"])
+        print(f"T6-10 references: {len(labelled)} cases; final spacing (SD): count {dist}; worst certificate "
+              f"{worst[1]['certificate']:.3e} ({worst[0]})", file=sys_.stderr)
+        self.assert_certified(labelled)
+
+    def test_T6_10_tail_bound_rule(self):
+        """A_design_v5 clarification 2, D1, white box (pred_count_lpd's controller with a stub grid pass whose
+        estimates are prescribed per span): with the score law a pass is range-adequate only if main's end-node check
+        AND the tail bound log(2 PhiBar(b)) <= log(TRAP_TAIL) + log I^ hold for EVERY replicate, b = TRAP_SD span,
+        log I^ = full + log(1 - 2 PhiBar(b)), TRAP_TAIL = 1e-4 (the bound fails below log I^ = -17.48, -91.66 and
+        -386.3 at b = 7, 14 and 28: clarification 2's figures). 4e-13 either side of the exact threshold at b = 7 (where
+        the normalized full and log I^ differ by 2.6e-12) the bound decides; one failing replicate is enough; either
+        check alone extends the range, with the requirement recomputed on it (the grid at span 2 is at least the
+        bucket of the brute-force requirement there); still failing at the cap (span 8, +-56 SD) the pair is kept and
+        counted in grid_unresolved; a range-adequate pass that fails the resolution check refines; with the score law
+        unset the same passes are main's (no tail bound: nothing extends)."""
+        M, tab = self.M, self.tab
+        W, SL = self.hooks(tab)
+
+        def lt(span):                       # log(2 PhiBar(7 span)), independently of map
+            return math.log(2.0) + float(ref_log_sf(np.array([7.0 * span]))[0])
+
+        def thr(span):                      # the exact threshold of the bound on a pass's normalized estimate full
+            return lt(span) - math.log(1e-4) - math.log1p(-math.exp(lt(span)))
+        for span, want, places in ((1, -17.48, 2), (2, -91.66, 2), (4, -386.3, 1)):
+            self.assertAlmostEqual(lt(span) - math.log(1e-4), want, places=places)
+        self.assertGreater(-math.log1p(-math.exp(lt(1))), 2.5e-12)           # (log I^ vs full at b = 7)
+        t1 = thr(1)
+
+        def run(fulls, edges=None, hook=True, unresolved_first=False):
+            """fulls / edges: {span: (replicate 1, replicate 2)} -> (score, info, [(K, span)])."""
+            calls = []
+
+            def stub(lk, m_, cnt, eta, sd, N, K, span):
+                s = float(span[0])
+                calls.append((int(K), s))
+                f = np.tile(np.asarray(fulls[s], float), (len(eta), 1))
+                e = np.tile(np.asarray((edges or {}).get(s, (-50.0, -50.0)), float), (len(eta), 1))
+                h = f + (0.01 if unresolved_first and len(calls) == 1 else 0.0)
+                return f, h, e
+            m = {"link": M.Link(), "phi": 1.0, "var_fn": W}
+            if hook:
+                m["score_law"] = SL
+            with mock.patch.object(M, "_grid_pass", stub):
+                sc, info = self.score(m, [0.0], [1.0], [[100, 100]])
+            return float(sc[0]), info, calls
+        ok2 = {2.0: (-20.0, -20.0)}
+        sc, info, calls = run({1.0: (t1 + 4e-13, t1 + 4e-13)})                  # (just inside: adequate)
+        self.assertEqual((info["extended"], info["grid"], [s for _, s in calls]), (0, 1, [1.0]))
+        self.assertEqual(sc, t1 + 4e-13)
+        sc, info, calls = run({1.0: (t1 - 4e-13, t1 - 4e-13), **ok2})            # (just outside: extended)
+        self.assertEqual((info["extended"], info["grid_unresolved"], [s for _, s in calls]), (1, 0, [1.0, 2.0]))
+        self.assertEqual(sc, -20.0)
+        need2 = self.brute_need(tab, M.Link(), 1.0, 0.0, 1.0, 2.0)[0]
+        self.assertGreaterEqual(calls[1][0], M.TRAP_KS[min(int(np.searchsorted(M.TRAP_KS, need2)), len(M.TRAP_KS) - 1)])
+        sc, info, calls = run({1.0: (t1 + 1.0, t1 - 4e-13), **ok2})              # (one replicate fails: extended)
+        self.assertEqual((info["extended"], [s for _, s in calls]), (1, [1.0, 2.0]))
+        sc, info, calls = run({1.0: (-1.0, -1.0), **ok2}, edges={1.0: (-50.0, -1.0)})   # (the end-node check alone)
+        self.assertEqual((info["extended"], [s for _, s in calls]), (1, [1.0, 2.0]))
+        cap = {s: (-2000.0, -2000.0) for s in (1.0, 2.0, 4.0, 8.0)}               # (below thr(8): fails at the cap)
+        self.assertLess(-2000.0, thr(4))
+        self.assertLess(-2000.0, thr(8))
+        sc, info, calls = run(cap)
+        self.assertEqual((info["extended"], info["grid_unresolved"], info["grid"], [s for _, s in calls]),
+                         (3, 1, 0, [1.0, 2.0, 4.0, 8.0]))
+        self.assertEqual(sc, -2000.0)
+        sc, info, calls = run({1.0: (-1.0, -1.0)}, unresolved_first=True)        # (adequate, unresolved: refined)
+        self.assertEqual((info["extended"], info["refined"], info["grid"], [s for _, s in calls]),
+                         (0, 1, 1, [1.0, 1.0]))
+        self.assertGreater(calls[1][0], calls[0][0])
+        for fulls in ({1.0: (t1 - 4e-13, t1 - 4e-13)}, {1.0: (-2000.0, -2000.0)}):   # (score law unset: main's)
+            sc, info, calls = run(fulls, hook=False)
+            self.assertEqual((info["extended"], info["grid"], [s for _, s in calls]), (0, 1, [1.0]))
+        self.assertEqual((M.TRAP_TAIL, M.TRAP_SD, M.TRAP_SPAN_MAX), (1e-4, 7.0, 8))
+
+    def test_T6_10_second_extension_recomputes_on_a_nonidentity_link(self):
+        """Codex's extension-coverage gap (WP2 review: the controller's recomputation was shown on one extension of an
+        identity link only): T610_TWO_EXT, two cases on spline links (the steep curve, k = B at fractions 0.01 and 0.1,
+        SD 0.2) whose ranges the tail bound (clarification 2, D1) extends twice, to span 4. Every grid used is at least
+        the bucket of the requirement recomputed on its own range (g_max, H^max and h; v5 3.3 'on every range
+        extension'), computed here by brute force; at span 4 that bucket exceeds the span-2 grid and what a
+        controller recomputing only on the first extension would use (main's span-scaled span-1 requirement, or the
+        span-2 requirement doubled), and on the first case the link's slope bound itself changes there (0.5 -> 2.5).
+        Each score agrees with its certified reference within 2 x TRAP_TOL, with no grid_unresolved pair."""
+        import sys as sys_
+        M, tab = self.M, self.tab
+        W, SL = self.hooks(tab)
+        top = len(M.TRAP_KS) - 1
+
+        def bkt(n):
+            return min(int(np.searchsorted(M.TRAP_KS, n)), top)
+        for i, (spec, mu, sd, k) in enumerate(T610_TWO_EXT):
+            lk = M.Link(np.array(spec[0]), np.array(spec[1]), spec[2], spec[3])
+            m = {"link": lk, "phi": 1.0, "var_fn": W, "score_law": SL}
+            eta = self.t610_eta(tab, spec, mu)
+            calls = []
+            real = M._grid_pass
+
+            def spy(lk_, m_, cnt, e_, s_, N, K, span, calls=calls, real=real):
+                calls.append((int(K), float(span[0])))
+                return real(lk_, m_, cnt, e_, s_, N, K, span)
+            with mock.patch.object(M, "_grid_pass", spy):
+                sc, info = self.score(m, [eta], [sd * sd], [[k]])
+            need = {s: self.brute_need(tab, lk, 1.0, eta, sd, s) for s in (1.0, 2.0, 4.0)}
+            r = self.t610_refs([(("val", spec, 1.0), "val", spec, 1.0, mu, sd, k)])[0]
+            print(f"T6-10 two extensions, case {i} (link knots {spec[0]}, fraction {mu}, SD {sd}, k {k}): grids (K, "
+                  f"span) {calls}, brute-force requirement per span {[(s, v[0]) for s, v in need.items()]}, g_max "
+                  f"{[(s, v[2]) for s, v in need.items()]}; score {float(sc[0]):.6f}, reference {r['log_I']:.6f}; "
+                  f"info {info}", file=sys_.stderr)
+            self.assertEqual(info["extended"], 2)
+            self.assertEqual(sorted({s for _, s in calls}), [1.0, 2.0, 4.0])
+            for K, s in calls:
+                self.assertGreaterEqual(K, M.TRAP_KS[bkt(need[s][0])], (i, K, s))
+            k2 = max(K for K, s in calls if s == 2.0)
+            self.assertGreater(bkt(need[4.0][0]), max(M.TRAP_KS.index(k2), bkt(need[1.0][0] * 4.0),
+                                                       bkt(need[2.0][0] * 2.0)))
+            if i == 0:
+                self.assertEqual((need[1.0][2], need[2.0][2], need[4.0][2]), (0.5, 0.5, 2.5))
+            self.assert_certified([(("two extensions", i), r)])
+            self.assertEqual(info["grid_unresolved"], 0)
+            self.assertLessEqual(abs(float(sc[0]) - r["log_I"]), 2 * M.TRAP_TOL)
 
     # ---------------------------------------------------------------- T6-11
     def test_T6_11_reference_self_test(self):
         """T6-11 (A_design_v5 PC-25; the ten fixtures frozen in v5), prior N(0, 1): (a) L = exp(-(e - d)^2 / (2 w^2)),
         w in {0.17, 1.0} x d in {0, 5, 15, 30}, log I = log w - log(1 + w^2) / 2 - d^2 / (2 (1 + w^2)); (b) L = 1,
         log I = 0; (c) L = Phi((-12 - e) / 0.5), I = Phi(-12 / sqrt 1.25). Each: |log I^ - log I| <= 1e-8 and the
-        halving certificate <= 1e-9; the stopping bound is checked at every extension step (each earlier step fails
-        it, the last meets it, with the finer value too); stops within 10-32 SD. Negative controls: under v4's 1e-6
+        halving certificate <= 1e-9, by the same refinement as T6-10's (A_design_v5 clarification 2, D2: halved until
+        certified, at most four times; these fixtures certify after one halving, as clarification 2 records, and each
+        one's halvings and final spacing are recorded); the stopping bound is checked at every extension step (each
+        earlier step fails it, the last meets it, with the final value too); stops within 10-32 SD. Negative controls:
+        under v4's 1e-6
         budget (a) w = 0.17, d = 30 and (c) miss by more than 1e-8 (omitted fractions about 2.48e-7 and 2.8e-7) while
         their certificates read about 0; truncated at +-10 SD, (a) d = 15, 30 and (c) are refused. The log tail is
         continuous where it switches from erfc to the continued fraction."""
@@ -2977,8 +3250,9 @@ class TestMapBankMode(unittest.TestCase):
             r = ref_log_integral(loglik, 1.0)
             err = abs(r["log_I"] - exact)
             worst = max(worst, err)
-            print(f"T6-11 ({kind}) w={w} d={d}: |log I^ - log I| {err:.2e}, certificate {r['certificate']:.2e}, "
-                  f"stopped at b = {r['b']:g} SD after {len(r['trace'])} step(s)", file=sys_.stderr)
+            print(f"T6-11 ({kind}) w={w} d={d}: |log I^ - log I| {err:.2e}, certificate {r['certificate']:.2e} after "
+                  f"{r['halvings']} halving(s) (final spacing {r['spacing']:g} SD), stopped at b = {r['b']:g} SD after "
+                  f"{len(r['trace'])} step(s)", file=sys_.stderr)
             self.assertLessEqual(err, 1e-8, (kind, w, d))
             self.assertLessEqual(r["certificate"], REF_CERT, (kind, w, d))
             self.assertTrue(all(not t[3] for t in r["trace"][:-1]) and r["trace"][-1][3] and r["fine_bound_ok"])
