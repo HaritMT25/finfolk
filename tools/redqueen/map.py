@@ -46,7 +46,8 @@ empirical-logit replicate variance of obslaw's frozen fitter table at the fitted
 shrinks each cell's replicate variance toward phi W with the bank's prior degrees of freedom (capture_scale;
 the bank artifact's map_variance rule, obslaw.MAP_VARIANCE_RULE; nu0 None: full pooling); score_law (A, L) is
 the bank's latent law, which the count score uses at mu^ = m_z^-1(predicted empirical logit) with phi scaling
-the latent variance (_score_law), the integration step bounding the composed location's slope (_score_need). A
+the latent variance (_score_law), the integration step bounding the composed location's slope (_score_need), the
+integration range certified by the end-node check and a tail bound (_tail_ok; A_design_v5 clarification 2, D1). A
 rep_prior or score_law without a var_fn is refused. THIS IS ALSO THE PRODUCTION MAP'S PATH (A_design_v5 3.3,
 design v4 D:711): the production map fit must call fit_best with the same bank-derived var_fn (W), rep_prior
 (nu0_C) and score_law from the adopted bank/3 artifact's frozen tables; a different production variance model
@@ -562,9 +563,14 @@ def capture_scale(V, zrep, R, nu0=None):
     cells' variances are shrunk toward the pooled working variance, v~_e = (nu0 phi V_e + (R - 1) zrep_e) /
     (nu0 + R - 1) with phi as above (unchanged definition; V_e and zrep_e both empirical-logit variances), and
     w_e = (1 / v~_e) / mean(1 / v~), unit = 1 / (R mean(1 / v~)), so unit / w_e = v~_e / R exactly. nu0 None
-    (full pooling, planning, numerical) is exactly the rule above. nu0 needs V (refused without it), and a
-    data set with no replicate variance in any cell (phi = 0, so v~ = 0: the shrinkage is undefined) is
-    refused, never floored."""
+    (full pooling, planning, numerical) is exactly the rule above. nu0 needs V (refused without it).
+    The nu0 branch is evaluated in the algebraically identical, overflow-safe form of A_design_v5 clarification 2
+    (implementation note): a = 1 / (1 + (R - 1) / nu0), v~_e = a phi V_e + (1 - a) zrep_e, so every positive finite
+    nu0 gives the formula's value (no cap on nu0, no variance floor). Its domain (clarification 2, D3): a
+    non-finite V or zrep is refused; a data set with no replicate variance in any cell (phi = 0, so every v~_e = 0
+    and the inverse-variance weights are undefined) is refused with that context, never floored and never fully
+    pooled instead; and phi, every v~_e, mean(1 / v~), every w_e and unit must be finite and positive (refused
+    otherwise)."""
     nu0 = _check_nu0(nu0)
     zrep = np.asarray(zrep, float)
     if V is None:
@@ -577,13 +583,26 @@ def capture_scale(V, zrep, R, nu0=None):
         M = float(np.mean(1.0 / V))
         phi = float(np.mean(zrep / V))
         return (1.0 / V) / M, max(phi / (R * M), UNIT_FLOOR), phi
+    if not (np.all(np.isfinite(V)) and np.all(np.isfinite(zrep))):
+        raise ValueError("capture_scale: a non-finite value in V or zrep: the nu0 shrinkage is refused "
+                         "(A_design_v5 clarification 2, D3)")
+    if not np.any(zrep):
+        raise ValueError("capture_scale: every replicate variance is zero (phi = 0), so every shrunk cell variance "
+                         "v~ is 0 and the inverse-variance weights are undefined: the nu0 shrinkage is refused, not "
+                         "floored (A_design_v5 clarification 2, D3)")
     phi = float(np.mean(zrep / V))
-    vt = (nu0 * phi * V + (R - 1) * zrep) / (nu0 + R - 1)
-    if not np.all(vt > 0):
-        raise ValueError("capture_scale: a shrunk cell variance is not positive (no replicate variance in any cell, "
-                         "or a non-finite input): the nu0 shrinkage is undefined (refused)")
-    Mt = float(np.mean(1.0 / vt))
-    return (1.0 / vt) / Mt, 1.0 / (R * Mt), phi
+    a = 1.0 / (1.0 + (R - 1) / nu0)                      # (= nu0 / (nu0 + R - 1), formed without nu0 phi V)
+    vt = a * phi * V + (1.0 - a) * zrep
+    with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
+        Mt = float(np.mean(1.0 / vt))
+        w = (1.0 / vt) / Mt
+    unit = 1.0 / (R * Mt) if math.isfinite(Mt) and Mt > 0.0 else math.nan
+    if not (math.isfinite(phi) and phi > 0.0 and np.all(np.isfinite(vt)) and np.all(vt > 0.0) and math.isfinite(Mt)
+            and Mt > 0.0 and np.all(np.isfinite(w)) and np.all(w > 0.0) and math.isfinite(unit) and unit > 0.0):
+        raise ValueError(f"capture_scale: a derived quantity of the nu0 shrinkage is not finite and positive (phi "
+                         f"{phi!r}, v~ in [{float(np.min(vt))!r}, {float(np.max(vt))!r}], mean(1 / v~) {Mt!r}, unit "
+                         f"{unit!r}): refused (A_design_v5 clarification 2, D3)")
+    return w, unit, phi
 
 
 def pair_variance(r, s2, grid=200, iters=200, full=False):
@@ -1070,6 +1089,33 @@ TRAP_TOL = 1e-3                          # (the a-posteriori check, log units: f
 TRAP_SPAN_MAX = 8                        # (the range may double up to +-TRAP_SD x 8 = +-56 prior SDs)
 TRAP_EDGE = math.log(1e-10)              # (an end node's share of the integral above this: the range is extended)
 VMIN_GRID = np.linspace(-20.0, 20.0, 20001)    # (the logit grid on which the variance function's minimum is taken)
+TRAP_TAIL = 1e-4                         # (bank mode: the omitted prior mass 2 PhiBar(b) <= this share of the integral)
+_TAIL_SWITCH = 25.0                      # (_log_2sf: math.erfc below, Laplace's continued fraction at and above)
+_TAIL_CF_TERMS = 60
+
+
+def _log_2sf(b):
+    """log(2 PhiBar(b)) for a scalar b >= 0, PhiBar the standard normal upper tail, in log space so that it never
+    underflows: log erfc(b / sqrt 2) below 25 and, at and above, log 2 - b^2/2 - log sqrt(2 pi) - log(b + 1/(b + 2/(b +
+    3/(b + ...)))) (Laplace's continued fraction, 60 terms). The T6-10 reference's method, copied here (the reference
+    shares no code with the scorer; A_design_v5 clarification 2, D1)."""
+    b = float(b)
+    if b < _TAIL_SWITCH:
+        return math.log(math.erfc(b / math.sqrt(2.0)))
+    t = 0.0
+    for k in range(_TAIL_CF_TERMS, 0, -1):
+        t = k / (b + t)
+    return math.log(2.0) - 0.5 * b * b - 0.5 * math.log(2.0 * math.pi) - math.log(b + t)
+
+
+def _tail_ok(full, span):
+    """The bank-mode tail bound of a grid pass on +-b = TRAP_SD x span prior SDs (A_design_v5 clarification 2, D1),
+    per pair: for EVERY replicate, log(2 PhiBar(b)) <= log(TRAP_TAIL) + log I^, where log I^ = full + log(1 - 2
+    PhiBar(b)) is the pass's estimate (full: Gaussian weights normalized over the grid) converted to the unnormalized
+    integral over [-b, b]. Rigorous because the count probability is <= 1: the omitted part of the integral is at most
+    2 PhiBar(b), so the omitted fraction is at most TRAP_TAIL (the log score low by at most log(1 + TRAP_TAIL))."""
+    lt = _log_2sf(TRAP_SD * span)
+    return np.all(lt <= math.log(TRAP_TAIL) + (full + math.log1p(-math.exp(lt))), axis=1)
 
 
 def _logsumexp(a, axis):
@@ -1131,10 +1177,15 @@ def pred_count_lpd(D, m, idx, cnt, N, own=None, info=None):
     _score_law (the plain case likewise); the exact case is never reached (a score law needs a var_fn: refused
     otherwise); the step accounts for the composed location H(G(eta)), H = A piecewise linear with segment slopes
     kappa_j: h_e = min(sd_e, TRAP_H s_lat / (g_max,e max(H^max_e, 1e-12))) per pair (_score_need), recomputed on
-    every range extension with the node requirement ceil(2 TRAP_SD span_e sd_e / h_e) + 1; everything else (the
-    buckets, the checks, beyond_rule, grid_unresolved, the refusal) is the rule above. info also gains
-    table_extrapolated: the score law's evaluations outside its table in this call. score_law unset: this
-    function is unchanged (main's rule and integrand, byte for byte)."""
+    every range extension with the node requirement ceil(2 TRAP_SD span_e sd_e / h_e) + 1; a pass is
+    RANGE-ADEQUATE only if the end-node check AND the tail bound hold for every replicate (_tail_ok: log(2
+    PhiBar(b)) <= log(TRAP_TAIL) + log I^ on +-b = TRAP_SD span prior SDs; A_design_v5 clarification 2, D1: the
+    end-node share alone cannot see a larger mode beyond the range), and either failure extends the range exactly
+    as the end-node check does (recomputed requirement, counted in extended; still inadequate at the cap: kept and
+    counted in grid_unresolved); everything else (the buckets, the resolution check, beyond_rule, grid_unresolved,
+    the refusal) is the rule above. info also gains table_extrapolated: the score law's evaluations outside its
+    table in this call. score_law unset: this function is unchanged (main's rule and integrand, byte for byte; no
+    tail bound)."""
     eta, s2 = pred_eta(D, m, idx, own)
     lk = m["link"]
     sl = m.get("score_law")
@@ -1183,15 +1234,17 @@ def pred_count_lpd(D, m, idx, cnt, N, own=None, info=None):
                     with np.errstate(invalid="ignore"):
                         err = np.max(np.abs(full - half), axis=1)
                         res_ok = err <= TRAP_TOL                                   # (NaN: not ok)
-                        edge_ok = np.all(edge <= TRAP_EDGE, axis=1)
+                        range_ok = np.all(edge <= TRAP_EDGE, axis=1)               # (main's end-node check)
+                        if sl is not None:            # (bank mode: and the tail bound, every replicate; clar. 2 D1)
+                            range_ok &= _tail_ok(full, s_)
                     fin = np.isfinite(full).all(axis=1)
-                    ok = res_ok & edge_ok & fin
+                    ok = res_ok & range_ok & fin
                     out[r_[ok]] = full[ok].mean(axis=1)
                     st["grid"] += int(ok.sum())
                     if ok.any():
                         st["max_check"] = max(st["max_check"], float(err[ok].max()))
                     for i in np.flatnonzero(~ok):
-                        if fin[i] and not edge_ok[i] and s_ < TRAP_SPAN_MAX:          # (extend the range)
+                        if fin[i] and not range_ok[i] and s_ < TRAP_SPAN_MAX:         # (extend the range)
                             s2_ = 2 * s_
                             if sl is None:
                                 nb2 = max(int(b), int(np.searchsorted(TRAP_KS, nr_[i] * s2_)))
