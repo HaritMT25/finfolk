@@ -2048,6 +2048,7 @@ class TestMap(unittest.TestCase):
 # Red Queen recovery option A, work package 2: tests T6-2, T6-7, T6-8, T6-10, T6-11 of A_design_v5 section 5 (and
 # T6-1's map.fit clause). Synthetic only (D9): fitter tables from synthetic curves, counts drawn from the law here.
 import math  # noqa: E402
+from fractions import Fraction  # noqa: E402
 from unittest import mock  # noqa: E402
 
 # The T6-10 REFERENCE INTEGRATOR (A_design_v5 T6-10 and PC-25, frozen; its refinement amended by A_design_v5
@@ -2405,6 +2406,48 @@ T610_GAP = {("val", 0.002, 1.0, 324), ("val", 0.01, 1.0, 324), ("val", 0.1, 0.5,
 # curve (test_T6_10_second_extension_recomputes_on_a_nonidentity_link).
 T610_TWO_EXT = [(((-8.0, -4.0, 4.0, 8.0), (-8.0, -6.0, -2.0, 8.0), 0.0, 1.0), 0.01, 0.2, 324),   # (slope 0.5, then 2.5)
                 (((-12.0, -3.0, 3.0, 12.0), (-12.0, -1.0, 1.0, 12.0), 0.0, 1.0), 0.1, 0.2, 324)]
+# The nu0 shrinkage's arithmetic (A_design_v5 clarification 2, Revision 1; Codex's WP2 re-review P2: the reciprocal
+# form a = 1 / (1 + (R - 1) / nu0) overflowed to a = 0 for a very small nu0). Synthetic (V, zrep) sets for the sweep of
+# nu0 over the float range: Codex's two known answers' sets (the large-prior one gives v~ = [2, 1] at every nu0); round
+# 2's six cells (a zero-variance cell: its v~ is a subnormal float at the low end); a tiny pooled variance (phi V =
+# 5e-281: up to nu0 ~ 3e-28 the zero cell's v~ rounds to 0 or mean(1 / v~) overflows, i.e. the formula's value is
+# outside the float range there); 256 cells, 255 with zero variance (at nu0 ~ 1e-304 every derived quantity is a normal
+# float but the sum of the 1 / v~ is not: only a scaled evaluation of mean(1 / v~) returns them).
+NU0_SETS = {
+    "codex_large": ([0.5, 0.25], [2.0, 1.0]),
+    "codex_small": ([1.0, 0.001], [0.0, 1.0]),
+    "six_cells": ([0.5, 0.25, 0.1, 0.04, 0.3, 0.0123], [0.6, 0.2, 0.15, 0.01, 0.0, 0.031]),
+    "tiny_pooled": ([1.0, 1.0], [1e-280, 0.0]),
+    "256_cells": ([1.0] * 256, [1.0] + [0.0] * 255),
+}
+NU0_OVF = Fraction(2) ** 1024 - Fraction(2) ** 970     # (an exact value at or above this rounds to inf)
+NU0_MINN = Fraction(2) ** -1022                         # (the smallest positive normal float)
+NU0_ZERO = Fraction(2) ** -1075                         # (a positive exact value at or below this rounds to 0)
+
+
+def nu0_exact(V, zrep, R, nu0):
+    """capture_scale's nu0 shrinkage in exact rational arithmetic (A_design_v5 3.3): V after main's 1e-8 floor, phi =
+    mean(zrep / V), a = nu0 / (nu0 + R - 1), v~_e = a phi V_e + (1 - a) zrep_e, mean(1 / v~), w_e = (1 / v~_e) /
+    mean(1 / v~), unit = 1 / (R mean(1 / v~)); identical cells grouped -> (phi, {cell: v~}, mean(1 / v~), {cell: w},
+    unit, {cell: multiplicity}), a cell being its (floored V, zrep)."""
+    V = np.maximum(np.asarray(V, float), 1e-8)
+    mult = Counter(zip(V.tolist(), np.asarray(zrep, float).tolist()))
+    n = len(V)
+    phi = sum(c * Fraction(z) / Fraction(v) for (v, z), c in mult.items()) / n
+    a = Fraction(nu0) / (Fraction(nu0) + R - 1)
+    vt = {k: a * phi * Fraction(k[0]) + (1 - a) * Fraction(k[1]) for k in mult}
+    mt = sum(c / vt[k] for k, c in mult.items()) / n
+    return phi, vt, mt, {k: 1 / vt[k] / mt for k in mult}, 1 / (R * mt), mult
+
+
+def nu0_class(q):
+    """A positive exact value q: 'U' outside the float range (rounds to 0 or to inf), 'S' in the subnormal range
+    (gradual underflow: representable with fewer significant bits), 'N' a normal float."""
+    if q >= NU0_OVF or q <= NU0_ZERO:
+        return "U"
+    return "N" if q >= NU0_MINN else "S"
+
+
 _BANK = {}
 _T610_REF = {}
 
@@ -2534,48 +2577,166 @@ class TestMapBankMode(unittest.TestCase):
                 self.assertEqual((type(got[1]), got[1], type(got[2]), got[2]),
                                  (type(want[1]), want[1], type(want[2]), want[2]))
 
-    def test_T6_2_nu0_overflow_safe_and_domain(self):
-        """T6-2 with A_design_v5 clarification 2 (D3 and its implementation note; Codex WP2 review P2): every positive
-        finite nu0 gives the formula's value -- Codex's known answer nu0 = 1e308, V = [0.5, 0.25], zrep = [2, 1], R = 6
-        (phi = 4): v~ = [2, 1], w = [2/3, 4/3], unit = 2/9 (at a4227b6 nu0 phi V overflowed: v~ = inf, unit 1/0) -- and
-        the formula against exact rational arithmetic for nu0 from 1e-300 to the largest float; a non-finite V or
-        zrep is refused with that context; no replicate variance in any cell (phi = 0, every v~ = 0) is refused with
-        that context, never floored; a v~ that underflows to 0 is refused by the positivity check, never divided."""
-        from fractions import Fraction as F
-        import sys as sys_
+    def test_T6_2_nu0_known_answers_at_both_ends(self):
+        """T6-2 with A_design_v5 clarification 2, Revision 1 (its implementation note; Codex's WP2 reviews): Codex's two
+        known answers, each against exact rational arithmetic (nu0_exact) and against the stated values. nu0 = 1e308
+        (the branch nu0 >= R - 1), V = [0.5, 0.25], zrep = [2, 1], R = 6 (phi = 4): v~ = [2, 1], w = [2/3, 4/3], unit =
+        2/9 (a4227b6's numerator-first form overflowed). nu0 = 1e-308 (the branch nu0 < R - 1), V = [1, 0.001], zrep =
+        [0, 1] (phi = 500): v~ ~ [1e-306, 1], w ~ [2, 2e-306], unit ~ 3.333e-307, a valid fit (922320e's reciprocal
+        form: (R - 1) / nu0 = inf, a = 0, v~_0 = 0, a false refusal). v~ is read back as R unit / w_e."""
         M = self.M
         R = 6
-        with self.subTest("Codex's known answer, nu0 = 1e308"):
-            w, unit, phi = M.capture_scale(np.array([0.5, 0.25]), np.array([2.0, 1.0]), R, nu0=1e308)
-            self.assertEqual(phi, 4.0)
-            self.assertTrue(np.allclose(w, [2.0 / 3.0, 4.0 / 3.0], rtol=1e-15, atol=0), w)
-            self.assertAlmostEqual(unit, 2.0 / 9.0, delta=1e-16)
-            self.assertTrue(np.allclose(R * unit / w, [2.0, 1.0], rtol=1e-15, atol=0))          # (v~ = R unit / w)
+        for nu0, V, Z, want in ((1e308, [0.5, 0.25], [2.0, 1.0], ([2.0, 1.0], [2.0 / 3.0, 4.0 / 3.0], 2.0 / 9.0)),
+                                (1e-308, [1.0, 0.001], [0.0, 1.0], ([1e-306, 1.0], [2.0, 2e-306], 1.0 / 3e306))):
+            with self.subTest("Codex's known answer", nu0=nu0):
+                try:
+                    w, unit, phi = M.capture_scale(np.array(V), np.array(Z), R, nu0=nu0)
+                except ValueError as e:
+                    self.fail(f"nu0 {nu0!r}: a fit whose every derived quantity is a normal float was refused: {e}")
+                fphi, vt, mt, fw, funit, mult = nu0_exact(V, Z, R, nu0)
+                self.assertEqual({nu0_class(q) for q in [fphi, mt, funit, *vt.values(), *fw.values()]}, {"N"})
+
+                def rel(x, q):
+                    return float(abs(Fraction(float(x)) - q) / q)
+                self.assertLessEqual(rel(phi, fphi), 1e-15)
+                self.assertLessEqual(rel(unit, funit), 1e-13, (nu0, unit, float(funit)))
+                for i, k in enumerate(zip(V, Z)):
+                    self.assertLessEqual(rel(w[i], fw[k]), 1e-13, (nu0, i, w, float(fw[k])))
+                    self.assertLessEqual(rel(R * unit / w[i], vt[k]), 1e-13, (nu0, i, float(vt[k])))
+                self.assertTrue(np.allclose(R * unit / w, want[0], rtol=1e-12, atol=0), (nu0, R * unit / w))
+                self.assertTrue(np.allclose(w, want[1], rtol=1e-12, atol=0), (nu0, w))
+                self.assertLessEqual(abs(unit - want[2]), 1e-12 * want[2], (nu0, unit))
+                print(f"T6-2 known answer nu0 {nu0!r}: phi {phi!r}, v~ = R unit / w {(R * unit / w).tolist()}, w "
+                      f"{w.tolist()}, unit {unit!r}; vs exact: unit {rel(unit, funit):.2e}, w "
+                      f"{max(rel(w[i], fw[k]) for i, k in enumerate(zip(V, Z))):.2e}")
+
+    def test_T6_2_nu0_sweep_smallest_normal_to_largest_float(self):
+        """T6-2 with A_design_v5 clarification 2, Revision 1 ('any positive finite nu0 the loader accepts must give the
+        formula's value wherever that value is representable'): nu0 = every power of two and 1.5 x power of two from
+        the smallest positive normal float 2^-1022 to the largest finite float, every decade in that range, R - 1 and
+        its two float neighbours (4711 values; both branches of the two-sided form, nu0 >= R - 1 and below) on each of
+        NU0_SETS, against exact rational arithmetic. Each point is classed by its exact derived quantities (phi, every
+        v~_e, mean(1 / v~), every w_e, unit; nu0_class): N, all normal floats: returned, every quantity within 1e-13
+        (relative) and R unit / w_e = v~_e; S, some in the subnormal range and none outside the float range: returned,
+        within the rounding bound of subnormal intermediates (|x - exact| <= (4 d + 1e-13) exact + 2 n 2^-1074, d the
+        largest 2^-1072 (1 + phi V_e + zrep_e) / v~_e + 1e-13); U, some exact quantity outside the float range (it
+        rounds to 0 or to inf): refused (the finiteness / positivity check). A refusal at an N or S point is an
+        artifact of the arithmetic and fails (922320e: the reciprocal form at the low end; main's unscaled mean(1 /
+        v~), whose sum of 1 / v~ overflows on 256 cells where every derived quantity is a normal float). The classes,
+        both branches' counts and every U point's reason (the exact quantity outside the range) are printed."""
+        M = self.M
+        R = 6
+        pts = {sys.float_info.max, float(R - 1), math.nextafter(float(R - 1), 0.0),
+               math.nextafter(float(R - 1), math.inf)}
+        for k in range(-1022, 1024):
+            pts.update([math.ldexp(1.0, k), math.ldexp(1.5, k)])            # (1.5 x 2^1023 < the largest float)
+        pts.update(float(f"1e{k}") for k in range(-307, 309))
+        pts = sorted(x for x in pts if x >= 2.0 ** -1022)
+        tiny = Fraction(2) ** -1074
+        print(f"T6-2 nu0 sweep: {len(pts)} values of nu0 from {pts[0]!r} to {pts[-1]!r}, "
+              f"{sum(x >= R - 1 for x in pts)} with nu0 >= R - 1 = {R - 1} and {sum(x < R - 1 for x in pts)} below")
+        failures = []
+        for name, (V, Z) in NU0_SETS.items():
+            cells = list(zip(np.maximum(np.asarray(V, float), 1e-8).tolist(), np.asarray(Z, float).tolist()))
+            n = len(cells)
+            cls_n, ref_n, reasons, s_pts, worst, bad = Counter(), Counter(), defaultdict(list), [], 0.0, []
+            for nu0 in pts:
+                phi, vt, mt, fw, funit, mult = nu0_exact(V, Z, R, nu0)
+                qs = [("phi", phi), ("mean(1 / v~)", mt), ("unit", funit)] + \
+                     [(f"v~ of cell {k}", q) for k, q in vt.items()] + [(f"w of cell {k}", q) for k, q in fw.items()]
+                cl = [(lab, q, nu0_class(q)) for lab, q in qs]
+                c = "U" if any(x[2] == "U" for x in cl) else ("S" if any(x[2] == "S" for x in cl) else "N")
+                cls_n[c] += 1
+                try:
+                    got, err = M.capture_scale(V, Z, R, nu0=nu0), None
+                except ValueError as e:
+                    got, err = None, str(e)
+                    ref_n[c] += 1
+                if c == "U":
+                    why = " & ".join(f"{lab} {'overflows' if q >= NU0_OVF else 'rounds to 0'}" for lab, q, k in cl
+                                     if k == "U")
+                    reasons[why].append(nu0)
+                    if got is not None or "not finite and positive" not in err:
+                        bad.append(f"nu0 {nu0!r}: {why} (outside the float range) but NOT refused ({err})")
+                    continue
+                if got is None:
+                    bad.append(f"nu0 {nu0!r} (class {c}: every exact derived quantity is in the float range) REFUSED: "
+                               f"{err}")
+                    continue
+                w, unit, ph = got
+                wf = {k: float(q) for k, q in fw.items()}
+                wx = np.array([wf[k] for k in cells])
+                if c == "N":
+                    vf = {k: float(q) for k, q in vt.items()}
+                    vx = np.array([vf[k] for k in cells])
+                    e = max(abs(ph - float(phi)) / float(phi), abs(unit - float(funit)) / float(funit),
+                            float(np.max(np.abs(w - wx) / wx)), float(np.max(np.abs(R * unit / w - vx) / vx)))
+                    worst = max(worst, e)
+                    if not e <= 1e-13:
+                        bad.append(f"nu0 {nu0!r} (N): largest relative error {e:.3e} > 1e-13")
+                    continue
+                d = max(Fraction(2) ** -1072 * (1 + phi * Fraction(k[0]) + Fraction(k[1])) / vt[k] for k in mult) \
+                    + Fraction(1, 10 ** 13)
+                s_pts.append(f"{nu0!r} ({', '.join(lab for lab, q, k in cl if k == 'S')[:120]})")
+                over = [(lab, x, q) for lab, x, q in [("unit", unit, funit)] +
+                        [(f"w[{i}]", w[i], fw[k]) for i, k in enumerate(cells)]
+                        if not abs(Fraction(float(x)) - q) <= (4 * d + Fraction(1, 10 ** 13)) * q + 2 * n * tiny]
+                if abs(ph - float(phi)) > 1e-13 * float(phi) or over:
+                    bad.append(f"nu0 {nu0!r} (S): beyond the subnormal rounding bound: "
+                               f"{[(lab, float(x), float(q)) for lab, x, q in over[:3]]}")
+            print(f"T6-2 nu0 sweep {name} ({n} cells): N {cls_n['N']} ({ref_n['N']} refused; worst relative error "
+                  f"{worst:.2e}), S {cls_n['S']} ({ref_n['S']} refused), U {cls_n['U']} ({ref_n['U']} refused); "
+                  f"{len(bad)} failing")
+            for why, xs in reasons.items():
+                print(f"    U: {why} at {len(xs)} values of nu0 in [{min(xs)!r}, {max(xs)!r}]")
+            for s in s_pts:
+                print(f"    S: nu0 {s}")
+            failures += [f"{name}: {b}" for b in bad]
+        self.assertFalse(failures, f"{len(failures)} sweep points fail; the first 12:\n" + "\n".join(failures[:12]))
+
+    def test_T6_2_nu0_domain_raw_inputs(self):
+        """T6-2 with A_design_v5 clarification 2 (D3; Revision 1: the raw inputs are validated before main's floor;
+        Codex's WP2 re-review P2): with a prior, a non-finite V (+inf, -inf, NaN) or zrep is refused BEFORE main's
+        1e-8 floor of V -- 922320e floored V = -inf to 1e-8 and returned weights (Codex's input: V = [-inf], zrep =
+        [1], R = 6, nu0 = 4: phi 1e8, unit ~ 1/6); finite values take the floor exactly as before (a V below 1e-8
+        gives the bytes of the floored V); nu0 None keeps main's bytes on every one of these inputs (no check); no
+        replicate variance in any cell (phi = 0) is refused with that context, never floored; a v~ whose exact value
+        rounds to 0 (outside the float range) is refused by the positivity check, never divided."""
+        M = self.M
+        R = 6
         V = np.array([0.5, 0.25, 0.1, 0.04, 0.3, 0.0123])
         zrep = np.array([0.6, 0.2, 0.15, 0.01, 0.0, 0.031])
-        for nu0 in (1e-300, 1e-12, 0.37, 4.0, 1e12, 1e200, 1e300, 1e308, sys_.float_info.max):
-            with self.subTest("the formula against exact rationals", nu0=nu0):
-                w, unit, phi = M.capture_scale(V, zrep, R, nu0=nu0)
-                fv, fz, fn = [F(float(v)) for v in V], [F(float(v)) for v in zrep], F(nu0)
-                fphi = sum(z / v for z, v in zip(fz, fv)) / len(fv)
-                vt = [(fn * fphi * v + (R - 1) * z) / (fn + R - 1) for z, v in zip(fz, fv)]
-                mt = sum(1 / x for x in vt) / len(vt)
-                self.assertTrue(np.allclose(w, [float((1 / x) / mt) for x in vt], rtol=1e-13, atol=0), (nu0, w))
-                self.assertAlmostEqual(unit, float(1 / (R * mt)), delta=1e-13 * float(1 / (R * mt)))
-                self.assertTrue(np.allclose(R * unit / w, [float(x) for x in vt], rtol=1e-13, atol=0))
-        for label, Vb, zb in (("zrep inf", V, np.r_[np.inf, zrep[1:]]), ("zrep nan", V, np.r_[zrep[:-1], np.nan]),
-                              ("V inf", np.r_[V[:-1], np.inf], zrep), ("V nan", np.r_[np.nan, V[1:]], zrep),
-                              ("zrep -inf", V, np.r_[zrep[:2], -np.inf, zrep[3:]])):
-            with self.subTest("a non-finite input is refused", input=label):
+        ns = main_map()
+        cases = (("zrep +inf", V, np.r_[np.inf, zrep[1:]]), ("zrep -inf", V, np.r_[zrep[:2], -np.inf, zrep[3:]]),
+                 ("zrep nan", V, np.r_[zrep[:-1], np.nan]), ("V +inf", np.r_[V[:-1], np.inf], zrep),
+                 ("V nan", np.r_[np.nan, V[1:]], zrep), ("V -inf", np.r_[V[:2], -np.inf, V[3:]], zrep),
+                 ("V -inf (Codex's input)", np.array([-np.inf]), np.array([1.0])))
+        for label, Vb, zb in cases:
+            with self.subTest("a non-finite input is refused before the floor", input=label):
                 with self.assertRaisesRegex(ValueError, "non-finite value in V or zrep"):
                     M.capture_scale(Vb, zb, R, nu0=4.0)
+            with self.subTest("nu0 None: main's bytes on the same input (no check)", input=label):
+                with np.errstate(all="ignore"):
+                    want = ns["capture_scale"](Vb, zb, R)
+                    for got in (M.capture_scale(Vb, zb, R), M.capture_scale(Vb, zb, R, nu0=None)):
+                        self.assertEqual(got[0].tobytes(), want[0].tobytes())
+                        self.assertEqual((type(got[1]), type(got[2])), (type(want[1]), type(want[2])))
+                        self.assertEqual(np.array([got[1], got[2]]).tobytes(), np.array([want[1], want[2]]).tobytes())
+        with self.subTest("finite values below the floor take it exactly as before"):
+            Vlow = np.r_[V[:2], -3.0, 0.0, 1e-12, V[5:]]
+            for nu0 in (0.37, 4.0, 1e12):
+                got, want = M.capture_scale(Vlow, zrep, R, nu0=nu0), M.capture_scale(np.maximum(Vlow, 1e-8), zrep, R,
+                                                                                    nu0=nu0)
+                self.assertEqual((got[0].tobytes(), got[1], got[2]), (want[0].tobytes(), want[1], want[2]))
         for nu0 in (4.0, 1e308, 1e-300):
             with self.subTest("phi = 0 is refused with that context", nu0=nu0):
                 with self.assertRaisesRegex(ValueError, r"every replicate variance is zero \(phi = 0\).*not floored"):
                     M.capture_scale(V, np.zeros(len(V)), R, nu0=nu0)
-        with self.subTest("a shrunk variance that underflows to 0 is refused (positivity), never divided"):
+        with self.subTest("a v~ whose exact value rounds to 0 is refused (positivity), never divided"):
+            phi, vt, mt, fw, funit, mult = nu0_exact(V, zrep, R, 5e-324)
+            self.assertEqual(nu0_class(vt[(0.3, 0.0)]), "U")                # (the zero-variance cell: ~3.1e-325)
             with self.assertRaisesRegex(ValueError, "not finite and positive"):
-                M.capture_scale(V, zrep, R, nu0=5e-324)                  # (the zero-variance cell's v~ underflows)
+                M.capture_scale(V, zrep, R, nu0=5e-324)
 
     # ---------------------------------------------------------------- T6-7
     def bank_data(self, D, idx, seed, quantum=None, nu0_het=None):
