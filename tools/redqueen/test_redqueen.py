@@ -55,6 +55,39 @@ def wr(path, data, mode=None):
 POOR_PAYLOAD = "".join(hashlib.sha256(str(i).encode()).hexdigest() for i in range(3200))
 
 
+# (Codex re-review of a5c366c, P2: a central-directory compression method the packer never writes, which
+# zipfile then decodes by: STORED, BZIP2, LZMA (a5c366c: LZMAError, uncaught), Zstandard (Python 3.14's
+# zipfile decodes it: ZstdError, uncaught; earlier ones do not know it), and one no zipfile knows; shared with
+# test_noisebank / test_refsel's collection matrix: Codex re-review of 6407f80, P2)
+METHODS = {"stored": 0, "bzip2": 12, "lzma": 14, "zstd": 93, "unknown": 99}
+
+
+def set_chunk_member_method(path, arc, method):
+    """The chunk at `path` with the central-directory compression method of its member `arc` changed from
+    DEFLATE (8) to `method`: one byte, the size kept, any index untouched."""
+    raw = bytearray(rqlib.read_bytes(path))
+    sig, _, _, _, n, _, off, clen = struct.unpack("<IHHHHIIH", raw[-22:])
+    assert sig == 0x06054B50 and clen == 0, (sig, clen)
+    for _ in range(n):
+        assert raw[off:off + 4] == b"PK\x01\x02", off
+        ln, lm, lk = struct.unpack("<HHH", raw[off + 28:off + 34])
+        if raw[off + 46:off + 46 + ln] == arc.encode():
+            assert raw[off + 10:off + 12] == b"\x08\x00", raw[off + 10:off + 12]
+            raw[off + 10] = method
+            wr(path, bytes(raw))
+            with zipfile.ZipFile(path) as z:
+                assert z.getinfo(arc).compress_type == method
+            return
+        off += 46 + ln + lm + lk
+    raise AssertionError(f"{arc} is not in {path}")
+
+
+def tree_bytes(root):
+    """{relative path: bytes} of every file under root (what a refusal must leave as it was)."""
+    return {os.path.relpath(os.path.join(dp, f), root): rqlib.read_bytes(os.path.join(dp, f))
+            for dp, _, fs in os.walk(root) for f in fs}
+
+
 @contextlib.contextmanager
 def members_opened():
     """-> the names of every zip member opened while inside (z.read and testzip open each member they
@@ -1027,31 +1060,13 @@ class TestStore(unittest.TestCase):
         raw[i.header_offset + 30 + n + x + i.compress_size // 2] ^= 0x55
         wr(p, bytes(raw))
 
-    # (Codex re-review of a5c366c, P2: a central-directory compression method the packer never writes, which
-    # zipfile then decodes by: STORED, BZIP2, LZMA (a5c366c: LZMAError, uncaught), Zstandard (Python 3.14's
-    # zipfile decodes it: ZstdError, uncaught; earlier ones do not know it), and one no zipfile knows)
-    METHODS = {"stored": 0, "bzip2": 12, "lzma": 14, "zstd": 93, "unknown": 99}
+    METHODS = METHODS        # (the module's: Codex re-review of a5c366c, P2)
 
     @staticmethod
     def set_member_method(root, cid, method, member="bundle.json"):
         """chunk_000001.zip with the central-directory compression method of cid's `member` changed from
-        DEFLATE (8) to `method`: one byte, the size kept, the index untouched."""
-        p = os.path.join(root, store.CHUNKS, "chunk_000001.zip")
-        raw = bytearray(rqlib.read_bytes(p))
-        sig, _, _, _, n, _, off, clen = struct.unpack("<IHHHHIIH", raw[-22:])
-        assert sig == 0x06054B50 and clen == 0, (sig, clen)
-        for _ in range(n):
-            assert raw[off:off + 4] == b"PK\x01\x02", off
-            ln, lm, lk = struct.unpack("<HHH", raw[off + 28:off + 34])
-            if raw[off + 46:off + 46 + ln] == f"{cid}/{member}".encode():
-                assert raw[off + 10:off + 12] == b"\x08\x00", raw[off + 10:off + 12]
-                raw[off + 10] = method
-                wr(p, bytes(raw))
-                with zipfile.ZipFile(p) as z:
-                    assert z.getinfo(f"{cid}/{member}").compress_type == method
-                return
-            off += 46 + ln + lm + lk
-        raise AssertionError(f"{cid}/{member} is not in {p}")
+        DEFLATE (8) to `method`: one byte, the size kept, the index untouched (set_chunk_member_method)."""
+        set_chunk_member_method(os.path.join(root, store.CHUNKS, "chunk_000001.zip"), f"{cid}/{member}", method)
 
     def stamped_v3_roots(self, attack, leftovers=None):
         """(Codex re-review of e82ed4e, P2) One root per plan version x case, each holding one /3 completion
@@ -1132,16 +1147,20 @@ class TestStore(unittest.TestCase):
             self.root = base
         return out
 
-    def unbound_index_problems_and_pack(self, attacks, refused):
+    def unbound_index_problems_and_pack(self, attacks, refused, paths=("index_problems", "pack")):
         """index_problems on each stamped_v3_roots(attack) root refuses the bad ones (`refused`: the
         assertion, given the members opened), so pack() extends no such root (its refusal names the
-        cell; nothing packed or deleted); the complete controls pass, and pack."""
+        cell; nothing packed or deleted); the complete controls pass, and pack. paths: the ones checked
+        (Codex re-review of 6407f80: "pack" alone shows pack's own refusal, not after index_problems')."""
         for attack in attacks:
             for cid, root, bad, snap in self.stamped_v3_roots(attack):
                 with self.subTest(attack=attack, cid=cid):
-                    with members_opened() as opened:
-                        probs = store.index_problems(root)
-                    refused(cid, bad, probs, "index_problems", opened)
+                    if "index_problems" in paths:
+                        with members_opened() as opened:
+                            probs = store.index_problems(root)
+                        refused(cid, bad, probs, "index_problems", opened)
+                    if "pack" not in paths:
+                        continue
                     self.root, base = root, self.root
                     try:
                         self.mk_cell("new", group="g-new", csha="b" * 64)
@@ -1166,13 +1185,21 @@ class TestStore(unittest.TestCase):
         complete controls pass, and pack (unbound_index_problems_and_pack)."""
         self.unbound_index_problems_and_pack(self.STAMP_COPIED + self.STAMP_CHANGED, self.assert_age_refused)
 
-    def test_method_byte_index_problems_and_pack(self):
+    def test_method_byte_index_problems(self):
         """Codex re-review of a5c366c, P2: a stamped /3 entry (plan/1 and plan/2) whose packed bundle's
         central-directory compression method was changed to one the packer never writes (STORED, BZIP2,
         LZMA, Zstandard, unknown; the size kept: stamped_v3_roots("method")) is refused by index_problems
         for that method BEFORE its bundle is decoded (never opened; a5c366c decoded it, and LZMA's
-        LZMAError escaped as a traceback), and pack() extends no such root; the complete control packs."""
-        self.unbound_index_problems_and_pack(("method",), self.assert_method_refused)
+        LZMAError escaped as a traceback); the complete control passes. (Split from the pack check, Codex
+        re-review of 6407f80: each path's old-head failure on its own.)"""
+        self.unbound_index_problems_and_pack(("method",), self.assert_method_refused, paths=("index_problems",))
+
+    def test_method_byte_pack_refused(self):
+        """Codex re-review of a5c366c, P2: pack() of a disjoint new cell into such a root (no index_problems
+        call of the test's own before it: Codex re-review of 6407f80) refuses, naming the entry, its
+        method and "refused before decoding", its bundle never opened, nothing packed or deleted (a5c366c:
+        pack's index check decoded it); the complete control packs."""
+        self.unbound_index_problems_and_pack(("method",), self.assert_method_refused, paths=("pack",))
 
     def unbound_verify_all(self, attacks, refused):
         """verify_all, deep or not, on each stamped_v3_roots(attack) root: a bad one's age summary is
@@ -1199,16 +1226,18 @@ class TestStore(unittest.TestCase):
         complete control verifies clean."""
         self.unbound_verify_all(("method",), self.assert_method_refused)
 
-    def unbound_recover_changes_nothing(self, attacks, refused):
+    def unbound_recover_changes_nothing(self, attacks, refused, deeps=(False, True)):
         """recover (deep or not; leftovers "packed" and "unpacked") on each stamped_v3_roots(attack)
         root: a bad one's problem returned (`refused`), no action, every byte of work/ and chunks/ as
-        it was; the complete controls recovered and cleaned as before."""
+        it was; the complete controls recovered and cleaned as before. deeps: the modes run, in order,
+        on each root (Codex re-review of 6407f80: one mode alone, on its own fresh roots, shows that
+        mode's refusal, not only the first failing one's)."""
         for attack in attacks:
             for leftovers in ("packed", "unpacked"):
                 for cid, root, bad, snap in self.stamped_v3_roots(attack, leftovers):
                     with self.subTest(attack=attack, leftovers=leftovers, cid=cid):
                         before = snap()
-                        for deep in (False, True):
+                        for deep in deeps:
                             with members_opened() as opened:
                                 acts, probs = store.recover(root, log=lambda m: None, deep=deep)
                             if not bad:
@@ -1236,13 +1265,18 @@ class TestStore(unittest.TestCase):
         (unbound_recover_changes_nothing)."""
         self.unbound_recover_changes_nothing(self.STAMP_COPIED + self.STAMP_CHANGED, self.assert_age_refused)
 
-    def test_method_byte_recover_changes_nothing(self):
-        """Codex re-review of a5c366c, P2: recover (deep or not; the packed cell's working directory back,
-        or not) on a root whose stamped /3 entry's packed bundle has a compression method the packer
-        never writes returns the age-summary problem naming that method (before decoding: never opened;
-        a5c366c raised LZMAError for LZMA), takes no action and changes no byte of work/ or chunks/; the
-        complete control is recovered and cleaned as before."""
-        self.unbound_recover_changes_nothing(("method",), self.assert_method_refused)
+    def test_method_byte_recover_quick_changes_nothing(self):
+        """Codex re-review of a5c366c, P2: a quick recover (the packed cell's working directory back, or
+        not) on a root whose stamped /3 entry's packed bundle has a compression method the packer never
+        writes returns the age-summary problem naming that method (before decoding: never opened; a5c366c
+        raised LZMAError for LZMA), takes no action and changes no byte of work/ or chunks/; the complete
+        control is recovered and cleaned as before. (Split from the deep mode, Codex re-review of 6407f80.)"""
+        self.unbound_recover_changes_nothing(("method",), self.assert_method_refused, deeps=(False,))
+
+    def test_method_byte_recover_deep_changes_nothing(self):
+        """Codex re-review of a5c366c, P2: the same with a deep recover alone, on its own fresh roots (Codex
+        re-review of 6407f80: a5c366c's quick-mode failure used to stop the test before its deep call)."""
+        self.unbound_recover_changes_nothing(("method",), self.assert_method_refused, deeps=(True,))
 
     def unbound_runner_refused(self, attacks, method=False):
         """run.py --pack, a resume (a plan, a binary, no disk floor) and a --quick-resume on each
@@ -1271,6 +1305,44 @@ class TestStore(unittest.TestCase):
         (a5c366c: LZMAError out of recover), the bundle never opened, every byte of work/ and chunks/
         kept; the complete control runs."""
         self.unbound_runner_refused(("method",), method=True)
+
+    def test_method_byte_replay_refused(self):
+        """Codex re-review of 6407f80, P2: run.py --replay (start_replay) and the replay child's entry
+        (replay_cell: `--_replay`) on a root whose stamped /3 entry's packed bundle (plan/1 and plan/2) has
+        a compression method the packer never writes (stamped_v3_roots("method"): a large, poorly
+        compressible bundle, the size kept) refuse: exit 2, stderr naming the root, the chunk, the cell and
+        the method ("refused before decoding"), no traceback, the bundle never opened (no decoder ran on
+        it), nothing written (no --out; every byte of the root kept). (6407f80's find_bundle read it
+        ungated, before any check: LZMAError, ZstdError on 3.14 and NotImplementedError escaped as
+        tracebacks, STORED's CRC error too.) The complete control's bundle is found in its chunk, its
+        bytes the indexed ones (the engine replays of packed cells: tests/redqueen_tooling.sh)."""
+        for cid, root, bad, snap in self.stamped_v3_roots("method"):
+            _, cells = store.load_index(root)
+            if not bad:
+                with self.subTest(cid=cid):
+                    data, where = run.find_bundle(root, cid)
+                    self.assertEqual((rqlib.sha256_bytes(data), where), (cells[cid][1]["bundle_sha256"], "chunk"))
+                continue
+            m = self.METHODS[cid.rsplit("-p", 1)[0]]
+            for how in ("--replay", "--_replay"):
+                with self.subTest(cid=cid, how=how):
+                    before = tree_bytes(root)
+                    out = os.path.join(self.root, f"replay-{cid}{how.replace('-', '_')}")
+                    err = io.StringIO()
+                    with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()), \
+                            members_opened() as opened:
+                        rc = (run.main(["--root", root, "--replay", cid, "--out", out]) if how == "--replay"
+                              else run.replay_cell(root, cid, out))
+                    msg = err.getvalue()
+                    self.assertEqual(rc, 2, msg)
+                    self.assertNotIn("Traceback", msg)
+                    self.assertIn(f"cannot replay {cid}: {cid} (packed in chunk_000001.zip of {root}): its packed "
+                                  "bundle.json cannot be read (", msg)
+                    self.assertIn(f"compression method {m}, not the DEFLATE (8) pack() writes: refused before "
+                                  "decoding", msg)
+                    self.assertNotIn(f"{cid}/bundle.json", opened)
+                    self.assertFalse(os.path.exists(out))
+                    self.assertEqual(tree_bytes(root), before)
 
     def test_method_byte_legacy_entry_refused(self):
         """Codex re-review of a5c366c, P2 (index_problems' other reading): a legacy index entry (no bundle

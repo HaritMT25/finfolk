@@ -663,6 +663,108 @@ class TestCollectAndCli(Base):
         with self.assertRaises(rs.RefselError):
             rs.collect(self.study({pick[0]["id"]: bundle(pick[0], 599)}), d, pp, sorted(set(rows) - {pick[0]["id"]}))
 
+    def test_method_byte_collect_refused(self):
+        """Codex re-review of 6407f80, P2: collection reads every indexed bundle (a cell's design is recorded
+        only inside it) through store.read_packed. A packed bundle whose central-directory compression method
+        is one the packer never writes (test_redqueen.METHODS: STORED, BZIP2, LZMA, Zstandard, unknown; a
+        large, poorly compressible bundle, the size kept) refuses the WHOLE collection, whether it is a cell
+        of this plan ("plan") or another design's (a plan/1 cell, "p1"; a plan/2 cell of another design,
+        "p2": never skipped, its design being in the unreadable bundle). collect raises RefselError naming the
+        root, the chunk, the cell, the method ("refused before decoding") and whose cell it is; the CLI exits
+        2 with that one line, no traceback, writing neither --out nor --age-diagnostics; the bundle is never
+        opened (no decoder ran on it) and every byte of the root is kept. (6407f80 decoded it: LZMAError,
+        ZstdError on 3.14 and NotImplementedError escaped as tracebacks, refsel re-raising types it does not
+        list; a CRC or bzip2 error was an exit 2 naming no cell.) The controls (every member DEFLATE) collect,
+        a foreign cell skipped: the same observations as without it."""
+        import store
+        import zipfile
+        from unittest import mock
+        from test_redqueen import METHODS, POOR_PAYLOAD, members_opened, set_chunk_member_method, tree_bytes
+        d = self.design()
+        rows = final_rows(d)
+        pp, dp = os.path.join(self.tmp, "plan.jsonl"), os.path.join(self.tmp, "design.json")
+        plan.write_plan(list(rows.values()), pp)
+        write_json(dp, d)
+        pick = sorted(rows)[:3]
+        rest = sorted(set(rows) - set(pick))
+        mp = os.path.join(self.tmp, "missing.txt")
+        with open(mp, "w") as f:
+            f.write("\n".join(rest) + "\n")
+        foreign = {"p1": lambda cid: {"id": cid, "schema": "finfolk.redqueen.plan/1", "kind": "assay"},
+                   "p2": lambda cid: {"id": cid, "schema": plan.PLAN_SCHEMA_V2, "kind": "assay",
+                                      "design": "another-design"}}
+
+        def bundle(cell_, payload="x"):
+            return {"schema": "finfolk.redqueen.bundle/2", "cell": cell_, "payload": payload,
+                    "score": {"n_start": 600, "horizons": [{"steps": 5000, "survivors": 400, "captures": 50}]}}
+
+        def study(whose, name):
+            """The picked cells packed DEFLATE as pack() writes chunks (plus whose's foreign cell), the target's
+            bundle large and poorly compressible, then (name != "complete") its method byte set -> (root, target)."""
+            root = os.path.join(self.tmp, f"study-{whose}-{name}")
+            os.makedirs(os.path.join(root, store.CHUNKS))
+            target = pick[1] if whose == "plan" else f"{name}-{whose}"
+            bundles = {cid: bundle(rows[cid], POOR_PAYLOAD if cid == target else "x") for cid in pick}
+            if whose != "plan":
+                bundles[target] = bundle(foreign[whose](target), POOR_PAYLOAD)
+            chunk, cells = os.path.join(root, store.CHUNKS, "chunk_000001.zip"), {}
+            with zipfile.ZipFile(chunk, "w", compression=store.PACK_METHOD) as z:
+                for cid in sorted(bundles):
+                    data = json.dumps(bundles[cid]).encode()
+                    z.writestr(f"{cid}/bundle.json", data)
+                    cells[cid] = {"bundle_sha256": rqlib.sha256_bytes(data)}
+            with open(os.path.join(root, store.INDEX), "w") as f:
+                f.write(json.dumps({"chunk": "chunk_000001.zip", "cells": cells}) + "\n")
+            if name != "complete":
+                set_chunk_member_method(chunk, f"{target}/bundle.json", METHODS[name])
+            return root, target
+        ref = rs.collect(study("plan", "complete")[0], d, pp, rest)
+        self.assertEqual(len(ref["observations"]), 3)
+        bound = rs.bind_plan(d, pp)
+
+        def bind(design, plan_path):        # (the binding is upstream of the reads under test: bound once)
+            self.assertEqual((rqlib.canonical(design), plan_path), (rqlib.canonical(d), pp))
+            return bound
+        for whose, name in [(w, n) for w in ("plan", "p1", "p2") for n in METHODS] + [("p1", "complete"),
+                                                                                    ("p2", "complete")]:
+            root, target = study(whose, name)
+            if name == "complete":
+                with self.subTest(cid=target), mock.patch.object(rs, "bind_plan", bind):
+                    self.assertEqual(rs.collect(root, d, pp, rest), ref)        # (intact: the foreign cell skipped)
+                continue
+            before = tree_bytes(root)
+            m = METHODS[name]
+            with mock.patch.object(rs, "bind_plan", bind):
+                with self.subTest(cid=target, method=name, whose=whose, path="collect"):
+                    with members_opened() as opened, self.assertRaises(rs.RefselError) as cm:
+                        rs.collect(root, d, pp, rest)
+                    msg = str(cm.exception)
+                    self.assertIn(f"collection refused: {target} (packed in chunk_000001.zip of {root}): its packed "
+                                  "bundle.json cannot be read (", msg)
+                    self.assertIn(f"compression method {m}, not the DEFLATE (8) pack() writes: refused before "
+                                  "decoding", msg)
+                    self.assertIn("(a cell of this plan)" if whose == "plan" else "not one of this plan's cell ids",
+                                  msg)
+                    self.assertNotIn(f"{target}/bundle.json", opened)
+                    self.assertEqual(tree_bytes(root), before)
+                with self.subTest(cid=target, method=name, whose=whose, path="cli"):
+                    op, ap = (os.path.join(self.tmp, f"{x}-{whose}-{name}.json") for x in ("obs", "ages"))
+                    err = io.StringIO()
+                    with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()), \
+                            members_opened() as opened:
+                        rc = rs.main(["collect", "--study", root, "--design", dp, "--plan", pp, "--declare-missing",
+                                      mp, "--out", op, "--age-diagnostics", ap])
+                    self.assertEqual(rc, 2, err.getvalue())
+                    self.assertNotIn("Traceback", err.getvalue())
+                    self.assertTrue(err.getvalue().startswith(
+                        f"refsel.py collect: collection refused: {target} (packed in chunk_000001.zip of {root}): "),
+                        err.getvalue())
+                    self.assertIn(f"compression method {m}, not the DEFLATE (8) pack() writes", err.getvalue())
+                    self.assertEqual(err.getvalue().count("\n"), 1, err.getvalue())
+                    self.assertNotIn(f"{target}/bundle.json", opened)
+                    self.assertFalse(os.path.exists(op) or os.path.exists(ap))
+                    self.assertEqual(tree_bytes(root), before)
+
     def test_cli(self):
         """The plan CLI (the binding arguments); every refusal is a normalized exit 2 (a missing file, bad
         JSON, a refused binding), never a traceback."""
