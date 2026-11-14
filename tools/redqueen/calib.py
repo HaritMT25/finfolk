@@ -139,7 +139,8 @@ directional change; T2 both; T3 none, stressed red variation, half the worlds sa
 capture), noise x 1.5; T4 cycles 32 subtypes ((14 boundary components + a capture-only + a survival-only
 transition) x 2 directions) over the three epoch pairs; alternatives TA1 / TA2 (material / doubled,
 direction by panel parity). Graph strata: "actual" (the qualifying worlds) and "stress24" (24 worlds by
-sha256 of the registry id). Streams: AnnexH/1/<hyp>/<stage>:<stratum>/<mode>/<panel>[/<purpose>].
+sha256 of the registry id). Streams: AnnexH/D8/1/<hyp>/<stage>:<stratum>/<mode>/<panel>[/<purpose>] (D8 rule
+51: the registered AnnexH/1/ keys under the D8 prefix, CALIBRATION_NAMESPACE).
 
 DECISIONS (H.11). Development: per mode x graph x stratum (B; I when calibrated) the plus-one 0.99
 order statistic; a decision's critical value is the LARGEST over its applicable modes, graphs and strata
@@ -2974,7 +2975,8 @@ def report(records):
                      "BOUNDARY_TOL": BOUNDARY_TOL, "TAU_NUM": TAU_NUM, "AMP_TOL": AMP_TOL, "DIR_TOL": DIR_TOL,
                      "A_SUP": A_SUP, "AMP_GRID": AMP_GRID, "KNOB_GRID": [KNOB_GRID[0], KNOB_GRID[-1], len(KNOB_GRID)],
                      "LAMBDA_GRID": [LAMBDA_GRID[0], LAMBDA_GRID[-1], len(LAMBDA_GRID)], "LAMBDA_TOL": LAMBDA_TOL,
-                     "streams": "audit: the slot's original AnnexH/1/<hyp>/<stage>:<graph>/<mode>/<slot>/...; "
+                     # (#68 round 14: the namespace the panels' seeds use, Panel.rng; D8 rule 51)
+                     "streams": f"audit: the slot's original {CALIBRATION_NAMESPACE}/<hyp>/<stage>:<graph>/<mode>/<slot>/...; "
                                 "continuation: .../<mode>/<cell>/<k>/...",
                      "stopping": "after the audit while B_c < n_c or (I collection and I_c < n_c), up to K_c; I "
                                  "collection iff the audit I-eligible fraction x ROUNDS n >= N_MIN",

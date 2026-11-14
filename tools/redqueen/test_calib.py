@@ -443,6 +443,19 @@ class TestGenerator(unittest.TestCase):
         finally:
             shutil.rmtree(tmp)
 
+    def test_report_streams_label_names_the_d8_namespace(self):
+        """#68 round 14 (Codex, round-13 review note): report()'s stream rule names the namespace the panels'
+        seeds actually use (CALIBRATION_NAMESPACE = AnnexH/D8/1, D8 rule 51), not the pre-D8 AnnexH/1."""
+        import hashlib
+        cb = self.cb
+        label = cb.report([])["rules"]["streams"]
+        self.assertEqual(cb.CALIBRATION_NAMESPACE, "AnnexH/D8/1")
+        self.assertTrue(label.startswith("audit: the slot's original AnnexH/D8/1/<hyp>/<stage>:"), label)
+        self.assertNotIn("AnnexH/1/", label)
+        pan = cb.Panel(cb.synthetic_graph(n=4), cb.placeholder_params(), "H-F", "dev", "actual", "F1", 3)
+        seed = int.from_bytes(hashlib.sha256(b"AnnexH/D8/1/H-F/dev:actual/F1/3/noise").digest()[:8], "little")
+        self.assertEqual(pan.rng("noise").normals(4).tobytes(), cb.VecSplitMix64(seed).normals(4).tobytes())
+
     def test_d4_grid_table_cache(self):
         """The D4 warm-up fix: the grid tables and cell checks are built once and, with TABLE_CACHE, stored and
         reloaded BITWISE (no rebuild: expected_fraction is never called on a warm cache); a damaged entry is a
