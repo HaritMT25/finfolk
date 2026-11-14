@@ -42,6 +42,45 @@ def strip(rec):
     return {k: v for k, v in rec.items() if not k.startswith("cpu")}
 
 
+def d8_bank_and_params(cb):
+    """#68 round 14 (pr68_engine_field_spec_v2; A_design_v5 2.8): a SYNTHETIC noisebank.bank/3 document (its
+    fields, invented values: never fitted to, nor read from, any bank) and the generator parameter set assembled
+    from it by the assembly contract: the bank's complete noise block and fit.noise (plus only
+    source_artifact_sha256), its noise likelihood and the seven shared fields copied verbatim, a synthetic mean fit
+    added, and the top-level engine_sha256 = fit.mean.engine_sha256 (the bank's executable differs on purpose).
+    -> (bank, bank_bytes, params)"""
+    import copy
+    m = cb.stats.material
+    ceiling = m.cohort_ceiling(m.registered_ages(), 5000, 0.016)
+    s_logit = {"C": {"x": [-2.0, 0.0, 1.5], "s": [0.6, 0.3, 0.25], "direction": "decreasing"},
+               "S": {"x": [0.0], "s": [0.2]}, "F": {"x": [-1.0, 2.0], "s": [0.2, 0.3]}}
+    bank = {"schema": "finfolk.redqueen.noisebank.bank/3", "status": "d8-fitted", "synthetic": False,
+            "cohort": m.registered_ages(), "cohort_sha256": m.AGES_SHA256, "horizon": 5000, "dt": 0.016,
+            "support_law": m.SUPPORT_LAW, "age_clock": m.age_clock_identity(), "survivor_ceiling": ceiling,
+            "fit": {"noise_likelihood": "600-rounded-capped-upper-infinity",
+                    "noise": {"implementation_sha256": "1" * 64, "inputs_sha256": "2" * 64,
+                              "receipt_sha256": "3" * 64, "engine_sha256": "c" * 64},
+                    "streams": {"bootstrap": {"generator": "rqlib.SplitMix64", "namespace": "AnnexH/D8/1"}}},
+            "noise": {"available": True, "s_logit": s_logit,
+                      "SigmaR": [[0.25, 0.05, 0.05], [0.05, 0.25, 0.15], [0.05, 0.15, 0.5]],
+                      "SigmaD": [[0.25, 0.05], [0.05, 0.25]], "SigmaE": [[0.5, 0.1], [0.1, 0.5]],
+                      "horizon": 5000, "capture_bound": 324, "survivor_ceiling": ceiling},
+            "map_variance": {"s_logit": s_logit, "nu0": {ch: {"status": "full_pooling"} for ch in "CSF"}},
+            "d8": {"ceilings": {"5000": ceiling, "10000": 0, "20000": 0}, "denominator": 600}}
+    raw = cb.rqlib.canonical(bank)
+    p = cb.placeholder_params()
+    p["fitted"] = True
+    for k in ("cohort", "cohort_sha256", "horizon", "dt", "support_law", "age_clock", "survivor_ceiling"):
+        p[k] = copy.deepcopy(bank[k])
+    p["noise"] = copy.deepcopy(bank["noise"])
+    p["fit"] = {"mean_head": "c_H*sigmoid(eta)", "noise_likelihood": bank["fit"]["noise_likelihood"],
+                "mean": {"implementation_sha256": "4" * 64, "inputs_sha256": "5" * 64, "receipt_sha256": "6" * 64,
+                         "engine_sha256": "b" * 64},
+                "noise": dict(copy.deepcopy(bank["fit"]["noise"]), source_artifact_sha256=cb.rqlib.sha256_bytes(raw))}
+    p["engine_sha256"] = p["fit"]["mean"]["engine_sha256"]
+    return bank, raw, p
+
+
 @unittest.skipIf(np is None, "numpy is not installed")
 class TestCalib(unittest.TestCase):
     @classmethod
@@ -188,6 +227,10 @@ class TestGenerator(unittest.TestCase):
                     "noise_likelihood": "600-rounded-capped-upper-infinity",
                     **{kind: {k: "a" * 64 for k in ("implementation_sha256", "inputs_sha256", "receipt_sha256")}
                        for kind in ("mean", "noise")}})
+        # (#68 round 14, engine-field spec v2: each fit's executable; the noise fit's source artifact; the top-level
+        # engine is the production assay engine = fit.mean.engine_sha256, the noise fit's may differ)
+        p["fit"]["mean"]["engine_sha256"] = p["engine_sha256"]
+        p["fit"]["noise"].update(engine_sha256="c" * 64, source_artifact_sha256="d" * 64)
         with self.assertRaises(cb.CalibError):
             cb.check_params(p, production=True)                    # (bins only)
         cb.check_params(p)                                         # (fine for a synthetic run)
@@ -207,6 +250,39 @@ class TestGenerator(unittest.TestCase):
             legacy = copy.deepcopy(p); legacy["fit"].pop(key)
             with self.assertRaises(cb.CalibError):
                 cb.check_params(legacy, production=True)
+        # (#68 round 14, spec v2 test 2: the engine-field convention and the noise block's cross-field checks)
+        for kind, key, why in (("mean", "engine_sha256", "receipt and engine sha256 identities"),
+                               ("noise", "engine_sha256", "receipt and engine sha256 identities"),
+                               ("noise", "source_artifact_sha256", "the bank artifact it was copied from")):
+            with self.subTest(missing=f"fit.{kind}.{key}"):
+                q = copy.deepcopy(p); q["fit"][kind].pop(key)
+                with self.assertRaisesRegex(cb.CalibError, why):
+                    cb.check_params(q, production=True)
+            with self.subTest(malformed=f"fit.{kind}.{key}"):
+                q = copy.deepcopy(p); q["fit"][kind][key] = "B" * 64
+                with self.assertRaisesRegex(cb.CalibError, why):
+                    cb.check_params(q, production=True)
+        with self.subTest(top_level_engine="differs from fit.mean.engine_sha256"):
+            q = copy.deepcopy(p); q["engine_sha256"] = q["fit"]["noise"]["engine_sha256"]   # (overwritten by the noise's)
+            with self.assertRaisesRegex(cb.CalibError, "must equal fit.mean.engine_sha256"):
+                cb.check_params(q, production=True)
+        with self.subTest(noise_engine="a different fit.noise.engine_sha256 is accepted"):
+            q = copy.deepcopy(p); q["fit"]["noise"]["engine_sha256"] = "e" * 64
+            self.assertNotEqual(q["fit"]["noise"]["engine_sha256"], q["engine_sha256"])
+            cb.check_params(q, production=True)
+        consistent = dict(horizon=5000, survivor_ceiling=247, capture_bound=p["capture_bound"], available=True)
+        with self.subTest(noise_block="consistent copied keys are accepted"):
+            q = copy.deepcopy(p); q["noise"].update(consistent)
+            cb.check_params(q, production=True)
+        for key, value, why in (("horizon", 10000, "noise.horizon 10000 differs from horizon 5000"),
+                                ("survivor_ceiling", 246, "noise.survivor_ceiling 246 differs from survivor_ceiling 247"),
+                                ("capture_bound", 323, "noise.capture_bound 323 differs from capture_bound 324"),
+                                ("available", False, "the noise block is marked unavailable")):
+            for production in (True, False):
+                with self.subTest(noise_key=key, value=value, production=production):
+                    q = copy.deepcopy(p); q["noise"].update(consistent); q["noise"][key] = value
+                    with self.assertRaisesRegex(cb.CalibError, why):
+                        cb.check_params(q, production=production)
         mu = np.array([1e-6, 0.1, 0.5, 0.7, 0.99])
         self.assertEqual(cb.noise_scale(p, "C", mu).tobytes(), cb.noisescale.evaluate(good["C"], mu).tobytes())
         self.assertTrue(np.all(np.diff(cb.noise_scale(p, "C", mu)) <= 0))
@@ -231,6 +307,141 @@ class TestGenerator(unittest.TestCase):
         p['noise']['s_logit'] = {ch: {'x': [0.], 's': [.2]} for ch in 'CSF'}
         with self.assertRaises(self.cb.CalibError):
             self.cb.check_params(p, production=True)
+
+    def test_check_noise_source(self):
+        """#68 round 14 (pr68_engine_field_spec_v2 test 3; A_design_v5 2.8 / T5-4): parameters assembled from a
+        SYNTHETIC noisebank.bank/3 document pass check_params(production=True) and check_noise_source; every
+        assembly defect is refused by check_noise_source with the comparison that caught it (the complete
+        canonical noise block, the complete fit.noise but its one added key, the likelihood, the seven shared
+        fields, the bank's bytes, schema, status and synthetic flag)."""
+        import copy
+        import json as js
+        cb = self.cb
+        bank, raw, p = d8_bank_and_params(cb)
+        with self.subTest(case="assembled parameters pass both checks"):
+            self.assertNotEqual(p["fit"]["noise"]["engine_sha256"], p["engine_sha256"])
+            cb.check_params(copy.deepcopy(p), production=True)
+            self.assertIs(cb.check_noise_source(p, raw), p)
+
+        def rebank(**changes):           # a different bank document, the parameters re-pointed at its bytes
+            b = copy.deepcopy(bank); b.update(changes)
+            r = cb.rqlib.canonical(b)
+            q = copy.deepcopy(p); q["fit"]["noise"]["source_artifact_sha256"] = cb.rqlib.sha256_bytes(r)
+            return q, r
+
+        def edit(fn):                    # the same bank bytes, one assembly defect in the parameters
+            q = copy.deepcopy(p); fn(q)
+            return q, raw
+
+        def setp(path, value):
+            def fn(q):
+                d = q
+                for k in path[:-1]:
+                    d = d[k]
+                d[path[-1]] = value
+            return fn
+
+        def sigma_d(q):
+            q["noise"]["SigmaD"][0][1] = q["noise"]["SigmaD"][1][0] = 0.06
+        bad_noise = "the noise block is not the bank artifact's, verbatim"
+        bad_fit = r"fit.noise is not the bank artifact's \(only source_artifact_sha256 may be added\)"
+        cases = [
+            ("wrong bytes: one byte appended", (p, raw + b" "), "bytes are not the ones named by fit.noise"),
+            ("wrong bytes: the same document re-encoded", (p, js.dumps(bank, indent=1).encode()),
+             "bytes are not the ones named by fit.noise"),
+            ("wrong bytes: another bank", (p, cb.rqlib.canonical(dict(bank, horizons={}))),
+             "bytes are not the ones named by fit.noise"),
+            ("synthetic: true", rebank(synthetic=True), "not an adopted, non-synthetic noisebank.bank/3"),
+            ("status: unavailable", rebank(status="unavailable"), "not an adopted, non-synthetic noisebank.bank/3"),
+            ("schema bank/2", rebank(schema="finfolk.redqueen.noisebank.bank/2"), "not an adopted, non-synthetic"),
+            ("a changed SigmaD entry", edit(sigma_d), bad_noise),
+            ("a changed noise.horizon", edit(setp(("noise", "horizon"), 10000)), bad_noise),
+            ("a changed noise.capture_bound", edit(setp(("noise", "capture_bound"), 323)), bad_noise),
+            ("a changed noise.survivor_ceiling", edit(setp(("noise", "survivor_ceiling"), 246)), bad_noise),
+            ("noise.available false", edit(setp(("noise", "available"), False)), bad_noise),
+            ("an extra key in noise", edit(setp(("noise", "s"), {"C": [0.5] * 3, "S": [0.3] * 3, "F": [0.3] * 3})),
+             bad_noise),
+            ("a key missing from noise", edit(lambda q: q["noise"].pop("capture_bound")), bad_noise),
+            ("a changed s_logit knot", edit(setp(("noise", "s_logit", "F", "s"), [0.2, 0.31])), bad_noise),
+            ("a changed fit.noise.engine_sha256", edit(setp(("fit", "noise", "engine_sha256"), "e" * 64)), bad_fit),
+            ("a changed fit.noise.receipt_sha256", edit(setp(("fit", "noise", "receipt_sha256"), "e" * 64)), bad_fit),
+            ("an extra key in fit.noise", edit(setp(("fit", "noise", "note"), "assembled")), bad_fit),
+            ("a key missing from fit.noise", edit(lambda q: q["fit"]["noise"].pop("inputs_sha256")), bad_fit),
+            ("a changed noise_likelihood", edit(setp(("fit", "noise_likelihood"), "600-rounded")),
+             "noise_likelihood differs from the bank artifact"),
+            ("a changed age_clock", edit(setp(("age_clock", "helper_sha256"), "0" * 64)),
+             "age_clock differs from the bank artifact"),
+            ("a changed cohort_sha256", edit(setp(("cohort_sha256",), "0" * 64)), "cohort_sha256 differs"),
+            ("a changed cohort", edit(setp(("cohort", "assembled"), True)), "cohort differs"),
+            ("a changed top-level horizon", edit(setp(("horizon",), 10000)), "horizon differs from the bank"),
+            ("a changed dt", edit(setp(("dt",), 0.017)), "dt differs from the bank"),
+            ("a changed support_law", edit(setp(("support_law",), "D8/old")), "support_law differs"),
+            ("a changed top-level survivor_ceiling", edit(setp(("survivor_ceiling",), 246)),
+             "survivor_ceiling differs from the bank"),
+        ]
+        for name, (q, r), why in cases:
+            with self.subTest(case=name):
+                with self.assertRaisesRegex(cb.CalibError, f"noise source: .*{why}"):
+                    cb.check_noise_source(q, r)
+        # (the check_params half of T5-4 on the same assembly: the engine fields and the copied block's own keys)
+        for name, fn, why in (("top-level engine overwritten by the bank's", lambda q: q.update(
+                                  engine_sha256=q["fit"]["noise"]["engine_sha256"]), "must equal fit.mean.engine_sha256"),
+                              ("source_artifact_sha256 removed", lambda q: q["fit"]["noise"].pop("source_artifact_sha256"),
+                               "the bank artifact it was copied from"),
+                              ("noise.horizon 10000", setp(("noise", "horizon"), 10000), "noise.horizon 10000 differs"),
+                              ("noise.available false", setp(("noise", "available"), False), "marked unavailable")):
+            with self.subTest(check_params=name):
+                q, _ = edit(fn)
+                with self.assertRaisesRegex(cb.CalibError, why):
+                    cb.check_params(q, production=True)
+        with self.subTest(case="the bank's extra fields (streams, map_variance, d8) are not part of the copy"):
+            self.assertNotIn("streams", p["fit"])
+            self.assertNotIn("map_variance", p)
+
+    def test_production_panels_check_the_noise_source(self):
+        """#68 round 14 (spec v2, callers): production panels refuse to start without --noise-source, run
+        check_noise_source on its bytes right after check_params and before any panel, and a smoke run checks the
+        bytes whenever given (the graph and the parameters stubbed; manifest() stands for the first panel step)."""
+        import copy
+        import io
+        import shutil
+        import tempfile
+        from contextlib import redirect_stderr
+        from unittest import mock
+        cb = self.cb
+        bank, raw, p = d8_bank_and_params(cb)
+
+        class Reached(Exception):
+            pass
+        tmp = tempfile.mkdtemp()
+        try:
+            good, other = os.path.join(tmp, "bank.json"), os.path.join(tmp, "other.json")
+            with open(good, "wb") as f:
+                f.write(raw)
+            with open(other, "wb") as f:
+                f.write(cb.rqlib.canonical(dict(bank, synthetic=True)))
+            out = os.path.join(tmp, "panels.jsonl")
+            argv = ["panels", "--hyp", "H-F", "--stage", "dev", "--mode", "F0", "--stratum", "actual", "--out", out]
+            prod = argv + ["--eligibility", os.path.join(tmp, "eligibility.json")]
+            with mock.patch.object(cb, "get_graph", return_value=(cb.synthetic_graph(n=4), "file:stub")), \
+                    mock.patch.object(cb, "get_params", side_effect=lambda a: copy.deepcopy(p)), \
+                    mock.patch.object(cb, "manifest", side_effect=Reached) as man:
+                for args, why in ((prod, "production panels need --noise-source"),
+                                  (prod + ["--noise-source", other], "noise source: the bank artifact bytes"),
+                                  (argv + ["--smoke", "--noise-source", other], "noise source: the bank artifact bytes")):
+                    with self.subTest(args=args[len(argv):]):
+                        err = io.StringIO()
+                        with redirect_stderr(err):
+                            rc = cb.main(args)
+                        self.assertEqual(rc, 2)
+                        self.assertIn(why, err.getvalue())
+                self.assertEqual(man.call_count, 0)
+                with self.assertRaises(Reached):
+                    cb.main(prod + ["--noise-source", good])
+                self.assertEqual(man.call_count, 1)
+            self.assertFalse(os.path.exists(out))
+        finally:
+            shutil.rmtree(tmp)
 
     def test_d4_grid_table_cache(self):
         """The D4 warm-up fix: the grid tables and cell checks are built once and, with TABLE_CACHE, stored and

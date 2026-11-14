@@ -116,10 +116,18 @@ Production parameter artifacts must explicitly contain `cohort`, `cohort_sha256`
 `support_law`, `age_clock`, `engine_sha256`, `survivor_ceiling`, and `fit`, as well as the existing fitted flag and curves.
 Use the exact authenticated registered cohort, its D8 source hash, horizon 5000, timestep 0.016,
 `material.SUPPORT_LAW`, `material.age_clock_identity()`, the actual fitting-source engine executable
-SHA-256, and the ceiling M_5000 the common clock gives for the registered ages (247). `fit.mean_head` must be
+SHA-256, and the ceiling M_5000 the common clock gives for the registered ages (247).
+
+`engine_sha256` names the production assay engine and equals `fit.mean.engine_sha256`. Each fit records the
+executable that produced its inputs (`fit.mean.engine_sha256`, `fit.noise.engine_sha256`). The noise source is the
+adopted `noisebank.bank/3` artifact named by `fit.noise.source_artifact_sha256`; its complete `noise` block and its
+`fit.noise` record (plus only `source_artifact_sha256`) are copied verbatim (`check_noise_source`), and the copied
+block's `horizon`, `survivor_ceiling` and `capture_bound` agree with the top-level fields.
+
+`fit.mean_head` must be
 `c_H*sigmoid(eta)` and `fit.noise_likelihood` must be `600-rounded-capped-upper-infinity`.
-Both `fit.mean` and `fit.noise` must identify `implementation_sha256`, `inputs_sha256` and
-`receipt_sha256`. These fields attest the fitting procedure and bind its independent receipts; they
+Both `fit.mean` and `fit.noise` must identify `implementation_sha256`, `inputs_sha256`,
+`receipt_sha256` and `engine_sha256`. These fields attest the fitting procedure and bind its independent receipts; they
 do not implement or replace the scientific fit review. Missing provenance is refused, with no
 production defaults. In particular the fitted interval likelihood's upper capped category must have
 latent upper endpoint +infinity. Parameter fitting is still outside this generator module.

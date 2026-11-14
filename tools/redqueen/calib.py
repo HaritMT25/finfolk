@@ -490,10 +490,22 @@ def check_params(p, production=False):
         fit = p["fit"]
         if not isinstance(fit, dict) or fit.get("mean_head") != "c_H*sigmoid(eta)" or fit.get("noise_likelihood") != "600-rounded-capped-upper-infinity":
             raise CalibError("D8 production fitting identities must describe bounded means and capped interval likelihood")
+        # (#68 round 14, engine-field convention, pr68_engine_field_spec_v2 / A_design_v5 2.8: the top-level
+        # engine_sha256 is the PRODUCTION ASSAY engine and equals fit.mean.engine_sha256; each fit records the
+        # executable that produced its inputs; fit.noise names the adopted noisebank.bank/3 artifact it was
+        # copied from. The two engines may differ.)
         for kind in ("mean", "noise"):
             record = fit.get(kind, {})
-            if not isinstance(record, dict) or not all(rqlib.is_sha256(record.get(k)) for k in ("implementation_sha256", "inputs_sha256", "receipt_sha256")):
-                raise CalibError(f"D8 production {kind} fit needs implementation, inputs and receipt sha256 identities")
+            if not isinstance(record, dict) or not all(
+                    rqlib.is_sha256(record.get(k))
+                    for k in ("implementation_sha256", "inputs_sha256", "receipt_sha256", "engine_sha256")):
+                raise CalibError(f"D8 production {kind} fit needs implementation, inputs, receipt and engine "
+                                 "sha256 identities")
+        if not rqlib.is_sha256(fit["noise"].get("source_artifact_sha256")):
+            raise CalibError("D8 production noise fit needs the sha256 of the bank artifact it was copied from")
+        if p["engine_sha256"] != fit["mean"]["engine_sha256"]:
+            raise CalibError("engine_sha256 names the production assay engine and must equal "
+                             "fit.mean.engine_sha256; the noise source's executable is fit.noise.engine_sha256")
     cohort = p.get("cohort", stats.material.registered_ages())
     if len(cohort.get("ages", [])) != TRIALS:
         raise CalibError("generator parameters: initial cohort must contain 600 registered ages")
@@ -518,6 +530,14 @@ def check_params(p, production=False):
             raise CalibError("generator parameters: the innovation covariance and the autoregressions have no "
                              "PSD irregular-time diffusion (OU) form: refit in the OU parametrization")
     nz = p["noise"]
+    # (#68 round 14, spec v2 (b): a copied bank noise block agrees with the top-level fields; all modes, and a
+    # key that is absent is not checked here, because synthetic placeholder parameters do not carry it)
+    for key, top in (("horizon", "horizon"), ("survivor_ceiling", "survivor_ceiling"),
+                     ("capture_bound", "capture_bound")):
+        if key in nz and nz[key] != p.get(top):
+            raise CalibError(f"generator parameters: noise.{key} {nz[key]!r} differs from {top} {p.get(top)!r}")
+    if "available" in nz and nz["available"] is not True:
+        raise CalibError("generator parameters: the noise block is marked unavailable")
     for k in ("SigmaR", "SigmaD", "SigmaE"):
         if k not in nz:
             raise CalibError(f"generator parameters: noise.{k} is required (H.9.2: row, donor AND cell)")
@@ -541,6 +561,34 @@ def check_params(p, production=False):
         for ch in ("C", "S", "F"):
             if np.any(np.asarray(nz["s"][ch], float) <= 0):
                 raise CalibError(f"generator parameters: noise scales s_{ch} must be positive")
+    return p
+
+
+BANK_SCHEMA_D8 = "finfolk.redqueen.noisebank.bank/3"
+NOISE_SOURCE_ADDED = ("source_artifact_sha256",)   # the only key the assembly adds to fit.noise
+
+
+def check_noise_source(p, bank_bytes):
+    """The production noise block and fit.noise are the adopted D8 bank artifact's, copied verbatim: the complete
+    canonical noise block, the complete fit.noise record except the enumerated added key, the noise likelihood, and
+    the seven shared provenance fields. (#68 round 14, pr68_engine_field_spec_v2; run after
+    check_params(production=True), which guarantees the fields read here.)"""
+    fit = p["fit"]
+    if hashlib.sha256(bank_bytes).hexdigest() != fit["noise"].get("source_artifact_sha256"):
+        raise CalibError("noise source: the bank artifact bytes are not the ones named by fit.noise")
+    bank = json.loads(bank_bytes)
+    if bank.get("schema") != BANK_SCHEMA_D8 or bank.get("status") != "d8-fitted" or bank.get("synthetic") is not False:
+        raise CalibError("noise source: not an adopted, non-synthetic noisebank.bank/3 artifact")
+    if rqlib.canonical(p["noise"]) != rqlib.canonical(bank["noise"]):
+        raise CalibError("noise source: the noise block is not the bank artifact's, verbatim")
+    copied = {k: v for k, v in fit["noise"].items() if k not in NOISE_SOURCE_ADDED}
+    if rqlib.canonical(copied) != rqlib.canonical(bank["fit"]["noise"]):
+        raise CalibError("noise source: fit.noise is not the bank artifact's (only source_artifact_sha256 may be added)")
+    if fit["noise_likelihood"] != bank["fit"]["noise_likelihood"]:
+        raise CalibError("noise source: noise_likelihood differs from the bank artifact")
+    for k in ("cohort", "cohort_sha256", "horizon", "dt", "support_law", "age_clock", "survivor_ceiling"):
+        if rqlib.canonical(p[k]) != rqlib.canonical(bank[k]):
+            raise CalibError(f"noise source: {k} differs from the bank artifact")
     return p
 
 
@@ -3151,6 +3199,8 @@ def main(argv=None):
                                              "(refused below 24; a production calibration requires it)")
         s.add_argument("--synthetic-worlds", type=int, default=32)
         s.add_argument("--params")
+        s.add_argument("--noise-source", help="the adopted noisebank.bank/3 artifact named by the parameters' "
+                       "fit.noise.source_artifact_sha256 (production panels require it: check_noise_source)")
         s.add_argument("--gates", help="the frozen epoch-gate artifact (calib.py gates) H-T requires")
         s.add_argument("--draws", type=int, default=stats.B_BOOT)
         s.add_argument("--smoke", action="store_true", help="a smoke / test run: synthetic inputs allowed, the "
@@ -3216,6 +3266,14 @@ def main(argv=None):
             params = get_params(a)
             production = a.cmd == "panels" and not a.smoke
             check_params(params, production=production)
+            # (#68 round 14, spec v2: the noise block's source, verbatim. The bank bytes are bound in every record's
+            # manifest through params_sha256, which covers fit.noise.source_artifact_sha256 = sha256 of these bytes.)
+            if production and not a.noise_source:
+                raise CalibError("production panels need --noise-source (the adopted noisebank.bank/3 artifact "
+                                 "named by fit.noise.source_artifact_sha256)")
+            if a.noise_source:
+                with open(a.noise_source, "rb") as f:
+                    check_noise_source(params, f.read())
             if production and (src == "synthetic" or a.draws != stats.B_BOOT):
                 raise CalibError("production panels need the real graph (--graph) and the locked 9,999 draws "
                                  "(--smoke for a test run)")

@@ -261,11 +261,18 @@ class Assays:
 
 def analyze(roots, rows, registry, ecology, mask, params, crit, acceptance, gates, *,
             registry_sha256, ecology_sha256, mask_sha256, references_raw, production=True,
-            draws=stats.B_BOOT, min_q200=stats.MIN_Q200, reps=calib.R_REP):
-    """Dispatch every hypothesis; production safeguards cannot be relaxed without a synthetic report label."""
+            draws=stats.B_BOOT, min_q200=stats.MIN_Q200, reps=calib.R_REP, noise_source_raw=None):
+    """Dispatch every hypothesis; production safeguards cannot be relaxed without a synthetic report label.
+    noise_source_raw: the bytes of the adopted noisebank.bank/3 artifact the parameters' noise block was copied
+    from (production requires it; checked by calib.check_noise_source whenever given)."""
     if production and (draws != stats.B_BOOT or min_q200 != stats.MIN_Q200 or reps != calib.R_REP):
         raise AnalysisError('production requires registered bootstrap draws, Q200 minimum and six replicates')
     calib.check_params(params, production=production)
+    if production and noise_source_raw is None:
+        raise AnalysisError('production requires the adopted noise-bank artifact named by '
+                            'fit.noise.source_artifact_sha256 (--noise-source)')
+    if noise_source_raw is not None:
+        calib.check_noise_source(params, noise_source_raw)
     bundles = load_packed(roots, rows)
     if not rows:
         raise AnalysisError('empty executable plan')
@@ -449,7 +456,9 @@ def analyze(roots, rows, registry, ecology, mask, params, crit, acceptance, gate
             'input_provenance': {'adapter_sha256': rqlib.sha256_file(__file__),
                 'registry_sha256': registry_sha256, 'ecology_sha256': ecology_sha256,
                 'mask_sha256': mask_sha256, 'references_sha256': rqlib.sha256_bytes(references_raw),
-                'params_sha256': calib.doc_sha(params), 'critical_sha256': calib.doc_sha(crit),
+                'params_sha256': calib.doc_sha(params),
+                'noise_source_sha256': None if noise_source_raw is None else rqlib.sha256_bytes(noise_source_raw),
+                'critical_sha256': calib.doc_sha(crit),
                 'acceptance_sha256': calib.doc_sha(acceptance), 'gates_sha256': calib.doc_sha(gates)},
             'input_summary': {'packed_bundles': len(bundles), 'free_controls': len(assays.free),
                               'measured_pairs': len(assays.pairs), 'ignored': dict(assays.ignored)}}
@@ -494,7 +503,8 @@ def json_safe(value):
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('--root', action='append', required=True, help='committed assay store(s), including scripted cells')
-    for name in ('plan', 'registry', 'ecology', 'mask', 'references', 'params', 'critical', 'acceptance', 'gates', 'out'):
+    for name in ('plan', 'registry', 'ecology', 'mask', 'references', 'params', 'noise-source', 'critical',
+                 'acceptance', 'gates', 'out'):
         ap.add_argument('--' + name, required=True)
     ap.add_argument('--plan-sha256', required=True, help='frozen executable-plan digest')
     a = ap.parse_args(argv)
@@ -508,7 +518,8 @@ def main(argv=None):
         registry, rs = read(a.registry); ecology, es = read(a.ecology); mask, ms = read(a.mask)
         result = analyze(a.root, [json.loads(line) for line in plan_raw.splitlines() if line.strip()],
             registry, ecology, mask, read(a.params)[0], read(a.critical)[0], read(a.acceptance)[0], read(a.gates)[0],
-            registry_sha256=rs, ecology_sha256=es, mask_sha256=ms, references_raw=Path(a.references).read_bytes())
+            registry_sha256=rs, ecology_sha256=es, mask_sha256=ms, references_raw=Path(a.references).read_bytes(),
+            noise_source_raw=Path(a.noise_source).read_bytes())
         result['plan_sha256'] = a.plan_sha256
         Path(a.out).write_text(json.dumps(json_safe(result), sort_keys=True, indent=2, allow_nan=False) + '\n')
     except (AnalysisError, store.StoreError, stats.StatsError, calib.CalibError, backbone.BackboneError,

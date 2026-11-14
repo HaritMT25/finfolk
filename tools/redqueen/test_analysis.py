@@ -31,6 +31,7 @@ import stats
 import store
 from test_redqueen import mk_cp
 from test_stats import layout64, eco_doc, mask_doc
+from test_calib import d8_bank_and_params
 
 
 def sha(x):
@@ -539,6 +540,39 @@ class AnalysisTests(unittest.TestCase):
     def test_production_cannot_use_synthetic_shortcuts(self):
         with self.assertRaisesRegex(analysis.AnalysisError, 'production requires registered'):
             analysis.analyze(**dict(self.run_args, production=True))
+
+    def test_noise_source_is_checked_before_any_bundle(self):
+        """#68 round 14 (pr68_engine_field_spec_v2, callers): a production analysis without the adopted bank
+        artifact's bytes is refused; with them, calib.check_noise_source runs right after check_params and before
+        any bundle is read (load_packed stubbed); a non-production run checks the bytes whenever given. Synthetic
+        bank and parameters only (test_calib.d8_bank_and_params)."""
+        bank, raw, fitted = d8_bank_and_params(calib)
+        prod = dict(self.run_args, params=fitted, production=True, draws=stats.B_BOOT,
+                    min_q200=stats.MIN_Q200, reps=calib.R_REP)
+
+        class Reached(Exception):
+            pass
+        sigma_d = copy.deepcopy(fitted)
+        sigma_d['noise']['SigmaD'][0][1] = sigma_d['noise']['SigmaD'][1][0] = 0.06
+        with patch.object(analysis, 'load_packed', side_effect=Reached) as lp:
+            with self.assertRaisesRegex(analysis.AnalysisError, 'noise-bank artifact named by fit.noise'):
+                analysis.analyze(**prod)
+            for name, args, why in (
+                    ('appended byte', dict(prod, noise_source_raw=raw + b' '), 'noise source: the bank artifact bytes'),
+                    ('synthetic bank', dict(prod, noise_source_raw=rqlib.canonical(dict(bank, synthetic=True))),
+                     'noise source: the bank artifact bytes'),
+                    ('changed SigmaD', dict(prod, params=sigma_d, noise_source_raw=raw),
+                     "noise source: the noise block is not the bank artifact's"),
+                    ('non-production, given', dict(self.run_args, params=fitted, noise_source_raw=raw + b' '),
+                     'noise source: the bank artifact bytes')):
+                with self.subTest(case=name):
+                    with self.assertRaisesRegex(calib.CalibError, why):
+                        analysis.analyze(**args)
+            self.assertEqual(lp.call_count, 0)
+            with self.assertRaises(Reached):
+                analysis.analyze(**dict(prod, noise_source_raw=raw))
+            self.assertEqual(lp.call_count, 1)
+        self.assertIsNone(self.report['input_provenance']['noise_source_sha256'])
 
 
 class DirectionalPanelsTests(unittest.TestCase):
