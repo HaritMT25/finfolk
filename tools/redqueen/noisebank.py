@@ -145,6 +145,30 @@ THE ESTIMATOR (per horizon; Annex H.9.2: an interval-censored Gaussian composite
   replicate, with no declared missing cells or duplicate endpoint/replicate keys. --descriptive explicitly
   permits partial summaries; their generator_noise.available is always false.
 
+THE D8 REFIT (amendment D8 v2 rules 46-48; A_design_v5.md section 2, clarifications 1 and 2): the frozen observations
+REFITTED, never re-collected, into finfolk.redqueen.noisebank.bank/3 (the legacy estimate and its bank/2 output stay
+byte-for-byte; every D8 consumer refuses bank/2).
+  - The capped law: a survivor count is min{M_h, floor(600 sigma(z) + 1/2)} with M_h from #90's clock through
+    material.cohort_ceiling (247 / 0 / 0 at 5k / 10k / 20k, refused otherwise); the interval map gives the CAPPED
+    category k = M_h the upper end +inf (interval_bounds' ceiling, threaded through arrays, the marginals, the
+    standardized bounds); the support 0..M_h is checked first (a violation refuses the refit, counts only).
+  - D8 path only: a cell-channel whose replicates occupy fewer than MIN_CATEGORIES = 3 distinct counts is excluded
+    as unidentified by policy before the Newton fit, and counted ("screened").
+  - 10k / 20k (M_h = 0): S and F are structural-zero declarations; capture is fitted alone and its dependence is the
+    capture-only reduced fit (the R_CC, D_CC group maxima ARE the row and donor variances when feasible).
+  - The bootstrap draws its world multiplicities from rqlib.SplitMix64 streams AnnexH/D8/1/noisebank/D8-refit/
+    h<h>/bootstrap (below(n)), recorded with their seeds and first outputs.
+  - provenance binds the frozen observations to the registered bank root's bundles (store.verify_all, verify_chunk,
+    the in-memory reconstruction by collect, one engine binary); estimate-d8 verifies every input by hash before
+    parsing, writes its receipt durably first and the artifact binding it; validate-d8 runs the prospective
+    parameter-recovery study (V1-V5) on synthetic banks from the witnessed spec. Every D8 run is charged to the
+    cumulative D5 CPU ledger (failed and interrupted runs too).
+    noisebank.py provenance --study BANK_ROOT --design D --plan P --obs OBS [--manifest M] --out PROV --ledger L
+    noisebank.py d8-validation-spec --design D [--round 1] --out SPEC
+    noisebank.py validate-d8 --spec SPEC --design D --out REPORT --ledger L
+    noisebank.py estimate-d8 --obs OBS --ages A --design D --plan P --provenance PROV --validation-report REPORT \\
+        --out bank_d8.json --receipt RECEIPT --ledger L [--boot 999]
+
 THE PRODUCTION V BUILDER (cov_parts; Annex H.3.1): one block's bank covariance diag(d) + U U' (for
 recurrence.Cov), from the bank's components and the bank's s(mu) curves (noisescale.evaluate, the
 registered D4 scale; there is no binned default), EVALUATED AT THE MEANS PASSED IN (D4: the null-model
@@ -1957,6 +1981,964 @@ def estimate(doc, boot=BOOT, seed=0, m=Z_INTERVALS, replicates=None, descriptive
     return out
 
 
+# ================================================================== THE D8 BANK REFIT (A_design_v5.md section 2)
+# The frozen observations are REFITTED under the capped 600-scaled law (D8 v2 rules 46-48), never re-collected; the
+# legacy estimate above stays byte-for-byte (its bank/2 output lacks the D8 fields and every D8 consumer refuses it).
+# obslaw (the law, the D8 streams, the bank/3 record constants and the strict loader) is imported only inside these
+# functions, so there is no import cycle (obslaw imports this module). The bound constants below are v5's.
+D8_DESIGN = "A_design_v5.md"
+D8_BANK_ROOT = "/home/harit/finfolk/redqueen_noisebank_2026"   # (v5 2.2 item 1: ~/finfolk/..., the root of VI:25)
+D8_PROVENANCE_SCHEMA = "finfolk.redqueen.noisebank.provenance/1"
+D8_RECEIPT_SCHEMA = "finfolk.redqueen.noisebank.d8refitreceipt/1"
+D8_SPEC_SCHEMA = "finfolk.redqueen.noisebank.d8validation.spec/1"
+D8_REPORT_SCHEMA = "finfolk.redqueen.noisebank.d8validation.report/1"
+D8_IMPLEMENTATION = ("noisebank.py", "noisescale.py", "obslaw.py", "common.py", "material.py", "plan.py", "store.py",
+                     "rqlib.py", "fixtures/registered_ages.json")       # (v5 2.8 L753-754: fit.noise.implementation)
+D8_COMMANDS = ("provenance", "estimate-d8", "d8-validation-spec", "validate-d8")
+D5_CEILING_H = 240.0               # (the cumulative D5 ledger's ceiling, D8:289, H:1571-1577; calib's
+                                   #  stats.CPU_CEILING_H)
+D8_START_GUARD_H = 25.0            # (v5 2.11 / 7: >= 25 CPU-h remaining before provenance, a starting guard only)
+CAPTURE_GROUPS = ("R_CC", "D_CC")                  # (v5 2.6: the capture-only reduced fit's two groups; C4)
+CAPTURE_BOOT_NAMES = ("R_CC", "D_CC", "E_CC")      # (C4.1: BOOT_NAMES restricted to C)
+
+
+def d8_bindings():
+    """The registered bindings of the D8 refit (v5 0.3, 2.1, 2.2 item 1): the four input hashes and the bank root.
+    Any other bindings make every D8 output synthetic (validation and tests only; production consumers refuse it)."""
+    import obslaw
+    return dict(obslaw.REGISTERED_INPUTS, bank_root=D8_BANK_ROOT)
+
+
+def _bound_bytes(path, want, what):
+    """A bound input's bytes, refused BEFORE parsing when their sha256 is not the bound one (v5 2.1, R1)."""
+    raw = rqlib.read_bytes(path)
+    got = rqlib.sha256_bytes(raw)
+    if got != want:
+        raise NoiseBankError(f"{what} {path}: sha256 {got} is not the bound {want} (refused before parsing; "
+                             "A_design_v5 2.1, R1)")
+    return raw
+
+
+def _json_of(raw, what):
+    try:
+        return json.loads(raw)
+    except (UnicodeDecodeError, ValueError) as e:
+        raise NoiseBankError(f"{what}: not JSON ({e})") from None
+
+
+def _plan_rows(raw, what="plan"):
+    rows = []
+    for ln in raw.decode("utf-8").split("\n"):
+        if ln.strip():
+            rows.append(_json_of(ln.encode(), what))
+    return rows
+
+
+def d8_ceilings():
+    """M_h of the registered cohort through #90's clock (material.cohort_ceiling; never re-derived here), which must
+    be D8:154's 247 / 0 / 0 (v5 2.3, R4) -> {str(h): M_h}."""
+    import material
+    import obslaw
+    ages = material.registered_ages()
+    got = {str(h): material.cohort_ceiling(ages, h, DT) for h in HORIZONS}
+    if got != obslaw.CEILINGS:
+        raise NoiseBankError(f"the computed survivor ceilings {got} are not D8:154's {obslaw.CEILINGS} (refused; "
+                             "A_design_v5 2.3, R4)")
+    return got
+
+
+def d8_support(obs, ceilings):
+    """The support check (v5 2.3, D8:162-169): captures in 0..B(h), exposed and free survivors in 0..M_h at every
+    horizon. Any violation refuses the WHOLE refit (R3), reporting only the number of violating observations per
+    horizon and channel (never a value or a cell)."""
+    bad = {}
+    for o in obs:
+        for h in HORIZONS:
+            x = o["horizons"][str(h)]
+            checks = [("F" if o["pred"] is None else "S", x.get("survivors"), ceilings[str(h)])]
+            if o["pred"] is not None:
+                checks.append(("C", x.get("captures"), capture_bound(h)))
+            for ch, v, top in checks:
+                if type(v) is not int:
+                    raise NoiseBankError(f"counts at {h} steps must be integers (channel {ch})")
+                if v < 0 or v > top:
+                    bad.setdefault(str(h), {}).setdefault(ch, 0)
+                    bad[str(h)][ch] += 1
+    if bad:
+        raise NoiseBankError(f"support violation: observations outside 0..B(h) (captures) or 0..M_h (survivors), "
+                             f"counted per horizon and channel: {json.dumps(bad, sort_keys=True)} (D8 v2 rule 46; "
+                             "the whole refit is refused, A_design_v5 2.3, R3)")
+
+
+def d8_matched_controls(obs):
+    """v5 2.3 (R2): every exposed observation's prey snapshot has its free control FOR THE SAME REPLICATE."""
+    free = {(tuple(o["prey"]), o["replicate"]) for o in obs if o["pred"] is None}
+    lost = sum(1 for o in obs if o["pred"] is not None and (tuple(o["prey"]), o["replicate"]) not in free)
+    if lost:
+        raise NoiseBankError(f"{lost} exposed observations have no matched free control for their replicate (refused; "
+                             "A_design_v5 2.3, R2)")
+
+
+def d8_draws(text):
+    """The refit bootstrap's multiplicities (v5 2.5 item 5, PC-9): one rqlib.SplitMix64 stream per horizon, seeded
+    from its AnnexH/D8/1 text; per draw n_worlds below(n_worlds) for the prey-role multiplicities, then n_worlds
+    below(n_worlds) for the predator-role ones (the existing order: m, then m'). -> draws(n_worlds) -> draw()."""
+    def factory(n_worlds):
+        import numpy as np
+        import obslaw
+        rng = obslaw.d8_stream(text)
+
+        def draw():
+            mm = np.bincount(obslaw.splitmix_below(rng, n_worlds, n_worlds), minlength=n_worlds)
+            mp = np.bincount(obslaw.splitmix_below(rng, n_worlds, n_worlds), minlength=n_worlds)
+            return mm, mp
+        return draw
+    return factory
+
+
+def capture_only_fit(objs, pairs=None):
+    """The capture-only reduced fit of a zero-ceiling horizon (v5 2.6, PC-10; clarification 1 C4.2): the unconstrained
+    group maxima rho_R (R_CC) and rho_D (D_CC) ARE SigmaR[C,C] and SigmaD[C,C], SigmaE[C,C] = 1 - rho_R - rho_D (the
+    registered expression of components_of), when rho_R >= 0, rho_D >= 0 and rho_R + rho_D <= 1; otherwise refused
+    (NoiseBankError naming the maxima): no barrier fit is registered for the reduced set. -> fit_dependence's
+    record restricted to C."""
+    rR, rD = _argmax(*objs["R_CC"])[0], _argmax(*objs["D_CC"])[0]
+    if not (rR >= 0 and rD >= 0 and rR + rD <= 1):
+        raise NoiseBankError(f"the capture-only group maxima are infeasible (R_CC {rR:.4g}, D_CC {rD:.4g}; rho_R >= 0, "
+                             "rho_D >= 0 and rho_R + rho_D <= 1 are needed, and no barrier fit is registered for the "
+                             "reduced set: A_design_v5 2.6)")
+    rho = {"R_CC": rR, "D_CC": rD}
+    ll = sum(float(obj_rho(*objs[g], rho[g])[0][0]) for g in CAPTURE_GROUPS)
+    return {"rho": rho, "fit": "unconstrained", "loglik": ll, "SigmaR": [[rR]], "SigmaD": [[rD]],
+            "SigmaE": [[1.0 - rR - rD]], "problems": [], "starts": None,
+            "at_box": sorted(g for g in CAPTURE_GROUPS if abs(rho[g]) >= RHO_MAX - 1e-6)}
+
+
+def _capture_entries(f):
+    return [f["SigmaR"][0][0], f["SigmaD"][0][0], f["SigmaE"][0][0]]
+
+
+def horizon_capture_only(A, boot=BOOT, m=Z_INTERVALS, draws=None):
+    """A zero-ceiling horizon (v5 2.6; clarification 1 C4, C4.1, C4.2, C7): channels.S and .F are the structural-zero
+    declarations (no survival fit, curve, nu0, group, variance or covariance of any value); capture is fitted as at
+    5k (the minimum-categories screen, the marginals, S_C, nu0_C) and its dependence is the capture-only reduced fit
+    over R_CC and D_CC, validated locally on the grid and bootstrapped over these two groups (a draw whose reduced fit
+    is infeasible is a refused fit: a failed draw, as at 5k). The record is the 5k encoding restricted to C."""
+    import numpy as np
+    import obslaw
+    U = usable(A, screen=True, channels=("C",))
+    rec = {"capture_bound": A["N"]["C"], "replicates": A["R"], "incomplete_cells": A["incomplete_cells"],
+           "channels": {"C": U["C"]["counts"], "S": dict(obslaw.STRUCTURAL_ZERO), "F": dict(obslaw.STRUCTURAL_ZERO)},
+           "scales": {}, "nu0": {}, "curve_points": {}}
+    ok = U["C"]["ok"]
+    cv = fit_scale(U["C"]["mu"][ok], U["C"]["sigma"][ok] ** 2)
+    rec["scales"]["C"] = cv
+    rec["nu0"]["C"] = nu0_of(U["C"]["mu"][ok], U["C"]["sigma"][ok], U["C"]["var_t"][ok], cv)
+    rec["curve_points"]["C"] = sorted([float(a), float(b)] for a, b in zip(U["C"]["mu"][ok], U["C"]["sigma"][ok]))
+    Uc = dict(U, S={"ok": np.zeros(len(A["S"]), bool)}, F={"ok": np.zeros(len(A["F"]), bool)})
+    G, worlds = group_pairs(A, Uc)
+    rec["worlds"] = worlds
+    reasons = [f"no {g} pairs" for g in CAPTURE_GROUPS if not G[g]]
+    if reasons:
+        rec.update(status="unavailable", reasons=reasons, components=None, bootstrap=None)
+        return rec
+    try:
+        tab = group_tables(A, Uc, G, m, CAPTURE_GROUPS)
+        objs = {g: (tab[g]["z"], tab[g]["T"].sum(axis=0)) for g in CAPTURE_GROUPS}
+        groups = {}
+        for g in CAPTURE_GROUPS:
+            r_hat, _ = _argmax(*objs[g])
+            good, per, at_box = identified(*objs[g], r_hat, tab[g]["pairs"])
+            groups[g] = {"pairs": tab[g]["pairs"], "rho_max": r_hat, "curvature_per_pair": per, "at_box": at_box,
+                         "deep_tail": tab[g]["deep_tail"]}
+            if not good:
+                reasons.append(f"{g} is unidentified ({'one-sided slope' if at_box else 'curvature'} per pair "
+                               f"{per:.3g} < {INFO_MIN})")
+        if reasons:
+            rec.update(status="unavailable", reasons=reasons, components=None, bootstrap=None, groups=groups)
+            return rec
+        try:
+            fit = capture_only_fit(objs)
+        except NoiseBankError as e:                    # (C4.2: infeasible maxima stay as diagnostics, unavailable)
+            rec.update(status="unavailable", reasons=[str(e)], components=None, bootstrap=None, groups=groups)
+            return rec
+        inserted, worst = validate_grid(tab, fit["rho"], CAPTURE_GROUPS)
+        shift = 0.0
+        if inserted:                                   # (ONE refit on the locally refined table, as at 5k)
+            objs = {g: (tab[g]["z"], tab[g]["T"].sum(axis=0)) for g in CAPTURE_GROUPS}
+            for g in CAPTURE_GROUPS:
+                r_hat, _ = _argmax(*objs[g])
+                good, per, at_box = identified(*objs[g], r_hat, tab[g]["pairs"])
+                groups[g].update(rho_max=r_hat, curvature_per_pair=per, at_box=at_box)
+                if not good:
+                    how = "one-sided slope" if at_box else "curvature"
+                    reasons.append(f"{g} is unidentified on the refined grid ({how} per pair {per:.3g} < {INFO_MIN})")
+            if reasons:
+                rec.update(status="unavailable", reasons=reasons, components=None, bootstrap=None, groups=groups)
+                return rec
+            try:
+                refit = capture_only_fit(objs)
+            except NoiseBankError as e:
+                rec.update(status="unavailable", reasons=[str(e)], components=None, bootstrap=None, groups=groups)
+                return rec
+            shift = max(abs(refit["rho"][g] - fit["rho"][g]) for g in CAPTURE_GROUPS)
+            fit = refit
+        for g in CAPTURE_GROUPS:
+            groups[g]["nodes"] = int(len(tab[g]["z"]))
+    except NoiseBankError as e:
+        rec.update(status="unavailable", reasons=[str(e)], components=None, bootstrap=None)
+        return rec
+    rec["groups"] = groups
+    rec["grid_validation"] = {"label": "local objective-value validation (not a global certificate)",
+                              "worst_miss_per_pair": worst, "tolerance": GRID_LL_TOL, "refined": inserted,
+                              "refit_shift": shift, "shift_flag": shift > GRID_RHO_TOL}
+    rR, rD, eC = fit["SigmaR"][0][0], fit["SigmaD"][0][0], fit["SigmaE"][0][0]
+    rec["components"] = {"SigmaR": fit["SigmaR"], "SigmaD": fit["SigmaD"], "SigmaE": fit["SigmaE"], "fit": fit["fit"],
+                         "loglik": fit["loglik"], "unconstrained_problems": fit["problems"],
+                         "multistart": fit["starts"], "at_box": fit["at_box"],
+                         "box": f"|rho| <= {RHO_MAX}: a registered numerical restriction (a share above it cannot be "
+                                "fitted)",
+                         "shares": {"C": {"row": float(rR), "donor": float(rD), "cell": float(eC)}}}
+    draw = None if draws is None else draws(len(worlds))
+    D, failed, unident = bootstrap(tab, len(worlds), boot, 0, draws=draw, groups=CAPTURE_GROUPS, fit=capture_only_fit,
+                                   entries=_capture_entries, names=CAPTURE_BOOT_NAMES)
+    rec["bootstrap"] = interval_record(D, failed, boot, unident, names=CAPTURE_BOOT_NAMES)
+    rec.update(status="ok", reasons=[])
+    return rec
+
+
+def horizon_estimate_d8(A, horizon, boot=BOOT, m=Z_INTERVALS, text=None):
+    """One horizon of the D8 refit (v5 2.4-2.6): A from arrays(obs, horizon, ceilings) (the capped interval map at
+    k = M_h), the minimum-categories screen, the bootstrap from the horizon's SplitMix64 stream (text: the refit's
+    AnnexH/D8/1/noisebank/D8-refit/h<h>/bootstrap unless given); a zero ceiling gives the capture-only record."""
+    import obslaw
+    draws = d8_draws(text or obslaw.REFIT_TEXT.format(horizon))
+    if A["M"]["S"] == 0:
+        return horizon_capture_only(A, boot, m, draws)
+    return horizon_estimate(A, boot, m=m, screen=True, draws=draws)
+
+
+def d8_provenance_record(raw, bindings, n_obs):
+    """The provenance receipt as estimate_d8 binds it (v5 2.1 item 5): reconstruction from the registered root
+    reproduces the frozen observations exactly, the cell count is the observations', one engine binary -> the
+    engine sha256 (fit.noise.engine_sha256)."""
+    p = _json_of(raw, "provenance receipt")
+    if not isinstance(p, dict) or p.get("schema") != D8_PROVENANCE_SCHEMA:
+        raise NoiseBankError(f"provenance receipt: schema {p.get('schema') if isinstance(p, dict) else None!r} is not "
+                             f"{D8_PROVENANCE_SCHEMA}")
+    rc = p.get("reconstruction") or {}
+    want = {"bank_root": bindings["bank_root"], "observations_sha256": bindings["observations_sha256"],
+            "plan_sha256": bindings["plan_sha256"], "design_sha256": bindings["design_file_sha256"],
+            "ages_sha256": bindings["ages_sha256"], "cells": n_obs}
+    wrong = sorted(k for k, v in want.items() if p.get(k) != v)
+    if wrong or rc.get("equals_frozen") is not True or rc.get("canonical_sha256") != bindings["observations_sha256"]:
+        what = wrong or "reconstruction"
+        raise NoiseBankError(f"provenance receipt: does not bind these inputs ({what}; A_design_v5 2.1 item 5, R5)")
+    if not rqlib.is_sha256(p.get("engine_sha256")):
+        raise NoiseBankError("provenance receipt: no single engine binary sha256 (R5)")
+    return p["engine_sha256"]
+
+
+def estimate_d8(obs_path, ages_path, design_path, plan_path, provenance_path, validation_path, bindings=None,
+                boot=BOOT, m=Z_INTERVALS):
+    """The D8 refit (A_design_v5 2.1-2.7) of the frozen bank observations, everything verified first (R1-R5, R10):
+      1. the four inputs by file sha256 BEFORE parsing (obs 64b113ce..., plan 2ce2bb7a..., design 6559a8da..., ages
+         6ffb99ec...); obs schema obs/1 and missing == []; obs plan_sha256 == the plan's; canonical_sha(design) ==
+         obs design_sha256; the parsed ages == material.registered_ages(); every plan row's ages.sha256 == 6ffb99ec;
+      2. the complete registered allocation and the matched controls (validate_observations; R2), the ceilings
+         247 / 0 / 0 (R4), the support (R3);
+      3. the provenance receipt binds these observations (d8_provenance_record; 2.1 item 5, R5); the validation
+         report's sha256 is recorded (its acceptance gates adoption, R8, not this run);
+      4. per horizon: the capped interval map, the minimum-categories screen (R10), the bootstrap's SplitMix64
+         streams; 10k / 20k capture-only (2.6).
+    bindings: d8_bindings() unless given; any other bindings make the output synthetic. -> the refit record that
+    d8_artifact turns into the bank/3 artifact once its receipt is written (2.8: the receipt first)."""
+    import material
+    b = d8_bindings() if bindings is None else dict(bindings)
+    synthetic = b != d8_bindings()
+    if not isinstance(boot, int) or isinstance(boot, bool) or boot < 1:
+        raise NoiseBankError(f"bootstrap draws must be a positive integer (got {boot!r})")
+    obs_raw = _bound_bytes(obs_path, b["observations_sha256"], "observations")
+    plan_raw = _bound_bytes(plan_path, b["plan_sha256"], "plan")
+    design_raw = _bound_bytes(design_path, b["design_file_sha256"], "design")
+    ages_raw = _bound_bytes(ages_path, b["ages_sha256"], "ages")
+    doc, design = _json_of(obs_raw, "observations"), _json_of(design_raw, "design")
+    if not isinstance(doc, dict) or doc.get("schema") != OBS_SCHEMA:
+        raise NoiseBankError(f"observations schema {doc.get('schema') if isinstance(doc, dict) else None!r} is not "
+                             f"{OBS_SCHEMA}")
+    if doc.get("missing") != []:
+        raise NoiseBankError("observations: the D8 refit needs the complete bank (missing == []; A_design_v5 2.1)")
+    if doc.get("plan_sha256") != b["plan_sha256"]:
+        raise NoiseBankError("observations: plan_sha256 is not the bound plan's (A_design_v5 2.1 item 2)")
+    if not isinstance(design, dict) or rqlib.canonical_sha(design) != doc.get("design_sha256"):
+        raise NoiseBankError("observations: design_sha256 is not the canonical sha256 of the bound design file "
+                             "(A_design_v5 2.1 item 3)")
+    if _json_of(ages_raw, "ages") != material.registered_ages():
+        raise NoiseBankError("ages: the parsed ages are not material.registered_ages() (A_design_v5 2.1 item 4)")
+    rows = _plan_rows(plan_raw)
+    if not rows or any(not isinstance(r, dict) or not isinstance(r.get("ages"), dict)
+                       or r["ages"].get("sha256") != b["ages_sha256"] for r in rows):
+        raise NoiseBankError("plan: a row whose ages.sha256 is not the registered ages' (A_design_v5 2.1 item 4)")
+    coverage = validate_observations(doc, descriptive=False, design=design)            # (R2)
+    obs = doc["observations"]
+    d8_matched_controls(obs)
+    ceilings = d8_ceilings()                                                             # (R4)
+    d8_support(obs, ceilings)                                                            # (R3)
+    prov_raw = rqlib.read_bytes(provenance_path)                                        # (2.1 item 5; R5)
+    engine = d8_provenance_record(prov_raw, b, len(obs))
+    val_raw = rqlib.read_bytes(validation_path)
+    val = _json_of(val_raw, "validation report")
+    if not isinstance(val, dict) or val.get("schema") != D8_REPORT_SCHEMA:
+        raise NoiseBankError(f"validation report: schema is not {D8_REPORT_SCHEMA}")
+    horizons = {}
+    for h in HORIZONS:
+        A = arrays(obs, h, ceilings)
+        if A["R"] != REPLICATES:
+            raise NoiseBankError(f"{A['R']} replicates; {REPLICATES} are registered")
+        horizons[str(h)] = horizon_estimate_d8(A, h, boot, m)
+    inputs = {"observations_sha256": rqlib.sha256_bytes(obs_raw), "ages_sha256": rqlib.sha256_bytes(ages_raw),
+              "plan_sha256": rqlib.sha256_bytes(plan_raw), "design_file_sha256": rqlib.sha256_bytes(design_raw),
+              "design_canonical_sha256": doc["design_sha256"], "provenance_sha256": rqlib.sha256_bytes(prov_raw),
+              "validation_report_sha256": rqlib.sha256_bytes(val_raw)}
+    return {"inputs": inputs, "horizons": horizons, "engine_sha256": engine, "ceilings": ceilings, "boot": boot,
+            "z_intervals": m, "synthetic": synthetic, "coverage": coverage}
+
+
+def d8_implementation():
+    """fit.noise.implementation_sha256 (v5 2.8 L753-754): the canonical sha256 of {file: sha256} over the D8
+    implementation's sources -> (sha256, the map)."""
+    files = {f: rqlib.sha256_file(os.path.join(HERE, f)) for f in D8_IMPLEMENTATION}
+    return rqlib.canonical_sha(files), files
+
+
+def d8_streams():
+    """fit.streams.bootstrap (v5 2.5 item 5, 2.8; clarification 1 C2): the three refit streams' texts, derived seeds
+    and first two next64() outputs, in the order h = 5000, 10000, 20000."""
+    import obslaw
+    texts = [obslaw.REFIT_TEXT.format(h) for h in HORIZONS]
+    return {"generator": obslaw.STREAM_GENERATOR, "namespace": obslaw.STREAM_NAMESPACE, "texts": texts,
+            "seeds": [obslaw.stream_seed_d8(t) for t in texts],
+            "first_outputs": [obslaw.stream_record(t)["first_outputs"] for t in texts]}
+
+
+def d8_artifact(fit, receipt_sha256):
+    """The finfolk.redqueen.noisebank.bank/3 artifact (v5 2.8 in clarification 1's representation; every text and
+    record constant from obslaw, shared with the strict loader): status d8-fitted, or unavailable (R7) when the 5k
+    fit is not ok, a channel has no curve or nu0_C is unavailable; noise and map_variance built from horizons["5000"]
+    (C9); every emitted nu0 positive and finite (clarification 2 D3's domain); no top-level engine_sha256 (the bank
+    executable is fit.noise.engine_sha256: the executable recorded by the bundles that reconstruct the frozen
+    observations, 2.2)."""
+    import material
+    import obslaw
+    hz = fit["horizons"]
+    for h, rec in hz.items():
+        for ch, v in (rec.get("nu0") or {}).items():
+            x = v.get("nu0")
+            if v.get("status") == "estimated" and not (isinstance(x, (int, float)) and not isinstance(x, bool)
+                                                       and math.isfinite(x) and x > 0):
+                raise NoiseBankError(f"horizon {h} nu0 {ch}: an estimated nu0 outside (0, inf) (clarification 2 D3)")
+    base = hz[str(HORIZONS[0])]
+    why = list(base.get("reasons") or []) + [f"no {ch} curve" for ch in ("C", "S", "F") if base["scales"][ch] is None]
+    if base["nu0"]["C"].get("status") == "unavailable":
+        why.append(f"nu0 C unavailable ({base['nu0']['C'].get('reason')})")
+    if base.get("status") != "ok" and not why:
+        why.append(f"5k status {base.get('status')!r}")
+    ceil5 = fit["ceilings"][str(HORIZONS[0])]
+    noise = {"available": not why, "horizon": HORIZONS[0], "capture_bound": capture_bound(HORIZONS[0]),
+             "survivor_ceiling": ceil5}
+    if why:
+        noise["reasons"] = why
+        s_logit = None
+    else:
+        s_logit = {ch: {k: base["scales"][ch][k] for k in ("x", "s", "direction")} for ch in ("C", "S", "F")}
+        c = base["components"]
+        noise.update(s_logit=s_logit, SigmaR=c["SigmaR"], SigmaD=c["SigmaD"], SigmaE=c["SigmaE"])
+    inputs = dict(fit["inputs"])
+    ages = material.registered_ages()
+    return {
+        "schema": obslaw.BANK_SCHEMA, "status": "unavailable" if why else obslaw.STATUS_FITTED,
+        "synthetic": bool(fit["synthetic"]), "cohort": ages, "cohort_sha256": material.AGES_SHA256,
+        "horizon": HORIZONS[0], "dt": DT, "support_law": material.SUPPORT_LAW,
+        "age_clock": material.age_clock_identity(),
+        "survivor_ceiling": ceil5,
+        "fit": {"noise_likelihood": obslaw.NOISE_LIKELIHOOD,
+                "noise": {"implementation_sha256": d8_implementation()[0], "inputs_sha256": rqlib.canonical_sha(inputs),
+                          "receipt_sha256": receipt_sha256, "engine_sha256": fit["engine_sha256"]},
+                "streams": {"bootstrap": d8_streams()}},
+        "noise": noise,
+        "map_variance": {"s_logit": s_logit, "nu0": base["nu0"], "rule": obslaw.MAP_VARIANCE_RULE,
+                         "consumer": obslaw.MAP_VARIANCE_CONSUMER},
+        "d8": {"amendment_sha256": obslaw.D8_SHA256, "capture_law": obslaw.CAPTURE_LAW,
+               "ceilings": dict(fit["ceilings"]), "max_age": ages["max_age"], "denominator": N_PREY,
+               "age_predicate": obslaw.D8_TEXTS["age_predicate"],
+               "capped_category": obslaw.D8_TEXTS["capped_category"]},
+        "inputs": inputs,
+        "estimator": dict(obslaw.registered_estimator(), boot=fit["boot"], z_intervals=fit["z_intervals"]),
+        "horizons": hz,
+    }
+
+
+# ---------------------------------------------------------------- provenance (v5 2.2: the store, the reconstruction)
+def _manifest_check(path, root, recs):
+    """v5 2.2 item 4: a pre-existing integrity manifest (sha256sum lines "<sha256>  <path>", a path absolute or
+    relative to the bank root): every chunk it lists must match it (a mismatch refuses, R9); covers_chunks when it
+    lists every chunk of the store."""
+    import store
+    raw = rqlib.read_bytes(path)
+    listed = {}
+    for i, ln in enumerate(raw.decode("utf-8").splitlines(), 1):
+        if not ln.strip():
+            continue
+        parts = ln.split(None, 1)
+        if len(parts) != 2 or not rqlib.is_sha256(parts[0]):
+            raise NoiseBankError(f"manifest {path} line {i}: not a sha256sum line")
+        p = parts[1].strip().lstrip("*")
+        listed[os.path.normpath(p if os.path.isabs(p) else os.path.join(root, p))] = parts[0]
+    checked = 0
+    for r in recs:
+        p = os.path.normpath(os.path.join(root, store.CHUNKS, r["chunk"]))
+        if p in listed:
+            if rqlib.sha256_file(p) != listed[p]:
+                raise NoiseBankError(f"provenance: chunk {r['chunk']} differs from the manifest {path} (R9)")
+            checked += 1
+    return {"sha256": rqlib.sha256_bytes(raw), "covers_chunks": bool(recs) and checked == len(recs),
+            "chunks_checked": checked}
+
+
+def provenance(study, design_path, plan_path, obs_path, manifest_path=None, bindings=None):
+    """`noisebank.py provenance` (A_design_v5 2.2): the receipt that binds the frozen observations to the stored
+    bundles and the executable they record. In this order, each failure a refusal (R5, R9):
+      1. the root: the registered bank root by path (a copy, restore elsewhere or replay is refused); the design,
+         plan and observations by file sha256 before parsing;
+      2. store integrity, independent of any manifest: store.verify_all(root, deep=True) and, for every chunk holding
+         a cell of the plan, store.verify_chunk (CRCs, the exact member set, every member's sha256);
+      5. from the same verified bundles (store.read_packed: read_member's index-checked read, refused with context,
+         #90): exactly ONE binary_sha256, tools_sha256 recorded as a set, every plan row's ages.sha256 the
+         registered ages', the cell set equal to the observations';
+      3. the reconstruction: collect(root, design, plan) IN MEMORY (since #90 collect_with_age_diagnostics(...)[0],
+         the same bytes), sha256(rqlib.canonical(doc)) == the frozen observations' (only the boolean and the two
+         hashes are recorded; the document is never written or printed);
+      4. a pre-existing manifest, when given (_manifest_check); otherwise covers_chunks false.
+    Reads bundles that contain scores (as collect always has) but reports none. -> the provenance/1 record."""
+    import store
+    import zipfile
+    try:
+        return _provenance(study, design_path, plan_path, obs_path, manifest_path, bindings)
+    except (store.StoreError, zipfile.BadZipFile, KeyError, TypeError) as e:
+        raise NoiseBankError(f"provenance: the store cannot be read as indexed ({type(e).__name__}: {e}; R9)") \
+            from None
+
+
+def _provenance(study, design_path, plan_path, obs_path, manifest_path, bindings):
+    import store
+    b = d8_bindings() if bindings is None else dict(bindings)
+    root = os.path.abspath(study)
+    if root != b["bank_root"] or os.path.realpath(study) != b["bank_root"]:
+        raise NoiseBankError(f"provenance: {study} is not the registered bank root {b['bank_root']} (refused by path: "
+                             "a copy, a restore elsewhere or a replay; A_design_v5 2.2 item 1, R9)")
+    design_raw = _bound_bytes(design_path, b["design_file_sha256"], "design")
+    _bound_bytes(plan_path, b["plan_sha256"], "plan")
+    obs_raw = _bound_bytes(obs_path, b["observations_sha256"], "observations")
+    design, obs_doc = _json_of(design_raw, "design"), _json_of(obs_raw, "observations")
+    index = os.path.join(root, store.INDEX)
+    if not os.path.isfile(index):
+        raise NoiseBankError(f"provenance: no chunk index at {index} (R9)")
+    index_sha = rqlib.sha256_file(index)
+    probs = store.verify_all(root, deep=True)                                          # 2(a)
+    if probs:
+        raise NoiseBankError(f"provenance: store.verify_all(deep=True) reports {len(probs)} problem(s): {probs[:3]} "
+                             "(R9)")
+    recs, cells = store.load_index(root)
+    rows, plan_sha = bind_plan(design, plan_path)
+    ours = sorted(c for c in rows if c in cells)
+    chunks = sorted({cells[c][0]["chunk"] for c in ours})
+    for r in recs:                                                                      # 2(b)
+        if r["chunk"] in chunks:
+            probs = store.verify_chunk(os.path.join(root, store.CHUNKS, r["chunk"]), r["cells"])
+            if probs:
+                raise NoiseBankError(f"provenance: store.verify_chunk({r['chunk']}) reports {probs[:3]} (R9)")
+    binaries, tools = set(), {}                                                         # 5.
+    for cid in ours:
+        bd = _json_of(store.read_packed(root, cid, cells=cells), f"bundle {cid}")
+        binaries.add(bd.get("binary_sha256"))
+        t = bd.get("tools_sha256")
+        tools[rqlib.canonical_sha(t)] = t
+    if len(binaries) != 1 or not rqlib.is_sha256(next(iter(binaries))):
+        raise NoiseBankError(f"provenance: the bundles record {len(binaries)} engine binaries, not exactly one sha256 "
+                             "(A_design_v5 2.2 item 5, R5)")
+    if any(not isinstance(r.get("ages"), dict) or r["ages"].get("sha256") != b["ages_sha256"] for r in rows.values()):
+        raise NoiseBankError("provenance: a plan row's ages.sha256 is not the registered ages' (R5)")
+    obs_cells = {o.get("cell") for o in obs_doc.get("observations", [])} if isinstance(obs_doc, dict) else set()
+    if set(ours) != obs_cells:
+        raise NoiseBankError(f"provenance: the stored cell set differs from the observations' "
+                             f"({len(set(ours) ^ obs_cells)} cells; R5)")
+    doc = collect(root, design, plan_path)                                              # 3.
+    got = rqlib.canonical_sha(doc)
+    del doc
+    if got != b["observations_sha256"]:
+        raise NoiseBankError(f"provenance: the reconstruction's canonical sha256 {got} is not the frozen observations' "
+                             f"{b['observations_sha256']} (R9)")
+    manifest = (_manifest_check(manifest_path, root, recs) if manifest_path else           # 4.
+                {"sha256": None, "covers_chunks": False, "chunks_checked": 0})
+    return {"schema": D8_PROVENANCE_SCHEMA, "bank_root": root, "observations_sha256": rqlib.sha256_bytes(obs_raw),
+            "store": {"index_sha256": index_sha, "chunks_verified_all": len(recs),
+                      "chunks_verified_members": len(chunks)},
+            "reconstruction": {"method": "noisebank.collect in memory; sha256 of rqlib.canonical(doc), the bytes "
+                                         "write_json_durable writes", "canonical_sha256": got, "equals_frozen": True},
+            "plan_sha256": plan_sha, "design_sha256": rqlib.sha256_bytes(design_raw), "manifest": manifest,
+            "cells": len(ours), "engine_sha256": next(iter(binaries)),
+            "tools_sha256": [tools[k] for k in sorted(tools)], "ages_sha256": b["ages_sha256"]}
+
+
+# ---------------------------------------------------------------- the receipt and the D5 ledger (v5 2.8, 2.11)
+def _cpu_s():
+    import resource
+    s, c = resource.getrusage(resource.RUSAGE_SELF), resource.getrusage(resource.RUSAGE_CHILDREN)
+    return s.ru_utime + s.ru_stime + c.ru_utime + c.ru_stime
+
+
+def ledger_add(path, entry):
+    """One CPU entry appended to the cumulative D5 ledger, in calib.ledger_add's format (#68 @ff67064 calib.py:2998:
+    one sort_keys JSON line with its utc), fsync'd."""
+    with open(path, "a") as f:
+        f.write(json.dumps(dict(entry, utc=rqlib.now_utc()), sort_keys=True) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def ledger_total(paths):
+    """calib.ledger_total's sum (by kind) against the D5 ceiling (D5_CEILING_H)."""
+    by = {}
+    n = 0
+    for p in paths:
+        if not os.path.isfile(p):
+            continue
+        for ln in rqlib.read_text(p).splitlines():
+            if ln.strip():
+                e = json.loads(ln)
+                n += 1
+                by[e.get("kind", "?")] = by.get(e.get("kind", "?"), 0.0) + float(e.get("cpu_s", 0.0))
+    tot = sum(by.values())
+    return {"entries": n, "cpu_h": tot / 3600, "by_kind_h": {k: v / 3600 for k, v in sorted(by.items())},
+            "ceiling_h": D5_CEILING_H, "remaining_h": D5_CEILING_H - tot / 3600}
+
+
+def d8_receipt(argv, fit, impl, utc_start, utc_end, cpu_s, entry):
+    """The refit receipt (finfolk.redqueen.noisebank.d8refitreceipt/1, v5 2.8 L755-757): command line, tool and input
+    hashes, Python / NumPy versions, host, UTC start / end, CPU seconds (resource.getrusage), the ledger entry. It
+    is written durably BEFORE the artifact, which binds its sha256."""
+    import platform
+    import numpy as np
+    return {"schema": D8_RECEIPT_SCHEMA, "command": list(argv), "tools": impl[1], "implementation_sha256": impl[0],
+            "inputs": fit["inputs"], "python": sys.version, "numpy": np.__version__, "host": platform.node(),
+            "utc_start": utc_start, "utc_end": utc_end, "cpu_s": cpu_s, "ledger_entry": entry,
+            "boot": fit["boot"], "synthetic": fit["synthetic"]}
+
+
+# ---------------------------------------------------------------- the prospective validation (v5 2.10, PC-12, PC-22)
+# v5 2.10's declared synthetic parameters (written before any run, chosen without reference to bank values) and the
+# items v5 leaves to the validation spec, as this code implements them (the spec must equal d8_validation_spec()).
+D8_VAL = {"SigmaR": [[0.25, 0.05, 0.05], [0.05, 0.25, 0.15], [0.05, 0.15, 0.50]],
+          "SigmaD": [[0.25, 0.05], [0.05, 0.25]], "SigmaE": [[0.50, 0.10], [0.10, 0.50]],
+          "curves": {"C": {"x": [-2.2, -0.6, 0.4], "s": [0.55, 0.30, 0.20]},
+                     "S": {"x": [-2.5, -1.2, -0.5], "s": [0.35, 0.25, 0.22]},
+                     "F": {"x": [-2.5, -1.2, -0.5], "s": [0.35, 0.25, 0.22]}},
+          "means": {"C": "sigma(-0.6 + 0.4 z), z ~ U[-2, 2] per exposed pair",
+                    "F": "c sigma(eta_i), eta_i ~ U[0.5, 3.5] per prey snapshot",
+                    "S": "c sigma(eta_i - Delta_ij), Delta_ij ~ U[0, 1] per exposed pair"},
+          "banks": 10, "R": REPLICATES, "B": 324, "N": N_PREY, "M": 247, "horizon": 5000,
+          "V2": {"floor": 0.02, "se_multiplier": 2.6},
+          "V3": {"points": 201, "quantiles": [0.05, 0.95], "dev_max": 0.10, "avg": [0.95, 1.05]}}
+D8_VAL_PURPOSES = ("means", "rows", "donors", "cells", "free")
+D8_VAL_TEXT = "AnnexH/D8/1/noisebank/D8-validation/{bank}/{purpose}"     # (v5 2.5 item 5)
+D8_VAL_NAMES = ("R_CC", "R_SS", "R_CS", "R_CF", "R_SF", "D_CC", "D_SS", "D_CS", "E_CC", "E_SS", "E_CS")
+
+
+def d8_validation_truth():
+    """The declared components with SigmaR[F,F] set to the registered convention v' A^+ v (as components_of) and the
+    11 BOOT_NAMES values they imply."""
+    import numpy as np
+    SR = np.array(D8_VAL["SigmaR"], float)
+    A, v = SR[:2, :2], SR[:2, 2]
+    SR[2, 2] = float(v @ np.linalg.pinv(A, rcond=1e-12) @ v)
+    SD, SE = np.array(D8_VAL["SigmaD"], float), np.array(D8_VAL["SigmaE"], float)
+    theta = dict(zip(BOOT_NAMES, _entries({"SigmaR": SR, "SigmaD": SD, "SigmaE": SE})))
+    return SR, SD, SE, {k: float(v) for k, v in theta.items()}
+
+
+def d8_validation_spec(design_file_sha256, round_=1):
+    """The validation spec (v5 2.10, written and witnessed at 7 step 3 before any run): the declared parameters, the
+    registered size, the streams and their draw order, the fit, the acceptance rules V1-V5. round_ 2.. are the
+    fresh-key reruns after a failure (bank<k>-r<round>)."""
+    import obslaw
+    sfx = "" if round_ == 1 else f"-r{round_}"
+    banks = [f"bank{k}{sfx}" for k in range(1, D8_VAL["banks"] + 1)]
+    SR = d8_validation_truth()[0]
+    return {
+        "schema": D8_SPEC_SCHEMA, "design": f"{D8_DESIGN} section 2.10 (PC-12, PC-22)", "round": round_,
+        "bank_design_file_sha256": design_file_sha256,
+        "size": {k: D8_VAL[k] for k in ("R", "B", "N", "M", "horizon")},
+        "parameters": {"SigmaR": SR.tolist(), "SigmaR_FF": "the registered convention v' A^+ v (components_of)",
+                       "SigmaD": D8_VAL["SigmaD"], "SigmaE": D8_VAL["SigmaE"], "curves": D8_VAL["curves"],
+                       "means": D8_VAL["means"]},
+        "streams": {"generator": obslaw.STREAM_GENERATOR, "namespace": obslaw.STREAM_NAMESPACE,
+                    "text": D8_VAL_TEXT, "purposes": list(D8_VAL_PURPOSES), "banks": banks,
+                    "v5_bank": f"bank{D8_VAL['banks'] + 1}{sfx}", "fit_bootstrap_purpose": "bootstrap"},
+        "draw_order": {
+            "structure": "exposed pairs = the design's (prey, predator) snapshot keys sorted; prey snapshots sorted; "
+                         "predator snapshots sorted (noisebank.arrays' order)",
+            "means": "per exposed pair in that order two uniforms (u_C: z = -2 + 4 u_C; u_S: Delta = u_S), then per "
+                     "prey snapshot one (u_F: eta = 0.5 + 3 u_F); uniforms (x >> 11) 2^-53",
+            "rows": "Z_R = splitmix_normals(rows, nQ R 3) reshaped C-order to (nQ, R, 3)",
+            "donors": "Z_D = splitmix_normals(donors, nP R 2) reshaped C-order to (nP, R, 2)",
+            "cells": "Z_E = splitmix_normals(cells, |E| R 2) reshaped C-order to (|E|, R, 2)",
+            "free": "Z_EF = splitmix_normals(free, nQ R) reshaped C-order to (nQ, R)",
+            "counts": "obslaw.latent + generate_counts with exact locations (obslaw.solve_location)"},
+        "fit": {"horizon": D8_VAL["horizon"], "boot": 1, "z_intervals": Z_INTERVALS,
+                "estimator": "estimate_d8's horizon fit (capped interval map, minimum-categories screen)"},
+        "acceptance": {"V1": "every bank's 5k fit has status ok with all three curves",
+                       "V2": dict(D8_VAL["V2"], rule="|mean(theta_hat - theta)| <= max(floor, se_multiplier SE), "
+                                                     "SE = sd(ddof=1) / sqrt(banks), each BOOT_NAMES entry"),
+                       "V3": dict(D8_VAL["V3"], rule="per bank and channel on the usable cells' logit mean fractions: "
+                                                     "type-7 quantiles, equally spaced points, r = S_hat / S; median "
+                                                     "over banks of max|r - 1| <= dev_max and of mean r in avg; a bank "
+                                                     "failing V1 fails V3"),
+                       "V4": {"banks": banks[:2], "reported": True,
+                              "map": "legacy uncapped interval map (ceiling = N), marginals and s(mu) only, S and F"},
+                       "V5": "the M = 0 bank yields S / F structural_zero and an ok capture-only fit"},
+    }
+
+
+def _sigmoid(x):
+    import numpy as np
+    return 1.0 / (1.0 + np.exp(-np.asarray(x, float)))
+
+
+def d8_structure(design):
+    """The bank's pairing structure (v5 2.10: from bank.design.json): sorted exposed pairs, prey and predator
+    snapshot keys."""
+    rows, _, _ = planlib.expand_v2(design, pending=True)
+    pairs = sorted({((r["prey"]["world"], r["prey"]["time"]), (r["predators"]["world"], r["predators"]["time"]))
+                    for r in rows if r["predators"] is not None})
+    prey = sorted({p for p, _ in pairs} |
+                  {(r["prey"]["world"], r["prey"]["time"]) for r in rows if r["predators"] is None})
+    pred = sorted({q for _, q in pairs})
+    return pairs, prey, pred
+
+
+def d8_validation_bank(spec, bank, structure, M=None, R=None):
+    """One synthetic bank (v5 2.10) drawn by obslaw from the declared parameters on the D8 streams of `bank`, in the
+    spec's draw order -> (5k observations, the stream records {purpose: {text, seed, generator, first_outputs}})."""
+    import numpy as np
+    import obslaw
+    pairs, prey, pred = structure
+    R = spec["size"]["R"] if R is None else R
+    B, N = spec["size"]["B"], spec["size"]["N"]
+    M = spec["size"]["M"] if M is None else M
+    c = M / N
+    qi = np.array([prey.index(p) for p, _ in pairs], np.int64)
+    pj = np.array([pred.index(q) for _, q in pairs], np.int64)
+    nE, nQ, nP = len(pairs), len(prey), len(pred)
+    records = {}
+
+    def stream(purpose):
+        t = spec["streams"]["text"].format(bank=bank, purpose=purpose)
+        records[purpose] = obslaw.stream_record(t)
+        return obslaw.d8_stream(t)
+    u = obslaw.splitmix_uniforms(stream("means"), 2 * nE + nQ)
+    z, delta, eta = -2.0 + 4.0 * u[0:2 * nE:2], u[1:2 * nE:2], 0.5 + 3.0 * u[2 * nE:]
+    mu = {"C": _sigmoid(-0.6 + 0.4 * z), "S": c * _sigmoid(eta[qi] - delta), "F": c * _sigmoid(eta)}
+    Z = {"R": obslaw.splitmix_normals(stream("rows"), nQ * R * 3).reshape(nQ, R, 3),
+         "D": obslaw.splitmix_normals(stream("donors"), nP * R * 2).reshape(nP, R, 2),
+         "E": obslaw.splitmix_normals(stream("cells"), nE * R * 2).reshape(nE, R, 2),
+         "EF": obslaw.splitmix_normals(stream("free"), nQ * R).reshape(nQ, R)}
+    SR, SD, SE = d8_validation_truth()[:3]
+    lat = obslaw.latent(Z, obslaw.psd_factors(SR.tolist(), SD.tolist(), SE.tolist()), qi, pj)
+    K = {}
+    for ch, n_, m_ in (("C", B, B), ("S", N, M), ("F", N, M)):
+        curve = spec["parameters"]["curves"][ch]
+        K[ch] = obslaw.generate_counts(mu[ch], lat[ch], n_, m_, lambda x, cv=curve: obslaw.scale(cv, x),
+                                       lambda x, i, cv=curve, n2=n_, m2=m_: obslaw.solve_location(
+                                           x, obslaw.scale(cv, x), n2, m2)[0])[0]
+    obs = []
+    for e, (p, q) in enumerate(pairs):
+        for r in range(R):
+            obs.append({"cell": f"v{e}.{r}", "prey": list(p), "pred": list(q), "replicate": r,
+                        "horizons": {"5000": {"captures": int(K["C"][e, r]), "survivors": int(K["S"][e, r])}}})
+    for i, p in enumerate(prey):
+        for r in range(R):
+            obs.append({"cell": f"f{i}.{r}", "prey": list(p), "pred": None, "replicate": r,
+                        "horizons": {"5000": {"captures": None, "survivors": int(K["F"][i, r])}}})
+    return obs, records
+
+
+def _v3_stats(mu, curve, true_curve, spec):
+    """V3's per-bank, per-channel statistics (v5 2.10, PC-22): the usable cells' mean fractions mu -> D = [q05, q95] of
+    their logits (type-7), the ratio r_j = S_hat / S at the equally spaced points -> {dev: max|r - 1|, avg: mean r}
+    (None without a curve or cells)."""
+    import numpy as np
+    v3 = spec["acceptance"]["V3"]
+    mu = np.asarray(mu, float)
+    if curve is None or len(mu) == 0:
+        return None
+    x = np.log(mu / (1.0 - mu))
+    lo, hi = np.quantile(x, v3["quantiles"])
+    xs = np.linspace(lo, hi, v3["points"])
+    r = noisescale.evaluate(curve, _sigmoid(xs)) / noisescale.evaluate(true_curve, _sigmoid(xs))
+    return {"dev": float(np.max(np.abs(r - 1.0))), "avg": float(np.mean(r))}
+
+
+def d8_validation_criteria(spec, banks, legacy, v5):
+    """V1-V5 (v5 2.10, PC-12) from the per-bank results -> the acceptance record. banks: {bank: {"status", "curves"
+    (C, S, F: noisescale curves or None), "theta" (BOOT_NAMES -> value or None), "v3" (channel -> {dev, avg} or
+    None)}}; legacy: {bank: {S, F: {dev, avg} or None}} (V4, reported); v5: the M = 0 bank's horizon record."""
+    import numpy as np
+    theta = d8_validation_truth()[3]
+    names = list(spec["streams"]["banks"])
+    V1 = {b: banks[b]["status"] == "ok" and all(banks[b]["curves"].get(ch) is not None for ch in ("C", "S", "F"))
+          for b in names}
+    v1 = all(V1.values())
+    V2 = {}
+    for k in D8_VAL_NAMES:
+        d = [banks[b]["theta"].get(k) for b in names]
+        if not v1 or any(x is None for x in d):
+            V2[k] = {"pass": False, "reason": "a bank failed V1"}
+            continue
+        d = np.array(d, float) - theta[k]
+        se = float(np.std(d, ddof=1) / math.sqrt(len(d)))
+        bound = max(spec["acceptance"]["V2"]["floor"], spec["acceptance"]["V2"]["se_multiplier"] * se)
+        V2[k] = {"bias": float(np.mean(d)), "se": se, "bound": bound, "pass": abs(float(np.mean(d))) <= bound}
+    V3 = {}
+    v3s = spec["acceptance"]["V3"]
+    for ch in ("C", "S", "F"):
+        st = [banks[b]["v3"].get(ch) for b in names]
+        if not v1 or any(s is None for s in st):
+            V3[ch] = {"pass": False, "reason": "a bank failed V1"}
+            continue
+        dev = float(np.median([s["dev"] for s in st]))
+        avg = float(np.median([s["avg"] for s in st]))
+        V3[ch] = {"median_dev": dev, "median_avg": avg,
+                  "pass": dev <= v3s["dev_max"] and v3s["avg"][0] <= avg <= v3s["avg"][1]}
+    V4 = {}
+    for b, st in legacy.items():
+        V4[b] = {ch: (None if s is None else dict(s, outside_band=not (s["dev"] <= v3s["dev_max"] and
+                                                                        v3s["avg"][0] <= s["avg"] <= v3s["avg"][1])))
+                 for ch, s in st.items()}
+    import obslaw
+    v5ok = (v5.get("status") == "ok" and v5["channels"].get("S") == obslaw.STRUCTURAL_ZERO
+            and v5["channels"].get("F") == obslaw.STRUCTURAL_ZERO and not set(v5.get("scales") or {}) - {"C"}
+            and v5.get("components") is not None and v5["components"].get("fit") == "unconstrained")
+    out = {"V1": {"pass": v1, "banks": V1}, "V2": {"pass": all(x["pass"] for x in V2.values()), "entries": V2},
+           "V3": {"pass": all(x["pass"] for x in V3.values()), "channels": V3},
+           "V4": {"reported": True, "banks": V4,
+                  "shows_bias": any(s and s["outside_band"] for st in V4.values() for s in st.values())},
+           "V5": {"pass": bool(v5ok), "status": v5.get("status"), "reasons": v5.get("reasons")}}
+    out["accepted"] = out["V1"]["pass"] and out["V2"]["pass"] and out["V3"]["pass"] and out["V5"]["pass"]
+    return out
+
+
+def _bank_result(rec):
+    """What V1-V3 read of one bank's 5k horizon record."""
+    import numpy as np
+    curves = {ch: (rec.get("scales") or {}).get(ch) for ch in ("C", "S", "F")}
+    th = {k: None for k in D8_VAL_NAMES}
+    if rec.get("status") == "ok":
+        c = rec["components"]
+        th = dict(zip(D8_VAL_NAMES, (float(x) for x in _entries({k: np.array(c[k], float)
+                                                                    for k in ("SigmaR", "SigmaD", "SigmaE")}))))
+    return {"status": rec.get("status"), "curves": curves, "theta": th}
+
+
+def validate_d8(spec, design_path, bindings=None, m=Z_INTERVALS, structure=None, R=None):
+    """`noisebank.py validate-d8` (A_design_v5 2.10): the prospective parameter-recovery study of the capped estimator
+    on synthetic banks at the registered size, from the witnessed spec (which must be exactly d8_validation_spec of
+    the bound design, round included). Per bank: draw (d8_validation_bank), fit the 5k horizon as estimate_d8 does
+    (the bootstrap from the bank's own `bootstrap` purpose), record what V1-V3 read; V4 refits the first two banks'
+    marginals and s(mu) under the legacy uncapped map; V5 draws and fits the M = 0 bank. -> the report (no ledger or
+    timing fields: the CLI adds them). structure / R: test hooks only (never on the command line)."""
+    import obslaw
+    b = d8_bindings() if bindings is None else dict(bindings)
+    design_raw = _bound_bytes(design_path, b["design_file_sha256"], "design")
+    rnd = spec.get("round") if isinstance(spec, dict) else None
+    if type(rnd) is not int or rnd < 1 or rqlib.canonical(spec) != rqlib.canonical(
+            d8_validation_spec(b["design_file_sha256"], rnd)):
+        raise NoiseBankError("validate-d8: the spec is not the registered validation spec of this code and design "
+                             "(d8_validation_spec; A_design_v5 2.10: fixed and witnessed before any run)")
+    structure = structure or d8_structure(_json_of(design_raw, "design"))
+    true_curves = spec["parameters"]["curves"]
+    h = spec["size"]["horizon"]
+    banks, legacy, streams = {}, {}, {}
+
+    def fitted(bank, M):
+        obs, recs = d8_validation_bank(spec, bank, structure, M=M, R=R)
+        text = spec["streams"]["text"].format(bank=bank, purpose=spec["streams"]["fit_bootstrap_purpose"])
+        recs["bootstrap"] = obslaw.stream_record(text)
+        streams[bank] = recs
+        return obs, horizon_estimate_d8(arrays(obs, h, {str(h): M}), h, spec["fit"]["boot"], m, text=text)
+    for bank in spec["streams"]["banks"]:
+        obs, rec = fitted(bank, spec["size"]["M"])
+        res = _bank_result(rec)
+        res["v3"] = {ch: _v3_stats([p[0] for p in (rec.get("curve_points") or {}).get(ch, [])], res["curves"][ch],
+                                   true_curves[ch], spec) for ch in ("C", "S", "F")}
+        res["counts"], res["reasons"] = rec.get("channels"), rec.get("reasons")
+        banks[bank] = res
+        if bank in spec["acceptance"]["V4"]["banks"]:
+            UL = usable(arrays(obs, h))                          # (the legacy map: M = N, no screen)
+            legacy[bank] = {}
+            for ch in ("S", "F"):
+                okc = UL[ch]["ok"]
+                cv = fit_scale(UL[ch]["mu"][okc], UL[ch]["sigma"][okc] ** 2)
+                legacy[bank][ch] = _v3_stats(UL[ch]["mu"][okc], cv, true_curves[ch], spec)
+    vb = spec["streams"]["v5_bank"]
+    _, v5rec = fitted(vb, 0)
+    crit = d8_validation_criteria(spec, banks, legacy, v5rec)
+    return {"schema": D8_REPORT_SCHEMA, "spec_sha256": rqlib.canonical_sha(spec),
+            "design_file_sha256": rqlib.sha256_bytes(design_raw), "synthetic_banks": True,
+            "implementation_sha256": d8_implementation()[0], "streams": streams, "banks": banks,
+            "legacy_V4": legacy, "v5_bank": {"status": v5rec.get("status"), "channels": v5rec.get("channels"),
+                                             "reasons": v5rec.get("reasons")},
+            "acceptance": crit}
+
+
+def assemble_generator(bank_path, mean, allow_synthetic=False):
+    """A's assembly of a D8 generator parameter artifact (v5 2.8 assembly contract, PC-21): the adopted bank/3
+    artifact (validated by obslaw's strict loader, its bytes named by fit.noise.source_artifact_sha256) supplies the
+    COMPLETE noise block verbatim, its complete fit.noise record plus exactly one key (source_artifact_sha256),
+    fit.noise_likelihood and the seven shared provenance fields verbatim; mean (the H.9.1 mean fit, outside A)
+    supplies schema, fitted, theta, ar, capture_bound, replicates, the top-level engine_sha256 (the production
+    assay engine = fit.mean.engine_sha256) and fit.mean_head / fit.mean. A mean block carrying any bank-supplied
+    field is refused (no field is overwritten). #68's check_params(production=True) and check_noise_source verify
+    the result (T5-4)."""
+    import copy
+    import obslaw
+    raw = rqlib.read_bytes(bank_path)
+    sha = rqlib.sha256_bytes(raw)
+    obslaw.BankArtifact(bank_path, sha256=sha, allow_synthetic=allow_synthetic)
+    bank = json.loads(raw)
+    shared = ("cohort", "cohort_sha256", "horizon", "dt", "support_law", "age_clock", "survivor_ceiling")
+    clash = sorted(k for k in mean if k in shared + ("noise",)) + sorted(
+        k for k in (mean.get("fit") or {}) if k in ("noise", "noise_likelihood", "streams"))
+    if clash:
+        raise NoiseBankError(f"assembly: the mean block carries bank-supplied fields {clash} (refused)")
+    out = copy.deepcopy({k: v for k, v in mean.items() if k != "fit"})
+    out.update({k: copy.deepcopy(bank[k]) for k in shared})
+    out["noise"] = copy.deepcopy(bank["noise"])
+    out["fit"] = dict(copy.deepcopy(mean.get("fit") or {}), noise_likelihood=bank["fit"]["noise_likelihood"],
+                      noise=dict(copy.deepcopy(bank["fit"]["noise"]), source_artifact_sha256=sha))
+    return out
+
+
+class _Charge:
+    """One D8 run's charge to the cumulative D5 ledger (v5 2.11): appended exactly once, failed and interrupted runs
+    too (an exception leaves the entry "failed", an interrupt "interrupted")."""
+
+    def __init__(self, ledger, kind, command):
+        self.ledger, self.c0, self.done = ledger, _cpu_s(), False
+        self.entry = {"kind": kind, "command": command, "status": "failed"}
+
+    def __enter__(self):
+        return self
+
+    def measure(self, status):
+        self.entry.update(status=status, cpu_s=_cpu_s() - self.c0)
+        return self.entry
+
+    def charge(self):
+        if not self.done:
+            self.entry.setdefault("cpu_s", _cpu_s() - self.c0)
+            ledger_add(self.ledger, self.entry)
+            self.done = True
+
+    def __exit__(self, et, ev, tb):
+        if not self.done:
+            if et is not None and issubclass(et, KeyboardInterrupt):
+                self.entry["status"] = "interrupted"
+            self.entry["cpu_s"] = _cpu_s() - self.c0
+            self.charge()
+        return False
+
+
+def run_provenance(study, design, plan, obs, manifest, out, ledger, bindings=None):
+    """`provenance` with its D5 charge: the starting guard first (>= D8_START_GUARD_H CPU-h remaining, v5 2.11 / 7;
+    refused before any work), then the receipt written durably -> the receipt."""
+    before = ledger_total([ledger])
+    if before["remaining_h"] < D8_START_GUARD_H:
+        raise NoiseBankError(f"{before['remaining_h']:.2f} CPU-h remain on the D5 ledger, below the starting guard "
+                             f"{D8_START_GUARD_H} (A_design_v5 2.11, 7): refused")
+    with _Charge(ledger, "D8-noisebank-provenance", "provenance") as ch:
+        rec = provenance(study, design, plan, obs, manifest, bindings)
+        rqlib.write_json_durable(out, rec)
+        ch.measure("ok")
+        ch.charge()
+    return rec
+
+
+def run_estimate_d8(obs, ages, design, plan, prov, validation, out, receipt, ledger, argv, bindings=None, boot=BOOT,
+                    m=Z_INTERVALS):
+    """`estimate-d8` with its receipt and D5 charge (v5 2.8 L755-757): the refit, then the receipt (with the ledger
+    entry) written durably FIRST, the entry appended to the ledger, then the artifact that binds the receipt's
+    sha256 -> the artifact."""
+    start = rqlib.now_utc()
+    with _Charge(ledger, "D8-noisebank-refit", "estimate-d8") as ch:
+        fit = estimate_d8(obs, ages, design, plan, prov, validation, bindings, boot, m)
+        impl = d8_implementation()
+        entry = ch.measure("ok")
+        rqlib.write_json_durable(receipt, d8_receipt(argv, fit, impl, start, rqlib.now_utc(), entry["cpu_s"], entry))
+        ch.charge()
+        art = d8_artifact(fit, rqlib.sha256_file(receipt))
+        rqlib.write_json_durable(out, art)
+    return art
+
+
+def run_validate_d8(spec, design, out, ledger, bindings=None, **hooks):
+    """`validate-d8` with its D5 charge: the report carries the ledger before the run and this run's entry (the
+    after-validation check of v5 2.11 re-projects from them) -> the report."""
+    before = ledger_total([ledger])
+    start = rqlib.now_utc()
+    with _Charge(ledger, "D8-noisebank-validation", "validate-d8") as ch:
+        rep = validate_d8(rqlib.read_json(spec), design, bindings, **hooks)
+        entry = ch.measure("ok")
+        rep.update(ledger_before=before, ledger_entry=dict(entry), utc_start=start, utc_end=rqlib.now_utc())
+        rqlib.write_json_durable(out, rep)
+        ch.charge()
+    return rep
+
+
+def _d8_main(a, argv):
+    """The D8 commands (A_design_v5 2.2, 2.8, 2.10, 2.11)."""
+    import signal
+
+    def term(signum, frame):
+        raise KeyboardInterrupt(f"signal {signum}")
+    signal.signal(signal.SIGTERM, term)
+    if a.cmd == "d8-validation-spec":
+        rqlib.write_json_durable(a.out, d8_validation_spec(rqlib.sha256_file(a.design), a.round))
+        print(f"validation spec written: {a.out}")
+        return 0
+    t = ledger_total([a.ledger])
+    print(f"D5 ledger before {a.cmd}: {t['cpu_h']:.3f} CPU-h charged, {t['remaining_h']:.3f} remaining")
+    if a.cmd == "provenance":
+        rec = run_provenance(a.study, a.design, a.plan, a.obs, a.manifest, a.out, a.ledger)
+        print(json.dumps({k: rec[k] for k in ("cells", "engine_sha256", "manifest", "store")}, sort_keys=True))
+        code = 0
+    elif a.cmd == "validate-d8":
+        rep = run_validate_d8(a.spec, a.design, a.out, a.ledger)
+        print(json.dumps({"accepted": rep["acceptance"]["accepted"]}))
+        code = 0 if rep["acceptance"]["accepted"] else 2
+    else:
+        art = run_estimate_d8(a.obs, a.ages, a.design, a.plan, a.provenance, a.validation_report, a.out, a.receipt,
+                              a.ledger, argv, boot=a.boot)
+        print(json.dumps({"status": art["status"], "noise_available": art["noise"]["available"]}))
+        code = 0
+        if art["status"] != "d8-fitted":
+            print(f"noisebank.py estimate-d8: the bank/3 artifact is unavailable: {art['noise'].get('reasons')}",
+                  file=sys.stderr)
+            code = 2
+    t = ledger_total([a.ledger])
+    print(f"D5 ledger after {a.cmd}: {t['cpu_h']:.3f} CPU-h charged, {t['remaining_h']:.3f} remaining")
+    return code
+
+
 # ================================================================== THE PRODUCTION V BUILDER
 def _psd_factor(M):
     """F with F F' = M for a PSD M (the eigen square root; a singular M is allowed)."""
@@ -2055,7 +3037,37 @@ def main(argv=None):
     s.add_argument("--design", help="registered design for older observations that do not embed it")
     s.add_argument("--descriptive", action="store_true", help="allow partial descriptive estimation; never production-available")
     s.add_argument("--out", required=True)
+    s = sub.add_parser("provenance", help="the D8 provenance receipt (A_design_v5 2.2)")
+    s.add_argument("--study", required=True, help="the registered bank root")
+    s.add_argument("--design", required=True)
+    s.add_argument("--plan", required=True)
+    s.add_argument("--obs", required=True)
+    s.add_argument("--manifest", help="a pre-existing integrity manifest (sha256sum lines), when available")
+    s.add_argument("--out", required=True)
+    s.add_argument("--ledger", required=True, help="the cumulative D5 CPU ledger (charged, failed runs too)")
+    s = sub.add_parser("estimate-d8", help="the D8 refit: the bank/3 artifact (A_design_v5 2.1-2.8)")
+    for k in ("--obs", "--ages", "--design", "--plan", "--provenance", "--validation-report"):
+        s.add_argument(k, required=True)
+    s.add_argument("--boot", type=int, default=BOOT)
+    s.add_argument("--out", required=True, help="the bank/3 artifact (written after its receipt)")
+    s.add_argument("--receipt", required=True, help="the refit receipt (written durably first)")
+    s.add_argument("--ledger", required=True, help="the cumulative D5 CPU ledger (charged, failed runs too)")
+    s = sub.add_parser("d8-validation-spec", help="write the validation spec (A_design_v5 2.10, 7 step 3)")
+    s.add_argument("--design", required=True)
+    s.add_argument("--round", type=int, default=1, help="2, 3, ...: the fresh-key reruns (bank<k>-r<round>)")
+    s.add_argument("--out", required=True)
+    s = sub.add_parser("validate-d8", help="the prospective validation V1-V5 (A_design_v5 2.10)")
+    s.add_argument("--spec", required=True)
+    s.add_argument("--design", required=True)
+    s.add_argument("--out", required=True)
+    s.add_argument("--ledger", required=True, help="the cumulative D5 CPU ledger (charged, failed runs too)")
     a = ap.parse_args(argv)
+    if a.cmd in D8_COMMANDS:
+        try:
+            return _d8_main(a, sys.argv[1:] if argv is None else list(argv))
+        except (NoiseBankError, OSError, ValueError) as e:
+            print(f"noisebank.py {a.cmd}: {e}", file=sys.stderr)
+            return 2
     try:
         if a.cmd == "plan":
             d = make_design(rqlib.read_json(a.block), [os.path.abspath(t) for t in a.templates],
