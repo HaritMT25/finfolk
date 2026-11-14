@@ -2412,13 +2412,21 @@ T610_TWO_EXT = [(((-8.0, -4.0, 4.0, 8.0), (-8.0, -6.0, -2.0, 8.0), 0.0, 1.0), 0.
 # 2's six cells (a zero-variance cell: its v~ is a subnormal float at the low end); a tiny pooled variance (phi V =
 # 5e-281: up to nu0 ~ 3e-28 the zero cell's v~ rounds to 0 or mean(1 / v~) overflows, i.e. the formula's value is
 # outside the float range there); 256 cells, 255 with zero variance (at nu0 ~ 1e-304 every derived quantity is a normal
-# float but the sum of the 1 / v~ is not: only a scaled evaluation of mean(1 / v~) returns them).
+# float but the sum of the 1 / v~ is not: only a scaled evaluation of mean(1 / v~) returns them). Revision 2 (WP2 round
+# 4): the sweep runs down through the SUBNORMAL nu0 range to 2^-1074, where e973ddf's ratio r = nu0 / (R - 1) was itself
+# subnormal (and 0 at nu0 <= 2^-1073): a subnormal nu0 now goes through an exact power-of-two scale. On the five sets
+# above no subnormal nu0 exposes that (their zero cells' v~ leave the float range first), so two sets with a large
+# pooled variance in a zero-variance cell join them: round 3's example (V_0 = 1e6: every derived quantity a normal
+# float at nu0 = 1e-315, where e973ddf's unit was off by ~9.9e-9) and V_0 = 1e20 (the zero cell's v~ ~ 1e22 nu0 is a
+# normal float down to nu0 = 2^-1074, where e973ddf's r rounded to 0: a false refusal).
 NU0_SETS = {
     "codex_large": ([0.5, 0.25], [2.0, 1.0]),
     "codex_small": ([1.0, 0.001], [0.0, 1.0]),
     "six_cells": ([0.5, 0.25, 0.1, 0.04, 0.3, 0.0123], [0.6, 0.2, 0.15, 0.01, 0.0, 0.031]),
     "tiny_pooled": ([1.0, 1.0], [1e-280, 0.0]),
     "256_cells": ([1.0] * 256, [1.0] + [0.0] * 255),
+    "r3_example": ([1e6, 0.001], [0.0, 1.0]),
+    "huge_pooled": ([1e20, 0.001], [0.0, 1.0]),
 }
 NU0_OVF = Fraction(2) ** 1024 - Fraction(2) ** 970     # (an exact value at or above this rounds to inf)
 NU0_MINN = Fraction(2) ** -1022                         # (the smallest positive normal float)
@@ -2446,6 +2454,95 @@ def nu0_class(q):
     if q >= NU0_OVF or q <= NU0_ZERO:
         return "U"
     return "N" if q >= NU0_MINN else "S"
+
+
+def nu0_point(cs, V, zrep, R, nu0):
+    """One point of the nu0 shrinkage's float-range requirement (A_design_v5 clarification 2, implementation note,
+    Revisions 1 and 2: the formula's value wherever it is representable, refused only where an exact quantity lies
+    outside the float range), capture_scale (cs) against exact rationals (nu0_exact). The point's class: 'U' if an
+    exact derived quantity (phi, every v~_e, mean(1 / v~), every w_e, unit) is outside the float range, else 'S' if
+    one is subnormal, else 'N'. U: cs must refuse it (the finiteness / positivity check). N: returned with phi, unit,
+    every w_e and R unit / w_e (= v~_e) within 1e-13 (relative). S: returned with phi within 1e-13 and unit and every
+    w_e within the rounding bound of subnormal values, |x - exact| <= (4 d + 1e-13) exact + 2 n 2^-1074 with d = max_e
+    2^-1072 c_e / v~_e + 1e-13, where c_e = 1 at a SUBNORMAL nu0 (Revision 2's scaled ratio: r' is normal, so only a
+    value in the subnormal range itself rounds on that grid) and c_e = 1 + phi V_e + zrep_e at a normal nu0 (Revision
+    1's r = nu0 / (R - 1) is itself subnormal below (R - 1) 2^-1022, so a and 1 - a carry up to 2^-1075 each). ->
+    (class, the U reasons or the S quantities, failure text or None, the largest relative error (N) or error / bound
+    (S), cs's result or None)."""
+    phi, vt, mt, fw, funit, mult = nu0_exact(V, zrep, R, nu0)
+    cells = list(zip(np.maximum(np.asarray(V, float), 1e-8).tolist(), np.asarray(zrep, float).tolist()))
+    n = len(cells)
+    qs = [("phi", phi), ("mean(1 / v~)", mt), ("unit", funit)] + \
+         [(f"v~ of cell {k}", q) for k, q in vt.items()] + [(f"w of cell {k}", q) for k, q in fw.items()]
+    cl = [(lab, q, nu0_class(q)) for lab, q in qs]
+    c = "U" if any(x[2] == "U" for x in cl) else ("S" if any(x[2] == "S" for x in cl) else "N")
+    try:
+        got, err = cs(V, zrep, R, nu0=nu0), None
+    except ValueError as e:
+        got, err = None, str(e)
+    if c == "U":
+        why = " & ".join(f"{lab} {'overflows' if q >= NU0_OVF else 'rounds to 0'}" for lab, q, k in cl if k == "U")
+        ok = got is None and "not finite and positive" in err
+        return c, why, None if ok else f"{why} (outside the float range) but NOT refused ({err})", 0.0, got
+    labs = ", ".join(lab for lab, q, k in cl if k == "S")
+    if got is None:
+        return c, labs, f"class {c} (every exact derived quantity is in the float range) REFUSED: {err}", 0.0, got
+    w, unit, ph = got
+    wx = np.array([float(fw[k]) for k in cells])
+    if c == "N":
+        vx = np.array([float(vt[k]) for k in cells])
+        e = max(abs(ph - float(phi)) / float(phi), abs(unit - float(funit)) / float(funit),
+                float(np.max(np.abs(w - wx) / wx)), float(np.max(np.abs(R * unit / w - vx) / vx)))
+        return c, labs, None if e <= 1e-13 else f"(N): largest relative error {e:.3e} > 1e-13", e, got
+    sub = nu0 < 2.0 ** -1022
+    d = max(Fraction(2) ** -1072 * (1 if sub else 1 + phi * Fraction(k[0]) + Fraction(k[1])) / vt[k] for k in mult) \
+        + Fraction(1, 10 ** 13)
+    tiny = Fraction(2) ** -1074
+    rows = [("unit", unit, funit)] + [(f"w[{i}]", w[i], fw[k]) for i, k in enumerate(cells)]
+    ratio = [(abs(Fraction(float(x)) - q) / ((4 * d + Fraction(1, 10 ** 13)) * q + 2 * n * tiny), lab, x, q)
+             for lab, x, q in rows]
+    over = [(lab, float(x), float(q)) for rt, lab, x, q in ratio if rt > 1]
+    worst = float(max(rt for rt, lab, x, q in ratio))
+    if abs(ph - float(phi)) > 1e-13 * float(phi) or over:
+        return c, labs, f"(S): beyond the subnormal rounding bound: {over[:3]} (phi {ph!r})", worst, got
+    return c, labs, None, worst, got
+
+
+def nu0_rev1(V, zrep, R, nu0):
+    """WP2 round 3's (e973ddf) evaluation of capture_scale's nu0 shrinkage, operation for operation, on finite inputs
+    with some replicate variance (clarification 2, Revision 1: the two-sided ratio r = (R - 1) / nu0 or nu0 / (R -
+    1) at EVERY nu0, then the power-of-two-scaled mean(1 / v~), w and unit): the reference for Revision 2's 'a normal
+    nu0 keeps round 3's bytes' (a subnormal nu0 now takes the scaled ratio instead). -> (w, unit, phi), or None where
+    round 3 refused (a derived quantity not finite and positive)."""
+    zrep = np.asarray(zrep, float)
+    V = np.maximum(np.asarray(V, float), 1e-8)
+    phi = float(np.mean(zrep / V))
+    if nu0 >= R - 1:
+        r = (R - 1) / nu0
+        a, ac = 1.0 / (1.0 + r), r / (1.0 + r)
+    else:
+        r = nu0 / (R - 1)
+        a, ac = r / (1.0 + r), 1.0 / (1.0 + r)
+    with np.errstate(divide="ignore", over="ignore", invalid="ignore", under="ignore"):
+        vt = a * (phi * V) + ac * zrep
+        vmin = float(np.min(vt))
+        s = math.ldexp(1.0, math.frexp(vmin)[1] - 1) if math.isfinite(vmin) and vmin > 0.0 else 1.0
+        y = s / vt
+        my = float(np.mean(y))
+        Mt = my / s
+        w = y / my
+        unit = s / (R * my) if math.isfinite(my) and my > 0.0 else math.nan
+    ok = math.isfinite(phi) and phi > 0.0 and np.all(np.isfinite(vt)) and np.all(vt > 0.0) and math.isfinite(Mt) \
+        and Mt > 0.0 and np.all(np.isfinite(w)) and np.all(w > 0.0) and math.isfinite(unit) and unit > 0.0
+    return (w, unit, phi) if ok else None
+
+
+def nu0_same(got, want):
+    """Two capture_scale results (w, unit, phi), or None for a refusal: byte for byte equal (both refused alike)."""
+    if got is None or want is None:
+        return got is None and want is None
+    return (got[0].tobytes(), float(got[1]).hex(), float(got[2]).hex()) == \
+        (want[0].tobytes(), float(want[1]).hex(), float(want[2]).hex())
 
 
 _BANK = {}
@@ -2610,89 +2707,91 @@ class TestMapBankMode(unittest.TestCase):
                       f"{w.tolist()}, unit {unit!r}; vs exact: unit {rel(unit, funit):.2e}, w "
                       f"{max(rel(w[i], fw[k]) for i, k in enumerate(zip(V, Z))):.2e}")
 
-    def test_T6_2_nu0_sweep_smallest_normal_to_largest_float(self):
-        """T6-2 with A_design_v5 clarification 2, Revision 1 ('any positive finite nu0 the loader accepts must give the
-        formula's value wherever that value is representable'): nu0 = every power of two and 1.5 x power of two from
-        the smallest positive normal float 2^-1022 to the largest finite float, every decade in that range, R - 1 and
-        its two float neighbours (4711 values; both branches of the two-sided form, nu0 >= R - 1 and below) on each of
-        NU0_SETS, against exact rational arithmetic. Each point is classed by its exact derived quantities (phi, every
-        v~_e, mean(1 / v~), every w_e, unit; nu0_class): N, all normal floats: returned, every quantity within 1e-13
-        (relative) and R unit / w_e = v~_e; S, some in the subnormal range and none outside the float range: returned,
-        within the rounding bound of subnormal intermediates (|x - exact| <= (4 d + 1e-13) exact + 2 n 2^-1074, d the
-        largest 2^-1072 (1 + phi V_e + zrep_e) / v~_e + 1e-13); U, some exact quantity outside the float range (it
-        rounds to 0 or to inf): refused (the finiteness / positivity check). A refusal at an N or S point is an
-        artifact of the arithmetic and fails (922320e: the reciprocal form at the low end; main's unscaled mean(1 /
-        v~), whose sum of 1 / v~ overflows on 256 cells where every derived quantity is a normal float). The classes,
-        both branches' counts and every U point's reason (the exact quantity outside the range) are printed."""
+    def test_T6_2_nu0_sweep_smallest_positive_to_largest_float(self):
+        """T6-2 with A_design_v5 clarification 2, Revisions 1 and 2 ('any positive finite nu0 the loader accepts must
+        give the formula's value wherever that value is representable', subnormal ones included: none is refused for
+        its size): nu0 = every power of two and 1.5 x power of two from the smallest positive float 2^-1074 to the
+        largest finite float, every decade in that range, the 16 smallest subnormals, the smallest normal float 2^-1022
+        and its two float neighbours, R - 1 and its two float neighbours (both branches of the two-sided form, nu0 >= R
+        - 1 and below, and below 2^-1022 the scaled ratio) on each of NU0_SETS (round 3's five, and the two with a large
+        pooled variance in a zero-variance cell), every point against exact rational arithmetic (nu0_point): N, every
+        exact derived quantity a normal float: returned within 1e-13; S, some in the subnormal range and none outside
+        the float range: returned within the subnormal rounding bound; U, some exact quantity outside the float range
+        (it rounds to 0 or to inf): refused, and only there. A refusal at an N or S point is an artifact of the
+        arithmetic and fails (e973ddf: r = nu0 / (R - 1) itself subnormal below 2^-1022 and 0 at nu0 <= 2^-1073, so a
+        = 0 and a false refusal, or a beyond the bound; 922320e: the reciprocal form; main's unscaled mean(1 / v~)). At
+        every NORMAL nu0 the result is round 3's, byte for byte (nu0_rev1; Revision 2: 'normal nu0 keeps round 3's
+        bytes'), returned or refused alike. The classes per nu0 band (subnormal, normal), every U point's reason and
+        every S point's subnormal quantities (grouped) are printed."""
         M = self.M
         R = 6
+        mn = 2.0 ** -1022
         pts = {sys.float_info.max, float(R - 1), math.nextafter(float(R - 1), 0.0),
-               math.nextafter(float(R - 1), math.inf)}
-        for k in range(-1022, 1024):
+               math.nextafter(float(R - 1), math.inf), mn, math.nextafter(mn, 0.0), math.nextafter(mn, math.inf)}
+        for k in range(-1074, 1024):
             pts.update([math.ldexp(1.0, k), math.ldexp(1.5, k)])            # (1.5 x 2^1023 < the largest float)
-        pts.update(float(f"1e{k}") for k in range(-307, 309))
-        pts = sorted(x for x in pts if x >= 2.0 ** -1022)
-        tiny = Fraction(2) ** -1074
-        print(f"T6-2 nu0 sweep: {len(pts)} values of nu0 from {pts[0]!r} to {pts[-1]!r}, "
-              f"{sum(x >= R - 1 for x in pts)} with nu0 >= R - 1 = {R - 1} and {sum(x < R - 1 for x in pts)} below")
+        pts.update(float(f"1e{k}") for k in range(-323, 309))
+        pts.update(m * 2.0 ** -1074 for m in range(1, 17))
+        pts = sorted(x for x in pts if x > 0.0)
+        print(f"T6-2 nu0 sweep: {len(pts)} values of nu0 from {pts[0]!r} to {pts[-1]!r}: {sum(x < mn for x in pts)} "
+              f"subnormal (below 2^-1022), {sum(mn <= x < R - 1 for x in pts)} normal below R - 1 = {R - 1}, "
+              f"{sum(x >= R - 1 for x in pts)} with nu0 >= R - 1")
         failures = []
         for name, (V, Z) in NU0_SETS.items():
-            cells = list(zip(np.maximum(np.asarray(V, float), 1e-8).tolist(), np.asarray(Z, float).tolist()))
-            n = len(cells)
-            cls_n, ref_n, reasons, s_pts, worst, bad = Counter(), Counter(), defaultdict(list), [], 0.0, []
+            n = len(V)
+            cnt, ref_n, groups, worst, bad, same = Counter(), Counter(), defaultdict(list), Counter(), [], 0
             for nu0 in pts:
-                phi, vt, mt, fw, funit, mult = nu0_exact(V, Z, R, nu0)
-                qs = [("phi", phi), ("mean(1 / v~)", mt), ("unit", funit)] + \
-                     [(f"v~ of cell {k}", q) for k, q in vt.items()] + [(f"w of cell {k}", q) for k, q in fw.items()]
-                cl = [(lab, q, nu0_class(q)) for lab, q in qs]
-                c = "U" if any(x[2] == "U" for x in cl) else ("S" if any(x[2] == "S" for x in cl) else "N")
-                cls_n[c] += 1
-                try:
-                    got, err = M.capture_scale(V, Z, R, nu0=nu0), None
-                except ValueError as e:
-                    got, err = None, str(e)
-                    ref_n[c] += 1
-                if c == "U":
-                    why = " & ".join(f"{lab} {'overflows' if q >= NU0_OVF else 'rounds to 0'}" for lab, q, k in cl
-                                     if k == "U")
-                    reasons[why].append(nu0)
-                    if got is not None or "not finite and positive" not in err:
-                        bad.append(f"nu0 {nu0!r}: {why} (outside the float range) but NOT refused ({err})")
-                    continue
-                if got is None:
-                    bad.append(f"nu0 {nu0!r} (class {c}: every exact derived quantity is in the float range) REFUSED: "
-                               f"{err}")
-                    continue
-                w, unit, ph = got
-                wf = {k: float(q) for k, q in fw.items()}
-                wx = np.array([wf[k] for k in cells])
-                if c == "N":
-                    vf = {k: float(q) for k, q in vt.items()}
-                    vx = np.array([vf[k] for k in cells])
-                    e = max(abs(ph - float(phi)) / float(phi), abs(unit - float(funit)) / float(funit),
-                            float(np.max(np.abs(w - wx) / wx)), float(np.max(np.abs(R * unit / w - vx) / vx)))
-                    worst = max(worst, e)
-                    if not e <= 1e-13:
-                        bad.append(f"nu0 {nu0!r} (N): largest relative error {e:.3e} > 1e-13")
-                    continue
-                d = max(Fraction(2) ** -1072 * (1 + phi * Fraction(k[0]) + Fraction(k[1])) / vt[k] for k in mult) \
-                    + Fraction(1, 10 ** 13)
-                s_pts.append(f"{nu0!r} ({', '.join(lab for lab, q, k in cl if k == 'S')[:120]})")
-                over = [(lab, x, q) for lab, x, q in [("unit", unit, funit)] +
-                        [(f"w[{i}]", w[i], fw[k]) for i, k in enumerate(cells)]
-                        if not abs(Fraction(float(x)) - q) <= (4 * d + Fraction(1, 10 ** 13)) * q + 2 * n * tiny]
-                if abs(ph - float(phi)) > 1e-13 * float(phi) or over:
-                    bad.append(f"nu0 {nu0!r} (S): beyond the subnormal rounding bound: "
-                               f"{[(lab, float(x), float(q)) for lab, x, q in over[:3]]}")
-            print(f"T6-2 nu0 sweep {name} ({n} cells): N {cls_n['N']} ({ref_n['N']} refused; worst relative error "
-                  f"{worst:.2e}), S {cls_n['S']} ({ref_n['S']} refused), U {cls_n['U']} ({ref_n['U']} refused); "
-                  f"{len(bad)} failing")
-            for why, xs in reasons.items():
-                print(f"    U: {why} at {len(xs)} values of nu0 in [{min(xs)!r}, {max(xs)!r}]")
-            for s in s_pts:
-                print(f"    S: nu0 {s}")
+                band = "sub" if nu0 < mn else "normal"
+                c, lab, fail, e, got = nu0_point(M.capture_scale, V, Z, R, nu0)
+                cnt[c] += 1
+                cnt[band, c] += 1
+                ref_n[c] += int(got is None)
+                worst[c] = max(worst[c], e)
+                if c != "N":
+                    groups[c, lab[:150]].append(nu0)
+                if fail:
+                    bad.append(f"nu0 {nu0!r}: {fail}")
+                if band == "normal":
+                    if nu0_same(got, nu0_rev1(V, Z, R, nu0)):
+                        same += 1
+                    else:
+                        bad.append(f"nu0 {nu0!r} (a normal nu0): not round 3's bytes (nu0_rev1)")
+            nn = sum(x >= mn for x in pts)
+            print(f"T6-2 nu0 sweep {name} ({n} cells): N {cnt['N']} ({ref_n['N']} refused; worst relative error "
+                  f"{worst['N']:.2e}), S {cnt['S']} ({ref_n['S']} refused; worst error / bound {worst['S']:.2e}), U "
+                  f"{cnt['U']} ({ref_n['U']} refused); at a subnormal nu0: N {cnt['sub', 'N']}, S {cnt['sub', 'S']}, U "
+                  f"{cnt['sub', 'U']}; normal nu0: round 3's bytes at {same} of {nn}; {len(bad)} failing")
+            for (c, lab), xs in groups.items():
+                print(f"    {c}: {lab} at {len(xs)} values of nu0 in [{min(xs)!r}, {max(xs)!r}]")
             failures += [f"{name}: {b}" for b in bad]
         self.assertFalse(failures, f"{len(failures)} sweep points fail; the first 12:\n" + "\n".join(failures[:12]))
+
+    def test_T6_2_nu0_subnormal_examples(self):
+        """T6-2 with A_design_v5 clarification 2, Revision 2 (a subnormal nu0 is evaluated through an exact power-of-two
+        scale; none is refused for its size), each example against exact rationals (nu0_point), its class asserted so
+        it tests what it claims: (a) WP2 round 3's example V = [1e6, 0.001], zrep = [0, 1], R = 6, nu0 = 1e-315: every
+        exact derived quantity is a normal float (v~ ~ [1e-307, 1], unit ~ 3.3e-308), so the fit is returned within
+        1e-13 (e973ddf: r = nu0 / 5 is itself subnormal and unit is off by ~9.9e-9); (b) nu0 = 2^-1074 and 2^-1073 (both
+        <= 1.2e-323), V = [1e20, 0.001], zrep = [0, 1]: the zero-variance cell's exact v~ (~1e22 nu0: ~4.9e-302 and
+        ~9.9e-302) and every other derived quantity are normal floats, so the fit is returned within 1e-13 (e973ddf: r =
+        nu0 / 5 rounds to 0, a = 0, v~_0 = 0: a false refusal); (c) the same zero cell with V = [3e13, 0.001] at nu0 =
+        2^-1074: v~_0 ~ 1.5e-308 and unit are subnormal (class S; mean(1 / v~) ~ 3.4e307 is finite), returned within
+        the subnormal rounding bound (e973ddf: refused as in (b))."""
+        M = self.M
+        R = 6
+        for label, V, Z, nu0, want in (("round 3's example", [1e6, 0.001], [0.0, 1.0], 1e-315, "N"),
+                                       ("zero cell, v~ normal", [1e20, 0.001], [0.0, 1.0], 2.0 ** -1074, "N"),
+                                       ("zero cell, v~ normal", [1e20, 0.001], [0.0, 1.0], 2.0 ** -1073, "N"),
+                                       ("zero cell, v~ subnormal", [3e13, 0.001], [0.0, 1.0], 2.0 ** -1074, "S")):
+            with self.subTest(label, nu0=nu0):
+                self.assertLess(nu0, 2.0 ** -1022)                          # (a subnormal nu0)
+                c, lab, fail, e, got = nu0_point(M.capture_scale, V, Z, R, nu0)
+                self.assertEqual(c, want, lab)
+                self.assertIsNone(fail, f"{label}, nu0 {nu0!r}: {fail}")
+                w, unit, phi = got
+                print(f"T6-2 subnormal nu0 {nu0!r} ({label}; V {V}, zrep {Z}): class {c}, v~ = R unit / w "
+                      f"{(R * unit / w).tolist()}, w {w.tolist()}, unit {unit!r}; largest "
+                      f"{'relative error' if c == 'N' else 'error / bound'} {e:.2e}")
 
     def test_T6_2_nu0_domain_raw_inputs(self):
         """T6-2 with A_design_v5 clarification 2 (D3; Revision 1: the raw inputs are validated before main's floor;
