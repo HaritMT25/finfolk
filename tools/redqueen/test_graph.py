@@ -2819,31 +2819,34 @@ class TestMapBankMode(unittest.TestCase):
         replaced for the call by one that gives 0 just above the lower cutoff and inf at or just below the upper one,
         as a libm rounding there might; at a band point whose computed logarithm is in range (unit 2^-1075 (1 + 1e-11);
         phi = the largest float (1 - 1e-11)) capture_scale must then refuse ('after its conversion to binary64'), never
-        return the 0 or the inf; with the real exp the same points are returned, positive and within the contract."""
+        return the 0 or the inf; with the real exp the same points are returned here, positive and within the contract
+        (a range refusal before the conversion would also be allowed there). Each case is a subtest."""
         M = self.M
         R = 6
         mx = sys.float_info.max
-        V, Z = [1.0], [3 * 2.0 ** -1074]
-        phi, vt, mt, fw, funit, mult = nu0_exact(V, Z, R, 5.0)
-        self.assertEqual(funit, NU0_ZERO)                               # (exactly the lower edge)
-        c, lab, fail, e, got = nu0_point(M.capture_scale, V, Z, R, 5.0)
-        self.assertEqual(c, "B", lab)
-        self.assertIsNone(fail, fail)
-        res = "refused (allowed in the band)" if got is None else "returned " + repr(got)
-        if got is not None:
-            self.assertTrue(all(x > 0.0 for x in [*got[0].tolist(), got[1], got[2]]), got)
-        print(f"T6-2 Revision 4a lower-edge regression (V {V}, zrep [3 2^-1074], nu0 5): exact unit 2^-1075 (class B): "
-              f"{res}")
-        V, Z = [1.0, 2.0 ** 1023], [8.0, 0.0]
-        phi, vt, mt, fw, funit, mult = nu0_exact(V, Z, R, 5.0)
-        self.assertEqual(vt[(2.0 ** 1023, 0.0)], Fraction(2) ** 1024)  # (an intermediate above the largest float)
-        c, lab, fail, e, got = nu0_point(M.capture_scale, V, Z, R, 5.0)
-        self.assertEqual(c, "N", lab)
-        self.assertIsNone(fail, fail)
-        w, unit, ph = got
-        self.assertLessEqual(abs(w[1] - 3 * 2.0 ** -1022), 1e-9 * 3 * 2.0 ** -1022)
-        print(f"T6-2 Revision 4a item 0 (V [1, 2^1023], zrep [8, 0], nu0 5): exact v~_2 = 2^1024 (intermediate); "
-              f"returned phi {ph!r}, w {w.tolist()}, unit {unit!r}; worst relative error {e[0]:.2e}")
+        with self.subTest("the lower-edge regression (exact unit 2^-1075)"):
+            V, Z = [1.0], [3 * 2.0 ** -1074]
+            phi, vt, mt, fw, funit, mult = nu0_exact(V, Z, R, 5.0)
+            self.assertEqual(funit, NU0_ZERO)                           # (exactly the lower edge)
+            c, lab, fail, e, got = nu0_point(M.capture_scale, V, Z, R, 5.0)
+            self.assertEqual(c, "B", lab)
+            self.assertIsNone(fail, fail)
+            res = "refused (allowed in the band)" if got is None else "returned " + repr(got)
+            if got is not None:
+                self.assertTrue(all(x > 0.0 for x in [*got[0].tolist(), got[1], got[2]]), got)
+            print(f"T6-2 Revision 4a lower-edge regression (V {V}, zrep [3 2^-1074], nu0 5): exact unit 2^-1075 (class "
+                  f"B): {res}")
+        with self.subTest("item 0: an intermediate v~ = 2^1024, every returned quantity normal"):
+            V, Z = [1.0, 2.0 ** 1023], [8.0, 0.0]
+            phi, vt, mt, fw, funit, mult = nu0_exact(V, Z, R, 5.0)
+            self.assertEqual(vt[(2.0 ** 1023, 0.0)], Fraction(2) ** 1024)  # (an intermediate above the largest float)
+            c, lab, fail, e, got = nu0_point(M.capture_scale, V, Z, R, 5.0)
+            self.assertEqual(c, "N", lab)
+            self.assertIsNone(fail, fail)
+            w, unit, ph = got
+            self.assertLessEqual(abs(w[1] - 3 * 2.0 ** -1022), 1e-9 * 3 * 2.0 ** -1022)
+            print(f"T6-2 Revision 4a item 0 (V [1, 2^1023], zrep [8, 0], nu0 5): exact v~_2 = 2^1024 (intermediate); "
+                  f"returned phi {ph!r}, w {w.tolist()}, unit {unit!r}; worst relative error {e[0]:.2e}")
         lo, hi = -1075.0 * math.log(2.0), math.log(mx)
         real = np.exp
 
@@ -2858,8 +2861,10 @@ class TestMapBankMode(unittest.TestCase):
                 q = funit if what == "unit" else phi
                 self.assertEqual(nu0_class(q), "B")
                 c, lab, fail, e, got = nu0_point(M.capture_scale, V, Z, R, nu0)
-                self.assertIsNotNone(got, f"{label}: the real exp returns this point ({lab})")
                 self.assertIsNone(fail, fail)
+                if got is None:                 # (a range refusal before the conversion: allowed in the band)
+                    print(f"T6-2 Revision 4a conversion, {label}: refused before the conversion (allowed in the band)")
+                    continue
                 with mock.patch.object(np, "exp", libm):
                     with self.assertRaisesRegex(ValueError, "outside the float range after its conversion to binary64"):
                         M.capture_scale(np.array(V), np.array(Z), R, nu0=nu0)
