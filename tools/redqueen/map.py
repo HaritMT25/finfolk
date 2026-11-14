@@ -564,13 +564,22 @@ def capture_scale(V, zrep, R, nu0=None):
     (nu0 + R - 1) with phi as above (unchanged definition; V_e and zrep_e both empirical-logit variances), and
     w_e = (1 / v~_e) / mean(1 / v~), unit = 1 / (R mean(1 / v~)), so unit / w_e = v~_e / R exactly. nu0 None
     (full pooling, planning, numerical) is exactly the rule above. nu0 needs V (refused without it).
-    The nu0 branch is evaluated in the algebraically identical, overflow-safe form of A_design_v5 clarification 2
-    (implementation note): a = 1 / (1 + (R - 1) / nu0), v~_e = a phi V_e + (1 - a) zrep_e, so every positive finite
-    nu0 gives the formula's value (no cap on nu0, no variance floor). Its domain (clarification 2, D3): a
-    non-finite V or zrep is refused; a data set with no replicate variance in any cell (phi = 0, so every v~_e = 0
-    and the inverse-variance weights are undefined) is refused with that context, never floored and never fully
-    pooled instead; and phi, every v~_e, mean(1 / v~), every w_e and unit must be finite and positive (refused
-    otherwise)."""
+    The nu0 branch follows A_design_v5 clarification 2 (Revision 1, implementation note). v~_e = a (phi V_e) + (1 -
+    a) zrep_e, the algebraically identical form, with a = nu0 / (nu0 + R - 1) and 1 - a = (R - 1) / (nu0 + R - 1)
+    each formed from the ratio that cannot overflow: nu0 >= R - 1: r = (R - 1) / nu0, a = 1 / (1 + r), 1 - a = r /
+    (1 + r); nu0 < R - 1: r = nu0 / (R - 1), a = r / (1 + r), 1 - a = 1 / (1 + r) (the reciprocal form alone
+    overflowed to a = 0 for a very small nu0). mean(1 / v~), w and unit are formed with an exact power-of-two scale s
+    (s <= min v~ < 2 s, y = s / v~ in (0, 1], mean(1 / v~) = mean(y) / s, w = y / mean(y), unit = s / (R mean(y))):
+    1 / v~ itself is never formed, so a tiny v~ or many cells cannot overflow an intermediate (bit-identical to the
+    unscaled form when neither has a subnormal or overflowing intermediate). Every nu0 from the smallest normal float
+    up thus gives the formula's value wherever that value is representable (no cap on nu0, no variance floor; a
+    SUBNORMAL nu0, which the loaders accept, makes r = nu0 / (R - 1) subnormal itself, so a carries fewer
+    significant bits: the prescribed form, kept as written). Its domain (clarification 2, D3): V and zrep are
+    validated RAW, before main's 1e-8 floor of V (a non-finite V, -inf included, or zrep is refused; finite values
+    then take the floor exactly as before); a data set with no replicate variance in any cell (phi = 0, so every
+    v~_e = 0 and the inverse-variance weights are undefined) is refused with that context, never floored and never
+    fully pooled instead; and phi, every v~_e, mean(1 / v~), every w_e and unit must be finite and positive (refused
+    otherwise: a quantity outside the float range). nu0 None: main's code and bytes (the floor first, no check)."""
     nu0 = _check_nu0(nu0)
     zrep = np.asarray(zrep, float)
     if V is None:
@@ -578,25 +587,34 @@ def capture_scale(V, zrep, R, nu0=None):
             raise ValueError("capture_scale: nu0 without a variance function V (refused)")
         phi = float(np.mean(zrep))
         return np.ones(len(zrep)), max(phi / R, UNIT_FLOOR), phi
+    if nu0 is not None and not (np.all(np.isfinite(np.asarray(V, float))) and np.all(np.isfinite(zrep))):
+        raise ValueError("capture_scale: a non-finite value in V or zrep (checked raw, before the 1e-8 floor of V): "
+                         "the nu0 shrinkage is refused (A_design_v5 clarification 2, D3)")
     V = np.maximum(np.asarray(V, float), 1e-8)
     if nu0 is None:
         M = float(np.mean(1.0 / V))
         phi = float(np.mean(zrep / V))
         return (1.0 / V) / M, max(phi / (R * M), UNIT_FLOOR), phi
-    if not (np.all(np.isfinite(V)) and np.all(np.isfinite(zrep))):
-        raise ValueError("capture_scale: a non-finite value in V or zrep: the nu0 shrinkage is refused "
-                         "(A_design_v5 clarification 2, D3)")
     if not np.any(zrep):
         raise ValueError("capture_scale: every replicate variance is zero (phi = 0), so every shrunk cell variance "
                          "v~ is 0 and the inverse-variance weights are undefined: the nu0 shrinkage is refused, not "
                          "floored (A_design_v5 clarification 2, D3)")
     phi = float(np.mean(zrep / V))
-    a = 1.0 / (1.0 + (R - 1) / nu0)                      # (= nu0 / (nu0 + R - 1), formed without nu0 phi V)
-    vt = a * phi * V + (1.0 - a) * zrep
-    with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
-        Mt = float(np.mean(1.0 / vt))
-        w = (1.0 / vt) / Mt
-    unit = 1.0 / (R * Mt) if math.isfinite(Mt) and Mt > 0.0 else math.nan
+    if nu0 >= R - 1:                     # (each from the ratio that cannot overflow, r <= 1: clar. 2 Revision 1)
+        r = (R - 1) / nu0
+        a, ac = 1.0 / (1.0 + r), r / (1.0 + r)           # (a = nu0 / (nu0 + R - 1), ac = 1 - a)
+    else:
+        r = nu0 / (R - 1)
+        a, ac = r / (1.0 + r), 1.0 / (1.0 + r)
+    with np.errstate(divide="ignore", over="ignore", invalid="ignore", under="ignore"):
+        vt = a * (phi * V) + ac * zrep
+        vmin = float(np.min(vt))
+        s = math.ldexp(1.0, math.frexp(vmin)[1] - 1) if math.isfinite(vmin) and vmin > 0.0 else 1.0
+        y = s / vt                                        # (= s / v~ in (0, 1] for v~ > 0: 1 / v~ = y / s)
+        my = float(np.mean(y))
+        Mt = my / s                                       # (mean(1 / v~))
+        w = y / my
+        unit = s / (R * my) if math.isfinite(my) and my > 0.0 else math.nan
     if not (math.isfinite(phi) and phi > 0.0 and np.all(np.isfinite(vt)) and np.all(vt > 0.0) and math.isfinite(Mt)
             and Mt > 0.0 and np.all(np.isfinite(w)) and np.all(w > 0.0) and math.isfinite(unit) and unit > 0.0):
         raise ValueError(f"capture_scale: a derived quantity of the nu0 shrinkage is not finite and positive (phi "
