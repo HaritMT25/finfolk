@@ -670,7 +670,8 @@ class TestRecoveryExtra(unittest.TestCase):
             try:
                 with open(f"/proc/{pid}/stat") as handle:
                     return handle.read().split()[2] != "Z"
-            except FileNotFoundError:
+            except (FileNotFoundError, ProcessLookupError):
+                # A reaped worker can vanish between open() and read(): the read then raises ESRCH.
                 return False
 
         for sig in (signal.SIGTERM, signal.SIGKILL):
