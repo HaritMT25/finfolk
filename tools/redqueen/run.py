@@ -771,7 +771,7 @@ def _main(argv, files):
     if a.chunk_size < 1 or a.retries < 0:
         ap.error("--chunk-size >= 1 and --retries >= 0")
 
-    os.makedirs(os.path.join(root, store.WORK), exist_ok=True)
+    rqlib.mkdirs_durable(os.path.join(root, store.WORK), ancestors=True)
     lock = files.enter_context(open(os.path.join(root, ".runner.lock"), "w"))
     try:
         import fcntl
@@ -1065,7 +1065,7 @@ def _main(argv, files):
                 d = os.path.join(root, store.WORK, spec["id"])
                 try:
                     retire(root, spec["id"])
-                    os.makedirs(d)
+                    rqlib.mkdirs_durable(d)
                     rqlib.write_json_durable(os.path.join(d, "cell.json"), spec)
                     tmpd = os.path.join(d, "tmp")
                     os.makedirs(tmpd)
