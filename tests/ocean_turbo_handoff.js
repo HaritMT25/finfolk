@@ -3126,6 +3126,31 @@ async function pageTruthfulHints() {
            'bodies): ' + rows.join(', ') + '; the size dims with the gate off; evolving bodies at 1.5 now, fixed next: the gate still acts now, ' +
            'usable and noted (' + stillNow + ')');
     }
+    {   /* the thresholds as the engine sees them: kMouth is a float32 (ocean_config.hpp kMouth) and a fish eats unless
+         * 1 > kMouth x size (ocean_world.hpp's food loop), so equality eats; a typed decimal that rounds up to the threshold is
+         * the threshold. [bodies evolving, kMouth typed, the gate dimmed?], each state written out, not computed */
+        const EDGES = [[false, 1, true],             /* fixed bodies at the equality: 1 x 1 = 1 eats, nothing refused */
+                       [false, 0.99999994, false],   /* float32 1 - 2^-24, just below: every fish refused */
+                       [false, 0.99999999, true],    /* float32 1: the equality again */
+                       [true, 2, true],              /* evolving bodies at the equality: 2 x 0.5 = 1 eats */
+                       [true, 1.9999999, false],     /* float32 2 - 2^-23, just below: the smallest fish refused */
+                       [true, 1.99999999, true]];    /* float32 2: the equality again */
+        const rows = [];
+        let good = true;
+        for (const bodies of [false, true]) {
+            const p = await boot({ bodyModel: bodies, mouthGate: true });
+            for (const [b, k, want] of EDGES) {
+                if (b !== bodies) continue;
+                p.edit('kMouth', k);
+                const gate = dimmed(p, ['mouthGate']).length === 1;
+                if (gate !== want || p.T.getVal('kMouth') !== k) good = false;
+                rows.push((bodies ? 'evolving' : 'fixed') + ' x' + k + ' (float32 ' + Math.fround(k) + '): gate ' + (gate ? 'dimmed' : 'active') +
+                          (gate === want ? '' : ' (should be ' + (want ? 'dimmed' : 'active') + ')'));
+            }
+            if (!clean(p)) good = false;
+        }
+        ok(good, 'the mouth gate at its float32 thresholds (equality eats; a decimal rounding up to the threshold is it): ' + rows.join(', '));
+    }
 }
 
 /* The Setup modeline says the detail the tank is drawn at, after every change of it: Hold 60 fps lowering it (one frame a
