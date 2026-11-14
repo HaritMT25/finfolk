@@ -22,9 +22,10 @@ STUDY/chunks/index.jsonl                one line per COMMITTED chunk: its file, 
 
 Pack protocol (pack()): (1) every candidate cell's bundle.json re-hashed against its done.json;
 (2) the chunk written as a temporary file, fsync'd, renamed, the directory fsync'd; (3) the chunk
-re-read: zip CRCs, and every member's SHA-256 against its record; (4) the index line appended
-and fsync'd (the commit point); (5) only then the cells' working directories deleted and
-work/ fsync'd. recover() (at every runner start) undoes a crash at any point, but first checks,
+re-read: every member's compression method (DEFLATE, PACK_METHOD: any other is refused before it
+is decoded, here and in every check), zip CRCs, and every member's SHA-256 against its record;
+(4) the index line appended and fsync'd (the commit point); (5) only then the cells' working
+directories deleted and work/ fsync'd. recover() (at every runner start) undoes a crash at any point, but first checks,
 read-only: the committed chunks (in full where a packed cell's working directory is still there;
 by SHA-256 when deep or when they hold a stamped /3 entry), every indexed /3 completion's age
 summary (indexed_age_problems) and every leftover bundle. Any failure repairs, removes and
@@ -40,8 +41,14 @@ import gzip
 import json
 import os
 import shutil
+import struct
 import zipfile
 import zlib
+
+try:                    # (zipfile's own guard: a Python built without liblzma has no lzma)
+    import lzma
+except ImportError:
+    lzma = None
 
 import rqlib
 
@@ -373,10 +380,50 @@ AGE_SUMMARY_TAG = "the age summary (D8 rule 48)"    # in every age-summary probl
 # another entry, an older contract's once this one is versioned up, or a chunk changed since.
 AGE_SUMMARY_KEY = "age_summary"
 AGE_SUMMARY_CHECKED = "finfolk.redqueen.agesummary/1"     # the contract's version (age_summary_problems)
+# (Codex re-review of a5c366c, P2) pack() writes every chunk member DEFLATE-compressed, and only so (every
+# packer since 58c9592): a member whose central directory names any other compression method (a damaged
+# byte: STORED, BZIP2, LZMA, Python 3.14's Zstandard, or one zipfile does not know) is refused BEFORE a
+# decoder runs on it (packed_member; verify_chunk refuses its chunk), so validation never hands chunk
+# bytes to a decoder the packer does not use.
+PACK_METHOD = zipfile.ZIP_DEFLATED
+
+
+def _codec_errors():
+    """The decoders' own exceptions that zipfile lets through on damaged bytes (defence in depth behind
+    PACK_METHOD): lzma's and, on Python 3.14+, Zstandard's (bz2 raises OSError, EOFError, ValueError)."""
+    out = [lzma.LZMAError] if lzma is not None else []
+    try:
+        from compression import zstd
+        out.append(zstd.ZstdError)
+    except ImportError:
+        pass
+    return tuple(out)
+
+
 # reading damaged chunk bytes can raise any of these (zlib.error: a corrupt deflate stream; EOFError: a
-# short member; NotImplementedError / RuntimeError: a damaged method or flag): never accepted, never a crash
+# short member; NotImplementedError / RuntimeError: a damaged method, version or flag; struct.error,
+# zipfile.LargeZipFile: zipfile's own; _codec_errors: a codec's): never accepted, never a crash
 UNREADABLE = (KeyError, ValueError, OSError, EOFError, RuntimeError, NotImplementedError, zipfile.BadZipFile,
-              zlib.error)
+              zipfile.LargeZipFile, struct.error, zlib.error) + _codec_errors()
+
+
+def method_problem(zi):
+    """Why the chunk member `zi` (a ZipInfo) must not be decoded -> str, or None: its compression method
+    is not the one pack() writes (PACK_METHOD)."""
+    if zi.compress_type == PACK_METHOD:
+        return None
+    return (f"{zi.filename}: compression method {zi.compress_type}, not the DEFLATE ({PACK_METHOD}) pack() "
+            "writes: refused before decoding")
+
+
+def packed_member(z, arc):
+    """Member `arc` of the open chunk `z`, decoded only if it is compressed as pack() writes it -> bytes;
+    any other method raises zipfile.BadZipFile (one of UNREADABLE) before a decoder runs."""
+    zi = z.getinfo(arc)
+    why = method_problem(zi)
+    if why:
+        raise zipfile.BadZipFile(why)
+    return z.read(zi)
 
 
 def sharing_required(bundle_schema, plan_schema):
@@ -444,7 +491,9 @@ def indexed_age_problems(root, cells=None, sound=None):
     entries, while decoding every bundle each time would grow with the square of the study. Every
     other /3 entry (no stamp, a stamp not bound to it, or a chunk missing or changed since, of the
     same size or not) has its packed bundle read from its chunk (each chunk opened once) and checked
-    against the index hash and the contract; an unreadable one is a problem, never accepted."""
+    against the index hash and the contract; an unreadable one is a problem, never accepted, and one
+    whose compression method is not pack()'s is refused before it is decoded (packed_member: Codex
+    re-review of a5c366c, P2)."""
     if cells is None:
         _, cells = load_index(root)
     stamped, todo = {}, {}
@@ -462,7 +511,7 @@ def indexed_age_problems(root, cells=None, sound=None):
                 for cid in ids:
                     where = f"{cid} (packed in {chunk})"
                     try:
-                        data = z.read(f"{cid}/bundle.json")
+                        data = packed_member(z, f"{cid}/bundle.json")
                         if rqlib.sha256_bytes(data) != cells[cid][1].get("bundle_sha256"):
                             probs.append(f"{where}: {AGE_SUMMARY_TAG} cannot be checked (its packed bundle "
                                          "does not match the index)")
@@ -583,10 +632,10 @@ def index_problems(root, cells=None):
                     "transplant_group" not in e or not e.get("role")):
                 probs.append(f"{cid}: a plan/2 completion indexed without its sharing summary")
             continue
-        try:
-            b = json.loads(read_member(root, cid, "bundle.json", cells))
-            d = json.loads(read_member(root, cid, "done.json", cells))
-        except (OSError, ValueError, KeyError, zipfile.BadZipFile, StoreError) as x:
+        try:        # (Codex re-review of a5c366c, P2: refused before decoding; damaged bytes, never a crash)
+            b = json.loads(read_member(root, cid, "bundle.json", cells, packed_only=True))
+            d = json.loads(read_member(root, cid, "done.json", cells, packed_only=True))
+        except UNREADABLE + (StoreError,) as x:
             probs.append(f"{cid}: its packed bundle cannot be checked ({x})")
             continue
         if not (isinstance(b, dict) and isinstance(d, dict)):
@@ -700,10 +749,10 @@ def pack(root, ids=None, log=print):
     name = next_chunk_name(root, recs)
     final = os.path.join(cdir, name)
     tmp = final + ".tmp"
-    with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as z:
+    with zipfile.ZipFile(tmp, "w", compression=PACK_METHOD, compresslevel=6) as z:
         for arc, data in members:
             zi = zipfile.ZipInfo(arc, date_time=ZIP_TIME)
-            zi.compress_type = zipfile.ZIP_DEFLATED
+            zi.compress_type = PACK_METHOD
             zi.external_attr = 0o644 << 16
             z.writestr(zi, data)
     rqlib.fsync_file(tmp)
@@ -730,10 +779,16 @@ def pack(root, ids=None, log=print):
 
 
 def verify_chunk(path, entries):
-    """Problems of a chunk against its cell entries (CRCs, every member's SHA-256, no extras)."""
+    """Problems of a chunk against its cell entries (every member compressed as pack() writes it, CRCs,
+    every member's SHA-256, no extras). (Codex re-review of a5c366c, P2) A member of any other
+    compression method refuses the chunk before anything in it is decoded, and damaged bytes are
+    problems (UNREADABLE), never a crash."""
     probs = []
     try:
         with zipfile.ZipFile(path) as z:
+            odd = [w for w in map(method_problem, z.infolist()) if w]
+            if odd:
+                return odd
             bad = z.testzip()
             if bad:
                 probs.append(f"CRC error in {bad}")
@@ -744,22 +799,24 @@ def verify_chunk(path, entries):
             for cid, e in entries.items():
                 for m, key in (("bundle.json", "bundle_sha256"), ("done.json", "done_sha256")):
                     arc = f"{cid}/{m}"
-                    if arc in names and rqlib.sha256_bytes(z.read(arc)) != e[key]:
+                    if arc in names and rqlib.sha256_bytes(packed_member(z, arc)) != e[key]:
                         probs.append(f"{arc} does not match its record")
-    except (OSError, zipfile.BadZipFile) as e:
+    except UNREADABLE as e:
         probs.append(f"unreadable ({e})")
     return probs
 
 
-def read_member(root, cid, member="bundle.json", cells=None):
-    """A packed cell's member bytes, checked against the index -> bytes (or None if not packed)."""
+def read_member(root, cid, member="bundle.json", cells=None, packed_only=False):
+    """A packed cell's member bytes, checked against the index -> bytes (or None if not packed).
+    packed_only (validation: index_problems): a member not compressed as pack() writes it raises
+    zipfile.BadZipFile before it is decoded (packed_member)."""
     if cells is None:
         _, cells = load_index(root)
     if cid not in cells:
         return None
     rec, e = cells[cid]
     with zipfile.ZipFile(os.path.join(root, CHUNKS, rec["chunk"])) as z:
-        data = z.read(f"{cid}/{member}")
+        data = packed_member(z, f"{cid}/{member}") if packed_only else z.read(f"{cid}/{member}")
     key = "bundle_sha256" if member == "bundle.json" else "done_sha256"
     if rqlib.sha256_bytes(data) != e[key]:
         raise StoreError(f"{cid}/{member} in {rec['chunk']} does not match the index")
