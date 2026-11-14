@@ -4,21 +4,24 @@ section 5). Synthetic data only: no bank observation, no study store or output i
 
   T1 law oracle: T1-1 category probabilities and E[K] against an independent scalar oracle (explicit intervals,
      the capped top category, tail-stable math.erfc); T1-2 a definitional quadrature; T1-3 location solves and a
-     knot-inclusive location table; T1-4 uncapped draws above the ceiling; T1-5 the analytic and Monte Carlo
-     mean, and the two prohibited substitutions; T1-6 endpoints and refusals (+ the #68 cross-check, adoption
-     gate); T1-7 the fitter-table certification under the v5 adaptive policy, its negative controls, caps and
-     extrapolation.
+     knot-inclusive location table (exact solves outside +-12 even where a knot extends it); T1-4 uncapped draws
+     above the ceiling; T1-5 the analytic and Monte Carlo mean, and the two prohibited substitutions; T1-6
+     endpoints and refusals (+ the #68 cross-check, adoption gate); T1-7 the fitter-table certification under the v5
+     adaptive policy, the empirical-logit moments and probe inversions against test-local oracles, its negative
+     controls, caps (knot set and initial grid included) and extrapolation.
   T2 (obslaw's part): the clock fixture, the registered ceilings and the model's age_clock, the static and the
      monkeypatch guards.
   T3 (obslaw's unit part; the bank-mode recovery integration is test_graph.py's): latent correlations per sharing
      class, a singular PSD SigmaR, no second layer.
-  T5-3 / T5-7 the strict bank/3 loader; T5-5 the D8 streams (+ #68's normals, adoption gate).
+  T5-3 / T5-7 the strict bank/3 loader (V5_FIELDS: every field v5 2.8 prescribes, by v5 line); T5-5 the D8 streams
+     (+ #68's normals, adoption gate); 4.2 item 7 the tables (shapes, identity incl. the noisescale evaluator).
 
     RQ_REQUIRE_NUMPY=1 python3 -I -W error::ResourceWarning tools/redqueen/test_obslaw.py -v
 
-The adoption gates (v5 5: T1-6's #68 cross-check, T5-5's VecSplitMix64 equality) run against a read-only
-extraction of the pinned #68 commit's tools/redqueen named by RQ_PR68_DIR; otherwise they are skipped with a
-reason starting "adoption gate".
+The adoption gates (v5 5: T1-6's #68 cross-check, T5-5's VecSplitMix64 equality) run against a read-only `git
+archive` extraction of the pinned #68 commit: RQ_PR68_DIR names the extraction root, which holds PINNED_COMMIT (the
+full 40-hex sha, printed by the gate; the gate refuses without it) and tools/redqueen/. Without RQ_PR68_DIR they are
+skipped with a reason starting "adoption gate".
 """
 from __future__ import annotations
 
@@ -29,9 +32,12 @@ import json
 import math
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
+import tokenize
+import tracemalloc
 import unittest
 import zipfile
 from unittest import mock
@@ -111,6 +117,49 @@ def oracle_location(mu, s, N, M):
     return 0.5 * (lo + hi)
 
 
+def oracle_logit_moments(a, s, N, M):
+    """(m_z, V_z) of ell_N(K) = log((K + 1/2) / (N - K + 1/2)) under the oracle's categories: the mean and the
+    CENTERED variance sum_k p_k (ell_k - m_z)^2 (v5 1.7b (ii)), by math.fsum."""
+    p = oracle_probs(a, s, N, M)
+    ell = [math.log((k + 0.5) / (N - k + 0.5)) for k in range(M + 1)]
+    m = math.fsum(pk * lk for pk, lk in zip(p, ell))
+    return m, math.fsum(pk * (lk - m) ** 2 for pk, lk in zip(p, ell))
+
+
+def oracle_curve(curve, x):
+    """S at x = logit(mu): linear in x between the knots, constant beyond (noisescale's documented rule, re-coded)."""
+    xs, ss = curve["x"], curve["s"]
+    if x <= xs[0]:
+        return float(ss[0])
+    for (x0, s0), (x1, s1) in zip(zip(xs, ss), zip(xs[1:], ss[1:])):
+        if x <= x1:
+            return s0 + (x - x0) / (x1 - x0) * (s1 - s0)
+    return float(ss[-1])
+
+
+def oracle_pipeline(curve, x, B=324):
+    """The exact capture pipeline at x = logit(mu), test-local: mu, S_C(mu), the oracle location, (m_z, V_z)."""
+    mu = 1.0 / (1.0 + math.exp(-x))
+    s = oracle_curve(curve, x)
+    a = oracle_location(mu, s, B, B)
+    m, v = oracle_logit_moments(a, s, B, B)
+    return mu, s, a, m, v
+
+
+def oracle_inverse(curve, z, xl, xr, B=324):
+    """mu* with m_z(mu*) = z by a scalar bisection in x inside [xl, xr] over the test-local pipeline."""
+    lo, hi = xl, xr
+    for _ in range(60):
+        mid = 0.5 * (lo + hi)
+        if oracle_pipeline(curve, mid, B)[3] < z:
+            lo = mid
+        else:
+            hi = mid
+        if hi - lo < 1e-12:
+            break
+    return oracle_pipeline(curve, 0.5 * (lo + hi), B)
+
+
 # ------------------------------------------------------------------ an independent SplitMix64 (published reference)
 M64 = (1 << 64) - 1
 GAMMA = 0x9E3779B97F4A7C15
@@ -171,20 +220,57 @@ def sha_of(tag):
     return hashlib.sha256(tag.encode()).hexdigest()
 
 
+REFIT_TEXTS = [f"AnnexH/D8/1/noisebank/D8-refit/h{h}/bootstrap" for h in (5000, 10000, 20000)]   # v5 L641-643
+AGE_PREDICATE = ("updated binary32 age > binary32(max_age) is an age death; F_i(H)=1 iff false through H frames "
+                 "(common.age_feasible)")                                                     # v5 L748, verbatim
+CAPPED_CATEGORY = "k = M_H: latent upper endpoint +inf, scale N = 600"                        # v5 L748, verbatim
+STRUCTURAL_ZERO = {"status": "structural_zero", "M_H": 0,                                    # v5 2.6 L671-672
+                   "reason": "D8 rule 46: no age-feasible initial individual at this horizon"}
+
+
+def _horizon_record(h, status):
+    """A synthetic per-horizon record carrying the fields noisebank's horizon records carry (v5 L751 "as now":
+    noisebank.py L1689-1690, L1698, L1701 / L1756; with status ok L1741-1742). Placeholder values, not a fit. The
+    structural-zero survival records sit under scales/nu0 here only as placeholders: v5 2.6 fixes their content
+    but not where they sit in the record, so the loader does not look for them (a reported gap)."""
+    zero = h != 5000
+    rec = {"capture_bound": {5000: 324, 10000: 642, 20000: 1284}[h], "replicates": 64, "incomplete_cells": 0,
+           "channels": {"C": {"usable": 200}, "S": {"usable": 0 if zero else 120}, "F": {"usable": 0 if zero else 40}},
+           "scales": {"C": copy.deepcopy(VAL_SC), "S": dict(STRUCTURAL_ZERO) if zero else copy.deepcopy(VAL_SS),
+                      "F": dict(STRUCTURAL_ZERO) if zero else copy.deepcopy(VAL_SS)},
+           "nu0": {"C": {"status": "estimated", "nu0": 12.5, "cells": 200},
+                   "S": dict(STRUCTURAL_ZERO) if zero else {"status": "full_pooling", "cells": 120},
+                   "F": dict(STRUCTURAL_ZERO) if zero else {"status": "unavailable", "reason": "synthetic test"}},
+           "curve_points": {"C": [[0.2, 0.5], [0.8, 0.25]]}, "worlds": [f"w{i}" for i in range(8)],
+           "status": status, "reasons": [] if status == "ok" else ["reduced capture-only fit: rho_R + rho_D > 1"],
+           "components": None, "bootstrap": None}
+    if status == "ok":
+        groups = ("R_CC", "D_CC") if zero else ("R_CC", "R_SS", "R_CS", "R_CF", "R_SF", "D_CC", "D_SS", "D_CS", "E_CS")
+        rec.update(groups={g: {"pairs": 100, "rho_max": 0.2} for g in groups},
+                   grid_validation={"label": "local objective-value validation (not a global certificate)"},
+                   components={"SigmaR": copy.deepcopy(SIGMA_R), "SigmaD": copy.deepcopy(SIGMA_D),
+                               "SigmaE": copy.deepcopy(SIGMA_E)},
+                   bootstrap={"draws": 999, "failed": 0, "status": "ok"})
+    return rec
+
+
 def bank3_doc(synthetic=False):
-    """A complete, valid synthetic bank/3 artifact (v5 2.8): declared synthetic parameters, the registered constants,
-    placeholder identities. Not a bank fit."""
+    """A complete, valid synthetic bank/3 artifact (v5 2.8): every field V5_FIELDS lists, declared synthetic
+    parameters, the registered constants and texts, placeholder identities and placeholder estimator/horizon
+    contents (v5 fixes their presence, not their structure). Not a bank fit."""
     curves = {"C": copy.deepcopy(VAL_SC), "S": copy.deepcopy(VAL_SS), "F": copy.deepcopy(VAL_SS)}
-    texts = [f"AnnexH/D8/1/noisebank/D8-refit/h{h}/bootstrap" for h in (5000, 10000, 20000)]
+    inputs = dict(ol.REGISTERED_INPUTS, design_canonical_sha256=sha_of("dc"), provenance_sha256=sha_of("pv"),
+                  validation_report_sha256=sha_of("vr"))
     return {
         "schema": ol.BANK_SCHEMA, "status": ol.STATUS_FITTED, "synthetic": synthetic,
         "cohort": material.registered_ages(), "cohort_sha256": material.AGES_SHA256, "horizon": 5000, "dt": 0.016,
         "support_law": material.SUPPORT_LAW, "age_clock": copy.deepcopy(material.age_clock_identity()),  # (lru-cached)
         "survivor_ceiling": 247,
         "fit": {"noise_likelihood": ol.NOISE_LIKELIHOOD,
-                "noise": {k: sha_of("fit.noise." + k) for k in ol.FIT_NOISE_SHAS},
-                "streams": {"bootstrap": {"generator": "rqlib.SplitMix64", "namespace": "AnnexH/D8/1", "texts": texts,
-                                          "seeds": [ol.stream_seed_d8(t) for t in texts]}}},
+                "noise": {"implementation_sha256": sha_of("impl"), "inputs_sha256": rqlib.canonical_sha(inputs),
+                          "receipt_sha256": sha_of("receipt"), "engine_sha256": sha_of("engine")},
+                "streams": {"bootstrap": {"generator": "rqlib.SplitMix64", "namespace": "AnnexH/D8/1",
+                                          "texts": list(REFIT_TEXTS), "seeds": [ref_seed(t) for t in REFIT_TEXTS]}}},
         "noise": {"available": True, "s_logit": curves, "SigmaR": copy.deepcopy(SIGMA_R),
                   "SigmaD": copy.deepcopy(SIGMA_D), "SigmaE": copy.deepcopy(SIGMA_E), "horizon": 5000,
                   "capture_bound": 324, "survivor_ceiling": 247},
@@ -192,17 +278,129 @@ def bank3_doc(synthetic=False):
                          "nu0": {"C": {"status": "estimated", "nu0": 12.5, "cells": 200},
                                  "S": {"status": "full_pooling", "cells": 120},
                                  "F": {"status": "unavailable", "reason": "synthetic test"}},
-                         "rule": "working replicate-mean variance (nu0 phi W(z) + (R-1) s2) / (nu0 + R - 1) / R "
-                                 "(A_design_v5.md 1.7b)", "consumer": "map.fit rep_prior, capture channel"},
+                         "rule": "working replicate-mean variance (nu0 phi W(z) + (R-1) s2) / (nu0 + R - 1) / R, W the "
+                                 "empirical-logit variance of the frozen fitter table (A_design_v5.md 1.7b); "
+                                 "full_pooling: phi W(z) / R", "consumer": "map.fit rep_prior, capture channel"},
         "d8": {"amendment_sha256": ol.D8_SHA256, "capture_law": ol.CAPTURE_LAW, "ceilings": dict(ol.CEILINGS),
                "max_age": material.registered_ages()["max_age"], "denominator": 600,
-               "age_predicate": "updated binary32 age > binary32(max_age) is an age death",
-               "capped_category": "k = M_H: latent upper endpoint +inf, scale N = 600"},
-        "inputs": dict(ol.REGISTERED_INPUTS, design_canonical_sha256=sha_of("dc"), provenance_sha256=sha_of("pv"),
-                       validation_report_sha256=sha_of("vr")),
-        "estimator": {"note": "synthetic test artifact (declared parameters)"},
-        "horizons": {"5000": {"status": "ok"}},
+               "age_predicate": AGE_PREDICATE, "capped_category": CAPPED_CATEGORY},
+        "inputs": inputs,
+        "estimator": {"z_intervals": 64, "rho_max": 0.95, "sigma_min": 0.05, "info_min": 0.25, "multi_start": 16,
+                      "start_tol": 1e-4, "boot": 999, "boot_fail_max": 0.1, "rectangle": "log_rect (synthetic)",
+                      "grid": "z = atanh(rho) (synthetic)", "constrained_fit": "16 Halton starts (synthetic)",
+                      "fixed_replicate_bias": "not corrected (synthetic)",
+                      "ceilings": dict(ol.CEILINGS),
+                      "saturation": {"window": [0.02, 0.98], "basis": "mean fraction of N",
+                                     "channels": {"C": [0.02, 0.98], "S": [0.02, 0.98], "F": [0.02, 0.98]}},
+                      "capped_category": {"S": CAPPED_CATEGORY, "F": CAPPED_CATEGORY}},
+        "horizons": {"5000": _horizon_record(5000, "ok"), "10000": _horizon_record(10000, "ok"),
+                     "20000": _horizon_record(20000, "unavailable")},
     }
+
+
+# v5 2.8's required fields, from v5's own text (A_design_v5.md, sha256 5d4c00be...): (path, v5 line, what v5 cites).
+# Deleting any one from the complete fixture must be refused naming it (v5 2.9 L773: "a missing field of 2.8").
+_NB = "noisebank.py @4991907"
+V5_FIELDS = (
+    *(((k,), line, "") for k, line in (("schema", 734), ("status", 735), ("synthetic", 736), ("cohort", 737),
+                                       ("cohort_sha256", 738), ("horizon", 739), ("dt", 740), ("support_law", 741),
+                                       ("age_clock", 742), ("survivor_ceiling", 744))),
+    (("fit",), 745, ""), (("fit", "noise_likelihood"), 745, ""), (("fit", "noise"), 745, ""),
+    *((("fit", "noise", k), 745, "") for k in ("implementation_sha256", "inputs_sha256", "receipt_sha256",
+                                                "engine_sha256")),
+    (("fit", "streams"), 745, ""), (("fit", "streams", "bootstrap"), 745, ""),
+    *((("fit", "streams", "bootstrap", k), 745, "") for k in ("generator", "namespace", "texts", "seeds")),
+    (("noise",), 746, ""),
+    *((("noise", k), 746, "") for k in ("available", "s_logit", "SigmaR", "SigmaD", "SigmaE", "horizon",
+                                         "capture_bound", "survivor_ceiling")),
+    *((("noise", "s_logit", ch), 746, "{C,S,F}") for ch in "CSF"),
+    (("map_variance",), 747, ""),
+    *((("map_variance", k), 747, "") for k in ("s_logit", "nu0", "rule", "consumer")),
+    *((("map_variance", "nu0", ch), 747, "{C,S,F}") for ch in "CSF"),
+    (("d8",), 748, ""),
+    *((("d8", k), 748, "") for k in ("amendment_sha256", "capture_law", "ceilings", "max_age", "denominator",
+                                      "age_predicate", "capped_category")),
+    (("inputs",), 749, ""),
+    *((("inputs", k), 749, "") for k in ("observations_sha256", "ages_sha256", "plan_sha256", "design_file_sha256",
+                                          "design_canonical_sha256", "provenance_sha256", "validation_report_sha256")),
+    (("estimator",), 750, ""),
+    *((("estimator", k), 750, f"the existing record, {_NB} L1769-1777")
+      for k in ("z_intervals", "rho_max", "sigma_min", "info_min", "multi_start", "start_tol", "boot",
+                "boot_fail_max", "rectangle", "grid", "constrained_fit", "fixed_replicate_bias")),
+    (("estimator", "saturation"), 750, f"the existing record ({_NB} L1769) and 'saturation per channel and its basis'"),
+    (("estimator", "ceilings"), 750, ""), (("estimator", "capped_category"), 750, ""),
+    (("horizons",), 751, ""),
+    *((("horizons", h), 751, f"'per horizon as now', {_NB} L1778-1782") for h in ("5000", "10000", "20000")),
+    *((("horizons", h, k), 751, f"'as now', {_NB} L1689-1690, L1698, L1701, L1756")
+      for h in ("5000", "10000", "20000")
+      for k in ("capture_bound", "replicates", "incomplete_cells", "channels", "scales", "nu0", "curve_points",
+                "worlds", "status", "reasons", "components", "bootstrap")),
+    *((("horizons", h, k), 751, f"'as now' with status ok, {_NB} L1741-1742")
+      for h in ("5000", "10000") for k in ("groups", "grid_validation")),
+)
+
+
+def _set(path, value):
+    """mutate(d): d[path] = value."""
+    def mutate(d):
+        node = d
+        for k in path[:-1]:
+            node = node[k]
+        node[path[-1]] = value
+    return mutate
+
+
+_BOOT = ("fit", "streams", "bootstrap")
+# v5 2.8's types and fixed values (and 2.5 / 2.6 / 2.7 where 2.8 cites them): (mutation, refusal pattern, v5 line).
+V5_VALUES = (
+    (_set(("estimator",), {}), r"missing field estimator\.z_intervals", "750"),          # (the review's cases)
+    (_set(("horizons",), {}), r"missing field horizons\.5000", "751"),
+    (lambda d: d["fit"]["streams"]["bootstrap"].update(texts=None, seeds=None), "texts must be a list", "745"),
+    (_set(_BOOT + ("texts",), None), "texts must be a list", "745"),
+    (_set(_BOOT + ("seeds",), None), "seeds must be a list", "745"),
+    (_set(_BOOT + ("texts",), {"5000": REFIT_TEXTS[0]}), "texts must be a list", "745"),
+    (_set(_BOOT + ("texts",), REFIT_TEXTS[:2] + [5]), "texts must be a list", "745"),
+    (lambda d: d["fit"]["streams"]["bootstrap"].update(texts=REFIT_TEXTS[:2], seeds=[ref_seed(t) for t in
+                                                                                     REFIT_TEXTS[:2]]),
+     "texts must be exactly the refit streams", "641-643"),
+    (lambda d: d["fit"]["streams"]["bootstrap"].update(texts=REFIT_TEXTS[:2] + REFIT_TEXTS[:1],
+                                                       seeds=[ref_seed(t) for t in REFIT_TEXTS[:2] + REFIT_TEXTS[:1]]),
+     "texts must be exactly the refit streams", "641-643"),
+    (lambda d: d["fit"]["streams"]["bootstrap"]["texts"].__setitem__(1, REFIT_TEXTS[1].replace("D8/1", "1")),
+     "texts must be exactly the refit streams", "641-643, 647-649"),
+    (lambda d: d["fit"]["streams"]["bootstrap"]["seeds"].pop(), "seeds must be a list", "745"),
+    (lambda d: d["fit"]["streams"]["bootstrap"]["seeds"].__setitem__(0, True), "seeds must be a list", "745"),
+    (lambda d: d["fit"]["streams"]["bootstrap"]["seeds"].__setitem__(0, -1), "seeds must be a list", "745"),
+    (lambda d: d["fit"]["streams"]["bootstrap"]["seeds"].__setitem__(0, 1 << 64), "seeds must be a list", "745"),
+    (lambda d: d["fit"]["streams"]["bootstrap"]["seeds"].__setitem__(0, str(ref_seed(REFIT_TEXTS[0]))),
+     "seeds must be a list", "745"),
+    (lambda d: d["fit"]["streams"]["bootstrap"]["seeds"].reverse(), "is not the derived seed", "631-633"),
+    (lambda d: d["fit"]["streams"]["bootstrap"]["seeds"].__setitem__(2, ref_seed(REFIT_TEXTS[2]) ^ 1),
+     "is not the derived seed", "631-633"),
+    (_set(("fit", "noise", "inputs_sha256"), sha_of("inputs")), "inputs_sha256 is not the canonical sha256", "755"),
+    (_set(("d8", "age_predicate"), "updated binary32 age > binary32(max_age) is an age death"),
+     "d8.age_predicate is not", "748"),
+    (_set(("d8", "capped_category"), "k = M_H: capped"), "d8.capped_category is not", "748"),
+    (_set(("map_variance", "consumer"), "map.fit"), "map_variance.consumer is not", "747"),
+    (_set(("map_variance", "rule"), None), "map_variance.rule must be a non-empty string", "747"),
+    (_set(("map_variance", "rule"), ""), "map_variance.rule must be a non-empty string", "747"),
+    (_set(("estimator",), []), "estimator must be an object", "750"),
+    (_set(("estimator", "boot"), 1000), "estimator.boot 1000 is not the registered 999", "616"),
+    (_set(("estimator", "boot"), 999.0), "estimator.boot 999.0 is not the registered 999", "616"),
+    (_set(("estimator", "multi_start"), 8), "estimator.multi_start 8 is not the registered 16", "615"),
+    (_set(("horizons",), []), "horizons must be an object", "751"),
+    (_set(("horizons", "5000"), "ok"), "horizons.5000 must be an object", "751"),
+    (_set(("horizons", "5000", "status"), "unavailable"), r"horizons\.5000\.status 'unavailable' is refused",
+     "692 (R7), 735"),
+    (_set(("horizons", "10000", "status"), "maybe"), r"horizons\.10000\.status 'maybe' is refused", "676-678"),
+    (_set(("horizons", "20000", "status"), None), r"horizons\.20000\.status None is refused", "676-678"),
+    (_set(("horizons", "5000", "components"), None), r"horizons\.5000\.components must be an object", "751"),
+    (_set(("horizons", "10000", "bootstrap"), None), r"horizons\.10000\.bootstrap must be an object", "751"),
+    (_set(("horizons", "5000", "capture_bound"), 323), r"horizons\.5000\.capture_bound 323", "592-594, 751"),
+    (_set(("horizons", "10000", "capture_bound"), 324), r"horizons\.10000\.capture_bound 324", "592-594, 751"),
+    (_set(("horizons", "5000", "capture_bound"), 324.0), r"horizons\.5000\.capture_bound 324\.0", "592-594, 751"),
+    (_set(("horizons", "5000", "reasons"), None), r"horizons\.5000\.reasons must be a list", "751"),
+)
 
 
 class TmpDir(unittest.TestCase):
@@ -326,6 +524,25 @@ class TestLocation(unittest.TestCase):
             t.locate(mu, x=eta + 0.01)                 # (x must be logit(mu / c))
         with self.assertRaises(ValueError):
             t.locate(np.array([0.0]))
+
+    def test_T1_3_exterior_knot_extends_the_table_but_beyond_12_the_solve_is_exact(self):
+        """v5 1.7 (L300-302, L309): the knot union is literal, so a capture-curve knot at -13 extends the table to
+        -13; but outside [-12, 12] the location is solved exactly whatever the table covers. Lookups at -12.5 (and
+        other points between -13 and -12) equal the exact solve bit for bit, by mu alone and with the exact axis;
+        inside +-12 the table still interpolates."""
+        curve = {"x": [-13.0, -2.2, -0.6, 0.4], "s": [0.6, 0.55, 0.30, 0.20]}
+        t = ol.build_location_table(curve, "C", 1.0, 324, 324, "0" * 64)
+        self.assertEqual((float(t.x[0]), float(t.x[1])), (-13.0, -12.0))     # (the knot is a node; no grid below -12)
+        xs = np.array([-12.5, -12.9, -12.25, -12.0 - 1e-9])
+        mu = 1.0 / (1.0 + np.exp(-xs))
+        exact = ol.solve_location(mu, ol.scale(curve, mu, 1.0), 324, 324)[0]
+        self.assertTrue(np.array_equal(t.locate(mu, x=xs), exact))
+        self.assertTrue(np.array_equal(t.locate(mu), exact))
+        interp = np.interp(xs, t.x, t.a)                                       # (what an interpolation would give)
+        self.assertNotEqual(float(interp[0]), float(exact[0]))
+        inner = np.array([-11.995, 0.123])
+        mi = 1.0 / (1.0 + np.exp(-inner))
+        self.assertTrue(np.array_equal(t.locate(mi, x=inner), np.interp(inner, t.x, t.a)))
 
 
 @NEED_NP
@@ -462,9 +679,12 @@ class TestFitterTable(unittest.TestCase):
         self.assertFalse(np.any(np.abs(t.x[:, None] - np.array(VAL_SC["x"])[None, :])[~np.isin(t.x, VAL_SC["x"])]
                                 <= ol.FIT_KNOT_GAP))
 
-    def test_T1_7_every_final_segment_meets_items_1_to_4_on_recheck(self):
-        """An independent re-run of the certification on the FINAL table: every refined segment and a sample of
-        the others."""
+    def test_T1_7_repeated_production_certification_of_the_final_table(self):
+        """A REPEATED PRODUCTION CERTIFICATION, not an independent oracle: certify_segments (the code that built the
+        table) runs again on the FINAL table, every refined segment and a sample of the others, and the production
+        lookup reproduces its interpolants. An error shared by the build and the certifier (e.g., in logit_moments)
+        passes this; the independent evidence is test_T1_7_logit_moments_vs_scalar_oracle and
+        test_T1_7_probes_inverted_independently."""
         t = fitter_validation()
         segs = np.arange(len(t.x) - 1)
         refined = segs[(t.x[1:] - t.x[:-1]) < 0.0099]
@@ -481,6 +701,48 @@ class TestFitterTable(unittest.TestCase):
         j = np.repeat(pick, 3)
         lam = (z - t.m[j]) / (t.m[j + 1] - t.m[j])
         self.assertLessEqual(float(np.max(np.abs(ev["W"] - (t.V[j] + lam * (t.V[j + 1] - t.V[j]))))), 1e-15)
+
+    def test_T1_7_logit_moments_vs_scalar_oracle(self):
+        """v5 1.7b (L341-344, (ii)): m_z and the centered V_z of the empirical logit against the test-local scalar
+        category oracle (explicit intervals, math.fsum), from the deep tails through saturation, both laws."""
+        worst_m = worst_v = 0.0
+        for N, M in ((324, 324), (600, 247)):
+            for a in (-9.0, -5.0, -2.2, -0.6, 0.0, 0.4, 2.0, 4.8, 5.775, 6.5, 9.0):
+                for s in (0.05, 0.2, 0.3, 0.55, 1.0):
+                    m, v = (float(u) for u in ol.logit_moments(a, s, N, M))
+                    mo, vo = oracle_logit_moments(a, s, N, M)
+                    worst_m = max(worst_m, abs(m - mo))
+                    worst_v = max(worst_v, abs(v - vo) / (vo + 1e-300))
+        self.assertLessEqual(worst_m, 1e-12, "m_z")
+        self.assertLessEqual(worst_v, 1e-9, "V_z (relative)")
+
+    def test_T1_7_probes_inverted_independently(self):
+        """v5 1.7b items 1-4 at probes of refined and unrefined segments of the final table, against a scalar
+        bisection in x over the test-local exact pipeline (oracle_curve, oracle_location, oracle_logit_moments; no
+        obslaw solver, moments or inversion): the inverse fraction, W, L and the score location against mu*, and
+        the round trip m_z(mu_hat(z)) evaluated by the oracle."""
+        t = fitter_validation()
+        widths = np.diff(t.x)
+        refined = np.flatnonzero(widths < 0.0099)
+        codex = int(np.searchsorted(t.x, 5.775 + 1e-7) - 1)                   # (a segment of Codex's probe region)
+        unrefined = [int(np.searchsorted(t.x, v) - 1) for v in (-6.003, -2.205, 0.005, 3.005)]
+        probes = [(codex, f) for f in (0.25, 0.5, 0.75)] + [(int(refined[k]), 0.5) for k in (0, len(refined) // 2, -1)]
+        probes += [(j, 0.5) for j in unrefined]
+        self.assertTrue(widths[codex] < 0.0099 and all(widths[j] > 0.0099 for j in unrefined))
+        for j, f in probes:
+            z = float(t.m[j] + f * (t.m[j + 1] - t.m[j]))
+            ev = t.evaluate(np.array([z]))
+            xh, W, A, L = (float(ev[k][0]) for k in ("x", "W", "A", "L"))
+            mus, ss, _, ms, vs = oracle_inverse(VAL_SC, z, float(t.x[j]), float(t.x[j + 1]))
+            self.assertLessEqual(abs(ms - z), 1e-9, (j, f))                    # (the reference itself converged)
+            muh = 1.0 / (1.0 + math.exp(-xh))
+            rt = oracle_pipeline(VAL_SC, xh)[3]
+            with self.subTest(segment=j, fraction=f, x=float(t.x[j])):
+                self.assertLessEqual(abs(rt - z), ol.FIT_TOL["roundtrip"])
+                self.assertLessEqual(abs(muh - mus), ol.FIT_TOL["inverse"])
+                self.assertLessEqual(abs(W - vs), ol.FIT_TOL["W"] * vs)
+                self.assertLessEqual(abs(L - ss * ss), ol.FIT_TOL["L"] * ss * ss)
+                self.assertLessEqual(abs(oracle_mean(A, ss, 324, 324) / 324 - mus), ol.FIT_TOL["score"])
 
     def test_T1_7_negative_control_v4_uniform_rule_refuses_at_codex_probe(self):
         """v4's rule (uniform h = 0.01 / 2^k, k <= 4): the z-midpoint of the segment containing x = 5.775 fails the
@@ -527,6 +789,63 @@ class TestFitterTable(unittest.TestCase):
         with mock.patch.object(ol, "fitter_initial_nodes", few), mock.patch.object(ol, "FIT_NODE_CAP", 10):
             with self.assertRaisesRegex(ValueError, "exceed 10"):
                 ol.build_fitter_table(VAL_SC, "0" * 64)
+
+    def test_T1_7_over_cap_initial_grid_is_refused_before_any_evaluation(self):
+        """v5 1.7b (L397-398): the table may not exceed the node cap, the initial grid included. (1) A smooth,
+        already certifiable initial grid of 201 nodes under a cap lowered to 150; (2) the real 2,401-node initial
+        grid of a smooth constant curve under a cap lowered to 2,000: both refused before any node is evaluated or
+        any segment certified."""
+        def never(name):
+            def f(*a, **k):
+                raise AssertionError(f"{name} ran on an over-cap initial grid")
+            return f
+        smooth = {"x": [0.0], "s": [0.3]}
+        grid = lambda curve: np.arange(-100, 101) * 0.01  # noqa: E731
+        with mock.patch.object(ol, "_fit_values", never("_fit_values")), \
+                mock.patch.object(ol, "certify_segments", never("certify_segments")):
+            with mock.patch.object(ol, "fitter_initial_nodes", grid), mock.patch.object(ol, "FIT_NODE_CAP", 150):
+                with self.assertRaisesRegex(ValueError, "initial grid has 201 nodes, over the node cap 150"):
+                    ol.build_fitter_table(smooth, "0" * 64)
+            with mock.patch.object(ol, "FIT_NODE_CAP", 2000):
+                with self.assertRaisesRegex(ValueError, "initial grid has 2401 nodes, over the node cap 2000"):
+                    ol.build_fitter_table(smooth, "0" * 64)
+        with mock.patch.object(ol, "fitter_initial_nodes", grid), mock.patch.object(ol, "FIT_NODE_CAP", 201):
+            self.assertEqual(ol.build_fitter_table(smooth, "0" * 64).record["nodes"], 201)   # (at the cap: built)
+
+    def test_T1_7_over_cap_knot_set_is_refused_before_any_allocation(self):
+        """A knot set larger than the node cap is refused before the initial grid (or any array) is built."""
+        curve = {"x": [k * 1e-3 for k in range(60)], "s": [0.3] * 60}
+        with mock.patch.object(ol, "FIT_NODE_CAP", 50), \
+                mock.patch.object(ol.np, "arange", side_effect=AssertionError("an array was allocated")):
+            with self.assertRaisesRegex(ValueError, "60 curve knots exceed the node cap 50"):
+                ol.build_fitter_table(curve, "0" * 64)
+            with self.assertRaisesRegex(ValueError, "60 curve knots exceed the node cap 50"):
+                ol.fitter_initial_nodes(curve)
+
+    def test_T1_7_initial_nodes_sorted_search_equals_the_rule_without_a_dense_matrix(self):
+        """v5 1.7b's initial-node rule, computed here densely (min over all knots), equals fitter_initial_nodes on
+        knots near grid nodes (inside and outside 1e-9), outside [-12, 12], unsorted and duplicated; and with 5,000
+        knots fitter_initial_nodes allocates far less than the 2,401 x 5,000 distance matrix (96 MB)."""
+        def dense(knots):
+            xu = np.arange(-1200, 1201) * 0.01
+            k = np.asarray(knots, float)
+            xu = xu[np.min(np.abs(xu[:, None] - k[None, :]), axis=1) > 1e-9]
+            return np.union1d(xu, k[(k >= -12.0) & (k <= 12.0)])
+        rng = np.random.default_rng(13)
+        cases = [[0.0], [-2.2, -0.6, 0.4], [0.5 + 5e-10, 0.5 + 2e-9, -11.99 - 1e-9, 12.0 + 5e-10, 12.3, -13.0],
+                 [3.0, -1.0, 3.0, 2.5], rng.uniform(-13, 13, 300).tolist(),
+                 (np.round(rng.uniform(-12, 12, 200), 2) + rng.choice([-2e-9, -5e-10, 0.0, 5e-10, 2e-9], 200)).tolist()]
+        for knots in cases:
+            self.assertTrue(np.array_equal(ol.fitter_initial_nodes({"x": knots}), dense(knots)), knots[:4])
+        big = sorted(set(rng.uniform(-11.9, 11.9, 5000).tolist()))
+        tracemalloc.start()
+        try:
+            got = ol.fitter_initial_nodes({"x": big})
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        self.assertLess(peak, 8 << 20, f"peak {peak} bytes")
+        self.assertTrue(np.all(np.isin(big, got)) and np.all(np.diff(got) > 0))
 
     def test_T1_7_non_monotone_m_z_is_refused(self):
         x = np.array([0.0, 0.01, 0.02])
@@ -687,25 +1006,31 @@ class TestBankArtifact(TmpDir):
         d = bank3_doc(synthetic=True)
         self.assertTrue(self.load(d, flag=True).synthetic)
 
-    def test_T5_3_each_missing_field_is_named(self):
-        paths = [(k,) for k in ol.TOP_FIELDS if k != "schema"] + [("noise", k) for k in ol.NOISE_FIELDS] + \
-                [("map_variance", k) for k in ol.MAP_VARIANCE_FIELDS] + [("d8", k) for k in ol.D8_FIELDS] + \
-                [("fit", "noise_likelihood"), ("fit", "noise"), ("fit", "streams")] + \
-                [("fit", "noise", k) for k in ol.FIT_NOISE_SHAS] + [("inputs", k) for k in ol.INPUT_KEYS] + \
-                [("map_variance", "nu0", ch) for ch in ("C", "S", "F")]
-        for path in paths:
+    def test_T5_3_each_v5_required_field_missing_is_refused_and_named(self):
+        """V5_FIELDS (from v5 2.8's text, by line; not from obslaw's own lists): deleting each field from the complete
+        fixture, with the file hash correctly bound, is refused with that field named."""
+        self.assertEqual(len({p for p, _, _ in V5_FIELDS}), len(V5_FIELDS))
+        for path, line, _ in V5_FIELDS:
             d = bank3_doc()
             node = d
             for k in path[:-1]:
                 node = node[k]
             del node[path[-1]]
             name = ".".join(path)
-            with self.subTest(field=name), self.assertRaisesRegex(ValueError, re.escape(f"missing field {name}")):
+            if path[:2] == ("noise", "s_logit") and len(path) == 3:
+                pattern = re.escape("noise.s_logit") + ".*" + re.escape(f"no curve for ['{path[2]}']")
+            else:
+                pattern = re.escape(f"missing field {name}") + "$"
+            with self.subTest(field=name, v5_line=line), self.assertRaisesRegex(ValueError, pattern):
                 self.load(d)
-        d = bank3_doc()
-        del d["schema"]
-        with self.assertRaisesRegex(ValueError, "missing field schema"):
-            self.load(d)
+
+    def test_T5_3_v5_types_and_fixed_values_of_the_records(self):
+        """V5_VALUES: the estimator record, the horizon records and the bootstrap stream texts and seeds (structure
+        and types), the derived inputs_sha256 and v5 2.8's fixed texts; each malformed artifact has its file hash
+        correctly bound, so only the semantic check can refuse it."""
+        for i, (mutate, pattern, line) in enumerate(V5_VALUES):
+            with self.subTest(case=i, pattern=pattern, v5_line=line):
+                self.refuses(mutate, pattern)
 
     def test_T5_3_each_wrong_value_of_section_2_9(self):
         cases = [
@@ -785,11 +1110,25 @@ class TestBankArtifact(TmpDir):
         self.assertEqual(bank3_doc()["age_clock"], material.age_clock_identity())
 
     def test_T2_3_obslaw_derives_no_age_arithmetic(self):
+        """Static guard over obslaw's CODE: comments and string literals are blanked by the tokenizer first (v5 2.8
+        L748's verbatim d8.age_predicate text names common.age_feasible and binary32(max_age) as text)."""
         src = rqlib.read_text(os.path.join(HERE, "obslaw.py"))
-        code = "\n".join(line.split("#", 1)[0] for line in src.splitlines())
+        drop = {tokenize.COMMENT, tokenize.STRING} | {getattr(tokenize, n) for n in ("FSTRING_MIDDLE", "TSTRING_MIDDLE")
+                                                      if hasattr(tokenize, n)}
+        starts = [0]
+        for line in src.splitlines(keepends=True):
+            starts.append(starts[-1] + len(line))
+        chars = list(src)
+        for tok in tokenize.generate_tokens(io.StringIO(src).readline):
+            if tok.type in drop:
+                for i in range(starts[tok.start[0] - 1] + tok.start[1], starts[tok.end[0] - 1] + tok.end[1]):
+                    if chars[i] != "\n":
+                        chars[i] = " "
+        code = "".join(chars)
+        self.assertIn("material.cohort_ceiling(", code)                  # (the blanking keeps code)
         for pat in (r"\bcommon\.", r"age_feasible", r"age_death_frame", r"binary32\(", r"_CLOCKS",
-                    r"\bages\b.*\*\s*(DT|0\.016)", r"max_age\s*[-+*/<>]"):
-            self.assertIsNone(re.search(pat, code), pat)
+                    r"\bages\b.*\*\s*(DT|0\.016)", r"max_age\s*[-+*/<>]", r"^\s*(import|from)\s+common\b"):
+            self.assertIsNone(re.search(pat, code, re.M), pat)
         self.assertEqual(len(re.findall(r"material\.cohort_ceiling\(", code)), 1)
 
     def test_T2_3_monkeypatched_clock_changes_the_ceiling_and_the_load_refuses(self):
@@ -823,6 +1162,33 @@ def _model_fixture(tmp, gammas=(1.0,), doc=None):
     tp = os.path.join(tmp, "obs_tables.npz")
     ol.ObsTables(loc, fit, bank.sha256).save(tp)
     return bp, tp
+
+
+def _rehashed_tables(raw, changes):
+    """A tables file with some arrays changed (changes: {member: f(array) -> array}) and its content sha256
+    RE-COMPUTED here for the changed arrays (the obstables/1 rule: canonical sha256 of {schema, identity, records,
+    arrays: {name: [dtype, shape, sha256 of the C-order bytes]}}), so only a semantic check can refuse it."""
+    with np.load(io.BytesIO(raw), allow_pickle=False) as z:
+        arrays = {k: np.array(z[k]) for k in z.files}
+    meta = json.loads(str(arrays.pop("meta")))
+    for k, f in changes.items():
+        arrays[k] = f(arrays[k])
+    body = {k: meta[k] for k in ("schema", "identity", "records")}
+    digest = {k: [v.dtype.str, list(v.shape), hashlib.sha256(np.ascontiguousarray(v).tobytes()).hexdigest()]
+              for k, v in sorted(arrays.items())}
+    meta["content_sha256"] = rqlib.canonical_sha(dict(body, arrays=digest))
+    buf = io.BytesIO()
+    np.savez(buf, meta=np.array(rqlib.canonical(meta).decode("ascii")), **arrays)
+    return buf.getvalue(), meta["content_sha256"]
+
+
+_LOAD_MODEL = r"""
+import sys
+sys.path.insert(0, sys.argv[1])
+import obslaw
+obslaw.BankObservationModel(sys.argv[2], sys.argv[3])
+print("LOADED")
+"""
 
 
 @NEED_NP
@@ -924,17 +1290,83 @@ class TestModel(TmpDir):
         with self.assertRaisesRegex(ValueError, "fitter table's identity"):
             ol.BankObservationModel(bp, p)
 
+    def test_item7_column_shaped_fitter_axis_is_refused_at_load(self):
+        """A tables file whose fit_x is (n, 1), correctly re-hashed (content sha256 recomputed, file sha256
+        configured), is refused at load with the field named; so is a (n, 1) fit_m. The control (a re-hash of the
+        unchanged arrays) loads."""
+        bp, tp = _model_fixture(self.tmp)
+        raw = rqlib.read_bytes(tp)
+        for member in ("fit_x", "fit_m"):
+            data, content = _rehashed_tables(raw, {member: lambda a: a.reshape(-1, 1)})
+            p = self.write(f"{member}_col.npz", data)
+            n = len(ol.ObsTables.from_bytes(raw).fitter.x)
+            msg = re.escape(f"fitter table: {member} has shape ({n}, 1), not ({n},)")
+            with self.subTest(member=member), self.assertRaisesRegex(ValueError, msg):
+                ol.BankObservationModel(bp, p, tables_sha256=rqlib.sha256_file(p), tables_content_sha256=content)
+        data, content = _rehashed_tables(raw, {})
+        p = self.write("control.npz", data)
+        ol.BankObservationModel(bp, p, tables_sha256=rqlib.sha256_file(p), tables_content_sha256=content)
+
+    def test_P3_1_tables_identity_binds_obslaw_and_noisescale_sources(self):
+        """Coordinator decision on review P3-1: every table identity records obslaw_sha256 and noisescale_sha256
+        (sha256 of each source file); tables whose recorded value differs from the current file are refused. A
+        copy of tools/redqueen in which ONLY noisescale.py (or only obslaw.py) changed refuses the tables built
+        here; an unchanged copy loads them."""
+        bp, tp = _model_fixture(self.tmp)
+        ident = ol.ObsTables.load(tp).identity()
+        want = {"obslaw_sha256": rqlib.sha256_file(os.path.join(HERE, "obslaw.py")),
+                "noisescale_sha256": rqlib.sha256_file(os.path.join(HERE, "noisescale.py"))}
+        for rec in [ident] + ident["location"] + [ident["fitter"]]:
+            self.assertEqual({k: rec[k] for k in want}, want)
+        for changed, field in ((None, None), ("noisescale.py", "noisescale_sha256"), ("obslaw.py", "obslaw_sha256")):
+            tools = os.path.join(self.tmp, f"tools_{changed}")
+            shutil.copytree(HERE, tools, ignore=shutil.ignore_patterns("__pycache__", "test_*.py", "*.pyc"))
+            if changed:
+                with open(os.path.join(tools, changed), "ab") as fh:
+                    fh.write(b"\n# (this file alone changed)\n")
+            r = subprocess.run([sys.executable, "-I", "-c", _LOAD_MODEL, tools, bp, tp], capture_output=True,
+                               text=True, timeout=900)
+            with self.subTest(changed=changed):
+                if changed is None:
+                    self.assertEqual((r.returncode, r.stdout.strip()), (0, "LOADED"), r.stderr[-1500:])
+                else:
+                    self.assertNotEqual(r.returncode, 0, r.stdout)
+                    self.assertIn(f"({field})", r.stderr)
+
     def test_generate_draw_order_and_endpoints(self):
+        """PC-3 (v5 1.4, L231-233): the expected observations are built HERE from default_rng([17, 3]) drawn
+        explicitly in v5's order, Z_R (nQ, R, 3), Z_EF (nQ, R), Z_D (nP, R, 2), Z_E (|E|, R, 2), with the latents
+        (L216-218) and the capped rounded counts (L260-265) composed here; only the location lookup and S are
+        production's. Exchanging any two of obslaw.standard_normals' draws fails this test."""
         m = self.model()
         qi, pj = np.array([0, 0, 1, 2, 2]), np.array([0, 1, 1, 0, 1])
+        nQ, nP, nE, R = 3, 2, 5, 6
         eta = np.array([-2.0, 0.3, 1.5, 40.0, -1.0])
         mu = {"C": 1 / (1 + np.exp(-eta)), "S": m.c_H / (1 + np.exp(-(eta - 0.5))), "F": np.array([0.2, m.c_H, 0.0])}
-        out = m.generate(np.random.default_rng([17, 3]), qi, pj, 3, 2, mu, x={"S": eta - 0.5})
-        Z = ol.standard_normals(np.random.default_rng([17, 3]), 3, 2, 5, 6)
-        u = ol.latent(Z, m.factors, qi, pj)
+        xs = {"S": eta - 0.5}
+        out = m.generate(np.random.default_rng([17, 3]), qi, pj, nQ, nP, mu, x=xs)
+        g = np.random.default_rng([17, 3])
+        ZR = g.standard_normal((nQ, R, 3))
+        ZEF = g.standard_normal((nQ, R))
+        ZD = g.standard_normal((nP, R, 2))
+        ZE = g.standard_normal((nE, R, 2))
+        FR, FD, FE = (np.asarray(m.factors[k], float) for k in ("R", "D", "E"))
+        rows, donors, cells = ZR @ FR.T, ZD @ FD.T, ZE @ FE.T
+        u = {"C": rows[qi, :, 0] + donors[pj, :, 0] + cells[:, :, 0],
+             "S": rows[qi, :, 1] + donors[pj, :, 1] + cells[:, :, 1],
+             "F": rows[:, :, 2] + math.sqrt(1.0 - SIGMA_R[2][2]) * ZEF}
         for ch in ol.CHANNELS:
-            K, _, _ = m.counts(ch, mu[ch], u[ch], 1.0, eta - 0.5 if ch == "S" else None)
-            self.assertTrue(np.array_equal(out["counts"][ch], K), ch)
+            N, M = (324, 324) if ch == "C" else (600, 247)
+            c = M / N
+            want = np.zeros((len(mu[ch]), R), np.int64)
+            want[mu[ch] == c] = M
+            inner = np.flatnonzero((mu[ch] > 0) & (mu[ch] < c))
+            tab = m.location_table(ch, 1.0)
+            a = tab.locate(mu[ch][inner], None if ch not in xs else xs[ch][inner])
+            s = m.s(ch, mu[ch][inner])
+            v = np.floor(N * (1.0 / (1.0 + np.exp(-(a[:, None] + s[:, None] * u[ch][inner])))) + 0.5)
+            want[inner] = np.minimum(M, v).astype(np.int64)
+            self.assertTrue(np.array_equal(out["counts"][ch], want), ch)
         self.assertEqual(out["counts"]["C"].shape, (5, 6))
         self.assertTrue(np.all(out["counts"]["F"][1] == 247) and np.all(out["counts"]["F"][2] == 0))
         self.assertTrue(np.all(out["counts"]["C"][3] == 324))       # (sigma(40) = 1 exactly: the endpoint mu = c)
@@ -963,19 +1395,48 @@ print(json.dumps(out))
 """
 
 
+def pr68_pinned_commit(root):
+    """The #68 extraction's PINNED_COMMIT (a full 40-hex sha); refused (AssertionError) when absent or malformed,
+    so a directory of unknown provenance cannot pass as the pinned commit."""
+    pin = os.path.join(root, "PINNED_COMMIT")
+    if not os.path.isfile(pin):
+        raise AssertionError(f"adoption gate refused: {pin} is absent (RQ_PR68_DIR must be the root of a git-archive "
+                             "extraction of the pinned #68 commit, holding PINNED_COMMIT and tools/redqueen/)")
+    sha = rqlib.read_text(pin).strip()
+    if not re.fullmatch(r"[0-9a-f]{40}", sha):
+        raise AssertionError(f"adoption gate refused: PINNED_COMMIT {sha!r} is not a full 40-hex commit sha")
+    return sha
+
+
+class TestAdoptionGatePin(TmpDir):
+    def test_pinned_commit_is_required_and_read(self):
+        """The gate's provenance check (review: RQ_PR68_DIR alone does not prove which commit was extracted)."""
+        with self.assertRaisesRegex(AssertionError, "PINNED_COMMIT is absent"):
+            pr68_pinned_commit(self.tmp)
+        self.write("PINNED_COMMIT", b"75817e2\n")
+        with self.assertRaisesRegex(AssertionError, "not a full 40-hex"):
+            pr68_pinned_commit(self.tmp)
+        self.write("PINNED_COMMIT", b"75817e293a8368a1cb1168f446bd33f9454dd644\n")
+        self.assertEqual(pr68_pinned_commit(self.tmp), "75817e293a8368a1cb1168f446bd33f9454dd644")
+
+
 @NEED_NP
-@unittest.skipUnless(PR68, "adoption gate: RQ_PR68_DIR (a read-only extraction of the pinned #68 commit's "
-                           "tools/redqueen) not set")
+@unittest.skipUnless(PR68, "adoption gate: RQ_PR68_DIR (the root of a read-only extraction of the pinned #68 "
+                           "commit, with PINNED_COMMIT and tools/redqueen) not set")
 class TestAdoptionGate68(unittest.TestCase):
-    """v5 5: T1-6's cross-check with #68's law and T5-5's normals against transition.VecSplitMix64."""
+    """v5 5: T1-6's cross-check with #68's law and T5-5's normals against transition.VecSplitMix64, at the commit
+    named by the extraction's PINNED_COMMIT (printed; refused when absent)."""
 
     @classmethod
     def setUpClass(cls):
+        cls.commit = pr68_pinned_commit(PR68)
+        tools = os.path.join(PR68, "tools", "redqueen")
+        print(f"\nadoption gate: #68 PINNED_COMMIT {cls.commit} (extraction {tools})", file=sys.stderr, flush=True)
         cls.loc = [(C247 - 1e-3, 0.3, 600, 247), (C247 - 1e-4, 0.5, 600, 247), (0.2, 0.25, 600, 247),
                    (1e-3, 0.3, 600, 247), (0.5, 0.3, 324, 324), (0.99, 0.2, 324, 324), (0.02, 0.45, 324, 324)]
         cls.ef = [(-1.0, 0.3, 600, 247), (-0.36, 0.6, 600, 247), (0.5, 0.8, 600, 247), (2.0, 0.2, 324, 324)]
         cls.normals = [(ref_seed(REFIT), 64), (ref_seed(VALROWS), 64)]
-        r = subprocess.run([sys.executable, "-I", "-c", _GATE68, PR68], capture_output=True, text=True, timeout=1800,
+        r = subprocess.run([sys.executable, "-I", "-c", _GATE68, tools], capture_output=True, text=True, timeout=1800,
                            input=json.dumps({"loc": cls.loc, "ef": cls.ef, "normals": cls.normals}))
         if r.returncode:
             raise AssertionError(f"#68 side failed: {r.stderr[-2000:]}")
