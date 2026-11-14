@@ -14,7 +14,8 @@ section 5). Synthetic data only: no bank observation, no study store or output i
   T3 (obslaw's unit part; the bank-mode recovery integration is test_graph.py's): latent correlations per sharing
      class, a singular PSD SigmaR, no second layer.
   T5-3 / T5-7 the strict bank/3 loader (V5_FIELDS: every field v5 2.8 prescribes, by v5 line and the section of
-     A_design_v5_clarification_1.md that fixes its representation; V5_VALUES: types and values, C1-C5); T5-5 the D8
+     A_design_v5_clarification_1.md that fixes its representation; V5_VALUES: types and values, C1-C5 and Addendum
+     A's C7-C9: screened, exact horizon records, noise / map_variance equal to their 5k sources); T5-5 the D8
      streams (+ #68's normals, adoption gate); 4.2 item 7 the tables (shapes, identity incl. the noisescale evaluator).
 
     RQ_REQUIRE_NUMPY=1 python3 -I -W error::ResourceWarning tools/redqueen/test_obslaw.py -v
@@ -246,7 +247,8 @@ NB_GROUPS = ("R_CC", "R_SS", "R_CS", "D_CC", "D_SS", "D_CS", "T_CS", "R_CF", "R_
 NB_BOOT_NAMES = ("R_CC", "R_SS", "R_CS", "R_CF", "R_SF", "D_CC", "D_SS", "D_CS", "E_CC", "E_SS", "E_CS")   # L1623
 CAP_GROUPS = ("R_CC", "D_CC")                                                                 # v5 L674; C4
 CAP_BOOT_NAMES = ("R_CC", "D_CC", "E_CC")                                                     # C4.1: L1623 on C
-COUNT_KEYS = ("rows", "incomplete", "saturated", "unidentified", "usable")                    # L946-947
+COUNT_KEYS = ("rows", "incomplete", "saturated", "unidentified", "usable",                    # L946-947
+              "screened")                                                        # clarification Addendum A C7
 CURVE_KEYS = ("x", "s", "direction", "support", "cells", "blocks", "extrapolation")           # L1546-1548
 NU0_KEYS = {"estimated": ("status", "nu0", "excess_log_variance", "sampling_log_variance", "cells"),   # L1597-1610
             "full_pooling": ("status", "excess_log_variance", "sampling_log_variance", "cells"),
@@ -334,7 +336,7 @@ def c3_estimator():
 
 # ------------------------------------------------------------------ the synthetic bank/3 fixture
 def counts_rec():
-    return {"rows": 512, "incomplete": 0, "saturated": 12, "unidentified": 4, "usable": 496}
+    return {"rows": 512, "incomplete": 0, "saturated": 12, "unidentified": 4, "usable": 496, "screened": 2}
 
 
 def curve_rec(base):
@@ -415,8 +417,13 @@ def bank3_doc(synthetic=False):
     """A complete, valid synthetic bank/3 artifact (v5 2.8 with clarification 1): every field V5_FIELDS lists,
     declared synthetic parameters, the registered constants and texts (the estimator record and the horizon texts
     read from noisebank's own source; the C2/C3/C5 records from the clarification), placeholder identities and
-    placeholder fit values, no survival quantity at 10k/20k. Not a bank fit."""
-    curves = {"C": copy.deepcopy(VAL_SC), "S": copy.deepcopy(VAL_SS), "F": copy.deepcopy(VAL_SS)}
+    placeholder fit values, no survival quantity at 10k/20k. Not a bank fit. noise and map_variance are built from
+    horizons["5000"] as noisebank.py L1788-1796 builds them (clarification Addendum A C9): s_logit = {x, s,
+    direction} of the 5k curves, the matrices = the 5k components, map_variance.nu0 = the 5k nu0 records."""
+    hz = {"5000": _horizon_record("5000", "ok"), "10000": _horizon_record("10000", "ok"),
+          "20000": _horizon_record("20000", "unavailable")}
+    base = hz["5000"]
+    curves = {ch: {k: copy.deepcopy(base["scales"][ch][k]) for k in ("x", "s", "direction")} for ch in "CSF"}
     inputs = dict(ol.REGISTERED_INPUTS, design_canonical_sha256=sha_of("dc"), provenance_sha256=sha_of("pv"),
                   validation_report_sha256=sha_of("vr"))
     firsts = []
@@ -434,19 +441,18 @@ def bank3_doc(synthetic=False):
                 "streams": {"bootstrap": {"generator": "rqlib.SplitMix64", "namespace": "AnnexH/D8/1",
                                           "texts": list(REFIT_TEXTS), "seeds": [ref_seed(t) for t in REFIT_TEXTS],
                                           "first_outputs": firsts}}},
-        "noise": {"available": True, "s_logit": curves, "SigmaR": copy.deepcopy(SIGMA_R),
-                  "SigmaD": copy.deepcopy(SIGMA_D), "SigmaE": copy.deepcopy(SIGMA_E), "horizon": 5000,
+        "noise": {"available": True, "s_logit": curves, "SigmaR": copy.deepcopy(base["components"]["SigmaR"]),
+                  "SigmaD": copy.deepcopy(base["components"]["SigmaD"]),
+                  "SigmaE": copy.deepcopy(base["components"]["SigmaE"]), "horizon": 5000,
                   "capture_bound": 324, "survivor_ceiling": 247},
-        "map_variance": {"s_logit": copy.deepcopy(curves),
-                         "nu0": {ch: nu0_rec(NU0_STATUS[("5000", ch)]) for ch in "CSF"},
+        "map_variance": {"s_logit": copy.deepcopy(curves), "nu0": copy.deepcopy(base["nu0"]),
                          "rule": C5_RULE, "consumer": "map.fit rep_prior, capture channel"},
         "d8": {"amendment_sha256": ol.D8_SHA256, "capture_law": ol.CAPTURE_LAW, "ceilings": dict(ol.CEILINGS),
                "max_age": material.registered_ages()["max_age"], "denominator": 600,
                "age_predicate": AGE_PREDICATE, "capped_category": CAPPED_CATEGORY},
         "inputs": inputs,
         "estimator": c3_estimator(),
-        "horizons": {"5000": _horizon_record("5000", "ok"), "10000": _horizon_record("10000", "ok"),
-                     "20000": _horizon_record("20000", "unavailable")},
+        "horizons": hz,
     }
 
 
@@ -466,7 +472,9 @@ def _v5_horizon_fields():
         H = ("horizons", h)
         v5 = "751; C4, C4.1" if zero else "751"
         out += [(H + ("channels", ch), v5, f"{_NB} L1690") for ch in "CSF"]
-        out += [(H + ("channels", ch, k), v5, f"{_NB} L946-947") for ch in chans for k in COUNT_KEYS]
+        out += [(H + ("channels", ch, k), v5 + ("; clarification Addendum A C7" if k == "screened" else ""),
+                 "v5 L666-667, the screen's counts" if k == "screened" else f"{_NB} L946-947")
+                for ch in chans for k in COUNT_KEYS]
         if zero:
             out += [(H + ("channels", ch, k), "671-673; C4", "the structural-zero declaration, whatever the status")
                     for ch in "SF" for k in STRUCTURAL_ZERO]
@@ -583,12 +591,36 @@ def _cap_fit(rR, rD):
     return mutate
 
 
+def constrained_fit(d, **extra):
+    """The 5k components as a constrained (multi-start) fit (noisebank.fit_dependence L1423-1440), extra keys
+    added to its multistart record."""
+    d["horizons"]["5000"]["components"].update(
+        fit="constrained", unconstrained_problems=["SigmaE is not PSD"],
+        multistart=dict({"starts": 16, "converged": 12, "reaching_best": 9, "parameter_spread": 2e-4,
+                         "kkt_residual": 3e-7, "label": nb_text("multi-start validated")}, **extra))
+
+
+def unavailable_interval(d, h="5000", **extra):
+    """horizons[h].bootstrap as an unavailable interval (interval_record L1676-1678), extra keys added."""
+    d["horizons"][h]["bootstrap"].update(dict(failed=60, identification_rejections=10, failure_rate=60 / 999,
+                                              status="unavailable", ci95=None,
+                                              reason="60 of 999 draws failed (> 5%)"), **extra)
+
+
+def _both_s_logit(ch, change):
+    """noise.s_logit[ch] and map_variance.s_logit[ch] changed alike (so v5 4.2 item 5 still passes)."""
+    def mutate(d):
+        for blk in ("noise", "map_variance"):
+            change(d[blk]["s_logit"][ch])
+    return mutate
+
+
 _BOOT = ("fit", "streams", "bootstrap")
 _FO = _BOOT + ("first_outputs",)
 _5K, _10K, _20K = ("horizons", "5000"), ("horizons", "10000"), ("horizons", "20000")
 # v5 2.8's types and fixed values (and 2.5 / 2.6 / 2.7 where 2.8 cites them), with clarification 1's sections:
 # (mutation, refusal pattern, v5 line; clarification section). Entries 0-37 are round 2's (21 and 22, the rule's,
-# re-bound to C5's fixed text); every later entry is new in round 3.
+# re-bound to C5's fixed text); 38-188 are round 3's; every later entry is round 4's (clarification Addendum A).
 V5_VALUES = (
     (_set(("estimator",), {}), r"missing field estimator\.z_intervals", "750"),          # (the review's cases)
     (_set(("horizons",), {}), r"missing field horizons\.5000", "751"),
@@ -874,6 +906,109 @@ V5_VALUES = (
      "L1676"),
     (_set(_5K + ("bootstrap", "identification_rejections"), 4),
      r"bootstrap\.identification_rejections is not an integer in 0\.\.failed", "L1671"),
+    # ---- round 4, clarification Addendum A. C7: screened (missing: the V5_FIELDS deletions)
+    (_set(_5K + ("channels", "C", "screened"), -1), r"horizons\.5000\.channels\.C\.screened -1 is not a non-negative",
+     "666-667; Addendum A C7"),
+    (_set(_5K + ("channels", "C", "screened"), None), r"horizons\.5000\.channels\.C\.screened None is not",
+     "666-667; Addendum A C7"),
+    (_set(_5K + ("channels", "S", "screened"), 1.0), r"horizons\.5000\.channels\.S\.screened 1\.0 is not",
+     "666-667; Addendum A C7"),
+    (_set(_5K + ("channels", "F", "screened"), "2"), r"horizons\.5000\.channels\.F\.screened '2' is not",
+     "666-667; Addendum A C7"),
+    (_set(_10K + ("channels", "C", "screened"), True), r"horizons\.10000\.channels\.C\.screened True is not",
+     "666-667; Addendum A C7"),
+    (_set(_5K + ("channels", "F", "screened"), 5), r"horizons\.5000\.channels\.F\.screened 5 exceeds unidentified 4",
+     "656, 666-667; Addendum A C7"),
+    (_set(_20K + ("channels", "C", "screened"), 5),
+     r"horizons\.20000\.channels\.C\.screened 5 exceeds unidentified 4", "656, 666-667; Addendum A C7"),
+    (_upd(_10K + ("channels", "S"), screened=0),
+     r"horizons\.10000\.channels\.S carries screened: a structural-zero declaration has no counts",
+     "671-673; C4, Addendum A C7"),
+    (_upd(_20K + ("channels", "F"), screened=0),
+     r"horizons\.20000\.channels\.F carries screened: a structural-zero declaration has no counts",
+     "671-673; C4, Addendum A C7 (unavailable)"),
+    # ---- C8: an extra key at every record level of a horizon (both unavailable shapes stay admitted)
+    (_upd(_5K, note="x"), r"horizons\.5000 has keys \['note'\] outside its ok record", "751; Addendum A C8"),
+    (_upd(_10K, note="x"), r"horizons\.10000 has keys \['note'\] outside its ok record", "751; C4.1, Addendum A C8"),
+    (_put(_20K + ("grid_validation",), lambda: dict(_horizon_record("5000", "ok")["grid_validation"])),
+     r"horizons\.20000 has keys \['grid_validation'\] outside its unavailable record", "751; C4.1, Addendum A C8"),
+    (_upd(_5K + ("channels", "C"), excluded=0), r"horizons\.5000\.channels\.C has keys \['excluded'\] outside",
+     "L946-947; Addendum A C7, C8"),
+    (_upd(_10K + ("channels", "C"), excluded=0), r"horizons\.10000\.channels\.C has keys \['excluded'\] outside",
+     "L946-947; C4.1, Addendum A C8"),
+    (_upd(_5K + ("scales", "S"), knots=3), r"horizons\.5000\.scales\.S has keys \['knots'\] outside",
+     "L1546-1548; Addendum A C8"),
+    (_upd(_20K + ("scales", "C"), knots=3), r"horizons\.20000\.scales\.C has keys \['knots'\] outside",
+     "L1546-1548; C4.1, Addendum A C8"),
+    (_upd(_5K + ("nu0", "C"), note="x"), r"horizons\.5000\.nu0\.C has keys \['note'\] outside",
+     "L1597-1610; Addendum A C8 (estimated)"),
+    (_upd(_5K + ("nu0", "S"), extra=1), r"horizons\.5000\.nu0\.S has keys \['extra'\] outside",
+     "L1597-1610; Addendum A C8 (full_pooling)"),
+    (_upd(_5K + ("nu0", "S"), note="x"), r"horizons\.5000\.nu0\.S\.note 'x' is not noisebank's text",
+     "L1610; Addendum A C8 (full_pooling's one note)"),
+    (_upd(_5K + ("nu0", "F"), cells=3), r"horizons\.5000\.nu0\.F has keys \['cells'\] outside",
+     "L1597-1599; Addendum A C8 (unavailable)"),
+    (_upd(_10K + ("nu0", "C"), extra=1), r"horizons\.10000\.nu0\.C has keys \['extra'\] outside",
+     "L1597-1610; C4.1, Addendum A C8"),
+    (_upd(("map_variance", "nu0", "S"), extra=1), r"map_variance\.nu0\.S has keys \['extra'\] outside",
+     "747; Addendum A C8, C9"),
+    (_upd(_5K + ("groups", "R_CC"), weight=1), r"horizons\.5000\.groups\.R_CC has keys \['weight'\] outside",
+     "L1710-1711, L1737; Addendum A C8"),
+    (_upd(_10K + ("groups", "D_CC"), weight=1), r"horizons\.10000\.groups\.D_CC has keys \['weight'\] outside",
+     "L1710-1711, L1737; C4.1, Addendum A C8"),
+    (_upd(_20K + ("groups", "R_CC"), nodes=241), r"horizons\.20000\.groups\.R_CC has keys \['nodes'\] outside",
+     "L1716, L1737; C4.1, Addendum A C8 (unavailable: no nodes)"),
+    (_upd(_5K + ("grid_validation",), certificate=False),
+     r"horizons\.5000\.grid_validation has keys \['certificate'\] outside", "L1742-1744; Addendum A C8"),
+    (_upd(_10K + ("grid_validation",), certificate=False),
+     r"horizons\.10000\.grid_validation has keys \['certificate'\] outside", "L1742-1744; C4.1, Addendum A C8"),
+    (_upd(_5K + ("components",), problems=[]), r"horizons\.5000\.components has keys \['problems'\] outside",
+     "L1745-1753; Addendum A C8"),
+    (_upd(_10K + ("components",), rho={}), r"horizons\.10000\.components has keys \['rho'\] outside",
+     "L1745-1753; C4.1, Addendum A C8"),
+    (_upd(_5K + ("components", "SigmaR_FF"), note="x"),
+     r"horizons\.5000\.components\.SigmaR_FF has keys \['note'\] outside", "L1749-1751; Addendum A C8"),
+    (_upd(_5K + ("components", "shares", "C"), total=1.0),
+     r"horizons\.5000\.components\.shares\.C has keys \['total'\] outside", "L1752-1753; Addendum A C8"),
+    (_upd(_10K + ("components", "shares", "C"), total=1.0),
+     r"horizons\.10000\.components\.shares\.C has keys \['total'\] outside", "L1752-1753; C4.1, Addendum A C8"),
+    (lambda d: constrained_fit(d, extra=1), r"horizons\.5000\.components\.multistart has keys \['extra'\] outside",
+     "L1434-1436; Addendum A C8"),
+    (_upd(_5K + ("bootstrap",), seed=0), r"horizons\.5000\.bootstrap has keys \['seed'\] outside",
+     "L1671-1680; Addendum A C8"),
+    (_upd(_5K + ("bootstrap",), reason="x"), r"horizons\.5000\.bootstrap has keys \['reason'\] outside",
+     "L1676-1680; Addendum A C8 (an ok interval has no reason)"),
+    (lambda d: unavailable_interval(d, extra=1), r"horizons\.5000\.bootstrap has keys \['extra'\] outside",
+     "L1676-1678; Addendum A C8 (unavailable interval)"),
+    (_upd(_10K + ("bootstrap",), seed=0), r"horizons\.10000\.bootstrap has keys \['seed'\] outside",
+     "L1671-1680; C4.1, Addendum A C8"),
+    # ---- C9: noise and map_variance against their sources in horizons["5000"] (noisebank.py L1788-1796)
+    (_both_s_logit("C", lambda c: c.update(s=[0.56, 0.30, 0.20])),
+     r"noise\.s_logit\.C differs from \{x, s, direction\} of horizons\.5000\.scales\.C", "746; Addendum A C9 (L1790)"),
+    (_both_s_logit("S", lambda c: c.update(x=[-2.5, -1.2, -0.4])),
+     r"noise\.s_logit\.S differs from \{x, s, direction\} of horizons\.5000\.scales\.S", "746; Addendum A C9 (L1790)"),
+    (_both_s_logit("F", lambda c: c.pop("direction")),
+     r"noise\.s_logit\.F differs from \{x, s, direction\} of horizons\.5000\.scales\.F", "746; Addendum A C9 (L1790)"),
+    (_both_s_logit("C", lambda c: c.update(support=[-2.7, 0.9])),
+     r"noise\.s_logit\.C differs from \{x, s, direction\} of horizons\.5000\.scales\.C",
+     "746; Addendum A C9 (L1790: exactly x, s, direction)"),
+    (_set(_5K + ("scales", "C", "s"), [0.56, 0.30, 0.20]),
+     r"noise\.s_logit\.C differs from \{x, s, direction\} of horizons\.5000\.scales\.C",
+     "746; Addendum A C9 (the source side)"),
+    (_set(("noise", "SigmaR"), [[0.25, 0.05, 0.05], [0.05, 0.25, 0.15], [0.05, 0.15, 0.4]]),
+     r"noise\.SigmaR differs from horizons\.5000\.components\.SigmaR", "746; Addendum A C9 (L1788, L1792)"),
+    (_set(("noise", "SigmaD"), [[0.25, 0.04], [0.04, 0.25]]),
+     r"noise\.SigmaD differs from horizons\.5000\.components\.SigmaD", "746; Addendum A C9 (L1788, L1792)"),
+    (_set(("noise", "SigmaE"), [[0.5, 0.05], [0.05, 0.5]]),
+     r"noise\.SigmaE differs from horizons\.5000\.components\.SigmaE", "746; Addendum A C9 (L1788, L1792)"),
+    (_set(("map_variance", "nu0", "C", "nu0"), 13.0),
+     r"map_variance\.nu0\.C differs from horizons\.5000\.nu0\.C", "747; Addendum A C9 (L1794)"),
+    (_set(("map_variance", "nu0", "S", "excess_log_variance"), -0.02),
+     r"map_variance\.nu0\.S differs from horizons\.5000\.nu0\.S", "747; Addendum A C9 (L1794)"),
+    (_set(("map_variance", "nu0", "F", "reason"), "another reason"),
+     r"map_variance\.nu0\.F differs from horizons\.5000\.nu0\.F", "747; Addendum A C9 (L1794)"),
+    (_set(_5K + ("nu0", "C", "nu0"), 12.0),
+     r"map_variance\.nu0\.C differs from horizons\.5000\.nu0\.C", "747; Addendum A C9 (the source side)"),
 )
 
 
@@ -1449,9 +1584,17 @@ class TestBankArtifact(TmpDir):
         self.assertEqual((b.nu0_C, b.M_H, b.law("C"), b.law("S")), (12.5, 247, (324, 324), (600, 247)))
         self.assertLessEqual(float(np.max(np.abs(b.factors["R"] @ b.factors["R"].T - np.array(SIGMA_R)))), 1e-12)
         self.assertAlmostEqual(b.factors["free_sd"], math.sqrt(0.5))
-        d = bank3_doc()
+        d = bank3_doc()                         # (map_variance.nu0 and its source alike: Addendum A C9)
         d["map_variance"]["nu0"]["C"] = nu0_rec("full_pooling")
+        d["horizons"]["5000"]["nu0"]["C"] = nu0_rec("full_pooling")
         self.assertIsNone(self.load(d).nu0_C)
+        d = bank3_doc()                         # (the admitted variants of the exact records, Addendum A C8)
+        for rec in (d["horizons"]["5000"]["nu0"]["S"], d["map_variance"]["nu0"]["S"]):
+            rec["note"] = nb_text("nu0 beyond the float range")              # (full_pooling's one note, L1610)
+        constrained_fit(d)                                                 # (the multi-start branch, L1423-1440)
+        unavailable_interval(d)                                            # (L1676-1678)
+        unavailable_interval(d, "10000")
+        self.load(d)
         d = bank3_doc()                         # (C4.1: a capture-only 10k fit may be unavailable, 20k ok; groups
         d["horizons"]["10000"] = _horizon_record("10000", "unavailable")   # of an unavailable record are optional)
         del d["horizons"]["10000"]["groups"]
@@ -1467,6 +1610,8 @@ class TestBankArtifact(TmpDir):
         est = ol.registered_estimator()
         self.assertEqual(rqlib.canonical(est), rqlib.canonical(c3_estimator()))
         self.assertNotIn("seed", est)
+        self.assertEqual(set(est), (set(nb_existing_estimator()) - {"seed"}) | {"ceilings", "saturation",
+                                                                                "capped_category"})   # (C3 erratum)
         self.assertEqual(rqlib.canonical(est["saturation"]), rqlib.canonical(C3_SATURATION))
         self.assertEqual(est["ceilings"], C3_CEILINGS)
         self.assertEqual((est["multi_start"], est["boot"]), (16, 999))
@@ -1747,9 +1892,10 @@ class TestModel(TmpDir):
             ol.BankObservationModel(bp, tp, tables_content_sha256="0" * 64)
         with self.assertRaisesRegex(ValueError, "no location table for channel C at gamma 2.0"):
             ol.BankObservationModel(bp, tp, gammas=(1.0, 2.0))
-        d = bank3_doc()                                     # another bank (one curve value changed)
-        d["noise"]["s_logit"]["S"]["s"][0] = 0.36
+        d = bank3_doc()                                     # another bank (one curve value changed, in its source
+        d["noise"]["s_logit"]["S"]["s"][0] = 0.36           # and both copies: Addendum A C9)
         d["map_variance"]["s_logit"]["S"]["s"][0] = 0.36
+        d["horizons"]["5000"]["scales"]["S"]["s"][0] = 0.36
         bp2 = os.path.join(self.tmp, "bank2.json")
         rqlib.write_durable(bp2, rqlib.canonical(d))
         with self.assertRaisesRegex(ValueError, "another bank artifact"):
