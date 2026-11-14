@@ -2044,5 +2044,964 @@ class TestMap(unittest.TestCase):
         self.assertEqual(rec.REGISTERED_LAMBDAS, (0.01, 0.02, 0.05, 0.2))
 
 
+# ------------------------------------------------------------------ map.py in bank mode (A_design_v5.md 3.3)
+# Red Queen recovery option A, work package 2: tests T6-2, T6-7, T6-8, T6-10, T6-11 of A_design_v5 section 5 (and
+# T6-1's map.fit clause). Synthetic only (D9): fitter tables from synthetic curves, counts drawn from the law here.
+import math  # noqa: E402
+from unittest import mock  # noqa: E402
+
+# The T6-10 REFERENCE INTEGRATOR (A_design_v5 T6-10 and PC-25, frozen). It shares no code with the scorer
+# (map.pred_count_lpd, _grid_pass, _score_law, _interval_logp, noisebank): its own upper-tail function, interval
+# probabilities, thresholds, link and table interpolation (numpy's interp). Budget: tail <= 1e-10 relative
+# (rigorous), quadrature <= 1e-9 in log (the halving certificate: evidence, not a bound), total about 1.1e-9.
+REF_TAIL = 1e-10            # the tail budget (v5; v4's 1e-6 is the negative control of T6-11)
+REF_TAIL_V4 = 1e-6
+REF_SPACING = 5e-5          # node spacing in prior SDs (400,001 nodes over +-10 SD, more as the range extends)
+REF_START = 10.0            # the first range: +-10 SD
+REF_STEP = 2.0              # each extension: 2 SD per side
+REF_CAP = 60.0              # beyond +-60 SD a case is refused as unrepresentable
+REF_CERT = 1e-9             # the halving certificate's allowance (log units)
+REF_SF_SWITCH = 25.0        # the log upper tail: math.erfc below, the Laplace continued fraction at and above
+REF_CF_TERMS = 60
+_REF_LOG_SQRT2PI = 0.5 * math.log(2.0 * math.pi)
+_REF_ERFC = []
+
+
+def ref_log_sf(x):
+    """log P(Z > x) for a standard normal Z, elementwise: log(erfc(x / sqrt 2) / 2) with math.erfc below 25, and at
+    and above 25, -x^2/2 - log sqrt(2 pi) - log(x + 1/(x + 2/(x + 3/(x + ...)))) (Laplace's continued fraction, 60
+    terms), so a far tail never underflows."""
+    if not _REF_ERFC:
+        _REF_ERFC.append(np.frompyfunc(math.erfc, 1, 1))
+    x = np.asarray(x, float)
+    out = np.empty(x.shape)
+    lo = x < REF_SF_SWITCH
+    if lo.any():
+        xl = x[lo] / math.sqrt(2.0)
+        e = np.empty(xl.shape)
+        for k in range(0, xl.size, 1 << 20):
+            e[k:k + (1 << 20)] = _REF_ERFC[0](xl[k:k + (1 << 20)]).astype(float)
+        out[lo] = np.log(0.5 * e)
+    hi = ~lo
+    if hi.any():
+        xh = x[hi]
+        t = np.zeros(xh.shape)
+        for k in range(REF_CF_TERMS, 0, -1):
+            t = k / (xh + t)
+        out[hi] = -0.5 * xh * xh - _REF_LOG_SQRT2PI - np.log(xh + t)
+    return out
+
+
+def ref_log_iprob(u1, u2):
+    """log(Phi(u2) - Phi(u1)) for u1 < u2 (infinite ends allowed), from upper tails S only: both ends at or above 0
+    -> S(u1) - S(u2); both at or below 0 -> S(-u2) - S(-u1); straddling 0 -> 1 - S(-u1) - S(u2)."""
+    u1, u2 = np.broadcast_arrays(np.asarray(u1, float), np.asarray(u2, float))
+    out = np.empty(u1.shape)
+    up = u1 >= 0.0
+    dn = u2 <= 0.0
+    mid = ~(up | dn)
+    for sel, a_, b_ in ((up, u1, u2), (dn, -u2, -u1)):
+        if sel.any():
+            la, lb = ref_log_sf(a_[sel]), ref_log_sf(b_[sel])
+            out[sel] = la + np.log(-np.expm1(lb - la))
+    if mid.any():
+        out[mid] = np.log1p(-(np.exp(ref_log_sf(-u1[mid])) + np.exp(ref_log_sf(u2[mid]))))
+    return out
+
+
+def ref_count_logp(k, loc, var, B):
+    """log P(K = k) of a capture count (scale = ceiling = B; Annex H.9.2's rounded logit-normal: the latent interval
+    [logit((k - 1/2)/B), logit((k + 1/2)/B)), open at 0 and B) at latent locations loc and variances var."""
+    sd = np.sqrt(np.asarray(var, float))
+    lo = -math.inf if k == 0 else math.log((k - 0.5) / (B - k + 0.5))
+    hi = math.inf if k == B else math.log((k + 0.5) / (B - k - 0.5))
+    return ref_log_iprob((lo - loc) / sd, (hi - loc) / sd)
+
+
+def ref_log_integral(loglik, sigma, tail=REF_TAIL, start=REF_START, cap=REF_CAP):
+    """log of the integral of N(e; 0, sigma^2) L(e) de for a likelihood 0 <= L <= 1 given as loglik(e) = log L(e)
+    (vectorized), by the frozen rule of A_design_v5 T6-10: the log-sum-exp trapezoid on nodes e = i h, exact integer
+    multiples of h = 5e-5 sigma, over [-b, b], b = 10 sigma at first and extended symmetrically by 2 sigma until
+    log(2 S(b / sigma)) <= log(tail) + log I^ (I^ the integral over the current range; rigorous because L <= 1: the
+    omitted part is at most 2 S(b / sigma)); refused (ValueError) beyond +-60 sigma; then the spacing halved once,
+    the finer value being the reference and |fine - coarse| the certificate.
+    -> {log_I, coarse, certificate, b (in SD), trace [(b, log bound, log I^, stopped) per step], fine_bound_ok}."""
+    h = REF_SPACING * sigma
+    lnorm = -math.log(sigma) - _REF_LOG_SQRT2PI
+
+    def logf(e):
+        return loglik(e) - 0.5 * (e / sigma) ** 2 + lnorm
+
+    def trap(lf, hh):
+        t = lf.copy()
+        t[0] += math.log(0.5)
+        t[-1] += math.log(0.5)
+        mx = float(np.max(t))
+        if not math.isfinite(mx):
+            return mx
+        return mx + math.log(float(np.sum(np.exp(t - mx)))) + math.log(hh)
+
+    n, step, ncap = int(round(start / REF_SPACING)), int(round(REF_STEP / REF_SPACING)), int(round(cap / REF_SPACING))
+    lf = logf(np.arange(-n, n + 1) * h)
+    trace = []
+    while True:
+        log_i = trap(lf, h)
+        b = n * REF_SPACING
+        bound = math.log(2.0) + float(ref_log_sf(np.array([b]))[0])
+        stop = bound <= math.log(tail) + log_i
+        trace.append((b, bound, log_i, bool(stop)))
+        if stop:
+            break
+        if n + step > ncap:
+            raise ValueError(f"reference: the tail bound still fails at +-{b:g} SD (cap {cap:g}): unrepresentable")
+        lf = np.concatenate([logf(np.arange(-n - step, -n) * h), lf, logf(np.arange(n + 1, n + step + 1) * h)])
+        n += step
+    i2 = np.arange(-2 * n, 2 * n + 1)
+    lf2 = np.empty(len(i2))
+    lf2[0::2] = lf
+    lf2[1::2] = logf(i2[1::2] * (h / 2.0))
+    fine = trap(lf2, h / 2.0)
+    return {"log_I": fine, "coarse": log_i, "certificate": abs(fine - log_i), "b": b, "trace": trace,
+            "fine_bound_ok": bool(trace[-1][1] <= math.log(tail) + fine)}
+
+
+def ref_link(knots=None, theta=None, lo=0.0, hi=1.0):
+    """The reference's own link G(eta) = logit(lo + (hi - lo) sigma(h(eta))), h the linear spline through (knots,
+    theta) extended linearly beyond the end knots (knots None: the identity); no code shared with map.Link."""
+    if knots is None:
+        def hfun(e):
+            return np.asarray(e, float)
+    else:
+        kn, th = np.asarray(knots, float), np.asarray(theta, float)
+
+        def hfun(e):
+            e = np.asarray(e, float)
+            i = np.clip(np.searchsorted(kn, e, side="right") - 1, 0, len(kn) - 2)
+            return th[i] + (e - kn[i]) * (th[i + 1] - th[i]) / (kn[i + 1] - kn[i])
+    if lo == 0.0 and hi == 1.0:
+        return hfun
+
+    def G(e):
+        hv = hfun(e)
+        with np.errstate(over="ignore"):
+            s, sc = 1.0 / (1.0 + np.exp(-hv)), 1.0 / (1.0 + np.exp(hv))
+        return np.log(lo + (hi - lo) * s) - np.log((1.0 - hi) + (hi - lo) * sc)
+    return G
+
+
+# The main-branch code the hook-unset tests compare with byte for byte: map.py lines 530-547 and 951-1088 at main
+# (@4991907 = @1555de5 = @dc64646, identical), verbatim (capture_scale; the scorer's constants, _logsumexp,
+# _grid_pass, pred_count_lpd), executed against map.py's own unchanged helpers.
+MAIN_CAPTURE_SCALE = '''
+UNIT_FLOOR = 1e-6                       # (the absolute unit's floor: noiseless data)
+
+
+def capture_scale(V, zrep, R):
+    """The capture rows' working weights and their ABSOLUTE scale under the registered predictive model
+    (Codex #66 r2 P2-1). Cell e's replicate-mean variance is v_e = phi V_e / R, with phi = mean(zrep / V)
+    the replicate dispersion of the variance function V (zrep: the cells' replicate variances). The weights
+    are w_e = (1 / V_e) / mean(1 / V) (mean 1, so the penalties keep their meaning), and one weight unit is
+    unit = phi / (R mean(1 / V)), so unit / w_e = v_e exactly: a weighted Hessian times unit is the absolute
+    covariance. V None (unweighted): w = 1, phi = mean(zrep), unit = phi / R. -> (w, unit, phi)."""
+    zrep = np.asarray(zrep, float)
+    if V is None:
+        phi = float(np.mean(zrep))
+        return np.ones(len(zrep)), max(phi / R, UNIT_FLOOR), phi
+    V = np.maximum(np.asarray(V, float), 1e-8)
+    M = float(np.mean(1.0 / V))
+    phi = float(np.mean(zrep / V))
+    return (1.0 / V) / M, max(phi / (R * M), UNIT_FLOOR), phi
+'''
+
+MAIN_SCORER = '''
+TRAP_H = 0.25                            # (the grid step, in units of the narrowest replicate SD / steepest slope)
+TRAP_SD = 7.0                            # (the grid covers +-TRAP_SD prior SDs)
+TRAP_KS = (15, 23, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193,
+           12289, 16385, 24577, 32769, 49153, 65537, 98305, 131073, 196609, 262145)   # (grid sizes: bucketed)
+TRAP_CELLS = 1_000_000                   # (pairs x replicates x nodes per vectorized chunk)
+TRAP_TOL = 1e-3                          # (the a-posteriori check, log units: full grid vs every other node)
+TRAP_SPAN_MAX = 8                        # (the range may double up to +-TRAP_SD x 8 = +-56 prior SDs)
+TRAP_EDGE = math.log(1e-10)              # (an end node's share of the integral above this: the range is extended)
+VMIN_GRID = np.linspace(-20.0, 20.0, 20001)    # (the logit grid on which the variance function's minimum is taken)
+
+
+def _logsumexp(a, axis):
+    mx = np.max(a, axis=axis, keepdims=True)
+    mx = np.where(np.isfinite(mx), mx, 0.0)
+    with np.errstate(divide="ignore"):
+        return np.squeeze(mx, axis=axis) + np.log(np.sum(np.exp(a - mx), axis=axis))
+
+
+def _grid_pass(lk, m, cnt, eta, sd, N, K, span):
+    """The e-order trapezoid, in log space, on K nodes over +-TRAP_SD x span prior SDs (span per pair), the same
+    on every other node (the check), and the larger end node's log share of the integral (the range check) ->
+    (log P, log P on the half grid, edge share), pairs x replicates. The integrand is the registered one at every
+    node: the bounded count probability with the replicate variance phi V(G(eta + e)) at that node."""
+    x = np.linspace(-1.0, 1.0, K)[None, :] * (TRAP_SD * span)[:, None]                      # (pairs x nodes, SDs)
+    lw = -0.5 * x * x
+    lwh = lw[:, ::2] - _logsumexp(lw[:, ::2], 1)[:, None]
+    lw = lw - _logsumexp(lw, 1)[:, None]
+    loc = lk.G(eta[:, None] + sd[:, None] * x)
+    lp = _interval_logp(cnt[:, :, None], N, loc[:, None, :], _rep_var(m, loc)[:, None, :])
+    terms = lp + lw[:, None, :]
+    full = _logsumexp(terms, 2)
+    with np.errstate(invalid="ignore"):
+        edge = np.maximum(terms[..., 0], terms[..., -1]) - full
+    return full, _logsumexp(lp[..., ::2] + lwh[:, None, :], 2), edge
+
+
+def pred_count_lpd(D, m, idx, cnt, N, own=None, info=None):
+    """THE registered score (v4 §7.6) of the capture head on pairs idx: the capture-count log predictive
+    density per replicate observation, with the predictor-scale uncertainty (pred_eta: the posterior variance
+    of eta and the pair residual delta_ij, both INSIDE the link) integrated through the link:
+        P(K = k) = E_e[P(k | G(eta + e), phi V(G(eta + e)))],  e ~ N(0, s2),
+    each P from Annex H.9.2's bounded model with the fresh replicate's variance (count_logp). Per observation
+    (the marginal score: the mixture is not shared across a pair's replicates). -> one value per pair.
+    THE INTEGRAL, by case (Codex #66 r3 P2-1, r4 P2-1/2: never silently capped, never a frozen variance,
+    never a silent non-finite value):
+      - s2 = 0: the plain density;
+      - the identity link with a constant replicate variance (no var_fn): EXACT, Y ~ N(eta, phi + s2);
+      - otherwise the e-order trapezoid IN LOG SPACE with the registered integrand at every node (the bounded
+        count probability at the replicate variance phi V(G(eta + e)) of that node; the far tails of the
+        interval probability are log-space continued fractions, so a count beyond the link's reach is a finite,
+        very negative log probability). The grid covers +-TRAP_SD prior SDs; its step is at most one SD and at
+        most TRAP_H x the narrowest replicate SD (the variance function's minimum on VMIN_GRID) / a
+        CONSERVATIVE bound on the link's slope over the range (Link.max_slope), on the smallest of TRAP_KS
+        (15 .. 262,145 nodes) that achieves it. Every observation is CHECKED a posteriori:
+          * resolution: against the same grid's every other node; above TRAP_TOL its pair moves to the next grid;
+          * range: if an end node carries more than 1e-10 of the integral (the integrand still rises at the edge,
+            e.g. a count beyond the link's asymptote), the pair's range doubles, up to +-56 SDs;
+        a pair failing a check on the largest grid or range keeps that value and is counted as grid_unresolved
+        (a finite but UNRESOLVED score: reported, never hidden, and the callers' comparisons (recovery.py) refuse
+        to decide on it); a pair whose rule needs more than the largest grid, in its initial range or in an
+        extended one (Codex #66 r5 P2-2), is computed there, checked, and counted ONCE in beyond_rule.
+      - any non-finite result is REFUSED (ValueError): it never reaches a model comparison.
+    info (a dict): the counts per case are added to it (pairs, plain, exact, grid, refined, extended,
+    beyond_rule, grid_unresolved) with the largest accepted check difference (max_check)."""
+    eta, s2 = pred_eta(D, m, idx, own)
+    lk = m["link"]
+    cnt = np.asarray(cnt)
+    out = np.empty(len(eta))
+    sd = np.sqrt(s2)
+    st = {"pairs": int(len(eta)), "plain": 0, "exact": 0, "grid": 0, "refined": 0, "extended": 0, "beyond_rule": 0,
+          "grid_unresolved": 0, "max_check": 0.0}
+    plain = sd <= 1e-9
+    if plain.any():
+        g0 = lk.G(eta[plain])
+        out[plain] = count_lpd(cnt[plain], N, g0, _rep_var(m, g0))
+        st["plain"] = int(plain.sum())
+    q = np.flatnonzero(~plain)
+    if len(q) and lk.identity() and m.get("var_fn") is None:
+        out[q] = count_lpd(cnt[q], N, eta[q], m["phi"] + s2[q])
+        st["exact"] = int(len(q))
+    elif len(q):
+        R = cnt.shape[1]
+        lo_, hi_ = float((eta[q] - TRAP_SD * sd[q]).min()), float((eta[q] + TRAP_SD * sd[q]).max())
+        gmax = max(lk.max_slope(lo_, hi_), 1e-12)
+        smin = math.sqrt(max(float(_rep_var(m, VMIN_GRID).min()), 1e-300))
+        h = np.minimum(sd[q], TRAP_H * smin / gmax)
+        need0 = np.ceil(2 * TRAP_SD * sd[q] / np.maximum(h, 1e-300)) + 1          # (nodes at span 1)
+        top = len(TRAP_KS) - 1
+        bucket = np.searchsorted(TRAP_KS, need0)
+        beyond = np.zeros(len(eta), bool)                         # (pairs whose rule exceeded the largest grid, once)
+        beyond[q[bucket > top]] = True
+        cur, cb, cs, n0 = q, np.minimum(bucket, top), np.ones(len(q)), need0
+        while len(cur):
+            nxt = []
+            for b, s_ in sorted(set(zip(cb.tolist(), cs.tolist()))):
+                sel = (cb == b) & (cs == s_)
+                rows, need_r = cur[sel], n0[sel]
+                Kb = TRAP_KS[int(b)]
+                step = max(1, TRAP_CELLS // (R * Kb))
+                for k0 in range(0, len(rows), step):
+                    r_, nr_ = rows[k0:k0 + step], need_r[k0:k0 + step]
+                    full, half, edge = _grid_pass(lk, m, cnt[r_], eta[r_], sd[r_], N, Kb, np.full(len(r_), s_))
+                    with np.errstate(invalid="ignore"):
+                        err = np.max(np.abs(full - half), axis=1)
+                        res_ok = err <= TRAP_TOL                                   # (NaN: not ok)
+                        edge_ok = np.all(edge <= TRAP_EDGE, axis=1)
+                    fin = np.isfinite(full).all(axis=1)
+                    ok = res_ok & edge_ok & fin
+                    out[r_[ok]] = full[ok].mean(axis=1)
+                    st["grid"] += int(ok.sum())
+                    if ok.any():
+                        st["max_check"] = max(st["max_check"], float(err[ok].max()))
+                    for i in np.flatnonzero(~ok):
+                        if fin[i] and not edge_ok[i] and s_ < TRAP_SPAN_MAX:          # (extend the range)
+                            s2_ = 2 * s_
+                            nb2 = max(int(b), int(np.searchsorted(TRAP_KS, nr_[i] * s2_)))
+                            if nb2 > top:                                     # (the extended range's rule is beyond
+                                beyond[r_[i]] = True                          #  the cap: counted, Codex #66 r5 P2-2)
+                            nxt.append((r_[i], min(nb2, top), s2_, nr_[i]))
+                            st["extended"] += 1
+                        elif fin[i] and not res_ok[i] and b < top:                    # (refine the grid)
+                            nxt.append((r_[i], int(b) + 1, s_, nr_[i]))
+                            st["refined"] += 1
+                        else:                                                        # (kept, flagged)
+                            out[r_[i]] = full[i].mean()
+                            st["grid_unresolved"] += 1
+            cur = np.array([t[0] for t in nxt], int)
+            cb = np.array([t[1] for t in nxt], int)
+            cs = np.array([t[2] for t in nxt], float)
+            n0 = np.array([t[3] for t in nxt], float)
+        st["beyond_rule"] = int(beyond.sum())
+    bad = ~np.isfinite(out)
+    if bad.any():
+        raise ValueError(f"pred_count_lpd: {int(bad.sum())} non-finite count scores: refused (never compared)")
+    if info is not None:
+        for k, v in st.items():
+            info[k] = max(info.get(k, 0.0), v) if k == "max_check" else info.get(k, 0) + v
+    return out
+'''
+
+
+def main_map():
+    """main's capture_scale and scorer (MAIN_CAPTURE_SCALE, MAIN_SCORER) in a namespace over map.py's helpers."""
+    import map as mapfit
+    ns = dict(vars(mapfit))
+    exec(compile(MAIN_CAPTURE_SCALE + "\n\n" + MAIN_SCORER, "map.py@main", "exec"), ns)
+    return ns
+
+
+VAL_SC = {"x": [-2.2, -0.6, 0.4], "s": [0.55, 0.30, 0.20]}      # A_design_v5 2.10's steep validation curve
+CONST_SC = {"x": [0.0], "s": [0.2]}                             # T6-10's mandatory case: S_C = 0.2
+T610_FRACS = (0.002, 0.01, 0.1, 0.5, 0.9, 0.99, 0.998)          # predicted capture fractions (T6-10: 0.002-0.998)
+T610_SDS = (0.05, 0.3, 0.5, 1.0)                                # predictor SDs (T6-10: 0.05-1.0)
+# Unrepresentable by v5's rule (the reference's tail bound still fails at +-60 SD): not T6-10 cases.
+T610_UNREPRESENTABLE = {("val", 0.998, 0.05, 0), ("const", 0.998, 0.05, 0), ("const", 0.002, 0.05, 324)}
+# STOPPED, NOT DECIDED (reported to the coordinator): the steep curve's k = B at low predicted fractions. The
+# integrand is bimodal -- an interior mode inside the first +-7 SD range, the dominant mode at +10..+15 SD -- and
+# main's range check (TRAP_EDGE, an end node's share of the integral over the CURRENT range), which v5 3.3 keeps,
+# never extends the range: the score is silently wrong by 9.6-83 nats with no grid_unresolved flag. The scorer's own
+# integrand, integrated densely, matches the reference (test_T6_10_gap_diagnosis); only the range rule fails. A fix
+# changes the registered range check and is not v5's to make here (test_T6_10_gap_cases_agree: expected to fail).
+T610_GAP = {("val", 0.002, 1.0, 324), ("val", 0.01, 1.0, 324), ("val", 0.1, 0.5, 324)}
+# STOPPED, NOT DECIDED (reported): the reference's halving certificate (<= 1e-9, PC-25) is not met on some T6-10
+# cases: the score-law integrand is only piecewise smooth (the fitter table's kinks, segment slopes up to ~79), so the
+# frozen spacing 5e-5 SD halved once leaves O(h^2) differences of up to ~2.4e-8 on rare counts (the mandatory case
+# 4.5e-9); halving further converges (below 1e-9 at 1.25e-5 SD). v5 does not say what an uncertified case does, so
+# test_T6_10 records the certificates and test_T6_10_reference_certificates_meet_v5 (expected to fail) holds v5's
+# allowance; the agreement tolerance 2 x TRAP_TOL = 2e-3 is five orders above these differences.
+_BANK = {}
+_T610_REF = {}
+
+
+@unittest.skipIf(np is None, "numpy is not installed (set RQ_PYLIB, or RQ_REQUIRE_NUMPY=1 to require it)")
+class TestMapBankMode(unittest.TestCase):
+    """map.py in bank mode (Red Queen recovery option A, A_design_v5.md section 3.3): the nu0 shrinkage of
+    capture_scale (T6-2), the working coordinate and nu0 in it (T6-7), the score law (T6-8), the integrated score
+    with the hook and its grid rule (per-pair H^max, recomputed on every range extension) against the frozen
+    reference integrator (T6-10), the reference's self-test (T6-11), and the refusal of a variance model without a
+    var_fn (T6-1's map.fit clause). With the hooks unset, capture_scale and the scorer are main's byte for byte."""
+
+    @classmethod
+    def setUpClass(cls):
+        import map as mapfit
+        import noisescale
+        import obslaw
+        import recovery
+        cls.M, cls.ol, cls.rec, cls.nsc = mapfit, obslaw, recovery, noisescale
+        cls.B = recovery.B_COUNT
+        if not _BANK:
+            _BANK["val"] = obslaw.build_fitter_table(VAL_SC, "0" * 64)
+            _BANK["const"] = obslaw.build_fitter_table(CONST_SC, "0" * 64)
+        cls.tabs = dict(_BANK)
+        cls.tab = _BANK["val"]
+
+    def hooks(self, tab, tag="wp2"):
+        return self.ol.WorkingVariance(tab, tag), self.ol.ScoreLaw(tab, tag)
+
+    def score(self, m, eta, s2, cnt, ns=None):
+        """pred_count_lpd at given predictors (eta, s2) per pair (pred_eta replaced) -> (scores, info); ns: main's."""
+        eta, s2 = np.asarray(eta, float), np.asarray(s2, float)
+
+        def fake(D, m_, idx, own=None):
+            return eta[idx], s2[idx]
+        info = {}
+        idx = np.arange(len(eta))
+        if ns is None:
+            with mock.patch.object(self.M, "pred_eta", fake):
+                out = self.M.pred_count_lpd(None, m, idx, np.asarray(cnt), self.B, info=info)
+        else:
+            ns["pred_eta"] = fake
+            out = ns["pred_count_lpd"](None, m, idx, np.asarray(cnt), self.B, info=info)
+        return out, info
+
+    def assert_main_bytes(self, cases):
+        """Each case (m, eta, s2, cnt) has no score law: pred_count_lpd equals main's byte for byte, info included."""
+        ns = main_map()
+        for m, eta, s2, cnt in cases:
+            self.assertIsNone(m.get("score_law"))
+            got, info = self.score(m, eta, s2, cnt)
+            want, info0 = self.score(m, eta, s2, cnt, ns=ns)
+            self.assertEqual(got.tobytes(), want.tobytes())
+            self.assertEqual(info, info0)
+
+    def zmu(self, tab, mu):
+        """The table's m_z at the fraction mu (its x -> m_z interpolant)."""
+        return float(np.interp(math.log(mu / (1.0 - mu)), tab.x, tab.m))
+
+    # ---------------------------------------------------------------- T6-1 (map.fit's clause), T6-2
+    def test_T6_1_map_fit_refuses_a_variance_model_without_var_fn(self):
+        """T6-1's map.fit clause (A_design_v5 3.3; the spy across candidates and procedures is recovery's, WP4): a
+        rep_prior or score_law given with var_fn None is refused before D, idx or data is read (a numerical fit can
+        never carry a variance model), also through fit_best; a malformed rep_prior or a score law without its
+        frozen table is refused; the scorer refuses a score law without a var_fn."""
+        M = self.M
+        W, SL = self.hooks(self.tab)
+        for kw in ({"rep_prior": {"nu0": 4.0}}, {"score_law": SL}, {"rep_prior": {"nu0": None}, "score_law": SL},
+                   {"rep_prior": {"nu0": None}}):
+            with self.assertRaisesRegex(ValueError, "without a var_fn"):
+                M.fit(None, None, None, 1, 0.1, **kw)
+            with self.assertRaisesRegex(ValueError, "without a var_fn"):
+                M.fit_best(None, None, None, 1, 0.1, **kw)
+        for bad in ({"nu0": -1.0}, {"nu0": 0.0}, {"nu0": float("nan")}, {"nu0": float("inf")}, {"nu0": True},
+                    {"nu": 4.0}, {"nu0": 4.0, "rule": "x"}, [4.0]):
+            with self.assertRaises(ValueError):
+                M.fit(None, None, None, 1, 0.1, var_fn=W, rep_prior=bad)
+        with self.assertRaisesRegex(ValueError, "frozen fitter table"):
+            M.fit(None, None, None, 1, 0.1, var_fn=W, score_law=lambda p: (p, p))
+        with self.assertRaisesRegex(ValueError, "without a var_fn"):
+            self.score({"link": M.Link(), "phi": 1.0, "var_fn": None, "score_law": SL}, [0.0], [1.0], [[100]])
+
+    def test_T6_2_capture_scale_nu0_known_answer(self):
+        """T6-2 (A_design_v5 3.3): capture_scale(V, zrep, R, nu0): phi = mean(zrep / V), v~_e = (nu0 phi V_e + (R - 1)
+        zrep_e) / (nu0 + R - 1), w = (1 / v~) / mean(1 / v~), unit = 1 / (R mean(1 / v~)), so unit / w = v~ / R --
+        against exact rational arithmetic; the limits nu0 -> inf (full pooling) and nu0 -> 0 (the raw variances);
+        the refusals (a nu0 that is not a positive finite number, nu0 without V, no replicate variance at all); nu0
+        None is main's capture_scale byte for byte."""
+        from fractions import Fraction as F
+        M = self.M
+        V = np.array([0.5, 0.25, 0.1, 0.04, 0.3, 0.0123])
+        zrep = np.array([0.6, 0.2, 0.15, 0.01, 0.0, 0.031])
+        R = 6
+        for nu0 in (4.0, 0.37, 25.5, 7):
+            w, unit, phi = M.capture_scale(V, zrep, R, nu0=nu0)
+            fv, fz, fn = [F(float(v)) for v in V], [F(float(v)) for v in zrep], F(nu0)
+            fphi = sum(z / v for z, v in zip(fz, fv)) / len(fv)
+            vt = [(fn * fphi * v + (R - 1) * z) / (fn + R - 1) for z, v in zip(fz, fv)]
+            mt = sum(1 / x for x in vt) / len(vt)
+            self.assertAlmostEqual(phi, float(fphi), delta=1e-14 * float(fphi))
+            self.assertTrue(np.allclose(w, [float((1 / x) / mt) for x in vt], rtol=1e-14, atol=0), w)
+            self.assertAlmostEqual(unit, float(1 / (R * mt)), delta=1e-14 * float(1 / (R * mt)))
+            self.assertTrue(np.allclose(unit / w, [float(x / R) for x in vt], rtol=1e-14, atol=0))
+            self.assertAlmostEqual(float(w.mean()), 1.0, delta=1e-14)
+        w, u, p = M.capture_scale(V, zrep, R, nu0=1e12)
+        self.assertTrue(np.allclose(u / w, p * V / R, rtol=1e-9, atol=0))           # (nu0 -> inf: phi V / R)
+        pos = zrep > 0
+        w, u, p = M.capture_scale(V[pos], zrep[pos], R, nu0=1e-12)
+        self.assertTrue(np.allclose(u / w, zrep[pos] / R, rtol=1e-9, atol=0))       # (nu0 -> 0: zrep / R)
+        for bad in (0, 0.0, -1.0, float("nan"), float("inf"), True, "4", [4.0]):
+            with self.assertRaises(ValueError):
+                M.capture_scale(V, zrep, R, nu0=bad)
+        with self.assertRaisesRegex(ValueError, "without a variance function"):
+            M.capture_scale(None, zrep, R, nu0=4.0)
+        with self.assertRaisesRegex(ValueError, "undefined"):
+            M.capture_scale(V, np.zeros(len(V)), R, nu0=4.0)
+        ns = main_map()
+        rng = np.random.default_rng(11)
+        cases = [(V, zrep), (rng.uniform(1e-10, 2.0, 500), rng.gamma(1.0, 0.3, 500)), (None, zrep),
+                 (None, np.zeros(5)), (np.full(4, 1e-12), np.array([1e-3, 0.0, 2e-3, 0.0])), (V, np.zeros(len(V)))]
+        for Vc, zc in cases:
+            want = ns["capture_scale"](Vc, zc, R)
+            for got in (M.capture_scale(Vc, zc, R), M.capture_scale(Vc, zc, R, nu0=None)):
+                self.assertEqual(got[0].tobytes(), want[0].tobytes())
+                self.assertEqual((type(got[1]), got[1], type(got[2]), got[2]),
+                                 (type(want[1]), want[1], type(want[2]), want[2]))
+
+    # ---------------------------------------------------------------- T6-7
+    def bank_data(self, D, idx, seed, quantum=None, nu0_het=None):
+        """A synthetic bank-mode capture data set on the toy graph (gamma 1, the steep validation curve): the
+        scenario truth r1_017_cap's eta on idx, mapped affinely onto [logit 0.01, logit 0.99]; counts from the
+        capture law (obslaw: exact locations, B = 324, R = 6) with independent latents (T6-7's claims are about each
+        cell's own replicate variance, which cross-cell sharing does not change). quantum: the intended logit
+        fractions rounded to this step, the location solved once per level; nu0_het: per-cell latent scale
+        heterogeneity, s_e^2 = S_C(mu_e)^2 kappa_e with kappa_e = nu0 / chi2(nu0) (a scaled-inverse-chi2(nu0) of
+        scale 1; test only), the location solved at each cell's scale. -> (data, mu, exact V_z) on idx."""
+        ol, B, R = self.ol, self.B, self.rec.R_REPS
+        eta = self.rec.simulate(D, self.rec.SCENARIOS["r1_017_cap"], seed)["eta"][idx]
+        xmax = math.log(99.0)
+        x = -xmax + (eta - eta.min()) / (eta.max() - eta.min()) * (2.0 * xmax)
+        rng = np.random.default_rng([seed, 7])
+        if nu0_het is None:
+            lev, inv = np.unique(np.round(x / quantum) * quantum, return_inverse=True)
+            mul = ol.sig(lev)
+            sl = self.nsc.evaluate(VAL_SC, mul)
+            al, _ = ol.solve_location(mul, sl, B, B)
+            mu, s, a = mul[inv], sl[inv], al[inv]
+        else:
+            mu = ol.sig(x)
+            s = self.nsc.evaluate(VAL_SC, mu) * np.sqrt(nu0_het / rng.chisquare(nu0_het, len(mu)))
+            a, _ = ol.solve_location(mu, s, B, B)
+        K = ol.rounded_count(a[:, None], s[:, None], rng.standard_normal((len(mu), R)), B, B)
+        z = np.zeros((len(D.qi), R))
+        z[idx] = ol.empirical_logit(K, B)
+        return {"z": z, "zbar": z.mean(axis=1)}, mu, ol.logit_moments(a, s)[1]
+
+    def test_T6_7_working_coordinate_and_nu0(self):
+        """T6-7 (A_design_v5 PC-14, 1.7b). (a) On a bank-mode data set (gamma 1, the steep validation curve, intended
+        capture fractions 0.01-0.99, every fitting pair of the toy graph), fitted with the bank hooks and binned by
+        the fitted fraction sigma(z_fit): the mean of zrep_e / W(z_fit,e) is 1 within 4 Monte Carlo SE in every bin
+        and phi^ is in [0.95, 1.05], while the v1 adapter S_C(sigma(z_fit))^2 is distorted beyond 4 SE in the lowest
+        and the highest bin, and beyond 4 SE of its own pooled phi in at least one of them (a single phi cannot
+        absorb it); the fit's unit and phi are capture_scale's at its fitted fractions with its nu0 (full pooling
+        likewise), and it records rep_prior, score_law, var_fn.identity and table_extrapolated. (b) With per-cell
+        latent scale heterogeneity kappa_e ~ scaled-inverse-chi2(nu0) (test only), the shrunk v~_e has a lower mean
+        squared error against each cell's exact V_z than full pooling (phi W) and than the raw zrep_e."""
+        import sys as sys_
+        M, ol, rec, R = self.M, self.ol, self.rec, self.rec.R_REPS
+        D = rec.Data(full())
+        idx = D.fit["a"]
+        data, mu, _ = self.bank_data(D, idx, 1000, quantum=0.005)
+        self.assertTrue(0.0099 < float(mu.min()) < 0.011 and 0.989 < float(mu.max()) < 0.9901)
+        zrep = data["z"][idx].var(axis=1, ddof=1)
+        fits = {}
+        for nu0 in (10.0, None):
+            W, SL = self.hooks(self.tab, f"t6-7 {nu0}")
+            m = M.fit(D, idx, data, 1, 0.05, False, 10, 1, var_fn=W, rep_prior={"nu0": nu0}, score_law=SL)
+            p = np.clip(ol.sig(M.predict(D, m, idx)), 1e-4, 1.0 - 1e-4)
+            Vp = self.tab.evaluate(np.log(p) - np.log1p(-p))["W"]
+            w, unit, phi = M.capture_scale(Vp, zrep, R, nu0=nu0)
+            self.assertAlmostEqual(m["phi"], phi, delta=1e-12 * phi)
+            self.assertAlmostEqual(m["unit"], unit, delta=1e-12 * unit)
+            self.assertEqual(m["rep_prior"], {"nu0": nu0})
+            self.assertIs(m["score_law"], SL)
+            self.assertEqual(m["var_fn_identity"], f"t6-7 {nu0}")
+            self.assertIsInstance(m["table_extrapolated"], int)
+            self.assertEqual(m["table_extrapolated"], W.extrapolated)     # (W fresh: every count is this fit's)
+            fits[nu0] = (m, p, Vp)
+        self.assertNotEqual(fits[10.0][0]["unit"], fits[None][0]["unit"])          # (the shrinkage is applied)
+        m, p, Vp = fits[10.0]
+        phi_hat = m["phi"]
+        self.assertTrue(0.95 <= phi_hat <= 1.05, phi_hat)
+        rw = zrep / Vp
+        r1 = zrep / self.nsc.evaluate(VAL_SC, p) ** 2
+        edges = (0.0, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 1.0)
+        rows = []
+        for lo, hi in zip(edges[:-1], edges[1:]):
+            sel = (p >= lo) & (p < hi)
+            n = int(sel.sum())
+            self.assertGreater(n, 500, (lo, hi))
+            rows.append((lo, hi, n, rw[sel].mean(), rw[sel].std(ddof=1) / math.sqrt(n), r1[sel].mean(),
+                         r1[sel].std(ddof=1) / math.sqrt(n)))
+        for lo, hi, n, mw, sw, m1, s1 in rows:
+            print(f"T6-7 [{lo}, {hi}) n={n}: zrep/W {mw:.4f} +- {sw:.4f} ({(mw - 1) / sw:+.1f} SE); v1 adapter "
+                  f"{m1:.4f} ({(m1 - 1) / s1:+.1f} SE from 1, {(m1 - r1.mean()) / s1:+.1f} SE from its phi "
+                  f"{r1.mean():.4f}); phi^ {phi_hat:.4f}", file=sys_.stderr)
+            self.assertLessEqual(abs(mw - 1.0), 4.0 * sw, (lo, hi, mw, sw))
+        for lo, hi, n, mw, sw, m1, s1 in (rows[0], rows[-1]):
+            self.assertGreater(abs(m1 - 1.0), 4.0 * s1, (lo, hi, m1, s1))
+        self.assertTrue(any(abs(m1 - r1.mean()) > 4.0 * s1 for lo, hi, n, mw, sw, m1, s1 in (rows[0], rows[-1])))
+        # (b) nu0 in working coordinates
+        nu0 = 10.0
+        idx_b = idx[::8]
+        data_b, _, Vz = self.bank_data(D, idx_b, 2000, nu0_het=nu0)
+        W, SL = self.hooks(self.tab, "t6-7b")
+        mb = M.fit(D, idx_b, data_b, 1, 0.05, False, 10, 1, var_fn=W, rep_prior={"nu0": nu0}, score_law=SL)
+        pb = np.clip(ol.sig(M.predict(D, mb, idx_b)), 1e-4, 1.0 - 1e-4)
+        Vb = self.tab.evaluate(np.log(pb) - np.log1p(-pb))["W"]
+        zb = data_b["z"][idx_b].var(axis=1, ddof=1)
+        w, unit, phi = M.capture_scale(Vb, zb, R, nu0=nu0)
+        self.assertAlmostEqual(mb["unit"], unit, delta=1e-12 * unit)
+        w0, unit0, _ = M.capture_scale(Vb, zb, R)
+        mse = {"shrunk": float(np.mean((R * unit / w - Vz) ** 2)), "pooled": float(np.mean((R * unit0 / w0 - Vz) ** 2)),
+               "raw": float(np.mean((zb - Vz) ** 2))}
+        print(f"T6-7(b) nu0 {nu0}, {len(idx_b)} cells, phi^ {phi:.4f}: MSE against the exact V_z {mse}",
+              file=sys_.stderr)
+        self.assertLess(mse["shrunk"], mse["pooled"])
+        self.assertLess(mse["shrunk"], mse["raw"])
+
+    # ---------------------------------------------------------------- T6-8
+    def test_T6_8_score_law(self):
+        """T6-8 (A_design_v5 3.3, PC-17): at nodes with known predicted empirical logit z, _score_law returns
+        (A(mu^), phi L(mu^)), mu^ = m_z^-1(z), from the frozen fitter table: exact at the table's nodes, its
+        piecewise-linear interpolants between them (checked through numpy's interp, not obslaw's lookup), the end
+        values beyond it; at phi = 1 the count law (A, phi L) has mean fraction mu^ within 2e-7 (at the nodes, the
+        certification probes 1/4, 1/2, 3/4 of every segment, and random points); the deviation at phi != 1 is
+        recorded; score_law None reproduces today's scores byte for byte (main's pred_count_lpd: plain, exact and
+        grid cases, a refinement and a range extension included)."""
+        import sys as sys_
+        M, ol, tab, B = self.M, self.ol, self.tab, self.B
+        W, SL = self.hooks(tab)
+        rng = np.random.default_rng(8)
+        zs = {"nodes": tab.m.copy(),
+              "probes": np.concatenate([tab.m[:-1] + f * np.diff(tab.m) for f in (0.25, 0.5, 0.75)]),
+              "random": rng.uniform(tab.m[0], tab.m[-1], 5000)}
+        for phi in (1.0, 1.7):
+            m = {"phi": phi, "score_law": SL, "var_fn": W}
+            for label, z in zs.items():
+                A, V = M._score_law(m, z)
+                self.assertTrue(np.allclose(A, np.interp(z, tab.m, tab.A), rtol=0, atol=1e-10), label)
+                self.assertTrue(np.allclose(V, phi * np.interp(z, tab.m, tab.L), rtol=1e-12, atol=0), label)
+            A, V = M._score_law(m, tab.m)
+            self.assertTrue(np.allclose(A, tab.A, rtol=0, atol=1e-10) and np.allclose(V, phi * tab.L, rtol=1e-12))
+            far = np.array([tab.m[0] - 1.0, -20.0, -1e3, tab.m[-1] + 1.0, 20.0, 1e3])
+            A, V = M._score_law(m, far)
+            self.assertTrue(np.array_equal(A, np.repeat(tab.A[[0, -1]], 3)))
+            self.assertTrue(np.allclose(V, phi * np.repeat(tab.L[[0, -1]], 3), rtol=1e-15, atol=0))
+        self.assertTrue(np.allclose(tab.mu_hat(tab.m), ol.sig(tab.x), rtol=1e-12, atol=0))
+        m1 = {"phi": 1.0, "score_law": SL, "var_fn": W}
+        for label, z in zs.items():
+            A, V = M._score_law(m1, z)
+            muh = tab.mu_hat(z)
+            dev = float(np.max(np.abs(ol.expected_fraction(A, np.sqrt(V), B, B) - muh)))
+            self.assertLessEqual(dev, 2e-7, label)
+            for phi in (0.5, 0.8, 1.25, 2.0):
+                dv = np.abs(ol.expected_fraction(A, np.sqrt(phi * V), B, B) - muh)
+                print(f"T6-8 recorded ({label}): phi = {phi}: max |E[K]/B - mu^| = {float(dv.max()):.3e} at mu^ = "
+                      f"{float(muh[np.argmax(dv)]):.6f} (phi = 1: {dev:.2e})", file=sys_.stderr)
+        # score_law None: today's scorer, byte for byte
+        loc = np.linspace(-12.0, 12.0, 97)
+        m0 = {"phi": 0.9, "var_fn": W}
+        got = M._score_law(m0, loc)
+        self.assertIs(got[0], loc)
+        self.assertEqual(got[1].tobytes(), M._rep_var(m0, loc).tobytes())
+        vf = self.rec.var_model(self.rec.SCENARIOS["r2_017_cap15"])
+        one = lambda p: np.ones_like(p)                                         # noqa: E731
+        self.assert_main_bytes([
+            ({"link": M.Link(), "phi": 1.0, "var_fn": W}, [0.3, -2.0, 4.0, 0.0], [0.0, 0.0, 0.0, 0.25],
+             [[200, 201], [10, 12], [300, 324], [150, 170]]),                              # (plain and grid)
+            ({"link": M.Link(), "phi": 0.003 ** 2, "var_fn": one}, [0.0], [1.0], [[162]]),  # (24,577 nodes)
+            ({"link": M.Link(), "phi": 1.0, "var_fn": None}, [0.0, 1.0], [1.0, 0.5], [[162], [200]]),   # (exact)
+            ({"link": M.Link(None, None, 0.02, 0.8), "phi": 0.003 ** 2, "var_fn": one}, [0.0], [1.0], [[324]]),
+            ({"link": M.Link(), "phi": 1.0, "var_fn": vf}, [0.0], [1.646 ** 2],
+             [[75, 111, 125, 137, 49, 87]]),
+            ({"link": M.Link(np.array([-3.0, -1.0, 1.0, 3.0]), np.array([-3.0, -1.5, 1.4, 3.0]), 0.01, 0.95),
+              "phi": 1.2, "var_fn": W}, [-2.0, 0.5, 2.5], [0.4, 1.0, 0.09], [[3], [180], [320]])])
+
+    # ---------------------------------------------------------------- T6-10
+    def t610_cases(self):
+        """(group key, table name, link spec, phi, predicted fraction, SD, count) for T6-10: identity G on both
+        tables over T610_FRACS x T610_SDS x counts {0, the modal count, B} (unrepresentable and STOPPED cases
+        excluded), plus a spline link, a bounded link and phi = 1.5 on the steep curve."""
+        B = self.B
+        out = []
+        for tname in ("val", "const"):
+            for mu in T610_FRACS:
+                for sd in T610_SDS:
+                    for k in sorted({0, int(round(B * mu)), B}):
+                        key = (tname, mu, sd, k)
+                        if key not in T610_UNREPRESENTABLE and key not in T610_GAP:
+                            out.append(((tname, None, 1.0), tname, None, 1.0, mu, sd, k))
+        spline = ((-4.0, -1.0, 1.0, 4.0), (-4.0, -1.6, 0.4, 4.0), 0.0, 1.0)
+        bounded = ((-3.0, 0.0, 3.0), (-3.0, 0.5, 3.0), 0.02, 0.9)
+        for mu in (0.01, 0.5, 0.99):
+            for sd in (0.3, 1.0):
+                out.append((("val", "spline", 1.0), "val", spline, 1.0, mu, sd, int(round(B * mu))))
+        for mu in (0.05, 0.5, 0.85):
+            for sd in (0.3, 1.0):
+                for k in (0, int(round(B * mu))):
+                    out.append((("val", "bounded", 1.0), "val", bounded, 1.0, mu, sd, k))
+        for mu in (0.1, 0.5, 0.9):
+            for sd in (0.3, 1.0):
+                for k in (0, int(round(B * mu))):
+                    out.append((("val", None, 1.5), "val", None, 1.5, mu, sd, k))
+        return out
+
+    def t610_eta(self, tab, spec, mu):
+        """The predictor whose G is the table's m_z at mu (the predicted empirical logit of fraction mu)."""
+        z = self.zmu(tab, mu)
+        if spec is None:
+            return z
+        G = ref_link(*spec)
+        lo, hi = -60.0, 60.0
+        for _ in range(200):
+            mid = 0.5 * (lo + hi)
+            lo, hi = (mid, hi) if float(G(np.array([mid]))[0]) < z else (lo, mid)
+        return 0.5 * (lo + hi)
+
+    def t610_reference(self, tab, spec, phi, eta, sd, k):
+        G = ref_link(*spec) if spec is not None else ref_link()
+        m_, A_, L_ = tab.m, tab.A, tab.L
+
+        def loglik(e):
+            z = G(eta + e)
+            return ref_count_logp(k, np.interp(z, m_, A_), phi * np.interp(z, m_, L_), self.B)
+        return ref_log_integral(loglik, sd)
+
+    def t610_refs(self, cases):
+        """The reference of every case (computed once per test run: a module cache keyed by the case)."""
+        out = []
+        for g, tname, spec, phi, mu, sd, k in cases:
+            key = (tname, spec, phi, mu, sd, k)
+            if key not in _T610_REF:
+                tab = self.tabs[tname]
+                _T610_REF[key] = self.t610_reference(tab, spec, phi, self.t610_eta(tab, spec, mu), sd, k)
+            out.append(_T610_REF[key])
+        return out
+
+    def t610_run(self, cases, rule=None, hook=True):
+        """Score every case (one replicate per pair, so a pair's score is one observation's): grouped by table, link
+        and phi -> ({case index: score}, {group: info}). rule: a replacement _score_need (the negative control);
+        hook False: no score law (main's scorer, for the byte comparison)."""
+        M = self.M
+        groups = {}
+        for i, c in enumerate(cases):
+            groups.setdefault(c[0], []).append(i)
+        out, infos, models = {}, {}, {}
+        for g, ix in groups.items():
+            tname, spec, phi = cases[ix[0]][1], cases[ix[0]][2], cases[ix[0]][3]
+            tab = self.tabs[tname]
+            W, SL = self.hooks(tab, "t6-10")
+            lk = M.Link() if spec is None else M.Link(np.array(spec[0]), np.array(spec[1]), spec[2], spec[3])
+            m = {"link": lk, "phi": phi, "var_fn": W}
+            if hook:
+                m["score_law"] = SL
+            eta = [self.t610_eta(tab, spec, cases[i][4]) for i in ix]
+            s2 = [cases[i][5] ** 2 for i in ix]
+            cnt = [[cases[i][6]] for i in ix]
+            if rule is None:
+                sc, info = self.score(m, eta, s2, cnt)
+            else:
+                with mock.patch.object(M, "_score_need", rule):
+                    sc, info = self.score(m, eta, s2, cnt)
+            out.update(zip(ix, sc.tolist()))
+            infos[g], models[g] = info, (m, eta, s2, cnt)
+        return out, infos, models
+
+    def test_T6_10_integrated_score_with_the_hook(self):
+        """T6-10 (A_design_v5 3.3, PC-24, PC-25): pred_count_lpd with the score law equals the frozen reference within
+        2 x TRAP_TOL per observation, with no grid_unresolved pair, for predicted capture fractions 0.002-0.998
+        (the saturated ones, where the table's slopes kappa_j are largest, included), predictor SDs 0.05-1.0 and
+        counts 0, modal and B (the rarest at the extreme predictions), on the steep validation curve and S_C = 0.2,
+        with identity, spline and bounded links and phi 1 and 1.5 -- except the cases the reference refuses as
+        unrepresentable (+-60 SD) and the STOPPED gap (T610_GAP); the reference's halving certificates are recorded
+        (v5's 1e-9 allowance is STOPPED: test_T6_10_reference_certificates_meet_v5). The mandatory rare-count case
+        (S_C = 0.2, phi 1, identity G, fraction 0.998, SD 1, k = 0, location m_z(0.998)): the reference extends
+        beyond 10 SD and the scorer records a range extension and agrees. The v2 rule (main's step, no H^max) runs
+        as the negative control and its misses are reported; with score_law unset the scores are main's byte for
+        byte."""
+        import sys as sys_
+        M, ol, B = self.M, self.ol, self.B
+        tol = 2 * M.TRAP_TOL
+        for key in T610_UNREPRESENTABLE:
+            tab = self.tabs[key[0]]
+            with self.assertRaisesRegex(ValueError, "unrepresentable"):
+                self.t610_reference(tab, None, 1.0, self.zmu(tab, key[1]), key[2], key[3])
+        cases = self.t610_cases()
+        got, infos, models = self.t610_run(cases)
+        worst, misses = 0.0, []
+        refs = {}
+        rr = self.t610_refs(cases)
+        for i, r in enumerate(rr):
+            refs[i] = r["log_I"]
+            d = abs(got[i] - r["log_I"])
+            worst = max(worst, d)
+            if d > tol:
+                misses.append((cases[i][1:], got[i], r["log_I"]))
+        for g, info in infos.items():
+            self.assertEqual(info["grid_unresolved"], 0, g)
+            self.assertIsInstance(info["table_extrapolated"], int)
+        ext = sum(info["extended"] for info in infos.values())
+        certs = [r["certificate"] for r in rr]
+        print(f"T6-10: {len(cases)} observations, worst |score - reference| {worst:.2e} (tolerance {tol}), {ext} range "
+              f"extensions, misses {misses}; reference certificates: worst {max(certs):.2e}, "
+              f"{sum(c > REF_CERT for c in certs)} above v5's {REF_CERT} (STOPPED; see T610_GAP's note)",
+              file=sys_.stderr)
+        self.assertEqual(misses, [])
+        self.assertGreater(ext, 10)
+        # the mandatory rare-count case
+        tabc = self.tabs["const"]
+        a, _ = ol.solve_location(np.array([0.998]), np.array([0.2]), B, B)
+        loc = float(ol.logit_moments(a, np.array([0.2]))[0][0])
+        r = self.t610_reference(tabc, None, 1.0, loc, 1.0, 0)
+        self.assertGreater(r["b"], REF_START)
+        self.assertTrue(all(not t[3] for t in r["trace"][:-1]) and r["trace"][-1][3])
+        W, SL = self.hooks(tabc)
+        sc, info = self.score({"link": M.Link(), "phi": 1.0, "var_fn": W, "score_law": SL}, [loc], [1.0], [[0]])
+        print(f"T6-10 mandatory case: score {float(sc[0]):.6f}, reference {r['log_I']:.6f} (b = {r['b']:g} SD), "
+              f"scorer info {info}", file=sys_.stderr)
+        self.assertGreaterEqual(info["extended"], 1)
+        self.assertEqual(info["grid_unresolved"], 0)
+        self.assertLessEqual(abs(float(sc[0]) - r["log_I"]), tol)
+
+        # the negative control: the v2 rule (main's step: the working variance's floor, no H^max)
+        def v2_rule(lk, m, eta, sd, span):
+            smin = math.sqrt(max(float(M._rep_var(m, M.VMIN_GRID).min()), 1e-300))
+            d_ = M.TRAP_SD * span * sd
+            gmax = np.array([max(lk.max_slope(e - dd, e + dd), 1e-12) for e, dd in
+                             zip(np.atleast_1d(eta), np.broadcast_to(d_, np.shape(np.atleast_1d(eta))))])
+            h = np.minimum(sd, M.TRAP_H * smin / gmax)
+            return np.ceil(2 * M.TRAP_SD * span * sd / np.maximum(h, 1e-300)) + 1
+        got2, infos2, _ = self.t610_run(cases, rule=v2_rule)
+        miss2 = [(cases[i][1:], round(got2[i] - refs[i], 6)) for i in refs if abs(got2[i] - refs[i]) > tol]
+        unres2 = sum(info["grid_unresolved"] for info in infos2.values())
+        print(f"T6-10 negative control (v2 rule): {len(miss2)} misses beyond {tol}, {unres2} unresolved, worst "
+              f"{max(abs(got2[i] - refs[i]) for i in refs):.2e}; misses {miss2}", file=sys_.stderr)
+        # score_law unset: main's scorer, byte for byte, on the same groups
+        _, _, plain = self.t610_run(cases, hook=False)
+        self.assert_main_bytes(list(plain.values()))
+
+    def test_T6_10_grid_rule_per_pair_hmax_and_extension(self):
+        """T6-10's grid rule (A_design_v5 3.3, PC-24) against an independent computation: H^max the largest |kappa_j|
+        of the table segments meeting [G(eta - Delta), G(eta + Delta)] (brute force over every segment; 0 wholly beyond
+        the table), Delta = TRAP_SD span sd, g_max the link's max_slope over [eta - Delta, eta + Delta] per pair,
+        s_lat = sqrt(phi min L), h = min(sd, TRAP_H s_lat / (g_max max(H^max, 1e-12))): _score_need gives
+        ceil(2 TRAP_SD span sd / h) + 1 for identity, spline and bounded links, spans 1-8 and phi 0.6-2.2. On a range
+        extension (the steep curve, k = 0 at fraction 0.998, SD 1, where the extended range reaches the table's
+        steepest segments) every grid used is at least the bucket of the requirement RECOMPUTED on its range, which
+        main's span-scaled requirement does not reach there."""
+        M, tab = self.M, self.tab
+        W, SL = self.hooks(tab)
+        kappa = np.abs(np.diff(tab.A) / np.diff(tab.m))
+
+        def zc(g):
+            p = np.clip(M._sig(np.asarray(g, float)), 1e-4, 1 - 1e-4)
+            return np.log(p) - np.log1p(-p)
+
+        def need(lk, phi, eta, sd, span):
+            d_ = M.TRAP_SD * span * sd
+            zlo, zhi = float(zc(lk.G(np.array([eta - d_])))[0]), float(zc(lk.G(np.array([eta + d_])))[0])
+            hit = (tab.m[:-1] <= zhi) & (tab.m[1:] >= zlo)
+            hmax = float(kappa[hit].max()) if hit.any() else 0.0
+            gmax = max(lk.max_slope(eta - d_, eta + d_), 1e-12)
+            slat = math.sqrt(max(phi * float(tab.L.min()), 1e-300))
+            h = min(sd, M.TRAP_H * slat / (gmax * max(hmax, 1e-12)))
+            return math.ceil(2 * M.TRAP_SD * span * sd / max(h, 1e-300)) + 1, hmax
+        rng = np.random.default_rng(10)
+        links = [M.Link(), M.Link(np.array([-4.0, -1.0, 1.0, 4.0]), np.array([-4.0, -1.6, 0.4, 4.0])),
+                 M.Link(np.array([-3.0, 0.0, 3.0]), np.array([-3.0, 0.5, 3.0]), 0.02, 0.9)]
+        zero_hmax = 0
+        for lk in links:
+            for phi in (1.0, 0.6, 2.2):
+                m = {"link": lk, "phi": phi, "var_fn": W, "score_law": SL}
+                eta = rng.uniform(-12.0, 12.0, 120)
+                sd = np.exp(rng.uniform(math.log(0.005), math.log(3.0), 120))
+                for span in (1.0, 2.0, 4.0, 8.0):
+                    got = M._score_need(lk, m, eta, sd, span)
+                    want = [need(lk, phi, e, s, span) for e, s in zip(eta, sd)]
+                    self.assertTrue(np.array_equal(got, np.array([w[0] for w in want], float)), (span, phi))
+                    zero_hmax += sum(w[1] == 0.0 for w in want)
+                    one = M._score_need(lk, m, eta[:1], sd[:1], span)
+                    self.assertEqual(float(one[0]), float(got[0]))
+        self.assertGreater(zero_hmax, 0)                       # (intervals wholly in the constant extrapolation)
+        # the extension: the grid used at every span is at least the recomputed requirement's bucket
+        eta0 = self.zmu(tab, 0.998)
+        calls = []
+        real = M._grid_pass
+
+        def spy(lk, m, cnt, eta, sd, N, K, span):
+            calls.append((int(K), float(span[0])))
+            return real(lk, m, cnt, eta, sd, N, K, span)
+        m = {"link": M.Link(), "phi": 1.0, "var_fn": W, "score_law": SL}
+        with mock.patch.object(M, "_grid_pass", spy):
+            _, info = self.score(m, [eta0], [1.0], [[0]])
+        self.assertGreaterEqual(info["extended"], 1)
+        self.assertIn(2.0, [s for _, s in calls])
+        top = len(M.TRAP_KS) - 1
+        for K, span in calls:
+            n_, _ = need(M.Link(), 1.0, eta0, 1.0, span)
+            self.assertGreaterEqual(K, M.TRAP_KS[min(int(np.searchsorted(M.TRAP_KS, n_)), top)], (K, span))
+        n1, h1 = need(M.Link(), 1.0, eta0, 1.0, 1.0)
+        n2, h2 = need(M.Link(), 1.0, eta0, 1.0, 2.0)
+        self.assertGreater(h2, h1)                             # (the extended range meets steeper segments)
+        self.assertGreater(int(np.searchsorted(M.TRAP_KS, n2)), int(np.searchsorted(M.TRAP_KS, n1 * 2.0)))
+
+    def test_T6_10_gap_diagnosis(self):
+        """The STOPPED T6-10 gap (T610_GAP; reported, not decided): for each case the scorer's own integrand
+        (_score_law and the interval probability), integrated densely over +-25 SD, matches the reference within
+        1e-6, while pred_count_lpd neither extends the range nor flags the pair -- the miss is the range rule's
+        (main's TRAP_EDGE check, kept by v5 3.3), not the score law's or the grid step's."""
+        import sys as sys_
+        M, B = self.M, self.B
+        for tname, mu, sd, k in sorted(T610_GAP):
+            tab = self.tabs[tname]
+            W, SL = self.hooks(tab)
+            m = {"link": M.Link(), "phi": 1.0, "var_fn": W, "score_law": SL}
+            eta = self.zmu(tab, mu)
+            r = self.t610_reference(tab, None, 1.0, eta, sd, k)
+            sc, info = self.score(m, [eta], [sd * sd], [[k]])
+            x = np.linspace(-25.0, 25.0, 2_000_001)
+            loc, var = M._score_law(m, eta + sd * x)
+            t = (M._interval_logp(np.full((len(x), 1), k), B, loc[:, None], var[:, None])[:, 0] - 0.5 * x * x
+                 - 0.5 * math.log(2 * math.pi) + math.log(x[1] - x[0]))
+            dense = float(t.max() + math.log(float(np.exp(t - t.max()).sum())))
+            print(f"T6-10 STOPPED gap {tname} mu^ {mu} SD {sd} k {k}: scorer {float(sc[0]):.4f}, reference "
+                  f"{r['log_I']:.4f}, the scorer's integrand densely {dense:.4f} (peak at e = "
+                  f"{float(x[np.argmax(t)]):+.2f} SD); info {info}", file=sys_.stderr)
+            self.assertLessEqual(abs(dense - r["log_I"]), 1e-6)
+            self.assertEqual((info["extended"], info["grid_unresolved"]), (0, 0))
+            self.assertGreater(float(x[np.argmax(t)]), M.TRAP_SD)
+
+    @unittest.expectedFailure
+    def test_T6_10_gap_cases_agree(self):
+        """T6-10's requirement on the STOPPED gap cases (T610_GAP): the scorer agrees with the reference within
+        2 x TRAP_TOL. It fails under v5 3.3's retained range check (expected failure, reported to the coordinator);
+        a fix to the registered range rule turns it into an unexpected success, which fails the suite."""
+        cases = [((t, None, 1.0), t, None, 1.0, mu, sd, k) for t, mu, sd, k in sorted(T610_GAP)]
+        got, _, _ = self.t610_run(cases)
+        for i, c in enumerate(cases):
+            tab = self.tabs[c[1]]
+            r = self.t610_reference(tab, None, 1.0, self.t610_eta(tab, None, c[4]), c[5], c[6])
+            self.assertLessEqual(abs(got[i] - r["log_I"]), 2 * self.M.TRAP_TOL, c)
+
+    @unittest.expectedFailure
+    def test_T6_10_reference_certificates_meet_v5(self):
+        """T6-10's reference requirement (PC-25): every case's halving certificate <= 1e-9, the mandatory case's
+        included. It fails under the frozen spacing on rare counts (the STOPPED certificate note above; expected
+        failure, reported to the coordinator)."""
+        cases = self.t610_cases()
+        B, ol = self.B, self.ol
+        a, _ = ol.solve_location(np.array([0.998]), np.array([0.2]), B, B)
+        loc = float(ol.logit_moments(a, np.array([0.2]))[0][0])
+        certs = [r["certificate"] for r in self.t610_refs(cases)]
+        certs.append(self.t610_reference(self.tabs["const"], None, 1.0, loc, 1.0, 0)["certificate"])
+        self.assertLessEqual(max(certs), REF_CERT)
+
+    # ---------------------------------------------------------------- T6-11
+    def test_T6_11_reference_self_test(self):
+        """T6-11 (A_design_v5 PC-25; the ten fixtures frozen in v5), prior N(0, 1): (a) L = exp(-(e - d)^2 / (2 w^2)),
+        w in {0.17, 1.0} x d in {0, 5, 15, 30}, log I = log w - log(1 + w^2) / 2 - d^2 / (2 (1 + w^2)); (b) L = 1,
+        log I = 0; (c) L = Phi((-12 - e) / 0.5), I = Phi(-12 / sqrt 1.25). Each: |log I^ - log I| <= 1e-8 and the
+        halving certificate <= 1e-9; the stopping bound is checked at every extension step (each earlier step fails
+        it, the last meets it, with the finer value too); stops within 10-32 SD. Negative controls: under v4's 1e-6
+        budget (a) w = 0.17, d = 30 and (c) miss by more than 1e-8 (omitted fractions about 2.48e-7 and 2.8e-7) while
+        their certificates read about 0; truncated at +-10 SD, (a) d = 15, 30 and (c) are refused. The log tail is
+        continuous where it switches from erfc to the continued fraction."""
+        import sys as sys_
+        fixtures = [("a", w, d) for w in (0.17, 1.0) for d in (0.0, 5.0, 15.0, 30.0)] + [("b", None, None),
+                                                                                        ("c", None, None)]
+
+        def fixture(kind, w, d):
+            if kind == "a":
+                return ((lambda e: -(e - d) ** 2 / (2.0 * w * w)),
+                        math.log(w) - 0.5 * math.log(1.0 + w * w) - d * d / (2.0 * (1.0 + w * w)))
+            if kind == "b":
+                return (lambda e: np.zeros(np.shape(e))), 0.0
+            x = 12.0 / math.sqrt(1.25)
+            return (lambda e: ref_log_sf((12.0 + e) / 0.5)), math.log(0.5 * math.erfc(x / math.sqrt(2.0)))
+        self.assertAlmostEqual(12.0 / math.sqrt(1.25), 10.7331263, places=7)
+        worst = 0.0
+        for kind, w, d in fixtures:
+            loglik, exact = fixture(kind, w, d)
+            r = ref_log_integral(loglik, 1.0)
+            err = abs(r["log_I"] - exact)
+            worst = max(worst, err)
+            print(f"T6-11 ({kind}) w={w} d={d}: |log I^ - log I| {err:.2e}, certificate {r['certificate']:.2e}, "
+                  f"stopped at b = {r['b']:g} SD after {len(r['trace'])} step(s)", file=sys_.stderr)
+            self.assertLessEqual(err, 1e-8, (kind, w, d))
+            self.assertLessEqual(r["certificate"], REF_CERT, (kind, w, d))
+            self.assertTrue(all(not t[3] for t in r["trace"][:-1]) and r["trace"][-1][3] and r["fine_bound_ok"])
+            for b, bound, log_i, stop in r["trace"]:
+                self.assertEqual(stop, bound <= math.log(REF_TAIL) + log_i)
+            self.assertTrue(10.0 <= r["b"] <= 32.0, r["b"])
+        for kind, w, d in (("a", 0.17, 30.0), ("c", None, None)):
+            loglik, exact = fixture(kind, w, d)
+            r = ref_log_integral(loglik, 1.0, tail=REF_TAIL_V4)
+            print(f"T6-11 negative control, v4 budget ({kind}) w={w} d={d}: log I^ - log I = "
+                  f"{r['log_I'] - exact:+.4e}, certificate {r['certificate']:.1e}", file=sys_.stderr)
+            self.assertGreater(abs(r["log_I"] - exact), 1e-8)
+            self.assertLess(abs(r["log_I"] - exact), 1e-6)
+            self.assertLessEqual(r["certificate"], 1e-12)
+        for kind, w, d in (("a", 0.17, 15.0), ("a", 0.17, 30.0), ("a", 1.0, 15.0), ("a", 1.0, 30.0), ("c", None, None)):
+            with self.assertRaisesRegex(ValueError, "unrepresentable"):
+                ref_log_integral(fixture(kind, w, d)[0], 1.0, cap=REF_START)
+        x = np.array([REF_SF_SWITCH * (1 - 1e-15), REF_SF_SWITCH])
+        v = ref_log_sf(x)
+        self.assertLess(abs(v[0] - v[1]) / abs(v[1]), 1e-12)
+        self.assertTrue(np.all(np.isfinite(ref_log_sf(np.array([40.0, 1e3, 1e8])))))
+        self.assertEqual(float(ref_log_sf(np.array([math.inf]))[0]), -math.inf)
+
+
 if __name__ == "__main__":
     unittest.main()
