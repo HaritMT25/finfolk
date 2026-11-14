@@ -1082,10 +1082,15 @@ class TestSupervisor(unittest.TestCase):
                 self.assertLess(calls.index(c), k, c)
         finally:
             worlds.rqlib.fsync_dir, worlds.rqlib.fsync_file, worlds._append_durable = real_dir, real_file, real_append
-        # no plain os.makedirs left on a bootstrap path (the helper itself and the throwaway probe only)
-        src = rqlib.read_text(os.path.join(worlds.HERE, "worlds.py")).splitlines()
-        plain = [ln.strip() for ln in src if "os.makedirs(" in ln]
-        self.assertEqual(plain, ["os.makedirs(path, exist_ok=True)", "os.makedirs(d)"], plain)
+        # Bootstrap/quarantine paths use the shared durable helper. Only the
+        # throwaway binary probe may create a directory without parent barriers.
+        src = rqlib.read_text(os.path.join(worlds.HERE, "worlds.py"))
+        helper = src.split("def mkdirs_durable(path):", 1)[1].split("\ndef ", 1)[0]
+        self.assertIn("rqlib.mkdirs_durable(path)", helper)
+        plain = [ln.strip() for ln in src.splitlines() if "os.makedirs(" in ln]
+        self.assertEqual(plain, ["os.makedirs(d)"], plain)
+        probe = src.split("def probe_binary(exe, bdir):", 1)[1].split("\ndef ", 1)[0]
+        self.assertIn("os.makedirs(d)", probe)
 
     def test_non_serial_checkpoint_refused(self):
         """P2 (6): a checkpoint that declares a non-exact resume is never archived or accepted."""

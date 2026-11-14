@@ -137,6 +137,13 @@ THE ESTIMATOR (per horizon; Annex H.9.2: an interval-censored Gaussian composite
       reported with the failure rate, labelled approximate and conditional on identification.
     - This departs from H.7's materialized-record bootstrap: the bank's intervals are descriptive and
       outside the confirmatory family. No coverage study is registered.
+    - RNG EXCEPTION to Annex H's general SplitMix convention: this bank's descriptive bootstrap uses
+      NumPy default_rng(0), with its existing draws unchanged. Alignment requires the owner's decision;
+      the observation content hash, estimator code hash and NumPy version are recorded in each estimate.
+
+  Production availability requires the complete registered allocation, including every free control and
+  replicate, with no declared missing cells or duplicate endpoint/replicate keys. --descriptive explicitly
+  permits partial summaries; their generator_noise.available is always false.
 
 THE PRODUCTION V BUILDER (cov_parts; Annex H.3.1): one block's bank covariance diag(d) + U U' (for
 recurrence.Cov), from the bank's components and the bank's s(mu) curves (noisescale.evaluate, the
@@ -150,6 +157,8 @@ counts, not their exact native-scale covariance (checked against simulation at s
         --age-reference ages.json --avoid production_plan.jsonl ... --out nb_design.json
     noisebank.py collect --study STUDY --design noisebank_design.json --plan plan.jsonl [--declare-missing ...]
     noisebank.py estimate --obs noisebank_obs.json --out bank.json [--boot 999]
+    noisebank.py estimate --obs partial_obs.json --descriptive --out descriptive_bank.json
+    # Older observations without an embedded design also require --design noisebank_design.json.
 """
 from __future__ import annotations
 
@@ -322,28 +331,12 @@ def bind_validation(block, validation_dir, main_registries):
     return {"registry": rp, "registry_sha256": sha, "namespace": reg["namespace"], "main_registries": mains}
 
 
-def _collect_seeds(obj, out, hint=False):
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            _collect_seeds(v, out, hint or "seed" in str(k).lower())
-    elif isinstance(obj, list):
-        for v in obj:
-            _collect_seeds(v, out, hint)
-    elif isinstance(obj, int) and not isinstance(obj, bool) and hint:
-        out.add(obj)
-    return out
-
-
 def avoid_seeds(path):
-    text = rqlib.read_text(path)
+    """Validated reservations shared with worlds registration and the assay planner."""
     try:
-        doc = json.loads(text)
-    except ValueError:
-        doc = None
-    if isinstance(doc, dict):
-        return _collect_seeds(doc, set())
-    rows = [json.loads(ln) for ln in text.split("\n") if ln.strip()]
-    return planlib.plan_seeds(rows) | _collect_seeds(rows, set())
+        return rqlib.load_reservations(path)[0]
+    except rqlib.ReservationError as exc:
+        raise NoiseBankError(str(exc)) from exc
 
 
 def make_design(block, templates, ages, avoid_paths, ns=SEED_NAMESPACE, validation_dir=None, arena=None,
@@ -383,10 +376,14 @@ def make_design(block, templates, ages, avoid_paths, ns=SEED_NAMESPACE, validati
     seeds = planlib.plan_seeds(rows)
     checked = []
     for p in avoid_paths:
-        hit = sorted(seeds & avoid_seeds(p))
+        try:
+            reserved, record = rqlib.load_reservations(p)
+        except rqlib.ReservationError as exc:
+            raise NoiseBankError(str(exc)) from exc
+        hit = sorted(seeds & reserved)
         if hit:
             raise NoiseBankError(f"{len(hit)} noise-bank engine seed(s) are reserved in {p}: {hit[:5]}")
-        checked.append({"path": os.path.abspath(p), "sha256": rqlib.sha256_file(p)})
+        checked.append(record)
     n_pred = sum(1 for r in rows if r.get("predators") is not None)
     design["noisebank"] = {"schema": SCHEMA, "validation_dir": os.path.abspath(validation_dir), "arena": str(arena),
                            "validation": binding, "worlds": order, "partner": partner, "times": list(TIMES),
@@ -461,7 +458,7 @@ def collect(study, design, plan_path, declared_missing=()):
     if missing != sorted(set(declared_missing)):
         raise NoiseBankError(f"{len(missing)} plan cells are not collected; a missing cell must be declared exactly")
     return {"schema": OBS_SCHEMA, "design_sha256": rqlib.canonical_sha(design), "plan_sha256": plan_sha,
-            "missing": missing, "observations": obs}
+            "design": design, "missing": missing, "observations": obs}
 
 
 # ================================================================== numerics: normal tails, BVN
@@ -899,7 +896,10 @@ def arrays(obs, horizon):
         if any(not isinstance(v, int) or isinstance(v, bool) for v in vals):
             raise NoiseBankError(f"{o.get('cell')}: counts at {h} steps must be integers")
         if o["pred"] is None:
-            free.setdefault(tuple(o["prey"]), {})[o["replicate"]] = x["survivors"]
+            key = tuple(o["prey"])
+            if o["replicate"] in free.get(key, {}):
+                raise NoiseBankError(f"free {key} replicate {o['replicate']} occurs twice")
+            free.setdefault(key, {})[o["replicate"]] = x["survivors"]
         else:
             key = (tuple(o["prey"]), tuple(o["pred"]))
             if o["replicate"] in by.get(key, {}):
@@ -1757,15 +1757,100 @@ def horizon_estimate(A, boot=BOOT, seed=0, m=Z_INTERVALS):
     return rec
 
 
-def estimate(doc, boot=BOOT, seed=0, m=Z_INTERVALS, replicates=None):
+def observation_key(observation):
+    """The exposed/free endpoint-replicate identity, independently of the cell id."""
+    try:
+        prey, pred, replicate = observation["prey"], observation["pred"], observation["replicate"]
+        if (not isinstance(prey, (list, tuple)) or len(prey) != 2
+                or not all(isinstance(v, str) and v for v in prey)
+                or (pred is not None and (not isinstance(pred, (list, tuple)) or len(pred) != 2
+                                         or not all(isinstance(v, str) and v for v in pred)))
+                or type(replicate) is not int or replicate < 0):
+            raise ValueError("invalid endpoint or replicate")
+        return tuple(prey), None if pred is None else tuple(pred), replicate
+    except (KeyError, TypeError, ValueError) as exc:
+        raise NoiseBankError(f"invalid observation identity: {exc}") from exc
+
+
+def validate_observations(doc, descriptive=False, design=None):
+    """Check identities always; production additionally requires the exact expanded design.
+
+    The design is embedded by collect; older observation files can supply it explicitly.
+    Comparing every expanded row catches entire absent pairs and entire absent replicates,
+    which an observed-only coverage check cannot detect.
+    """
+    observations = doc.get("observations")
+    if not isinstance(observations, list) or not observations:
+        raise NoiseBankError("no observations")
+    keys, cells = set(), {}
+    for observation in observations:
+        key = observation_key(observation)
+        if key in keys:
+            raise NoiseBankError(f"endpoint-replicate {key} occurs twice")
+        keys.add(key)
+        cell = observation.get("cell")
+        if not isinstance(cell, str) or not cell or cell in cells:
+            raise NoiseBankError(f"invalid or duplicate cell id {cell!r}")
+        cells[cell] = key
+        if not isinstance(observation.get("horizons"), dict) or any(str(h) not in observation["horizons"] for h in HORIZONS):
+            raise NoiseBankError(f"{cell}: missing required horizons")
+    if descriptive:
+        return {"observed": len(cells), "declared_missing": doc.get("missing"), "complete": False}
+    if doc.get("missing") != []:
+        raise NoiseBankError("production estimation requires no declared missing cells (use --descriptive for partial summaries)")
+    design = design if design is not None else doc.get("design")
+    if not isinstance(design, dict) or rqlib.canonical_sha(design) != doc.get("design_sha256"):
+        raise NoiseBankError("production estimation requires the hash-matching registered design (recollect or supply --design)")
+    allocation = design.get("noisebank")
+    if not isinstance(allocation, dict):
+        raise NoiseBankError("the registered design has no noise-bank allocation")
+    worlds = allocation.get("worlds", [])
+    times = allocation.get("times", [])
+    if (design.get("name") != "noisebank" or design.get("replicates") != REPLICATES
+            or not isinstance(worlds, list) or not all(isinstance(w, str) and w for w in worlds)
+            or len(worlds) != N_WORLDS or len(set(worlds)) != N_WORLDS or times != list(TIMES)
+            or allocation.get("partner") != {w: worlds[(i + 1) % len(worlds)] for i, w in enumerate(worlds)}):
+        raise NoiseBankError("not the registered noise-bank allocation (use --descriptive for other designs)")
+    try:
+        rows, _, _ = planlib.expand_v2(design, pending=True)
+    except (planlib.DesignError, KeyError, TypeError, ValueError) as exc:
+        raise NoiseBankError(f"cannot expand registered bank design: {exc}") from exc
+    expected = {row["id"]: ((row["prey"]["world"], row["prey"]["time"]),
+                            None if row["predators"] is None else
+                            (row["predators"]["world"], row["predators"]["time"]), row["replicate"])
+                for row in rows}
+    if not expected or len(expected) != len(rows) or len(set(expected.values())) != len(rows):
+        raise NoiseBankError("registered bank design has empty or duplicate endpoint-replicate allocation")
+    registered_keys = {((w, tq), pred, r)
+                       for w in worlds for tq in times for r in range(design["replicates"])
+                       for pred in [None] + [(wp, tp) for wp in (w, allocation["partner"][w]) for tp in times]}
+    if set(expected.values()) != registered_keys:
+        raise NoiseBankError("the design does not expand to the complete registered bank allocation")
+    if cells != expected:
+        missing, extra = len(set(expected) - set(cells)), len(set(cells) - set(expected))
+        raise NoiseBankError(f"incomplete registered bank allocation: expected {len(expected)} trajectories, "
+                             f"observed {len(cells)} ({missing} missing, {extra} extra; endpoint/replicate identities must match)")
+    return {"expected": len(expected), "observed": len(cells), "complete": True}
+
+
+def estimate(doc, boot=BOOT, seed=0, m=Z_INTERVALS, replicates=None, descriptive=False, design=None, obs_bytes=None):
     """The bank: per horizon (horizon_estimate); the generator noise block and map.py's prior at the
-    production 5k horizon (available only when its components and all three curves are)."""
+    production 5k horizon. Production availability requires the complete registered
+    allocation, identified components and all three curves. Partial estimation requires
+    descriptive=True and is always unavailable for production."""
     if doc.get("schema") != OBS_SCHEMA:
         raise NoiseBankError(f"observations schema {doc.get('schema')!r}")
     if not isinstance(boot, int) or isinstance(boot, bool) or boot < 1:
         raise NoiseBankError(f"bootstrap draws must be a positive integer (got {boot!r})")
+    coverage = validate_observations(doc, descriptive, design)
+    import numpy as np
     obs = doc["observations"]
-    out = {"schema": BANK_SCHEMA, "obs_design_sha256": doc.get("design_sha256"), "plan_sha256": doc.get("plan_sha256"),
+    obs_sha = rqlib.sha256_bytes(obs_bytes) if obs_bytes is not None else rqlib.canonical_sha(doc)
+    out = {"schema": BANK_SCHEMA, "purpose": "descriptive" if descriptive else "production", "coverage": coverage,
+           "provenance": {"observations_sha256": obs_sha,
+                          "observation_hash_basis": "file bytes" if obs_bytes is not None else "canonical JSON",
+                          "estimator_sha256": rqlib.sha256_file(__file__), "numpy_version": np.__version__},
+           "obs_design_sha256": doc.get("design_sha256"), "plan_sha256": doc.get("plan_sha256"),
            "estimator": {"z_intervals": m, "rho_max": RHO_MAX, "saturation": list(SATURATION), "sigma_min": SIGMA_MIN,
                          "info_min": INFO_MIN, "multi_start": MULTI_START, "start_tol": START_TOL,
                          "boot": boot, "boot_fail_max": BOOT_FAIL_MAX, "seed": seed,
@@ -1791,6 +1876,9 @@ def estimate(doc, boot=BOOT, seed=0, m=Z_INTERVALS, replicates=None):
                                               for ch in ("C", "S", "F")},
                                   "SigmaR": c["SigmaR"], "SigmaD": c["SigmaD"], "SigmaE": c["SigmaE"],
                                   "horizon": HORIZONS[0], "capture_bound": capture_bound(HORIZONS[0])}
+    if descriptive:
+        out["generator_noise"]["available"] = False
+        out["generator_noise"].setdefault("reasons", []).append("explicitly descriptive estimate; unavailable for production")
     out["map_variance"] = {"s_logit": out["generator_noise"].get("s_logit"), "nu0": base["nu0"],
                            "rule": "replicate-mean variance (nu0 s(mu)^2 + (R - 1) s_obs^2) / (nu0 + R - 1) / R; "
                                    "full_pooling: s(mu)^2 / R"}
@@ -1890,6 +1978,8 @@ def main(argv=None):
     s = sub.add_parser("estimate")
     s.add_argument("--obs", required=True)
     s.add_argument("--boot", type=int, default=BOOT)
+    s.add_argument("--design", help="registered design for older observations that do not embed it")
+    s.add_argument("--descriptive", action="store_true", help="allow partial descriptive estimation; never production-available")
     s.add_argument("--out", required=True)
     a = ap.parse_args(argv)
     try:
@@ -1905,7 +1995,9 @@ def main(argv=None):
             rqlib.write_json_durable(a.out, doc)
             print(f"{len(doc['observations'])} observations, {len(doc['missing'])} declared missing")
         else:
-            bank = estimate(rqlib.read_json(a.obs), boot=a.boot, replicates=REPLICATES)
+            raw = rqlib.read_bytes(a.obs)
+            bank = estimate(json.loads(raw), boot=a.boot, replicates=None if a.descriptive else REPLICATES,
+                            descriptive=a.descriptive, design=rqlib.read_json(a.design) if a.design else None, obs_bytes=raw)
             rqlib.write_json_durable(a.out, bank)
             g = bank["generator_noise"]
             print(json.dumps(g))
@@ -1913,7 +2005,7 @@ def main(argv=None):
                 print(f"noisebank.py estimate: the 5k generator noise is unavailable: {g['reasons']}", file=sys.stderr)
                 return 2
         return 0
-    except NoiseBankError as e:
+    except (NoiseBankError, OSError, ValueError) as e:
         print(f"noisebank.py {a.cmd}: {e}", file=sys.stderr)
         return 2
 
