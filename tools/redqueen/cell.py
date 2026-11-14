@@ -30,6 +30,29 @@ execute(cell, d, exe, paths) runs, in the empty directory d:
      and the source contents: the same row gives the same bytes (tested), and a replay compares
      them. What is not (wall times, host) goes into done.json, outside the bundle.
 
+Age diagnostics (bundle /3, D8 v2 rule 48; the nested score's existing fields and schema stay
+unchanged): each score.horizons entry adds age_strata (schema finfolk.redqueen.agestrata/1,
+score.age_strata). Ten START-age bins [0,12), [12,24), ..., [108,120] seconds (bin_edges_s; the
+last closed), each crossed with rule 46's age feasibility at that horizon: F_i(H) from
+common.age_feasible, the engine's binary32 age clock (start age rounded to binary32, then
+H additions of binary32(0.016), age death when the age exceeds binary32(maxAge); age_clock names
+it). Not the exact-arithmetic start age <= maxAge - H x dt, which rounding contradicts near the
+boundary. Every bin, each bin's feasible and infeasible stratum, the two feasibility totals and
+the cohort total carry n_start, survivors and survival (null for an empty denominator). Ages come
+from arena.json at f0, keyed by the initial prey IDs, never the horizon's ages; max_age_s is
+config.maxAge, dt_s score.dt; steps and frame name the horizon. Missing / invalid ages, ages
+beyond the fixed bins, totals that do not reconcile with the score's n_start and survivors, and
+any age-infeasible survivor refuse scoring. score.age_strata_problems is the contract: execute
+checks it against the cell's horizons before the bundle is bound (so before any checkpoint is
+deleted), store.completion_problems at completion verification, packing and resume,
+store.indexed_age_problems for packed cells (index_problems, verify_all, recover: pack()'s index
+stamp bound to the bundle's digest, over a chunk whose bytes still match, or else the packed
+bundle), and the
+collectors at ingestion: a /3 bundle without a complete summary is refused (a recording omission,
+never zero survival). Readers accept old /1 and /2 bundles without age_strata (explicitly
+unavailable, never inferred or rewritten) and /3 for either plan version; plan/2 still requires
+its sharing record in /2 and /3 bundles.
+
 Exit codes (also the worker's): 0 ok, 2 the engine is not a serial build, 3 an engine call
 failed, 4 a score check failed, 5 a source is missing or not its registered content (hashed
 from the very bytes parsed), 6 the checkpoint schedule is incomplete, 7 (the worker) the
@@ -54,6 +77,7 @@ import score as score_mod  # noqa: E402
 
 BUNDLE_SCHEMA = "finfolk.redqueen.bundle/1"
 BUNDLE_SCHEMA_V2 = "finfolk.redqueen.bundle/2"   # a plan/2 row's (reference ages, roles, global seeds)
+BUNDLE_SCHEMA_V3 = "finfolk.redqueen.bundle/3"   # start-age diagnostics, either plan version
 SHARING_SCHEMA = "finfolk.redqueen.sharing/1"
 OUTPUT_TOOLS = ("rqlib.py", "ckpt.py", "common.py", "score.py", "cell.py")   # what a bundle depends on
 TIMING_COLS = ("elapsed_s", "steps_per_sec")   # run.csv columns that depend on the machine, not the run
@@ -326,6 +350,10 @@ def execute(cell, d, exe, paths, procs=None):
                              int(cell["log_every"]), cell["assay"], fork=cell["kind"] == "nopred", scripted=scripted)
     except (score_mod.ScoreError, ckpt.CheckpointError, KeyError, ValueError) as e:
         raise CellFailure(4, f"score check failed: {e}")
+    # (D8 v2 rule 48) the bundle binds a complete age summary for every registered horizon
+    probs = score_mod.age_strata_problems(sc, list(cell["horizons"]))
+    if probs:
+        raise CellFailure(4, "score check failed: incomplete age summary: " + "; ".join(probs[:3]))
     info["t_score"] = time.time() - t2
     pred_csv = ""
     if not scripted:
@@ -337,7 +365,7 @@ def execute(cell, d, exe, paths, procs=None):
     arena_manifest = rqlib.read_json(os.path.join(d, "arena.manifest.json"))
     plan2 = cell.get("schema") == "finfolk.redqueen.plan/2"
     bundle = {
-        "schema": BUNDLE_SCHEMA_V2 if plan2 else BUNDLE_SCHEMA,
+        "schema": BUNDLE_SCHEMA_V3,
         "cell": cell,
         "binary_sha256": rqlib.sha256_file(exe), "tools_sha256": tools_sha256(),
         "engine_args": {"transplant": targs, "assay": aargs},

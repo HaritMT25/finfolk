@@ -2,7 +2,7 @@
 # redqueen_forks.sh — tools/redqueen/forks.py end to end against the real engine (serial build), on
 # tiny worlds (200 prey, 24,000 steps, a checkpoint every 4,000), plus its unit tests.
 #
-#   tests/redqueen_forks.sh PATH/TO/evo_boids WORKDIR        (env: PYTHON, default python3)
+#   tests/redqueen_forks.sh PATH/TO/evo_boids WORKDIR        (env: PYTHON; RQ_TEST_WORKERS, default 4)
 #
 #   1. two C histories run to the end (one a fork world, one the pilot's validation world);
 #   2. register: 2 main origins (8,000 archived; 28,000 past the histories' end: unavailable,

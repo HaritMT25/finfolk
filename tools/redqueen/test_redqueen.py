@@ -9,17 +9,20 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import hashlib
 import io
 import json
 import os
 import re
 import shutil
+import struct
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 import zipfile
+from fractions import Fraction
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -30,6 +33,7 @@ import rqlib  # noqa: E402
 import run  # noqa: E402
 import store  # noqa: E402
 import cell  # noqa: E402
+import score  # noqa: E402
 import worlds  # noqa: E402
 import noisebank as nb  # noqa: E402
 
@@ -45,12 +49,67 @@ def wr(path, data, mode=None):
         f.write(data)
 
 
+# (Codex re-review of a5c366c, P2) a large, poorly compressible bundle payload (the review's reproduction used
+# a 202,702-byte member): its DEFLATE stream is long enough that reading it as LZMA gets past the 4-byte
+# header to the filter properties and raises LZMAError (a small member's ends in a CRC error instead)
+POOR_PAYLOAD = "".join(hashlib.sha256(str(i).encode()).hexdigest() for i in range(3200))
+
+
+# (Codex re-review of a5c366c, P2: a central-directory compression method the packer never writes, which
+# zipfile then decodes by: STORED, BZIP2, LZMA (a5c366c: LZMAError, uncaught), Zstandard (Python 3.14's
+# zipfile decodes it: ZstdError, uncaught; earlier ones do not know it), and one no zipfile knows; shared with
+# test_noisebank / test_refsel's collection matrix: Codex re-review of 6407f80, P2)
+METHODS = {"stored": 0, "bzip2": 12, "lzma": 14, "zstd": 93, "unknown": 99}
+
+
+def set_chunk_member_method(path, arc, method):
+    """The chunk at `path` with the central-directory compression method of its member `arc` changed from
+    DEFLATE (8) to `method`: one byte, the size kept, any index untouched."""
+    raw = bytearray(rqlib.read_bytes(path))
+    sig, _, _, _, n, _, off, clen = struct.unpack("<IHHHHIIH", raw[-22:])
+    assert sig == 0x06054B50 and clen == 0, (sig, clen)
+    for _ in range(n):
+        assert raw[off:off + 4] == b"PK\x01\x02", off
+        ln, lm, lk = struct.unpack("<HHH", raw[off + 28:off + 34])
+        if raw[off + 46:off + 46 + ln] == arc.encode():
+            assert raw[off + 10:off + 12] == b"\x08\x00", raw[off + 10:off + 12]
+            raw[off + 10] = method
+            wr(path, bytes(raw))
+            with zipfile.ZipFile(path) as z:
+                assert z.getinfo(arc).compress_type == method
+            return
+        off += 46 + ln + lm + lk
+    raise AssertionError(f"{arc} is not in {path}")
+
+
+def tree_bytes(root):
+    """{relative path: bytes} of every file under root (what a refusal must leave as it was)."""
+    return {os.path.relpath(os.path.join(dp, f), root): rqlib.read_bytes(os.path.join(dp, f))
+            for dp, _, fs in os.walk(root) for f in fs}
+
+
+@contextlib.contextmanager
+def members_opened():
+    """-> the names of every zip member opened while inside (z.read and testzip open each member they
+    decode): a member never opened was never handed to a decoder."""
+    names, real = [], zipfile.ZipFile.open
+
+    def spy(z, name, *a, **kw):
+        names.append(getattr(name, "filename", name))
+        return real(z, name, *a, **kw)
+    zipfile.ZipFile.open = spy
+    try:
+        yield names
+    finally:
+        zipfile.ZipFile.open = real
+
+
 def mk_cp(n_prey=8, n_pred=3, version=2, frame=100, seed=1, cfg_extra=None):
     """A small, self-consistent synthetic checkpoint (not engine output: the layout only)."""
     rng = rqlib.SplitMix64(seed)
     u = lambda: rng.below(10 ** 6) / 10 ** 6  # noqa: E731
     cfg = {"genomeMinLength": 1, "genomeMaxLength": 12, "minPopulation": 0, "maxPopulation": 50,
-           "fastTanh": False, "bodyModel": False, "predatorCount": n_pred, "predatorSpeed": 110}
+           "fastTanh": False, "bodyModel": False, "predatorCount": n_pred, "predatorSpeed": 110, "maxAge": 120.0}
     if version == 2:
         cfg.update(predatorBrain=True, predatorMutation=1, predatorTurnRate=4, predatorMinSpeed=0,
                    predatorPrimer=False, predatorFrozen=False)
@@ -95,6 +154,49 @@ def mk_cp(n_prey=8, n_pred=3, version=2, frame=100, seed=1, cfg_extra=None):
     return cp
 
 
+def _r32(x):
+    """Exact rational x (0, or positive in binary32's normal range) rounded to the nearest binary32,
+    ties to even: an oracle that uses neither struct nor a C cast."""
+    if x == 0:
+        return Fraction(0)
+    e = x.numerator.bit_length() - x.denominator.bit_length()
+    if Fraction(2) ** e > x:
+        e -= 1
+    ulp = Fraction(2) ** (e - 23)
+    q, r = divmod(x, ulp)
+    if 2 * r > ulp or (2 * r == ulp and q % 2):
+        q += 1
+    return q * ulp
+
+
+def _oracle_clock(start, steps, max_age=120.0, stop=False):
+    """The engine's age law by exact rationals (D8 v2 rule 46): A_0 = binary32(start), A_{k+1} =
+    round32(A_k + 0.016f), the literal rounded from its decimal -> (A after `steps` frames, or at the
+    age death if stop, as a float; the first frame with A_k > binary32(max_age), or None)."""
+    a, d, m = _r32(Fraction(start)), _r32(Fraction("0.016")), _r32(Fraction(max_age))
+    death = None
+    for k in range(1, steps + 1):
+        a = _r32(a + d)
+        if death is None and a > m:
+            death = k
+            if stop:
+                break
+    return float(a), death
+
+
+def mk_age_score(horizons=(5000,), ages=(0.0,), alive=None, f0=100):
+    """A synthetic score (no engine) whose horizons carry complete age summaries (score.age_strata):
+    the initial cohort ids 7, 8, ... with start `ages`, all alive at every horizon unless alive =
+    {horizon: set of ids}."""
+    start = {7 + i: a for i, a in enumerate(ages)}
+    hs = []
+    for h in horizons:
+        live = set(start) if alive is None else set(alive.get(h, ()))
+        hs.append({"steps": h, "frame": f0 + h, "survivors": len(live),
+                   "age_strata": score.age_strata(start, live, 120.0, h, f0 + h, score.DT, len(start), len(live))})
+    return {"schema": score.SCHEMA, "n_start": len(start), "dt": score.DT, "horizons": hs}
+
+
 class TestRng(unittest.TestCase):
     def test_splitmix_reference_vector(self):
         # the reference splitmix64.c (Vigna) from state 1234567
@@ -130,6 +232,106 @@ class TestTemplateValues(unittest.TestCase):
         g = rqlib.read_text(os.path.join(REPO, "src", "core", "genome.hpp"))
         self.assertRegex(g, r"float output = 0\.5f;")
         self.assertEqual(common.NEURON_BIRTH_OUTPUT, 0.5)
+
+    def test_age_clock_mirrors_the_engine_source(self):
+        """D8 v2 rule 46: common's age clock is the engine's arithmetic: a binary32 age loaded by a
+        (float) cast, += the 0.016f fixed step every frame, age death when the UPDATED age is strictly
+        greater than the binary32 maxAge (starvation tested first), and no floating-point contraction."""
+        rd = lambda *p: rqlib.read_text(os.path.join(REPO, *p))  # noqa: E731
+        self.assertRegex(rd("src", "core", "agent_core.hpp"), r"\n\s*float age = 0\.0f;")
+        k = rd("src", "core", "kernel.hpp")
+        self.assertRegex(k, r"inline void stepMetabolism\(AgentCore& c, const SimConfig& cfg, float dt\) \{\s*"
+                            r"c\.age \+= dt;")
+        self.assertRegex(k, r"if \(c\.foodReserves <= 0\.0f\) return 's';\s*if \(c\.age > cfg\.maxAge\) return 'a';")
+        self.assertRegex(rd("src", "core", "config.hpp"), r"float maxAge\s*= 120\.0f;")
+        self.assertEqual(set(re.findall(r"const float fixedDt = ([0-9.]+)f;", rd("src", "app", "main.cpp"))), {"0.016"})
+        j = rd("src", "core", "json_min.hpp")
+        self.assertIn("out.push_back((float)e.num);", j)
+        self.assertIn("(float)v->num", j)
+        self.assertIn("add_compile_options(-ffp-contract=off)", rd("CMakeLists.txt"))
+        self.assertEqual((common.ENGINE_DT, score.DT), (0.016, 0.016))
+
+
+class TestAgeClock(unittest.TestCase):
+    """D8 v2 rule 46 (Codex review of 870daa6, P2-1): common's binary32 age clock against an
+    exact-rational oracle. Synthetic ages only (no study, bank or validation data)."""
+
+    def setUp(self):
+        common._CLOCKS.clear()
+
+    def test_dt_and_rounding(self):
+        self.assertEqual(common.binary32(0.016), float(_r32(Fraction("0.016"))))   # = the literal 0.016f
+        self.assertEqual(common.binary32(0.016), 0.01600000075995922)
+        for x in (0.0320000015, 11.999, 40.001, 119.999, 120.0, 1e-3):
+            self.assertEqual(common.binary32(x), float(_r32(Fraction(x))), x)
+
+    def test_rule46_boundary_is_feasible(self):
+        """Rule 46's counterexample: 40.00001907348633 (the age after 2,500 additions from zero) reaches
+        119.99422454833984 after 5,000 more and is feasible; the exact formula says 120.00002 > 120."""
+        self.assertEqual(_oracle_clock(0.0, 2500), (40.00001907348633, None))
+        self.assertEqual(_oracle_clock(40.00001907348633, 5000), (119.99422454833984, None))
+        self.assertGreater(40.00001907348633 + 5000 * 0.016, 120.0)           # (what a + H dt <= 120 concludes)
+        self.assertTrue(common.age_feasible(40.00001907348633, 5000, 120.0))
+        # the review's case: start 40.001 (binary32 40.0009994506836) ends at 119.99520111083984
+        self.assertEqual(_oracle_clock(40.001, 5000), (119.99520111083984, None))
+        self.assertTrue(common.age_feasible(40.001, 5000, 120.0))
+        # one clock: from zero, the age death comes exactly 2,500 frames after the death from its 2,500th age
+        self.assertEqual(common.age_death_frame(0.0, 120.0, 20000),
+                         2500 + common.age_death_frame(40.00001907348633, 120.0, 20000))
+
+    def test_boundary_and_death_frames_match_the_oracle(self):
+        """The 5k boundary between adjacent binary32 start ages, and death frames, agree with the oracle."""
+        bits = lambda x: struct.unpack("<I", struct.pack("<f", x))[0]  # noqa: E731
+        flt = lambda b: struct.unpack("<f", struct.pack("<I", b))[0]   # noqa: E731
+        lo, hi = bits(30.0), bits(50.0)                       # (positive binary32 order = bit order)
+        while hi - lo > 1:
+            mid = (lo + hi) // 2
+            lo, hi = (mid, hi) if common.age_feasible(flt(mid), 5000, 120.0) else (lo, mid)
+        self.assertGreater(flt(lo), 40.00001907348633)
+        self.assertIsNone(_oracle_clock(flt(lo), 5000)[1])
+        self.assertEqual(_oracle_clock(flt(hi), 5000)[1], 5000)
+        for a in (0.0, 12.25, 47.999, 119.99):
+            self.assertEqual(common.age_death_frame(a, 120.0, 8000), _oracle_clock(a, 8000, stop=True)[1], a)
+
+    def test_strictly_greater_and_frame_count(self):
+        m = float(2 * _r32(Fraction("0.016")))                    # A_2 from zero, exactly
+        self.assertEqual(common.age_death_frame(0.0, m, 10), 3)   # A_2 == maxAge lives; A_3 > maxAge dies
+        self.assertEqual((common.age_feasible(0.0, 2, m), common.age_feasible(0.0, 3, m)), (True, False))
+        self.assertEqual(common.age_death_frame(120.0, 120.0, 5), 1)
+        self.assertTrue(common.age_feasible(120.0, 0, 120.0))     # (no frame yet, no age death)
+        self.assertEqual(common.age_feasible_count([0.0, 40.0, 40.001, 47.999, 120.0], 5000, 120.0), 3)
+
+    def test_cache_resumes_exactly(self):
+        ages, hs = (0.0, 11.5, 40.001, 47.999), (20000, 5000, 7500, 7501, 1, 0)
+        fresh = {}
+        for h in hs:
+            for a in ages:
+                common._CLOCKS.clear()
+                fresh[a, h] = common.age_death_frame(a, 120.0, h)
+        common._CLOCKS.clear()
+        for h in (1, 5000, 7501, 0, 20000, 7500, 5000):
+            for a in ages:
+                self.assertEqual(common.age_death_frame(a, 120.0, h), fresh[a, h], (a, h))
+
+    def test_invalid_inputs(self):
+        for args in ((float("nan"), 120.0, 5), (1.0, float("inf"), 5), (True, 120.0, 5), (1.0, 120.0, -1),
+                     (1.0, 120.0, 2.5), (1.0, 1e39, 5), ("1", 120.0, 5)):
+            with self.subTest(args=args), self.assertRaises(ValueError):
+                common.age_death_frame(*args)
+        for dt in (0.0, -0.016):
+            with self.assertRaises(ValueError):
+                common.age_death_frame(1.0, 120.0, 5, dt=dt)
+
+    @unittest.skipUnless(os.environ.get("RQ_FROZEN_AGES"), "RQ_FROZEN_AGES (the frozen config ages.json) not set")
+    def test_frozen_age_reference_counts(self):
+        """Rule 46's registered values for the frozen ages (rule 43; config, not outcomes): M_5000 = 247
+        of 600, M_10000 = M_20000 = 0."""
+        p = os.environ["RQ_FROZEN_AGES"]
+        self.assertEqual(rqlib.sha256_file(p), "6ffb99ec4062801b68c462ab08208e8367d128ca820e0a9e84752f4403a717d5")
+        ref = common.load_age_reference(p)
+        self.assertEqual((ref["n"], ref["max_age"]), (600, 120.0))
+        self.assertEqual([common.age_feasible_count(ref["ages"], h, ref["max_age"]) for h in (5000, 10000, 20000)],
+                         [247, 0, 0])
 
 
 class TestCkpt(unittest.TestCase):
@@ -450,6 +652,781 @@ class TestStore(unittest.TestCase):
             store.pack(self.root, log=lambda m: None)
         self.assertTrue(os.path.exists(os.path.join(self.root, store.WORK, "t4", "bundle.json")))
 
+    def rewrite(self, cid, bundle):
+        """Replace cid's finished bundle, its done.json summaries and bundle hash recomputed as run.py
+        writes them (so only checks of the bundle's own content can refuse it) -> (bundle, done)."""
+        d = os.path.join(self.root, store.WORK, cid)
+        done = rqlib.read_json(os.path.join(d, "done.json"))
+        done.update(store.summary_of(bundle))
+        raw = rqlib.canonical(bundle)
+        done["bundle_sha256"] = rqlib.sha256_bytes(raw)
+        wr(os.path.join(d, "bundle.json"), raw)
+        rqlib.write_json_durable(os.path.join(d, "done.json"), done)
+        return bundle, done
+
+    def as_v3(self, cid, sc=None, horizons=(5000,)):
+        """cid's finished bundle (mk_cell) as a /3 completion: the cell names its registered horizons and
+        the score carries complete synthetic age summaries (mk_age_score) -> (bundle, done)."""
+        bundle = json.loads(rqlib.read_bytes(os.path.join(self.root, store.WORK, cid, "bundle.json")))
+        bundle["schema"] = store.BUNDLE_V3
+        bundle["cell"]["horizons"] = list(horizons)
+        bundle["score"] = sc or mk_age_score(horizons)
+        return self.rewrite(cid, bundle)
+
+    def test_age_bundle_versions_pack_and_read_unchanged(self):
+        """Old /1 and /2 bytes remain readable beside /3, with or without plan/2 sharing."""
+        expected = {}
+        for version, plan2 in ((1, False), (2, True), (3, False), (3, True)):
+            cid = f"v{version}-p{int(plan2) + 1}"
+            raw = self.mk_cell(cid, group=cid, transplant=(cid, "d" * 64) if plan2 else None)
+            if version == 3:
+                bundle, done = self.as_v3(cid)
+            else:
+                bundle = json.loads(raw)
+                bundle["schema"] = f"finfolk.redqueen.bundle/{version}"
+                bundle["score"] = {"schema": score.SCHEMA, "n_start": 1,
+                                   "horizons": [{"steps": 5000, "survivors": 1}]}
+                bundle, done = self.rewrite(cid, bundle)
+            self.assertEqual(store.completion_problems(done, bundle), [])
+            expected[cid] = rqlib.canonical(bundle)
+        store.pack(self.root, log=lambda m: None)
+        _, cells = store.load_index(self.root)
+        self.assertEqual(store.index_problems(self.root, cells), [])
+        for cid, raw in expected.items():
+            self.assertEqual(store.read_member(self.root, cid, cells=cells), raw)
+            self.assertEqual(run.find_bundle(self.root, cid), (raw, "chunk"))
+        # /3 plan/2 retains every sharing check, including the fast indexed checks.
+        b = json.loads(expected["v3-p2"])
+        done = json.loads(store.read_member(self.root, "v3-p2", "done.json", cells))
+        del b["sharing"]
+        self.assertTrue(any("sharing record" in p for p in store.completion_problems(done, b)))
+        b["cell"].pop("schema")
+        self.assertTrue(any("plan schema" in p for p in store.completion_problems(done, b)))
+        e = cells["v3-p2"][1]
+        e.pop("role")
+        self.assertTrue(any("sharing summary" in p for p in store.index_problems(self.root, cells)))
+        e["transplant_group"] = e["transplant_realized_sha256"] = None
+        with self.assertRaisesRegex(store.StoreError, "without its group"):
+            store.transplant_groups(cells)
+        del e["plan_schema"]
+        self.assertTrue(any("plan schema" in p for p in store.index_problems(self.root, cells)))
+
+    def test_v3_completion_requires_its_age_summary(self):
+        """Codex review of 870daa6, P2-3 (D8 v2 rule 48): a /3 completion of either plan version whose age
+        summary is missing, misses a registered horizon, or does not reconcile with its counts, its bundle
+        hash updated in done.json (so integrity checks cannot see it), is refused at completion
+        verification and at packing, nothing deleted; complete /3 and summary-less /1 and /2 pack."""
+        two = mk_age_score((5000, 10000), alive={5000: {7}, 10000: set()})
+        mutations = {
+            "nostrata": lambda b: b["score"]["horizons"][1].pop("age_strata"),
+            "nohorizon": lambda b: b["score"]["horizons"].pop(),
+            "unreconciled": lambda b: b["score"]["horizons"][0].update(survivors=0),
+            "badbin": lambda b: b["score"]["horizons"][0]["age_strata"]["bins"][0]["feasible"].update(n_start=0),
+            "noregistered": lambda b: b["cell"].pop("horizons"),
+            "noscore": lambda b: b.pop("score"),
+        }
+        for plan2 in (False, True):
+            for name, mutate in mutations.items():
+                cid = f"{name}-p{int(plan2) + 1}"
+                with self.subTest(cid=cid):
+                    self.mk_cell(cid, group=cid, transplant=(cid, "d" * 64) if plan2 else None)
+                    bundle, done = self.as_v3(cid, copy.deepcopy(two), (5000, 10000))
+                    self.assertEqual(store.completion_problems(done, bundle), [])
+                    mutate(bundle)
+                    bundle, done = self.rewrite(cid, bundle)
+                    probs = store.completion_problems(done, bundle)
+                    self.assertTrue(probs and all("age summary" in p for p in probs), probs)
+                    with self.assertRaisesRegex(store.StoreError, "age summary"):
+                        store.pack(self.root, ids=[cid], log=lambda m: None)
+                    self.assertTrue(os.path.exists(os.path.join(self.root, store.WORK, cid, "bundle.json")))
+                    shutil.rmtree(os.path.join(self.root, store.WORK, cid))
+        for cid, transplant in (("v1", None), ("v2", ("v2", "d" * 64))):      # (mk_cell: no score at all)
+            self.mk_cell(cid, group=cid, transplant=transplant)
+        self.mk_cell("v3", group="v3")
+        self.as_v3("v3", copy.deepcopy(two), (5000, 10000))
+        self.assertEqual(store.pack(self.root, log=lambda m: None)[1], 3)
+
+    def pack_unchecked(self):
+        """Pack every finished cell as the packers before the age-summary contract did (b83a029..870daa6:
+        the Codex re-review of 5ecffb5's scenario): no age-summary check at packing and no stamp in the
+        index entry; done.json, the chunk and its index line stay hash-consistent."""
+        real = store.completion_problems, store.age_summary_problems
+        store.completion_problems = lambda done, bundle: []
+        store.age_summary_problems = lambda bundle: []
+        try:
+            store.pack(self.root, log=lambda m: None)
+        finally:
+            store.completion_problems, store.age_summary_problems = real
+        ip = os.path.join(self.root, store.INDEX)
+        recs = [json.loads(ln) for ln in rqlib.read_text(ip).splitlines() if ln.strip()]
+        for r in recs:
+            for e in r["cells"].values():
+                e.pop("age_summary", None)
+        rqlib.write_durable(ip, b"".join(rqlib.canonical(r) for r in recs))
+
+    # (Codex re-review of 5ecffb5, P2: D8 v2 rule 48 for PACKED /3 completions)
+    PACKED_V3 = {
+        "omitted": lambda b: b["score"]["horizons"][1].pop("age_strata"),
+        "badstratum": lambda b: b["score"]["horizons"][0]["age_strata"]["bins"][0]["feasible"].update(n_start=0),
+        "complete": lambda b: None,
+    }
+
+    def packed_v3_roots(self, leftovers=False):
+        """One root per plan version x PACKED_V3 case, each holding one /3 completion (cid = case-p<plan>)
+        whose bundle (a registered horizon's summary omitted, one stratum corrupted, or complete) is
+        packed by pack_unchecked with done.json, chunk and index hash-consistent. leftovers: plus an
+        interrupted pack's state (the packed cell's working directory back, byte for byte; an
+        uncommitted chunk and its temporary; a torn index tail) and a disjoint finished cell "new"
+        -> [(cid, root, bad, snapshot)], snapshot() -> the bytes of every file in the root's work/ and
+        chunks/ (everything recover or packing may touch)."""
+        two = mk_age_score((5000, 10000), alive={5000: {7}, 10000: set()})
+        base, out = self.root, []
+        try:
+            for plan2 in (False, True):
+                for name, mutate in self.PACKED_V3.items():
+                    cid = f"{name}-p{int(plan2) + 1}"
+                    self.root = root = os.path.join(base, cid)
+                    os.makedirs(root)
+                    self.mk_cell(cid, group=cid, transplant=(cid, "d" * 64) if plan2 else None)
+                    bundle, _ = self.as_v3(cid, copy.deepcopy(two), (5000, 10000))
+                    mutate(bundle)
+                    bundle, done = self.rewrite(cid, bundle)
+                    wdir = os.path.join(root, store.WORK, cid)
+                    left = {m: rqlib.read_bytes(os.path.join(wdir, m)) for m in ("bundle.json", "done.json")}
+                    self.pack_unchecked()
+                    _, cells = store.load_index(root)
+                    e = cells[cid][1]
+                    self.assertEqual((e["bundle_schema"], e["plan_schema"], "age_summary" in e),
+                                     (store.BUNDLE_V3, bundle["cell"]["schema"], False))
+                    self.assertEqual(store.read_member(root, cid, cells=cells), left["bundle.json"])
+                    self.assertFalse(os.path.exists(wdir))
+                    if leftovers:
+                        os.makedirs(wdir)
+                        for m, raw in left.items():
+                            wr(os.path.join(wdir, m), raw)
+                        cdir = os.path.join(root, store.CHUNKS)
+                        wr(os.path.join(cdir, "chunk_000009.zip"), b"uncommitted")
+                        wr(os.path.join(cdir, "chunk_000010.zip.tmp"), b"partial")
+                        wr(os.path.join(root, store.INDEX), b'{"chunk": "chunk_000009.zip"', "ab")
+                        self.mk_cell("new", group="g-new", csha="b" * 64)
+
+                    def snapshot(root=root):
+                        return {os.path.relpath(os.path.join(dp, f), root): rqlib.read_bytes(os.path.join(dp, f))
+                                for sub in (store.WORK, store.CHUNKS)
+                                for dp, _, fs in os.walk(os.path.join(root, sub)) for f in fs}
+                    out.append((cid, root, name != "complete", snapshot))
+        finally:
+            self.root = base
+        return out
+
+    def assert_age_refused(self, cid, bad, probs, what, opened=()):
+        """A bad one's age summary is reported, a complete one's nothing (opened: assert_method_refused's)."""
+        if bad:
+            self.assertTrue(probs and any(cid in p and "age summary" in p for p in probs), (what, probs))
+        else:
+            self.assertEqual(probs, [], what)
+
+    def assert_method_refused(self, cid, bad, probs, what, opened=()):
+        """assert_age_refused, and (Codex re-review of a5c366c, P2) a bad one (stamped_v3_roots("method"))
+        is refused for its compression method, before decoding: the problem names the method, and its
+        packed bundle was never opened (`opened`: members_opened), so no decoder ran on it."""
+        self.assert_age_refused(cid, bad, probs, what)
+        if bad:
+            m = self.METHODS[cid.rsplit("-p", 1)[0]]
+            self.assertTrue(any(cid in p and f"compression method {m}," in p and "refused before decoding" in p
+                                for p in probs), (what, probs))
+            self.assertNotIn(f"{cid}/bundle.json", opened, what)
+
+    def test_packed_v3_age_summary_index_problems(self):
+        """Codex re-review of 5ecffb5, P2 (D8 v2 rule 48): a /3 completion of either plan version PACKED
+        without the age-summary check (packed_v3_roots: a registered horizon's summary omitted, or one
+        stratum corrupted, every hash consistent) is refused by index_problems, and so no cell is packed
+        beside it (nothing deleted); the complete one, packed the same way (unstamped), passes."""
+        for cid, root, bad, snap in self.packed_v3_roots():
+            with self.subTest(cid=cid):
+                self.assert_age_refused(cid, bad, store.index_problems(root), "index_problems")
+                self.root, base = root, self.root
+                try:
+                    self.mk_cell("new", group="g-new", csha="b" * 64)
+                    if bad:
+                        with self.assertRaisesRegex(store.StoreError, "cannot be extended"):
+                            store.pack(root, ids=["new"], log=lambda m: None)
+                        self.assertTrue(os.path.exists(os.path.join(root, store.WORK, "new", "bundle.json")))
+                    else:
+                        self.assertEqual(store.pack(root, ids=["new"], log=lambda m: None)[1], 1)
+                finally:
+                    self.root = base
+
+    def test_packed_v3_age_summary_verify_all(self):
+        """Codex re-review of 5ecffb5, P2: verify_all, deep or not, reports such a packed completion (the
+        chunk's size and SHA-256 are right: only the age-summary contract can see it); the complete one
+        verifies clean."""
+        for cid, root, bad, snap in self.packed_v3_roots():
+            with self.subTest(cid=cid):
+                for deep in (True, False):
+                    self.assert_age_refused(cid, bad, store.verify_all(root, deep=deep), f"verify_all deep={deep}")
+
+    def test_packed_v3_age_summary_recover_deletes_nothing(self):
+        """Codex re-review of 5ecffb5, P2: recover() checks every indexed /3 age summary BEFORE any repair,
+        cleanup or deletion. With a packed completion that fails it, recover (deep or not) returns the
+        problem, takes no action, and leaves every byte of work/ and chunks/ as it was: the packed cell's
+        leftover working directory, the uncommitted chunk and its temporary, and the torn index tail.
+        The complete one is recovered and cleaned as before."""
+        for cid, root, bad, snap in self.packed_v3_roots(leftovers=True):
+            with self.subTest(cid=cid):
+                before = snap()
+                for deep in (False, True):
+                    acts, probs = store.recover(root, log=lambda m: None, deep=deep)
+                    self.assert_age_refused(cid, bad, probs, f"recover deep={deep}")
+                    if not bad:
+                        break
+                    self.assertEqual(acts, [], deep)
+                    self.assertEqual(snap(), before, deep)
+                if not bad:
+                    self.assertFalse(os.path.exists(os.path.join(root, store.WORK, cid)))
+                    self.assertEqual(sorted(os.listdir(os.path.join(root, store.CHUNKS))),
+                                     ["chunk_000001.zip", "index.jsonl"])
+                    self.assertEqual(len([a for a in acts if "deleted the packed cell" in a]), 1, acts)
+
+    def runner_refuses(self, argv, roots=None, method=False, **label):
+        """run.main on each packed_v3_roots(leftovers) root (or each of `roots`, same shape): a bad one
+        exits 2, the operator told why on stderr and the cell named in runner.log, every byte of work/
+        and chunks/ kept; a complete one exits 0 with the leftovers cleaned and the disjoint cell packed.
+        method (stamped_v3_roots("method")): a bad one's compression method is named on stderr and in
+        runner.log, and its packed bundle was never opened (no decoder ran on it)."""
+        for cid, root, bad, snap in roots if roots is not None else self.packed_v3_roots(leftovers=True):
+            with self.subTest(cid=cid, **label):
+                before = snap()
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()), \
+                        members_opened() as opened:
+                    rc = run.main(["--root", root] + argv)
+                if not bad:
+                    self.assertEqual(rc, 0, err.getvalue())
+                    self.assertEqual(os.listdir(os.path.join(root, store.WORK)), [])
+                    self.assertIn("new", store.load_index(root)[1])
+                    continue
+                self.assertEqual(rc, 2, (argv, err.getvalue()))
+                self.assertIn("age summary", err.getvalue())
+                self.assertIn("repair or an explicit deviation record", err.getvalue())
+                self.assertEqual(snap(), before, argv)
+                self.assertIn(f"index: {cid} (packed in chunk_000001.zip)",
+                              rqlib.read_text(os.path.join(root, "runner.log")))
+                if method:
+                    m = f"compression method {self.METHODS[cid.rsplit('-p', 1)[0]]},"
+                    self.assertIn(m, err.getvalue())
+                    self.assertIn(m, rqlib.read_text(os.path.join(root, "runner.log")))
+                    self.assertNotIn(f"{cid}/bundle.json", opened, argv)
+
+    def test_packed_v3_age_summary_runner_pack_refused(self):
+        """Codex re-review of 5ecffb5, P2: run.py --pack refuses such a root (runner_refuses)."""
+        self.runner_refuses(["--pack"])
+
+    def test_packed_v3_age_summary_runner_resume_refused(self):
+        """Codex re-review of 5ecffb5, P2: resuming such a root (a plan, a binary, no disk floor) is refused
+        at the start, before anything is pinned or run (runner_refuses)."""
+        plan_p = os.path.join(self.root, "disjoint.jsonl")
+        wr(plan_p, "")
+        stub = os.path.join(self.root, "evo_boids_stub")
+        wr(stub, "#!/bin/sh\nexit 9\n")
+        self.runner_refuses(["--plan", plan_p, "--binary", stub, "--disk-min", "none"])
+
+    def test_indexed_v3_age_summary_stamp(self):
+        """(Scale; Codex re-reviews of 5ecffb5 and e82ed4e) pack() stamps each /3 entry whose age summary
+        it checked with the contract AND the SHA-256 of the exact bundle bytes checked (store.age_stamp:
+        "<contract>:<digest>"); /1 and /2 entries get no stamp (their index entries are as before) and are
+        never read for it. index_problems, which pack() runs over the whole index before every chunk, and
+        verify_all, deep or not, accept a bound stamp WITHOUT decoding its bundle, once the chunk's bytes
+        match their recorded SHA-256. An unbound stamp sends its entry to the full read (decoded and
+        checked): none, e82ed4e's bare marker, an older contract's, another entry's, the right contract
+        and digest in another shape, a suffix. With the chunk
+        moved away the stamped entries are NOT accepted from the index alone (e82ed4e accepted them: its
+        stamp vouched for bytes nobody read): only the /3 entries are reported, the /1 and /2 stay
+        index-only."""
+        two = mk_age_score((5000, 10000), alive={5000: {7}, 10000: set()})
+        for cid, transplant, v3 in (("v1", None, False), ("v2", ("v2", "d" * 64), False),
+                                    ("v3-p1", None, True), ("v3-p2", ("v3-p2", "d" * 64), True)):
+            self.mk_cell(cid, group=cid, transplant=transplant)
+            if v3:
+                self.as_v3(cid, copy.deepcopy(two), (5000, 10000))
+        self.assertEqual(store.pack(self.root, log=lambda m: None), ("chunk_000001.zip", 4))
+        recs, cells = store.load_index(self.root)
+        keys = {"bundle_sha256", "done_sha256", "row_sha256", "common_group", "common_sha256", "pair_group",
+                "prey_config_sha256", "kind", "role", "transplant_group", "transplant_realized_sha256",
+                "bundle_schema"}
+        for cid in ("v1", "v2"):
+            self.assertEqual(set(cells[cid][1]), keys, cid)
+        for cid in ("v3-p1", "v3-p2"):
+            e = cells[cid][1]
+            self.assertEqual(set(e), keys | {"plan_schema", store.AGE_SUMMARY_KEY}, cid)
+            packed = store.read_member(self.root, cid, cells=cells)
+            self.assertEqual(e[store.AGE_SUMMARY_KEY], f"{store.AGE_SUMMARY_CHECKED}:{rqlib.sha256_bytes(packed)}", cid)
+        decoded = []
+        real = store.age_summary_problems
+        store.age_summary_problems = lambda b: decoded.append(b["cell"]["id"]) or real(b)
+        try:
+            self.assertEqual(store.index_problems(self.root), [])
+            for deep in (True, False):
+                self.assertEqual(store.verify_all(self.root, deep=deep), [])
+            self.assertEqual(decoded, [])                         # the fast path decodes nothing
+            own = {cid: cells[cid][1][store.AGE_SUMMARY_KEY] for cid in ("v3-p1", "v3-p2")}
+            digest = {cid: cells[cid][1]["bundle_sha256"] for cid in ("v3-p1", "v3-p2")}
+            unbound = {"none": lambda cid: None, "e82ed4e marker": lambda cid: store.AGE_SUMMARY_CHECKED,
+                       "older contract": lambda cid: f"finfolk.redqueen.agesummary/0:{digest[cid]}",
+                       "another entry's": lambda cid: own["v3-p2" if cid == "v3-p1" else "v3-p1"],
+                       "another shape": lambda cid: {"contract": store.AGE_SUMMARY_CHECKED, "bundle_sha256": digest[cid]},
+                       "a suffix": lambda cid: own[cid] + ":x"}
+            for what, stamp in unbound.items():
+                with self.subTest(stamp=what):
+                    for cid in ("v3-p1", "v3-p2"):
+                        cells[cid][1].pop(store.AGE_SUMMARY_KEY, None)
+                        if stamp(cid) is not None:
+                            cells[cid][1][store.AGE_SUMMARY_KEY] = stamp(cid)
+                    del decoded[:]
+                    self.assertEqual(store.index_problems(self.root, cells), [])   # read and checked: complete
+                    self.assertEqual(sorted(decoded), ["v3-p1", "v3-p2"])
+            for cid in ("v3-p1", "v3-p2"):
+                cells[cid][1][store.AGE_SUMMARY_KEY] = own[cid]
+        finally:
+            store.age_summary_problems = real
+        chunk = os.path.join(self.root, store.CHUNKS, "chunk_000001.zip")
+        os.rename(chunk, chunk + ".away")         # the stamped bytes cannot be matched: no longer accepted
+        try:
+            for probs in (store.index_problems(self.root), store.index_problems(self.root, cells),
+                          store.indexed_age_problems(self.root)):
+                self.assertEqual(sorted(p.split(" ")[0] for p in probs), ["v3-p1", "v3-p2"], probs)
+                self.assertTrue(all("cannot be checked" in p and store.AGE_SUMMARY_TAG in p for p in probs), probs)
+        finally:
+            os.rename(chunk + ".away", chunk)
+        self.assertEqual(store.index_problems(self.root), [])
+
+    # (Codex re-review of e82ed4e, P2: the stamp must bind the validation result to the bundle checked)
+    STAMP_COPIED = ("copied", "marker")                 # the index edited: a stamp that is not this entry's
+    STAMP_CHANGED = ("resized", "samesize", "bitflip")  # the chunk's bytes changed after pack() stamped them
+
+    def donor_stamp(self):
+        """The stamp pack() itself writes on a complete /3 entry (packed in a scratch root): what a stamp
+        copied from a valid entry carries."""
+        base = self.root
+        self.root = tempfile.mkdtemp(dir=base)
+        try:
+            self.mk_cell("donor", group="g-donor")
+            self.as_v3("donor", mk_age_score((5000, 10000), alive={5000: {7}, 10000: set()}), (5000, 10000))
+            store.pack(self.root, log=lambda m: None)
+            return store.load_index(self.root)[1]["donor"][1][store.AGE_SUMMARY_KEY]
+        finally:
+            self.root = base
+
+    @staticmethod
+    def rewrite_chunk(root, cid, raw, same_size):
+        """chunk_000001.zip rewritten with cid's bundle.json replaced by `raw`, the index untouched (every
+        other member and the member order kept, every CRC right: only a hash can tell). same_size: written
+        at the highest compression and padded to exactly the old size with an archive comment (a change a
+        size check cannot see); otherwise of another size (a one-byte comment if it came out the same)."""
+        p = os.path.join(root, store.CHUNKS, "chunk_000001.zip")
+        size = os.path.getsize(p)
+        with zipfile.ZipFile(p) as z:
+            members = [(i.filename, z.read(i.filename)) for i in z.infolist()]
+
+        def build(comment=b""):
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w") as z:
+                for name, data in members:
+                    zi = zipfile.ZipInfo(name, date_time=store.ZIP_TIME)
+                    zi.compress_type = zipfile.ZIP_DEFLATED
+                    zi.external_attr = 0o644 << 16
+                    z.writestr(zi, raw if name == f"{cid}/bundle.json" else data,
+                               compresslevel=9 if same_size else 6)
+                z.comment = comment
+            return buf.getvalue()
+        out = build()
+        if same_size:
+            assert len(out) <= size, (len(out), size)
+            out = build(b" " * (size - len(out)))
+        elif len(out) == size:
+            out = build(b" ")
+        assert (len(out) == size) == same_size, (len(out), size, same_size)
+        wr(p, out)
+
+    @staticmethod
+    def flip_packed_bundle(root, cid):
+        """One byte in the middle of cid's packed bundle's compressed data flipped in place (bit rot: the
+        same size; the member no longer inflates to its CRC)."""
+        p = os.path.join(root, store.CHUNKS, "chunk_000001.zip")
+        with zipfile.ZipFile(p) as z:
+            i = z.getinfo(f"{cid}/bundle.json")
+        raw = bytearray(rqlib.read_bytes(p))
+        n, x = struct.unpack("<HH", raw[i.header_offset + 26:i.header_offset + 30])
+        raw[i.header_offset + 30 + n + x + i.compress_size // 2] ^= 0x55
+        wr(p, bytes(raw))
+
+    METHODS = METHODS        # (the module's: Codex re-review of a5c366c, P2)
+
+    @staticmethod
+    def set_member_method(root, cid, method, member="bundle.json"):
+        """chunk_000001.zip with the central-directory compression method of cid's `member` changed from
+        DEFLATE (8) to `method`: one byte, the size kept, the index untouched (set_chunk_member_method)."""
+        set_chunk_member_method(os.path.join(root, store.CHUNKS, "chunk_000001.zip"), f"{cid}/{member}", method)
+
+    def stamped_v3_roots(self, attack, leftovers=None):
+        """(Codex re-review of e82ed4e, P2) One root per plan version x case, each holding one /3 completion
+        (cid = case-p<plan>) that a stamp no longer vouches for. STAMP_COPIED, the index edited: its
+        bundle (PACKED_V3: a registered horizon's summary omitted, one stratum corrupted, or complete)
+        packed unchecked (pack_unchecked), then "copied": the stamp pack() wrote on a valid entry
+        (donor_stamp) copied onto its index entry; "marker": e82ed4e's bare marker (the constant alone)
+        written there. STAMP_CHANGED, the index untouched: a complete bundle packed and stamped by pack()
+        itself, then its packed bytes changed: "resized" / "samesize": replaced by the omitted or the
+        corrupted bundle (rewrite_chunk: the chunk of another size, or padded to the very same size);
+        "bitflip": one byte flipped in place (flip_packed_bundle); "method" (Codex re-review of a5c366c,
+        P2): a large, poorly compressible bundle (POOR_PAYLOAD) whose central-directory compression
+        method is then changed to one the packer never writes (set_member_method; a case per METHODS);
+        "complete": untouched. leftovers:
+        "packed" adds an interrupted pack's state (the packed cell's working directory back, byte for
+        byte; an uncommitted chunk and its temporary; a torn index tail) and a disjoint finished cell
+        "new"; "unpacked", the same without the packed cell's directory (so nothing else makes a quick
+        recovery verify that chunk in full) -> [(cid, root, bad, snapshot)] as packed_v3_roots."""
+        two = mk_age_score((5000, 10000), alive={5000: {7}, 10000: set()})
+        stamp = self.donor_stamp() if attack == "copied" else store.AGE_SUMMARY_CHECKED
+        if attack == "bitflip":
+            cases = {"bitflip": None, "complete": None}
+        elif attack == "method":
+            cases = dict.fromkeys(list(self.METHODS) + ["complete"])
+        else:
+            cases = dict(self.PACKED_V3)
+        base, out = self.root, []
+        try:
+            for plan2 in (False, True):
+                for name, mutate in cases.items():
+                    cid = f"{name}-p{int(plan2) + 1}"
+                    self.root = root = tempfile.mkdtemp(dir=base, prefix=f"{attack}-{leftovers}-{cid}-")
+                    self.mk_cell(cid, group=cid, transplant=(cid, "d" * 64) if plan2 else None,
+                                 payload=POOR_PAYLOAD if attack == "method" else "x")
+                    bundle, _ = self.as_v3(cid, copy.deepcopy(two), (5000, 10000))
+                    wdir = os.path.join(root, store.WORK, cid)
+                    chunk = os.path.join(root, store.CHUNKS, "chunk_000001.zip")
+                    if attack in self.STAMP_COPIED:
+                        mutate(bundle)
+                        self.rewrite(cid, bundle)
+                        left = {m: rqlib.read_bytes(os.path.join(wdir, m)) for m in ("bundle.json", "done.json")}
+                        self.pack_unchecked()
+                        ip = os.path.join(root, store.INDEX)
+                        recs = [json.loads(ln) for ln in rqlib.read_text(ip).splitlines() if ln.strip()]
+                        recs[0]["cells"][cid][store.AGE_SUMMARY_KEY] = copy.deepcopy(stamp)
+                        rqlib.write_durable(ip, b"".join(rqlib.canonical(r) for r in recs))
+                    else:
+                        left = {m: rqlib.read_bytes(os.path.join(wdir, m)) for m in ("bundle.json", "done.json")}
+                        self.assertEqual(store.pack(root, log=lambda m: None), ("chunk_000001.zip", 1))
+                        self.assertIn(store.AGE_SUMMARY_KEY, store.load_index(root)[1][cid][1])
+                        size = os.path.getsize(chunk)
+                        if name == "bitflip":
+                            self.flip_packed_bundle(root, cid)
+                        elif attack == "method":
+                            if name != "complete":
+                                self.set_member_method(root, cid, self.METHODS[name])
+                        elif name != "complete":
+                            mutate(bundle)
+                            self.rewrite_chunk(root, cid, rqlib.canonical(bundle), attack == "samesize")
+                        self.assertEqual(os.path.getsize(chunk) == size, attack != "resized" or name == "complete")
+                    if leftovers:
+                        if leftovers == "packed":
+                            os.makedirs(wdir)
+                            for m, raw in left.items():
+                                wr(os.path.join(wdir, m), raw)
+                        cdir = os.path.join(root, store.CHUNKS)
+                        wr(os.path.join(cdir, "chunk_000009.zip"), b"uncommitted")
+                        wr(os.path.join(cdir, "chunk_000010.zip.tmp"), b"partial")
+                        wr(os.path.join(root, store.INDEX), b'{"chunk": "chunk_000009.zip"', "ab")
+                        self.mk_cell("new", group="g-new", csha="b" * 64)
+
+                    def snapshot(root=root):
+                        return {os.path.relpath(os.path.join(dp, f), root): rqlib.read_bytes(os.path.join(dp, f))
+                                for sub in (store.WORK, store.CHUNKS)
+                                for dp, _, fs in os.walk(os.path.join(root, sub)) for f in fs}
+                    out.append((cid, root, name != "complete", snapshot))
+        finally:
+            self.root = base
+        return out
+
+    def unbound_index_problems_and_pack(self, attacks, refused, paths=("index_problems", "pack")):
+        """index_problems on each stamped_v3_roots(attack) root refuses the bad ones (`refused`: the
+        assertion, given the members opened), so pack() extends no such root (its refusal names the
+        cell; nothing packed or deleted); the complete controls pass, and pack. paths: the ones checked
+        (Codex re-review of 6407f80: "pack" alone shows pack's own refusal, not after index_problems')."""
+        for attack in attacks:
+            for cid, root, bad, snap in self.stamped_v3_roots(attack):
+                with self.subTest(attack=attack, cid=cid):
+                    if "index_problems" in paths:
+                        with members_opened() as opened:
+                            probs = store.index_problems(root)
+                        refused(cid, bad, probs, "index_problems", opened)
+                    if "pack" not in paths:
+                        continue
+                    self.root, base = root, self.root
+                    try:
+                        self.mk_cell("new", group="g-new", csha="b" * 64)
+                        if bad:
+                            with self.assertRaisesRegex(store.StoreError, "cannot be extended") as cm, \
+                                    members_opened() as opened:
+                                store.pack(root, ids=["new"], log=lambda m: None)
+                            refused(cid, bad, [str(cm.exception)], "pack", opened)
+                            self.assertTrue(os.path.exists(os.path.join(root, store.WORK, "new", "bundle.json")))
+                            self.assertEqual(sorted(os.listdir(os.path.join(root, store.CHUNKS))),
+                                             ["chunk_000001.zip", "index.jsonl"])
+                        else:
+                            self.assertEqual(store.pack(root, ids=["new"], log=lambda m: None)[1], 1)
+                    finally:
+                        self.root = base
+
+    def test_stamp_unbound_index_problems_and_pack(self):
+        """Codex re-review of e82ed4e, P2: a /3 entry whose stamp is not this entry's (copied from a valid
+        entry, or e82ed4e's bare marker) or whose packed bytes changed after stamping (of another size,
+        the same size with right CRCs, or a flipped byte) is unchecked: index_problems reads its bundle
+        and refuses the bad ones, so pack() extends no such root (nothing packed or deleted); the
+        complete controls pass, and pack (unbound_index_problems_and_pack)."""
+        self.unbound_index_problems_and_pack(self.STAMP_COPIED + self.STAMP_CHANGED, self.assert_age_refused)
+
+    def test_method_byte_index_problems(self):
+        """Codex re-review of a5c366c, P2: a stamped /3 entry (plan/1 and plan/2) whose packed bundle's
+        central-directory compression method was changed to one the packer never writes (STORED, BZIP2,
+        LZMA, Zstandard, unknown; the size kept: stamped_v3_roots("method")) is refused by index_problems
+        for that method BEFORE its bundle is decoded (never opened; a5c366c decoded it, and LZMA's
+        LZMAError escaped as a traceback); the complete control passes. (Split from the pack check, Codex
+        re-review of 6407f80: each path's old-head failure on its own.)"""
+        self.unbound_index_problems_and_pack(("method",), self.assert_method_refused, paths=("index_problems",))
+
+    def test_method_byte_pack_refused(self):
+        """Codex re-review of a5c366c, P2: pack() of a disjoint new cell into such a root (no index_problems
+        call of the test's own before it: Codex re-review of 6407f80) refuses, naming the entry, its
+        method and "refused before decoding", its bundle never opened, nothing packed or deleted (a5c366c:
+        pack's index check decoded it); the complete control packs."""
+        self.unbound_index_problems_and_pack(("method",), self.assert_method_refused, paths=("pack",))
+
+    def unbound_verify_all(self, attacks, refused):
+        """verify_all, deep or not, on each stamped_v3_roots(attack) root: a bad one's age summary is
+        reported (`refused`) and, for changed bytes, the chunk; the complete controls verify clean."""
+        for attack in attacks:
+            for cid, root, bad, snap in self.stamped_v3_roots(attack):
+                for deep in (True, False):
+                    with self.subTest(attack=attack, cid=cid, deep=deep):
+                        with members_opened() as opened:
+                            probs = store.verify_all(root, deep=deep)
+                        refused(cid, bad, probs, f"verify_all deep={deep}", opened)
+                        if bad and attack in self.STAMP_CHANGED + ("method",):
+                            self.assertTrue(any(p.startswith("chunk_000001.zip ") for p in probs), probs)
+
+    def test_stamp_unbound_verify_all(self):
+        """Codex re-review of e82ed4e, P2: verify_all, deep or not, reports such an entry's age summary
+        (and, for changed bytes, the chunk: deep or not, a chunk holding a stamped entry is hashed, so
+        the same-size change is seen too); the complete controls verify clean (unbound_verify_all)."""
+        self.unbound_verify_all(self.STAMP_COPIED + self.STAMP_CHANGED, self.assert_age_refused)
+
+    def test_method_byte_verify_all(self):
+        """Codex re-review of a5c366c, P2: verify_all, deep and quick, reports the changed chunk and the
+        entry's age summary refused for its compression method before decoding (never opened); the
+        complete control verifies clean."""
+        self.unbound_verify_all(("method",), self.assert_method_refused)
+
+    def unbound_recover_changes_nothing(self, attacks, refused, deeps=(False, True)):
+        """recover (deep or not; leftovers "packed" and "unpacked") on each stamped_v3_roots(attack)
+        root: a bad one's problem returned (`refused`), no action, every byte of work/ and chunks/ as
+        it was; the complete controls recovered and cleaned as before. deeps: the modes run, in order,
+        on each root (Codex re-review of 6407f80: one mode alone, on its own fresh roots, shows that
+        mode's refusal, not only the first failing one's)."""
+        for attack in attacks:
+            for leftovers in ("packed", "unpacked"):
+                for cid, root, bad, snap in self.stamped_v3_roots(attack, leftovers):
+                    with self.subTest(attack=attack, leftovers=leftovers, cid=cid):
+                        before = snap()
+                        for deep in deeps:
+                            with members_opened() as opened:
+                                acts, probs = store.recover(root, log=lambda m: None, deep=deep)
+                            if not bad:
+                                self.assertEqual(probs, [], f"recover deep={deep}")
+                                break
+                            after = snap()
+                            changed = sorted(k for k in set(before) | set(after) if before.get(k) != after.get(k))
+                            self.assertEqual((acts, changed), ([], []), (f"recover deep={deep}", probs))
+                            refused(cid, bad, probs, f"recover deep={deep}", opened)
+                        if not bad:
+                            self.assertFalse(os.path.exists(os.path.join(root, store.WORK, cid)))
+                            self.assertEqual(sorted(os.listdir(os.path.join(root, store.CHUNKS))),
+                                             ["chunk_000001.zip", "index.jsonl"])
+                            self.assertTrue(rqlib.read_bytes(os.path.join(root, store.INDEX)).endswith(b"}\n"))
+                            self.assertEqual(len([a for a in acts if "deleted the packed cell" in a]),
+                                             int(leftovers == "packed"), acts)
+
+    def test_stamp_unbound_recover_changes_nothing(self):
+        """Codex re-review of e82ed4e, P2: recover() checks the chunks' bytes and every age summary BEFORE
+        it repairs, removes or deletes anything. With such an entry, recover (deep or not; with the
+        packed cell's working directory back, or without it, so that only the stamp makes a quick
+        recovery hash the chunk) returns the problem, takes no action and leaves every byte of work/ and
+        chunks/ as it was: the torn index tail, the uncommitted chunk and its temporary, every working
+        directory. The complete controls are recovered and cleaned as before
+        (unbound_recover_changes_nothing)."""
+        self.unbound_recover_changes_nothing(self.STAMP_COPIED + self.STAMP_CHANGED, self.assert_age_refused)
+
+    def test_method_byte_recover_quick_changes_nothing(self):
+        """Codex re-review of a5c366c, P2: a quick recover (the packed cell's working directory back, or
+        not) on a root whose stamped /3 entry's packed bundle has a compression method the packer never
+        writes returns the age-summary problem naming that method (before decoding: never opened; a5c366c
+        raised LZMAError for LZMA), takes no action and changes no byte of work/ or chunks/; the complete
+        control is recovered and cleaned as before. (Split from the deep mode, Codex re-review of 6407f80.)"""
+        self.unbound_recover_changes_nothing(("method",), self.assert_method_refused, deeps=(False,))
+
+    def test_method_byte_recover_deep_changes_nothing(self):
+        """Codex re-review of a5c366c, P2: the same with a deep recover alone, on its own fresh roots (Codex
+        re-review of 6407f80: a5c366c's quick-mode failure used to stop the test before its deep call)."""
+        self.unbound_recover_changes_nothing(("method",), self.assert_method_refused, deeps=(True,))
+
+    def unbound_runner_refused(self, attacks, method=False):
+        """run.py --pack, a resume (a plan, a binary, no disk floor) and a --quick-resume on each
+        stamped_v3_roots(attack) root (runner_refuses; `method`: its compression-method checks)."""
+        plan_p = os.path.join(self.root, "disjoint.jsonl")
+        wr(plan_p, "")
+        stub = os.path.join(self.root, "evo_boids_stub")
+        wr(stub, "#!/bin/sh\nexit 9\n")
+        resume = ["--plan", plan_p, "--binary", stub, "--disk-min", "none"]
+        for attack in attacks:
+            for how, argv, leftovers in (("pack", ["--pack"], "packed"), ("resume", resume, "packed"),
+                                         ("quick-resume", resume + ["--quick-resume"], "unpacked")):
+                self.runner_refuses(argv, self.stamped_v3_roots(attack, leftovers), method=method, attack=attack,
+                                    how=how)
+
+    def test_stamp_unbound_runner_refused(self):
+        """Codex re-review of e82ed4e, P2: run.py --pack, a resume (a plan, a binary, no disk floor) and a
+        --quick-resume refuse such a root: exit 2 with the operator's message, the cell named in
+        runner.log, every byte of work/ and chunks/ kept (runner_refuses); the controls run."""
+        self.unbound_runner_refused(self.STAMP_COPIED + self.STAMP_CHANGED)
+
+    def test_method_byte_runner_refused(self):
+        """Codex re-review of a5c366c, P2: run.py --pack, a resume and a --quick-resume refuse a root whose
+        stamped /3 entry's packed bundle has a compression method the packer never writes: exit 2 with
+        the operator's age-summary message naming the method (stderr and runner.log), no traceback
+        (a5c366c: LZMAError out of recover), the bundle never opened, every byte of work/ and chunks/
+        kept; the complete control runs."""
+        self.unbound_runner_refused(("method",), method=True)
+
+    def test_method_byte_replay_refused(self):
+        """Codex re-review of 6407f80, P2: run.py --replay (start_replay) and the replay child's entry
+        (replay_cell: `--_replay`) on a root whose stamped /3 entry's packed bundle (plan/1 and plan/2) has
+        a compression method the packer never writes (stamped_v3_roots("method"): a large, poorly
+        compressible bundle, the size kept) refuse: exit 2, stderr naming the root, the chunk, the cell and
+        the method ("refused before decoding"), no traceback, the bundle never opened (no decoder ran on
+        it), nothing written (no --out; every byte of the root kept). (6407f80's find_bundle read it
+        ungated, before any check: LZMAError, ZstdError on 3.14 and NotImplementedError escaped as
+        tracebacks, STORED's CRC error too.) The complete control's bundle is found in its chunk, its
+        bytes the indexed ones (the engine replays of packed cells: tests/redqueen_tooling.sh)."""
+        for cid, root, bad, snap in self.stamped_v3_roots("method"):
+            _, cells = store.load_index(root)
+            if not bad:
+                with self.subTest(cid=cid):
+                    data, where = run.find_bundle(root, cid)
+                    self.assertEqual((rqlib.sha256_bytes(data), where), (cells[cid][1]["bundle_sha256"], "chunk"))
+                continue
+            m = self.METHODS[cid.rsplit("-p", 1)[0]]
+            for how in ("--replay", "--_replay"):
+                with self.subTest(cid=cid, how=how):
+                    before = tree_bytes(root)
+                    out = os.path.join(self.root, f"replay-{cid}{how.replace('-', '_')}")
+                    err = io.StringIO()
+                    with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()), \
+                            members_opened() as opened:
+                        rc = (run.main(["--root", root, "--replay", cid, "--out", out]) if how == "--replay"
+                              else run.replay_cell(root, cid, out))
+                    msg = err.getvalue()
+                    self.assertEqual(rc, 2, msg)
+                    self.assertNotIn("Traceback", msg)
+                    self.assertIn(f"cannot replay {cid}: {cid} (packed in chunk_000001.zip of {root}): its packed "
+                                  "bundle.json cannot be read (", msg)
+                    self.assertIn(f"compression method {m}, not the DEFLATE (8) pack() writes: refused before "
+                                  "decoding", msg)
+                    self.assertNotIn(f"{cid}/bundle.json", opened)
+                    self.assertFalse(os.path.exists(out))
+                    self.assertEqual(tree_bytes(root), before)
+
+    def test_method_byte_legacy_entry_refused(self):
+        """Codex re-review of a5c366c, P2 (index_problems' other reading): a legacy index entry (no bundle
+        schema: its packed bundle and done.json are read; legacy_root, with a large, poorly compressible
+        bundle) whose packed bundle has a compression method the packer never writes is reported, refused
+        before decoding (never opened), never a traceback (a5c366c: LZMAError for LZMA, NotImplementedError
+        for Zstandard before 3.14 and the unknown method), and pack() extends no such root."""
+        base = self.root
+        try:
+            for name, m in self.METHODS.items():
+                with self.subTest(method=name):
+                    self.root = tempfile.mkdtemp(dir=base, prefix=f"legacy-{name}-")
+                    self.legacy_root(payload=POOR_PAYLOAD)
+                    self.set_member_method(self.root, "old", m)
+                    with members_opened() as opened:
+                        probs = store.index_problems(self.root)
+                    self.assertTrue(any(p.startswith("old: its packed bundle cannot be checked (")
+                                        and f"compression method {m}," in p and "refused before decoding" in p
+                                        for p in probs), probs)
+                    self.assertNotIn("old/bundle.json", opened)
+                    self.mk_cell("new", group="g2", csha="b" * 64, transplant=("P.w02.t5|r00", "f" * 64))
+                    with self.assertRaisesRegex(store.StoreError, "cannot be extended"):
+                        store.pack(self.root, log=lambda s: None)
+                    self.assertTrue(os.path.exists(os.path.join(self.root, store.WORK, "new", "bundle.json")))
+        finally:
+            self.root = base
+
+    def test_method_byte_verify_chunk(self):
+        """Codex re-review of a5c366c, P2 (defence in depth): verify_chunk (pack()'s check of the chunk it
+        wrote; recover's of a chunk that matches its SHA-256 while a packed cell's working directory is
+        still there) refuses a chunk holding a member of a compression method the packer never writes,
+        naming it, before anything in the chunk is decoded (nothing opened; a5c366c's testzip decoded it:
+        LZMAError, NotImplementedError). And damaged ZIP bytes are problems, never a crash: every byte of a
+        small packed chunk's ZIP structure (local headers, central directory, end record) set to 0x00,
+        0xFF and each single-bit flip, through verify_chunk and indexed_age_problems (a5c366c's
+        verify_chunk raised NotImplementedError, RuntimeError, zlib.error)."""
+        self.mk_cell("m-p1", group="m-p1", payload=POOR_PAYLOAD)
+        self.as_v3("m-p1", mk_age_score((5000, 10000), alive={5000: {7}, 10000: set()}), (5000, 10000))
+        self.assertEqual(store.pack(self.root, log=lambda s: None), ("chunk_000001.zip", 1))
+        recs, cells = store.load_index(self.root)
+        p = os.path.join(self.root, store.CHUNKS, "chunk_000001.zip")
+        good = rqlib.read_bytes(p)
+        self.assertEqual(store.verify_chunk(p, recs[0]["cells"]), [])
+        for name, m in self.METHODS.items():
+            with self.subTest(method=name):
+                wr(p, good)                     # (each case from the chunk as packed, whatever the last one did)
+                self.set_member_method(self.root, "m-p1", m)
+                with members_opened() as opened:
+                    probs = store.verify_chunk(p, recs[0]["cells"])
+                self.assertEqual(probs, [f"m-p1/bundle.json: compression method {m}, not the DEFLATE (8) pack() "
+                                         "writes: refused before decoding"])
+                self.assertEqual(opened, [])
+        wr(p, good)
+        shutil.rmtree(os.path.join(self.root, store.CHUNKS))
+        self.mk_cell("small", group="small")
+        self.as_v3("small", mk_age_score((5000, 10000), alive={5000: {7}, 10000: set()}), (5000, 10000))
+        self.assertEqual(store.pack(self.root, log=lambda s: None), ("chunk_000001.zip", 1))
+        recs, cells = store.load_index(self.root)
+        good = rqlib.read_bytes(p)
+        payload = set()
+        with zipfile.ZipFile(p) as z:
+            for zi in z.infolist():
+                n, x = struct.unpack("<HH", good[zi.header_offset + 26:zi.header_offset + 30])
+                s = zi.header_offset + 30 + n + x
+                payload.update(range(s, s + zi.compress_size))
+        cases = [(i, v) for i in range(len(good)) if i not in payload
+                 for v in {0x00, 0xFF, *(good[i] ^ (1 << b) for b in range(8))} - {good[i]}]
+        self.assertGreater(len(cases), 1500)
+        escaped = []
+        for i, v in cases:
+            raw = bytearray(good)
+            raw[i] = v
+            wr(p, bytes(raw))
+            for what, f in (("verify_chunk", lambda: store.verify_chunk(p, recs[0]["cells"])),
+                            ("indexed_age_problems", lambda: store.indexed_age_problems(self.root, cells, sound=set()))):
+                try:
+                    f()
+                except Exception as e:  # noqa: BLE001 (any escape is the failure)
+                    escaped.append((what, i, v, f"{type(e).__name__}: {e}"))
+        wr(p, good)
+        self.assertEqual(escaped[:5], [], f"{len(escaped)} of {2 * len(cases)} calls raised")
+        self.assertEqual(store.verify_chunk(p, recs[0]["cells"]), [])
+        self.assertEqual(store.indexed_age_problems(self.root, cells, sound=set()), [])
+
     def test_v2_completions_checked(self):
         """Review of 03a608b, P2 1: packing (and resume) require a /2 completion's sharing record and
         cross-check done.json's role and transplant summary against the hash-valid bundle; a /2 bundle
@@ -495,10 +1472,10 @@ class TestStore(unittest.TestCase):
         self.assertTrue(any("realized common" in x for x in store.completion_problems(
             rqlib.read_json(os.path.join(d, "done.json")), b)))
 
-    def legacy_root(self):
+    def legacy_root(self, payload="x"):
         """A root holding a /2 completion packed before 03a608b: no sharing record in its bundle, no
-        bundle schema or transplant summary in its index entry."""
-        self.mk_cell("old", group="g1", transplant=("P.w01.t5|r00", "d" * 64), sharing=False)
+        bundle schema or transplant summary in its index entry (payload: its bundle's, mk_cell)."""
+        self.mk_cell("old", group="g1", transplant=("P.w01.t5|r00", "d" * 64), sharing=False, payload=payload)
         real = store.completion_problems
         store.completion_problems = lambda done, bundle: []
         try:
@@ -827,6 +1804,246 @@ class TestSharing(unittest.TestCase):
         self.assertEqual(cell.sharing_record(c, mk_cp(n_pred=0), {}, files)["realized"]["transplant"]["picked"], [])
 
 
+class TestAgeStrata(unittest.TestCase):
+    """Synthetic checkpoints only: start ages survive slot changes and births at the horizon."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.d = self.tmp.name
+        self.ages = [0, 11.999, 12, 23.999, 24, 35.999, 36, 40, 40.001, 47.999,
+                     48, 59.999, 60, 71.999, 72, 83.999, 84, 95.999, 96, 107.999,
+                     108, 119.999, 120]
+        self.arena = mk_cp(n_prey=len(self.ages) + 1, n_pred=0, frame=100)
+        self.arena["creatures"]["age"] = self.ages + [-1]  # a dead slot is outside the initial cohort
+        self.arena["creatures"]["alive"][-1] = 0
+
+    def write(self, horizons=(5000,), survive_ages=(0, 12, 24, 36, 40)):
+        wr(os.path.join(self.d, "arena.json"), ckpt.dumps(self.arena))
+        f0 = self.arena["world"]["frame"]
+        rows = []
+        for h in horizons:
+            cp = copy.deepcopy(self.arena)
+            cp["world"].update(frame=f0 + h, nextId=100000)
+            prey = ckpt.prey(cp, alive_only=True)
+            for r in prey:
+                r["alive"] = int(r["age"] in survive_ages)
+                r["age"] = 1.0                      # deliberately different from START ages
+            n_dead = sum(not r["alive"] for r in prey)
+            child = dict(prey[0], id=99999, lineageId=prey[0]["id"], generation=1, age=0, alive=1)
+            ckpt.set_prey(cp, list(reversed(prey + [child])))
+            cp["counters"]["totalBirths"] += 1
+            cp["counters"]["totalDeaths"] += n_dead
+            cp["counters"]["totalDeathsAge"] += n_dead
+            wr(os.path.join(self.d, f"end.{f0 + h}.json"), ckpt.dumps(cp))
+        for h in range(100, max(horizons) + 1, 100):
+            rows.append(f"{f0+h},0,0,0,0,0,0,0,0\n")
+        wr(os.path.join(self.d, "run.predators.csv"),
+           "step,predator_pop,captures_interval,births_interval,deaths_starv_interval,"
+           "deaths_age_interval,reseeds_interval,pursuit_frac,virtual_buds_interval\n" + "".join(rows))
+
+    def scored(self, horizons=(5000,), assay="frozen", fork=True):
+        return score.score(self.d, 0, max(horizons), list(horizons), 100, assay, fork=fork)
+
+    @staticmethod
+    def st(n, s):
+        return {"n_start": n, "survivors": s, "survival": s / n if n else None}
+
+    def cross(self, n, nf, s, sf=None):
+        """Expected bins: per bin its count n, feasible count nf, survivors s (sf of them feasible)."""
+        sf = s if sf is None else sf
+        return [dict(self.st(n[j], s[j]), feasible=self.st(nf[j], sf[j]), infeasible=self.st(n[j] - nf[j], s[j] - sf[j]))
+                for j in range(len(n))]
+
+    def test_bins_crossed_with_feasibility_by_start_id(self):
+        """Codex review of 870daa6, P2-2 (D8 v2 rule 48): every bin x feasibility stratum with its counts
+        and survival fraction (None for an empty denominator), the bin, feasibility and cohort totals,
+        and the identities. Feasibility is the engine's binary32 clock (P2-1): at 5k the 36-48 s bin's
+        40.001 is feasible, not only starts <= 40, and 47.999 is not."""
+        self.write()
+        bins = self.cross([2, 2, 2, 4, 2, 2, 2, 2, 2, 3], [2, 2, 2, 3, 0, 0, 0, 0, 0, 0],
+                          [1, 1, 1, 2, 0, 0, 0, 0, 0, 0])
+        for assay in ("frozen", "frozen-newborn", "live"):
+            for fork in (True, False):
+                with self.subTest(assay=assay, fork=fork):
+                    sc = self.scored(assay=assay, fork=fork)
+                    h = sc["horizons"][0]
+                    a = h["age_strata"]
+                    self.assertEqual(a["bins"], bins)
+                    self.assertEqual((a["feasible"], a["infeasible"]), (self.st(9, 5), self.st(14, 0)))
+                    self.assertEqual({k: a[k] for k in ("n_start", "survivors", "survival")}, self.st(23, 5))
+                    self.assertEqual({k: a[k] for k in ("schema", "steps", "frame", "max_age_s", "dt_s", "age_clock",
+                                                        "bin_edges_s", "bin_convention")},
+                                     {"schema": score.AGE_STRATA_SCHEMA, "steps": 5000, "frame": 5100,
+                                      "max_age_s": self.arena["config"]["maxAge"], "dt_s": score.DT,
+                                      "age_clock": common.AGE_CLOCK, "bin_edges_s": list(range(0, 121, 12)),
+                                      "bin_convention": score.AGE_BINS})
+                    self.assertEqual(score.age_strata_problems(sc, [5000]), [])
+                    self.assertEqual((sc["n_start"], h["survivors"], h["prey"]), (23, 5, 24))
+
+    def test_boundary_survivor_on_the_engine_clock(self):
+        """Codex review of 870daa6, P2-1 (D8 v2 rule 46): prey that start just over 40 s and are alive at
+        5k are age-feasible on the engine's binary32 clock; the exact-arithmetic cutoff refused the cell."""
+        self.write(survive_ages=(0, 12, 24, 36, 40, 40.001))
+        a = self.scored()["horizons"][0]["age_strata"]
+        self.assertEqual(a["bins"][3], dict(self.st(4, 3), feasible=self.st(3, 3), infeasible=self.st(1, 0)))
+        self.assertEqual((a["feasible"], a["infeasible"]), (self.st(9, 6), self.st(14, 0)))
+        # rule 46's own example as a scored start age
+        self.ages = [36.0, 40.00001907348633, 44.0]
+        self.arena = mk_cp(n_prey=3, n_pred=0, frame=100)
+        self.arena["creatures"]["age"] = list(self.ages)
+        self.write(survive_ages=(36.0, 40.00001907348633))
+        a = self.scored()["horizons"][0]["age_strata"]
+        self.assertEqual(a["bins"][3], dict(self.st(3, 2), feasible=self.st(2, 2), infeasible=self.st(1, 0)))
+
+    def test_review_example_bin_crossing(self):
+        """The review's example: start ages 36, 40, 44 at 5k, only 36 alive: the 36-48 s bin's feasible
+        stratum is 2 / 1 / 0.5 and its infeasible one 1 / 0 / 0.0; empty strata have survival None."""
+        a = score.age_strata({1: 36.0, 2: 40.0, 3: 44.0}, {1}, 120.0, 5000, 5100, score.DT, 3, 1)
+        self.assertEqual(a["bins"][3], dict(self.st(3, 1), feasible=self.st(2, 1), infeasible=self.st(1, 0)))
+        empty = dict(self.st(0, 0), feasible=self.st(0, 0), infeasible=self.st(0, 0))
+        self.assertEqual(a["bins"][:3] + a["bins"][4:], [empty] * 9)
+        self.assertEqual((a["feasible"], a["infeasible"]), (self.st(2, 1), self.st(1, 0)))
+
+    def test_horizon_specific_feasibility_and_empty_strata(self):
+        self.write(horizons=(7500, 10000, 20000), survive_ages=())
+        sc = self.scored((7500, 10000, 20000))
+        for h, n in zip(sc["horizons"], (1, 0, 0)):
+            a = h["age_strata"]
+            self.assertEqual((a["feasible"], a["infeasible"]), (self.st(n, 0), self.st(23 - n, 0)))
+            self.assertEqual(a["bins"], self.cross([2, 2, 2, 4, 2, 2, 2, 2, 2, 3], [n] + [0] * 9, [0] * 10))
+        self.assertEqual(score.age_strata_problems(sc, [7500, 10000, 20000]), [])
+        # Empty initial cohort remains a complete ten-bin partition with zero counts and no fractions.
+        self.arena["creatures"]["alive"] = [0] * len(self.arena["creatures"]["alive"])
+        wr(os.path.join(self.d, "arena.json"), ckpt.dumps(self.arena))
+        end = copy.deepcopy(self.arena)
+        end["world"]["frame"] += 5000
+        wr(os.path.join(self.d, "end.5100.json"), ckpt.dumps(end))
+        p = os.path.join(self.d, "run.predators.csv")
+        wr(p, "\n".join(rqlib.read_text(p).splitlines()[:51]) + "\n")
+        h = self.scored()["horizons"][0]
+        a = h["age_strata"]
+        self.assertEqual(h["survivors"], 0)
+        self.assertEqual(a["bins"], self.cross([0] * 10, [0] * 10, [0] * 10))
+        self.assertEqual((a["n_start"], a["survival"], a["feasible"], a["infeasible"]),
+                         (0, None, self.st(0, 0), self.st(0, 0)))
+
+    def test_actual_max_age_and_step_constant(self):
+        """The clock uses the arena's maxAge and score.DT: with maxAge 60 and a 0.024 s step, 1,000 frames
+        leave 35.9 feasible and 40 infeasible (at 0.016 s, 40 would be feasible; at maxAge 120, both)."""
+        from unittest.mock import patch
+        self.ages = [0, 12, 24, 35.9, 40, 60]
+        self.arena = mk_cp(n_prey=6, n_pred=0, frame=100, cfg_extra={"maxAge": 60})
+        self.arena["creatures"]["age"] = self.ages
+        self.write(horizons=(1000,), survive_ages=(0, 12, 24, 35.9))
+        with patch.object(score, "DT", 0.024):
+            sc = self.scored((1000,))
+            self.assertEqual(score.age_strata_problems(sc, [1000]), [])
+        a = sc["horizons"][0]["age_strata"]
+        self.assertEqual((sc["dt"], a["dt_s"], a["max_age_s"]), (0.024, 0.024, 60))
+        self.assertEqual((a["feasible"], a["infeasible"]), (self.st(4, 4), self.st(2, 0)))
+        self.assertEqual(a["bins"][3]["infeasible"], self.st(1, 0))                     # 40
+        self.assertTrue(all(b["n_start"] == 0 for b in a["bins"][6:]))
+
+    def test_missing_invalid_or_out_of_range_start_age_refused(self):
+        original = copy.deepcopy(self.arena)
+        for ages in (None, [], self.ages[:-1], [None] + self.ages[1:] + [-1],
+                     [-0.001] + self.ages[1:] + [-1], [120.001] + self.ages[1:] + [-1],
+                     [float("nan")] + self.ages[1:] + [-1], [float("inf")] + self.ages[1:] + [-1],
+                     [True] + self.ages[1:] + [-1]):
+            with self.subTest(ages=ages):
+                self.arena = copy.deepcopy(original)
+                if ages is None:
+                    del self.arena["creatures"]["age"]
+                else:
+                    self.arena["creatures"]["age"] = ages
+                wr(os.path.join(self.d, "arena.json"), json.dumps(self.arena))
+                with self.assertRaisesRegex(score.ScoreError, "start age"):
+                    self.scored()
+        self.arena = original
+        for max_age in (None, -1, True, "120", float("nan"), float("inf")):
+            with self.subTest(max_age=max_age):
+                self.arena["config"]["maxAge"] = max_age
+                wr(os.path.join(self.d, "arena.json"), json.dumps(self.arena))
+                with self.assertRaisesRegex(score.ScoreError, "config.maxAge"):
+                    self.scored()
+        self.arena["config"]["maxAge"] = 240
+        self.arena["creatures"]["age"][0] = 121
+        wr(os.path.join(self.d, "arena.json"), ckpt.dumps(self.arena))
+        with self.assertRaisesRegex(score.ScoreError, "fixed diagnostic bins"):
+            self.scored()
+
+    def test_infeasible_survivor_refused_at_each_horizon(self):
+        for h in (5000, 10000, 20000):
+            with self.subTest(h=h):
+                self.write(horizons=(h,), survive_ages=(120,))
+                with self.assertRaisesRegex(score.ScoreError, "age-infeasible"):
+                    self.scored((h,))
+
+    def test_strata_must_reconcile_with_the_scorer(self):
+        for n, s in ((2, 1), (1, 0)):
+            with self.subTest(n=n, s=s), self.assertRaisesRegex(score.ScoreError, "not the scorer's"):
+                score.age_strata({7: 0.0}, {7}, 120.0, 5000, 5100, score.DT, n, s)
+
+    def test_contract_guards_refuse_independently(self):
+        """Codex review of 870daa6 (test effectiveness, P2-2, P2-3): each guard of the age-summary
+        contract (the one completion verification and ingestion apply) refuses its own corruption of an
+        otherwise complete summary; most corruptions trip that guard alone."""
+        good = mk_age_score((5000, 10000), ages=(0.0, 36.0, 44.0, 119.0), alive={5000: {7, 8}, 10000: set()})
+        self.assertEqual(score.age_strata_problems(good, [5000, 10000]), [])
+        a0 = lambda s: s["horizons"][0]["age_strata"]  # noqa: E731
+
+        def infeasible_survivor(s):          # consistent counts everywhere, but an age-infeasible prey alive
+            a = a0(s)
+            a["bins"][9]["infeasible"].update(survivors=1, survival=1.0)
+            a["bins"][9].update(survivors=1, survival=1.0)
+            a["infeasible"].update(survivors=1, survival=0.5)
+            a.update(survivors=3, survival=0.75)
+            s["horizons"][0]["survivors"] = 3
+
+        def moved_between_bins(s):           # bin totals still sum to the cohort, not to their own strata
+            a = a0(s)
+            a["bins"][3].update(n_start=1, survival=1.0)
+            a["bins"][9].update(n_start=2, survival=0.0)
+
+        cases = [  # (message, corruption, the only problem?)
+            ("the score has no horizon records", lambda s: s["horizons"].clear(), True),
+            ("no age_strata", lambda s: s["horizons"][1].pop("age_strata"), True),
+            ("registered horizons", lambda s: s["horizons"].pop(), True),
+            ("keys differ", lambda s: a0(s).pop("bin_convention"), True),
+            ("keys differ", lambda s: a0(s).update(feasible_start_age_max_s=40.0), True),
+            ("schema", lambda s: a0(s).update(schema="finfolk.redqueen.agestrata/0"), True),
+            ("age predicate", lambda s: a0(s).update(age_clock="exact a + H dt"), True),
+            ("steps / frame", lambda s: a0(s).update(frame=1), True),
+            ("dt", lambda s: a0(s).update(dt_s=0.017), True),
+            ("not a finite age", lambda s: a0(s).update(max_age_s=float("nan")), True),
+            ("fixed 12-second", lambda s: a0(s)["bin_edges_s"].append(132), True),
+            ("ten bins", lambda s: a0(s)["bins"].pop(), True),
+            ("not a bin x feasibility record", lambda s: a0(s)["bins"][0].pop("infeasible"), False),
+            ("is not survivors / n_start", lambda s: a0(s)["bins"][3]["feasible"].update(survival=0.5), True),
+            ("None when n_start is 0", lambda s: a0(s)["bins"][1].update(survival=0.0), True),
+            ("is not survivors / n_start", lambda s: a0(s)["bins"][0]["feasible"].update(survival=True), True),
+            ("0 <= survivors <= n_start", lambda s: a0(s)["bins"][0]["feasible"].update(survivors=2), False),
+            ("0 <= survivors <= n_start", lambda s: a0(s)["bins"][0].update(n_start=True), False),
+            ("feasible + infeasible n_start is not the bin's", moved_between_bins, False),
+            ("is not the sum of its bins", lambda s: a0(s).update(feasible={"n_start": 1, "survivors": 1,
+                                                                             "survival": 1.0}), True),
+            ("not the scorer's", lambda s: s["horizons"][0].update(survivors=1), False),
+            ("not the scorer's", lambda s: s.update(n_start=5), False),
+            ("age-infeasible initial prey survived", infeasible_survivor, True),
+        ]
+        for msg, corrupt, alone in cases:
+            with self.subTest(msg=msg):
+                s = copy.deepcopy(good)
+                corrupt(s)
+                probs = score.age_strata_problems(s, [5000, 10000])
+                self.assertTrue(any(msg in p for p in probs), probs)
+                if alone:
+                    self.assertEqual(len(probs), 1, probs)
+        self.assertEqual(score.age_strata_problems(None), ["the score has no horizon records"])
+        self.assertTrue(any("not an object" in p for p in score.age_strata_problems({"horizons": [3]})))
+
+
 class TestFork(unittest.TestCase):
     """Review round 2, P2-5: a predator-free continuation with predators, captures, births or refills
     at any time is refused."""
@@ -930,6 +2147,8 @@ class TestScripted(unittest.TestCase):
         s = self.score()
         h = s["horizons"][0]
         self.assertEqual((h["captures"], h["deaths_predation"], h["survivors"], h["predators"]), (2, 2, 4, 3))
+        self.assertEqual(h["age_strata"]["feasible"], {"n_start": 6, "survivors": 4, "survival": 4 / 6})
+        self.assertEqual(score.age_strata_problems(s, [200]), [])
         self.assertAlmostEqual(h["predator_seconds"], 3 * 200 * score.DT)
         self.assertEqual((s["scripted"], s["checks"]["rows"], s["checks"]["predation_deaths_equal_captures"]),
                          (True, None, "by construction (scripted)"))

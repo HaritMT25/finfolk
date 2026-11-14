@@ -1083,7 +1083,9 @@ class TestCollect(unittest.TestCase):
         pick = rows[:3]
 
         def bundle(r, n=600):
-            return {"cell": r, "score": {"n_start": n, "horizons": [{"steps": h, "survivors": 400, "captures": 50}
+            return {"schema": "finfolk.redqueen.bundle/2", "cell": r,
+                    "score": {"n_start": n, "horizons": [{"steps": h, "survivors": 400 if h == 5000 else 0,
+                                                         "captures": 50}
                                                                      for h in nb.HORIZONS]}}
 
         def study(bundles):
@@ -1091,7 +1093,10 @@ class TestCollect(unittest.TestCase):
             shutil.rmtree(root, ignore_errors=True)
             os.makedirs(os.path.join(root, store.CHUNKS))
             cells = {}
-            with zipfile.ZipFile(os.path.join(root, store.CHUNKS, "c0001.zip"), "w") as z:
+            # (Codex re-review of 6407f80, P2) compressed as pack() writes chunks (store.PACK_METHOD, DEFLATE):
+            # collection now refuses any other method before decoding (store.read_packed)
+            with zipfile.ZipFile(os.path.join(root, store.CHUNKS, "c0001.zip"), "w",
+                                 compression=store.PACK_METHOD) as z:
                 for cid, bd in bundles.items():
                     data = json.dumps(bd).encode()
                     z.writestr(f"{cid}/bundle.json", data)
@@ -1103,6 +1108,53 @@ class TestCollect(unittest.TestCase):
         doc = nb.collect(study({r["id"]: bundle(r) for r in pick}), d, pp, rest)
         self.assertEqual(len(doc["observations"]), 3)
         self.assertEqual(sorted(doc["observations"][0]["horizons"]), ["10000", "20000", "5000"])
+        # Collection reads legacy bundles without diagnostics and /3 bundles identically (the same
+        # observation bytes); D8 v2 rule 48 at ingestion (Codex review of 870daa6, P2-3): the /3 age
+        # summaries go to the separately versioned diagnostics output, where /1 and /2 bundles are
+        # explicitly unavailable, and a /3 bundle without a complete summary is refused.
+        import score
+
+        def v3(r):
+            b = bundle(r)
+            b["schema"] = "finfolk.redqueen.bundle/3"
+            b["score"]["dt"] = score.DT
+            start = dict.fromkeys(range(600), 0.0)
+            for h in b["score"]["horizons"]:
+                alive = set(range(400)) if h["steps"] == 5000 else set()
+                h["frame"] = 1000 + h["steps"]
+                h["age_strata"] = score.age_strata(start, alive, 120.0, h["steps"], h["frame"], score.DT, 600,
+                                                   len(alive))
+            return b
+        newer = {r["id"]: v3(r) for r in pick}
+        got, ages = nb.collect_with_age_diagnostics(study(newer), d, pp, rest)
+        self.assertEqual(rqlib.canonical(got), rqlib.canonical(doc))
+        self.assertEqual(nb.collect(study(newer), d, pp, rest), doc)
+        self.assertEqual((ages["schema"], ages["observations_sha256"], ages["missing"], ages["available"],
+                          ages["unavailable"]), (store.AGE_DIAGNOSTICS_SCHEMA, rqlib.canonical_sha(doc), rest, 3, 0))
+        for c in ages["cells"]:
+            self.assertEqual(c["horizons"], {str(h["steps"]): h["age_strata"]
+                                             for h in newer[c["cell"]]["score"]["horizons"]})
+        _, old = nb.collect_with_age_diagnostics(study({r["id"]: bundle(r) for r in pick}), d, pp, rest)
+        self.assertEqual((old["available"], old["unavailable"]), (0, 3))
+        self.assertTrue(all(not c["available"] and "predates" in c["reason"] and "horizons" not in c
+                            for c in old["cells"]))
+        for corrupt in (lambda b: b["score"]["horizons"][2].pop("age_strata"),       # a missing summary
+                        lambda b: b["score"]["horizons"].pop(),                        # a registered horizon
+                        lambda b: b["score"]["horizons"][0].update(survivors=399)):    # unreconciled
+            broken = {r["id"]: v3(r) for r in pick}
+            corrupt(broken[pick[1]["id"]])
+            with self.assertRaisesRegex(nb.NoiseBankError, "age summary"):
+                nb.collect(study(broken), d, pp, rest)
+        # the CLI writes the diagnostics only where asked, beside the unchanged observations
+        dp, op, ap = (os.path.join(self.tmp, x) for x in ("design.json", "obs.json", "age_diagnostics.json"))
+        rqlib.write_json_durable(dp, d)
+        args = ["collect", "--study", study(newer), "--design", dp, "--plan", pp, "--declare-missing", *rest,
+                "--out", op]
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(nb.main(args), 0)
+            self.assertFalse(os.path.exists(ap))
+            self.assertEqual(nb.main(args + ["--age-diagnostics", ap]), 0)
+        self.assertEqual((rqlib.read_json(op), rqlib.read_json(ap)), (doc, ages))
         with self.assertRaises(nb.NoiseBankError):
             nb.collect(study({r["id"]: bundle(r) for r in pick}), d, pp)                      # (undeclared missing)
         with self.assertRaises(nb.NoiseBankError):
@@ -1111,6 +1163,110 @@ class TestCollect(unittest.TestCase):
         bad["score"] = {"n_start": 600, "horizons": [{"steps": 5000, "survivors": 1, "captures": 1}]}
         with self.assertRaises(nb.NoiseBankError):
             nb.collect(study({pick[0]["id"]: bad}), d, pp, sorted(set(rest) | {r["id"] for r in pick[1:]}))
+
+    def test_method_byte_collect_refused(self):
+        """Codex re-review of 6407f80, P2: collection reads every indexed bundle (a cell's design is recorded
+        only inside it) through store.read_packed. A packed bundle whose central-directory compression method
+        is one the packer never writes (test_redqueen.METHODS: STORED, BZIP2, LZMA, Zstandard, unknown; a
+        large, poorly compressible bundle, the size kept) refuses the WHOLE collection, whether it is a cell
+        of this plan ("plan") or another design's (a plan/1 cell, "p1"; a plan/2 cell of another design,
+        "p2": never skipped, its design being in the unreadable bundle). collect raises NoiseBankError naming
+        the root, the chunk, the cell, the method ("refused before decoding") and whose cell it is; the CLI
+        exits 2 with that one line, no traceback, writing neither --out nor --age-diagnostics; the bundle is
+        never opened (no decoder ran on it) and every byte of the root is kept. (6407f80 decoded it: LZMAError,
+        ZstdError on 3.14 and NotImplementedError escaped as tracebacks; a CRC or bzip2 error was an exit 2
+        naming no cell.) The controls (every member DEFLATE) collect, a foreign cell skipped: the same
+        observations as without it."""
+        import store
+        import zipfile
+        from test_redqueen import METHODS, POOR_PAYLOAD, members_opened, set_chunk_member_method, tree_bytes
+        d = nb.make_design(block(self.root), [self.f["t.json"]], self.f["ages.json"], [self.f["prod.json"]],
+                           validation_dir=self.root, arena="a", main_registries=[self.f["main"]])
+        rows, _, _ = plan.expand_v2(d, pending=True)
+        for r in rows:
+            for k in nb.HASHED:
+                if isinstance(r.get(k), dict) and r[k].get("path"):
+                    r[k]["sha256"] = rqlib.sha256_bytes(f"{k}|{r[k]['path']}".encode())
+        pp, dp = os.path.join(self.tmp, "plan.jsonl"), os.path.join(self.tmp, "design.json")
+        plan.write_plan(rows, pp)
+        rqlib.write_json_durable(dp, d)
+        pick = rows[:3]
+        rest = sorted({r["id"] for r in rows} - {r["id"] for r in pick})
+        foreign = {"p1": lambda cid: {"id": cid, "schema": "finfolk.redqueen.plan/1", "kind": "assay"},
+                   "p2": lambda cid: {"id": cid, "schema": plan.PLAN_SCHEMA_V2, "kind": "assay",
+                                      "design": "another-design"}}
+
+        def bundle(cell_, payload="x"):
+            return {"schema": "finfolk.redqueen.bundle/2", "cell": cell_, "payload": payload,
+                    "score": {"n_start": 600, "horizons": [{"steps": h, "survivors": 400 if h == 5000 else 0,
+                                                            "captures": 50} for h in nb.HORIZONS]}}
+
+        def study(whose, name):
+            """The picked cells packed DEFLATE as pack() writes chunks (plus whose's foreign cell), the target's
+            bundle large and poorly compressible, then (name != "complete") its method byte set -> (root, target)."""
+            root = os.path.join(self.tmp, f"study-{whose}-{name}")
+            os.makedirs(os.path.join(root, store.CHUNKS))
+            target = pick[1]["id"] if whose == "plan" else f"{name}-{whose}"
+            bundles = {r["id"]: bundle(r, POOR_PAYLOAD if r["id"] == target else "x") for r in pick}
+            if whose != "plan":
+                bundles[target] = bundle(foreign[whose](target), POOR_PAYLOAD)
+            chunk, cells = os.path.join(root, store.CHUNKS, "chunk_000001.zip"), {}
+            with zipfile.ZipFile(chunk, "w", compression=store.PACK_METHOD) as z:
+                for cid in sorted(bundles):
+                    data = json.dumps(bundles[cid]).encode()
+                    z.writestr(f"{cid}/bundle.json", data)
+                    cells[cid] = {"bundle_sha256": rqlib.sha256_bytes(data)}
+            with open(os.path.join(root, store.INDEX), "w") as f:
+                f.write(json.dumps({"chunk": "chunk_000001.zip", "cells": cells}) + "\n")
+            if name != "complete":
+                set_chunk_member_method(chunk, f"{target}/bundle.json", METHODS[name])
+            return root, target
+        ref = nb.collect(study("plan", "complete")[0], d, pp, rest)
+        self.assertEqual(len(ref["observations"]), 3)
+        bound = nb.bind_plan(d, pp)
+
+        def bind(design, plan_path):        # (the binding is upstream of the reads under test: bound once)
+            self.assertEqual((rqlib.canonical(design), plan_path), (rqlib.canonical(d), pp))
+            return bound
+        for whose, name in [(w, n) for w in ("plan", "p1", "p2") for n in METHODS] + [("p1", "complete"),
+                                                                                    ("p2", "complete")]:
+            root, target = study(whose, name)
+            if name == "complete":
+                with self.subTest(cid=target), mock.patch.object(nb, "bind_plan", bind):
+                    self.assertEqual(nb.collect(root, d, pp, rest), ref)        # (intact: the foreign cell skipped)
+                continue
+            before = tree_bytes(root)
+            m = METHODS[name]
+            with mock.patch.object(nb, "bind_plan", bind):
+                with self.subTest(cid=target, method=name, whose=whose, path="collect"):
+                    with members_opened() as opened, self.assertRaises(nb.NoiseBankError) as cm:
+                        nb.collect(root, d, pp, rest)
+                    msg = str(cm.exception)
+                    self.assertIn(f"collection refused: {target} (packed in chunk_000001.zip of {root}): its packed "
+                                  "bundle.json cannot be read (", msg)
+                    self.assertIn(f"compression method {m}, not the DEFLATE (8) pack() writes: refused before "
+                                  "decoding", msg)
+                    self.assertIn("(a cell of this plan)" if whose == "plan" else "not one of this plan's cell ids",
+                                  msg)
+                    self.assertNotIn(f"{target}/bundle.json", opened)
+                    self.assertEqual(tree_bytes(root), before)
+                with self.subTest(cid=target, method=name, whose=whose, path="cli"):
+                    op, ap = (os.path.join(self.tmp, f"{x}-{whose}-{name}.json") for x in ("obs", "ages"))
+                    err = io.StringIO()
+                    with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()), \
+                            members_opened() as opened:
+                        rc = nb.main(["collect", "--study", root, "--design", dp, "--plan", pp, "--declare-missing",
+                                      *rest, "--out", op, "--age-diagnostics", ap])
+                    self.assertEqual(rc, 2, err.getvalue())
+                    self.assertNotIn("Traceback", err.getvalue())
+                    self.assertTrue(err.getvalue().startswith(
+                        f"noisebank.py collect: collection refused: {target} (packed in chunk_000001.zip of {root}): "),
+                        err.getvalue())
+                    self.assertIn(f"compression method {m}, not the DEFLATE (8) pack() writes", err.getvalue())
+                    self.assertEqual(err.getvalue().count("\n"), 1, err.getvalue())
+                    self.assertNotIn(f"{target}/bundle.json", opened)
+                    self.assertFalse(os.path.exists(op) or os.path.exists(ap))
+                    self.assertEqual(tree_bytes(root), before)
 
 
 

@@ -71,10 +71,13 @@ subprocesses, never multiprocessing, so Python 3.10 to 3.14 behave the same):
   * packing: whenever --chunk-size finished cells are waiting, and at every exit, they are packed
     (store.pack: written, verified, committed, then deleted; a challenge and its predator-free
     control must show the same arena prey settings, and one common group one common checkpoint);
-    at start store.recover() repairs and fsyncs the index, verifies the committed chunks (in full
-    where a packed cell's working directory remains; --quick-resume: the others by size), checks
-    every leftover bundle, and only then deletes those leftovers; any failure keeps them all and
-    exits 1;
+    at start store.recover() checks, read-only and before it repairs, removes or deletes anything:
+    the committed chunks (in full where a packed cell's working directory remains; by SHA-256,
+    and with --quick-resume by size only for chunks without a stamped /3 entry), every indexed /3
+    completion's complete age summary (store.indexed_age_problems, D8 v2 rule 48) and every
+    leftover bundle; only then does it repair and fsync the index, delete uncommitted chunks and
+    delete those leftovers. A failure repairs and deletes nothing: exit 2 for a /3 completion
+    without a verifiable complete age summary, otherwise exit 1;
   * signals: SIGINT / SIGTERM to the runner stop every worker's process group: SIGTERM, bounded
     polling for RQ_KILL_GRACE seconds (20), then SIGKILL (which also ends a SIGSTOPped worker),
     then bounded reaps; exit 130. Workers forward signals to their engine. Every child (worker or
@@ -85,7 +88,9 @@ subprocesses, never multiprocessing, so Python 3.10 to 3.14 behave the same):
     binary, the tool versions it ran (from the store when they are no longer pinned) and its
     sources (registered path, else the store), and compares the new bundle with the recorded one
     byte for byte (replay.json; exit 0 identical, 8 different). The replayed checkpoints stay
-    there: that is how a deleted state comes back.
+    there: that is how a deleted state comes back. A packed bundle that cannot be read as pack()
+    wrote it (store.read_packed: e.g. a compression method pack() never writes, refused before
+    decoding) is exit 2 with the root, chunk and cell named, before anything is written.
 """
 from __future__ import annotations
 
@@ -528,7 +533,11 @@ def run_cell(root, cid, link=False):
 
 # ---------------------------------------------------------------- replay
 def find_bundle(root, cid):
-    data = store.read_member(root, cid, "bundle.json")
+    """cid's finished bundle -> (bytes, "chunk" | "work") or (None, None). (Codex re-review of 6407f80, P2) A
+    packed one is read through store.read_packed: one that cannot be read as pack() wrote it (a compression
+    method pack() never writes, refused before decoding; damaged bytes; a mismatch with the index) raises
+    store.StoreError naming the root, chunk and cell (the replay refuses: exit 2), never a codec's own."""
+    data = store.read_packed(root, cid, "bundle.json")
     if data is not None:
         return data, "chunk"
     p = os.path.join(root, store.WORK, cid)
@@ -544,7 +553,11 @@ def find_bundle(root, cid):
 def replay_cell(root, cid, out):
     """Child (the right tool versions): rerun cid into out, compare -> 0 identical, 8 different."""
     import cell as cell_mod
-    data, where = find_bundle(root, cid)
+    try:
+        data, where = find_bundle(root, cid)
+    except store.StoreError as e:
+        print(f"cannot replay {cid}: {e}; nothing was replayed", file=sys.stderr)
+        return 2
     if data is None:
         print(f"{cid}: no finished cell of that id in {root}", file=sys.stderr)
         return 2
@@ -594,7 +607,11 @@ def start_replay(root, cid, out):
     if os.path.isdir(out) and os.listdir(out):
         print(f"--out {out} must be an empty directory", file=sys.stderr)
         return 2
-    data, _ = find_bundle(root, cid)
+    try:        # (Codex re-review of 6407f80, P2: before --out or a child exists; the child reads the same bundle)
+        data, _ = find_bundle(root, cid)
+    except store.StoreError as e:
+        print(f"cannot replay {cid}: {e}; nothing was replayed or written", file=sys.stderr)
+        return 2
     if data is None:
         print(f"{cid}: no finished cell of that id in {root}", file=sys.stderr)
         return 2
@@ -789,6 +806,20 @@ def _main(argv, files):
         log(f"recover failed: {e}")
         return 1
     if probs:
+        # (Codex re-review of 5ecffb5, P2) an indexed /3 completion without its complete age summary:
+        # recover() repaired and deleted nothing; the operator is told why, and nothing is resumed
+        age = [p for p in probs if store.AGE_SUMMARY_TAG in p]
+        if age:
+            for p in age[:10]:
+                log(f"index: {p}")
+            other = [p for p in probs if store.AGE_SUMMARY_TAG not in p]
+            if other:      # (Codex re-review of e82ed4e) e.g. the chunk whose changed bytes unbound the stamps
+                log(f"committed chunks damaged or inconsistent (working copies kept): {other[:5]}")
+            n = len({p.split(" ", 1)[0] for p in age})
+            print(f"{root}: {n} packed /3 completions without a verifiable complete age summary (D8 v2 rule 48; "
+                  f"{age[0]}): a recording omission requiring repair or an explicit deviation record, not zero "
+                  "survival; nothing was repaired, deleted or resumed", file=sys.stderr)
+            return 2
         log(f"committed chunks damaged or inconsistent (working copies kept): {probs[:5]}")
         return 1
     # (review of d4dc4b7, P2 1) EVERY indexed cell, whatever plan extends the root: a /2 completion
@@ -850,7 +881,8 @@ def _main(argv, files):
                 print(f"cell {r['id']}: packed without the /2 sharing records or with another role (a completion "
                       "before 03a608b): a /2 study is rerun in a new root, not resumed", file=sys.stderr)
                 return 2
-            continue
+            continue      # (a packed /3: its age summary was checked at start: store.recover, index_problems,
+            #              each matching the bytes behind a bound stamp or reading the bundle in full)
         if r["id"] in fin:
             dn = fin[r["id"]]
             if dn.get("row_sha256") != rs:
@@ -861,8 +893,9 @@ def _main(argv, files):
             if rqlib.sha256_bytes(raw) != dn["bundle_sha256"]:
                 print(f"cell {r['id']}: its bundle.json no longer matches done.json", file=sys.stderr)
                 return 1
-            if v2:
-                probs = store.completion_problems(dn, json.loads(raw))
+            b = json.loads(raw)
+            if v2 or b.get("schema") == store.BUNDLE_V3:     # (/3: its age summary, D8 v2 rule 48)
+                probs = store.completion_problems(dn, b)
                 if probs:
                     print(f"cell {r['id']}: {'; '.join(probs)}", file=sys.stderr)
                     return 2

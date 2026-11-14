@@ -2,7 +2,7 @@
 # redqueen_worlds.sh — tools/redqueen/worlds.py end to end against the real engine (serial build),
 # on tiny worlds (200 prey, 24,000 steps, a checkpoint every 4,000), plus its unit tests.
 #
-#   tests/redqueen_worlds.sh PATH/TO/evo_boids WORKDIR        (env: PYTHON, default python3)
+#   tests/redqueen_worlds.sh PATH/TO/evo_boids WORKDIR        (env: PYTHON; RQ_TEST_WORKERS, default 3)
 #
 #   1. register: deterministic bytes; one block of C, A and B; both floors passed as explicit
 #      zeros; refusals (placeholder, a floor, an omitted floor); an existing registry is never
