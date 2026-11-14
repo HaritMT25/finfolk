@@ -564,25 +564,26 @@ def capture_scale(V, zrep, R, nu0=None):
     (nu0 + R - 1) with phi as above (unchanged definition; V_e and zrep_e both empirical-logit variances), and
     w_e = (1 / v~_e) / mean(1 / v~), unit = 1 / (R mean(1 / v~)), so unit / w_e = v~_e / R exactly. nu0 None
     (full pooling, planning, numerical) is exactly the rule above. nu0 needs V (refused without it).
-    The nu0 branch follows A_design_v5 clarification 2 (Revisions 1 and 2, implementation note). v~_e = a (phi V_e)
-    + (1 - a) zrep_e, the algebraically identical form, with a = nu0 / (nu0 + R - 1) and 1 - a = (R - 1) / (nu0 + R
-    - 1) each formed from the ratio that cannot overflow: nu0 >= R - 1: r = (R - 1) / nu0, a = 1 / (1 + r), 1 - a =
-    r / (1 + r); nu0 < R - 1: r = nu0 / (R - 1), a = r / (1 + r), 1 - a = 1 / (1 + r) (the reciprocal form alone
-    overflowed to a = 0 for a very small nu0). A SUBNORMAL nu0 (below 2^-1022; the loaders accept it) would make
-    that r subnormal itself (fewer significant bits; 0 for nu0 <= 2^-1073 at R = 6), so it goes through an exact
-    power-of-two scale (Revision 2): nu0' = nu0 2^k with the fixed k = 64 (nu0' is normal for every subnormal nu0),
-    r' = nu0' / (R - 1), the prior term a (phi V_e) = (r' (phi V_e)) 2^-k / (1 + r) with r = r' 2^-k (1 + r rounds
-    to 1 here) and 1 - a = 1 / (1 + r); a normal nu0 keeps the form above byte for byte. mean(1 / v~), w and unit
-    are formed with an exact power-of-two scale s (s <= min v~ < 2 s, y = s / v~ in (0, 1], mean(1 / v~) = mean(y)
-    / s, w = y / mean(y), unit = s / (R mean(y))): 1 / v~ itself is never formed, so a tiny v~ or many cells cannot
-    overflow an intermediate (bit-identical to the unscaled form when neither has a subnormal or overflowing
-    intermediate). Every positive finite nu0, subnormal ones included, thus gives the formula's value wherever that
-    value is representable (no cap on nu0, no variance floor). Its domain (clarification 2, D3): V and zrep are
-    validated RAW, before main's 1e-8 floor of V (a non-finite V, -inf included, or zrep is refused; finite values
-    then take the floor exactly as before); a data set with no replicate variance in any cell (phi = 0, so every
-    v~_e = 0 and the inverse-variance weights are undefined) is refused with that context, never floored and never
-    fully pooled instead; and phi, every v~_e, mean(1 / v~), every w_e and unit must be finite and positive (refused
-    otherwise: a quantity outside the float range). nu0 None: main's code and bytes (the floor first, no check)."""
+    The nu0 branch is evaluated IN LOGARITHMS (A_design_v5 clarification 2, Revision 4, "Log-space evaluation", which
+    supersedes the float arithmetic of Revisions 1-3), so no intermediate (phi V, v~, 1 / v~, mean(1 / v~)) is ever
+    formed as a float: none can overflow, underflow or cause a refusal. With n cells, l(x) = log x (log 0 = -inf),
+    lae = logaddexp and lse(x) = m + log sum e^(x - m) with m = max x and a pairwise sum (np.sum): l_D = lae(
+    l(nu0), l(R - 1)), l_a = l(nu0) - l_D, l_ac = l(R - 1) - l_D (a = nu0 / (nu0 + R - 1), ac = 1 - a); l_phi =
+    lse(l(zrep_e) - l(V_e)) - log n; l(v~_e) = lae(l_a + l_phi + l(V_e), l_ac + l(zrep_e)); l_M = lse(-l(v~_e)) - log
+    n (M = mean(1 / v~)); returned: phi = e^l_phi, w_e = e^(-l(v~_e) - l_M), unit = e^(-log R - l_M). The accuracy
+    contract (Revision 4, item 3): each returned quantity is within 1e-10 relative of the formula's exact value on
+    the floored float inputs (a subnormal one: 1e-10 relative + 2^-1074); no byte requirement against the float
+    forms. The refusal rule (item 4): refused if and only if a RETURNED quantity's computed logarithm is outside the
+    float range, above log(largest finite float) or below log 2^-1075 (the value rounds to zero); in floats, in
+    range is log 2^-1075 < l <= log(largest float), both float logarithms lying below the true values (by 1.4e-14
+    and 2.4e-14), so this is exactly "not below" and "not above", and e^l is then positive and finite. Within a
+    factor e^(+-1e-10) of an edge either outcome is allowed (the indeterminate band). Its domain (clarification 2,
+    D3; Revision 4, item 1): V and zrep are validated RAW, before main's 1e-8 floor of V (a non-finite V, -inf
+    included, a non-finite zrep or a negative replicate variance is refused; finite values then take the floor
+    exactly as before); a data set with no replicate variance in any cell (phi = 0, so every v~_e = 0 and the
+    inverse-variance weights are undefined) is refused with that context, never floored and never fully pooled
+    instead. No cap on nu0 (subnormal ones included) and no variance floor. nu0 None: main's code and bytes (the
+    floor first, no check)."""
     nu0 = _check_nu0(nu0)
     zrep = np.asarray(zrep, float)
     if V is None:
@@ -593,6 +594,9 @@ def capture_scale(V, zrep, R, nu0=None):
     if nu0 is not None and not (np.all(np.isfinite(np.asarray(V, float))) and np.all(np.isfinite(zrep))):
         raise ValueError("capture_scale: a non-finite value in V or zrep (checked raw, before the 1e-8 floor of V): "
                          "the nu0 shrinkage is refused (A_design_v5 clarification 2, D3)")
+    if nu0 is not None and np.any(zrep < 0.0):
+        raise ValueError("capture_scale: a negative replicate variance in zrep (checked raw, before the 1e-8 floor of "
+                         "V): the nu0 shrinkage is refused (A_design_v5 clarification 2, Revision 4)")
     V = np.maximum(np.asarray(V, float), 1e-8)
     if nu0 is None:
         M = float(np.mean(1.0 / V))
@@ -602,37 +606,32 @@ def capture_scale(V, zrep, R, nu0=None):
         raise ValueError("capture_scale: every replicate variance is zero (phi = 0), so every shrunk cell variance "
                          "v~ is 0 and the inverse-variance weights are undefined: the nu0 shrinkage is refused, not "
                          "floored (A_design_v5 clarification 2, D3)")
-    phi = float(np.mean(zrep / V))
-    k = None
-    if nu0 >= R - 1:                     # (each from the ratio that cannot overflow, r <= 1: clar. 2 Revision 1)
-        r = (R - 1) / nu0
-        a, ac = 1.0 / (1.0 + r), r / (1.0 + r)           # (a = nu0 / (nu0 + R - 1), ac = 1 - a)
-    elif nu0 >= 2.0 ** -1022:            # (a normal nu0)
-        r = nu0 / (R - 1)
-        a, ac = r / (1.0 + r), 1.0 / (1.0 + r)
-    else:                                # (a SUBNORMAL nu0: an exact power-of-two scale, clar. 2 Revision 2)
-        k = 64
-        rk = nu0 * 2.0 ** k / (R - 1)                     # (r' = nu0' / (R - 1), nu0' = nu0 2^k exact and normal)
-        r = rk * 2.0 ** -k                                # (r = r' 2^-k, so 1 + r rounds to 1)
-        ac = 1.0 / (1.0 + r)                              # (ac = 1 - a)
+    n = len(V)
+
+    def lse(x):                          # (log sum e^x = m + log sum e^(x - m), m = max x; numpy's pairwise sum)
+        m = float(np.max(x))
+        return m + math.log(float(np.sum(np.exp(x - m))))
     with np.errstate(divide="ignore", over="ignore", invalid="ignore", under="ignore"):
-        if k is None:
-            vt = a * (phi * V) + ac * zrep
-        else:                                             # (a (phi V) = (r' (phi V)) 2^-k / (1 + r))
-            vt = (rk * (phi * V)) * 2.0 ** -k / (1.0 + r) + ac * zrep
-        vmin = float(np.min(vt))
-        s = math.ldexp(1.0, math.frexp(vmin)[1] - 1) if math.isfinite(vmin) and vmin > 0.0 else 1.0
-        y = s / vt                                        # (= s / v~ in (0, 1] for v~ > 0: 1 / v~ = y / s)
-        my = float(np.mean(y))
-        Mt = my / s                                       # (mean(1 / v~))
-        w = y / my
-        unit = s / (R * my) if math.isfinite(my) and my > 0.0 else math.nan
-    if not (math.isfinite(phi) and phi > 0.0 and np.all(np.isfinite(vt)) and np.all(vt > 0.0) and math.isfinite(Mt)
-            and Mt > 0.0 and np.all(np.isfinite(w)) and np.all(w > 0.0) and math.isfinite(unit) and unit > 0.0):
-        raise ValueError(f"capture_scale: a derived quantity of the nu0 shrinkage is not finite and positive (phi "
-                         f"{phi!r}, v~ in [{float(np.min(vt))!r}, {float(np.max(vt))!r}], mean(1 / v~) {Mt!r}, unit "
-                         f"{unit!r}): refused (A_design_v5 clarification 2, D3)")
-    return w, unit, phi
+        lV, lz = np.log(V), np.log(zrep)                  # (V >= 1e-8 after the floor; log 0 = -inf: a zero cell)
+        l0, lR = math.log(nu0), float(np.log(np.float64(R - 1)))
+        lD = float(np.logaddexp(l0, lR))                  # (log (nu0 + R - 1))
+        la, lac = l0 - lD, lR - lD                        # (log a, log (1 - a))
+        lphi = lse(lz - lV) - math.log(n)
+        lvt = np.logaddexp(la + lphi + lV, lac + lz)      # (log v~_e)
+        lM = lse(-lvt) - math.log(n)                      # (log mean(1 / v~))
+        lw = -lvt - lM
+        lunit = -math.log(R) - lM
+    lo, hi = -1075.0 * math.log(2.0), math.log(float(np.finfo(np.float64).max))   # (log 2^-1075, log of the largest)
+    bad = [f"{lab} (log {float(x)!r})" for lab, x in (("phi", lphi), ("unit", lunit)) if not lo < x <= hi]
+    out = np.flatnonzero(~((lw > lo) & (lw <= hi)))
+    bad += [f"w of cell {int(e)} (V {float(V[e])!r}, zrep {float(zrep[e])!r}; log {float(lw[e])!r})" for e in out[:3]]
+    if bad:
+        more = f"; and {len(out) - 3} more w" if len(out) > 3 else ""
+        raise ValueError(f"capture_scale: a returned quantity of the nu0 shrinkage is outside the float range (its "
+                         f"logarithm not in (log 2^-1075, log of the largest float] = ({lo!r}, {hi!r}]: "
+                         f"{'; '.join(bad)}{more}): refused (A_design_v5 clarification 2, Revision 4)")
+    with np.errstate(under="ignore"):
+        return np.exp(lw), math.exp(lunit), math.exp(lphi)
 
 
 def pair_variance(r, s2, grid=200, iters=200, full=False):
