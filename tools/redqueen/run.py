@@ -88,7 +88,9 @@ subprocesses, never multiprocessing, so Python 3.10 to 3.14 behave the same):
     binary, the tool versions it ran (from the store when they are no longer pinned) and its
     sources (registered path, else the store), and compares the new bundle with the recorded one
     byte for byte (replay.json; exit 0 identical, 8 different). The replayed checkpoints stay
-    there: that is how a deleted state comes back.
+    there: that is how a deleted state comes back. A packed bundle that cannot be read as pack()
+    wrote it (store.read_packed: e.g. a compression method pack() never writes, refused before
+    decoding) is exit 2 with the root, chunk and cell named, before anything is written.
 """
 from __future__ import annotations
 
@@ -531,7 +533,11 @@ def run_cell(root, cid, link=False):
 
 # ---------------------------------------------------------------- replay
 def find_bundle(root, cid):
-    data = store.read_member(root, cid, "bundle.json")
+    """cid's finished bundle -> (bytes, "chunk" | "work") or (None, None). (Codex re-review of 6407f80, P2) A
+    packed one is read through store.read_packed: one that cannot be read as pack() wrote it (a compression
+    method pack() never writes, refused before decoding; damaged bytes; a mismatch with the index) raises
+    store.StoreError naming the root, chunk and cell (the replay refuses: exit 2), never a codec's own."""
+    data = store.read_packed(root, cid, "bundle.json")
     if data is not None:
         return data, "chunk"
     p = os.path.join(root, store.WORK, cid)
@@ -547,7 +553,11 @@ def find_bundle(root, cid):
 def replay_cell(root, cid, out):
     """Child (the right tool versions): rerun cid into out, compare -> 0 identical, 8 different."""
     import cell as cell_mod
-    data, where = find_bundle(root, cid)
+    try:
+        data, where = find_bundle(root, cid)
+    except store.StoreError as e:
+        print(f"cannot replay {cid}: {e}; nothing was replayed", file=sys.stderr)
+        return 2
     if data is None:
         print(f"{cid}: no finished cell of that id in {root}", file=sys.stderr)
         return 2
@@ -597,7 +607,11 @@ def start_replay(root, cid, out):
     if os.path.isdir(out) and os.listdir(out):
         print(f"--out {out} must be an empty directory", file=sys.stderr)
         return 2
-    data, _ = find_bundle(root, cid)
+    try:        # (Codex re-review of 6407f80, P2: before --out or a child exists; the child reads the same bundle)
+        data, _ = find_bundle(root, cid)
+    except store.StoreError as e:
+        print(f"cannot replay {cid}: {e}; nothing was replayed or written", file=sys.stderr)
+        return 2
     if data is None:
         print(f"{cid}: no finished cell of that id in {root}", file=sys.stderr)
         return 2

@@ -1093,7 +1093,10 @@ class TestCollect(unittest.TestCase):
             shutil.rmtree(root, ignore_errors=True)
             os.makedirs(os.path.join(root, store.CHUNKS))
             cells = {}
-            with zipfile.ZipFile(os.path.join(root, store.CHUNKS, "c0001.zip"), "w") as z:
+            # (Codex re-review of 6407f80, P2) compressed as pack() writes chunks (store.PACK_METHOD, DEFLATE):
+            # collection now refuses any other method before decoding (store.read_packed)
+            with zipfile.ZipFile(os.path.join(root, store.CHUNKS, "c0001.zip"), "w",
+                                 compression=store.PACK_METHOD) as z:
                 for cid, bd in bundles.items():
                     data = json.dumps(bd).encode()
                     z.writestr(f"{cid}/bundle.json", data)

@@ -23,7 +23,8 @@ STUDY/chunks/index.jsonl                one line per COMMITTED chunk: its file, 
 Pack protocol (pack()): (1) every candidate cell's bundle.json re-hashed against its done.json;
 (2) the chunk written as a temporary file, fsync'd, renamed, the directory fsync'd; (3) the chunk
 re-read: every member's compression method (DEFLATE, PACK_METHOD: any other is refused before it
-is decoded, here and in every check), zip CRCs, and every member's SHA-256 against its record;
+is decoded, here, in every check and by every reader: read_member, and read_packed for collection
+and replay), zip CRCs, and every member's SHA-256 against its record;
 (4) the index line appended and fsync'd (the commit point); (5) only then the cells' working
 directories deleted and work/ fsync'd. recover() (at every runner start) undoes a crash at any point, but first checks,
 read-only: the committed chunks (in full where a packed cell's working directory is still there;
@@ -384,7 +385,9 @@ AGE_SUMMARY_CHECKED = "finfolk.redqueen.agesummary/1"     # the contract's versi
 # packer since 58c9592): a member whose central directory names any other compression method (a damaged
 # byte: STORED, BZIP2, LZMA, Python 3.14's Zstandard, or one zipfile does not know) is refused BEFORE a
 # decoder runs on it (packed_member; verify_chunk refuses its chunk), so validation never hands chunk
-# bytes to a decoder the packer does not use.
+# bytes to a decoder the packer does not use. (Codex re-review of 6407f80, P2) Nor does any consumer:
+# read_member is always gated, and collection and replay read through read_packed, whose damaged
+# members are a StoreError naming the root, chunk and cell (a refusal, never a codec's traceback).
 PACK_METHOD = zipfile.ZIP_DEFLATED
 
 
@@ -633,8 +636,8 @@ def index_problems(root, cells=None):
                 probs.append(f"{cid}: a plan/2 completion indexed without its sharing summary")
             continue
         try:        # (Codex re-review of a5c366c, P2: refused before decoding; damaged bytes, never a crash)
-            b = json.loads(read_member(root, cid, "bundle.json", cells, packed_only=True))
-            d = json.loads(read_member(root, cid, "done.json", cells, packed_only=True))
+            b = json.loads(read_member(root, cid, "bundle.json", cells))
+            d = json.loads(read_member(root, cid, "done.json", cells))
         except UNREADABLE + (StoreError,) as x:
             probs.append(f"{cid}: its packed bundle cannot be checked ({x})")
             continue
@@ -806,21 +809,54 @@ def verify_chunk(path, entries):
     return probs
 
 
-def read_member(root, cid, member="bundle.json", cells=None, packed_only=False):
-    """A packed cell's member bytes, checked against the index -> bytes (or None if not packed).
-    packed_only (validation: index_problems): a member not compressed as pack() writes it raises
-    zipfile.BadZipFile before it is decoded (packed_member)."""
+def read_member(root, cid, member="bundle.json", cells=None):
+    """A packed cell's member bytes, checked against the index -> bytes (or None if not packed). A
+    member not compressed as pack() writes it raises zipfile.BadZipFile before it is decoded
+    (packed_member), on every path (Codex re-review of 6407f80, P2: there is no ungated read); other
+    damaged bytes raise one of UNREADABLE, a member that does not match the index StoreError
+    (consumers: read_packed)."""
     if cells is None:
         _, cells = load_index(root)
     if cid not in cells:
         return None
     rec, e = cells[cid]
     with zipfile.ZipFile(os.path.join(root, CHUNKS, rec["chunk"])) as z:
-        data = packed_member(z, f"{cid}/{member}") if packed_only else z.read(f"{cid}/{member}")
+        data = packed_member(z, f"{cid}/{member}")
     key = "bundle_sha256" if member == "bundle.json" else "done_sha256"
     if rqlib.sha256_bytes(data) != e[key]:
         raise StoreError(f"{cid}/{member} in {rec['chunk']} does not match the index")
     return data
+
+
+def read_packed(root, cid, member="bundle.json", cells=None):
+    """read_member for the store's consumers (noise-bank and reference-selection collection, replay:
+    Codex re-review of 6407f80, P2) -> bytes (or None if not packed). A packed member that cannot be
+    read as pack() wrote it (a compression method pack() never writes, refused before decoding;
+    damaged bytes, UNREADABLE; bytes that do not match the index) raises StoreError naming the root,
+    the chunk and the cell, never a codec's or zipfile's own exception."""
+    if cells is None:
+        _, cells = load_index(root)
+    if cid not in cells:
+        return None
+    try:
+        return read_member(root, cid, member, cells)
+    except UNREADABLE + (StoreError,) as x:
+        raise StoreError(f"{cid} (packed in {cells[cid][0].get('chunk')} of {root}): its packed {member} "
+                         f"cannot be read ({x})") from x
+
+
+def collect_refusal(err, in_plan):
+    """A collection's refusal (noisebank / refsel collect) of an indexed bundle read_packed cannot read
+    (`err`; in_plan: its cell id is one of the final plan's) -> the operator's message. The WHOLE
+    collection is refused, never the cell skipped, even one of another design (Codex re-review of
+    6407f80, P2): a collector reads every indexed bundle because a cell's design is recorded only
+    inside it, so an unreadable one may be a cell of this design (in the plan, or one the plan does not
+    hold, which the collector must refuse), and skipping it would leave a silent gap (D8 v2 rule 48: an
+    omission needs a repair or an explicit deviation record)."""
+    whose = ("a cell of this plan" if in_plan else "not one of this plan's cell ids, but its design is recorded "
+             "only in the bundle that cannot be read, so it is not skipped")
+    return (f"collection refused: {err} ({whose}); nothing was written: the chunk needs a repair or an "
+            "explicit deviation record")
 
 
 def verify_all(root, deep=True):

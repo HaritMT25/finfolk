@@ -538,13 +538,23 @@ def collect(study, design, plan_path, declared_missing=()):
 def collect_with_age_diagnostics(study, design, plan_path, declared_missing=()):
     """collect's observations (the same bytes) and, separately versioned, the collected cells'
     age-stratified diagnostics (D8 v2 rule 48; store.age_diagnostics_doc). A /3 bundle without its
-    complete age summary is refused; a /1 or /2 bundle's diagnostics are explicitly unavailable."""
+    complete age summary is refused; a /1 or /2 bundle's diagnostics are explicitly unavailable.
+    (Codex re-review of 6407f80, P2) Every indexed bundle is read through store.read_packed: one that
+    cannot be read (a compression method pack() never writes, refused before decoding; damaged bytes; a
+    mismatch with the index) refuses the WHOLE collection, naming the root, chunk and cell, whatever its
+    design: its design is inside the unreadable bundle, so it is never skipped (store.collect_refusal)."""
     import store
     rows, plan_sha = bind_plan(design, plan_path)
-    _, cells = store.load_index(study)
+    try:
+        _, cells = store.load_index(study)
+    except store.StoreError as e:
+        raise RefselError(f"study {study}: its chunk index cannot be read ({e})")
     obs, ages = [], []
     for cid in sorted(cells):
-        b = json.loads(store.read_member(study, cid, cells=cells))
+        try:
+            b = json.loads(store.read_packed(study, cid, cells=cells))
+        except store.StoreError as e:
+            raise RefselError(store.collect_refusal(e, cid in rows))
         c = b["cell"]
         if c.get("design") != design.get("name"):
             continue
