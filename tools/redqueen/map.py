@@ -564,17 +564,20 @@ def capture_scale(V, zrep, R, nu0=None):
     (nu0 + R - 1) with phi as above (unchanged definition; V_e and zrep_e both empirical-logit variances), and
     w_e = (1 / v~_e) / mean(1 / v~), unit = 1 / (R mean(1 / v~)), so unit / w_e = v~_e / R exactly. nu0 None
     (full pooling, planning, numerical) is exactly the rule above. nu0 needs V (refused without it).
-    The nu0 branch follows A_design_v5 clarification 2 (Revision 1, implementation note). v~_e = a (phi V_e) + (1 -
-    a) zrep_e, the algebraically identical form, with a = nu0 / (nu0 + R - 1) and 1 - a = (R - 1) / (nu0 + R - 1)
-    each formed from the ratio that cannot overflow: nu0 >= R - 1: r = (R - 1) / nu0, a = 1 / (1 + r), 1 - a = r /
-    (1 + r); nu0 < R - 1: r = nu0 / (R - 1), a = r / (1 + r), 1 - a = 1 / (1 + r) (the reciprocal form alone
-    overflowed to a = 0 for a very small nu0). mean(1 / v~), w and unit are formed with an exact power-of-two scale s
-    (s <= min v~ < 2 s, y = s / v~ in (0, 1], mean(1 / v~) = mean(y) / s, w = y / mean(y), unit = s / (R mean(y))):
-    1 / v~ itself is never formed, so a tiny v~ or many cells cannot overflow an intermediate (bit-identical to the
-    unscaled form when neither has a subnormal or overflowing intermediate). Every nu0 from the smallest normal float
-    up thus gives the formula's value wherever that value is representable (no cap on nu0, no variance floor; a
-    SUBNORMAL nu0, which the loaders accept, makes r = nu0 / (R - 1) subnormal itself, so a carries fewer
-    significant bits: the prescribed form, kept as written). Its domain (clarification 2, D3): V and zrep are
+    The nu0 branch follows A_design_v5 clarification 2 (Revisions 1 and 2, implementation note). v~_e = a (phi V_e)
+    + (1 - a) zrep_e, the algebraically identical form, with a = nu0 / (nu0 + R - 1) and 1 - a = (R - 1) / (nu0 + R
+    - 1) each formed from the ratio that cannot overflow: nu0 >= R - 1: r = (R - 1) / nu0, a = 1 / (1 + r), 1 - a =
+    r / (1 + r); nu0 < R - 1: r = nu0 / (R - 1), a = r / (1 + r), 1 - a = 1 / (1 + r) (the reciprocal form alone
+    overflowed to a = 0 for a very small nu0). A SUBNORMAL nu0 (below 2^-1022; the loaders accept it) would make
+    that r subnormal itself (fewer significant bits; 0 for nu0 <= 2^-1073 at R = 6), so it goes through an exact
+    power-of-two scale (Revision 2): nu0' = nu0 2^k with the fixed k = 64 (nu0' is normal for every subnormal nu0),
+    r' = nu0' / (R - 1), the prior term a (phi V_e) = (r' (phi V_e)) 2^-k / (1 + r) with r = r' 2^-k (1 + r rounds
+    to 1 here) and 1 - a = 1 / (1 + r); a normal nu0 keeps the form above byte for byte. mean(1 / v~), w and unit
+    are formed with an exact power-of-two scale s (s <= min v~ < 2 s, y = s / v~ in (0, 1], mean(1 / v~) = mean(y)
+    / s, w = y / mean(y), unit = s / (R mean(y))): 1 / v~ itself is never formed, so a tiny v~ or many cells cannot
+    overflow an intermediate (bit-identical to the unscaled form when neither has a subnormal or overflowing
+    intermediate). Every positive finite nu0, subnormal ones included, thus gives the formula's value wherever that
+    value is representable (no cap on nu0, no variance floor). Its domain (clarification 2, D3): V and zrep are
     validated RAW, before main's 1e-8 floor of V (a non-finite V, -inf included, or zrep is refused; finite values
     then take the floor exactly as before); a data set with no replicate variance in any cell (phi = 0, so every
     v~_e = 0 and the inverse-variance weights are undefined) is refused with that context, never floored and never
@@ -600,14 +603,23 @@ def capture_scale(V, zrep, R, nu0=None):
                          "v~ is 0 and the inverse-variance weights are undefined: the nu0 shrinkage is refused, not "
                          "floored (A_design_v5 clarification 2, D3)")
     phi = float(np.mean(zrep / V))
+    k = None
     if nu0 >= R - 1:                     # (each from the ratio that cannot overflow, r <= 1: clar. 2 Revision 1)
         r = (R - 1) / nu0
         a, ac = 1.0 / (1.0 + r), r / (1.0 + r)           # (a = nu0 / (nu0 + R - 1), ac = 1 - a)
-    else:
+    elif nu0 >= 2.0 ** -1022:            # (a normal nu0)
         r = nu0 / (R - 1)
         a, ac = r / (1.0 + r), 1.0 / (1.0 + r)
+    else:                                # (a SUBNORMAL nu0: an exact power-of-two scale, clar. 2 Revision 2)
+        k = 64
+        rk = nu0 * 2.0 ** k / (R - 1)                     # (r' = nu0' / (R - 1), nu0' = nu0 2^k exact and normal)
+        r = rk * 2.0 ** -k                                # (r = r' 2^-k, so 1 + r rounds to 1)
+        ac = 1.0 / (1.0 + r)                              # (ac = 1 - a)
     with np.errstate(divide="ignore", over="ignore", invalid="ignore", under="ignore"):
-        vt = a * (phi * V) + ac * zrep
+        if k is None:
+            vt = a * (phi * V) + ac * zrep
+        else:                                             # (a (phi V) = (r' (phi V)) 2^-k / (1 + r))
+            vt = (rk * (phi * V)) * 2.0 ** -k / (1.0 + r) + ac * zrep
         vmin = float(np.min(vt))
         s = math.ldexp(1.0, math.frexp(vmin)[1] - 1) if math.isfinite(vmin) and vmin > 0.0 else 1.0
         y = s / vt                                        # (= s / v~ in (0, 1] for v~ > 0: 1 / v~ = y / s)
