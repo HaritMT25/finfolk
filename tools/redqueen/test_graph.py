@@ -2418,9 +2418,11 @@ T610_TWO_EXT = [(((-8.0, -4.0, 4.0, 8.0), (-8.0, -6.0, -2.0, 8.0), 0.0, 1.0), 0.
 # infeasible at real cell counts): the nu0 branch is evaluated in LOGARITHMS under an accuracy CONTRACT -- every
 # returned quantity (phi, every w_e, unit) within 1e-10 relative of the formula's exact value on the floored float
 # inputs, a subnormal one within 1e-10 relative + 2^-1074 -- and refused if and only if a returned quantity's computed
-# logarithm is outside the float range (above log of the largest float, below log 2^-1075), with an INDETERMINATE BAND:
-# within a factor e^(+-1e-10) of either edge a return and a refusal are both acceptable. Intermediates (phi V, v~,
-# mean(1 / v~)) never refuse; there is no byte requirement against any earlier round.
+# logarithm is outside the float range (above log of the largest float, at or below log 2^-1075), with an INDETERMINATE
+# BAND: within a factor e^(+-1e-10) of either edge a return and a refusal are both acceptable. Intermediates (phi V, v~,
+# mean(1 / v~)) never refuse; there is no byte requirement against any earlier round. Revision 4a (Codex's spec review):
+# every successful return is finite and STRICTLY POSITIVE (in the band a refusal after the conversion to binary64 is
+# allowed too); no intermediate representability check at all (item 0).
 NU0_SETS = {
     "codex_large": ([0.5, 0.25], [2.0, 1.0]),
     "codex_small": ([1.0, 0.001], [0.0, 1.0]),
@@ -2474,8 +2476,9 @@ def nu0_fmt(q):
 
 def nu0_err(x, q):
     """A returned float x against its exact value q > 0 (Revision 4's accuracy contract): (|x - q| / q, |x - q| / the
-    allowance 1e-10 q, + 2^-1074 when q is subnormal); (inf, inf) if x is not a finite float."""
-    if not (isinstance(x, float) and math.isfinite(x)):
+    allowance 1e-10 q, + 2^-1074 when q is subnormal); (inf, inf) if x is not a finite, STRICTLY POSITIVE float
+    (Revision 4a, item 4: a returned 0 fails even where the allowance would cover it)."""
+    if not (isinstance(x, float) and math.isfinite(x) and x > 0.0):
         return math.inf, math.inf
     d = abs(Fraction(x) - q)
     a = NU0_TOL * q + (NU0_TINY if q < NU0_MINN else 0)
@@ -2483,13 +2486,14 @@ def nu0_err(x, q):
 
 
 def nu0_point(cs, V, zrep, R, nu0):
-    """One point of the nu0 shrinkage's Revision 4 contract (A_design_v5 clarification 2, "Log-space evaluation"):
+    """One point of the nu0 shrinkage's Revision 4 / 4a contract (A_design_v5 clarification 2, "Log-space evaluation"):
     capture_scale (cs) against exact rationals (nu0_exact). The RETURNED quantities (phi, unit, every w_e;
     intermediates never count) are classed by nu0_class and the point takes the first of U, B, S, N that any of them
-    has. U: cs must refuse it, by the range rule ('outside the float range'); B: a return or a range refusal; N and S:
-    cs must return it. Whatever cs returns must meet the accuracy contract, every quantity within its allowance
-    (nu0_err). -> (class, the U / B reasons or the S quantities, failure text or None, (the largest relative error over
-    the normal quantities, the largest error / allowance over all; 0 when refused), cs's result or None)."""
+    has. U: cs must refuse it, by the range rule ('outside the float range'); B: a return or a range refusal (before
+    or after the conversion to binary64); N and S: cs must return it. Whatever cs returns must be finite, strictly
+    positive and meet the accuracy contract, every quantity within its allowance (nu0_err). -> (class, the U / B
+    reasons or the S quantities, failure text or None, (the largest relative error over the normal quantities, the
+    largest error / allowance over all; 0 when refused), cs's result or None)."""
     phi, vt, mt, fw, funit, mult = nu0_exact(V, zrep, R, nu0)
     cells = list(zip(np.maximum(np.asarray(V, float), 1e-8).tolist(), np.asarray(zrep, float).tolist()))
     qs = [("phi", phi), ("unit", funit)] + [(f"w of cell {k}", q) for k, q in fw.items()]
@@ -2519,7 +2523,7 @@ def nu0_point(cs, V, zrep, R, nu0):
     rel = max([e[0] for e, lab, x, q in errs if q >= NU0_MINN], default=0.0)
     ratio = max(e[1] for e, lab, x, q in errs)
     over = [(lab, x, nu0_fmt(q)) for e, lab, x, q in errs if e[1] > 1]
-    fail = f"({c}): beyond the accuracy contract: {over[:3]}" if over else None
+    fail = f"({c}): not finite and strictly positive, or beyond the accuracy contract: {over[:3]}" if over else None
     return c, why, fail, (rel, ratio), got
 
 
@@ -2803,6 +2807,66 @@ class TestMapBankMode(unittest.TestCase):
                       f"exact mean(1 / v~) {nu0_fmt(mt)!r}, v~ {vts}; worst relative error {e[0]:.2e}, error / "
                       f"allowance {e[1]:.2e}")
 
+    def test_T6_2_nu0_rev4a_codex_cases(self):
+        """T6-2 with A_design_v5 clarification 2, Revision 4a (Codex's spec review of Revision 4). (1) The lower-edge
+        regression: V = [1], zrep = [3 2^-1074], nu0 = 5, R = 6: the exact unit is 2^-1075 itself (class B), whose
+        computed logarithm sits at the cutoff and whose exponential is 0: either a contextual refusal or a return whose
+        every value is finite, STRICTLY POSITIVE and within the contract -- never a successful return containing 0.
+        (2) Item 0, no intermediate representability check: V = [1, 2^1023], zrep = [8, 0], nu0 = 5, R = 6: the exact
+        v~_2 = 2^1024 is above the largest float, but w ~ [2, 3 2^-1022] and unit ~ 2 are normal (class N): RETURNED
+        within the contract (f18a0ca refused it: v~ = inf). (3) The conversion to binary64 (item 4: every successful
+        return finite and strictly positive; in the band a refusal after the conversion is allowed): numpy's exp is
+        replaced for the call by one that gives 0 just above the lower cutoff and inf at or just below the upper one,
+        as a libm rounding there might; at a band point whose computed logarithm is in range (unit 2^-1075 (1 + 1e-11);
+        phi = the largest float (1 - 1e-11)) capture_scale must then refuse ('after its conversion to binary64'), never
+        return the 0 or the inf; with the real exp the same points are returned, positive and within the contract."""
+        M = self.M
+        R = 6
+        mx = sys.float_info.max
+        V, Z = [1.0], [3 * 2.0 ** -1074]
+        phi, vt, mt, fw, funit, mult = nu0_exact(V, Z, R, 5.0)
+        self.assertEqual(funit, NU0_ZERO)                               # (exactly the lower edge)
+        c, lab, fail, e, got = nu0_point(M.capture_scale, V, Z, R, 5.0)
+        self.assertEqual(c, "B", lab)
+        self.assertIsNone(fail, fail)
+        res = "refused (allowed in the band)" if got is None else "returned " + repr(got)
+        if got is not None:
+            self.assertTrue(all(x > 0.0 for x in [*got[0].tolist(), got[1], got[2]]), got)
+        print(f"T6-2 Revision 4a lower-edge regression (V {V}, zrep [3 2^-1074], nu0 5): exact unit 2^-1075 (class B): "
+              f"{res}")
+        V, Z = [1.0, 2.0 ** 1023], [8.0, 0.0]
+        phi, vt, mt, fw, funit, mult = nu0_exact(V, Z, R, 5.0)
+        self.assertEqual(vt[(2.0 ** 1023, 0.0)], Fraction(2) ** 1024)  # (an intermediate above the largest float)
+        c, lab, fail, e, got = nu0_point(M.capture_scale, V, Z, R, 5.0)
+        self.assertEqual(c, "N", lab)
+        self.assertIsNone(fail, fail)
+        w, unit, ph = got
+        self.assertLessEqual(abs(w[1] - 3 * 2.0 ** -1022), 1e-9 * 3 * 2.0 ** -1022)
+        print(f"T6-2 Revision 4a item 0 (V [1, 2^1023], zrep [8, 0], nu0 5): exact v~_2 = 2^1024 (intermediate); "
+              f"returned phi {ph!r}, w {w.tolist()}, unit {unit!r}; worst relative error {e[0]:.2e}")
+        lo, hi = -1075.0 * math.log(2.0), math.log(mx)
+        real = np.exp
+
+        def libm(x, *a, **k):         # (0 just above the lower cutoff, inf at or just below the upper one)
+            y, xa = real(x, *a, **k), np.asarray(x, float)
+            return np.where((xa > lo) & (xa <= lo + 1e-9), 0.0, np.where((xa >= hi - 1e-9) & (xa <= hi), np.inf, y))
+        for label, V, Z, nu0, what in (
+                ("unit 2^-1075 (1 + 1e-11)", [1.0, 1.0], [0.0, 1e-280], 7.4109846876187e-43 * (1.0 + 1e-11), "unit"),
+                ("phi = the largest float (1 - 1e-11)", [0.75], [0.75 * mx * (1.0 - 1e-11)], 4.0, "phi")):
+            with self.subTest("the conversion to binary64", point=label):
+                phi, vt, mt, fw, funit, mult = nu0_exact(V, Z, R, nu0)
+                q = funit if what == "unit" else phi
+                self.assertEqual(nu0_class(q), "B")
+                c, lab, fail, e, got = nu0_point(M.capture_scale, V, Z, R, nu0)
+                self.assertIsNotNone(got, f"{label}: the real exp returns this point ({lab})")
+                self.assertIsNone(fail, fail)
+                with mock.patch.object(np, "exp", libm):
+                    with self.assertRaisesRegex(ValueError, "outside the float range after its conversion to binary64"):
+                        M.capture_scale(np.array(V), np.array(Z), R, nu0=nu0)
+                val = got[1] if what == "unit" else got[2]
+                print(f"T6-2 Revision 4a conversion, {label}: real exp -> returned {what} {val!r}; an exp giving 0 / "
+                      f"inf there -> refused")
+
     def test_T6_2_nu0_float_range_edges(self):
         """T6-2 with A_design_v5 clarification 2, Revision 4 (refused if and only if a returned quantity's computed
         logarithm is outside the float range; within a factor e^(+-1e-10) of an edge either outcome): at each edge of
@@ -2816,8 +2880,9 @@ class TestMapBankMode(unittest.TestCase):
         = x (w_1 ~ 2e-281 x); phi above the largest float: V = [0.75], zrep = [x], nu0 = 4 (phi = x / 0.75); phi below
         2^-1075: V = [x], zrep = [2^-80], nu0 = 4 (phi = 2^-80 / x; at x = 2^995 exactly 2^-1075). w cannot leave the
         float range upward: w_e = n (1 / v~_e) / sum(1 / v~) <= n. First, capture_scale's float thresholds (log 2^-1075
-        < l <= log of the largest float) are exactly "not below" and "not above" the true logarithms (each threshold
-        float lies below its true value and the next float above it), and e^l is positive and finite at both."""
+        < l <= log of the largest float) are exactly "not at or below" and "not above" the true logarithms (each
+        threshold float lies below its true value and the next float above it), and e^l is positive and finite at
+        both."""
         from decimal import Decimal, localcontext
         M = self.M
         R = 6
