@@ -20,6 +20,20 @@
   * the production V builder: the term-by-term formula through the shared evaluator (noisescale), the
     simulated covariance of replicate means at small s, refusals;
   * collection bound to the final plan; the CLI (plan; estimate: canonical JSON, never Infinity / NaN).
+  * the D8 bank refit (A_design_v5.md section 2; test IDs of its section 5), synthetic data only (D9):
+    - T4-1 / T4-2 the capped interval map and marginal MLE near the ceiling; T4-7 the D8-only minimum-categories
+      screen; the ceilings threaded through arrays;
+    - T4-3 population recovery under capping (20 banks) and log_rect on capped rectangles; T4-4 the zero-ceiling
+      capture-only fit (structural zeros, C4.2's maxima, infeasible maxima, refused bootstrap draws); the D8
+      bootstrap streams;
+    - a registered-size synthetic store through provenance and estimate-d8 into obslaw's strict loader (the round
+      trip; every single-field corruption refused), the receipt written first and bound, the D5 ledger charged;
+      T5-1 every binding of 2.1; T4-5 support counts only; R4 the clock's ceilings; R7; clarification 2 D3;
+    - T5-2 / T5-6 provenance on a small synthetic store: one engine, ages, cell set, reconstruction, verify_all
+      (a repacked chunk, no manifest), verify_chunk (an extra member), a manifest, the registered root by path;
+    - the validation of 2.10: the spec, banks on the D8 validation streams, V1-V5, an end-to-end run at a test
+      size; A's assembly of a generator artifact (2.8) and T5-4 against the pinned #68 commit (adoption gate:
+      RQ_PR68_DIR; skipped without it, the only permitted skip).
 numpy required for the estimator (RQ_REQUIRE_NUMPY=1 makes a missing numpy a failure).
 
     python3 -I tools/redqueen/test_noisebank.py [-v]
@@ -28,10 +42,12 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import hashlib
 import io
 import json
 import math
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -44,6 +60,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 if os.environ.get("RQ_PYLIB"):
     sys.path.insert(0, os.environ["RQ_PYLIB"])
+import material  # noqa: E402
 import noisebank as nb  # noqa: E402
 import noisescale  # noqa: E402
 import plan  # noqa: E402
@@ -54,6 +71,8 @@ except ImportError:
     if os.environ.get("RQ_REQUIRE_NUMPY"):
         raise SystemExit("RQ_REQUIRE_NUMPY is set, but numpy cannot be imported")
     np = None
+if np is not None:
+    import obslaw as ol  # noqa: E402  (the D8 law, streams and strict bank/3 loader; numpy)
 
 NS = nb.VALIDATION_NAMESPACE
 M = 60                           # (a coarse dependence grid for the tests: 61 nodes in atanh(rho); registered 240)
@@ -1425,6 +1444,1276 @@ class TestBankCoverage(unittest.TestCase):
             self.assertEqual(result['provenance']['observations_sha256'], rqlib.sha256_file(p))
             self.assertNotEqual(rqlib.sha256_file(p), rqlib.canonical_sha(self.doc))
 
+
+# ================================================================== the D8 refit (A_design_v5.md section 2; WP3)
+# Synthetic data only (D9): the banks below are drawn by obslaw's generator (the capped law, v5 1.4-1.6) from the
+# declared synthetic parameters of v5 2.10 (typed here from v5, not read from noisebank); the registered-size world is a
+# synthetic store whose design, plan and observations are bound by TEST bindings (whatever non-registered bindings
+# produce is synthetic). Test IDs are v5 5's: T4-1..T4-5, T4-7, T5-1, T5-2, T5-4 (adoption gate), T5-6; the round trip
+# through obslaw's strict loader; V1-V5's machinery (T4-6 itself runs on the server).
+VAL_SR = [[0.25, 0.05, 0.05], [0.05, 0.25, 0.15], [0.05, 0.15, 0.50]]   # v5 2.10 L789 (then [F][F] by the convention)
+VAL_FF = 0.0055 / 0.06                     # v' A^-1 v, A = [[.25, .05], [.05, .25]], v = (.05, .15): the convention
+VAL_SD = [[0.25, 0.05], [0.05, 0.25]]
+VAL_SE = [[0.50, 0.10], [0.10, 0.50]]
+VAL_CURVES = {"C": {"x": [-2.2, -0.6, 0.4], "s": [0.55, 0.30, 0.20]},
+              "S": {"x": [-2.5, -1.2, -0.5], "s": [0.35, 0.25, 0.22]},
+              "F": {"x": [-2.5, -1.2, -0.5], "s": [0.35, 0.25, 0.22]}}
+GROUP_TRUTH = {"R_CC": 0.25, "R_SS": 0.25, "R_CS": 0.05, "D_CC": 0.25, "D_SS": 0.25, "D_CS": 0.05,
+               "T_CS": 0.05 + 0.05 + 0.10, "R_CF": 0.05, "R_SF": 0.15}
+THETA_TRUTH = {"R_CC": 0.25, "R_SS": 0.25, "R_CS": 0.05, "R_CF": 0.05, "R_SF": 0.15, "D_CC": 0.25, "D_SS": 0.25,
+               "D_CS": 0.05, "E_CC": 0.50, "E_SS": 0.50, "E_CS": 0.10}
+CEIL = {"5000": 247, "10000": 0, "20000": 0}                             # D8:154
+C247 = 247 / 600
+AGES_FIXTURE = os.path.join(HERE, "fixtures", "registered_ages.json")
+
+
+def val_components():
+    SR = [list(r) for r in VAL_SR]
+    SR[2][2] = VAL_FF
+    return SR, VAL_SD, VAL_SE
+
+
+def capped_counts(mu, u, N, M, curve):
+    """obslaw's capped count law at exact locations (v5 1.6)."""
+    return ol.generate_counts(mu, u, N, M, lambda x: ol.scale(curve, x),
+                              lambda x, i: ol.solve_location(x, ol.scale(curve, x), N, M)[0])[0]
+
+
+def capped_obs(seed, W=4, T=2, R=16, horizons=(5000,), keep=None):
+    """A small bank under the capped law, drawn by obslaw from v5 2.10's declared components, curves and means (capture
+    sigma(-0.6 + 0.4 z), free survival c sigma(eta), exposed c sigma(eta - Delta): F crowds the ceiling): W worlds x T
+    times, each prey snapshot meeting its own world's and its partner's predator snapshots; M = 247 at 5k and 0 at
+    10k / 20k (every survivor 0 there). keep: only these (prey, pred) pairs and their prey's controls are usable, every
+    other count is 0 (saturated). -> observations in noisebank's encoding."""
+    rng = np.random.default_rng(seed)
+    worlds = [f"w{i}" for i in range(W)]
+    times = nb.TIMES[:T]
+    prey = sorted((w, t) for w in worlds for t in times)
+    partner = {w: worlds[(k + 1) % W] for k, w in enumerate(worlds)}
+    pairs = sorted((q, (wp, tp)) for q in prey for wp in (q[0], partner[q[0]]) for tp in times)
+    pred = sorted({p for _, p in pairs})
+    qi = np.array([prey.index(q) for q, _ in pairs])
+    pj = np.array([pred.index(p) for _, p in pairs])
+    fac = ol.psd_factors(*val_components())
+    eta = rng.uniform(0.5, 3.5, len(prey))
+    zc, dl = rng.uniform(-2, 2, len(pairs)), rng.uniform(0, 1, len(pairs))
+    cells = {}
+    for h in horizons:
+        M, B = CEIL[str(h)], nb.capture_bound(h)
+        c = M / 600
+        mu = {"C": 1 / (1 + np.exp(0.6 - 0.4 * zc)), "S": c / (1 + np.exp(-(eta[qi] - dl))),
+              "F": c / (1 + np.exp(-eta))}
+        if keep is not None:
+            kp = np.array([(q, p) in keep for q, p in pairs])
+            kq = np.array([q in {a for a, _ in keep} for q in prey])
+            mu = {"C": np.where(kp, mu["C"], 0.0), "S": np.where(kp, mu["S"], 0.0), "F": np.where(kq, mu["F"], 0.0)}
+        lat = ol.latent(ol.standard_normals(rng, len(prey), len(pred), len(pairs), R), fac, qi, pj)
+        K = {ch: capped_counts(mu[ch], lat[ch], n, m, VAL_CURVES[ch])
+             for ch, n, m in (("C", B, B), ("S", 600, M), ("F", 600, M))}
+        for e, (q, p) in enumerate(pairs):
+            for r in range(R):
+                x = cells.setdefault((q, p, r), {"cell": f"{q}|{p}|{r}", "prey": list(q), "pred": list(p),
+                                                 "replicate": r, "horizons": {}})
+                x["horizons"][str(h)] = {"captures": int(K["C"][e, r]), "survivors": int(K["S"][e, r])}
+        for i, q in enumerate(prey):
+            for r in range(R):
+                x = cells.setdefault((q, None, r), {"cell": f"{q}|free|{r}", "prey": list(q), "pred": None,
+                                                    "replicate": r, "horizons": {}})
+                x["horizons"][str(h)] = {"captures": None, "survivors": int(K["F"][i, r])}
+    return list(cells.values())
+
+
+def survival_paths(node, path=""):
+    """Paths of every key naming a survival quantity (obslaw.SURVIVAL_KEYS) below node."""
+    out = []
+    if isinstance(node, dict):
+        for k, v in node.items():
+            p = f"{path}.{k}"
+            if k in ol.SURVIVAL_KEYS:
+                out.append(p)
+            out += survival_paths(v, p)
+    elif isinstance(node, list):
+        for i, v in enumerate(node):
+            out += survival_paths(v, f"{path}[{i}]")
+    return out
+
+
+@unittest.skipIf(np is None, "numpy is not installed")
+class TestD8CeilingAndScreen(unittest.TestCase):
+    """T4-1, T4-2, T4-7 and the ceiling threading of v5 2.5 items 1-3."""
+
+    def test_T4_1_interval_bounds_capped_at_the_ceiling(self):
+        """interval_bounds(k, 600, 247): +inf upper end at 247, the old map below it, k > 247 refused; capture (and
+        every default caller) unchanged."""
+        k = np.arange(0, 248, dtype=float)
+        lo, hi = nb.interval_bounds(k, 600, 247)
+        lo0, hi0 = nb.interval_bounds(k, 600)
+        self.assertEqual(hi[247], math.inf)
+        self.assertEqual(lo[247], math.log(246.5 / 353.5))                     # (t_247 = logit(246.5 / 600))
+        self.assertTrue(np.array_equal(lo, lo0) and np.array_equal(hi[:247], hi0[:247]))
+        self.assertEqual(hi0[247], math.log(247.5 / 352.5))                     # (the old map: an interior interval)
+        self.assertEqual(lo[0], -math.inf)
+        for bad in (248, 600):
+            with self.subTest(k=bad), self.assertRaisesRegex(nb.NoiseBankError, "above the ceiling 247"):
+                nb.interval_bounds(np.array([3.0, bad]), 600, 247)
+        kc = np.arange(0, 325, dtype=float)
+        a, b = nb.interval_bounds(kc, 324)
+        a2, b2 = nb.interval_bounds(kc, 324, 324)
+        self.assertTrue(np.array_equal(a, a2) and np.array_equal(b, b2))
+        self.assertEqual((b[324], b[323]), (math.inf, math.log(323.5 / 0.5)))
+        with self.assertRaises(nb.NoiseBankError):
+            nb.interval_bounds(np.array([325.0]), 324)
+        lo, hi = nb.interval_bounds(np.zeros(3), 600, 0)                        # (M = 0: the single category)
+        self.assertTrue(np.all(lo == -math.inf) and np.all(hi == math.inf))
+
+    def test_T4_2_capped_marginal_mle_near_the_ceiling(self):
+        """The capped marginal MLE recovers sigma on near-ceiling synthetic cells (s = 0.35, 64 replicates, mu in
+        [0.30, 0.405] of c = 0.4117, v5 2.4's prototype setting; median within 10%, and within 15% for mu > 0.39); the
+        old map on the same data is biased low by more than 25% where the cap binds (mu > 0.39)."""
+        rng = np.random.default_rng(42)
+        mu = rng.uniform(0.30, 0.405, 300)
+        a = ol.solve_location(mu, 0.35, 600, 247)[0]
+        K = ol.rounded_count(a[:, None], 0.35, rng.standard_normal((300, 64)), 600, 247).astype(float)
+        near = mu > 0.39
+        self.assertGreater(float(np.mean(K[near] == 247)), 0.5)                 # (the cap binds there)
+        new, old = nb.fit_marginals(K, 600, 247), nb.fit_marginals(K, 600)
+        self.assertGreater(int(new["ok"].sum()), 250)
+        self.assertGreater(int((new["ok"] & near).sum()), 10)
+        s_all = float(np.median(new["sigma"][new["ok"]]))
+        s_near = float(np.median(new["sigma"][new["ok"] & near]))
+        s_old = float(np.median(old["sigma"][old["ok"] & near]))
+        self.assertLess(abs(s_all / 0.35 - 1), 0.10, s_all)
+        self.assertLess(abs(s_near / 0.35 - 1), 0.15, s_near)
+        self.assertLess(s_old, 0.75 * 0.35, s_old)
+        with self.assertRaises(nb.NoiseBankError):
+            nb.fit_marginals(K + 1, 600, 247)
+
+    def test_T2_3_the_bank_code_derives_no_age_arithmetic(self):
+        """v5 1.3 / T2-3, for the bank code: the ceilings come from #90's clock through material.cohort_ceiling (once);
+        noisebank's CODE (comments and strings blanked) has no age arithmetic of its own."""
+        import tokenize
+        src = rqlib.read_text(os.path.join(HERE, "noisebank.py"))
+        drop = {tokenize.COMMENT, tokenize.STRING} | {getattr(tokenize, n) for n in ("FSTRING_MIDDLE", "TSTRING_MIDDLE")
+                                                      if hasattr(tokenize, n)}
+        starts = [0]
+        for line in src.splitlines(keepends=True):
+            starts.append(starts[-1] + len(line))
+        chars = list(src)
+        for tok in tokenize.generate_tokens(io.StringIO(src).readline):
+            if tok.type in drop:
+                for i in range(starts[tok.start[0] - 1] + tok.start[1], starts[tok.end[0] - 1] + tok.end[1]):
+                    if chars[i] != "\n":
+                        chars[i] = " "
+        code = "".join(chars)
+        self.assertEqual(len(re.findall(r"material\.cohort_ceiling\(", code)), 1)
+        for pat in (r"\bcommon\.", r"age_feasible", r"age_death_frame", r"binary32\(", r"_CLOCKS",
+                    r"\bages\b.*\*\s*(DT|0\.016)", r"max_age\s*[-+*/<>]", r"^\s*(import|from)\s+common\b"):
+            self.assertIsNone(re.search(pat, code, re.M), pat)
+
+    def test_arrays_thread_the_ceilings(self):
+        """arrays(obs, h, ceilings): A["M"] = {C: B, S: M_h, F: M_h} and the survivors' range is 0..M_h (a violation
+        refused with its count only); without ceilings M = N (the legacy map)."""
+        obs = capped_obs(3, horizons=(5000, 10000))
+        A = nb.arrays(obs, 5000, CEIL)
+        self.assertEqual(A["M"], {"C": 324, "S": 247, "F": 247})
+        self.assertEqual(nb.arrays(obs, 10000, CEIL)["M"], {"C": 642, "S": 0, "F": 0})
+        self.assertEqual(nb.arrays(obs, 5000)["M"], {"C": 324, "S": 600, "F": 600})
+        bad = copy.deepcopy(obs)
+        frees = [o for o in bad if o["pred"] is None]
+        frees[0]["horizons"]["5000"]["survivors"] = 248
+        frees[1]["horizons"]["5000"]["survivors"] = 300
+        with self.assertRaisesRegex(nb.NoiseBankError, r"^2 free survivors observation\(s\) above the survivor "
+                                                       r"ceiling M = 247 at 5000 steps") as cm:
+            nb.arrays(bad, 5000, CEIL)
+        self.assertNotIn("248", str(cm.exception))
+        self.assertNotIn("300", str(cm.exception))
+        nb.arrays(bad, 5000)                                                    # (legacy: up to 600)
+
+    def test_T4_7_the_D8_minimum_categories_screen(self):
+        """PC-18 / R10: in the D8 path an all-247 cell, a {246, 247} cell and a separated two-category capture cell
+        (counts 100 and 200: its interval-normal MLE exists, it is excluded BY POLICY) are excluded as unidentified
+        and counted (screened <= unidentified); a three-category near-ceiling cell is fitted. Without the screen
+        (the legacy path) the same cells reach the Newton fit and no "screened" key exists."""
+        obs = capped_obs(5)
+        cells = sorted({(tuple(o["prey"]), tuple(o["pred"])) for o in obs if o["pred"] is not None})
+        pat = {cells[0]: ("S", [247] * 16), cells[1]: ("S", [246, 247] * 8), cells[2]: ("C", [100, 200] * 8),
+               cells[3]: ("S", ([238, 243, 247] * 6)[:16]), cells[4]: ("S", [245, 246, 247, 247] * 4)}
+        for o in obs:
+            k = (tuple(o["prey"]), None if o["pred"] is None else tuple(o["pred"]))
+            if k in pat:
+                ch, vals = pat[k]
+                o["horizons"]["5000"]["captures" if ch == "C" else "survivors"] = vals[o["replicate"]]
+        A = nb.arrays(obs, 5000, CEIL)
+        idx = {c: i for i, c in enumerate((tuple(A["prey"][i]), tuple(A["pred"][j])) for i, j in zip(A["I"], A["J"]))}
+        U = nb.usable(A, screen=True)
+        L = nb.usable(A)
+        for ch in "CSF":
+            self.assertIn("screened", U[ch]["counts"])
+            self.assertLessEqual(U[ch]["counts"]["screened"], U[ch]["counts"]["unidentified"])
+            self.assertNotIn("screened", L[ch]["counts"])
+            self.assertEqual(U[ch]["counts"]["rows"], sum(U[ch]["counts"][k] for k in
+                                                          ("incomplete", "saturated", "unidentified", "usable")))
+        self.assertEqual((U["S"]["counts"]["screened"], U["C"]["counts"]["screened"]), (2, 1))
+        for c, ch in ((cells[0], "S"), (cells[1], "S"), (cells[2], "C")):
+            self.assertFalse(U[ch]["ok"][idx[c]], c)
+            self.assertTrue(np.isnan(U[ch]["sigma"][idx[c]]), "a screened cell never reaches the Newton fit")
+        self.assertTrue(U["S"]["ok"][idx[cells[3]]], "three categories near the ceiling: fitted")
+        row3 = A["S"][idx[cells[3]]][None, :]                   # (fitted at the ceiling: the capped map, 2.5 item 3)
+        self.assertEqual(float(U["S"]["sigma"][idx[cells[3]]]), float(nb.fit_marginals(row3, 600, 247)["sigma"][0]))
+        self.assertNotEqual(float(U["S"]["sigma"][idx[cells[3]]]), float(nb.fit_marginals(row3, 600)["sigma"][0]))
+        rows = np.array([idx[cells[3]]])
+        lo, hi = nb._std_bounds(A, U, "S", rows)                # (the standardized bounds of stage 2: +inf at 247)
+        self.assertTrue(np.all(np.isinf(hi[A["S"][rows] == 247])) and np.all(np.isfinite(hi[A["S"][rows] < 247])))
+        row = A["S"][idx[cells[4]]][None, :]                    # (three categories, barely informative: the screen
+        self.assertFalse(np.isnan(U["S"]["sigma"][idx[cells[4]]]))   # passes it; the identification rules decide)
+        self.assertEqual(bool(U["S"]["ok"][idx[cells[4]]]), bool(nb.fit_marginals(row, 600, 247)["ok"][0]))
+        f = nb.fit_marginals(np.array([[100, 200] * 8], float), 324)
+        self.assertTrue(f["ok"][0] and 0.5 < f["sigma"][0] < 3, "the separated two-category MLE exists")
+        self.assertTrue(L["C"]["ok"][idx[cells[2]]], "legacy: the two-category capture cell is fitted (no screen)")
+        self.assertFalse(np.isnan(L["S"]["sigma"][idx[cells[0]]]), "legacy: the all-247 cell reaches the Newton fit")
+        rec = nb.horizon_estimate(A, boot=1, m=M)
+        self.assertNotIn("screened", json.dumps(rec), "the legacy record carries no screen count")
+
+
+_T43_WORKER = r'''
+import json, sys
+sys.path.insert(0, sys.argv[1])
+import noisebank as nb
+import test_noisebank as tn
+out = {}
+for s in json.loads(sys.argv[2]):
+    rec = nb.horizon_estimate_d8(nb.arrays(tn.capped_obs(s), 5000, tn.CEIL), 5000, boot=1, m=tn.M)
+    out[s] = {"status": rec["status"], "reasons": rec["reasons"],
+              "rho": {g: rec["groups"][g]["rho_max"] for g in nb.GROUPS} if rec["status"] == "ok" else None}
+print(json.dumps(out))
+'''
+
+
+def t43_fits(seeds):
+    """T4-3's bank fits (capped_obs(seed), the D8 5k fit, boot 1, the test grid) in RQ_TEST_WORKERS (default: up to 4,
+    the CPUs) plain subprocesses -> {seed: {status, reasons, rho: {group: rho_max}}}."""
+    import subprocess
+    seeds = list(seeds)
+    n = max(1, min(len(seeds), int(os.environ.get("RQ_TEST_WORKERS") or min(4, os.cpu_count() or 1))))
+    procs = [subprocess.Popen([sys.executable, "-I", "-c", _T43_WORKER, HERE, json.dumps(seeds[k::n])],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) for k in range(n)]
+    out = {}
+    for p in procs:
+        so, se = p.communicate()
+        if p.returncode:
+            raise AssertionError(f"T4-3 worker failed: {se[-3000:]}")
+        out.update({int(k): v for k, v in json.loads(so).items()})
+    return out
+
+
+@unittest.skipIf(np is None, "numpy is not installed")
+class TestD8Horizons(unittest.TestCase):
+    """T4-3 (population recovery under capping), T4-4 (the zero-ceiling capture-only fit), the D8 bootstrap streams."""
+
+    def test_T4_3_population_parameter_recovery(self):
+        """20 small synthetic banks (4 worlds x 2 times, R = 16) under the capped law from known components: every 5k
+        D8 fit ok, and each group's mean maximum within 3 sd / sqrt(20) + 0.03 of its true correlation (0.03: v5's
+        allowance for the fixed-R IFM bias at R = 16). Plus the independent capped-likelihood check: log_rect against
+        the independent Simpson reference on 200 random rectangles built from the capped interval map (half-infinite
+        capped categories included) within 1e-8. (The capped categories make log_rect take its restricted half-infinite
+        path often, about a minute per bank: the 20 banks are fitted in RQ_TEST_WORKERS plain subprocesses.)"""
+        rng = np.random.default_rng(8)
+        worst, capped, n = 0.0, 0, 0
+
+        def count(Mx):                          # (a third the capped category, a third near it, a third anywhere)
+            u = rng.random()
+            if u < 0.35:
+                return Mx
+            return int(rng.integers(max(0, Mx - 6), Mx)) if u < 0.7 else int(rng.integers(0, Mx + 1))
+        for _ in range(200):
+            N, Mx = (600, 247) if rng.random() < 0.7 else (324, 324)
+            k1, k2 = count(Mx), count(Mx)
+            (l1,), (h1,) = nb.interval_bounds(np.array([k1]), N, Mx)
+            (l2,), (h2,) = nb.interval_bounds(np.array([k2]), N, Mx)
+            a1, a2 = rng.normal(np.log(Mx / (N - Mx + 1)) - 0.3, 0.3, 2)
+            s1, s2 = rng.uniform(0.25, 0.6, 2)
+            box = [(l1 - a1) / s1, (h1 - a1) / s1, (l2 - a2) / s2, (h2 - a2) / s2]
+            if any(abs(v) > nb.E_MAX for v in box if math.isfinite(v)) or box[1] - box[0] < nb.W_MIN or \
+                    box[3] - box[2] < nb.W_MIN:
+                continue
+            capped += (h1 == math.inf and N == 600) or (h2 == math.inf and N == 600)
+            n += 1
+            r = float(rng.uniform(-0.9, 0.9))
+            got = float(nb.log_rect(*[np.array([v]) for v in box], r)[0])
+            worst = max(worst, abs(got - _ref_log_rect(*box, r)))
+        self.assertGreater(n, 150)
+        self.assertGreater(capped, 40)
+        self.assertLessEqual(worst, nb.LOG_RECT_TOL)
+        recs = t43_fits(range(1000, 1020))
+        est = {g: [] for g in nb.GROUPS}
+        for k, rec in recs.items():
+            self.assertEqual(rec["status"], "ok", (k, rec["reasons"]))
+            for g in nb.GROUPS:
+                est[g].append(rec["rho"][g])
+        self.assertEqual(len(recs), 20)
+        for g in nb.GROUPS:
+            x = np.array(est[g])
+            tol = 3 * float(x.std(ddof=1)) / math.sqrt(20) + 0.03
+            print(f"T4-3 {g}: mean {float(x.mean()):.4f} true {GROUP_TRUTH[g]:.4f} sd {float(x.std(ddof=1)):.4f} "
+                  f"tolerance {tol:.4f}", file=sys.stderr)
+            self.assertLessEqual(abs(float(x.mean()) - GROUP_TRUTH[g]), tol, (g, float(x.mean()), tol))
+
+    def test_T4_4_zero_ceiling_capture_only_fit(self):
+        """M = 0 (10k): S and F are the structural-zero declarations, the capture-only fit is ok with no survival
+        parameter anywhere; its components ARE the group maxima (C4.2) and the record is what obslaw's strict loader
+        admits at a zero-ceiling horizon (C4.1, C7, C8)."""
+        obs = capped_obs(11, W=4, T=2, R=24, horizons=(5000, 10000))
+        rec = nb.horizon_estimate_d8(nb.arrays(obs, 10000, CEIL), 10000, boot=999, m=M)
+        self.assertEqual(rec["status"], "ok", rec["reasons"])
+        for ch in "SF":
+            self.assertEqual(rec["channels"][ch], {"status": "structural_zero", "M_H": 0, "reason":
+                                                   "D8 rule 46: no age-feasible initial individual at this horizon"})
+        self.assertEqual(survival_paths(dict(rec, channels={"C": rec["channels"]["C"]})), [])
+        self.assertEqual(sorted(rec["groups"]), ["D_CC", "R_CC"])
+        rR, rD = rec["groups"]["R_CC"]["rho_max"], rec["groups"]["D_CC"]["rho_max"]
+        c = rec["components"]
+        self.assertEqual((c["SigmaR"], c["SigmaD"], c["SigmaE"], c["fit"]), ([[rR]], [[rD]], [[1.0 - rR - rD]],
+                                                                             "unconstrained"))
+        self.assertEqual(rec["bootstrap"]["draws"], 999)
+        if rec["bootstrap"]["status"] == "ok":
+            self.assertEqual(sorted(rec["bootstrap"]["ci95"]), ["D_CC", "E_CC", "R_CC"])
+        self.assertIn("screened", rec["channels"]["C"])
+        for g, want in (("R_CC", 0.25), ("D_CC", 0.25)):
+            self.assertLess(abs(rec["groups"][g]["rho_max"] - want), 0.2)
+        ol.BankArtifact._horizon_record(rec, "10000", "horizons.10000", zero=True)
+
+    def test_T4_4_infeasible_maxima_and_refused_draws(self):
+        """Infeasible capture-only maxima: status unavailable with the groups kept as diagnostics (C4.2), never a
+        barrier fit; in the bootstrap an infeasible reduced fit is a refused fit, i.e. a failed draw."""
+        obs = capped_obs(11, W=4, T=2, R=24, horizons=(5000, 10000))
+        A = nb.arrays(obs, 10000, CEIL)
+
+        def peaked(zn, at):                     # (an objective whose maximum is at rho = at)
+            return zn, -50.0 * (np.tanh(zn) - at) ** 2
+        for bad in ({"R_CC": -0.2, "D_CC": 0.3}, {"R_CC": 0.3, "D_CC": -0.05}, {"R_CC": 0.6, "D_CC": 0.5}):
+            objs = {g: peaked(nb.z_nodes(M), bad[g]) for g in ("R_CC", "D_CC")}
+            with self.subTest(objective=bad), self.assertRaisesRegex(nb.NoiseBankError, "infeasible"):
+                nb.capture_only_fit(objs)
+        ok = nb.capture_only_fit({g: peaked(nb.z_nodes(M), v) for g, v in (("R_CC", 0.2), ("D_CC", 0.3))})
+        self.assertEqual(ok["SigmaE"], [[1.0 - ok["SigmaR"][0][0] - ok["SigmaD"][0][0]]])
+        self.assertLess(abs(ok["SigmaR"][0][0] - 0.2) + abs(ok["SigmaD"][0][0] - 0.3), 1e-3)   # (spline maxima)
+        real = nb.capture_only_fit
+        for bad in ({"R_CC": -0.1, "D_CC": 0.3}, {"R_CC": 0.7, "D_CC": 0.4}):
+            def shifted(objs, pairs=None, _b=bad):          # (the real rule on objectives peaked where _b says)
+                return real({g: peaked(objs[g][0], _b[g]) for g in objs})
+            with self.subTest(point_estimate=bad), mock.patch.object(nb, "capture_only_fit", shifted):
+                rec = nb.horizon_capture_only(A, boot=3, m=M)
+                self.assertEqual(rec["status"], "unavailable")
+                self.assertIn("infeasible", rec["reasons"][0])
+                self.assertIsNone(rec["components"])
+                self.assertEqual(sorted(rec["groups"]), ["D_CC", "R_CC"])
+                self.assertTrue(all("nodes" not in g for g in rec["groups"].values()))
+                ol.BankArtifact._horizon_record(rec, "10000", "horizons.10000", zero=True)
+        tab_obs = nb.arrays(obs, 10000, CEIL)
+        U = nb.usable(tab_obs, screen=True, channels=("C",))
+        Uc = dict(U, S={"ok": np.zeros(len(tab_obs["S"]), bool)}, F={"ok": np.zeros(len(tab_obs["F"]), bool)})
+        G, worlds = nb.group_pairs(tab_obs, Uc)
+        tab = nb.group_tables(tab_obs, Uc, G, M, ("R_CC", "D_CC"))
+
+        def refuse(objs, pairs=None):
+            raise nb.NoiseBankError("the capture-only group maxima are infeasible")
+        D, failed, unident = nb.bootstrap(tab, len(worlds), 6, 0, draws=nb.d8_draws("AnnexH/D8/1/test/x")(len(worlds)),
+                                          groups=("R_CC", "D_CC"), fit=refuse, entries=nb._capture_entries,
+                                          names=("R_CC", "D_CC", "E_CC"))
+        self.assertEqual((len(D), failed), (0, 6))
+
+    def test_D8_bootstrap_draws_are_the_registered_splitmix_streams(self):
+        """v5 2.5 item 5 (PC-9): per draw n_worlds below(n_worlds) for the prey role, then n_worlds for the predator
+        role, from rqlib.SplitMix64 seeded by the horizon's AnnexH/D8/1 text (an independent SplitMix64 here)."""
+        text = "AnnexH/D8/1/noisebank/D8-refit/h10000/bootstrap"
+        draw = nb.d8_draws(text)(8)
+        seed = int.from_bytes(hashlib.sha256(text.encode()).digest()[:8], "little")
+        ref = rqlib.SplitMix64(seed)
+        for _ in range(5):
+            mm, mp = draw()
+            want_m = np.bincount([ref.below(8) for _ in range(8)], minlength=8)
+            want_p = np.bincount([ref.below(8) for _ in range(8)], minlength=8)
+            self.assertEqual((mm.tolist(), mp.tolist()), (want_m.tolist(), want_p.tolist()))
+        rec = nb.d8_streams()
+        self.assertEqual(rec["texts"], [f"AnnexH/D8/1/noisebank/D8-refit/h{h}/bootstrap" for h in (5000, 10000, 20000)])
+        self.assertEqual(rec["seeds"][1], seed)
+        g = rqlib.SplitMix64(seed)
+        self.assertEqual(rec["first_outputs"][1], [g.next64(), g.next64()])
+        with mock.patch.object(nb, "d8_draws", wraps=nb.d8_draws) as spy:
+            nb.horizon_estimate_d8(nb.arrays(capped_obs(2), 5000, CEIL), 5000, boot=2, m=M)
+        spy.assert_called_once_with("AnnexH/D8/1/noisebank/D8-refit/h5000/bootstrap")
+
+
+def _hashed_rows(design, ages_sha):
+    rows, _, _ = plan.expand_v2(design, pending=True)
+    for r in rows:
+        for k in nb.HASHED:
+            if isinstance(r.get(k), dict) and r[k].get("path"):
+                r[k]["sha256"] = ages_sha if k == "ages" else rqlib.sha256_bytes(f"{k}|{r[k]['path']}".encode())
+    return rows
+
+
+def _write_store(root, bundles, per_chunk=64):
+    """A synthetic packed store (store.py's layout): chunks of bundle.json + done.json members and their index."""
+    import store
+    import zipfile
+    os.makedirs(os.path.join(root, store.CHUNKS))
+    ids = sorted(bundles)
+    lines = []
+    for n, k in enumerate(range(0, len(ids), per_chunk), 1):
+        name = f"chunk_{n:06d}.zip"
+        path = os.path.join(root, store.CHUNKS, name)
+        cells = {}
+        with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as z:
+            for cid in ids[k:k + per_chunk]:
+                data = rqlib.canonical(bundles[cid])
+                done = rqlib.canonical({"bundle_sha256": rqlib.sha256_bytes(data)})
+                z.writestr(f"{cid}/bundle.json", data)
+                z.writestr(f"{cid}/done.json", done)
+                cells[cid] = {"bundle_sha256": rqlib.sha256_bytes(data), "done_sha256": rqlib.sha256_bytes(done)}
+        lines.append(rqlib.canonical({"schema": store.CHUNK_SCHEMA, "chunk": name, "sha256": rqlib.sha256_file(path),
+                                      "bytes": os.path.getsize(path), "cells": cells}))
+    with open(os.path.join(root, store.INDEX), "wb") as f:
+        f.write(b"".join(lines))
+
+
+ENGINE = rqlib.sha256_bytes(b"synthetic engine")
+
+
+class D8World:
+    """A synthetic bank world in a temporary directory: a design (the registered planner, a synthetic validation
+    registry), its hashed plan (ages: the registered fixture's bytes), synthetic bundles packed in a store, the
+    observations collected from it, and TEST bindings. small: a reduced design (a few edges, 2 replicates) for the
+    provenance tests; otherwise the registered 18,432-cell allocation with only a few usable cells (the rest
+    saturated at 0), cheap to fit."""
+
+    def __init__(self, tmp, small=False, seed=7):
+        self.tmp = tmp
+        root = os.path.join(tmp, "validation")
+        f = files(tmp)
+        self.ages = os.path.join(tmp, "ages.json")
+        shutil.copyfile(AGES_FIXTURE, self.ages)
+        d = nb.make_design(block(root), [f["t.json"]], self.ages, [f["prod.json"]], validation_dir=root, arena="a",
+                           main_registries=[f["main"]])
+        if small:
+            d["edges"] = [e for e in d["edges"] if e["prey"]["world"] == d["noisebank"]["worlds"][0]][:6]
+            d["replicates"] = 2
+        self.design_doc = d
+        self.design = os.path.join(tmp, "design.json")
+        rqlib.write_json_durable(self.design, d)
+        self.rows = _hashed_rows(d, material.AGES_SHA256)
+        self.plan = os.path.join(tmp, "plan.jsonl")
+        plan.write_plan(self.rows, self.plan)
+        w = d["noisebank"]["worlds"][0]
+        P = [(w, "20M"), (w, "40M")]
+        self.keep = {(p, q) for p in P for q in P}
+        self.counts = self._counts(seed)
+        self.bundles = {r["id"]: self.bundle(r) for r in self.rows}
+        self.root = os.path.realpath(os.path.join(tmp, "bank"))
+        _write_store(self.root, self.bundles, per_chunk=4 if small else 64)
+        self.obs = os.path.join(tmp, "obs.json")
+        rqlib.write_json_durable(self.obs, nb.collect(self.root, d, self.plan))
+        self.ledger = os.path.join(tmp, "ledger.jsonl")
+        self.bindings = self.bind()
+
+    def _counts(self, seed):
+        """(prey, pred or None, replicate) -> {h: (captures, survivors)}: obslaw's capped law on the kept cells."""
+        rng = np.random.default_rng(seed)
+        R = self.design_doc["replicates"]
+        out = {}
+        cells = sorted(self.keep)
+        prey = sorted({p for p, _ in cells})
+        pred = sorted({q for _, q in cells})
+        qi = np.array([prey.index(p) for p, _ in cells])
+        pj = np.array([pred.index(q) for _, q in cells])
+        fac = ol.psd_factors(*val_components())
+        for h in nb.HORIZONS:
+            M, B = CEIL[str(h)], nb.capture_bound(h)
+            lat = ol.latent(ol.standard_normals(rng, len(prey), len(pred), len(cells), R), fac, qi, pj)
+            muC = np.full(len(cells), 0.3)
+            muS, muF = np.full(len(cells), 0.75 * M / 600), np.full(len(prey), 0.92 * M / 600)
+            KC = capped_counts(muC, lat["C"], B, B, VAL_CURVES["C"])
+            KS = capped_counts(muS, lat["S"], 600, M, VAL_CURVES["S"])
+            KF = capped_counts(muF, lat["F"], 600, M, VAL_CURVES["F"])
+            for e, (p, q) in enumerate(cells):
+                for r in range(R):
+                    out.setdefault((p, q, r), {})[h] = (int(KC[e, r]), int(KS[e, r]))
+            for i, p in enumerate(prey):
+                for r in range(R):
+                    out.setdefault((p, None, r), {})[h] = (None, int(KF[i, r]))
+        return out
+
+    def bundle(self, row, engine=ENGINE):
+        p = (row["prey"]["world"], row["prey"]["time"])
+        q = None if row["predators"] is None else (row["predators"]["world"], row["predators"]["time"])
+        got = self.counts.get((p, q, row["replicate"]), {})
+        hz = [{"steps": h, "captures": got.get(h, (None if q is None else 0, 0))[0],
+               "survivors": got.get(h, (0, 0))[1]} for h in nb.HORIZONS]
+        return {"cell": row, "score": {"n_start": 600, "horizons": hz}, "binary_sha256": engine,
+                "tools_sha256": {"run.py": rqlib.sha256_bytes(b"run"), "cell.py": rqlib.sha256_bytes(b"cell")}}
+
+    def bind(self, **over):
+        b = {"observations_sha256": rqlib.sha256_file(self.obs), "plan_sha256": rqlib.sha256_file(self.plan),
+             "design_file_sha256": rqlib.sha256_file(self.design), "ages_sha256": material.AGES_SHA256,
+             "bank_root": self.root}
+        b.update(over)
+        return b
+
+    def path(self, name):
+        return os.path.join(self.tmp, name)
+
+
+def _walk(node, path=()):
+    """Every (path, value) below node: dict keys and the first element of each list."""
+    if isinstance(node, dict):
+        for k, v in node.items():
+            yield path + (k,), v
+            yield from _walk(v, path + (k,))
+    elif isinstance(node, list) and node:
+        yield path + (0,), node[0]
+        yield from _walk(node[0], path + (0,))
+
+
+def _edit(doc, path, value=None, delete=False):
+    d = copy.deepcopy(doc)
+    x = d
+    for k in path[:-1]:
+        x = x[k]
+    if delete:
+        del x[path[-1]]
+    else:
+        x[path[-1]] = value
+    return d
+
+
+@unittest.skipIf(np is None, "numpy is not installed")
+class TestD8Refit(unittest.TestCase):
+    """The registered-size synthetic world through provenance and estimate-d8 (receipt, ledger) into obslaw's strict
+    loader (the round trip); T5-1 (every binding of v5 2.1), T4-5 (support), R4 (ceilings), R7, D3's nu0 domain."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp()
+        cls.w = D8World(cls.tmp)
+        w = cls.w
+        cls.prov = w.path("prov.json")
+        nb.run_provenance(w.root, w.design, w.plan, w.obs, None, cls.prov, w.ledger, bindings=w.bindings)
+        cls.val = w.path("val.json")
+        rqlib.write_json_durable(cls.val, {"schema": nb.D8_REPORT_SCHEMA, "synthetic_banks": True, "test": True})
+        cls.out, cls.receipt = w.path("bank3.json"), w.path("receipt.json")
+        cls.art = nb.run_estimate_d8(w.obs, w.ages, w.design, w.plan, cls.prov, cls.val, cls.out, cls.receipt, w.ledger,
+                                     ["estimate-d8", "(test)"], bindings=w.bindings)
+        cls.inputs = {k: cls.art["inputs"][k] for k in ol.REGISTERED_INPUTS}
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp)
+
+    def load(self, doc=None):
+        """obslaw's strict loader with this world's four input hashes as the registered ones (test bindings)."""
+        path = self.out
+        if doc is not None:
+            path = os.path.join(self.tmp, "variant.json")
+            rqlib.write_json_durable(path, doc)
+        with mock.patch.dict(ol.REGISTERED_INPUTS, self.inputs):
+            return ol.BankArtifact(path, sha256=rqlib.sha256_file(path), allow_synthetic=True)
+
+    def refit(self, **over):
+        w = self.w
+        kw = dict(obs_path=w.obs, ages_path=w.ages, design_path=w.design, plan_path=w.plan,
+                  provenance_path=self.prov, validation_path=self.val, bindings=w.bindings, boot=1)
+        kw.update(over)
+        return nb.estimate_d8(**kw)
+
+    def test_round_trip_the_strict_loader_accepts_what_estimate_d8_writes(self):
+        """What estimate-d8 writes on the synthetic store, obslaw's strict loader (v5 4.2, clarification 1) accepts:
+        bank/3, synthetic (test bindings), no estimator.seed (C1), C2's streams, C5's rule, C4's declarations and
+        C7's screen counts; noise and map_variance built from the 5k record (C9)."""
+        bank = self.load()
+        a = self.art
+        self.assertEqual((a["schema"], a["status"], a["synthetic"]), ("finfolk.redqueen.noisebank.bank/3",
+                                                                      "d8-fitted", True))
+        self.assertNotIn("engine_sha256", a)
+        self.assertEqual(a["fit"]["noise"]["engine_sha256"], ENGINE)
+        self.assertNotIn("seed", a["estimator"])
+        self.assertEqual(a["estimator"]["boot"], 999)
+        self.assertEqual(a["map_variance"]["rule"], ol.MAP_VARIANCE_RULE)
+        self.assertEqual(a["fit"]["streams"]["bootstrap"]["texts"],
+                         [f"AnnexH/D8/1/noisebank/D8-refit/h{h}/bootstrap" for h in (5000, 10000, 20000)])
+        for h in ("10000", "20000"):
+            for ch in "SF":
+                self.assertEqual(a["horizons"][h]["channels"][ch]["status"], "structural_zero")
+            self.assertEqual(survival_paths(dict(a["horizons"][h], channels={})), [])
+        for ch in "CSF":
+            self.assertIn("screened", a["horizons"]["5000"]["channels"][ch])
+        self.assertEqual(a["map_variance"]["nu0"], a["horizons"]["5000"]["nu0"])
+        self.assertEqual(bank.M_H, 247)
+        self.assertEqual(a["inputs"]["provenance_sha256"], rqlib.sha256_file(self.prov))
+        self.assertEqual(a["fit"]["noise"]["inputs_sha256"], rqlib.canonical_sha(a["inputs"]))
+        self.assertEqual(a["fit"]["noise"]["implementation_sha256"], rqlib.canonical_sha(
+            {f: rqlib.sha256_file(os.path.join(HERE, f)) for f in
+             ("noisebank.py", "noisescale.py", "obslaw.py", "common.py", "material.py", "plan.py", "store.py",
+              "rqlib.py", "fixtures/registered_ages.json")}))
+        with self.assertRaisesRegex(ol.ObsLawError, "synthetic: true is refused"):
+            with mock.patch.dict(ol.REGISTERED_INPUTS, self.inputs):
+                ol.BankArtifact(self.out)
+
+    def test_round_trip_every_single_field_corruption_is_refused(self):
+        """Each single-field corruption of the written artifact is refused by the loader: every key deleted at every
+        level, and every scalar (and each list's first element) replaced by null."""
+        doc = rqlib.read_json(self.out)
+        self.load(doc)
+        admitted = {("deleted", ("horizons", h, "groups")) for h, r in doc["horizons"].items()   # (C4.1: both
+                    if r["status"] == "unavailable" and "groups" in r}                       # unavailable shapes)
+        accepted = []
+        n = 0
+        for path, v in list(_walk(doc)):
+            variants = [("null", _edit(doc, path, None))] if v is not None and not isinstance(v, (dict, list)) else []
+            if isinstance(path[-1], str):
+                variants.append(("deleted", _edit(doc, path, delete=True)))
+            for how, d in variants:
+                if (how, path) in admitted:
+                    continue
+                n += 1
+                try:
+                    self.load(d)
+                except ol.ObsLawError:
+                    continue
+                accepted.append((how, path))
+        self.assertGreater(n, 500)
+        self.assertEqual(accepted, [], f"{len(accepted)} of {n} corruptions accepted")
+
+    def test_receipt_written_first_and_bound_and_the_ledger_charged(self):
+        """v5 2.8 L755-757, 2.11: the receipt (command line, tool and input hashes, Python / NumPy, host, UTC, CPU
+        seconds, the ledger entry) is written durably BEFORE the artifact, which binds its sha256; the run is charged
+        to the D5 ledger once (calib.ledger_add's line format), and a failed run is charged too."""
+        rc = rqlib.read_json(self.receipt)
+        self.assertEqual(self.art["fit"]["noise"]["receipt_sha256"], rqlib.sha256_file(self.receipt))
+        self.assertEqual(rc["schema"], "finfolk.redqueen.noisebank.d8refitreceipt/1")
+        self.assertEqual(rc["inputs"], self.art["inputs"])
+        self.assertEqual(rc["implementation_sha256"], self.art["fit"]["noise"]["implementation_sha256"])
+        for k in ("command", "tools", "python", "numpy", "host", "utc_start", "utc_end", "cpu_s", "ledger_entry"):
+            self.assertIn(k, rc)
+        led = [json.loads(x) for x in rqlib.read_text(self.w.ledger).splitlines()]
+        kinds = [e["kind"] for e in led]
+        self.assertEqual(kinds.count("D8-noisebank-refit"), 1)
+        self.assertEqual(kinds.count("D8-noisebank-provenance"), 1)
+        e = led[kinds.index("D8-noisebank-refit")]
+        self.assertEqual({k: v for k, v in e.items() if k != "utc"}, rc["ledger_entry"])
+        self.assertEqual(json.dumps(e, sort_keys=True), rqlib.read_text(self.w.ledger).splitlines()[kinds.index(
+            "D8-noisebank-refit")])
+        self.assertGreater(e["cpu_s"], 0)
+        order = []
+        real = rqlib.write_json_durable
+        tmp = tempfile.mkdtemp()
+        try:
+            led2 = os.path.join(tmp, "ledger.jsonl")
+            with mock.patch.object(rqlib, "write_json_durable", lambda p, o: (order.append(os.path.basename(p)),
+                                                                             real(p, o))):
+                w = self.w
+                nb.run_estimate_d8(w.obs, w.ages, w.design, w.plan, self.prov, self.val, os.path.join(tmp, "a.json"),
+                                   os.path.join(tmp, "r.json"), led2, ["x"], bindings=w.bindings, boot=1)
+            self.assertEqual(order, ["r.json", "a.json"])
+            with self.assertRaises(nb.NoiseBankError):
+                nb.run_estimate_d8(w.obs, w.ages, w.design, w.plan, self.prov, self.val, os.path.join(tmp, "b.json"),
+                                   os.path.join(tmp, "s.json"), led2, ["x"],
+                                   bindings=w.bind(plan_sha256="0" * 64), boot=1)
+            self.assertFalse(os.path.exists(os.path.join(tmp, "s.json")))
+            led = [json.loads(x) for x in rqlib.read_text(led2).splitlines()]
+            self.assertEqual([x["status"] for x in led], ["ok", "failed"])
+        finally:
+            shutil.rmtree(tmp)
+
+    def test_T5_1_every_binding_of_2_1_is_refused(self):
+        """estimate_d8 refuses each wrong binding of v5 2.1 (R1, the four file hashes BEFORE parsing; R5 the
+        provenance receipt), the obs schema / missing / plan / design identities, the parsed ages, a plan row's ages
+        hash, a missing allocation (R2) and an unmatched control."""
+        w = self.w
+        junk = w.path("junk.json")
+        with open(junk, "wb") as f:
+            f.write(b"not json at all")
+        for key, arg in (("observations_sha256", "obs_path"), ("plan_sha256", "plan_path"),
+                         ("design_file_sha256", "design_path"), ("ages_sha256", "ages_path")):
+            with self.subTest(file=key), self.assertRaisesRegex(nb.NoiseBankError, "refused before parsing"):
+                self.refit(**{arg: junk})
+            with self.subTest(binding=key), self.assertRaisesRegex(nb.NoiseBankError, "is not the bound"):
+                self.refit(bindings=w.bind(**{key: "0" * 64}))
+        doc = rqlib.read_json(w.obs)
+
+        def obs_variant(name, d):
+            p = w.path(name)
+            rqlib.write_json_durable(p, d)
+            return {"obs_path": p, "bindings": w.bind(observations_sha256=rqlib.sha256_file(p))}
+        cases = [
+            ("schema", obs_variant("o1.json", dict(doc, schema="finfolk.redqueen.noisebank.obs/0")), "schema"),
+            ("missing", obs_variant("o2.json", dict(doc, missing=["x"])), "complete bank"),
+            ("plan_sha256", obs_variant("o3.json", dict(doc, plan_sha256="1" * 64)), "plan_sha256"),
+            ("design_sha256", obs_variant("o4.json", dict(doc, design_sha256="2" * 64)), "design_sha256"),
+        ]
+        ages2 = w.path("ages2.json")
+        rqlib.write_json_durable(ages2, dict(material.registered_ages(), max_age=121.0))
+        cases.append(("ages content", {"ages_path": ages2, "bindings": w.bind(ages_sha256=rqlib.sha256_file(ages2))},
+                      "registered_ages"))
+        rows = copy.deepcopy(w.rows)
+        rows[5]["ages"]["sha256"] = "3" * 64
+        p2 = w.path("plan2.jsonl")
+        plan.write_plan(rows, p2)
+        d2 = dict(doc, plan_sha256=rqlib.sha256_file(p2))
+        ov = obs_variant("o5.json", d2)
+        cases.append(("plan row ages", dict(ov, plan_path=p2, bindings=dict(ov["bindings"],
+                                                                             plan_sha256=rqlib.sha256_file(p2))),
+                      "ages.sha256"))
+        prov = rqlib.read_json(self.prov)
+        for k, v in (("bank_root", "/elsewhere"), ("observations_sha256", "4" * 64), ("cells", 18431),
+                     ("engine_sha256", "x"), ("schema", "finfolk.redqueen.noisebank.provenance/0"),
+                     ("reconstruction", dict(prov["reconstruction"], equals_frozen=False))):
+            p = w.path(f"prov_{k}.json")
+            rqlib.write_json_durable(p, dict(prov, **{k: v}))
+            cases.append((f"provenance {k}", {"provenance_path": p}, "provenance receipt"))
+        pv = w.path("val0.json")
+        rqlib.write_json_durable(pv, {"schema": "something else"})
+        cases.append(("validation report", {"validation_path": pv}, "validation report"))
+        lost = dict(doc, observations=doc["observations"][:-1])
+        cases.append(("missing allocation", obs_variant("o6.json", lost), "incomplete registered bank allocation"))
+        moved = copy.deepcopy(doc)
+        ex = next(o for o in moved["observations"] if o["pred"] is not None)
+        ex["replicate"] = 64
+        cases.append(("unmatched control", obs_variant("o7.json", moved), "allocation"))
+        for name, kw, msg in cases:
+            with self.subTest(case=name), self.assertRaisesRegex(nb.NoiseBankError, msg):
+                self.refit(**kw)
+        obs = copy.deepcopy(doc["observations"])
+        o = next(x for x in obs if x["pred"] is not None)
+        same = [x for x in obs if x["prey"] == o["prey"]]                    # (this prey snapshot's observations)
+        nb.d8_matched_controls(same)
+        lost = sum(1 for x in same if x["pred"] is not None and x["replicate"] == o["replicate"])
+        self.assertEqual(lost, 8)                                           # (its 8 predators at that replicate)
+        same = [x for x in same if not (x["pred"] is None and x["replicate"] == o["replicate"])]
+        with self.assertRaisesRegex(nb.NoiseBankError, f"^{lost} exposed observations have no matched free control"):
+            nb.d8_matched_controls(same)
+
+    def test_T4_5_support_violation_refuses_with_counts_only(self):
+        """A survivor count 248 at 5k and 1 at 10k refuse the whole refit (R3); the refusal reports only the number
+        of violating observations per horizon and channel."""
+        doc = rqlib.read_json(self.w.obs)
+        frees = [o for o in doc["observations"] if o["pred"] is None]
+        ex = [o for o in doc["observations"] if o["pred"] is not None]
+        frees[0]["horizons"]["5000"]["survivors"] = 248
+        ex[0]["horizons"]["10000"]["survivors"] = 1
+        ex[1]["horizons"]["20000"]["captures"] = 1285
+        p = self.w.path("o_support.json")
+        rqlib.write_json_durable(p, doc)
+        with self.assertRaises(nb.NoiseBankError) as cm:
+            self.refit(obs_path=p, bindings=self.w.bind(observations_sha256=rqlib.sha256_file(p)))
+        msg = str(cm.exception)
+        self.assertIn('{"10000": {"S": 1}, "20000": {"C": 1}, "5000": {"F": 1}}', msg)
+        for v in ("248", "1285", frees[0]["cell"], ex[0]["cell"]):
+            self.assertNotIn(v, msg)
+        self.assertIn("the whole refit is refused", msg)
+
+    def test_R4_ceilings_from_the_clock(self):
+        """The ceilings come from #90's clock through material.cohort_ceiling and must be 247 / 0 / 0 (R4); a changed
+        clock helper changes them and refuses."""
+        self.assertEqual(nb.d8_ceilings(), {"5000": 247, "10000": 0, "20000": 0})
+        with mock.patch.object(material, "cohort_ceiling", lambda ages, h, dt: 246 if h == 5000 else 0):
+            with self.assertRaisesRegex(nb.NoiseBankError, "R4"):
+                self.refit()
+        import common
+        with mock.patch.object(common, "age_feasible_count", lambda *a, **k: 3):
+            with self.assertRaisesRegex(nb.NoiseBankError, "R4"):
+                nb.d8_ceilings()
+
+    def test_R7_unavailable_artifact_and_D3_nu0_domain(self):
+        """R7: no 5k curve, or nu0_C unavailable, or a 5k fit not ok -> status unavailable and noise.available false,
+        which the loader refuses. Clarification 2 D3: an estimated nu0 must be finite and > 0 to be emitted."""
+        fit = {"inputs": self.art["inputs"], "horizons": copy.deepcopy(self.art["horizons"]), "engine_sha256": ENGINE,
+               "ceilings": dict(CEIL), "boot": 999, "z_intervals": nb.Z_INTERVALS, "synthetic": True}
+        for name, change in (("no S curve", lambda h: h["scales"].update(S=None)),
+                             ("nu0 C unavailable",
+                              lambda h: h["nu0"].update(C={"status": "unavailable", "reason": "x"})),
+                             ("5k unavailable", lambda h: h.update(status="unavailable", reasons=["x"]))):
+            f = copy.deepcopy(fit)
+            change(f["horizons"]["5000"])
+            art = nb.d8_artifact(f, "5" * 64)
+            with self.subTest(case=name):
+                self.assertEqual((art["status"], art["noise"]["available"]), ("unavailable", False))
+                with self.assertRaisesRegex(ol.ObsLawError, "status 'unavailable'"):
+                    self.load(art)
+        for bad in (0.0, -1.0, -5e-324, math.inf, float("nan"), True, "1"):
+            f = copy.deepcopy(fit)
+            f["horizons"]["5000"]["nu0"]["C"] = {"status": "estimated", "nu0": bad, "excess_log_variance": 0.1,
+                                                 "sampling_log_variance": 0.1, "cells": 4}
+            with self.subTest(nu0=bad), self.assertRaisesRegex(nb.NoiseBankError, "D3"):
+                nb.d8_artifact(f, "5" * 64)
+
+
+@unittest.skipIf(np is None, "numpy is not installed")
+class TestD8Provenance(unittest.TestCase):
+    """T5-2 and T5-6 on a small synthetic store (v5 2.2): the binding by reconstruction and the store integrity
+    checks, each refusal by its own cause."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.w = D8World(self.tmp, small=True)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def prov(self, **kw):
+        w = self.w
+        args = dict(study=w.root, design_path=w.design, plan_path=w.plan, obs_path=w.obs, manifest_path=None,
+                    bindings=w.bindings)
+        args.update(kw)
+        return nb.provenance(**args)
+
+    def rebuild(self, bundles):
+        shutil.rmtree(self.w.root)
+        _write_store(self.w.root, bundles, per_chunk=4)
+
+    def test_T5_6_passes_on_an_intact_store_and_emits_no_score(self):
+        rec = self.prov()
+        self.assertEqual(rec["schema"], "finfolk.redqueen.noisebank.provenance/1")
+        self.assertEqual(rec["reconstruction"]["equals_frozen"], True)
+        self.assertEqual(rec["reconstruction"]["canonical_sha256"], rqlib.sha256_file(self.w.obs))
+        self.assertEqual((rec["engine_sha256"], rec["cells"], rec["ages_sha256"]), (ENGINE, 12, material.AGES_SHA256))
+        self.assertEqual(rec["store"], {"index_sha256": rqlib.sha256_file(os.path.join(self.w.root, "chunks",
+                                                                                         "index.jsonl")),
+                                        "chunks_verified_all": 3, "chunks_verified_members": 3})
+        self.assertEqual(rec["manifest"], {"sha256": None, "covers_chunks": False, "chunks_checked": 0})
+        text = json.dumps(rec)
+        for k in ("score", "survivors", "captures", "horizons"):
+            self.assertNotIn(f'"{k}"', text, "the receipt reports no score field")
+        self.assertEqual(set(rec), {"schema", "bank_root", "observations_sha256", "store", "reconstruction",
+                                    "plan_sha256", "design_sha256", "manifest", "cells", "engine_sha256",
+                                    "tools_sha256", "ages_sha256"})
+
+    def test_T5_2_two_engine_binaries_are_refused(self):
+        b = dict(self.w.bundles)
+        cid = sorted(b)[3]
+        b[cid] = self.w.bundle(next(r for r in self.w.rows if r["id"] == cid), engine=rqlib.sha256_bytes(b"other"))
+        self.rebuild(b)
+        with self.assertRaisesRegex(nb.NoiseBankError, "2 engine binaries"):
+            self.prov()
+
+    def test_T5_2_a_wrong_ages_hash_is_refused(self):
+        w = self.w
+        rows = copy.deepcopy(w.rows)
+        rows[0]["ages"]["sha256"] = "3" * 64
+        plan.write_plan(rows, w.plan)
+        self.rebuild({r["id"]: dict(w.bundle(r)) for r in rows})
+        rqlib.write_json_durable(w.obs, nb.collect(w.root, w.design_doc, w.plan))
+        with self.assertRaisesRegex(nb.NoiseBankError, "ages.sha256 is not the registered"):
+            self.prov(bindings=w.bind())
+
+    def test_T5_2_a_cell_set_mismatch_is_refused(self):
+        w = self.w
+        doc = rqlib.read_json(w.obs)
+        doc["observations"][0]["cell"] = "someone-else"
+        rqlib.write_json_durable(w.obs, doc)
+        with self.assertRaisesRegex(nb.NoiseBankError, "stored cell set differs"):
+            self.prov(bindings=w.bind())
+
+    def test_T5_6_one_changed_score_breaks_the_reconstruction(self):
+        b = copy.deepcopy(self.w.bundles)
+        cid = sorted(b)[2]
+        b[cid]["score"]["horizons"][0]["survivors"] += 1
+        self.rebuild(b)
+        with self.assertRaisesRegex(nb.NoiseBankError, "reconstruction's canonical sha256 .* is not the frozen"):
+            self.prov()
+
+    def test_T5_6_a_repacked_chunk_is_refused_by_the_index_alone(self):
+        """A chunk repacked (deflated as pack() writes, at another level and in reverse member order) with every
+        bundle.json member identical: store.verify_all(deep) reports its size / sha256 against the index, with no
+        manifest."""
+        import store
+        import zipfile
+        name = "chunk_000002.zip"
+        p = os.path.join(self.w.root, store.CHUNKS, name)
+        old = rqlib.sha256_file(p)
+        with zipfile.ZipFile(p) as z:
+            members = [(i.filename, z.read(i.filename)) for i in z.infolist()]
+        with zipfile.ZipFile(p, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1) as z:
+            for n, data in reversed(members):
+                z.writestr(n, data)
+        self.assertNotEqual(rqlib.sha256_file(p), old)
+        _, cells = store.load_index(self.w.root)
+        self.assertEqual([store.read_member(self.w.root, c, cells=cells) for c in sorted(cells)
+                          if cells[c][0]["chunk"] == name],
+                         [rqlib.canonical(self.w.bundles[c]) for c in sorted(cells) if cells[c][0]["chunk"] == name])
+        with self.assertRaisesRegex(nb.NoiseBankError, r"verify_all\(deep=True\) reports 1 problem"):
+            self.prov()
+
+    def test_T5_6_an_extra_member_is_refused_by_verify_chunk(self):
+        import store
+        import zipfile
+        name = "chunk_000001.zip"
+        p = os.path.join(self.w.root, store.CHUNKS, name)
+        with zipfile.ZipFile(p, "a", compression=zipfile.ZIP_DEFLATED) as z:     # (deflated, as pack() writes)
+            z.writestr("intruder/bundle.json", b"{}")
+        ip = os.path.join(self.w.root, store.INDEX)
+        recs = [json.loads(x) for x in rqlib.read_text(ip).splitlines()]
+        recs[0].update(sha256=rqlib.sha256_file(p), bytes=os.path.getsize(p))
+        with open(ip, "wb") as f:
+            f.write(b"".join(rqlib.canonical(r) for r in recs))
+        self.assertEqual(store.verify_all(self.w.root, deep=True), [])
+        with self.assertRaisesRegex(nb.NoiseBankError, r"verify_chunk\(chunk_000001.zip\) reports .*members differ "
+                                                       r"from the record"):
+            self.prov()
+
+    def test_T5_6_the_manifest_when_given(self):
+        """A manifest covering every chunk is checked and recorded (covers_chunks); one that disagrees refuses; one
+        that lists no chunk is recorded as not covering (the store checks ran anyway)."""
+        import store
+        root = self.w.root
+        chunks = sorted(os.listdir(os.path.join(root, store.CHUNKS)))
+        chunks = [c for c in chunks if c.endswith(".zip")]
+        good = "".join(f"{rqlib.sha256_file(os.path.join(root, store.CHUNKS, c))}  chunks/{c}\n" for c in chunks)
+        mp = self.w.path("continue.sha256")
+        with open(mp, "w") as f:
+            f.write(good)
+        rec = self.prov(manifest_path=mp)
+        self.assertEqual(rec["manifest"], {"sha256": rqlib.sha256_file(mp), "covers_chunks": True,
+                                           "chunks_checked": len(chunks)})
+        with open(mp, "w") as f:
+            f.write(good.replace(good[:64], "f" * 64, 1))
+        with self.assertRaisesRegex(nb.NoiseBankError, "differs from the manifest"):
+            self.prov(manifest_path=mp)
+        with open(mp, "w") as f:
+            f.write(f"{'a' * 64}  config/other.json\n")
+        self.assertEqual(self.prov(manifest_path=mp)["manifest"]["covers_chunks"], False)
+
+    def test_T5_6_a_non_registered_root_is_refused_by_path(self):
+        copy_root = self.w.path("copy_of_bank")
+        shutil.copytree(self.w.root, copy_root)
+        with self.assertRaisesRegex(nb.NoiseBankError, "is not the registered bank root"):
+            self.prov(study=copy_root)
+        link = self.w.path("link_to_bank")
+        os.symlink(self.w.root, link)
+        with self.assertRaisesRegex(nb.NoiseBankError, "is not the registered bank root"):
+            self.prov(study=link)
+        self.assertEqual(nb.d8_bindings()["bank_root"], "/home/harit/finfolk/redqueen_noisebank_2026")
+
+    def test_the_cli_charges_the_ledger_and_keeps_the_starting_guard(self):
+        """provenance through the CLI: the D5 ledger is charged (kind D8-noisebank-provenance); with fewer than 25
+        CPU-h left it is refused before any work (v5 2.11 / 7's starting guard)."""
+        w = self.w
+        out = w.path("p.json")
+        args = ["provenance", "--study", w.root, "--design", w.design, "--plan", w.plan, "--obs", w.obs, "--out", out,
+                "--ledger", w.ledger]
+        with mock.patch.object(nb, "d8_bindings", return_value=w.bindings), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(nb.main(args), 0)
+            led = [json.loads(x) for x in rqlib.read_text(w.ledger).splitlines()]
+            self.assertEqual([(e["kind"], e["status"]) for e in led], [("D8-noisebank-provenance", "ok")])
+            os.remove(out)
+            with open(w.ledger, "a") as f:
+                f.write(json.dumps({"kind": "calibration", "cpu_s": 216.5 * 3600}) + "\n")
+            self.assertEqual(nb.main(args), 2)
+        self.assertFalse(os.path.exists(out))
+        self.assertEqual(len(rqlib.read_text(w.ledger).splitlines()), 2)
+
+
+@unittest.skipIf(np is None, "numpy is not installed")
+class TestD8Validation(unittest.TestCase):
+    """v5 2.10's machinery (T4-6 itself is the server's registered-size run): the spec, the synthetic banks on the
+    D8 validation streams, V1-V5, an end-to-end run at a test size."""
+
+    def small(self):
+        """A test-size structure (4 worlds x 2 times, crossed with the partner) and a design file bound by hash."""
+        worlds = [f"w{i}" for i in range(4)]
+        prey = sorted((w, t) for w in worlds for t in nb.TIMES[:2])
+        partner = {w: worlds[(k + 1) % 4] for k, w in enumerate(worlds)}
+        pairs = sorted((q, (wp, tp)) for q in prey for wp in (q[0], partner[q[0]]) for tp in nb.TIMES[:2])
+        return pairs, prey, sorted({p for _, p in pairs})
+
+    def test_the_spec_is_v5s_declared_parameters(self):
+        spec = nb.d8_validation_spec("a" * 64)
+        SR, SD, SE = val_components()
+        self.assertTrue(np.allclose(spec["parameters"]["SigmaR"], SR, atol=1e-15, rtol=0))
+        self.assertEqual((spec["parameters"]["SigmaD"], spec["parameters"]["SigmaE"]), (SD, SE))
+        self.assertEqual(spec["parameters"]["curves"], VAL_CURVES)
+        self.assertEqual(spec["size"], {"R": 64, "B": 324, "N": 600, "M": 247, "horizon": 5000})
+        self.assertEqual(spec["streams"]["banks"], [f"bank{k}" for k in range(1, 11)])
+        self.assertEqual(spec["streams"]["purposes"], ["means", "rows", "donors", "cells", "free"])
+        self.assertEqual(spec["streams"]["text"], "AnnexH/D8/1/noisebank/D8-validation/{bank}/{purpose}")
+        self.assertEqual(nb.d8_validation_spec("a" * 64, 2)["streams"]["banks"],
+                         [f"bank{k}-r2" for k in range(1, 11)])
+        self.assertEqual((spec["acceptance"]["V2"]["floor"], spec["acceptance"]["V2"]["se_multiplier"]), (0.02, 2.6))
+        self.assertEqual((spec["acceptance"]["V3"]["points"], spec["acceptance"]["V3"]["dev_max"],
+                          spec["acceptance"]["V3"]["avg"]), (201, 0.10, [0.95, 1.05]))
+        th = nb.d8_validation_truth()[3]
+        for k, v in THETA_TRUTH.items():
+            self.assertAlmostEqual(th[k], v, places=15)
+
+    def test_banks_are_drawn_on_the_D8_validation_streams(self):
+        """Each bank's purposes are distinct D8 streams (seed = the text's first 8 sha256 bytes, recorded with its
+        first two outputs); the means lie in v5's declared ranges; survival is capped at 247 (and 0 for M = 0); the
+        draw is deterministic."""
+        spec = nb.d8_validation_spec("a" * 64)
+        st = self.small()
+        obs, recs = nb.d8_validation_bank(spec, "bank3", st, R=8)
+        obs2, _ = nb.d8_validation_bank(spec, "bank3", st, R=8)
+        self.assertEqual(obs, obs2)
+        seeds = set()
+        for p in ("means", "rows", "donors", "cells", "free"):
+            t = f"AnnexH/D8/1/noisebank/D8-validation/bank3/{p}"
+            s = int.from_bytes(hashlib.sha256(t.encode()).digest()[:8], "little")
+            g = rqlib.SplitMix64(s)
+            self.assertEqual((recs[p]["text"], recs[p]["seed"], recs[p]["first_outputs"]), (t, s, [g.next64(),
+                                                                                                  g.next64()]))
+            seeds.add(s)
+        self.assertEqual(len(seeds), 5)
+        surv = [o["horizons"]["5000"]["survivors"] for o in obs]
+        self.assertLessEqual(max(surv), 247)
+        self.assertGreater(sum(v == 247 for v in surv), 10)
+        g = rqlib.SplitMix64(recs["means"]["seed"])
+        u = [(g.next64() >> 11) * 2.0 ** -53 for _ in range(2 * len(st[0]) + len(st[1]))]
+        z0 = -2 + 4 * u[0]
+        self.assertTrue(-2 <= z0 < 2)
+        obs0, _ = nb.d8_validation_bank(spec, "bank11", st, M=0, R=8)
+        self.assertEqual({o["horizons"]["5000"]["survivors"] for o in obs0}, {0})
+        self.assertNotEqual(nb.d8_validation_bank(spec, "bank4", st, R=8)[0], obs)
+
+    def test_V1_to_V5_criteria(self):
+        """V1-V5 as v5 2.10 defines them, at their boundaries (crafted per-bank results)."""
+        spec = nb.d8_validation_spec("a" * 64)
+        names = spec["streams"]["banks"]
+
+        def bank(dth=0.0, dev=0.05, avg=1.0, status="ok"):
+            return {"status": status, "curves": {ch: VAL_CURVES[ch] for ch in "CSF"},
+                    "theta": {k: v + dth for k, v in THETA_TRUTH.items()},
+                    "v3": {ch: {"dev": dev, "avg": avg} for ch in "CSF"}}
+        v5ok = {"status": "ok", "channels": {"C": {}, "S": dict(ol.STRUCTURAL_ZERO), "F": dict(ol.STRUCTURAL_ZERO)},
+                "scales": {"C": VAL_CURVES["C"]}, "components": {"fit": "unconstrained"}}
+        good = {b: bank() for b in names}
+        c = nb.d8_validation_criteria(spec, good, {}, v5ok)
+        self.assertTrue(c["accepted"])
+        cases = {
+            "V1 status": ({**good, names[3]: bank(status="unavailable")}, "V1"),
+            "V1 curve": ({**good, names[0]: dict(bank(), curves={"C": VAL_CURVES["C"], "S": None,
+                                                                 "F": VAL_CURVES["F"]})}, "V1"),
+            "V2 bias 0.021": ({b: bank(dth=0.021) for b in names}, "V2"),
+            "V3 dev": ({b: bank(dev=0.11) for b in names}, "V3"),
+            "V3 avg low": ({b: bank(avg=0.94) for b in names}, "V3"),
+            "V3 avg high": ({b: bank(avg=1.06) for b in names}, "V3"),
+        }
+        for name, (banks, which) in cases.items():
+            with self.subTest(case=name):
+                c = nb.d8_validation_criteria(spec, banks, {}, v5ok)
+                self.assertFalse(c[which]["pass"])
+                self.assertFalse(c["accepted"])
+        c = nb.d8_validation_criteria(spec, {b: bank(dth=0.019) for b in names}, {}, v5ok)
+        self.assertTrue(c["V2"]["pass"])
+        spread = {b: bank(dth=(0.03 if k % 2 else -0.03) + 0.02) for k, b in enumerate(names)}
+        c = nb.d8_validation_criteria(spec, spread, {}, v5ok)
+        self.assertTrue(c["V2"]["pass"], "2.6 SE above the floor admits a larger bias")
+        self.assertTrue(nb.d8_validation_criteria(spec, {b: bank(dev=0.10, avg=1.05) for b in names}, {}, v5ok)["V3"]
+                        ["pass"])
+        half = {b: bank(dev=0.2 if k < 4 else 0.05) for k, b in enumerate(names)}
+        self.assertTrue(nb.d8_validation_criteria(spec, half, {}, v5ok)["V3"]["pass"], "the median over banks")
+        for bad in (dict(v5ok, status="unavailable"), dict(v5ok, channels={"C": {}, "S": {}, "F": {}}),
+                    dict(v5ok, scales={"C": {}, "S": {}}), dict(v5ok, components=None)):
+            with self.subTest(v5=bad):
+                c = nb.d8_validation_criteria(spec, good, {}, bad)
+                self.assertFalse(c["V5"]["pass"] or c["accepted"])
+        leg = {names[0]: {"S": {"dev": 0.4, "avg": 0.7}, "F": {"dev": 0.05, "avg": 1.0}}}
+        c = nb.d8_validation_criteria(spec, good, leg, v5ok)
+        self.assertTrue(c["V4"]["shows_bias"] and c["accepted"], "V4 is reported, not an acceptance rule")
+
+    def test_one_validation_bank_fits_as_estimate_d8_does(self):
+        """A validation bank (test size: the 4 x 2 structure, R = 12; the registered size is the server's) fitted at
+        5k on its own `bootstrap` purpose: ok with all three curves, and V3's statistics computed from its usable
+        cells."""
+        spec = nb.d8_validation_spec("a" * 64)
+        obs, _ = nb.d8_validation_bank(spec, "bank1", self.small(), R=12)
+        text = "AnnexH/D8/1/noisebank/D8-validation/bank1/bootstrap"
+        rec = nb.horizon_estimate_d8(nb.arrays(obs, 5000, CEIL), 5000, 1, M, text=text)
+        res = nb._bank_result(rec)
+        self.assertEqual(res["status"], "ok", rec["reasons"])
+        self.assertTrue(all(res["curves"][ch] is not None for ch in "CSF"))
+        for ch in "CSF":
+            st = nb._v3_stats([p[0] for p in rec["curve_points"][ch]], res["curves"][ch], VAL_CURVES[ch], spec)
+            self.assertTrue(st["dev"] >= 0 and 0.5 < st["avg"] < 2, (ch, st))
+
+    def test_end_to_end_orchestration_and_the_spec_binding(self):
+        """validate_d8 (through run_validate_d8, which charges the D5 ledger) on a test-size structure with the 5k fit
+        stubbed by a recorder returning the true parameters (the real fit is tested above and runs on the server):
+        the 10 banks and the M = 0 bank (bank11) are drawn and fitted once each on their own bootstrap streams, every
+        stream recorded, V4's legacy contrast on bank1 and bank2, V1-V5 computed (the stub's exact parameters pass);
+        a changed spec, another round or another design are refused."""
+        tmp = tempfile.mkdtemp()
+        calls = []
+
+        def stub(A, horizon, boot=nb.BOOT, m=nb.Z_INTERVALS, text=None):
+            calls.append((A["M"]["S"], text, boot, A["R"]))
+            if A["M"]["S"] == 0:
+                return {"status": "ok", "reasons": [], "scales": {"C": VAL_CURVES["C"]},
+                        "channels": {"C": {}, "S": dict(ol.STRUCTURAL_ZERO), "F": dict(ol.STRUCTURAL_ZERO)},
+                        "components": {"fit": "unconstrained"}}
+            mu = {ch: np.nanmean(A[ch], axis=1) / A["N"][ch] for ch in "CSF"}
+            SR, SD, SE = val_components()
+            return {"status": "ok", "reasons": [], "scales": VAL_CURVES, "channels": {},
+                    "curve_points": {ch: [[float(x), 0.3] for x in mu[ch] if 0.02 < x < 0.98] for ch in "CSF"},
+                    "components": {"SigmaR": SR, "SigmaD": SD, "SigmaE": SE}}
+        try:
+            dp = os.path.join(tmp, "design.json")
+            rqlib.write_json_durable(dp, {"test": "design"})
+            b = {"observations_sha256": "0" * 64, "plan_sha256": "0" * 64, "design_file_sha256": rqlib.sha256_file(dp),
+                 "ages_sha256": material.AGES_SHA256, "bank_root": tmp}
+            sp = os.path.join(tmp, "spec.json")
+            rqlib.write_json_durable(sp, nb.d8_validation_spec(rqlib.sha256_file(dp)))
+            out, led = os.path.join(tmp, "report.json"), os.path.join(tmp, "ledger.jsonl")
+            with mock.patch.object(nb, "horizon_estimate_d8", stub):
+                rep = nb.run_validate_d8(sp, dp, out, led, bindings=b, m=M, structure=self.small(), R=8)
+            want = [(247, f"AnnexH/D8/1/noisebank/D8-validation/bank{k}/bootstrap", 1, 8) for k in range(1, 11)]
+            self.assertEqual(calls, want + [(0, "AnnexH/D8/1/noisebank/D8-validation/bank11/bootstrap", 1, 8)])
+            self.assertEqual(rep["schema"], "finfolk.redqueen.noisebank.d8validation.report/1")
+            self.assertEqual(sorted(rep["streams"]), sorted([f"bank{k}" for k in range(1, 12)]))
+            self.assertEqual(sorted(rep["streams"]["bank1"]), ["bootstrap", "cells", "donors", "free", "means", "rows"])
+            self.assertEqual(rep["streams"]["bank7"]["rows"]["text"], "AnnexH/D8/1/noisebank/D8-validation/bank7/rows")
+            self.assertEqual(sorted(rep["legacy_V4"]), ["bank1", "bank2"])
+            self.assertEqual({ch for bk in ("bank1", "bank2") for ch in rep["legacy_V4"][bk]}, {"S", "F"})
+            self.assertTrue(rep["acceptance"]["accepted"], rep["acceptance"])
+            self.assertEqual(rep["acceptance"]["V2"]["entries"]["R_SF"]["bias"], 0.0)
+            self.assertEqual(rqlib.read_json(out)["ledger_entry"]["kind"], "D8-noisebank-validation")
+            self.assertEqual([json.loads(x)["kind"] for x in rqlib.read_text(led).splitlines()],
+                             ["D8-noisebank-validation"])
+            spec = rqlib.read_json(sp)
+            for name, d in (("SigmaD", _edit(spec, ("parameters", "SigmaD", 0, 1), 0.06)),
+                            ("banks", _edit(spec, ("streams", "banks", 0), "bank0")),
+                            ("round", dict(spec, round=2))):
+                with self.subTest(spec=name), self.assertRaisesRegex(nb.NoiseBankError, "registered validation spec"):
+                    nb.validate_d8(d, dp, b, m=M, structure=self.small(), R=4)
+            with self.assertRaisesRegex(nb.NoiseBankError, "is not the bound"):
+                nb.validate_d8(spec, dp, dict(b, design_file_sha256="1" * 64), m=M, structure=self.small(), R=4)
+        finally:
+            shutil.rmtree(tmp)
+
+
+@unittest.skipIf(np is None, "numpy is not installed")
+class TestD8Assembly(unittest.TestCase):
+    """v5 2.8's assembly contract in A (the T5-4 conformance with #68 itself is the adoption gate below)."""
+
+    def setUp(self):
+        import test_obslaw as tob
+        self.tmp = tempfile.mkdtemp()
+        self.bank = os.path.join(self.tmp, "bank3.json")
+        rqlib.write_json_durable(self.bank, tob.bank3_doc(synthetic=False))
+        self.mean = {"schema": "finfolk.redqueen.annexH.generator/1", "fitted": True, "theta": [[0.0] * 98] * 2,
+                     "ar": {"rho": [0.7] * 5, "Sigma": np.eye(5).tolist(), "step": 5.0}, "capture_bound": 324,
+                     "replicates": 6, "engine_sha256": "e" * 64,
+                     "fit": {"mean_head": "c_H*sigmoid(eta)",
+                             "mean": {k: "f" * 64 for k in ("implementation_sha256", "inputs_sha256", "receipt_sha256",
+                                                            "engine_sha256")}}}
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def test_the_bank_fields_are_copied_verbatim_with_one_added_key(self):
+        raw = rqlib.read_bytes(self.bank)
+        bank = json.loads(raw)
+        p = nb.assemble_generator(self.bank, self.mean)
+        self.assertEqual(rqlib.canonical(p["noise"]), rqlib.canonical(bank["noise"]))
+        self.assertEqual(set(p["fit"]["noise"]) - set(bank["fit"]["noise"]), {"source_artifact_sha256"})
+        self.assertEqual({k: v for k, v in p["fit"]["noise"].items() if k != "source_artifact_sha256"},
+                         bank["fit"]["noise"])
+        self.assertEqual(p["fit"]["noise"]["source_artifact_sha256"], rqlib.sha256_bytes(raw))
+        self.assertEqual(p["fit"]["noise_likelihood"], bank["fit"]["noise_likelihood"])
+        for k in ("cohort", "cohort_sha256", "horizon", "dt", "support_law", "age_clock", "survivor_ceiling"):
+            self.assertEqual(p[k], bank[k])
+        self.assertEqual((p["engine_sha256"], p["fit"]["mean"]["engine_sha256"]), ("e" * 64, "f" * 64))
+        self.assertNotIn("streams", p["fit"])
+
+    def test_refusals(self):
+        for k in ("noise", "cohort", "survivor_ceiling"):
+            with self.subTest(mean_carries=k), self.assertRaisesRegex(nb.NoiseBankError, "bank-supplied"):
+                nb.assemble_generator(self.bank, dict(self.mean, **{k: 1}))
+        with self.assertRaisesRegex(nb.NoiseBankError, "bank-supplied"):
+            nb.assemble_generator(self.bank, dict(self.mean, fit=dict(self.mean["fit"], noise={})))
+        import test_obslaw as tob
+        rqlib.write_json_durable(self.bank, tob.bank3_doc(synthetic=True))
+        with self.assertRaisesRegex(ol.ObsLawError, "synthetic"):
+            nb.assemble_generator(self.bank, self.mean)
+
+
+_GATE_T5_4 = r'''
+import copy, json, sys
+sys.path.insert(0, sys.argv[1])
+import calib
+req = json.load(sys.stdin)
+bank = open(req["bank"], "rb").read()
+out = {}
+for name, p in req["cases"].items():
+    try:
+        calib.check_params(p, production=True)
+        calib.check_noise_source(p, bank if name != "altered bank bytes" else bank + b" ")
+        out[name] = "pass"
+    except calib.CalibError as e:
+        out[name] = "refused: " + str(e)
+print(json.dumps(out))
+'''
+_MEAN_68 = r'''
+import json, sys
+sys.path.insert(0, sys.argv[1])
+import calib
+p = calib.placeholder_params(n_train=4)
+print(json.dumps({k: p[k] for k in ("schema", "theta", "ar", "capture_bound", "replicates")}))
+'''
+
+
+@unittest.skipIf(np is None, "numpy is not installed")
+@unittest.skipUnless(os.environ.get("RQ_PR68_DIR"), "adoption gate: RQ_PR68_DIR (the root of a read-only extraction "
+                     "of the pinned #68 commit with the engine-field change) not set")
+class TestAdoptionGateT5_4(unittest.TestCase):
+    """T5-4 (v5 2.8, mandatory #68 conformance; adoption gate): A's assembly of a bank/3 artifact plus a synthetic mean
+    block (#68's placeholder parameters, marked fitted for the check) passes #68's check_params(production=True) and
+    check_noise_source at the pinned commit with the engine-field change (the extraction authenticated as in
+    test_obslaw); overwriting fit.noise.engine_sha256, a top-level engine_sha256 other than fit.mean.engine_sha256,
+    one altered SigmaD entry and altered bank bytes each fail. No name-only fallback."""
+
+    def test_T5_4_assembly_conforms_to_pinned_68(self):
+        import subprocess
+        import test_obslaw as tob
+        root = os.environ["RQ_PR68_DIR"]
+        commit, n = tob.pr68_pinned_commit(root)
+        tools = os.path.join(root, "tools", "redqueen")
+        print(f"\nadoption gate T5-4: #68 PINNED_COMMIT {commit} ({n} files match its trusted MANIFEST)",
+              file=sys.stderr)
+        r = subprocess.run([sys.executable, "-I", "-B", "-c", _MEAN_68, tools], capture_output=True, text=True,
+                           timeout=600)
+        self.assertEqual(r.returncode, 0, r.stderr[-2000:])
+        mean = json.loads(r.stdout)
+        mean.update(fitted=True, engine_sha256="e" * 64,
+                    fit={"mean_head": "c_H*sigmoid(eta)",
+                         "mean": {k: "f" * 64 for k in ("implementation_sha256", "inputs_sha256", "receipt_sha256")}})
+        mean["fit"]["mean"]["engine_sha256"] = "e" * 64
+        tmp = tempfile.mkdtemp()
+        try:
+            bank = os.path.join(tmp, "bank3.json")
+            rqlib.write_json_durable(bank, tob.bank3_doc(synthetic=False))
+            p = nb.assemble_generator(bank, mean)
+            cases = {"assembly": p}
+            q = copy.deepcopy(p)
+            q["fit"]["noise"]["engine_sha256"] = "9" * 64
+            cases["overwritten fit.noise.engine_sha256"] = q
+            q = copy.deepcopy(p)
+            q["engine_sha256"] = "8" * 64
+            cases["top-level engine != fit.mean.engine"] = q
+            q = copy.deepcopy(p)
+            q["noise"]["SigmaD"][0][1] = q["noise"]["SigmaD"][1][0] = q["noise"]["SigmaD"][0][1] + 1e-3
+            cases["altered SigmaD"] = q
+            cases["altered bank bytes"] = p
+            r = subprocess.run([sys.executable, "-I", "-B", "-c", _GATE_T5_4, tools], capture_output=True, text=True,
+                               timeout=600, input=json.dumps({"bank": bank, "cases": cases}))
+            self.assertEqual(r.returncode, 0, r.stderr[-2000:])
+            got = json.loads(r.stdout)
+            print(f"adoption gate T5-4 results: {json.dumps(got, sort_keys=True)}", file=sys.stderr)
+            self.assertEqual(got["assembly"], "pass")
+            for k in cases:
+                if k != "assembly":
+                    self.assertTrue(got[k].startswith("refused"), (k, got[k]))
+        finally:
+            shutil.rmtree(tmp)
 
 if __name__ == "__main__":
     unittest.main()
