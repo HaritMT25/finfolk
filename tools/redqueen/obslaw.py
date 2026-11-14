@@ -50,10 +50,16 @@ of one output; standard normals by #68's Box-Muller (two outputs: u1 = 1 - (x1 >
 
 THE BANK MODEL (v5 4.2, 2.8, 2.9). BankObservationModel loads a finfolk.redqueen.noisebank.bank/3 artifact and
 its finfolk.redqueen.obstables/1 tables and validates them in 4.2's order (bytes, schema and identity, scalars,
-matrices, curves, nu0, tables). Item 2's required fields are 2.8's: every field it prescribes must be present, with
-the type and value 2.8 (or the section it cites) fixes; where 2.8 names a record without fixing its internal
-structure (estimator.ceilings / saturation / capped_category, the horizon records' contents), only what it states is
-required. The tables' identity records obslaw_sha256 AND noisescale_sha256 (the evaluator of S the builds call),
+matrices, curves, nu0, tables). Item 2's required fields are 2.8's, in the representation fixed by
+A_design_v5_clarification_1.md (C1-C5): every field must be present with the type and value 2.8, the clarification
+or noisebank's existing encoding fixes. fit.streams.bootstrap is C2's record (seeds and first outputs recomputed);
+the estimator is C3's (no legacy seed, C1; each retained scalar equal to the noisebank constant it comes from;
+ceilings, the saturation window and basis, capped_category); map_variance.rule is C5's fixed string
+(MAP_VARIANCE_RULE, shared with estimate-d8); the horizon records follow the 5k encoding (noisebank.py L1683-1757)
+and, at the zero-ceiling horizons 10k/20k, carry the channels.S/F structural-zero declarations (C4) whatever their
+status, no survival fitted quantity anywhere else, and the capture-only fit as the 5k encoding restricted to C
+(C4.1, a builder draft until the coordinator confirms it). The tables' identity records obslaw_sha256 AND
+noisescale_sha256 (the evaluator of S the builds call),
 and both must equal the current files' (stricter than, and consistent with, 4.2 item 7's "obslaw implementation
 sha"). Every failure is an ObsLawError (a ValueError) naming the field; no default is ever substituted. The fitter
 receives W (working_var_fn) and the score law (A, L) (score_law), evaluated only at fitted quantities.
@@ -1008,13 +1014,20 @@ def splitmix_normals(rng, count):
 
 
 # ================================================================== the bank/3 artifact (v5 2.8, 2.9, 4.2)
-# What v5 2.8 prescribes (table L732-751; test_obslaw.py's V5_FIELDS cites the line of every entry). Where 2.8 names a
-# record without fixing its internal structure, only what it does state is required (presence, type, a fixed value).
+# What v5 2.8 prescribes (table L732-751) with its representation fixed by A_design_v5_clarification_1.md (C1-C5;
+# 2026-11-14, prospective, representation only). test_obslaw.py's V5_FIELDS / V5_VALUES cite v5's line and the
+# clarification's section of every entry. noisebank.py line numbers are @4991907 (unchanged at this branch's base).
+CLARIFICATION = "A_design_v5_clarification_1.md"
 TOP_FIELDS = ("schema", "status", "synthetic", "cohort", "cohort_sha256", "horizon", "dt", "support_law", "age_clock",
               "survivor_ceiling", "fit", "noise", "map_variance", "d8", "inputs", "estimator", "horizons")
 NOISE_FIELDS = ("available", "s_logit", "SigmaR", "SigmaD", "SigmaE", "horizon", "capture_bound", "survivor_ceiling")
 MAP_VARIANCE_FIELDS = ("s_logit", "nu0", "rule", "consumer")
 MAP_VARIANCE_CONSUMER = "map.fit rep_prior, capture channel"                                  # (L747)
+# C5: map_variance.rule is exactly this string (the design named by file and section, v5 L747); estimate-d8 (WP3)
+# writes it from this constant.
+MAP_VARIANCE_RULE = ("working replicate-mean variance (nu0*phi*W(z) + (R-1)*s_hat^2)/(nu0 + R - 1)/R, W the "
+                     f"empirical-logit variance of the frozen fitter table ({DESIGN} section 1.7b, the adopted design; "
+                     "its sha256 as recorded in the dated adoption receipt); full_pooling: phi*W(z)/R")
 D8_FIELDS = ("amendment_sha256", "capture_law", "ceilings", "max_age", "denominator", "age_predicate",
              "capped_category")
 D8_TEXTS = {"age_predicate": "updated binary32 age > binary32(max_age) is an age death; F_i(H)=1 iff false through "
@@ -1022,22 +1035,87 @@ D8_TEXTS = {"age_predicate": "updated binary32 age > binary32(max_age) is an age
             "capped_category": "k = M_H: latent upper endpoint +inf, scale N = 600"}
 FIT_FIELDS = ("noise_likelihood", "noise", "streams")
 FIT_NOISE_SHAS = ("implementation_sha256", "inputs_sha256", "receipt_sha256", "engine_sha256")
-BOOTSTRAP_FIELDS = ("generator", "namespace", "texts", "seeds")
+# C2: fit.streams.bootstrap = {generator, namespace, texts, seeds, first_outputs} and no other key.
+BOOTSTRAP_FIELDS = ("generator", "namespace", "texts", "seeds", "first_outputs")
 REFIT_TEXT = STREAM_NAMESPACE + "/noisebank/D8-refit/h{}/bootstrap"   # (v5 2.5 item 5, L641-643)
 HORIZON_KEYS = ("5000", "10000", "20000")                    # (noisebank.HORIZONS, keyed str(h) as now: L1778-1782)
-# estimator (L750): "the existing record (noisebank.py L1769-1777 @4991907) plus ceilings, saturation per channel and
-# its basis, capped_category". The existing record's "seed" (the legacy NumPy bootstrap seed, which the D8 path
-# replaces by the fit.streams.bootstrap streams) is NOT required: v5 is ambiguous on it (reported, not decided).
+# estimator (v5 L750; C1, C3): the existing record (noisebank.py L1769-1777) WITHOUT seed (C1: refused when present),
+# each value the registered estimator's (registered_estimator(): noisebank's constants, imported), plus ceilings,
+# saturation (the exact C3 object) and capped_category. No other key.
 ESTIMATOR_FIELDS = ("z_intervals", "rho_max", "saturation", "sigma_min", "info_min", "multi_start", "start_tol", "boot",
                     "boot_fail_max", "rectangle", "grid", "constrained_fit", "fixed_replicate_bias", "ceilings",
                     "capped_category")
 ESTIMATOR_VALUES = {"multi_start": 16, "boot": 999}          # (v5 2.5 L615-616: 16 Halton starts, 999 draws)
-# horizons (L751): "per horizon as now (noisebank.py L1683-1757)": the fields every record carries (L1689-1690, L1698,
-# L1701 / L1756) and, with status ok, groups and grid_validation (L1741-1742).
+ESTIMATOR_SOURCES = {"z_intervals": "noisebank.Z_INTERVALS", "rho_max": "noisebank.RHO_MAX",
+                     "sigma_min": "noisebank.SIGMA_MIN", "info_min": "noisebank.INFO_MIN",
+                     "multi_start": "noisebank.MULTI_START", "start_tol": "noisebank.START_TOL",
+                     "boot": "noisebank.BOOT", "boot_fail_max": "noisebank.BOOT_FAIL_MAX",
+                     "rectangle": "noisebank.py L1772-1773 (E_MAX, W_MIN, RHO_MAX, LOG_RECT_TOL)",
+                     "grid": "noisebank.py L1774", "constrained_fit": "noisebank.py L1775-1776",
+                     "fixed_replicate_bias": "noisebank.py L1777", "ceilings": "clarification C3 (= d8.ceilings)",
+                     "saturation": "clarification C3 (noisebank.SATURATION on the mean fraction of N = 600)",
+                     "capped_category": "clarification C3 (= d8.capped_category)"}
+# horizons (v5 L751): "per horizon as now (noisebank.py L1683-1757)": the fields every record carries (L1689-1690,
+# L1698, L1701 / L1756) and, with status ok, groups and grid_validation (L1741-1742); their contents are the encodings
+# below. At the zero-ceiling horizons (10k, 20k) the S/F records are the structural-zero declarations and the fit is
+# capture-only (v5 2.6 L671-680; C4, and C4.1's builder draft: the 5k encoding restricted to C).
 HORIZON_FIELDS = ("capture_bound", "replicates", "incomplete_cells", "channels", "scales", "nu0", "curve_points",
                   "worlds", "status", "reasons", "components", "bootstrap")
 HORIZON_OK_FIELDS = ("groups", "grid_validation")
 HORIZON_STATUSES = ("ok", "unavailable")
+STRUCTURAL_ZERO = {"status": "structural_zero", "M_H": 0,                                   # (v5 2.6 L671-673; C4)
+                   "reason": "D8 rule 46: no age-feasible initial individual at this horizon"}
+COUNT_FIELDS = ("rows", "incomplete", "saturated", "unidentified", "usable")                  # (L946-947)
+CURVE_FIELDS = ("x", "s", "direction", "support", "cells", "blocks", "extrapolation")         # (L1546-1548)
+CURVE_EXTRAPOLATION = ("constant beyond the outermost knots (an assumption beyond the bank's support, not an "
+                       "estimate)")
+NU0_FIT_FIELDS = ("excess_log_variance", "sampling_log_variance", "cells")                    # (L1604-1610)
+GROUPS = tuple(noisebank.GROUPS)                             # (L220: the nine groups)
+CAPTURE_GROUPS = ("R_CC", "D_CC")                            # (v5 2.6 L674; C4)
+GROUP_FIELDS = ("pairs", "rho_max", "curvature_per_pair", "at_box", "deep_tail")             # (L1710-1711)
+GRID_FIELDS = ("label", "worst_miss_per_pair", "tolerance", "refined", "refit_shift", "shift_flag")   # (L1742-1744)
+GRID_LABEL = "local objective-value validation (not a global certificate)"
+COMPONENT_FIELDS = ("SigmaR", "SigmaD", "SigmaE", "fit", "loglik", "unconstrained_problems", "multistart", "at_box",
+                    "box", "SigmaR_FF", "shares")                                             # (L1745-1753)
+CAPTURE_COMPONENT_FIELDS = tuple(k for k in COMPONENT_FIELDS if k != "SigmaR_FF")             # (C4.1)
+COMPONENT_BOX = (f"|rho| <= {noisebank.RHO_MAX}: a registered numerical restriction (a share above it cannot be "
+                 "fitted)")
+FF_FIELDS = ("value", "status", "rule")                                                       # (L1749-1751)
+FF_RULE = ("the minimal feasible free row variance v' A^+ v: one control per row leaves the free row / control split "
+           "unidentified")
+SHARE_FIELDS = ("row", "donor", "cell")                                                       # (L1752-1753)
+MULTISTART_FIELDS = ("starts", "converged", "reaching_best", "parameter_spread", "kkt_residual",
+                     "label")                                                                 # (L1434-1436)
+MULTISTART_LABEL = "multi-start validated, not a global certificate"
+INTERVAL_FIELDS = ("draws", "failed", "identification_rejections", "failure_rate", "procedure", "label", "status",
+                   "ci95")                                                                    # (L1671-1680)
+INTERVAL_PROCEDURE = ("world-multiplicity weighted likelihood (prey and predator roles resampled independently; a pair "
+                      "weighted by the product over the DISTINCT worlds of each role); a departure from H.7's "
+                      "materialized-record bootstrap: descriptive, outside the confirmatory family")
+INTERVAL_LABEL = "approximate; conditional on identification (failed draws excluded)"
+BOOT_NAMES = tuple(noisebank.BOOT_NAMES)                     # (L1623)
+CAPTURE_BOOT_NAMES = ("R_CC", "D_CC", "E_CC")                # (C4.1: BOOT_NAMES restricted to C)
+# Every key naming a survival quantity: refused anywhere in a zero-ceiling horizon's record except the channels.S/F
+# declarations (C4: "no survival fitted quantity of any value may appear anywhere in its record").
+SURVIVAL_KEYS = frozenset({"S", "F", "SigmaR_FF"} | {n for n in GROUPS + BOOT_NAMES if n not in CAPTURE_BOOT_NAMES})
+
+
+def registered_estimator():
+    """The C3 estimator record: noisebank's existing estimator record (L1769-1777) minus seed (C1), every value the
+    registered estimator's (noisebank's module constants, imported; the four texts as noisebank writes them), plus
+    ceilings, the exact saturation object and capped_category."""
+    nb = noisebank
+    return {"z_intervals": nb.Z_INTERVALS, "rho_max": nb.RHO_MAX,
+            "saturation": {"basis": "mean fraction of N", "denominator": SURV_N,
+                           "window": {ch: list(nb.SATURATION) for ch in CHANNELS}},
+            "sigma_min": nb.SIGMA_MIN, "info_min": nb.INFO_MIN, "multi_start": nb.MULTI_START,
+            "start_tol": nb.START_TOL, "boot": nb.BOOT, "boot_fail_max": nb.BOOT_FAIL_MAX,
+            "rectangle": f"log_rect on the registered domain (|e| <= {nb.E_MAX}, width >= {nb.W_MIN}, "
+                         f"|rho| <= {nb.RHO_MAX}); validated max error {nb.LOG_RECT_TOL}",
+            "grid": "z = atanh(rho), refined edges; local objective-value validation at the fit",
+            "constrained_fit": "interior point from 16 Halton starts; multi-start validated, not a global certificate",
+            "fixed_replicate_bias": "not corrected (see the PR's simulation)",
+            "ceilings": dict(CEILINGS), "capped_category": D8_TEXTS["capped_category"]}
 
 
 def _num(v):
@@ -1081,28 +1159,98 @@ def _sha_field(d, key, where):
     return v
 
 
-def _nu0_record(rec, ch, consumed):
+def _same(a, b):
+    """a equals b with JSON types kept (int is not float is not bool); objects by key set, arrays by position."""
+    if isinstance(b, dict):
+        return isinstance(a, dict) and set(a) == set(b) and all(_same(a[k], b[k]) for k in b)
+    if isinstance(b, list):
+        return isinstance(a, list) and len(a) == len(b) and all(_same(x, y) for x, y in zip(a, b))
+    return type(a) is type(b) and a == b
+
+
+def _require(got, want, where, source):
+    """got must be exactly want (the registered record): objects key by key (a missing key named as a missing field,
+    a key outside want refused), arrays by position, scalars by JSON type and value; null is refused."""
+    if got is None:
+        raise ObsLawError(f"bank artifact: {where} is null (refused; {source})")
+    if isinstance(want, dict):
+        if not isinstance(got, dict):
+            raise ObsLawError(f"bank artifact: {where} {got!r} is not the registered object {want!r} ({source})")
+        for k in want:
+            _field(got, k, where)
+        extra = sorted(set(got) - set(want))
+        if extra:
+            raise ObsLawError(f"bank artifact: {where} carries keys outside the registered record: {extra} ({source})")
+        for k in want:
+            _require(got[k], want[k], f"{where}.{k}", source)
+    elif not _same(got, want):
+        raise ObsLawError(f"bank artifact: {where} {got!r} is not the registered {want!r} ({source})")
+
+
+def _keys(d, keys, where, exact=True):
+    """d is an object holding every key of keys (each missing one named); exact: and no other key."""
+    if not isinstance(d, dict):
+        raise ObsLawError(f"bank artifact: {where} must be an object")
+    for k in keys:
+        _field(d, k, where)
+    extra = sorted(set(d) - set(keys))
+    if exact and extra:
+        raise ObsLawError(f"bank artifact: {where} has keys {extra} outside {list(keys)}")
+    return d
+
+
+def _check(ok, where, what):
+    if not ok:
+        raise ObsLawError(f"bank artifact: {where} {what}")
+
+
+def _count(v, lo=0):
+    return _int(v) and v >= lo
+
+
+def _matrix(v, n, where):
+    """An n x n array of finite numbers (not bool), exactly symmetric (the 5k encoding's .tolist() of noisebank's
+    symmetric components_of matrices, L1745-1746) -> the nested list."""
+    _check(isinstance(v, list) and len(v) == n and all(isinstance(r, list) and len(r) == n for r in v), where,
+           f"must be a {n}x{n} array")
+    _check(all(_num(x) for r in v for x in r), where, "entries must be finite numbers (not bool)")
+    _check(all(v[i][j] == v[j][i] for i in range(n) for j in range(n)), where, "is not symmetric")
+    return v
+
+
+def _nu0_record(rec, ch, consumed, where=None):
     """v5 4.2 item 6 / 2.8: exactly one of estimated (nu0 > 0 finite, not bool), full_pooling (no nu0 key) or
-    unavailable (refused for the consumed capture channel). -> nu0 float or None."""
-    where = f"map_variance.nu0.{ch}"
-    if not isinstance(rec, dict) or "status" not in rec:
+    unavailable (refused for the consumed capture channel), in the existing encoding (noisebank.py L1597-1610):
+    estimated and full_pooling also carry excess_log_variance, sampling_log_variance (finite numbers) and cells
+    (an integer >= 3); unavailable carries a reason. -> nu0 float or None."""
+    where = where or f"map_variance.nu0.{ch}"
+    if not isinstance(rec, dict):
         raise ObsLawError(f"bank artifact: {where} must be an object with a status")
-    st = rec["status"]
+    st = _field(rec, "status", where)
     if st == "estimated":
         v = rec.get("nu0")
         if not _num(v) or not v > 0:
             raise ObsLawError(f"bank artifact: {where} is estimated but nu0 {v!r} is not a finite number > 0")
-        return float(v)
-    if st == "full_pooling":
+        out = float(v)
+    elif st == "full_pooling":
         if "nu0" in rec:
             raise ObsLawError(f"bank artifact: {where} is full_pooling but carries a nu0 key")
-        return None
-    if st == "unavailable" and not consumed:
-        if not isinstance(rec.get("reason"), str):
+        out = None
+    elif st == "unavailable" and not consumed:
+        if "reason" not in rec:
+            raise ObsLawError(f"bank artifact: {where} is unavailable without a reason: missing field {where}.reason")
+        if not isinstance(rec["reason"], str):
             raise ObsLawError(f"bank artifact: {where} is unavailable without a reason")
         return None
-    raise ObsLawError(f"bank artifact: {where} status {st!r} is refused"
-                      + (" (the capture channel's nu0 is consumed by map.fit)" if consumed else ""))
+    else:
+        raise ObsLawError(f"bank artifact: {where} status {st!r} is refused"
+                          + (" (the capture channel's nu0 is consumed by map.fit)" if consumed else ""))
+    for k in NU0_FIT_FIELDS:
+        _field(rec, k, where)
+    for k in NU0_FIT_FIELDS[:2]:
+        _check(_num(rec[k]), f"{where}.{k}", f"{rec[k]!r} is not a finite number")
+    _check(_count(rec["cells"], 3), f"{where}.cells", f"{rec['cells']!r} is not an integer >= 3 (L1598-1599)")
+    return out
 
 
 class BankArtifact:
@@ -1200,8 +1348,9 @@ class BankArtifact:
         mv = doc["map_variance"]
         for k in MAP_VARIANCE_FIELDS:
             _field(mv, k, "map_variance")
-        if not isinstance(mv["rule"], str) or not mv["rule"]:
-            raise ObsLawError("bank artifact: map_variance.rule must be a non-empty string")
+        if mv["rule"] != MAP_VARIANCE_RULE:                                # (C5: one shared constant)
+            raise ObsLawError("bank artifact: map_variance.rule is not the fixed rule text of clarification C5 "
+                              "(obslaw.MAP_VARIANCE_RULE)")
         if mv["consumer"] != MAP_VARIANCE_CONSUMER:
             raise ObsLawError(f"bank artifact: map_variance.consumer is not {MAP_VARIANCE_CONSUMER!r}")
         BankArtifact._estimator(doc["estimator"])
@@ -1209,47 +1358,73 @@ class BankArtifact:
 
     @staticmethod
     def _bootstrap_streams(boot):
-        """fit.streams.bootstrap (v5 2.8 L745; 2.5 item 5 L630-647): the generator and namespace; texts = the refit
-        streams AnnexH/D8/1/noisebank/D8-refit/h<h>/bootstrap, one per horizon (any order, no duplicate); seeds = one
-        unsigned 64-bit integer per text, each the text's derived seed (first eight SHA-256 bytes, little-endian)."""
+        """fit.streams.bootstrap (v5 2.8 L745; 2.5 item 5 L630-647; clarification C2): exactly {generator: rqlib.
+        SplitMix64, namespace: AnnexH/D8/1, texts, seeds, first_outputs}; texts = the refit streams AnnexH/D8/1/
+        noisebank/D8-refit/h<h>/bootstrap for h = 5000, 10000, 20000 in that order; seeds[i] = the derived seed of
+        texts[i] (first eight SHA-256 bytes, little-endian); first_outputs[i] = the first two next64() outputs of
+        SplitMix64(seeds[i]) (v5 L646). Seeds and first outputs are recomputed here; any difference is refused."""
         where = "fit.streams.bootstrap"
-        for k in BOOTSTRAP_FIELDS:
-            _field(boot, k, where)
+        _keys(boot, BOOTSTRAP_FIELDS, where)
         if boot["generator"] != STREAM_GENERATOR or boot["namespace"] != STREAM_NAMESPACE:
             raise ObsLawError(f"bank artifact: {where} must be {STREAM_GENERATOR} under {STREAM_NAMESPACE}")
-        texts, seeds = boot["texts"], boot["seeds"]
+        texts, seeds, firsts = boot["texts"], boot["seeds"], boot["first_outputs"]
         if not isinstance(texts, list) or not all(isinstance(t, str) for t in texts):
             raise ObsLawError(f"bank artifact: {where}.texts must be a list of stream texts")
-        want = sorted(REFIT_TEXT.format(h) for h in HORIZON_KEYS)
-        if sorted(texts) != want:
+        want = [REFIT_TEXT.format(h) for h in HORIZON_KEYS]
+        if sorted(texts) != sorted(want):
             raise ObsLawError(f"bank artifact: {where}.texts must be exactly the refit streams {want} "
                               "(one per horizon)")
+        if texts != want:
+            raise ObsLawError(f"bank artifact: {where}.texts must be in the order h = 5000, 10000, 20000 "
+                              "(clarification C2)")
         if not isinstance(seeds, list) or len(seeds) != len(texts) or \
                 not all(_int(s) and 0 <= s < 1 << 64 for s in seeds):
             raise ObsLawError(f"bank artifact: {where}.seeds must be a list of unsigned 64-bit integers, one per text")
         for t, s in zip(texts, seeds):
             if s != stream_seed_d8(t):
                 raise ObsLawError(f"bank artifact: {where}.seeds: {s} is not the derived seed of {t!r}")
+        if not isinstance(firsts, list) or len(firsts) != len(texts) or \
+                not all(isinstance(p, list) and len(p) == 2 and all(_int(x) and 0 <= x < 1 << 64 for x in p)
+                        for p in firsts):
+            raise ObsLawError(f"bank artifact: {where}.first_outputs must be one pair of unsigned 64-bit integers "
+                              "per text (clarification C2)")
+        for t, p in zip(texts, firsts):
+            exp = stream_record(t)["first_outputs"]
+            if p != exp:
+                raise ObsLawError(f"bank artifact: {where}.first_outputs {p} of {t!r} are not the first two outputs "
+                                  f"{exp} of its SplitMix64 stream (v5 L646; clarification C2)")
 
     @staticmethod
     def _estimator(est):
-        """estimator (v5 2.8 L750): an object with the existing record's fields and ceilings, saturation,
-        capped_category (their internal structure is not fixed by v5: presence only), and the two values v5 2.5
-        fixes (multi_start 16, boot 999)."""
+        """estimator (v5 2.8 L750, 2.5 L612-616; clarification C1, C3): exactly registered_estimator(): the
+        existing record's keys without seed (C1: a seed is refused), every retained scalar equal (JSON type and
+        value) to the noisebank constant it comes from, the existing texts as noisebank writes them, ceilings,
+        the exact saturation object and capped_category. Null, a wrong type or value, or another key is refused."""
         if not isinstance(est, dict):
             raise ObsLawError("bank artifact: estimator must be an object")
+        if "seed" in est:
+            raise ObsLawError("bank artifact: estimator.seed is refused: the legacy scalar bootstrap seed is retired "
+                              "in bank/3 (clarification C1); fit.streams.bootstrap is the authoritative record")
+        want = registered_estimator()
+        for k, v in ESTIMATOR_VALUES.items():                              # (v5's stated numbers)
+            if not _same(want[k], v):
+                raise ObsLawError(f"bank artifact: the registered estimator's {ESTIMATOR_SOURCES[k]} = {want[k]!r} "
+                                  f"is not v5 2.5's {v}")
         for k in ESTIMATOR_FIELDS:
             _field(est, k, "estimator")
-        for k, v in ESTIMATOR_VALUES.items():
-            if not (_int(est[k]) and est[k] == v):
-                raise ObsLawError(f"bank artifact: estimator.{k} {est[k]!r} is not the registered {v}")
+        extra = sorted(set(est) - set(ESTIMATOR_FIELDS))
+        if extra:
+            raise ObsLawError(f"bank artifact: estimator carries keys outside the C3 record: {extra}")
+        for k in ESTIMATOR_FIELDS:
+            _require(est[k], want[k], f"estimator.{k}", ESTIMATOR_SOURCES[k])
 
     @staticmethod
     def _horizons(hz):
-        """horizons (v5 2.8 L751): one record per horizon 5000, 10000, 20000, each with the fields every record
-        carries as now; status a string, 'ok' at 5000 (R7: a d8-fitted artifact's 5k fit is ok), 'ok' or
-        'unavailable' at 10k/20k (2.6); with status ok the groups, grid_validation, components and bootstrap
-        records; capture_bound = noisebank.capture_bound(h); reasons a list."""
+        """horizons (v5 2.8 L751; clarification C4 / C4.1): one record per horizon 5000, 10000, 20000 in the 5k
+        encoding (noisebank.py L1683-1757). Status 'ok' at 5000 (R7: a d8-fitted artifact's 5k fit is ok), 'ok' or
+        'unavailable' at 10k/20k (2.6); capture_bound = noisebank.capture_bound(h). At a zero-ceiling horizon the
+        channels.S/F structural-zero declarations are required whatever the status, no survival fitted quantity
+        may appear anywhere else in the record, and the fit's records are the 5k encoding restricted to C."""
         if not isinstance(hz, dict):
             raise ObsLawError("bank artifact: horizons must be an object")
         for h in HORIZON_KEYS:
@@ -1274,6 +1449,225 @@ class BankArtifact:
                                   f"noisebank.capture_bound({h}) = {noisebank.capture_bound(int(h))}")
             if not isinstance(rec["reasons"], list):
                 raise ObsLawError(f"bank artifact: {where}.reasons must be a list")
+            BankArtifact._horizon_record(rec, h, where, zero=(CEILINGS[h] == 0))
+
+    @staticmethod
+    def _horizon_record(rec, h, where, zero):
+        """One horizon's contents in the 5k encoding (L1683-1757); zero: the capture-only representation (C4,
+        C4.1). Every container type, the fields noisebank writes and the values its code fixes are checked."""
+        st = rec["status"]
+        chans = ("C",) if zero else CHANNELS
+        groups_set = CAPTURE_GROUPS if zero else GROUPS
+        ch_rec = _keys(rec["channels"], CHANNELS, f"{where}.channels")           # (L1690)
+        if zero:                                                                # (C4: whatever the status)
+            for ch in ("S", "F"):
+                _require(ch_rec[ch], STRUCTURAL_ZERO, f"{where}.channels.{ch}",
+                         "the structural-zero declaration, v5 2.6 L671-673; clarification C4")
+            scan = dict(rec, channels={"C": ch_rec["C"]})
+            bad = BankArtifact._survival_keys(scan, where)
+            if bad:
+                raise ObsLawError(f"bank artifact: {bad[0]} is a survival fitted quantity at a zero-ceiling horizon "
+                                  "(refused: v5 2.6 L671-673, clarification C4)")
+        for ch in chans:
+            c = _keys(ch_rec[ch], COUNT_FIELDS, f"{where}.channels.{ch}", exact=False)   # (L946-947)
+            for k in COUNT_FIELDS:
+                _check(_count(c[k]), f"{where}.channels.{ch}.{k}", f"{c[k]!r} is not a non-negative integer")
+        _check(_count(rec["replicates"], 1), f"{where}.replicates", f"{rec['replicates']!r} is not an integer >= 1")
+        _check(_count(rec["incomplete_cells"]), f"{where}.incomplete_cells",
+               f"{rec['incomplete_cells']!r} is not a non-negative integer")
+        for k in ("scales", "nu0", "curve_points"):                             # (L1690-1696)
+            _keys(rec[k], chans, f"{where}.{k}")
+        for ch in chans:
+            BankArtifact._curve(rec["scales"][ch], f"{where}.scales.{ch}", allow_null=zero)
+            _nu0_record(rec["nu0"][ch], ch, consumed=(h == HORIZON_KEYS[0] and ch == "C"),
+                        where=f"{where}.nu0.{ch}")
+            pts = rec["curve_points"][ch]
+            _check(isinstance(pts, list) and all(isinstance(p, list) and len(p) == 2 and all(_num(x) for x in p)
+                                                 for p in pts), f"{where}.curve_points.{ch}",
+                   "must be a list of [mu, sigma] pairs of finite numbers")
+            _check(pts == sorted(pts), f"{where}.curve_points.{ch}", "is not sorted (L1696)")
+        w = rec["worlds"]                                                       # (L1698; group_pairs L966)
+        _check(isinstance(w, list) and all(isinstance(x, str) and x for x in w) and w == sorted(set(w)),
+               f"{where}.worlds", "must be a sorted list of distinct non-empty world names")
+        reasons = rec["reasons"]
+        _check(all(isinstance(r, str) and r for r in reasons), f"{where}.reasons", "must hold non-empty strings")
+        if st == "ok":
+            _check(reasons == [], f"{where}.reasons", f"{reasons!r} must be [] when the status is ok (L1756)")
+            BankArtifact._groups(rec["groups"], groups_set, f"{where}.groups", ok=True)
+            BankArtifact._grid_validation(rec["grid_validation"], f"{where}.grid_validation")
+            BankArtifact._components(rec["components"], groups_set, f"{where}.components", zero)
+            BankArtifact._interval(rec["bootstrap"], CAPTURE_BOOT_NAMES if zero else BOOT_NAMES, f"{where}.bootstrap")
+        else:
+            _check(reasons != [], f"{where}.reasons", "must name a reason when the status is unavailable (L1701)")
+            for k in ("components", "bootstrap"):
+                _check(rec[k] is None, f"{where}.{k}", "must be null when the status is unavailable (L1701)")
+            if "groups" in rec:                                                 # (L1716 / L1731: without nodes)
+                BankArtifact._groups(rec["groups"], groups_set, f"{where}.groups", ok=False)
+
+    @staticmethod
+    def _survival_keys(node, path):
+        """Paths of every key in SURVIVAL_KEYS anywhere below node (objects and arrays)."""
+        out = []
+        if isinstance(node, dict):
+            for k, v in node.items():
+                p = f"{path}.{k}"
+                if k in SURVIVAL_KEYS:
+                    out.append(p)
+                out += BankArtifact._survival_keys(v, p)
+        elif isinstance(node, list):
+            for i, v in enumerate(node):
+                out += BankArtifact._survival_keys(v, f"{path}[{i}]")
+        return out
+
+    @staticmethod
+    def _curve(c, where, allow_null):
+        """A horizon s(mu) curve (fit_scale, L1546-1549): a noisescale curve with direction, support, cells, blocks
+        (one per knot) and the extrapolation text; null (no usable cells) only where allowed (a d8-fitted
+        artifact's 5k curves exist, R7)."""
+        if c is None:
+            _check(allow_null, where, "is null (refused at 5k: a d8-fitted artifact has all three 5k curves, R7)")
+            return
+        _keys(c, CURVE_FIELDS, where, exact=False)
+        try:
+            noisescale.check_curve(c, where)
+        except noisescale.ScaleError as e:
+            raise ObsLawError(f"bank artifact: {e}") from None
+        _check(c["direction"] in ("increasing", "decreasing"), f"{where}.direction", f"{c['direction']!r} is refused")
+        _check(isinstance(c["support"], list) and len(c["support"]) == 2 and all(_num(x) for x in c["support"])
+               and c["support"][0] <= c["support"][1], f"{where}.support", "must be [lo, hi] finite numbers")
+        _check(_count(c["cells"], 1), f"{where}.cells", f"{c['cells']!r} is not an integer >= 1")
+        _check(_int(c["blocks"]) and c["blocks"] == len(c["x"]), f"{where}.blocks",
+               f"{c['blocks']!r} is not the number of knots {len(c['x'])}")
+        _check(c["extrapolation"] == CURVE_EXTRAPOLATION, f"{where}.extrapolation", "is not noisebank's text (L1547)")
+
+    @staticmethod
+    def _groups(g, names, where, ok):
+        """The groups record (L1706-1711, L1737): exactly the named groups, each {pairs >= 1, rho_max within the box,
+        curvature_per_pair, at_box (bool), deep_tail >= 0} and, with status ok, nodes >= 1."""
+        _keys(g, names, where)
+        for n in names:
+            r = _keys(g[n], GROUP_FIELDS + (("nodes",) if ok else ()), f"{where}.{n}", exact=False)
+            _check(_count(r["pairs"], 1), f"{where}.{n}.pairs", f"{r['pairs']!r} is not an integer >= 1")
+            _check(_num(r["rho_max"]) and abs(r["rho_max"]) <= noisebank.RHO_MAX, f"{where}.{n}.rho_max",
+                   f"{r['rho_max']!r} is not a finite number within |rho| <= {noisebank.RHO_MAX}")
+            _check(_num(r["curvature_per_pair"]), f"{where}.{n}.curvature_per_pair", "is not a finite number")
+            _check(type(r["at_box"]) is bool, f"{where}.{n}.at_box", f"{r['at_box']!r} is not true or false")
+            _check(_count(r["deep_tail"]), f"{where}.{n}.deep_tail",
+                   f"{r['deep_tail']!r} is not a non-negative integer")
+            if ok:
+                _check(_count(r["nodes"], 1), f"{where}.{n}.nodes", f"{r['nodes']!r} is not an integer >= 1")
+
+    @staticmethod
+    def _grid_validation(g, where):
+        """grid_validation (L1742-1744): the label text, worst_miss_per_pair >= 0, tolerance = noisebank.GRID_LL_TOL,
+        refined (bool), refit_shift >= 0, shift_flag = refit_shift > noisebank.GRID_RHO_TOL."""
+        _keys(g, GRID_FIELDS, where, exact=False)
+        _check(g["label"] == GRID_LABEL, f"{where}.label", "is not noisebank's text (L1742)")
+        _check(_num(g["worst_miss_per_pair"]) and g["worst_miss_per_pair"] >= 0, f"{where}.worst_miss_per_pair",
+               "is not a finite number >= 0")
+        _check(_same(g["tolerance"], noisebank.GRID_LL_TOL), f"{where}.tolerance",
+               f"{g['tolerance']!r} is not noisebank.GRID_LL_TOL = {noisebank.GRID_LL_TOL!r}")
+        _check(type(g["refined"]) is bool, f"{where}.refined", "is not true or false")
+        _check(_num(g["refit_shift"]) and g["refit_shift"] >= 0, f"{where}.refit_shift", "is not a finite number >= 0")
+        _check(type(g["shift_flag"]) is bool and g["shift_flag"] == (g["refit_shift"] > noisebank.GRID_RHO_TOL),
+               f"{where}.shift_flag", f"{g['shift_flag']!r} is not refit_shift > noisebank.GRID_RHO_TOL")
+
+    @staticmethod
+    def _components(c, names, where, zero):
+        """components (L1745-1753; noisebank.fit_dependence L1406-1447, components_of L1156-1181). 5k: SigmaR 3x3,
+        SigmaD / SigmaE 2x2 (the unit totals E = 1 - R - D exactly), fit unconstrained (no problem, no multistart)
+        or constrained (its multistart record), loglik, at_box (groups), the box text, SigmaR_FF = SigmaR[F,F] by
+        the convention, shares = the C and S diagonals. Zero-ceiling horizons (v5 2.6 L674-678; C4.1): the 1x1
+        capture blocks with rho_R >= 0, rho_D >= 0, rho_R + rho_D <= 1 and E = 1 - rho_R - rho_D, the unconstrained
+        group maxima (no barrier fit), no SigmaR_FF, shares of C only."""
+        fields = CAPTURE_COMPONENT_FIELDS if zero else COMPONENT_FIELDS
+        _keys(c, fields, where, exact=False)
+        n = {"SigmaR": 1 if zero else 3, "SigmaD": 1 if zero else 2, "SigmaE": 1 if zero else 2}
+        for k, m in n.items():
+            if zero:
+                _check(isinstance(c[k], list) and len(c[k]) == 1 and isinstance(c[k][0], list) and len(c[k][0]) == 1,
+                       f"{where}.{k}", "has survival rows/columns at a zero-ceiling horizon: only the 1x1 capture "
+                       "block is admitted (v5 2.6 L671-673, clarification C4)")
+            _matrix(c[k], m, f"{where}.{k}")
+        SR, SD, SE = c["SigmaR"], c["SigmaD"], c["SigmaE"]
+        for i in range(1 if zero else 2):
+            _check(SE[i][i] == 1.0 - SR[i][i] - SD[i][i], f"{where}.SigmaE",
+                   f"[{i}][{i}] {SE[i][i]!r} is not 1 - SigmaR - SigmaD = {1.0 - SR[i][i] - SD[i][i]!r} (L1162)")
+        if zero:
+            rR, rD = SR[0][0], SD[0][0]
+            _check(rR >= 0 and rD >= 0 and rR + rD <= 1, where,
+                   f"rho_R {rR!r}, rho_D {rD!r}: an ok capture-only fit needs rho_R >= 0, rho_D >= 0, "
+                   "rho_R + rho_D <= 1 (v5 2.6 L676-678)")
+        fit = c["fit"]
+        _check(fit in (("unconstrained",) if zero else ("unconstrained", "constrained")), f"{where}.fit",
+               f"{fit!r} is refused" + (" (the capture-only fit is the unconstrained group maxima, v5 2.6 L675-678)"
+                                         if zero else ""))
+        _check(_num(c["loglik"]), f"{where}.loglik", "is not a finite number")
+        pr = c["unconstrained_problems"]
+        _check(isinstance(pr, list) and all(isinstance(p, str) and p for p in pr), f"{where}.unconstrained_problems",
+               "must be a list of strings")
+        _check((pr == []) == (fit == "unconstrained"), f"{where}.unconstrained_problems",
+               f"{pr!r} disagrees with fit {fit!r} (the unconstrained fit is taken exactly when feasible, L1418-1421)")
+        ms = c["multistart"]
+        if fit == "unconstrained":
+            _check(ms is None, f"{where}.multistart", "must be null for the unconstrained fit (L1419)")
+        else:
+            _keys(ms, MULTISTART_FIELDS, f"{where}.multistart", exact=False)
+            _check(_same(ms["starts"], noisebank.MULTI_START), f"{where}.multistart.starts",
+                   f"{ms['starts']!r} is not noisebank.MULTI_START")
+            _check(_count(ms["converged"], 1) and ms["converged"] <= ms["starts"], f"{where}.multistart.converged",
+                   "is not an integer in 1..starts")
+            _check(_count(ms["reaching_best"], 1) and ms["reaching_best"] <= ms["converged"],
+                   f"{where}.multistart.reaching_best", "is not an integer in 1..converged")
+            for k in ("parameter_spread", "kkt_residual"):
+                _check(_num(ms[k]) and ms[k] >= 0, f"{where}.multistart.{k}", "is not a finite number >= 0")
+            _check(ms["label"] == MULTISTART_LABEL, f"{where}.multistart.label", "is not noisebank's text (L1436)")
+        ab = c["at_box"]
+        _check(isinstance(ab, list) and all(x in names for x in ab) and ab == sorted(set(ab)), f"{where}.at_box",
+               f"{ab!r} is not a sorted list of distinct groups of {list(names)}")
+        _check(c["box"] == COMPONENT_BOX, f"{where}.box", "is not noisebank's text (L1748)")
+        if not zero:
+            ff = _keys(c["SigmaR_FF"], FF_FIELDS, f"{where}.SigmaR_FF", exact=False)
+            _check(_same(ff["value"], float(SR[2][2])) and ff["status"] == "convention" and ff["rule"] == FF_RULE,
+                   f"{where}.SigmaR_FF", "is not {value: SigmaR[F][F], status: convention, rule: noisebank's text} "
+                   "(L1749-1751)")
+        sh = _keys(c["shares"], ("C",) if zero else ("C", "S"), f"{where}.shares")
+        for i, ch in enumerate(("C",) if zero else ("C", "S")):
+            s = _keys(sh[ch], SHARE_FIELDS, f"{where}.shares.{ch}", exact=False)
+            for k, M in zip(SHARE_FIELDS, (SR, SD, SE)):
+                _check(_same(s[k], float(M[i][i])), f"{where}.shares.{ch}.{k}",
+                       f"{s[k]!r} is not the component's [{ch}][{ch}] = {M[i][i]!r} (L1752-1753)")
+
+    @staticmethod
+    def _interval(b, names, where):
+        """The bootstrap interval record (interval_record L1665-1680): draws = the registered 999, failed and
+        identification_rejections counts, failure_rate = failed / draws, the procedure and label texts; status
+        ok (rate <= BOOT_FAIL_MAX, some draw kept) with ci95 = {name: [lo, hi]} over exactly the named entries, or
+        unavailable with ci95 null and a reason."""
+        _keys(b, INTERVAL_FIELDS, where, exact=False)
+        _check(_same(b["draws"], noisebank.BOOT), f"{where}.draws", f"{b['draws']!r} is not the registered "
+               f"{noisebank.BOOT} (noisebank.BOOT; v5 L616)")
+        _check(_count(b["failed"]) and b["failed"] <= b["draws"], f"{where}.failed", "is not an integer in 0..draws")
+        _check(_count(b["identification_rejections"]) and b["identification_rejections"] <= b["failed"],
+               f"{where}.identification_rejections", "is not an integer in 0..failed")
+        _check(_same(b["failure_rate"], b["failed"] / b["draws"]), f"{where}.failure_rate",
+               f"{b['failure_rate']!r} is not failed / draws = {b['failed'] / b['draws']!r}")
+        _check(b["procedure"] == INTERVAL_PROCEDURE, f"{where}.procedure", "is not noisebank's text (L1672-1674)")
+        _check(b["label"] == INTERVAL_LABEL, f"{where}.label", "is not noisebank's text (L1675)")
+        avail = b["failure_rate"] <= noisebank.BOOT_FAIL_MAX and b["failed"] < b["draws"]
+        if b["status"] == "ok":
+            _check(avail, f"{where}.status", "is ok beyond BOOT_FAIL_MAX failed draws (L1676)")
+            ci = _keys(b["ci95"], names, f"{where}.ci95")
+            for n in names:
+                v = ci[n]
+                _check(isinstance(v, list) and len(v) == 2 and all(_num(x) for x in v) and v[0] <= v[1],
+                       f"{where}.ci95.{n}", f"{v!r} is not [lo, hi] finite numbers")
+        elif b["status"] == "unavailable":
+            _check(not avail, f"{where}.status", "is unavailable within BOOT_FAIL_MAX failed draws (L1676)")
+            _check(b["ci95"] is None, f"{where}.ci95", "must be null when the interval is unavailable (L1677)")
+            _check(isinstance(_field(b, "reason", where), str), f"{where}.reason", "must be a string")
+        else:
+            raise ObsLawError(f"bank artifact: {where}.status {b['status']!r} is refused")
 
     @staticmethod
     def _scalars(doc):
