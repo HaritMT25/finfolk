@@ -14,12 +14,14 @@ import json
 import os
 import re
 import shutil
+import struct
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 import zipfile
+from fractions import Fraction
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -30,6 +32,7 @@ import rqlib  # noqa: E402
 import run  # noqa: E402
 import store  # noqa: E402
 import cell  # noqa: E402
+import score  # noqa: E402
 import worlds  # noqa: E402
 import noisebank as nb  # noqa: E402
 
@@ -95,6 +98,49 @@ def mk_cp(n_prey=8, n_pred=3, version=2, frame=100, seed=1, cfg_extra=None):
     return cp
 
 
+def _r32(x):
+    """Exact rational x (0, or positive in binary32's normal range) rounded to the nearest binary32,
+    ties to even: an oracle that uses neither struct nor a C cast."""
+    if x == 0:
+        return Fraction(0)
+    e = x.numerator.bit_length() - x.denominator.bit_length()
+    if Fraction(2) ** e > x:
+        e -= 1
+    ulp = Fraction(2) ** (e - 23)
+    q, r = divmod(x, ulp)
+    if 2 * r > ulp or (2 * r == ulp and q % 2):
+        q += 1
+    return q * ulp
+
+
+def _oracle_clock(start, steps, max_age=120.0, stop=False):
+    """The engine's age law by exact rationals (D8 v2 rule 46): A_0 = binary32(start), A_{k+1} =
+    round32(A_k + 0.016f), the literal rounded from its decimal -> (A after `steps` frames, or at the
+    age death if stop, as a float; the first frame with A_k > binary32(max_age), or None)."""
+    a, d, m = _r32(Fraction(start)), _r32(Fraction("0.016")), _r32(Fraction(max_age))
+    death = None
+    for k in range(1, steps + 1):
+        a = _r32(a + d)
+        if death is None and a > m:
+            death = k
+            if stop:
+                break
+    return float(a), death
+
+
+def mk_age_score(horizons=(5000,), ages=(0.0,), alive=None, f0=100):
+    """A synthetic score (no engine) whose horizons carry complete age summaries (score.age_strata):
+    the initial cohort ids 7, 8, ... with start `ages`, all alive at every horizon unless alive =
+    {horizon: set of ids}."""
+    start = {7 + i: a for i, a in enumerate(ages)}
+    hs = []
+    for h in horizons:
+        live = set(start) if alive is None else set(alive.get(h, ()))
+        hs.append({"steps": h, "frame": f0 + h, "survivors": len(live),
+                   "age_strata": score.age_strata(start, live, 120.0, h, f0 + h, score.DT, len(start), len(live))})
+    return {"schema": score.SCHEMA, "n_start": len(start), "dt": score.DT, "horizons": hs}
+
+
 class TestRng(unittest.TestCase):
     def test_splitmix_reference_vector(self):
         # the reference splitmix64.c (Vigna) from state 1234567
@@ -130,6 +176,106 @@ class TestTemplateValues(unittest.TestCase):
         g = rqlib.read_text(os.path.join(REPO, "src", "core", "genome.hpp"))
         self.assertRegex(g, r"float output = 0\.5f;")
         self.assertEqual(common.NEURON_BIRTH_OUTPUT, 0.5)
+
+    def test_age_clock_mirrors_the_engine_source(self):
+        """D8 v2 rule 46: common's age clock is the engine's arithmetic: a binary32 age loaded by a
+        (float) cast, += the 0.016f fixed step every frame, age death when the UPDATED age is strictly
+        greater than the binary32 maxAge (starvation tested first), and no floating-point contraction."""
+        rd = lambda *p: rqlib.read_text(os.path.join(REPO, *p))  # noqa: E731
+        self.assertRegex(rd("src", "core", "agent_core.hpp"), r"\n\s*float age = 0\.0f;")
+        k = rd("src", "core", "kernel.hpp")
+        self.assertRegex(k, r"inline void stepMetabolism\(AgentCore& c, const SimConfig& cfg, float dt\) \{\s*"
+                            r"c\.age \+= dt;")
+        self.assertRegex(k, r"if \(c\.foodReserves <= 0\.0f\) return 's';\s*if \(c\.age > cfg\.maxAge\) return 'a';")
+        self.assertRegex(rd("src", "core", "config.hpp"), r"float maxAge\s*= 120\.0f;")
+        self.assertEqual(set(re.findall(r"const float fixedDt = ([0-9.]+)f;", rd("src", "app", "main.cpp"))), {"0.016"})
+        j = rd("src", "core", "json_min.hpp")
+        self.assertIn("out.push_back((float)e.num);", j)
+        self.assertIn("(float)v->num", j)
+        self.assertIn("add_compile_options(-ffp-contract=off)", rd("CMakeLists.txt"))
+        self.assertEqual((common.ENGINE_DT, score.DT), (0.016, 0.016))
+
+
+class TestAgeClock(unittest.TestCase):
+    """D8 v2 rule 46 (Codex review of 870daa6, P2-1): common's binary32 age clock against an
+    exact-rational oracle. Synthetic ages only (no study, bank or validation data)."""
+
+    def setUp(self):
+        common._CLOCKS.clear()
+
+    def test_dt_and_rounding(self):
+        self.assertEqual(common.binary32(0.016), float(_r32(Fraction("0.016"))))   # = the literal 0.016f
+        self.assertEqual(common.binary32(0.016), 0.01600000075995922)
+        for x in (0.0320000015, 11.999, 40.001, 119.999, 120.0, 1e-3):
+            self.assertEqual(common.binary32(x), float(_r32(Fraction(x))), x)
+
+    def test_rule46_boundary_is_feasible(self):
+        """Rule 46's counterexample: 40.00001907348633 (the age after 2,500 additions from zero) reaches
+        119.99422454833984 after 5,000 more and is feasible; the exact formula says 120.00002 > 120."""
+        self.assertEqual(_oracle_clock(0.0, 2500), (40.00001907348633, None))
+        self.assertEqual(_oracle_clock(40.00001907348633, 5000), (119.99422454833984, None))
+        self.assertGreater(40.00001907348633 + 5000 * 0.016, 120.0)           # (what a + H dt <= 120 concludes)
+        self.assertTrue(common.age_feasible(40.00001907348633, 5000, 120.0))
+        # the review's case: start 40.001 (binary32 40.0009994506836) ends at 119.99520111083984
+        self.assertEqual(_oracle_clock(40.001, 5000), (119.99520111083984, None))
+        self.assertTrue(common.age_feasible(40.001, 5000, 120.0))
+        # one clock: from zero, the age death comes exactly 2,500 frames after the death from its 2,500th age
+        self.assertEqual(common.age_death_frame(0.0, 120.0, 20000),
+                         2500 + common.age_death_frame(40.00001907348633, 120.0, 20000))
+
+    def test_boundary_and_death_frames_match_the_oracle(self):
+        """The 5k boundary between adjacent binary32 start ages, and death frames, agree with the oracle."""
+        bits = lambda x: struct.unpack("<I", struct.pack("<f", x))[0]  # noqa: E731
+        flt = lambda b: struct.unpack("<f", struct.pack("<I", b))[0]   # noqa: E731
+        lo, hi = bits(30.0), bits(50.0)                       # (positive binary32 order = bit order)
+        while hi - lo > 1:
+            mid = (lo + hi) // 2
+            lo, hi = (mid, hi) if common.age_feasible(flt(mid), 5000, 120.0) else (lo, mid)
+        self.assertGreater(flt(lo), 40.00001907348633)
+        self.assertIsNone(_oracle_clock(flt(lo), 5000)[1])
+        self.assertEqual(_oracle_clock(flt(hi), 5000)[1], 5000)
+        for a in (0.0, 12.25, 47.999, 119.99):
+            self.assertEqual(common.age_death_frame(a, 120.0, 8000), _oracle_clock(a, 8000, stop=True)[1], a)
+
+    def test_strictly_greater_and_frame_count(self):
+        m = float(2 * _r32(Fraction("0.016")))                    # A_2 from zero, exactly
+        self.assertEqual(common.age_death_frame(0.0, m, 10), 3)   # A_2 == maxAge lives; A_3 > maxAge dies
+        self.assertEqual((common.age_feasible(0.0, 2, m), common.age_feasible(0.0, 3, m)), (True, False))
+        self.assertEqual(common.age_death_frame(120.0, 120.0, 5), 1)
+        self.assertTrue(common.age_feasible(120.0, 0, 120.0))     # (no frame yet, no age death)
+        self.assertEqual(common.age_feasible_count([0.0, 40.0, 40.001, 47.999, 120.0], 5000, 120.0), 3)
+
+    def test_cache_resumes_exactly(self):
+        ages, hs = (0.0, 11.5, 40.001, 47.999), (20000, 5000, 7500, 7501, 1, 0)
+        fresh = {}
+        for h in hs:
+            for a in ages:
+                common._CLOCKS.clear()
+                fresh[a, h] = common.age_death_frame(a, 120.0, h)
+        common._CLOCKS.clear()
+        for h in (1, 5000, 7501, 0, 20000, 7500, 5000):
+            for a in ages:
+                self.assertEqual(common.age_death_frame(a, 120.0, h), fresh[a, h], (a, h))
+
+    def test_invalid_inputs(self):
+        for args in ((float("nan"), 120.0, 5), (1.0, float("inf"), 5), (True, 120.0, 5), (1.0, 120.0, -1),
+                     (1.0, 120.0, 2.5), (1.0, 1e39, 5), ("1", 120.0, 5)):
+            with self.subTest(args=args), self.assertRaises(ValueError):
+                common.age_death_frame(*args)
+        for dt in (0.0, -0.016):
+            with self.assertRaises(ValueError):
+                common.age_death_frame(1.0, 120.0, 5, dt=dt)
+
+    @unittest.skipUnless(os.environ.get("RQ_FROZEN_AGES"), "RQ_FROZEN_AGES (the frozen config ages.json) not set")
+    def test_frozen_age_reference_counts(self):
+        """Rule 46's registered values for the frozen ages (rule 43; config, not outcomes): M_5000 = 247
+        of 600, M_10000 = M_20000 = 0."""
+        p = os.environ["RQ_FROZEN_AGES"]
+        self.assertEqual(rqlib.sha256_file(p), "6ffb99ec4062801b68c462ab08208e8367d128ca820e0a9e84752f4403a717d5")
+        ref = common.load_age_reference(p)
+        self.assertEqual((ref["n"], ref["max_age"]), (600, 120.0))
+        self.assertEqual([common.age_feasible_count(ref["ages"], h, ref["max_age"]) for h in (5000, 10000, 20000)],
+                         [247, 0, 0])
 
 
 class TestCkpt(unittest.TestCase):
