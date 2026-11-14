@@ -1286,7 +1286,7 @@ class BankObservationModel:
                 "synthetic": d["synthetic"], "allow_synthetic_bank": self.allow_synthetic_bank,
                 "accepting": self.accepting, "obs_tables_sha256": self.tables.file_sha256,
                 "obs_tables_content_sha256": self.tables.stored_content_sha256,
-                "tables_identity": self.tables.identity(), "gammas": self.gammas,
+                "tables_identity": self.tables.identity(),
                 "support_law": d["support_law"], "capture_law": d["d8"]["capture_law"], "age_clock": d["age_clock"],
                 "survivor_ceiling": d["survivor_ceiling"], "cohort_sha256": d["cohort_sha256"],
                 "amendment_D8_sha256": d["d8"]["amendment_sha256"], "inputs": d["inputs"],
