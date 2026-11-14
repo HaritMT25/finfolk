@@ -227,7 +227,7 @@ jobs:
           RQ_REQUIRE_NUMPY=1 python3 -I -W error::ResourceWarning tools/redqueen/test_obslaw.py -v 2>&1 | tee obslaw.log
           test "${PIPESTATUS[0]}" = 0
           if grep -q ResourceWarning obslaw.log; then exit 1; fi
-          if grep "skipped" obslaw.log | grep -qv "adoption gate"; then exit 1; fi
+          if grep -E '\.\.\. skipped' obslaw.log | grep -qv "adoption gate"; then exit 1; fi
       - name: "Linear forecasts (forecast.py, design v4 section 10.6; numpy required)"
         run: |
           python3 -m pip install -q "numpy>=2"
