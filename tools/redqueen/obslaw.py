@@ -54,13 +54,16 @@ matrices, curves, nu0, tables). Item 2's required fields are 2.8's, in the repre
 A_design_v5_clarification_1.md (C1-C5): every field must be present with the type and value 2.8, the clarification
 or noisebank's existing encoding fixes. fit.streams.bootstrap is C2's record (seeds and first outputs recomputed);
 the estimator is C3's (no legacy seed, C1; each retained scalar equal to the noisebank constant it comes from;
-ceilings, the saturation window and basis, capped_category); map_variance.rule is C5's fixed string
+ceilings, the saturation window on each channel's own N per horizon, as Addendum B corrects it, capped_category);
+map_variance.rule is C5's fixed string
 (MAP_VARIANCE_RULE, shared with estimate-d8); the horizon records follow the 5k encoding (noisebank.py L1683-1757)
 and, at the zero-ceiling horizons 10k/20k, carry the channels.S/F structural-zero declarations (C4) whatever their
 status, no survival fitted quantity anywhere else, and the capture-only fit as the 5k encoding restricted to C
 (C4.1, accepted by the coordinator subject to Codex). The clarification's Addendum A adds: every record of a
 horizon is an exact key set (C8), each fitted channel's counts record carries screened <= unidentified (C7), and
-noise / map_variance must equal their sources in horizons["5000"] (C9; noisebank.py L1788-1796). The tables'
+noise / map_variance must equal their sources in horizons["5000"] (C9; noisebank.py L1788-1796); Addendum B adds
+that an ok capture-only fit's components ARE its group maxima, which must be feasible (C4.2), and that the copied maps
+have exactly the keys C, S, F (C9 completion). The tables'
 identity records obslaw_sha256 AND noisescale_sha256 (the evaluator of S the builds call), and both must equal the
 current files' (stricter than, and consistent with, 4.2 item 7's "obslaw implementation sha"). Every failure is
 an ObsLawError (a ValueError) naming the field; no default is ever substituted. The fitter receives W
@@ -1055,7 +1058,8 @@ ESTIMATOR_SOURCES = {"z_intervals": "noisebank.Z_INTERVALS", "rho_max": "noiseba
                      "rectangle": "noisebank.py L1772-1773 (E_MAX, W_MIN, RHO_MAX, LOG_RECT_TOL)",
                      "grid": "noisebank.py L1774", "constrained_fit": "noisebank.py L1775-1776",
                      "fixed_replicate_bias": "noisebank.py L1777", "ceilings": "clarification C3 (= d8.ceilings)",
-                     "saturation": "clarification C3 (noisebank.SATURATION on the mean fraction of N = 600)",
+                     "saturation": "clarification C3 as corrected by Addendum B (noisebank.SATURATION on the mean "
+                                   "fraction of each channel's N: noisebank.capture_bound(h) for C, N_PREY for S/F)",
                      "capped_category": "clarification C3 (= d8.capped_category)"}
 # horizons (v5 L751): "per horizon as now (noisebank.py L1683-1757)": the fields every record carries (L1689-1690,
 # L1698, L1701 / L1756) and, with status ok, groups and grid_validation (L1741-1742); their contents are the encodings
@@ -1112,11 +1116,15 @@ SURVIVAL_KEYS = frozenset({"S", "F", "SigmaR_FF"} | {n for n in GROUPS + BOOT_NA
 def registered_estimator():
     """The C3 estimator record: noisebank's existing estimator record (L1769-1777) minus seed (C1), every value the
     registered estimator's (noisebank's module constants, imported; the four texts as noisebank writes them), plus
-    ceilings, the exact saturation object and capped_category."""
+    ceilings, the exact saturation object and capped_category. saturation (C3 as corrected by Addendum B): the window
+    on the mean fraction of EACH CHANNEL'S N, N per horizon as noisebank's encoder sets it (arrays, L923; usable divides
+    each channel's mean by its own N, L933-937): C = noisebank.capture_bound(h), S = F = noisebank.N_PREY (600)."""
     nb = noisebank
     return {"z_intervals": nb.Z_INTERVALS, "rho_max": nb.RHO_MAX,
-            "saturation": {"basis": "mean fraction of N", "denominator": SURV_N,
-                           "window": {ch: list(nb.SATURATION) for ch in CHANNELS}},
+            "saturation": {"basis": "mean fraction of the channel's N",
+                           "window": {ch: list(nb.SATURATION) for ch in CHANNELS},
+                           "N": {str(h): {"C": nb.capture_bound(h), "S": nb.N_PREY, "F": nb.N_PREY}
+                                 for h in nb.HORIZONS}},
             "sigma_min": nb.SIGMA_MIN, "info_min": nb.INFO_MIN, "multi_start": nb.MULTI_START,
             "start_tol": nb.START_TOL, "boot": nb.BOOT, "boot_fail_max": nb.BOOT_FAIL_MAX,
             "rectangle": f"log_rect on the registered domain (|e| <= {nb.E_MAX}, width >= {nb.W_MIN}, "
@@ -1311,8 +1319,13 @@ class BankArtifact:
             map_variance.nu0[ch] = horizons["5000"].nu0[ch]                             (L1794)
         noise.available, horizon and capture_bound are computed there, not copied (L1789, L1793), and are checked
         against their registered values in _scalars; noise.survivor_ceiling and map_variance.rule / consumer are D8
-        fields (v5 2.8, C5), not copies."""
+        fields (v5 2.8, C5), not copies. Addendum B's C9 completion: the copied maps noise.s_logit,
+        map_variance.s_logit and map_variance.nu0 have exactly the keys C, S, F, and map_variance.nu0 equals the
+        complete horizons["5000"].nu0 map (L1794 copies the whole map)."""
         base, nz, mv = doc["horizons"][HORIZON_KEYS[0]], doc["noise"], doc["map_variance"]
+        for name, m in (("noise.s_logit", nz["s_logit"]), ("map_variance.s_logit", mv["s_logit"]),
+                        ("map_variance.nu0", mv["nu0"])):
+            _keys(m, CHANNELS, name)
         for ch in CHANNELS:
             src = {k: base["scales"][ch][k] for k in NOISE_CURVE_FIELDS}
             if not _same(nz["s_logit"][ch], src):
@@ -1326,6 +1339,9 @@ class BankArtifact:
             if not _same(mv["nu0"][ch], base["nu0"][ch]):
                 raise ObsLawError(f"bank artifact: map_variance.nu0.{ch} differs from horizons.5000.nu0.{ch} "
                                   "(Addendum A C9; noisebank.py L1794)")
+        if not _same(mv["nu0"], base["nu0"]):                              # (Addendum B: the complete map)
+            raise ObsLawError("bank artifact: map_variance.nu0 differs from the complete horizons.5000.nu0 map "
+                              "(Addendum B C9 completion; noisebank.py L1794)")
 
     @staticmethod
     def _identity(doc, allow_synthetic):
@@ -1545,6 +1561,8 @@ class BankArtifact:
             BankArtifact._groups(rec["groups"], groups_set, f"{where}.groups", ok=True)
             BankArtifact._grid_validation(rec["grid_validation"], f"{where}.grid_validation")
             BankArtifact._components(rec["components"], groups_set, f"{where}.components", zero)
+            if zero:
+                BankArtifact._capture_maxima(rec["groups"], rec["components"], where)
             BankArtifact._interval(rec["bootstrap"], CAPTURE_BOOT_NAMES if zero else BOOT_NAMES, f"{where}.bootstrap")
         else:
             _check(reasons != [], f"{where}.reasons", "must name a reason when the status is unavailable (L1701)")
@@ -1552,6 +1570,22 @@ class BankArtifact:
                 _check(rec[k] is None, f"{where}.{k}", "must be null when the status is unavailable (L1701)")
             if "groups" in rec:                                                 # (L1716 / L1731: without nodes)
                 BankArtifact._groups(rec["groups"], groups_set, f"{where}.groups", ok=False)
+
+    @staticmethod
+    def _capture_maxima(g, c, where):
+        """Addendum B C4.2 (an ok zero-ceiling horizon): the capture row and donor variances ARE the group maxima
+        (v5 L674-677). The feasibility conditions apply to the maxima, so infeasible maxima (rho_R < 0, rho_D < 0 or
+        rho_R + rho_D > 1) require status unavailable, where they stay admissible as diagnostics; and SigmaR =
+        [[R_CC.rho_max]], SigmaD = [[D_CC.rho_max]], SigmaE = [[1 - R_CC.rho_max - D_CC.rho_max]] by the registered
+        expression (noisebank.components_of L1162, eC = 1.0 - rC - dC), JSON types kept. The shares follow: they are
+        checked against the components in _components."""
+        rR, rD = g["R_CC"]["rho_max"], g["D_CC"]["rho_max"]
+        _check(rR >= 0 and rD >= 0 and rR + rD <= 1, f"{where}.groups",
+               f"R_CC.rho_max {rR!r}, D_CC.rho_max {rD!r} are infeasible maxima (rho_R >= 0, rho_D >= 0, "
+               "rho_R + rho_D <= 1): they require status unavailable (v5 L676-678; Addendum B C4.2)")
+        for k, want in (("SigmaR", [[rR]]), ("SigmaD", [[rD]]), ("SigmaE", [[1.0 - rR - rD]])):
+            _check(_same(c[k], want), f"{where}.components.{k}",
+                   f"{c[k]!r} is not the group maxima's {want!r} (v5 L674-677; Addendum B C4.2)")
 
     @staticmethod
     def _survival_keys(node, path):
