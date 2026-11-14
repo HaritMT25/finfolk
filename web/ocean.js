@@ -1314,9 +1314,11 @@
     draft = null;
     resetForm();
     fill();
-    updateNeeds(); updateTabDots();
     d.base = snapForm();
     draft = d; d.gen = ++draftGen;
+    /* (with the draft in place: a staged sheet is the next world alone, so
+     * acting on the running world no longer keeps a live field undimmed) */
+    updateNeeds(); updateTabDots();
     hideAsk();
     renderStartBar();
   }
