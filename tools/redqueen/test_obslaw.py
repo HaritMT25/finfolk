@@ -23,10 +23,11 @@ section 5). Synthetic data only: no bank observation, no study store or output i
 The adoption gates (v5 5: T1-6's #68 cross-check, T5-5's VecSplitMix64 equality) run against a read-only `git
 archive` extraction of the pinned #68 commit: RQ_PR68_DIR names the extraction root, which holds PINNED_COMMIT (the
 full 40-hex sha, printed by the gate), MANIFEST (`git ls-tree -r <that sha> tools/redqueen`, written at extraction:
-git's record of that commit's files and blob ids) and tools/redqueen/. Before any gate runs, every extracted file's
-git blob id is checked against MANIFEST (a mismatch, an extra or a missing file refuses), which authenticates the
-extraction against that commit's tree as git recorded it. Without RQ_PR68_DIR the gates are skipped with a reason
-starting "adoption gate".
+git's record of that commit's files and blob ids) and tools/redqueen/. Before any gate runs, sha256(MANIFEST) must be
+the digest TRUSTED_MANIFESTS binds to PINNED_COMMIT (recorded from git when the commit was pinned; a commit without an
+entry is refused), and every extracted file's git blob id must match MANIFEST (a mismatch, an extra or a missing file
+refuses): together, the extraction is the pinned commit's tools/redqueen tree as git recorded it. Without RQ_PR68_DIR
+the gates are skipped with a reason starting "adoption gate".
 """
 from __future__ import annotations
 
@@ -235,8 +236,10 @@ STRUCTURAL_ZERO = {"status": "structural_zero", "M_H": 0,                       
                    "reason": "D8 rule 46: no age-feasible initial individual at this horizon"}
 # A_design_v5_clarification_1.md (coordinator, 2026-11-14), verbatim
 C3_CEILINGS = {"5000": 247, "10000": 0, "20000": 0}                                           # C3
-C3_SATURATION = {"basis": "mean fraction of N", "denominator": 600,                           # C3
-                 "window": {"C": [0.02, 0.98], "S": [0.02, 0.98], "F": [0.02, 0.98]}}
+C3_SATURATION_FORM = {"basis": "mean fraction of the channel's N",            # C3 as corrected by Addendum B; its "N"
+                      "window": {"C": [0.02, 0.98], "S": [0.02, 0.98], "F": [0.02, 0.98]}}   # comes from the encoder
+R4_SATURATION = {"basis": "mean fraction of N", "denominator": 600,           # (5c4d047's object: the single
+                 "window": {"C": [0.02, 0.98], "S": [0.02, 0.98], "F": [0.02, 0.98]}}   # denominator, wrong for C)
 C5_RULE = ("working replicate-mean variance (nu0*phi*W(z) + (R-1)*s_hat^2)/(nu0 + R - 1)/R, W the empirical-logit "
            "variance of the frozen fitter table (A_design_v5.md section 1.7b, the adopted design; its sha256 as "
            "recorded in the dated adoption receipt); full_pooling: phi*W(z)/R")                # C5
@@ -326,11 +329,38 @@ def nb_existing_estimator():
     return copy.deepcopy(_CACHE["nb_est"])
 
 
+def encoder_obs(caps=(7, 8, 9)):
+    """A tiny synthetic observation list in noisebank's observation encoding (L896-907): one exposed cell and its free
+    control, three replicates, the same counts at every horizon (capture mean 8: Codex's example)."""
+    obs = []
+    for r, c in enumerate(caps):
+        obs.append({"cell": f"e{r}", "prey": ["w0", "20M"], "pred": ["w1", "20M"], "replicate": r,
+                    "horizons": {str(h): {"captures": c, "survivors": 300 + r} for h in noisebank.HORIZONS}})
+        obs.append({"cell": f"f{r}", "prey": ["w0", "20M"], "pred": None, "replicate": r,
+                    "horizons": {str(h): {"survivors": 400 + r} for h in noisebank.HORIZONS}})
+    return obs
+
+
+def encoder_N():
+    """Each horizon's per-channel N exactly as noisebank's legacy encoder sets it (arrays, L923 @4991907) and its
+    saturation mask divides by (usable, L933-937): the meaning Addendum B restores, read from the encoder itself, not
+    from obslaw and not typed here."""
+    if "enc_N" not in _CACHE:
+        obs = encoder_obs()
+        _CACHE["enc_N"] = {str(h): dict(noisebank.arrays(obs, h)["N"]) for h in noisebank.HORIZONS}
+    return copy.deepcopy(_CACHE["enc_N"])
+
+
+def c3_saturation():
+    return dict(copy.deepcopy(C3_SATURATION_FORM), N=encoder_N())
+
+
 def c3_estimator():
-    """Clarification C3's record: the existing one minus seed (C1), plus ceilings, saturation, capped_category."""
+    """Clarification C3's record: the existing one minus seed (C1), plus ceilings, saturation (as Addendum B corrects
+    it) and capped_category."""
     rec = nb_existing_estimator()
     del rec["seed"]
-    rec.update(ceilings=dict(C3_CEILINGS), saturation=copy.deepcopy(C3_SATURATION), capped_category=CAPPED_CATEGORY)
+    rec.update(ceilings=dict(C3_CEILINGS), saturation=c3_saturation(), capped_category=CAPPED_CATEGORY)
     return rec
 
 
@@ -356,8 +386,8 @@ def nu0_rec(status):
     return rec
 
 
-def group_rec(ok=True):
-    g = {"pairs": 4096, "rho_max": 0.2, "curvature_per_pair": 0.05, "at_box": False, "deep_tail": 0}
+def group_rec(ok=True, rho=0.2):
+    g = {"pairs": 4096, "rho_max": rho, "curvature_per_pair": 0.05, "at_box": False, "deep_tail": 0}
     if ok:
         g["nodes"] = 241
     return g
@@ -389,7 +419,8 @@ def components_rec(zero):
 def _horizon_record(h, status):
     """A synthetic per-horizon record in noisebank's 5k encoding (v5 L751 "as now": noisebank.py L1683-1757); at the
     zero-ceiling horizons (10k, 20k) the channels.S/F structural-zero declarations (C4) and the capture-only fit
-    as the 5k encoding restricted to C (C4.1). Placeholder values, not a fit."""
+    as the 5k encoding restricted to C (C4.1), its components equal to its group maxima (Addendum B C4.2).
+    Placeholder values, not a fit."""
     zero = h != "5000"
     chans = "C" if zero else "CSF"
     curves = {"C": VAL_SC, "S": VAL_SS, "F": VAL_SS}
@@ -402,8 +433,8 @@ def _horizon_record(h, status):
            "reasons": [] if status == "ok" else ["R_CC is unidentified (curvature per pair 0.0004 < 0.001)"],
            "components": None, "bootstrap": None}
     gs = CAP_GROUPS if zero else NB_GROUPS
-    if status == "ok":
-        rec.update(groups={g: group_rec() for g in gs},
+    if status == "ok":                          # (at 10k the maxima ARE the capture components: Addendum B C4.2)
+        rec.update(groups={g: group_rec(rho=dict(zip(CAP_GROUPS, CAP_RHO))[g] if zero else 0.2) for g in gs},
                    grid_validation={"label": nb_text("local objective-value validation ("), "worst_miss_per_pair": 2e-4,
                                     "tolerance": noisebank.GRID_LL_TOL, "refined": False, "refit_shift": 0.0,
                                     "shift_flag": False},
@@ -530,10 +561,15 @@ V5_FIELDS = (
       for k in ("z_intervals", "rho_max", "sigma_min", "info_min", "multi_start", "start_tol", "boot",
                 "boot_fail_max", "rectangle", "grid", "constrained_fit", "fixed_replicate_bias")),
     (("estimator", "saturation"), "750, 613; C3", f"the existing key ({_NB} L1769) holding C3's object"),
-    *((("estimator", "saturation", k), "613, 624-629, 750; C3", "saturation per channel and its basis")
-      for k in C3_SATURATION),
+    *((("estimator", "saturation", k), "613, 624-629, 750; C3, Addendum B", "saturation per channel and its basis")
+      for k in ("basis", "window", "N")),
     *((("estimator", "saturation", "window", ch), "624-625; C3", "the same window for every channel")
       for ch in "CSF"),
+    *((("estimator", "saturation", "N", h), "613, 624; Addendum B (C3 correction)", f"{_NB} L923")
+      for h in ("5000", "10000", "20000")),
+    *((("estimator", "saturation", "N", h, ch), "613, 624; Addendum B (C3 correction)",
+       f"{_NB} L923 (C: capture_bound(h); S, F: 600), L933")
+      for h in ("5000", "10000", "20000") for ch in "CSF"),
     (("estimator", "ceilings"), "750; C3", ""),
     *((("estimator", "ceilings", h), "748, 750; C3", "equal to d8.ceilings") for h in C3_CEILINGS),
     (("estimator", "capped_category"), "750; C3", ""),
@@ -582,13 +618,20 @@ def _permute_streams(order):
     return mutate
 
 
-def _cap_fit(rR, rD):
-    """The 10k capture-only fit replaced consistently (components and shares) by rho_R, rho_D."""
+def _cap_fit(rR, rD, h="10000"):
+    """The capture-only fit's components and shares replaced consistently by rho_R, rho_D (the groups untouched)."""
     def mutate(d):
-        d["horizons"]["10000"]["components"].update(
+        d["horizons"][h]["components"].update(
             SigmaR=[[rR]], SigmaD=[[rD]], SigmaE=[[1.0 - rR - rD]],
             shares={"C": {"row": rR, "donor": rD, "cell": 1.0 - rR - rD}})
     return mutate
+
+
+def capture_fit(d, rR, rD, h="10000"):
+    """An ok capture-only fit with maxima rho_R, rho_D: the groups' maxima, the 1x1 components and the shares alike
+    (Addendum B C4.2; E by the registered expression 1.0 - rho_R - rho_D)."""
+    d["horizons"][h]["groups"]["R_CC"]["rho_max"], d["horizons"][h]["groups"]["D_CC"]["rho_max"] = rR, rD
+    _cap_fit(rR, rD, h)(d)
 
 
 def constrained_fit(d, **extra):
@@ -709,15 +752,16 @@ V5_VALUES = (
      r"estimator\.constrained_fit .* is not the registered", "615; C3"),
     (_set(("estimator", "fixed_replicate_bias"), "corrected"), r"estimator\.fixed_replicate_bias 'corrected' is not",
      "612; C3"),
-    (_set(("estimator", "saturation", "basis"), "mean fraction of M_H"),
-     r"estimator\.saturation\.basis 'mean fraction of M_H' is not the registered 'mean fraction of N'",
-     "613, 624-629; C3"),
+    (_set(("estimator", "saturation", "basis"), "mean fraction of M_H"),     # (re-bound in round 5: Addendum B's basis)
+     r"estimator\.saturation\.basis 'mean fraction of M_H' is not the registered \"mean fraction of the channel's N\"",
+     "613, 624-629; C3, Addendum B"),
     (_set(("estimator", "saturation", "basis"), "mean fraction of N "), r"estimator\.saturation\.basis .* is not",
      "613, 624-629; C3"),
-    (_set(("estimator", "saturation", "denominator"), 247),
-     r"estimator\.saturation\.denominator 247 is not the registered 600", "624; C3"),
-    (_set(("estimator", "saturation", "denominator"), 600.0),
-     r"estimator\.saturation\.denominator 600\.0 is not the registered 600", "624; C3"),
+    (_put(("estimator", "saturation"), lambda: copy.deepcopy(R4_SATURATION)),   # (re-bound in round 5: 5c4d047's
+     r"missing field estimator\.saturation\.N$", "613, 624; Addendum B (the old single denominator)"),   # object)
+    (_upd(("estimator", "saturation"), denominator=600),                       # (re-bound in round 5)
+     r"estimator\.saturation carries keys outside the registered record: \['denominator'\]",
+     "613, 624; Addendum B (the old denominator beside N)"),
     (_set(("estimator", "saturation", "window", "S"), [0.02, 1.0]),
      r"estimator\.saturation\.window\.S \[0\.02, 1\.0\] is not the registered \[0\.02, 0\.98\]", "624-629; C3"),
     (_set(("estimator", "saturation", "window", "C"), [0.02]), r"estimator\.saturation\.window\.C \[0\.02\] is not",
@@ -1009,6 +1053,66 @@ V5_VALUES = (
      r"map_variance\.nu0\.F differs from horizons\.5000\.nu0\.F", "747; Addendum A C9 (L1794)"),
     (_set(_5K + ("nu0", "C", "nu0"), 12.0),
      r"map_variance\.nu0\.C differs from horizons\.5000\.nu0\.C", "747; Addendum A C9 (the source side)"),
+    # ---- round 5, clarification Addendum B. C3 correction: per-channel saturation N (noisebank.py L923, L933)
+    (_set(("estimator", "saturation", "N", "5000", "C"), 600),
+     r"estimator\.saturation\.N\.5000\.C 600 is not the registered 324", "613, 624; Addendum B C3"),
+    (_set(("estimator", "saturation", "N", "10000", "C"), 324),
+     r"estimator\.saturation\.N\.10000\.C 324 is not the registered 642", "613, 624; Addendum B C3"),
+    (_set(("estimator", "saturation", "N", "20000", "C"), 642),
+     r"estimator\.saturation\.N\.20000\.C 642 is not the registered 1284", "613, 624; Addendum B C3"),
+    (_set(("estimator", "saturation", "N", "5000", "C"), 324.0),
+     r"estimator\.saturation\.N\.5000\.C 324\.0 is not the registered 324", "613, 624; Addendum B C3"),
+    (lambda d: d["estimator"]["saturation"]["N"].pop("20000"), r"missing field estimator\.saturation\.N\.20000$",
+     "613, 624; Addendum B C3 (a missing horizon)"),
+    (_put(("estimator", "saturation", "N", "40000"), lambda: {"C": 2568, "S": 600, "F": 600}),
+     r"estimator\.saturation\.N carries keys outside the registered record: \['40000'\]", "613, 624; Addendum B C3"),
+    (_set(("estimator", "saturation", "N", "5000", "S"), 247),
+     r"estimator\.saturation\.N\.5000\.S 247 is not the registered 600", "613, 624; Addendum B C3"),
+    (_set(("estimator", "saturation", "N", "10000", "F"), 600.0),
+     r"estimator\.saturation\.N\.10000\.F 600\.0 is not the registered 600", "613, 624; Addendum B C3"),
+    (lambda d: d["estimator"]["saturation"]["N"]["20000"].pop("F"),
+     r"missing field estimator\.saturation\.N\.20000\.F$", "613, 624; Addendum B C3"),
+    (_set(("estimator", "saturation", "N"), {"C": 324, "S": 600, "F": 600}),
+     r"missing field estimator\.saturation\.N\.5000$", "613, 624; Addendum B C3 (one N for every horizon)"),
+    # ---- C4.2: an ok capture-only fit's components ARE its group maxima, which must be feasible
+    (_set(_10K + ("groups", "R_CC", "rho_max"), -0.1),
+     r"horizons\.10000\.groups R_CC\.rho_max -0\.1, D_CC\.rho_max 0\.125 are infeasible maxima",
+     "674-678; Addendum B C4.2 (Codex's scenario)"),
+    (_set(_10K + ("groups", "D_CC", "rho_max"), -0.05),
+     r"horizons\.10000\.groups R_CC\.rho_max 0\.375, D_CC\.rho_max -0\.05 are infeasible maxima",
+     "674-678; Addendum B C4.2"),
+    (lambda d: (_get(d, _10K + ("groups", "R_CC")).update(rho_max=0.9),
+                _get(d, _10K + ("groups", "D_CC")).update(rho_max=0.2)),
+     r"horizons\.10000\.groups R_CC\.rho_max 0\.9, D_CC\.rho_max 0\.2 are infeasible maxima",
+     "676-678; Addendum B C4.2 (rho_R + rho_D > 1)"),
+    (_set(_10K + ("groups", "R_CC", "rho_max"), 0.3),
+     r"horizons\.10000\.components\.SigmaR \[\[0\.375\]\] is not the group maxima's \[\[0\.3\]\]",
+     "674-677; Addendum B C4.2"),
+    (_set(_10K + ("groups", "D_CC", "rho_max"), 0.1),
+     r"horizons\.10000\.components\.SigmaD \[\[0\.125\]\] is not the group maxima's \[\[0\.1\]\]",
+     "674-677; Addendum B C4.2"),
+    (lambda d: [_get(d, _10K + ("groups", g)).update(rho_max=0.2) for g in CAP_GROUPS],
+     r"horizons\.10000\.components\.SigmaR \[\[0\.375\]\] is not the group maxima's \[\[0\.2\]\]",
+     "674-677; Addendum B C4.2 (5c4d047's fixture)"),
+    (_cap_fit(0.25, 0.25),
+     r"horizons\.10000\.components\.SigmaR \[\[0\.25\]\] is not the group maxima's \[\[0\.375\]\]",
+     "674-677; Addendum B C4.2 (consistent components, other maxima)"),
+    (lambda d: (_cap_fit(0.0, 0.125)(d), _get(d, _10K + ("groups", "R_CC")).update(rho_max=0),
+                _get(d, _10K + ("groups", "D_CC")).update(rho_max=0.125)),
+     r"horizons\.10000\.components\.SigmaR \[\[0\.0\]\] is not the group maxima's \[\[0\]\]",
+     "674-677; Addendum B C4.2 (JSON types kept)"),
+    # ---- C9 completion: the copied maps have exactly C, S, F; map_variance.nu0 is the complete 5k map
+    (lambda d: [m.update(X=None) for m in (d["noise"]["s_logit"], d["map_variance"]["s_logit"],
+                                          d["map_variance"]["nu0"])],
+     r"noise\.s_logit has keys \['X'\] outside", "746-747; Addendum B C9 completion (Codex's scenario)"),
+    (lambda d: [m.update(X=None) for m in (d["noise"]["s_logit"], d["map_variance"]["s_logit"])],
+     r"noise\.s_logit has keys \['X'\] outside", "746-747; Addendum B C9 completion"),
+    (lambda d: [m.update(X=copy.deepcopy(m["C"])) for m in (d["noise"]["s_logit"], d["map_variance"]["s_logit"])],
+     r"noise\.s_logit has keys \['X'\] outside", "746-747; Addendum B C9 completion (a valid fourth curve)"),
+    (lambda d: d["map_variance"]["nu0"].update(X=None),
+     r"map_variance\.nu0 has keys \['X'\] outside", "747; Addendum B C9 completion"),
+    (lambda d: d["map_variance"]["nu0"].update(X=nu0_rec("full_pooling")),
+     r"map_variance\.nu0 has keys \['X'\] outside", "747; Addendum B C9 completion (a valid fourth record)"),
 )
 
 
@@ -1602,6 +1706,42 @@ class TestBankArtifact(TmpDir):
         d["horizons"]["20000"]["scales"]["C"] = None                      # (null: no usable cells, as at 5k L1528)
         self.load(d)
 
+    def test_C4_2_valid_boundaries_and_unavailable_diagnostics_load(self):
+        """Addendum B C4.2: with the components equal to the group maxima, the feasibility boundaries (rho = 0,
+        rho_R + rho_D = 1) load as ok; infeasible maxima (negative, or summing above 1) load as unavailable
+        diagnostics."""
+        for rR, rD in ((0.0, 0.125), (0.375, 0.0), (0.0, 0.0), (0.75, 0.25)):
+            d = bank3_doc()
+            capture_fit(d, rR, rD)
+            with self.subTest(ok=(rR, rD)):
+                self.load(d)
+        for rR, rD in ((-0.1, -0.05), (-0.1, 0.125), (0.9, 0.2)):
+            d = bank3_doc()
+            for g, v in zip(CAP_GROUPS, (rR, rD)):
+                d["horizons"]["20000"]["groups"][g]["rho_max"] = v
+            with self.subTest(unavailable=(rR, rD)):
+                self.load(d)
+
+    def test_C3_saturation_denominators_are_the_encoders(self):
+        """Addendum B's C3 correction against the legacy encoder's own behaviour (not against obslaw or a typed copy):
+        the recorded N is each channel's N as noisebank.arrays sets it (L923: C = capture_bound(h), S = F = 600), and
+        noisebank.usable's saturation decision (L933-937) agrees with the window on the recorded N. Codex's example:
+        at 5k a capture mean of 8 is 8/324 ~ 0.0247, inside the window, while 8/600 (5c4d047's single denominator)
+        is outside; at 10k the same mean is outside (8/642)."""
+        sat = ol.registered_estimator()["saturation"]
+        N, (lo, hi) = sat["N"], sat["window"]["C"]
+        self.assertEqual(N, encoder_N())
+        for h in noisebank.HORIZONS:
+            self.assertEqual(N[str(h)], {"C": noisebank.capture_bound(h), "S": 600, "F": 600})
+            self.assertIs(type(N[str(h)]["C"]), int)
+        self.assertEqual([N[h]["C"] for h in ("5000", "10000", "20000")], [324, 642, 1284])
+        for h, saturated in ((5000, 0), (10000, 1)):
+            U = noisebank.usable(noisebank.arrays(encoder_obs(), h))
+            with self.subTest(horizon=h):
+                self.assertEqual(U["C"]["counts"]["saturated"], saturated)            # the encoder's decision
+                self.assertEqual(not (lo <= 8 / N[str(h)]["C"] <= hi), bool(saturated))   # the recorded N's
+        self.assertFalse(lo <= 8 / 600 <= hi)                                         # (the single 600's)
+
     def test_C1_to_C5_registered_records_are_noisebank_and_the_clarification(self):
         """The loader's registered records against independent sources: C3's estimator = noisebank.estimate's
         existing record evaluated from noisebank's own source, minus seed (C1), plus the clarification's verbatim
@@ -1612,7 +1752,7 @@ class TestBankArtifact(TmpDir):
         self.assertNotIn("seed", est)
         self.assertEqual(set(est), (set(nb_existing_estimator()) - {"seed"}) | {"ceilings", "saturation",
                                                                                 "capped_category"})   # (C3 erratum)
-        self.assertEqual(rqlib.canonical(est["saturation"]), rqlib.canonical(C3_SATURATION))
+        self.assertEqual(rqlib.canonical(est["saturation"]), rqlib.canonical(c3_saturation()))
         self.assertEqual(est["ceilings"], C3_CEILINGS)
         self.assertEqual((est["multi_start"], est["boot"]), (16, 999))
         self.assertEqual(ol.MAP_VARIANCE_RULE, C5_RULE)
@@ -2060,12 +2200,22 @@ def git_blob_id(path):
     return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
 
 
+# The trusted manifest digest of each pinned #68 commit: sha256 of `git ls-tree -r <commit> tools/redqueen` (git's own
+# record of that commit's files and blob ids), computed from the repository's object store when the commit was pinned
+# (evidence: recA_build/p2/evidence/r5/pr68_manifest_digest.log, which recomputes it with git). A commit without an
+# entry here cannot pass the adoption gates.
+TRUSTED_MANIFESTS = {
+    "75817e293a8368a1cb1168f446bd33f9454dd644": "2ea2162728e1dd8b9116b6c6fcabe014916548af1329fcaf9e630672eb373d61",
+}
+
+
 def pr68_pinned_commit(root):
-    """The #68 extraction root's PINNED_COMMIT (a full 40-hex sha), after authenticating the extraction against its
-    MANIFEST: the `git ls-tree -r <PINNED_COMMIT> tools/redqueen` output written beside it when the extraction was
-    made (git's own record of that commit's tree: mode, type, blob id and path of every file). Every file under
-    tools/redqueen/ must have the blob id MANIFEST records for its path, and no file may be missing or extra;
-    otherwise the gate is refused (AssertionError) before anything runs. -> (sha, number of files verified)."""
+    """The #68 extraction root's PINNED_COMMIT (a full 40-hex sha), after two checks that run before any gate:
+    (1) provenance: sha256(MANIFEST) must equal TRUSTED_MANIFESTS[PINNED_COMMIT], the digest of `git ls-tree -r
+    <PINNED_COMMIT> tools/redqueen` bound to that commit in this harness (a commit without an entry is refused);
+    (2) consistency: every file under tools/redqueen/ must have the git blob id MANIFEST records for its path, and no
+    file may be missing or extra. Together they authenticate the extraction as the pinned commit's tools/redqueen
+    tree, as git recorded it. Otherwise the gate is refused (AssertionError). -> (sha, number of files verified)."""
     pin = os.path.join(root, "PINNED_COMMIT")
     if not os.path.isfile(pin):
         raise AssertionError(f"adoption gate refused: {pin} is absent (RQ_PR68_DIR must be the root of a git-archive "
@@ -2078,6 +2228,14 @@ def pr68_pinned_commit(root):
     if not os.path.isfile(man):
         raise AssertionError(f"adoption gate refused: {man} is absent (git ls-tree -r {sha} tools/redqueen, written at "
                              "extraction)")
+    trusted = TRUSTED_MANIFESTS.get(sha)
+    if trusted is None:
+        raise AssertionError(f"adoption gate refused: PINNED_COMMIT {sha} has no trusted manifest digest "
+                             "(TRUSTED_MANIFESTS)")
+    got = hashlib.sha256(rqlib.read_bytes(man)).hexdigest()
+    if got != trusted:
+        raise AssertionError(f"adoption gate refused: sha256(MANIFEST) {got} is not the trusted digest {trusted} of "
+                             f"commit {sha}")
     want = {}
     for i, line in enumerate(rqlib.read_text(man).splitlines(), 1):
         m = re.fullmatch(r"(100644|100755|120000) blob ([0-9a-f]{40})\t(tools/redqueen/[^\t]+)", line)
@@ -2105,14 +2263,28 @@ class TestAdoptionGatePin(TmpDir):
     HELLO = "ce013625030ba8dba906f756967f9e9ca394464a"     # git's blob id of b"hello\n" (git hash-object)
     EMPTY = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"     # git's blob id of the empty file
 
+    def setUp(self):
+        """Each test runs with its own trusted-digest table (the real one is restored afterwards)."""
+        super().setUp()
+        self.real = dict(TRUSTED_MANIFESTS)
+        p = mock.patch.dict(TRUSTED_MANIFESTS, clear=True)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def trust(self, manifest):
+        TRUSTED_MANIFESTS[self.SHA] = hashlib.sha256(manifest).hexdigest()
+
     def extraction(self):
-        """A synthetic extraction root: PINNED_COMMIT, MANIFEST and two files, ids from git (not from the helper)."""
+        """A synthetic extraction root: PINNED_COMMIT, MANIFEST and two files, ids from git (not from the helper),
+        with this synthetic MANIFEST's digest trusted for the test."""
         os.makedirs(os.path.join(self.tmp, "tools", "redqueen", "sub"))
         self.write("tools/redqueen/a.py", b"hello\n")
         self.write("tools/redqueen/sub/b.txt", b"")
         self.write("PINNED_COMMIT", (self.SHA + "\n").encode())
-        self.write("MANIFEST", (f"100644 blob {self.HELLO}\ttools/redqueen/a.py\n"
-                                f"100644 blob {self.EMPTY}\ttools/redqueen/sub/b.txt\n").encode())
+        man = (f"100644 blob {self.HELLO}\ttools/redqueen/a.py\n"
+               f"100644 blob {self.EMPTY}\ttools/redqueen/sub/b.txt\n").encode()
+        self.write("MANIFEST", man)
+        self.trust(man)
 
     def test_pinned_commit_is_required_and_read(self):
         """The gate's provenance check (review: RQ_PR68_DIR alone does not prove which commit was extracted)."""
@@ -2135,6 +2307,7 @@ class TestAdoptionGatePin(TmpDir):
                     f"100644 blob {self.HELLO}\ttools/redqueen/a.py\n100644 blob {self.HELLO}\ttools/redqueen/a.py\n"
                     .encode()):
             self.write("MANIFEST", bad)
+            self.trust(bad)                     # (trusted here so that the line parser is what refuses it)
             with self.subTest(manifest=bad), self.assertRaisesRegex(AssertionError, "MANIFEST (line|lists no)"):
                 pr68_pinned_commit(self.tmp)
 
@@ -2156,6 +2329,33 @@ class TestAdoptionGatePin(TmpDir):
         self.write("tools/redqueen/sub/b.txt", b"")
         self.assertEqual(pr68_pinned_commit(self.tmp), (self.SHA, 2))
 
+    def test_P3_the_manifest_is_bound_to_the_commit(self):
+        """Codex's round-4 scenarios (the manifest was checked against the files, never against the commit):
+        another valid 40-hex PINNED_COMMIT beside the same files and MANIFEST is refused (no trusted digest); a
+        consistent synthetic extraction under the real #68 sha is refused by the real trusted digest; a MANIFEST
+        whose digest differs from its commit's trusted digest is refused even though it matches the files."""
+        self.extraction()
+        self.write("PINNED_COMMIT", b"0123456789abcdef0123456789abcdef01234567\n")
+        with self.assertRaisesRegex(AssertionError, "PINNED_COMMIT 0123456789abcdef0123456789abcdef01234567 has no "
+                                                    "trusted manifest digest"):
+            pr68_pinned_commit(self.tmp)
+        self.write("PINNED_COMMIT", (self.SHA + "\n").encode())
+        TRUSTED_MANIFESTS.clear()
+        TRUSTED_MANIFESTS.update(self.real)     # (the harness's real entry for 75817e2)
+        with self.assertRaisesRegex(AssertionError, r"sha256\(MANIFEST\) [0-9a-f]{64} is not the trusted digest "
+                                                    "2ea2162728e1dd8b"):
+            pr68_pinned_commit(self.tmp)
+        TRUSTED_MANIFESTS[self.SHA] = "0" * 64
+        with self.assertRaisesRegex(AssertionError, "is not the trusted digest 0{64}"):
+            pr68_pinned_commit(self.tmp)
+        TRUSTED_MANIFESTS.clear()
+        with self.assertRaisesRegex(AssertionError, "has no trusted manifest digest"):
+            pr68_pinned_commit(self.tmp)
+
+    def test_P3_the_harness_binds_75817e2_to_its_recorded_digest(self):
+        self.assertEqual(self.real, {"75817e293a8368a1cb1168f446bd33f9454dd644":
+                                     "2ea2162728e1dd8b9116b6c6fcabe014916548af1329fcaf9e630672eb373d61"})
+
 
 @NEED_NP
 @unittest.skipUnless(PR68, "adoption gate: RQ_PR68_DIR (the root of a read-only extraction of the pinned #68 "
@@ -2169,8 +2369,9 @@ class TestAdoptionGate68(unittest.TestCase):
     def setUpClass(cls):
         cls.commit, n = pr68_pinned_commit(PR68)
         tools = os.path.join(PR68, "tools", "redqueen")
-        print(f"\nadoption gate: #68 PINNED_COMMIT {cls.commit} (extraction {tools}; {n} files match MANIFEST, git "
-              "ls-tree -r of that commit)", file=sys.stderr, flush=True)
+        print(f"\nadoption gate: #68 PINNED_COMMIT {cls.commit} (extraction {tools}; MANIFEST sha256 = the trusted "
+              f"digest {TRUSTED_MANIFESTS[cls.commit][:16]}... of that commit; {n} files match MANIFEST)",
+              file=sys.stderr, flush=True)
         cls.loc = [(C247 - 1e-3, 0.3, 600, 247), (C247 - 1e-4, 0.5, 600, 247), (0.2, 0.25, 600, 247),
                    (1e-3, 0.3, 600, 247), (0.5, 0.3, 324, 324), (0.99, 0.2, 324, 324), (0.02, 0.45, 324, 324)]
         cls.ef = [(-1.0, 0.3, 600, 247), (-0.36, 0.6, 600, 247), (0.5, 0.8, 600, 247), (2.0, 0.2, 324, 324)]
