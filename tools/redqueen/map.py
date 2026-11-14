@@ -564,26 +564,29 @@ def capture_scale(V, zrep, R, nu0=None):
     (nu0 + R - 1) with phi as above (unchanged definition; V_e and zrep_e both empirical-logit variances), and
     w_e = (1 / v~_e) / mean(1 / v~), unit = 1 / (R mean(1 / v~)), so unit / w_e = v~_e / R exactly. nu0 None
     (full pooling, planning, numerical) is exactly the rule above. nu0 needs V (refused without it).
-    The nu0 branch is evaluated IN LOGARITHMS (A_design_v5 clarification 2, Revision 4, "Log-space evaluation", which
-    supersedes the float arithmetic of Revisions 1-3), so no intermediate (phi V, v~, 1 / v~, mean(1 / v~)) is ever
-    formed as a float: none can overflow, underflow or cause a refusal. With n cells, l(x) = log x (log 0 = -inf),
-    lae = logaddexp and lse(x) = m + log sum e^(x - m) with m = max x and a pairwise sum (np.sum): l_D = lae(
-    l(nu0), l(R - 1)), l_a = l(nu0) - l_D, l_ac = l(R - 1) - l_D (a = nu0 / (nu0 + R - 1), ac = 1 - a); l_phi =
-    lse(l(zrep_e) - l(V_e)) - log n; l(v~_e) = lae(l_a + l_phi + l(V_e), l_ac + l(zrep_e)); l_M = lse(-l(v~_e)) - log
-    n (M = mean(1 / v~)); returned: phi = e^l_phi, w_e = e^(-l(v~_e) - l_M), unit = e^(-log R - l_M). The accuracy
-    contract (Revision 4, item 3): each returned quantity is within 1e-10 relative of the formula's exact value on
-    the floored float inputs (a subnormal one: 1e-10 relative + 2^-1074); no byte requirement against the float
-    forms. The refusal rule (item 4): refused if and only if a RETURNED quantity's computed logarithm is outside the
-    float range, above log(largest finite float) or below log 2^-1075 (the value rounds to zero); in floats, in
-    range is log 2^-1075 < l <= log(largest float), both float logarithms lying below the true values (by 1.4e-14
-    and 2.4e-14), so this is exactly "not below" and "not above", and e^l is then positive and finite. Within a
-    factor e^(+-1e-10) of an edge either outcome is allowed (the indeterminate band). Its domain (clarification 2,
-    D3; Revision 4, item 1): V and zrep are validated RAW, before main's 1e-8 floor of V (a non-finite V, -inf
-    included, a non-finite zrep or a negative replicate variance is refused; finite values then take the floor
-    exactly as before); a data set with no replicate variance in any cell (phi = 0, so every v~_e = 0 and the
-    inverse-variance weights are undefined) is refused with that context, never floored and never fully pooled
-    instead. No cap on nu0 (subnormal ones included) and no variance floor. nu0 None: main's code and bytes (the
-    floor first, no check)."""
+    The nu0 branch is evaluated IN LOGARITHMS (A_design_v5 clarification 2, Revisions 4 and 4a, "Log-space
+    evaluation", which supersedes the arithmetic, the intermediate checks and the compatibility requirements of
+    Revisions 1-3: item 0), so no intermediate (phi V, v~, 1 / v~, mean(1 / v~)) is ever formed as a float: none can
+    overflow or cause a refusal (D3 needs only the exact v~ positive), and only negligible max-shifted terms of a sum
+    underflow. With n cells, l(x) = log x (log 0 = -inf), lae = logaddexp and lse(x) = m + log sum e^(x - m) with m
+    = max x and a pairwise sum (np.sum): l_D = lae(l(nu0), l(R - 1)), l_a = l(nu0) - l_D, l_ac = l(R - 1) - l_D (a =
+    nu0 / (nu0 + R - 1), ac = 1 - a); l_phi = lse(l(zrep_e) - l(V_e)) - log n; l(v~_e) = lae(l_a + l_phi + l(V_e),
+    l_ac + l(zrep_e)); l_M = lse(-l(v~_e)) - log n (M = mean(1 / v~)); returned: phi = e^l_phi, w_e = e^(-l(v~_e) -
+    l_M), unit = e^(-log R - l_M). The accuracy contract (item 3): each returned quantity is within 1e-10 relative of
+    the formula's exact value on the floored float inputs (a subnormal one: 1e-10 relative + 2^-1074); no byte
+    requirement against the float forms. The refusal rule (item 4, Revision 4a): refused when a RETURNED quantity's
+    computed logarithm is above log(largest finite float) or at or below log 2^-1075 (the value rounds to zero); in
+    floats, in range is log 2^-1075 < l <= log(largest float), both float logarithms lying below the true values (by
+    1.4e-14 and 2.4e-14), so this is exactly "not at or below" and "not above". Every successful return is finite
+    and strictly positive: if the conversion e^l to binary64 still gives 0 or inf (possible only within an ulp of
+    an edge, inside the indeterminate band, where a refusal is allowed; this libm gives positive finite values on
+    the whole range), the call is refused, never returned. Within a factor e^(+-1e-10) of an edge either outcome is
+    allowed. Its domain (clarification 2, D3; item 1): V and zrep are validated RAW, before main's 1e-8 floor of V
+    (a non-finite V, -inf included, a non-finite zrep or a negative replicate variance is refused; finite values
+    then take the floor exactly as before); a data set with no replicate variance in any cell (phi = 0, so every
+    v~_e = 0 and the inverse-variance weights are undefined) is refused with that context, never floored and never
+    fully pooled instead. No cap on nu0 (subnormal ones included) and no variance floor. nu0 None: main's code and
+    bytes (the floor first, no check)."""
     nu0 = _check_nu0(nu0)
     zrep = np.asarray(zrep, float)
     if V is None:
@@ -629,9 +632,15 @@ def capture_scale(V, zrep, R, nu0=None):
         more = f"; and {len(out) - 3} more w" if len(out) > 3 else ""
         raise ValueError(f"capture_scale: a returned quantity of the nu0 shrinkage is outside the float range (its "
                          f"logarithm not in (log 2^-1075, log of the largest float] = ({lo!r}, {hi!r}]: "
-                         f"{'; '.join(bad)}{more}): refused (A_design_v5 clarification 2, Revision 4)")
-    with np.errstate(under="ignore"):
-        return np.exp(lw), math.exp(lunit), math.exp(lphi)
+                         f"{'; '.join(bad)}{more}): refused (A_design_v5 clarification 2, Revision 4a)")
+    with np.errstate(under="ignore", over="ignore"):
+        w, unit, phi = np.exp(lw), float(np.exp(lunit)), float(np.exp(lphi))
+    if not (np.all((w > 0.0) & np.isfinite(w)) and 0.0 < unit < math.inf and 0.0 < phi < math.inf):
+        raise ValueError(f"capture_scale: a returned quantity of the nu0 shrinkage is outside the float range after "
+                         f"its conversion to binary64 (e^l gave 0 or inf at a logarithm within an ulp of an edge, "
+                         f"inside the indeterminate band: phi {phi!r}, unit {unit!r}, w in [{float(np.min(w))!r}, "
+                         f"{float(np.max(w))!r}]): refused, never returned (A_design_v5 clarification 2, Revision 4a)")
+    return w, unit, phi
 
 
 def pair_variance(r, s2, grid=200, iters=200, full=False):
