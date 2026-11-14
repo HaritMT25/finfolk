@@ -3003,6 +3003,131 @@ async function pageDraft() {
     }
 }
 
+/* Truthful Setup hints (steps 1-2 of the fact-check of the Argon UI answer): a field dims when the settings make it do
+ * nothing; these assert which fields are dimmed and which are active in each state, never the prose.
+ *   - Predators: predatorCount is only how many the world starts with; with their economy on, the floor
+ *     (predatorMinPopulation > 0) adds hunters even from 0 (src/ocean/ocean_world.hpp: the step calls refillPredators when
+ *     predatorEconomy and predatorMinPopulation > 0, and neither reads predatorCount). So the economy switch matters with
+ *     starting predators or a floor; the hunting settings with hunters (starting, or economy + floor); the economy's settings
+ *     with hunters and the economy; the floor with the economy alone. Both worlds count (a live field stays usable while it
+ *     acts on the running world: nv / nvRunning); a staged file is the next world alone.
+ *   - Appearance: its inheritance knobs act on the parts it carries: patterns with bit 1, body shapes with bit 2
+ *     (src/ocean/appearance_model.hpp offspringFromDraws).
+ *   - The mouth gate refuses food (size 1) only when kMouth x the smallest fish is under 1: a fish is size 1 without
+ *     evolving bodies, 0.5 to 2 with them (src/core/body_model.hpp BODY_PARAM_MIN), so mouth size 2 refuses nothing even
+ *     with evolving bodies, and under 1 with fixed bodies it refuses everything. */
+async function pageTruthfulHints() {
+    section('Truthful Setup hints: hunters from 0 starting predators (economy + floor), the appearance bits, the mouth gate: dimmed or active, per state');
+    const P = ['predatorEconomy', 'predatorSpeed', 'predatorPerception', 'predatorCaptureRadius', 'predatorCooldown', 'predatorMeal',
+               'predatorMetabolism', 'predatorReproEnergy', 'predatorMaxAge', 'predatorMinPopulation', 'predatorMaxPopulation',
+               'predatorInheritance', 'predatorTraitMutation'];
+    const HUNT = ['predatorSpeed', 'predatorPerception', 'predatorCaptureRadius', 'predatorCooldown'];
+    const ECON = ['predatorMeal', 'predatorMetabolism', 'predatorReproEnergy', 'predatorMaxAge', 'predatorMaxPopulation', 'predatorInheritance'];
+    const APP = ['patternMutation', 'patternPhaseMutation', 'patternNovelProbability', 'morphologyMutation', 'morphologyNovelProbability'];
+    const dimmed = (p, keys) => keys.filter(k => p.el('f_' + k).classList.contains('inert'));
+    const noted = (p, k) => { const n = p.el('f_' + k).querySelector('.needs'); return !!n && n.textContent !== ''; };
+    const fmt = (a) => a.length ? a.map(k => k.replace(/^predator/, '')).join(' ') : 'none';
+    const same = (a, b) => a.join(' ') === b.join(' ');
+    const boot = (cfg) => bootPage(PAGE_Q7 + '&cfg=' + encodeURIComponent(JSON.stringify(cfg)));
+    const clean = (p) => p.uncaught.length === 0;
+    /* the predator fields that do nothing with these settings (count, economy, floor, hunters inherit traits) */
+    const idleP = (c, e, f, i) => {
+        const hunters = c > 0 || (e && f > 0), acts = new Set();
+        if (c > 0 || f > 0) acts.add('predatorEconomy');
+        if (hunters) HUNT.forEach(k => acts.add(k));
+        if (hunters && e) ECON.forEach(k => acts.add(k));
+        if (e) acts.add('predatorMinPopulation');
+        if (hunters && e && i) acts.add('predatorTraitMutation');
+        return P.filter(k => !acts.has(k));
+    };
+    /* each world booted with the settings: the running world and the next one agree */
+    for (const e of [false, true]) {
+        const rows = [];
+        let good = true;
+        for (const c of [0, 3]) for (const f of [0, 2]) for (const i of e ? [false, true] : [false]) {
+            const p = await boot({ predatorCount: c, predatorEconomy: e, predatorMinPopulation: f, predatorInheritance: i });
+            const got = dimmed(p, P), want = idleP(c, e, f, i);
+            if (!same(got, want) || !clean(p)) good = false;
+            rows.push('predators ' + c + ', floor ' + f + (e ? ', inherit ' + (i ? 'on' : 'off') : '') + ': dimmed ' + fmt(got) +
+                      (same(got, want) ? '' : ' (should be ' + fmt(want) + ')'));
+        }
+        ok(good, 'economy ' + (e ? 'on' : 'off') + ', starting predators 0 / 3 x floor 0 / 2: ' + rows.join('; '));
+    }
+    {   /* the running world's economy and the next one's differ (nothing staged: nv / nvRunning) */
+        const p = await boot({ predatorCount: 0, predatorEconomy: true, predatorMinPopulation: 2 });   /* hunters now, from the floor */
+        p.edit('predatorEconomy', false);                                                            /* none in the next world */
+        const offNext = dimmed(p, P), wantOff = HUNT.concat(['predatorMeal', 'predatorMetabolism', 'predatorReproEnergy', 'predatorMaxAge',
+                                                             'predatorInheritance', 'predatorTraitMutation']);
+        const sorted = (a) => P.filter(k => a.includes(k));
+        const nowNoted = noted(p, 'predatorMinPopulation') && noted(p, 'predatorMaxPopulation');
+        const q = await boot({ predatorCount: 0, predatorEconomy: false, predatorMinPopulation: 2 });   /* no hunters now */
+        q.edit('predatorEconomy', true);                                                             /* the floor's in the next world */
+        const onNext = dimmed(q, P), quiet = ['predatorEconomy', 'predatorSpeed', 'predatorMeal', 'predatorMinPopulation', 'predatorMaxPopulation']
+            .every(k => !noted(q, k));
+        ok(same(offNext, sorted(wantOff)) && nowNoted && same(onNext, ['predatorTraitMutation']) && quiet && clean(p) && clean(q),
+           'economy on now with a floor of 2 and 0 starting predators, off for the next world: the floor and the cap (live) still act on ' +
+           'the running world\'s hunters, usable and noted; the next world\'s own settings dim (dimmed ' + fmt(offNext) + '); economy off now, ' +
+           'on for the next world: everything but trait mutation is the next world\'s, usable, no note (dimmed ' + fmt(onNext) + ')');
+    }
+    {   /* a staged setup file is the next world alone, whatever runs */
+        const file = (cfg) => JSON.stringify({ format: 'evo_ocean_setup', seed: 99, population: 12, depth: 200, width: 800, height: 600, config: cfg });
+        const p = await boot({ predatorCount: 0, predatorEconomy: true, predatorMinPopulation: 2 });   /* hunters now */
+        await stageFile(p, file({ predatorEconomy: false, predatorMinPopulation: 2 }));
+        const offFile = !!p.T.draft && dimmed(p, ['predatorMinPopulation', 'predatorMaxPopulation', 'predatorTraitMutation']).length === 3;
+        /* (the dimming is worked out once the file is staged: before, a running world's hunters kept its live fields undimmed) */
+        const r = await boot({ predatorCount: 3, predatorEconomy: true, predatorInheritance: true });   /* hunters now, from the start */
+        await stageFile(r, file({}));                                                                  /* none in the file */
+        const noneFile = !!r.T.draft && same(dimmed(r, P), P);
+        const q = await bootPage(PAGE_Q7);                                                           /* no predators at all now */
+        await stageFile(q, file({ predatorEconomy: true, predatorMinPopulation: 2 }));
+        const onFile = dimmed(q, P);
+        ok(offFile && noneFile && !!q.T.draft && same(onFile, ['predatorTraitMutation']) && clean(p) && clean(q) && clean(r),
+           'a staged file without the economy, hunters running from a floor: its floor, cap and trait mutation dim (' + offFile + '); a staged ' +
+           'file without predators, 3 running with their economy: every predator field dims, the live ones too (' + noneFile + '); a staged ' +
+           'file with the economy and a floor of 2 from 0 starting predators, none running: dimmed ' + fmt(onFile));
+    }
+    {   /* appearance 0 / 1 / 2 / 3: patterns need bit 1, body shapes bit 2 */
+        const rows = [];
+        let good = true;
+        for (const a of [0, 1, 2, 3]) {
+            const p = await boot({ appearance: a });
+            const got = dimmed(p, APP), want = APP.filter(k => !(/^pattern/.test(k) ? a & 1 : a & 2));
+            if (!same(got, want) || !clean(p)) good = false;
+            rows.push(a + ': dimmed ' + fmt(got) + (same(got, want) ? '' : ' (should be ' + fmt(want) + ')'));
+        }
+        /* both worlds: patterns and shapes running, patterns only typed for the next world (the knobs are live) */
+        const p = await boot({ appearance: 3 });
+        p.edit('appearance', 1);
+        const both = dimmed(p, APP).length === 0 && noted(p, 'morphologyMutation') && noted(p, 'morphologyNovelProbability') && !noted(p, 'patternMutation');
+        ok(good && both && clean(p), 'appearance genes ' + rows.join('; ') + '; shapes running, patterns only next: the shape knobs still act now, ' +
+           'usable and noted (' + both + ')');
+    }
+    {   /* the mouth gate on, bodies fixed at 1 or evolving, the mouth size typed (live: both worlds) */
+        const rows = [];
+        let good = true;
+        for (const bodies of [false, true]) {
+            const p = await boot({ bodyModel: bodies, mouthGate: true });
+            for (const k of [2, 1.5, 0.8, 0.4]) {
+                p.edit('kMouth', k);
+                const gate = dimmed(p, ['mouthGate']).length === 1, size = dimmed(p, ['kMouth']).length === 1;
+                const want = k * (bodies ? 0.5 : 1) >= 1;   /* no fish's mouth is too small for a size-1 item */
+                if (gate !== want || size) good = false;
+                rows.push((bodies ? 'evolving' : 'fixed') + ' x' + k + ': gate ' + (gate ? 'dimmed' : 'active'));
+            }
+            p.edit('mouthGate', false);
+            if (dimmed(p, ['kMouth']).length !== 1) good = false;   /* the mouth size needs the gate on */
+            if (!clean(p)) good = false;
+        }
+        /* both worlds: evolving bodies running at mouth size 1.5 (the smallest go hungry), bodies fixed typed for the next world */
+        const p = await boot({ bodyModel: true, mouthGate: true, kMouth: 1.5 });
+        p.edit('bodyModel', false);
+        const stillNow = dimmed(p, ['mouthGate']).length === 0 && noted(p, 'mouthGate');
+        ok(good && stillNow && clean(p), 'the mouth gate dims only where it can refuse nothing (food is size 1, a fish 0.5 to 2 with evolving ' +
+           'bodies): ' + rows.join(', ') + '; the size dims with the gate off; evolving bodies at 1.5 now, fixed next: the gate still acts now, ' +
+           'usable and noted (' + stillNow + ')');
+    }
+}
+
 /* The Setup modeline says the detail the tank is drawn at, after every change of it: Hold 60 fps lowering it (one frame a
  * second: slow frames at one step), then switched off (restoreDetail: the full detail again) */
 async function pageModelineDetail() {
@@ -5264,7 +5389,7 @@ const SECTIONS = {
     pageWallsOverride, pageFreshVisit, pageSizeFields, pageRoundTrip,
     pageColourBench, pageLayers, pageResize, pageKeys, pageStartupFailures, pageTourEscape, pageWholeFields,
     pageTurboFraction, pageCardNumbers, pageMixedRecovery, pageEscOwner, pageTabKeys, pageSetupTabs, pageIntegralFloats,
-    pageTurboMode, pageStartDoor, pageFollowBack, pageDraft, pageModelineDetail, pageReplayHistory, pageReplayReopen, pageScenarios,
+    pageTurboMode, pageStartDoor, pageFollowBack, pageDraft, pageTruthfulHints, pageModelineDetail, pageReplayHistory, pageReplayReopen, pageScenarios,
     pageCancelQueued, pageQueuedFile, pageNextBehindLive, pageEditedFile, pageReplayStaleRead, pageAskTarget, pagePendingAsk,
     pageKeyboardAsk,
     worldCodec, pageWorldFile, pageWorldTurbo, pageWorldRefusals,
