@@ -171,6 +171,344 @@
         { "do": "key", "key": "Escape", "world": "ocean" },
         { "do": "shot", "name": "help_kb_closed", "world": "ocean", "expect": { "focus": { "id": "helpbtn", "ring": true } } }
       ]
+    },
+    {
+      "id": "s3_card_390x844",
+      "set": "S3",
+      "title": "The fish card at 390 x 844, a phone, portrait (the card at the foot, collapsed by default below 600 px): the tank (Classic) and the Ocean, paused at tick 600, a fish selected, the card as it opens, then its brain toggled (expanded / collapsed); the Ocean steps once (.) between them (pause / select / step: the activations' freshness)",
+      "worlds": ["classic", "ocean"],
+      "viewport": [390, 844],
+      "steps": [
+        { "do": "run", "tick": 600, "then": "pause" },
+        { "do": "select" },
+        { "do": "shot", "name": "card", "expect": { "tick": 600, "paused": true } },
+        { "do": "key", "key": ".", "world": "ocean" },
+        { "do": "settle", "world": "ocean" },
+        { "do": "shot", "name": "card_stepped", "world": "ocean", "expect": { "tick": 601, "paused": true } },
+        { "do": "press", "sel": "#iexpand" },
+        { "do": "settle" },
+        { "do": "shot", "name": "card_toggled", "expect": { "paused": true } }
+      ]
+    },
+    {
+      "id": "s3_card_390x844_flat",
+      "set": "S3",
+      "title": "The fish card at 390 x 844, a phone, portrait (the card at the foot, collapsed by default below 600 px): Classic's WebGL flat view, paused at tick 600, a fish selected, the card as it opens, then its brain toggled (expanded / collapsed)",
+      "worlds": ["classic"],
+      "query": "view=flat",
+      "viewport": [390, 844],
+      "steps": [
+        { "do": "run", "tick": 600, "then": "pause" },
+        { "do": "select" },
+        { "do": "shot", "name": "card", "expect": { "tick": 600, "paused": true } },
+        { "do": "press", "sel": "#iexpand" },
+        { "do": "settle" },
+        { "do": "shot", "name": "card_toggled", "expect": { "paused": true } }
+      ]
+    },
+    {
+      "id": "s3_card_390x844_canvas",
+      "set": "S3",
+      "title": "The fish card at 390 x 844, a phone, portrait (the card at the foot, collapsed by default below 600 px): Classic's canvas-2D fallback, paused at tick 600, a fish selected, the card as it opens, then its brain toggled (expanded / collapsed)",
+      "worlds": ["classic"],
+      "query": "gl=0",
+      "viewport": [390, 844],
+      "steps": [
+        { "do": "run", "tick": 600, "then": "pause" },
+        { "do": "select" },
+        { "do": "shot", "name": "card", "expect": { "tick": 600, "paused": true } },
+        { "do": "press", "sel": "#iexpand" },
+        { "do": "settle" },
+        { "do": "shot", "name": "card_toggled", "expect": { "paused": true } }
+      ]
+    },
+    {
+      "id": "s3_card_320x568",
+      "set": "S3",
+      "title": "The fish card at 320 x 568, the smallest phone: the tank (Classic) and the Ocean, paused at tick 600, a fish selected, the card as it opens, then its brain toggled (expanded / collapsed)",
+      "worlds": ["classic", "ocean"],
+      "viewport": [320, 568],
+      "steps": [
+        { "do": "run", "tick": 600, "then": "pause" },
+        { "do": "select" },
+        { "do": "shot", "name": "card", "expect": { "tick": 600, "paused": true } },
+        { "do": "press", "sel": "#iexpand" },
+        { "do": "settle" },
+        { "do": "shot", "name": "card_toggled", "expect": { "paused": true } }
+      ]
+    },
+    {
+      "id": "s3_card_320x568_flat",
+      "set": "S3",
+      "title": "The fish card at 320 x 568, the smallest phone: Classic's WebGL flat view, paused at tick 600, a fish selected, the card as it opens, then its brain toggled (expanded / collapsed)",
+      "worlds": ["classic"],
+      "query": "view=flat",
+      "viewport": [320, 568],
+      "steps": [
+        { "do": "run", "tick": 600, "then": "pause" },
+        { "do": "select" },
+        { "do": "shot", "name": "card", "expect": { "tick": 600, "paused": true } },
+        { "do": "press", "sel": "#iexpand" },
+        { "do": "settle" },
+        { "do": "shot", "name": "card_toggled", "expect": { "paused": true } }
+      ]
+    },
+    {
+      "id": "s3_card_320x568_canvas",
+      "set": "S3",
+      "title": "The fish card at 320 x 568, the smallest phone: Classic's canvas-2D fallback, paused at tick 600, a fish selected, the card as it opens, then its brain toggled (expanded / collapsed)",
+      "worlds": ["classic"],
+      "query": "gl=0",
+      "viewport": [320, 568],
+      "steps": [
+        { "do": "run", "tick": 600, "then": "pause" },
+        { "do": "select" },
+        { "do": "shot", "name": "card", "expect": { "tick": 600, "paused": true } },
+        { "do": "press", "sel": "#iexpand" },
+        { "do": "settle" },
+        { "do": "shot", "name": "card_toggled", "expect": { "paused": true } }
+      ]
+    },
+    {
+      "id": "s3_card_844x390",
+      "set": "S3",
+      "title": "The fish card at 844 x 390, a phone, landscape (a short window: the card's short-height rules): the tank (Classic) and the Ocean, paused at tick 600, a fish selected, the card as it opens, then its brain toggled (expanded / collapsed)",
+      "worlds": ["classic", "ocean"],
+      "viewport": [844, 390],
+      "steps": [
+        { "do": "run", "tick": 600, "then": "pause" },
+        { "do": "select" },
+        { "do": "shot", "name": "card", "expect": { "tick": 600, "paused": true } },
+        { "do": "press", "sel": "#iexpand" },
+        { "do": "settle" },
+        { "do": "shot", "name": "card_toggled", "expect": { "paused": true } }
+      ]
+    },
+    {
+      "id": "s3_card_844x390_flat",
+      "set": "S3",
+      "title": "The fish card at 844 x 390, a phone, landscape (a short window: the card's short-height rules): Classic's WebGL flat view, paused at tick 600, a fish selected, the card as it opens, then its brain toggled (expanded / collapsed)",
+      "worlds": ["classic"],
+      "query": "view=flat",
+      "viewport": [844, 390],
+      "steps": [
+        { "do": "run", "tick": 600, "then": "pause" },
+        { "do": "select" },
+        { "do": "shot", "name": "card", "expect": { "tick": 600, "paused": true } },
+        { "do": "press", "sel": "#iexpand" },
+        { "do": "settle" },
+        { "do": "shot", "name": "card_toggled", "expect": { "paused": true } }
+      ]
+    },
+    {
+      "id": "s3_card_844x390_canvas",
+      "set": "S3",
+      "title": "The fish card at 844 x 390, a phone, landscape (a short window: the card's short-height rules): Classic's canvas-2D fallback, paused at tick 600, a fish selected, the card as it opens, then its brain toggled (expanded / collapsed)",
+      "worlds": ["classic"],
+      "query": "gl=0",
+      "viewport": [844, 390],
+      "steps": [
+        { "do": "run", "tick": 600, "then": "pause" },
+        { "do": "select" },
+        { "do": "shot", "name": "card", "expect": { "tick": 600, "paused": true } },
+        { "do": "press", "sel": "#iexpand" },
+        { "do": "settle" },
+        { "do": "shot", "name": "card_toggled", "expect": { "paused": true } }
+      ]
+    },
+    {
+      "id": "s3_card_890x453",
+      "set": "S3",
+      "title": "The fish card at 890 x 453, the portfolio's embed (short): the tank (Classic) and the Ocean, paused at tick 600, a fish selected, the card as it opens, then its brain toggled (expanded / collapsed)",
+      "worlds": ["classic", "ocean"],
+      "viewport": [890, 453],
+      "steps": [
+        { "do": "run", "tick": 600, "then": "pause" },
+        { "do": "select" },
+        { "do": "shot", "name": "card", "expect": { "tick": 600, "paused": true } },
+        { "do": "press", "sel": "#iexpand" },
+        { "do": "settle" },
+        { "do": "shot", "name": "card_toggled", "expect": { "paused": true } }
+      ]
+    },
+    {
+      "id": "s3_card_890x453_flat",
+      "set": "S3",
+      "title": "The fish card at 890 x 453, the portfolio's embed (short): Classic's WebGL flat view, paused at tick 600, a fish selected, the card as it opens, then its brain toggled (expanded / collapsed)",
+      "worlds": ["classic"],
+      "query": "view=flat",
+      "viewport": [890, 453],
+      "steps": [
+        { "do": "run", "tick": 600, "then": "pause" },
+        { "do": "select" },
+        { "do": "shot", "name": "card", "expect": { "tick": 600, "paused": true } },
+        { "do": "press", "sel": "#iexpand" },
+        { "do": "settle" },
+        { "do": "shot", "name": "card_toggled", "expect": { "paused": true } }
+      ]
+    },
+    {
+      "id": "s3_card_890x453_canvas",
+      "set": "S3",
+      "title": "The fish card at 890 x 453, the portfolio's embed (short): Classic's canvas-2D fallback, paused at tick 600, a fish selected, the card as it opens, then its brain toggled (expanded / collapsed)",
+      "worlds": ["classic"],
+      "query": "gl=0",
+      "viewport": [890, 453],
+      "steps": [
+        { "do": "run", "tick": 600, "then": "pause" },
+        { "do": "select" },
+        { "do": "shot", "name": "card", "expect": { "tick": 600, "paused": true } },
+        { "do": "press", "sel": "#iexpand" },
+        { "do": "settle" },
+        { "do": "shot", "name": "card_toggled", "expect": { "paused": true } }
+      ]
+    },
+    {
+      "id": "s3_card_959x800",
+      "set": "S3",
+      "title": "The fish card at 959 x 800, just below the wide layout (960 px): the tank (Classic) and the Ocean, paused at tick 600, a fish selected, the card as it opens, then its brain toggled (expanded / collapsed)",
+      "worlds": ["classic", "ocean"],
+      "viewport": [959, 800],
+      "steps": [
+        { "do": "run", "tick": 600, "then": "pause" },
+        { "do": "select" },
+        { "do": "shot", "name": "card", "expect": { "tick": 600, "paused": true } },
+        { "do": "press", "sel": "#iexpand" },
+        { "do": "settle" },
+        { "do": "shot", "name": "card_toggled", "expect": { "paused": true } }
+      ]
+    },
+    {
+      "id": "s3_card_959x800_flat",
+      "set": "S3",
+      "title": "The fish card at 959 x 800, just below the wide layout (960 px): Classic's WebGL flat view, paused at tick 600, a fish selected, the card as it opens, then its brain toggled (expanded / collapsed)",
+      "worlds": ["classic"],
+      "query": "view=flat",
+      "viewport": [959, 800],
+      "steps": [
+        { "do": "run", "tick": 600, "then": "pause" },
+        { "do": "select" },
+        { "do": "shot", "name": "card", "expect": { "tick": 600, "paused": true } },
+        { "do": "press", "sel": "#iexpand" },
+        { "do": "settle" },
+        { "do": "shot", "name": "card_toggled", "expect": { "paused": true } }
+      ]
+    },
+    {
+      "id": "s3_card_959x800_canvas",
+      "set": "S3",
+      "title": "The fish card at 959 x 800, just below the wide layout (960 px): Classic's canvas-2D fallback, paused at tick 600, a fish selected, the card as it opens, then its brain toggled (expanded / collapsed)",
+      "worlds": ["classic"],
+      "query": "gl=0",
+      "viewport": [959, 800],
+      "steps": [
+        { "do": "run", "tick": 600, "then": "pause" },
+        { "do": "select" },
+        { "do": "shot", "name": "card", "expect": { "tick": 600, "paused": true } },
+        { "do": "press", "sel": "#iexpand" },
+        { "do": "settle" },
+        { "do": "shot", "name": "card_toggled", "expect": { "paused": true } }
+      ]
+    },
+    {
+      "id": "s3_card_960x800",
+      "set": "S3",
+      "title": "The fish card at 960 x 800, the wide layout's first width: the tank (Classic) and the Ocean, paused at tick 600, a fish selected, the card as it opens, then its brain toggled (expanded / collapsed); the Ocean steps once (.) between them (pause / select / step: the activations' freshness)",
+      "worlds": ["classic", "ocean"],
+      "viewport": [960, 800],
+      "steps": [
+        { "do": "run", "tick": 600, "then": "pause" },
+        { "do": "select" },
+        { "do": "shot", "name": "card", "expect": { "tick": 600, "paused": true } },
+        { "do": "key", "key": ".", "world": "ocean" },
+        { "do": "settle", "world": "ocean" },
+        { "do": "shot", "name": "card_stepped", "world": "ocean", "expect": { "tick": 601, "paused": true } },
+        { "do": "press", "sel": "#iexpand" },
+        { "do": "settle" },
+        { "do": "shot", "name": "card_toggled", "expect": { "paused": true } }
+      ]
+    },
+    {
+      "id": "s3_card_960x800_flat",
+      "set": "S3",
+      "title": "The fish card at 960 x 800, the wide layout's first width: Classic's WebGL flat view, paused at tick 600, a fish selected, the card as it opens, then its brain toggled (expanded / collapsed)",
+      "worlds": ["classic"],
+      "query": "view=flat",
+      "viewport": [960, 800],
+      "steps": [
+        { "do": "run", "tick": 600, "then": "pause" },
+        { "do": "select" },
+        { "do": "shot", "name": "card", "expect": { "tick": 600, "paused": true } },
+        { "do": "press", "sel": "#iexpand" },
+        { "do": "settle" },
+        { "do": "shot", "name": "card_toggled", "expect": { "paused": true } }
+      ]
+    },
+    {
+      "id": "s3_card_960x800_canvas",
+      "set": "S3",
+      "title": "The fish card at 960 x 800, the wide layout's first width: Classic's canvas-2D fallback, paused at tick 600, a fish selected, the card as it opens, then its brain toggled (expanded / collapsed)",
+      "worlds": ["classic"],
+      "query": "gl=0",
+      "viewport": [960, 800],
+      "steps": [
+        { "do": "run", "tick": 600, "then": "pause" },
+        { "do": "select" },
+        { "do": "shot", "name": "card", "expect": { "tick": 600, "paused": true } },
+        { "do": "press", "sel": "#iexpand" },
+        { "do": "settle" },
+        { "do": "shot", "name": "card_toggled", "expect": { "paused": true } }
+      ]
+    },
+    {
+      "id": "s3_card_390x844_dpr2",
+      "set": "S3",
+      "title": "The fish card at 390 x 844 DPR 2, a phone at DPR 2: the tank (Classic) and the Ocean, paused at tick 600, a fish selected, the card as it opens, then its brain toggled (expanded / collapsed)",
+      "worlds": ["classic", "ocean"],
+      "viewport": [390, 844],
+      "dpr": 2,
+      "steps": [
+        { "do": "run", "tick": 600, "then": "pause" },
+        { "do": "select" },
+        { "do": "shot", "name": "card", "expect": { "tick": 600, "paused": true } },
+        { "do": "press", "sel": "#iexpand" },
+        { "do": "settle" },
+        { "do": "shot", "name": "card_toggled", "expect": { "paused": true } }
+      ]
+    },
+    {
+      "id": "s3_card_390x844_dpr2_flat",
+      "set": "S3",
+      "title": "The fish card at 390 x 844 DPR 2, a phone at DPR 2: Classic's WebGL flat view, paused at tick 600, a fish selected, the card as it opens, then its brain toggled (expanded / collapsed)",
+      "worlds": ["classic"],
+      "query": "view=flat",
+      "viewport": [390, 844],
+      "dpr": 2,
+      "steps": [
+        { "do": "run", "tick": 600, "then": "pause" },
+        { "do": "select" },
+        { "do": "shot", "name": "card", "expect": { "tick": 600, "paused": true } },
+        { "do": "press", "sel": "#iexpand" },
+        { "do": "settle" },
+        { "do": "shot", "name": "card_toggled", "expect": { "paused": true } }
+      ]
+    },
+    {
+      "id": "s3_card_390x844_dpr2_canvas",
+      "set": "S3",
+      "title": "The fish card at 390 x 844 DPR 2, a phone at DPR 2: Classic's canvas-2D fallback, paused at tick 600, a fish selected, the card as it opens, then its brain toggled (expanded / collapsed)",
+      "worlds": ["classic"],
+      "query": "gl=0",
+      "viewport": [390, 844],
+      "dpr": 2,
+      "steps": [
+        { "do": "run", "tick": 600, "then": "pause" },
+        { "do": "select" },
+        { "do": "shot", "name": "card", "expect": { "tick": 600, "paused": true } },
+        { "do": "press", "sel": "#iexpand" },
+        { "do": "settle" },
+        { "do": "shot", "name": "card_toggled", "expect": { "paused": true } }
+      ]
     }
   ]
 }

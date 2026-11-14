@@ -1,7 +1,66 @@
-/* web/ui_common.css: the styles that go with web/ui_common.js's focus primitives, on both pages (web/index.html,
- * web/ocean.html; after each page's own <style>). Display only. */
+/* web/ui_common.css: the styles that go with web/ui_common.js, on both pages (web/index.html, web/ocean.html;
+ * after each page's own <style>, so at equal specificity these win: the short-screen rules below override the
+ * pages' wide ones). Display only. */
 
 /* A tablist (EvoUI.tabs marks it .ui-tablist) scrolls sideways (overflow-x: auto, which clips on both axes), and
  * its tabs fill its height: the page's ring, drawn 2 px outside the element, would be cut away there. A tab's ring
  * goes just inside its edge instead, whole on every side. */
 .ui-tablist [role="tab"]:focus-visible { outline-offset: -2px; }
+
+/* ---------- the fish card (#fishcard: both pages, every view; web/ui_common.js) ----------
+ * The colour key: the generic silhouette in the fish's colour (EvoUI.drawPortrait), captioned as what it is. Its
+ * caption sits in the picture's empty foot (the silhouette is at most ~31 of its 40 px), so the head grows little. */
+.fc-key { display: flex; flex-direction: column; align-items: center; flex: none; margin: 0; }
+.fc-key figcaption { margin-top: -3px; font-size: 10px; line-height: 12px; color: var(--ink-3); white-space: nowrap; }
+/* The Ocean's skin (data-ext: a world's own field): the unlit pattern on its flank, under the colour key's column,
+ * its caption in that column. */
+.fc-skin { display: flex; align-items: center; gap: 12px; padding: 0 14px 8px 12px; }
+.fc-skin[hidden] { display: none; }
+.fc-skin .fc-cap { flex: none; width: 56px; font-size: 10px; line-height: 12px; color: var(--ink-3); text-align: center; }
+#iswatch { display: block; flex: 1 1 auto; min-width: 0; height: 22px; border-radius: 4px; image-rendering: auto; }
+#iswatch[hidden] { display: none; }
+
+/* A phone (below 480 px): the name and its line take a row of their own, under the colour key and the buttons,
+ * instead of the few px left between them (at 320 px the name broke over two lines and its line over five); the
+ * buttons keep their 44 px. */
+@media (max-width: 479px) {
+  .fc-head { flex-wrap: wrap; row-gap: 2px; }
+  .fc-key { margin-right: auto; }
+  .fc-title { order: 1; flex: 1 0 100%; padding: 0 0 2px 2px; }
+}
+/* A short window (a landscape phone; an embed, such as the portfolio's 890 x 453): the card, its brain open, fits
+ * between the top bar and the dock instead of scrolling. What gives way first is optional: the stats' bars and the
+ * brain's height; the card's actions (its buttons) and its numbers stay (the UI parity plan's U55). Both pages. */
+@media (max-height: 560px) {
+  #fishcard { max-height: calc(100dvh - 64px - var(--dock-h) - 22px - var(--safe-t) - var(--safe-b)); }
+  .fc-head { gap: 10px; padding: 4px 4px 2px 10px; }
+  .fc-skin { gap: 10px; padding: 0 12px 6px 10px; }
+  #ititle { font-size: 15px; }
+  #isub { font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .fc-stats { gap: 6px 12px; padding: 2px 12px 8px; }
+  .stat .k { font-size: 11px; }
+  .stat .v { font-size: 13px; }
+  .fc-stats .bar { display: none; }   /* the numbers stay; the brain gets the room */
+  #fishcard .fc-brain .inet, #fishcard.expanded .fc-brain .inet { height: clamp(96px, calc(100dvh - 346px), 170px); }
+  #isense { min-height: 2.8em; padding: 4px 12px 8px; font-size: 12px; }
+}
+/* (a mouse's buttons may be smaller there; a finger's stay 44 px) */
+@media (max-height: 560px) and (pointer: fine) {
+  .fc-head .icon-btn { width: 36px; height: 36px; }
+}
+@media (max-height: 560px) and (min-width: 960px) {
+  #fishcard, #fishcard.flip { top: calc(64px + var(--safe-t));
+                              max-height: calc(100dvh - 64px - var(--dock-h) - 24px - var(--safe-t) - var(--safe-b)); }
+}
+
+/* ---------- touch targets: 44 x 44 px where a finger presses (the UI parity plan's U56) ----------
+ * A switch's 48 x 28 track in a 64 x 44 target: a transparent border the background stays inside (its 1 px edge
+ * an inset shadow), the margin keeping the layout's 48 x 28. The card's buttons are 44 px .icon-btn already; its
+ * one link (the Ocean's body-plan viewer) gets the height too. */
+@media (pointer: coarse) {
+  input.switch { width: 64px; height: 44px; margin: -8px; border: 8px solid transparent;
+                 background-clip: padding-box; box-shadow: inset 0 0 0 1px var(--line); }
+  input.switch:checked { background-clip: padding-box; box-shadow: none; border-color: transparent; }
+  input.switch:focus-visible { outline-offset: -6px; }
+  #fishcard a { display: inline-flex; align-items: center; min-height: 44px; padding: 0 6px; }
+}

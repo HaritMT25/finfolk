@@ -134,7 +134,10 @@ jobs:
   # (key ownership, typing, keyboard / pointer presses, the tablists' roving focus, focus return), both
   # dashboards' tabs and Classic's setup sheet (web/renderer.js run whole) on a small DOM; then the paired
   # browser harness's parts that need no browser (tests/ui_parity_browser.mjs: the selection and fixture
-  # checks, --compare as a gate on synthetic runs). The harness's browser runs are a local tool.
+  # checks, --compare as a gate on synthetic runs). The harness's browser runs are a local tool. Then the
+  # fish card (P03): its shared parts against both pages' own drawing, gene counts and activation freshness
+  # on both real modules, and both pages run whole with their modules (the card in every view, pause /
+  # select / step, zero steps, a load, hiding the card without letting the fish go).
   web-ui:
     name: web ui (node)
     runs-on: ubuntu-24.04
@@ -145,6 +148,7 @@ jobs:
           node-version: "20.x"
       - run: node tests/ui_common_tests.cjs
       - run: node tests/ui_parity_harness_tests.mjs
+      - run: node tests/ui_inspector_tests.cjs
 
   # tools/redqueen (the Red Queen tournament tooling) on the Python versions it must run on: the
   # serial job's ctest runs it on the runner image's python3 (3.12); this job builds the serial app

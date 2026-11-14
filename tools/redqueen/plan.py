@@ -470,32 +470,37 @@ def plan_seeds(rows, kinds=ENGINE_SEEDS):
     return out
 
 
-def collect_seeds(obj, out=None, hint=False):
-    """Every integer under a key whose name contains "seed" (a registry's founder seeds and reserved
-    seed slots, any nesting)."""
-    out = set() if out is None else out
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            collect_seeds(v, out, hint or "seed" in str(k).lower())
-    elif isinstance(obj, list):
-        for v in obj:
-            collect_seeds(v, out, hint)
-    elif isinstance(obj, int) and not isinstance(obj, bool) and hint:
-        out.add(obj)
-    return out
-
-
 def avoid_seeds(path):
-    """The seeds an --avoid input reserves: an archived plan (JSONL rows: their engine seeds) or any JSON
-    document (a worlds registry with its reserved history seeds, a reservation file: every nested seed)."""
-    text = rqlib.read_text(path)
+    """Validated reservations shared with worlds registration and the noise bank."""
     try:
-        doc = json.loads(text)
-    except ValueError:
-        doc = None
-    if isinstance(doc, dict):
-        return collect_seeds(doc)
-    return plan_seeds(json.loads(ln) for ln in text.split("\n") if ln.strip())
+        return rqlib.load_reservations(path)[0]
+    except rqlib.ReservationError as exc:
+        raise DesignError(str(exc)) from exc
+
+
+def read_joint_plan(path):
+    """--joint accepts assay plan/2 JSONL, with sharing groups; registries go in --avoid."""
+    try:
+        rows = [json.loads(line) for line in rqlib.read_text(path).splitlines() if line.strip()]
+    except (ValueError, OSError) as exc:
+        raise DesignError(f"{path}: cannot read --joint assay plan: {exc}") from exc
+    if not rows:
+        raise DesignError(f"{path}: empty --joint assay plan")
+    for number, row in enumerate(rows, 1):
+        if not isinstance(row, dict) or row.get("schema") != PLAN_SCHEMA_V2:
+            raise DesignError(f"{path}: row {number}: --joint requires assay plan/2 rows; registries go in --avoid")
+        groups, seeds = row.get("groups"), row.get("seeds")
+        if not isinstance(groups, dict) or not isinstance(seeds, dict):
+            raise DesignError(f"{path}: row {number}: --joint plan requires seed/group fields")
+        for kind in SEED_KINDS_V2:
+            if kind not in groups or kind not in seeds:
+                raise DesignError(f"{path}: row {number}: --joint plan requires {kind} seed/group fields")
+            group, seed = groups.get(kind), seeds.get(kind)
+            if kind != "reseed" and group is None and seed is None:
+                continue           # native prey / absent age reference / no donor draw
+            if not isinstance(group, str) or not group or type(seed) is not int or seed < 0:
+                raise DesignError(f"{path}: row {number}: --joint plan has invalid {kind} seed/group fields")
+    return rows
 
 
 def joint_seed_problems(rows, other):
@@ -1030,7 +1035,7 @@ def main(argv=None):
         if a.joint:           # ONE seed universe: the generated rows and every --joint plan together
             other = []
             for p in a.joint:
-                other += [json.loads(ln) for ln in rqlib.read_text(p).split("\n") if ln.strip()]
+                other += read_joint_plan(p)
             probs = joint_seed_problems(rows, other)
             if probs:
                 raise DesignError(f"jointly with {', '.join(a.joint)}: " + "; ".join(probs[:5]))
@@ -1054,7 +1059,13 @@ def main(argv=None):
     if a.avoid:
         old = set()
         for p in a.avoid:
-            old |= avoid_seeds(p)
+            try:
+                reserved, record = rqlib.load_reservations(p)
+            except rqlib.ReservationError as exc:
+                print(f"plan.py: {exc}", file=sys.stderr)
+                return 2
+            old |= reserved
+            print(f"reservations: {rqlib.canonical(record).decode().strip()}", file=sys.stderr)
         hit = sorted(plan_seeds(rows) & old)
         if hit:
             print(f"{len(hit)} engine seed(s) also used by {a.avoid}: {hit[:10]}", file=sys.stderr)
