@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import hashlib
 import io
 import json
 import os
@@ -42,6 +43,28 @@ def wr(path, data, mode=None):
         data = data.encode()
     with open(path, mode or "wb") as f:
         f.write(data)
+
+
+# (Codex re-review of a5c366c, P2) a large, poorly compressible bundle payload (the review's reproduction used
+# a 202,702-byte member): its DEFLATE stream is long enough that reading it as LZMA gets past the 4-byte
+# header to the filter properties and raises LZMAError (a small member's ends in a CRC error instead)
+POOR_PAYLOAD = "".join(hashlib.sha256(str(i).encode()).hexdigest() for i in range(3200))
+
+
+@contextlib.contextmanager
+def members_opened():
+    """-> the names of every zip member opened while inside (z.read and testzip open each member they
+    decode): a member never opened was never handed to a decoder."""
+    names, real = [], zipfile.ZipFile.open
+
+    def spy(z, name, *a, **kw):
+        names.append(getattr(name, "filename", name))
+        return real(z, name, *a, **kw)
+    zipfile.ZipFile.open = spy
+    try:
+        yield names
+    finally:
+        zipfile.ZipFile.open = real
 
 
 def mk_cp(n_prey=8, n_pred=3, version=2, frame=100, seed=1, cfg_extra=None):
@@ -759,11 +782,23 @@ class TestStore(unittest.TestCase):
             self.root = base
         return out
 
-    def assert_age_refused(self, cid, bad, probs, what):
+    def assert_age_refused(self, cid, bad, probs, what, opened=()):
+        """A bad one's age summary is reported, a complete one's nothing (opened: assert_method_refused's)."""
         if bad:
             self.assertTrue(probs and any(cid in p and "age summary" in p for p in probs), (what, probs))
         else:
             self.assertEqual(probs, [], what)
+
+    def assert_method_refused(self, cid, bad, probs, what, opened=()):
+        """assert_age_refused, and (Codex re-review of a5c366c, P2) a bad one (stamped_v3_roots("method"))
+        is refused for its compression method, before decoding: the problem names the method, and its
+        packed bundle was never opened (`opened`: members_opened), so no decoder ran on it."""
+        self.assert_age_refused(cid, bad, probs, what)
+        if bad:
+            m = self.METHODS[cid.rsplit("-p", 1)[0]]
+            self.assertTrue(any(cid in p and f"compression method {m}," in p and "refused before decoding" in p
+                                for p in probs), (what, probs))
+            self.assertNotIn(f"{cid}/bundle.json", opened, what)
 
     def test_packed_v3_age_summary_index_problems(self):
         """Codex re-review of 5ecffb5, P2 (D8 v2 rule 48): a /3 completion of either plan version PACKED
@@ -816,15 +851,18 @@ class TestStore(unittest.TestCase):
                                      ["chunk_000001.zip", "index.jsonl"])
                     self.assertEqual(len([a for a in acts if "deleted the packed cell" in a]), 1, acts)
 
-    def runner_refuses(self, argv, roots=None, **label):
+    def runner_refuses(self, argv, roots=None, method=False, **label):
         """run.main on each packed_v3_roots(leftovers) root (or each of `roots`, same shape): a bad one
         exits 2, the operator told why on stderr and the cell named in runner.log, every byte of work/
-        and chunks/ kept; a complete one exits 0 with the leftovers cleaned and the disjoint cell packed."""
+        and chunks/ kept; a complete one exits 0 with the leftovers cleaned and the disjoint cell packed.
+        method (stamped_v3_roots("method")): a bad one's compression method is named on stderr and in
+        runner.log, and its packed bundle was never opened (no decoder ran on it)."""
         for cid, root, bad, snap in roots if roots is not None else self.packed_v3_roots(leftovers=True):
             with self.subTest(cid=cid, **label):
                 before = snap()
                 err = io.StringIO()
-                with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()), \
+                        members_opened() as opened:
                     rc = run.main(["--root", root] + argv)
                 if not bad:
                     self.assertEqual(rc, 0, err.getvalue())
@@ -837,6 +875,11 @@ class TestStore(unittest.TestCase):
                 self.assertEqual(snap(), before, argv)
                 self.assertIn(f"index: {cid} (packed in chunk_000001.zip)",
                               rqlib.read_text(os.path.join(root, "runner.log")))
+                if method:
+                    m = f"compression method {self.METHODS[cid.rsplit('-p', 1)[0]]},"
+                    self.assertIn(m, err.getvalue())
+                    self.assertIn(m, rqlib.read_text(os.path.join(root, "runner.log")))
+                    self.assertNotIn(f"{cid}/bundle.json", opened, argv)
 
     def test_packed_v3_age_summary_runner_pack_refused(self):
         """Codex re-review of 5ecffb5, P2: run.py --pack refuses such a root (runner_refuses)."""
@@ -980,6 +1023,32 @@ class TestStore(unittest.TestCase):
         raw[i.header_offset + 30 + n + x + i.compress_size // 2] ^= 0x55
         wr(p, bytes(raw))
 
+    # (Codex re-review of a5c366c, P2: a central-directory compression method the packer never writes, which
+    # zipfile then decodes by: STORED, BZIP2, LZMA (a5c366c: LZMAError, uncaught), Zstandard (Python 3.14's
+    # zipfile decodes it: ZstdError, uncaught; earlier ones do not know it), and one no zipfile knows)
+    METHODS = {"stored": 0, "bzip2": 12, "lzma": 14, "zstd": 93, "unknown": 99}
+
+    @staticmethod
+    def set_member_method(root, cid, method, member="bundle.json"):
+        """chunk_000001.zip with the central-directory compression method of cid's `member` changed from
+        DEFLATE (8) to `method`: one byte, the size kept, the index untouched."""
+        p = os.path.join(root, store.CHUNKS, "chunk_000001.zip")
+        raw = bytearray(rqlib.read_bytes(p))
+        sig, _, _, _, n, _, off, clen = struct.unpack("<IHHHHIIH", raw[-22:])
+        assert sig == 0x06054B50 and clen == 0, (sig, clen)
+        for _ in range(n):
+            assert raw[off:off + 4] == b"PK\x01\x02", off
+            ln, lm, lk = struct.unpack("<HHH", raw[off + 28:off + 34])
+            if raw[off + 46:off + 46 + ln] == f"{cid}/{member}".encode():
+                assert raw[off + 10:off + 12] == b"\x08\x00", raw[off + 10:off + 12]
+                raw[off + 10] = method
+                wr(p, bytes(raw))
+                with zipfile.ZipFile(p) as z:
+                    assert z.getinfo(f"{cid}/{member}").compress_type == method
+                return
+            off += 46 + ln + lm + lk
+        raise AssertionError(f"{cid}/{member} is not in {p}")
+
     def stamped_v3_roots(self, attack, leftovers=None):
         """(Codex re-review of e82ed4e, P2) One root per plan version x case, each holding one /3 completion
         (cid = case-p<plan>) that a stamp no longer vouches for. STAMP_COPIED, the index edited: its
@@ -989,21 +1058,30 @@ class TestStore(unittest.TestCase):
         written there. STAMP_CHANGED, the index untouched: a complete bundle packed and stamped by pack()
         itself, then its packed bytes changed: "resized" / "samesize": replaced by the omitted or the
         corrupted bundle (rewrite_chunk: the chunk of another size, or padded to the very same size);
-        "bitflip": one byte flipped in place (flip_packed_bundle); "complete": untouched. leftovers:
+        "bitflip": one byte flipped in place (flip_packed_bundle); "method" (Codex re-review of a5c366c,
+        P2): a large, poorly compressible bundle (POOR_PAYLOAD) whose central-directory compression
+        method is then changed to one the packer never writes (set_member_method; a case per METHODS);
+        "complete": untouched. leftovers:
         "packed" adds an interrupted pack's state (the packed cell's working directory back, byte for
         byte; an uncommitted chunk and its temporary; a torn index tail) and a disjoint finished cell
         "new"; "unpacked", the same without the packed cell's directory (so nothing else makes a quick
         recovery verify that chunk in full) -> [(cid, root, bad, snapshot)] as packed_v3_roots."""
         two = mk_age_score((5000, 10000), alive={5000: {7}, 10000: set()})
         stamp = self.donor_stamp() if attack == "copied" else store.AGE_SUMMARY_CHECKED
-        cases = dict(self.PACKED_V3) if attack != "bitflip" else {"bitflip": None, "complete": None}
+        if attack == "bitflip":
+            cases = {"bitflip": None, "complete": None}
+        elif attack == "method":
+            cases = dict.fromkeys(list(self.METHODS) + ["complete"])
+        else:
+            cases = dict(self.PACKED_V3)
         base, out = self.root, []
         try:
             for plan2 in (False, True):
                 for name, mutate in cases.items():
                     cid = f"{name}-p{int(plan2) + 1}"
                     self.root = root = tempfile.mkdtemp(dir=base, prefix=f"{attack}-{leftovers}-{cid}-")
-                    self.mk_cell(cid, group=cid, transplant=(cid, "d" * 64) if plan2 else None)
+                    self.mk_cell(cid, group=cid, transplant=(cid, "d" * 64) if plan2 else None,
+                                 payload=POOR_PAYLOAD if attack == "method" else "x")
                     bundle, _ = self.as_v3(cid, copy.deepcopy(two), (5000, 10000))
                     wdir = os.path.join(root, store.WORK, cid)
                     chunk = os.path.join(root, store.CHUNKS, "chunk_000001.zip")
@@ -1023,6 +1101,9 @@ class TestStore(unittest.TestCase):
                         size = os.path.getsize(chunk)
                         if name == "bitflip":
                             self.flip_packed_bundle(root, cid)
+                        elif attack == "method":
+                            if name != "complete":
+                                self.set_member_method(root, cid, self.METHODS[name])
                         elif name != "complete":
                             mutate(bundle)
                             self.rewrite_chunk(root, cid, rqlib.canonical(bundle), attack == "samesize")
@@ -1047,22 +1128,24 @@ class TestStore(unittest.TestCase):
             self.root = base
         return out
 
-    def test_stamp_unbound_index_problems_and_pack(self):
-        """Codex re-review of e82ed4e, P2: a /3 entry whose stamp is not this entry's (copied from a valid
-        entry, or e82ed4e's bare marker) or whose packed bytes changed after stamping (of another size,
-        the same size with right CRCs, or a flipped byte) is unchecked: index_problems reads its bundle
-        and refuses the bad ones, so pack() extends no such root (nothing packed or deleted); the
-        complete controls pass, and pack."""
-        for attack in self.STAMP_COPIED + self.STAMP_CHANGED:
+    def unbound_index_problems_and_pack(self, attacks, refused):
+        """index_problems on each stamped_v3_roots(attack) root refuses the bad ones (`refused`: the
+        assertion, given the members opened), so pack() extends no such root (its refusal names the
+        cell; nothing packed or deleted); the complete controls pass, and pack."""
+        for attack in attacks:
             for cid, root, bad, snap in self.stamped_v3_roots(attack):
                 with self.subTest(attack=attack, cid=cid):
-                    self.assert_age_refused(cid, bad, store.index_problems(root), "index_problems")
+                    with members_opened() as opened:
+                        probs = store.index_problems(root)
+                    refused(cid, bad, probs, "index_problems", opened)
                     self.root, base = root, self.root
                     try:
                         self.mk_cell("new", group="g-new", csha="b" * 64)
                         if bad:
-                            with self.assertRaisesRegex(store.StoreError, "cannot be extended"):
+                            with self.assertRaisesRegex(store.StoreError, "cannot be extended") as cm, \
+                                    members_opened() as opened:
                                 store.pack(root, ids=["new"], log=lambda m: None)
+                            refused(cid, bad, [str(cm.exception)], "pack", opened)
                             self.assertTrue(os.path.exists(os.path.join(root, store.WORK, "new", "bundle.json")))
                             self.assertEqual(sorted(os.listdir(os.path.join(root, store.CHUNKS))),
                                              ["chunk_000001.zip", "index.jsonl"])
@@ -1071,40 +1154,66 @@ class TestStore(unittest.TestCase):
                     finally:
                         self.root = base
 
-    def test_stamp_unbound_verify_all(self):
-        """Codex re-review of e82ed4e, P2: verify_all, deep or not, reports such an entry's age summary
-        (and, for changed bytes, the chunk: deep or not, a chunk holding a stamped entry is hashed, so
-        the same-size change is seen too); the complete controls verify clean."""
-        for attack in self.STAMP_COPIED + self.STAMP_CHANGED:
+    def test_stamp_unbound_index_problems_and_pack(self):
+        """Codex re-review of e82ed4e, P2: a /3 entry whose stamp is not this entry's (copied from a valid
+        entry, or e82ed4e's bare marker) or whose packed bytes changed after stamping (of another size,
+        the same size with right CRCs, or a flipped byte) is unchecked: index_problems reads its bundle
+        and refuses the bad ones, so pack() extends no such root (nothing packed or deleted); the
+        complete controls pass, and pack (unbound_index_problems_and_pack)."""
+        self.unbound_index_problems_and_pack(self.STAMP_COPIED + self.STAMP_CHANGED, self.assert_age_refused)
+
+    def test_method_byte_index_problems_and_pack(self):
+        """Codex re-review of a5c366c, P2: a stamped /3 entry (plan/1 and plan/2) whose packed bundle's
+        central-directory compression method was changed to one the packer never writes (STORED, BZIP2,
+        LZMA, Zstandard, unknown; the size kept: stamped_v3_roots("method")) is refused by index_problems
+        for that method BEFORE its bundle is decoded (never opened; a5c366c decoded it, and LZMA's
+        LZMAError escaped as a traceback), and pack() extends no such root; the complete control packs."""
+        self.unbound_index_problems_and_pack(("method",), self.assert_method_refused)
+
+    def unbound_verify_all(self, attacks, refused):
+        """verify_all, deep or not, on each stamped_v3_roots(attack) root: a bad one's age summary is
+        reported (`refused`) and, for changed bytes, the chunk; the complete controls verify clean."""
+        for attack in attacks:
             for cid, root, bad, snap in self.stamped_v3_roots(attack):
                 for deep in (True, False):
                     with self.subTest(attack=attack, cid=cid, deep=deep):
-                        probs = store.verify_all(root, deep=deep)
-                        self.assert_age_refused(cid, bad, probs, f"verify_all deep={deep}")
-                        if bad and attack in self.STAMP_CHANGED:
+                        with members_opened() as opened:
+                            probs = store.verify_all(root, deep=deep)
+                        refused(cid, bad, probs, f"verify_all deep={deep}", opened)
+                        if bad and attack in self.STAMP_CHANGED + ("method",):
                             self.assertTrue(any(p.startswith("chunk_000001.zip ") for p in probs), probs)
 
-    def test_stamp_unbound_recover_changes_nothing(self):
-        """Codex re-review of e82ed4e, P2: recover() checks the chunks' bytes and every age summary BEFORE
-        it repairs, removes or deletes anything. With such an entry, recover (deep or not; with the
-        packed cell's working directory back, or without it, so that only the stamp makes a quick
-        recovery hash the chunk) returns the problem, takes no action and leaves every byte of work/ and
-        chunks/ as it was: the torn index tail, the uncommitted chunk and its temporary, every working
-        directory. The complete controls are recovered and cleaned as before."""
-        for attack in self.STAMP_COPIED + self.STAMP_CHANGED:
+    def test_stamp_unbound_verify_all(self):
+        """Codex re-review of e82ed4e, P2: verify_all, deep or not, reports such an entry's age summary
+        (and, for changed bytes, the chunk: deep or not, a chunk holding a stamped entry is hashed, so
+        the same-size change is seen too); the complete controls verify clean (unbound_verify_all)."""
+        self.unbound_verify_all(self.STAMP_COPIED + self.STAMP_CHANGED, self.assert_age_refused)
+
+    def test_method_byte_verify_all(self):
+        """Codex re-review of a5c366c, P2: verify_all, deep and quick, reports the changed chunk and the
+        entry's age summary refused for its compression method before decoding (never opened); the
+        complete control verifies clean."""
+        self.unbound_verify_all(("method",), self.assert_method_refused)
+
+    def unbound_recover_changes_nothing(self, attacks, refused):
+        """recover (deep or not; leftovers "packed" and "unpacked") on each stamped_v3_roots(attack)
+        root: a bad one's problem returned (`refused`), no action, every byte of work/ and chunks/ as
+        it was; the complete controls recovered and cleaned as before."""
+        for attack in attacks:
             for leftovers in ("packed", "unpacked"):
                 for cid, root, bad, snap in self.stamped_v3_roots(attack, leftovers):
                     with self.subTest(attack=attack, leftovers=leftovers, cid=cid):
                         before = snap()
                         for deep in (False, True):
-                            acts, probs = store.recover(root, log=lambda m: None, deep=deep)
+                            with members_opened() as opened:
+                                acts, probs = store.recover(root, log=lambda m: None, deep=deep)
                             if not bad:
                                 self.assertEqual(probs, [], f"recover deep={deep}")
                                 break
                             after = snap()
                             changed = sorted(k for k in set(before) | set(after) if before.get(k) != after.get(k))
                             self.assertEqual((acts, changed), ([], []), (f"recover deep={deep}", probs))
-                            self.assert_age_refused(cid, bad, probs, f"recover deep={deep}")
+                            refused(cid, bad, probs, f"recover deep={deep}", opened)
                         if not bad:
                             self.assertFalse(os.path.exists(os.path.join(root, store.WORK, cid)))
                             self.assertEqual(sorted(os.listdir(os.path.join(root, store.CHUNKS))),
@@ -1113,19 +1222,134 @@ class TestStore(unittest.TestCase):
                             self.assertEqual(len([a for a in acts if "deleted the packed cell" in a]),
                                              int(leftovers == "packed"), acts)
 
-    def test_stamp_unbound_runner_refused(self):
-        """Codex re-review of e82ed4e, P2: run.py --pack, a resume (a plan, a binary, no disk floor) and a
-        --quick-resume refuse such a root: exit 2 with the operator's message, the cell named in
-        runner.log, every byte of work/ and chunks/ kept (runner_refuses); the controls run."""
+    def test_stamp_unbound_recover_changes_nothing(self):
+        """Codex re-review of e82ed4e, P2: recover() checks the chunks' bytes and every age summary BEFORE
+        it repairs, removes or deletes anything. With such an entry, recover (deep or not; with the
+        packed cell's working directory back, or without it, so that only the stamp makes a quick
+        recovery hash the chunk) returns the problem, takes no action and leaves every byte of work/ and
+        chunks/ as it was: the torn index tail, the uncommitted chunk and its temporary, every working
+        directory. The complete controls are recovered and cleaned as before
+        (unbound_recover_changes_nothing)."""
+        self.unbound_recover_changes_nothing(self.STAMP_COPIED + self.STAMP_CHANGED, self.assert_age_refused)
+
+    def test_method_byte_recover_changes_nothing(self):
+        """Codex re-review of a5c366c, P2: recover (deep or not; the packed cell's working directory back,
+        or not) on a root whose stamped /3 entry's packed bundle has a compression method the packer
+        never writes returns the age-summary problem naming that method (before decoding: never opened;
+        a5c366c raised LZMAError for LZMA), takes no action and changes no byte of work/ or chunks/; the
+        complete control is recovered and cleaned as before."""
+        self.unbound_recover_changes_nothing(("method",), self.assert_method_refused)
+
+    def unbound_runner_refused(self, attacks, method=False):
+        """run.py --pack, a resume (a plan, a binary, no disk floor) and a --quick-resume on each
+        stamped_v3_roots(attack) root (runner_refuses; `method`: its compression-method checks)."""
         plan_p = os.path.join(self.root, "disjoint.jsonl")
         wr(plan_p, "")
         stub = os.path.join(self.root, "evo_boids_stub")
         wr(stub, "#!/bin/sh\nexit 9\n")
         resume = ["--plan", plan_p, "--binary", stub, "--disk-min", "none"]
-        for attack in self.STAMP_COPIED + self.STAMP_CHANGED:
+        for attack in attacks:
             for how, argv, leftovers in (("pack", ["--pack"], "packed"), ("resume", resume, "packed"),
                                          ("quick-resume", resume + ["--quick-resume"], "unpacked")):
-                self.runner_refuses(argv, self.stamped_v3_roots(attack, leftovers), attack=attack, how=how)
+                self.runner_refuses(argv, self.stamped_v3_roots(attack, leftovers), method=method, attack=attack,
+                                    how=how)
+
+    def test_stamp_unbound_runner_refused(self):
+        """Codex re-review of e82ed4e, P2: run.py --pack, a resume (a plan, a binary, no disk floor) and a
+        --quick-resume refuse such a root: exit 2 with the operator's message, the cell named in
+        runner.log, every byte of work/ and chunks/ kept (runner_refuses); the controls run."""
+        self.unbound_runner_refused(self.STAMP_COPIED + self.STAMP_CHANGED)
+
+    def test_method_byte_runner_refused(self):
+        """Codex re-review of a5c366c, P2: run.py --pack, a resume and a --quick-resume refuse a root whose
+        stamped /3 entry's packed bundle has a compression method the packer never writes: exit 2 with
+        the operator's age-summary message naming the method (stderr and runner.log), no traceback
+        (a5c366c: LZMAError out of recover), the bundle never opened, every byte of work/ and chunks/
+        kept; the complete control runs."""
+        self.unbound_runner_refused(("method",), method=True)
+
+    def test_method_byte_legacy_entry_refused(self):
+        """Codex re-review of a5c366c, P2 (index_problems' other reading): a legacy index entry (no bundle
+        schema: its packed bundle and done.json are read; legacy_root, with a large, poorly compressible
+        bundle) whose packed bundle has a compression method the packer never writes is reported, refused
+        before decoding (never opened), never a traceback (a5c366c: LZMAError for LZMA, NotImplementedError
+        for Zstandard before 3.14 and the unknown method), and pack() extends no such root."""
+        base = self.root
+        try:
+            for name, m in self.METHODS.items():
+                with self.subTest(method=name):
+                    self.root = tempfile.mkdtemp(dir=base, prefix=f"legacy-{name}-")
+                    self.legacy_root(payload=POOR_PAYLOAD)
+                    self.set_member_method(self.root, "old", m)
+                    with members_opened() as opened:
+                        probs = store.index_problems(self.root)
+                    self.assertTrue(any(p.startswith("old: its packed bundle cannot be checked (")
+                                        and f"compression method {m}," in p and "refused before decoding" in p
+                                        for p in probs), probs)
+                    self.assertNotIn("old/bundle.json", opened)
+                    self.mk_cell("new", group="g2", csha="b" * 64, transplant=("P.w02.t5|r00", "f" * 64))
+                    with self.assertRaisesRegex(store.StoreError, "cannot be extended"):
+                        store.pack(self.root, log=lambda s: None)
+                    self.assertTrue(os.path.exists(os.path.join(self.root, store.WORK, "new", "bundle.json")))
+        finally:
+            self.root = base
+
+    def test_method_byte_verify_chunk(self):
+        """Codex re-review of a5c366c, P2 (defence in depth): verify_chunk (pack()'s check of the chunk it
+        wrote; recover's of a chunk that matches its SHA-256 while a packed cell's working directory is
+        still there) refuses a chunk holding a member of a compression method the packer never writes,
+        naming it, before anything in the chunk is decoded (nothing opened; a5c366c's testzip decoded it:
+        LZMAError, NotImplementedError). And damaged ZIP bytes are problems, never a crash: every byte of a
+        small packed chunk's ZIP structure (local headers, central directory, end record) set to 0x00,
+        0xFF and each single-bit flip, through verify_chunk and indexed_age_problems (a5c366c's
+        verify_chunk raised NotImplementedError, RuntimeError, zlib.error)."""
+        self.mk_cell("m-p1", group="m-p1", payload=POOR_PAYLOAD)
+        self.as_v3("m-p1", mk_age_score((5000, 10000), alive={5000: {7}, 10000: set()}), (5000, 10000))
+        self.assertEqual(store.pack(self.root, log=lambda s: None), ("chunk_000001.zip", 1))
+        recs, cells = store.load_index(self.root)
+        p = os.path.join(self.root, store.CHUNKS, "chunk_000001.zip")
+        good = rqlib.read_bytes(p)
+        self.assertEqual(store.verify_chunk(p, recs[0]["cells"]), [])
+        for name, m in self.METHODS.items():
+            with self.subTest(method=name):
+                wr(p, good)                     # (each case from the chunk as packed, whatever the last one did)
+                self.set_member_method(self.root, "m-p1", m)
+                with members_opened() as opened:
+                    probs = store.verify_chunk(p, recs[0]["cells"])
+                self.assertEqual(probs, [f"m-p1/bundle.json: compression method {m}, not the DEFLATE (8) pack() "
+                                         "writes: refused before decoding"])
+                self.assertEqual(opened, [])
+        wr(p, good)
+        shutil.rmtree(os.path.join(self.root, store.CHUNKS))
+        self.mk_cell("small", group="small")
+        self.as_v3("small", mk_age_score((5000, 10000), alive={5000: {7}, 10000: set()}), (5000, 10000))
+        self.assertEqual(store.pack(self.root, log=lambda s: None), ("chunk_000001.zip", 1))
+        recs, cells = store.load_index(self.root)
+        good = rqlib.read_bytes(p)
+        payload = set()
+        with zipfile.ZipFile(p) as z:
+            for zi in z.infolist():
+                n, x = struct.unpack("<HH", good[zi.header_offset + 26:zi.header_offset + 30])
+                s = zi.header_offset + 30 + n + x
+                payload.update(range(s, s + zi.compress_size))
+        cases = [(i, v) for i in range(len(good)) if i not in payload
+                 for v in {0x00, 0xFF, *(good[i] ^ (1 << b) for b in range(8))} - {good[i]}]
+        self.assertGreater(len(cases), 1500)
+        escaped = []
+        for i, v in cases:
+            raw = bytearray(good)
+            raw[i] = v
+            wr(p, bytes(raw))
+            for what, f in (("verify_chunk", lambda: store.verify_chunk(p, recs[0]["cells"])),
+                            ("indexed_age_problems", lambda: store.indexed_age_problems(self.root, cells, sound=set()))):
+                try:
+                    f()
+                except Exception as e:  # noqa: BLE001 (any escape is the failure)
+                    escaped.append((what, i, v, f"{type(e).__name__}: {e}"))
+        wr(p, good)
+        self.assertEqual(escaped[:5], [], f"{len(escaped)} of {2 * len(cases)} calls raised")
+        self.assertEqual(store.verify_chunk(p, recs[0]["cells"]), [])
+        self.assertEqual(store.indexed_age_problems(self.root, cells, sound=set()), [])
 
     def test_v2_completions_checked(self):
         """Review of 03a608b, P2 1: packing (and resume) require a /2 completion's sharing record and
@@ -1172,10 +1396,10 @@ class TestStore(unittest.TestCase):
         self.assertTrue(any("realized common" in x for x in store.completion_problems(
             rqlib.read_json(os.path.join(d, "done.json")), b)))
 
-    def legacy_root(self):
+    def legacy_root(self, payload="x"):
         """A root holding a /2 completion packed before 03a608b: no sharing record in its bundle, no
-        bundle schema or transplant summary in its index entry."""
-        self.mk_cell("old", group="g1", transplant=("P.w01.t5|r00", "d" * 64), sharing=False)
+        bundle schema or transplant summary in its index entry (payload: its bundle's, mk_cell)."""
+        self.mk_cell("old", group="g1", transplant=("P.w01.t5|r00", "d" * 64), sharing=False, payload=payload)
         real = store.completion_problems
         store.completion_problems = lambda done, bundle: []
         try:
