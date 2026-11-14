@@ -18,7 +18,8 @@ bracketed bisection, then a safeguarded Newton, and the residual |E/N - mu| <= S
 the returned iterate (else refused). The generator's location tables (one per channel and noise multiplier
 gamma; s = gamma S_ch(mu)) live on x = logit(mu / c): the uniform grid k h, |k h| <= 12, united with the s-curve
 knots mapped to x; linear interpolation verified at EVERY midpoint (|E/N(a_interp) - mu| <= LOC_TOL = 2e-7);
-h = 0.01 halving up to 4 times, else the build refuses. Outside the table the location is solved per cell.
+h = 0.01 halving up to 4 times, else the build refuses. Outside |x| <= 12 the location is solved exactly per cell,
+whatever the table covers (a mapped knot beyond +-12 extends the node set but is never interpolated).
 
 THE FITTER TABLE (v5 1.7b/1.7c, PC-16). The exact conversion, for the registered map, between the bank's latent
 capture law and the empirical-logit coordinate z = log((K + 1/2) / (B - K + 1/2)) (capture, gamma = 1, unscaled
@@ -31,8 +32,8 @@ INDEPENDENT inversion (Illinois iteration in x on the exact pipeline, to |m_z - 
 1/2, 3/4 of every segment in z: (1) round trip |m_z(mu(z)) - z| <= 1e-5; (2) inverse |mu(z) - mu*| <= 2e-7;
 (3) |W - V_z(mu*)| <= 1e-4 V_z(mu*) and |L - S_C(mu*)^2| <= 1e-5 S_C(mu*)^2; (4) score location
 |E_{A(z), S_C(mu*)}[K] / B - mu*| <= 2e-7. Refinement: local adaptive bisection of every failing segment at its
-x-midpoint; certified segments are final; refused at bisection depth 12, beyond 100,000 nodes, or when m_z is
-not strictly increasing.
+x-midpoint; certified segments are final; refused at bisection depth 12, beyond 100,000 nodes (an over-cap knot
+set before any allocation, an over-cap initial grid before any evaluation), or when m_z is not strictly increasing.
 
 THE SAMPLER (v5 1.4-1.6). Independent across keys and replicates: rows R (prey node x replicate; C, S, F),
 donors D (predator node x replicate; C, S), cells E (pair x replicate; C, S) and the free residual E^F with
@@ -49,9 +50,13 @@ of one output; standard normals by #68's Box-Muller (two outputs: u1 = 1 - (x1 >
 
 THE BANK MODEL (v5 4.2, 2.8, 2.9). BankObservationModel loads a finfolk.redqueen.noisebank.bank/3 artifact and
 its finfolk.redqueen.obstables/1 tables and validates them in 4.2's order (bytes, schema and identity, scalars,
-matrices, curves, nu0, tables). Every failure is an ObsLawError (a ValueError) naming the field; no default is
-ever substituted. The fitter receives W (working_var_fn) and the score law (A, L) (score_law), evaluated only at
-fitted quantities.
+matrices, curves, nu0, tables). Item 2's required fields are 2.8's: every field it prescribes must be present, with
+the type and value 2.8 (or the section it cites) fixes; where 2.8 names a record without fixing its internal
+structure (estimator.ceilings / saturation / capped_category, the horizon records' contents), only what it states is
+required. The tables' identity records obslaw_sha256 AND noisescale_sha256 (the evaluator of S the builds call),
+and both must equal the current files' (stricter than, and consistent with, 4.2 item 7's "obslaw implementation
+sha"). Every failure is an ObsLawError (a ValueError) naming the field; no default is ever substituted. The fitter
+receives W (working_var_fn) and the score law (A, L) (score_law), evaluated only at fitted quantities.
 
 Imports: numpy, noisescale, material (and through it common's clock), rqlib and noisebank (its _psd_factor and
 capture_bound) only. noisebank imports this module only inside its D8 functions, so there is no cycle. This
@@ -131,6 +136,14 @@ class ObsLawError(ValueError):
 def implementation_sha256():
     """sha256 of this file's bytes: the 'obslaw implementation sha' of the table identities (v5 1.7, 4.2 item 7)."""
     return rqlib.sha256_file(os.path.abspath(__file__))
+
+
+def noisescale_sha256():
+    """sha256 of the imported noisescale.py's bytes: the evaluator of S that every table build calls. Every table
+    identity records it beside obslaw_sha256 and the loader refuses tables whose recorded value differs from the
+    current file (coordinator decision on review P3-1: stricter than, and consistent with, v5 4.2 item 7's
+    'obslaw implementation sha')."""
+    return rqlib.sha256_file(os.path.abspath(noisescale.__file__))
 
 
 # ================================================================== the law
@@ -407,8 +420,10 @@ class LocationTable:
             raise ObsLawError(f"location table {self.channel}/{self.gamma}: malformed nodes")
 
     def locate(self, mu, x=None):
-        """Interior locations a(mu) (0 < mu < c): the table's linear interpolation on x = logit(mu / c) inside
-        its node range, the exact solve outside it. x: the exact axis value when the caller has it (for the
+        """Interior locations a(mu) (0 < mu < c): the table's linear interpolation on x = logit(mu / c) where
+        |x| <= X = 12 and x lies inside its node range; the exact solve everywhere else (v5 1.7: outside [-X, X]
+        the location is solved exactly per cell WHATEVER the table covers, so mapped knots beyond +-12, which do
+        extend the node set, are never interpolated). x: the exact axis value when the caller has it (for the
         logit link and the survival heads x = eta exactly), checked against mu."""
         mu = np.asarray(mu, float).ravel()
         c = self.M / self.N
@@ -421,7 +436,7 @@ class LocationTable:
             if x.shape != mu.shape or not np.all(np.abs(_mu_of_x(x, c) - mu) <= 1e-14):
                 raise ObsLawError("locate: x is not logit(mu / c) for the given means")
         a = np.empty(mu.shape)
-        inside = (x >= self.x[0]) & (x <= self.x[-1])
+        inside = (x >= self.x[0]) & (x <= self.x[-1]) & (np.abs(x) <= LOC_X)
         a[inside] = np.interp(x[inside], self.x, self.a)
         out = ~inside
         if out.any():
@@ -433,7 +448,7 @@ def location_identity(curve, channel, gamma, N, M, h, bank_sha256):
     return {"kind": "location", "channel": channel, "gamma": float(gamma), "N": N, "M": M, "X": LOC_X,
             "h0": LOC_H0, "max_halvings": LOC_HALVINGS, "h": h, "knots_x": location_knots(curve, N, M),
             "curve": curve, "loc_tol": LOC_TOL, "solve_tol": SOLVE_TOL, "bank_artifact_sha256": bank_sha256,
-            "obslaw_sha256": implementation_sha256()}
+            "obslaw_sha256": implementation_sha256(), "noisescale_sha256": noisescale_sha256()}
 
 
 def build_location_table(curve, channel, gamma, N, M, bank_sha256):
@@ -478,12 +493,21 @@ def _lerp(z, m0, m1, y0, y1):
 
 def fitter_initial_nodes(curve):
     """v5 1.7b: x_k = k h0 (exact integer multiples, |x| <= 12); uniform nodes within 1e-9 of a knot dropped;
-    the knots inside [-12, 12] inserted."""
+    the knots inside [-12, 12] inserted. A knot set larger than the node cap is refused before anything is
+    allocated; the distance of each uniform node to its nearest knot is found by a sorted search (its predecessor
+    or successor among the sorted knots: floating subtraction is monotone, so this is exactly the minimum over all
+    knots), never through a uniform-node x knot matrix."""
+    if len(curve["x"]) > FIT_NODE_CAP:
+        raise ObsLawError(f"fitter table: {len(curve['x'])} curve knots exceed the node cap {FIT_NODE_CAP} (refused "
+                          "before any table allocation)")
     n = int(round(FIT_X / FIT_H0))
     xu = np.arange(-n, n + 1) * FIT_H0
     knots = np.asarray([float(v) for v in curve["x"]], float)
     if len(knots):
-        xu = xu[np.min(np.abs(xu[:, None] - knots[None, :]), axis=1) > FIT_KNOT_GAP]
+        ks = np.unique(knots)
+        i = np.searchsorted(ks, xu)
+        near = np.minimum(np.abs(xu - ks[np.maximum(i - 1, 0)]), np.abs(xu - ks[np.minimum(i, len(ks) - 1)]))
+        xu = xu[near > FIT_KNOT_GAP]
     return np.union1d(xu, knots[(knots >= -FIT_X) & (knots <= FIT_X)])
 
 
@@ -582,15 +606,20 @@ def fitter_identity(curve, bank_sha256):
             "h0": FIT_H0, "knot_gap": FIT_KNOT_GAP, "knots": [float(v) for v in curve["x"]], "curve": curve,
             "probes": list(FIT_PROBES), "tolerances": dict(FIT_TOL), "invert_tol": FIT_INVERT_TOL,
             "solve_tol": SOLVE_TOL, "depth_cap": FIT_DEPTH_CAP, "node_cap": FIT_NODE_CAP,
-            "bank_artifact_sha256": bank_sha256, "obslaw_sha256": implementation_sha256()}
+            "bank_artifact_sha256": bank_sha256, "obslaw_sha256": implementation_sha256(),
+            "noisescale_sha256": noisescale_sha256()}
 
 
 def build_fitter_table(curve, bank_sha256):
     """Build and certify the fitter table (v5 1.7b, local adaptive bisection; 1.7c). Refused at bisection depth
-    FIT_DEPTH_CAP, beyond FIT_NODE_CAP nodes, or when m_z is not strictly increasing."""
+    FIT_DEPTH_CAP, beyond FIT_NODE_CAP nodes (the initial grid included: checked before any node is evaluated or
+    certified), or when m_z is not strictly increasing."""
     noisescale.check_curve(curve, "C")
     depth_cap, node_cap = FIT_DEPTH_CAP, FIT_NODE_CAP
     x0 = fitter_initial_nodes(curve)
+    if len(x0) > node_cap:
+        raise ObsLawError(f"fitter table: the initial grid has {len(x0)} nodes, over the node cap {node_cap} (refused "
+                          "before evaluating or certifying)")
     a0, m0, v0, L0, r0 = _fit_values(curve, x0)
     if not np.all(np.diff(m0) > 0):
         raise ObsLawError("fitter table: m_z is not strictly increasing over the initial nodes (refused)")
@@ -655,9 +684,12 @@ class FitterTable:
     def __init__(self, x, m, V, A, L, identity, record):
         self.x, self.m, self.V, self.A, self.L = (np.asarray(v, float) for v in (x, m, V, A, L))
         self.identity, self.record = identity, record
-        n = len(self.x)
-        if n < 2 or any(v.shape != (n,) for v in (self.m, self.V, self.A, self.L)) or \
-                not all(np.all(np.isfinite(v)) for v in (self.x, self.m, self.V, self.A, self.L)):
+        n = self.x.shape[0] if self.x.ndim else 0
+        for name in ("x", "m", "V", "A", "L"):               # (every node array flat, (n,): checked at load)
+            shape = getattr(self, name).shape
+            if shape != (n,):
+                raise ObsLawError(f"fitter table: fit_{name} has shape {shape}, not ({n},) (refused)")
+        if n < 2 or not all(np.all(np.isfinite(v)) for v in (self.x, self.m, self.V, self.A, self.L)):
             raise ObsLawError("fitter table: malformed node arrays")
         if not np.all(np.diff(self.x) > 0) or not np.all(np.diff(self.m) > 0):
             raise ObsLawError("fitter table: x and m_z must be strictly increasing (refused)")
@@ -770,7 +802,7 @@ class ObsTables:
         if self._stored_identity is not None:
             return self._stored_identity
         return {"schema": TABLES_SCHEMA, "bank_artifact_sha256": self.bank_sha256,
-                "obslaw_sha256": implementation_sha256(),
+                "obslaw_sha256": implementation_sha256(), "noisescale_sha256": noisescale_sha256(),
                 "location": [self.location[k].identity for k in self._order()], "fitter": self.fitter.identity}
 
     def _payload(self):
@@ -976,13 +1008,36 @@ def splitmix_normals(rng, count):
 
 
 # ================================================================== the bank/3 artifact (v5 2.8, 2.9, 4.2)
+# What v5 2.8 prescribes (table L732-751; test_obslaw.py's V5_FIELDS cites the line of every entry). Where 2.8 names a
+# record without fixing its internal structure, only what it does state is required (presence, type, a fixed value).
 TOP_FIELDS = ("schema", "status", "synthetic", "cohort", "cohort_sha256", "horizon", "dt", "support_law", "age_clock",
               "survivor_ceiling", "fit", "noise", "map_variance", "d8", "inputs", "estimator", "horizons")
 NOISE_FIELDS = ("available", "s_logit", "SigmaR", "SigmaD", "SigmaE", "horizon", "capture_bound", "survivor_ceiling")
 MAP_VARIANCE_FIELDS = ("s_logit", "nu0", "rule", "consumer")
+MAP_VARIANCE_CONSUMER = "map.fit rep_prior, capture channel"                                  # (L747)
 D8_FIELDS = ("amendment_sha256", "capture_law", "ceilings", "max_age", "denominator", "age_predicate",
              "capped_category")
+D8_TEXTS = {"age_predicate": "updated binary32 age > binary32(max_age) is an age death; F_i(H)=1 iff false through "
+                             "H frames (common.age_feasible)",                               # (L748)
+            "capped_category": "k = M_H: latent upper endpoint +inf, scale N = 600"}
+FIT_FIELDS = ("noise_likelihood", "noise", "streams")
 FIT_NOISE_SHAS = ("implementation_sha256", "inputs_sha256", "receipt_sha256", "engine_sha256")
+BOOTSTRAP_FIELDS = ("generator", "namespace", "texts", "seeds")
+REFIT_TEXT = STREAM_NAMESPACE + "/noisebank/D8-refit/h{}/bootstrap"   # (v5 2.5 item 5, L641-643)
+HORIZON_KEYS = ("5000", "10000", "20000")                    # (noisebank.HORIZONS, keyed str(h) as now: L1778-1782)
+# estimator (L750): "the existing record (noisebank.py L1769-1777 @4991907) plus ceilings, saturation per channel and
+# its basis, capped_category". The existing record's "seed" (the legacy NumPy bootstrap seed, which the D8 path
+# replaces by the fit.streams.bootstrap streams) is NOT required: v5 is ambiguous on it (reported, not decided).
+ESTIMATOR_FIELDS = ("z_intervals", "rho_max", "saturation", "sigma_min", "info_min", "multi_start", "start_tol", "boot",
+                    "boot_fail_max", "rectangle", "grid", "constrained_fit", "fixed_replicate_bias", "ceilings",
+                    "capped_category")
+ESTIMATOR_VALUES = {"multi_start": 16, "boot": 999}          # (v5 2.5 L615-616: 16 Halton starts, 999 draws)
+# horizons (L751): "per horizon as now (noisebank.py L1683-1757)": the fields every record carries (L1689-1690, L1698,
+# L1701 / L1756) and, with status ok, groups and grid_validation (L1741-1742).
+HORIZON_FIELDS = ("capture_bound", "replicates", "incomplete_cells", "channels", "scales", "nu0", "curve_points",
+                  "worlds", "status", "reasons", "components", "bootstrap")
+HORIZON_OK_FIELDS = ("groups", "grid_validation")
+HORIZON_STATUSES = ("ok", "unavailable")
 
 
 def _num(v):
@@ -1116,17 +1171,16 @@ class BankArtifact:
             if inputs[k] != v:
                 raise ObsLawError(f"bank artifact: inputs.{k} is not the registered {v[:8]}...")
         fit = doc["fit"]
-        if _field(fit, "noise_likelihood", "fit") != NOISE_LIKELIHOOD:
+        for k in FIT_FIELDS:
+            _field(fit, k, "fit")
+        if fit["noise_likelihood"] != NOISE_LIKELIHOOD:
             raise ObsLawError(f"bank artifact: fit.noise_likelihood is not {NOISE_LIKELIHOOD}")
-        noise = _field(fit, "noise", "fit")
+        noise = fit["noise"]
         for k in FIT_NOISE_SHAS:
             _sha_field(noise, k, "fit.noise")
-        boot = _field(_field(fit, "streams", "fit"), "bootstrap", "fit.streams")
-        if _field(boot, "generator", "fit.streams.bootstrap") != STREAM_GENERATOR or \
-                _field(boot, "namespace", "fit.streams.bootstrap") != STREAM_NAMESPACE:
-            raise ObsLawError(f"bank artifact: fit.streams.bootstrap must be {STREAM_GENERATOR} under {STREAM_NAMESPACE}")
-        for k in ("texts", "seeds"):
-            _field(boot, k, "fit.streams.bootstrap")
+        if noise["inputs_sha256"] != rqlib.canonical_sha(inputs):           # (v5 2.8 L755)
+            raise ObsLawError("bank artifact: fit.noise.inputs_sha256 is not the canonical sha256 of the inputs block")
+        BankArtifact._bootstrap_streams(_field(_field(fit, "streams", "fit"), "bootstrap", "fit.streams"))
         d8 = doc["d8"]
         for k in D8_FIELDS:
             _field(d8, k, "d8")
@@ -1138,13 +1192,88 @@ class BankArtifact:
             raise ObsLawError(f"bank artifact: d8.denominator is not {SURV_N}")
         if d8["max_age"] != material.registered_ages()["max_age"]:
             raise ObsLawError("bank artifact: d8.max_age is not the registered cohort's")
+        for k, v in D8_TEXTS.items():
+            if d8[k] != v:
+                raise ObsLawError(f"bank artifact: d8.{k} is not v5 2.8's text {v!r}")
         for k in NOISE_FIELDS:
             _field(doc["noise"], k, "noise")
+        mv = doc["map_variance"]
         for k in MAP_VARIANCE_FIELDS:
-            _field(doc["map_variance"], k, "map_variance")
-        for k in ("estimator", "horizons"):
-            if not isinstance(doc[k], dict):
-                raise ObsLawError(f"bank artifact: {k} must be an object")
+            _field(mv, k, "map_variance")
+        if not isinstance(mv["rule"], str) or not mv["rule"]:
+            raise ObsLawError("bank artifact: map_variance.rule must be a non-empty string")
+        if mv["consumer"] != MAP_VARIANCE_CONSUMER:
+            raise ObsLawError(f"bank artifact: map_variance.consumer is not {MAP_VARIANCE_CONSUMER!r}")
+        BankArtifact._estimator(doc["estimator"])
+        BankArtifact._horizons(doc["horizons"])
+
+    @staticmethod
+    def _bootstrap_streams(boot):
+        """fit.streams.bootstrap (v5 2.8 L745; 2.5 item 5 L630-647): the generator and namespace; texts = the refit
+        streams AnnexH/D8/1/noisebank/D8-refit/h<h>/bootstrap, one per horizon (any order, no duplicate); seeds = one
+        unsigned 64-bit integer per text, each the text's derived seed (first eight SHA-256 bytes, little-endian)."""
+        where = "fit.streams.bootstrap"
+        for k in BOOTSTRAP_FIELDS:
+            _field(boot, k, where)
+        if boot["generator"] != STREAM_GENERATOR or boot["namespace"] != STREAM_NAMESPACE:
+            raise ObsLawError(f"bank artifact: {where} must be {STREAM_GENERATOR} under {STREAM_NAMESPACE}")
+        texts, seeds = boot["texts"], boot["seeds"]
+        if not isinstance(texts, list) or not all(isinstance(t, str) for t in texts):
+            raise ObsLawError(f"bank artifact: {where}.texts must be a list of stream texts")
+        want = sorted(REFIT_TEXT.format(h) for h in HORIZON_KEYS)
+        if sorted(texts) != want:
+            raise ObsLawError(f"bank artifact: {where}.texts must be exactly the refit streams {want} "
+                              "(one per horizon)")
+        if not isinstance(seeds, list) or len(seeds) != len(texts) or \
+                not all(_int(s) and 0 <= s < 1 << 64 for s in seeds):
+            raise ObsLawError(f"bank artifact: {where}.seeds must be a list of unsigned 64-bit integers, one per text")
+        for t, s in zip(texts, seeds):
+            if s != stream_seed_d8(t):
+                raise ObsLawError(f"bank artifact: {where}.seeds: {s} is not the derived seed of {t!r}")
+
+    @staticmethod
+    def _estimator(est):
+        """estimator (v5 2.8 L750): an object with the existing record's fields and ceilings, saturation,
+        capped_category (their internal structure is not fixed by v5: presence only), and the two values v5 2.5
+        fixes (multi_start 16, boot 999)."""
+        if not isinstance(est, dict):
+            raise ObsLawError("bank artifact: estimator must be an object")
+        for k in ESTIMATOR_FIELDS:
+            _field(est, k, "estimator")
+        for k, v in ESTIMATOR_VALUES.items():
+            if not (_int(est[k]) and est[k] == v):
+                raise ObsLawError(f"bank artifact: estimator.{k} {est[k]!r} is not the registered {v}")
+
+    @staticmethod
+    def _horizons(hz):
+        """horizons (v5 2.8 L751): one record per horizon 5000, 10000, 20000, each with the fields every record
+        carries as now; status a string, 'ok' at 5000 (R7: a d8-fitted artifact's 5k fit is ok), 'ok' or
+        'unavailable' at 10k/20k (2.6); with status ok the groups, grid_validation, components and bootstrap
+        records; capture_bound = noisebank.capture_bound(h); reasons a list."""
+        if not isinstance(hz, dict):
+            raise ObsLawError("bank artifact: horizons must be an object")
+        for h in HORIZON_KEYS:
+            rec = _field(hz, h, "horizons")
+            where = f"horizons.{h}"
+            for k in HORIZON_FIELDS:
+                _field(rec, k, where)
+            st = rec["status"]
+            if st not in HORIZON_STATUSES or (h == HORIZON_KEYS[0] and st != "ok"):
+                raise ObsLawError(f"bank artifact: {where}.status {st!r} is refused "
+                                  + ("(a d8-fitted artifact's 5k fit is ok, R7)" if h == HORIZON_KEYS[0] else
+                                     f"(one of {HORIZON_STATUSES})"))
+            if st == "ok":
+                for k in HORIZON_OK_FIELDS:
+                    _field(rec, k, where)
+                for k in ("components", "bootstrap"):
+                    if not isinstance(rec[k], dict):
+                        raise ObsLawError(f"bank artifact: {where}.{k} must be an object when the status is ok")
+            cb = rec["capture_bound"]
+            if not (_int(cb) and cb == noisebank.capture_bound(int(h))):
+                raise ObsLawError(f"bank artifact: {where}.capture_bound {cb!r} is not "
+                                  f"noisebank.capture_bound({h}) = {noisebank.capture_bound(int(h))}")
+            if not isinstance(rec["reasons"], list):
+                raise ObsLawError(f"bank artifact: {where}.reasons must be a list")
 
     @staticmethod
     def _scalars(doc):
@@ -1204,7 +1333,7 @@ class BankObservationModel:
         got = t.stored_content_sha256
         if content_sha256 is not None and got != content_sha256:
             raise ObsLawError(f"observation tables: content sha256 {got} differs from the configured {content_sha256}")
-        impl = implementation_sha256()
+        impl, nsc = implementation_sha256(), noisescale_sha256()
         ident = t.identity()
         if t.bank_sha256 != b.sha256:
             raise ObsLawError("observation tables: built from another bank artifact (bank_artifact_sha256)")
@@ -1213,6 +1342,8 @@ class BankObservationModel:
                 raise ObsLawError("observation tables: a table of another bank artifact")
             if k.get("obslaw_sha256") != impl:
                 raise ObsLawError("observation tables: built by another obslaw implementation (obslaw_sha256)")
+            if k.get("noisescale_sha256") != nsc:
+                raise ObsLawError("observation tables: built with another noisescale evaluator (noisescale_sha256)")
         for (ch, g), lt in t.location.items():
             N, M = b.law(ch)
             want = location_identity(b.s_logit[ch], ch, g, N, M, lt.identity.get("h"), b.sha256)
@@ -1294,4 +1425,4 @@ class BankObservationModel:
                 "parameters_sha256": rqlib.canonical_sha({"noise": d["noise"], "map_variance": d["map_variance"]}),
                 "receipt_sha256": d["fit"]["noise"]["receipt_sha256"],
                 "fitter": {"var_fn": "W", "rep_prior": "nu0_C", "score_law": "A,L"},
-                "obslaw_sha256": implementation_sha256(), "design": DESIGN}
+                "obslaw_sha256": implementation_sha256(), "noisescale_sha256": noisescale_sha256(), "design": DESIGN}
