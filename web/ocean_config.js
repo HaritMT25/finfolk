@@ -293,7 +293,7 @@
     predatorMetabolism: { d: "Predator energy burn per second (economy on); fish burn 1.5.", t: "try: 2-3" },
     predatorReproEnergy: { d: "Energy a predator needs to bud a child (economy on).", t: "try: 40-80" },
     predatorMaxAge: { d: "Predator death age; 0 = immortal until starved.", t: "try: 0, or 120 to age them out" },
-    predatorMinPopulation: { d: "Predator floor: fresh hunters are put back whenever fewer than this are alive (economy on; 0 = off). Applies live.", t: "try: 2, with a cap" },
+    predatorMinPopulation: { d: "Predator floor: fresh hunters are put back whenever fewer than this are alive, even from 0 starting predators (economy on; 0 = off). Applies live.", t: "try: 2, with a cap" },
     predatorMaxPopulation: { d: "Predator cap: a well-fed hunter doesn't bud while this many are alive (economy on; 0 = none). Applies live.", t: "try: 15 with the default 3 s digesting time" },
     predatorInheritance: { d: "Each bud inherits its parent's speed and budding threshold (×0.5 to ×2) with a small mutation, so hunters evolve.", t: "try: on with a swimming cost, a predator lifespan and a cap" },
     predatorTraitMutation: { d: "How far a bud's traits can stray from its parent's, per trait per bud. Applies live.", t: "try: 0.1 (the default)" },

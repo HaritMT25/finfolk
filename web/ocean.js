@@ -1099,9 +1099,16 @@
     }],
     [["predatorEconomy", "predatorSpeed", "predatorPerception", "predatorCaptureRadius", "predatorCooldown"],
       function () { return hasPredators() ? "" : "needs predators above 0"; }],
-    [["predatorMeal", "predatorMetabolism", "predatorReproEnergy", "predatorMaxAge", "predatorMinPopulation",
+    [["predatorMeal", "predatorMetabolism", "predatorReproEnergy", "predatorMaxAge",
       "predatorMaxPopulation", "predatorInheritance"],
       function () { return hasPredators() && nv("predatorEconomy") ? "" : "needs predators, with their economy on"; }],
+    /* the floor refills hunters with the economy on, even from 0 starting
+     * predators (src/ocean/ocean_world.hpp: the step's refillPredators call
+     * needs only predatorEconomy and predatorMinPopulation > 0; neither reads
+     * predatorCount) */
+    [["predatorMinPopulation"], function () {
+      return nv("predatorEconomy") ? "" : "needs predator economy on (refills hunters even from 0)";
+    }],
     [["predatorTraitMutation"], function () {
       return hasPredators() && nv("predatorEconomy") && nv("predatorInheritance") ? "" : "needs hunters inherit traits on"; }],
     [["maxTurnRate"], function () { return nv("triangularMotion") ? "" : "needs fast-swims-straight on"; }],
