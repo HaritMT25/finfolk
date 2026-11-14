@@ -226,6 +226,7 @@ MU_FINAL = 1e-7                    # (the last barrier weight: its duality gap, 
 BOOT_FAIL_MAX = 0.05               # (the interval is unavailable beyond this share of failed draws)
 MARGINAL_TOL = 1e-8                # (the marginal Newton's gradient tolerance, per replicate)
 FEAS_TOL = 1e-12                   # (the feasibility tolerance of the unconstrained group maxima)
+MIN_CATEGORIES = 3                 # (the D8 path only, A_design_v5 2.5 item 7: fewer distinct counts: screened out)
 BOOT = 999
 GROUPS = ("R_CC", "R_SS", "R_CS", "D_CC", "D_SS", "D_CS", "T_CS", "R_CF", "R_SF")
 KINDS = ("C", "RC", "Q", "RQ")
@@ -669,7 +670,7 @@ def _log_iprob(a, b):
 def check_domain(l1, h1, l2, h2, r):
     """THE REGISTERED ADMISSIBLE DOMAIN of log_rect (what the bank produces; anything else is refused):
     |rho| <= RHO_MAX; every finite standardized endpoint within +-E_MAX (infinite ends only for the
-    counts 0 and N); every interval at least W_MIN wide."""
+    counts 0, the ceiling M, and N); every interval at least W_MIN wide."""
     import numpy as np
     if not abs(r) <= RHO_MAX:
         raise NoiseBankError(f"log_rect: rho {r} outside the registered box")
@@ -807,13 +808,19 @@ def log_rect(l1, h1, l2, h2, r, chunk=20000):
 
 
 # ================================================================== stage 1: the marginals
-def interval_bounds(k, N):
-    """The latent interval of count k of N: [logit((k - 1/2)/N), logit((k + 1/2)/N)], -inf at 0, +inf at N."""
+def interval_bounds(k, N, ceiling=None):
+    """The latent interval of count k of N: [logit((k - 1/2)/N), logit((k + 1/2)/N)], -inf at 0, +inf at the
+    ceiling M (D8 v2 rules 46-47, A_design_v5 2.4 / 2.5 item 1: the CAPPED category k = M has upper end +inf while
+    the scale stays N). The ceiling defaults to N (capture, and every pre-D8 caller unchanged); a count above it is
+    refused."""
     import numpy as np
+    M = N if ceiling is None else ceiling
     k = np.asarray(k, float)
+    if np.any(k > M):
+        raise NoiseBankError(f"interval_bounds: a count above the ceiling {M} (of N = {N}) is refused")
     with np.errstate(divide="ignore", invalid="ignore"):
         lo = np.where(k <= 0, -np.inf, np.log((k - 0.5) / (N - k + 0.5)))
-        hi = np.where(k >= N, np.inf, np.log((k + 0.5) / (N - k - 0.5)))
+        hi = np.where(k >= M, np.inf, np.log((k + 0.5) / (N - k - 0.5)))
     return lo, hi
 
 
@@ -844,15 +851,15 @@ def _marg_hess(lo, hi, a, t, eps=1e-5):
     return 0.5 * (H + np.transpose(H, (0, 2, 1)))
 
 
-def fit_marginals(K, N, max_iter=200):
-    """Stage 1: per row of K (rows x R counts of N) the interval-censored normal MLE (a, sigma): Newton
-    (finite-difference Hessian of the analytic gradient, step halving) from the EMPIRICAL-LOGIT MOMENTS (the
-    starting values only). -> dict a, sigma, loglik, ok (converged, sigma >= SIGMA_MIN, negative definite
-    Hessian), var_t (the observed-information variance of log sigma-hat)."""
+def fit_marginals(K, N, ceiling=None, max_iter=200):
+    """Stage 1: per row of K (rows x R counts of N, capped at the ceiling M: A_design_v5 2.5 item 3) the
+    interval-censored normal MLE (a, sigma): Newton (finite-difference Hessian of the analytic gradient, step
+    halving) from the EMPIRICAL-LOGIT MOMENTS (the starting values only). -> dict a, sigma, loglik, ok (converged,
+    sigma >= SIGMA_MIN, negative definite Hessian), var_t (the observed-information variance of log sigma-hat)."""
     import numpy as np
     K = np.asarray(K, float)
     n, R = K.shape
-    lo, hi = interval_bounds(K, N)
+    lo, hi = interval_bounds(K, N, ceiling)
     z0 = np.log((K + 0.5) / (N - K + 0.5))
     a = z0.mean(axis=1)
     t = np.log(np.maximum(z0.std(axis=1, ddof=1), 0.05))
@@ -902,12 +909,16 @@ def fit_marginals(K, N, max_iter=200):
 
 
 # ================================================================== the bank's arrays and pairs
-def arrays(obs, horizon):
+def arrays(obs, horizon, ceilings=None):
     """-> per horizon the complete exposed cells (prey / predator snapshot keys and indices, counts C and S:
-    cells x R), the free controls (prey snapshot x R, NaN where missing), N per channel, the replicates."""
+    cells x R), the free controls (prey snapshot x R, NaN where missing), N per channel, the ceiling M per channel
+    and the replicates. ceilings (the D8 path, A_design_v5 2.5 item 2): {str(horizon): M_h} of the survivor
+    ceilings; then A["M"] = {"C": B, "S": M_h, "F": M_h} and the range check tests survivors against M_h (a
+    support violation, 2.3: refused, reporting only the number of violating observations). Without it M = N."""
     import numpy as np
     B = capture_bound(horizon)
     h = str(horizon)
+    Mh = None if ceilings is None else ceilings[h]
     by, free = {}, {}
     reps = {o["replicate"] for o in obs}
     if any(not isinstance(r, int) or isinstance(r, bool) for r in reps) or sorted(reps) != list(range(len(reps))):
@@ -941,19 +952,30 @@ def arrays(obs, horizon):
         v = arr[np.isfinite(arr)]
         if np.any(v < 0) or np.any(v > n):
             raise NoiseBankError(f"{name} outside the integers 0..{n} at {horizon} steps")
+        if Mh is not None and n == N_PREY and np.any(v > Mh):
+            raise NoiseBankError(f"{int(np.sum(v > Mh))} {name} observation(s) above the survivor ceiling M = {Mh} "
+                                 f"at {horizon} steps (a support violation, D8 v2 rule 46: the refit is refused)")
     return {"prey": prey, "pred": pred, "I": np.array([pi[i] for i, _ in cells], int),
             "J": np.array([pj[j] for _, j in cells], int), "C": Cc, "S": Sc, "F": Fc,
-            "N": {"C": B, "S": N_PREY, "F": N_PREY}, "R": R, "incomplete_cells": len(by) - len(cells)}
+            "N": {"C": B, "S": N_PREY, "F": N_PREY},
+            "M": {"C": B, "S": N_PREY if Mh is None else Mh, "F": N_PREY if Mh is None else Mh},
+            "R": R, "incomplete_cells": len(by) - len(cells)}
 
 
-def usable(A):
-    """Per CHANNEL: the saturation mask, then the stage-1 marginal fits -> {ch: {"ok", "mu", "a", "sigma",
-    "var_t", "counts"}}."""
+def usable(A, screen=False, channels=("C", "S", "F")):
+    """Per CHANNEL: the saturation mask, then the stage-1 marginal fits (at the channel's ceiling A["M"], 2.5 item 3)
+    -> {ch: {"ok", "mu", "a", "sigma", "var_t", "counts"}}. screen (the D8 path only, A_design_v5 2.5 item 7, PC-18,
+    R10): a cell-channel that passes the saturation mask but whose replicates occupy fewer than MIN_CATEGORIES
+    distinct count categories is excluded as unidentified BEFORE the Newton fit (a prospective conservative
+    exclusion, by policy), counted in "unidentified" and in its own "screened" (clarification 1 C7); the
+    identification rules still apply to every cell that passes it. Without screen the legacy records are unchanged
+    (no "screened" key). channels: those fitted (the zero-ceiling horizons fit capture only, 2.6)."""
     import numpy as np
     out = {}
-    for ch in ("C", "S", "F"):
+    for ch in channels:
         Kc = A[ch]
         N = A["N"][ch]
+        M = A.get("M", A["N"])[ch]
         complete = np.all(np.isfinite(Kc), axis=1)
         mu = np.full(len(Kc), np.nan)
         mu[complete] = Kc[complete].mean(axis=1) / N
@@ -961,19 +983,26 @@ def usable(A):
         fit_rows = np.flatnonzero(complete & ~sat)
         ok = np.zeros(len(Kc), bool)
         a, sg, vt = (np.full(len(Kc), np.nan) for _ in range(3))
-        if len(fit_rows):
-            f = fit_marginals(Kc[fit_rows], N)
-            ok[fit_rows] = f["ok"]
-            a[fit_rows], sg[fit_rows], vt[fit_rows] = f["a"], f["sigma"], f["var_t"]
-        out[ch] = {"ok": ok, "mu": mu, "a": a, "sigma": sg, "var_t": vt,
-                   "counts": {"rows": int(len(Kc)), "incomplete": int((~complete).sum()), "saturated": int(sat.sum()),
-                              "unidentified": int(len(fit_rows) - ok[fit_rows].sum()), "usable": int(ok.sum())}}
+        screened = np.zeros(len(Kc), bool)
+        if screen and len(fit_rows):
+            ncat = np.array([len(np.unique(Kc[i])) for i in fit_rows], int)
+            screened[fit_rows[ncat < MIN_CATEGORIES]] = True
+        newton = fit_rows[~screened[fit_rows]]
+        if len(newton):
+            f = fit_marginals(Kc[newton], N, M)
+            ok[newton] = f["ok"]
+            a[newton], sg[newton], vt[newton] = f["a"], f["sigma"], f["var_t"]
+        counts = {"rows": int(len(Kc)), "incomplete": int((~complete).sum()), "saturated": int(sat.sum()),
+                  "unidentified": int(len(fit_rows) - ok[fit_rows].sum()), "usable": int(ok.sum())}
+        if screen:
+            counts["screened"] = int(screened.sum())
+        out[ch] = {"ok": ok, "mu": mu, "a": a, "sigma": sg, "var_t": vt, "counts": counts}
     return out
 
 
 def _std_bounds(A, U, ch, rows):
-    """The standardized interval bounds (rows x R) of channel ch at the stage-1 margins."""
-    lo, hi = interval_bounds(A[ch][rows], A["N"][ch])
+    """The standardized interval bounds (rows x R) of channel ch at the stage-1 margins (capped at A["M"][ch])."""
+    lo, hi = interval_bounds(A[ch][rows], A["N"][ch], A.get("M", A["N"])[ch])
     a, s = U[ch]["a"][rows][:, None], U[ch]["sigma"][rows][:, None]
     return (lo - a) / s, (hi - a) / s
 
@@ -1036,11 +1065,11 @@ def rho_grid(m=Z_INTERVALS):
     return np.tanh(z_nodes(m))
 
 
-def _pair_blocks(A, U, G):
+def _pair_blocks(A, U, G, groups=GROUPS):
     """Per group: the pair blocks (standardized bounds, source keys) and the keys."""
     import numpy as np
     out = {}
-    for g in GROUPS:
+    for g in groups:
         keys, blocks = {}, []
         for c1, r1, c2, r2, prey_w, pred_w in G[g]:
             l1, h1 = _std_bounds(A, U, c1, r1)
@@ -1071,16 +1100,17 @@ def exact_column(blocks, nkeys, r, chunk=40000):
     return col, deep
 
 
-def group_tables(A, U, G, m=Z_INTERVALS):
-    """Stage 2's exact contributions: per group and per bootstrap source key (DISTINCT worlds per role), the
+def group_tables(A, U, G, m=Z_INTERVALS, groups=GROUPS):
+    """Stage 2's exact contributions: per group (of groups: all nine, or the capture-only R_CC and D_CC of a
+    zero-ceiling horizon, A_design_v5 2.6) and per bootstrap source key (DISTINCT worlds per role), the
     summed dependence contributions log P(both; rho) - log P(1) - log P(2) at every grid node, the pair blocks
     (kept for the certification) -> {g: {"keys", "z" (nodes), "T" (keys x nodes), "pairs", "npk" (pairs per
     key), "deep_tail", "blocks"}}."""
     import numpy as np
     zn = z_nodes(m)
-    pb = _pair_blocks(A, U, G)
+    pb = _pair_blocks(A, U, G, groups)
     out = {}
-    for g in GROUPS:
+    for g in groups:
         keys, blocks = pb[g]
         T = np.zeros((len(keys), len(zn)))
         deep = 0
@@ -1481,8 +1511,9 @@ def identified(zn, vals, rho, npairs):
     return per >= INFO_MIN, per, at_box
 
 
-def validate_grid(tab, fitrho):
-    """LOCAL OBJECTIVE-VALUE VALIDATION (Codex #72 r3 P2-2, narrowed by the coordinator after r4): per group,
+def validate_grid(tab, fitrho, groups=GROUPS):
+    """LOCAL OBJECTIVE-VALUE VALIDATION (Codex #72 r3 P2-2, narrowed by the coordinator after r4): per group
+    (of groups),
     the EXACT objective at the fitted rho and at the off-grid midpoints of its bracket and both neighbours,
     against the interpolant; where a miss exceeds GRID_LL_TOL per pair, those exact columns are inserted as
     nodes (candidates deduplicated against each other and the grid at MIN_KNOT in z; an invalid grid is a
@@ -1490,7 +1521,7 @@ def validate_grid(tab, fitrho):
     is not a global certificate."""
     import numpy as np
     worst, inserted = 0.0, False
-    for g in GROUPS:
+    for g in groups:
         t = tab[g]
         zn = t["z"]
         z = math.atanh(max(-RHO_MAX, min(RHO_MAX, fitrho[g])))
@@ -1651,19 +1682,35 @@ def _entries(f):
     return [SR[0, 0], SR[1, 1], SR[0, 1], SR[0, 2], SR[1, 2], SD[0, 0], SD[1, 1], SD[0, 1], SE[0, 0], SE[1, 1], SE[0, 1]]
 
 
-def bootstrap(tab, n_worlds, boot, seed):
-    """The registered uncertainty procedure -> (draws x BOOT_NAMES, failed draws, of which identification
-    rejections). Each weighted refit applies THE SAME identification rule as the point estimate (identified,
-    with the WEIGHTED pair counts); a group without weight, an unidentified group or a refused fit is a failed
-    draw (Codex #72 r3 P2-5)."""
+def _numpy_multiplicities(seed, n_worlds):
+    """The pre-D8 bootstrap's draws (the registered RNG exception of the legacy estimate: NumPy default_rng(seed),
+    its existing draws unchanged) -> a function returning one draw's (prey-role m, predator-role m')."""
     import numpy as np
     rng = np.random.default_rng(seed)
-    out, failed, unident = [], 0, 0
-    for _ in range(boot):
+
+    def draw():
         mm = np.bincount(rng.integers(0, n_worlds, n_worlds), minlength=n_worlds)
         mp = np.bincount(rng.integers(0, n_worlds, n_worlds), minlength=n_worlds)
+        return mm, mp
+    return draw
+
+
+def bootstrap(tab, n_worlds, boot, seed, draws=None, groups=GROUPS, fit=None, entries=None, names=BOOT_NAMES):
+    """The registered uncertainty procedure -> (draws x names, failed draws, of which identification
+    rejections). Each weighted refit applies THE SAME identification rule as the point estimate (identified,
+    with the WEIGHTED pair counts); a group without weight, an unidentified group or a refused fit is a failed
+    draw (Codex #72 r3 P2-5). draws (the D8 path, A_design_v5 2.5 item 5): a function returning one draw's
+    multiplicities (m, m') in place of NumPy default_rng(seed); groups / fit / entries / names: the capture-only
+    reduced fit of a zero-ceiling horizon (2.6) in place of the nine groups' fit_dependence."""
+    import numpy as np
+    draw = draws or _numpy_multiplicities(seed, n_worlds)
+    fit = fit or fit_dependence
+    entries = entries or _entries
+    out, failed, unident = [], 0, 0
+    for _ in range(boot):
+        mm, mp = draw()
         objs, pairs, bad = {}, {}, False
-        for g in GROUPS:
+        for g in groups:
             w = pick_weights(tab[g]["keys"], mm, mp)
             if not w.any():
                 bad = True
@@ -1679,13 +1726,13 @@ def bootstrap(tab, n_worlds, boot, seed):
             failed += 1
             continue
         try:
-            out.append(_entries(fit_dependence(objs, pairs)))
+            out.append(entries(fit(objs, pairs)))
         except NoiseBankError:
             failed += 1
-    return np.array(out, float).reshape(len(out), len(BOOT_NAMES)), failed, unident
+    return np.array(out, float).reshape(len(out), len(names)), failed, unident
 
 
-def interval_record(D, failed, boot, unident=0):
+def interval_record(D, failed, boot, unident=0, names=BOOT_NAMES):
     """Codex #72 r2 P2-5 / r3 P2-5: the failed draws (identification rejections included) are counted; the
     interval is UNAVAILABLE (its own status) beyond BOOT_FAIL_MAX of the draws, otherwise reported with the
     failure rate, labelled approximate and conditional on identification."""
@@ -1700,15 +1747,17 @@ def interval_record(D, failed, boot, unident=0):
         return dict(rec, status="unavailable", ci95=None,
                     reason=f"{failed} of {boot} draws failed (> {BOOT_FAIL_MAX:.0%})")
     return dict(rec, status="ok", ci95={n: [float(np.percentile(D[:, k], 2.5)), float(np.percentile(D[:, k], 97.5))]
-                                        for k, n in enumerate(BOOT_NAMES)})
+                                        for k, n in enumerate(names)})
 
 
-def horizon_estimate(A, boot=BOOT, seed=0, m=Z_INTERVALS):
+def horizon_estimate(A, boot=BOOT, seed=0, m=Z_INTERVALS, screen=False, draws=None):
     """One horizon: the usable channels, the s(mu) curves and nu0, the nine groups (identification), the
     components (or "unavailable" with reasons) with the grid VALIDATED LOCALLY at the fit, the registered uncertainty
-    procedure."""
+    procedure. The D8 path (estimate_d8, A_design_v5 2.5) passes screen=True (the minimum-categories screen) and
+    draws(n_worlds) (the bootstrap's SplitMix64 multiplicities); the capped interval map comes with A (arrays'
+    ceilings). Without them the legacy record is unchanged."""
     import numpy as np
-    U = usable(A)
+    U = usable(A, screen=screen)
     rec = {"capture_bound": A["N"]["C"], "replicates": A["R"], "incomplete_cells": A["incomplete_cells"],
            "channels": {ch: U[ch]["counts"] for ch in ("C", "S", "F")}, "scales": {}, "nu0": {}, "curve_points": {}}
     for ch in ("C", "S", "F"):
@@ -1774,7 +1823,7 @@ def horizon_estimate(A, boot=BOOT, seed=0, m=Z_INTERVALS):
                                                "row leaves the free row / control split unidentified"},
                          "shares": {ch: {"row": float(fit["SigmaR"][k, k]), "donor": float(fit["SigmaD"][k, k]),
                                          "cell": float(fit["SigmaE"][k, k])} for k, ch in enumerate("CS")}}
-    D, failed, unident = bootstrap(tab, len(worlds), boot, seed)
+    D, failed, unident = bootstrap(tab, len(worlds), boot, seed, draws=None if draws is None else draws(len(worlds)))
     rec["bootstrap"] = interval_record(D, failed, boot, unident)
     rec.update(status="ok", reasons=[])
     return rec
