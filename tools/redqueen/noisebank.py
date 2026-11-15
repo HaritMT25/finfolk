@@ -162,12 +162,18 @@ byte-for-byte; every D8 consumer refuses bank/2).
     the in-memory reconstruction by collect, one engine binary); estimate-d8 verifies every input by hash before
     parsing, writes its receipt durably first and the artifact binding it; validate-d8 runs the prospective
     parameter-recovery study (V1-V5) on synthetic banks from the witnessed spec. Every D8 run is charged to the
-    cumulative D5 CPU ledger (failed and interrupted runs too).
+    cumulative D5 CPU ledger (failed and interrupted runs too): the D8 commands require the EXISTING ledger and
+    validate every entry (a missing ledger or a malformed entry refuses, never read as 0); before its work each run
+    writes an in-progress attempt record beside the ledger (<ledger>.attempts.jsonl, never the shared ledger), refreshed
+    durably while it runs; finalization appends exactly one entry per attempt. A run killed hard (SIGKILL, OOM, a
+    reboot) leaves its attempt open: every budget-dependent command refuses until d8-reconcile charges it its last
+    durable CPU plus 60 s.
     noisebank.py provenance --study BANK_ROOT --design D --plan P --obs OBS [--manifest M] --out PROV --ledger L
     noisebank.py d8-validation-spec --design D [--round 1] --out SPEC
     noisebank.py validate-d8 --spec SPEC --design D --out REPORT --ledger L
     noisebank.py estimate-d8 --obs OBS --ages A --design D --plan P --provenance PROV --validation-report REPORT \\
         --out bank_d8.json --receipt RECEIPT --ledger L [--boot 999]
+    noisebank.py d8-reconcile --ledger L
 
 THE PRODUCTION V BUILDER (cov_parts; Annex H.3.1): one block's bank covariance diag(d) + U U' (for
 recurrence.Cov), from the bank's components and the bank's s(mu) curves (noisescale.evaluate, the
@@ -1994,7 +2000,7 @@ D8_SPEC_SCHEMA = "finfolk.redqueen.noisebank.d8validation.spec/1"
 D8_REPORT_SCHEMA = "finfolk.redqueen.noisebank.d8validation.report/1"
 D8_IMPLEMENTATION = ("noisebank.py", "noisescale.py", "obslaw.py", "common.py", "material.py", "plan.py", "store.py",
                      "rqlib.py", "fixtures/registered_ages.json")       # (v5 2.8 L753-754: fit.noise.implementation)
-D8_COMMANDS = ("provenance", "estimate-d8", "d8-validation-spec", "validate-d8")
+D8_COMMANDS = ("provenance", "estimate-d8", "d8-validation-spec", "validate-d8", "d8-reconcile")
 D5_CEILING_H = 240.0               # (the cumulative D5 ledger's ceiling, D8:289, H:1571-1577; calib's
                                    #  stats.CPU_CEILING_H)
 D8_START_GUARD_H = 25.0            # (v5 2.11 / 7: >= 25 CPU-h remaining before provenance, a starting guard only)
@@ -2242,7 +2248,7 @@ def d8_provenance_record(raw, bindings, n_obs):
 
 
 def estimate_d8(obs_path, ages_path, design_path, plan_path, provenance_path, validation_path, bindings=None,
-                boot=BOOT, m=Z_INTERVALS):
+                boot=BOOT, m=Z_INTERVALS, progress=None):
     """The D8 refit (A_design_v5 2.1-2.7) of the frozen bank observations, everything verified first (R1-R5, R10):
       1. the four inputs by file sha256 BEFORE parsing (obs 64b113ce..., plan 2ce2bb7a..., design 6559a8da..., ages
          6ffb99ec...); obs schema obs/1 and missing == []; obs plan_sha256 == the plan's; canonical_sha(design) ==
@@ -2253,9 +2259,11 @@ def estimate_d8(obs_path, ages_path, design_path, plan_path, provenance_path, va
          report's sha256 is recorded (its acceptance gates adoption, R8, not this run);
       4. per horizon: the capped interval map, the minimum-categories screen (R10), the bootstrap's SplitMix64
          streams; 10k / 20k capture-only (2.6).
-    bindings: d8_bindings() unless given; any other bindings make the output synthetic. -> the refit record that
-    d8_artifact turns into the bank/3 artifact once its receipt is written (2.8: the receipt first)."""
+    bindings: d8_bindings() unless given; any other bindings make the output synthetic. progress(label): called at
+    each major step (run_estimate_d8: the attempt's durable refresh). -> the refit record that d8_artifact turns into
+    the bank/3 artifact once its receipt is written (2.8: the receipt first)."""
     import material
+    step = progress or (lambda label: None)
     b = d8_bindings() if bindings is None else dict(bindings)
     synthetic = b != d8_bindings()
     if not isinstance(boot, int) or isinstance(boot, bool) or boot < 1:
@@ -2292,12 +2300,14 @@ def estimate_d8(obs_path, ages_path, design_path, plan_path, provenance_path, va
     val = _json_of(val_raw, "validation report")
     if not isinstance(val, dict) or val.get("schema") != D8_REPORT_SCHEMA:
         raise NoiseBankError(f"validation report: schema is not {D8_REPORT_SCHEMA}")
+    step("estimate-d8: inputs verified")
     horizons = {}
     for h in HORIZONS:
         A = arrays(obs, h, ceilings)
         if A["R"] != REPLICATES:
             raise NoiseBankError(f"{A['R']} replicates; {REPLICATES} are registered")
         horizons[str(h)] = horizon_estimate_d8(A, h, boot, m)
+        step(f"estimate-d8: horizon {h}")
     inputs = {"observations_sha256": rqlib.sha256_bytes(obs_raw), "ages_sha256": rqlib.sha256_bytes(ages_raw),
               "plan_sha256": rqlib.sha256_bytes(plan_raw), "design_file_sha256": rqlib.sha256_bytes(design_raw),
               "design_canonical_sha256": doc["design_sha256"], "provenance_sha256": rqlib.sha256_bytes(prov_raw),
@@ -2436,17 +2446,19 @@ def provenance(study, design_path, plan_path, obs_path, manifest_path=None, bind
          the same bytes), sha256(rqlib.canonical(doc)) == the frozen observations' (only the boolean and the two
          hashes are recorded; the document is never written or printed);
       4. a pre-existing manifest, when given (_manifest_check); otherwise covers_chunks false.
-    Reads bundles that contain scores (as collect always has) but reports none. -> the provenance/1 record."""
+    Reads bundles that contain scores (as collect always has) but reports none. progress(label): called after each
+    major step (run_provenance: the attempt's durable refresh). -> the provenance/1 record."""
     import store
     import zipfile
     try:
-        return _provenance(study, design_path, plan_path, obs_path, manifest_path, bindings)
+        return _provenance(study, design_path, plan_path, obs_path, manifest_path, bindings,
+                           progress or (lambda label: None))
     except (store.StoreError, zipfile.BadZipFile, KeyError, TypeError) as e:
         raise NoiseBankError(f"provenance: the store cannot be read as indexed ({type(e).__name__}: {e}; R9)") \
             from None
 
 
-def _provenance(study, design_path, plan_path, obs_path, manifest_path, bindings):
+def _provenance(study, design_path, plan_path, obs_path, manifest_path, bindings, step):
     import store
     b = d8_bindings() if bindings is None else dict(bindings)
     root = os.path.abspath(study)
@@ -2465,6 +2477,7 @@ def _provenance(study, design_path, plan_path, obs_path, manifest_path, bindings
     if probs:
         raise NoiseBankError(f"provenance: store.verify_all(deep=True) reports {len(probs)} problem(s): {probs[:3]} "
                              "(R9)")
+    step("provenance: store.verify_all(deep=True)")
     recs, cells = store.load_index(root)
     rows, plan_sha = bind_plan(design, plan_path)
     ours = sorted(c for c in rows if c in cells)
@@ -2474,12 +2487,14 @@ def _provenance(study, design_path, plan_path, obs_path, manifest_path, bindings
             probs = store.verify_chunk(os.path.join(root, store.CHUNKS, r["chunk"]), r["cells"])
             if probs:
                 raise NoiseBankError(f"provenance: store.verify_chunk({r['chunk']}) reports {probs[:3]} (R9)")
+    step("provenance: store.verify_chunk")
     binaries, tools = set(), {}                                                         # 5.
     for cid in ours:
         bd = _json_of(store.read_packed(root, cid, cells=cells), f"bundle {cid}")
         binaries.add(bd.get("binary_sha256"))
         t = bd.get("tools_sha256")
         tools[rqlib.canonical_sha(t)] = t
+    step("provenance: bundles read")
     if len(binaries) != 1 or not rqlib.is_sha256(next(iter(binaries))):
         raise NoiseBankError(f"provenance: the bundles record {len(binaries)} engine binaries, not exactly one sha256 "
                              "(A_design_v5 2.2 item 5, R5)")
@@ -2492,6 +2507,7 @@ def _provenance(study, design_path, plan_path, obs_path, manifest_path, bindings
     doc = collect(root, design, plan_path)                                              # 3.
     got = rqlib.canonical_sha(doc)
     del doc
+    step("provenance: reconstruction")
     if got != b["observations_sha256"]:
         raise NoiseBankError(f"provenance: the reconstruction's canonical sha256 {got} is not the frozen observations' "
                              f"{b['observations_sha256']} (R9)")
@@ -2508,36 +2524,300 @@ def _provenance(study, design_path, plan_path, obs_path, manifest_path, bindings
 
 
 # ---------------------------------------------------------------- the receipt and the D5 ledger (v5 2.8, 2.11)
+# The cumulative D5 ledger is #68's file, read by #68's tools too: its line format (calib.ledger_add, calib.py:2998
+# @ff67064: one sort_keys JSON object with its utc per line) is unchanged here. What the D8 commands add (Codex revWP3
+# P2-1, P2-2; the coordinator's accounting plumbing for v5 2.11's "failed and interrupted runs are charged"):
+#   - fail-closed reading: the ledger must exist and every entry is validated (ledger_entries);
+#   - an attempts file BESIDE the ledger (<ledger>.attempts.jsonl; never the shared ledger): before its work every D8
+#     run writes an in-progress record, refreshed durably while it runs; finalization appends exactly one ledger entry
+#     per attempt (its id prevents a double charge) and closes the attempt; an attempt left open by a hard kill makes
+#     every budget-dependent command refuse until reconcile_attempts charges it.
+ATTEMPTS_SUFFIX = ".attempts.jsonl"   # (the attempts file of a ledger: <ledger>.attempts.jsonl)
+ATTEMPT_REFRESH_CPU_S = 30.0          # (a durable cpu_s refresh once this much CPU has passed since the last one; the
+ATTEMPT_POLL_S = 1.0                  #  refresher polls every ATTEMPT_POLL_S: durable refreshes < 60 CPU-s apart)
+RECONCILE_MARGIN_S = 60.0             # (a reconciled attempt is charged its last durable cpu_s + 60 s: conservative)
+INTERRUPTED_KIND = "D8-noisebank-interrupted"   # (the ledger kind of a reconciled, hard-interrupted attempt)
+
+
 def _cpu_s():
     import resource
     s, c = resource.getrusage(resource.RUSAGE_SELF), resource.getrusage(resource.RUSAGE_CHILDREN)
     return s.ru_utime + s.ru_stime + c.ru_utime + c.ru_stime
 
 
+def _cpu_value(v, where):
+    """A charge's cpu_s: a JSON number (not a boolean), finite and >= 0 -> float; anything else refused (never 0)."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        raise NoiseBankError(f"{where}: cpu_s {v!r} is not a number (refused, never read as 0)")
+    try:
+        x = float(v)
+    except OverflowError:
+        x = math.inf
+    if not math.isfinite(x) or x < 0:
+        raise NoiseBankError(f"{where}: cpu_s {v!r} is not a finite number >= 0 (refused)")
+    return x
+
+
+def _write_all(fd, data):
+    while data:
+        data = data[os.write(fd, data):]
+
+
+def ledger_init_empty(path):
+    """TEST / INITIALIZATION ONLY: create an EMPTY cumulative ledger at a path that does not exist yet (an existing
+    path is refused). The D8 commands never create a ledger: they require the existing registered calibration ledger,
+    and a nonexistent path is refused (ledger_entries, ledger_add)."""
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    except FileExistsError:
+        raise NoiseBankError(f"D5 ledger {path}: exists (ledger_init_empty creates a new, empty ledger only)") from None
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    rqlib.fsync_dir(os.path.dirname(os.path.abspath(path)))
+
+
+def ledger_entries(path):
+    """Every entry of the cumulative D5 ledger, validated (fail closed): the file must exist (a nonexistent path is
+    refused, never read as an unused ledger); every line is one JSON object (calib.ledger_add's line) whose cpu_s is
+    present, a number (not a boolean), finite and >= 0, and whose kind, when present, is a string; the last line ends
+    with a newline. Any other line (blank, not JSON, not an object, unterminated) is refused with the file and line
+    number: never skipped, never read as 0. -> [entry]"""
+    if not os.path.isfile(path):
+        raise NoiseBankError(f"D5 ledger {path}: no such file (the D8 commands require the existing cumulative "
+                             "ledger and never create one; ledger_init_empty is the explicit test / initialization "
+                             "path)")
+    lines = rqlib.read_bytes(path).split(b"\n")
+    tail = lines.pop()                                  # (b"" when the file ends with a newline or is empty)
+    out = []
+    for i, ln in enumerate(lines, 1):
+        where = f"D5 ledger {path} line {i}"
+        try:
+            e = json.loads(ln.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as err:
+            raise NoiseBankError(f"{where}: not a JSON line ({err}; refused, never skipped)") from None
+        if not isinstance(e, dict):
+            raise NoiseBankError(f"{where}: not a JSON object (refused, never skipped)")
+        if "cpu_s" not in e:
+            raise NoiseBankError(f"{where}: no cpu_s (refused, never read as 0)")
+        _cpu_value(e["cpu_s"], where)
+        if "kind" in e and not isinstance(e["kind"], str):
+            raise NoiseBankError(f"{where}: kind {e['kind']!r} is not a string (refused)")
+        out.append(e)
+    if tail:
+        raise NoiseBankError(f"D5 ledger {path} line {len(lines) + 1}: no terminating newline (a torn or partial "
+                             "append; refused)")
+    return out
+
+
 def ledger_add(path, entry):
-    """One CPU entry appended to the cumulative D5 ledger, in calib.ledger_add's format (#68 @ff67064 calib.py:2998:
-    one sort_keys JSON line with its utc), fsync'd."""
-    with open(path, "a") as f:
-        f.write(json.dumps(dict(entry, utc=rqlib.now_utc()), sort_keys=True) + "\n")
-        f.flush()
-        os.fsync(f.fileno())
+    """One CPU entry appended to the EXISTING cumulative D5 ledger in calib.ledger_add's line format (#68 @ff67064
+    calib.py:2998: one sort_keys JSON line with its utc), in one write, fsync'd. Refused: a nonexistent ledger (never
+    created), an entry whose cpu_s is not a finite number >= 0, a ledger whose last line is unterminated (appending
+    would corrupt the next line)."""
+    _cpu_value(entry.get("cpu_s"), f"D5 ledger {path}: entry {entry.get('kind')!r}")
+    data = (json.dumps(dict(entry, utc=rqlib.now_utc()), sort_keys=True) + "\n").encode("utf-8")
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_APPEND)     # (no O_CREAT)
+    except FileNotFoundError:
+        raise NoiseBankError(f"D5 ledger {path}: no such file (a D8 command never creates the ledger)") from None
+    try:
+        size = os.fstat(fd).st_size
+        if size and os.pread(fd, 1, size - 1) != b"\n":
+            raise NoiseBankError(f"D5 ledger {path}: the last line has no terminating newline (a torn append; refused)")
+        _write_all(fd, data)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def ledger_total(paths):
-    """calib.ledger_total's sum (by kind) against the D5 ceiling (D5_CEILING_H)."""
+    """calib.ledger_total's sum (by kind, in file order) against the D5 ceiling (D5_CEILING_H), over VALIDATED entries
+    (ledger_entries: a missing ledger or any malformed entry refuses; nothing is skipped or read as 0)."""
     by = {}
     n = 0
     for p in paths:
-        if not os.path.isfile(p):
-            continue
-        for ln in rqlib.read_text(p).splitlines():
-            if ln.strip():
-                e = json.loads(ln)
-                n += 1
-                by[e.get("kind", "?")] = by.get(e.get("kind", "?"), 0.0) + float(e.get("cpu_s", 0.0))
+        for e in ledger_entries(p):
+            n += 1
+            by[e.get("kind", "?")] = by.get(e.get("kind", "?"), 0.0) + float(e["cpu_s"])
     tot = sum(by.values())
     return {"entries": n, "cpu_h": tot / 3600, "by_kind_h": {k: v / 3600 for k, v in sorted(by.items())},
             "ceiling_h": D5_CEILING_H, "remaining_h": D5_CEILING_H - tot / 3600}
+
+
+def attempts_path(ledger):
+    """The attempts file of a ledger: the D8 runs' in-progress attempt records, beside the ledger, never in it."""
+    return ledger + ATTEMPTS_SUFFIX
+
+
+def _attempt_append(ledger, rec):
+    """One attempt record (a sort_keys JSON line) appended to the attempts file in one write, fsync'd (the file is
+    created on first use and its directory entry made durable). An unterminated tail (a torn append whose fsync never
+    returned) is truncated first, so it never joins the next record."""
+    p = attempts_path(ledger)
+    data = (json.dumps(rec, sort_keys=True) + "\n").encode("utf-8")
+    new = not os.path.exists(p)
+    fd = os.open(p, os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o644)
+    try:
+        size = os.fstat(fd).st_size
+        if size and os.pread(fd, 1, size - 1) != b"\n":
+            os.ftruncate(fd, os.pread(fd, size, 0).rfind(b"\n") + 1)
+        _write_all(fd, data)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    if new:
+        rqlib.fsync_dir(os.path.dirname(os.path.abspath(p)))
+
+
+_ATTEMPT_OPEN = ("attempt", "kind", "command", "utc_start", "pid", "host", "cpu_s")
+
+
+def attempts_state(ledger):
+    """The attempts beside a ledger, validated (fail closed) -> {attempt id: {"open": its open record, "cpu_s": its last
+    durable cumulative cpu_s, "steps": [major-step labels], "close": its close record or None}}, in file order. A
+    malformed record, a duplicate or incomplete open, or a record of an unknown or closed attempt is refused with the
+    file and line; an unterminated final line (a torn append whose fsync never returned: never durable) is ignored.
+    No attempts file: no attempts."""
+    p = attempts_path(ledger)
+    if not os.path.exists(p):
+        return {}
+    lines = rqlib.read_bytes(p).split(b"\n")
+    lines.pop()                                         # (b"" after the final newline, or a torn tail)
+    st = {}
+    for i, ln in enumerate(lines, 1):
+        where = f"attempts file {p} line {i}"
+        try:
+            r = json.loads(ln.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as err:
+            raise NoiseBankError(f"{where}: not a JSON line ({err}; refused)") from None
+        ev, aid = (r.get("event"), r.get("attempt")) if isinstance(r, dict) else (None, None)
+        if ev not in ("open", "progress", "close") or not isinstance(aid, str):
+            raise NoiseBankError(f"{where}: not an attempt record (refused)")
+        c = _cpu_value(r.get("cpu_s"), where)
+        if ev == "open":
+            if aid in st or any(k not in r for k in _ATTEMPT_OPEN):
+                raise NoiseBankError(f"{where}: a duplicate or incomplete open record of attempt {aid} (refused)")
+            st[aid] = {"open": r, "cpu_s": c, "steps": [], "close": None}
+            continue
+        a = st.get(aid)
+        if a is None or a["close"] is not None:
+            raise NoiseBankError(f"{where}: a {ev} record of an unknown or closed attempt {aid} (refused)")
+        if ev == "progress":
+            a["cpu_s"] = c
+            if r.get("step"):
+                a["steps"].append(r["step"])
+        else:
+            a["close"] = r
+    return st
+
+
+def open_attempts(ledger):
+    """The attempts beside the ledger that are not closed (running, or interrupted and not yet reconciled)."""
+    return {k: v for k, v in attempts_state(ledger).items() if v["close"] is None}
+
+
+def _budget_check(ledger, command):
+    """Before a budget-dependent D8 command (provenance, validate-d8, estimate-d8) does any work: the existing ledger,
+    every entry valid, and no unclosed attempt beside it (an interrupted run's CPU is not yet charged, so the ledger
+    would read too low) -> ledger_total([ledger])."""
+    t = ledger_total([ledger])
+    op = open_attempts(ledger)
+    if op:
+        desc = "; ".join(f"{k} ({v['open']['kind']}, started {v['open']['utc_start']}, pid {v['open']['pid']} on "
+                         f"{v['open']['host']}, last durable cpu_s {v['cpu_s']:.1f})" for k, v in op.items())
+        raise NoiseBankError(f"{command}: {len(op)} unclosed D8 attempt(s) beside the D5 ledger {ledger}: {desc}. An "
+                             "interrupted run's CPU is not yet charged (A_design_v5 2.11): `noisebank.py d8-reconcile "
+                             f"--ledger {ledger}` first (refused)")
+    return t
+
+
+def _boot_id():
+    try:
+        with open("/proc/sys/kernel/random/boot_id") as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
+
+
+def _proc_stat(pid):
+    """(state, start time in clock ticks since boot) of a process from /proc/<pid>/stat, or None."""
+    try:
+        with open(f"/proc/{int(pid)}/stat") as f:
+            rest = f.read().rsplit(")", 1)[1].split()
+        return rest[0], int(rest[19])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _attempt_alive(o):
+    """Whether an attempt's recorded process still runs (then it is not interrupted and is never reconciled): checked
+    on its own host only (another host is refused: reconcile it there), within the same boot (/proc boot_id), as the
+    pid with the recorded start time (a reused pid or a zombie is not it); without /proc, os.kill(pid, 0)."""
+    import platform
+    if o.get("host") != platform.node():
+        raise NoiseBankError(f"attempt {o.get('attempt')}: recorded on host {o.get('host')!r}, not "
+                             f"{platform.node()!r}: its process cannot be checked here; reconcile it on that host "
+                             "(refused)")
+    boot = _boot_id()
+    if boot is not None and o.get("boot_id") is not None and o["boot_id"] != boot:
+        return False
+    st = _proc_stat(o["pid"])
+    if st is not None:
+        return st[0] != "Z" and (o.get("start_ticks") is None or st[1] == o["start_ticks"])
+    if boot is not None:
+        return False
+    try:
+        os.kill(int(o["pid"]), 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _charge_once(ledger, entry):
+    """The attempt's one ledger entry, appended unless an entry with its attempt id is already in the ledger (the
+    idempotence of finalization and reconciliation) -> whether it was appended."""
+    if any(e.get("attempt") == entry["attempt"] for e in ledger_entries(ledger)):
+        return False
+    ledger_add(ledger, entry)
+    return True
+
+
+def reconcile_attempts(ledger):
+    """`noisebank.py d8-reconcile` (v5 2.11: interrupted runs are charged): every unclosed attempt beside the ledger
+    whose process is gone (a SIGKILL, an OOM kill, a reboot) is charged ONCE, its last durable cpu_s plus
+    RECONCILE_MARGIN_S (60 s, conservative: durable refreshes are < 60 CPU-s apart), as a normal ledger_add-format entry
+    of kind INTERRUPTED_KIND carrying its attempt id, and closed. Idempotent: an attempt whose id is already in the
+    ledger (its finalization stopped between the ledger append and the close) is closed without a second charge. A
+    still running attempt refuses the whole reconciliation. -> [{attempt, kind, charged_cpu_s (None: already charged),
+    charged_by}]"""
+    led = ledger_entries(ledger)
+    op = open_attempts(ledger)
+    for aid, a in op.items():
+        if _attempt_alive(a["open"]):
+            raise NoiseBankError(f"d8-reconcile: attempt {aid} (pid {a['open']['pid']} on {a['open']['host']}) is "
+                                 "still running: it is not interrupted, and nothing is reconciled (refused)")
+    out = []
+    for aid, a in op.items():
+        o = a["open"]
+        prior = next((e for e in led if e.get("attempt") == aid), None)
+        if prior is None:
+            entry = {"kind": INTERRUPTED_KIND, "status": "interrupted", "attempt": aid, "attempt_kind": o["kind"],
+                     "command": o["command"], "utc_start": o["utc_start"], "cpu_s": a["cpu_s"] + RECONCILE_MARGIN_S,
+                     "cpu_s_durable": a["cpu_s"], "margin_s": RECONCILE_MARGIN_S}
+            if not _charge_once(ledger, entry):
+                raise NoiseBankError(f"d8-reconcile: attempt {aid} was charged while reconciling (refused)")
+            charged, by, cpu = entry["cpu_s"], "reconcile", entry["cpu_s"]
+        else:
+            charged, by, cpu = None, "finalize (already in the D5 ledger)", float(prior["cpu_s"])
+        _attempt_append(ledger, {"event": "close", "attempt": aid, "cpu_s": cpu, "charged_by": by,
+                                 "status": "interrupted" if prior is None else prior.get("status"),
+                                 "utc": rqlib.now_utc()})
+        out.append({"attempt": aid, "kind": o["kind"], "charged_cpu_s": charged, "charged_by": by})
+    return out
 
 
 def d8_receipt(argv, fit, impl, utc_start, utc_end, cpu_s, entry):
@@ -2766,14 +3046,19 @@ def _bank_result(rec):
     return {"status": rec.get("status"), "curves": curves, "theta": th}
 
 
-def validate_d8(spec, design_path, bindings=None, m=Z_INTERVALS, structure=None, R=None):
+def validate_d8(spec, design_path, bindings=None, m=Z_INTERVALS, structure=None, R=None, progress=None):
     """`noisebank.py validate-d8` (A_design_v5 2.10): the prospective parameter-recovery study of the capped estimator
     on synthetic banks at the registered size, from the witnessed spec (which must be exactly d8_validation_spec of
     the bound design, round included). Per bank: draw (d8_validation_bank), fit the 5k horizon as estimate_d8 does
-    (the bootstrap from the bank's own `bootstrap` purpose), record what V1-V3 read; V4 refits the first two banks'
-    marginals and s(mu) under the legacy uncapped map; V5 draws and fits the M = 0 bank. -> the report (no ledger or
-    timing fields: the CLI adds them). structure / R: test hooks only (never on the command line)."""
+    with boot = 1 on the bank's own bootstrap stream (clarification 3 E1: purpose `bootstrap`, validation fits only,
+    text AnnexH/D8/1/noisebank/D8-validation/{bank}/bootstrap with the complete bank key, a rerun suffix included,
+    recorded with its seed and first two outputs; never the refit's D8-refit streams), record what V1-V3 read (V1-V5
+    take nothing from the bootstrap results); V4 refits the first two banks' marginals and s(mu) under the legacy
+    uncapped map; V5 draws and fits the M = 0 bank. -> the report (no ledger or timing fields: the CLI adds them).
+    structure / R: test hooks only (never on the command line); progress(label): called after each bank (the
+    attempt's durable refresh)."""
     import obslaw
+    step = progress or (lambda label: None)
     b = d8_bindings() if bindings is None else dict(bindings)
     design_raw = _bound_bytes(design_path, b["design_file_sha256"], "design")
     rnd = spec.get("round") if isinstance(spec, dict) else None
@@ -2806,8 +3091,10 @@ def validate_d8(spec, design_path, bindings=None, m=Z_INTERVALS, structure=None,
                 okc = UL[ch]["ok"]
                 cv = fit_scale(UL[ch]["mu"][okc], UL[ch]["sigma"][okc] ** 2)
                 legacy[bank][ch] = _v3_stats(UL[ch]["mu"][okc], cv, true_curves[ch], spec)
+        step(f"validate-d8: {bank}")
     vb = spec["streams"]["v5_bank"]
     _, v5rec = fitted(vb, 0)
+    step(f"validate-d8: {vb} (V5)")
     crit = d8_validation_criteria(spec, banks, legacy, v5rec)
     return {"schema": D8_REPORT_SCHEMA, "spec_sha256": rqlib.canonical_sha(spec),
             "design_file_sha256": rqlib.sha256_bytes(design_raw), "synthetic_banks": True,
@@ -2845,79 +3132,157 @@ def assemble_generator(bank_path, mean, allow_synthetic=False):
     return out
 
 
-class _Charge:
-    """One D8 run's charge to the cumulative D5 ledger (v5 2.11): appended exactly once, failed and interrupted runs
-    too (an exception leaves the entry "failed", an interrupt "interrupted")."""
+class _Attempt:
+    """One D8 run as an attempt, and its D5 charge (v5 2.11: failed and interrupted runs are charged; the
+    coordinator's accounting plumbing, brief_WP3_r2 P2-2). BEFORE any substantial work, an in-progress record
+    (attempt id, kind, command, UTC start, pid, host, boot id, process start ticks) is written durably to the attempts
+    file beside the ledger (attempts_path), never to the shared ledger. While the run works, the attempt's cumulative
+    cpu_s is refreshed durably at each major step (step) and by a background thread whenever ATTEMPT_REFRESH_CPU_S of
+    CPU has passed (polled every ATTEMPT_POLL_S), so the durable value lags the true CPU by less than 60 s. Finalization
+    (charge) appends exactly one ledger_add-format entry carrying the attempt id (idempotent: never twice for one id);
+    leaving the block closes the attempt. An exception after measure("ok") still charges "failed" ("interrupted" for
+    KeyboardInterrupt, i.e. SIGTERM through _d8_main), never the measured "ok"; an exception AFTER the charge (the
+    artifact write of estimate-d8) leaves the one entry and closes the attempt "failed" (its ledger_status kept). A
+    hard kill (SIGKILL, OOM, a reboot) leaves the attempt open: every budget-dependent command refuses
+    (_budget_check) until reconcile_attempts charges it. refresher=False: no thread (tests drive tick())."""
 
-    def __init__(self, ledger, kind, command):
-        self.ledger, self.c0, self.done = ledger, _cpu_s(), False
-        self.entry = {"kind": kind, "command": command, "status": "failed"}
+    def __init__(self, ledger, kind, command, refresher=True):
+        import platform
+        import threading
+        self.ledger, self.id, self.c0 = ledger, uuid.uuid4().hex, _cpu_s()
+        self.entry = {"kind": kind, "command": command, "status": "failed", "attempt": self.id}
+        self.charged = self.closed = False
+        self.error, self._last = None, 0.0
+        self._lock, self._stop, self._thread = threading.Lock(), threading.Event(), None
+        st = _proc_stat(os.getpid())
+        _attempt_append(ledger, {"event": "open", "attempt": self.id, "kind": kind, "command": command,
+                                 "utc_start": rqlib.now_utc(), "pid": os.getpid(), "host": platform.node(),
+                                 "boot_id": _boot_id(), "start_ticks": None if st is None else st[1], "cpu_s": 0.0,
+                                 "utc": rqlib.now_utc()})
+        if refresher:
+            self._thread = threading.Thread(target=self._run, name=f"d8-attempt-{self.id[:8]}", daemon=True)
+            self._thread.start()
 
     def __enter__(self):
         return self
 
+    def cpu(self):
+        return _cpu_s() - self.c0
+
+    def step(self, label):
+        """A major step: the attempt's cumulative cpu_s refreshed durably now."""
+        self._refresh(str(label))
+
+    def tick(self):
+        """The refresher's poll: a durable refresh once ATTEMPT_REFRESH_CPU_S of CPU has passed since the last one."""
+        if self.cpu() - self._last >= ATTEMPT_REFRESH_CPU_S:
+            self._refresh(None)
+
+    def _refresh(self, label):
+        with self._lock:
+            if self.charged or self.closed:
+                return
+            c = self.cpu()
+            rec = {"event": "progress", "attempt": self.id, "cpu_s": c, "utc": rqlib.now_utc()}
+            if label:
+                rec["step"] = label
+            _attempt_append(self.ledger, rec)
+            self._last = c
+
+    def _run(self):
+        import _thread
+        while not self._stop.wait(ATTEMPT_POLL_S):
+            try:
+                self.tick()
+            except BaseException as e:          # (no durable refresh possible: the run is interrupted and charged)
+                self.error = f"{type(e).__name__}: {e}"
+                _thread.interrupt_main()
+                return
+
+    def _halt(self):
+        self._stop.set()
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join()
+
     def measure(self, status):
-        self.entry.update(status=status, cpu_s=_cpu_s() - self.c0)
-        return self.entry
+        """The entry with this status and the CPU so far (what the receipt / report records) -> a copy."""
+        self.entry.update(status=status, cpu_s=self.cpu())
+        return dict(self.entry)
 
     def charge(self):
-        if not self.done:
-            self.entry.setdefault("cpu_s", _cpu_s() - self.c0)
-            ledger_add(self.ledger, self.entry)
-            self.done = True
+        """Finalization: the one ledger entry of this attempt (once)."""
+        if not self.charged:
+            self._halt()
+            self.entry.setdefault("cpu_s", self.cpu())
+            _charge_once(self.ledger, self.entry)
+            self.charged = True
 
     def __exit__(self, et, ev, tb):
-        if not self.done:
-            if et is not None and issubclass(et, KeyboardInterrupt):
-                self.entry["status"] = "interrupted"
-            self.entry["cpu_s"] = _cpu_s() - self.c0
+        self._halt()
+        final = self.entry["status"] if et is None else (
+            "interrupted" if issubclass(et, KeyboardInterrupt) else "failed")
+        if not self.charged:
+            if et is not None:                  # (also after measure("ok"): a late failure is charged as one)
+                self.entry.update(status=final, cpu_s=self.cpu())
+                if self.error:
+                    self.entry["refresh_error"] = self.error
             self.charge()
+        with self._lock:
+            if (attempts_state(self.ledger).get(self.id) or {}).get("close") is None:   # (unless reconciled)
+                _attempt_append(self.ledger, {"event": "close", "attempt": self.id, "status": final,
+                                              "ledger_status": self.entry["status"], "cpu_s": self.entry["cpu_s"],
+                                              "charged_by": "finalize", "utc": rqlib.now_utc()})
+            self.closed = True
         return False
 
 
 def run_provenance(study, design, plan, obs, manifest, out, ledger, bindings=None):
-    """`provenance` with its D5 charge: the starting guard first (>= D8_START_GUARD_H CPU-h remaining, v5 2.11 / 7;
-    refused before any work), then the receipt written durably -> the receipt."""
-    before = ledger_total([ledger])
+    """`provenance` with its D5 charge: first the budget check (the existing, valid ledger; no unclosed attempt) and
+    the starting guard (>= D8_START_GUARD_H CPU-h remaining, v5 2.11 / 7), refused before any work; then the attempt
+    record (durable), the work, the receipt written durably, the charge -> the receipt."""
+    before = _budget_check(ledger, "provenance")
     if before["remaining_h"] < D8_START_GUARD_H:
         raise NoiseBankError(f"{before['remaining_h']:.2f} CPU-h remain on the D5 ledger, below the starting guard "
                              f"{D8_START_GUARD_H} (A_design_v5 2.11, 7): refused")
-    with _Charge(ledger, "D8-noisebank-provenance", "provenance") as ch:
-        rec = provenance(study, design, plan, obs, manifest, bindings)
+    with _Attempt(ledger, "D8-noisebank-provenance", "provenance") as att:
+        rec = provenance(study, design, plan, obs, manifest, bindings, progress=att.step)
         rqlib.write_json_durable(out, rec)
-        ch.measure("ok")
-        ch.charge()
+        att.measure("ok")
+        att.charge()
     return rec
 
 
 def run_estimate_d8(obs, ages, design, plan, prov, validation, out, receipt, ledger, argv, bindings=None, boot=BOOT,
                     m=Z_INTERVALS):
-    """`estimate-d8` with its receipt and D5 charge (v5 2.8 L755-757): the refit, then the receipt (with the ledger
-    entry) written durably FIRST, the entry appended to the ledger, then the artifact that binds the receipt's
-    sha256 -> the artifact."""
+    """`estimate-d8` with its receipt and D5 charge (v5 2.8 L755-757, 2.11): the budget check and the attempt record
+    before the work; the refit; the receipt (with the ledger entry) written durably FIRST; that entry appended to the
+    ledger (once, by attempt id); then the artifact that binds the receipt's sha256 (so every artifact's receipt
+    entry is in the ledger) -> the artifact. A receipt write failure is charged "failed", never the measured "ok"."""
+    _budget_check(ledger, "estimate-d8")
     start = rqlib.now_utc()
-    with _Charge(ledger, "D8-noisebank-refit", "estimate-d8") as ch:
-        fit = estimate_d8(obs, ages, design, plan, prov, validation, bindings, boot, m)
+    with _Attempt(ledger, "D8-noisebank-refit", "estimate-d8") as att:
+        fit = estimate_d8(obs, ages, design, plan, prov, validation, bindings, boot, m, progress=att.step)
         impl = d8_implementation()
-        entry = ch.measure("ok")
+        entry = att.measure("ok")
         rqlib.write_json_durable(receipt, d8_receipt(argv, fit, impl, start, rqlib.now_utc(), entry["cpu_s"], entry))
-        ch.charge()
+        att.charge()
         art = d8_artifact(fit, rqlib.sha256_file(receipt))
         rqlib.write_json_durable(out, art)
     return art
 
 
 def run_validate_d8(spec, design, out, ledger, bindings=None, **hooks):
-    """`validate-d8` with its D5 charge: the report carries the ledger before the run and this run's entry (the
-    after-validation check of v5 2.11 re-projects from them) -> the report."""
-    before = ledger_total([ledger])
+    """`validate-d8` with its D5 charge: the budget check and the attempt record before the work; the report carries
+    the ledger before the run and this run's entry (the after-validation check of v5 2.11 re-projects from them); a
+    report write failure is charged "failed" -> the report."""
+    before = _budget_check(ledger, "validate-d8")
     start = rqlib.now_utc()
-    with _Charge(ledger, "D8-noisebank-validation", "validate-d8") as ch:
-        rep = validate_d8(rqlib.read_json(spec), design, bindings, **hooks)
-        entry = ch.measure("ok")
+    with _Attempt(ledger, "D8-noisebank-validation", "validate-d8") as att:
+        rep = validate_d8(rqlib.read_json(spec), design, bindings, progress=att.step, **hooks)
+        entry = att.measure("ok")
         rep.update(ledger_before=before, ledger_entry=dict(entry), utc_start=start, utc_end=rqlib.now_utc())
         rqlib.write_json_durable(out, rep)
-        ch.charge()
+        att.charge()
     return rep
 
 
@@ -2934,7 +3299,10 @@ def _d8_main(a, argv):
         return 0
     t = ledger_total([a.ledger])
     print(f"D5 ledger before {a.cmd}: {t['cpu_h']:.3f} CPU-h charged, {t['remaining_h']:.3f} remaining")
-    if a.cmd == "provenance":
+    if a.cmd == "d8-reconcile":
+        print(json.dumps({"reconciled": reconcile_attempts(a.ledger)}, sort_keys=True))
+        code = 0
+    elif a.cmd == "provenance":
         rec = run_provenance(a.study, a.design, a.plan, a.obs, a.manifest, a.out, a.ledger)
         print(json.dumps({k: rec[k] for k in ("cells", "engine_sha256", "manifest", "store")}, sort_keys=True))
         code = 0
@@ -3078,6 +3446,9 @@ def main(argv=None):
     s.add_argument("--design", required=True)
     s.add_argument("--out", required=True)
     s.add_argument("--ledger", required=True, help="the cumulative D5 CPU ledger (charged, failed runs too)")
+    s = sub.add_parser("d8-reconcile", help="charge every unclosed (hard-interrupted) D8 attempt beside the ledger its "
+                       "last durable CPU + 60 s, once, and close it (A_design_v5 2.11)")
+    s.add_argument("--ledger", required=True, help="the cumulative D5 CPU ledger")
     a = ap.parse_args(argv)
     if a.cmd in D8_COMMANDS:
         try:
