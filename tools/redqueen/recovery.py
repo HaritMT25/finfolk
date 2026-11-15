@@ -32,10 +32,12 @@ OBSERVATION MODES (Red Queen recovery option A, A_design_v5.md sections 1, 3.1-3
       otherwise (numerical fits): never the scenario settings or another truth-only field (v5 1.8). Every result
       records noise_source "bank_d8", accepting, observation_model_sha256, noiseless and the observations' hashes
       (observation_hashes; a noiseless dataset's absent counts are the explicit record {"absent": "noiseless"}).
-  obs-tables builds and verifies the location tables and the fitter table once (v5 1.7, 1.7b); pairing refuses
-  directories whose shared (scenario, rep) observations differ (v5 3.6); packet evaluates the acceptance packet
-  from a frozen schedule (v5 3.8: --mode acceptance refuses an incomplete schedule or a synthetic bank before any
-  check; --mode diagnostic evaluates what is scheduled and can never report acceptance).
+  obs-tables builds and verifies the location tables and the fitter table once (v5 1.7, 1.7b) and publishes them
+  with no replacement; pairing refuses a directory that is not bank mode (before reading any result) and directories
+  whose shared (scenario, rep) observations differ (v5 3.6, 3.7); packet evaluates the acceptance packet from a frozen
+  schedule (v5 3.8; the schedule document of clarification 4 F1: --mode acceptance refuses, before any check, an
+  incomplete schedule, directories whose bound settings do not satisfy CRITERION C2's matrix, or a synthetic bank;
+  --mode diagnostic evaluates what is scheduled and can never report acceptance).
 
 Needs numpy (RQ_PYLIB, when set, is put on sys.path first: an unpacked wheel on a host without pip).
 `run` starts `one` jobs as subprocesses (never multiprocessing), each with one BLAS thread, and
@@ -1755,11 +1757,33 @@ def bench(a):
 
 
 # ------------------------------------------------------------------ bank mode's commands (A_design_v5 3.2, 3.6, 3.8)
+def _publish_new(tmp, path):
+    """Publish the fsync'd private file tmp at path WITHOUT REPLACEMENT (Codex WP4 P2-WP4-4): os.link fails if any
+    file is at path, so a command that loses a race to another publisher refuses and the winner's bytes stay intact;
+    the directory is fsync'd after the link. The caller removes its own tmp."""
+    try:
+        os.link(tmp, path)
+    except FileExistsError:
+        try:
+            same = rqlib.read_bytes(path) == rqlib.read_bytes(tmp)
+        except OSError:
+            same = None
+        raise SystemExit(f"obs-tables: {path} was published by another command while these tables were built ("
+                         f"{'the same' if same else 'other' if same is False else 'unreadable'} bytes): refused, the "
+                         "existing file is left intact (a published table file is never replaced)")
+    rqlib.fsync_dir(os.path.dirname(os.path.abspath(path)))
+
+
 def obs_tables(a):
     """`obs-tables` (A_design_v5 1.7, 1.7b, 7 step 7): from a validated bank/3 artifact, the location tables of every
     channel at every noise multiplier and the fitter table (obslaw.build_obs_tables: built once, before the freeze;
-    workers only load them), written to --out (never over an existing file), then verified by loading them back
-    through the model with both file hashes configured -> prints the identity and the certification records."""
+    workers only load them). The completed bytes are written to a private temporary file beside --out and fsync'd,
+    verified there by loading them through the model with both file hashes configured, and only then published at
+    --out with no replacement (_publish_new: an existing --out, including one another command published meanwhile,
+    is never overwritten, and that command's bytes are left intact; only this command's own temporary file is
+    removed) -> prints the identity and the certification records."""
+    import uuid
+
     import obslaw
     try:
         gammas = sorted({float(x) for x in a.noise_scales.split(",")})
@@ -1767,20 +1791,32 @@ def obs_tables(a):
         raise SystemExit(f"--noise-scales {a.noise_scales}: a comma list of numbers")
     if not gammas or any(not (math.isfinite(g) and g > 0) for g in gammas):
         raise SystemExit(f"--noise-scales {a.noise_scales}: positive finite noise multipliers")
-    if os.path.exists(a.out):
+    if os.path.lexists(a.out):
         raise SystemExit(f"{a.out} exists: refusing to overwrite (the tables are built once, before the freeze)")
     try:
         bank = obslaw.BankArtifact(a.bank, allow_synthetic=a.allow_synthetic_bank)
-        tables = obslaw.build_obs_tables(bank, gammas)
-        sha = tables.save(a.out)
+        raw = obslaw.build_obs_tables(bank, gammas).to_bytes()
     except (ValueError, OSError) as e:
         raise SystemExit(f"obs-tables: {e} (refused; nothing written)")
+    sha = rqlib.sha256_bytes(raw)
+    tmp = f"{os.path.abspath(a.out)}.tmp.{os.getpid()}.{uuid.uuid4().hex[:16]}"
+    made = False
     try:
-        obs = obslaw.BankObservationModel(a.bank, a.out, bank_sha256=bank.sha256, tables_sha256=sha, gammas=gammas,
-                                          allow_synthetic_bank=a.allow_synthetic_bank)
-    except (ValueError, OSError) as e:
-        os.remove(a.out)
-        raise SystemExit(f"obs-tables: the written tables do not load back ({e}): removed, refused")
+        try:
+            with open(tmp, "xb") as f:
+                made = True
+                f.write(raw)
+                f.flush()
+                os.fsync(f.fileno())
+            obs = obslaw.BankObservationModel(a.bank, tmp, bank_sha256=bank.sha256, tables_sha256=sha, gammas=gammas,
+                                              allow_synthetic_bank=a.allow_synthetic_bank)
+        except (ValueError, OSError) as e:
+            raise SystemExit(f"obs-tables: the built tables do not write or load back ({e}): refused, nothing "
+                             "published")
+        _publish_new(tmp, a.out)
+    finally:
+        if made:
+            os.unlink(tmp)
     rep = {"obs_tables_sha256": sha, "obs_tables_content_sha256": obs.tables.stored_content_sha256,
            "bank_artifact_sha256": bank.sha256, "noise_scales": gammas, "accepting": obs.accepting,
            "location": [{"channel": ch, "gamma": g, "nodes": int(len(t.x)), "h": t.identity["h"], "record": t.record}
@@ -1820,16 +1856,47 @@ def _extra_results(d):
     return [(f"{d}/results/{n}", r["scenario"], r["rep"], r) for n, r in sorted(X.read_results(d, plan).items())]
 
 
+def _bank_directory(d):
+    """pairing's input rule (A_design_v5 3.6, 3.7; Codex WP4 P2-WP4-5): a directory's configuration (legacy:
+    config.json's observation_model) or frozen plan (extra: plan.json) must be bank mode, checked BEFORE any result
+    is read, so a planning directory is refused whether or not it holds results -> its kind; SystemExit naming the
+    directory otherwise (an unreadable configuration or plan included)."""
+    kind = _dir_kind(d)
+    try:
+        if kind == "legacy":
+            cfg = rqlib.read_json(os.path.join(d, "config.json"))
+            om = cfg.get("observation_model") if isinstance(cfg, dict) else None
+            src = om.get("noise_source") if isinstance(om, dict) else None
+            bank = isinstance(om, dict) and om.get("mode") == "bank" and src == NOISE_SOURCE["bank"]
+        else:
+            import recovery_extra as X
+            src = X.read_frozen(d).get("noise_source")
+            bank = src == NOISE_SOURCE["bank"]
+    except (OSError, ValueError) as e:
+        raise SystemExit(f"pairing: {d}: its {'configuration' if kind == 'legacy' else 'frozen plan'} cannot be read "
+                         f"({e}): refused")
+    if not bank:
+        raise SystemExit(f"pairing: {d} is not a bank-mode {'run directory' if kind == 'legacy' else 'plan'} "
+                         f"(noise_source {src!r}): planning input is refused (A_design_v5 3.7), with or without "
+                         "results")
+    return kind
+
+
 def pairing(dirs):
     """`pairing` (A_design_v5 3.6): every (scenario, rep) present in two or more results of the given directories
     (legacy run directories and recovery_extra directories, every case of the latter) must carry identical
-    observations hashes; a planning-mode result is refused (v5 3.7), and so is any mismatch (SystemExit naming both
-    results) -> {directories, datasets, comparisons}."""
+    observations hashes; a directory whose configuration or plan is not bank mode is refused before any of its
+    results is read (v5 3.7: an empty or zero-rep planning directory too), so is a planning-mode result, and so is any
+    mismatch (SystemExit naming both results) -> {directories, datasets, comparisons}."""
     if not dirs:
         raise SystemExit("pairing: no directories")
+    kinds = [_bank_directory(d) for d in dirs]
     seen, compared = {}, 0
-    for d in dirs:
-        rows = _legacy_results(d) if _dir_kind(d) == "legacy" else _extra_results(d)
+    for d, kind in zip(dirs, kinds):
+        try:
+            rows = _legacy_results(d) if kind == "legacy" else _extra_results(d)
+        except (OSError, ValueError) as e:
+            raise SystemExit(f"pairing: {d}: a result cannot be read ({e}): refused")
         for where, sc, rep, r in rows:
             if r.get("noise_source") != NOISE_SOURCE["bank"]:
                 raise SystemExit(f"pairing: {where} is not a bank-mode result (noise_source {r.get('noise_source')!r}):"
@@ -1848,18 +1915,30 @@ def pairing(dirs):
     return {"directories": list(dirs), "datasets": len(seen), "comparisons": compared, "result": "paired"}
 
 
-# PROPOSED READINGS (WP4 stops, for the coordinator; A_design_v5 3.8 fixes the per-directory fields, not these):
-#  (S1) the schedule document: {schema, observation_model_sha256 (the one model every result must carry), inputs:
-#       {graph, references | null, bank, obs_tables} (what the read-only prepare_run / verified logic re-derives
-#       from), directories: [{dir, kind, role, scenarios, reps (a count: reps 0..reps-1), options, cases (extra),
-#       expected_config_sha256 | expected_plan_sha256}]}, paths relative to the schedule file;
-#  (S2) acceptance completeness against C2_MATRIX below, encoded from CRITERION C2-C4 (rec_C_v2, unchanged by v5 6.1
-#       but for the namespace), each sensitivity variant a directory of its own (the variant itself is bound by the
-#       expected configuration sha256, not checked here); every acceptance directory in namespace A_NAMESPACE;
-#  (S3) the guards check (_guards): summarize must succeed on every directory, and no option record or branch decides
-#       or succeeds with fewer than MIN_TEST_ROOTS contributing roots, on an unresolved comparison, or while
-#       unavailable ("root guards", CRITERION C4 / C6).
+# The schedule document is A_design_v5 clarification 4 F1's (ac21be55..., WP4 stop S1): ONE JSON object with exactly
+# {schema, observation_model_sha256 (the one model every configuration, plan and result carries), inputs: exactly
+# {graph, references (a path or null), bank, obs_tables} (what the read-only prepare_run / verified logic re-derives
+# from), directories: a non-empty list of entries with exactly v5 3.8's fields}, reps a positive count (reps
+# 0..reps-1), every path resolving relative to the schedule file's directory (an absolute path, which would not, is
+# refused). Acceptance completeness (WP4 stop S2, ruled by Codex and clarification 4) is the frozen C2 matrix of
+# CRITERION C2-C4 (rec_C_v2 b8a3323e..., unchanged by v5 6.1 but for the namespace): its roles and blocks
+# (schedule_gaps), AND every scheduled directory's bound settings (bound_settings_gaps: C2's registered settings for
+# every noisy fit, exactly one directory per sensitivity variant); every acceptance directory in namespace A_NAMESPACE
+# (identity). The guards check (stop S3; _guard_violations) checks availability and unresolved-state consistency of
+# every decision, branch and primary selection, successful or not, and the root guards (CRITERION C1, C4, C6).
+# PROPOSED READINGS (WP4 round-2 stops, for the coordinator: CRITERION C2-C4 do not fix these settings):
+#  (S5) the numerical role: C2 fixes only "the source's own fixed true-rank continuation (.3,.1,.03,.01)", which is
+#       the registered map's REG_CONTINUATION (the minimal fitter continues to .001), so fitter "registered" is
+#       decided; its basis / embedding / center (C2's "default basis6/shared/references" follows the noisy-fit
+#       sentence) and its ranks / lambdas / iters / start (unread by a numerical fit) are read here as the registered
+#       defaults, the same settings as every noisy role (NUMERICAL_SETTINGS);
+#  (S6) the extra roles (extra-interp, -fwd_all, -fwd_early, -attrition): their fits are noisy fits, so C2's "All
+#       noisy fits use ranks 0..4, lambdas .01,.02,.05,.2, 30 sweeps, both starts; default basis6/shared/references"
+#       is read as fixing each frozen plan's fit (recovery_extra.py's own summarize applies its criterion to exactly
+#       this fit), with recovery_extra's registered map (plan.legacy_config's fitter) and no A/B cap.
 SCHEDULE_SCHEMA = "finfolk.redqueen.recoveryschedule/1"
+SCHEDULE_KEYS = ("schema", "observation_model_sha256", "inputs", "directories")     # (clarification 4 F1)
+SCHEDULE_INPUTS = ("graph", "references", "bank", "obs_tables")
 PACKET_SCHEMA = "finfolk.redqueen.recoverypacket/1"
 SCHEDULE_ROLES = ("C1-primary", "stress", "numerical", "sensitivity",
                   "extra-interp", "extra-fwd_all", "extra-fwd_early", "extra-attrition")     # (A_design_v5 3.8)
@@ -1889,6 +1968,15 @@ C2_MATRIX = {
 NUMERICAL_FWD = {"procedure": "forward", "available": False,
                  "reason": "the forward-time procedure is not defined for a noiseless scenario"}
 ACCEPTED_TEXT = "UNRESOLVED (review required, D8:327)"
+# CRITERION C2's settings for every noisy fit ("All noisy fits use ranks 0..4, lambdas .01,.02,.05,.2, 30 sweeps,
+# both starts; default basis6/shared/references"), the registered map (the minimal fitter never satisfies a role),
+# and C2's four sensitivity variants, each exactly ONE change of the default surface. (v5 3.8; clarification 4)
+REGISTERED_FIT = {"fitter": "registered", "ranks": 4, "lambdas": FITTER_DEFAULTS["registered"]["lambdas"],
+                  "iters": 30, "start": "both", "ab_cap": -1}
+DEFAULT_SURFACE = {"basis": 6, "embedding": "shared", "center": "references"}
+SENSITIVITY_VARIANTS = {"basis4": {"basis": 4}, "basis8": {"basis": 8}, "separate": {"embedding": "separate"},
+                        "train_c": {"center": "train_c"}}
+NUMERICAL_SETTINGS = dict(REGISTERED_FIT, **DEFAULT_SURFACE)   # (PROPOSED READING S5 beyond fitter "registered")
 
 
 class Refused(Exception):
@@ -1899,33 +1987,60 @@ def _items(e):
     return {(c, s, r) for c in (e.get("cases") or (None,)) for s in e["scenarios"] for r in range(e["reps"])}
 
 
+def _schedule_path(p, base, where):
+    """A schedule path (clarification 4 F1: resolved relative to the schedule file's directory) -> its absolute
+    normalized path; an empty, non-string or absolute path is refused (an absolute one would not resolve relative to
+    the schedule's directory)."""
+    if not isinstance(p, str) or not p:
+        raise Refused(f"{where}: a non-empty path relative to the schedule file's directory")
+    if os.path.isabs(p):
+        raise Refused(f"{where}: {p!r} is absolute; every schedule path resolves relative to the schedule file's "
+                      "directory (clarification 4 F1)")
+    return os.path.normpath(os.path.join(base, p))
+
+
+def _exact_keys(d, keys, where):
+    """d must hold exactly keys (clarification 4 F1) -> None, or Refused naming the extra and missing keys."""
+    extra, missing = sorted(set(d) - set(keys)), sorted(set(keys) - set(d))
+    if extra or missing:
+        raise Refused(f"{where} must hold exactly {sorted(keys)} (clarification 4 F1): extra {extra}, missing "
+                      f"{missing}")
+
+
 def _schedule_entries(sched, base):
-    """The schedule's structure (both modes) -> [entries with an absolute 'path'], or Refused naming the defect."""
+    """The schedule's structure (both modes; clarification 4 F1: exactly its keys, inputs and per-directory fields,
+    reps a positive integer, every path relative to the schedule file's directory) -> [entries with an absolute
+    'path'], or Refused naming the defect. Types are checked before any membership test (Codex WP4 P3-WP4-6)."""
     if not isinstance(sched, dict) or sched.get("schema") != SCHEDULE_SCHEMA:
         raise Refused(f"the schedule is not a {SCHEDULE_SCHEMA} document")
-    if not rqlib.is_sha256(sched.get("observation_model_sha256")):
+    _exact_keys(sched, SCHEDULE_KEYS, "the schedule")
+    if not rqlib.is_sha256(sched["observation_model_sha256"]):
         raise Refused("the schedule must bind observation_model_sha256 (64 hex)")
-    inp = sched.get("inputs")
-    if not isinstance(inp, dict) or set(inp) != {"graph", "references", "bank", "obs_tables"} or \
-            not all(isinstance(inp[k], str) and inp[k] for k in ("graph", "bank", "obs_tables")) or \
-            not (inp["references"] is None or isinstance(inp["references"], str) and inp["references"]):
-        raise Refused("the schedule's inputs must be exactly {graph, references (or null), bank, obs_tables}")
-    ds = sched.get("directories")
+    inp = sched["inputs"]
+    if not isinstance(inp, dict):
+        raise Refused("the schedule's inputs must be an object")
+    _exact_keys(inp, SCHEDULE_INPUTS, "the schedule's inputs")
+    for k in SCHEDULE_INPUTS:
+        if not (k == "references" and inp[k] is None):
+            _schedule_path(inp[k], base, f"inputs.{k}")
+    ds = sched["directories"]
     if not isinstance(ds, list) or not ds:
         raise Refused("the schedule names no directory (a packet needs a non-empty schedule)")
     out, paths = [], set()
     for i, e in enumerate(ds):
         where = f"directories[{i}]"
-        if not isinstance(e, dict) or e.get("role") not in SCHEDULE_ROLES:
-            role = e.get("role") if isinstance(e, dict) else e
+        role = e.get("role") if isinstance(e, dict) else e
+        if not isinstance(e, dict) or not isinstance(role, str) or role not in SCHEDULE_ROLES:
             raise Refused(f"{where}: role {role!r} is not one of {SCHEDULE_ROLES}")
         kind = "legacy" if e["role"] in LEGACY_ROLES else "extra"
         keys = {"dir", "kind", "role", "scenarios", "reps", "options"} | (
             {"expected_config_sha256"} if kind == "legacy" else {"cases", "expected_plan_sha256"})
-        if set(e) != keys or e["kind"] != kind:
-            raise Refused(f"{where} ({e['role']}): a {kind} directory with exactly {sorted(keys)}")
+        _exact_keys(e, keys, f"{where} ({e['role']}, a {kind} directory)")
+        if e["kind"] != kind:
+            raise Refused(f"{where} ({e['role']}): kind {e['kind']!r}, not {kind!r}")
         sc, opts = e["scenarios"], e["options"]
-        if not (isinstance(sc, list) and sc and all(s in SCENARIOS for s in sc) and len(set(sc)) == len(sc)):
+        if not (isinstance(sc, list) and sc and all(isinstance(s, str) and s in SCENARIOS for s in sc)
+                and len(set(sc)) == len(sc)):
             raise Refused(f"{where}: scenarios must be distinct registered scenarios")
         if (e["role"] == "numerical") != all(SCENARIOS[s].get("noiseless") for s in sc) or \
                 (e["role"] != "numerical" and any(SCENARIOS[s].get("noiseless") for s in sc)):
@@ -1939,9 +2054,9 @@ def _schedule_entries(sched, base):
                                     all(isinstance(c, str) for c in e["cases"])):
             raise Refused(f"{where}: cases must be a non-empty list of case names")
         sha = e["expected_config_sha256" if kind == "legacy" else "expected_plan_sha256"]
-        if not isinstance(e["dir"], str) or not e["dir"] or not rqlib.is_sha256(sha):
-            raise Refused(f"{where}: dir and its expected sha256 (64 hex)")
-        path = os.path.normpath(os.path.join(base, e["dir"]))
+        if not rqlib.is_sha256(sha):
+            raise Refused(f"{where}: its expected sha256 must be 64 hex")
+        path = _schedule_path(e["dir"], base, f"{where}.dir")
         if path in paths:
             raise Refused(f"{where}: {e['dir']} is scheduled twice")
         paths.add(path)
@@ -1973,6 +2088,66 @@ def schedule_gaps(entries):
             if miss:
                 gaps.append(f"{role}: {len(miss)} scheduled (case, scenario, rep) missing or without options "
                             f"{list(b['options'])}, e.g. {miss[:3]}")
+    return gaps
+
+
+def _same(v, w):
+    return type(v) is type(w) and v == w
+
+
+def _fit_settings(e):
+    """A scheduled directory's fit settings as bound in it: a legacy directory's config.json (fitter, ranks, lambdas,
+    iters, start, ab_cap, basis, embedding, center), or an extra directory's frozen plan (plan.json's fit;
+    recovery_extra fits with its legacy_config's fitter, the registered map, and no A/B cap)."""
+    keys = (*REGISTERED_FIT, *DEFAULT_SURFACE)
+    if e["kind"] == "legacy":
+        cfg = rqlib.read_json(os.path.join(e["path"], "config.json"))
+        if not isinstance(cfg, dict):
+            raise ValueError("config.json is not an object")
+        return {k: cfg.get(k) for k in keys}
+    import recovery_extra as X
+    plan = X.read_frozen(e["path"])
+    fit, lc = plan.get("fit"), plan.get("legacy_config")
+    if not isinstance(fit, dict) or not isinstance(lc, dict):
+        raise ValueError("plan.json has no fit / legacy_config object")
+    return {k: (lc.get(k) if k in ("fitter", "ab_cap") else fit.get(k)) for k in keys}
+
+
+def bound_settings_gaps(entries):
+    """Acceptance mode (CRITERION C2-C4 via A_design_v5 3.8 and clarification 4; Codex WP4 P2-WP4-2), before any check:
+    every scheduled directory's BOUND settings (_fit_settings) satisfy its role -- C1-primary, stress and the extra
+    roles (S6) C2's registered noisy-fit settings with the default surface basis 6 / shared / references; numerical
+    NUMERICAL_SETTINGS (S5); each sensitivity the registered settings with exactly one of the four variants, and
+    exactly one directory per variant -> the list of gaps (empty: none). The expected configuration / plan sha256 is
+    checked in addition (identity, C1): a hash shows which configuration a directory used, not that it satisfies C2."""
+    gaps, variants = [], {name: [] for name in SENSITIVITY_VARIANTS}
+    for e in entries:
+        where = f"{e['dir']} ({e['role']})"
+        try:
+            got = _fit_settings(e)
+        except (SystemExit, OSError, ValueError) as ex:
+            gaps.append(f"{where}: its bound configuration or plan cannot be read ({ex})")
+            continue
+        want = NUMERICAL_SETTINGS if e["role"] == "numerical" else dict(REGISTERED_FIT, **DEFAULT_SURFACE)
+        bad = {k: got[k] for k in REGISTERED_FIT if not _same(got[k], want[k])}
+        if bad:
+            gaps.append(f"{where}: not the registered fit settings ({bad}; C2: the registered map, ranks 0..4, "
+                        "lambdas .01,.02,.05,.2, 30 sweeps, both starts)")
+        surf = {k: got[k] for k in DEFAULT_SURFACE}
+        if e["role"] == "sensitivity":
+            name = next((n for n, ch in SENSITIVITY_VARIANTS.items()
+                         if all(_same(surf[k], v) for k, v in dict(DEFAULT_SURFACE, **ch).items())), None)
+            if name is None:
+                gaps.append(f"{where}: basis / embedding / center {surf} is none of the four sensitivity variants "
+                            f"{sorted(SENSITIVITY_VARIANTS)} (C2: each one change of {DEFAULT_SURFACE})")
+            else:
+                variants[name].append(e["dir"])
+        elif not all(_same(surf[k], v) for k, v in DEFAULT_SURFACE.items()):
+            gaps.append(f"{where}: basis / embedding / center {surf}, not the default {DEFAULT_SURFACE} (C2)")
+    for name, ds in variants.items():
+        if len(ds) != 1:
+            gaps.append(f"sensitivity variant {name}: {len(ds)} directories {ds} (C2: exactly one each of "
+                        f"{sorted(SENSITIVITY_VARIANTS)})")
     return gaps
 
 
@@ -2111,34 +2286,75 @@ def _numerical(entries):
     return {"status": "fail" if bad else "pass", **({"reason": "; ".join(bad)} if bad else {}), "cases": rows}
 
 
+BRANCHES = ("forward_transfer", "intersection", "world_transfer", "interpolation")
+
+
+def _unresolved(x):
+    """An unresolved record as stored -> its count: None / absent 0, a bool 0 / 1, an int itself, a {phase: count}
+    record its sum; anything else 1 (an unreadable unresolved state is never read as resolved)."""
+    if x is None:
+        return 0
+    if isinstance(x, bool):
+        return int(x)
+    if isinstance(x, int):
+        return x
+    if isinstance(x, dict):
+        return sum(_unresolved(v) for v in x.values())
+    return 1
+
+
+def _roots(*xs):
+    return next((x for x in xs if type(x) is int), None)
+
+
 def _guard_violations(o, where):
-    """The registered guards on one option record: no decision or success with fewer than MIN_TEST_ROOTS contributing
-    roots (D6 rule 27; CRITERION C4's root guards), none on an unresolved comparison, no success when unavailable."""
-    v = []
+    """The registered guards on one option record (A_design_v5 3.8 check 5; CRITERION C1, C4, C6; Codex WP4 P2-WP4-3),
+    for the top-level decision, every branch and the primary selection, SUCCESSFUL OR NOT: a success needs an
+    available, decided record; a decision (decision.available / decision_available true) needs an available record;
+    an unresolved selection or comparison is never decided, successful or marked available; no decision or success
+    with fewer than MIN_TEST_ROOTS contributing roots (D6 rule 27). Unavailable records and one-root descriptive
+    scores (available false, no decision) are permitted (C4)."""
     if not isinstance(o, dict):
         return [f"{where}: not a record"]
-    if o.get("available") is False and o.get("success"):
-        v.append(f"{where}: success while unavailable")
-    dec = o.get("decision") if isinstance(o.get("decision"), dict) else {}
-    tw = dec.get("test_worlds")
-    if isinstance(tw, int) and tw < MIN_TEST_ROOTS and (dec.get("available") or o.get("success")):
-        v.append(f"{where}: a decision with {tw} contributing test root(s)")
-    if (dec.get("integration_unresolved") or 0) and (dec.get("available") or o.get("success")):
+    v = []
+    dec = o.get("decision") if isinstance(o.get("decision"), dict) else None
+    decided = (dec is not None and dec.get("available") is True) or o.get("decision_available") is True
+    d0 = dec or {}
+    sel = o.get("selected") if isinstance(o.get("selected"), dict) else {}
+    unres = (_unresolved(d0.get("integration_unresolved")) + _unresolved(d0.get("selection_unresolved"))
+             + _unresolved(sel.get("selection_unresolved")))
+    roots = _roots(d0.get("test_worlds"), o.get("test_roots"), o.get("worlds"))
+    if o.get("success") and (o.get("available") is False or not decided):
+        v.append(f"{where}: success without an available decision")
+    if decided and o.get("available") is False:
+        v.append(f"{where}: a decision while unavailable")
+    if unres and (decided or o.get("success")):
         v.append(f"{where}: an unresolved comparison decided")
-    for b in ("forward_transfer", "intersection", "world_transfer", "interpolation"):
+    if roots is not None and roots < MIN_TEST_ROOTS and (decided or o.get("success")):
+        v.append(f"{where}: a decision with {roots} contributing test root(s)")
+    for b in BRANCHES:
         br = o.get(b)
         if not isinstance(br, dict):
             continue
-        roots = br.get("test_roots", br.get("worlds"))
-        if isinstance(roots, int) and roots < MIN_TEST_ROOTS and (br.get("success") or br.get("decision_available")):
-            v.append(f"{where}.{b}: a decision with {roots} contributing root(s)")
-        if br.get("integration_unresolved") and br.get("success"):
-            v.append(f"{where}.{b}: an unresolved comparison decided")
-        if br.get("available") is False and br.get("success"):
-            v.append(f"{where}.{b}: success while unavailable")
+        w = f"{where}.{b}"
+        bdec = br.get("decision_available") is True
+        broots = _roots(br.get("test_roots"), br.get("worlds"))
+        if br.get("success") and (br.get("available") is not True or not bdec):
+            v.append(f"{w}: success without an available decision")
+        if bdec and br.get("available") is not True:
+            v.append(f"{w}: a decision while unavailable")
+        if _unresolved(br.get("integration_unresolved")) and (bdec or br.get("success") or br.get("available") is True):
+            v.append(f"{w}: an unresolved comparison decided or marked available")
+        if broots is not None and broots < MIN_TEST_ROOTS and (bdec or br.get("success")):
+            v.append(f"{w}: a decision with {broots} contributing root(s)")
     sp = o.get("selected_primary")
-    if isinstance(sp, dict) and sp.get("success") and not sp.get("available"):
-        v.append(f"{where}.selected_primary: success while unavailable")
+    if isinstance(sp, dict):
+        if sp.get("success") and sp.get("available") is not True:
+            v.append(f"{where}.selected_primary: success while unavailable")
+        if _unresolved(sp.get("selection_unresolved")) and (sp.get("available") is True or sp.get("success")):
+            v.append(f"{where}.selected_primary: an unresolved selection decided")
+        if roots is not None and roots < MIN_TEST_ROOTS and (sp.get("available") is True or sp.get("success")):
+            v.append(f"{where}.selected_primary: decided with {roots} contributing test root(s)")
     return v
 
 
@@ -2172,11 +2388,33 @@ def _guards(entries):
             "counts": counts}
 
 
+def c1_success(o):
+    """CRITERION C1's success on one option-a record (Codex WP4 P2-WP4-3): "selected rank > 0 AND crossed-source-
+    bootstrap test lower bound > 0, with an available resolved comparison and at least two contributing test roots"
+    -- success true; the record not unavailable; decision.available true with no unresolved comparison or selection;
+    decision.test_worlds >= MIN_TEST_ROOTS; the selected rank > 0 and a finite test_lb > 0; and no guard violation.
+    Anything else (an unavailable, unresolved or inconsistent "success" included) is unsuccessful."""
+    if not isinstance(o, dict) or o.get("success") is not True or o.get("available") is False:
+        return False
+    dec, sel, lb = o.get("decision"), o.get("selected"), o.get("test_lb")
+    if not isinstance(dec, dict) or dec.get("available") is not True or \
+            _unresolved(dec.get("integration_unresolved")) or _unresolved(dec.get("selection_unresolved")):
+        return False
+    tw = dec.get("test_worlds")
+    if type(tw) is not int or tw < MIN_TEST_ROOTS:
+        return False
+    if not (isinstance(sel, dict) and type(sel.get("rank")) is int and sel["rank"] > 0 and type(lb) in (int, float)
+            and math.isfinite(lb) and lb > 0):
+        return False
+    return not _guard_violations(o, "C1")
+
+
 def _c1(entries, mode):
     """Check 6, C1 (A_design_v5 3.8 PC-23; CRITERION C1): from the C1-primary directory ONLY, after verifying that its
-    config.json hashes to the scheduled expected_config_sha256 (and has the registered settings): option a's success
-    for r1_034 and r2_034, reps 0..19 exactly, at least 16 of 20 separately; a missing, unreadable or unavailable
-    realization is unsuccessful. Never pooled, never substituted by another directory's identical identities."""
+    config.json hashes to the scheduled expected_config_sha256 (and has the registered settings): option a's
+    successes (c1_success: an available, resolved success only) for r1_034 and r2_034, reps 0..19 exactly, at least
+    16 of 20 separately; a missing, unreadable, unavailable or unresolved realization is unsuccessful. Never pooled,
+    never substituted by another directory's identical identities."""
     prim = [e for e in entries if e["role"] == "C1-primary"]
     if not prim:
         return {"status": "not_evaluated", "reason": "C1: no C1-primary directory scheduled"}
@@ -2195,7 +2433,7 @@ def _c1(entries, mode):
         return {"status": "fail", "reason": f"refused: the C1-primary configuration is not the registered one: {bad}"}
     out, ok = {}, True
     for sc in C1_RULE["scenarios"]:
-        k = 0
+        k = flagged = 0
         for rep in range(C1_RULE["reps"]):
             f = f"{sc}.{rep:03d}.json"
             try:
@@ -2203,12 +2441,16 @@ def _c1(entries, mode):
                 check_result(d, f, r, sha, cfg.get("namespace"), "C1", cfg)
             except (SystemExit, OSError, ValueError):
                 continue                                   # (missing or invalid: unsuccessful, never removed)
-            k += bool(((r.get("options") or {}).get(C1_RULE["option"]) or {}).get("success") is True)
+            o = (r.get("options") or {}).get(C1_RULE["option"])
+            win = c1_success(o)
+            k += win
+            flagged += bool(isinstance(o, dict) and o.get("success") is True and not win)
         out[sc] = {"successes": k, "datasets": C1_RULE["reps"], "wilson95": wilson(k, C1_RULE["reps"]),
-                   "pass": k >= C1_RULE["min_successes"]}
+                   "pass": k >= C1_RULE["min_successes"], "success_flags_not_counted": flagged}
         ok &= k >= C1_RULE["min_successes"]
     return {"status": "pass" if ok else "fail", "dir": e["dir"], "scenarios": out,
-            "rule": ">= 16/20 successes separately in r1_034 and r2_034, option a; unavailable = unsuccessful"}
+            "rule": ">= 16/20 successes separately in r1_034 and r2_034, option a; a success counts only when "
+                    "available and resolved with >= 2 contributing test roots; unavailable = unsuccessful"}
 
 
 def packet(schedule_path, mode, allow_synthetic=False):
@@ -2219,22 +2461,41 @@ def packet(schedule_path, mode, allow_synthetic=False):
     D8:327)"; exit 0 iff every check passes. --mode diagnostic: any non-empty schedule; each check whose inputs are
     scheduled runs, the others are not_evaluated with their reason; scope "diagnostic (partial)", accepting false,
     no acceptance field; exit 0 iff every evaluated check passes. Everything is re-derived from the directories;
-    summary files are never trusted."""
+    summary files are never trusted. Acceptance mode also refuses, before any check, a schedule whose directories'
+    bound settings do not satisfy the C2 matrix (bound_settings_gaps). A schedule that cannot be read, is not strict
+    JSON (a duplicated key included) or is malformed is a contextual refusal (Codex WP4 P3-WP4-6), never an
+    exception."""
     if mode not in ("acceptance", "diagnostic"):
         raise Refused(f"--mode {mode}: acceptance or diagnostic")
-    raw = rqlib.read_bytes(schedule_path)
     try:
-        sched = json.loads(raw)
+        raw = rqlib.read_bytes(schedule_path)
+    except OSError as e:
+        raise Refused(f"the schedule {schedule_path} cannot be read ({e})")
+
+    def strict(pairs):
+        keys = [k for k, _ in pairs]
+        if len(set(keys)) != len(keys):
+            raise ValueError(f"duplicate key(s) {sorted({k for k in keys if keys.count(k) > 1})}")
+        return dict(pairs)
+    try:
+        sched = json.loads(raw, object_pairs_hook=strict)
     except ValueError as e:
-        raise Refused(f"the schedule is not JSON ({e})")
+        raise Refused(f"the schedule {schedule_path} is not strict JSON ({e})")
     base = os.path.dirname(os.path.abspath(schedule_path))
     if mode == "acceptance" and allow_synthetic:
         raise Refused("--mode acceptance refuses --allow-synthetic-bank: a synthetic bank is never acceptance evidence")
-    entries = _schedule_entries(sched, base)
+    try:
+        entries = _schedule_entries(sched, base)
+        gaps = schedule_gaps(entries) if mode == "acceptance" else []
+    except (TypeError, KeyError, ValueError, AttributeError) as e:     # (a backstop: the validator checks types first)
+        raise Refused(f"the schedule {schedule_path} is malformed ({type(e).__name__}: {e})")
+    if gaps:
+        raise Refused("--mode acceptance: the schedule is incomplete: " + "; ".join(gaps))
     if mode == "acceptance":
-        gaps = schedule_gaps(entries)
+        gaps = bound_settings_gaps(entries)
         if gaps:
-            raise Refused("--mode acceptance: the schedule is incomplete: " + "; ".join(gaps))
+            raise Refused("--mode acceptance: the scheduled directories' bound settings do not satisfy the C2 matrix "
+                          "(CRITERION C2-C4; a scheduled hash alone does not show that): " + "; ".join(gaps))
     inputs = {k: (None if v is None else os.path.normpath(os.path.join(base, v))) for k, v in sched["inputs"].items()}
     gammas = sorted({scenario_gamma(s) for e in entries for s in e["scenarios"]})
     try:
