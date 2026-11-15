@@ -3742,10 +3742,49 @@ class TestMapBankMode(unittest.TestCase):
         self.assertEqual(float(ref_log_sf(np.array([math.inf]))[0]), -math.inf)
 
 
-# main dc64646's planning generator, verbatim (recovery.py L349-475 @dc64646): T6-5 runs it beside recovery.simulate on
-# the same machine, so the byte comparison does not depend on the platform's floating-point libraries.
-MAIN_SIMULATE = '''
-def simulate(D, sc, seed):
+# T6-5's reference (A_design_v5 clarification 4 F2; Codex WP4 P2-WP4-1): main dc64646's COMPLETE planning-simulation
+# dependency set, frozen verbatim from `git show dc64646:tools/redqueen/recovery.py` -- the transitive closure of
+# simulate's global loads (scripts_P2/wp4r2_closure.py): the generator (simulate, N_SURV, simulate_survival), the
+# helpers it calls (capture_sd, _walk, _rise, additive_projection) and the simulation constants it reads (R_REPS,
+# B_COUNT, CAPTURE_SD, DEFAULTS); numpy and math are the shared modules. Each piece is (first line, last line, the
+# sha256 of its text, the text), every text and pin checked against git by scripts_P2/wp4r2_main_text.sh.
+# main_reference() runs the pieces in a namespace that holds only the builtins, numpy and math, so nothing resolves from
+# HEAD's recovery module (reference_violations() checks that by construction); T6-5 passes both generators the same
+# fixed Data, scenario and seed and compares every output exactly. The cross-machine output digests recorded at WP4 are
+# machine-specific evidence (evidence/wp4/pins, diagnosis), not asserted: CI run 43720048383 (Python 3.14) produced
+# another r0 digest from the same code on another runner, and numpy's CPU dispatch changes the laptop's own digests.
+MAIN_REF = (   # (first line, last line, sha256 of the text, the text: dc64646's recovery.py lines verbatim)
+    (110, 111, "313bc7d3103da07665b12dcb9284f7dabdcaf9e1e5c35ef6419a8656d084c166",
+     '''R_REPS = 6
+B_COUNT = 324                     # K [1 + floor(80 s / 1.5 s)]: the 1.5 s cooldown's capture bound
+'''),
+    (151, 151, "3030067b3995297b9cc46f17da64aed9577de3e6a1a256d66ca9e6a89a8d87e7",
+     '''CAPTURE_SD = ((0.25, 0.6), (0.45, 0.15))
+'''),
+    (178, 180, "163c2920489d1d97450866e28e98a6349eb067c0634fbeea95819716521ef7d0",
+     '''DEFAULTS = dict(rank=0, energy=0.0, link="logit", kappa=0.0, clustered=False, own=-0.25, noise_scale=1.0,
+                noiseless=False, mu0=-0.5, rise=1.5, rw_end=0.5, snap_sd=0.1,
+                noise_row=0.15, noise_col=0.15, noise_cell=0.20, noise_model="flat")
+'''),
+    (196, 199, "ddac1f67ea40d716315152900dd79c4e8bdec7ef8d69b79994d95d7224ba5a4c",
+     '''def capture_sd(p, scale=1.0):
+    """The measured per-replicate logit SD at capture fraction p (CAPTURE_SD, flat beyond its ends), x scale."""
+    (p0, s0), (p1, s1) = CAPTURE_SD
+    return scale * np.interp(p, [p0, p1], [s0, s1])
+'''),
+    (338, 342, "7f472c11ddafeb05315e1cb36582cc5830697693f1d73e226be4898c98898e52",
+     '''def _walk(rng, n_t, end_sd, dim=None):
+    shape = (n_t,) if dim is None else (n_t, dim)
+    steps = rng.normal(0.0, end_sd / math.sqrt(n_t), shape)
+    steps[0] = 0.0
+    return np.cumsum(steps, axis=0)
+'''),
+    (345, 346, "2726cb2ea4939c3b848743e125ded8fa232d342ec2b7b9009db169d4b0b7df66",
+     '''def _rise(t):
+    return np.log1p(np.asarray(t) / 10.0) / math.log1p(20.0)
+'''),
+    (349, 475, "ea991216caf2440ba6329683b401a85890a5a126c13189c9bb534bb66addc271",
+     '''def simulate(D, sc, seed):
     """-> the truth (eta per pair, the interaction) and the data (empirical logits, R per pair)."""
     s = dict(DEFAULTS, **sc)
     rng = np.random.default_rng(seed)
@@ -3872,24 +3911,103 @@ def simulate_survival(D, s, seed, a, b, u, v, c, rank):
         S = lg(rng.binomial(N_SURV, 1.0 / (1.0 + np.exp(-y))))
         S0 = lg(rng.binomial(N_SURV, 1.0 / (1.0 + np.exp(-y0))))
     return {"cS": cS, "etaS": etaS, "DS": DS, "s": S, "sbar": S.mean(axis=1), "s0": S0, "s0bar": S0.mean(axis=1)}
-'''
+'''),
+    (478, 488, "73581e65a59ab18e9b3c8f628a0d9f510cd1a2bddb0a0d98377d5b88f79553b7",
+     '''def additive_projection(D, y, iters=40):
+    """The additive (mu + a_j - b_i) least-squares fit of y over every pair of the graph."""
+    a, b = np.zeros(D.nP), np.zeros(D.nQ)
+    mu = y.mean()
+    nq = np.bincount(D.qi, minlength=D.nQ)
+    npp = np.bincount(D.pj, minlength=D.nP)
+    for _ in range(iters):
+        b = -np.bincount(D.qi, weights=y - mu - a[D.pj], minlength=D.nQ) / np.maximum(nq, 1)
+        a = np.bincount(D.pj, weights=y - mu + b[D.qi], minlength=D.nP) / np.maximum(npp, 1)
+        mu = (y - a[D.pj] + b[D.qi]).mean()
+    return mu + a[D.pj] - b[D.qi]
+'''),
+)
+
 
 
 # ================================================================== bank-mode recovery (A_design_v5 1, 3.1-3.8; WP4)
-# T6-5's reference is main dc64646's planning generator itself: MAIN_SIMULATE (above) is dc64646's recovery.py L349-475
-# verbatim, and its text is pinned by sha256 (MAIN_SIMULATE_SHA256: those bytes of `git show
-# dc64646:tools/redqueen/recovery.py`, checked against git by scripts_P2/wp4_main_text.sh). T6-5 runs it beside
-# recovery.simulate in the same process and compares the outputs byte for byte, every planning observation branch
-# (T65_SCENARIOS). Main's OUTPUT digests are not pinned: they are one machine's floating-point arithmetic. CI run
-# 43720048383 (Python 3.14) produced another r0 digest from the same code on another runner, while the push run's 3.14
-# job reproduced the laptop's, and the laptop's own digests change when numpy's CPU dispatch is restricted.
-MAIN_SIMULATE_SHA256 = "991bf20c1336ac2f3a1392e5032ca8bc32e7aaa9f7fc4d5af3bbe7649b8b4d17"
+_GLOBAL_OPS = frozenset({"LOAD_GLOBAL", "LOAD_NAME", "LOAD_FROM_DICT_OR_GLOBALS", "STORE_GLOBAL", "DELETE_GLOBAL",
+                         "DELETE_NAME"})
 T65_SCENARIOS = ("r0", "r1_017_cap", "r0_asym", "num_r1", "r2_034")   # flat, capture-level, asym, noiseless, rank 2
+
+
+def main_reference(pieces=MAIN_REF):
+    """T6-5's reference namespace (clarification 4 F2): every frozen piece's text checked against its sha256 pin, then
+    executed in dc64646's line order into a namespace holding only the builtins module and the allow-listed shared
+    modules (numpy as np, math) -> the namespace (its simulate is main dc64646's)."""
+    import builtins
+    import hashlib
+    ns = {"__builtins__": builtins, "np": np, "math": math}
+    for lo, hi, sha, text in pieces:
+        if hashlib.sha256(text.encode("utf-8")).hexdigest() != sha:
+            raise AssertionError(f"recovery.py@dc64646 L{lo}-{hi}: the frozen text does not hash to its pin {sha}")
+        exec(compile(text, f"recovery.py@dc64646:L{lo}-{hi}", "exec"), ns)
+    return ns
+
+
+def _code_objects(code):
+    yield code
+    for c in code.co_consts:
+        if hasattr(c, "co_code"):
+            yield from _code_objects(c)
+
+
+def reference_violations(ns, pieces=MAIN_REF):
+    """'Nothing resolves from HEAD', by construction (clarification 4 F2) -> the violations (empty: none): (1) the
+    namespace holds only __builtins__ (the builtins module), the allow-listed modules (np is numpy, math is math) and
+    the names the frozen texts define (their module-level stores); (2) every global name any frozen code object loads
+    (module level, functions, nested functions, lambdas, comprehensions: dis's global-name instructions) is defined
+    by the frozen texts, an allow-listed module or a builtin (so the pieces cover simulate's complete dependency
+    closure); (3) every frozen function in the namespace was compiled from a frozen text and its globals are the
+    namespace itself; (4) every frozen constant has the frozen text's value."""
+    import builtins
+    import dis
+    defined, loads = set(), {}
+    for lo, hi, _, text in pieces:
+        top = compile(text, f"recovery.py@dc64646:L{lo}-{hi}", "exec")
+        defined |= {i.argval for i in dis.get_instructions(top) if i.opname == "STORE_NAME"}
+        for c in _code_objects(top):
+            for i in dis.get_instructions(c):
+                if i.opname in _GLOBAL_OPS:
+                    loads.setdefault(i.argval, f"{c.co_name} (L{lo}-{hi})")
+    mods = {"np": np, "math": math}
+    v = []
+    extra = sorted(set(ns) - defined - set(mods) - {"__builtins__"})
+    if extra:
+        v.append(f"the namespace holds names no frozen text defines: {extra[:12]}")
+    if ns.get("__builtins__") is not builtins:
+        v.append("__builtins__ is not the builtins module")
+    v += [f"{k} is not the allow-listed module {m.__name__}" for k, m in mods.items() if ns.get(k) is not m]
+    for name, where in sorted(loads.items()):
+        if name not in defined and name not in mods and not hasattr(builtins, name):
+            v.append(f"{where} loads the global {name!r}: neither frozen nor allow-listed")
+    fresh = None
+    for name in sorted(defined):
+        if name not in ns:
+            v.append(f"{name} is missing")
+            continue
+        f = ns[name]
+        code = getattr(f, "__code__", None)
+        if code is not None:
+            if getattr(f, "__globals__", None) is not ns or not code.co_filename.startswith("recovery.py@dc64646:"):
+                v.append(f"{name} is not the frozen text's function in this namespace")
+            continue
+        fresh = fresh or main_reference(pieces)                 # (4) a constant: the frozen text's value
+        if type(f) is not type(fresh[name]) or repr(f) != repr(fresh[name]):
+            v.append(f"{name} is not the frozen text's value")
+    return v
 # A bank with DISTINCT dyadic components, so every sharing class has its own latent correlation (C: 0.375 + 0.125 + 0.5,
-# S: 0.25 + 0.375 + 0.375; E = 1 - R - D exactly in binary, as the loader requires)
+# S: 0.25 + 0.375 + 0.375; E = 1 - R - D exactly in binary, as the loader requires). The donor's cross-channel C-S
+# correlation, 0.1875, is the one a different-prey pair of one predator shares (Codex WP4 P3-WP4-7): far enough from 0
+# for T3-1's tolerance to see it gone, with SigmaE + its off-diagonal still PSD (a sampler moving it into the cell term,
+# the same-cell C-S sum 0.125 + 0.1875 + 0.125 unchanged, is caught only by the donor C-S class)
 T3_SR = [[0.375, 0.125, 0.0625], [0.125, 0.25, 0.1875], [0.0625, 0.1875, 0.5]]
-T3_SD = [[0.125, 0.0625], [0.0625, 0.375]]
-T3_SE = [[0.5, 0.25], [0.25, 0.375]]
+T3_SD = [[0.125, 0.1875], [0.1875, 0.375]]
+T3_SE = [[0.5, 0.125], [0.125, 0.375]]
 _BANKFIX = {}
 _T36_ERFC = None
 
@@ -4035,8 +4153,9 @@ class TestRecoveryBankMode(unittest.TestCase):
     def test_T3_1_latents_per_sharing_class_through_recovery(self):
         """T3-1: the latents recovery's bank path hands the sampler (obslaw.latent, spied) for THIS graph's pairs have
         the bank's correlation per sharing class: one prey row and another predator Sigma_R, one donor and another
-        prey Sigma_D, one cell C-S Sigma_R + Sigma_D + Sigma_E, exposed-free Sigma_R[., F], nothing shared 0, across
-        replicates 0; unit variances. The bank's components are distinct per class (T3_SR / T3_SD / T3_SE)."""
+        prey Sigma_D (C-C, S-S and the cross-channel C-S / S-C, Codex WP4 P3-WP4-7), one cell C-S Sigma_R + Sigma_D +
+        Sigma_E, exposed-free Sigma_R[., F], nothing shared 0, across replicates 0; unit variances. The bank's
+        components are distinct per class (T3_SR / T3_SD / T3_SE)."""
         rec, ol, D = self.rec, self.ol, self.Dt
         got, real = {}, ol.latent
 
@@ -4057,6 +4176,8 @@ class TestRecoveryBankMode(unittest.TestCase):
         checks = [("row C-C", u["C"][0], u["C"][same_q], SR[0, 0]), ("row S-S", u["S"][0], u["S"][same_q], SR[1, 1]),
                   ("row C-S", u["C"][0], u["S"][same_q], SR[0, 1]),
                   ("donor C-C", u["C"][0], u["C"][same_p], SD[0, 0]), ("donor S-S", u["S"][0], u["S"][same_p], SD[1, 1]),
+                  ("donor C-S", u["C"][0], u["S"][same_p], SD[0, 1]),
+                  ("donor S-C", u["S"][0], u["C"][same_p], SD[1, 0]),
                   ("cell C-S", u["C"][0], u["S"][0], SR[0, 1] + SD[0, 1] + SE[0, 1]),
                   ("exposed-free C-F", u["C"][0], u["F"][q], SR[0, 2]), ("exposed-free S-F", u["S"][0], u["F"][q], SR[1, 2]),
                   ("nothing shared", u["C"][0], u["C"][other], 0.0),
@@ -4163,7 +4284,8 @@ class TestRecoveryBankMode(unittest.TestCase):
 
     def test_T3_6_observable_count_dependence_per_sharing_class(self):
         """T3-6 (v2 P2 #8): for each sharing class -- one cell C-S; one prey row C-C, S-S and C-S across predators; one
-        donor C-C and S-S; exposed-free S-F and C-F; different replicates -- the empirical covariance of the COUNTS
+        donor C-C, S-S and C-S / S-C across prey (Codex WP4 P3-WP4-7); exposed-free S-F and C-F; different replicates --
+        the empirical covariance of the COUNTS
         (R = 2000) and the joint frequencies of a 3 x 3 coarse binning match an independent definitional quadrature
         (t36_reference) under the bivariate normal with the class's latent correlation, within 4 MC SE; the cells
         include ceiling-heavy ones (mu_S / c and mu_F / c >= 0.95: the capped category). The truth is chosen so;
@@ -4196,6 +4318,8 @@ class TestRecoveryBankMode(unittest.TestCase):
                    ("row C-C", ("C", em), ("C", em_q), SR[0, 0], 0), ("row S-S", ("S", em), ("S", em_q), SR[1, 1], 0),
                    ("row C-S", ("C", em), ("S", em_q), SR[0, 1], 0), ("donor C-C", ("C", em), ("C", em_p), SD[0, 0], 0),
                    ("donor S-S", ("S", em), ("S", em_p), SD[1, 1], 0),
+                   ("donor C-S", ("C", em), ("S", em_p), SD[0, 1], 0),
+                   ("donor S-C", ("S", em), ("C", em_p), SD[1, 0], 0),
                    ("exposed-free S-F", ("S", em), ("F", qm), SR[1, 2], 0),
                    ("exposed-free C-F", ("C", em), ("F", qm), SR[0, 2], 0),
                    ("exposed-free S-F, both ceiling-heavy", ("S", 0), ("F", q0), SR[1, 2], 0),
@@ -4337,20 +4461,20 @@ class TestRecoveryBankMode(unittest.TestCase):
         self.assertFalse(out["success"])
 
     def test_T6_5_planning_is_main_byte_for_byte_and_bank_truth_is_planning_truth(self):
-        """T6-5 (v2 Codex note): planning-mode simulate on the full v4 test graph is main dc64646's byte for byte for
-        every observation branch (flat, capture-level, asym, noiseless, rank 2 with D_S; survival in each): main's
-        generator (MAIN_SIMULATE, dc64646's L349-475 verbatim, its text pinned by sha256) runs in this process beside
-        recovery.simulate, so the comparison is exact on whatever machine and numpy run it (main's output digests are
-        a machine's floating-point arithmetic, not a constant); for one seed bank mode's truth (eta, inter, c, energy,
-        cS, etaS, D_S, the settings but noise_model) is the planning truth byte for byte; the bank observations are
-        obslaw's sampler on the stream default_rng([seed, 3]) at the scenario's gamma; bank mode refuses the
-        capture-level planning scenario."""
-        import hashlib
+        """T6-5 (v2 Codex note; clarification 4 F2): planning-mode simulate on the full v4 test graph is main dc64646's
+        byte for byte for every observation branch (flat, capture-level, asym, noiseless, rank 2 with D_S; survival in
+        each). The reference is dc64646's complete simulation dependency set (MAIN_REF: the generator, the helpers it
+        calls and the constants it reads, each verbatim and sha256-pinned) run in a namespace that resolves nothing
+        from HEAD (main_reference; reference_violations empty), in this process, on the same fixed Data, scenario and
+        seed: every returned array's dtype, shape and bytes and every other value compare exactly, on any machine,
+        with no skip and no tolerance. For one seed bank mode's truth (eta, inter, c, energy, cS, etaS, D_S, the
+        settings but noise_model) is the planning truth byte for byte; the bank observations are obslaw's sampler on
+        the stream default_rng([seed, 3]) at the scenario's gamma; bank mode refuses the capture-level planning
+        scenario."""
         rec = self.rec
-        self.assertEqual(hashlib.sha256(MAIN_SIMULATE.encode("utf-8")).hexdigest(), MAIN_SIMULATE_SHA256)
         D = rec.Data(full())
-        ns = dict(vars(rec))
-        exec(compile(MAIN_SIMULATE, "recovery.py@dc64646", "exec"), ns)
+        ns = main_reference()
+        self.assertEqual(reference_violations(ns), [])
         self.assertIsNot(ns["simulate"], rec.simulate)
         for sc in T65_SCENARIOS:
             seed = rqlib.derive_seed("rq-T6-5", sc, 0)
@@ -4389,6 +4513,46 @@ class TestRecoveryBankMode(unittest.TestCase):
             rec.simulate(D, rec.SCENARIOS["r1_017_cap"], 1, obs=self.obs)
         with self.assertRaisesRegex(ValueError, "at gamma 2.0"):       # (gamma = the scenario's noise_scale: no table)
             rec.simulate(self.Dt, rec.SCENARIOS["r1_017_noisy"], 1, obs=self.obs)
+
+    def test_T6_5_the_reference_resolves_nothing_from_head(self):
+        """T6-5's reference is independent of HEAD by construction (clarification 4 F2; Codex WP4 P2-WP4-1): the
+        namespace main_reference builds holds only the builtins, numpy, math and the frozen texts' definitions (exactly
+        simulate's dependency closure at dc64646), every global its code loads is one of those, its functions run on
+        that namespace and its constants are the frozen values (reference_violations empty). Each control is reported:
+        11f8164's construction (HEAD's module namespace with the generator text executed into it), a HEAD helper or a
+        changed constant substituted into the frozen namespace, a frozen set missing a helper (simulate would load
+        it from elsewhere), a frozen text loading a HEAD name, and a text that does not hash to its pin."""
+        import hashlib
+        rec = self.rec
+        ns = main_reference()
+        self.assertEqual(reference_violations(ns), [])
+        self.assertEqual(set(ns) - {"__builtins__"},
+                         {"np", "math", "R_REPS", "B_COUNT", "CAPTURE_SD", "DEFAULTS", "capture_sd", "_walk", "_rise",
+                          "simulate", "N_SURV", "simulate_survival", "additive_projection"})
+        self.assertEqual([p[:2] for p in MAIN_REF], sorted(p[:2] for p in MAIN_REF))
+        gen = next(p for p in MAIN_REF if p[:2] == (349, 475))
+        old = dict(vars(rec))                       # (11f8164's construction: HEAD's helpers and constants resolve)
+        exec(compile(gen[3], "recovery.py@dc64646:L349-475", "exec"), old)
+        bad = reference_violations(old)
+        for want in ("names no frozen text defines", "_rise is not the frozen text's function",
+                     "capture_sd is not the frozen text's function", "additive_projection is not the frozen"):
+            self.assertTrue(any(want in x for x in bad), (want, bad))
+        sub = main_reference()
+        sub["_rise"] = rec._rise
+        self.assertEqual(reference_violations(sub), ["_rise is not the frozen text's function in this namespace"])
+        sub = main_reference()
+        sub["CAPTURE_SD"] = ((0.25, 0.5), (0.45, 0.15))
+        self.assertEqual(reference_violations(sub), ["CAPTURE_SD is not the frozen text's value"])
+        short = tuple(p for p in MAIN_REF if p[:2] != (345, 346))
+        self.assertIn("simulate (L349-475) loads the global '_rise': neither frozen nor allow-listed",
+                      reference_violations(main_reference(short), short))
+        leak = "def leak():\n    return SCENARIOS\n"
+        more = MAIN_REF + ((900, 901, hashlib.sha256(leak.encode()).hexdigest(), leak),)
+        self.assertIn("leak (L900-901) loads the global 'SCENARIOS': neither frozen nor allow-listed",
+                      reference_violations(main_reference(more), more))
+        lo, hi, sha, text = gen
+        with self.assertRaisesRegex(AssertionError, "L349-475: the frozen text does not hash to its pin"):
+            main_reference(tuple(p if p is not gen else (lo, hi, sha, text.replace("0.6", "0.7", 1)) for p in MAIN_REF))
 
     def test_T6_6_the_configuration_binds_the_bank_and_its_tables(self):
         """T6-6: a bank-mode configuration records the observation model (A_design_v5 4.1: the bank artifact's and the
