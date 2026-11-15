@@ -2221,7 +2221,9 @@ def horizon_estimate_d8(A, horizon, boot=BOOT, m=Z_INTERVALS, text=None):
 def d8_provenance_record(raw, bindings, n_obs):
     """The provenance receipt as estimate_d8 binds it (v5 2.1 item 5): reconstruction from the registered root
     reproduces the frozen observations exactly, the cell count is the observations', one engine binary -> the
-    engine sha256 (fit.noise.engine_sha256)."""
+    engine sha256 (fit.noise.engine_sha256: "the executable recorded by the verified bundles that reconstruct the
+    frozen observations", v5 2.2; by clarification 3 E2 that registered meaning plus this bound receipt satisfy 2.2's
+    attribution, and no label field exists)."""
     p = _json_of(raw, "provenance receipt")
     if not isinstance(p, dict) or p.get("schema") != D8_PROVENANCE_SCHEMA:
         raise NoiseBankError(f"provenance receipt: schema {p.get('schema') if isinstance(p, dict) else None!r} is not "
@@ -2325,9 +2327,12 @@ def d8_artifact(fit, receipt_sha256):
     """The finfolk.redqueen.noisebank.bank/3 artifact (v5 2.8 in clarification 1's representation; every text and
     record constant from obslaw, shared with the strict loader): status d8-fitted, or unavailable (R7) when the 5k
     fit is not ok, a channel has no curve or nu0_C is unavailable; noise and map_variance built from horizons["5000"]
-    (C9); every emitted nu0 positive and finite (clarification 2 D3's domain); no top-level engine_sha256 (the bank
-    executable is fit.noise.engine_sha256: the executable recorded by the bundles that reconstruct the frozen
-    observations, 2.2)."""
+    (C9); every emitted nu0 positive and finite (clarification 2 D3's domain); no top-level engine_sha256. The bank
+    executable is fit.noise.engine_sha256, clarification 1's four-key fit.noise unchanged: by v5 2.2 and
+    clarification 3 E2 the field MEANS "the executable recorded by the verified bundles that reconstruct the frozen
+    observations", and that registered meaning together with the provenance receipt the artifact binds
+    (inputs.provenance_sha256, finfolk.redqueen.noisebank.provenance/1) satisfies 2.2's attribution: there is no label
+    field, in the artifact or in the receipt. Neither establishes historical executable origin beyond 2.2's limits."""
     import material
     import obslaw
     hz = fit["horizons"]
@@ -2380,12 +2385,16 @@ def d8_artifact(fit, receipt_sha256):
 
 # ---------------------------------------------------------------- provenance (v5 2.2: the store, the reconstruction)
 def _manifest_check(path, root, recs):
-    """v5 2.2 item 4: a pre-existing integrity manifest (sha256sum lines "<sha256>  <path>", a path absolute or
-    relative to the bank root): every chunk it lists must match it (a mismatch refuses, R9); covers_chunks when it
-    lists every chunk of the store."""
+    """v5 2.2 item 4 (R9): a pre-existing integrity manifest (sha256sum lines "<sha256>  <path>", a "*" binary marker
+    allowed, a path absolute or relative to the bank root). Every declaration is kept with its line number (never a
+    last-wins map; Codex revWP3 P2-3): two declarations of one normalized path (chunks/x.zip, ./chunks/x.zip and the
+    absolute path under the root are one path) with different sha256 are refused, naming both lines; EVERY declaration
+    of a chunk of the store is verified against the chunk's bytes (a mismatch refuses, naming its line); covers_chunks
+    when every chunk of the store is declared. Declarations of other files are parsed and conflict-checked only (v5
+    2.2 item 4 checks the store's chunks against the manifest; clarification 3: "verify every covered chunk")."""
     import store
     raw = rqlib.read_bytes(path)
-    listed = {}
+    declared = {}                                       # normalized path -> [(line, sha256)], in manifest order
     for i, ln in enumerate(raw.decode("utf-8").splitlines(), 1):
         if not ln.strip():
             continue
@@ -2393,19 +2402,27 @@ def _manifest_check(path, root, recs):
         if len(parts) != 2 or not rqlib.is_sha256(parts[0]):
             raise NoiseBankError(f"manifest {path} line {i}: not a sha256sum line")
         p = parts[1].strip().lstrip("*")
-        listed[os.path.normpath(p if os.path.isabs(p) else os.path.join(root, p))] = parts[0]
+        norm = os.path.normpath(p if os.path.isabs(p) else os.path.join(root, p))
+        for j, h in declared.get(norm, []):
+            if h != parts[0]:
+                raise NoiseBankError(f"manifest {path}: lines {j} and {i} declare {norm} with different sha256 "
+                                     "(conflicting duplicate declarations refused, R9)")
+        declared.setdefault(norm, []).append((i, parts[0]))
     checked = 0
     for r in recs:
         p = os.path.normpath(os.path.join(root, store.CHUNKS, r["chunk"]))
-        if p in listed:
-            if rqlib.sha256_file(p) != listed[p]:
-                raise NoiseBankError(f"provenance: chunk {r['chunk']} differs from the manifest {path} (R9)")
+        if p in declared:
+            got = rqlib.sha256_file(p)
+            for i, h in declared[p]:                    # (every declaration, not one per path)
+                if got != h:
+                    raise NoiseBankError(f"provenance: chunk {r['chunk']} differs from the manifest {path} line {i} "
+                                         "(R9)")
             checked += 1
     return {"sha256": rqlib.sha256_bytes(raw), "covers_chunks": bool(recs) and checked == len(recs),
             "chunks_checked": checked}
 
 
-def provenance(study, design_path, plan_path, obs_path, manifest_path=None, bindings=None):
+def provenance(study, design_path, plan_path, obs_path, manifest_path=None, bindings=None, progress=None):
     """`noisebank.py provenance` (A_design_v5 2.2): the receipt that binds the frozen observations to the stored
     bundles and the executable they record. In this order, each failure a refusal (R5, R9):
       1. the root: the registered bank root by path (a copy, restore elsewhere or replay is refused); the design,
