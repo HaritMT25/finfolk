@@ -2511,8 +2511,12 @@ class TestD8Validation(unittest.TestCase):
                         ["pass"])
         half = {b: bank(dev=0.2 if k < 4 else 0.05) for k, b in enumerate(names)}
         self.assertTrue(nb.d8_validation_criteria(spec, half, {}, v5ok)["V3"]["pass"], "the median over banks")
+        sz = dict(ol.STRUCTURAL_ZERO)
         for bad in (dict(v5ok, status="unavailable"), dict(v5ok, channels={"C": {}, "S": {}, "F": {}}),
-                    dict(v5ok, scales={"C": {}, "S": {}}), dict(v5ok, components=None)):
+                    dict(v5ok, channels={"C": {}, "S": {}, "F": sz}),        # (S alone not a structural zero)
+                    dict(v5ok, channels={"C": {}, "S": sz, "F": {}}),        # (F alone)
+                    dict(v5ok, scales={"C": {}, "S": {}}), dict(v5ok, components=None),
+                    dict(v5ok, components={"fit": "constrained"})):
             with self.subTest(v5=bad):
                 c = nb.d8_validation_criteria(spec, good, {}, bad)
                 self.assertFalse(c["V5"]["pass"] or c["accepted"])
