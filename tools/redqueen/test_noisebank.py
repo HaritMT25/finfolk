@@ -3269,10 +3269,13 @@ class TestD8Ledger(unittest.TestCase):
         self.assertEqual(nb.attempts_state(led)[aid]["close"]["charged_by"], "reconcile")
 
     def test_P2_R2_1_the_lock_is_held_from_before_the_budget_check_until_the_close(self):
-        """Each D8 accounting command holds the lock on the ledger file over its budget check, its attempt's open,
-        progress and close records (provenance, validate-d8, estimate-d8), and d8-reconcile over its liveness check,
-        charge and close: an independent non-blocking flock probe on the ledger fails at every one of those points,
-        and succeeds once the command returns."""
+        """Each D8 accounting command holds the lock on the ledger file over its budget check, its attempt's open
+        record, the progress records its work publishes, its charge and its close record (provenance, validate-d8,
+        estimate-d8), and d8-reconcile over its liveness check, charge and close: an independent non-blocking flock
+        probe on the ledger fails at every one of those points, and succeeds once the command returns. The stubbed
+        work of each command calls the progress callback it is given (exactly as the real work does after each
+        step), so each command's progress publication is one of the observed points (Codex revWP3c P3-R3-1: the
+        stubs of round 3 never called it)."""
         import fcntl
 
         def held(path):
@@ -3296,28 +3299,38 @@ class TestD8Ledger(unittest.TestCase):
             return real_budget(ledger, command)
 
         def append(ledger, rec):
-            seen.append((rec.get("event"), "record", held(ledger)))
+            seen.append((rec.get("event"), "record", held(ledger), rec.get("step")))
             return real_append(ledger, rec)
 
         def add(ledger, entry):
             seen.append((entry.get("kind"), "charge", held(ledger)))
             return real_add(ledger, entry)
+
+        def work(name, value):
+            """A stubbed D8 work function that publishes one progress step through the callback it is given."""
+            def stub(*a, **k):
+                k["progress"](f"stub {name}")
+                return value
+            return stub
         fit = {"inputs": {"observations_sha256": "0" * 64}, "boot": 1, "synthetic": True}
         p = lambda name: os.path.join(self.tmp, name)  # noqa: E731
         with mock.patch.object(nb, "_budget_check", budget), mock.patch.object(nb, "_attempt_append", append), \
                 mock.patch.object(nb, "ledger_add", add), \
-                mock.patch.object(nb, "validate_d8", lambda *a, **k: {"acceptance": {"accepted": True}}), \
-                mock.patch.object(nb, "provenance", lambda *a, **k: {"provenance": "stub"}), \
-                mock.patch.object(nb, "estimate_d8", lambda *a, **k: fit), \
+                mock.patch.object(nb, "validate_d8", work("validate-d8", {"acceptance": {"accepted": True}})), \
+                mock.patch.object(nb, "provenance", work("provenance", {"provenance": "stub"})), \
+                mock.patch.object(nb, "estimate_d8", work("estimate-d8", fit)), \
                 mock.patch.object(nb, "d8_artifact", lambda f, sha: {"receipt_sha256": sha}):
             nb.run_validate_d8(self.spec(), "d", p("v.json"), led, bindings={})
             nb.run_provenance("r", "d", "p", "o", None, p("p.json"), led, bindings={})
             nb.run_estimate_d8("o", "a", "d", "p", "v", "r", p("a.json"), p("rc.json"), led, ["x"], bindings={})
         self.assertFalse(held(led))
-        self.assertEqual([c for c, what, _ in seen if what == "budget check"], ["validate-d8", "provenance",
-                                                                                "estimate-d8"])
+        self.assertEqual([c for c, what, *_ in seen if what == "budget check"], ["validate-d8", "provenance",
+                                                                                 "estimate-d8"])
         self.assertEqual(sum(e == "open" for e, *_ in seen), 3)
         self.assertEqual(sum(e == "close" for e, *_ in seen), 3)
+        self.assertEqual([(x[0], x[3], x[2]) for x in seen if x[0] == "progress" and x[3]],
+                         [("progress", "stub validate-d8", True), ("progress", "stub provenance", True),
+                          ("progress", "stub estimate-d8", True)], "each command's progress record, under the lock")
         self.assertEqual([x for x in seen if not x[2]], [], "a point of the transaction without the lock")
         led2 = self.ledger(name="reconcile.jsonl")
         aid = self.dead_attempt(led2)
