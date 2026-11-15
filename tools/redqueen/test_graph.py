@@ -3876,19 +3876,15 @@ def simulate_survival(D, s, seed, a, b, u, v, c, rank):
 
 
 # ================================================================== bank-mode recovery (A_design_v5 1, 3.1-3.8; WP4)
-# T6-5's pins: main dc64646's PLANNING simulate outputs on the full v4 test graph (full()), one per planning observation
-# branch -- flat r0, capture-level r1_017_cap, asym r0_asym, noiseless num_r1, rank 2 with D_S r2_034; the survival
-# branch in every one -- at seed derive_seed("rq-T6-5", scenario, 0), digested by sim_digest. Computed with
-# dc64646's tools/redqueen (scripts_P2/wp4_pin_main.py, 2026-11-15); the worktree's digests were equal.
-T65_PINS = {
-    "num_r1": "c2bb2e8e6f7ef7b238ccc3ad4e30e822f198212834e9b10c100ec6306a9e1b62",
-    "r0": "1921db4ca2343870207bcc573656104f04793e006b457357443b42f232b21759",
-    "r0_asym": "c10c58d398a0afde94c5a9037c8bfe19e68c4fd489d8270ae6d51783c6780fcf",
-    "r1_017_cap": "3a27e47c08307e13b536536546344af366a61e167d6c33d649fd816410993f13",
-    "r2_034": "fadd281e61f249d46920bb8285b142a84d1b1e95f45462c6017961929705f78d",
-}
-PIN_PROBE = "a41cf1b3617172d057a5c189a9c8d0244f1f4610162ea7d0646e5de0b68d7357"   # (t65_probe on the pinning machine:
-#                                                                            numpy 2.3.4, the laptop's WSL Python 3.12)
+# T6-5's reference is main dc64646's planning generator itself: MAIN_SIMULATE (above) is dc64646's recovery.py L349-475
+# verbatim, and its text is pinned by sha256 (MAIN_SIMULATE_SHA256: those bytes of `git show
+# dc64646:tools/redqueen/recovery.py`, checked against git by scripts_P2/wp4_main_text.sh). T6-5 runs it beside
+# recovery.simulate in the same process and compares the outputs byte for byte, every planning observation branch
+# (T65_SCENARIOS). Main's OUTPUT digests are not pinned: they are one machine's floating-point arithmetic. CI run
+# 43720048383 (Python 3.14) produced another r0 digest from the same code on another runner, while the push run's 3.14
+# job reproduced the laptop's, and the laptop's own digests change when numpy's CPU dispatch is restricted.
+MAIN_SIMULATE_SHA256 = "991bf20c1336ac2f3a1392e5032ca8bc32e7aaa9f7fc4d5af3bbe7649b8b4d17"
+T65_SCENARIOS = ("r0", "r1_017_cap", "r0_asym", "num_r1", "r2_034")   # flat, capture-level, asym, noiseless, rank 2
 # A bank with DISTINCT dyadic components, so every sharing class has its own latent correlation (C: 0.375 + 0.125 + 0.5,
 # S: 0.25 + 0.375 + 0.375; E = 1 - R - D exactly in binary, as the loader requires)
 T3_SR = [[0.375, 0.125, 0.0625], [0.125, 0.25, 0.1875], [0.0625, 0.1875, 0.5]]
@@ -3896,17 +3892,6 @@ T3_SD = [[0.125, 0.0625], [0.0625, 0.375]]
 T3_SE = [[0.5, 0.25], [0.25, 0.375]]
 _BANKFIX = {}
 _T36_ERFC = None
-
-
-def t65_probe():
-    """A digest of the floating-point operations planning simulate uses (numpy's exp, log, sqrt, mean, var on fixed
-    inputs). The pins are byte digests of one machine's arithmetic: they bind wherever this probe equals PIN_PROBE;
-    elsewhere (another SIMD dispatch of exp / log) the embedded-main comparison of T6-5 is the byte check."""
-    import hashlib
-    x = np.linspace(-40.0, 40.0, 200_001)
-    parts = [np.exp(x), np.log(np.exp(x) + 0.5), 1.0 / (1.0 + np.exp(-x)), np.sqrt(np.abs(x)),
-             np.array([x.mean(), x.var(), np.var(np.sin(x))])]
-    return hashlib.sha256(b"".join(np.ascontiguousarray(p).tobytes() for p in parts)).hexdigest()
 
 
 def sim_digest(out):
@@ -4353,28 +4338,33 @@ class TestRecoveryBankMode(unittest.TestCase):
 
     def test_T6_5_planning_is_main_byte_for_byte_and_bank_truth_is_planning_truth(self):
         """T6-5 (v2 Codex note): planning-mode simulate on the full v4 test graph is main dc64646's byte for byte for
-        every observation branch (flat, capture-level, asym, noiseless, rank 2 with D_S; survival in each): against
-        main's generator run here (MAIN_SIMULATE, verbatim) and against main's pinned digests (T65_PINS, binding where
-        the floating-point probe equals the pinning machine's, PIN_PROBE); for one seed bank mode's truth (eta, inter,
-        c, energy, cS, etaS, D_S, the settings but noise_model) is the planning truth byte for byte; the bank
-        observations are obslaw's sampler on the stream default_rng([seed, 3]) at the scenario's gamma; bank mode
-        refuses the capture-level planning scenario."""
-        import sys as sys_
+        every observation branch (flat, capture-level, asym, noiseless, rank 2 with D_S; survival in each): main's
+        generator (MAIN_SIMULATE, dc64646's L349-475 verbatim, its text pinned by sha256) runs in this process beside
+        recovery.simulate, so the comparison is exact on whatever machine and numpy run it (main's output digests are
+        a machine's floating-point arithmetic, not a constant); for one seed bank mode's truth (eta, inter, c, energy,
+        cS, etaS, D_S, the settings but noise_model) is the planning truth byte for byte; the bank observations are
+        obslaw's sampler on the stream default_rng([seed, 3]) at the scenario's gamma; bank mode refuses the
+        capture-level planning scenario."""
+        import hashlib
         rec = self.rec
+        self.assertEqual(hashlib.sha256(MAIN_SIMULATE.encode("utf-8")).hexdigest(), MAIN_SIMULATE_SHA256)
         D = rec.Data(full())
         ns = dict(vars(rec))
         exec(compile(MAIN_SIMULATE, "recovery.py@dc64646", "exec"), ns)
-        pinned = t65_probe() == PIN_PROBE
-        if not pinned:
-            print(f"T6-5: this machine's floating-point probe {t65_probe()[:16]} differs from the pinning machine's "
-                  f"{PIN_PROBE[:16]}: the pins are that machine's digests; the embedded-main byte comparison binds here",
-                  file=sys_.stderr)
-        for sc, pin in T65_PINS.items():
+        self.assertIsNot(ns["simulate"], rec.simulate)
+        for sc in T65_SCENARIOS:
             seed = rqlib.derive_seed("rq-T6-5", sc, 0)
-            data = rec.simulate(D, rec.SCENARIOS[sc], seed)
-            self.assertEqual(sim_digest(data), sim_digest(ns["simulate"](D, rec.SCENARIOS[sc], seed)), sc)
-            if pinned:
-                self.assertEqual(sim_digest(data), pin, sc)
+            data, main = rec.simulate(D, rec.SCENARIOS[sc], seed), ns["simulate"](D, rec.SCENARIOS[sc], seed)
+            self.assertEqual(list(data), list(main), sc)
+            for k in main:                  # (compared as bytes; the message names the key, never the megabytes)
+                v, w = data[k], main[k]
+                if isinstance(w, np.ndarray):
+                    same = isinstance(v, np.ndarray) and (v.dtype, v.shape) == (w.dtype, w.shape) and \
+                        v.tobytes() == w.tobytes()
+                    self.assertTrue(same, f"{sc}: {k} differs from main dc64646's bytes")
+                else:
+                    self.assertTrue(repr(v) == repr(w), f"{sc}: {k} {repr(v)[:80]} != main's {repr(w)[:80]}")
+            self.assertEqual(sim_digest(data), sim_digest(main), sc)
             self.assertFalse({"mu", "loc", "obs", "noise_source"} & set(data), sc)
         for sc in ("r0", "r0_asym", "num_r1", "r2_034", "r1_017"):
             seed = rqlib.derive_seed("rq-T6-5", sc, 0)
