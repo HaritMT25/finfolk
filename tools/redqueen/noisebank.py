@@ -167,7 +167,8 @@ byte-for-byte; every D8 consumer refuses bank/2).
     writes an in-progress attempt record beside the ledger (<ledger>.attempts.jsonl, never the shared ledger), refreshed
     durably while it runs; finalization appends exactly one entry per attempt. A run killed hard (SIGKILL, OOM, a
     reboot) leaves its attempt open: every budget-dependent command refuses until d8-reconcile charges it its last
-    durable CPU plus 60 s.
+    durable CPU plus 60 s. Every D8 accounting command holds one exclusive lock on the ledger file for its whole
+    transaction and refuses, never waits, when another holds it.
     noisebank.py provenance --study BANK_ROOT --design D --plan P --obs OBS [--manifest M] --out PROV --ledger L
     noisebank.py d8-validation-spec --design D [--round 1] --out SPEC
     noisebank.py validate-d8 --spec SPEC --design D --out REPORT --ledger L
@@ -2531,12 +2532,17 @@ def _provenance(study, design_path, plan_path, obs_path, manifest_path, bindings
 #   - an attempts file BESIDE the ledger (<ledger>.attempts.jsonl; never the shared ledger): before its work every D8
 #     run writes an in-progress record, refreshed durably while it runs; finalization appends exactly one ledger entry
 #     per attempt (its id prevents a double charge) and closes the attempt; an attempt left open by a hard kill makes
-#     every budget-dependent command refuse until reconcile_attempts charges it.
+#     every budget-dependent command refuse until reconcile_attempts charges it;
+#   - (Codex revWP3b) one process-shared lock on the ledger (_LedgerLock) around every D8 accounting command, a charge
+#     already in the ledger committed only after the ledger is synced (_charge_once), and liveness refused when it
+#     cannot be determined (_attempt_alive).
 ATTEMPTS_SUFFIX = ".attempts.jsonl"   # (the attempts file of a ledger: <ledger>.attempts.jsonl)
-ATTEMPT_REFRESH_CPU_S = 30.0          # (a durable cpu_s refresh once this much CPU has passed since the last one; the
-ATTEMPT_POLL_S = 1.0                  #  refresher polls every ATTEMPT_POLL_S: durable refreshes < 60 CPU-s apart)
-RECONCILE_MARGIN_S = 60.0             # (a reconciled attempt is charged its last durable cpu_s + 60 s: conservative)
+ATTEMPT_REFRESH_CPU_S = 30.0          # (a durable cpu_s refresh SCHEDULED once this much CPU has passed since the last
+ATTEMPT_POLL_S = 1.0                  #  one, polled every ATTEMPT_POLL_S by a thread that needs the GIL: a long
+                                      #  GIL-holding call delays it; the gap on D8 work is measured, WP3 r3's probe)
+RECONCILE_MARGIN_S = 60.0             # (a reconciled attempt is charged its last durable cpu_s + 60 s)
 INTERRUPTED_KIND = "D8-noisebank-interrupted"   # (the ledger kind of a reconciled, hard-interrupted attempt)
+PROC = "/proc"                        # (the process table read for liveness; a test hook)
 
 
 def _cpu_s():
@@ -2627,9 +2633,81 @@ def ledger_add(path, entry):
         if size and os.pread(fd, 1, size - 1) != b"\n":
             raise NoiseBankError(f"D5 ledger {path}: the last line has no terminating newline (a torn append; refused)")
         _write_all(fd, data)
-        os.fsync(fd)
+        try:
+            os.fsync(fd)
+        except OSError as e:
+            raise NoiseBankError(f"D5 ledger {path}: the entry was written but its fsync failed ({type(e).__name__}: "
+                                 f"{e}); it is not committed and the attempt stays open (refused)") from None
     finally:
         os.close(fd)
+
+
+def _ledger_sync(path):
+    """fsync the ledger. A charge already visible in it is treated as committed only after this succeeds (Codex revWP3b
+    P2-R2-2: a line written by a process killed before its own fsync may not be durable); a failure refuses, leaving
+    the attempt open."""
+    try:
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError as e:
+        raise NoiseBankError(f"D5 ledger {path}: fsync failed ({type(e).__name__}: {e}); a charge already in the "
+                             "ledger is not treated as durable, and the attempt stays open (refused)") from None
+
+
+class _LedgerLock:
+    """THE D8 accounting lock (Codex revWP3b P2-R2-1; the coordinator's decision): one process-shared, exclusive,
+    non-blocking fcntl.flock on the EXISTING ledger file itself (opened read-only, never created), taken by every D8
+    command that reads or changes accounting state (provenance, validate-d8, estimate-d8: BEFORE the budget check,
+    held until the attempt is closed; d8-reconcile: through its whole check, charge and close). A held lock refuses at
+    once, naming the open attempt(s) recorded beside the ledger; it never waits. The kernel releases the lock when its
+    holder exits, a SIGKILL included (the holder's attempt then stays open for d8-reconcile). #68's ledger_add takes no
+    lock (flock is advisory): its appends are single-line O_APPEND writes, and #68 never writes a D8 attempt id, so
+    they can interleave with D8 appends line by line but never satisfy or duplicate a D8 charge."""
+
+    def __init__(self, ledger, command):
+        import fcntl
+        try:
+            fd = os.open(ledger, os.O_RDONLY)          # (no O_CREAT)
+        except FileNotFoundError:
+            raise NoiseBankError(f"D5 ledger {ledger}: no such file (the D8 commands require the existing cumulative "
+                                 "ledger and never create one)") from None
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(fd)
+            raise NoiseBankError(f"{command}: the D5 ledger {ledger} is locked by another D8 accounting command "
+                                 f"({_lock_holders(ledger)}): refused (one at a time; it never waits)") from None
+        except OSError as e:
+            os.close(fd)
+            raise NoiseBankError(f"{command}: the D5 ledger {ledger} cannot be locked ({type(e).__name__}: {e}; "
+                                 "refused)") from None
+        self.fd = fd
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, et, ev, tb):
+        import fcntl
+        try:
+            fcntl.flock(self.fd, fcntl.LOCK_UN)
+        finally:
+            os.close(self.fd)
+        return False
+
+
+def _lock_holders(ledger):
+    """The open attempt(s) beside the ledger, as context for a lock refusal (the holder's, when it has written one)."""
+    try:
+        op = open_attempts(ledger)
+    except NoiseBankError as e:
+        return f"the attempts file cannot be read: {e}"
+    if not op:
+        return "no open attempt recorded: a d8-reconcile, or a command before its attempt record"
+    return "open attempt(s): " + "; ".join(f"{k} ({v['open']['kind']}, pid {v['open']['pid']} on {v['open']['host']}, "
+                                           f"started {v['open']['utc_start']})" for k, v in op.items())
 
 
 def ledger_total(paths):
@@ -2733,28 +2811,47 @@ def _budget_check(ledger, command):
     return t
 
 
+def _read_proc(path):
+    with open(path) as f:
+        return f.read()
+
+
 def _boot_id():
     try:
-        with open("/proc/sys/kernel/random/boot_id") as f:
-            return f.read().strip() or None
+        return _read_proc(f"{PROC}/sys/kernel/random/boot_id").strip() or None
     except OSError:
         return None
 
 
 def _proc_stat(pid):
-    """(state, start time in clock ticks since boot) of a process from /proc/<pid>/stat, or None."""
+    """The process record of pid from <PROC>/<pid>/stat -> None when the process table has no such process
+    (CONFIRMED absence: FileNotFoundError), else (state, start time in clock ticks since boot). An unreadable record
+    (PermissionError, any other OSError) or an unparsable one raises NoiseBankError: liveness indeterminate, never
+    read as absence (Codex revWP3b P2-R2-3)."""
     try:
-        with open(f"/proc/{int(pid)}/stat") as f:
-            rest = f.read().rsplit(")", 1)[1].split()
-        return rest[0], int(rest[19])
-    except (OSError, ValueError, IndexError):
+        text = _read_proc(f"{PROC}/{int(pid)}/stat")
+    except FileNotFoundError:
         return None
+    except OSError as e:
+        raise NoiseBankError(f"{PROC}/{pid}/stat cannot be read ({type(e).__name__}: {e}): the process's liveness is "
+                             "indeterminate (refused)") from None
+    try:
+        rest = text.rsplit(")", 1)[1].split()
+        return rest[0], int(rest[19])
+    except (ValueError, IndexError):
+        raise NoiseBankError(f"{PROC}/{pid}/stat cannot be parsed: the process's liveness is indeterminate "
+                             "(refused)") from None
 
 
 def _attempt_alive(o):
-    """Whether an attempt's recorded process still runs (then it is not interrupted and is never reconciled): checked
-    on its own host only (another host is refused: reconcile it there), within the same boot (/proc boot_id), as the
-    pid with the recorded start time (a reused pid or a zombie is not it); without /proc, os.kill(pid, 0)."""
+    """Whether an attempt's recorded process still runs (then it is not interrupted and is never reconciled), True or
+    False only when CONFIRMED (Codex revWP3b P2-R2-3); anything indeterminate refuses (NoiseBankError, with context):
+      - another host: refused (reconcile it there);
+      - another boot (the boot id differs): gone;
+      - with a process table: no <PROC>/<pid> is confirmed absence (gone); a record with another start time (a reused
+        pid) or a zombie is gone; otherwise running; an unreadable or unparsable record is indeterminate;
+      - without a process table: os.kill(pid, 0): ESRCH is gone, success is running, EPERM or any other error is
+        indeterminate."""
     import platform
     if o.get("host") != platform.node():
         raise NoiseBankError(f"attempt {o.get('attempt')}: recorded on host {o.get('host')!r}, not "
@@ -2763,61 +2860,66 @@ def _attempt_alive(o):
     boot = _boot_id()
     if boot is not None and o.get("boot_id") is not None and o["boot_id"] != boot:
         return False
-    st = _proc_stat(o["pid"])
-    if st is not None:
+    if os.path.isdir(f"{PROC}/self"):
+        try:
+            st = _proc_stat(o["pid"])
+        except NoiseBankError as e:
+            raise NoiseBankError(f"attempt {o.get('attempt')} (pid {o.get('pid')}): {e}") from None
+        if st is None:
+            return False
         return st[0] != "Z" and (o.get("start_ticks") is None or st[1] == o["start_ticks"])
-    if boot is not None:
-        return False
     try:
         os.kill(int(o["pid"]), 0)
     except ProcessLookupError:
         return False
-    except PermissionError:
-        return True
+    except OSError as e:
+        raise NoiseBankError(f"attempt {o.get('attempt')} (pid {o.get('pid')}): os.kill(pid, 0) gives "
+                             f"{type(e).__name__} ({e}): the process's liveness is indeterminate (refused)") from None
     return True
 
 
 def _charge_once(ledger, entry):
-    """The attempt's one ledger entry, appended unless an entry with its attempt id is already in the ledger (the
-    idempotence of finalization and reconciliation) -> whether it was appended."""
-    if any(e.get("attempt") == entry["attempt"] for e in ledger_entries(ledger)):
-        return False
+    """The attempt's one ledger entry (called under the D8 lock): appended (ledger_add: one write, then fsync) unless
+    an entry with its attempt id is already in the ledger (the idempotence of finalization and reconciliation); such
+    an existing entry is treated as committed only after the ledger is synced (_ledger_sync; Codex revWP3b P2-R2-2),
+    and a failure refuses, the attempt staying open -> (the committed entry, whether it was appended)."""
+    prior = next((e for e in ledger_entries(ledger) if e.get("attempt") == entry["attempt"]), None)
+    if prior is not None:
+        _ledger_sync(ledger)
+        return prior, False
     ledger_add(ledger, entry)
-    return True
+    return dict(entry), True
 
 
 def reconcile_attempts(ledger):
-    """`noisebank.py d8-reconcile` (v5 2.11: interrupted runs are charged): every unclosed attempt beside the ledger
-    whose process is gone (a SIGKILL, an OOM kill, a reboot) is charged ONCE, its last durable cpu_s plus
-    RECONCILE_MARGIN_S (60 s, conservative: durable refreshes are < 60 CPU-s apart), as a normal ledger_add-format entry
-    of kind INTERRUPTED_KIND carrying its attempt id, and closed. Idempotent: an attempt whose id is already in the
-    ledger (its finalization stopped between the ledger append and the close) is closed without a second charge. A
-    still running attempt refuses the whole reconciliation. -> [{attempt, kind, charged_cpu_s (None: already charged),
-    charged_by}]"""
-    led = ledger_entries(ledger)
-    op = open_attempts(ledger)
-    for aid, a in op.items():
-        if _attempt_alive(a["open"]):
-            raise NoiseBankError(f"d8-reconcile: attempt {aid} (pid {a['open']['pid']} on {a['open']['host']}) is "
-                                 "still running: it is not interrupted, and nothing is reconciled (refused)")
-    out = []
-    for aid, a in op.items():
-        o = a["open"]
-        prior = next((e for e in led if e.get("attempt") == aid), None)
-        if prior is None:
+    """`noisebank.py d8-reconcile` (v5 2.11: interrupted runs are charged), holding the D8 lock (_LedgerLock) through
+    its whole check, charge and close: every unclosed attempt beside the ledger whose process is CONFIRMED gone (a
+    SIGKILL, an OOM kill, a reboot; _attempt_alive) is charged ONCE, its last durable cpu_s plus RECONCILE_MARGIN_S
+    (60 s), as a normal ledger_add-format entry of kind INTERRUPTED_KIND carrying its attempt id, and closed only after
+    that charge is durable. Idempotent: an attempt whose id is already in the ledger (its finalization stopped between
+    the ledger append and the close) is closed without a second charge, after the ledger is synced (_charge_once). A
+    running attempt, or one whose liveness cannot be determined, refuses the whole reconciliation before any charge.
+    -> [{attempt, kind, charged_cpu_s (None: already charged), charged_by}]"""
+    with _LedgerLock(ledger, "d8-reconcile"):
+        ledger_entries(ledger)
+        op = open_attempts(ledger)
+        for aid, a in op.items():
+            if _attempt_alive(a["open"]):
+                raise NoiseBankError(f"d8-reconcile: attempt {aid} (pid {a['open']['pid']} on {a['open']['host']}) is "
+                                     "still running: it is not interrupted, and nothing is reconciled (refused)")
+        out = []
+        for aid, a in op.items():
+            o = a["open"]
             entry = {"kind": INTERRUPTED_KIND, "status": "interrupted", "attempt": aid, "attempt_kind": o["kind"],
                      "command": o["command"], "utc_start": o["utc_start"], "cpu_s": a["cpu_s"] + RECONCILE_MARGIN_S,
                      "cpu_s_durable": a["cpu_s"], "margin_s": RECONCILE_MARGIN_S}
-            if not _charge_once(ledger, entry):
-                raise NoiseBankError(f"d8-reconcile: attempt {aid} was charged while reconciling (refused)")
-            charged, by, cpu = entry["cpu_s"], "reconcile", entry["cpu_s"]
-        else:
-            charged, by, cpu = None, "finalize (already in the D5 ledger)", float(prior["cpu_s"])
-        _attempt_append(ledger, {"event": "close", "attempt": aid, "cpu_s": cpu, "charged_by": by,
-                                 "status": "interrupted" if prior is None else prior.get("status"),
-                                 "utc": rqlib.now_utc()})
-        out.append({"attempt": aid, "kind": o["kind"], "charged_cpu_s": charged, "charged_by": by})
-    return out
+            committed, appended = _charge_once(ledger, entry)
+            by = "reconcile" if appended else "finalize (already in the D5 ledger; synced)"
+            _attempt_append(ledger, {"event": "close", "attempt": aid, "cpu_s": float(committed["cpu_s"]),
+                                     "charged_by": by, "status": committed.get("status"), "utc": rqlib.now_utc()})
+            out.append({"attempt": aid, "kind": o["kind"], "charged_cpu_s": committed["cpu_s"] if appended else None,
+                        "charged_by": by})
+        return out
 
 
 def d8_receipt(argv, fit, impl, utc_start, utc_end, cpu_s, entry):
@@ -3136,15 +3238,18 @@ class _Attempt:
     """One D8 run as an attempt, and its D5 charge (v5 2.11: failed and interrupted runs are charged; the
     coordinator's accounting plumbing, brief_WP3_r2 P2-2). BEFORE any substantial work, an in-progress record
     (attempt id, kind, command, UTC start, pid, host, boot id, process start ticks) is written durably to the attempts
-    file beside the ledger (attempts_path), never to the shared ledger. While the run works, the attempt's cumulative
-    cpu_s is refreshed durably at each major step (step) and by a background thread whenever ATTEMPT_REFRESH_CPU_S of
-    CPU has passed (polled every ATTEMPT_POLL_S), so the durable value lags the true CPU by less than 60 s. Finalization
-    (charge) appends exactly one ledger_add-format entry carrying the attempt id (idempotent: never twice for one id);
-    leaving the block closes the attempt. An exception after measure("ok") still charges "failed" ("interrupted" for
-    KeyboardInterrupt, i.e. SIGTERM through _d8_main), never the measured "ok"; an exception AFTER the charge (the
-    artifact write of estimate-d8) leaves the one entry and closes the attempt "failed" (its ledger_status kept). A
-    hard kill (SIGKILL, OOM, a reboot) leaves the attempt open: every budget-dependent command refuses
-    (_budget_check) until reconcile_attempts charges it. refresher=False: no thread (tests drive tick())."""
+    file beside the ledger (attempts_path), never to the shared ledger. The run_* commands open it under the D8 lock
+    (_LedgerLock), held until it is closed. While the run works, the attempt's cumulative cpu_s is refreshed durably
+    at each major step (step) and by a background thread SCHEDULED whenever ATTEMPT_REFRESH_CPU_S of CPU has passed
+    (polled every ATTEMPT_POLL_S; the thread needs the GIL, so a long GIL-holding call can delay it: the gap is
+    measured, not proven). Finalization (charge) appends exactly one ledger_add-format entry carrying the attempt id
+    (idempotent: never twice for one id; an entry already there is committed only after the ledger is synced);
+    leaving the block closes the attempt, only after its charge is durable. An exception after measure("ok") still
+    charges "failed" ("interrupted" for KeyboardInterrupt, i.e. SIGTERM through _d8_main), never the measured "ok";
+    an exception AFTER the charge (the artifact write of estimate-d8) leaves the one entry and closes the attempt
+    "failed" (its ledger_status kept). A hard kill (SIGKILL, OOM, a reboot) leaves the attempt open: every
+    budget-dependent command refuses (_budget_check) until reconcile_attempts charges it. refresher=False: no thread
+    (tests drive tick())."""
 
     def __init__(self, ledger, kind, command, refresher=True):
         import platform
@@ -3154,7 +3259,11 @@ class _Attempt:
         self.charged = self.closed = False
         self.error, self._last = None, 0.0
         self._lock, self._stop, self._thread = threading.Lock(), threading.Event(), None
-        st = _proc_stat(os.getpid())
+        self.committed = None
+        try:
+            st = _proc_stat(os.getpid())
+        except NoiseBankError:                  # (its own record unreadable: the start time stays unknown)
+            st = None
         _attempt_append(ledger, {"event": "open", "attempt": self.id, "kind": kind, "command": command,
                                  "utc_start": rqlib.now_utc(), "pid": os.getpid(), "host": platform.node(),
                                  "boot_id": _boot_id(), "start_ticks": None if st is None else st[1], "cpu_s": 0.0,
@@ -3210,11 +3319,11 @@ class _Attempt:
         return dict(self.entry)
 
     def charge(self):
-        """Finalization: the one ledger entry of this attempt (once)."""
+        """Finalization: the one ledger entry of this attempt (once), durable when this returns."""
         if not self.charged:
             self._halt()
             self.entry.setdefault("cpu_s", self.cpu())
-            _charge_once(self.ledger, self.entry)
+            self.committed, _ = _charge_once(self.ledger, self.entry)
             self.charged = True
 
     def __exit__(self, et, ev, tb):
@@ -3230,25 +3339,28 @@ class _Attempt:
         with self._lock:
             if (attempts_state(self.ledger).get(self.id) or {}).get("close") is None:   # (unless reconciled)
                 _attempt_append(self.ledger, {"event": "close", "attempt": self.id, "status": final,
-                                              "ledger_status": self.entry["status"], "cpu_s": self.entry["cpu_s"],
-                                              "charged_by": "finalize", "utc": rqlib.now_utc()})
+                                              "ledger_status": self.committed.get("status"),
+                                              "cpu_s": float(self.committed["cpu_s"]), "charged_by": "finalize",
+                                              "utc": rqlib.now_utc()})
             self.closed = True
         return False
 
 
 def run_provenance(study, design, plan, obs, manifest, out, ledger, bindings=None):
-    """`provenance` with its D5 charge: first the budget check (the existing, valid ledger; no unclosed attempt) and
-    the starting guard (>= D8_START_GUARD_H CPU-h remaining, v5 2.11 / 7), refused before any work; then the attempt
-    record (durable), the work, the receipt written durably, the charge -> the receipt."""
-    before = _budget_check(ledger, "provenance")
-    if before["remaining_h"] < D8_START_GUARD_H:
-        raise NoiseBankError(f"{before['remaining_h']:.2f} CPU-h remain on the D5 ledger, below the starting guard "
-                             f"{D8_START_GUARD_H} (A_design_v5 2.11, 7): refused")
-    with _Attempt(ledger, "D8-noisebank-provenance", "provenance") as att:
-        rec = provenance(study, design, plan, obs, manifest, bindings, progress=att.step)
-        rqlib.write_json_durable(out, rec)
-        att.measure("ok")
-        att.charge()
+    """`provenance` with its D5 charge: the D8 lock first (held until the attempt is closed), then the budget check
+    (the existing, valid ledger; no unclosed attempt) and the starting guard (>= D8_START_GUARD_H CPU-h remaining, v5
+    2.11 / 7), refused before any work; then the attempt record (durable), the work, the receipt written durably, the
+    charge -> the receipt."""
+    with _LedgerLock(ledger, "provenance"):
+        before = _budget_check(ledger, "provenance")
+        if before["remaining_h"] < D8_START_GUARD_H:
+            raise NoiseBankError(f"{before['remaining_h']:.2f} CPU-h remain on the D5 ledger, below the starting "
+                                 f"guard {D8_START_GUARD_H} (A_design_v5 2.11, 7): refused")
+        with _Attempt(ledger, "D8-noisebank-provenance", "provenance") as att:
+            rec = provenance(study, design, plan, obs, manifest, bindings, progress=att.step)
+            rqlib.write_json_durable(out, rec)
+            att.measure("ok")
+            att.charge()
     return rec
 
 
@@ -3257,32 +3369,37 @@ def run_estimate_d8(obs, ages, design, plan, prov, validation, out, receipt, led
     """`estimate-d8` with its receipt and D5 charge (v5 2.8 L755-757, 2.11): the budget check and the attempt record
     before the work; the refit; the receipt (with the ledger entry) written durably FIRST; that entry appended to the
     ledger (once, by attempt id); then the artifact that binds the receipt's sha256 (so every artifact's receipt
-    entry is in the ledger) -> the artifact. A receipt write failure is charged "failed", never the measured "ok"."""
-    _budget_check(ledger, "estimate-d8")
-    start = rqlib.now_utc()
-    with _Attempt(ledger, "D8-noisebank-refit", "estimate-d8") as att:
-        fit = estimate_d8(obs, ages, design, plan, prov, validation, bindings, boot, m, progress=att.step)
-        impl = d8_implementation()
-        entry = att.measure("ok")
-        rqlib.write_json_durable(receipt, d8_receipt(argv, fit, impl, start, rqlib.now_utc(), entry["cpu_s"], entry))
-        att.charge()
-        art = d8_artifact(fit, rqlib.sha256_file(receipt))
-        rqlib.write_json_durable(out, art)
+    entry is in the ledger) -> the artifact. A receipt write failure is charged "failed", never the measured "ok". The
+    D8 lock is held from before the budget check until the attempt is closed."""
+    with _LedgerLock(ledger, "estimate-d8"):
+        _budget_check(ledger, "estimate-d8")
+        start = rqlib.now_utc()
+        with _Attempt(ledger, "D8-noisebank-refit", "estimate-d8") as att:
+            fit = estimate_d8(obs, ages, design, plan, prov, validation, bindings, boot, m, progress=att.step)
+            impl = d8_implementation()
+            entry = att.measure("ok")
+            rqlib.write_json_durable(receipt, d8_receipt(argv, fit, impl, start, rqlib.now_utc(), entry["cpu_s"],
+                                                         entry))
+            att.charge()
+            art = d8_artifact(fit, rqlib.sha256_file(receipt))
+            rqlib.write_json_durable(out, art)
     return art
 
 
 def run_validate_d8(spec, design, out, ledger, bindings=None, **hooks):
     """`validate-d8` with its D5 charge: the budget check and the attempt record before the work; the report carries
     the ledger before the run and this run's entry (the after-validation check of v5 2.11 re-projects from them); a
-    report write failure is charged "failed" -> the report."""
-    before = _budget_check(ledger, "validate-d8")
-    start = rqlib.now_utc()
-    with _Attempt(ledger, "D8-noisebank-validation", "validate-d8") as att:
-        rep = validate_d8(rqlib.read_json(spec), design, bindings, progress=att.step, **hooks)
-        entry = att.measure("ok")
-        rep.update(ledger_before=before, ledger_entry=dict(entry), utc_start=start, utc_end=rqlib.now_utc())
-        rqlib.write_json_durable(out, rep)
-        att.charge()
+    report write failure is charged "failed" -> the report. The D8 lock is held from before the budget check until the
+    attempt is closed."""
+    with _LedgerLock(ledger, "validate-d8"):
+        before = _budget_check(ledger, "validate-d8")
+        start = rqlib.now_utc()
+        with _Attempt(ledger, "D8-noisebank-validation", "validate-d8") as att:
+            rep = validate_d8(rqlib.read_json(spec), design, bindings, progress=att.step, **hooks)
+            entry = att.measure("ok")
+            rep.update(ledger_before=before, ledger_entry=dict(entry), utc_start=start, utc_end=rqlib.now_utc())
+            rqlib.write_json_durable(out, rep)
+            att.charge()
     return rep
 
 
