@@ -2176,6 +2176,67 @@ class TestModel(TmpDir):
             m.generate(rng, qi, pj, 3, 2, mu, gamma=2.0)
 
 
+def _code_of(path):
+    """A source file with its comments and string literals blanked (the tokenizer's view of its CODE), as
+    test_T2_3_obslaw_derives_no_age_arithmetic reads obslaw.py."""
+    src = rqlib.read_text(path)
+    drop = {tokenize.COMMENT, tokenize.STRING} | {getattr(tokenize, n) for n in ("FSTRING_MIDDLE", "TSTRING_MIDDLE")
+                                                  if hasattr(tokenize, n)}
+    starts = [0]
+    for line in src.splitlines(keepends=True):
+        starts.append(starts[-1] + len(line))
+    chars = list(src)
+    for tok in tokenize.generate_tokens(io.StringIO(src).readline):
+        if tok.type in drop:
+            for i in range(starts[tok.start[0] - 1] + tok.start[1], starts[tok.end[0] - 1] + tok.end[1]):
+                if chars[i] != "\n":
+                    chars[i] = " "
+    return "".join(chars)
+
+
+@NEED_NP
+class TestRecoveryAgeClockT2(TmpDir):
+    """T2's recovery.py parts (A_design_v5 1.3, 4.1; 5 T2-2, T2-3; WP4): bank-mode recovery takes the ceiling from the
+    loaded model only (the artifact's survivor_ceiling, which the loader checks against #90's clock through
+    material.cohort_ceiling at every load) and binds the model's age_clock in its configuration."""
+
+    def ns(self, bp, tp):
+        import argparse
+        return argparse.Namespace(obs_model="bank", bank=bp, obs_tables=tp, allow_synthetic_bank=False)
+
+    def test_T2_2_the_recovery_configuration_binds_the_models_age_clock_and_ceiling(self):
+        import argparse
+        import recovery
+        bp, tp = _model_fixture(self.tmp)
+        obs = recovery.load_model(self.ns(bp, tp))
+        om = recovery.observation_model(argparse.Namespace(obs_model="bank"), obs)
+        self.assertEqual(om["age_clock"], material.age_clock_identity())
+        self.assertEqual((om["survivor_ceiling"], om["cohort_sha256"]), (247, material.AGES_SHA256))
+        self.assertEqual((obs.M_H, obs.c_H), (material.cohort_ceiling(material.registered_ages(), 5000, 0.016), 247 / 600))
+
+    def test_T2_3_recovery_tools_derive_no_age_arithmetic(self):
+        """Static guard over recovery.py, recovery_extra.py and map.py CODE (comments and strings blanked): no clock
+        helper, no start-age or max_age feasibility arithmetic, no import of common, no ceiling computed (bank mode
+        reads M_H from the model)."""
+        for name in ("recovery.py", "recovery_extra.py", "map.py"):
+            code = _code_of(os.path.join(HERE, name))
+            for pat in (r"\bcommon\.", r"age_feasible", r"age_death_frame", r"binary32\(", r"_CLOCKS", r"cohort_ceiling",
+                        r"\bages\b.*\*\s*(DT|0\.016)", r"max_age\s*[-+*/<>]", r"^\s*(import|from)\s+common\b",
+                        r"registered_ages\("):
+                self.assertIsNone(re.search(pat, code, re.M), (name, pat))
+        self.assertIn("obs.M_H", _code_of(os.path.join(HERE, "recovery.py")))
+
+    def test_T2_3_a_monkeypatched_clock_refuses_the_recovery_load(self):
+        """Monkeypatching common.age_feasible_count changes the ceiling the model computes, and recovery's bank-mode
+        load (every worker's) then refuses, naming it."""
+        import recovery
+        bp, tp = _model_fixture(self.tmp)
+        with mock.patch.object(common, "age_feasible_count", lambda *a, **k: 246):
+            with self.assertRaisesRegex(SystemExit, "cohort_ceiling 246"):
+                recovery.load_model(self.ns(bp, tp))
+        self.assertEqual(recovery.load_model(self.ns(bp, tp)).M_H, 247)
+
+
 # ================================================================== the #68 adoption gates
 _GATE68 = r"""
 import json, sys

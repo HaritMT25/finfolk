@@ -3742,5 +3742,775 @@ class TestMapBankMode(unittest.TestCase):
         self.assertEqual(float(ref_log_sf(np.array([math.inf]))[0]), -math.inf)
 
 
+# main dc64646's planning generator, verbatim (recovery.py L349-475 @dc64646): T6-5 runs it beside recovery.simulate on
+# the same machine, so the byte comparison does not depend on the platform's floating-point libraries.
+MAIN_SIMULATE = '''
+def simulate(D, sc, seed):
+    """-> the truth (eta per pair, the interaction) and the data (empirical logits, R per pair)."""
+    s = dict(DEFAULTS, **sc)
+    rng = np.random.default_rng(seed)
+    nW = len(D.worlds)
+    T = 201
+    qual = {}
+    for g in ("Q", "P"):
+        lat = np.empty((nW + 4, T))
+        for w in range(nW + 4):           # (the last four: the sentinels the references come from)
+            tr = D.treat[w] if w < nW else "C"
+            rise = s["rise"] * (1.0 if tr == "C" else 0.7 if tr == "A" else 0.85)
+            lat[w] = rise * _rise(np.arange(T)) + _walk(rng, T, s["rw_end"])
+        qual[g] = lat
+    rank = s["rank"]
+
+    def embed():
+        if rank == 0:
+            return None
+        out = np.empty((nW + 4, T, rank))
+        if s["clustered"]:
+            centres = rng.normal(0.0, 1.5, (4, rank))
+            for w in range(nW + 4):
+                k = rng.integers(4)
+                for t in range(T):
+                    if rng.random() < 0.02:
+                        k = rng.integers(4)
+                    out[w, t] = centres[k]
+        else:
+            for w in range(nW + 4):
+                out[w] = rng.normal(0.0, 1.0, rank) + _walk(rng, T, 1.0, rank)
+        return out
+    emb = {"Q": embed(), "P": embed()}
+
+    def node_vals(g, wv, tv, ref, sidx):
+        sent = np.where(ref, nW + sidx, wv)              # (a reference's history: its ACTUAL sentinel's)
+        x = qual[g][sent, tv] + rng.normal(0.0, s["snap_sd"], len(wv))
+        e = None
+        if rank:
+            e = emb[g][sent, tv] + rng.normal(0.0, 0.3, (len(wv), rank))
+            e -= e[ref].mean(axis=0)               # centred on the eight references (v4 §6.3)
+        return x, e
+    b, u = node_vals("Q", D.qw, D.qt, D.qref, D.qsent)
+    a, v = node_vals("P", D.pw, D.pt, D.pref, D.psent)
+    eta0 = s["mu0"] + a[D.pj] - b[D.qi] - s["kappa"] * a[D.pj] * b[D.qi]
+    own = np.zeros(len(D.qi))
+    if D.within.any():
+        lag = (D.pt[D.pj] - D.qt[D.qi])[D.within]
+        wdev = rng.normal(0.0, 0.08, len(D.worlds))
+        own[D.within] = (s["own"] + wdev[D.qw[D.qi][D.within]]) * np.exp(-np.abs(lag) / 8.0)
+    inter = np.zeros(len(D.qi))
+    c = 0.0
+    if rank:
+        raw = (u[D.qi] * v[D.pj]).sum(axis=1)
+        res = raw - additive_projection(D, raw)
+        base = eta0 + own
+        c = 0.1
+        for _ in range(20):                       # c^2 Var(residual) = energy x Var(signal)
+            c = math.sqrt(s["energy"] * np.var(base + c * raw) / np.var(res))
+        inter = c * raw
+    eta = eta0 + own + inter
+    cnt = None
+    if s["noiseless"]:
+        z = np.repeat(eta[:, None], R_REPS, axis=1)
+    elif s["noise_model"] == "capture":
+        # the row / column / cell structure kept, its total per-pair SD set by the pair's capture level:
+        # the Gaussian part's SD g = sqrt(capture_sd^2 - binomial variance), at least 0.05
+        pt = 1.0 / (1.0 + np.exp(-eta))
+        if s["link"] == "asym":
+            pt = 0.03 + 0.77 * pt
+        flat = math.sqrt(s["noise_row"] ** 2 + s["noise_col"] ** 2 + s["noise_cell"] ** 2)
+        g = np.sqrt(np.maximum(capture_sd(pt, s["noise_scale"]) ** 2 - 1.0 / (B_COUNT * pt * (1.0 - pt)), 0.05 ** 2))
+        y = eta[:, None] + (g / flat)[:, None] * (
+            s["noise_row"] * rng.normal(size=(D.nQ, R_REPS))[D.qi]
+            + s["noise_col"] * rng.normal(size=(D.nP, R_REPS))[D.pj]
+            + s["noise_cell"] * rng.normal(size=(len(eta), R_REPS)))
+        p = 1.0 / (1.0 + np.exp(-y))
+        if s["link"] == "asym":
+            p = 0.03 + 0.77 * p
+        cnt = rng.binomial(B_COUNT, p)
+        z = np.log((cnt + 0.5) / (B_COUNT - cnt + 0.5))
+    else:
+        k = s["noise_scale"]
+        y = (eta[:, None] + k * s["noise_row"] * rng.normal(size=(D.nQ, R_REPS))[D.qi]
+             + k * s["noise_col"] * rng.normal(size=(D.nP, R_REPS))[D.pj]
+             + k * s["noise_cell"] * rng.normal(size=(len(eta), R_REPS)))
+        p = 1.0 / (1.0 + np.exp(-y))
+        if s["link"] == "asym":
+            p = 0.03 + 0.77 * p
+        cnt = rng.binomial(B_COUNT, p)
+        z = np.log((cnt + 0.5) / (B_COUNT - cnt + 0.5))
+    energy = float(np.var(c * (inter / c - additive_projection(D, inter / c))) / np.var(eta)) if rank else 0.0
+    out = {"eta": eta, "inter": inter, "z": z, "zbar": z.mean(axis=1), "c": c, "energy": energy, "settings": s}
+    if cnt is not None:
+        out["cnt"] = cnt.astype(np.int16)         # (the capture counts: the registered count score's data)
+    out.update(simulate_survival(D, s, seed, a, b, u, v, c, rank))
+    return out
+
+
+N_SURV = 600
+
+
+def simulate_survival(D, s, seed, a, b, u, v, c, rank):
+    """The survival head's truth and data (its own stream: the capture data stay what they were):
+    logit S_i0 = c_i (predator-free controls, one per prey snapshot x replicate), logit S_ij =
+    c_i - 0.6 (a_j - b_i) - 0.3 + c' u_i' D_S v_j (a full D_S); the prey-row noise of a replicate
+    is shared by its control and its exposed cells (the global seeds); survivors ~ Binomial(600)."""
+    rng = np.random.default_rng([seed, 2])
+    cS = 1.4 + 0.35 * rng.normal(size=D.nQ)
+    etaS = cS[D.qi] - 0.6 * (a[D.pj] - b[D.qi]) - 0.3
+    DS = None
+    if rank:
+        DS = rng.normal(size=(rank, rank)) / math.sqrt(rank)
+        etaS = etaS + 0.8 * c * (u[D.qi] * (v[D.pj] @ DS.T)).sum(axis=1)
+    if s["noiseless"]:
+        S = np.repeat(etaS[:, None], R_REPS, axis=1)
+        S0 = np.repeat(cS[:, None], R_REPS, axis=1)
+    else:
+        k = s["noise_scale"]
+        row = k * 0.15 * rng.normal(size=(D.nQ, R_REPS))
+        y = (etaS[:, None] + row[D.qi] + k * 0.10 * rng.normal(size=(D.nP, R_REPS))[D.pj]
+             + k * 0.15 * rng.normal(size=(len(etaS), R_REPS)))
+        y0 = cS[:, None] + row + k * 0.15 * rng.normal(size=(D.nQ, R_REPS))
+        lg = lambda x: np.log((x + 0.5) / (N_SURV - x + 0.5))  # noqa: E731
+        S = lg(rng.binomial(N_SURV, 1.0 / (1.0 + np.exp(-y))))
+        S0 = lg(rng.binomial(N_SURV, 1.0 / (1.0 + np.exp(-y0))))
+    return {"cS": cS, "etaS": etaS, "DS": DS, "s": S, "sbar": S.mean(axis=1), "s0": S0, "s0bar": S0.mean(axis=1)}
+'''
+
+
+# ================================================================== bank-mode recovery (A_design_v5 1, 3.1-3.8; WP4)
+# T6-5's pins: main dc64646's PLANNING simulate outputs on the full v4 test graph (full()), one per planning observation
+# branch -- flat r0, capture-level r1_017_cap, asym r0_asym, noiseless num_r1, rank 2 with D_S r2_034; the survival
+# branch in every one -- at seed derive_seed("rq-T6-5", scenario, 0), digested by sim_digest. Computed with
+# dc64646's tools/redqueen (scripts_P2/wp4_pin_main.py, 2026-11-15); the worktree's digests were equal.
+T65_PINS = {
+    "num_r1": "c2bb2e8e6f7ef7b238ccc3ad4e30e822f198212834e9b10c100ec6306a9e1b62",
+    "r0": "1921db4ca2343870207bcc573656104f04793e006b457357443b42f232b21759",
+    "r0_asym": "c10c58d398a0afde94c5a9037c8bfe19e68c4fd489d8270ae6d51783c6780fcf",
+    "r1_017_cap": "3a27e47c08307e13b536536546344af366a61e167d6c33d649fd816410993f13",
+    "r2_034": "fadd281e61f249d46920bb8285b142a84d1b1e95f45462c6017961929705f78d",
+}
+PIN_PROBE = "a41cf1b3617172d057a5c189a9c8d0244f1f4610162ea7d0646e5de0b68d7357"   # (t65_probe on the pinning machine:
+#                                                                            numpy 2.3.4, the laptop's WSL Python 3.12)
+# A bank with DISTINCT dyadic components, so every sharing class has its own latent correlation (C: 0.375 + 0.125 + 0.5,
+# S: 0.25 + 0.375 + 0.375; E = 1 - R - D exactly in binary, as the loader requires)
+T3_SR = [[0.375, 0.125, 0.0625], [0.125, 0.25, 0.1875], [0.0625, 0.1875, 0.5]]
+T3_SD = [[0.125, 0.0625], [0.0625, 0.375]]
+T3_SE = [[0.5, 0.25], [0.25, 0.375]]
+_BANKFIX = {}
+_T36_ERFC = None
+
+
+def t65_probe():
+    """A digest of the floating-point operations planning simulate uses (numpy's exp, log, sqrt, mean, var on fixed
+    inputs). The pins are byte digests of one machine's arithmetic: they bind wherever this probe equals PIN_PROBE;
+    elsewhere (another SIMD dispatch of exp / log) the embedded-main comparison of T6-5 is the byte check."""
+    import hashlib
+    x = np.linspace(-40.0, 40.0, 200_001)
+    parts = [np.exp(x), np.log(np.exp(x) + 0.5), 1.0 / (1.0 + np.exp(-x)), np.sqrt(np.abs(x)),
+             np.array([x.mean(), x.var(), np.var(np.sin(x))])]
+    return hashlib.sha256(b"".join(np.ascontiguousarray(p).tobytes() for p in parts)).hexdigest()
+
+
+def sim_digest(out):
+    """A digest of simulate's output: every array (dtype, shape, sha256 of its bytes), the settings' canonical JSON, the
+    floats by repr, None as None."""
+    import hashlib
+    d = {}
+    for k in sorted(out):
+        v = out[k]
+        if isinstance(v, np.ndarray):
+            d[k] = [v.dtype.str, list(v.shape), hashlib.sha256(np.ascontiguousarray(v).tobytes()).hexdigest()]
+        elif k == "settings":
+            d[k] = rqlib.canonical(v).decode("ascii")
+        elif v is None:
+            d[k] = None
+        else:
+            d[k] = repr(v)
+    return hashlib.sha256(json.dumps(d, sort_keys=True).encode()).hexdigest()
+
+
+def bank_doc(SR=None, SD=None, SE=None, synthetic=False):
+    """test_obslaw's synthetic bank/3 document (loader-valid: the registered input hashes, placeholder fit values; not
+    a bank fit), optionally with other components, written consistently into noise and their source
+    horizons["5000"].components (clarification 1 Addendum A C9: SigmaR_FF and the shares follow)."""
+    import test_obslaw as TO
+    d = TO.bank3_doc(synthetic=synthetic)
+    if SR is not None:
+        comp = d["horizons"]["5000"]["components"]
+        for k, m in (("SigmaR", SR), ("SigmaD", SD), ("SigmaE", SE)):
+            d["noise"][k] = [list(r) for r in m]
+            comp[k] = [list(r) for r in m]
+        comp["SigmaR_FF"]["value"] = float(SR[2][2])
+        comp["shares"] = {ch: {"row": float(SR[i][i]), "donor": float(SD[i][i]), "cell": float(SE[i][i])}
+                          for i, ch in enumerate("CS")}
+    return d
+
+
+def bank_files(key="default", doc=None):
+    """(bank path, tables path): a synthetic bank/3 document (bank_doc) and its gamma = 1 tables, built once per key
+    in this process as test_obslaw._model_fixture builds them (the validation curves' node values, under this bank's
+    identity), the document's synthetic flag admitted (allow_synthetic: the test flag)."""
+    if key not in _BANKFIX:
+        import atexit
+        import obslaw as ol
+        import test_obslaw as TO
+        d = tempfile.mkdtemp(prefix=f"rq-wp4-{key}-")
+        atexit.register(shutil.rmtree, d, True)
+        doc = doc or bank_doc()
+        bp, tp = os.path.join(d, "bank.json"), os.path.join(d, "obs_tables.npz")
+        rqlib.write_durable(bp, rqlib.canonical(doc))
+        bank = ol.BankArtifact(bp, allow_synthetic=doc["synthetic"])
+        loc = {}
+        for ch in ol.CHANNELS:
+            N, M = bank.law(ch)
+            src = TO.location_validation("C" if ch == "C" else "S")
+            ident = ol.location_identity(bank.s_logit[ch], ch, 1.0, N, M, src.identity["h"], bank.sha256)
+            loc[(ch, 1.0)] = ol.LocationTable(src.x, src.a, ident, src.record)
+        f = TO.fitter_validation()
+        fit = ol.FitterTable(f.x, f.m, f.V, f.A, f.L, ol.fitter_identity(bank.s_logit["C"], bank.sha256), f.record)
+        ol.ObsTables(loc, fit, bank.sha256).save(tp)
+        _BANKFIX[key] = (bp, tp)
+    return _BANKFIX[key]
+
+
+def toy_graph():
+    """test_recovery_extra's toy graph (64 worlds, references, a few thousand pairs: registered fits take seconds)."""
+    import test_recovery_extra as TX
+    return TX.toy()
+
+
+def counts_of(x, N):
+    """The counts behind empirical logits x = log((k + 1/2) / (N - k + 1/2))."""
+    return np.rint((N + 1) / (1.0 + np.exp(-x)) - 0.5).astype(np.int64)
+
+
+def t36_phi_cdf(x):
+    global _T36_ERFC
+    if _T36_ERFC is None:
+        _T36_ERFC = np.frompyfunc(math.erfc, 1, 1)
+    return 0.5 * _T36_ERFC(-np.asarray(x, float) / math.sqrt(2.0)).astype(float)
+
+
+def t36_reference(a1, s1, N1, M1, a2, s2, N2, M2, rho, cuts1, cuts2, h=4e-3, zmax=9.0):
+    """The DEFINITIONAL joint law of two counts K_i = min{M_i, floor(N_i sigma(a_i + s_i Z_i) + 1/2)} with (Z_1, Z_2)
+    bivariate standard normal, correlation rho (independent of obslaw): a trapezoid over z1 on [-zmax, zmax] with K_1
+    evaluated pointwise by its definition, and K_2's exact conditional law given z1 (P(K_2 >= k | z1) = P(a_2 + s_2 Z_2 >=
+    logit((k - 1/2) / N_2)), k = 1..M_2, the capped top category included) -> {E1, E2, E12, cov, joint (3 x 3 bins at
+    the integer cuts: K < c1, c1 <= K < c2, K >= c2)}."""
+    z = np.arange(-zmax, zmax + h / 2, h)
+    w = np.exp(-0.5 * z * z) / math.sqrt(2 * math.pi) * h
+    w[[0, -1]] *= 0.5
+    K1 = np.minimum(M1, np.floor(N1 / (1.0 + np.exp(-(a1 + s1 * z))) + 0.5))
+    k = np.arange(1, M2 + 1, dtype=float)
+    t = np.log((k - 0.5) / (N2 - k + 0.5))
+    G = t36_phi_cdf((rho * z[:, None] - (t[None, :] - a2) / s2) / math.sqrt(1.0 - rho * rho))
+    EK2 = G.sum(axis=1)
+
+    def ge(c):
+        return np.ones(len(z)) if c <= 0 else (np.zeros(len(z)) if c > M2 else G[:, c - 1])
+    b1 = np.digitize(K1, cuts1)
+    P2 = [1.0 - ge(cuts2[0]), ge(cuts2[0]) - ge(cuts2[1]), ge(cuts2[1])]
+    joint = np.array([[float(np.sum(w * (b1 == i) * P2[j])) for j in range(3)] for i in range(3)])
+    E1, E2, E12 = float(w @ K1), float(w @ EK2), float(w @ (K1 * EK2))
+    return {"E1": E1, "E2": E2, "E12": E12, "cov": E12 - E1 * E2, "joint": joint}
+
+
+@unittest.skipIf(np is None, "numpy is not installed (set RQ_PYLIB, or RQ_REQUIRE_NUMPY=1 to require it)")
+class TestRecoveryBankMode(unittest.TestCase):
+    """recovery.py in BANK mode (Red Queen recovery option A; A_design_v5.md 1, 3.1-3.8, 4; WP4) on a synthetic bank/3
+    (test_obslaw's fixture) and test_recovery_extra's toy graph: T3-1..T3-6 through recovery.simulate on its 8 x 8
+    reference grid with the test hook R_REPS = 2000 (A_design_v5 5: "bank mode, tiny graph, test hook R=2000"), T6-3
+    (excluded controls and outcomes), T6-4 (resolution and availability guards), T6-5 (planning byte-identical to main
+    dc64646 for every observation branch; bank truth = planning truth), T6-6 (the configuration binds the bank and its
+    tables), T6-9 (truth leakage). T6-1's spy (it needs the extra procedures' plan) and T7 are test_recovery_extra.py's;
+    T2's recovery parts are test_obslaw.py's."""
+
+    @classmethod
+    def setUpClass(cls):
+        import map as mapfit
+        import obslaw
+        import recovery
+        cls.M, cls.ol, cls.rec = mapfit, obslaw, recovery
+        cls.g = toy_graph()
+        cls.D = recovery.Data(cls.g)
+        cls.Dt = recovery.Data(dict(cls.g, edges=cls.g["edges"][:64]))   # (RQ:q x RP:p: rows and donors shared)
+        cls.bp, cls.tp = bank_files()
+        cls.obs = obslaw.BankObservationModel(cls.bp, cls.tp)
+        cls.bp3, cls.tp3 = bank_files("t3", bank_doc(T3_SR, T3_SD, T3_SE))
+        cls.obs3 = obslaw.BankObservationModel(cls.bp3, cls.tp3)
+
+    def ns(self, **kw):
+        import argparse as ap_
+        base = dict(graph=None, namespace="ns-bank", fitter="registered", options="a", ranks=1, lambdas="0.05",
+                    iters=2, ab_cap=-1, start="warm", basis=4, embedding=None, center=None, set="main",
+                    scenarios="r0", reps=0, jobs=1, obs_model="bank", bank=self.bp, obs_tables=self.tp,
+                    allow_synthetic_bank=False)
+        base.update(kw)
+        return ap_.Namespace(**base)
+
+    # ---------------------------------------------------------------- T3 (through recovery.simulate)
+    def test_T3_1_latents_per_sharing_class_through_recovery(self):
+        """T3-1: the latents recovery's bank path hands the sampler (obslaw.latent, spied) for THIS graph's pairs have
+        the bank's correlation per sharing class: one prey row and another predator Sigma_R, one donor and another
+        prey Sigma_D, one cell C-S Sigma_R + Sigma_D + Sigma_E, exposed-free Sigma_R[., F], nothing shared 0, across
+        replicates 0; unit variances. The bank's components are distinct per class (T3_SR / T3_SD / T3_SE)."""
+        rec, ol, D = self.rec, self.ol, self.Dt
+        got, real = {}, ol.latent
+
+        def spy(Z, f, qi, pj):
+            got["u"] = real(Z, f, qi, pj)
+            return got["u"]
+        with mock.patch.object(rec, "R_REPS", 2000), mock.patch.object(ol, "latent", spy):
+            data = rec.simulate(D, rec.SCENARIOS["r0"], 101, obs=self.obs3)
+        u = got["u"]
+        self.assertEqual((u["C"].shape, u["S"].shape, u["F"].shape), ((64, 2000), (64, 2000), (D.nQ, 2000)))
+        self.assertEqual(data["cnt"].shape, (64, 2000))
+        SR, SD, SE = (np.array(m) for m in (T3_SR, T3_SD, T3_SE))
+        q, p = D.qi[0], D.pj[0]
+        same_q = next(e for e in range(64) if D.qi[e] == q and D.pj[e] != p)
+        same_p = next(e for e in range(64) if D.pj[e] == p and D.qi[e] != q)
+        other = next(e for e in range(64) if D.qi[e] != q and D.pj[e] != p)
+        tol = 4.5 / math.sqrt(2000)
+        checks = [("row C-C", u["C"][0], u["C"][same_q], SR[0, 0]), ("row S-S", u["S"][0], u["S"][same_q], SR[1, 1]),
+                  ("row C-S", u["C"][0], u["S"][same_q], SR[0, 1]),
+                  ("donor C-C", u["C"][0], u["C"][same_p], SD[0, 0]), ("donor S-S", u["S"][0], u["S"][same_p], SD[1, 1]),
+                  ("cell C-S", u["C"][0], u["S"][0], SR[0, 1] + SD[0, 1] + SE[0, 1]),
+                  ("exposed-free C-F", u["C"][0], u["F"][q], SR[0, 2]), ("exposed-free S-F", u["S"][0], u["F"][q], SR[1, 2]),
+                  ("nothing shared", u["C"][0], u["C"][other], 0.0),
+                  ("replicates C", u["C"][0][:-1], u["C"][0][1:], 0.0), ("replicates F", u["F"][q][:-1], u["F"][q][1:], 0.0)]
+        for name, x, y, want in checks:
+            self.assertLessEqual(abs(float(np.corrcoef(x, y)[0, 1]) - want), tol, name)
+        for ch in "CSF":
+            self.assertLessEqual(abs(float(u[ch].var()) - 1.0), 0.03, ch)
+
+    def test_T3_2_a_singular_psd_sigma_r_generates_and_a_non_psd_one_is_refused(self):
+        """T3-2: the free-row convention's exactly singular Sigma_R (Schur complement 0) loads and generates through
+        recovery (eigen factor, never Cholesky); a non-PSD one is refused at the load, naming SigmaR."""
+        rec, ol = self.rec, self.ol
+        A, b = np.array(T3_SR)[:2, :2], np.array(T3_SR)[:2, 2]
+        ff = float(b @ np.linalg.solve(A, b))
+        SR = [list(r) for r in T3_SR]
+        SR[2][2] = ff
+        bp, tp = bank_files("singular", bank_doc(SR, T3_SD, T3_SE))
+        obs = ol.BankObservationModel(bp, tp)
+        self.assertLess(float(np.min(np.linalg.eigvalsh(np.array(SR)))), 1e-12)
+        data = rec.simulate(self.Dt, rec.SCENARIOS["r0"], 5, obs=obs)
+        for k in ("z", "s", "s0"):
+            self.assertTrue(np.all(np.isfinite(data[k])), k)
+        self.assertTrue(0 <= int(data["cnt"].min()) and int(data["cnt"].max()) <= 324)
+        bad = [list(r) for r in SR]
+        bad[2][2] = ff - 0.01
+        p = os.path.join(os.path.dirname(bp), "nonpsd.json")
+        rqlib.write_json_durable(p, bank_doc(bad, T3_SD, T3_SE))
+        with self.assertRaisesRegex(SystemExit, "SigmaR: not PSD"):
+            rec.load_model(self.ns(bank=p, obs_tables=tp))
+
+    def test_T3_3_the_replicate_variance_is_the_law_with_no_second_layer(self):
+        """T3-3: per pair, the replicate variance of z = ell_B(K) (R = 2000) is the bounded law's exact category variance
+        V_z at the pair's location and scale (test_obslaw's independent scalar oracle), within 4.5 SE; a second
+        (binomial) layer would add about 1/(B mu (1 - mu)), far outside on aggregate."""
+        import test_obslaw as TO
+        rec, D = self.rec, self.Dt
+        with mock.patch.object(rec, "R_REPS", 2000):
+            data = rec.simulate(D, rec.SCENARIOS["r0"], 202, obs=self.obs)
+        z, loc, mu = data["z"], data["loc"]["C"], data["mu"]["C"]
+        ell = np.log((np.arange(325) + 0.5) / (324 - np.arange(325) + 0.5))
+        dev, dev_b = [], []
+        for e in range(len(mu)):
+            if not 0.02 < mu[e] < 0.98:
+                continue
+            s = float(self.obs.s("C", np.array([mu[e]]))[0])
+            p = np.array(TO.oracle_probs(float(loc[e]), s, 324, 324))
+            m = float(p @ ell)
+            V, m4 = float(p @ (ell - m) ** 2), float(p @ (ell - m) ** 4)
+            se = math.sqrt((m4 - V * V) / 2000)
+            v = float(z[e].var())
+            self.assertLessEqual(abs(v - V), 4.5 * se, (e, v, V))
+            dev.append((v - V) / se)
+            dev_b.append((v - V - 1.0 / (324 * mu[e] * (1 - mu[e]))) / se)
+        self.assertGreater(len(dev), 30)
+        self.assertLess(float(np.mean(dev_b)), -3.0)
+        self.assertLess(abs(float(np.mean(dev))), 1.5)
+
+    def test_T3_4_one_free_control_per_prey_and_replicate_on_a_fixed_data(self):
+        """T3-4 (fixed Data, v2 P2 #9): the free controls come from the rows and free cells, drawn before any pair-sized
+        array, so pairs appended among the SAME nodes (same node universe and order) leave every control unchanged in
+        bank mode, while main's planning draw order (controls after the pair-sized draws) moves them; every exposed
+        pair of a prey node reads its node's one control (s0 is per prey node); generation is deterministic and the
+        procedures' masks are applied after it (the data are never rewritten)."""
+        rec, g = self.rec, self.g
+        base = g["edges"][:200]
+        have = {e[:2] for e in base}
+        qs = list(dict.fromkeys(e[0] for e in base))
+        ps = list(dict.fromkeys(e[1] for e in base))
+        extra = [(q, p, base[0][2], base[0][3], base[0][4]) for q in qs for p in ps if (q, p) not in have][:150]
+        D1, D2 = rec.Data(dict(g, edges=base)), rec.Data(dict(g, edges=base + extra))
+        self.assertEqual((D1.qkey, D1.pkey), (D2.qkey, D2.pkey))
+        self.assertEqual(len(D2.qi), len(D1.qi) + 150)
+        b1, b2 = (rec.simulate(D_, rec.SCENARIOS["r0"], 9, obs=self.obs) for D_ in (D1, D2))
+        self.assertTrue(np.array_equal(b1["s0"], b2["s0"]))
+        self.assertTrue(np.array_equal(b1["mu"]["F"], b2["mu"]["F"]))
+        p1, p2 = (rec.simulate(D_, rec.SCENARIOS["r0"], 9) for D_ in (D1, D2))
+        self.assertFalse(np.array_equal(p1["s0"], p2["s0"]))            # (planning: the control noise follows the cells)
+        self.assertEqual(b1["s0"].shape, (D1.nQ, rec.R_REPS))
+        again = rec.simulate(D1, rec.SCENARIOS["r0"], 9, obs=self.obs)
+        self.assertTrue(all(np.array_equal(b1[k], again[k]) for k in ("z", "s", "s0", "cnt")))
+        before = {k: b1[k].copy() for k in ("z", "s", "s0", "cnt")}
+        rec.forward_procedure(D1, b1, 0, [0.05], 1, 9)                  # (a mask applied after generation)
+        self.assertTrue(all(np.array_equal(before[k], b1[k]) for k in before))
+
+    def test_T3_5_bounded_survival_heads(self):
+        """T3-5: every survival count is at most M_H = 247 (exposed and free), the intended means are at most c_H =
+        247 / 600, and each cell's replicate mean of L / 600 tracks its intended mean (4.5 SE, R = 2000); the planning
+        survival counts of the same seed exceed 247 (main's Binomial(600) at sigma(eta) ~ 0.8)."""
+        rec, D = self.rec, self.Dt
+        with mock.patch.object(rec, "R_REPS", 2000):
+            data = rec.simulate(D, rec.SCENARIOS["r2_034"], 303, obs=self.obs)
+        cH = 247 / 600
+        for key, ch in (("s", "S"), ("s0", "F")):
+            L = counts_of(data[key], 600)
+            mu = data["mu"][ch]
+            self.assertLessEqual(int(L.max()), 247, key)
+            self.assertTrue(np.all((mu > 0) & (mu <= cH)), ch)
+            sd = L.std(axis=1, ddof=1) / 600
+            dev = np.abs(L.mean(axis=1) / 600 - mu)
+            self.assertTrue(np.all(dev <= 4.5 * np.maximum(sd, 1e-12) / math.sqrt(2000)), (ch, float(np.max(dev / sd))))
+        plan = rec.simulate(D, rec.SCENARIOS["r2_034"], 303)
+        self.assertGreater(int(counts_of(plan["s"], 600).max()), 247)
+
+    def test_T3_6_observable_count_dependence_per_sharing_class(self):
+        """T3-6 (v2 P2 #8): for each sharing class -- one cell C-S; one prey row C-C, S-S and C-S across predators; one
+        donor C-C and S-S; exposed-free S-F and C-F; different replicates -- the empirical covariance of the COUNTS
+        (R = 2000) and the joint frequencies of a 3 x 3 coarse binning match an independent definitional quadrature
+        (t36_reference) under the bivariate normal with the class's latent correlation, within 4 MC SE; the cells
+        include ceiling-heavy ones (mu_S / c and mu_F / c >= 0.95: the capped category). The truth is chosen so;
+        observe_bank generates. A sampler drawing exposed survival from independent normals fails the cell class."""
+        rec, ol, D, obs = self.rec, self.ol, self.Dt, self.obs3
+        SR, SD, SE = (np.array(m) for m in (T3_SR, T3_SD, T3_SE))
+        cq = np.where(np.arange(D.nQ) < 4, 3.5, 0.3)                       # (prey 0..3: mu_F / c = 0.97)
+        etaS = np.where(D.qi == D.qi[0], 3.2, 1.0)                          # (prey 0's cells: mu_S / c = 0.96)
+        eta = -1.0 + 0.03 * np.arange(64)
+        truth = {"eta": eta, "settings": dict(rec.DEFAULTS, noise_model="bank")}
+        tS = {"cS": cq, "etaS": etaS}
+
+        def generate(latent=None):
+            with mock.patch.object(rec, "R_REPS", 2000), \
+                    mock.patch.object(ol, "latent", latent or ol.latent):
+                ob = rec.observe_bank(D, truth, tS, obs, 404)
+            return ob, {"C": ob["cnt"].astype(np.int64), "S": counts_of(ob["s"], 600), "F": counts_of(ob["s0"], 600)}
+        ob, K = generate()
+        self.assertGreaterEqual(float(ob["mu"]["F"][D.qi[0]]) / obs.c_H, 0.95)
+        self.assertGreaterEqual(float(ob["mu"]["S"][0]) / obs.c_H, 0.95)
+        self.assertGreater(int((K["S"][0] == 247).sum()), 100)              # (the capped category is populated)
+        law = {"C": (324, 324), "S": (600, 247), "F": (600, 247)}
+        q0, qm = int(D.qi[0]), 4                                            # (prey 0: ceiling-heavy; prey 4: moderate)
+        em = next(e for e in range(64) if D.qi[e] == qm)
+        pm = int(D.pj[em])
+        em_q = next(e for e in range(64) if D.qi[e] == qm and D.pj[e] != pm)
+        em_p = next(e for e in range(64) if D.pj[e] == pm and D.qi[e] not in (qm, q0))
+        cell = SR[0, 1] + SD[0, 1] + SE[0, 1]
+        classes = [("cell C-S", ("C", em), ("S", em), cell, 0), ("cell C-S, ceiling-heavy S", ("C", 0), ("S", 0), cell, 0),
+                   ("row C-C", ("C", em), ("C", em_q), SR[0, 0], 0), ("row S-S", ("S", em), ("S", em_q), SR[1, 1], 0),
+                   ("row C-S", ("C", em), ("S", em_q), SR[0, 1], 0), ("donor C-C", ("C", em), ("C", em_p), SD[0, 0], 0),
+                   ("donor S-S", ("S", em), ("S", em_p), SD[1, 1], 0),
+                   ("exposed-free S-F", ("S", em), ("F", qm), SR[1, 2], 0),
+                   ("exposed-free C-F", ("C", em), ("F", qm), SR[0, 2], 0),
+                   ("exposed-free S-F, both ceiling-heavy", ("S", 0), ("F", q0), SR[1, 2], 0),
+                   ("replicates C-C", ("C", em), ("C", em), 0.0, 1), ("replicates S-F", ("S", em), ("F", qm), 0.0, 1)]
+
+        def ref_of(c1, c2, rho, K):
+            (ch1, i1), (ch2, i2) = c1, c2
+            a1, a2 = float(ob["loc"][ch1][i1]), float(ob["loc"][ch2][i2])
+            s1 = float(obs.s(ch1, np.array([ob["mu"][ch1][i1]]))[0])
+            s2 = float(obs.s(ch2, np.array([ob["mu"][ch2][i2]]))[0])
+            cuts = []
+            for ch, i in (c1, c2):
+                v = np.sort(K[ch][i])
+                c = [int(v[len(v) // 3]), int(v[2 * len(v) // 3])]
+                if c[1] <= c[0]:
+                    c = [c[0], c[0] + 1]
+                cuts.append(c)
+            return cuts, t36_reference(a1, s1, *law[ch1], a2, s2, *law[ch2], rho, cuts[0], cuts[1])
+
+        def compare(name, c1, c2, rho, lag, K):
+            x = K[c1[0]][c1[1]].astype(float)
+            y = K[c2[0]][c2[1]].astype(float)
+            if lag:
+                x, y = x[:-1], y[1:]
+            cuts, ref = ref_of(c1, c2, rho, K)
+            n = len(x)
+            prod = (x - x.mean()) * (y - y.mean())
+            ok = abs(float(prod.mean()) - ref["cov"]) <= 4 * float(prod.std()) / math.sqrt(n)
+            b1, b2 = np.digitize(x, cuts[0]), np.digitize(y, cuts[1])
+            for i in range(3):
+                for j in range(3):
+                    pr = ref["joint"][i, j]
+                    f = float(np.mean((b1 == i) & (b2 == j)))
+                    ok &= abs(f - pr) <= 4 * math.sqrt(max(pr * (1 - pr), 1.0 / n) / n)
+            ok &= abs(float(x.mean()) - ref["E1"]) <= 4 * float(x.std()) / math.sqrt(n) + 1e-9
+            return ok, float(prod.mean()), ref["cov"]
+        for name, c1, c2, rho, lag in classes:
+            ok, got, want = compare(name, c1, c2, rho, lag, K)
+            self.assertTrue(ok, f"{name}: count covariance {got:.3f} vs the quadrature's {want:.3f} (or a joint "
+                                "frequency / mean outside 4 SE)")
+        real = ol.latent
+
+        def independent_survival(Z, f, qi, pj):                           # (the negative control)
+            u = real(Z, f, qi, pj)
+            u["S"] = np.random.default_rng(7).standard_normal(u["S"].shape)
+            return u
+        _, Kbad = generate(independent_survival)
+        self.assertFalse(compare("cell C-S", ("C", em), ("S", em), cell, 0, Kbad)[0])
+
+    # ---------------------------------------------------------------- T6
+    def test_T6_3_excluded_controls_and_outcomes_cannot_influence_a_bank_fit(self):
+        """T6-3 (extends TestMap.test_control_access_and_invariance to bank mode): through the choke point any_fit
+        (bank: W, nu0 prior and score law), perturbing every excluded control and every outcome -- z, s and the counts
+        -- outside the forward fit's pairs leaves the fit bit-identical; an accessible control moves it."""
+        rec, M, D = self.rec, self.M, self.D
+        data = rec.simulate(D, rec.SCENARIOS["r1_017"], 41, obs=self.obs)
+        idx = D.forward["fit"]
+        ctrl = M.control_access(D, idx, rec.FORWARD_TMAX)
+        self.assertTrue(ctrl.any() and (~ctrl).any())
+        rng = np.random.default_rng(2)
+        bad = dict(data)
+        s0 = data["s0"].copy()
+        s0[~ctrl] += rng.normal(0.0, 3.0, s0[~ctrl].shape)
+        bad["s0"], bad["s0bar"] = s0, s0.mean(axis=1)
+        out = np.ones(len(D.qi), bool)
+        out[idx] = False
+        for key, bar in (("z", "zbar"), ("s", "sbar")):
+            x = data[key].copy()
+            x[out] += rng.normal(0.0, 2.0, x[out].shape)
+            bad[key], bad[bar] = x, x.mean(axis=1)
+        cnt = data["cnt"].copy()
+        cnt[out] = 324 - cnt[out]
+        bad["cnt"] = cnt
+
+        def fit(d_):
+            return rec.any_fit("registered", D, idx, d_, 1, 0.05, False, 6, 1, start="warm", ctrl=ctrl, basis=4)
+        f0, f1 = fit(data), fit(bad)
+        self.assertIsNotNone(f0["score_law"])
+        self.assertEqual(f0["objective"], f1["objective"])
+        for k in ("a", "b", "aS", "bS", "u", "v", "c", "DS", "covQ", "covP"):
+            self.assertTrue(np.array_equal(f0[k], f1[k]), k)
+        self.assertEqual((f0["phi"], f0["unit"], f0["table_extrapolated"]), (f1["phi"], f1["unit"], f1["table_extrapolated"]))
+        moved = dict(data)
+        s0 = data["s0"].copy()
+        s0[ctrl] += 0.5
+        moved["s0"], moved["s0bar"] = s0, s0.mean(axis=1)
+        self.assertNotEqual(fit(moved)["objective"], f0["objective"])
+
+    def flagged(self, where, model=None):
+        """recovery.scorer wrapped: a score of a set with where(ix) (and of a model with model(m)) also reports one
+        finite UNRESOLVED pair (grid_unresolved)."""
+        real = self.rec.scorer
+
+        def scorer(D, data, m, idx, fitter):
+            sc = real(D, data, m, idx, fitter)
+
+            def score(ix, info=None):
+                res = sc(ix, info)
+                if info is not None and where(ix) and (model is None or model(m)):
+                    info["grid_unresolved"] = info.get("grid_unresolved", 0) + 1
+                return res
+            return score
+        return mock.patch.object(self.rec, "scorer", scorer)
+
+    def test_T6_4_resolution_and_availability_guards_unchanged_in_bank_mode(self):
+        """T6-4: in bank mode the count score's integration diagnostics are reported per comparison (with the bank's
+        table_extrapolated), an UNRESOLVED score (grid_unresolved) in the test comparison or the selection is never
+        decided (unavailable, reason, no bound, success False; the selection-dependent metrics withheld), the
+        forward branches likewise, and fewer than MIN_TEST_WORLDS contributing test worlds leave the decision
+        unavailable: main's guards, unchanged."""
+        rec, D = self.rec, self.D
+        data = rec.simulate(D, dict(rank=1, energy=0.10), 13, obs=self.obs)
+        kw = dict(fitter="registered", start="warm", basis=4)
+        run = lambda: rec.procedure(D, data, "a", 1, [0.1], 3, 13, **kw)  # noqa: E731
+        base = run()
+        self.assertTrue(base["decision"]["available"], base["decision"])
+        self.assertEqual(base["integration_comparison"]["unresolved"], {"validation": 0, "test": 0, "snapshot": 0})
+        self.assertIn("table_extrapolated", base["integration_comparison"]["selected"])
+        with self.flagged(lambda ix: ix is D.test_idx):
+            out = run()
+        self.assertFalse(out["decision"]["available"])
+        self.assertRegex(out["decision"]["reason"], "UNRESOLVED")
+        self.assertFalse(out["success"])
+        self.assertIsNone(out["test_lb"])
+        self.assertIsNone(out["test_improvement"])
+        with self.flagged(lambda ix: ix is D.val_idx):
+            out = run()
+        self.assertTrue(out["decision"]["selection_unresolved"])
+        self.assertFalse(out["success"])
+        self.assertIsNone(out["classes"])
+        with self.flagged(lambda ix: ix is D.forward["tests"]["forward_transfer"]):
+            fw = rec.forward_procedure(D, data, 1, [0.1], 3, 13, **kw)
+        self.assertFalse(fw["forward_transfer"]["available"])
+        self.assertFalse(fw["success"])
+        with mock.patch.object(rec, "MIN_TEST_WORLDS", 99):
+            out = run()
+        self.assertFalse(out["decision"]["available"])
+        self.assertRegex(out["decision"]["reason"], "fewer than 99 contributing test worlds")
+        self.assertFalse(out["success"])
+
+    def test_T6_5_planning_is_main_byte_for_byte_and_bank_truth_is_planning_truth(self):
+        """T6-5 (v2 Codex note): planning-mode simulate on the full v4 test graph is main dc64646's byte for byte for
+        every observation branch (flat, capture-level, asym, noiseless, rank 2 with D_S; survival in each): against
+        main's generator run here (MAIN_SIMULATE, verbatim) and against main's pinned digests (T65_PINS, binding where
+        the floating-point probe equals the pinning machine's, PIN_PROBE); for one seed bank mode's truth (eta, inter,
+        c, energy, cS, etaS, D_S, the settings but noise_model) is the planning truth byte for byte; the bank
+        observations are obslaw's sampler on the stream default_rng([seed, 3]) at the scenario's gamma; bank mode
+        refuses the capture-level planning scenario."""
+        import sys as sys_
+        rec = self.rec
+        D = rec.Data(full())
+        ns = dict(vars(rec))
+        exec(compile(MAIN_SIMULATE, "recovery.py@dc64646", "exec"), ns)
+        pinned = t65_probe() == PIN_PROBE
+        if not pinned:
+            print(f"T6-5: this machine's floating-point probe {t65_probe()[:16]} differs from the pinning machine's "
+                  f"{PIN_PROBE[:16]}: the pins are that machine's digests; the embedded-main byte comparison binds here",
+                  file=sys_.stderr)
+        for sc, pin in T65_PINS.items():
+            seed = rqlib.derive_seed("rq-T6-5", sc, 0)
+            data = rec.simulate(D, rec.SCENARIOS[sc], seed)
+            self.assertEqual(sim_digest(data), sim_digest(ns["simulate"](D, rec.SCENARIOS[sc], seed)), sc)
+            if pinned:
+                self.assertEqual(sim_digest(data), pin, sc)
+            self.assertFalse({"mu", "loc", "obs", "noise_source"} & set(data), sc)
+        for sc in ("r0", "r0_asym", "num_r1", "r2_034", "r1_017"):
+            seed = rqlib.derive_seed("rq-T6-5", sc, 0)
+            p, b = rec.simulate(D, rec.SCENARIOS[sc], seed), rec.simulate(D, rec.SCENARIOS[sc], seed, obs=self.obs)
+            for k in ("eta", "inter", "cS", "etaS"):
+                self.assertEqual(p[k].tobytes(), b[k].tobytes(), (sc, k))
+            self.assertEqual(None if p["DS"] is None else p["DS"].tobytes(),
+                             None if b["DS"] is None else b["DS"].tobytes(), sc)
+            self.assertEqual((repr(p["c"]), repr(p["energy"])), (repr(b["c"]), repr(b["energy"])), sc)
+            self.assertEqual(dict(p["settings"], noise_model="bank"), b["settings"], sc)
+            self.assertEqual((b["noise_source"], b["obs"]), ("bank_d8", self.obs))
+            self.assertEqual("cnt" in b, not rec.SCENARIOS[sc].get("noiseless"), sc)
+            if "cnt" in b:                  # (the observations: obslaw's sampler on the stream default_rng([seed, 3]))
+                x = {"S": b["etaS"], "F": b["cS"]}
+                if b["settings"]["link"] == "logit":
+                    x["C"] = b["eta"]
+                g = self.obs.generate(np.random.default_rng([seed, 3]), D.qi, D.pj, D.nQ, D.nP, b["mu"], 1.0,
+                                      rec.R_REPS, x=x)
+                self.assertTrue(np.array_equal(g["counts"]["C"], b["cnt"]), sc)
+                self.assertTrue(np.array_equal(counts_of(b["s0"], 600), g["counts"]["F"]), sc)
+        with self.assertRaisesRegex(ValueError, "_cap"):
+            rec.simulate(D, rec.SCENARIOS["r1_017_cap"], 1, obs=self.obs)
+        with self.assertRaisesRegex(ValueError, "at gamma 2.0"):       # (gamma = the scenario's noise_scale: no table)
+            rec.simulate(self.Dt, rec.SCENARIOS["r1_017_noisy"], 1, obs=self.obs)
+
+    def test_T6_6_the_configuration_binds_the_bank_and_its_tables(self):
+        """T6-6: a bank-mode configuration records the observation model (A_design_v5 4.1: the bank artifact's and the
+        tables' sha256, the tables' identity, D8 / D9, the streams, the fitter's hooks) and tools_sha256 lists the
+        new sources; ONE changed byte of the artifact (its tables rebuilt) changes config_sha256 and refuses the
+        resume, and with the old tables refuses the load; a changed table array (re-hashed: it loads) changes it too;
+        an un-re-hashed table byte refuses the load."""
+        import test_obslaw as TO
+        rec = self.rec
+        tmp = tempfile.mkdtemp()
+        try:
+            gdir = os.path.join(tmp, "g")
+            graph.write(self.g, gdir)
+            gp = os.path.join(gdir, "graph.jsonl.gz")
+            out = os.path.join(tmp, "run")
+            want = rec.prepare_run(self.ns(graph=gp, out=out))
+            cfg = rqlib.read_json(os.path.join(out, "config.json"))
+            om = cfg["observation_model"]
+            self.assertEqual((om["mode"], om["noise_source"], om["accepting"]), ("bank", "bank_d8", True))
+            self.assertEqual((om["bank_artifact_sha256"], om["obs_tables_sha256"]),
+                             (rqlib.sha256_file(self.bp), rqlib.sha256_file(self.tp)))
+            self.assertEqual(om["amendment_D9_sha256"], rec.D9_SHA256)
+            self.assertEqual(om["streams"], {"truth": "default_rng(seed)", "survival_truth": "default_rng([seed,2])",
+                                             "observations": "default_rng([seed,3])"})
+            self.assertEqual(om["fitter"], {"var_fn": "W", "rep_prior": "nu0_C", "score_law": "A,L"})
+            self.assertTrue({"noisescale.py", "common.py", "material.py", "obslaw.py", "fixtures/registered_ages.json",
+                             "recovery.py", "map.py"} <= set(cfg["tools_sha256"]))
+            self.assertEqual(rec.prepare_run(self.ns(graph=gp, out=out)), want)            # (an unchanged resume)
+            doc = bank_doc()
+            old = rqlib.canonical(doc)
+            h = doc["fit"]["noise"]["receipt_sha256"]
+            doc["fit"]["noise"]["receipt_sha256"] = h[:-1] + ("0" if h[-1] != "0" else "1")
+            self.assertEqual(sum(x != y for x, y in zip(old, rqlib.canonical(doc))), 1)    # (exactly one byte)
+            bp2, tp2 = bank_files("onebyte", doc)
+            with self.assertRaisesRegex(SystemExit, "another configuration"):
+                rec.prepare_run(self.ns(graph=gp, out=out, bank=bp2, obs_tables=tp2))
+            with self.assertRaisesRegex(SystemExit, "another bank artifact"):
+                rec.prepare_run(self.ns(graph=gp, out=out, bank=bp2, obs_tables=self.tp))
+            raw = rqlib.read_bytes(self.tp)
+            data, content = TO._rehashed_tables(raw, {"fit_V": lambda a: a * np.where(np.arange(len(a)) == 7, 1.001, 1.0)})
+            tp3 = os.path.join(tmp, "tables_changed.npz")
+            rqlib.write_durable(tp3, data)
+            self.assertNotEqual(rec.prepare_run(self.ns(graph=gp, out=os.path.join(tmp, "other"), obs_tables=tp3)), want)
+            with self.assertRaisesRegex(SystemExit, "another configuration"):
+                rec.prepare_run(self.ns(graph=gp, out=out, obs_tables=tp3))
+            i = raw.index(b"fit_V.npy") + 400
+            tp4 = os.path.join(tmp, "tables_flipped.npz")
+            rqlib.write_durable(tp4, raw[:i] + bytes([raw[i] ^ 1]) + raw[i + 1:])
+            with self.assertRaisesRegex(SystemExit, "obs-model bank"):
+                rec.prepare_run(self.ns(graph=gp, out=out, obs_tables=tp4))
+        finally:
+            shutil.rmtree(tmp)
+
+    def test_T6_9_truth_only_fields_never_reach_a_bank_fit_score_or_selection(self):
+        """T6-9 (v2 P2 #8): on a noisy bank-mode dataset, REPLACING every truth-only field (eta, inter, mu, loc, c,
+        energy, settings -- a capture-level asym x4 planning setting --, cS, etaS, DS) or DELETING them all, with the
+        observations and obs fixed, leaves every candidate's fitted parameters, the predictive scores, the selection,
+        the bounds and the success flags of the legacy and forward procedures identical; only the labelled truth
+        diagnostics (test_rmse_truth, classes) may change. Control: in PLANNING mode the same settings change the
+        fit (var_model reads them)."""
+        rec, D = self.rec, self.D
+        data = rec.simulate(D, rec.SCENARIOS["r1_034"], 77, obs=self.obs)
+        kw = dict(fitter="registered", start="warm", basis=4)
+        real = rec.any_fit
+
+        def run(d_):
+            fits = []
+
+            def spy(*a, **k):
+                m = real(*a, **k)
+                fits.append(m)
+                return m
+            with mock.patch.object(rec, "any_fit", spy):
+                out = rec.procedure(D, d_, "a", 1, [0.05], 3, 7, **kw)
+                fw = rec.forward_procedure(D, d_, 1, [0.05], 3, 7, **kw)
+            return out, fw, fits
+
+        def strip(x):
+            if isinstance(x, dict):
+                return {k: strip(v) for k, v in x.items() if k not in ("seconds", "test_rmse_truth", "classes")}
+            if isinstance(x, list):
+                return [strip(v) for v in x]
+            return x
+        rng = np.random.default_rng(5)
+        settings = dict(rec.DEFAULTS, noise_model="capture", noise_scale=4.0, link="asym", rank=3, noiseless=False)
+        replaced = dict(data, eta=rng.normal(size=data["eta"].shape), inter=rng.normal(size=data["inter"].shape),
+                        mu={k: rng.random(v.shape) for k, v in data["mu"].items()},
+                        loc={k: rng.normal(size=v.shape) for k, v in data["loc"].items()}, c=123.0, energy=-1.0,
+                        settings=settings, cS=rng.normal(size=data["cS"].shape),
+                        etaS=rng.normal(size=data["etaS"].shape), DS=np.eye(1) * 5.0)
+        deleted = {k: v for k, v in data.items() if k not in rec.TRUTH_ONLY}
+        self.assertEqual(set(rec.TRUTH_ONLY) - set(data), set())
+        out0, fw0, fits0 = run(data)
+        self.assertGreater(len(fits0), 2)
+        for name, variant in (("replaced", replaced), ("deleted", deleted)):
+            out, fw, fits = run(variant)
+            self.assertEqual(len(fits), len(fits0), name)
+            for m0, m1 in zip(fits0, fits):
+                for k in ("a", "b", "aS", "bS", "u", "v", "c", "DS", "covQ", "covP"):
+                    self.assertTrue(np.array_equal(m0[k], m1[k]), (name, k))
+                self.assertEqual([m0[k] for k in ("objective", "phi", "unit", "pair_var", "rep_prior", "var_fn_identity")],
+                                 [m1[k] for k in ("objective", "phi", "unit", "pair_var", "rep_prior", "var_fn_identity")],
+                                 name)
+            self.assertEqual(json.dumps(strip(out), sort_keys=True), json.dumps(strip(out0), sort_keys=True), name)
+            self.assertEqual(json.dumps(strip(fw), sort_keys=True), json.dumps(strip(fw0), sort_keys=True), name)
+        self.assertIsNone(rec.procedure(D, deleted, "a", 1, [0.05], 3, 7, **kw)["classes"])
+        plan = rec.simulate(D, rec.SCENARIOS["r1_034"], 77)
+        f0 = rec.any_fit("registered", D, D.fit["a"], plan, 1, 0.05, False, 3, 7, start="warm", basis=4)
+        f1 = rec.any_fit("registered", D, D.fit["a"], dict(plan, settings=settings), 1, 0.05, False, 3, 7, start="warm",
+                         basis=4)
+        self.assertNotEqual(f0["objective"], f1["objective"])
+
+
 if __name__ == "__main__":
     unittest.main()
