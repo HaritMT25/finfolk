@@ -37,8 +37,10 @@
       from it), an end-to-end run at a test size; A's assembly of a generator artifact (2.8) and T5-4 against the
       pinned #68 commit (adoption gate: RQ_PR68_DIR; skipped without it, the only permitted skip);
     - the D5 ledger and the attempt records (2.11): every entry validated, no implicit ledger, the durable
-      in-progress attempt and its refreshes, a late failure charged as one, a SIGKILLed run refused until
-      reconciled and then charged once (its last durable CPU + 60 s).
+      in-progress attempt and its scheduled refreshes, a late failure charged as one, a SIGKILLed run refused until
+      reconciled and then charged once (its last durable CPU + 60 s); the D8 lock (two-process races: simultaneous
+      starts, simultaneous reconciles), an existing charge committed only after a ledger sync (a kill and a failed
+      fsync at the append-before-fsync boundary), liveness refused when indeterminate.
 numpy required for the estimator (RQ_REQUIRE_NUMPY=1 makes a missing numpy a failure).
 
     python3 -I tools/redqueen/test_noisebank.py [-v]
@@ -2837,13 +2839,96 @@ def burn(*args, **kw):                   # (CPU-bound until SIGKILLed; no major 
 nb.validate_d8 = burn
 nb.run_validate_d8(sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[2], bindings={})
 '''
+_DIE_CHILD = r'''
+import os
+import sys
+sys.path.insert(0, sys.argv[1])
+import noisebank as nb
+
+
+def die(*args, **kw):                    # (the process ends inside its attempt, as a SIGKILL ends it)
+    os._exit(9)
+
+
+nb.validate_d8 = die
+nb.run_validate_d8(sys.argv[3], "d", sys.argv[4], sys.argv[2], bindings={})
+'''
+_RACE_START = r'''
+import os
+import sys
+import time
+sys.path.insert(0, sys.argv[1])
+import noisebank as nb
+led, spec, out, release = sys.argv[2:6]
+
+
+def hold(*args, **kw):                   # (the winner keeps its attempt, and the lock, until the parent releases it)
+    while not os.path.exists(release):
+        time.sleep(0.02)
+    return {"acceptance": {"accepted": True}}
+
+
+nb.validate_d8 = hold
+print("ready", flush=True)
+sys.stdin.readline()                     # (the start barrier: one parent write releases each child)
+try:
+    nb.run_validate_d8(spec, "d", out, led, bindings={})
+    print("ran", flush=True)
+except nb.NoiseBankError as e:
+    print("refused:", e, flush=True)
+'''
+_RACE_RECONCILE = r'''
+import os
+import sys
+import time
+sys.path.insert(0, sys.argv[1])
+import noisebank as nb
+led, release = sys.argv[2:4]
+real = nb.ledger_add
+
+
+def held_add(path, entry):               # (the winner holds its transaction at the charge until the parent releases it)
+    while not os.path.exists(release):
+        time.sleep(0.02)
+    return real(path, entry)
+
+
+nb.ledger_add = held_add
+print("ready", flush=True)
+sys.stdin.readline()
+try:
+    print("done", nb.reconcile_attempts(led), flush=True)
+except nb.NoiseBankError as e:
+    print("refused:", e, flush=True)
+'''
+_SYNC_KILL_CHILD = r'''
+import os
+import signal
+import sys
+sys.path.insert(0, sys.argv[1])
+import noisebank as nb
+led = os.path.realpath(sys.argv[2])
+real_fsync = os.fsync
+
+
+def fsync(fd):                           # (killed after its ledger line is written, before the ledger's fsync)
+    if os.path.realpath(f"/proc/self/fd/{fd}") == led:
+        os.kill(os.getpid(), signal.SIGKILL)
+    return real_fsync(fd)
+
+
+nb.validate_d8 = lambda *args, **kw: {"acceptance": {"accepted": True}}
+os.fsync = fsync
+nb.run_validate_d8(sys.argv[3], "d", sys.argv[4], sys.argv[2], bindings={})
+'''
 
 
 @unittest.skipIf(np is None, "numpy is not installed")
 class TestD8Ledger(unittest.TestCase):
     """The cumulative D5 ledger and the attempt records (v5 2.11: failed and interrupted runs are charged; Codex
-    revWP3 P2-1, P2-2): fail-closed reading, no implicit ledger, the durable in-progress attempt record and its
-    refreshes, the late-failure status, a SIGKILLed run refused until reconciled and then charged once."""
+    revWP3 P2-1, P2-2; revWP3b P2-R2-1..3): fail-closed reading, no implicit ledger, the durable in-progress attempt
+    record and its scheduled refreshes, the late-failure status, a SIGKILLed run refused until reconciled and then
+    charged once; the D8 lock across processes, the durable commit of an existing charge, liveness refusals."""
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
@@ -2917,11 +3002,12 @@ class TestD8Ledger(unittest.TestCase):
         with self.assertRaisesRegex(nb.NoiseBankError, "exists"):
             nb.ledger_init_empty(new)
 
-    def test_P2_2_the_attempt_is_durable_before_the_work_and_refreshed_under_60_cpu_s(self):
+    def test_P2_2_the_attempt_is_durable_before_the_work_and_its_refreshes_are_scheduled(self):
         """The in-progress record (attempt id, kind, command, UTC start, pid, host) is in the attempts file beside the
         ledger, never in the ledger, from the attempt's start; its cumulative cpu_s is refreshed durably at each major
-        step and, by the refresher's poll, whenever 30 CPU-s have passed, so the durable value never lags the CPU by
-        60 s (a fake CPU clock); finalization appends one entry with the attempt id, once, and closes the attempt."""
+        step and SCHEDULED by the refresher's poll whenever 30 CPU-s have passed (a fake CPU clock driving tick(): the
+        scheduling logic only; the real gap on D8 work, where a GIL-holding call can delay the thread, is measured by
+        WP3 r3's probe); finalization appends one entry with the attempt id, once, and closes the attempt."""
         import platform
         led = self.ledger()
         clock = [100.0]
@@ -3023,11 +3109,12 @@ class TestD8Ledger(unittest.TestCase):
             nb._attempt_alive(dict(o, host=platform.node() + "-elsewhere"))
 
     def test_P2_2_a_SIGKILLed_run_is_refused_until_reconciled_and_charged_once(self):
-        """A validate-d8 child SIGKILLed mid-run (CPU-bound; only the refresher writes, at a test-speed 0.2 CPU-s)
-        leaves its attempt open with durable progress and charges nothing; every budget-dependent command then refuses
-        before its work; d8-reconcile charges the last durable cpu_s + 60 s once, in the registered line format with
-        kind D8-noisebank-interrupted, and closes the attempt; a second reconcile charges nothing; the commands run
-        again."""
+        """A validate-d8 child SIGKILLed mid-run (CPU-bound; only the refresher writes, at a test-speed 0.2 CPU-s).
+        While it runs it holds the D8 lock: a second command is refused at once, naming the child's attempt and pid.
+        The kill releases the lock with the process and leaves the attempt open with durable progress and nothing
+        charged; every budget-dependent command then refuses before its work for the unclosed attempt; d8-reconcile
+        charges the last durable cpu_s + 60 s once, in the registered line format with kind D8-noisebank-interrupted,
+        and closes the attempt; a second reconcile charges nothing; the commands run again."""
         import platform
         import signal
         import subprocess
@@ -3038,7 +3125,7 @@ class TestD8Ledger(unittest.TestCase):
         child = subprocess.Popen([sys.executable, "-I", "-c", _KILL_CHILD, HERE, led, self.spec(),
                                   os.path.join(self.tmp, "design.json"), out],
                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        recs, alive = [], False
+        recs, alive, locked = [], False, ""
         try:
             deadline = time.time() + 120
             while time.time() < deadline and child.poll() is None:
@@ -3048,6 +3135,11 @@ class TestD8Ledger(unittest.TestCase):
                         break
                 time.sleep(0.05)
             alive = child.poll() is None
+            if alive:                           # (the running child holds the D8 lock: refused at once, not waited)
+                try:
+                    nb.run_provenance("r", "d", "p", "o", None, out, led, bindings={})
+                except nb.NoiseBankError as e:
+                    locked = str(e)
         finally:
             if child.poll() is None:
                 os.kill(child.pid, signal.SIGKILL)
@@ -3060,6 +3152,9 @@ class TestD8Ledger(unittest.TestCase):
         self.assertIsNone(a["close"])
         self.assertEqual((a["open"]["kind"], a["open"]["pid"], a["open"]["host"]),
                          ("D8-noisebank-validation", child.pid, platform.node()))
+        self.assertIn("is locked by another D8 accounting command", locked)
+        self.assertIn(aid, locked)
+        self.assertIn(f"pid {child.pid}", locked)
         self.assertGreater(a["cpu_s"], 0.4)
         self.assertEqual(rqlib.read_text(led), "")              # (the kill charged nothing by itself)
         work = mock.Mock()
@@ -3089,6 +3184,271 @@ class TestD8Ledger(unittest.TestCase):
             nb.run_validate_d8(self.spec(), "d", out, led, bindings={})
         self.assertEqual([x["kind"] for x in nb.ledger_entries(led)], ["D8-noisebank-interrupted",
                                                                        "D8-noisebank-validation"])
+
+    # ---- round 3 (Codex revWP3b): the D8 lock, the durable commit of an existing charge, liveness refusals
+    def dead_attempt(self, led):
+        """An attempt whose process ended inside it (os._exit in its work, as a SIGKILL ends it) -> its id."""
+        import subprocess
+        r = subprocess.run([sys.executable, "-I", "-c", _DIE_CHILD, HERE, led, self.spec(),
+                            os.path.join(self.tmp, "dead.json")], capture_output=True, text=True, timeout=120)
+        self.assertEqual(r.returncode, 9, r.stderr[-2000:])
+        (aid,) = nb.open_attempts(led)
+        self.assertEqual(rqlib.read_text(led), "")
+        return aid
+
+    def race(self, script, args):
+        """Two children of script, both released by one write each once both are ready (the start barrier); the one
+        that finishes first while the other still holds its transaction (it waits for a release file) is recorded;
+        then the release file lets the other finish -> (whether one finished before the release, its index, the
+        children, their (stdout, stderr))."""
+        import subprocess
+        import time
+        release = os.path.join(self.tmp, "release")
+        kids = [subprocess.Popen([sys.executable, "-I", "-c", script, HERE] + args(i) + [release],
+                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                for i in range(2)]
+        try:
+            for k in kids:
+                self.assertEqual(k.stdout.readline().strip(), "ready")
+            for k in kids:
+                k.stdin.write("go\n")
+            for k in kids:
+                k.stdin.flush()
+            first, t0 = None, time.time()
+            while first is None and time.time() - t0 < 60:
+                first = next((i for i, k in enumerate(kids) if k.poll() is not None), None)
+                time.sleep(0.02)
+            with open(release, "w"):
+                pass
+            outs = [k.communicate(timeout=120) for k in kids]
+        finally:
+            for k in kids:
+                if k.poll() is None:
+                    k.kill()
+                    k.communicate()
+        return first is not None, first, kids, outs
+
+    def test_P2_R2_1_simultaneous_starts_exactly_one_runs(self):
+        """Two validate-d8 processes released together by a start barrier: exactly one runs (it holds its attempt, and
+        the D8 lock, until the parent releases it); the other is refused by the lock before writing any record, never
+        waiting; one attempt, one charge."""
+        led = self.ledger()
+        refused, first, kids, outs = self.race(_RACE_START, lambda i: [led, self.spec(),
+                                                                      os.path.join(self.tmp, f"out{i}.json")])
+        self.assertTrue(refused, f"neither start was refused while the other held its attempt: {outs}")
+        loser, winner = first, 1 - first
+        self.assertIn("refused: validate-d8: the D5 ledger", outs[loser][0])
+        self.assertIn("is locked by another D8 accounting command", outs[loser][0])
+        self.assertEqual(outs[winner][0].strip(), "ran", outs[winner][1][-2000:])
+        st = nb.attempts_state(led)
+        self.assertEqual(len(st), 1, "the refused start wrote an attempt record")
+        ((aid, a),) = st.items()
+        self.assertEqual((a["open"]["pid"], a["close"]["status"]), (kids[winner].pid, "ok"))
+        self.assertEqual([(e["kind"], e["attempt"]) for e in nb.ledger_entries(led)],
+                         [("D8-noisebank-validation", aid)])
+        named = re.search(r"open attempt\(s\): (\w+) ", outs[loser][0])
+        if named:                               # (the holder had written its record: it is named, with its pid)
+            self.assertEqual(named.group(1), aid)
+            self.assertIn(f"pid {kids[winner].pid}", outs[loser][0])
+
+    def test_P2_R2_1_simultaneous_reconciles_charge_a_dead_attempt_once(self):
+        """Two d8-reconcile processes released together on one dead attempt: exactly one charges and closes it (it
+        holds the lock at its charge until the parent releases it); the other is refused by the lock: one charge, one
+        close record."""
+        led = self.ledger()
+        aid = self.dead_attempt(led)
+        refused, first, kids, outs = self.race(_RACE_RECONCILE, lambda i: [led])
+        self.assertTrue(refused, f"neither reconcile was refused while the other held the lock: {outs}")
+        loser, winner = first, 1 - first
+        self.assertIn("refused: d8-reconcile: the D5 ledger", outs[loser][0])
+        self.assertIn("is locked by another D8 accounting command", outs[loser][0])
+        self.assertTrue(outs[winner][0].startswith("done"), outs[winner][1][-2000:])
+        self.assertEqual([(e["kind"], e["attempt"]) for e in nb.ledger_entries(led)],
+                         [("D8-noisebank-interrupted", aid)])
+        self.assertEqual(sum('"event": "close"' in x for x in rqlib.read_text(nb.attempts_path(led)).splitlines()), 1)
+        self.assertEqual(nb.attempts_state(led)[aid]["close"]["charged_by"], "reconcile")
+
+    def test_P2_R2_1_the_lock_is_held_from_before_the_budget_check_until_the_close(self):
+        """Each D8 accounting command holds the lock on the ledger file over its budget check, its attempt's open,
+        progress and close records (provenance, validate-d8, estimate-d8), and d8-reconcile over its liveness check,
+        charge and close: an independent non-blocking flock probe on the ledger fails at every one of those points,
+        and succeeds once the command returns."""
+        import fcntl
+
+        def held(path):
+            fd = os.open(path, os.O_RDONLY)
+            try:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    return True
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                return False
+            finally:
+                os.close(fd)
+        led = self.ledger()
+        seen = []
+        real_budget, real_append, real_alive = nb._budget_check, nb._attempt_append, nb._attempt_alive
+        real_add = nb.ledger_add
+
+        def budget(ledger, command):
+            seen.append((command, "budget check", held(ledger)))
+            return real_budget(ledger, command)
+
+        def append(ledger, rec):
+            seen.append((rec.get("event"), "record", held(ledger)))
+            return real_append(ledger, rec)
+
+        def add(ledger, entry):
+            seen.append((entry.get("kind"), "charge", held(ledger)))
+            return real_add(ledger, entry)
+        fit = {"inputs": {"observations_sha256": "0" * 64}, "boot": 1, "synthetic": True}
+        p = lambda name: os.path.join(self.tmp, name)  # noqa: E731
+        with mock.patch.object(nb, "_budget_check", budget), mock.patch.object(nb, "_attempt_append", append), \
+                mock.patch.object(nb, "ledger_add", add), \
+                mock.patch.object(nb, "validate_d8", lambda *a, **k: {"acceptance": {"accepted": True}}), \
+                mock.patch.object(nb, "provenance", lambda *a, **k: {"provenance": "stub"}), \
+                mock.patch.object(nb, "estimate_d8", lambda *a, **k: fit), \
+                mock.patch.object(nb, "d8_artifact", lambda f, sha: {"receipt_sha256": sha}):
+            nb.run_validate_d8(self.spec(), "d", p("v.json"), led, bindings={})
+            nb.run_provenance("r", "d", "p", "o", None, p("p.json"), led, bindings={})
+            nb.run_estimate_d8("o", "a", "d", "p", "v", "r", p("a.json"), p("rc.json"), led, ["x"], bindings={})
+        self.assertFalse(held(led))
+        self.assertEqual([c for c, what, _ in seen if what == "budget check"], ["validate-d8", "provenance",
+                                                                                "estimate-d8"])
+        self.assertEqual(sum(e == "open" for e, *_ in seen), 3)
+        self.assertEqual(sum(e == "close" for e, *_ in seen), 3)
+        self.assertEqual([x for x in seen if not x[2]], [], "a point of the transaction without the lock")
+        led2 = self.ledger(name="reconcile.jsonl")
+        aid = self.dead_attempt(led2)
+        seen.clear()
+
+        def alive(o):
+            seen.append(("liveness", "check", held(led2)))
+            return real_alive(o)
+        with mock.patch.object(nb, "_attempt_alive", alive), mock.patch.object(nb, "_attempt_append", append), \
+                mock.patch.object(nb, "ledger_add", add):
+            (r,) = nb.reconcile_attempts(led2)
+        self.assertEqual(r["attempt"], aid)
+        self.assertEqual([x[:2] for x in seen], [("liveness", "check"), ("D8-noisebank-interrupted", "charge"),
+                                                 ("close", "record")])
+        self.assertEqual([x for x in seen if not x[2]], [], "a point of the reconciliation without the lock")
+        self.assertFalse(held(led2))
+
+    def test_P2_R2_2_a_charge_written_but_not_synced_is_committed_only_after_a_sync(self):
+        """The append-before-fsync boundary (Codex revWP3b P2-R2-2). (1) A run killed (SIGKILL) after its ledger line
+        is written and before the ledger's fsync: the line is visible, the attempt open; d8-reconcile commits that
+        existing charge only after syncing the ledger, by the recorded call order the ledger fsync precedes the close
+        record, with no second charge. (2) An exception at the same boundary (an injected fsync failure on the ledger):
+        the cleanup retry finds the written line but cannot sync it, so the run refuses and its attempt stays OPEN with
+        no close record; d8-reconcile under the same failure refuses too; without it, the ledger is synced, then the
+        attempt closed."""
+        import errno
+        import signal
+        import subprocess
+        led = self.ledger()
+        rp = os.path.realpath(led)
+        r = subprocess.run([sys.executable, "-I", "-c", _SYNC_KILL_CHILD, HERE, led, self.spec(),
+                            os.path.join(self.tmp, "k.json")], capture_output=True, text=True, timeout=120)
+        self.assertEqual(r.returncode, -signal.SIGKILL, r.stderr[-2000:])
+        (aid,) = nb.open_attempts(led)
+        (e,) = nb.ledger_entries(led)
+        self.assertEqual((e["attempt"], e["status"]), (aid, "ok"))
+        order = []
+        real_fsync, real_append = os.fsync, nb._attempt_append
+
+        def fsync(fd):
+            order.append(("fsync", os.path.realpath(f"/proc/self/fd/{fd}")))
+            return real_fsync(fd)
+
+        def append(ledger, rec):
+            order.append(("record", rec.get("event")))
+            return real_append(ledger, rec)
+        with mock.patch.object(os, "fsync", fsync), mock.patch.object(nb, "_attempt_append", append):
+            (res,) = nb.reconcile_attempts(led)
+        self.assertIsNone(res["charged_cpu_s"])
+        self.assertIn(("fsync", rp), order, f"the ledger was never synced before the close: {order}")
+        self.assertIn(("record", "close"), order)
+        self.assertLess(order.index(("fsync", rp)), order.index(("record", "close")), order)
+        self.assertEqual(len(nb.ledger_entries(led)), 1)
+        self.assertTrue(nb.attempts_state(led)[aid]["close"]["charged_by"].startswith("finalize"))
+        led2 = self.ledger(name="sync.jsonl")
+        rp2 = os.path.realpath(led2)
+
+        def failing(fd):
+            if os.path.realpath(f"/proc/self/fd/{fd}") == rp2:
+                raise OSError(errno.EIO, "injected fsync failure")
+            return real_fsync(fd)
+        with mock.patch.object(os, "fsync", failing), \
+                mock.patch.object(nb, "validate_d8", lambda *a, **k: {"acceptance": {"accepted": True}}):
+            with self.assertRaises((nb.NoiseBankError, OSError)):
+                nb.run_validate_d8(self.spec(), "d", os.path.join(self.tmp, "s.json"), led2, bindings={})
+        ((aid2, a2),) = nb.attempts_state(led2).items()
+        self.assertIsNone(a2["close"], "an unsynced charge was treated as committed: the attempt was closed")
+        self.assertEqual([x["attempt"] for x in nb.ledger_entries(led2)], [aid2])
+        with mock.patch.object(os, "fsync", failing), mock.patch.object(nb, "_attempt_alive", return_value=False):
+            with self.assertRaisesRegex(nb.NoiseBankError, "fsync failed"):
+                nb.reconcile_attempts(led2)
+        self.assertIsNone(nb.attempts_state(led2)[aid2]["close"])
+        order.clear()
+        with mock.patch.object(os, "fsync", fsync), mock.patch.object(nb, "_attempt_append", append), \
+                mock.patch.object(nb, "_attempt_alive", return_value=False):
+            nb.reconcile_attempts(led2)
+        self.assertLess(order.index(("fsync", rp2)), order.index(("record", "close")), order)
+        self.assertEqual(len(nb.ledger_entries(led2)), 1)
+
+    def test_P2_R2_3_indeterminate_liveness_refuses_and_confirmed_absence_is_charged(self):
+        """Liveness is charged on CONFIRMED absence only (Codex revWP3b P2-R2-3). With a readable boot id, a dead
+        attempt whose /proc/<pid>/stat cannot be read (PermissionError, EIO) or parsed is refused by d8-reconcile with
+        context: no charge, no close. Without a process table, os.kill(pid, 0) giving EPERM is refused the same way,
+        ESRCH is gone and success is running. Unpatched (no /proc/<pid>: confirmed absence), it is charged once."""
+        import builtins
+        import errno
+        led = self.ledger()
+        aid = self.dead_attempt(led)
+        o = nb.attempts_state(led)[aid]["open"]
+        stat = f"/proc/{o['pid']}/stat"
+        real_open = builtins.open
+
+        def opener(effect):
+            def fake(file, *args, **kw):
+                if str(file) == stat:
+                    return effect()
+                return real_open(file, *args, **kw)
+            return fake
+
+        def denied():
+            raise PermissionError(errno.EACCES, "Permission denied", stat)
+
+        def failing():
+            raise OSError(errno.EIO, "Input/output error", stat)
+        for name, effect in (("PermissionError", denied), ("EIO", failing),
+                             ("unparsable", lambda: io.StringIO("1234 (truncated"))):
+            with self.subTest(stat=name), mock.patch("builtins.open", opener(effect)):
+                with self.assertRaisesRegex(nb.NoiseBankError, r"liveness is indeterminate"):
+                    nb.reconcile_attempts(led)
+            self.assertEqual(rqlib.read_text(led), "")
+            self.assertIsNone(nb.attempts_state(led)[aid]["close"])
+
+        def no_proc(file, *args, **kw):         # (no process table at all)
+            if str(file).startswith("/proc/"):
+                raise FileNotFoundError(errno.ENOENT, "No such file or directory", str(file))
+            return real_open(file, *args, **kw)
+        with mock.patch.object(nb, "PROC", "/nonexistent-proc-table", create=True), \
+                mock.patch("builtins.open", no_proc):
+            with self.subTest(kill="EPERM"), \
+                    mock.patch.object(os, "kill", side_effect=PermissionError(errno.EPERM, "Operation not permitted")):
+                with self.assertRaisesRegex(nb.NoiseBankError, r"os\.kill\(pid, 0\).*liveness is indeterminate"):
+                    nb.reconcile_attempts(led)
+            with mock.patch.object(os, "kill", side_effect=ProcessLookupError(errno.ESRCH, "No such process")):
+                self.assertFalse(nb._attempt_alive(o))
+            with mock.patch.object(os, "kill", return_value=None):
+                self.assertTrue(nb._attempt_alive(o))
+        self.assertEqual(rqlib.read_text(led), "")
+        self.assertIsNone(nb.attempts_state(led)[aid]["close"])
+        (r,) = nb.reconcile_attempts(led)
+        self.assertEqual((r["attempt"], r["charged_by"]), (aid, "reconcile"))
+        self.assertEqual([e["attempt"] for e in nb.ledger_entries(led)], [aid])
 
 
 @unittest.skipIf(np is None, "numpy is not installed")
