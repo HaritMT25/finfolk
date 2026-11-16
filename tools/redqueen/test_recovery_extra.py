@@ -965,14 +965,25 @@ def fabricated(cfg, sc, rep, success=True, options=("a", "fwd")):
             opts[o] = dict(R.NUMERICAL_FWD) if o == "fwd" else {"rank": 1, "relative": 0.01, "relative_identified": 0.01}
             continue
         lb = 0.01 if success else -0.01
+        # (the candidate records the flags summarize, as the procedures store them: rank 0 and the validation winner,
+        #  resolved; procedure's candidates also carry their test integration and comparison against rank 0)
+        test = {} if o == "fwd" else {"test": {}}
+        cands = [dict({"rank": r, "lambda": lam, "val_lpd": val, "integration": dict({"validation": {}}, **test)},
+                      **({} if o == "fwd" else {"integration_unresolved": 0}))
+                 for r, lam, val in ((0, 0.0, 0.0), (1, 0.05, 1.0))]
         rec_ = {"available": True, "selected": {"rank": 1, "lambda": 0.05, "start": "warm"}, "success": bool(success),
-                "test_improvement": 0.1, "test_lb": lb, "fit_pairs": 100, "classes": None, "candidates": [],
+                "test_improvement": 0.1, "test_lb": lb, "fit_pairs": 100, "classes": None, "candidates": cands,
                 "start": "both", "decision": {"available": True, "test_worlds": 6, "selection_unresolved": False,
                                               "integration_unresolved": 0, "reason": None}}
         if o == "fwd":                  # (forward_procedure's decided branch: available, decision_available, resolved)
             br = {"available": True, "success": bool(success), "worlds": 3, "decision_available": True,
-                  "integration_unresolved": 0, "test_improvement": 0.1, "test_lb": lb}
+                  "integration_unresolved": 0, "test_improvement": 0.1, "test_lb": lb, "per_world": [0.1] * 3,
+                  "integration": {"selected": {}, "rank0": {}}}
             rec_.update(procedure="forward", forward_transfer=dict(br), intersection=dict(br))
+        else:                           # (procedure's per-test-world comparison and restricted primary)
+            rec_.update(per_test_world=[0.1] * 6, selected_primary={
+                "ranks": [0, 1, 2], "rank": 1, "lambda": 0.05, "start": "warm", "available": True,
+                "test_improvement": 0.1, "test_lb": lb, "success": bool(success)})
         opts[o] = rec_
     return {"schema": R.RESULT_SCHEMA, "scenario": sc, "rep": rep,
             "seed": rqlib.derive_seed(cfg["namespace"], "recovery", sc, rep), "settings": {},
@@ -1834,19 +1845,27 @@ class TestRecoveryBankPacket(unittest.TestCase):
         primary's 16 r1_034 successes, one whose success flag stays true is made unavailable (decision.available false,
         six roots, no integration flag: Codex's counterexample), unresolved (an integration flag, a selection flag),
         one-root, unavailable at the top level, or inconsistent with the rule (selected rank 0; a non-positive lower
-        bound): each time C1 counts 15 (fail) and reports the uncounted flag; the guards fail where the record is
-        internally inconsistent."""
+        bound), or (round 3) unresolved only in its candidate records (the winner's stored comparison, its test
+        integration, a validation flag) while every decision flag says resolved: each time C1 counts 15 (fail) and
+        reports the uncounted flag; the guards fail where the record is internally inconsistent (a selected rank 0
+        is not the validation winner, rank 1, of its candidates)."""
         f = self.complete()
         prim = f["dirs"]["primary"]["dir"]
         fr = os.path.join(prim, "r1_034.003.json")
         good = rqlib.read_bytes(fr)
+        win = lambda o: o["candidates"][1]  # noqa: E731
         cases = (("decision unavailable", lambda o: o["decision"].update(available=False), True),
                  ("integration unresolved", lambda o: o["decision"].update(integration_unresolved=1), True),
                  ("selection unresolved", lambda o: o["decision"].update(selection_unresolved=True), True),
                  ("one test root", lambda o: o["decision"].update(test_worlds=1), True),
                  ("top-level unavailable", lambda o: o.update(available=False), True),
-                 ("selected rank 0", lambda o: o["selected"].update(rank=0), False),
-                 ("lower bound <= 0", lambda o: o.update(test_lb=-0.01), False))
+                 ("selected rank 0", lambda o: o["selected"].update(rank=0), True),
+                 ("lower bound <= 0", lambda o: o.update(test_lb=-0.01), False),
+                 ("winner's stored comparison unresolved", lambda o: win(o).update(integration_unresolved=1), True),
+                 ("winner's test integration unresolved", lambda o: win(o)["integration"].update(
+                     test={"grid_unresolved": 1}), True),
+                 ("a candidate's validation unresolved", lambda o: o["candidates"][0]["integration"].update(
+                     validation={"grid_unresolved": 1}), True))
         with mock.patch.object(R, "C2_MATRIX", self.TOY_C2):
             doc, _ = R.packet(f["path"], "acceptance")
             self.assertEqual(doc["checks"]["C1"]["scenarios"]["r1_034"]["successes"], 16)
@@ -2076,6 +2095,217 @@ class TestRecoveryBankPacket(unittest.TestCase):
         tabs = obslaw.ObsTables.load(out, sha256=rep["obs_tables_sha256"])
         self.assertEqual(sorted({g for _, g in tabs.location}), rep["noise_scales"])
         self.assertEqual(os.listdir(d), ["obs_tables.npz"])
+
+    def test_T7_8_guards_check_the_restricted_primary_comparison_and_every_flag_against_its_records(self):
+        """P2-WP4-3, round 3 (Codex WP4 r2): the guards derive each flag from the stored candidate and integration
+        records, as procedure does. Codex's exact case: the full winner rank 3, resolved, six roots; the restricted
+        winner rank 1 with integration_unresolved 1 (also when only the stored flag, or only its test integration, says
+        so); the primary available, unsuccessful, no selection_unresolved -- is reported, alone and in a packet. The
+        primary stays independent of higher-rank failures: a rank-3 validation flag or comparison leaves the full
+        decision unavailable and an available rank-1 primary unreported. The audit's other paths are each reported:
+        a decided full selection whose winner's comparison or a candidate's validation is unresolved in the records
+        only, a selected candidate that is not the validation winner, a primary that is not the restricted winner, a
+        decision without candidate records, a per-test-world record of the wrong length, a decided forward branch
+        whose integration record is unresolved, a forward decision or success its decision branch does not carry."""
+        f = self.complete()
+        base = fabricated(f["cfgs"]["stress"], "r0_asym", 0, success=True)["options"]
+
+        def cand(rank, lam, val, unres=0, vflag=0, tflag=0):
+            return {"rank": rank, "lambda": lam, "val_lpd": val, "integration_unresolved": unres,
+                    "integration": {"validation": {"grid_unresolved": vflag} if vflag else {},
+                                    "test": {"grid_unresolved": tflag} if tflag else {}}}
+
+        def proc(cands, selected, decision, success, primary, per=6):
+            o = copy.deepcopy(base["a"])
+            o.update(candidates=cands, selected=dict(selected, start="warm"), success=success,
+                     per_test_world=[0.1] * per if per else [], decision=dict(
+                         {"available": True, "test_worlds": 6, "selection_unresolved": False,
+                          "integration_unresolved": 0, "reason": None}, **decision),
+                     selected_primary=dict({"ranks": [0, 1, 2], "start": "warm", "test_improvement": 0.1,
+                                            "test_lb": 0.01}, **primary))
+            return o
+        r13 = {"rank": 3, "lambda": 0.05}
+        r1 = {"rank": 1, "lambda": 0.05}
+        codex = {"stored and integration flags": (1, 1), "the stored flag only": (1, 0),
+                 "the test integration only": (0, 1)}
+        for name, (unres, tflag) in codex.items():
+            with self.subTest(codex=name):
+                o = proc([cand(0, 0.0, 0.0), cand(1, 0.05, 1.0, unres=unres, tflag=tflag), cand(3, 0.05, 2.0)], r13,
+                         {}, True, dict(r1, available=True, success=False))
+                self.assertNotIn("selection_unresolved", o["selected_primary"])
+                self.assertIn("a.selected_primary: available or successful on an unresolved restricted selection or "
+                              "comparison", "; ".join(R._guard_violations(o, "a")))
+        for name, c3 in (("rank-3 validation flag", cand(3, 0.05, 2.0, vflag=1)),
+                         ("rank-3 comparison unresolved", cand(3, 0.05, 2.0, unres=1, tflag=1))):
+            with self.subTest(independent=name):
+                o = proc([cand(0, 0.0, 0.0), cand(1, 0.05, 1.0), c3], r13,
+                         {"available": False, "selection_unresolved": bool(c3["integration"]["validation"]),
+                          "integration_unresolved": 1, "reason": "unresolved"}, False,
+                         dict(r1, available=True, success=True), per=0)
+                self.assertEqual(R._guard_violations(o, "a"), [])
+        resolved = [cand(0, 0.0, 0.0), cand(1, 0.05, 1.0), cand(3, 0.05, 2.0)]
+        self.assertEqual(R._guard_violations(proc(resolved, r13, {}, True, dict(r1, available=True, success=True)),
+                                             "a"), [])
+        bad = {"winner's comparison unresolved in the records only": (
+                   proc([cand(0, 0.0, 0.0), cand(1, 0.05, 1.0), cand(3, 0.05, 2.0, unres=1)], r13, {}, False,
+                        dict(r1, available=True, success=True)), "decided on an unresolved selection or comparison"),
+               "a candidate's validation flag only": (
+                   proc([cand(0, 0.0, 0.0), cand(1, 0.05, 1.0), cand(3, 0.05, 2.0, vflag=1)], r13, {}, False,
+                        dict(r1, available=False, success=False)), "decided on an unresolved selection"),
+               "selected is not the validation winner": (
+                   proc(resolved, r1, {}, False, dict(r1, available=True, success=True)),
+                   "the selected candidate (1, 0.05) is not the validation winner (3, 0.05)"),
+               "primary is not the restricted winner": (
+                   proc(resolved, r13, {}, False, dict(r13, available=True, success=True)),
+                   "selected_primary: (3, 0.05) is not the restricted validation winner (1, 0.05)"),
+               "a decision without candidate records": (
+                   proc([], r13, {}, False, dict(r1, available=False, success=False)),
+                   "a decision without its candidate records"),
+               "per-test-world record of the wrong length": (
+                   proc(resolved, r13, {}, False, dict(r1, available=True, success=True), per=5),
+                   "5 per-world comparison(s) for 6 recorded contributing root(s)")}
+        fw = copy.deepcopy(base["fwd"])
+        fw["intersection"]["integration"] = {"selected": {"grid_unresolved": 1}, "rank0": {}}
+        bad["a decided forward branch whose integration record is unresolved"] = (
+            fw, "fwd.intersection: decided or available on an unresolved comparison")
+        fw = copy.deepcopy(base["fwd"])
+        fw["forward_transfer"].update(available=False, decision_available=False, success=False)
+        bad["a forward decision its decision branch does not carry"] = (
+            fw, "a decision whose decision branch is not decided")
+        fw = copy.deepcopy(base["fwd"])
+        fw["forward_transfer"]["success"] = False
+        bad["a forward success its decision branch does not carry"] = (
+            fw, "success whose decision branch is not successful")
+        for name, (o, want) in bad.items():
+            with self.subTest(audit=name):
+                got = "; ".join(R._guard_violations(o, "fwd" if "forward" in name else "a"))
+                self.assertIn(want, got)
+        fr = os.path.join(f["dirs"]["stress"]["dir"], "r0_asym.000.json")
+        r = rqlib.read_json(fr)
+        r["options"]["a"] = proc([cand(0, 0.0, 0.0), cand(1, 0.05, 1.0, unres=1, tflag=1), cand(3, 0.05, 2.0)], r13,
+                                 {}, True, dict(r1, available=True, success=False))
+        rqlib.write_json_durable(fr, r)
+        with mock.patch.object(R, "C2_MATRIX", self.TOY_C2):
+            doc, code = R.packet(f["path"], "acceptance")
+        self.assertEqual((doc["checks"]["guards"]["status"], code), ("fail", 2))
+        self.assertIn("r0_asym.000.json:a.selected_primary: available or successful on an unresolved restricted",
+                      doc["checks"]["guards"]["reason"])
+
+    def doctored(self, f, name, role_key, edit):
+        """A copy of f's role_key directory whose bound config.json (legacy) or frozen plan.json (extra, re-frozen:
+        FROZEN.sha256 rewritten) is changed by edit, with its own correct expected sha256 -> its schedule entry."""
+        e = f["dirs"][role_key]
+        d = os.path.join(f["root"], name)
+        shutil.copytree(e["dir"], d)
+        if e["kind"] == "legacy":
+            cfg = rqlib.read_json(os.path.join(d, "config.json"))
+            edit(cfg)
+            rqlib.write_durable(os.path.join(d, "config.json"), rqlib.canonical(cfg))
+            return dict(e, dir=d, expected_config_sha256=rqlib.canonical_sha(cfg))
+        plan = X.read_frozen(d)
+        edit(plan)
+        files = {"plan.json": rqlib.canonical(plan),
+                 "diagnostics.json": rqlib.read_bytes(os.path.join(d, "diagnostics.json"))}
+        rqlib.write_durable(os.path.join(d, "plan.json"), files["plan.json"])
+        rqlib.write_durable(os.path.join(d, "FROZEN.sha256"), X.freeze_text(files))
+        self.assertEqual(X.read_frozen(d), plan)
+        return dict(e, dir=d, expected_plan_sha256=rqlib.canonical_sha(plan))
+
+    def test_T7_8_acceptance_applies_clarification_4_F3_to_the_numerical_and_extra_roles(self):
+        """Clarification 4 F3 (frozen 87053a80...; WP4 stops S5 / S6): in acceptance mode the numerical directory's
+        bound configuration is fitter registered, basis 6, embedding shared, center references, ab_cap -1, recording
+        ranks 4, lambdas 0.01,0.02,0.05,0.2, iters 30 and start both; each extra noisy role's plan fit is ranks 4,
+        lambdas 0.01,0.02,0.05,0.2, iters 30, start both, basis 6, embedding shared, center references, and its
+        legacy_config fitter registered and ab_cap -1. Each field's departure alone -- ab_cap included -- with its own
+        correct expected hash is refused before any check, naming the field. Diagnostic mode still accepts a numerical
+        directory with reduced settings."""
+        f = self.complete()
+        surface = ("basis", "embedding", "center")
+        num = {"fitter": "minimal", "basis": 4, "embedding": "separate", "center": "train_c", "ab_cap": 0,
+               "ranks": 1, "lambdas": "0.05", "iters": 2, "start": "warm"}
+        self.assertEqual(set(num), set(R.F3_NUMERICAL))
+        for k, val in num.items():
+            with self.subTest(numerical=k):
+                e = self.doctored(f, f"num_{k}", "numerical", lambda c, k=k, val=val: c.update({k: val}))
+                want = (r"basis / embedding / center .* not the default" if k in surface else
+                        rf"not the registered fit settings \(\{{'{k}': {val!r}\}}")
+                self.refused(f, [x for x in f["entries"] if x["role"] != "numerical"] + [e],
+                             rf"num_{k} \(numerical\): {want}")
+        extra = {"ranks": 1, "lambdas": "0.05", "iters": 2, "start": "warm", "basis": 4, "embedding": "separate",
+                 "center": "train_c"}
+        legacy = {"fitter": "minimal", "ab_cap": 0}
+        self.assertEqual((set(extra), set(legacy)), (set(R.F3_EXTRA_FIT), set(R.F3_EXTRA_LEGACY)))
+        for part, fields in (("fit", extra), ("legacy_config", legacy)):
+            for k, val in fields.items():
+                with self.subTest(extra=f"{part}.{k}"):
+                    e = self.doctored(f, f"ext_{k}", "extra_interp",
+                                      lambda p, part=part, k=k, val=val: p[part].update({k: val}))
+                    want = (r"basis / embedding / center .* not the default" if k in surface else
+                            rf"not the registered fit settings \(\{{'{k}': {val!r}\}}")
+                    self.refused(f, [x for x in f["entries"] if x["role"] != "extra-interp"] + [e],
+                                 rf"ext_{k} \(extra-interp\): {want}")
+        d, _ = self.legacy_dir(f["root"], "num_reduced", ("num_r1",), 1, ("a",), options="a", ranks=1, iters=2,
+                               start="warm", basis=4)
+        sd = self.schedule(os.path.join(f["root"], "SCHEDULE_num_diag.json"),
+                           [self.legacy_entry(d, "numerical", ("num_r1",), 1, ("a",))], f["om_sha"], f["bp"], f["tp"])
+        doc, code = R.packet(sd, "diagnostic")
+        self.assertEqual((code, doc["checks"]["identity"]["status"]), (0, "pass"), doc["checks"])
+
+    def test_T7_7_obs_tables_publication_failures_are_contextual_refusals(self):
+        """P3-R2-1 (Codex WP4 r2): every publication OSError of obs-tables is a contextual refusal. A failed hard link
+        (EPERM, as on a filesystem refusing links) publishes nothing and leaves no file; a failed directory fsync after
+        the link says the verified tables ARE published (their sha256) and leaves exactly that file. Neither escapes
+        as a traceback. (The tables are the class's own, loaded instead of rebuilt; validation and publication run.)"""
+        import errno
+
+        import obslaw
+        built = obslaw.ObsTables.load(self.tables)
+        sha = rqlib.sha256_bytes(built.to_bytes())
+        d = tempfile.mkdtemp(dir=self.base)
+        out = os.path.join(d, "obs_tables.npz")
+        args = ["obs-tables", "--bank", self.bank, "--noise-scales", "1", "--out", out, "--allow-synthetic-bank"]
+        with mock.patch.object(obslaw, "build_obs_tables", lambda bank, g: built), \
+                mock.patch.object(R.os, "link", side_effect=OSError(errno.EPERM, "Operation not permitted")):
+            with self.assertRaisesRegex(SystemExit, r"publishing .* by a hard link failed \(PermissionError: .*"
+                                                    r"NOTHING was published"):
+                R.main(args)
+        self.assertEqual(os.listdir(d), [])
+        real = rqlib.fsync_dir
+
+        def fail(p):
+            if os.path.abspath(p) == os.path.abspath(d):
+                raise OSError(errno.EIO, "Input/output error")
+            return real(p)
+        with mock.patch.object(obslaw, "build_obs_tables", lambda bank, g: built), \
+                mock.patch.object(R.rqlib, "fsync_dir", fail):
+            with self.assertRaisesRegex(SystemExit, rf"IS PUBLISHED \(the verified tables, sha256 {sha}\), but the "
+                                                    r"directory fsync after the link failed \(OSError: "):
+                R.main(args)
+        self.assertEqual(os.listdir(d), ["obs_tables.npz"])
+        self.assertEqual(rqlib.sha256_file(out), sha)
+
+    def test_T7_8_a_schedule_nested_beyond_the_parser_is_a_contextual_refusal(self):
+        """P3-WP4-6, remaining (Codex WP4 r2): a schedule nested deeper than the JSON parser's recursion limit (arrays
+        or objects) is a contextual REFUSED with exit 2 and no packet file, in process and as a command; never a
+        RecursionError traceback."""
+        p = os.path.join(self.base, "SCHEDULE_deep.json")
+        out = os.path.join(self.base, "P_deep.json")
+        for name, raw in (("arrays", b"[" * 100000 + b"]" * 100000),
+                          ("objects", b'{"a":' * 100000 + b"1" + b"}" * 100000)):
+            with self.subTest(nesting=name):
+                rqlib.write_durable(p, raw)
+                with contextlib.redirect_stderr(io.StringIO()) as err:
+                    rc = R.main(["packet", "--mode", "diagnostic", "--schedule", p, "--out", out,
+                                 "--allow-synthetic-bank"])
+                self.assertEqual(rc, 2)
+                self.assertIn("REFUSED before any check", err.getvalue())
+                self.assertIn("nested deeper than the parser's recursion limit", err.getvalue())
+                self.assertFalse(os.path.exists(out))
+                cp = self.cli("packet", "--mode", "acceptance", "--schedule", p, "--out", out)
+                self.assertEqual(cp.returncode, 2, cp.stderr[-1500:])
+                self.assertNotIn("Traceback", cp.stderr)
+                self.assertIn("nested deeper than the parser's recursion limit", cp.stderr)
+                self.assertFalse(os.path.exists(out))
 
     @unittest.expectedFailure
     def test_T7_8_WP5_a_complete_bank_mode_schedule_passes_every_check(self):
