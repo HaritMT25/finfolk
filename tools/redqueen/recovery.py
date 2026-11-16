@@ -1757,10 +1757,13 @@ def bench(a):
 
 
 # ------------------------------------------------------------------ bank mode's commands (A_design_v5 3.2, 3.6, 3.8)
-def _publish_new(tmp, path):
-    """Publish the fsync'd private file tmp at path WITHOUT REPLACEMENT (Codex WP4 P2-WP4-4): os.link fails if any
-    file is at path, so a command that loses a race to another publisher refuses and the winner's bytes stay intact;
-    the directory is fsync'd after the link. The caller removes its own tmp."""
+def _publish_new(tmp, path, sha):
+    """Publish the fsync'd, verified private file tmp (sha256 sha) at path WITHOUT REPLACEMENT (Codex WP4 P2-WP4-4):
+    os.link fails if any file is at path, so a command that loses a race to another publisher refuses and the
+    winner's bytes stay intact; the directory is fsync'd after the link. Every publication OSError is a contextual
+    refusal (Codex WP4 r2 P3-R2-1): a failed link (an existing file, or a filesystem refusing hard links) published
+    nothing; a failed directory fsync AFTER the link leaves the verified file published but its directory entry
+    possibly not durable, and says so. The caller removes its own tmp."""
     try:
         os.link(tmp, path)
     except FileExistsError:
@@ -1771,7 +1774,16 @@ def _publish_new(tmp, path):
         raise SystemExit(f"obs-tables: {path} was published by another command while these tables were built ("
                          f"{'the same' if same else 'other' if same is False else 'unreadable'} bytes): refused, the "
                          "existing file is left intact (a published table file is never replaced)")
-    rqlib.fsync_dir(os.path.dirname(os.path.abspath(path)))
+    except OSError as e:
+        raise SystemExit(f"obs-tables: publishing {path} by a hard link failed ({type(e).__name__}: {e}): refused, "
+                         "NOTHING was published (this command's temporary file is removed; an existing file is never "
+                         "replaced)")
+    try:
+        rqlib.fsync_dir(os.path.dirname(os.path.abspath(path)))
+    except OSError as e:
+        raise SystemExit(f"obs-tables: {path} IS PUBLISHED (the verified tables, sha256 {sha}), but the directory "
+                         f"fsync after the link failed ({type(e).__name__}: {e}): its directory entry may not be "
+                         "durable; refused -- check the file's sha256 before relying on it")
 
 
 def obs_tables(a):
@@ -1813,7 +1825,7 @@ def obs_tables(a):
         except (ValueError, OSError) as e:
             raise SystemExit(f"obs-tables: the built tables do not write or load back ({e}): refused, nothing "
                              "published")
-        _publish_new(tmp, a.out)
+        _publish_new(tmp, a.out, sha)
     finally:
         if made:
             os.unlink(tmp)
@@ -1915,27 +1927,20 @@ def pairing(dirs):
     return {"directories": list(dirs), "datasets": len(seen), "comparisons": compared, "result": "paired"}
 
 
-# The schedule document is A_design_v5 clarification 4 F1's (ac21be55..., WP4 stop S1): ONE JSON object with exactly
-# {schema, observation_model_sha256 (the one model every configuration, plan and result carries), inputs: exactly
-# {graph, references (a path or null), bank, obs_tables} (what the read-only prepare_run / verified logic re-derives
-# from), directories: a non-empty list of entries with exactly v5 3.8's fields}, reps a positive count (reps
-# 0..reps-1), every path resolving relative to the schedule file's directory (an absolute path, which would not, is
-# refused). Acceptance completeness (WP4 stop S2, ruled by Codex and clarification 4) is the frozen C2 matrix of
-# CRITERION C2-C4 (rec_C_v2 b8a3323e..., unchanged by v5 6.1 but for the namespace): its roles and blocks
+# The schedule document is A_design_v5 clarification 4 F1's (frozen 87053a80..., WP4 stop S1): ONE JSON object
+# with exactly {schema, observation_model_sha256 (the one model every configuration, plan and result carries),
+# inputs: exactly {graph, references (a path or null), bank, obs_tables} (what the read-only prepare_run / verified
+# logic re-derives from), directories: a non-empty list of entries with exactly v5 3.8's fields}, reps a positive
+# count (reps 0..reps-1), every path resolving relative to the schedule file's directory (an absolute path, which
+# would not, is refused). Acceptance completeness (WP4 stop S2, ruled by Codex and clarification 4) is the frozen C2
+# matrix of CRITERION C2-C4 (rec_C_v2 b8a3323e..., unchanged by v5 6.1 but for the namespace): its roles and blocks
 # (schedule_gaps), AND every scheduled directory's bound settings (bound_settings_gaps: C2's registered settings for
-# every noisy fit, exactly one directory per sensitivity variant); every acceptance directory in namespace A_NAMESPACE
-# (identity). The guards check (stop S3; _guard_violations) checks availability and unresolved-state consistency of
-# every decision, branch and primary selection, successful or not, and the root guards (CRITERION C1, C4, C6).
-# PROPOSED READINGS (WP4 round-2 stops, for the coordinator: CRITERION C2-C4 do not fix these settings):
-#  (S5) the numerical role: C2 fixes only "the source's own fixed true-rank continuation (.3,.1,.03,.01)", which is
-#       the registered map's REG_CONTINUATION (the minimal fitter continues to .001), so fitter "registered" is
-#       decided; its basis / embedding / center (C2's "default basis6/shared/references" follows the noisy-fit
-#       sentence) and its ranks / lambdas / iters / start (unread by a numerical fit) are read here as the registered
-#       defaults, the same settings as every noisy role (NUMERICAL_SETTINGS);
-#  (S6) the extra roles (extra-interp, -fwd_all, -fwd_early, -attrition): their fits are noisy fits, so C2's "All
-#       noisy fits use ranks 0..4, lambdas .01,.02,.05,.2, 30 sweeps, both starts; default basis6/shared/references"
-#       is read as fixing each frozen plan's fit (recovery_extra.py's own summarize applies its criterion to exactly
-#       this fit), with recovery_extra's registered map (plan.legacy_config's fitter) and no A/B cap.
+# every noisy fit, exactly one directory per sensitivity variant, clarification 4 F3's settings for the numerical and
+# extra roles); every acceptance directory in namespace A_NAMESPACE (identity). The guards check (stop S3;
+# _guard_violations) checks availability and unresolved-state consistency of every decision, branch and primary
+# selection, successful or not, against the candidate and integration records they summarize, and the root guards
+# (CRITERION C1, C4, C6). The acceptance-role fit settings (WP4 stops S5 / S6) are clarification 4 F3's (frozen
+# 87053a80...): F3_NUMERICAL, F3_EXTRA_FIT and F3_EXTRA_LEGACY below.
 SCHEDULE_SCHEMA = "finfolk.redqueen.recoveryschedule/1"
 SCHEDULE_KEYS = ("schema", "observation_model_sha256", "inputs", "directories")     # (clarification 4 F1)
 SCHEDULE_INPUTS = ("graph", "references", "bank", "obs_tables")
@@ -1976,7 +1981,17 @@ REGISTERED_FIT = {"fitter": "registered", "ranks": 4, "lambdas": FITTER_DEFAULTS
 DEFAULT_SURFACE = {"basis": 6, "embedding": "shared", "center": "references"}
 SENSITIVITY_VARIANTS = {"basis4": {"basis": 4}, "basis8": {"basis": 8}, "separate": {"embedding": "separate"},
                         "train_c": {"center": "train_c"}}
-NUMERICAL_SETTINGS = dict(REGISTERED_FIT, **DEFAULT_SURFACE)   # (PROPOSED READING S5 beyond fitter "registered")
+# Clarification 4 F3 (frozen 87053a80...), acceptance mode only (diagnostic mode permits reduced settings):
+#  the numerical role's bound configuration: fitter "registered", basis 6, embedding shared, center references and
+#  ab_cap -1, recording ranks 4, lambdas "0.01,0.02,0.05,0.2", iters 30 and start both as binding configuration metadata
+#  (the numerical procedure itself -- the scenario's true rank, REG_CONTINUATION, 30 sweeps per step, its initialization
+#  sequence, the disabled observation-model hooks -- is unchanged; no numerical RMSE threshold);
+F3_NUMERICAL = {"fitter": "registered", "basis": 6, "embedding": "shared", "center": "references", "ab_cap": -1,
+                "ranks": 4, "lambdas": "0.01,0.02,0.05,0.2", "iters": 30, "start": "both"}
+#  the extra noisy roles (C2's "All noisy fits"): each plan's fit, and its legacy_config's fitter and ab_cap.
+F3_EXTRA_FIT = {"ranks": 4, "lambdas": "0.01,0.02,0.05,0.2", "iters": 30, "start": "both", "basis": 6,
+                "embedding": "shared", "center": "references"}
+F3_EXTRA_LEGACY = {"fitter": "registered", "ab_cap": -1}
 
 
 class Refused(Exception):
@@ -2113,13 +2128,26 @@ def _fit_settings(e):
     return {k: (lc.get(k) if k in ("fitter", "ab_cap") else fit.get(k)) for k in keys}
 
 
+def _role_settings(e):
+    """The bound settings an acceptance role requires (CRITERION C2-C4; clarification 4 F3) -> {key: value} over the
+    fit keys and, except for a sensitivity (whose surface is one of SENSITIVITY_VARIANTS), the surface keys."""
+    if e["role"] == "numerical":
+        return dict(F3_NUMERICAL)                             # (F3: the numerical role)
+    if e["kind"] == "extra":
+        return dict(F3_EXTRA_FIT, **F3_EXTRA_LEGACY)          # (F3: the extra noisy roles, C2's "All noisy fits")
+    if e["role"] == "sensitivity":
+        return dict(REGISTERED_FIT)                           # (C2; the surface: one variant)
+    return dict(REGISTERED_FIT, **DEFAULT_SURFACE)            # (C2: C1-primary, stress)
+
+
 def bound_settings_gaps(entries):
-    """Acceptance mode (CRITERION C2-C4 via A_design_v5 3.8 and clarification 4; Codex WP4 P2-WP4-2), before any check:
-    every scheduled directory's BOUND settings (_fit_settings) satisfy its role -- C1-primary, stress and the extra
-    roles (S6) C2's registered noisy-fit settings with the default surface basis 6 / shared / references; numerical
-    NUMERICAL_SETTINGS (S5); each sensitivity the registered settings with exactly one of the four variants, and
-    exactly one directory per variant -> the list of gaps (empty: none). The expected configuration / plan sha256 is
-    checked in addition (identity, C1): a hash shows which configuration a directory used, not that it satisfies C2."""
+    """Acceptance mode (CRITERION C2-C4 via A_design_v5 3.8 and clarification 4 F3; Codex WP4 P2-WP4-2), before any
+    check: every scheduled directory's BOUND settings (_fit_settings) are its role's (_role_settings) -- C1-primary and
+    stress C2's registered noisy-fit settings with the default surface basis 6 / shared / references; numerical
+    F3_NUMERICAL; the extra roles F3_EXTRA_FIT and F3_EXTRA_LEGACY; each sensitivity the registered settings with
+    exactly one of the four variants, and exactly one directory per variant; every field compared by type and value,
+    ab_cap included -> the list of gaps (empty: none). The expected configuration / plan sha256 is checked in addition
+    (identity, C1): a hash shows which configuration a directory used, not that it satisfies C2 / F3."""
     gaps, variants = [], {name: [] for name in SENSITIVITY_VARIANTS}
     for e in entries:
         where = f"{e['dir']} ({e['role']})"
@@ -2128,11 +2156,11 @@ def bound_settings_gaps(entries):
         except (SystemExit, OSError, ValueError) as ex:
             gaps.append(f"{where}: its bound configuration or plan cannot be read ({ex})")
             continue
-        want = NUMERICAL_SETTINGS if e["role"] == "numerical" else dict(REGISTERED_FIT, **DEFAULT_SURFACE)
-        bad = {k: got[k] for k in REGISTERED_FIT if not _same(got[k], want[k])}
+        want = _role_settings(e)
+        bad = {k: got[k] for k in want if k not in DEFAULT_SURFACE and not _same(got[k], want[k])}
         if bad:
             gaps.append(f"{where}: not the registered fit settings ({bad}; C2: the registered map, ranks 0..4, "
-                        "lambdas .01,.02,.05,.2, 30 sweeps, both starts)")
+                        "lambdas .01,.02,.05,.2, 30 sweeps, both starts, no A/B cap; clarification 4 F3)")
         surf = {k: got[k] for k in DEFAULT_SURFACE}
         if e["role"] == "sensitivity":
             name = next((n for n, ch in SENSITIVITY_VARIANTS.items()
@@ -2142,8 +2170,9 @@ def bound_settings_gaps(entries):
                             f"{sorted(SENSITIVITY_VARIANTS)} (C2: each one change of {DEFAULT_SURFACE})")
             else:
                 variants[name].append(e["dir"])
-        elif not all(_same(surf[k], v) for k, v in DEFAULT_SURFACE.items()):
-            gaps.append(f"{where}: basis / embedding / center {surf}, not the default {DEFAULT_SURFACE} (C2)")
+        elif not all(_same(surf[k], want[k]) for k in DEFAULT_SURFACE):
+            gaps.append(f"{where}: basis / embedding / center {surf}, not the default {DEFAULT_SURFACE} (C2; "
+                        "clarification 4 F3)")
     for name, ds in variants.items():
         if len(ds) != 1:
             gaps.append(f"sensitivity variant {name}: {len(ds)} directories {ds} (C2: exactly one each of "
@@ -2307,13 +2336,127 @@ def _roots(*xs):
     return next((x for x in xs if type(x) is int), None)
 
 
+def _sub(d, *keys):
+    """d[k1][k2]... where every level is a dict, else None."""
+    for k in keys:
+        d = d.get(k) if isinstance(d, dict) else None
+    return d
+
+
+def _grid(*infos):
+    """procedure's _flagged over STORED integration records: the summed grid_unresolved flags (absent record: 0; a
+    record that is not an object: 1, never read as resolved)."""
+    return sum(0 if i is None else _unresolved(i.get("grid_unresolved")) if isinstance(i, dict) else 1 for i in infos)
+
+
+def _val_key(c):
+    """A candidate's validation score as the procedures compare it (max over val_lpd, first on ties); a value that
+    is not a number (recovery_extra's "-Infinity" text included) ranks lowest."""
+    x = c.get("val_lpd")
+    return float(x) if isinstance(x, (int, float)) and not isinstance(x, bool) else -math.inf
+
+
+def _per_world(per, roots, where):
+    """A decided comparison's contributing roots against its stored per-world record (crossed_lb's per-test-world
+    means: one entry per contributing root) -> violations."""
+    if not isinstance(per, list):
+        return [f"{where}: a decision without its per-world comparison record"]
+    if roots is None or len(per) != roots:
+        return [f"{where}: {len(per)} per-world comparison(s) for {roots} recorded contributing root(s)"]
+    return []
+
+
+def _record_violations(o, where, decided):
+    """The decision flags checked against the records they summarize (Codex WP4 r2 P2-WP4-3: no availability or
+    success flag is trusted on its own) -> violations. From the stored candidate records, exactly as procedure /
+    forward_procedure / recovery_extra.forward compute the flags: the validation flags (grid_unresolved over every
+    candidate's validation integration); the full selection (the recorded `selected` is the validation winner) and,
+    for the selection-and-prediction procedure, the winner's comparison against rank zero (its stored
+    integration_unresolved and its own and rank zero's test-integration flags); the RESTRICTED PRIMARY (ranks <=
+    PRIMARY_RANKS: their validation flags only, the recorded primary is the restricted winner, and that winner's
+    comparison against rank zero), so a higher-rank failure outside the restricted set never touches it; for the
+    forward procedures, each branch's comparison (its stored flag, its selected / rank-zero integration records and
+    the validation flags) and the decision branch behind the top-level decision and success; and a decided comparison's
+    contributing roots against its per-world record (_per_world). A decided, successful or available record needs
+    these records present and resolved."""
+    v = []
+    cands = o.get("candidates")
+    if not (isinstance(cands, list) and cands and all(isinstance(c, dict) for c in cands)):
+        if decided or o.get("success") or (_sub(o, "selected_primary", "available") is True):
+            v.append(f"{where}: a decision without its candidate records")
+        return v
+    rank0 = next((c for c in cands if c.get("rank") == 0), None)
+    if rank0 is None:
+        return [f"{where}: no rank-0 candidate record"]
+    val_all = _grid(*(_sub(c, "integration", "validation") for c in cands))
+    win = max(cands, key=_val_key)
+    s = o.get("selected") if isinstance(o.get("selected"), dict) else {}
+    if (s.get("rank"), s.get("lambda")) != (win.get("rank"), win.get("lambda")):
+        v.append(f"{where}: the selected candidate ({s.get('rank')}, {s.get('lambda')}) is not the validation winner "
+                 f"({win.get('rank')}, {win.get('lambda')})")
+
+    def compared(c):        # (a candidate against rank zero, as procedure stores it)
+        own = _grid(_sub(c, "integration", "test")) + (0 if c is rank0 else _grid(_sub(rank0, "integration", "test")))
+        return max(_unresolved(c.get("integration_unresolved")), own)
+    if o.get("procedure") == "forward" or "reference_policy" in o:
+        sel0 = (s.get("rank"), s.get("lambda")) == (0, 0.0)
+        for b in BRANCHES:
+            br = o.get(b)
+            if not isinstance(br, dict) or not (br.get("decision_available") is True or br.get("success")
+                                                or br.get("available") is True):
+                continue
+            n = (_unresolved(br.get("integration_unresolved")) + _grid(_sub(br, "integration", "selected"))
+                 + (0 if sel0 else _grid(_sub(br, "integration", "rank0"))) + val_all)
+            if n:
+                v.append(f"{where}.{b}: decided or available on an unresolved comparison ({n} flag(s) in its "
+                         "integration records or the validation)")
+            if br.get("decision_available") is True or br.get("success"):
+                v += _per_world(br.get("per_world"), _roots(br.get("test_roots"), br.get("worlds")), f"{where}.{b}")
+        db = o.get("forward_transfer") if "forward_transfer" in o else next(
+            (o[b] for b in ("world_transfer", "interpolation") if isinstance(o.get(b), dict)), None)
+        if decided and not (isinstance(db, dict) and db.get("available") is True and
+                            db.get("decision_available") is True):
+            v.append(f"{where}: a decision whose decision branch is not decided")
+        if o.get("success") and not (isinstance(db, dict) and db.get("success") is True):
+            v.append(f"{where}: success whose decision branch is not successful")
+        if (decided or o.get("success")) and val_all:
+            v.append(f"{where}: decided on an unresolved selection ({val_all} validation flag(s) in the candidates)")
+        return v
+    full = val_all + compared(win)
+    if (decided or o.get("success")) and full:
+        v.append(f"{where}: decided on an unresolved selection or comparison (from the candidate records: {val_all} "
+                 f"validation flag(s), {compared(win)} in the winner's comparison against rank zero)")
+    if decided or o.get("success"):
+        v += _per_world(o.get("per_test_world"), _roots(_sub(o, "decision", "test_worlds")), where)
+    sp = o.get("selected_primary")
+    if isinstance(sp, dict):
+        restricted = [c for c in cands if type(c.get("rank")) is int and c["rank"] <= PRIMARY_RANKS]
+        live = sp.get("available") is True or bool(sp.get("success"))
+        if not restricted:
+            if live:
+                v.append(f"{where}.selected_primary: decided without restricted candidate records")
+            return v
+        pw = max(restricted, key=_val_key)
+        if (sp.get("rank"), sp.get("lambda")) != (pw.get("rank"), pw.get("lambda")):
+            v.append(f"{where}.selected_primary: ({sp.get('rank')}, {sp.get('lambda')}) is not the restricted "
+                     f"validation winner ({pw.get('rank')}, {pw.get('lambda')})")
+        pv = _grid(*(_sub(c, "integration", "validation") for c in restricted))
+        if live and (pv or compared(pw)):
+            v.append(f"{where}.selected_primary: available or successful on an unresolved restricted selection or "
+                     f"comparison ({pv} validation flag(s) over ranks <= {PRIMARY_RANKS}, {compared(pw)} in the "
+                     "restricted winner's comparison against rank zero)")
+    return v
+
+
 def _guard_violations(o, where):
     """The registered guards on one option record (A_design_v5 3.8 check 5; CRITERION C1, C4, C6; Codex WP4 P2-WP4-3),
     for the top-level decision, every branch and the primary selection, SUCCESSFUL OR NOT: a success needs an
     available, decided record; a decision (decision.available / decision_available true) needs an available record;
     an unresolved selection or comparison is never decided, successful or marked available; no decision or success
-    with fewer than MIN_TEST_ROOTS contributing roots (D6 rule 27). Unavailable records and one-root descriptive
-    scores (available false, no decision) are permitted (C4)."""
+    with fewer than MIN_TEST_ROOTS contributing roots (D6 rule 27); and every such flag agrees with the stored
+    candidate and integration records it summarizes (_record_violations; the restricted primary's own comparison
+    included). Unavailable records and one-root descriptive scores (available false, no decision) are permitted
+    (C4)."""
     if not isinstance(o, dict):
         return [f"{where}: not a record"]
     v = []
@@ -2355,6 +2498,7 @@ def _guard_violations(o, where):
             v.append(f"{where}.selected_primary: an unresolved selection decided")
         if roots is not None and roots < MIN_TEST_ROOTS and (sp.get("available") is True or sp.get("success")):
             v.append(f"{where}.selected_primary: decided with {roots} contributing test root(s)")
+    v += _record_violations(o, where, decided)
     return v
 
 
@@ -2479,6 +2623,9 @@ def packet(schedule_path, mode, allow_synthetic=False):
         return dict(pairs)
     try:
         sched = json.loads(raw, object_pairs_hook=strict)
+    except RecursionError:                # (Codex WP4 r2 P3-WP4-6: a nesting depth the parser cannot follow)
+        raise Refused(f"the schedule {schedule_path} is not strict JSON (nested deeper than the parser's recursion "
+                      "limit)") from None
     except ValueError as e:
         raise Refused(f"the schedule {schedule_path} is not strict JSON ({e})")
     base = os.path.dirname(os.path.abspath(schedule_path))
@@ -2487,8 +2634,8 @@ def packet(schedule_path, mode, allow_synthetic=False):
     try:
         entries = _schedule_entries(sched, base)
         gaps = schedule_gaps(entries) if mode == "acceptance" else []
-    except (TypeError, KeyError, ValueError, AttributeError) as e:     # (a backstop: the validator checks types first)
-        raise Refused(f"the schedule {schedule_path} is malformed ({type(e).__name__}: {e})")
+    except (TypeError, KeyError, ValueError, AttributeError, RecursionError) as e:     # (a backstop: types first)
+        raise Refused(f"the schedule {schedule_path} is malformed ({type(e).__name__}: {e})") from None
     if gaps:
         raise Refused("--mode acceptance: the schedule is incomplete: " + "; ".join(gaps))
     if mode == "acceptance":
