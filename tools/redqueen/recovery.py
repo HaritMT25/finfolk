@@ -2457,6 +2457,8 @@ _BRANCH_LIVE = ((("available",), "flag"), (("decision_available",), "flag"), (("
                 (("integration_unresolved",), "count"), (("integration", "selected"), "object"),
                 (("per_world",), "list"))
 _PRIMARY_LIVE = ((("rank",), "rank"), (("lambda",), "penalty"), (("available",), "flag"), (("success",), "flag"))
+_PRIMARY_ROOTS = ((("decision", "test_worlds"), "count"),)       # (the live primary's roots)
+_CAND_SCORE, _CAND_VALIDATION = _CAND_SELECTION[:3], _CAND_SELECTION[3:]
 
 
 def _require(rec, fields, where):
@@ -2482,6 +2484,13 @@ def _per_world(per, roots, where):
     return []
 
 
+def _branch_live(br):
+    """A forward branch that claims something: decided, successful or available (recovery.py forward_procedure;
+    recovery_extra.forward) -- live on its own, whatever the top-level decision says (Codex WP4 r4 P2-R4-1)."""
+    return isinstance(br, dict) and (br.get("decision_available") is True or bool(br.get("success"))
+                                     or br.get("available") is True)
+
+
 def _record_violations(o, where, decided):
     """The decision flags checked against the records they summarize (Codex WP4 r2 P2-WP4-3: no availability or
     success flag is trusted on its own) -> violations. From the stored candidate records, exactly as procedure /
@@ -2490,21 +2499,27 @@ def _record_violations(o, where, decided):
     for the selection-and-prediction procedure, the winner's comparison against rank zero (its stored
     integration_unresolved and its own and rank zero's test-integration flags); the RESTRICTED PRIMARY (ranks <=
     PRIMARY_RANKS: their validation flags only, the recorded primary is the restricted winner, and that winner's
-    comparison against rank zero), so a higher-rank failure outside the restricted set never touches it; for the
-    forward procedures, each branch's comparison (its stored flag, its selected / rank-zero integration records and
-    the validation flags) and the decision branch behind the top-level decision and success; and a decided comparison's
-    contributing roots against its per-world record (_per_world). A decided, successful or available record needs
-    these records present, with the producer's shape (_require; Codex WP4 r3 P2), and resolved: each live path
-    requires exactly the records it reads -- the full selection every candidate's selection records and the winner's
-    and rank zero's comparison records; the restricted primary only its restricted candidates' (every candidate's rank,
-    to tell which they are) and its restricted winner's and rank zero's; a live forward branch its own."""
+    comparison against rank zero), so a higher-rank failure outside the restricted set never touches its derivation;
+    for the forward procedures, each branch's comparison (its stored flag, its selected / rank-zero integration
+    records and the validation flags) and the decision branch behind the top-level decision and success; and a decided
+    comparison's contributing roots against its per-world record (_per_world). Each claim is LIVE on its own (Codex
+    WP4 r4): the top-level decision (decided or successful), the restricted primary (available or successful) and
+    EACH forward branch (_branch_live), whatever the others say; each live claim requires, present and with the
+    producer's shape (_require), exactly the records its derivation reads: any live claim every candidate's rank /
+    lambda / val_lpd (the validation-winner consistency reads them); the top-level decision or a live branch every
+    candidate's validation integration (the validation flags); the top-level decision its decision fields and the
+    winner's and rank zero's comparison records; a live branch its own records; the live primary its fields, its
+    restricted candidates' records, its restricted winner's and rank zero's comparison records and its
+    contributing-root count decision.test_worlds (P2-R4-2), whose minimum the root guard enforces."""
     v = []
     cands = o.get("candidates")
     sp = o.get("selected_primary") if isinstance(o.get("selected_primary"), dict) else None
     live_full = decided or bool(o.get("success"))
     live_primary = sp is not None and (sp.get("available") is True or bool(sp.get("success")))
+    live_branches = [b for b in BRANCHES if _branch_live(o.get(b))]
+    live_any = live_full or live_primary or bool(live_branches)
     if not (isinstance(cands, list) and cands and all(isinstance(c, dict) for c in cands)):
-        if live_full or live_primary:
+        if live_any:
             v.append(f"{where}: a decision without its candidate records")
         return v
     rank0 = next((c for c in cands if c.get("rank") == 0), None)
@@ -2513,14 +2528,18 @@ def _record_violations(o, where, decided):
     fwd = o.get("procedure") == "forward" or "reference_policy" in o
     win = max(cands, key=_val_key)
     wi, zi = next(i for i, c in enumerate(cands) if c is win), next(i for i, c in enumerate(cands) if c is rank0)
+    validation_read = live_full or bool(live_branches)
+    for i, c in enumerate(cands):
+        if live_any:            # (the validation-winner consistency check below reads every candidate's score)
+            v += _require(c, _CAND_SCORE, f"{where}.candidates[{i}]")
+        if validation_read:     # (the validation flags: every candidate's validation integration)
+            v += _require(c, _CAND_VALIDATION, f"{where}.candidates[{i}]")
     if live_full:
         v += _require(o, _FWD_DECIDED if fwd else _PROC_DECIDED, where)
-        for i, c in enumerate(cands):
-            v += _require(c, _CAND_SELECTION, f"{where}.candidates[{i}]")
         if not fwd:
             v += _require(win, _CAND_COMPARED, f"{where}.candidates[{wi}]")
             v += _require(rank0, _CAND_TEST, f"{where}.candidates[{zi}]")
-    val_all = _grid(*(_sub(c, "integration", "validation") for c in cands))
+    val_all = _grid(*(_sub(c, "integration", "validation") for c in cands)) if validation_read else 0
     s = o.get("selected") if isinstance(o.get("selected"), dict) else {}
     if (s.get("rank"), s.get("lambda")) != (win.get("rank"), win.get("lambda")):
         v.append(f"{where}: the selected candidate ({s.get('rank')}, {s.get('lambda')}) is not the validation winner "
@@ -2529,21 +2548,18 @@ def _record_violations(o, where, decided):
     def compared(c):        # (a candidate against rank zero, as procedure stores it)
         own = _grid(_sub(c, "integration", "test")) + (0 if c is rank0 else _grid(_sub(rank0, "integration", "test")))
         return max(_unresolved(c.get("integration_unresolved")), own)
-    if o.get("procedure") == "forward" or "reference_policy" in o:
-        sel0 = (s.get("rank"), s.get("lambda")) == (0, 0.0)
-        for b in BRANCHES:
-            br = o.get(b)
-            if not isinstance(br, dict) or not (br.get("decision_available") is True or br.get("success")
-                                                or br.get("available") is True):
-                continue
-            v += _require(br, _BRANCH_LIVE + (() if sel0 else ((("integration", "rank0"), "object"),)), f"{where}.{b}")
-            n = (_unresolved(br.get("integration_unresolved")) + _grid(_sub(br, "integration", "selected"))
-                 + (0 if sel0 else _grid(_sub(br, "integration", "rank0"))) + val_all)
-            if n:
-                v.append(f"{where}.{b}: decided or available on an unresolved comparison ({n} flag(s) in its "
-                         "integration records or the validation)")
-            if br.get("decision_available") is True or br.get("success"):
-                v += _per_world(br.get("per_world"), _roots(br.get("test_roots"), br.get("worlds")), f"{where}.{b}")
+    sel0 = (s.get("rank"), s.get("lambda")) == (0, 0.0)
+    for b in live_branches:     # (every live branch, of any record kind: Codex WP4 r4 P2-R4-1)
+        br = o[b]
+        v += _require(br, _BRANCH_LIVE + (() if sel0 else ((("integration", "rank0"), "object"),)), f"{where}.{b}")
+        n = (_unresolved(br.get("integration_unresolved")) + _grid(_sub(br, "integration", "selected"))
+             + (0 if sel0 else _grid(_sub(br, "integration", "rank0"))) + val_all)
+        if n:
+            v.append(f"{where}.{b}: decided or available on an unresolved comparison ({n} flag(s) in its "
+                     "integration records or the validation)")
+        if br.get("decision_available") is True or br.get("success"):
+            v += _per_world(br.get("per_world"), _roots(br.get("test_roots"), br.get("worlds")), f"{where}.{b}")
+    if fwd:
         db = o.get("forward_transfer") if "forward_transfer" in o else next(
             (o[b] for b in ("world_transfer", "interpolation") if isinstance(o.get(b), dict)), None)
         if decided and not (isinstance(db, dict) and db.get("available") is True and
@@ -2554,7 +2570,7 @@ def _record_violations(o, where, decided):
         if (decided or o.get("success")) and val_all:
             v.append(f"{where}: decided on an unresolved selection ({val_all} validation flag(s) in the candidates)")
         return list(dict.fromkeys(v))
-    full = val_all + compared(win)
+    full = val_all + compared(win) if live_full else 0
     if (decided or o.get("success")) and full:
         v.append(f"{where}: decided on an unresolved selection or comparison (from the candidate records: {val_all} "
                  f"validation flag(s), {compared(win)} in the winner's comparison against rank zero)")
@@ -2565,6 +2581,7 @@ def _record_violations(o, where, decided):
         live = live_primary
         if live:                # (every rank, to tell the restricted set; the restricted candidates' records only)
             v += _require(sp, _PRIMARY_LIVE, f"{where}.selected_primary")
+            v += _require(o, _PRIMARY_ROOTS, where)          # (its contributing roots: Codex WP4 r4 P2-R4-2)
             for i, c in enumerate(cands):
                 inside = any(c is r for r in restricted)
                 v += _require(c, ((("rank",), "rank"),) + (_CAND_SELECTION[1:] if inside else ()),
@@ -2581,7 +2598,7 @@ def _record_violations(o, where, decided):
         if (sp.get("rank"), sp.get("lambda")) != (pw.get("rank"), pw.get("lambda")):
             v.append(f"{where}.selected_primary: ({sp.get('rank')}, {sp.get('lambda')}) is not the restricted "
                      f"validation winner ({pw.get('rank')}, {pw.get('lambda')})")
-        pv = _grid(*(_sub(c, "integration", "validation") for c in restricted))
+        pv = _grid(*(_sub(c, "integration", "validation") for c in restricted)) if live else 0
         if live and (pv or compared(pw)):
             v.append(f"{where}.selected_primary: available or successful on an unresolved restricted selection or "
                      f"comparison ({pv} validation flag(s) over ranks <= {PRIMARY_RANKS}, {compared(pw)} in the "
