@@ -2218,12 +2218,12 @@ class TestRecoveryBankPacket(unittest.TestCase):
         lambdas 0.01,0.02,0.05,0.2, iters 30, start both, basis 6, embedding shared, center references, and its
         legacy_config fitter registered and ab_cap -1. Each field's departure alone -- ab_cap included -- with its own
         correct expected hash is refused before any check, naming the field. Diagnostic mode still accepts a numerical
-        directory with reduced settings."""
+        directory with reduced settings. (The fields are F3's text, listed here, never read from recovery.py's
+        constants: a field dropped from those constants is caught by its departure being admitted.)"""
         f = self.complete()
         surface = ("basis", "embedding", "center")
         num = {"fitter": "minimal", "basis": 4, "embedding": "separate", "center": "train_c", "ab_cap": 0,
                "ranks": 1, "lambdas": "0.05", "iters": 2, "start": "warm"}
-        self.assertEqual(set(num), set(R.F3_NUMERICAL))
         for k, val in num.items():
             with self.subTest(numerical=k):
                 e = self.doctored(f, f"num_{k}", "numerical", lambda c, k=k, val=val: c.update({k: val}))
@@ -2234,7 +2234,6 @@ class TestRecoveryBankPacket(unittest.TestCase):
         extra = {"ranks": 1, "lambdas": "0.05", "iters": 2, "start": "warm", "basis": 4, "embedding": "separate",
                  "center": "train_c"}
         legacy = {"fitter": "minimal", "ab_cap": 0}
-        self.assertEqual((set(extra), set(legacy)), (set(R.F3_EXTRA_FIT), set(R.F3_EXTRA_LEGACY)))
         for part, fields in (("fit", extra), ("legacy_config", legacy)):
             for k, val in fields.items():
                 with self.subTest(extra=f"{part}.{k}"):
@@ -2285,11 +2284,34 @@ class TestRecoveryBankPacket(unittest.TestCase):
         self.assertEqual(rqlib.sha256_file(out), sha)
 
     def test_T7_8_a_schedule_nested_beyond_the_parser_is_a_contextual_refusal(self):
-        """P3-WP4-6, remaining (Codex WP4 r2): a schedule nested deeper than the JSON parser's recursion limit (arrays
-        or objects) is a contextual REFUSED with exit 2 and no packet file, in process and as a command; never a
-        RecursionError traceback."""
+        """P3-WP4-6, remaining (Codex WP4 r2): a RecursionError from the schedule's JSON parser is a contextual REFUSED
+        (exit 2, "nested deeper than the parser's recursion limit", no packet file), never an escaping exception. The
+        RecursionError is INJECTED at the parser packet calls (json.loads), so the check does not depend on how deep an
+        interpreter's parser can go: in process through main, and in a separate process (python -c with the same
+        patch) for the exit code and the absence of a traceback. A natural, very deep schedule (arrays, objects) is
+        refused too -- exit 2, no packet file, no traceback -- by the depth refusal, or by the schema check where the
+        interpreter parses that depth (Python 3.14 does: a20af4d's CI)."""
         p = os.path.join(self.base, "SCHEDULE_deep.json")
         out = os.path.join(self.base, "P_deep.json")
+        depth = "nested deeper than the parser's recursion limit"
+        rqlib.write_durable(p, b"[[[]]]")
+
+        def too_deep(*a, **k):
+            raise RecursionError("maximum recursion depth exceeded while decoding a JSON array from a unicode string")
+        with mock.patch.object(R.json, "loads", too_deep), contextlib.redirect_stderr(io.StringIO()) as err:
+            rc = R.main(["packet", "--mode", "diagnostic", "--schedule", p, "--out", out, "--allow-synthetic-bank"])
+        self.assertEqual(rc, 2)
+        self.assertIn(f"REFUSED before any check: the schedule {p} is not strict JSON ({depth})", err.getvalue())
+        self.assertFalse(os.path.exists(out))
+        code = ("import json, sys\nsys.path.insert(0, sys.argv[1])\nimport recovery\n"
+                "def too_deep(*a, **k):\n    raise RecursionError('maximum recursion depth exceeded')\n"
+                "json.loads = too_deep\nsys.exit(recovery.main(sys.argv[2:]))\n")
+        cp = subprocess.run([sys.executable, "-I", "-B", "-c", code, HERE, "packet", "--mode", "acceptance",
+                             "--schedule", p, "--out", out], stdin=subprocess.DEVNULL, capture_output=True, text=True)
+        self.assertEqual(cp.returncode, 2, cp.stderr[-1500:])
+        self.assertNotIn("Traceback", cp.stderr)
+        self.assertIn(depth, cp.stderr)
+        self.assertFalse(os.path.exists(out))
         for name, raw in (("arrays", b"[" * 100000 + b"]" * 100000),
                           ("objects", b'{"a":' * 100000 + b"1" + b"}" * 100000)):
             with self.subTest(nesting=name):
@@ -2298,13 +2320,13 @@ class TestRecoveryBankPacket(unittest.TestCase):
                     rc = R.main(["packet", "--mode", "diagnostic", "--schedule", p, "--out", out,
                                  "--allow-synthetic-bank"])
                 self.assertEqual(rc, 2)
-                self.assertIn("REFUSED before any check", err.getvalue())
-                self.assertIn("nested deeper than the parser's recursion limit", err.getvalue())
+                self.assertRegex(err.getvalue(), rf"REFUSED before any check: (the schedule .* \({depth}\)|the "
+                                                 r"schedule is not a finfolk\.redqueen\.recoveryschedule/1 document)")
                 self.assertFalse(os.path.exists(out))
                 cp = self.cli("packet", "--mode", "acceptance", "--schedule", p, "--out", out)
                 self.assertEqual(cp.returncode, 2, cp.stderr[-1500:])
                 self.assertNotIn("Traceback", cp.stderr)
-                self.assertIn("nested deeper than the parser's recursion limit", cp.stderr)
+                self.assertIn("REFUSED before any check", cp.stderr)
                 self.assertFalse(os.path.exists(out))
 
     @unittest.expectedFailure
