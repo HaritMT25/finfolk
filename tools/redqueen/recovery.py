@@ -1339,6 +1339,15 @@ def load_model(a, gammas=(1.0,)):
         require_survival(obs)
     except (ValueError, OSError) as e:
         raise SystemExit(f"--obs-model bank: {e}")
+    except RecursionError:          # (obslaw's strict parsers: named here, obslaw.py unchanged; Codex WP4 r3 P3-R3-2)
+        try:
+            obslaw.BankArtifact(a.bank, allow_synthetic=bool(getattr(a, "allow_synthetic_bank", False)))
+            what = f"the observation tables {a.obs_tables}"
+        except RecursionError:
+            what = f"the bank artifact {a.bank}"
+        except (ValueError, OSError):
+            what = f"the bank artifact {a.bank} or its observation tables {a.obs_tables}"
+        raise SystemExit(f"--obs-model bank: {what} is {DEEP}") from None
     return obs
 
 
@@ -1387,7 +1396,7 @@ def run_config(a, graph, obs=None):
 
 
 def graph_meta(path):
-    return graph_identity(rqlib.read_json(os.path.join(os.path.dirname(os.path.abspath(path)), "graph.meta.json")))
+    return graph_identity(_read_json_at(os.path.join(os.path.dirname(os.path.abspath(path)), "graph.meta.json")))
 
 
 def load_data(path, refs_path=None):
@@ -1606,7 +1615,7 @@ def summarize(d):
     cp = os.path.join(d, "config.json")
     if not os.path.isfile(cp):
         raise SystemExit(f"{d}: no config.json (a run directory is written by run / prepare_run): refusing a summary")
-    cfg = rqlib.read_json(cp)
+    cfg = _read_json_at(cp)
     want = rqlib.canonical_sha(cfg)
     om = cfg.get("observation_model")
     if not isinstance(om, dict) or om.get("mode") not in OBS_MODELS:
@@ -1614,7 +1623,7 @@ def summarize(d):
                          "summary")
     rows, seen, sups = {}, {}, []
     for f in _result_files(d):
-        r = rqlib.read_json(os.path.join(d, f))
+        r = _read_json_at(os.path.join(d, f))
         key = check_result(d, f, r, want, cfg.get("namespace"), "refusing a mixed summary", cfg)
         if key in seen or r["seed"] in {s for _, s in seen.values()}:
             raise SystemExit(f"{d}: {f} duplicates {seen.get(key, ('another result',))[0]}: refusing a summary")
@@ -1839,6 +1848,27 @@ def obs_tables(a):
     return 0
 
 
+DEEP = "nested deeper than the parser's recursion limit"
+
+
+def _read_json_at(path):
+    """rqlib.read_json with a parser / serializer recursion failure named (Codex WP4 r3 P3-R3-2) -> the document;
+    ValueError naming path otherwise."""
+    try:
+        return rqlib.read_json(path)
+    except RecursionError:
+        raise ValueError(f"{path}: {DEEP}") from None
+
+
+def _extra_call(fn, d, *args):
+    """A recovery_extra reader of directory d (its frozen plan, results, summary; recovery_extra.py is accepted and
+    unchanged) with a recursion failure named -> fn's result; ValueError naming d otherwise."""
+    try:
+        return fn(d, *args)
+    except RecursionError:
+        raise ValueError(f"{d}: its frozen plan, a result or an input recovery_extra re-reads is {DEEP}") from None
+
+
 def _dir_kind(d):
     if os.path.isfile(os.path.join(d, "config.json")):
         return "legacy"
@@ -1849,12 +1879,15 @@ def _dir_kind(d):
 
 def _legacy_results(d):
     """A legacy run directory's results, each identity-checked against its config.json -> [(where, scenario, rep,
-    result)]."""
-    cfg = rqlib.read_json(os.path.join(d, "config.json"))
-    want = rqlib.canonical_sha(cfg)
+    result)]; a document nested deeper than the parser's recursion limit is a ValueError naming it."""
+    cfg = _read_json_at(os.path.join(d, "config.json"))
+    try:
+        want = rqlib.canonical_sha(cfg)
+    except RecursionError:
+        raise ValueError(f"{d}/config.json: {DEEP}") from None
     out = []
     for f in _result_files(d):
-        r = rqlib.read_json(os.path.join(d, f))
+        r = _read_json_at(os.path.join(d, f))
         sc, rep = check_result(d, f, r, want, cfg.get("namespace"), "refused", cfg)
         out.append((f"{d}/{f}", sc, rep, r))
     return out
@@ -1864,8 +1897,9 @@ def _extra_results(d):
     """A recovery_extra.py directory's results (its frozen plan and result identities verified by recovery_extra's
     own readers) -> [(where, scenario, rep, result)]."""
     import recovery_extra as X
-    plan = X.read_frozen(d)
-    return [(f"{d}/results/{n}", r["scenario"], r["rep"], r) for n, r in sorted(X.read_results(d, plan).items())]
+    plan = _extra_call(X.read_frozen, d)
+    return [(f"{d}/results/{n}", r["scenario"], r["rep"], r)
+            for n, r in sorted(_extra_call(X.read_results, d, plan).items())]
 
 
 def _bank_directory(d):
@@ -1876,13 +1910,13 @@ def _bank_directory(d):
     kind = _dir_kind(d)
     try:
         if kind == "legacy":
-            cfg = rqlib.read_json(os.path.join(d, "config.json"))
+            cfg = _read_json_at(os.path.join(d, "config.json"))
             om = cfg.get("observation_model") if isinstance(cfg, dict) else None
             src = om.get("noise_source") if isinstance(om, dict) else None
             bank = isinstance(om, dict) and om.get("mode") == "bank" and src == NOISE_SOURCE["bank"]
         else:
             import recovery_extra as X
-            src = X.read_frozen(d).get("noise_source")
+            src = _extra_call(X.read_frozen, d).get("noise_source")
             bank = src == NOISE_SOURCE["bank"]
     except (OSError, ValueError) as e:
         raise SystemExit(f"pairing: {d}: its {'configuration' if kind == 'legacy' else 'frozen plan'} cannot be read "
@@ -1916,7 +1950,10 @@ def pairing(dirs):
             ob = r.get("observations")
             if not isinstance(ob, dict) or not ob:
                 raise SystemExit(f"pairing: {where} records no observations")
-            c = rqlib.canonical(ob)
+            try:
+                c = rqlib.canonical(ob)
+            except RecursionError:
+                raise SystemExit(f"pairing: {where}: its observations record is {DEEP}: refused") from None
             if (sc, rep) in seen:
                 compared += 1
                 if seen[(sc, rep)][0] != c:
@@ -2116,12 +2153,12 @@ def _fit_settings(e):
     recovery_extra fits with its legacy_config's fitter, the registered map, and no A/B cap)."""
     keys = (*REGISTERED_FIT, *DEFAULT_SURFACE)
     if e["kind"] == "legacy":
-        cfg = rqlib.read_json(os.path.join(e["path"], "config.json"))
+        cfg = _read_json_at(os.path.join(e["path"], "config.json"))
         if not isinstance(cfg, dict):
             raise ValueError("config.json is not an object")
         return {k: cfg.get(k) for k in keys}
     import recovery_extra as X
-    plan = X.read_frozen(e["path"])
+    plan = _extra_call(X.read_frozen, e["path"])
     fit, lc = plan.get("fit"), plan.get("legacy_config")
     if not isinstance(fit, dict) or not isinstance(lc, dict):
         raise ValueError("plan.json has no fit / legacy_config object")
@@ -2185,8 +2222,10 @@ def _check(fn):
         return fn()
     except Refused:
         raise
-    except (SystemExit, ValueError, KeyError, TypeError, OSError) as e:
+    except (SystemExit, ValueError, KeyError, TypeError, OSError, OverflowError) as e:
         return {"status": "fail", "reason": f"{type(e).__name__}: {e}"}
+    except RecursionError as e:      # (a backstop: the readers name their input; Codex WP4 r3 P3-R3-2)
+        return {"status": "fail", "reason": f"RecursionError: an input is {DEEP} ({e})"}
 
 
 def _rederive_config(e, cfg, inputs, obs, allow_synthetic):
@@ -2217,7 +2256,10 @@ def _identity(entries, inputs, obs, om_sha, mode, allow_synthetic):
         try:
             if e["kind"] == "legacy":
                 raw = rqlib.read_bytes(os.path.join(d, "config.json"))
-                cfg = json.loads(raw)
+                try:
+                    cfg = json.loads(raw)
+                except RecursionError:
+                    raise ValueError(f"config.json is {DEEP}") from None
                 if raw != rqlib.canonical(cfg):
                     raise ValueError("config.json is not canonical JSON")
                 if rqlib.canonical_sha(cfg) != e["expected_config_sha256"]:
@@ -2241,21 +2283,23 @@ def _identity(entries, inputs, obs, om_sha, mode, allow_synthetic):
                         raise ValueError(f"the C1-primary configuration is not the registered one: {bad}")
                 _legacy_results(d)
             else:
-                plan = X.read_frozen(d)
+                plan = _extra_call(X.read_frozen, d)
                 if rqlib.canonical_sha(plan) != e["expected_plan_sha256"]:
                     raise ValueError(f"plan.json hashes to {rqlib.canonical_sha(plan)}, not the scheduled "
                                      f"{e['expected_plan_sha256']}")
                 if plan.get("noise_source") != NOISE_SOURCE["bank"]:
                     raise ValueError(f"a {plan.get('noise_source')!r} plan: planning input is refused (v5 3.7; "
                                      "recovery_extra's bank mode, v5 3.4, is WP5's)")
-                X.verified(d, inputs["graph"], inputs["references"])
+                _extra_call(X.verified, d, inputs["graph"], inputs["references"])
                 if mode == "acceptance" and plan.get("namespace") != A_NAMESPACE:
                     raise ValueError(f"namespace {plan.get('namespace')!r} is not {A_NAMESPACE}")
-                for n, r in sorted(X.read_results(d, plan).items()):
+                for n, r in sorted(_extra_call(X.read_results, d, plan).items()):
                     if r.get("noise_source") != NOISE_SOURCE["bank"] or r.get("observation_model_sha256") != om_sha:
                         raise ValueError(f"results/{n}: noise_source / observation_model_sha256 not the scheduled ones")
         except (SystemExit, ValueError, KeyError, TypeError, OSError) as ex:
             fails.append(f"{e['dir']} ({e['role']}): {ex}")
+        except RecursionError:       # (a re-serialization of a parsed document: Codex WP4 r3 P3-R3-2)
+            fails.append(f"{e['dir']} ({e['role']}): a configuration, plan or result is {DEEP}")
     out = {"status": "fail" if fails else "pass", "directories": len(entries)}
     if fails:
         out.update(reason=" | ".join(fails), failures=fails)
@@ -2277,8 +2321,12 @@ def _completeness(entries):
             if not os.path.isfile(p):
                 miss.append(f"{e['dir']}: {os.path.basename(p)} missing")
                 continue
-            r = rqlib.read_json(p)
-            lack = sorted(set(e["options"]) - set((r.get("options") or {})))
+            try:
+                r = _read_json_at(p)
+            except (OSError, ValueError) as ex:
+                miss.append(f"{e['dir']}: {os.path.basename(p)} unreadable ({ex})")
+                continue
+            lack = sorted(set(e["options"]) - set(((r.get("options") if isinstance(r, dict) else None) or {})))
             if lack:
                 miss.append(f"{e['dir']}: {os.path.basename(p)} lacks options {lack}")
     return {"status": "fail" if miss else "pass", **({"reason": "; ".join(miss[:20]) + (
@@ -2297,13 +2345,13 @@ def _numerical(entries):
         for _, sc, rep in sorted(_items(e), key=str):
             p = _result_path(e, None, sc, rep)
             try:
-                r = rqlib.read_json(p)
+                r = _read_json_at(p)
             except (OSError, ValueError) as ex:
                 bad.append(f"{e['dir']}: {sc}.{rep:03d} unreadable or missing ({ex})")
                 continue
             o = (r.get("options") or {}).get("a") or {}
             rel = o.get("relative")
-            ok = (isinstance(rel, (int, float)) and not isinstance(rel, bool) and math.isfinite(rel)
+            ok = (_num(rel) is not None and math.isfinite(_num(rel))
                   and r.get("noiseless") is True and (r.get("observations") or {}).get("cnt") == ABSENT_CNT)
             fwd = (r.get("options") or {}).get("fwd")
             if fwd is not None and fwd != NUMERICAL_FWD:
@@ -2349,11 +2397,79 @@ def _grid(*infos):
     return sum(0 if i is None else _unresolved(i.get("grid_unresolved")) if isinstance(i, dict) else 1 for i in infos)
 
 
+_ABSENT = object()
+
+
+def _at(d, path):
+    """d at path (a tuple of keys, every level an object) -> the value, or _ABSENT."""
+    for k in path:
+        if not isinstance(d, dict) or k not in d:
+            return _ABSENT
+        d = d[k]
+    return d
+
+
+def _num(x):
+    """A JSON number as a float -> None for a non-number (bool included) or one no float represents (Codex WP4 r3
+    P3-R3-1: a huge JSON integer raises OverflowError in float())."""
+    if isinstance(x, bool) or not isinstance(x, (int, float)):
+        return None
+    try:
+        return float(x)
+    except OverflowError:
+        return None
+
+
+def _score(x):
+    """A candidate's val_lpd as the procedures compare it -> a float: finite, or -inf (stored as the number or, by
+    recovery_extra, as the text "-Infinity"); None when absent, not a number, NaN, +inf or not representable."""
+    if x == "-Infinity":
+        return -math.inf
+    f = _num(x)
+    return f if f is not None and (math.isfinite(f) or f == -math.inf) else None
+
+
 def _val_key(c):
-    """A candidate's validation score as the procedures compare it (max over val_lpd, first on ties); a value that
-    is not a number (recovery_extra's "-Infinity" text included) ranks lowest."""
-    x = c.get("val_lpd")
-    return float(x) if isinstance(x, (int, float)) and not isinstance(x, bool) else -math.inf
+    """A candidate's validation score as the procedures compare it (max over val_lpd, first on ties); an unreadable
+    score ranks lowest (and is itself a violation: _require)."""
+    s = _score(c.get("val_lpd"))
+    return -math.inf if s is None else s
+
+
+_SHAPES = {"object": lambda x: isinstance(x, dict), "list": lambda x: isinstance(x, list),
+           "count": lambda x: type(x) is int, "flag": lambda x: type(x) is bool, "rank": lambda x: type(x) is int,
+           "penalty": lambda x: _num(x) is not None and math.isfinite(_num(x)),
+           "score": lambda x: _score(x) is not None}
+# The records each live guard / C1 path reads, with the producers' shapes (procedure, forward_procedure,
+# recovery_extra.forward always store them; Codex WP4 r3 P2: an absent record is a violation, never zero flags):
+_CAND_SELECTION = ((("rank",), "rank"), (("lambda",), "penalty"), (("val_lpd",), "score"),
+                   (("integration", "validation"), "object"))            # (every candidate a selection compares)
+_CAND_TEST = ((("integration", "test"), "object"),)                       # (a comparison's two candidates)
+_CAND_COMPARED = ((("integration_unresolved",), "count"),) + _CAND_TEST   # (the winner compared with rank 0)
+_PROC_DECIDED = ((("success",), "flag"), (("selected", "rank"), "rank"), (("selected", "lambda"), "penalty"),
+                 (("decision", "available"), "flag"), (("decision", "test_worlds"), "count"),
+                 (("decision", "selection_unresolved"), "flag"), (("decision", "integration_unresolved"), "count"),
+                 (("per_test_world",), "list"))
+_FWD_DECIDED = ((("success",), "flag"), (("selected", "rank"), "rank"), (("selected", "lambda"), "penalty"),
+                (("decision", "available"), "flag"), (("decision", "selection_unresolved"), "flag"),
+                (("decision", "integration_unresolved"), "count"))
+_BRANCH_LIVE = ((("available",), "flag"), (("decision_available",), "flag"), (("success",), "flag"),
+                (("integration_unresolved",), "count"), (("integration", "selected"), "object"),
+                (("per_world",), "list"))
+_PRIMARY_LIVE = ((("rank",), "rank"), (("lambda",), "penalty"), (("available",), "flag"), (("success",), "flag"))
+
+
+def _require(rec, fields, where):
+    """The records a live guard or C1 path reads must be present with the producer's shape (an empty object the
+    producer writes is valid) -> violations naming each absent or malformed field."""
+    v = []
+    for path, shape in fields:
+        x = _at(rec, path)
+        if x is _ABSENT:
+            v.append(f"{where}: {'.'.join(path)} is absent (the producer always records this {shape})")
+        elif not _SHAPES[shape](x):
+            v.append(f"{where}: {'.'.join(path)} is not a {shape} ({repr(x)[:60]})")
+    return v
 
 
 def _per_world(per, roots, where):
@@ -2378,18 +2494,33 @@ def _record_violations(o, where, decided):
     forward procedures, each branch's comparison (its stored flag, its selected / rank-zero integration records and
     the validation flags) and the decision branch behind the top-level decision and success; and a decided comparison's
     contributing roots against its per-world record (_per_world). A decided, successful or available record needs
-    these records present and resolved."""
+    these records present, with the producer's shape (_require; Codex WP4 r3 P2), and resolved: each live path
+    requires exactly the records it reads -- the full selection every candidate's selection records and the winner's
+    and rank zero's comparison records; the restricted primary only its restricted candidates' (every candidate's rank,
+    to tell which they are) and its restricted winner's and rank zero's; a live forward branch its own."""
     v = []
     cands = o.get("candidates")
+    sp = o.get("selected_primary") if isinstance(o.get("selected_primary"), dict) else None
+    live_full = decided or bool(o.get("success"))
+    live_primary = sp is not None and (sp.get("available") is True or bool(sp.get("success")))
     if not (isinstance(cands, list) and cands and all(isinstance(c, dict) for c in cands)):
-        if decided or o.get("success") or (_sub(o, "selected_primary", "available") is True):
+        if live_full or live_primary:
             v.append(f"{where}: a decision without its candidate records")
         return v
     rank0 = next((c for c in cands if c.get("rank") == 0), None)
     if rank0 is None:
         return [f"{where}: no rank-0 candidate record"]
-    val_all = _grid(*(_sub(c, "integration", "validation") for c in cands))
+    fwd = o.get("procedure") == "forward" or "reference_policy" in o
     win = max(cands, key=_val_key)
+    wi, zi = next(i for i, c in enumerate(cands) if c is win), next(i for i, c in enumerate(cands) if c is rank0)
+    if live_full:
+        v += _require(o, _FWD_DECIDED if fwd else _PROC_DECIDED, where)
+        for i, c in enumerate(cands):
+            v += _require(c, _CAND_SELECTION, f"{where}.candidates[{i}]")
+        if not fwd:
+            v += _require(win, _CAND_COMPARED, f"{where}.candidates[{wi}]")
+            v += _require(rank0, _CAND_TEST, f"{where}.candidates[{zi}]")
+    val_all = _grid(*(_sub(c, "integration", "validation") for c in cands))
     s = o.get("selected") if isinstance(o.get("selected"), dict) else {}
     if (s.get("rank"), s.get("lambda")) != (win.get("rank"), win.get("lambda")):
         v.append(f"{where}: the selected candidate ({s.get('rank')}, {s.get('lambda')}) is not the validation winner "
@@ -2405,6 +2536,7 @@ def _record_violations(o, where, decided):
             if not isinstance(br, dict) or not (br.get("decision_available") is True or br.get("success")
                                                 or br.get("available") is True):
                 continue
+            v += _require(br, _BRANCH_LIVE + (() if sel0 else ((("integration", "rank0"), "object"),)), f"{where}.{b}")
             n = (_unresolved(br.get("integration_unresolved")) + _grid(_sub(br, "integration", "selected"))
                  + (0 if sel0 else _grid(_sub(br, "integration", "rank0"))) + val_all)
             if n:
@@ -2421,22 +2553,31 @@ def _record_violations(o, where, decided):
             v.append(f"{where}: success whose decision branch is not successful")
         if (decided or o.get("success")) and val_all:
             v.append(f"{where}: decided on an unresolved selection ({val_all} validation flag(s) in the candidates)")
-        return v
+        return list(dict.fromkeys(v))
     full = val_all + compared(win)
     if (decided or o.get("success")) and full:
         v.append(f"{where}: decided on an unresolved selection or comparison (from the candidate records: {val_all} "
                  f"validation flag(s), {compared(win)} in the winner's comparison against rank zero)")
     if decided or o.get("success"):
         v += _per_world(o.get("per_test_world"), _roots(_sub(o, "decision", "test_worlds")), where)
-    sp = o.get("selected_primary")
-    if isinstance(sp, dict):
+    if sp is not None:
         restricted = [c for c in cands if type(c.get("rank")) is int and c["rank"] <= PRIMARY_RANKS]
-        live = sp.get("available") is True or bool(sp.get("success"))
+        live = live_primary
+        if live:                # (every rank, to tell the restricted set; the restricted candidates' records only)
+            v += _require(sp, _PRIMARY_LIVE, f"{where}.selected_primary")
+            for i, c in enumerate(cands):
+                inside = any(c is r for r in restricted)
+                v += _require(c, ((("rank",), "rank"),) + (_CAND_SELECTION[1:] if inside else ()),
+                              f"{where}.candidates[{i}]")
         if not restricted:
             if live:
                 v.append(f"{where}.selected_primary: decided without restricted candidate records")
-            return v
+            return list(dict.fromkeys(v))
         pw = max(restricted, key=_val_key)
+        if live:
+            pi = next(i for i, c in enumerate(cands) if c is pw)
+            v += _require(pw, _CAND_COMPARED, f"{where}.candidates[{pi}]")
+            v += _require(rank0, _CAND_TEST, f"{where}.candidates[{zi}]")
         if (sp.get("rank"), sp.get("lambda")) != (pw.get("rank"), pw.get("lambda")):
             v.append(f"{where}.selected_primary: ({sp.get('rank')}, {sp.get('lambda')}) is not the restricted "
                      f"validation winner ({pw.get('rank')}, {pw.get('lambda')})")
@@ -2445,7 +2586,7 @@ def _record_violations(o, where, decided):
             v.append(f"{where}.selected_primary: available or successful on an unresolved restricted selection or "
                      f"comparison ({pv} validation flag(s) over ranks <= {PRIMARY_RANKS}, {compared(pw)} in the "
                      "restricted winner's comparison against rank zero)")
-    return v
+    return list(dict.fromkeys(v))
 
 
 def _guard_violations(o, where):
@@ -2517,7 +2658,7 @@ def _guards(entries):
                                     for c in summ["cells"]]
                 rows = [(f"{e['dir']}/{os.path.basename(w)}", r) for w, _, _, r in _legacy_results(e["path"])]
             else:
-                summ = X.summarize(e["path"])
+                summ = _extra_call(X.summarize, e["path"])
                 counts[e["dir"]] = [{k: c.get(k) for k in ("case", "scenario", "option", "branch", "datasets",
                                                            "completed", "decided", "unavailable")}
                                     for c in summ["cells"]]
@@ -2525,9 +2666,15 @@ def _guards(entries):
         except (SystemExit, ValueError, KeyError, TypeError, OSError) as ex:
             viol.append(f"{e['dir']}: summarize refused ({ex})")
             continue
+        except RecursionError:
+            viol.append(f"{e['dir']}: summarize refused (a document is {DEEP})")
+            continue
         for w, r in rows:
             for opt, o in (r.get("options") or {}).items():
-                viol += _guard_violations(o, f"{w}:{opt}")
+                try:
+                    viol += _guard_violations(o, f"{w}:{opt}")
+                except RecursionError:
+                    viol.append(f"{w}:{opt}: a record nested deeper than the recursion limit")
     return {"status": "fail" if viol else "pass", **({"reason": "; ".join(viol[:20])} if viol else {}),
             "counts": counts}
 
@@ -2540,14 +2687,14 @@ def c1_success(o):
     Anything else (an unavailable, unresolved or inconsistent "success" included) is unsuccessful."""
     if not isinstance(o, dict) or o.get("success") is not True or o.get("available") is False:
         return False
-    dec, sel, lb = o.get("decision"), o.get("selected"), o.get("test_lb")
+    dec, sel, lb = o.get("decision"), o.get("selected"), _num(o.get("test_lb"))   # (_num: never an OverflowError)
     if not isinstance(dec, dict) or dec.get("available") is not True or \
             _unresolved(dec.get("integration_unresolved")) or _unresolved(dec.get("selection_unresolved")):
         return False
     tw = dec.get("test_worlds")
     if type(tw) is not int or tw < MIN_TEST_ROOTS:
         return False
-    if not (isinstance(sel, dict) and type(sel.get("rank")) is int and sel["rank"] > 0 and type(lb) in (int, float)
+    if not (isinstance(sel, dict) and type(sel.get("rank")) is int and sel["rank"] > 0 and lb is not None
             and math.isfinite(lb) and lb > 0):
         return False
     return not _guard_violations(o, "C1")
@@ -2566,7 +2713,7 @@ def _c1(entries, mode):
         return {"status": "fail", "reason": f"{len(prim)} C1-primary directories (exactly one)"}
     e = prim[0]
     d = e["path"]
-    cfg = rqlib.read_json(os.path.join(d, "config.json"))
+    cfg = _read_json_at(os.path.join(d, "config.json"))
     sha = rqlib.canonical_sha(cfg)
     if sha != e["expected_config_sha256"]:
         return {"status": "fail", "reason": f"refused: the C1-primary config.json hashes to {sha}, not the scheduled "
@@ -2581,12 +2728,15 @@ def _c1(entries, mode):
         for rep in range(C1_RULE["reps"]):
             f = f"{sc}.{rep:03d}.json"
             try:
-                r = rqlib.read_json(os.path.join(d, f))
+                r = _read_json_at(os.path.join(d, f))
                 check_result(d, f, r, sha, cfg.get("namespace"), "C1", cfg)
             except (SystemExit, OSError, ValueError):
                 continue                                   # (missing or invalid: unsuccessful, never removed)
             o = (r.get("options") or {}).get(C1_RULE["option"])
-            win = c1_success(o)
+            try:
+                win = c1_success(o)
+            except RecursionError:
+                win = False
             k += win
             flagged += bool(isinstance(o, dict) and o.get("success") is True and not win)
         out[sc] = {"successes": k, "datasets": C1_RULE["reps"], "wilson95": wilson(k, C1_RULE["reps"]),
