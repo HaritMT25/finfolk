@@ -2578,6 +2578,326 @@ class TestRecoveryBankPacket(unittest.TestCase):
         self.assertIn("the bank artifact", cp.stderr)
         self.assertFalse(os.path.exists(out))
 
+    # ---------------------------------------------------------------- round 5 (Codex WP4 r4): the liveness matrix
+    @staticmethod
+    def r5_states():
+        """Producer-shaped records for every liveness state the producers emit -> {name: (kind, record, producer)}.
+        Kinds: the selection-and-prediction procedure (recovery.py procedure, L989-1107: option a, and recovery_extra's
+        a / interp with several test worlds, L758-763), the legacy forward procedure (recovery.py forward_procedure,
+        L1110-1187), recovery_extra's forward (recovery_extra.py forward, L623-744) and its one-root merged record
+        (recovery_extra.py evaluate, L750-756). Integration records carry grid_unresolved as the registered map writes
+        them (map.py L1237: 0 when resolved)."""
+        def info(g=0):
+            return {"pairs": 4, "grid_unresolved": g}
+
+        def pcand(rank, lam, val, vg=0, tg=0):           # (procedure's _cand_record, L949-964, and L1037-1044)
+            return {"rank": rank, "lambda": lam, "val_lpd": val, "val_lpd_gauss": val, "start": "warm",
+                    "integration": {"validation": info(vg), "test": info(tg)}, "test_rmse_truth": None,
+                    "test_improvement": None if tg else 0.1, "test_lb": None if tg else 0.01,
+                    "integration_unresolved": tg, "test_improvement_gauss": 0.1, "test_lb_gauss": 0.01}
+
+        def fcand(rank, lam, val, vg=0):                 # (forward's _cand_record: validation integration only)
+            return {"rank": rank, "lambda": lam, "val_lpd": val, "val_lpd_gauss": val, "start": "warm",
+                    "integration": {"validation": info(vg)}}
+
+        def proc(vg3=0, tg3=0, vg1=0, tg1=0, success=True):
+            cands = [pcand(0, 0.0, 0.0), pcand(1, 0.05, 1.0, vg=vg1, tg=tg1), pcand(3, 0.05, 2.0, vg=vg3, tg=tg3)]
+            unres_val, unres_test = vg1 + vg3, tg3
+            avail = not (unres_val or unres_test)
+            unres_val_prim, prim_unres = vg1, tg1
+            avail_prim = not unres_val_prim and not prim_unres
+            ok = avail and success
+            rec = {"candidates": cands, "fitter": "registered", "start": "both", "score": {}, "basis": 6,
+                   "embedding": "shared", "center": "references",
+                   "selected": dict({"rank": 3, "lambda": 0.05, "start": "warm"},
+                                    **({"selection_unresolved": True} if unres_val else {})),
+                   "test_improvement": 0.1 if avail else None, "test_lb": (0.02 if ok else -0.01) if avail else None,
+                   "per_test_world": [0.1] * 6 if avail else [], "success": bool(ok),
+                   "decision": {"available": bool(avail), "test_worlds": 6, "selection_unresolved": bool(unres_val),
+                                "integration_unresolved": unres_val + unres_test, "reason": None if avail else "u"},
+                   "selected_primary": dict({"ranks": [0, 1, 2], "rank": 1, "lambda": 0.05, "start": "warm",
+                                             "available": bool(avail_prim), "test_improvement": 0.1,
+                                             "test_lb": 0.01, "success": bool(avail_prim)},
+                                            **({"selection_unresolved": True} if unres_val_prim else {})),
+                   "fit_pairs": 100, "classes": None, "ab_cap": None}
+            return rec
+
+        def lbranch(state):                              # (forward_procedure's branches, L1148-1176)
+            if state == "decided":
+                return {"available": True, "test_improvement": 0.1, "test_lb": 0.01, "per_world": [0.1] * 3,
+                        "success": True, "targets": 40, "worlds": 3, "decision_available": True,
+                        "integration": {"selected": info(), "rank0": info()}, "integration_unresolved": 0,
+                        "test_improvement_gauss": 0.1, "test_lb_gauss": 0.01}
+            if state == "no targets":
+                return {"available": False, "reason": "no targets"}
+            if state == "one root":
+                return {"available": False, "targets": 9, "test_roots": 1, "reason": "fewer than 2 roots"}
+            return {"available": False, "integration_unresolved": 1, "targets": 40, "worlds": 3,
+                    "integration": {"selected": info(), "rank0": info()}, "reason": "unresolved"}
+
+        def lfwd(ft, inter, vg=0):
+            b = {"forward_transfer": lbranch(ft), "intersection": lbranch(inter)}
+            f = b["forward_transfer"]
+            return dict({"procedure": "forward", "candidates": [fcand(0, 0.0, 0.0), fcand(1, 0.05, 1.0, vg=vg)],
+                         "fitter": "registered", "fit_pairs": 90, "score": {}, "val_pairs": 30,
+                         "test_pairs": {"forward_transfer": 40, "intersection": 40}, "controls": 50,
+                         "selected": dict({"rank": 1, "lambda": 0.05, "start": "warm"},
+                                          **({"selection_unresolved": True} if vg else {})),
+                         "integration_unresolved": {"validation": vg},
+                         "decision": {"available": bool(f.get("available") and f.get("decision_available")),
+                                      "reason": f.get("reason"), "selection_unresolved": bool(vg),
+                                      "integration_unresolved": max(vg, int(f.get("integration_unresolved", 0)))},
+                         "success": f.get("success", False), "test_improvement": f.get("test_improvement"),
+                         "test_lb": f.get("test_lb"), "classes": {}}, **b)
+
+        def xbranch(state):                              # (recovery_extra.forward's branches, L670-735)
+            if state == "decided":
+                return {"targets": 40, "test_roots": 3, "worlds": 3, "available": True, "decision_available": True,
+                        "success": True, "test_improvement": 0.1, "test_lb": 0.01, "per_world": [0.1] * 3,
+                        "integration": {"selected": info(), "rank0": info()}, "integration_unresolved": 0,
+                        "test_improvement_gauss": 0.1, "test_lb_gauss": 0.01}
+            if state == "no targets":
+                return {"targets": 0, "test_roots": 0, "worlds": 0, "available": False, "decision_available": False,
+                        "success": False, "reason": "fewer than 2 contributing test roots"}
+            return {"targets": 9, "test_roots": 1, "worlds": 1, "available": False, "decision_available": False,
+                    "success": False, "descriptive": True, "test_improvement": 0.1, "per_world": [0.1],
+                    "per_world_ids": ["w1"], "test_improvement_gauss": 0.1,
+                    "integration": {"selected": info(), "rank0": info()}, "integration_unresolved": 0,
+                    "reason": "fewer than 2 contributing test roots"}
+
+        def xfwd(ft, inter):
+            b = {"forward_transfer": xbranch(ft), "intersection": xbranch(inter)}
+            f = b["forward_transfer"]
+            return dict({"procedure": "forward", "reference_policy": "fwd_all", "fitter": "registered", "score": {},
+                         "fit_pairs": 90, "val_pairs": 30, "controls": 50,
+                         "candidates": [fcand(0, 0.0, 0.0), fcand(1, 0.05, 1.0)],
+                         "selected": {"rank": 1, "lambda": 0.05, "start": "warm"},
+                         "integration_unresolved": {"validation": 0},
+                         "decision": {"available": bool(f.get("available")), "reason": f.get("reason"),
+                                      "selection_unresolved": False,
+                                      "integration_unresolved": int(f.get("integration_unresolved", 0))},
+                         "success": f.get("success", False), "test_improvement": f.get("test_improvement"),
+                         "test_lb": f.get("test_lb")}, **b)
+
+        merged = xfwd("decided", "decided")              # (evaluate's one-root a / interp, L750-756)
+        for k in ("forward_transfer", "intersection"):
+            merged.pop(k)
+        wt = xbranch("one root")
+        merged.update(reference_policy="a", world_transfer=wt,
+                      decision={"available": False, "reason": wt["reason"], "selection_unresolved": False,
+                                "integration_unresolved": 0}, success=False, test_improvement=wt["test_improvement"],
+                      test_lb=None)
+        merged.update(dict(wt), procedure="a", per_test_world=wt["per_world"])
+        return {
+            "P1 decided, primary live, success": ("procedure", proc(), "L1035, L1055-1060, L1089-1091"),
+            "P2 decided, primary live, unsuccessful": ("procedure", proc(success=False), "L1046-1047, L1090"),
+            "P3 decided, primary unavailable (restricted comparison unresolved)": ("procedure", proc(tg1=1),
+                                                                                   "L1040-1043, L1055"),
+            "P4 full unavailable (rank-3 validation), primary live": ("procedure", proc(vg3=1),
+                                                                      "L1032-1035, L1053-1055"),
+            "P5 full unavailable (winner comparison), primary live": ("procedure", proc(tg3=1),
+                                                                      "L1033-1035, L1063-1066"),
+            "P6 full and primary unavailable": ("procedure", proc(vg1=1), "L1032, L1053-1062"),
+            "P7 procedure unavailable (roots)": ("procedure", {
+                "available": False, "reason": "1 contributing test root(s)", "fitter": "registered",
+                "fit_pairs": 100, "validation_targets": 20, "test_targets": 30, "test_roots": 1}, "L998-1001"),
+            "L1 legacy forward: both branches decided": ("forward", lfwd("decided", "decided"), "L1172-1183"),
+            "L2 legacy forward: forward_transfer decided, intersection one root": (
+                "forward", lfwd("decided", "one root"), "L1157-1161, L1178"),
+            "L3 legacy forward: forward_transfer no targets, intersection decided (Codex P2-R4-1)": (
+                "forward", lfwd("no targets", "decided"), "L1149-1151, L1172-1179"),
+            "L4 legacy forward: validation unresolved, no branch live": ("forward",
+                                                                       lfwd("unresolved", "unresolved", vg=1),
+                                                                       "L1146, L1164-1169, L1178-1180"),
+            "L5 legacy forward: nothing to fit": ("forward", {
+                "procedure": "forward", "candidates": [], "fitter": "registered", "fit_pairs": 0, "score": {},
+                "val_pairs": 0, "test_pairs": {}, "controls": 0, "available": False,
+                "reason": "no fitting pairs"}, "L1125-1130"),
+            "X1 extra forward: both branches decided": ("extra forward", xfwd("decided", "decided"), "L715-744"),
+            "X2 extra forward: forward_transfer no targets, intersection decided": (
+                "extra forward", xfwd("no targets", "decided"), "L672-678, L715-744"),
+            "X3 extra forward: forward_transfer decided, intersection one-root descriptive": (
+                "extra forward", xfwd("decided", "one root"), "L703-715"),
+            "M1 extra a / interp, one test world (descriptive)": ("extra merged", merged, "L750-756, L703-715"),
+        }
+
+    # (documented ALTERNATIVES: a read whose deletion leaves a live claim standing is accepted only here)
+    R5_ALTERNATIVES = (
+        ("grid_unresolved", "a zero unresolved count: an absent grid_unresolved reads 0 and the registered map "
+                            "writes 0 for a resolved record (map.py L1237); the minimal fitter writes none "
+                            "(recovery.py L812). "
+                            "Deleting a 0 hides no unresolved pair: a positive count is the only unresolved state, "
+                            "and it also sets the stored integration_unresolved / decision flags the paths require"),
+        ("test_roots|worlds", "recovery_extra writes a branch's test_roots and worlds from the same count "
+                              "(recovery_extra.py L671): either one gives the root guard and the per-world length "
+                              "their count, so a missing one cannot hide an under-rooted claim"),
+        ("procedure|reference_policy", "recovery_extra marks a forward record twice, procedure 'forward' and "
+                                       "reference_policy (recovery_extra.py L631-632): either one selects the forward "
+                                       "derivation, so a missing one changes nothing"),
+    )
+
+    @staticmethod
+    def r5_owner(path):
+        """The claims a record field is evidence for (the comparison's own records, by the producers' layout)."""
+        k = path[0]
+        if k in R.BRANCHES:
+            return {f"branch:{k}"}
+        if k == "selected_primary":
+            return {"primary"}
+        if k == "candidates" or path in (("selected",), ("selected", "rank"), ("selected", "lambda")):
+            return {"any"}
+        if path in (("decision",), ("decision", "test_worlds")):
+            return {"decision", "primary"}
+        if path == ("test_lb",):         # (read by C1 alone; the guards never read it)
+            return {"c1"}
+        return {"decision"}
+
+    @staticmethod
+    def r5_live(rec):
+        """The record's live claims, read from its flags (as the producers set them)."""
+        out = set()
+        dec = rec.get("decision") if isinstance(rec.get("decision"), dict) else {}
+        if dec.get("available") is True or rec.get("success") or rec.get("decision_available") is True:
+            out.add("decision")
+        sp = rec.get("selected_primary")
+        if isinstance(sp, dict) and (sp.get("available") is True or sp.get("success")):
+            out.add("primary")
+        for b in R.BRANCHES:
+            br = rec.get(b)
+            if isinstance(br, dict) and (br.get("decision_available") is True or br.get("success")
+                                         or br.get("available") is True):
+                out.add(f"branch:{b}")
+        if R.c1_success(rec):           # (C1 counts the record: a claim of its own)
+            out.add("c1")
+        return out | ({"any"} if out else set())
+
+    @staticmethod
+    def r5_reads(rec):
+        """Every key path the guards (_guard_violations) and C1 (c1_success) read on rec, tracked during a real
+        evaluation -> (reads, violations, c1)."""
+        log = set()
+
+        class Tracked(dict):
+            def __init__(self, data, path):
+                super().__init__()
+                self.path = path
+                for k, x in data.items():
+                    dict.__setitem__(self, k, track(x, path + (k,)))
+
+            def get(self, k, default=None):
+                log.add(self.path + (k,))
+                return dict.get(self, k, default)
+
+            def __getitem__(self, k):
+                log.add(self.path + (k,))
+                return dict.__getitem__(self, k)
+
+            def __contains__(self, k):
+                log.add(self.path + (k,))
+                return dict.__contains__(self, k)
+
+        def track(x, path):
+            if isinstance(x, dict):
+                return Tracked(x, path)
+            if isinstance(x, list):
+                return [track(y, path + (i,)) for i, y in enumerate(x)]
+            return x
+        t = track(rec, ())
+        viol = R._guard_violations(t, "x")
+        return log, viol, R.c1_success(t)
+
+    @staticmethod
+    def r5_present(rec, path):
+        for k in path:
+            if isinstance(rec, dict) and k in rec:
+                rec = rec[k]
+            elif isinstance(rec, list) and isinstance(k, int) and k < len(rec):
+                rec = rec[k]
+            else:
+                return False, None
+        return True, rec
+
+    def r5_alternative(self, rec, path):
+        """The documented alternative a path is, if any (R5_ALTERNATIVES)."""
+        leaf = path[-1]
+        if leaf == "grid_unresolved" and self.r5_present(rec, path)[1] == 0:
+            return "grid_unresolved"
+        if leaf in ("test_roots", "worlds") and len(path) == 2 and path[0] in R.BRANCHES:
+            other = "worlds" if leaf == "test_roots" else "test_roots"
+            if self.r5_present(rec, path[:-1] + (other,))[1] == self.r5_present(rec, path)[1]:
+                return "test_roots|worlds"
+        if path in (("procedure",), ("reference_policy",)) and rec.get("procedure") == "forward" and \
+                "reference_policy" in rec:
+            return "procedure|reference_policy"
+        return None
+
+    def test_T7_8_every_liveness_state_requires_every_record_its_live_claims_read(self):
+        """P2-R4-1 / P2-R4-2 and their class (Codex WP4 r4): for every liveness state the producers emit (r5_states:
+        the procedure with the full decision and the restricted primary each live or not; legacy and extra forward
+        with each branch live or not, independently of the top-level decision; the early returns; the merged
+        one-root record), the guards and C1 are evaluated on a tracked copy and every key path they READ is
+        recorded. Then each read field present in the record is deleted, one at a time. A deletion must be caught --
+        a guard violation, or C1 no longer counting a record it counted -- unless (a) the field is evidence only for
+        claims that are not live in that state, (b) the deletion withdraws every live claim the field is evidence
+        for, or (c) the field is one of the documented alternatives (R5_ALTERNATIVES); and no deletion may ever add a
+        live claim or make C1 count a record it did not. Every read of a key ABSENT from the record (a conditional
+        read) is reported too. With RQ_WP4_COVERAGE set, the full coverage table is written there (evidence).
+        Codex's two inputs are in the matrix (L3's candidate integrations; P4's decision.test_worlds), with the
+        absent candidate list beside a live branch."""
+        states = self.r5_states()
+        holes, table = [], {}
+        for name, (kind, rec, where) in states.items():
+            reads, viol, c1 = self.r5_reads(rec)
+            self.assertEqual(viol, [], f"{name}: the producer-shaped record must pass the guards")
+            live = self.r5_live(rec)
+            row = {"kind": kind, "producer": where, "live": sorted(live), "c1": c1, "caught": [], "not_live": [],
+                   "withdrawn": [], "alternative": [], "absent_reads": []}
+            for path in sorted(reads, key=str):
+                present, _ = self.r5_present(rec, path)
+                if not present:
+                    row["absent_reads"].append(".".join(map(str, path)))
+                    continue
+                d = self.without(rec, path)
+                dv, dc1 = R._guard_violations(d, "x"), R.c1_success(d)
+                dlive = self.r5_live(d)
+                label = ".".join(map(str, path))
+                if not dlive <= live or (dc1 and not c1):
+                    holes.append(f"{name}: deleting {label} ADDS a claim ({sorted(dlive - live)}, C1 {c1}->{dc1})")
+                if dv or (c1 and not dc1):
+                    row["caught"].append(label)
+                    continue
+                own = self.r5_owner(path) & live
+                if not own:
+                    row["not_live"].append(label)
+                elif not own & dlive:
+                    row["withdrawn"].append(label)
+                elif self.r5_alternative(rec, path):
+                    row["alternative"].append(f"{label} ({self.r5_alternative(rec, path)})")
+                else:
+                    holes.append(f"{name}: deleting {label} leaves {sorted(own & dlive)} live and is not caught")
+            table[name] = row
+        if os.environ.get("RQ_WP4_COVERAGE"):
+            rqlib.write_json_durable(os.environ["RQ_WP4_COVERAGE"], {"states": table, "holes": holes,
+                                                                     "alternatives": dict(self.R5_ALTERNATIVES)})
+        self.assertEqual(holes, [])
+        self.assertTrue(all(table[n]["caught"] for n in table if table[n]["live"]))
+        # (Codex's two inputs, explicitly; and the absent candidate list beside a live branch)
+        _, l3, _ = states["L3 legacy forward: forward_transfer no targets, intersection decided (Codex P2-R4-1)"]
+        stripped = copy.deepcopy(l3)
+        for c in stripped["candidates"]:
+            c.pop("integration")
+        self.assertIn("x.candidates[0]: integration.validation is absent",
+                      "; ".join(R._guard_violations(stripped, "x")))
+        self.assertIn("x: a decision without its candidate records",
+                      R._guard_violations(self.without(l3, ("candidates",)), "x"))
+        _, p4, _ = states["P4 full unavailable (rank-3 validation), primary live"]
+        self.assertIn("x: decision.test_worlds is absent",
+                      "; ".join(R._guard_violations(self.without(p4, ("decision", "test_worlds")), "x")))
+        low = copy.deepcopy(p4)
+        low["decision"]["test_worlds"] = 1
+        self.assertIn("x.selected_primary: decided with 1 contributing test root(s)",
+                      R._guard_violations(low, "x"))
+
     @unittest.expectedFailure
     def test_T7_8_WP5_a_complete_bank_mode_schedule_passes_every_check(self):
         """T7-8's complete schedule with bank-mode recovery_extra directories passes every check (exit 0): needs
