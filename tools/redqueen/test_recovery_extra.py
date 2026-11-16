@@ -2329,6 +2329,255 @@ class TestRecoveryBankPacket(unittest.TestCase):
                 self.assertIn("REFUSED before any check", cp.stderr)
                 self.assertFalse(os.path.exists(out))
 
+    # ---------------------------------------------------------------- round 4 (Codex WP4 r3)
+    @staticmethod
+    def without(rec, path):
+        """A deep copy of rec with the field at path (a tuple of keys / list indices) deleted."""
+        out = copy.deepcopy(rec)
+        parent = out
+        for k in path[:-1]:
+            parent = parent[k]
+        del parent[path[-1]]
+        return out
+
+    def r4_records(self):
+        """A decided, successful selection-and-prediction record (option a: candidates rank 0, rank 1 -- the restricted
+        winner -- and rank 3, the full winner; six roots; a live restricted primary) and a decided, successful forward
+        record (fabricated's), both consistent: no guard violation, C1 counts the first."""
+        f = self.complete()
+        base = fabricated(f["cfgs"]["stress"], "r0_asym", 0, success=True)["options"]
+
+        def cand(rank, lam, val):
+            return {"rank": rank, "lambda": lam, "val_lpd": val, "integration_unresolved": 0,
+                    "integration": {"validation": {}, "test": {}}}
+        a = copy.deepcopy(base["a"])
+        a.update(candidates=[cand(0, 0.0, 0.0), cand(1, 0.05, 1.0), cand(3, 0.05, 2.0)],
+                 selected={"rank": 3, "lambda": 0.05, "start": "warm"},
+                 selected_primary={"ranks": [0, 1, 2], "rank": 1, "lambda": 0.05, "start": "warm", "available": True,
+                                   "test_improvement": 0.1, "test_lb": 0.01, "success": True})
+        a.pop("available")                      # (as procedure writes an available record: no "available" key)
+        fw = copy.deepcopy(base["fwd"])
+        self.assertEqual((R._guard_violations(a, "a"), R._guard_violations(fw, "fwd"), R.c1_success(a)), ([], [], True))
+        return f, a, fw
+
+    def test_T7_8_guards_require_every_record_they_read_the_deletion_table(self):
+        """P2, round 4 (Codex WP4 r3: missing integration records were read as resolved): every record field a live
+        guard or C1 path reads must be present with the producer's shape -- deleting any one of them is a violation (C1
+        then never counts the record), never zero flags. Codex's counterexample (integration and integration_unresolved
+        stripped from every candidate of a successful option-a record) is reported and C1 refuses it, alone and in a
+        packet; so is a forward branch without its integration object. The table deletes, in turn, every field of the
+        TABLE below from a consistent decided record (option a with a live restricted primary; forward with two decided
+        branches). Fields the producers write only conditionally (a record's "available" when false,
+        selection_unresolved when true, a missing selected_primary, which claims nothing) are outside it. The
+        restricted primary stays
+        independent: a missing higher-rank record fails the full selection only, and nothing when only the primary is
+        live. Empty integration objects, as the producers write them, are valid."""
+        f, a, fw = self.r4_records()
+        cands = range(3)
+        table_a = ([("success",), ("selected",), ("selected", "rank"), ("selected", "lambda"), ("decision",),
+                    ("decision", "available"), ("decision", "test_worlds"), ("decision", "selection_unresolved"),
+                    ("decision", "integration_unresolved"), ("per_test_world",), ("candidates",)]
+                   + [("candidates", i, k) for i in cands for k in ("rank", "lambda", "val_lpd", "integration")]
+                   + [("candidates", i, "integration", "validation") for i in cands]
+                   + [("candidates", i, "integration", "test") for i in (0, 1, 2)]          # (rank 0 and both winners)
+                   + [("candidates", i, "integration_unresolved") for i in (1, 2)]         # (the two winners)
+                   + [("selected_primary", k) for k in ("rank", "lambda", "available", "success")])
+        table_fw = ([("success",), ("selected",), ("selected", "rank"), ("selected", "lambda"), ("decision",),
+                     ("decision", "available"), ("decision", "selection_unresolved"),
+                     ("decision", "integration_unresolved"), ("candidates",)]
+                    + [("candidates", i, k) for i in range(2) for k in ("rank", "lambda", "val_lpd", "integration")]
+                    + [("candidates", i, "integration", "validation") for i in range(2)]
+                    + [(b, k) for b in ("forward_transfer", "intersection")
+                       for k in ("available", "decision_available", "success", "worlds", "integration",
+                                 "integration_unresolved", "per_world")]
+                    + [(b, "integration", k) for b in ("forward_transfer", "intersection")
+                       for k in ("selected", "rank0")])
+        for name, rec, table in (("a", a, table_a), ("fwd", fw, table_fw)):
+            for path in table:
+                with self.subTest(record=name, delete=".".join(map(str, path))):
+                    d = self.without(rec, path)
+                    self.assertTrue(R._guard_violations(d, name), path)
+                    if name == "a":
+                        self.assertFalse(R.c1_success(d), path)
+        with self.subTest(c1_only="test_lb"):
+            self.assertFalse(R.c1_success(self.without(a, ("test_lb",))))
+        stripped = copy.deepcopy(a)                 # (Codex's exact counterexample)
+        for c in stripped["candidates"]:
+            c.pop("integration")
+            c.pop("integration_unresolved")
+        got = "; ".join(R._guard_violations(stripped, "a"))
+        self.assertIn("a.candidates[0]: integration.validation is absent", got)
+        self.assertIn("a.candidates[2]: integration_unresolved is absent", got)
+        self.assertFalse(R.c1_success(stripped))
+        self.assertIn("fwd.intersection: integration.selected is absent",
+                      "; ".join(R._guard_violations(self.without(fw, ("intersection", "integration")), "fwd")))
+        hi = self.without(a, ("candidates", 2, "integration", "validation"))     # (a higher-rank record missing)
+        got = R._guard_violations(hi, "a")
+        self.assertTrue(got)
+        self.assertFalse([x for x in got if "selected_primary" in x], got)
+        only = copy.deepcopy(hi)                    # (only the primary live: the rank-3 record is not read at all)
+        only.update(success=False, per_test_world=[],
+                    decision=dict(only["decision"], available=False, selection_unresolved=True,
+                                  integration_unresolved=1))
+        self.assertEqual(R._guard_violations(only, "a"), [])
+        prim = f["dirs"]["primary"]["dir"]
+        fr = os.path.join(prim, "r1_034.003.json")
+        r = rqlib.read_json(fr)
+        for c in r["options"]["a"]["candidates"]:
+            c.pop("integration")
+            c.pop("integration_unresolved")
+        rqlib.write_json_durable(fr, r)
+        with mock.patch.object(R, "C2_MATRIX", self.TOY_C2):
+            doc, code = R.packet(f["path"], "acceptance")
+        self.assertEqual((doc["checks"]["guards"]["status"], doc["checks"]["C1"]["scenarios"]["r1_034"]["successes"],
+                          doc["checks"]["C1"]["status"], code), ("fail", 15, "fail", 2))
+        self.assertIn("r1_034.003.json:a.candidates[0]: integration.validation is absent",
+                      doc["checks"]["guards"]["reason"])
+
+    def test_T7_8_an_unrepresentable_number_is_a_contextual_failure(self):
+        """P3-R3-1 (Codex WP4 r3): a JSON integer no float represents (1 followed by 400 zeros) as a candidate's
+        val_lpd, the test_lb or a numerical relative error is a contextual violation / failed check -- never an
+        OverflowError: the guards name the field, C1 does not count the record, the packet's guards / C1 / numerical checks fail with
+        context. recovery_extra's "-Infinity" text stays a valid score."""
+        huge = 10 ** 400
+        f, a, fw = self.r4_records()
+        bad = copy.deepcopy(a)
+        bad["candidates"][1]["val_lpd"] = huge
+        self.assertIn("a.candidates[1]: val_lpd is not a score", "; ".join(R._guard_violations(bad, "a")))
+        self.assertFalse(R.c1_success(bad))
+        self.assertFalse(R.c1_success(dict(a, test_lb=huge)))
+        ninf = copy.deepcopy(a)                     # (rank 0 scored -inf, as recovery_extra stores it: valid)
+        ninf["candidates"][0]["val_lpd"] = "-Infinity"
+        self.assertEqual(R._guard_violations(ninf, "a"), [])
+        self.assertTrue(R.c1_success(ninf))
+        fr = os.path.join(f["dirs"]["primary"]["dir"], "r1_034.003.json")
+        r = rqlib.read_json(fr)
+        r["options"]["a"]["candidates"][1]["val_lpd"] = huge
+        rqlib.write_json_durable(fr, r)
+        self.assertIn(str(huge), rqlib.read_text(fr))
+        with mock.patch.object(R, "C2_MATRIX", self.TOY_C2):
+            doc, code = R.packet(f["path"], "acceptance")
+        self.assertEqual((doc["checks"]["guards"]["status"], doc["checks"]["C1"]["scenarios"]["r1_034"]["successes"],
+                          code), ("fail", 15, 2))
+        self.assertIn("val_lpd is not a score", doc["checks"]["guards"]["reason"])
+        d = os.path.join(f["root"], "num_huge")
+        shutil.copytree(self.num, d)
+        fn = os.path.join(d, "num_r2.000.json")
+        r = rqlib.read_json(fn)
+        r["options"]["a"]["relative"] = huge
+        rqlib.write_json_durable(fn, r)
+        cfg = rqlib.read_json(os.path.join(d, "config.json"))
+        sched = self.schedule(os.path.join(f["root"], "SCHEDULE_huge.json"),
+                              [self.legacy_entry(d, "numerical", R.SETS["numerical"], 1, ("a", "fwd"))],
+                              rqlib.canonical_sha(cfg["observation_model"]))
+        doc, code = R.packet(sched, "diagnostic", allow_synthetic=True)
+        self.assertEqual((doc["checks"]["numerical"]["status"], code), ("fail", 2))
+        self.assertIn("num_r2.000", doc["checks"]["numerical"]["reason"])
+
+    def test_T7_8_recursion_in_any_packet_input_is_a_contextual_refusal_or_failed_check(self):
+        """P3-R3-2 (Codex WP4 r3): a RecursionError from the parser at ANY packet input -- injected at json.loads for
+        a document carrying a marker, so it does not depend on an interpreter's C stack -- is named: an input read
+        before any check (the bank via load_model, the observation tables, a bound configuration or frozen plan in
+        acceptance mode's settings check) is REFUSED (exit 2, no packet file); one read inside the checks (a result, a
+        configuration in diagnostic mode) is a contextual failed check. Never an escaping exception, in process or
+        (the bank) in a separate process."""
+        import obslaw
+        mark = "@@DEEP-INJECTED@@"
+        real = json.loads
+
+        def loads(s, *a, **k):
+            t = s.decode("utf-8", "replace") if isinstance(s, (bytes, bytearray)) else s
+            if mark in t:
+                raise RecursionError("maximum recursion depth exceeded while decoding a JSON object")
+            return real(s, *a, **k)
+        deep = '{"x": "%s"}' % mark
+        f = self.complete()
+
+        def refused(entries, pattern, **inputs):
+            path = self.schedule(f["path"], entries, f["om_sha"], inputs.get("bank", f["bp"]), f["tp"])
+            out = os.path.join(f["root"], "P_deep.json")
+            with mock.patch.object(R, "C2_MATRIX", self.TOY_C2), mock.patch.object(json, "loads", loads), \
+                    contextlib.redirect_stderr(io.StringIO()) as err:
+                rc = R.main(["packet", "--mode", "acceptance", "--schedule", path, "--out", out])
+            self.assertEqual(rc, 2)
+            self.assertIn("REFUSED before any check", err.getvalue())
+            self.assertRegex(err.getvalue(), pattern)
+            self.assertIn("nested deeper than the parser's recursion limit", err.getvalue())
+            self.assertFalse(os.path.exists(out))
+        bank = os.path.join(f["root"], "bank_deep.json")
+        rqlib.write_durable(bank, deep)
+        with self.subTest(input="bank"):
+            refused(f["entries"], r"the bank artifact .*bank_deep\.json is nested", bank=bank)
+        with self.subTest(input="tables"), mock.patch.object(obslaw.ObsTables, "from_bytes",
+                                                             side_effect=RecursionError("deep")):
+            refused(f["entries"], r"the observation tables .* is nested")
+        with self.subTest(input="bound configuration"):
+            e = dict(f["dirs"]["stress"])
+            d = os.path.join(f["root"], "stress_deep")
+            shutil.copytree(e["dir"], d)
+            rqlib.write_durable(os.path.join(d, "config.json"), deep)
+            refused([x for x in f["entries"] if x["role"] != "stress"] + [dict(e, dir=d)],
+                    r"stress_deep \(stress\): its bound configuration or plan cannot be read .*config\.json: nested")
+        with self.subTest(input="frozen plan"):
+            e = dict(f["dirs"]["extra_interp"])
+            d = os.path.join(f["root"], "extra_deep")
+            shutil.copytree(e["dir"], d)
+            files = {"plan.json": deep.encode(),
+                     "diagnostics.json": rqlib.read_bytes(os.path.join(d, "diagnostics.json"))}
+            rqlib.write_durable(os.path.join(d, "plan.json"), files["plan.json"])
+            rqlib.write_durable(os.path.join(d, "FROZEN.sha256"), X.freeze_text(files))
+            refused([x for x in f["entries"] if x["role"] != "extra-interp"] + [dict(e, dir=d)],
+                    r"extra_deep \(extra-interp\): its bound configuration or plan cannot be read .*nested")
+        with self.subTest(input="a result, inside the checks"):
+            fr = os.path.join(f["dirs"]["primary"]["dir"], "r1_034.003.json")
+            good = rqlib.read_bytes(fr)
+            rqlib.write_durable(fr, deep)
+            path = self.schedule(f["path"], f["entries"], f["om_sha"], f["bp"], f["tp"])
+            with mock.patch.object(R, "C2_MATRIX", self.TOY_C2), mock.patch.object(json, "loads", loads):
+                doc, code = R.packet(path, "acceptance")
+            ch = doc["checks"]
+            self.assertEqual(code, 2)
+            for k in ("identity", "completeness", "guards"):
+                self.assertEqual(ch[k]["status"], "fail", k)
+                self.assertIn("r1_034.003.json", ch[k]["reason"], k)
+                self.assertIn("nested deeper than the parser's recursion limit", ch[k]["reason"], k)
+            self.assertEqual(ch["C1"]["scenarios"]["r1_034"]["successes"], 15)
+            # (this schedule's pairing stops first at the planning-mode extra plans; pairing reading the result:)
+            with mock.patch.object(json, "loads", loads):
+                with self.assertRaisesRegex(SystemExit, r"pairing: .*primary: a result cannot be read \(.*"
+                                                        r"r1_034\.003\.json: nested deeper than the parser's"):
+                    R.pairing([f["dirs"]["primary"]["dir"]])
+            rqlib.write_durable(fr, good)
+        with self.subTest(input="a configuration, inside the checks (diagnostic)"):
+            d = os.path.join(f["root"], "num_deep")
+            shutil.copytree(self.num, d)
+            cfg = rqlib.read_json(os.path.join(d, "config.json"))
+            entry = self.legacy_entry(d, "numerical", R.SETS["numerical"], 1, ("a", "fwd"))
+            rqlib.write_durable(os.path.join(d, "config.json"), deep)
+            sched = self.schedule(os.path.join(f["root"], "SCHEDULE_numdeep.json"), [entry],
+                                  rqlib.canonical_sha(cfg["observation_model"]))
+            with mock.patch.object(json, "loads", loads):
+                doc, code = R.packet(sched, "diagnostic", allow_synthetic=True)
+            self.assertEqual(code, 2)
+            for k in ("identity", "pairing", "guards"):
+                self.assertEqual(doc["checks"][k]["status"], "fail", k)
+                self.assertIn("nested deeper than the parser's recursion limit", doc["checks"][k]["reason"], k)
+        code = ("import json, sys\nsys.path.insert(0, sys.argv[1])\nimport recovery\nreal = json.loads\n"
+                "def loads(s, *a, **k):\n"
+                "    t = s.decode('utf-8', 'replace') if isinstance(s, (bytes, bytearray)) else s\n"
+                f"    if {mark!r} in t:\n        raise RecursionError('maximum recursion depth exceeded')\n"
+                "    return real(s, *a, **k)\n"
+                "json.loads = loads\nsys.exit(recovery.main(sys.argv[2:]))\n")
+        path = self.schedule(f["path"], f["entries"], f["om_sha"], bank, f["tp"])
+        out = os.path.join(f["root"], "P_deep_cli.json")
+        cp = subprocess.run([sys.executable, "-I", "-B", "-c", code, HERE, "packet", "--mode", "diagnostic",
+                             "--schedule", path, "--out", out], stdin=subprocess.DEVNULL, capture_output=True,
+                            text=True)
+        self.assertEqual(cp.returncode, 2, cp.stderr[-1500:])
+        self.assertNotIn("Traceback", cp.stderr)
+        self.assertIn("the bank artifact", cp.stderr)
+        self.assertFalse(os.path.exists(out))
+
     @unittest.expectedFailure
     def test_T7_8_WP5_a_complete_bank_mode_schedule_passes_every_check(self):
         """T7-8's complete schedule with bank-mode recovery_extra directories passes every check (exit 0): needs
