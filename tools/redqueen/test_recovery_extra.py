@@ -12,6 +12,7 @@ import json
 import math
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -996,6 +997,37 @@ def write_result(d, r):
     rqlib.write_json_durable(os.path.join(d, f"{r['scenario']}.{r['rep']:03d}.json"), r)
 
 
+def fabricated_extra(d, case, sc, rep, success=True):
+    """A recovery_extra result of d's frozen plan for (case, sc, rep), written under d/results: its identity, labels
+    and body hash consistent (read_results passes), its observations hashed from (sc, rep) alone as fabricated()'s (so
+    pairing compares it with every legacy directory carrying (sc, rep)), producer-shaped option records (the liveness
+    matrix's states: a decided procedure for a / interp, a decided extra forward for fwd_*, the unavailable procedure
+    in roots0) -> the result."""
+    plan = X.read_frozen(d)
+    keys = R.OBS_KEYS + (R.BANK_OBS_KEYS if plan["noise_source"] == "bank_d8" else ())
+    states = TestRecoveryBankPacket.r5_states()
+    opts = {}
+    for op in plan["options"]:
+        if case == "roots0" and not op.startswith("fwd_"):
+            opts[op] = states["P7 procedure unavailable (roots)"][1]
+        elif op.startswith("fwd_"):
+            opts[op] = dict(states["X1 extra forward: both branches decided"][1], reference_policy=op)
+        else:
+            opts[op] = states["P1 decided, primary live, success" if success else
+                              "P2 decided, primary live, unsuccessful"][1]
+    body = X.clean({
+        "schema": X.RESULT_SCHEMA, "plan_sha256": rqlib.canonical_sha(plan), "case": case, "scenario": sc, "rep": rep,
+        "seed": rqlib.derive_seed(plan["namespace"], "recovery", sc, rep), "noise_source": plan["noise_source"],
+        "accepting": plan["accepting"], "observation_model_sha256": plan["inputs"]["observation_model_sha256"],
+        "noiseless": False,
+        "observations": {k: {"shape": [100, 6], "dtype": "<f8", "sha256": sha_tag(f"{sc}:{rep}:{k}")} for k in keys},
+        "scheduled_energy": 0.034, "retained_additive_projection_energy": 0.034, "options": opts})
+    body["body_sha256"] = rqlib.canonical_sha(body)
+    os.makedirs(os.path.join(d, "results"), exist_ok=True)
+    rqlib.write_durable(os.path.join(d, "results", X.task_name((case, sc, rep))), rqlib.canonical(body))
+    return body
+
+
 FAST_FIT = ("--ranks", "1", "--lambdas", "0.05", "--iters", "2", "--start", "warm", "--basis", "4")
 REG_EXTRA_FIT = ("--ranks", "4", "--lambdas", "0.01,0.02,0.05,0.2", "--iters", "30", "--start", "both", "--basis", "6",
                  "--embedding", "shared", "--center", "references")
@@ -1003,11 +1035,28 @@ REG_EXTRA_FIT = ("--ranks", "4", "--lambdas", "0.01,0.02,0.05,0.2", "--iters", "
 
 def extra_prepare(out, gpath, refs, *more, namespace="rq-extra-tests", options="a", cases="intact",
                   scenarios="r0", reps=1, fit=FAST_FIT):
-    """recovery_extra.py prepare (in process, the planning-mode tool of WP4) -> its exit code."""
+    """recovery_extra.py prepare (in process; planning mode unless more holds the bank flags; refs None: the assumed
+    reference slots, as a legacy run without --references) -> its exit code."""
     with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-        return X.main(["prepare", "--graph", gpath, "--references", refs, "--namespace", namespace, "--allow-toy",
-                       "--options", options, "--cases", cases, "--scenarios", scenarios, "--reps", str(reps),
-                       *fit, "--out", out, *more])
+        return X.main(["prepare", "--graph", gpath, *(["--references", refs] if refs else []), "--namespace",
+                       namespace, "--allow-toy", "--options", options, "--cases", cases, "--scenarios", scenarios,
+                       "--reps", str(reps), *fit, "--out", out, *more])
+
+
+def extra_one(d, gpath, task, *more, refs=None):
+    """recovery_extra.py one (in process) -> its exit code."""
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        return X.main(["one", "--dir", d, "--graph", gpath, *(["--references", refs] if refs else []), "--task", task,
+                       *more])
+
+
+def rewrite_extra_result(path, edit):
+    """Edit a recovery_extra result in place with its body hash recomputed (a doctored but self-consistent file)."""
+    r = rqlib.read_json(path)
+    edit(r)
+    body = {k: v for k, v in r.items() if k != "body_sha256"}
+    r["body_sha256"] = rqlib.canonical_sha(body)
+    rqlib.write_durable(path, rqlib.canonical(r))
 
 
 @unittest.skipIf(np is None, "numpy unavailable")
@@ -1114,6 +1163,122 @@ class TestRecoveryBankMode(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "without a var_fn"):
                 M.fit(D, D.fit["a"], data, 1, 0.1, **bad)
 
+    def test_T6_1_WP5_recovery_extra_one_routes_every_fit_through_the_bank_model(self):
+        """T6-1, the extra procedures through recovery_extra's own command (v5 3.4 `one`, 3.5): a spy on map.fit while
+        `recovery_extra.py one` evaluates bank-mode tasks (options a, interp, fwd_all and fwd_early; ranks 0..2, two
+        lambdas, both starts; the intact case and roots2) records, for every fit, the bank's W tagged with the model's
+        identity, rep_prior {nu0: nu0_C} and the score law (A, L); a planning-mode task's fits keep the planning
+        variance model with no prior and no score law (planning unchanged)."""
+        fit = ("--ranks", "2", "--lambdas", "0.05,0.2", "--iters", "2", "--start", "both", "--basis", "4")
+        calls, real = [], M.fit
+
+        def spy(*a, **k):
+            calls.append((a[3], a[4], k.get("var_fn"), k.get("rep_prior"), k.get("score_law")))
+            return real(*a, **k)
+        for mode, flags in (("bank", self.bank_flags()), ("planning", ())):
+            d = os.path.join(self.root, mode)
+            self.assertEqual(extra_prepare(d, self.gpath, self.refs, *flags, options="a,interp,fwd_all,fwd_early",
+                                           cases="intact,roots2", scenarios="r1_034", fit=fit), 0)
+            calls.clear()
+            with mock.patch.object(M, "fit", spy):
+                for case in ("intact", "roots2"):
+                    self.assertEqual(extra_one(d, self.gpath, f"{case}.r1_034.000.json", *flags, refs=self.refs), 0)
+            with self.subTest(mode=mode):
+                self.assertEqual({c[0] for c in calls}, {0, 1, 2})
+                self.assertEqual({c[1] for c in calls if c[0]}, {0.05, 0.2})
+                if mode == "bank":
+                    self.assertEqual({(getattr(v, "identity", None), rqlib.canonical(p), getattr(s, "identity", None))
+                                      for _, _, v, p, s in calls},
+                                     {(self.obs.identity_sha, rqlib.canonical({"nu0": self.obs.nu0_C}),
+                                       self.obs.identity_sha)})
+                    self.assertTrue(all(isinstance(v, self.ol.WorkingVariance) and isinstance(s, self.ol.ScoreLaw)
+                                        for _, _, v, _, s in calls))
+                else:
+                    self.assertTrue(all(callable(v) and not isinstance(v, self.ol.WorkingVariance) and p is None
+                                        and s is None for _, _, v, p, s in calls))
+
+    # ---------------------------------------------------------------- T6-5's extra branches (clarification 4 F2)
+    # dc64646's recovery_extra observation code, frozen verbatim from
+    # `git show dc64646:tools/redqueen/recovery_extra.py` (= 2f82515's: WP4 changed no recovery_extra.py line), each
+    # text sha256-pinned and checked against git by
+    # scripts_P2/wp5_main_text.sh; it runs on test_graph.main_reference()'s frozen dc64646 simulate and
+    # additive_projection, with numpy, copy and hashlib the only shared modules (nothing resolves from HEAD).
+    EXTRA_REF = (   # (first line, last line, sha256 of the text, the text)
+        (779, 787, "15571f959630c8405f04e7bfadcc2ba119dba1fbe68fb27e755a25348bd737b1",
+         '''def observation_hashes(data):
+    out = {}
+    for key in ("eta", "inter", "cnt", "z", "s", "s0"):
+        value = np.ascontiguousarray(data[key], dtype="<f8")
+        out[key] = {
+            "shape": list(value.shape), "dtype": "<f8",
+            "sha256": rqlib.sha256_bytes(value.tobytes(order="C")),
+        }
+    return out
+'''),
+        (790, 800, "43873f7fc4e350a7ad51379983ea62e2fa3738c046ecfe5eeb6c73609fd31370",
+         '''def retained_energy(D, data, keep):
+    if not keep.any():
+        return None
+    v = copy.copy(D)
+    v.qi, v.pj = D.qi[keep], D.pj[keep]
+    inter, eta = data["inter"][keep], data["eta"][keep]
+    den = float(np.var(eta))
+    if not den:
+        return None
+    residual = inter - rec.additive_projection(v, inter)
+    return float(np.var(residual) / den)
+'''),
+    )
+    T65_EXTRA = ("r0", "r1_017_cap", "r0_asym", "r2_034", "r2_034_noisy")   # flat, capture-level, asym, rank 2, x2
+
+    def extra_reference(self):
+        """The frozen dc64646 extra observation code in a namespace holding the builtins, numpy, copy, an rqlib shim
+        (hashlib's sha256) and an rec shim (main_reference's additive_projection) -> (namespace, main_reference)."""
+        import builtins
+        import types
+        main = self.TG.main_reference()
+        ns = {"__builtins__": builtins, "np": np, "copy": copy,
+              "rqlib": types.SimpleNamespace(sha256_bytes=lambda b: hashlib.sha256(b).hexdigest()),
+              "rec": types.SimpleNamespace(additive_projection=main["additive_projection"])}
+        for lo, hi, sha, text in self.EXTRA_REF:
+            self.assertEqual(hashlib.sha256(text.encode()).hexdigest(), sha, f"recovery_extra.py@dc64646 L{lo}-{hi}")
+            exec(compile(text, f"recovery_extra.py@dc64646:L{lo}-{hi}", "exec"), ns)
+        return ns, main
+
+    def test_T6_5_WP5_planning_extra_observation_branches_are_main_byte_for_byte(self):
+        """T6-5's extra branches (v5 T6-5, 3.4, 3.7; clarification 4 F2): in planning mode, for every observation
+        branch a recovery_extra plan can schedule (flat r0, capture-level r1_017_cap, asym r0_asym, rank 2 with D_S
+        r2_034, doubled noise r2_034_noisy; survival in each; noiseless scenarios are refused by make_plan), the extra
+        result's observation record (recovery.observation_hashes), its scheduled energy and its retained additive-
+        projection energy under every case's mask (all ten) equal main dc64646's: recovery_extra's L779-787 and
+        L790-800, frozen verbatim and pinned (EXTRA_REF), on dc64646's frozen simulate, in a namespace resolving nothing
+        from HEAD; compared exactly (canonical JSON, floats by repr). recovery_extra one writes exactly those values."""
+        ref, main = self.extra_reference()
+        self.assertEqual(self.TG.reference_violations(main), [])
+        D = X.data_from(self.gpath, self.refs)
+        fit = dict(ranks=1, lambdas="0.05", iters=2, start="warm", basis=4, embedding="shared", center="references")
+        plan = X.make_plan(D, self.gpath, self.refs, "rq-T6-5-extra", fit, ["r0"], 1, list(X.OPTIONS), list(X.CASES),
+                           True)
+        keeps = {case: X.mask_for(D, plan, case)[0] for case in X.CASES}
+        self.assertTrue(any(not k.all() for k in keeps.values()))
+        for sc in self.T65_EXTRA:
+            seed = rqlib.derive_seed("rq-T6-5-extra", "recovery", sc, 0)
+            head, old = R.simulate(D, R.SCENARIOS[sc], seed), main["simulate"](D, R.SCENARIOS[sc], seed)
+            h = {"observations": X.observation_hashes(head), "scheduled_energy": repr(head["energy"]),
+                 "retained": {c: repr(X.retained_energy(D, head, k)) for c, k in keeps.items()}}
+            m = {"observations": ref["observation_hashes"](old), "scheduled_energy": repr(old["energy"]),
+                 "retained": {c: repr(ref["retained_energy"](D, old, k)) for c, k in keeps.items()}}
+            self.assertEqual(rqlib.canonical(h), rqlib.canonical(m), sc)
+            self.assertEqual(list(h["observations"]), ["eta", "inter", "cnt", "z", "s", "s0"], sc)
+        d = os.path.join(self.root, "planning")
+        self.assertEqual(extra_prepare(d, self.gpath, self.refs, namespace="rq-T6-5-extra", cases="mixed"), 0)
+        self.assertEqual(extra_one(d, self.gpath, "mixed.r0.000.json", refs=self.refs), 0)
+        r = rqlib.read_json(os.path.join(d, "results", "mixed.r0.000.json"))
+        old = main["simulate"](D, R.SCENARIOS["r0"], rqlib.derive_seed("rq-T6-5-extra", "recovery", "r0", 0))
+        self.assertEqual(r["observations"], ref["observation_hashes"](old))
+        self.assertEqual((repr(r["scheduled_energy"]), repr(r["retained_additive_projection_energy"])),
+                         (repr(old["energy"]), repr(ref["retained_energy"](D, old, keeps["mixed"]))))
+
     # ---------------------------------------------------------------- T7-1
     def test_T7_1_changed_bank_or_table_bytes_refuse_run_and_another_model_is_refused_on_read(self):
         """T7-1 (legacy recovery.py): a run directory is bound to its bank and tables -- one changed byte of the artifact
@@ -1151,14 +1316,69 @@ class TestRecoveryBankMode(unittest.TestCase):
         rqlib.write_durable(f, good)
         self.assertEqual(R.summarize(out)["datasets"], 1)
 
-    @unittest.expectedFailure
+    def bank_flags(self, bank=None, tables=None):
+        return ("--obs-model", "bank", "--bank", bank or self.bp, "--obs-tables", tables or self.tp)
+
     def test_T7_1_WP5_recovery_extra_binds_the_bank(self):
-        """T7-1, recovery_extra's part (v5 3.4: prepare loads the model, verified re-derives the plan with it, read_results
-        refuses another observation model). """
+        """T7-1, recovery_extra's part (v5 3.4 make_plan / prepare / verified / read_results, 4.1, 4.3): a bank-mode
+        plan records noise_source bank_d8, accepting, the bank artifact's, the tables' and the observation model's
+        sha256 in its inputs, recovery.run_config's full observation_model as its legacy_config (the legacy record
+        exactly), and
+        the sources including obslaw, material, common, noisescale and the ages fixture; verified and run re-derive it
+        with the model loaded from the given paths, so one changed byte of the artifact (its tables rebuilt) or a
+        changed table array refuses both, as does a bank plan without its bank; a result of another observation model
+        (its observation_model_sha256, noise_source or accepting label, its body hash recomputed) or with another
+        mode's observations record is refused on read."""
         out = os.path.join(self.root, "extra")
-        self.assertEqual(extra_prepare(out, self.gpath, self.refs, "--obs-model", "bank", "--bank", self.bp,
-                                       "--obs-tables", self.tp), 0)
-        self.assertEqual(X.read_frozen(out)["noise_source"], "bank_d8")
+        self.assertEqual(extra_prepare(out, self.gpath, self.refs, *self.bank_flags()), 0)
+        plan = X.read_frozen(out)
+        om = plan["legacy_config"]["observation_model"]
+        self.assertEqual((plan["noise_source"], plan["accepting"], om["mode"]), ("bank_d8", True, "bank"))
+        self.assertEqual(om, R.observation_model(argparse.Namespace(obs_model="bank"), self.obs))
+        self.assertEqual(plan["inputs"]["bank_artifact_sha256"], rqlib.sha256_file(self.bp))
+        self.assertEqual(plan["inputs"]["obs_tables_sha256"], rqlib.sha256_file(self.tp))
+        self.assertEqual(plan["inputs"]["observation_model_sha256"], rqlib.canonical_sha(om))
+        self.assertEqual(plan["criterion"], dict(X.CRITERION, scope="bank/D8-calibrated observation model "
+                                                                    "(A_design_v5.md)"))
+        for name in ("obslaw.py", "material.py", "common.py", "noisescale.py", "fixtures/registered_ages.json"):
+            self.assertEqual(plan["sources_sha256"][name], rqlib.sha256_file(os.path.join(HERE, name)), name)
+        self.assertEqual(X.verified(out, self.gpath, self.refs, self.bp, self.tp)[1], plan)
+        import test_obslaw as TO
+        bp2, tp2 = self.flipped_bank("t71x")
+        data, _ = TO._rehashed_tables(rqlib.read_bytes(self.tp),
+                                      {"fit_A": lambda x: x + np.where(np.arange(len(x)) == 9, 1e-9, 0.0)})
+        tp3 = os.path.join(self.root, "t3.npz")
+        rqlib.write_durable(tp3, data)
+        for name, (b, t) in (("artifact byte", (bp2, tp2)), ("table array", (self.bp, tp3))):
+            with self.subTest(changed=name):
+                with self.assertRaisesRegex(SystemExit, "graph, references, sources, runtime or frozen recipe changed"):
+                    X.verified(out, self.gpath, self.refs, b, t)
+                with self.assertRaisesRegex(SystemExit, "graph, references, sources, runtime or frozen recipe changed"):
+                    X.main(["run", "--dir", out, "--graph", self.gpath, "--references", self.refs, "--jobs", "1",
+                            *self.bank_flags(b, t)])
+                self.assertFalse(os.path.exists(os.path.join(out, "results")))
+        with self.assertRaisesRegex(SystemExit, "a bank-mode plan: --obs-model bank --bank and --obs-tables"):
+            X.verified(out, self.gpath, self.refs)
+        task = "intact.r0.000.json"
+        self.assertEqual(extra_one(out, self.gpath, task, *self.bank_flags(), refs=self.refs), 0)
+        f = os.path.join(out, "results", task)
+        good = rqlib.read_bytes(f)
+        r = json.loads(good)
+        self.assertEqual((r["noise_source"], r["accepting"], r["observation_model_sha256"], r["noiseless"]),
+                         ("bank_d8", True, plan["inputs"]["observation_model_sha256"], False))
+        self.assertEqual(list(X.read_results(out, plan)), [task])
+        for field, value in (("observation_model_sha256", "0" * 64), ("noise_source", "scenario_planning_only"),
+                             ("accepting", False)):
+            with self.subTest(field=field):
+                rewrite_extra_result(f, lambda r, field=field, value=value: r.update({field: value}))
+                with self.assertRaisesRegex(SystemExit, "a result of another noise source or observation model"):
+                    X.read_results(out, plan)
+                rqlib.write_durable(f, good)
+        rewrite_extra_result(f, lambda r: [r["observations"].pop(k) for k in R.BANK_OBS_KEYS])
+        with self.assertRaisesRegex(SystemExit, "observations must hold exactly"):
+            X.read_results(out, plan)
+        rqlib.write_durable(f, good)
+        self.assertEqual(list(X.read_results(out, plan)), [task])
 
     # ---------------------------------------------------------------- T7-2
     def test_T7_2_paired_observations_and_pairing_refuses_a_doctored_pair(self):
@@ -1241,13 +1461,30 @@ class TestRecoveryBankMode(unittest.TestCase):
         self.assertEqual(R.c1_success(recs["a"]), recs["a"]["success"])
         self.assertFalse(R.c1_success(recs["one-root"]))
 
-    @unittest.expectedFailure
     def test_T7_2_WP5_extra_results_carry_the_legacy_observation_records(self):
-        """T7-2, recovery_extra's part (v5 3.4 L779-787: observation_hashes moves to recovery.py, with mu_* and the
-        absent-cnt record): an extra result's observations equal a legacy result's for the same (scenario, rep)."""
-        D = X.data_from(self.gpath, self.refs)
-        data = R.simulate(D, R.SCENARIOS["r0"], 5, obs=self.obs)
-        self.assertEqual(X.observation_hashes(data), R.observation_hashes(data))
+        """T7-2, recovery_extra's part (v5 3.4 L779-787, 3.6): observation_hashes is recovery.py's one shared helper
+        (with mu_* in bank mode); a bank-mode extra directory and a legacy bank run of one namespace carry identical
+        observations for the shared (scenario, rep) -- in every case, since the masks apply after generation -- and
+        `pairing` accepts the pair, compares every extra case, and refuses one doctored hash (body re-hashed)."""
+        self.assertIs(X.observation_hashes, R.observation_hashes)
+        d1, f1 = self.bank_run("legacy", scenario="r1_034")
+        out = os.path.join(self.root, "extra")
+        self.assertEqual(extra_prepare(out, self.gpath, None, *self.bank_flags(), namespace="rq-bank-t7",
+                                       options="a,fwd_all", cases="intact,roots1", scenarios="r1_034"), 0)
+        r1 = rqlib.read_json(f1)
+        for case in ("intact", "roots1"):
+            task = f"{case}.r1_034.000.json"
+            self.assertEqual(extra_one(out, self.gpath, task, *self.bank_flags()), 0)
+            r = rqlib.read_json(os.path.join(out, "results", task))
+            self.assertEqual(r["observations"], r1["observations"], case)
+        self.assertEqual(sorted(r1["observations"]), sorted(R.OBS_KEYS + R.BANK_OBS_KEYS))
+        rep = R.pairing([d1, out])
+        self.assertEqual((rep["datasets"], rep["comparisons"]), (1, 2))
+        f = os.path.join(out, "results", "roots1.r1_034.000.json")
+        rewrite_extra_result(f, lambda r: r["observations"]["mu_S"].update(sha256="0" * 64))
+        self.assertEqual(len(X.read_results(out, X.read_frozen(out))), 2)    # (self-consistent: pairing alone sees it)
+        with self.assertRaisesRegex(SystemExit, r"\(r1_034, 0\) has different observations"):
+            R.pairing([d1, out])
 
     # ---------------------------------------------------------------- T7-3
     def test_T7_3_forward_masks_root_guards_and_fixed_denominators_persist_in_bank_mode(self):
@@ -1289,14 +1526,51 @@ class TestRecoveryBankMode(unittest.TestCase):
         self.assertEqual(cell["rate"], round(k / 4, 3))
         self.assertEqual(cell["wilson95"], R.wilson(k, 4))
 
-    @unittest.expectedFailure
     def test_T7_3_WP5_extra_partitions_masks_denominators_and_two_workers_in_bank_mode(self):
-        """T7-3, recovery_extra's part: its partitions, access masks, root guards, fixed denominators and the
-        1-or-2-worker limit, in bank mode (v5 3.4)."""
-        out = os.path.join(self.root, "extra")
-        self.assertEqual(extra_prepare(out, self.gpath, self.refs, "--obs-model", "bank", "--bank", self.bp,
-                                       "--obs-tables", self.tp, options="a,interp,fwd_all,fwd_early",
-                                       cases="intact,roots1"), 0)
+        """T7-3, recovery_extra's part (v5 3.4): in bank mode the 80/10/10 partition, the attrition recipes and root
+        order (the plan's recipe) and every view's access sets, centring, target tables and conditioning (diagnostics)
+        are the planning plan's byte for byte (observation-free); `run` accepts 1 or 2 workers only and, at 2, its
+        subprocess workers receive the bank flags (every result is bank_d8: a worker without them is refused by the
+        bank plan); one-root branches withhold their decisions (roots1) and every record passes the guards; a missing
+        result stays in every cell's fixed denominator (unavailable = unsuccessful)."""
+        kw = dict(options="a,interp,fwd_all,fwd_early", cases="intact,roots1", scenarios="r1_034", reps=2)
+        pb, pp = os.path.join(self.root, "bank"), os.path.join(self.root, "plan")
+        self.assertEqual(extra_prepare(pb, self.gpath, self.refs, *self.bank_flags(), **kw), 0)
+        self.assertEqual(extra_prepare(pp, self.gpath, self.refs, **kw), 0)
+        plan_b, plan_p = X.read_frozen(pb), X.read_frozen(pp)
+        self.assertEqual(plan_b["recipe"], plan_p["recipe"])
+        self.assertEqual(rqlib.read_bytes(os.path.join(pb, "diagnostics.json")),
+                         rqlib.read_bytes(os.path.join(pp, "diagnostics.json")))
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as cm:
+            X.main(["run", "--dir", pb, "--graph", self.gpath, "--references", self.refs, "--jobs", "3",
+                    *self.bank_flags()])
+        self.assertEqual(cm.exception.code, 2)                                    # (argparse: choices 1, 2)
+        with self.assertRaisesRegex(SystemExit, "--jobs must be 1 or 2"):
+            X.run(argparse.Namespace(dir=pb, graph=self.gpath, references=self.refs, jobs=3, obs_model="bank",
+                                     bank=self.bp, obs_tables=self.tp, allow_synthetic_bank=False))
+        with contextlib.redirect_stdout(io.StringIO()) as so:
+            rc = X.main(["run", "--dir", pb, "--graph", self.gpath, "--references", self.refs, "--jobs", "2",
+                         *self.bank_flags()])
+        self.assertEqual(rc, 0, so.getvalue()[-2000:])
+        found = X.read_results(pb, plan_b)
+        self.assertEqual(sorted(found), sorted(X.task_name(t) for t in X.tasks(plan_b)))
+        self.assertEqual(len(re.findall(r"^started ", so.getvalue(), re.M)), 4)
+        for name, r in found.items():
+            self.assertEqual((r["noise_source"], r["accepting"]), ("bank_d8", True), name)
+            for op, o in r["options"].items():
+                self.assertEqual(R._guard_violations(o, f"{name}:{op}"), [], (name, op))
+        root1 = found["roots1.r1_034.000.json"]["options"]
+        wt = root1["a"]["world_transfer"]
+        self.assertEqual((wt["test_roots"], wt["available"], wt["decision_available"], wt["success"]),
+                         (1, False, False, False))
+        self.assertFalse(root1["a"]["decision"]["available"])
+        os.remove(os.path.join(pb, "results", "intact.r1_034.001.json"))
+        cells = X.summarize(pb)["cells"]
+        for c in cells:
+            self.assertEqual(c["datasets"], 2, c)
+            if c["case"] == "intact":
+                self.assertEqual((c["completed"], c["missing"]), (1, 1), c)
+                self.assertEqual(c["rate"], round(c["successes"] / 2, 3), c)
 
     # ---------------------------------------------------------------- T7-4
     def test_T7_4_labels_and_mixed_mode_summaries_are_refused(self):
@@ -1337,13 +1611,68 @@ class TestRecoveryBankMode(unittest.TestCase):
         with self.assertRaisesRegex(SystemExit, "needs --bank and --obs-tables"):
             R.resolve(self.ns(obs_tables=None))
 
-    @unittest.expectedFailure
     def test_T7_4_WP5_extra_labels_in_bank_mode(self):
-        """T7-4, recovery_extra's part: its plans, results and summaries labelled bank_d8 / planning (v5 3.4, 3.7)."""
-        out = os.path.join(self.root, "extra")
-        self.assertEqual(extra_prepare(out, self.gpath, self.refs, "--obs-model", "bank", "--bank", self.bp,
-                                       "--obs-tables", self.tp), 0)
-        self.assertEqual(X.summarize(out)["noise_source"], "bank_d8")
+        """T7-4, recovery_extra's part (v5 3.4, 3.7): bank plans, results and summaries carry noise_source bank_d8 and
+        accepting (true with an accepted-form bank; false with a synthetic one, which also needs the test flag), the
+        criterion scope "bank/D8-calibrated observation model (A_design_v5.md)" and no planning label; planning ones
+        scenario_planning_only, accepting false, the criterion's unchanged text with accepting false, and the summary
+        label "PLANNING NOISE: NOT GATE-2 EVIDENCE"; a planning result in a bank directory and a relabelled bank result
+        are refused (a mixed-mode summary); bank and planning arguments do not mix."""
+        task = "intact.r0.000.json"
+        runs = {}
+        bps, tps = self.TG.bank_files("synthetic", self.TG.bank_doc(synthetic=True))
+        with self.assertRaisesRegex(SystemExit, "synthetic: true is refused"):
+            extra_prepare(os.path.join(self.root, "syn0"), self.gpath, self.refs, *self.bank_flags(bps, tps))
+        for name, flags in (("bank", self.bank_flags()), ("synthetic", self.bank_flags(bps, tps) +
+                                                          ("--allow-synthetic-bank",)), ("planning", ())):
+            d = os.path.join(self.root, name)
+            self.assertEqual(extra_prepare(d, self.gpath, self.refs, *flags), 0, name)
+            self.assertEqual(extra_one(d, self.gpath, task, *flags, refs=self.refs), 0, name)
+            runs[name] = (d, X.read_frozen(d), rqlib.read_json(os.path.join(d, "results", task)), X.summarize(d))
+        for name, (src, acc) in (("bank", ("bank_d8", True)), ("synthetic", ("bank_d8", False)),
+                                 ("planning", ("scenario_planning_only", False))):
+            d, plan, r, s = runs[name]
+            with self.subTest(mode=name):
+                self.assertEqual((plan["noise_source"], plan["accepting"]), (src, acc))
+                self.assertEqual((r["noise_source"], r["accepting"], r["noiseless"]), (src, acc, False))
+                self.assertEqual(r["observation_model_sha256"], plan["inputs"]["observation_model_sha256"])
+                self.assertEqual((s["noise_source"], s["accepting"], s["criterion"]["scope"]),
+                                 (src, acc, plan["criterion"]))
+                if name == "planning":
+                    self.assertEqual(plan["criterion"], dict(X.CRITERION, accepting=False))
+                    self.assertEqual(s["label"], "PLANNING NOISE: NOT GATE-2 EVIDENCE")
+                    self.assertEqual(sorted(r["observations"]), sorted(R.OBS_KEYS))
+                    self.assertEqual(plan["inputs"]["observation_model_sha256"], rqlib.canonical_sha(
+                        R.observation_model(argparse.Namespace(obs_model="planning"))))
+                    self.assertEqual((plan["inputs"]["bank_artifact_sha256"], plan["inputs"]["obs_tables_sha256"]),
+                                     (None, None))
+                else:
+                    self.assertEqual(plan["criterion"]["scope"], R.BANK_SCOPE)
+                    self.assertNotIn("label", s)
+                    self.assertEqual(sorted(r["observations"]), sorted(R.OBS_KEYS + R.BANK_OBS_KEYS))
+        db, plan_b, rb, _ = runs["bank"]
+        fb = os.path.join(db, "results", task)
+        good = rqlib.read_bytes(fb)
+        rp = runs["planning"][2]
+        mixed = dict(rp, plan_sha256=rqlib.canonical_sha(plan_b))
+        mixed["body_sha256"] = rqlib.canonical_sha({k: v for k, v in mixed.items() if k != "body_sha256"})
+        rqlib.write_durable(fb, rqlib.canonical(mixed))
+        with self.assertRaisesRegex(SystemExit, "a result of another noise source or observation model"):
+            X.summarize(db)
+        rqlib.write_durable(fb, good)
+        rewrite_extra_result(fb, lambda r: r.update(noise_source="scenario_planning_only"))
+        with self.assertRaisesRegex(SystemExit, "another noise source"):
+            X.summarize(db)
+        rqlib.write_durable(fb, good)
+        self.assertTrue(X.summarize(db)["complete"])
+        d = os.path.join(self.root, "mix")
+        with self.assertRaisesRegex(SystemExit, "bank mode's"):
+            extra_prepare(d, self.gpath, self.refs, "--bank", self.bp, "--obs-tables", self.tp)
+        with self.assertRaisesRegex(SystemExit, "needs --bank and --obs-tables"):
+            extra_prepare(d, self.gpath, self.refs, "--obs-model", "bank", "--bank", self.bp)
+        with self.assertRaisesRegex(SystemExit, "a planning-mode plan"):
+            extra_one(runs["planning"][0], self.gpath, task, *self.bank_flags(), refs=self.refs)
+        self.assertFalse(os.path.exists(d))
 
     # ---------------------------------------------------------------- T7-5
     def test_T7_5_cap_scenarios_and_a_zero_ceiling_are_refused_in_bank_mode(self):
@@ -1380,13 +1709,32 @@ class TestRecoveryBankMode(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, "M_H is 0"):
                 R.one(self.ns(out=os.path.join(self.root, "z.json"), scenario="r0", rep=0))
 
-    @unittest.expectedFailure
     def test_T7_5_WP5_extra_refuses_cap_scenarios_in_bank_mode(self):
-        """T7-5, recovery_extra's part: prepare in bank mode refuses a *_cap scenario (v5 3.4)."""
-        out = os.path.join(self.root, "extra")
-        with self.assertRaisesRegex(SystemExit, "BANK_REFUSED"):
-            extra_prepare(out, self.gpath, self.refs, "--obs-model", "bank", "--bank", self.bp, "--obs-tables",
-                          self.tp, scenarios="r0_cap")
+        """T7-5, recovery_extra's part (v5 3.4, 1.5 PC-4, 1.10): in bank mode prepare refuses a *_cap / *_cap15 scenario
+        (BANK_REFUSED) before any file, and so does make_plan (the plan verified re-derives); planning mode still
+        prepares them; a configuration whose ceiling M_H is 0 is refused at the load, before any file."""
+        D = X.data_from(self.gpath, self.refs)
+        fit = dict(ranks=1, lambdas="0.05", iters=2, start="warm", basis=4, embedding="shared", center="references")
+        for sc in ("r0_cap", "r2_034_cap15"):
+            out = os.path.join(self.root, sc)
+            with self.subTest(sc=sc):
+                with self.assertRaisesRegex(SystemExit, "BANK_REFUSED"):
+                    extra_prepare(out, self.gpath, self.refs, *self.bank_flags(), scenarios=f"r0,{sc}")
+                self.assertFalse(os.path.exists(out))
+                with self.assertRaisesRegex(SystemExit, "BANK_REFUSED"):
+                    X.make_plan(D, self.gpath, self.refs, "rq-t75", fit, [sc], 1, ["a"], ["intact"], True, obs=self.obs)
+                self.assertEqual(extra_prepare(out, self.gpath, self.refs, scenarios=sc), 0)
+                self.assertEqual(X.read_frozen(out)["noise_source"], "scenario_planning_only")
+        real = self.ol.BankObservationModel.__init__
+
+        def init(self_, *a, **k):
+            real(self_, *a, **k)
+            self_.M_H, self_.c_H = 0, 0.0
+        out = os.path.join(self.root, "zero")
+        with mock.patch.object(self.ol.BankObservationModel, "__init__", init):
+            with self.assertRaisesRegex(SystemExit, "M_H is 0"):
+                extra_prepare(out, self.gpath, self.refs, *self.bank_flags())
+        self.assertFalse(os.path.exists(out))
 
     # ---------------------------------------------------------------- T7-7's helper (v5 3.2 observation_hashes, 1.8)
     def test_T7_7_observation_hashes_absent_counts_record_and_refusals(self):
@@ -1532,8 +1880,10 @@ class TestRecoveryBankPacket(unittest.TestCase):
         """A fresh copy of T7-8's complete toy schedule (built once per class): an accepted-form bank; the C1-primary
         (r1_034 and r2_034 x 20, 16 and 17 successes); the four sensitivity variants (the same identities, every
         realization a success); stress (r0_asym x 1); numerical (num_r1, option a); every legacy directory with the
-        registered settings and namespace A1; the four extra roles' recovery_extra plans with the registered fit
-        (planning mode until WP5) -> {path (SCHEDULE.json), entries, dirs (role key -> entry), cfgs, om_sha, bp, tp}."""
+        registered settings and namespace A1; the four extra roles' BANK-MODE recovery_extra plans (WP5: prepared with
+        --obs-model bank from the same bank and tables, the registered fit, namespace A1, the assumed reference slots
+        as the legacy directories and the schedule) with one fabricated_extra result per scheduled task -> {path
+        (SCHEDULE.json), entries, dirs (role key -> entry), cfgs, om_sha, bp, tp}."""
         cls = type(self)
         if cls._complete is None:
             root = tempfile.mkdtemp(dir=self.base)
@@ -1547,11 +1897,14 @@ class TestRecoveryBankPacket(unittest.TestCase):
             for name, role, scen, reps, opts, wins, kw in spec:
                 d, _ = self.legacy_dir(root, name, scen, reps, opts, wins, **kw)
                 made.append((name, role, scen, reps, opts))
+            bp, tp = self.TG.bank_files()
             for op, cases, sc in (("interp", "intact", "r1_034"), ("fwd_all", "intact", "r1_034"),
                                   ("fwd_early", "intact", "r1_034"), ("a", "roots0", "r0")):
                 d = os.path.join(root, f"extra_{op}")
-                self.assertEqual(extra_prepare(d, self.gpath, self.refs, namespace=A1, options=op, cases=cases,
+                self.assertEqual(extra_prepare(d, self.gpath, None, "--obs-model", "bank", "--bank", bp,
+                                               "--obs-tables", tp, namespace=A1, options=op, cases=cases,
                                                scenarios=sc, fit=REG_EXTRA_FIT), 0)
+                fabricated_extra(d, cases, sc, 0)
                 made.append((f"extra_{op}", "extra-attrition" if cases == "roots0" else f"extra-{op}", (sc,), 1,
                              (op,), cases))
             cls._complete = (root, made)
@@ -1674,9 +2027,8 @@ class TestRecoveryBankPacket(unittest.TestCase):
         C2 matrix (complete(): an accepted-form bank, every role, a C1-primary directory and the four sensitivity
         variants repeating its (scenario, rep) identities, the registered settings everywhere) C1 counts the primary
         directory only: doctoring a sensitivity's results leaves C1 unchanged, doctoring the primary's changes it, and
-        a primary whose config.json does not hash to expected_config_sha256 is refused. (Every legacy check is
-        evaluated; the extra roles' directories are recovery_extra.py's planning-mode ones until WP5, so identity,
-        completeness and pairing fail on them alone.)"""
+        a primary whose config.json does not hash to expected_config_sha256 is refused. (Every check is evaluated and,
+        from WP5 on, with the extra roles' bank-mode plans and results, every check passes before the doctoring.)"""
         sched = self.numerical_schedule()
         cp = self.cli("packet", "--mode", "acceptance", "--schedule", sched, "--out", os.path.join(self.base, "P1.json"))
         self.assertEqual(cp.returncode, 2)
@@ -1704,12 +2056,8 @@ class TestRecoveryBankPacket(unittest.TestCase):
             self.assertEqual({k: ch[k]["status"] for k in ("numerical", "guards", "C1")},
                              {"numerical": "pass", "guards": "pass", "C1": "pass"}, ch)
             self.assertEqual({s: v["successes"] for s, v in ch["C1"]["scenarios"].items()}, {"r1_034": 16, "r2_034": 17})
-            fails = ch["identity"]["failures"]
-            self.assertEqual(len(fails), 4, fails)
-            self.assertTrue(all("(extra-" in f and "planning input is refused" in f for f in fails), fails)
-            self.assertEqual(ch["pairing"]["status"], "fail")
-            self.assertRegex(ch["pairing"]["reason"], r"extra_\w+ is not a bank-mode plan .*planning input is refused")
-            self.assertEqual(code, 2)
+            self.assertEqual({k: c["status"] for k, c in ch.items()}, dict.fromkeys(ch, "pass"), ch)    # (WP5)
+            self.assertEqual(code, 0)
             fr = os.path.join(dirs["stress"]["dir"], "r0_asym.000.json")     # (the guards: a decision with one root, a
             good = rqlib.read_bytes(fr)                                      #  decided unresolved forward comparison)
             for where, why in (("decision", "a decision with 1 contributing test root"),
@@ -2581,12 +2929,14 @@ class TestRecoveryBankPacket(unittest.TestCase):
     # ---------------------------------------------------------------- round 5 (Codex WP4 r4): the liveness matrix
     @staticmethod
     def r5_states():
-        """Producer-shaped records for every liveness state the producers emit -> {name: (kind, record, producer)}.
+        """Producer-shaped records, a REPRESENTATIVE set of the liveness states the producers emit (hand-built after the
+        cited producer lines, not generated from them; recovery_extra's actually produced records are the WP5 matrix's,
+        r5_real_states), plus two availability-only inputs the guards support -> {name: (kind, record, producer)}.
         Kinds: the selection-and-prediction procedure (recovery.py procedure, L989-1107: option a, and recovery_extra's
-        a / interp with several test worlds, L758-763), the legacy forward procedure (recovery.py forward_procedure,
-        L1110-1187), recovery_extra's forward (recovery_extra.py forward, L623-744) and its one-root merged record
-        (recovery_extra.py evaluate, L750-756). Integration records carry grid_unresolved as the registered map writes
-        them (map.py L1237: 0 when resolved)."""
+        a / interp with several test worlds, recovery_extra.py L864-869), the legacy forward procedure (recovery.py
+        forward_procedure, L1110-1187), recovery_extra's forward (recovery_extra.py forward, L730-850) and its one-root
+        merged record (recovery_extra.py evaluate, L857-863). Integration records carry grid_unresolved as the
+        registered map writes them (map.py L1237: 0 when resolved). (Line numbers @WP5; R5_CITES checks them.)"""
         def info(g=0):
             return {"pairs": 4, "grid_unresolved": g}
 
@@ -2600,7 +2950,7 @@ class TestRecoveryBankPacket(unittest.TestCase):
             return {"rank": rank, "lambda": lam, "val_lpd": val, "val_lpd_gauss": val, "start": "warm",
                     "integration": {"validation": info(vg)}}
 
-        def proc(vg3=0, tg3=0, vg1=0, tg1=0, success=True):
+        def proc(vg3=0, tg3=0, vg1=0, tg1=0, success=True, psuccess=True):
             cands = [pcand(0, 0.0, 0.0), pcand(1, 0.05, 1.0, vg=vg1, tg=tg1), pcand(3, 0.05, 2.0, vg=vg3, tg=tg3)]
             unres_val, unres_test = vg1 + vg3, tg3
             avail = not (unres_val or unres_test)
@@ -2617,15 +2967,17 @@ class TestRecoveryBankPacket(unittest.TestCase):
                                 "integration_unresolved": unres_val + unres_test, "reason": None if avail else "u"},
                    "selected_primary": dict({"ranks": [0, 1, 2], "rank": 1, "lambda": 0.05, "start": "warm",
                                              "available": bool(avail_prim), "test_improvement": 0.1,
-                                             "test_lb": 0.01, "success": bool(avail_prim)},
+                                             "test_lb": 0.01 if psuccess else -0.01,
+                                             "success": bool(avail_prim and psuccess)},
                                             **({"selection_unresolved": True} if unres_val_prim else {})),
                    "fit_pairs": 100, "classes": None, "ab_cap": None}
             return rec
 
         def lbranch(state):                              # (forward_procedure's branches, L1148-1176)
-            if state == "decided":
+            if state in ("decided", "available only"):   # (available only: an input the guards support, P3-R5-2;
+                avail_only = state == "available only"   #  the producers never emit it, both minima being 2)
                 return {"available": True, "test_improvement": 0.1, "test_lb": 0.01, "per_world": [0.1] * 3,
-                        "success": True, "targets": 40, "worlds": 3, "decision_available": True,
+                        "success": not avail_only, "targets": 40, "worlds": 3, "decision_available": not avail_only,
                         "integration": {"selected": info(), "rank0": info()}, "integration_unresolved": 0,
                         "test_improvement_gauss": 0.1, "test_lb_gauss": 0.01}
             if state == "no targets":
@@ -2650,10 +3002,12 @@ class TestRecoveryBankPacket(unittest.TestCase):
                          "success": f.get("success", False), "test_improvement": f.get("test_improvement"),
                          "test_lb": f.get("test_lb"), "classes": {}}, **b)
 
-        def xbranch(state):                              # (recovery_extra.forward's branches, L670-735)
-            if state == "decided":
-                return {"targets": 40, "test_roots": 3, "worlds": 3, "available": True, "decision_available": True,
-                        "success": True, "test_improvement": 0.1, "test_lb": 0.01, "per_world": [0.1] * 3,
+        def xbranch(state):                              # (recovery_extra.forward's branches, L780-837)
+            if state in ("decided", "available only"):
+                avail_only = state == "available only"
+                return {"targets": 40, "test_roots": 3, "worlds": 3, "available": True,
+                        "decision_available": not avail_only, "success": not avail_only, "test_improvement": 0.1,
+                        "test_lb": 0.01, "per_world": [0.1] * 3,
                         "integration": {"selected": info(), "rank0": info()}, "integration_unresolved": 0,
                         "test_improvement_gauss": 0.1, "test_lb_gauss": 0.01}
             if state == "no targets":
@@ -2679,7 +3033,7 @@ class TestRecoveryBankPacket(unittest.TestCase):
                          "success": f.get("success", False), "test_improvement": f.get("test_improvement"),
                          "test_lb": f.get("test_lb")}, **b)
 
-        merged = xfwd("decided", "decided")              # (evaluate's one-root a / interp, L750-756)
+        merged = xfwd("decided", "decided")              # (evaluate's one-root a / interp, L857-863)
         for k in ("forward_transfer", "intersection"):
             merged.pop(k)
         wt = xbranch("one root")
@@ -2698,6 +3052,8 @@ class TestRecoveryBankPacket(unittest.TestCase):
             "P5 full unavailable (winner comparison), primary live": ("procedure", proc(tg3=1),
                                                                       "L1033-1035, L1063-1066"),
             "P6 full and primary unavailable": ("procedure", proc(vg1=1), "L1032, L1053-1062"),
+            "P8 full unavailable (rank-3 validation), primary available, unsuccessful (Codex P3-R5-2)": (
+                "procedure", proc(vg3=1, psuccess=False), "L1032-1035, L1053-1062"),
             "P7 procedure unavailable (roots)": ("procedure", {
                 "available": False, "reason": "1 contributing test root(s)", "fitter": "registered",
                 "fit_pairs": 100, "validation_targets": 20, "test_targets": 30, "test_roots": 1}, "L998-1001"),
@@ -2713,12 +3069,16 @@ class TestRecoveryBankPacket(unittest.TestCase):
                 "procedure": "forward", "candidates": [], "fitter": "registered", "fit_pairs": 0, "score": {},
                 "val_pairs": 0, "test_pairs": {}, "controls": 0, "available": False,
                 "reason": "no fitting pairs"}, "L1125-1130"),
-            "X1 extra forward: both branches decided": ("extra forward", xfwd("decided", "decided"), "L715-744"),
+            "L6 legacy forward: forward_transfer available only, intersection no targets (input, P3-R5-2)": (
+                "forward", lfwd("available only", "no targets"), "the guards' input; L1172-1176 never emit it"),
+            "X1 extra forward: both branches decided": ("extra forward", xfwd("decided", "decided"), "L822-850"),
             "X2 extra forward: forward_transfer no targets, intersection decided": (
-                "extra forward", xfwd("no targets", "decided"), "L672-678, L715-744"),
+                "extra forward", xfwd("no targets", "decided"), "L782-788, L822-850"),
             "X3 extra forward: forward_transfer decided, intersection one-root descriptive": (
-                "extra forward", xfwd("decided", "one root"), "L703-715"),
-            "M1 extra a / interp, one test world (descriptive)": ("extra merged", merged, "L750-756, L703-715"),
+                "extra forward", xfwd("decided", "one root"), "L808-821"),
+            "X4 extra forward: intersection available only, forward_transfer no targets (input, P3-R5-2)": (
+                "extra forward", xfwd("no targets", "available only"), "the guards' input; L830-837 never emit it"),
+            "M1 extra a / interp, one test world (descriptive)": ("extra merged", merged, "L857-863, L808-821"),
         }
 
     # (documented ALTERNATIVES: a read whose deletion leaves a live claim standing is accepted only here)
@@ -2729,18 +3089,54 @@ class TestRecoveryBankPacket(unittest.TestCase):
                             "Deleting a 0 hides no unresolved pair: a positive count is the only unresolved state, "
                             "and it also sets the stored integration_unresolved / decision flags the paths require"),
         ("test_roots|worlds", "recovery_extra writes a branch's test_roots and worlds from the same count "
-                              "(recovery_extra.py L671): either one gives the root guard and the per-world length "
-                              "their count, so a missing one cannot hide an under-rooted claim"),
+                              "(recovery_extra.py L782; L675 at 2f82515, not L671 as round 5 cited), and a merged "
+                              "record carries both at its top level as copies of its branch's (L861, "
+                              "out.update(branch)): either one gives the root guard and the per-world length their "
+                              "count, so a missing one cannot hide an under-rooted claim"),
         ("procedure|reference_policy", "recovery_extra marks a forward record twice, procedure 'forward' and "
-                                       "reference_policy (recovery_extra.py L631-632): either one selects the forward "
-                                       "derivation, so a missing one changes nothing"),
+                                       "reference_policy (recovery_extra.py L738), and a merged record carries "
+                                       "reference_policy beside procedure 'a' / 'interp' (L861); the guards take the "
+                                       "forward derivation when procedure is 'forward' OR reference_policy is present "
+                                       "(recovery.py L2532), so deleting one marker while the other still selects it "
+                                       "changes nothing"),
+        ("merged copy", "a merged record's top-level available is its branch's (recovery_extra.py L861, "
+                        "out.update(branch)); the decision it carries is checked against that branch itself (the "
+                        "decision branch, recovery.py L2567-2571: available and decision_available required), so "
+                        "deleting the copy hides nothing (WP5: first seen on a live merged record, M2)"),
     )
+    # (every producer line this matrix cites, with the code it names: test_T7_8_WP5_the_matrix_cites_its_producers)
+    R5_CITES = (("recovery_extra.py", 730, "def forward(v, data, fit, seed, option):"),
+                ("recovery_extra.py", 738, '"procedure": "forward", "reference_policy": option,'),
+                ("recovery_extra.py", 743, "if not len(idx) or not len(val):"),
+                ("recovery_extra.py", 782, 'base = {"targets": len(ix), "test_roots": roots, "worlds": roots}'),
+                ("recovery_extra.py", 783, "if not len(ix):"),
+                ("recovery_extra.py", 789, "if unres_val:"),
+                ("recovery_extra.py", 808, "if roots < rec.MIN_TEST_ROOTS:"),
+                ("recovery_extra.py", 830, "out[name] = dict("),
+                ("recovery_extra.py", 850, "return out"),
+                ("recovery_extra.py", 853, "def evaluate(v, data, plan, seed, option):"),
+                ("recovery_extra.py", 857, "if (len(np.unique(v.test_world)) == 1"),
+                ("recovery_extra.py", 861, "out.update(branch, procedure=option)"),
+                ("recovery_extra.py", 863, "return out"),
+                ("recovery.py", 2532, 'fwd = o.get("procedure") == "forward" or "reference_policy" in o'),
+                ("recovery.py", 2567, 'db = o.get("forward_transfer") if "forward_transfer" in o else next('),
+                ("recovery.py", 2571, "a decision whose decision branch is not decided"),
+                ("recovery_extra.py", 864, "return rec.procedure("),
+                ("recovery.py", 991, "def procedure(D, data, option, ranks, lambdas, iters, seed"),
+                ("recovery.py", 1057, "avail_prim = bool(nw >= MIN_TEST_WORLDS and not unres_val_prim"),
+                ("recovery.py", 1112, "def forward_procedure(D, data, ranks, lambdas, iters, seed"),
+                ("recovery.py", 812, 'info["exact"] = info.get("exact", 0) + int(len(ix))'),
+                ("map.py", 1237, "grid_unresolved"))
 
     @staticmethod
     def r5_owner(path):
-        """The claims a record field is evidence for (the comparison's own records, by the producers' layout)."""
+        """The claims a record field is evidence for (the comparison's own records, by the producers' layout). A
+        branch's root count is evidence for its DECISION only (CRITERION C4 keeps available one-root descriptive
+        scores; WP5: L6 / X4, branches available without a decision)."""
         k = path[0]
         if k in R.BRANCHES:
+            if len(path) == 2 and path[1] in ("test_roots", "worlds"):
+                return {f"branch-decision:{k}"}
             return {f"branch:{k}"}
         if k == "selected_primary":
             return {"primary"}
@@ -2767,6 +3163,8 @@ class TestRecoveryBankPacket(unittest.TestCase):
             if isinstance(br, dict) and (br.get("decision_available") is True or br.get("success")
                                          or br.get("available") is True):
                 out.add(f"branch:{b}")
+            if isinstance(br, dict) and (br.get("decision_available") is True or br.get("success")):
+                out.add(f"branch-decision:{b}")
         if R.c1_success(rec):           # (C1 counts the record: a claim of its own)
             out.add("c1")
         return out | ({"any"} if out else set())
@@ -2822,29 +3220,26 @@ class TestRecoveryBankPacket(unittest.TestCase):
         leaf = path[-1]
         if leaf == "grid_unresolved" and self.r5_present(rec, path)[1] == 0:
             return "grid_unresolved"
-        if leaf in ("test_roots", "worlds") and len(path) == 2 and path[0] in R.BRANCHES:
+        if leaf in ("test_roots", "worlds") and (len(path) == 2 and path[0] in R.BRANCHES or len(path) == 1):
             other = "worlds" if leaf == "test_roots" else "test_roots"
-            if self.r5_present(rec, path[:-1] + (other,))[1] == self.r5_present(rec, path)[1]:
+            here, there = self.r5_present(rec, path), self.r5_present(rec, path[:-1] + (other,))
+            if there[0] and there[1] == here[1]:
                 return "test_roots|worlds"
-        if path in (("procedure",), ("reference_policy",)) and rec.get("procedure") == "forward" and \
-                "reference_policy" in rec:
+        if (path == ("procedure",) and "reference_policy" in rec) or \
+                (path == ("reference_policy",) and rec.get("procedure") == "forward"):
             return "procedure|reference_policy"
+        if path == ("available",) and "reference_policy" in rec and rec.get("procedure") != "forward" and any(
+                isinstance(rec.get(b), dict) and rec[b].get("available") == rec.get("available")
+                for b in ("world_transfer", "interpolation")):
+            return "merged copy"
         return None
 
-    def test_T7_8_every_liveness_state_requires_every_record_its_live_claims_read(self):
-        """P2-R4-1 / P2-R4-2 and their class (Codex WP4 r4): for every liveness state the producers emit (r5_states:
-        the procedure with the full decision and the restricted primary each live or not; legacy and extra forward
-        with each branch live or not, independently of the top-level decision; the early returns; the merged
-        one-root record), the guards and C1 are evaluated on a tracked copy and every key path they READ is
-        recorded. Then each read field present in the record is deleted, one at a time. A deletion must be caught --
-        a guard violation, or C1 no longer counting a record it counted -- unless (a) the field is evidence only for
-        claims that are not live in that state, (b) the deletion withdraws every live claim the field is evidence
-        for, or (c) the field is one of the documented alternatives (R5_ALTERNATIVES); and no deletion may ever add a
-        live claim or make C1 count a record it did not. Every read of a key ABSENT from the record (a conditional
-        read) is reported too. With RQ_WP4_COVERAGE set, the full coverage table is written there (evidence).
-        Codex's two inputs are in the matrix (L3's candidate integrations; P4's decision.test_worlds), with the
-        absent candidate list beside a live branch."""
-        states = self.r5_states()
+    def r5_matrix(self, states):
+        """Round 5's tracked-read deletion loop over states ({name: (kind, record, producer)}): each record must pass
+        the guards; every key path the guards and C1 read on it is deleted, one at a time, while present; a deletion
+        must be caught (a violation, or C1 no longer counting the record) unless the field is evidence only for claims
+        not live, the deletion withdraws every live claim it is evidence for, or it is a documented alternative; no
+        deletion may add a claim -> (the per-state table, the holes)."""
         holes, table = [], {}
         for name, (kind, rec, where) in states.items():
             reads, viol, c1 = self.r5_reads(rec)
@@ -2876,11 +3271,35 @@ class TestRecoveryBankPacket(unittest.TestCase):
                 else:
                     holes.append(f"{name}: deleting {label} leaves {sorted(own & dlive)} live and is not caught")
             table[name] = row
+        return table, holes
+
+    @staticmethod
+    def r5_counts(row):
+        return [len(row[k]) for k in ("caught", "not_live", "withdrawn", "alternative", "absent_reads")]
+
+    def test_T7_8_every_liveness_state_requires_every_record_its_live_claims_read(self):
+        """P2-R4-1 / P2-R4-2 and their class (Codex WP4 r4): for every liveness state the producers emit (r5_states:
+        the procedure with the full decision and the restricted primary each live or not; legacy and extra forward
+        with each branch live or not, independently of the top-level decision; the early returns; the merged
+        one-root record), the guards and C1 are evaluated on a tracked copy and every key path they READ is
+        recorded. Then each read field present in the record is deleted, one at a time. A deletion must be caught --
+        a guard violation, or C1 no longer counting a record it counted -- unless (a) the field is evidence only for
+        claims that are not live in that state, (b) the deletion withdraws every live claim the field is evidence
+        for, or (c) the field is one of the documented alternatives (R5_ALTERNATIVES); and no deletion may ever add a
+        live claim or make C1 count a record it did not. Every read of a key ABSENT from the record (a conditional
+        read) is reported too. With RQ_WP4_COVERAGE set, the full coverage table is written there (evidence).
+        Codex's two inputs are in the matrix (L3's candidate integrations; P4's decision.test_worlds), with the
+        absent candidate list beside a live branch. (WP5: P8, the available but unsuccessful restricted primary, and
+        L6 / X4, branches live only through `available`, are states too; the classification counts are pinned,
+        R5_COUNTS.)"""
+        states = self.r5_states()
+        table, holes = self.r5_matrix(states)
         if os.environ.get("RQ_WP4_COVERAGE"):
             rqlib.write_json_durable(os.environ["RQ_WP4_COVERAGE"], {"states": table, "holes": holes,
                                                                      "alternatives": dict(self.R5_ALTERNATIVES)})
         self.assertEqual(holes, [])
         self.assertTrue(all(table[n]["caught"] for n in table if table[n]["live"]))
+        self.assertEqual({n: self.r5_counts(row) for n, row in table.items()}, self.R5_COUNTS)
         # (Codex's two inputs, explicitly; and the absent candidate list beside a live branch)
         _, l3, _ = states["L3 legacy forward: forward_transfer no targets, intersection decided (Codex P2-R4-1)"]
         stripped = copy.deepcopy(l3)
@@ -2898,14 +3317,709 @@ class TestRecoveryBankPacket(unittest.TestCase):
         self.assertIn("x.selected_primary: decided with 1 contributing test root(s)",
                       R._guard_violations(low, "x"))
 
-    @unittest.expectedFailure
+    # ---------------------------------------------------------------- WP5 (Codex WP4 r5's P3-R5-1 / P3-R5-2)
+    P8 = "P8 full unavailable (rank-3 validation), primary available, unsuccessful (Codex P3-R5-2)"
+    L6 = "L6 legacy forward: forward_transfer available only, intersection no targets (input, P3-R5-2)"
+    X4 = "X4 extra forward: intersection available only, forward_transfer no targets (input, P3-R5-2)"
+    # (the matrix's classification counts per state, [caught, not live, withdrawn, alternative, absent reads]: round
+    #  5's 16 states as its coverage table reconciled them, and WP5's P8, L6 and X4; a classifier that misclassifies
+    #  one exemption changes one of these)
+    R5_COUNTS = {
+        "P1 decided, primary live, success": [36, 0, 1, 6, 11],
+        "P2 decided, primary live, unsuccessful": [34, 0, 2, 6, 11],
+        "P3 decided, primary unavailable (restricted comparison unresolved)": [32, 3, 0, 5, 11],
+        "P4 full unavailable (rank-3 validation), primary live": [26, 5, 1, 4, 10],
+        "P5 full unavailable (winner comparison), primary live": [26, 4, 1, 4, 11],
+        "P6 full and primary unavailable": [12, 13, 0, 0, 9],
+        P8: [25, 5, 2, 4, 10],
+        "P7 procedure unavailable (roots)": [0, 1, 0, 0, 11],
+        "L1 legacy forward: both branches decided": [39, 1, 1, 6, 10],
+        "L2 legacy forward: forward_transfer decided, intersection one root": [30, 4, 0, 4, 13],
+        "L3 legacy forward: forward_transfer no targets, intersection decided (Codex P2-R4-1)": [23, 8, 1, 4, 14],
+        "L4 legacy forward: validation unresolved, no branch live": [7, 17, 0, 0, 13],
+        "L5 legacy forward: nothing to fit": [0, 1, 0, 0, 11],
+        L6: [21, 9, 2, 4, 14],
+        "X1 extra forward: both branches decided": [36, 1, 1, 11, 8],
+        "X2 extra forward: forward_transfer no targets, intersection decided": [22, 12, 1, 6, 9],
+        "X3 extra forward: forward_transfer decided, intersection one-root descriptive": [28, 8, 0, 7, 8],
+        X4: [21, 14, 2, 4, 9],
+        "M1 extra a / interp, one test world (descriptive)": [7, 19, 0, 0, 6],
+    }
+
+    def test_T7_8_WP5_availability_without_success_activates_the_requirements(self):
+        """P3-R5-2 (Codex WP4 r5): a claim is live through availability alone. P8 -- the restricted primary available
+        but unsuccessful while the full decision is unavailable (recovery.py L1057) -- requires its contributing-root
+        count: deleting decision.test_worlds is caught, and so are 0 and 1 roots, while 2 (the minimum) and 6 pass
+        (controls). L6 and X4 -- a branch available without a decision or a success (an input the guards support;
+        the producers never emit it, both minima being 2) -- require the candidate list, every candidate's validation
+        integration and the branch's own records; with the branch unavailable none is required (control)."""
+        states = self.r5_states()
+        _, p8, _ = states[self.P8]
+        self.assertEqual((p8["decision"]["available"], p8["selected_primary"]["available"],
+                          p8["selected_primary"]["success"]), (False, True, False))
+        self.assertEqual(R._guard_violations(p8, "x"), [])
+        self.assertIn("x: decision.test_worlds is absent",
+                      "; ".join(R._guard_violations(self.without(p8, ("decision", "test_worlds")), "x")))
+        for n, bad in ((0, True), (1, True), (2, False), (6, False)):
+            o = copy.deepcopy(p8)
+            o["decision"]["test_worlds"] = n
+            with self.subTest(roots=n):
+                v = R._guard_violations(o, "x")
+                if bad:
+                    self.assertIn(f"x.selected_primary: decided with {n} contributing test root(s)", v)
+                else:
+                    self.assertEqual(v, [])
+        for key, b in ((self.L6, "forward_transfer"), (self.X4, "intersection")):
+            _, rec, _ = states[key]
+            with self.subTest(state=key):
+                self.assertEqual((rec[b]["available"], rec[b]["decision_available"], rec[b]["success"],
+                                  rec["decision"]["available"]), (True, False, False, False))
+                self.assertEqual(R._guard_violations(rec, "x"), [])
+                self.assertIn("x: a decision without its candidate records",
+                              R._guard_violations(self.without(rec, ("candidates",)), "x"))
+                stripped = copy.deepcopy(rec)
+                for c in stripped["candidates"]:
+                    c.pop("integration")
+                self.assertIn("x.candidates[0]: integration.validation is absent",
+                              "; ".join(R._guard_violations(stripped, "x")))
+                self.assertIn(f"x.{b}: integration.selected is absent",
+                              "; ".join(R._guard_violations(self.without(rec, (b, "integration", "selected")), "x")))
+                off = copy.deepcopy(rec)
+                off[b]["available"] = False
+                self.assertEqual(R._guard_violations(self.without(off, ("candidates",)), "x"), [])
+
+    def test_T7_8_WP5_the_matrix_reports_injected_guard_holes(self):
+        """P3-R5-2's fault test of the matrix's exemption classifier (Codex WP4 r5): with the guards weakened in two
+        known ways the matrix must REPORT the holes, none exempted as not live, withdrawn or an alternative -- (a) a
+        live primary's root count no longer required (P2-R4-2 reverted: recovery._PRIMARY_ROOTS empty) leaves exactly
+        the decision record and its test_worlds of P4, P5 and P8 (the primary live beside an unavailable full decision)
+        and P2's decision record (deleting it leaves the unsuccessful decision withdrawn, the primary live); (b) a
+        branch no longer live through `available` alone (_branch_live's availability arm dropped) leaves L6's and
+        X4's availability-only branches unguarded, and only theirs.
+        Unweakened the matrix reports none, with the pinned classification counts R5_COUNTS. A classifier that
+        misclassifies one exemption therefore changes a pinned count or hides one of these holes (the WP5 classifier
+        mutations show both)."""
+        states = self.r5_states()
+        table, holes = self.r5_matrix(states)
+        self.assertEqual(holes, [])
+        self.assertEqual({n: self.r5_counts(row) for n, row in table.items()}, self.R5_COUNTS)
+        with mock.patch.object(R, "_PRIMARY_ROOTS", ()):
+            _, holes = self.r5_matrix(states)
+        p45 = [n for n in states if n.startswith(("P4 ", "P5 "))] + [self.P8]
+        p2 = next(n for n in states if n.startswith("P2 "))
+        self.assertEqual(sorted(holes), sorted([f"{n}: deleting {f} leaves ['primary'] live and is not caught"
+                                                for n in p45 for f in ("decision", "decision.test_worlds")] +
+                                               [f"{p2}: deleting decision leaves ['primary'] live and is not caught"]))
+
+        def no_availability_arm(br):
+            return isinstance(br, dict) and (br.get("decision_available") is True or bool(br.get("success")))
+        with mock.patch.object(R, "_branch_live", no_availability_arm):
+            _, holes = self.r5_matrix(states)
+        self.assertEqual({h.split(": deleting")[0] for h in holes}, {self.L6, self.X4})
+        for key, b in ((self.L6, "forward_transfer"), (self.X4, "intersection")):
+            self.assertEqual(sorted(h.split(": deleting ")[1].split(" leaves")[0] for h in holes if h.startswith(key)),
+                             sorted(["candidates", "candidates.0.val_lpd", f"{b}.decision_available",
+                                     f"{b}.integration_unresolved", f"{b}.success"]), key)
+
+    def test_T7_8_WP5_the_matrix_cites_its_producers(self):
+        """Codex WP4 r5's citation note (the root-alternative producer was recovery_extra.py:675 at 2f82515, not :671)
+        and every producer line the matrix cites at this head (R5_CITES): each cited line holds the cited code, so a
+        citation cannot go stale silently."""
+        for name, line, code in self.R5_CITES:
+            lines = rqlib.read_text(os.path.join(HERE, name)).split("\n")
+            self.assertIn(code, lines[line - 1], f"{name}:{line}")
+        self.assertIn("L782", dict(self.R5_ALTERNATIVES)["test_roots|worlds"])
+
+    @staticmethod
+    def r5_signature(rec):
+        """A produced record's liveness signature: (its kind, its live claims as r5_live reads them, C1's left out: a
+        decided record's success is the data's, so whether C1 counts it is not part of the state)."""
+        if not rec.get("candidates"):
+            kind = "early return"
+        elif "reference_policy" in rec and rec.get("procedure") != "forward":
+            kind = "merged"
+        elif rec.get("procedure") == "forward":
+            kind = "extra forward"
+        else:
+            kind = "procedure"
+        return kind, tuple(sorted(x for x in TestRecoveryBankPacket.r5_live(rec)
+                                  if x != "c1" and not x.startswith("branch-decision:")))
+
+    def r5_real_states(self):
+        """Records PRODUCED by recovery_extra in bank mode (recovery_extra.evaluate on the views of a bank-mode plan:
+        the toy graph, the accepted-form synthetic bank/3, r1_034 / r0 data, ranks 0..3) for the liveness states it
+        emits; the rarer ones by test hooks on its INPUTS only (a mask; an integration diagnostic marked unresolved as
+        the registered map records one; the root minimum lowered to 1, under which a merged record's branch can be
+        live) -> {name: (signature wanted, record, how, context)}; the context also wraps the matrix's evaluation."""
+        import obslaw
+        bp, tp = self.TG.bank_files()
+        obs = obslaw.BankObservationModel(bp, tp)
+        D = X.data_from(self.gpath, None)
+        fit = dict(ranks=3, lambdas="0.05", iters=2, start="warm", basis=4, embedding="shared", center="references")
+        plan = X.make_plan(D, self.gpath, None, "rq-r5-real", fit, ["r1_034", "r0"], 1, list(X.OPTIONS),
+                           list(X.CASES), True, obs=obs)
+        seed = 91
+        data = {sc: R.simulate(D, R.SCENARIOS[sc], seed, obs=obs) for sc in ("r1_034", "r0")}
+        ones = np.ones(len(D.qi), bool)
+        null = contextlib.nullcontext
+        real_cand, real_scorer = R._cand_record, R.scorer
+
+        def unresolved_validation(ranks):            # (an unresolved validation integral, as map records it)
+            def cand(*a, **k):
+                out = real_cand(*a, **k)
+                if out["rank"] in ranks:
+                    out["integration"]["validation"]["grid_unresolved"] = 1
+                return out
+            return mock.patch.object(R, "_cand_record", cand)
+
+        def unresolved_comparison(target):            # (an unresolved test integral of one branch's targets)
+            def scorer(*a):
+                s = real_scorer(*a)
+
+                def score(ix, info=None):
+                    out = s(ix, info)
+                    if info is not None and ix is target:
+                        info["grid_unresolved"] = info.get("grid_unresolved", 0) + 1
+                    return out
+                return score
+            return mock.patch.object(R, "scorer", scorer)
+
+        def ev(op, keep, sc="r1_034", hook=null, view=None):
+            v = view if view is not None else X.view_for(D, plan, op, keep)
+            with hook():
+                return X.evaluate(v, data[sc], plan, seed, op)
+        states = {}
+        want = {"intact a": ("procedure", ("any", "decision", "primary")),
+                "intact interp": ("procedure", ("any", "decision", "primary")),
+                "intact fwd_all": ("extra forward", ("any", "branch:forward_transfer", "branch:intersection",
+                                                     "decision")),
+                "roots0 a": ("early return", ()),
+                "roots0 fwd_all": ("extra forward", ("any", "branch:forward_transfer", "decision")),
+                "roots1 a": ("merged", ()),
+                "roots1 fwd_all": ("extra forward", ("any", "branch:forward_transfer", "decision"))}
+        for name in want:
+            case, op = name.split()
+            states[name] = (want[name], ev(op, X.mask_for(D, plan, case)[0]), f"evaluate, case {case}", null)
+        k = ones.copy()
+        k[D.forward["tests"]["forward_transfer"]] = False
+        states["X2 forward_transfer's targets masked out"] = (
+            ("extra forward", ("any", "branch:intersection")), ev("fwd_all", k), "evaluate, a mask", null)
+        states["early return: no fitting pairs"] = (("early return", ()), ev("fwd_all", ~ones), "a mask", null)
+        k = ones.copy()
+        k[D.forward["val"]] = False
+        states["early return: no validation targets"] = (("early return", ()), ev("fwd_all", k), "a mask", null)
+        states["neither branch live: validation unresolved"] = (
+            ("extra forward", ()), ev("fwd_all", ones, hook=lambda: unresolved_validation({0, 1, 2, 3})),
+            "validation integral unresolved", null)
+        v = X.view_for(D, plan, "fwd_all", ones)
+        states["forward_transfer's comparison unresolved"] = (
+            ("extra forward", ("any", "branch:intersection")),
+            ev("fwd_all", ones, view=v, hook=lambda: unresolved_comparison(v.forward["tests"]["forward_transfer"])),
+            "forward_transfer test integral unresolved", null)
+        states["P6 full and primary unavailable"] = (
+            ("procedure", ()), ev("a", ones, hook=lambda: unresolved_validation({1})), "rank-1 validation unresolved",
+            null)
+        states["P8 primary available, unsuccessful"] = (
+            ("procedure", ("any", "primary")), ev("a", ones, sc="r0", hook=lambda: unresolved_validation({3})),
+            "r0 data, rank-3 validation unresolved", null)
+        lowered = lambda: mock.patch.object(R, "MIN_TEST_ROOTS", 1)   # noqa: E731
+        states["M2 merged, its world_transfer live"] = (
+            ("merged", ("any", "branch:world_transfer", "decision")),
+            ev("a", X.mask_for(D, plan, "roots1")[0], hook=lowered), "the root minimum lowered to 1", lowered)
+        return states
+
+    def test_T7_8_WP5_the_liveness_matrix_on_real_bank_mode_extra_results(self):
+        """P3-R5-1 and the WP4 r5 note (Codex WP4 r5): round 5's tracked-read deletion loop on records ACTUALLY PRODUCED
+        by recovery_extra in bank mode (r5_real_states), REPRESENTATIVE coverage of the liveness states it emits, not a
+        claim about every producer state: extra forward with both branches live (intact), a branch live with the
+        top-level decision unavailable (X2: forward_transfer's targets masked out; and forward_transfer's comparison
+        unresolved), forward_transfer live beside a dead intersection (roots0, roots1), neither branch live
+        (validation unresolved, recovery_extra.py L789), the empty-candidate early returns (no fitting pairs, no
+        validation targets, L743), the one-root merged record (M1, roots1 a), a merged record whose world_transfer is
+        live (the root minimum lowered to 1: at 2 a merged record's one root can never decide), the procedure of
+        recovery_extra's a / interp (decided; unavailable at roots0; both unavailable; the restricted primary
+        available but unsuccessful beside an unavailable full decision, P3-R5-2). Every record passes the guards,
+        every deletion is caught or exempt as in round 5 (0 holes), every live state has a caught deletion, and every
+        state has its wanted liveness signature. With RQ_WP5_COVERAGE set, the table is written there (evidence)."""
+        states = self.r5_real_states()
+        table, holes, sigs = {}, [], {}
+        for name, (wanted, rec, how, ctx) in states.items():
+            sigs[name] = self.r5_signature(rec)
+            with ctx():
+                t, h = self.r5_matrix({name: (sigs[name][0], rec, how)})
+            table.update(t)
+            holes += h
+        if os.environ.get("RQ_WP5_COVERAGE"):
+            rqlib.write_json_durable(os.environ["RQ_WP5_COVERAGE"], {"states": table, "holes": holes,
+                                                                     "signatures": sigs})
+        self.assertEqual({n: [s[0], list(s[1])] for n, s in sigs.items()},
+                         {n: [w[0], list(w[1])] for n, (w, _, _, _) in states.items()})
+        self.assertEqual(holes, [])
+        self.assertTrue(all(table[n]["caught"] for n in table if table[n]["live"]))
+        p8 = states["P8 primary available, unsuccessful"][1]
+        self.assertEqual((p8["decision"]["available"], p8["selected_primary"]["available"],
+                          p8["selected_primary"]["success"]), (False, True, False))
+        self.assertIn("x: decision.test_worlds is absent",
+                      "; ".join(R._guard_violations(self.without(p8, ("decision", "test_worlds")), "x")))
+        low = copy.deepcopy(p8)
+        low["decision"]["test_worlds"] = 1
+        self.assertIn("x.selected_primary: decided with 1 contributing test root(s)", R._guard_violations(low, "x"))
+
+    def test_T7_8_WP5_packet_refuses_round_5s_branch_only_inputs(self):
+        """Codex WP4 r5's note (no packet regression for round 5's branch-only inputs): in a complete schedule, a legacy
+        fwd record shaped L3 (forward_transfer without targets, the intersection decided) and an extra fwd_all record
+        shaped X2 pass the packet; with their candidates' integration records removed, or without their candidate
+        list, each fails the packet's guards check naming the violation (exit 2), C1 unchanged."""
+        f = self.complete()
+        states = self.r5_states()
+        l3 = states["L3 legacy forward: forward_transfer no targets, intersection decided (Codex P2-R4-1)"][1]
+        x2 = dict(states["X2 extra forward: forward_transfer no targets, intersection decided"][1],
+                  reference_policy="fwd_all")
+
+        def stripped(rec):
+            out = copy.deepcopy(rec)
+            for c in out["candidates"]:
+                c.pop("integration")
+            return out
+        fr = os.path.join(f["dirs"]["stress"]["dir"], "r0_asym.000.json")
+        fx = os.path.join(f["dirs"]["extra_fwd_all"]["dir"], "results", "intact.r1_034.000.json")
+
+        def put_legacy(rec):
+            r = rqlib.read_json(fr)
+            r["options"]["fwd"] = rec
+            rqlib.write_json_durable(fr, r)
+
+        def put_extra(rec):
+            rewrite_extra_result(fx, lambda r: r["options"].update(fwd_all=rec))
+        with mock.patch.object(R, "C2_MATRIX", self.TOY_C2):
+            c1 = R.packet(f["path"], "acceptance")[0]["checks"]["C1"]
+            for where, put, base in (("legacy", put_legacy, l3), ("extra", put_extra, x2)):
+                for name, rec, why in (("intact", base, None),
+                                       ("integration removed", stripped(base), "integration.validation is absent"),
+                                       ("no candidates", self.without(base, ("candidates",)),
+                                        "a decision without its candidate records")):
+                    with self.subTest(where=where, input=name):
+                        put(rec)
+                        doc, code = R.packet(f["path"], "acceptance")
+                        g = doc["checks"]["guards"]
+                        self.assertEqual(doc["checks"]["C1"], c1)
+                        if why is None:
+                            self.assertEqual((g["status"], code), ("pass", 0), g)
+                        else:
+                            self.assertEqual((g["status"], code), ("fail", 2))
+                            self.assertIn(why, g["reason"])
+                put(base)
+
     def test_T7_8_WP5_a_complete_bank_mode_schedule_passes_every_check(self):
-        """T7-8's complete schedule with bank-mode recovery_extra directories passes every check (exit 0): needs
-        recovery_extra.py's bank mode (v5 3.4)."""
-        d = os.path.join(self.base, "extra_wp5")
-        self.assertEqual(extra_prepare(d, self.gpath, self.refs, "--obs-model", "bank", "--bank", self.bank,
-                                       "--obs-tables", self.tables, "--allow-synthetic-bank", namespace=A1,
-                                       options="interp", scenarios="r1_034"), 0)
+        """T7-8 with recovery_extra's bank mode (v5 3.4, 3.8; WP4's carried test): complete() -- its four extra roles'
+        plans prepared with --obs-model bank (the registered fit, namespace A1) and their results -- passes `packet
+        --mode acceptance` through the command line: exit 0, every check pass, scope bank/D8, accepting, the UNRESOLVED
+        acceptance text. The identity check re-derives each extra plan with the schedule's OWN bank and tables
+        (recovery_extra.verified, through _extra_call): a schedule naming other tables (one array changed, re-hashed)
+        fails identity on every directory, each extra plan included ("changed"); an extra plan bound to another
+        observation model fails it on that directory; an extra result relabelled planning (body re-hashed) is
+        refused."""
+        f = self.complete()
+        for k in ("extra_interp", "extra_fwd_all", "extra_fwd_early", "extra_a"):
+            plan = X.read_frozen(f["dirs"][k]["dir"])
+            self.assertEqual((plan["noise_source"], plan["accepting"], plan["namespace"],
+                              plan["inputs"]["observation_model_sha256"]), ("bank_d8", True, A1, f["om_sha"]), k)
+        out = os.path.join(f["root"], "PACKET.json")
+        with mock.patch.object(R, "C2_MATRIX", self.TOY_C2), contextlib.redirect_stdout(io.StringIO()) as so:
+            self.assertEqual(R.main(["packet", "--mode", "acceptance", "--schedule", f["path"], "--out", out]), 0,
+                             so.getvalue())
+        p = rqlib.read_json(out)
+        self.assertEqual({k: c["status"] for k, c in p["checks"].items()},
+                         dict.fromkeys(("identity", "completeness", "numerical", "pairing", "guards", "C1"), "pass"),
+                         p["checks"])
+        self.assertEqual((p["scope"], p["accepting"], p["scientific_ACCEPTED"], p["exit"]),
+                         ("bank/D8", True, "UNRESOLVED (review required, D8:327)", 0))
+        self.assertEqual(p["checks"]["identity"]["directories"], len(f["entries"]))
+        self.assertGreaterEqual(p["checks"]["pairing"]["comparisons"], 3 + 4)    # (3 extra intact + 4 sensitivities)
+        import test_obslaw as TO
+        data, _ = TO._rehashed_tables(rqlib.read_bytes(f["tp"]), {"fit_A": lambda x: x + np.where(
+            np.arange(len(x)) == 9, 1e-9, 0.0)})
+        tp3 = os.path.join(f["root"], "t3.npz")
+        rqlib.write_durable(tp3, data)
+        with mock.patch.object(R, "C2_MATRIX", self.TOY_C2):
+            doc, code = R.packet(self.schedule(f["path"], f["entries"], f["om_sha"], f["bp"], tp3), "acceptance")
+        fails = doc["checks"]["identity"]["failures"]
+        self.assertEqual((code, doc["checks"]["identity"]["status"]), (2, "fail"))
+        for k in ("extra_interp", "extra_fwd_all", "extra_fwd_early", "extra_a"):
+            self.assertTrue(any(f["dirs"][k]["dir"].endswith(x.split(" (")[0]) and
+                                "graph, references, sources, runtime or frozen recipe changed" in x for x in fails),
+                            (k, fails))
+        self.assertTrue(any("primary (C1-primary)" in x and "re-derived" in x for x in fails), fails)
+        self.schedule(f["path"], f["entries"], f["om_sha"], f["bp"], f["tp"])
+        e = self.doctored(f, "ext_om", "extra_fwd_all",
+                          lambda p: p["inputs"].update(observation_model_sha256="0" * 64))
+        with mock.patch.object(R, "C2_MATRIX", self.TOY_C2):
+            doc, code = R.packet(self.schedule(f["path"], [x for x in f["entries"] if x["role"] != "extra-fwd_all"] +
+                                               [e], f["om_sha"], f["bp"], f["tp"]), "acceptance")
+        self.assertEqual(code, 2)
+        self.assertIn("ext_om (extra-fwd_all): its plan's observation model is not the scheduled one",
+                      doc["checks"]["identity"]["reason"])
+        self.schedule(f["path"], f["entries"], f["om_sha"], f["bp"], f["tp"])
+        fx = os.path.join(f["dirs"]["extra_interp"]["dir"], "results", "intact.r1_034.000.json")
+        rewrite_extra_result(fx, lambda r: r.update(noise_source="scenario_planning_only"))
+        with mock.patch.object(R, "C2_MATRIX", self.TOY_C2):
+            doc, code = R.packet(f["path"], "acceptance")
+        self.assertEqual((code, doc["checks"]["identity"]["status"]), (2, "fail"))
+        self.assertIn("a result of another noise source or observation model", doc["checks"]["identity"]["reason"])
+
+
+# ================================================================== the wrapper rec_A_v1 (A_design_v5 4.4; WP5)
+REC_A_SH = os.path.join(HERE, "rec_A_v1.sh")
+CRITERION_DRAFT = os.path.join(HERE, "..", "..", "docs", "redqueen_recovery_A", "CRITERION_rec_A_v1.draft.txt")
+
+
+def rec_a_fixture(root, schedule):
+    """A --test-fixture directory for rec_A_v1 (SYNTHETIC ONLY, never a real input): the toy graph; d8/ with an
+    accepted-form synthetic bank/3 (test_obslaw's placeholder values, synthetic false, so acceptance mode admits it)
+    whose inputs and receipt fields bind the placeholder provenance receipt, validation report and refit receipt written
+    beside it, its gamma-1 tables, a witness receipt naming the placeholder validation spec, a #68 conformance receipt
+    naming the bank artifact, and placeholders for the four bank inputs; placeholder authorities; the CRITERION draft;
+    the schedule spec -> (the directory, the bank artifact's sha256)."""
+    import rec_A_v1 as W
+    import test_graph as TG
+    fx = os.path.join(root, "fixture")
+    graph.write(toy(opponents=12), os.path.join(fx, "graph"))
+    d8 = os.path.join(fx, "d8")
+    os.makedirs(d8)
+
+    def put(name, data):
+        rqlib.write_durable(os.path.join(d8, name), data)
+        return hashlib.sha256(data).hexdigest()
+    pv = put(W.PROVENANCE, b'{"test": "a placeholder provenance receipt (synthetic)"}\n')
+    vr = put(W.VALIDATION_REPORT, b'{"test": "a placeholder validation report (synthetic)"}\n')
+    rc = put(W.BANK_RECEIPT, b'{"test": "a placeholder refit receipt (synthetic)"}\n')
+    spec = put(W.VALIDATION_SPEC, b'{"test": "a placeholder validation spec (synthetic)"}\n')
+    put(W.VALIDATION_WITNESS, f"synthetic witness of {spec}\n".encode())
+    for n in W.BANK_INPUTS:
+        put(n, f"a placeholder for {n} (synthetic, not the registered bytes)\n".encode())
+    doc = TG.bank_doc()
+    doc["inputs"].update(provenance_sha256=pv, validation_report_sha256=vr)
+    doc["fit"]["noise"].update(inputs_sha256=rqlib.canonical_sha(doc["inputs"]), receipt_sha256=rc)
+    bp, tp = TG.bank_files("rec_a_v1", doc)
+    shutil.copy(bp, os.path.join(d8, W.BANK_ARTIFACT))
+    shutil.copy(tp, os.path.join(d8, W.OBS_TABLES))
+    put(W.CONFORMANCE, f"synthetic #68 conformance of {rqlib.sha256_file(bp)}\n".encode())
+    auth = os.path.join(fx, "authority")
+    os.makedirs(auth)
+    for n in W.AUTHORITIES:
+        rqlib.write_durable(os.path.join(auth, n), f"a placeholder for {n}\n")
+    shutil.copy(CRITERION_DRAFT, os.path.join(fx, "CRITERION.txt"))
+    rqlib.write_json_durable(os.path.join(fx, "schedule.json"), schedule)
+    return fx, rqlib.sha256_file(bp)
+
+
+def procs_with(text):
+    """Live processes whose command line contains text -> [(pid, command line)]."""
+    out = []
+    for pid in os.listdir("/proc"):
+        if pid.isdigit() and int(pid) != os.getpid():
+            try:
+                with open(f"/proc/{pid}/cmdline", "rb") as f:
+                    cmd = f.read().replace(b"\0", b" ").decode("utf-8", "replace")
+            except OSError:
+                continue
+            if text in cmd:
+                out.append((int(pid), cmd))
+    return out
+
+
+@unittest.skipIf(np is None or not sys.platform.startswith("linux") or not shutil.which("nice")
+                 or not shutil.which("ps"), "numpy, Linux, nice and ps required")
+class TestRecAV1Wrapper(unittest.TestCase):
+    """The wrapper rec_A_v1.sh / rec_A_v1.py (A_design_v5 4.4; clarification 4 F1), end to end on the toy graph with a
+    synthetic accepted-form bank/3 through its test fixture (CI-sized; never a real input): measure, prepare, the
+    schedule and the freeze, the refusals, a run with 2 workers and its interruption, the acceptance packet."""
+    FAST = {"namespace": A1, "fit": {"ranks": 1, "lambdas": "0.05", "iters": 2, "start": "warm", "basis": 4},
+            "legacy": [dict(name="main", role="C1-primary", scenarios=["r1_034"], reps=1, options=["a", "fwd"],
+                            basis=4, embedding="shared", center="references"),
+                       dict(name="numerical_num_r1", role="numerical", scenarios=["num_r1"], reps=1, options=["a"],
+                            basis=4, embedding="shared", center="references")],
+            "extra": [dict(name="interp", role="extra-interp", options=["interp"], cases=["intact"],
+                           scenarios=["r1_034"], reps=1),
+                      dict(name="attrition", role="extra-attrition", options=["a", "fwd_all"], cases=["roots1"],
+                           scenarios=["r0"], reps=1)]}
+
+    def setUp(self):
+        import rec_A_v1 as W
+        self.W = W
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = self.tmp.name
+        self.prec = os.path.join(self.root, "P_REC")
+
+    def tearDown(self):
+        for pid, _ in procs_with(self.root):
+            with contextlib.suppress(OSError):
+                os.kill(pid, signal.SIGKILL)
+        for d, _, fs in os.walk(self.root):          # (the read-only copies: writable again for the cleanup)
+            for n in fs:
+                with contextlib.suppress(OSError):
+                    os.chmod(os.path.join(d, n), 0o600)
+        self.tmp.cleanup()
+
+    def wrap(self, *args, jobs="2", nice=True, env=None, background=False):
+        e = {k: v for k, v in os.environ.items() if k not in ("D8_DIR", "AUTHORITY_DIR", "CRITERION", "JOBS")}
+        e.update(P_REC=self.prec, JOBS=jobs, PY=sys.executable, RQ_REC_A_TEST_FIXTURE=self.fx, **(env or {}))
+        cmd = (["nice", "-n", "19"] if nice else []) + ["bash", REC_A_SH, *args]
+        if background:
+            return subprocess.Popen(cmd, env=e, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, text=True)
+        return subprocess.run(cmd, env=e, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=1800)
+
+    def expected_schedule(self, spec):
+        """clarification 4 F1's document, built here independently of the wrapper from the prepared directories."""
+        dirs, oms = [], set()
+        for x in spec["legacy"]:
+            cfg = rqlib.read_json(os.path.join(self.prec, "runs", x["name"], "config.json"))
+            oms.add(rqlib.canonical_sha(cfg["observation_model"]))
+            dirs.append({"dir": f"runs/{x['name']}", "kind": "legacy", "role": x["role"], "scenarios": x["scenarios"],
+                         "reps": x["reps"], "options": x["options"],
+                         "expected_config_sha256": rqlib.canonical_sha(cfg)})
+        for x in spec["extra"]:
+            plan = X.read_frozen(os.path.join(self.prec, "extra", x["name"]))
+            oms.add(plan["inputs"]["observation_model_sha256"])
+            dirs.append({"dir": f"extra/{x['name']}", "kind": "extra", "role": x["role"], "scenarios": x["scenarios"],
+                         "reps": x["reps"], "options": x["options"], "cases": x["cases"],
+                         "expected_plan_sha256": rqlib.canonical_sha(plan)})
+        self.assertEqual(len(oms), 1)
+        return {"schema": "finfolk.redqueen.recoveryschedule/1", "observation_model_sha256": oms.pop(),
+                "inputs": {"graph": "inputs/graph/graph.jsonl.gz", "references": None,
+                           "bank": "inputs/bank/bank_d8.json", "obs_tables": "inputs/bank/obs_tables.npz"},
+                "directories": dirs}
+
+    def frozen(self):
+        return dict(reversed(line.split("  ", 1)) for line in
+                    rqlib.read_text(os.path.join(self.prec, "FROZEN.sha256")).splitlines())
+
+    def test_rec_A_v1_end_to_end_measure_prepare_refusals_run_and_cleanup(self):
+        """v5 4.4 end to end (toy graph, synthetic accepted-form bank/3, the test fixture; 2 workers):
+        measure -- the measurement-only benchmark (r2_034, a and fwd, bank mode, namespace
+        rq2026-d8-recovery-A1-measure, the registered fit) records completion, timing, RSS and unresolved counts only; a
+        second benchmark is refused. prepare -- SCHEDULE.json is clarification 4 F1's document byte for byte (built
+        here independently, and recovery.py's own F1 parser accepts it); FROZEN.sha256 binds every v5 4.4 input (the
+        bank/D8 files as read-only copies of the fixture's bytes, the tool snapshot with obslaw, material, common,
+        noisescale and the ages fixture, the wrapper pair and the criterion, every configuration and plan, the
+        authorities, SCHEDULE.json) and the benchmark as measurement-only; every configuration and plan is bank mode
+        in namespace rq2026-d8-recovery-A1 and binds the fixture bank; measure after the freeze is refused. Refused:
+        JOBS 3 (the shell and the Python), the diagnostic mode (both), no nice 19 (where the test itself is not at nice
+        19), a second concurrent wrapper (the lock), run without PRIOR.receipt, a changed bound input, a
+        planning-mode configuration under P_REC. run -- interrupted by SIGTERM while a worker runs: exit 2, every
+        process of P_REC reaped (process-group cleanup), status.json written; resumed: every scheduled result written
+        in bank mode by commands that all carry --obs-model bank, the bank and the tables (never the synthetic-bank
+        flag), at --jobs 2 and one stage at a time, then the acceptance packet through recovery.py packet --mode
+        acceptance only, which refuses this toy schedule (not the frozen C2 matrix): exit 2, as it must."""
+        W = self.W
+        self.fx, bank_sha = rec_a_fixture(self.root, self.FAST)
+        cp = self.wrap("measure")
+        self.assertEqual(cp.returncode, 0, cp.stderr[-3000:])
+        m = rqlib.read_json(os.path.join(self.prec, "measure", "MEASUREMENT.json"))
+        self.assertEqual(sorted(m), sorted(["label", "namespace", "scenario", "options", "completed", "wall_s", "cpu_s",
+                                            "max_rss_kib", "unresolved_integration_pairs"]))
+        self.assertEqual((m["namespace"], m["scenario"], m["completed"]), (W.NS_MEASURE, "r2_034", True))
+        mcfg = rqlib.read_json(os.path.join(self.prec, "measure", "r2_034", "config.json"))
+        self.assertEqual((mcfg["namespace"], mcfg["observation_model"]["mode"], mcfg["ranks"], mcfg["iters"]),
+                         (W.NS_MEASURE, "bank", 4, 30))
+        cp = self.wrap("measure")
+        self.assertEqual(cp.returncode, 2)
+        self.assertIn("a single dataset", cp.stderr)
+        cp = self.wrap("prepare")
+        self.assertEqual(cp.returncode, 0, cp.stderr[-3000:])
+        self.assertIn("PREPARED, no recovery observations generated. Witness:", cp.stdout)
+        raw = rqlib.read_bytes(os.path.join(self.prec, "SCHEDULE.json"))
+        self.assertEqual(raw, rqlib.canonical(self.expected_schedule(self.FAST)))
+        entries = R._schedule_entries(json.loads(raw), self.prec)
+        self.assertEqual([e["role"] for e in entries], ["C1-primary", "numerical", "extra-interp", "extra-attrition"])
+        fz = self.frozen()
+        want = (["SCHEDULE.json", "MEASUREMENT_ONLY.sha256", "measure/MEASUREMENT.json", "measure/r2_034/config.json",
+                 "measure/r2_034/r2_034.000.json", "control/rec_A_v1.sh", "control/rec_A_v1.py",
+                 "control/CRITERION.txt", "runs/main/config.json", "runs/numerical_num_r1/config.json",
+                 "extra/interp/plan.json", "extra/interp/diagnostics.json", "extra/interp/FROZEN.sha256",
+                 "extra/attrition/plan.json", "tools/redqueen/fixtures/registered_ages.json", "inputs/provenance.json",
+                 "inputs/policy.json", "inputs/runtime_files.json", "inputs/graph/graph.jsonl.gz"]
+                + [f"tools/redqueen/{n}" for n in ("obslaw.py", "material.py", "common.py", "noisescale.py",
+                                                   "recovery.py", "recovery_extra.py", "map.py", "rec_A_v1.py")]
+                + [f"inputs/bank/{n}" for n in W.D8_FILES] + [f"authority/{n}" for n in W.AUTHORITIES])
+        for name in want:
+            with self.subTest(frozen=name):
+                self.assertIn(name, fz)
+                self.assertEqual(fz[name], rqlib.sha256_file(os.path.join(self.prec, name)))
+        for n in W.D8_FILES:
+            p = os.path.join(self.prec, "inputs", "bank", n)
+            self.assertEqual(rqlib.read_bytes(p), rqlib.read_bytes(os.path.join(self.fx, "d8", n)), n)
+            self.assertEqual(os.stat(p).st_mode & 0o777, 0o444, n)
+        self.assertIn("measure/r2_034/r2_034.000.json", rqlib.read_text(os.path.join(self.prec,
+                                                                                      "MEASUREMENT_ONLY.sha256")))
+        for x in self.FAST["legacy"]:
+            cfg = rqlib.read_json(os.path.join(self.prec, "runs", x["name"], "config.json"))
+            om = cfg["observation_model"]
+            self.assertEqual((cfg["namespace"], om["mode"], om["accepting"], om["bank_artifact_sha256"]),
+                             (A1, "bank", True, bank_sha), x["name"])
+        for x in self.FAST["extra"]:
+            plan = X.read_frozen(os.path.join(self.prec, "extra", x["name"]))
+            self.assertEqual((plan["namespace"], plan["noise_source"], plan["inputs"]["bank_artifact_sha256"]),
+                             (A1, "bank_d8", bank_sha), x["name"])
+        cp = self.wrap("measure")
+        self.assertEqual(cp.returncode, 2)
+        self.assertIn("precedes the freeze", cp.stderr)
+        # refusals before any run
+        refusals = [(("run",), dict(jobs="3"), "JOBS must be 1 or 2"),
+                    (("run", "--mode", "diagnostic"), {}, "takes the phase only"),
+                    (("run",), {}, "witness receipt")]
+        for args, kw, why in refusals:
+            with self.subTest(refusal=why):
+                cp = self.wrap(*args, **kw)
+                self.assertEqual(cp.returncode, 2, cp.stderr[-1500:])
+                self.assertIn(why, cp.stderr)
+        py = ["nice", "-n", "19", sys.executable, "-I", "-B", os.path.join(HERE, "rec_A_v1.py")]
+        for args, why in ((["run", "--root", self.prec, "--jobs", "3", "--test-fixture", self.fx], "at most 2"),
+                          (["run", "--root", self.prec, "--test-fixture", self.fx, "--mode", "diagnostic"],
+                           "never uses diagnostic mode")):
+            cp = subprocess.run(py + args, stdin=subprocess.DEVNULL, capture_output=True, text=True)
+            self.assertEqual(cp.returncode, 2, cp.stderr)
+            self.assertIn(why, cp.stderr)
+        if os.getpriority(os.PRIO_PROCESS, 0) != 19:
+            cp = self.wrap("run", nice=False)
+            self.assertEqual(cp.returncode, 2)
+            self.assertIn("Launch with nice -n 19", cp.stderr)
+        import fcntl
+        with open(os.path.join(self.prec, ".lock"), "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            cp = self.wrap("run")
+            fcntl.flock(lock, fcntl.LOCK_UN)
+        self.assertEqual(cp.returncode, 2)
+        self.assertIn("holds the P_REC lock", cp.stderr)
+        digest = rqlib.sha256_file(os.path.join(self.prec, "FROZEN.sha256"))
+        rqlib.write_durable(os.path.join(self.prec, "PRIOR.receipt"), f"synthetic witness of {digest}\n")
+        tables = os.path.join(self.prec, "inputs", "bank", "obs_tables.npz")
+        good = rqlib.read_bytes(tables)
+        os.chmod(tables, 0o600)
+        rqlib.write_durable(tables, good[:-1] + bytes([good[-1] ^ 1]))
+        cp = self.wrap("run")
+        self.assertEqual(cp.returncode, 2)
+        self.assertIn("frozen input changed: inputs/bank/obs_tables.npz", cp.stderr)
+        rqlib.write_durable(tables, good)
+        os.chmod(tables, 0o444)
+        stray = os.path.join(self.prec, "runs", "stray")
+        os.makedirs(stray)
+        cfg = rqlib.read_json(os.path.join(self.prec, "runs", "main", "config.json"))
+        cfg["observation_model"] = R.observation_model(argparse.Namespace(obs_model="planning"))
+        rqlib.write_durable(os.path.join(stray, "config.json"), rqlib.canonical(cfg))
+        cp = self.wrap("run")
+        self.assertEqual(cp.returncode, 2)
+        self.assertIn("runs/stray/config.json: a planning-mode or non-accepting configuration", cp.stderr)
+        shutil.rmtree(stray)
+        self.assertEqual(rqlib.read_json(os.path.join(self.prec, "status.json"))["exit"], 2)
+        # run, interrupted while a worker runs: every process under P_REC is reaped
+        p = self.wrap("run", background=True)
+        t0 = time.time()
+        while time.time() - t0 < 300 and not any(" one " in c for _, c in procs_with(self.prec)):
+            time.sleep(0.2)
+        self.assertTrue(any(" one " in c for _, c in procs_with(self.prec)), "no worker started")
+        p.send_signal(signal.SIGTERM)
+        out, err = p.communicate(timeout=120)
+        self.assertEqual(p.returncode, 2, err[-2000:])
+        self.assertIn("FAILED: signal 15", err)
+        time.sleep(0.5)
+        self.assertEqual(procs_with(self.prec), [])
+        self.assertEqual(rqlib.read_json(os.path.join(self.prec, "status.json"))["phase"], "run")
+        # resumed to the end: every result in bank mode, the commands, the packet (acceptance only)
+        cp = self.wrap("run")
+        self.assertEqual(cp.returncode, 2, cp.stderr[-3000:])
+        self.assertIn("the acceptance packet exits 2", cp.stderr)
+        for x in self.FAST["legacy"]:
+            for sc in x["scenarios"]:
+                r = rqlib.read_json(os.path.join(self.prec, "runs", x["name"], f"{sc}.000.json"))
+                self.assertEqual((r["noise_source"], r["observation_model_sha256"]),
+                                 ("bank_d8", json.loads(raw)["observation_model_sha256"]), x["name"])
+        for x in self.FAST["extra"]:
+            d = os.path.join(self.prec, "extra", x["name"])
+            self.assertEqual(len(X.read_results(d, X.read_frozen(d))), 1, x["name"])
+        cmds = [ln for ln in cp.stdout.splitlines() if " -I -B " in ln]
+        bank = ["--obs-model", "bank", "--bank", os.path.join(self.prec, "inputs", "bank", "bank_d8.json"),
+                "--obs-tables", os.path.join(self.prec, "inputs", "bank", "obs_tables.npz")]
+        stages = [shlex.split(c) for c in cmds if re.search(r"recovery(_extra)?\.py run ", c)]
+        self.assertEqual(len(stages), len(self.FAST["legacy"]) + len(self.FAST["extra"]))
+        for c in stages:
+            k = c.index("--obs-model")
+            self.assertEqual(c[k:k + 6], bank, c)
+            self.assertEqual(c[c.index("--jobs") + 1], "2", c)
+        self.assertNotIn("--allow-synthetic-bank", cp.stdout)
+        packets = [shlex.split(c) for c in cmds if "recovery.py packet" in c]
+        self.assertEqual(len(packets), 1)
+        self.assertEqual(packets[0][packets[0].index("--mode") + 1], "acceptance")
+        self.assertNotIn("diagnostic", cp.stdout)
+        attempt = rqlib.read_json(os.path.join(self.prec, "status.json"))["attempt"]
+        log = os.path.join(self.prec, "logs", f"{attempt}.packet.log")
+        self.assertIn("REFUSED before any check: --mode acceptance: the schedule is incomplete", rqlib.read_text(log))
+        self.assertTrue(os.path.isfile(os.path.join(self.prec, "ARTIFACTS.sha256")))
+
+    def test_rec_A_v1_run_produces_a_passing_acceptance_packet_on_a_complete_toy_matrix(self):
+        """The wrapper's run phase on a complete schedule (the toy version of the frozen C2 matrix that T7-8 uses: every
+        role, a C1-primary of r1_034 / r2_034 x 20, the four sensitivity variants, the registered fit): prepared by the
+        real wrapper, every result fabricated as complete() fabricates them (a real C1-primary of 40 registered fits is
+        not CI-sized, and C1's 16/20 is the data's), the witness installed; then run() -- every stage executes with
+        nothing left to compute -- produces the packet through exactly `recovery.py packet --mode acceptance
+        --schedule P_REC/SCHEDULE.json --out P_REC/acceptance.<attempt>.json` (the toy C2 matrix substituted in that
+        child alone, as T7-8 substitutes it in process): exit 0, every check pass, so run returns normally."""
+        W = self.W
+        TP = TestRecoveryBankPacket
+        surface = {"basis": 6, "embedding": "shared", "center": "references"}
+        legacy = [dict(name="primary", role="C1-primary", scenarios=list(TP.C1S), reps=20, options=["a", "fwd"],
+                       **surface),
+                  dict(name="stress", role="stress", scenarios=["r0_asym"], reps=1, options=["a", "fwd"], **surface),
+                  dict(name="numerical", role="numerical", scenarios=["num_r1"], reps=1, options=["a"], **surface)]
+        legacy += [dict(name=v, role="sensitivity", scenarios=list(TP.C1S), reps=20, options=["a", "fwd"],
+                        **dict(surface, **kw)) for v, kw in TP.VARIANTS]
+        extra = [dict(name=op, role=f"extra-{op}", options=[op], cases=["intact"], scenarios=["r1_034"], reps=1)
+                 for op in ("interp", "fwd_all", "fwd_early")]
+        extra.append(dict(name="attrition", role="extra-attrition", options=["a"], cases=["roots0"], scenarios=["r0"],
+                          reps=1))
+        spec = {"namespace": A1, "legacy": legacy, "extra": extra}
+        self.fx, _ = rec_a_fixture(self.root, spec)
+        cp = self.wrap("prepare")
+        self.assertEqual(cp.returncode, 0, cp.stderr[-3000:])
+        for x in legacy:
+            d = os.path.join(self.prec, "runs", x["name"])
+            cfg = rqlib.read_json(os.path.join(d, "config.json"))
+            for sc in x["scenarios"]:
+                for rep in range(x["reps"]):
+                    win = x["role"] != "C1-primary" or rep < (16 if sc == "r1_034" else 17)
+                    write_result(d, fabricated(cfg, sc, rep, success=win, options=x["options"]))
+        for x in extra:
+            fabricated_extra(os.path.join(self.prec, "extra", x["name"]), x["cases"][0], x["scenarios"][0], 0)
+        digest = rqlib.sha256_file(os.path.join(self.prec, "FROZEN.sha256"))
+        rqlib.write_durable(os.path.join(self.prec, "PRIOR.receipt"), f"synthetic witness of {digest}\n")
+        toy_c2 = {r: [{k: list(v) if isinstance(v, tuple) else v for k, v in b.items()} for b in bl]
+                  for r, bl in TP.TOY_C2.items()}
+        shim = ("import json, sys\nsys.path.insert(0, sys.argv[1])\nimport recovery\n"
+                "recovery.C2_MATRIX = json.loads(sys.argv[2])\nsys.exit(recovery.main(sys.argv[3:]))\n")
+        real, seen = W.call, []
+
+        def call(args, label, check=True):
+            if label == "packet":
+                args = [str(x) for x in args]
+                seen.append(args)
+                return real(["-c", shim, os.path.dirname(args[0]), json.dumps(toy_c2), *args[1:]], label, check)
+            return real(args, label, check)
+        W.configure(argparse.Namespace(root=self.prec, jobs=2, d8=None, authority=None, criterion=None,
+                                       test_fixture=self.fx))
+        with mock.patch.object(W, "call", call), contextlib.redirect_stdout(io.StringIO()):
+            W.run()
+        tools = os.path.join(self.prec, "tools", "redqueen")
+        out = os.path.join(self.prec, f"acceptance.{W.STAMP}.json")
+        self.assertEqual(seen, [[os.path.join(tools, "recovery.py"), "packet", "--mode", "acceptance", "--schedule",
+                                 os.path.join(self.prec, "SCHEDULE.json"), "--out", out]])
+        p = rqlib.read_json(out)
+        self.assertEqual({k: c["status"] for k, c in p["checks"].items()},
+                         dict.fromkeys(("identity", "completeness", "numerical", "pairing", "guards", "C1"), "pass"),
+                         p["checks"])
+        self.assertEqual((p["mode"], p["scope"], p["accepting"], p["exit"]), ("acceptance", "bank/D8", True, 0))
+        self.assertEqual({s: v["successes"] for s, v in p["checks"]["C1"]["scenarios"].items()},
+                         {"r1_034": 16, "r2_034": 17})
 
 
 if __name__ == "__main__":
