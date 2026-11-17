@@ -3740,6 +3740,60 @@ def procs_with(text):
     return out
 
 
+def group_members(pgid):
+    """The processes of process group pgid, zombies included (/proc/<pid>/stat's pgrp field) -> [pid]."""
+    out = []
+    for pid in os.listdir("/proc"):
+        if pid.isdigit():
+            try:
+                with open(f"/proc/{pid}/stat") as f:
+                    fields = f.read().rsplit(")", 1)[1].split()
+            except (OSError, IndexError):
+                continue
+            if int(fields[2]) == pgid:
+                out.append(int(pid))
+    return out
+
+
+def toy_production(root):
+    """A toy production study for rec_A_v1.production_inputs (SYNTHETIC ONLY: toy registry, reservation, bank-plan and
+    fork metadata, never a real input) -> (PROD, BANK, the registry's sha256, the registry). PROD/config: a 64-world
+    registry (worlds.register on test_worlds' toy arena, the registered 64 layout, one toy avoidance file; its namespace
+    FIELD relabelled to the literal production_inputs checks, while its seeds and uuids stay the toy namespace's), its
+    verification record and two placeholders; PROD/reservations: one seed-named toy reservation; BANK/config: an empty
+    avoidance provenance, an 18,432-row plan of toy seeds outside the registry's, two placeholders. No PROD/graph and
+    no PROD/config/forks.json: the graph is built and the forks registered inside P_REC (the intended, unpublished
+    production graph's path)."""
+    import worlds
+    from test_worlds import ARENA
+    prod, bank = os.path.join(root, "prod"), os.path.join(root, "bank")
+    for d in (os.path.join(prod, "config"), os.path.join(prod, "reservations"), os.path.join(bank, "config"),
+              os.path.join(root, "registry_avoid")):
+        os.makedirs(d)
+    arena, avoid = os.path.join(root, "arena.json"), os.path.join(root, "registry_avoid", "toy.avoid.json")
+    rqlib.write_json_durable(arena, ARENA)
+    rqlib.write_json_durable(avoid, {"seeds": [5]})
+    reg = worlds.register(arena, "toy-rec-a-inventory", per_block=worlds.LAYOUTS["64"], avoid_paths=[avoid],
+                          layout="64")
+    reg["namespace"] = "finfolk-rq-production-2026-11-d6d7-v1"
+    wpath = os.path.join(prod, "config", "worlds.json")
+    rqlib.write_durable(wpath, rqlib.canonical(reg))
+    regsha = rqlib.sha256_file(wpath)
+    rqlib.write_json_durable(os.path.join(prod, "config", "registry.verify.json"),
+                             {"ok": True, "registry_sha256": regsha})
+    for n in ("reservation_sources.json", "arena.selected.json"):
+        rqlib.write_json_durable(os.path.join(prod, "config", n), {"test": f"a placeholder {n} (synthetic)"})
+    rqlib.write_json_durable(os.path.join(prod, "reservations", "toy.seeds.json"), {"seeds": [7]})
+    rqlib.write_json_durable(os.path.join(bank, "config", "production_avoid_sources.json"), [])
+    hist = {s for x in reg["reserved"] for s in x["seeds"]}
+    seeds = [s for s in range(1_000_000, 1_100_000) if s not in hist][:18432]
+    rqlib.write_durable(os.path.join(bank, "config", "bank.plan.jsonl"), "".join(
+        json.dumps({"schema": "finfolk.redqueen.plan/2", "seed": s}) + "\n" for s in seeds))
+    for n in ("bank.design.json", "readiness.json"):
+        rqlib.write_json_durable(os.path.join(bank, "config", n), {"test": f"a placeholder {n} (synthetic)"})
+    return prod, bank, regsha, reg
+
+
 @unittest.skipIf(np is None or not sys.platform.startswith("linux") or not shutil.which("nice")
                  or not shutil.which("ps"), "numpy, Linux, nice and ps required")
 class TestRecAV1Wrapper(unittest.TestCase):
@@ -3773,9 +3827,12 @@ class TestRecAV1Wrapper(unittest.TestCase):
                     os.chmod(os.path.join(d, n), 0o600)
         self.tmp.cleanup()
 
-    def wrap(self, *args, jobs="2", nice=True, env=None, background=False):
-        e = {k: v for k, v in os.environ.items() if k not in ("D8_DIR", "AUTHORITY_DIR", "CRITERION", "JOBS")}
-        e.update(P_REC=self.prec, JOBS=jobs, PY=sys.executable, RQ_REC_A_TEST_FIXTURE=self.fx, **(env or {}))
+    def wrap(self, *args, jobs="2", nice=True, env=None, background=False, fixture=True):
+        e = {k: v for k, v in os.environ.items() if k not in ("D8_DIR", "AUTHORITY_DIR", "CRITERION", "JOBS",
+                                                                "RQ_REC_A_TEST_FIXTURE", "EXTRA_AVOID")}
+        e.update(P_REC=self.prec, JOBS=jobs, PY=sys.executable, **(env or {}))
+        if fixture:             # (fixture False: a production-mode invocation of a test root, refused by its mode)
+            e["RQ_REC_A_TEST_FIXTURE"] = self.fx
         cmd = (["nice", "-n", "19"] if nice else []) + ["bash", REC_A_SH, *args]
         if background:
             return subprocess.Popen(cmd, env=e, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
@@ -4034,6 +4091,354 @@ class TestRecAV1Wrapper(unittest.TestCase):
         self.assertEqual((p["mode"], p["scope"], p["accepting"], p["exit"]), ("acceptance", "bank/D8", True, 0))
         self.assertEqual({s: v["successes"] for s, v in p["checks"]["C1"]["scenarios"].items()},
                          {"r1_034": 16, "r2_034": 17})
+
+    # ---------------------------------------------------------------- WP5 fix round 2 (Codex revWP5 at 9ce0f61)
+    def witness(self):
+        digest = rqlib.sha256_file(os.path.join(self.prec, "FROZEN.sha256"))
+        rqlib.write_durable(os.path.join(self.prec, "PRIOR.receipt"), f"synthetic witness of {digest}\n")
+
+    def refreeze(self, name, data):
+        """Replace one frozen file of the prepared root by data, re-freeze FROZEN.sha256's entry and re-witness it
+        (what a prepare of other inputs would have frozen)."""
+        p = os.path.join(self.prec, name)
+        os.chmod(p, 0o600)
+        rqlib.write_durable(p, data)
+        fz = os.path.join(self.prec, "FROZEN.sha256")
+        lines = [f"{hashlib.sha256(data).hexdigest()}  {name}" if ln.split("  ", 1)[1] == name else ln
+                 for ln in rqlib.read_text(fz).splitlines()]
+        rqlib.write_durable(fz, "".join(ln + "\n" for ln in lines))
+        self.witness()
+
+    def test_rec_A_v1_production_inventory_restores_extra_avoid_on_a_toy_registry(self):
+        """Codex WP5 P2-W5-1 and the line-by-line recheck of production_inputs against rec_C_v2.py, in process on a toy
+        production study (toy_production: SYNTHETIC registry, reservation, bank-plan and fork metadata, never a real
+        input; PROD, BANK and REGSHA pointed at it). EXTRA_AVOID (rec_C_v2.py:120-130): a listed file that is missing
+        is refused; a listed reservation holding a proposed fork seed is refused by the fork registration, and one
+        holding an actual production fork's seed, a history seed or an unrelated bank seed by the collision checks; a
+        valid list is copied (inputs/extra_avoid.list), its file copied into inputs/reservations/ as a collision path,
+        checked (avoid_checks.json), passed to forks.register and bound by FROZEN.sha256's manifest. In fixture mode
+        EXTRA_AVOID is refused. The recheck's other restorations: the planning fork registry is re-derived by a second
+        inventory and the planning graph even when a copy is already in P_REC (a changed copy is refused, as
+        rec_C_v2's unconditional register through same() and build through graph.py's write refused it), and a
+        reserved slot without exactly nine seeds is refused (rec_C_v2.py:157)."""
+        import forks
+        from pathlib import Path
+        W = self.W
+        prod, bank, regsha, reg = toy_production(self.root)
+        hist = {s for x in reg["reserved"] for s in x["seeds"]}
+        stamps = iter(range(1000))
+
+        def inventory(name, extra=None, **patch):
+            """production_inputs into P_REC.<name> with EXTRA_AVOID = extra (unset: None) -> the root."""
+            root = os.path.realpath(os.path.join(self.root, f"P_REC.{name}"))
+            for d in ("logs", "timing"):
+                os.makedirs(os.path.join(root, d), exist_ok=True)
+            W.configure(argparse.Namespace(root=root, jobs=2, d8=None, authority=None, criterion=None,
+                                           test_fixture=None))
+            kw = dict(PROD=Path(prod), BANK=Path(bank), REGSHA=regsha, T=Path(HERE), STAMP=f"inv{next(stamps)}")
+            kw.update(patch)
+            with mock.patch.multiple(W, **kw), mock.patch.dict(os.environ, {"EXTRA_AVOID": extra or ""}), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                W.production_inputs()
+            return root
+
+        def reservation(name, seeds):
+            p = os.path.join(self.root, "extra", f"{name}.seeds.json")
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            rqlib.write_json_durable(p, {"seeds": sorted(seeds)})
+            return p
+
+        def listing(name, *files):
+            p = os.path.join(self.root, f"{name}.extra_avoid.list")
+            rqlib.write_durable(p, "".join(f"{f}\n" for f in files) + "\n")      # (a blank line is skipped)
+            return p
+        base = inventory("base")                     # (no EXTRA_AVOID: the planning forks this study proposes)
+        fork_seed = rqlib.read_json(os.path.join(base, "inputs/study/config/forks.json"))["worlds"][0]["origin"]["seed"]
+        bank_seed = json.loads(rqlib.read_text(os.path.join(bank, "config", "bank.plan.jsonl")).splitlines()[0])["seed"]
+        self.assertNotIn(fork_seed, hist)
+        fork_file = reservation("fork_collision", {fork_seed})
+        cases = [("a listed file that is missing", [os.path.join(self.root, "extra", "absent.seeds.json")],
+                  RuntimeError, "EXTRA_AVOID lists a missing reservation file: .*/extra/absent.seeds.json"),
+                 ("a reserved seed colliding with a proposed fork seed", [fork_file], forks.ForkError,
+                  rf"\({fork_seed}\) is a seed reserved in "
+                  r".*/inputs/reservations/\d{3}\.fork_collision\.seeds\.json"),
+                 ("a history seed", [reservation("history_collision", {min(hist)})], AssertionError,
+                  r"history shares avoidance seeds: .*/inputs/reservations/\d{3}\.history_collision\.seeds\.json"),
+                 ("an unrelated bank seed", [reservation("bank_collision", {bank_seed})], RuntimeError,
+                  r"bank shares unrelated avoidance seeds: .*/inputs/reservations/\d{3}\.bank_collision\.seeds\.json")]
+        for i, (case, files, exc, why) in enumerate(cases):
+            with self.subTest(extra_avoid=f"{case}: refused"):
+                with self.assertRaisesRegex(exc, why):
+                    inventory(f"refused{i}", listing(f"refused{i}", *files))
+        with self.subTest(extra_avoid="a reserved seed colliding with an actual production fork's seed: refused"):
+            shutil.copy(os.path.join(base, "inputs/study/config/forks.json"),
+                        os.path.join(prod, "config", "forks.json"))
+            try:
+                with self.assertRaisesRegex(AssertionError, r"/inputs/reservations/\d{3}\.fork_collision\.seeds\.json"):
+                    inventory("actual", listing("actual", fork_file))
+            finally:
+                os.remove(os.path.join(prod, "config", "forks.json"))
+        ok = reservation("extra_ok", {11, 13})
+        lst = listing("valid", ok)
+        with self.subTest(extra_avoid="a valid list: copied, checked, passed to forks.register, frozen"):
+            seen, real = [], forks.register
+
+            def spy(*a, **k):
+                seen.append(list(k.get("avoid_paths", ())))
+                return real(*a, **k)
+            with mock.patch.object(forks, "register", spy):
+                root = inventory("valid", lst)
+            self.assertTrue(os.path.isfile(os.path.join(root, "inputs", "extra_avoid.list")),
+                            "EXTRA_AVOID's list is not copied into P_REC")
+            self.assertEqual(rqlib.read_bytes(os.path.join(root, "inputs", "extra_avoid.list")), rqlib.read_bytes(lst))
+            copies = [n for n in sorted(os.listdir(os.path.join(root, "inputs", "reservations")))
+                      if n.endswith(".extra_ok.seeds.json")]
+            self.assertEqual(len(copies), 1, copies)
+            cpath = os.path.join(root, "inputs", "reservations", copies[0])
+            self.assertEqual(rqlib.read_bytes(cpath), rqlib.read_bytes(ok))
+            self.assertIn(cpath, rqlib.read_json(os.path.join(root, "inputs", "avoid_paths.json")))
+            self.assertIn(cpath, [x["path"] for x in rqlib.read_json(os.path.join(root, "inputs",
+                                                                                     "avoid_checks.json"))["files"]])
+            self.assertEqual(len(seen), 1)
+            self.assertIn(cpath, seen[0])
+            fz = dict(reversed(ln.split("  ", 1)) for ln in W.frozen_manifest().decode().splitlines())
+            for name in ("inputs/extra_avoid.list", f"inputs/reservations/{copies[0]}"):
+                self.assertEqual(fz.get(name), rqlib.sha256_file(os.path.join(root, name)), name)
+        with self.subTest(recheck="the planning fork registry is re-derived by a second inventory"):
+            p = os.path.join(self.root, "P_REC.valid", "inputs/study/config/forks.json")
+            good = rqlib.read_bytes(p)
+            rqlib.write_durable(p, rqlib.canonical(dict(json.loads(good), doctored=True)))
+            try:
+                with self.assertRaisesRegex(RuntimeError,
+                                            r"conflicting immutable bytes: .*/inputs/study/config/forks\.json"):
+                    inventory("valid", lst)
+            finally:
+                rqlib.write_durable(p, good)
+        with self.subTest(recheck="the planning graph is re-derived, never trusted (a changed copy in P_REC before the "
+                                  "first inventory)"):
+            src = os.path.join(self.root, "P_REC.valid", "inputs", "graph")
+            dst = os.path.join(self.root, "P_REC.planted", "inputs", "graph")
+            os.makedirs(dst)
+            shutil.copy(os.path.join(src, "graph.jsonl.gz"), dst)
+            meta = rqlib.read_json(os.path.join(src, "graph.meta.json"))
+            rqlib.write_durable(os.path.join(dst, "graph.meta.json"), rqlib.canonical(dict(meta, doctored=True)))
+            with self.assertRaisesRegex(RuntimeError, "graph-build: exit 2"):
+                inventory("planted", lst)
+        with self.subTest(recheck="a reserved slot without exactly nine seeds: refused"):
+            bad = copy.deepcopy(reg)
+            bad["reserved"][0]["seeds"].append(bad["reserved"][1]["seeds"].pop())    # (10 and 8: still 576 seeds)
+            prod9 = os.path.join(self.root, "prod9")
+            shutil.copytree(prod, prod9)
+            rqlib.write_durable(os.path.join(prod9, "config", "worlds.json"), rqlib.canonical(bad))
+            sha9 = rqlib.sha256_file(os.path.join(prod9, "config", "worlds.json"))
+            rqlib.write_json_durable(os.path.join(prod9, "config", "registry.verify.json"),
+                                     {"ok": True, "registry_sha256": sha9})
+            with self.assertRaisesRegex(AssertionError, "nine seeds"):
+                inventory("nine", PROD=Path(prod9), REGSHA=sha9)
+        with self.subTest(extra_avoid="fixture mode: refused (the fixture has no study inventory)"):
+            root = os.path.join(self.root, "P_REC.fixture")
+            W.configure(argparse.Namespace(root=root, jobs=2, d8=None, authority=None, criterion=None,
+                                           test_fixture=os.path.join(self.root, "no-fixture")))
+            with mock.patch.dict(os.environ, {"EXTRA_AVOID": lst}), contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaisesRegex(RuntimeError, "EXTRA_AVOID is a production study input"):
+                    W.all_inputs(freeze=False)
+            self.assertFalse(os.path.exists(os.path.join(root, "inputs")))
+
+    def test_rec_A_v1_a_killed_supervisor_s_group_is_gone_before_the_lock_is_released(self):
+        """Codex WP5 P2-W5-2 (toy graph, synthetic accepted-form bank/3, the test fixture; CI-sized): the legacy
+        `recovery.py run` SUPERVISOR is killed alone (SIGKILL) while its two workers fit. The wrapper's run exits 2,
+        and at the moment it releases P_REC/.lock (polled) no process of the supervisor's group remains (on 9ce0f61
+        the wrapper dropped the supervisor from its cleanup after wait4 and unlocked with the workers still fitting).
+        Resumed, the run completes every scheduled dataset with at most 2 workers at any time and none of the old
+        group, then reaches the acceptance packet, which refuses this toy schedule (as in the end-to-end test)."""
+        import fcntl
+        spec = {"namespace": A1, "fit": {"ranks": 2, "lambdas": "0.02,0.05,0.2", "iters": 20, "start": "both",
+                                         "basis": 4},
+                "legacy": [dict(name="main", role="C1-primary", scenarios=["r1_034"], reps=2, options=["a", "fwd"],
+                                basis=4, embedding="shared", center="references")],
+                "extra": []}
+        self.fx, _ = rec_a_fixture(self.root, spec)
+        cp = self.wrap("prepare")
+        self.assertEqual(cp.returncode, 0, cp.stderr[-3000:])
+        self.witness()
+
+        def pgid(pid):
+            try:
+                return os.getpgid(pid)
+            except ProcessLookupError:
+                return None
+        p = self.wrap("run", background=True)
+        sup, t0 = None, time.time()
+        while sup is None and time.time() - t0 < 300 and p.poll() is None:
+            procs = procs_with(self.prec)
+            for s in [pid for pid, c in procs if "recovery.py run " in c]:
+                if sum("recovery.py one " in c and pgid(pid) == s for pid, c in procs) == 2:
+                    sup = s
+            time.sleep(0.05)
+        self.assertIsNotNone(sup, "no legacy supervisor with two workers")
+        time.sleep(1.0)                                   # (both workers fitting)
+        workers = [pid for pid in group_members(sup) if pid != sup]
+        self.assertEqual(len(workers), 2, workers)
+        os.kill(sup, signal.SIGKILL)
+        with open(os.path.join(self.prec, ".lock"), "a") as lock:
+            deadline = time.time() + 120
+            while True:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    self.assertLess(time.time(), deadline, "the wrapper never released its lock")
+                    time.sleep(0.01)
+            survivors = group_members(sup)                # (the instant the lock is free)
+            fcntl.flock(lock, fcntl.LOCK_UN)
+        out, err = p.communicate(timeout=120)
+        self.assertEqual(survivors, [], f"processes of the killed supervisor's group outlived the wrapper's lock: "
+                                        f"{survivors} (its workers {workers})")
+        self.assertEqual(p.returncode, 2, err[-2000:])
+        self.assertIn("legacy-main: exit -9; the rest of its process group stopped", err)
+        q = self.wrap("run", background=True)
+        peak, stray = 0, set()
+        while q.poll() is None:
+            peak = max(peak, sum("recovery.py one " in c for _, c in procs_with(self.prec)))
+            stray.update(group_members(sup))
+            time.sleep(0.05)
+        out, err = q.communicate(timeout=120)
+        self.assertEqual(q.returncode, 2, err[-3000:])
+        self.assertIn("the acceptance packet exits 2", err)
+        self.assertEqual(stray, set())
+        self.assertLessEqual(peak, 2)
+        for rep in range(2):
+            r = rqlib.read_json(os.path.join(self.prec, "runs", "main", f"r1_034.{rep:03d}.json"))
+            self.assertEqual(r["noise_source"], "bank_d8")
+
+    def test_rec_A_v1_a_signal_between_spawn_and_tracking_still_stops_the_child(self):
+        """Codex WP5 P2-W5-2, the spawn gap (in process, the wrapper's TERM handler installed): TERM sent after Popen
+        has started the child but before call() tracks it (injected through subprocess.Popen) is delivered once the
+        child is in CHILDREN, so the cleanup stops and reaps it (on 9ce0f61 the interrupt left an untracked child
+        running). The child itself starts with TERM and INT unblocked (the wrapper's own mask, restored before exec)."""
+        W = self.W
+        for d in ("logs", "timing"):
+            os.makedirs(os.path.join(self.prec, d))
+        W.configure(argparse.Namespace(root=self.prec, jobs=2, d8=None, authority=None, criterion=None,
+                                       test_fixture=None))
+        real, spawned = subprocess.Popen, []
+
+        def popen(*a, **k):
+            child = real(*a, **k)
+            spawned.append(child)
+            os.kill(os.getpid(), signal.SIGTERM)          # (between the spawn and the tracking)
+            return child
+        status = os.path.join(self.root, "child.status")
+        previous = signal.signal(signal.SIGTERM, W.interrupted)
+        try:
+            with mock.patch.object(W.subprocess, "Popen", popen), contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaisesRegex(KeyboardInterrupt, "signal 15"):
+                    W.call(["-c", "import time; time.sleep(120)", self.root], "gap")
+            self.assertEqual(len(spawned), 1)
+            left = W.stop_children()
+            self.assertEqual(group_members(spawned[0].pid), [], "the untracked child still runs")
+            self.assertEqual((left, spawned[0].returncode), ([], -signal.SIGTERM))
+            with contextlib.redirect_stdout(io.StringIO()):
+                W.call(["-c", "import sys; open(sys.argv[1], 'w').write(open('/proc/self/status').read())", status],
+                       "mask")
+        finally:
+            signal.signal(signal.SIGTERM, previous)
+        blocked = int(next(ln.split()[1] for ln in rqlib.read_text(status).splitlines() if ln.startswith("SigBlk:")),
+                      16)
+        self.assertEqual(blocked & (1 << (signal.SIGTERM - 1) | 1 << (signal.SIGINT - 1)), 0, f"SigBlk {blocked:x}")
+
+    def test_rec_A_v1_measurement_reports_the_branch_test_integrations_apart(self):
+        """Codex WP5 P3-W5-1: MEASUREMENT.json's unresolved-integration counts report each forward branch's test
+        comparison (its integration records stored under the branch, recovery.py forward_procedure, not among the
+        candidates') apart from the candidates' records, labelled. The real measure() on the fixture, in process (FIT at
+        the toy settings), whose benchmark dataset is produced by the real `recovery.py one` with ONE forward test
+        comparison unresolved exactly as the registered map records one (grid_unresolved in the intersection branch's
+        selected and rank-0 integration records) and every validation resolved: on 9ce0f61 it reported fwd 0."""
+        W = self.W
+        self.fx, _ = rec_a_fixture(self.root, self.FAST)
+        for d in ("logs", "timing"):
+            os.makedirs(os.path.join(self.prec, d))
+        W.configure(argparse.Namespace(root=self.prec, jobs=1, d8=None, authority=None, criterion=None,
+                                       test_fixture=self.fx))
+        shim = ("import sys\nsys.path.insert(0, sys.argv[1])\nimport numpy as np\nimport recovery as R\n"
+                "real = R.scorer\n\n\ndef flagged(D, *a, **k):\n    score = real(D, *a, **k)\n\n"
+                "    def wrapped(ix, info=None):\n        out = score(ix, info)\n"
+                "        if info is not None and np.array_equal(ix, D.forward['tests']['intersection']):\n"
+                "            info['grid_unresolved'] = info.get('grid_unresolved', 0) + 1\n"
+                "        return out\n    return wrapped\n\n\nR.scorer = flagged\nsys.exit(R.main(sys.argv[2:]))\n")
+        real, seen = W.call, []
+
+        def call(args, label, check=True):
+            if label != "measure-r2_034":
+                return real(args, label, check)
+            a = [str(x) for x in args]
+            seen.append(a)
+            kv = dict(zip(a[2::2], a[3::2]))          # (run's flags -> one's, as recovery.py run builds a worker)
+            out = kv.pop("--out")
+            del kv["--jobs"], kv["--reps"]
+            kv.update({"--scenario": kv.pop("--scenarios"), "--rep": "0", "--ab-cap": "-1",
+                       "--out": os.path.join(out, "r2_034.000.json")})
+            return real(["-c", shim, os.path.dirname(a[0]), "one", *(x for item in kv.items() for x in item)], label,
+                        check)
+        fit = {"ranks": 1, "lambdas": "0.05", "iters": 2, "start": "warm"}
+        with mock.patch.object(W, "call", call), mock.patch.object(W, "FIT", fit), \
+                contextlib.redirect_stdout(io.StringIO()):
+            W.measure()
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0][1], "run")
+        rec = rqlib.read_json(os.path.join(self.prec, "measure", "r2_034", "r2_034.000.json"))
+        fwd = rec["options"]["fwd"]
+        flags = {o: sum(int((c["integration"].get(s) or {}).get("grid_unresolved", 0))
+                        for c in rec["options"][o]["candidates"] for s in ("validation", "test")) for o in ("a", "fwd")}
+        self.assertEqual(flags, {"a": 0, "fwd": 0})       # (every validation resolved: the branch alone is unresolved)
+        self.assertFalse(fwd["intersection"]["available"])
+        self.assertTrue(fwd["intersection"]["integration_unresolved"] > 0)
+        u = rqlib.read_json(os.path.join(self.prec, "measure", "MEASUREMENT.json"))["unresolved_integration_pairs"]
+        self.assertIn("branch_tests", u, f"the forward branch's unresolved test comparison is not counted: {u}")
+        self.assertEqual(u["candidates"], flags)
+        self.assertEqual(u["branch_tests"]["a"], {})
+        self.assertEqual(u["branch_tests"]["fwd"], {
+            b: {k: int(fwd[b]["integration"][k].get("grid_unresolved", 0)) for k in ("selected", "rank0")}
+            for b in ("forward_transfer", "intersection")})
+        self.assertEqual(u["branch_tests"]["fwd"]["intersection"], {"selected": 1, "rank0": 1})
+        self.assertEqual(u["branch_tests"]["fwd"]["forward_transfer"], {"selected": 0, "rank0": 0})
+        self.assertIn("not summed", u["label"])
+
+    def test_rec_A_v1_the_frozen_mode_binds_run_and_resume(self):
+        """Codex WP5 P3-W5-2 (toy graph, synthetic accepted-form bank/3, the test fixture): prepare records the mode
+        (inputs/mode.json, bound in FROZEN.sha256), and a run of the other mode is refused in both directions -- the
+        fixture-frozen root run without --test-fixture, and a production-frozen root (the mode record a production
+        prepare writes, re-frozen and re-witnessed) run with --test-fixture, whose resource preflight 9ce0f61 skipped
+        without a toy graph; a fixture-frozen root whose frozen graph is not a recovery toy is refused before the
+        preflight is skipped. No result is written."""
+        spec = {"namespace": A1, "fit": self.FAST["fit"],
+                "legacy": [dict(name="main", role="C1-primary", scenarios=["r1_034"], reps=1, options=["a"], basis=4,
+                                embedding="shared", center="references")],
+                "extra": []}
+        self.fx, _ = rec_a_fixture(self.root, spec)
+        cp = self.wrap("prepare")
+        self.assertEqual(cp.returncode, 0, cp.stderr[-3000:])
+        self.witness()
+        cp = self.wrap("run", fixture=False)
+        self.assertEqual(cp.returncode, 2, cp.stderr[-2000:])
+        self.assertIn("P_REC was frozen in fixture mode and this invocation is production mode", cp.stderr)
+        mode = os.path.join(self.prec, "inputs", "mode.json")
+        self.assertIn("inputs/mode.json", self.frozen())
+        self.assertEqual(rqlib.read_json(mode), {"mode": "fixture"})
+        fixture_bytes = rqlib.read_bytes(mode)
+        production = (json.dumps({"mode": "production"}, sort_keys=True, indent=2) + "\n").encode()
+        self.refreeze("inputs/mode.json", production)
+        cp = self.wrap("run")
+        self.assertEqual(cp.returncode, 2, cp.stderr[-2000:])
+        self.assertIn("P_REC was frozen in production mode and this invocation is fixture mode", cp.stderr)
+        self.refreeze("inputs/mode.json", fixture_bytes)
+        meta = rqlib.read_json(os.path.join(self.prec, "inputs", "graph", "graph.meta.json"))
+        self.assertTrue(meta.pop("recovery_toy"))
+        self.refreeze("inputs/graph/graph.meta.json", rqlib.canonical(meta))
+        cp = self.wrap("run")
+        self.assertEqual(cp.returncode, 2, cp.stderr[-2000:])
+        self.assertIn("a fixture-frozen root must hold a recovery toy graph", cp.stderr)
+        self.assertEqual([n for n in os.listdir(os.path.join(self.prec, "runs", "main")) if n != "config.json"], [])
 
 
 if __name__ == "__main__":
