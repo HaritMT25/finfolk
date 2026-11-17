@@ -23,15 +23,27 @@ only: it never edits a tool or any production or bank path, and every output goe
 
 Protections kept from rec_C_v2: nice 19 and one BLAS thread (rec_A_v1.sh), an exclusive P_REC lock, process-group
 cleanup of every child on TERM / INT, protected roots, no output symlinks, immutable bytes, RETAINED_RESULTS.sha256,
-ARTIFACTS.sha256, status.json. A planning-mode configuration or plan anywhere under P_REC is refused.
+ARTIFACTS.sha256, status.json. A planning-mode configuration or plan anywhere under P_REC is refused. Every child
+stays tracked until its whole process group is gone (Codex WP5 P2-W5-2): TERM / INT are blocked from before each
+spawn until the child is tracked, and a child that exits abnormally (a recovery supervisor killed alone, say) has
+the rest of its group stopped (TERM, then KILL after 8 s) before the wrapper goes on, so no worker outlives the lock.
+
+EXTRA_AVOID (production; rec_C_v2's): a file listing additional reservation paths, one per line. The list and every
+listed file are copied into P_REC (inputs/extra_avoid.list, inputs/reservations/), bound in FROZEN.sha256, included in
+the collision checks and passed to the fork registration; a listed file that is missing is refused (Codex WP5
+P2-W5-1). measure and prepare must see the same inventory (its copies are immutable).
 
 --test-fixture DIR (rec_A_v1.sh: RQ_REC_A_TEST_FIXTURE; TESTS ONLY): the study inventory (registry, reservations,
 forks, references, the production graph) is replaced by DIR's toy graph (recovery_toy is required), the schedule by
 DIR/schedule.json, the bank/D8 inputs come from DIR/d8 and the authorities from DIR/authority; the frozen pins of the
 four registered bank inputs and of the authorities, the resource preflight and prepare's acceptance-completeness
-precheck are not applied (recorded in inputs/policy.json). Every other rule is the production one.
+precheck are not applied (recorded in inputs/policy.json), and EXTRA_AVOID is refused. Every other rule is the
+production one. The mode, fixture or production, is recorded once in inputs/mode.json (bound in FROZEN.sha256; Codex
+WP5 P3-W5-2): a prepare, run or resume of the other mode is refused, and run skips the resource preflight only in a
+fixture-frozen root, whose frozen graph must be a recovery toy.
 """
 import argparse
+import contextlib
 import datetime
 import fcntl
 import hashlib
@@ -91,6 +103,8 @@ AUTHORITIES = {
     'PRELAUNCH_GATES.md': None, 'recovery_runbook_codex.md': None, 'recovery_tooling_plan_codex.md': None,
 }
 CHILDREN = set()
+SPAWN_SIGNALS = {signal.SIGTERM, signal.SIGINT}    # (blocked from before a spawn until its child is tracked)
+TERM_GRACE, KILL_WAIT = 8, 30                      # (seconds: a group's wait after TERM, then after KILL)
 STAMP = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%S.%fZ')
 # (set by configure: the root, the snapshot tools, the graph, the bank copies, the worker count, the inputs, test mode)
 C = T = G = B = TB = None
@@ -143,55 +157,94 @@ def copy(src, dst, read_only=False):
         data).hexdigest()}
 
 
+def group_alive(pgid):
+    """Whether process group pgid still has a member (killpg(pgid, 0); an unreaped zombie is still a member)."""
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 def stop_children():
-    """Process-group cleanup (rec_C_v2): every child is a group leader (start_new_session); TERM its group, wait up to
-    8 s, then KILL the group (a supervisor can exit before its workers)."""
+    """Process-group cleanup (rec_C_v2; Codex WP5 P2-W5-2): every child is a group leader (start_new_session) and stays
+    in CHILDREN until its WHOLE group is gone, its exited leader included (a supervisor can exit before its workers).
+    TERM every group, wait until each has no member (reaping our own exited leaders: a zombie leader keeps its group)
+    or 8 s, KILL every group left and wait again (at most 30 s) -> the groups that still have members ([]: every
+    child and every worker of every child is gone)."""
     for p in list(CHILDREN):
-        try:
+        with contextlib.suppress(ProcessLookupError):
             os.killpg(p.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-    deadline = time.monotonic() + 8
-    while CHILDREN and time.monotonic() < deadline:
-        for p in list(CHILDREN):
-            if p.poll() is not None:
-                try:
-                    os.killpg(p.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                CHILDREN.discard(p)
-        time.sleep(.1)
-    for p in list(CHILDREN):
-        try:
-            os.killpg(p.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        p.wait()
-        CHILDREN.discard(p)
+    for sig, wait in ((None, TERM_GRACE), (signal.SIGKILL, KILL_WAIT)):
+        for p in list(CHILDREN) if sig else ():
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(p.pid, sig)
+        deadline = time.monotonic() + wait
+        while True:
+            for p in list(CHILDREN):
+                p.poll()                                  # (reaps an exited leader of ours; a known exit is kept)
+                if p.returncode is not None and not group_alive(p.pid):
+                    CHILDREN.discard(p)
+            if not CHILDREN or time.monotonic() >= deadline:
+                break
+            time.sleep(.05)
+        if not CHILDREN:
+            break
+    return sorted(p.pid for p in CHILDREN)
 
 
 def interrupted(sig, frame):
     raise KeyboardInterrupt(f'signal {sig}')
 
 
+def spawn(cmd, out):
+    """subprocess.Popen in its own process group, tracked in CHILDREN before TERM / INT can act (Codex WP5 P2-W5-2;
+    recovery_extra.run's pattern): both are blocked from before the fork until the child is in CHILDREN, so a signal in
+    between is delivered once the child can be stopped; the child starts with the wrapper's own mask (preexec_fn
+    restores it before exec)."""
+    old = signal.pthread_sigmask(signal.SIG_BLOCK, SPAWN_SIGNALS)
+    try:
+        p = subprocess.Popen(cmd, stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                             start_new_session=True, preexec_fn=lambda: signal.pthread_sigmask(signal.SIG_SETMASK, old))
+        CHILDREN.add(p)
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, old)
+    return p
+
+
 def call(args, label, check=True):
     """One child (sys.executable -I -B args) in its own process group, logged and timed (wall, user / system CPU and
-    the maximum RSS from wait4) -> its exit code; a nonzero exit raises unless check is False."""
+    the maximum RSS from wait4) -> its exit code; a nonzero exit raises unless check is False. The child leaves
+    CHILDREN only once its whole group is gone (Codex WP5 P2-W5-2): after a nonzero exit, or with members of its group
+    still running, the group is stopped (stop_children) while it is still tracked, so a recovery supervisor killed
+    alone never leaves its workers running past the wrapper's lock; members left by an exit 0 fail the stage."""
     log, timing = C / 'logs' / f'{STAMP}.{label}.log', C / 'timing' / f'{STAMP}.{label}.json'
     cmd = [sys.executable, '-I', '-B', *map(str, args)]
     print(shlex.join(cmd), flush=True)
     t0 = time.time()
     with log.open('ab') as f:
-        p = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True)
-        CHILDREN.add(p)
+        p = spawn(cmd, f)
         _, status, ru = os.wait4(p.pid, 0)
         p.returncode = os.waitstatus_to_exitcode(status)
-        CHILDREN.discard(p)
     rc = p.returncode
+    members = group_alive(p.pid)
+    if rc or members:           # (an abnormal exit or a group still running: stopped before the child is released)
+        left = stop_children()
+    else:
+        left = []
+        CHILDREN.discard(p)
     dump(timing, {'label': label, 'command': cmd, 'exit': rc, 'wall_s': round(time.time() - t0, 3),
                   'user_s': ru.ru_utime, 'system_s': ru.ru_stime, 'max_rss_kib': ru.ru_maxrss})
+    if left:
+        raise RuntimeError(f'{label}: exit {rc}; INTEGRITY: process group(s) {left} still have members after SIGKILL')
+    if members and not rc:
+        raise RuntimeError(f'{label}: exit 0 with processes of its group still running (stopped): not a completed '
+                           f'stage; see {log}')
     if rc and check:
-        raise RuntimeError(f'{label}: exit {rc}; see {log}')
+        raise RuntimeError(f'{label}: exit {rc}{"; the rest of its process group stopped" if members else ""}; '
+                           f'see {log}')
     return rc
 
 
@@ -379,17 +432,14 @@ def study_inputs():
     return production_inputs()
 
 
-def production_inputs():
-    """rec_C_v2's snapshot_inputs + build_inputs (server-verified there), with NS and the bank paths of A: production
-    only (it needs the production registry), never run by the tests."""
-    graph, worlds, sealing, forks, rec, extra = modules('graph', 'worlds', 'sealing', 'forks', 'recovery',
-                                                        'recovery_extra')
+def reservations(reg):
+    """The reservation inventory (rec_C_v2.py:106-137): the registry's avoidance records and the bank's frozen
+    avoidance provenance (each verified by sha256), every production reservation file and, with EXTRA_AVOID
+    (rec_C_v2.py:120-125, 129-130; Codex WP5 P2-W5-1), every file its list names (one path per line; a missing one is
+    refused), all copied into inputs/reservations/; the list itself is copied to inputs/extra_avoid.list and read
+    from that copy. The registry's originals, the seed-named production reservations and every listed file are the
+    collision paths (the avoidance checks and the fork registration read them) -> (provenance, collision paths)."""
     prov = []
-    for n in ('worlds.json', 'registry.verify.json', 'reservation_sources.json', 'arena.selected.json'):
-        prov.append(copy(PROD / 'config' / n, C / 'inputs/study/config' / n))
-    reg = json.loads((C / 'inputs/study/config/worlds.json').read_text())
-    if sha(C / 'inputs/study/config/worlds.json') != REGSHA:
-        raise RuntimeError('registry changed')
     records = list(reg['avoid'])
     bank_sources = BANK / 'config/production_avoid_sources.json'
     prov.append(copy(bank_sources, C / 'inputs/bank/production_avoid_sources.json'))
@@ -403,13 +453,44 @@ def production_inputs():
     for p in sorted((PROD / 'reservations').iterdir()):
         if p.is_file():
             external[str(p)] = p
+    listed = []
+    if os.environ.get('EXTRA_AVOID'):
+        prov.append(copy(Path(os.environ['EXTRA_AVOID']).resolve(), C / 'inputs/extra_avoid.list'))
+        for line in (C / 'inputs/extra_avoid.list').read_text().splitlines():
+            if line.strip():
+                p = Path(line.strip()).resolve()
+                if not p.is_file():
+                    raise RuntimeError(f'EXTRA_AVOID lists a missing reservation file: {p}')
+                listed.append(p)
+                external[str(p)] = p
     paths, originals = [], {str(Path(x['path'])) for x in reg['avoid']}
     originals.update(str(p) for p in (PROD / 'reservations').iterdir() if p.is_file() and 'seed' in p.name)
+    originals.update(str(p) for p in listed)
     for i, (original, p) in enumerate(sorted(external.items())):
         dst = C / 'inputs/reservations' / f'{i:03d}.{p.name}'
         prov.append(copy(p, dst))
         if original in originals:
             paths.append(str(dst))
+    return prov, paths
+
+
+def production_inputs():
+    """rec_C_v2's snapshot_inputs + build_inputs (server-verified there), with NS and the bank paths of A: production
+    only (it needs the production registry). The tests run it only on a toy registry with toy reservation and fork
+    metadata (TestRecAV1Wrapper's inventory test; never a real input). Rechecked line by line against rec_C_v2.py
+    (Codex WP5 P2-W5-1): EXTRA_AVOID restored (reservations()), the nine seeds per reserved slot checked again
+    (rec_C_v2.py:157), and the planning graph and fork registry re-derived on every call as rec_C_v2 did (graph.py's
+    write and same() accept only the same bytes: measure's and prepare's inventories must agree)."""
+    graph, worlds, sealing, forks, rec, extra = modules('graph', 'worlds', 'sealing', 'forks', 'recovery',
+                                                        'recovery_extra')
+    prov = []
+    for n in ('worlds.json', 'registry.verify.json', 'reservation_sources.json', 'arena.selected.json'):
+        prov.append(copy(PROD / 'config' / n, C / 'inputs/study/config' / n))
+    reg = json.loads((C / 'inputs/study/config/worlds.json').read_text())
+    if sha(C / 'inputs/study/config/worlds.json') != REGSHA:
+        raise RuntimeError('registry changed')
+    rprov, paths = reservations(reg)
+    prov += rprov
     for n in ('bank.plan.jsonl', 'bank.design.json', 'readiness.json'):
         prov.append(copy(BANK / 'config' / n, C / 'inputs/bank' / n))
     dump(C / 'inputs/avoid_paths.json', paths)
@@ -418,6 +499,7 @@ def production_inputs():
     assert reg['namespace'] == 'finfolk-rq-production-2026-11-d6d7-v1'
     assert sealing.layout_of(reg['worlds'])['registered_64']
     assert reg['max_restarts'] == 8 and len(reg['reserved']) == 64
+    assert all(len(x['seeds']) == 9 for x in reg['reserved']), 'a reserved slot without exactly nine seeds'
     hist = {s for x in reg['reserved'] for s in x['seeds']}
     assert len(hist) == 576 and all(0 < s < 2 ** 32 for s in hist)
     plan_rows = [json.loads(s) for s in (C / 'inputs/bank/bank.plan.jsonl').read_text().splitlines() if s.strip()]
@@ -440,11 +522,10 @@ def production_inputs():
         for n in ('graph.jsonl.gz', 'graph.meta.json'):
             prov.append(copy(pg / n, C / 'inputs/graph' / n))
         graph_policy = 'copied existing production graph'
-    else:
-        if not G.exists():
-            call([T / 'graph.py', 'build', '--registry', C / 'inputs/study/config/worlds.json', '--namespace',
-                  'rq2026-d6d7-graph', '--snapshot-topup', '6', '--ab-topup', '8', '--ab-topup-mode', 'fitting',
-                  '--lag-probe', '7', '--out', G.parent], 'graph-build')
+    else:                       # (re-derived on every call, as rec_C_v2: graph.py write accepts only the same bytes)
+        call([T / 'graph.py', 'build', '--registry', C / 'inputs/study/config/worlds.json', '--namespace',
+              'rq2026-d6d7-graph', '--snapshot-topup', '6', '--ab-topup', '8', '--ab-topup-mode', 'fitting',
+              '--lag-probe', '7', '--out', G.parent], 'graph-build')
         graph_policy = 'INTENDED production graph; not yet published in production root'
     g = graph.load(str(G))
     assert not graph.check_quotas(g)
@@ -455,12 +536,11 @@ def production_inputs():
     if fp.exists():
         prov.append(copy(fp, C / 'inputs/study/config/forks.json'))
         fork_policy = 'actual production registry'
-    else:
-        if not (C / 'inputs/study/config/forks.json').exists():
-            f = forks.register(str(C / 'inputs/study'), str(G.parent / 'graph.meta.json'), 'rq2026-d6d7-replay',
-                               avoid_paths=[str(C / 'inputs/bank/bank.plan.jsonl'),
-                                            str(C / 'inputs/study/config/worlds.json'), *paths])
-            same(C / 'inputs/study/config/forks.json', canonical(f))
+    else:                       # (re-registered on every call, as rec_C_v2: same() accepts only the same bytes)
+        f = forks.register(str(C / 'inputs/study'), str(G.parent / 'graph.meta.json'), 'rq2026-d6d7-replay',
+                           avoid_paths=[str(C / 'inputs/bank/bank.plan.jsonl'),
+                                        str(C / 'inputs/study/config/worlds.json'), *paths])
+        same(C / 'inputs/study/config/forks.json', canonical(f))
         fork_policy = 'PLANNING registry only; not published production forks'
     f = json.loads((C / 'inputs/study/config/forks.json').read_text())
     assert f['worlds_registry']['sha256'] == REGSHA
@@ -481,9 +561,31 @@ def production_inputs():
     return prov
 
 
+def mode_name():
+    return 'fixture' if TEST else 'production'
+
+
+def frozen_mode():
+    """The mode this root was frozen in (inputs/mode.json, bound in FROZEN.sha256; Codex WP5 P3-W5-2), which must be
+    this invocation's (--test-fixture or not) -> it; another or no recorded mode is refused."""
+    p = C / 'inputs/mode.json'
+    mode = json.loads(p.read_text()).get('mode') if p.is_file() else None
+    if mode != mode_name():
+        raise RuntimeError(f'P_REC was frozen in {mode or "an unrecorded"} mode and this invocation is {mode_name()} '
+                           f'mode (--test-fixture / RQ_REC_A_TEST_FIXTURE): refused')
+    return mode
+
+
 def all_inputs(freeze=True):
     """The tools, the authorities, the bank/D8 inputs and the study inputs, bound in inputs/provenance.json (prepare);
-    the measurement-only benchmark takes the tools, the bank/D8 inputs and the study inputs only."""
+    the measurement-only benchmark takes the tools, the bank/D8 inputs and the study inputs only. First the mode is
+    recorded (once: measure and prepare must agree) and, in fixture mode, EXTRA_AVOID is refused (a production study
+    input the fixture has no inventory for)."""
+    if TEST and os.environ.get('EXTRA_AVOID'):
+        raise RuntimeError('EXTRA_AVOID is a production study input; --test-fixture has no study inventory: refused')
+    if (C / 'inputs/mode.json').exists():
+        frozen_mode()
+    dump(C / 'inputs/mode.json', {'mode': mode_name()})
     if not freeze:
         snapshot_tools(criterion=False)
         bank_inputs()
@@ -508,6 +610,26 @@ def prepare_legacy(x, fit, out, ns):
     call(['-c', PREPARE_LEGACY, T, json.dumps(a)], f'prepare-{out.name}')
 
 
+def unresolved_integrations(rec, branches):
+    """MEASUREMENT.json's unresolved-integration counts: pairs whose count score is finite but UNRESOLVED
+    (map.pred_count_lpd's grid_unresolved), per option and stored integration record, reported separately and never
+    summed (Codex WP5 P3-W5-1). candidates: every candidate's validation and test integration records. branch_tests:
+    each forward branch's test-comparison records, the selected and the rank-0 model's, stored under the branch
+    (recovery.py forward_procedure: a branch's comparison is not among the candidates'). Reads no score, selected rank,
+    bound or success (CRITERION C6)."""
+    def n(info):
+        return int((info or {}).get('grid_unresolved', 0))
+    return {
+        'label': 'pairs with grid_unresolved per stored integration record, not summed: candidates = every '
+                 'candidate\'s validation and test records; branch_tests = each forward branch\'s test comparison, its '
+                 'selected and rank-0 records (stored under the branch)',
+        'candidates': {opt: sum(n((c.get('integration') or {}).get(s)) for c in o.get('candidates', ())
+                                for s in ('validation', 'test')) for opt, o in rec['options'].items()},
+        'branch_tests': {opt: {b: {k: n((o[b].get('integration') or {}).get(k)) for k in ('selected', 'rank0')}
+                               for b in branches if isinstance(o.get(b), dict)}
+                         for opt, o in rec['options'].items()}}
+
+
 def measure():
     """The measurement-only benchmark (v5 7 step 8, PC-20; CRITERION C6): before the freeze, once."""
     if (C / 'FROZEN.sha256').exists():
@@ -525,9 +647,8 @@ def measure():
     call(args, 'measure-r2_034')
     rec = json.loads((out / 'r2_034.000.json').read_text())
     timing = json.loads((C / 'timing' / f'{STAMP}.measure-r2_034.json').read_text())
-    unresolved = {opt: sum(int(((c.get('integration') or {}).get(s) or {}).get('grid_unresolved', 0))
-                           for c in o.get('candidates', ()) for s in ('validation', 'test'))
-                  for opt, o in rec['options'].items()}
+    (recovery,) = modules('recovery')
+    unresolved = unresolved_integrations(rec, recovery.BRANCHES)
     dump(C / 'measure/MEASUREMENT.json', {
         'label': 'MEASUREMENT-ONLY (CRITERION C6): never an acceptance realization; only completion, timing, RSS and '
                  'unresolved-integration counts are read', 'namespace': NS_MEASURE, 'scenario': 'r2_034',
@@ -569,6 +690,15 @@ def prepare():
     if (C / 'measure').exists():
         same(C / 'MEASUREMENT_ONLY.sha256', ''.join(
             f'{sha(p)}  {p.relative_to(C)}\n' for p in sorted((C / 'measure').rglob('*')) if p.is_file()).encode())
+    same(C / 'FROZEN.sha256', frozen_manifest())
+    check_freeze()
+    print('PREPARED, no recovery observations generated. Witness:', sha(C / 'FROZEN.sha256'), flush=True)
+
+
+def frozen_manifest():
+    """FROZEN.sha256's bytes: every file under control/, authority/, inputs/ (the bank/D8 copies, the mode, the study
+    inventory with EXTRA_AVOID's list and reservations), tools/, runs/, extra/ and measure/, then SCHEDULE.json and
+    MEASUREMENT_ONLY.sha256, sorted."""
     frozen = []
     for sub in ('control', 'authority', 'inputs', 'tools', 'runs', 'extra', 'measure'):
         for p in sorted((C / sub).rglob('*')):
@@ -577,19 +707,23 @@ def prepare():
     for n in ('SCHEDULE.json', 'MEASUREMENT_ONLY.sha256'):
         if (C / n).exists():
             frozen.append(f'{sha(C / n)}  {n}\n')
-    same(C / 'FROZEN.sha256', ''.join(sorted(frozen)).encode())
-    check_freeze()
-    print('PREPARED, no recovery observations generated. Witness:', sha(C / 'FROZEN.sha256'), flush=True)
+    return ''.join(sorted(frozen)).encode()
 
 
 def check_freeze():
-    """Every FROZEN.sha256 entry, the active wrapper (= its control copy), the runtime, the schedule (re-derived from
-    the frozen configurations and plans, byte for byte) and the bank mode of everything under P_REC."""
+    """Every FROZEN.sha256 entry, the frozen mode (= this invocation's), the active wrapper (= its control copy), the
+    runtime, the schedule (re-derived from the frozen configurations and plans, byte for byte) and the bank mode of
+    everything under P_REC."""
+    names = set()
     for line in (C / 'FROZEN.sha256').read_text().splitlines():
         digest, name = line.split('  ', 1)
         p = (C / name).resolve()
         if not p.is_relative_to(C) or not p.is_file() or sha(p) != digest:
             raise RuntimeError(f'frozen input changed: {name}')
+        names.add(name)
+    if 'inputs/mode.json' not in names:
+        raise RuntimeError('the freeze does not bind the mode (inputs/mode.json): refused')
+    frozen_mode()
     for n in ('rec_A_v1.sh', 'rec_A_v1.py'):
         if sha(HERE / n) != sha(C / 'control' / n):
             raise RuntimeError(f'active orchestrator changed: {n}')
@@ -615,13 +749,18 @@ def run():
     if not receipt.is_file() or sha(C / 'FROZEN.sha256') not in receipt.read_text():
         raise RuntimeError('authentic pre-result external witness receipt containing the freeze digest required '
                            '(P_REC/PRIOR.receipt)')
-    if not TEST:          # (rec_C_v2's conservative preflight, at 2 workers)
+    if frozen_mode() == 'production':      # (rec_C_v2's conservative preflight, at 2 workers)
         available = int(next(s.split()[1] for s in Path('/proc/meminfo').read_text().splitlines()
                              if s.startswith('MemAvailable:'))) * 1024
         if available < (8 + 4 * JOBS) * 1024 ** 3:
             raise RuntimeError('need 8 GiB headroom + 4 GiB/worker')
         if shutil.disk_usage(C).free < 60 * 1024 ** 3:
             raise RuntimeError('need 50 GiB free reserve + 10 GiB recovery allowance')
+    else:                                  # (no preflight only in a fixture-frozen root, on its frozen toy graph)
+        (graph,) = modules('graph')
+        if not graph.load(str(G)).get('recovery_toy'):
+            raise RuntimeError('a fixture-frozen root must hold a recovery toy graph (never a registered graph): '
+                               'refused')
     spec = schedule_spec()
     fit = fit_of(spec)
     call([T / 'recovery.py', 'conditioning', '--graph', G, '--out', C / 'conditioning.json'], 'conditioning')
@@ -752,7 +891,13 @@ def guarded(argv):
         except (Exception, KeyboardInterrupt, SystemExit) as e:
             print(f'FAILED: {e}', file=sys.stderr, flush=True)
         finally:
-            stop_children()
+            for s in SPAWN_SIGNALS:        # (a second TERM / INT never cuts the cleanup short)
+                signal.signal(s, signal.SIG_IGN)
+            left = stop_children()
+            if left:
+                print(f'INTEGRITY ERROR: process group(s) {left} still have members after SIGKILL', file=sys.stderr,
+                      flush=True)
+                rc = 2
             (C / 'status.json').write_text(json.dumps({'phase': a.phase, 'exit': rc, 'attempt': STAMP}) + '\n')
             try:
                 checkpoint_results()

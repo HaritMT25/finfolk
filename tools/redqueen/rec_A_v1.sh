@@ -5,7 +5,9 @@
 # external witness of FROZEN.sha256: P_REC/PRIOR.receipt). The acceptance packet is produced by run, through
 # `recovery.py packet --mode acceptance` only; the wrapper never uses diagnostic mode.
 #   env: P_REC, JOBS (1 or 2: at most 2 concurrent workers in total), PY, D8_DIR, AUTHORITY_DIR, CRITERION;
-#        RQ_REC_A_TEST_FIXTURE (tests only: a toy-graph fixture directory, never a real input).
+#        EXTRA_AVOID (production, rec_C_v2's: a file listing additional reservation files, one path per line; read
+#        by rec_A_v1.py, the same for measure and prepare); RQ_REC_A_TEST_FIXTURE (tests only: a toy-graph fixture
+#        directory, never a real input; the mode is frozen at prepare).
 set -euo pipefail
 umask 077
 HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
