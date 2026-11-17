@@ -477,8 +477,19 @@ records (JSON: exit, wall and user/system CPU seconds, maximum RSS) are under
 workers on TERM/INT, and a child that exits abnormally (a recovery supervisor
 killed alone, say) has the rest of its process group stopped before the wrapper
 goes on or releases its lock. An exclusive P_REC lock prevents overlapping invocations.
+That cleanup is bounded, and two cases escape it. If members of a group survive
+SIGKILL past the wait, the wrapper reports an INTEGRITY error naming the group,
+exits 2 and still releases its lock. If the wrapper itself is hard-killed
+(SIGKILL), its legacy supervisor and workers can keep running: legacy workers
+have no parent-death protection. An available lock or an exit 2 is therefore not
+evidence that earlier workers are gone. Before resuming after a wrapper hard kill
+or an exit-2 integrity error, confirm that no recovery supervisor or worker
+started for this P_REC is still running (`ps -eo pid,pgid,args | grep -F
+"$P_REC"`, and the groups the error names), and stop any that are before
+reissuing the command.
 Do not change runtime/tools/criterion or share an output root between freezes.
-Hard-kill/power-loss resume still depends on durable files and the merged tools'
+A reboot or power loss leaves no worker running, but resume after one, like resume
+after a wrapper hard kill, still depends on durable files and the merged tools'
 checks; the external witness and immutable failed attempts must be preserved.
 
 ## Measurements and resources
