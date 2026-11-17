@@ -4347,6 +4347,33 @@ class TestRecAV1Wrapper(unittest.TestCase):
                       16)
         self.assertEqual(blocked & (1 << (signal.SIGTERM - 1) | 1 << (signal.SIGINT - 1)), 0, f"SigBlk {blocked:x}")
 
+    def test_rec_A_v1_an_exit_0_that_leaves_its_group_running_fails_the_stage(self):
+        """Codex WP5 r2 P3-R2-2: a supervisor that exits 0 while a child of its own process group still runs is not a
+        completed stage. call() stops the rest of the group while it is still tracked, then refuses the stage with
+        check=True and with check=False alike. Nothing of the group survives and CHILDREN is empty. (The
+        killed-supervisor test exits -9, so removing only the exit-0 refusal would pass it.)"""
+        W = self.W
+        for d in ("logs", "timing"):
+            os.makedirs(os.path.join(self.prec, d))
+        W.configure(argparse.Namespace(root=self.prec, jobs=2, d8=None, authority=None, criterion=None,
+                                       test_fixture=None))
+        supervisor = ("import os, subprocess, sys\n"
+                      "c = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'])\n"
+                      "open(sys.argv[1], 'w').write(f'{os.getpid()} {c.pid}')\n"
+                      "sys.exit(0)\n")
+        for check in (True, False):
+            with self.subTest(check=check):
+                pids, label = os.path.join(self.root, f"straggler_{check}.pids"), f"straggler_{check}"
+                with contextlib.redirect_stdout(io.StringIO()):
+                    with self.assertRaisesRegex(RuntimeError, "exit 0 with processes of its group still running"):
+                        W.call(["-c", supervisor, pids], label, check=check)
+                pgid, straggler = map(int, rqlib.read_text(pids).split())
+                self.assertNotEqual(os.getpgid(os.getpid()), pgid, "the supervisor led its own group")
+                self.assertEqual(group_members(pgid), [], f"the straggler {straggler} still runs")
+                self.assertEqual(W.CHILDREN, set())
+                timing = json.loads(rqlib.read_text(os.path.join(self.prec, "timing", f"{W.STAMP}.{label}.json")))
+                self.assertEqual(timing["exit"], 0)
+
     def test_rec_A_v1_measurement_reports_the_branch_test_integrations_apart(self):
         """Codex WP5 P3-W5-1: MEASUREMENT.json's unresolved-integration counts report each forward branch's test
         comparison (its integration records stored under the branch, recovery.py forward_procedure, not among the
