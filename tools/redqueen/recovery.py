@@ -2288,9 +2288,13 @@ def _identity(entries, inputs, obs, om_sha, mode, allow_synthetic):
                     raise ValueError(f"plan.json hashes to {rqlib.canonical_sha(plan)}, not the scheduled "
                                      f"{e['expected_plan_sha256']}")
                 if plan.get("noise_source") != NOISE_SOURCE["bank"]:
-                    raise ValueError(f"a {plan.get('noise_source')!r} plan: planning input is refused (v5 3.7; "
-                                     "recovery_extra's bank mode, v5 3.4, is WP5's)")
-                _extra_call(X.verified, d, inputs["graph"], inputs["references"])
+                    raise ValueError(f"a {plan.get('noise_source')!r} plan: planning input is refused (v5 3.7)")
+                if (plan.get("inputs") or {}).get("observation_model_sha256") != om_sha:
+                    raise ValueError("its plan's observation model is not the scheduled one")
+                # (v5 3.4 `verified`, 3.8 check 1: the plan re-derived with the model loaded from the schedule's bank
+                #  and tables; WP5)
+                _extra_call(X.verified, d, inputs["graph"], inputs["references"], inputs["bank"], inputs["obs_tables"],
+                            allow_synthetic)
                 if mode == "acceptance" and plan.get("namespace") != A_NAMESPACE:
                     raise ValueError(f"namespace {plan.get('namespace')!r} is not {A_NAMESPACE}")
                 for n, r in sorted(_extra_call(X.read_results, d, plan).items()):
