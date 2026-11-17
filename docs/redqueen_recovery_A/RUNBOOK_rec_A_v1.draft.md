@@ -153,6 +153,11 @@ Before prepare:
 2. The registry, its verification/avoidance inputs, actual bank plan and bank
    provenance files must exist with their verified bytes. Optional `EXTRA_AVOID`
    is a file listing additional absolute reservation paths, one per line.
+   rec_A_v1 copies the list to `inputs/extra_avoid.list` and every listed file
+   into `inputs/reservations/`, binds them in `FROZEN.sha256`, includes them in
+   the collision checks and passes them to the fork registration; a listed file
+   that is missing is refused. Export the same `EXTRA_AVOID` for `measure` and
+   `prepare`: the copied inventory is immutable, so a different one is refused.
    #84's general reservation-loader fix is a separate tracked gate; this job
    does not certify it or replace its required owner review.
 3. The offline Python/NumPy runtime, main-7253fdf tools, this wrapper/helper,
@@ -440,6 +445,7 @@ cd /home/harit/finfolk/work/trees/rq-recovery-run
 export PY="$PWD/build_recrun/venv/bin/python3"
 export P_REC=/home/harit/finfolk/work/recovery_A_v1
 export AUTHORITY_DIR=...   # the authorities rec_A_v1.py binds (AUTHORITIES)
+# export EXTRA_AVOID=...   # optional (Before prepare, item 2); the same for measure and prepare
 # Step 8 (before the criterion's adoption): the measurement-only benchmark.
 JOBS=1 nice -n 19 bash tools/redqueen/rec_A_v1.sh measure
 # Step 9: adopt the criterion/graph/scope with the re-derived CPU plan and retain
@@ -464,10 +470,13 @@ Reissue the identical phase command to resume. Prepare checks an existing
 freeze; it does not refreeze changed inputs. Legacy results retain their tool
 configuration/identity checks; companion results also verify canonical body
 hashes and scheduled tasks. The wrapper's retained-result hash manifest rejects
-changed previously retained bytes. Per-invocation logs and GNU time receipts
-are under `logs/` and `timing/`; status records the attempt and exit code;
+changed previously retained bytes. Per-invocation logs and `wait4` timing
+records (JSON: exit, wall and user/system CPU seconds, maximum RSS) are under
+`logs/` and `timing/`; status records the attempt and exit code;
 `ARTIFACTS.sha256` inventories produced files. A process-group cleanup reaps
-workers on TERM/INT. An exclusive P_REC lock prevents overlapping invocations.
+workers on TERM/INT, and a child that exits abnormally (a recovery supervisor
+killed alone, say) has the rest of its process group stopped before the wrapper
+goes on or releases its lock. An exclusive P_REC lock prevents overlapping invocations.
 Do not change runtime/tools/criterion or share an output root between freezes.
 Hard-kill/power-loss resume still depends on durable files and the merged tools'
 checks; the external witness and immutable failed attempts must be preserved.
