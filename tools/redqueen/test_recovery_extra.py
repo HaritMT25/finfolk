@@ -3670,6 +3670,18 @@ class TestRecoveryBankPacket(unittest.TestCase):
 
 # ================================================================== the wrapper rec_A_v1 (A_design_v5 4.4; WP5)
 REC_A_SH = os.path.join(HERE, "rec_A_v1.sh")
+# (the wrapper's bindings as v5 4.4, 6.2 item 6 and T5-4 name them, written here, never read from rec_A_v1.py, so a
+#  binding dropped from the wrapper's constants is caught; the benchmark's namespace, v5 7 step 8)
+MEASURE_NS = "rq2026-d8-recovery-A1-measure"
+D8_NAMES = ("bank_d8.json", "bank_d8.receipt.json", "provenance.json", "d8validation.spec.json",
+            "d8validation.report.json", "d8validation.witness.receipt", "obs_tables.npz", "pr68_conformance.receipt",
+            "observations.json", "ages.json", "bank.plan.jsonl", "bank.design.json")
+AUTHORITY_NAMES = ("A_design_v5.md", "A_design_v5_clarification_1.md", "A_design_v5_clarification_2.md",
+                   "A_design_v5_clarification_3.md", "A_design_v5_clarification_4.md",
+                   "A_design_v5_clarification_4.freeze_addendum.md", "amendment_D8_v2.md",
+                   "amendment_D9_launch_before_registration.md", "redqueen_study_design_v4_codex.md",
+                   "redqueen_annexH_codex.md", "PRELAUNCH_GATES.md", "recovery_runbook_codex.md",
+                   "recovery_tooling_plan_codex.md")
 CRITERION_DRAFT = os.path.join(HERE, "..", "..", "docs", "redqueen_recovery_A", "CRITERION_rec_A_v1.draft.txt")
 
 
@@ -3819,10 +3831,11 @@ class TestRecAV1Wrapper(unittest.TestCase):
         m = rqlib.read_json(os.path.join(self.prec, "measure", "MEASUREMENT.json"))
         self.assertEqual(sorted(m), sorted(["label", "namespace", "scenario", "options", "completed", "wall_s", "cpu_s",
                                             "max_rss_kib", "unresolved_integration_pairs"]))
-        self.assertEqual((m["namespace"], m["scenario"], m["completed"]), (W.NS_MEASURE, "r2_034", True))
+        self.assertEqual((m["namespace"], m["scenario"], m["completed"]), (MEASURE_NS, "r2_034", True))
         mcfg = rqlib.read_json(os.path.join(self.prec, "measure", "r2_034", "config.json"))
         self.assertEqual((mcfg["namespace"], mcfg["observation_model"]["mode"], mcfg["ranks"], mcfg["iters"]),
-                         (W.NS_MEASURE, "bank", 4, 30))
+                         (MEASURE_NS, "bank", 4, 30))
+        self.assertNotEqual(MEASURE_NS, A1)
         cp = self.wrap("measure")
         self.assertEqual(cp.returncode, 2)
         self.assertIn("a single dataset", cp.stderr)
@@ -3842,12 +3855,13 @@ class TestRecAV1Wrapper(unittest.TestCase):
                  "inputs/policy.json", "inputs/runtime_files.json", "inputs/graph/graph.jsonl.gz"]
                 + [f"tools/redqueen/{n}" for n in ("obslaw.py", "material.py", "common.py", "noisescale.py",
                                                    "recovery.py", "recovery_extra.py", "map.py", "rec_A_v1.py")]
-                + [f"inputs/bank/{n}" for n in W.D8_FILES] + [f"authority/{n}" for n in W.AUTHORITIES])
+                + [f"inputs/bank/{n}" for n in D8_NAMES] + [f"authority/{n}" for n in AUTHORITY_NAMES])
+        self.assertEqual((sorted(W.D8_FILES), sorted(W.AUTHORITIES)), (sorted(D8_NAMES), sorted(AUTHORITY_NAMES)))
         for name in want:
             with self.subTest(frozen=name):
                 self.assertIn(name, fz)
                 self.assertEqual(fz[name], rqlib.sha256_file(os.path.join(self.prec, name)))
-        for n in W.D8_FILES:
+        for n in D8_NAMES:
             p = os.path.join(self.prec, "inputs", "bank", n)
             self.assertEqual(rqlib.read_bytes(p), rqlib.read_bytes(os.path.join(self.fx, "d8", n)), n)
             self.assertEqual(os.stat(p).st_mode & 0o777, 0o444, n)
