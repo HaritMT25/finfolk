@@ -226,7 +226,7 @@ constexpr std::size_t fieldCount() {
 
 #define OFP_FIELDS(T, N) \
     static_assert(detail::fieldCount<T>() == (N), #T " gained or lost a field: hash it in tools/ocean_fingerprint.hpp, then update this count")
-OFP_FIELDS(SimConfig, 78);   // 71 + the seven Stage C keys (visitSimConfigBrain)
+OFP_FIELDS(SimConfig, 79);   // previous 78 + weightMutationMode
 OFP_FIELDS(OceanConfig, 40);   // 37 + the body-plan preview's three (visitOceanConfigBodyPlan, hashed in `body`)
 OFP_FIELDS(appearance::Stats, 10);   // founders, offspring, pattern[4], morph[4]
 OFP_FIELDS(physical::Stats, 6);      // founders, offspring, mode[4]
@@ -414,6 +414,10 @@ void visitSimConfigBrain(const SimConfig& c, V& v) {
     OFP_B(predatorBrain); OFP_F(predatorMutation); OFP_F(predatorTurnRate); OFP_F(predatorMinSpeed);
     OFP_B(predatorPrimer); OFP_B(predatorFrozen); OFP_B(predatorLog);
 }
+template <class V>
+void visitSimConfigWeightPolicy(const SimConfig& c, V& v) {
+    v.i32("weightMutationMode", static_cast<int>(c.weightMutationMode));
+}
 inline bool simBrainActive(const SimConfig& c) { return c.predatorBrain; }
 template <class V>
 void visitOceanConfig(const OceanConfig& c, V& v) {
@@ -486,6 +490,10 @@ inline void hashConfig(Hasher& h, const SimConfig& c, const OceanConfig& o) {
     if (simBrainActive(c)) {          // Stage C's keys: only with the brain on
         h.u64(kBrainCfgTag);
         visitSimConfigBrain(c, h);
+    }
+    if (c.weightMutationMode != WeightMutationMode::Legacy) {
+        VisionTagger policyTagger{h};
+        visitSimConfigWeightPolicy(c, policyTagger);
     }
 }
 
@@ -841,6 +849,7 @@ inline long countNonFinite(const OceanWorld& w) {
     f(w.D);
     visitSimConfig(w.cfg, nf);
     visitSimConfigBrain(w.cfg, nf);
+    visitSimConfigWeightPolicy(w.cfg, nf);
     visitOceanConfig(w.ocfg, nf);
     visitOceanConfigVision(w.ocfg, nf);
     visitOceanConfigAppearance(w.ocfg, nf);
@@ -929,6 +938,8 @@ inline void dumpState(const OceanWorld& w, std::FILE* out) {
     // The Stage C keys only with the brain on, as they are hashed, so a
     // brain-off dump is the 0.26.0 dump line for line (inactive values too).
     if (simBrainActive(w.cfg)) visitSimConfigBrain(w.cfg, d);
+    if (w.cfg.weightMutationMode != WeightMutationMode::Legacy)
+        visitSimConfigWeightPolicy(w.cfg, d);
     std::fprintf(out, "\noceanconfig");
     visitOceanConfig(w.ocfg, d);
     visitOceanConfigVision(w.ocfg, d);
