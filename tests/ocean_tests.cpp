@@ -4703,13 +4703,6 @@ void testPreflight() {
 
 }  // namespace ot
 
-// The E1 cache's private state, for flow_lanes (an explicit instantiation
-// waives access checking, as ofp::peek does).
-namespace ofp::peek {
-struct OwFlowT { friend constexpr auto member(OwFlowT) noexcept; };
-template struct Expose<OwFlowT, &OceanWorld::flow_>;
-}  // namespace ofp::peek
-
 namespace ot {
 // The wave tables' vector evaluator (OceanWorld::wavesTable: the three trains
 // in the lanes of a GCC 4-float vector — SSE2 natively, SIMD128 under wasm)
@@ -4751,7 +4744,7 @@ void testFlowLanes() {
             if (ph[0] < 0.0) for (int s = 0; s < 60; ++s) w.update(0.016f);
             else for (int i = 0; i < OceanWorld::kWaveTrains; ++i) waves[i].phase = ph[i];
             (void)w.flowAt({1.0f, 1.0f}, 1.0f);   // ensureFlow for this phase
-            const FlowCache& c = ofp::field<ofp::peek::OwFlowT>(w);
+            const FlowCache& c = ofp::field<ofp::peek::OwFlowState>(w).cache;
             // The scalar reference for train i (false: the exact formulas).
             auto scalarTrain = [&](int i, Vec2 p, float d, Fl& u) -> bool {
                 if (!c.depthOn) return false;
@@ -4861,6 +4854,7 @@ void testFlowLanes() {
 #include "ocean_body_plan_tests.hpp"   // the M2a body-plan preview (diagnostic)
 #include "ocean_sense_tests.hpp"
 #include "ocean_speed_tests.hpp"   // the exact Turbo speed-ups' own checks
+#include "ocean_transport_tests.hpp"   // explicit flow state and the synchronous kernel
 
 namespace ot {
 #include "ocean_walls_tests.hpp"   // the glass walls (uses this file's helpers)
@@ -4877,6 +4871,12 @@ int main(int argc, char** argv) {
     // --only label_mask: that test alone (tests/label_mask_fault.sh runs it on
     // copies of the engine with a planted fault, each of which must fail it)
     if (argc > 2 && std::strcmp(argv[1], "--only") == 0) {
+        if (std::strcmp(argv[2], "transport") == 0) {
+            ot::testTransportReaders(); ot::testTransportState(); ot::testTransportKernel();
+            ot::testWallAdvect4();
+            std::printf("OCEAN TESTS: %d passed, %d failed\n", ot::g_passed, ot::g_failed);
+            return ot::g_failed ? 1 : 0;
+        }
         if (std::strcmp(argv[2], "body") == 0) {   // the body-plan preview's checks alone (a quick loop)
             ot::testBodyDraws(); ot::testBodyGeometry(); ot::testBodySurface(); ot::testBodyIso(); ot::testBodyEdges(); ot::testBodyDevelop();
             ot::testBodyOwner(); ot::testBodyNeutral(); ot::testBodyHash(); ot::testBodyNumbers();
@@ -4887,7 +4887,7 @@ int main(int argc, char** argv) {
             return ot::g_failed ? 1 : 0;
         }
         if (std::strcmp(argv[2], "label_mask") != 0) {
-            std::fprintf(stderr, "--only: label_mask (or body) is the one test it runs\n");
+            std::fprintf(stderr, "--only: expected label_mask, body or transport\n");
             return 2;
         }
         ot::testLabelMask();
@@ -4957,6 +4957,9 @@ int main(int argc, char** argv) {
 #endif
     ot::testE1Hash();
     ot::testLazyWaves();
+    ot::testTransportReaders();
+    ot::testTransportState();
+    ot::testTransportKernel();
 #ifndef OCEAN_TESTS_NO_SHIM
     ot::testPreset();
 #endif
