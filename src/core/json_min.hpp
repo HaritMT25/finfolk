@@ -50,6 +50,7 @@ public:
     void value(bool b)               { comma(); out_ += (b ? "true" : "false"); afterValue(); }
     void value(const std::string& s) { comma(); quote(s.c_str()); afterValue(); }
     void value(const char* s)        { comma(); quote(s); afterValue(); }
+    void nullValue() { comma(); out_ += "null"; afterValue(); }
 
     // convenience: key + value in one call
     template <typename T>
