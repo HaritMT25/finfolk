@@ -4862,6 +4862,11 @@ void testFlowLanes() {
 #include "ocean_sense_tests.hpp"
 #include "ocean_speed_tests.hpp"   // the exact Turbo speed-ups' own checks
 
+namespace ofp::peek {
+struct OwWallTransportFood { friend constexpr auto member(OwWallTransportFood) noexcept; };
+template struct Expose<OwWallTransportFood, &OceanWorld::wallTransportFood>;
+}  // namespace ofp::peek
+
 namespace ot {
 #include "ocean_walls_tests.hpp"   // the glass walls (uses this file's helpers)
 #include "ocean_exp_tests.hpp"     // the ALIFE 2027 instruments (eye build; uses this file's helpers)
@@ -4877,6 +4882,12 @@ int main(int argc, char** argv) {
     // --only label_mask: that test alone (tests/label_mask_fault.sh runs it on
     // copies of the engine with a planted fault, each of which must fail it)
     if (argc > 2 && std::strcmp(argv[1], "--only") == 0) {
+        if (std::strcmp(argv[2], "wall_transport_food") == 0 || std::strcmp(argv[2], "type_masks") == 0) {
+            if (std::strcmp(argv[2], "wall_transport_food") == 0) ot::testWallTransportFood();
+            else ot::testTypeMasks();
+            std::printf("OCEAN TESTS: %d passed, %d failed\n", ot::g_passed, ot::g_failed);
+            return ot::g_failed ? 1 : 0;
+        }
         if (std::strcmp(argv[2], "body") == 0) {   // the body-plan preview's checks alone (a quick loop)
             ot::testBodyDraws(); ot::testBodyGeometry(); ot::testBodySurface(); ot::testBodyIso(); ot::testBodyEdges(); ot::testBodyDevelop();
             ot::testBodyOwner(); ot::testBodyNeutral(); ot::testBodyHash(); ot::testBodyNumbers();
@@ -4887,7 +4898,7 @@ int main(int argc, char** argv) {
             return ot::g_failed ? 1 : 0;
         }
         if (std::strcmp(argv[2], "label_mask") != 0) {
-            std::fprintf(stderr, "--only: label_mask (or body) is the one test it runs\n");
+            std::fprintf(stderr, "--only: label_mask, body, wall_transport_food or type_masks\n");
             return 2;
         }
         ot::testLabelMask();
@@ -5009,6 +5020,7 @@ int main(int argc, char** argv) {
     ot::testWallPlacement();
     ot::testWallTransport();
     ot::testWallAdvect4();
+    ot::testWallTransportFood();
     ot::testWallWavesOff();
     ot::testWallEddy();
     ot::testWallSensing();
