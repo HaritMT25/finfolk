@@ -98,6 +98,64 @@ int main() {
         });
     }
     section("zero RNG streams");
+    // Analysis settings belong to the receiving run, not the checkpoint.
+    {
+        World restored;
+        auto& c = restored.cfg;
+        c.reproLog = c.predatorLog = c.clusterMap = c.wiringLog = true;
+        c.profile = c.captureActivations = c.clusterPca = true;
+        c.reproLogMax = 123; c.clusterMax = 456;
+        c.clusterEpoch = 789; c.clusterColor = 1;
+        // Persisted fields must still come from the checkpoint.
+        c.maxAge = 17.0f;
+        c.weightMutationMode = WeightMutationMode::Legacy;
+        CHECK(checkpoint::deserialize(good, restored, error));
+        CHECK(c.reproLog); CHECK(c.predatorLog); CHECK(c.clusterMap);
+        CHECK(c.wiringLog); CHECK(c.profile); CHECK(c.captureActivations);
+        CHECK(c.clusterPca); CHECK(c.reproLogMax == 123);
+        CHECK(c.clusterMax == 456); CHECK(c.clusterEpoch == 789);
+        CHECK(c.clusterColor == 1);
+        CHECK(c.maxAge == g_world->cfg.maxAge);
+        CHECK(c.weightMutationMode == WeightMutationMode::Saturating);
+        CHECK(checkpoint::serialize(restored, "test") == good);
+    }
+    section("destination analysis settings");
+    // Use the real writer, not hand-picked decimal approximations. maxAge and
+    // signed position state accept these values without stepping the world.
+    for (float value : {std::numeric_limits<float>::max(),
+                        -std::numeric_limits<float>::max(),
+                        std::numeric_limits<float>::denorm_min(),
+                        -std::numeric_limits<float>::denorm_min()}) {
+        const float savedAge = g_world->cfg.maxAge;
+        const float savedX = g_world->creatures[0].pos.x;
+        g_world->cfg.maxAge = value;
+        g_world->creatures[0].pos.x = value;
+        const std::string text = checkpoint::serialize(*g_world, "test");
+        g_world->cfg.maxAge = savedAge;
+        g_world->creatures[0].pos.x = savedX;
+        World restored;
+        const bool loaded = checkpoint::deserialize(text, restored, error);
+        CHECK(loaded);
+        if (loaded) {
+            CHECK(restored.cfg.maxAge == value);
+            CHECK(restored.creatures[0].pos.x == value);
+            CHECK(checkpoint::serialize(restored, "test") == text);
+        }
+        CHECK(evo_load_checkpoint(text.c_str()) == 1);
+        CHECK(g_world->cfg.maxAge == value);
+        CHECK(g_world->creatures[0].pos.x == value);
+        CHECK(evo_load_checkpoint(good.c_str()) == 1);
+    }
+    section("writer float endpoints and subnormals");
+    // The first overflowing rounding interval (including its tie) is refused.
+    const double overflow = double(std::numeric_limits<float>::max()) +
+        std::ldexp(1.0, std::numeric_limits<float>::max_exponent -
+                        std::numeric_limits<float>::digits - 1);
+    for (double value : {overflow, -overflow, 1e100, -1e100}) {
+        refuse([&](auto& j) { member(member(j, "config"), "maxAge") = number(value); });
+        refuse([&](auto& j) { member(member(j, "creatures"), "posX").arr[0] = number(value); });
+    }
+    section("float overflow refusal");
     // Saved payload, not startup settings, controls restoration allocations.
     for (const char* key : {"predatorCount", "targetFood", "foodPatches", "currentEddies"}) {
         jsonm::Value j;

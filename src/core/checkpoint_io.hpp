@@ -305,9 +305,15 @@ inline bool integer(const Value* v, double lo, double hi) {
 }
 
 inline bool finiteFloat(const Value& v) {
-    return v.type == Type::Number && std::isfinite(v.num) &&
-           v.num >= -double(std::numeric_limits<float>::max()) &&
-           v.num <= double(std::numeric_limits<float>::max());
+    if (v.type != Type::Number || !std::isfinite(v.num)) return false;
+    // %.9g can write FLT_MAX slightly beyond its exact double value. Accept
+    // the entire interval that rounds to a finite float, excluding the tie
+    // at the overflow midpoint, before attempting the narrowing conversion.
+    const double overflow = double(std::numeric_limits<float>::max()) +
+        std::ldexp(1.0, std::numeric_limits<float>::max_exponent -
+                        std::numeric_limits<float>::digits - 1);
+    return v.num > -overflow && v.num < overflow &&
+           std::isfinite(static_cast<float>(v.num));
 }
 
 inline bool uniqueKeys(const Value& v) {
@@ -586,8 +592,12 @@ inline bool floatColumn(const Value& block, const char* key, size_t n,
                         double hi = std::numeric_limits<float>::max()) {
     const Value* a = block.find(key);
     if (!a || !a->isArray() || a->arr.size() != n) return false;
-    for (const Value& v : a->arr)
-        if (!finiteFloat(v) || v.num < lo || v.num > hi) return false;
+    for (const Value& v : a->arr) {
+        if (!finiteFloat(v)) return false;
+        // Bounds describe stored float state, after the checked conversion.
+        const float stored = static_cast<float>(v.num);
+        if (stored < lo || stored > hi) return false;
+    }
     return true;
 }
 
@@ -1250,7 +1260,8 @@ inline bool deserialize(const std::string& text, World& world, std::string& erro
     // state. init() draws from the rng (vortices, food patches), which is
     // exactly why the rng state is restored LAST, below.
     if (policy) {
-        world.cfg = policyConfig;
+        // readConfig above applied the validated persisted fields to the
+        // destination. Keep its nonserialized analysis/inspection settings.
         world.initForCheckpoint(width, height);
     } else {
         world.init(width, height, 0);
