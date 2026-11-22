@@ -253,7 +253,7 @@ const isType = (t) => (m) => m.type === t;
 const statsAt = (f) => (m) => m.type === 'stats' && m.frame >= f;
 
 /* ---------------------------------------------------------------------
- * The page itself. web/ocean_handoff.js, web/ocean_config.js,
+ * The page itself. web/ui_common.js, web/ocean_handoff.js, web/ocean_config.js,
  * web/ocean_dash.js and web/ocean.js, as they are and in ocean.html's order,
  * in one vm context over a small DOM: the elements ocean.html declares (made
  * on first use) and the ones the page makes, events that bubble, listeners
@@ -306,6 +306,7 @@ const PAGE_SRC = (() => {
         '    get lastS() { return fresh(lastS); }, inspect: inspect,\n' +
         '    get draft() { return typeof draft === "undefined" ? null : draft; }, get draftGen() { return typeof draftGen === "undefined" ? 0 : draftGen; },\n' +
         '    pendingDiff: typeof pendingDiff === "function" ? pendingDiff : function () { return []; }, readForm: readForm,\n' +
+        '    liveTweaks: typeof liveTweaks === "function" ? liveTweaks : function () { return []; },\n' +
         '    getVal: getVal, importWorld: importWorld, wiringNow: wiringNow, frame: frame,\n' +
         '    get worldSave() { return typeof worldSave === "undefined" ? null : worldSave; }, get selectedId() { return selectedId; },\n' +
         '    get engineState() { return typeof engineState === "undefined" ? null : engineState; },\n' +
@@ -333,6 +334,14 @@ const SCENE_STUB = `window.EvoOceanScene = { load: function () { return Promise.
     return function () { return fixed[k]; };
   } });
 } };`;
+/* the same scene with a detail level that changes, as ocean_scene.js's setQuality / degrade (1..3; true when it changed) */
+const SCENE_DETAIL = (() => {
+    const marker = '    if (k === "setFlashlight")';
+    onceIn(SCENE_STUB, marker, 'SCENE_STUB');
+    return SCENE_STUB.replace(marker,
+        '    if (k === "setQuality") return function (q) { q = Math.max(1, Math.min(3, q | 0)); if (q === fixed.quality) return false; fixed.quality = q; return true; };\n' +
+        '    if (k === "degrade") return function () { if (fixed.quality <= 1) return false; fixed.quality--; return true; };\n' + marker);
+})();
 /* a browser whose WebGL2 context can't be made: ocean_scene.js's create() returns null */
 const SCENE_NOGL = `window.EvoOceanScene = { load: function () { return Promise.resolve(); }, create: function () { return null; } };`;
 const CHARTS_STUB = `(function () {
@@ -518,7 +527,7 @@ const unref = (t) => { if (t && t.unref) t.unref(); return t; };
 
 /* A page at ocean.html?query, started (or refused: page.failed). opts: perf
  * (web/ocean_perf.js loaded, as ocean.html loads it), guide (web/guide.js
- * after ocean.js, as ocean.html), nogl (no WebGL2: the scene can't be made),
+ * after ocean.js, as ocean.html), nogl (no WebGL2: the scene can't be made), scene (the scene stub's source),
  * nosimd (WebAssembly without SIMD), media {query: true} (matchMedia; every
  * other query false; page.setMedia changes one and tells its listeners). */
 /* every page booted (the runner stops their Turbo workers when their section ends: in node a worker shares the
@@ -671,9 +680,9 @@ async function bootPage(query, opts) {
         return sh;
     };
     const run = (name, src) => vm.runInContext(src !== undefined ? src : fs.readFileSync(path.join(WEB, name), 'utf8'), ctx, { filename: path.join(WEB, name) });
-    run('ocean_handoff.js');
+    run('ui_common.js'); run('ocean_handoff.js');
     if (opts.perf) run('ocean_perf.js');
-    run('ocean_scene_stub.js', opts.nogl ? SCENE_NOGL : SCENE_STUB); run('ocean_config.js');
+    run('ocean_scene_stub.js', opts.nogl ? SCENE_NOGL : opts.scene || SCENE_STUB); run('ocean_config.js');
     run('charts_stub.js', CHARTS_STUB); run('ocean_dash.js'); run('ocean.js', PAGE_SRC);
     if (opts.guide) run('guide.js');
     page.ctx = ctx; page.doc = doc; page.Ev = Ev; page.T = ctx.__oceanPage; page.KEYS = ctx.EvoOceanConfig.KEYS;
@@ -2376,6 +2385,47 @@ async function pageTabKeys() {
     ok(p.uncaught.length === 0, 'no exception escaped the page\'s handlers' + (p.uncaught.length ? ' (' + p.uncaught[0] + ')' : ''));
 }
 
+/* The review of PR #89: the setup sheet's tabs as ocean.js builds and selects
+ * them (EvoUI.tabs, web/ui_common.js), not only the shared helper: built with
+ * one tab in the Tab order, the keyboard's keys with the focus going along,
+ * a focused tab's Up not a speed key, and a pointer's press letting the focus
+ * go, so the page's keys work again. */
+async function pageSetupTabs() {
+    section('The page: the setup sheet\'s tabs through EvoUI.tabs, as ocean.js builds and selects them (review of PR #89)');
+    const p = await bootPage(PAGE_Q);
+    const tabs = () => p.el('tabs').children.filter(b => b.getAttribute('role') === 'tab');
+    const sel = () => tabs().findIndex(b => b.getAttribute('aria-selected') === 'true');
+    const roving = () => tabs().every((b, i) => b.tabIndex === (i === sel() ? 0 : -1));
+    const shown = (b) => !p.el(b.getAttribute('aria-controls')).hidden;
+    const n = tabs().length, speed = () => p.el('speedlabel').textContent;
+    ok(n >= 6 && tabs()[0].id === 'tab-run' && sel() === 0 && roving() && tabs().every(b => /^panel-/.test(b.getAttribute('aria-controls') || '')) &&
+       tabs().filter(shown).length === 1 && shown(tabs()[0]),
+       'built: ' + n + ' tabs, each controlling its panel; Run selected, only it in the Tab order, only its panel shown');
+    p.tabTo('tab-run');
+    const spd0 = speed();
+    p.key('ArrowRight');
+    ok(sel() === 1 && p.doc.activeElement === tabs()[1] && roving() && shown(tabs()[1]) && !shown(tabs()[0]) &&
+       p.ctx.localStorage.getItem('evo_boids.ocean.tab') === tabs()[1].id.slice(4),
+       '  Right: the next tab selected, focused, its panel shown, stored (' + p.ctx.localStorage.getItem('evo_boids.ocean.tab') + ')');
+    p.key('End');
+    ok(sel() === n - 1 && p.doc.activeElement === tabs()[n - 1] && roving(), '  End: the last (the sheet had Left / Right only before)');
+    p.key('ArrowRight');
+    ok(sel() === 0 && p.doc.activeElement === tabs()[0], '  Right on the last: round to Run');
+    p.key('ArrowLeft');
+    ok(sel() === n - 1 && p.doc.activeElement === tabs()[n - 1], '  Left on the first: round to the last');
+    p.key('Home');
+    ok(sel() === 0 && roving() && shown(tabs()[0]), '  Home: the first');
+    p.key('ArrowUp');
+    ok(sel() === 0 && speed() === spd0, '  Up on a focused tab: no tab move, not a speed key (' + spd0 + ')');
+    p.key('Enter');
+    ok(sel() === 0 && p.doc.activeElement === tabs()[0], '  Enter on a focused tab: it stays selected and keeps the focus');
+    p.pointer(); tabs()[2].focus(); tabs()[2].click();
+    ok(sel() === 2 && p.doc.activeElement !== tabs()[2] && roving() && shown(tabs()[2]), 'a pointer\'s press: selected, its panel shown, the focus let go (it kept it before)');
+    p.key('ArrowUp');
+    ok(speed() !== spd0, '  then ArrowUp: the page\'s speed key again (' + spd0 + ' -> ' + speed() + ')');
+    ok(p.uncaught.length === 0, 'no exception escaped the page\'s handlers' + (p.uncaught.length ? ' (' + p.uncaught[0] + ')' : ''));
+}
+
 /* The review's coverage: a whole number written 300.0 (a float that is
  * whole) is accepted as 300 by the field, a setup file and the link. */
 async function pageIntegralFloats() {
@@ -2926,6 +2976,137 @@ async function pageDraft() {
            'the next world\'s own settings dim');
         ok(p.uncaught.length === 0, 'no exception escaped the page\'s handlers' + (p.uncaught.length ? ' (' + p.uncaught[0] + ')' : ''));
     }
+    {   /* the water's rules: food drifts with waves alone (the engine carries it in any flow: flowE1, wallFlowOn); the eddy
+         * count needs eddies; the eddy radius also sets the walled current's fade at the glass, in the gyre too (wallBc) */
+        const p = await bootPage(PAGE_Q7);   /* no current, no waves, wrapping sides */
+        const inert = (k) => p.el('f_' + k).classList.contains('inert');
+        const st = () => ['foodDrift', 'currentMode', 'deepCurrent', 'currentEddies', 'currentCore'].filter(inert).join(' ') || 'none';
+        const still = st();
+        p.edit('waveSpeed', 6);   /* live: the running world's waves and the next one's */
+        const waves = st();
+        p.edit('waveSpeed', 0);
+        const calm = st();
+        p.edit('currentStrength', 5);
+        const eddies = st();
+        p.edit('currentMode', 1);
+        const gyreWrap = st();
+        p.edit('walls', true);
+        const gyreWalls = st();
+        p.edit('currentMode', 0);
+        const eddiesWalls = st();
+        ok(still === 'foodDrift currentMode deepCurrent currentEddies currentCore' && waves === 'currentMode deepCurrent currentEddies currentCore' &&
+           calm === still && eddies === 'none' && gyreWrap === 'currentEddies currentCore' && gyreWalls === 'currentEddies' && eddiesWalls === 'none',
+           'the water\'s settings dim by what moves the water: still (' + still + '), waves only: food drift usable (' + waves + '), calm again (' + calm +
+           '); a current in eddies (' + eddies + '); a gyre with wrapping sides: no eddies, no radius (' + gyreWrap + '); a gyre in glass walls: ' +
+           'the radius sets the fade at the glass (' + gyreWalls + '); eddies in walls (' + eddiesWalls + ')');
+        ok(p.uncaught.length === 0, 'no exception escaped the page\'s handlers' + (p.uncaught.length ? ' (' + p.uncaught[0] + ')' : ''));
+    }
+}
+
+/* The Setup modeline says the detail the tank is drawn at, after every change of it: Hold 60 fps lowering it (one frame a
+ * second: slow frames at one step), then switched off (restoreDetail: the full detail again) */
+async function pageModelineDetail() {
+    section('The Setup modeline follows the tank\'s drawing detail: Hold 60 fps lowers it, switching it off restores it');
+    const p = await bootPage(PAGE_Q7, { scene: SCENE_DETAIL });
+    const sc = p.ctx.EvoOcean.scene;
+    const said = () => { const m = /detail (\d) of 3/.exec(p.el('modeline').textContent); return m ? +m[1] : null; };
+    const d0 = said(), q0 = sc.quality();
+    let now = performance.now();
+    for (let i = 0; i < 12 && sc.quality() === q0; i++) { now += 1000; p.raf(now); }
+    const q1 = sc.quality(), d1 = said();
+    const g = p.el('governor');
+    g.checked = false; g.dispatchEvent(new p.Ev('change', { bubbles: true }));
+    const q2 = sc.quality(), d2 = said();
+    ok(q0 === 3 && d0 === 3 && q1 === 2 && d1 === 2 && q2 === 3 && d2 === 3,
+       'the modeline\'s detail follows the scene\'s: ' + d0 + ' of 3 at ' + q0 + ', ' + d1 + ' after Hold 60 fps lowered it to ' + q1 + ', ' + d2 +
+       ' once it is off (' + q2 + ')');
+    ok(p.uncaught.length === 0, 'no exception escaped the page\'s handlers' + (p.uncaught.length ? ' (' + p.uncaught[0] + ')' : ''));
+}
+
+/* What the modeline says replays is the run's history, not a comparison of settings (review of #88, P2-1): a reseed floor
+ * raised for a step adds founders that Replay never makes, so setting it back leaves the run changed; an edit to the value
+ * the world already runs changes nothing; Replay (a new world) starts clean. Read from the modeline's data-replay / data-why. */
+async function pageReplayHistory() {
+    section('The modeline\'s replay claim is the run\'s history: a live change set back still counts, a no-op edit and Replay do not');
+    const p = await bootPage(PAGE_Q7);
+    const claim = () => { const d = p.el('modeline').dataset; return (d.replay || '?') + (d.why ? ':' + d.why : ''); };
+    const fish = () => p.ctx.EvoOcean.state().n;
+    let now = performance.now();
+    const frames = (k) => { for (let i = 0; i < k; i++) { const cb = p.raf; p.raf = null; if (cb) cb(now += 17); } };
+    frames(3);
+    const c0 = claim(), floor0 = p.T.getVal('minPopulation');
+    p.edit('minPopulation', floor0);   /* the value it runs: nothing changes */
+    const cSame = claim();
+    const n0 = fish();
+    p.edit('minPopulation', n0 + 40);   /* live: founders below it at the next step */
+    frames(3);
+    const n1 = fish(), cRaised = claim();
+    p.edit('minPopulation', floor0);    /* set back: the settings equal the setup's again */
+    frames(2);
+    const tweaksBack = p.T.liveTweaks().length, cBack = claim();
+    p.click('replay');
+    if (p.T.asking) p.click('startconfirm');
+    frames(1);
+    const cReplay = claim();
+    ok(c0 === 'yes' && cSame === 'yes' && n1 >= n0 + 40 && cRaised === 'no:live' && tweaksBack === 0 && cBack === 'no:live' && cReplay === 'yes',
+       'a fresh world replays (' + c0 + '); its floor edited to the value it runs (' + floor0 + '): still (' + cSame + '); raised to ' + (n0 + 40) +
+       ' for a step (' + n0 + ' -> ' + n1 + ' fish): not (' + cRaised + '); set back (' + tweaksBack + ' settings differ from the setup): still not (' +
+       cBack + '); after Replay (' + cReplay + ')');
+    /* EvoOcean.set, around the sheet (review of #88, round 2, P3): by value too, its own repeated writes included */
+    const set = (k, v) => { const r = p.ctx.EvoOcean.set(k, v); frames(1); return r && claim(); };
+    const sSame = set('minPopulation', floor0), sSame2 = set('minPopulation', floor0);
+    const sUp = set('minPopulation', floor0 + 20), sUp2 = set('minPopulation', floor0 + 20), sBack = set('minPopulation', floor0);
+    p.click('replay');
+    if (p.T.asking) p.click('startconfirm');
+    frames(1);
+    const sClean = claim(), sAgain = set('minPopulation', floor0);
+    ok(sSame === 'yes' && sSame2 === 'yes' && sUp === 'no:live' && sUp2 === 'no:live' && sBack === 'no:live' && sClean === 'yes' && sAgain === 'yes',
+       'EvoOcean.set: the floor it runs (' + floor0 + '), twice: no change (' + sSame + ', ' + sSame2 + '); ' + (floor0 + 20) + ', twice: a change (' + sUp +
+       ', ' + sUp2 + '), set back: still (' + sBack + '); after Replay (' + sClean + '), ' + floor0 + ' again: no change (' + sAgain + ')');
+    ok(p.uncaught.length === 0, 'no exception escaped the page\'s handlers' + (p.uncaught.length ? ' (' + p.uncaught[0] + ')' : ''));
+}
+
+/* A saved world's file keeps its setup and settings, not what changed live before it was saved (review of #88, round 2,
+ * P2): the floor raised for a step and set back, saved and opened on a fresh page, is "unknown", never "yes", until a
+ * Replay or a start begins a run with a clean history; a file whose settings still differ from its setup says "no". */
+async function pageReplayReopen() {
+    section('A world opened from a file: whether Replay repeats it is unknown (its history is not in the file), until Replay');
+    const p = await bootPage(PAGE_Q7);
+    const claimOf = (x) => { const d = x.el('modeline').dataset; return (d.replay || '?') + (d.why ? ':' + d.why : ''); };
+    let now = performance.now();
+    const frames = (x, k) => { for (let i = 0; i < k; i++) { const cb = x.raf; x.raf = null; if (cb) cb(now += 17); } };
+    frames(p, 3);
+    const floor0 = p.T.getVal('minPopulation'), n0 = p.ctx.EvoOcean.state().n;
+    p.edit('minPopulation', n0 + 40);
+    frames(p, 3);
+    p.edit('minPopulation', floor0);
+    frames(p, 2);
+    if (!p.T.paused) p.key(' ');
+    const n1 = p.ctx.EvoOcean.state().n, cSaved = claimOf(p);
+    const s = await savedWorld(p);
+    const q = await bootPage(PAGE_Q7);
+    const said = await openWorld(q, s.bytes, s.name);
+    frames(q, 1);
+    const nq = q.ctx.EvoOcean.state().n, cOpened = claimOf(q), tq = q.T.liveTweaks().length;
+    q.click('replay');
+    if (q.T.asking) q.click('startconfirm');
+    frames(q, 1);
+    const cReplayed = claimOf(q);
+    ok(n1 >= n0 + 40 && cSaved === 'no:live' && /Opened the saved world/.test(said) && nq === n1 && tq === 0 && cOpened === 'unknown:opened' &&
+       cReplayed === 'yes',
+       'floor raised for a step (' + n0 + ' -> ' + n1 + ' fish) and set back: ' + cSaved + '; saved and opened on a fresh page ("' + said.slice(0, 40) +
+       '…", ' + nq + ' fish, ' + tq + ' settings differ): ' + cOpened + ', not yes; after Replay: ' + cReplayed);
+    /* a file whose settings differ from its setup: "no" (its own tweak), and still opened */
+    p.edit('minPopulation', floor0 + 10);
+    frames(p, 1);
+    const s2 = await savedWorld(p);
+    const r = await bootPage(PAGE_Q7);
+    await openWorld(r, s2.bytes, s2.name);
+    frames(r, 1);
+    const cTweaked = claimOf(r);
+    ok(cTweaked === 'no:live opened', 'a saved world still carrying a live tweak (floor ' + (floor0 + 10) + '): ' + cTweaked);
+    ok(p.uncaught.length + q.uncaught.length + r.uncaught.length === 0, 'no exception escaped the pages\' handlers' +
+       (p.uncaught.concat(q.uncaught, r.uncaught).length ? ' (' + p.uncaught.concat(q.uncaught, r.uncaught)[0] + ')' : ''));
 }
 
 /* UI-3: Start from. Every scenario (and Surprise me's draws) starts in
@@ -5082,8 +5263,8 @@ const SECTIONS = {
     pageHeld, pageRefusal, pageAsyncSetup, pageStartFailures, pageOverflow, pageBools, pageDashboards,
     pageWallsOverride, pageFreshVisit, pageSizeFields, pageRoundTrip,
     pageColourBench, pageLayers, pageResize, pageKeys, pageStartupFailures, pageTourEscape, pageWholeFields,
-    pageTurboFraction, pageCardNumbers, pageMixedRecovery, pageEscOwner, pageTabKeys, pageIntegralFloats,
-    pageTurboMode, pageStartDoor, pageFollowBack, pageDraft, pageScenarios,
+    pageTurboFraction, pageCardNumbers, pageMixedRecovery, pageEscOwner, pageTabKeys, pageSetupTabs, pageIntegralFloats,
+    pageTurboMode, pageStartDoor, pageFollowBack, pageDraft, pageModelineDetail, pageReplayHistory, pageReplayReopen, pageScenarios,
     pageCancelQueued, pageQueuedFile, pageNextBehindLive, pageEditedFile, pageReplayStaleRead, pageAskTarget, pagePendingAsk,
     pageKeyboardAsk,
     worldCodec, pageWorldFile, pageWorldTurbo, pageWorldRefusals,

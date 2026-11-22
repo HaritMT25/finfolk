@@ -137,6 +137,44 @@ THE ESTIMATOR (per horizon; Annex H.9.2: an interval-censored Gaussian composite
       reported with the failure rate, labelled approximate and conditional on identification.
     - This departs from H.7's materialized-record bootstrap: the bank's intervals are descriptive and
       outside the confirmatory family. No coverage study is registered.
+    - RNG EXCEPTION to Annex H's general SplitMix convention: this bank's descriptive bootstrap uses
+      NumPy default_rng(0), with its existing draws unchanged. Alignment requires the owner's decision;
+      the observation content hash, estimator code hash and NumPy version are recorded in each estimate.
+
+  Production availability requires the complete registered allocation, including every free control and
+  replicate, with no declared missing cells or duplicate endpoint/replicate keys. --descriptive explicitly
+  permits partial summaries; their generator_noise.available is always false.
+
+THE D8 REFIT (amendment D8 v2 rules 46-48; A_design_v5.md section 2, clarifications 1 and 2): the frozen observations
+REFITTED, never re-collected, into finfolk.redqueen.noisebank.bank/3 (the legacy estimate and its bank/2 output stay
+byte-for-byte; every D8 consumer refuses bank/2).
+  - The capped law: a survivor count is min{M_h, floor(600 sigma(z) + 1/2)} with M_h from #90's clock through
+    material.cohort_ceiling (247 / 0 / 0 at 5k / 10k / 20k, refused otherwise); the interval map gives the CAPPED
+    category k = M_h the upper end +inf (interval_bounds' ceiling, threaded through arrays, the marginals, the
+    standardized bounds); the support 0..M_h is checked first (a violation refuses the refit, counts only).
+  - D8 path only: a cell-channel whose replicates occupy fewer than MIN_CATEGORIES = 3 distinct counts is excluded
+    as unidentified by policy before the Newton fit, and counted ("screened").
+  - 10k / 20k (M_h = 0): S and F are structural-zero declarations; capture is fitted alone and its dependence is the
+    capture-only reduced fit (the R_CC, D_CC group maxima ARE the row and donor variances when feasible).
+  - The bootstrap draws its world multiplicities from rqlib.SplitMix64 streams AnnexH/D8/1/noisebank/D8-refit/
+    h<h>/bootstrap (below(n)), recorded with their seeds and first outputs.
+  - provenance binds the frozen observations to the registered bank root's bundles (store.verify_all, verify_chunk,
+    the in-memory reconstruction by collect, one engine binary); estimate-d8 verifies every input by hash before
+    parsing, writes its receipt durably first and the artifact binding it; validate-d8 runs the prospective
+    parameter-recovery study (V1-V5) on synthetic banks from the witnessed spec. Every D8 run is charged to the
+    cumulative D5 CPU ledger (failed and interrupted runs too): the D8 commands require the EXISTING ledger and
+    validate every entry (a missing ledger or a malformed entry refuses, never read as 0); before its work each run
+    writes an in-progress attempt record beside the ledger (<ledger>.attempts.jsonl, never the shared ledger), refreshed
+    durably while it runs; finalization appends exactly one entry per attempt. A run killed hard (SIGKILL, OOM, a
+    reboot) leaves its attempt open: every budget-dependent command refuses until d8-reconcile charges it its last
+    durable CPU plus 60 s. Every D8 accounting command holds one exclusive lock on the ledger file for its whole
+    transaction and refuses, never waits, when another holds it.
+    noisebank.py provenance --study BANK_ROOT --design D --plan P --obs OBS [--manifest M] --out PROV --ledger L
+    noisebank.py d8-validation-spec --design D [--round 1] --out SPEC
+    noisebank.py validate-d8 --spec SPEC --design D --out REPORT --ledger L
+    noisebank.py estimate-d8 --obs OBS --ages A --design D --plan P --provenance PROV --validation-report REPORT \\
+        --out bank_d8.json --receipt RECEIPT --ledger L [--boot 999]
+    noisebank.py d8-reconcile --ledger L
 
 THE PRODUCTION V BUILDER (cov_parts; Annex H.3.1): one block's bank covariance diag(d) + U U' (for
 recurrence.Cov), from the bank's components and the bank's s(mu) curves (noisescale.evaluate, the
@@ -148,8 +186,11 @@ counts, not their exact native-scale covariance (checked against simulation at s
     noisebank.py plan --block val_block.json --validation-dir ~/finfolk/validation --arena ARENA_ID \\
         --main-registry ~/finfolk/study/config/worlds.json --templates t.json ... \\
         --age-reference ages.json --avoid production_plan.jsonl ... --out nb_design.json
-    noisebank.py collect --study STUDY --design noisebank_design.json --plan plan.jsonl [--declare-missing ...]
+    noisebank.py collect --study STUDY --design noisebank_design.json --plan plan.jsonl [--declare-missing ...] \\
+        --out obs.json [--age-diagnostics age_diagnostics.json]
     noisebank.py estimate --obs noisebank_obs.json --out bank.json [--boot 999]
+    noisebank.py estimate --obs partial_obs.json --descriptive --out descriptive_bank.json
+    # Older observations without an embedded design also require --design noisebank_design.json.
 """
 from __future__ import annotations
 
@@ -216,6 +257,7 @@ MU_FINAL = 1e-7                    # (the last barrier weight: its duality gap, 
 BOOT_FAIL_MAX = 0.05               # (the interval is unavailable beyond this share of failed draws)
 MARGINAL_TOL = 1e-8                # (the marginal Newton's gradient tolerance, per replicate)
 FEAS_TOL = 1e-12                   # (the feasibility tolerance of the unconstrained group maxima)
+MIN_CATEGORIES = 3                 # (the D8 path only, A_design_v5 2.5 item 7: fewer distinct counts: screened out)
 BOOT = 999
 GROUPS = ("R_CC", "R_SS", "R_CS", "D_CC", "D_SS", "D_CS", "T_CS", "R_CF", "R_SF")
 KINDS = ("C", "RC", "Q", "RQ")
@@ -322,28 +364,12 @@ def bind_validation(block, validation_dir, main_registries):
     return {"registry": rp, "registry_sha256": sha, "namespace": reg["namespace"], "main_registries": mains}
 
 
-def _collect_seeds(obj, out, hint=False):
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            _collect_seeds(v, out, hint or "seed" in str(k).lower())
-    elif isinstance(obj, list):
-        for v in obj:
-            _collect_seeds(v, out, hint)
-    elif isinstance(obj, int) and not isinstance(obj, bool) and hint:
-        out.add(obj)
-    return out
-
-
 def avoid_seeds(path):
-    text = rqlib.read_text(path)
+    """Validated reservations shared with worlds registration and the assay planner."""
     try:
-        doc = json.loads(text)
-    except ValueError:
-        doc = None
-    if isinstance(doc, dict):
-        return _collect_seeds(doc, set())
-    rows = [json.loads(ln) for ln in text.split("\n") if ln.strip()]
-    return planlib.plan_seeds(rows) | _collect_seeds(rows, set())
+        return rqlib.load_reservations(path)[0]
+    except rqlib.ReservationError as exc:
+        raise NoiseBankError(str(exc)) from exc
 
 
 def make_design(block, templates, ages, avoid_paths, ns=SEED_NAMESPACE, validation_dir=None, arena=None,
@@ -383,10 +409,14 @@ def make_design(block, templates, ages, avoid_paths, ns=SEED_NAMESPACE, validati
     seeds = planlib.plan_seeds(rows)
     checked = []
     for p in avoid_paths:
-        hit = sorted(seeds & avoid_seeds(p))
+        try:
+            reserved, record = rqlib.load_reservations(p)
+        except rqlib.ReservationError as exc:
+            raise NoiseBankError(str(exc)) from exc
+        hit = sorted(seeds & reserved)
         if hit:
             raise NoiseBankError(f"{len(hit)} noise-bank engine seed(s) are reserved in {p}: {hit[:5]}")
-        checked.append({"path": os.path.abspath(p), "sha256": rqlib.sha256_file(p)})
+        checked.append(record)
     n_pred = sum(1 for r in rows if r.get("predators") is not None)
     design["noisebank"] = {"schema": SCHEMA, "validation_dir": os.path.abspath(validation_dir), "arena": str(arena),
                            "validation": binding, "worlds": order, "partner": partner, "times": list(TIMES),
@@ -433,12 +463,29 @@ def bind_plan(design, plan_path):
 def collect(study, design, plan_path, declared_missing=()):
     """The bank's observations, bound to the final plan: per cell the prey and predator snapshots, the
     replicate and, per horizon, the captures and survivors of the 600 cohort."""
+    return collect_with_age_diagnostics(study, design, plan_path, declared_missing)[0]
+
+
+def collect_with_age_diagnostics(study, design, plan_path, declared_missing=()):
+    """collect's observations (the same bytes) and, separately versioned, the collected cells'
+    age-stratified diagnostics (D8 v2 rule 48; store.age_diagnostics_doc). A /3 bundle without its
+    complete age summary is refused; a /1 or /2 bundle's diagnostics are explicitly unavailable.
+    (Codex re-review of 6407f80, P2) Every indexed bundle is read through store.read_packed: one that
+    cannot be read (a compression method pack() never writes, refused before decoding; damaged bytes; a
+    mismatch with the index) refuses the WHOLE collection, naming the root, chunk and cell, whatever its
+    design: its design is inside the unreadable bundle, so it is never skipped (store.collect_refusal)."""
     import store
     rows, plan_sha = bind_plan(design, plan_path)
-    _, cells = store.load_index(study)
-    obs = []
+    try:
+        _, cells = store.load_index(study)
+    except store.StoreError as e:
+        raise NoiseBankError(f"study {study}: its chunk index cannot be read ({e})")
+    obs, ages = [], []
     for cid in sorted(cells):
-        b = json.loads(store.read_member(study, cid, cells=cells))
+        try:
+            b = json.loads(store.read_packed(study, cid, cells=cells))
+        except store.StoreError as e:
+            raise NoiseBankError(store.collect_refusal(e, cid in rows))
         c = b["cell"]
         if c.get("design") != design.get("name"):
             continue
@@ -447,6 +494,10 @@ def collect(study, design, plan_path, declared_missing=()):
             raise NoiseBankError(f"{cid}: not exactly a cell of the final plan")
         if b["score"].get("n_start") != N_PREY:
             raise NoiseBankError(f"{cid}: cohort {b['score'].get('n_start')}, not {N_PREY}")
+        try:
+            ages.append(store.age_diagnostics_entry(cid, b))
+        except store.StoreError as e:
+            raise NoiseBankError(str(e))
         hz = {}
         for h in HORIZONS:
             x = [y for y in b["score"]["horizons"] if y["steps"] == h]
@@ -460,8 +511,9 @@ def collect(study, design, plan_path, declared_missing=()):
     missing = sorted(set(rows) - {o["cell"] for o in obs})
     if missing != sorted(set(declared_missing)):
         raise NoiseBankError(f"{len(missing)} plan cells are not collected; a missing cell must be declared exactly")
-    return {"schema": OBS_SCHEMA, "design_sha256": rqlib.canonical_sha(design), "plan_sha256": plan_sha,
-            "missing": missing, "observations": obs}
+    doc = {"schema": OBS_SCHEMA, "design_sha256": rqlib.canonical_sha(design), "plan_sha256": plan_sha,
+           "design": design, "missing": missing, "observations": obs}
+    return doc, store.age_diagnostics_doc(doc, ages)
 
 
 # ================================================================== numerics: normal tails, BVN
@@ -649,7 +701,7 @@ def _log_iprob(a, b):
 def check_domain(l1, h1, l2, h2, r):
     """THE REGISTERED ADMISSIBLE DOMAIN of log_rect (what the bank produces; anything else is refused):
     |rho| <= RHO_MAX; every finite standardized endpoint within +-E_MAX (infinite ends only for the
-    counts 0 and N); every interval at least W_MIN wide."""
+    counts 0, the ceiling M, and N); every interval at least W_MIN wide."""
     import numpy as np
     if not abs(r) <= RHO_MAX:
         raise NoiseBankError(f"log_rect: rho {r} outside the registered box")
@@ -787,13 +839,19 @@ def log_rect(l1, h1, l2, h2, r, chunk=20000):
 
 
 # ================================================================== stage 1: the marginals
-def interval_bounds(k, N):
-    """The latent interval of count k of N: [logit((k - 1/2)/N), logit((k + 1/2)/N)], -inf at 0, +inf at N."""
+def interval_bounds(k, N, ceiling=None):
+    """The latent interval of count k of N: [logit((k - 1/2)/N), logit((k + 1/2)/N)], -inf at 0, +inf at the
+    ceiling M (D8 v2 rules 46-47, A_design_v5 2.4 / 2.5 item 1: the CAPPED category k = M has upper end +inf while
+    the scale stays N). The ceiling defaults to N (capture, and every pre-D8 caller unchanged); a count above it is
+    refused."""
     import numpy as np
+    M = N if ceiling is None else ceiling
     k = np.asarray(k, float)
+    if np.any(k > M):
+        raise NoiseBankError(f"interval_bounds: a count above the ceiling {M} (of N = {N}) is refused")
     with np.errstate(divide="ignore", invalid="ignore"):
         lo = np.where(k <= 0, -np.inf, np.log((k - 0.5) / (N - k + 0.5)))
-        hi = np.where(k >= N, np.inf, np.log((k + 0.5) / (N - k - 0.5)))
+        hi = np.where(k >= M, np.inf, np.log((k + 0.5) / (N - k - 0.5)))
     return lo, hi
 
 
@@ -824,15 +882,15 @@ def _marg_hess(lo, hi, a, t, eps=1e-5):
     return 0.5 * (H + np.transpose(H, (0, 2, 1)))
 
 
-def fit_marginals(K, N, max_iter=200):
-    """Stage 1: per row of K (rows x R counts of N) the interval-censored normal MLE (a, sigma): Newton
-    (finite-difference Hessian of the analytic gradient, step halving) from the EMPIRICAL-LOGIT MOMENTS (the
-    starting values only). -> dict a, sigma, loglik, ok (converged, sigma >= SIGMA_MIN, negative definite
-    Hessian), var_t (the observed-information variance of log sigma-hat)."""
+def fit_marginals(K, N, ceiling=None, max_iter=200):
+    """Stage 1: per row of K (rows x R counts of N, capped at the ceiling M: A_design_v5 2.5 item 3) the
+    interval-censored normal MLE (a, sigma): Newton (finite-difference Hessian of the analytic gradient, step
+    halving) from the EMPIRICAL-LOGIT MOMENTS (the starting values only). -> dict a, sigma, loglik, ok (converged,
+    sigma >= SIGMA_MIN, negative definite Hessian), var_t (the observed-information variance of log sigma-hat)."""
     import numpy as np
     K = np.asarray(K, float)
     n, R = K.shape
-    lo, hi = interval_bounds(K, N)
+    lo, hi = interval_bounds(K, N, ceiling)
     z0 = np.log((K + 0.5) / (N - K + 0.5))
     a = z0.mean(axis=1)
     t = np.log(np.maximum(z0.std(axis=1, ddof=1), 0.05))
@@ -882,12 +940,16 @@ def fit_marginals(K, N, max_iter=200):
 
 
 # ================================================================== the bank's arrays and pairs
-def arrays(obs, horizon):
+def arrays(obs, horizon, ceilings=None):
     """-> per horizon the complete exposed cells (prey / predator snapshot keys and indices, counts C and S:
-    cells x R), the free controls (prey snapshot x R, NaN where missing), N per channel, the replicates."""
+    cells x R), the free controls (prey snapshot x R, NaN where missing), N per channel, the ceiling M per channel
+    and the replicates. ceilings (the D8 path, A_design_v5 2.5 item 2): {str(horizon): M_h} of the survivor
+    ceilings; then A["M"] = {"C": B, "S": M_h, "F": M_h} and the range check tests survivors against M_h (a
+    support violation, 2.3: refused, reporting only the number of violating observations). Without it M = N."""
     import numpy as np
     B = capture_bound(horizon)
     h = str(horizon)
+    Mh = None if ceilings is None else ceilings[h]
     by, free = {}, {}
     reps = {o["replicate"] for o in obs}
     if any(not isinstance(r, int) or isinstance(r, bool) for r in reps) or sorted(reps) != list(range(len(reps))):
@@ -899,7 +961,10 @@ def arrays(obs, horizon):
         if any(not isinstance(v, int) or isinstance(v, bool) for v in vals):
             raise NoiseBankError(f"{o.get('cell')}: counts at {h} steps must be integers")
         if o["pred"] is None:
-            free.setdefault(tuple(o["prey"]), {})[o["replicate"]] = x["survivors"]
+            key = tuple(o["prey"])
+            if o["replicate"] in free.get(key, {}):
+                raise NoiseBankError(f"free {key} replicate {o['replicate']} occurs twice")
+            free.setdefault(key, {})[o["replicate"]] = x["survivors"]
         else:
             key = (tuple(o["prey"]), tuple(o["pred"]))
             if o["replicate"] in by.get(key, {}):
@@ -918,19 +983,30 @@ def arrays(obs, horizon):
         v = arr[np.isfinite(arr)]
         if np.any(v < 0) or np.any(v > n):
             raise NoiseBankError(f"{name} outside the integers 0..{n} at {horizon} steps")
+        if Mh is not None and n == N_PREY and np.any(v > Mh):
+            raise NoiseBankError(f"{int(np.sum(v > Mh))} {name} observation(s) above the survivor ceiling M = {Mh} "
+                                 f"at {horizon} steps (a support violation, D8 v2 rule 46: the refit is refused)")
     return {"prey": prey, "pred": pred, "I": np.array([pi[i] for i, _ in cells], int),
             "J": np.array([pj[j] for _, j in cells], int), "C": Cc, "S": Sc, "F": Fc,
-            "N": {"C": B, "S": N_PREY, "F": N_PREY}, "R": R, "incomplete_cells": len(by) - len(cells)}
+            "N": {"C": B, "S": N_PREY, "F": N_PREY},
+            "M": {"C": B, "S": N_PREY if Mh is None else Mh, "F": N_PREY if Mh is None else Mh},
+            "R": R, "incomplete_cells": len(by) - len(cells)}
 
 
-def usable(A):
-    """Per CHANNEL: the saturation mask, then the stage-1 marginal fits -> {ch: {"ok", "mu", "a", "sigma",
-    "var_t", "counts"}}."""
+def usable(A, screen=False, channels=("C", "S", "F")):
+    """Per CHANNEL: the saturation mask, then the stage-1 marginal fits (at the channel's ceiling A["M"], 2.5 item 3)
+    -> {ch: {"ok", "mu", "a", "sigma", "var_t", "counts"}}. screen (the D8 path only, A_design_v5 2.5 item 7, PC-18,
+    R10): a cell-channel that passes the saturation mask but whose replicates occupy fewer than MIN_CATEGORIES
+    distinct count categories is excluded as unidentified BEFORE the Newton fit (a prospective conservative
+    exclusion, by policy), counted in "unidentified" and in its own "screened" (clarification 1 C7); the
+    identification rules still apply to every cell that passes it. Without screen the legacy records are unchanged
+    (no "screened" key). channels: those fitted (the zero-ceiling horizons fit capture only, 2.6)."""
     import numpy as np
     out = {}
-    for ch in ("C", "S", "F"):
+    for ch in channels:
         Kc = A[ch]
         N = A["N"][ch]
+        M = A.get("M", A["N"])[ch]
         complete = np.all(np.isfinite(Kc), axis=1)
         mu = np.full(len(Kc), np.nan)
         mu[complete] = Kc[complete].mean(axis=1) / N
@@ -938,19 +1014,26 @@ def usable(A):
         fit_rows = np.flatnonzero(complete & ~sat)
         ok = np.zeros(len(Kc), bool)
         a, sg, vt = (np.full(len(Kc), np.nan) for _ in range(3))
-        if len(fit_rows):
-            f = fit_marginals(Kc[fit_rows], N)
-            ok[fit_rows] = f["ok"]
-            a[fit_rows], sg[fit_rows], vt[fit_rows] = f["a"], f["sigma"], f["var_t"]
-        out[ch] = {"ok": ok, "mu": mu, "a": a, "sigma": sg, "var_t": vt,
-                   "counts": {"rows": int(len(Kc)), "incomplete": int((~complete).sum()), "saturated": int(sat.sum()),
-                              "unidentified": int(len(fit_rows) - ok[fit_rows].sum()), "usable": int(ok.sum())}}
+        screened = np.zeros(len(Kc), bool)
+        if screen and len(fit_rows):
+            ncat = np.array([len(np.unique(Kc[i])) for i in fit_rows], int)
+            screened[fit_rows[ncat < MIN_CATEGORIES]] = True
+        newton = fit_rows[~screened[fit_rows]]
+        if len(newton):
+            f = fit_marginals(Kc[newton], N, M)
+            ok[newton] = f["ok"]
+            a[newton], sg[newton], vt[newton] = f["a"], f["sigma"], f["var_t"]
+        counts = {"rows": int(len(Kc)), "incomplete": int((~complete).sum()), "saturated": int(sat.sum()),
+                  "unidentified": int(len(fit_rows) - ok[fit_rows].sum()), "usable": int(ok.sum())}
+        if screen:
+            counts["screened"] = int(screened.sum())
+        out[ch] = {"ok": ok, "mu": mu, "a": a, "sigma": sg, "var_t": vt, "counts": counts}
     return out
 
 
 def _std_bounds(A, U, ch, rows):
-    """The standardized interval bounds (rows x R) of channel ch at the stage-1 margins."""
-    lo, hi = interval_bounds(A[ch][rows], A["N"][ch])
+    """The standardized interval bounds (rows x R) of channel ch at the stage-1 margins (capped at A["M"][ch])."""
+    lo, hi = interval_bounds(A[ch][rows], A["N"][ch], A.get("M", A["N"])[ch])
     a, s = U[ch]["a"][rows][:, None], U[ch]["sigma"][rows][:, None]
     return (lo - a) / s, (hi - a) / s
 
@@ -1013,11 +1096,11 @@ def rho_grid(m=Z_INTERVALS):
     return np.tanh(z_nodes(m))
 
 
-def _pair_blocks(A, U, G):
+def _pair_blocks(A, U, G, groups=GROUPS):
     """Per group: the pair blocks (standardized bounds, source keys) and the keys."""
     import numpy as np
     out = {}
-    for g in GROUPS:
+    for g in groups:
         keys, blocks = {}, []
         for c1, r1, c2, r2, prey_w, pred_w in G[g]:
             l1, h1 = _std_bounds(A, U, c1, r1)
@@ -1048,16 +1131,17 @@ def exact_column(blocks, nkeys, r, chunk=40000):
     return col, deep
 
 
-def group_tables(A, U, G, m=Z_INTERVALS):
-    """Stage 2's exact contributions: per group and per bootstrap source key (DISTINCT worlds per role), the
+def group_tables(A, U, G, m=Z_INTERVALS, groups=GROUPS):
+    """Stage 2's exact contributions: per group (of groups: all nine, or the capture-only R_CC and D_CC of a
+    zero-ceiling horizon, A_design_v5 2.6) and per bootstrap source key (DISTINCT worlds per role), the
     summed dependence contributions log P(both; rho) - log P(1) - log P(2) at every grid node, the pair blocks
     (kept for the certification) -> {g: {"keys", "z" (nodes), "T" (keys x nodes), "pairs", "npk" (pairs per
     key), "deep_tail", "blocks"}}."""
     import numpy as np
     zn = z_nodes(m)
-    pb = _pair_blocks(A, U, G)
+    pb = _pair_blocks(A, U, G, groups)
     out = {}
-    for g in GROUPS:
+    for g in groups:
         keys, blocks = pb[g]
         T = np.zeros((len(keys), len(zn)))
         deep = 0
@@ -1458,8 +1542,9 @@ def identified(zn, vals, rho, npairs):
     return per >= INFO_MIN, per, at_box
 
 
-def validate_grid(tab, fitrho):
-    """LOCAL OBJECTIVE-VALUE VALIDATION (Codex #72 r3 P2-2, narrowed by the coordinator after r4): per group,
+def validate_grid(tab, fitrho, groups=GROUPS):
+    """LOCAL OBJECTIVE-VALUE VALIDATION (Codex #72 r3 P2-2, narrowed by the coordinator after r4): per group
+    (of groups),
     the EXACT objective at the fitted rho and at the off-grid midpoints of its bracket and both neighbours,
     against the interpolant; where a miss exceeds GRID_LL_TOL per pair, those exact columns are inserted as
     nodes (candidates deduplicated against each other and the grid at MIN_KNOT in z; an invalid grid is a
@@ -1467,7 +1552,7 @@ def validate_grid(tab, fitrho):
     is not a global certificate."""
     import numpy as np
     worst, inserted = 0.0, False
-    for g in GROUPS:
+    for g in groups:
         t = tab[g]
         zn = t["z"]
         z = math.atanh(max(-RHO_MAX, min(RHO_MAX, fitrho[g])))
@@ -1628,19 +1713,35 @@ def _entries(f):
     return [SR[0, 0], SR[1, 1], SR[0, 1], SR[0, 2], SR[1, 2], SD[0, 0], SD[1, 1], SD[0, 1], SE[0, 0], SE[1, 1], SE[0, 1]]
 
 
-def bootstrap(tab, n_worlds, boot, seed):
-    """The registered uncertainty procedure -> (draws x BOOT_NAMES, failed draws, of which identification
-    rejections). Each weighted refit applies THE SAME identification rule as the point estimate (identified,
-    with the WEIGHTED pair counts); a group without weight, an unidentified group or a refused fit is a failed
-    draw (Codex #72 r3 P2-5)."""
+def _numpy_multiplicities(seed, n_worlds):
+    """The pre-D8 bootstrap's draws (the registered RNG exception of the legacy estimate: NumPy default_rng(seed),
+    its existing draws unchanged) -> a function returning one draw's (prey-role m, predator-role m')."""
     import numpy as np
     rng = np.random.default_rng(seed)
-    out, failed, unident = [], 0, 0
-    for _ in range(boot):
+
+    def draw():
         mm = np.bincount(rng.integers(0, n_worlds, n_worlds), minlength=n_worlds)
         mp = np.bincount(rng.integers(0, n_worlds, n_worlds), minlength=n_worlds)
+        return mm, mp
+    return draw
+
+
+def bootstrap(tab, n_worlds, boot, seed, draws=None, groups=GROUPS, fit=None, entries=None, names=BOOT_NAMES):
+    """The registered uncertainty procedure -> (draws x names, failed draws, of which identification
+    rejections). Each weighted refit applies THE SAME identification rule as the point estimate (identified,
+    with the WEIGHTED pair counts); a group without weight, an unidentified group or a refused fit is a failed
+    draw (Codex #72 r3 P2-5). draws (the D8 path, A_design_v5 2.5 item 5): a function returning one draw's
+    multiplicities (m, m') in place of NumPy default_rng(seed); groups / fit / entries / names: the capture-only
+    reduced fit of a zero-ceiling horizon (2.6) in place of the nine groups' fit_dependence."""
+    import numpy as np
+    draw = draws or _numpy_multiplicities(seed, n_worlds)
+    fit = fit or fit_dependence
+    entries = entries or _entries
+    out, failed, unident = [], 0, 0
+    for _ in range(boot):
+        mm, mp = draw()
         objs, pairs, bad = {}, {}, False
-        for g in GROUPS:
+        for g in groups:
             w = pick_weights(tab[g]["keys"], mm, mp)
             if not w.any():
                 bad = True
@@ -1656,13 +1757,13 @@ def bootstrap(tab, n_worlds, boot, seed):
             failed += 1
             continue
         try:
-            out.append(_entries(fit_dependence(objs, pairs)))
+            out.append(entries(fit(objs, pairs)))
         except NoiseBankError:
             failed += 1
-    return np.array(out, float).reshape(len(out), len(BOOT_NAMES)), failed, unident
+    return np.array(out, float).reshape(len(out), len(names)), failed, unident
 
 
-def interval_record(D, failed, boot, unident=0):
+def interval_record(D, failed, boot, unident=0, names=BOOT_NAMES):
     """Codex #72 r2 P2-5 / r3 P2-5: the failed draws (identification rejections included) are counted; the
     interval is UNAVAILABLE (its own status) beyond BOOT_FAIL_MAX of the draws, otherwise reported with the
     failure rate, labelled approximate and conditional on identification."""
@@ -1677,15 +1778,17 @@ def interval_record(D, failed, boot, unident=0):
         return dict(rec, status="unavailable", ci95=None,
                     reason=f"{failed} of {boot} draws failed (> {BOOT_FAIL_MAX:.0%})")
     return dict(rec, status="ok", ci95={n: [float(np.percentile(D[:, k], 2.5)), float(np.percentile(D[:, k], 97.5))]
-                                        for k, n in enumerate(BOOT_NAMES)})
+                                        for k, n in enumerate(names)})
 
 
-def horizon_estimate(A, boot=BOOT, seed=0, m=Z_INTERVALS):
+def horizon_estimate(A, boot=BOOT, seed=0, m=Z_INTERVALS, screen=False, draws=None):
     """One horizon: the usable channels, the s(mu) curves and nu0, the nine groups (identification), the
     components (or "unavailable" with reasons) with the grid VALIDATED LOCALLY at the fit, the registered uncertainty
-    procedure."""
+    procedure. The D8 path (estimate_d8, A_design_v5 2.5) passes screen=True (the minimum-categories screen) and
+    draws(n_worlds) (the bootstrap's SplitMix64 multiplicities); the capped interval map comes with A (arrays'
+    ceilings). Without them the legacy record is unchanged."""
     import numpy as np
-    U = usable(A)
+    U = usable(A, screen=screen)
     rec = {"capture_bound": A["N"]["C"], "replicates": A["R"], "incomplete_cells": A["incomplete_cells"],
            "channels": {ch: U[ch]["counts"] for ch in ("C", "S", "F")}, "scales": {}, "nu0": {}, "curve_points": {}}
     for ch in ("C", "S", "F"):
@@ -1751,21 +1854,106 @@ def horizon_estimate(A, boot=BOOT, seed=0, m=Z_INTERVALS):
                                                "row leaves the free row / control split unidentified"},
                          "shares": {ch: {"row": float(fit["SigmaR"][k, k]), "donor": float(fit["SigmaD"][k, k]),
                                          "cell": float(fit["SigmaE"][k, k])} for k, ch in enumerate("CS")}}
-    D, failed, unident = bootstrap(tab, len(worlds), boot, seed)
+    D, failed, unident = bootstrap(tab, len(worlds), boot, seed, draws=None if draws is None else draws(len(worlds)))
     rec["bootstrap"] = interval_record(D, failed, boot, unident)
     rec.update(status="ok", reasons=[])
     return rec
 
 
-def estimate(doc, boot=BOOT, seed=0, m=Z_INTERVALS, replicates=None):
+def observation_key(observation):
+    """The exposed/free endpoint-replicate identity, independently of the cell id."""
+    try:
+        prey, pred, replicate = observation["prey"], observation["pred"], observation["replicate"]
+        if (not isinstance(prey, (list, tuple)) or len(prey) != 2
+                or not all(isinstance(v, str) and v for v in prey)
+                or (pred is not None and (not isinstance(pred, (list, tuple)) or len(pred) != 2
+                                         or not all(isinstance(v, str) and v for v in pred)))
+                or type(replicate) is not int or replicate < 0):
+            raise ValueError("invalid endpoint or replicate")
+        return tuple(prey), None if pred is None else tuple(pred), replicate
+    except (KeyError, TypeError, ValueError) as exc:
+        raise NoiseBankError(f"invalid observation identity: {exc}") from exc
+
+
+def validate_observations(doc, descriptive=False, design=None):
+    """Check identities always; production additionally requires the exact expanded design.
+
+    The design is embedded by collect; older observation files can supply it explicitly.
+    Comparing every expanded row catches entire absent pairs and entire absent replicates,
+    which an observed-only coverage check cannot detect.
+    """
+    observations = doc.get("observations")
+    if not isinstance(observations, list) or not observations:
+        raise NoiseBankError("no observations")
+    keys, cells = set(), {}
+    for observation in observations:
+        key = observation_key(observation)
+        if key in keys:
+            raise NoiseBankError(f"endpoint-replicate {key} occurs twice")
+        keys.add(key)
+        cell = observation.get("cell")
+        if not isinstance(cell, str) or not cell or cell in cells:
+            raise NoiseBankError(f"invalid or duplicate cell id {cell!r}")
+        cells[cell] = key
+        if not isinstance(observation.get("horizons"), dict) or any(str(h) not in observation["horizons"] for h in HORIZONS):
+            raise NoiseBankError(f"{cell}: missing required horizons")
+    if descriptive:
+        return {"observed": len(cells), "declared_missing": doc.get("missing"), "complete": False}
+    if doc.get("missing") != []:
+        raise NoiseBankError("production estimation requires no declared missing cells (use --descriptive for partial summaries)")
+    design = design if design is not None else doc.get("design")
+    if not isinstance(design, dict) or rqlib.canonical_sha(design) != doc.get("design_sha256"):
+        raise NoiseBankError("production estimation requires the hash-matching registered design (recollect or supply --design)")
+    allocation = design.get("noisebank")
+    if not isinstance(allocation, dict):
+        raise NoiseBankError("the registered design has no noise-bank allocation")
+    worlds = allocation.get("worlds", [])
+    times = allocation.get("times", [])
+    if (design.get("name") != "noisebank" or design.get("replicates") != REPLICATES
+            or not isinstance(worlds, list) or not all(isinstance(w, str) and w for w in worlds)
+            or len(worlds) != N_WORLDS or len(set(worlds)) != N_WORLDS or times != list(TIMES)
+            or allocation.get("partner") != {w: worlds[(i + 1) % len(worlds)] for i, w in enumerate(worlds)}):
+        raise NoiseBankError("not the registered noise-bank allocation (use --descriptive for other designs)")
+    try:
+        rows, _, _ = planlib.expand_v2(design, pending=True)
+    except (planlib.DesignError, KeyError, TypeError, ValueError) as exc:
+        raise NoiseBankError(f"cannot expand registered bank design: {exc}") from exc
+    expected = {row["id"]: ((row["prey"]["world"], row["prey"]["time"]),
+                            None if row["predators"] is None else
+                            (row["predators"]["world"], row["predators"]["time"]), row["replicate"])
+                for row in rows}
+    if not expected or len(expected) != len(rows) or len(set(expected.values())) != len(rows):
+        raise NoiseBankError("registered bank design has empty or duplicate endpoint-replicate allocation")
+    registered_keys = {((w, tq), pred, r)
+                       for w in worlds for tq in times for r in range(design["replicates"])
+                       for pred in [None] + [(wp, tp) for wp in (w, allocation["partner"][w]) for tp in times]}
+    if set(expected.values()) != registered_keys:
+        raise NoiseBankError("the design does not expand to the complete registered bank allocation")
+    if cells != expected:
+        missing, extra = len(set(expected) - set(cells)), len(set(cells) - set(expected))
+        raise NoiseBankError(f"incomplete registered bank allocation: expected {len(expected)} trajectories, "
+                             f"observed {len(cells)} ({missing} missing, {extra} extra; endpoint/replicate identities must match)")
+    return {"expected": len(expected), "observed": len(cells), "complete": True}
+
+
+def estimate(doc, boot=BOOT, seed=0, m=Z_INTERVALS, replicates=None, descriptive=False, design=None, obs_bytes=None):
     """The bank: per horizon (horizon_estimate); the generator noise block and map.py's prior at the
-    production 5k horizon (available only when its components and all three curves are)."""
+    production 5k horizon. Production availability requires the complete registered
+    allocation, identified components and all three curves. Partial estimation requires
+    descriptive=True and is always unavailable for production."""
     if doc.get("schema") != OBS_SCHEMA:
         raise NoiseBankError(f"observations schema {doc.get('schema')!r}")
     if not isinstance(boot, int) or isinstance(boot, bool) or boot < 1:
         raise NoiseBankError(f"bootstrap draws must be a positive integer (got {boot!r})")
+    coverage = validate_observations(doc, descriptive, design)
+    import numpy as np
     obs = doc["observations"]
-    out = {"schema": BANK_SCHEMA, "obs_design_sha256": doc.get("design_sha256"), "plan_sha256": doc.get("plan_sha256"),
+    obs_sha = rqlib.sha256_bytes(obs_bytes) if obs_bytes is not None else rqlib.canonical_sha(doc)
+    out = {"schema": BANK_SCHEMA, "purpose": "descriptive" if descriptive else "production", "coverage": coverage,
+           "provenance": {"observations_sha256": obs_sha,
+                          "observation_hash_basis": "file bytes" if obs_bytes is not None else "canonical JSON",
+                          "estimator_sha256": rqlib.sha256_file(__file__), "numpy_version": np.__version__},
+           "obs_design_sha256": doc.get("design_sha256"), "plan_sha256": doc.get("plan_sha256"),
            "estimator": {"z_intervals": m, "rho_max": RHO_MAX, "saturation": list(SATURATION), "sigma_min": SIGMA_MIN,
                          "info_min": INFO_MIN, "multi_start": MULTI_START, "start_tol": START_TOL,
                          "boot": boot, "boot_fail_max": BOOT_FAIL_MAX, "seed": seed,
@@ -1791,10 +1979,1466 @@ def estimate(doc, boot=BOOT, seed=0, m=Z_INTERVALS, replicates=None):
                                               for ch in ("C", "S", "F")},
                                   "SigmaR": c["SigmaR"], "SigmaD": c["SigmaD"], "SigmaE": c["SigmaE"],
                                   "horizon": HORIZONS[0], "capture_bound": capture_bound(HORIZONS[0])}
+    if descriptive:
+        out["generator_noise"]["available"] = False
+        out["generator_noise"].setdefault("reasons", []).append("explicitly descriptive estimate; unavailable for production")
     out["map_variance"] = {"s_logit": out["generator_noise"].get("s_logit"), "nu0": base["nu0"],
                            "rule": "replicate-mean variance (nu0 s(mu)^2 + (R - 1) s_obs^2) / (nu0 + R - 1) / R; "
                                    "full_pooling: s(mu)^2 / R"}
     return out
+
+
+# ================================================================== THE D8 BANK REFIT (A_design_v5.md section 2)
+# The frozen observations are REFITTED under the capped 600-scaled law (D8 v2 rules 46-48), never re-collected; the
+# legacy estimate above stays byte-for-byte (its bank/2 output lacks the D8 fields and every D8 consumer refuses it).
+# obslaw (the law, the D8 streams, the bank/3 record constants and the strict loader) is imported only inside these
+# functions, so there is no import cycle (obslaw imports this module). The bound constants below are v5's.
+D8_DESIGN = "A_design_v5.md"
+D8_BANK_ROOT = "/home/harit/finfolk/redqueen_noisebank_2026"   # (v5 2.2 item 1: ~/finfolk/..., the root of VI:25)
+D8_PROVENANCE_SCHEMA = "finfolk.redqueen.noisebank.provenance/1"
+D8_RECEIPT_SCHEMA = "finfolk.redqueen.noisebank.d8refitreceipt/1"
+D8_SPEC_SCHEMA = "finfolk.redqueen.noisebank.d8validation.spec/1"
+D8_REPORT_SCHEMA = "finfolk.redqueen.noisebank.d8validation.report/1"
+D8_IMPLEMENTATION = ("noisebank.py", "noisescale.py", "obslaw.py", "common.py", "material.py", "plan.py", "store.py",
+                     "rqlib.py", "fixtures/registered_ages.json")       # (v5 2.8 L753-754: fit.noise.implementation)
+D8_COMMANDS = ("provenance", "estimate-d8", "d8-validation-spec", "validate-d8", "d8-reconcile")
+D5_CEILING_H = 240.0               # (the cumulative D5 ledger's ceiling, D8:289, H:1571-1577; calib's
+                                   #  stats.CPU_CEILING_H)
+D8_START_GUARD_H = 25.0            # (v5 2.11 / 7: >= 25 CPU-h remaining before provenance, a starting guard only)
+CAPTURE_GROUPS = ("R_CC", "D_CC")                  # (v5 2.6: the capture-only reduced fit's two groups; C4)
+CAPTURE_BOOT_NAMES = ("R_CC", "D_CC", "E_CC")      # (C4.1: BOOT_NAMES restricted to C)
+
+
+def d8_bindings():
+    """The registered bindings of the D8 refit (v5 0.3, 2.1, 2.2 item 1): the four input hashes and the bank root.
+    Any other bindings make every D8 output synthetic (validation and tests only; production consumers refuse it)."""
+    import obslaw
+    return dict(obslaw.REGISTERED_INPUTS, bank_root=D8_BANK_ROOT)
+
+
+def _bound_bytes(path, want, what):
+    """A bound input's bytes, refused BEFORE parsing when their sha256 is not the bound one (v5 2.1, R1)."""
+    raw = rqlib.read_bytes(path)
+    got = rqlib.sha256_bytes(raw)
+    if got != want:
+        raise NoiseBankError(f"{what} {path}: sha256 {got} is not the bound {want} (refused before parsing; "
+                             "A_design_v5 2.1, R1)")
+    return raw
+
+
+def _json_of(raw, what):
+    try:
+        return json.loads(raw)
+    except (UnicodeDecodeError, ValueError) as e:
+        raise NoiseBankError(f"{what}: not JSON ({e})") from None
+
+
+def _plan_rows(raw, what="plan"):
+    rows = []
+    for ln in raw.decode("utf-8").split("\n"):
+        if ln.strip():
+            rows.append(_json_of(ln.encode(), what))
+    return rows
+
+
+def d8_ceilings():
+    """M_h of the registered cohort through #90's clock (material.cohort_ceiling; never re-derived here), which must
+    be D8:154's 247 / 0 / 0 (v5 2.3, R4) -> {str(h): M_h}."""
+    import material
+    import obslaw
+    ages = material.registered_ages()
+    got = {str(h): material.cohort_ceiling(ages, h, DT) for h in HORIZONS}
+    if got != obslaw.CEILINGS:
+        raise NoiseBankError(f"the computed survivor ceilings {got} are not D8:154's {obslaw.CEILINGS} (refused; "
+                             "A_design_v5 2.3, R4)")
+    return got
+
+
+def d8_support(obs, ceilings):
+    """The support check (v5 2.3, D8:162-169): captures in 0..B(h), exposed and free survivors in 0..M_h at every
+    horizon. Any violation refuses the WHOLE refit (R3), reporting only the number of violating observations per
+    horizon and channel (never a value or a cell)."""
+    bad = {}
+    for o in obs:
+        for h in HORIZONS:
+            x = o["horizons"][str(h)]
+            checks = [("F" if o["pred"] is None else "S", x.get("survivors"), ceilings[str(h)])]
+            if o["pred"] is not None:
+                checks.append(("C", x.get("captures"), capture_bound(h)))
+            for ch, v, top in checks:
+                if type(v) is not int:
+                    raise NoiseBankError(f"counts at {h} steps must be integers (channel {ch})")
+                if v < 0 or v > top:
+                    bad.setdefault(str(h), {}).setdefault(ch, 0)
+                    bad[str(h)][ch] += 1
+    if bad:
+        raise NoiseBankError(f"support violation: observations outside 0..B(h) (captures) or 0..M_h (survivors), "
+                             f"counted per horizon and channel: {json.dumps(bad, sort_keys=True)} (D8 v2 rule 46; "
+                             "the whole refit is refused, A_design_v5 2.3, R3)")
+
+
+def d8_matched_controls(obs):
+    """v5 2.3 (R2): every exposed observation's prey snapshot has its free control FOR THE SAME REPLICATE."""
+    free = {(tuple(o["prey"]), o["replicate"]) for o in obs if o["pred"] is None}
+    lost = sum(1 for o in obs if o["pred"] is not None and (tuple(o["prey"]), o["replicate"]) not in free)
+    if lost:
+        raise NoiseBankError(f"{lost} exposed observations have no matched free control for their replicate (refused; "
+                             "A_design_v5 2.3, R2)")
+
+
+def d8_draws(text):
+    """The refit bootstrap's multiplicities (v5 2.5 item 5, PC-9): one rqlib.SplitMix64 stream per horizon, seeded
+    from its AnnexH/D8/1 text; per draw n_worlds below(n_worlds) for the prey-role multiplicities, then n_worlds
+    below(n_worlds) for the predator-role ones (the existing order: m, then m'). -> draws(n_worlds) -> draw()."""
+    def factory(n_worlds):
+        import numpy as np
+        import obslaw
+        rng = obslaw.d8_stream(text)
+
+        def draw():
+            mm = np.bincount(obslaw.splitmix_below(rng, n_worlds, n_worlds), minlength=n_worlds)
+            mp = np.bincount(obslaw.splitmix_below(rng, n_worlds, n_worlds), minlength=n_worlds)
+            return mm, mp
+        return draw
+    return factory
+
+
+def capture_only_fit(objs, pairs=None):
+    """The capture-only reduced fit of a zero-ceiling horizon (v5 2.6, PC-10; clarification 1 C4.2): the unconstrained
+    group maxima rho_R (R_CC) and rho_D (D_CC) ARE SigmaR[C,C] and SigmaD[C,C], SigmaE[C,C] = 1 - rho_R - rho_D (the
+    registered expression of components_of), when rho_R >= 0, rho_D >= 0 and rho_R + rho_D <= 1; otherwise refused
+    (NoiseBankError naming the maxima): no barrier fit is registered for the reduced set. -> fit_dependence's
+    record restricted to C."""
+    rR, rD = _argmax(*objs["R_CC"])[0], _argmax(*objs["D_CC"])[0]
+    if not (rR >= 0 and rD >= 0 and rR + rD <= 1):
+        raise NoiseBankError(f"the capture-only group maxima are infeasible (R_CC {rR:.4g}, D_CC {rD:.4g}; rho_R >= 0, "
+                             "rho_D >= 0 and rho_R + rho_D <= 1 are needed, and no barrier fit is registered for the "
+                             "reduced set: A_design_v5 2.6)")
+    rho = {"R_CC": rR, "D_CC": rD}
+    ll = sum(float(obj_rho(*objs[g], rho[g])[0][0]) for g in CAPTURE_GROUPS)
+    return {"rho": rho, "fit": "unconstrained", "loglik": ll, "SigmaR": [[rR]], "SigmaD": [[rD]],
+            "SigmaE": [[1.0 - rR - rD]], "problems": [], "starts": None,
+            "at_box": sorted(g for g in CAPTURE_GROUPS if abs(rho[g]) >= RHO_MAX - 1e-6)}
+
+
+def _capture_entries(f):
+    return [f["SigmaR"][0][0], f["SigmaD"][0][0], f["SigmaE"][0][0]]
+
+
+def horizon_capture_only(A, boot=BOOT, m=Z_INTERVALS, draws=None):
+    """A zero-ceiling horizon (v5 2.6; clarification 1 C4, C4.1, C4.2, C7): channels.S and .F are the structural-zero
+    declarations (no survival fit, curve, nu0, group, variance or covariance of any value); capture is fitted as at
+    5k (the minimum-categories screen, the marginals, S_C, nu0_C) and its dependence is the capture-only reduced fit
+    over R_CC and D_CC, validated locally on the grid and bootstrapped over these two groups (a draw whose reduced fit
+    is infeasible is a refused fit: a failed draw, as at 5k). The record is the 5k encoding restricted to C."""
+    import numpy as np
+    import obslaw
+    U = usable(A, screen=True, channels=("C",))
+    rec = {"capture_bound": A["N"]["C"], "replicates": A["R"], "incomplete_cells": A["incomplete_cells"],
+           "channels": {"C": U["C"]["counts"], "S": dict(obslaw.STRUCTURAL_ZERO), "F": dict(obslaw.STRUCTURAL_ZERO)},
+           "scales": {}, "nu0": {}, "curve_points": {}}
+    ok = U["C"]["ok"]
+    cv = fit_scale(U["C"]["mu"][ok], U["C"]["sigma"][ok] ** 2)
+    rec["scales"]["C"] = cv
+    rec["nu0"]["C"] = nu0_of(U["C"]["mu"][ok], U["C"]["sigma"][ok], U["C"]["var_t"][ok], cv)
+    rec["curve_points"]["C"] = sorted([float(a), float(b)] for a, b in zip(U["C"]["mu"][ok], U["C"]["sigma"][ok]))
+    Uc = dict(U, S={"ok": np.zeros(len(A["S"]), bool)}, F={"ok": np.zeros(len(A["F"]), bool)})
+    G, worlds = group_pairs(A, Uc)
+    rec["worlds"] = worlds
+    reasons = [f"no {g} pairs" for g in CAPTURE_GROUPS if not G[g]]
+    if reasons:
+        rec.update(status="unavailable", reasons=reasons, components=None, bootstrap=None)
+        return rec
+    try:
+        tab = group_tables(A, Uc, G, m, CAPTURE_GROUPS)
+        objs = {g: (tab[g]["z"], tab[g]["T"].sum(axis=0)) for g in CAPTURE_GROUPS}
+        groups = {}
+        for g in CAPTURE_GROUPS:
+            r_hat, _ = _argmax(*objs[g])
+            good, per, at_box = identified(*objs[g], r_hat, tab[g]["pairs"])
+            groups[g] = {"pairs": tab[g]["pairs"], "rho_max": r_hat, "curvature_per_pair": per, "at_box": at_box,
+                         "deep_tail": tab[g]["deep_tail"]}
+            if not good:
+                reasons.append(f"{g} is unidentified ({'one-sided slope' if at_box else 'curvature'} per pair "
+                               f"{per:.3g} < {INFO_MIN})")
+        if reasons:
+            rec.update(status="unavailable", reasons=reasons, components=None, bootstrap=None, groups=groups)
+            return rec
+        try:
+            fit = capture_only_fit(objs)
+        except NoiseBankError as e:                    # (C4.2: infeasible maxima stay as diagnostics, unavailable)
+            rec.update(status="unavailable", reasons=[str(e)], components=None, bootstrap=None, groups=groups)
+            return rec
+        inserted, worst = validate_grid(tab, fit["rho"], CAPTURE_GROUPS)
+        shift = 0.0
+        if inserted:                                   # (ONE refit on the locally refined table, as at 5k)
+            objs = {g: (tab[g]["z"], tab[g]["T"].sum(axis=0)) for g in CAPTURE_GROUPS}
+            for g in CAPTURE_GROUPS:
+                r_hat, _ = _argmax(*objs[g])
+                good, per, at_box = identified(*objs[g], r_hat, tab[g]["pairs"])
+                groups[g].update(rho_max=r_hat, curvature_per_pair=per, at_box=at_box)
+                if not good:
+                    how = "one-sided slope" if at_box else "curvature"
+                    reasons.append(f"{g} is unidentified on the refined grid ({how} per pair {per:.3g} < {INFO_MIN})")
+            if reasons:
+                rec.update(status="unavailable", reasons=reasons, components=None, bootstrap=None, groups=groups)
+                return rec
+            try:
+                refit = capture_only_fit(objs)
+            except NoiseBankError as e:
+                rec.update(status="unavailable", reasons=[str(e)], components=None, bootstrap=None, groups=groups)
+                return rec
+            shift = max(abs(refit["rho"][g] - fit["rho"][g]) for g in CAPTURE_GROUPS)
+            fit = refit
+        for g in CAPTURE_GROUPS:
+            groups[g]["nodes"] = int(len(tab[g]["z"]))
+    except NoiseBankError as e:
+        rec.update(status="unavailable", reasons=[str(e)], components=None, bootstrap=None)
+        return rec
+    rec["groups"] = groups
+    rec["grid_validation"] = {"label": "local objective-value validation (not a global certificate)",
+                              "worst_miss_per_pair": worst, "tolerance": GRID_LL_TOL, "refined": inserted,
+                              "refit_shift": shift, "shift_flag": shift > GRID_RHO_TOL}
+    rR, rD, eC = fit["SigmaR"][0][0], fit["SigmaD"][0][0], fit["SigmaE"][0][0]
+    rec["components"] = {"SigmaR": fit["SigmaR"], "SigmaD": fit["SigmaD"], "SigmaE": fit["SigmaE"], "fit": fit["fit"],
+                         "loglik": fit["loglik"], "unconstrained_problems": fit["problems"],
+                         "multistart": fit["starts"], "at_box": fit["at_box"],
+                         "box": f"|rho| <= {RHO_MAX}: a registered numerical restriction (a share above it cannot be "
+                                "fitted)",
+                         "shares": {"C": {"row": float(rR), "donor": float(rD), "cell": float(eC)}}}
+    draw = None if draws is None else draws(len(worlds))
+    D, failed, unident = bootstrap(tab, len(worlds), boot, 0, draws=draw, groups=CAPTURE_GROUPS, fit=capture_only_fit,
+                                   entries=_capture_entries, names=CAPTURE_BOOT_NAMES)
+    rec["bootstrap"] = interval_record(D, failed, boot, unident, names=CAPTURE_BOOT_NAMES)
+    rec.update(status="ok", reasons=[])
+    return rec
+
+
+def horizon_estimate_d8(A, horizon, boot=BOOT, m=Z_INTERVALS, text=None):
+    """One horizon of the D8 refit (v5 2.4-2.6): A from arrays(obs, horizon, ceilings) (the capped interval map at
+    k = M_h), the minimum-categories screen, the bootstrap from the horizon's SplitMix64 stream (text: the refit's
+    AnnexH/D8/1/noisebank/D8-refit/h<h>/bootstrap unless given); a zero ceiling gives the capture-only record."""
+    import obslaw
+    draws = d8_draws(text or obslaw.REFIT_TEXT.format(horizon))
+    if A["M"]["S"] == 0:
+        return horizon_capture_only(A, boot, m, draws)
+    return horizon_estimate(A, boot, m=m, screen=True, draws=draws)
+
+
+def d8_provenance_record(raw, bindings, n_obs):
+    """The provenance receipt as estimate_d8 binds it (v5 2.1 item 5): reconstruction from the registered root
+    reproduces the frozen observations exactly, the cell count is the observations', one engine binary -> the
+    engine sha256 (fit.noise.engine_sha256: "the executable recorded by the verified bundles that reconstruct the
+    frozen observations", v5 2.2; by clarification 3 E2 that registered meaning plus this bound receipt satisfy 2.2's
+    attribution, and no label field exists)."""
+    p = _json_of(raw, "provenance receipt")
+    if not isinstance(p, dict) or p.get("schema") != D8_PROVENANCE_SCHEMA:
+        raise NoiseBankError(f"provenance receipt: schema {p.get('schema') if isinstance(p, dict) else None!r} is not "
+                             f"{D8_PROVENANCE_SCHEMA}")
+    rc = p.get("reconstruction") or {}
+    want = {"bank_root": bindings["bank_root"], "observations_sha256": bindings["observations_sha256"],
+            "plan_sha256": bindings["plan_sha256"], "design_sha256": bindings["design_file_sha256"],
+            "ages_sha256": bindings["ages_sha256"], "cells": n_obs}
+    wrong = sorted(k for k, v in want.items() if p.get(k) != v)
+    if wrong or rc.get("equals_frozen") is not True or rc.get("canonical_sha256") != bindings["observations_sha256"]:
+        what = wrong or "reconstruction"
+        raise NoiseBankError(f"provenance receipt: does not bind these inputs ({what}; A_design_v5 2.1 item 5, R5)")
+    if not rqlib.is_sha256(p.get("engine_sha256")):
+        raise NoiseBankError("provenance receipt: no single engine binary sha256 (R5)")
+    return p["engine_sha256"]
+
+
+def estimate_d8(obs_path, ages_path, design_path, plan_path, provenance_path, validation_path, bindings=None,
+                boot=BOOT, m=Z_INTERVALS, progress=None):
+    """The D8 refit (A_design_v5 2.1-2.7) of the frozen bank observations, everything verified first (R1-R5, R10):
+      1. the four inputs by file sha256 BEFORE parsing (obs 64b113ce..., plan 2ce2bb7a..., design 6559a8da..., ages
+         6ffb99ec...); obs schema obs/1 and missing == []; obs plan_sha256 == the plan's; canonical_sha(design) ==
+         obs design_sha256; the parsed ages == material.registered_ages(); every plan row's ages.sha256 == 6ffb99ec;
+      2. the complete registered allocation and the matched controls (validate_observations; R2), the ceilings
+         247 / 0 / 0 (R4), the support (R3);
+      3. the provenance receipt binds these observations (d8_provenance_record; 2.1 item 5, R5); the validation
+         report's sha256 is recorded (its acceptance gates adoption, R8, not this run);
+      4. per horizon: the capped interval map, the minimum-categories screen (R10), the bootstrap's SplitMix64
+         streams; 10k / 20k capture-only (2.6).
+    bindings: d8_bindings() unless given; any other bindings make the output synthetic. progress(label): called at
+    each major step (run_estimate_d8: the attempt's durable refresh). -> the refit record that d8_artifact turns into
+    the bank/3 artifact once its receipt is written (2.8: the receipt first)."""
+    import material
+    step = progress or (lambda label: None)
+    b = d8_bindings() if bindings is None else dict(bindings)
+    synthetic = b != d8_bindings()
+    if not isinstance(boot, int) or isinstance(boot, bool) or boot < 1:
+        raise NoiseBankError(f"bootstrap draws must be a positive integer (got {boot!r})")
+    obs_raw = _bound_bytes(obs_path, b["observations_sha256"], "observations")
+    plan_raw = _bound_bytes(plan_path, b["plan_sha256"], "plan")
+    design_raw = _bound_bytes(design_path, b["design_file_sha256"], "design")
+    ages_raw = _bound_bytes(ages_path, b["ages_sha256"], "ages")
+    doc, design = _json_of(obs_raw, "observations"), _json_of(design_raw, "design")
+    if not isinstance(doc, dict) or doc.get("schema") != OBS_SCHEMA:
+        raise NoiseBankError(f"observations schema {doc.get('schema') if isinstance(doc, dict) else None!r} is not "
+                             f"{OBS_SCHEMA}")
+    if doc.get("missing") != []:
+        raise NoiseBankError("observations: the D8 refit needs the complete bank (missing == []; A_design_v5 2.1)")
+    if doc.get("plan_sha256") != b["plan_sha256"]:
+        raise NoiseBankError("observations: plan_sha256 is not the bound plan's (A_design_v5 2.1 item 2)")
+    if not isinstance(design, dict) or rqlib.canonical_sha(design) != doc.get("design_sha256"):
+        raise NoiseBankError("observations: design_sha256 is not the canonical sha256 of the bound design file "
+                             "(A_design_v5 2.1 item 3)")
+    if _json_of(ages_raw, "ages") != material.registered_ages():
+        raise NoiseBankError("ages: the parsed ages are not material.registered_ages() (A_design_v5 2.1 item 4)")
+    rows = _plan_rows(plan_raw)
+    if not rows or any(not isinstance(r, dict) or not isinstance(r.get("ages"), dict)
+                       or r["ages"].get("sha256") != b["ages_sha256"] for r in rows):
+        raise NoiseBankError("plan: a row whose ages.sha256 is not the registered ages' (A_design_v5 2.1 item 4)")
+    coverage = validate_observations(doc, descriptive=False, design=design)            # (R2)
+    obs = doc["observations"]
+    d8_matched_controls(obs)
+    ceilings = d8_ceilings()                                                             # (R4)
+    d8_support(obs, ceilings)                                                            # (R3)
+    prov_raw = rqlib.read_bytes(provenance_path)                                        # (2.1 item 5; R5)
+    engine = d8_provenance_record(prov_raw, b, len(obs))
+    val_raw = rqlib.read_bytes(validation_path)
+    val = _json_of(val_raw, "validation report")
+    if not isinstance(val, dict) or val.get("schema") != D8_REPORT_SCHEMA:
+        raise NoiseBankError(f"validation report: schema is not {D8_REPORT_SCHEMA}")
+    step("estimate-d8: inputs verified")
+    horizons = {}
+    for h in HORIZONS:
+        A = arrays(obs, h, ceilings)
+        if A["R"] != REPLICATES:
+            raise NoiseBankError(f"{A['R']} replicates; {REPLICATES} are registered")
+        horizons[str(h)] = horizon_estimate_d8(A, h, boot, m)
+        step(f"estimate-d8: horizon {h}")
+    inputs = {"observations_sha256": rqlib.sha256_bytes(obs_raw), "ages_sha256": rqlib.sha256_bytes(ages_raw),
+              "plan_sha256": rqlib.sha256_bytes(plan_raw), "design_file_sha256": rqlib.sha256_bytes(design_raw),
+              "design_canonical_sha256": doc["design_sha256"], "provenance_sha256": rqlib.sha256_bytes(prov_raw),
+              "validation_report_sha256": rqlib.sha256_bytes(val_raw)}
+    return {"inputs": inputs, "horizons": horizons, "engine_sha256": engine, "ceilings": ceilings, "boot": boot,
+            "z_intervals": m, "synthetic": synthetic, "coverage": coverage}
+
+
+def d8_implementation():
+    """fit.noise.implementation_sha256 (v5 2.8 L753-754): the canonical sha256 of {file: sha256} over the D8
+    implementation's sources -> (sha256, the map)."""
+    files = {f: rqlib.sha256_file(os.path.join(HERE, f)) for f in D8_IMPLEMENTATION}
+    return rqlib.canonical_sha(files), files
+
+
+def d8_streams():
+    """fit.streams.bootstrap (v5 2.5 item 5, 2.8; clarification 1 C2): the three refit streams' texts, derived seeds
+    and first two next64() outputs, in the order h = 5000, 10000, 20000."""
+    import obslaw
+    texts = [obslaw.REFIT_TEXT.format(h) for h in HORIZONS]
+    return {"generator": obslaw.STREAM_GENERATOR, "namespace": obslaw.STREAM_NAMESPACE, "texts": texts,
+            "seeds": [obslaw.stream_seed_d8(t) for t in texts],
+            "first_outputs": [obslaw.stream_record(t)["first_outputs"] for t in texts]}
+
+
+def d8_artifact(fit, receipt_sha256):
+    """The finfolk.redqueen.noisebank.bank/3 artifact (v5 2.8 in clarification 1's representation; every text and
+    record constant from obslaw, shared with the strict loader): status d8-fitted, or unavailable (R7) when the 5k
+    fit is not ok, a channel has no curve or nu0_C is unavailable; noise and map_variance built from horizons["5000"]
+    (C9); every emitted nu0 positive and finite (clarification 2 D3's domain); no top-level engine_sha256. The bank
+    executable is fit.noise.engine_sha256, clarification 1's four-key fit.noise unchanged: by v5 2.2 and
+    clarification 3 E2 the field MEANS "the executable recorded by the verified bundles that reconstruct the frozen
+    observations", and that registered meaning together with the provenance receipt the artifact binds
+    (inputs.provenance_sha256, finfolk.redqueen.noisebank.provenance/1) satisfies 2.2's attribution: there is no label
+    field, in the artifact or in the receipt. Neither establishes historical executable origin beyond 2.2's limits."""
+    import material
+    import obslaw
+    hz = fit["horizons"]
+    for h, rec in hz.items():
+        for ch, v in (rec.get("nu0") or {}).items():
+            x = v.get("nu0")
+            if v.get("status") == "estimated" and not (isinstance(x, (int, float)) and not isinstance(x, bool)
+                                                       and math.isfinite(x) and x > 0):
+                raise NoiseBankError(f"horizon {h} nu0 {ch}: an estimated nu0 outside (0, inf) (clarification 2 D3)")
+    base = hz[str(HORIZONS[0])]
+    why = list(base.get("reasons") or []) + [f"no {ch} curve" for ch in ("C", "S", "F") if base["scales"][ch] is None]
+    if base["nu0"]["C"].get("status") == "unavailable":
+        why.append(f"nu0 C unavailable ({base['nu0']['C'].get('reason')})")
+    if base.get("status") != "ok" and not why:
+        why.append(f"5k status {base.get('status')!r}")
+    ceil5 = fit["ceilings"][str(HORIZONS[0])]
+    noise = {"available": not why, "horizon": HORIZONS[0], "capture_bound": capture_bound(HORIZONS[0]),
+             "survivor_ceiling": ceil5}
+    if why:
+        noise["reasons"] = why
+        s_logit = None
+    else:
+        s_logit = {ch: {k: base["scales"][ch][k] for k in ("x", "s", "direction")} for ch in ("C", "S", "F")}
+        c = base["components"]
+        noise.update(s_logit=s_logit, SigmaR=c["SigmaR"], SigmaD=c["SigmaD"], SigmaE=c["SigmaE"])
+    inputs = dict(fit["inputs"])
+    ages = material.registered_ages()
+    return {
+        "schema": obslaw.BANK_SCHEMA, "status": "unavailable" if why else obslaw.STATUS_FITTED,
+        "synthetic": bool(fit["synthetic"]), "cohort": ages, "cohort_sha256": material.AGES_SHA256,
+        "horizon": HORIZONS[0], "dt": DT, "support_law": material.SUPPORT_LAW,
+        "age_clock": material.age_clock_identity(),
+        "survivor_ceiling": ceil5,
+        "fit": {"noise_likelihood": obslaw.NOISE_LIKELIHOOD,
+                "noise": {"implementation_sha256": d8_implementation()[0], "inputs_sha256": rqlib.canonical_sha(inputs),
+                          "receipt_sha256": receipt_sha256, "engine_sha256": fit["engine_sha256"]},
+                "streams": {"bootstrap": d8_streams()}},
+        "noise": noise,
+        "map_variance": {"s_logit": s_logit, "nu0": base["nu0"], "rule": obslaw.MAP_VARIANCE_RULE,
+                         "consumer": obslaw.MAP_VARIANCE_CONSUMER},
+        "d8": {"amendment_sha256": obslaw.D8_SHA256, "capture_law": obslaw.CAPTURE_LAW,
+               "ceilings": dict(fit["ceilings"]), "max_age": ages["max_age"], "denominator": N_PREY,
+               "age_predicate": obslaw.D8_TEXTS["age_predicate"],
+               "capped_category": obslaw.D8_TEXTS["capped_category"]},
+        "inputs": inputs,
+        "estimator": dict(obslaw.registered_estimator(), boot=fit["boot"], z_intervals=fit["z_intervals"]),
+        "horizons": hz,
+    }
+
+
+# ---------------------------------------------------------------- provenance (v5 2.2: the store, the reconstruction)
+def _manifest_check(path, root, recs):
+    """v5 2.2 item 4 (R9): a pre-existing integrity manifest (sha256sum lines "<sha256>  <path>", a "*" binary marker
+    allowed, a path absolute or relative to the bank root). Every declaration is kept with its line number (never a
+    last-wins map; Codex revWP3 P2-3): two declarations of one normalized path (chunks/x.zip, ./chunks/x.zip and the
+    absolute path under the root are one path) with different sha256 are refused, naming both lines; EVERY declaration
+    of a chunk of the store is verified against the chunk's bytes (a mismatch refuses, naming its line); covers_chunks
+    when every chunk of the store is declared. Declarations of other files are parsed and conflict-checked only (v5
+    2.2 item 4 checks the store's chunks against the manifest; clarification 3: "verify every covered chunk")."""
+    import store
+    raw = rqlib.read_bytes(path)
+    declared = {}                                       # normalized path -> [(line, sha256)], in manifest order
+    for i, ln in enumerate(raw.decode("utf-8").splitlines(), 1):
+        if not ln.strip():
+            continue
+        parts = ln.split(None, 1)
+        if len(parts) != 2 or not rqlib.is_sha256(parts[0]):
+            raise NoiseBankError(f"manifest {path} line {i}: not a sha256sum line")
+        p = parts[1].strip().lstrip("*")
+        norm = os.path.normpath(p if os.path.isabs(p) else os.path.join(root, p))
+        for j, h in declared.get(norm, []):
+            if h != parts[0]:
+                raise NoiseBankError(f"manifest {path}: lines {j} and {i} declare {norm} with different sha256 "
+                                     "(conflicting duplicate declarations refused, R9)")
+        declared.setdefault(norm, []).append((i, parts[0]))
+    checked = 0
+    for r in recs:
+        p = os.path.normpath(os.path.join(root, store.CHUNKS, r["chunk"]))
+        if p in declared:
+            got = rqlib.sha256_file(p)
+            for i, h in declared[p]:                    # (every declaration, not one per path)
+                if got != h:
+                    raise NoiseBankError(f"provenance: chunk {r['chunk']} differs from the manifest {path} line {i} "
+                                         "(R9)")
+            checked += 1
+    return {"sha256": rqlib.sha256_bytes(raw), "covers_chunks": bool(recs) and checked == len(recs),
+            "chunks_checked": checked}
+
+
+def provenance(study, design_path, plan_path, obs_path, manifest_path=None, bindings=None, progress=None):
+    """`noisebank.py provenance` (A_design_v5 2.2): the receipt that binds the frozen observations to the stored
+    bundles and the executable they record. In this order, each failure a refusal (R5, R9):
+      1. the root: the registered bank root by path (a copy, restore elsewhere or replay is refused); the design,
+         plan and observations by file sha256 before parsing;
+      2. store integrity, independent of any manifest: store.verify_all(root, deep=True) and, for every chunk holding
+         a cell of the plan, store.verify_chunk (CRCs, the exact member set, every member's sha256);
+      5. from the same verified bundles (store.read_packed: read_member's index-checked read, refused with context,
+         #90): exactly ONE binary_sha256, tools_sha256 recorded as a set, every plan row's ages.sha256 the
+         registered ages', the cell set equal to the observations';
+      3. the reconstruction: collect(root, design, plan) IN MEMORY (since #90 collect_with_age_diagnostics(...)[0],
+         the same bytes), sha256(rqlib.canonical(doc)) == the frozen observations' (only the boolean and the two
+         hashes are recorded; the document is never written or printed);
+      4. a pre-existing manifest, when given (_manifest_check); otherwise covers_chunks false.
+    Reads bundles that contain scores (as collect always has) but reports none. progress(label): called after each
+    major step (run_provenance: the attempt's durable refresh). -> the provenance/1 record."""
+    import store
+    import zipfile
+    try:
+        return _provenance(study, design_path, plan_path, obs_path, manifest_path, bindings,
+                           progress or (lambda label: None))
+    except (store.StoreError, zipfile.BadZipFile, KeyError, TypeError) as e:
+        raise NoiseBankError(f"provenance: the store cannot be read as indexed ({type(e).__name__}: {e}; R9)") \
+            from None
+
+
+def _provenance(study, design_path, plan_path, obs_path, manifest_path, bindings, step):
+    import store
+    b = d8_bindings() if bindings is None else dict(bindings)
+    root = os.path.abspath(study)
+    if root != b["bank_root"] or os.path.realpath(study) != b["bank_root"]:
+        raise NoiseBankError(f"provenance: {study} is not the registered bank root {b['bank_root']} (refused by path: "
+                             "a copy, a restore elsewhere or a replay; A_design_v5 2.2 item 1, R9)")
+    design_raw = _bound_bytes(design_path, b["design_file_sha256"], "design")
+    _bound_bytes(plan_path, b["plan_sha256"], "plan")
+    obs_raw = _bound_bytes(obs_path, b["observations_sha256"], "observations")
+    design, obs_doc = _json_of(design_raw, "design"), _json_of(obs_raw, "observations")
+    index = os.path.join(root, store.INDEX)
+    if not os.path.isfile(index):
+        raise NoiseBankError(f"provenance: no chunk index at {index} (R9)")
+    index_sha = rqlib.sha256_file(index)
+    probs = store.verify_all(root, deep=True)                                          # 2(a)
+    if probs:
+        raise NoiseBankError(f"provenance: store.verify_all(deep=True) reports {len(probs)} problem(s): {probs[:3]} "
+                             "(R9)")
+    step("provenance: store.verify_all(deep=True)")
+    recs, cells = store.load_index(root)
+    rows, plan_sha = bind_plan(design, plan_path)
+    ours = sorted(c for c in rows if c in cells)
+    chunks = sorted({cells[c][0]["chunk"] for c in ours})
+    for r in recs:                                                                      # 2(b)
+        if r["chunk"] in chunks:
+            probs = store.verify_chunk(os.path.join(root, store.CHUNKS, r["chunk"]), r["cells"])
+            if probs:
+                raise NoiseBankError(f"provenance: store.verify_chunk({r['chunk']}) reports {probs[:3]} (R9)")
+    step("provenance: store.verify_chunk")
+    binaries, tools = set(), {}                                                         # 5.
+    for cid in ours:
+        bd = _json_of(store.read_packed(root, cid, cells=cells), f"bundle {cid}")
+        binaries.add(bd.get("binary_sha256"))
+        t = bd.get("tools_sha256")
+        tools[rqlib.canonical_sha(t)] = t
+    step("provenance: bundles read")
+    if len(binaries) != 1 or not rqlib.is_sha256(next(iter(binaries))):
+        raise NoiseBankError(f"provenance: the bundles record {len(binaries)} engine binaries, not exactly one sha256 "
+                             "(A_design_v5 2.2 item 5, R5)")
+    if any(not isinstance(r.get("ages"), dict) or r["ages"].get("sha256") != b["ages_sha256"] for r in rows.values()):
+        raise NoiseBankError("provenance: a plan row's ages.sha256 is not the registered ages' (R5)")
+    obs_cells = {o.get("cell") for o in obs_doc.get("observations", [])} if isinstance(obs_doc, dict) else set()
+    if set(ours) != obs_cells:
+        raise NoiseBankError(f"provenance: the stored cell set differs from the observations' "
+                             f"({len(set(ours) ^ obs_cells)} cells; R5)")
+    doc = collect(root, design, plan_path)                                              # 3.
+    got = rqlib.canonical_sha(doc)
+    del doc
+    step("provenance: reconstruction")
+    if got != b["observations_sha256"]:
+        raise NoiseBankError(f"provenance: the reconstruction's canonical sha256 {got} is not the frozen observations' "
+                             f"{b['observations_sha256']} (R9)")
+    manifest = (_manifest_check(manifest_path, root, recs) if manifest_path else           # 4.
+                {"sha256": None, "covers_chunks": False, "chunks_checked": 0})
+    return {"schema": D8_PROVENANCE_SCHEMA, "bank_root": root, "observations_sha256": rqlib.sha256_bytes(obs_raw),
+            "store": {"index_sha256": index_sha, "chunks_verified_all": len(recs),
+                      "chunks_verified_members": len(chunks)},
+            "reconstruction": {"method": "noisebank.collect in memory; sha256 of rqlib.canonical(doc), the bytes "
+                                         "write_json_durable writes", "canonical_sha256": got, "equals_frozen": True},
+            "plan_sha256": plan_sha, "design_sha256": rqlib.sha256_bytes(design_raw), "manifest": manifest,
+            "cells": len(ours), "engine_sha256": next(iter(binaries)),
+            "tools_sha256": [tools[k] for k in sorted(tools)], "ages_sha256": b["ages_sha256"]}
+
+
+# ---------------------------------------------------------------- the receipt and the D5 ledger (v5 2.8, 2.11)
+# The cumulative D5 ledger is #68's file, read by #68's tools too: its line format (calib.ledger_add, calib.py:2998
+# @ff67064: one sort_keys JSON object with its utc per line) is unchanged here. What the D8 commands add (Codex revWP3
+# P2-1, P2-2; the coordinator's accounting plumbing for v5 2.11's "failed and interrupted runs are charged"):
+#   - fail-closed reading: the ledger must exist and every entry is validated (ledger_entries);
+#   - an attempts file BESIDE the ledger (<ledger>.attempts.jsonl; never the shared ledger): before its work every D8
+#     run writes an in-progress record, refreshed durably while it runs; finalization appends exactly one ledger entry
+#     per attempt (its id prevents a double charge) and closes the attempt; an attempt left open by a hard kill makes
+#     every budget-dependent command refuse until reconcile_attempts charges it;
+#   - (Codex revWP3b) one process-shared lock on the ledger (_LedgerLock) around every D8 accounting command, a charge
+#     already in the ledger committed only after the ledger is synced (_charge_once), and liveness refused when it
+#     cannot be determined (_attempt_alive).
+ATTEMPTS_SUFFIX = ".attempts.jsonl"   # (the attempts file of a ledger: <ledger>.attempts.jsonl)
+ATTEMPT_REFRESH_CPU_S = 30.0          # (a durable cpu_s refresh SCHEDULED once this much CPU has passed since the last
+ATTEMPT_POLL_S = 1.0                  #  one, polled every ATTEMPT_POLL_S by a thread that needs the GIL: a long
+                                      #  GIL-holding call delays it; the gap on D8 work is measured, WP3 r3's probe)
+RECONCILE_MARGIN_S = 60.0             # (a reconciled attempt is charged its last durable cpu_s + 60 s)
+INTERRUPTED_KIND = "D8-noisebank-interrupted"   # (the ledger kind of a reconciled, hard-interrupted attempt)
+PROC = "/proc"                        # (the process table read for liveness; a test hook)
+
+
+def _cpu_s():
+    import resource
+    s, c = resource.getrusage(resource.RUSAGE_SELF), resource.getrusage(resource.RUSAGE_CHILDREN)
+    return s.ru_utime + s.ru_stime + c.ru_utime + c.ru_stime
+
+
+def _cpu_value(v, where):
+    """A charge's cpu_s: a JSON number (not a boolean), finite and >= 0 -> float; anything else refused (never 0)."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        raise NoiseBankError(f"{where}: cpu_s {v!r} is not a number (refused, never read as 0)")
+    try:
+        x = float(v)
+    except OverflowError:
+        x = math.inf
+    if not math.isfinite(x) or x < 0:
+        raise NoiseBankError(f"{where}: cpu_s {v!r} is not a finite number >= 0 (refused)")
+    return x
+
+
+def _write_all(fd, data):
+    while data:
+        data = data[os.write(fd, data):]
+
+
+def ledger_init_empty(path):
+    """TEST / INITIALIZATION ONLY: create an EMPTY cumulative ledger at a path that does not exist yet (an existing
+    path is refused). The D8 commands never create a ledger: they require the existing registered calibration ledger,
+    and a nonexistent path is refused (ledger_entries, ledger_add)."""
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    except FileExistsError:
+        raise NoiseBankError(f"D5 ledger {path}: exists (ledger_init_empty creates a new, empty ledger only)") from None
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    rqlib.fsync_dir(os.path.dirname(os.path.abspath(path)))
+
+
+def ledger_entries(path):
+    """Every entry of the cumulative D5 ledger, validated (fail closed): the file must exist (a nonexistent path is
+    refused, never read as an unused ledger); every line is one JSON object (calib.ledger_add's line) whose cpu_s is
+    present, a number (not a boolean), finite and >= 0, and whose kind, when present, is a string; the last line ends
+    with a newline. Any other line (blank, not JSON, not an object, unterminated) is refused with the file and line
+    number: never skipped, never read as 0. -> [entry]"""
+    if not os.path.isfile(path):
+        raise NoiseBankError(f"D5 ledger {path}: no such file (the D8 commands require the existing cumulative "
+                             "ledger and never create one; ledger_init_empty is the explicit test / initialization "
+                             "path)")
+    lines = rqlib.read_bytes(path).split(b"\n")
+    tail = lines.pop()                                  # (b"" when the file ends with a newline or is empty)
+    out = []
+    for i, ln in enumerate(lines, 1):
+        where = f"D5 ledger {path} line {i}"
+        try:
+            e = json.loads(ln.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as err:
+            raise NoiseBankError(f"{where}: not a JSON line ({err}; refused, never skipped)") from None
+        if not isinstance(e, dict):
+            raise NoiseBankError(f"{where}: not a JSON object (refused, never skipped)")
+        if "cpu_s" not in e:
+            raise NoiseBankError(f"{where}: no cpu_s (refused, never read as 0)")
+        _cpu_value(e["cpu_s"], where)
+        if "kind" in e and not isinstance(e["kind"], str):
+            raise NoiseBankError(f"{where}: kind {e['kind']!r} is not a string (refused)")
+        out.append(e)
+    if tail:
+        raise NoiseBankError(f"D5 ledger {path} line {len(lines) + 1}: no terminating newline (a torn or partial "
+                             "append; refused)")
+    return out
+
+
+def ledger_add(path, entry):
+    """One CPU entry appended to the EXISTING cumulative D5 ledger in calib.ledger_add's line format (#68 @ff67064
+    calib.py:2998: one sort_keys JSON line with its utc), in one write, fsync'd. Refused: a nonexistent ledger (never
+    created), an entry whose cpu_s is not a finite number >= 0, a ledger whose last line is unterminated (appending
+    would corrupt the next line)."""
+    _cpu_value(entry.get("cpu_s"), f"D5 ledger {path}: entry {entry.get('kind')!r}")
+    data = (json.dumps(dict(entry, utc=rqlib.now_utc()), sort_keys=True) + "\n").encode("utf-8")
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_APPEND)     # (no O_CREAT)
+    except FileNotFoundError:
+        raise NoiseBankError(f"D5 ledger {path}: no such file (a D8 command never creates the ledger)") from None
+    try:
+        size = os.fstat(fd).st_size
+        if size and os.pread(fd, 1, size - 1) != b"\n":
+            raise NoiseBankError(f"D5 ledger {path}: the last line has no terminating newline (a torn append; refused)")
+        _write_all(fd, data)
+        try:
+            os.fsync(fd)
+        except OSError as e:
+            raise NoiseBankError(f"D5 ledger {path}: the entry was written but its fsync failed ({type(e).__name__}: "
+                                 f"{e}); it is not committed and the attempt stays open (refused)") from None
+    finally:
+        os.close(fd)
+
+
+def _ledger_sync(path):
+    """fsync the ledger. A charge already visible in it is treated as committed only after this succeeds (Codex revWP3b
+    P2-R2-2: a line written by a process killed before its own fsync may not be durable); a failure refuses, leaving
+    the attempt open."""
+    try:
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError as e:
+        raise NoiseBankError(f"D5 ledger {path}: fsync failed ({type(e).__name__}: {e}); a charge already in the "
+                             "ledger is not treated as durable, and the attempt stays open (refused)") from None
+
+
+class _LedgerLock:
+    """THE D8 accounting lock (Codex revWP3b P2-R2-1; the coordinator's decision): one process-shared, exclusive,
+    non-blocking fcntl.flock on the EXISTING ledger file itself (opened read-only, never created), taken by every D8
+    command that reads or changes accounting state (provenance, validate-d8, estimate-d8: BEFORE the budget check,
+    held until the attempt is closed; d8-reconcile: through its whole check, charge and close). A held lock refuses at
+    once, naming the open attempt(s) recorded beside the ledger; it never waits. The kernel releases the lock when its
+    holder exits, a SIGKILL included (the holder's attempt then stays open for d8-reconcile). #68's ledger_add takes no
+    lock (flock is advisory): its appends are single-line O_APPEND writes, and #68 never writes a D8 attempt id, so
+    they can interleave with D8 appends line by line but never satisfy or duplicate a D8 charge."""
+
+    def __init__(self, ledger, command):
+        import fcntl
+        try:
+            fd = os.open(ledger, os.O_RDONLY)          # (no O_CREAT)
+        except FileNotFoundError:
+            raise NoiseBankError(f"D5 ledger {ledger}: no such file (the D8 commands require the existing cumulative "
+                                 "ledger and never create one)") from None
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(fd)
+            raise NoiseBankError(f"{command}: the D5 ledger {ledger} is locked by another D8 accounting command "
+                                 f"({_lock_holders(ledger)}): refused (one at a time; it never waits)") from None
+        except OSError as e:
+            os.close(fd)
+            raise NoiseBankError(f"{command}: the D5 ledger {ledger} cannot be locked ({type(e).__name__}: {e}; "
+                                 "refused)") from None
+        self.fd = fd
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, et, ev, tb):
+        import fcntl
+        try:
+            fcntl.flock(self.fd, fcntl.LOCK_UN)
+        finally:
+            os.close(self.fd)
+        return False
+
+
+def _lock_holders(ledger):
+    """The open attempt(s) beside the ledger, as context for a lock refusal (the holder's, when it has written one)."""
+    try:
+        op = open_attempts(ledger)
+    except NoiseBankError as e:
+        return f"the attempts file cannot be read: {e}"
+    if not op:
+        return "no open attempt recorded: a d8-reconcile, or a command before its attempt record"
+    return "open attempt(s): " + "; ".join(f"{k} ({v['open']['kind']}, pid {v['open']['pid']} on {v['open']['host']}, "
+                                           f"started {v['open']['utc_start']})" for k, v in op.items())
+
+
+def ledger_total(paths):
+    """calib.ledger_total's sum (by kind, in file order) against the D5 ceiling (D5_CEILING_H), over VALIDATED entries
+    (ledger_entries: a missing ledger or any malformed entry refuses; nothing is skipped or read as 0)."""
+    by = {}
+    n = 0
+    for p in paths:
+        for e in ledger_entries(p):
+            n += 1
+            by[e.get("kind", "?")] = by.get(e.get("kind", "?"), 0.0) + float(e["cpu_s"])
+    tot = sum(by.values())
+    return {"entries": n, "cpu_h": tot / 3600, "by_kind_h": {k: v / 3600 for k, v in sorted(by.items())},
+            "ceiling_h": D5_CEILING_H, "remaining_h": D5_CEILING_H - tot / 3600}
+
+
+def attempts_path(ledger):
+    """The attempts file of a ledger: the D8 runs' in-progress attempt records, beside the ledger, never in it."""
+    return ledger + ATTEMPTS_SUFFIX
+
+
+def _attempt_append(ledger, rec):
+    """One attempt record (a sort_keys JSON line) appended to the attempts file in one write, fsync'd (the file is
+    created on first use and its directory entry made durable). An unterminated tail (a torn append whose fsync never
+    returned) is truncated first, so it never joins the next record."""
+    p = attempts_path(ledger)
+    data = (json.dumps(rec, sort_keys=True) + "\n").encode("utf-8")
+    new = not os.path.exists(p)
+    fd = os.open(p, os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o644)
+    try:
+        size = os.fstat(fd).st_size
+        if size and os.pread(fd, 1, size - 1) != b"\n":
+            os.ftruncate(fd, os.pread(fd, size, 0).rfind(b"\n") + 1)
+        _write_all(fd, data)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    if new:
+        rqlib.fsync_dir(os.path.dirname(os.path.abspath(p)))
+
+
+_ATTEMPT_OPEN = ("attempt", "kind", "command", "utc_start", "pid", "host", "cpu_s")
+
+
+def attempts_state(ledger):
+    """The attempts beside a ledger, validated (fail closed) -> {attempt id: {"open": its open record, "cpu_s": its last
+    durable cumulative cpu_s, "steps": [major-step labels], "close": its close record or None}}, in file order. A
+    malformed record, a duplicate or incomplete open, or a record of an unknown or closed attempt is refused with the
+    file and line; an unterminated final line (a torn append whose fsync never returned: never durable) is ignored.
+    No attempts file: no attempts."""
+    p = attempts_path(ledger)
+    if not os.path.exists(p):
+        return {}
+    lines = rqlib.read_bytes(p).split(b"\n")
+    lines.pop()                                         # (b"" after the final newline, or a torn tail)
+    st = {}
+    for i, ln in enumerate(lines, 1):
+        where = f"attempts file {p} line {i}"
+        try:
+            r = json.loads(ln.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as err:
+            raise NoiseBankError(f"{where}: not a JSON line ({err}; refused)") from None
+        ev, aid = (r.get("event"), r.get("attempt")) if isinstance(r, dict) else (None, None)
+        if ev not in ("open", "progress", "close") or not isinstance(aid, str):
+            raise NoiseBankError(f"{where}: not an attempt record (refused)")
+        c = _cpu_value(r.get("cpu_s"), where)
+        if ev == "open":
+            if aid in st or any(k not in r for k in _ATTEMPT_OPEN):
+                raise NoiseBankError(f"{where}: a duplicate or incomplete open record of attempt {aid} (refused)")
+            st[aid] = {"open": r, "cpu_s": c, "steps": [], "close": None}
+            continue
+        a = st.get(aid)
+        if a is None or a["close"] is not None:
+            raise NoiseBankError(f"{where}: a {ev} record of an unknown or closed attempt {aid} (refused)")
+        if ev == "progress":
+            a["cpu_s"] = c
+            if r.get("step"):
+                a["steps"].append(r["step"])
+        else:
+            a["close"] = r
+    return st
+
+
+def open_attempts(ledger):
+    """The attempts beside the ledger that are not closed (running, or interrupted and not yet reconciled)."""
+    return {k: v for k, v in attempts_state(ledger).items() if v["close"] is None}
+
+
+def _budget_check(ledger, command):
+    """Before a budget-dependent D8 command (provenance, validate-d8, estimate-d8) does any work: the existing ledger,
+    every entry valid, and no unclosed attempt beside it (an interrupted run's CPU is not yet charged, so the ledger
+    would read too low) -> ledger_total([ledger])."""
+    t = ledger_total([ledger])
+    op = open_attempts(ledger)
+    if op:
+        desc = "; ".join(f"{k} ({v['open']['kind']}, started {v['open']['utc_start']}, pid {v['open']['pid']} on "
+                         f"{v['open']['host']}, last durable cpu_s {v['cpu_s']:.1f})" for k, v in op.items())
+        raise NoiseBankError(f"{command}: {len(op)} unclosed D8 attempt(s) beside the D5 ledger {ledger}: {desc}. An "
+                             "interrupted run's CPU is not yet charged (A_design_v5 2.11): `noisebank.py d8-reconcile "
+                             f"--ledger {ledger}` first (refused)")
+    return t
+
+
+def _read_proc(path):
+    with open(path) as f:
+        return f.read()
+
+
+def _boot_id():
+    try:
+        return _read_proc(f"{PROC}/sys/kernel/random/boot_id").strip() or None
+    except OSError:
+        return None
+
+
+def _proc_stat(pid):
+    """The process record of pid from <PROC>/<pid>/stat -> None when the process table has no such process
+    (CONFIRMED absence: FileNotFoundError), else (state, start time in clock ticks since boot). An unreadable record
+    (PermissionError, any other OSError) or an unparsable one raises NoiseBankError: liveness indeterminate, never
+    read as absence (Codex revWP3b P2-R2-3)."""
+    try:
+        text = _read_proc(f"{PROC}/{int(pid)}/stat")
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        raise NoiseBankError(f"{PROC}/{pid}/stat cannot be read ({type(e).__name__}: {e}): the process's liveness is "
+                             "indeterminate (refused)") from None
+    try:
+        rest = text.rsplit(")", 1)[1].split()
+        return rest[0], int(rest[19])
+    except (ValueError, IndexError):
+        raise NoiseBankError(f"{PROC}/{pid}/stat cannot be parsed: the process's liveness is indeterminate "
+                             "(refused)") from None
+
+
+def _attempt_alive(o):
+    """Whether an attempt's recorded process still runs (then it is not interrupted and is never reconciled), True or
+    False only when CONFIRMED (Codex revWP3b P2-R2-3); anything indeterminate refuses (NoiseBankError, with context):
+      - another host: refused (reconcile it there);
+      - another boot (the boot id differs): gone;
+      - with a process table: no <PROC>/<pid> is confirmed absence (gone); a record with another start time (a reused
+        pid) or a zombie is gone; otherwise running; an unreadable or unparsable record is indeterminate;
+      - without a process table: os.kill(pid, 0): ESRCH is gone, success is running, EPERM or any other error is
+        indeterminate."""
+    import platform
+    if o.get("host") != platform.node():
+        raise NoiseBankError(f"attempt {o.get('attempt')}: recorded on host {o.get('host')!r}, not "
+                             f"{platform.node()!r}: its process cannot be checked here; reconcile it on that host "
+                             "(refused)")
+    boot = _boot_id()
+    if boot is not None and o.get("boot_id") is not None and o["boot_id"] != boot:
+        return False
+    if os.path.isdir(f"{PROC}/self"):
+        try:
+            st = _proc_stat(o["pid"])
+        except NoiseBankError as e:
+            raise NoiseBankError(f"attempt {o.get('attempt')} (pid {o.get('pid')}): {e}") from None
+        if st is None:
+            return False
+        return st[0] != "Z" and (o.get("start_ticks") is None or st[1] == o["start_ticks"])
+    try:
+        os.kill(int(o["pid"]), 0)
+    except ProcessLookupError:
+        return False
+    except OSError as e:
+        raise NoiseBankError(f"attempt {o.get('attempt')} (pid {o.get('pid')}): os.kill(pid, 0) gives "
+                             f"{type(e).__name__} ({e}): the process's liveness is indeterminate (refused)") from None
+    return True
+
+
+def _charge_once(ledger, entry):
+    """The attempt's one ledger entry (called under the D8 lock): appended (ledger_add: one write, then fsync) unless
+    an entry with its attempt id is already in the ledger (the idempotence of finalization and reconciliation); such
+    an existing entry is treated as committed only after the ledger is synced (_ledger_sync; Codex revWP3b P2-R2-2),
+    and a failure refuses, the attempt staying open -> (the committed entry, whether it was appended)."""
+    prior = next((e for e in ledger_entries(ledger) if e.get("attempt") == entry["attempt"]), None)
+    if prior is not None:
+        _ledger_sync(ledger)
+        return prior, False
+    ledger_add(ledger, entry)
+    return dict(entry), True
+
+
+def reconcile_attempts(ledger):
+    """`noisebank.py d8-reconcile` (v5 2.11: interrupted runs are charged), holding the D8 lock (_LedgerLock) through
+    its whole check, charge and close: every unclosed attempt beside the ledger whose process is CONFIRMED gone (a
+    SIGKILL, an OOM kill, a reboot; _attempt_alive) is charged ONCE, its last durable cpu_s plus RECONCILE_MARGIN_S
+    (60 s), as a normal ledger_add-format entry of kind INTERRUPTED_KIND carrying its attempt id, and closed only after
+    that charge is durable. Idempotent: an attempt whose id is already in the ledger (its finalization stopped between
+    the ledger append and the close) is closed without a second charge, after the ledger is synced (_charge_once). A
+    running attempt, or one whose liveness cannot be determined, refuses the whole reconciliation before any charge.
+    -> [{attempt, kind, charged_cpu_s (None: already charged), charged_by}]"""
+    with _LedgerLock(ledger, "d8-reconcile"):
+        ledger_entries(ledger)
+        op = open_attempts(ledger)
+        for aid, a in op.items():
+            if _attempt_alive(a["open"]):
+                raise NoiseBankError(f"d8-reconcile: attempt {aid} (pid {a['open']['pid']} on {a['open']['host']}) is "
+                                     "still running: it is not interrupted, and nothing is reconciled (refused)")
+        out = []
+        for aid, a in op.items():
+            o = a["open"]
+            entry = {"kind": INTERRUPTED_KIND, "status": "interrupted", "attempt": aid, "attempt_kind": o["kind"],
+                     "command": o["command"], "utc_start": o["utc_start"], "cpu_s": a["cpu_s"] + RECONCILE_MARGIN_S,
+                     "cpu_s_durable": a["cpu_s"], "margin_s": RECONCILE_MARGIN_S}
+            committed, appended = _charge_once(ledger, entry)
+            by = "reconcile" if appended else "finalize (already in the D5 ledger; synced)"
+            _attempt_append(ledger, {"event": "close", "attempt": aid, "cpu_s": float(committed["cpu_s"]),
+                                     "charged_by": by, "status": committed.get("status"), "utc": rqlib.now_utc()})
+            out.append({"attempt": aid, "kind": o["kind"], "charged_cpu_s": committed["cpu_s"] if appended else None,
+                        "charged_by": by})
+        return out
+
+
+def d8_receipt(argv, fit, impl, utc_start, utc_end, cpu_s, entry):
+    """The refit receipt (finfolk.redqueen.noisebank.d8refitreceipt/1, v5 2.8 L755-757): command line, tool and input
+    hashes, Python / NumPy versions, host, UTC start / end, CPU seconds (resource.getrusage), the ledger entry. It
+    is written durably BEFORE the artifact, which binds its sha256."""
+    import platform
+    import numpy as np
+    return {"schema": D8_RECEIPT_SCHEMA, "command": list(argv), "tools": impl[1], "implementation_sha256": impl[0],
+            "inputs": fit["inputs"], "python": sys.version, "numpy": np.__version__, "host": platform.node(),
+            "utc_start": utc_start, "utc_end": utc_end, "cpu_s": cpu_s, "ledger_entry": entry,
+            "boot": fit["boot"], "synthetic": fit["synthetic"]}
+
+
+# ---------------------------------------------------------------- the prospective validation (v5 2.10, PC-12, PC-22)
+# v5 2.10's declared synthetic parameters (written before any run, chosen without reference to bank values) and the
+# items v5 leaves to the validation spec, as this code implements them (the spec must equal d8_validation_spec()).
+D8_VAL = {"SigmaR": [[0.25, 0.05, 0.05], [0.05, 0.25, 0.15], [0.05, 0.15, 0.50]],
+          "SigmaD": [[0.25, 0.05], [0.05, 0.25]], "SigmaE": [[0.50, 0.10], [0.10, 0.50]],
+          "curves": {"C": {"x": [-2.2, -0.6, 0.4], "s": [0.55, 0.30, 0.20]},
+                     "S": {"x": [-2.5, -1.2, -0.5], "s": [0.35, 0.25, 0.22]},
+                     "F": {"x": [-2.5, -1.2, -0.5], "s": [0.35, 0.25, 0.22]}},
+          "means": {"C": "sigma(-0.6 + 0.4 z), z ~ U[-2, 2] per exposed pair",
+                    "F": "c sigma(eta_i), eta_i ~ U[0.5, 3.5] per prey snapshot",
+                    "S": "c sigma(eta_i - Delta_ij), Delta_ij ~ U[0, 1] per exposed pair"},
+          "banks": 10, "R": REPLICATES, "B": 324, "N": N_PREY, "M": 247, "horizon": 5000,
+          "V2": {"floor": 0.02, "se_multiplier": 2.6},
+          "V3": {"points": 201, "quantiles": [0.05, 0.95], "dev_max": 0.10, "avg": [0.95, 1.05]}}
+D8_VAL_PURPOSES = ("means", "rows", "donors", "cells", "free")
+D8_VAL_TEXT = "AnnexH/D8/1/noisebank/D8-validation/{bank}/{purpose}"     # (v5 2.5 item 5)
+D8_VAL_NAMES = ("R_CC", "R_SS", "R_CS", "R_CF", "R_SF", "D_CC", "D_SS", "D_CS", "E_CC", "E_SS", "E_CS")
+
+
+def d8_validation_truth():
+    """The declared components with SigmaR[F,F] set to the registered convention v' A^+ v (as components_of) and the
+    11 BOOT_NAMES values they imply."""
+    import numpy as np
+    SR = np.array(D8_VAL["SigmaR"], float)
+    A, v = SR[:2, :2], SR[:2, 2]
+    SR[2, 2] = float(v @ np.linalg.pinv(A, rcond=1e-12) @ v)
+    SD, SE = np.array(D8_VAL["SigmaD"], float), np.array(D8_VAL["SigmaE"], float)
+    theta = dict(zip(BOOT_NAMES, _entries({"SigmaR": SR, "SigmaD": SD, "SigmaE": SE})))
+    return SR, SD, SE, {k: float(v) for k, v in theta.items()}
+
+
+def d8_validation_spec(design_file_sha256, round_=1):
+    """The validation spec (v5 2.10, written and witnessed at 7 step 3 before any run): the declared parameters, the
+    registered size, the streams and their draw order, the fit, the acceptance rules V1-V5. round_ 2.. are the
+    fresh-key reruns after a failure (bank<k>-r<round>)."""
+    import obslaw
+    sfx = "" if round_ == 1 else f"-r{round_}"
+    banks = [f"bank{k}{sfx}" for k in range(1, D8_VAL["banks"] + 1)]
+    SR = d8_validation_truth()[0]
+    return {
+        "schema": D8_SPEC_SCHEMA, "design": f"{D8_DESIGN} section 2.10 (PC-12, PC-22)", "round": round_,
+        "bank_design_file_sha256": design_file_sha256,
+        "size": {k: D8_VAL[k] for k in ("R", "B", "N", "M", "horizon")},
+        "parameters": {"SigmaR": SR.tolist(), "SigmaR_FF": "the registered convention v' A^+ v (components_of)",
+                       "SigmaD": D8_VAL["SigmaD"], "SigmaE": D8_VAL["SigmaE"], "curves": D8_VAL["curves"],
+                       "means": D8_VAL["means"]},
+        "streams": {"generator": obslaw.STREAM_GENERATOR, "namespace": obslaw.STREAM_NAMESPACE,
+                    "text": D8_VAL_TEXT, "purposes": list(D8_VAL_PURPOSES), "banks": banks,
+                    "v5_bank": f"bank{D8_VAL['banks'] + 1}{sfx}", "fit_bootstrap_purpose": "bootstrap"},
+        "draw_order": {
+            "structure": "exposed pairs = the design's (prey, predator) snapshot keys sorted; prey snapshots sorted; "
+                         "predator snapshots sorted (noisebank.arrays' order)",
+            "means": "per exposed pair in that order two uniforms (u_C: z = -2 + 4 u_C; u_S: Delta = u_S), then per "
+                     "prey snapshot one (u_F: eta = 0.5 + 3 u_F); uniforms (x >> 11) 2^-53",
+            "rows": "Z_R = splitmix_normals(rows, nQ R 3) reshaped C-order to (nQ, R, 3)",
+            "donors": "Z_D = splitmix_normals(donors, nP R 2) reshaped C-order to (nP, R, 2)",
+            "cells": "Z_E = splitmix_normals(cells, |E| R 2) reshaped C-order to (|E|, R, 2)",
+            "free": "Z_EF = splitmix_normals(free, nQ R) reshaped C-order to (nQ, R)",
+            "counts": "obslaw.latent + generate_counts with exact locations (obslaw.solve_location)"},
+        "fit": {"horizon": D8_VAL["horizon"], "boot": 1, "z_intervals": Z_INTERVALS,
+                "estimator": "estimate_d8's horizon fit (capped interval map, minimum-categories screen)"},
+        "acceptance": {"V1": "every bank's 5k fit has status ok with all three curves",
+                       "V2": dict(D8_VAL["V2"], rule="|mean(theta_hat - theta)| <= max(floor, se_multiplier SE), "
+                                                     "SE = sd(ddof=1) / sqrt(banks), each BOOT_NAMES entry"),
+                       "V3": dict(D8_VAL["V3"], rule="per bank and channel on the usable cells' logit mean fractions: "
+                                                     "type-7 quantiles, equally spaced points, r = S_hat / S; median "
+                                                     "over banks of max|r - 1| <= dev_max and of mean r in avg; a bank "
+                                                     "failing V1 fails V3"),
+                       "V4": {"banks": banks[:2], "reported": True,
+                              "map": "legacy uncapped interval map (ceiling = N), marginals and s(mu) only, S and F"},
+                       "V5": "the M = 0 bank yields S / F structural_zero and an ok capture-only fit"},
+    }
+
+
+def _sigmoid(x):
+    import numpy as np
+    return 1.0 / (1.0 + np.exp(-np.asarray(x, float)))
+
+
+def d8_structure(design):
+    """The bank's pairing structure (v5 2.10: from bank.design.json): sorted exposed pairs, prey and predator
+    snapshot keys."""
+    rows, _, _ = planlib.expand_v2(design, pending=True)
+    pairs = sorted({((r["prey"]["world"], r["prey"]["time"]), (r["predators"]["world"], r["predators"]["time"]))
+                    for r in rows if r["predators"] is not None})
+    prey = sorted({p for p, _ in pairs} |
+                  {(r["prey"]["world"], r["prey"]["time"]) for r in rows if r["predators"] is None})
+    pred = sorted({q for _, q in pairs})
+    return pairs, prey, pred
+
+
+def d8_validation_bank(spec, bank, structure, M=None, R=None):
+    """One synthetic bank (v5 2.10) drawn by obslaw from the declared parameters on the D8 streams of `bank`, in the
+    spec's draw order -> (5k observations, the stream records {purpose: {text, seed, generator, first_outputs}})."""
+    import numpy as np
+    import obslaw
+    pairs, prey, pred = structure
+    R = spec["size"]["R"] if R is None else R
+    B, N = spec["size"]["B"], spec["size"]["N"]
+    M = spec["size"]["M"] if M is None else M
+    c = M / N
+    qi = np.array([prey.index(p) for p, _ in pairs], np.int64)
+    pj = np.array([pred.index(q) for _, q in pairs], np.int64)
+    nE, nQ, nP = len(pairs), len(prey), len(pred)
+    records = {}
+
+    def stream(purpose):
+        t = spec["streams"]["text"].format(bank=bank, purpose=purpose)
+        records[purpose] = obslaw.stream_record(t)
+        return obslaw.d8_stream(t)
+    u = obslaw.splitmix_uniforms(stream("means"), 2 * nE + nQ)
+    z, delta, eta = -2.0 + 4.0 * u[0:2 * nE:2], u[1:2 * nE:2], 0.5 + 3.0 * u[2 * nE:]
+    mu = {"C": _sigmoid(-0.6 + 0.4 * z), "S": c * _sigmoid(eta[qi] - delta), "F": c * _sigmoid(eta)}
+    Z = {"R": obslaw.splitmix_normals(stream("rows"), nQ * R * 3).reshape(nQ, R, 3),
+         "D": obslaw.splitmix_normals(stream("donors"), nP * R * 2).reshape(nP, R, 2),
+         "E": obslaw.splitmix_normals(stream("cells"), nE * R * 2).reshape(nE, R, 2),
+         "EF": obslaw.splitmix_normals(stream("free"), nQ * R).reshape(nQ, R)}
+    SR, SD, SE = d8_validation_truth()[:3]
+    lat = obslaw.latent(Z, obslaw.psd_factors(SR.tolist(), SD.tolist(), SE.tolist()), qi, pj)
+    K = {}
+    for ch, n_, m_ in (("C", B, B), ("S", N, M), ("F", N, M)):
+        curve = spec["parameters"]["curves"][ch]
+        K[ch] = obslaw.generate_counts(mu[ch], lat[ch], n_, m_, lambda x, cv=curve: obslaw.scale(cv, x),
+                                       lambda x, i, cv=curve, n2=n_, m2=m_: obslaw.solve_location(
+                                           x, obslaw.scale(cv, x), n2, m2)[0])[0]
+    obs = []
+    for e, (p, q) in enumerate(pairs):
+        for r in range(R):
+            obs.append({"cell": f"v{e}.{r}", "prey": list(p), "pred": list(q), "replicate": r,
+                        "horizons": {"5000": {"captures": int(K["C"][e, r]), "survivors": int(K["S"][e, r])}}})
+    for i, p in enumerate(prey):
+        for r in range(R):
+            obs.append({"cell": f"f{i}.{r}", "prey": list(p), "pred": None, "replicate": r,
+                        "horizons": {"5000": {"captures": None, "survivors": int(K["F"][i, r])}}})
+    return obs, records
+
+
+def _v3_stats(mu, curve, true_curve, spec):
+    """V3's per-bank, per-channel statistics (v5 2.10, PC-22): the usable cells' mean fractions mu -> D = [q05, q95] of
+    their logits (type-7), the ratio r_j = S_hat / S at the equally spaced points -> {dev: max|r - 1|, avg: mean r}
+    (None without a curve or cells)."""
+    import numpy as np
+    v3 = spec["acceptance"]["V3"]
+    mu = np.asarray(mu, float)
+    if curve is None or len(mu) == 0:
+        return None
+    x = np.log(mu / (1.0 - mu))
+    lo, hi = np.quantile(x, v3["quantiles"])
+    xs = np.linspace(lo, hi, v3["points"])
+    r = noisescale.evaluate(curve, _sigmoid(xs)) / noisescale.evaluate(true_curve, _sigmoid(xs))
+    return {"dev": float(np.max(np.abs(r - 1.0))), "avg": float(np.mean(r))}
+
+
+def d8_validation_criteria(spec, banks, legacy, v5):
+    """V1-V5 (v5 2.10, PC-12) from the per-bank results -> the acceptance record. banks: {bank: {"status", "curves"
+    (C, S, F: noisescale curves or None), "theta" (BOOT_NAMES -> value or None), "v3" (channel -> {dev, avg} or
+    None)}}; legacy: {bank: {S, F: {dev, avg} or None}} (V4, reported); v5: the M = 0 bank's horizon record."""
+    import numpy as np
+    theta = d8_validation_truth()[3]
+    names = list(spec["streams"]["banks"])
+    V1 = {b: banks[b]["status"] == "ok" and all(banks[b]["curves"].get(ch) is not None for ch in ("C", "S", "F"))
+          for b in names}
+    v1 = all(V1.values())
+    V2 = {}
+    for k in D8_VAL_NAMES:
+        d = [banks[b]["theta"].get(k) for b in names]
+        if not v1 or any(x is None for x in d):
+            V2[k] = {"pass": False, "reason": "a bank failed V1"}
+            continue
+        d = np.array(d, float) - theta[k]
+        se = float(np.std(d, ddof=1) / math.sqrt(len(d)))
+        bound = max(spec["acceptance"]["V2"]["floor"], spec["acceptance"]["V2"]["se_multiplier"] * se)
+        V2[k] = {"bias": float(np.mean(d)), "se": se, "bound": bound, "pass": abs(float(np.mean(d))) <= bound}
+    V3 = {}
+    v3s = spec["acceptance"]["V3"]
+    for ch in ("C", "S", "F"):
+        st = [banks[b]["v3"].get(ch) for b in names]
+        if not v1 or any(s is None for s in st):
+            V3[ch] = {"pass": False, "reason": "a bank failed V1"}
+            continue
+        dev = float(np.median([s["dev"] for s in st]))
+        avg = float(np.median([s["avg"] for s in st]))
+        V3[ch] = {"median_dev": dev, "median_avg": avg,
+                  "pass": dev <= v3s["dev_max"] and v3s["avg"][0] <= avg <= v3s["avg"][1]}
+    V4 = {}
+    for b, st in legacy.items():
+        V4[b] = {ch: (None if s is None else dict(s, outside_band=not (s["dev"] <= v3s["dev_max"] and
+                                                                        v3s["avg"][0] <= s["avg"] <= v3s["avg"][1])))
+                 for ch, s in st.items()}
+    import obslaw
+    v5ok = (v5.get("status") == "ok" and v5["channels"].get("S") == obslaw.STRUCTURAL_ZERO
+            and v5["channels"].get("F") == obslaw.STRUCTURAL_ZERO and not set(v5.get("scales") or {}) - {"C"}
+            and v5.get("components") is not None and v5["components"].get("fit") == "unconstrained")
+    out = {"V1": {"pass": v1, "banks": V1}, "V2": {"pass": all(x["pass"] for x in V2.values()), "entries": V2},
+           "V3": {"pass": all(x["pass"] for x in V3.values()), "channels": V3},
+           "V4": {"reported": True, "banks": V4,
+                  "shows_bias": any(s and s["outside_band"] for st in V4.values() for s in st.values())},
+           "V5": {"pass": bool(v5ok), "status": v5.get("status"), "reasons": v5.get("reasons")}}
+    out["accepted"] = out["V1"]["pass"] and out["V2"]["pass"] and out["V3"]["pass"] and out["V5"]["pass"]
+    return out
+
+
+def _bank_result(rec):
+    """What V1-V3 read of one bank's 5k horizon record."""
+    import numpy as np
+    curves = {ch: (rec.get("scales") or {}).get(ch) for ch in ("C", "S", "F")}
+    th = {k: None for k in D8_VAL_NAMES}
+    if rec.get("status") == "ok":
+        c = rec["components"]
+        th = dict(zip(D8_VAL_NAMES, (float(x) for x in _entries({k: np.array(c[k], float)
+                                                                    for k in ("SigmaR", "SigmaD", "SigmaE")}))))
+    return {"status": rec.get("status"), "curves": curves, "theta": th}
+
+
+def validate_d8(spec, design_path, bindings=None, m=Z_INTERVALS, structure=None, R=None, progress=None):
+    """`noisebank.py validate-d8` (A_design_v5 2.10): the prospective parameter-recovery study of the capped estimator
+    on synthetic banks at the registered size, from the witnessed spec (which must be exactly d8_validation_spec of
+    the bound design, round included). Per bank: draw (d8_validation_bank), fit the 5k horizon as estimate_d8 does
+    with boot = 1 on the bank's own bootstrap stream (clarification 3 E1: purpose `bootstrap`, validation fits only,
+    text AnnexH/D8/1/noisebank/D8-validation/{bank}/bootstrap with the complete bank key, a rerun suffix included,
+    recorded with its seed and first two outputs; never the refit's D8-refit streams), record what V1-V3 read (V1-V5
+    take nothing from the bootstrap results); V4 refits the first two banks' marginals and s(mu) under the legacy
+    uncapped map; V5 draws and fits the M = 0 bank. -> the report (no ledger or timing fields: the CLI adds them).
+    structure / R: test hooks only (never on the command line); progress(label): called after each bank (the
+    attempt's durable refresh)."""
+    import obslaw
+    step = progress or (lambda label: None)
+    b = d8_bindings() if bindings is None else dict(bindings)
+    design_raw = _bound_bytes(design_path, b["design_file_sha256"], "design")
+    rnd = spec.get("round") if isinstance(spec, dict) else None
+    if type(rnd) is not int or rnd < 1 or rqlib.canonical(spec) != rqlib.canonical(
+            d8_validation_spec(b["design_file_sha256"], rnd)):
+        raise NoiseBankError("validate-d8: the spec is not the registered validation spec of this code and design "
+                             "(d8_validation_spec; A_design_v5 2.10: fixed and witnessed before any run)")
+    structure = structure or d8_structure(_json_of(design_raw, "design"))
+    true_curves = spec["parameters"]["curves"]
+    h = spec["size"]["horizon"]
+    banks, legacy, streams = {}, {}, {}
+
+    def fitted(bank, M):
+        obs, recs = d8_validation_bank(spec, bank, structure, M=M, R=R)
+        text = spec["streams"]["text"].format(bank=bank, purpose=spec["streams"]["fit_bootstrap_purpose"])
+        recs["bootstrap"] = obslaw.stream_record(text)
+        streams[bank] = recs
+        return obs, horizon_estimate_d8(arrays(obs, h, {str(h): M}), h, spec["fit"]["boot"], m, text=text)
+    for bank in spec["streams"]["banks"]:
+        obs, rec = fitted(bank, spec["size"]["M"])
+        res = _bank_result(rec)
+        res["v3"] = {ch: _v3_stats([p[0] for p in (rec.get("curve_points") or {}).get(ch, [])], res["curves"][ch],
+                                   true_curves[ch], spec) for ch in ("C", "S", "F")}
+        res["counts"], res["reasons"] = rec.get("channels"), rec.get("reasons")
+        banks[bank] = res
+        if bank in spec["acceptance"]["V4"]["banks"]:
+            UL = usable(arrays(obs, h))                          # (the legacy map: M = N, no screen)
+            legacy[bank] = {}
+            for ch in ("S", "F"):
+                okc = UL[ch]["ok"]
+                cv = fit_scale(UL[ch]["mu"][okc], UL[ch]["sigma"][okc] ** 2)
+                legacy[bank][ch] = _v3_stats(UL[ch]["mu"][okc], cv, true_curves[ch], spec)
+        step(f"validate-d8: {bank}")
+    vb = spec["streams"]["v5_bank"]
+    _, v5rec = fitted(vb, 0)
+    step(f"validate-d8: {vb} (V5)")
+    crit = d8_validation_criteria(spec, banks, legacy, v5rec)
+    return {"schema": D8_REPORT_SCHEMA, "spec_sha256": rqlib.canonical_sha(spec),
+            "design_file_sha256": rqlib.sha256_bytes(design_raw), "synthetic_banks": True,
+            "implementation_sha256": d8_implementation()[0], "streams": streams, "banks": banks,
+            "legacy_V4": legacy, "v5_bank": {"status": v5rec.get("status"), "channels": v5rec.get("channels"),
+                                             "reasons": v5rec.get("reasons")},
+            "acceptance": crit}
+
+
+def assemble_generator(bank_path, mean, allow_synthetic=False):
+    """A's assembly of a D8 generator parameter artifact (v5 2.8 assembly contract, PC-21): the adopted bank/3
+    artifact (validated by obslaw's strict loader, its bytes named by fit.noise.source_artifact_sha256) supplies the
+    COMPLETE noise block verbatim, its complete fit.noise record plus exactly one key (source_artifact_sha256),
+    fit.noise_likelihood and the seven shared provenance fields verbatim; mean (the H.9.1 mean fit, outside A)
+    supplies schema, fitted, theta, ar, capture_bound, replicates, the top-level engine_sha256 (the production
+    assay engine = fit.mean.engine_sha256) and fit.mean_head / fit.mean. A mean block carrying any bank-supplied
+    field is refused (no field is overwritten). #68's check_params(production=True) and check_noise_source verify
+    the result (T5-4)."""
+    import copy
+    import obslaw
+    raw = rqlib.read_bytes(bank_path)
+    sha = rqlib.sha256_bytes(raw)
+    obslaw.BankArtifact(bank_path, sha256=sha, allow_synthetic=allow_synthetic)
+    bank = json.loads(raw)
+    shared = ("cohort", "cohort_sha256", "horizon", "dt", "support_law", "age_clock", "survivor_ceiling")
+    clash = sorted(k for k in mean if k in shared + ("noise",)) + sorted(
+        k for k in (mean.get("fit") or {}) if k in ("noise", "noise_likelihood", "streams"))
+    if clash:
+        raise NoiseBankError(f"assembly: the mean block carries bank-supplied fields {clash} (refused)")
+    out = copy.deepcopy({k: v for k, v in mean.items() if k != "fit"})
+    out.update({k: copy.deepcopy(bank[k]) for k in shared})
+    out["noise"] = copy.deepcopy(bank["noise"])
+    out["fit"] = dict(copy.deepcopy(mean.get("fit") or {}), noise_likelihood=bank["fit"]["noise_likelihood"],
+                      noise=dict(copy.deepcopy(bank["fit"]["noise"]), source_artifact_sha256=sha))
+    return out
+
+
+class _Attempt:
+    """One D8 run as an attempt, and its D5 charge (v5 2.11: failed and interrupted runs are charged; the
+    coordinator's accounting plumbing, brief_WP3_r2 P2-2). BEFORE any substantial work, an in-progress record
+    (attempt id, kind, command, UTC start, pid, host, boot id, process start ticks) is written durably to the attempts
+    file beside the ledger (attempts_path), never to the shared ledger. The run_* commands open it under the D8 lock
+    (_LedgerLock), held until it is closed. While the run works, the attempt's cumulative cpu_s is refreshed durably
+    at each major step (step) and by a background thread SCHEDULED whenever ATTEMPT_REFRESH_CPU_S of CPU has passed
+    (polled every ATTEMPT_POLL_S; the thread needs the GIL, so a long GIL-holding call can delay it: the gap is
+    measured, not proven). Finalization (charge) appends exactly one ledger_add-format entry carrying the attempt id
+    (idempotent: never twice for one id; an entry already there is committed only after the ledger is synced);
+    leaving the block closes the attempt, only after its charge is durable. An exception after measure("ok") still
+    charges "failed" ("interrupted" for KeyboardInterrupt, i.e. SIGTERM through _d8_main), never the measured "ok";
+    an exception AFTER the charge (the artifact write of estimate-d8) leaves the one entry and closes the attempt
+    "failed" (its ledger_status kept). A hard kill (SIGKILL, OOM, a reboot) leaves the attempt open: every
+    budget-dependent command refuses (_budget_check) until reconcile_attempts charges it. refresher=False: no thread
+    (tests drive tick())."""
+
+    def __init__(self, ledger, kind, command, refresher=True):
+        import platform
+        import threading
+        self.ledger, self.id, self.c0 = ledger, uuid.uuid4().hex, _cpu_s()
+        self.entry = {"kind": kind, "command": command, "status": "failed", "attempt": self.id}
+        self.charged = self.closed = False
+        self.error, self._last = None, 0.0
+        self._lock, self._stop, self._thread = threading.Lock(), threading.Event(), None
+        self.committed = None
+        try:
+            st = _proc_stat(os.getpid())
+        except NoiseBankError:                  # (its own record unreadable: the start time stays unknown)
+            st = None
+        _attempt_append(ledger, {"event": "open", "attempt": self.id, "kind": kind, "command": command,
+                                 "utc_start": rqlib.now_utc(), "pid": os.getpid(), "host": platform.node(),
+                                 "boot_id": _boot_id(), "start_ticks": None if st is None else st[1], "cpu_s": 0.0,
+                                 "utc": rqlib.now_utc()})
+        if refresher:
+            self._thread = threading.Thread(target=self._run, name=f"d8-attempt-{self.id[:8]}", daemon=True)
+            self._thread.start()
+
+    def __enter__(self):
+        return self
+
+    def cpu(self):
+        return _cpu_s() - self.c0
+
+    def step(self, label):
+        """A major step: the attempt's cumulative cpu_s refreshed durably now."""
+        self._refresh(str(label))
+
+    def tick(self):
+        """The refresher's poll: a durable refresh once ATTEMPT_REFRESH_CPU_S of CPU has passed since the last one."""
+        if self.cpu() - self._last >= ATTEMPT_REFRESH_CPU_S:
+            self._refresh(None)
+
+    def _refresh(self, label):
+        with self._lock:
+            if self.charged or self.closed:
+                return
+            c = self.cpu()
+            rec = {"event": "progress", "attempt": self.id, "cpu_s": c, "utc": rqlib.now_utc()}
+            if label:
+                rec["step"] = label
+            _attempt_append(self.ledger, rec)
+            self._last = c
+
+    def _run(self):
+        import _thread
+        while not self._stop.wait(ATTEMPT_POLL_S):
+            try:
+                self.tick()
+            except BaseException as e:          # (no durable refresh possible: the run is interrupted and charged)
+                self.error = f"{type(e).__name__}: {e}"
+                _thread.interrupt_main()
+                return
+
+    def _halt(self):
+        self._stop.set()
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join()
+
+    def measure(self, status):
+        """The entry with this status and the CPU so far (what the receipt / report records) -> a copy."""
+        self.entry.update(status=status, cpu_s=self.cpu())
+        return dict(self.entry)
+
+    def charge(self):
+        """Finalization: the one ledger entry of this attempt (once), durable when this returns."""
+        if not self.charged:
+            self._halt()
+            self.entry.setdefault("cpu_s", self.cpu())
+            self.committed, _ = _charge_once(self.ledger, self.entry)
+            self.charged = True
+
+    def __exit__(self, et, ev, tb):
+        self._halt()
+        final = self.entry["status"] if et is None else (
+            "interrupted" if issubclass(et, KeyboardInterrupt) else "failed")
+        if not self.charged:
+            if et is not None:                  # (also after measure("ok"): a late failure is charged as one)
+                self.entry.update(status=final, cpu_s=self.cpu())
+                if self.error:
+                    self.entry["refresh_error"] = self.error
+            self.charge()
+        with self._lock:
+            if (attempts_state(self.ledger).get(self.id) or {}).get("close") is None:   # (unless reconciled)
+                _attempt_append(self.ledger, {"event": "close", "attempt": self.id, "status": final,
+                                              "ledger_status": self.committed.get("status"),
+                                              "cpu_s": float(self.committed["cpu_s"]), "charged_by": "finalize",
+                                              "utc": rqlib.now_utc()})
+            self.closed = True
+        return False
+
+
+def run_provenance(study, design, plan, obs, manifest, out, ledger, bindings=None):
+    """`provenance` with its D5 charge: the D8 lock first (held until the attempt is closed), then the budget check
+    (the existing, valid ledger; no unclosed attempt) and the starting guard (>= D8_START_GUARD_H CPU-h remaining, v5
+    2.11 / 7), refused before any work; then the attempt record (durable), the work, the receipt written durably, the
+    charge -> the receipt."""
+    with _LedgerLock(ledger, "provenance"):
+        before = _budget_check(ledger, "provenance")
+        if before["remaining_h"] < D8_START_GUARD_H:
+            raise NoiseBankError(f"{before['remaining_h']:.2f} CPU-h remain on the D5 ledger, below the starting "
+                                 f"guard {D8_START_GUARD_H} (A_design_v5 2.11, 7): refused")
+        with _Attempt(ledger, "D8-noisebank-provenance", "provenance") as att:
+            rec = provenance(study, design, plan, obs, manifest, bindings, progress=att.step)
+            rqlib.write_json_durable(out, rec)
+            att.measure("ok")
+            att.charge()
+    return rec
+
+
+def run_estimate_d8(obs, ages, design, plan, prov, validation, out, receipt, ledger, argv, bindings=None, boot=BOOT,
+                    m=Z_INTERVALS):
+    """`estimate-d8` with its receipt and D5 charge (v5 2.8 L755-757, 2.11): the budget check and the attempt record
+    before the work; the refit; the receipt (with the ledger entry) written durably FIRST; that entry appended to the
+    ledger (once, by attempt id); then the artifact that binds the receipt's sha256 (so every artifact's receipt
+    entry is in the ledger) -> the artifact. A receipt write failure is charged "failed", never the measured "ok". The
+    D8 lock is held from before the budget check until the attempt is closed."""
+    with _LedgerLock(ledger, "estimate-d8"):
+        _budget_check(ledger, "estimate-d8")
+        start = rqlib.now_utc()
+        with _Attempt(ledger, "D8-noisebank-refit", "estimate-d8") as att:
+            fit = estimate_d8(obs, ages, design, plan, prov, validation, bindings, boot, m, progress=att.step)
+            impl = d8_implementation()
+            entry = att.measure("ok")
+            rqlib.write_json_durable(receipt, d8_receipt(argv, fit, impl, start, rqlib.now_utc(), entry["cpu_s"],
+                                                         entry))
+            att.charge()
+            art = d8_artifact(fit, rqlib.sha256_file(receipt))
+            rqlib.write_json_durable(out, art)
+    return art
+
+
+def run_validate_d8(spec, design, out, ledger, bindings=None, **hooks):
+    """`validate-d8` with its D5 charge: the budget check and the attempt record before the work; the report carries
+    the ledger before the run and this run's entry (the after-validation check of v5 2.11 re-projects from them); a
+    report write failure is charged "failed" -> the report. The D8 lock is held from before the budget check until the
+    attempt is closed."""
+    with _LedgerLock(ledger, "validate-d8"):
+        before = _budget_check(ledger, "validate-d8")
+        start = rqlib.now_utc()
+        with _Attempt(ledger, "D8-noisebank-validation", "validate-d8") as att:
+            rep = validate_d8(rqlib.read_json(spec), design, bindings, progress=att.step, **hooks)
+            entry = att.measure("ok")
+            rep.update(ledger_before=before, ledger_entry=dict(entry), utc_start=start, utc_end=rqlib.now_utc())
+            rqlib.write_json_durable(out, rep)
+            att.charge()
+    return rep
+
+
+def _d8_main(a, argv):
+    """The D8 commands (A_design_v5 2.2, 2.8, 2.10, 2.11)."""
+    import signal
+
+    def term(signum, frame):
+        raise KeyboardInterrupt(f"signal {signum}")
+    signal.signal(signal.SIGTERM, term)
+    if a.cmd == "d8-validation-spec":
+        rqlib.write_json_durable(a.out, d8_validation_spec(rqlib.sha256_file(a.design), a.round))
+        print(f"validation spec written: {a.out}")
+        return 0
+    t = ledger_total([a.ledger])
+    print(f"D5 ledger before {a.cmd}: {t['cpu_h']:.3f} CPU-h charged, {t['remaining_h']:.3f} remaining")
+    if a.cmd == "d8-reconcile":
+        print(json.dumps({"reconciled": reconcile_attempts(a.ledger)}, sort_keys=True))
+        code = 0
+    elif a.cmd == "provenance":
+        rec = run_provenance(a.study, a.design, a.plan, a.obs, a.manifest, a.out, a.ledger)
+        print(json.dumps({k: rec[k] for k in ("cells", "engine_sha256", "manifest", "store")}, sort_keys=True))
+        code = 0
+    elif a.cmd == "validate-d8":
+        rep = run_validate_d8(a.spec, a.design, a.out, a.ledger)
+        print(json.dumps({"accepted": rep["acceptance"]["accepted"]}))
+        code = 0 if rep["acceptance"]["accepted"] else 2
+    else:
+        art = run_estimate_d8(a.obs, a.ages, a.design, a.plan, a.provenance, a.validation_report, a.out, a.receipt,
+                              a.ledger, argv, boot=a.boot)
+        print(json.dumps({"status": art["status"], "noise_available": art["noise"]["available"]}))
+        code = 0
+        if art["status"] != "d8-fitted":
+            print(f"noisebank.py estimate-d8: the bank/3 artifact is unavailable: {art['noise'].get('reasons')}",
+                  file=sys.stderr)
+            code = 2
+    t = ledger_total([a.ledger])
+    print(f"D5 ledger after {a.cmd}: {t['cpu_h']:.3f} CPU-h charged, {t['remaining_h']:.3f} remaining")
+    return code
 
 
 # ================================================================== THE PRODUCTION V BUILDER
@@ -1887,11 +3531,48 @@ def main(argv=None):
     s.add_argument("--plan", required=True)
     s.add_argument("--declare-missing", nargs="*", default=[])
     s.add_argument("--out", required=True)
+    s.add_argument("--age-diagnostics", help="also write the collected cells' age-stratified diagnostics "
+                   "(finfolk.redqueen.agediagnostics/1, D8 rule 48) to this path")
     s = sub.add_parser("estimate")
     s.add_argument("--obs", required=True)
     s.add_argument("--boot", type=int, default=BOOT)
+    s.add_argument("--design", help="registered design for older observations that do not embed it")
+    s.add_argument("--descriptive", action="store_true", help="allow partial descriptive estimation; never production-available")
     s.add_argument("--out", required=True)
+    s = sub.add_parser("provenance", help="the D8 provenance receipt (A_design_v5 2.2)")
+    s.add_argument("--study", required=True, help="the registered bank root")
+    s.add_argument("--design", required=True)
+    s.add_argument("--plan", required=True)
+    s.add_argument("--obs", required=True)
+    s.add_argument("--manifest", help="a pre-existing integrity manifest (sha256sum lines), when available")
+    s.add_argument("--out", required=True)
+    s.add_argument("--ledger", required=True, help="the cumulative D5 CPU ledger (charged, failed runs too)")
+    s = sub.add_parser("estimate-d8", help="the D8 refit: the bank/3 artifact (A_design_v5 2.1-2.8)")
+    for k in ("--obs", "--ages", "--design", "--plan", "--provenance", "--validation-report"):
+        s.add_argument(k, required=True)
+    s.add_argument("--boot", type=int, default=BOOT)
+    s.add_argument("--out", required=True, help="the bank/3 artifact (written after its receipt)")
+    s.add_argument("--receipt", required=True, help="the refit receipt (written durably first)")
+    s.add_argument("--ledger", required=True, help="the cumulative D5 CPU ledger (charged, failed runs too)")
+    s = sub.add_parser("d8-validation-spec", help="write the validation spec (A_design_v5 2.10, 7 step 3)")
+    s.add_argument("--design", required=True)
+    s.add_argument("--round", type=int, default=1, help="2, 3, ...: the fresh-key reruns (bank<k>-r<round>)")
+    s.add_argument("--out", required=True)
+    s = sub.add_parser("validate-d8", help="the prospective validation V1-V5 (A_design_v5 2.10)")
+    s.add_argument("--spec", required=True)
+    s.add_argument("--design", required=True)
+    s.add_argument("--out", required=True)
+    s.add_argument("--ledger", required=True, help="the cumulative D5 CPU ledger (charged, failed runs too)")
+    s = sub.add_parser("d8-reconcile", help="charge every unclosed (hard-interrupted) D8 attempt beside the ledger its "
+                       "last durable CPU + 60 s, once, and close it (A_design_v5 2.11)")
+    s.add_argument("--ledger", required=True, help="the cumulative D5 CPU ledger")
     a = ap.parse_args(argv)
+    if a.cmd in D8_COMMANDS:
+        try:
+            return _d8_main(a, sys.argv[1:] if argv is None else list(argv))
+        except (NoiseBankError, OSError, ValueError) as e:
+            print(f"noisebank.py {a.cmd}: {e}", file=sys.stderr)
+            return 2
     try:
         if a.cmd == "plan":
             d = make_design(rqlib.read_json(a.block), [os.path.abspath(t) for t in a.templates],
@@ -1901,11 +3582,15 @@ def main(argv=None):
             print(json.dumps({k: d["noisebank"][k] for k in ("worlds", "cells", "predator_trajectories",
                                                             "free_trajectories")}))
         elif a.cmd == "collect":
-            doc = collect(a.study, rqlib.read_json(a.design), a.plan, a.declare_missing)
+            doc, ages = collect_with_age_diagnostics(a.study, rqlib.read_json(a.design), a.plan, a.declare_missing)
             rqlib.write_json_durable(a.out, doc)
+            if a.age_diagnostics:
+                rqlib.write_json_durable(a.age_diagnostics, ages)
             print(f"{len(doc['observations'])} observations, {len(doc['missing'])} declared missing")
         else:
-            bank = estimate(rqlib.read_json(a.obs), boot=a.boot, replicates=REPLICATES)
+            raw = rqlib.read_bytes(a.obs)
+            bank = estimate(json.loads(raw), boot=a.boot, replicates=None if a.descriptive else REPLICATES,
+                            descriptive=a.descriptive, design=rqlib.read_json(a.design) if a.design else None, obs_bytes=raw)
             rqlib.write_json_durable(a.out, bank)
             g = bank["generator_noise"]
             print(json.dumps(g))
@@ -1913,7 +3598,7 @@ def main(argv=None):
                 print(f"noisebank.py estimate: the 5k generator noise is unavailable: {g['reasons']}", file=sys.stderr)
                 return 2
         return 0
-    except NoiseBankError as e:
+    except (NoiseBankError, OSError, ValueError) as e:
         print(f"noisebank.py {a.cmd}: {e}", file=sys.stderr)
         return 2
 

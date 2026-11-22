@@ -21,6 +21,7 @@
   },
   "files": [
     "web/types.d.ts",
+    "web/ui_common.js",
     "web/ocean_appearance_slots.js",
     "web/ocean_handoff.js",
     "web/ocean_perf.js",

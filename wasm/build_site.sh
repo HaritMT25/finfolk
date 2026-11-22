@@ -18,7 +18,7 @@
 #                              (web/ocean_bodyplan.html: the Ocean module's
 #                              body-plan law, its fixture and GPU check), no-cache,
 #                              hashed references; the fish card links to it
-#   dist/assets/NAME.HASH.EXT  every script, wasm and image, content-hashed,
+#   dist/assets/NAME.HASH.EXT  every script, stylesheet, wasm and image, content-hashed,
 #                              served with a one-year immutable cache
 #   dist/vercel.json           headers: COOP/COEP (cross-origin isolation for
 #                              Classic's threaded module), wasm MIME, caching
@@ -44,7 +44,8 @@ SRC=(web/evo_boids.js web/evo_boids.wasm web/evo_boids_mt.js web/evo_boids_mt.wa
      web/ocean_config.js web/ocean_dash.js web/ocean_worker.js web/ocean_appearance.js
      web/ocean_appearance_slots.js web/ocean_handoff.js web/ocean_perf.js web/ocean_shaders.js
      web/ocean_pose.js web/ocean_materials.js web/ocean_scene_parity.js
-     web/ocean_bodyplan.html web/ocean_bodyplan.js tests/fixtures/ocean_body_fixture.json)
+     web/ocean_bodyplan.html web/ocean_bodyplan.js tests/fixtures/ocean_body_fixture.json
+     web/ui_common.js web/ui_common.css)
 for f in "${SRC[@]}"; do
     [ -f "$f" ] || { echo "missing $f — build the modules first (wasm/build_wasm.sh, wasm/build_ocean.sh)" >&2; exit 1; }
 done
@@ -84,10 +85,12 @@ OCSHADERS=$(publish web/ocean_shaders.js); OCPOSE=$(publish web/ocean_pose.js)
 OCPARITY=$(publish web/ocean_scene_parity.js); OCMATS=$(publish web/ocean_materials.js)
 # the body plan's fixture viewer (and its fixture: the native law's digests)
 OCBP=$(publish web/ocean_bodyplan.js); OCBPFIX=$(publish tests/fixtures/ocean_body_fixture.json)
+# both pages' shared focus primitives (window.EvoUI: web/ui_common.js) and their stylesheet
+UICOMMON=$(publish web/ui_common.js); UICSS=$(publish web/ui_common.css)
 
-# Classic: rewrite the EVO_ASSETS block, the <script src> tags and the
-# switch's link to the Ocean (now the root). Fails loudly if web/index.html no
-# longer has the shape this expects.
+# Classic: rewrite the EVO_ASSETS block, the <script src> tags, the shared
+# stylesheet's <link> and the switch's link to the Ocean (now the root). Fails
+# loudly if web/index.html no longer has the shape this expects.
 python3 - "$OUT/classic.html" <<PY
 import re, sys
 src = open("web/index.html").read()
@@ -109,13 +112,16 @@ out, n8 = re.subn(r'<script src="charts\.js"></script>', '<script src="$CHARTS">
 out, n9 = re.subn(r'<script src="dashboard\.js"></script>', '<script src="$DASH"></script>', out, count=1)
 out, n10 = re.subn(r'<script src="scene3d\.js"></script>', '<script src="$SCENE"></script>', out, count=1)
 out, n11 = re.subn(r'id="to3d" href="ocean\.html"', 'id="to3d" href="./"', out, count=1)
-counts = (n1, n2, n3, n4, n5, n6, n7, n8, n9, n10, n11)
-assert counts == (1,) * 11, ("index.html changed shape", counts)
+out, n12 = re.subn(r'<script src="ui_common\.js"></script>', '<script src="$UICOMMON"></script>', out, count=1)
+out, n13 = re.subn(r'<link rel="stylesheet" href="ui_common\.css">', '<link rel="stylesheet" href="$UICSS">', out, count=1)
+counts = (n1, n2, n3, n4, n5, n6, n7, n8, n9, n10, n11, n12, n13)
+assert counts == (1,) * 13, ("index.html changed shape", counts)
 open(sys.argv[1], "w").write(out)
 PY
 
-# The Ocean page: its EVO_ASSETS block, its fourteen <script src> tags, and
-# Classic's name in the switch and in the old-link redirect. ocean.js loads the
+# The Ocean page: its EVO_ASSETS block, its fifteen <script src> tags, the
+# shared stylesheet's <link>, and Classic's name in the switch and in the
+# old-link redirect. ocean.js loads the
 # engine (ocean / oceanWasm) and starts the Turbo worker (worker) from these,
 # handing the worker the hand-off helper's name (handoff: it loads it as the
 # page does), ocean_scene.js the three bundle. (mock: ?mock=1's stand-in,
@@ -147,8 +153,10 @@ out, n14 = re.subn(r'<script src="ocean_shaders\.js"></script>', '<script src="$
 out, n15 = re.subn(r'<script src="ocean_pose\.js"></script>', '<script src="$OCPOSE"></script>', out, count=1)
 out, n16 = re.subn(r'<script src="ocean_scene_parity\.js"></script>', '<script src="$OCPARITY"></script>', out, count=1)
 out, n17 = re.subn(r'<script src="ocean_materials\.js"></script>', '<script src="$OCMATS"></script>', out, count=1)
-counts = (n1, n2, n3, n4, n5, n6, n7, n8, n9, n10, n11, n12, n13, n14, n15, n16, n17)
-assert counts == (1,) * 17, ("ocean.html changed shape", counts)
+out, n18 = re.subn(r'<script src="ui_common\.js"></script>', '<script src="$UICOMMON"></script>', out, count=1)
+out, n19 = re.subn(r'<link rel="stylesheet" href="ui_common\.css">', '<link rel="stylesheet" href="$UICSS">', out, count=1)
+counts = (n1, n2, n3, n4, n5, n6, n7, n8, n9, n10, n11, n12, n13, n14, n15, n16, n17, n18, n19)
+assert counts == (1,) * 19, ("ocean.html changed shape", counts)
 open(sys.argv[1], "w").write(out)
 PY
 cp "$OUT/index.html" "$OUT/ocean.html"

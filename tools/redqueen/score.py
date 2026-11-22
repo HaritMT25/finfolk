@@ -18,7 +18,12 @@ Readouts per horizon h (summed counts over summed exposure, never a mean of inte
   * survivors / survival: how many of the arena's prey ids (the initial cohort) are alive in
     end.<f0 + h>.json, over the cohort size (compared with the predator-free fork later);
   * prey, births, deaths by cause: from the checkpoints' cumulative counters minus the arena's
-    (exact; the main CSV's first interval row can carry a loaded world's history).
+    (exact; the main CSV's first interval row can carry a loaded world's history);
+  * age_strata (D8 v2 rule 48; age_strata() below): the initial cohort by START age, ten 12-second
+    bins crossed with rule 46's age feasibility at that horizon (common.age_feasible: the engine's
+    binary32 age clock), with counts, survival fractions (None for an empty denominator), the bin
+    and feasibility totals and the identities. age_strata_problems() is its contract, checked here,
+    at bundle creation, at completion verification and at ingestion.
 Checks (any failure raises ScoreError): rows exactly at f0 + m x log_every; the checkpoint at
 each horizon at its frame; the arena's and every checkpoint's predator count == K in the frozen
 modes, no predator births / deaths / refills there; the predation-death counter difference
@@ -38,18 +43,29 @@ baseline subtracted), the exposure K x h x dt, and no predator birth, refill or 
 from __future__ import annotations
 
 import argparse
+from bisect import bisect_right
 import csv
 import io
 import json
+import math
 import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ckpt  # noqa: E402
+import common  # noqa: E402  (the engine's binary32 age clock: the one feasibility definition)
 
 SCHEMA = "finfolk.redqueen.score/1"
 DT = 0.016          # main.cpp fixedDt
 FROZEN = ("frozen", "frozen-newborn")
+START_AGE_EDGES_S = tuple(range(0, 121, 12))  # fixed diagnostic bins; not the cell's maxAge
+AGE_STRATA_SCHEMA = "finfolk.redqueen.agestrata/1"
+AGE_BINS = ("start ages from arena.json at f0, keyed by live initial-cohort id; bins [0,12), [12,24), ..., "
+            "[96,108), [108,120]: an interior edge belongs to the bin on its right, 120 to the last")
+_STRATUM_KEYS = {"n_start", "survivors", "survival"}
+_BIN_KEYS = _STRATUM_KEYS | {"feasible", "infeasible"}
+_STRATA_KEYS = _STRATUM_KEYS | {"schema", "steps", "frame", "max_age_s", "dt_s", "age_clock", "bin_edges_s",
+                                "bin_convention", "bins", "feasible", "infeasible"}
 
 
 class ScoreError(Exception):
@@ -65,6 +81,164 @@ def read_predators_csv(text):
 
 def _ratio(a, b):
     return a / b if b > 0 else None
+
+
+def _start_ages(arena, start_ids):
+    """The initial cohort's ages at f0, keyed by the same IDs as the survival readout."""
+    max_age = (arena.get("config") or {}).get("maxAge")
+    if (isinstance(max_age, bool) or not isinstance(max_age, (int, float)) or
+            not math.isfinite(max_age) or max_age < 0):
+        raise ScoreError("arena.json: missing or invalid config.maxAge")
+    cs = arena["creatures"]
+    ages = cs.get("age")
+    if not isinstance(ages, list) or len(ages) != len(cs["id"]):
+        raise ScoreError("arena.json: missing start age (creature age column incomplete)")
+    by_id = {}
+    for i, age in zip(cs["id"], ages):
+        if int(i) not in start_ids:
+            continue
+        if (isinstance(age, bool) or not isinstance(age, (int, float)) or
+                not math.isfinite(age) or not 0 <= age <= max_age):
+            raise ScoreError(f"arena.json: start age {age!r} for prey {i} outside [0, maxAge={max_age}]")
+        if age > START_AGE_EDGES_S[-1]:
+            raise ScoreError(f"arena.json: start age {age} for prey {i} outside fixed diagnostic bins "
+                             f"[0, {START_AGE_EDGES_S[-1]}] s")
+        by_id[int(i)] = age
+    if set(by_id) != start_ids:
+        raise ScoreError("arena.json: missing start age for an initial-cohort ID")
+    return by_id, max_age
+
+
+def _stratum(n, s):
+    return {"n_start": n, "survivors": s, "survival": _ratio(s, n)}
+
+
+def age_strata(start_ages, alive_ids, max_age, h, frame, dt, n_start, survivors):
+    """D8 v2 rule 48's summary at horizon h: the initial cohort (start_ages: {live start id: START age})
+    in ten 12-second start-age bins, each crossed with rule 46's age feasibility F_i(h), evaluated per
+    individual by common.age_feasible (the engine's binary32 clock; never a+h*dt <= maxAge, never a
+    bin midpoint). Every bin x feasibility stratum, every bin, both feasibility totals and the whole
+    cohort carry n_start, survivors and survival (None for an empty denominator). n_start and
+    survivors are the scorer's own totals, so the strata must reconcile to them; an age-infeasible
+    survivor is impossible in the engine. Either failure refuses scoring (age_strata_problems)."""
+    cnt = [[[0, 0], [0, 0]] for _ in START_AGE_EDGES_S[1:]]   # [bin][feasible, infeasible][n, survivors]
+    for i, age in start_ages.items():
+        # bisect puts interior edges in the bin on their right; the final edge is closed.
+        b = min(bisect_right(START_AGE_EDGES_S, age) - 1, len(cnt) - 1)
+        c = cnt[b][0 if common.age_feasible(age, h, max_age, dt) else 1]
+        c[0] += 1
+        c[1] += int(i in alive_ids)
+    bins = [{**_stratum(f[0] + x[0], f[1] + x[1]), "feasible": _stratum(*f), "infeasible": _stratum(*x)}
+            for f, x in cnt]
+    rec = {"schema": AGE_STRATA_SCHEMA, "steps": h, "frame": frame, **_stratum(n_start, survivors),
+           "max_age_s": max_age, "dt_s": dt, "age_clock": common.AGE_CLOCK,
+           "bin_edges_s": list(START_AGE_EDGES_S), "bin_convention": AGE_BINS, "bins": bins}
+    for k in ("feasible", "infeasible"):
+        rec[k] = _stratum(sum(b[k]["n_start"] for b in bins), sum(b[k]["survivors"] for b in bins))
+    probs = _strata_problems(rec, h, frame, n_start, survivors, dt)
+    if probs:
+        raise ScoreError(f"horizon {h}: " + "; ".join(probs))
+    return rec
+
+
+def _count(v):
+    return isinstance(v, int) and not isinstance(v, bool) and v >= 0
+
+
+def _stratum_problems(s, what):
+    if not isinstance(s, dict) or set(s) != _STRATUM_KEYS:
+        return [f"{what} is not an n_start / survivors / survival record"]
+    n, k = s["n_start"], s["survivors"]
+    if not (_count(n) and _count(k) and k <= n):
+        return [f"{what}: counts {n!r} / {k!r} are not 0 <= survivors <= n_start"]
+    if isinstance(s["survival"], bool) or s["survival"] != _ratio(k, n) or (n == 0) != (s["survival"] is None):
+        return [f"{what}: survival {s['survival']!r} is not survivors / n_start (None when n_start is 0)"]
+    return []
+
+
+def _strata_problems(a, steps, frame, n_start, survivors, dt):
+    """One horizon's age_strata against the contract and the scorer's horizon, frame, totals and dt."""
+    if not isinstance(a, dict):
+        return ["age_strata is not a record"]
+    if set(a) != _STRATA_KEYS:
+        return [f"age_strata keys differ from the contract ({sorted(set(a) ^ _STRATA_KEYS)})"]
+    probs = []
+    if a["schema"] != AGE_STRATA_SCHEMA:
+        probs.append(f"age_strata schema {a['schema']!r}, not {AGE_STRATA_SCHEMA}")
+    if a["age_clock"] != common.AGE_CLOCK:
+        probs.append(f"age predicate {a['age_clock']!r}, not {common.AGE_CLOCK}")
+    if (a["steps"], a["frame"]) != (steps, frame):
+        probs.append(f"age_strata for steps / frame {a['steps']} / {a['frame']}, the horizon is {steps} / {frame}")
+    if a["dt_s"] != dt:
+        probs.append(f"age_strata dt {a['dt_s']!r}, the score's is {dt!r}")
+    m = a["max_age_s"]
+    if isinstance(m, bool) or not isinstance(m, (int, float)) or not math.isfinite(m) or m < 0:
+        probs.append(f"age_strata maxAge {m!r} is not a finite age")
+    if a["bin_edges_s"] != list(START_AGE_EDGES_S) or a["bin_convention"] != AGE_BINS:
+        probs.append("age_strata bins are not the fixed 12-second start-age bins")
+    probs += _stratum_problems({k: a[k] for k in _STRATUM_KEYS}, "the cohort total")
+    if (a["n_start"], a["survivors"]) != (n_start, survivors):
+        probs.append(f"the cohort total {a['n_start']} / {a['survivors']} is not the scorer's n_start / survivors "
+                     f"{n_start} / {survivors}")
+    bins = a["bins"]
+    if not isinstance(bins, list) or len(bins) != len(START_AGE_EDGES_S) - 1:
+        return probs + ["age_strata does not hold ten bins"]
+    sums = {k: [0, 0] for k in ("bins", "feasible", "infeasible")}
+    for j, b in enumerate(bins):
+        what = f"bin {START_AGE_EDGES_S[j]}-{START_AGE_EDGES_S[j + 1]} s"
+        if not isinstance(b, dict) or set(b) != _BIN_KEYS:
+            probs.append(f"{what} is not a bin x feasibility record")
+            continue
+        counted = True
+        for k, s, w in (("bins", {x: b[x] for x in _STRATUM_KEYS}, what), ("feasible", b["feasible"], what + " feasible"),
+                        ("infeasible", b["infeasible"], what + " infeasible")):
+            probs += _stratum_problems(s, w)
+            if isinstance(s, dict) and _count(s.get("n_start")) and _count(s.get("survivors")):
+                sums[k][0] += s["n_start"]
+                sums[k][1] += s["survivors"]
+            else:
+                counted = False
+        if counted:
+            for x in ("n_start", "survivors"):
+                if b["feasible"][x] + b["infeasible"][x] != b[x]:
+                    probs.append(f"{what}: feasible + infeasible {x} is not the bin's")
+    for k in ("feasible", "infeasible"):
+        p = _stratum_problems(a[k], f"the {k} total")
+        probs += p
+        if not p and [a[k]["n_start"], a[k]["survivors"]] != sums[k]:
+            probs.append(f"the {k} total {a[k]['n_start']} / {a[k]['survivors']} is not the sum of its bins "
+                         f"{sums[k][0]} / {sums[k][1]}")
+    if sums["bins"] != [n_start, survivors]:
+        probs.append(f"the bins sum to {sums['bins'][0]} / {sums['bins'][1]}, not the scorer's n_start / survivors "
+                     f"{n_start} / {survivors}")
+    if isinstance(a["infeasible"], dict) and a["infeasible"].get("survivors") != 0:
+        probs.append("age-infeasible initial prey survived (impossible on the engine's binary32 age clock)")
+    return probs
+
+
+def age_strata_problems(sc, horizons=None):
+    """Why a score lacks rule 48's complete age summary -> problems ([] = complete): every horizon
+    record (and, given the cell's registered `horizons`, exactly those, in order) must carry an
+    age_strata that satisfies the contract (_strata_problems) and reconciles with that horizon's
+    steps, frame and survivors and the score's n_start and dt. A missing summary is a recording
+    omission (repair it or record a deviation), never zero survival."""
+    if not isinstance(sc, dict) or not isinstance(sc.get("horizons"), list) or not sc["horizons"]:
+        return ["the score has no horizon records"]
+    hs = sc["horizons"]
+    probs = []
+    steps = [h.get("steps") if isinstance(h, dict) else None for h in hs]
+    if horizons is not None and (not isinstance(horizons, (list, tuple)) or steps != list(horizons)):
+        probs.append(f"the scored horizons {steps} are not the cell's registered horizons {horizons!r}")
+    for h in hs:
+        if not isinstance(h, dict):
+            probs.append("a horizon record is not an object")
+        elif "age_strata" not in h:
+            probs.append(f"horizon {h.get('steps')}: no age_strata (a recording omission, not zero survival)")
+        else:
+            probs += [f"horizon {h.get('steps')}: {p}" for p in
+                      _strata_problems(h["age_strata"], h.get("steps"), h.get("frame"), sc.get("n_start"),
+                                       h.get("survivors"), sc.get("dt"))]
+    return probs
 
 
 def scripted_problems(cp, k, what):
@@ -88,10 +262,15 @@ def score(d, k, steps, horizons, log_every, assay, fork=False, scripted=False):
     control could otherwise be refilled by a predator floor and still pass). scripted: K fixed,
     immortal Stage A hunters (no brain: no predators.csv): captures are the predation-death counter's
     difference (exact), the exposure K x h x dt; K and no predator birth or refill at every horizon."""
-    arena = ckpt.load(os.path.join(d, "arena.json"))
+    # Read ages before the adapter's general validation so missing / non-finite ages are
+    # reported as scoring failures, just like out-of-range ages and the partition invariants.
+    arena_path = os.path.join(d, "arena.json")
+    arena = ckpt.load(arena_path, check=False)
     f0 = int(arena["world"]["frame"])
     start_ids = {int(i) for i, a in zip(arena["creatures"]["id"], arena["creatures"]["alive"]) if int(a)}
     n0 = len(start_ids)
+    start_ages, max_age = _start_ages(arena, start_ids)
+    ckpt.validate(arena, arena_path)
     k_arena = int(arena["predators"]["count"])
     if k_arena != k:
         raise ScoreError(f"the arena has {k_arena} predators, the cell asked for K = {k}")
@@ -163,6 +342,8 @@ def score(d, k, steps, horizons, log_every, assay, fork=False, scripted=False):
             vbuds = sum(int(r["virtual_buds_interval"]) for r in rows)
         cs = cp["creatures"]
         survivors = sum(1 for i, a in zip(cs["id"], cs["alive"]) if int(a) and int(i) in start_ids)
+        alive_ids = {int(i) for i, a in zip(cs["id"], cs["alive"]) if int(a)}
+        strata = age_strata(start_ages, alive_ids, max_age, h, f0 + h, DT, n0, survivors)
         ctr = cp["counters"]
         dc = {key: int(ctr[key]) - int(base.get(key, 0)) for key in
               ("totalBirths", "totalDeaths", "totalDeathsPredation", "totalDeathsStarvation", "totalDeathsAge")}
@@ -186,6 +367,7 @@ def score(d, k, steps, horizons, log_every, assay, fork=False, scripted=False):
             "virtual_bud_rate": _ratio(vbuds, pred_s), "pursuit_seconds": pursuit_s,
             "captures_per_pursuit_s": _ratio(captures, pursuit_s) if pursuit_s is not None else None,
             "survivors": survivors, "survival": _ratio(survivors, n0),
+            "age_strata": strata,
             "prey": int(cs["count"]), "predators": int(cp["predators"]["count"]),
             "births": dc["totalBirths"], "deaths": dc["totalDeaths"],
             "deaths_predation": dc["totalDeathsPredation"], "deaths_starvation": dc["totalDeathsStarvation"],

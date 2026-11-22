@@ -60,13 +60,19 @@ validate runs the pinned engine on a built checkpoint: it loads and runs 100 ste
 resumes s100 for 100 more (a), resumes a Python load + dump of s100 for 100 more (b), and runs
 200 steps straight from the common checkpoint (c). It requires a == b (the Python adapter
 round-trips exactly) and a == c (the engine's save / load round trip is exact on this world).
+
+The engine's binary32 age clock (age_death_frame, age_feasible, age_feasible_count; D8 v2 rule
+46, used by rule 48) is defined here, once, for every tool that needs age feasibility: score.py's
+age strata, and the statistics' age ceiling M_H (import it from here; do not re-derive it).
 """
 from __future__ import annotations
 
 import argparse
 import copy
 import json
+import math
 import os
+import struct
 import subprocess
 import sys
 
@@ -88,6 +94,88 @@ COUNTER_ONES = ("clusterStride", "reproStride")
 
 class CommonError(Exception):
     pass
+
+
+# ---------------------------------------------------------------- the engine's binary32 age clock
+# D8 v2 rule 46 (and rule 48, which uses the same predicate): the ONE definition of age feasibility.
+# The pinned engine keeps a creature's age as a binary32 float (src/core/agent_core.hpp:42
+# `float age`), loads it from a checkpoint as the (float) cast of the parsed double
+# (src/core/json_min.hpp:288 readFloats for the age column, :132 floatOr for maxAge), adds the fixed step every frame
+# (src/core/kernel.hpp:97 `c.age += dt;`, dt = `const float fixedDt = 0.016f;` src/app/main.cpp:687)
+# and kills a prey of age when the UPDATED age is strictly greater than the binary32 maxAge
+# (src/core/kernel.hpp:117 `if (c.age > cfg.maxAge) return 'a';`, src/core/config.hpp:119
+# `float maxAge`). The build forbids contraction (-ffp-contract=off), so each += is one correctly
+# rounded binary32 addition. For a start age a, maxAge m and horizon H (frames):
+#
+#     A_0 = binary32(a),   A_{k+1} = round32(A_k + binary32(0.016)),
+#     age death at the first frame k >= 1 with A_k > binary32(m);
+#     F(H) = 1 (age-feasible) exactly when no k in 1..H has A_k > binary32(m).
+#
+# This is NOT the exact-arithmetic a + H * 0.016 <= m (nor that with its equality case corrected):
+# rounding moves individuals across that boundary. Start 40.00001907348633 reaches
+# 119.99422454833984 after 5,000 frames on this clock (feasible) although 40.000019 + 80 > 120.
+# The engine tests starvation before age (deathCause); F is an age-only support predicate.
+# A binary32 sum computed in double and rounded once to binary32 is the correctly rounded binary32
+# sum (53 >= 2 x 24 + 2 bits), so the simulation below is exact. Each start age's clock is cached and
+# resumed (a later, longer horizon continues where an earlier one stopped): an exactly equivalent
+# cache, as rule 46 permits.
+AGE_CLOCK = "finfolk.redqueen.ageclock/binary32-1"   # the predicate's identity, recorded with each summary
+ENGINE_DT = 0.016                                     # fixedDt (main.cpp:687); score.DT is the same value
+_F32 = struct.Struct("<f")
+_CLOCKS = {}                                          # (A_0, binary32 m, binary32 dt) -> [k, A_k, death]
+
+
+def binary32(x):
+    """x rounded to the nearest IEEE-754 binary32 value (ties to even): the engine's (float) cast of a
+    parsed double. Raises ValueError for a value that is not a finite binary32 number."""
+    if isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x):
+        raise ValueError(f"age clock: {x!r} is not a finite number")
+    try:
+        return _F32.unpack(_F32.pack(x))[0]
+    except OverflowError:
+        raise ValueError(f"age clock: {x!r} is outside the binary32 range") from None
+
+
+def age_death_frame(start_age, max_age, limit, dt=ENGINE_DT):
+    """The frame k (1 <= k <= limit) of the age death of a prey whose engine-loaded age at frame 0 is
+    start_age, on the engine's binary32 age clock (above), or None if it does not come within `limit`
+    frames (predation and starvation aside)."""
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+        raise ValueError(f"age clock: limit {limit!r} is not a frame count")
+    key = (binary32(start_age), binary32(max_age), binary32(dt))
+    if not key[2] > 0:
+        raise ValueError(f"age clock: dt {dt!r} is not positive")
+    st = _CLOCKS.get(key)
+    if st is None:
+        if len(_CLOCKS) >= 1 << 16:
+            _CLOCKS.clear()
+        st = _CLOCKS[key] = [0, key[0], None]
+    k, a, death = st
+    if death is None and k < limit:
+        m, d = key[1], key[2]
+        pack, unpack = _F32.pack, _F32.unpack
+        while k < limit:
+            k += 1
+            try:
+                a = unpack(pack(a + d))[0]
+            except OverflowError:                   # (rounds to +inf: past any finite maxAge)
+                a = math.inf
+            if a > m:
+                death = k
+                break
+        st[:] = [k, a, death]
+    return death if death is not None and death <= limit else None
+
+
+def age_feasible(start_age, horizon, max_age, dt=ENGINE_DT):
+    """F(H) of D8 v2 rule 46: True exactly when the engine's age-death predicate stays false through
+    all `horizon` frames from the engine-loaded start age (the binary32 clock above)."""
+    return age_death_frame(start_age, max_age, horizon, dt) is None
+
+
+def age_feasible_count(start_ages, horizon, max_age, dt=ENGINE_DT):
+    """M_H of D8 v2 rule 46: how many of start_ages are age-feasible at the horizon (age_feasible)."""
+    return sum(age_feasible(a, horizon, max_age, dt) for a in start_ages)
 
 
 def sample_indices(m, n, seed, policy):

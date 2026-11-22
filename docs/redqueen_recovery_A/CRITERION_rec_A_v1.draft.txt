@@ -1,0 +1,150 @@
+DRAFT FOR OWNER/COORDINATOR ADOPTION BEFORE ANY PRODUCTION-RECOVERY DATASET
+rec_A_v1, source <phase-2 merge commit on main>; observation model BANK/D8
+(A_design_v5.md sha256 <as recorded in the dated adoption receipt>; bank_d8.json sha256 <…>; obs_tables.npz sha256 <…>)
+
+VERBATIM DESIGN (redqueen_study_design_v4_codex.md:707,709,711,713,715):
+A proposed compact recovery allocation is **20 independent noise realizations** for rank 0 and each rank-1/rank-2 effect setting: **100 noisy datasets**, plus noiseless numerical checks. Report Monte Carlo intervals; this is a recovery diagnostic, not a precise type-I certification.
+The proposed design target is at least **80% empirical predictive-specificity success at the doubled setting**, with performance at the smaller setting reported separately. Freeze the criterion before running recovery.
+Evaluate the full selection-and-prediction procedure. Run the **80/10/10 interpolation partition as a separate fit**; do not subtract another 20% from the primary training graph.
+If recovery fails, do not interpret subsequent rank-zero selection as evidence against detectable specificity. Repair or amend the graph before sealing; do not inspect main outcomes to choose the repair.
+A **48 CPU-hour recovery allowance is an estimate**, included within the modelling budget. Benchmark it. Failure to meet the prelaunch requirement delays sealing rather than weakening the check.
+
+VERBATIM FORWARD POLICY (design:785):
+Sentinel references, including late references, are declared external calibration information. Repeat the complete forward-time analysis using only references at **≤120M**.
+
+COORDINATOR CHOICE C1 (adopt prospectively, not already verbatim design):
+Require >=16 successes among ALL 20 scheduled realizations separately in
+r1_034 and r2_034, intact graph, legacy option a, validation rank search 0..4,
+every dataset generated AND fitted in bank mode (--obs-model bank) from the
+frozen D8 bank artifact and observation tables named in the header.
+No pooling across scenarios. Success is the merged capture-count predictive
+score rule: selected rank >0 AND crossed-source-bootstrap test lower bound >0,
+with an available resolved comparison and at least two contributing test roots.
+Unavailable or missing realizations are unsuccessful, never removed from 20.
+Missing files additionally make the matrix incomplete. Report Wilson95 intervals;
+their lower endpoints need not exceed .80. The restricted {0,1,2} summary does
+not replace rank-0..4 selection. Report both smaller effects, rank-zero false
+positives, selection/decision availability and reasons separately.
+
+EFFECT-SETTING INTERPRETATION (frozen; memo §5 on C:5,16,27-32; D:705):
+"1.7%"/"3.4%" mean Var(c r)/Var(eta) over every pair of the graph, where eta is
+the noiseless capture predictor, r = raw - P(raw), raw = u_i.v_j, P the
+unweighted least-squares additive (rank-0, identity link) projection over all
+graph pairs (recovery.additive_projection, 40 sweeps), c solved by the 20-step
+fixed point of recovery.py:403-407 and recorded per dataset as energy_check
+(recovery.py:440). This is NOT the post-refit energy under the registered
+monotone 6x6 baseline and link; no claim is made that the registered map's
+post-refit fraction equals these values. Scale of eta: in the LOGIT-LINK
+scenarios (every main, sensitivity and numerical scenario and every stress
+scenario except the two asym ones) eta is the logit of the intended capture
+mean sigma(eta) (bank mode, H:1113), not the latent location. In the ASYM
+stress scenarios (r0_asym, r2_034_asym) the intended mean is 0.03+0.77
+sigma(eta) (eta = 0 gives 0.415), so eta is not the logit of the intended mean;
+their energy fraction is defined, and reported, on the eta scale itself.
+
+COORDINATOR CHOICE C2 (complete schedule, counts not all prescribed by design):
+Legacy main: five scenarios x20, options a,fwd. Eight named stress scenarios
+x10, options a,fwd. num_r1..num_r4 x1, option a. Each of basis4, basis8,
+separate-embedding and train_c centering: the five main scenarios x20,
+options a,fwd. All noisy fits use ranks 0..4, lambdas .01,.02,.05,.2,
+30 sweeps, both starts; default basis6/shared/references. Numerical checks
+retain the source's own fixed true-rank continuation (.3,.1,.03,.01).
+Bank mode: each *_noisy scenario multiplies the bank's latent scales s_C, s_S,
+s_F by 2 with locations re-solved (intended means unchanged); the fitter keeps
+the unscaled bank curve. Planning noise parameters and the *_cap/*_cap15
+scenarios are not used (refused). Noiseless numerical checks are observation-
+model free (z = eta).
+
+COORDINATOR CHOICE C3 (interpolation/forward acceptance scope):
+Run each of interp, fwd_all and fwd_early on all five main scenarios x20
+using the same observation namespace/replicate identities as legacy main.
+Adopt #86's ordered-population-pair SHA256 partition: floor(.8N) train,
+floor(.1N) validation, remainder test, all versions of a pair together;
+references/support remain calibration and within-world families stay outside
+Level 1. No additional removal from the primary graph.
+Adopt #86's all/early reference-grid and free-control access masks exactly.
+Report interpolation, forward transfer and the forward/world-transfer
+intersection separately, including Wilson95, missing/unavailable counts,
+selected ranks and restricted-rank results where supplied. Completion and
+honest availability reporting are mandatory; C1's >=16/20 threshold applies
+ONLY to option a world transfer. Neither design nor #86 prescribes an extra
+>=80% interpolation/forward threshold. No such threshold is inferred or tuned.
+A coordinator wanting such thresholds must amend this draft BEFORE prepare,
+and amend the evaluator accordingly, before generating recovery datasets.
+
+COORDINATOR CHOICE C4 (attrition checks, not attrition power):
+Freeze nine #86 cases: biological_at, biological_after, technical,
+pending_prefix, pending_attempt, mixed, roots0, roots1, roots2. One r0
+realization per case, all four options a,interp,fwd_all,fwd_early. This is a
+bounded mechanical/availability allocation, not attrition power certification.
+Adopt the merged identity-only world selection and exact boundary recipes.
+Require any BRANCH with zero/one contributing root to withhold prediction
+decisions; retain available one-root descriptive scores. Fixture roots0/1/2
+counts refer to primary world-transfer roots: interpolation and forward-transfer
+branches can retain other training/validation roots. Two roots satisfy only a
+count guard: success or availability is not required. Keep attrition tables, retained prefixes and
+energy diagnostics. No synthetic fixture is production extinction evidence.
+
+COORDINATOR CHOICE C5 (inputs, reservations, qualification):
+Adopt the production-registry graph namespace rq2026-d6d7-graph and topups
+snapshot6/AB8 fitting/lag7, training matchings on. If absent, prepare creates
+an INTENDED graph and fork-planning registry inside P_REC only. Freeze these
+bytes before recovery; publish production counterparts only in another
+explicitly authorized job, and compare topology/identities before reuse.
+Assumed reference slots (0,20,60,100,120,140,180,200M) are allowed by design:404
+only with deterministic later relabelling and unchanged topology/support.
+Actual reference assignments require the merged receipt/provenance checks.
+Use namespace rq2026-d8-recovery-A1, distinct from every measurement namespace.
+Bind the bank inputs 64b113ce.../6ffb99ec.../2ce2bb7a.../6559a8da..., the D8
+bank artifact, its receipt, provenance receipt, validation report and witness,
+and the observation tables. Share observations across procedures/sensitivities
+(verified by recovery.py pairing) without claiming
+independence among those fits. Bind all reservation files and the actual bank
+plan. Overlap with the bank's own 10,240-seed reservation is intentional;
+require disjointness from history attempts and all unrelated avoidance sets.
+
+OBSERVATION MODEL AND SCOPE (owner decision A, 2026-11-13): generation follows
+A_design_v5.md §1: Annex H.9.2's bounded observation model with the bank's fitted
+s(mu) curves and PSD row/donor/cell components, D8 rule 46's capped 600-scaled
+survival law (M_5000 = 247 from the binary32 age clock), bounded survival heads
+c_H sigma(eta), each free control generated once, no binomial/Poisson layer.
+The fitter is the registered map with the bank's capture curve converted
+exactly to its working (empirical-logit) variance, bank-informed
+replicate-variance shrinkage (nu0), and the bank's latent law for the fresh-
+count score (A_design_v5 §1.7b, §3.3), all at fitted quantities. A
+planning-mode result (noise_source scenario_planning_only) is never acceptance
+evidence.
+TIMING AND SEAL (D9, sha256 6bff8134...): the 64 histories were launched before
+registration; accepted exact-graph recovery is a gate BEFORE OUTCOME ACCESS
+(D9:21), its evidence requirement unchanged (D8:327; D9:33): tooling tests,
+performance measurements and program existence do not substitute. Until the
+registration is deposited and its timestamp verified, no assay of any history
+checkpoint is run (time-shift, bank-style or any other scoring of capture,
+survival, q, C/B) and no outcome of any kind is computed, inspected or reported
+(D9:22-26). Permitted meanwhile: engine-health and protocol monitoring as the
+design's monitoring rules define it, and the prospective-integrity guard (no
+directional time trend of any outcome). This recovery reads no history outcome:
+only synthetic truths, the bank by hash, and frozen graph/registry metadata; no
+bank or recovery quantity is reported by snapshot time. Failures delay outcome
+access; preserve all failed runs, immutable inputs and receipts; do not inspect
+main outcomes to choose a repair (D:713).
+
+CHRONOLOGY AND EXIT POLICY (COORDINATOR CHOICE C6):
+Adopt this text before prepare. Witness the top-level FROZEN.sha256 digest in
+an authentic immutable dated external log before run; put its authentic receipt
+in P_REC/PRIOR.receipt. A local hash/receipt file alone proves no chronology.
+The witness deadline applies to every ACCEPTANCE dataset (namespace
+rq2026-d8-recovery-A1). One MEASUREMENT-ONLY exception precedes it: a single
+complete dataset (r2_034, options a,fwd) in namespace
+rq2026-d8-recovery-A1-measure, run with the frozen tools and adopted bank
+artifact to measure CPU/RSS. Its inputs and outputs are retained immutably and
+bound in FROZEN.sha256 as measurement-only; only completion, timing, RSS and
+unresolved-integration counts are read (no score, selected rank, bound or
+success); it is never an acceptance realization (its seeds differ by
+namespace); nothing in this criterion is changed because of it.
+Exit 0 means every scheduled case completed, root guards passed and C1 passed,
+within the bank/D8 scope, the numerical cases completed, and the pairing check
+passed (recovery.py packet --mode acceptance, C1 from the C1-primary run only). Exit 2 means incomplete,
+core/guard failure or invalid inputs. Exit 0 is not final scientific ACCEPTED,
+which requires the reviewed acceptance report (D8:327), including the retained
+numerical/conditioning diagnostics (D:703; RB:291-293).

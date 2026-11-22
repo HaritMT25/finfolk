@@ -40,6 +40,18 @@ capture-level variance function (var_fn: in production the noise bank's), normal
 ABSOLUTE UNIT for every row (capture_scale, Codex #66 r2 P2-1): a weight-1 capture row has variance unit =
 phi / (R mean(1/V)), so weight / unit is each row's absolute precision; the exposed survival rows, the
 controls and the c_i prior are weighted in that unit (unit / their variance).
+BANK MODE (Red Queen recovery option A, A_design_v5.md section 3.3; the hooks are None in planning mode and in
+every numerical fit, which then run exactly as before): var_fn is the bank's working variance W, the
+empirical-logit replicate variance of obslaw's frozen fitter table at the fitted mean; rep_prior {"nu0": nu0_C}
+shrinks each cell's replicate variance toward phi W with the bank's prior degrees of freedom (capture_scale;
+the bank artifact's map_variance rule, obslaw.MAP_VARIANCE_RULE; nu0 None: full pooling); score_law (A, L) is
+the bank's latent law, which the count score uses at mu^ = m_z^-1(predicted empirical logit) with phi scaling
+the latent variance (_score_law), the integration step bounding the composed location's slope (_score_need), the
+integration range certified by the end-node check and a tail bound (_tail_ok; A_design_v5 clarification 2, D1). A
+rep_prior or score_law without a var_fn is refused. THIS IS ALSO THE PRODUCTION MAP'S PATH (A_design_v5 3.3,
+design v4 D:711): the production map fit must call fit_best with the same bank-derived var_fn (W), rep_prior
+(nu0_C) and score_law from the adopted bank/3 artifact's frozen tables; a different production variance model
+would need its own prospective amendment and a recovery re-run.
 
 Fitting: alternating, from the additive fit: the capture surface (IRLS through the link), the link, the
 survival surface, the c_i and D_S, then every prey node's (b_i, b^S_i, u_i) and every predator node's
@@ -530,21 +542,105 @@ def _noise(x):
 UNIT_FLOOR = 1e-6                       # (the absolute unit's floor: noiseless data)
 
 
-def capture_scale(V, zrep, R):
+def _check_nu0(nu0):
+    """The bank's prior degrees of freedom nu0 (A_design_v5 3.1: a positive float, or None for full pooling)."""
+    if nu0 is None:
+        return None
+    if isinstance(nu0, bool) or not isinstance(nu0, (int, float, np.floating, np.integer)) \
+            or not math.isfinite(float(nu0)) or float(nu0) <= 0.0:
+        raise ValueError(f"nu0 {nu0!r}: a positive finite number, or None (full pooling)")
+    return float(nu0)
+
+
+def capture_scale(V, zrep, R, nu0=None):
     """The capture rows' working weights and their ABSOLUTE scale under the registered predictive model
     (Codex #66 r2 P2-1). Cell e's replicate-mean variance is v_e = phi V_e / R, with phi = mean(zrep / V)
     the replicate dispersion of the variance function V (zrep: the cells' replicate variances). The weights
     are w_e = (1 / V_e) / mean(1 / V) (mean 1, so the penalties keep their meaning), and one weight unit is
     unit = phi / (R mean(1 / V)), so unit / w_e = v_e exactly: a weighted Hessian times unit is the absolute
-    covariance. V None (unweighted): w = 1, phi = mean(zrep), unit = phi / R. -> (w, unit, phi)."""
+    covariance. V None (unweighted): w = 1, phi = mean(zrep), unit = phi / R. -> (w, unit, phi).
+    nu0 (bank mode, A_design_v5 3.3; the bank artifact's map_variance rule, obslaw.MAP_VARIANCE_RULE): the
+    cells' variances are shrunk toward the pooled working variance, v~_e = (nu0 phi V_e + (R - 1) zrep_e) /
+    (nu0 + R - 1) with phi as above (unchanged definition; V_e and zrep_e both empirical-logit variances), and
+    w_e = (1 / v~_e) / mean(1 / v~), unit = 1 / (R mean(1 / v~)), so unit / w_e = v~_e / R exactly. nu0 None
+    (full pooling, planning, numerical) is exactly the rule above. nu0 needs V (refused without it).
+    The nu0 branch is evaluated IN LOGARITHMS (A_design_v5 clarification 2, Revisions 4 and 4a, "Log-space
+    evaluation", which supersedes the arithmetic, the intermediate checks and the compatibility requirements of
+    Revisions 1-3: item 0), so no intermediate (phi V, v~, 1 / v~, mean(1 / v~)) is ever formed as a float: none can
+    overflow or cause a refusal (D3 needs only the exact v~ positive), and only negligible max-shifted terms of a sum
+    underflow. With n cells, l(x) = log x (log 0 = -inf), lae = logaddexp and lse(x) = m + log sum e^(x - m) with m
+    = max x and a pairwise sum (np.sum): l_D = lae(l(nu0), l(R - 1)), l_a = l(nu0) - l_D, l_ac = l(R - 1) - l_D (a =
+    nu0 / (nu0 + R - 1), ac = 1 - a); l_phi = lse(l(zrep_e) - l(V_e)) - log n; l(v~_e) = lae(l_a + l_phi + l(V_e),
+    l_ac + l(zrep_e)); l_M = lse(-l(v~_e)) - log n (M = mean(1 / v~)); returned: phi = e^l_phi, w_e = e^(-l(v~_e) -
+    l_M), unit = e^(-log R - l_M). The accuracy contract (item 3): each returned quantity is within 1e-10 relative of
+    the formula's exact value on the floored float inputs (a subnormal one: 1e-10 relative + 2^-1074); no byte
+    requirement against the float forms. The refusal rule (item 4, Revision 4a): refused when a RETURNED quantity's
+    computed logarithm is above log(largest finite float) or at or below log 2^-1075 (the value rounds to zero); in
+    floats, in range is log 2^-1075 < l <= log(largest float), both float logarithms lying below the true values (by
+    1.4e-14 and 2.4e-14), so this is exactly "not at or below" and "not above". Every successful return is finite
+    and strictly positive: if the conversion e^l to binary64 still gives 0 or inf (possible only within an ulp of
+    an edge, inside the indeterminate band, where a refusal is allowed; this libm gives positive finite values on
+    the whole range), the call is refused, never returned. Within a factor e^(+-1e-10) of an edge either outcome is
+    allowed. Its domain (clarification 2, D3; item 1): V and zrep are validated RAW, before main's 1e-8 floor of V
+    (a non-finite V, -inf included, a non-finite zrep or a negative replicate variance is refused; finite values
+    then take the floor exactly as before); a data set with no replicate variance in any cell (phi = 0, so every
+    v~_e = 0 and the inverse-variance weights are undefined) is refused with that context, never floored and never
+    fully pooled instead. No cap on nu0 (subnormal ones included) and no variance floor. nu0 None: main's code and
+    bytes (the floor first, no check)."""
+    nu0 = _check_nu0(nu0)
     zrep = np.asarray(zrep, float)
     if V is None:
+        if nu0 is not None:
+            raise ValueError("capture_scale: nu0 without a variance function V (refused)")
         phi = float(np.mean(zrep))
         return np.ones(len(zrep)), max(phi / R, UNIT_FLOOR), phi
+    if nu0 is not None and not (np.all(np.isfinite(np.asarray(V, float))) and np.all(np.isfinite(zrep))):
+        raise ValueError("capture_scale: a non-finite value in V or zrep (checked raw, before the 1e-8 floor of V): "
+                         "the nu0 shrinkage is refused (A_design_v5 clarification 2, D3)")
+    if nu0 is not None and np.any(zrep < 0.0):
+        raise ValueError("capture_scale: a negative replicate variance in zrep (checked raw, before the 1e-8 floor of "
+                         "V): the nu0 shrinkage is refused (A_design_v5 clarification 2, Revision 4)")
     V = np.maximum(np.asarray(V, float), 1e-8)
-    M = float(np.mean(1.0 / V))
-    phi = float(np.mean(zrep / V))
-    return (1.0 / V) / M, max(phi / (R * M), UNIT_FLOOR), phi
+    if nu0 is None:
+        M = float(np.mean(1.0 / V))
+        phi = float(np.mean(zrep / V))
+        return (1.0 / V) / M, max(phi / (R * M), UNIT_FLOOR), phi
+    if not np.any(zrep):
+        raise ValueError("capture_scale: every replicate variance is zero (phi = 0), so every shrunk cell variance "
+                         "v~ is 0 and the inverse-variance weights are undefined: the nu0 shrinkage is refused, not "
+                         "floored (A_design_v5 clarification 2, D3)")
+    n = len(V)
+
+    def lse(x):                          # (log sum e^x = m + log sum e^(x - m), m = max x; numpy's pairwise sum)
+        m = float(np.max(x))
+        return m + math.log(float(np.sum(np.exp(x - m))))
+    with np.errstate(divide="ignore", over="ignore", invalid="ignore", under="ignore"):
+        lV, lz = np.log(V), np.log(zrep)                  # (V >= 1e-8 after the floor; log 0 = -inf: a zero cell)
+        l0, lR = math.log(nu0), float(np.log(np.float64(R - 1)))
+        lD = float(np.logaddexp(l0, lR))                  # (log (nu0 + R - 1))
+        la, lac = l0 - lD, lR - lD                        # (log a, log (1 - a))
+        lphi = lse(lz - lV) - math.log(n)
+        lvt = np.logaddexp(la + lphi + lV, lac + lz)      # (log v~_e)
+        lM = lse(-lvt) - math.log(n)                      # (log mean(1 / v~))
+        lw = -lvt - lM
+        lunit = -math.log(R) - lM
+    lo, hi = -1075.0 * math.log(2.0), math.log(float(np.finfo(np.float64).max))   # (log 2^-1075, log of the largest)
+    bad = [f"{lab} (log {float(x)!r})" for lab, x in (("phi", lphi), ("unit", lunit)) if not lo < x <= hi]
+    out = np.flatnonzero(~((lw > lo) & (lw <= hi)))
+    bad += [f"w of cell {int(e)} (V {float(V[e])!r}, zrep {float(zrep[e])!r}; log {float(lw[e])!r})" for e in out[:3]]
+    if bad:
+        more = f"; and {len(out) - 3} more w" if len(out) > 3 else ""
+        raise ValueError(f"capture_scale: a returned quantity of the nu0 shrinkage is outside the float range (its "
+                         f"logarithm not in (log 2^-1075, log of the largest float] = ({lo!r}, {hi!r}]: "
+                         f"{'; '.join(bad)}{more}): refused (A_design_v5 clarification 2, Revision 4a)")
+    with np.errstate(under="ignore", over="ignore"):
+        w, unit, phi = np.exp(lw), float(np.exp(lunit)), float(np.exp(lphi))
+    if not (np.all((w > 0.0) & np.isfinite(w)) and 0.0 < unit < math.inf and 0.0 < phi < math.inf):
+        raise ValueError(f"capture_scale: a returned quantity of the nu0 shrinkage is outside the float range after "
+                         f"its conversion to binary64 (e^l gave 0 or inf at a logarithm within an ulp of an edge, "
+                         f"inside the indeterminate band: phi {phi!r}, unit {unit!r}, w in [{float(np.min(w))!r}, "
+                         f"{float(np.max(w))!r}]): refused, never returned (A_design_v5 clarification 2, Revision 4a)")
+    return w, unit, phi
 
 
 def pair_variance(r, s2, grid=200, iters=200, full=False):
@@ -637,7 +733,7 @@ def _block_cov(node, X, w, diag, nn, unit):
 # ------------------------------------------------------------------ the fitter
 def fit(D, idx, data, rank, lam, own_layer=False, iters=40, seed=0, survival=True, link=True,
         lam_ab=1e-3, lam_world=10.0, init=None, start="warm", var_fn=None, ctrl=None, basis=K,
-        embedding="shared", center="references"):
+        embedding="shared", center="references", rep_prior=None, score_law=None):
     """The registered map on the fitting pairs idx -> its parameters (see the module doc). start:
     "warm" (the embedding starts from svd_start on the rank-0 spline residuals) or "cold" (small
     random normals); init (a previous fit) overrides both; fit_best runs both and keeps the lower
@@ -647,11 +743,29 @@ def fit(D, idx, data, rank, lam, own_layer=False, iters=40, seed=0, survival=Tru
     weights follow the fit; normalized to mean 1 so the penalties keep their meaning); None: equal.
     ctrl: the prey whose predator-free controls may be read (None: control_access(D, idx)). basis: the
     surfaces' and the link's basis functions (6; 4 and 8 the sensitivities). embedding: "shared" or
-    "separate" (the sensitivity). center: the fixed distribution u and v are centred on."""
+    "separate" (the sensitivity). center: the fixed distribution u and v are centred on.
+    Bank mode (A_design_v5 3.3; recovery.any_fit passes all three or none): var_fn the bank's working variance
+    W; rep_prior {"nu0": nu0_C} (nu0 a positive float, or None: full pooling), the cells' variance shrinkage
+    of capture_scale; score_law the bank's latent law p -> (A, L) of the frozen fitter table, used by the
+    scorer (_score_law) and carrying that table (.table: slope_max, lat_var_min) and its extrapolation count
+    (.extrapolated). A rep_prior or score_law without a var_fn is REFUSED (a fit without a variance function,
+    e.g. a numerical case, can never carry a variance model)."""
     import recovery as rec          # (the data layout and the additive start)
     if own_layer:
         raise ValueError("option (b) is dropped (q30b): the Level-1 map is placed on the common cross-world "
                          "support alone; within-world edges are the cross-fitted stage 2 (own_world_stage2)")
+    if var_fn is None and (rep_prior is not None or score_law is not None):
+        raise ValueError("a rep_prior or score_law without a var_fn: refused (a fit without a variance function "
+                         "can never carry a variance model; A_design_v5 3.3)")
+    if rep_prior is not None:
+        if not isinstance(rep_prior, dict) or set(rep_prior) != {"nu0"}:
+            raise ValueError(f"rep_prior {rep_prior!r}: exactly {{'nu0': nu0}} (A_design_v5 3.2)")
+        rep_prior = {"nu0": _check_nu0(rep_prior["nu0"])}
+    if score_law is not None and not (callable(score_law) and hasattr(score_law, "extrapolated")
+                                      and all(hasattr(getattr(score_law, "table", None), k)
+                                              for k in ("slope_max", "lat_var_min"))):
+        raise ValueError("score_law: a callable p -> (A, L) carrying its frozen fitter table (.table with slope_max "
+                         "and lat_var_min) and its extrapolation count (.extrapolated), as obslaw.ScoreLaw")
     if start not in ("warm", "cold"):
         raise ValueError(f"start {start!r}: warm or cold")
     if basis not in BASES:
@@ -687,13 +801,15 @@ def fit(D, idx, data, rank, lam, own_layer=False, iters=40, seed=0, survival=Tru
         else:
             cbar = float(np.mean(s))
     c0 = np.where(ctrl, s0, cbar)
+    nu0 = rep_prior and rep_prior["nu0"]
+    ext0 = getattr(var_fn, "extrapolated", None)     # (a bank working variance counts its table extrapolations)
 
     def scales(zfit):
         """The capture weights at the fitted capture fraction, their absolute unit (capture_scale) and the
         other rows' weights IN THAT UNIT (an absolute precision is weight / unit for every row: Codex #66 r2
         P2-1): exposed survival unit / nS, a control unit / n0, the c_i prior unit / tau_c^2."""
         V = None if var_fn is None else var_fn(np.clip(_sig(zfit), 1e-4, 1.0 - 1e-4))
-        w, unit, ph = capture_scale(V, zrep, R)
+        w, unit, ph = capture_scale(V, zrep, R, nu0=nu0)
         if not surv:
             return w, unit, ph, 0.0, 0.0, 0.0
         return w, unit, ph, unit / nS, (unit / n0 if n0 else 0.0), unit / tau2
@@ -868,7 +984,9 @@ def fit(D, idx, data, rank, lam, own_layer=False, iters=40, seed=0, survival=Tru
             "center": {"distribution": center, "prey": int(len(SQ)), "pred": int(len(SP))},
             "center_nodes": {"prey": SQ, "pred": SP},
             "controls": {"accessible": int(ctrl.sum()), "cbar": cbar, "prior_var": tau2},
-            "qp": qp_summary(surfC.statuses + surfS.statuses + lk.statuses)}
+            "qp": qp_summary(surfC.statuses + surfS.statuses + lk.statuses),
+            "rep_prior": rep_prior, "score_law": score_law, "var_fn_identity": getattr(var_fn, "identity", None),
+            "table_extrapolated": None if ext0 is None else int(var_fn.extrapolated - ext0)}
 
 
 def fit_best(D, idx, data, rank, lam, iters=40, seed=0, starts=("warm", "cold"), **kw):
@@ -937,6 +1055,58 @@ def _rep_var(m, loc):
     return m["phi"] * np.maximum(vf(np.clip(_sig(loc), 1e-4, 1 - 1e-4)), 1e-8)
 
 
+def _score_law(m, loc):
+    """The latent law of one fresh replicate at predicted empirical logits loc -> (location, variance), shaped like
+    loc. score_law None: (loc, _rep_var(m, loc)), exactly today's scorer (planning). Bank mode (A_design_v5 3.3,
+    PC-17): (A(mu^), phi L(mu^)) with mu^ = m_z^-1(loc) from the frozen fitter table: the bank's latent law at the
+    predicted mean (location solved at gamma = 1; phi scales the variance only). Its argument p is clipped as
+    _rep_var's; the clip cannot change a value (the table's m_z lies inside the empirical-logit range +-6.48,
+    inside the clip's +-9.21, and beyond m_z the table holds its end values)."""
+    sl = m.get("score_law")
+    if sl is None:
+        return loc, _rep_var(m, loc)
+    A, L = sl(np.clip(_sig(loc), 1e-4, 1 - 1e-4))
+    return A, m["phi"] * L
+
+
+def _score_z(g):
+    """The z at which the score law evaluates predicted empirical logits g: logit of _score_law's clipped p."""
+    p = np.clip(_sig(g), 1e-4, 1 - 1e-4)
+    return np.log(p) - np.log1p(-p)
+
+
+def _max_slope_each(lk, lo_, hi_):
+    """Link.max_slope over [lo_e, hi_e] for each pair (the same conservative bound on G', vectorized)."""
+    lo_, hi_ = np.asarray(lo_, float), np.asarray(hi_, float)
+    if lk.knots is None:
+        sl = np.ones(lo_.shape)
+    else:
+        kn, th = lk.knots, lk.theta
+        slopes = np.diff(th) / np.diff(kn)
+        a = np.clip(np.searchsorted(kn, lo_, side="right") - 1, 0, len(kn) - 2)
+        b = np.clip(np.searchsorted(kn, hi_, side="right") - 1, 0, len(kn) - 2)
+        j = np.arange(len(slopes))
+        sl = np.where((j >= a[..., None]) & (j <= b[..., None]), slopes, -np.inf).max(axis=-1)
+    return sl if (lk.lo == 0.0 and lk.hi == 1.0) else sl / (lk.hi - lk.lo)
+
+
+def _score_need(lk, m, eta, sd, span):
+    """The node requirement of the grid rule with the score law (A_design_v5 3.3, PC-24) on +-TRAP_SD x span
+    prior SDs: h_e = min(sd_e, TRAP_H s_lat / (g_max,e max(H^max_e, 1e-12))), where Delta_e = TRAP_SD span_e sd_e,
+    H^max_e is the exact range maximum of the table's segment slopes |kappa_j| over the image [G(eta_e - Delta_e),
+    G(eta_e + Delta_e)] (G increasing; 0 wholly in the constant extrapolation), g_max,e = Link.max_slope over
+    [eta_e - Delta_e, eta_e + Delta_e] and s_lat = sqrt(phi min_j L_j) (the latent SD floor). -> ceil(2 TRAP_SD
+    span_e sd_e / h_e) + 1 per pair; recomputed by the caller on every range extension."""
+    tab = m["score_law"].table
+    delta = TRAP_SD * span * sd
+    lo_, hi_ = eta - delta, eta + delta
+    hmax = tab.slope_max(_score_z(lk.G(lo_)), _score_z(lk.G(hi_)))
+    gmax = np.maximum(_max_slope_each(lk, lo_, hi_), 1e-12)
+    slat = math.sqrt(max(float(m["phi"]) * float(tab.lat_var_min), 1e-300))
+    h = np.minimum(sd, TRAP_H * slat / (gmax * np.maximum(hmax, 1e-12)))
+    return np.ceil(2 * TRAP_SD * span * sd / np.maximum(h, 1e-300)) + 1
+
+
 def pred_var(D, m, idx, own=None):
     """The capture head's predictive MOMENTS for one fresh replicate observation of each pair of idx, to first
     order (the Gaussian diagnostic's; the registered score integrates exactly, pred_count_lpd) -> (location
@@ -957,6 +1127,33 @@ TRAP_TOL = 1e-3                          # (the a-posteriori check, log units: f
 TRAP_SPAN_MAX = 8                        # (the range may double up to +-TRAP_SD x 8 = +-56 prior SDs)
 TRAP_EDGE = math.log(1e-10)              # (an end node's share of the integral above this: the range is extended)
 VMIN_GRID = np.linspace(-20.0, 20.0, 20001)    # (the logit grid on which the variance function's minimum is taken)
+TRAP_TAIL = 1e-4                         # (bank mode: the omitted prior mass 2 PhiBar(b) <= this share of the integral)
+_TAIL_SWITCH = 25.0                      # (_log_2sf: math.erfc below, Laplace's continued fraction at and above)
+_TAIL_CF_TERMS = 60
+
+
+def _log_2sf(b):
+    """log(2 PhiBar(b)) for a scalar b >= 0, PhiBar the standard normal upper tail, in log space so that it never
+    underflows: log erfc(b / sqrt 2) below 25 and, at and above, log 2 - b^2/2 - log sqrt(2 pi) - log(b + 1/(b + 2/(b +
+    3/(b + ...)))) (Laplace's continued fraction, 60 terms). The T6-10 reference's method, copied here (the reference
+    shares no code with the scorer; A_design_v5 clarification 2, D1)."""
+    b = float(b)
+    if b < _TAIL_SWITCH:
+        return math.log(math.erfc(b / math.sqrt(2.0)))
+    t = 0.0
+    for k in range(_TAIL_CF_TERMS, 0, -1):
+        t = k / (b + t)
+    return math.log(2.0) - 0.5 * b * b - 0.5 * math.log(2.0 * math.pi) - math.log(b + t)
+
+
+def _tail_ok(full, span):
+    """The bank-mode tail bound of a grid pass on +-b = TRAP_SD x span prior SDs (A_design_v5 clarification 2, D1),
+    per pair: for EVERY replicate, log(2 PhiBar(b)) <= log(TRAP_TAIL) + log I^, where log I^ = full + log(1 - 2
+    PhiBar(b)) is the pass's estimate (full: Gaussian weights normalized over the grid) converted to the unnormalized
+    integral over [-b, b]. Rigorous because the count probability is <= 1: the omitted part of the integral is at most
+    2 PhiBar(b), so the omitted fraction is at most TRAP_TAIL (the log score low by at most log(1 + TRAP_TAIL))."""
+    lt = _log_2sf(TRAP_SD * span)
+    return np.all(lt <= math.log(TRAP_TAIL) + (full + math.log1p(-math.exp(lt))), axis=1)
 
 
 def _logsumexp(a, axis):
@@ -970,13 +1167,15 @@ def _grid_pass(lk, m, cnt, eta, sd, N, K, span):
     """The e-order trapezoid, in log space, on K nodes over +-TRAP_SD x span prior SDs (span per pair), the same
     on every other node (the check), and the larger end node's log share of the integral (the range check) ->
     (log P, log P on the half grid, edge share), pairs x replicates. The integrand is the registered one at every
-    node: the bounded count probability with the replicate variance phi V(G(eta + e)) at that node."""
+    node: the bounded count probability with the replicate variance phi V(G(eta + e)) at that node (bank mode:
+    the score law's latent location and variance at that node, _score_law)."""
     x = np.linspace(-1.0, 1.0, K)[None, :] * (TRAP_SD * span)[:, None]                      # (pairs x nodes, SDs)
     lw = -0.5 * x * x
     lwh = lw[:, ::2] - _logsumexp(lw[:, ::2], 1)[:, None]
     lw = lw - _logsumexp(lw, 1)[:, None]
     loc = lk.G(eta[:, None] + sd[:, None] * x)
-    lp = _interval_logp(cnt[:, :, None], N, loc[:, None, :], _rep_var(m, loc)[:, None, :])
+    sloc, svar = _score_law(m, loc)
+    lp = _interval_logp(cnt[:, :, None], N, sloc[:, None, :], svar[:, None, :])
     terms = lp + lw[:, None, :]
     full = _logsumexp(terms, 2)
     with np.errstate(invalid="ignore"):
@@ -1011,9 +1210,26 @@ def pred_count_lpd(D, m, idx, cnt, N, own=None, info=None):
         extended one (Codex #66 r5 P2-2), is computed there, checked, and counted ONCE in beyond_rule.
       - any non-finite result is REFUSED (ValueError): it never reaches a model comparison.
     info (a dict): the counts per case are added to it (pairs, plain, exact, grid, refined, extended,
-    beyond_rule, grid_unresolved) with the largest accepted check difference (max_check)."""
+    beyond_rule, grid_unresolved) with the largest accepted check difference (max_check).
+    BANK MODE (m["score_law"] set; A_design_v5 3.3, PC-17, PC-24): every node's latent law is the score law's,
+    _score_law (the plain case likewise); the exact case is never reached (a score law needs a var_fn: refused
+    otherwise); the step accounts for the composed location H(G(eta)), H = A piecewise linear with segment slopes
+    kappa_j: h_e = min(sd_e, TRAP_H s_lat / (g_max,e max(H^max_e, 1e-12))) per pair (_score_need), recomputed on
+    every range extension with the node requirement ceil(2 TRAP_SD span_e sd_e / h_e) + 1; a pass is
+    RANGE-ADEQUATE only if the end-node check AND the tail bound hold for every replicate (_tail_ok: log(2
+    PhiBar(b)) <= log(TRAP_TAIL) + log I^ on +-b = TRAP_SD span prior SDs; A_design_v5 clarification 2, D1: the
+    end-node share alone cannot see a larger mode beyond the range), and either failure extends the range exactly
+    as the end-node check does (recomputed requirement, counted in extended; still inadequate at the cap: kept and
+    counted in grid_unresolved); everything else (the buckets, the resolution check, beyond_rule, grid_unresolved,
+    the refusal) is the rule above. info also gains table_extrapolated: the score law's evaluations outside its
+    table in this call. score_law unset: this function is unchanged (main's rule and integrand, byte for byte; no
+    tail bound)."""
     eta, s2 = pred_eta(D, m, idx, own)
     lk = m["link"]
+    sl = m.get("score_law")
+    if sl is not None and m.get("var_fn") is None:
+        raise ValueError("pred_count_lpd: a score law without a var_fn (refused: A_design_v5 3.3)")
+    ext0 = None if sl is None else sl.extrapolated
     cnt = np.asarray(cnt)
     out = np.empty(len(eta))
     sd = np.sqrt(s2)
@@ -1022,7 +1238,7 @@ def pred_count_lpd(D, m, idx, cnt, N, own=None, info=None):
     plain = sd <= 1e-9
     if plain.any():
         g0 = lk.G(eta[plain])
-        out[plain] = count_lpd(cnt[plain], N, g0, _rep_var(m, g0))
+        out[plain] = count_lpd(cnt[plain], N, *_score_law(m, g0))
         st["plain"] = int(plain.sum())
     q = np.flatnonzero(~plain)
     if len(q) and lk.identity() and m.get("var_fn") is None:
@@ -1030,11 +1246,14 @@ def pred_count_lpd(D, m, idx, cnt, N, own=None, info=None):
         st["exact"] = int(len(q))
     elif len(q):
         R = cnt.shape[1]
-        lo_, hi_ = float((eta[q] - TRAP_SD * sd[q]).min()), float((eta[q] + TRAP_SD * sd[q]).max())
-        gmax = max(lk.max_slope(lo_, hi_), 1e-12)
-        smin = math.sqrt(max(float(_rep_var(m, VMIN_GRID).min()), 1e-300))
-        h = np.minimum(sd[q], TRAP_H * smin / gmax)
-        need0 = np.ceil(2 * TRAP_SD * sd[q] / np.maximum(h, 1e-300)) + 1          # (nodes at span 1)
+        if sl is None:
+            lo_, hi_ = float((eta[q] - TRAP_SD * sd[q]).min()), float((eta[q] + TRAP_SD * sd[q]).max())
+            gmax = max(lk.max_slope(lo_, hi_), 1e-12)
+            smin = math.sqrt(max(float(_rep_var(m, VMIN_GRID).min()), 1e-300))
+            h = np.minimum(sd[q], TRAP_H * smin / gmax)
+            need0 = np.ceil(2 * TRAP_SD * sd[q] / np.maximum(h, 1e-300)) + 1          # (nodes at span 1)
+        else:
+            need0 = _score_need(lk, m, eta[q], sd[q], 1.0)                            # (the v3/v5 rule, span 1)
         top = len(TRAP_KS) - 1
         bucket = np.searchsorted(TRAP_KS, need0)
         beyond = np.zeros(len(eta), bool)                         # (pairs whose rule exceeded the largest grid, once)
@@ -1053,17 +1272,24 @@ def pred_count_lpd(D, m, idx, cnt, N, own=None, info=None):
                     with np.errstate(invalid="ignore"):
                         err = np.max(np.abs(full - half), axis=1)
                         res_ok = err <= TRAP_TOL                                   # (NaN: not ok)
-                        edge_ok = np.all(edge <= TRAP_EDGE, axis=1)
+                        range_ok = np.all(edge <= TRAP_EDGE, axis=1)               # (main's end-node check)
+                        if sl is not None:            # (bank mode: and the tail bound, every replicate; clar. 2 D1)
+                            range_ok &= _tail_ok(full, s_)
                     fin = np.isfinite(full).all(axis=1)
-                    ok = res_ok & edge_ok & fin
+                    ok = res_ok & range_ok & fin
                     out[r_[ok]] = full[ok].mean(axis=1)
                     st["grid"] += int(ok.sum())
                     if ok.any():
                         st["max_check"] = max(st["max_check"], float(err[ok].max()))
                     for i in np.flatnonzero(~ok):
-                        if fin[i] and not edge_ok[i] and s_ < TRAP_SPAN_MAX:          # (extend the range)
+                        if fin[i] and not range_ok[i] and s_ < TRAP_SPAN_MAX:         # (extend the range)
                             s2_ = 2 * s_
-                            nb2 = max(int(b), int(np.searchsorted(TRAP_KS, nr_[i] * s2_)))
+                            if sl is None:
+                                nb2 = max(int(b), int(np.searchsorted(TRAP_KS, nr_[i] * s2_)))
+                            else:                     # (g_max, H^max and h recomputed on the extended range)
+                                ri = r_[i:i + 1]
+                                nb2 = max(int(b), int(np.searchsorted(TRAP_KS, _score_need(lk, m, eta[ri], sd[ri],
+                                                                                           s2_)[0])))
                             if nb2 > top:                                     # (the extended range's rule is beyond
                                 beyond[r_[i]] = True                          #  the cap: counted, Codex #66 r5 P2-2)
                             nxt.append((r_[i], min(nb2, top), s2_, nr_[i]))
@@ -1082,6 +1308,8 @@ def pred_count_lpd(D, m, idx, cnt, N, own=None, info=None):
     bad = ~np.isfinite(out)
     if bad.any():
         raise ValueError(f"pred_count_lpd: {int(bad.sum())} non-finite count scores: refused (never compared)")
+    if sl is not None:
+        st["table_extrapolated"] = int(sl.extrapolated - ext0)
     if info is not None:
         for k, v in st.items():
             info[k] = max(info.get(k, 0.0), v) if k == "max_check" else info.get(k, 0) + v

@@ -174,7 +174,7 @@
     fastTanh: "Fast tanh",
     foodPatches: "Food patches", foodPatchRadius: "Patch radius", targetFood: "Food target",
     foodSpawnBase: "Food per step", foodSpawnAmp: "Food swing", foodEnergy: "Energy per food",
-    pickupRadius: "Eating distance", foodDrift: "Food drifts with the current", foodLife: "Food lifetime (s)",
+    pickupRadius: "Eating distance", foodDrift: "Food drifts with currents and waves", foodLife: "Food lifetime (s)",
     foodDepthMode: "Where food appears", foodDepthSpread: "Depth spread per patch",
     metabolicRate: "Energy burned per second", moveCost: "Swimming cost", geneCost: "Cost per gene",
     maxAge: "Lifespan (s)", reproEnergy: "Energy needed to breed", newbornEnergy: "Newborn energy",
@@ -236,9 +236,9 @@
    * has too carry Classic's text (web/renderer.js TIPS), with the Ocean's
    * defaults where they differ. */
   var TIPS = {
-    seed: { d: "RNG seed — the same seed and the same settings replay the run step for step.", t: "try: any uint32; keep it to reproduce a run" },
+    seed: { d: "RNG seed — the same seed and the same setup replay a run step for step: the Ocean's engine is single-threaded, and Hold 60 fps never changes the simulation. A setting changed live, mid-run, is not part of the setup: Replay starts the world again without it.", t: "try: any uint32; keep it to reproduce a run" },
     population: { d: "Starting fish (the world reseeds below the reseed floor).", t: "try: 200-600; more than ~1500 gets slow in a browser" },
-    depth: { d: "How deep the sea is, in world units (the tank is 1920 x 1080 across, or the same area on its side on a portrait screen). Fish, food and predators live anywhere from the surface to the floor.", t: "try: 240 (the default); 120 is a shallow sea, 480 a deep one" },
+    depth: { d: "How deep the sea is, in world units. The tank's size across is set apart, by its width and length (above: a new page sizes them for its screen, 1920 x 1080, or 1080 x 1920 on a portrait one). Fish, food and predators live anywhere from the surface to the floor.", t: "try: 240 (the default); 120 is a shallow sea, 480 a deep one" },
     toroidal: { d: "Without glass walls only: senses wrap across the world's sides, so a fish near one side senses what is near the opposite one — no sensory dead zone at the edges. Depth never wraps: the surface and the floor are real.", t: "try: on in a wrap-around world; glass walls turn it off" },
     walls: { d: "The four sides are glass, like a real tank: fish and predators turn away as they near one and bounce off if they touch it, food stays inside, and the water's waves and currents flow along the glass, never through it. Off, the sides wrap: a fish swimming out of one comes back in through the opposite side. Restart to apply.", t: "try: on (a new page's default); off for the wrap-around world older links show" },
     sideWallBand: { d: "Glass walls: how far from a side a fish (or predator) starts turning away from it; the closer it gets, the harder it turns. 0 = no turning: it only bounces off the glass. Restart to apply.", t: "try: 80 (the default); 30 lets fish hug the glass" },
@@ -263,7 +263,7 @@
     foodSpawnAmp: { d: "Sinusoidal swing of food abundance around the base rate. Applies live.", t: "try: 0 for a steady food supply" },
     foodEnergy: { d: "Energy gained per food item eaten. Applies live.", t: "try: 3-8 around the default 5" },
     pickupRadius: { d: "How close (in 3-D) a fish must come to eat a food item. The Ocean's default is 24 (Classic's 10).", t: "try: 16-32" },
-    foodDrift: { d: "Food is carried by the current into drifting filaments.", t: "try: on — pairs well with currents" },
+    foodDrift: { d: "Food is carried by the moving water, the current and the waves alike, into drifting filaments.", t: "try: on — pairs well with a current or waves" },
     foodLife: { d: "Every food item disappears this many seconds after it appeared, eaten or not (it sinks out or decays); 0 = it stays until eaten. With a fixed inflow, food nobody finds is lost, so how many fish a world feeds depends on how well they search. Applies live.", t: "try: 30-90" },
     foodDepthMode: { d: "Anywhere: food appears at any depth. Each patch at its own depth: every food patch gets a depth at the start and its food lands near it (needs food patches).", t: "try: patches at their own depth, to make depth worth choosing" },
     foodDepthSpread: { d: "How far above and below its patch's depth food lands. Applies live.", t: "try: 15 tight, 60 loose" },
@@ -307,7 +307,7 @@
     currentStrength: { d: "Peak ocean-flow speed in world units per second (0 = still water).", t: "try: 5 with a deep current (the E1 preset); 80 for a strong 2-D-style flow" },
     currentMode: { d: "Eddies = moving vortices; gyre = two counter-rotating basins.", t: "try: eddies" },
     currentEddies: { d: "Number of vortices in eddies mode.", t: "try: 3-8 around the default 5" },
-    currentCore: { d: "Eddy radius — the distance of peak flow speed.", t: "try: 100-250 around the default 150" },
+    currentCore: { d: "Eddy radius — the distance of peak flow speed. With glass walls it also sets how close to the glass the current fades to nothing (at most a quarter of the tank's width or length), in the gyre shape too.", t: "try: 100-250 around the default 150" },
     currentDrift: { d: "How fast the flow field evolves (0 = static).", t: "try: 0.5-2 around the default 1" },
     deepCurrent: { d: "The current flows at depth only: still at the surface, full strength from mid-depth down, so where a fish swims decides whether it is carried. Applies live.", t: "try: on (the E1 preset)" },
     waveSpeed: { d: "Surface waves: three fixed wave trains move the water in orbits, strongest near the surface, fading toward the floor; fish and food are carried. Their orbital speed in units per second (0 = still). Applies live.", t: "try: 6 (the E1 preset)" },
@@ -581,12 +581,26 @@
                    foodDepthMode: 1, foodDepthSpread: 30, foodDrift: true, minSpeed: 0, moveCost: 0.00005 };
   var SCENARIOS = [
     { id: "standard", title: "Standard", blurb: "A new visitor's ocean: the default rules, glass walls, sized for this screen" },
-    { id: "bigtank", title: "Big tank", blurb: "Four times the volume and the fish, four times the food, the tuned water" },
+    { id: "bigtank", title: "Big tank", blurb: bigTankBlurb() },
     { id: "e1", title: "Living water", blurb: "Waves, a deep current, light that fades with depth, depth costs (E1)" },
     { id: "hunters", title: "Hunters", blurb: "Four predators hunt; plenty of food, a cap on the fish, swimming costs energy" },
     { id: "currents", title: "Currents & patches", blurb: "Eddies carry six food patches, each at its own depth; swimming costs energy" },
     { id: "surprise", title: "Surprise me", blurb: "A whole setup drawn from ranges that worked, for the tank as set" }
   ];
+  /* a recipe's ratio to the standard tank in words ("four times"); else "×1.5" */
+  function times(r) {
+    var w = ["", "the same", "twice", "three times", "four times", "five times", "six times", "seven times", "eight times", "nine times", "ten times"];
+    return r === Math.round(r) && r >= 1 && r < w.length ? w[r] : "×" + +r.toFixed(2);
+  }
+  /* Big tank's card, from its recipe: its volume and food stock against the
+   * standard tank's, and its founders (2000, not four times Standard's 300) */
+  function bigTankBlurb() {
+    var b = BIG_TANK, vol = (b.width * b.height * b.depth) / (REFERENCE.width * REFERENCE.height * REFERENCE.depth);
+    var food = b.cfg.targetFood / KEYS.targetFood[0];
+    var s = times(vol) + " the volume" + (food === vol ? " and the food" : ", " + times(food) + " the food") + ", " +
+            b.population.toLocaleString("en-US") + " founders, the tuned water";
+    return s.charAt(0).toUpperCase() + s.slice(1);
+  }
   function tankText(w, h, d) { return w + " × " + h + " × " + d; }
   function scenario(id, ctx) {
     var sw = ctx.screen, fresh = ctx.walls ? Object.assign({}, FRESH) : {};
@@ -595,7 +609,7 @@
     if (id === "bigtank") {
       var b = BIG_TANK;
       r.width = b.width; r.height = b.height; r.depth = b.depth; r.population = b.population; r.cfg = Object.assign({}, b.cfg);
-      r.labels = ["four times the food", "births stop at " + b.cfg.maxPopulation, "the tuned water"];
+      r.labels = [times(b.cfg.targetFood / KEYS.targetFood[0]) + " the food", "births stop at " + b.cfg.maxPopulation, "the tuned water"];
     } else if (id === "e1") {
       if (!ctx.e1) return null;
       Object.keys(ctx.e1).forEach(function (k) { r.cfg[k] = ctx.e1[k]; });

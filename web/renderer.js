@@ -4,16 +4,17 @@
  * No interpolation, no trails, no wrap ghosts. Typed-array views are re-created
  * after every _evo_sync/_evo_inspect (memory growth invalidates buffers).
  *
- * The world canvas (scene, selection ring, HUD, inspector) is drawn the way the
- * native SFML window draws it. Compact screens leave the HUD and the inspector
- * off the canvas and show them as DOM instead (the readout and the fish card).
- * Everything around the world (top bar, dock, settings, Turbo, toasts) is DOM,
- * laid out in CSS px.
+ * The world canvas (scene, selection ring) is drawn the way the native SFML
+ * window draws its scene. The selected fish is the fish card and the live
+ * numbers are the readout, both DOM laid out in CSS px, in every view and on
+ * every screen (the UI parity plan's U19: the web page has one inspector; the
+ * native window keeps its own panel and HUD). Everything around the world (top
+ * bar, dock, settings, Turbo, toasts) is DOM too.
  *
  * The tank view (the default; the Run tab's switch, or ?view=flat / ?view=3d)
  * draws the same world as a 3D picture instead (web/scene3d.js, three.js,
- * loaded when first needed) on its own canvas; the selected fish is then the
- * card on every screen. The flat view is the native window's picture. */
+ * loaded when first needed) on its own canvas. The flat view is the native
+ * window's picture. */
 (function () {
   var DEFAULT_W = 1920, DEFAULT_H = 1080, TAU = Math.PI * 2;
   var WORLD_W = DEFAULT_W, WORLD_H = DEFAULT_H; /* may change on checkpoint load */
@@ -40,7 +41,7 @@
   var RING_STYLE = "rgba(255,235,120," + (230 / 255).toFixed(4) + ")";
   var ACTION_NAMES = ["steerX", "steerY", "moveFwd", "moveRnd", "speed", "signal",
                       "oscPer", "resp", "share", "repro", "fight", "ignore"];
-  /* the fish card's names for the same actions (compact screens) */
+  /* the fish card's names for the same actions */
   var ACTION_LABELS = ["steer x", "steer y", "swim forward", "wander", "speed", "signal",
                        "oscillator period", "respond", "share food", "reproduce", "fight", "ignore"];
   var ACTION_SHORT = ["steer x", "steer y", "forward", "wander", "speed", "signal",
@@ -112,6 +113,13 @@
                maxAge: 1, reproEnergy: 1, newbornEnergy: 1, mutationMultiplier: 1,
                minSpeed: 1, maxSpeed: 1,
                predatorMinPopulation: 1, predatorMaxPopulation: 1, predatorTraitMutation: 1 };
+  /* The keys the engine reads as whole numbers (src/core/checkpoint_io.hpp readConfig: intOr, an (int) cast), so a
+   * fractional value would run truncated: 0.5 fish as a reseed floor of 0. A live edit refuses one (applyLive); what a
+   * start or a file took is read as the engine reads it (runFloor). */
+  var INT_KEYS = { reproWindow: 1, reproMinCluster: 1, minPopulation: 1, maxPopulation: 1, targetFood: 1, maxNeighbors: 1,
+                   genomeMinLength: 1, genomeMaxLength: 1, genomeInitMin: 1, genomeInitMax: 1, currentMode: 1, currentEddies: 1,
+                   foodPatches: 1, predatorCount: 1, predatorMinPopulation: 1, predatorMaxPopulation: 1, sensorSet: 1,
+                   neuronsPerPredator: 1, neuronsPerCreature: 1 };
 
   /* The settings: tabs, then groups of keys ("b:" = a basic setting). */
   var SETTINGS_TABS = [
@@ -186,8 +194,20 @@
 
   /* Hover info per parameter: d = what it is, t = suggested values (docs/evo_boids_flags.md). */
   var TIPS = {
-    seed: { d: "RNG seed — same seed + same settings replays the run bit-for-bit.", t: "try: any uint32; keep it to reproduce a run" },
-    population: { d: "Starting creature count (the world reseeds below a floor of 50).", t: "try: 200-800; >2000 gets slow in-browser" },
+    seed: { get d() {
+      return "RNG seed — on the single-threaded module the same seed and the same settings replay a run step for step, as long as no " +
+        "live setting changes during it and Hold 60 fps removes no fish. " + (threaded
+          ? "This page runs the threaded module: fast, but its runs do not replay from the seed."
+          : "This page runs the single-threaded module" + (threadWhy ? " (" + threadWhy + ")" : "") + ".");
+    }, t: "try: any uint32; keep it to reproduce a run" },
+    population: { get d() {
+      /* the floor the running world took (runCfg: a start's, a loaded world's, an applied live edit's), not the form's */
+      var floor = runFloor(), form = intVal("adv_minPopulation", floor);
+      return "Starting creature count. " + (floor > 0
+        ? "Whenever fewer than the reseed floor (" + floor + " in this run, under World → Population limits) are alive, random founders are added."
+        : "This run's reseed floor is 0 (World → Population limits): no founders are added, so the population can die out.") +
+        (form !== floor ? " The form's " + form + " is not in this run: Restart starts a world with it." : "");
+    }, t: "try: 200-800; >2000 gets slow in-browser" },
     predators: { d: "Number of scripted hunters chasing prey (0 = none).", t: "try: 3-4 with predator economy on" },
     foodPatches: { d: "Cluster food into N spatial patches (0 = uniform scatter).", t: "try: 5-6; patchy food makes currents matter" },
     currentStrength: { d: "Peak ocean-flow speed in world units/sec (0 = still water).", t: "try: 80 with eddies = a lively ocean" },
@@ -276,13 +296,11 @@
   function el(id) { return document.getElementById(id); }
   var errEl = el("err");
 
-  /* Compact screens (phones, touch devices, narrow windows): the world-space
-   * overlays — HUD text, inspector panel — shrink with the canvas until they
-   * are unreadable, so there the inspector is the fish card, laid out in CSS
-   * px, and the HUD is left to the readout. Elsewhere the canvas versions
-   * stay, matching the native SFML window. */
-  /* short windows too: an embed (the portfolio's is 890x453) would otherwise
-   * spend a third of its height on the bars around the world */
+  /* Compact screens (phones, touch devices, narrow windows): the world fills
+   * the screen and the controls float over it; the selection ring keeps its
+   * size on screen there. (The fish card and the readout are the same on every
+   * screen.) Short windows too: an embed (the portfolio's is 890x453) would
+   * otherwise spend a third of its height on the bars around the world */
   var compactMQ = window.matchMedia("(max-width: 700px), (max-height: 560px), (pointer: coarse)");
   var coarseMQ = window.matchMedia("(pointer: coarse)");
   /* the settings sit beside the world from here up, and are a bottom sheet below */
@@ -433,13 +451,36 @@
     if (!Module || turboState !== "live") return;
     var v = parseFloat(input.value);
     if (!Number.isFinite(v)) v = def;
-    if (key === "maxPopulation") { userCap = Math.max(0, Math.round(v)); applyCap(); return; }
+    if (INT_KEYS[key] && !Number.isInteger(v)) {   /* (the engine would run it truncated: refused, the field back to what runs) */
+      var back = key === "maxPopulation" ? userCap : (key in runCfg ? runCfg[key] : def);
+      input.value = String(back);
+      showError((LABELS[key] || key) + " must be a whole number (the running world keeps " + back + ").");
+      return;
+    }
+    /* (the run's history changes only with a value: a stepper clamped at its bound still fires change) */
+    if (key === "maxPopulation") {
+      var cap = Math.max(0, Math.round(v));
+      if (cap !== userCap) liveEdited = true;
+      userCap = cap; applyCap(); updateModeline(); return;
+    }
     if (!Module._evo_set_param) return;
     var ok = withCString(key, function (ptr) { return Module._evo_set_param(ptr, v); });
-    if (ok) { runCfg[key] = v; showNote((LABELS[key] || key) + " is now " + v + " (live)"); }
+    if (ok) {
+      if (v !== (key in runCfg ? runCfg[key] : def)) liveEdited = true;
+      runCfg[key] = v; updateModeline(); showNote((LABELS[key] || key) + " is now " + v + " (live)");
+    }
     else showError(Module.UTF8ToString(Module._evo_last_error()));
   }
   var tabsEl = el("tabs"), panelsEl = el("panels"), currentTab = "run";
+  /* the settings' tabs (web/ui_common.js tabs, as the Ocean's): Left / Right
+   * round the ends, Home / End, the focus going with the selection; a
+   * pointer's press lets the focus go, the keyboard's keeps it */
+  var sheetTabs = EvoUI.tabs(tabsEl, {
+    ids: function () { return SETTINGS_TABS.map(function (t) { return t.id; }); },
+    current: function () { return currentTab; },
+    button: function (id) { return el("tab-" + id); },
+    select: setSheetTab
+  });
   function buildSettings() {
     SETTINGS_TABS.forEach(function (tab) {
       var b = document.createElement("button");
@@ -448,7 +489,7 @@
       b.setAttribute("role", "tab");
       b.setAttribute("aria-controls", "panel-" + tab.id);
       b.textContent = tab.title;
-      b.addEventListener("click", function () { setSheetTab(tab.id); });
+      sheetTabs.bind(b, tab.id);
       tabsEl.appendChild(b);
       if (!tab.groups) return;   /* "run" is static HTML */
       var panel = document.createElement("section");
@@ -483,25 +524,12 @@
   }
   function setSheetTab(id) {
     currentTab = id;
-    SETTINGS_TABS.forEach(function (tab) {
-      var on = tab.id === id;
-      el("tab-" + tab.id).setAttribute("aria-selected", on ? "true" : "false");
-      el("tab-" + tab.id).tabIndex = on ? 0 : -1;
-      el("panel-" + tab.id).hidden = !on;
-    });
+    sheetTabs.mark(id);
+    SETTINGS_TABS.forEach(function (tab) { el("panel-" + tab.id).hidden = tab.id !== id; });
     panelsEl.scrollTop = 0;
     hideTip();
     try { localStorage.setItem("evo_boids.tab", id); } catch (e) { /* private mode */ }
   }
-  tabsEl.addEventListener("keydown", function (e) {
-    if (e.key !== "ArrowRight" && e.key !== "ArrowLeft") return;
-    var ids = SETTINGS_TABS.map(function (t) { return t.id; });
-    var i = ids.indexOf(currentTab) + (e.key === "ArrowRight" ? 1 : -1);
-    i = (i + ids.length) % ids.length;
-    setSheetTab(ids[i]);
-    el("tab-" + ids[i]).focus();
-    e.preventDefault();
-  });
   /* a dot on each tab that holds a setting changed from its default */
   function updateTabDots() {
     SETTINGS_TABS.forEach(function (tab) {
@@ -658,8 +686,19 @@
     autoCap = 0;
     resetGovernor();
     if (!ok) showError("evo_init failed: " + Module.UTF8ToString(Module._evo_last_error()));
-    else { runCfg = cfg; if (dash()) dash().reset(); }   /* a new run: new charts */
+    else {
+      runCfg = cfg; governed = false; liveEdited = false; loadedRun = false; updateModeline(); if (dash()) dash().reset();   /* a new run: new charts */
+      brainClock.reset(worldTick(), true);   /* (tick 0: no fish has run its brain yet) */
+    }
     return !!ok;
+  }
+  /* The fish card's live brain is the last step's (evo_wasm.cpp captures every step's senses and actions, from evo_init
+   * and from a load, but a checkpoint carries none): a new or loaded world's waits for its first step (EvoUI.activationClock) */
+  var brainClock = EvoUI.activationClock();
+  /* the world's frame counter as the shim reads it (evo_sync repacks the same state: no step, no draw) */
+  function worldTick() {
+    Module._evo_sync();
+    return new Float64Array(heap(), Module._evo_stats(), 4)[3];
   }
 
   /* ---- per-frame data: resolve selection + _evo_inspect BEFORE creating views ---- */
@@ -711,117 +750,20 @@
     return s;
   }
 
-  /* ---- neural inspector panel (drawn last, above HUD) ---- */
-  function colY(i, n, yTop, yBot) {
-    return n <= 1 ? (yTop + yBot) / 2 : yTop + (yBot - yTop) * i / (n - 1);
-  }
-  function activationColor(v) {
-    var m = Math.min(1, Math.abs(v));
-    var lo = 45;
-    var hot = lo + Math.round((235 - lo) * m);
-    var mid = Math.round(lo + (v >= 0 ? 60 : 90) * (1 - m));
-    return v >= 0 ? "rgb(" + hot + "," + mid + "," + lo + ")"
-                  : "rgb(" + lo + "," + mid + "," + hot + ")";
-  }
-  /* Canvas x of the settings panel's left edge (WORLD_W when it is closed, a
-   * bottom sheet, or off the canvas). The inspector's default home is the
-   * canvas's top-right, so it has to step aside if the panel overlaps it. */
-  function drawerLeftInCanvas() {
-    if (!drawerEl.classList.contains("open") || !wideMQ.matches) return WORLD_W;
-    var cr = canvas.getBoundingClientRect();
-    if (cr.width <= 0) return WORLD_W;
-    var x = (drawerEl.getBoundingClientRect().left - cr.left) * (canvas.width / cr.width);
-    return Math.min(WORLD_W, x);
-  }
-  /* The network: 1. connections, under 2. the nodes. sen/hid/act map a node
-   * index to its [x, y]; g is the 2D context to draw into. */
-  function drawNet(g, s, sen, hid, act, rSen, rNode) {
-    g.lineWidth = 1;
-    for (var k = 0; k < s.connCount; k++) {
-      var o = k * 5;
-      var srcSen = s.conns[o] !== 0;
-      var srcNum = s.conns[o + 1] | 0;
-      var sinkAct = s.conns[o + 2] !== 0;
-      var sinkNum = s.conns[o + 3] | 0;
-      var w = s.conns[o + 4];
-      var a = srcSen ? sen(srcNum) : hid(srcNum);
-      var b = sinkAct ? act(sinkNum) : hid(sinkNum);
-      var srcAct = srcSen ? s.sensors[srcNum] : s.hidden[srcNum];
-      var mag = Math.min(1, Math.abs(w) * Math.abs(srcAct) * 1.5);
-      var alpha = ((25 + Math.round(180 * mag)) / 255).toFixed(4);
-      g.strokeStyle = (w >= 0 ? "rgba(120,200,130," : "rgba(210,120,120,") + alpha + ")";
-      g.beginPath(); g.moveTo(a[0], a[1]); g.lineTo(b[0], b[1]); g.stroke();
-    }
-    function node(p, r, v) {
-      g.fillStyle = activationColor(v);
-      g.beginPath(); g.arc(p[0], p[1], r, 0, TAU); g.fill();
-      g.strokeStyle = "rgba(0,0,0," + (160 / 255).toFixed(4) + ")";
-      g.lineWidth = 1;
-      g.stroke();
-    }
-    var i;
-    for (i = 0; i < 41; i++) node(sen(i), rSen, s.sensors[i]);
-    for (i = 0; i < 12; i++) node(hid(i), rNode, s.hidden[i]);
-    for (i = 0; i < 12; i++) node(act(i), rNode, s.actions[i]);
-  }
-  /* Canvas inspector panel, in world px: top-right by default; with the
-   * settings panel over the canvas, just left of its edge (follows it while it
-   * slides), never off the canvas's left side. */
-  var INSP_W = 340, INSP_H = 560, INSP_Y = 44;
-  function inspectorX() {
-    return Math.max(12, Math.min(WORLD_W - INSP_W - 12, drawerLeftInCanvas() - INSP_W - 12));
-  }
-  function drawInspector(s) {
-    var pw = INSP_W, ph = INSP_H, py = INSP_Y;
-    var px = inspectorX();
-    ctx.fillStyle = "rgba(10,22,30," + (205 / 255).toFixed(4) + ")";
-    ctx.fillRect(px, py, pw, ph);
-    ctx.strokeStyle = "rgba(90,140,150," + (220 / 255).toFixed(4) + ")";
-    ctx.lineWidth = 1;
-    ctx.strokeRect(px + 0.5, py + 0.5, pw - 1, ph - 1);
-    var xS = px + 30, xH = px + 170, xA = px + 310;
-    var yTop = py + 46, yBot = py + ph - 22;
-    var i;
-
-    drawNet(ctx, s,
-            function (n) { return [xS, colY(n, 41, yTop, yBot)]; },
-            function (n) { return [xH, colY(n, 12, yTop, yBot)]; },
-            function (n) { return [xA, colY(n, 12, yTop, yBot)]; }, 3, 5);
-
-    /* 3. text */
-    ctx.font = "13px monospace";
-    ctx.fillStyle = "rgba(220,235,240," + (235 / 255).toFixed(4) + ")";
-    ctx.fillText("Fish #" + Math.round(s.info[0]) + "   spd " + Math.round(s.info[1]) +
-                 "   E " + Math.round(s.info[2]) + "   age " + Math.round(s.info[3]),
-                 px + 12, py + 19);
-    /* Body params get their own line at the panel foot — appended to the title
-     * they would run past the 340px panel. Always drawn: the page has no view of
-     * cfg.bodyModel, and a fixed 1.00 / 1.00 is itself the readout for a run
-     * with the model off. */
-    ctx.font = "11px monospace";
-    ctx.fillStyle = "rgba(190,205,210," + (220 / 255).toFixed(4) + ")";
-    ctx.fillText("body " + s.info[4].toFixed(2) + "   elong " + s.info[5].toFixed(2) +
-                 "   gen " + Math.round(s.info[6]),
-                 px + 12, py + ph - 8);
-    ctx.fillStyle = "rgba(150,175,180," + (200 / 255).toFixed(4) + ")";
-    var hy = yTop - 18 + 11; /* text top at yTop-18, ~11px to baseline */
-    ctx.fillText("in", xS - 8, hy);
-    ctx.fillText("hidden", xH - 20, hy);
-    ctx.fillText("out", xA - 12, hy);
-    ctx.font = "10px monospace";
-    ctx.fillStyle = "rgba(190,205,210," + (220 / 255).toFixed(4) + ")";
-    for (i = 0; i < 12; i++) ctx.fillText(ACTION_NAMES[i], xA + 8, colY(i, 12, yTop, yBot) + 3);
-  }
-
-  /* ---- compact screens: the selected fish as a card ----
+  /* ---- the selected fish: the fish card, in every view ----
    * Its numbers, with bars against the run's settings, and its live brain,
    * drawn in CSS px at devicePixelRatio so the text stays readable however
-   * small the world is on screen. Tapping (or pointing at) a node names it. */
+   * small the world is on screen. Tapping (or pointing at) a node names it.
+   * Both pages' card (web/ui_common.js: the colour key, the common fields in
+   * their order, the brain and whether it is this tick's). The flat view
+   * drew a world-pixel panel and HUD on the canvas instead, as the native
+   * window does; the web page now has this one inspector everywhere (the UI
+   * parity plan's U19). */
   var cardEl = el("fishcard"), inetCanvas = el("inetc"), inetCtx = inetCanvas.getContext("2d");
-  var portrait = el("iportrait"), portraitCtx = portrait.getContext("2d");
+  var portrait = el("iportrait");
   var cardExpanded = window.innerWidth >= 600, cardCache = {}, cardFor = null;
   el("iexpand").setAttribute("aria-expanded", cardExpanded ? "true" : "false");   /* the tour reads it */
-  var sensorNames = null, netNodes = [], netHover = -1, uiFont = "";
+  var sensorNames = null, netNodes = [], netHover = -1, uiFont = "", cardFresh = false;
   function prettyName(n) {
     return String(n).replace(/_/g, " ").replace(/([a-z])([A-Z])/g, "$1 $2").toLowerCase();
   }
@@ -849,15 +791,22 @@
     el("iexpand").setAttribute("aria-expanded", cardExpanded ? "true" : "false");
     cardCache = {};
   }
+  /* Hiding the card is presentation only: the fish stays selected, and
+   * followed. Letting go of the fish (endCard) is what stops the follow. */
   function hideCard() {
     if (cardEl.hidden) return;
-    if (scene && scene.following()) scene.setFollow(false);
     cardEl.hidden = true;
     cardFor = null;
     netHover = -1;
     cardFlip = false;
     cardEl.classList.remove("flip");
     document.body.classList.remove("card-open");
+  }
+  /* no fish selected any more (closed, let go, gone, a new world): the tank
+   * stops following it and its card goes */
+  function endCard() {
+    if (scene && scene.following()) scene.setFollow(false);
+    hideCard();
   }
   /* The card's home is the bottom of a narrow screen (the right of a wider
    * one); .flip puts it at the top (the left). Like a docked panel it moves
@@ -872,28 +821,8 @@
     cardFlip = flip;
     cardEl.classList.toggle("flip", flip);
   }
-  function drawPortrait(rgb, size, elong) {
-    var dpr = window.devicePixelRatio || 1, w = 56, h = 40;
-    if (portrait.width !== w * dpr) { portrait.width = w * dpr; portrait.height = h * dpr; }
-    var g = portraitCtx;
-    g.setTransform(dpr, 0, 0, dpr, 0, 0);
-    g.clearRect(0, 0, w, h);
-    var k = 3.0 * bodyScale(size), len = 1 + 0.35 * Math.tanh(4 * (elong - 1));
-    g.translate(w / 2 + 4, h / 2);
-    g.scale(len, 1);
-    g.fillStyle = "rgb(" + rgb.join(",") + ")";
-    g.beginPath();
-    g.moveTo(-9 * k / 1.2, 0);
-    g.bezierCurveTo(-7 * k / 1.2, -4.2 * k / 1.2, 2, -4.4 * k / 1.2, 6, -1.4);
-    g.lineTo(11, -5.5); g.lineTo(9.5, 0); g.lineTo(11, 5.5); g.lineTo(6, 1.4);
-    g.bezierCurveTo(2, 4.4 * k / 1.2, -7 * k / 1.2, 4.2 * k / 1.2, -9 * k / 1.2, 0);
-    g.fill();
-    g.fillStyle = "rgba(4,14,15,0.9)";
-    g.beginPath(); g.arc(-6.2 * k / 1.2, -1.2, 1.1, 0, TAU); g.fill();
-    g.setTransform(1, 0, 0, 1, 0, 0);
-  }
   function updateCard(s) {
-    if (s.selIdx < 0 || !s.info) { hideCard(); return; }
+    if (s.selIdx < 0 || !s.info) { endCard(); return; }
     if (cardEl.hidden) showCard();
     /* layout reads first, DOM writes last, so a frame never forces a
      * synchronous reflow (except right after a rare side change) */
@@ -906,11 +835,17 @@
     }
     var info = s.info, id = Math.round(info[0]);
     var rgb = [s.colors[3 * s.selIdx], s.colors[3 * s.selIdx + 1], s.colors[3 * s.selIdx + 2]];
-    var pkey = id + "|" + rgb.join() + "|" + info[4].toFixed(2) + "|" + info[5].toFixed(2);
-    if (cardFor !== pkey) { cardFor = pkey; drawPortrait(rgb, info[4], info[5]); }
+    var pkey = id + "|" + rgb.join() + "|" + info[4].toFixed(2) + "|" + info[5].toFixed(2) + "|" + colourBrain;
+    if (cardFor !== pkey) {
+      cardFor = pkey;
+      EvoUI.drawPortrait(portrait, rgb, info[4], info[5], window.devicePixelRatio || 1);
+      el("ikey").title = "A colour key, not a likeness: " + (colourBrain ? "the colour of its brain (similar wiring, similar colour)"
+                                                                         : "the colour of its family line, as the charts show it") + ".";
+    }
     setText("ititle", "Fish #" + id);
-    setText("isub", "Generation " + Math.round(info[6]) + " · family #" + Math.round(info[7]) +
-            (cfgVal("bodyModel", false) ? " · body " + info[4].toFixed(2) + " × " + info[5].toFixed(2) : ""));
+    /* the common fields, in their order (both pages); its genes are its brain's links, one per gene (evo_inspect's) */
+    setText("isub", EvoUI.cardSubtitle({ generation: info[6], family: info[7], genes: s.connCount,
+                                         body: cfgVal("bodyModel", false) ? [info[4], info[5]] : null }));
     var reproE = cfgVal("reproEnergy", 20), maxAge = cfgVal("maxAge", 120), maxSpd = cfgVal("maxSpeed", 150);
     setText("ienergyv", info[2].toFixed(1));
     setBar("ienergy", info[2] / (reproE * 2), 0.5);
@@ -919,115 +854,44 @@
     setBar("iage", info[3] / maxAge);
     setText("ispeedv", String(Math.round(info[1])));
     setBar("ispeed", info[1] / maxSpd);
+    /* its live brain: the last step's, or (a new or loaded world, a fish born in the last step) waiting for a step;
+     * data-activations-at: the tick of the activations it shows, empty while it waits (EvoUI.activationClock's stamp) */
+    var tick = s.stats[3], state = brainClock.state(tick, info[3]), at = brainClock.stamp(tick, info[3]);
+    cardFresh = state === "current";
+    if (cardCache.acts !== state + "|" + at) {
+      cardCache.acts = state + "|" + at;
+      cardEl.dataset.activations = state;
+      cardEl.dataset.activationsAt = at === null ? "" : String(at);
+    }
     if (cardExpanded) drawBrain(s);
   }
 
-  /* The card's network: senses -> hidden -> actions. Links are drawn first,
-   * nodes on top; nodes keep their screen positions for the tap-to-name line. */
-  function brainColor(v, a) {
-    var m = Math.min(1, Math.abs(v));
-    return v >= 0 ? "rgba(" + Math.round(70 + 130 * m) + "," + Math.round(90 + 150 * m) + "," + Math.round(60 + 10 * m) + "," + a + ")"
-                  : "rgba(" + Math.round(80 + 175 * m) + "," + Math.round(90 + 20 * m) + "," + Math.round(70 + 10 * m) + "," + a + ")";
-  }
+  /* The card's network (EvoUI.drawBrain: senses -> hidden -> actions, the
+   * links under the nodes); the nodes keep their places for the tap-to-name line. */
   function drawBrain(s) {
     var box = inetCanvas.parentNode, w = box.clientWidth, h = box.clientHeight;
     if (w < 60 || h < 60) return;
     var dpr = window.devicePixelRatio || 1, bw = Math.round(w * dpr), bh = Math.round(h * dpr);
     if (inetCanvas.width !== bw) inetCanvas.width = bw;
     if (inetCanvas.height !== bh) inetCanvas.height = bh;
-    var g = inetCtx, i;
-    g.setTransform(dpr, 0, 0, dpr, 0, 0);
-    g.clearRect(0, 0, w, h);
-    var wide = w > h * 1.15, pos = { sen: [], hid: [], act: [] };
-    var m = 14;
-    if (wide) {
-      var yIn = 26, yOut = h - 40, yHid = (yIn + yOut) / 2;
-      for (i = 0; i < 41; i++) pos.sen.push([m + (w - 2 * m) * i / 40, yIn]);
-      for (i = 0; i < 12; i++) { var x = m + 18 + (w - 2 * m - 36) * i / 11; pos.hid.push([x, yHid]); pos.act.push([x, yOut]); }
-    } else {
-      var yTop = 26, yBot = h - 12, xS = 18, xA = w - 92, xH = (xS + xA) / 2;
-      for (i = 0; i < 41; i++) pos.sen.push([xS, yTop + (yBot - yTop) * i / 40]);
-      for (i = 0; i < 12; i++) { var y = yTop + (yBot - yTop) * i / 11; pos.hid.push([xH, y]); pos.act.push([xA, y]); }
-    }
-    /* links: curved, brighter and thicker the more they carry right now */
-    var hoverKey = netHover >= 0 && netNodes[netHover] ? netNodes[netHover].kind + netNodes[netHover].i : null;
-    for (var k = 0; k < s.connCount; k++) {
-      var o = k * 5;
-      var srcSen = s.conns[o] !== 0, srcNum = s.conns[o + 1] | 0;
-      var sinkAct = s.conns[o + 2] !== 0, sinkNum = s.conns[o + 3] | 0, wgt = s.conns[o + 4];
-      var a = srcSen ? pos.sen[srcNum] : pos.hid[srcNum];
-      var b = sinkAct ? pos.act[sinkNum] : pos.hid[sinkNum];
-      if (!a || !b) continue;
-      var srcAct = srcSen ? s.sensors[srcNum] : s.hidden[srcNum];
-      var mag = Math.min(1, Math.abs(wgt) * Math.abs(srcAct) * 1.5);
-      var hl = hoverKey !== null && ((srcSen ? "Sense" : "Hidden neuron") + srcNum === hoverKey ||
-                                     (sinkAct ? "Action" : "Hidden neuron") + sinkNum === hoverKey);
-      g.strokeStyle = (wgt >= 0 ? "rgba(180,235,80," : "rgba(255,120,80,") + (hl ? 0.9 : (0.10 + 0.7 * mag)).toFixed(3) + ")";
-      g.lineWidth = hl ? 2 : 0.8 + 1.6 * mag;
-      g.beginPath();
-      g.moveTo(a[0], a[1]);
-      if (wide) g.bezierCurveTo(a[0], (a[1] + b[1]) / 2, b[0], (a[1] + b[1]) / 2, b[0], b[1]);
-      else g.bezierCurveTo((a[0] + b[0]) / 2, a[1], (a[0] + b[0]) / 2, b[1], b[0], b[1]);
-      g.stroke();
-    }
-    netNodes = [];
-    function node(p, r, v, kind, idx) {
-      g.fillStyle = brainColor(v, 1);
-      g.beginPath(); g.arc(p[0], p[1], r, 0, TAU); g.fill();
-      g.strokeStyle = "rgba(4,14,16,0.85)";
-      g.lineWidth = 1;
-      g.stroke();
-      netNodes.push({ x: p[0], y: p[1], kind: kind, i: idx, v: v });
-    }
-    var rs = Math.max(2, Math.min(3.2, (wide ? w : h) / 41 * 0.36));
-    for (i = 0; i < 41; i++) node(pos.sen[i], rs, s.sensors[i], "Sense", i);
-    for (i = 0; i < 12; i++) node(pos.hid[i], 5, s.hidden[i], "Hidden neuron", i);
-    for (i = 0; i < 12; i++) node(pos.act[i], 5.5, s.actions[i], "Action", i);
-    if (netHover >= 0 && netNodes[netHover]) {
-      var hn = netNodes[netHover];
-      g.strokeStyle = "rgba(230,255,160,0.95)"; g.lineWidth = 2;
-      g.beginPath(); g.arc(hn.x, hn.y, 8, 0, TAU); g.stroke();
-    }
     if (!uiFont) uiFont = getComputedStyle(document.body).fontFamily;
-    g.font = "11px " + uiFont;
-    g.fillStyle = "rgba(190,210,205,0.9)";
-    function tag(text, x, y) {   /* a label on a small backing, readable over the links */
-      var tw = g.measureText(text).width;
-      g.fillStyle = "rgba(15,39,39,0.92)";
-      g.fillRect(x - 3, y - 10, tw + 6, 14);
-      g.fillStyle = "rgba(190,210,205,0.95)";
-      g.fillText(text, x, y);
-    }
-    if (wide) {
-      tag("senses", m, 13);
-      tag("hidden", m, (26 + h - 40) / 2 - 9);
-      g.fillStyle = "rgba(190,210,205,0.9)";
-      g.textAlign = "center";
-      for (i = 0; i < 12; i++) g.fillText(ACTION_SHORT[i], pos.act[i][0], h - 40 + (i % 2 ? 30 : 18));
-      g.textAlign = "left";
-    } else {
-      g.fillText("senses", 6, 13);
-      g.fillText("hidden", (18 + w - 92) / 2 - 18, 13);
-      g.fillText("actions", w - 98, 13);
-      for (i = 0; i < 12; i++) g.fillText(ACTION_LABELS[i], pos.act[i][0] + 10, pos.act[i][1] + 4);
-    }
+    netNodes = EvoUI.drawBrain(inetCtx, w, h, s, { nS: 41, nH: 12, nA: 12, gutter: 92, actShort: ACTION_SHORT, actLabels: ACTION_LABELS,
+                                                   font: uiFont, dpr: dpr, fresh: cardFresh, prev: netNodes, hover: netHover });
     updateSenseLine();
   }
-  var DEFAULT_SENSE = "Senses on one side, actions on the other. Lime links excite, orange ones inhibit; brighter = stronger right now. Tap a dot to name it.";
   function updateSenseLine() {
-    var html;
     if (netHover >= 0 && netNodes[netHover]) {
       var n = netNodes[netHover];
       var label = n.kind === "Sense" ? senseName(n.i) : n.kind === "Action" ? ACTION_LABELS[n.i] : "neuron " + (n.i + 1);
-      html = n.kind + ": <b></b> " + (n.v >= 0 ? "+" : "") + n.v.toFixed(2);
+      var html = EvoUI.senseHtml(n, cardFresh);
       if (cardCache.sense !== html + label) {
         cardCache.sense = html + label;
         el("isense").innerHTML = html;
         el("isense").querySelector("b").textContent = label;
       }
-    } else if (cardCache.sense !== "default") {
-      cardCache.sense = "default";
-      el("isense").textContent = coarseMQ.matches ? DEFAULT_SENSE : DEFAULT_SENSE.replace("Tap", "Point at");
+    } else {
+      var t = EvoUI.senseIdle(cardFresh, coarseMQ.matches, paused, "Space runs it");
+      if (cardCache.sense !== t) { cardCache.sense = t; el("isense").textContent = t; }
     }
   }
   function nearestNode(e) {
@@ -1043,7 +907,7 @@
   /* Scene layer (background, currents, food, creatures, predators): WebGL2
    * when available (web/gl_renderer.js; one instanced draw per kind), else the
    * 2D path below. Both read the same constants, so they draw the same scene;
-   * ?gl=0 forces 2D. Overlays (ring, HUD, inspector) are always 2D, on top. */
+   * ?gl=0 forces 2D. The selection ring is always 2D, on top. */
   var LOOK = {
     radii: RADII, segAlpha: SEG_ALPHA, minRadius: MIN_RADIUS, bodyScale: bodyScale,
     /* fish shapes (opt-in): one body over the six spine points; the fin's
@@ -1062,7 +926,7 @@
   }
 
   function draw(s, stepped) {
-    if (view3d) {   /* the tank view: no canvas overlays, the card on every screen */
+    if (view3d) {   /* the tank view: no canvas overlays (its ring is the scene's), the card */
       if (sceneW !== WORLD_W || sceneH !== WORLD_H) { sceneW = WORLD_W; sceneH = WORLD_H; scene.setWorld(WORLD_W, WORLD_H); }
       scene.render(s, { animT: animT, dtSim: stepped / 60, selIdx: s.selIdx });
       updateCard(s);
@@ -1145,25 +1009,9 @@
       ctx.arc(s.segs[12 * s.selIdx], s.segs[12 * s.selIdx + 1], 16 * k, 0, TAU);
       ctx.stroke();
     }
-    if (compact) {  /* no HUD or canvas inspector: the readout and the fish card */
-      updateCard(s);
-      return;
-    }
-    hideCard();
-
-    var st = s.stats, fmt = function (v) { return String(Math.round(v)); };
-    ctx.font = "14px monospace";
-    ctx.fillStyle = "rgba(200,200,200,0.78)";
-    ctx.fillText(
-      "pop " + fmt(st[0]) + "  food " + fmt(st[1]) + "  pred " + fmt(st[2]) +
-      "  frame " + fmt(st[3]) + "  births " + fmt(st[4]) + "  deaths " + fmt(st[5]) +
-      "  gLen " + st[8].toFixed(1) +
-      (STATS_LEN > 10 ? "  gen " + fmt(st[10]) + " (avg " + st[9].toFixed(1) + ")" : "") +
-      "  speed " + simSpeed + "x" + (paused ? " [PAUSED]" : ""),
-      10, 18);
-    ctx.fillText("[Space] pause  [Up/Down] speed  [R] restart  [click] inspect", 10, 36);
-
-    if (s.selIdx >= 0) drawInspector(s); /* last: above HUD */
+    /* No HUD or inspector panel on the canvas, on any screen: the readout (the
+     * HUD's live numbers, and more) and the fish card are the page's */
+    updateCard(s);
   }
 
   /* ---- frame budget: degrade agent count rather than stutter ----
@@ -1188,7 +1036,35 @@
   var userCap = 0, autoCap = 0;
   var governorOn = true;
   var govNote = "";
-  var governed = false;   /* the governor has changed this run */
+  /* This run's history, for what its seed replays. Set as it happens; cleared only when a new world is
+   * accepted (initWorld's evo_init, a loaded file): a refused Restart or file leaves the run, and them, as they were. */
+  var governed = false;   /* the governor has changed this run (its cap and cull) */
+  var liveEdited = false;  /* a live setting's value changed during this run (applyLive) */
+  var loadedRun = false;   /* this run carries on from a loaded checkpoint */
+  /* the reasons this single-threaded run does not replay from its seed: [key, words] */
+  function replayReasons() {
+    var not = [];
+    if (governed) not.push(["governed", "the frame budget removed fish from it"]);
+    if (liveEdited) not.push(["live", "a live setting changed during it"]);
+    if (loadedRun) not.push(["loaded", "it carries on from a loaded world"]);
+    return not;
+  }
+  /* the reseed floor the running world took: runCfg's (a start's non-default keys, a loaded world's config,
+   * an applied live edit), else the default; as the engine reads it, a whole number (an (int) cast: 0.5 runs as 0) */
+  function runFloor() {
+    var v = runCfg ? runCfg.minPopulation : undefined;
+    if (typeof v === "number" && Number.isFinite(v)) return Math.trunc(v);
+    for (var i = 0; i < ADV.length; i++) if (ADV[i][0] === "minPopulation") return ADV[i][1];
+    return 50;
+  }
+  function replayClaim() {
+    var not = replayReasons();
+    return "the same seed and settings replay a run step for step" +
+      (not.length ? ", but not this one: " + not.map(function (r) { return r[1]; }).join("; ") : "");
+  }
+  function replayNote() {
+    return threaded ? "Threaded runs are fast but do not replay from the seed." : "Single-threaded (" + threadWhy + "): " + replayClaim() + ".";
+  }
   /* Time ignored after a (re)start: JIT warm-up and buffer growth would
    * otherwise read as "this machine is too slow". Measured in time, not
    * frames — an overloaded page draws few frames, and waiting for N of them
@@ -1215,8 +1091,9 @@
     lastFrameAt = now;
   }
   function framesLate() { return intervalEma > displayMs * 1.2; }
+  /* the governor's timing and note start over (`governed`, the run's history, stays: an accepted new world clears it) */
   function resetGovernor() {
-    workEma = 0; overFrames = 0; underFrames = 0; govNote = ""; governed = false;
+    workEma = 0; overFrames = 0; underFrames = 0; govNote = "";
     intervalEma = 0;
     warmupUntil = performance.now() + WARMUP_MS;
     restoreDetail();
@@ -1269,6 +1146,7 @@
           var removed = Module._evo_cull_to ? Module._evo_cull_to(autoCap) : 0;
           selectedId = null;  /* the inspected creature may be gone */
           governed = true;
+          updateModeline();
           setGovNote((removed ? "removed " + removed + " fish at random, " : "") +
                      "capped at " + autoCap + " to hold 60 fps; this run no longer replays from its seed");
         }
@@ -1308,7 +1186,7 @@
     var cap = userCap > 0 && autoCap > 0 ? Math.min(userCap, autoCap) : (userCap || autoCap);
     var rows = [
       ["Fish", fmtNum(st[0])], ["Food", fmtNum(st[1])], ["Predators", fmtNum(st[2])],
-      ["Births", fmtNum(st[4])], ["Deaths", fmtNum(st[5])],
+      ["Births (total)", fmtNum(st[6])], ["Deaths (total)", fmtNum(st[7])],
       ["Generation", STATS_LEN > 10 ? fmtNum(st[10]) + " (avg " + st[9].toFixed(1) + ")" : "–"],
       ["Genes per fish", st[8].toFixed(1)],
       ["Frame", fmtNum(st[3])],
@@ -1322,9 +1200,7 @@
     var html = "<dl>" + rows.map(function (r) { return "<dt>" + r[0] + "</dt><dd>" + r[1] + "</dd>"; }).join("") + "</dl>";
     var notes = [];
     if (govNote) notes.push(govNote.charAt(0).toUpperCase() + govNote.slice(1) + ".");
-    if (governed) notes.push("The frame budget changed this run, so it no longer replays from its seed.");
-    notes.push(threaded ? "Threaded runs are fast but not reproducible from the seed."
-                        : "Single-threaded (" + threadWhy + "): reproducible from the seed.");
+    notes.push(replayNote());
     html += "<div class='notes'>" + notes.map(function () { return "<p></p>"; }).join("") + "</div>";
     p.innerHTML = html;
     p.querySelectorAll(".notes p").forEach(function (node, i) { node.textContent = notes[i]; });
@@ -1518,20 +1394,23 @@
     toast("Saved the world at frame " + frameNo.toLocaleString() + ".");
   }
   /* fromTurbo: the Turbo worker handing the same run back, so the dashboards
-   * carry on; a file is a new run, so they start over */
+   * carry on; a file is a new run, so they start over. Returns whether the
+   * module took it (a refusal leaves the running world, and its history, as they were). */
   function loadCheckpointText(text, fromTurbo) {
     var ok = withCString(text, function (ptr) { return Module._evo_load_checkpoint(ptr); });
     if (!ok) {
       showError("Couldn't load that checkpoint: " + Module.UTF8ToString(Module._evo_last_error()));
-      return;
+      return false;
     }
     if (!fromTurbo) {
+      governed = false; liveEdited = false; loadedRun = true;   /* (updateModeline: the caller's, after the governor's reset) */
       try { runCfg = JSON.parse(text).config || {}; } catch (e) { runCfg = {}; }
       if (dash()) dash().reset();
       if (Module._evo_rec_reset) Module._evo_rec_reset(1);   /* the loaded fish, as the tree's roots */
     }
     selectedId = null;
     if (glScene && glScene.forgetFish) glScene.forgetFish();
+    brainClock.reset(worldTick(), true);   /* a checkpoint carries no activations: they wait for the loaded world's first step */
     warmupUntil = performance.now() + WARMUP_MS;  /* a load is a restart for frame timing */
     workEma = 0;
     var w = Module._evo_width(), h = Module._evo_height();
@@ -1543,6 +1422,7 @@
     updateFitButton();
     el("randnote").textContent = "";  /* the Randomize pick no longer describes this world */
     if (!fromTurbo) showNote("Checkpoint loaded.");
+    return true;
   }
 
   /* ---- TURBO (headless worker) mode ----
@@ -2096,7 +1976,7 @@
     this.value = "";
     if (!file || !Module || guardTurbo()) return;
     file.text().then(function (text) {
-      loadCheckpointText(text);
+      if (!loadCheckpointText(text)) return;   /* refused: the running world, its cap and its governor stay */
       /* the file's own cap becomes the user cap; the governor starts fresh */
       var cap = 0;
       try { cap = (JSON.parse(text).config || {}).maxPopulation || 0; } catch (e) { /* load reported it */ }
@@ -2104,6 +1984,7 @@
       autoCap = 0;
       el("adv_maxPopulation").value = String(cap);
       resetGovernor();
+      updateModeline();
       updateNeeds();
       updateTabDots();
     }, function (err) { showError("Couldn't read that file: " + err); });
@@ -2126,8 +2007,9 @@
   window.EvoApp = {
     ready: false,   /* the world is running; "evo:ready" fires on window then */
     touch: function () { return coarseMQ.matches; },
-    /* the selected fish is the card (compact screens, and the tank view) */
-    compact: function () { return compactMQ.matches || view3d; },
+    /* the selected fish is the card: in every view and on every screen (the
+     * flat view's canvas panel is gone; guide.js reads this to show the card) */
+    compact: function () { return true; },
     has3D: function () { return view3d; },
     /* fish coloured by brain similarity (else by family line) */
     colourByBrain: function () { return colourBrain; },
@@ -2136,9 +2018,9 @@
     setDrawer: setDrawer,
     setSheetTab: setSheetTab,
     /* Selects a fish for the guide to show, unless one is selected: the one
-     * nearest a point left of centre, clear of the desktop inspector. Leaves
-     * everSelected alone, so the one-time hint still comes until the visitor
-     * picks one. */
+     * nearest a point left of centre, clear of a wide screen's card at the
+     * right. Leaves everSelected alone, so the one-time hint still comes until
+     * the visitor picks one. */
     inspectSomeFish: function () {
       if (!Module || turboState !== "live") return false;
       if (selectedId !== null) return true;
@@ -2151,14 +2033,10 @@
       if (guideFish !== null && selectedId === guideFish) selectedId = null;
       guideFish = null;
     },
-    /* CSS rect of the inspector being shown (the fish card on compact
-     * screens, the canvas panel elsewhere), or null */
+    /* CSS rect of the inspector being shown (the fish card), or null */
     inspectorRect: function () {
       if (selectedId === null || turboState !== "live") return null;
-      if (compactMQ.matches || view3d) return cardEl.hidden ? null : cardEl.getBoundingClientRect();
-      var cr = canvas.getBoundingClientRect(), c = cr.width / canvas.width;
-      return { left: cr.left + inspectorX() * c, top: cr.top + INSP_Y * c,
-               width: INSP_W * c, height: INSP_H * c };
+      return cardEl.hidden ? null : cardEl.getBoundingClientRect();
     }
   };
 
@@ -2181,6 +2059,9 @@
       runConfig: function () { return runCfg; },
       /* fish drawn by brain (genome colour) instead of by family line */
       colourByBrain: function () { return colourBrain; },
+      /* what the fish wear now ("family" or "brain"), and the charts' way to show their family colours in the tank */
+      colourMode: function () { return colourBrain ? "brain" : "family"; },
+      showFamilyColours: function () { setColourBrain(false, true); },
       /* the sampling interval, here and in a running Turbo worker */
       setRecEvery: function (every) {
         Module._evo_rec_config(every, -1);
@@ -2226,9 +2107,13 @@
     showError("failed to load wasm module: " + err);
   });
   function updateModeline() {
-    el("modeline").textContent = (threaded
+    /* the claim as data too (data-replay "yes" / "no", data-why: the reasons' keys) */
+    var ml = el("modeline"), why = threaded ? ["threaded"] : replayReasons().map(function (r) { return r[0]; });
+    ml.dataset.replay = why.length ? "no" : "yes";
+    ml.dataset.why = why.join(" ");
+    ml.textContent = (threaded
       ? "Running the threaded module (" + Module._evo_threads() + " threads): fast, not reproducible from the seed."
-      : "Running the single-threaded module, reproducible from the seed (" + threadWhy + ").") +
+      : "Running the single-threaded module (" + threadWhy + "): " + replayClaim() + ".") +
       " Drawing: " + drawingName() + ".";
   }
   function start() {
