@@ -20,8 +20,8 @@
 interface NumArray { length: number; [index: number]: number }
 /** a JSON value as JSON.parse makes it */
 type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
-/** a flat settings record (a cfg): oc_init's keys, numbers and switches */
-type Cfg = Record<string, number | boolean>;
+/** A flat settings record: numbers, switches and the weight mutation policy. */
+type Cfg = Record<string, number | boolean | "legacy" | "saturating">;
 
 /* ---------------- the engine: web/evo_ocean.{js,wasm} (wasm/ocean_wasm.cpp, EVO_EXPORT) ---------------- */
 

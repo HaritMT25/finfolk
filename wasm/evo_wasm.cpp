@@ -504,6 +504,10 @@ EVO_EXPORT int evo_set_param(const char* name, double value) {
     SimConfig cfg = g_world->cfg;
     checkpoint::readConfig(root, cfg);
     clampConfig(cfg);
+    if (const char* why = brainPolicyConfigError(cfg)) {
+        g_error = why;
+        return 0;
+    }
     g_world->cfg = cfg;
     return 1;
 }

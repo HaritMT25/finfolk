@@ -727,8 +727,12 @@
       for (var i = 0; i < ks.length; i++) {
         var k = ks[i], v = c[k], d = R.keys[k];
         if (!NAME.test(k) || args[k]) return what + " have a setting named " + JSON.stringify(k.slice(0, 40));
-        if (d ? (typeof d[0] === "boolean" ? typeof v !== "boolean" : !fin(v)) : !(fin(v) || typeof v === "boolean"))
+        if (k === "weightMutationMode") {
+          if (v !== "legacy" && v !== "saturating")
+            return what + " have weightMutationMode outside legacy / saturating";
+        } else if (d ? (typeof d[0] === "boolean" ? typeof v !== "boolean" : !fin(v)) : !(fin(v) || typeof v === "boolean")) {
           return what + " have " + k + " " + (typeof v === "string" ? "as text" : Array.isArray(v) ? "as a list" : obj(v) ? "as a record" : JSON.stringify(v));
+        }
       }
       return "";
     }

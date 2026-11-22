@@ -478,6 +478,10 @@ inline bool readOceanJson(const char* json, SimConfig& sc, OceanConfig& oc, std:
             }
         }
     checkpoint::readConfig(root, sc);
+    if (const char* why = brainPolicyConfigError(sc)) {
+        err = why;
+        return false;
+    }
     if (const jsonm::Value* o = root.find("config"))
         if (!readOceanConfig(*o, oc, &err)) return false;
     return true;
@@ -695,6 +699,7 @@ inline constexpr int kOceanMaxWorldSide = 100000;    // world width / height (th
 inline constexpr double kOceanMaxGridCells = 16777216.0;   // per neighbour grid (2^24)
 
 inline std::string oceanSimConfigError(const SimConfig& c) {
+    if (const char* why = brainPolicyConfigError(c)) return why;
     const struct { const char* name; float v, lo, hi; } r[] = {
         {"currentStrength", c.currentStrength, 0.0f, 1000.0f},
         {"currentCore", c.currentCore, 0.0f, 100000.0f},
