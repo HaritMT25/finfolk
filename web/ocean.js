@@ -1081,7 +1081,13 @@
   var nvRunning = false;
   function nv(k) { return nvRunning ? runningVal(k) : getVal(k); }
   function hasCurrent() { return nv("currentStrength") > 0; }
-  function hasPredators() { return nv("predatorCount") > 0; }
+  /* hunters in the world: the starting predators, or the floor's: with their
+   * economy on, a floor above 0 adds hunters even from 0 starting predators
+   * (src/ocean/ocean_world.hpp: the step calls refillPredators when
+   * predatorEconomy and predatorMinPopulation > 0; neither reads
+   * predatorCount, which only says how many the world starts with) */
+  function hasHunters() { return nv("predatorCount") > 0 || (!!nv("predatorEconomy") && nv("predatorMinPopulation") > 0); }
+  var HUNTERS_ECONOMY = "needs predators (above 0, or a predator floor above 0), with their economy on";
   var NEEDS = [
     [["walls"], function () { return M && !hasWalls() ? "needs a newer engine module (this one has no glass walls)" : ""; }],
     [["sideWallBand", "sideWallTurnRate"], function () { return nv("walls") ? "" : "needs glass walls on"; }],
@@ -1097,13 +1103,21 @@
       if (!hasCurrent()) return "needs a current (strength above 0)";
       return nv("currentMode") === 0 || nv("walls") ? "" : "needs the eddies shape, or glass walls (where it sets the current's fade at the glass)";
     }],
-    [["predatorEconomy", "predatorSpeed", "predatorPerception", "predatorCaptureRadius", "predatorCooldown"],
-      function () { return hasPredators() ? "" : "needs predators above 0"; }],
-    [["predatorMeal", "predatorMetabolism", "predatorReproEnergy", "predatorMaxAge", "predatorMinPopulation",
-      "predatorMaxPopulation", "predatorInheritance"],
-      function () { return hasPredators() && nv("predatorEconomy") ? "" : "needs predators, with their economy on"; }],
+    /* the economy switch also switches the floor's refill on: it matters with starting predators or a floor */
+    [["predatorEconomy"], function () {
+      return nv("predatorCount") > 0 || nv("predatorMinPopulation") > 0 ? "" : "needs predators above 0, or a predator floor above 0 (with the economy on, the floor adds hunters)";
+    }],
+    [["predatorSpeed", "predatorPerception", "predatorCaptureRadius", "predatorCooldown"],
+      function () { return hasHunters() ? "" : "needs predators above 0, or their economy on with a predator floor above 0"; }],
+    [["predatorMeal", "predatorMetabolism", "predatorReproEnergy", "predatorMaxAge", "predatorMaxPopulation", "predatorInheritance"],
+      function () { return hasHunters() && nv("predatorEconomy") ? "" : HUNTERS_ECONOMY; }],
+    [["predatorMinPopulation"], function () {
+      return nv("predatorEconomy") ? "" : "needs predator economy on (refills hunters even from 0)";
+    }],
     [["predatorTraitMutation"], function () {
-      return hasPredators() && nv("predatorEconomy") && nv("predatorInheritance") ? "" : "needs hunters inherit traits on"; }],
+      if (!(hasHunters() && nv("predatorEconomy"))) return HUNTERS_ECONOMY;
+      return nv("predatorInheritance") ? "" : "needs hunters inherit traits on";
+    }],
     [["maxTurnRate"], function () { return nv("triangularMotion") ? "" : "needs fast-swims-straight on"; }],
     [["steerFrame"], function () { return nv("triangularMotion") ? "no effect with fast-swims-straight on: it turns by steer x already" : ""; }],
     [["reproSoftWidth", "reproGracePeriod"], function () { return nv("reproMaxDistance") >= 0 ? "" : "needs a breeding distance limit of 0 or more"; }],
@@ -1112,10 +1126,28 @@
       if (!nv("bodyModel")) return "needs evolving bodies on (without them every fish is size 1)";
       return hasCurrent() || nv("waveSpeed") > 0 ? "" : "needs a current or waves to drift in";
     }],
+    /* food is size 1 (ocean_world.hpp OceanFood::size) and the gate refuses an
+     * item only when 1 > kMouth x the fish's size (the food loop's mouthGate
+     * test); a fish is size 1 without evolving bodies, 0.5 to 2 with them
+     * (src/core/body_model.hpp BODY_PARAM_MIN): so it can refuse anything only
+     * when kMouth x the smallest size is under 1 — never at the default 2, even
+     * with evolving bodies (kMouth is a float in the engine: fround) */
+    [["mouthGate"], function () {
+      var k = nv("kMouth"), small = nv("bodyModel") ? 0.5 : 1;
+      return Math.fround(k) * small >= 1 ? "no effect at mouth size × " + k + ": food is size 1 and every fish can eat it (" +
+        (small < 1 ? "the smallest fish is size 0.5)" : "every fish is size 1)") : "";
+    }],
     [["kMouth"], function () { return nv("mouthGate") ? "" : "needs the mouth gate on"; }],
     [["waveBand", "waveGravity"], function () { return nv("waveSpeed") > 0 ? "" : "needs waves (strength above 0)"; }],
     [["L0", "kWater"], function () { return nv("lightEnabled") ? "" : "needs the light field on"; }],
-    [["depthCostScaled"], function () { return nv("cHold") > 0 || nv("cPress") > 0 ? "" : "needs a depth cost above 0"; }],
+    [["depthCostScaled"], function () { return nv("cHold") > 0 || nv("cPress") > 0 ? "" : "needs a cost of leaving neutral depth, or of pressure, above 0"; }],
+    /* the appearance genes' inheritance knobs act on the parts appearance
+     * carries: the skin patterns with bit 1, the body shapes with bit 2
+     * (src/ocean/appearance_model.hpp offspringFromDraws: kPatterns, kShapes) */
+    [["patternMutation", "patternPhaseMutation", "patternNovelProbability"],
+      function () { return nv("appearance") & 1 ? "" : "needs skin patterns in Appearance genes"; }],
+    [["morphologyMutation", "morphologyNovelProbability"],
+      function () { return nv("appearance") & 2 ? "" : "needs body shapes in Appearance genes"; }],
     [["eye", "eyeOnly"], function () { return HAS_EYE ? "" : "needs the eye build of the module; this page runs the plain Ocean build"; }],
     [["eyeCode"], function () {
       if (!HAS_EYE) return "needs the eye build of the module; this page runs the plain Ocean build";
@@ -1136,7 +1168,8 @@
         if (!hint) { hint = document.createElement("span"); hint.className = "needs"; row.appendChild(hint); }
         var inert = !!why && !(LIVE[k] && !draft && initArgs && !whyNow);
         row.classList.toggle("inert", inert);
-        hint.textContent = inert ? why : why ? why.replace(/^needs/, "the next world needs") + "; it still acts on this one" : "";
+        hint.textContent = inert ? why : why ? why.replace(/^needs/, "the next world needs").replace(/^no effect/, "no effect in the next world") +
+          "; it still acts on this one" : "";
       });
     });
     /* glass walls and wrap-around senses exclude each other (the engine
@@ -1281,9 +1314,11 @@
     draft = null;
     resetForm();
     fill();
-    updateNeeds(); updateTabDots();
     d.base = snapForm();
     draft = d; d.gen = ++draftGen;
+    /* (with the draft in place: a staged sheet is the next world alone, so
+     * acting on the running world no longer keeps a live field undimmed) */
+    updateNeeds(); updateTabDots();
     hideAsk();
     renderStartBar();
   }

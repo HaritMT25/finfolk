@@ -1,8 +1,14 @@
 name: ci
 
+# One run per change: pushes to main, and pull requests (which test the PR merged
+# into main). A branch without a PR has no automatic run: open a (draft) PR, or
+# start one by hand (Actions -> ci -> Run workflow). Before, every PR commit ran
+# twice (push + pull_request), doubling the jobs competing for runners.
 on:
   push:
+    branches: [main]
   pull_request:
+  workflow_dispatch:
 
 jobs:
   native:
@@ -154,13 +160,27 @@ jobs:
   # serial job's ctest runs it on the runner image's python3 (3.12); this job builds the serial app
   # only and runs the same unit + end-to-end tests on 3.14 (the study server's: its multiprocessing
   # default start method changed, so the runner uses plain subprocess workers) and the oldest 3.10.
+  # The suite runs as four parallel shards per Python version (it took ~51 min as one serial job):
+  #   e2e                 unit tests + the app-driven end-to-end runs (tooling, worlds, forks)  ~17 min
+  #   analysis            graph/recovery, sealing, evidence, val_block, refsel, obslaw, forecast, probes  ~10 min
+  #   noisebank-horizons  test_noisebank.py's TestD8Horizons alone (T4-3 is ~12 min by itself)  ~14 min
+  #   noisebank-rest      every other test_noisebank.py class  ~14 min
+  # Same commands, flags and log checks as before, only distributed. noisebank-rest first checks that the
+  # two halves together name every TestCase class in test_noisebank.py, so a new class cannot be dropped.
   redqueen:
-    name: redqueen tools (Python ${{ matrix.python }})
+    name: redqueen tools (Python ${{ matrix.python }}, ${{ matrix.shard }})
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
         python: ["3.10", "3.14"]
+        shard: [e2e, analysis, noisebank-horizons, noisebank-rest]
+    env:
+      NB_HORIZONS: TestD8Horizons
+      NB_REST: >-
+        TestPlan TestNumerics TestEstimator TestFeasibilityAndRefusals TestScaleNu0Bootstrap TestVBuilder
+        TestCollect TestBankCoverage TestD8CeilingAndScreen TestD8Refit TestD8Provenance TestD8Validation
+        TestD8Ledger TestD8Assembly TestAdoptionGateT5_4
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v6
@@ -173,55 +193,84 @@ jobs:
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DEVO_NO_OPENMP=ON
           cmake --build build --target evo_boids -j
       - name: Unit tests
+        if: matrix.shard == 'e2e'
         # (a leaked file handle is a failure: ResourceWarning as an error, and none in the output)
         run: |
           python3 -I -W error::ResourceWarning tools/redqueen/test_redqueen.py -v 2>&1 | tee unit.log
           test "${PIPESTATUS[0]}" = 0
           ! grep -q ResourceWarning unit.log
       - name: Map graph and recovery simulation (numpy required)
+        if: matrix.shard == 'analysis'
         run: |
           python3 -m pip install -q "numpy>=2"
           RQ_REQUIRE_NUMPY=1 python3 -I -W error::ResourceWarning tools/redqueen/test_graph.py -v 2>&1 | tee graph.log
           test "${PIPESTATUS[0]}" = 0
           ! grep -q ResourceWarning graph.log
           ! grep -q "skipped" graph.log
+      # (the serial job had numpy here from the graph step: redqueen_tooling.sh runs test_graph.py and
+      # test_recovery_extra.py, whose numpy tests skip without it; installed at the same point, after the unit tests)
+      - name: numpy for the end-to-end runs
+        if: matrix.shard == 'e2e'
+        run: python3 -m pip install -q "numpy>=2"
       - name: End to end (10 workers)
+        if: matrix.shard == 'e2e'
         run: PYTHON=python3 RQ_TEST_WORKERS=10 bash tests/redqueen_tooling.sh build/evo_boids "$RUNNER_TEMP/rq_work"
       - name: Histories (worlds.py, end to end; its unit tests first)
+        if: matrix.shard == 'e2e'
         run: PYTHON=python3 bash tests/redqueen_worlds.sh build/evo_boids "$RUNNER_TEMP/rq_worlds"
       - name: Fork branches (forks.py, end to end; its unit tests first)
+        if: matrix.shard == 'e2e'
         run: PYTHON=python3 bash tests/redqueen_forks.sh build/evo_boids "$RUNNER_TEMP/rq_forks"
       - name: Sealing (split manifest, filters, prediction commitments, public freeze)
+        if: matrix.shard == 'analysis'
         run: |
           python3 -I -W error::ResourceWarning tools/redqueen/test_sealing.py -v 2>&1 | tee sealing.log
           test "${PIPESTATUS[0]}" = 0
           ! grep -q ResourceWarning sealing.log
       - name: "The shared evidence-chain rule (evidence.py: val_block.py and worlds.py's ecology)"
+        if: matrix.shard == 'analysis'
         run: |
           python3 -I -W error::ResourceWarning tools/redqueen/test_evidence.py -v 2>&1 | tee evidence.log
           test "${PIPESTATUS[0]}" = 0
           ! grep -q ResourceWarning evidence.log
       - name: "Validation-layout adapter (val_block.py, the runner_val worlds block)"
+        if: matrix.shard == 'analysis'
         run: |
           python3 -I -W error::ResourceWarning tools/redqueen/test_val_block.py -v 2>&1 | tee val_block.log
           test "${PIPESTATUS[0]}" = 0
           ! grep -q ResourceWarning val_block.log
       - name: "Reference selection (refsel.py, design v4 section 4.2; numpy required)"
+        if: matrix.shard == 'analysis'
         run: |
           python3 -m pip install -q "numpy>=2"
           RQ_REQUIRE_NUMPY=1 python3 -I -W error::ResourceWarning tools/redqueen/test_refsel.py -v 2>&1 | tee refsel.log
           test "${PIPESTATUS[0]}" = 0
           ! grep -q ResourceWarning refsel.log
           ! grep -q "skipped" refsel.log
+      - name: "Noise bank shards cover every test class"
+        if: matrix.shard == 'noisebank-rest'
+        run: |
+          python3 -I - <<'EOF'
+          import os, re
+          src = open("tools/redqueen/test_noisebank.py", encoding="utf-8").read()
+          have = {n for n, bases in re.findall(r"^class (\w+)\(([^)]*)\):", src, re.M) if "TestCase" in bases}
+          a, b = set(os.environ["NB_HORIZONS"].split()), set(os.environ["NB_REST"].split())
+          assert not (a & b), f"in both halves: {sorted(a & b)}"
+          assert have == a | b, f"unassigned: {sorted(have - a - b)}; not in the file: {sorted((a | b) - have)}"
+          print(f"the two noise-bank shards name all {len(have)} TestCase classes")
+          EOF
       - name: "Noise bank (noisebank.py: design v4 section 7.4, A_design_v5.md section 2; numpy required)"
+        if: startsWith(matrix.shard, 'noisebank-')
         # (the only permitted skip is T5-4's #68 adoption gate, which needs RQ_PR68_DIR)
         run: |
           python3 -m pip install -q "numpy>=2"
-          RQ_REQUIRE_NUMPY=1 python3 -I -W error::ResourceWarning tools/redqueen/test_noisebank.py -v 2>&1 | tee noisebank.log
+          case "${{ matrix.shard }}" in noisebank-horizons) classes="$NB_HORIZONS" ;; *) classes="$NB_REST" ;; esac
+          RQ_REQUIRE_NUMPY=1 python3 -I -W error::ResourceWarning tools/redqueen/test_noisebank.py -v $classes 2>&1 | tee noisebank.log
           test "${PIPESTATUS[0]}" = 0
           if grep -q ResourceWarning noisebank.log; then exit 1; fi
           if grep -E '\.\.\. skipped' noisebank.log | grep -qv "adoption gate"; then exit 1; fi
       - name: "Observation law (obslaw.py, recovery option A, A_design_v5.md; numpy required)"
+        if: matrix.shard == 'analysis'
         # (the only permitted skips are the #68 adoption gates, which need RQ_PR68_DIR)
         run: |
           python3 -m pip install -q "numpy>=2"
@@ -230,6 +279,7 @@ jobs:
           if grep -q ResourceWarning obslaw.log; then exit 1; fi
           if grep -E '\.\.\. skipped' obslaw.log | grep -qv "adoption gate"; then exit 1; fi
       - name: "Linear forecasts (forecast.py, design v4 section 10.6; numpy required)"
+        if: matrix.shard == 'analysis'
         run: |
           python3 -m pip install -q "numpy>=2"
           RQ_REQUIRE_NUMPY=1 python3 -I -W error::ResourceWarning tools/redqueen/test_forecast.py -v 2>&1 | tee test_forecast.log
@@ -237,6 +287,7 @@ jobs:
           ! grep -q ResourceWarning test_forecast.log
           ! grep -q "skipped" test_forecast.log
       - name: "Level-3 probes (probes.py, design v4 section 11; numpy required)"
+        if: matrix.shard == 'analysis'
         run: |
           python3 -m pip install -q "numpy>=2"
           RQ_REQUIRE_NUMPY=1 python3 -I -W error::ResourceWarning tools/redqueen/test_probes.py -v 2>&1 | tee test_probes.log
