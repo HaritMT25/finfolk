@@ -5,9 +5,43 @@
 #include <cmath>
 #include <algorithm>
 #include <bit>
+#include <string_view>
 #include "sensors_actions.hpp"
 #include "portable_math.hpp"
 #include "random.hpp"
+
+enum class WeightMutationMode : uint8_t {
+    Legacy = 0,
+    Saturating = 1,
+    Invalid = 255
+};
+
+inline constexpr const char* weightMutationModeName(WeightMutationMode mode) {
+    switch (mode) {
+    case WeightMutationMode::Legacy: return "legacy";
+    case WeightMutationMode::Saturating: return "saturating";
+    default: return "invalid";
+    }
+}
+
+inline bool parseWeightMutationMode(std::string_view text,
+                                    WeightMutationMode& mode) {
+    if (text == "legacy") {
+        mode = WeightMutationMode::Legacy;
+        return true;
+    }
+    if (text == "saturating") {
+        mode = WeightMutationMode::Saturating;
+        return true;
+    }
+    return false;
+}
+
+inline int16_t saturatingWeightAdd(int16_t weight, int32_t delta) {
+    const int32_t sum = static_cast<int32_t>(weight) + delta;
+    return static_cast<int16_t>(
+        std::clamp(sum, int32_t{-32768}, int32_t{32767}));
+}
 
 // Max number of internal (hidden) neurons per creature
 constexpr int MAX_INTERNAL_NEURONS = 12;
@@ -118,13 +152,15 @@ struct NeuralNet {
 
     // Gene-type bit masks: bit i of srcTypeBits / sinkTypeBits is gene i's
     // sourceType / sinkType, for genes 0..127 (two 64-bit words each), written
-    // by buildNeuralNet from the genome in GENOME order (not flat's). They let
-    // genomeSimilarityMasked count the positional type matches with a popcount
-    // over the net's own bytes instead of a loop over both genomes' heap
-    // buffers: the same integer count, so the same float. Derived state, like
-    // the rest of the net: rebuilt wherever the net is (birth, checkpoint load),
-    // never serialized. Genes past 127 are not covered (no configurable genome
-    // is that long today); the masked compare falls back to the loop.
+    // by buildNeuralNet (the prey's builder; predbrain::buildNet does not fill
+    // them, and nothing reads a predator's) from the genome in GENOME order
+    // (not flat's). They let genomeSimilarityMasked count the positional type
+    // matches with a popcount over the net's own bytes instead of a loop over
+    // both genomes' heap buffers: the same integer count, so the same float.
+    // Derived state, like the rest of the net: rebuilt wherever the net is
+    // (birth, checkpoint load), never serialized. Genes past 127 (a
+    // --genome-max above 128) are not covered: the masked compare takes the
+    // loop whenever the shorter genome is longer than that.
     uint64_t srcTypeBits[2]  = {0, 0};
     uint64_t sinkTypeBits[2] = {0, 0};
 };
@@ -161,6 +197,23 @@ inline Genome makeRandomGenome(int initMin = GENOME_INITIAL_MIN,
     return makeRandomGenome(initMin, initMax, rng);
 }
 
+// The gene-type masks of a genome (NeuralNet::srcTypeBits / sinkTypeBits):
+// bit i of src / sink is gene i's sourceType / sinkType, genes 0..127, genome
+// order. buildNeuralNet writes them into the net it builds; a net wired from
+// another gene list on purpose (a test fixture) restores them from the genome
+// it keeps, and typeMasksMatch checks a net against its genome.
+inline void genomeTypeMasks(const Genome& genome, uint64_t src[2], uint64_t sink[2]) {
+    src[0] = src[1] = 0;
+    sink[0] = sink[1] = 0;
+    for (size_t i = 0; i < genome.size() && i < 128; ++i) {
+        const uint64_t bit = 1ull << (i & 63);
+        if (genome[i].sourceType) src[i >> 6]  |= bit;
+        if (genome[i].sinkType)   sink[i >> 6] |= bit;
+    }
+}
+struct NeuralNet;
+inline bool typeMasksMatch(const Genome& genome, const NeuralNet& nnet);
+
 // Build neural net wiring from genome
 // Adapted from biosim4's createWiringFromGenome
 inline void buildNeuralNet(const Genome& genome, NeuralNet& nnet) {
@@ -192,13 +245,7 @@ inline void buildNeuralNet(const Genome& genome, NeuralNet& nnet) {
     }
 
     // The gene-type masks (see NeuralNet): genome order, genes 0..127.
-    nnet.srcTypeBits[0] = nnet.srcTypeBits[1] = 0;
-    nnet.sinkTypeBits[0] = nnet.sinkTypeBits[1] = 0;
-    for (size_t i = 0; i < genome.size() && i < 128; ++i) {
-        const uint64_t bit = 1ull << (i & 63);
-        if (genome[i].sourceType) nnet.srcTypeBits[i >> 6]  |= bit;
-        if (genome[i].sinkType)   nnet.sinkTypeBits[i >> 6] |= bit;
-    }
+    genomeTypeMasks(genome, nnet.srcTypeBits, nnet.sinkTypeBits);
 
     // Stable counting sort by sink slot. Stability is what preserves
     // bit-exactness: within one accumulator the contributions keep their genome
@@ -277,15 +324,18 @@ inline void feedForward(NeuralNet& nnet, const float sensors[], float actions[],
             }
         }
     } else {
-        // evomath::tanhf's bits, as two branch-free batches the compiler
-        // vectorises (portable_math.hpp: tanhfArray). An undriven neuron's
-        // accumulator is 0 and its value is dropped: it keeps its fixed output.
-        evomath::tanhfArray(accum, actions, NUM_ACTIONS);
-        float hidden[MAX_INTERNAL_NEURONS];
-        evomath::tanhfArray(accum + NUM_ACTIONS, hidden, MAX_INTERNAL_NEURONS);
+        // evomath::tanhf's bits, as one branch-free batch over both sink kinds
+        // (the accumulators are contiguous: the actions, then the neurons) that
+        // the compiler vectorises (24 values in Classic, 25 in the Ocean; portable_math.hpp:
+        // tanhfArray; per element the same function, so the same bits). An
+        // undriven neuron's accumulator is 0 and its value is dropped: it keeps
+        // its fixed output.
+        float act[NUM_ACTIONS + MAX_INTERNAL_NEURONS];
+        evomath::tanhfArray(accum, act, NUM_ACTIONS + MAX_INTERNAL_NEURONS);
+        std::memcpy(actions, act, NUM_ACTIONS * sizeof(float));
         for (int i = 0; i < MAX_INTERNAL_NEURONS; ++i) {
             NeuralNet::Neuron& n = nnet.neurons[i];
-            n.output = n.driven ? hidden[i] : n.output;
+            n.output = n.driven ? act[NUM_ACTIONS + i] : n.output;
         }
     }
 }
@@ -313,44 +363,52 @@ inline Genome crossover(const Genome& parent1, const Genome& parent2) {
     return child;
 }
 
-inline void mutateGenome(Genome& genome, float rate, int minLen, int maxLen, RandomGen& r) {
-    // Weight mutations and rewiring
+inline void mutateGenome(Genome& genome, float rate, int minLen, int maxLen,
+                         RandomGen& r,
+                         WeightMutationMode mode = WeightMutationMode::Legacy) {
+    // Preserve the legacy gates, payloads and random-stream ordering.
     for (auto& gene : genome) {
         if (r.unit() < rate) {
-            // Mutate the weight
-            gene.weight += static_cast<int16_t>(r.intRange(-1000, 1000));
+            if (mode == WeightMutationMode::Saturating) {
+                const int32_t delta = r.intRange(-1000, 1000);
+                gene.weight = saturatingWeightAdd(gene.weight, delta);
+            } else {
+                gene.weight += static_cast<int16_t>(r.intRange(-1000, 1000));
+            }
         }
         if (r.unit() < rate * 0.5f) {
-            // Rarely rewire a connection entirely
             gene = Gene::makeRandom(r);
         }
     }
 
-    // Gene insertion — genome can grow
     if (r.unit() < rate * 2.0f && (int)genome.size() < maxLen) {
         int pos = r.intRange(0, (int)genome.size());
         genome.insert(genome.begin() + pos, Gene::makeRandom(r));
     }
 
-    // Gene deletion — genome can shrink
     if (r.unit() < rate * 2.0f && (int)genome.size() > minLen) {
         int pos = r.intRange(0, (int)genome.size() - 1);
         genome.erase(genome.begin() + pos);
     }
 
-    // Gene duplication — copy an existing gene to a new position (rare)
     if (r.unit() < rate * 0.5f && (int)genome.size() < maxLen) {
         int src = r.intRange(0, (int)genome.size() - 1);
         Gene dup = genome[src];
-        // Slightly mutate the duplicate's weight
-        dup.weight += static_cast<int16_t>(r.intRange(-500, 500));
+        if (mode == WeightMutationMode::Saturating) {
+            const int32_t delta = r.intRange(-500, 500);
+            dup.weight = saturatingWeightAdd(dup.weight, delta);
+        } else {
+            dup.weight += static_cast<int16_t>(r.intRange(-500, 500));
+        }
         genome.push_back(dup);
     }
 }
+
 inline void mutateGenome(Genome& genome, float rate = 0.01f,
                          int minLen = GENOME_MIN_LENGTH,
-                         int maxLen = GENOME_MAX_LENGTH) {
-    mutateGenome(genome, rate, minLen, maxLen, rng);
+                         int maxLen = GENOME_MAX_LENGTH,
+                         WeightMutationMode mode = WeightMutationMode::Legacy) {
+    mutateGenome(genome, rate, minLen, maxLen, rng, mode);
 }
 
 inline float genomeSimilarity(const Genome& g1, const Genome& g2) {
@@ -367,6 +425,13 @@ inline float genomeSimilarity(const Genome& g1, const Genome& g2) {
                    (g1[i].sinkType == g2[i].sinkType);
     }
     return static_cast<float>(matches) / static_cast<float>(minLen);
+}
+
+inline bool typeMasksMatch(const Genome& genome, const NeuralNet& nnet) {
+    uint64_t src[2], sink[2];
+    genomeTypeMasks(genome, src, sink);
+    return src[0] == nnet.srcTypeBits[0] && src[1] == nnet.srcTypeBits[1] &&
+           sink[0] == nnet.sinkTypeBits[0] && sink[1] == nnet.sinkTypeBits[1];
 }
 
 // genomeSimilarity, from the nets' gene-type masks (NeuralNet::srcTypeBits /

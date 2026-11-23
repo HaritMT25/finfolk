@@ -81,9 +81,10 @@ inline Fish makeRandomFish(Vec2 pos, float depth, float D, int initMin, int init
 // world re-places it on the torus — and their midpoint depth. bodyBuoy is the
 // world's to draw, AFTER kernel::inheritFromPair (OceanWorld::doInteraction).
 inline Fish makeChildFish(const Fish& p1, const Fish& p2, int minLen, int maxLen,
-                          float mutMultiplier, float newbornEnergy) {
+                          float mutMultiplier, float newbornEnergy,
+                          WeightMutationMode mode = WeightMutationMode::Legacy) {
     Fish child;
-    kernel::inheritGenome(child, p1, p2, minLen, maxLen, mutMultiplier);
+    kernel::inheritGenome(child, p1, p2, minLen, maxLen, mutMultiplier, mode);
     const Vec2 midpoint = {(p1.pos.x + p2.pos.x) * 0.5f, (p1.pos.y + p2.pos.y) * 0.5f};
     child.init(midpoint, (p1.depth + p2.depth) * 0.5f);
     child.foodReserves = newbornEnergy;

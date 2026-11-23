@@ -169,12 +169,13 @@ struct Expose { friend constexpr auto member(Tag) noexcept { return M; } };
     struct NAME { friend constexpr auto member(NAME) noexcept; };        \
     template struct Expose<NAME, &CLASS::FIELD>;                         \
     }
-OFP_PEEK(OwCurrent, OceanWorld, current_)
+OFP_PEEK(OwFlowState, OceanWorld, flowState_)
+// Keep the existing test/harness tags while storage moves into FlowState.
+namespace ofp::peek { struct OwCurrent {}; struct OwWaves {}; }
 OFP_PEEK(OwPatches, OceanWorld, foodPatches_)
 OFP_PEEK(OwPatchDepth, OceanWorld, foodPatchDepth_)
 OFP_PEEK(OwCreatureGrid, OceanWorld, creatureGrid_)
 OFP_PEEK(OwFoodGrid, OceanWorld, foodGrid_)
-OFP_PEEK(OwWaves, OceanWorld, waves_)
 OFP_PEEK(OwHot, OceanWorld, hot_)
 OFP_PEEK(CfMode, CurrentField, mode_)
 OFP_PEEK(CfCenters, CurrentField, centers_)
@@ -211,7 +212,11 @@ namespace ofp {
 // The private member `Tag` names, of obj (const in, const out; tests that bump
 // private state pass a non-const object).
 template <class Tag, class T>
-constexpr decltype(auto) field(T& obj) { return (obj.*member(Tag{})); }
+constexpr decltype(auto) field(T& obj) {
+    if constexpr (std::is_same_v<Tag, peek::OwCurrent>) return (field<peek::OwFlowState>(obj).current);
+    else if constexpr (std::is_same_v<Tag, peek::OwWaves>) return (field<peek::OwFlowState>(obj).waves);
+    else return (obj.*member(Tag{}));
+}
 
 // ---- tripwires ----------------------------------------------------------------
 namespace detail {
@@ -226,7 +231,7 @@ constexpr std::size_t fieldCount() {
 
 #define OFP_FIELDS(T, N) \
     static_assert(detail::fieldCount<T>() == (N), #T " gained or lost a field: hash it in tools/ocean_fingerprint.hpp, then update this count")
-OFP_FIELDS(SimConfig, 78);   // 71 + the seven Stage C keys (visitSimConfigBrain)
+OFP_FIELDS(SimConfig, 79);   // previous 78 + weightMutationMode
 OFP_FIELDS(OceanConfig, 40);   // 37 + the body-plan preview's three (visitOceanConfigBodyPlan, hashed in `body`)
 OFP_FIELDS(appearance::Stats, 10);   // founders, offspring, pattern[4], morph[4]
 OFP_FIELDS(physical::Stats, 6);      // founders, offspring, mode[4]
@@ -261,6 +266,11 @@ struct OceanFoodGrid_ {   // the entries (x .. index) are scratch
 struct CurrentField_ { CurrentField::Mode m; std::vector<int> vort, centers; float s, core; int w, h; float eps, om, a, t; };
 struct Mt_ { std::uint32_t x[624]; int p; };
 struct WaveTrain_ { double kx, ky, phase, phi; float k, qx, qy, frac; };
+struct FlowState_ {
+    CurrentField current;
+    WaveTrain_ waves[OceanWorld::kWaveTrains];
+    oceanflow::FlowCache cache;   // derived scratch, unchanged by extraction
+};
 struct FishHot_ {
     Vec2 pos, vel; float depth;
 #ifdef EVO_OCEAN_EYE
@@ -276,17 +286,17 @@ struct OceanWorld_ : WorldCommon {
 #ifdef EVO_OCEAN_PROF
     OceanWorld::OceanProf oprof;   // wall clock
 #endif
-    SpatialGrid creatureGrid; OceanFoodGrid foodGrid; std::vector<FishHot_> hot; std::vector<Pending_> pending;
+    SpatialGrid creatureGrid; OceanFoodGrid foodGrid; std::vector<FishHot_> hot;
+    std::vector<int> advectIdx;   // scratch: wallTransportFood's live-item list, rebuilt every call
+    std::vector<Pending_> pending;
     std::vector<int> neighbors, nearbyFood, nearby, near;
     std::vector<int> foodSeen;   // scratch (see above)
-    CurrentField current; std::vector<Vec2> patches; std::vector<float> patchDepth;
+    FlowState_ flowState; std::vector<Vec2> patches; std::vector<float> patchDepth;
     std::vector<appearance::Record> app; std::uint64_t appKey; int appFlags; bool appBroken; appearance::Stats appStats;
     std::vector<std::uint64_t> bodyOwners; std::vector<physical::Genes> bodyGenes;
     std::vector<bodyplan::BirthCoefficients> bodyBirth;
     std::uint64_t bodyKey, bodyRevision, bodyUncompiled;   // bodyRevision: the exports' change counter (not hashed)
     physical::Stats bodyStats; bool bodyFlag, bodyBroken;
-    WaveTrain_ waves[OceanWorld::kWaveTrains];
-    oceanflow::FlowCache flow;   // scratch (see above)
 #ifdef EVO_OCEAN_EYE
     std::vector<float> predCon;  // scratch (see above)
 #endif
@@ -296,6 +306,9 @@ static_assert(sizeof(SignalGrid) == sizeof(mirror::SignalGrid_), "SignalGrid's m
 static_assert(sizeof(SpatialGrid) == sizeof(mirror::SpatialGrid_), "SpatialGrid's members changed: update hashGrid and mirror::SpatialGrid_");
 static_assert(sizeof(OceanFoodGrid) == sizeof(mirror::OceanFoodGrid_), "OceanFoodGrid's members changed: update hashGrid and mirror::OceanFoodGrid_");
 static_assert(sizeof(CurrentField) == sizeof(mirror::CurrentField_), "CurrentField's members changed: update hashCurrent and mirror::CurrentField_");
+static_assert(sizeof(oceantransport::WaveTrain) == sizeof(mirror::WaveTrain_) &&
+              sizeof(oceantransport::FlowState) == sizeof(mirror::FlowState_),
+              "FlowState's members changed: update hashCurrent/hashGeometry and mirror::FlowState_");
 static_assert(sizeof(PortableMT19937) == sizeof(mirror::Mt_) && sizeof(RandomGen) == sizeof(mirror::Mt_),
               "the rng engine's members changed: update hashRng and mirror::Mt_");
 // hot_ is a vector (its size does not show in OceanWorld's): its element is checked on its own.
@@ -414,6 +427,10 @@ void visitSimConfigBrain(const SimConfig& c, V& v) {
     OFP_B(predatorBrain); OFP_F(predatorMutation); OFP_F(predatorTurnRate); OFP_F(predatorMinSpeed);
     OFP_B(predatorPrimer); OFP_B(predatorFrozen); OFP_B(predatorLog);
 }
+template <class V>
+void visitSimConfigWeightPolicy(const SimConfig& c, V& v) {
+    v.i32("weightMutationMode", static_cast<int>(c.weightMutationMode));
+}
 inline bool simBrainActive(const SimConfig& c) { return c.predatorBrain; }
 template <class V>
 void visitOceanConfig(const OceanConfig& c, V& v) {
@@ -486,6 +503,10 @@ inline void hashConfig(Hasher& h, const SimConfig& c, const OceanConfig& o) {
     if (simBrainActive(c)) {          // Stage C's keys: only with the brain on
         h.u64(kBrainCfgTag);
         visitSimConfigBrain(c, h);
+    }
+    if (c.weightMutationMode != WeightMutationMode::Legacy) {
+        VisionTagger policyTagger{h};
+        visitSimConfigWeightPolicy(c, policyTagger);
     }
 }
 
@@ -576,6 +597,12 @@ inline void hashFish(Hasher& h, const Fish& c, bool withActivations = true) {
     };
     h.u64(fl.size());
     for (std::size_t i = 0; i < fl.size(); i += 2) h.u64(flatWord(fl[i]) | (i + 1 < fl.size() ? flatWord(fl[i + 1]) << 32 : 0));
+    // The net's gene-type masks (genome.hpp) are derived from the genome hashed
+    // above, so they are not hashed; the INVARIANT is: a net's masks are its
+    // genome's. A fish that breaks it hashes a marker word, so a stale or
+    // foreign mask changes every fingerprint from that step on (the parity
+    // gate catches it) while the format and every baseline stay as they are.
+    if (!typeMasksMatch(c.genome, c.nnet)) h.u64(0x4d41534b5f424144ull);   // "MASK_BAD"
     if (withActivations) {
         float io[(int)NUM_SENSES + (int)NUM_ACTIONS + 1] = {};
         std::memcpy(io, c.lastSensors, sizeof c.lastSensors);
@@ -841,6 +868,7 @@ inline long countNonFinite(const OceanWorld& w) {
     f(w.D);
     visitSimConfig(w.cfg, nf);
     visitSimConfigBrain(w.cfg, nf);
+    visitSimConfigWeightPolicy(w.cfg, nf);
     visitOceanConfig(w.ocfg, nf);
     visitOceanConfigVision(w.ocfg, nf);
     visitOceanConfigAppearance(w.ocfg, nf);
@@ -929,6 +957,8 @@ inline void dumpState(const OceanWorld& w, std::FILE* out) {
     // The Stage C keys only with the brain on, as they are hashed, so a
     // brain-off dump is the 0.26.0 dump line for line (inactive values too).
     if (simBrainActive(w.cfg)) visitSimConfigBrain(w.cfg, d);
+    if (w.cfg.weightMutationMode != WeightMutationMode::Legacy)
+        visitSimConfigWeightPolicy(w.cfg, d);
     std::fprintf(out, "\noceanconfig");
     visitOceanConfig(w.ocfg, d);
     visitOceanConfigVision(w.ocfg, d);

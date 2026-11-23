@@ -3,7 +3,16 @@
 
 prepare writes no simulated observations.
 run verifies the frozen plan and starts at most two one-thread workers.
-Scientific outputs are synthetic planning-noise diagnostics, not bank validation.
+Two observation modes (A_design_v5.md 3.4, 3.7; recovery.py's OBSERVATION MODES):
+  planning (the default): scenario planning noise, labelled non-accepting (noise_source
+      scenario_planning_only, accepting false); never acceptance evidence.
+  bank (--obs-model bank --bank BANK_D8.json --obs-tables OBS_TABLES.npz on prepare, run and one):
+      the frozen bank/3 artifact and its tables, loaded and validated at prepare and in every
+      worker (obslaw.BankObservationModel); the plan binds them (inputs: bank_artifact_sha256,
+      obs_tables_sha256, observation_model_sha256; legacy_config: recovery.run_config with the full
+      observation_model), every result carries noise_source bank_d8, accepting,
+      observation_model_sha256, noiseless and recovery.observation_hashes, and every fit goes
+      through recovery.any_fit with the dataset that carries the model (the single choke point).
 """
 from __future__ import annotations
 
@@ -62,6 +71,15 @@ CRITERION = {
 }
 
 
+def criterion(obs):
+    """The plan's criterion record by observation mode (A_design_v5 3.4, L51-62): bank -> scope
+    "bank/D8-calibrated observation model (A_design_v5.md)"; planning -> the unchanged text plus
+    accepting false (3.7)."""
+    if obs is None:
+        return dict(CRITERION, accepting=False)
+    return dict(CRITERION, scope=rec.BANK_SCOPE)
+
+
 def clean(x):
     """Stable scientific JSON; legacy timing fields stay out of new results."""
     if isinstance(x, np.generic):
@@ -84,12 +102,18 @@ def csv(value, allowed):
     return xs
 
 
+FIXTURES = ("fixtures/registered_ages.json",)     # (A_design_v5 3.4: the fixture's sha beside the sources)
+
+
 def source_hashes():
-    return {
+    out = {
         name: rqlib.sha256_file(os.path.join(HERE, name))
         for name in sorted(os.listdir(HERE))
         if name.endswith(".py") and not name.startswith("test_")
     }
+    for name in FIXTURES:
+        out[name] = rqlib.sha256_file(os.path.join(HERE, name))
+    return out
 
 
 def ranked(namespace, category, worlds):
@@ -389,8 +413,23 @@ def diagnostics(D, plan):
     return clean(out)
 
 
+def obs_namespace(obs):
+    """The legacy argument fields of an observation mode (recovery.resolve / run_config read them):
+    planning for obs None, else bank with the model's synthetic-bank flag. The two paths are
+    presence markers only: the plan binds the model by its identity (sha256), never by path."""
+    if obs is None:
+        return {"obs_model": "planning", "bank": None, "obs_tables": None,
+                "allow_synthetic_bank": False}
+    return {"obs_model": "bank", "bank": "(bound by sha256)", "obs_tables": "(bound by sha256)",
+            "allow_synthetic_bank": bool(obs.allow_synthetic_bank)}
+
+
 def make_plan(D, graph_path, refs_path, namespace, fit, scenarios,
-              reps, options, cases, allow_toy=False):
+              reps, options, cases, allow_toy=False, obs=None):
+    """The frozen plan. obs None: planning mode; a loaded obslaw.BankObservationModel: bank mode
+    (A_design_v5 3.4: noise_source bank_d8, inputs add the bank artifact's, the tables' and the
+    observation model's sha256, legacy_config is recovery.run_config with the full
+    observation_model; the *_cap / *_cap15 scenarios are refused, BANK_REFUSED)."""
     if graph.layout_of(D.g["worlds"]) != "64":
         raise SystemExit("a registered 64-world layout is required")
     toy = bool(D.g.get("recovery_toy"))
@@ -410,6 +449,8 @@ def make_plan(D, graph_path, refs_path, namespace, fit, scenarios,
         raise SystemExit("registered search is ranks 0..4")
     if any(rec.SCENARIOS[s].get("noiseless") for s in scenarios):
         raise SystemExit("use legacy recovery.py for noiseless numerical checks")
+    om_args = obs_namespace(obs)
+    rec.bank_refusals(argparse.Namespace(**om_args), scenarios)
     seeds = {}
     for sc in scenarios:
         for rep in range(reps):
@@ -419,19 +460,21 @@ def make_plan(D, graph_path, refs_path, namespace, fit, scenarios,
             seeds[seed] = (sc, rep)
     a = argparse.Namespace(
         **fit, namespace=namespace, fitter="registered", options="a",
-        ab_cap=-1, references=refs_path,
+        ab_cap=-1, references=refs_path, **om_args,
     )
     rec.resolve(a)
+    om = rec.observation_model(a, obs)
     return {
         "schema": PLAN_SCHEMA,
         "synthetic": True,
         "toy": toy,
-        "noise_source": "scenario_planning_only",
+        "noise_source": om["noise_source"],
+        "accepting": om["accepting"],
         "namespace": namespace,
         "fit": {k: getattr(a, k) for k in FIT_KEYS},
         "scenarios": scenarios, "reps": reps,
         "options": options, "cases": cases,
-        "criterion": CRITERION,
+        "criterion": criterion(obs),
         "inputs": {
             "graph_file_sha256": rqlib.sha256_file(graph_path),
             "meta_file_sha256": rqlib.sha256_file(os.path.join(
@@ -440,8 +483,11 @@ def make_plan(D, graph_path, refs_path, namespace, fit, scenarios,
             "references_file_sha256": (
                 rqlib.sha256_file(refs_path) if refs_path else None
             ),
+            "bank_artifact_sha256": None if obs is None else obs.bank.sha256,
+            "obs_tables_sha256": None if obs is None else obs.tables.file_sha256,
+            "observation_model_sha256": rqlib.canonical_sha(om),
         },
-        "legacy_config": rec.run_config(a, rec.graph_identity(D.g)),
+        "legacy_config": rec.run_config(a, rec.graph_identity(D.g), obs),
         "sources_sha256": source_hashes(),
         "runtime": {
             "python": list(sys.version_info[:3]), "numpy": np.__version__,
@@ -566,20 +612,53 @@ def publish(directory, files):
         graph._publish_exclusive(os.path.join(directory, name), raw)
 
 
+def obs_args(a):
+    """The observation-mode arguments of prepare / run / one (A_design_v5 3.4, CLI row) ->
+    (bank, obs_tables, allow_synthetic) in bank mode, None in planning mode (the default);
+    incomplete or mixed arguments are refused before any file is read."""
+    mode = getattr(a, "obs_model", None) or "planning"
+    if mode not in rec.OBS_MODELS:
+        raise SystemExit(f"--obs-model {mode}: one of {rec.OBS_MODELS}")
+    given = [k for k in ("bank", "obs_tables") if getattr(a, k, None)]
+    allow = bool(getattr(a, "allow_synthetic_bank", False))
+    if mode == "bank" and len(given) != 2:
+        raise SystemExit("--obs-model bank needs --bank and --obs-tables "
+                         "(the frozen bank/3 artifact and its tables)")
+    if mode == "planning" and (given or allow):
+        raise SystemExit("--bank / --obs-tables / --allow-synthetic-bank are bank mode's "
+                         "(--obs-model bank) only")
+    return (a.bank, a.obs_tables, allow) if mode == "bank" else None
+
+
+def load_model(bank, obs_tables, allow_synthetic, scenarios):
+    """The bank/3 artifact and its tables, loaded and validated by recovery.load_model
+    (A_design_v5 4.2's order; every scheduled scenario's noise multiplier must be tabulated; the
+    test-only synthetic-bank flag; a zero ceiling M_H refused) -> the model."""
+    return rec.load_model(
+        argparse.Namespace(obs_model="bank", bank=bank, obs_tables=obs_tables,
+                           allow_synthetic_bank=allow_synthetic),
+        sorted({rec.scenario_gamma(s) for s in scenarios}) or (1.0,),
+    )
+
+
 def prepare(a):
     options = csv(a.options, OPTIONS)
     cases = list(CASES) if a.cases == "all" else csv(a.cases, CASES)
     scenarios = csv(a.scenarios, rec.SCENARIOS)
+    oa = obs_args(a)
+    if oa:     # (before any file: T7-5)
+        rec.bank_refusals(argparse.Namespace(obs_model="bank"), scenarios)
     fa = argparse.Namespace(
         **{k: getattr(a, k) for k in FIT_KEYS},
         fitter="registered", options="a", ab_cap=-1,
     )
     rec.resolve(fa)
     fit = {k: getattr(fa, k) for k in FIT_KEYS}
+    obs = load_model(*oa, scenarios) if oa else None     # (validated at prepare: v5 3.4, 4.2)
     D = data_from(a.graph, a.references)
     plan = make_plan(
         D, a.graph, a.references, a.namespace, fit, scenarios,
-        a.reps, options, cases, a.allow_toy,
+        a.reps, options, cases, a.allow_toy, obs=obs,
     )
     files = {
         "plan.json": rqlib.canonical(plan),
@@ -604,20 +683,48 @@ def read_frozen(directory):
         raise SystemExit("not a recovery-extra frozen plan")
     if files["plan.json"] != rqlib.canonical(plan):
         raise SystemExit("plan is not canonical JSON")
+    inputs = plan.get("inputs")
+    if (plan.get("noise_source") not in rec.NOISE_SOURCE.values()
+            or type(plan.get("accepting")) is not bool
+            or not isinstance(inputs, dict)
+            or not rqlib.is_sha256(inputs.get("observation_model_sha256"))):
+        raise SystemExit("a recovery-extra plan without its observation model "
+                         "(an older recovery_extra.py's): refused")
     return plan
 
 
-def verified(directory, graph_path, refs_path):
+def is_bank(plan):
+    return plan["noise_source"] == rec.NOISE_SOURCE["bank"]
+
+
+def verified_model(directory, graph_path, refs_path, bank=None, obs_tables=None,
+                   allow_synthetic=False):
+    """The frozen plan re-derived (A_design_v5 3.4, 4.3) from the graph, the references, the
+    current sources and runtime and, for a bank-mode plan, the model loaded from the given bank
+    and tables (any changed artifact or table byte changes the plan) -> (D, plan, the model or
+    None). A bank-mode plan needs the bank and tables; a planning-mode one refuses them."""
     plan = read_frozen(directory)
+    if is_bank(plan) and not (bank and obs_tables):
+        raise SystemExit(f"{directory}: a bank-mode plan: --obs-model bank --bank and "
+                         "--obs-tables are required (A_design_v5 3.4)")
+    if not is_bank(plan) and (bank or obs_tables or allow_synthetic):
+        raise SystemExit(f"{directory}: a planning-mode plan: --bank / --obs-tables / "
+                         "--allow-synthetic-bank are bank mode's only")
+    obs = load_model(bank, obs_tables, allow_synthetic, plan["scenarios"]) if is_bank(plan) else None
     D = data_from(graph_path, refs_path)
     expected = make_plan(
         D, graph_path, refs_path, plan["namespace"], plan["fit"],
         plan["scenarios"], plan["reps"], plan["options"], plan["cases"],
-        allow_toy=plan["toy"],
+        allow_toy=plan["toy"], obs=obs,
     )
     if rqlib.canonical(expected) != rqlib.canonical(plan):
         raise SystemExit("graph, references, sources, runtime or frozen recipe changed")
-    return D, plan
+    return D, plan, obs
+
+
+def verified(directory, graph_path, refs_path, bank=None, obs_tables=None, allow_synthetic=False):
+    """verified_model -> (D, plan)."""
+    return verified_model(directory, graph_path, refs_path, bank, obs_tables, allow_synthetic)[:2]
 
 
 def forward(v, data, fit, seed, option):
@@ -776,15 +883,9 @@ def task_name(task):
     return f"{case}.{scenario}.{rep:03d}.json"
 
 
-def observation_hashes(data):
-    out = {}
-    for key in ("eta", "inter", "cnt", "z", "s", "s0"):
-        value = np.ascontiguousarray(data[key], dtype="<f8")
-        out[key] = {
-            "shape": list(value.shape), "dtype": "<f8",
-            "sha256": rqlib.sha256_bytes(value.tobytes(order="C")),
-        }
-    return out
+# (A_design_v5 3.4 L779-787: moved to recovery.py, shared by every result: the fixed key list, the
+#  intended means mu_* in bank mode, the explicit absent-cnt record; this name is the same function)
+observation_hashes = rec.observation_hashes
 
 
 def retained_energy(D, data, keep):
@@ -801,20 +902,24 @@ def retained_energy(D, data, keep):
 
 
 def one(a):
-    D, plan = verified(a.dir, a.graph, a.references)
+    D, plan, obs = verified_model(a.dir, a.graph, a.references, *(obs_args(a) or ()))
     expected = {task_name(t): t for t in tasks(plan)}
     if a.task not in expected:
         raise SystemExit("task is not in the frozen schedule")
     case, scenario, rep = expected[a.task]
     seed = rqlib.derive_seed(plan["namespace"], "recovery", scenario, rep)
-    data = rec.simulate(D, rec.SCENARIOS[scenario], seed)
+    data = rec.simulate(D, rec.SCENARIOS[scenario], seed, obs=obs)     # (bank mode: v5 3.4, 3.5)
     keep, _, _ = mask_for(D, plan, case)
     result = {
         "schema": RESULT_SCHEMA,
         "plan_sha256": rqlib.canonical_sha(plan),
         "case": case, "scenario": scenario, "rep": rep, "seed": seed,
-        "noise_source": "scenario_planning_only",
-        "observations": observation_hashes(data),
+        # (A_design_v5 3.4, 4.1: the plan's labels and observation model; every result)
+        "noise_source": plan["noise_source"],
+        "accepting": plan["accepting"],
+        "observation_model_sha256": plan["inputs"]["observation_model_sha256"],
+        "noiseless": bool(rec.SCENARIOS[scenario].get("noiseless")),
+        "observations": rec.observation_hashes(data),
         "scheduled_energy": data["energy"],
         "retained_additive_projection_energy": retained_energy(D, data, keep),
         "options": {
@@ -822,6 +927,7 @@ def one(a):
             for op in plan["options"]
         },
     }
+    rec.check_observations(scenario, result, is_bank(plan), a.task)
     result = clean(result)
     result["body_sha256"] = rqlib.canonical_sha(result)
     directory = os.path.join(a.dir, "results")
@@ -857,6 +963,17 @@ def read_results(directory, plan):
             or value.get("body_sha256") != rqlib.canonical_sha(body)
         ):
             raise SystemExit(f"wrong identity, configuration or body hash: {name}")
+        # (A_design_v5 3.4 L835-861, 4.3: the plan's noise source and observation model; the
+        #  observations record of its mode, as recovery.check_result requires of a legacy result)
+        want = (plan["noise_source"], plan["accepting"], plan["inputs"]["observation_model_sha256"])
+        got = (value.get("noise_source"), value.get("accepting"), value.get("observation_model_sha256"))
+        if got != want or type(value.get("accepting")) is not bool:
+            raise SystemExit(f"{name}: a result of another noise source or observation model "
+                             f"(noise_source {got[0]!r}, the plan's {want[0]!r})")
+        try:
+            rec.check_observations(scenario, value, is_bank(plan), name)
+        except ValueError as e:
+            raise SystemExit(str(e))
         found[name] = value
     return found
 
@@ -898,8 +1015,9 @@ def termination_signals():
 def run(a):
     if a.jobs not in (1, 2):
         raise SystemExit("--jobs must be 1 or 2")
+    oa = obs_args(a)
     with locked(a.dir), termination_signals():
-        _, plan = verified(a.dir, a.graph, a.references)
+        _, plan = verified(a.dir, a.graph, a.references, *(oa or ()))
         found = read_results(a.dir, plan)
         pending = [task_name(t) for t in tasks(plan) if task_name(t) not in found]
         logdir = os.path.join(a.dir, "logs")
@@ -918,6 +1036,9 @@ def run(a):
                     ]
                     if a.references:
                         cmd += ["--references", a.references]
+                    if oa:      # (A_design_v5 3.4: the bank flags reach every worker)
+                        cmd += ["--obs-model", "bank", "--bank", oa[0], "--obs-tables", oa[1]]
+                        cmd += ["--allow-synthetic-bank"] if oa[2] else []
                     with open(os.path.join(logdir, task[:-5] + ".log"), "ab") as log:
                         # Do not deliver termination between spawning and tracking a child.
                         blocked = signal.pthread_sigmask(
@@ -1062,11 +1183,12 @@ def summarize(directory):
                 "wilson95": cell["wilson95"],
                 "pass": cell["completed"] == 20 and cell["successes"] >= 16,
             }
-    return {
+    out = {
         "schema": SUMMARY_SCHEMA,
         "plan_sha256": rqlib.canonical_sha(plan),
         "synthetic": True, "toy": plan["toy"],
         "noise_source": plan["noise_source"],
+        "accepting": plan["accepting"],         # (A_design_v5 3.4, 3.7)
         "scheduled_tasks": len(tasks(plan)),
         "completed_tasks": len(found),
         "complete": len(found) == len(tasks(plan)),
@@ -1076,14 +1198,29 @@ def summarize(directory):
             "core_pass": (
                 all(c["pass"] for c in checks.values()) if checks else None
             ),
-            "scope": CRITERION,
+            "scope": plan["criterion"],
             "sealing": "no automatic sealing or launch authorization",
         },
     }
+    if not is_bank(plan):                       # (a planning summary is never gate-2 evidence)
+        out["label"] = rec.PLANNING_LABEL
+    return out
+
+
+def obs_cli(p):
+    """--obs-model / --bank / --obs-tables (A_design_v5 3.4) and the test-only synthetic-bank flag."""
+    p.add_argument("--obs-model", choices=rec.OBS_MODELS, default="planning",
+                   help="planning (default: labelled non-accepting) or bank (the bank/D8 "
+                        "observation model; needs --bank and --obs-tables)")
+    p.add_argument("--bank", help="bank mode: the bank/3 artifact (bank_d8.json)")
+    p.add_argument("--obs-tables", help="bank mode: its observation tables (obs_tables.npz)")
+    p.add_argument("--allow-synthetic-bank", action="store_true",
+                   help="TEST ONLY: admit a synthetic bank (never accepting)")
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("prepare")
     p.add_argument("--graph", required=True)
@@ -1102,11 +1239,13 @@ def main(argv=None):
     p.add_argument("--center", choices=("references", "train_c"), default=None)
     p.add_argument("--allow-toy", action="store_true")
     p.add_argument("--out", required=True)
+    obs_cli(p)
     for name in ("run", "one"):
         p = sub.add_parser(name)
         p.add_argument("--dir", required=True)
         p.add_argument("--graph", required=True)
         p.add_argument("--references")
+        obs_cli(p)
         if name == "run":
             p.add_argument("--jobs", type=int, choices=(1, 2), default=2)
         else:
