@@ -360,6 +360,10 @@ the navigation comment added beside the implementation includes (comment only).
 | Map gate 8: page smoke | `node tools/ocean_render_perf/smoke.mjs --web http://localhost:8182 --root http://localhost:8183` | exit 0, **5/5** |
 | Map gate 7, remainder | the PR's CI: native serial/OpenMP/thread-pool, Classic module freshness/parity, engine identity base vs head and vs the pinned engine, Ocean module freshness + FAST parity + Turbo, web checks | see the PR's checks for the merged head |
 
-Each browser job took the machine-wide browser lock itself. Logs are kept
-outside the repository (`fish runs/ocean_handoff/splitA/gate8/`). After deploy,
+Only the smoke job takes the machine-wide browser lock itself
+(`tools/ocean_render_perf/smoke.mjs`); the render and body-GPU harnesses launch
+Brave directly. The three jobs ran one after another from one script, with no
+other browser job running (the previous deploy's live checks had finished at
+12:42 PM ET; these ran 1:09–1:21 PM ET). Logs are kept outside the repository
+(`fish runs/ocean_handoff/splitA/gate8/`). After deploy,
 the live checks (both hosts, Turbo, frame rate) run as for every deploy.
