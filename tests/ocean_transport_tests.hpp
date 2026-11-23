@@ -137,13 +137,13 @@ void testTransportState() {
             t.expect(same(Vec2{zero.cache.eddies[i].cx, zero.cache.eddies[i].cy}, centers[i]), "curAdvanced omitted at frame zero");
         // Both construction and assignment own all mutable storage. Mutate the
         // copies as well as checking addresses, including each depth piece.
-        auto checkCopy = [&](tr::FlowState copy) {
+        auto checkCopy = [&](tr::FlowState& copy, const char* operation) {
             auto independent = [&](auto& a, auto& b, const char* name) {
-                t.expect(!a.empty() && a.size() == b.size() && a.data() != b.data(), "%s aliases or was dropped", name);
+                t.expect(!a.empty() && a.size() == b.size() && a.data() != b.data(), "%s %s aliases or was dropped", operation, name);
                 if (!a.empty() && !b.empty()) {
                     const auto saved = b[0];
                     a[0] = std::remove_cv_t<decltype(saved)>{};
-                    t.expect(std::memcmp(&saved, &b[0], sizeof saved) == 0, "%s mutation reached owner", name);
+                    t.expect(std::memcmp(&saved, &b[0], sizeof saved) == 0, "%s %s mutation reached owner", operation, name);
                 }
             };
             independent(copy.cache.vort, future.cache.vort, "vort");
@@ -154,10 +154,12 @@ void testTransportState() {
             independent(ofp::field<pk::CfCenters>(copy.current), ofp::field<pk::CfCenters>(future.current), "current centers");
             const auto vort = future.current.vortexState();
             auto changed = copy.current.vortexState(); changed[0] += 1.0f;
-            t.expect(copy.current.restoreVortexState(changed) && future.current.vortexState() == vort, "current vortices shared");
+            t.expect(copy.current.restoreVortexState(changed) && future.current.vortexState() == vort, "%s current vortices shared", operation);
         };
-        checkCopy(future);
-        tr::FlowState assigned; assigned = future; checkCopy(assigned);
+        tr::FlowState constructed = future;
+        checkCopy(constructed, "construction");
+        tr::FlowState assigned; assigned = future;
+        checkCopy(assigned, "assignment");
     }
     // Preserve actual derived gyre values, even when different from config.
     // A reconstruction from params or vortices is NOT a copy of CurrentField.

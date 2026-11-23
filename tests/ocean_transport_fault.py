@@ -36,7 +36,7 @@ def plant(root, name):
         replace(transport, 'const Flow U = flowFast(state, params, targetFrame, f.pos, f.depth);',
                 'const Flow U = flowFast(state, params, targetFrame, f.pos, f.depth);\n'
                 '            if (U.x == 0 && U.y == 0 && U.d == 0) continue;')
-    elif name == 'shallow_yrot':
+    elif name in ('shallow_yrot', 'assignment_yrot'):
         flow = root / 'src/ocean/ocean_flow.hpp'
         replace(flow, '#include <vector>', '#include <vector>\n#include <memory>')
         replace(flow, 'struct FlowCache {', '''// Intentionally broken: copied mutable wave storage aliases the owner.
@@ -49,6 +49,14 @@ struct SharedYRot {
     TrigV& operator[](std::size_t i) const { return (*v)[i]; }
 };
 struct FlowCache {''')
+        if name == 'assignment_yrot':
+            # Construction remains deep: a by-value test helper would hide the
+            # assignment alias by constructing another independent copy.
+            replace(flow, '    void assign(std::size_t n, const TrigV& x)',
+                    '    SharedYRot() = default;\n'
+                    '    SharedYRot(const SharedYRot& x) : v(std::make_shared<std::vector<TrigV>>(*x.v)) {}\n'
+                    '    SharedYRot& operator=(const SharedYRot&) = default;\n'
+                    '    void assign(std::size_t n, const TrigV& x)')
         replace(flow, 'std::vector<TrigV> yRot;', 'SharedYRot yRot;')
     elif name.startswith('drop_gyre'):
         dropped = name.removeprefix('drop_') + '_'
@@ -97,7 +105,7 @@ def main():
     tracked = ['src/ocean/ocean_transport.hpp', 'src/ocean/ocean_world.hpp',
                'src/ocean/ocean_flow.hpp', 'src/core/current.hpp']
     original = {name: (source / name).read_bytes() for name in tracked}
-    mutants = ['live_frame', 'zero_e1', 'shallow_yrot', 'drop_gyreA', 'drop_gyreOmega',
+    mutants = ['live_frame', 'zero_e1', 'shallow_yrot', 'assignment_yrot', 'drop_gyreA', 'drop_gyreOmega',
                'drop_gyreT', 'waves_off', 'cur_advanced']
     if args.eye:
         mutants += ['eye_contrast']
@@ -119,6 +127,8 @@ def main():
         result = subprocess.run([str(out / 'tests'), '--only', 'transport'], capture_output=True, text=True)
         (out / f'{name}.log').write_text(result.stdout + result.stderr)
         fails = [line for line in result.stdout.splitlines() if line.startswith('FAIL ')]
+        if name == 'assignment_yrot' and not any('assignment yRot aliases' in line for line in fails):
+            raise RuntimeError('assignment mutant did not reach the direct assignment isolation check')
         want_fail = not name.startswith('clean_')
         if (want_fail and result.returncode == 1 and fails) or (not want_fail and result.returncode == 0 and not fails):
             print(f'{name}: exit {result.returncode}; ' + ('; '.join(fails) if fails else 'PASS'), flush=True)

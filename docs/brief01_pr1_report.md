@@ -96,3 +96,25 @@ Toolchain: GCC 15.2.0, Emscripten 6.0.4 (`fe5be6afdff43ad58860d821fcc8572a23f92d
 2. Generated ST module: `web/evo_ocean.js` and `web/evo_ocean.wasm`. Suggested subject: `wasm: rebuild Ocean after FlowState extraction`.
 
 The coordinator supplies the repository's required attribution trailer when committing. Do not commit `build_b01/`, other build outputs, or `dist/`; do not edit any pin file. Logs, reference documents, scripts and full trace outputs remain local under `build_b01/` for review.
+
+**Review round 1 (against committed `533a841`)**
+
+Both P3 findings are fixed. `checkCopy` now accepts `FlowState&`; an explicitly constructed copy tests construction, and the assigned object is inspected directly. Diagnostics identify the operation. The new `assignment_yrot` mutant preserves deep copy construction but shares mutable `yRot` storage on assignment. It compiled and failed `flow_state` (4/118 checks, first: `assignment yRot aliases or was dropped`); clean controls passed before and after. Disposable sources were restored, and all 77 C++ source files matched the current tree afterward.
+
+A whole-tree caller search, including `tools/` and `wasm/`, supported removing 28 unused private forwarders, their private vector alias, and the world's unused `kWallFoodMaxSubsteps`. Execution helpers and `kPiF` remain; both public sections are byte-identical to `533a841`. Audit logs: `build_b01/review_round1/{forwarder-usage,public-compatibility}.txt`.
+
+The requested gates passed in order. Commands ran at nice 19, with at most two jobs and four threads; Wasm shells sourced emsdk before setting the in-tree `EM_CACHE`, with native variables unset and `EMCC_CORES=1`. Logs below are under `build_b01/review_round1/`; exact commands/exits/durations are in `build_b01/gates.jsonl`.
+
+| Command / check | Result | Seconds | Log |
+|---|---|---:|---|
+| `python3 tests/ocean_transport_fault.py --only assignment_yrot --out build_b01/review_round1/mutation-plain` | exit 0; mutant caught, restored controls pass | 191.141 | `mutation-plain.log` |
+| `bash build_b01/review_round1/units.sh` | exit 0; 94 plain / 101 eye tests, native == Wasm full output | 1401.382 | `units.log` |
+| `FAST=1 JOBS=2 BUILD_JOBS=2 KEEP_OUT=1 bash wasm/ocean_parity.sh` | exit 0; 49/49 baselines, 15/15 appearance twins, 7/7 body twins, all guards, fixture and four unit runs | 1570.880 | `parity-fast-r2.log` |
+| `bash build_b01/review_round1/modules.sh` (two `build_ocean.sh` builds) | exit 0; both files repeat exactly and equal `533a841` | 40.578 | `modules.log` |
+| `node tests/ocean_turbo_handoff.js` | exit 0; 556/556 checks | 318.928 | `turbo.log` |
+| `python3 build_b01/review_round1/identity.py` (initial) | exit 1; own harness compared host timings on stderr | 125.374 | `identity.log` |
+| Same identity command, corrected once | exit 0; 10/29 workloads, 30,000 updates per revision | 290.289 | `identity-r2.log` |
+
+The earlier incomplete FAST log had no exit receipt and is not counted; the complete rerun is retained at `/tmp/ocean_parity.P46LE9`. The identity harness's first failure had identical deterministic stdout; only elapsed time and steps/second differed. One own-test correction normalizes those two stderr fields, retaining step/population counts and every other diagnostic. The rerun rebuilt BASE `e3c46ae` and the fixed worktree, compared full stdout from initialization and every step (`--trace`, no `--sparse`), and compared stderr with only timing normalized. All matched. Recipes/results/traces are retained beside the logs. Workloads: `def_s1`, `eddies_s11`, `e1_preset_s42`, `e1_live_s21`, `e1_gyre_s13`, `walls_e1_s42`, `walls_gyre_s13`, `walls_live_s21`, `eye_e1_capture_s17`, `eye_walls_e1_capture_s17`; these cover plain/eye, walls, E1 waves and deep current.
+
+Ocean JS/Wasm hashes remain the values recorded above; no generated artifact, pin or baseline change is needed. Proposed single coordinator commit: `ocean: check assignment isolation directly and remove unused private wrappers`, containing `src/ocean/ocean_world.hpp`, `tests/ocean_transport_tests.hpp`, `tests/ocean_transport_fault.py`, and this report, with the coordinator's attribution trailer. No commit was made.
