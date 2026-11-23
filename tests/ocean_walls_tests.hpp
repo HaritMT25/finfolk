@@ -638,6 +638,144 @@ void testWallTransport() {
     t.note("substeps vs n = 8 (20 calls of dt 0.16): n=1 %.2e, n=2 %.2e, n=4 %.2e units (mean)", e[0], e[1], e[2]);
 }
 
+// wallAdvect4 (four particles lane-wise) == wallAdvect per particle, bit for
+// bit: random points in the tank, points on the faces and outside (the folds'
+// other branches and the wave tables' exact fallback), four configs (eddies
+// with and without waves and the deep factor, the double gyre), substeps
+// 1, 2 and 16, after a few hundred steps of flow.
+void testWallAdvect4() {
+    Test t("wall_advect4");
+    static const char* cfgs[] = {
+        R"({"walls":true,"minPopulation":0,"targetFood":0,"foodSpawnBase":0,"foodSpawnAmp":0,"waveSpeed":20,"waveBand":24,"currentStrength":60,"currentEddies":8,"currentCore":120,"foodDrift":true})",
+        R"({"walls":true,"minPopulation":0,"targetFood":0,"foodSpawnBase":0,"foodSpawnAmp":0,"waveSpeed":6,"waveBand":32,"deepCurrent":true,"currentStrength":5,"currentEddies":5,"foodDrift":true})",
+        R"({"walls":true,"minPopulation":0,"targetFood":0,"foodSpawnBase":0,"foodSpawnAmp":0,"waveSpeed":0,"currentStrength":40,"currentEddies":3,"currentCore":60,"foodDrift":true})",
+        R"({"walls":true,"minPopulation":0,"targetFood":0,"foodSpawnBase":0,"foodSpawnAmp":0,"waveSpeed":9,"currentMode":1,"currentStrength":30,"deepCurrent":true,"foodDrift":true})",
+    };
+    const float W = 1920.0f, H = 1080.0f, D = 240.0f;
+    long lanes = 0, differ = 0;
+    for (int c = 0; c < 4; ++c) {
+        OceanWorld w;
+        std::string err;
+        if (!t.expect(ofp::initWorld(w, 2601 + c, 1920, 1080, 240.0f, 0, cfgs[c], err), "cfg %d: %s", c, err.c_str())) continue;
+        for (int s = 0; s < 150; ++s) w.update(0.016f);
+        (void)w.flowAt({1.0f, 1.0f}, 1.0f);   // the cache for this step
+        Lcg g(2700 + c);
+        static const float edgesX[] = {0.0f, 1920.0f, -3.0f, 1925.0f, 0.5f, 1919.5f, 4000.0f, -2000.0f};
+        static const float edgesD[] = {0.0f, 240.0f, -1.0f, 241.0f, 0.25f, 239.75f, 700.0f, -500.0f};
+        for (int trial = 0; trial < 400; ++trial) {
+            const int nStep = trial % 3 == 0 ? 1 : trial % 3 == 1 ? 2 : 16;
+            const float dt = trial % 5 == 4 ? 0.16f : 0.016f;
+            Vec2 p[4], q[4]; float d[4], e[4];
+            for (int l = 0; l < 4; ++l) {
+                p[l] = {W * g.unit(), H * g.unit()}; d[l] = D * g.unit();
+                if (trial % 4 == 1) { p[l].x = edgesX[(trial + l) % 8]; }
+                if (trial % 4 == 2) { p[l].y = edgesX[(trial + 3 * l) % 8] * (H / W); d[l] = edgesD[(trial + l) % 8]; }
+                q[l] = p[l]; e[l] = d[l];
+            }
+            w.wallAdvect4(p, d, dt, nStep);
+            for (int l = 0; l < 4; ++l) {
+                w.wallAdvect(q[l], e[l], dt, nStep);
+                ++lanes;
+                if (ofp::bits(p[l].x) != ofp::bits(q[l].x) || ofp::bits(p[l].y) != ofp::bits(q[l].y) || ofp::bits(d[l]) != ofp::bits(e[l])) ++differ;
+            }
+        }
+    }
+    t.expect(differ == 0 && lanes > 0, "%ld of %ld lanes differ from wallAdvect", differ, lanes);
+    t.note("%ld lanes, 4 configs, substeps 1 / 2 / 16", lanes);
+}
+
+// The production gather / scatter / live filter / remainder, against a scalar
+// loop over the original items. Reuse the world as live counts grow and shrink
+// so stale scratch indices also fail. Dead sentinels must remain untouched.
+void testWallTransportFood() {
+    Test t("wall_transport_food");
+    const char* cfgs[] = {
+        R"({"walls":true,"foodDrift":true,"currentMode":1,"currentStrength":30,"currentDrift":0,"currentGyreEps":0,"waveSpeed":0,"minPopulation":0,"targetFood":0,"foodSpawnBase":0,"foodSpawnAmp":0})",
+        R"({"walls":true,"foodDrift":true,"currentStrength":60,"deepCurrent":true,"waveSpeed":20,"waveBand":24,"minPopulation":0,"targetFood":0,"foodSpawnBase":0,"foodSpawnAmp":0})",
+    };
+    const float dt = 0.016f;
+    {
+        // The reported five-item regression through update itself (no fish,
+        // waves or spawning): the fifth item must move just like the first four.
+        OceanWorld w;
+        std::string err;
+        if (t.expect(ofp::initWorld(w, 2752, 1920, 1080, 240.0f, 0, cfgs[0], err), "%s", err.c_str())) {
+            OceanFood f;
+            f.pos = {480, 270}; f.depth = 120.0f;
+    #ifdef EVO_OCEAN_EYE
+            f.eyeCon = ocean::eyeContrast(ocean::kEyeFoodBright, f.depth);
+    #endif
+            w.food.assign(5, f);
+            w.update(dt);
+            const auto fs = w.wallFoodStepsNow(dt);
+            w.wallAdvect(f.pos, f.depth, fs.dt, fs.n);   // this step's frozen flow
+            t.expect(ofp::bits(f.pos.x) != ofp::bits(480.0f) || ofp::bits(f.pos.y) != ofp::bits(270.0f),
+                     "five-item fixture has no horizontal motion");
+            t.expect(w.food.size() == 5, "five-item fixture: %zu items after update", w.food.size());
+            for (std::size_t i = 0; i < w.food.size(); ++i)
+                t.expect(ofp::bits(w.food[i].pos.x) == ofp::bits(f.pos.x) &&
+                         ofp::bits(w.food[i].pos.y) == ofp::bits(f.pos.y) && ofp::bits(w.food[i].depth) == ofp::bits(f.depth),
+                         "update: item %zu differs from scalar transport", i);
+        }
+    }
+    long depthBatch = 0, depthTail = 0;
+    for (int c = 0; c < 2; ++c) {
+        OceanWorld w;
+        std::string err;
+        if (!t.expect(ofp::initWorld(w, 2750 + c, 1920, 1080, 240.0f, 0, cfgs[c], err),
+                      "cfg %d: %s", c, err.c_str())) continue;
+        (void)w.flowAt({480, 270}, 120.0f);   // prepare the frozen flow, as update does
+        const auto fs = w.wallFoodStepsNow(dt);
+        for (int trial = 0; trial < 16; ++trial) {
+            const int live = trial < 8 ? trial : 15 - trial;
+            w.food.clear();
+            for (int i = 0; i < 2 * live + 1; ++i) {
+                OceanFood f;
+                f.alive = i % 2 != 0;
+                f.pos = {480.0f + 37.0f * i, 270.0f + 19.0f * i};
+                f.depth = 12.0f + 9.0f * i;
+#ifdef EVO_OCEAN_EYE
+                // Sentinel contrasts also catch an unconditional refresh when
+                // depth stays fixed, and any refresh of a dead item.
+                f.eyeCon = -0.25f - 0.01f * i;
+#endif
+                w.food.push_back(f);
+            }
+            auto expected = w.food;
+            int lane = 0;
+            for (OceanFood& f : expected) {
+                if (!f.alive) continue;
+                const float z0 = f.depth;
+                w.wallAdvect(f.pos, f.depth, fs.dt, fs.n);
+                if (f.depth != z0) {
+                    if (lane < (live & ~3)) ++depthBatch;
+                    else ++depthTail;
+#ifdef EVO_OCEAN_EYE
+                    f.eyeCon = ocean::eyeContrast(ocean::kEyeFoodBright, f.depth);
+#endif
+                }
+                ++lane;
+            }
+            const RandomGen before = rng;
+            (w.*member(ofp::peek::OwWallTransportFood{}))(dt);
+            t.expect(sameEngine(before, rng) && w.food.size() == expected.size(),
+                     "cfg %d live %d: transport changed rng or item count", c, live);
+            for (std::size_t i = 0; i < expected.size(); ++i) {
+                const OceanFood &a = w.food[i], &b = expected[i];
+                bool same = a.alive == b.alive && ofp::bits(a.pos.x) == ofp::bits(b.pos.x) &&
+                            ofp::bits(a.pos.y) == ofp::bits(b.pos.y) && ofp::bits(a.depth) == ofp::bits(b.depth);
+#ifdef EVO_OCEAN_EYE
+                same = same && ofp::bits(a.eyeCon) == ofp::bits(b.eyeCon);
+#endif
+                t.expect(same, "cfg %d live %d item %zu (%s): differs from scalar transport", c, live, i,
+                         b.alive ? "live" : "dead");
+            }
+        }
+    }
+    t.expect(depthBatch > 0 && depthTail > 0, "depth-changing coverage: batch %ld, tail %ld", depthBatch, depthTail);
+
+}
+
 // Waves off with walls: the per-train readers give exact zeros (never NaN),
 // before the trains were ever prepared (waveSpeed 0 from init: a pair's |K|² is
 // 0 there) and after the waves ran and stopped; reading them changes nothing.
