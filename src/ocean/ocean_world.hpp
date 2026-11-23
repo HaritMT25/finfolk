@@ -1242,6 +1242,16 @@ private:
     void refillPredators();
 };
 
+// Out-of-class member definitions, by topic. They need the complete class above, so they are
+// included here and nowhere else (each is #pragma once and includes nothing itself):
+//   ocean_world_util.hpp   non-finite checks, removedDead, radiusError, wraps, depthStats, dist2
+//   ocean_walls.hpp        wallAvoid, wallContact, containBody, wallPatchDraw
+//   ocean_eye.hpp          the eye's sector / see / write helpers (EVO_OCEAN_EYE)
+//   ocean_side_tracks.hpp  appearance and body-plan side tracks
+//   ocean_sensing.hpp      computeSensors and the sensing pass
+//   ocean_predators.hpp    scripted-predator stepping
+// OceanFood / OceanPredator live in ocean_entities.hpp (included above the class); the flow state
+// and food transport live in ocean_transport.hpp.
 #include "ocean_world_util.hpp"
 #include "ocean_walls.hpp"
 #include "ocean_eye.hpp"

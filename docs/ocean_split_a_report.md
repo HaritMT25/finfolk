@@ -5,9 +5,12 @@ Base: `c5b6b42ac0bbb8b585423a579aebaf69083b0c61`, tree
 The pristine `build_splitA/base/` copy matched all 443 available tracked files
 before extraction. Changes are uncommitted for the coordinator.
 
-Gates 1–8 are complete. The extraction and gates 1–4 were retained from
-the earlier run; no production source or existing test was changed during this
-continuation.
+Status: the builder ran the move map's gates 1–7 on the server, except gate 7's
+SFML-dependent Classic checks, plus the performance comparison (gate 9); its
+"gate 8" below is that performance report. The map's **browser gate 8** and the
+rest of gate 7 were run afterwards by the coordinator; see "Coordinator gates"
+at the end. The extraction and gates 1–4 were retained from the earlier run; no
+production source or existing test was changed during this continuation.
 All 352 recorded source/test/tool hashes still match the handoff. The saved gate 5
 and production rebuild receipts were independently checked before continuing.
 All changes remain uncommitted. Commands and wall times are recorded in
@@ -341,3 +344,22 @@ not establish a general speedup or regression across other workloads.
 The coordinator supplies the required attribution trailer. Local scripts, caches,
 logs, binaries and traces under `build_splitA/`, plus `dist/` and `node_modules/`,
 are excluded from the commits.
+
+## Coordinator gates (laptop, 2026-11-23)
+
+These ran after review round 1 (Codex rev98: extraction independently verified;
+one P2, which was this report claiming gates 1–8 before the browser gate had run).
+They used the branch with main 294fc8b merged in (#94, #97; no file overlap) and
+the navigation comment added beside the implementation includes (comment only).
+
+| Gate | Command | Result |
+|---|---|---|
+| Independent module freshness | `bash wasm/build_ocean.sh` (laptop `~/emsdk`, Emscripten 6.0.4 fe5be6af), before and after the comment | `web/evo_ocean.wasm` and `web/evo_ocean.js` byte-identical to the committed server build (`e55a4fcb…`, `8bdce72b…`) both times |
+| Map gate 8: render correctness | `node tests/ocean_render_browser.mjs --base http://localhost:8182 --parts correctness,faults,slots,noperf,missing,timer,beam,iframe,gate` (headless Brave, Intel Iris Xe, D3D11; `web/` served by `wasm/serve.py`) | exit 0, **137/137** checks |
+| Map gate 8: body GPU | `node tests/ocean_body_gpu.mjs --base http://localhost:8183 --page /web/ocean_bodyplan.html` (repository root served) | exit 0, **20/20**: "BODY GPU CHECK: all passed" |
+| Map gate 8: page smoke | `node tools/ocean_render_perf/smoke.mjs --web http://localhost:8182 --root http://localhost:8183` | exit 0, **5/5** |
+| Map gate 7, remainder | the PR's CI: native serial/OpenMP/thread-pool, Classic module freshness/parity, engine identity base vs head and vs the pinned engine, Ocean module freshness + FAST parity + Turbo, web checks | see the PR's checks for the merged head |
+
+Each browser job took the machine-wide browser lock itself. Logs are kept
+outside the repository (`fish runs/ocean_handoff/splitA/gate8/`). After deploy,
+the live checks (both hosts, Turbo, frame rate) run as for every deploy.
