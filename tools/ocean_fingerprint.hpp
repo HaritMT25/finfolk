@@ -169,12 +169,13 @@ struct Expose { friend constexpr auto member(Tag) noexcept { return M; } };
     struct NAME { friend constexpr auto member(NAME) noexcept; };        \
     template struct Expose<NAME, &CLASS::FIELD>;                         \
     }
-OFP_PEEK(OwCurrent, OceanWorld, current_)
+OFP_PEEK(OwFlowState, OceanWorld, flowState_)
+// Keep the existing test/harness tags while storage moves into FlowState.
+namespace ofp::peek { struct OwCurrent {}; struct OwWaves {}; }
 OFP_PEEK(OwPatches, OceanWorld, foodPatches_)
 OFP_PEEK(OwPatchDepth, OceanWorld, foodPatchDepth_)
 OFP_PEEK(OwCreatureGrid, OceanWorld, creatureGrid_)
 OFP_PEEK(OwFoodGrid, OceanWorld, foodGrid_)
-OFP_PEEK(OwWaves, OceanWorld, waves_)
 OFP_PEEK(OwHot, OceanWorld, hot_)
 OFP_PEEK(CfMode, CurrentField, mode_)
 OFP_PEEK(CfCenters, CurrentField, centers_)
@@ -211,7 +212,11 @@ namespace ofp {
 // The private member `Tag` names, of obj (const in, const out; tests that bump
 // private state pass a non-const object).
 template <class Tag, class T>
-constexpr decltype(auto) field(T& obj) { return (obj.*member(Tag{})); }
+constexpr decltype(auto) field(T& obj) {
+    if constexpr (std::is_same_v<Tag, peek::OwCurrent>) return (field<peek::OwFlowState>(obj).current);
+    else if constexpr (std::is_same_v<Tag, peek::OwWaves>) return (field<peek::OwFlowState>(obj).waves);
+    else return (obj.*member(Tag{}));
+}
 
 // ---- tripwires ----------------------------------------------------------------
 namespace detail {
@@ -261,6 +266,11 @@ struct OceanFoodGrid_ {   // the entries (x .. index) are scratch
 struct CurrentField_ { CurrentField::Mode m; std::vector<int> vort, centers; float s, core; int w, h; float eps, om, a, t; };
 struct Mt_ { std::uint32_t x[624]; int p; };
 struct WaveTrain_ { double kx, ky, phase, phi; float k, qx, qy, frac; };
+struct FlowState_ {
+    CurrentField current;
+    WaveTrain_ waves[OceanWorld::kWaveTrains];
+    oceanflow::FlowCache cache;   // derived scratch, unchanged by extraction
+};
 struct FishHot_ {
     Vec2 pos, vel; float depth;
 #ifdef EVO_OCEAN_EYE
@@ -281,14 +291,12 @@ struct OceanWorld_ : WorldCommon {
     std::vector<Pending_> pending;
     std::vector<int> neighbors, nearbyFood, nearby, near;
     std::vector<int> foodSeen;   // scratch (see above)
-    CurrentField current; std::vector<Vec2> patches; std::vector<float> patchDepth;
+    FlowState_ flowState; std::vector<Vec2> patches; std::vector<float> patchDepth;
     std::vector<appearance::Record> app; std::uint64_t appKey; int appFlags; bool appBroken; appearance::Stats appStats;
     std::vector<std::uint64_t> bodyOwners; std::vector<physical::Genes> bodyGenes;
     std::vector<bodyplan::BirthCoefficients> bodyBirth;
     std::uint64_t bodyKey, bodyRevision, bodyUncompiled;   // bodyRevision: the exports' change counter (not hashed)
     physical::Stats bodyStats; bool bodyFlag, bodyBroken;
-    WaveTrain_ waves[OceanWorld::kWaveTrains];
-    oceanflow::FlowCache flow;   // scratch (see above)
 #ifdef EVO_OCEAN_EYE
     std::vector<float> predCon;  // scratch (see above)
 #endif
@@ -298,6 +306,9 @@ static_assert(sizeof(SignalGrid) == sizeof(mirror::SignalGrid_), "SignalGrid's m
 static_assert(sizeof(SpatialGrid) == sizeof(mirror::SpatialGrid_), "SpatialGrid's members changed: update hashGrid and mirror::SpatialGrid_");
 static_assert(sizeof(OceanFoodGrid) == sizeof(mirror::OceanFoodGrid_), "OceanFoodGrid's members changed: update hashGrid and mirror::OceanFoodGrid_");
 static_assert(sizeof(CurrentField) == sizeof(mirror::CurrentField_), "CurrentField's members changed: update hashCurrent and mirror::CurrentField_");
+static_assert(sizeof(oceantransport::WaveTrain) == sizeof(mirror::WaveTrain_) &&
+              sizeof(oceantransport::FlowState) == sizeof(mirror::FlowState_),
+              "FlowState's members changed: update hashCurrent/hashGeometry and mirror::FlowState_");
 static_assert(sizeof(PortableMT19937) == sizeof(mirror::Mt_) && sizeof(RandomGen) == sizeof(mirror::Mt_),
               "the rng engine's members changed: update hashRng and mirror::Mt_");
 // hot_ is a vector (its size does not show in OceanWorld's): its element is checked on its own.

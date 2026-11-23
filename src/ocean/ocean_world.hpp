@@ -255,7 +255,7 @@
 #include "../core/world.hpp"   // SignalGrid, MAX_TOPOLOGICAL_NEIGHBORS, and through it the
                                // kernel, WorldCommon, SpatialGrid, CurrentField, Predator
 #include "ocean_config.hpp"
-#include "ocean_flow.hpp"
+#include "ocean_transport.hpp"
 #include "ocean_math.hpp"
 #include "fish.hpp"
 #include "appearance_model.hpp"
@@ -571,18 +571,7 @@ public:
     //     loops was exact too, so this equals them there as well (pinned by
     //     tests/ocean_tests.cpp testWrap); a non-finite v gives NaN, not a hang.
     // The bounded configs (ocean_config.hpp) keep every caller in the first case.
-    static float wrapCoord(float v, float span) {
-        if (v >= -span && v < 2.0f * span) {
-            if (v < 0.0f) v += span;
-            if (v >= span) v -= span;
-            return v;
-        }
-        float r = std::fmod(v, span);   // exact; the sign of v, |r| < span
-        if (r < 0.0f) r += span;        // the loops' last add
-        else if (r == 0.0f) r = 0.0f;   // -0 -> +0, as that add gives
-        if (r >= span) r -= span;
-        return r;
-    }
+    static float wrapCoord(float v, float span) { return oceantransport::wrapCoord(v, span); }
     // The preview's single-pass wrap of food and predators (`if (v < 0) v +=
     // span; else if (v >= span) v -= span;`), exactly as it was for every v in
     // [-span, 2·span) — an add that rounds up still leaves span there, as it
@@ -590,32 +579,32 @@ public:
     // outside the world (100 eddies at strength 1000 in a 100-wide world move
     // food ~150 in a step). The bounded cases never go further out: their
     // results are unchanged.
-    static float wrapPreview(float v, float span) {
-        if (v < -span || v >= 2.0f * span) return wrapCoord(v, span);
-        if (v < 0.0f) v += span;
-        else if (v >= span) v -= span;
-        return v;
-    }
-    float clampDepth(float z) const { return std::clamp(z, 0.0f, D); }
+    static float wrapPreview(float v, float span) { return oceantransport::wrapPreview(v, span); }
+    float clampDepth(float z) const { return oceantransport::clampDepth(flowState_, transportParams(), frame, z); }
 
     // ---- E1: flow and light ------------------------------------------------
-    struct Flow { float x = 0.0f, y = 0.0f, d = 0.0f; };   // d: + = sinking
+    oceantransport::TransportParams transportParams() const {
+        return {.width = width, .height = height, .D = D,
+                .currentCore = cfg.currentCore, .currentDrift = cfg.currentDrift,
+                .currentEddies = cfg.currentEddies, .currentGyreEps = cfg.currentGyreEps,
+                .currentMode = cfg.currentMode, .currentStrength = cfg.currentStrength,
+                .deepCurrent = ocfg.deepCurrent, .foodDrift = cfg.foodDrift,
+                .toroidal = cfg.toroidal, .walls = ocfg.walls,
+                .waveBand = ocfg.waveBand, .waveGravity = ocfg.waveGravity,
+                .waveSpeed = ocfg.waveSpeed};
+    }
+    using Flow = oceantransport::Flow;   // d: + = sinking
+    using FoodSteps = oceantransport::FoodSteps;
 
-    static constexpr int kWaveTrains = 3;
-    bool wavesOn() const { return ocfg.waveSpeed > 0.0f; }
+    static constexpr int kWaveTrains = oceantransport::kWaveTrains;
+    bool wavesOn() const { return oceantransport::wavesOn(flowState_, transportParams(), frame); }
     // The 3-D flow replaces the preview's horizontal current (food, predators,
     // fish, the CURRENT sensors). Off: the preview's blocks run unchanged.
-    bool flowE1() const { return wavesOn() || ocfg.deepCurrent; }
+    bool flowE1() const { return oceantransport::flowE1(flowState_, transportParams(), frame); }
 
     // smoothstep S(r) = 3r² − 2r³ on r clamped to [0, 1], and dS/dr.
-    static float smooth01(float r) {
-        r = std::clamp(r, 0.0f, 1.0f);
-        return r * r * (3.0f - 2.0f * r);
-    }
-    static float smooth01d(float r) {
-        r = std::clamp(r, 0.0f, 1.0f);
-        return 6.0f * r * (1.0f - r);
-    }
+    static float smooth01(float r) { return oceantransport::smooth01(r); }
+    static float smooth01d(float r) { return oceantransport::smooth01d(r); }
 
     // The flow at (p, depth d), units/s. Divergence-free:
     //  * the current C(p) (CurrentField, 2-D, from streamfunctions), times
@@ -640,96 +629,23 @@ public:
     // wall-compatible one (wallFlowFast / wallFlowExact below: standing-mode
     // pairs, a tapered streamfunction current); off, the branches below run
     // as they did.
-    Flow flowAt(Vec2 p, float d) const {
-        if (ocfg.walls) { ensureFlow(); return wallFlowFast(p, d); }
-        if (!flowE1()) return flowExactAt(p, d);
-        ensureFlow();
-        return flowFast(p, d);
-    }
-    Flow flowExactAt(Vec2 p, float d) const {
-        if (ocfg.walls) { ensureFlow(); return wallFlowExact(p, d); }
-        Flow U = currentFlowExactAt(p, d);
-        if (wavesOn()) {
-            ensureWaves();   // (waves switched on by a direct config change, nothing read since)
-            const Taper tp = taperAt(d);
-            for (int i = 0; i < kWaveTrains; ++i) {
-                const Flow u = waveTrainExactAt(i, p, d, tp);
-                U.x += u.x;
-                U.y += u.y;
-                U.d += u.d;
-            }
-        }
-        return U;
-    }
+    Flow flowAt(Vec2 p, float d) const { return oceantransport::flowAt(flowState_, transportParams(), frame, p, d); }
+    Flow flowExactAt(Vec2 p, float d) const { return oceantransport::flowExactAt(flowState_, transportParams(), frame, p, d); }
 
     // flowAt's parts (public for the divergence probes in tests/ocean_tests.cpp).
     // The current, weighted by f(d) with deepCurrent; no vertical part.
-    Flow currentFlowAt(Vec2 p, float d) const {
-        if (ocfg.walls) { ensureFlow(); return wallCurrentFlow(p, d); }
-        if (!flowE1()) return currentFlowExactAt(p, d);
-        ensureFlow();
-        return currentFlowFast(p, d);
-    }
-    Flow currentFlowExactAt(Vec2 p, float d) const {
-        Flow U;
-        if (current_.active()) {
-            const Vec2 c = current_.velocityAt(p);
-            const float f = ocfg.deepCurrent ? smooth01(2.0f * d / D) : 1.0f;
-            U.x = f * c.x;
-            U.y = f * c.y;
-        }
-        return U;
-    }
+    Flow currentFlowAt(Vec2 p, float d) const { return oceantransport::currentFlowAt(flowState_, transportParams(), frame, p, d); }
+    Flow currentFlowExactAt(Vec2 p, float d) const { return oceantransport::currentFlowExactAt(flowState_, transportParams(), frame, p, d); }
     // The trains' shared depth taper B = S(d/b)·S((D−d)/b) and its d-derivative.
-    struct Taper { float B, Bp; };
-    Taper taperAt(float d) const {
-        const float b = std::min(ocfg.waveBand, 0.25f * D);
-        const float r1 = d / b, r2 = (D - d) / b;
-        const float s1 = smooth01(r1), s2 = smooth01(r2);
-        Taper tp;
-        tp.B = s1 * s2;
-        tp.Bp = (smooth01d(r1) * s2 - s1 * smooth01d(r2)) / b;
-        return tp;
-    }
+    using Taper = oceantransport::Taper;
+    Taper taperAt(float d) const { return oceantransport::taperAt(flowState_, transportParams(), frame, d); }
     // Wave train i alone (whatever waveSpeed is; 0 gives zero flow — so do
     // trains never prepared, which only a world whose waves were never on has).
     // With walls, waves off return exact zeros before anything is read (the
     // pairs divide by |K|², 0 in trains never prepared: 0·inf was NaN).
-    Flow waveTrainAt(int i, Vec2 p, float d) const {
-        if (ocfg.walls) {
-            if (!wavesOn()) return Flow{};
-            ensureFlow();
-            Flow u[kWaveTrains];
-            return wallWavesTable(p, d, u) ? u[i] : wallTrainExactAt(i, p, d);
-        }
-        if (!flowE1()) return waveTrainExactAt(i, p, d);
-        ensureFlow();
-        return waveTrainFast(i, p, d);
-    }
-    Flow waveTrainExactAt(int i, Vec2 p, float d) const {
-        if (ocfg.walls) return wallTrainExactAt(i, p, d);
-        ensureWaves();
-        return waveTrainExactAt(i, p, d, taperAt(d));
-    }
-    Flow waveTrainExactAt(int i, Vec2 p, float d, const Taper& tp) const {
-        ensureWaves();   // public: it may be the first reader after the waves came on directly
-        const WaveTrain& t = waves_[i];
-        const float B = tp.B, Bp = tp.Bp;
-        const float A = t.frac * ocfg.waveSpeed;
-        // e^{−kd} as 1 / e^{kd}: full relative precision at depth, where
-        // expm1f(−kd) + 1 would keep only ~1e-7 absolute (e^{kd} = inf -> 0).
-        const float E = 1.0f / (evomath::expm1f(t.k * d) + 1.0f);
-        double th = t.kx * (double)p.x + t.ky * (double)p.y - t.phase + t.phi;
-        th -= kTwoPi * std::floor(th / kTwoPi);
-        const float tf = (float)th;
-        const float sn = evomath::sinf(tf), cs = evomath::cosf(tf);
-        const float uh = A * E * (B - Bp / t.k) * cs;
-        Flow u;
-        u.x = t.qx * uh;
-        u.y = t.qy * uh;
-        u.d = -A * E * B * sn;
-        return u;
-    }
+    Flow waveTrainAt(int i, Vec2 p, float d) const { return oceantransport::waveTrainAt(flowState_, transportParams(), frame, i, p, d); }
+    Flow waveTrainExactAt(int i, Vec2 p, float d) const { return oceantransport::waveTrainExactAt(flowState_, transportParams(), frame, i, p, d); }
+    Flow waveTrainExactAt(int i, Vec2 p, float d, const Taper& tp) const { return oceantransport::waveTrainExactAt(flowState_, transportParams(), frame, i, p, d, tp); }
 
     // Light at depth d (display only in E1): L0·exp(−kWater·d), the exp taken
     // directly (oceanmath::expf: full relative precision at every depth). It
@@ -738,9 +654,9 @@ public:
     float lightAt(float d) const { return ocfg.L0 * oceanmath::expf(-ocfg.kWater * d); }
 
     // A wave train's travelled phase φ(t) in [0, 2π) (state; 0 until waves run).
-    double wavePhase(int i) const { return waves_[i].phase; }
+    double wavePhase(int i) const { return flowState_.waves[i].phase; }
     bool waveClockStarted() const {
-        for (const WaveTrain& t : waves_) if (t.phase != 0.0) return true;
+        for (const WaveTrain& t : flowState_.waves) if (t.phase != 0.0) return true;
         return false;
     }
 
@@ -759,10 +675,10 @@ public:
 
         CurrentField::Mode cmode = (cfg.currentMode == 1) ? CurrentField::Mode::Gyre
                                                            : CurrentField::Mode::Eddies;
-        current_.init(cmode, w, h, cfg.currentEddies, cfg.currentStrength,
+        flowState_.current.init(cmode, w, h, cfg.currentEddies, cfg.currentStrength,
                       cfg.currentCore, cfg.currentDrift, cfg.currentGyreEps);
         initFlowCache();
-        for (WaveTrain& t : waves_) t = WaveTrain{};   // unprepared (a reused world too)
+        for (WaveTrain& t : flowState_.waves) t = WaveTrain{};   // unprepared (a reused world too)
         ensureWaves();                                 // prepared now only if the waves are on
         foodPatches_.clear();
         foodPatchDepth_.clear();
@@ -834,44 +750,10 @@ public:
         appearanceCheck();   // the side array still matches `creatures` (else it is dropped)
         bodyPlanCheck();     // the body-plan arrays too (and appearance still on)
 
-        current_.advance(frame);
-        flow_.curAdvanced = true;
-        if (wavesOn()) {   // the wave clock runs only while waves are on
-            ensureWaves();   // switched on live since the last step: the modes first
-            advanceWaves(dt);
-        }
-
-        if (ocfg.walls) {
-            ensureFlow();   // the cache for this frame / phase (read by every wall evaluator below)
-            // Glass walls: food rides the wall flow by the mirror-folding midpoint transport.
-            if (cfg.foodDrift && wallFlowOn()) wallTransportFood(dt);
-        } else if (flowE1()) {
-            ensureFlow();   // the E1 cache, for this frame / phase / config (read by every flowFast below)
-            // E1: food rides the 3-D flow (depth too), sampled where it is.
-            if (cfg.foodDrift) {
-                for (auto& f : food) {
-                    if (!f.alive) continue;
-                    const Flow U = flowFast(f.pos, f.depth);
-                    f.pos.x = wrapCoord(f.pos.x + U.x * dt, (float)width);
-                    f.pos.y = wrapCoord(f.pos.y + U.y * dt, (float)height);
-#ifdef EVO_OCEAN_EYE
-                    const float z0 = f.depth;
-#endif
-                    f.depth = clampDepth(f.depth + U.d * dt);
-#ifdef EVO_OCEAN_EYE
-                    if (f.depth != z0) f.eyeCon = ocean::eyeContrast(ocean::kEyeFoodBright, f.depth);   // no draws
-#endif
-                }
-            }
-        } else if (cfg.foodDrift && current_.active()) {
-            for (auto& f : food) {
-                if (!f.alive) continue;
-                Vec2 v = current_.velocityAt(f.pos);
-                f.pos.x += v.x * dt;  f.pos.y += v.y * dt;
-                f.pos.x = wrapPreview(f.pos.x, (float)width);
-                f.pos.y = wrapPreview(f.pos.y, (float)height);
-            }
-        }
+        oceantransport::advanceFlowClock(flowState_, transportParams(), frame, dt);
+        const auto params = transportParams();
+        if (params.walls || oceantransport::flowE1(flowState_, params, frame)) ensureFlow();
+        transportFood(dt);
 
         // Every item is alive here (the last step erased the dead ones), so
         // food.size() - expiredNow is the live stock the spawn cap counts.
@@ -1025,16 +907,11 @@ public:
     } oprof;
 #endif
 
-    bool currentActive() const { return current_.active(); }
+    bool currentActive() const { return oceantransport::currentActive(flowState_, transportParams(), frame); }
     // The 2-D current the step uses: while flowE1() with eddies, the Ocean's
     // evaluator (ocean_flow.hpp); otherwise CurrentField's own.
-    Vec2 currentAt(Vec2 p) const {
-        if (ocfg.walls) { ensureFlow(); return wallCurrent(p); }   // glass walls: the tapered current
-        if (!flowE1() || !flow_.curOn) return current_.velocityAt(p);
-        ensureFlow();
-        return eddyVelocity(p);
-    }
-    Vec2 currentExactAt(Vec2 p) const { return current_.velocityAt(p); }   // CurrentField's own (tests)
+    Vec2 currentAt(Vec2 p) const { return oceantransport::currentAt(flowState_, transportParams(), frame, p); }
+    Vec2 currentExactAt(Vec2 p) const { return oceantransport::currentExactAt(flowState_, transportParams(), frame, p); }   // CurrentField's own (tests)
 
     // Mean and SD of the live fish's depth, and the fraction per depth eighth
     // (surface first). Read-only.
@@ -1241,11 +1118,11 @@ private:
     SpatialGrid creatureGrid_;
     OceanFoodGrid foodGrid_;   // SpatialGrid's layout and queries + each item's depth / size / eyeCon
     std::vector<FishHot> hot_;
-    std::vector<int> advectIdx_;   // wallTransportFood's live items, reused
+    std::vector<int> advectIdx_;   // transportFood's live items, reused
     std::vector<PendingSignal> pending_;
     std::vector<int> neighbors_, nearbyFood_, nearby_, near_;
     std::vector<FoodSeen> foodSeen_;   // foodWithin's list (scratch, one fish at a time)
-    CurrentField current_;
+    oceantransport::FlowState flowState_;
     std::vector<Vec2> foodPatches_;
     std::vector<float> foodPatchDepth_;   // foodDepthMode 1: one depth per patch
     // The appearance genome (see the header comment). Hashed in the harness's
@@ -1267,670 +1144,17 @@ private:
     bool bodyFlag_ = false;                                 // OceanConfig::bodyPlanPreviewEnabled at init
     bool bodyBroken_ = false;                               // the arrays lost their owners (dropped)
 
-    // E1 wave trains: fixed modes over the world (no draws). kx, ky = K
-    // (double, for θ); k, q = |K|, K/|K|; phase = the travelled ∫ω dt, kept in
-    // [0, 2π) (the only wave state that changes); ω = sqrt(waveGravity·k) is
-    // read fresh each step, so a live waveGravity change is smooth.
-    //
-    // Prepared lazily: the modes (and the flow cache's wave part) are set the
-    // first time the waves are on — at init, at the start of a step, or in a
-    // flow reader after a direct config change (the driver's --set, the tests)
-    // — and kept from then on; a world whose waves were never on keeps the
-    // unprepared defaults below (frac 0: no amplitude), which is what its geo
-    // section hashes. Invariant: wavesOn() => wavesPrepared() wherever the
-    // waves are evaluated. The modes depend on the world size alone (and phase
-    // is 0 until the clock first runs), so preparing late gives the trains
-    // they would have had from init: only the geo hash of the steps before
-    // differs. `mutable` for the const readers (ensureFlow); the clock
-    // (advanceWaves) runs only in update.
-    static constexpr double kTwoPi = 6.283185307179586;
-    struct WaveTrain {
-        double kx = 0.0, ky = 0.0, phase = 0.0, phi = 0.0;
-        float k = 1.0f, qx = 1.0f, qy = 0.0f, frac = 0.0f;
-    };
-    mutable WaveTrain waves_[kWaveTrains];
+    // Flow state lives in oceantransport; retain only the private entry points
+    // used by world initialization and execution. Public readers forward above.
+    using WaveTrain = oceantransport::WaveTrain;
+    void ensureWaves() const { oceantransport::ensureWaves(flowState_, transportParams(), frame); }
+    void initFlowCache() { oceantransport::initFlowCache(flowState_, transportParams(), frame); }
+    void ensureFlow() const { oceantransport::ensureFlow(flowState_, transportParams(), frame); }
+    Flow flowFast(Vec2 p, float d) const { return oceantransport::flowFast(flowState_, transportParams(), frame, p, d); }
+    Flow flowStep(Vec2 p, float d) const { return oceantransport::flowStep(flowState_, transportParams(), frame, p, d); }
+    Flow wallFlowFast(Vec2 p, float d) const { return oceantransport::wallFlowFast(flowState_, transportParams(), frame, p, d); }
 
-    bool wavesPrepared() const { return waves_[0].frac != 0.0f; }   // kFrac[0] = 0.5 once prepared
-    void ensureWaves() const { if (wavesOn() && !wavesPrepared()) prepareWaves(); }
-    void prepareWaves() const {
-        const auto& kModes = oceanflow::kWaveModes;   // the flow tables are built from the same modes
-        static const float kFrac[kWaveTrains] = {0.5f, 0.3f, 0.2f};
-        for (int i = 0; i < kWaveTrains; ++i) {
-            WaveTrain& t = waves_[i];
-            t.kx = kTwoPi * kModes[i][0] / (double)width;
-            t.ky = kTwoPi * kModes[i][1] / (double)height;
-            const double k = std::sqrt(t.kx * t.kx + t.ky * t.ky);
-            t.k = (float)k;
-            t.qx = (float)(t.kx / k);
-            t.qy = (float)(t.ky / k);
-            t.frac = kFrac[i];
-            t.phi = (double)i;   // 0, 1, 2 rad
-            t.phase = 0.0;
-        }
-        // The flow cache's wave part (initFlowCache leaves it empty): T = K / |K|²,
-        // and in cell units (∂/∂x = d/dt · kXCells / W); the depth pieces and the
-        // phase factors are (re)built by the next ensureFlow from these modes.
-        oceanflow::FlowCache& c = flow_;
-        c.xScale = (double)oceanflow::kXCells / (double)width;
-        c.yScale = (double)oceanflow::kYCells / (double)height;
-        for (int i = 0; i < kWaveTrains; ++i) {
-            const WaveTrain& t = waves_[i];
-            const double kk = t.kx * t.kx + t.ky * t.ky;
-            c.Tx[i] = (float)(t.kx / kk);
-            c.Ty[i] = (float)(t.ky / kk);
-            c.TxS[i] = (float)(t.kx / kk * c.xScale);
-            c.TyS[i] = (float)(t.ky / kk * c.yScale);
-            // The glass walls' quadrature pair (ocean_flow.hpp wallModeA / B;
-            // read only with walls on): F = −V / k² with the primary's k (the
-            // periodic train's); the neighbour (wavenumber kb) is weighted
-            // ka / kb, which makes the bulk orbit circular where one mode's
-            // slope and the other's value vanish; and an oblique pair (both
-            // mode numbers non-zero: a standing product averages cos²·cos² =
-            // 1/4 against the travelling train's 1/2) is weighted √2, so the
-            // pair's mean square speed is the periodic train's.
-            const double kbx = kTwoPi * 0.5 * (double)oceanflow::wallModeB(i, 0) / (double)width;
-            const double kby = kTwoPi * 0.5 * (double)oceanflow::wallModeB(i, 1) / (double)height;
-            const double kb = std::sqrt(kbx * kbx + kby * kby), ka = std::sqrt(kk);   // IEEE sqrt: portable
-            const double g = (kModes[i][0] != 0 && kModes[i][1] != 0) ? 1.4142135623730951 : 1.0;
-            c.wInvK2[i] = (float)(1.0 / kk);
-            c.wAmpA[i] = (float)g;
-            c.wAmpB[i] = (float)(g * ka / kb);
-        }
-        c.wxS = (float)((double)oceanflow::kXCells / (double)width);
-        c.wyS = (float)((double)oceanflow::kYCells / (double)height);
-        c.yRot.assign(oceanflow::kYCells, oceanflow::TrigV{});
-        c.depthKeyed = false;
-        c.phaseKeyed = false;
-    }
-    void advanceWaves(float dt) {
-        for (WaveTrain& t : waves_) {
-            t.phase += std::sqrt((double)ocfg.waveGravity * (double)t.k) * (double)dt;
-            while (t.phase >= kTwoPi) t.phase -= kTwoPi;
-        }
-    }
-
-    // ---- the E1 flow cache (ocean_flow.hpp) --------------------------------
-    // Derived scratch: rebuilt from hashed state (cfg / ocfg / the world size
-    // at init, the CurrentField's vortices, the frame, the live wave knobs,
-    // modes and phases) by ensureFlow before it is read, on bitwise keys: init
-    // clears it; preparing the waves (prepareWaves, the first time they are
-    // on) sets its wave part and unkeys the depth pieces and phase factors; a
-    // waveSpeed / waveBand change rebuilds the depth pieces
-    // (the phases are kept); waveGravity only changes the clock. ensureFlow
-    // runs once per step (update, after the clocks advance) and in every
-    // public reader, so the shim, the harness driver (which assigns configs
-    // directly) and the tests all get it; a refused oc_set_param changes no
-    // key.
-    static_assert(kWaveTrains == oceanflow::kTrains, "ocean_flow.hpp's train count");
-    mutable oceanflow::FlowCache flow_;
-
-    void initFlowCache() {
-        flow_ = oceanflow::FlowCache{};
-        // CurrentField::init's own: eddies unless mode 1, nothing at strength <= 0,
-        // core_ = max(core, 1); velocityAt's inv2c2 and scale.
-        if (cfg.currentMode != 1 && cfg.currentStrength > 0.0f) {
-            flow_.curOn = true;
-            const float core = (cfg.currentCore > 1.0f) ? cfg.currentCore : 1.0f;
-            flow_.inv2c2 = 1.0f / (2.0f * core * core);
-            const float scale = cfg.currentStrength / core * 1.6487212707f;
-            flow_.vort = current_.vortexState();
-            flow_.eddies.resize(flow_.vort.size() / CurrentField::VORTEX_FLOATS);
-            for (std::size_t i = 0; i < flow_.eddies.size(); ++i)
-                flow_.eddies[i].signScale = flow_.vort[i * CurrentField::VORTEX_FLOATS + 2] * scale;
-            // The glass walls' streamfunction prefactor per eddy: psi = signScale · core² · G(u).
-            flow_.psiScale.resize(flow_.eddies.size());
-            for (std::size_t i = 0; i < flow_.eddies.size(); ++i) flow_.psiScale[i] = flow_.eddies[i].signScale * (core * core);
-        }
-        // The glass walls' current taper band (eddies and gyre alike).
-        {
-            const float core = (cfg.currentCore > 1.0f) ? cfg.currentCore : 1.0f;
-            flow_.wallBc = std::min(core, std::min(0.25f * (float)width, 0.25f * (float)height));
-        }
-        // The waves' part is prepareWaves' (when the waves are first on).
-    }
-
-    static std::uint32_t floatKey(float v) { std::uint32_t u; std::memcpy(&u, &v, 4); return u; }
-
-    // The depth pieces (ocean_flow.hpp) for the current waveSpeed, waveBand, D.
-    void buildDepth() const {
-        oceanflow::FlowCache& c = flow_;
-        c.depthOn = false;
-        const float b = std::min(ocfg.waveBand, 0.25f * D);   // taperAt's
-        const float Dh = 0.5f * D, Dmb = D - b;
-        const float lo[4] = {0.0f, b, Dh, Dmb}, hi[4] = {b, Dh, Dmb, D};
-        float kMax = 0.0f;
-        for (const WaveTrain& t : waves_) kMax = std::max(kMax, t.k);
-        // Cell counts in double, checked before any conversion or allocation.
-        double cells[4], total = 0.0;
-        for (int q = 0; q < 4; ++q) {
-            const double L = (double)hi[q] - (double)lo[q];
-            if (!(L > 0.0)) return;   // a degenerate piece (unvalidated band): the exact formulas
-            const int least = (q == 0 || q == 3) ? oceanflow::kDepthCellsBand : oceanflow::kDepthCellsMin;
-            cells[q] = std::max((double)least, std::ceil((double)kMax * L / oceanflow::kDepthKCell));
-            total += cells[q];
-        }
-        if (!(total <= oceanflow::kDepthCellsMax)) return;   // NaN too
-        for (int q = 0; q < 4; ++q) {
-            oceanflow::DepthPiece& pc = c.piece[q];
-            const int n = (int)cells[q];
-            const double L = (double)hi[q] - (double)lo[q], h = L / (double)n;
-            pc.lo = lo[q];
-            pc.n = n;
-            pc.scale = (double)n / L;
-            pc.dScale = (float)pc.scale;
-            // waveTrainExactAt's own expressions at depth x: H = A e^{−kx} (B − B'/k)
-            // (u_h without cos θ) and V = −A e^{−kx} B; both exactly 0 at the
-            // surface and the floor (no flow through either).
-            auto HV = [&](int i, float x, float& H, float& V) {
-                const WaveTrain& t = waves_[i];
-                const Taper tp = taperAt(x);
-                const float A = t.frac * ocfg.waveSpeed;
-                const float E = 1.0f / (evomath::expm1f(t.k * x) + 1.0f);
-                H = A * E * (tp.B - tp.Bp / t.k);
-                V = -A * E * tp.B;
-                if (x == 0.0f || x == D) { H = 0.0f; V = 0.0f; }
-            };
-            // Node j: at the ideal position lo + h·j (atD, double; the piece's
-            // ends exactly), and that position as the float the formulas take
-            // (at). The lookup (depthProfiles: (d − lo)·scale) and the slopes
-            // (h·k·H) both use the ideal grid, so the rise is integrated over
-            // the ideal cell too: integrated between the float-rounded nodes it
-            // carried their rounding into the derivative (rise / h), 0.25% of
-            // V' in the 0.008-wide cells of a 1.01 band at D 240.
-            auto atD = [&](int j) { return (j == n) ? (double)hi[q] : (double)lo[q] + h * (double)j; };
-            auto at = [&](int j) { return (j == 0) ? lo[q] : (j == n) ? hi[q] : (float)atD(j); };
-            pc.cell.assign((std::size_t)n, oceanflow::DepthCell{});
-            for (int j = 0; j < n; ++j) {
-                const float d0 = at(j), d1 = at(j + 1);
-                oceanflow::DepthCell& cl = pc.cell[j];
-                for (int i = 0; i < kWaveTrains; ++i) {
-                    const double k = (double)waves_[i].k;
-                    float H0, V0, H1, V1;
-                    HV(i, d0, H0, V0);
-                    HV(i, d1, H1, V1);
-                    // The rise V(d1) − V(d0) = ∫ k·H over the ideal cell: from H,
-                    // never from the two rounded V values (see oceanflow::hval).
-                    const double rise = oceanflow::gauss3(atD(j), atD(j + 1), [&](double x) {
-                        float Hx, Vx;
-                        HV(i, (float)x, Hx, Vx);
-                        return k * (double)Hx;
-                    });
-                    cl.v[i] = V0;
-                    cl.dv[i] = (float)rise;
-                    cl.m0[i] = (float)(h * k * (double)H0);   // V' = k·H, per unit t
-                    cl.m1[i] = (float)(h * k * (double)H1);
-                }
-            }
-        }
-        c.b = b;
-        c.Dh = Dh;
-        c.Dmb = Dmb;
-        c.depthOn = true;
-    }
-
-    void ensureFlow() const {
-        oceanflow::FlowCache& c = flow_;
-        ensureWaves();
-        // The waves' depth pieces: rebuilt when waveSpeed, waveBand or D move.
-        // Only for prepared waves (never on: nothing reads them, wavesOn() is false).
-        if (wavesPrepared()) {
-            const std::uint32_t ks = floatKey(ocfg.waveSpeed), kb = floatKey(ocfg.waveBand), kd = floatKey(D);
-            if (!c.depthKeyed || ks != c.keySpeed || kb != c.keyBand || kd != c.keyD) {
-                buildDepth();
-                c.depthKeyed = true;
-                c.keySpeed = ks;
-                c.keyBand = kb;
-                c.keyD = kd;
-            }
-        }
-        // The phase factors: regenerated when a phase moves (every step while
-        // the waves run; frozen with the clock), from the static base.
-        if (wavesPrepared()) {
-            bool same = c.phaseKeyed;
-            std::uint64_t kp[kWaveTrains];
-            for (int i = 0; i < kWaveTrains; ++i) {
-                std::memcpy(&kp[i], &waves_[i].phase, 8);
-                same = same && kp[i] == c.keyPhase[i];
-            }
-            if (!same) {
-                for (int i = 0; i < kWaveTrains; ++i) {
-                    oceanflow::cosSin(waves_[i].phi - waves_[i].phase, c.cp[i], c.sp[i]);
-                    c.keyPhase[i] = kp[i];
-                }
-                const oceanflow::TrigV* base = oceanflow::yBaseTable().cell;
-                const oceanflow::TrigCell lane0 = {c.cp[0], 0.0f, 0.0f, 0.0f, c.sp[0], 0.0f, 0.0f, 0.0f};
-                for (int j = 0; j < oceanflow::kYCells; ++j) {
-                    oceanflow::TrigV& y = c.yRot[j];
-                    oceanflow::setLane(y, 0, lane0);   // train 0 (n = 0): its constant y factor
-                    for (int i = 1; i < kWaveTrains; ++i) {
-                        oceanflow::TrigCell r = oceanflow::getLane(base[j], i);
-                        const float cr = c.cp[i], sr = c.sp[i];
-                        oceanflow::rotate(r.c, r.s, cr, sr);
-                        oceanflow::rotate(r.dc, r.ds, cr, sr);
-                        oceanflow::rotate(r.mc0, r.ms0, cr, sr);
-                        oceanflow::rotate(r.mc1, r.ms1, cr, sr);
-                        oceanflow::setLane(y, i, r);
-                    }
-                }
-                c.phaseKeyed = true;
-            }
-        }
-        if (c.curOn && (!c.curReady || c.curFrame != frame || c.curAdvKey != c.curAdvanced)) {
-            // CurrentField::advance(frame)'s centres (vortexState(): base x, y,
-            // sign, ax, ay, fx, fy, px, py), or 0 before the first advance.
-            const float t = (float)frame;
-            for (std::size_t i = 0; i < c.eddies.size(); ++i) {
-                const float* v = &c.vort[i * CurrentField::VORTEX_FLOATS];
-                oceanflow::Eddy& e = c.eddies[i];
-                if (c.curAdvanced) {
-                    e.cx = v[0] + v[3] * evomath::sinf(v[5] * t + v[7]);
-                    e.cy = v[1] + v[4] * evomath::sinf(v[6] * t + v[8]);
-                } else {
-                    e.cx = 0.0f;
-                    e.cy = 0.0f;
-                }
-            }
-            c.curReady = true;
-            c.curFrame = frame;
-            c.curAdvKey = c.curAdvanced;
-        }
-    }
-
-    // CurrentField::velocityAt (Mode::Eddies) with e^{−u} from the radial
-    // table (ocean_flow.hpp): same vortex order, prefactor, raw differences
-    // and accumulation; a vortex at u >= 16 adds nothing.
-    Vec2 eddyVelocity(Vec2 p) const {
-        Vec2 v{0.0f, 0.0f};
-        const float inv2c2 = flow_.inv2c2;
-        const float* E = oceanflow::radialTable().E;
-        for (const oceanflow::Eddy& e : flow_.eddies) {
-            const float dx = p.x - e.cx;
-            const float dy = p.y - e.cy;
-            float g;
-            if (!oceanflow::radial(E, (dx * dx + dy * dy) * inv2c2, g)) continue;
-            const float f = e.signScale * g;
-            v.x += f * (-dy);
-            v.y += f * dx;
-        }
-        return v;
-    }
-
-    // The E1 flow from the cache (flowE1(), ensureFlow() done).
-    Flow currentFlowFast(Vec2 p, float d) const {
-        Flow U;
-        if (current_.active()) {
-            const Vec2 c = flow_.curOn ? eddyVelocity(p) : current_.velocityAt(p);
-            const float f = ocfg.deepCurrent ? smooth01(2.0f * d / D) : 1.0f;
-            U.x = f * c.x;
-            U.y = f * c.y;
-        }
-        return U;
-    }
-    // Every train's V and V' = dV/dd at depth d from the pieces (a train per
-    // lane); false = not from the tables (none built, or d is NaN).
-    bool depthProfiles(float d, oceanflow::v4f& V, oceanflow::v4f& Vd) const {
-        const oceanflow::FlowCache& c = flow_;
-        if (!c.depthOn) return false;
-        if (!(d > 0.0f && d < D)) {
-            if (!(d <= 0.0f || d >= D)) return false;   // NaN
-            V = oceanflow::v4f{};                        // surface, floor, outside
-            Vd = oceanflow::v4f{};
-            return true;
-        }
-        const int q = (d <= c.b) ? 0 : (d <= c.Dh) ? 1 : (d <= c.Dmb) ? 2 : 3;
-        const oceanflow::DepthPiece& pc = c.piece[q];
-        const double s = ((double)d - (double)pc.lo) * pc.scale;   // in [0, n] (rounding aside)
-        if (!(s >= 0.0 && s <= (double)pc.n + 0.5)) return false;
-        int j = (int)s;
-        if (j > pc.n - 1) j = pc.n - 1;
-        const oceanflow::BasisV B = oceanflow::basisV((float)(s - (double)j));
-        const oceanflow::DepthCell& cl = pc.cell[j];
-        V = oceanflow::hval(B, cl.v, cl.dv, cl.m0, cl.m1);
-        Vd = oceanflow::hder(B, cl.dv, cl.m0, cl.m1) * oceanflow::splat(pc.dScale);
-        return true;
-    }
-    // A periodic cell coordinate: v·scale in [0, N) after at most one add /
-    // subtract of a period (ordinary positions, swimming or just spawned at
-    // an inclusive edge); false for anything further out or not finite.
-    static bool cellCoord(float v, double scale, int N, int& i, float& t) {
-        double s = (double)v * scale;
-        if (s < 0.0) s += (double)N;
-        if (s >= (double)N) s -= (double)N;   // also s == N (the periodic end) -> 0
-        if (!(s >= 0.0 && s < (double)N)) return false;
-        i = (int)s;
-        t = (float)(s - (double)i);
-        return true;
-    }
-    // The three trains at (p, d) from the tables (ocean_flow.hpp):
-    //   u_x = (T_x V') P, u_y = (T_y V') P, u_d = (−V)(T_x ∂x P + T_y ∂y P),
-    // P = cos θ from the cos / sin tables; false = use the exact formulas.
-    bool wavesTable(Vec2 p, float d, Flow u[kWaveTrains]) const {
-        using oceanflow::v4f;
-        const oceanflow::FlowCache& c = flow_;
-        v4f V, Vd;
-        if (!depthProfiles(d, V, Vd)) return false;
-        int ix, iy;
-        float tx, ty;
-        if (!cellCoord(p.x, c.xScale, oceanflow::kXCells, ix, tx)) return false;
-        if (!cellCoord(p.y, c.yScale, oceanflow::kYCells, iy, ty)) return false;
-        const oceanflow::BasisV bx = oceanflow::basisV(tx), by = oceanflow::basisV(ty);
-        const oceanflow::TrigV& X = oceanflow::xTable().cell[ix];
-        const oceanflow::TrigV& Y = c.yRot[iy];   // lane 0: train 0's constant factor
-        const v4f cx = oceanflow::hval(bx, X.c, X.dc, X.mc0, X.mc1);
-        const v4f sx = oceanflow::hval(bx, X.s, X.ds, X.ms0, X.ms1);
-        const v4f cxd = oceanflow::hder(bx, X.dc, X.mc0, X.mc1);   // per unit t
-        const v4f sxd = oceanflow::hder(bx, X.ds, X.ms0, X.ms1);
-        const v4f cy = oceanflow::hval(by, Y.c, Y.dc, Y.mc0, Y.mc1);
-        const v4f sy = oceanflow::hval(by, Y.s, Y.ds, Y.ms0, Y.ms1);
-        const v4f cyd = oceanflow::hder(by, Y.dc, Y.mc0, Y.mc1);
-        const v4f syd = oceanflow::hder(by, Y.ds, Y.ms0, Y.ms1);
-        const v4f P = cx * cy - sx * sy;
-        const v4f gradT = c.TxS * (cxd * cy - sxd * sy) + c.TyS * (cx * cyd - sx * syd);   // T·∇P
-        const v4f ux = (c.Tx * Vd) * P, uy = (c.Ty * Vd) * P, ud = (-V) * gradT;
-        for (int i = 0; i < kWaveTrains; ++i) {
-            u[i].x = ux[i];
-            u[i].y = uy[i];
-            u[i].d = ud[i];
-        }
-        return true;
-    }
-    void wavesExact(Vec2 p, float d, Flow u[kWaveTrains]) const {
-        const Taper tp = taperAt(d);
-        for (int i = 0; i < kWaveTrains; ++i) u[i] = waveTrainExactAt(i, p, d, tp);
-    }
-    Flow waveTrainFast(int i, Vec2 p, float d) const {
-        Flow u[kWaveTrains];
-        if (!wavesTable(p, d, u)) return waveTrainExactAt(i, p, d);
-        return u[i];
-    }
-    Flow flowFast(Vec2 p, float d) const {
-        Flow U = currentFlowFast(p, d);
-        if (wavesOn()) {
-            Flow u[kWaveTrains];
-            if (!wavesTable(p, d, u)) wavesExact(p, d, u);
-            for (int i = 0; i < kWaveTrains; ++i) {
-                U.x += u[i].x;
-                U.y += u[i].y;
-                U.d += u[i].d;
-            }
-        }
-        return U;
-    }
-    // What the step's fish read: the E1 cache while flowE1(), else the exact
-    // formulas (sizeDrift alone: the preview's current, unweighted).
-    Flow flowStep(Vec2 p, float d) const { return flowE1() ? flowFast(p, d) : flowExactAt(p, d); }
-
-    // ---- glass walls: the wall-compatible flow (OceanConfig::walls) --------
-    // Read only with walls on; the periodic evaluators above are untouched.
-    // The current: the streamfunction psi of the same vortices (or the double
-    // gyre), tapered by Q(x, y) = χ_W(x) χ_H(y), χ_L(q) = S(q/b_c) S((L−q)/b_c),
-    // b_c = min(max(core, 1), W/4, H/4): C_w = (−∂y(Q psi), ∂x(Q psi))
-    // = Q·C + psi·(−Q_y, Q_x). Divergence-free (a curl); Q and its gradient
-    // vanish on the side faces, so the current is exactly 0 there (inside,
-    // where Q = 1, it is the periodic evaluator's eddy current bit for bit).
-    // × f(d) (deepCurrent) as before. The waves: each train's quadrature pair
-    // of Neumann modes (ocean_flow.hpp wallModeA / B), from the potential
-    // Φ = F(d) P(x, y) τ(t), F = (A / k²) e^{−kd} B(d) = −V / k²:
-    //   u_x = F' ∂x P τ,  u_y = F' ∂y P τ,  u_d = −F (∂xx P + ∂yy P) τ,
-    // τ = cos(φ0 − phase) for the primary, sin(φ0 − phase) for the neighbour
-    // (and their weights). ∇·u = F' ΔP τ − F' ΔP τ = 0; ∂x P = 0 at x = 0, W,
-    // ∂y P = 0 at y = 0, H, F = 0 at the surface and floor: no flow through
-    // any face, exactly (the tables pin the end slopes to 0; the bounded
-    // lookup puts x = W at the last cell's end, never the first's).
     static constexpr float kPiF = 3.14159265358979f;
-    static void wallTaper(float q, float L, float b, float& chi, float& dchi) {
-        const float r1 = q / b, r2 = (L - q) / b;
-        const float s1 = smooth01(r1), s2 = smooth01(r2);
-        chi = s1 * s2;
-        dchi = (smooth01d(r1) * s2 - s1 * smooth01d(r2)) / b;
-    }
-    // The bounded current at p (2-D; ensureFlow done).
-    Vec2 wallCurrent(Vec2 p) const {
-        if (!current_.active()) return {0.0f, 0.0f};
-        Vec2 C{0.0f, 0.0f};
-        float psi = 0.0f;
-        if (flow_.curOn) {   // eddies: eddyVelocity's sum, plus the streamfunction alongside
-            const float inv2c2 = flow_.inv2c2;
-            const float* E = oceanflow::radialTable().E;
-            const float* G = oceanflow::radialIntTable().G;
-            for (std::size_t k = 0; k < flow_.eddies.size(); ++k) {
-                const oceanflow::Eddy& e = flow_.eddies[k];
-                const float dx = p.x - e.cx;
-                const float dy = p.y - e.cy;
-                float g, Gu;
-                if (!oceanflow::radialPsi(E, G, (dx * dx + dy * dy) * inv2c2, g, Gu)) continue;
-                const float f = e.signScale * g;
-                C.x += f * (-dy);
-                C.y += f * dx;
-                psi += flow_.psiScale[k] * Gu;
-            }
-        } else {   // the double gyre: CurrentField's own velocity and streamfunction
-            C = current_.velocityAt(p);
-            psi = current_.gyreStreamAt(p);
-        }
-        float cx, dcx, cy, dcy;
-        wallTaper(p.x, (float)width, flow_.wallBc, cx, dcx);
-        wallTaper(p.y, (float)height, flow_.wallBc, cy, dcy);
-        const float Q = cx * cy, Qx = dcx * cy, Qy = cx * dcy;
-        return {Q * C.x - psi * Qy, Q * C.y + psi * Qx};
-    }
-    Flow wallCurrentFlow(Vec2 p, float d) const {
-        Flow U;
-        if (current_.active()) {
-            const Vec2 c = wallCurrent(p);
-            const float f = ocfg.deepCurrent ? smooth01(2.0f * d / D) : 1.0f;
-            U.x = f * c.x;
-            U.y = f * c.y;
-        }
-        return U;
-    }
-    // cos / sin of π·mode·v / L, the angle reduced exactly in double (its
-    // cycles' fractional part); sin exactly 0 on the faces v = 0, v = L.
-    static void halfTurn(int mode, float v, double L, float& c, float& s) {
-        if (mode == 0) { c = 1.0f; s = 0.0f; return; }
-        double cyc = 0.5 * (double)mode * ((double)v / L);
-        cyc -= std::floor(cyc);
-        oceanflow::cosSin(kTwoPi * cyc, c, s);
-        if (v == 0.0f || (double)v == L) s = 0.0f;
-    }
-    // Train i's pair at (p, d) from the formulas (the tables' fallback and the
-    // tests' reference). Waves off: exact zeros, before the division by |K|²
-    // (a train never prepared has K = 0; wallFlowFast / wallFlowExact never
-    // ask then, the public readers can). No state is touched.
-    Flow wallTrainExactAt(int i, Vec2 p, float d) const {
-        if (!wavesOn()) return Flow{};
-        ensureWaves();
-        const WaveTrain& t = waves_[i];
-        const Taper tp = taperAt(d);
-        const float A = t.frac * ocfg.waveSpeed;
-        const float E = 1.0f / (evomath::expm1f(t.k * d) + 1.0f);
-        const float ik2 = (float)(1.0 / (t.kx * t.kx + t.ky * t.ky));
-        const float F = A * ik2 * E * tp.B;
-        const float Fd = A * ik2 * E * (tp.Bp - t.k * tp.B);
-        float cp, sp;
-        oceanflow::cosSin(t.phi - t.phase, cp, sp);
-        Flow u;
-        for (int ab = 0; ab < 2; ++ab) {
-            const int mx = ab ? oceanflow::wallModeB(i, 0) : oceanflow::wallModeA(i, 0);
-            const int my = ab ? oceanflow::wallModeB(i, 1) : oceanflow::wallModeA(i, 1);
-            const float kx = (float)(kTwoPi * 0.5 * (double)mx / (double)width);
-            const float ky = (float)(kTwoPi * 0.5 * (double)my / (double)height);
-            float cx, sx, cy, sy;
-            halfTurn(mx, p.x, (double)width, cx, sx);
-            halfTurn(my, p.y, (double)height, cy, sy);
-            const float tau = (ab ? sp * flow_.wAmpB[i] : cp * flow_.wAmpA[i]);
-            const float Px = -kx * sx * cy, Py = -ky * cx * sy;
-            const float lap = -((kx * kx + ky * ky) * (cx * cy));
-            u.x += (Fd * tau) * Px;
-            u.y += (Fd * tau) * Py;
-            u.d += -(F * tau) * lap;
-        }
-        return u;
-    }
-    // The three pairs from the tables (depth pieces: the periodic trains' own;
-    // x / y: the quintic Neumann tables); false = the formulas.
-    bool wallWavesTable(Vec2 p, float d, Flow u[kWaveTrains]) const {
-        using oceanflow::v4f;
-        using oceanflow::splat;
-        const oceanflow::FlowCache& c = flow_;
-        v4f V, Vd;
-        if (!depthProfiles(d, V, Vd)) return false;
-        int ix, iy;
-        float tx, ty;
-        if (!oceanflow::wallCellCoord(p.x, (double)width, oceanflow::kXCells, ix, tx)) return false;
-        if (!oceanflow::wallCellCoord(p.y, (double)height, oceanflow::kYCells, iy, ty)) return false;
-        const oceanflow::WallAxisTable& XT = oceanflow::wallXTable();
-        const oceanflow::WallAxisTable& YT = oceanflow::wallYTable();
-        const oceanflow::Eval5V xa = oceanflow::eval5(tx, XT.A[ix]), xb = oceanflow::eval5(tx, XT.B[ix]);
-        const oceanflow::Eval5V ya = oceanflow::eval5(ty, YT.A[iy]), yb = oceanflow::eval5(ty, YT.B[iy]);
-        // ∂x, ∂y in world units; on a face its normal slope is pinned to exactly 0
-        // (sin(0) = sin(μπ) = 0: at t = 1 the Horner sum gives it only to rounding)
-        const v4f sx = splat((p.x == 0.0f || p.x == (float)width) ? 0.0f : c.wxS);
-        const v4f sy = splat((p.y == 0.0f || p.y == (float)height) ? 0.0f : c.wyS);
-        const v4f sxx = splat(c.wxS * c.wxS), syy = splat(c.wyS * c.wyS);
-        const v4f axd = xa.d * sx, bxd = xb.d * sx, ayd = ya.d * sy, byd = yb.d * sy;
-        const v4f axs = xa.s * sxx, bxs = xb.s * sxx, ays = ya.s * syy, bys = yb.s * syy;
-        const v4f cpv = {c.cp[0], c.cp[1], c.cp[2], 0.0f}, spv = {c.sp[0], c.sp[1], c.sp[2], 0.0f};
-        const v4f F = (-V) * c.wInvK2, Fd = (-Vd) * c.wInvK2;
-        const v4f ta = c.wAmpA * cpv, tb = c.wAmpB * spv;
-        const v4f FdA = Fd * ta, FdB = Fd * tb, FA = F * ta, FB = F * tb;
-        const v4f ux = FdA * (axd * ya.p) + FdB * (bxd * yb.p);
-        const v4f uy = FdA * (xa.p * ayd) + FdB * (xb.p * byd);
-        const v4f ud = -(FA * (axs * ya.p + xa.p * ays) + FB * (bxs * yb.p + xb.p * bys));
-        for (int i = 0; i < kWaveTrains; ++i) {
-            u[i].x = ux[i];
-            u[i].y = uy[i];
-            u[i].d = ud[i];
-        }
-        return true;
-    }
-    // The whole wall flow (ensureFlow done): the current, then the trains in order.
-    Flow wallFlowFast(Vec2 p, float d) const {
-        Flow U = wallCurrentFlow(p, d);
-        if (wavesOn()) {
-            Flow u[kWaveTrains];
-            if (!wallWavesTable(p, d, u))
-                for (int i = 0; i < kWaveTrains; ++i) u[i] = wallTrainExactAt(i, p, d);
-            for (int i = 0; i < kWaveTrains; ++i) {
-                U.x += u[i].x;
-                U.y += u[i].y;
-                U.d += u[i].d;
-            }
-        }
-        return U;
-    }
-    Flow wallFlowExact(Vec2 p, float d) const {
-        Flow U = wallCurrentFlow(p, d);
-        if (wavesOn())
-            for (int i = 0; i < kWaveTrains; ++i) {
-                const Flow u = wallTrainExactAt(i, p, d);
-                U.x += u.x;
-                U.y += u.y;
-                U.d += u.d;
-            }
-        return U;
-    }
-
-    // ---- glass walls, four points at once (wallAdvect4) -----------------------
-    typedef int v4i __attribute__((vector_size(16)));
-    static oceanflow::v4f sel4(v4i m, oceanflow::v4f a, oceanflow::v4f b) {   // m's lane all ones: a, else b (on the bits)
-        return (oceanflow::v4f)((m & (v4i)a) | (~m & (v4i)b));
-    }
-    // mirrorFold per lane; every lane already in [0, L] is returned as it is.
-    static oceanflow::v4f fold4(oceanflow::v4f q, float L) {
-        using oceanflow::v4f;
-        const v4i in = (q >= splat4(0.0f)) & (q <= splat4(L));
-        if (in[0] & in[1] & in[2] & in[3]) return q;
-        v4f r;
-        for (int l = 0; l < 4; ++l) r[l] = mirrorFold(q[l], L);
-        return r;
-    }
-    static oceanflow::v4f splat4(float x) { return oceanflow::v4f{x, x, x, x}; }
-    // smooth01 / smooth01d, per lane (std::clamp's own two comparisons).
-    static oceanflow::v4f smooth01v(oceanflow::v4f r) {
-        using oceanflow::v4f;
-        r = sel4(r < splat4(0.0f), splat4(0.0f), sel4(splat4(1.0f) < r, splat4(1.0f), r));
-        return r * r * (splat4(3.0f) - splat4(2.0f) * r);
-    }
-    static oceanflow::v4f smooth01dv(oceanflow::v4f r) {
-        using oceanflow::v4f;
-        r = sel4(r < splat4(0.0f), splat4(0.0f), sel4(splat4(1.0f) < r, splat4(1.0f), r));
-        return splat4(6.0f) * r * (splat4(1.0f) - r);
-    }
-    static void wallTaper4(oceanflow::v4f q, float L, float b, oceanflow::v4f& chi, oceanflow::v4f& dchi) {
-        using oceanflow::v4f;
-        const v4f r1 = q / splat4(b), r2 = (splat4(L) - q) / splat4(b);
-        const v4f s1 = smooth01v(r1), s2 = smooth01v(r2);
-        chi = s1 * s2;
-        dchi = (smooth01dv(r1) * s2 - s1 * smooth01dv(r2)) / splat4(b);
-    }
-    // wallCurrent for four points: (x, y) per lane.
-    void wallCurrent4(oceanflow::v4f px, oceanflow::v4f py, oceanflow::v4f& outx, oceanflow::v4f& outy) const {
-        using oceanflow::v4f;
-        if (!current_.active()) { outx = splat4(0.0f); outy = splat4(0.0f); return; }
-        v4f Cx = splat4(0.0f), Cy = splat4(0.0f), psi = splat4(0.0f);
-        if (flow_.curOn) {
-            const float inv2c2 = flow_.inv2c2;
-            const float* E = oceanflow::radialTable().E;
-            const float* G = oceanflow::radialIntTable().G;
-            const v4f EN = splat4(E[oceanflow::kRadialCells]);
-            for (std::size_t k = 0; k < flow_.eddies.size(); ++k) {
-                const oceanflow::Eddy& e = flow_.eddies[k];
-                const v4f dx = px - splat4(e.cx);
-                const v4f dy = py - splat4(e.cy);
-                const v4f u = (dx * dx + dy * dy) * splat4(inv2c2);
-                // radialPsi per lane: a lane it refuses keeps its sums (the scalar's continue)
-                const v4i ok = (u >= splat4(0.0f)) & (u < splat4(oceanflow::kRadialCut));
-                const v4f s = sel4(ok, u * splat4(oceanflow::kRadialPerUnit), splat4(0.0f));
-                const v4i i = __builtin_convertvector(s, v4i);
-                const v4f t = s - __builtin_convertvector(i, v4f);
-                const v4f Ei = {E[i[0]], E[i[1]], E[i[2]], E[i[3]]};
-                const v4f Ei1 = {E[i[0] + 1], E[i[1] + 1], E[i[2] + 1], E[i[3] + 1]};
-                const v4f Gi = {G[i[0]], G[i[1]], G[i[2]], G[i[3]]};
-                const v4f de = Ei1 - Ei;
-                const v4f g = (Ei + t * de) - EN;
-                const v4f Gu = Gi + (t * ((Ei - EN) + (splat4(0.5f) * t) * de)) * splat4(1.0f / oceanflow::kRadialPerUnit);
-                const v4f f = splat4(e.signScale) * g;
-                Cx = sel4(ok, Cx + f * (-dy), Cx);
-                Cy = sel4(ok, Cy + f * dx, Cy);
-                psi = sel4(ok, psi + splat4(flow_.psiScale[k]) * Gu, psi);
-            }
-        } else {   // the double gyre: CurrentField's own evaluators, per lane
-            for (int l = 0; l < 4; ++l) {
-                const Vec2 c = current_.velocityAt({px[l], py[l]});
-                Cx[l] = c.x; Cy[l] = c.y;
-                psi[l] = current_.gyreStreamAt({px[l], py[l]});
-            }
-        }
-        v4f cx, dcx, cy, dcy;
-        wallTaper4(px, (float)width, flow_.wallBc, cx, dcx);
-        wallTaper4(py, (float)height, flow_.wallBc, cy, dcy);
-        const v4f Q = cx * cy, Qx = dcx * cy, Qy = cx * dcy;
-        outx = Q * Cx - psi * Qy;
-        outy = Q * Cy + psi * Qx;
-    }
-    // wallFlowFast for four points.
-    void wallFlowFast4(oceanflow::v4f px, oceanflow::v4f py, oceanflow::v4f pd,
-                       oceanflow::v4f& ux, oceanflow::v4f& uy, oceanflow::v4f& ud) const {
-        using oceanflow::v4f;
-        // wallCurrentFlow: the current × the deep factor (1 exactly without deepCurrent)
-        v4f cx, cy;
-        wallCurrent4(px, py, cx, cy);
-        const v4f f = ocfg.deepCurrent ? smooth01v(splat4(2.0f) * pd / splat4(D)) : splat4(1.0f);
-        ux = f * cx; uy = f * cy; ud = splat4(0.0f);
-        if (!current_.active()) { ux = splat4(0.0f); uy = splat4(0.0f); }
-        if (wavesOn()) {
-            for (int l = 0; l < 4; ++l) {
-                const Vec2 pl = {px[l], py[l]};
-                Flow u[kWaveTrains];
-                if (!wallWavesTable(pl, pd[l], u))
-                    for (int i = 0; i < kWaveTrains; ++i) u[i] = wallTrainExactAt(i, pl, pd[l]);
-                float x = ux[l], y = uy[l], z = ud[l];
-                for (int i = 0; i < kWaveTrains; ++i) { x += u[i].x; y += u[i].y; z += u[i].d; }
-                ux[l] = x; uy[l] = y; ud[l] = z;
-            }
-        }
-    }
 
     // ---- glass walls: movement, contact, placement (no draws) --------------
     // The side-wall soft turn (fish and predators): inside sideWallBand of a
@@ -2001,101 +1225,19 @@ private:
         (void)rng.range(0.0f, 1.0f);
         return std::clamp(c, inset, L - inset);
     }
-    // Food's transport this step: n midpoint substeps over a time dtFood. The
-    // count the flow needs, need = ceil(ub·dt / (len/8)), is from a bound ub
-    // on the wall flow's speed (the pairs' amplitudes incl. the narrow-band
-    // horizontal factor; each eddy's peak and taper correction; the gyre's)
-    // against an eighth of its shortest length scale len (the wave band, the
-    // current's band and core): a substep turns an eddy's core by at most
-    // ~0.05 rad, where the midpoint's radial error is ~θ⁴/8 < 1e-6 (a
-    // stationary eddy's tracers keep their radius: tests "wall_eddy").
-    // need <= 16: n = need (at least 1) over the whole step. need > 16, flow
-    // too fast or too fine for the work budget (one eddy of currentStrength
-    // 1000 and core 1 needs 577): n = 16 substeps of the size the bound asks
-    // for, dt·16/need, so food covers 16/need of the step's flow — it lags
-    // water too fast for it, deterministically, rather than taking 16
-    // substeps too long (at the old cap a tracer 0.1 units from that eddy's
-    // centre went out to 1.2 in one frame). Over a shorter time it is the
-    // same divergence-free field with no flow through the glass, so food
-    // stays uniform and inside. Config arithmetic in double (IEEE ops only):
-    // the same count and time on every build.
-    struct FoodSteps { int n; float dt; double need; };
-    FoodSteps wallFoodSteps(float dt) const {
-        double ub = 0.0, len = 1e30;
-        if (wavesOn()) {
-            const double b = std::min((double)ocfg.waveBand, 0.25 * (double)D);
-            for (const WaveTrain& t : waves_)
-                ub += 3.2 * (double)t.frac * (double)ocfg.waveSpeed * (1.0 + 1.5 / (b * (double)t.k));
-            len = std::min(len, b);
-        }
-        if (current_.active()) {
-            const double s = (double)cfg.currentStrength, bc = (double)flow_.wallBc;
-            const double core = std::max(1.0, (double)cfg.currentCore);
-            if (cfg.currentMode == 1) {
-                const double e = std::abs((double)cfg.currentGyreEps);
-                ub += s * (1.0 + 2.0 * ((double)height / (double)width) * (1.0 + 6.0 * e)) +
-                      s * ((double)height / 3.14159265358979) * 2.2 / bc;
-            } else {
-                ub += (double)cfg.currentEddies * s * (1.0 + 3.5 * core / bc);
-                len = std::min(len, core);
-            }
-            len = std::min(len, bc);
-        }
-        const double need = std::ceil(ub * (double)dt / (0.125 * len));
-        if (!(need > 1.0)) return {1, dt, 1.0};
-        if (need <= (double)kWallFoodMaxSubsteps) return {(int)need, dt, need};
-        return {kWallFoodMaxSubsteps, (float)((double)dt * (double)kWallFoodMaxSubsteps / need), need};
-    }
-    static constexpr int kWallFoodMaxSubsteps = 16;
-    void wallTransportFood(float dt) {
-        const FoodSteps fs = wallFoodSteps(dt);
-        // Four live items at a time through wallAdvect4 (each item's transport
-        // is its own: the flow is frozen for the step and nothing else is read,
-        // so the grouping and the order change no item's bits), the rest one
-        // by one through wallAdvect.
-        std::vector<int>& idx = advectIdx_;
-        idx.clear();
-        for (int i = 0; i < (int)food.size(); ++i) if (food[i].alive) idx.push_back(i);
-        const int n4 = (int)idx.size() & ~3;
-        for (int j = 0; j < n4; j += 4) {
-            Vec2 p[4]; float d[4];
-            for (int l = 0; l < 4; ++l) { p[l] = food[idx[j + l]].pos; d[l] = food[idx[j + l]].depth; }
-            wallAdvect4(p, d, fs.dt, fs.n);
-            for (int l = 0; l < 4; ++l) {
-                OceanFood& f = food[idx[j + l]];
+    void transportFood(float dt) {
+        oceantransport::transportFood(flowState_, transportParams(), frame, dt,
+            std::span<const OceanFood>(food), std::span<OceanFood>(food), advectIdx_
 #ifdef EVO_OCEAN_EYE
-                const float z0 = f.depth;
+            , [](float d) { return ocean::eyeContrast(ocean::kEyeFoodBright, d); }
 #endif
-                f.pos = p[l]; f.depth = d[l];
-#ifdef EVO_OCEAN_EYE
-                if (f.depth != z0) f.eyeCon = ocean::eyeContrast(ocean::kEyeFoodBright, f.depth);   // no draws
-#endif
-            }
-        }
-        for (int j = n4; j < (int)idx.size(); ++j) {
-            OceanFood& f = food[idx[j]];
-#ifdef EVO_OCEAN_EYE
-            const float z0 = f.depth;
-#endif
-            wallAdvect(f.pos, f.depth, fs.dt, fs.n);
-#ifdef EVO_OCEAN_EYE
-            if (f.depth != z0) f.eyeCon = ocean::eyeContrast(ocean::kEyeFoodBright, f.depth);   // no draws
-#endif
-        }
+        );
     }
 
 public:
     // q mirror-folded into [0, L] (period 2L: r = q mod 2L, r or 2L − r):
     // never wrapped to the opposite face, never piled onto one.
-    static float mirrorFold(float q, float L) {
-        if (q >= 0.0f && q <= L) return q;
-        if (q < 0.0f && q >= -L) return -q;
-        const float L2 = 2.0f * L;
-        if (q > L && q <= L2) return L2 - q;
-        float r = std::fmod(q, L2);   // exact
-        if (r < 0.0f) r += L2;
-        return (r <= L) ? r : L2 - r;
-    }
+    static float mirrorFold(float q, float L) { return oceantransport::mirrorFold(q, L); }
     // One particle's transport over dt through the wall flow, frozen at this
     // step's time (ensureFlow done): n midpoint (RK2) substeps (wallFoodSteps),
     // every trial and final coordinate mirror-folded into the tank. (A single
@@ -2105,18 +1247,7 @@ public:
     // exactly: tests "wall_transport" checks uniform tracers for wall
     // accumulation and convergence in n, "wall_eddy" a stationary eddy's radii
     // and density.
-    void wallAdvect(Vec2& p, float& d, float dt, int n) const {
-        const float W = (float)width, H = (float)height;
-        const float h = dt / (float)n, hh = 0.5f * h;
-        for (int k = 0; k < n; ++k) {
-            const Flow U1 = wallFlowFast(p, d);
-            const Vec2 pm = {mirrorFold(p.x + hh * U1.x, W), mirrorFold(p.y + hh * U1.y, H)};
-            const float dm = mirrorFold(d + hh * U1.d, D);
-            const Flow U2 = wallFlowFast(pm, dm);
-            p = {mirrorFold(p.x + h * U2.x, W), mirrorFold(p.y + h * U2.y, H)};
-            d = mirrorFold(d + h * U2.d, D);
-        }
-    }
+    void wallAdvect(Vec2& p, float& d, float dt, int n) const { oceantransport::wallAdvect(flowState_, transportParams(), frame, p, d, dt, n); }
     // Four particles through wallAdvect's midpoint step at once, each lane
     // wallAdvect's result bit for bit (tests "wall_advect4"): the current (the
     // eddy sum, the wall tapers, the deep factor), the half and full steps and
@@ -2126,26 +1257,10 @@ public:
     // skipped it), the wave trains per item by the very wallWavesTable /
     // wallTrainExactAt, and the sums U = current + train 0 + train 1 + train 2
     // in that order. A fold outside [0, L] takes the scalar mirrorFold per lane.
-    void wallAdvect4(Vec2 p[4], float d[4], float dt, int n) const {
-        using oceanflow::v4f;
-        using oceanflow::splat;
-        const float W = (float)width, H = (float)height;
-        const float h = dt / (float)n, hh = 0.5f * h;
-        v4f px = {p[0].x, p[1].x, p[2].x, p[3].x}, py = {p[0].y, p[1].y, p[2].y, p[3].y};
-        v4f pd = {d[0], d[1], d[2], d[3]};
-        for (int k = 0; k < n; ++k) {
-            v4f u1x, u1y, u1d;
-            wallFlowFast4(px, py, pd, u1x, u1y, u1d);
-            const v4f mx = fold4(px + splat(hh) * u1x, W), my = fold4(py + splat(hh) * u1y, H), md = fold4(pd + splat(hh) * u1d, D);
-            v4f u2x, u2y, u2d;
-            wallFlowFast4(mx, my, md, u2x, u2y, u2d);
-            px = fold4(px + splat(h) * u2x, W); py = fold4(py + splat(h) * u2y, H); pd = fold4(pd + splat(h) * u2d, D);
-        }
-        for (int l = 0; l < 4; ++l) { p[l] = {px[l], py[l]}; d[l] = pd[l]; }
-    }
-    bool wallFlowOn() const { return ocfg.walls && (current_.active() || wavesOn()); }
-    int wallFoodSubstepsNow(float dt) const { return wallFoodSteps(dt).n; }   // (tests)
-    FoodSteps wallFoodStepsNow(float dt) const { return wallFoodSteps(dt); }  // (tests: n, the time, the need)
+    void wallAdvect4(Vec2 p[4], float d[4], float dt, int n) const { oceantransport::wallAdvect4(flowState_, transportParams(), frame, p, d, dt, n); }
+    bool wallFlowOn() const { return oceantransport::wallFlowOn(flowState_, transportParams(), frame); }
+    int wallFoodSubstepsNow(float dt) const { return oceantransport::wallFoodSubstepsNow(flowState_, transportParams(), frame, dt); }   // (tests)
+    FoodSteps wallFoodStepsNow(float dt) const { return oceantransport::wallFoodStepsNow(flowState_, transportParams(), frame, dt); }  // (tests: n, the time, the need)
 
 private:
 
@@ -2420,8 +1535,8 @@ private:
                 c.pos.x = wrapCoord(c.pos.x + w * U.x * dt, (float)width);
                 c.pos.y = wrapCoord(c.pos.y + w * U.y * dt, (float)height);
                 c.depth = clampDepth(c.depth + w * U.d * dt);
-            } else if (current_.active()) {
-                Vec2 cur = current_.velocityAt(c.pos);
+            } else if (currentActive()) {
+                Vec2 cur = currentExactAt(c.pos);
                 c.pos.x += cur.x * dt;
                 c.pos.y += cur.y * dt;
             }
@@ -2538,8 +1653,8 @@ private:
             // E1: the water's horizontal flow here (deep current × f(d) + waves).
             const Flow U = flowFast(c.pos, c.depth);
             current(U.x, U.y);
-        } else if (current_.active()) {
-            Vec2 cur = current_.velocityAt(c.pos);
+        } else if (currentActive()) {
+            Vec2 cur = currentExactAt(c.pos);
             current(cur.x, cur.y);
         } else {
             sensors[CURRENT_FWD] = 0.0f;
@@ -3188,8 +2303,8 @@ private:
                     p.pos.x = wrapCoord(p.pos.x + U.x * dt, (float)width);
                     p.pos.y = wrapCoord(p.pos.y + U.y * dt, (float)height);
                     p.depth = clampDepth(p.depth + U.d * dt);
-                } else if (current_.active()) {
-                    const Vec2 cur = current_.velocityAt(p.pos);
+                } else if (currentActive()) {
+                    const Vec2 cur = currentExactAt(p.pos);
                     p.pos.x += cur.x * dt;
                     p.pos.y += cur.y * dt;
                 }
