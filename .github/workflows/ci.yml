@@ -207,6 +207,11 @@ jobs:
           test "${PIPESTATUS[0]}" = 0
           ! grep -q ResourceWarning graph.log
           ! grep -q "skipped" graph.log
+      # (the serial job had numpy here from the graph step: redqueen_tooling.sh runs test_graph.py and
+      # test_recovery_extra.py, whose numpy tests skip without it; installed at the same point, after the unit tests)
+      - name: numpy for the end-to-end runs
+        if: matrix.shard == 'e2e'
+        run: python3 -m pip install -q "numpy>=2"
       - name: End to end (10 workers)
         if: matrix.shard == 'e2e'
         run: PYTHON=python3 RQ_TEST_WORKERS=10 bash tests/redqueen_tooling.sh build/evo_boids "$RUNNER_TEMP/rq_work"
