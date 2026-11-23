@@ -252,6 +252,21 @@ console.log("== the lock, deterministic interleavings");
   relB();
   ok(!fs.existsSync(f), "  and releases it");
 }
+{
+  /* the review of PR #89: each acquire put an exit, a SIGINT and a SIGTERM listener on the process and its release left them,
+     so a harness taking the lock once per browser piled them up (MaxListenersExceededWarning after ten) */
+  const f = mk(fresh()), A = createLock({ path: f, pollMs: 10 });
+  const count = () => ["exit", "SIGINT", "SIGTERM"].map((e) => process.listenerCount(e)).join(",");
+  const before = count();
+  const rel = await A.acquire("job A", () => {});
+  const held = count();
+  rel();
+  const after1 = count();
+  for (let k = 0; k < 25; k++) (await A.acquire("job A " + k, () => {}))();
+  ok(held !== before && after1 === before && count() === before && !fs.existsSync(f),
+     "acquire adds its exit / SIGINT / SIGTERM listeners and release takes them off again: 26 acquisitions leave none behind (" +
+     before + " -> " + held + " -> " + count() + ")");
+}
 
 console.log("== the lock, real processes at the same instant");
 async function round(label, n, pre) {

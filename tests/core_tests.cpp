@@ -5249,6 +5249,8 @@ static void test_fused_scan_production_paths() {
 }
 #endif  // serial builds only
 
+#include "genome_v2_pr1_tests.hpp"
+
 int main() {
     std::printf("=== evo_boids core tests (no SFML linked) ===\n");
     test_portable_mt19937();
@@ -5266,6 +5268,7 @@ int main() {
     test_fast_tanh();
     test_topological_neighbors();
     test_checkpoint();
+    test_genome_v2_pr1();
     test_toroidal();
     test_creature();
     test_world_invariants();

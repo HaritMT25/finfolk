@@ -80,7 +80,7 @@
 (function () {
   /* the page is on its way to Classic (an old Classic link: ocean.html's head) */
   if (window.EVO_REDIRECT) return;
-  var A = window.EVO_ASSETS, CFG = window.EvoOceanConfig;
+  var A = window.EVO_ASSETS, CFG = window.EvoOceanConfig, UI = window.EvoUI;
   var P = new URLSearchParams(location.search);
   var MOCK = P.get("mock") === "1";
   var E1 = P.get("e1") === "1";
@@ -403,7 +403,10 @@
       return { ok: false, why: lastError() };
     }
     /* committed: the page's bookkeeping, once */
+    var hist0 = { changed: changedLive, unknown: historyUnknown, console: consoleSet };
     try {
+      changedLive = {}; consoleSet = {};   /* a new world: no live change yet (a saved world's own tweaks: liveTweaks) */
+      historyUnknown = plan.op === "open";   /* (its file has no history: unknown until a start or Replay) */
       clearFieldNotes();
       afterNewWorld();
       stepOnce = false; summary = null; usedTurbo = false; turboReturn = null;
@@ -416,6 +419,7 @@
       hideAsk();
       renderStartBar();
     } catch (err) {
+      changedLive = hist0.changed; historyUnknown = hist0.unknown; consoleSet = hist0.console;   /* (the run that stays: restoreRun puts its page back, these with it) */
       if (!undo) throw err;
       return restoreRun(undo, err);
     }
@@ -448,11 +452,13 @@
              selectedId: selectedId, wantFollow: wantFollow, following: !!(scene && scene.following()), draft: draft, draftGen: draftGen,
              fields: fields, extraCfg: Object.assign({}, extraCfg), nextOnly: Object.assign({}, nextOnly), paused: paused, url: location.href,
              dash: dash() && dash().save ? dash().save() : null, sampleBucket: sampleBucket, rates: rates.q.slice(),
-             usedTurbo: usedTurbo, turboReturn: turboReturn, stepOnce: stepOnce, summary: summary };
+             usedTurbo: usedTurbo, turboReturn: turboReturn, stepOnce: stepOnce, summary: summary, changedLive: Object.assign({}, changedLive),
+             historyUnknown: historyUnknown, consoleSet: Object.assign({}, consoleSet) };
   }
   /* the page's side of a run put back (its memory is in the module again) */
   function pageBack(u) {
     initArgs = u.initArgs; runCfg = u.runCfg; worldEpoch = u.epoch; draft = u.draft; draftGen = u.draftGen;
+    changedLive = Object.assign({}, u.changedLive); historyUnknown = !!u.historyUnknown; consoleSet = Object.assign({}, u.consoleSet);
     selectedId = null; wantFollow = false;
     afterNewWorld(true);   /* this world read again: no new epoch (the charts: below) */
     if (u.dash && dash() && dash().restore) dash().restore(u.dash);
@@ -618,6 +624,9 @@
       if (scene && scene.following()) scene.setFollow(false);
     }
     applyDisplaySwitches();
+    /* the card's clock starts over here, and only here (never at a display switch: review of #91, P2): a world the
+     * page has not seen step, so its fish's kept activations, if any, are no step the card can vouch for */
+    brainClock.reset(syncedFrame(), has("oc_set_capture") && selectedId !== null);
     updateModeline();     /* the world's appearance genes may differ */
     estPrev.n = 0;
     stepMs = 0;
@@ -631,11 +640,18 @@
   }
   /* the shim's display switches: the colour mode is the shim's (memory), the
    * capture flag the world's, so both are set again after every new world and
-   * every Turbo hand-off */
+   * every Turbo hand-off, and whenever the colour mode changes (setColourMode).
+   * None changes a step's activations: the card's clock hears only of a capture
+   * that switched (none, when the selection already set it); a new world resets
+   * it (afterNewWorld) */
   function applyDisplaySwitches() {
     if (has("oc_set_colour_mode")) M._oc_set_colour_mode(colourBrain ? 0 : 1);
     if (scene && scene.setAppearance) scene.setAppearance(colourMode === "appearance");
-    if (has("oc_set_capture")) M._oc_set_capture(selectedId !== null ? 1 : 0);
+    if (has("oc_set_capture")) {
+      var cap = selectedId !== null;
+      M._oc_set_capture(cap ? 1 : 0);
+      brainClock.capture(cap, syncedFrame());
+    }
   }
 
   /* ---- the sheet (built from EvoOceanConfig.TABS) ---- */
@@ -873,6 +889,8 @@
    * key on its way, the field shows what now runs (a refusal in between may
    * have set it back), unless the visitor is in it. */
   function liveApplied(key, v, quiet, seq) {
+    if (v !== historyVal(key)) changedLive[key] = true;   /* (the run's history: changedKeys) */
+    delete consoleSet[key];   /* (runCfg has it now) */
     if (v === KEYS[key][0]) delete runCfg[key]; else runCfg[key] = v;
     /* the light the picture is drawn in: this module's, or while Turbo owns
      * the world, what the worker acknowledged (this page's copy is the world
@@ -883,6 +901,7 @@
       setVal(key, v); updateNeeds(); updateTabDots();
     }
     renderStartBar();
+    engineCall(updateModeline);   /* (its live tweaks) */
     if (!quiet) showNote((LABELS[key] || key) + " is now " + shown(v) + " (live)");
   }
   /* a refused live value: the field goes back to the newest edit of it still
@@ -924,6 +943,15 @@
   function flushHeld(quiet) { return replayEdits(live.takeHeld(), quiet); }
 
   var tabsEl = el("tabs"), panelsEl = el("panels"), currentTab = "run";
+  /* the setup's tabs (web/ui_common.js tabs, as Classic's): Left / Right round
+   * the ends, Home / End, the focus going with the selection; a pointer's
+   * press lets the focus go (Space pauses again), the keyboard's keeps it */
+  var sheetTabs = UI.tabs(tabsEl, {
+    ids: function () { return CFG.TABS.map(function (t) { return t.id; }); },
+    current: function () { return currentTab; },
+    button: function (id) { return el("tab-" + id); },
+    select: setSheetTab
+  });
   function buildSettings() {
     CFG.TABS.forEach(function (tab) {
       var b = document.createElement("button");
@@ -932,7 +960,7 @@
       b.setAttribute("role", "tab");
       b.setAttribute("aria-controls", "panel-" + tab.id);
       b.textContent = tab.title;
-      b.addEventListener("click", function () { setSheetTab(tab.id); });
+      sheetTabs.bind(b, tab.id);
       tabsEl.appendChild(b);
       if (!tab.groups) return;
       var panel = document.createElement("section");
@@ -980,6 +1008,11 @@
    * pressed: two presses in one place. Surprise me draws again with Reroll.
    * Picking one over edits that wait asks first (Replace / Keep editing). */
   var CARD_IDS = { standard: "advreset", bigtank: "bigbtn", e1: "e1btn", hunters: "huntersbtn", currents: "currentsbtn", surprise: "randombig", file: "loadcp" };
+  /* each card's line is its recipe's (SCENARIOS: Big tank's is written from BIG_TANK) */
+  CFG.SCENARIOS.forEach(function (sc) {
+    var card = el(CARD_IDS[sc.id]), line = card && card.querySelector("span");
+    if (line) line.textContent = sc.blurb;
+  });
   function newSeed() { return (Math.random() * 0x100000000) >>> 0; }
   /* the seed the sheet shows (a scenario keeps it; Surprise me draws its own) */
   function shownSeed() { var s = formNum("seed"); return wholeIn(s, [0, 4294967295]) ? s : initArgs ? initArgs.seed : KEYS.seed[0]; }
@@ -1016,24 +1049,12 @@
   function startStaged() { restart(); }
   function setSheetTab(id) {
     currentTab = id;
-    CFG.TABS.forEach(function (tab) {
-      var on = tab.id === id;
-      el("tab-" + tab.id).setAttribute("aria-selected", on ? "true" : "false");
-      el("tab-" + tab.id).tabIndex = on ? 0 : -1;
-      el("panel-" + tab.id).hidden = !on;
-    });
+    sheetTabs.mark(id);
+    CFG.TABS.forEach(function (tab) { el("panel-" + tab.id).hidden = tab.id !== id; });
     panelsEl.scrollTop = 0;
     hideTip();
     store("evo_boids.ocean.tab", id);
   }
-  tabsEl.addEventListener("keydown", function (e) {
-    if (e.key !== "ArrowRight" && e.key !== "ArrowLeft") return;
-    var ids = CFG.TABS.map(function (t) { return t.id; });
-    var i = (ids.indexOf(currentTab) + (e.key === "ArrowRight" ? 1 : -1) + ids.length) % ids.length;
-    setSheetTab(ids[i]);
-    el("tab-" + ids[i]).focus();
-    e.preventDefault();
-  });
   function updateTabDots() {
     CFG.TABS.forEach(function (tab) {
       if (!tab.groups) return;
@@ -1067,8 +1088,15 @@
     [["toroidal"], function () { return nv("walls") ? "off with glass walls: a walled tank has no seam to sense across" : ""; }],
     [["foodPatchRadius", "foodDepthMode"], function () { return nv("foodPatches") > 0 ? "" : "needs food patches above 0"; }],
     [["foodDepthSpread"], function () { return nv("foodPatches") > 0 && nv("foodDepthMode") === 1 ? "" : "needs food patches, each at its own depth"; }],
-    [["foodDrift", "currentMode", "currentDrift", "deepCurrent"], function () { return hasCurrent() ? "" : "needs a current (strength above 0)"; }],
-    [["currentEddies", "currentCore"], function () { return hasCurrent() && nv("currentMode") === 0 ? "" : "needs a current in the eddies shape"; }],
+    /* food rides the whole flow: the current and the waves (src/ocean/ocean_world.hpp: flowE1, wallFlowOn) */
+    [["foodDrift"], function () { return hasCurrent() || nv("waveSpeed") > 0 ? "" : "needs a current or waves to carry it"; }],
+    [["currentMode", "currentDrift", "deepCurrent"], function () { return hasCurrent() ? "" : "needs a current (strength above 0)"; }],
+    [["currentEddies"], function () { return hasCurrent() && nv("currentMode") === 0 ? "" : "needs a current in the eddies shape"; }],
+    /* the eddies' radius, and with glass walls the current's fade at the glass in either shape (initFlowCache: wallBc) */
+    [["currentCore"], function () {
+      if (!hasCurrent()) return "needs a current (strength above 0)";
+      return nv("currentMode") === 0 || nv("walls") ? "" : "needs the eddies shape, or glass walls (where it sets the current's fade at the glass)";
+    }],
     [["predatorEconomy", "predatorSpeed", "predatorPerception", "predatorCaptureRadius", "predatorCooldown"],
       function () { return hasPredators() ? "" : "needs predators above 0"; }],
     [["predatorMeal", "predatorMetabolism", "predatorReproEnergy", "predatorMaxAge", "predatorMinPopulation",
@@ -1327,6 +1355,28 @@
       if (a !== b) out.push(k);
     });
     return out;
+  }
+  /* The live settings whose value changed during this world, set back or not: the run's history, which a
+   * comparison of settings forgets (a floor raised for a step and set back has added its founders). Set by
+   * an accepted change (liveApplied, EvoOcean.set); cleared only when a new world is committed (startWorld). */
+  var changedLive = {};
+  /* A world opened from a file (Save world's): the file keeps its setup and its settings, not what changed live before
+   * it was saved, so with no setting differing whether Replay repeats it is unknown, not "yes" (review of #88, round 2).
+   * Set when an open commits; a start or Replay (a new world from its setup) clears it. */
+  var historyUnknown = false;
+  /* EvoOcean.set's own last values (it changes the world around the sheet, so runCfg does not have them) */
+  var consoleSet = {};
+  /* for the history: the value the running world has for k, as far as the page knows, EvoOcean.set's included
+   * (undefined: a key the sheet does not know). Not runningVal (above), the sheet's view, which reads the size too. */
+  function historyVal(k) {
+    if (Object.prototype.hasOwnProperty.call(consoleSet, k)) return consoleSet[k];
+    return KEYS[k] ? cfgVal(k) : undefined;
+  }
+  /* what makes this run differ from its setup's replay: history, and a saved world's own tweaks (liveTweaks) */
+  function changedKeys() {
+    var o = Object.assign({}, changedLive);
+    liveTweaks().forEach(function (k) { o[k] = true; });
+    return Object.keys(o);
   }
   /* Edits waiting for the next start (the approved rule's fourth reason to
    * ask): a field changed (Fit and the E1 water too), a staged recipe
@@ -2179,6 +2229,15 @@
     if (s.n > 1 && s.ids[i] === notId) i = (i + 1 + Math.floor(Math.random() * (s.n - 1))) % s.n;
     return i;
   }
+  /* The fish card's live brain (EvoUI.activationClock): the senses and actions
+   * the last step kept, which it keeps only while a fish is picked (the
+   * capture, oc_set_capture: lazy, as it costs every fish its whole sensing).
+   * A fish picked in a world that stepped without it waits for the next step,
+   * which a paused world takes only when asked (Space, or . for one). */
+  var brainClock = EvoUI.activationClock();
+  /* the world's frame as the shim's last oc_sync left it: every step the page takes is synced at once (the
+   * frame loop, EvoOcean.step), so this is the world's tick between them (no sync here: it allocates) */
+  function syncedFrame() { return HO.f64(M, M._oc_stats(), statsLen)[1]; }
   /* handover: a followed fish died and another takes its place (the frame
    * loop), not a fish the visitor picked */
   function select(id, handover) {
@@ -2188,7 +2247,10 @@
     if (id !== null && id !== was && !handover) { cardNewer = true; cardHeld = false; }   /* its card, over the live numbers (updateCard) */
     /* the capture, only into a running engine (Close, Esc and the tour let go of a fish while it is stopped or
      * restarting too: review of #44, round 3, finding 3; a restarted one gets it with its run, applyDisplaySwitches) */
-    if ((was === null) !== (id === null) && M && engineState === "ok" && has("oc_set_capture")) M._oc_set_capture(id !== null ? 1 : 0);
+    if ((was === null) !== (id === null) && M && engineState === "ok" && has("oc_set_capture")) {
+      M._oc_set_capture(id !== null ? 1 : 0);
+      brainClock.capture(id !== null, syncedFrame());
+    }
     dirtyHud = true;
   }
   /* F: follow the selected fish; again (or with none): a random one */
@@ -2259,15 +2321,17 @@
 
   /* ---- the View menu and Help: one popover at a time; ×, Esc, its key or a
    * press outside closes it. [popover, trigger, its first control] ---- */
-  var POPS = { view: ["viewpop", "viewmenubtn", "lightnow"], help: ["helppop", "helpbtn", "tourbtn"] }, openPop = null, popOpener = null;
+  var POPS = { view: ["viewpop", "viewmenubtn", "lightnow"], help: ["helppop", "helpbtn", "tourbtn"] }, openPop = null, popOpener = UI.returnPoint();
   /* A press by the keyboard (its focus ring showing) keeps the focus; a
-   * pointer's lets it go, so Space goes back to pausing. */
-  function pointerBlur(n) { if (!n.matches(":focus-visible")) n.blur(); }
-  /* opener: the trigger, when the keyboard pressed it: the focus goes to the
-   * popover's first control, and back to the trigger when the keyboard closes it */
+   * pointer's lets it go, so Space goes back to pausing (web/ui_common.js). */
+  function pointerBlur(n) { UI.pointerBlur(n); }
+  /* opener: the trigger, when the keyboard pressed it (else null): the focus
+   * goes to the popover's first control, and back to the trigger when the
+   * keyboard closes it (closePop: the return point, web/ui_common.js). Each
+   * opening replaces it, so only the open popover's is ever restored. */
   function setPop(name, opener) {
     openPop = POPS[name] ? name : null;
-    popOpener = openPop && opener || null;
+    if (openPop) popOpener.set(opener);
     Object.keys(POPS).forEach(function (n) {
       el(POPS[n][0]).hidden = n !== openPop;
       el(POPS[n][1]).setAttribute("aria-expanded", n === openPop ? "true" : "false");
@@ -2278,13 +2342,12 @@
       if (dash() && dash().isOpen()) dash().close();
       if (!wideMQ.matches && drawerEl.classList.contains("open")) setDrawer(false);
       setStatPanel(false); hideCoach(); placePop();
-      if (popOpener) el(POPS[openPop][2]).focus();
+      if (popOpener.get()) el(POPS[openPop][2]).focus();
     }
   }
   function closePop(keyboard) {
-    var back = popOpener;
     setPop(null);
-    if (keyboard && back) back.focus();
+    popOpener.restore(keyboard);
   }
   function togglePop(name, opener, keyboard) { if (openPop === name) closePop(keyboard); else setPop(name, opener); }
   /* the View menu over its button, left of a wide screen's settings panel (a
@@ -2457,10 +2520,10 @@
 
   /* ---------------- the fish card ---------------- */
   var cardEl = el("fishcard"), inetCanvas = el("inetc"), inetCtx = inetCanvas.getContext("2d");
-  var portraitEl = el("iportrait"), portraitCtx = portraitEl.getContext("2d");
+  var portraitEl = el("iportrait");
   var cardExpanded = window.innerWidth >= 600, cardCache = {}, cardFor = null, cardFlip = false;
   el("iexpand").setAttribute("aria-expanded", cardExpanded ? "true" : "false");
-  var sensorNames = null, actionNames = null, netNodes = [], netHover = -1, uiFont = "";
+  var sensorNames = null, actionNames = null, netNodes = [], netHover = -1, uiFont = "", cardFresh = false;
   function prettyName(n) { return String(n).replace(/_/g, " ").toLowerCase(); }
   function brainShape() {
     if (!sensorNames) {
@@ -2504,37 +2567,29 @@
     cardFlip = flip;
     cardEl.classList.toggle("flip", flip);
   }
-  function drawPortrait(rgb, size, elong) {
-    var dpr = window.devicePixelRatio || 1, w = 56, h = 40;
-    if (portraitEl.width !== w * dpr) { portraitEl.width = w * dpr; portraitEl.height = h * dpr; }
-    var g = portraitCtx;
-    g.setTransform(dpr, 0, 0, dpr, 0, 0);
-    g.clearRect(0, 0, w, h);
-    var k = 3.0 * bodyScale(size), len = 1 + 0.35 * Math.tanh(4 * (elong - 1));
-    g.translate(w / 2 + 4, h / 2);
-    g.scale(len, 1);
-    g.fillStyle = "rgb(" + rgb.join(",") + ")";
-    g.beginPath();
-    g.moveTo(-9 * k / 1.2, 0);
-    g.bezierCurveTo(-7 * k / 1.2, -4.2 * k / 1.2, 2, -4.4 * k / 1.2, 6, -1.4);
-    g.lineTo(11, -5.5); g.lineTo(9.5, 0); g.lineTo(11, 5.5); g.lineTo(6, 1.4);
-    g.bezierCurveTo(2, 4.4 * k / 1.2, -7 * k / 1.2, 4.2 * k / 1.2, -9 * k / 1.2, 0);
-    g.fill();
-    g.fillStyle = "rgba(4,14,15,0.9)";
-    g.beginPath(); g.arc(-6.2 * k / 1.2, -1.2, 1.1, 0, Math.PI * 2); g.fill();
-    g.setTransform(1, 0, 0, 1, 0, 0);
-  }
-  /* The card's swatch: the fish's skin pattern on its flank (unlit, from its
-   * appearance genes; web/ocean_appearance.js), when the module exports it. */
-  var swatchEl = el("iswatch");
+  /* The card's two pictures of the fish (the UI parity plan's U45): the
+   * colour key (EvoUI.drawPortrait), a generic silhouette in the colour the
+   * charts and the colour modes give it, which is not its likeness (the tank
+   * draws the shape and skin it inherited); and, under it, its skin itself:
+   * the pattern on its flank, unlit, from its appearance genes
+   * (web/ocean_appearance.js), when the module exports them. Both captioned
+   * (ocean.html #ikey, #iskin). */
+  var swatchEl = el("iswatch"), skinEl = el("iskin");
   function drawSwatch(s, idx, size, elong) {
     var EA = window.EvoAppearance;
-    if (!swatchEl || !EA || !s.app) { if (swatchEl) swatchEl.hidden = true; return; }
+    if (!swatchEl || !EA || !s.app) { if (swatchEl) swatchEl.hidden = true; if (skinEl) skinEl.hidden = true; return; }
     var W = 96, H = 24, row = s.app.subarray(63 * idx, 63 * idx + 63);
     swatchEl.width = W; swatchEl.height = H;
     var ctx = swatchEl.getContext("2d");
     ctx.putImageData(new ImageData(EA.flankImage(row, EA.lambdaOf(size, elong), W, H), W, H), 0, 0);
     swatchEl.hidden = false;
+    if (skinEl) skinEl.hidden = false;
+  }
+  /* what the colour key's colour is, in this colour mode (its title) */
+  function keyTitle() {
+    return "A colour key, not a likeness: " + (colourMode === "brain" ? "the colour of its brain (similar wiring, similar colour)"
+      : colourMode === "appearance" ? "the colour of its family line, as the charts show it; in the tank it wears its own skin (below)"
+      : "the colour of its family line, as the charts show it") + ".";
   }
   /* oc_inspect(idx) right after the sync: its numbers, then the card */
   function inspect(idx) {
@@ -2568,11 +2623,27 @@
     }
     var info = f.info, id = Math.round(info[0]);
     var rgb = [s.colors[3 * idx], s.colors[3 * idx + 1], s.colors[3 * idx + 2]];
-    var pkey = id + "|" + rgb.join() + "|" + info[4].toFixed(2) + "|" + info[5].toFixed(2);
-    if (cardFor !== pkey) { cardFor = pkey; drawPortrait(rgb, info[4], info[5]); drawSwatch(s, idx, info[4], info[5]); }
+    var pkey = id + "|" + rgb.join() + "|" + info[4].toFixed(2) + "|" + info[5].toFixed(2) + "|" + colourMode;
+    if (cardFor !== pkey) {
+      cardFor = pkey;
+      EvoUI.drawPortrait(portraitEl, rgb, info[4], info[5], window.devicePixelRatio || 1);
+      drawSwatch(s, idx, info[4], info[5]);
+      el("ikey").title = keyTitle();
+    }
     cardText("ititle", "Fish #" + id);
-    cardText("isub", "Generation " + Math.round(info[6]) + " · family #" + Math.round(info[7]) + " · " + Math.round(info[11]) + " genes" +
-             (cfgVal("bodyModel") ? " · body " + info[4].toFixed(2) + " × " + info[5].toFixed(2) : ""));
+    /* the common fields, in their order (both pages: EvoUI.cardSubtitle); genes: its genome's length (oc_inspect), one link of its brain each */
+    cardText("isub", EvoUI.cardSubtitle({ generation: info[6], family: info[7], genes: info[11],
+                                          body: cfgVal("bodyModel") ? [info[4], info[5]] : null }));
+    /* its live brain: the last step's, or waiting for one (a fish just picked in a world that stepped without the
+     * capture, a new or handed-back world, a fish born in the last step; EvoUI.activationClock). data-activations:
+     * current or waiting; data-activations-at: the tick of the activations it shows, empty while it waits (stamp) */
+    var tick = s.stats[STATS.frame], state = brainClock.state(tick, info[3]), at = brainClock.stamp(tick, info[3]);
+    cardFresh = state === "current";
+    if (cardCache.acts !== state + "|" + at) {
+      cardCache.acts = state + "|" + at;
+      cardEl.dataset.activations = state;
+      cardEl.dataset.activationsAt = at === null ? "" : String(at);
+    }
     var reproE = cfgVal("reproEnergy"), maxAge = cfgVal("maxAge"), maxSpd = cfgVal("maxSpeed"), pitchMax = cfgVal("pitchMax");
     cardText("ienergyv", info[2].toFixed(1));
     setBar("ienergy", info[2] / (reproE * 2), 0.5);
@@ -2652,105 +2723,32 @@
       bodyLinkEl.hidden = false;
     } else if (bodyLinkEl) bodyLinkEl.hidden = true;
   }
-  function brainColor(v, a) {
-    var m = Math.min(1, Math.abs(v));
-    return v >= 0 ? "rgba(" + Math.round(70 + 130 * m) + "," + Math.round(90 + 150 * m) + "," + Math.round(60 + 10 * m) + "," + a + ")"
-                  : "rgba(" + Math.round(80 + 175 * m) + "," + Math.round(90 + 20 * m) + "," + Math.round(70 + 10 * m) + "," + a + ")";
-  }
-  /* senses -> hidden -> actions (renderer.js drawBrain, the Ocean's shape) */
+  /* senses -> hidden -> actions (EvoUI.drawBrain, both pages' network; the Ocean's shape, its depth senses and steer z) */
   function drawBrain(f) {
     var box = inetCanvas.parentNode, w = box.clientWidth, h = box.clientHeight;
     if (w < 60 || h < 60) return;
-    var sh = f.shape, nS = sh.nS, nH = sh.nH, nA = sh.nA;
+    var sh = f.shape;
     var dpr = window.devicePixelRatio || 1, bw = Math.round(w * dpr), bh = Math.round(h * dpr);
     if (inetCanvas.width !== bw) inetCanvas.width = bw;
     if (inetCanvas.height !== bh) inetCanvas.height = bh;
-    var g = inetCtx, i;
-    g.setTransform(dpr, 0, 0, dpr, 0, 0);
-    g.clearRect(0, 0, w, h);
-    var wide = w > h * 1.15, pos = { sen: [], hid: [], act: [] }, m = 14;
-    if (wide) {
-      var yIn = 26, yOut = h - 40, yHid = (yIn + yOut) / 2;
-      for (i = 0; i < nS; i++) pos.sen.push([m + (w - 2 * m) * i / (nS - 1), yIn]);
-      for (i = 0; i < nH; i++) pos.hid.push([m + 18 + (w - 2 * m - 36) * i / (nH - 1), yHid]);
-      for (i = 0; i < nA; i++) pos.act.push([m + 18 + (w - 2 * m - 36) * i / (nA - 1), yOut]);
-    } else {
-      var yTop = 26, yBot = h - 12, xS = 18, xA = w - 100, xH = (xS + xA) / 2;
-      for (i = 0; i < nS; i++) pos.sen.push([xS, yTop + (yBot - yTop) * i / (nS - 1)]);
-      for (i = 0; i < nH; i++) pos.hid.push([xH, yTop + (yBot - yTop) * i / (nH - 1)]);
-      for (i = 0; i < nA; i++) pos.act.push([xA, yTop + (yBot - yTop) * i / (nA - 1)]);
-    }
-    var hoverKey = netHover >= 0 && netNodes[netHover] ? netNodes[netHover].kind + netNodes[netHover].i : null;
-    for (var k = 0; k < f.connCount; k++) {
-      var o = k * 5;
-      var srcSen = f.conns[o] !== 0, srcNum = f.conns[o + 1] | 0, sinkAct = f.conns[o + 2] !== 0, sinkNum = f.conns[o + 3] | 0, wgt = f.conns[o + 4];
-      var a = srcSen ? pos.sen[srcNum] : pos.hid[srcNum], b = sinkAct ? pos.act[sinkNum] : pos.hid[sinkNum];
-      if (!a || !b) continue;
-      var srcAct = srcSen ? f.sensors[srcNum] : f.hidden[srcNum];
-      var mag = Math.min(1, Math.abs(wgt) * Math.abs(srcAct) * 1.5);
-      var hl = hoverKey !== null && ((srcSen ? "Sense" : "Hidden neuron") + srcNum === hoverKey ||
-                                     (sinkAct ? "Action" : "Hidden neuron") + sinkNum === hoverKey);
-      g.strokeStyle = (wgt >= 0 ? "rgba(180,235,80," : "rgba(255,120,80,") + (hl ? 0.9 : (0.10 + 0.7 * mag)).toFixed(3) + ")";
-      g.lineWidth = hl ? 2 : 0.8 + 1.6 * mag;
-      g.beginPath();
-      g.moveTo(a[0], a[1]);
-      if (wide) g.bezierCurveTo(a[0], (a[1] + b[1]) / 2, b[0], (a[1] + b[1]) / 2, b[0], b[1]);
-      else g.bezierCurveTo((a[0] + b[0]) / 2, a[1], (a[0] + b[0]) / 2, b[1], b[0], b[1]);
-      g.stroke();
-    }
-    netNodes = [];
-    function node(p, r, v, kind, idx) {
-      g.fillStyle = brainColor(v, 1);
-      g.beginPath(); g.arc(p[0], p[1], r, 0, Math.PI * 2); g.fill();
-      g.strokeStyle = "rgba(4,14,16,0.85)"; g.lineWidth = 1; g.stroke();
-      netNodes.push({ x: p[0], y: p[1], kind: kind, i: idx, v: v });
-    }
-    var rs = Math.max(2, Math.min(3.2, (wide ? w : h) / nS * 0.36));
-    for (i = 0; i < nS; i++) node(pos.sen[i], rs, f.sensors[i], "Sense", i);
-    for (i = 0; i < nH; i++) node(pos.hid[i], 5, f.hidden[i], "Hidden neuron", i);
-    for (i = 0; i < nA; i++) node(pos.act[i], 5.5, f.actions[i], "Action", i);
-    if (netHover >= 0 && netNodes[netHover]) {
-      var hn = netNodes[netHover];
-      g.strokeStyle = "rgba(230,255,160,0.95)"; g.lineWidth = 2;
-      g.beginPath(); g.arc(hn.x, hn.y, 8, 0, Math.PI * 2); g.stroke();
-    }
     if (!uiFont) uiFont = getComputedStyle(document.body).fontFamily;
-    g.font = "11px " + uiFont;
-    function tag(text, x, y) {
-      var tw = g.measureText(text).width;
-      g.fillStyle = "rgba(15,39,39,0.92)"; g.fillRect(x - 3, y - 10, tw + 6, 14);
-      g.fillStyle = "rgba(190,210,205,0.95)"; g.fillText(text, x, y);
-    }
-    g.fillStyle = "rgba(190,210,205,0.9)";
-    if (wide) {
-      tag("senses", m, 13);
-      tag("hidden", m, (26 + h - 40) / 2 - 9);
-      g.fillStyle = "rgba(190,210,205,0.9)";
-      g.textAlign = "center";
-      for (i = 0; i < nA; i++) g.fillText(ACTION_SHORT[i] || "", pos.act[i][0], h - 40 + (i % 2 ? 30 : 18));
-      g.textAlign = "left";
-    } else {
-      g.fillText("senses", 6, 13);
-      g.fillText("hidden", (18 + w - 100) / 2 - 18, 13);
-      g.fillText("actions", w - 106, 13);
-      for (i = 0; i < nA; i++) g.fillText(ACTION_LABELS[i] || "", pos.act[i][0] + 10, pos.act[i][1] + 4);
-    }
+    netNodes = EvoUI.drawBrain(inetCtx, w, h, f, { nS: sh.nS, nH: sh.nH, nA: sh.nA, gutter: 100, actShort: ACTION_SHORT, actLabels: ACTION_LABELS,
+                                                   font: uiFont, dpr: dpr, fresh: cardFresh, prev: netNodes, hover: netHover });
     updateSenseLine();
   }
-  var DEFAULT_SENSE = "Senses on one side, actions on the other. Lime links excite, orange ones inhibit; brighter = stronger right now. Tap a dot to name it.";
   function updateSenseLine() {
     if (netHover >= 0 && netNodes[netHover]) {
       var n = netNodes[netHover];
       var label = n.kind === "Sense" ? (sensorNames[n.i] || "sense " + (n.i + 1)) : n.kind === "Action" ? (ACTION_LABELS[n.i] || actionNames[n.i]) : "neuron " + (n.i + 1);
-      var html = n.kind + ": <b></b> " + (n.v >= 0 ? "+" : "") + n.v.toFixed(2);
+      var html = EvoUI.senseHtml(n, cardFresh);
       if (cardCache.sense !== html + label) {
         cardCache.sense = html + label;
         el("isense").innerHTML = html;
         el("isense").querySelector("b").textContent = label;
       }
-    } else if (cardCache.sense !== "default") {
-      cardCache.sense = "default";
-      el("isense").textContent = coarseMQ.matches ? DEFAULT_SENSE : DEFAULT_SENSE.replace("Tap", "Point at");
+    } else {
+      var t = EvoUI.senseIdle(cardFresh, coarseMQ.matches, paused, "Space runs it; . steps once");
+      if (cardCache.sense !== t) { cardCache.sense = t; el("isense").textContent = t; }
     }
   }
   function nearestNode(e) {
@@ -3174,7 +3172,7 @@
       }
     } else slowSince = 0;
   }
-  function restoreDetail() { if (scene && detail0) scene.setQuality(detail0); }
+  function restoreDetail() { if (scene && detail0 && scene.setQuality(detail0)) engineCall(updateModeline); }
 
   /* ---------------- the loop ---------------- */
   var splashDone = false;
@@ -3233,7 +3231,10 @@
     s = updateCard(s);
     pt = PROF.lap(SP.card, pt);
     fpsFrames++;
-    if (now - fpsT >= 1000) { fps = Math.round(fpsFrames * 1000 / (now - fpsT)); fpsFrames = 0; fpsT = now; dirtyHud = true; govern(now); }
+    if (now - fpsT >= 1000) {
+      fps = Math.round(fpsFrames * 1000 / (now - fpsT)); fpsFrames = 0; fpsT = now; dirtyHud = true; govern(now);
+      if (scene.quality() !== modelineDetail) updateModeline();   /* (the detail changed: Hold 60 fps, or a benchmark's case) */
+    }
     updateHud(s, now);
     PROF.lap(SP.hud, pt);
     if (!splashDone) { splashDone = true; el("splash").classList.add("done"); }
@@ -3251,24 +3252,13 @@
   function releaseMoveKeys() { heldMoveKeys = {}; shiftHeld = false; }
   /* a focused field takes the keys: the text inputs, selects, text areas and
    * editable text (the settings' number fields among them). A switch or a
-   * slider is not one: letters are shortcuts there too (ownKey keeps theirs). */
-  function typingIn(t) {
-    if (!t || !t.tagName) return false;
-    if (t.tagName === "INPUT") return !/^(checkbox|radio|range|button|submit|reset|color|file|image)$/i.test(t.type || "text");
-    return t.tagName === "TEXTAREA" || t.tagName === "SELECT" || !!t.isContentEditable;
-  }
-  /* the keys a focused control acts on itself: Space and Enter press a button
-   * or turn a switch (Enter follows a link), a slider takes the arrows, Home,
-   * End and Page Up / Down, a tab the arrows. Every other key stays a shortcut. */
-  function ownKey(t, k) {
-    if (!t || !t.tagName) return false;
-    var press = k === " " || k === "Spacebar" || k === "Enter";
-    if (t.tagName === "BUTTON") return press || (/^Arrow/.test(k) && t.getAttribute("role") === "tab");
-    if (t.tagName === "A") return k === "Enter";
-    if (t.tagName !== "INPUT") return false;
-    if (t.type === "range") return /^(Arrow|Page)/.test(k) || k === "Home" || k === "End";
-    return press && (t.type === "checkbox" || t.type === "radio");
-  }
+   * slider is not one: letters are shortcuts there too (ownKey keeps theirs).
+   * And the keys a focused control acts on itself: Space and Enter press a
+   * button or turn a switch (Enter follows a link), a slider takes the arrows,
+   * Home, End and Page Up / Down, a tab its arrows, Home and End. Every other
+   * key stays a shortcut. (web/ui_common.js: both pages' rule) */
+  function typingIn(t) { return UI.typingIn(t); }
+  function ownKey(t, k) { return UI.ownsKey(t, k); }
   /* One owner for each Esc, the top layer: the tour (web/guide.js), then the
    * charts (web/ocean_dash.js: it leaves an Esc to the tour), then this
    * page's own (a popover, the settings, the live numbers, the fish). Seen
@@ -3520,7 +3510,7 @@
    * question is answered Keep; a pointer's press blurs it, as btn's. */
   function askBtn(id, fn, back) {
     el(id).addEventListener("click", fenced(function (e) {
-      var kb = this.matches(":focus-visible") || (!!e && e.detail === 0);
+      var kb = UI.pressedByKeyboard(this, e);
       fn();
       if (kb && asking) { asking.opener = back ? el(back) : this; el("startconfirm").focus(); }
       else this.blur();
@@ -3554,11 +3544,11 @@
   btn("lightbtn", toggleLight);
   ["view", "help"].forEach(function (n) {   /* the triggers; × closes (pointerBlur, setPop: the focus) */
     el(POPS[n][1]).addEventListener("click", function () {
-      var kb = this.matches(":focus-visible");
+      var kb = UI.keyboardFocused(this);
       togglePop(n, kb ? this : null, kb);
       if (!kb) this.blur();
     });
-    el(n + "close").addEventListener("click", function () { closePop(this.matches(":focus-visible")); });
+    el(n + "close").addEventListener("click", function () { closePop(UI.keyboardFocused(this)); });
   });
   btn("tourbtn", function () { setPop(null); if (window.EvoGuide) EvoGuide.start(); });
   btn("whatturbo", function () { setPop(null); if (window.EvoGuide && EvoGuide.turbo) EvoGuide.turbo(); });
@@ -3593,7 +3583,7 @@
    * the file dialog comes between, so it is remembered here) */
   var fileOpener = null;
   el("loadcp").addEventListener("click", function (e) {
-    fileOpener = this.matches(":focus-visible") || (!!e && e.detail === 0) ? this : null;
+    fileOpener = UI.pressedByKeyboard(this, e) ? this : null;
     if (!fileOpener) this.blur();
     el("cpfile").click();
   });
@@ -3738,6 +3728,12 @@
     applyClarity();
   });
   el("clarity").addEventListener("pointerup", function () { this.blur(); });   /* the keys go back to the tank; arrow keys keep it */
+  /* the tank draws family colours: Family, or Appearance where the world has no appearance genes (updateModeline's rule) */
+  function tankShowsFamily() {
+    if (colourMode !== "appearance") return colourMode === "family";
+    return !engineCall(function () { return HAS_APP ? (has("oc_appearance_flags") ? M._oc_appearance_flags() : 3) : 0; }, 3);
+  }
+  var modelineDetail = 0;   /* the detail level the modeline says */
   function updateModeline() {
     /* the world's appearance genes (bit 1 patterns, bit 2 shapes; 0 = off, or a module without them) */
     var flags = HAS_APP ? (has("oc_appearance_flags") ? M._oc_appearance_flags() : 3) : 0;
@@ -3745,8 +3741,20 @@
       ? (flags ? ", each fish drawn from its appearance genes (skin pattern and body shape)"
                : ", coloured by family (" + (HAS_APP ? "the appearance genes are off in this world" : "this module has no appearance genes") + ")")
       : (flags & 2 ? ", each fish in its inherited body shape" : "") + (colourBrain ? ", coloured by brain" : ", coloured by family");
-    el("modeline").textContent = "Running the single-threaded Ocean module, reproducible from the seed" +
-      (HAS_EYE ? " (the eye build)" : "") + ". The tank: " + W + " × " + H + " × " + D +
+    /* what replays: the module is serial and Hold 60 fps never changes the run; a live change is not part of the setup,
+     * set back or not (changedKeys: the run's history); a world opened from a file, its history unknown (historyUnknown).
+     * As data too: data-replay "yes" / "no" / "unknown", data-why "live" and / or "opened". */
+    var tw = changedKeys().length, ml = el("modeline");
+    modelineDetail = scene ? scene.quality() : 0;
+    ml.dataset.replay = tw ? "no" : historyUnknown ? "unknown" : "yes";
+    ml.dataset.why = [tw ? "live" : "", historyUnknown ? "opened" : ""].filter(Boolean).join(" ");
+    ml.textContent = "Running the single-threaded Ocean module" + (HAS_EYE ? " (the eye build)" : "") +
+      ": the same seed and setup replay a run step for step" +
+      (tw ? "; " + (tw === 1 ? "a setting was" : tw + " settings were") + " changed live during this run, which is not part of its setup" +
+            " (even if set back), so Replay starts it again without " + (tw === 1 ? "that change" : "those changes")
+          : historyUnknown ? "; this world was opened from a file, which does not record what changed live before it was saved, so whether" +
+            " Replay repeats this run is unknown (Start or Replay begins one that does)" : "") +
+      ". The tank: " + W + " × " + H + " × " + D +
       (WALLS ? ", glass walls" : ", the sides wrap around") +
       ". Drawing: the 3D tank" + (scene ? ", detail " + scene.quality() + " of 3" : "") +
       what + ".";
@@ -4031,6 +4039,10 @@
       depth: function () { return D; },
       /* (the charts' timer: never into a stopped or restarting engine; a trap here stops it once) */
       familyColor: function (id) { return engineCall(function () { return has("oc_family_color") ? M._oc_family_color(id) : 0x3b5957; }, 0x3b5957); },
+      /* what the tank's fish wear now: "family" (Family, or Appearance in a world without appearance genes), "appearance" or
+       * "brain"; and the charts' way to show their family colours in the tank */
+      colourMode: function () { return tankShowsFamily() ? "family" : colourMode; },
+      showFamilyColours: function () { setColourMode("family"); },
       wiring: function () { return turboState !== "live" ? wiringNow() : engineCall(wiringNow, null); },
       setDrawer: setDrawer,
       /* the charts cover the page: no popover left open under them, and the coach mark goes */
@@ -4053,8 +4065,17 @@
       set: function (name, v) {
         return engineCall(function () {
           if (!has("oc_set_param")) return false;
-          var ok = withCString(String(name), function (p) { return M._oc_set_param(p, +v); });
+          var key = String(name), was = historyVal(key);
+          var ok = withCString(key, function (p) { return M._oc_set_param(p, +v); });
           if (!ok) console.warn("oc_set_param(" + name + "): " + lastError());
+          else {
+            /* around the sheet: the run's history all the same, by value as liveApplied's (the engine reads a whole-number
+             * key as an int: truncated); a key the sheet does not know has no known value, so it counts */
+            var now = KEYS[key] ? valOf(key, wholeKey(key) ? Math.trunc(+v) : +v) : +v;
+            if (was === undefined || now !== was) changedLive[key] = true;
+            consoleSet[key] = now;
+            updateModeline();
+          }
           readLight();
           return !!ok;
         }, false);

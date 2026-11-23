@@ -44,7 +44,7 @@
 #      sampling, reference ages permuted per prey snapshot x replicate (common manifest /2), one
 #      common checkpoint and reseed per prey snapshot x replicate and one transplant seed per
 #      predator snapshot x replicate across families, short and long horizons (the long subset
-#      exact), bundles /2 with their roles in the chunk index, the actual sharing recorded (group
+#      exact), bundles /3 with their roles in the chunk index, the actual sharing recorded (group
 #      keys, seeds, the realized common checkpoint, donor draw and placement: one per transplant
 #      group, checked at packing), and a replay.
 set -u
@@ -67,6 +67,10 @@ grep -q ResourceWarning unit.log && { grep -m 5 ResourceWarning unit.log; fail "
 # the map graph (stdlib) and the recovery simulation (numpy: skipped without it, unless RQ_REQUIRE_NUMPY=1)
 $PY -W error::ResourceWarning "$T/test_graph.py" > graph_unit.log 2>&1 || { tail -30 graph_unit.log; fail "graph unit tests"; }
 grep -q ResourceWarning graph_unit.log && fail "the graph unit tests leak file handles"
+# additive recovery partitions, forward reference access, and frozen synthetic attrition
+$PY -W error::ResourceWarning "$T/test_recovery_extra.py" > recovery_extra_unit.log 2>&1 \
+    || { tail -40 recovery_extra_unit.log; fail "recovery extension unit tests"; }
+grep -q ResourceWarning recovery_extra_unit.log && fail "the recovery extension tests leak file handles"
 
 # --- tiny Stage C worlds: A and B (periodic checkpoints at 1500 and 3000, a one-step F1 replay), a template
 STAGEC="--population 200 --predators 6 --predator-economy --predator-brain --predator-meal 14
@@ -198,6 +202,9 @@ groups = {}
 for cid, b in B.items():
     sc, cl = b["score"], b["cell"]
     assert sc["schema"] == "finfolk.redqueen.score/1" and [h["steps"] for h in sc["horizons"]] == [200, 600]
+    # (D8 v2 rule 48) the age summary bound before the checkpoints went, through completion and packing
+    assert b["schema"] == "finfolk.redqueen.bundle/3" and store.age_summary_problems(b) == [], \
+        (cid, store.age_summary_problems(b))
     h5 = sc["horizons"][-1]
     assert 0 <= h5["survival"] <= 1 and h5["deaths_predation"] == h5["captures"], (cid, h5)
     if cl["kind"] == "nopred":
@@ -523,7 +530,8 @@ assert lm["units"] == 6 and lm["long"] == 2, lm          # (the scripted edge's 
 B = {c: json.loads(store.read_member("r15", c, cells=cells)) for c in cells}
 for cid, b in B.items():
     c = b["cell"]
-    assert b["schema"] == "finfolk.redqueen.bundle/2" and cells[cid][1]["role"] == c["role"]
+    assert b["schema"] == "finfolk.redqueen.bundle/3" and cells[cid][1]["role"] == c["role"]
+    assert store.age_summary_problems(b) == [], (cid, store.age_summary_problems(b))   # (D8 v2 rule 48)
     hs = [h["steps"] for h in b["score"]["horizons"]]
     assert hs == ([400, 800] if c["horizon"] == "long" else [400]), (cid, hs)
     assert c["sampling"] == "wor-balanced"

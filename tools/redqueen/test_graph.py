@@ -2044,5 +2044,2627 @@ class TestMap(unittest.TestCase):
         self.assertEqual(rec.REGISTERED_LAMBDAS, (0.01, 0.02, 0.05, 0.2))
 
 
+# ------------------------------------------------------------------ map.py in bank mode (A_design_v5.md 3.3)
+# Red Queen recovery option A, work package 2: tests T6-2, T6-7, T6-8, T6-10, T6-11 of A_design_v5 section 5 (and
+# T6-1's map.fit clause). Synthetic only (D9): fitter tables from synthetic curves, counts drawn from the law here.
+import math  # noqa: E402
+from fractions import Fraction  # noqa: E402
+from unittest import mock  # noqa: E402
+
+# The T6-10 REFERENCE INTEGRATOR (A_design_v5 T6-10 and PC-25, frozen; its refinement amended by A_design_v5
+# clarification 2, D2). It shares no code with the scorer (map.pred_count_lpd, _grid_pass, _score_law, _tail_ok,
+# _log_2sf, _interval_logp, noisebank): its own upper-tail function, interval probabilities, thresholds, link and table
+# interpolation (numpy's interp). Budget: tail <= 1e-10 relative (rigorous), quadrature <= 1e-9 in log (the halving
+# certificate: evidence, not a bound), total about 1.1e-9.
+REF_TAIL = 1e-10            # the tail budget (v5; v4's 1e-6 is the negative control of T6-11)
+REF_TAIL_V4 = 1e-6
+REF_SPACING = 5e-5          # the first node spacing, prior SDs (400,001 nodes over +-10 SD, more as the range extends)
+REF_START = 10.0            # the first range: +-10 SD
+REF_STEP = 2.0              # each extension: 2 SD per side
+REF_CAP = 60.0              # beyond +-60 SD a case is refused as unrepresentable
+REF_CERT = 1e-9             # the certificate: two consecutive estimates within this (log units)
+REF_HALVINGS = 4            # clarification 2 D2: at most four halvings (final spacing >= 3.125e-6 SD)
+REF_CHUNK = 1 << 21         # (nodes evaluated per chunk when the spacing is halved)
+REF_SF_SWITCH = 25.0        # the log upper tail: math.erfc below, the Laplace continued fraction at and above
+REF_CF_TERMS = 60
+_REF_LOG_SQRT2PI = 0.5 * math.log(2.0 * math.pi)
+_REF_ERFC = []
+
+
+def ref_log_sf(x):
+    """log P(Z > x) for a standard normal Z, elementwise: log(erfc(x / sqrt 2) / 2) with math.erfc below 25, and at
+    and above 25, -x^2/2 - log sqrt(2 pi) - log(x + 1/(x + 2/(x + 3/(x + ...)))) (Laplace's continued fraction, 60
+    terms), so a far tail never underflows."""
+    if not _REF_ERFC:
+        _REF_ERFC.append(np.frompyfunc(math.erfc, 1, 1))
+    x = np.asarray(x, float)
+    out = np.empty(x.shape)
+    lo = x < REF_SF_SWITCH
+    if lo.any():
+        xl = x[lo] / math.sqrt(2.0)
+        e = np.empty(xl.shape)
+        for k in range(0, xl.size, 1 << 20):
+            e[k:k + (1 << 20)] = _REF_ERFC[0](xl[k:k + (1 << 20)]).astype(float)
+        out[lo] = np.log(0.5 * e)
+    hi = ~lo
+    if hi.any():
+        xh = x[hi]
+        t = np.zeros(xh.shape)
+        for k in range(REF_CF_TERMS, 0, -1):
+            t = k / (xh + t)
+        out[hi] = -0.5 * xh * xh - _REF_LOG_SQRT2PI - np.log(xh + t)
+    return out
+
+
+def ref_log_iprob(u1, u2):
+    """log(Phi(u2) - Phi(u1)) for u1 < u2 (infinite ends allowed), from upper tails S only: both ends at or above 0
+    -> S(u1) - S(u2); both at or below 0 -> S(-u2) - S(-u1); straddling 0 -> 1 - S(-u1) - S(u2)."""
+    u1, u2 = np.broadcast_arrays(np.asarray(u1, float), np.asarray(u2, float))
+    out = np.empty(u1.shape)
+    up = u1 >= 0.0
+    dn = u2 <= 0.0
+    mid = ~(up | dn)
+    for sel, a_, b_ in ((up, u1, u2), (dn, -u2, -u1)):
+        if sel.any():
+            la, lb = ref_log_sf(a_[sel]), ref_log_sf(b_[sel])
+            out[sel] = la + np.log(-np.expm1(lb - la))
+    if mid.any():
+        out[mid] = np.log1p(-(np.exp(ref_log_sf(-u1[mid])) + np.exp(ref_log_sf(u2[mid]))))
+    return out
+
+
+def ref_count_logp(k, loc, var, B):
+    """log P(K = k) of a capture count (scale = ceiling = B; Annex H.9.2's rounded logit-normal: the latent interval
+    [logit((k - 1/2)/B), logit((k + 1/2)/B)), open at 0 and B) at latent locations loc and variances var."""
+    sd = np.sqrt(np.asarray(var, float))
+    lo = -math.inf if k == 0 else math.log((k - 0.5) / (B - k + 0.5))
+    hi = math.inf if k == B else math.log((k + 0.5) / (B - k - 0.5))
+    return ref_log_iprob((lo - loc) / sd, (hi - loc) / sd)
+
+
+def ref_log_integral(loglik, sigma, tail=REF_TAIL, start=REF_START, cap=REF_CAP, halvings=REF_HALVINGS):
+    """log of the integral of N(e; 0, sigma^2) L(e) de for a likelihood 0 <= L <= 1 given as loglik(e) = log L(e)
+    (vectorized), by the frozen rule of A_design_v5 T6-10: the log-sum-exp trapezoid on nodes e = i h, exact integer
+    multiples of h = 5e-5 sigma, over [-b, b], b = 10 sigma at first and extended symmetrically by 2 sigma until
+    log(2 S(b / sigma)) <= log(tail) + log I^ (I^ the integral over the current range; rigorous because L <= 1: the
+    omitted part is at most 2 S(b / sigma)); refused (ValueError) beyond +-60 sigma. Then (A_design_v5 clarification 2,
+    D2, which replaces v5's single halving) the spacing is halved until two consecutive estimates differ by at most
+    REF_CERT in log, at most `halvings` times (four: final spacing >= 3.125e-6 sigma); the finer of the last two is the
+    reference and their |difference| its certificate (certified: <= REF_CERT); the tail criterion is re-asserted with
+    the final estimate (fine_bound_ok). A case not certified is returned with certified False, for the caller to fail.
+    -> {log_I, coarse (the estimate at 5e-5 sigma), estimates [(spacing in sigma units, log I^) per spacing],
+    halvings, spacing (the final one, in sigma units), certificate, certified, b (in SD), trace [(b, log bound, log I^,
+    stopped) per range step], fine_bound_ok}."""
+    h = REF_SPACING * sigma
+    lnorm = -math.log(sigma) - _REF_LOG_SQRT2PI
+
+    def logf(e):
+        return loglik(e) - 0.5 * (e / sigma) ** 2 + lnorm
+
+    def trap(lf, hh):
+        t = lf.copy()
+        t[0] += math.log(0.5)
+        t[-1] += math.log(0.5)
+        mx = float(np.max(t))
+        if not math.isfinite(mx):
+            return mx
+        return mx + math.log(float(np.sum(np.exp(t - mx)))) + math.log(hh)
+
+    n, step, ncap = int(round(start / REF_SPACING)), int(round(REF_STEP / REF_SPACING)), int(round(cap / REF_SPACING))
+    lf = logf(np.arange(-n, n + 1) * h)
+    trace = []
+    while True:
+        log_i = trap(lf, h)
+        b = n * REF_SPACING
+        bound = math.log(2.0) + float(ref_log_sf(np.array([b]))[0])
+        stop = bound <= math.log(tail) + log_i
+        trace.append((b, bound, log_i, bool(stop)))
+        if stop:
+            break
+        if n + step > ncap:
+            raise ValueError(f"reference: the tail bound still fails at +-{b:g} SD (cap {cap:g}): unrepresentable")
+        lf = np.concatenate([logf(np.arange(-n - step, -n) * h), lf, logf(np.arange(n + 1, n + step + 1) * h)])
+        n += step
+    ests = [(REF_SPACING, log_i)]
+    for j in range(1, halvings + 1):          # (halve: the old nodes stay, the midpoints are new; all exact multiples)
+        hj = h / 2.0 ** j
+        nj = n * 2 ** j
+        lf2 = np.empty(2 * nj + 1)
+        lf2[0::2] = lf
+        odd = np.arange(-nj + 1, nj, 2)
+        new = np.empty(len(odd))
+        for k in range(0, len(odd), REF_CHUNK):
+            new[k:k + REF_CHUNK] = logf(odd[k:k + REF_CHUNK] * hj)
+        lf2[1::2] = new
+        lf = lf2
+        ests.append((REF_SPACING / 2.0 ** j, trap(lf, hj)))
+        if abs(ests[-1][1] - ests[-2][1]) <= REF_CERT:
+            break
+    final, cert = ests[-1][1], abs(ests[-1][1] - ests[-2][1])
+    return {"log_I": final, "coarse": log_i, "estimates": ests, "halvings": len(ests) - 1, "spacing": ests[-1][0],
+            "certificate": cert, "certified": bool(cert <= REF_CERT), "b": b, "trace": trace,
+            "fine_bound_ok": bool(trace[-1][1] <= math.log(tail) + final)}
+
+
+def ref_link(knots=None, theta=None, lo=0.0, hi=1.0):
+    """The reference's own link G(eta) = logit(lo + (hi - lo) sigma(h(eta))), h the linear spline through (knots,
+    theta) extended linearly beyond the end knots (knots None: the identity); no code shared with map.Link."""
+    if knots is None:
+        def hfun(e):
+            return np.asarray(e, float)
+    else:
+        kn, th = np.asarray(knots, float), np.asarray(theta, float)
+
+        def hfun(e):
+            e = np.asarray(e, float)
+            i = np.clip(np.searchsorted(kn, e, side="right") - 1, 0, len(kn) - 2)
+            return th[i] + (e - kn[i]) * (th[i + 1] - th[i]) / (kn[i + 1] - kn[i])
+    if lo == 0.0 and hi == 1.0:
+        return hfun
+
+    def G(e):
+        hv = hfun(e)
+        with np.errstate(over="ignore"):
+            s, sc = 1.0 / (1.0 + np.exp(-hv)), 1.0 / (1.0 + np.exp(hv))
+        return np.log(lo + (hi - lo) * s) - np.log((1.0 - hi) + (hi - lo) * sc)
+    return G
+
+
+# The main-branch code the hook-unset tests compare with byte for byte: map.py lines 530-547 and 951-1088 at main
+# (@4991907 = @1555de5 = @dc64646, identical), verbatim (capture_scale; the scorer's constants, _logsumexp,
+# _grid_pass, pred_count_lpd), executed against map.py's own unchanged helpers.
+MAIN_CAPTURE_SCALE = '''
+UNIT_FLOOR = 1e-6                       # (the absolute unit's floor: noiseless data)
+
+
+def capture_scale(V, zrep, R):
+    """The capture rows' working weights and their ABSOLUTE scale under the registered predictive model
+    (Codex #66 r2 P2-1). Cell e's replicate-mean variance is v_e = phi V_e / R, with phi = mean(zrep / V)
+    the replicate dispersion of the variance function V (zrep: the cells' replicate variances). The weights
+    are w_e = (1 / V_e) / mean(1 / V) (mean 1, so the penalties keep their meaning), and one weight unit is
+    unit = phi / (R mean(1 / V)), so unit / w_e = v_e exactly: a weighted Hessian times unit is the absolute
+    covariance. V None (unweighted): w = 1, phi = mean(zrep), unit = phi / R. -> (w, unit, phi)."""
+    zrep = np.asarray(zrep, float)
+    if V is None:
+        phi = float(np.mean(zrep))
+        return np.ones(len(zrep)), max(phi / R, UNIT_FLOOR), phi
+    V = np.maximum(np.asarray(V, float), 1e-8)
+    M = float(np.mean(1.0 / V))
+    phi = float(np.mean(zrep / V))
+    return (1.0 / V) / M, max(phi / (R * M), UNIT_FLOOR), phi
+'''
+
+MAIN_SCORER = '''
+TRAP_H = 0.25                            # (the grid step, in units of the narrowest replicate SD / steepest slope)
+TRAP_SD = 7.0                            # (the grid covers +-TRAP_SD prior SDs)
+TRAP_KS = (15, 23, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193,
+           12289, 16385, 24577, 32769, 49153, 65537, 98305, 131073, 196609, 262145)   # (grid sizes: bucketed)
+TRAP_CELLS = 1_000_000                   # (pairs x replicates x nodes per vectorized chunk)
+TRAP_TOL = 1e-3                          # (the a-posteriori check, log units: full grid vs every other node)
+TRAP_SPAN_MAX = 8                        # (the range may double up to +-TRAP_SD x 8 = +-56 prior SDs)
+TRAP_EDGE = math.log(1e-10)              # (an end node's share of the integral above this: the range is extended)
+VMIN_GRID = np.linspace(-20.0, 20.0, 20001)    # (the logit grid on which the variance function's minimum is taken)
+
+
+def _logsumexp(a, axis):
+    mx = np.max(a, axis=axis, keepdims=True)
+    mx = np.where(np.isfinite(mx), mx, 0.0)
+    with np.errstate(divide="ignore"):
+        return np.squeeze(mx, axis=axis) + np.log(np.sum(np.exp(a - mx), axis=axis))
+
+
+def _grid_pass(lk, m, cnt, eta, sd, N, K, span):
+    """The e-order trapezoid, in log space, on K nodes over +-TRAP_SD x span prior SDs (span per pair), the same
+    on every other node (the check), and the larger end node's log share of the integral (the range check) ->
+    (log P, log P on the half grid, edge share), pairs x replicates. The integrand is the registered one at every
+    node: the bounded count probability with the replicate variance phi V(G(eta + e)) at that node."""
+    x = np.linspace(-1.0, 1.0, K)[None, :] * (TRAP_SD * span)[:, None]                      # (pairs x nodes, SDs)
+    lw = -0.5 * x * x
+    lwh = lw[:, ::2] - _logsumexp(lw[:, ::2], 1)[:, None]
+    lw = lw - _logsumexp(lw, 1)[:, None]
+    loc = lk.G(eta[:, None] + sd[:, None] * x)
+    lp = _interval_logp(cnt[:, :, None], N, loc[:, None, :], _rep_var(m, loc)[:, None, :])
+    terms = lp + lw[:, None, :]
+    full = _logsumexp(terms, 2)
+    with np.errstate(invalid="ignore"):
+        edge = np.maximum(terms[..., 0], terms[..., -1]) - full
+    return full, _logsumexp(lp[..., ::2] + lwh[:, None, :], 2), edge
+
+
+def pred_count_lpd(D, m, idx, cnt, N, own=None, info=None):
+    """THE registered score (v4 §7.6) of the capture head on pairs idx: the capture-count log predictive
+    density per replicate observation, with the predictor-scale uncertainty (pred_eta: the posterior variance
+    of eta and the pair residual delta_ij, both INSIDE the link) integrated through the link:
+        P(K = k) = E_e[P(k | G(eta + e), phi V(G(eta + e)))],  e ~ N(0, s2),
+    each P from Annex H.9.2's bounded model with the fresh replicate's variance (count_logp). Per observation
+    (the marginal score: the mixture is not shared across a pair's replicates). -> one value per pair.
+    THE INTEGRAL, by case (Codex #66 r3 P2-1, r4 P2-1/2: never silently capped, never a frozen variance,
+    never a silent non-finite value):
+      - s2 = 0: the plain density;
+      - the identity link with a constant replicate variance (no var_fn): EXACT, Y ~ N(eta, phi + s2);
+      - otherwise the e-order trapezoid IN LOG SPACE with the registered integrand at every node (the bounded
+        count probability at the replicate variance phi V(G(eta + e)) of that node; the far tails of the
+        interval probability are log-space continued fractions, so a count beyond the link's reach is a finite,
+        very negative log probability). The grid covers +-TRAP_SD prior SDs; its step is at most one SD and at
+        most TRAP_H x the narrowest replicate SD (the variance function's minimum on VMIN_GRID) / a
+        CONSERVATIVE bound on the link's slope over the range (Link.max_slope), on the smallest of TRAP_KS
+        (15 .. 262,145 nodes) that achieves it. Every observation is CHECKED a posteriori:
+          * resolution: against the same grid's every other node; above TRAP_TOL its pair moves to the next grid;
+          * range: if an end node carries more than 1e-10 of the integral (the integrand still rises at the edge,
+            e.g. a count beyond the link's asymptote), the pair's range doubles, up to +-56 SDs;
+        a pair failing a check on the largest grid or range keeps that value and is counted as grid_unresolved
+        (a finite but UNRESOLVED score: reported, never hidden, and the callers' comparisons (recovery.py) refuse
+        to decide on it); a pair whose rule needs more than the largest grid, in its initial range or in an
+        extended one (Codex #66 r5 P2-2), is computed there, checked, and counted ONCE in beyond_rule.
+      - any non-finite result is REFUSED (ValueError): it never reaches a model comparison.
+    info (a dict): the counts per case are added to it (pairs, plain, exact, grid, refined, extended,
+    beyond_rule, grid_unresolved) with the largest accepted check difference (max_check)."""
+    eta, s2 = pred_eta(D, m, idx, own)
+    lk = m["link"]
+    cnt = np.asarray(cnt)
+    out = np.empty(len(eta))
+    sd = np.sqrt(s2)
+    st = {"pairs": int(len(eta)), "plain": 0, "exact": 0, "grid": 0, "refined": 0, "extended": 0, "beyond_rule": 0,
+          "grid_unresolved": 0, "max_check": 0.0}
+    plain = sd <= 1e-9
+    if plain.any():
+        g0 = lk.G(eta[plain])
+        out[plain] = count_lpd(cnt[plain], N, g0, _rep_var(m, g0))
+        st["plain"] = int(plain.sum())
+    q = np.flatnonzero(~plain)
+    if len(q) and lk.identity() and m.get("var_fn") is None:
+        out[q] = count_lpd(cnt[q], N, eta[q], m["phi"] + s2[q])
+        st["exact"] = int(len(q))
+    elif len(q):
+        R = cnt.shape[1]
+        lo_, hi_ = float((eta[q] - TRAP_SD * sd[q]).min()), float((eta[q] + TRAP_SD * sd[q]).max())
+        gmax = max(lk.max_slope(lo_, hi_), 1e-12)
+        smin = math.sqrt(max(float(_rep_var(m, VMIN_GRID).min()), 1e-300))
+        h = np.minimum(sd[q], TRAP_H * smin / gmax)
+        need0 = np.ceil(2 * TRAP_SD * sd[q] / np.maximum(h, 1e-300)) + 1          # (nodes at span 1)
+        top = len(TRAP_KS) - 1
+        bucket = np.searchsorted(TRAP_KS, need0)
+        beyond = np.zeros(len(eta), bool)                         # (pairs whose rule exceeded the largest grid, once)
+        beyond[q[bucket > top]] = True
+        cur, cb, cs, n0 = q, np.minimum(bucket, top), np.ones(len(q)), need0
+        while len(cur):
+            nxt = []
+            for b, s_ in sorted(set(zip(cb.tolist(), cs.tolist()))):
+                sel = (cb == b) & (cs == s_)
+                rows, need_r = cur[sel], n0[sel]
+                Kb = TRAP_KS[int(b)]
+                step = max(1, TRAP_CELLS // (R * Kb))
+                for k0 in range(0, len(rows), step):
+                    r_, nr_ = rows[k0:k0 + step], need_r[k0:k0 + step]
+                    full, half, edge = _grid_pass(lk, m, cnt[r_], eta[r_], sd[r_], N, Kb, np.full(len(r_), s_))
+                    with np.errstate(invalid="ignore"):
+                        err = np.max(np.abs(full - half), axis=1)
+                        res_ok = err <= TRAP_TOL                                   # (NaN: not ok)
+                        edge_ok = np.all(edge <= TRAP_EDGE, axis=1)
+                    fin = np.isfinite(full).all(axis=1)
+                    ok = res_ok & edge_ok & fin
+                    out[r_[ok]] = full[ok].mean(axis=1)
+                    st["grid"] += int(ok.sum())
+                    if ok.any():
+                        st["max_check"] = max(st["max_check"], float(err[ok].max()))
+                    for i in np.flatnonzero(~ok):
+                        if fin[i] and not edge_ok[i] and s_ < TRAP_SPAN_MAX:          # (extend the range)
+                            s2_ = 2 * s_
+                            nb2 = max(int(b), int(np.searchsorted(TRAP_KS, nr_[i] * s2_)))
+                            if nb2 > top:                                     # (the extended range's rule is beyond
+                                beyond[r_[i]] = True                          #  the cap: counted, Codex #66 r5 P2-2)
+                            nxt.append((r_[i], min(nb2, top), s2_, nr_[i]))
+                            st["extended"] += 1
+                        elif fin[i] and not res_ok[i] and b < top:                    # (refine the grid)
+                            nxt.append((r_[i], int(b) + 1, s_, nr_[i]))
+                            st["refined"] += 1
+                        else:                                                        # (kept, flagged)
+                            out[r_[i]] = full[i].mean()
+                            st["grid_unresolved"] += 1
+            cur = np.array([t[0] for t in nxt], int)
+            cb = np.array([t[1] for t in nxt], int)
+            cs = np.array([t[2] for t in nxt], float)
+            n0 = np.array([t[3] for t in nxt], float)
+        st["beyond_rule"] = int(beyond.sum())
+    bad = ~np.isfinite(out)
+    if bad.any():
+        raise ValueError(f"pred_count_lpd: {int(bad.sum())} non-finite count scores: refused (never compared)")
+    if info is not None:
+        for k, v in st.items():
+            info[k] = max(info.get(k, 0.0), v) if k == "max_check" else info.get(k, 0) + v
+    return out
+'''
+
+
+def main_map():
+    """main's capture_scale and scorer (MAIN_CAPTURE_SCALE, MAIN_SCORER) in a namespace over map.py's helpers."""
+    import map as mapfit
+    ns = dict(vars(mapfit))
+    exec(compile(MAIN_CAPTURE_SCALE + "\n\n" + MAIN_SCORER, "map.py@main", "exec"), ns)
+    return ns
+
+
+VAL_SC = {"x": [-2.2, -0.6, 0.4], "s": [0.55, 0.30, 0.20]}      # A_design_v5 2.10's steep validation curve
+CONST_SC = {"x": [0.0], "s": [0.2]}                             # T6-10's mandatory case: S_C = 0.2
+T610_FRACS = (0.002, 0.01, 0.1, 0.5, 0.9, 0.99, 0.998)          # predicted capture fractions (T6-10: 0.002-0.998)
+T610_SDS = (0.05, 0.3, 0.5, 1.0)                                # predictor SDs (T6-10: 0.05-1.0)
+# Unrepresentable by v5's rule (the reference's tail bound still fails at +-60 SD): not T6-10 cases.
+T610_UNREPRESENTABLE = {("val", 0.998, 0.05, 0), ("const", 0.998, 0.05, 0), ("const", 0.002, 0.05, 324)}
+# The RANGE GAP (Codex WP2 review P1; closed by A_design_v5 clarification 2, D1): the steep curve's k = B at low
+# predicted fractions. The integrand is bimodal -- an interior mode inside the first +-7 SD range, the dominant mode at
+# +10..+15 SD -- and main's end-node check alone (TRAP_EDGE, an end node's share of the integral over the CURRENT range)
+# never extends the range: at a4227b6 the score was wrong by 9.6-83 nats with no grid_unresolved flag. With the score
+# law the tail bound (map._tail_ok) extends these ranges; the cases are part of T6-10's ordinary agreement set
+# (t610_cases) and must record an extension (test_T6_10_gap_diagnosis, test_T6_10_gap_cases_agree).
+T610_GAP = {("val", 0.002, 1.0, 324), ("val", 0.01, 1.0, 324), ("val", 0.1, 0.5, 324)}
+# The reference's certificate (Codex WP2 review P2; clarification 2, D2): the score-law integrand is only piecewise
+# smooth (the fitter table's kinks, segment slopes up to ~79), so one halving of 5e-5 SD left O(h^2) differences up to
+# ~2.4e-8 on rare counts (the mandatory case 4.5e-9); the reference now halves until two consecutive estimates agree
+# within 1e-9, at most four times, and a case not certified fails T6-10 with its diagnostics (never excluded).
+# Codex's coverage gap (the controller's recomputation on a SECOND extension, with a changing non-identity link slope):
+# (link knots, values, lo, hi), predicted fraction, SD, count -- two cases needing two range extensions on the steep
+# curve (test_T6_10_second_extension_recomputes_on_a_nonidentity_link).
+T610_TWO_EXT = [(((-8.0, -4.0, 4.0, 8.0), (-8.0, -6.0, -2.0, 8.0), 0.0, 1.0), 0.01, 0.2, 324),   # (slope 0.5, then 2.5)
+                (((-12.0, -3.0, 3.0, 12.0), (-12.0, -1.0, 1.0, 12.0), 0.0, 1.0), 0.1, 0.2, 324)]
+# The nu0 shrinkage's arithmetic (A_design_v5 clarification 2, Revision 1; Codex's WP2 re-review P2: the reciprocal
+# form a = 1 / (1 + (R - 1) / nu0) overflowed to a = 0 for a very small nu0). Synthetic (V, zrep) sets for the sweep of
+# nu0 over the float range: Codex's two known answers' sets (the large-prior one gives v~ = [2, 1] at every nu0); round
+# 2's six cells (a zero-variance cell: its v~ is a subnormal float at the low end); a tiny pooled variance (phi V =
+# 5e-281: up to nu0 ~ 3e-28 the zero cell's v~ rounds to 0 or mean(1 / v~) overflows); 256 cells, 255 with zero
+# variance (at nu0 ~ 1e-304 the sum of the 1 / v~ is not a float). Revision 2 (WP2 round 4): the sweep runs down through
+# the SUBNORMAL nu0 range to 2^-1074, and two sets with a large pooled variance in a zero-variance cell join them:
+# round 3's example (V_0 = 1e6: every returned quantity a normal float at nu0 = 1e-315) and V_0 = 1e20 (the zero cell's
+# v~ ~ 1e22 nu0 is a normal float down to nu0 = 2^-1074). Revision 4 (WP2 round 6; after round 5 found exact evaluation
+# infeasible at real cell counts): the nu0 branch is evaluated in LOGARITHMS under an accuracy CONTRACT -- every
+# returned quantity (phi, every w_e, unit) within 1e-10 relative of the formula's exact value on the floored float
+# inputs, a subnormal one within 1e-10 relative + 2^-1074 -- and refused if and only if a returned quantity's computed
+# logarithm is outside the float range (above log of the largest float, at or below log 2^-1075), with an INDETERMINATE
+# BAND: within a factor e^(+-1e-10) of either edge a return and a refusal are both acceptable. Intermediates (phi V, v~,
+# mean(1 / v~)) never refuse; there is no byte requirement against any earlier round. Revision 4a (Codex's spec review):
+# every successful return is finite and STRICTLY POSITIVE (in the band a refusal after the conversion to binary64 is
+# allowed too); no intermediate representability check at all (item 0).
+NU0_SETS = {
+    "codex_large": ([0.5, 0.25], [2.0, 1.0]),
+    "codex_small": ([1.0, 0.001], [0.0, 1.0]),
+    "six_cells": ([0.5, 0.25, 0.1, 0.04, 0.3, 0.0123], [0.6, 0.2, 0.15, 0.01, 0.0, 0.031]),
+    "tiny_pooled": ([1.0, 1.0], [1e-280, 0.0]),
+    "256_cells": ([1.0] * 256, [1.0] + [0.0] * 255),
+    "r3_example": ([1e6, 0.001], [0.0, 1.0]),
+    "huge_pooled": ([1e20, 0.001], [0.0, 1.0]),
+}
+NU0_MAX = Fraction(sys.float_info.max)                  # (the upper edge: the largest finite float)
+NU0_MINN = Fraction(2) ** -1022                         # (the smallest positive normal float)
+NU0_ZERO = Fraction(2) ** -1075                         # (the lower edge: a positive exact value below it rounds to 0)
+NU0_TINY = Fraction(2) ** -1074                         # (the smallest positive float: the subnormal allowance)
+NU0_TOL = Fraction(1, 10 ** 10)                         # (Revision 4's relative tolerance)
+NU0_BAND = (1 - NU0_TOL, 1 + NU0_TOL + NU0_TOL ** 2)    # (factors containing [e^-1e-10, e^1e-10]: never narrower)
+
+
+def nu0_exact(V, zrep, R, nu0):
+    """capture_scale's nu0 shrinkage in exact rational arithmetic (A_design_v5 3.3): V after main's 1e-8 floor, phi =
+    mean(zrep / V), a = nu0 / (nu0 + R - 1), v~_e = a phi V_e + (1 - a) zrep_e, mean(1 / v~), w_e = (1 / v~_e) /
+    mean(1 / v~), unit = 1 / (R mean(1 / v~)); identical cells grouped -> (phi, {cell: v~}, mean(1 / v~), {cell: w},
+    unit, {cell: multiplicity}), a cell being its (floored V, zrep)."""
+    V = np.maximum(np.asarray(V, float), 1e-8)
+    mult = Counter(zip(V.tolist(), np.asarray(zrep, float).tolist()))
+    n = len(V)
+    phi = sum(c * Fraction(z) / Fraction(v) for (v, z), c in mult.items()) / n
+    a = Fraction(nu0) / (Fraction(nu0) + R - 1)
+    vt = {k: a * phi * Fraction(k[0]) + (1 - a) * Fraction(k[1]) for k in mult}
+    mt = sum(c / vt[k] for k, c in mult.items()) / n
+    return phi, vt, mt, {k: 1 / vt[k] / mt for k in mult}, 1 / (R * mt), mult
+
+
+def nu0_class(q):
+    """A positive exact RETURNED quantity q (clarification 2, Revision 4): 'U' outside the float range beyond the
+    indeterminate band (above the largest finite float, or below 2^-1075, by more than a factor e^1e-10: it must be
+    refused), 'B' within the band of either edge (a return and a refusal are both acceptable), 'S' in the subnormal
+    range, 'N' a normal float. The band is taken a hair wider than e^(+-1e-10) (NU0_BAND), never narrower, so no point
+    the rule leaves open is ever required."""
+    lo, hi = NU0_BAND
+    if q > NU0_MAX * hi or q < NU0_ZERO * lo:
+        return "U"
+    if q >= NU0_MAX * lo or q <= NU0_ZERO * hi:
+        return "B"
+    return "N" if q >= NU0_MINN else "S"
+
+
+def nu0_fmt(q):
+    """An exact value for messages: its float, or a note when it is above the largest float."""
+    return float(q) if q <= NU0_MAX else f"{float(q / NU0_MAX):.12g} x the largest float"
+
+
+def nu0_err(x, q):
+    """A returned float x against its exact value q > 0 (Revision 4's accuracy contract): (|x - q| / q, |x - q| / the
+    allowance 1e-10 q, + 2^-1074 when q is subnormal); (inf, inf) if x is not a finite, STRICTLY POSITIVE float
+    (Revision 4a, item 4: a returned 0 fails even where the allowance would cover it)."""
+    if not (isinstance(x, float) and math.isfinite(x) and x > 0.0):
+        return math.inf, math.inf
+    d = abs(Fraction(x) - q)
+    a = NU0_TOL * q + (NU0_TINY if q < NU0_MINN else 0)
+    return tuple(float(r) if r <= NU0_MAX else math.inf for r in (d / q, d / a))
+
+
+def nu0_point(cs, V, zrep, R, nu0):
+    """One point of the nu0 shrinkage's Revision 4 / 4a contract (A_design_v5 clarification 2, "Log-space evaluation"):
+    capture_scale (cs) against exact rationals (nu0_exact). The RETURNED quantities (phi, unit, every w_e;
+    intermediates never count) are classed by nu0_class and the point takes the first of U, B, S, N that any of them
+    has. U: cs must refuse it, by the range rule ('outside the float range'); B: a return or a range refusal (before
+    or after the conversion to binary64); N and S: cs must return it. Whatever cs returns must be finite, strictly
+    positive and meet the accuracy contract, every quantity within its allowance (nu0_err). -> (class, the U / B
+    reasons or the S quantities, failure text or None, (the largest relative error over the normal quantities, the
+    largest error / allowance over all; 0 when refused), cs's result or None)."""
+    phi, vt, mt, fw, funit, mult = nu0_exact(V, zrep, R, nu0)
+    cells = list(zip(np.maximum(np.asarray(V, float), 1e-8).tolist(), np.asarray(zrep, float).tolist()))
+    qs = [("phi", phi), ("unit", funit)] + [(f"w of cell {k}", q) for k, q in fw.items()]
+    cl = [(lab, q, nu0_class(q)) for lab, q in qs]
+    c = next(k for k in "UBSN" if any(x[2] == k for x in cl))
+    if c in "UB":
+        why = " & ".join(f"{lab} {'above the largest float' if q > 1 else 'below 2^-1075'} ({k})"
+                         for lab, q, k in cl if k in "UB")
+    else:
+        why = ", ".join(lab for lab, q, k in cl if k == "S")
+    try:
+        got, err = cs(V, zrep, R, nu0=nu0), None
+    except ValueError as e:
+        got, err = None, str(e)
+    if got is None:
+        if c in "UB" and "outside the float range" in err:
+            return c, why, None, (0.0, 0.0), None
+        note = "not by the range rule" if c in "UB" else "every returned quantity in range"
+        return c, why, f"class {c} ({why}) REFUSED ({note}): {err}", (0.0, 0.0), None
+    if c == "U":
+        return c, why, f"{why}: outside the float range beyond the band, but NOT refused", (0.0, 0.0), got
+    w, unit, ph = got
+    rows = [("phi", ph, phi), ("unit", unit, funit)] + \
+           [(f"w[{i}]", float(w[i]) if isinstance(w, np.ndarray) and w.dtype == np.float64 else None, fw[k])
+            for i, k in enumerate(cells)]
+    errs = [(nu0_err(x, q), lab, x, q) for lab, x, q in rows]
+    rel = max([e[0] for e, lab, x, q in errs if q >= NU0_MINN], default=0.0)
+    ratio = max(e[1] for e, lab, x, q in errs)
+    over = [(lab, x, nu0_fmt(q)) for e, lab, x, q in errs if e[1] > 1]
+    fail = f"({c}): not finite and strictly positive, or beyond the accuracy contract: {over[:3]}" if over else None
+    return c, why, fail, (rel, ratio), got
+
+
+_BANK = {}
+_T610_REF = {}
+
+
+@unittest.skipIf(np is None, "numpy is not installed (set RQ_PYLIB, or RQ_REQUIRE_NUMPY=1 to require it)")
+class TestMapBankMode(unittest.TestCase):
+    """map.py in bank mode (Red Queen recovery option A, A_design_v5.md section 3.3, with clarification 2): the nu0
+    shrinkage of capture_scale (T6-2; log-space evaluation under Revision 4's accuracy contract and refusal rule) and
+    its domain (refusals: D3), the working coordinate and nu0 in it (T6-7), the score law (T6-8), the integrated
+    score with the hook, its grid rule (per-pair H^max, recomputed on every range extension) and its range rule
+    (the end-node check and the tail bound: D1) against the reference
+    integrator, which halves until certified (T6-10, D2), the reference's self-test (T6-11), and the refusal of a
+    variance model without a var_fn (T6-1's map.fit clause). With the hooks unset, capture_scale and the scorer are
+    main's byte for byte."""
+
+    @classmethod
+    def setUpClass(cls):
+        import map as mapfit
+        import noisescale
+        import obslaw
+        import recovery
+        cls.M, cls.ol, cls.rec, cls.nsc = mapfit, obslaw, recovery, noisescale
+        cls.B = recovery.B_COUNT
+        if not _BANK:
+            _BANK["val"] = obslaw.build_fitter_table(VAL_SC, "0" * 64)
+            _BANK["const"] = obslaw.build_fitter_table(CONST_SC, "0" * 64)
+        cls.tabs = dict(_BANK)
+        cls.tab = _BANK["val"]
+
+    def hooks(self, tab, tag="wp2"):
+        return self.ol.WorkingVariance(tab, tag), self.ol.ScoreLaw(tab, tag)
+
+    def score(self, m, eta, s2, cnt, ns=None):
+        """pred_count_lpd at given predictors (eta, s2) per pair (pred_eta replaced) -> (scores, info); ns: main's."""
+        eta, s2 = np.asarray(eta, float), np.asarray(s2, float)
+
+        def fake(D, m_, idx, own=None):
+            return eta[idx], s2[idx]
+        info = {}
+        idx = np.arange(len(eta))
+        if ns is None:
+            with mock.patch.object(self.M, "pred_eta", fake):
+                out = self.M.pred_count_lpd(None, m, idx, np.asarray(cnt), self.B, info=info)
+        else:
+            ns["pred_eta"] = fake
+            out = ns["pred_count_lpd"](None, m, idx, np.asarray(cnt), self.B, info=info)
+        return out, info
+
+    def assert_main_bytes(self, cases):
+        """Each case (m, eta, s2, cnt) has no score law: pred_count_lpd equals main's byte for byte, info included."""
+        ns = main_map()
+        for m, eta, s2, cnt in cases:
+            self.assertIsNone(m.get("score_law"))
+            got, info = self.score(m, eta, s2, cnt)
+            want, info0 = self.score(m, eta, s2, cnt, ns=ns)
+            self.assertEqual(got.tobytes(), want.tobytes())
+            self.assertEqual(info, info0)
+
+    def zmu(self, tab, mu):
+        """The table's m_z at the fraction mu (its x -> m_z interpolant)."""
+        return float(np.interp(math.log(mu / (1.0 - mu)), tab.x, tab.m))
+
+    # ---------------------------------------------------------------- T6-1 (map.fit's clause), T6-2
+    def test_T6_1_map_fit_refuses_a_variance_model_without_var_fn(self):
+        """T6-1's map.fit clause (A_design_v5 3.3; the spy across candidates and procedures is recovery's, WP4): a
+        rep_prior or score_law given with var_fn None is refused before D, idx or data is read (a numerical fit can
+        never carry a variance model), also through fit_best; a malformed rep_prior or a score law without its
+        frozen table is refused; the scorer refuses a score law without a var_fn."""
+        M = self.M
+        W, SL = self.hooks(self.tab)
+        for kw in ({"rep_prior": {"nu0": 4.0}}, {"score_law": SL}, {"rep_prior": {"nu0": None}, "score_law": SL},
+                   {"rep_prior": {"nu0": None}}):
+            with self.assertRaisesRegex(ValueError, "without a var_fn"):
+                M.fit(None, None, None, 1, 0.1, **kw)
+            with self.assertRaisesRegex(ValueError, "without a var_fn"):
+                M.fit_best(None, None, None, 1, 0.1, **kw)
+        for bad in ({"nu0": -1.0}, {"nu0": 0.0}, {"nu0": float("nan")}, {"nu0": float("inf")}, {"nu0": True},
+                    {"nu": 4.0}, {"nu0": 4.0, "rule": "x"}, [4.0]):
+            with self.assertRaises(ValueError):
+                M.fit(None, None, None, 1, 0.1, var_fn=W, rep_prior=bad)
+        with self.assertRaisesRegex(ValueError, "frozen fitter table"):
+            M.fit(None, None, None, 1, 0.1, var_fn=W, score_law=lambda p: (p, p))
+        with self.assertRaisesRegex(ValueError, "without a var_fn"):
+            self.score({"link": M.Link(), "phi": 1.0, "var_fn": None, "score_law": SL}, [0.0], [1.0], [[100]])
+
+    def test_T6_2_capture_scale_nu0_known_answer(self):
+        """T6-2 (A_design_v5 3.3): capture_scale(V, zrep, R, nu0): phi = mean(zrep / V), v~_e = (nu0 phi V_e + (R - 1)
+        zrep_e) / (nu0 + R - 1), w = (1 / v~) / mean(1 / v~), unit = 1 / (R mean(1 / v~)), so unit / w = v~ / R --
+        against exact rational arithmetic, within clarification 2 Revision 4's accuracy contract (1e-10 relative per
+        returned quantity; unit / w and mean(w) = 1 within what that allows); the limits nu0 -> inf (full pooling) and
+        nu0 -> 0 (the raw variances); the refusals (a nu0 that is not a positive finite number, nu0 without V, no
+        replicate variance at all); nu0 None is main's capture_scale byte for byte."""
+        from fractions import Fraction as F
+        M = self.M
+        V = np.array([0.5, 0.25, 0.1, 0.04, 0.3, 0.0123])
+        zrep = np.array([0.6, 0.2, 0.15, 0.01, 0.0, 0.031])
+        R = 6
+        for nu0 in (4.0, 0.37, 25.5, 7):
+            w, unit, phi = M.capture_scale(V, zrep, R, nu0=nu0)
+            fv, fz, fn = [F(float(v)) for v in V], [F(float(v)) for v in zrep], F(nu0)
+            fphi = sum(z / v for z, v in zip(fz, fv)) / len(fv)
+            vt = [(fn * fphi * v + (R - 1) * z) / (fn + R - 1) for z, v in zip(fz, fv)]
+            mt = sum(1 / x for x in vt) / len(vt)
+            self.assertLessEqual(nu0_err(phi, fphi)[1], 1.0, (nu0, phi))
+            for i, x in enumerate(vt):
+                self.assertLessEqual(nu0_err(float(w[i]), (1 / x) / mt)[1], 1.0, (nu0, i, w))
+            self.assertLessEqual(nu0_err(unit, 1 / (R * mt))[1], 1.0, (nu0, unit))
+            self.assertTrue(np.allclose(unit / w, [float(x / R) for x in vt], rtol=3e-10, atol=0))
+            self.assertAlmostEqual(float(w.mean()), 1.0, delta=2e-10)
+        w, u, p = M.capture_scale(V, zrep, R, nu0=1e12)
+        self.assertTrue(np.allclose(u / w, p * V / R, rtol=1e-9, atol=0))           # (nu0 -> inf: phi V / R)
+        pos = zrep > 0
+        w, u, p = M.capture_scale(V[pos], zrep[pos], R, nu0=1e-12)
+        self.assertTrue(np.allclose(u / w, zrep[pos] / R, rtol=1e-9, atol=0))       # (nu0 -> 0: zrep / R)
+        for bad in (0, 0.0, -1.0, float("nan"), float("inf"), True, "4", [4.0]):
+            with self.assertRaises(ValueError):
+                M.capture_scale(V, zrep, R, nu0=bad)
+        with self.assertRaisesRegex(ValueError, "without a variance function"):
+            M.capture_scale(None, zrep, R, nu0=4.0)
+        with self.assertRaisesRegex(ValueError, "undefined"):
+            M.capture_scale(V, np.zeros(len(V)), R, nu0=4.0)
+        ns = main_map()
+        rng = np.random.default_rng(11)
+        cases = [(V, zrep), (rng.uniform(1e-10, 2.0, 500), rng.gamma(1.0, 0.3, 500)), (None, zrep),
+                 (None, np.zeros(5)), (np.full(4, 1e-12), np.array([1e-3, 0.0, 2e-3, 0.0])), (V, np.zeros(len(V)))]
+        for Vc, zc in cases:
+            want = ns["capture_scale"](Vc, zc, R)
+            for got in (M.capture_scale(Vc, zc, R), M.capture_scale(Vc, zc, R, nu0=None)):
+                self.assertEqual(got[0].tobytes(), want[0].tobytes())
+                self.assertEqual((type(got[1]), got[1], type(got[2]), got[2]),
+                                 (type(want[1]), want[1], type(want[2]), want[2]))
+
+    def test_T6_2_nu0_known_answers_at_both_ends(self):
+        """T6-2 with A_design_v5 clarification 2 (Revision 1's known answers, Revision 4's contract; Codex's WP2
+        reviews): Codex's two known answers, each against exact rational arithmetic (nu0_exact: every returned quantity
+        within the 1e-10 contract) and against the stated values. nu0 = 1e308, V = [0.5, 0.25], zrep = [2, 1], R = 6
+        (phi = 4): v~ = [2, 1], w = [2/3, 4/3], unit = 2/9 (a4227b6's numerator-first form overflowed). nu0 = 1e-308,
+        V = [1, 0.001], zrep = [0, 1] (phi = 500): v~ ~ [1e-306, 1], w ~ [2, 2e-306], unit ~ 3.333e-307, a valid fit
+        (922320e's reciprocal form: (R - 1) / nu0 = inf, a = 0, v~_0 = 0, a false refusal). v~ is read back as R unit /
+        w_e."""
+        M = self.M
+        R = 6
+        for nu0, V, Z, want in ((1e308, [0.5, 0.25], [2.0, 1.0], ([2.0, 1.0], [2.0 / 3.0, 4.0 / 3.0], 2.0 / 9.0)),
+                                (1e-308, [1.0, 0.001], [0.0, 1.0], ([1e-306, 1.0], [2.0, 2e-306], 1.0 / 3e306))):
+            with self.subTest("Codex's known answer", nu0=nu0):
+                try:
+                    w, unit, phi = M.capture_scale(np.array(V), np.array(Z), R, nu0=nu0)
+                except ValueError as e:
+                    self.fail(f"nu0 {nu0!r}: a fit whose every derived quantity is a normal float was refused: {e}")
+                fphi, vt, mt, fw, funit, mult = nu0_exact(V, Z, R, nu0)
+                self.assertEqual({nu0_class(q) for q in [fphi, mt, funit, *vt.values(), *fw.values()]}, {"N"})
+
+                def rel(x, q):
+                    return float(abs(Fraction(float(x)) - q) / q)
+                self.assertLessEqual(rel(phi, fphi), 1e-10)
+                self.assertLessEqual(rel(unit, funit), 1e-10, (nu0, unit, float(funit)))
+                for i, k in enumerate(zip(V, Z)):
+                    self.assertLessEqual(rel(w[i], fw[k]), 1e-10, (nu0, i, w, float(fw[k])))
+                    self.assertLessEqual(rel(R * unit / w[i], vt[k]), 3e-10, (nu0, i, float(vt[k])))
+                self.assertTrue(np.allclose(R * unit / w, want[0], rtol=3e-10, atol=0), (nu0, R * unit / w))
+                self.assertTrue(np.allclose(w, want[1], rtol=2e-10, atol=0), (nu0, w))
+                self.assertLessEqual(abs(unit - want[2]), 2e-10 * want[2], (nu0, unit))
+                print(f"T6-2 known answer nu0 {nu0!r}: phi {phi!r}, v~ = R unit / w {(R * unit / w).tolist()}, w "
+                      f"{w.tolist()}, unit {unit!r}; vs exact: phi {rel(phi, fphi):.2e}, unit {rel(unit, funit):.2e}, "
+                      f"w {max(rel(w[i], fw[k]) for i, k in enumerate(zip(V, Z))):.2e}")
+
+    def test_T6_2_nu0_sweep_smallest_positive_to_largest_float(self):
+        """T6-2 with A_design_v5 clarification 2 (every positive finite nu0 the loader accepts, subnormal ones included:
+        none is refused for its size; Revision 4: the log-space evaluation's accuracy contract and refusal rule): nu0 =
+        every power of two and 1.5 x power of two from the smallest positive float 2^-1074 to the largest finite float,
+        every decade in that range, the 16 smallest subnormals, the smallest normal float 2^-1022 and its two float
+        neighbours, R - 1 and its two float neighbours, on each of NU0_SETS, every point against exact rational
+        arithmetic (nu0_point; classes from the RETURNED quantities phi, unit and every w_e): N (all normal) and S (some
+        subnormal, none outside the float range): returned, every returned quantity within the contract (1e-10 relative;
+        a subnormal one + 2^-1074); U (some returned quantity above the largest float, or below 2^-1075, beyond the
+        indeterminate band): refused by the range rule, and only there; B (within a factor e^(+-1e-10) of an edge, none
+        U): a return within the contract or a range refusal. An intermediate outside the float range (phi V, v~, mean(1
+        / v~)) never makes a point U. A refusal at an N or S point fails (f18a0ca: round 4's float arithmetic refused
+        where a rounded v~ or mean(1 / v~) left the float range). The classes per nu0 band (subnormal, normal), every
+        U / B point's reason, every S point's subnormal quantities (grouped) and the worst relative error (normal
+        quantities) and error / allowance (all) are printed."""
+        M = self.M
+        R = 6
+        mn = 2.0 ** -1022
+        pts = {sys.float_info.max, float(R - 1), math.nextafter(float(R - 1), 0.0),
+               math.nextafter(float(R - 1), math.inf), mn, math.nextafter(mn, 0.0), math.nextafter(mn, math.inf)}
+        for k in range(-1074, 1024):
+            pts.update([math.ldexp(1.0, k), math.ldexp(1.5, k)])            # (1.5 x 2^1023 < the largest float)
+        pts.update(float(f"1e{k}") for k in range(-323, 309))
+        pts.update(m * 2.0 ** -1074 for m in range(1, 17))
+        pts = sorted(x for x in pts if x > 0.0)
+        print(f"T6-2 nu0 sweep: {len(pts)} values of nu0 from {pts[0]!r} to {pts[-1]!r}: {sum(x < mn for x in pts)} "
+              f"subnormal (below 2^-1022), {sum(mn <= x < R - 1 for x in pts)} normal below R - 1 = {R - 1}, "
+              f"{sum(x >= R - 1 for x in pts)} with nu0 >= R - 1")
+        failures = []
+        top = [0.0, 0.0]
+        for name, (V, Z) in NU0_SETS.items():
+            n = len(V)
+            cnt, ref_n, groups, worst, bad = Counter(), Counter(), defaultdict(list), [0.0, 0.0], []
+            for nu0 in pts:
+                band = "sub" if nu0 < mn else "normal"
+                c, lab, fail, e, got = nu0_point(M.capture_scale, V, Z, R, nu0)
+                cnt[c] += 1
+                cnt[band, c] += 1
+                ref_n[c] += int(got is None)
+                worst = [max(worst[0], e[0]), max(worst[1], e[1])]
+                if c != "N":
+                    groups[c, lab[:150]].append(nu0)
+                if fail:
+                    bad.append(f"nu0 {nu0!r}: {fail}")
+            top = [max(top[0], worst[0]), max(top[1], worst[1])]
+            print(f"T6-2 nu0 sweep {name} ({n} cells): N {cnt['N']} ({ref_n['N']} refused), S {cnt['S']} ({ref_n['S']} "
+                  f"refused), B {cnt['B']} ({ref_n['B']} refused), U {cnt['U']} ({ref_n['U']} refused); at a subnormal "
+                  f"nu0: N {cnt['sub', 'N']}, S {cnt['sub', 'S']}, B {cnt['sub', 'B']}, U {cnt['sub', 'U']}; worst "
+                  f"relative error {worst[0]:.2e} (normal quantities), worst error / allowance {worst[1]:.2e}; "
+                  f"{len(bad)} failing")
+            for (c, lab), xs in groups.items():
+                print(f"    {c}: {lab} at {len(xs)} values of nu0 in [{min(xs)!r}, {max(xs)!r}]")
+            failures += [f"{name}: {b}" for b in bad]
+        print(f"T6-2 nu0 sweep, all sets: worst relative error {top[0]:.2e} (normal quantities; contract 1e-10), worst "
+              f"error / allowance {top[1]:.2e} (contract 1)")
+        self.assertFalse(failures, f"{len(failures)} sweep points fail; the first 12:\n" + "\n".join(failures[:12]))
+
+    def test_T6_2_nu0_subnormal_examples(self):
+        """T6-2 with A_design_v5 clarification 2 (Revision 2: a subnormal nu0 is never refused for its size; Revision 4:
+        the contract), each example against exact rationals (nu0_point), its class (from the returned quantities)
+        asserted so it tests what it claims: (a) WP2 round 3's example V = [1e6, 0.001], zrep = [0, 1], R = 6, nu0 =
+        1e-315: every returned quantity is a normal float (unit ~ 3.3e-308; e973ddf: r = nu0 / 5 is itself subnormal and
+        unit is off by ~9.9e-9); (b) nu0 = 2^-1074 and 2^-1073 (both <= 1.2e-323), V = [1e20, 0.001], zrep = [0, 1]: the
+        zero-variance cell's exact v~ is ~1e22 nu0 and every returned quantity a normal float (e973ddf: r = nu0 / 5
+        rounds to 0, a = 0, v~_0 = 0: a false refusal); (c) the same zero cell with V = [3e13, 0.001] at nu0 = 2^-1074:
+        unit is subnormal (class S; e973ddf: refused as in (b)). Each is returned within the contract."""
+        M = self.M
+        R = 6
+        for label, V, Z, nu0, want in (("round 3's example", [1e6, 0.001], [0.0, 1.0], 1e-315, "N"),
+                                       ("zero cell, v~ normal", [1e20, 0.001], [0.0, 1.0], 2.0 ** -1074, "N"),
+                                       ("zero cell, v~ normal", [1e20, 0.001], [0.0, 1.0], 2.0 ** -1073, "N"),
+                                       ("zero cell, v~ subnormal", [3e13, 0.001], [0.0, 1.0], 2.0 ** -1074, "S")):
+            with self.subTest(label, nu0=nu0):
+                self.assertLess(nu0, 2.0 ** -1022)                          # (a subnormal nu0)
+                c, lab, fail, e, got = nu0_point(M.capture_scale, V, Z, R, nu0)
+                self.assertEqual(c, want, lab)
+                self.assertIsNone(fail, f"{label}, nu0 {nu0!r}: {fail}")
+                w, unit, phi = got
+                print(f"T6-2 subnormal nu0 {nu0!r} ({label}; V {V}, zrep {Z}): class {c}, v~ = R unit / w "
+                      f"{(R * unit / w).tolist()}, w {w.tolist()}, unit {unit!r}; worst relative error {e[0]:.2e}, "
+                      f"error / allowance {e[1]:.2e}")
+
+    def test_T6_2_nu0_rereview_counterexamples(self):
+        """T6-2 with A_design_v5 clarification 2, Revision 4 (Codex's re-review of f18a0ca: two false refusals caused by
+        rounding an intermediate). (1) V = [1.2500000000000002, 1], zrep = [0, 1], R = 6, nu0 = 2^-1022: exact phi = 1/2
+        and mean(1 / v~) ~ 1.7976931348623155e308 (in range), w = [2.0, 5.562684646268003e-309], unit =
+        9.27114107711336e-310 (subnormal: class S); f18a0ca rounded v~_0 to 2^-1025, mean(1 / v~) overflowed and the
+        fit was refused. (2) V = [2^1020, 2^-20], zrep = [0, 1], R = 6, nu0 = 2^-1000: phi = 2^19 and phi V_0 = 2^1039
+        (an intermediate above the largest float), w ~ [1.818989403529313e-11, 1.99999999998181], unit ~
+        0.3333333333303017 (class N); f18a0ca formed phi V first, overflowed and refused. Codex's stated values are the
+        correctly rounded exact values (checked here); each fit is returned with every returned quantity within the
+        contract of the exact value, so within the contract of Codex's values (plus their half-ulp rounding)."""
+        M = self.M
+        R = 6
+        for label, V, Z, nu0, want, cls in (
+                ("Codex 1 (v~ rounded, mean(1 / v~) overflowed)", [1.2500000000000002, 1.0], [0.0, 1.0], 2.0 ** -1022,
+                 ([2.0, 5.562684646268003e-309], 9.27114107711336e-310, 0.5), "S"),
+                ("Codex 2 (phi V overflowed first)", [2.0 ** 1020, 2.0 ** -20], [0.0, 1.0], 2.0 ** -1000,
+                 ([1.818989403529313e-11, 1.99999999998181], 0.3333333333303017, 2.0 ** 19), "N")):
+            with self.subTest(label):
+                phi, vt, mt, fw, funit, mult = nu0_exact(V, Z, R, nu0)
+                self.assertEqual(([float(fw[k]) for k in zip(V, Z)], float(funit), float(phi)), want)
+                c, lab, fail, e, got = nu0_point(M.capture_scale, V, Z, R, nu0)
+                self.assertEqual(c, cls, lab)
+                self.assertIsNone(fail, f"{label}: {fail}")
+                w, unit, ph = got
+                for x, y in zip([*w.tolist(), unit, ph], [*want[0], want[1], want[2]]):
+                    self.assertLessEqual(abs(x - y), 1e-10 * y + (2.0 ** -1074 if y < 2.0 ** -1022 else 0.0)
+                                         + math.ulp(y), (label, x, y))
+                vts = [nu0_fmt(x) for x in vt.values()]
+                print(f"T6-2 re-review counterexample {label}: class {c}, phi {ph!r}, w {w.tolist()}, unit {unit!r}; "
+                      f"exact mean(1 / v~) {nu0_fmt(mt)!r}, v~ {vts}; worst relative error {e[0]:.2e}, error / "
+                      f"allowance {e[1]:.2e}")
+
+    def test_T6_2_nu0_rev4a_codex_cases(self):
+        """T6-2 with A_design_v5 clarification 2, Revision 4a (Codex's spec review of Revision 4). (1) The lower-edge
+        regression: V = [1], zrep = [3 2^-1074], nu0 = 5, R = 6: the exact unit is 2^-1075 itself (class B), whose
+        computed logarithm sits at the cutoff and whose exponential is 0: either a contextual refusal or a return whose
+        every value is finite, STRICTLY POSITIVE and within the contract -- never a successful return containing 0.
+        (2) Item 0, no intermediate representability check: V = [1, 2^1023], zrep = [8, 0], nu0 = 5, R = 6: the exact
+        v~_2 = 2^1024 is above the largest float, but w ~ [2, 3 2^-1022] and unit ~ 2 are normal (class N): RETURNED
+        within the contract (f18a0ca refused it: v~ = inf). (3) The conversion to binary64 (item 4: every successful
+        return finite and strictly positive; in the band a refusal after the conversion is allowed): numpy's exp is
+        replaced for the call by one that gives 0 just above the lower cutoff and inf at or just below the upper one,
+        as a libm rounding there might; at a band point whose computed logarithm is in range (unit 2^-1075 (1 + 1e-11);
+        phi = the largest float (1 - 1e-11)) capture_scale must then refuse ('after its conversion to binary64'), never
+        return the 0 or the inf; with the real exp the same points are returned here, positive and within the contract
+        (a range refusal before the conversion would also be allowed there). Each case is a subtest."""
+        M = self.M
+        R = 6
+        mx = sys.float_info.max
+        with self.subTest("the lower-edge regression (exact unit 2^-1075)"):
+            V, Z = [1.0], [3 * 2.0 ** -1074]
+            phi, vt, mt, fw, funit, mult = nu0_exact(V, Z, R, 5.0)
+            self.assertEqual(funit, NU0_ZERO)                           # (exactly the lower edge)
+            c, lab, fail, e, got = nu0_point(M.capture_scale, V, Z, R, 5.0)
+            self.assertEqual(c, "B", lab)
+            self.assertIsNone(fail, fail)
+            res = "refused (allowed in the band)" if got is None else "returned " + repr(got)
+            if got is not None:
+                self.assertTrue(all(x > 0.0 for x in [*got[0].tolist(), got[1], got[2]]), got)
+            print(f"T6-2 Revision 4a lower-edge regression (V {V}, zrep [3 2^-1074], nu0 5): exact unit 2^-1075 (class "
+                  f"B): {res}")
+        with self.subTest("item 0: an intermediate v~ = 2^1024, every returned quantity normal"):
+            V, Z = [1.0, 2.0 ** 1023], [8.0, 0.0]
+            phi, vt, mt, fw, funit, mult = nu0_exact(V, Z, R, 5.0)
+            self.assertEqual(vt[(2.0 ** 1023, 0.0)], Fraction(2) ** 1024)  # (an intermediate above the largest float)
+            c, lab, fail, e, got = nu0_point(M.capture_scale, V, Z, R, 5.0)
+            self.assertEqual(c, "N", lab)
+            self.assertIsNone(fail, fail)
+            w, unit, ph = got
+            self.assertLessEqual(abs(w[1] - 3 * 2.0 ** -1022), 1e-9 * 3 * 2.0 ** -1022)
+            print(f"T6-2 Revision 4a item 0 (V [1, 2^1023], zrep [8, 0], nu0 5): exact v~_2 = 2^1024 (intermediate); "
+                  f"returned phi {ph!r}, w {w.tolist()}, unit {unit!r}; worst relative error {e[0]:.2e}")
+        lo, hi = -1075.0 * math.log(2.0), math.log(mx)
+        real = np.exp
+
+        def libm(x, *a, **k):         # (0 just above the lower cutoff, inf at or just below the upper one)
+            y, xa = real(x, *a, **k), np.asarray(x, float)
+            return np.where((xa > lo) & (xa <= lo + 1e-9), 0.0, np.where((xa >= hi - 1e-9) & (xa <= hi), np.inf, y))
+        for label, V, Z, nu0, what in (
+                ("unit 2^-1075 (1 + 1e-11)", [1.0, 1.0], [0.0, 1e-280], 7.4109846876187e-43 * (1.0 + 1e-11), "unit"),
+                ("phi = the largest float (1 - 1e-11)", [0.75], [0.75 * mx * (1.0 - 1e-11)], 4.0, "phi")):
+            with self.subTest("the conversion to binary64", point=label):
+                phi, vt, mt, fw, funit, mult = nu0_exact(V, Z, R, nu0)
+                q = funit if what == "unit" else phi
+                self.assertEqual(nu0_class(q), "B")
+                c, lab, fail, e, got = nu0_point(M.capture_scale, V, Z, R, nu0)
+                self.assertIsNone(fail, fail)
+                if got is None:                 # (a range refusal before the conversion: allowed in the band)
+                    print(f"T6-2 Revision 4a conversion, {label}: refused before the conversion (allowed in the band)")
+                    continue
+                with mock.patch.object(np, "exp", libm):
+                    with self.assertRaisesRegex(ValueError, "outside the float range after its conversion to binary64"):
+                        M.capture_scale(np.array(V), np.array(Z), R, nu0=nu0)
+                val = got[1] if what == "unit" else got[2]
+                print(f"T6-2 Revision 4a conversion, {label}: real exp -> returned {what} {val!r}; an exp giving 0 / "
+                      f"inf there -> refused")
+
+    def test_T6_2_nu0_float_range_edges(self):
+        """T6-2 with A_design_v5 clarification 2, Revision 4 (refused if and only if a returned quantity's computed
+        logarithm is outside the float range; within a factor e^(+-1e-10) of an edge either outcome): at each edge of
+        each returned quantity that has one, an input whose exact quantity lies JUST INSIDE the float range but outside
+        the band (~3e-10 relative from the edge: returned, within the contract) and one JUST OUTSIDE beyond the band
+        (refused by the range rule, naming that quantity), each asserted against exact rationals; and the edge input
+        itself and its two float neighbours, inside the band (class B: either outcome, within the contract if
+        returned). unit above the largest float: 12 cells, V = [1] + [1e300] x 11, zrep = [x] + [0] x 11, nu0 = 1e-20
+        (unit ~ 2 x, the other cells' v~ ~ 1e586 above the largest float: intermediates); unit below 2^-1075: V = [1,
+        1], zrep = [0, 1e-280], nu0 = x (unit ~ x 1e-281 / 3); w below 2^-1075: V = [1, 1e280], zrep = [0, 1e300], nu0
+        = x (w_1 ~ 2e-281 x); phi above the largest float: V = [0.75], zrep = [x], nu0 = 4 (phi = x / 0.75); phi below
+        2^-1075: V = [x], zrep = [2^-80], nu0 = 4 (phi = 2^-80 / x; at x = 2^995 exactly 2^-1075). w cannot leave the
+        float range upward: w_e = n (1 / v~_e) / sum(1 / v~) <= n. First, capture_scale's float thresholds (log 2^-1075
+        < l <= log of the largest float) are exactly "not at or below" and "not above" the true logarithms (each
+        threshold float lies below its true value and the next float above it), and e^l is positive and finite at
+        both."""
+        from decimal import Decimal, localcontext
+        M = self.M
+        R = 6
+        mx = sys.float_info.max
+        with localcontext() as ctx:
+            ctx.prec = 60
+            tlo, thi = -1075 * Decimal(2).ln(), Decimal(int(NU0_MAX)).ln()
+        lo, hi = -1075.0 * math.log(2.0), math.log(mx)                  # (capture_scale's thresholds)
+        self.assertTrue(Decimal(lo) < tlo < Decimal(math.nextafter(lo, math.inf)), (lo, tlo))
+        self.assertTrue(Decimal(hi) < thi < Decimal(math.nextafter(hi, math.inf)), (hi, thi))
+        self.assertGreater(math.exp(math.nextafter(lo, math.inf)), 0.0)
+        self.assertTrue(math.isfinite(math.exp(hi)))
+        cases = (    # (label, input family, the edge input x0, the quantity, the edge, the input's direction outward)
+            ("unit above the largest float", lambda x: ([1.0] + [1e300] * 11, [x] + [0.0] * 11, 1e-20), mx / 2.0,
+             "unit", NU0_MAX, +1),
+            ("unit below 2^-1075", lambda x: ([1.0, 1.0], [0.0, 1e-280], x), 7.4109846876187e-43, "unit", NU0_ZERO, -1),
+            ("w below 2^-1075", lambda x: ([1.0, 1e280], [0.0, 1e300], x), 1.2351641146031166e-43, (1e280, 1e300),
+             NU0_ZERO, -1),
+            ("phi above the largest float", lambda x: ([0.75], [x], 4.0), 0.75 * mx, "phi", NU0_MAX, +1),
+            ("phi below 2^-1075", lambda x: ([x], [2.0 ** -80], 4.0), 2.0 ** 995, "phi", NU0_ZERO, +1))
+        for label, make, x0, what, edge, out in cases:
+            def q_of(x):
+                phi, vt, mt, fw, funit, mult = nu0_exact(*make(x)[:2], R, make(x)[2])
+                self.assertLessEqual(max(fw.values()), len(make(x)[0]))
+                return funit if what == "unit" else phi if what == "phi" else fw[what]
+            name = "w of cell 1" if isinstance(what, tuple) else what
+            with self.subTest(label):
+                for side, x in (("just inside", x0 * (1.0 - out * 3e-10)), ("just outside", x0 * (1.0 + out * 3e-10))):
+                    V, Z, nu0 = make(x)
+                    r = q_of(x) / edge
+                    inside = side == "just inside"
+                    self.assertTrue(abs(r - 1) < Fraction(1, 10 ** 9), (label, side, float(r)))
+                    up = edge == NU0_MAX
+                    in_range = (r < NU0_BAND[0]) if up else (r > NU0_BAND[1])      # (inside, beyond the band)
+                    beyond = (r > NU0_BAND[1]) if up else (r < NU0_BAND[0])        # (outside, beyond the band)
+                    self.assertTrue(in_range if inside else beyond, (label, side, float(r)))
+                    c, lab, fail, e, got = nu0_point(M.capture_scale, V, Z, R, nu0)
+                    self.assertIn(c, ("N", "S") if inside else ("U",), (label, side, lab))
+                    self.assertIsNone(fail, f"{label}, {side}: {fail}")
+                    head = f"T6-2 float-range edge, {label}, {side}: x {x!r} -> exact / edge - 1 = {float(r - 1):.3e}"
+                    if inside:
+                        print(f"{head}: returned (class {c}), worst relative error {e[0]:.2e}, error / allowance "
+                              f"{e[1]:.2e}")
+                    else:
+                        with self.assertRaisesRegex(ValueError, "outside the float range") as cm:
+                            M.capture_scale(np.array(V), np.array(Z), R, nu0=nu0)
+                        self.assertIn(f"{name} (", str(cm.exception))
+                        print(f"{head}: refused ({str(cm.exception)[:200]})")
+                for x in (math.nextafter(x0, 0.0), x0, math.nextafter(x0, math.inf)):
+                    V, Z, nu0 = make(x)
+                    c, lab, fail, e, got = nu0_point(M.capture_scale, V, Z, R, nu0)
+                    self.assertEqual(c, "B", (label, x, lab))
+                    self.assertIsNone(fail, f"{label}, in the band (x {x!r}): {fail}")
+                    print(f"T6-2 float-range edge, {label}, in the band: x {x!r} -> exact / edge - 1 = "
+                          f"{float(q_of(x) / edge - 1):.3e}: {'refused' if got is None else 'returned'} (either is "
+                          f"allowed{'' if got is None else '; within the contract'})")
+
+    def test_T6_2_nu0_random_sets(self):
+        """T6-2, clarification 2 Revision 4's contract on random small sets against exact rationals (nu0_point), R = 6:
+        (a) the coordinator's prototype check: 300 sets of 2-8 cells, V and zrep log-uniform over e^(+-5) (a fifth of
+        the zrep zero, at least one positive), nu0 log-uniform over e^(+-700); (b) 300 sets of 1-8 cells, V and zrep
+        log-uniform over e^(+-300) (a fifth of the zrep zero, at least one positive), nu0 log-uniform from 2^-1074 to
+        the largest float, which reaches every class (U, B, S, N). Every point meets the contract and the refusal rule;
+        the classes, the worst relative error (normal quantities) and the worst error / allowance per family are
+        printed."""
+        M = self.M
+        R = 6
+        rng = np.random.default_rng(20261114)
+        failures = []
+        for fam, sets, nlo, sp, lnu in (("(a) prototype", 300, 2, 5.0, (-700.0, 700.0)),
+                                       ("(b) wide", 300, 1, 300.0, (-744.4, 709.78))):
+            cnt, worst = Counter(), [0.0, 0.0]
+            for t in range(sets):
+                n = int(rng.integers(nlo, 9))
+                V = np.exp(rng.uniform(-sp, sp, n))
+                Z = np.exp(rng.uniform(-sp, sp, n)) * (rng.random(n) > 0.2)
+                if not Z.any():
+                    Z[0] = math.exp(rng.uniform(-sp, sp))
+                nu0 = max(math.exp(rng.uniform(*lnu)), 2.0 ** -1074)
+                c, lab, fail, e, got = nu0_point(M.capture_scale, V.tolist(), Z.tolist(), R, nu0)
+                cnt[c] += 1
+                cnt[c, got is None] += 1
+                worst = [max(worst[0], e[0]), max(worst[1], e[1])]
+                if fail:
+                    failures.append(f"{fam} set {t} (V {V.tolist()}, zrep {Z.tolist()}, nu0 {nu0!r}): {fail}")
+            print(f"T6-2 nu0 random sets {fam}: {sets} sets: N {cnt['N']} ({cnt['N', True]} refused), S {cnt['S']} "
+                  f"({cnt['S', True]} refused), B {cnt['B']} ({cnt['B', True]} refused), U {cnt['U']} "
+                  f"({cnt['U', True]} refused); worst relative error {worst[0]:.2e} (normal quantities), worst error / "
+                  f"allowance {worst[1]:.2e}")
+        self.assertFalse(failures, f"{len(failures)} random sets fail; the first 8:\n" + "\n".join(failures[:8]))
+
+    def test_T6_2_nu0_domain_raw_inputs(self):
+        """T6-2 with A_design_v5 clarification 2 (D3; Revision 1: the raw inputs are validated before main's floor;
+        Revision 4, item 1: V finite, zrep finite and >= 0; Codex's WP2 re-review P2): with a prior, a non-finite V
+        (+inf, -inf, NaN) or zrep, or a NEGATIVE replicate variance, is refused BEFORE main's 1e-8 floor of V --
+        922320e floored V = -inf to 1e-8 and returned weights (Codex's input: V = [-inf], zrep = [1], R = 6, nu0 = 4:
+        phi 1e8, unit ~ 1/6); a negative zrep whose shrunk variances would all still be positive (zrep = [1, -1e-300])
+        is refused too (f18a0ca returned it); -0.0 is not negative (it gives the bytes of +0.0); finite values take the
+        floor exactly as before (a V below 1e-8 gives the bytes of the floored V); nu0 None keeps main's bytes on every
+        one of these inputs (no check); no replicate variance in any cell (phi = 0) is refused with that context, never
+        floored. Revision 4: a v~ whose exact value is below the float range is an intermediate (never a refusal by
+        itself); here it takes the returned unit below the float range with it, and that is the refusal."""
+        M = self.M
+        R = 6
+        V = np.array([0.5, 0.25, 0.1, 0.04, 0.3, 0.0123])
+        zrep = np.array([0.6, 0.2, 0.15, 0.01, 0.0, 0.031])
+        ns = main_map()
+        cases = (("zrep +inf", V, np.r_[np.inf, zrep[1:]]), ("zrep -inf", V, np.r_[zrep[:2], -np.inf, zrep[3:]]),
+                 ("zrep nan", V, np.r_[zrep[:-1], np.nan]), ("V +inf", np.r_[V[:-1], np.inf], zrep),
+                 ("V nan", np.r_[np.nan, V[1:]], zrep), ("V -inf", np.r_[V[:2], -np.inf, V[3:]], zrep),
+                 ("V -inf (Codex's input)", np.array([-np.inf]), np.array([1.0])),
+                 ("zrep negative", V, np.r_[zrep[:3], -0.01, zrep[4:]]),
+                 ("zrep negative, every v~ still positive", np.array([1.0, 1.0]), np.array([1.0, -1e-300])),
+                 ("zrep negative, phi = 0", np.array([1.0, 1.0]), np.array([-1.0, 1.0])))
+        for label, Vb, zb in cases:
+            with self.subTest("an invalid raw input is refused before the floor", input=label):
+                msg = "a negative replicate variance in zrep" if "negative" in label else \
+                    "non-finite value in V or zrep"
+                with self.assertRaisesRegex(ValueError, msg + r".*checked raw, before the 1e-8 floor of V"):
+                    M.capture_scale(Vb, zb, R, nu0=4.0)
+            with self.subTest("nu0 None: main's bytes on the same input (no check)", input=label):
+                with np.errstate(all="ignore"):
+                    want = ns["capture_scale"](Vb, zb, R)
+                    for got in (M.capture_scale(Vb, zb, R), M.capture_scale(Vb, zb, R, nu0=None)):
+                        self.assertEqual(got[0].tobytes(), want[0].tobytes())
+                        self.assertEqual((type(got[1]), type(got[2])), (type(want[1]), type(want[2])))
+                        self.assertEqual(np.array([got[1], got[2]]).tobytes(), np.array([want[1], want[2]]).tobytes())
+        with self.subTest("-0.0 is not a negative replicate variance"):
+            zneg0 = np.r_[zrep[:4], -0.0, zrep[5:]]
+            self.assertTrue(math.copysign(1.0, zneg0[4]) < 0.0)
+            for nu0 in (0.37, 4.0, 1e12):
+                got, want = M.capture_scale(V, zneg0, R, nu0=nu0), M.capture_scale(V, zrep, R, nu0=nu0)
+                self.assertEqual((got[0].tobytes(), got[1], got[2]), (want[0].tobytes(), want[1], want[2]))
+        with self.subTest("finite values below the floor take it exactly as before"):
+            Vlow = np.r_[V[:2], -3.0, 0.0, 1e-12, V[5:]]
+            for nu0 in (0.37, 4.0, 1e12):
+                got, want = M.capture_scale(Vlow, zrep, R, nu0=nu0), M.capture_scale(np.maximum(Vlow, 1e-8), zrep, R,
+                                                                                    nu0=nu0)
+                self.assertEqual((got[0].tobytes(), got[1], got[2]), (want[0].tobytes(), want[1], want[2]))
+        for nu0 in (4.0, 1e308, 1e-300):
+            with self.subTest("phi = 0 is refused with that context", nu0=nu0):
+                with self.assertRaisesRegex(ValueError, r"every replicate variance is zero \(phi = 0\).*not floored"):
+                    M.capture_scale(V, np.zeros(len(V)), R, nu0=nu0)
+        with self.subTest("a v~ below the float range: refused only through the returned quantities"):
+            phi, vt, mt, fw, funit, mult = nu0_exact(V, zrep, R, 5e-324)
+            self.assertEqual(nu0_class(vt[(0.3, 0.0)]), "U")                # (the zero-variance cell: ~3.1e-325)
+            self.assertEqual(nu0_class(funit), "U")                         # (unit ~ that cell's v~: below 2^-1075)
+            c, lab, fail, e, got = nu0_point(M.capture_scale, V, zrep, R, 5e-324)
+            self.assertEqual(c, "U")
+            self.assertIsNone(fail, fail)
+            self.assertIn("unit", lab)
+            with self.assertRaisesRegex(ValueError, r"outside the float range.*unit \(log"):
+                M.capture_scale(V, zrep, R, nu0=5e-324)
+
+    # ---------------------------------------------------------------- T6-7
+    def bank_data(self, D, idx, seed, quantum=None, nu0_het=None):
+        """A synthetic bank-mode capture data set on the toy graph (gamma 1, the steep validation curve): the
+        scenario truth r1_017_cap's eta on idx, mapped affinely onto [logit 0.01, logit 0.99]; counts from the
+        capture law (obslaw: exact locations, B = 324, R = 6) with independent latents (T6-7's claims are about each
+        cell's own replicate variance, which cross-cell sharing does not change). quantum: the intended logit
+        fractions rounded to this step, the location solved once per level; nu0_het: per-cell latent scale
+        heterogeneity, s_e^2 = S_C(mu_e)^2 kappa_e with kappa_e = nu0 / chi2(nu0) (a scaled-inverse-chi2(nu0) of
+        scale 1; test only), the location solved at each cell's scale. -> (data, mu, exact V_z) on idx."""
+        ol, B, R = self.ol, self.B, self.rec.R_REPS
+        eta = self.rec.simulate(D, self.rec.SCENARIOS["r1_017_cap"], seed)["eta"][idx]
+        xmax = math.log(99.0)
+        x = -xmax + (eta - eta.min()) / (eta.max() - eta.min()) * (2.0 * xmax)
+        rng = np.random.default_rng([seed, 7])
+        if nu0_het is None:
+            lev, inv = np.unique(np.round(x / quantum) * quantum, return_inverse=True)
+            mul = ol.sig(lev)
+            sl = self.nsc.evaluate(VAL_SC, mul)
+            al, _ = ol.solve_location(mul, sl, B, B)
+            mu, s, a = mul[inv], sl[inv], al[inv]
+        else:
+            mu = ol.sig(x)
+            s = self.nsc.evaluate(VAL_SC, mu) * np.sqrt(nu0_het / rng.chisquare(nu0_het, len(mu)))
+            a, _ = ol.solve_location(mu, s, B, B)
+        K = ol.rounded_count(a[:, None], s[:, None], rng.standard_normal((len(mu), R)), B, B)
+        z = np.zeros((len(D.qi), R))
+        z[idx] = ol.empirical_logit(K, B)
+        return {"z": z, "zbar": z.mean(axis=1)}, mu, ol.logit_moments(a, s)[1]
+
+    def test_T6_7_working_coordinate_and_nu0(self):
+        """T6-7 (A_design_v5 PC-14, 1.7b). (a) On a bank-mode data set (gamma 1, the steep validation curve, intended
+        capture fractions 0.01-0.99, every fitting pair of the toy graph), fitted with the bank hooks and binned by
+        the fitted fraction sigma(z_fit): the mean of zrep_e / W(z_fit,e) is 1 within 4 Monte Carlo SE in every bin
+        and phi^ is in [0.95, 1.05], while the v1 adapter S_C(sigma(z_fit))^2 is distorted beyond 4 SE in the lowest
+        and the highest bin, and beyond 4 SE of its own pooled phi in at least one of them (a single phi cannot
+        absorb it); the fit's unit and phi are capture_scale's at its fitted fractions with its nu0 (full pooling
+        likewise), and it records rep_prior, score_law, var_fn.identity and table_extrapolated. (b) With per-cell
+        latent scale heterogeneity kappa_e ~ scaled-inverse-chi2(nu0) (test only), the shrunk v~_e has a lower mean
+        squared error against each cell's exact V_z than full pooling (phi W) and than the raw zrep_e."""
+        import sys as sys_
+        M, ol, rec, R = self.M, self.ol, self.rec, self.rec.R_REPS
+        D = rec.Data(full())
+        idx = D.fit["a"]
+        data, mu, _ = self.bank_data(D, idx, 1000, quantum=0.005)
+        self.assertTrue(0.0099 < float(mu.min()) < 0.011 and 0.989 < float(mu.max()) < 0.9901)
+        zrep = data["z"][idx].var(axis=1, ddof=1)
+        fits = {}
+        for nu0 in (10.0, None):
+            W, SL = self.hooks(self.tab, f"t6-7 {nu0}")
+            m = M.fit(D, idx, data, 1, 0.05, False, 10, 1, var_fn=W, rep_prior={"nu0": nu0}, score_law=SL)
+            p = np.clip(ol.sig(M.predict(D, m, idx)), 1e-4, 1.0 - 1e-4)
+            Vp = self.tab.evaluate(np.log(p) - np.log1p(-p))["W"]
+            w, unit, phi = M.capture_scale(Vp, zrep, R, nu0=nu0)
+            self.assertAlmostEqual(m["phi"], phi, delta=1e-12 * phi)
+            self.assertAlmostEqual(m["unit"], unit, delta=1e-12 * unit)
+            self.assertEqual(m["rep_prior"], {"nu0": nu0})
+            self.assertIs(m["score_law"], SL)
+            self.assertEqual(m["var_fn_identity"], f"t6-7 {nu0}")
+            self.assertIsInstance(m["table_extrapolated"], int)
+            self.assertEqual(m["table_extrapolated"], W.extrapolated)     # (W fresh: every count is this fit's)
+            fits[nu0] = (m, p, Vp)
+        self.assertNotEqual(fits[10.0][0]["unit"], fits[None][0]["unit"])          # (the shrinkage is applied)
+        m, p, Vp = fits[10.0]
+        phi_hat = m["phi"]
+        self.assertTrue(0.95 <= phi_hat <= 1.05, phi_hat)
+        rw = zrep / Vp
+        r1 = zrep / self.nsc.evaluate(VAL_SC, p) ** 2
+        edges = (0.0, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 1.0)
+        rows = []
+        for lo, hi in zip(edges[:-1], edges[1:]):
+            sel = (p >= lo) & (p < hi)
+            n = int(sel.sum())
+            self.assertGreater(n, 500, (lo, hi))
+            rows.append((lo, hi, n, rw[sel].mean(), rw[sel].std(ddof=1) / math.sqrt(n), r1[sel].mean(),
+                         r1[sel].std(ddof=1) / math.sqrt(n)))
+        for lo, hi, n, mw, sw, m1, s1 in rows:
+            print(f"T6-7 [{lo}, {hi}) n={n}: zrep/W {mw:.4f} +- {sw:.4f} ({(mw - 1) / sw:+.1f} SE); v1 adapter "
+                  f"{m1:.4f} ({(m1 - 1) / s1:+.1f} SE from 1, {(m1 - r1.mean()) / s1:+.1f} SE from its phi "
+                  f"{r1.mean():.4f}); phi^ {phi_hat:.4f}", file=sys_.stderr)
+            self.assertLessEqual(abs(mw - 1.0), 4.0 * sw, (lo, hi, mw, sw))
+        for lo, hi, n, mw, sw, m1, s1 in (rows[0], rows[-1]):
+            self.assertGreater(abs(m1 - 1.0), 4.0 * s1, (lo, hi, m1, s1))
+        self.assertTrue(any(abs(m1 - r1.mean()) > 4.0 * s1 for lo, hi, n, mw, sw, m1, s1 in (rows[0], rows[-1])))
+        # (b) nu0 in working coordinates
+        nu0 = 10.0
+        idx_b = idx[::8]
+        data_b, _, Vz = self.bank_data(D, idx_b, 2000, nu0_het=nu0)
+        W, SL = self.hooks(self.tab, "t6-7b")
+        mb = M.fit(D, idx_b, data_b, 1, 0.05, False, 10, 1, var_fn=W, rep_prior={"nu0": nu0}, score_law=SL)
+        pb = np.clip(ol.sig(M.predict(D, mb, idx_b)), 1e-4, 1.0 - 1e-4)
+        Vb = self.tab.evaluate(np.log(pb) - np.log1p(-pb))["W"]
+        zb = data_b["z"][idx_b].var(axis=1, ddof=1)
+        w, unit, phi = M.capture_scale(Vb, zb, R, nu0=nu0)
+        self.assertAlmostEqual(mb["unit"], unit, delta=1e-12 * unit)
+        w0, unit0, _ = M.capture_scale(Vb, zb, R)
+        mse = {"shrunk": float(np.mean((R * unit / w - Vz) ** 2)), "pooled": float(np.mean((R * unit0 / w0 - Vz) ** 2)),
+               "raw": float(np.mean((zb - Vz) ** 2))}
+        print(f"T6-7(b) nu0 {nu0}, {len(idx_b)} cells, phi^ {phi:.4f}: MSE against the exact V_z {mse}",
+              file=sys_.stderr)
+        self.assertLess(mse["shrunk"], mse["pooled"])
+        self.assertLess(mse["shrunk"], mse["raw"])
+
+    # ---------------------------------------------------------------- T6-8
+    def test_T6_8_score_law(self):
+        """T6-8 (A_design_v5 3.3, PC-17): at nodes with known predicted empirical logit z, _score_law returns
+        (A(mu^), phi L(mu^)), mu^ = m_z^-1(z), from the frozen fitter table: exact at the table's nodes, its
+        piecewise-linear interpolants between them (checked through numpy's interp, not obslaw's lookup), the end
+        values beyond it; at phi = 1 the count law (A, phi L) has mean fraction mu^ within 2e-7 (at the nodes, the
+        certification probes 1/4, 1/2, 3/4 of every segment, and random points); the deviation at phi != 1 is
+        recorded; score_law None reproduces today's scores byte for byte (main's pred_count_lpd: plain, exact and
+        grid cases, a refinement and a range extension included)."""
+        import sys as sys_
+        M, ol, tab, B = self.M, self.ol, self.tab, self.B
+        W, SL = self.hooks(tab)
+        rng = np.random.default_rng(8)
+        zs = {"nodes": tab.m.copy(),
+              "probes": np.concatenate([tab.m[:-1] + f * np.diff(tab.m) for f in (0.25, 0.5, 0.75)]),
+              "random": rng.uniform(tab.m[0], tab.m[-1], 5000)}
+        for phi in (1.0, 1.7):
+            m = {"phi": phi, "score_law": SL, "var_fn": W}
+            for label, z in zs.items():
+                A, V = M._score_law(m, z)
+                self.assertTrue(np.allclose(A, np.interp(z, tab.m, tab.A), rtol=0, atol=1e-10), label)
+                self.assertTrue(np.allclose(V, phi * np.interp(z, tab.m, tab.L), rtol=1e-12, atol=0), label)
+            A, V = M._score_law(m, tab.m)
+            self.assertTrue(np.allclose(A, tab.A, rtol=0, atol=1e-10) and np.allclose(V, phi * tab.L, rtol=1e-12))
+            far = np.array([tab.m[0] - 1.0, -20.0, -1e3, tab.m[-1] + 1.0, 20.0, 1e3])
+            A, V = M._score_law(m, far)
+            self.assertTrue(np.array_equal(A, np.repeat(tab.A[[0, -1]], 3)))
+            self.assertTrue(np.allclose(V, phi * np.repeat(tab.L[[0, -1]], 3), rtol=1e-15, atol=0))
+        self.assertTrue(np.allclose(tab.mu_hat(tab.m), ol.sig(tab.x), rtol=1e-12, atol=0))
+        m1 = {"phi": 1.0, "score_law": SL, "var_fn": W}
+        for label, z in zs.items():
+            A, V = M._score_law(m1, z)
+            muh = tab.mu_hat(z)
+            dev = float(np.max(np.abs(ol.expected_fraction(A, np.sqrt(V), B, B) - muh)))
+            self.assertLessEqual(dev, 2e-7, label)
+            for phi in (0.5, 0.8, 1.25, 2.0):
+                dv = np.abs(ol.expected_fraction(A, np.sqrt(phi * V), B, B) - muh)
+                print(f"T6-8 recorded ({label}): phi = {phi}: max |E[K]/B - mu^| = {float(dv.max()):.3e} at mu^ = "
+                      f"{float(muh[np.argmax(dv)]):.6f} (phi = 1: {dev:.2e})", file=sys_.stderr)
+        # score_law None: today's scorer, byte for byte
+        loc = np.linspace(-12.0, 12.0, 97)
+        m0 = {"phi": 0.9, "var_fn": W}
+        got = M._score_law(m0, loc)
+        self.assertIs(got[0], loc)
+        self.assertEqual(got[1].tobytes(), M._rep_var(m0, loc).tobytes())
+        vf = self.rec.var_model(self.rec.SCENARIOS["r2_017_cap15"])
+        one = lambda p: np.ones_like(p)                                         # noqa: E731
+        self.assert_main_bytes([
+            ({"link": M.Link(), "phi": 1.0, "var_fn": W}, [0.3, -2.0, 4.0, 0.0], [0.0, 0.0, 0.0, 0.25],
+             [[200, 201], [10, 12], [300, 324], [150, 170]]),                              # (plain and grid)
+            ({"link": M.Link(), "phi": 0.003 ** 2, "var_fn": one}, [0.0], [1.0], [[162]]),  # (24,577 nodes)
+            ({"link": M.Link(), "phi": 1.0, "var_fn": None}, [0.0, 1.0], [1.0, 0.5], [[162], [200]]),   # (exact)
+            ({"link": M.Link(None, None, 0.02, 0.8), "phi": 0.003 ** 2, "var_fn": one}, [0.0], [1.0], [[324]]),
+            ({"link": M.Link(), "phi": 1.0, "var_fn": vf}, [0.0], [1.646 ** 2],
+             [[75, 111, 125, 137, 49, 87]]),
+            ({"link": M.Link(np.array([-3.0, -1.0, 1.0, 3.0]), np.array([-3.0, -1.5, 1.4, 3.0]), 0.01, 0.95),
+              "phi": 1.2, "var_fn": W}, [-2.0, 0.5, 2.5], [0.4, 1.0, 0.09], [[3], [180], [320]])])
+
+    # ---------------------------------------------------------------- T6-10
+    def t610_cases(self):
+        """(group key, table name, link spec, phi, predicted fraction, SD, count) for T6-10: identity G on both
+        tables over T610_FRACS x T610_SDS x counts {0, the modal count, B} (the unrepresentable cases excluded; the
+        three range-gap cases T610_GAP included since clarification 2), plus a spline link, a bounded link and
+        phi = 1.5 on the steep curve: 195 observations."""
+        B = self.B
+        out = []
+        for tname in ("val", "const"):
+            for mu in T610_FRACS:
+                for sd in T610_SDS:
+                    for k in sorted({0, int(round(B * mu)), B}):
+                        key = (tname, mu, sd, k)
+                        if key not in T610_UNREPRESENTABLE:
+                            out.append(((tname, None, 1.0), tname, None, 1.0, mu, sd, k))
+        spline = ((-4.0, -1.0, 1.0, 4.0), (-4.0, -1.6, 0.4, 4.0), 0.0, 1.0)
+        bounded = ((-3.0, 0.0, 3.0), (-3.0, 0.5, 3.0), 0.02, 0.9)
+        for mu in (0.01, 0.5, 0.99):
+            for sd in (0.3, 1.0):
+                out.append((("val", "spline", 1.0), "val", spline, 1.0, mu, sd, int(round(B * mu))))
+        for mu in (0.05, 0.5, 0.85):
+            for sd in (0.3, 1.0):
+                for k in (0, int(round(B * mu))):
+                    out.append((("val", "bounded", 1.0), "val", bounded, 1.0, mu, sd, k))
+        for mu in (0.1, 0.5, 0.9):
+            for sd in (0.3, 1.0):
+                for k in (0, int(round(B * mu))):
+                    out.append((("val", None, 1.5), "val", None, 1.5, mu, sd, k))
+        return out
+
+    def t610_eta(self, tab, spec, mu):
+        """The predictor whose G is the table's m_z at mu (the predicted empirical logit of fraction mu)."""
+        z = self.zmu(tab, mu)
+        if spec is None:
+            return z
+        G = ref_link(*spec)
+        lo, hi = -60.0, 60.0
+        for _ in range(200):
+            mid = 0.5 * (lo + hi)
+            lo, hi = (mid, hi) if float(G(np.array([mid]))[0]) < z else (lo, mid)
+        return 0.5 * (lo + hi)
+
+    def t610_reference(self, tab, spec, phi, eta, sd, k):
+        G = ref_link(*spec) if spec is not None else ref_link()
+        m_, A_, L_ = tab.m, tab.A, tab.L
+
+        def loglik(e):
+            z = G(eta + e)
+            return ref_count_logp(k, np.interp(z, m_, A_), phi * np.interp(z, m_, L_), self.B)
+        return ref_log_integral(loglik, sd)
+
+    def t610_refs(self, cases):
+        """The reference of every case (computed once per test run: a module cache keyed by the case)."""
+        out = []
+        for g, tname, spec, phi, mu, sd, k in cases:
+            key = (tname, spec, phi, mu, sd, k)
+            if key not in _T610_REF:
+                tab = self.tabs[tname]
+                _T610_REF[key] = self.t610_reference(tab, spec, phi, self.t610_eta(tab, spec, mu), sd, k)
+            out.append(_T610_REF[key])
+        return out
+
+    def t610_run(self, cases, rule=None, hook=True):
+        """Score every case (one replicate per pair, so a pair's score is one observation's): grouped by table, link
+        and phi -> ({case index: score}, {group: info}). rule: a replacement _score_need (the negative control);
+        hook False: no score law (main's scorer, for the byte comparison)."""
+        M = self.M
+        groups = {}
+        for i, c in enumerate(cases):
+            groups.setdefault(c[0], []).append(i)
+        out, infos, models = {}, {}, {}
+        for g, ix in groups.items():
+            tname, spec, phi = cases[ix[0]][1], cases[ix[0]][2], cases[ix[0]][3]
+            tab = self.tabs[tname]
+            W, SL = self.hooks(tab, "t6-10")
+            lk = M.Link() if spec is None else M.Link(np.array(spec[0]), np.array(spec[1]), spec[2], spec[3])
+            m = {"link": lk, "phi": phi, "var_fn": W}
+            if hook:
+                m["score_law"] = SL
+            eta = [self.t610_eta(tab, spec, cases[i][4]) for i in ix]
+            s2 = [cases[i][5] ** 2 for i in ix]
+            cnt = [[cases[i][6]] for i in ix]
+            if rule is None:
+                sc, info = self.score(m, eta, s2, cnt)
+            else:
+                with mock.patch.object(M, "_score_need", rule):
+                    sc, info = self.score(m, eta, s2, cnt)
+            out.update(zip(ix, sc.tolist()))
+            infos[g], models[g] = info, (m, eta, s2, cnt)
+        return out, infos, models
+
+    def mandatory(self):
+        """T6-10's mandatory rare-count case (S_C = 0.2, phi 1, identity G, fraction 0.998, SD 1, k = 0, location
+        m_z(0.998) from the exact location solve) -> (location, its reference; cached)."""
+        if "mandatory" not in _T610_REF:
+            B, ol = self.B, self.ol
+            a, _ = ol.solve_location(np.array([0.998]), np.array([0.2]), B, B)
+            loc = float(ol.logit_moments(a, np.array([0.2]))[0][0])
+            _T610_REF["mandatory"] = (loc, self.t610_reference(self.tabs["const"], None, 1.0, loc, 1.0, 0))
+        return _T610_REF["mandatory"]
+
+    def assert_certified(self, labelled):
+        """Every reference of labelled [(label, reference)] is certified within REF_HALVINGS halvings (A_design_v5
+        clarification 2, D2): the halving stopped at the first two consecutive estimates within REF_CERT in log, the
+        finer of them is the reference and their |difference| its certificate, the final spacing is 5e-5 / 2^halvings
+        SD, and the tail criterion holds with the final estimate. Otherwise T6-10 fails with each such case's spacings,
+        estimates and certificate (no case is excluded or given an allowance)."""
+        bad = []
+        for label, r in labelled:
+            est = r["estimates"]
+            ok = (r["certified"] and r["fine_bound_ok"] and 1 <= r["halvings"] == len(est) - 1 <= REF_HALVINGS
+                  and r["spacing"] == est[-1][0] == REF_SPACING / 2.0 ** r["halvings"] and r["log_I"] == est[-1][1]
+                  and r["certificate"] == abs(est[-1][1] - est[-2][1]) <= REF_CERT
+                  and all(abs(y[1] - x[1]) > REF_CERT for x, y in zip(est[:-2], est[1:-1])))
+            if not ok:
+                bad.append((label, est, r["certificate"], r["fine_bound_ok"]))
+        self.assertEqual(bad, [], "references not certified within four halvings (A_design_v5 clarification 2, D2): "
+                                  "(case, [(spacing in SD, log I^), ...], certificate, tail criterion with the final)")
+
+    @staticmethod
+    def tail_holds(full, span):
+        """The bank-mode tail bound of A_design_v5 clarification 2, D1, computed here independently of map (from the
+        reference's ref_log_sf; TRAP_SD = 7, TRAP_TAIL = 1e-4): log(2 PhiBar(b)) <= log(1e-4) + full + log(1 - 2
+        PhiBar(b)), b = 7 span, elementwise on a pass's normalized estimates full."""
+        lt = math.log(2.0) + float(ref_log_sf(np.array([7.0 * span]))[0])
+        return np.asarray(full, float) >= lt - math.log(1e-4) - math.log1p(-math.exp(lt))
+
+    def brute_need(self, tab, lk, phi, eta, sd, span):
+        """The grid rule's node requirement (A_design_v5 3.3, PC-24) computed independently of map._score_need: H^max
+        by brute force over every table segment meeting [G(eta - Delta), G(eta + Delta)] (clipped like the score law's
+        argument), Delta = TRAP_SD span sd, g_max = Link.max_slope over [eta - Delta, eta + Delta], s_lat = sqrt(phi
+        min L), h = min(sd, TRAP_H s_lat / (g_max max(H^max, 1e-12))) -> (ceil(2 TRAP_SD span sd / h) + 1, H^max,
+        g_max)."""
+        M = self.M
+        kappa = np.abs(np.diff(tab.A) / np.diff(tab.m))
+        d_ = M.TRAP_SD * span * sd
+        pz = np.clip(M._sig(lk.G(np.array([eta - d_, eta + d_]))), 1e-4, 1 - 1e-4)
+        zlo, zhi = (np.log(pz) - np.log1p(-pz)).tolist()
+        hit = (tab.m[:-1] <= zhi) & (tab.m[1:] >= zlo)
+        hmax = float(kappa[hit].max()) if hit.any() else 0.0
+        gmax = max(lk.max_slope(eta - d_, eta + d_), 1e-12)
+        h = min(sd, M.TRAP_H * math.sqrt(max(phi * float(tab.L.min()), 1e-300)) / (gmax * max(hmax, 1e-12)))
+        return math.ceil(2 * M.TRAP_SD * span * sd / max(h, 1e-300)) + 1, hmax, gmax
+
+    def test_T6_10_integrated_score_with_the_hook(self):
+        """T6-10 (A_design_v5 3.3, PC-24, PC-25, with clarification 2): pred_count_lpd with the score law equals the
+        reference within 2 x TRAP_TOL per observation, with no grid_unresolved pair, for predicted capture fractions
+        0.002-0.998 (the saturated ones, where the table's slopes kappa_j are largest, included), predictor SDs
+        0.05-1.0 and counts 0, modal and B (the rarest at the extreme predictions), on the steep validation curve and
+        S_C = 0.2, with identity, spline and bounded links and phi 1 and 1.5: 195 observations (every case but the
+        three the reference refuses as unrepresentable at +-60 SD; the three range-gap cases T610_GAP included, which
+        the tail bound of D1 now extends); every reference is certified within four halvings (D2: the case fails
+        otherwise). The mandatory rare-count case (S_C = 0.2, phi 1, identity G, fraction 0.998, SD 1, k = 0,
+        location m_z(0.998)): the reference extends beyond 10 SD and the scorer records a range extension and agrees.
+        The v2 rule (main's step, no H^max) runs as the negative control and its misses are reported; with score_law
+        unset the scores are main's byte for byte."""
+        import sys as sys_
+        M = self.M
+        tol = 2 * M.TRAP_TOL
+        for key in T610_UNREPRESENTABLE:
+            tab = self.tabs[key[0]]
+            with self.assertRaisesRegex(ValueError, "unrepresentable"):
+                self.t610_reference(tab, None, 1.0, self.zmu(tab, key[1]), key[2], key[3])
+        cases = self.t610_cases()
+        self.assertEqual(len(cases), 195)
+        self.assertTrue(T610_GAP <= {(c[1], c[4], c[5], c[6]) for c in cases if c[2] is None and c[3] == 1.0})
+        got, infos, models = self.t610_run(cases)
+        worst, misses = 0.0, []
+        refs = {}
+        rr = self.t610_refs(cases)
+        self.assert_certified([(c[1:], r) for c, r in zip(cases, rr)])
+        for i, r in enumerate(rr):
+            refs[i] = r["log_I"]
+            d = abs(got[i] - r["log_I"])
+            worst = max(worst, d)
+            if d > tol:
+                misses.append((cases[i][1:], got[i], r["log_I"]))
+        for g, info in infos.items():
+            self.assertEqual(info["grid_unresolved"], 0, g)
+            self.assertIsInstance(info["table_extrapolated"], int)
+        ext = sum(info["extended"] for info in infos.values())
+        certs = [r["certificate"] for r in rr]
+        print(f"T6-10: {len(cases)} observations, worst |score - reference| {worst:.2e} (tolerance {tol}), {ext} range "
+              f"extensions, misses {misses}; reference certificates: worst {max(certs):.2e}, all certified within "
+              f"four halvings (halvings used: {sorted(Counter(r['halvings'] for r in rr).items())})",
+              file=sys_.stderr)
+        self.assertEqual(misses, [])
+        self.assertGreater(ext, 10)
+        # the mandatory rare-count case
+        tabc = self.tabs["const"]
+        loc, r = self.mandatory()
+        self.assert_certified([("mandatory", r)])
+        self.assertGreater(r["b"], REF_START)
+        self.assertTrue(all(not t[3] for t in r["trace"][:-1]) and r["trace"][-1][3])
+        W, SL = self.hooks(tabc)
+        sc, info = self.score({"link": M.Link(), "phi": 1.0, "var_fn": W, "score_law": SL}, [loc], [1.0], [[0]])
+        print(f"T6-10 mandatory case: score {float(sc[0]):.6f}, reference {r['log_I']:.6f} (b = {r['b']:g} SD), "
+              f"scorer info {info}", file=sys_.stderr)
+        self.assertGreaterEqual(info["extended"], 1)
+        self.assertEqual(info["grid_unresolved"], 0)
+        self.assertLessEqual(abs(float(sc[0]) - r["log_I"]), tol)
+
+        # the negative control: the v2 rule (main's step: the working variance's floor, no H^max)
+        def v2_rule(lk, m, eta, sd, span):
+            smin = math.sqrt(max(float(M._rep_var(m, M.VMIN_GRID).min()), 1e-300))
+            d_ = M.TRAP_SD * span * sd
+            gmax = np.array([max(lk.max_slope(e - dd, e + dd), 1e-12) for e, dd in
+                             zip(np.atleast_1d(eta), np.broadcast_to(d_, np.shape(np.atleast_1d(eta))))])
+            h = np.minimum(sd, M.TRAP_H * smin / gmax)
+            return np.ceil(2 * M.TRAP_SD * span * sd / np.maximum(h, 1e-300)) + 1
+        got2, infos2, _ = self.t610_run(cases, rule=v2_rule)
+        miss2 = [(cases[i][1:], round(got2[i] - refs[i], 6)) for i in refs if abs(got2[i] - refs[i]) > tol]
+        unres2 = sum(info["grid_unresolved"] for info in infos2.values())
+        print(f"T6-10 negative control (v2 rule): {len(miss2)} misses beyond {tol}, {unres2} unresolved, worst "
+              f"{max(abs(got2[i] - refs[i]) for i in refs):.2e}; misses {miss2}", file=sys_.stderr)
+        # score_law unset: main's scorer, byte for byte, on the same groups
+        _, _, plain = self.t610_run(cases, hook=False)
+        self.assert_main_bytes(list(plain.values()))
+
+    def test_T6_10_grid_rule_per_pair_hmax_and_extension(self):
+        """T6-10's grid rule (A_design_v5 3.3, PC-24) against an independent computation: H^max the largest |kappa_j|
+        of the table segments meeting [G(eta - Delta), G(eta + Delta)] (brute force over every segment; 0 wholly beyond
+        the table), Delta = TRAP_SD span sd, g_max the link's max_slope over [eta - Delta, eta + Delta] per pair,
+        s_lat = sqrt(phi min L), h = min(sd, TRAP_H s_lat / (g_max max(H^max, 1e-12))): _score_need gives
+        ceil(2 TRAP_SD span sd / h) + 1 for identity, spline and bounded links, spans 1-8 and phi 0.6-2.2. On a range
+        extension (the steep curve, k = 0 at fraction 0.998, SD 1, where the extended range reaches the table's
+        steepest segments) every grid used is at least the bucket of the requirement RECOMPUTED on its range, which
+        main's span-scaled requirement does not reach there."""
+        M, tab = self.M, self.tab
+        W, SL = self.hooks(tab)
+        kappa = np.abs(np.diff(tab.A) / np.diff(tab.m))
+
+        def zc(g):
+            p = np.clip(M._sig(np.asarray(g, float)), 1e-4, 1 - 1e-4)
+            return np.log(p) - np.log1p(-p)
+
+        def need(lk, phi, eta, sd, span):
+            d_ = M.TRAP_SD * span * sd
+            zlo, zhi = float(zc(lk.G(np.array([eta - d_])))[0]), float(zc(lk.G(np.array([eta + d_])))[0])
+            hit = (tab.m[:-1] <= zhi) & (tab.m[1:] >= zlo)
+            hmax = float(kappa[hit].max()) if hit.any() else 0.0
+            gmax = max(lk.max_slope(eta - d_, eta + d_), 1e-12)
+            slat = math.sqrt(max(phi * float(tab.L.min()), 1e-300))
+            h = min(sd, M.TRAP_H * slat / (gmax * max(hmax, 1e-12)))
+            return math.ceil(2 * M.TRAP_SD * span * sd / max(h, 1e-300)) + 1, hmax
+        rng = np.random.default_rng(10)
+        links = [M.Link(), M.Link(np.array([-4.0, -1.0, 1.0, 4.0]), np.array([-4.0, -1.6, 0.4, 4.0])),
+                 M.Link(np.array([-3.0, 0.0, 3.0]), np.array([-3.0, 0.5, 3.0]), 0.02, 0.9)]
+        zero_hmax = 0
+        for lk in links:
+            for phi in (1.0, 0.6, 2.2):
+                m = {"link": lk, "phi": phi, "var_fn": W, "score_law": SL}
+                eta = rng.uniform(-12.0, 12.0, 120)
+                sd = np.exp(rng.uniform(math.log(0.005), math.log(3.0), 120))
+                for span in (1.0, 2.0, 4.0, 8.0):
+                    got = M._score_need(lk, m, eta, sd, span)
+                    want = [need(lk, phi, e, s, span) for e, s in zip(eta, sd)]
+                    self.assertTrue(np.array_equal(got, np.array([w[0] for w in want], float)), (span, phi))
+                    zero_hmax += sum(w[1] == 0.0 for w in want)
+                    one = M._score_need(lk, m, eta[:1], sd[:1], span)
+                    self.assertEqual(float(one[0]), float(got[0]))
+        self.assertGreater(zero_hmax, 0)                       # (intervals wholly in the constant extrapolation)
+        # the extension: the grid used at every span is at least the recomputed requirement's bucket
+        eta0 = self.zmu(tab, 0.998)
+        calls = []
+        real = M._grid_pass
+
+        def spy(lk, m, cnt, eta, sd, N, K, span):
+            calls.append((int(K), float(span[0])))
+            return real(lk, m, cnt, eta, sd, N, K, span)
+        m = {"link": M.Link(), "phi": 1.0, "var_fn": W, "score_law": SL}
+        with mock.patch.object(M, "_grid_pass", spy):
+            _, info = self.score(m, [eta0], [1.0], [[0]])
+        self.assertGreaterEqual(info["extended"], 1)
+        self.assertIn(2.0, [s for _, s in calls])
+        top = len(M.TRAP_KS) - 1
+        for K, span in calls:
+            n_, _ = need(M.Link(), 1.0, eta0, 1.0, span)
+            self.assertGreaterEqual(K, M.TRAP_KS[min(int(np.searchsorted(M.TRAP_KS, n_)), top)], (K, span))
+        n1, h1 = need(M.Link(), 1.0, eta0, 1.0, 1.0)
+        n2, h2 = need(M.Link(), 1.0, eta0, 1.0, 2.0)
+        self.assertGreater(h2, h1)                             # (the extended range meets steeper segments)
+        self.assertGreater(int(np.searchsorted(M.TRAP_KS, n2)), int(np.searchsorted(M.TRAP_KS, n1 * 2.0)))
+
+    def test_T6_10_gap_diagnosis(self):
+        """The T6-10 range gap (T610_GAP; Codex WP2 review P1), closed by the tail bound (A_design_v5 clarification 2,
+        D1): for each case the scorer's own integrand (_score_law and the interval probability), integrated densely
+        over +-25 SD, matches the reference within 1e-6 and peaks beyond +-TRAP_SD prior SDs (the dominant mode lies
+        outside the first range); the first pass (span 1) passes main's end-node check but fails the tail bound
+        (computed here independently, from the reference's tail function), so pred_count_lpd EXTENDS the range and
+        the score agrees with the certified reference within 2 x TRAP_TOL, with no grid_unresolved pair (at a4227b6
+        it extended nothing and missed by 9.6-83 nats, unflagged)."""
+        import sys as sys_
+        M, B = self.M, self.B
+        for tname, mu, sd, k in sorted(T610_GAP):
+            tab = self.tabs[tname]
+            W, SL = self.hooks(tab)
+            m = {"link": M.Link(), "phi": 1.0, "var_fn": W, "score_law": SL}
+            eta = self.zmu(tab, mu)
+            r = self.t610_refs([((tname, None, 1.0), tname, None, 1.0, mu, sd, k)])[0]
+            passes = []
+            real = M._grid_pass
+
+            def spy(lk, m_, cnt, e_, s_, N, K, span, passes=passes, real=real):
+                res = real(lk, m_, cnt, e_, s_, N, K, span)
+                passes.append((float(span[0]), res[0].copy(), res[2].copy()))
+                return res
+            with mock.patch.object(M, "_grid_pass", spy):
+                sc, info = self.score(m, [eta], [sd * sd], [[k]])
+            x = np.linspace(-25.0, 25.0, 2_000_001)
+            loc, var = M._score_law(m, eta + sd * x)
+            t = (M._interval_logp(np.full((len(x), 1), k), B, loc[:, None], var[:, None])[:, 0] - 0.5 * x * x
+                 - 0.5 * math.log(2 * math.pi) + math.log(x[1] - x[0]))
+            dense = float(t.max() + math.log(float(np.exp(t - t.max()).sum())))
+            span1, full1, edge1 = passes[0]
+            print(f"T6-10 range gap {tname} mu^ {mu} SD {sd} k {k}: scorer {float(sc[0]):.6f}, reference "
+                  f"{r['log_I']:.6f}, the scorer's integrand densely {dense:.6f} (peak at e = "
+                  f"{float(x[np.argmax(t)]):+.2f} SD); first pass (span {span1:g}) {float(full1[0, 0]):.4f}, spans "
+                  f"used {sorted({p[0] for p in passes})}; info {info}", file=sys_.stderr)
+            self.assertLessEqual(abs(dense - r["log_I"]), 1e-6)
+            self.assertGreater(float(x[np.argmax(t)]), M.TRAP_SD)
+            self.assertEqual(span1, 1.0)
+            self.assertTrue(np.all(edge1 <= M.TRAP_EDGE))                      # (main's end-node check passes ...)
+            self.assertFalse(np.all(self.tail_holds(full1, 1.0)))              # (... the tail bound does not)
+            self.assertGreaterEqual(info["extended"], 1)
+            self.assertEqual(info["grid_unresolved"], 0)
+            self.assertLessEqual(abs(float(sc[0]) - r["log_I"]), 2 * M.TRAP_TOL)
+            self.assert_certified([((tname, mu, sd, k), r)])
+
+    def test_T6_10_gap_cases_agree(self):
+        """T6-10's requirement on the range-gap cases (T610_GAP), each scored alone: the scorer records a range
+        extension and agrees with the certified reference within 2 x TRAP_TOL, with no grid_unresolved pair (an
+        expected failure at a4227b6; A_design_v5 clarification 2, D1)."""
+        cases = [((t, None, 1.0), t, None, 1.0, mu, sd, k) for t, mu, sd, k in sorted(T610_GAP)]
+        refs = self.t610_refs(cases)
+        self.assert_certified([(c[1:], r) for c, r in zip(cases, refs)])
+        for c, r in zip(cases, refs):
+            got, infos, _ = self.t610_run([c])
+            self.assertGreaterEqual(infos[c[0]]["extended"], 1, c)
+            self.assertEqual(infos[c[0]]["grid_unresolved"], 0, c)
+            self.assertLessEqual(abs(got[0] - r["log_I"]), 2 * self.M.TRAP_TOL, c)
+
+    def test_T6_10_reference_certificates(self):
+        """T6-10's reference (A_design_v5 PC-25 with clarification 2, D2): every one of the 195 observations (v5's 192
+        and the three range-gap cases) and the mandatory rare-count case certifies within four halvings of 5e-5 SD --
+        the halving stops at the first two consecutive estimates within 1e-9 in log, the finer of them is the
+        reference, and the tail criterion holds with it. Each case's final spacing and certificate are recorded, with
+        the spacings' distribution. (At a4227b6 the reference halved once and 22 of 192 exceeded 1e-9, the mandatory
+        case 4.5e-9: the halve-once mutation reproduces that.)"""
+        import sys as sys_
+        cases = self.t610_cases()
+        labelled = [(c[1:], r) for c, r in zip(cases, self.t610_refs(cases))]
+        labelled.append(("mandatory (S_C 0.2, 0.998, SD 1, k 0)", self.mandatory()[1]))
+        self.assertEqual(len(labelled), 196)
+        for label, r in labelled:
+            print(f"T6-10 reference {label}: b = {r['b']:g} SD, {r['halvings']} halving(s), final spacing "
+                  f"{r['spacing']:.4g} SD, certificate {r['certificate']:.3e}, log I^ {r['log_I']:.12f}",
+                  file=sys_.stderr)
+        dist = sorted(Counter(r["spacing"] for _, r in labelled).items(), reverse=True)
+        worst = max(labelled, key=lambda x: x[1]["certificate"])
+        print(f"T6-10 references: {len(labelled)} cases; final spacing (SD): count {dist}; worst certificate "
+              f"{worst[1]['certificate']:.3e} ({worst[0]})", file=sys_.stderr)
+        self.assert_certified(labelled)
+
+    def test_T6_10_tail_bound_rule(self):
+        """A_design_v5 clarification 2, D1, white box (pred_count_lpd's controller with a stub grid pass whose
+        estimates are prescribed per span): with the score law a pass is range-adequate only if main's end-node check
+        AND the tail bound log(2 PhiBar(b)) <= log(TRAP_TAIL) + log I^ hold for EVERY replicate, b = TRAP_SD span,
+        log I^ = full + log(1 - 2 PhiBar(b)), TRAP_TAIL = 1e-4 (the bound fails below log I^ = -17.48, -91.66 and
+        -386.3 at b = 7, 14 and 28: clarification 2's figures). 4e-13 either side of the exact threshold at b = 7 (where
+        the normalized full and log I^ differ by 2.6e-12) the bound decides; one failing replicate is enough; either
+        check alone extends the range, with the requirement recomputed on it (the grid at span 2 is at least the
+        bucket of the brute-force requirement there); still failing at the cap (span 8, +-56 SD) the pair is kept and
+        counted in grid_unresolved; a range-adequate pass that fails the resolution check refines; with the score law
+        unset the same passes are main's (no tail bound: nothing extends)."""
+        M, tab = self.M, self.tab
+        W, SL = self.hooks(tab)
+
+        def lt(span):                       # log(2 PhiBar(7 span)), independently of map
+            return math.log(2.0) + float(ref_log_sf(np.array([7.0 * span]))[0])
+
+        def thr(span):                      # the exact threshold of the bound on a pass's normalized estimate full
+            return lt(span) - math.log(1e-4) - math.log1p(-math.exp(lt(span)))
+        for span, want, places in ((1, -17.48, 2), (2, -91.66, 2), (4, -386.3, 1)):
+            self.assertAlmostEqual(lt(span) - math.log(1e-4), want, places=places)
+        self.assertGreater(-math.log1p(-math.exp(lt(1))), 2.5e-12)           # (log I^ vs full at b = 7)
+        t1 = thr(1)
+
+        def run(fulls, edges=None, hook=True, unresolved_first=False):
+            """fulls / edges: {span: (replicate 1, replicate 2)} -> (score, info, [(K, span)])."""
+            calls = []
+
+            def stub(lk, m_, cnt, eta, sd, N, K, span):
+                s = float(span[0])
+                calls.append((int(K), s))
+                f = np.tile(np.asarray(fulls[s], float), (len(eta), 1))
+                e = np.tile(np.asarray((edges or {}).get(s, (-50.0, -50.0)), float), (len(eta), 1))
+                h = f + (0.01 if unresolved_first and len(calls) == 1 else 0.0)
+                return f, h, e
+            m = {"link": M.Link(), "phi": 1.0, "var_fn": W}
+            if hook:
+                m["score_law"] = SL
+            with mock.patch.object(M, "_grid_pass", stub):
+                sc, info = self.score(m, [0.0], [1.0], [[100, 100]])
+            return float(sc[0]), info, calls
+        ok2 = {2.0: (-20.0, -20.0)}
+        sc, info, calls = run({1.0: (t1 + 4e-13, t1 + 4e-13)})                  # (just inside: adequate)
+        self.assertEqual((info["extended"], info["grid"], [s for _, s in calls]), (0, 1, [1.0]))
+        self.assertEqual(sc, t1 + 4e-13)
+        sc, info, calls = run({1.0: (t1 - 4e-13, t1 - 4e-13), **ok2})            # (just outside: extended)
+        self.assertEqual((info["extended"], info["grid_unresolved"], [s for _, s in calls]), (1, 0, [1.0, 2.0]))
+        self.assertEqual(sc, -20.0)
+        need2 = self.brute_need(tab, M.Link(), 1.0, 0.0, 1.0, 2.0)[0]
+        self.assertGreaterEqual(calls[1][0], M.TRAP_KS[min(int(np.searchsorted(M.TRAP_KS, need2)), len(M.TRAP_KS) - 1)])
+        sc, info, calls = run({1.0: (t1 + 1.0, t1 - 4e-13), **ok2})              # (one replicate fails: extended)
+        self.assertEqual((info["extended"], [s for _, s in calls]), (1, [1.0, 2.0]))
+        sc, info, calls = run({1.0: (-1.0, -1.0), **ok2}, edges={1.0: (-50.0, -1.0)})   # (the end-node check alone)
+        self.assertEqual((info["extended"], [s for _, s in calls]), (1, [1.0, 2.0]))
+        cap = {s: (-2000.0, -2000.0) for s in (1.0, 2.0, 4.0, 8.0)}               # (below thr(8): fails at the cap)
+        self.assertLess(-2000.0, thr(4))
+        self.assertLess(-2000.0, thr(8))
+        sc, info, calls = run(cap)
+        self.assertEqual((info["extended"], info["grid_unresolved"], info["grid"], [s for _, s in calls]),
+                         (3, 1, 0, [1.0, 2.0, 4.0, 8.0]))
+        self.assertEqual(sc, -2000.0)
+        sc, info, calls = run({1.0: (-1.0, -1.0)}, unresolved_first=True)        # (adequate, unresolved: refined)
+        self.assertEqual((info["extended"], info["refined"], info["grid"], [s for _, s in calls]),
+                         (0, 1, 1, [1.0, 1.0]))
+        self.assertGreater(calls[1][0], calls[0][0])
+        for fulls in ({1.0: (t1 - 4e-13, t1 - 4e-13)}, {1.0: (-2000.0, -2000.0)}):   # (score law unset: main's)
+            sc, info, calls = run(fulls, hook=False)
+            self.assertEqual((info["extended"], info["grid"], [s for _, s in calls]), (0, 1, [1.0]))
+        self.assertEqual((M.TRAP_TAIL, M.TRAP_SD, M.TRAP_SPAN_MAX), (1e-4, 7.0, 8))
+
+    def test_T6_10_second_extension_recomputes_on_a_nonidentity_link(self):
+        """Codex's extension-coverage gap (WP2 review: the controller's recomputation was shown on one extension of an
+        identity link only): T610_TWO_EXT, two cases on spline links (the steep curve, k = B at fractions 0.01 and 0.1,
+        SD 0.2) whose ranges the tail bound (clarification 2, D1) extends twice, to span 4. Every grid used is at least
+        the bucket of the requirement recomputed on its own range (g_max, H^max and h; v5 3.3 'on every range
+        extension'), computed here by brute force; at span 4 that bucket exceeds the span-2 grid and what a
+        controller recomputing only on the first extension would use (main's span-scaled span-1 requirement, or the
+        span-2 requirement doubled), and on the first case the link's slope bound itself changes there (0.5 -> 2.5).
+        Each score agrees with its certified reference within 2 x TRAP_TOL, with no grid_unresolved pair."""
+        import sys as sys_
+        M, tab = self.M, self.tab
+        W, SL = self.hooks(tab)
+        top = len(M.TRAP_KS) - 1
+
+        def bkt(n):
+            return min(int(np.searchsorted(M.TRAP_KS, n)), top)
+        for i, (spec, mu, sd, k) in enumerate(T610_TWO_EXT):
+            lk = M.Link(np.array(spec[0]), np.array(spec[1]), spec[2], spec[3])
+            m = {"link": lk, "phi": 1.0, "var_fn": W, "score_law": SL}
+            eta = self.t610_eta(tab, spec, mu)
+            calls = []
+            real = M._grid_pass
+
+            def spy(lk_, m_, cnt, e_, s_, N, K, span, calls=calls, real=real):
+                calls.append((int(K), float(span[0])))
+                return real(lk_, m_, cnt, e_, s_, N, K, span)
+            with mock.patch.object(M, "_grid_pass", spy):
+                sc, info = self.score(m, [eta], [sd * sd], [[k]])
+            need = {s: self.brute_need(tab, lk, 1.0, eta, sd, s) for s in (1.0, 2.0, 4.0)}
+            r = self.t610_refs([(("val", spec, 1.0), "val", spec, 1.0, mu, sd, k)])[0]
+            print(f"T6-10 two extensions, case {i} (link knots {spec[0]}, fraction {mu}, SD {sd}, k {k}): grids (K, "
+                  f"span) {calls}, brute-force requirement per span {[(s, v[0]) for s, v in need.items()]}, g_max "
+                  f"{[(s, v[2]) for s, v in need.items()]}; score {float(sc[0]):.6f}, reference {r['log_I']:.6f}; "
+                  f"info {info}", file=sys_.stderr)
+            self.assertEqual(info["extended"], 2)
+            self.assertEqual(sorted({s for _, s in calls}), [1.0, 2.0, 4.0])
+            for K, s in calls:
+                self.assertGreaterEqual(K, M.TRAP_KS[bkt(need[s][0])], (i, K, s))
+            k2 = max(K for K, s in calls if s == 2.0)
+            self.assertGreater(bkt(need[4.0][0]), max(M.TRAP_KS.index(k2), bkt(need[1.0][0] * 4.0),
+                                                       bkt(need[2.0][0] * 2.0)))
+            if i == 0:
+                self.assertEqual((need[1.0][2], need[2.0][2], need[4.0][2]), (0.5, 0.5, 2.5))
+            self.assert_certified([(("two extensions", i), r)])
+            self.assertEqual(info["grid_unresolved"], 0)
+            self.assertLessEqual(abs(float(sc[0]) - r["log_I"]), 2 * M.TRAP_TOL)
+
+    # ---------------------------------------------------------------- T6-11
+    def test_T6_11_reference_self_test(self):
+        """T6-11 (A_design_v5 PC-25; the ten fixtures frozen in v5), prior N(0, 1): (a) L = exp(-(e - d)^2 / (2 w^2)),
+        w in {0.17, 1.0} x d in {0, 5, 15, 30}, log I = log w - log(1 + w^2) / 2 - d^2 / (2 (1 + w^2)); (b) L = 1,
+        log I = 0; (c) L = Phi((-12 - e) / 0.5), I = Phi(-12 / sqrt 1.25). Each: |log I^ - log I| <= 1e-8 and the
+        halving certificate <= 1e-9, by the same refinement as T6-10's (A_design_v5 clarification 2, D2: halved until
+        certified, at most four times; these fixtures certify after one halving, as clarification 2 records, and each
+        one's halvings and final spacing are recorded); the stopping bound is checked at every extension step (each
+        earlier step fails it, the last meets it, with the final value too); stops within 10-32 SD. Negative controls:
+        under v4's 1e-6
+        budget (a) w = 0.17, d = 30 and (c) miss by more than 1e-8 (omitted fractions about 2.48e-7 and 2.8e-7) while
+        their certificates read about 0; truncated at +-10 SD, (a) d = 15, 30 and (c) are refused. The log tail is
+        continuous where it switches from erfc to the continued fraction."""
+        import sys as sys_
+        fixtures = [("a", w, d) for w in (0.17, 1.0) for d in (0.0, 5.0, 15.0, 30.0)] + [("b", None, None),
+                                                                                        ("c", None, None)]
+
+        def fixture(kind, w, d):
+            if kind == "a":
+                return ((lambda e: -(e - d) ** 2 / (2.0 * w * w)),
+                        math.log(w) - 0.5 * math.log(1.0 + w * w) - d * d / (2.0 * (1.0 + w * w)))
+            if kind == "b":
+                return (lambda e: np.zeros(np.shape(e))), 0.0
+            x = 12.0 / math.sqrt(1.25)
+            return (lambda e: ref_log_sf((12.0 + e) / 0.5)), math.log(0.5 * math.erfc(x / math.sqrt(2.0)))
+        self.assertAlmostEqual(12.0 / math.sqrt(1.25), 10.7331263, places=7)
+        worst = 0.0
+        for kind, w, d in fixtures:
+            loglik, exact = fixture(kind, w, d)
+            r = ref_log_integral(loglik, 1.0)
+            err = abs(r["log_I"] - exact)
+            worst = max(worst, err)
+            print(f"T6-11 ({kind}) w={w} d={d}: |log I^ - log I| {err:.2e}, certificate {r['certificate']:.2e} after "
+                  f"{r['halvings']} halving(s) (final spacing {r['spacing']:g} SD), stopped at b = {r['b']:g} SD after "
+                  f"{len(r['trace'])} step(s)", file=sys_.stderr)
+            self.assertLessEqual(err, 1e-8, (kind, w, d))
+            self.assertLessEqual(r["certificate"], REF_CERT, (kind, w, d))
+            self.assertTrue(all(not t[3] for t in r["trace"][:-1]) and r["trace"][-1][3] and r["fine_bound_ok"])
+            for b, bound, log_i, stop in r["trace"]:
+                self.assertEqual(stop, bound <= math.log(REF_TAIL) + log_i)
+            self.assertTrue(10.0 <= r["b"] <= 32.0, r["b"])
+        for kind, w, d in (("a", 0.17, 30.0), ("c", None, None)):
+            loglik, exact = fixture(kind, w, d)
+            r = ref_log_integral(loglik, 1.0, tail=REF_TAIL_V4)
+            print(f"T6-11 negative control, v4 budget ({kind}) w={w} d={d}: log I^ - log I = "
+                  f"{r['log_I'] - exact:+.4e}, certificate {r['certificate']:.1e}", file=sys_.stderr)
+            self.assertGreater(abs(r["log_I"] - exact), 1e-8)
+            self.assertLess(abs(r["log_I"] - exact), 1e-6)
+            self.assertLessEqual(r["certificate"], 1e-12)
+        for kind, w, d in (("a", 0.17, 15.0), ("a", 0.17, 30.0), ("a", 1.0, 15.0), ("a", 1.0, 30.0), ("c", None, None)):
+            with self.assertRaisesRegex(ValueError, "unrepresentable"):
+                ref_log_integral(fixture(kind, w, d)[0], 1.0, cap=REF_START)
+        x = np.array([REF_SF_SWITCH * (1 - 1e-15), REF_SF_SWITCH])
+        v = ref_log_sf(x)
+        self.assertLess(abs(v[0] - v[1]) / abs(v[1]), 1e-12)
+        self.assertTrue(np.all(np.isfinite(ref_log_sf(np.array([40.0, 1e3, 1e8])))))
+        self.assertEqual(float(ref_log_sf(np.array([math.inf]))[0]), -math.inf)
+
+
+# T6-5's reference (A_design_v5 clarification 4 F2; Codex WP4 P2-WP4-1): main dc64646's COMPLETE planning-simulation
+# dependency set, frozen verbatim from `git show dc64646:tools/redqueen/recovery.py` -- the transitive closure of
+# simulate's global loads (scripts_P2/wp4r2_closure.py): the generator (simulate, N_SURV, simulate_survival), the
+# helpers it calls (capture_sd, _walk, _rise, additive_projection) and the simulation constants it reads (R_REPS,
+# B_COUNT, CAPTURE_SD, DEFAULTS); numpy and math are the shared modules. Each piece is (first line, last line, the
+# sha256 of its text, the text), every text and pin checked against git by scripts_P2/wp4r2_main_text.sh.
+# main_reference() runs the pieces in a namespace that holds only the builtins, numpy and math, so nothing resolves from
+# HEAD's recovery module (reference_violations() checks that by construction); T6-5 passes both generators the same
+# fixed Data, scenario and seed and compares every output exactly. The cross-machine output digests recorded at WP4 are
+# machine-specific evidence (evidence/wp4/pins, diagnosis), not asserted: CI run 43720048383 (Python 3.14) produced
+# another r0 digest from the same code on another runner, and numpy's CPU dispatch changes the laptop's own digests.
+MAIN_REF = (   # (first line, last line, sha256 of the text, the text: dc64646's recovery.py lines verbatim)
+    (110, 111, "313bc7d3103da07665b12dcb9284f7dabdcaf9e1e5c35ef6419a8656d084c166",
+     '''R_REPS = 6
+B_COUNT = 324                     # K [1 + floor(80 s / 1.5 s)]: the 1.5 s cooldown's capture bound
+'''),
+    (151, 151, "3030067b3995297b9cc46f17da64aed9577de3e6a1a256d66ca9e6a89a8d87e7",
+     '''CAPTURE_SD = ((0.25, 0.6), (0.45, 0.15))
+'''),
+    (178, 180, "163c2920489d1d97450866e28e98a6349eb067c0634fbeea95819716521ef7d0",
+     '''DEFAULTS = dict(rank=0, energy=0.0, link="logit", kappa=0.0, clustered=False, own=-0.25, noise_scale=1.0,
+                noiseless=False, mu0=-0.5, rise=1.5, rw_end=0.5, snap_sd=0.1,
+                noise_row=0.15, noise_col=0.15, noise_cell=0.20, noise_model="flat")
+'''),
+    (196, 199, "ddac1f67ea40d716315152900dd79c4e8bdec7ef8d69b79994d95d7224ba5a4c",
+     '''def capture_sd(p, scale=1.0):
+    """The measured per-replicate logit SD at capture fraction p (CAPTURE_SD, flat beyond its ends), x scale."""
+    (p0, s0), (p1, s1) = CAPTURE_SD
+    return scale * np.interp(p, [p0, p1], [s0, s1])
+'''),
+    (338, 342, "7f472c11ddafeb05315e1cb36582cc5830697693f1d73e226be4898c98898e52",
+     '''def _walk(rng, n_t, end_sd, dim=None):
+    shape = (n_t,) if dim is None else (n_t, dim)
+    steps = rng.normal(0.0, end_sd / math.sqrt(n_t), shape)
+    steps[0] = 0.0
+    return np.cumsum(steps, axis=0)
+'''),
+    (345, 346, "2726cb2ea4939c3b848743e125ded8fa232d342ec2b7b9009db169d4b0b7df66",
+     '''def _rise(t):
+    return np.log1p(np.asarray(t) / 10.0) / math.log1p(20.0)
+'''),
+    (349, 475, "ea991216caf2440ba6329683b401a85890a5a126c13189c9bb534bb66addc271",
+     '''def simulate(D, sc, seed):
+    """-> the truth (eta per pair, the interaction) and the data (empirical logits, R per pair)."""
+    s = dict(DEFAULTS, **sc)
+    rng = np.random.default_rng(seed)
+    nW = len(D.worlds)
+    T = 201
+    qual = {}
+    for g in ("Q", "P"):
+        lat = np.empty((nW + 4, T))
+        for w in range(nW + 4):           # (the last four: the sentinels the references come from)
+            tr = D.treat[w] if w < nW else "C"
+            rise = s["rise"] * (1.0 if tr == "C" else 0.7 if tr == "A" else 0.85)
+            lat[w] = rise * _rise(np.arange(T)) + _walk(rng, T, s["rw_end"])
+        qual[g] = lat
+    rank = s["rank"]
+
+    def embed():
+        if rank == 0:
+            return None
+        out = np.empty((nW + 4, T, rank))
+        if s["clustered"]:
+            centres = rng.normal(0.0, 1.5, (4, rank))
+            for w in range(nW + 4):
+                k = rng.integers(4)
+                for t in range(T):
+                    if rng.random() < 0.02:
+                        k = rng.integers(4)
+                    out[w, t] = centres[k]
+        else:
+            for w in range(nW + 4):
+                out[w] = rng.normal(0.0, 1.0, rank) + _walk(rng, T, 1.0, rank)
+        return out
+    emb = {"Q": embed(), "P": embed()}
+
+    def node_vals(g, wv, tv, ref, sidx):
+        sent = np.where(ref, nW + sidx, wv)              # (a reference's history: its ACTUAL sentinel's)
+        x = qual[g][sent, tv] + rng.normal(0.0, s["snap_sd"], len(wv))
+        e = None
+        if rank:
+            e = emb[g][sent, tv] + rng.normal(0.0, 0.3, (len(wv), rank))
+            e -= e[ref].mean(axis=0)               # centred on the eight references (v4 §6.3)
+        return x, e
+    b, u = node_vals("Q", D.qw, D.qt, D.qref, D.qsent)
+    a, v = node_vals("P", D.pw, D.pt, D.pref, D.psent)
+    eta0 = s["mu0"] + a[D.pj] - b[D.qi] - s["kappa"] * a[D.pj] * b[D.qi]
+    own = np.zeros(len(D.qi))
+    if D.within.any():
+        lag = (D.pt[D.pj] - D.qt[D.qi])[D.within]
+        wdev = rng.normal(0.0, 0.08, len(D.worlds))
+        own[D.within] = (s["own"] + wdev[D.qw[D.qi][D.within]]) * np.exp(-np.abs(lag) / 8.0)
+    inter = np.zeros(len(D.qi))
+    c = 0.0
+    if rank:
+        raw = (u[D.qi] * v[D.pj]).sum(axis=1)
+        res = raw - additive_projection(D, raw)
+        base = eta0 + own
+        c = 0.1
+        for _ in range(20):                       # c^2 Var(residual) = energy x Var(signal)
+            c = math.sqrt(s["energy"] * np.var(base + c * raw) / np.var(res))
+        inter = c * raw
+    eta = eta0 + own + inter
+    cnt = None
+    if s["noiseless"]:
+        z = np.repeat(eta[:, None], R_REPS, axis=1)
+    elif s["noise_model"] == "capture":
+        # the row / column / cell structure kept, its total per-pair SD set by the pair's capture level:
+        # the Gaussian part's SD g = sqrt(capture_sd^2 - binomial variance), at least 0.05
+        pt = 1.0 / (1.0 + np.exp(-eta))
+        if s["link"] == "asym":
+            pt = 0.03 + 0.77 * pt
+        flat = math.sqrt(s["noise_row"] ** 2 + s["noise_col"] ** 2 + s["noise_cell"] ** 2)
+        g = np.sqrt(np.maximum(capture_sd(pt, s["noise_scale"]) ** 2 - 1.0 / (B_COUNT * pt * (1.0 - pt)), 0.05 ** 2))
+        y = eta[:, None] + (g / flat)[:, None] * (
+            s["noise_row"] * rng.normal(size=(D.nQ, R_REPS))[D.qi]
+            + s["noise_col"] * rng.normal(size=(D.nP, R_REPS))[D.pj]
+            + s["noise_cell"] * rng.normal(size=(len(eta), R_REPS)))
+        p = 1.0 / (1.0 + np.exp(-y))
+        if s["link"] == "asym":
+            p = 0.03 + 0.77 * p
+        cnt = rng.binomial(B_COUNT, p)
+        z = np.log((cnt + 0.5) / (B_COUNT - cnt + 0.5))
+    else:
+        k = s["noise_scale"]
+        y = (eta[:, None] + k * s["noise_row"] * rng.normal(size=(D.nQ, R_REPS))[D.qi]
+             + k * s["noise_col"] * rng.normal(size=(D.nP, R_REPS))[D.pj]
+             + k * s["noise_cell"] * rng.normal(size=(len(eta), R_REPS)))
+        p = 1.0 / (1.0 + np.exp(-y))
+        if s["link"] == "asym":
+            p = 0.03 + 0.77 * p
+        cnt = rng.binomial(B_COUNT, p)
+        z = np.log((cnt + 0.5) / (B_COUNT - cnt + 0.5))
+    energy = float(np.var(c * (inter / c - additive_projection(D, inter / c))) / np.var(eta)) if rank else 0.0
+    out = {"eta": eta, "inter": inter, "z": z, "zbar": z.mean(axis=1), "c": c, "energy": energy, "settings": s}
+    if cnt is not None:
+        out["cnt"] = cnt.astype(np.int16)         # (the capture counts: the registered count score's data)
+    out.update(simulate_survival(D, s, seed, a, b, u, v, c, rank))
+    return out
+
+
+N_SURV = 600
+
+
+def simulate_survival(D, s, seed, a, b, u, v, c, rank):
+    """The survival head's truth and data (its own stream: the capture data stay what they were):
+    logit S_i0 = c_i (predator-free controls, one per prey snapshot x replicate), logit S_ij =
+    c_i - 0.6 (a_j - b_i) - 0.3 + c' u_i' D_S v_j (a full D_S); the prey-row noise of a replicate
+    is shared by its control and its exposed cells (the global seeds); survivors ~ Binomial(600)."""
+    rng = np.random.default_rng([seed, 2])
+    cS = 1.4 + 0.35 * rng.normal(size=D.nQ)
+    etaS = cS[D.qi] - 0.6 * (a[D.pj] - b[D.qi]) - 0.3
+    DS = None
+    if rank:
+        DS = rng.normal(size=(rank, rank)) / math.sqrt(rank)
+        etaS = etaS + 0.8 * c * (u[D.qi] * (v[D.pj] @ DS.T)).sum(axis=1)
+    if s["noiseless"]:
+        S = np.repeat(etaS[:, None], R_REPS, axis=1)
+        S0 = np.repeat(cS[:, None], R_REPS, axis=1)
+    else:
+        k = s["noise_scale"]
+        row = k * 0.15 * rng.normal(size=(D.nQ, R_REPS))
+        y = (etaS[:, None] + row[D.qi] + k * 0.10 * rng.normal(size=(D.nP, R_REPS))[D.pj]
+             + k * 0.15 * rng.normal(size=(len(etaS), R_REPS)))
+        y0 = cS[:, None] + row + k * 0.15 * rng.normal(size=(D.nQ, R_REPS))
+        lg = lambda x: np.log((x + 0.5) / (N_SURV - x + 0.5))  # noqa: E731
+        S = lg(rng.binomial(N_SURV, 1.0 / (1.0 + np.exp(-y))))
+        S0 = lg(rng.binomial(N_SURV, 1.0 / (1.0 + np.exp(-y0))))
+    return {"cS": cS, "etaS": etaS, "DS": DS, "s": S, "sbar": S.mean(axis=1), "s0": S0, "s0bar": S0.mean(axis=1)}
+'''),
+    (478, 488, "73581e65a59ab18e9b3c8f628a0d9f510cd1a2bddb0a0d98377d5b88f79553b7",
+     '''def additive_projection(D, y, iters=40):
+    """The additive (mu + a_j - b_i) least-squares fit of y over every pair of the graph."""
+    a, b = np.zeros(D.nP), np.zeros(D.nQ)
+    mu = y.mean()
+    nq = np.bincount(D.qi, minlength=D.nQ)
+    npp = np.bincount(D.pj, minlength=D.nP)
+    for _ in range(iters):
+        b = -np.bincount(D.qi, weights=y - mu - a[D.pj], minlength=D.nQ) / np.maximum(nq, 1)
+        a = np.bincount(D.pj, weights=y - mu + b[D.qi], minlength=D.nP) / np.maximum(npp, 1)
+        mu = (y - a[D.pj] + b[D.qi]).mean()
+    return mu + a[D.pj] - b[D.qi]
+'''),
+)
+
+
+
+# ================================================================== bank-mode recovery (A_design_v5 1, 3.1-3.8; WP4)
+_GLOBAL_OPS = frozenset({"LOAD_GLOBAL", "LOAD_NAME", "LOAD_FROM_DICT_OR_GLOBALS", "STORE_GLOBAL", "DELETE_GLOBAL",
+                         "DELETE_NAME"})
+T65_SCENARIOS = ("r0", "r1_017_cap", "r0_asym", "num_r1", "r2_034")   # flat, capture-level, asym, noiseless, rank 2
+
+
+def main_reference(pieces=MAIN_REF):
+    """T6-5's reference namespace (clarification 4 F2): every frozen piece's text checked against its sha256 pin, then
+    executed in dc64646's line order into a namespace holding only the builtins module and the allow-listed shared
+    modules (numpy as np, math) -> the namespace (its simulate is main dc64646's)."""
+    import builtins
+    import hashlib
+    ns = {"__builtins__": builtins, "np": np, "math": math}
+    for lo, hi, sha, text in pieces:
+        if hashlib.sha256(text.encode("utf-8")).hexdigest() != sha:
+            raise AssertionError(f"recovery.py@dc64646 L{lo}-{hi}: the frozen text does not hash to its pin {sha}")
+        exec(compile(text, f"recovery.py@dc64646:L{lo}-{hi}", "exec"), ns)
+    return ns
+
+
+def _code_objects(code):
+    yield code
+    for c in code.co_consts:
+        if hasattr(c, "co_code"):
+            yield from _code_objects(c)
+
+
+def reference_violations(ns, pieces=MAIN_REF):
+    """'Nothing resolves from HEAD', by construction (clarification 4 F2) -> the violations (empty: none): (1) the
+    namespace holds only __builtins__ (the builtins module), the allow-listed modules (np is numpy, math is math) and
+    the names the frozen texts define (their module-level stores); (2) every global name any frozen code object loads
+    (module level, functions, nested functions, lambdas, comprehensions: dis's global-name instructions) is defined
+    by the frozen texts, an allow-listed module or a builtin (so the pieces cover simulate's complete dependency
+    closure); (3) every frozen function in the namespace was compiled from a frozen text and its globals are the
+    namespace itself; (4) every frozen constant has the frozen text's value."""
+    import builtins
+    import dis
+    defined, loads = set(), {}
+    for lo, hi, _, text in pieces:
+        top = compile(text, f"recovery.py@dc64646:L{lo}-{hi}", "exec")
+        defined |= {i.argval for i in dis.get_instructions(top) if i.opname == "STORE_NAME"}
+        for c in _code_objects(top):
+            for i in dis.get_instructions(c):
+                if i.opname in _GLOBAL_OPS:
+                    loads.setdefault(i.argval, f"{c.co_name} (L{lo}-{hi})")
+    mods = {"np": np, "math": math}
+    v = []
+    extra = sorted(set(ns) - defined - set(mods) - {"__builtins__"})
+    if extra:
+        v.append(f"the namespace holds names no frozen text defines: {extra[:12]}")
+    if ns.get("__builtins__") is not builtins:
+        v.append("__builtins__ is not the builtins module")
+    v += [f"{k} is not the allow-listed module {m.__name__}" for k, m in mods.items() if ns.get(k) is not m]
+    for name, where in sorted(loads.items()):
+        if name not in defined and name not in mods and not hasattr(builtins, name):
+            v.append(f"{where} loads the global {name!r}: neither frozen nor allow-listed")
+    fresh = None
+    for name in sorted(defined):
+        if name not in ns:
+            v.append(f"{name} is missing")
+            continue
+        f = ns[name]
+        code = getattr(f, "__code__", None)
+        if code is not None:
+            if getattr(f, "__globals__", None) is not ns or not code.co_filename.startswith("recovery.py@dc64646:"):
+                v.append(f"{name} is not the frozen text's function in this namespace")
+            continue
+        fresh = fresh or main_reference(pieces)                 # (4) a constant: the frozen text's value
+        if type(f) is not type(fresh[name]) or repr(f) != repr(fresh[name]):
+            v.append(f"{name} is not the frozen text's value")
+    return v
+# A bank with DISTINCT dyadic components, so every sharing class has its own latent correlation (C: 0.375 + 0.125 + 0.5,
+# S: 0.25 + 0.375 + 0.375; E = 1 - R - D exactly in binary, as the loader requires). The donor's cross-channel C-S
+# correlation, 0.1875, is the one a different-prey pair of one predator shares (Codex WP4 P3-WP4-7): far enough from 0
+# for T3-1's tolerance to see it gone, with SigmaE + its off-diagonal still PSD (a sampler moving it into the cell term,
+# the same-cell C-S sum 0.125 + 0.1875 + 0.125 unchanged, is caught only by the donor C-S class)
+T3_SR = [[0.375, 0.125, 0.0625], [0.125, 0.25, 0.1875], [0.0625, 0.1875, 0.5]]
+T3_SD = [[0.125, 0.1875], [0.1875, 0.375]]
+T3_SE = [[0.5, 0.125], [0.125, 0.375]]
+_BANKFIX = {}
+_T36_ERFC = None
+
+
+def sim_digest(out):
+    """A digest of simulate's output: every array (dtype, shape, sha256 of its bytes), the settings' canonical JSON, the
+    floats by repr, None as None."""
+    import hashlib
+    d = {}
+    for k in sorted(out):
+        v = out[k]
+        if isinstance(v, np.ndarray):
+            d[k] = [v.dtype.str, list(v.shape), hashlib.sha256(np.ascontiguousarray(v).tobytes()).hexdigest()]
+        elif k == "settings":
+            d[k] = rqlib.canonical(v).decode("ascii")
+        elif v is None:
+            d[k] = None
+        else:
+            d[k] = repr(v)
+    return hashlib.sha256(json.dumps(d, sort_keys=True).encode()).hexdigest()
+
+
+def bank_doc(SR=None, SD=None, SE=None, synthetic=False):
+    """test_obslaw's synthetic bank/3 document (loader-valid: the registered input hashes, placeholder fit values; not
+    a bank fit), optionally with other components, written consistently into noise and their source
+    horizons["5000"].components (clarification 1 Addendum A C9: SigmaR_FF and the shares follow)."""
+    import test_obslaw as TO
+    d = TO.bank3_doc(synthetic=synthetic)
+    if SR is not None:
+        comp = d["horizons"]["5000"]["components"]
+        for k, m in (("SigmaR", SR), ("SigmaD", SD), ("SigmaE", SE)):
+            d["noise"][k] = [list(r) for r in m]
+            comp[k] = [list(r) for r in m]
+        comp["SigmaR_FF"]["value"] = float(SR[2][2])
+        comp["shares"] = {ch: {"row": float(SR[i][i]), "donor": float(SD[i][i]), "cell": float(SE[i][i])}
+                          for i, ch in enumerate("CS")}
+    return d
+
+
+def bank_files(key="default", doc=None):
+    """(bank path, tables path): a synthetic bank/3 document (bank_doc) and its gamma = 1 tables, built once per key
+    in this process as test_obslaw._model_fixture builds them (the validation curves' node values, under this bank's
+    identity), the document's synthetic flag admitted (allow_synthetic: the test flag)."""
+    if key not in _BANKFIX:
+        import atexit
+        import obslaw as ol
+        import test_obslaw as TO
+        d = tempfile.mkdtemp(prefix=f"rq-wp4-{key}-")
+        atexit.register(shutil.rmtree, d, True)
+        doc = doc or bank_doc()
+        bp, tp = os.path.join(d, "bank.json"), os.path.join(d, "obs_tables.npz")
+        rqlib.write_durable(bp, rqlib.canonical(doc))
+        bank = ol.BankArtifact(bp, allow_synthetic=doc["synthetic"])
+        loc = {}
+        for ch in ol.CHANNELS:
+            N, M = bank.law(ch)
+            src = TO.location_validation("C" if ch == "C" else "S")
+            ident = ol.location_identity(bank.s_logit[ch], ch, 1.0, N, M, src.identity["h"], bank.sha256)
+            loc[(ch, 1.0)] = ol.LocationTable(src.x, src.a, ident, src.record)
+        f = TO.fitter_validation()
+        fit = ol.FitterTable(f.x, f.m, f.V, f.A, f.L, ol.fitter_identity(bank.s_logit["C"], bank.sha256), f.record)
+        ol.ObsTables(loc, fit, bank.sha256).save(tp)
+        _BANKFIX[key] = (bp, tp)
+    return _BANKFIX[key]
+
+
+def toy_graph():
+    """test_recovery_extra's toy graph (64 worlds, references, a few thousand pairs: registered fits take seconds)."""
+    import test_recovery_extra as TX
+    return TX.toy()
+
+
+def counts_of(x, N):
+    """The counts behind empirical logits x = log((k + 1/2) / (N - k + 1/2))."""
+    return np.rint((N + 1) / (1.0 + np.exp(-x)) - 0.5).astype(np.int64)
+
+
+def t36_phi_cdf(x):
+    global _T36_ERFC
+    if _T36_ERFC is None:
+        _T36_ERFC = np.frompyfunc(math.erfc, 1, 1)
+    return 0.5 * _T36_ERFC(-np.asarray(x, float) / math.sqrt(2.0)).astype(float)
+
+
+def t36_reference(a1, s1, N1, M1, a2, s2, N2, M2, rho, cuts1, cuts2, h=4e-3, zmax=9.0):
+    """The DEFINITIONAL joint law of two counts K_i = min{M_i, floor(N_i sigma(a_i + s_i Z_i) + 1/2)} with (Z_1, Z_2)
+    bivariate standard normal, correlation rho (independent of obslaw): a trapezoid over z1 on [-zmax, zmax] with K_1
+    evaluated pointwise by its definition, and K_2's exact conditional law given z1 (P(K_2 >= k | z1) = P(a_2 + s_2 Z_2 >=
+    logit((k - 1/2) / N_2)), k = 1..M_2, the capped top category included) -> {E1, E2, E12, cov, joint (3 x 3 bins at
+    the integer cuts: K < c1, c1 <= K < c2, K >= c2)}."""
+    z = np.arange(-zmax, zmax + h / 2, h)
+    w = np.exp(-0.5 * z * z) / math.sqrt(2 * math.pi) * h
+    w[[0, -1]] *= 0.5
+    K1 = np.minimum(M1, np.floor(N1 / (1.0 + np.exp(-(a1 + s1 * z))) + 0.5))
+    k = np.arange(1, M2 + 1, dtype=float)
+    t = np.log((k - 0.5) / (N2 - k + 0.5))
+    G = t36_phi_cdf((rho * z[:, None] - (t[None, :] - a2) / s2) / math.sqrt(1.0 - rho * rho))
+    EK2 = G.sum(axis=1)
+
+    def ge(c):
+        return np.ones(len(z)) if c <= 0 else (np.zeros(len(z)) if c > M2 else G[:, c - 1])
+    b1 = np.digitize(K1, cuts1)
+    P2 = [1.0 - ge(cuts2[0]), ge(cuts2[0]) - ge(cuts2[1]), ge(cuts2[1])]
+    joint = np.array([[float(np.sum(w * (b1 == i) * P2[j])) for j in range(3)] for i in range(3)])
+    E1, E2, E12 = float(w @ K1), float(w @ EK2), float(w @ (K1 * EK2))
+    return {"E1": E1, "E2": E2, "E12": E12, "cov": E12 - E1 * E2, "joint": joint}
+
+
+@unittest.skipIf(np is None, "numpy is not installed (set RQ_PYLIB, or RQ_REQUIRE_NUMPY=1 to require it)")
+class TestRecoveryBankMode(unittest.TestCase):
+    """recovery.py in BANK mode (Red Queen recovery option A; A_design_v5.md 1, 3.1-3.8, 4; WP4) on a synthetic bank/3
+    (test_obslaw's fixture) and test_recovery_extra's toy graph: T3-1..T3-6 through recovery.simulate on its 8 x 8
+    reference grid with the test hook R_REPS = 2000 (A_design_v5 5: "bank mode, tiny graph, test hook R=2000"), T6-3
+    (excluded controls and outcomes), T6-4 (resolution and availability guards), T6-5 (planning byte-identical to main
+    dc64646 for every observation branch; bank truth = planning truth), T6-6 (the configuration binds the bank and its
+    tables), T6-9 (truth leakage). T6-1's spy (it needs the extra procedures' plan) and T7 are test_recovery_extra.py's;
+    T2's recovery parts are test_obslaw.py's."""
+
+    @classmethod
+    def setUpClass(cls):
+        import map as mapfit
+        import obslaw
+        import recovery
+        cls.M, cls.ol, cls.rec = mapfit, obslaw, recovery
+        cls.g = toy_graph()
+        cls.D = recovery.Data(cls.g)
+        cls.Dt = recovery.Data(dict(cls.g, edges=cls.g["edges"][:64]))   # (RQ:q x RP:p: rows and donors shared)
+        cls.bp, cls.tp = bank_files()
+        cls.obs = obslaw.BankObservationModel(cls.bp, cls.tp)
+        cls.bp3, cls.tp3 = bank_files("t3", bank_doc(T3_SR, T3_SD, T3_SE))
+        cls.obs3 = obslaw.BankObservationModel(cls.bp3, cls.tp3)
+
+    def ns(self, **kw):
+        import argparse as ap_
+        base = dict(graph=None, namespace="ns-bank", fitter="registered", options="a", ranks=1, lambdas="0.05",
+                    iters=2, ab_cap=-1, start="warm", basis=4, embedding=None, center=None, set="main",
+                    scenarios="r0", reps=0, jobs=1, obs_model="bank", bank=self.bp, obs_tables=self.tp,
+                    allow_synthetic_bank=False)
+        base.update(kw)
+        return ap_.Namespace(**base)
+
+    # ---------------------------------------------------------------- T3 (through recovery.simulate)
+    def test_T3_1_latents_per_sharing_class_through_recovery(self):
+        """T3-1: the latents recovery's bank path hands the sampler (obslaw.latent, spied) for THIS graph's pairs have
+        the bank's correlation per sharing class: one prey row and another predator Sigma_R, one donor and another
+        prey Sigma_D (C-C, S-S and the cross-channel C-S / S-C, Codex WP4 P3-WP4-7), one cell C-S Sigma_R + Sigma_D +
+        Sigma_E, exposed-free Sigma_R[., F], nothing shared 0, across replicates 0; unit variances. The bank's
+        components are distinct per class (T3_SR / T3_SD / T3_SE)."""
+        rec, ol, D = self.rec, self.ol, self.Dt
+        got, real = {}, ol.latent
+
+        def spy(Z, f, qi, pj):
+            got["u"] = real(Z, f, qi, pj)
+            return got["u"]
+        with mock.patch.object(rec, "R_REPS", 2000), mock.patch.object(ol, "latent", spy):
+            data = rec.simulate(D, rec.SCENARIOS["r0"], 101, obs=self.obs3)
+        u = got["u"]
+        self.assertEqual((u["C"].shape, u["S"].shape, u["F"].shape), ((64, 2000), (64, 2000), (D.nQ, 2000)))
+        self.assertEqual(data["cnt"].shape, (64, 2000))
+        SR, SD, SE = (np.array(m) for m in (T3_SR, T3_SD, T3_SE))
+        q, p = D.qi[0], D.pj[0]
+        same_q = next(e for e in range(64) if D.qi[e] == q and D.pj[e] != p)
+        same_p = next(e for e in range(64) if D.pj[e] == p and D.qi[e] != q)
+        other = next(e for e in range(64) if D.qi[e] != q and D.pj[e] != p)
+        tol = 4.5 / math.sqrt(2000)
+        checks = [("row C-C", u["C"][0], u["C"][same_q], SR[0, 0]), ("row S-S", u["S"][0], u["S"][same_q], SR[1, 1]),
+                  ("row C-S", u["C"][0], u["S"][same_q], SR[0, 1]),
+                  ("donor C-C", u["C"][0], u["C"][same_p], SD[0, 0]), ("donor S-S", u["S"][0], u["S"][same_p], SD[1, 1]),
+                  ("donor C-S", u["C"][0], u["S"][same_p], SD[0, 1]),
+                  ("donor S-C", u["S"][0], u["C"][same_p], SD[1, 0]),
+                  ("cell C-S", u["C"][0], u["S"][0], SR[0, 1] + SD[0, 1] + SE[0, 1]),
+                  ("exposed-free C-F", u["C"][0], u["F"][q], SR[0, 2]), ("exposed-free S-F", u["S"][0], u["F"][q], SR[1, 2]),
+                  ("nothing shared", u["C"][0], u["C"][other], 0.0),
+                  ("replicates C", u["C"][0][:-1], u["C"][0][1:], 0.0), ("replicates F", u["F"][q][:-1], u["F"][q][1:], 0.0)]
+        for name, x, y, want in checks:
+            self.assertLessEqual(abs(float(np.corrcoef(x, y)[0, 1]) - want), tol, name)
+        for ch in "CSF":
+            self.assertLessEqual(abs(float(u[ch].var()) - 1.0), 0.03, ch)
+
+    def test_T3_2_a_singular_psd_sigma_r_generates_and_a_non_psd_one_is_refused(self):
+        """T3-2: the free-row convention's exactly singular Sigma_R (Schur complement 0) loads and generates through
+        recovery (eigen factor, never Cholesky); a non-PSD one is refused at the load, naming SigmaR."""
+        rec, ol = self.rec, self.ol
+        A, b = np.array(T3_SR)[:2, :2], np.array(T3_SR)[:2, 2]
+        ff = float(b @ np.linalg.solve(A, b))
+        SR = [list(r) for r in T3_SR]
+        SR[2][2] = ff
+        bp, tp = bank_files("singular", bank_doc(SR, T3_SD, T3_SE))
+        obs = ol.BankObservationModel(bp, tp)
+        self.assertLess(float(np.min(np.linalg.eigvalsh(np.array(SR)))), 1e-12)
+        data = rec.simulate(self.Dt, rec.SCENARIOS["r0"], 5, obs=obs)
+        for k in ("z", "s", "s0"):
+            self.assertTrue(np.all(np.isfinite(data[k])), k)
+        self.assertTrue(0 <= int(data["cnt"].min()) and int(data["cnt"].max()) <= 324)
+        bad = [list(r) for r in SR]
+        bad[2][2] = ff - 0.01
+        p = os.path.join(os.path.dirname(bp), "nonpsd.json")
+        rqlib.write_json_durable(p, bank_doc(bad, T3_SD, T3_SE))
+        with self.assertRaisesRegex(SystemExit, "SigmaR: not PSD"):
+            rec.load_model(self.ns(bank=p, obs_tables=tp))
+
+    def test_T3_3_the_replicate_variance_is_the_law_with_no_second_layer(self):
+        """T3-3: per pair, the replicate variance of z = ell_B(K) (R = 2000) is the bounded law's exact category variance
+        V_z at the pair's location and scale (test_obslaw's independent scalar oracle), within 4.5 SE; a second
+        (binomial) layer would add about 1/(B mu (1 - mu)), far outside on aggregate."""
+        import test_obslaw as TO
+        rec, D = self.rec, self.Dt
+        with mock.patch.object(rec, "R_REPS", 2000):
+            data = rec.simulate(D, rec.SCENARIOS["r0"], 202, obs=self.obs)
+        z, loc, mu = data["z"], data["loc"]["C"], data["mu"]["C"]
+        ell = np.log((np.arange(325) + 0.5) / (324 - np.arange(325) + 0.5))
+        dev, dev_b = [], []
+        for e in range(len(mu)):
+            if not 0.02 < mu[e] < 0.98:
+                continue
+            s = float(self.obs.s("C", np.array([mu[e]]))[0])
+            p = np.array(TO.oracle_probs(float(loc[e]), s, 324, 324))
+            m = float(p @ ell)
+            V, m4 = float(p @ (ell - m) ** 2), float(p @ (ell - m) ** 4)
+            se = math.sqrt((m4 - V * V) / 2000)
+            v = float(z[e].var())
+            self.assertLessEqual(abs(v - V), 4.5 * se, (e, v, V))
+            dev.append((v - V) / se)
+            dev_b.append((v - V - 1.0 / (324 * mu[e] * (1 - mu[e]))) / se)
+        self.assertGreater(len(dev), 30)
+        self.assertLess(float(np.mean(dev_b)), -3.0)
+        self.assertLess(abs(float(np.mean(dev))), 1.5)
+
+    def test_T3_4_one_free_control_per_prey_and_replicate_on_a_fixed_data(self):
+        """T3-4 (fixed Data, v2 P2 #9): the free controls come from the rows and free cells, drawn before any pair-sized
+        array, so pairs appended among the SAME nodes (same node universe and order) leave every control unchanged in
+        bank mode, while main's planning draw order (controls after the pair-sized draws) moves them; every exposed
+        pair of a prey node reads its node's one control (s0 is per prey node); generation is deterministic and the
+        procedures' masks are applied after it (the data are never rewritten)."""
+        rec, g = self.rec, self.g
+        base = g["edges"][:200]
+        have = {e[:2] for e in base}
+        qs = list(dict.fromkeys(e[0] for e in base))
+        ps = list(dict.fromkeys(e[1] for e in base))
+        extra = [(q, p, base[0][2], base[0][3], base[0][4]) for q in qs for p in ps if (q, p) not in have][:150]
+        D1, D2 = rec.Data(dict(g, edges=base)), rec.Data(dict(g, edges=base + extra))
+        self.assertEqual((D1.qkey, D1.pkey), (D2.qkey, D2.pkey))
+        self.assertEqual(len(D2.qi), len(D1.qi) + 150)
+        b1, b2 = (rec.simulate(D_, rec.SCENARIOS["r0"], 9, obs=self.obs) for D_ in (D1, D2))
+        self.assertTrue(np.array_equal(b1["s0"], b2["s0"]))
+        self.assertTrue(np.array_equal(b1["mu"]["F"], b2["mu"]["F"]))
+        p1, p2 = (rec.simulate(D_, rec.SCENARIOS["r0"], 9) for D_ in (D1, D2))
+        self.assertFalse(np.array_equal(p1["s0"], p2["s0"]))            # (planning: the control noise follows the cells)
+        self.assertEqual(b1["s0"].shape, (D1.nQ, rec.R_REPS))
+        again = rec.simulate(D1, rec.SCENARIOS["r0"], 9, obs=self.obs)
+        self.assertTrue(all(np.array_equal(b1[k], again[k]) for k in ("z", "s", "s0", "cnt")))
+        before = {k: b1[k].copy() for k in ("z", "s", "s0", "cnt")}
+        rec.forward_procedure(D1, b1, 0, [0.05], 1, 9)                  # (a mask applied after generation)
+        self.assertTrue(all(np.array_equal(before[k], b1[k]) for k in before))
+
+    def test_T3_5_bounded_survival_heads(self):
+        """T3-5: every survival count is at most M_H = 247 (exposed and free), the intended means are at most c_H =
+        247 / 600, and each cell's replicate mean of L / 600 tracks its intended mean (4.5 SE, R = 2000); the planning
+        survival counts of the same seed exceed 247 (main's Binomial(600) at sigma(eta) ~ 0.8)."""
+        rec, D = self.rec, self.Dt
+        with mock.patch.object(rec, "R_REPS", 2000):
+            data = rec.simulate(D, rec.SCENARIOS["r2_034"], 303, obs=self.obs)
+        cH = 247 / 600
+        for key, ch in (("s", "S"), ("s0", "F")):
+            L = counts_of(data[key], 600)
+            mu = data["mu"][ch]
+            self.assertLessEqual(int(L.max()), 247, key)
+            self.assertTrue(np.all((mu > 0) & (mu <= cH)), ch)
+            sd = L.std(axis=1, ddof=1) / 600
+            dev = np.abs(L.mean(axis=1) / 600 - mu)
+            self.assertTrue(np.all(dev <= 4.5 * np.maximum(sd, 1e-12) / math.sqrt(2000)), (ch, float(np.max(dev / sd))))
+        plan = rec.simulate(D, rec.SCENARIOS["r2_034"], 303)
+        self.assertGreater(int(counts_of(plan["s"], 600).max()), 247)
+
+    def test_T3_6_observable_count_dependence_per_sharing_class(self):
+        """T3-6 (v2 P2 #8): for each sharing class -- one cell C-S; one prey row C-C, S-S and C-S across predators; one
+        donor C-C, S-S and C-S / S-C across prey (Codex WP4 P3-WP4-7); exposed-free S-F and C-F; different replicates --
+        the empirical covariance of the COUNTS
+        (R = 2000) and the joint frequencies of a 3 x 3 coarse binning match an independent definitional quadrature
+        (t36_reference) under the bivariate normal with the class's latent correlation, within 4 MC SE; the cells
+        include ceiling-heavy ones (mu_S / c and mu_F / c >= 0.95: the capped category). The truth is chosen so;
+        observe_bank generates. A sampler drawing exposed survival from independent normals fails the cell class."""
+        rec, ol, D, obs = self.rec, self.ol, self.Dt, self.obs3
+        SR, SD, SE = (np.array(m) for m in (T3_SR, T3_SD, T3_SE))
+        cq = np.where(np.arange(D.nQ) < 4, 3.5, 0.3)                       # (prey 0..3: mu_F / c = 0.97)
+        etaS = np.where(D.qi == D.qi[0], 3.2, 1.0)                          # (prey 0's cells: mu_S / c = 0.96)
+        eta = -1.0 + 0.03 * np.arange(64)
+        truth = {"eta": eta, "settings": dict(rec.DEFAULTS, noise_model="bank")}
+        tS = {"cS": cq, "etaS": etaS}
+
+        def generate(latent=None):
+            with mock.patch.object(rec, "R_REPS", 2000), \
+                    mock.patch.object(ol, "latent", latent or ol.latent):
+                ob = rec.observe_bank(D, truth, tS, obs, 404)
+            return ob, {"C": ob["cnt"].astype(np.int64), "S": counts_of(ob["s"], 600), "F": counts_of(ob["s0"], 600)}
+        ob, K = generate()
+        self.assertGreaterEqual(float(ob["mu"]["F"][D.qi[0]]) / obs.c_H, 0.95)
+        self.assertGreaterEqual(float(ob["mu"]["S"][0]) / obs.c_H, 0.95)
+        self.assertGreater(int((K["S"][0] == 247).sum()), 100)              # (the capped category is populated)
+        law = {"C": (324, 324), "S": (600, 247), "F": (600, 247)}
+        q0, qm = int(D.qi[0]), 4                                            # (prey 0: ceiling-heavy; prey 4: moderate)
+        em = next(e for e in range(64) if D.qi[e] == qm)
+        pm = int(D.pj[em])
+        em_q = next(e for e in range(64) if D.qi[e] == qm and D.pj[e] != pm)
+        em_p = next(e for e in range(64) if D.pj[e] == pm and D.qi[e] not in (qm, q0))
+        cell = SR[0, 1] + SD[0, 1] + SE[0, 1]
+        classes = [("cell C-S", ("C", em), ("S", em), cell, 0), ("cell C-S, ceiling-heavy S", ("C", 0), ("S", 0), cell, 0),
+                   ("row C-C", ("C", em), ("C", em_q), SR[0, 0], 0), ("row S-S", ("S", em), ("S", em_q), SR[1, 1], 0),
+                   ("row C-S", ("C", em), ("S", em_q), SR[0, 1], 0), ("donor C-C", ("C", em), ("C", em_p), SD[0, 0], 0),
+                   ("donor S-S", ("S", em), ("S", em_p), SD[1, 1], 0),
+                   ("donor C-S", ("C", em), ("S", em_p), SD[0, 1], 0),
+                   ("donor S-C", ("S", em), ("C", em_p), SD[1, 0], 0),
+                   ("exposed-free S-F", ("S", em), ("F", qm), SR[1, 2], 0),
+                   ("exposed-free C-F", ("C", em), ("F", qm), SR[0, 2], 0),
+                   ("exposed-free S-F, both ceiling-heavy", ("S", 0), ("F", q0), SR[1, 2], 0),
+                   ("replicates C-C", ("C", em), ("C", em), 0.0, 1), ("replicates S-F", ("S", em), ("F", qm), 0.0, 1)]
+
+        def ref_of(c1, c2, rho, K):
+            (ch1, i1), (ch2, i2) = c1, c2
+            a1, a2 = float(ob["loc"][ch1][i1]), float(ob["loc"][ch2][i2])
+            s1 = float(obs.s(ch1, np.array([ob["mu"][ch1][i1]]))[0])
+            s2 = float(obs.s(ch2, np.array([ob["mu"][ch2][i2]]))[0])
+            cuts = []
+            for ch, i in (c1, c2):
+                v = np.sort(K[ch][i])
+                c = [int(v[len(v) // 3]), int(v[2 * len(v) // 3])]
+                if c[1] <= c[0]:
+                    c = [c[0], c[0] + 1]
+                cuts.append(c)
+            return cuts, t36_reference(a1, s1, *law[ch1], a2, s2, *law[ch2], rho, cuts[0], cuts[1])
+
+        def compare(name, c1, c2, rho, lag, K):
+            x = K[c1[0]][c1[1]].astype(float)
+            y = K[c2[0]][c2[1]].astype(float)
+            if lag:
+                x, y = x[:-1], y[1:]
+            cuts, ref = ref_of(c1, c2, rho, K)
+            n = len(x)
+            prod = (x - x.mean()) * (y - y.mean())
+            ok = abs(float(prod.mean()) - ref["cov"]) <= 4 * float(prod.std()) / math.sqrt(n)
+            b1, b2 = np.digitize(x, cuts[0]), np.digitize(y, cuts[1])
+            for i in range(3):
+                for j in range(3):
+                    pr = ref["joint"][i, j]
+                    f = float(np.mean((b1 == i) & (b2 == j)))
+                    ok &= abs(f - pr) <= 4 * math.sqrt(max(pr * (1 - pr), 1.0 / n) / n)
+            ok &= abs(float(x.mean()) - ref["E1"]) <= 4 * float(x.std()) / math.sqrt(n) + 1e-9
+            return ok, float(prod.mean()), ref["cov"]
+        for name, c1, c2, rho, lag in classes:
+            ok, got, want = compare(name, c1, c2, rho, lag, K)
+            self.assertTrue(ok, f"{name}: count covariance {got:.3f} vs the quadrature's {want:.3f} (or a joint "
+                                "frequency / mean outside 4 SE)")
+        real = ol.latent
+
+        def independent_survival(Z, f, qi, pj):                           # (the negative control)
+            u = real(Z, f, qi, pj)
+            u["S"] = np.random.default_rng(7).standard_normal(u["S"].shape)
+            return u
+        _, Kbad = generate(independent_survival)
+        self.assertFalse(compare("cell C-S", ("C", em), ("S", em), cell, 0, Kbad)[0])
+
+    # ---------------------------------------------------------------- T6
+    def test_T6_3_excluded_controls_and_outcomes_cannot_influence_a_bank_fit(self):
+        """T6-3 (extends TestMap.test_control_access_and_invariance to bank mode): through the choke point any_fit
+        (bank: W, nu0 prior and score law), perturbing every excluded control and every outcome -- z, s and the counts
+        -- outside the forward fit's pairs leaves the fit bit-identical; an accessible control moves it."""
+        rec, M, D = self.rec, self.M, self.D
+        data = rec.simulate(D, rec.SCENARIOS["r1_017"], 41, obs=self.obs)
+        idx = D.forward["fit"]
+        ctrl = M.control_access(D, idx, rec.FORWARD_TMAX)
+        self.assertTrue(ctrl.any() and (~ctrl).any())
+        rng = np.random.default_rng(2)
+        bad = dict(data)
+        s0 = data["s0"].copy()
+        s0[~ctrl] += rng.normal(0.0, 3.0, s0[~ctrl].shape)
+        bad["s0"], bad["s0bar"] = s0, s0.mean(axis=1)
+        out = np.ones(len(D.qi), bool)
+        out[idx] = False
+        for key, bar in (("z", "zbar"), ("s", "sbar")):
+            x = data[key].copy()
+            x[out] += rng.normal(0.0, 2.0, x[out].shape)
+            bad[key], bad[bar] = x, x.mean(axis=1)
+        cnt = data["cnt"].copy()
+        cnt[out] = 324 - cnt[out]
+        bad["cnt"] = cnt
+
+        def fit(d_):
+            return rec.any_fit("registered", D, idx, d_, 1, 0.05, False, 6, 1, start="warm", ctrl=ctrl, basis=4)
+        f0, f1 = fit(data), fit(bad)
+        self.assertIsNotNone(f0["score_law"])
+        self.assertEqual(f0["objective"], f1["objective"])
+        for k in ("a", "b", "aS", "bS", "u", "v", "c", "DS", "covQ", "covP"):
+            self.assertTrue(np.array_equal(f0[k], f1[k]), k)
+        self.assertEqual((f0["phi"], f0["unit"], f0["table_extrapolated"]), (f1["phi"], f1["unit"], f1["table_extrapolated"]))
+        moved = dict(data)
+        s0 = data["s0"].copy()
+        s0[ctrl] += 0.5
+        moved["s0"], moved["s0bar"] = s0, s0.mean(axis=1)
+        self.assertNotEqual(fit(moved)["objective"], f0["objective"])
+
+    def flagged(self, where, model=None):
+        """recovery.scorer wrapped: a score of a set with where(ix) (and of a model with model(m)) also reports one
+        finite UNRESOLVED pair (grid_unresolved)."""
+        real = self.rec.scorer
+
+        def scorer(D, data, m, idx, fitter):
+            sc = real(D, data, m, idx, fitter)
+
+            def score(ix, info=None):
+                res = sc(ix, info)
+                if info is not None and where(ix) and (model is None or model(m)):
+                    info["grid_unresolved"] = info.get("grid_unresolved", 0) + 1
+                return res
+            return score
+        return mock.patch.object(self.rec, "scorer", scorer)
+
+    def test_T6_4_resolution_and_availability_guards_unchanged_in_bank_mode(self):
+        """T6-4: in bank mode the count score's integration diagnostics are reported per comparison (with the bank's
+        table_extrapolated), an UNRESOLVED score (grid_unresolved) in the test comparison or the selection is never
+        decided (unavailable, reason, no bound, success False; the selection-dependent metrics withheld), the
+        forward branches likewise, and fewer than MIN_TEST_WORLDS contributing test worlds leave the decision
+        unavailable: main's guards, unchanged."""
+        rec, D = self.rec, self.D
+        data = rec.simulate(D, dict(rank=1, energy=0.10), 13, obs=self.obs)
+        kw = dict(fitter="registered", start="warm", basis=4)
+        run = lambda: rec.procedure(D, data, "a", 1, [0.1], 3, 13, **kw)  # noqa: E731
+        base = run()
+        self.assertTrue(base["decision"]["available"], base["decision"])
+        self.assertEqual(base["integration_comparison"]["unresolved"], {"validation": 0, "test": 0, "snapshot": 0})
+        self.assertIn("table_extrapolated", base["integration_comparison"]["selected"])
+        with self.flagged(lambda ix: ix is D.test_idx):
+            out = run()
+        self.assertFalse(out["decision"]["available"])
+        self.assertRegex(out["decision"]["reason"], "UNRESOLVED")
+        self.assertFalse(out["success"])
+        self.assertIsNone(out["test_lb"])
+        self.assertIsNone(out["test_improvement"])
+        with self.flagged(lambda ix: ix is D.val_idx):
+            out = run()
+        self.assertTrue(out["decision"]["selection_unresolved"])
+        self.assertFalse(out["success"])
+        self.assertIsNone(out["classes"])
+        with self.flagged(lambda ix: ix is D.forward["tests"]["forward_transfer"]):
+            fw = rec.forward_procedure(D, data, 1, [0.1], 3, 13, **kw)
+        self.assertFalse(fw["forward_transfer"]["available"])
+        self.assertFalse(fw["success"])
+        with mock.patch.object(rec, "MIN_TEST_WORLDS", 99):
+            out = run()
+        self.assertFalse(out["decision"]["available"])
+        self.assertRegex(out["decision"]["reason"], "fewer than 99 contributing test worlds")
+        self.assertFalse(out["success"])
+
+    def test_T6_5_planning_is_main_byte_for_byte_and_bank_truth_is_planning_truth(self):
+        """T6-5 (v2 Codex note; clarification 4 F2): planning-mode simulate on the full v4 test graph is main dc64646's
+        byte for byte for every observation branch (flat, capture-level, asym, noiseless, rank 2 with D_S; survival in
+        each). The reference is dc64646's complete simulation dependency set (MAIN_REF: the generator, the helpers it
+        calls and the constants it reads, each verbatim and sha256-pinned) run in a namespace that resolves nothing
+        from HEAD (main_reference; reference_violations empty), in this process, on the same fixed Data, scenario and
+        seed: every returned array's dtype, shape and bytes and every other value compare exactly, on any machine,
+        with no skip and no tolerance. For one seed bank mode's truth (eta, inter, c, energy, cS, etaS, D_S, the
+        settings but noise_model) is the planning truth byte for byte; the bank observations are obslaw's sampler on
+        the stream default_rng([seed, 3]) at the scenario's gamma; bank mode refuses the capture-level planning
+        scenario."""
+        rec = self.rec
+        D = rec.Data(full())
+        ns = main_reference()
+        self.assertEqual(reference_violations(ns), [])
+        self.assertIsNot(ns["simulate"], rec.simulate)
+        for sc in T65_SCENARIOS:
+            seed = rqlib.derive_seed("rq-T6-5", sc, 0)
+            data, main = rec.simulate(D, rec.SCENARIOS[sc], seed), ns["simulate"](D, rec.SCENARIOS[sc], seed)
+            self.assertEqual(list(data), list(main), sc)
+            for k in main:                  # (compared as bytes; the message names the key, never the megabytes)
+                v, w = data[k], main[k]
+                if isinstance(w, np.ndarray):
+                    same = isinstance(v, np.ndarray) and (v.dtype, v.shape) == (w.dtype, w.shape) and \
+                        v.tobytes() == w.tobytes()
+                    self.assertTrue(same, f"{sc}: {k} differs from main dc64646's bytes")
+                else:
+                    self.assertTrue(repr(v) == repr(w), f"{sc}: {k} {repr(v)[:80]} != main's {repr(w)[:80]}")
+            self.assertEqual(sim_digest(data), sim_digest(main), sc)
+            self.assertFalse({"mu", "loc", "obs", "noise_source"} & set(data), sc)
+        for sc in ("r0", "r0_asym", "num_r1", "r2_034", "r1_017"):
+            seed = rqlib.derive_seed("rq-T6-5", sc, 0)
+            p, b = rec.simulate(D, rec.SCENARIOS[sc], seed), rec.simulate(D, rec.SCENARIOS[sc], seed, obs=self.obs)
+            for k in ("eta", "inter", "cS", "etaS"):
+                self.assertEqual(p[k].tobytes(), b[k].tobytes(), (sc, k))
+            self.assertEqual(None if p["DS"] is None else p["DS"].tobytes(),
+                             None if b["DS"] is None else b["DS"].tobytes(), sc)
+            self.assertEqual((repr(p["c"]), repr(p["energy"])), (repr(b["c"]), repr(b["energy"])), sc)
+            self.assertEqual(dict(p["settings"], noise_model="bank"), b["settings"], sc)
+            self.assertEqual((b["noise_source"], b["obs"]), ("bank_d8", self.obs))
+            self.assertEqual("cnt" in b, not rec.SCENARIOS[sc].get("noiseless"), sc)
+            if "cnt" in b:                  # (the observations: obslaw's sampler on the stream default_rng([seed, 3]))
+                x = {"S": b["etaS"], "F": b["cS"]}
+                if b["settings"]["link"] == "logit":
+                    x["C"] = b["eta"]
+                g = self.obs.generate(np.random.default_rng([seed, 3]), D.qi, D.pj, D.nQ, D.nP, b["mu"], 1.0,
+                                      rec.R_REPS, x=x)
+                self.assertTrue(np.array_equal(g["counts"]["C"], b["cnt"]), sc)
+                self.assertTrue(np.array_equal(counts_of(b["s0"], 600), g["counts"]["F"]), sc)
+        with self.assertRaisesRegex(ValueError, "_cap"):
+            rec.simulate(D, rec.SCENARIOS["r1_017_cap"], 1, obs=self.obs)
+        with self.assertRaisesRegex(ValueError, "at gamma 2.0"):       # (gamma = the scenario's noise_scale: no table)
+            rec.simulate(self.Dt, rec.SCENARIOS["r1_017_noisy"], 1, obs=self.obs)
+
+    def test_T6_5_the_reference_resolves_nothing_from_head(self):
+        """T6-5's reference is independent of HEAD by construction (clarification 4 F2; Codex WP4 P2-WP4-1): the
+        namespace main_reference builds holds only the builtins, numpy, math and the frozen texts' definitions (exactly
+        simulate's dependency closure at dc64646), every global its code loads is one of those, its functions run on
+        that namespace and its constants are the frozen values (reference_violations empty). Each control is reported:
+        11f8164's construction (HEAD's module namespace with the generator text executed into it), a HEAD helper or a
+        changed constant substituted into the frozen namespace, a frozen set missing a helper (simulate would load
+        it from elsewhere), a frozen text loading a HEAD name, and a text that does not hash to its pin."""
+        import hashlib
+        rec = self.rec
+        ns = main_reference()
+        self.assertEqual(reference_violations(ns), [])
+        self.assertEqual(set(ns) - {"__builtins__"},
+                         {"np", "math", "R_REPS", "B_COUNT", "CAPTURE_SD", "DEFAULTS", "capture_sd", "_walk", "_rise",
+                          "simulate", "N_SURV", "simulate_survival", "additive_projection"})
+        self.assertEqual([p[:2] for p in MAIN_REF], sorted(p[:2] for p in MAIN_REF))
+        gen = next(p for p in MAIN_REF if p[:2] == (349, 475))
+        old = dict(vars(rec))                       # (11f8164's construction: HEAD's helpers and constants resolve)
+        exec(compile(gen[3], "recovery.py@dc64646:L349-475", "exec"), old)
+        bad = reference_violations(old)
+        for want in ("names no frozen text defines", "_rise is not the frozen text's function",
+                     "capture_sd is not the frozen text's function", "additive_projection is not the frozen"):
+            self.assertTrue(any(want in x for x in bad), (want, bad))
+        sub = main_reference()
+        sub["_rise"] = rec._rise
+        self.assertEqual(reference_violations(sub), ["_rise is not the frozen text's function in this namespace"])
+        sub = main_reference()
+        sub["CAPTURE_SD"] = ((0.25, 0.5), (0.45, 0.15))
+        self.assertEqual(reference_violations(sub), ["CAPTURE_SD is not the frozen text's value"])
+        short = tuple(p for p in MAIN_REF if p[:2] != (345, 346))
+        self.assertIn("simulate (L349-475) loads the global '_rise': neither frozen nor allow-listed",
+                      reference_violations(main_reference(short), short))
+        leak = "def leak():\n    return SCENARIOS\n"
+        more = MAIN_REF + ((900, 901, hashlib.sha256(leak.encode()).hexdigest(), leak),)
+        self.assertIn("leak (L900-901) loads the global 'SCENARIOS': neither frozen nor allow-listed",
+                      reference_violations(main_reference(more), more))
+        lo, hi, sha, text = gen
+        with self.assertRaisesRegex(AssertionError, "L349-475: the frozen text does not hash to its pin"):
+            main_reference(tuple(p if p is not gen else (lo, hi, sha, text.replace("0.6", "0.7", 1)) for p in MAIN_REF))
+
+    def test_T6_6_the_configuration_binds_the_bank_and_its_tables(self):
+        """T6-6: a bank-mode configuration records the observation model (A_design_v5 4.1: the bank artifact's and the
+        tables' sha256, the tables' identity, D8 / D9, the streams, the fitter's hooks) and tools_sha256 lists the
+        new sources; ONE changed byte of the artifact (its tables rebuilt) changes config_sha256 and refuses the
+        resume, and with the old tables refuses the load; a changed table array (re-hashed: it loads) changes it too;
+        an un-re-hashed table byte refuses the load."""
+        import test_obslaw as TO
+        rec = self.rec
+        tmp = tempfile.mkdtemp()
+        try:
+            gdir = os.path.join(tmp, "g")
+            graph.write(self.g, gdir)
+            gp = os.path.join(gdir, "graph.jsonl.gz")
+            out = os.path.join(tmp, "run")
+            want = rec.prepare_run(self.ns(graph=gp, out=out))
+            cfg = rqlib.read_json(os.path.join(out, "config.json"))
+            om = cfg["observation_model"]
+            self.assertEqual((om["mode"], om["noise_source"], om["accepting"]), ("bank", "bank_d8", True))
+            self.assertEqual((om["bank_artifact_sha256"], om["obs_tables_sha256"]),
+                             (rqlib.sha256_file(self.bp), rqlib.sha256_file(self.tp)))
+            self.assertEqual(om["amendment_D9_sha256"], rec.D9_SHA256)
+            self.assertEqual(om["streams"], {"truth": "default_rng(seed)", "survival_truth": "default_rng([seed,2])",
+                                             "observations": "default_rng([seed,3])"})
+            self.assertEqual(om["fitter"], {"var_fn": "W", "rep_prior": "nu0_C", "score_law": "A,L"})
+            self.assertTrue({"noisescale.py", "common.py", "material.py", "obslaw.py", "fixtures/registered_ages.json",
+                             "recovery.py", "map.py"} <= set(cfg["tools_sha256"]))
+            self.assertEqual(rec.prepare_run(self.ns(graph=gp, out=out)), want)            # (an unchanged resume)
+            doc = bank_doc()
+            old = rqlib.canonical(doc)
+            h = doc["fit"]["noise"]["receipt_sha256"]
+            doc["fit"]["noise"]["receipt_sha256"] = h[:-1] + ("0" if h[-1] != "0" else "1")
+            self.assertEqual(sum(x != y for x, y in zip(old, rqlib.canonical(doc))), 1)    # (exactly one byte)
+            bp2, tp2 = bank_files("onebyte", doc)
+            with self.assertRaisesRegex(SystemExit, "another configuration"):
+                rec.prepare_run(self.ns(graph=gp, out=out, bank=bp2, obs_tables=tp2))
+            with self.assertRaisesRegex(SystemExit, "another bank artifact"):
+                rec.prepare_run(self.ns(graph=gp, out=out, bank=bp2, obs_tables=self.tp))
+            raw = rqlib.read_bytes(self.tp)
+            data, content = TO._rehashed_tables(raw, {"fit_V": lambda a: a * np.where(np.arange(len(a)) == 7, 1.001, 1.0)})
+            tp3 = os.path.join(tmp, "tables_changed.npz")
+            rqlib.write_durable(tp3, data)
+            self.assertNotEqual(rec.prepare_run(self.ns(graph=gp, out=os.path.join(tmp, "other"), obs_tables=tp3)), want)
+            with self.assertRaisesRegex(SystemExit, "another configuration"):
+                rec.prepare_run(self.ns(graph=gp, out=out, obs_tables=tp3))
+            i = raw.index(b"fit_V.npy") + 400
+            tp4 = os.path.join(tmp, "tables_flipped.npz")
+            rqlib.write_durable(tp4, raw[:i] + bytes([raw[i] ^ 1]) + raw[i + 1:])
+            with self.assertRaisesRegex(SystemExit, "obs-model bank"):
+                rec.prepare_run(self.ns(graph=gp, out=out, obs_tables=tp4))
+        finally:
+            shutil.rmtree(tmp)
+
+    def test_T6_9_truth_only_fields_never_reach_a_bank_fit_score_or_selection(self):
+        """T6-9 (v2 P2 #8): on a noisy bank-mode dataset, REPLACING every truth-only field (eta, inter, mu, loc, c,
+        energy, settings -- a capture-level asym x4 planning setting --, cS, etaS, DS) or DELETING them all, with the
+        observations and obs fixed, leaves every candidate's fitted parameters, the predictive scores, the selection,
+        the bounds and the success flags of the legacy and forward procedures identical; only the labelled truth
+        diagnostics (test_rmse_truth, classes) may change. Control: in PLANNING mode the same settings change the
+        fit (var_model reads them)."""
+        rec, D = self.rec, self.D
+        data = rec.simulate(D, rec.SCENARIOS["r1_034"], 77, obs=self.obs)
+        kw = dict(fitter="registered", start="warm", basis=4)
+        real = rec.any_fit
+
+        def run(d_):
+            fits = []
+
+            def spy(*a, **k):
+                m = real(*a, **k)
+                fits.append(m)
+                return m
+            with mock.patch.object(rec, "any_fit", spy):
+                out = rec.procedure(D, d_, "a", 1, [0.05], 3, 7, **kw)
+                fw = rec.forward_procedure(D, d_, 1, [0.05], 3, 7, **kw)
+            return out, fw, fits
+
+        def strip(x):
+            if isinstance(x, dict):
+                return {k: strip(v) for k, v in x.items() if k not in ("seconds", "test_rmse_truth", "classes")}
+            if isinstance(x, list):
+                return [strip(v) for v in x]
+            return x
+        rng = np.random.default_rng(5)
+        settings = dict(rec.DEFAULTS, noise_model="capture", noise_scale=4.0, link="asym", rank=3, noiseless=False)
+        replaced = dict(data, eta=rng.normal(size=data["eta"].shape), inter=rng.normal(size=data["inter"].shape),
+                        mu={k: rng.random(v.shape) for k, v in data["mu"].items()},
+                        loc={k: rng.normal(size=v.shape) for k, v in data["loc"].items()}, c=123.0, energy=-1.0,
+                        settings=settings, cS=rng.normal(size=data["cS"].shape),
+                        etaS=rng.normal(size=data["etaS"].shape), DS=np.eye(1) * 5.0)
+        deleted = {k: v for k, v in data.items() if k not in rec.TRUTH_ONLY}
+        self.assertEqual(set(rec.TRUTH_ONLY) - set(data), set())
+        out0, fw0, fits0 = run(data)
+        self.assertGreater(len(fits0), 2)
+        for name, variant in (("replaced", replaced), ("deleted", deleted)):
+            out, fw, fits = run(variant)
+            self.assertEqual(len(fits), len(fits0), name)
+            for m0, m1 in zip(fits0, fits):
+                for k in ("a", "b", "aS", "bS", "u", "v", "c", "DS", "covQ", "covP"):
+                    self.assertTrue(np.array_equal(m0[k], m1[k]), (name, k))
+                self.assertEqual([m0[k] for k in ("objective", "phi", "unit", "pair_var", "rep_prior", "var_fn_identity")],
+                                 [m1[k] for k in ("objective", "phi", "unit", "pair_var", "rep_prior", "var_fn_identity")],
+                                 name)
+            self.assertEqual(json.dumps(strip(out), sort_keys=True), json.dumps(strip(out0), sort_keys=True), name)
+            self.assertEqual(json.dumps(strip(fw), sort_keys=True), json.dumps(strip(fw0), sort_keys=True), name)
+        self.assertIsNone(rec.procedure(D, deleted, "a", 1, [0.05], 3, 7, **kw)["classes"])
+        plan = rec.simulate(D, rec.SCENARIOS["r1_034"], 77)
+        f0 = rec.any_fit("registered", D, D.fit["a"], plan, 1, 0.05, False, 3, 7, start="warm", basis=4)
+        f1 = rec.any_fit("registered", D, D.fit["a"], dict(plan, settings=settings), 1, 0.05, False, 3, 7, start="warm",
+                         basis=4)
+        self.assertNotEqual(f0["objective"], f1["objective"])
+
+
 if __name__ == "__main__":
     unittest.main()

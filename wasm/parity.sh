@@ -140,6 +140,10 @@ run_case "pbrain_frozenacct_s3" 3 2000 --rich --pred-brain --pred-frozen --pred-
 run_case "pbrain_primer_s5" 5  2000 --rich --pred-brain --pred-primer --pred-count 8
 run_case "long_s42"    42    10000
 
+run_case "sat_s42"       42 2000 --weight-mutation-mode saturating
+run_case "sat_rich_s7"    7 2000 --rich --weight-mutation-mode saturating
+run_case "sat_pbrain_s42" 42 2000 --rich --pred-brain --weight-mutation-mode saturating
+
 if [ "$FAILED" = "1" ]; then
     echo "== PARITY FAILED — bisect with --trace 10 on the failing case"
     exit 1

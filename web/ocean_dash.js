@@ -21,8 +21,8 @@
  * close() / isOpen(). Charts redraw at most twice a second, only while
  * open. */
 (function () {
-  var C = window.EvoCharts;
-  if (!C) return;
+  var C = window.EvoCharts, UI = window.EvoUI;
+  if (!C || !UI) return;
   var T = C.T, S = T.series, DT = 0.016, MAX_ROWS = 1200, FAM_K = 8;
   var host = null, rows = [], every = 60, version = 0;
   var isOpen = false, tab = "pop", timer = 0, lastKey = "", cards = {}, view = {};
@@ -179,7 +179,7 @@
             { name: "caught", y: rate(function (r) { return r.su[2]; }).map(z), color: S[7] }] };
         } },
       { id: "preds", title: "Predators", draw: C.lines, when: function () { return view.f.pred; },
-        needs: "Shows up when the world has predators (Settings → Predators).",
+        needs: "Shows up when the world has predators (Setup → Predators).",
         cap: "Hunters alive. With their economy on they breed when well fed and starve when not.",
         data: function () { return { t: view.t, series: [line("predators", su(1), S[7])] }; } },
       /* Classic's two phase portraits (web/dashboard.js), over the same columns */
@@ -187,7 +187,7 @@
         cap: "Fish against food, one point per moment, the bright end now. Going round a loop is the cycle: food piles up, fish boom and eat it down, fish crash, food recovers.",
         data: function () { return { x: st(0), y: su(0), t: view.t, xName: "fish", yName: "food", color: S[2] }; } },
       { id: "phase2", title: "Hunters and fish", draw: C.phase, when: function () { return view.f.pred; },
-        needs: "Shows up when the world has predators (Settings → Predators).",
+        needs: "Shows up when the world has predators (Setup → Predators).",
         cap: "Fish against predators, the bright end now. With the predator economy on, a loop is the classic predator–prey cycle: hunters boom after the fish, then starve.",
         data: function () { return { x: st(0), y: su(1), t: view.t, xName: "fish", yName: "predators", color: S[7] }; } }
     ] },
@@ -214,13 +214,14 @@
           return band(su(14).map(function (v) { return v * d; }), su(15).map(function (v) { return v * d; }), S[2], "neutral depth", fmtD);
         } },
       { id: "pitch", title: "Climbing and diving", draw: C.lines,
-        cap: "How steeply the fish swim up or down on average (0° = level). It rises when depth starts to matter to them.",
-        data: function () { return { t: view.t, yFmt: fmtDeg, valFmt: fmtDeg, series: [line("mean pitch", su(21).map(function (v) { return Math.atan(v) * 180 / Math.PI; }), S[4])] }; } }
+        cap: "How steeply the fish swim up or down: the angle equivalent of their mean absolute vertical slope (climb or dive speed over forward speed, averaged, as an angle; 0° = level). It rises when depth starts to matter to them.",
+        /* (the tooltip's row does not wrap, in a box at most 300 px wide: the short name; the caption has the long one) */
+        data: function () { return { t: view.t, yFmt: fmtDeg, valFmt: fmtDeg, series: [line("angle of mean |slope|", su(21).map(function (v) { return Math.atan(v) * 180 / Math.PI; }), S[4])] }; } }
     ] },
     { id: "families", name: "Family lines", cards: [
       { id: "muller", title: "Family lines over time", wide: true, tall: true, draw: C.stack,
-        cap: "Each band is a family line (every fish descended from one starting fish), its share of the population, in the colour its fish have in the tank. Lines that take over are selection at work.",
-        data: mullerData },
+        cap: "Each band is a family line (every fish descended from one starting fish), its share of the population, in its family colour: the colour its fish have in the tank when Fish colours is Family. Lines that take over are selection at work.",
+        famColours: true, data: mullerData },
       { id: "lines", title: "Family lines alive", draw: C.lines,
         cap: "Lines die out one by one until a few remain. Founders added below the reseed floor start new lines.",
         data: function () { return { t: view.t, series: [line("lines alive", su(19), S[0])] }; } },
@@ -243,12 +244,12 @@
         cap: "Genes per fish, on average: the size of its brain's wiring list.",
         data: function () { return { t: view.t, series: [line("genes", su(18), S[6])] }; } },
       { id: "body", title: "Body size and shape", draw: C.lines, when: function () { return view.f.body; },
-        needs: "Shows up when bodies evolve (Settings → World → Evolving bodies).",
+        needs: "Shows up when bodies evolve (Setup → World → Evolving bodies).",
         cap: "Average body size and elongation (both start at 1).",
         legend: function () { return [{ name: "size", color: S[0] }, { name: "elongation", color: S[1] }]; },
         data: function () { return { t: view.t, zero: false, series: [line("size", su(16), S[0]), line("elongation", su(17), S[1])] }; } },
       { id: "predE", title: "Predator energy", draw: C.lines, when: function () { return view.f.predEnergy; },
-        needs: "Shows up when predators eat, breed and starve (Settings → Predators).",
+        needs: "Shows up when predators eat, breed and starve (Setup → Predators).",
         cap: "The hunters' average energy store.",
         data: function () { return { t: view.t, series: [line("predator energy", su(20), S[7])] }; } }
     ] },
@@ -282,33 +283,28 @@
 
   /* ---- DOM ---- */
   var tabsEl = el("dtabs"), gridEl = el("dgrid"), noteEl = el("dnote");
+  /* the tabs (web/ui_common.js tabs, as Classic's): a pointer's press lets the
+   * focus go (Space pauses again), the keyboard's keeps it; Left / Right the
+   * next one round, Home / End the first and last, the focus going with the
+   * selection (the page leaves a focused tab those keys); Tab lands on the
+   * selected one */
+  var tabIds = TABS.map(function (t) { return t.id; }), tabBtn = {};
+  var dtabs = UI.tabs(tabsEl, { ids: function () { return tabIds; }, current: function () { return tab; },
+                                button: function (id) { return tabBtn[id] || null; }, select: showTab });
   TABS.forEach(function (tb) {
     var b = document.createElement("button");
     b.type = "button";
     b.textContent = tb.name;
     b.setAttribute("role", "tab");
     b.dataset.tab = tb.id;
-    /* a pointer's press lets the focus go (Space pauses again); the keyboard's keeps it */
-    b.addEventListener("click", function () { showTab(tb.id); if (!this.matches(":focus-visible")) this.blur(); });
+    tabBtn[tb.id] = b;
+    dtabs.bind(b, tb.id);
     tabsEl.appendChild(b);
   });
-  /* the tabs from the keyboard (the page leaves a focused tab its arrows):
-   * Left / Right the next one round, Home / End the first and last; the
-   * focus goes with the selection, and Tab lands on the selected one */
-  tabsEl.addEventListener("keydown", function (e) {
-    var ids = TABS.map(function (t) { return t.id; }), i = ids.indexOf(tab), n = ids.length;
-    var j = e.key === "ArrowRight" ? (i + 1) % n : e.key === "ArrowLeft" ? (i - 1 + n) % n : e.key === "Home" ? 0 : e.key === "End" ? n - 1 : -1;
-    if (j < 0) return;
-    showTab(ids[j]);
-    tabsEl.children[j].focus();
-    e.preventDefault();
-  });
+  dtabs.mark(tab);   /* (closed too: one tab in the Tab order from the start) */
   function showTab(id) {
     tab = id;
-    Array.prototype.forEach.call(tabsEl.children, function (b) {
-      b.setAttribute("aria-selected", b.dataset.tab === id ? "true" : "false");
-      b.tabIndex = b.dataset.tab === id ? 0 : -1;
-    });
+    dtabs.mark(id);
     C.tip(null);
     gridEl.innerHTML = "";
     cards = {};
@@ -322,10 +318,27 @@
       box.className = "cbox" + (cd.tall ? " tall" : "") + (cd.xtall ? " xtall" : "");
       gridEl.appendChild(sec);
       cards[cd.id] = { def: cd, el: sec, box: box, legend: sec.querySelector(".legend"), note: sec.querySelector(".cnote"),
-                       chart: new C.Chart(box, cd.draw) };
+                       chart: new C.Chart(box, cd.draw), fam: cd.famColours ? famSwitch(sec) : null };
     });
     gridEl.scrollTop = 0;
     update(true);
+  }
+  /* A chart in family colours, while the tank's fish wear others (host.colourMode): a line saying so, and a
+   * button that shows the family colours in the tank (host.showFamilyColours: the View menu's Family) */
+  var MODE_WORDS = { appearance: "each fish's inherited appearance", brain: "colours from the fish's brains" };
+  function tankColours() { return host && host.colourMode ? host.colourMode() : "family"; }
+  function famSwitch(sec) {
+    var p = document.createElement("p"), t = document.createElement("span"), b = document.createElement("button");
+    p.className = "cnote famswitch";
+    b.type = "button"; b.className = "btn"; b.textContent = "Show family colours in the tank";
+    b.addEventListener("click", function () {
+      if (host && host.showFamilyColours) host.showFamilyColours();
+      if (!this.matches(":focus-visible")) this.blur();
+      update(true);
+    });
+    p.appendChild(t); p.appendChild(b);
+    sec.appendChild(p);
+    return { p: p, text: t };
   }
   function rampLegend(e, from, to) {
     var key = "ramp" + from + "|" + to;
@@ -338,13 +351,17 @@
   function update(force) {
     if (!isOpen) return;
     var due = tab === "brains" && (!wireCache || performance.now() - wireCache.at >= WIRE_EVERY_MS);
-    var key = tab + "|" + version + "|" + gridEl.clientWidth;
+    var mode = tankColours(), key = tab + "|" + version + "|" + gridEl.clientWidth + "|" + mode;
     if (!force && key === lastKey && !due) return;
     lastKey = key;
     view = { t: times(), f: flags() };
     Object.keys(cards).forEach(function (id) {
       var c = cards[id], cd = c.def, on = !cd.when || cd.when();
       c.el.classList.toggle("off", !on);
+      if (c.fam) {
+        c.fam.p.hidden = mode === "family";
+        c.fam.text.textContent = "The tank shows " + (MODE_WORDS[mode] || mode) + " now, not these family colours. ";
+      }
       if (!on) { c.note.textContent = cd.needs || ""; c.legend.innerHTML = ""; c.legend.__html = ""; return; }
       var data = cd.data();
       c.chart.draw(data || null);

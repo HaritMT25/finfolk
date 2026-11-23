@@ -1118,7 +1118,7 @@ private:
     SpatialGrid creatureGrid_;
     OceanFoodGrid foodGrid_;   // SpatialGrid's layout and queries + each item's depth / size / eyeCon
     std::vector<FishHot> hot_;
-    std::vector<int> advectIdx_;   // wallTransportFood's live items, reused
+    std::vector<int> advectIdx_;   // transportFood's live items, reused
     std::vector<PendingSignal> pending_;
     std::vector<int> neighbors_, nearbyFood_, nearby_, near_;
     std::vector<FoodSeen> foodSeen_;   // foodWithin's list (scratch, one fish at a time)
@@ -1594,7 +1594,8 @@ private:
                 newborns.push_back(makeChildFish(c1, c2, cfg.genomeMinLength,
                                                  cfg.genomeMaxLength,
                                                  cfg.mutationMultiplier,
-                                                 cfg.newbornEnergy));
+                                                 cfg.newbornEnergy,
+                                                 cfg.weightMutationMode));
                 if (appearanceOn()) {   // c1, c2 are elements of `creatures` (update's serial loop)
                     newbornParents.push_back((std::uint32_t)(&c1 - creatures.data()));
                     newbornParents.push_back((std::uint32_t)(&c2 - creatures.data()));
