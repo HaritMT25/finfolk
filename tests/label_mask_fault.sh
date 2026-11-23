@@ -28,7 +28,7 @@ cp wasm/*.cpp "$TMP/wasm/" 2>/dev/null
 cp wasm/*.hpp "$TMP/wasm/" 2>/dev/null
 FLAGS="${OPT:--O2} -std=c++20 -ffp-contract=off -DEVO_WORLD_OCEAN -I $TMP/src"
 [ -n "${EYE:-}" ] && FLAGS="$FLAGS -DEVO_OCEAN_EYE"
-ENGINE="$TMP/src/ocean/ocean_world.hpp"
+ENGINE="$TMP/src/ocean/ocean_sensing.hpp"
 cp "$ENGINE" "$TMP/ocean_world.orig"
 
 plant () {  # plant OLD NEW: the pristine engine with OLD (found exactly once) replaced by NEW
