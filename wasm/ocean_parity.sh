@@ -516,7 +516,7 @@ add eye_walls_e1_capture_s17 "17 3000 --capture --cfg {\"eye\":1,\"eyeCode\":7,\
 add eye_walls_only_steer_s3 "3 5000 --cfg {$EXP,\"eye\":1,\"eyeOnly\":1,\"steerFrame\":1,\"walls\":true} $WALLX --expect eyeOnlySteps>0" \
                   "eye-only + own frame + the experiment's economy, in a glass tank"
 
-# CI's subset (FAST=1; .github/workflows/ci.yml on every push / pull request;
+# CI's subset (FAST=1; .github/workflows/ci.yml on pull requests and pushes to main;
 # the whole matrix runs there weekly and on demand): one or more cases of every
 # family above, the cheap ones — defaults, predators + economy, rich, the
 # extremes, live changes, capture, the population cap, triangular + body, E1

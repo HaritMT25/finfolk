@@ -2,7 +2,7 @@ name: ocean-full
 
 # The Ocean's whole determinism matrix (wasm/ocean_parity.sh, every case:
 # native == wasm == the committed baseline, every step), its guards and unit
-# checks. ci.yml runs the FAST subset on every push; this runs everything,
+# checks. ci.yml runs the FAST subset on pull requests and pushes to main; this runs everything,
 # weekly and on demand (Actions -> ocean-full -> Run workflow).
 on:
   schedule:

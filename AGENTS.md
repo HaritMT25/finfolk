@@ -43,7 +43,7 @@ the site is static three.js/JS in `web/` (no JS build step). Python tools run ex
   machine-wide browser lock; `docs/ocean_render_perf.md` says how to run them and what they measured),
   `gen_planes*.{cpp,sh}` (regenerate plane headers), `invasion/` (invasion-matrix study: plan/run/score/analyze),
   `alife2027/` (ALIFE 2027 study runner: plan/run/analyze), `three_bundle/`.
-- `.github/workflows/` `ci.yml` (every push/PR), `ocean-full.yml` (full Ocean matrix, weekly/on demand).
+- `.github/workflows/` `ci.yml` (pull requests, pushes to main, manual runs), `ocean-full.yml` (full Ocean matrix, weekly/on demand).
 - `docs/`, `experiments/`, `img/` notes and artefacts.
 
 ## The big files (find things by name, not line number)
