@@ -667,6 +667,84 @@ class TestRecoveryExtra(unittest.TestCase):
 
     def test_supervisor_termination_reaps_workers_before_unlock_and_resumes(self):
         import fcntl
+        import textwrap
+
+        # Keep cleanup at an acknowledged wait until the parent has probed the
+        # lock. A fixed sleep can resume after both five-second waits finish.
+        ready = os.path.join(self.root, "cleanup-ready.json")
+        release = os.path.join(self.root, "cleanup-release")
+        unlocked = os.path.join(self.root, "cleanup-unlocked.json")
+        shim = os.path.join(self.root, "supervisor-shim.py")
+        with open(shim, "w") as handle:
+            handle.write(textwrap.dedent("""\
+                import fcntl, json, os, runpy, subprocess, sys, time
+                ready, release, unlocked, script, *args = sys.argv[1:]
+                original_init = subprocess.Popen.__init__
+                original_wait = subprocess.Popen.wait
+                original_flock = fcntl.flock
+                workers = []
+                acknowledged = False
+
+                def init(self, *args, **kwargs):
+                    cmd = args[0]
+                    if len(cmd) > 4 and cmd[4] == "one":
+                        # Stop after exec (Popen's guarded launch remains real),
+                        # before the toy can finish or publish a result.
+                        stop = ("import os,sys,signal,runpy,pathlib; "
+                                "assert os.getppid()==int(sys.argv[1]); "
+                                "assert b'one' in pathlib.Path('/proc/self/cmdline').read_bytes(); "
+                                "os.kill(os.getpid(),signal.SIGSTOP); "
+                                "sys.argv=sys.argv[2:]; "
+                                "sys.path.insert(0,os.path.dirname(sys.argv[0])); "
+                                "runpy.run_path(sys.argv[0],run_name='__main__')")
+                        cmd = [cmd[0], "-I", "-B", "-c", stop, str(os.getpid()), *cmd[3:]]
+                        args = (cmd, *args[1:])
+                    original_init(self, *args, **kwargs)
+                    workers.append(self)
+
+                def wait(self, timeout=None):
+                    global acknowledged
+                    if timeout == 5 and not acknowledged:
+                        acknowledged = True
+                        with open(ready + ".tmp", "w") as out:
+                            json.dump([p.pid for p in workers], out)
+                        os.replace(ready + ".tmp", ready)
+                        deadline = time.monotonic() + 60
+                        while not os.path.exists(release):
+                            if time.monotonic() >= deadline:
+                                raise RuntimeError("test did not release cleanup")
+                            time.sleep(0.01)
+                    return original_wait(self, timeout=timeout)
+
+                def flock(handle, operation):
+                    if operation == fcntl.LOCK_UN and workers:
+                        # Observe the real unlock, including a premature unlock
+                        # after the parent's probe but before wait() returns.
+                        with open(unlocked, "a") as out:
+                            json.dump([{
+                                "pid": p.pid, "returncode": p.returncode,
+                                "exists": os.path.exists(f"/proc/{p.pid}"),
+                            } for p in workers], out)
+                            out.write("\\n")
+                    return original_flock(handle, operation)
+
+                subprocess.Popen.__init__ = init
+                subprocess.Popen.wait = wait
+                fcntl.flock = flock
+                sys.argv = [script, *args]
+                sys.path.insert(0, os.path.dirname(script))
+                runpy.run_path(script, run_name="__main__")
+                """))
+
+        def stopped(pid):
+            with open(f"/proc/{pid}/stat") as handle:
+                return handle.read().rsplit(")", 1)[1].split()[0] == "T"
+
+        def await_state(predicate, message):
+            deadline = time.monotonic() + 30
+            while not predicate():
+                self.assertLess(time.monotonic(), deadline, message)
+                time.sleep(0.01)
 
         directory = os.path.join(self.root, "termination")
         self.prepared(directory, cases="intact,roots1", options="a")
@@ -688,7 +766,7 @@ class TestRecoveryExtra(unittest.TestCase):
         for sig in (signal.SIGTERM, signal.SIGKILL):
             launch_log = os.path.join(self.root, f"supervisor-{sig}.log")
             with self.subTest(signal=sig), open(launch_log, "wb") as output, subprocess.Popen(
-                [sys.executable, "-I", "-B", X.__file__, *argv],
+                [sys.executable, "-I", "-B", shim, ready, release, unlocked, X.__file__, *argv],
                 stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT,
             ) as supervisor:
                 workers = []
@@ -710,17 +788,36 @@ class TestRecoveryExtra(unittest.TestCase):
                     for pid in workers:
                         with open(f"/proc/{pid}/cmdline", "rb") as handle:
                             self.assertIn(b"\0one\0", handle.read())
+                        self.assertIn(pid, children(supervisor.pid))
                         os.kill(pid, signal.SIGSTOP)
+                    await_state(lambda: all(stopped(pid) for pid in workers),
+                                "workers did not acknowledge SIGSTOP")
                     supervisor.send_signal(sig)
                     if sig == signal.SIGTERM:
-                        # Stopped workers force the bounded-kill path. During reaping,
-                        # a restart must still be refused by the supervisor's lock.
-                        time.sleep(0.2)
+                        # The wait hook acknowledges that the handler has entered
+                        # cleanup, and holds it there while we inspect the lock.
+                        await_state(lambda: os.path.exists(ready), "cleanup did not start")
+                        with open(ready) as handle:
+                            self.assertEqual(json.load(handle), workers)
+                        self.assertIsNone(supervisor.poll())
+                        self.assertTrue(all(stopped(pid) for pid in workers))
                         with open(os.path.join(directory, ".lock"), "a") as lock:
                             with self.assertRaises(BlockingIOError):
                                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
                         supervisor.send_signal(signal.SIGTERM)  # repeated termination cannot skip cleanup
-                    self.assertNotEqual(supervisor.wait(timeout=15), 0)
+                        with open(release, "w"):
+                            pass
+                    status = supervisor.wait(timeout=30)
+                    self.assertNotEqual(status, 0)
+                    if sig == signal.SIGTERM:
+                        self.assertEqual(status, 128 + signal.SIGTERM)
+                        with open(unlocked) as handle:
+                            unlocks = [json.loads(line) for line in handle]
+                        self.assertTrue(unlocks)
+                        for at_unlock in unlocks:
+                            self.assertEqual([row["pid"] for row in at_unlock], workers)
+                            self.assertTrue(all(row["returncode"] is not None and not row["exists"]
+                                                for row in at_unlock), at_unlock)
                     deadline = time.monotonic() + 5
                     while any(active(pid) for pid in workers) and time.monotonic() < deadline:
                         time.sleep(0.01)
