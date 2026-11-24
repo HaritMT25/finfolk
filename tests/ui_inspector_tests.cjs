@@ -859,7 +859,7 @@ async function oceanPage(mkOcean, HO) {
     return () => {};
   } }) };
   vm.createContext(P.ctx);
-  for (const f of ["ui_common.js", "ocean_handoff.js", "ocean_appearance.js", "ocean_config.js", "ocean.js"]) run(P.ctx, f);
+  for (const f of ["ui_common.js", "ocean_handoff.js", "ocean_appearance.js", "ocean_config.js", "ocean_tour.js", "ocean.js"]) run(P.ctx, f);
   await until(() => (P.ctx.EvoApp && P.ctx.EvoApp.ready) || /error/.test(D.doc.getElementById("splashstate").className), "the Ocean's page to start");
   const el = (id) => D.doc.getElementById(id), card = el("fishcard"), O = P.ctx.EvoOcean;
   const inet = D.doc.createElement("div"); inet.className = "inet"; inet.clientWidth = 380; inet.clientHeight = 340;
