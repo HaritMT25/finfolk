@@ -42,6 +42,7 @@ SRC=(web/evo_boids.js web/evo_boids.wasm web/evo_boids_mt.js web/evo_boids_mt.wa
      web/worker.js img/rocks.jpg web/index.html web/vercel.json
      web/evo_ocean.js web/evo_ocean.wasm web/ocean.js web/ocean_scene.js web/ocean.html
      web/ocean_config.js web/ocean_dash.js web/ocean_worker.js web/ocean_appearance.js
+     web/ocean_tour.js
      web/ocean_appearance_slots.js web/ocean_handoff.js web/ocean_perf.js web/ocean_shaders.js
      web/ocean_pose.js web/ocean_materials.js web/ocean_scene_parity.js
      web/ocean_bodyplan.html web/ocean_bodyplan.js tests/fixtures/ocean_body_fixture.json
@@ -78,6 +79,7 @@ SCENE=$(publish web/scene3d.js);      THREE=$(publish web/vendor/three.bundle.mi
 OC=$(publish web/evo_ocean.js);       OC_WASM=$(publish web/evo_ocean.wasm)
 OCJS=$(publish web/ocean.js);         OCSCENE=$(publish web/ocean_scene.js)
 OCCFG=$(publish web/ocean_config.js); OCDASH=$(publish web/ocean_dash.js)
+OCTOUR=$(publish web/ocean_tour.js)
 OCWORKER=$(publish web/ocean_worker.js); OCAPP=$(publish web/ocean_appearance.js)
 OCHANDOFF=$(publish web/ocean_handoff.js)
 OCPERF=$(publish web/ocean_perf.js);  OCSLOTS=$(publish web/ocean_appearance_slots.js)
@@ -119,7 +121,7 @@ assert counts == (1,) * 13, ("index.html changed shape", counts)
 open(sys.argv[1], "w").write(out)
 PY
 
-# The Ocean page: its EVO_ASSETS block, its fifteen <script src> tags, the
+# The Ocean page: its EVO_ASSETS block, its sixteen <script src> tags, the
 # shared stylesheet's <link>, and Classic's name in the switch and in the
 # old-link redirect. ocean.js loads the
 # engine (ocean / oceanWasm) and starts the Turbo worker (worker) from these,
@@ -155,8 +157,9 @@ out, n16 = re.subn(r'<script src="ocean_scene_parity\.js"></script>', '<script s
 out, n17 = re.subn(r'<script src="ocean_materials\.js"></script>', '<script src="$OCMATS"></script>', out, count=1)
 out, n18 = re.subn(r'<script src="ui_common\.js"></script>', '<script src="$UICOMMON"></script>', out, count=1)
 out, n19 = re.subn(r'<link rel="stylesheet" href="ui_common\.css">', '<link rel="stylesheet" href="$UICSS">', out, count=1)
-counts = (n1, n2, n3, n4, n5, n6, n7, n8, n9, n10, n11, n12, n13, n14, n15, n16, n17, n18, n19)
-assert counts == (1,) * 19, ("ocean.html changed shape", counts)
+out, n20 = re.subn(r'<script src="ocean_tour\.js"></script>', '<script src="$OCTOUR"></script>', out, count=1)
+counts = (n1, n2, n3, n4, n5, n6, n7, n8, n9, n10, n11, n12, n13, n14, n15, n16, n17, n18, n19, n20)
+assert counts == (1,) * 20, ("ocean.html changed shape", counts)
 open(sys.argv[1], "w").write(out)
 PY
 cp "$OUT/index.html" "$OUT/ocean.html"

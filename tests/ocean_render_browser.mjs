@@ -6,7 +6,7 @@
 //        [--cameras whole,dense,follow,fit] [--colours appearance,family,brain]   (perf; default whole, appearance)
 //        [--modes off,frame,spans,spansGpu] [--viewport 1920x1080[@1]]       (perf; the default: all four, 1920 x 1080 at DPR 1)
 //        [--arms main,off,on,ungated --main-base URL]   (perf by arms, below; offimage needs --main-base)
-//        [--query renderOpt=0]   (added to this site's links: offimage's pixel identity with main is the reference pipeline's)
+//        [--query renderOpt=0 --main-query renderOpt=0]   (offimage: force the reference pipeline on both sites)
 //   --counts takes "big" too: the Big tank (EvoOceanConfig.BIG_TANK: its size, population and set-up)
 //   --cameras fit: the page's own fit of the whole tank (scene.resetView), where whole is a fixed camera
 //   --arms: instead of profiler modes, the swim polish's arms, each capture spansGpu (cpu spans, GPU frame
@@ -107,10 +107,11 @@ const DUR = Number(arg("dur", 15000)), WARM = Number(arg("warm", 10000)), ROUNDS
 const CAMERAS = String(arg("cameras", "whole")).split(","), COLOURS = String(arg("colours", "appearance")).split(",");
 const PERF_MODES = String(arg("modes", "off,frame,spans,spansGpu")).split(",");
 const MAIN_BASE = arg("main-base", null) ? String(arg("main-base")).replace(/\/$/, "") : null;
-/* --query "renderOpt=0": query parameters added to this site's links (not --main-base's): offimage compares this site's polish-off image with
+/* --query and --main-query: parameters added to this site's and --main-base's links respectively: offimage compares this site's polish-off image with
  * main's, pixel for pixel, which is the reference pipeline's property (?renderOpt=0); the optimized pipeline's image is compared with the
  * reference by tools/ocean_render_perf/shots.mjs, where its intended differences (the coarse bodies of small fish) are measured */
 const QUERY = arg("query", "") ? String(arg("query")) : "";
+const MAIN_QUERY = arg("main-query", "") ? String(arg("main-query")) : "";
 const ARMS = arg("arms", null) ? String(arg("arms")).split(",") : null;
 const VIEWPORT = (() => { const m = /^(\d+)x(\d+)(?:@([\d.]+))?$/.exec(String(arg("viewport", "1920x1080@1")));
   if (!m) throw new Error("--viewport WxH[@dpr]"); return { width: +m[1], height: +m[2], dpr: m[3] ? +m[3] : 1 }; })();
@@ -143,11 +144,17 @@ async function launch(label, opts = {}) {
   page.on("response", (r) => { if (r.status() >= 400) errors.push("http " + r.status() + ": " + r.url()); });
   return { ctx, page, errors, browserVersion: ctx.browser() ? ctx.browser().version() : null };
 }
-function benchUrl(c, extra = {}, base = BASE) {
+function benchUrl(c, extra = {}, base = BASE, query = base === BASE ? QUERY : MAIN_QUERY) {
   const q = new URLSearchParams(Object.assign({ renderBench: "1", guide: "0", intro: "0", seed: String(c.worldSeed), pop: String(c.population),
     w: String(c.world[0]), h: String(c.world[1]), depth: String(c.world[2]), speed: String(c.speed), colour: c.colourMode || "appearance",
     walls: c.config.walls ? "1" : "0", cfg: JSON.stringify(Object.assign({}, c.config, { walls: undefined })) }, extra));
-  return base + "/ocean.html?" + q.toString() + (QUERY && base === BASE ? "&" + QUERY : "");
+  return base + "/ocean.html?" + q.toString() + (query ? "&" + query : "");
+}
+/* Pure seam for the off-image policy check; missing diagnostics cannot establish identity. */
+function sameOffImagePolicy(a, b) {
+  const valid = (p) => p && ["quality", "screen", "medium", "coarse"].includes(p.lod) &&
+    typeof p.decoded === "boolean" && ["body", "gated", "off"].includes(p.barbels);
+  return !!(valid(a) && valid(b) && a.lod === b.lod && a.decoded === b.decoded && a.barbels === b.barbels);
 }
 /* The swim polish's size weights against an independent projection (in the
  * page): for every fish as the last frame uploaded it (scene.poseOf: its
@@ -275,7 +282,7 @@ async function manifestOf(page, label, extra = {}) {
     hashes: { "web/evo_ocean.wasm": sha("web/evo_ocean.wasm"), "web/ocean_scene.js": sha("web/ocean_scene.js"), "web/ocean_perf.js": sha("web/ocean_perf.js"),
               "web/ocean_appearance_slots.js": sha("web/ocean_appearance_slots.js"), "web/ocean_shaders.js": sha("web/ocean_shaders.js"),
               "web/ocean_pose.js": sha("web/ocean_pose.js"), "web/ocean_materials.js": sha("web/ocean_materials.js"),
-              "web/ocean_scene_parity.js": sha("web/ocean_scene_parity.js"), "web/ocean.js": sha("web/ocean.js"), "web/vendor/three.bundle.min.js": sha("web/vendor/three.bundle.min.js") },
+              "web/ocean_scene_parity.js": sha("web/ocean_scene_parity.js"), "web/ocean.js": sha("web/ocean.js"), "web/ocean_tour.js": sha("web/ocean_tour.js"), "web/vendor/three.bundle.min.js": sha("web/vendor/three.bundle.min.js") },
     host: { platform: process.platform, cpus: os.cpus().length, cpuModel: os.cpus()[0] && os.cpus()[0].model, totalMemGB: Math.round(os.totalmem() / 1e9) },
     info }, extra);
 }
@@ -1190,7 +1197,7 @@ async function partOffImage() {
   console.log("== the polish off draws main's image, pixel for pixel (main " + MAIN_BASE + ")");
   if (!MAIN_BASE) { check("offimage: --main-base given", false); return; }
   const VP = { width: 1280, height: 720 }, got = { main: {}, mainFresh: {}, fresh: {}, switched: {} };
-  report.parts.offimage = { viewport: VP, states: {} };
+  report.parts.offimage = { viewport: VP, query: QUERY, mainQuery: MAIN_QUERY, states: {} };
   const sites = ["main", "fresh", "switched"];
   let polishedMain = false;
   for (let si = 0; si < sites.length; si++) {
@@ -1200,7 +1207,7 @@ async function partOffImage() {
     const L = await launch("offimage-" + site, { viewport: VP, init });
     for (const st of OFF_STATES) {
       const c = caseFor(600, { config: Object.assign({}, st.cfg) });
-      await L.page.goto(benchUrl(c, {}, base));
+      await L.page.goto(benchUrl(c, {}, base, ofMain ? MAIN_QUERY : QUERY));
       await ready(L.page, true);
       const r = await L.page.evaluate(async ([st, cd, cand]) => {
         const B = EvoOcean.bench, S = EvoOcean.scene;
@@ -1248,7 +1255,8 @@ async function partOffImage() {
         await B.wait(2600);   /* the caustics' and the flashlight's fades */
         await B.frames(4);
         const out = { n: EvoOcean.state().n, pc: EvoOcean.state().pc, tick: EvoOcean.state().frame, view: S.view(), size: [W, H],
-                      polishApi: !!S.setPolish, appearance: S.appearance(), pickHover };
+                      polishApi: !!S.setPolish, appearance: S.appearance(), pickHover,
+                      renderPolicy: S.renderOptimization ? S.renderOptimization().effective : null };
         if (pickHover) pickHover.hovering = document.getElementById("tank").style.cursor === "pointer";
         /* switched: the page as it opens (its default look), then switched to plain */
         if (cand === "switched") { out.polishOn0 = S.polish(); out.on0 = await grab(); S.setPolish(false); await B.wait(1500); await B.frames(4); }
@@ -1265,6 +1273,15 @@ async function partOffImage() {
         S.render = orig;
         return out;
       }, [st, c, ofMain ? false : site]);
+      const mainPolicy = site === "main" ? r.renderPolicy : got.main[st.name].renderPolicy;
+      const reference = { lod: "quality", decoded: false, barbels: "body" };
+      const policyOk = sameOffImagePolicy(reference, r.renderPolicy) && sameOffImagePolicy(mainPolicy, r.renderPolicy);
+      check("offimage " + site + " " + st.name + ": effective reference render policy matches main", policyOk, { main: mainPolicy, current: r.renderPolicy });
+      if (!policyOk) {
+        report.parts.offimage.policyMismatch = { site, state: st.name, main: mainPolicy, current: r.renderPolicy };
+        await L.ctx.close();
+        return;
+      }
       got[site][st.name] = r;
     }
     check("offimage " + site + ": no console / page / network errors", L.errors.length === 0, L.errors.slice(0, 5));
@@ -1288,13 +1305,13 @@ async function partOffImage() {
     /* m: main's plain image (pre-polish main as it is; a polished main's plain from the start) */
     const m = polishedMain ? got.mainFresh[st.name] : got.main[st.name], f = got.fresh[st.name], c = got.switched[st.name];
     const d0 = diff(m.off, f.off), d1 = diff(m.off, c.off), d2 = diff(m.off, c.on);
-    report.parts.offimage.states[st.name] = { main: { tick: m.tick, n: m.n, pc: m.pc, view: m.view, appearance: m.appearance, polish: m.polish },
-      fresh: { tick: f.tick, n: f.n, polish: f.polish }, switched: { tick: c.tick, n: c.n, pc: c.pc, view: c.view, polishOff: c.polish, polishOn: c.polishOn, polishOn0: c.polishOn0, appearance: c.appearance },
+    report.parts.offimage.states[st.name] = { main: { renderPolicy: m.renderPolicy, tick: m.tick, n: m.n, pc: m.pc, view: m.view, appearance: m.appearance, polish: m.polish },
+      fresh: { renderPolicy: f.renderPolicy, tick: f.tick, n: f.n, polish: f.polish }, switched: { renderPolicy: c.renderPolicy, tick: c.tick, n: c.n, pc: c.pc, view: c.view, polishOff: c.polish, polishOn: c.polishOn, polishOn0: c.polishOn0, appearance: c.appearance },
       mainVsFresh: d0, mainVsSwitched: d1, mainVsOn: d2 };
     if (polishedMain) {
       /* the default look: this page as it opens (the polish on) == main's as it opens */
       const md = got.main[st.name], dd = diff(md.off, c.on0);
-      report.parts.offimage.states[st.name].mainDefault = { polish: md.polish, view: md.view };
+      report.parts.offimage.states[st.name].mainDefault = { renderPolicy: md.renderPolicy, polish: md.polish, view: md.view };
       report.parts.offimage.states[st.name].defaultVsMain = dd;
       check("offimage " + st.name + ": the look as the page opens (the polish on) == main's, every RGBA8 pixel (tick " + md.tick + ", " + md.n + " fish, " + md.pc + " predators, same camera)",
             sameView(md, c) && md.polish && md.polish.on === true && c.polishOn0 && c.polishOn0.on === true && dd.differing === 0,

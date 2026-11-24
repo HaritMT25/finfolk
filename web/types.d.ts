@@ -1208,10 +1208,94 @@ interface EvoUIApi {
   senseIdle(fresh: boolean, touch: boolean, paused: boolean, keys: string): string;
 }
 
+/* ---------------- web/ocean_tour.js (window.EvoOceanTour) ---------------- */
+
+interface OceanGuideHelpers {
+  touch(): boolean;
+  app(): OceanGuideApp;
+  q(selector: string): HTMLElement | null;
+  rectOf(selector: string): DOMRect | null;
+  drawerSides(): string[];
+}
+interface OceanGuideStep {
+  title: string;
+  body(): string;
+  target?(): DOMRect | null;
+  enter?(): void;
+  place?: string[] | (() => string[]);
+  drawer: boolean;
+  welcome?: boolean;
+  fish?: boolean;
+  desktopOnly?: boolean;
+  last?: boolean;
+  intro?: boolean;
+  tab?: string;
+  scroll?: string;
+}
+interface OceanGuideConfig {
+  key: string;
+  introKey: string;
+  quiet: boolean;
+  steps(h: OceanGuideHelpers): OceanGuideStep[];
+  intro(h: OceanGuideHelpers): OceanGuideStep;
+}
+interface OceanGuideApp {
+  ready: boolean;
+  touch(): boolean;
+  compact(): boolean;
+  has3D(): boolean;
+  colourByBrain(): boolean;
+  colourMode(): string;
+  startTurbo(): void;
+  turboActive(): boolean;
+  setDrawer(open: boolean): void;
+  setSheetTab(id: string): void;
+  inspectSomeFish(): boolean;
+  releaseFish(): void;
+  inspectorRect(): DOMRect | null;
+}
+/** Root bindings are read at the original execution points. No accessor syncs or refreshes. */
+interface OceanTourPorts {
+  store(key: string, value?: string): string | null;
+  readonly P: URLSearchParams;
+  el(id: string): HTMLElement;
+  readonly coarseMQ: MediaQueryList;
+  readonly summary: ArrayLike<number> | null;
+  readonly turboState: TurboPhase;
+  readonly openPop: string | null;
+  readonly statOpen: boolean;
+  readonly selectedId: number | null;
+  readonly drawerEl: HTMLElement;
+  dash(): { isOpen(): boolean } | null;
+  readonly colourMode: string;
+  readonly HAS_APP: boolean;
+  readonly colourBrain: boolean;
+  readonly M: OceanModule | null;
+  enterTurbo(): void;
+  setDrawer(open: boolean): void;
+  setSheetTab(id: string): void;
+  engineCall<T>(fn: () => T, fallback: T): T;
+  engineCall<T>(fn: () => T): T | undefined;
+  fresh(s: OceanSnapshot | null): OceanSnapshot | null;
+  readonly lastS: OceanSnapshot | null;
+  readonly scene: Pick<OceanScene, "pick">;
+  select(id: number | null): void;
+  readonly cardEl: HTMLElement;
+}
+interface OceanTour {
+  installGuide(): void;
+  startCoach(): void;
+  hideCoach(): void;
+  placeCoach(): void;
+  markCoachSeen(): void;
+}
+interface EvoOceanTourApi { create(p: OceanTourPorts): OceanTour }
+
 /* ---------------- not checked yet: declared by what checked files use ---------------- */
 
 /** the scene (web/ocean_scene.js create()): what the benchmark and the page's API use of it */
 interface OceanScene {
+  pick(s: OceanSnapshot, x: number, y: number, radius: number): number;
   setQuality(q: number): void;
   quality(): number;
   appearance(): { want: boolean; skin: boolean; shapes: boolean; drawing: boolean; status?: string; lod?: string; verts?: number; barbels?: boolean };
@@ -1248,6 +1332,9 @@ declare var EvoOceanHandoff: EvoOceanHandoffApi;
 declare var EvoAppearanceSlots: EvoAppearanceSlotsApi;
 declare var EvoOceanPerf: EvoOceanPerfApi;
 declare var EvoOceanConfig: EvoOceanConfigApi;
+declare var EvoOceanTour: EvoOceanTourApi;
+declare var EvoGuideConfig: OceanGuideConfig;
+declare var EvoApp: OceanGuideApp;
 declare var EvoAppearance: EvoAppearanceApi;
 /** the scripts web/ocean_scene.js needs: undefined when the file did not load, null when it threw as it
  * loaded (each sets its namespace null first and registers at the end) */
