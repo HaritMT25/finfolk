@@ -8,9 +8,13 @@ PYTHON=/absolute/offline/venv/bin/python3
 nice -n 19 "$PYTHON" -I tools/redqueen/analysis.py \
   --root ASSAYS --root SCRIPTED_ASSAYS --plan EXECUTABLE.jsonl --plan-sha256 FROZEN_DIGEST \
   --registry worlds.json --ecology ecology.json --mask mask.json --references references.json \
-  --params fitted-generator.json --critical critical.json --acceptance acceptance.json \
+  --params fitted-generator.json --noise-source adopted-bank.json \
+  --critical critical.json --acceptance acceptance.json \
   --gates epoch-gates.json --out final-analysis.json
 ```
+
+`adopted-bank.json` is the exact noise-bank artifact named by
+`fit.noise.source_artifact_sha256`; provide its original bytes, not a re-encoded copy.
 
 Supply one combined, frozen executable plan containing the required cells from every root, including
 predator-free and scripted assays. A control shared across panels is measured and supplied once.

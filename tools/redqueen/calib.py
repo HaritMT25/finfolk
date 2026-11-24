@@ -167,14 +167,20 @@ in turn) with every fit, period, window, material rule, epoch, direction and boo
 decision, and reports CPU seconds per panel against stats.cpu_targets() (D5: 35.1 s; smoke records: never accepted
 by crit / accept).
 
-    python3 calib.py panels --hyp H-F --stage dev --graph g.jsonl.gz --params fitted.json --mode F3 \\
+Production panel commands require --noise-source adopted-bank.json, the artifact named by
+fit.noise.source_artifact_sha256 (the exact adopted bytes, not a re-encoded document).
+
+    python3 calib.py panels --hyp H-F --stage dev --graph g.jsonl.gz --params fitted.json \\
+        --noise-source adopted-bank.json --eligibility eligibility.json --mode F3 \\
         --stratum actual --to 160 --out dev_F3.jsonl --ledger cpu.jsonl        (the audit; --smoke for tests)
-    python3 calib.py panels ... --phase continue --cell all --kfrom 160 --kto 480 --prior dev_F3.jsonl \\
+    python3 calib.py panels ... --noise-source adopted-bank.json --phase continue --cell all \\
+        --kfrom 160 --kto 480 --prior dev_F3.jsonl \\
         --out dev_F3_c.jsonl                                   (each quota cell's stream to its stopping point)
     python3 calib.py crit dev_HF.jsonl > crit_HF.json
     python3 calib.py accept --crit crit_HF.json val_HF.jsonl > acc_HF.json
     python3 calib.py gates --crit crit_HF.json --accept acc_HF.json --out gates.json
-    python3 calib.py panels --hyp H-T ... --gates gates.json ...; crit / accept / power likewise
+    python3 calib.py panels --hyp H-T ... --noise-source adopted-bank.json --gates gates.json ...
+        (crit / accept / power likewise)
     python3 calib.py bench --hyp H-F [--graph g.jsonl.gz] [--params p.json] [--panels 50]
     python3 calib.py report dev_*.jsonl val_*.jsonl > report.json       (proposals, clips, boundaries, CPU)
     python3 calib.py ledger cpu.jsonl [--add fitting 7200]               (the cumulative CPU against 240 h: D5)

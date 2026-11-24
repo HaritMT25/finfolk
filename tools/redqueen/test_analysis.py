@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import csv
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -47,6 +48,8 @@ class SyntheticScorer:
             k = 0 if kind == 'free' else 6
             cp = mk_cp(600, k, version=1 if kind == 'scripted' else 2)
             cp['config'].update(predatorBrain=kind != 'scripted', predatorEconomy=False)
+            # Valid synthetic start ages; mk_cp's increasing ages exceed maxAge for a 600-prey cohort.
+            cp['creatures']['age'] = [12.25] * 600
             self.arenas[kind] = cp
 
     def __call__(self, kind, captures, survivors):
@@ -69,7 +72,8 @@ class SyntheticScorer:
                              pursuit_frac=0.2, virtual_buds_interval=0) for t in range(500, 5001, 500)]
                 with p.open('w') as f:
                     w = csv.DictWriter(f, fieldnames=list(rows[0])); w.writeheader(); w.writerows(rows)
-            with patch.object(ckpt, 'load', side_effect=lambda p: arena if Path(p).name == 'arena.json' else end):
+            with patch.object(ckpt, 'load',
+                              side_effect=lambda p, check=True: arena if Path(p).name == 'arena.json' else end):
                 self.cache[key] = score.score(self.d, k, 5000, [5000], 500, 'frozen',
                                                fork=kind == 'free', scripted=kind == 'scripted')
         return copy.deepcopy(self.cache[key])
@@ -181,7 +185,7 @@ def fixture(d, shared_reference=False):
                     L = int(165 + (0.23 + block * 0.001) * ti) if q['world'].startswith('C') else 165
             sc = scorer(kind, C, L)
             if i % 2:
-                sc['horizons'][0]['age_strata'] = [{'initial': 600, 'survivors': L}]
+                sc['horizons'][0].pop('age_strata')  # Keep the real scorer's valid summary on the other half.
             files = {'common.json': sha(c['groups']['common']), 'common.manifest.json': sha(['manifest', c['groups']['common']])}
             sh = {'schema': cell.SHARING_SCHEMA, 'keys': c['groups'], 'seeds': c['seeds'],
                   'realized': {'common_sha256': files['common.json'],
@@ -268,7 +272,7 @@ class AnalysisTests(unittest.TestCase):
         self.assertEqual(r['eligibility']['Q200']['count'], 8)
         self.assertEqual(len(r['results']['H-T']['worlds']), 8)
         self.assertEqual(r['input_summary']['ignored'], {})
-        # Optional parallel-PR age_strata is present in half the real-shaped scores and absent in half.
+        # Optional age_strata is present in half the real-shaped scores and absent in half.
         bundles = analysis.load_packed(self.args['roots'], self.args['rows'])
         self.assertEqual({('age_strata' in b['score']['horizons'][0]) for b in bundles.values()}, {True, False})
         # Plan display aliases do not change the main-world identity or a shared reference's source.
@@ -541,11 +545,25 @@ class AnalysisTests(unittest.TestCase):
         with self.assertRaisesRegex(analysis.AnalysisError, 'production requires registered'):
             analysis.analyze(**dict(self.run_args, production=True))
 
+    def test_completed_analysis_reports_noise_source_sha256(self):
+        """Complete a synthetic analysis through report construction, including the adopted-source hash.
+        The separate load_packed stub test proves preflight ordering only."""
+        _, raw, fitted = d8_bank_and_params(calib)
+        args = calibrated(dict(self.args, params=fitted, noise_source_raw=raw), self.graphs)
+        report = analysis.analyze(**args)
+        expected = hashlib.sha256(raw).hexdigest()
+        self.assertEqual(report['input_provenance']['noise_source_sha256'], expected)
+        self.assertEqual(fitted['fit']['noise']['source_artifact_sha256'], expected)
+        self.assertFalse(report['production'])
+        self.assertEqual([row['hypothesis'] for row in report['rows']], list(stats.HYPOTHESES))
+        json.dumps(analysis.json_safe(report), allow_nan=False)
+
     def test_noise_source_is_checked_before_any_bundle(self):
         """#68 round 14 (pr68_engine_field_spec_v2, callers): a production analysis without the adopted bank
         artifact's bytes is refused; with them, calib.check_noise_source runs right after check_params and before
         any bundle is read (load_packed stubbed); a non-production run checks the bytes whenever given. Synthetic
-        bank and parameters only (test_calib.d8_bank_and_params)."""
+        bank and parameters only (test_calib.d8_bank_and_params). This proves preflight ordering only;
+        test_completed_analysis_reports_noise_source_sha256 covers the completed report's provenance."""
         bank, raw, fitted = d8_bank_and_params(calib)
         prod = dict(self.run_args, params=fitted, production=True, draws=stats.B_BOOT,
                     min_q200=stats.MIN_Q200, reps=calib.R_REP)
