@@ -1,0 +1,1667 @@
+#!/usr/bin/env python3
+"""test_calib.py: the Annex H calibration generator and harness (calib.py, H.9-H.12) on a small synthetic
+graph. Covers:
+  * whole H-F and H-T panels run, finite and deterministic;
+  * the q33 speed-ups equal their reference routes: the cached loading sparsity (Panel.cov) against the
+    direct construction, the amplitude solver's RMS (recurrence.ref_rms) against RefDesign.readout;
+  * the H-T analysis pairs worlds by id;
+  * #68 round 3: an H-T numerical failure fails the panel (never a non-rejection); gate artifacts bound to
+    their critical values, acceptance and manifests; a background above its target is clipped, never
+    accepted; a ceiling is a numerical failure; a failed alternative keeps its direction;
+  * the D2 strata (#68 round 4): a feasible panel enters B only inside the one-sided boundary window under
+    BOTH metrics (a final-metric failure is discarded), an unreached one goes to I (clipped, null-checked;
+    a non-member discarded), membership without scientific slack across all six H-T candidates, pooled
+    ordered streams per quota cell with the registered stopping point, crit = the maximum over strata, cap
+    exhaustion makes a mode unavailable, the audit's q-hats, the stratum set frozen at dev, the
+    unavailability adapters, the CPU ledger.
+numpy required (RQ_REQUIRE_NUMPY=1 makes a missing numpy a failure).
+
+    python3 -I tools/redqueen/test_calib.py [-v]
+"""
+from __future__ import annotations
+
+import json
+import math
+import os
+import sys
+import unittest
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+if os.environ.get("RQ_PYLIB"):
+    sys.path.insert(0, os.environ["RQ_PYLIB"])
+try:
+    import numpy as np  # noqa: E402
+except ImportError:
+    if os.environ.get("RQ_REQUIRE_NUMPY"):
+        raise SystemExit("RQ_REQUIRE_NUMPY is set, but numpy cannot be imported")
+    np = None
+
+
+def strip(rec):
+    return {k: v for k, v in rec.items() if not k.startswith("cpu")}
+
+
+def d8_bank_and_params(cb):
+    """#68 round 14 (pr68_engine_field_spec_v2; A_design_v5 2.8): a SYNTHETIC noisebank.bank/3 document (its
+    fields, invented values: never fitted to, nor read from, any bank) and the generator parameter set assembled
+    from it by the assembly contract: the bank's complete noise block and fit.noise (plus only
+    source_artifact_sha256), its noise likelihood and the seven shared fields copied verbatim, a synthetic mean fit
+    added, and the top-level engine_sha256 = fit.mean.engine_sha256 (the bank's executable differs on purpose).
+    -> (bank, bank_bytes, params)"""
+    import copy
+    m = cb.stats.material
+    ceiling = m.cohort_ceiling(m.registered_ages(), 5000, 0.016)
+    s_logit = {"C": {"x": [-2.0, 0.0, 1.5], "s": [0.6, 0.3, 0.25], "direction": "decreasing"},
+               "S": {"x": [0.0], "s": [0.2]}, "F": {"x": [-1.0, 2.0], "s": [0.2, 0.3]}}
+    bank = {"schema": "finfolk.redqueen.noisebank.bank/3", "status": "d8-fitted", "synthetic": False,
+            "cohort": m.registered_ages(), "cohort_sha256": m.AGES_SHA256, "horizon": 5000, "dt": 0.016,
+            "support_law": m.SUPPORT_LAW, "age_clock": m.age_clock_identity(), "survivor_ceiling": ceiling,
+            "fit": {"noise_likelihood": "600-rounded-capped-upper-infinity",
+                    "noise": {"implementation_sha256": "1" * 64, "inputs_sha256": "2" * 64,
+                              "receipt_sha256": "3" * 64, "engine_sha256": "c" * 64},
+                    "streams": {"bootstrap": {"generator": "rqlib.SplitMix64", "namespace": "AnnexH/D8/1"}}},
+            "noise": {"available": True, "s_logit": s_logit,
+                      "SigmaR": [[0.25, 0.05, 0.05], [0.05, 0.25, 0.15], [0.05, 0.15, 0.5]],
+                      "SigmaD": [[0.25, 0.05], [0.05, 0.25]], "SigmaE": [[0.5, 0.1], [0.1, 0.5]],
+                      "horizon": 5000, "capture_bound": 324, "survivor_ceiling": ceiling},
+            "map_variance": {"s_logit": s_logit, "nu0": {ch: {"status": "full_pooling"} for ch in "CSF"}},
+            "d8": {"ceilings": {"5000": ceiling, "10000": 0, "20000": 0}, "denominator": 600}}
+    raw = cb.rqlib.canonical(bank)
+    p = cb.placeholder_params()
+    p["fitted"] = True
+    for k in ("cohort", "cohort_sha256", "horizon", "dt", "support_law", "age_clock", "survivor_ceiling"):
+        p[k] = copy.deepcopy(bank[k])
+    p["noise"] = copy.deepcopy(bank["noise"])
+    p["fit"] = {"mean_head": "c_H*sigmoid(eta)", "noise_likelihood": bank["fit"]["noise_likelihood"],
+                "mean": {"implementation_sha256": "4" * 64, "inputs_sha256": "5" * 64, "receipt_sha256": "6" * 64,
+                         "engine_sha256": "b" * 64},
+                "noise": dict(copy.deepcopy(bank["fit"]["noise"]), source_artifact_sha256=cb.rqlib.sha256_bytes(raw))}
+    p["engine_sha256"] = p["fit"]["mean"]["engine_sha256"]
+    return bank, raw, p
+
+
+@unittest.skipIf(np is None, "numpy is not installed")
+class TestCalib(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        import calib
+        import recurrence
+        cls.cb, cls.rc = calib, recurrence
+        cls.graph = calib.synthetic_graph(n=4)
+        cls.params = calib.placeholder_params()
+
+    def test_hf_panel_runs_and_is_deterministic(self):
+        cb = self.cb
+        r1 = cb.run_panel(self.graph, self.params, "H-F", "dev", "actual", "F1", 0)
+        r2 = cb.run_panel(self.graph, self.params, "H-F", "dev", "actual", "F1", 0)
+        self.assertFalse(r1.get("error"), r1.get("error"))
+        self.assertTrue(math.isfinite(r1["score"]))
+        self.assertEqual(json.dumps(strip(r1), sort_keys=True, default=str),
+                         json.dumps(strip(r2), sort_keys=True, default=str))
+
+    def test_ht_panel_runs_and_is_deterministic(self):
+        cb = self.cb
+        g0 = {e: 0.0 for e in ("E1", "E2", "E3")}
+        r1 = cb.run_panel(self.graph, self.params, "H-T", "dev", "actual", "T1", 0, g0, draws=19)
+        r2 = cb.run_panel(list(reversed(self.graph)), self.params, "H-T", "dev", "actual", "T1", 0, g0, draws=19)
+        self.assertFalse(r1.get("error"), r1.get("error"))
+        self.assertTrue(r1["available"], r1)
+        self.assertGreaterEqual(r1["joint_rounds"], 1)                 # (the declared constraints verified)
+        self.assertEqual(json.dumps(strip(r1), sort_keys=True, default=str),
+                         json.dumps(strip(r2), sort_keys=True, default=str))
+
+    def test_structured_woodbury_end_to_end(self):
+        """#68 CPU lever L2 end to end: every world's full-history and epoch analysis (supports, selections,
+        phases, J, RMS) under the structured W-apply equals the pre-L2 dense Woodbury's (support and selection
+        decisions identical; values <= 1e-10 relative)."""
+        cb, rc = self.cb, self.rc
+
+        class OldCov(rc.Cov):
+            def subset(self, mask):
+                c = rc.Cov.subset(self, mask)
+                c.__class__ = OldCov
+                return c
+
+            def wmul(self, A):
+                A = np.asarray(A, float)
+                A2 = A.reshape(self.n, -1)
+                out = A2 * self.dinv[:, None]
+                if self.U is not None:
+                    DU = self.U * self.dinv[:, None]
+                    Kc = np.linalg.cholesky(np.eye(self.U.shape[1]) + self.U.T @ DU)
+                    Ki = np.linalg.solve(Kc.T, np.linalg.solve(Kc, np.eye(Kc.shape[0])))
+                    out = out - (DU @ ((Ki + Ki.T) / 2)) @ (self.U.T @ out)
+                return out.ravel() if A.ndim == 1 else out
+        pn = cb.Panel(self.graph, self.params, "H-F", "dev", "actual", "F1", 0).simulate()
+        for w in pn.worlds[:2]:
+            old = pn.scope_covs(w["graph"], pn.eval_means(w["graph"], w["m"], "full"))
+            for v in old.values():
+                v.__class__ = OldCov
+            for scope in ("full", "E2"):
+                a = rc.analyze_world(cb.Panel._world_design(w["graph"], old, scope), w["y"])
+                new = {k: rc.Cov(v.d, v.U) for k, v in old.items()}
+                b = rc.analyze_world(cb.Panel._world_design(w["graph"], new, scope), w["y"])
+                self.assertEqual(rc.select(a)[:1] + (rc.select(a)[2],), rc.select(b)[:1] + (rc.select(b)[2],))
+                for ra, rb in zip(a["periods"], b["periods"]):
+                    self.assertEqual((ra["supported"], ra["fails"]), (rb["supported"], rb["fails"]))
+                    for key in ("J_C", "J_Q", "r_C", "r_Q", "s"):
+                        if key in ra and math.isfinite(ra[key]):
+                            self.assertLessEqual(abs(ra[key] - rb[key]), 1e-10 * max(1.0, abs(ra[key])), (scope, key))
+            for v in old.values():
+                v.__class__ = rc.Cov
+
+    def test_cached_loadings_equal_the_direct_construction(self):
+        """Panel.cov through the cached sparsity equals the direct construction (the pre-q33 code)."""
+        cb, rc = self.cb, self.rc
+        pn = cb.Panel(self.graph, self.params, "H-F", "dev", "actual", "F0", 0)
+        wg = self.graph[0]
+        rng = np.random.default_rng(1)
+        m = {"C": rng.uniform(0.2, 0.6, len(wg.ti)), "S": rng.uniform(0.3, 0.8, len(wg.ti)),
+             "F": rng.uniform(0.5, 0.9, len(wg.prey))}
+        mr = {"C": rng.uniform(0.2, 0.6, len(wg.cT)), "S": rng.uniform(0.3, 0.8, len(wg.qT)), "F": m["F"]}
+        for kind, mm in (("C", m), ("Q", m), ("RC", mr), ("RQ", {"S": mr["S"], "F": m["F"]})):
+            got = pn.cov(wg, mm, kind)
+            want = direct_cov(pn, wg, mm, kind)
+            self.assertTrue(np.allclose(got.d, want.d, rtol=0, atol=0), kind)
+            self.assertTrue(np.allclose(got.U, want.U, rtol=0, atol=0), kind)
+
+    def test_amplitude_rms_equals_the_readout(self):
+        """recurrence.ref_rms (the amplitude solver's fast route) equals RefDesign.readout's rms and den."""
+        rc = self.rc
+        wg = self.graph[1]
+        rng = np.random.default_rng(2)
+        cov = rc.Cov(1e-4 * (1 + rng.random(len(wg.cT))), 3e-3 * rng.standard_normal((len(wg.cT), 2)))
+        y = 0.4 + 0.05 * np.cos(2 * math.pi * wg.cT / 12.0 - 0.3) + 0.01 * rng.standard_normal(len(wg.cT))
+        for scope in ("full", "E2"):
+            rd = rc.RefDesign(wg.cT, wg.cR, cov, scope, (12.0,))
+            out = rd.readout(y, 12.0)
+            rms, den = rc.ref_rms(wg.cT, wg.cR, cov, scope, 12.0, y)
+            self.assertAlmostEqual(rms, out["rms"], delta=1e-12 * max(1.0, out["rms"]))
+            self.assertAlmostEqual(den, out["den"], delta=1e-14)
+
+
+class TestGenerator(unittest.TestCase):
+    """#68 round 2: the bounded observation model, the OU red variation, the parameters, the cell
+    covariance, the verified joint solve."""
+
+    @classmethod
+    def setUpClass(cls):
+        import calib
+        cls.cb = calib
+
+    def test_erfc(self):
+        xs = np.linspace(-9, 30, 20001)
+        ref = np.array([math.erfc(x) for x in xs])
+        rel = np.abs(self.cb.erfc(xs) - ref) / np.maximum(ref, 1e-300)
+        self.assertLess(float(rel.max()), 1e-11)
+
+    def test_location_exact_over_the_full_range(self):
+        """E[K/N](a(mu)) = mu (verified interpolation) INCLUDING means below 0.5/N and above 1 - 0.5/N; two
+        different saturated means keep different locations (no clipping)."""
+        cb = self.cb
+        for N, s in ((600, 0.3), (324, 0.8), (600, 0.2)):
+            mus = np.array([1e-6, 2e-5, 0.4 / N, 0.6 / N, 0.01, 0.35, 0.5, 0.97, 1 - 0.3 / N, 1 - 1e-6])
+            a = cb.location(mus, np.full(len(mus), s), N)
+            back = cb.expected_fraction(a, s, N)
+            self.assertTrue(np.all(np.abs(back - mus) <= 3 * cb.LOC_TOL), (N, s, back - mus))
+            self.assertTrue(np.all(np.diff(a) > 0))
+            self.assertLessEqual(cb.location_table(s, N)[2], cb.LOC_TOL)
+        # the old Gauss-Hermite / clipping route would give these two the same location
+        a = cb.location(np.array([1e-5, 1e-4]), np.array([0.3, 0.3]), 600)
+        self.assertLess(a[0], a[1])
+        for bad in (0.0, 1.0, float("nan")):
+            with self.assertRaises(cb.CalibError):
+                cb.location(np.array([bad]), np.array([0.3]), 600)
+
+    def test_d4_production_requires_the_bank_curve(self):
+        """Codex r8 P2-1: production parameters need validated monotone s_logit curves for C, S and F (the
+        blended bins only for synthetic / comparison runs); noise_scale evaluates them through noisescale (the
+        evaluator the bank's V builder shares); malformed curves are refused anywhere."""
+        cb = self.cb
+        p = cb.placeholder_params()
+        p["fitted"] = True
+        p.update(cohort=cb.stats.material.registered_ages(), cohort_sha256=cb.stats.material.AGES_SHA256,
+                 support_law=cb.stats.material.SUPPORT_LAW, age_clock=cb.stats.material.age_clock_identity(),
+                 survivor_ceiling=247, engine_sha256="b" * 64, fit={"mean_head": "c_H*sigmoid(eta)",
+                    "noise_likelihood": "600-rounded-capped-upper-infinity",
+                    **{kind: {k: "a" * 64 for k in ("implementation_sha256", "inputs_sha256", "receipt_sha256")}
+                       for kind in ("mean", "noise")}})
+        # (#68 round 14, engine-field spec v2: each fit's executable; the noise fit's source artifact; the top-level
+        # engine is the production assay engine = fit.mean.engine_sha256, the noise fit's may differ)
+        p["fit"]["mean"]["engine_sha256"] = p["engine_sha256"]
+        p["fit"]["noise"].update(engine_sha256="c" * 64, source_artifact_sha256="d" * 64)
+        with self.assertRaises(cb.CalibError):
+            cb.check_params(p, production=True)                    # (bins only)
+        cb.check_params(p)                                         # (fine for a synthetic run)
+        good = {"C": {"x": [-2.0, 0.0, 1.5], "s": [0.6, 0.3, 0.25], "direction": "decreasing"},
+                "S": {"x": [0.0], "s": [0.2]}, "F": {"x": [-1.0, 2.0], "s": [0.2, 0.3]}}
+        p["noise"]["s_logit"] = good
+        cb.check_params(p, production=True)
+        for key in ("cohort", "cohort_sha256", "horizon", "dt", "support_law", "age_clock", "engine_sha256", "survivor_ceiling", "fit"):
+            legacy = dict(p); legacy.pop(key)
+            with self.assertRaisesRegex(cb.CalibError, 'D8.*provenance'):
+                cb.check_params(legacy, production=True)
+        import copy
+        for key, value in (("support_law", "pre-D8"), ("survivor_ceiling", 600), ("age_clock", {})):
+            with self.assertRaises(cb.CalibError):
+                cb.check_params(dict(p, **{key: value}), production=True)
+        for key in ("mean_head", "noise_likelihood", "mean", "noise"):
+            legacy = copy.deepcopy(p); legacy["fit"].pop(key)
+            with self.assertRaises(cb.CalibError):
+                cb.check_params(legacy, production=True)
+        # (#68 round 14, spec v2 test 2: the engine-field convention and the noise block's cross-field checks)
+        for kind, key, why in (("mean", "engine_sha256", "receipt and engine sha256 identities"),
+                               ("noise", "engine_sha256", "receipt and engine sha256 identities"),
+                               ("noise", "source_artifact_sha256", "the bank artifact it was copied from")):
+            with self.subTest(missing=f"fit.{kind}.{key}"):
+                q = copy.deepcopy(p); q["fit"][kind].pop(key)
+                with self.assertRaisesRegex(cb.CalibError, why):
+                    cb.check_params(q, production=True)
+            with self.subTest(malformed=f"fit.{kind}.{key}"):
+                q = copy.deepcopy(p); q["fit"][kind][key] = "B" * 64
+                with self.assertRaisesRegex(cb.CalibError, why):
+                    cb.check_params(q, production=True)
+        with self.subTest(top_level_engine="differs from fit.mean.engine_sha256"):
+            q = copy.deepcopy(p); q["engine_sha256"] = q["fit"]["noise"]["engine_sha256"]   # (overwritten by the noise's)
+            with self.assertRaisesRegex(cb.CalibError, "must equal fit.mean.engine_sha256"):
+                cb.check_params(q, production=True)
+        with self.subTest(noise_engine="a different fit.noise.engine_sha256 is accepted"):
+            q = copy.deepcopy(p); q["fit"]["noise"]["engine_sha256"] = "e" * 64
+            self.assertNotEqual(q["fit"]["noise"]["engine_sha256"], q["engine_sha256"])
+            cb.check_params(q, production=True)
+        consistent = dict(horizon=5000, survivor_ceiling=247, capture_bound=p["capture_bound"], available=True)
+        with self.subTest(noise_block="consistent copied keys are accepted"):
+            q = copy.deepcopy(p); q["noise"].update(consistent)
+            cb.check_params(q, production=True)
+        for key, value, why in (("horizon", 10000, "noise.horizon 10000 differs from horizon 5000"),
+                                ("survivor_ceiling", 246, "noise.survivor_ceiling 246 differs from survivor_ceiling 247"),
+                                ("capture_bound", 323, "noise.capture_bound 323 differs from capture_bound 324"),
+                                ("available", False, "the noise block is marked unavailable")):
+            for production in (True, False):
+                with self.subTest(noise_key=key, value=value, production=production):
+                    q = copy.deepcopy(p); q["noise"].update(consistent); q["noise"][key] = value
+                    with self.assertRaisesRegex(cb.CalibError, why):
+                        cb.check_params(q, production=production)
+        mu = np.array([1e-6, 0.1, 0.5, 0.7, 0.99])
+        self.assertEqual(cb.noise_scale(p, "C", mu).tobytes(), cb.noisescale.evaluate(good["C"], mu).tobytes())
+        self.assertTrue(np.all(np.diff(cb.noise_scale(p, "C", mu)) <= 0))
+        self.assertEqual(float(cb.noise_scale(p, "C", np.array([1e-9]))[0]), 0.6)      # (constant beyond)
+        bad = [{"x": [0.0, 0.0], "s": [0.3, 0.2]}, {"x": [1.0, 0.0], "s": [0.3, 0.2]},
+               {"x": [0.0, 1.0, 2.0], "s": [0.3, 0.2, 0.3]}, {"x": [0.0], "s": [0.0]},
+               {"x": [0.0, float("nan")], "s": [0.3, 0.2]}, {"x": [0.0, 1.0], "s": [0.3]},
+               {"x": [0.0, 1.0], "s": [0.2, 0.3], "direction": "decreasing"}, {"x": [], "s": []}, [0.3]]
+        for b in bad:
+            p["noise"]["s_logit"] = dict(good, S=b)
+            with self.assertRaises(cb.CalibError):
+                cb.check_params(p)
+        p["noise"]["s_logit"] = {"C": good["C"], "S": good["S"]}
+        with self.assertRaises(cb.CalibError):
+            cb.check_params(p)                                     # (F missing)
+        self.assertEqual(len(cb.solver_identity()["m0_basis"]), 64)
+
+    def test_legacy_fit_rejected_without_D8_provenance(self):
+        p = self.cb.placeholder_params()
+        p['fitted'] = True
+        p.pop('cohort')
+        p['noise']['s_logit'] = {ch: {'x': [0.], 's': [.2]} for ch in 'CSF'}
+        with self.assertRaises(self.cb.CalibError):
+            self.cb.check_params(p, production=True)
+
+    def test_check_noise_source(self):
+        """#68 round 14 (pr68_engine_field_spec_v2 test 3; A_design_v5 2.8 / T5-4): parameters assembled from a
+        SYNTHETIC noisebank.bank/3 document pass check_params(production=True) and check_noise_source; every
+        assembly defect is refused by check_noise_source with the comparison that caught it (the complete
+        canonical noise block, the complete fit.noise but its one added key, the likelihood, the seven shared
+        fields, the bank's bytes, schema, status and synthetic flag)."""
+        import copy
+        import json as js
+        cb = self.cb
+        bank, raw, p = d8_bank_and_params(cb)
+        with self.subTest(case="assembled parameters pass both checks"):
+            self.assertNotEqual(p["fit"]["noise"]["engine_sha256"], p["engine_sha256"])
+            cb.check_params(copy.deepcopy(p), production=True)
+            self.assertIs(cb.check_noise_source(p, raw), p)
+
+        def rebank(**changes):           # a different bank document, the parameters re-pointed at its bytes
+            b = copy.deepcopy(bank); b.update(changes)
+            r = cb.rqlib.canonical(b)
+            q = copy.deepcopy(p); q["fit"]["noise"]["source_artifact_sha256"] = cb.rqlib.sha256_bytes(r)
+            return q, r
+
+        def edit(fn):                    # the same bank bytes, one assembly defect in the parameters
+            q = copy.deepcopy(p); fn(q)
+            return q, raw
+
+        def setp(path, value):
+            def fn(q):
+                d = q
+                for k in path[:-1]:
+                    d = d[k]
+                d[path[-1]] = value
+            return fn
+
+        def sigma_d(q):
+            q["noise"]["SigmaD"][0][1] = q["noise"]["SigmaD"][1][0] = 0.06
+        bad_noise = "the noise block is not the bank artifact's, verbatim"
+        bad_fit = r"fit.noise is not the bank artifact's \(only source_artifact_sha256 may be added\)"
+        cases = [
+            ("wrong bytes: one byte appended", (p, raw + b" "), "bytes are not the ones named by fit.noise"),
+            ("wrong bytes: the same document re-encoded", (p, js.dumps(bank, indent=1).encode()),
+             "bytes are not the ones named by fit.noise"),
+            ("wrong bytes: another bank", (p, cb.rqlib.canonical(dict(bank, horizons={}))),
+             "bytes are not the ones named by fit.noise"),
+            ("synthetic: true", rebank(synthetic=True), "not an adopted, non-synthetic noisebank.bank/3"),
+            ("status: unavailable", rebank(status="unavailable"), "not an adopted, non-synthetic noisebank.bank/3"),
+            ("schema bank/2", rebank(schema="finfolk.redqueen.noisebank.bank/2"), "not an adopted, non-synthetic"),
+            ("a changed SigmaD entry", edit(sigma_d), bad_noise),
+            ("a changed noise.horizon", edit(setp(("noise", "horizon"), 10000)), bad_noise),
+            ("a changed noise.capture_bound", edit(setp(("noise", "capture_bound"), 323)), bad_noise),
+            ("a changed noise.survivor_ceiling", edit(setp(("noise", "survivor_ceiling"), 246)), bad_noise),
+            ("noise.available false", edit(setp(("noise", "available"), False)), bad_noise),
+            ("an extra key in noise", edit(setp(("noise", "s"), {"C": [0.5] * 3, "S": [0.3] * 3, "F": [0.3] * 3})),
+             bad_noise),
+            ("a key missing from noise", edit(lambda q: q["noise"].pop("capture_bound")), bad_noise),
+            ("a changed s_logit knot", edit(setp(("noise", "s_logit", "F", "s"), [0.2, 0.31])), bad_noise),
+            ("a changed fit.noise.engine_sha256", edit(setp(("fit", "noise", "engine_sha256"), "e" * 64)), bad_fit),
+            ("a changed fit.noise.receipt_sha256", edit(setp(("fit", "noise", "receipt_sha256"), "e" * 64)), bad_fit),
+            ("an extra key in fit.noise", edit(setp(("fit", "noise", "note"), "assembled")), bad_fit),
+            ("a key missing from fit.noise", edit(lambda q: q["fit"]["noise"].pop("inputs_sha256")), bad_fit),
+            ("a changed noise_likelihood", edit(setp(("fit", "noise_likelihood"), "600-rounded")),
+             "noise_likelihood differs from the bank artifact"),
+            ("a changed age_clock", edit(setp(("age_clock", "helper_sha256"), "0" * 64)),
+             "age_clock differs from the bank artifact"),
+            ("a changed cohort_sha256", edit(setp(("cohort_sha256",), "0" * 64)), "cohort_sha256 differs"),
+            ("a changed cohort", edit(setp(("cohort", "assembled"), True)), "cohort differs"),
+            ("a changed top-level horizon", edit(setp(("horizon",), 10000)), "horizon differs from the bank"),
+            ("a changed dt", edit(setp(("dt",), 0.017)), "dt differs from the bank"),
+            ("a changed support_law", edit(setp(("support_law",), "D8/old")), "support_law differs"),
+            ("a changed top-level survivor_ceiling", edit(setp(("survivor_ceiling",), 246)),
+             "survivor_ceiling differs from the bank"),
+        ]
+        for name, (q, r), why in cases:
+            with self.subTest(case=name):
+                with self.assertRaisesRegex(cb.CalibError, f"noise source: .*{why}"):
+                    cb.check_noise_source(q, r)
+        # (the check_params half of T5-4 on the same assembly: the engine fields and the copied block's own keys)
+        for name, fn, why in (("top-level engine overwritten by the bank's", lambda q: q.update(
+                                  engine_sha256=q["fit"]["noise"]["engine_sha256"]), "must equal fit.mean.engine_sha256"),
+                              ("source_artifact_sha256 removed", lambda q: q["fit"]["noise"].pop("source_artifact_sha256"),
+                               "the bank artifact it was copied from"),
+                              ("noise.horizon 10000", setp(("noise", "horizon"), 10000), "noise.horizon 10000 differs"),
+                              ("noise.available false", setp(("noise", "available"), False), "marked unavailable")):
+            with self.subTest(check_params=name):
+                q, _ = edit(fn)
+                with self.assertRaisesRegex(cb.CalibError, why):
+                    cb.check_params(q, production=True)
+        with self.subTest(case="the bank's extra fields (streams, map_variance, d8) are not part of the copy"):
+            self.assertNotIn("streams", p["fit"])
+            self.assertNotIn("map_variance", p)
+
+    def test_production_panels_check_the_noise_source(self):
+        """#68 round 14 (spec v2, callers): production panels refuse to start without --noise-source, run
+        check_noise_source on its bytes right after check_params and before any panel, and a smoke run checks the
+        bytes whenever given (the graph and the parameters stubbed; manifest() stands for the first panel step)."""
+        import copy
+        import io
+        import shutil
+        import tempfile
+        from contextlib import redirect_stderr
+        from unittest import mock
+        cb = self.cb
+        bank, raw, p = d8_bank_and_params(cb)
+
+        class Reached(Exception):
+            pass
+        tmp = tempfile.mkdtemp()
+        try:
+            good, other = os.path.join(tmp, "bank.json"), os.path.join(tmp, "other.json")
+            with open(good, "wb") as f:
+                f.write(raw)
+            with open(other, "wb") as f:
+                f.write(cb.rqlib.canonical(dict(bank, synthetic=True)))
+            out = os.path.join(tmp, "panels.jsonl")
+            argv = ["panels", "--hyp", "H-F", "--stage", "dev", "--mode", "F0", "--stratum", "actual", "--out", out]
+            prod = argv + ["--eligibility", os.path.join(tmp, "eligibility.json")]
+            with mock.patch.object(cb, "get_graph", return_value=(cb.synthetic_graph(n=4), "file:stub")), \
+                    mock.patch.object(cb, "get_params", side_effect=lambda a: copy.deepcopy(p)), \
+                    mock.patch.object(cb, "manifest", side_effect=Reached) as man:
+                for args, why in ((prod, "production panels need --noise-source"),
+                                  (prod + ["--noise-source", other], "noise source: the bank artifact bytes"),
+                                  (argv + ["--smoke", "--noise-source", other], "noise source: the bank artifact bytes")):
+                    with self.subTest(args=args[len(argv):]):
+                        err = io.StringIO()
+                        with redirect_stderr(err):
+                            rc = cb.main(args)
+                        self.assertEqual(rc, 2)
+                        self.assertIn(why, err.getvalue())
+                self.assertEqual(man.call_count, 0)
+                with self.assertRaises(Reached):
+                    cb.main(prod + ["--noise-source", good])
+                self.assertEqual(man.call_count, 1)
+            self.assertFalse(os.path.exists(out))
+        finally:
+            shutil.rmtree(tmp)
+
+    def test_report_streams_label_names_the_d8_namespace(self):
+        """#68 round 14 (Codex, round-13 review note): report()'s stream rule names the namespace the panels'
+        seeds actually use (CALIBRATION_NAMESPACE = AnnexH/D8/1, D8 rule 51), not the pre-D8 AnnexH/1."""
+        import hashlib
+        cb = self.cb
+        label = cb.report([])["rules"]["streams"]
+        self.assertEqual(cb.CALIBRATION_NAMESPACE, "AnnexH/D8/1")
+        self.assertTrue(label.startswith("audit: the slot's original AnnexH/D8/1/<hyp>/<stage>:"), label)
+        self.assertNotIn("AnnexH/1/", label)
+        pan = cb.Panel(cb.synthetic_graph(n=4), cb.placeholder_params(), "H-F", "dev", "actual", "F1", 3)
+        seed = int.from_bytes(hashlib.sha256(b"AnnexH/D8/1/H-F/dev:actual/F1/3/noise").digest()[:8], "little")
+        self.assertEqual(pan.rng("noise").normals(4).tobytes(), cb.VecSplitMix64(seed).normals(4).tobytes())
+
+    def test_d4_grid_table_cache(self):
+        """The D4 warm-up fix: the grid tables and cell checks are built once and, with TABLE_CACHE, stored and
+        reloaded BITWISE (no rebuild: expected_fraction is never called on a warm cache); a damaged entry is a
+        CalibError; warm_tables covers the parameter set's whole s range."""
+        import tempfile
+        cb = self.cb
+        mus = np.array([0.003, 0.2, 0.5, 0.9])
+        ss = np.array([0.2125, 0.31, 0.3125, 0.4])
+        saved = (cb.TABLE_CACHE, dict(cb._GRID), dict(cb._SCELL))
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                cb.TABLE_CACHE = d
+                cb._GRID.clear()
+                cb._SCELL.clear()
+                a1 = cb.location(mus, ss, 600)
+                files = sorted(os.listdir(d))
+                self.assertTrue(any(f.startswith("loc-") for f in files) and any(f.startswith("cell-") for f in files))
+                cb._GRID.clear()
+                cb._SCELL.clear()
+                ef = cb.expected_fraction
+                cb.expected_fraction = None                      # (a rebuild would crash)
+                try:
+                    a2 = cb.location(mus, ss, 600)
+                finally:
+                    cb.expected_fraction = ef
+                self.assertEqual(a1.tobytes(), a2.tobytes())
+                cb.TABLE_CACHE = None
+                cb._GRID.clear()
+                cb._SCELL.clear()
+                self.assertEqual(cb.location(mus, ss, 600).tobytes(), a1.tobytes())   # (no cache: the same bits)
+                cb.TABLE_CACHE = d
+                cb._GRID.clear()
+                cb._SCELL.clear()
+                locs = sorted(f for f in files if f.startswith("loc-"))
+                cells = sorted(f for f in files if f.startswith("cell-"))
+                saved_files = {}
+                for f_ in locs + cells:
+                    with open(os.path.join(d, f_), "rb") as fh:
+                        saved_files[f_] = fh.read()
+                # (r9 P3: an entry copied under another name is refused)
+                with open(os.path.join(d, locs[1]), "wb") as f:
+                    f.write(saved_files[locs[0]])
+                with self.assertRaises(cb.CalibError):
+                    cb.location(mus, ss, 600)
+                with open(os.path.join(d, locs[1]), "wb") as f:
+                    f.write(saved_files[locs[1]])
+                # (r9 P3: a cell verification names its endpoint tables' content)
+                cb._GRID.clear()
+                cb._SCELL.clear()
+                with np.load(os.path.join(d, cells[0])) as z:
+                    arrs = {n: z[n] for n in z.files}
+                arrs["ends"] = np.array(["0" * 64, "0" * 64])
+                del arrs["sha256"]
+                with open(os.path.join(d, cells[0]), "wb") as f:
+                    np.savez(f, sha256=np.array(cb._arrays_sha(arrs)), **arrs)
+                with self.assertRaises(cb.CalibError):
+                    cb.location(mus, ss, 600)
+                with open(os.path.join(d, cells[0]), "wb") as f:
+                    f.write(saved_files[cells[0]])
+                cb._GRID.clear()
+                cb._SCELL.clear()
+                self.assertEqual(cb.location(mus, ss, 600).tobytes(), a1.tobytes())
+                cb._GRID.clear()
+                bad = os.path.join(d, locs[0])
+                with np.load(bad) as z:
+                    arrs = {n: z[n] for n in z.files}
+                arrs["f"] = arrs["f"] + 1e-15
+                with open(bad, "wb") as f:
+                    np.savez(f, **arrs)
+                with self.assertRaises(cb.CalibError):
+                    cb.location(mus, ss, 600)
+            cb._GRID.clear()
+            cb._SCELL.clear()
+            cb.TABLE_CACHE = None
+            ns, sb = cb.noise_scale, cb.s_bounds                 # (a narrow s range: a fast test)
+            cb.noise_scale = lambda p, ch, mu, stress=False, extra=1.0: np.where(mu < 0.5, 0.2, 0.2 + 0.006 * extra)
+            cb.s_bounds = lambda p, ch, stress=False, extra=1.0: (math.inf, -math.inf)    # (the sample alone here)
+            try:
+                span = cb.warm_tables(cb.placeholder_params())
+            finally:
+                cb.noise_scale, cb.s_bounds = ns, sb
+            self.assertEqual(span, {int(cb.placeholder_params()["capture_bound"]): [40, 41], cb.TRIALS: [40, 41]})
+            self.assertTrue(all((k, N) in cb._SCELL for N in span for k in (40, 41)))
+            # (r9 P3: a curve whose extreme lies at a knot beyond logit +-16 is covered)
+            pk = cb.placeholder_params()
+            pk["noise"]["s_logit"] = {ch: {"x": [-20.0, 0.0], "s": [0.3, 0.2]} for ch in "CSF"}
+            cb.noise_scale = lambda p, ch, mu, stress=False, extra=1.0: np.where(mu < cb.sig(-18.0), 0.2 + 0.006, 0.2)
+            cb.s_bounds = lambda p, ch, stress=False, extra=1.0: (math.inf, -math.inf)
+            try:
+                span2 = cb.warm_tables(pk, extras=(1.0,))
+            finally:
+                cb.noise_scale, cb.s_bounds = ns, sb
+            self.assertEqual(span2[cb.TRIALS], [40, 41])
+        finally:
+            cb.TABLE_CACHE = saved[0]
+            cb._GRID.clear()
+            cb._GRID.update(saved[1])
+            cb._SCELL.clear()
+            cb._SCELL.update(saved[2])
+
+    def test_s_spans_cover_the_serialized_values(self):
+        """#68 r10 P3: the pre-build range comes from the SERIALIZED scale values too, so no sampling of mu (through
+        sigmoid and inverse logit) can hide an extreme. Codex's counterexample x = [19.99999999, 20.0], s = [0.2,
+        0.8]: every s the REAL evaluator returns (noise_scale -> noisescale.evaluate), at representable means up to
+        1, unstressed and under validation stress, at both extras, lies within s_spans; the upper plateau times
+        stress and extra is covered; the registered bins' bounds are their convex blends."""
+        cb = self.cb
+        p = cb.placeholder_params()
+        p["noise"]["s_logit"] = {ch: {"x": [19.99999999, 20.0], "s": [0.2, 0.8]} for ch in "CSF"}
+        sp = cb.s_spans(p)
+        mu = np.concatenate([cb.sig(np.linspace(-40.0, 40.0, 8001)), [0.5, np.nextafter(1.0, 0.0), 1.0 - 1e-12]])
+        for ch, n in (("C", int(p["capture_bound"])), ("S", cb.TRIALS), ("F", cb.TRIALS)):
+            for stress in (False, True):
+                for extra in (1.0, 1.5):
+                    s = cb.noise_scale(p, ch, mu, stress, extra)
+                    self.assertTrue(sp[n][0] <= float(s.min()) and float(s.max()) <= sp[n][1], (ch, stress, extra))
+        self.assertGreaterEqual(sp[cb.TRIALS][1], 0.8 * 1.5 * 1.5 - 1e-12)          # (the plateau, stress x extra)
+        for (ch, stress, extra), want in ((("S", True, 1.5), (0.45, 1.8)), (("C", True, 1.0), (0.35, 1.2)),
+                                          (("F", False, 1.0), (0.2, 0.8))):
+            got = cb.s_bounds(p, ch, stress, extra)
+            self.assertAlmostEqual(got[0], want[0], places=12)
+            self.assertAlmostEqual(got[1], want[1], places=12)
+        q = cb.placeholder_params()                                               # (the registered bins)
+        self.assertEqual(cb.s_bounds(q, "C"), (0.20, 0.55))
+        lo, hi = cb.s_bounds(q, "C", True)
+        self.assertAlmostEqual(lo, 0.35, places=12)
+        self.assertAlmostEqual(hi, 0.825, places=12)
+
+    def test_eligible_graph(self):
+        """Annex H D6 §§9.1-9.4 (#68 eligibility; Codex #68 D6 P2-3 / P3 and r2 P2-3): H-F / H-T calibrate on the
+        ACTUAL qualifying C graph: the graph restricted to the hypothesis's population under stats.eligibility's
+        record, only when the DISPATCHER made that hypothesis available (its own flag: a pending repair refuses even
+        with |Q200| >= 24; below 24 refused, no smaller-n substitute), only on the graph the record's bound mask
+        names (its graph.edges_sha256 and namespace; the meta beside it those edges', its intensive worlds
+        graph.splits'), and only when every population world carries its REQUIRED panels: the coarse 41 x 41
+        within grid, the registered FINE within pairs (the fine windows' offsets, an intensive world's complete
+        window grids, the lag probe; a coarse-only within panel is refused), four RQ and four RP series at every
+        graph time 0..200M; the source binds both files; the stress24 stratum comes from it; a production
+        calibration needs that binding, and production panel generation refuses a missing --eligibility before
+        any panel."""
+        import gzip
+        import hashlib
+        import io
+        import shutil
+        import tempfile
+        from contextlib import redirect_stderr
+        import graph as graphlib
+        import stats
+        cb = self.cb
+        # registered_fine against graph.py's design counts (each window 21 times: 133 offset pairs, 441 grid
+        # pairs, 5 / 25 of them coarse; the lag probe 78 per non-intensive world, graph.py's own count)
+        self.assertEqual(len(cb.registered_fine(False, None)), 3 * (133 - 5))
+        self.assertEqual(len(cb.registered_fine(False, 7)), 3 * (133 - 5) + 78)
+        self.assertEqual(len(cb.registered_fine(True, 7)), 3 * (441 - 25))
+        tmp = tempfile.mkdtemp()
+        try:
+            gp = os.path.join(tmp, "graph.jsonl.gz")
+            ns = "rq-test-graph"
+            # (the registered 64-world layout, the only one graph.splits accepts: 8 blocks x 4 C, 2 A, 2 B)
+            reg = ([{"id": f"C{k:02d}", "treatment": "C", "block": k // 4 + 1} for k in range(32)]
+                   + [{"id": f"{t}{k:02d}", "treatment": t, "block": k // 2 + 1} for t in "AB" for k in range(16)])
+            intensive = graphlib.splits(ns, reg)[2]
+            plain = [w["id"] for w in reg if w["treatment"] == "C" and w["id"] not in intensive]
+            broken = {"noRQ": plain[-1], "rp": plain[-2], "coarse": plain[-3], "coarse_only": plain[-4],
+                      "lag": plain[-5], "intensive": intensive[-1]}
+            good = [w["id"] for w in reg if w["treatment"] == "C" and w["id"] not in broken.values()][:24]
+            self.assertTrue(set(good) & set(intensive))          # (an intensive world among the accepted)
+            coarse, times = range(0, 201, 5), range(201)
+
+            def gi(x):
+                return 0 if x < 1 else int(x)
+            lines = []
+            for w in good + sorted(broken.values()):              # (graph.py's design: integer graph times)
+                pairs = {(a, b) for a in coarse for b in coarse} - ({(0, 200)} if w == broken["coarse"] else set())
+                if w != broken["coarse_only"]:                   # (Codex's case: a coarse-only within panel)
+                    pairs |= {(gi(a), gi(b)) for a, b in cb.registered_fine(w in intensive, 7)}
+                pairs -= {(5, 12)} if w == broken["lag"] else {(1, 20)} if w == broken["intensive"] else set()
+                lines += [{"prey": f"Q:{w}:{a}", "pred": f"P:{w}:{b}"} for a, b in sorted(pairs)]
+                if w != broken["noRQ"]:
+                    lines += [{"prey": f"RQ:{r}", "pred": f"P:{w}:{t}"} for r in range(4) for t in times]
+                lines += [{"prey": f"Q:{w}:{t}", "pred": f"RP:{r}"} for r in range(4, 8) for t in times
+                          if not (w == broken["rp"] and (r, t) == (5, 137))]
+            text = "".join(json.dumps(e) + "\n" for e in lines)
+            with gzip.open(gp, "wt") as f:
+                f.write(text)
+            edges = hashlib.sha256(text.encode()).hexdigest()
+            meta = {"namespace": ns, "worlds": reg, "intensive": intensive, "lag_probe": 7, "edges_sha256": edges}
+            mp = os.path.join(tmp, "graph.meta.json")
+
+            def put_meta(**kw):
+                with open(mp, "w") as f:
+                    json.dump(dict(meta, **kw), f)
+            put_meta()
+
+            def elig(q, avail=True, reason=None, hyp="H-F", mask=edges, namespace=ns):
+                p = os.path.join(tmp, f"e{len(q)}{int(avail)}{hyp}{len(os.listdir(tmp))}.json")
+                h = {"population": "Q200", "worlds": q, "available": avail, "reason": reason}
+                with open(p, "w") as f:
+                    json.dump({"schema": stats.ELIGIBILITY_SCHEMA, "Q200": {"worlds": q, "count": len(q),
+                                                                            "available": len(q) >= 24},
+                               "mask": None if mask is None else {"sha256": "m" * 64, "graph_edges_sha256": mask,
+                                                                  "graph_namespace": namespace},
+                               "hypotheses": {hyp: h}}, f)
+                return p
+            g, src = cb.eligible_graph(gp, elig(good), "H-F")
+            self.assertEqual([x.id for x in g], sorted(good))
+            self.assertEqual([cb.panel_problems(x, x.id in intensive, 7) for x in g], [[]] * 24)
+            self.assertTrue(src.startswith("file:") and "+eligibility:" in src)
+            self.assertEqual(len(cb.stratum_worlds(g, "stress24")), 24)
+            self.assertEqual(len(cb.eligible_graph(gp, elig(good, hyp="H-T"), "H-T")[0]), 24)
+            with self.assertRaisesRegex(cb.CalibError, "H-F is unavailable.*23 < 24"):
+                cb.eligible_graph(gp, elig(good[:23], False, "|Q200| = 23 < 24"), "H-F")
+            with self.assertRaisesRegex(cb.CalibError, "H-F is unavailable.*pending repair"):
+                cb.eligible_graph(gp, elig(good, False, "technical gaps: pending repair"), "H-F")   # (|Q200| 24)
+            with self.assertRaisesRegex(cb.CalibError, "H-T is unavailable"):
+                cb.eligible_graph(gp, elig(good), "H-T")                       # (the record has no H-T entry)
+            for m in ("0" * 64, None):
+                with self.assertRaisesRegex(cb.CalibError, "bound mask is not this graph's"):
+                    cb.eligible_graph(gp, elig(good, mask=m), "H-F")
+            with self.assertRaisesRegex(cb.CalibError, "meta is not these edges'"):
+                cb.eligible_graph(gp, elig(good, namespace="another"), "H-F")
+            for kw, why in (({"intensive": intensive[:-1]}, "intensive worlds are not its registered design"),
+                            ({"edges_sha256": "0" * 64}, "meta is not these edges'")):
+                put_meta(**kw)
+                with self.assertRaisesRegex(cb.CalibError, why):
+                    cb.eligible_graph(gp, elig(good), "H-F")
+            os.remove(mp)
+            with self.assertRaisesRegex(cb.CalibError, "meta .* is unreadable"):
+                cb.eligible_graph(gp, elig(good), "H-F")
+            put_meta()
+            for k, why in (("noRQ", "without their complete fixed panels"), ("rp", "RP:5 misses 1 graph time"),
+                           ("coarse", "coarse 41 x 41"),
+                           ("coarse_only", f"fine within-world panel misses {3 * 128 + 78} registered pair"),
+                           ("lag", "fine within-world panel misses 1 registered pair.*5M -> 12M"),
+                           ("intensive", "intensive fine within-world panel misses 1 registered pair.*1M -> 20M")):
+                with self.assertRaisesRegex(cb.CalibError, why):
+                    cb.eligible_graph(gp, elig(good[:23] + [broken[k]]), "H-F")
+            probs = []
+            cb._manifest([{"manifest": dict(self.man_fixture(), graph_source="file:x")}], True, probs)
+            self.assertTrue(probs and "restricted to the common Q200" in probs[0])
+            out = os.path.join(tmp, "panels.jsonl")
+            err = io.StringIO()
+            with redirect_stderr(err):                           # (P3: refused before the graph, any panel)
+                rc = cb.main(["panels", "--hyp", "H-F", "--graph", gp, "--stage", "dev", "--mode", "F0",
+                              "--stratum", "actual", "--out", out])
+            self.assertEqual(rc, 2)
+            self.assertIn("production panels need --eligibility", err.getvalue())
+            self.assertFalse(os.path.exists(out))
+        finally:
+            shutil.rmtree(tmp)
+
+    @staticmethod
+    def man_fixture():
+        import calib
+        return {"graph_sha256": "g", "graph_source": "file:x+eligibility:y", "params_sha256": "p", "params_fitted": True,
+                "tools_sha256": "t", "draws": 9999, "gates_sha256": None, "production": True,
+                   "material_spec_sha256": calib.doc_sha(calib.stats.material.specification()),
+                   "calibration_stream_namespace": "AnnexH/D8/1"}
+
+    def test_ou_red_variation(self):
+        """Codex's counterexample rho = (0, .98) is refused, and so is rho = (.05, .98) with innovations
+        correlated .95 (no PSD diffusion); valid parameters give PSD transition covariances at every gap."""
+        cb = self.cb
+        p = cb.placeholder_params()
+        bad = [([0.0, 0.98, 0.7, 0.7, 0.7], None), ([0.05, 0.98, 0.7, 0.7, 0.7], 0.95)]
+        for rho, c in bad:
+            q = json.loads(json.dumps(p))
+            q["ar"]["rho"] = rho
+            if c is not None:
+                S = np.eye(5)
+                S[0, 1] = S[1, 0] = c
+                q["ar"]["Sigma"] = S.tolist()
+            with self.assertRaises(cb.CalibError):
+                cb.check_params(q)
+        S = cb.shrunk(p["ar"]["Sigma"])
+        rho = np.array([0.2, 0.5, 0.7, 0.9, 0.98])
+        q = json.loads(json.dumps(p))
+        q["ar"]["rho"] = rho.tolist()
+        cb.check_params(q)
+        _, Q, G = cb.ou_matrices(rho, S)
+        rr = np.outer(rho, rho)
+        for D in (0.01, 0.2, 1.0, 3.7, 40.0):
+            self.assertGreater(np.min(np.linalg.eigvalsh(G * (1 - rr ** D))), -1e-14)
+        t = np.array([1e-6, 1.0, 2.0, 5.0, 9.0, 10.0, 31.0, 100.0])
+        x = cb.ar_paths(t, rho, p["ar"]["Sigma"], 5.0, np.random.default_rng(1).standard_normal((len(t), 5)))
+        self.assertTrue(np.all(np.isfinite(x)))
+
+    def test_parameters(self):
+        cb = self.cb
+        p = cb.placeholder_params()
+        cb.check_params(p)
+        with self.assertRaises(cb.CalibError):
+            cb.check_params(p, production=True)                      # (not fitted)
+        q = json.loads(json.dumps(p))
+        del q["noise"]["SigmaE"]
+        with self.assertRaises(cb.CalibError):
+            cb.check_params(q)
+        q = json.loads(json.dumps(p))
+        q["noise"]["SigmaE"][0][0] = 0.4                               # (row + donor + cell != 1)
+        with self.assertRaises(cb.CalibError):
+            cb.check_params(q)
+
+    def test_cell_covariance(self):
+        """The capture and exposed-survival cell components of one assay cell are drawn jointly
+        (SigmaE's cross-channel correlation)."""
+        cb = self.cb
+        p = cb.placeholder_params()
+        p["noise"]["SigmaE"] = [[0.5, 0.4], [0.4, 0.5]]
+        LE = np.linalg.cholesky(np.asarray(p["noise"]["SigmaE"]))
+        z = cb.VecSplitMix64(5).normals(40000 * 2).reshape(-1, 2) @ LE.T
+        self.assertAlmostEqual(float(np.corrcoef(z.T)[0, 1]), 0.8, delta=0.02)
+        g = cb.synthetic_graph(4)
+        r = cb.run_panel(g, p, "H-F", "dev", "actual", "F0", 0)
+        self.assertFalse(r.get("error"), r.get("error"))
+
+    def test_verified_constraints(self):
+        """The completed noise-free panel meets its declared directional slopes (T2: 1.5 delta with
+        recurrence) and a perturbed declaration is caught."""
+        cb = self.cb
+        g = cb.synthetic_graph(4)
+        pn = cb.Panel(g, cb.placeholder_params(), "H-T", "dev", "actual", "T2", 0).simulate()
+        self.assertTrue(all(v["ok"] for v in pn.verified))
+        miss = {(x["world"], x["scope"], x["readout"]) for x in pn.unattainable}
+        checked = 0
+        for v in pn.verified:
+            for k, b in v["dir"].items():
+                e, nm = k.split("/")
+                if (v["world"], e, nm) in miss:
+                    continue
+                want = {"beta_P": 1.5 * cb.stats.DELTA_P, "beta_Q": 1.5 * cb.stats.DELTA_Q}[nm]
+                self.assertAlmostEqual(b, want, delta=cb.DIR_TOL)
+                checked += 1
+        self.assertGreater(checked, 0)
+
+
+def rec(hyp, stage, mode, stratum, panel, man, **kw):
+    r = {"hyp": hyp, "stage": stage, "mode": mode, "stratum": stratum, "panel": panel, "manifest": man,
+         "available": True, "score": 0.0, "role": "B", "eligible": "B", "status": "feasible", "member": True,
+         "stream": None}
+    if stage in ("dev", "val"):
+        import calib
+        n = {"dev": calib.N_DEV, "val": calib.N_VAL}[stage]
+        c = calib.quota_cell(hyp, mode, panel)
+        r.update(cell=c, k=calib.cells_of(hyp, mode, n)[c].index(panel))
+    if hyp == "H-F":
+        r.update(M=0.5, R_C=0.05, R_Q=0.02, material_point=False, S_e={e: 0.0 for e in ("E1", "E2", "E3")},
+                 S_e_available={e: True for e in ("E1", "E2", "E3")})
+    r.update(kw)
+    return r
+
+
+class TestHarness(unittest.TestCase):
+    """#68 round 2 P1-1, P1-3, P2-4: complete allocations, independent acceptance of the frozen rules,
+    failures and manifests, the frozen epoch gates."""
+
+    @classmethod
+    def setUpClass(cls):
+        import calib
+        cls.cb = calib
+        cls.man = {"graph_sha256": "g", "graph_source": "file:x+eligibility:y", "params_sha256": "p", "params_fitted": True,
+                   "tools_sha256": "t", "draws": 9999, "gates_sha256": None, "production": True,
+                   "material_spec_sha256": calib.doc_sha(calib.stats.material.specification()),
+                   "calibration_stream_namespace": "AnnexH/D8/1"}
+
+    def allocation(self, hyp, stage, n, score=lambda m, s, k: 0.001 * k, man=None, **kw):
+        cb = self.cb
+        return [rec(hyp, stage, m, s, k, man or self.man, score=score(m, s, k), **kw)
+                for m, s in cb.strata_of(hyp) for k in range(n)]
+
+    def test_completeness_failures_and_manifests(self):
+        cb = self.cb
+        dev = self.allocation("H-F", "dev", cb.N_DEV)
+        crit = cb.critical_values(dev)
+        self.assertAlmostEqual(crit["c_F"], 0.159)
+        for bad in (dev[:-1],                                                  # (a panel missing)
+                    [r for r in dev if not (r["mode"] == "F4" and r["stratum"] == "stress24")],   # (a stratum)
+                    dev + [dict(dev[0])],                                      # (a duplicate)
+                    [dict(r, error="CalibError: x") if i == 7 else r for i, r in enumerate(dev)],  # (a failure)
+                    [dict(r, manifest=dict(self.man, params_sha256="q")) if i == 3 else r for i, r in enumerate(dev)],
+                    [dict(r, manifest=dict(self.man, production=False)) for r in dev]):
+            with self.assertRaises(cb.CalibError):
+                cb.critical_values(bad)
+        cb.critical_values([dict(r, manifest=dict(self.man, production=False)) for r in dev], production=False)
+
+    def test_acceptance_is_independent_and_can_fail(self):
+        """Every validation panel above the frozen c_F: 1,000 false positives per rate -> FAIL (a panel is
+        never judged against a table containing itself); below it -> pass; unavailable panels cannot
+        reject; the validation manifest must equal the development one."""
+        cb = self.cb
+        crit = cb.critical_values(self.allocation("H-F", "dev", cb.N_DEV))
+        hi = cb.acceptance(self.allocation("H-F", "val", cb.N_VAL, score=lambda m, s, k: 5.0), crit)
+        self.assertEqual(hi["rates"]["H-F"]["detection|F0|actual|B"]["fp"], 1000)
+        self.assertFalse(hi["pass"]["H-F detection"])
+        lo = cb.acceptance(self.allocation("H-F", "val", cb.N_VAL, score=lambda m, s, k: 0.0), crit)
+        self.assertTrue(lo["pass"]["H-F detection"] and lo["pass"]["H-F material"])
+        self.assertTrue(all(lo["pass"][f"gate {e}"] for e in ("E1", "E2", "E3")))
+        self.assertEqual(len(lo["ptables"]["H-F detection"]["F0|actual|B"]), 1000)
+        self.assertEqual(lo["crit_sha256"], cb.doc_sha(crit))
+        # 12 false positives pass, 13 fail (the frozen rule, exactly counted)
+        def sc(n):
+            return lambda m, s, k: (5.0 if (m == "F1" and s == "actual" and k < n) else 0.0)
+        self.assertTrue(cb.acceptance(self.allocation("H-F", "val", cb.N_VAL, score=sc(12)), crit)["pass"]["H-F detection"])
+        self.assertFalse(cb.acceptance(self.allocation("H-F", "val", cb.N_VAL, score=sc(13)), crit)["pass"]["H-F detection"])
+        un = self.allocation("H-F", "val", cb.N_VAL, score=lambda m, s, k: 5.0, available=False)
+        self.assertEqual(cb.acceptance(un, crit)["rates"]["H-F"]["detection|F0|actual|B"]["fp"], 0)
+        with self.assertRaises(cb.CalibError):                   # (1,000 FAILED panels never pass)
+            cb.acceptance([dict(r, error="x") for r in self.allocation("H-F", "val", cb.N_VAL)], crit)
+        with self.assertRaises(cb.CalibError):
+            cb.acceptance(self.allocation("H-F", "val", cb.N_VAL, man=dict(self.man, graph_sha256="other")), crit)
+        with self.assertRaises(cb.CalibError):
+            cb.acceptance(self.allocation("H-F", "val", 160), crit)              # (an incomplete allocation)
+        # the nested material claim needs detection, the material points and both thresholds
+        mat = self.allocation("H-F", "val", cb.N_VAL, score=lambda m, s, k: 5.0 if m == "F3" else 0.0,
+                              M=9.0, R_C=0.2, R_Q=0.1, material_point=True)
+        acc = cb.acceptance(mat, crit)
+        self.assertEqual(acc["rates"]["H-F"]["material|F3|actual|B"]["fp"], 1000)
+        self.assertEqual(acc["rates"]["H-F"]["material|F4|actual|B"]["fp"], 0)
+
+    def test_frozen_gates(self):
+        """H-T needs every epoch gate with a passing validation; a failed gate refuses the freeze; ht()
+        without a gate is unavailable."""
+        cb = self.cb
+        crit = cb.critical_values(self.allocation("H-F", "dev", cb.N_DEV))
+        acc = cb.acceptance(self.allocation("H-F", "val", cb.N_VAL, score=lambda m, s, k: 0.0), crit)
+        art = cb.freeze_gates(crit, acc)
+        self.assertEqual(cb.check_gates(art)["c_E"], crit["c_E"])
+        bad = self.allocation("H-F", "val", cb.N_VAL, score=lambda m, s, k: 0.0)
+        bad = [dict(r, S_e=dict(r["S_e"], E2=9.0)) if r["mode"] == "F0" else r for r in bad]
+        with self.assertRaises(cb.CalibError):
+            cb.freeze_gates(crit, cb.acceptance(bad, crit))
+        with self.assertRaises(cb.CalibError):
+            cb.check_gates(dict(art, passed=dict(art["passed"], E3=False)))
+
+    def test_gates_bound_to_their_artifacts(self):
+        """#68 round 3 P2: acceptance names the critical artifact it evaluated; a gate freeze from another
+        artifact's acceptance, a tampered rate, an unbound artifact or a consumer on another graph /
+        parameters / code / draws is refused."""
+        cb = self.cb
+        dev = self.allocation("H-F", "dev", cb.N_DEV)
+        crit = cb.critical_values(dev)
+        crit2 = cb.critical_values(self.allocation("H-F", "dev", cb.N_DEV, score=lambda m, s, k: 0.002 * k))
+        acc2 = cb.acceptance(self.allocation("H-F", "val", cb.N_VAL, score=lambda m, s, k: 0.0), crit2)
+        with self.assertRaises(cb.CalibError):
+            cb.freeze_gates(crit, acc2)                                     # (another crit's acceptance)
+        art = cb.freeze_gates(crit2, acc2)
+        self.assertEqual(art["crit_sha256"], cb.doc_sha(crit2))
+        cb.check_gates(art, self.man, production=True)
+        with self.assertRaises(cb.CalibError):
+            cb.check_gates(art, dict(self.man, params_sha256="other"))     # (gates from other parameters)
+        with self.assertRaises(cb.CalibError):
+            cb.check_gates(art, dict(self.man, tools_sha256="other"))      # (other code)
+        bad = json.loads(json.dumps(art))
+        bad["rates"]["gate_E2|F1|actual|B"]["fp"] = 40                     # (a tampered count: U95 > 0.02)
+        with self.assertRaises(cb.CalibError):
+            cb.check_gates(bad)
+        with self.assertRaises(cb.CalibError):
+            cb.check_gates({k: v for k, v in art.items() if k != "accept_sha256"})
+
+    def alt_allocation(self, hyp="H-T", **kw):
+        cb = self.cb
+        out = []
+        for m in cb.ALT[hyp]:
+            for s_ in cb.STRATA:
+                for k in range(cb.N_ALT):
+                    r = rec(hyp, "alt", m, s_, k, self.man, score=9.0, role="alt", **kw)
+                    if hyp == "H-T":
+                        r["direction"] = "ARD->FSD" if k % 2 == 0 else "FSD->ARD"
+                    out.append(r)
+        return out
+
+    def test_power_and_non_success(self):
+        """The registered alternative allocation (incomplete refused); a non-success and a FAILED
+        alternative count in the denominator of their direction (#68 round 3 P2: 49/50, not 49/49)."""
+        cb = self.cb
+        crit = {"c_F": 1.0, "c_M": 1.0, "c_T": 7.0, "manifest": {"H-T": dict(self.man, gates_sha256=None)}}
+        alt = self.alt_allocation()
+        alt[0]["non_success"] = True                                       # (TA1 actual panel 0: forward)
+        alt[2] = {k: v for k, v in alt[2].items() if k not in ("score", "direction")}
+        alt[2].update(error="CalibError: x", available=False)               # (TA1 actual panel 2: forward, failed)
+        alt[2]["direction"] = "ARD->FSD"
+        pw = cb.power(alt, crit)["H-T|TA1|actual"]
+        self.assertEqual((pw["n"], pw["success"]["rejection"], pw["non_success"], pw["failed"]), (100, 98, 1, 1))
+        self.assertEqual(pw["by_direction"]["ARD->FSD"], {"n": 50, "success": 48, "wilson95": cb.wilson(48, 50)})
+        self.assertEqual(pw["by_direction"]["FSD->ARD"]["n"], 50)
+        with self.assertRaises(cb.CalibError):
+            cb.power(alt[:-1], crit)                                         # (an incomplete allocation)
+        with self.assertRaises(cb.CalibError):
+            cb.power(alt, dict(crit, manifest={"H-T": dict(self.man, graph_sha256="other")}))
+
+    def test_failed_alternative_keeps_its_direction(self):
+        cb = self.cb
+        orig = cb.Panel.triage
+
+        def boom(self_):
+            raise cb.CalibError("a forced generator failure")
+        cb.Panel.triage = boom
+        try:
+            r = cb.run_panel(cb.synthetic_graph(4), cb.placeholder_params(), "H-T", "alt", "actual", "TA1", 1,
+                             {e: 0.0 for e in ("E1", "E2", "E3")}, draws=19)
+        finally:
+            cb.Panel.triage = orig
+        self.assertEqual((r["direction"], r["role"]), ("FSD->ARD", "failed"))
+
+
+class TestRound3(unittest.TestCase):
+    """#68 rounds 3-4: numerical failures are never non-rejections or unreached; a background above its
+    target is clipped (unreached), never accepted as an overshoot."""
+
+    @classmethod
+    def setUpClass(cls):
+        import calib
+        cls.cb = calib
+        cls.graph = calib.synthetic_graph(4)
+        cls.params = calib.placeholder_params()
+
+    def test_ht_numerical_failure_fails_the_panel(self):
+        cb = self.cb
+        orig = cb.transition.ht
+
+        def failing(*a, **k):
+            return {"available": False, "reject": False, "T_T": None, "error": "a nonfinite window mean",
+                    "failure": "numerical", "winner": None, "phase_support": {}, "EU_unsupported": {}}
+        cb.transition.ht = failing
+        try:
+            r = cb.run_panel(self.graph, self.params, "H-T", "dev", "actual", "T3", 0,
+                             {e: 0.0 for e in ("E1", "E2", "E3")}, draws=19, cell="all", k=0)
+        finally:
+            cb.transition.ht = orig
+        self.assertEqual(r["role"], "failed")
+        self.assertIn("numerical failure", r["error"])
+        self.assertFalse(r["available"])
+        self.assertNotIn("score", r)
+
+    def with_rms(self, fn, mode="F1", panel=0):
+        cb = self.cb
+        orig = cb.Panel.rms_of
+
+        def rms_of(self_, wg, th, pl, u, amp, scope, h, dirC, dirQ):
+            return fn(amp.get(scope, (0.0, 0.0))[h], h)
+        cb.Panel.rms_of = rms_of
+        try:
+            return cb.run_panel(self.graph, self.params, "H-F", "dev", "actual", mode, panel, cell="lvl0", k=0)
+        finally:
+            cb.Panel.rms_of = orig
+
+    def test_background_above_target_is_clipped(self):
+        """A background RMS above the target at every amplitude of the registered search: UNREACHED, clipped to
+        the attained minimum (recorded with its shortfall), never accepted as the target."""
+        r = self.with_rms(lambda a, h: 0.2)
+        self.assertEqual((r["status"], r["role"]), ("unreached", "I"))
+        c = r["clips"][0]
+        self.assertEqual((c["kind"], c["readout"], c["target"]), ("unreached-below", "C", 0.10))
+        self.assertAlmostEqual(c["nearest"], 0.2)
+        self.assertAlmostEqual(c["shortfall"], 0.1)
+
+    def test_unreached_is_neither_infeasible_nor_failed(self):
+        """#68 round 4 P2-4: a target above the maximum attained on the registered search ([0, A_SUP]) is
+        UNREACHED (an honest class, kept in I), whatever larger amplitudes might do; a nonfinite solver value
+        is a NUMERICAL failure, which blocks the allocation and stays out of every q-hat."""
+        cb = self.cb
+        r = self.with_rms(lambda a, h: 0.001 * a)
+        self.assertEqual((r["status"], r["eligible"], r["role"]), ("unreached", "I", "I"))
+        self.assertTrue(all(c["kind"] == "unreached-above" and abs(c["nearest"] - 0.001 * cb.A_SUP) < 1e-12
+                            for c in r["clips"]))
+        bad = self.with_rms(lambda a, h: math.nan)
+        self.assertEqual((bad["role"], bad["status"]), ("failed", "failed"))
+        a = cb.audit_classes([r, dict(r, eligible="B", role="B", status="feasible"), bad])
+        self.assertEqual((a["n"], a["classes"]["I_eligible"], a["classes"]["B"], a["classes"]["failed"]), (2, 1, 1, 1))
+
+    def test_capture_slope_fallback(self):
+        """#68 repair: when the coupled capture secant does not converge (forced here: DIR_STEPS = 1), each epoch
+        is solved alone on KNOB_GRID with the safeguarded root; the completed panel still verifies its slopes."""
+        cb = self.cb
+        old = cb.DIR_STEPS
+        cb.DIR_STEPS = 1
+        try:
+            pn = cb.Panel(self.graph, self.params, "H-T", "dev", "actual", "T0", 0).triage()
+        finally:
+            cb.DIR_STEPS = old
+        self.assertTrue(all(v["ok"] for v in pn.verified))
+        for v in pn.verified:
+            for e in ("E1", "E2", "E3"):
+                self.assertAlmostEqual(v["dir"][f"{e}/beta_P"], 1.5 * cb.stats.DELTA_P, delta=cb.DIR_TOL)
+
+    def test_knob_stays_in_its_domain(self):
+        """#68 round 5 P2-1: a survival-slope root just outside the registered knob domain (8.2 > KNOB_MAX = 8) with
+        a warm start at 7.5: the walk never evaluates beyond 8, the grid search finds no bracket, and the target is
+        UNREACHED at a knob inside the domain (never an accepted root at 8.2)."""
+        cb = self.cb
+        pn = cb.Panel(self.graph, self.params, "H-T", "dev", "actual", "T0", 0)
+        pn.member = lambda: {"member": True, "by": "test"}
+        pn.triage()
+        w = pn.worlds[0]
+        th, u, dirC, dirQ = w["_ctx"]
+        seen = []
+        mid = {"E1": (10.0, 40.0), "E2": (85.0, 115.0), "E3": (160.0, 190.0)}
+
+        def fake(wg, th_, pl, u_, dC, dQ, only=None, which="PQ", amp=None):
+            out = {}
+            for e in ([only] if only else cb.transition.EPOCHS):
+                t1, t2 = mid[e]
+                kq = (dQ(t2) - dQ(t1)) / (t2 - t1) * 50.0
+                seen.append(kq)
+                out[e] = (pl["dir"][e][0], pl["dir"][e][1] + 0.1 * (kq - 8.2))
+            return out
+        pn.noiseless_betas = fake
+        pn.unattainable = []
+        E = cb.transition.EPOCHS
+        _, _, (bC, bQ) = pn.solve_dir(w["graph"], th, w["plan"], u, {}, ({e: 0.0 for e in E}, {e: 7.5 for e in E}))
+        self.assertTrue(all(abs(k) <= cb.KNOB_MAX + 1e-9 for k in seen), max(seen))
+        self.assertTrue(all(abs(v) <= cb.KNOB_MAX for v in bQ.values()))
+        un = [x for x in pn.unattainable if x["readout"] == "beta_Q"]
+        self.assertEqual(len(un), 3)
+        self.assertTrue(all(x["kind"] == "unreached-above" and abs(x["knob"]) <= cb.KNOB_MAX for x in un))
+
+    def test_structural_membership(self):
+        """C2 (Codex round 5): T0-T3 membership from the completed, verified slopes alone (no functionals),
+        with its witness: T1 pins beta_P[a] (scaled <= DIR_TOL / delta_P), T0 pins delta_P - beta_P[f] (about
+        -0.5)."""
+        cb = self.cb
+        orig = cb.Panel.functionals
+        cb.Panel.functionals = lambda self_, final=False: (_ for _ in ()).throw(AssertionError("functionals called"))
+        try:
+            p1 = cb.Panel(self.graph, self.params, "H-T", "dev", "actual", "T1", 0).triage()
+            p0 = cb.Panel(self.graph, self.params, "H-T", "dev", "actual", "T0", 1).triage()
+        finally:
+            cb.Panel.functionals = orig
+        for pn, pin, lim in ((p1, "beta_P[a]", cb.DIR_TOL / cb.stats.DELTA_P), (p0, "dP-beta_P[f]", -0.5 + cb.DIR_TOL / cb.stats.DELTA_P)):
+            m = pn.membership
+            self.assertEqual((m["by"], m["member"]), ("structural", True))
+            self.assertEqual(len(m["witness"]), 6)
+            self.assertLessEqual(m["strongest_margin"], lim + 1e-12)
+            self.assertLess(m["bound"], cb.TAU_NUM)
+            self.assertTrue(all(v["scaled"] <= lim + 1e-12 for v in m["witness"].values()))
+            self.assertTrue(set(v["margin"] for v in m["witness"].values()) <= set(cb.MARGIN_NAMES))
+
+    def test_solver_identity_in_the_manifest(self):
+        """C3: the registered solver settings (the frozen-metric lambda included) are bound into every manifest
+        and compared across artifacts (IDENT)."""
+        cb = self.cb
+        man = cb.manifest(self.graph, self.params, 19)
+        self.assertEqual(man["solver"]["lambda_frozen_metric"], cb.LAMBDA_FROZEN_METRIC)
+        self.assertEqual(man["solver_sha256"], cb.doc_sha(cb.solver_identity()))
+        self.assertIn("solver_sha256", cb.IDENT)
+
+    def test_tools_hash_covers_the_registration_checks(self):
+        """Codex #68 D6 r3 P2: calibration executes graph.py's WINDOWS / OFFSETS / splits() to authorize production
+        inputs, so graph.py is part of tools_sha256 (the manifest's calibration identity) and its bytes change it."""
+        import shutil
+        import tempfile
+        cb = self.cb
+        self.assertIn("graph.py", cb.TOOLS)
+        for mod in (cb.graphlib, cb.stats, cb.backbone, cb.recurrence, cb.transition, cb.noisescale):
+            self.assertIn(os.path.basename(mod.__file__), cb.TOOLS, mod.__name__)
+        base = cb.tools_sha()
+        self.assertEqual(cb.manifest(self.graph, self.params, 19)["tools_sha256"], base)
+        with tempfile.TemporaryDirectory() as d:
+            for f in cb.TOOLS:
+                dest = os.path.join(d, f)
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                shutil.copy(os.path.join(cb.HERE, f), dest)
+            here, cb.HERE = cb.HERE, d
+            try:
+                self.assertEqual(cb.tools_sha(), base)
+                with open(os.path.join(d, "graph.py"), "ab") as fh:
+                    fh.write(b"\n# a changed registration check\n")
+                self.assertNotEqual(cb.tools_sha(), base)
+            finally:
+                cb.HERE = here
+
+    def test_verify_enforces_the_declared_tolerance(self):
+        """The completed noise-free panel must meet each declared RMS target to AMP_TOL on both sides."""
+        cb = self.cb
+        pn = cb.Panel(self.graph, self.params, "H-F", "dev", "actual", "F1", 0).triage()
+        self.assertTrue(all(v["ok"] for v in pn.verified))
+        for v in pn.verified:
+            for k, x in v["rms"].items():
+                self.assertLessEqual(abs(x - 0.10), cb.AMP_TOL * 0.10 + 1e-12, k)
+
+    def test_unavailability_adapters(self):
+        """#68 round 4 P3: an unavailable critical value never reaches a numeric comparison: hf_decision and
+        ht() return unavailable (p = 1 in Holm), decision_inputs reports it."""
+        cb = self.cb
+        res = {"available": True, "S_F": 9.0, "material_point": True, "M_F": 2.0, "R_C": 0.2, "R_Q": 0.1}
+        d = cb.recurrence.hf_decision(res, None, p_F=0.001)
+        self.assertFalse(d["available"])
+        ok = {"pass": {"H-F detection": True, "H-F material": True, "H-T": True}}
+        inp = cb.decision_inputs({"manifest": {"H-F": {}, "H-T": {}}, "c_F": None, "c_M": 1.0, "c_T": 7.0}, ok)
+        self.assertEqual((inp["H-F detection"]["available"], inp["H-F material"]["available"], inp["H-T"]["available"]),
+                         (False, False, True))
+        # (#68 round 5 P3: an F3-only cap leaves detection available)
+        inp = cb.decision_inputs({"manifest": {"H-F": {}}, "c_F": 1.0, "c_M": None},
+                                 {"pass": {"H-F detection": True, "H-F material": False}})
+        self.assertEqual((inp["H-F detection"]["available"], inp["H-F material"]["available"]), (True, False))
+
+
+class TestStrata(unittest.TestCase):
+    """The D2 ruling with Codex round 4: proposals, triage, the enforced boundary, the B / I strata from
+    pooled per-cell streams, crit = the maximum over strata, membership, cap exhaustion, the audit, the
+    frozen stratum set, the CPU ledger."""
+
+    @classmethod
+    def setUpClass(cls):
+        import calib
+        cls.cb = calib
+        cls.graph = calib.synthetic_graph(4)
+        cls.params = calib.placeholder_params()
+        cls.man = {"graph_sha256": "g", "graph_source": "file:x+eligibility:y", "params_sha256": "p", "params_fitted": True,
+                   "tools_sha256": "t", "draws": 9999, "gates_sha256": None, "production": True,
+                   "material_spec_sha256": calib.doc_sha(calib.stats.material.specification()),
+                   "calibration_stream_namespace": "AnnexH/D8/1"}
+
+    def run_(self, mode, slot, **kw):
+        cb = self.cb
+        c = cb.quota_cell("H-F", mode, slot)
+        # These boundary-geometry fixtures were constructed on this fixed synthetic stream.
+        # Preserve their jump / smooth-bracket geometry when the production stream version changes.
+        # The unpatched D8 stream and stage separation are independently tested in test_material.
+        from unittest.mock import patch
+        def fixture_rng(panel, purpose):
+            return cb.VecSplitMix64(cb.stats.stream_seed(*panel.tag, purpose, namespace="AnnexH/1"))
+        with patch.object(cb.Panel, "rng", fixture_rng):
+            return cb.run_panel(self.graph, self.params, "H-F", "dev", "actual", mode, slot, cell=c,
+                                k=cb.cells_of("H-F", mode, cb.N_DEV)[c].index(slot), **kw)
+
+    def test_feasible_panel_goes_to_B_and_is_verified(self):
+        """F4 slot 0: the panel multiplier lambda puts the noise-free FUNCTIONAL E_Q in the one-sided window
+        [d_Q^2 (1 - LAMBDA_TOL), d_Q^2]; the final-metric check passes too (ok REQUIRED); the panel is B."""
+        cb = self.cb
+        self.assertFalse(cb.LAMBDA_FROZEN_METRIC)                            # (the registered value: OFF)
+        r = self.run_("F4", 0)
+        self.assertFalse(r.get("error"), r.get("error"))
+        self.assertEqual((r["status"], r["eligible"], r["role"], r["member"]), ("feasible", "B", "B", True))
+        bs = r["boundary_solve"]
+        self.assertEqual(bs["outcome"], "feasible")
+        self.assertTrue(-cb.LAMBDA_TOL * cb.D_Q ** 2 <= bs["functional"] - cb.D_Q ** 2 <= 0.0)
+        nb, fb = r["membership"]["boundary"], r["boundary_final"]
+        self.assertTrue(nb["ok"])
+        self.assertEqual(fb["metric"], "final")
+        self.assertLessEqual(abs(fb["residual"]), 0.03)                     # (D4: the metric-induced change, reported)
+        self.assertTrue(math.isfinite(r["score"]))
+        self.assertIn("full/Q", r["targets"])
+
+    def test_design_cache_and_frozen_metric_lambda(self):
+        """#68 CPU levers: (a) a world's final-metric design is built once and shared by the analysis and the
+        final-metric boundary check (the identical covariance: exact); (c) with LAMBDA_FROZEN_METRIC the lambda
+        iterates are proposed on a frozen metric but ACCEPTED only by the true one (the same window)."""
+        cb = self.cb
+        pn = cb.Panel(self.graph, self.params, "H-F", "dev", "actual", "F4", 0).simulate()
+        w = pn.worlds[0]
+        d1 = pn.design(w, "full")
+        self.assertIs(pn.design(w, "full"), d1)
+        fresh = cb.Panel._world_design(w["graph"], pn.scope_covs(w["graph"], pn.eval_means(w["graph"], w["m"], "full")),
+                                       "full")
+        a, b = cb.recurrence.analyze_world(d1, w["y"]), cb.recurrence.analyze_world(fresh, w["y"])
+        self.assertEqual(json.dumps(a, default=str, sort_keys=True), json.dumps(b, default=str, sort_keys=True))
+        self.assertIs(pn.design_nf(w, "full"), pn.design_nf(w, "full"))
+        old = cb.LAMBDA_FROZEN_METRIC
+        try:
+            cb.LAMBDA_FROZEN_METRIC = False
+            off = self.run_("F4", 0)
+            cb.LAMBDA_FROZEN_METRIC = True
+            on = self.run_("F4", 0)
+        finally:
+            cb.LAMBDA_FROZEN_METRIC = old
+        for r in (off, on):
+            bs = r["boundary_solve"]
+            self.assertEqual(bs["outcome"], "feasible")
+            self.assertTrue(-cb.LAMBDA_TOL * cb.D_Q ** 2 <= bs["functional"] - cb.D_Q ** 2 <= 0.0)   # (the TRUE metric)
+        self.assertIsNone(off["boundary_solve"]["frozen"])
+        self.assertGreater(on["boundary_solve"]["frozen"]["evals"], 0)
+        self.assertLessEqual(on["boundary_solve"]["evals"], off["boundary_solve"]["evals"])
+        self.assertEqual(on["role"], off["role"])
+
+    def test_design_cache_guard(self):
+        """#68 round 6 P3: a cached design carries its covariance version, graph and periods; a lookup after the
+        covariance changed raises (a stale design is impossible); observe resets the final-metric cache."""
+        cb = self.cb
+        pn = cb.Panel(self.graph, self.params, "H-F", "dev", "actual", "F1", 0).simulate()
+        w = pn.worlds[0]
+        pn.design(w, "full")
+        w["_cov_ver"] += 1000
+        with self.assertRaises(cb.CalibError):
+            pn.design(w, "full")
+        pn.observe_all()
+        self.assertIsNotNone(pn.design(w, "full"))
+        d = pn.design_nf(w, "E2")
+        self.assertIs(pn.design_nf(w, "E2"), d)
+        w["_cov_nf_ver"] += 1000
+        with self.assertRaises(cb.CalibError):
+            pn.design_nf(w, "E2")
+
+    def test_lambda_bracket_handoff(self):
+        """The frozen-metric proposals hand their first TRUE bracket to the true safeguarded solver: the
+        classification equals the pure true-metric search's, the accepted functional lies in the same true
+        window, and the handoff never takes more true evaluations than the pure search."""
+        cb = self.cb
+        old = cb.LAMBDA_FROZEN_METRIC
+        out = {}
+        try:
+            for flag in (False, True):
+                cb.LAMBDA_FROZEN_METRIC = flag
+                out[flag] = [self.run_(m, k) for m, k in (("F3", 0), ("F3", 1), ("F4", 0), ("F4", 1))]
+        finally:
+            cb.LAMBDA_FROZEN_METRIC = old
+        for a, b in zip(out[False], out[True]):
+            self.assertEqual((a["status"], a.get("eligible")), (b["status"], b.get("eligible")))
+            for r in (a, b):
+                bs = r["boundary_solve"]
+                if bs["outcome"] == "feasible":
+                    self.assertTrue(-cb.BOUNDARY_TOL <= bs["residual"] <= 0.0)
+            self.assertLessEqual(b["boundary_solve"]["evals"], a["boundary_solve"]["evals"] + 1)
+
+    def test_final_metric_is_reported_never_gating(self):
+        """The coordinator's ruling (2026-11-08): the final-metric value is REPORTED as the estimator distortion,
+        never a discard; under D4 (V at the null-fit means, a smooth s) the distortion on the 4-world fixture's
+        boundary panels is at most 3% (it was about -10% with the raw-means metric on F3 slot 1)."""
+        cb = self.cb
+        for mode, slot in (("F3", 1), ("F4", 0), ("F4", 1)):
+            r = self.run_(mode, slot)
+            self.assertEqual((r["eligible"], r["role"], r.get("discard")), ("B", "B", None), (mode, slot))
+            self.assertTrue(r["membership"]["boundary"]["ok"])
+            self.assertLessEqual(abs(r["boundary_final"]["residual"]), 0.03, (mode, slot, r["boundary_final"]))
+            self.assertTrue(math.isfinite(r["score"]))
+            self.assertEqual(cb.audit_classes([r])["classes"]["final_boundary"], 0)
+        old = cb.METRIC_MEANS
+        try:
+            cb.METRIC_MEANS = "raw"                                      # (the raw-means metric: the old distortion)
+            r = self.run_("F3", 1)
+        finally:
+            cb.METRIC_MEANS = old
+        self.assertGreater(abs(r["boundary_final"]["residual"]), 0.03)
+
+    def test_d4_null_fit_cannot_follow_the_signal(self):
+        """D4: the evaluation means are the scope's OLS null fit, so adding a recurrent component orthogonal to the
+        scope's nuisance basis to the true means leaves them EXACTLY unchanged (the signal cannot move the
+        weights); the raw means would move with it."""
+        cb = self.cb
+        rc = cb.recurrence
+        pn = cb.Panel(self.graph, self.params, "H-F", "dev", "actual", "F1", 0)
+        pn.member = lambda: {"member": True, "by": "test"}
+        pn.triage()
+        w = pn.worlds[0]
+        wg = w["graph"]
+        mu = {k: np.array(w["mu"][k], float) for k in ("C", "S", "F", "RC", "RS")}
+        for scope in ("full", "E2"):
+            L, U = rc.scope_bounds(scope)
+            mw = (wg.ti >= L) & (wg.ti <= U) & (wg.tj >= L) & (wg.tj <= U)
+            X = rc.within_geometry(np.ascontiguousarray(wg.ti[mw]), np.ascontiguousarray(wg.tj[mw]), (L, U),
+                                   tuple(rc.PERIODS[scope]))["X"]
+            h = 0.02 * np.cos(2 * math.pi * (wg.tj[mw] - wg.ti[mw]) / 8.0 + 0.4)
+            h_perp = h - X @ np.linalg.lstsq(X, h, rcond=None)[0]               # (the recurrent part only)
+            mu2 = {k: v.copy() for k, v in mu.items()}
+            mu2["C"][mw] = mu2["C"][mw] + h_perp
+            a, b = cb.null_fit_means(wg, mu, scope, 324), cb.null_fit_means(wg, mu2, scope, 324)
+            self.assertLessEqual(float(np.max(np.abs(a["C"][mw] - b["C"][mw]))), 1e-12, scope)
+            self.assertGreater(float(np.max(np.abs(mu["C"][mw] - mu2["C"][mw]))), 1e-3)
+            for ch in ("S", "F", "RC", "RS"):
+                self.assertTrue(np.array_equal(a[ch], b[ch]), (scope, ch))
+
+    def test_d4_smooth_scale_and_the_s_grid(self):
+        """D4: the smooth s(mu) is continuous and monotone between the bins and reduces EXACTLY to the bins when
+        SMOOTH_W = 0 (the stress floor alike); the generator's location on the registered s grid meets
+        E[K/N] = mu to LOC_TOL + LOC_S_TOL at continuous s."""
+        cb = self.cb
+        p = cb.placeholder_params()
+        mu = np.linspace(0.01, 0.99, 981)
+        old = cb.SMOOTH_W
+        try:
+            cb.SMOOTH_W = 0.0
+            for ch, (lo, hi) in (("C", cb.CAP_BINS), ("S", cb.SURV_BINS)):
+                s = np.asarray(p["noise"]["s"][ch])
+                want = np.where(mu < lo, s[0], np.where(mu < hi, s[1], s[2]))
+                self.assertTrue(np.array_equal(cb.noise_scale(p, ch, mu), want), ch)
+            st = cb.noise_scale(p, "C", mu, stress=True)
+            s = np.asarray(p["noise"]["s"]["C"])
+            want = np.maximum(1.5 * np.where(mu < 0.35, s[0], np.where(mu < 0.70, s[1], s[2])), np.where(mu < 0.35, 0.80, 0.35))
+            self.assertTrue(np.array_equal(st, want))
+        finally:
+            cb.SMOOTH_W = old
+        for ch in ("C", "S"):
+            v = cb.noise_scale(p, ch, mu)
+            self.assertLess(float(np.max(np.abs(np.diff(v)))), 0.02, ch)          # (no jump at the edges)
+        v = cb.noise_scale(p, "C", mu)
+        self.assertTrue(np.all(np.diff(v[mu < 0.6]) <= 1e-15))                    # (decreasing across 0.35)
+        rng = np.random.default_rng(4)
+        for N in (324, 600):
+            s = rng.uniform(0.2, 0.9, 200)
+            m = rng.uniform(0.02, 0.98, 200)
+            a = cb.location(m, s, N)
+            got = np.array([cb.expected_fraction(a[i], s[i], N)[0] for i in range(len(s))])
+            self.assertLessEqual(float(np.max(np.abs(got - m))), cb.LOC_TOL + cb.LOC_S_TOL)
+
+    def test_d4_switches_and_the_bootstrap_v(self):
+        """D4: the registered switches are in the solver identity; the bootstrap switch works both ways: V held
+        fixed at the observed m0 (registered) and V re-fitted per draw (Panel.redesign: a slow exact path) give the
+        same observed epoch scores, and both complete."""
+        cb = self.cb
+        sol = cb.solver_identity()
+        self.assertEqual((sol["metric_means"], sol["v_per_draw"], sol["smooth_w"]), ("null_fit", False, cb.SMOOTH_W))
+        g0 = {e: 0.0 for e in cb.transition.EPOCHS}
+        out = {}
+        old = cb.V_PER_DRAW
+        try:
+            for flag in (False, True):
+                cb.V_PER_DRAW = flag
+                out[flag] = cb.run_panel(self.graph, self.params, "H-T", "dev", "actual", "T3", 0, g0, draws=9,
+                                         cell="all", k=0)
+        finally:
+            cb.V_PER_DRAW = old
+        for flag in (False, True):
+            self.assertFalse(out[flag].get("error"), out[flag].get("error"))
+        self.assertEqual(out[False]["S_e"], out[True]["S_e"])
+
+    def test_d4_cache_source_identity_and_report_errors(self):
+        """Codex r7 P3: replacing a world's observed means without a version bump raises (the cache token holds
+        the source's identity); report() counts a final-metric diagnostic error instead of crashing."""
+        cb = self.cb
+        pn = cb.Panel(self.graph, self.params, "H-F", "dev", "actual", "F1", 0).simulate()
+        w = pn.worlds[0]
+        pn.design(w, "full")
+        w["m"] = {k: np.array(v, copy=True) for k, v in w["m"].items()}
+        with self.assertRaises(cb.CalibError):
+            pn.design(w, "full")
+        rec = {"hyp": "H-F", "stage": "dev", "mode": "F3", "stratum": "actual", "boundary_final": {"metric": "final",
+               "ok": False, "error": "RecurrenceError: x"}}
+        g = cb.report([rec])["groups"]["H-F|dev|F3|actual"]["boundary_final"]
+        self.assertEqual((g["errors"], g["metric_induced_change"]["n"]), (1, 0))
+
+    def test_boundary_jump_is_unreached(self):
+        """F3 slot 0 on four worlds: E_C(lambda) jumps over d_C^2 (a selection switches) with the null-side
+        endpoint outside the window, and the registered LAMBDA_GRID holds no other bracket: UNREACHED on the
+        registered search, kept in I at the attained null-side endpoint, the shortfall recorded."""
+        cb = self.cb
+        r = self.run_("F3", 0)
+        self.assertEqual((r["status"], r["eligible"], r["role"], r["member"]), ("unreached", "I", "I", True))
+        j = [c for c in r["clips"] if c.get("kind") == "jump"]
+        self.assertEqual(len(j), 1)
+        self.assertLess(j[0]["nearest"], 0.01 * (1 - cb.BOUNDARY_TOL))
+        self.assertAlmostEqual(j[0]["shortfall"], 0.01 - j[0]["nearest"])
+        self.assertEqual(r["boundary_solve"]["lambda"], j[0]["lambda"])
+        self.assertIn(j[0]["lambda"], [p[0] for p in r["boundary_solve"]["path"]])      # (an evaluated point)
+        self.assertNotIn("boundary_final", r)
+        g = cb.report([r])["groups"]["H-F|dev|F3|actual"]
+        self.assertEqual(g["boundary_solve"]["outcomes"]["unreached"], 1)
+        self.assertIsNotNone(g["targets"]["full/Q"]["achieved_max"])           # (#68 round 5 P3: "max" ranges kept)
+        self.assertLessEqual(g["targets"]["full/Q"]["achieved_min"], g["targets"]["full/Q"]["achieved_max"])
+
+    def test_boundary_outside_the_range_and_failures(self):
+        """E(lambda) above the boundary on the whole registered grid (patched functionals): unreached and,
+        with E_Q above its material threshold, NOT a material null: discarded. A nonfinite functional is a
+        numerical failure."""
+        cb = self.cb
+        orig = cb.Panel.functionals
+        cb.Panel.functionals = lambda self_, final=False: {"E_C": 0.02, "E_Q": 0.01, "R_C": 0.1414, "R_Q": 0.1,
+                                                           "M_F": 1.4, "available": True}
+        try:
+            r = self.run_("F3", 1)
+        finally:
+            cb.Panel.functionals = orig
+        self.assertEqual((r["status"], r["member"], r["role"], r["discard"]), ("unreached", False, "discarded", "non-member"))
+        self.assertEqual([c["kind"] for c in r["clips"] if c["world"] == "panel"], ["unreached-below"])
+        cb.Panel.functionals = lambda self_, final=False: {"E_C": math.nan, "E_Q": 0.0}
+        try:
+            r = self.run_("F3", 1)
+        finally:
+            cb.Panel.functionals = orig
+        self.assertEqual(r["role"], "failed")
+        self.assertIn("numerical failure", r["error"])
+
+    def with_target(self, mode, target):
+        cb = self.cb
+        orig = cb.plan_world
+
+        def plan(hyp, mode_, panel, k, rng):
+            pl = orig(hyp, mode_, panel, k, rng)
+            if hyp == "H-F":
+                pl["rec"]["full"] = (target, pl["rec"]["full"][1])
+            return pl
+        cb.plan_world = plan
+        try:
+            return self.run_(mode, 0)
+        finally:
+            cb.plan_world = orig
+
+    def test_unreached_panel_goes_to_I_clipped_and_null_checked(self):
+        """A capture RMS of 50 is above the maximum attained on the registered search: clipped to it; F1 (a
+        detection null by construction) keeps it in I and analyses it."""
+        r = self.with_target("F1", 50.0)
+        self.assertEqual((r["status"], r["role"], r["member"]), ("unreached", "I", True))
+        self.assertTrue(all(c["kind"] == "unreached-above" and c["nearest"] < 50.0 for c in r["clips"]))
+        self.assertEqual(len({c["world"] for c in r["clips"]}), len(self.graph))
+        self.assertEqual(r["targets"]["full/C"]["clipped"], len(self.graph))
+        self.assertTrue(math.isfinite(r["score"]))
+
+    def test_ht_membership_has_no_scientific_slack(self):
+        """#68 round 4 P2-5: a member iff EVERY one of the six candidates has a margin <= TAU_NUM x its scale
+        (scaled solver accuracy); Codex's +0.025 scaled candidate is a genuine transition (not a member)."""
+        cb = self.cb
+        self.assertAlmostEqual(cb.TAU_NUM, 2 * cb.DIR_TOL / cb.stats.DELTA_Q)
+        cands = [f"{a}->{f}" for a, f, _ in cb.transition.candidates()]
+        ms = {c: {k: -1.0 * cb.MARGIN_SCALE[k] if k == "beta_P[a]" else 1.0 * cb.MARGIN_SCALE[k]
+                  for k in cb.MARGIN_NAMES} for c in cands}
+        self.assertEqual(cb.ht_membership(ms)[0], True)
+        ms["E2->E3"] = {k: 1.0 * cb.MARGIN_SCALE[k] for k in cb.MARGIN_NAMES}
+        ms["E2->E3"]["EF_Q[f]-dQ2"] = 0.025 * cb.MARGIN_SCALE["EF_Q[f]-dQ2"]          # (Codex: +0.025 scaled)
+        ok, cand, val = cb.ht_membership(ms)
+        self.assertEqual((ok, cand), (False, "E2->E3"))
+        self.assertAlmostEqual(val, 0.025)
+        ms["E2->E3"]["EF_Q[f]-dQ2"] = 0.5 * cb.TAU_NUM * cb.MARGIN_SCALE["EF_Q[f]-dQ2"]  # (a solver-pinned zero)
+        self.assertEqual(cb.ht_membership(ms)[:2], (True, "E2->E3"))
+        ms["E1->E2"]["beta_Q[a]"] = math.nan
+        with self.assertRaises(cb.CalibError):
+            cb.ht_membership(ms)
+
+    def stream(self, stage, m, s_, cell, roles, score=lambda k: 0.001 * k):
+        """One quota cell's ordered stream from a role list ("B", "I", "s" = an I-eligible surplus, "n" = a
+        non-member, "f" = a B-eligible final-boundary failure)."""
+        cb = self.cb
+        n = {"dev": cb.N_DEV, "val": cb.N_VAL}[stage]
+        out = []
+        for k, ro in enumerate(roles):
+            panel, st = cb.proposal_of("H-F", m, n, cell, k)
+            kw = {"cell": cell, "k": k, "stream": st, "score": score(k)}
+            if ro == "I":
+                kw.update(role="I", eligible="I", status="unreached", score=5.0)
+            elif ro == "s":
+                kw.update(role="discarded", eligible="I", status="unreached", discard="surplus")
+            elif ro == "n":
+                kw.update(role="discarded", eligible=None, status="feasible", member=False, discard="non-member")
+            elif ro == "f":
+                kw.update(role="discarded", eligible="B", status="feasible", discard="final-boundary")
+            out.append(rec("H-F", stage, m, s_, panel, self.man, **kw))
+        return out
+
+    def allocation(self, stage, special=None, score=None):
+        cb = self.cb
+        n = {"dev": cb.N_DEV, "val": cb.N_VAL}[stage]
+        sc = score or ((lambda k: 0.001 * k) if stage == "dev" else (lambda k: 0.0))
+        out = []
+        for m, s_ in cb.strata_of("H-F"):
+            got = special(m, s_, n) if special else None
+            out.extend(got if got is not None else [rec("H-F", stage, m, s_, k, self.man, score=sc(k)) for k in range(n)])
+        return out
+
+    def test_crit_is_the_maximum_over_strata(self):
+        """F1 actual, each level cell (n_c = 80): an audit of 60 B then 20 I (I-eligible fraction 0.25 x K 480 =
+        120 >= 99: I collection), then the stream continues to 80 B and 80 I (k = 159, the registered stopping
+        point). I = 160 >= 99: calibrated; its scores (5.0) set c_F, never pooled into B."""
+        cb = self.cb
+
+        def special(m, s_, n):
+            if (m, s_) != ("F1", "actual"):
+                return None
+            return [r for c in ("lvl0", "lvl1") for r in self.stream("dev", m, s_, c, ["B"] * 60 + ["I"] * 20 + ["B"] * 20 + ["I"] * 60)]
+        recs = self.allocation("dev", special)
+        crit = cb.critical_values(recs)
+        self.assertEqual(crit["strata"]["H-F|F1|actual|I"]["n"], 160)
+        self.assertEqual(crit["strata"]["H-F|F1|actual|I"]["score"], 5.0)
+        self.assertEqual(crit["c_F"], 5.0)
+        self.assertEqual(crit["strata_set"]["H-F|F1|actual"], ["B", "I"])
+        pr = crit["proposals"]["H-F|F1|actual"]
+        self.assertTrue(pr["I_calibrated"] and pr["collect_I"])
+        self.assertAlmostEqual(pr["audit"]["q_I"]["q_hat"], 40 / 160)
+        # the registered stream is enforced: a gap, a stop before the stopping point, a surplus before full
+        with self.assertRaises(cb.CalibError):
+            cb.critical_values([r for r in recs if not (r["mode"] == "F1" and r.get("cell") == "lvl0" and r["k"] == 100)])
+        with self.assertRaises(cb.CalibError):
+            cb.critical_values([r for r in recs if not (r["mode"] == "F1" and r.get("cell") == "lvl1" and r["k"] >= 150)])
+        bad = [dict(r, role="discarded", discard="surplus") if (r["mode"] == "F1" and r.get("cell") == "lvl0" and r["k"] == 85)
+               else r for r in recs]
+        with self.assertRaises(cb.CalibError):
+            cb.critical_values(bad)
+
+    def test_cap_exhaustion_makes_the_mode_unavailable(self):
+        """F2 actual, cell lvl1: 79 B in its audit and none after, the stream run to its cap K_c = 240 (the I
+        surplus once I is full): CAPPED, every decision needing F2 unavailable (None, never a non-rejection);
+        I = 80 < 99: not calibrated."""
+        cb = self.cb
+
+        def special(m, s_, n):
+            if (m, s_) != ("F2", "actual"):
+                return None
+            return (self.stream("dev", m, s_, "lvl0", ["B"] * 80)
+                    + self.stream("dev", m, s_, "lvl1", ["B"] * 79 + ["I"] + ["I"] * 79 + ["s"] * 81))
+        crit = cb.critical_values(self.allocation("dev", special))
+        self.assertIn("H-F|F2|actual", crit["unavailable"])
+        self.assertEqual(crit["proposals"]["H-F|F2|actual"]["capped"], ["lvl1"])
+        self.assertEqual((crit["c_F"], crit["c_M"]), (None, None))
+        self.assertTrue(all(v is None for v in crit["c_E"].values()))
+        acc = cb.acceptance(self.allocation("val"), crit)
+        self.assertFalse(acc["pass"]["H-F detection"] or acc["pass"]["H-F material"])
+        with self.assertRaises(cb.CalibError):
+            cb.freeze_gates(crit, acc)
+
+        def short(m, s_, n):                                                  # (a stream stopped short of its cap)
+            got = special(m, s_, n)
+            return None if got is None else [r for r in got if not (r.get("cell") == "lvl1" and r["k"] >= 200)]
+        with self.assertRaises(cb.CalibError):
+            cb.critical_values(self.allocation("dev", short))
+
+    def test_stratum_set_is_frozen_at_dev(self):
+        """#68 round 4 P2-7: an I not calibrated at dev is never rated at validation (the scope limitation,
+        with the audit's uncovered classes, carries through); an I calibrated at dev but short at validation
+        fails its decisions ("unvalidated")."""
+        cb = self.cb
+        crit = cb.critical_values(self.allocation("dev"))
+        self.assertEqual(crit["strata_set"]["H-F|F3|actual"], ["B"])
+
+        def val_I(m, s_, n):                                               # (F3 val: 500 audit I, I collection)
+            if (m, s_) != ("F3", "actual"):
+                return None
+            return self.stream("val", m, s_, "all", ["B"] * 500 + ["I"] * 500 + ["B"] * 500 + ["I"] * 500,
+                               score=lambda k: 0.0)
+        acc = cb.acceptance(self.allocation("val", val_I), crit)
+        self.assertNotIn("material|F3|actual|I", acc["rates"]["H-F"])
+        sc = acc["scope"]["H-F|F3|actual"]
+        self.assertEqual((sc["uncovered_null_classes"]["I_eligible"], sc["audit_n"]), (500, 1000))
+        self.assertGreater(sc["q_uncovered_U"], 0.5)
+        self.assertIn("material", sc["bounds"])
+
+        def dev_I(m, s_, n):
+            if (m, s_) != ("F3", "actual"):
+                return None
+            return self.stream("dev", m, s_, "all", ["B"] * 100 + ["I"] * 60 + ["B"] * 60 + ["I"] * 100)
+        crit2 = cb.critical_values(self.allocation("dev", dev_I))
+        self.assertEqual(crit2["strata_set"]["H-F|F3|actual"], ["B", "I"])
+        acc2 = cb.acceptance(self.allocation("val"), crit2)
+        self.assertIn("H-F|F3|actual", acc2["unvalidated"])
+        self.assertFalse(acc2["pass"]["H-F material"])
+        self.assertTrue(acc2["pass"]["H-F detection"])                    # (F3 is not a detection mode)
+        with self.assertRaises(cb.CalibError):
+            cb.acceptance(self.allocation("val"), {k: v for k, v in crit.items() if k != "strata_set"})
+
+    def test_cell_stop_and_quota_cells(self):
+        cb = self.cb
+        self.assertEqual(sorted(cb.cells_of("H-F", "F1", 160)), ["lvl0", "lvl1"])
+        self.assertEqual(len(cb.cells_of("H-T", "T4", 160)), 96)
+        self.assertEqual(cb.proposal_of("H-F", "F1", 160, "lvl1", 3), (7, None))
+        self.assertEqual(cb.proposal_of("H-F", "F1", 160, "lvl1", 80), (1, "lvl1/80"))
+        with self.assertRaises(cb.CalibError):
+            cb.proposal_of("H-F", "F1", 160, "lvl1", 240)
+        cx = [{"k": k, "role": r} for k, r in enumerate(["B", "I", "B", "B"])]
+        self.assertEqual(cb.cell_stop(cx, 3, False), 3)
+        self.assertIsNone(cb.cell_stop(cx, 3, True))
+
+    def test_cpu_ledger(self):
+        import tempfile
+        cb = self.cb
+        d = tempfile.mkdtemp()
+        try:
+            p = os.path.join(d, "cpu.jsonl")
+            cb.ledger_add(p, {"kind": "panels", "cpu_s": 3600.0})
+            cb.ledger_add(p, {"kind": "fitting", "cpu_s": 7200.0})
+            t = cb.ledger_total([p])
+            self.assertAlmostEqual(t["cpu_h"], 3.0)
+            self.assertAlmostEqual(t["remaining_h"], cb.stats.CPU_CEILING_H - 3.0)
+            self.assertEqual(t["by_kind_h"], {"fitting": 2.0, "panels": 1.0})
+        finally:
+            import shutil
+            shutil.rmtree(d)
+
+
+def direct_cov(pn, wg, m, kind):
+    """The pre-q33 Panel.cov, verbatim (the oracle)."""
+    import calib as cb
+    import recurrence
+    R = cb.R_REP
+    SR, SD = np.asarray(pn.p["noise"]["SigmaR"], float), np.asarray(pn.p["noise"]["SigmaD"], float)
+    N = pn.p["capture_bound"]
+
+    def g(ch, x, n):
+        x = np.clip(x, 0.5 / n, 1 - 0.5 / n)
+        return cb.noise_scale(pn.p, ch, x) * x * (1 - x)
+    if kind in ("C", "RC"):
+        t_pred = wg.tj if kind == "C" else wg.cT
+        prey_key = [("Q", t) for t in wg.ti] if kind == "C" else [("RQ", r) for r in wg.cR]
+        gg = g("C", m["C"], N)
+        eC = 1 - SR[0, 0] - SD[0, 0]
+        cols, d = [], gg ** 2 * eC / R
+        for keys, var in ((prey_key, SR[0, 0]), ([("P", t) for t in t_pred], SD[0, 0])):
+            uk = {k: i for i, k in enumerate(sorted(set(keys), key=str))}
+            M = np.zeros((len(keys), len(uk)))
+            M[np.arange(len(keys)), [uk[k] for k in keys]] = gg * math.sqrt(var / R)
+            cols.append(M)
+        return recurrence.Cov(d, np.hstack(cols))
+    prey_t = wg.ti if kind == "Q" else wg.qT
+    pred_key = [("P", t) for t in wg.tj] if kind == "Q" else [("RP", r) for r in wg.qR]
+    gS = g("S", m["S"], cb.TRIALS)
+    fm = dict(zip(wg.prey.tolist(), m["F"].tolist()))
+    gF = g("F", np.array([fm[t] for t in prey_t]), cb.TRIALS)
+    L = np.linalg.cholesky(np.array([[SR[1, 1], SR[1, 2]], [SR[1, 2], SR[2, 2]]]) + 1e-15 * np.eye(2))
+    eS, eF = 1 - SR[1, 1] - SD[1, 1], 1 - SR[2, 2]
+    d = gS ** 2 * eS / R
+    uk = {t: i for i, t in enumerate(sorted(set(prey_t.tolist())))}
+    rows = np.arange(len(prey_t))
+    ci = np.array([uk[t] for t in prey_t.tolist()])
+    M = np.zeros((len(prey_t), 3 * len(uk)))
+    M[rows, 3 * ci] = (gS * L[0, 0] - gF * L[1, 0]) / math.sqrt(R)
+    M[rows, 3 * ci + 1] = (-gF * L[1, 1]) / math.sqrt(R)
+    M[rows, 3 * ci + 2] = (-gF * math.sqrt(eF)) / math.sqrt(R)
+    pk = {k: i for i, k in enumerate(sorted(set(pred_key), key=str))}
+    Md = np.zeros((len(prey_t), len(pk)))
+    Md[rows, [pk[k] for k in pred_key]] = gS * math.sqrt(SD[1, 1] / R)
+    return recurrence.Cov(d, np.hstack([M, Md]))
+
+
+if __name__ == "__main__":
+    unittest.main()
