@@ -372,7 +372,28 @@
    * can load one (the eye world will). */
   var ENGINE = "ocean";
   var usedTurbo = false;     /* Turbo ran this world (a reason to ask before replacing it) */
-  var turboReturn = null;    /* the fish to select / follow again after Turbo (restoreAfterTurbo) */
+  var inspector = EvoOceanInspector.create({
+    el: el, has: has, syncedFrame: syncedFrame, turboPictureHint: turboPictureHint, engineCall: engineCall, fresh: fresh, setStatPanel: setStatPanel, cfgVal: cfgVal, STATS: STATS, ACTION_SHORT: ACTION_SHORT, ACTION_LABELS: ACTION_LABELS, coarseMQ: coarseMQ, heap: heap, cString: cString, toast: toast,
+    get M() { return M; },
+    get engineState() { return engineState; },
+    get turboState() { return turboState; },
+    get lastS() { return lastS; },
+    get scene() { return scene; },
+    get colourMode() { return colourMode; },
+    get statOpen() { return statOpen; },
+    get paused() { return paused; },
+    get BODY_LAYOUT() { return BODY_LAYOUT; },
+    get HO() { return HO; },
+    get worldEpoch() { return worldEpoch; },
+    get WALLS() { return WALLS; },
+    get W() { return W; },
+    get H() { return H; },
+    get D() { return D; },
+    get cardNewer() { return cardNewer; }, set cardNewer(v) { cardNewer = v; },
+    get cardHeld() { return cardHeld; }, set cardHeld(v) { cardHeld = v; },
+    get dirtyHud() { return dirtyHud; }, set dirtyHud(v) { dirtyHud = v; },
+    hideCoach: function () { tour.hideCoach(); }
+  });
   function startWorld(plan) {
     if (!M) return { ok: false, why: "the engine is not loaded" };
     if (engineState !== "ok") return { ok: false, why: engineBusyWhy() };
@@ -409,7 +430,7 @@
       historyUnknown = plan.op === "open";   /* (its file has no history: unknown until a start or Replay) */
       clearFieldNotes();
       afterNewWorld();
-      stepOnce = false; summary = null; usedTurbo = false; turboReturn = null;
+      stepOnce = false; summary = null; usedTurbo = false; inspector.turboReturn = null;
       if (plan.op === "init") { draft = null; projectForm(); }   /* a start consumes the draft */
       else if (plan.op === "open") { draft = null; projectRunning(); }   /* (its settings now: its live tweaks too) */
       else if (keep) { projectForm(); keep.forEach(function (e) { setRaw(e[0], e[1]); }); updateNeeds(); updateTabDots(); }
@@ -449,28 +470,28 @@
     var u8 = new Uint8Array(heap()), fields = {};
     Object.keys(KEYS).forEach(function (k) { if (el("o_" + k)) fields[k] = rawOf(k); });
     return { data: u8.slice(0, HO.storedLength(u8)), bytes: u8.length, initArgs: initArgs, runCfg: runCfg, epoch: worldEpoch,
-             selectedId: selectedId, wantFollow: wantFollow, following: !!(scene && scene.following()), draft: draft, draftGen: draftGen,
+             selectedId: inspector.selectedId, wantFollow: inspector.wantFollow, following: !!(scene && scene.following()), draft: draft, draftGen: draftGen,
              fields: fields, extraCfg: Object.assign({}, extraCfg), nextOnly: Object.assign({}, nextOnly), paused: paused, url: location.href,
              dash: dash() && dash().save ? dash().save() : null, sampleBucket: sampleBucket, rates: rates.q.slice(),
-             usedTurbo: usedTurbo, turboReturn: turboReturn, stepOnce: stepOnce, summary: summary, changedLive: Object.assign({}, changedLive),
+             usedTurbo: usedTurbo, turboReturn: inspector.turboReturn, stepOnce: stepOnce, summary: summary, changedLive: Object.assign({}, changedLive),
              historyUnknown: historyUnknown, consoleSet: Object.assign({}, consoleSet) };
   }
   /* the page's side of a run put back (its memory is in the module again) */
   function pageBack(u) {
     initArgs = u.initArgs; runCfg = u.runCfg; worldEpoch = u.epoch; draft = u.draft; draftGen = u.draftGen;
     changedLive = Object.assign({}, u.changedLive); historyUnknown = !!u.historyUnknown; consoleSet = Object.assign({}, u.consoleSet);
-    selectedId = null; wantFollow = false;
+    inspector.resetSelection();
     afterNewWorld(true);   /* this world read again: no new epoch (the charts: below) */
     if (u.dash && dash() && dash().restore) dash().restore(u.dash);
     sampleBucket = u.sampleBucket; rates.q = u.rates.slice();
-    usedTurbo = u.usedTurbo; turboReturn = u.turboReturn; stepOnce = u.stepOnce; summary = u.summary;
+    usedTurbo = u.usedTurbo; inspector.turboReturn = u.turboReturn; stepOnce = u.stepOnce; summary = u.summary;
     Object.keys(u.fields).forEach(function (k) { setRaw(k, u.fields[k]); });
     extraCfg = u.extraCfg; nextOnly = u.nextOnly;
     updateNeeds(); updateTabDots();
     /* the fish and the follow as they were, both ways (the open may have followed one) */
-    var back = u.selectedId !== null && indexOfId(fresh(lastS), u.selectedId) >= 0;
-    if (back) select(u.selectedId, true);
-    wantFollow = back && u.wantFollow;
+    var back = u.selectedId !== null && inspector.indexOfId(fresh(lastS), u.selectedId) >= 0;
+    if (back) inspector.select(u.selectedId, true);
+    inspector.wantFollow = back && u.wantFollow;
     if (scene && scene.following() !== (back && u.following)) scene.setFollow(back && u.following);
     setPaused(u.paused);
     try { if (location.href !== u.url) history.replaceState(null, "", u.url); } catch (e) { /* file:// or a sandboxed frame */ }
@@ -500,7 +521,7 @@
       if (window.EvoOcean) EvoOcean.module = M;
       engineState = "ok";
       pageBack(u);
-      if (turboReturn) restoreAfterTurbo();   /* (Stop Turbo & open: the fish Turbo had, picked up again now the run is back) */
+      if (inspector.turboReturn) inspector.restoreAfterTurbo();   /* (Stop Turbo & open: the fish Turbo had, picked up again now the run is back) */
       showNote("The engine restarted, and your run is back where it was.");
     }).catch(function (e) {
       engineState = "down";
@@ -620,13 +641,13 @@
      * kept capturing senses with nothing selected (review of #44, finding 6;
      * a saved world picks its fish again after this, which sets it again) */
     if (!fromTurbo) {
-      selectedId = null; wantFollow = false;
+      inspector.resetSelection();
       if (scene && scene.following()) scene.setFollow(false);
     }
     applyDisplaySwitches();
     /* the card's clock starts over here, and only here (never at a display switch: review of #91, P2): a world the
      * page has not seen step, so its fish's kept activations, if any, are no step the card can vouch for */
-    brainClock.reset(syncedFrame(), has("oc_set_capture") && selectedId !== null);
+    inspector.resetBrainClock(syncedFrame(), has("oc_set_capture") && inspector.selectedId !== null);
     updateModeline();     /* the world's appearance genes may differ */
     estPrev.n = 0;
     stepMs = 0;
@@ -648,9 +669,9 @@
     if (has("oc_set_colour_mode")) M._oc_set_colour_mode(colourBrain ? 0 : 1);
     if (scene && scene.setAppearance) scene.setAppearance(colourMode === "appearance");
     if (has("oc_set_capture")) {
-      var cap = selectedId !== null;
+      var cap = inspector.selectedId !== null;
       M._oc_set_capture(cap ? 1 : 0);
-      brainClock.capture(cap, syncedFrame());
+      inspector.captureBrainClock(cap, syncedFrame());
     }
   }
 
@@ -1682,14 +1703,6 @@
   var RULES = { keys: KEYS, live: LIVE, lim: LIM, setupVersion: SETUP_VERSION };   /* a world file's header (HO.headerProblem) */
   var worldSave = null;   /* a Save world under way: {id, picked}; with a worker: waiting for its copy */
   var worldSaveSeq = 0;
-  /* the fish picked (and followed) now, for the file, with its family line
-   * and place (returnPoint's: what the open needs to pick its nearest
-   * kin, as Turbo's hand-back does, if it is gone); in Turbo the one Turbo
-   * will pick up again (its place when Turbo took the world) */
-  function pickedNow() {
-    var r = turboState !== "live" ? turboReturn : returnPoint();
-    return r ? { id: r.id, follow: !!r.follow, family: r.family, x: r.x, y: r.y, d: r.d } : null;
-  }
   /* What this device opens (and so saves): a world file's image at most
    * `image`, and an open holding at most `budget` at once (openNeeds), from
    * navigator.deviceMemory (Chrome's: GB, reported up to 8) or, where the
@@ -1722,7 +1735,7 @@
     if (turboState === "entering" || turboState === "exiting") { turboWait(); return; }
     var lim = worldLimitsHere();
     if (turboState === "turbo") {   /* the worker's copy, between two of its chunks: Turbo runs on */
-      worldSave = { id: ++worldSaveSeq, waiting: true, picked: pickedNow(), lim: lim };   /* (the fish as now, not when the copy comes) */
+      worldSave = { id: ++worldSaveSeq, waiting: true, picked: inspector.pickedNow(), lim: lim };   /* (the fish as now, not when the copy comes) */
       turboWorker.postMessage({ cmd: "snapshot", id: worldSave.id, maxBytes: lim.image });
       errEl.textContent = "Saving the world from Turbo (it keeps running)…"; errEl.className = "";   /* (no toast: the saved one follows) */
       return;
@@ -1730,7 +1743,7 @@
     if (heap().byteLength > lim.image) { showError(tooBigToSave(heap().byteLength, lim)); return; }
     var my = worldSave = { id: ++worldSaveSeq, picked: null, lim: lim }, mem, s;
     try {
-      my.picked = pickedNow();   /* (first: its card's oc_inspect may allocate; the copy is the world after it, as it runs on) */
+      my.picked = inspector.pickedNow();   /* (first: its card's oc_inspect may allocate; the copy is the world after it, as it runs on) */
       s = fresh(lastS);   /* this frame's numbers: no step since its sync, so the image's */
       /* again, right before the copy: the inspection may have grown the memory past the limit (review of #44, round 3, finding 4) */
       if (heap().byteLength > lim.image) { worldSave = null; showError(tooBigToSave(heap().byteLength, lim)); return; }
@@ -1943,12 +1956,12 @@
   function worldOpened(world) {
     var p = world.picked, said = "";
     if (p) {
-      var s = fresh(lastS), id = indexOfId(s, p.id) >= 0 ? p.id : nearestOfFamily(s, p);
+      var s = fresh(lastS), id = inspector.indexOfId(s, p.id) >= 0 ? p.id : inspector.nearestOfFamily(s, p);
       if (id === null) said = " Fish #" + p.id + ", " + (p.follow ? "followed" : "picked") + " when it was saved, is not in it (it died during Turbo before the save), " +
                               "nor is any of its family line: nothing " + (p.follow ? "followed" : "picked") + ".";
       else {
-        select(id);
-        if (p.follow && scene) { wantFollow = true; scene.setFollow(true); }
+        inspector.select(id);
+        if (p.follow && scene) { inspector.wantFollow = true; scene.setFollow(true); }
         if (id !== p.id) said = " Fish #" + p.id + " is not in it (it died during Turbo before the save): " + (p.follow ? "following" : "showing") + " #" + id +
                                 ", the nearest of its family line.";
       }
@@ -2218,7 +2231,7 @@
   var paused = BENCH, stepOnce = false;
   var speedIdx = Math.max(0, SPEEDS.indexOf(Math.round(Math.max(1, Math.min(64, parseFloat(P.get("speed")) || 1)))));
   var stepMs = 0, lastSteps = 0;
-  var selectedId = null, wantFollow = false, everSelected = false;
+  inspector.initSelection();
   var animT = 0, lastNow = 0;
   var fpsFrames = 0, fpsT = 0, fps = 0;
   var governorOn = !BENCH, colourBrain = false, colourMode = "family";
@@ -2253,62 +2266,14 @@
     el("speedcap").hidden = !(ran < ask);
     if (ran < ask) setTxt("speedcap", "runs " + ran);
   }
-  function indexOfId(s, id) {
-    if (id === null || !s) return -1;
-    for (var i = 0; i < s.n; i++) if (s.ids[i] === id) return i;
-    return -1;
-  }
-  function randomFish(s, notId) {
-    if (!s || !s.n) return -1;
-    var i = Math.floor(Math.random() * s.n);
-    if (s.n > 1 && s.ids[i] === notId) i = (i + 1 + Math.floor(Math.random() * (s.n - 1))) % s.n;
-    return i;
-  }
-  /* The fish card's live brain (EvoUI.activationClock): the senses and actions
-   * the last step kept, which it keeps only while a fish is picked (the
-   * capture, oc_set_capture: lazy, as it costs every fish its whole sensing).
-   * A fish picked in a world that stepped without it waits for the next step,
-   * which a paused world takes only when asked (Space, or . for one). */
-  var brainClock = EvoUI.activationClock();
+  inspector.initBrainClock();
   /* the world's frame as the shim's last oc_sync left it: every step the page takes is synced at once (the
    * frame loop, EvoOcean.step), so this is the world's tick between them (no sync here: it allocates) */
   function syncedFrame() { return HO.f64(M, M._oc_stats(), statsLen)[1]; }
-  /* handover: a followed fish died and another takes its place (the frame
-   * loop), not a fish the visitor picked */
-  function select(id, handover) {
-    var was = selectedId;
-    selectedId = id;
-    if (id !== null) { everSelected = true; tour.hideCoach(); }   /* its card opens where the coach mark sits */
-    if (id !== null && id !== was && !handover) { cardNewer = true; cardHeld = false; }   /* its card, over the live numbers (updateCard) */
-    /* the capture, only into a running engine (Close, Esc and the tour let go of a fish while it is stopped or
-     * restarting too: review of #44, round 3, finding 3; a restarted one gets it with its run, applyDisplaySwitches) */
-    if ((was === null) !== (id === null) && M && engineState === "ok" && has("oc_set_capture")) {
-      M._oc_set_capture(id !== null ? 1 : 0);
-      brainClock.capture(id !== null, syncedFrame());
-    }
-    dirtyHud = true;
-  }
-  /* F: follow the selected fish; again (or with none): a random one */
-  function follow() {
-    if (turboState !== "live") { turboPictureHint(); return; }
-    engineCall(function () {   /* (a stopped engine: says why; a trap: stops it once, from F, the console or the tour) */
-      var s = fresh(lastS);
-      if (!s || !s.n) return;
-      var idx = !scene.following() ? indexOfId(s, selectedId) : -1;
-      if (idx < 0) idx = randomFish(s, selectedId);
-      select(s.ids[idx]);
-      wantFollow = true;
-      if (!scene.following()) scene.setFollow(true);
-    }, undefined, "Following a fish");
-  }
-  function unfollow() {
-    wantFollow = false;
-    if (scene.following()) scene.setFollow(false);
-  }
   function onFollowChange(on) {
     el("followbtn").setAttribute("aria-pressed", on ? "true" : "false");
     el("followbtn").title = on ? "Stop following (F or Esc)" : "Follow this fish (F)";
-    if (!on) wantFollow = false;
+    if (!on) inspector.wantFollow = false;
     if (on) toast(coarseMQ.matches ? "Following. Drag to circle around it."
                                    : "Following. Drag or A / D to circle it, W / S to come closer or back off; Esc stops.");
     /* Light while following: on as the follow starts, back as it was when it ends */
@@ -2400,12 +2365,12 @@
 
   var tour = EvoOceanTour.create({
     store: store, P: P, el: el, coarseMQ: coarseMQ,
-    dash: dash, enterTurbo: enterTurbo, setDrawer: setDrawer, setSheetTab: setSheetTab, engineCall: engineCall, fresh: fresh, select: select,
+    dash: dash, enterTurbo: enterTurbo, setDrawer: setDrawer, setSheetTab: setSheetTab, engineCall: engineCall, fresh: fresh,
     get summary() { return summary; }, get turboState() { return turboState; }, get openPop() { return openPop; },
-    get statOpen() { return statOpen; }, get selectedId() { return selectedId; }, get drawerEl() { return drawerEl; },
+    get statOpen() { return statOpen; }, get drawerEl() { return drawerEl; },
     get colourMode() { return colourMode; }, get HAS_APP() { return HAS_APP; }, get colourBrain() { return colourBrain; },
     get M() { return M; }, get lastS() { return lastS; }, get scene() { return scene; },
-    get cardEl() { return cardEl; }
+    inspector: inspector
   });
 
   /* ---------------- the readout and the stat panel ---------------- */
@@ -2530,248 +2495,10 @@
     setTxt("statnotes", notes.join(" "));
   }
 
-  /* ---------------- the fish card ---------------- */
-  var cardEl = el("fishcard"), inetCanvas = el("inetc"), inetCtx = inetCanvas.getContext("2d");
-  var portraitEl = el("iportrait");
-  var cardExpanded = window.innerWidth >= 600, cardCache = {}, cardFor = null, cardFlip = false;
-  el("iexpand").setAttribute("aria-expanded", cardExpanded ? "true" : "false");
-  var sensorNames = null, actionNames = null, netNodes = [], netHover = -1, uiFont = "", cardFresh = false;
-  function prettyName(n) { return String(n).replace(/_/g, " ").toLowerCase(); }
-  function brainShape() {
-    if (!sensorNames) {
-      sensorNames = has("oc_sensor_names") ? cString(M._oc_sensor_names()).split(",").map(prettyName) : [];
-      actionNames = has("oc_action_names") ? cString(M._oc_action_names()).split(",").map(prettyName) : [];
-    }
-    return { nS: has("oc_num_senses") ? M._oc_num_senses() : sensorNames.length,
-             nH: has("oc_num_hidden") ? M._oc_num_hidden() : 12,
-             nA: has("oc_num_actions") ? M._oc_num_actions() : actionNames.length };
-  }
-  function cardText(id, v) { if (cardCache[id] !== v) { cardCache[id] = v; el(id).textContent = v; } }
-  function setBar(id, f, tick) {
-    f = Math.max(0, Math.min(1, f));
-    var key = f.toFixed(3) + "|" + (tick === undefined ? "" : tick.toFixed(3));
-    if (cardCache[id + "bar"] === key) return;
-    cardCache[id + "bar"] = key;
-    var bar = el(id);
-    bar.firstElementChild.style.transform = "scaleX(" + f.toFixed(3) + ")";
-    var t = bar.querySelector(".tick");
-    if (t) t.style.left = "calc(" + ((tick || 0) * 100).toFixed(1) + "% - 1px)";
-  }
-  function showCard() {
-    cardEl.hidden = false;
-    document.body.classList.add("card-open");
-    cardEl.classList.toggle("expanded", cardExpanded);
-    el("iexpand").setAttribute("aria-expanded", cardExpanded ? "true" : "false");
-    cardCache = {};
-  }
-  function hideCard() {
-    if (cardEl.hidden) return;
-    cardEl.hidden = true;
-    cardFor = null; netHover = -1; cardFlip = false;
-    cardEl.classList.remove("flip");
-    document.body.classList.remove("card-open");
-  }
-  function placeCard(fx, fy) {
-    var r = cardEl.getBoundingClientRect(), m = 24;
-    if (fx < r.left - m || fx > r.right + m || fy < r.top - m || fy > r.bottom + m) return;
-    var flip = window.innerWidth < 600 ? fy > window.innerHeight / 2 : fx > window.innerWidth / 2;
-    if (flip === cardFlip) return;
-    cardFlip = flip;
-    cardEl.classList.toggle("flip", flip);
-  }
-  /* The card's two pictures of the fish (the UI parity plan's U45): the
-   * colour key (EvoUI.drawPortrait), a generic silhouette in the colour the
-   * charts and the colour modes give it, which is not its likeness (the tank
-   * draws the shape and skin it inherited); and, under it, its skin itself:
-   * the pattern on its flank, unlit, from its appearance genes
-   * (web/ocean_appearance.js), when the module exports them. Both captioned
-   * (ocean.html #ikey, #iskin). */
-  var swatchEl = el("iswatch"), skinEl = el("iskin");
-  function drawSwatch(s, idx, size, elong) {
-    var EA = window.EvoAppearance;
-    if (!swatchEl || !EA || !s.app) { if (swatchEl) swatchEl.hidden = true; if (skinEl) skinEl.hidden = true; return; }
-    var W = 96, H = 24, row = s.app.subarray(63 * idx, 63 * idx + 63);
-    swatchEl.width = W; swatchEl.height = H;
-    var ctx = swatchEl.getContext("2d");
-    ctx.putImageData(new ImageData(EA.flankImage(row, EA.lambdaOf(size, elong), W, H), W, H), 0, 0);
-    swatchEl.hidden = false;
-    if (skinEl) skinEl.hidden = false;
-  }
-  /* what the colour key's colour is, in this colour mode (its title) */
-  function keyTitle() {
-    return "A colour key, not a likeness: " + (colourMode === "brain" ? "the colour of its brain (similar wiring, similar colour)"
-      : colourMode === "appearance" ? "the colour of its family line, as the charts show it; in the tank it wears its own skin (below)"
-      : "the colour of its family line, as the charts show it") + ".";
-  }
-  /* oc_inspect(idx) right after the sync: its numbers, then the card */
-  function inspect(idx) {
-    if (!has("oc_inspect")) return null;
-    var sh = brainShape();   /* first: the name lists allocate (once) */
-    if (!M._oc_inspect(idx)) return null;
-    var buf = heap(), nc = M._oc_inspect_conn_count();   /* after oc_inspect, which allocates */
-    return {
-      info: new Float64Array(buf, M._oc_inspect_info(), M._oc_inspect_len()),
-      sensors: new Float32Array(buf, M._oc_inspect_sensors(), sh.nS),
-      hidden: new Float32Array(buf, M._oc_inspect_hidden(), sh.nH),
-      actions: new Float32Array(buf, M._oc_inspect_actions(), sh.nA),
-      connCount: nc, conns: new Float32Array(buf, M._oc_inspect_conns(), nc * 5), shape: sh
-    };
-  }
-  function overlap(a, b) {
-    return a.width > 0 && a.height > 0 && b.width > 0 && b.height > 0 &&
-           a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom;
-  }
-  function updateCard(s) {
-    if (cardHeld && statOpen) { hideCard(); return s; }   /* under the live numbers: the fish stays selected */
-    var idx = s.selIdx, f = idx >= 0 && turboState === "live" ? inspect(idx) : null;
-    if (!f) { hideCard(); return s; }
-    s = fresh(s);   /* oc_inspect may have grown the memory */
-    if (cardEl.hidden) showCard();
-    var p = scene.project(s, idx);
-    if (p) placeCard(p.x, p.y);
-    if (statOpen && overlap(cardEl.getBoundingClientRect(), el("statpanel").getBoundingClientRect())) {
-      if (cardNewer) setStatPanel(false);   /* a fish picked over the numbers: its card */
-      else { cardHeld = true; hideCard(); return s; }   /* the numbers opened over the card: they */
-    }
-    var info = f.info, id = Math.round(info[0]);
-    var rgb = [s.colors[3 * idx], s.colors[3 * idx + 1], s.colors[3 * idx + 2]];
-    var pkey = id + "|" + rgb.join() + "|" + info[4].toFixed(2) + "|" + info[5].toFixed(2) + "|" + colourMode;
-    if (cardFor !== pkey) {
-      cardFor = pkey;
-      EvoUI.drawPortrait(portraitEl, rgb, info[4], info[5], window.devicePixelRatio || 1);
-      drawSwatch(s, idx, info[4], info[5]);
-      el("ikey").title = keyTitle();
-    }
-    cardText("ititle", "Fish #" + id);
-    /* the common fields, in their order (both pages: EvoUI.cardSubtitle); genes: its genome's length (oc_inspect), one link of its brain each */
-    cardText("isub", EvoUI.cardSubtitle({ generation: info[6], family: info[7], genes: info[11],
-                                          body: cfgVal("bodyModel") ? [info[4], info[5]] : null }));
-    /* its live brain: the last step's, or waiting for one (a fish just picked in a world that stepped without the
-     * capture, a new or handed-back world, a fish born in the last step; EvoUI.activationClock). data-activations:
-     * current or waiting; data-activations-at: the tick of the activations it shows, empty while it waits (stamp) */
-    var tick = s.stats[STATS.frame], state = brainClock.state(tick, info[3]), at = brainClock.stamp(tick, info[3]);
-    cardFresh = state === "current";
-    if (cardCache.acts !== state + "|" + at) {
-      cardCache.acts = state + "|" + at;
-      cardEl.dataset.activations = state;
-      cardEl.dataset.activationsAt = at === null ? "" : String(at);
-    }
-    var reproE = cfgVal("reproEnergy"), maxAge = cfgVal("maxAge"), maxSpd = cfgVal("maxSpeed"), pitchMax = cfgVal("pitchMax");
-    cardText("ienergyv", info[2].toFixed(1));
-    setBar("ienergy", info[2] / (reproE * 2), 0.5);
-    el("ienergy").title = info[2] >= reproE ? "enough energy to breed" : "needs " + reproE + " to breed";
-    cardText("iagev", Math.round(info[3]) + " s");
-    setBar("iage", info[3] / maxAge);
-    cardText("ispeedv", String(Math.round(info[1])));
-    setBar("ispeed", info[1] / maxSpd);
-    cardText("idepthv", info[8].toFixed(0) + " of " + D.toFixed(0));
-    setBar("idepth", info[8] / D, info[9]);
-    el("idepth").title = "the tick: its neutral depth";
-    cardText("ibuoyv", (info[9] * D).toFixed(0));
-    setBar("ibuoy", info[9]);
-    var deg = Math.atan(info[10]) * 180 / Math.PI;
-    cardText("ipitchv", Math.abs(deg) < 0.5 ? "level" : Math.abs(deg).toFixed(0) + "° " + (deg > 0 ? "down" : "up"));
-    setBar("ipitch", 0.5 + 0.5 * Math.max(-1, Math.min(1, info[10] / (pitchMax || 0.5))), 0.5);
-    drawBody(s, idx, id);
-    if (cardExpanded) drawBrain(f);
-    return s;
-  }
-  /* The card's body plan (the M2a preview, DIAGNOSTIC): what the fish
-   * inherited (its five physical alleles), what it developed (expressed
-   * values, with any developmental limit), what its body measures (the C++
-   * law's closed-mesh geometry) and the unloaded material ESTIMATE; speed and
-   * turning are not predicted until M2b calibrates them. Built once per fish
-   * (its body never changes); hidden when the world has no preview. */
-  var bodyEl = el("ibody"), bodyTableEl = el("ibodyt"), bodyLinkEl = el("ibodylink"), bodyFor = "";
-  function drawBody(s, idx, id) {
-    if (!bodyEl) return;
-    var B = s.bodyPlan;
-    if (!B || !BODY_LAYOUT || idx < 0 || idx * 2 + 1 >= B.owners.length) { bodyEl.hidden = true; bodyFor = ""; return; }
-    var owner = B.owners[2 * idx] + 4294967296 * B.owners[2 * idx + 1];
-    if (owner !== id) { bodyEl.hidden = true; bodyFor = ""; return; }   /* (never a row of another fish) */
-    bodyEl.hidden = false;
-    var key = s.worldEpoch + ":" + id;   /* (a new world reuses ids) */
-    if (bodyFor === key) return;
-    bodyFor = key;
-    var at = BODY_LAYOUT.at, st = B.stride, base = idx * st, mm = B.metrics, g = B.genes;
-    function v(name, k) { var f = at[name]; return f ? mm[base + f.offset + (k || 0)] : NaN; }
-    function fin(i, k) { var f = at.fins; return f ? mm[base + f.offset + BODY_LAYOUT.fins.stride * i + BODY_LAYOUT.fins.values[k]] : NaN; }
-    function num(x, d) { return isFinite(x) ? x.toFixed(d === undefined ? 2 : d) : "–"; }
-    var lim = v("limits"), why = [];
-    if (lim & 1) why.push("eye clipped to the head");
-    if (lim & 2) why.push("tail chord capped");
-    if (lim & 4) why.push("storage bounded");
-    if (lim & 8) why.push("organs bounded");
-    if (lim & 16) why.push("shell capped");
-    var rows = [
-      ["Inherited", "gape " + num(g[5 * idx]) + " · bladder " + num(g[5 * idx + 1]) + " · armour " + num(g[5 * idx + 2]) +
-                    " · fat " + num(g[5 * idx + 3]) + " · fibre " + num(g[5 * idx + 4])],
-      ["Developed", "mouth " + num(v("gapeDiameter")) + " u · bladder " + num(v("bladderCapacity"), 1) + " u³ · reserve " +
-                    num(v("reserveEnergy"), 0) + " E · shell " + num(v("armourThickness")) + " u" + (why.length ? " (" + why.join(", ") + ")" : "")],
-      ["Body", num(v("hullLength"), 1) + " u long · " + num(v("hullVolume"), 0) + " u³ · skin " + num(v("wettedArea"), 0) + " u²"],
-      ["Silhouette", "front " + num(v("frontalArea"), 1) + " · side " + num(v("sideArea"), 1) + " · plan " + num(v("planArea"), 1) + " u²"],
-      ["Tail", num(fin(0, "area"), 1) + " u² · aspect " + num(v("caudalActualAR")) + (lim & 2 ? " (genes ask " + num(v("caudalNominalAR")) + ")" : "")],
-      ["Fins", "dorsal " + num(fin(1, "area"), 1) + " · anal " + num(fin(2, "area"), 1) + " · pectorals 2×" + num(fin(3, "area"), 1) +
-               " · pelvics 2×" + num(fin(5, "area"), 1) + " u²"],
-      ["Mass (est.)", num(v("unloadedMassEstimate")) + " × the neutral body, unloaded (an estimate, not the M2b law)"],
-      ["Cruise speed", "not calibrated — M2b"],
-      ["Turning radius", "not calibrated — M2b"]
-    ];
-    bodyTableEl.textContent = "";
-    rows.forEach(function (r) {
-      var tr = document.createElement("tr"), th = document.createElement("th"), td = document.createElement("td");
-      th.textContent = r[0]; td.textContent = r[1];
-      if (r[1].indexOf("not calibrated") === 0) td.className = "pending";
-      tr.appendChild(th); tr.appendChild(td); bodyTableEl.appendChild(tr);
-    });
-    if (bodyLinkEl && s.app) {   /* the fixture viewer, with this fish's genes (float bits, hex) */
-      var words = [], f32 = new Float32Array(1), u32 = new Uint32Array(f32.buffer), k;
-      for (k = 0; k < 63; k++) { f32[0] = s.app[63 * idx + k]; words.push(("00000000" + u32[0].toString(16)).slice(-8)); }
-      for (k = 0; k < 5; k++) { f32[0] = g[5 * idx + k]; words.push(("00000000" + u32[0].toString(16)).slice(-8)); }
-      f32[0] = v("size"); words.push(("00000000" + u32[0].toString(16)).slice(-8));
-      f32[0] = v("elong"); words.push(("00000000" + u32[0].toString(16)).slice(-8));
-      var page = (window.EVO_ASSETS && window.EVO_ASSETS.bodyplan) || "ocean_bodyplan.html";
-      bodyLinkEl.href = page + "#fish=" + id + ":" + words.join("");
-      bodyLinkEl.hidden = false;
-    } else if (bodyLinkEl) bodyLinkEl.hidden = true;
-  }
-  /* senses -> hidden -> actions (EvoUI.drawBrain, both pages' network; the Ocean's shape, its depth senses and steer z) */
-  function drawBrain(f) {
-    var box = inetCanvas.parentNode, w = box.clientWidth, h = box.clientHeight;
-    if (w < 60 || h < 60) return;
-    var sh = f.shape;
-    var dpr = window.devicePixelRatio || 1, bw = Math.round(w * dpr), bh = Math.round(h * dpr);
-    if (inetCanvas.width !== bw) inetCanvas.width = bw;
-    if (inetCanvas.height !== bh) inetCanvas.height = bh;
-    if (!uiFont) uiFont = getComputedStyle(document.body).fontFamily;
-    netNodes = EvoUI.drawBrain(inetCtx, w, h, f, { nS: sh.nS, nH: sh.nH, nA: sh.nA, gutter: 100, actShort: ACTION_SHORT, actLabels: ACTION_LABELS,
-                                                   font: uiFont, dpr: dpr, fresh: cardFresh, prev: netNodes, hover: netHover });
-    updateSenseLine();
-  }
-  function updateSenseLine() {
-    if (netHover >= 0 && netNodes[netHover]) {
-      var n = netNodes[netHover];
-      var label = n.kind === "Sense" ? (sensorNames[n.i] || "sense " + (n.i + 1)) : n.kind === "Action" ? (ACTION_LABELS[n.i] || actionNames[n.i]) : "neuron " + (n.i + 1);
-      var html = EvoUI.senseHtml(n, cardFresh);
-      if (cardCache.sense !== html + label) {
-        cardCache.sense = html + label;
-        el("isense").innerHTML = html;
-        el("isense").querySelector("b").textContent = label;
-      }
-    } else {
-      var t = EvoUI.senseIdle(cardFresh, coarseMQ.matches, paused, "Space runs it; . steps once");
-      if (cardCache.sense !== t) { cardCache.sense = t; el("isense").textContent = t; }
-    }
-  }
-  function nearestNode(e) {
-    var r = inetCanvas.getBoundingClientRect(), x = e.clientX - r.left, y = e.clientY - r.top;
-    var best = -1, bd = e.pointerType === "mouse" ? 100 : 400;
-    netNodes.forEach(function (n, i) { var d = (n.x - x) * (n.x - x) + (n.y - y) * (n.y - y); if (d < bd) { bd = d; best = i; } });
-    return best;
-  }
-  inetCanvas.addEventListener("pointermove", function (e) { if (e.pointerType === "mouse") netHover = nearestNode(e); });
-  inetCanvas.addEventListener("pointerdown", function (e) { if (e.pointerType !== "mouse") netHover = nearestNode(e); });
-  inetCanvas.addEventListener("pointerleave", function (e) { if (e.pointerType === "mouse") netHover = -1; });
+  inspector.initCard();
+  inspector.initSwatch();
+  inspector.initBody();
+  inspector.registerNetwork();
 
   /* ---------------- the dashboards' recorder ---------------- */
   var sampleBucket = -1;
@@ -2791,7 +2518,7 @@
   function wiringNow() {
     if (!M || !has("oc_wiring")) return null;
     if (turboState !== "live") return turboWiring();
-    var sh = brainShape(), n = M._oc_wiring();   /* both allocate: the view after them */
+    var sh = inspector.brainShape(), n = M._oc_wiring();   /* both allocate: the view after them */
     var data = new Float32Array(heap(), M._oc_wiring_data(), 2 * sh.nS * sh.nA);
     return { at: performance.now(), n: n, senses: sh.nS, actions: sh.nA,
              path: Array.prototype.slice.call(data, 0, sh.nS * sh.nA), direct: Array.prototype.slice.call(data, sh.nS * sh.nA),
@@ -2960,9 +2687,9 @@
     } else if (msg.type === "wiring") {
       wireAsked = false;   /* answered: the next one may be asked */
       if (msg.none || turboState === "live" || engineState !== "ok") return;   /* no world there; it is back here, the page's own the source; or no engine to name them */
-      brainShape();   /* the names: this page's module is the same build */
+      inspector.brainShape();   /* the names: this page's module is the same build */
       turboWire = { at: performance.now(), n: msg.n, senses: msg.senses, actions: msg.actions, path: msg.path, direct: msg.direct,
-                    senseNames: sensorNames, actionNames: actionNames, frame: msg.frame, turbo: true };
+                    senseNames: inspector.sensorNames, actionNames: inspector.actionNames, frame: msg.frame, turbo: true };
     } else if (msg.type === "rec") {
       if (dash()) dash().ingest(msg.rows);
     } else if (msg.type === "snapshot") {
@@ -3001,7 +2728,7 @@
        * start (the run carries on), in this message, before any frame steps
        * the world handed back */
       turboBack(false, false, false, !!ps);
-      if (ps && !finishPendingStart(ps)) restoreAfterTurbo();
+      if (ps && !finishPendingStart(ps)) inspector.restoreAfterTurbo();
       if (!ps) showNote("Turbo ran " + (msg.totalSteps || 0).toLocaleString() + " steps.");
     } else if (msg.type === "error") {
       turboFailed("Turbo stopped: " + (msg.message || "unknown error"), msg.mem);
@@ -3024,7 +2751,7 @@
     setPaused(startFailed ? turboEntryPaused : false);
     updateLocks();
     var res = replayEdits(plan, quiet);
-    if (!holdReturn) restoreAfterTurbo();   /* (held: Stop Turbo & start decides first) */
+    if (!holdReturn) inspector.restoreAfterTurbo();   /* (held: Stop Turbo & start decides first) */
     return res;
   }
   /* The worker stopped on an error, or died. With its memory (the world was
@@ -3064,61 +2791,6 @@
               (again.length ? ", with " + again.join(", ") + " applied again." : ".")) +
               (refused.length ? " Refused: " + refused.join("; ") + "." : ""));
   }
-  /* The fish the visitor had picked (and followed) when Turbo took the world:
-   * its id, family line, place and whether it was followed, in this world
-   * (epoch). The picture can't show it during Turbo; the hand-back (or a
-   * recovery) picks it up again: the same fish if it lives, else the nearest
-   * of its family line (world distance, across the wrap without walls; the
-   * lower id on a tie), else none, said so. Following resumes only if it was
-   * on and not let go meanwhile (C, the fit button: no follow; Esc: nothing).
-   * Never across a new world. The flashlight preference is never written:
-   * the follow's own rule turns the lamp on and puts it back. */
-  function returnPoint() {
-    if (selectedId === null) return null;
-    var s = fresh(lastS), idx = indexOfId(s, selectedId);
-    var r = { id: selectedId, follow: !!(scene && scene.following()), epoch: worldEpoch, family: null, x: 0, y: 0, d: 0 };
-    if (idx >= 0) {
-      r.x = s.segs[12 * idx]; r.y = s.segs[12 * idx + 1]; r.d = s.depth[idx];   /* read before oc_inspect, which may grow the memory */
-      var f = inspect(idx);
-      if (f) r.family = Math.round(f.info[7]);
-    }
-    return r;
-  }
-  function restoreAfterTurbo() {
-    if (engineState !== "ok") return;   /* (restarting: rebuildEngine picks it up when the run is back) */
-    var r = turboReturn;
-    turboReturn = null;
-    if (!r || r.epoch !== worldEpoch || !M || turboState !== "live") return;
-    var s = fresh(lastS), idx = indexOfId(s, r.id), id = r.id;
-    if (idx < 0) { id = nearestOfFamily(s, r); }
-    if (id === null) {
-      toast("Fish #" + r.id + " did not survive Turbo, nor did any of its family line" + (r.follow ? ": nothing to follow." : "."));
-      return;
-    }
-    select(id, true);
-    if (r.follow && scene) { wantFollow = true; scene.setFollow(true); }
-    if (id !== r.id) toast("Fish #" + r.id + " died during Turbo: " + (r.follow ? "following" : "showing") + " #" + id + ", the nearest of its family line.");
-  }
-  /* the nearest living member of r's family line, by id (one oc_inspect per fish: the ids and places copied first) */
-  function nearestOfFamily(s, r) {
-    if (r.family === null || !s || !s.n || !has("oc_inspect")) return null;
-    var n = s.n, ids = Array.prototype.slice.call(s.ids, 0, n), xs = [], ys = [], ds = [], i;
-    for (i = 0; i < n; i++) { xs.push(s.segs[12 * i]); ys.push(s.segs[12 * i + 1]); ds.push(s.depth[i]); }
-    var best = null, bd = Infinity;
-    for (i = 0; i < n; i++) {
-      if (!M._oc_inspect(i)) continue;
-      var info = HO.f64(M, M._oc_inspect_info(), M._oc_inspect_len());   /* a fresh view: oc_inspect allocates */
-      if (Math.round(info[7]) !== r.family) continue;
-      var dx = xs[i] - r.x, dy = ys[i] - r.y, dz = ds[i] - r.d;
-      if (!WALLS) {
-        if (dx > W / 2) dx -= W; else if (dx < -W / 2) dx += W;
-        if (dy > H / 2) dy -= H; else if (dy < -H / 2) dy += H;
-      }
-      var d2 = dx * dx + dy * dy + dz * dz;
-      if (d2 < bd || (d2 === bd && ids[i] < best)) { bd = d2; best = ids[i]; }
-    }
-    return best;
-  }
   function dropWorker() {
     cancelSnapshot("Turbo stopped before it could copy the world");
     if (!turboWorker) return;
@@ -3143,9 +2815,9 @@
       turboEntryCfg = Object.assign({}, runCfg);
       turboEntryPaused = paused;
       live.start();
-      turboReturn = returnPoint();   /* the fish to pick up again after Turbo, before the picture lets it go */
-      select(null);
-      unfollow();
+      inspector.turboReturn = inspector.returnPoint();   /* the fish to pick up again after Turbo, before the picture lets it go */
+      inspector.select(null);
+      inspector.unfollow();
       updateLocks();
       if (!turboWorker) {
         turboWorker = new Worker(A.worker);
@@ -3230,17 +2902,17 @@
     for (var key in heldMoveKeys) ax[heldMoveKeys[key][0]] += heldMoveKeys[key][1];
     scene.setMove(ax.f, ax.r, ax.u, shiftHeld);
     /* the selected fish, by id; a followed fish that died hands over to another */
-    var idx = turboState === "live" ? indexOfId(s, selectedId) : -1;
-    if (idx < 0 && selectedId !== null && turboState === "live") {
-      if (wantFollow && s.n) { idx = randomFish(s, null); select(s.ids[idx], true); }
-      else select(null);
+    var idx = turboState === "live" ? inspector.indexOfId(s, inspector.selectedId) : -1;
+    if (idx < 0 && inspector.selectedId !== null && turboState === "live") {
+      if (inspector.wantFollow && s.n) { idx = inspector.randomFish(s, null); inspector.select(s.ids[idx], true); }
+      else inspector.select(null);
     }
     s.selIdx = idx;
     lastS = s;
     PROF.lap(SP.controller, pt);
     if (!(dash() && dash().isOpen())) scene.render(s, { animT: animT, dtSim: steps * DT, selIdx: idx });
     pt = PROF.beginCpu();
-    s = updateCard(s);
+    s = inspector.updateCard(s);
     pt = PROF.lap(SP.card, pt);
     fpsFrames++;
     if (now - fpsT >= 1000) {
@@ -3298,8 +2970,8 @@
         if (!escHandledElsewhere) {
           if (drawerEl.classList.contains("open")) setDrawer(false);
           else if (statOpen) setStatPanel(false);
-          else if (scene.following()) unfollow();
-          else { select(null); if (turboReturn) { turboReturn = null; showNote("Let go: no fish to pick up after Turbo."); } }
+          else if (scene.following()) inspector.unfollow();
+          else { inspector.select(null); if (inspector.turboReturn) { inspector.turboReturn = null; showNote("Let go: no fish to pick up after Turbo."); } }
         }
         if (document.activeElement && document.activeElement.blur) document.activeElement.blur();
         return;
@@ -3329,9 +3001,9 @@
       if (lk === "o") { setPop(null); setDrawer(!drawerEl.classList.contains("open")); return; }
       if (lk === "i") { setPop(null); setStatPanel(!statOpen); return; }
       /* the view: always */
-      if (lk === "c") { wantFollow = false; scene.resetView(true); if (turboReturn) turboReturn.follow = false; return; }
+      if (lk === "c") { inspector.wantFollow = false; scene.resetView(true); if (inspector.turboReturn) inspector.turboReturn.follow = false; return; }
       if (lk === "l") { toggleLight(); return; }
-      if (lk === "f") { follow(); return; }
+      if (lk === "f") { inspector.follow(); return; }
       /* Turbo: Space stops it (as T does); the speed and the step are Turbo's
        * own while it runs, and say so */
       if (turboState !== "live") {
@@ -3374,8 +3046,8 @@
         if (turboState !== "live") { turboPictureHint(); return; }
         var best = scene.pick(s, e.clientX, e.clientY, e.pointerType === "mouse" ? 18 : 30);
         if (best < 0 && scene.following()) return;   /* a stray tap doesn't drop a follow */
-        if (best >= 0 && scene.following() && s.ids[best] !== selectedId) unfollow();
-        select(best >= 0 ? s.ids[best] : null);
+        if (best >= 0 && scene.following() && s.ids[best] !== inspector.selectedId) inspector.unfollow();
+        inspector.select(best >= 0 ? s.ids[best] : null);
       }, undefined, "Picking a fish");
     });
     var fitTimer = 0;
@@ -3570,21 +3242,15 @@
     updateLight();
     pointerBlur(this);
   });
-  btn("viewbtn", function () { if (scene) { wantFollow = false; scene.resetView(true); if (turboReturn) turboReturn.follow = false; } });
+  btn("viewbtn", function () { if (scene) { inspector.wantFollow = false; scene.resetView(true); if (inspector.turboReturn) inspector.turboReturn.follow = false; } });
   btn("fitbtn", fitToScreen);
   btn("followbtn", function () {
     if (!scene) return;
-    if (scene.following()) unfollow();
-    else if (selectedId !== null) { wantFollow = true; scene.setFollow(true); }
+    if (scene.following()) inspector.unfollow();
+    else if (inspector.selectedId !== null) { inspector.wantFollow = true; scene.setFollow(true); }
   });
-  btn("iclose", function () { unfollow(); select(null); });
-  btn("iexpand", function () {
-    cardExpanded = !cardExpanded;
-    cardEl.classList.toggle("expanded", cardExpanded);
-    el("iexpand").setAttribute("aria-expanded", cardExpanded ? "true" : "false");
-    el("iexpand").title = cardExpanded ? "Hide its brain" : "Show its brain";
-    cardCache.sense = null;
-  });
+  btn("iclose", function () { inspector.unfollow(); inspector.select(null); });
+  btn("iexpand", inspector.toggleExpanded);
   btn("savecp", saveSetup);   /* in Turbo too: the accepted setup */
   btn("saveworld", saveWorld);   /* in Turbo too: the worker's copy, Turbo runs on */
   btn("startconfirm", confirmAsk);
@@ -3952,14 +3618,14 @@
           return !!ok;
         }, false);
       },
-      select: function (idx) { engineCall(function () { var s = fresh(lastS); if (s && idx >= 0 && idx < s.n) select(s.ids[idx]); }); },
+      select: function (idx) { engineCall(function () { var s = fresh(lastS); if (s && idx >= 0 && idx < s.n) inspector.select(s.ids[idx]); }); },
       /* index of the deepest fish right now (-1 with none) */
       deepest: fenced(function () {
         var s = fresh(lastS), best = -1;
         if (s) for (var i = 0; i < s.n; i++) if (best < 0 || s.depth[i] > s.depth[best]) best = i;
         return best;
       }),
-      follow: follow,
+      follow: inspector.follow,
       turbo: function () { return turboState; },
       state: fenced(function () {
         var s = fresh(lastS);
@@ -3969,7 +3635,7 @@
         return { n: s.n, fc: s.fc, pc: s.pc, W: W, H: H, D: D, paused: paused, speed: speed(), steps: lastSteps,
                  hasVz: HAS_VZ, view: scene.view(), e1: E1, cfg: initArgs ? initArgs.cfg : null, seed: initArgs ? initArgs.seed : null,
                  runCfg: Object.assign({}, runCfg), light: LIGHT, flashlight: scene.flashlight(), flashlightLevel: scene.flashlightLevel(),
-                 stepMs: stepMs, fps: fps, following: scene.following(), selectedId: selectedId, selIdx: s.selIdx,
+                 stepMs: stepMs, fps: fps, following: scene.following(), selectedId: inspector.selectedId, selIdx: s.selIdx,
                  turbo: turboState, colourMode: colourMode, colourBrain: colourBrain, frame: s.stats[1],
                  held: live.held(), inflight: live.inflight(), fixedSize: [URL_W, URL_H], walls: WALLS, hasWalls: hasWalls(),
                  stats: Array.prototype.slice.call(s.stats), depthMin: s.n ? lo : 0, depthMax: s.n ? hi : 0,
@@ -3995,7 +3661,7 @@
     window.EvoApp.ready = true;
     window.dispatchEvent(new Event("evo:ready"));
     setTimeout(function () {
-      if (!everSelected && selectedId === null && turboState === "live" && !document.getElementById("guide"))
+      if (!inspector.everSelected && inspector.selectedId === null && turboState === "live" && !document.getElementById("guide"))
         toast(coarseMQ.matches ? "Tap any fish to see its brain." : "Click any fish to see its brain; F follows one with a flashlight.");
     }, 9000);
     tour.startCoach();   /* later: the Turbo coach mark, once */

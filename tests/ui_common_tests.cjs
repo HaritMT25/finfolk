@@ -418,7 +418,7 @@ section("Classic's setup sheet through web/renderer.js: built, the keyboard's ke
 }
 
 section("both pages load ui_common.js and its stylesheet before the scripts that use it");
-for (const [page, users] of [["index.html", ["renderer.js", "dashboard.js"]], ["ocean.html", ["ocean.js", "ocean_dash.js", "ocean_tour.js"]]]) {
+for (const [page, users] of [["index.html", ["renderer.js", "dashboard.js"]], ["ocean.html", ["ocean.js", "ocean_dash.js", "ocean_inspector.js", "ocean_tour.js"]]]) {
   const html = fs.readFileSync(path.join(WEB, page), "utf8"), at = (s) => html.indexOf('<script src="' + s + '"></script>');
   const head = html.slice(0, html.indexOf("</head>"));
   ok(at("ui_common.js") > 0 && users.every((u) => at(u) > at("ui_common.js")) && html.split('<script src="ui_common.js"></script>').length === 2,

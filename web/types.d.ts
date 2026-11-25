@@ -1208,6 +1208,81 @@ interface EvoUIApi {
   senseIdle(fresh: boolean, touch: boolean, paused: boolean, keys: string): string;
 }
 
+/* ---------------- web/ocean_inspector.js (window.EvoOceanInspector) ---------------- */
+
+interface OceanPickedFish { id: number; follow: boolean; family: number | null; x: number; y: number; d: number }
+interface OceanReturnPoint extends OceanPickedFish { epoch: number }
+interface OceanBrainShape { nS: number; nH: number; nA: number }
+interface OceanInspection extends UiBrainNet { info: Float64Array; shape: OceanBrainShape }
+/** The validated runtime body layout, including the diagnostic field lookup built by bodyDetect. */
+interface OceanBodyLayout {
+  at: Record<string, { offset: number }>;
+  fins: { stride: number; values: Record<string, number> };
+}
+interface OceanInspectorElements {
+  fishcard: HTMLElement; inetc: HTMLCanvasElement; iportrait: HTMLCanvasElement;
+  iswatch: HTMLCanvasElement; iskin: HTMLElement; ibody: HTMLElement; ibodyt: HTMLElement; ibodylink: HTMLAnchorElement;
+}
+/** Engine/scene operations retain their existing ready-world preconditions. Getters read the current
+ * root binding on every access; none syncs, refreshes, or invokes a controller during construction. */
+interface OceanInspectorPorts {
+  el<K extends keyof OceanInspectorElements>(id: K): OceanInspectorElements[K];
+  el(id: string): HTMLElement;
+  readonly M: OceanModule;
+  readonly engineState: "ok" | "restarting" | "down";
+  readonly turboState: TurboPhase;
+  readonly lastS: OceanSnapshot;
+  readonly scene: OceanScene;
+  readonly colourMode: string;
+  readonly statOpen: boolean;
+  readonly paused: boolean;
+  readonly BODY_LAYOUT: OceanBodyLayout;
+  readonly HO: Pick<EvoOceanHandoffApi, "f64">;
+  readonly worldEpoch: number;
+  readonly WALLS: boolean;
+  readonly W: number; readonly H: number; readonly D: number;
+  readonly STATS: { frame: number };
+  readonly ACTION_SHORT: string[]; readonly ACTION_LABELS: string[];
+  readonly coarseMQ: MediaQueryList;
+  cardNewer: boolean; cardHeld: boolean; dirtyHud: boolean;
+  has(name: string): boolean;
+  syncedFrame(): number;
+  turboPictureHint(): void;
+  engineCall<T>(fn: () => T, fallback: T | undefined, action?: string): T | undefined;
+  fresh(s: OceanSnapshot): OceanSnapshot;
+  setStatPanel(on: boolean): void;
+  cfgVal(key: string): number;
+  heap(): ArrayBuffer;
+  cString(ptr: number): string;
+  toast(text: string): void;
+  hideCoach(): void;
+}
+interface OceanInspector {
+  initSelection(): void; initBrainClock(): void;
+  initCard(): void; initSwatch(): void; initBody(): void; registerNetwork(): void;
+  readonly selectedId: number | null; readonly everSelected: boolean;
+  wantFollow: boolean;
+  turboReturn: OceanReturnPoint | null;
+  readonly cardEl: HTMLElement;
+  readonly sensorNames: string[] | null; readonly actionNames: string[] | null;
+  resetSelection(): void;
+  resetBrainClock(tick: number, on: boolean): void;
+  captureBrainClock(on: boolean, tick: number): void;
+  pickedNow(): OceanPickedFish | null;
+  indexOfId(s: OceanSnapshot | null, id: number | null): number;
+  randomFish(s: OceanSnapshot | null, notId: number | null): number;
+  select(id: number | null, handover?: boolean): void;
+  follow(): void; unfollow(): void;
+  inspect(idx: number): OceanInspection | null;
+  brainShape(): OceanBrainShape;
+  updateCard(s: OceanSnapshot): OceanSnapshot;
+  nearestOfFamily(s: OceanSnapshot | null, r: OceanPickedFish): number | null;
+  returnPoint(): OceanReturnPoint | null;
+  restoreAfterTurbo(): void;
+  toggleExpanded(): void;
+}
+interface EvoOceanInspectorApi { create(ports: OceanInspectorPorts): OceanInspector }
+
 /* ---------------- web/ocean_tour.js (window.EvoOceanTour) ---------------- */
 
 interface OceanGuideHelpers {
@@ -1264,7 +1339,7 @@ interface OceanTourPorts {
   readonly turboState: TurboPhase;
   readonly openPop: string | null;
   readonly statOpen: boolean;
-  readonly selectedId: number | null;
+  readonly inspector: Pick<OceanInspector, "selectedId" | "cardEl" | "select">;
   readonly drawerEl: HTMLElement;
   dash(): { isOpen(): boolean } | null;
   readonly colourMode: string;
@@ -1279,8 +1354,6 @@ interface OceanTourPorts {
   fresh(s: OceanSnapshot | null): OceanSnapshot | null;
   readonly lastS: OceanSnapshot | null;
   readonly scene: Pick<OceanScene, "pick">;
-  select(id: number | null): void;
-  readonly cardEl: HTMLElement;
 }
 interface OceanTour {
   installGuide(): void;
@@ -1295,6 +1368,9 @@ interface EvoOceanTourApi { create(p: OceanTourPorts): OceanTour }
 
 /** the scene (web/ocean_scene.js create()): what the benchmark and the page's API use of it */
 interface OceanScene {
+  following(): boolean;
+  setFollow(on: boolean): void;
+  project(s: OceanSnapshot, idx: number): { x: number; y: number } | null;
   pick(s: OceanSnapshot, x: number, y: number, radius: number): number;
   setQuality(q: number): void;
   quality(): number;
@@ -1332,6 +1408,7 @@ declare var EvoOceanHandoff: EvoOceanHandoffApi;
 declare var EvoAppearanceSlots: EvoAppearanceSlotsApi;
 declare var EvoOceanPerf: EvoOceanPerfApi;
 declare var EvoOceanConfig: EvoOceanConfigApi;
+declare var EvoOceanInspector: EvoOceanInspectorApi;
 declare var EvoOceanTour: EvoOceanTourApi;
 declare var EvoGuideConfig: OceanGuideConfig;
 declare var EvoApp: OceanGuideApp;

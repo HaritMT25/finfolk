@@ -301,14 +301,14 @@ const PAGE_SRC = (() => {
         '    get worldEpoch() { return worldEpoch; }, get pendingStart() { return typeof pendingStart === "undefined" ? null : pendingStart; },\n' +
         '    get asking() { return typeof asking === "undefined" ? null : asking; },\n' +
         '    get usedTurbo() { return typeof usedTurbo === "undefined" ? null : usedTurbo; }, get turboStats() { return turboStats; },\n' +
-        '    get turboReturn() { return typeof turboReturn === "undefined" ? null : turboReturn; },\n' +
-        '    set turboReturn(v) { if (typeof turboReturn !== "undefined") turboReturn = v; },\n' +
-        '    get lastS() { return fresh(lastS); }, inspect: inspect,\n' +
+        '    get turboReturn() { return inspector.turboReturn; },\n' +
+        '    set turboReturn(v) { inspector.turboReturn = v; },\n' +
+        '    get lastS() { return fresh(lastS); }, inspect: inspector.inspect,\n' +
         '    get draft() { return typeof draft === "undefined" ? null : draft; }, get draftGen() { return typeof draftGen === "undefined" ? 0 : draftGen; },\n' +
         '    pendingDiff: typeof pendingDiff === "function" ? pendingDiff : function () { return []; }, readForm: readForm,\n' +
         '    liveTweaks: typeof liveTweaks === "function" ? liveTweaks : function () { return []; },\n' +
         '    getVal: getVal, importWorld: importWorld, wiringNow: wiringNow, frame: frame,\n' +
-        '    get worldSave() { return typeof worldSave === "undefined" ? null : worldSave; }, get selectedId() { return selectedId; },\n' +
+        '    get worldSave() { return typeof worldSave === "undefined" ? null : worldSave; }, get selectedId() { return inspector.selectedId; },\n' +
         '    get engineState() { return typeof engineState === "undefined" ? null : engineState; },\n' +
         '    get filesRead() { return typeof filesRead === "undefined" ? null : filesRead; }, get fileReq() { return fileReq; },\n' +
         '    answered: function (id) { return typeof fileAnswered === "undefined" ? null : fileAnswered.indexOf(id) >= 0; },\n' +
@@ -683,7 +683,7 @@ async function bootPage(query, opts) {
     run('ui_common.js'); run('ocean_handoff.js');
     if (opts.perf) run('ocean_perf.js');
     run('ocean_scene_stub.js', opts.nogl ? SCENE_NOGL : opts.scene || SCENE_STUB); run('ocean_config.js');
-    run('charts_stub.js', CHARTS_STUB); run('ocean_dash.js'); run('ocean_tour.js'); run('ocean.js', PAGE_SRC);
+    run('charts_stub.js', CHARTS_STUB); run('ocean_dash.js'); run('ocean_inspector.js'); run('ocean_tour.js'); run('ocean.js', PAGE_SRC);
     if (opts.guide) run('guide.js');
     page.ctx = ctx; page.doc = doc; page.Ev = Ev; page.T = ctx.__oceanPage; page.KEYS = ctx.EvoOceanConfig.KEYS;
     page.el = (id) => doc.getElementById(id);

@@ -18,7 +18,7 @@
     coachTimer = setInterval(function () {
       var t = (performance.now() - t0) / 1000, gen = p.summary ? p.summary[13] : 0;
       if (coachDone()) { clearInterval(coachTimer); return; }   /* Turbo used, or its card seen, meanwhile */
-      if (!(t >= 60 || (gen >= 1 && t >= 25)) || p.turboState !== "live" || p.openPop || p.statOpen || p.selectedId !== null || document.hidden ||
+      if (!(t >= 60 || (gen >= 1 && t >= 25)) || p.turboState !== "live" || p.openPop || p.statOpen || p.inspector.selectedId !== null || document.hidden ||
           document.getElementById("guide") || p.drawerEl.classList.contains("open") || (p.dash() && /** @type {{ isOpen(): boolean }} */ (p.dash()).isOpen())) return;
       clearInterval(coachTimer);
       p.store(COACH_KEY, "1");
@@ -167,18 +167,18 @@
       return p.engineCall(function () {
         var s = p.fresh(p.lastS);
         if (p.turboState !== "live" || !s || !s.n) return false;
-        if (p.selectedId !== null) return true;
+        if (p.inspector.selectedId !== null) return true;
         var best = p.scene.pick(s, innerWidth * 0.4, innerHeight * 0.45, 4000);
         if (best < 0) best = 0;
-        p.select(guideFish = s.ids[best]);
+        p.inspector.select(guideFish = s.ids[best]);
         return true;
       }, false);
     },
     releaseFish: function () {
-      if (guideFish !== null && p.selectedId === guideFish) p.engineCall(function () { p.select(null); });
+      if (guideFish !== null && p.inspector.selectedId === guideFish) p.engineCall(function () { p.inspector.select(null); });
       guideFish = null;
     },
-    inspectorRect: function () { return p.selectedId === null || p.cardEl.hidden ? null : p.cardEl.getBoundingClientRect(); }
+    inspectorRect: function () { return p.inspector.selectedId === null || p.inspector.cardEl.hidden ? null : p.inspector.cardEl.getBoundingClientRect(); }
   };
 
   }
