@@ -98,7 +98,7 @@
       ports.M._oc_set_capture(id !== null ? 1 : 0);
       brainClock.capture(id !== null, ports.syncedFrame());
     }
-    ports.dirtyHud = true;
+    ports.readouts.dirtyHud = true;
   }
   /* F: follow the selected fish; again (or with none): a random one */
   function follow() {

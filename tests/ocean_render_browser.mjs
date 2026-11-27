@@ -282,7 +282,7 @@ async function manifestOf(page, label, extra = {}) {
     hashes: { "web/evo_ocean.wasm": sha("web/evo_ocean.wasm"), "web/ocean_scene.js": sha("web/ocean_scene.js"), "web/ocean_perf.js": sha("web/ocean_perf.js"),
               "web/ocean_appearance_slots.js": sha("web/ocean_appearance_slots.js"), "web/ocean_shaders.js": sha("web/ocean_shaders.js"),
               "web/ocean_pose.js": sha("web/ocean_pose.js"), "web/ocean_materials.js": sha("web/ocean_materials.js"),
-              "web/ocean_scene_parity.js": sha("web/ocean_scene_parity.js"), "web/ocean.js": sha("web/ocean.js"), "web/ocean_tour.js": sha("web/ocean_tour.js"), "web/ocean_inspector.js": sha("web/ocean_inspector.js"), "web/vendor/three.bundle.min.js": sha("web/vendor/three.bundle.min.js") },
+              "web/ocean_scene_parity.js": sha("web/ocean_scene_parity.js"), "web/ocean.js": sha("web/ocean.js"), "web/ocean_tour.js": sha("web/ocean_tour.js"), "web/ocean_inspector.js": sha("web/ocean_inspector.js"), "web/ocean_readouts.js": sha("web/ocean_readouts.js"), "web/vendor/three.bundle.min.js": sha("web/vendor/three.bundle.min.js") },
     host: { platform: process.platform, cpus: os.cpus().length, cpuModel: os.cpus()[0] && os.cpus()[0].model, totalMemGB: Math.round(os.totalmem() / 1e9) },
     info }, extra);
 }

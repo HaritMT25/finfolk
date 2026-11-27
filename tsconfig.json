@@ -26,6 +26,7 @@
     "web/ocean_handoff.js",
     "web/ocean_perf.js",
     "web/ocean_config.js",
+    "web/ocean_readouts.js",
     "web/ocean_inspector.js",
     "web/ocean_tour.js",
     "web/ocean_appearance.js",

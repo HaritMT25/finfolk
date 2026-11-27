@@ -391,7 +391,7 @@
     get D() { return D; },
     get cardNewer() { return cardNewer; }, set cardNewer(v) { cardNewer = v; },
     get cardHeld() { return cardHeld; }, set cardHeld(v) { cardHeld = v; },
-    get dirtyHud() { return dirtyHud; }, set dirtyHud(v) { dirtyHud = v; },
+    get readouts() { return readouts; },
     hideCoach: function () { tour.hideCoach(); }
   });
   function startWorld(plan) {
@@ -430,7 +430,7 @@
       historyUnknown = plan.op === "open";   /* (its file has no history: unknown until a start or Replay) */
       clearFieldNotes();
       afterNewWorld();
-      stepOnce = false; summary = null; usedTurbo = false; inspector.turboReturn = null;
+      stepOnce = false; readouts.summary = null; usedTurbo = false; inspector.turboReturn = null;
       if (plan.op === "init") { draft = null; projectForm(); }   /* a start consumes the draft */
       else if (plan.op === "open") { draft = null; projectRunning(); }   /* (its settings now: its live tweaks too) */
       else if (keep) { projectForm(); keep.forEach(function (e) { setRaw(e[0], e[1]); }); updateNeeds(); updateTabDots(); }
@@ -472,8 +472,8 @@
     return { data: u8.slice(0, HO.storedLength(u8)), bytes: u8.length, initArgs: initArgs, runCfg: runCfg, epoch: worldEpoch,
              selectedId: inspector.selectedId, wantFollow: inspector.wantFollow, following: !!(scene && scene.following()), draft: draft, draftGen: draftGen,
              fields: fields, extraCfg: Object.assign({}, extraCfg), nextOnly: Object.assign({}, nextOnly), paused: paused, url: location.href,
-             dash: dash() && dash().save ? dash().save() : null, sampleBucket: sampleBucket, rates: rates.q.slice(),
-             usedTurbo: usedTurbo, turboReturn: inspector.turboReturn, stepOnce: stepOnce, summary: summary, changedLive: Object.assign({}, changedLive),
+             dash: readouts.dash() && readouts.dash().save ? readouts.dash().save() : null, sampleBucket: readouts.sampleBucket, rates: readouts.rates.q.slice(),
+             usedTurbo: usedTurbo, turboReturn: inspector.turboReturn, stepOnce: stepOnce, summary: readouts.summary, changedLive: Object.assign({}, changedLive),
              historyUnknown: historyUnknown, consoleSet: Object.assign({}, consoleSet) };
   }
   /* the page's side of a run put back (its memory is in the module again) */
@@ -482,9 +482,9 @@
     changedLive = Object.assign({}, u.changedLive); historyUnknown = !!u.historyUnknown; consoleSet = Object.assign({}, u.consoleSet);
     inspector.resetSelection();
     afterNewWorld(true);   /* this world read again: no new epoch (the charts: below) */
-    if (u.dash && dash() && dash().restore) dash().restore(u.dash);
-    sampleBucket = u.sampleBucket; rates.q = u.rates.slice();
-    usedTurbo = u.usedTurbo; inspector.turboReturn = u.turboReturn; stepOnce = u.stepOnce; summary = u.summary;
+    if (u.dash && readouts.dash() && readouts.dash().restore) readouts.dash().restore(u.dash);
+    readouts.sampleBucket = u.sampleBucket; readouts.rates.q = u.rates.slice();
+    usedTurbo = u.usedTurbo; inspector.turboReturn = u.turboReturn; stepOnce = u.stepOnce; readouts.summary = u.summary;
     Object.keys(u.fields).forEach(function (k) { setRaw(k, u.fields[k]); });
     extraCfg = u.extraCfg; nextOnly = u.nextOnly;
     updateNeeds(); updateTabDots();
@@ -635,7 +635,7 @@
     WALLS = wallsOn();
     M._oc_sync();         /* the last snapshot's views are the old world's: */
     lastS = snapshot();   /* the new world's now, not at the next frame */
-    if (scene && (W !== w0 || H !== h0 || D !== d0 || WALLS !== g0)) { scene.setWorld(W, H, D, { walls: WALLS }); labelHist(); }
+    if (scene && (W !== w0 || H !== h0 || D !== d0 || WALLS !== g0)) { scene.setWorld(W, H, D, { walls: WALLS }); readouts.labelHist(); }
     /* a new world has nothing picked, BEFORE the capture is set from the
      * selection (applyDisplaySwitches): it was set from the old one, and
      * kept capturing senses with nothing selected (review of #44, finding 6;
@@ -653,10 +653,10 @@
     stepMs = 0;
     if (!fromTurbo) {
       if (window.EvoOceanDash) EvoOceanDash.reset();
-      sampleBucket = -1;
-      rates.reset();
+      readouts.sampleBucket = -1;
+      readouts.rates.reset();
     }
-    dirtyHud = true;
+    readouts.dirtyHud = true;
     updateFitButton();
   }
   /* the shim's display switches: the colour mode is the shim's (memory), the
@@ -1966,7 +1966,7 @@
                                 ", the nearest of its family line.";
       }
     }
-    if (dash() && dash().origin) dash().origin("the saved world opened at frame " + fmtInt(world.header.frame));
+    if (readouts.dash() && readouts.dash().origin) readouts.dash().origin("the saved world opened at frame " + fmtInt(world.header.frame));
     showNote("Opened " + worldText(world) + ": it carries on from where it was saved (its charts start afresh). Replay starts its setup again from frame 0." + said);
   }
   /* a world from another engine build: its fish can't come here; its setup,
@@ -2235,7 +2235,25 @@
   var animT = 0, lastNow = 0;
   var fpsFrames = 0, fpsT = 0, fps = 0;
   var governorOn = !BENCH, colourBrain = false, colourMode = "family";
-  var summary = null, summaryT = 0;   /* oc_summary, refreshed twice a second for the readout */
+  var readouts = EvoOceanReadouts.create({
+    el: el, DT: DT, has: has, fresh: fresh, STATS: STATS, updateKeysLegend: updateKeysLegend, showSpeedCap: showSpeedCap, speed: speed, setHtml: setHtml, setTxt: setTxt, fmtInt: fmtInt, fmtTime: fmtTime, lightOn: lightOn, inspector: inspector, heap: heap, cString: cString, turboWiring: turboWiring, engineCall: engineCall, tankShowsFamily: tankShowsFamily, setColourMode: setColourMode, setDrawer: setDrawer, setPop: setPop,
+    get D() { return D; },
+    get M() { return M; },
+    get HO() { return HO; },
+    get turboState() { return turboState; },
+    get turboView() { return turboView; },
+    get fps() { return fps; },
+    get statOpen() { return statOpen; },
+    get initArgs() { return initArgs; },
+    get paused() { return paused; },
+    get lastSteps() { return lastSteps; },
+    get turboStats() { return turboStats; },
+    get scene() { return scene; },
+    get statsLen() { return statsLen; },
+    get colourMode() { return colourMode; },
+    get turboWorker() { return turboWorker; },
+    hideCoach: function () { tour.hideCoach(); }
+  });
   function speed() { return SPEEDS[speedIdx]; }
   function stepsThisFrame() {
     var ask = speed();
@@ -2250,12 +2268,12 @@
     b.title = (paused ? "Play" : "Pause") + " (Space)";
     el("stepbtn").hidden = !paused;   /* one step: only while paused */
     paintRunState();
-    dirtyHud = true;
+    readouts.dirtyHud = true;
   }
   function changeSpeed(d) {
     speedIdx = Math.max(0, Math.min(SPEEDS.length - 1, speedIdx + d));
     el("speedlabel").textContent = speed() + "×";
-    dirtyHud = true;
+    readouts.dirtyHud = true;
   }
   /* Hold 60 fps may run fewer steps than asked: the label turns, and the
    * caption under it (#speedcap) says how many, on a touch screen too */
@@ -2339,7 +2357,7 @@
     document.body.classList.toggle("help-open", openPop === "help");
     if (openPop) {
       /* never under a layer above it: the charts, a narrow screen's settings sheet */
-      if (dash() && dash().isOpen()) dash().close();
+      if (readouts.dash() && readouts.dash().isOpen()) readouts.dash().close();
       if (!wideMQ.matches && drawerEl.classList.contains("open")) setDrawer(false);
       setStatPanel(false); tour.hideCoach(); placePop();
       if (popOpener.get()) el(POPS[openPop][2]).focus();
@@ -2365,8 +2383,8 @@
 
   var tour = EvoOceanTour.create({
     store: store, P: P, el: el, coarseMQ: coarseMQ,
-    dash: dash, enterTurbo: enterTurbo, setDrawer: setDrawer, setSheetTab: setSheetTab, engineCall: engineCall, fresh: fresh,
-    get summary() { return summary; }, get turboState() { return turboState; }, get openPop() { return openPop; },
+    readouts: readouts, enterTurbo: enterTurbo, setDrawer: setDrawer, setSheetTab: setSheetTab, engineCall: engineCall, fresh: fresh,
+    get turboState() { return turboState; }, get openPop() { return openPop; },
     get statOpen() { return statOpen; }, get drawerEl() { return drawerEl; },
     get colourMode() { return colourMode; }, get HAS_APP() { return HAS_APP; }, get colourBrain() { return colourBrain; },
     get M() { return M; }, get lastS() { return lastS; }, get scene() { return scene; },
@@ -2374,44 +2392,8 @@
   });
 
   /* ---------------- the readout and the stat panel ---------------- */
-  var dirtyHud = true, hudT = 0, histRows = [];
-  function buildHist() {
-    var box = el("hist");
-    for (var i = 0; i < 8; i++) {
-      var row = document.createElement("div"); row.className = "row";
-      var lab = document.createElement("span");
-      var track = document.createElement("div"); track.className = "track";
-      var bar = document.createElement("div"); bar.className = "bar";
-      var t = i / 7;
-      bar.style.background = "oklch(" + (0.84 - 0.30 * t).toFixed(3) + " " + (0.15 - 0.04 * t).toFixed(3) + " " + (150 + 90 * t).toFixed(0) + ")";
-      var pct = document.createElement("b");
-      track.appendChild(bar); row.appendChild(lab); row.appendChild(track); row.appendChild(pct);
-      box.appendChild(row);
-      histRows.push({ lab: lab, bar: bar, pct: pct });
-    }
-  }
-  function labelHist() {
-    for (var i = 0; i < 8; i++) histRows[i].lab.textContent = Math.round(D * i / 8);
-    histRows[0].lab.title = "surface";
-  }
-  /* births / deaths per simulated second over a sliding window (the counters
-   * are cumulative; a drop means a new world) */
-  var rates = {
-    q: [],
-    reset: function () { this.q.length = 0; },
-    push: function (frame, b, d) {
-      var q = this.q, last = q[q.length - 1];
-      if (last && (frame < last.f || b < last.b)) q.length = 0;
-      if (!last || frame !== last.f) q.push({ f: frame, b: b, d: d });
-      while (q.length > 2 && q[q.length - 1].f - q[0].f > 6000) q.shift();
-    },
-    perSec: function (key) {
-      var q = this.q;
-      if (q.length < 2) return null;
-      var a = q[0], b = q[q.length - 1], df = (b.f - a.f) * DT;
-      return df > 0 ? (b[key] - a[key]) / df : null;
-    }
-  };
+  readouts.initHud();
+  readouts.initRates();
   function fmtInt(v) { return Math.round(v).toLocaleString("en-US"); }
   function fmtTime(s) { s = Math.max(0, Math.round(s)); var m = Math.floor(s / 60); return m ? m + " min " + (s % 60) + " s" : s + " s"; }
   function setHtml(id, html) { var e = el(id); if (e && e._v !== html) { e._v = html; e.innerHTML = html; } }
@@ -2432,67 +2414,11 @@
     /* opening, as a popover does (setPop): never under the charts or a narrow
      * screen's settings sheet; no popover over it; the coach mark goes */
     if (open) {
-      if (dash() && dash().isOpen()) dash().close();
+      if (readouts.dash() && readouts.dash().isOpen()) readouts.dash().close();
       if (!wideMQ.matches && drawerEl.classList.contains("open")) setDrawer(false);
       setPop(null); tour.hideCoach();
     }
-    dirtyHud = true;
-  }
-  function updateHud(s, now) {
-    if (!dirtyHud && now - hudT < 500) return;
-    dirtyHud = false; hudT = now;
-    /* while Turbo owns the world, its numbers: the worker's latest stats and
-     * summary (turboView); this page's copy is the world as Turbo took it */
-    var tv = turboState !== "live" ? turboView : null;
-    if (!tv && has("oc_summary") && (!summary || now - summaryT > 450)) {
-      summary = HO.f64(M, M._oc_summary(), M._oc_summary_len());   /* it allocates: the views after it */
-      summaryT = now;
-      s = fresh(s);
-    }
-    var st = tv ? tv.st : s.stats, su = tv ? tv.su : summary, g = function (k) { return STATS[k] < st.length ? st[STATS[k]] : NaN; };
-    var nFish = tv ? g("pop") : s.n, nFood = tv ? su[0] : s.fc, nPred = tv ? su[1] : s.pc;
-    var frame = g("frame");
-    rates.push(frame, g("births"), g("deaths"));
-    setTxt("ro-fish", fmtInt(nFish));
-    setTxt("ro-gen", su ? String(Math.round(su[13])) : "–");
-    setTxt("ro-depth", g("depthMean").toFixed(0));
-    setTxt("ro-fps", String(fps));
-    el("ro-fps").className = "num" + (fps && fps < 45 ? " warn" : "");
-    updateKeysLegend(); showSpeedCap();
-    if (!statOpen) return;
-    var rb = rates.perSec("b"), rd = rates.perSec("d");
-    var rows = [
-      ["fish", fmtInt(nFish)],
-      ["food", fmtInt(nFood)],
-      ["predators", String(nPred)],
-      ["time", fmtTime(frame * DT) + " <small>· frame " + fmtInt(frame) + "</small>"],
-      ["seed", initArgs ? String(initArgs.seed) : "–"],
-      ["births", fmtInt(g("births")) + (rb !== null ? " <small>· " + rb.toFixed(1) + "/s</small>" : "")],
-      ["deaths", fmtInt(g("deaths")) + (rd !== null ? " <small>· " + rd.toFixed(1) + "/s</small>" : "")],
-      ["founders added", fmtInt(g("reseeds"))]
-    ];
-    if (su) {
-      rows.push(["died", "<small>starved </small>" + fmtInt(su[3]) + "<small> · old </small>" + fmtInt(su[4]) + "<small> · caught </small>" + fmtInt(su[2])]);
-      rows.push(["generation", su[12].toFixed(1) + " <small>avg · " + Math.round(su[13]) + " max</small>"]);
-      rows.push(["family lines", fmtInt(su[19])]);
-      rows.push(["neutral depth", (su[14] * D).toFixed(0) + " <small>± " + (su[15] * D).toFixed(0) + "</small>"]);
-    }
-    rows.push(["depth", g("depthMean").toFixed(0) + " ± " + g("depthSd").toFixed(0) + " <small>of " + D.toFixed(0) + "</small>"]);
-    var ask = speed(), ran = paused ? ask : lastSteps;
-    if (tv && turboStats) rows.push(["steps / s", fmtInt(turboStats.stepsPerSec) + " <small>· Turbo</small>"]);
-    else rows.push(["steps / frame", ran + (ran !== ask ? "<small>/" + ask + "</small>" : "") + " <small>· " + fps + " fps</small>"]);
-    setHtml("statlist", rows.map(function (r) { return "<dt>" + r[0] + "</dt><dd>" + r[1] + "</dd>"; }).join(""));
-    for (var i = 0; i < 8; i++) {
-      var k = STATS.hist0 + i, v = k < st.length ? st[k] : 0;
-      v = isFinite(v) ? v : 0;
-      histRows[i].bar.style.width = Math.min(100, v * 200).toFixed(1) + "%";   /* full track = 50 % */
-      histRows[i].pct.textContent = Math.round(v * 100) + "%";
-    }
-    var notes = [];
-    if (paused) notes.push("Paused. Space or ▶ runs it; . steps once.");
-    if (turboState !== "live") notes.push(tv ? "Turbo is running: these are its numbers; the picture waits for it." : "Turbo is running: this picture waits for it.");
-    if (scene && scene.following()) notes.push("Following a fish" + (lightOn() ? ", with the flashlight on." : "."));
-    setTxt("statnotes", notes.join(" "));
+    readouts.dirtyHud = true;
   }
 
   inspector.initCard();
@@ -2500,30 +2426,7 @@
   inspector.initBody();
   inspector.registerNetwork();
 
-  /* ---------------- the dashboards' recorder ---------------- */
-  var sampleBucket = -1;
-  function dash() { return window.EvoOceanDash || null; }
-  /* one sample of this frame's synced world: the row the Turbo worker records
-   * too (web/ocean_handoff.js row(): the stats copied before the summary and
-   * the family lines allocate) */
-  function takeSample(st) {
-    if (!dash() || !has("oc_summary")) return;
-    var every = dash().every(), b = Math.floor(st[1] / every);
-    if (b === sampleBucket) return;
-    sampleBucket = b;
-    dash().push(HO.row(M, dash().famK, statsLen));
-  }
-  /* the Brains dashboard's wiring: this world's, or, while Turbo owns the
-   * world, the worker's (turboWiring) */
-  function wiringNow() {
-    if (!M || !has("oc_wiring")) return null;
-    if (turboState !== "live") return turboWiring();
-    var sh = inspector.brainShape(), n = M._oc_wiring();   /* both allocate: the view after them */
-    var data = new Float32Array(heap(), M._oc_wiring_data(), 2 * sh.nS * sh.nA);
-    return { at: performance.now(), n: n, senses: sh.nS, actions: sh.nA,
-             path: Array.prototype.slice.call(data, 0, sh.nS * sh.nA), direct: Array.prototype.slice.call(data, sh.nS * sh.nA),
-             senseNames: cString(M._oc_sensor_names()).split(","), actionNames: cString(M._oc_action_names()).split(",") };
-  }
+  readouts.initRecorder();
 
   /* ---------------- TURBO (web/ocean_worker.js) ----------------
    * live -> entering -> turbo -> exiting -> live. The worker gets a copy of
@@ -2603,7 +2506,7 @@
     paintStart();
     if (on) paintTurbo();
     updateKeysLegend();
-    dirtyHud = true;
+    readouts.dirtyHud = true;
   }
   /* the strip's numbers (and the bars'), from the worker's latest stats */
   var SPARK_N = 90, spark = [];
@@ -2691,7 +2594,7 @@
       turboWire = { at: performance.now(), n: msg.n, senses: msg.senses, actions: msg.actions, path: msg.path, direct: msg.direct,
                     senseNames: inspector.sensorNames, actionNames: inspector.actionNames, frame: msg.frame, turbo: true };
     } else if (msg.type === "rec") {
-      if (dash()) dash().ingest(msg.rows);
+      if (readouts.dash()) readouts.dash().ingest(msg.rows);
     } else if (msg.type === "snapshot") {
       onSnapshot(msg);   /* Save world's copy: every acknowledgement it holds came before it */
     } else if (msg.type === "set") {
@@ -2744,10 +2647,10 @@
   function turboBack(quiet, lost, startFailed, holdReturn) {
     turboState = "live";
     turboView = null; turboWire = null; wireAsked = false;
-    summary = null;   /* the readout's summary: this world's again, at the next refresh */
+    readouts.summary = null;   /* the readout's summary: this world's again, at the next refresh */
     var plan = live.back(!!lost);
     afterNewWorld(true);
-    sampleBucket = Math.floor(M._oc_stats ? frameNow() / (dash() ? dash().every() : 60) : -1);
+    readouts.sampleBucket = Math.floor(M._oc_stats ? frameNow() / (readouts.dash() ? readouts.dash().every() : 60) : -1);
     setPaused(startFailed ? turboEntryPaused : false);
     updateLocks();
     var res = replayEdits(plan, quiet);
@@ -2779,7 +2682,7 @@
     var lost = !back && was !== "entering";
     if (lost && turboEntryCfg) runCfg = Object.assign({}, turboEntryCfg);
     var res = turboBack(true, lost, was === "entering");
-    if (lost && dash() && dash().rewind) dash().rewind(frameNow());
+    if (lost && readouts.dash() && readouts.dash().rewind) readouts.dash().rewind(frameNow());
     /* what this world took again (the acknowledged edits), and what it refused, truthfully */
     var again = [], seen = {};
     res.applied.forEach(function (e) {
@@ -2829,7 +2732,7 @@
       }
       var mem = heap().slice(0);
       turboWorker.postMessage({ cmd: "start", js: moduleUrls.js, wasm: moduleUrls.wasm, handoff: moduleUrls.handoff, mem: mem,
-                                recEvery: dash() ? dash().every() : 60, famK: dash() ? dash().famK : 8 }, [mem]);
+                                recEvery: readouts.dash() ? readouts.dash().every() : 60, famK: readouts.dash() ? readouts.dash().famK : 8 }, [mem]);
     } catch (err) {
       if (err instanceof WebAssembly.RuntimeError) engineStopped(err);   /* (a trap picking up its fish: the engine stops once, and Turbo goes without a read) */
       turboFailed("Turbo could not start: " + (err && err.message || err), null);
@@ -2895,7 +2798,7 @@
     pt = PROF.lap(SP.sync, pt);
     var s = snapshot();
     pt = PROF.lap(SP.snapshot, pt);
-    if (turboState === "live") { takeSample(s.stats); s = fresh(s); }
+    if (turboState === "live") { readouts.takeSample(s.stats); s = fresh(s); }
     pt = PROF.lap(SP.dashboard, pt);
     if (!HAS_VZ) s.vz = vzEstimate(s, steps > 0);
     var ax = { f: 0, r: 0, u: 0 };
@@ -2910,19 +2813,19 @@
     s.selIdx = idx;
     lastS = s;
     PROF.lap(SP.controller, pt);
-    if (!(dash() && dash().isOpen())) scene.render(s, { animT: animT, dtSim: steps * DT, selIdx: idx });
+    if (!(readouts.dash() && readouts.dash().isOpen())) scene.render(s, { animT: animT, dtSim: steps * DT, selIdx: idx });
     pt = PROF.beginCpu();
     s = inspector.updateCard(s);
     pt = PROF.lap(SP.card, pt);
     fpsFrames++;
     if (now - fpsT >= 1000) {
-      fps = Math.round(fpsFrames * 1000 / (now - fpsT)); fpsFrames = 0; fpsT = now; dirtyHud = true; govern(now);
+      fps = Math.round(fpsFrames * 1000 / (now - fpsT)); fpsFrames = 0; fpsT = now; readouts.dirtyHud = true; govern(now);
       if (scene.quality() !== modelineDetail) updateModeline();   /* (the detail changed: Hold 60 fps, or a benchmark's case) */
     }
-    updateHud(s, now);
+    readouts.updateHud(s, now);
     PROF.lap(SP.hud, pt);
     if (!splashDone) { splashDone = true; el("splash").classList.add("done"); }
-    if (PROF.active) PROF.endFrame(s.n, s.stats[1], !!(dash() && dash().isOpen()));
+    if (PROF.active) PROF.endFrame(s.n, s.stats[1], !!(readouts.dash() && readouts.dash().isOpen()));
   }
 
   /* ---------------- input ---------------- */
@@ -2949,7 +2852,7 @@
    * here in the capture phase, before any handler has closed anything. */
   var escHandledElsewhere = false;
   window.addEventListener("keydown", function (e) {
-    if (e.key === "Escape") escHandledElsewhere = !!(dash() && dash().isOpen()) || !!document.getElementById("guide");
+    if (e.key === "Escape") escHandledElsewhere = !!(readouts.dash() && readouts.dash().isOpen()) || !!document.getElementById("guide");
   }, true);
   function wireInput() {
     document.addEventListener("keyup", function (e) {
@@ -3080,7 +2983,7 @@
   /* ---- settings: a bottom sheet on narrow screens, a side panel on wide ones ---- */
   var drawerEl = el("drawer"), menuBtn = el("menubtn");
   function setDrawer(open) {
-    if (open && dash()) dash().close();
+    if (open && readouts.dash()) readouts.dash().close();
     drawerEl.classList.toggle("open", open);
     document.body.classList.toggle("sheet-open", open);
     menuBtn.setAttribute("aria-expanded", open ? "true" : "false");
@@ -3454,7 +3357,7 @@
   tour.installGuide();
 
   /* ---------------- start ---------------- */
-  buildHist();
+  readouts.buildHist();
   /* An Ocean link is one with any of the keys only the Ocean reads
    * (ocean.html's OCEAN_ONLY, the same list: tests/ocean_turbo_handoff.js
    * holds them equal), ?speed= among them; the keys both pages read (colour,
@@ -3567,28 +3470,13 @@
     scene.setWorld(W, H, D, { walls: WALLS });
     scene.setLight(LIGHT);
     if (scene.setAppearance) scene.setAppearance(colourMode === "appearance");
-    labelHist();
+    readouts.labelHist();
     wireInput();
     updateInsets();
     updateLight();
     updateModeline();
     applyClarity();
-    if (dash()) dash().attach({
-      depth: function () { return D; },
-      /* (the charts' timer: never into a stopped or restarting engine; a trap here stops it once) */
-      familyColor: function (id) { return engineCall(function () { return has("oc_family_color") ? M._oc_family_color(id) : 0x3b5957; }, 0x3b5957); },
-      /* what the tank's fish wear now: "family" (Family, or Appearance in a world without appearance genes), "appearance" or
-       * "brain"; and the charts' way to show their family colours in the tank */
-      colourMode: function () { return tankShowsFamily() ? "family" : colourMode; },
-      showFamilyColours: function () { setColourMode("family"); },
-      wiring: function () { return turboState !== "live" ? wiringNow() : engineCall(wiringNow, null); },
-      setDrawer: setDrawer,
-      /* the charts cover the page: no popover left open under them, and the coach mark goes */
-      onOpen: function () { setPop(null); tour.hideCoach(); },
-      setRecEvery: function (every) {
-        if (turboWorker && (turboState === "entering" || turboState === "turbo")) turboWorker.postMessage({ cmd: "rec", every: every });
-      }
-    });
+    readouts.attach();
     /* (the handles that read the world through fresh(), which cuts a new snapshot from the engine when
      * the memory grew: each fenced whole, as select's and set's are; review of #44, round 4, finding 3) */
     window.EvoOcean = {
@@ -3639,7 +3527,7 @@
                  turbo: turboState, colourMode: colourMode, colourBrain: colourBrain, frame: s.stats[1],
                  held: live.held(), inflight: live.inflight(), fixedSize: [URL_W, URL_H], walls: WALLS, hasWalls: hasWalls(),
                  stats: Array.prototype.slice.call(s.stats), depthMin: s.n ? lo : 0, depthMax: s.n ? hi : 0,
-                 dashRows: dash() ? dash()._rows().length : 0, worldEpoch: worldEpoch,
+                 dashRows: readouts.dash() ? readouts.dash()._rows().length : 0, worldEpoch: worldEpoch,
                  engine: engineState, rebuilds: rebuilds, engineId: pinned ? pinned.sha256 : null };
       })
     };
@@ -3656,7 +3544,7 @@
       },
       /* the page's own colour switch and state, and whether the charts are up (they suspend the tank) */
       setColourMode: setColourMode, colourMode: function () { return colourMode; },
-      dashOpen: function () { return !!(dash() && dash().isOpen()); } });
+      dashOpen: function () { return !!(readouts.dash() && readouts.dash().isOpen()); } });
     requestAnimationFrame(frame);
     window.EvoApp.ready = true;
     window.dispatchEvent(new Event("evo:ready"));
