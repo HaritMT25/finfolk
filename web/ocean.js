@@ -997,6 +997,19 @@
       panel.id = "panel-" + tab.id;
       panel.dataset.tab = tab.id;
       panel.setAttribute("role", "tabpanel");
+      var banner = document.createElement("div");
+      banner.className = "preset staging-banner";
+      banner.hidden = true;
+      var message = document.createElement("span");
+      banner.appendChild(message);
+      var discard = document.createElement("button");
+      discard.type = "button";
+      discard.className = "btn ghost";
+      discard.textContent = "Discard";
+      discard.title = el("startdiscard").title;
+      discard.addEventListener("click", discardDraft);
+      banner.appendChild(discard);
+      panel.appendChild(banner);
       if (tab.id === "ocean") panel.appendChild(presetBox());
       tab.groups.forEach(function (g) {
         var h = document.createElement("h3");
@@ -1010,22 +1023,22 @@
     var saved = store("evo_boids.ocean.tab");
     setSheetTab(saved && el("panel-" + saved) ? saved : "run");
   }
-  /* the Water (E1) tab: the tuned E1 water added to what the tabs hold (the
+  /* the Water tab: the living water added to what the tabs hold (the
    * next world; the rest kept). The whole Living water world is a scenario
    * in Run › Start from. */
   function presetBox() {
     var box = document.createElement("div");
     box.className = "preset";
-    box.innerHTML = "<button type='button' class='btn' id='e1add'><svg class='i'><use href='#i-plus'/></svg>Add the tuned E1 water</button>" +
+    box.innerHTML = "<button type='button' class='btn' id='e1add' title='Adds living water to the next world’s current rules.'><svg class='i'><use href='#i-plus'/></svg>Add living water (waves, current, light)</button>" +
       "<p>Surface waves, a gentle deep current with food drifting in it, light that fades with depth, and depth costs scaled to each fish's " +
       "metabolism, put into these tabs on top of the rest (predators, food, ... stay). They wait for the next start. The whole " +
       "<b>Living water</b> world is in Run › Start from.</p>";
     box.querySelector("#e1add").addEventListener("click", fenced(function () {
       var p = e1Preset();
-      if (!p) { showError(engineState !== "ok" ? "The E1 water: " + engineBusyWhy() + "." : "this module has no E1 preset (oc_e1_preset)"); return; }
+      if (!p) { showError(engineState !== "ok" ? "Living water: " + engineBusyWhy() + "." : "Living water is unavailable in this engine module (oc_e1_preset)"); return; }
       cfgToForm(p);
       updateNeeds(); updateTabDots(); renderStartBar();
-      showNote("The E1 water is in the tabs: it waits for the next start.");
+      showNote("Living water is in the tabs: it waits for the next start.");
       this.blur();
     }));
     return box;
@@ -1057,7 +1070,7 @@
   function pickScenario(id) {
     if (!M) return;
     if (id === "bigtank" && !hasWalls()) { showError("The Big tank needs glass walls: this engine module has none (rebuild web/evo_ocean)."); return; }
-    if (id === "e1" && !e1Preset()) { showError("this module has no E1 preset (oc_e1_preset)"); return; }
+    if (id === "e1" && !e1Preset()) { showError("Living water is unavailable in this engine module (oc_e1_preset)"); return; }
     var n = atRisk(), title = (CFG.SCENARIOS.filter(function (s) { return s.id === id; })[0] || {}).title;
     if (draft && draft.id === id && id !== "surprise") { showNote(title + " is ready: its Start (or the start bar's) starts it."); return; }
     if (n) { askReplace(title, n, function () { stageScenario(id); }); return; }
@@ -1070,7 +1083,6 @@
       setVal("seed", r.seed); setVal("population", r.population); setVal("depth", r.depth); setVal("width", r.width); setVal("height", r.height);
       cfgToForm(r.cfg);
     });
-    el("randnote").textContent = id === "surprise" ? "Picked: " + r.summary + ". Reroll draws again; every setting is in the tabs." : "";
     clearError();
     showNote(r.title + " is ready: Start starts it" + (turboState !== "live" ? " (and stops Turbo)." : "."));
   }
@@ -1085,6 +1097,7 @@
     store("evo_boids.ocean.tab", id);
   }
   function updateTabDots() {
+    var waiting = pendingDiff();
     CFG.TABS.forEach(function (tab) {
       if (!tab.groups) return;
       /* against what a new page starts with: the screen's size, glass walls */
@@ -1095,9 +1108,22 @@
       var changed = tab.groups.some(function (g) {
         return g[1].some(function (k) { return k !== "seed" && k !== "population" && getVal(k) !== pageDef(k); });
       });
-      var b = el("tab-" + tab.id), dot = b.querySelector(".dot");
-      if (changed && !dot) { dot = document.createElement("span"); dot.className = "dot"; dot.title = "changed from the default"; b.appendChild(dot); }
-      else if (!changed && dot) b.removeChild(dot);
+      var waits = tab.groups.some(function (g) {
+        return g[1].some(function (k) {
+          return waiting.indexOf(k) >= 0 || (!!draft && differs(k, formNum(k), runningVal(k)));
+        });
+      });
+      var b = el("tab-" + tab.id);
+      function marker(cls, show, label) {
+        var m = b.querySelector("." + cls);
+        if (show && !m) {
+          m = document.createElement("span"); m.className = cls; m.title = label;
+          m.setAttribute("role", "img"); m.setAttribute("aria-label", label);
+          b.appendChild(m);
+        } else if (!show && m) b.removeChild(m);
+      }
+      marker("dot", changed, "changed from the default");
+      marker("wait-ring", waits, "waits for Start");
     });
   }
   /* Settings that do nothing with the others as they are: dimmed, with the
@@ -1214,7 +1240,7 @@
    * staged scenario or setup file (draft {kind, id, title, summary, base,
    * plan}) fills the whole sheet with its recipe: every edit of it, a live
    * setting's too, is the next world's, and nothing reaches the running one
-   * (the "live" tags hide). What waits is derived from values, never
+   * (the tags read "next world"). What waits is derived from values, never
    * remembered (pendingDiff): a field changed back waits no more. Discard
    * drops what waits, never an accepted live tweak; a start consumes it;
    * Replay keeps it (and drops the live tweaks). draftGen moves with every
@@ -1286,10 +1312,19 @@
     var diff = pendingDiff(), n = diff.length, turbo = turboState !== "live";
     var b = el("restart");
     b.querySelector("span").textContent = pendingStart ? "Stopping Turbo…" : turbo ? "Stop Turbo & start" :
-      draft ? "Start " + draft.title : n ? "Start with " + (n === 1 ? "the change" : "the " + n + " changes") : "Start again";
+      draft ? (draft.id === "surprise" ? "Start this draw" : "Start " + draft.title) : n ? "Start with " + (n === 1 ? "the change" : "the " + n + " changes") : "Start again";
     b.classList.toggle("pending", !!draft || n > 0 || turbo);
     el("startdiscard").hidden = !(draft || n);
     drawerEl.classList.toggle("staging", !!draft);
+    panelsEl.querySelectorAll(".staging-banner").forEach(function (banner) {
+      banner.hidden = !draft;
+      banner.querySelector("span").textContent = draft
+        ? "Editing the next world (" + draft.title + "). The running world keeps its rules." : "";
+    });
+    panelsEl.querySelectorAll(".livetag").forEach(function (tag) {
+      tag.textContent = draft ? "next world" : "live";
+      tag.title = draft ? "applies to the next world when you press Start" : "applies to the running world at once";
+    });
     setHtml("startsummary", draft
       ? "<b>Next world: " + escHtml(draft.title) + "</b> · " + escHtml(draft.summary) + (n ? " · modified (" + n + ")" : "") +
         ". Starting it replaces this run."
@@ -1323,7 +1358,7 @@
     acts.hidden = !pickedId;
     el("rerollbtn").hidden = pickedId !== "surprise";
     var lab = el("scenario-start").querySelector("span");
-    if (lab) lab.textContent = turboState !== "live" ? "Stop & start" : "Start";
+    if (lab) lab.textContent = pickedId === "surprise" ? "Start this draw" : turboState !== "live" ? "Stop & start" : "Start";
     el("scenario-start").title = turboState !== "live" ? "Stops Turbo, then starts this world (asked first)" : "Starts this world";
     /* a phone's strip scrolls sideways: the picked card comes into view with
      * its Start, at a place the strip snaps to (its start), so it stays there */
@@ -1622,10 +1657,8 @@
              build: function () { var x = f(); return { seed: x.seed, population: x.population, depth: x.depth, size: [x.width, x.height], cfg: x.cfg }; } };
   }
   function restart(done) {
-    var plan = startPlan(), d0 = plan.done, picked = !!draft && draft.id === "surprise";
+    var plan = startPlan(), d0 = plan.done;
     plan.done = function () {
-      if (picked) el("randnote").textContent = el("randnote").textContent.replace(/ Reroll draws again;.*$/, " It runs now; every setting is in the tabs.");
-      else el("randnote").textContent = "";
       if (d0) d0();
       if (done) done();
     };
@@ -1633,7 +1666,7 @@
   }
   function newWorld() {
     var plan = startPlan((Math.random() * 0x100000000) >>> 0), d0 = plan.done;
-    plan.done = function () { el("randnote").textContent = ""; if (d0) d0(); toast("A new world, seed " + initArgs.seed + "."); };
+    plan.done = function () { if (d0) d0(); toast("A new world, seed " + initArgs.seed + "."); };
     requestStart(plan);
   }
   /* this world again from its start: oc_reset (the last init's seed and
@@ -2064,7 +2097,6 @@
           setVal("seed", seed >>> 0); setVal("population", pop); setVal("depth", depth); setVal("width", w); setVal("height", h);
           cfgToForm(plan.imported);
         });
-      el("randnote").textContent = "";
       showNote("Ready: " + title + ". Start replaces this run with it, from its start.");
     }
     var n = pendingDiff().length;
