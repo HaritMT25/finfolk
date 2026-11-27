@@ -106,6 +106,8 @@ Memory is tight on the maintainer's PC: use `JOBS`/`BUILD_JOBS`, `nice -n 19`, a
 - `build_ocean.sh` / `build_wasm.sh` then `git diff --quiet -- web/` (exit 0 = unchanged; CI also uses `git diff --quiet -- web/evo_ocean.js web/evo_ocean.wasm`
   for the Ocean): the rebuilt committed modules match their sources. If `web/` shows changes, the modules were stale.
 - `node tests/ocean_turbo_handoff.js`: Turbo hand-off, exit 0 = pass.
+- `node tests/classic_safety_tests.cjs`: 2-D Classic's run safety on its real module and Turbo worker (no browser): the ask-before-replace
+  rule and its entry points, live edits during Turbo (`worker.js` "set") read back after the hand-back, the failure screens. Exit 0 = pass.
 - `node tests/ocean_shader_slots_tests.cjs`: the fish programs' slot contract (`web/ocean_shaders.js`): with no
   feature each program is the plain one; the swim polish's feature gives the lite / full variants; every assembly
   error (slots, targets, ABI, providers, declaration collisions) with a planted mistake; the appends' order.

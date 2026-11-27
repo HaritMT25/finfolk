@@ -1018,4 +1018,6 @@ function markup() {
   ok(css.indexOf(".fc-key figcaption") >= 0 && css.indexOf(".fc-skin .fc-cap") >= 0, "  the colour key's and the skin's captions");
 }
 
-main().catch((e) => { console.log("  FAIL the run threw: " + (e && e.stack || e)); process.exit(1); });
+/* run, or (required by another page test: tests/classic_safety_tests.cjs) lend it the small page DOM and window */
+if (require.main === module) main().catch((e) => { console.log("  FAIL the run threw: " + (e && e.stack || e)); process.exit(1); });
+else module.exports = { pageIds, makeDom, makeWindow, recorder };
