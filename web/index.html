@@ -625,6 +625,7 @@
       <span><b id="ro-fish" class="num">–</b> fish</span>
       <span>gen <b id="ro-gen" class="num">–</b></span>
       <span class="ro-rate"><b id="ro-fps" class="num">–</b> fps</span>
+      <span id="runstate" class="runstate" data-s="live" title="The world is running"><span class="rs-word">Live</span></span>
       <span id="ro-gov" hidden title="the frame budget changed this run: it no longer replays from its seed"><span class="sr">governed run</span></span>
     </button>
     <nav id="worlds" class="chip-surface" aria-label="world">
@@ -636,7 +637,11 @@
       <button id="menubtn" class="icon-btn" aria-label="settings" aria-expanded="false" aria-controls="drawer" title="Settings"><svg class="i"><use href="#i-sliders"/></svg><span>Settings</span></button>
     </div>
   </header>
-  <div id="statpanel" class="chip-surface" hidden aria-live="off"></div>
+  <!-- the live numbers (renderer.js fills #statbody); a phone: the world switch moves in here (#worlds-alt, the Ocean's) -->
+  <div id="statpanel" class="chip-surface" hidden aria-live="off">
+    <div id="statbody"></div>
+    <div id="worlds-alt"><a id="to3dmenu" class="btn" href="#to3d">3-D Ocean<svg class="i out" aria-hidden="true"><use href="#i-out"/></svg></a><span>Fish that sense depth and steer in it, on its own page. This run stops.</span></div>
+  </div>
   <button id="fitbtn" class="btn chip-surface" hidden><svg class="i"><use href="#i-frame"/></svg>Fit the world to this screen</button>
   <div id="toasts" aria-live="polite"></div>
 
