@@ -2,7 +2,8 @@
 // module, headless Brave, one page at a time under tools/ocean_render_perf/lock.mjs): the numbers panel's cumulative
 // births and deaths, what the seed replays (the modeline's data-replay / data-why) through a governor cull, refused files,
 // a refused Restart and a stepper clamped at its bound, and the reseed floor's tip for a loaded world and for an edit
-// Turbo did not take. A local check: it needs a browser and a served tree, so it is not a CI step.
+// made during Turbo (its worker takes it). A Restart or a file that would replace a run with something to lose asks first
+// (the replace rule): these cases answer Replace it. A local check: it needs a browser and a served tree, so it is not a CI step.
 //   python3 wasm/serve.py . 8191            (from the repository root: COOP/COEP, the root's ../img for Classic)
 //   node tests/classic_replay_claims_browser.mjs [--base http://localhost:8191] [--only totals,stepper,refusals,floor,fractional,turbo]
 import { createRequire } from "node:module";
@@ -65,12 +66,21 @@ function floorSaid(tip) {
   return { run: run ? +run[1] : null, form: form ? +form[1] : null };
 }
 async function say(p) { return p.evaluate(() => document.getElementById("err").textContent); }
+/* the replace rule's question, if a start asked it: answered Replace it (Open it) */
+async function answerReplace(p) {
+  await p.waitForTimeout(100);
+  if (await p.isVisible("#startask")) await p.click("#startconfirm");
+}
 async function loadFile(p, name, text) {
   await p.evaluate(() => { document.getElementById("err").textContent = ""; });
   await p.setInputFiles("#cpfile", { name, mimeType: "application/json", buffer: Buffer.from(text) });
+  await p.waitForFunction(() => document.getElementById("err").textContent !== "" || !document.getElementById("startask").hidden, null, { timeout: 15000 });
+  await answerReplace(p);
   await p.waitForFunction(() => document.getElementById("err").textContent !== "", null, { timeout: 15000 });
   return say(p);
 }
+/* Restart, its question (edits waiting ask first) answered Replace it */
+async function restartReplacing(p) { await p.click("#restart"); await answerReplace(p); }
 const errsOk = (p, what) => ok(p.__errs.length === 0, what + ": no page error" + (p.__errs.length ? " (" + p.__errs[0] + ")" : ""));
 
 const CASES = {
@@ -125,7 +135,7 @@ const CASES = {
       const p = await open(ctx, "&threads=0");
       await drawer(p, "world");
       await setField(p, "population", 2500);
-      await p.click("#restart");
+      await restartReplacing(p);
       await closeDrawer(p);
       const cdp = await p.context().newCDPSession(p);
       await cdp.send("Emulation.setCPUThrottlingRate", { rate: 8 });   /* slow frames: Hold 60 fps cuts the population */
@@ -142,7 +152,7 @@ const CASES = {
       await drawer(p, "world");
       await p.evaluate(() => { document.getElementById("err").textContent = ""; });
       await p.fill("#population", "-1");
-      await p.click("#restart");
+      await restartReplacing(p);
       await p.waitForFunction(() => document.getElementById("err").textContent !== "", null, { timeout: 10000 });
       const said4 = await say(p), c4 = await claim(p), g4 = await govShown(p), n4 = (await stats(p))[0];
       ok(/load that checkpoint/.test(said2) && /load that checkpoint/.test(said3) && /evo_init failed/.test(said4) &&
@@ -150,8 +160,9 @@ const CASES = {
          "refused: {} (" + c2 + ", badge " + g2 + "), malformed JSON (" + c3 + ", " + g3 + "), Restart with -1 fish (" + c4 + ", " + g4 +
          "); the world kept its " + n1 + " fish (" + n3 + ", " + n4 + ")");
       await p.fill("#population", "300");
-      await p.click("#restart");
-      await p.waitForTimeout(300);
+      await restartReplacing(p);
+      /* (the badge follows at the page's next tick of its numbers, every 500 ms: waited for, not raced with a fixed 300 ms) */
+      await p.waitForFunction(() => document.getElementById("ro-gov").hidden, null, { timeout: 5000, polling: 50 }).catch(() => {});
       const c5 = await claim(p), g5 = await govShown(p);
       ok(c5 === "yes" && !g5, "an accepted Restart is a new run: it replays (" + c5 + "), the governed badge is gone (" + g5 + ")");
       errsOk(p, "refusals");
@@ -195,9 +206,10 @@ const CASES = {
     }
   },
   /* review of #88, round 2: the floor is a whole number to the engine (an (int) cast): a fractional live edit is refused,
-   * and one that reaches a start (typed during Turbo, which takes no edit, then Restart) is said as the engine runs it */
+   * during Turbo too (its worker takes live edits, after the same check), and one that reaches the world from a file is
+   * said as the engine runs it (0.5 runs as 0) */
   async fractional() {
-    section("A fractional reseed floor: refused live; a start takes it as the engine reads it (0.5 runs as 0)");
+    section("A fractional reseed floor: refused live and during Turbo; a file's is taken as the engine reads it (0.5 runs as 0)");
     const ctx = await launch();
     try {
       const p = await open(ctx, "&threads=0");
@@ -216,27 +228,37 @@ const CASES = {
       await p.click("#turbobtn");
       await p.waitForFunction(() => !document.getElementById("turboexit").disabled, null, { timeout: 60000, polling: 100 });
       await drawer(p, "world");
-      await setField(p, "adv_minPopulation", "0.5");   /* (Turbo takes no live edit: it stays in the form) */
+      await p.evaluate(() => { document.getElementById("err").textContent = ""; });
+      await setField(p, "adv_minPopulation", "0.5");
+      await p.waitForTimeout(200);
+      const during = { said: await say(p), field: await p.inputValue("#adv_minPopulation") };
       await closeDrawer(p);
       await p.click("#turboexit");
       await p.waitForFunction(() => document.getElementById("turbobtn").getAttribute("aria-pressed") === "false" &&
                                     !document.getElementById("turbobtn").disabled, null, { timeout: 60000, polling: 100 });
-      await drawer(p, "world");
-      await p.click("#restart");
-      await p.waitForTimeout(300);
-      const tip = floorSaid(await tipOf(p, "f_population")), field = await p.inputValue("#adv_minPopulation");
       await drawer(p, "run");
       const [dl] = await Promise.all([p.waitForEvent("download"), p.click("#savecp")]);
-      const engine = (JSON.parse(fs.readFileSync(await dl.path(), "utf8")).config || {}).minPopulation;
-      ok(field === "0.5" && engine === 0 && tip.run === 0 && tip.form === null,
-         "0.5 typed during Turbo, then Restart: the engine runs floor " + engine + " (its saved world); the tip says " + JSON.stringify(tip) +
-         " (the form's " + field + " is what runs, as a whole number), not 0.5");
+      const text = fs.readFileSync(await dl.path(), "utf8"), engine = (JSON.parse(text).config || {}).minPopulation;
+      ok(/whole number/.test(during.said) && during.field === "50" && engine === 50,
+         "0.5 typed during Turbo: refused as it is live (\"" + during.said.slice(0, 45) + "…\"), the field back to " + during.field +
+         "; after the hand-back the engine runs floor " + engine);
+      const cp = JSON.parse(text);
+      cp.config.minPopulation = 0.5;
+      const said = await loadFile(p, "half.json", JSON.stringify(cp));
+      await drawer(p, "world");
+      const tip = floorSaid(await tipOf(p, "f_population"));
+      await drawer(p, "run");
+      const [dl2] = await Promise.all([p.waitForEvent("download"), p.click("#savecp")]);
+      const engine2 = (JSON.parse(fs.readFileSync(await dl2.path(), "utf8")).config || {}).minPopulation;
+      ok(/Checkpoint loaded/.test(said) && engine2 === 0 && tip.run === 0,
+         "a saved world whose floor is 0.5 (a file): the engine runs floor " + engine2 + " (its saved world again); the tip says " + JSON.stringify(tip) + ", not 0.5");
       errsOk(p, "fractional");
     } finally { await ctx.close(); }
   },
-  /* review of #88, P2-3: Classic's Turbo takes no live edit, so the form's value is not the run's */
+  /* review of #88, P2-3, and the Turbo fix after it: a live edit made during Turbo goes to its worker and is the run's,
+   * then and after the hand-back (the world's own config: its saved world) */
   async turbo() {
-    section("The reseed floor's tip: an edit made during Turbo, which Turbo does not take");
+    section("The reseed floor's tip: an edit made during Turbo reaches the world");
     const ctx = await launch();
     try {
       const p = await open(ctx, "&threads=0");
@@ -244,7 +266,7 @@ const CASES = {
       await p.waitForFunction(() => !document.getElementById("turboexit").disabled, null, { timeout: 60000, polling: 100 });
       await drawer(p, "world");
       await setField(p, "adv_minPopulation", 0);
-      await p.waitForTimeout(200);
+      await p.waitForFunction(() => document.getElementById("err").textContent === "Reseed floor is now 0 (live)", null, { timeout: 15000, polling: 100 });
       const during = floorSaid(await tipOf(p, "f_population"));
       await closeDrawer(p);
       await p.click("#turboexit");
@@ -252,8 +274,12 @@ const CASES = {
                                     !document.getElementById("turbobtn").disabled, null, { timeout: 60000, polling: 100 });
       await drawer(p, "world");
       const back = floorSaid(await tipOf(p, "f_population"));
-      ok(during.run === 50 && during.form === 0 && back.run === 50 && back.form === 0,
-         "floor 0 typed during Turbo: the tip says this run's 50 and the form's 0 not in it (" + JSON.stringify(during) + "), and after Turbo (" + JSON.stringify(back) + ")");
+      await drawer(p, "run");
+      const [dl] = await Promise.all([p.waitForEvent("download"), p.click("#savecp")]);
+      const engine = (JSON.parse(fs.readFileSync(await dl.path(), "utf8")).config || {}).minPopulation;
+      ok(during.run === 0 && during.form === null && back.run === 0 && back.form === null && engine === 0,
+         "floor 0 typed during Turbo: confirmed by the worker, the tip says this run's 0 (" + JSON.stringify(during) + "), and after Turbo (" +
+         JSON.stringify(back) + "); the engine runs floor " + engine + " (its saved world)");
       errsOk(p, "turbo");
     } finally { await ctx.close(); }
   }

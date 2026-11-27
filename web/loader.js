@@ -80,9 +80,9 @@
     },
     /* -> Promise<{Module, threaded, why, js, wasm}> */
     load: function () {
-      if (!simdSupport())
-        return Promise.reject(new Error("this browser has no WebAssembly SIMD, which the simulation " +
-                                        "needs (Chrome 91+, Firefox 89+ or Safari 16.4+)"));
+      if (!simdSupport())   /* (noSimd: the page offers no other world, the Ocean needs SIMD too) */
+        return Promise.reject(Object.assign(new Error("this browser has no WebAssembly SIMD, which the simulation " +
+                                                      "needs (Chrome 91+, Firefox 89+ or Safari 16.4+)"), { noSimd: true }));
       var t = threadSupport();
       var f = flavor(t.ok);
       return load(f).then(function (m) {

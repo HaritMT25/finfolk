@@ -432,6 +432,17 @@
   #restart.pending { background: var(--plankton); color: var(--plankton-ink); border-color: transparent; }
   #err { flex: 1; min-width: 0; font-size: 13px; line-height: 1.35; color: var(--ink-3); }
   #err.error { color: var(--ember); }
+  /* the question before a start replaces a run with something to lose (renderer.js askStart; the Ocean's
+   * #startask): it takes Restart's place, the status line under it */
+  #startask { flex: 1 1 100%; display: flex; flex-wrap: wrap; align-items: center; gap: 8px 10px; }
+  #startask[hidden] { display: none; }
+  #startaskmsg { flex: 1 1 100%; font-size: 13px; line-height: 1.4; color: var(--ink); }
+  #startask .btn { min-height: 44px; }
+  #applybar.asking { flex-wrap: wrap; gap: 6px 12px; }
+  #applybar.asking #restart { display: none; }
+  #applybar.asking #err { flex: 1 1 100%; }
+  #applybar.asking #err:empty { display: none; }
+  @media (min-width: 600px) and (max-width: 959px) { #startaskmsg { flex: 1 1 240px; } }   /* a tablet's sheet: the question beside its answers */
 
   /* ---------- turbo ----------
    * While Turbo runs, the world is dimmed, not the controls: the scrim sits
@@ -502,6 +513,14 @@
   #splash .swim { display: block; width: 120px; height: 2px; margin: 18px auto 0; border-radius: 1px; background: var(--surface-3); overflow: hidden; position: relative; }
   #splash .swim::after { content: ""; position: absolute; inset: 0 auto 0 0; width: 40%; background: var(--plankton); animation: swim 1.1s var(--ease) infinite; }
   @keyframes swim { from { transform: translateX(-100%); } to { transform: translateX(260%); } }
+  /* a failed start, or the engine stopped mid-run (renderer.js failScreen, the Ocean's): the bar stops, the error in
+   * red, and the ways on (the 3-D Ocean, Reload) */
+  #splash.failed { padding: 20px; transition: none; }   /* (at once: a fading splash is still hidden, and its first way could not take the focus) */
+  #splash.failed .swim { display: none; }
+  #splash.failed p { margin-inline: auto; }   /* (the error widens the column: the line under the name stays centred) */
+  #splashstate.error { color: var(--ember); text-align: left; white-space: pre-wrap; max-width: 60ch; }
+  #splash .splash-acts { display: flex; flex-wrap: wrap; justify-content: center; gap: 10px; margin-top: 18px; }
+  #splash .splash-acts .btn { text-decoration: none; }
 
   /* ---------- tooltip ---------- */
   #tooltip {
@@ -782,6 +801,12 @@
       <!-- the other panels are built by renderer.js (SETTINGS_TABS) -->
     </div>
     <div id="applybar">
+      <!-- asked before a start replaces a run with something to lose (the Ocean's question); it takes Restart's place -->
+      <div id="startask" role="group" aria-labelledby="startaskmsg" hidden>
+        <p id="startaskmsg"></p>
+        <button id="startconfirm" class="btn primary">Replace it</button>
+        <button id="startcancel" class="btn ghost">Keep it</button>
+      </div>
       <button id="restart" class="btn"><svg class="i"><use href="#i-restart"/></svg><span>Restart</span></button>
       <span id="err" role="status"></span>
     </div>
