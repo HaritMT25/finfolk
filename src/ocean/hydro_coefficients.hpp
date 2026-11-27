@@ -92,6 +92,7 @@
 #include "body_plan.hpp"
 #include "body_material.hpp"
 #include "hydro_math.hpp"
+#include "hydro_calibration.hpp"
 #include "physical_genome.hpp"
 
 namespace hydro {
@@ -100,12 +101,12 @@ namespace hydro {
 inline constexpr int kCoefficientAbi = 1;
 inline constexpr int kSupportAbi = 1;
 inline constexpr int kExpressionStage = 1;    // M2b1: gape, eye size neutral; armour zero; barbels absent
-inline constexpr int kReferenceLaw = 1;       // analytic force balance (provisional until assay 2)
+inline constexpr int kReferenceLaw = calibration::kFrozenThrough >= 2 ? 2 : 1;
 inline constexpr int kMaterialLaw = bodymat::kMaterialLaw;
 inline constexpr int kGeometryLaw = bodyplan::kGeometryLaw;
-// the mechanics / energetics laws arrive with the integrator (PR 2); 0 = none yet
-inline constexpr int kMechanicsLaw = 0;
-inline constexpr int kEnergeticsLaw = 0;
+// Internal kernels only until the production integration in PR 3.
+inline constexpr int kMechanicsLaw = 1;
+inline constexpr int kEnergeticsLaw = 1;
 inline bool versionsSupported(int geometry, int material, int expression, int reference) {
     return geometry == kGeometryLaw && material == kMaterialLaw && expression == kExpressionStage && reference == kReferenceLaw;
 }
@@ -125,6 +126,10 @@ inline constexpr float kBuildCost = 6.0f;
 inline constexpr float kNewbornEnergy = 25.0f, kReproEnergy = 20.0f;
 inline constexpr float kMaintFin = 0.04f, kMaintWall = 0.04f, kMaintLipid = 0.02f;
 inline constexpr float kCruiseMotorShare = 0.60f;        // E/s at Uref: workConversion's anchor
+
+// Use this exact division for ledger loads and their acceptance endpoint.
+// Multiplication by kFuelPerEnergy has a separately rounded reciprocal.
+inline float fuelMass(float energy) { return energy > 0 ? energy / 500.0f : 0.0f; }
 
 // The water density in mass units per u³: 1 / Vref.
 inline float rhoWater() {
@@ -609,8 +614,16 @@ struct Loaded {
     S6 Dfin{}, Afin{}, Abody{}, Meff{};   // about the COM
     V3 mouth{0, 0, 0};            // loaded canonical mouth centre
 };
+// The physical-mass and energy-ledger endpoints represent the same real
+// capacity but can round differently. Retain the PR 1 physical endpoint and
+// include the image of Ecap under the exact ledger conversion. This is the
+// outward envelope of those two representations, not an extra ULP allowance.
+inline float fuelCapacity(const Coefficients& c) {
+    return std::max(c.reserveCapacity * (bodymat::kRhoLipid * rhoWater()),
+                    fuelMass(c.energyCapacity));
+}
 // Admissible compressed gas volume is [0, gasCapacity] (surface pressure is
-// the minimum); lipid mass is [0, reserveCapacity * .90 rhoWater]. Refuse
+// the minimum); lipid mass is [0, fuelCapacity(c)]. Refuse
 // out-of-capacity loads without clamping. Publish only a complete finite result;
 // every refusal restores the default Loaded value, including k = 1.
 inline bool evalLoad(const Coefficients& c, float gasVolume, float fuelMass, Loaded& out) {
@@ -619,8 +632,10 @@ inline bool evalLoad(const Coefficients& c, float gasVolume, float fuelMass, Loa
     if (!(gasVolume >= 0.0f) || !(fuelMass >= 0.0f) || !std::isfinite(gasVolume) || !std::isfinite(fuelMass) || !(c.hullVolume > 0.0f)) {
         return refuse();
     }
+    if (!(c.reserveCapacity >= 0.0f) || !std::isfinite(c.reserveCapacity) ||
+        !(c.energyCapacity >= 0.0f) || !std::isfinite(c.energyCapacity)) return refuse();
     const float rw = rhoWater();
-    const float maxFuel = c.reserveCapacity * (bodymat::kRhoLipid * rw);
+    const float maxFuel = fuelCapacity(c);
     if (!std::isfinite(c.gasCapacity) || !std::isfinite(maxFuel) ||
         !(gasVolume <= c.gasCapacity) || !(fuelMass <= maxFuel)) return refuse();
     const float V0 = c.hullVolume;
@@ -795,10 +810,16 @@ inline References buildReferences() {
     r.thrustCap = 2.0f * ((r.forwardDrag * kUact) * kUact);
     r.rowSpeed = std::sqrt(2.0f * r.thrustCap / (rw * c.propArea));
     r.tailEfficiency = c.tailEfficiency;
-    r.cruisePower = r.pmotor(kUref);
-    r.sustainedPower = r.pmotor(kUsusRef);
+    if constexpr (calibration::kFrozenThrough >= 2) {
+        r.cruisePower = std::bit_cast<float>(calibration::kMeasuredCruisePowerBits);
+        r.sustainedPower = std::bit_cast<float>(calibration::kMeasuredSustainedPowerBits);
+    } else {
+        r.cruisePower = r.pmotor(kUref);
+        r.sustainedPower = r.pmotor(kUsusRef);
+    }
     r.workConversion = kCruiseMotorShare / r.cruisePower;
-    r.ok = std::isfinite(r.workConversion) && r.workConversion > 0.0f && r.leanMass > 0.0f && r.muscleMass > 0.0f &&
+    r.ok = std::isfinite(r.cruisePower) && r.cruisePower > 0.0f &&
+           std::isfinite(r.sustainedPower) && r.sustainedPower > 0.0f && std::isfinite(r.workConversion) && r.workConversion > 0.0f && r.leanMass > 0.0f && r.muscleMass > 0.0f &&
            r.finMass > 0.0f && r.wallMass > 0.0f && r.spar > 0.0f ? 1 : 0;
     return r;
 }
@@ -856,6 +877,26 @@ struct Digest {
     void addf(float f) { std::uint32_t u; std::memcpy(&u, &f, 4); add(u); }
     void addFloats(const float* p, int n) { for (int i = 0; i < n; ++i) addf(p[i]); }
 };
+// Explicit law constants, in the frozen protocol order (never struct bytes).
+inline std::uint64_t constantDigest() {
+    Digest d;
+    for (int v : {kGeometryLaw, kMaterialLaw, kExpressionStage, kReferenceLaw,
+                  kMechanicsLaw, kEnergeticsLaw, calibration::kFrozenThrough}) d.add(v);
+    const float values[] = {
+        calibration::kGravity, calibration::kPressureDepthFraction, calibration::kMetacentricFraction,
+        calibration::kDepthGain, calibration::kVerticalGain, calibration::kRegulatorTau,
+        calibration::kGasRateFraction, calibration::kPumpEfficiency,
+        calibration::kStaticFriction, calibration::kDynamicFriction,
+        calibration::kContactSlopPerSize, calibration::kPenetrationLimitPerSize,
+        calibration::kControllerTau, calibration::kHeaveGain, calibration::kPitchGain,
+        calibration::kPairedYawGain, calibration::kTailYawGain, calibration::kTailStiffSpeed,
+        calibration::kPairedInducedEfficiency, calibration::kBrakeCd,
+        kUref, kUsusRef, kUact, kPairedEfficiency, kTauBurst, kGamma,
+        kMaintFin, kMaintWall, kMaintLipid};
+    for (float f : values) d.addf(f);
+    d.add(calibration::kMeasuredCruisePowerBits); d.add(calibration::kMeasuredSustainedPowerBits);
+    return d.h;
+}
 inline std::uint64_t digest(const Coefficients& c) { Digest d; d.addFloats(floats(c).data(), kCoefficientFloats); return d.h; }
 inline std::uint64_t digest(const Support& s) { Digest d; d.addFloats(floats(s).data(), kSupportFloats); return d.h; }
 inline std::uint64_t digest(const References& r) {

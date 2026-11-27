@@ -128,9 +128,13 @@ int main(int argc, char** argv) {
     if (argc != 1) { std::fprintf(stderr, "usage: %s [--bench N]\n", argv[0]); return 2; }
     const std::vector<Body> B = bodies();
     const References& R = references();
-    std::printf("{\"format\":1,\"geometryLaw\":%d,\"materialLaw\":%d,\"expressionStage\":%d,\"referenceLaw\":%d,\"coefficientAbi\":%d,"
+    if(calibration::kFrozenThrough!=4||!R.ok){std::fprintf(stderr,"hydro fixture requires valid frozen stage4\n");return 1;}
+    std::printf("{\"format\":2,\"geometryLaw\":%d,\"materialLaw\":%d,\"expressionStage\":%d,\"referenceLaw\":%d,\"coefficientAbi\":%d,"
                 "\"supportAbi\":%d,\"stateAbi\":%d,\n",
                 kGeometryLaw, kMaterialLaw, kExpressionStage, kReferenceLaw, kCoefficientAbi, kSupportAbi, kStateAbi);
+    std::printf("\"mechanicsLaw\":%d,\"energeticsLaw\":%d,\"frozenThrough\":%d,\"constantDigest\":\"%s\",\n",
+                kMechanicsLaw,kEnergeticsLaw,calibration::kFrozenThrough,hex64(constantDigest()).c_str());
+    bool invariants=true;
     std::printf("\"bytes\":{\"coefficients\":%zu,\"support\":%zu,\"state\":%zu,\"genes\":%zu,\"owner\":8,\"total\":%zu,\"ceiling\":1404,\n",
                 sizeof(Coefficients), sizeof(Support), sizeof(HydroState), sizeof(physical::Genes),
                 sizeof(Coefficients) + sizeof(Support) + sizeof(HydroState) + sizeof(physical::Genes) + 8);
@@ -161,12 +165,13 @@ int main(int argc, char** argv) {
         Coefficients c;
         Support s;
         const int e = compile(b.G, b.S, b.E, b.P, Params{}, c, s);
+        invariants=invariants&&e==kOk;
         std::uint64_t ld[3] = {0, 0, 0}, sd = 0;
         if (e == kOk) {
             const float loads[3][2] = {{0.0f, 0.0f}, {0.5f, 0.25f}, {1.0f, 1.0f}};
             Loaded L;
             for (int q = 0; q < 3; ++q) {
-                evalLoad(c, loads[q][0] * c.gasCapacity, loads[q][1] * c.reserveCapacity * (bodymat::kRhoLipid * rhoWater()), L);
+                invariants=evalLoad(c, loads[q][0] * c.gasCapacity, loads[q][1] * c.reserveCapacity * (bodymat::kRhoLipid * rhoWater()), L)&&invariants;
                 ld[q] = loadedDigest(L);
             }
             const V6 z{{-82.0f, 3.0f, -2.0f, 0.4f, -0.3f, 1.2f}};
@@ -176,6 +181,7 @@ int main(int argc, char** argv) {
             V6 x{};
             LDL6 f;
             const bool ok = solveScaled(A, mulS6(L.Meff, z), c.halfLength, x, &f);
+            invariants=invariants&&ok;
             Digest dd;
             dd.add(ok ? 1u : 0u);
             dd.addFloats(x.v, 6);
@@ -204,5 +210,5 @@ int main(int argc, char** argv) {
     std::printf("\"bodyCount\":%zu,\"digest\":\"%s\"}\n", B.size(), hex64(all.h).c_str());
     std::fprintf(stderr, "ocean_hydro_fixture: %zu bodies, %zu + %zu + %zu B a fish, references %s, digest %s\n", B.size(), sizeof(Coefficients),
                  sizeof(Support), sizeof(HydroState), hex64(digest(R)).c_str(), hex64(all.h).c_str());
-    return 0;
+    return invariants?0:1;
 }

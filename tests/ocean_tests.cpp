@@ -5034,7 +5034,8 @@ void testFlowLanes() {
 #include "ocean_genome_v2_tests.hpp"
 #include "ocean_appearance_tests.hpp"
 #include "ocean_body_plan_tests.hpp"   // the M2a body-plan preview (diagnostic)
-#include "ocean_hydro_tests.hpp"       // M2b1 PR 1: the birth physics foundation (no world)
+#include "ocean_hydro_tests.hpp"
+#include "ocean_hydro_step_tests.hpp"       // M2b1 PR 1: the birth physics foundation (no world)
 #include "ocean_sense_tests.hpp"
 #include "ocean_speed_tests.hpp"   // the exact Turbo speed-ups' own checks
 #include "ocean_transport_tests.hpp"   // explicit flow state and the synchronous kernel
@@ -5091,8 +5092,13 @@ int main(int argc, char** argv) {
             std::printf("OCEAN TESTS: %d passed, %d failed\n", ot::g_passed, ot::g_failed);
             return ot::g_failed ? 1 : 0;
         }
+        if (std::strcmp(argv[2], "hydro_step") == 0) {
+            ot::testHydroStepSuite();
+            std::printf("OCEAN TESTS: %d passed, %d failed\n", ot::g_passed, ot::g_failed);
+            return ot::g_failed ? 1 : 0;
+        }
         if (std::strcmp(argv[2], "label_mask") != 0) {
-            std::fprintf(stderr, "--only: label_mask, body, hydro, transport, wall_transport_food or type_masks\n");
+            std::fprintf(stderr, "--only: label_mask, body, hydro, hydro_step, transport, wall_transport_food or type_masks\n");
             return 2;
         }
         ot::testLabelMask();
@@ -5222,6 +5228,7 @@ int main(int argc, char** argv) {
     ot::testHydroRefuse();
     ot::testHydroState();
     ot::testHydroNumbers();
+    ot::testHydroStepSuite();
     // the glass walls: tests/ocean_walls_tests.hpp
 #ifndef OCEAN_TESTS_NO_SHIM
     ot::testWallsConfig();

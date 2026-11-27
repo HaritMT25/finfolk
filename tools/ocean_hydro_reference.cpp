@@ -29,8 +29,8 @@
 //               with 1, 2.6, 6 rad/s yaw) and relaxation states (sway, heave,
 //               roll, pitch rates): REPORTED, not gated (a model comparison:
 //               the tensor law prices every fin at the body's speed scale s;
-//               the tow / turn / relaxation TRAJECTORY differences need the
-//               integrator, M2b1 PR 2)
+//               fixed-load tow / turn / relaxation trajectories and the
+//               sequential implicit updates are reported by hydroref2)
 //
 // Exits 1 when a gated check exceeds its tolerance. Native only:
 //   g++ -O3 -std=c++20 -ffp-contract=off -DEVO_WORLD_OCEAN -I src tools/ocean_hydro_reference.cpp -o ohr && ./ohr
@@ -44,6 +44,7 @@
 #include <vector>
 #include "ocean/hydro_coefficients.hpp"
 #include "ocean_hydro_bodies.hpp"
+#include "ocean_hydro_trajectory_reference.hpp"
 
 namespace {
 using namespace hydro;
@@ -664,10 +665,41 @@ int main(int argc, char** argv) {
                     wTen.see(rel(at6(L.Dfin, i, j), Dd[i][j], sD), b.name + " D");
                     wTen.see(rel(at6(L.Afin, i, j), Ad[i][j], sA), b.name + " A");
                 }
+            hydroref2::Model model;
+            model.rw=rw; model.materialMass=material.mass; model.length=c.halfLength;
+            model.displaced=birthHull.v+Vg+fuelVolume+double(c.finVolume);
+            model.hullVolume=birthHull.v;model.finVolume=c.finVolume;
+            model.fuelVolume=fuelVolume;model.gasVolume=Vg;
+            model.halfDepth=kd*geometry(bodyplan::at(bodyplan::fMaxHalfDepth));
+            for(int i=0;i<3;++i) {
+                model.K[i]=Khull[i]+.025*profileArea;
+                for(int j=0;j<3;++j){model.inertia[i][j]=material.inertia[i][j];model.J[i][j]=Jbody[i][j];}
+            }
+            for(int i=0;i<6;++i)for(int j=0;j<6;++j) {
+                const double rigid=i<3&&j<3?(i==j?material.mass:0):(i>=3&&j>=3?material.inertia[i-3][j-3]:0);
+                model.mass[i][j]=rigid+Abody[i][j]+Ad[i][j];model.finD[i][j]=Dd[i][j];
+            }
+            // Independent fin-patch order, including zero-area holes.
+            for(int f=0;f<7;++f) {
+                const float area=bc.m[bodyplan::finAt(f,bodyplan::kFinArea)];
+                if(!(area>0))continue;
+                const float* n=bc.m+bodyplan::finAt(f,bodyplan::kFinNormal);
+                const float* p=bc.m+bodyplan::finAt(f,bodyplan::kFinCentroid);
+                const auto& base=finMaterial[f].basis;
+                const D3 lever{p[0]+td*base[0]-material.com[0],p[1]+td*base[1]-material.com[1],p[2]+td*base[2]-material.com[2]};
+                const D3 torque=dcross(lever,{n[0],n[1],n[2]});
+                const double w[]={n[0],n[1],n[2],torque.x,torque.y,torque.z};
+                std::copy(w,w+6,model.finW[f]);model.finCoefficient[f]=.5*rw*kCn*area;
+                model.area[f]=area;model.lever[f]={lever.x,lever.y,lever.z};model.normal[f]={n[0],n[1],n[2]};
+                const double span=bc.m[bodyplan::finAt(f,bodyplan::kFinSpan)];model.aspect[f]=span*span/area;
+            }
             // the solve
             for (int si = 0; si < nStates; ++si) {
                 V6 z;
                 for (int i = 0; i < 6; ++i) z.v[i] = (float)states[si].z[i];
+                const auto referenceName=loadName+" "+states[si].name;
+                hydroref2::check(c,L,model,z,referenceName);
+                hydroref2::checkActuator(c,L,model,z,referenceName);
                 const S6 D = passiveDamping(L, c.halfLength, z);
                 S6 A = L.Meff;
                 for (int q = 0; q < 21; ++q) A.m[q] = A.m[q] + 0.008f * D.m[q];
@@ -721,6 +753,8 @@ int main(int argc, char** argv) {
                     cosSum[si] += dotp / std::sqrt(nt * np);
                 }
             }
+            if(ld[0]==.5f&&(b.name=="neutral"||b.name=="random19"||b.name=="noAppendages"))
+                hydroref2::trajectories(c,L,model,b.name);
         }
     }
     // Reference-only asymmetric hull: shear/translate the neutral point set,
@@ -795,6 +829,7 @@ int main(int argc, char** argv) {
         if (ratioN[si])
             std::printf("    %-22s %10.4g %10.4g %10.4g %10.4f\n", states[si].name, ratioSum[si] / ratioN[si], ratioMin[si], ratioMax[si],
                         cosSum[si] / ratioN[si]);
+    ok = hydroref2::run() && ok;
     std::printf("ocean_hydro_reference: %s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }
