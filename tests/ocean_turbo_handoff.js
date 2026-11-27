@@ -307,7 +307,7 @@ const PAGE_SRC = (() => {
         '    get draft() { return typeof draft === "undefined" ? null : draft; }, get draftGen() { return typeof draftGen === "undefined" ? 0 : draftGen; },\n' +
         '    pendingDiff: typeof pendingDiff === "function" ? pendingDiff : function () { return []; }, readForm: readForm,\n' +
         '    liveTweaks: typeof liveTweaks === "function" ? liveTweaks : function () { return []; },\n' +
-        '    getVal: getVal, importWorld: importWorld, wiringNow: wiringNow, frame: frame,\n' +
+        '    getVal: getVal, importWorld: importWorld, wiringNow: readouts.wiringNow, frame: frame,\n' +
         '    get worldSave() { return typeof worldSave === "undefined" ? null : worldSave; }, get selectedId() { return inspector.selectedId; },\n' +
         '    get engineState() { return typeof engineState === "undefined" ? null : engineState; },\n' +
         '    get filesRead() { return typeof filesRead === "undefined" ? null : filesRead; }, get fileReq() { return fileReq; },\n' +
@@ -683,7 +683,7 @@ async function bootPage(query, opts) {
     run('ui_common.js'); run('ocean_handoff.js');
     if (opts.perf) run('ocean_perf.js');
     run('ocean_scene_stub.js', opts.nogl ? SCENE_NOGL : opts.scene || SCENE_STUB); run('ocean_config.js');
-    run('charts_stub.js', CHARTS_STUB); run('ocean_dash.js'); run('ocean_inspector.js'); run('ocean_tour.js'); run('ocean.js', PAGE_SRC);
+    run('charts_stub.js', CHARTS_STUB); run('ocean_dash.js'); run('ocean_readouts.js'); run('ocean_inspector.js'); run('ocean_tour.js'); run('ocean.js', PAGE_SRC);
     if (opts.guide) run('guide.js');
     page.ctx = ctx; page.doc = doc; page.Ev = Ev; page.T = ctx.__oceanPage; page.KEYS = ctx.EvoOceanConfig.KEYS;
     page.el = (id) => doc.getElementById(id);

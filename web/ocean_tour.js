@@ -16,10 +16,10 @@
     if (p.P.get("guide") === "0" || p.P.has("renderBench") || coachDone()) return;
     var t0 = performance.now();
     coachTimer = setInterval(function () {
-      var t = (performance.now() - t0) / 1000, gen = p.summary ? p.summary[13] : 0;
+      var t = (performance.now() - t0) / 1000, gen = p.readouts.summary ? p.readouts.summary[13] : 0;
       if (coachDone()) { clearInterval(coachTimer); return; }   /* Turbo used, or its card seen, meanwhile */
       if (!(t >= 60 || (gen >= 1 && t >= 25)) || p.turboState !== "live" || p.openPop || p.statOpen || p.inspector.selectedId !== null || document.hidden ||
-          document.getElementById("guide") || p.drawerEl.classList.contains("open") || (p.dash() && /** @type {{ isOpen(): boolean }} */ (p.dash()).isOpen())) return;
+          document.getElementById("guide") || p.drawerEl.classList.contains("open") || (p.readouts.dash() && /** @type {{ isOpen(): boolean }} */ (p.readouts.dash()).isOpen())) return;
       clearInterval(coachTimer);
       p.store(COACH_KEY, "1");
       p.el("coach").hidden = false;

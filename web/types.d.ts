@@ -1208,6 +1208,98 @@ interface EvoUIApi {
   senseIdle(fresh: boolean, touch: boolean, paused: boolean, keys: string): string;
 }
 
+/* ---------------- web/ocean_readouts.js (window.EvoOceanReadouts) ---------------- */
+
+interface OceanRatePoint { f: number; b: number; d: number }
+interface OceanRateHistory {
+  q: OceanRatePoint[];
+  reset(): void;
+  push(frame: number, b: number, d: number): void;
+  perSec(key: "b" | "d"): number | null;
+}
+interface OceanWiring {
+  at: number; n: number; senses: number; actions: number;
+  path: number[]; direct: number[]; senseNames: string[]; actionNames: string[];
+}
+interface OceanDashboardHost {
+  depth(): number;
+  familyColor(id: number): number;
+  colourMode(): string;
+  showFamilyColours(): void;
+  wiring(): OceanWiring | null;
+  setDrawer(open: boolean): void;
+  onOpen(): void;
+  setRecEvery(every: number): void;
+}
+/** Only the dashboard members used by this owner and its existing root callers. */
+interface OceanDashboard {
+  attach(host: OceanDashboardHost): void;
+  every(): number;
+  famK: number;
+  push(row: ReturnType<EvoOceanHandoffApi["row"]>): void;
+  ingest(rows: ReturnType<EvoOceanHandoffApi["row"]>[]): void;
+  reset(): void;
+  rewind(frame: number): void;
+  origin(text: string): void;
+  save(): unknown;
+  restore(saved: unknown): void;
+  open(): void; close(): void; isOpen(): boolean;
+  _rows(): ReturnType<EvoOceanHandoffApi["row"]>[];
+}
+/** Getters read current root bindings, without syncing or refreshing. Engine operations retain their
+ * ready-world preconditions; fresh() in updateHud follows the same allocating export as before. */
+interface OceanReadoutsPorts {
+  el(id: string): HTMLElement;
+  readonly D: number; readonly DT: number;
+  readonly M: OceanModule;
+  readonly HO: Pick<EvoOceanHandoffApi, "f64" | "row">;
+  readonly turboState: TurboPhase;
+  readonly turboView: { st: number[]; su: number[] } | null;
+  readonly STATS: Record<string, number>;
+  readonly fps: number;
+  readonly statOpen: boolean;
+  readonly initArgs: { seed: number } | null;
+  readonly paused: boolean; readonly lastSteps: number;
+  readonly turboStats: { stepsPerSec: number } | null;
+  readonly scene: Pick<OceanScene, "following"> | null;
+  readonly statsLen: number;
+  readonly inspector: Pick<OceanInspector, "brainShape">;
+  readonly colourMode: string;
+  readonly turboWorker: Pick<Worker, "postMessage"> | null;
+  has(name: string): boolean;
+  fresh(s: OceanSnapshot): OceanSnapshot;
+  updateKeysLegend(): void; showSpeedCap(): void;
+  speed(): number;
+  setHtml(id: string, html: string): void;
+  setTxt(id: string, text: string): void;
+  fmtInt(n: number): string; fmtTime(seconds: number): string;
+  lightOn(): boolean;
+  heap(): ArrayBuffer;
+  cString(ptr: number): string;
+  turboWiring(): OceanWiring | null;
+  engineCall<T>(fn: () => T, fallback: T): T;
+  tankShowsFamily(): boolean;
+  setColourMode(mode: string): void;
+  setDrawer(open: boolean): void;
+  setPop(name: string | null): void;
+  hideCoach(): void;
+}
+interface OceanReadouts {
+  initHud(): void; initRates(): void; initRecorder(): void;
+  buildHist(): void; labelHist(): void;
+  updateHud(s: OceanSnapshot, now: number): void;
+  dash(): OceanDashboard | null;
+  takeSample(st: ArrayLike<number>): void;
+  wiringNow(): OceanWiring | null;
+  attach(): void;
+  summary: number[] | null;
+  dirtyHud: boolean;
+  sampleBucket: number;
+  readonly rates: OceanRateHistory;
+}
+interface EvoOceanReadoutsApi { create(ports: OceanReadoutsPorts): OceanReadouts }
+declare var EvoOceanDash: OceanDashboard | undefined;
+
 /* ---------------- web/ocean_inspector.js (window.EvoOceanInspector) ---------------- */
 
 interface OceanPickedFish { id: number; follow: boolean; family: number | null; x: number; y: number; d: number }
@@ -1244,7 +1336,8 @@ interface OceanInspectorPorts {
   readonly STATS: { frame: number };
   readonly ACTION_SHORT: string[]; readonly ACTION_LABELS: string[];
   readonly coarseMQ: MediaQueryList;
-  cardNewer: boolean; cardHeld: boolean; dirtyHud: boolean;
+  cardNewer: boolean; cardHeld: boolean;
+  readonly readouts: Pick<OceanReadouts, "dirtyHud">;
   has(name: string): boolean;
   syncedFrame(): number;
   turboPictureHint(): void;
@@ -1335,13 +1428,12 @@ interface OceanTourPorts {
   readonly P: URLSearchParams;
   el(id: string): HTMLElement;
   readonly coarseMQ: MediaQueryList;
-  readonly summary: ArrayLike<number> | null;
+  readonly readouts: Pick<OceanReadouts, "summary" | "dash">;
   readonly turboState: TurboPhase;
   readonly openPop: string | null;
   readonly statOpen: boolean;
   readonly inspector: Pick<OceanInspector, "selectedId" | "cardEl" | "select">;
   readonly drawerEl: HTMLElement;
-  dash(): { isOpen(): boolean } | null;
   readonly colourMode: string;
   readonly HAS_APP: boolean;
   readonly colourBrain: boolean;
@@ -1408,6 +1500,7 @@ declare var EvoOceanHandoff: EvoOceanHandoffApi;
 declare var EvoAppearanceSlots: EvoAppearanceSlotsApi;
 declare var EvoOceanPerf: EvoOceanPerfApi;
 declare var EvoOceanConfig: EvoOceanConfigApi;
+declare var EvoOceanReadouts: EvoOceanReadoutsApi;
 declare var EvoOceanInspector: EvoOceanInspectorApi;
 declare var EvoOceanTour: EvoOceanTourApi;
 declare var EvoGuideConfig: OceanGuideConfig;
