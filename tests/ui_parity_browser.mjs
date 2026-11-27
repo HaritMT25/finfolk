@@ -30,6 +30,8 @@
 //          opacity 0 from the page's load on, so they keep their place, their focus and their clicks and nothing else
 //          moves; recorded in the manifest. A pull request that restyles some of the page shows that the rest did not change:
 //          its run and main's, both with the same --hide (--compare refuses two runs that hid different elements, INVALID).
+//          A masked comparison proves only the rest of the page, so --compare gates on two --hide runs only with --allow-hide
+//          (without it, INVALID; --report lists them as usual). The selectors' order does not matter.
 // The run writes DIR/manifest.json (kept current after every case): the harness's and the fixture's sha256, the selection,
 //          every capture it was to take, and every one it took (sha256, size, case, set, world, shot, the fixture's difference
 //          policy for it); "complete" only once every run passed and every capture was taken. Exit 1 on any failed run.
@@ -136,7 +138,7 @@ const FORMAT = "ui-parity-run", FORMAT_VERSION = 1;
 
 /* ---------------- arguments: every flag known, a value where one is wanted ---------------- */
 const FLAGS = { base: 1, out: 1, layout: 1, sets: 1, cases: 1, worlds: 1, name: 1, "cases-file": 1,
-                expect: 1, hide: 1, smoke: 0, headed: 0, list: 0, plan: 0, clean: 0, report: 0, archival: 0, compare: 2 };
+                expect: 1, hide: 1, smoke: 0, headed: 0, list: 0, plan: 0, clean: 0, report: 0, archival: 0, compare: 2, "allow-hide": 0 };
 const DEFAULT_CASES = path.join(HERE, "fixtures", "ui_parity_cases.json");
 const SHA_RE = /^[0-9a-f]{64}$/;
 const READY_FIRST = process.env.UI_PARITY_READY_FIRST === "1";
@@ -509,10 +511,14 @@ function compareMain(o) {
     for (const [h, side, m] of [[ha, "BEFORE", ra.m], [hb, "AFTER", rb.m]])
       if (h.bad) problems.push(side + ": its manifest's hide " + JSON.stringify(m.hide) + " is not one a run records (" + h.bad + ")");
     if (!ha.bad && !hb.bad) {
-      if (hideText(ha.list) !== hideText(hb.list))
+      const sorted = (l) => (l ? l.slice().sort() : l);   /* the same elements in another order are the same --hide */
+      if (hideText(sorted(ha.list)) !== hideText(sorted(hb.list)))
         problems.push("the two runs hid different elements (BEFORE --hide " + hideText(ha.list) + ", AFTER --hide " + hideText(hb.list) + "): take both with the same --hide");
       else hidden = ha.list;
     }
+    /* a masked comparison proves only the visible rest: a gate takes it only when asked (--allow-hide); a --report lists it */
+    if (hidden && !report && !o["allow-hide"])
+      problems.push("both runs used --hide " + hideText(hidden) + ": a masked comparison proves only the rest of the page; pass --allow-hide to gate on it (or --report)");
     for (const f of planned) for (const [r, side] of [[ra, "BEFORE"], [rb, "AFTER"]])
       if (!r.m.captures[f]) problems.push(f + ": the comparison plans it, " + side + " did not take it (its selection: " + selText(r.m.selection) + "); narrow the comparison or take the run again");
     files = planned.filter((f) => ra.m.captures[f] && rb.m.captures[f]);
@@ -564,7 +570,10 @@ function compareMain(o) {
 
 /* ---------------- dispatch: compare, list, plan (no browser), then a run ---------------- */
 if (ARGS.compare) {
-  for (const k of Object.keys(ARGS)) if (["compare", "report", "archival", "cases-file", "sets", "cases", "worlds", "out", "clean"].indexOf(k) < 0) usage("--" + k + " is not a --compare flag");
+  for (const k of Object.keys(ARGS)) if (["compare", "report", "archival", "cases-file", "sets", "cases", "worlds", "out", "clean", "allow-hide"].indexOf(k) < 0) usage("--" + k + " is not a --compare flag");
+}
+if (ARGS["allow-hide"] && !ARGS.compare) usage("--allow-hide goes with --compare");
+if (ARGS.compare) {
   compareMain(ARGS);
 }
 if (ARGS.report) usage("--report goes with --compare");

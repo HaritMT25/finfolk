@@ -92,7 +92,7 @@
   --bar-light: oklch(0.93 0.12 95); --bar-light-soft: oklch(0.93 0.12 95 / 0.18);
   --bar-mark: oklch(0.70 0.11 235);
 }
-@media (pointer: coarse) { :root { --bar-h: 52px; --bar-btn: 44px; } }   /* 44 px to tap */
+@media (pointer: coarse) { :root { --bar-h: 52px; --bar-btn: 44px; --bar-edge: 10px; } }   /* 44 px to tap; 10 + 52 keeps the panels at 64 px clear */
 @media (max-width: 599px) { :root { --bar-edge: 10px; } }
 
 /* the shell (the dock's is its ::before, below); the coach mark has buttons, so it is a shell too. (A shell's glass,
@@ -223,6 +223,13 @@ svg.i.out { width: 13px; height: 13px; stroke-width: 2; }
   transition: transform 260ms var(--ease), opacity 200ms var(--ease);
 }
 #dock::before { content: ""; position: absolute; z-index: -1; left: 0; right: 0; bottom: 0; height: var(--bar-h); border-radius: 999px; }
+/* only the painted pill and its controls take input: the reserved band above the pill lets taps reach the tank.
+ * The pages' own rules still hide the dock under a narrow screen's open sheet; there its contents take no input either. */
+#dock, body.sheet-open #dock { pointer-events: none; }
+#dock::before, #dock > * { pointer-events: auto; }
+@media (max-width: 959px) {
+  body.sheet-open #dock::before, body.sheet-open #dock > * { pointer-events: none; }
+}
 #dock .dock-sep { flex: none; width: 1px; height: 20px; margin: 0 6px; background: var(--bar-div); }
 #dock .speed { position: relative; display: flex; align-items: center; margin-left: 4px; }
 #dock .speed .icon-btn { width: var(--bar-btn); }
@@ -266,6 +273,8 @@ svg.i.out { width: 13px; height: 13px; stroke-width: 2; }
 /* the coach mark (the Ocean's Turbo tip): the shell, just above the dock, its arrow in the shell's colours */
 #coach { bottom: calc(var(--bar-edge) + var(--safe-b) + var(--bar-h) + 14px); }
 #coach::after { background: oklch(0.235 0.028 198); border-right: 1px solid var(--bar-rim); border-bottom: 1px solid var(--bar-rim); }
+#coach #coachgo { background: var(--bar-mode); color: var(--bar-mode-ink); }        /* "Try Turbo": Turbo's colour, not Start's lime */
+#coach #coachgo:hover { background: oklch(0.72 0.18 38 / 0.28); }
 
 /* toasts: a lighter caption pill (no rim, no shadow), just above the dock (a phone: under the top bar) */
 #toasts {

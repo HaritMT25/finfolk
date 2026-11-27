@@ -421,13 +421,21 @@ section("--hide: elements kept out of the pictures, the same on both runs of a c
   r = harness("--compare", "x", "y", "--hide", "#topbar");
   ok(r.code === 2 && /--hide is not a --compare flag/.test(r.out), "  --hide with --compare: refused (the runs record what they hid)", r.out);
   const hid = (list) => makeRun(base(), { mutate: (m) => { m.hide = list; } });
+  r = cmp(hid(["#topbar", "#dock"]), hid(["#topbar", "#dock"]), "--allow-hide");
+  ok(r.code === 0 && /PASS: 3 pictures \(both runs with --hide #topbar, #dock\)/.test(r.out), "two runs with the same --hide and --allow-hide: compared, PASS, and it says so", r.out);
   r = cmp(hid(["#topbar", "#dock"]), hid(["#topbar", "#dock"]));
-  ok(r.code === 0 && /PASS: 3 pictures \(both runs with --hide #topbar, #dock\)/.test(r.out), "two runs with the same --hide: compared, PASS, and it says so", r.out);
+  ok(r.code !== 0 && /a masked comparison proves only the rest of the page; pass --allow-hide/.test(r.out), "  the same two runs without --allow-hide: never a silent PASS (a masked gate is asked for)", r.out);
+  r = cmp(hid(["#topbar", "#dock"]), hid(["#topbar", "#dock"]), "--report");
+  ok(r.code === 0 && /both runs with --hide/.test(r.out), "  --report lists two --hide runs without --allow-hide", r.out);
+  r = cmp(hid(["#topbar", "#dock"]), hid(["#dock", "#topbar"]), "--allow-hide");
+  ok(r.code === 0 && /PASS/.test(r.out), "  the same elements in another order: the same --hide", r.out);
+  r = harness("--plan", "--sets", "S0", "--allow-hide");
+  ok(r.code === 2 && /--allow-hide goes with --compare/.test(r.out), "  --allow-hide without --compare: refused (exit 2)", r.out);
   invalid("  one run with --hide, the other without", (...m) => cmp(hid(["#topbar"]), makeRun(base()), ...m), /the two runs hid different elements \(BEFORE --hide #topbar, AFTER --hide none\)/);
   invalid("  two runs that hid different elements", (...m) => cmp(hid(["#topbar"]), hid(["#dock"]), ...m), /hid different elements/);
   invalid("  a manifest whose hide is not a run's (a selector --hide refuses)", (...m) => cmp(hid(["div p"]), hid(["div p"]), ...m), /BEFORE: its manifest's hide \["div p"\] is not one a run records/);
   const d = path.join(TMP, "hidediff");
-  r = cmp(hid(["#keys"]), hid(["#keys"]), "--out", d);
+  r = cmp(hid(["#keys"]), hid(["#keys"]), "--allow-hide", "--out", d);
   let j = {};
   try { j = JSON.parse(fs.readFileSync(path.join(d, "compare.json"), "utf8")); } catch (e) { /* not written: the check fails */ }
   ok(r.code === 0 && Array.isArray(j.hide) && j.hide.join() === "#keys", "  compare.json records what both runs hid", j.hide);

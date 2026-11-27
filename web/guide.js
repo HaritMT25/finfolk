@@ -94,11 +94,12 @@
                (touch() ? "Tap" : "Click") + " it for the rest: food, births, deaths, and the " +
                "average generation, which climbs as evolution runs.";
       } },
-    { drawer: false, title: "Two worlds",
-      target: function () { return rectOf("#worlds"); },
+    { drawer: false, title: "Two worlds",   /* a phone: the switch is in the live numbers' panel (index.html #worlds-alt) */
+      target: function () { return rectOf(innerWidth < 600 ? "#readout" : "#worlds"); },
       body: function () {
         return "You are in <b>2-D Classic</b>, the original flat world that the native app runs; the tank and " +
-               "the flat view in the settings are two pictures of it. <b>3-D</b> opens the Ocean, where the fish " +
+               "the flat view in the settings are two pictures of it. <b>3-D</b>" +
+               (innerWidth < 600 ? " (tap the live numbers here; it is at the bottom)" : "") + " opens the Ocean, where the fish " +
                "sense depth and steer in it. Each world runs on its own, so switching starts the other one fresh.";
       } },
     { desktopOnly: true, drawer: false, title: "Keyboard",

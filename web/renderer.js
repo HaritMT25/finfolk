@@ -1645,6 +1645,7 @@
   }
   function renderStatPanel() {
     var st = lastStats, p = el("statbody");   /* (the panel's numbers; a phone's world switch, #worlds-alt, stays under them) */
+    if (!p) return;
     if (!st || !Module) { p.textContent = "Starting…"; return; }
     var mode = threaded ? "threaded × " + threadCount() : "single-threaded";
     var cap = userCap > 0 && autoCap > 0 ? Math.min(userCap, autoCap) : (userCap || autoCap);
@@ -2540,7 +2541,7 @@
   askBtn("randombtn", randomize);
   askBtn("randombig", randomize);
   btn("guidebtn", function () { if (window.EvoGuide) EvoGuide.start(); });
-  el("to3dmenu").href = el("to3d").href;   /* a phone's switch, in the live numbers: the deploy build renames the Ocean's page in #to3d */
+  if (el("to3dmenu") && el("to3d")) el("to3dmenu").href = el("to3d").href;   /* a phone's switch, in the live numbers: the deploy build renames the Ocean's page in #to3d */
   btn("followbtn", toggleFollow);
   btn("viewbtn", function () { if (view3d) scene.resetView(true); });
   el("view3d").addEventListener("change", fenced(function () { setView(this.checked, true); this.blur(); }));
