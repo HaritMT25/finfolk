@@ -1,0 +1,8 @@
+{
+  "decoderVersion": 2,
+  "entries": 1024,
+  "hashEncoding": "1024 uint32 words, little endian, no prefix",
+  "law": "bits32(evomath::expf((float32(r)*0x1p-10f)*0x1.62e43p-1f)), r=0..1023",
+  "sha256": "695bf69728c263e2f888e9c7faa4b37eababd3c3cb3a29c523f1ef50acdd2553",
+  "tableVersion": 1
+}
