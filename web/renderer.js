@@ -936,6 +936,17 @@
     el("applybar").classList.add("asking");
     if (!drawerEl.classList.contains("open")) setDrawer(true);
   }
+  /* What a start would do changed (a field, Reset every setting): an open
+   * question asked about another start, so it goes (never a start other than
+   * the one asked about), and says so; quiet: the caller says it. A start's
+   * own fills (the dice's pick, R's seed, a load's cap) come after the answer,
+   * and a new question replaces the old one; the view switches and Hold 60 fps
+   * are not part of a start. */
+  function setupChanged(quiet) {
+    if (!asking) return;
+    hideAsk();
+    if (!quiet) showNote("The setup changed: start again to review it.");
+  }
   function hideAsk() {
     asking = null;
     var f = document.activeElement;
@@ -2327,7 +2338,7 @@
     updateTabDots();
     if (!t || !t.id) return;
     if (t.id === "governor" || t.id === "view3d" || t.id === "fishShape" || t.id === "colourBrain" || t.id === "cpfile") return;   /* not settings Restart applies */
-    if (asking) { hideAsk(); showNote("The setup changed: start again to review it."); }   /* never a start other than the one asked about */
+    setupChanged();
     if (t.id.indexOf("adv_") === 0 && LIVE[t.id.slice(4)]) return;  /* applies by itself */
     setPending(true);
   }
@@ -2347,10 +2358,12 @@
   });
   btn("turboexit", exitTurbo);
   btn("advreset", function () {
+    var was = !!asking;
     resetAdvanced();
     Object.keys(BASIC_DEFAULTS).forEach(function (id) { setField(el(id), BASIC_DEFAULTS[id]); });
+    setupChanged(true);
     setPending(true); updateNeeds(); updateTabDots();
-    showNote("Every setting is back to its default. Restart to apply.");
+    showNote("Every setting is back to its default. " + (was ? "Start again to review it." : "Restart to apply."));
   });
   btn("iclose", function () { selectedId = null; });
   btn("iexpand", function () {
