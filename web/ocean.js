@@ -17,10 +17,9 @@
  *     at once to the running world too, the rest waiting for Start;
  *     settings that do nothing with the others as they are are dimmed with
  *     the reason (NEEDS); the Run tab: Start from (scenario cards, Surprise
- *     me, a file: a setup, staged, or a saved world, opened), This run
- *     (Replay, Save setup, Save world: the fish themselves, mid-run); the
- *     start bar (what runs or what waits, Discard, Start: the same fish or
- *     new ones). One door: every world start is a plan for startWorld.
+ *     me), Open & save (a setup staged, a saved world reopened, the two
+ *     saves), This run (diagnostics); the start bar (the named run or what
+ *     waits, Discard, Start: same fish, new fish or Replay). One door: every world start is a plan for startWorld.
  *   - the fish card (click or tap a fish): oc_inspect's numbers and its live
  *     brain (oc_set_capture keeps its senses while a fish is selected)
  *   - Turbo: web/ocean_worker.js steps a copy of the module's memory at full
@@ -371,6 +370,7 @@
    * default); a plan may name another, which this page refuses until it
    * can load one (the eye world will). */
   var ENGINE = "ocean";
+  var runTitle = "your own setup", runCard = null;   /* display identity, kept through Replay and open rollback */
   var usedTurbo = false;     /* Turbo ran this world (a reason to ask before replacing it) */
   var inspector = EvoOceanInspector.create({
     el: el, has: has, syncedFrame: syncedFrame, turboPictureHint: turboPictureHint, engineCall: engineCall, fresh: fresh, setStatPanel: setStatPanel, cfgVal: cfgVal, STATS: STATS, ACTION_SHORT: ACTION_SHORT, ACTION_LABELS: ACTION_LABELS, coarseMQ: coarseMQ, heap: heap, cString: cString, toast: toast,
@@ -401,6 +401,13 @@
     if ((plan.engine || ENGINE) !== ENGINE)
       return { ok: false, why: "that world needs the " + plan.engine + " engine module, and this page runs the " + ENGINE + " one" };
     var a = plan.op === "init" ? plan.build() : null, undo = null;
+    var title = runTitle, card = runCard;
+    if (plan.op === "open") { title = plan.world.name || "saved world"; card = null; }
+    else if (plan.op === "init") {
+      if (draft) { title = draft.title; card = draft.kind === "scenario" ? draft.id : null; }
+      else if (!initArgs && OCEAN_KEYS.every(function (k) { return !P.has(k); })) { title = "Standard"; card = "standard"; }
+      else if (plan.source !== "start" || pendingDiff().some(function (k) { return k !== "seed"; })) { title = "your own setup"; card = null; }
+    }
     /* Replay keeps what waits (a staged recipe: the whole sheet; else the
      * fields that differ from this world, as typed), never the live tweaks
      * it drops: those fields equal this world, so they go back with it */
@@ -428,6 +435,7 @@
     try {
       changedLive = {}; consoleSet = {};   /* a new world: no live change yet (a saved world's own tweaks: liveTweaks) */
       historyUnknown = plan.op === "open";   /* (its file has no history: unknown until a start or Replay) */
+      runTitle = title; runCard = card;
       clearFieldNotes();
       afterNewWorld();
       stepOnce = false; readouts.summary = null; usedTurbo = false; inspector.turboReturn = null;
@@ -469,7 +477,7 @@
   function runNow() {
     var u8 = new Uint8Array(heap()), fields = {};
     Object.keys(KEYS).forEach(function (k) { if (el("o_" + k)) fields[k] = rawOf(k); });
-    return { data: u8.slice(0, HO.storedLength(u8)), bytes: u8.length, initArgs: initArgs, runCfg: runCfg, epoch: worldEpoch,
+    return { data: u8.slice(0, HO.storedLength(u8)), bytes: u8.length, initArgs: initArgs, runCfg: runCfg, runTitle: runTitle, runCard: runCard, epoch: worldEpoch,
              selectedId: inspector.selectedId, wantFollow: inspector.wantFollow, following: !!(scene && scene.following()), draft: draft, draftGen: draftGen,
              fields: fields, extraCfg: Object.assign({}, extraCfg), nextOnly: Object.assign({}, nextOnly), paused: paused, url: location.href,
              dash: readouts.dash() && readouts.dash().save ? readouts.dash().save() : null, sampleBucket: readouts.sampleBucket, rates: readouts.rates.q.slice(),
@@ -478,6 +486,7 @@
   }
   /* the page's side of a run put back (its memory is in the module again) */
   function pageBack(u) {
+    runTitle = u.runTitle; runCard = u.runCard;
     initArgs = u.initArgs; runCfg = u.runCfg; worldEpoch = u.epoch; draft = u.draft; draftGen = u.draftGen;
     changedLive = Object.assign({}, u.changedLive); historyUnknown = !!u.historyUnknown; consoleSet = Object.assign({}, u.consoleSet);
     inspector.resetSelection();
@@ -1013,7 +1022,7 @@
    * show it, and it starts only when its Start (or the start bar's) is
    * pressed: two presses in one place. Surprise me draws again with Reroll.
    * Picking one over edits that wait asks first (Replace / Keep editing). */
-  var CARD_IDS = { standard: "advreset", bigtank: "bigbtn", e1: "e1btn", hunters: "huntersbtn", currents: "currentsbtn", surprise: "randombig", file: "loadcp" };
+  var CARD_IDS = { standard: "advreset", bigtank: "bigbtn", e1: "e1btn", hunters: "huntersbtn", currents: "currentsbtn", surprise: "randombig" };
   /* each card's line is its recipe's (SCENARIOS: Big tank's is written from BIG_TANK) */
   CFG.SCENARIOS.forEach(function (sc) {
     var card = el(CARD_IDS[sc.id]), line = card && card.querySelector("span");
@@ -1266,23 +1275,29 @@
         ". Starting it replaces this run."
       : n ? "<b>Waiting for the next start:</b> " + diff.slice(0, 3).map(function (k) { return escHtml(fieldText(k)); }).join(" · ") +
             (n > 3 ? " · and " + (n - 3) + " more" : "")
-      : "<b>Running</b> · " + escHtml(runSummary()));
+      : "<b>Running: " + escHtml(runTitle) + "</b> · " + escHtml(runSummary()));
     el("startsummary").title = el("startsummary").textContent;   /* (a short screen shows two lines of it) */
     var wc = el("waitingcount"), count = draft ? 1 + n : n;
     wc.hidden = !count;
     setHtml("waitingcount", count + "<span class='wc-word'> waiting</span>");
     wc.title = draft ? draft.title + " is ready for the next start (Setup)" : count + " edit" + (count > 1 ? "s" : "") + " waiting for the next start (Setup)";
-    setTxt("startsame-sub", "seed " + shownSeed() + (draft ? ", " + draft.title : n ? ", with what waits" : ""));
+    setTxt("startsame-sub", "Keeps seed " + shownSeed() + "; " + (draft ? "uses " + draft.title : "keeps the current recipe") + "; applies waiting edits.");
     markCards();
   }
   /* the picked card wears its Start (and Surprise me its Reroll): the same start as the bar's */
   var cardShown = null;   /* the card last brought into view (a new pick scrolls to it, a Reroll doesn't) */
   function markCards() {
-    var pickedId = draft ? (draft.kind === "file" ? "file" : draft.id) : null, acts = el("scenario-acts");
+    var fromFile = !!draft && draft.kind === "file";
+    var pickedId = draft && !fromFile ? draft.id : null, acts = el("scenario-acts"), chip = el("file-recipe");
+    chip.hidden = !fromFile;
+    chip.textContent = fromFile ? "From file: " + draft.title : "";
     Object.keys(CARD_IDS).forEach(function (id) {
       var b = el(CARD_IDS[id]), on = id === pickedId;
       b.setAttribute("aria-pressed", on ? "true" : "false");
-      if (b.parentNode && b.parentNode.classList) b.parentNode.classList.toggle("picked", on);
+      if (b.parentNode && b.parentNode.classList) {
+        b.parentNode.classList.toggle("picked", on);
+        b.parentNode.classList.toggle("running", id === runCard);
+      }
       if (on && b.parentNode && acts.parentNode !== b.parentNode) b.parentNode.appendChild(acts);
     });
     acts.hidden = !pickedId;
@@ -1446,7 +1461,7 @@
     if (why) { showError("Couldn't start that world: " + why + "."); return "refused"; }
     if (pendingStart) { showNote("A new world is already waiting for Turbo to stop."); return "waiting"; }
     if (engineState !== "ok") { showError("Couldn't start that world: " + engineBusyWhy() + "."); return "refused"; }
-    if (loseReasons(plan).length && !confirmed) { askStart(plan); return "asked"; }
+    if ((plan.op === "open" || loseReasons(plan).length) && !confirmed) { askStart(plan); return "asked"; }
     clearError();
     if (turboState === "live") return commitStart(plan) ? "started" : "refused";
     pendingStart = { plan: plan, key: planKey(plan) };
@@ -1565,7 +1580,7 @@
     showNote(a && a.noNote ? a.noNote : a && a.replace ? "Kept your changes." : "Kept your run.");
     if (a && a.opener) a.opener.focus();   /* a question the keyboard opened: the focus back where it was (askBtn) */
   }
-  /* the start bar's menu: Start again (same fish), Start fresh (new fish) */
+  /* the start bar's menu: Start again, Start fresh, Replay from start */
   function setStartMenu(open) {
     var m = el("startmenu");
     if (!m) return;
@@ -1668,18 +1683,16 @@
    * it acknowledged before it copied, the fish the one picked when Save
    * world was pressed. View preferences (colours, clarity, the flashlight,
    * speed, pause) are the visitor's, never the world's, and stay out of it.
-   * From a file opens one (the same card as a setup file, which it tells
-   * apart by its first bytes), read part by part, each part checked before
-   * the next is read (HO.readWorld: the size, the header and its checksum,
+   * Open a file opens one (told apart from a setup file by its first
+   * bytes), read part by part, each part checked before the next is read (HO.readWorld: the size, the header and its checksum,
    * the lengths; HO.headerProblem: every field of it), against this engine
    * build (another build can't take the image: its setup, from the checked
    * header, is offered instead), the body unpacked and checked; then tried
    * in a module of its own, in a worker (probeWorld: the image in, checked
    * against its header, one step), so a file whose image is not a world
    * this engine can run is refused with the run untouched; then through the
-   * one door (requestStart, op "open"): asked first when the run has
-   * something to lose (a staged recipe included), Stop Turbo & open during
-   * Turbo, one new epoch, a transaction (startWorld). Replay then replays
+   * one door (requestStart, op "open"): always asked first (a staged recipe
+   * is dropped too), Stop Turbo & open during Turbo, one new epoch, a transaction (startWorld). Replay then replays
    * its setup from its start, frame 0; the file opened again goes back to
    * the saved moment. */
   /* this page's engine build: the sha-256 of the bytes it pinned and runs */
@@ -1786,7 +1799,7 @@
       var name = "finfolk_seed" + header.start.seed + "_frame" + header.frame + HO.WORLD.EXT;
       download(new Blob(w.parts, { type: "application/octet-stream" }), name);
       toast("Saved the world at frame " + fmtInt(header.frame) + " (" + fmtInt(header.fish) + " fish) as " + name + ", " + fmtMB(w.size) +
-            ". From a file opens it again, carrying on from there (on this engine build, " + shortId(header.engine.wasmSha256) + ")." +
+            ". Use Open a file… to reopen it, carrying on from there (on this engine build, " + shortId(header.engine.wasmSha256) + ")." +
             (waiting ? " What waits for the next start is not in it." : "") +
             (onWay.length ? " Not in it: " + onWay.map(function (k) { return LABELS[k] || k; }).join(", ") + ", still on the way to the world." : ""));
     }).catch(function (err) {
@@ -2019,8 +2032,8 @@
     var plan = importPlan("file", seed, pop, depth, config, undefined, cfgRepeats, [w, h], true);
     var title = "the setup file" + (name ? " " + name : "");
     function stage() {
-      stageDraft({ kind: "file", id: "file", title: "the setup file", plan: plan, seed: seed >>> 0,
-                   summary: (name ? name + ": " : "") + "seed " + (seed >>> 0) + " · " + w + " × " + h + " × " + depth + " · " + pop + " fish" +
+      stageDraft({ kind: "file", id: "file", title: name || "the setup file", plan: plan, seed: seed >>> 0,
+                   summary: "seed " + (seed >>> 0) + " · " + w + " × " + h + " × " + depth + " · " + pop + " fish" +
                             (config.walls === true || config.walls === 1 ? " · glass walls" : config.walls === false || config.walls === 0 ? " · wrapping sides" : "") },
         function () {
           setVal("seed", seed >>> 0); setVal("population", pop); setVal("depth", depth); setVal("width", w); setVal("height", h);
@@ -3081,7 +3094,7 @@
   btn("coachx", tour.hideCoach);
   btn("stepbtn", function () { if (guardTurbo()) return; if (paused) stepOnce = true; });
   /* Start from: each card stages (pickScenario); the picked one's Start starts it */
-  Object.keys(CARD_IDS).forEach(function (id) { if (id !== "file") askBtn(CARD_IDS[id], function () { pickScenario(id); }); });
+  Object.keys(CARD_IDS).forEach(function (id) { askBtn(CARD_IDS[id], function () { pickScenario(id); }); });
   askBtn("scenario-start", startStaged);
   askBtn("rerollbtn", function () { pickScenario("surprise"); });
   /* the start bar: Start (the same fish: this seed), and its menu */
@@ -3091,7 +3104,7 @@
   document.addEventListener("pointerdown", function (e) {
     if (startMenuOpen() && !(e.target.closest && e.target.closest("#startmenu, #startmenubtn"))) setStartMenu(false);
   });
-  askBtn("replay", replay);
+  askBtn("replay", function () { setStartMenu(false); replay(); }, "startmenubtn");
   btn("lightbtn", display.toggleLight);
   ["view", "help"].forEach(function (n) {   /* the triggers; × closes (pointerBlur, setPop: the focus) */
     el(POPS[n][1]).addEventListener("click", function () {
