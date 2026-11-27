@@ -492,6 +492,7 @@
   #tabs button:hover { color: var(--ink); }
   #tabs button[aria-selected="true"] { color: var(--ink); border-bottom-color: var(--plankton); }
   #tabs button .dot { display: inline-block; width: 6px; height: 6px; margin-left: 6px; border-radius: 3px; background: var(--plankton); vertical-align: 2px; }
+  #tabs button .wait-ring { display: inline-block; width: 8px; height: 8px; margin-left: 6px; border: 1.5px solid var(--beam); border-radius: 50%; vertical-align: 1px; }
   #panels { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 4px 18px 24px; }
   .panel[hidden] { display: none; }
   .panel h3 { margin: 18px 0 2px; font-size: 13px; font-weight: 600; color: var(--ink-3); }
@@ -571,7 +572,7 @@
   .spick:hover { background: var(--surface-3); }
   .spick b { font-size: 14px; font-weight: 650; color: var(--ink); }
   .spick span { font-size: 12px; line-height: 1.35; color: var(--ink-3); }
-  #scenario-acts { display: flex; gap: 8px; padding: 0 10px 10px; }
+  #scenario-acts { display: flex; flex-direction: column; gap: 8px; padding: 0 10px 10px; }
   #scenario-acts[hidden] { display: none; }
   #scenario-acts .btn { flex: 1 1 auto; min-height: 44px; padding: 0 12px; white-space: nowrap; }
   #scenario-acts svg.i { width: 18px; height: 18px; }
@@ -581,7 +582,6 @@
     #scenarios::-webkit-scrollbar { display: none; }
     .scard { flex: 0 0 min(64vw, 220px); scroll-snap-align: start; }
   }
-  #randnote { margin-top: 10px; font-size: 13px; color: var(--plankton); line-height: 1.5; }
   /* the start bar's split button and its menu (same fish / new fish / replay) */
   .startsplit { display: inline-flex; flex: 0 1 auto; min-width: 0; position: relative; }   /* (the label shortens with … before it overflows) */
   .startsplit #restart { border-top-right-radius: 0; border-bottom-right-radius: 0; }
@@ -598,7 +598,6 @@
   #startmenu b { display: flex; align-items: center; gap: 8px; font-size: 14px; font-weight: 600; color: var(--ink); }
   #startmenu svg.i { width: 18px; height: 18px; flex: none; }
   #startmenu small { font-size: 12px; color: var(--ink-3); }
-  #randnote:empty { display: none; }
   .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 10px; }
   .panel .hint { margin-top: 8px; font-size: 12px; color: var(--ink-3); line-height: 1.45; }
   .panel .preset { margin-top: 14px; padding: 12px 14px; border-radius: var(--r-md); background: var(--surface-2); border: 1px solid var(--line-soft); }
@@ -632,8 +631,10 @@
   #err { flex: 1 1 100%; min-width: 0; font-size: 13px; line-height: 1.35; color: var(--ink-3); }
   #err:empty { display: none; }
   #err.error { color: var(--ember); }
-  /* a staged scenario or file: its live settings belong to the next world, so they wear no "live" tag */
-  #drawer.staging .livetag { display: none; }
+  .panel .staging-banner { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; padding: 8px 10px; }
+  .panel .staging-banner[hidden] { display: none; }
+  .staging-banner span { flex: 1 1 200px; min-width: 0; overflow-wrap: anywhere; font-size: 12px; line-height: 1.4; color: var(--ink-2); }
+  .panel .staging-banner .btn { width: auto; margin-left: auto; }
   /* the readout: edits waiting for the next start */
   #waitingcount { flex: none; height: 22px; padding: 0 8px; border-radius: 999px; background: var(--beam-soft); color: var(--beam);
                   font-size: 12px; font-weight: 600; line-height: 22px; }
@@ -1082,14 +1083,13 @@
         <div id="scenarios" role="group" aria-label="start from">
           <div class="scard" data-s="standard"><button id="advreset" class="spick" type="button" aria-pressed="false"><b>Standard</b><span>A new visitor's ocean: the default rules, glass walls, sized for this screen</span></button></div>
           <div class="scard" data-s="bigtank"><button id="bigbtn" class="spick" type="button" aria-pressed="false"><b>Big tank</b><span>Four times the volume and the food, 2,000 founders, the tuned water</span></button></div>
-          <div class="scard" data-s="e1"><button id="e1btn" class="spick" type="button" aria-pressed="false"><b>Living water</b><span>Waves, a deep current, light that fades with depth, depth costs (E1)</span></button></div>
+          <div class="scard" data-s="e1"><button id="e1btn" class="spick" type="button" aria-pressed="false"><b>Living water</b><span>Starts a whole new world with living water: waves, a deep current and light that fades with depth.</span></button></div>
           <div class="scard" data-s="hunters"><button id="huntersbtn" class="spick" type="button" aria-pressed="false"><b>Hunters</b><span>Four predators hunt; plenty of food, a cap on the fish, swimming costs energy</span></button></div>
           <div class="scard" data-s="currents"><button id="currentsbtn" class="spick" type="button" aria-pressed="false"><b>Currents &amp; patches</b><span>Eddies carry six food patches, each at its own depth; swimming costs energy</span></button></div>
           <div class="scard" data-s="surprise"><button id="randombig" class="spick" type="button" aria-pressed="false"><b>Surprise me</b><span>A whole setup drawn from ranges that worked, for the tank as set</span></button></div>
         </div>
         <p id="file-recipe" hidden></p>
         <div id="scenario-acts" hidden><button id="scenario-start" class="btn primary" type="button"><svg class="i"><use href="#i-play"/></svg><span>Start</span></button><button id="rerollbtn" class="btn" type="button" hidden><svg class="i"><use href="#i-dice"/></svg>Reroll</button></div>
-        <p id="randnote"></p>
         <h3 id="files-heading">Open &amp; save</h3>
         <div role="group" aria-labelledby="files-heading">
           <button id="loadcp" class="btn" type="button" aria-describedby="open-file-hint">Open a file…</button>

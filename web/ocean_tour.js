@@ -134,7 +134,7 @@
         { drawer: true, tab: "depth", scroll: "#f_kBuoy", place: h.drawerSides, title: "Your own settings",
           target: function () { return h.rectOf("#f_kBuoy"); },
           body: function () {
-            return "Change anything by hand: the depth physics here, waves, light and currents under Water (E1). " +
+            return "Change anything by hand: the depth physics here, waves, light and currents under Water. " +
                    (h.touch() ? "Tap" : "Hover over") + " a setting's name to see what it does. Changes wait for " +
                    "<b>Start</b>, at the bottom; settings marked <i>live</i> apply at once.";
           } },

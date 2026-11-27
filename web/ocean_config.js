@@ -152,7 +152,7 @@
     { id: "depth", title: "Depth", groups: [
       ["Swimming in depth", ["kBuoy", "pitchMax", "vDrag", "wallBand"]],
       ["What depth costs", ["cHold", "cPress", "depthCostScaled"]]] },
-    { id: "ocean", title: "Water (E1)", groups: [
+    { id: "ocean", title: "Water", groups: [
       ["Currents", ["currentStrength", "currentMode", "currentEddies", "currentCore", "currentDrift", "deepCurrent"]],
       ["Waves", ["waveSpeed", "waveBand", "waveGravity"]],
       ["Light", ["lightEnabled", "L0", "kWater"]],
@@ -245,7 +245,7 @@
     sideWallTurnRate: { d: "Glass walls: how fast a fish turns away, in radians per second, right at the glass (less further out). Restart to apply.", t: "try: 6 (the default); 2 for wide arcs" },
     width: { d: "The tank's size along x, in world units (the standard tank is 1920 x 1080). A bigger tank holds more fish at the same crowding; Big tank (on the Run tab) is a whole recipe for one. Restart to apply.", t: "try: 3840 with a length of 2160 (four times the area)" },
     height: { d: "The tank's size along y, in world units (shown front to back in the 3-D view). Restart to apply.", t: "try: 2160 with a width of 3840" },
-    bodyModel: { d: "Heritable body size and elongation: bigger = slower and costlier, longer = turns worse. The size laws (the Water (E1) tab) act on the size.", t: "try: on; founders start at 1.0 and bodies drift from births" },
+    bodyModel: { d: "Heritable body size and elongation: bigger = slower and costlier, longer = turns worse. The size laws (the Water tab) act on the size.", t: "try: on; founders start at 1.0 and bodies drift from births" },
     maxPopulation: { d: "Birth cap: no births while the population is at or above it (0 = none). Applies live.", t: "try: 0, or 600 to keep a big run fast" },
     minPopulation: { d: "Reseed floor: random founders are added when the population falls below it. Applies live.", t: "try: 50 (the default)" },
     minSpeed: { d: "Minimum swim speed. Applies live.", t: "try: 0 when the swimming cost is above 0 (drifting allowed)" },
@@ -301,19 +301,19 @@
     pitchMax: { d: "The steepest a fish can climb or dive: its vertical speed is at most this × its speed. Applies live.", t: "try: 0.5 (about 27°); 1 = 45°" },
     vDrag: { d: "Vertical drag, per second: how fast a fish's climb or dive dies away when it stops steering in depth. Applies live.", t: "try: 2 (the default); 0.5 glides, 6 stops short" },
     wallBand: { d: "Within this distance of the surface or the floor, a soft push turns a fish back into the water. Applies live.", t: "try: 12 (the default); 0 = hard walls" },
-    cHold: { d: "Energy a fish pays for being away from its neutral depth, per unit of distance (as a share of the depth). With depth costs scaled: a multiple of its own metabolism. Applies live.", t: "try: 0.05 scaled (the E1 preset); 0 = free" },
-    cPress: { d: "Energy a fish pays for depth itself (pressure), growing toward the floor. With depth costs scaled: a multiple of its own metabolism. Applies live.", t: "try: 0.03 scaled (the E1 preset)" },
-    depthCostScaled: { d: "Off: the two depth costs are energy per second. On: they are multiples of each fish's own metabolism (bigger bodies pay more), the E1 physics' rule. Applies live.", t: "try: on with the E1 preset" },
-    currentStrength: { d: "Peak ocean-flow speed in world units per second (0 = still water).", t: "try: 5 with a deep current (the E1 preset); 80 for a strong 2-D-style flow" },
+    cHold: { d: "Energy a fish pays for being away from its neutral depth, per unit of distance (as a share of the depth). With depth costs scaled: a multiple of its own metabolism. Applies live.", t: "try: 0.05 scaled (Living water); 0 = free" },
+    cPress: { d: "Energy a fish pays for depth itself (pressure), growing toward the floor. With depth costs scaled: a multiple of its own metabolism. Applies live.", t: "try: 0.03 scaled (Living water)" },
+    depthCostScaled: { d: "Off: the two depth costs are energy per second. On: they are multiples of each fish's own metabolism (bigger bodies pay more), the living water rule. Applies live.", t: "try: on with Living water" },
+    currentStrength: { d: "Peak ocean-flow speed in world units per second (0 = still water).", t: "try: 5 with a deep current (Living water); 80 for a strong 2-D-style flow" },
     currentMode: { d: "Eddies = moving vortices; gyre = two counter-rotating basins.", t: "try: eddies" },
     currentEddies: { d: "Number of vortices in eddies mode.", t: "try: 3-8 around the default 5" },
     currentCore: { d: "Eddy radius — the distance of peak flow speed. With glass walls it also sets how close to the glass the current fades to nothing (at most a quarter of the tank's width or length), in the gyre shape too.", t: "try: 100-250 around the default 150" },
     currentDrift: { d: "How fast the flow field evolves (0 = static).", t: "try: 0.5-2 around the default 1" },
-    deepCurrent: { d: "The current flows at depth only: still at the surface, full strength from mid-depth down, so where a fish swims decides whether it is carried. Applies live.", t: "try: on (the E1 preset)" },
-    waveSpeed: { d: "Surface waves: three fixed wave trains move the water in orbits, strongest near the surface, fading toward the floor; fish and food are carried. Their orbital speed in units per second (0 = still). Applies live.", t: "try: 6 (the E1 preset)" },
+    deepCurrent: { d: "The current flows at depth only: still at the surface, full strength from mid-depth down, so where a fish swims decides whether it is carried. Applies live.", t: "try: on (Living water)" },
+    waveSpeed: { d: "Surface waves: three fixed wave trains move the water in orbits, strongest near the surface, fading toward the floor; fish and food are carried. Their orbital speed in units per second (0 = still). Applies live.", t: "try: 6 (Living water)" },
     waveBand: { d: "How far from the surface and floor the waves taper to nothing. Applies live.", t: "try: 32 (the default)" },
     waveGravity: { d: "The waves' dispersion constant (ω² = g·k): higher = faster orbits. Applies live.", t: "try: 20 (the default)" },
-    lightEnabled: { d: "Light that fades with depth, L(d) = L0·exp(−fall-off·d). The tank then shades depth by it. Display only in this version of the physics. Applies live.", t: "try: on (the E1 preset)" },
+    lightEnabled: { d: "Light that fades with depth, L(d) = L0·exp(−fall-off·d). The tank then shades depth by it. Display only in this version of the physics. Applies live.", t: "try: on (Living water)" },
     L0: { d: "Light at the surface. Applies live.", t: "try: 1 (the default)" },
     kWater: { d: "How fast light fades with depth, per unit (0.006: about half at 115). Applies live.", t: "try: 0.006 (the default); 0.012 for murky water" },
     sizeDrift: { d: "The flow moves a fish by min(1, 1 / size) of itself: small fish are carried more. Applies live.", t: "try: on with evolving bodies and a current or waves" },
@@ -523,7 +523,7 @@
      * own current is a gentle deep one) */
     if (e1 && !set.currentStrength && chance(CHANCE.e1)) {
       Object.keys(e1).forEach(function (k) { if (!(k in set)) set[k] = e1[k]; });
-      labels.push("E1 physics: waves, a deep current, light, depth costs");
+      labels.push("Living water: waves, a deep current, light, depth costs");
     }
     if (thrust || chance(CHANCE.thrustCost)) {
       if (set.moveCost === undefined) set.moveCost = range("moveCost");
@@ -582,7 +582,7 @@
   var SCENARIOS = [
     { id: "standard", title: "Standard", blurb: "A new visitor's ocean: the default rules, glass walls, sized for this screen" },
     { id: "bigtank", title: "Big tank", blurb: bigTankBlurb() },
-    { id: "e1", title: "Living water", blurb: "Waves, a deep current, light that fades with depth, depth costs (E1)" },
+    { id: "e1", title: "Living water", blurb: "Starts a whole new world with living water: waves, a deep current and light that fades with depth." },
     { id: "hunters", title: "Hunters", blurb: "Four predators hunt; plenty of food, a cap on the fish, swimming costs energy" },
     { id: "currents", title: "Currents & patches", blurb: "Eddies carry six food patches, each at its own depth; swimming costs energy" },
     { id: "surprise", title: "Surprise me", blurb: "A whole setup drawn from ranges that worked, for the tank as set" }

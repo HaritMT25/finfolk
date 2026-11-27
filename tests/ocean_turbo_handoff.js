@@ -3320,7 +3320,7 @@ async function pageScenarios() {
         const s1 = p.T.draft.seed, f1 = p.form();
         p.click('rerollbtn');
         const s2 = p.T.draft.seed, n1 = delta(a, c()).inits;
-        ok(p.T.draft.id === 'surprise' && s1 !== s2 && f1 !== p.form() && n1 === 2 && /Picked:/.test(p.el('randnote').textContent),
+        ok(p.T.draft.id === 'surprise' && s1 !== s2 && f1 !== p.form() && n1 === 2 && p.el('startsummary').textContent.includes(p.T.draft.summary),
            'Surprise me stages a draw (seed ' + s1 + '), Reroll another (seed ' + s2 + '); neither starts anything');
         p.click('startdiscard');
         p.edit('population', 77);
@@ -3335,7 +3335,7 @@ async function pageScenarios() {
         p.edit('predatorCount', 2);
         p.click('e1add');
         ok(!p.T.draft && p.T.getVal('predatorCount') === 2 && p.T.getVal('lightEnabled') === true && delta(a, c()).inits === 2,
-           'the Water tab\'s "Add the tuned E1 water": the E1 keys join the waiting edits (the 2 predators stay), nothing starts');
+           'the Water tab\'s "Add living water (waves, current, light)": the E1 keys join the waiting edits (the 2 predators stay), nothing starts');
         p.click('startdiscard');
         p.ctx.innerWidth = 800; p.ctx.innerHeight = 1200;
         p.click('fitbtn');
@@ -5447,7 +5447,7 @@ async function weightPolicyWorld() {
 async function pageSetupUX() {
     section('Setup UX: Open & save, three starts, named runs, file chip and keyboard focus');
     const html = fs.readFileSync(path.join(WEB, 'ocean.html'), 'utf8');
-    const recipes = html.slice(html.indexOf('<div id="scenarios"'), html.indexOf('<p id="randnote"'));
+    const recipes = html.slice(html.indexOf('<div id="scenarios"'), html.indexOf('<h3 id="files-heading"'));
     const files = html.slice(html.indexOf('<h3 id="files-heading"'), html.indexOf('<h3>This run</h3>'));
     ok(!recipes.includes('id="loadcp"') && !recipes.includes('data-s="file"') &&
        ['loadcp', 'savecp', 'saveworld'].every(id => files.includes('id="' + id + '"')) &&
@@ -5617,10 +5617,109 @@ async function genomeV2World() {
     }
 }
 
+/* UX PR 2: the real Setup controller and module, with the existing test DOM.
+ * The CSS contract is checked here; the coordinator checks actual layout on the laptop. */
+async function pageSetupStateUX() {
+    section('Setup wording and state: staged banners, next-world tags, independent tab markers, one Surprise summary');
+    const p = await bootPage('?guide=0&intro=0');
+    const rules = CFG.TABS.filter(t => t.groups);
+    const banners = () => rules.map(t => p.el('panel-' + t.id).querySelector('.staging-banner'));
+    const tags = () => p.el('panels').querySelectorAll('.livetag');
+    const ring = id => p.el('tab-' + id).querySelector('.wait-ring');
+    const dot = id => p.el('tab-' + id).querySelector('.dot');
+    const named = name => banners().every(b => b && !b.hidden &&
+        b.querySelector('span').textContent === 'Editing the next world (' + name + '). The running world keeps its rules.');
+    ok(banners().every(b => b && b.hidden) && tags().length > 0 && tags().every(t => t.textContent === 'live'),
+       'without a staged recipe: every banner hidden and the existing live tags unchanged');
+    p.edit('population', 500);
+    ok(!!ring('world') && !dot('world') && banners().every(b => b.hidden),
+       'Starting fish 500: World has a waiting ring, no default-change dot, and no staging banner');
+    p.edit('population', p.T.initArgs.population);
+    ok(!ring('world'), 'restoring Starting fish clears its waiting ring');
+    p.edit('seed', 999);
+    ok(!!ring('world') && !dot('world'), 'a waiting Seed edit also gets the World ring, without changing the default-dot rule');
+    p.click('startdiscard');
+    p.edit('foodSpawnBase', 6);
+    ok(!!dot('food') && !ring('food') && p.T.runCfg.foodSpawnBase === 6,
+       'Food per step 6 applied live: Food has the default-change dot and no waiting ring');
+    for (const [m, label] of [[dot('food'), 'changed from the default']]) {
+        ok(m && m.title === label && m.getAttribute('aria-label') === label && m.getAttribute('role') === 'img' && m.getAttribute('tabindex') === null,
+           'the default dot has a tooltip and accessible label, with no tab stop');
+    }
+    const sets = p.sets.length, inits = p.inits.length;
+    p.click('huntersbtn');
+    ok(named('Hunters') && p.el('startsummary').textContent.startsWith('Next world: Hunters') && tags().every(t => t.textContent === 'next world'),
+       'Hunters stages: all rule panels name the same next world as the bar; every formerly live tag reads next world');
+    p.edit('foodSpawnBase', 11);
+    ok(!!ring('food') && !!dot('food') && p.sets.length === sets && p.inits.length === inits && p.T.runCfg.foodSpawnBase === 6,
+       'a staged live field waits: both Food markers, no engine call and the running value stays 6');
+    const m = ring('food');
+    ok(m && m.title === 'waits for Start' && m.getAttribute('aria-label') === 'waits for Start' &&
+       m.getAttribute('role') === 'img' && m.getAttribute('tabindex') === null,
+       'the waiting ring has its own tooltip and accessible label, with no tab stop');
+    const discard = p.el('panel-food').querySelector('.staging-banner').querySelector('button');
+    discard.focus(); p.key('Enter');
+    ok(!p.T.draft && banners().every(b => b.hidden) && tags().every(t => t.textContent === 'live') &&
+       p.T.getVal('foodSpawnBase') === 6 && !!dot('food') && !ring('food'),
+       'the banner native button works by keyboard: existing Discard semantics, live tweak kept, banners hidden and live tags restored');
+    await stageFile(p, SETUP99, '<recipe&>.json');
+    ok(named('<recipe&>.json'), 'a staged file names its card safely as text on every rule panel');
+    p.click('startdiscard');
+    p.click('randombig');
+    const summary = p.T.draft.summary, start = p.el('scenario-start').querySelector('span');
+    ok(named('Surprise me') && p.el('startsummary').textContent.split(summary).length === 2 &&
+       start.textContent === 'Start this draw' && p.el('restart').querySelector('span').textContent === 'Start this draw',
+       'Surprise me: the draw summary appears once in the bar, with Start this draw on both start buttons');
+    p.click('rerollbtn');
+    ok(p.el('startsummary').textContent.includes(p.T.draft.summary) && named('Surprise me'),
+       'Reroll updates that single summary and keeps the banners in sync');
+    p.start();
+    ok(!p.T.draft && banners().every(b => b.hidden) && tags().every(t => t.textContent === 'live'),
+       'starting the draw hides all staging banners and restores live tags');
+    const html = fs.readFileSync(path.join(WEB, 'ocean.html'), 'utf8');
+    const js = fs.readFileSync(path.join(WEB, 'ocean.js'), 'utf8');
+    const tour = fs.readFileSync(path.join(WEB, 'ocean_tour.js'), 'utf8');
+    ok(!html.includes('randnote') && !js.includes('randnote') &&
+       /#scenario-acts \{[^}]*flex-direction: column/.test(html) &&
+       /#tabs button \.wait-ring \{[^}]*border:/.test(html),
+       'the duplicate green summary is removed; card actions stack inside the card and the waiting marker is a hollow ring');
+    ok(CFG.TABS.find(t => t.id === 'ocean').title === 'Water' && !tour.includes('Water (E1)') &&
+       CFG.SCENARIOS.find(t => t.id === 'e1').blurb.startsWith('Starts a whole new world with living water') &&
+       js.includes('Add living water (waves, current, light)') && js.includes('Adds living water to the next world’s current rules.'),
+       'Water naming is consistent; the recipe starts a whole world while the add button keeps the next world’s rules');
+    ok(!p.uncaught.length, 'no exception escaped the Setup wording and state handlers' + (p.uncaught.length ? ': ' + p.uncaught[0] : ''));
+    {   /* the rings follow the running world (review of #107): Replay with a recipe staged */
+        const q = await bootPage('?guide=0&intro=0');
+        const ringQ = id => q.el('tab-' + id).querySelector('.wait-ring');
+        q.edit('foodSpawnBase', 6);   /* live: the running world has 6 */
+        q.click('advreset');          /* Standard staged: its Food is the setup's */
+        const before = !!ringQ('food');
+        q.click('replay'); if (q.T.asking) q.click('startconfirm');
+        ok(before && !!q.T.draft && q.T.runCfg.foodSpawnBase !== 6 && !ringQ('food') && !q.uncaught.length,
+           'Replay with Standard staged: the Food ring was there (staged vs 6 running) and goes once Replay brings the setup\'s Food back');
+    }
+    {   /* ... and a Turbo answer: an edit acknowledged while a recipe is staged */
+        const { p: t, sh } = await pageInTurbo();
+        const ringT = id => t.el('tab-' + id).querySelector('.wait-ring');
+        sh.pause();
+        t.edit('foodSpawnBase', 6);   /* on its way to the worker */
+        t.click('advreset');          /* Standard staged while the answer is held */
+        const before = !!ringT('food');
+        sh.resume();
+        await until(() => sh.delivered.filter(isType('set')).length === sh.toWorker.filter(m => m.cmd === 'set').length, 'the edit\'s answer');
+        ok(!before && !!t.T.draft && t.T.runCfg.foodSpawnBase === 6 && !!ringT('food') && !t.uncaught.length,
+           'Turbo: the Food ring appears when the worker\'s answer makes the running Food 6 while Standard is staged');
+        t.click('randombig');   /* Surprise me staged while Turbo runs: its card says what its Start does, as every card does */
+        ok(t.el('scenario-start').querySelector('span').textContent === 'Stop & start' && t.el('restart').querySelector('span').textContent === 'Stop Turbo & start',
+           'Turbo: the Surprise card and the bar both say the start stops Turbo first (review of #107, P3)');
+    }
+}
+
 const SECTIONS = {
     genomeV2World,
     roundTripGenomeV2: () => roundTrip('Genome v2 with bias', { genomeVersion: 2, brainEvalVersion: 2, biasGenes: true, hiddenNeurons: 12, weightMutationMode: 'saturating' }),
     roundTripGenomeV2NoBias: () => roundTrip('Genome v2 without bias', { genomeVersion: 2, brainEvalVersion: 2, biasGenes: false, hiddenNeurons: 12, weightMutationMode: 'saturating' }),
+    pageSetupStateUX,
     pageSetupUX,
     weightPolicyWorld,
     roundTripSaturating: () =>
