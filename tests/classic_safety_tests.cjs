@@ -46,6 +46,12 @@
 //      real dashboards' reset) ends the whole operation; a trap in the worker stops its pump at once; a cap below 0 and a
 //      predator floor past 2000 refused, not clamped; a Turbo start that throws goes back to live; a world never drawn
 //      shows the failure screen; R whose start is refused keeps the seed
+//  10. the round-5 reviews of PR #104 (Codex and Hydrogen, f840859; each case fails there): a refusal's read leaves the first
+//      accepted setter's read owed (a loaded floor of 2001, a refusal, then an unrelated edit: 2000; here and in Turbo);
+//      Restart's words after Reset every setting say what the sheet starts with; a trap in the dashboards' hooks during the
+//      boot ends the boot; a trap in the frame's fallback stops the engine; a value refused before the engine while a newer
+//      one of its key is on its way puts that one back in the field; a refused live value leaves the question open; the
+//      page without EVO_ASSETS shows its failure screen; a worker refusal without a config asks nothing more
 //   (round 5 changed what three earlier cases asserted: a live value set back to the one it started with, or the same
 //   value, is a live tweak now; the question's words for the tweaks; a refusal reads the engine once: 2, 6a, 8a, 8b)
 // The page runs on tests/ui_inspector_tests.cjs's small DOM and window (its ids from web/index.html).
@@ -105,6 +111,7 @@ class FakeWorker {
   }
   postMessage(m) {
     if (m && m.cmd === "set") this.sets = (this.sets || 0) + 1;
+    if (m && m.cmd === "config") this.configs = (this.configs || 0) + 1;
     const c = structuredClone(m);
     setImmediate(() => {   /* (an exception in the worker's handler is its error event, as a browser's: the page's onerror) */
       if (this.dead) return;
@@ -175,12 +182,15 @@ async function bootPage(o) {
   const box = { M: null };
   if (o.scene) P.ctx.EvoScene = o.scene;
   if (o.gl) P.ctx.EvoGL = o.gl;   /* (a stand-in for web/gl_renderer.js: the flat view's WebGL drawing) */
+  if (o.noAssets) delete P.ctx.EVO_ASSETS;
   if (o.dash) {   /* (the dashboards' attach gets runConfig: the page's record of what runs) */
     P.ctx.EvoDash = { attach: (h) => { box.host = h; }, pump() {}, reset() {}, ingest() {}, every: () => 60, open() {}, close() {}, isOpen: () => false };
   }
   const load = o.load;
-  P.ctx.EVO_ASSETS = { st: "evo_boids.js", stWasm: "evo_boids.wasm", mt: "evo_boids_mt.js", mtWasm: "evo_boids_mt.wasm", worker: "worker.js", background: "rocks.jpg", three: "three.js" };
-  P.ctx.EvoLoader = { load: load || (() => mkClassic().then((m) => { box.M = m; return { Module: m, threaded: false, why: "the test", js: "evo_boids.js", wasm: "evo_boids.wasm" }; })),
+  if (!o.noAssets) P.ctx.EVO_ASSETS = { st: "evo_boids.js", stWasm: "evo_boids.wasm", mt: "evo_boids_mt.js", mtWasm: "evo_boids_mt.wasm", worker: "worker.js", background: "rocks.jpg", three: "three.js" };
+  /* (o.prep: the module changed before the page gets it; o.threaded: the page told it is the threaded one) */
+  P.ctx.EvoLoader = { load: load || (() => mkClassic().then((m) => { box.M = m; if (o.prep) o.prep(m, box);
+                                                                     return { Module: m, threaded: !!o.threaded, why: "the test", js: "evo_boids.js", wasm: "evo_boids.wasm" }; })),
                       poolThreads: () => 1 };
   P.ctx.Worker = FakeWorker;
   vm.createContext(P.ctx);
@@ -1247,6 +1257,174 @@ async function reviewSeedKept() {
   ok(/^evo_init failed/.test(G.said()) && el("seed").value === seed0, "R with -1 fish waiting: the engine refuses the start, and the seed field still says " + seed0, [G.said(), el("seed").value]);
 }
 
+/* ================================================ 10. the round-5 reviews of PR #104 (Codex and Hydrogen, f840859) ================================================ */
+/* the threaded flag for the page, on the single-threaded module: its thread exports stood in for */
+const asThreaded = (m) => { if (!m._evo_set_threads) m._evo_set_threads = () => 1; if (!m._evo_threads) m._evo_threads = () => 1; };
+
+/* P2 (Codex 1): a read without a setter (a refusal's) leaves the first accepted setter's read owed */
+async function reviewStaleAfterRefusal() {
+  section("10a. P2: a loaded floor of 2001, a refusal first, then an unrelated edit (its setter clamps the floor to 2000): the field and the record say 2000");
+  for (const turbo of [false, true]) {
+    const G = await startedPage({ dash: true }), { el, box } = G, M = box.M;
+    const cp = JSON.parse(M.UTF8ToString(M._evo_checkpoint()));
+    cp.config.predatorMinPopulation = 2001;
+    await G.load("floor2001.json", JSON.stringify(cp));
+    const where = turbo ? "in Turbo" : "here";
+    if (turbo) { el("turbobtn").click(); await until(() => G.state() === "turbo", "Turbo running"); }
+    G.setField("adv_predatorMinPopulation", -1);
+    const r1 = await quick(() => /^predatorMinPopulation must be finite/.test(G.said()));
+    ok(r1 && el("adv_predatorMinPopulation").value === "2001" && G.said() === "predatorMinPopulation must be finite and >= 0 (the running world keeps 2001).",
+       where + ": the loaded floor runs as 2001 (a load clamps nothing); a floor of -1 refused, the field back to the 2001 that runs", [G.said(), el("adv_predatorMinPopulation").value]);
+    G.setField("adv_foodEnergy", 6);
+    const r2 = await quick(() => G.said() === "Energy per food is now 6 (live)");
+    const rec = box.host.runConfig().predatorMinPopulation, field = el("adv_predatorMinPopulation").value;
+    if (turbo) { el("turboexit").click(); await until(() => G.state() === "live", "the hand-back"); }
+    ok(r2 && rec === 2000 && field === "2000" && configOf(M).predatorMinPopulation === 2000,
+       "  then Energy per food 6: its setter clamps the floor to 2000, and the read it owed says so (the record " + rec + ", the field " + field + ")", [r2, rec, field, configOf(M).predatorMinPopulation]);
+  }
+}
+
+/* P2 (Codex 2): after Reset every setting, Restart's words say what the sheet starts with */
+async function reviewResetWords() {
+  section("10b. P2: a live tweak, Reset every setting, then Restart: the question says what the new world sets, not that the tweak carries over");
+  const G = await startedPage(), { el, box } = G, M = box.M;
+  G.setField("adv_foodEnergy", 6);
+  G.setField("adv_targetFood", 900);
+  el("advreset").click(); G.settle();
+  G.setField("adv_targetFood", 900);   /* (typed again: the sheet shows it, the world runs it) */
+  el("restart").click(); G.settle();
+  const m = el("startaskmsg").textContent;
+  ok(G.asked() && / Your live tweak \(Food target 900\) carries over to the new world, as the sheet shows it\. The new world's setup sets Energy per food 5 instead of your live tweak \(Energy per food 6\)\.$/.test(m),
+     "Energy per food 6 and Food target 900, Reset every setting, Food target 900 typed again, Restart: Food target carries over, Energy per food is set to 5 instead", m);
+  el("startconfirm").click(); G.settle();
+  const c = configOf(M);
+  ok(c.foodEnergy === 5 && c.targetFood === 900, "  Replace it: the new world runs what the question said (Energy per food 5, Food target 900)", [c.foodEnergy, c.targetFood]);
+}
+
+/* P2 (Codex 3): the boot is one operation: a trap in the dashboards' hooks inside it ends it */
+async function reviewBootFence() {
+  section("10c. P2: a trap in the real dashboards' hooks during the boot (their attach, the first world's reset) ends the boot: nothing reaches the module after it");
+  for (const [what, nth] of [["the dashboards' attach (evo_rec_config, the first call)", 1], ["the first world's reset (evo_rec_config, the second call)", 2]]) {
+    const e0 = escaped.length;
+    const st = { n: 0, trapped: false, after: 0 };
+    const prep = (m) => {
+      asThreaded(m);   /* (a threaded page: its boot sets the threads after the attach) */
+      for (const k of Object.keys(m)) if (/^_evo_/.test(k) && typeof m[k] === "function") {
+        const f = m[k];
+        m[k] = function () { if (st.trapped) st.after++; return f.apply(this, arguments); };
+      }
+      const rc = m._evo_rec_config;
+      m._evo_rec_config = function () { if (++st.n === nth) { st.trapped = true; throw trapErr("evo_rec_config"); } return rc.apply(this, arguments); };
+    };
+    let threw = null;
+    try {
+      const G = await bootPage({ realDash: true, threaded: true, prep });
+      await quick(() => G.el("splash").classList.contains("failed") || (G.P.ctx.EvoApp && G.P.ctx.EvoApp.ready), 20000);
+      await new Promise((r) => setTimeout(r, 20));
+      for (let i = 0; i < 3; i++) G.P.frame();
+      ok(st.trapped && st.after === 0 && G.el("splash").classList.contains("failed") && /^The engine stopped \(injected trap in evo_rec_config\)/.test(G.el("splashstate").textContent) &&
+         G.D.errors.length === 0 && escaped.length === e0,
+         "a trap in " + what + ": the engine-stopped screen, the boot ends there (" + st.after + " calls after the trap), nothing escapes",
+         [st, G.el("splashstate").textContent.slice(0, 60), G.D.errors.slice(0, 1), escaped.slice(e0)]);
+    } catch (e) { threw = e; ok(false, what + ": the boot threw " + String(e && e.message || e)); }
+  }
+}
+
+/* P2 (Codex 4): a trap in the frame's fallback (the modeline's thread count, as the tank falls back) stops the engine */
+async function reviewFallbackTrap() {
+  section("10d. P2: the tank's render throws, and its fallback's module call traps: the engine stops, nothing reaches the module after");
+  const e0 = escaped.length;
+  let boom = false;
+  const scene = { load: () => Promise.resolve(), create: () => new Proxy({}, { get: (t, k) => {
+    if (k === "then" || typeof k === "symbol") return undefined;
+    if (k === "render") return () => { if (boom) throw new TypeError("tank boom"); };
+    if (k === "following") return () => false;
+    if (k === "quality") return () => 3;
+    if (k === "project") return () => null;
+    if (k === "setQuality" || k === "degrade") return () => false;
+    return () => {};
+  } }) };
+  const G = await startedPage({ view: "3d", scene, threaded: true, prep: asThreaded }), { D, el, box } = G, M = box.M;
+  await until(() => D.doc.body.classList.contains("view-3d"), "the tank view");
+  G.watchModule();
+  M._evo_threads = () => { G.calls = 0; G.trapped = true; throw trapErr("evo_threads"); };
+  boom = true;
+  let threw = null;
+  for (let i = 0; i < 4; i++) { try { G.P.frame(); } catch (e) { threw = threw || e; } }
+  ok(G.trapped && !threw && G.calls === 0 && el("splash").classList.contains("failed") && /^The engine stopped \(injected trap in evo_threads\)/.test(el("splashstate").textContent) &&
+     D.errors.length === 0 && escaped.length === e0,
+     "the tank fails (a TypeError), the flat view's modeline reads the threads (a trap): the engine stops, " + G.calls + " calls after, nothing escapes the frame",
+     [G.trapped, threw && String(threw), G.calls, el("splashstate").textContent.slice(0, 60)]);
+}
+
+/* P2 (Hydrogen): a value refused before the engine while a newer one of its key is on its way: that one back in the field */
+async function reviewRefusedOnTheWay() {
+  section("10e. P2: a value refused before the engine while an earlier one of its key is on its way: the field shows that one, never the refused one");
+  const G = await startedPage(), { el, box } = G, M = box.M;
+  el("turbobtn").click();   /* (starting: what is typed now is held) */
+  ok(G.state() === "moving", "Turbo starting");
+  G.setField("adv_maxPopulation", 300);
+  G.setField("adv_maxPopulation", -5);
+  const f1 = el("adv_maxPopulation").value, s1 = G.said();
+  G.setField("adv_minPopulation", 100);
+  G.setField("adv_minPopulation", 0.5);
+  const f2 = el("adv_minPopulation").value, s2 = G.said();
+  ok(f1 === "300" && s1 === "Population cap must be 0 or more (0: no cap) (300 is on its way to the world)." &&
+     f2 === "100" && s2 === "Reseed floor must be a whole number (100 is on its way to the world).",
+     "while Turbo starts: cap 300 then -5, floor 100 then 0.5: the refused ones never stay, the fields show the 300 and 100 on their way", [f1, s1, f2, s2]);
+  await until(() => G.state() === "turbo", "Turbo running");
+  await quick(() => /is now 100 \(live\)/.test(G.said()), 3000);
+  el("turboexit").click();
+  await until(() => G.state() === "live", "the hand-back");
+  const c = configOf(M);
+  ok(el("adv_maxPopulation").value === "300" && el("adv_minPopulation").value === "100" && c.maxPopulation === 300 && c.minPopulation === 100,
+     "  after Turbo: the fields say 300 and 100, and the engine runs them", [el("adv_maxPopulation").value, el("adv_minPopulation").value, c.maxPopulation, c.minPopulation]);
+  const seed0 = el("seed").value, t0 = tickOf(M);
+  G.P.key("r"); G.settle();
+  if (G.asked()) el("startconfirm").click();
+  G.settle();
+  ok(!/evo_init failed/.test(G.said()) && configOf(M).maxPopulation === 300 && el("seed").value !== seed0 && tickOf(M) < t0,
+     "  R: the new world starts (a new seed, tick " + tickOf(M) + "), with the cap the field shows (300)", [G.said(), configOf(M).maxPopulation, seed0, el("seed").value, t0, tickOf(M)]);
+}
+
+/* the round-5 reviews' P3s that this round fixes */
+async function reviewP3Round6() {
+  section("10f. P3s: a refused live value leaves the question open; no EVO_ASSETS: the failure screen; a worker refusal without a config asks nothing more");
+  {   /* Hydrogen P3-1 */
+    const G = await startedPage(), { el, box } = G, M = box.M;
+    M._evo_step(18750); M._evo_sync(); G.settle();
+    G.P.key("r"); G.settle();
+    ok(G.asked(), "five simulated minutes: R asks");
+    G.setField("adv_minPopulation", 0.5);
+    ok(G.asked() && G.said() === "Reseed floor must be a whole number (the running world keeps 50).",
+       "  a refused live value (Reseed floor 0.5) while it asks: the question stays, the refusal is what it says", [G.asked(), G.said()]);
+    G.setField("adv_targetFood", 700);
+    ok(!G.asked() && configOf(M).targetFood === 700, "  an accepted one (Food target 700): a tweak the question didn't name, so it goes");
+  }
+  {   /* Hydrogen P3-2 */
+    const e0 = escaped.length;
+    let G = null, threw = null;
+    try { G = await bootPage({ noAssets: true }); } catch (e) { threw = e; }
+    ok(!threw && G && G.el("splash").classList.contains("failed") && /^The simulation couldn't start\./.test(G.el("splashstate").textContent) && escaped.length === e0,
+       "a page without EVO_ASSETS: its failure screen (it threw before reaching it)", [threw && String(threw), G && G.el("splashstate").textContent]);
+  }
+  {   /* Hydrogen P3-3 */
+    const G = await startedPage(), { el } = G;
+    el("turbobtn").click();
+    await until(() => G.state() === "turbo", "Turbo running");
+    const w = workers[workers.length - 1];
+    vm.runInContext("readConfig = function () { return { config: null, configError: 'injected: the world overflowed' }; };", w.w.ctx);
+    G.setField("adv_foodEnergy", -1);
+    const r = await quick(() => /^foodEnergy must be finite/.test(G.said()));
+    await new Promise((res) => setTimeout(res, 30));
+    ok(r && (w.configs || 0) === 0 && el("adv_foodEnergy").value === "5" && G.said() === "foodEnergy must be finite and >= 0 (the running world keeps 5).",
+       "in Turbo on a world whose config can't be read: the worker's refusal (no config) puts the field back by the record, and asks the worker nothing more (" + (w.configs || 0) + " config requests)",
+       [G.said(), w.configs || 0, el("adv_foodEnergy").value]);
+    el("turboexit").click();
+    await until(() => G.state() === "live", "the hand-back");
+  }
+}
+
 (async () => {
   /* each section on its own: one section's throw never hides the next (sections 3 and 4b go on section 2's page) */
   const run = async (name, f) => { try { return await f(); } catch (e) { ok(false, name + " threw: " + (e && e.stack || e)); return null; } };
@@ -1258,7 +1436,9 @@ async function reviewSeedKept() {
                    reviewRounding, reviewRecordRule, reviewOverflow, reviewTrapsOutsideFrame, reviewResetWithdraws, reviewP3,
                    reviewTie, reviewCanonical, reviewReadbackTrap,
                    reviewTweakFlag, reviewAuthoritativeRevert, reviewNestedFence, reviewWorkerFatal, reviewNoSilentClamps,
-                   reviewTurboStartThrows, reviewFirstDraw, reviewSeedKept]) await run(t.name, t);
+                   reviewTurboStartThrows, reviewFirstDraw, reviewSeedKept,
+                   reviewStaleAfterRefusal, reviewResetWords, reviewBootFence, reviewFallbackTrap, reviewRefusedOnTheWay,
+                   reviewP3Round6]) await run(t.name, t);
   ok(escaped.length === 0, "nothing escaped to node in the whole run (no unhandled rejection, no uncaught exception)", escaped.slice(0, 3));
   for (const w of workers) w.terminate();
   console.log((fails ? "FAILED " + fails + " of " : "all ") + checks + " checks" + (fails ? "" : " passed"));
