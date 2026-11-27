@@ -14,6 +14,13 @@
 //      copy takes the values the worker had applied; Turbo used asks before the next start
 //   4. the failure screens: a start that fails (the loading bar stopped, the error, Open 3-D Ocean and Reload; no Ocean
 //      without WebAssembly SIMD), and an engine trap mid-run (the engine stopped, Reload; nothing more reaches the module)
+//   5. the review of PR #104 (each case fails on 25413b1): a file JSON.parse refuses but the engine's reader takes
+//      ("formatVersion": +N) is refused before the engine, never loaded unasked; after a trap no call reaches the module from
+//      any path (a file read on its way, Save world, the switches, the canvas, the keys) and the page behind the screen is
+//      inert; values a failed worker never answered are applied to the recovered world or refused and put back; held values
+//      in order (an older refusal leaves a newer value's field alone); a frame error that persists is said once, retried
+//      once a second, and the tank falls back to the flat view; the record of what runs is the engine's (a loaded floor of
+//      0.5 runs as 0, the speeds the engine put in order, a float said as typed)
 // The page runs on tests/ui_inspector_tests.cjs's small DOM and window (its ids from web/index.html).
 "use strict";
 const fs = require("fs");
@@ -94,6 +101,8 @@ async function workerSet() {
   const sets = got.slice(n0).filter((m) => m.type === "set");
   ok(sets.length === 4 && sets[0].ok === true && sets[0].value === 900 && sets[0].quiet === false && !sets[0].notRunning,
      "Turbo running: targetFood 900 applied between chunks, answered ok", sets[0]);
+  ok(sets[0].config && sets[0].config.targetFood === 900 && sets[0].config.minPopulation === 50 && sets[1].config === null,
+     "  the answer carries the world's config as its engine now holds it (the page's record); a refusal none", sets[0].config && sets[0].config.targetFood);
   ok(sets[1].ok === false && /not a live parameter/.test(sets[1].error) && !sets[1].notRunning,
      "  foodPatches (not live): the engine refuses it, with its reason", sets[1]);
   ok(sets[2].ok === false && /finite and >= 0/.test(sets[2].error), "  foodEnergy -1: the engine refuses it", sets[2]);
@@ -110,10 +119,15 @@ async function workerSet() {
 }
 
 /* ======================================================== the page ======================================================== */
-async function bootPage(load) {
-  const D = makeDom(pageIds(read("index.html")), (c) => (c.id === "canvas" || c.id === "inetc" ? recorder() : null));
-  const P = makeWindow(D, "http://classic.test/web/index.html?threads=0&view=flat&guide=0&intro=0", { media: ["min-width: 960px"] });
+/* o: a loader to use instead of the module's (a start that fails), a canvas context factory (the world's 2D drawing),
+ * the view (flat by default) and a stand-in tank scene (web/scene3d.js) */
+async function bootPage(o) {
+  o = typeof o === "function" ? { load: o } : (o || {});
+  const D = makeDom(pageIds(read("index.html")), o.canvas || ((c) => (c.id === "canvas" || c.id === "inetc" ? recorder() : null)));
+  const P = makeWindow(D, "http://classic.test/web/index.html?threads=0&view=" + (o.view || "flat") + "&guide=0&intro=0", { media: ["min-width: 960px"] });
   const box = { M: null };
+  if (o.scene) P.ctx.EvoScene = o.scene;
+  const load = o.load;
   P.ctx.EVO_ASSETS = { st: "evo_boids.js", stWasm: "evo_boids.wasm", mt: "evo_boids_mt.js", mtWasm: "evo_boids_mt.wasm", worker: "worker.js", background: "rocks.jpg", three: "three.js" };
   P.ctx.EvoLoader = { load: load || (() => mkClassic().then((m) => { box.M = m; return { Module: m, threaded: false, why: "the test", js: "evo_boids.js", wasm: "evo_boids.wasm" }; })),
                       poolThreads: () => 1 };
@@ -352,6 +366,202 @@ async function startFailures() {
   }
 }
 
+/* ======================================================== 5. the review of PR #104 ======================================================== */
+/* a started page, paused at tick 0: its module, helpers and a counter of every call into the module (count: the calls since) */
+async function startedPage(o) {
+  const G = await bootPage(o);
+  await until(() => G.P.ctx.EvoApp && G.P.ctx.EvoApp.ready, "Classic's page to start");
+  const { P, el, box } = G, M = box.M;
+  if (el("pausebtn").getAttribute("aria-label") !== "play") el("pausebtn").click();
+  G.settle = (n) => { for (let i = 0; i < (n || 2); i++) P.frame(); };
+  G.settle();
+  G.said = () => el("err").textContent;
+  G.asked = () => !el("startask").hidden;
+  G.state = () => (el("turbobtn").disabled ? "moving" : el("turbobtn").getAttribute("aria-pressed") === "true" ? "turbo" : "live");
+  G.calls = 0;
+  G.watchModule = () => {   /* every export of the module counted from here on */
+    for (const k of Object.keys(M)) if (/^_evo_/.test(k) && typeof M[k] === "function") {
+      const f = M[k];
+      M[k] = function () { G.calls++; return f.apply(this, arguments); };
+    }
+  };
+  G.load = async (name, text) => {
+    el("cpfile").files = [{ name, text: () => Promise.resolve(text) }];
+    G.fire(el("cpfile"), "change");
+    await new Promise((r) => setTimeout(r, 20));
+    G.settle();
+  };
+  return G;
+}
+
+/* P1: a file JSON.parse refuses but the engine's reader takes (std::strtod: "+1") never replaces a run unasked */
+async function reviewLoadBypass() {
+  section("5a. P1: a file the page cannot read never reaches the engine unasked");
+  const G = await startedPage(), { box, el } = G, M = box.M;
+  const cp = M.UTF8ToString(M._evo_checkpoint());
+  const plus = cp.replace(/("formatVersion"\s*:\s*)(\d+)/, "$1+$2");
+  let jsRefuses = false;
+  try { JSON.parse(plus); } catch (e) { jsRefuses = true; }
+  const B = await mkClassic();
+  const engineTakes = (() => { const n = B.lengthBytesUTF8(plus) + 1, p = B._malloc(n); B.stringToUTF8(plus, p, n); const r = B._evo_load_checkpoint(p); B._free(p); return r; })();
+  ok(plus !== cp && jsRefuses && engineTakes === 1, "the file: \"formatVersion\": +N, which JSON.parse refuses and the engine's own reader loads", [jsRefuses, engineTakes]);
+  M._evo_step(18750); M._evo_sync(); G.settle();
+  let loads = 0;
+  const load0 = M._evo_load_checkpoint;
+  M._evo_load_checkpoint = function () { loads++; return load0.apply(this, arguments); };
+  await G.load("plus.json", plus);
+  ok(loads === 0 && !G.asked() && tickOf(M) === 18750 && /^Couldn't load that checkpoint: it is not valid JSON \(.*\)\. Nothing changed\.$/.test(G.said()),
+     "five simulated minutes, then that file: refused before the engine, nothing replaced, and said: " + JSON.stringify(G.said()), [loads, G.asked(), tickOf(M)]);
+  await G.load("n.json", "42");
+  ok(loads === 0 && G.said() === "Couldn't load that checkpoint: it is not a saved world. Nothing changed.", "  JSON that is no saved world (42): refused the same way", G.said());
+  await G.load("cp.json", cp);
+  ok(loads === 0 && G.asked() && /It opens the saved world cp\.json/.test(el("startaskmsg").textContent), "  the same world as plain JSON: asked about first, as every saved world is");
+}
+
+/* P2: once the engine stopped, nothing reaches the module, from any path; the page behind the screen is inert */
+async function reviewStoppedFence() {
+  section("5b. P2: the stopped engine is fenced on every way into the module");
+  const G = await startedPage(), { D, P, box, el } = G, M = box.M;
+  /* the page's top-level parts, there before the trap as the page's HTML has them (this small DOM makes an element on
+   * its first use, straight under body) */
+  const parts = ["stage", "scene3d", "topbar", "statpanel", "fitbtn", "toasts", "fishcard", "dock", "drawer", "turbo", "dash", "tooltip"];
+  parts.forEach((id) => el(id));
+  M._evo_step(18750); M._evo_sync(); G.settle();
+  const cp = M.UTF8ToString(M._evo_checkpoint());
+  let release = null;
+  el("cpfile").files = [{ name: "late.json", text: () => new Promise((r) => { release = r; }) }];
+  G.fire(el("cpfile"), "change");   /* (a read still on its way when the engine stops) */
+  el("pausebtn").click();
+  M._evo_step = () => { throw new WebAssembly.RuntimeError("unreachable"); };
+  P.frame();
+  ok(el("splash").classList.contains("failed"), "the step traps: the engine-stopped screen");
+  G.watchModule();
+  release(cp);
+  await new Promise((r) => setTimeout(r, 20));
+  const tries = [];
+  const press = (id) => { el(id).click(); tries.push(id); };
+  press("savecp"); press("restart"); press("fitbtn"); press("randombtn"); press("randombig"); press("turbobtn"); press("readout");
+  for (const id of ["colourBrain", "fishShape", "governor", "view3d"]) { const e = el(id); e.checked = !e.checked; G.fire(e, "change"); tries.push(id); }
+  G.setField("adv_targetFood", 900); tries.push("adv_targetFood");
+  const cv = el("canvas"); cv._rect = { left: 0, top: 0, right: 100, bottom: 100 };
+  cv.dispatchEvent(new D.Ev("click", { bubbles: true, clientX: 10, clientY: 10 })); tries.push("canvas click");
+  D.doc.activeElement = null;   /* (the keys from the page itself, not the screen's Reload) */
+  P.key("r"); P.key(" "); tries.push("R", "Space");
+  P.ctx.EvoApp.startTurbo(); P.ctx.EvoApp.inspectSomeFish(); tries.push("tour hooks");
+  for (let i = 0; i < 5; i++) P.frame();
+  ok(G.calls === 0 && !G.asked(), "after the trap: the file read that was on its way, " + tries.join(", ") + ", five frames: no call reaches the module (" + G.calls + ")", G.calls);
+  ok(parts.every((id) => el(id) && el(id).getAttribute("inert") !== null) && el("splash").getAttribute("inert") === null,
+     "  the page behind the screen is inert (" + parts.join(", ") + "); the screen itself is not", parts.filter((id) => !el(id) || el(id).getAttribute("inert") === null));
+}
+
+/* P2: Turbo's worker fails with live values it never answered: the recovered world takes them, or refuses them and says so */
+async function reviewUnanswered() {
+  section("5c. P2: a worker that fails before it answers: its values are applied to the recovered world, or refused");
+  const G = await startedPage(), { el, box } = G, M = box.M;
+  el("turbobtn").click();
+  await until(() => G.state() === "turbo", "Turbo running");
+  G.setField("adv_targetFood", 777);
+  workers[workers.length - 1].onerror({ message: "injected: the worker died" });   /* (before its answer: it never gets the value) */
+  await new Promise((r) => setTimeout(r, 20));
+  ok(G.state() === "live" && configOf(M).targetFood === 777 && el("adv_targetFood").value === "777" && G.said() === "Food target is now 777 (live)",
+     "Food target 777 sent, the worker dead before its answer: this page's world runs 777, the field says 777, and so does the note", [configOf(M).targetFood, el("adv_targetFood").value, G.said()]);
+  el("turbobtn").click();
+  await until(() => G.state() === "turbo", "Turbo running again");
+  G.setField("adv_foodEnergy", -1);
+  workers[workers.length - 1].onerror({ message: "injected: the worker died" });
+  await new Promise((r) => setTimeout(r, 20));
+  ok(configOf(M).foodEnergy === 5 && el("adv_foodEnergy").value === "5" && G.said() === "foodEnergy must be finite and >= 0 (the running world keeps 5).",
+     "Energy per food -1 sent, the worker dead before its answer: the recovered world refuses it, the field back to 5, said", [el("adv_foodEnergy").value, G.said()]);
+}
+
+/* P2: values held while Turbo starts or hands back: an older refusal never overwrites a newer value of its key */
+async function reviewHeldOrder() {
+  section("5d. P2: held values in order: a refused one leaves a newer one's field alone");
+  const G = await startedPage(), { el, box } = G, M = box.M;
+  el("turbobtn").click();
+  await until(() => G.state() === "turbo", "Turbo running");
+  el("turboexit").click();
+  G.setField("adv_foodEnergy", -1);
+  G.setField("adv_foodEnergy", 6);   /* (both held: Turbo is handing back) */
+  await until(() => G.state() === "live", "the hand-back");
+  await until(() => G.said() === "Energy per food is now 6 (live)", "the held values applied");
+  ok(configOf(M).foodEnergy === 6 && el("adv_foodEnergy").value === "6", "while Turbo hands back, -1 then 6: the world runs 6 and the field says 6 (the refusal of -1 left it alone)",
+     [configOf(M).foodEnergy, el("adv_foodEnergy").value]);
+  el("turbobtn").click();   /* while Turbo starts, the worker then failing: the same, applied here */
+  G.setField("adv_foodEnergy", -1);
+  G.setField("adv_foodEnergy", 7);
+  workers[workers.length - 1].onerror({ message: "injected: the worker died" });
+  await new Promise((r) => setTimeout(r, 20));
+  ok(G.state() === "live" && configOf(M).foodEnergy === 7 && el("adv_foodEnergy").value === "7", "while Turbo starts, -1 then 7, the worker failing: the world runs 7, the field says 7",
+     [configOf(M).foodEnergy, el("adv_foodEnergy").value]);
+}
+
+/* P2: a frame that keeps failing (not the engine): said once, tried once a second, said again when it works; the tank falls back */
+async function reviewFrameErrors() {
+  section("5e. P2: a frame error that persists: said once, retried once a second, the picture back after");
+  let boom = false;
+  const throwing = () => { const r = recorder(); return new Proxy({}, { get: (t, k) => (k === "fillRect" && boom ? () => { throw new TypeError("boom"); } : r[k]), set: (t, k, v) => { r[k] = v; return true; } }); };
+  const G = await startedPage({ canvas: (c) => (c.id === "canvas" ? throwing() : c.id === "inetc" ? recorder() : null) });
+  const { P, el, box } = G, M = box.M;
+  el("pausebtn").click();   /* (running: a frame steps once) */
+  G.settle(3);
+  const t0 = tickOf(M), errs = () => P.logs.filter((l) => l[0] === "error").length;
+  boom = true;
+  let threw = null;
+  try { for (let i = 0; i < 30; i++) P.frame(); } catch (e) { threw = e; }
+  const t1 = tickOf(M);
+  ok(!threw && errs() === 1 && G.said() === "Drawing the world failed (boom); the page tries again once a second." && t1 === t0 + 1,
+     "the 2D canvas throws every frame: no error escapes the loop, it is logged once and said once, and the frame is not run again within the second (" + t0 + " -> " + t1 + ")",
+     [threw && String(threw), errs(), G.said(), t0, t1]);
+  for (let i = 0; i < 61; i++) P.frame();
+  ok(tickOf(M) === t1 + 1 && errs() === 1, "  a second later: tried once (tick " + tickOf(M) + "), failing still, nothing more logged");
+  boom = false;
+  for (let i = 0; i < 61; i++) P.frame();
+  const t2 = tickOf(M);
+  P.frame(); P.frame();
+  ok(G.said() === "The picture is back." && tickOf(M) === t2 + 2 && errs() === 1, "  the canvas works again: the next try draws, it says so, and every frame runs again (" + t2 + " -> " + tickOf(M) + ")");
+  /* the tank: its render throws, so the flat view takes over at once */
+  let sceneBoom = false;
+  const scene = { load: () => Promise.resolve(), create: () => new Proxy({}, { get: (t, k) => {
+    if (k === "then" || typeof k === "symbol") return undefined;
+    if (k === "render") return () => { if (sceneBoom) throw new TypeError("tank boom"); };
+    if (k === "following") return () => false;
+    if (k === "project") return () => null;
+    if (k === "pick") return () => -1;
+    if (k === "quality") return () => 3;
+    if (k === "setQuality" || k === "degrade") return () => false;
+    return () => {};
+  } }) };
+  const T = await startedPage({ view: "3d", scene });
+  await until(() => T.D.doc.body.classList.contains("view-3d"), "the tank view");
+  T.el("pausebtn").click();
+  sceneBoom = true;
+  let threw2 = null;
+  try { for (let i = 0; i < 5; i++) T.P.frame(); } catch (e) { threw2 = e; }
+  ok(!threw2 && !T.D.doc.body.classList.contains("view-3d") && T.said() === "The tank view failed (tank boom), so this is the flat view now." &&
+     T.P.logs.filter((l) => l[0] === "error").length === 1 && tickOf(T.box.M) >= 4,
+     "the tank's render throws: logged once, the flat view takes over at once and runs every frame (tick " + tickOf(T.box.M) + ")", [threw2 && String(threw2), T.said()]);
+}
+
+/* P2: the record of what runs is the engine's: a loaded floor of 0.5 runs as 0; the speeds the engine put in order */
+async function reviewRecord() {
+  section("5f. P2: the record of what runs is the engine's own (reverts and notes say it)");
+  const G = await startedPage(), { el, box } = G, M = box.M;
+  const cp = JSON.parse(M.UTF8ToString(M._evo_checkpoint()));
+  cp.config.minPopulation = 0.5;
+  await G.load("half.json", JSON.stringify(cp));
+  ok(/Checkpoint loaded/.test(G.said()) && configOf(M).minPopulation === 0, "a saved world whose floor is 0.5: loaded, and the engine runs floor 0");
+  G.setField("adv_minPopulation", -1);
+  ok(G.said() === "minPopulation must be finite and >= 0 (the running world keeps 0)." && el("adv_minPopulation").value === "0",
+     "  -1 refused: the field back to 0 and the error says 0, the floor that runs (not the file's 0.5)", [G.said(), el("adv_minPopulation").value]);
+  G.setField("adv_minSpeed", 200);
+  const c = configOf(M);
+  ok(c.minSpeed === 150 && c.maxSpeed === 200 && G.said() === "Slowest speed is now 150 (live)" && el("adv_minSpeed").value === "150" && el("adv_maxSpeed").value === "200",
+     "Slowest speed 200 (above the fastest, 150): the engine puts them in order (150 / 200), and the note and both fields say so", [c.minSpeed, c.maxSpeed, G.said(), el("adv_minSpeed").value, el("adv_maxSpeed").value]);
+  G.setField("adv_metabolicRate", 1.7);
+  ok(G.said() === "Energy burned per second is now 1.7 (live)" && Math.abs(configOf(M).metabolicRate - 1.7) < 1e-6, "  1.7 (a float the engine keeps as 1.70000005): said as 1.7", G.said());
+}
+
 (async () => {
   try {
     await workerSet();
@@ -359,6 +569,9 @@ async function startFailures() {
     await turboEdits(G);
     await engineTrap(G);
     await startFailures();
+    for (const t of [reviewLoadBypass, reviewStoppedFence, reviewUnanswered, reviewHeldOrder, reviewFrameErrors, reviewRecord]) {
+      try { await t(); } catch (e) { ok(false, t.name + " threw: " + (e && e.stack || e)); }   /* (one case's throw never hides the next) */
+    }
   } catch (e) { ok(false, "the run threw: " + (e && e.stack || e)); }
   for (const w of workers) w.terminate();
   console.log((fails ? "FAILED " + fails + " of " : "all ") + checks + " checks" + (fails ? "" : " passed"));
