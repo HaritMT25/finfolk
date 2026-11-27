@@ -829,10 +829,12 @@
     if (canvas.width !== WORLD_W) canvas.width = WORLD_W;
     if (canvas.height !== WORLD_H) canvas.height = WORLD_H;
     var ok = initWorld(f.seed, f.population, f.cfg);
-    if (ok) formAtStart = formSnapshot();
     updateFitButton();
-    setPending(false);
-    el("randnote").textContent = "";  /* randomize() fills it in after a pick */
+    if (ok) {   /* (refused: the run and what waits for the next start stay as they were) */
+      formAtStart = formSnapshot();
+      setPending(false);
+      el("randnote").textContent = "";  /* randomize() fills it in after a pick */
+    }
     return ok;
   }
 
@@ -1035,6 +1037,7 @@
     resetGovernor();
     if (!ok) showError("evo_init failed: " + Module.UTF8ToString(Module._evo_last_error()));
     else {
+      worldGen++;
       runCfg = readEngineConfig() || asEngineKeeps(cfg); governed = false; liveEdited = false; loadedRun = false; updateModeline(); if (dash()) dash().reset();   /* a new run: new charts */
       startCfg = Object.assign({}, runCfg); startCap = userCap; usedTurbo = false;   /* (what the replace rule compares with) */
       brainClock.reset(worldTick(), true);   /* (tick 0: no fish has run its brain yet) */
@@ -1601,7 +1604,7 @@
   }
   function frameFailed(err, now) {
     var why = String(err && err.message || err), prev = frameFault;
-    if (!prev) console.error("evo_boids: a frame failed (" + why + ")", err);
+    if (!prev || !prev.retrying) console.error("evo_boids: a frame failed (" + why + ")", err);   /* (once a step: each fallback's own) */
     if (view3d) {   /* the next frame, in the flat view */
       frameFault = { at: -Infinity, retrying: false };
       try { setView(false); } catch (e) { view3d = false; document.body.classList.remove("view-3d"); }
@@ -1610,6 +1613,11 @@
       frameFault = { at: -Infinity, retrying: false };
       glScene = null;
       LOOK.fishShape = false;
+      var fs = el("fishShape"), row = el("f_fishShape"), hint = row.querySelector(".needs");   /* (as at a start without WebGL2) */
+      fs.checked = false; fs.disabled = true; row.classList.add("inert");
+      if (!hint) { hint = document.createElement("span"); hint.className = "needs"; row.appendChild(hint); }
+      hint.textContent = "WebGL drawing failed, so this page draws with canvas 2D now, which keeps the circles";
+      updateModeline();
       showError("WebGL drawing failed (" + why + "), so the world is drawn with canvas 2D now.");
     } else {   /* no step left: once a second, said once */
       frameFault = { at: now, retrying: true };
@@ -1815,6 +1823,7 @@
     if (!fromTurbo) { try { fileCfg = JSON.parse(text).config || {}; } catch (e) { fileCfg = {}; } }
     runCfg = readEngineConfig() || (fromTurbo ? runCfg : asEngineKeeps(fileCfg));
     if (!fromTurbo) {
+      worldGen++;
       governed = false; liveEdited = false; loadedRun = true;   /* (updateModeline: the caller's, after the governor's reset) */
       startCfg = Object.assign({}, runCfg); usedTurbo = false;   /* (startCap: the caller's, with the file's cap) */
       if (dash()) dash().reset();
@@ -2461,8 +2470,10 @@
    * gives it back to Load world. */
   var fileOpener = null;
   el("loadcp").addEventListener("click", function (e) {
-    fileOpener = EvoUI.pressedByKeyboard(this, e) ? this : null;
-    if (!guardTurbo()) el("cpfile").click();
+    if (!guardTurbo()) {
+      fileOpener = EvoUI.pressedByKeyboard(this, e) ? this : null;
+      el("cpfile").click();
+    }
     this.blur();
   });
   /* {what}: the saved world, as the question names it; {bad}: why it is refused */
@@ -2476,19 +2487,22 @@
     if (typeof w.width === "number" && typeof w.height === "number") bits.push(w.width + " × " + w.height);
     return { what: "the saved world" + (name ? " " + name : "") + (bits.length ? " (" + bits.join(", ") + ")" : "") };
   }
+  var fileReq = 0, worldGen = 0;   /* (each pick; each new world: initWorld, a load) */
   el("cpfile").addEventListener("change", fenced(function () {
-    var file = this.files && this.files[0], opener = fileOpener;
+    var file = this.files && this.files[0], opener = fileOpener, my = ++fileReq, gen = worldGen;
     fileOpener = null;
     this.value = "";
     if (!file || !engineOk() || guardTurbo()) return;
     file.text().then(fenced(function (text) {
       if (!engineOk() || guardTurbo()) return;   /* (the engine stopped, or Turbo started, while it was read) */
+      if (my !== fileReq) return;   /* (a newer pick: that one answers) */
+      if (gen !== worldGen) { showNote("A new world started while " + (file.name || "the file") + " was read, so it was not opened: pick it again."); return; }
       var w = savedWorld(text, file.name);
       if (w.bad) { showError("Couldn't load that checkpoint: " + w.bad + ". Nothing changed."); return; }
       if (replaceRun("load", function () { openWorld(text); }, { world: w.what }) === "asked" && opener) {
         asking.opener = opener; el("startconfirm").focus();
       }
-    }), function (err) { showError("Couldn't read that file: " + err); });
+    }), function (err) { if (my === fileReq) showError("Couldn't read that file: " + err); });
   }));
   function openWorld(text) {
     if (!engineOk() || guardTurbo()) return;
