@@ -26,6 +26,12 @@
 //      value for value (the rule it keeps it by, with no read of the world but for the speeds and the predator floor);
 //      values the engine cannot keep (past float32, ten-digit whole numbers) refused first, here and in Turbo; a world whose
 //      checkpoint stopped being JSON (a fish's energy overflowed) contained here, in the worker, in its recovery, at the hand-back
+//   7. the third review of PR #104 (Hydrogen; 7a, 7b and 7c fail on 56418d1): an engine trap outside the frame (Restart, R,
+//      Save world, Load world after its read, a live value, Turbo's start and hand-back, the colour switch, a tap on the world,
+//      the tour's fish, the dashboards' module) stops the engine, nothing escapes, nothing reaches the module after; Reset
+//      every setting withdraws an open question; no key acts behind the failure screen; a refused Restart keeps what waits;
+//      Fit asks and 299.98 simulated seconds do not; a file read a newer pick or a new world overtook is dropped; each
+//      fallback step's failure is logged and the fish-shapes switch follows WebGL's
 // The page runs on tests/ui_inspector_tests.cjs's small DOM and window (its ids from web/index.html).
 "use strict";
 const fs = require("fs");
@@ -137,6 +143,7 @@ async function bootPage(o) {
   const P = makeWindow(D, "http://classic.test/web/index.html?threads=0&view=" + (o.view || "flat") + "&guide=0&intro=0", { media: ["min-width: 960px"] });
   const box = { M: null };
   if (o.scene) P.ctx.EvoScene = o.scene;
+  if (o.gl) P.ctx.EvoGL = o.gl;   /* (a stand-in for web/gl_renderer.js: the flat view's WebGL drawing) */
   if (o.dash) {   /* (the dashboards' attach gets runConfig: the page's record of what runs) */
     P.ctx.EvoDash = { attach: (h) => { box.host = h; }, pump() {}, reset() {}, ingest() {}, every: () => 60, open() {}, close() {}, isOpen: () => false };
   }
@@ -685,6 +692,155 @@ async function reviewOverflow() {
      "  its hand-back: the world loads, its unreadable config contained (the record stays the page's, and agrees), nothing thrown", G.said());
 }
 
+/* ================================================ 7. the third review of PR #104 (Hydrogen, fe5f9e6) ================================================ */
+/* errors that escaped to node (a rejection no one handled, an exception thrown in a worker's message or a timer): recorded,
+ * so a case that lets one escape fails instead of ending the run */
+const escaped = [];
+process.on("unhandledRejection", (e) => escaped.push("unhandled rejection: " + String(e && e.message || e)));
+process.on("uncaughtException", (e) => escaped.push("uncaught: " + String(e && e.message || e)));
+const trapErr = (what) => new WebAssembly.RuntimeError("injected trap in " + what);
+
+/* P2-1: a trap from any way into the module, not only the frame's, stops the engine (the screen, the fence) */
+async function reviewTrapsOutsideFrame() {
+  section("7a. P2-1: an engine trap outside the frame stops the engine, from every way in");
+  const cases = [
+    ["Restart (evo_init)", "_evo_init", async (G) => { G.el("restart").click(); }],
+    ["R (evo_init)", "_evo_init", async (G) => { G.P.key("r"); }],
+    ["Save world (evo_checkpoint)", "_evo_checkpoint", async (G) => { G.el("savecp").click(); }],
+    ["Load world (evo_load_checkpoint, after the read)", "_evo_load_checkpoint", async (G) => { await G.load("w.json", G.cp); }],
+    ["a live value (evo_set_param)", "_evo_set_param", async (G) => { G.setField("adv_targetFood", 700); }],
+    ["Turbo's start (evo_checkpoint)", "_evo_checkpoint", async (G) => { G.el("turbobtn").click(); }],
+    ["the colour switch (evo_set_colour_mode)", "_evo_set_colour_mode", async (G) => { const e = G.el("colourBrain"); e.checked = !e.checked; G.fire(e, "change"); }],
+    ["a tap on the world (evo_creature_count)", "_evo_creature_count", async (G) => {
+      const cv = G.el("canvas"); cv._rect = { left: 0, top: 0, right: 100, bottom: 100 };
+      cv.dispatchEvent(new G.D.Ev("click", { bubbles: true, clientX: 10, clientY: 10 })); }],
+    ["the tour's fish (evo_creature_count)", "_evo_creature_count", async (G) => { G.P.ctx.EvoApp.inspectSomeFish(); }],
+    ["the dashboards' module (evo_similarity)", "_evo_similarity", async (G) => { G.dashAnswer = G.box.host.module._evo_similarity(50); }],
+    ["Turbo's hand-back (evo_load_checkpoint, in the worker's message)", null, async (G) => {
+      G.el("turbobtn").click();
+      await until(() => G.state() === "turbo", "Turbo running");
+      G.box.M._evo_load_checkpoint = () => { throw trapErr("the hand-back"); };
+      G.el("turboexit").click();
+      await until(() => G.el("splash").classList.contains("failed") || escaped.length > 0, "the hand-back", 30000).catch(() => {});
+    }]
+  ];
+  for (const [what, fn, act] of cases) {
+    const e0 = escaped.length;
+    const G = await startedPage({ dash: true }), { D, el, box } = G, M = box.M;
+    G.cp = M.UTF8ToString(M._evo_checkpoint());
+    if (fn) M[fn] = () => { throw trapErr(what); };
+    let threw = null;
+    try { await act(G); } catch (e) { threw = e; }
+    await new Promise((r) => setTimeout(r, 20));
+    const sp = el("splash"), st = el("splashstate").textContent;
+    G.watchModule();
+    for (let i = 0; i < 3; i++) G.P.frame();
+    ok(!threw && D.errors.length === 0 && escaped.length === e0 && sp.classList.contains("failed") && /^The engine stopped \(injected trap in /.test(st) &&
+       G.calls === 0 && G.state() === "live",
+       what + ": the engine stopped (its screen), nothing escaped, and no call reaches the module after (" + G.calls + ")",
+       [threw && String(threw), D.errors.slice(0, 1), escaped.slice(e0, e0 + 1), sp.classList.contains("failed"), st.slice(0, 60), G.calls, G.state()]);
+    if (what.indexOf("dashboards") >= 0) ok(G.dashAnswer === 0, "  the dashboards' read answers 0 (an empty answer), not the trap");
+  }
+}
+
+/* P2-2: Reset every setting withdraws an open question, as an edit does */
+async function reviewResetWithdraws() {
+  section("7b. P2-2: Reset every setting withdraws the question (never a start other than the one asked about)");
+  const G = await startedPage(), { el, box } = G, M = box.M;
+  G.setField("predators", 3);
+  el("restart").click(); G.settle();
+  ok(G.asked() && /It starts with what waits: Predators 3\./.test(el("startaskmsg").textContent), "an edit waiting (Predators 3), Restart: asked");
+  el("advreset").click(); G.settle();
+  ok(!G.asked() && el("predators").value === "0" && G.said() === "Every setting is back to its default. Start again to review it.",
+     "Reset every setting: the question about Predators 3 goes, and says so; the form is the defaults", [G.asked(), el("predators").value, G.said()]);
+  let inits = 0;
+  const init0 = M._evo_init;
+  M._evo_init = function () { inits++; return init0.apply(this, arguments); };
+  el("restart").click(); G.settle();
+  ok(!G.asked() && inits === 1 && M._evo_predator_count() === 0, "  Restart now: nothing waits (the defaults run), it starts at once, no predators");
+}
+
+/* the review's P3s that this round fixes */
+async function reviewP3() {
+  section("7c. P3s: keys behind the failure screen; a refused Restart keeps what waits; Fit and the five-minute edge; stale file reads; each fallback logged");
+  {   /* P3-1 */
+    const G = await startedPage(), { D, el, box } = G, M = box.M;
+    el("pausebtn").click();
+    M._evo_step = () => { throw trapErr("a step"); };
+    G.P.frame();
+    const f0 = D.doc.activeElement;
+    G.P.key("Escape"); G.P.key("f");
+    ok(el("splash").classList.contains("failed") && f0 === el("splashreload") && D.doc.activeElement === el("splashreload"),
+       "P3-1: behind the engine-stopped screen, Esc and F do nothing: the focus stays on Reload", [f0 && f0.id, D.doc.activeElement && D.doc.activeElement.id]);
+  }
+  {   /* P3-4 */
+    const G = await startedPage(), { el, box } = G, M = box.M;
+    G.setField("population", -1);
+    el("restart").click(); G.settle();
+    if (G.asked()) el("startconfirm").click();
+    G.settle();
+    ok(/^evo_init failed/.test(G.said()) && el("restart").querySelector("span").textContent === "Restart to apply" && el("population").value === "-1",
+       "P3-4: a Restart the engine refuses (-1 fish) leaves its edit waiting: still Restart to apply", [G.said(), el("restart").querySelector("span").textContent]);
+    G.setField("population", 300);
+    M._evo_step(18749); M._evo_sync(); G.settle();
+    G.P.key("r"); G.settle();
+    ok(!G.asked() && tickOf(M) === 0, "  18749 steps (299.98 simulated seconds): R starts at once, under the five minutes");
+    M._evo_step(18750); M._evo_sync(); G.settle();
+    el("fitbtn").click(); G.settle();
+    ok(G.asked() && /^This replaces your run, and 5 min 0 s of evolution with it\.$/.test(el("startaskmsg").textContent), "  Fit the world to this screen, five minutes on: asks", el("startaskmsg").textContent);
+    el("startcancel").click();
+  }
+  {   /* P3-3 */
+    const G = await startedPage(), { el, box } = G, M = box.M;
+    const cp = M.UTF8ToString(M._evo_checkpoint());
+    let loads = 0;
+    const load0 = M._evo_load_checkpoint;
+    M._evo_load_checkpoint = function () { loads++; return load0.apply(this, arguments); };
+    let releaseA = null;
+    el("cpfile").files = [{ name: "a.json", text: () => new Promise((r) => { releaseA = r; }) }];
+    G.fire(el("cpfile"), "change");
+    await G.load("b.json", cp);
+    const afterB = loads;
+    releaseA(cp);
+    await new Promise((r) => setTimeout(r, 20));
+    ok(afterB === 1 && loads === 1, "P3-3: a.json picked (its read slow), then b.json: b opens; a's read, arriving after, is dropped", [afterB, loads]);
+    let releaseC = null;
+    el("cpfile").files = [{ name: "c.json", text: () => new Promise((r) => { releaseC = r; }) }];
+    G.fire(el("cpfile"), "change");
+    G.P.key("r"); G.settle();   /* (a new world while c.json is read) */
+    const t = tickOf(M);
+    releaseC(cp);
+    await new Promise((r) => setTimeout(r, 20));
+    ok(loads === 1 && tickOf(M) === t && G.said() === "A new world started while c.json was read, so it was not opened: pick it again.",
+       "  c.json picked, a new world started (R) before its read arrived: not opened over it, and said", [loads, G.said()]);
+  }
+  {   /* P3-2 */
+    let boom = false;
+    const scene = { load: () => Promise.resolve(), create: () => new Proxy({}, { get: (t, k) => {
+      if (k === "then" || typeof k === "symbol") return undefined;
+      if (k === "render") return () => { if (boom) throw new TypeError("tank boom"); };
+      if (k === "following") return () => false;
+      if (k === "quality") return () => 3;
+      if (k === "project") return () => null;
+      if (k === "setQuality" || k === "degrade") return () => false;
+      return () => {};
+    } }) };
+    const gl = { create: () => ({ fishShapes: true, resize() {}, forgetFish() {}, draw: () => { if (boom) throw new TypeError("webgl boom"); return null; } }) };
+    const G = await startedPage({ view: "3d", scene, gl });
+    await until(() => G.D.doc.body.classList.contains("view-3d"), "the tank view");
+    const fs = G.el("fishShape");
+    ok(!fs.disabled, "P3-2: a page with the tank and WebGL (fish shapes on offer)");
+    boom = true;
+    G.el("pausebtn").click();
+    for (let i = 0; i < 4; i++) G.P.frame();
+    const logs = G.P.logs.filter((l) => l[0] === "error" && /a frame failed/.test(l[1]));
+    ok(logs.length === 2 && /tank boom/.test(logs[0][1]) && /webgl boom/.test(logs[1][1]) && !G.D.doc.body.classList.contains("view-3d"),
+       "  the tank fails, then WebGL: both logged (once each), the flat view in canvas 2D runs", logs.map((l) => l[1].slice(0, 50)));
+    ok(fs.disabled && !fs.checked && /canvas 2D/.test(G.el("modeline").textContent) && /canvas 2D now/.test(G.el("f_fishShape").querySelector(".needs").textContent),
+       "  the fish-shapes switch follows: off, disabled, with why; the modeline says canvas 2D", [fs.disabled, fs.checked, G.el("modeline").textContent.slice(-60)]);
+  }
+}
+
 (async () => {
   /* each section on its own: one section's throw never hides the next (sections 3 and 4b go on section 2's page) */
   const run = async (name, f) => { try { return await f(); } catch (e) { ok(false, name + " threw: " + (e && e.stack || e)); return null; } };
@@ -693,7 +849,8 @@ async function reviewOverflow() {
   if (G) { await run("turboEdits", () => turboEdits(G)); await run("engineTrap", () => engineTrap(G)); }
   await run("startFailures", startFailures);
   for (const t of [reviewLoadBypass, reviewStoppedFence, reviewUnanswered, reviewHeldOrder, reviewFrameErrors, reviewRecord,
-                   reviewRounding, reviewRecordRule, reviewOverflow]) await run(t.name, t);
+                   reviewRounding, reviewRecordRule, reviewOverflow, reviewTrapsOutsideFrame, reviewResetWithdraws, reviewP3]) await run(t.name, t);
+  ok(escaped.length === 0, "nothing escaped to node in the whole run (no unhandled rejection, no uncaught exception)", escaped.slice(0, 3));
   for (const w of workers) w.terminate();
   console.log((fails ? "FAILED " + fails + " of " : "all ") + checks + " checks" + (fails ? "" : " passed"));
   process.exit(fails ? 1 : 0);
