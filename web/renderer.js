@@ -292,7 +292,7 @@
   var animT = 0;   /* the tank's animation clock: runs with the world, stops when it stops */
   var reducedMQ = window.matchMedia("(prefers-reduced-motion: reduce)");
   var bgImage = new Image();  /* background texture — shared with the native app (img/rocks.jpg) */
-  bgImage.src = ASSETS.background;
+  if (ASSETS) bgImage.src = ASSETS.background;   /* (without EVO_ASSETS the page says so: its failure screen, below) */
   function el(id) { return document.getElementById(id); }
   var errEl = el("err");
 
@@ -1705,7 +1705,8 @@
     try { frameBody(now); }
     catch (err) {
       if (isTrap(err)) { engineStopped(err); return; }
-      frameFailed(err, now);
+      /* (the fallback reaches the module too, the modeline's thread count: a trap there stops the engine as well) */
+      try { frameFailed(err, now); } catch (e2) { if (isTrap(e2)) { engineStopped(e2); return; } throw e2; }
       return;
     } finally { fenceDepth--; }
     if (frameFault) {
@@ -2745,7 +2746,8 @@
     showError("loader.js / EVO_ASSETS missing from the page");
     return;
   }
-  EvoLoader.load().then(function (r) {
+  /* (the boot is fenced as a whole, its start too: a trap in a hook inside it, the dashboards' attach and reset, ends it) */
+  EvoLoader.load().then(fenced(function (r) {
     Module = r.Module;
     threaded = r.threaded;
     threadWhy = r.why;
@@ -2800,8 +2802,8 @@
       row.appendChild(hint);
     }
     /* ?bench measures the view it starts in, so that one is loaded first */
-    return Promise.resolve(want === "3d" ? setView(true) : null).then(start);
-  }).catch(function (err) {
+    return Promise.resolve(want === "3d" ? setView(true) : null).then(fenced(start));
+  })).catch(function (err) {
     var why = String(err && err.message || err);
     console.error("evo_boids: " + why);
     failScreen("The simulation couldn't start.\n" + why, false, !!(err && err.noSimd));
