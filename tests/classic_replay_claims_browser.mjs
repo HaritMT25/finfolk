@@ -161,7 +161,8 @@ const CASES = {
          "); the world kept its " + n1 + " fish (" + n3 + ", " + n4 + ")");
       await p.fill("#population", "300");
       await restartReplacing(p);
-      await p.waitForTimeout(300);
+      /* (the badge follows at the page's next tick of its numbers, every 500 ms: waited for, not raced with a fixed 300 ms) */
+      await p.waitForFunction(() => document.getElementById("ro-gov").hidden, null, { timeout: 5000, polling: 50 }).catch(() => {});
       const c5 = await claim(p), g5 = await govShown(p);
       ok(c5 === "yes" && !g5, "an accepted Restart is a new run: it replays (" + c5 + "), the governed badge is gone (" + g5 + ")");
       errsOk(p, "refusals");
