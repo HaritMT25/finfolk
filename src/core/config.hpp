@@ -181,6 +181,10 @@ struct SimConfig {
     int   genomeInitMax   = GENOME_INITIAL_MAX;  // initial gene-count range (high)
     float mutationMultiplier = 1.0f;             // scales the per-birth mutation rate
     WeightMutationMode weightMutationMode = WeightMutationMode::Legacy;
+    int genomeVersion = 1;
+    bool biasGenes = false;
+    int hiddenNeurons = MAX_INTERNAL_NEURONS;
+    int brainEvalVersion = 1;
 
     // --- Currents (ocean flow; off by default) ---
     float currentStrength = 0.0f;   // peak flow speed, world units/sec (0 = off)
@@ -462,9 +466,21 @@ struct SimConfig {
         if (weightMutationMode != WeightMutationMode::Legacy)
             o << "\nweightMutationMode="
               << weightMutationModeName(weightMutationMode);
+        if (genomeVersion != 1)
+            o << "\ngenomeVersion=" << genomeVersion
+              << " biasGenes=" << (biasGenes ? "true" : "false")
+              << " hiddenNeurons=" << hiddenNeurons
+              << " brainEvalVersion=" << brainEvalVersion;
         return o.str();
     }
 };
+
+inline BrainSchema brainSchema(const SimConfig& config) {
+    return {
+        static_cast<std::uint8_t>(config.genomeVersion),
+        config.biasGenes
+    };
+}
 
 // The Stage C knobs every frontend and the checkpoint loader refuse, on the
 // terms the other mutation knobs are refused (finite and >= 0; negated tests
@@ -529,6 +545,30 @@ inline const char* brainPolicyConfigError(const SimConfig& c) {
         }
         if (c.predatorBrain && c.predatorPrimer && c.genomeMaxLength < 2)
             return "saturating neural predator primer requires genomeMaxLength >= 2";
+    }
+    if (c.genomeVersion != 1 && c.genomeVersion != 2)
+        return "genomeVersion must be 1 or 2";
+    if (c.hiddenNeurons != MAX_INTERNAL_NEURONS)
+        return "this engine supports hiddenNeurons=12 only";
+    if (c.genomeVersion == 1) {
+        if (c.biasGenes)
+            return "biasGenes requires genomeVersion=2";
+        if (c.brainEvalVersion != 1)
+            return "genomeVersion=1 requires brainEvalVersion=1";
+    } else {
+        if (c.brainEvalVersion != 2)
+            return "genomeVersion=2 requires brainEvalVersion=2";
+        if (c.weightMutationMode != WeightMutationMode::Saturating)
+            return "genomeVersion=2 requires weightMutationMode=saturating";
+        if (!(GENOME_MIN_LENGTH <= c.genomeMinLength
+              && c.genomeMinLength <= c.genomeInitMin
+              && c.genomeInitMin <= c.genomeInitMax
+              && c.genomeInitMax <= c.genomeMaxLength
+              && c.genomeMaxLength <= GENOME_MAX_LENGTH))
+            return "genomeVersion=2 requires coherent lengths within 16..80";
+        if (!std::isfinite(c.mutationMultiplier)
+            || !std::isfinite(c.geneCost))
+            return "genomeVersion=2 requires finite mutationMultiplier and geneCost";
     }
     return nullptr;
 }

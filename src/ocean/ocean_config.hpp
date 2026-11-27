@@ -377,6 +377,7 @@ inline constexpr const char* kSimConfigIntKeys[] = {
     "maxNeighbors", "genomeMinLength", "genomeMaxLength", "genomeInitMin", "genomeInitMax",
     "currentMode", "currentEddies", "foodPatches", "predatorCount",
     "predatorMinPopulation", "predatorMaxPopulation",
+    "genomeVersion", "hiddenNeurons", "brainEvalVersion",
 };
 inline bool isSimConfigIntKey(const std::string& k) {
     for (const char* i : kSimConfigIntKeys) if (k == i) return true;
@@ -408,7 +409,7 @@ inline bool isOceanIntKey(const std::string& k) {
 // kOceanBoolKeys readOceanConfig's readBool keys: wasm/ocean_parity.sh checks both.
 inline constexpr const char* kSimConfigBoolKeys[] = {"toroidal", "bodyModel", "triangularMotion", "foodDrift",
                                                      "predatorEconomy", "predatorInheritance", "predatorBrain",
-                                                     "predatorPrimer", "predatorFrozen", "fastTanh"};
+                                                     "predatorPrimer", "predatorFrozen", "fastTanh", "biasGenes"};
 inline constexpr const char* kOceanBoolKeys[] = {"deepCurrent", "lightEnabled", "depthCostScaled",
                                                  "sizeDrift", "sizeFight", "mouthGate", "walls",
                                                  "bodyPlanPreviewEnabled"};
@@ -434,11 +435,17 @@ inline bool isPhysicalKnobKey(const std::string& k) { return k == "physicalMutat
 // range (checked before the reader casts it, every occurrence of the key), a
 // SimConfig bool key that is not a JSON true / false, or an Ocean bool key
 // that is not true / false / 0 / 1 (every occurrence of either).
-inline bool readOceanJson(const char* json, SimConfig& sc, OceanConfig& oc, std::string& err) {
+inline bool readOceanJson(const char* json, SimConfig& simConfig, OceanConfig& oceanConfig, std::string& err) {
     if (!json || !json[0]) return true;
     const std::string wrapped = std::string("{\"config\":") + json + "}";
     jsonm::Value root;
     if (!jsonm::Parser::parse(wrapped, root, err)) { err = "config parse error: " + err; return false; }
+    // Stage every update: later policy or Ocean checks can refuse even when
+    // the JSON contains only pre-existing keys. Publish both configs together.
+    SimConfig nextSim = simConfig;
+    OceanConfig nextOcean = oceanConfig;
+    SimConfig& sc = nextSim;
+    OceanConfig& oc = nextOcean;
     using T = jsonm::Value::Type;
     if (const jsonm::Value* o = root.find("config"); o && o->isObject())
         for (const auto& kv : o->obj) {
@@ -484,6 +491,8 @@ inline bool readOceanJson(const char* json, SimConfig& sc, OceanConfig& oc, std:
     }
     if (const jsonm::Value* o = root.find("config"))
         if (!readOceanConfig(*o, oc, &err)) return false;
+    simConfig = nextSim;
+    oceanConfig = nextOcean;
     return true;
 }
 

@@ -376,18 +376,22 @@ void SfmlRenderer::drawNeuralOverlay(const Creature& c) {
     auto hiddenPos = [&](int i) { return sf::Vector2f(xHidden, colY(i, MAX_INTERNAL_NEURONS)); };
     auto actionPos = [&](int i) { return sf::Vector2f(xAction, colY(i, NUM_ACTIONS)); };
 
+    const sf::Vector2f biasPos(xHidden, panelY + 24.0f);
+    bool hasBias = false;
     // 1) Connections first (under the nodes). Alpha ~ |weight|*|source activation|.
     sf::VertexArray links(sf::Lines);
     for (const auto& fc : c.nnet.flat) {
         const Gene g = asGene(fc);
+        const bool bias = fc.logCodec() && g.sourceType == SOURCE_NEURON && g.sourceNum == 127;
+        hasBias |= bias;
         sf::Vector2f a = (g.sourceType == SOURCE_SENSOR) ? sensorPos(g.sourceNum)
-                                                         : hiddenPos(g.sourceNum);
+                                                         : (bias ? biasPos : hiddenPos(g.sourceNum));
         sf::Vector2f b = (g.sinkType == SINK_ACTION) ? actionPos(g.sinkNum)
                                                      : hiddenPos(g.sinkNum);
         const float srcAct = (g.sourceType == SOURCE_SENSOR)
                              ? c.lastSensors[g.sourceNum]
-                             : c.nnet.neurons[g.sourceNum].output;
-        const float w = g.weightAsFloat();
+                             : (bias ? 1.0f : c.nnet.neurons[g.sourceNum].output);
+        const float w = fc.w();
         const float mag = std::min(1.0f, std::fabs(w) * std::fabs(srcAct) * 1.5f);
         const uint8_t alpha = (uint8_t)(25 + std::lround(180 * mag));
         const sf::Color col = (w >= 0.0f) ? sf::Color(120, 200, 130, alpha)
@@ -411,8 +415,14 @@ void SfmlRenderer::drawNeuralOverlay(const Creature& c) {
     for (int i = 0; i < MAX_INTERNAL_NEURONS; ++i)  drawNode(hiddenPos(i), c.nnet.neurons[i].output, 5.0f);
     for (int i = 0; i < NUM_ACTIONS; ++i)           drawNode(actionPos(i), c.lastActions[i], 5.0f);
 
+    if (hasBias) drawNode(biasPos, 1.0f, 5.0f);
     // 3) Labels (title + action names) when a font is available.
     if (hasFont_) {
+        if (hasBias) {
+            sf::Text label("+1", font_, 11);
+            label.setPosition(biasPos.x + 6.0f, biasPos.y - 6.0f);
+            window_.draw(label);
+        }
         std::ostringstream title;
         title << "Fish #" << c.id
               << "   spd " << std::fixed << std::setprecision(0) << c.speed

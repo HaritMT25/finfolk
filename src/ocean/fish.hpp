@@ -69,9 +69,9 @@ struct Fish : AgentCore {
 
 // A founder: random genome, then init. bodyBuoy = depth / D (it starts neutral
 // where it was dropped).
-inline Fish makeRandomFish(Vec2 pos, float depth, float D, int initMin, int initMax) {
+inline Fish makeRandomFish(Vec2 pos, float depth, float D, int initMin, int initMax, BrainSchema schema = {}) {
     Fish f;
-    f.genome = makeRandomGenome(initMin, initMax);
+    f.genome = makeRandomGenome(initMin, initMax, schema);
     f.init(pos, depth);
     f.bodyBuoy = std::clamp(depth / D, 0.0f, 1.0f);
     return f;

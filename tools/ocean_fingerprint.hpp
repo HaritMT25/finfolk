@@ -231,7 +231,7 @@ constexpr std::size_t fieldCount() {
 
 #define OFP_FIELDS(T, N) \
     static_assert(detail::fieldCount<T>() == (N), #T " gained or lost a field: hash it in tools/ocean_fingerprint.hpp, then update this count")
-OFP_FIELDS(SimConfig, 79);   // previous 78 + weightMutationMode
+OFP_FIELDS(SimConfig, 83);   // previous 78 + weightMutationMode
 OFP_FIELDS(OceanConfig, 40);   // 37 + the body-plan preview's three (visitOceanConfigBodyPlan, hashed in `body`)
 OFP_FIELDS(appearance::Stats, 10);   // founders, offspring, pattern[4], morph[4]
 OFP_FIELDS(physical::Stats, 6);      // founders, offspring, mode[4]
@@ -242,10 +242,12 @@ OFP_FIELDS(Predator, 18);   // 9 + the Stage C brain (genome .. virtualBuds): ha
 OFP_FIELDS(OceanPredator, 3);                               // base, depth, pitch
 OFP_FIELDS(OceanFood, 5 + (kOceanHasEye ? 1 : 0));   // pos, depth, alive, size, age (+ eyeCon)
 OFP_FIELDS(Gene, 5);
+OFP_FIELDS(BrainSchema, 2);
+OFP_FIELDS(BrainConversion, 3);
 OFP_FIELDS(NeuralNet, 6);   // neurons, flat + srcTypeBits[2], sinkTypeBits[2]: the gene-type masks, derived from the genome (which is hashed) by buildNeuralNet, so not hashed
 OFP_FIELDS(NeuralNet::Neuron, 2);
 OFP_FIELDS(NeuralNet::FlatConn, 2);
-OFP_FIELDS(WorldCommon, 30);   // 25 + Stage C: predRng_, nextPredatorId_, arenaFresh_ (ctr's tagged block), predLog_, predTally_ (statistics, not hashed)
+OFP_FIELDS(WorldCommon, 31);   // 25 + Stage C: predRng_, nextPredatorId_, arenaFresh_ (ctr's tagged block), predLog_, predTally_ (statistics, not hashed)
 OFP_FIELDS(WorldCommon::DeathRecord, 7 + CLUSTER_SKETCH_DIM);
 OFP_FIELDS(WorldCommon::BirthRecord, 6);
 OFP_FIELDS(repro::Edge, 2);
@@ -431,6 +433,21 @@ template <class V>
 void visitSimConfigWeightPolicy(const SimConfig& c, V& v) {
     v.i32("weightMutationMode", static_cast<int>(c.weightMutationMode));
 }
+template <class V>
+void visitSimConfigGenomeV2(const SimConfig& c, V& v) {
+    v.i32("genomeVersion", c.genomeVersion);
+    v.b("biasGenes", c.biasGenes);
+    v.i32("hiddenNeurons", c.hiddenNeurons);
+    v.i32("brainEvalVersion", c.brainEvalVersion);
+    v.i32("decoderVersion", logweight::kDecoderVersion);
+    v.i32("weightTableVersion", logweight::kTableVersion);
+}
+inline constexpr std::uint64_t kGenomeV2Tag = 0x4732505242590001ull;
+inline constexpr std::uint64_t kConversionTag = 0x4732434f4e560001ull;
+inline void hashSchema(Hasher& h, const Genome& genome) {
+    if (genome.schema.genomeVersion != 2) return;
+    h.u64(kGenomeV2Tag); h.u32(genome.schema.genomeVersion); h.b(genome.schema.biasGenes);
+}
 inline bool simBrainActive(const SimConfig& c) { return c.predatorBrain; }
 template <class V>
 void visitOceanConfig(const OceanConfig& c, V& v) {
@@ -494,6 +511,11 @@ struct VisionTagger {
 inline void hashConfig(Hasher& h, const SimConfig& c, const OceanConfig& o) {
     visitSimConfig(c, h);
     visitOceanConfig(o, h);
+    if (c.genomeVersion == 2) {
+        h.u64(kGenomeV2Tag);
+        visitSimConfigGenomeV2(c, h);
+        for (const char* p = logweight::kTableSha256; *p; ++p) h.u32(static_cast<unsigned char>(*p));
+    }
     VisionTagger t{h};
     visitOceanConfigVision(o, t);
     if (!oceanWallsAtDefaults(o)) {   // the glass walls: one tagged block, only off the defaults
@@ -511,6 +533,12 @@ inline void hashConfig(Hasher& h, const SimConfig& c, const OceanConfig& o) {
 }
 
 inline void hashCounters(Hasher& h, const OceanWorld& w) {
+    if (!w.brainConversion.sourceSha256.empty()) {
+        h.u64(kConversionTag);
+        for (unsigned char c : w.brainConversion.sourceSha256) h.u32(c);
+        h.u64(w.brainConversion.sourceFrame);
+        h.u32(static_cast<unsigned>(w.brainConversion.sourceWeightMutationMode));
+    }
     h.u64(w.frame); h.i32(w.width); h.i32(w.height); h.f32(w.D);
     h.i32(w.births); h.i32(w.deaths); h.i64(w.totalBirths); h.i64(w.totalDeaths);
     h.i64(w.totalGraceBirths); h.i64(w.totalSoftBirths);
@@ -581,6 +609,7 @@ inline void hashFish(Hasher& h, const Fish& c, bool withActivations = true) {
     h.u64(c.id); h.u64(c.lineageId);
     h.f32x2(c.speed, c.age); h.f32x2(c.foodReserves, c.reproTimer); h.f32x2(c.interactTimer, c.responsiveness);
     h.f32x2(c.oscPeriod, c.oscPhase); h.f32x2(c.bodySize, c.bodyElong);
+    hashSchema(h, c.genome);
     const std::size_t ng = c.genome.size();
     h.u64(ng);
     for (std::size_t i = 0; i < ng; i += 2)
@@ -628,6 +657,7 @@ inline void hashPredator(Hasher& h, const OceanPredator& p) {
         h.u64(kBrainPredTag);
         h.u64(p.id); h.u64(p.lineageId); h.u64(p.parentId); h.f32(p.speed); h.u32(p.captures);
         h.u64(p.sourceId); h.u32(p.virtualBuds);
+        hashSchema(h, p.genome);
         h.u64(p.genome.size());
         for (const Gene& g : p.genome) h.u32(geneWord(g));
         h.u64(p.nnet.neurons.size());
@@ -869,6 +899,7 @@ inline long countNonFinite(const OceanWorld& w) {
     visitSimConfig(w.cfg, nf);
     visitSimConfigBrain(w.cfg, nf);
     visitSimConfigWeightPolicy(w.cfg, nf);
+    if (w.cfg.genomeVersion == 2) visitSimConfigGenomeV2(w.cfg, nf);
     visitOceanConfig(w.ocfg, nf);
     visitOceanConfigVision(w.ocfg, nf);
     visitOceanConfigAppearance(w.ocfg, nf);
@@ -959,6 +990,15 @@ inline void dumpState(const OceanWorld& w, std::FILE* out) {
     if (simBrainActive(w.cfg)) visitSimConfigBrain(w.cfg, d);
     if (w.cfg.weightMutationMode != WeightMutationMode::Legacy)
         visitSimConfigWeightPolicy(w.cfg, d);
+    if (w.cfg.genomeVersion == 2) {
+        visitSimConfigGenomeV2(w.cfg, d);
+        std::fprintf(out, " weightTableSha256=%s", logweight::kTableSha256);
+    }
+    if (!w.brainConversion.sourceSha256.empty()) {
+        std::fprintf(out, "\nconversion sourceSha256=%s", w.brainConversion.sourceSha256.c_str());
+        d.ull("sourceFrame", w.brainConversion.sourceFrame);
+        d.ll("sourceWeightMutationMode", static_cast<int>(w.brainConversion.sourceWeightMutationMode));
+    }
     std::fprintf(out, "\noceanconfig");
     visitOceanConfig(w.ocfg, d);
     visitOceanConfigVision(w.ocfg, d);

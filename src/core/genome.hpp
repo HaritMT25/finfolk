@@ -9,6 +9,9 @@
 #include "sensors_actions.hpp"
 #include "portable_math.hpp"
 #include "random.hpp"
+#include <cassert>
+#include <cstdlib>
+#include "weight_log.hpp"
 
 enum class WeightMutationMode : uint8_t {
     Legacy = 0,
@@ -61,6 +64,20 @@ constexpr uint8_t SOURCE_NEURON = 0;
 constexpr uint8_t SINK_ACTION = 1;
 constexpr uint8_t SINK_NEURON = 0;
 
+struct BrainSchema {
+    std::uint8_t genomeVersion = 1;
+    bool biasGenes = false;
+
+    friend constexpr bool operator==(
+        const BrainSchema&, const BrainSchema&
+    ) = default;
+};
+
+inline constexpr bool validBrainSchema(BrainSchema schema) {
+    return (schema.genomeVersion == 1 && !schema.biasGenes)
+        || schema.genomeVersion == 2;
+}
+
 struct Gene {
     uint16_t sourceType : 1;  // SENSOR or internal NEURON
     uint16_t sourceNum  : 7;
@@ -85,7 +102,94 @@ struct Gene {
     static Gene makeRandom() { return makeRandom(rng); }
 };
 
-using Genome = std::vector<Gene>;
+struct Genome final : std::vector<Gene> {
+    using std::vector<Gene>::vector;
+    Genome() = default;
+    Genome(const Genome&) = default;
+    Genome(Genome&&) noexcept = default;
+    Genome& operator=(const Genome&) = default;
+    Genome& operator=(Genome&&) noexcept = default;
+    // An unversioned vector/list explicitly means legacy, including reuse.
+    Genome(std::vector<Gene> genes) : std::vector<Gene>(std::move(genes)) {}
+    Genome& operator=(std::vector<Gene> genes) {
+        std::vector<Gene>::operator=(std::move(genes)); schema = {}; return *this;
+    }
+    Genome& operator=(std::initializer_list<Gene> genes) {
+        std::vector<Gene>::operator=(genes); schema = {}; return *this;
+    }
+    BrainSchema schema{};
+};
+
+static_assert(sizeof(Gene) == 4, "logical genes must remain four bytes");
+
+inline float geneWeight(const Gene& gene, BrainSchema schema) {
+    return schema.genomeVersion == 2
+        ? logweight::decodeValid(logweight::word(gene.weight))
+        : gene.weightAsFloat();
+}
+
+inline bool biasSource(const Gene& gene, BrainSchema schema) {
+    return schema.genomeVersion == 2
+        && gene.sourceType == SOURCE_NEURON
+        && gene.sourceNum == 127;
+}
+
+inline int genomeSourceIndex(
+    const Gene& gene, BrainSchema schema, int senses
+) {
+    if (schema.genomeVersion == 1) {
+        return gene.sourceType == SOURCE_SENSOR
+            ? static_cast<int>(gene.sourceNum % senses)
+            : senses + static_cast<int>(
+                gene.sourceNum % MAX_INTERNAL_NEURONS);
+    }
+    if (gene.sourceType == SOURCE_SENSOR) return gene.sourceNum;
+    return senses + (gene.sourceNum == 127
+        ? MAX_INTERNAL_NEURONS : static_cast<int>(gene.sourceNum));
+}
+
+inline int genomeSinkIndex(
+    const Gene& gene, BrainSchema schema, int actions
+) {
+    if (schema.genomeVersion == 1) {
+        return gene.sinkType == SINK_ACTION
+            ? static_cast<int>(gene.sinkNum % actions)
+            : actions + static_cast<int>(
+                gene.sinkNum % MAX_INTERNAL_NEURONS);
+    }
+    return gene.sinkType == SINK_ACTION
+        ? static_cast<int>(gene.sinkNum)
+        : actions + static_cast<int>(gene.sinkNum);
+}
+
+inline bool validCanonicalGene(
+    const Gene& gene, BrainSchema schema, int senses, int actions
+) {
+    if (schema.genomeVersion != 2) return false;
+    if (!logweight::valid(logweight::word(gene.weight))) return false;
+
+    const bool sourceOK = gene.sourceType == SOURCE_SENSOR
+        ? gene.sourceNum < senses
+        : gene.sourceNum < MAX_INTERNAL_NEURONS
+            || (schema.biasGenes && gene.sourceNum == 127);
+    const bool sinkOK = gene.sinkType == SINK_ACTION
+        ? gene.sinkNum < actions
+        : gene.sinkNum < MAX_INTERNAL_NEURONS;
+    return sourceOK && sinkOK;
+}
+
+inline bool validCanonicalGenome(
+    const Genome& genome, int senses, int actions
+) {
+    if (!validBrainSchema(genome.schema)
+        || genome.schema.genomeVersion != 2
+        || genome.size() > GENOME_MAX_LENGTH) return false;
+    for (const Gene& gene : genome)
+        if (!validCanonicalGene(
+                gene, genome.schema, senses, actions)) return false;
+    return true;
+}
+
 
 // --- NeuralNet: derived from genome ---
 // Free-topology: no fixed layers, any source can connect to any sink.
@@ -141,11 +245,25 @@ struct NeuralNet {
 #endif
         static constexpr uint16_t SRC_MASK = (1u << SRC_BITS) - 1u;
 
-        int   src()  const { return srcSink & SRC_MASK; }
-        int   sink() const { return srcSink >> SRC_BITS; }
-        // Division by 8192 is exact (power of two), so this is the identical
-        // float Gene::weightAsFloat() produces — bit-exactness is preserved.
-        float w()    const { return weight / 8192.0f; }
+        static constexpr std::uint16_t LOG_CODEC = 0x8000u;
+
+        bool logCodec() const { return (srcSink & LOG_CODEC) != 0u; }
+
+        int src() const {
+            const int bits = logCodec() ? 7 : SRC_BITS;
+            return srcSink & ((1u << bits) - 1u);
+        }
+
+        int sink() const {
+            const int bits = logCodec() ? 7 : SRC_BITS;
+            return (srcSink & 0x7fffu) >> bits;
+        }
+
+        float w() const {
+            return logCodec()
+                ? logweight::decodeValid(logweight::word(weight))
+                : weight / 8192.0f;
+        }
     };
     static_assert(sizeof(FlatConn) == 4, "flat connection must stay 4 bytes");
     std::vector<FlatConn> flat;
@@ -168,33 +286,98 @@ struct NeuralNet {
 // Decode a wired connection back into Gene form (post-remapping, i.e. the
 // indices the net actually uses). For code that inspects topology rather than
 // running it: the wiring log, the live inspector overlay, tests.
-inline Gene asGene(const NeuralNet::FlatConn& fc) {
-    const int src = fc.src(), sink = fc.sink();
-    Gene g;
-    g.sourceType = (src < NUM_SENSES) ? SOURCE_SENSOR : SOURCE_NEURON;
-    g.sourceNum  = (uint16_t)((src < NUM_SENSES) ? src : src - NUM_SENSES);
-    g.sinkType   = (sink < NUM_ACTIONS) ? SINK_ACTION : SINK_NEURON;
-    g.sinkNum    = (uint16_t)((sink < NUM_ACTIONS) ? sink : sink - NUM_ACTIONS);
-    g.weight     = fc.weight;
-    return g;
+inline Gene asGene(
+    const NeuralNet::FlatConn& connection,
+    int senses = NUM_SENSES, int actions = NUM_ACTIONS
+) {
+    const int source = connection.src();
+    const int sink = connection.sink();
+    Gene gene{};
+    gene.sourceType = source < senses ? SOURCE_SENSOR : SOURCE_NEURON;
+    gene.sourceNum = static_cast<std::uint16_t>(
+        source < senses ? source
+        : connection.logCodec()
+            && source == senses + MAX_INTERNAL_NEURONS
+                ? 127 : source - senses);
+    gene.sinkType = sink < actions ? SINK_ACTION : SINK_NEURON;
+    gene.sinkNum = static_cast<std::uint16_t>(
+        sink < actions ? sink : sink - actions);
+    gene.weight = connection.weight;
+    return gene;
 }
 
 // --- Genome operations ---
 
 // The genome operations take the stream they draw from; the overloads without
 // one use the global `rng` (the prey's), with the same draws in the same order.
-inline Genome makeRandomGenome(int initMin, int initMax, RandomGen& r) {
-    int length = r.intRange(initMin, initMax);
+template<class R>
+inline void sampleCanonicalSource(
+    Gene& gene, BrainSchema schema, int senses, R& random
+) {
+    if (schema.biasGenes && random.uint(15u) == 0u) {
+        gene.sourceType = SOURCE_NEURON;
+        gene.sourceNum = 127;
+        return;
+    }
+    gene.sourceType = random.uint(1u);
+    const unsigned count = gene.sourceType == SOURCE_SENSOR
+        ? static_cast<unsigned>(senses)
+        : static_cast<unsigned>(MAX_INTERNAL_NEURONS);
+    gene.sourceNum = static_cast<std::uint16_t>(
+        random.uint(count - 1u));
+}
+
+template<class R>
+inline void sampleCanonicalSink(
+    Gene& gene, int actions, R& random
+) {
+    gene.sinkType = random.uint(1u);
+    const unsigned count = gene.sinkType == SINK_ACTION
+        ? static_cast<unsigned>(actions)
+        : static_cast<unsigned>(MAX_INTERNAL_NEURONS);
+    gene.sinkNum = static_cast<std::uint16_t>(
+        random.uint(count - 1u));
+}
+
+template<class R>
+inline Gene makeCanonicalGene(
+    R& random, BrainSchema schema,
+    int senses = NUM_SENSES, int actions = NUM_ACTIONS
+) {
+    Gene gene{};
+    sampleCanonicalSource(gene, schema, senses, random);
+    sampleCanonicalSink(gene, actions, random);
+
+    const std::int32_t fixed =
+        static_cast<std::int32_t>(random.uint(0xffffu)) - 32768;
+    gene.weight = logweight::store(logweight::quantizeLegacy(
+        static_cast<std::int16_t>(fixed)));
+    return gene;
+}
+
+inline Genome makeRandomGenome(
+    int initMin, int initMax, RandomGen& random,
+    BrainSchema schema = {},
+    int senses = NUM_SENSES, int actions = NUM_ACTIONS
+) {
+    const int length = random.intRange(initMin, initMax);
     Genome genome;
+    genome.schema = schema;
     genome.reserve(length);
     for (int i = 0; i < length; ++i) {
-        genome.push_back(Gene::makeRandom(r));
+        genome.push_back(schema.genomeVersion == 2
+            ? makeCanonicalGene(random, schema, senses, actions)
+            : Gene::makeRandom(random));
     }
     return genome;
 }
-inline Genome makeRandomGenome(int initMin = GENOME_INITIAL_MIN,
-                               int initMax = GENOME_INITIAL_MAX) {
-    return makeRandomGenome(initMin, initMax, rng);
+
+inline Genome makeRandomGenome(
+    int initMin = GENOME_INITIAL_MIN,
+    int initMax = GENOME_INITIAL_MAX,
+    BrainSchema schema = {}
+) {
+    return makeRandomGenome(initMin, initMax, rng, schema);
 }
 
 // The gene-type masks of a genome (NeuralNet::srcTypeBits / sinkTypeBits):
@@ -214,9 +397,58 @@ inline void genomeTypeMasks(const Genome& genome, uint64_t src[2], uint64_t sink
 struct NeuralNet;
 inline bool typeMasksMatch(const Genome& genome, const NeuralNet& nnet);
 
+template<int S, int A>
+inline bool buildCanonicalNet(const Genome& genome, NeuralNet& destination) {
+    static_assert(S + MAX_INTERNAL_NEURONS + 1 <= 128);
+    static_assert(A + MAX_INTERNAL_NEURONS <= 256);
+
+    if (!validCanonicalGenome(genome, S, A)) return false;
+
+    constexpr int sinks = A + MAX_INTERNAL_NEURONS;
+    NeuralNet next;
+    next.neurons.resize(MAX_INTERNAL_NEURONS);
+
+    int counts[sinks] = {};
+    for (std::size_t i = 0; i < genome.size(); ++i) {
+        const Gene& gene = genome[i];
+        const int sink = genomeSinkIndex(gene, genome.schema, A);
+        ++counts[sink];
+        if (sink >= A) next.neurons[sink - A].driven = true;
+
+        if (i < 128) {
+            const std::uint64_t bit = 1ull << (i & 63);
+            if (gene.sourceType) next.srcTypeBits[i >> 6] |= bit;
+            if (gene.sinkType) next.sinkTypeBits[i >> 6] |= bit;
+        }
+    }
+
+    int offsets[sinks] = {};
+    for (int i = 1; i < sinks; ++i)
+        offsets[i] = offsets[i - 1] + counts[i - 1];
+
+    next.flat.resize(genome.size());
+    for (const Gene& gene : genome) {
+        const int source = genomeSourceIndex(gene, genome.schema, S);
+        const int sink = genomeSinkIndex(gene, genome.schema, A);
+        next.flat[offsets[sink]++] = {
+            static_cast<std::uint16_t>(
+                NeuralNet::FlatConn::LOG_CODEC
+                | static_cast<unsigned>(source)
+                | (static_cast<unsigned>(sink) << 7)),
+            gene.weight
+        };
+    }
+
+    destination = std::move(next);
+    return true;
+}
+
 // Build neural net wiring from genome
 // Adapted from biosim4's createWiringFromGenome
-inline void buildNeuralNet(const Genome& genome, NeuralNet& nnet) {
+inline bool buildNeuralNet(const Genome& genome, NeuralNet& nnet) {
+    if (genome.schema.genomeVersion == 2)
+        return buildCanonicalNet<NUM_SENSES, NUM_ACTIONS>(genome, nnet);
+    if (!validBrainSchema(genome.schema)) return false;
     nnet.neurons.clear();
     nnet.neurons.resize(MAX_INTERNAL_NEURONS);
 
@@ -264,6 +496,7 @@ inline void buildNeuralNet(const Genome& genome, NeuralNet& nnet) {
             gene.weight
         };
     }
+    return true;
 }
 
 // Rational (Pade 7,6) approximation to tanh, used only when SimConfig.fastTanh
@@ -303,7 +536,8 @@ inline void feedForward(NeuralNet& nnet, const float sensors[], float actions[],
                         bool fastTanh = false) {
     // Sources live in one flat array: sensors, then this creature's neuron
     // outputs carried over from the previous step (the recurrent state).
-    float vals[NUM_SENSES + MAX_INTERNAL_NEURONS];
+    float vals[NUM_SENSES + MAX_INTERNAL_NEURONS + 1];
+    vals[NUM_SENSES + MAX_INTERNAL_NEURONS] = 1.0f;
     std::memcpy(vals, sensors, NUM_SENSES * sizeof(float));
     for (int i = 0; i < MAX_INTERNAL_NEURONS; ++i) {
         vals[NUM_SENSES + i] = nnet.neurons[i].output;
@@ -343,9 +577,11 @@ inline void feedForward(NeuralNet& nnet, const float sensors[], float actions[],
 // --- Reproduction ---
 
 inline Genome crossover(const Genome& parent1, const Genome& parent2) {
+    if (parent1.schema != parent2.schema) std::abort();
     // Pick genome length from one parent randomly
     size_t len = rng.uint(1) ? parent1.size() : parent2.size();
     Genome child;
+    child.schema = parent1.schema;
     child.reserve(len);
 
     for (size_t i = 0; i < len; ++i) {
@@ -357,15 +593,84 @@ inline Genome crossover(const Genome& parent1, const Genome& parent2) {
         } else if (i < parent1.size()) {
             child.push_back(parent1[i]);
         } else {
-            child.push_back(Gene::makeRandom());
+            child.push_back(child.schema.genomeVersion == 2
+                ? makeCanonicalGene(rng, child.schema) : Gene::makeRandom());
         }
     }
     return child;
 }
 
+template<class R>
+inline void mutateGenomeV2(
+    Genome& genome, float rate, int minLen, int maxLen, R& random,
+    int senses = NUM_SENSES, int actions = NUM_ACTIONS
+) {
+    rate = std::clamp(rate, 0.0f, 1.0f);
+
+    for (Gene& gene : genome) {
+        std::uint16_t code = logweight::word(gene.weight);
+
+        if (random.unit() < rate) {
+            if ((code & logweight::kMagnitudeMask) == 0u) {
+                code = static_cast<std::uint16_t>(
+                    logweight::kRevivalQ | (random.uint(1u) << 15));
+            } else {
+                code = logweight::addMagnitude(
+                    code, random.intRange(-128, 128));
+            }
+        }
+
+        const bool flip = random.unit() < 0.01f * rate;
+        if (flip && (code & logweight::kMagnitudeMask) != 0u)
+            code ^= logweight::kSign;
+
+        if (random.unit() < 0.01f * rate) code = 0u;
+        gene.weight = logweight::store(code);
+
+        // PR 2 retains fullReset. PR 3 changes this selection policy.
+        if (random.unit() < 0.5f * rate)
+            gene = makeCanonicalGene(
+                random, genome.schema, senses, actions);
+    }
+
+    if (random.unit() < 2.0f * rate
+        && static_cast<int>(genome.size()) < maxLen) {
+        const int position =
+            random.intRange(0, static_cast<int>(genome.size()));
+        genome.insert(genome.begin() + position,
+            makeCanonicalGene(random, genome.schema, senses, actions));
+    }
+
+    if (random.unit() < 2.0f * rate
+        && static_cast<int>(genome.size()) > minLen) {
+        const int position =
+            random.intRange(0, static_cast<int>(genome.size()) - 1);
+        genome.erase(genome.begin() + position);
+    }
+
+    if (random.unit() < 0.5f * rate
+        && static_cast<int>(genome.size()) < maxLen
+        && !genome.empty()) {
+        const int source =
+            random.intRange(0, static_cast<int>(genome.size()) - 1);
+        Gene duplicate = genome[source];
+        const int delta = random.intRange(-64, 64);
+        duplicate.weight = logweight::store(
+            logweight::addMagnitude(
+                logweight::word(duplicate.weight), delta));
+        genome.push_back(duplicate);
+    }
+}
+
 inline void mutateGenome(Genome& genome, float rate, int minLen, int maxLen,
                          RandomGen& r,
-                         WeightMutationMode mode = WeightMutationMode::Legacy) {
+                         WeightMutationMode mode = WeightMutationMode::Legacy,
+                         int senses = NUM_SENSES, int actions = NUM_ACTIONS) {
+    if (genome.schema.genomeVersion == 2) {
+        if (mode != WeightMutationMode::Saturating) std::abort();
+        mutateGenomeV2(genome, rate, minLen, maxLen, r, senses, actions);
+        return;
+    }
     // Preserve the legacy gates, payloads and random-stream ordering.
     for (auto& gene : genome) {
         if (r.unit() < rate) {

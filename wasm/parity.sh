@@ -40,6 +40,18 @@ run_case () {  # run_case NAME SEED STEPS [extra args...]
         echo "      first differing byte: $(cmp "$OUT/$name.native.json" "$OUT/$name.wasm.json" | head -1)"
         FAILED=1
     fi
+    if [[ $name == v2_* ]]; then
+        local middle=$((steps / 2))
+        "$OUT/parity_native" "$seed" "$steps" "$@" --resume-at "$middle" > "$OUT/$name.resume.native.json" 2> "$OUT/$name.resume.native.log"
+        node "$OUT/parity_wasm.js" "$seed" "$steps" "$@" --resume-at "$middle" > "$OUT/$name.resume.wasm.json" 2> "$OUT/$name.resume.wasm.log"
+        if cmp -s "$OUT/$name.native.json" "$OUT/$name.resume.native.json" &&
+           cmp -s "$OUT/$name.native.json" "$OUT/$name.resume.wasm.json"; then
+            echo "PASS  $name continuation at step $middle: uninterrupted native == resumed native == resumed wasm"
+        else
+            echo "FAIL  $name continuation at step $middle"
+            FAILED=1
+        fi
+    fi
 }
 
 FAILED=0
@@ -143,6 +155,11 @@ run_case "long_s42"    42    10000
 run_case "sat_s42"       42 2000 --weight-mutation-mode saturating
 run_case "sat_rich_s7"    7 2000 --rich --weight-mutation-mode saturating
 run_case "sat_pbrain_s42" 42 2000 --rich --pred-brain --weight-mutation-mode saturating
+
+run_case "v2_bias_s42" 42 2000 --genome-v2 --bias-genes
+run_case "v2_nobias_s7" 7 2000 --rich --genome-v2
+run_case "v2_primer_s5" 5 2000 --rich --genome-v2 --bias-genes --pred-brain --pred-primer --pred-count 8
+run_case "v2_refill_s7" 7 4000 --rich --genome-v2 --bias-genes --toroidal --pred-brain --pred-inherit --pred-floor 3 --pred-cap 16 --pred-max-age 20 --pred-meal 14
 
 if [ "$FAILED" = "1" ]; then
     echo "== PARITY FAILED — bisect with --trace 10 on the failing case"

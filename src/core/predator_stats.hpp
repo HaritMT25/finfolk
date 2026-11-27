@@ -56,7 +56,7 @@ inline std::string header() {
 // A predator's genome folded onto its decoded (source, sink) cells, in the
 // network's own index spaces: the predator analogue of isolation.hpp's fold
 // (which decodes with the prey's sizes). Dense, NUM_PRED_SRC x NUM_PRED_SINK.
-inline constexpr int kSrc = NUM_PRED_SENSES + MAX_INTERNAL_NEURONS;
+inline constexpr int kSrc = NUM_PRED_SENSES + MAX_INTERNAL_NEURONS + 1;
 inline constexpr int kSink = NUM_PRED_ACTIONS + MAX_INTERNAL_NEURONS;
 inline void fold(const NeuralNet& nnet, float out[kSrc * kSink]) {
     for (int i = 0; i < kSrc * kSink; ++i) out[i] = 0.0f;

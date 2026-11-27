@@ -100,7 +100,10 @@ static_assert(NUM_PRED_ACTIONS + MAX_INTERNAL_NEURONS <= (1 << (16 - NeuralNet::
 // buildNeuralNet's algorithm with the predator's I/O sizes: genes remapped by
 // % NUM_PRED_SENSES / % NUM_PRED_ACTIONS / % MAX_INTERNAL_NEURONS, then a
 // stable counting sort by sink, so every accumulator sums in genome order.
-inline void buildNet(const Genome& genome, NeuralNet& nnet) {
+inline bool buildNet(const Genome& genome, NeuralNet& nnet) {
+    if (genome.schema.genomeVersion == 2)
+        return buildCanonicalNet<NUM_PRED_SENSES, NUM_PRED_ACTIONS>(genome, nnet);
+    if (!validBrainSchema(genome.schema)) return false;
     nnet.neurons.clear();
     nnet.neurons.resize(MAX_INTERNAL_NEURONS);
     constexpr int NUM_SINKS = NUM_PRED_ACTIONS + MAX_INTERNAL_NEURONS;
@@ -128,6 +131,7 @@ inline void buildNet(const Genome& genome, NeuralNet& nnet) {
             gene.weight
         };
     }
+    return true;
 }
 
 // feedForward's algorithm with the predator's I/O sizes (recurrent hidden
@@ -140,7 +144,8 @@ inline void buildNet(const Genome& genome, NeuralNet& nnet) {
 // slower with the brain off (review of PR #60, P1-1). 14 scalar calls per
 // predator-step cost nothing measurable; the prey's hot path keeps main's code.
 inline void feedForward(NeuralNet& nnet, const float sensors[], float actions[], bool fastTanh) {
-    float vals[NUM_PRED_SENSES + MAX_INTERNAL_NEURONS];
+    float vals[NUM_PRED_SENSES + MAX_INTERNAL_NEURONS + 1];
+    vals[NUM_PRED_SENSES + MAX_INTERNAL_NEURONS] = 1.0f;
     std::memcpy(vals, sensors, NUM_PRED_SENSES * sizeof(float));
     for (int i = 0; i < MAX_INTERNAL_NEURONS; ++i) vals[NUM_PRED_SENSES + i] = nnet.neurons[i].output;
     float accum[NUM_PRED_ACTIONS + MAX_INTERNAL_NEURONS] = {};
@@ -165,24 +170,27 @@ inline float topSpeed(const Predator& p, const SimConfig& cfg) {
 // The two "pursuit primer" genes (cfg.predatorPrimer, opt-in): steer toward the
 // nearest prey, speed up as it gets close. Written over a founder's first two
 // genes, so a primed founder draws exactly what an unprimed one does.
-inline Gene primerGene(int sensor, int action, float weight) {
+inline Gene primerGene(int sensor, int action, float weight, BrainSchema schema = {}) {
     Gene g{};
     g.sourceType = SOURCE_SENSOR;
     g.sourceNum  = (std::uint16_t)sensor;
     g.sinkType   = SINK_ACTION;
     g.sinkNum    = (std::uint16_t)action;
     g.weight     = (std::int16_t)(weight * 8192.0f);
+    if (schema.genomeVersion == 2)
+        g.weight = logweight::store(logweight::quantizeLegacy(g.weight));
     return g;
 }
 
 // A founder's genome (initial spawn, floor refill, transplant "random"): a
 // random genome of the prey's initial length range, from stream r.
 inline Genome founderGenome(const SimConfig& cfg, RandomGen& r) {
-    Genome g = makeRandomGenome(cfg.genomeInitMin, cfg.genomeInitMax, r);
+    Genome g = makeRandomGenome(cfg.genomeInitMin, cfg.genomeInitMax, r,
+                                brainSchema(cfg), NUM_PRED_SENSES, NUM_PRED_ACTIONS);
     if (cfg.predatorPrimer) {
         if (g.size() < 2) g.resize(2, Gene{});
-        g[0] = primerGene(PS_PREY_LR, PA_TURN, 3.0f);
-        g[1] = primerGene(PS_PREY_PROX, PA_THRUST, 2.0f);
+        g[0] = primerGene(PS_PREY_LR, PA_TURN, 3.0f, brainSchema(cfg));
+        g[1] = primerGene(PS_PREY_PROX, PA_THRUST, 2.0f, brainSchema(cfg));
     }
     return g;
 }
@@ -195,7 +203,7 @@ inline void inheritGenome(Predator& child, const Predator& parent, const SimConf
     const float rate = kernel::birthMutationRate(r.unit());
     mutateGenome(child.genome, rate * cfg.predatorMutation,
                  cfg.genomeMinLength, cfg.genomeMaxLength, r,
-                 cfg.weightMutationMode);
+                 cfg.weightMutationMode, NUM_PRED_SENSES, NUM_PRED_ACTIONS);
 }
 
 // The own-state inputs (no geometry, no draws).

@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <sstream>
 #include <cstdio>
+#include <charconv>
 
 #include "core/world.hpp"
 #include "core/stats.hpp"
@@ -99,6 +100,10 @@ void printUsage(const char* prog) {
         "  --min-speed F         (default 30)  --max-speed F (default 150)\n"
         "  --triangular-motion   couple speed+turn: fast=>can't turn, slow=>turns freely (default off)\n"
         "  --max-turn-rate F     [triangular] max heading change in rad/s at zero forward drive (default 4.0)\n"
+        "  --genome-version N   1 (default) or opt-in 2; v2 requires saturating and eval 2.\n"
+        "  --bias-genes         Enable ordinary constant-source genes in v2.\n"
+        "  --hidden-neurons N   Supported hidden count: 12.\n"
+        "  --brain-eval-version N  1 for v1, 2 for v2.\n"
         "  --genome-min N        (default 16)  --genome-max N (default 80)\n"
         "  --genome-init-min N   (default 24)  --genome-init-max N (default 48)\n"
         "  --mutation F          mutation-rate multiplier (default 1.0)\n"
@@ -236,6 +241,12 @@ int main(int argc, char** argv) {
     bool        loadedArenaStart = false; // the loaded checkpoint is a transplant's arena, not yet run
 
     int       initialPopulation = 300;  // starting creature count
+    std::vector<std::pair<int*, std::string>> rawGenomeLengths;
+    auto strictInt = [](const char* token, int& value) {
+        const char* end = token + std::strlen(token);
+        const auto result = std::from_chars(token, end, value);
+        return result.ec == std::errc{} && result.ptr == end;
+    };
     SimConfig cfg;                       // all other tunable parameters
 
     // Parse args. next() consumes the following token as this flag's value.
@@ -295,11 +306,30 @@ int main(int argc, char** argv) {
         else if (arg == "--toroidal")         cfg.toroidal          = true;
         else if (arg == "--triangular-motion") cfg.triangularMotion = true;
         else if (arg == "--max-turn-rate")    cfg.maxTurnRate       = std::atof(next("--max-turn-rate"));
-        else if (arg == "--genome-min")       cfg.genomeMinLength   = std::atoi(next("--genome-min"));
-        else if (arg == "--genome-max")       cfg.genomeMaxLength   = std::atoi(next("--genome-max"));
-        else if (arg == "--genome-init-min")  cfg.genomeInitMin     = std::atoi(next("--genome-init-min"));
-        else if (arg == "--genome-init-max")  cfg.genomeInitMax     = std::atoi(next("--genome-init-max"));
+        else if (arg == "--genome-min") rawGenomeLengths.emplace_back(&cfg.genomeMinLength, next("--genome-min"));
+        else if (arg == "--genome-max") rawGenomeLengths.emplace_back(&cfg.genomeMaxLength, next("--genome-max"));
+        else if (arg == "--genome-init-min") rawGenomeLengths.emplace_back(&cfg.genomeInitMin, next("--genome-init-min"));
+        else if (arg == "--genome-init-max") rawGenomeLengths.emplace_back(&cfg.genomeInitMax, next("--genome-init-max"));
         else if (arg == "--mutation")         cfg.mutationMultiplier= std::atof(next("--mutation"));
+        else if (arg == "--bias-genes") cfg.biasGenes = true;
+        else if (arg == "--genome-version") {
+            if (!strictInt(next("--genome-version"), cfg.genomeVersion)) {
+                std::cerr << "Error: --genome-version requires a complete integer.\n";
+                return 1;
+            }
+        }
+        else if (arg == "--hidden-neurons") {
+            if (!strictInt(next("--hidden-neurons"), cfg.hiddenNeurons)) {
+                std::cerr << "Error: --hidden-neurons requires a complete integer.\n";
+                return 1;
+            }
+        }
+        else if (arg == "--brain-eval-version") {
+            if (!strictInt(next("--brain-eval-version"), cfg.brainEvalVersion)) {
+                std::cerr << "Error: --brain-eval-version requires a complete integer.\n";
+                return 1;
+            }
+        }
         else if (arg == "--weight-mutation-mode") {
             const std::string mode = next("--weight-mutation-mode");
             if (!parseWeightMutationMode(mode, cfg.weightMutationMode)) {
@@ -407,6 +437,23 @@ int main(int argc, char** argv) {
     if (!csvPath.empty() && headlessSteps <= 0) {
         std::cerr << "Note: CSV logging only happens during the --headless run; "
                      "nothing will be written without --headless.\n";
+    }
+
+    // Defer every length conversion until the final schema is known. Validate
+    // all supplied tokens, including repeated/overridden ones, in v2.
+    for (const auto& [destination, token] : rawGenomeLengths) {
+        if (cfg.genomeVersion == 2) {
+            if (!strictInt(token.c_str(), *destination)) {
+                std::cerr << "Error: v2 genome lengths require complete integers.\n";
+                return 1;
+            }
+        } else *destination = std::atoi(token.c_str());
+    }
+    if (cfg.genomeVersion != 1) {
+        if (const char* why = brainPolicyConfigError(cfg)) {
+            std::cerr << "Error: " << why << ".\n";
+            return 1;
+        }
     }
 
     // Light validation: keep ranges sane and warn on anything clamped.

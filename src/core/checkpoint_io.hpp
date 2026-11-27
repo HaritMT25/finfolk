@@ -74,7 +74,7 @@ inline Gene unpackGene(long long wiring, long long weight) {
     g.sourceNum  = (uint16_t)((wiring >> 8)  & 0x7F);
     g.sinkType   = (uint16_t)((wiring >> 7)  & 0x1);
     g.sinkNum    = (uint16_t)( wiring        & 0x7F);
-    g.weight     = (int16_t)weight;
+    g.weight     = logweight::store(static_cast<std::uint16_t>(weight));
     return g;
 }
 
@@ -147,6 +147,12 @@ inline void writeConfig(jsonm::Writer& w, const SimConfig& c) {
     w.field("mutationMultiplier", c.mutationMultiplier);
     if (c.weightMutationMode != WeightMutationMode::Legacy)
         w.field("weightMutationMode", weightMutationModeName(c.weightMutationMode));
+    if (c.genomeVersion != 1) {
+        w.field("genomeVersion", c.genomeVersion);
+        w.field("biasGenes", c.biasGenes);
+        w.field("hiddenNeurons", c.hiddenNeurons);
+        w.field("brainEvalVersion", c.brainEvalVersion);
+    }
     w.field("currentStrength", c.currentStrength);
     w.field("currentMode", c.currentMode);
     w.field("currentEddies", c.currentEddies);
@@ -189,9 +195,59 @@ inline void writeConfig(jsonm::Writer& w, const SimConfig& c) {
 // Every field defaults to the value already in `c`, so a hand-edited checkpoint
 // may omit anything it doesn't want to change — that is what makes "resume with
 // different settings" a matter of editing one line.
+// Validate raw v2 startup values before intOr can narrow or default them.
+// The v1 parser (including saturation-only) deliberately retains its behavior.
+inline bool configIntegerKey(const std::string& key) {
+    static constexpr const char* keys[] = {"reproWindow", "reproMinCluster", "minPopulation", "maxPopulation", "targetFood", "maxNeighbors", "genomeMinLength", "genomeMaxLength", "genomeInitMin", "genomeInitMax", "currentMode", "currentEddies", "foodPatches", "predatorCount", "predatorMinPopulation", "predatorMaxPopulation", "genomeVersion", "hiddenNeurons", "brainEvalVersion"};
+    for (const char* k : keys) if (key == k) return true;
+    return false;
+}
+inline bool rawBrainConfigValid(const jsonm::Value& o, const SimConfig& c) {
+    using T = jsonm::Value::Type;
+    const char* schemaKeys[] = {"genomeVersion", "biasGenes", "hiddenNeurons", "brainEvalVersion"};
+    bool seen[4] = {};
+    bool v2 = c.genomeVersion == 2;
+    for (const auto& kv : o.obj) {
+        for (int i = 0; i < 4; ++i) {
+            if (kv.first != schemaKeys[i]) continue;
+            if (seen[i]) return false;
+            seen[i] = true;
+            const auto& v = kv.second;
+            if (i == 1) {
+                if (v.type != T::Bool) return false;
+            } else {
+                if (v.type != T::Number || !std::isfinite(v.num) ||
+                    std::trunc(v.num) != v.num ||
+                    v.num < std::numeric_limits<int>::min() ||
+                    v.num > std::numeric_limits<int>::max()) return false;
+                if (i == 0) v2 = v.num == 2;
+            }
+        }
+    }
+    if (v2) {
+        std::vector<std::string_view> integers;
+        for (const auto& kv : o.obj) {
+            if (!configIntegerKey(kv.first)) continue;
+            const auto& v = kv.second;
+            if (v.type != T::Number || !std::isfinite(v.num) ||
+                std::trunc(v.num) != v.num ||
+                v.num < std::numeric_limits<int>::min() ||
+                v.num > std::numeric_limits<int>::max()) return false;
+            if (std::find(integers.begin(), integers.end(), kv.first) != integers.end()) return false;
+            integers.push_back(kv.first);
+        }
+    }
+    return true;
+}
+
 inline void readConfig(const jsonm::Value& j, SimConfig& c) {
     const jsonm::Value* o = j.find("config");
     if (!o || !o->isObject()) return;
+    if (!rawBrainConfigValid(*o, c)) { c.genomeVersion = 0; return; }
+    c.genomeVersion = o->intOr("genomeVersion", c.genomeVersion);
+    c.biasGenes = o->boolOr("biasGenes", c.biasGenes);
+    c.hiddenNeurons = o->intOr("hiddenNeurons", c.hiddenNeurons);
+    c.brainEvalVersion = o->intOr("brainEvalVersion", c.brainEvalVersion);
     c.toroidal = o->boolOr("toroidal", c.toroidal);
     // Absent in checkpoints written before v0.21.0; the default (-1 = gate off)
     // is what those runs actually used, so they resume unchanged.
@@ -397,16 +453,60 @@ inline void writeBrainPolicyV1(jsonm::Writer& w, const SimConfig& c) {
     w.endObject();
 }
 
+inline void writeBrainPolicyV2(jsonm::Writer& w, const SimConfig& c,
+                               const BrainConversion& provenance = {}) {
+    const bool brain = c.predatorBrain;
+    w.key("brainPolicy");
+    w.beginObject();
+    w.field("metadataVersion", 2);
+    w.field("genomeVersion", 2);
+    w.field("weightEncoding", "signed-log-q1024-v1");
+    w.field("weightMutationMode", weightMutationModeName(c.weightMutationMode));
+    w.field("wiringMode", "canonical");
+    w.field("biasGenes", c.biasGenes);
+    w.field("rewireMode", "fullReset");
+    w.field("genomeLengthMutationMode", "legacy");
+    w.field("brainEvalVersion", 2);
+    w.field("hiddenNeurons", MAX_INTERNAL_NEURONS);
+    w.field("decoderVersion", 2);
+    w.field("weightTableVersion", 1);
+    w.field("weightTableSha256", logweight::kTableSha256);
+    w.field("fastTanh", c.fastTanh);
+    w.field("geneCostModel", "linear");
+    w.field("geneCostReference", 80); // inert in the linear model
+    w.field("predatorGeneCostModel", "none");
+    w.field("preySensorSet", "classic.prey.sensors.v1");
+    w.field("preyActionSet", "classic.prey.actions.v1");
+    w.field("preySensorCount", NUM_SENSES);
+    w.field("preyActionCount", NUM_ACTIONS);
+    w.field("predatorBrain", brain);
+    w.field("predatorSensorSet",
+            brain ? "classic.predator.sensors.v1" : "none");
+    w.field("predatorActionSet",
+            brain ? "classic.predator.actions.v1" : "none");
+    w.field("predatorSensorCount", brain ? int(NUM_PRED_SENSES) : 0);
+    w.field("predatorActionCount", brain ? int(NUM_PRED_ACTIONS) : 0);
+    w.field("predatorHiddenNeurons", brain ? MAX_INTERNAL_NEURONS : 0);
+    w.field("predatorSensorSetVersion", brain ? PRED_SENSOR_SET : 0);
+    w.key("conversionProvenance");
+    if (provenance.sourceSha256.empty()) w.nullValue();
+    else {
+        w.beginObject();
+        w.field("conversionVersion", 1);
+        w.field("sourceSha256", provenance.sourceSha256);
+        w.field("sourceFrame", provenance.sourceFrame);
+        w.field("fromGenomeVersion", 1);
+        w.field("fromWeightMutationMode", weightMutationModeName(provenance.sourceWeightMutationMode));
+        w.field("fromHiddenNeurons", MAX_INTERNAL_NEURONS);
+        w.field("fromBrainEvalVersion", 1);
+        w.field("numericalLineage", convertedNumericalLineage(provenance, c));
+        w.endObject();
+    }
+    w.endObject();
+}
+
 inline bool isConfigIntKey(const std::string& key) {
-    static constexpr const char* keys[] = {
-        "reproWindow", "reproMinCluster", "minPopulation", "maxPopulation",
-        "targetFood", "maxNeighbors", "genomeMinLength", "genomeMaxLength",
-        "genomeInitMin", "genomeInitMax", "currentMode", "currentEddies",
-        "foodPatches", "predatorCount", "predatorMinPopulation",
-        "predatorMaxPopulation"
-    };
-    for (const char* k : keys) if (key == k) return true;
-    return false;
+    return configIntegerKey(key);
 }
 
 inline bool isBrainOnlyConfigKey(const std::string& key) {
@@ -418,7 +518,7 @@ inline bool isBrainOnlyConfigKey(const std::string& key) {
     return false;
 }
 
-inline bool config(const Value& root, SimConfig& c, std::string& error) {
+inline bool config(const Value& root, SimConfig& c, std::string& error, int revision = 1) {
     const Value* raw = root.find("config");
     if (!raw || !raw->isObject())
         return fail(error, "missing config object");
@@ -427,6 +527,10 @@ inline bool config(const Value& root, SimConfig& c, std::string& error) {
     SimConfig shapeConfig;
     shapeConfig.predatorBrain = true;
     shapeConfig.weightMutationMode = WeightMutationMode::Saturating;
+    if (revision == 2) {
+        shapeConfig.genomeVersion = 2;
+        shapeConfig.brainEvalVersion = 2;
+    }
     std::string shapeText;
     jsonm::Writer sw(shapeText);
     sw.beginObject();
@@ -466,6 +570,7 @@ inline bool config(const Value& root, SimConfig& c, std::string& error) {
         error = std::string("format 3: config: ") + why;
         return false;
     }
+    if (c.genomeVersion != revision) return fail(error, "config and metadata revision disagree");
     if (!(c.genomeMinLength > 0 &&
           c.genomeMinLength <= c.genomeInitMin &&
           c.genomeInitMin <= c.genomeInitMax &&
@@ -548,11 +653,27 @@ inline bool genomePayload(const Value& block, const SimConfig& c,
     if (genes->arr.size() != needed)
         return fail(error, "gene words do not match genome lengths");
 
-    for (size_t i = 0; i < needed; i += 2) {
-        if (!integer(&genes->arr[i], 0, 65535) ||
-            !integer(&genes->arr[i + 1], -32768, 32767))
-            return fail(error, "invalid legacy wiring or weight code");
+for (std::size_t i = 0; i < needed; i += 2) {
+    if (!integer(&genes->arr[i], 0, 65535))
+        return fail(error, "invalid wiring word");
+
+    if (c.genomeVersion == 1) {
+        if (!integer(&genes->arr[i + 1], -32768, 32767))
+            return fail(error, "invalid legacy weight code");
+    } else {
+        if (!integer(&genes->arr[i + 1], 0, 65535))
+            return fail(error, "invalid log weight word");
+
+        const Gene gene = unpackGene(
+            static_cast<long long>(genes->arr[i].num),
+            static_cast<long long>(genes->arr[i + 1].num));
+        if (!validCanonicalGene(
+                gene, brainSchema(c),
+                predator ? int(NUM_PRED_SENSES) : int(NUM_SENSES),
+                predator ? int(NUM_PRED_ACTIONS) : int(NUM_ACTIONS)))
+            return fail(error, "invalid canonical endpoint or log weight code");
     }
+}
     return true;
 }
 
@@ -713,21 +834,53 @@ inline bool ordinaryState(const Value& root, const SimConfig& c,
     return true;
 }
 
-inline bool preflight(const Value& root, SimConfig& c,
-                      std::string& error) {
+inline bool readProvenance(const Value* raw, const SimConfig& c,
+                           BrainConversion& conversion, std::string& error) {
+    if (!raw) return fail(error, "missing provenance");
+    if (raw->type == Type::Null) return true;
+    if (!raw->isObject() || raw->obj.size() != 8)
+        return fail(error, "invalid provenance shape");
+    const Value* sha = raw->find("sourceSha256");
+    const Value* mode = raw->find("fromWeightMutationMode");
+    const Value* lineage = raw->find("numericalLineage");
+    if (!integer(raw->find("conversionVersion"), 1, 1) ||
+        !integer(raw->find("sourceFrame"), 0, 9007199254740991.0) ||
+        !integer(raw->find("fromGenomeVersion"), 1, 1) ||
+        !integer(raw->find("fromHiddenNeurons"), 12, 12) ||
+        !integer(raw->find("fromBrainEvalVersion"), 1, 1) ||
+        !sha || sha->type != Type::String || !validSourceSha256(sha->str) ||
+        !mode || mode->type != Type::String ||
+        !parseWeightMutationMode(mode->str, conversion.sourceWeightMutationMode) ||
+        !lineage || lineage->type != Type::String)
+        return fail(error, "invalid provenance values");
+    conversion.sourceSha256 = sha->str;
+    conversion.sourceFrame = static_cast<unsigned long long>(raw->find("sourceFrame")->num);
+    if (lineage->str != convertedNumericalLineage(conversion, c))
+        return fail(error, "invalid numerical lineage");
+    return true;
+}
+
+inline bool preflight(const Value& root, SimConfig& destinationConfig,
+                      std::string& error, BrainConversion* destinationConversion = nullptr) {
+    SimConfig c;
+    BrainConversion conversion;
     if (!integer(root.find("formatVersion"), 3, 3))
         return fail(error, "incorrect format version");
     if (!uniqueKeys(root))
         return fail(error, "duplicate object key");
     if (NUM_SENSES != 41 || NUM_ACTIONS != 12)
         return fail(error, "Classic format 3 requires Classic sensor/action identities");
-    if (!config(root, c, error)) return false;
-
     const Value* policy = root.find("brainPolicy");
+    if (!policy || !policy->isObject() || !integer(policy->find("metadataVersion"), 1, 2))
+        return fail(error, "unsupported metadata revision");
+    const int revision = static_cast<int>(policy->find("metadataVersion")->num);
+    if (!config(root, c, error, revision)) return false;
+    if (revision == 2 && !readProvenance(policy->find("conversionProvenance"), c, conversion, error)) return false;
     std::string expectedText;
     jsonm::Writer ew(expectedText);
     ew.beginObject();
-    writeBrainPolicyV1(ew, c);
+    if (revision == 2) writeBrainPolicyV2(ew, c, conversion);
+    else writeBrainPolicyV1(ew, c);
     ew.endObject();
     Value expected;
     std::string parseError;
@@ -770,9 +923,15 @@ inline bool preflight(const Value& root, SimConfig& c,
     }
 
     if (!ordinaryState(root, c, error)) return false;
+    if (!conversion.sourceSha256.empty() &&
+        (!integer(world->find("frame"), 0, 9007199254740991.0) ||
+         conversion.sourceFrame > world->find("frame")->num))
+        return fail(error, "provenance frame exceeds world frame");
     if (!rngState(root.find("rngState")) ||
         !rngState(root.find("predatorRngState")))
         return fail(error, "missing or malformed RNG state");
+    destinationConfig = c;
+    if (destinationConversion) *destinationConversion = std::move(conversion);
     return true;
 }
 
@@ -786,7 +945,7 @@ inline std::string serialize(const World& world, const char* engineVersion) {
 
     const bool brain = world.cfg.predatorBrain;
     const bool policy =
-        world.cfg.weightMutationMode != WeightMutationMode::Legacy;
+        world.cfg.weightMutationMode != WeightMutationMode::Legacy || world.cfg.genomeVersion != 1;
     w.beginObject();
     w.field("format", FORMAT_ID);
     w.field("formatVersion", policy ? FORMAT_VERSION_POLICY :
@@ -848,7 +1007,8 @@ inline std::string serialize(const World& world, const char* engineVersion) {
     writeConfig(w, world.cfg);
     w.newline();
     if (policy) {
-        v3::writeBrainPolicyV1(w, world.cfg);
+        if (world.cfg.genomeVersion == 2) v3::writeBrainPolicyV2(w, world.cfg, world.brainConversion);
+        else v3::writeBrainPolicyV1(w, world.cfg);
         w.newline();
     }
 
@@ -931,7 +1091,11 @@ inline std::string serialize(const World& world, const char* engineVersion) {
         w.key("genomeLengths"); w.beginArray(); for (const Predator& p : ps) w.value((long long)p.genome.size()); w.endArray();
         w.key("genes"); w.beginArray();
         for (const Predator& p : ps)
-            for (const Gene& g : p.genome) { w.value(packGene(g)); w.value((long long)g.weight); }
+            for (const Gene& g : p.genome) {
+            w.value(packGene(g));
+            w.value(p.genome.schema.genomeVersion == 2
+                ? static_cast<long long>(logweight::word(g.weight)) : static_cast<long long>(g.weight));
+        }
         w.endArray();
     }
     w.endObject();
@@ -1004,7 +1168,11 @@ inline std::string serialize(const World& world, const char* engineVersion) {
     w.key("genes");
     w.beginArray();
     for (const auto& c : cs)
-        for (const Gene& g : c.genome) { w.value(packGene(g)); w.value((long long)g.weight); }
+        for (const Gene& g : c.genome) {
+            w.value(packGene(g));
+            w.value(c.genome.schema.genomeVersion == 2
+                ? static_cast<long long>(logweight::word(g.weight)) : static_cast<long long>(g.weight));
+        }
     w.endArray();
 
     w.endObject();   // creatures
@@ -1029,7 +1197,7 @@ inline bool save(const World& world, const std::string& path,
 // `nextPredatorId` (0 = skip that test), gene counts consistent, every float
 // finite. Reject rather than repair, the rule of every other column.
 inline bool readPredators(const jsonm::Value& jp, bool brain, std::uint64_t nextPredatorId,
-                          std::vector<Predator>& out, std::string& error) {
+                          std::vector<Predator>& out, std::string& error, BrainSchema schema = {}) {
     const size_t n = (size_t)jp.llOr("count", 0);
     std::vector<float> px, py, vx, vy, dt, en, ag;
     std::vector<long long> alive;
@@ -1156,10 +1324,11 @@ inline bool readPredators(const jsonm::Value& jp, bool brain, std::uint64_t next
             p.virtualBuds = vbuds.empty() ? 0u : (std::uint32_t)vbuds[i];
             p.speed = spd[i];
             p.genome.clear();
+            p.genome.schema = schema;
             p.genome.reserve((size_t)glen[i]);
             for (long long k = 0; k < glen[i]; ++k, gi += 2) p.genome.push_back(unpackGene(genes[gi], genes[gi + 1]));
             // the wiring is derived; the recurrent outputs are live state
-            predbrain::buildNet(p.genome, p.nnet);
+            if (!predbrain::buildNet(p.genome, p.nnet)) { error = "invalid predator genome"; return false; }
             for (int k = 0; k < MAX_INTERNAL_NEURONS; ++k)
                 p.nnet.neurons[(size_t)k].output = neur[i * MAX_INTERNAL_NEURONS + (size_t)k];
         }
@@ -1184,11 +1353,12 @@ inline bool deserialize(const std::string& text, World& world, std::string& erro
     const int ver = static_cast<int>(jver->num);
     const bool policy = ver == FORMAT_VERSION_POLICY;
     SimConfig policyConfig;
+    BrainConversion policyConversion;
     bool brain = false;
 
     if (policy) {
         // Before init(), founder genomes, population storage, or live RNG writes.
-        if (!v3::preflight(j, policyConfig, error)) return false;
+        if (!v3::preflight(j, policyConfig, error, &policyConversion)) return false;
         brain = policyConfig.predatorBrain;
     } else {
         brain = ver == FORMAT_VERSION_BRAIN;
@@ -1201,18 +1371,16 @@ inline bool deserialize(const std::string& text, World& world, std::string& erro
             return false;
         }
 
-        // The old formats cannot acquire a new policy by caller-state leakage
-        // or by adding a saturation key to their config block.
+        // Old formats may explicitly spell their defaults, never a new schema.
         if (jcfg && jcfg->isObject()) {
-            bool seen = false;
-            for (const auto& kv : jcfg->obj) {
-                if (kv.first != "weightMutationMode") continue;
-                if (seen || kv.second.type != jsonm::Value::Type::String ||
-                    kv.second.str != "legacy") {
-                    error = "formats 1/2 require legacy weight mutation";
-                    return false;
-                }
-                seen = true;
+            if (!rawBrainConfigValid(*jcfg, SimConfig{})) {
+                error = "formats 1/2 require valid v1 policy"; return false;
+            }
+            SimConfig defaults;
+            readConfig(j, defaults);
+            if (defaults.genomeVersion != 1 || defaults.biasGenes || defaults.hiddenNeurons != 12 ||
+                defaults.brainEvalVersion != 1 || defaults.weightMutationMode != WeightMutationMode::Legacy) {
+                error = "formats 1/2 require legacy brain policy"; return false;
             }
         }
     }
@@ -1225,6 +1393,10 @@ inline bool deserialize(const std::string& text, World& world, std::string& erro
 
     // Config first: init() sizes the spatial grids from cfg.perceptionRadius.
     world.cfg.weightMutationMode = WeightMutationMode::Legacy;
+    world.cfg.genomeVersion = 1;
+    world.cfg.biasGenes = false;
+    world.cfg.hiddenNeurons = 12;
+    world.cfg.brainEvalVersion = 1;
     readConfig(j, world.cfg);
     world.cfg.predatorBrain = brain;
     if (const char* why = predatorBrainConfigError(world.cfg)) {
@@ -1266,6 +1438,7 @@ inline bool deserialize(const std::string& text, World& world, std::string& erro
     } else {
         world.init(width, height, 0);
     }
+    world.brainConversion = std::move(policyConversion);
     world.food.clear();
     world.predators.clear();
     world.creatures.clear();
@@ -1356,7 +1529,7 @@ inline bool deserialize(const std::string& text, World& world, std::string& erro
 
     // predators (a version-2 checkpoint must carry the block: its brains are the point)
     if (const jsonm::Value* jp = j.find("predators")) {
-        if (!readPredators(*jp, brain, world.nextPredatorId_, world.predators, error)) return false;
+        if (!readPredators(*jp, brain, world.nextPredatorId_, world.predators, error, brainSchema(world.cfg))) return false;
     } else if (brain) {
         error = "a version-2 checkpoint needs its 'predators' block"; return false;
     }
@@ -1494,13 +1667,14 @@ inline bool deserialize(const std::string& text, World& world, std::string& erro
             c.bodyElong = hasBodyEl ? bodyEl[i] : 1.0f;
 
             c.genome.clear();
+            c.genome.schema = brainSchema(world.cfg);
             c.genome.reserve((size_t)glen[i]);
             for (long long k = 0; k < glen[i]; ++k, gi += 2)
                 c.genome.push_back(unpackGene(genes[gi], genes[gi + 1]));
 
             // Net wiring is derived, so rebuild it — then put the recurrent
             // outputs back, which buildNeuralNet resets to the 0.5 default.
-            buildNeuralNet(c.genome, c.nnet);
+            if (!buildNeuralNet(c.genome, c.nnet)) { error = "invalid prey genome"; return false; }
             for (int nn = 0; nn < MAX_INTERNAL_NEURONS; ++nn)
                 c.nnet.neurons[nn].output = neurons[i * MAX_INTERNAL_NEURONS + nn];
 

@@ -575,7 +575,16 @@
   /* the header's bytes, parsed and checked as a world file's (not its checksum: readWorld) */
   function parseHeader(hb, L) {
     var h;
-    try { h = JSON.parse(fromUtf8(hb)); } catch (e) { throw new Error("That world file is damaged: its header is not JSON (" + e.message + ")."); }
+    try {
+      var headerText = fromUtf8(hb), parsedHeader = parseFirst(headerText);
+      var policyKeys = ["genomeVersion", "biasGenes", "hiddenNeurons", "brainEvalVersion", "weightMutationMode"];
+      parsedHeader.repeats.forEach(function (r) {
+        var path = r.path.join(".");
+        if (policyKeys.indexOf(r.key) >= 0 && (path === "start.cfg" || path === "runCfg" || path === "setup.config"))
+          throw new Error("repeated brain policy member " + r.key);
+      });
+      h = JSON.parse(headerText);
+    } catch (e) { throw new Error("That world file is damaged: its header is not JSON (" + e.message + ")."); }
     if (!h || typeof h !== "object" || Array.isArray(h) || h.format !== WORLD.FORMAT) throw new Error("That file is not a saved world (Save world makes those).");
     if (h.version !== WORLD.VERSION)
       throw new Error("That world file is version " + JSON.stringify(h.version) + "; this page reads version " + WORLD.VERSION + ".");
@@ -711,6 +720,28 @@
    * file). R: {keys: CFG.KEYS, live: CFG.LIVE, lim: CFG.SIZE_LIMITS,
    * setupVersion}. "" or why not. */
   var START_KEYS = ["seed", "population", "depth", "width", "height", "cfg"];
+  /* Stable order, shared by file expectations and the actual image exports. */
+  function brainPolicy(c) {
+    var version = c.genomeVersion === undefined ? 1 : c.genomeVersion;
+    var bias = c.biasGenes === undefined ? false : c.biasGenes;
+    var hidden = c.hiddenNeurons === undefined ? 12 : c.hiddenNeurons;
+    var evaluation = c.brainEvalVersion === undefined ? 1 : c.brainEvalVersion;
+    var mode = c.weightMutationMode === undefined ? "legacy" : c.weightMutationMode;
+    if ((version !== 1 && version !== 2) || typeof bias !== "boolean" || hidden !== 12 ||
+        (mode !== "legacy" && mode !== "saturating") ||
+        (version === 1 ? bias || evaluation !== 1 : evaluation !== 2 || mode !== "saturating"))
+      throw new Error("unsupported or incoherent brain policy");
+    if (version === 2) {
+      var lengths = [c.genomeMinLength === undefined ? 16 : c.genomeMinLength,
+                     c.genomeInitMin === undefined ? 24 : c.genomeInitMin,
+                     c.genomeInitMax === undefined ? 48 : c.genomeInitMax,
+                     c.genomeMaxLength === undefined ? 80 : c.genomeMaxLength];
+      if (!lengths.every(function (v) { return Number.isInteger(v) && v >= 16 && v <= 80; }) ||
+          lengths.some(function (v, i) { return i > 0 && v < lengths[i - 1]; }))
+        throw new Error("v2 genome lengths must be coherent within 16..80");
+    }
+    return [version, bias ? 1 : 0, hidden, evaluation, mode].join(":");
+  }
   var TOP_KEYS = ["format", "version", "app", "saved", "engine", "frame", "fish", "food", "predators", "start", "runCfg", "setup", "picked", "image", "sha256"];
   var SETUP_KEYS = ["format", "version", "seed", "population", "depth", "width", "height", "walls", "config"];
   /** @param {any} h (a parsed header: anything JSON) @param {HeaderRules} R */
@@ -730,10 +761,11 @@
         if (k === "weightMutationMode") {
           if (v !== "legacy" && v !== "saturating")
             return what + " have weightMutationMode outside legacy / saturating";
-        } else if (d ? (typeof d[0] === "boolean" ? typeof v !== "boolean" : !fin(v)) : !(fin(v) || typeof v === "boolean")) {
+        } else if (k === "biasGenes" ? typeof v !== "boolean" : d ? (typeof d[0] === "boolean" ? typeof v !== "boolean" : !fin(v)) : !(fin(v) || typeof v === "boolean")) {
           return what + " have " + k + " " + (typeof v === "string" ? "as text" : Array.isArray(v) ? "as a list" : obj(v) ? "as a record" : JSON.stringify(v));
         }
       }
+      try { brainPolicy(c); } catch (e) { return what + " have " + e.message; }
       return "";
     }
     if (!obj(h) || !only(h, TOP_KEYS)) return "its header has a field a world file has not";
@@ -780,7 +812,18 @@
     M._oc_sync();
     var len = buffer(M).byteLength;
     var r = { w: M._oc_width(), h: M._oc_height(), d: M._oc_depth_max(), fish: M._oc_creature_count(), food: M._oc_food_count(),
-              pred: M._oc_predator_count(), walls: typeof M._oc_walls_enabled === "function" ? !!M._oc_walls_enabled() : false, frame: -1 };
+              pred: M._oc_predator_count(), policy: "", walls: typeof M._oc_walls_enabled === "function" ? !!M._oc_walls_enabled() : false, frame: -1 };
+    var exportedMode = typeof M._oc_weight_mutation_mode === "function" ? M._oc_weight_mutation_mode() : 0;
+    var exportedBias = typeof M._oc_bias_genes === "function" ? M._oc_bias_genes() : 0;
+    if ((exportedMode !== 0 && exportedMode !== 1) || (exportedBias !== 0 && exportedBias !== 1))
+      throw new Error("unknown exported brain policy");
+    r.policy = brainPolicy({
+      genomeVersion: typeof M._oc_genome_version === "function" ? M._oc_genome_version() : 1,
+      biasGenes: !!exportedBias,
+      hiddenNeurons: typeof M._oc_num_hidden === "function" ? M._oc_num_hidden() : 12,
+      brainEvalVersion: typeof M._oc_brain_eval_version === "function" ? M._oc_brain_eval_version() : 1,
+      weightMutationMode: exportedMode === 1 ? "saturating" : "legacy"
+    });
     var statsLen = M._oc_stats_len();
     /** @type {Array<[string, number]>} */ ([["fish", r.fish], ["food", r.food], ["predators", r.pred], ["stats", statsLen]]).forEach(function (c) {
       if (!Number.isSafeInteger(c[1]) || c[1] < 0 || c[1] > len) throw new Error("its count of " + c[0] + " is " + c[1]);
@@ -819,7 +862,7 @@
   /** @param {WorldHeader} h @returns {WorldExpect} */
   function worldExpect(h) {
     return { w: h.setup.width, h: h.setup.height, d: h.start.depth, frame: h.frame, fish: h.fish, food: h.food, pred: h.predators,
-             walls: h.setup.walls, picked: !!h.picked };
+             walls: h.setup.walls, picked: !!h.picked, policy: brainPolicy(h.runCfg) };
   }
   /* "" or how a module's world (worldNow) differs from the one expected */
   /** @param {WorldNow} a @param {WorldExpect} e */
@@ -829,6 +872,7 @@
     if (a.frame !== e.frame) return "it is at frame " + a.frame + ", not the " + e.frame + " its header says";
     if (a.fish !== e.fish || a.food !== e.food || a.pred !== e.pred)
       return "it has " + a.fish + " fish, " + a.food + " food and " + a.pred + " predators, not the " + e.fish + ", " + e.food + " and " + e.pred + " its header says";
+    if (a.policy !== e.policy) return "its brain policy differs from its header";
     if (a.walls !== e.walls) return "its sides are " + (a.walls ? "glass walls" : "wrapping") + ", not as its header says";
     return "";
   }

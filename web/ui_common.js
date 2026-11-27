@@ -251,27 +251,33 @@
     var wide = w > h * 1.15, m = 14;
     /** @type {{sen: number[][], hid: number[][], act: number[][]}} */
     var pos = { sen: [], hid: [], act: [] };
+    var biasPos;
     if (wide) {
       var yIn = 26, yOut = h - 40, yHid = (yIn + yOut) / 2;
+      biasPos = [w - 18, (yIn + yOut) / 2 - 18];
       for (i = 0; i < nS; i++) pos.sen.push([m + (w - 2 * m) * i / (nS - 1), yIn]);
       for (i = 0; i < nH; i++) pos.hid.push([m + 18 + (w - 2 * m - 36) * i / (nH - 1), yHid]);
       for (i = 0; i < nA; i++) pos.act.push([m + 18 + (w - 2 * m - 36) * i / (nA - 1), yOut]);
     } else {
       var yTop = 26, yBot = h - 12, xS = 18, xA = w - gut, xH = (xS + xA) / 2;
+      biasPos = [(xS + xA) / 2 + 18, 14];
       for (i = 0; i < nS; i++) pos.sen.push([xS, yTop + (yBot - yTop) * i / (nS - 1)]);
       for (i = 0; i < nH; i++) pos.hid.push([xH, yTop + (yBot - yTop) * i / (nH - 1)]);
       for (i = 0; i < nA; i++) pos.act.push([xA, yTop + (yBot - yTop) * i / (nA - 1)]);
     }
+    var hasBias = false;
     var prev = o.prev || [], hv = typeof o.hover === "number" ? o.hover : -1;
     var hoverKey = hv >= 0 && prev[hv] ? prev[hv].kind + prev[hv].i : null;
     for (var k = 0; k < f.connCount; k++) {
       var c = k * 5;
       var srcSen = f.conns[c] !== 0, srcNum = f.conns[c + 1] | 0, sinkAct = f.conns[c + 2] !== 0, sinkNum = f.conns[c + 3] | 0, wgt = f.conns[c + 4];
-      var a = srcSen ? pos.sen[srcNum] : pos.hid[srcNum], b = sinkAct ? pos.act[sinkNum] : pos.hid[sinkNum];
+      var bias = !srcSen && srcNum === 127;
+      hasBias = hasBias || bias;
+      var a = srcSen ? pos.sen[srcNum] : bias ? biasPos : pos.hid[srcNum], b = sinkAct ? pos.act[sinkNum] : pos.hid[sinkNum];
       if (!a || !b) continue;
-      var srcAct = srcSen ? f.sensors[srcNum] : f.hidden[srcNum];
+      var srcAct = srcSen ? f.sensors[srcNum] : bias ? 1 : f.hidden[srcNum];
       var mag = fresh ? Math.min(1, Math.abs(wgt) * Math.abs(srcAct) * 1.5) : 0;
-      var hl = hoverKey !== null && ((srcSen ? "Sense" : "Hidden neuron") + srcNum === hoverKey ||
+      var hl = hoverKey !== null && ((srcSen ? "Sense" : bias ? "Bias" : "Hidden neuron") + srcNum === hoverKey ||
                                      (sinkAct ? "Action" : "Hidden neuron") + sinkNum === hoverKey);
       g.strokeStyle = (wgt >= 0 ? "rgba(180,235,80," : "rgba(255,120,80,") + (hl ? 0.9 : (0.10 + 0.7 * mag)).toFixed(3) + ")";
       g.lineWidth = hl ? 2 : 0.8 + 1.6 * mag;
@@ -294,6 +300,11 @@
     for (i = 0; i < nS; i++) node(pos.sen[i], rs, f.sensors[i], "Sense", i);
     for (i = 0; i < nH; i++) node(pos.hid[i], 5, f.hidden[i], "Hidden neuron", i);
     for (i = 0; i < nA; i++) node(pos.act[i], 5.5, f.actions[i], "Action", i);
+    if (hasBias) {
+      node(biasPos, 5, 1, "Bias", 127);
+      g.font = "11px " + o.font; g.fillStyle = "#dcefe0";
+      g.fillText("+1", biasPos[0] + 7, biasPos[1] + 3);
+    }
     if (hv >= 0 && nodes[hv]) {
       var hn = nodes[hv];
       g.strokeStyle = "rgba(230,255,160,0.95)"; g.lineWidth = 2;

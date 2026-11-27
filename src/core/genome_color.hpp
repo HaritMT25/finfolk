@@ -39,11 +39,11 @@ inline Color genomeColor(const Genome& genome) {
 
     double proj[3] = {0.0, 0.0, 0.0};
     for (const Gene& gene : genome) {
-        const int   idx = geneCell(gene);
-        const float w   = gene.weightAsFloat();
-        proj[0] += w * planes[0][idx];
-        proj[1] += w * planes[1][idx];
-        proj[2] += w * planes[2][idx];
+        const int   idx = geneCell(gene, genome.schema);
+        const float w   = geneWeight(gene, genome.schema);
+        proj[0] += w * (idx < STATS_DIM ? planes[0][idx] : biasProjectionPlanes()[0][idx - STATS_DIM]);
+        proj[1] += w * (idx < STATS_DIM ? planes[1][idx] : biasProjectionPlanes()[1][idx - STATS_DIM]);
+        proj[2] += w * (idx < STATS_DIM ? planes[2][idx] : biasProjectionPlanes()[2][idx - STATS_DIM]);
     }
 
     // tanh squash to [40,235] (vivid, no pure black/white). K keeps tanh

@@ -3552,6 +3552,7 @@ void testShimBools() {
         {"predatorBrain", &SimConfig::predatorBrain}, {"predatorPrimer", &SimConfig::predatorPrimer},   // v0.27.0
         {"predatorFrozen", &SimConfig::predatorFrozen},
         {"fastTanh", &SimConfig::fastTanh},
+        {"biasGenes", &SimConfig::biasGenes},
     };
     const struct { const char* key; bool OceanConfig::*m; } oceans[] = {
         {"deepCurrent", &OceanConfig::deepCurrent}, {"lightEnabled", &OceanConfig::lightEnabled},
@@ -3572,6 +3573,19 @@ void testShimBools() {
     // One checker for both tables: get(sc, oc) is the key's stored bool.
     auto check = [&](const char* key, const Good& good, const std::vector<const char*>& bad, auto get, auto set) {
         t.expect(isSimConfigBoolKey(key) || isOceanBoolKey(key), "%s is in neither bool-key list", key);
+        // Only the new policy bool needs a coherent v2 object for acceptance.
+        if (std::strcmp(key, "biasGenes") == 0) {
+            for (const auto& g : good) {
+                SimConfig sc;
+                OceanConfig oc;
+                set(sc, oc, !g.second);
+                std::string err;
+                const std::string j = std::string("{\"genomeVersion\":2,\"brainEvalVersion\":2,\"hiddenNeurons\":12,") +
+                                      "\"weightMutationMode\":\"saturating\",\"biasGenes\":" + g.first + "}";
+                accepted += t.expect(readOceanJson(j.c_str(), sc, oc, err) && get(sc, oc) == g.second,
+                                     "%s: policy bool refused or not stored (%s)", j.c_str(), err.c_str());
+            }
+        } else
         for (const auto& g : good) {
             SimConfig sc;
             OceanConfig oc;
@@ -3586,12 +3600,18 @@ void testShimBools() {
                 SimConfig sc;
                 OceanConfig oc;
                 const bool before = get(sc, oc);
+                const SimConfig policyBefore = sc;
                 std::string err;
                 const std::string kb = std::string("\"") + key + "\":" + b, kg = std::string("\"") + key + "\":true";
                 const std::string j = "{" + (form == 0 ? kb : form == 1 ? kg + "," + kb : kb + "," + kg) + "}";
                 refused += t.expect(!readOceanJson(j.c_str(), sc, oc, err) && get(sc, oc) == before &&
                                         err.find(key) != std::string::npos,
                                     "%s: accepted, or the error does not name the key (%s)", j.c_str(), err.c_str());
+                if (std::strcmp(key, "biasGenes") == 0)
+                    t.expect(sc.dump() == policyBefore.dump() && sc.genomeVersion == policyBefore.genomeVersion &&
+                                 sc.biasGenes == policyBefore.biasGenes && sc.hiddenNeurons == policyBefore.hiddenNeurons &&
+                                 sc.brainEvalVersion == policyBefore.brainEvalVersion,
+                             "%s: refused policy bool changed the config", j.c_str());
             }
     };
     for (const auto& k : sims)
@@ -3640,17 +3660,51 @@ void testShimInts() {
         {"foodPatches", &SimConfig::foodPatches}, {"predatorCount", &SimConfig::predatorCount},
         {"predatorMinPopulation", &SimConfig::predatorMinPopulation},
         {"predatorMaxPopulation", &SimConfig::predatorMaxPopulation},
+        {"genomeVersion", &SimConfig::genomeVersion},
+        {"hiddenNeurons", &SimConfig::hiddenNeurons},
+        {"brainEvalVersion", &SimConfig::brainEvalVersion},
     };
     t.expect(sizeof(ints) / sizeof(ints[0]) == sizeof(kSimConfigIntKeys) / sizeof(kSimConfigIntKeys[0]),
              "kSimConfigIntKeys has %zu keys, the member table %zu", sizeof(kSimConfigIntKeys) / sizeof(kSimConfigIntKeys[0]),
              sizeof(ints) / sizeof(ints[0]));
     for (const auto& k : ints) {
         t.expect(isSimConfigIntKey(k.key), "%s is not in kSimConfigIntKeys", k.key);
+        const bool policyInt = k.m == &SimConfig::genomeVersion || k.m == &SimConfig::hiddenNeurons ||
+                               k.m == &SimConfig::brainEvalVersion;
+        auto checkPolicyInt = [&](const char* token, int value) {
+            SimConfig sc, before;
+            OceanConfig oc;
+            std::string err;
+            const bool accepted = k.m == &SimConfig::hiddenNeurons ? value == 12 : value == 1 || value == 2;
+            // Supply companions only when selecting the supported v2 policy.
+            const bool v2 = k.m != &SimConfig::hiddenNeurons && value == 2;
+            const std::string companions = !v2 ? "" : k.m == &SimConfig::genomeVersion
+                ? "\"brainEvalVersion\":2,\"hiddenNeurons\":12,\"weightMutationMode\":\"saturating\","
+                : "\"genomeVersion\":2,\"hiddenNeurons\":12,\"weightMutationMode\":\"saturating\",";
+            const std::string j = "{" + companions + "\"" + k.key + "\":" + token + "}";
+            const bool read = readOceanJson(j.c_str(), sc, oc, err);
+            if (accepted)
+                t.expect(read && sc.*k.m == value && !brainPolicyConfigError(sc),
+                         "%s: supported policy int refused or not stored (%s)", j.c_str(), err.c_str());
+            else
+                t.expect(!read && !err.empty() && sc.dump() == before.dump() &&
+                             sc.genomeVersion == before.genomeVersion && sc.biasGenes == before.biasGenes &&
+                             sc.hiddenNeurons == before.hiddenNeurons && sc.brainEvalVersion == before.brainEvalVersion,
+                         "%s: unsupported policy int accepted or refusal changed the config (%s)", j.c_str(), err.c_str());
+        };
+        if (policyInt) {
+            checkPolicyInt("1", 1);
+            checkPolicyInt("12", 12);
+        }
         // The reader really reads it; whole numbers to the range ends read
         // exactly; a fraction, or one past either end, is refused before the
         // cast, the config untouched.
         for (const auto& v : {std::pair<const char*, int>{"3", 3}, {"-3", -3}, {"2.0", 2}, {"1e3", 1000}, {"-0", 0},
                               {"2147483647", 2147483647}, {"-2147483648", -2147483647 - 1}}) {
+            if (policyInt) {
+                checkPolicyInt(v.first, v.second);
+                continue;
+            }
             SimConfig sc;
             OceanConfig oc;
             std::string err;
@@ -3665,6 +3719,27 @@ void testShimInts() {
             std::string err;
             const std::string j = std::string("{\"") + k.key + "\":" + v + "}";
             t.expect(!readOceanJson(j.c_str(), sc, oc, err) && sc.*k.m == before.*k.m && !err.empty(), "%s accepted", j.c_str());
+        }
+    }
+    // The new policy ints also reject every malformed occurrence, in either
+    // order, and repeated valid occurrences, without changing the config.
+    for (const auto& k : ints) {
+        if (k.m != &SimConfig::genomeVersion && k.m != &SimConfig::hiddenNeurons && k.m != &SimConfig::brainEvalVersion) continue;
+        const char* good = k.m == &SimConfig::hiddenNeurons ? "12" : "1";
+        for (const char* v : {"0.5", "3.75", "-3.75", "1e-300", "2147483647.5", "-2147483648.5", "2147483648", "-2147483649",
+                              "1e300", "-1e300", "1e999", good}) {
+            for (int form = 0; form < 2; ++form) {
+                SimConfig sc, before;
+                OceanConfig oc;
+                std::string err;
+                const std::string kg = std::string("\"") + k.key + "\":" + good;
+                const std::string kb = std::string("\"") + k.key + "\":" + v;
+                const std::string j = "{" + (form == 0 ? kg + "," + kb : kb + "," + kg) + "}";
+                t.expect(!readOceanJson(j.c_str(), sc, oc, err) && !err.empty() && sc.dump() == before.dump() &&
+                             sc.genomeVersion == before.genomeVersion && sc.biasGenes == before.biasGenes &&
+                             sc.hiddenNeurons == before.hiddenNeurons && sc.brainEvalVersion == before.brainEvalVersion,
+                         "%s: repeated policy int accepted or refusal changed the config (%s)", j.c_str(), err.c_str());
+            }
         }
     }
     // A repeated key: every occurrence is checked, not only the one the reader takes.
@@ -4956,6 +5031,7 @@ void testFlowLanes() {
 }
 }  // namespace ot
 
+#include "ocean_genome_v2_tests.hpp"
 #include "ocean_appearance_tests.hpp"
 #include "ocean_body_plan_tests.hpp"   // the M2a body-plan preview (diagnostic)
 #include "ocean_hydro_tests.hpp"       // M2b1 PR 1: the birth physics foundation (no world)
@@ -5010,6 +5086,11 @@ int main(int argc, char** argv) {
             std::printf("OCEAN TESTS: %d passed, %d failed\n", ot::g_passed, ot::g_failed);
             return ot::g_failed ? 1 : 0;
         }
+        if (std::strcmp(argv[2], "genome_v2") == 0) {
+            ot::testGenomeV2();
+            std::printf("OCEAN TESTS: %d passed, %d failed\n", ot::g_passed, ot::g_failed);
+            return ot::g_failed ? 1 : 0;
+        }
         if (std::strcmp(argv[2], "label_mask") != 0) {
             std::fprintf(stderr, "--only: label_mask, body, hydro, transport, wall_transport_food or type_masks\n");
             return 2;
@@ -5018,6 +5099,7 @@ int main(int argc, char** argv) {
         std::printf("OCEAN TESTS: %d passed, %d failed\n", ot::g_passed, ot::g_failed);
         return ot::g_failed ? 1 : 0;
     }
+    ot::testGenomeV2();
     ot::testBounds();
     ot::testBuoyancy();
     ot::testSteerZ();

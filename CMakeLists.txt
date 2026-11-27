@@ -161,6 +161,14 @@ add_executable(checkpoint_v3_validation tests/checkpoint_v3_validation.cpp)
 target_link_libraries(checkpoint_v3_validation PRIVATE evo_core)
 add_test(NAME checkpoint_v3_validation COMMAND checkpoint_v3_validation)
 
+foreach(g2_target genome_v2_codec genome_v2_tests genome_v2_frontend)
+    add_executable(${g2_target} tests/${g2_target}.cpp)
+    target_link_libraries(${g2_target} PRIVATE evo_core)
+    add_test(NAME ${g2_target} COMMAND ${g2_target})
+endforeach()
+add_executable(genome_v2_convert tools/genome_v2_convert.cpp)
+target_link_libraries(genome_v2_convert PRIVATE evo_core)
+
 # predator_smoke — a longer no-SFML integration run with predators ON, asserting
 # the run-level invariants (pop floor, finite positions, predation occurs,
 # predator_align in range, deaths == predation+starvation+age, fixed predator
@@ -184,6 +192,9 @@ if(SFML_FOUND AND EVO_NO_OPENMP AND NOT EVO_POOL_THREADS)
     add_test(NAME stagec_cli
              COMMAND bash ${CMAKE_SOURCE_DIR}/tests/stagec_cli.sh
                      $<TARGET_FILE:evo_boids> ${CMAKE_CURRENT_BINARY_DIR}/stagec_cli_work)
+    add_test(NAME genome_v2_cli
+             COMMAND bash ${CMAKE_SOURCE_DIR}/tests/genome_v2_cli.sh
+                     $<TARGET_FILE:evo_boids> ${CMAKE_CURRENT_BINARY_DIR}/genome_v2_cli_work)
     add_test(NAME weight_policy_cli
              COMMAND bash ${CMAKE_SOURCE_DIR}/tests/weight_policy_cli.sh
                      $<TARGET_FILE:evo_boids> ${CMAKE_CURRENT_BINARY_DIR}/weight_policy_cli_work)

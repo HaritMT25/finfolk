@@ -72,13 +72,13 @@ inline void computeGeneticSpread(const std::vector<Creature>& cs,
 
     // Population accumulators for per-dimension variance. Zero cells contribute
     // nothing to either sum, so we only touch a genome's non-empty cells.
-    std::vector<double> gsum(STATS_DIM, 0.0), gsumsq(STATS_DIM, 0.0);
+    std::vector<double> gsum(STATS_V2_DIM, 0.0), gsumsq(STATS_V2_DIM, 0.0);
 
     // Per-creature sparse scratch: `cell` holds this genome's folded weights,
     // `stamp` marks which cells belong to the current epoch so we never clear
     // the whole array and never double-count a cell.
-    std::vector<float> cell(STATS_DIM, 0.0f);
-    std::vector<int>   stamp(STATS_DIM, -1);
+    std::vector<float> cell(STATS_V2_DIM, 0.0f);
+    std::vector<int>   stamp(STATS_V2_DIM, -1);
     std::vector<int>   touched;
     touched.reserve(GENOME_MAX_LENGTH);
 
@@ -91,9 +91,9 @@ inline void computeGeneticSpread(const std::vector<Creature>& cs,
     for (const Creature& c : cs) {
         touched.clear();
         for (const Gene& g : c.genome) {
-            const int idx = geneCell(g);
+            const int idx = geneCell(g, c.genome.schema);
             if (stamp[idx] != epoch) { stamp[idx] = epoch; cell[idx] = 0.0f; touched.push_back(idx); }
-            cell[idx] += g.weightAsFloat();
+            cell[idx] += geneWeight(g, c.genome.schema);
         }
 
         double proj[STATS_HASH_BITS] = {};
@@ -101,8 +101,12 @@ inline void computeGeneticSpread(const std::vector<Creature>& cs,
             const double v = cell[idx];
             gsum[idx]   += v;
             gsumsq[idx] += v * v;
-            const float* h = &HT[static_cast<std::size_t>(idx) * STATS_HASH_BITS];
-            for (int j = 0; j < STATS_HASH_BITS; ++j) proj[j] += v * h[j];
+            for (int j = 0; j < STATS_HASH_BITS; ++j) {
+                const float coefficient = idx < STATS_DIM
+                    ? HT[static_cast<std::size_t>(idx) * STATS_HASH_BITS + j]
+                    : biasProjectionPlanes()[3 + j][idx - STATS_DIM];
+                proj[j] += v * coefficient;
+            }
         }
 
         uint64_t sig = 0;
@@ -115,7 +119,7 @@ inline void computeGeneticSpread(const std::vector<Creature>& cs,
 
     const double invN = 1.0 / n;
     double totalVar = 0.0;
-    for (int d = 0; d < STATS_DIM; ++d) {
+    for (int d = 0; d < STATS_V2_DIM; ++d) {
         const double mean = gsum[d] * invN;
         const double var  = gsumsq[d] * invN - mean * mean;
         if (var > 0.0) totalVar += var;

@@ -201,6 +201,7 @@ public:
     }
 
     void init(int w, int h, int numCreatures) {
+        brainConversion = {};
         width = w;
         height = h;
         signals.init(w, h, 8, cfg.toroidal);
@@ -221,7 +222,7 @@ public:
         for (int i = 0; i < numCreatures; ++i) {
             Vec2 pos = {rng.range(10.0f, (float)w - 10.0f),
                         rng.range(10.0f, (float)h - 10.0f)};
-            creatures.push_back(makeRandomCreature(pos, cfg.genomeInitMin, cfg.genomeInitMax));
+            creatures.push_back(makeRandomCreature(pos, cfg.genomeInitMin, cfg.genomeInitMax, brainSchema(cfg)));
             markFounder(creatures.back());   // a new founder line
             // Body model: founders keep the default 1.0/1.0 and draw NOTHING,
             // even with cfg.bodyModel on. Body diversity is produced by the
@@ -259,6 +260,7 @@ public:
     // payload. Prepare only geometry and deterministic current parameters;
     // startup population/patch/eddy counts must never drive throwaway work.
     void initForCheckpoint(int w, int h) {
+        brainConversion = {};
         width = w;
         height = h;
         signals.init(w, h, 8, cfg.toroidal);
@@ -634,7 +636,7 @@ public:
             for (int j = 0; j < toAdd; ++j) {
                 Vec2 pos = {rng.range(10.0f, (float)width - 10.0f),
                             rng.range(10.0f, (float)height - 10.0f)};
-                creatures.push_back(makeRandomCreature(pos, cfg.genomeInitMin, cfg.genomeInitMax));
+                creatures.push_back(makeRandomCreature(pos, cfg.genomeInitMin, cfg.genomeInitMax, brainSchema(cfg)));
                 markFounder(creatures.back());   // new founder line
                 // Body model: a reseeded founder is 1.0/1.0 and draws nothing.
                 // Deliberate — the reseed floor already acts as a pump for

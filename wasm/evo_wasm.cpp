@@ -387,6 +387,9 @@ EVO_EXPORT int evo_init(unsigned seed, int width, int height, int population,
         }
         checkpoint::readConfig(root, cfg);
     }
+    if (cfg.genomeVersion != 1) {
+        if (const char* why = brainPolicyConfigError(cfg)) { g_error = why; return 0; }
+    }
     clampConfig(cfg);
     if (width < 100 || height < 100 || population < 0) {
         g_error = "bad world dimensions or population";
@@ -503,6 +506,9 @@ EVO_EXPORT int evo_set_param(const char* name, double value) {
     if (!jsonm::Parser::parse(json, root, err)) { g_error = "internal: " + err; return 0; }
     SimConfig cfg = g_world->cfg;
     checkpoint::readConfig(root, cfg);
+    if (cfg.genomeVersion != 1) {
+        if (const char* why = brainPolicyConfigError(cfg)) { g_error = why; return 0; }
+    }
     clampConfig(cfg);
     if (const char* why = brainPolicyConfigError(cfg)) {
         g_error = why;
@@ -708,7 +714,7 @@ EVO_EXPORT int evo_wiring() {
             grew = false;
             for (const auto& fc : c.nnet.flat) {
                 const int src = fc.src(), sink = fc.sink();
-                if (src < S) continue;
+                if (src < S || src >= S + H) continue;
                 const int h = src - S;
                 const std::uint32_t add = sink < A ? (1u << sink) : reach[sink - A];
                 if ((reach[h] | add) != reach[h]) { reach[h] |= add; grew = true; }
@@ -951,7 +957,7 @@ EVO_EXPORT int evo_inspect(int index) {
         g_inspConns[k++] = (float)g.sourceNum;
         g_inspConns[k++] = (g.sinkType == SINK_ACTION) ? 1.0f : 0.0f;
         g_inspConns[k++] = (float)g.sinkNum;
-        g_inspConns[k++] = g.weightAsFloat();
+        g_inspConns[k++] = fc.w();
     }
     return 1;
 }
