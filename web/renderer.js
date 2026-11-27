@@ -485,12 +485,33 @@
   var sentLive = [];     /* the same, sent to Turbo's worker and not yet answered, in the order sent (it answers in that order) */
   var turboAcked = [];   /* the values this Turbo session's worker applied: if its world is lost, the page's copy takes them */
   var turboEntryCfg = null;   /* the record when Turbo took the world (enterTurbo) */
+  /* Two records of the live settings. submitted: the values the world was
+   * given and took (the start's, a file's, each accepted edit's: as typed),
+   * which every decision compares, exactly (the run's history, the live
+   * tweaks the question counts, what a new world carries over): a value that
+   * differs from the last one given is a change, whatever the engine made of
+   * it (an extra question is safe; a missed one is not). runCfg: what the
+   * engine keeps, for what the page says and what a refusal puts back; read
+   * from the engine after a start or a load, then once more at the first
+   * accepted edit after it (recordStale: an edit's setter puts the whole
+   * config through clampConfig, a loaded file's values too), then kept edit by
+   * edit (applyRule), with a read whenever the clamps move a value (moves). */
+  var submittedCfg = {}, startSubmitted = {}, recordStale = true;
+  var turboEntrySubmitted = null, turboEntryStale = true;
+  function submittedOf(k) { return k === "maxPopulation" ? userCap : cfgOr(submittedCfg, k); }
+  function startSubmittedOf(k) { return k === "maxPopulation" ? startCap : cfgOr(startSubmitted, k); }
+  /* the live values a start or a file gives (as given: a floor of 0.5 is 0.5 here, 0 in the engine) */
+  function submittedFrom(cfg) {
+    var o = {};
+    Object.keys(LIVE).forEach(function (k) { if (k !== "maxPopulation") o[k] = cfgOr(cfg, k); });
+    return o;
+  }
   function sendLive(key, v, quiet) {
     if (!engineOk()) return;
     var e = { key: key, value: v, quiet: !!quiet };
     if (turboState === "turbo") {
       sentLive.push(e);
-      turboWorker.postMessage({ cmd: "set", key: key, value: v, quiet: e.quiet, readback: moves(key, v) });
+      turboWorker.postMessage({ cmd: "set", key: key, value: v, quiet: e.quiet, readback: recordStale || moves(key, v) });
       return;
     }
     if (turboState !== "live") {
@@ -500,8 +521,9 @@
     }
     var ok = withCString(key, function (ptr) { return Module._evo_set_param(ptr, v); });
     if (!ok) { liveRefused(key, Module.UTF8ToString(Module._evo_last_error()), quiet); return; }
-    var read = moves(key, v), cfg = read ? readEngineConfig() : null;
-    liveApplied(key, quiet, cfg || applyRule(runCfg, key, v));
+    var read = recordStale || moves(key, v), cfg = read ? readEngineConfig() : null;
+    if (cfg) recordStale = false;
+    liveApplied(key, v, quiet, cfg || applyRule(runCfg, key, v));
     if (read && !cfg) sayUnread("The engine", LABELS[key] || key);
   }
   /* a newer value of key on its way: held for Turbo's start or hand-back, or sent to its worker and not yet answered */
@@ -521,18 +543,22 @@
     if (input) input.value = shown(back);
     showError(why + " (the running world keeps " + shown(back) + ").");
   }
-  /* The world took a value for key. cfg: its whole config as the engine holds
-   * it now (engineConfig here, the worker's own in its answer), the run's
-   * record: the engine normalizes what it is given (whole numbers cut, the
-   * speeds put in order), so the record, the fields and the notes say what
-   * runs. The fields of what changed follow it, unless a newer value is on its
-   * way (or, for another field, the visitor is in it). maxPopulation's record
-   * is userCap (applyLive). */
-  function liveApplied(key, quiet, cfg) {
+  /* The world took v for key. The run's history follows what was submitted:
+   * a value other than the last one given for the key is a change, exactly
+   * (a stepper clamped at its bound fires change with the same value: none);
+   * maxPopulation's submitted record is userCap (applyLive), and the
+   * governor's cap is no edit. cfg: the engine's record now (its own config,
+   * here or in the worker's answer, or the rule's), for what the page says:
+   * the fields of what it moved follow it, unless a newer value is on its way
+   * (or, for another field, the visitor is in it). */
+  function liveApplied(key, v, quiet, cfg) {
+    if (key !== "maxPopulation") {
+      if (v !== cfgOr(submittedCfg, key)) liveEdited = true;
+      submittedCfg[key] = v;
+    }
     var prev = runCfg;
     runCfg = cfg;
     var moved = Object.keys(LIVE).filter(function (k) { return k !== "maxPopulation" && !sameRun(k, cfgOr(prev, k), cfgOr(runCfg, k)); });
-    if (moved.length) liveEdited = true;   /* (the run's history changes only with a value: a stepper clamped at its bound still fires change) */
     if (key !== "maxPopulation" && moved.indexOf(key) < 0) moved.push(key);
     moved.forEach(function (k) {
       var input = el("adv_" + k);
@@ -612,10 +638,9 @@
     Object.keys(LIVE).forEach(function (k) { if (typeof c[k] === "number" && Number.isFinite(c[k])) c[k] = engineVal(k, c[k]); });
     return c;
   }
-  /* Two values of live key k are the same run when the engine keeps them as
-   * the same number: decisions (the run's history, the live tweaks the
-   * question counts, what a new world carries over) compare that exactly
-   * (1.5 and 1.5000001 are two runs: 1.5 and 1.50000012 to the engine). */
+  /* Two values of live key k the engine's rule keeps as the same number: for
+   * what the page shows only (which fields follow the engine's record); no
+   * decision rests on it, they compare what was submitted (submittedCfg). */
   function sameRun(k, a, b) {
     var x = typeof a === "number" ? a : parseFloat(a), y = typeof b === "number" ? b : parseFloat(b);
     if (!Number.isFinite(x) || !Number.isFinite(y)) return String(a) === String(b);
@@ -847,7 +872,7 @@
    * world, and Load world come through here; Keep it (or Esc) keeps the run. */
   var DT = 0.016;            /* simulated seconds per step (wasm/evo_wasm.cpp: the step's fixed dt) */
   var usedTurbo = false;     /* Turbo ran this world (a reason to ask before replacing it) */
-  var startCfg = {}, startCap = 0;   /* the running world's settings when it started or was loaded (live tweaks: the difference) */
+  var startCap = 0;   /* the user's cap when the running world started or was loaded (its submitted start: startSubmitted) */
   var formAtStart = null;    /* the sheet's restart fields when the running world started from it (edits waiting: the difference) */
   var asking = null;         /* {go, opener}: the question is showing */
   /* the fields a Restart applies (every setting but the live ones, which apply by themselves) */
@@ -876,10 +901,9 @@
   }
   /* a live key's value in the running world (maxPopulation: the user's cap, userCap), and when it started */
   function liveNow(k) { return k === "maxPopulation" ? userCap : cfgOr(runCfg, k); }
-  function liveAtStart(k) { return k === "maxPopulation" ? startCap : cfgOr(startCfg, k); }
   /* the live settings changed since this world started (accepted ones) */
   function liveTweaks() {
-    return Object.keys(LIVE).filter(function (k) { return !sameRun(k, liveNow(k), liveAtStart(k)); });
+    return Object.keys(LIVE).filter(function (k) { return submittedOf(k) !== startSubmittedOf(k); });
   }
   function runAge() {
     if (!engineOk()) return 0;
@@ -919,7 +943,8 @@
     } else {
       var list = diff.slice(0, 3).map(fieldText).join(", ") + (diff.length > 3 ? " and " + (diff.length - 3) + " more" : "");
       var kept = [], other = [];
-      tw.forEach(function (k) { var next = x.next(k); (sameRun(k, next, liveNow(k)) ? kept : other).push([k, next]); });
+      /* (carried over: the new world is given the value given now, or the very number the engine keeps now) */
+      tw.forEach(function (k) { var next = x.next(k); (next === submittedOf(k) || next === liveNow(k) ? kept : other).push([k, next]); });
       msg += (kind === "random" ? " It starts " + x.what + "." + (diff.length ? " What waits for the next start is dropped." : "")
                                 : diff.length ? " It starts with what waits: " + list + "." : "") +
         (kept.length ? " Your live tweak" + s(kept.length) + " (" + mine(keys(kept)) + ") " + (kept.length === 1 ? "carries" : "carry") + " over to the new world." : "") +
@@ -1039,7 +1064,8 @@
     else {
       worldGen++;
       runCfg = readEngineConfig() || asEngineKeeps(cfg); governed = false; liveEdited = false; loadedRun = false; updateModeline(); if (dash()) dash().reset();   /* a new run: new charts */
-      startCfg = Object.assign({}, runCfg); startCap = userCap; usedTurbo = false;   /* (what the replace rule compares with) */
+      startCap = userCap; usedTurbo = false;   /* (what the replace rule compares with: and startSubmitted) */
+      submittedCfg = submittedFrom(cfg); startSubmitted = Object.assign({}, submittedCfg); recordStale = true;
       brainClock.reset(worldTick(), true);   /* (tick 0: no fish has run its brain yet) */
       sayUnread("The engine", "the new world's settings");
     }
@@ -1822,10 +1848,12 @@
     var fileCfg = null;
     if (!fromTurbo) { try { fileCfg = JSON.parse(text).config || {}; } catch (e) { fileCfg = {}; } }
     runCfg = readEngineConfig() || (fromTurbo ? runCfg : asEngineKeeps(fileCfg));
+    recordStale = true;   /* (the first accepted edit reads it again: its setter clamps the whole config, the file's values too) */
     if (!fromTurbo) {
       worldGen++;
+      submittedCfg = submittedFrom(fileCfg); startSubmitted = Object.assign({}, submittedCfg);   /* (the file's own values, as given) */
       governed = false; liveEdited = false; loadedRun = true;   /* (updateModeline: the caller's, after the governor's reset) */
-      startCfg = Object.assign({}, runCfg); usedTurbo = false;   /* (startCap: the caller's, with the file's cap) */
+      usedTurbo = false;   /* (startCap: the caller's, with the file's cap) */
       if (dash()) dash().reset();
       if (Module._evo_rec_reset) Module._evo_rec_reset(1);   /* the loaded fish, as the tree's roots */
     }
@@ -1893,7 +1921,8 @@
         turboAcked.push({ key: msg.key, value: msg.value });
         /* (a value the clamps move: the worker's engine's own config, read after it applied the value; else, or when that read
          * failed, the value as the engine keeps it) */
-        liveApplied(msg.key, msg.quiet, msg.config || applyRule(runCfg, msg.key, msg.value));
+        if (msg.config) recordStale = false;
+        liveApplied(msg.key, msg.value, msg.quiet, msg.config || applyRule(runCfg, msg.key, msg.value));
         if (msg.configError) { unread = msg.configError; sayUnread("Turbo's engine", LABELS[msg.key] || msg.key); }
       }
       else if (msg.notRunning) { if (turboState === "turbo") heldLive.push({ key: msg.key, value: msg.value, quiet: msg.quiet }); else sendLive(msg.key, msg.value, msg.quiet); }
@@ -1935,7 +1964,7 @@
    * field put back), before the ones typed while Turbo started or handed back. Each is kept by the rule against the
    * world it now goes to (a speed swap is the page's copy's). Not lost: every answer came before the checkpoint */
   function recoverLive(lost) {
-    if (lost && turboEntryCfg) runCfg = turboEntryCfg;
+    if (lost && turboEntryCfg) { runCfg = turboEntryCfg; submittedCfg = Object.assign({}, turboEntrySubmitted); recordStale = turboEntryStale; }
     turboAcked.splice(0).forEach(function (a) { sendLive(a.key, a.value, true); });
     heldLive = sentLive.splice(0).concat(heldLive);
   }
@@ -1950,6 +1979,7 @@
     turboStats = null;
     turboAcked = []; sentLive = [];
     turboEntryCfg = runCfg;   /* (the record of this page's copy as Turbo takes it: what a lost Turbo goes back to) */
+    turboEntrySubmitted = Object.assign({}, submittedCfg); turboEntryStale = recordStale;
     selectedId = null; /* ids will be stale by exit */
     updateLocks();
     if (!turboWorker) { /* created once, reused across sessions */
