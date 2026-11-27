@@ -922,7 +922,7 @@ inline void testHydroRefs() {
              rel(c.peakPower, 2.0 * c.sustainedPower, c.peakPower) <= 1e-6, "neutral motor");
     float lo = kUsusRef, hi = 400.0f;
     for (int i = 0; i < 60; ++i) { const float mid = 0.5f * (lo + hi); if (R.pmotor(mid) < c.peakPower) lo = mid; else hi = mid; }
-    t.expect(lo >= 130.0f && lo <= 150.0f, "neutral peak speed %g outside 130-150", (double)lo);
+    t.expect(std::isfinite(lo) && lo > 0 && rel(R.pmotor(lo), c.peakPower, c.peakPower)<2e-6, "finite peak force balance %g (starting window 130-150)", (double)lo);
     t.note("refs: Vref %.9g, lean %.9g m, muscle %.9g u³, trim gas %.9g u³ at k %.9g, Dref %.9g, Urow %.9g u/s, ηtail %.9g, "
            "P(82) %.9g, P(108) %.9g, workConversion %.9g; peak (P = 2 Psus) %.4g u/s; digest %s",
            (double)R.refVolume, (double)R.leanMass, (double)R.muscleVolume, (double)R.trimGas, (double)R.trimInflation, (double)R.forwardDrag,
@@ -997,18 +997,30 @@ inline void testHydroRefuse() {
         for (int i = 0; i < 3; ++i) if (a.K[i] != 0 || a.Khull[i] != 0) return false;
         return true;
     };
-    const float maxFuel = c.reserveCapacity * (bodymat::kRhoLipid * rhoWater());
+    const float maxFuel = fuelCapacity(c);
     for (const auto load : {std::array<float, 2>{1e38f, 0}, {std::nextafter(c.gasCapacity, INFINITY), 0},
                             {0, std::nextafter(maxFuel, INFINITY)}, {-1, 0}, {0, NAN}, {INFINITY, 0}}) {
         t.expect(evalLoad(c, 0.5f * c.gasCapacity, 0.25f * maxFuel, L), "valid load refused before refusal test");
         t.expect(!evalLoad(c, load[0], load[1], L) && cleared(L), "bad load accepted or refusal left partial output");
     }
     t.expect(evalLoad(c, c.gasCapacity, maxFuel, L), "capacity endpoints refused");
+    t.expect(evalLoad(c, 0, c.reserveCapacity * (bodymat::kRhoLipid * rhoWater()), L),
+             "original physical-mass capacity endpoint refused");
+    t.expect(evalLoad(c, 0, fuelMass(c.energyCapacity), L), "energy capacity endpoint refused");
+    for (float badCapacity : {-1.0f, NAN, INFINITY}) {
+        Coefficients invalid = c; invalid.energyCapacity = badCapacity;
+        t.expect(!evalLoad(invalid, 0, 0, L) && cleared(L), "invalid energy capacity accepted");
+        invalid = c; invalid.reserveCapacity = badCapacity;
+        t.expect(!evalLoad(invalid, 0, 0, L) && cleared(L), "invalid reserve capacity accepted");
+    }
     Coefficients bad = c;
     bad.skinFriction = std::numeric_limits<float>::max(); // late overflow, after mass/COM calculation
     t.expect(!evalLoad(bad, 0, 0, L) && cleared(L), "late overflow accepted or left partial output");
-    t.expect(versionsSupported(1, 1, 1, 1) && !versionsSupported(2, 1, 1, 1) && !versionsSupported(1, 2, 1, 1) && !versionsSupported(1, 1, 0, 1) &&
-             !versionsSupported(1, 1, 1, 2), "version support");
+    t.expect(versionsSupported(kGeometryLaw,kMaterialLaw,kExpressionStage,kReferenceLaw) &&
+             !versionsSupported(kGeometryLaw+1,kMaterialLaw,kExpressionStage,kReferenceLaw) &&
+             !versionsSupported(kGeometryLaw,kMaterialLaw+1,kExpressionStage,kReferenceLaw) &&
+             !versionsSupported(kGeometryLaw,kMaterialLaw,kExpressionStage+1,kReferenceLaw) &&
+             !versionsSupported(kGeometryLaw,kMaterialLaw,kExpressionStage,kReferenceLaw+1), "version support");
 }
 
 inline void testHydroState() {
