@@ -322,10 +322,14 @@ More detail: [`docs/architecture.md`](docs/architecture.md) (design notes, what 
 
 ## Credits
 
+- **Nikunj ([@techy-Nik](https://github.com/techy-Nik))** redesigned the browser page in [#7](https://github.com/HaritMT25/finfolk/pull/7).
+  - **The phone-first interface** that the site is still built around: the live readout, the playback dock, tabbed settings and the fish card.
+  - **The three.js tank** (`web/scene3d.js`): low-poly fish bent along their spines, glowing plankton, caustic light and current streaks.
+
+  His tank gave Classic's fish their look, and it is what pushed Finfolk from a flat 2-D world toward the 3-D Ocean. He also prototyped an opt-in Reef look ([#47](https://github.com/HaritMT25/finfolk/pull/47)).
 - [biosim4](https://github.com/davidrmiller/biosim4) by David R. Miller: the genome-to-network encoding, and several sensors and actions are adapted from it (MIT).
 - [learning_boids](https://github.com/Dairop/learning_boids) by Dairop: ideas for the food abundance cycle and the social interactions. No code or assets are taken from it.
 - [musl](https://musl.libc.org) / FreeBSD fdlibm: the portable float math, used so native and WebAssembly builds give identical results (MIT / Sun notice).
-- Classic's perspective tank view (`web/scene3d.js`) is by techy-Nik.
 
 ## License
 
