@@ -457,7 +457,7 @@
     /* refused before it reaches the engine, as it would run as something else (a fraction cut, a long whole number cut
      * or capped, a float past float32 as infinity, a predator floor past 2000 capped) or not at all (a cap below 0) */
     var why = liveProblem(key, v);
-    if (why) { revertField(key, (LABELS[key] || key) + " " + why); return; }
+    if (why) { refuseTyped(key, input, (LABELS[key] || key) + " " + why); return; }
     if (key === "maxPopulation") {
       var prevCap = userCap;
       userCap = v;
@@ -467,6 +467,24 @@
     }
     if (!Module._evo_set_param) return;
     sendLive(key, v, false, true);
+  }
+  /* A typed value the page refused before it reached the world (liveProblem):
+   * its field goes back to the newest value of the key on its way (held or
+   * sent, not yet answered: the field showed it until this was typed), or to
+   * the user's cap, which the cap's field always shows; with nothing on its
+   * way, to what runs (revertField). A refused value never stays in a field. */
+  function refuseTyped(key, input, why) {
+    if (!onTheWay(key)) { revertField(key, why); return; }
+    var q = key === "maxPopulation" ? userCap : newestOnTheWay(key);
+    input.value = shown(q);
+    showError(why + " (" + shown(q) + " is on its way to the world).");
+  }
+  /* the newest value of key on its way: held entries are newer than sent ones (held while Turbo starts, before
+   * anything is sent, or while it hands back, after) */
+  function newestOnTheWay(key) {
+    for (var lists = [heldLive, sentLive], i = 0; i < 2; i++)
+      for (var j = lists[i].length - 1; j >= 0; j--) if (lists[i][j].key === key) return lists[i][j].value;
+    return liveNow(key);
   }
   /* One live value into the world that runs: this page's module, or while
    * Turbo owns the world its worker's (worker.js "set": the module's own
@@ -493,14 +511,17 @@
   /* The engine record (runCfg), for what the page shows: read after a start or a load, once more at the first accepted
    * edit after it (recordStale: an edit's setter puts the whole config through clampConfig, a loaded file's values too;
    * staleAsked: that read asked of Turbo's worker once, not by every edit of a burst), then kept edit by edit (applyRule),
-   * with a read whenever the clamps move a value (moves). What a refusal puts back is read from the engine (revertField). */
+   * with a read whenever the clamps move a value (moves). What a refusal puts back is read from the engine (revertField).
+   * Only an accepted setter's read clears recordStale: a read without one (a refusal's, the question's, the worker's
+   * config) is what runs now, but the next accepted setter still clamps the whole config, so it still reads. */
   var recordStale = true, staleAsked = false;
   function markStale() { recordStale = true; staleAsked = false; }
   function sendLive(key, v, quiet, user, prevCap) {
     if (!engineOk()) return;
     var e = { key: key, value: v, quiet: !!quiet, user: !!user, prevCap: prevCap };
     if (turboState === "turbo") {
-      var rb = moves(key, v) || (recordStale && !staleAsked);
+      e.staleAsk = recordStale && !staleAsked;   /* (this one asks the read the first accepted setter owes) */
+      var rb = moves(key, v) || e.staleAsk;
       if (recordStale) staleAsked = true;
       sentLive.push(e);
       turboWorker.postMessage({ cmd: "set", key: key, value: v, quiet: e.quiet, readback: rb });
@@ -527,10 +548,11 @@
    * cfg: the worker's own config, read with its refusal): the field goes back
    * to the value that runs (revertField), the user's cap to the cap it had.
    * The governor's cap and a replay (quiet, not the visitor's): nothing. */
-  function liveRefused(e, why, cfg) {
+  function liveRefused(e, why, cfg, answered) {
+    if (e.staleAsk) staleAsked = false;   /* (no setter ran: the next accepted one asks for the read again) */
     if (e.quiet && !e.user) return;
     if (e.key === "maxPopulation" && e.user) { userCap = e.prevCap; updateModeline(); }
-    revertField(e.key, why, cfg);
+    revertField(e.key, why, cfg, answered);
   }
   /* A refused value's field goes back to the value that runs, and the error
    * says it. That value is the engine's own, not the page's record (which
@@ -538,13 +560,15 @@
    * other way): one read of the world, as refusals are rare (cfg: the worker
    * brought it), or, while Turbo's worker owns the world, asked of it
    * (pendingReverts: the field put right when it answers, the record standing
-   * in until then). Not while a newer value of the key is on its way: the
-   * field shows that one. The cap's field shows the user's cap (userCap). */
+   * in until then; answered: the worker's refusal came without a config, as
+   * its world can't be read, so the record stands). Not while a newer value
+   * of the key is on its way: the field shows that one. The cap's field shows
+   * the user's cap (userCap). */
   var pendingReverts = {};
-  function revertField(key, why, cfg) {
+  function revertField(key, why, cfg, answered) {
     if (onTheWay(key)) { showError(why); return; }
-    if (!cfg && key !== "maxPopulation") cfg = authoritativeConfig(key, why);
-    if (cfg) { runCfg = cfg; recordStale = false; }
+    if (!cfg && !answered && key !== "maxPopulation") cfg = authoritativeConfig(key, why);
+    if (cfg) runCfg = cfg;   /* (recordStale stays: no setter ran) */
     var back = liveNow(key), input = el("adv_" + key);
     if (input) input.value = shown(back);
     showError(why + " (the running world keeps " + shown(back) + ").");
@@ -561,7 +585,7 @@
   /* the engine's own config arrived (the worker's answer, a hand-back's read): the record, and each field a refusal put
    * back meanwhile, said again if what runs is not what it said */
   function settleReverts(cfg) {
-    runCfg = cfg; recordStale = false;
+    runCfg = cfg;   /* (recordStale stays: a read is no setter) */
     Object.keys(pendingReverts).forEach(function (key) {
       var why = pendingReverts[key];
       delete pendingReverts[key];
@@ -578,12 +602,13 @@
    * visitor is in it). */
   function liveApplied(e, cfg) {
     var key = e.key;
-    if (e.user) { liveEdited = true; markEdited(key); }
+    if (e.user) { liveEdited = true; markEdited(key); setupChanged(); }   /* (a tweak the question didn't name: it goes) */
     var prev = runCfg;
     runCfg = cfg;
     var moved = Object.keys(LIVE).filter(function (k) { return k !== "maxPopulation" && !sameRun(k, cfgOr(prev, k), cfgOr(runCfg, k)); });
     if (e.user) moved.forEach(markEdited);
     if (key !== "maxPopulation" && moved.indexOf(key) < 0) moved.push(key);
+    if (key === "maxPopulation" && e.user && !onTheWay(key)) moved.push(key);   /* (its field shows the user's cap) */
     moved.forEach(function (k) {
       var input = el("adv_" + k);
       if (!input || onTheWay(k) || (k !== key && document.activeElement === input)) return;
@@ -988,7 +1013,7 @@
     if (usedTurbo) lose.push("what Turbo ran");
     var s = function (n) { return n === 1 ? "" : "s"; };
     /* (the tweaks named with what the engine runs now: read from it, a question being rare) */
-    if (tw.length) { var now = readEngineConfig(); if (now) { runCfg = now; recordStale = false; } }
+    if (tw.length) { var now = readEngineConfig(); if (now) runCfg = now; }   /* (recordStale stays: a read is no setter) */
     var mine = function (ks) { return ks.map(function (k) { return (LABELS[k] || k) + " " + shown(liveNow(k)); }).join(", "); };
     var msg = "This replaces your run" + (lose.length ? ", and " + lose.join(" and ") + " with it" : "") + ".", yes = "Replace it";
     if (kind === "load") {
@@ -997,12 +1022,22 @@
       yes = "Open it";
     } else {
       var list = diff.slice(0, 3).map(fieldText).join(", ") + (diff.length > 3 ? " and " + (diff.length - 3) + " more" : "");
-      /* (a Restart starts from the sheet, which shows the tweaks; the dice's world has its own settings) */
+      /* (a Restart starts from the sheet: a tweak it shows carries over, one it sets otherwise (Reset every setting) is
+       * said so, with what it sets, the Ocean's words; the dice's world has its own settings) */
+      var kept = [], other = [];
+      if (kind !== "random") {
+        var sheet = readForm().cfg;
+        tw.forEach(function (k) { var next = startValue(sheet, k); (sameRun(k, next, liveNow(k)) ? kept : other).push([k, next]); });
+      }
+      var keys = function (l) { return l.map(function (e) { return e[0]; }); };
       msg += (kind === "random" ? " It starts " + x.what + "." + (diff.length ? " What waits for the next start is dropped." : "")
                                 : diff.length ? " It starts with what waits: " + list + "." : "") +
         (!tw.length ? "" : kind === "random"
           ? " Your live tweak" + s(tw.length) + " (" + mine(tw) + ") " + (tw.length === 1 ? "goes" : "go") + ": the random world has its own settings."
-          : " Your live tweak" + s(tw.length) + " (" + mine(tw) + ") " + (tw.length === 1 ? "carries" : "carry") + " over to the new world, as the sheet shows " + (tw.length === 1 ? "it." : "them."));
+          : (kept.length ? " Your live tweak" + s(kept.length) + " (" + mine(keys(kept)) + ") " + (kept.length === 1 ? "carries" : "carry") +
+                           " over to the new world, as the sheet shows " + (kept.length === 1 ? "it." : "them.") : "") +
+            (other.length ? " The new world's setup sets " + other.map(function (e) { return (LABELS[e[0]] || e[0]) + " " + shown(e[1]); }).join(", ") +
+                            " instead of your live tweak" + s(other.length) + " (" + mine(keys(other)) + ")." : ""));
     }
     showAsk(msg, yes, "Keep it");
     asking = { go: go, opener: null };
@@ -1046,6 +1081,8 @@
     if (a && a.opener) a.opener.focus();   /* a question the keyboard opened: the focus back where it was */
   }
   /* the entry points: each checks Turbo first (as before), then goes or asks */
+  /* the value a start from the sheet's cfg gives live key k (initWorld: the user's cap is cfg's maxPopulation) */
+  function startValue(cfg, k) { return k === "maxPopulation" ? cfg.maxPopulation || 0 : k in cfg ? cfg[k] : ADV_BY_KEY[k][1]; }
   function requestRestart() {
     if (!engineOk() || guardTurbo()) return "refused";
     return replaceRun("restart", restart, {});
@@ -1980,8 +2017,11 @@
         liveApplied(en, msg.config || applyRule(runCfg, msg.key, msg.value));
         if (msg.configError) { unread = msg.configError; sayUnread("Turbo's engine", LABELS[msg.key] || msg.key); }
       }
-      else if (msg.notRunning) { if (turboState === "turbo") heldLive.push(en); else sendLive(en.key, en.value, en.quiet, en.user, en.prevCap); }
-      else liveRefused(en, msg.error || "Turbo refused " + msg.key, msg.config || null);
+      else if (msg.notRunning) {
+        if (en.staleAsk) staleAsked = false;   /* (no setter ran there) */
+        if (turboState === "turbo") heldLive.push(en); else sendLive(en.key, en.value, en.quiet, en.user, en.prevCap);
+      }
+      else liveRefused(en, msg.error || "Turbo refused " + msg.key, msg.config || null, true);
     } else if (msg.type === "config") {
       if (msg.config) settleReverts(msg.config);   /* (the worker's engine's own config: a refusal's field put right) */
     } else if (msg.type === "rec") {
@@ -2445,8 +2485,8 @@
     updateTabDots();
     if (!t || !t.id) return;
     if (t.id === "governor" || t.id === "view3d" || t.id === "fishShape" || t.id === "colourBrain" || t.id === "cpfile") return;   /* not settings Restart applies */
+    if (t.id.indexOf("adv_") === 0 && LIVE[t.id.slice(4)]) return;  /* applies by itself (and withdraws a question once the world took it: liveApplied) */
     setupChanged();
-    if (t.id.indexOf("adv_") === 0 && LIVE[t.id.slice(4)]) return;  /* applies by itself */
     setPending(true);
   }
 
