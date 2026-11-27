@@ -5461,15 +5461,23 @@ async function pageSetupUX() {
        'one Start menu: three native buttons, distinct icons and visible consequence descriptions');
     const p = await bootPage('?guide=0&intro=0');
     const ids = ['advreset', 'bigbtn', 'e1btn', 'huntersbtn', 'currentsbtn', 'randombig'];
-    const cards = ids.map(id => { const c = p.doc.createElement('div'); c.className = 'scard'; p.doc.body.appendChild(c); c.appendChild(p.el(id)); return c; });
+    const mount = (q) => ids.map(id => { const c = q.doc.createElement('div'); c.className = 'scard'; q.doc.body.appendChild(c); c.appendChild(q.el(id)); return c; });
+    const cards = mount(p);
     p.click('startdiscard');
     const summary = () => p.el('startsummary').textContent;
-    ok(/Running: Standard/.test(summary()) && cards[0].classList.contains('running'), 'a fresh visit names Standard and outlines its card');
+    /* the running world's name (the start bar's bold part), and the cards wearing the running outline */
+    const nameOf = (q) => { const m = /^Running: (.*?) · /.exec(q.el('startsummary').textContent); return m ? m[1] : null; };
+    const outlined = (cs) => cs.map((c, i) => (c.classList.contains('running') ? ids[i] : '')).filter(Boolean).join();
+    const named = (q, cs) => JSON.stringify({ name: nameOf(q), outlined: outlined(cs) });
+    ok(nameOf(p) === 'Standard' && outlined(cards) === 'advreset', 'a fresh visit names Standard and outlines its card: ' + named(p, cards));
+    p.start();
+    ok(nameOf(p) === 'Standard' && outlined(cards) === 'advreset', 'the fresh visit\'s Standard started again untouched: Standard, outlined: ' + named(p, cards));
     p.click('huntersbtn');
     ok(cards[0].classList.contains('running') && cards[3].classList.contains('picked'), 'staging Hunters keeps Standard outlined and marks Hunters as picked');
     p.click('scenario-start');
-    ok(/Running: Hunters/.test(summary()) && cards[3].classList.contains('running') && !cards[0].classList.contains('running') && !cards[3].classList.contains('picked'),
-       'starting Hunters consumes the draft, names the run and moves the running outline');
+    ok(nameOf(p) === 'Hunters' && outlined(cards) === 'huntersbtn' && !cards[3].classList.contains('picked'),
+       'starting Hunters consumes the draft, names the run and moves the running outline: ' + named(p, cards));
+    const huntersPop = p.el('o_population').value, minSpeed0 = p.el('o_minSpeed').value;
     p.edit('minSpeed', 40);
     p.click('currentsbtn');
     const draft = p.T.draft, c = startCounter(p), before = c();
@@ -5482,13 +5490,55 @@ async function pageSetupUX() {
     p.click('startmenubtn'); p.key('Escape');
     ok(!p.shown('startmenu') && p.el('startmenubtn').getAttribute('aria-expanded') === 'false' && focused(p) === 'startmenubtn',
        'Esc closes the Start menu and restores focus to its button');
+    {   /* the menu from the keyboard (review of #105, Hydrogen P2 2 and P3 3): Enter / Space on its button open it with the
+         * focus on its first item; Up / Down (round the ends), Home / End move between its items and never reach the
+         * page's speed keys; Esc closes it, the focus back on its button; a pointer's press is as before */
+        const spd = () => p.el('speedlabel').textContent, kc = startCounter(p), k0 = kc(), paused0 = p.T.paused;
+        const s1 = spd();
+        p.tabTo('startmenubtn'); p.key('ArrowUp'); p.key('ArrowUp');   /* (outside the menu the arrows are the speed keys: a speed above the slowest, so Down shows too) */
+        const s3 = spd();
+        p.key('Enter');
+        const byEnter = p.shown('startmenu') && p.el('startmenubtn').getAttribute('aria-expanded') === 'true' && focused(p) === 'startsame';
+        const walk = ['ArrowDown', 'ArrowDown', 'ArrowDown', 'ArrowUp', 'Home', 'End', 'ArrowDown'].map((k) => { p.key(k); return focused(p); }).join();
+        ok(s3 !== s1 && byEnter && walk === 'newworld,replay,startsame,replay,startsame,replay,startsame' && spd() === s3 && p.shown('startmenu') &&
+           delta(k0, kc()).epoch === 0,
+           'Enter on the Start menu button opens it with the focus on Start again; the arrows, Home and End move inside it and leave the speed alone: ' +
+           JSON.stringify({ byEnter, walk, speed: [s1, s3, spd()], open: p.shown('startmenu') }));
+        p.key('Escape');
+        const escBack = !p.shown('startmenu') && focused(p) === 'startmenubtn';
+        p.key(' ');
+        const bySpace = p.shown('startmenu') && focused(p) === 'startsame' && p.T.paused === paused0;
+        p.key('Escape');
+        ok(escBack && bySpace && !p.shown('startmenu') && focused(p) === 'startmenubtn' && delta(k0, kc()).epoch === 0,
+           'Esc from inside the menu closes it and returns the focus to its button; Space opens it the same way (no pause): ' + JSON.stringify({ escBack, bySpace }));
+        p.key('ArrowDown'); p.key('ArrowDown');
+        p.pointer(); p.click('startmenubtn');
+        const byMouse = p.shown('startmenu') && focused(p) === null;
+        p.click('startmenubtn');
+        ok(spd() === s1 && byMouse && !p.shown('startmenu'), 'with the menu closed the arrows are the speed keys again; a pointer press opens and closes it as before, letting the focus go');
+    }
     const seed = p.T.initArgs.seed;
     p.click('startmenubtn'); p.tabTo('startsame'); p.key('Enter');
-    ok(!p.shown('startmenu') && p.T.initArgs.seed === seed && /Running: Hunters/.test(summary()), 'Enter on Start again keeps the seed and run name');
+    ok(!p.shown('startmenu') && p.T.initArgs.seed === seed && nameOf(p) === 'Hunters' && outlined(cards) === 'huntersbtn' && focused(p) === 'startmenubtn',
+       'Enter on Start again keeps the seed and run name; the focus goes back to the menu button: ' + JSON.stringify({ name: nameOf(p), focus: focused(p) }));
     p.click('startmenubtn'); p.tabTo('newworld'); p.key(' ');
-    ok(!p.shown('startmenu') && p.T.initArgs.seed !== seed && /Running: Hunters/.test(summary()), 'Space on Start fresh draws a seed and keeps the recipe name');
+    ok(!p.shown('startmenu') && p.T.initArgs.seed !== seed && nameOf(p) === 'Hunters' && outlined(cards) === 'huntersbtn' && focused(p) === 'startmenubtn',
+       'Space on Start fresh draws a seed and keeps the recipe name and outline');
+    /* (review of #105, Hydrogen P2 1 / Codex P3: a world that differs from its card's recipe is "<card> (edited)", unoutlined,
+     * whenever the edit was made: staged before the first Start (below, a fresh page), after a Start, or a live tweak a
+     * restart carries; set back, it is the recipe again) */
     p.edit('population', 25); p.click('restart'); if (asked(p)) p.click('startconfirm');
-    ok(/Running: your own setup/.test(summary()) && cards.every(c => !c.classList.contains('running')), 'starting hand-edited settings names your own setup and clears the recipe outline');
+    const afterStart = nameOf(p);
+    ok(afterStart === 'Hunters (edited)' && outlined(cards) === '', 'an edit after a Start: the next world is Hunters (edited), with no outline: ' + named(p, cards));
+    p.edit('population', huntersPop); p.start();
+    ok(nameOf(p) === 'Hunters' && outlined(cards) === 'huntersbtn', 'set back to the recipe and started: Hunters again, outlined: ' + named(p, cards));
+    p.edit('minSpeed', 40);
+    const tweaked = nameOf(p) === 'Hunters' && outlined(cards) === 'huntersbtn';
+    p.start();
+    ok(tweaked && nameOf(p) === 'Hunters (edited)' && outlined(cards) === '' && p.T.initArgs.cfg.minSpeed === 40,
+       'a live tweak leaves the running Hunters named; a restart that carries it starts Hunters (edited), unoutlined: ' + named(p, cards));
+    p.edit('minSpeed', minSpeed0); p.start();
+    ok(nameOf(p) === 'Hunters' && outlined(cards) === 'huntersbtn', 'the tweak set back and started: Hunters, outlined: ' + named(p, cards));
     await stageFile(p, SETUP99, 'aged.json');
     ok(p.shown('file-recipe') && p.el('file-recipe').textContent === 'From file: aged.json' && !p.shown('scenario-acts'),
        'a setup file stages a From file chip; Start remains in the start bar');
@@ -5501,6 +5551,34 @@ async function pageSetupUX() {
        'filenames use text in the chip and escaped HTML in the summary');
     p.click('startdiscard');
     ok(!p.shown('file-recipe') && /Running: aged.json/.test(summary()), 'Discard clears the file chip and keeps the running name');
+    p.edit('population', 30); p.start();
+    ok(nameOf(p) === 'aged.json (edited)' && outlined(cards) === '', 'a started file edited and started again: aged.json (edited): ' + named(p, cards));
+    {   /* a fresh page: the same edits before the first Start name the same worlds */
+        const q = await bootPage('?guide=0&intro=0'), qc = mount(q);
+        q.click('startdiscard');
+        q.click('huntersbtn'); q.edit('population', 25); q.start();
+        ok(nameOf(q) === 'Hunters (edited)' && nameOf(q) === afterStart && outlined(qc) === '',
+           'Hunters edited while staged, before its first Start: Hunters (edited), unoutlined, as when edited after a Start: ' + named(q, qc));
+        q.click('huntersbtn'); q.edit('seed', 777); q.start();
+        ok(nameOf(q) === 'Hunters' && outlined(qc) === 'huntersbtn' && q.T.initArgs.seed === 777,
+           'an unmodified Hunters (a seed of its own is no edit of the recipe): Hunters, outlined: ' + named(q, qc));
+        await stageFile(q, SETUP99, 'aged.json');
+        q.edit('population', 30); q.start();
+        ok(nameOf(q) === 'aged.json (edited)' && outlined(qc) === '' && q.T.initArgs.population === 30 && q.T.initArgs.seed === 99,
+           'a setup file edited after staging starts as aged.json (edited): ' + named(q, qc));
+        /* a link's setup has no recipe: your own setup, edited or not; a saved world is named after its file, "(edited)" once changed */
+        const r = await bootPage('?seed=4242&guide=0&intro=0'), rc = mount(r);
+        const fromLink = nameOf(r) === 'your own setup' && outlined(rc) === '';
+        r.edit('population', 30); r.start();
+        ok(fromLink && nameOf(r) === 'your own setup' && outlined(rc) === '', 'a link\'s world is your own setup, edited too: ' + named(r, rc));
+        const s = await savedWorld(r);
+        await openWorldConfirmed(q, s.bytes, s.name);
+        const opened = nameOf(q) === s.name && outlined(qc) === '';
+        q.edit('population', 31); q.start();
+        ok(opened && nameOf(q) === s.name + ' (edited)' && outlined(qc) === '',
+           'a saved world opens under its file name and, edited and started, is "' + s.name + ' (edited)": ' + named(q, qc));
+        ok(!q.uncaught.length && !r.uncaught.length, 'no exception escaped the fresh pages');
+    }
     const tour = fs.readFileSync(path.join(WEB, 'ocean_tour.js'), 'utf8');
     ok(tour.includes('Open &amp; save') && tour.includes('always asked first') && tour.includes('Replay from start') && !tour.includes('From a file'),
        'the tour describes Open & save, all three starts and unconditional saved-world confirmation');

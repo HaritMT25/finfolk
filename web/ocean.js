@@ -371,6 +371,15 @@
    * can load one (the eye world will). */
   var ENGINE = "ocean";
   var runTitle = "your own setup", runCard = null;   /* display identity, kept through Replay and open rollback */
+  /* What the run is named after: {name, card, base}, a card's recipe or a
+   * file's (base: its sheet as staged, snapForm), a saved world or a fresh
+   * visit's Standard (base: the sheet it started with); null for a setup of
+   * no name (a link's: "your own setup"). A start is "<name> (edited)",
+   * its card unoutlined, when the sheet it starts from differs from base
+   * by more than the seed, whenever the edit was made: staged before the
+   * first Start, typed after one, a live tweak a restart carries (the sheet
+   * holds it). Set back, it is the recipe again (review of #105, finding 1). */
+  var runRecipe = null;
   var usedTurbo = false;     /* Turbo ran this world (a reason to ask before replacing it) */
   var inspector = EvoOceanInspector.create({
     el: el, has: has, syncedFrame: syncedFrame, turboPictureHint: turboPictureHint, engineCall: engineCall, fresh: fresh, setStatPanel: setStatPanel, cfgVal: cfgVal, STATS: STATS, ACTION_SHORT: ACTION_SHORT, ACTION_LABELS: ACTION_LABELS, coarseMQ: coarseMQ, heap: heap, cString: cString, toast: toast,
@@ -401,12 +410,16 @@
     if ((plan.engine || ENGINE) !== ENGINE)
       return { ok: false, why: "that world needs the " + plan.engine + " engine module, and this page runs the " + ENGINE + " one" };
     var a = plan.op === "init" ? plan.build() : null, undo = null;
-    var title = runTitle, card = runCard;
-    if (plan.op === "open") { title = plan.world.name || "saved world"; card = null; }
-    else if (plan.op === "init") {
-      if (draft) { title = draft.title; card = draft.kind === "scenario" ? draft.id : null; }
-      else if (!initArgs && OCEAN_KEYS.every(function (k) { return !P.has(k); })) { title = "Standard"; card = "standard"; }
-      else if (plan.source !== "start" || pendingDiff().some(function (k) { return k !== "seed"; })) { title = "your own setup"; card = null; }
+    var title = runTitle, card = runCard, recipe = runRecipe;   /* (Replay: all three kept) */
+    if (plan.op !== "replay") {
+      if (plan.op === "open") recipe = { name: plan.world.name || "saved world", card: null, base: null };   /* (its base: its sheet, below) */
+      else if (draft) recipe = { name: draft.title, card: draft.kind === "scenario" ? draft.id : null, base: draft.base };
+      else if (!initArgs && OCEAN_KEYS.every(function (k) { return !P.has(k); })) recipe = { name: "Standard", card: "standard", base: null };
+      else if (plan.source !== "start") recipe = null;   /* (a link's setup, the benchmark's) */
+      /* (a staged recipe: diffFrom(draft.base) is pendingDiff itself) */
+      var edited = !!(recipe && recipe.base) && diffFrom(recipe.base).some(function (k) { return k !== "seed"; });
+      title = recipe ? recipe.name + (edited ? " (edited)" : "") : "your own setup";
+      card = recipe && !edited ? recipe.card : null;
     }
     /* Replay keeps what waits (a staged recipe: the whole sheet; else the
      * fields that differ from this world, as typed), never the live tweaks
@@ -435,13 +448,14 @@
     try {
       changedLive = {}; consoleSet = {};   /* a new world: no live change yet (a saved world's own tweaks: liveTweaks) */
       historyUnknown = plan.op === "open";   /* (its file has no history: unknown until a start or Replay) */
-      runTitle = title; runCard = card;
+      runTitle = title; runCard = card; runRecipe = recipe;
       clearFieldNotes();
       afterNewWorld();
       stepOnce = false; readouts.summary = null; usedTurbo = false; inspector.turboReturn = null;
       if (plan.op === "init") { draft = null; projectForm(); }   /* a start consumes the draft */
       else if (plan.op === "open") { draft = null; projectRunning(); }   /* (its settings now: its live tweaks too) */
       else if (keep) { projectForm(); keep.forEach(function (e) { setRaw(e[0], e[1]); }); updateNeeds(); updateTabDots(); }
+      if (recipe && !recipe.base) recipe.base = snapForm();   /* (Standard's, a saved world's: the sheet it starts with; a new object, this start's) */
       draftGen++;   /* every new world, Replay too (which keeps the draft): a setup file read from before it is stale */
       if (plan.imported && a) warnOdd(a.cfg);   /* (a setup from outside the sheet: what it ran) */
       if (plan.url) writeUrl();
@@ -477,7 +491,7 @@
   function runNow() {
     var u8 = new Uint8Array(heap()), fields = {};
     Object.keys(KEYS).forEach(function (k) { if (el("o_" + k)) fields[k] = rawOf(k); });
-    return { data: u8.slice(0, HO.storedLength(u8)), bytes: u8.length, initArgs: initArgs, runCfg: runCfg, runTitle: runTitle, runCard: runCard, epoch: worldEpoch,
+    return { data: u8.slice(0, HO.storedLength(u8)), bytes: u8.length, initArgs: initArgs, runCfg: runCfg, runTitle: runTitle, runCard: runCard, runRecipe: runRecipe, epoch: worldEpoch,
              selectedId: inspector.selectedId, wantFollow: inspector.wantFollow, following: !!(scene && scene.following()), draft: draft, draftGen: draftGen,
              fields: fields, extraCfg: Object.assign({}, extraCfg), nextOnly: Object.assign({}, nextOnly), paused: paused, url: location.href,
              dash: readouts.dash() && readouts.dash().save ? readouts.dash().save() : null, sampleBucket: readouts.sampleBucket, rates: readouts.rates.q.slice(),
@@ -486,7 +500,7 @@
   }
   /* the page's side of a run put back (its memory is in the module again) */
   function pageBack(u) {
-    runTitle = u.runTitle; runCard = u.runCard;
+    runTitle = u.runTitle; runCard = u.runCard; runRecipe = u.runRecipe;
     initArgs = u.initArgs; runCfg = u.runCfg; worldEpoch = u.epoch; draft = u.draft; draftGen = u.draftGen;
     changedLive = Object.assign({}, u.changedLive); historyUnknown = !!u.historyUnknown; consoleSet = Object.assign({}, u.consoleSet);
     inspector.resetSelection();
@@ -1231,17 +1245,23 @@
    * itself: a file's value the sheet can't show (an option 1e400) is not an edit */
   function differs(k, a, b) { return typeof KEYS[k][0] === "boolean" ? !!a !== !!b : !(a === b || (a !== a && b !== b)); }
   function snapForm() { var o = {}; Object.keys(KEYS).forEach(function (k) { if (el("o_" + k)) o[k] = formNum(k); }); return o; }
+  /* the fields the sheet has otherwise than base (snapForm's: a staged
+   * recipe's, or the one the run is named after, runRecipe) */
+  function diffFrom(base) {
+    var out = [];
+    Object.keys(KEYS).forEach(function (k) { if (el("o_" + k) && differs(k, formNum(k), base[k])) out.push(k); });
+    return out;
+  }
   /* the fields whose next value is not what runs now (nothing staged; an
    * edit on its way to the world has its own note), or not the staged
    * recipe's (a draft: "modified") */
   function pendingDiff() {
+    if (draft) return diffFrom(draft.base);
     var out = [];
     Object.keys(KEYS).forEach(function (k) {
       if (!el("o_" + k)) return;
-      var a = formNum(k);
-      if (draft) { if (differs(k, a, draft.base[k])) out.push(k); return; }
       if (LIVE[k] && live && live.pending(k) && !nextOnlyNow(k)) return;   /* (on its way: its own note; a newer next-world value waits) */
-      if (differs(k, a, runningVal(k))) out.push(k);
+      if (differs(k, formNum(k), runningVal(k))) out.push(k);
     });
     return out;
   }
@@ -1588,6 +1608,11 @@
     el("startmenubtn").setAttribute("aria-expanded", open ? "true" : "false");
   }
   function startMenuOpen() { var m = el("startmenu"); return !!m && !m.hidden; }
+  var START_ITEMS = ["startsame", "newworld", "replay"];   /* its items, in their order */
+  /* a key the open menu's focused item takes itself (its arrows, Home, End: ownKey) */
+  function startMenuKey(t, k) {
+    return !!t && START_ITEMS.indexOf(t.id) >= 0 && startMenuOpen() && (k === "ArrowUp" || k === "ArrowDown" || k === "Home" || k === "End");
+  }
   /* a plan from the sheet: its seed (or a new one, drawn once per request),
    * size and settings as typed, checked before anything stops */
   function formPlan(source, seed) {
@@ -2822,7 +2847,7 @@
    * Home, End and Page Up / Down, a tab its arrows, Home and End. Every other
    * key stays a shortcut. (web/ui_common.js: both pages' rule) */
   function typingIn(t) { return UI.typingIn(t); }
-  function ownKey(t, k) { return UI.ownsKey(t, k); }
+  function ownKey(t, k) { return UI.ownsKey(t, k) || startMenuKey(t, k); }   /* (the Start menu's items: as a tab's arrows) */
   /* One owner for each Esc, the top layer: the tour (web/guide.js), then the
    * charts (web/ocean_dash.js: it leaves an Esc to the tour), then this
    * page's own (a popover, the settings, the live numbers, the fish). Seen
@@ -3077,6 +3102,7 @@
       var kb = UI.pressedByKeyboard(this, e);
       fn();
       if (kb && asking) { asking.opener = back ? el(back) : this; el("startconfirm").focus(); }
+      else if (kb && back) el(back).focus();   /* (a menu's item, which hid with its menu: the focus back on the menu's button) */
       else this.blur();
     }));
   }
@@ -3097,8 +3123,27 @@
   Object.keys(CARD_IDS).forEach(function (id) { askBtn(CARD_IDS[id], function () { pickScenario(id); }); });
   askBtn("scenario-start", startStaged);
   askBtn("rerollbtn", function () { pickScenario("surprise"); });
-  /* the start bar: Start (the same fish: this seed), and its menu */
-  btn("startmenubtn", function () { setStartMenu(!startMenuOpen()); });
+  /* the start bar: Start (the same fish: this seed), and its menu. Pressed
+   * from the keyboard (askBtn's test), it opens with the focus on its first
+   * item and keeps the focus when it closes; a pointer's press lets the
+   * focus go (Space pauses again), as btn's. In the menu Up / Down (round
+   * the ends), Home and End move between the items (startMenuKey: the page's
+   * speed keys don't see them); Esc closes it, the focus back on its button
+   * (the window's Esc); Tab moves on as anywhere. */
+  el("startmenubtn").addEventListener("click", fenced(function (e) {
+    var kb = UI.pressedByKeyboard(this, e), open = !startMenuOpen();
+    setStartMenu(open);
+    if (open && kb) el(START_ITEMS[0]).focus();
+    else if (!kb) this.blur();
+  }));
+  START_ITEMS.forEach(function (id, i) {
+    el(id).addEventListener("keydown", function (e) {
+      if (e.altKey || e.ctrlKey || e.metaKey || !startMenuKey(this, e.key)) return;
+      var n = START_ITEMS.length, k = e.key;
+      el(START_ITEMS[k === "Home" ? 0 : k === "End" ? n - 1 : k === "ArrowDown" ? (i + 1) % n : (i + n - 1) % n]).focus();
+      e.preventDefault();
+    });
+  });
   askBtn("startsame", function () { setStartMenu(false); restart(); }, "startmenubtn");
   askBtn("newworld", function () { setStartMenu(false); newWorld(); }, "startmenubtn");
   document.addEventListener("pointerdown", function (e) {
