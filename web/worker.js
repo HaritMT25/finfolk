@@ -50,6 +50,8 @@ var samples = [];      /* [chunkStartMs, steps] pairs, rolling ~1 s window */
 var lastStats = 0;
 var recEvery = 60, recCulled = 0;
 var rec = [[], [], []]; /* recorder output not yet posted: Float64Array pieces per stream */
+/* the live settings the engine keeps as whole numbers (src/core/config.hpp int fields; renderer.js INT_KEYS) */
+var WHOLE = { maxPopulation: 1, minPopulation: 1, targetFood: 1, predatorMinPopulation: 1, predatorMaxPopulation: 1 };
 
 /* MessageChannel pump: schedules the next chunk as a plain macrotask (worker
  * timers can be throttled in background tabs; a port message is not). A 'stop'
@@ -110,11 +112,16 @@ onmessage = function (e) {
       postMessage({ type: "set", key: key, value: value, quiet: quiet, ok: false, notRunning: true, error: "Turbo is not running" });
       return;
     }
-    /* a value no field of the engine can keep (past float32's range: it would run as infinity) is refused before it
-     * is applied, as the page refuses it (renderer.js tooBig) */
-    if (!isFinite(Math.fround(+value.toPrecision(9)))) {
-      postMessage({ type: "set", key: key, value: value, quiet: quiet, ok: false, config: null,
-                    error: key + " is too large for the engine (it keeps 32-bit numbers, at most about 3.4e38)" });
+    /* the page's own checks, made here again (a second way in: defence in depth): a whole-number setting takes a whole
+     * number of up to nine digits (the engine's %.9g print and int cast would cut or cap a longer one, and cut a
+     * fraction), any other a value float32 can hold (past its range it would run as infinity); refused before it is
+     * applied, in the page's words (renderer.js applyLive, tooBig) */
+    var bad = !isFinite(value) ? "must be a number"
+            : WHOLE[key] && !Number.isInteger(value) ? "must be a whole number"
+            : WHOLE[key] && Math.abs(value) > 999999999 ? "is too large for the engine (it keeps whole numbers of up to nine digits)"
+            : !isFinite(Math.fround(+value.toPrecision(9))) ? "is too large for the engine (it keeps 32-bit numbers, at most about 3.4e38)" : "";
+    if (bad) {
+      postMessage({ type: "set", key: key, value: value, quiet: quiet, ok: false, config: null, error: key + " " + bad });
       return;
     }
     var ok = Module._evo_set_param ? withCString(key, function (ptr) { return Module._evo_set_param(ptr, value); }) : 0;
