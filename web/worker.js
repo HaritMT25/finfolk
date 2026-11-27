@@ -8,6 +8,15 @@
  *   in : {cmd:'stop'}                      -> finish current chunk, post the
  *                                             checkpoint back, go idle
  *   in : {cmd:'rec', every}                -> the dashboards' sampling interval
+ *   in : {cmd:'set', key, value, quiet}    -> a live setting into the running
+ *                                             world, between two chunks (the
+ *                                             module's evo_set_param: its own
+ *                                             whitelist and checks; the page
+ *                                             checks first, as for its own)
+ *   out: {type:'set', key, value, quiet, ok, error, notRunning}
+ *                                          -> its answer: applied, refused
+ *                                             (error), or no world here
+ *                                             (notRunning: the page keeps it)
  *   out: {type:'stats', frame, pop, food, pred, stepsPerSec, totalSteps} ~4x/s
  *   out: {type:'rec', s, b, c}             -> what the dashboard recorder saw
  *                                             (samples, births, changes; see
@@ -89,6 +98,16 @@ onmessage = function (e) {
   } else if (msg.cmd === "rec") {
     recEvery = msg.every;
     if (Module && Module._evo_rec_config) Module._evo_rec_config(recEvery, -1);
+  } else if (msg.cmd === "set") {
+    /* (the checkpoint posted at the hand-off carries the world's config, so an applied value goes back with it) */
+    var key = String(msg.key), value = +msg.value, quiet = !!msg.quiet;
+    if (!Module || !running) {
+      postMessage({ type: "set", key: key, value: value, quiet: quiet, ok: false, notRunning: true, error: "Turbo is not running" });
+      return;
+    }
+    var ok = Module._evo_set_param ? withCString(key, function (ptr) { return Module._evo_set_param(ptr, value); }) : 0;
+    postMessage({ type: "set", key: key, value: value, quiet: quiet, ok: !!ok,
+                  error: ok ? "" : Module._evo_set_param ? Module.UTF8ToString(Module._evo_last_error()) : "this module has no live settings" });
   }
 };
 

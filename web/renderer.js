@@ -446,9 +446,11 @@
     return row;
   }
   /* Push one live-capable knob into the running world. maxPopulation goes
-   * through the governor so a user cap and the frame-budget cap combine. */
+   * through the governor so a user cap and the frame-budget cap combine.
+   * While Turbo owns the world the value goes to its worker (sendLive), after
+   * the same checks, and is confirmed when the worker has applied it. */
   function applyLive(key, def, input) {
-    if (!Module || turboState !== "live") return;
+    if (!Module) return;
     var v = parseFloat(input.value);
     if (!Number.isFinite(v)) v = def;
     if (INT_KEYS[key] && !Number.isInteger(v)) {   /* (the engine would run it truncated: refused, the field back to what runs) */
@@ -461,15 +463,60 @@
     if (key === "maxPopulation") {
       var cap = Math.max(0, Math.round(v));
       if (cap !== userCap) liveEdited = true;
-      userCap = cap; applyCap(); updateModeline(); return;
+      userCap = cap; applyCap(turboState === "live"); updateModeline(); return;   /* (Turbo's answer says so: no note here) */
     }
     if (!Module._evo_set_param) return;
-    var ok = withCString(key, function (ptr) { return Module._evo_set_param(ptr, v); });
-    if (ok) {
-      if (v !== (key in runCfg ? runCfg[key] : def)) liveEdited = true;
-      runCfg[key] = v; updateModeline(); showNote((LABELS[key] || key) + " is now " + v + " (live)");
+    sendLive(key, v, false);
+  }
+  /* One live value into the world that runs: this page's module, or while
+   * Turbo owns the world its worker's (worker.js "set": the module's own
+   * evo_set_param; its answer comes back as a "set" message, onTurboMessage),
+   * or while Turbo starts or hands back, held and sent once it has (heldLive:
+   * a value typed then was dropped before, while its field showed it). quiet:
+   * no note (the governor's cap, a value put back after Turbo failed). */
+  var heldLive = [];     /* [{key, value, quiet}] waiting for Turbo to start or hand back, in the order typed */
+  var turboAcked = [];   /* the values this Turbo session's worker applied: if its world is lost, the page's copy takes them */
+  var inFlight = {};     /* key -> values sent to the worker and not yet answered */
+  function sendLive(key, v, quiet) {
+    if (turboState === "turbo") {
+      inFlight[key] = (inFlight[key] || 0) + 1;
+      turboWorker.postMessage({ cmd: "set", key: key, value: v, quiet: !!quiet });
+      return;
     }
-    else showError(Module.UTF8ToString(Module._evo_last_error()));
+    if (turboState !== "live") {
+      heldLive.push({ key: key, value: v, quiet: !!quiet });
+      if (!quiet) showNote((LABELS[key] || key) + " " + v + (turboState === "entering" ? " applies as soon as Turbo has started." : " applies as soon as Turbo hands the world back."));
+      return;
+    }
+    var ok = withCString(key, function (ptr) { return Module._evo_set_param(ptr, v); });
+    if (ok) liveApplied(key, v, quiet);
+    else liveRefused(key, Module.UTF8ToString(Module._evo_last_error()), quiet);
+  }
+  /* The world refused v for key (the engine's reason): the field goes back to
+   * the value that runs, and the error says so, as the whole-number check does
+   * (applyLive). Not while a newer value of the key is still on its way (sent
+   * to Turbo's worker, or held for it): the field shows that one. The cap
+   * (maxPopulation, through the governor) keeps its field: only the error. */
+  function liveRefused(key, why, quiet) {
+    if (quiet) return;
+    if (key === "maxPopulation" || inFlight[key] > 0 || heldLive.some(function (h) { return h.key === key; })) { showError(why); return; }
+    var back = key in runCfg ? runCfg[key] : ADV_BY_KEY[key][1], input = el("adv_" + key);
+    if (input) input.value = String(back);
+    showError(why + " (the running world keeps " + back + ").");
+  }
+  /* the world took v for key: the run's record (runCfg, its history); maxPopulation's record is userCap (applyLive) */
+  function liveApplied(key, v, quiet) {
+    if (key === "maxPopulation") {
+      if (!quiet) showNote((LABELS[key] || key) + " is now " + userCap + " (live)");
+      return;
+    }
+    if (v !== (key in runCfg ? runCfg[key] : ADV_BY_KEY[key][1])) liveEdited = true;
+    runCfg[key] = v; updateModeline();
+    if (!quiet) showNote((LABELS[key] || key) + " is now " + v + " (live)");
+  }
+  /* what was held for Turbo's start or hand-back, now to wherever the world is (in the order typed) */
+  function flushHeld() {
+    heldLive.splice(0).forEach(function (h) { sendLive(h.key, h.value, h.quiet); });
   }
   var tabsEl = el("tabs"), panelsEl = el("panels"), currentTab = "run";
   /* the settings' tabs (web/ui_common.js tabs, as the Ocean's): Left / Right
@@ -1110,10 +1157,11 @@
     intervalEma = 0;
     warmupUntil = performance.now() + 500;
   }
-  function applyCap() {
+  /* the effective cap into the world (sendLive: Turbo's worker while it owns the world); quiet unless false */
+  function applyCap(quiet) {
     if (!Module || !Module._evo_set_param) return;
     var eff = userCap > 0 && autoCap > 0 ? Math.min(userCap, autoCap) : (userCap || autoCap);
-    withCString("maxPopulation", function (ptr) { return Module._evo_set_param(ptr, eff); });
+    sendLive("maxPopulation", eff, quiet !== false);
   }
   function govern(workMs, pop) {
     if (performance.now() < warmupUntil) return;
@@ -1463,27 +1511,49 @@
     var msg = e.data || {};
     if (msg.type === "stats") {
       turboStats = msg;
-      if (turboState === "entering") { turboState = "turbo"; updateLocks(); }
+      if (turboState === "entering") { turboState = "turbo"; updateLocks(); flushHeld(); }
+    } else if (msg.type === "set") {
+      /* the worker's answer to a live value (sendLive): applied there, so the run's record has it (the hand-back's
+       * checkpoint carries the world's config); refused; or no world there any more (held, or applied here) */
+      if (inFlight[msg.key] > 0) inFlight[msg.key]--;
+      if (msg.ok) { turboAcked.push({ key: msg.key, value: msg.value }); liveApplied(msg.key, msg.value, msg.quiet); }
+      else if (msg.notRunning) { if (turboState === "turbo") heldLive.push({ key: msg.key, value: msg.value, quiet: msg.quiet }); else sendLive(msg.key, msg.value, msg.quiet); }
+      else liveRefused(msg.key, msg.error || "Turbo refused " + msg.key, msg.quiet);
     } else if (msg.type === "rec") {
       /* what the worker's recorder saw: same run, so straight into the dashboards */
       if (dash()) dash().ingest(new Float64Array(msg.s), new Float64Array(msg.b), new Float64Array(msg.c));
     } else if (msg.type === "checkpoint") {
       if (turboState !== "exiting") return;
       turboState = "live";
-      loadCheckpointText(msg.json, true); /* reuses the width/height re-read + selection clear */
+      /* (reuses the width/height re-read + selection clear; refused, this page's copy runs on with what the worker applied) */
+      var back = loadCheckpointText(msg.json, true);
       setPaused(false);             /* turbo implies running; come back un-paused */
       updateLocks();
-      showNote("Turbo ran " + (turboStats ? turboStats.totalSteps.toLocaleString() : 0) + " steps.");
+      if (back) showNote("Turbo ran " + (turboStats ? turboStats.totalSteps.toLocaleString() : 0) + " steps.");
+      else turboAcked.splice(0).forEach(function (a) { sendLive(a.key, a.value, true); });
+      flushHeld();                  /* values typed while it handed back: into the world it handed back */
     } else if (msg.type === "error") {
       showError("Turbo stopped: " + (msg.message || "unknown error"));
-      turboState = "live"; /* main module still holds its last state; nothing lost */
-      updateLocks();
+      turboLost(); /* main module still holds its last state; Turbo's steps are lost */
     }
+  }
+  /* Turbo ended without handing the world back: this page's copy, from where
+   * Turbo took it, runs on. It takes the live values the worker had applied
+   * (the run's record has them), then those held for the hand-off. The worker
+   * goes (a failed one may never start again); the next Turbo makes a new one. */
+  function turboLost() {
+    turboState = "live";
+    if (turboWorker) { turboWorker.onmessage = turboWorker.onerror = null; turboWorker.terminate(); turboWorker = null; }
+    inFlight = {};   /* (no answer comes now) */
+    updateLocks();
+    turboAcked.splice(0).forEach(function (a) { sendLive(a.key, a.value, true); });
+    flushHeld();
   }
   function enterTurbo() {
     if (turboState !== "live" || !Module) return;
     turboState = "entering";
     turboStats = null;
+    turboAcked = []; inFlight = {};
     selectedId = null; /* ids will be stale by exit */
     updateLocks();
     if (!turboWorker) { /* created once, reused across sessions */
@@ -1491,8 +1561,7 @@
       turboWorker.onmessage = onTurboMessage;
       turboWorker.onerror = function (ev) {
         showError("The Turbo worker failed: " + (ev.message || "could not load worker.js"));
-        turboState = "live";
-        updateLocks();
+        turboLost();
       };
     }
     /* everything recorded up to the hand-off goes to the dashboards first;
