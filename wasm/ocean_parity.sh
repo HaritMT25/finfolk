@@ -241,6 +241,8 @@ bgbuild hydro_fixture_native g++ $CXXFLAGS ${NATIVE_CXXFLAGS:-} tools/ocean_hydr
 bgbuild hydro_fixture_wasm   em++ $CXXFLAGS $EMFLAGS tools/ocean_hydro_fixture.cpp -o "$OUT/ohf_wasm.js"
 # shellcheck disable=SC2086
 bgbuild hydro_reference     g++ $CXXFLAGS ${NATIVE_CXXFLAGS:-} tools/ocean_hydro_reference.cpp -o "$OUT/ohr_native"
+bgbuild hydro_assay_native g++ $CXXFLAGS ${NATIVE_CXXFLAGS:-} tools/ocean_hydro_assay.cpp -o "$OUT/oha_native"
+bgbuild hydro_assay_wasm em++ $CXXFLAGS $EMFLAGS tools/ocean_hydro_assay.cpp -o "$OUT/oha_wasm.js"
 wait
 BUILD_OK=1
 for l in "${EXPECT[@]}"; do   # a build that never wrote its rc (killed wrapper) fails the run
@@ -1145,6 +1147,25 @@ if "$OUT/ohr_native" > "$OUT/hydro_reference.txt" 2>&1; then
 else
     echo "== offline reference FAILED:"; cat "$OUT/hydro_reference.txt"; FAILED=1
 fi
+# M2b1 PR 2: invariant-checked, every-substep mechanics and frozen calibration.
+for kind in step calibration; do
+    option=--fixture
+    fixture=tests/fixtures/ocean_hydro_step_fixture.json
+    if [ "$kind" = calibration ]; then
+        option=--calibration-fixture
+        fixture=tests/fixtures/ocean_hydro_calibration.json
+    fi
+    "$OUT/oha_native" "$option" > "$OUT/hydro_${kind}.native.json" 2> "$OUT/hydro_${kind}.native.log"; rsn=$?
+    $NODE "$OUT/oha_wasm.js" "$option" > "$OUT/hydro_${kind}.wasm.json" 2> "$OUT/hydro_${kind}.wasm.log"; rsw=$?
+    if [ "$rsn" = 0 ] && [ "$rsw" = 0 ] &&
+       cmp -s "$OUT/hydro_${kind}.native.json" "$OUT/hydro_${kind}.wasm.json" &&
+       cmp -s "$OUT/hydro_${kind}.native.json" "$fixture"; then
+        echo "== hydro $kind fixture: native == wasm == committed"
+    else
+        echo "== hydro $kind fixture FAILED (native $rsn wasm $rsw)"; FAILED=1
+    fi
+done
+
 
 # Separate opt-in checks never enter NAMES, the historical baseline matrix,
 # its twins, or the rebaseline writer. ONLY narrows this suite away as well.

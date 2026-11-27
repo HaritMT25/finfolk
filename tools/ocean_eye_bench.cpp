@@ -31,6 +31,7 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include "ocean_hydro_bench.hpp"
 #include "ocean_fingerprint.hpp"   // ofp::initWorld: the page's config path
 
 namespace {
@@ -102,6 +103,8 @@ void wiringReport(const OceanWorld& w, const char* label) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    if(argc>1&&std::strcmp(argv[1],"--mechanics-components")==0)
+        return hydrobench::main(argc-1,argv+1);
     unsigned seed = 42;
     int pop = 300, W = 1920, H = 1080, reps = 7, warm = 10, steps = 100;
     long evolve = 0;
