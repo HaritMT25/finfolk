@@ -521,13 +521,13 @@
   function liveApplied(key, quiet, cfg) {
     var prev = runCfg;
     runCfg = cfg;
-    var moved = Object.keys(LIVE).filter(function (k) { return k !== "maxPopulation" && !sameVal(cfgOr(prev, k), cfgOr(runCfg, k)); });
+    var moved = Object.keys(LIVE).filter(function (k) { return k !== "maxPopulation" && !sameRun(k, cfgOr(prev, k), cfgOr(runCfg, k)); });
     if (moved.length) liveEdited = true;   /* (the run's history changes only with a value: a stepper clamped at its bound still fires change) */
     if (key !== "maxPopulation" && moved.indexOf(key) < 0) moved.push(key);
     moved.forEach(function (k) {
       var input = el("adv_" + k);
       if (!input || onTheWay(k) || (k !== key && document.activeElement === input)) return;
-      if (!sameVal(input.value, liveNow(k))) input.value = shown(liveNow(k));
+      if (!sameShown(input.value, liveNow(k))) input.value = shown(liveNow(k));
     });
     updateModeline();
     if (!quiet) showNote((LABELS[key] || key) + " is now " + shown(liveNow(key)) + " (live)");
@@ -544,9 +544,34 @@
    * a read of the world's state, ~9 ms at 300 fish, ~90 ms at 6000), after a start, a load and an accepted live value */
   function engineConfig() { return JSON.parse(Module.UTF8ToString(Module._evo_checkpoint())).config || {}; }
   function cfgOr(c, k) { return Object.prototype.hasOwnProperty.call(c, k) ? c[k] : ADV_BY_KEY[k] ? ADV_BY_KEY[k][1] : undefined; }
-  /* a setting's value as the page says it: the engine keeps most as 32-bit floats (1.7 runs as 1.70000005), seven digits show them */
-  function shown(v) { return typeof v === "number" && Number.isFinite(v) && !Number.isInteger(v) ? String(+v.toPrecision(7)) : String(v); }
-  function sameVal(a, b) {
+  /* What evo_set_param keeps of v for live key k (wasm/evo_wasm.cpp): it prints
+   * v with %.9g and reads it back as the field's type, a float32 or a whole
+   * number (a cast). */
+  function engineVal(k, v) {
+    var x = +(+v).toPrecision(9);
+    if (INT_KEYS[k]) return Math.max(-2147483648, Math.min(2147483647, Math.trunc(x)));
+    return Math.fround(x);
+  }
+  /* Two values of live key k are the same run when the engine keeps them as
+   * the same number: decisions (the run's history, the live tweaks the
+   * question counts, what a new world carries over) compare that exactly
+   * (1.5 and 1.5000001 are two runs: 1.5 and 1.50000012 to the engine). */
+  function sameRun(k, a, b) {
+    var x = typeof a === "number" ? a : parseFloat(a), y = typeof b === "number" ? b : parseFloat(b);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return String(a) === String(b);
+    return LIVE[k] ? engineVal(k, x) === engineVal(k, y) : x === y;
+  }
+  /* A value as the page says it (display only): the fewest digits, from seven,
+   * that name the same float32 (1.7 runs as 1.70000005 and is said 1.7;
+   * 1.50000012 is said 1.5000001); whole numbers as they are. */
+  function shown(v) {
+    if (typeof v !== "number" || !Number.isFinite(v) || Number.isInteger(v)) return String(v);
+    var f = Math.fround(v);
+    for (var p = 7; p <= 9; p++) { var t = +v.toPrecision(p); if (Math.fround(t) === f) return String(t); }
+    return String(v);
+  }
+  /* (a field's text and a value that say the same: the field is left as typed) */
+  function sameShown(a, b) {
     var x = typeof a === "number" ? a : parseFloat(a), y = typeof b === "number" ? b : parseFloat(b);
     return Number.isFinite(x) && Number.isFinite(y) ? shown(x) === shown(y) : String(a) === String(b);
   }
@@ -762,7 +787,7 @@
   function liveAtStart(k) { return k === "maxPopulation" ? startCap : cfgOr(startCfg, k); }
   /* the live settings changed since this world started (accepted ones) */
   function liveTweaks() {
-    return Object.keys(LIVE).filter(function (k) { return !sameVal(liveNow(k), liveAtStart(k)); });
+    return Object.keys(LIVE).filter(function (k) { return !sameRun(k, liveNow(k), liveAtStart(k)); });
   }
   function runAge() {
     if (!engineOk()) return 0;
@@ -802,7 +827,7 @@
     } else {
       var list = diff.slice(0, 3).map(fieldText).join(", ") + (diff.length > 3 ? " and " + (diff.length - 3) + " more" : "");
       var kept = [], other = [];
-      tw.forEach(function (k) { var next = x.next(k); (sameVal(next, liveNow(k)) ? kept : other).push([k, next]); });
+      tw.forEach(function (k) { var next = x.next(k); (sameRun(k, next, liveNow(k)) ? kept : other).push([k, next]); });
       msg += (kind === "random" ? " It starts " + x.what + "." + (diff.length ? " What waits for the next start is dropped." : "")
                                 : diff.length ? " It starts with what waits: " + list + "." : "") +
         (kept.length ? " Your live tweak" + s(kept.length) + " (" + mine(keys(kept)) + ") " + (kept.length === 1 ? "carries" : "carry") + " over to the new world." : "") +
