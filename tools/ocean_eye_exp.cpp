@@ -169,7 +169,7 @@ void reachFrom(const NeuralNet& nn, Pred srcs, std::uint32_t& direct, std::uint3
         changed = false;
         for (const auto& fc : nn.flat) {
             const int s = fc.src(), k = fc.sink();
-            const bool on = (s < NUM_SENSES) ? srcs(s) : hid[s - NUM_SENSES];
+            const bool on = (s < NUM_SENSES) ? srcs(s) : s < NUM_SENSES + MAX_INTERNAL_NEURONS && hid[s - NUM_SENSES];
             if (!on) continue;
             if (k < NUM_ACTIONS) any |= 1u << k;
             else if (!hid[k - NUM_ACTIONS]) { hid[k - NUM_ACTIONS] = true; changed = true; }
@@ -207,7 +207,7 @@ struct Wiring {
             }
             if (k == STEER_Z && s >= EYE_UP_PROX && s <= EYE_DOWN_CON) vert = true;
             if (k == STEER_X && s >= EYE_LEFT_PROX && s <= EYE_RIGHT_CON) lr = true;
-            if (fc.weight > 0 && ((s == NEAREST_FOOD_DX && k == STEER_X) || (s == NEAREST_FOOD_DY && k == STEER_Y) ||
+            if (fc.w() > 0.0f && ((s == NEAREST_FOOD_DX && k == STEER_X) || (s == NEAREST_FOOD_DY && k == STEER_Y) ||
                                   (s == NEAREST_FOOD_DZ && k == STEER_Z)))
                 matched = true;
         }
@@ -954,6 +954,15 @@ int main(int argc, char** argv) {
     }
     if (fpOn && fpEvery == 0) fpEvery = every;
 
+    SimConfig checkConfig;
+    OceanConfig checkOcean;
+    std::string configError;
+    if (!ofp::buildConfigs(cfgJson, (float)depth, checkConfig, checkOcean, configError)) {
+        std::fprintf(stderr, "config refused: %s\n", configError.c_str()); return 2;
+    }
+    if (checkConfig.genomeVersion != 1) {
+        std::fprintf(stderr, "ocean_eye_exp: legacy-only diagnostic; genomeVersion=2 is not supported\n"); return 2;
+    }
     OceanWorld w;
     std::string err;
     if (!ofp::initWorld(w, seed, W, H, (float)depth, pop, cfgJson, err)) {

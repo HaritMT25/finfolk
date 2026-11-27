@@ -60,9 +60,9 @@ inline void clusterSketch(const Genome& genome, float out[CLUSTER_SKETCH_DIM]) {
     const auto& planes = clusterproj_detail::sketchPlanes();
     double acc[CLUSTER_SKETCH_DIM] = {};
     for (const Gene& gene : genome) {
-        const int   idx = geneCell(gene);
-        const float w   = gene.weightAsFloat();
-        for (int k = 0; k < CLUSTER_SKETCH_DIM; ++k) acc[k] += w * planes[k][idx];
+        const int   idx = geneCell(gene, genome.schema);
+        const float w   = geneWeight(gene, genome.schema);
+        for (int k = 0; k < CLUSTER_SKETCH_DIM; ++k) acc[k] += w * (idx < STATS_DIM ? planes[k][idx] : biasProjectionPlanes()[19 + k][idx - STATS_DIM]);
     }
     for (int k = 0; k < CLUSTER_SKETCH_DIM; ++k) out[k] = static_cast<float>(acc[k]);
 }

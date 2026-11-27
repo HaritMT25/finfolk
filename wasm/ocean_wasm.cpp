@@ -785,6 +785,10 @@ std::vector<float>  g_wiring;       // 2 * NUM_SENSES * NUM_ACTIONS
 
 EVO_EXPORT int oc_num_senses()  { return NUM_SENSES; }
 EVO_EXPORT int oc_num_actions() { return NUM_ACTIONS; }
+EVO_EXPORT int oc_genome_version() { return g_world ? g_world->cfg.genomeVersion : 1; }
+EVO_EXPORT int oc_bias_genes() { return g_world ? int(g_world->cfg.biasGenes) : 0; }
+EVO_EXPORT int oc_brain_eval_version() { return g_world ? g_world->cfg.brainEvalVersion : 1; }
+EVO_EXPORT int oc_weight_mutation_mode() { return g_world ? int(g_world->cfg.weightMutationMode) : 0; }
 EVO_EXPORT int oc_num_hidden()  { return MAX_INTERNAL_NEURONS; }
 // Comma-separated, in enum order (the engine's ocean::kSensorNames / kActionNames).
 EVO_EXPORT const char* oc_sensor_names() {
@@ -829,7 +833,7 @@ EVO_EXPORT int oc_inspect(int index) {
         g_inspConns[k++] = (float)g.sourceNum;
         g_inspConns[k++] = (g.sinkType == SINK_ACTION) ? 1.0f : 0.0f;
         g_inspConns[k++] = (float)g.sinkNum;
-        g_inspConns[k++] = g.weightAsFloat();
+        g_inspConns[k++] = fc.w();
     }
     return 1;
 }
@@ -938,7 +942,7 @@ EVO_EXPORT int oc_wiring() {
             grew = false;
             for (const auto& fc : c.nnet.flat) {
                 const int src = fc.src(), sink = fc.sink();
-                if (src < S) continue;
+                if (src < S || src >= S + H) continue;
                 const int h = src - S;
                 const std::uint32_t add = sink < A ? (1u << sink) : reach[sink - A];
                 if ((reach[h] | add) != reach[h]) { reach[h] |= add; grew = true; }

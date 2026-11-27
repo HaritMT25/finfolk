@@ -70,9 +70,9 @@ struct Creature : AgentCore {
 
 inline Creature makeRandomCreature(Vec2 pos,
                                    int initMin = GENOME_INITIAL_MIN,
-                                   int initMax = GENOME_INITIAL_MAX) {
+                                   int initMax = GENOME_INITIAL_MAX, BrainSchema schema = {}) {
     Creature c;
-    c.genome = makeRandomGenome(initMin, initMax);
+    c.genome = makeRandomGenome(initMin, initMax, schema);
     c.init(pos);
     return c;
 }

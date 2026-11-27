@@ -163,7 +163,8 @@ inline bool apply(World& world, const Options& o, const std::string& yText,
             }
         } else if (checkpoint::v3::integer(donorVersion, 2, 2)) {
             checkpoint::readConfig(y, yc);
-            if (yc.weightMutationMode != WeightMutationMode::Legacy) {
+            if (yc.weightMutationMode != WeightMutationMode::Legacy || yc.genomeVersion != 1 ||
+                yc.biasGenes || yc.hiddenNeurons != 12 || yc.brainEvalVersion != 1) {
                 error = "predator source formats 1/2 require legacy weight mutation";
                 return false;
             }
@@ -179,7 +180,8 @@ inline bool apply(World& world, const Options& o, const std::string& yText,
             error = std::string("predator source config: ") + why;
             return false;
         }
-        if (yc.weightMutationMode != cfg.weightMutationMode) {
+        if (yc.weightMutationMode != cfg.weightMutationMode || brainSchema(yc) != brainSchema(cfg) ||
+            yc.hiddenNeurons != cfg.hiddenNeurons || yc.brainEvalVersion != cfg.brainEvalVersion) {
             error = "predator source and prey world have different weight mutation policies";
             return false;
         }
@@ -189,7 +191,7 @@ inline bool apply(World& world, const Options& o, const std::string& yText,
         yNext = yw->ullOr("nextPredatorId", 0);
         const jsonm::Value* yp = y.find("predators");
         if (!yp) { error = "predator source has no 'predators'"; return false; }
-        if (!checkpoint::readPredators(*yp, true, yNext, pool, error)) { error = "predator source: " + error; return false; }
+        if (!checkpoint::readPredators(*yp, true, yNext, pool, error, brainSchema(yc))) { error = "predator source: " + error; return false; }
         if (pool.empty() && o.count != 0) { error = "predator source has no predators"; return false; }
         for (const PhysicsKey& k : kPhysics) {
             if (k.economy && !economyMatters) continue;

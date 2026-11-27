@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include "connectivity.hpp"
 #include "genome.hpp"
 
@@ -42,7 +43,7 @@ namespace isolation_detail {
 constexpr int ISO_MAX_GENES = 1024;
 static_assert(GENOME_MAX_LENGTH <= ISO_MAX_GENES,
               "fold buffer is smaller than the structural genome bound");
-static_assert(STATS_DIM <= 65535, "cell index no longer fits in uint16_t");
+static_assert(STATS_V2_DIM <= 65535, "cell index no longer fits in uint16_t");
 
 struct CellWeight {
     std::uint16_t cell;
@@ -74,7 +75,7 @@ inline int foldGenome(const Genome& g, std::uint16_t cells[], float weights[]) {
     CellWeight tmp[ISO_MAX_GENES];
     const int n = (int)std::min<std::size_t>(g.size(), ISO_MAX_GENES);
     for (int i = 0; i < n; ++i) {
-        tmp[i].cell   = (std::uint16_t)geneCell(g[i]);
+        tmp[i].cell   = (std::uint16_t)geneCell(g[i], g.schema);
         tmp[i].weight = g[i].weight;
     }
     std::sort(tmp, tmp + n, cellWeightLess);
@@ -85,7 +86,9 @@ inline int foldGenome(const Genome& g, std::uint16_t cells[], float weights[]) {
         float sum = 0.0f;
         int j = i;
         while (j < n && tmp[j].cell == cell) {
-            sum += (float)tmp[j].weight / 8192.0f;   // == Gene::weightAsFloat()
+            sum += g.schema.genomeVersion == 2
+                ? logweight::decodeValid(logweight::word(tmp[j].weight))
+                : (float)tmp[j].weight / 8192.0f;   // == Gene::weightAsFloat()
             ++j;
         }
         cells[m]   = cell;
@@ -107,6 +110,7 @@ inline int foldGenome(const Genome& g, std::uint16_t cells[], float weights[]) {
 // merge below visits cells in ascending order either way — so both calls sum
 // the identical sequence of identical terms.
 inline float genomeDistanceSq(const Genome& a, const Genome& b) {
+    if (a.schema != b.schema) return std::numeric_limits<float>::infinity();
     using namespace isolation_detail;
     std::uint16_t ca[ISO_MAX_GENES], cb[ISO_MAX_GENES];
     float wa[ISO_MAX_GENES], wb[ISO_MAX_GENES];

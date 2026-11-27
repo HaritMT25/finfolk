@@ -23,8 +23,10 @@
 #include "predator.hpp"
 #include "random.hpp"
 #include "repro_graph.hpp"
+#include "brain_conversion.hpp"
 
 struct WorldCommon {
+    BrainConversion brainConversion;
     unsigned long long frame = 0;
     int births = 0;          // this-frame only; reset every update()
     int deaths = 0;          // this-frame only; reset every update()

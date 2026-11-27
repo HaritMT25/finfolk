@@ -330,7 +330,7 @@ inline bool sensorReachesAction(const NeuralNet& nn, int s, int a) {
         changed = false;
         for (const NeuralNet::FlatConn& fc : nn.flat) {
             const int src = fc.src(), sink = fc.sink();
-            const bool on = (src == s) || (src >= NUM_SENSES && reach[src - NUM_SENSES]);
+            const bool on = (src == s) || (src >= NUM_SENSES && src < NUM_SENSES + MAX_INTERNAL_NEURONS && reach[src - NUM_SENSES]);
             if (!on) continue;
             if (sink == a) return true;
             if (sink >= NUM_ACTIONS && !reach[sink - NUM_ACTIONS]) {
@@ -572,6 +572,7 @@ public:
 
     // Set cfg and ocfg first (ocfg.depth is overwritten by `depth`).
     void init(int w, int h, float depth, int numCreatures) {
+        brainConversion = {};
         if (ocfg.walls) cfg.toroidal = false;   // glass walls never wrap (the validated paths refuse both)
         appearanceInit();   // first: its key reads a COPY of the engine before any draw
         bodyPlanInit();     // its key is the appearance key's, salted (no draw)
@@ -984,7 +985,7 @@ private:
         Vec2 pos = {rng.range(10.0f, (float)width - 10.0f),
                     rng.range(10.0f, (float)height - 10.0f)};
         const float z = rng.range(0.0f, D);
-        creatures.push_back(makeRandomFish(pos, z, D, cfg.genomeInitMin, cfg.genomeInitMax));
+        creatures.push_back(makeRandomFish(pos, z, D, cfg.genomeInitMin, cfg.genomeInitMax, brainSchema(cfg)));
         if (ocfg.walls) containBody(creatures.back());   // its trail laid out behind it stays inside
         markFounder(creatures.back());
         if (appearanceOn()) appearanceAppendFounder();
