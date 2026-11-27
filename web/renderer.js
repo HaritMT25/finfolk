@@ -1450,12 +1450,44 @@
   /* The frame loop. The next frame is asked for first, so a frame that throws
    * never stops the loop; an engine trap (a WebAssembly.RuntimeError: the
    * module's abort, an out-of-bounds access) stops the engine instead of
-   * freezing the page silently (engineStopped), as the Ocean's frame does. */
+   * freezing the page silently (engineStopped), as the Ocean's frame does.
+   * Any other error (the picture's, the page's) is said once (frameFailed):
+   * the picture falls back a step (the tank to the flat view, WebGL to canvas
+   * 2D) and the next frame tries again; with no step left, the frame is tried
+   * once a second until it works again, and then says so. */
+  var frameFault = null;   /* {at, retrying}: the frame threw (not the engine) */
   function frame(now) {
     requestAnimationFrame(frame);
     if (!engineOk()) return;   /* (stopped: nothing more is stepped or read) */
+    if (frameFault && now - frameFault.at < 1000) return;
     try { frameBody(now); }
-    catch (err) { if (err instanceof WebAssembly.RuntimeError) { engineStopped(err); return; } throw err; }
+    catch (err) {
+      if (err instanceof WebAssembly.RuntimeError) { engineStopped(err); return; }
+      frameFailed(err, now);
+      return;
+    }
+    if (frameFault) {
+      var retried = frameFault.retrying;
+      frameFault = null;
+      if (retried) showNote("The picture is back.");   /* (a fallback that drew at once said what it is) */
+    }
+  }
+  function frameFailed(err, now) {
+    var why = String(err && err.message || err), prev = frameFault;
+    if (!prev) console.error("evo_boids: a frame failed (" + why + ")", err);
+    if (view3d) {   /* the next frame, in the flat view */
+      frameFault = { at: -Infinity, retrying: false };
+      try { setView(false); } catch (e) { view3d = false; document.body.classList.remove("view-3d"); }
+      showError("The tank view failed (" + why + "), so this is the flat view now.");
+    } else if (glScene) {   /* the next frame, in canvas 2D (circles: no fish shapes) */
+      frameFault = { at: -Infinity, retrying: false };
+      glScene = null;
+      LOOK.fishShape = false;
+      showError("WebGL drawing failed (" + why + "), so the world is drawn with canvas 2D now.");
+    } else {   /* no step left: once a second, said once */
+      frameFault = { at: now, retrying: true };
+      if (!prev || !prev.retrying) showError("Drawing the world failed (" + why + "); the page tries again once a second.");
+    }
   }
   /* the engine trapped: nothing more is stepped, read or started, and the page says so, with the way on (Reload) */
   var engineDown = false;
