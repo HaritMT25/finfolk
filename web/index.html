@@ -141,63 +141,23 @@
     box-shadow: var(--shadow);
   }
 
-  /* ---------- top bar: live readout + tools ---------- */
-  #topbar {
-    position: fixed; z-index: var(--z-hud);
-    top: calc(10px + var(--safe-t)); left: 10px; right: 10px;
-    display: flex; justify-content: space-between; align-items: flex-start; gap: 8px;
-    pointer-events: none;
-  }
-  #topbar > * { pointer-events: auto; }
-  #readout {
-    display: inline-flex; align-items: center; gap: 10px;
-    min-height: 44px; max-width: calc(100vw - 132px - var(--worlds-w) - 8px);
-    padding: 0 14px 0 10px;
-    border-radius: 999px;
-    font-size: 13px; color: var(--ink-2); text-align: left;
-    white-space: nowrap; overflow: hidden;
-  }
-  #readout .mark { display: inline-flex; align-items: center; gap: 6px; color: var(--ink); font-family: var(--mono); font-size: 13px; }
-  #readout .mark svg { width: 20px; height: 20px; }
-  #readout .mark span { display: none; }
-  #readout b { color: var(--ink); font-weight: 600; }
-  #readout .sep { width: 1px; height: 16px; background: var(--line); }
-  #readout .warn { color: var(--ember); }
+  /* ---------- top bar: live readout, the world switch, tools ----------
+   * The bars (the top bar, the dock, toasts) are both pages' one system,
+   * web/ui_common.css: the same switch as web/ocean.html's (3-D Ocean, the
+   * world with depth, and 2-D Classic, this flat world: the tank view and the
+   * flat view, in the settings, are two pictures of it; the current world is
+   * not a link, so pressing it never restarts the run), the same run state.
+   * Here, only this page's own parts: the room the switch and the tools take
+   * (the readout's cap), the governed-run dot. */
+  #topbar { --worlds-w: 120px; --tools-w: 98px; }
+  @media (pointer: coarse) { #topbar { --worlds-w: 128px; --tools-w: 106px; } }
+  @media (min-width: 760px) { #topbar { --worlds-w: 236px; } }
+  @media (min-width: 760px) and (pointer: coarse) { #topbar { --worlds-w: 244px; } }
+  @media (min-width: 960px) { #topbar { --tools-w: 166px; } }
+  @media (min-width: 960px) and (pointer: coarse) { #topbar { --tools-w: 176px; } }
   /* the frame budget changed this run: it no longer replays from its seed */
   #ro-gov { width: 8px; height: 8px; flex: none; border-radius: 50%; background: var(--ember); }
   #ro-gov[hidden] { display: none; }
-  /* The two worlds, the same switch on both pages (web/ocean.html has its
-   * twin): 3-D Ocean, the world with depth, and 2-D Classic, this flat world
-   * (the tank view and the flat view, in the settings, are two pictures of
-   * it). Beside the readout; the current world is not a link, so pressing it
-   * never restarts the run. */
-  :root { --worlds-w: 90px; }
-  #worlds {
-    display: inline-flex; flex: none; gap: 2px; margin-right: auto;
-    height: 44px; padding: 3px; border-radius: 999px;
-    font-size: 13px; font-weight: 600; line-height: 1;
-  }
-  @media (pointer: coarse) { #worlds { height: 50px; } }   /* 44 px to tap */
-  /* a phone: the frame rate stays in the live numbers' panel */
-  @media (max-width: 479px) { #readout .ro-rate { display: none; } }
-  #worlds .seg {
-    display: inline-flex; align-items: center; gap: 5px;
-    padding: 0 9px; border-radius: 999px;
-    color: var(--ink-2); text-decoration: none; white-space: nowrap;
-    transition: background-color 150ms var(--ease), color 150ms var(--ease);
-  }
-  #worlds a.seg:hover { background: var(--surface-3); color: var(--ink); }
-  #worlds .seg[aria-current] { cursor: default; }
-  #worlds .w3[aria-current] { background: oklch(0.70 0.11 235 / 0.24); color: oklch(0.84 0.09 235); }
-  #worlds .w2[aria-current] { background: var(--plankton-soft); color: var(--plankton); }
-  #worlds .long { display: none; }
-  @media (min-width: 760px) {
-    :root { --worlds-w: 196px; }
-    #worlds .seg { padding: 0 13px; }
-    #worlds .long { display: inline; }
-  }
-  #tools { display: flex; gap: 6px; padding: 0; border-radius: 999px; }
-  #tools .icon-btn { width: 48px; height: 48px; }
 
   #statpanel {
     position: fixed; z-index: var(--z-hud);
@@ -217,25 +177,8 @@
   #statpanel .notes { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--line-soft); color: var(--ink-2); line-height: 1.5; }
   #statpanel .notes p + p { margin-top: 4px; }
 
-  /* ---------- playback dock ---------- */
-  #dock {
-    position: fixed; z-index: var(--z-dock);
-    left: 50%; bottom: var(--dock-b);
-    transform: translateX(-50%);
-    width: min(calc(100vw - 20px), 400px);
-    height: var(--dock-h);
-    display: flex; align-items: center; justify-content: space-between; gap: 2px;
-    padding: 0 6px;
-    border-radius: 999px;
-    transition: transform 260ms var(--ease), opacity 200ms var(--ease);
-  }
-  #dock .speed { display: flex; align-items: center; }
-  #dock .speed .icon-btn { width: 38px; }
-  #speedlabel { min-width: 3.2em; text-align: center; font-family: var(--mono); font-size: 14px; color: var(--ink); }
-  #pausebtn { color: var(--ink); background: var(--surface-3); }
-  #turbobtn { width: auto; padding: 0 12px; gap: 6px; border-radius: 999px; font-size: 13px; font-weight: 600; color: var(--ink-2); display: inline-flex; }
-  #turbobtn[aria-pressed="true"] { background: var(--ember-soft); color: var(--ember); }
-  #turbobtn span { display: none; }
+  /* ---------- playback dock (its look: web/ui_common.css) ----------
+   * two groups: time (pause, speed, Turbo) | the world and the view (randomize, fit the tank) */
   body.sheet-open #dock { transform: translateX(-50%) translateY(140%); opacity: 0; pointer-events: none; }
 
   /* ---------- fit-to-screen and toasts ---------- */
@@ -247,28 +190,7 @@
   #fitbtn[hidden] { display: none; }
   /* out of the fish card's way; closing the card brings the button back */
   body.card-open #fitbtn { display: none; }
-  #toasts {
-    position: fixed; z-index: var(--z-toast);
-    left: 50%; transform: translateX(-50%);
-    bottom: calc(var(--dock-b) + var(--dock-h) + 12px);
-    width: min(calc(100vw - 24px), 440px);
-    display: flex; flex-direction: column; gap: 8px; align-items: center;
-    pointer-events: none;
-  }
-  @media (max-width: 599px) {
-    /* phones: under the top bar, clear of the fish card and the dock */
-    #toasts { top: calc(66px + var(--safe-t)); bottom: auto; }
-  }
-  .toast {
-    padding: 10px 14px; border-radius: var(--r-md);
-    background: var(--surface-2); border: 1px solid var(--line);
-    box-shadow: var(--shadow);
-    font-size: 13px; color: var(--ink); line-height: 1.4;
-    animation: toast-in 220ms var(--ease);
-  }
-  .toast.error { border-color: var(--ember); }
-  .toast.out { opacity: 0; transform: translateY(6px); transition: opacity 200ms, transform 200ms; }
-  @keyframes toast-in { from { opacity: 0; transform: translateY(8px); } }
+  /* (toasts: both pages' captions, web/ui_common.css) */
 
   /* ---------- the selected fish ----------
    * The fish card, in every view (the tank, the flat view in WebGL or canvas
@@ -631,8 +553,6 @@
 
   /* ---------- larger screens ---------- */
   @media (min-width: 600px) {
-    #readout .mark span { display: inline; }
-    #turbobtn span { display: inline; }
     #fishcard { left: auto; right: 16px; width: 380px; }
     #fishcard.flip { left: 16px; right: auto; top: auto; bottom: calc(var(--dock-b) + var(--dock-h) + 10px); }
     #dgrid { grid-template-columns: repeat(auto-fill, minmax(440px, 1fr)); padding: 14px 16px 28px; gap: 14px; }
@@ -656,7 +576,6 @@
     body.sheet-open #stage, body.sheet-open #turbo { right: 406px; }
     body.sheet-open #dock { transform: translateX(calc(-50% - 200px)); opacity: 1; pointer-events: auto; }
     body.sheet-open #fishcard { right: 416px; }
-    body.sheet-open #tools { margin-right: 400px; }
     body.sheet-open #toasts { transform: translateX(calc(-50% - 200px)); }
     #fishcard, #fishcard.flip { top: calc(76px + var(--safe-t)); bottom: auto; max-height: calc(100dvh - 180px); }
     #fishcard.expanded .fc-brain .inet { height: 320px; }
@@ -693,6 +612,7 @@
     <symbol id="i-follow" viewBox="0 0 24 24"><circle cx="12" cy="12" r="6.5"/><circle cx="12" cy="12" r="2" fill="currentColor" stroke="none"/><path d="M12 2.5v3M12 18.5v3M2.5 12h3M18.5 12h3"/></symbol>
     <symbol id="i-frame" viewBox="0 0 24 24"><path d="M4 9V5.5A1.5 1.5 0 0 1 5.5 4H9M15 4h3.5A1.5 1.5 0 0 1 20 5.5V9M20 15v3.5a1.5 1.5 0 0 1-1.5 1.5H15M9 20H5.5A1.5 1.5 0 0 1 4 18.5V15"/></symbol>
     <symbol id="i-chevron" viewBox="0 0 24 24"><path d="m6 15 6-6 6 6"/></symbol>
+    <symbol id="i-out" viewBox="0 0 24 24"><path d="M10 5.5H6.5a1.5 1.5 0 0 0-1.5 1.5v10.5a1.5 1.5 0 0 0 1.5 1.5H17a1.5 1.5 0 0 0 1.5-1.5V14"/><path d="M13.5 4.5h6v6M19.5 4.5 11 13"/></symbol>
   </svg>
 
   <div id="stage"><canvas id="canvas" width="1920" height="1080" aria-label="the simulated ocean: click or tap a fish to inspect it"></canvas></div>
@@ -708,12 +628,12 @@
       <span id="ro-gov" hidden title="the frame budget changed this run: it no longer replays from its seed"><span class="sr">governed run</span></span>
     </button>
     <nav id="worlds" class="chip-surface" aria-label="world">
-      <a class="seg w3" id="to3d" href="ocean.html" title="3-D Ocean: fish that sense depth and steer in it (opens here; this run stops)">3-D<span class="long"> Ocean</span></a>
+      <a class="seg w3" id="to3d" href="ocean.html" title="3-D Ocean: fish that sense depth and steer in it (opens here; this run stops)">3-D<span class="long"> Ocean</span><svg class="i out" aria-hidden="true"><use href="#i-out"/></svg></a>
       <span class="seg w2" aria-current="page" title="2-D Classic: the original flat world (this page; its tank and flat views are in the settings)">2-D<span class="long"> Classic</span></span>
     </nav>
     <div id="tools" class="chip-surface">
       <button id="dashbtn" class="icon-btn" aria-label="dashboards: charts of this run" aria-expanded="false" title="Dashboards"><svg class="i"><use href="#i-chart"/></svg></button>
-      <button id="menubtn" class="icon-btn" aria-label="settings" aria-expanded="false" aria-controls="drawer" title="Settings"><svg class="i"><use href="#i-sliders"/></svg></button>
+      <button id="menubtn" class="icon-btn" aria-label="settings" aria-expanded="false" aria-controls="drawer" title="Settings"><svg class="i"><use href="#i-sliders"/></svg><span>Settings</span></button>
     </div>
   </header>
   <div id="statpanel" class="chip-surface" hidden aria-live="off"></div>
@@ -749,6 +669,7 @@
       <button id="faster" class="icon-btn" title="Faster (↑)" aria-label="faster"><svg class="i"><use href="#i-plus"/></svg></button>
     </div>
     <button id="turbobtn" class="icon-btn" aria-pressed="false" title="Turbo: run headless in a worker at full speed"><svg class="i"><use href="#i-bolt"/></svg><span>Turbo</span></button>
+    <span class="dock-sep" aria-hidden="true"></span>
     <button id="randombtn" class="icon-btn" title="Randomize: a new world from tested ranges" aria-label="randomize the world"><svg class="i"><use href="#i-dice"/></svg></button>
     <button id="viewbtn" class="icon-btn only-3d" title="Fit the view (C)" aria-label="fit the view"><svg class="i"><use href="#i-frame"/></svg></button>
   </nav>

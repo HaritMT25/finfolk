@@ -150,79 +150,18 @@
     box-shadow: var(--shadow);
   }
 
-  /* ---------- top bar: live readout + tools ---------- */
-  #topbar {
-    position: fixed; z-index: var(--z-hud);
-    top: calc(10px + var(--safe-t)); left: 10px; right: 10px;
-    display: flex; justify-content: space-between; align-items: flex-start; gap: 8px;
-    pointer-events: none;
-  }
-  #topbar > * { pointer-events: auto; }
-  #readout {
-    display: inline-flex; align-items: center; gap: 10px;
-    min-height: 44px; max-width: calc(100vw - 196px - var(--worlds-w));
-    padding: 0 14px 0 10px;
-    border-radius: 999px;
-    font-size: 13px; color: var(--ink-2); text-align: left;
-    white-space: nowrap; overflow: hidden;
-  }
-  #readout .mark { display: inline-flex; align-items: center; gap: 6px; color: var(--ink); font-family: var(--mono); font-size: 13px; }
-  #readout .mark svg { width: 20px; height: 20px; color: var(--deep); }
-  #readout .mark span { display: none; }
-  #readout b { color: var(--ink); font-weight: 600; }
-  /* The two worlds, the same switch on both pages (web/index.html has its
-   * twin): 3-D Ocean, the world with depth, and 2-D Classic, the flat world
-   * (which Classic draws as a tank or flat). Beside the readout; the current
-   * world is not a link, so pressing it never restarts the run. */
-  :root { --worlds-w: 108px; }
-  #worlds {
-    display: inline-flex; flex: none; gap: 2px; margin-right: auto;
-    height: 44px; padding: 3px; border-radius: 999px;
-    font-size: 13px; font-weight: 600; line-height: 1;
-  }
-  @media (pointer: coarse) { #worlds { height: 50px; } }   /* 44 px to tap */
-  /* a phone: the frame rate stays in the live numbers' panel */
-  @media (max-width: 479px) { #readout .ro-rate { display: none; } }
-  #worlds .seg {
-    display: inline-flex; align-items: center; gap: 5px;
-    padding: 0 9px; border-radius: 999px;
-    color: var(--ink-2); text-decoration: none; white-space: nowrap;
-    transition: background-color 150ms var(--ease), color 150ms var(--ease);
-  }
-  #worlds a.seg:hover { background: var(--surface-3); color: var(--ink); }
-  #worlds .seg[aria-current] { cursor: default; }
-  #worlds .w3[aria-current] { background: oklch(0.70 0.11 235 / 0.24); color: oklch(0.84 0.09 235); }
-  #worlds .w2[aria-current] { background: var(--plankton-soft); color: var(--plankton); }
-  #worlds .long { display: none; }
-  /* 2-D Classic is another page: the arrow says it leaves this one */
-  svg.i.out { width: 13px; height: 13px; stroke-width: 2; opacity: 0.8; }
-  @media (min-width: 760px) {
-    :root { --worlds-w: 222px; }
-    #worlds .seg { padding: 0 13px; }
-    #worlds .long { display: inline; }
-  }
-  /* a phone: the switch moves into the live numbers' panel (#worlds-alt), freeing the top bar */
-  #worlds-alt { display: none; margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line-soft); align-items: center; gap: 10px; }
-  #worlds-alt .btn { flex: none; min-height: 40px; padding: 0 12px; text-decoration: none; }
-  #worlds-alt span { font-size: 12px; color: var(--ink-3); line-height: 1.4; }
-  @media (max-width: 599px) {
-    :root { --worlds-w: 0px; }
-    #worlds { display: none; }
-    #worlds-alt { display: flex; }
-  }
-  #readout .sep { width: 1px; height: 16px; background: var(--line); }
-  /* the run's state: Live, Paused, Turbo (starting, running, stopping); a phone shows its dot only */
-  .runstate { display: inline-flex; align-items: center; gap: 5px; flex: none; height: 22px; padding: 0 8px; border-radius: 999px;
-              background: var(--surface-3); color: var(--ink-2); font-size: 12px; font-weight: 600; }
-  .runstate::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--plankton); }
-  .runstate[data-s="paused"]::before { background: var(--ink-3); border-radius: 1px; }
-  .runstate[data-s="entering"], .runstate[data-s="turbo"], .runstate[data-s="exiting"] { background: var(--ember-soft); color: var(--ember); }
-  .runstate[data-s="entering"]::before, .runstate[data-s="turbo"]::before, .runstate[data-s="exiting"]::before { background: var(--ember); }
-  @media (max-width: 479px) { .runstate { padding: 0 6px; } .runstate .rs-word { display: none; } }
-  #readout .warn { color: var(--ember); }
+  /* ---------- top bar: live readout, the world switch, tools ----------
+   * The bars (the top bar, the dock, the keys line, the coach mark, toasts) are
+   * both pages' one system, web/ui_common.css; here, only this page's own
+   * parts: the room the switch and the tools take (the readout's cap), the
+   * depth reading. */
+  #topbar { --worlds-w: 120px; --tools-w: 140px; }
+  @media (pointer: coarse) { #topbar { --worlds-w: 128px; --tools-w: 152px; } }
+  @media (min-width: 760px) { #topbar { --worlds-w: 236px; } }
+  @media (min-width: 760px) and (pointer: coarse) { #topbar { --worlds-w: 244px; } }
+  @media (min-width: 960px) { #topbar { --tools-w: 192px; } }
+  @media (min-width: 960px) and (pointer: coarse) { #topbar { --tools-w: 204px; } }
   #readout .ro-depth { display: none; }
-  #tools { display: flex; gap: 6px; padding: 0; border-radius: 999px; }
-  #tools .icon-btn { width: 48px; height: 48px; }
 
   #statpanel {
     position: fixed; z-index: var(--z-hud);
@@ -250,77 +189,27 @@
   #hist .track { position: relative; height: 8px; border-radius: 2px; background: oklch(0.32 0.03 200 / 0.6); overflow: hidden; }
   #hist .bar { position: absolute; left: 0; top: 0; bottom: 0; width: 0; border-radius: 2px; transition: width 240ms var(--ease); }
 
-  /* ---------- playback dock ---------- */
-  #dock {
-    position: fixed; z-index: var(--z-dock);
-    left: 50%; bottom: var(--dock-b);
-    transform: translateX(-50%);
-    width: max-content; max-width: calc(100vw - 20px);
-    height: var(--dock-h);
-    display: flex; align-items: center; justify-content: space-between; gap: 2px;
-    padding: 0 6px;
-    border-radius: 999px;
-    transition: transform 260ms var(--ease), opacity 200ms var(--ease);
-  }
-  /* two groups: time (pause, one step while paused, speed, Turbo) | watch (flashlight, View, fit the tank) */
-  #dock .dock-sep { flex: none; width: 1px; height: 26px; margin: 0 4px; background: var(--line-soft); }
+  /* ---------- playback dock (its look: web/ui_common.css) ----------
+   * two groups: time (pause, one step while paused, speed, Turbo) | watch (flashlight, View, fit the tank) */
   #stepbtn[hidden] { display: none; }
-  #dock .speed { display: flex; align-items: center; }
-  #dock .speed .icon-btn { width: 38px; }
-  #speedlabel { min-width: 3.2em; text-align: center; font-family: var(--mono); font-size: 14px; color: var(--ink); }
-  #speedlabel.capped { color: var(--beam); transform: translateY(-5px); }   /* Hold 60 fps runs fewer steps than asked */
-  /* ... and the caption under it says how many, on any screen (the title only shows to a mouse) */
-  #dock .speed { position: relative; }
-  #speedcap { position: absolute; left: 50%; bottom: 5px; transform: translateX(-50%); white-space: nowrap; pointer-events: none;
-              font-size: 10px; line-height: 1; font-weight: 600; color: var(--beam); }
+  /* Hold 60 fps runs fewer steps than asked: the label lifts, and the caption under it (#speedcap) says how many,
+   * on any screen (the title only shows to a mouse) */
   #speedcap[hidden] { display: none; }
-  #pausebtn { color: var(--ink); background: var(--surface-3); }
-  #turbobtn { width: auto; padding: 0 12px; gap: 6px; border-radius: 999px; font-size: 13px; font-weight: 600; color: var(--ink-2); display: inline-flex; justify-content: center; }
-  #turbobtn[aria-pressed="true"] { background: var(--ember-soft); color: var(--ember); }
-  #turbobtn span, #viewmenubtn span, #viewmenubtn .caret { display: none; }
-  #lightbtn[aria-pressed="true"] { background: var(--beam-soft); color: var(--beam); }
-  /* View: its own icon and (wider screens) its name, so it doesn't read as "more light" */
-  #viewmenubtn .caret { width: 14px; height: 14px; transition: transform 200ms var(--ease); }
-  #viewmenubtn[aria-expanded="true"] .caret { transform: rotate(180deg); }
   body.sheet-open #dock { transform: translateX(-50%) translateY(140%); opacity: 0; pointer-events: none; }
   /* Turbo is a mode of the time group: pause, step, speed and Turbo give way to its strip (Stop, a
    * population sparkline, its numbers); the watch group stays */
   body.turbo-on #pausebtn, body.turbo-on #stepbtn, body.turbo-on #dock .speed, body.turbo-on #turbobtn { display: none; }
-  #turbo-strip { display: flex; align-items: center; gap: 8px; min-width: 0; padding-right: 4px; }
   #turbo-strip[hidden] { display: none; }
-  #turboexit { width: auto; padding: 0 14px 0 10px; gap: 6px; border-radius: 999px; display: inline-flex; justify-content: center;
-               background: var(--ember-soft); color: var(--ember); font-size: 13px; font-weight: 650; }
-  #turboexit:hover { background: oklch(0.72 0.18 38 / 0.26); color: var(--ember); }
   #turboexit:disabled { opacity: 0.7; }
-  #turboexit svg.i { width: 18px; height: 18px; }
-  #turbo-sparkline { width: 64px; height: 24px; flex: none; }
-  .ts-nums { display: flex; align-items: baseline; gap: 10px; font-size: 12px; color: var(--ink-3); white-space: nowrap; }
-  .ts-nums b { font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: 13px; color: var(--ink); font-weight: 600; }
   @media (max-width: 759px) { .ts-nums .ts-steps { display: none; } }
-  /* short of room (a long run's counters), the numbers give way: they
-   * clip, and Stop (Cancel) and the sparkline (flex: none) never leave the dock */
-  .ts-nums { min-width: 0; overflow: hidden; }
 
-  /* ---------- the keys: one line beside the dock for what is on screen now (a wide screen with a mouse); Help has them all ---------- */
-  #keys {
-    position: fixed; z-index: var(--z-hud);
-    left: 12px; bottom: var(--dock-b);
-    max-width: calc(50vw - 290px - 24px);
-    padding: 7px 12px; border-radius: var(--r-md);
-    font-size: 12px; line-height: 1.8; color: var(--ink-3);
-    display: none;
-  }
-  #keys kbd, .pop kbd, #coach kbd {
+  /* ---------- the keys: one line beside the dock for what is on screen now (a wide screen with a mouse); Help has them all.
+   * Its look and its show / hide rules: web/ui_common.css ---------- */
+  .pop kbd, #coach kbd {
     display: inline-block; min-width: 1.6em; margin-right: 2px; padding: 0 4px;
     border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 4px;
     background: var(--surface-2); color: var(--ink); text-align: center;
     font: 11px/1.45 var(--mono);
-  }
-  #keys .k { display: inline-block; white-space: nowrap; margin-right: 12px; }   /* lines break between keys only */
-  #keys .k:last-child { margin-right: 0; }
-  @media (min-width: 1100px) and (min-height: 561px) and (pointer: fine) {
-    #keys { display: block; }
-    body.sheet-open #keys, body.help-open #keys { display: none; }
   }
 
   /* ---------- popovers: View (above the dock), Help (below the top bar); the Turbo coach mark ---------- */
@@ -357,9 +246,10 @@
   #helppop .k { display: inline-block; white-space: nowrap; margin: 2px 12px 2px 0; }
   #helppop .touchhint { display: none; margin: 4px 0 2px; color: var(--ink); }
   @media (pointer: coarse) { #helppop .touchhint { display: block; } }
+  /* (the coach mark's shell, its place above the dock and its arrow's colours: web/ui_common.css) */
   #coach {
     position: fixed; z-index: var(--z-pop);
-    bottom: calc(var(--dock-b) + var(--dock-h) + 14px); left: 10px;
+    left: 10px;
     width: min(300px, calc(100vw - 20px));
     padding: 12px 14px; border-radius: var(--r-md);
     font-size: 13px; color: var(--ink-2); line-height: 1.45;
@@ -371,7 +261,6 @@
   #coach::after {   /* points at the Turbo button */
     content: ""; position: absolute; bottom: -7px; left: var(--arrow-x, 50%);
     width: 12px; height: 12px; margin-left: -6px; transform: rotate(45deg);
-    background: var(--surface); border-right: 1px solid var(--line-soft); border-bottom: 1px solid var(--line-soft);
   }
 
   /* ---------- fit-to-screen and toasts ---------- */
@@ -382,27 +271,7 @@
   }
   #fitbtn[hidden] { display: none; }
   body.card-open #fitbtn, body.stat-open #fitbtn { display: none; }   /* it would sit over the card's or the live numbers' top */
-  #toasts {
-    position: fixed; z-index: var(--z-toast);
-    left: 50%; transform: translateX(-50%);
-    bottom: calc(var(--dock-b) + var(--dock-h) + 12px);
-    width: min(calc(100vw - 24px), 440px);
-    display: flex; flex-direction: column; gap: 8px; align-items: center;
-    pointer-events: none;
-  }
-  @media (max-width: 599px) {
-    #toasts { top: calc(66px + var(--safe-t)); bottom: auto; }
-  }
-  .toast {
-    padding: 10px 14px; border-radius: var(--r-md);
-    background: var(--surface-2); border: 1px solid var(--line);
-    box-shadow: var(--shadow);
-    font-size: 13px; color: var(--ink); line-height: 1.4;
-    animation: toast-in 220ms var(--ease);
-  }
-  .toast.error { border-color: var(--ember); }
-  .toast.out { opacity: 0; transform: translateY(6px); transition: opacity 200ms, transform 200ms; }
-  @keyframes toast-in { from { opacity: 0; transform: translateY(8px); } }
+  /* (toasts: both pages' captions, web/ui_common.css) */
 
   /* ---------- the selected fish ----------
    * Bottom of a narrow screen, the right of a wider one; .flip moves it to
@@ -635,11 +504,12 @@
   .panel .staging-banner[hidden] { display: none; }
   .staging-banner span { flex: 1 1 200px; min-width: 0; overflow-wrap: anywhere; font-size: 12px; line-height: 1.4; color: var(--ink-2); }
   .panel .staging-banner .btn { width: auto; margin-left: auto; }
-  /* the readout: edits waiting for the next start */
-  #waitingcount { flex: none; height: 22px; padding: 0 8px; border-radius: 999px; background: var(--beam-soft); color: var(--beam);
-                  font-size: 12px; font-weight: 600; line-height: 22px; }
+  /* the readout: edits waiting for the next start (a neutral pill beside the run's state: in the bars, yellow is the
+   * flashlight's alone) */
+  #waitingcount { flex: none; height: 28px; padding: 0 11px; border-radius: 999px; background: var(--surface-2); color: var(--ink-2);
+                  font-size: 12px; font-weight: 600; line-height: 28px; }
   #waitingcount[hidden] { display: none; }
-  @media (max-width: 479px) { #waitingcount { padding: 0 6px; } #waitingcount .wc-word { display: none; } }
+  @media (max-width: 479px) { #waitingcount { padding: 0 8px; } #waitingcount .wc-word { display: none; } }
 
   /* ---------- Turbo's Stop where the dock is covered: a narrow screen's setup sheet, the charts ---------- */
   .turbo-bar { display: flex; align-items: center; gap: 10px; padding: 6px 12px 6px 16px; font-size: 13px; color: var(--ember);
@@ -805,11 +675,7 @@
 
   /* ---------- larger screens ---------- */
   @media (min-width: 600px) {
-    #readout .mark span { display: inline; }
     #readout .ro-depth { display: inline; }
-    #turbobtn span, #viewmenubtn span { display: inline; }
-    #viewmenubtn { width: auto; padding: 0 10px 0 12px; gap: 6px; display: inline-flex; align-items: center; font-size: 13px; font-weight: 600; }
-    #viewmenubtn .caret { display: block; }
     #fishcard { left: auto; right: 16px; width: 380px; }
     #fishcard.flip { left: 16px; right: auto; top: auto; bottom: calc(var(--dock-b) + var(--dock-h) + 10px); }
     #dgrid { grid-template-columns: repeat(auto-fill, minmax(440px, 1fr)); padding: 14px 16px 28px; gap: 14px; }
@@ -820,39 +686,11 @@
     .dcard .cbox.xtall { height: 700px; }
   }
   @media (max-width: 599px) {
-    #dock { width: calc(100vw - 20px); }
-    /* the dock's own buttons give way (from 44 px, 40 up to 420, down to 34)
-     * so it fits paused too, with the step button: at full size it overflowed
-     * from 371 to 387 px and from 421 to 443 */
-    #dock > .icon-btn { width: 44px; flex: 0 1 auto; min-width: 34px; }
-    #dock > #turbobtn { padding: 0; }   /* its word is hidden here */
     #viewpop { right: 10px; width: auto; }
-    /* Turbo's strip on a phone: Stop (its icon, 44 px), the sparkline, generation and rate (the fish are in the readout) */
-    #turboexit { width: 44px; padding: 0; }
-    #turboexit .ts-word, .ts-nums .ts-pop { display: none; }
-    #turbo-strip { gap: 6px; flex: 1 1 auto; }
-    .ts-nums { gap: 8px; }
   }
-  @media (max-width: 370px) { #turbo-sparkline { display: none; } }
-  @media (max-width: 420px) {
-    #dock { padding: 0 3px; }
-    #dock .speed .icon-btn { width: 32px; }
-    #speedlabel { min-width: 2.6em; }
-    #dock > .icon-btn { width: 40px; }
-    #dock .dock-sep { margin: 0 2px; }
-  }
-  /* a 320-370 px phone: the dock fits paused too (eight buttons with the
-   * step), the live numbers keep their room beside the three tools, and
-   * Fish colours' three buttons take their own row */
+  /* (a phone's dock, its Turbo strip and a 320-370 px phone's readout: web/ui_common.css) Fish colours' three buttons
+   * take their own row there */
   @media (max-width: 370px) {
-    #dock { gap: 0; }
-    #dock > .icon-btn { width: 34px; }
-    #dock .speed .icon-btn { width: 26px; }
-    #speedlabel { min-width: 2.2em; }
-    #dock .dock-sep { margin: 0 1px; }
-    #tools .icon-btn { width: 44px; height: 44px; }
-    #readout { max-width: calc(100vw - 174px); gap: 6px; padding: 0 10px; }
-    #readout .mark, #readout .sep { display: none; }
     .vrow .seg3 { grid-column: 1 / -1; justify-self: start; }
   }
   @media (min-width: 960px) {
@@ -868,7 +706,6 @@
     /* beside the panel: centred in the screen less its 400 px, and never wider than that */
     body.sheet-open #dock { transform: translateX(calc(-50% - 200px)); opacity: 1; pointer-events: auto; max-width: calc(100vw - 420px); }
     body.sheet-open #fishcard { right: 416px; }
-    body.sheet-open #tools { margin-right: 400px; }
     body.sheet-open #helppop { right: 410px; }
     body.sheet-open #toasts { transform: translateX(calc(-50% - 200px)); }
     #fishcard, #fishcard.flip { top: calc(76px + var(--safe-t)); bottom: auto; max-height: calc(100dvh - 180px); }
@@ -881,8 +718,8 @@
    * steps/s and the generation, counters in the millions too */
   @media (min-width: 960px) and (max-width: 1199px) { body.sheet-open .ts-nums .ts-steps { display: none; } }
   @media (min-width: 960px) and (max-width: 1099px) {
-    body.sheet-open.turbo-on .ts-nums .ts-pop, body.sheet-open.turbo-on #viewmenubtn span, body.sheet-open.turbo-on #viewmenubtn .caret { display: none; }
-    body.sheet-open.turbo-on #viewmenubtn { width: 44px; padding: 0; justify-content: center; }
+    body.sheet-open.turbo-on .ts-nums .ts-pop, body.sheet-open.turbo-on #viewmenubtn span { display: none; }
+    body.sheet-open.turbo-on #dock #viewmenubtn { width: var(--bar-btn); padding: 0; justify-content: center; }
   }
   /* A short window's fish card (a landscape phone; an embed, such as the
    * portfolio's 890 x 453) and a switch's 44 px touch target: both pages'
@@ -921,8 +758,7 @@
     <symbol id="i-follow" viewBox="0 0 24 24"><circle cx="12" cy="12" r="6.5"/><circle cx="12" cy="12" r="2" fill="currentColor" stroke="none"/><path d="M12 2.5v3M12 18.5v3M2.5 12h3M18.5 12h3"/></symbol>
     <symbol id="i-frame" viewBox="0 0 24 24"><path d="M4 9V5.5A1.5 1.5 0 0 1 5.5 4H9M15 4h3.5A1.5 1.5 0 0 1 20 5.5V9M20 15v3.5a1.5 1.5 0 0 1-1.5 1.5H15M9 20H5.5A1.5 1.5 0 0 1 4 18.5V15"/></symbol>
     <symbol id="i-chevron" viewBox="0 0 24 24"><path d="m6 15 6-6 6 6"/></symbol>
-    <symbol id="i-light" viewBox="0 0 24 24"><path d="M8.5 3.5h7l-1.2 5.2 .9 1.8v9a1 1 0 0 1-1 1h-4.4a1 1 0 0 1-1-1v-9l.9-1.8-1.2-5.2Z"/><path d="M10.2 13.5h3.6"/><path d="M4.5 4.5 6 6M19.5 4.5 18 6M3 9.5h2M19 9.5h2"/></symbol>
-    <symbol id="i-tank" viewBox="0 0 24 24"><path d="M3.5 9 8 6h12.5L16 9H3.5Z"/><path d="M3.5 9v8.5H16V9M16 17.5l4.5-3V6"/><path d="M6.5 13.5h6" opacity=".6"/></symbol>
+    <symbol id="i-light" viewBox="0 0 24 24"><path d="M9 21h6M10 17h4l1-6a4 4 0 1 0-6 0Z"/><path d="M12 3V2M19 6l1-1M5 6 4 5"/></symbol>
     <symbol id="i-eye" viewBox="0 0 24 24"><path d="M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12Z"/><circle cx="12" cy="12" r="3"/></symbol>
     <symbol id="i-stop" viewBox="0 0 24 24"><rect x="6.5" y="6.5" width="11" height="11" rx="2" fill="currentColor" stroke="none"/></symbol>
     <symbol id="i-step" viewBox="0 0 24 24"><path d="M6.5 5.5v13l9.5-6.5-9.5-6.5Z"/><path d="M18.5 5.5v13"/></symbol>
@@ -948,7 +784,7 @@
     </nav>
     <div id="tools" class="chip-surface">
       <button id="dashbtn" class="icon-btn" aria-label="dashboards: charts of this run" aria-expanded="false" title="Dashboards: charts of this run (G)"><svg class="i"><use href="#i-chart"/></svg></button>
-      <button id="menubtn" class="icon-btn" aria-label="setup" aria-expanded="false" aria-controls="drawer" title="Setup (O): start a new world, change the rules"><svg class="i"><use href="#i-sliders"/></svg></button>
+      <button id="menubtn" class="icon-btn" aria-label="setup" aria-expanded="false" aria-controls="drawer" title="Setup (O): start a new world, change the rules"><svg class="i"><use href="#i-sliders"/></svg><span>Setup</span></button>
       <button id="helpbtn" class="icon-btn" aria-label="help and keys" aria-expanded="false" aria-controls="helppop" title="Help and keys (?)"><svg class="i"><use href="#i-help"/></svg></button>
     </div>
   </header>
@@ -1019,8 +855,8 @@
     <button id="turbobtn" class="icon-btn" aria-pressed="false" title="Turbo (T): runs this same world many times faster without drawing it; stop it to watch again, exactly where it got to"><svg class="i"><use href="#i-bolt"/></svg><span>Turbo</span></button>
     <span class="dock-sep" aria-hidden="true"></span>
     <button id="lightbtn" class="icon-btn" aria-pressed="false" title="Flashlight (L): clear light where you look, in true colours" aria-label="flashlight"><svg class="i"><use href="#i-light"/></svg></button>
-    <button id="viewmenubtn" class="icon-btn" aria-expanded="false" aria-controls="viewpop" title="View (V): the flashlight, water clarity, fish colours" aria-label="view"><svg class="i"><use href="#i-eye"/></svg><span>View</span><svg class="i caret" aria-hidden="true"><use href="#i-chevron"/></svg></button>
-    <button id="viewbtn" class="icon-btn" title="Fit the tank on screen (C)" aria-label="fit the tank on screen"><svg class="i"><use href="#i-tank"/></svg></button>
+    <button id="viewmenubtn" class="icon-btn" aria-expanded="false" aria-controls="viewpop" title="View (V): the flashlight, water clarity, fish colours" aria-label="view"><svg class="i"><use href="#i-eye"/></svg><span>View</span></button>
+    <button id="viewbtn" class="icon-btn" title="Fit the tank on screen (C)" aria-label="fit the tank on screen"><svg class="i"><use href="#i-frame"/></svg></button>
   </nav>
 
   <!-- View: how the tank looks (drawing only; nothing here changes the world) -->
