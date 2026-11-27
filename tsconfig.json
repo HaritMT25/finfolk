@@ -29,6 +29,7 @@
     "web/ocean_readouts.js",
     "web/ocean_inspector.js",
     "web/ocean_display.js",
+    "web/ocean_layers.js",
     "web/ocean_tour.js",
     "web/ocean_appearance.js",
     "web/ocean_shaders.js",

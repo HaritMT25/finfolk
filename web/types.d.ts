@@ -1254,6 +1254,7 @@ interface OceanDashboard {
 /** Getters read current root bindings, without syncing or refreshing. Engine operations retain their
  * ready-world preconditions; fresh() in updateHud follows the same allocating export as before. */
 interface OceanReadoutsPorts {
+  readonly layers: Pick<OceanLayers, "statOpen" | "setDrawer" | "setPop">;
   el(id: string): HTMLElement;
   readonly D: number; readonly DT: number;
   readonly M: OceanModule;
@@ -1262,7 +1263,6 @@ interface OceanReadoutsPorts {
   readonly turboView: { st: number[]; su: number[] } | null;
   readonly STATS: Record<string, number>;
   readonly fps: number;
-  readonly statOpen: boolean;
   readonly initArgs: { seed: number } | null;
   readonly paused: boolean; readonly lastSteps: number;
   readonly turboStats: { stepsPerSec: number } | null;
@@ -1282,8 +1282,6 @@ interface OceanReadoutsPorts {
   cString(ptr: number): string;
   turboWiring(): OceanWiring | null;
   engineCall<T>(fn: () => T, fallback: T): T;
-  setDrawer(open: boolean): void;
-  setPop(name: string | null): void;
   hideCoach(): void;
 }
 interface OceanReadouts {
@@ -1320,6 +1318,7 @@ interface OceanInspectorElements {
 /** Engine/scene operations retain their existing ready-world preconditions. Getters read the current
  * root binding on every access; none syncs, refreshes, or invokes a controller during construction. */
 interface OceanInspectorPorts {
+  readonly layers: Pick<OceanLayers, "statOpen" | "cardNewer" | "cardHeld" | "setStatPanel">;
   el<K extends keyof OceanInspectorElements>(id: K): OceanInspectorElements[K];
   el(id: string): HTMLElement;
   readonly M: OceanModule;
@@ -1328,7 +1327,6 @@ interface OceanInspectorPorts {
   readonly lastS: OceanSnapshot;
   readonly scene: OceanScene;
   readonly display: Pick<OceanDisplay, "colourMode">;
-  readonly statOpen: boolean;
   readonly paused: boolean;
   readonly BODY_LAYOUT: OceanBodyLayout;
   readonly HO: Pick<EvoOceanHandoffApi, "f64">;
@@ -1338,14 +1336,12 @@ interface OceanInspectorPorts {
   readonly STATS: { frame: number };
   readonly ACTION_SHORT: string[]; readonly ACTION_LABELS: string[];
   readonly coarseMQ: MediaQueryList;
-  cardNewer: boolean; cardHeld: boolean;
   readonly readouts: Pick<OceanReadouts, "dirtyHud">;
   has(name: string): boolean;
   syncedFrame(): number;
   turboPictureHint(): void;
   engineCall<T>(fn: () => T, fallback: T | undefined, action?: string): T | undefined;
   fresh(s: OceanSnapshot): OceanSnapshot;
-  setStatPanel(on: boolean): void;
   cfgVal(key: string): number;
   heap(): ArrayBuffer;
   cString(ptr: number): string;
@@ -1385,6 +1381,7 @@ interface OceanDisplayElements { lightnow: HTMLInputElement; followLight: HTMLIn
 /** Getters read the current root binding on every access; none syncs, refreshes, or invokes a controller, and
  * construction reads no port. Engine operations keep their existing ready-world preconditions (has, engineCall). */
 interface OceanDisplayPorts {
+  readonly layers: Pick<OceanLayers, "setPop" | "setDrawer">;
   el<K extends keyof OceanDisplayElements>(id: K): OceanDisplayElements[K];
   el(id: string): HTMLElement;
   has(name: string): boolean;
@@ -1399,8 +1396,6 @@ interface OceanDisplayPorts {
   readonly BENCH: boolean;
   engineCall<T>(fn: () => T, fallback: T): T;
   engineCall<T>(fn: () => T): T | undefined;
-  setPop(name: string | null): void;
-  setDrawer(open: boolean): void;
   setSheetTab(id: string): void;
   changedKeys(): string[];
   setHtml(id: string, html: string): void;
@@ -1428,6 +1423,44 @@ interface OceanDisplay {
   readonly modelineDetail: number;
 }
 interface EvoOceanDisplayApi { create(ports: OceanDisplayPorts): OceanDisplay }
+
+/* ---------------- web/ocean_layers.js (window.EvoOceanLayers) ---------------- */
+
+interface OceanLayerTip { d: string; t: string }
+/** Current root bindings are read lazily. Construction reads no port; initialization and listener
+ * phases run at their original page positions. CFG.TIPS is read on each attachTip call. */
+interface OceanLayersPorts {
+  el(id: string): HTMLElement;
+  readonly UI: Pick<EvoUIApi, "returnPoint">;
+  readonly wideMQ: MediaQueryList;
+  readonly compactMQ: MediaQueryList;
+  readonly scene: Pick<OceanScene, "setInsets"> | null;
+  readonly asking: unknown;
+  readonly lastPointer: string;
+  readonly panelsEl: HTMLElement;
+  readonly CFG: { TIPS: Record<string, OceanLayerTip> };
+  readonly readouts: Pick<OceanReadouts, "dash" | "dirtyHud">;
+  readonly tour: Pick<OceanTour, "hideCoach">;
+  setStartMenu(open: boolean): void;
+  hideAsk(): void;
+}
+interface OceanLayers {
+  initPop(): void; registerPopOutside(): void; initStats(): void;
+  initDrawer(): void; registerDrawer(): void; initTips(): void; registerTips(): void;
+  setPop(name: string | null, opener?: HTMLElement | null): void;
+  closePop(keyboard: boolean): void;
+  togglePop(name: string, opener: HTMLElement | null, keyboard: boolean): void;
+  placePop(): void;
+  setStatPanel(open: boolean): void;
+  updateInsets(): void; setDrawer(open: boolean): void; onWideChange(): void;
+  hideTip(): void; showTip(rowEl: HTMLElement, tip: OceanLayerTip): void;
+  attachTip(rowEl: HTMLElement | null, key: string): void;
+  readonly POPS: Record<string, string[]>;
+  readonly openPop: string | null; readonly statOpen: boolean;
+  readonly drawerEl: HTMLElement;
+  cardNewer: boolean; cardHeld: boolean;
+}
+interface EvoOceanLayersApi { create(ports: OceanLayersPorts): OceanLayers }
 
 /* ---------------- web/ocean_tour.js (window.EvoOceanTour) ---------------- */
 
@@ -1477,21 +1510,18 @@ interface OceanGuideApp {
 }
 /** Root bindings are read at the original execution points. No accessor syncs or refreshes. */
 interface OceanTourPorts {
+  readonly layers: Pick<OceanLayers, "openPop" | "statOpen" | "drawerEl" | "setDrawer">;
   store(key: string, value?: string): string | null;
   readonly P: URLSearchParams;
   el(id: string): HTMLElement;
   readonly coarseMQ: MediaQueryList;
   readonly readouts: Pick<OceanReadouts, "summary" | "dash">;
   readonly turboState: TurboPhase;
-  readonly openPop: string | null;
-  readonly statOpen: boolean;
   readonly inspector: Pick<OceanInspector, "selectedId" | "cardEl" | "select">;
-  readonly drawerEl: HTMLElement;
   readonly HAS_APP: boolean;
   readonly display: Pick<OceanDisplay, "colourMode" | "colourBrain">;
   readonly M: OceanModule | null;
   enterTurbo(): void;
-  setDrawer(open: boolean): void;
   setSheetTab(id: string): void;
   engineCall<T>(fn: () => T, fallback: T): T;
   engineCall<T>(fn: () => T): T | undefined;
@@ -1519,6 +1549,7 @@ interface OceanScene {
   setQuality(q: number): void;
   quality(): number;
   setFlashlight(on: boolean): void;
+  setInsets(insets: { top: number; right: number; bottom: number; left: number }): void;
   /** feature-detected by the page before it is called */
   setAppearance?(on: boolean): void;
   /** feature-detected by the page before it is called */
@@ -1560,6 +1591,7 @@ declare var EvoOceanConfig: EvoOceanConfigApi;
 declare var EvoOceanReadouts: EvoOceanReadoutsApi;
 declare var EvoOceanInspector: EvoOceanInspectorApi;
 declare var EvoOceanDisplay: EvoOceanDisplayApi;
+declare var EvoOceanLayers: EvoOceanLayersApi;
 declare var EvoOceanTour: EvoOceanTourApi;
 declare var EvoGuideConfig: OceanGuideConfig;
 declare var EvoApp: OceanGuideApp;

@@ -80,7 +80,7 @@
     ports.setTxt("ro-fps", String(ports.fps));
     ports.el("ro-fps").className = "num" + (ports.fps && ports.fps < 45 ? " warn" : "");
     ports.updateKeysLegend(); ports.showSpeedCap();
-    if (!ports.statOpen) return;
+    if (!ports.layers.statOpen) return;
     var rb = rates.perSec("b"), rd = rates.perSec("d");
     var rows = [
       ["fish", ports.fmtInt(nFish)],
@@ -152,9 +152,9 @@
       colourMode: function () { return ports.display.tankShowsFamily() ? "family" : ports.display.colourMode; },
       showFamilyColours: function () { ports.display.setColourMode("family"); },
       wiring: function () { return ports.turboState !== "live" ? wiringNow() : ports.engineCall(wiringNow, null); },
-      setDrawer: ports.setDrawer,
+      setDrawer: ports.layers.setDrawer,
       /* the charts cover the page: no popover left open under them, and the coach mark goes */
-      onOpen: function () { ports.setPop(null); ports.hideCoach(); },
+      onOpen: function () { ports.layers.setPop(null); ports.hideCoach(); },
       setRecEvery: function (every) {
         if (ports.turboWorker && (ports.turboState === "entering" || ports.turboState === "turbo")) ports.turboWorker.postMessage({ cmd: "rec", every: every });
       }
