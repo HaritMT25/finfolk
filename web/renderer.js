@@ -439,7 +439,7 @@
       ctl.appendChild(makeStepper(input, key, opt.min));
     }
     input.id = id;
-    if (LIVE[key]) input.addEventListener("change", function () { applyLive(key, def, input); });
+    if (LIVE[key]) input.addEventListener("change", fenced(function () { applyLive(key, def, input); }));
     row.appendChild(left);
     row.appendChild(ctl);
     attachTip(row, key);
@@ -562,7 +562,7 @@
   var unread = null, unreadSaid = false;   /* the last failed read's reason */
   function readEngineConfig() {
     try { var c = engineConfig(); unread = null; unreadSaid = false; return c; }
-    catch (e) { unread = String(e && e.message || e); return null; }
+    catch (e) { if (isTrap(e)) throw e; unread = String(e && e.message || e); return null; }
   }
   function sayUnread(who, what) {
     if (!unread || unreadSaid) return;
@@ -637,6 +637,36 @@
   }
   /* the engine is there and running: every call into the module checks it (a trap stops it: engineStopped) */
   function engineOk() { return !!Module && !engineDown; }
+  /* An engine trap: a WebAssembly.RuntimeError (the module's abort, an out-of-bounds access, out of memory) */
+  function isTrap(err) { return typeof WebAssembly !== "undefined" && err instanceof WebAssembly.RuntimeError; }
+  /* An entry into the page from outside it (a control, a key, a worker's
+   * message, a file read that arrived, the tour's hooks): a trap anywhere in
+   * it, at any depth, ends it and stops the engine (engineStopped), as the
+   * frame's does, never escaping with the engine unfenced (the Ocean's
+   * fenced). Any other error goes on as it was. */
+  function fenced(fn) {
+    return function () {
+      try { return fn.apply(this, arguments); }
+      catch (err) { if (isTrap(err)) { engineStopped(err); return undefined; } throw err; }
+    };
+  }
+  /* The module as the dashboards get it (web/dashboard.js reads it from its
+   * own controls and timer): each of its exports fenced, a trap stopping the
+   * engine; stopped, an export reads as 0 (an empty answer: the dashboards
+   * close with the engine) rather than run in a trapped module. */
+  function fencedModule() {
+    var wrapped = {};
+    return new Proxy(Module, { get: function (m, k) {
+      var f = m[k];
+      if (typeof f !== "function" || typeof k !== "string" || k.indexOf("_evo_") !== 0) return f;
+      if (!wrapped[k]) wrapped[k] = function () {
+        if (!engineOk()) return 0;
+        try { return m[k].apply(m, arguments); }
+        catch (err) { if (isTrap(err)) { engineStopped(err); return 0; } throw err; }
+      };
+      return wrapped[k];
+    } });
+  }
   function threadCount() { return engineOk() && Module._evo_threads ? Module._evo_threads() : "?"; }
   var tabsEl = el("tabs"), panelsEl = el("panels"), currentTab = "run";
   /* the settings' tabs (web/ui_common.js tabs, as the Ocean's): Left / Right
@@ -1521,7 +1551,7 @@
     el("readout").setAttribute("aria-expanded", open ? "true" : "false");
     if (open) renderStatPanel();
   }
-  el("readout").addEventListener("click", function () { setStatPanel(!statOpen); this.blur(); });
+  el("readout").addEventListener("click", fenced(function () { setStatPanel(!statOpen); this.blur(); }));
   document.addEventListener("pointerdown", function (e) {
     if (statOpen && !e.target.closest("#statpanel, #readout")) setStatPanel(false);
   });
@@ -1586,7 +1616,7 @@
     if (asking) hideAsk();
     dropWorker();   /* (Turbo's world has nowhere to come back to) */
     heldLive = []; sentLive = []; turboAcked = [];
-    if (turboState !== "live") { turboState = "live"; updateLocks(); }
+    turboState = "live"; updateLocks();   /* (a trap mid hand-back or mid start leaves its controls as they were: unlocked) */
     showError("The engine stopped (" + why + "), so this world can't go on. Reload the page to go on.");
     failScreen("The engine stopped (" + why + "), so this world can't go on.\nReload the page to go on.", true);
   }
@@ -1601,6 +1631,7 @@
       animT += dt * Math.min(simSpeed, 2);
     }
     if (dash()) dash().pump();   /* what the recorder saw (also a restart's first sample) */
+    if (!engineOk()) return;     /* (it trapped there: the engine stopped) */
     var t1 = performance.now();
     /* while not 'live' the main sim is frozen: re-sync repacks the same
      * state, so this keeps drawing the last frame (never stale-black) */
@@ -1903,11 +1934,12 @@
     updateLocks();
     if (!turboWorker) { /* created once, reused across sessions */
       turboWorker = new Worker(ASSETS.worker);
-      turboWorker.onmessage = onTurboMessage;
-      turboWorker.onerror = function (ev) {
+      turboWorker.onmessage = fenced(onTurboMessage);
+      turboWorker.onerror = fenced(function (ev) {
+        if (ev && ev.preventDefault) ev.preventDefault();   /* (said here: not also as the worker's uncaught error) */
         showError("The Turbo worker failed: " + (ev.message || "could not load worker.js"));
         turboLost();
-      };
+      });
     }
     /* everything recorded up to the hand-off goes to the dashboards first;
      * the worker records on from here at the same interval */
@@ -1927,7 +1959,7 @@
   }
 
   /* ---- input ---- */
-  canvas.addEventListener("click", function (e) {
+  canvas.addEventListener("click", fenced(function (e) {
     if (!engineOk() || turboState !== "live") return;
     var rect = canvas.getBoundingClientRect();
     var wx = (e.clientX - rect.left) * (canvas.width / rect.width);
@@ -1938,7 +1970,7 @@
     var best = nearestFish(wx, wy, reach * reach);
     selectedId = best >= 0 ? fishId(best) : null;
     if (best >= 0) everSelected = true;
-  });
+  }));
   /* Index of the creature whose head is nearest (wx, wy), at most
    * sqrt(maxD2) away, or -1. Ties go to the later creature. */
   function nearestFish(wx, wy, maxD2) {
@@ -1963,7 +1995,7 @@
     tap = e.isPrimary && e.button === 0 ? { x: e.clientX, y: e.clientY, t: performance.now(), id: e.pointerId } : null;
   });
   sceneCanvas.addEventListener("pointercancel", function () { tap = null; });
-  sceneCanvas.addEventListener("pointerup", function (e) {
+  sceneCanvas.addEventListener("pointerup", fenced(function (e) {
     if (!tap || e.pointerId !== tap.id) return;
     var moved = Math.hypot(e.clientX - tap.x, e.clientY - tap.y), held = performance.now() - tap.t;
     tap = null;
@@ -1971,7 +2003,7 @@
     var best = scene.pick(snapshot(-1), e.clientX, e.clientY, e.pointerType === "mouse" ? 18 : 30);
     selectedId = best >= 0 ? fishId(best) : null;
     if (best >= 0) everSelected = true;
-  });
+  }));
   function toggleFollow() {
     if (!view3d || selectedId === null) return;
     scene.setFollow(!scene.following());
@@ -2039,7 +2071,7 @@
     }
     if (view3d) return;
     el("view3d").disabled = true;
-    return loadScene().then(function (sc) {
+    return loadScene().then(fenced(function (sc) {
       el("view3d").disabled = false;
       if (!sc) {
         el("view3d").checked = false;
@@ -2055,7 +2087,7 @@
       updateInsets();
       if (fromUser) remember(true);
       updateModeline();
-    });
+    }));
   }
 
   /* Escape also closes the dashboards (dashboard.js) and ends the tour
@@ -2065,7 +2097,9 @@
   window.addEventListener("keydown", function (e) {
     if (e.key === "Escape") escHandledElsewhere = !!(dash() && dash().isOpen()) || !!document.getElementById("guide");
   }, true);
-  window.addEventListener("keydown", function (e) {
+  window.addEventListener("keydown", fenced(function (e) {
+    /* the failure screen: its buttons take their own keys (Tab, Enter, Space); no shortcut acts behind it */
+    if (el("splash").classList.contains("failed")) return;
     /* Escape always closes what is open, regardless of what has focus —
      * blurring the focused control so the sim shortcuts work again. */
     if (e.key === "Escape") {
@@ -2114,7 +2148,7 @@
       if (asking) { el("startconfirm").focus(); return; }
       if (requestNewSeed() === "asked") el("startconfirm").focus();
     }
-  });
+  }));
 
   /* ---- settings: a bottom sheet on narrow screens, a side panel on wide ones ---- */
   var drawerEl = el("drawer"), menuBtn = el("menubtn");
@@ -2228,7 +2262,7 @@
   });
 
   function btn(id, fn) {
-    el(id).addEventListener("click", function () { fn(); this.blur(); });
+    el(id).addEventListener("click", fenced(function () { fn(); this.blur(); }));
   }
   /* A button that may ask before it replaces the run (replaceRun). Pressed
    * from the keyboard (its focus ring showing, or a click no pointer made),
@@ -2236,11 +2270,11 @@
    * the button when it is answered Keep it (or Esc); a pointer's press blurs
    * it, as btn's (the Ocean's askBtn). */
   function askBtn(id, fn) {
-    el(id).addEventListener("click", function (e) {
+    el(id).addEventListener("click", fenced(function (e) {
       var kb = EvoUI.pressedByKeyboard(this, e);
       if (fn() === "asked" && kb) { asking.opener = this; el("startconfirm").focus(); }
       else this.blur();
-    });
+    }));
   }
 
   /* Settings that only matter while another one is on are dimmed, with the
@@ -2332,8 +2366,8 @@
   btn("guidebtn", function () { if (window.EvoGuide) EvoGuide.start(); });
   btn("followbtn", toggleFollow);
   btn("viewbtn", function () { if (view3d) scene.resetView(true); });
-  el("view3d").addEventListener("change", function () { setView(this.checked, true); this.blur(); });
-  el("fishShape").addEventListener("change", function () { setFishShape(this.checked); this.blur(); });
+  el("view3d").addEventListener("change", fenced(function () { setView(this.checked, true); this.blur(); }));
+  el("fishShape").addEventListener("change", fenced(function () { setFishShape(this.checked); this.blur(); }));
   /* Fish shapes: ?fish=1 / ?fish=0, else this visitor's last choice; off the
    * first time. WebGL2 only: in canvas 2D, Chrome fills the outlines at less
    * than half the frame rate it fills circles, so the 2D fallback keeps the
@@ -2393,7 +2427,7 @@
     colourBrain = want === "brain";
     el("colourBrain").checked = colourBrain;
   })();
-  el("colourBrain").addEventListener("change", function () { setColourBrain(this.checked, true); this.blur(); });
+  el("colourBrain").addEventListener("change", fenced(function () { setColourBrain(this.checked, true); this.blur(); }));
   var fitTimer = 0;
   window.addEventListener("resize", function () {
     if (scene) { scene.resize(); updateInsets(); }
@@ -2429,20 +2463,20 @@
     if (typeof w.width === "number" && typeof w.height === "number") bits.push(w.width + " × " + w.height);
     return { what: "the saved world" + (name ? " " + name : "") + (bits.length ? " (" + bits.join(", ") + ")" : "") };
   }
-  el("cpfile").addEventListener("change", function () {
+  el("cpfile").addEventListener("change", fenced(function () {
     var file = this.files && this.files[0], opener = fileOpener;
     fileOpener = null;
     this.value = "";
     if (!file || !engineOk() || guardTurbo()) return;
-    file.text().then(function (text) {
+    file.text().then(fenced(function (text) {
       if (!engineOk() || guardTurbo()) return;   /* (the engine stopped, or Turbo started, while it was read) */
       var w = savedWorld(text, file.name);
       if (w.bad) { showError("Couldn't load that checkpoint: " + w.bad + ". Nothing changed."); return; }
       if (replaceRun("load", function () { openWorld(text); }, { world: w.what }) === "asked" && opener) {
         asking.opener = opener; el("startconfirm").focus();
       }
-    }, function (err) { showError("Couldn't read that file: " + err); });
-  });
+    }), function (err) { showError("Couldn't read that file: " + err); });
+  }));
   function openWorld(text) {
     if (!engineOk() || guardTurbo()) return;
     if (!loadCheckpointText(text)) return;   /* refused: the running world, its cap and its governor stay */
@@ -2457,13 +2491,13 @@
     updateNeeds();
     updateTabDots();
   }
-  el("governor").addEventListener("change", function () {
+  el("governor").addEventListener("change", fenced(function () {
     governorOn = this.checked;
     if (!governorOn && autoCap) { autoCap = 0; applyCap(); }
     if (!governorOn) restoreDetail();
     govNote = "";
     this.blur();
-  });
+  }));
 
   updateNeeds();
   updateTabDots();
@@ -2482,21 +2516,21 @@
     /* fish coloured by brain similarity (else by family line) */
     colourByBrain: function () { return colourBrain; },
     /* the Turbo intro's "Try Turbo" */
-    startTurbo: function () { if (engineOk() && turboState === "live") enterTurbo(); },
+    startTurbo: fenced(function () { if (engineOk() && turboState === "live") enterTurbo(); }),
     setDrawer: setDrawer,
     setSheetTab: setSheetTab,
     /* Selects a fish for the guide to show, unless one is selected: the one
      * nearest a point left of centre, clear of a wide screen's card at the
      * right. Leaves everSelected alone, so the one-time hint still comes until
      * the visitor picks one. */
-    inspectSomeFish: function () {
+    inspectSomeFish: fenced(function () {
       if (!engineOk() || turboState !== "live") return false;
       if (selectedId !== null) return true;
       var best = nearestFish(WORLD_W * (view3d ? 0.4 : 0.35), WORLD_H * (view3d ? 0.45 : 0.5), Infinity);
       if (best < 0) return false;
       selectedId = guideFish = fishId(best);
       return true;
-    },
+    }),
     releaseFish: function () {
       if (guideFish !== null && selectedId === guideFish) selectedId = null;
       guideFish = null;
@@ -2555,20 +2589,20 @@
     if (Module._evo_stats_len) STATS_LEN = Module._evo_stats_len();
     applyColourMode();
     if (dash() && Module._evo_rec_take) dash().attach({
-      module: Module, heap: heap, actionNames: ACTION_NAMES, setDrawer: setDrawer,
+      module: fencedModule(), heap: heap, actionNames: ACTION_NAMES, setDrawer: setDrawer,
       runConfig: function () { return runCfg; },
       /* fish drawn by brain (genome colour) instead of by family line */
       colourByBrain: function () { return colourBrain; },
       /* what the fish wear now ("family" or "brain"), and the charts' way to show their family colours in the tank */
       colourMode: function () { return colourBrain ? "brain" : "family"; },
-      showFamilyColours: function () { setColourBrain(false, true); },
+      showFamilyColours: fenced(function () { setColourBrain(false, true); }),
       /* the sampling interval, here and in a running Turbo worker */
-      setRecEvery: function (every) {
+      setRecEvery: fenced(function (every) {
         if (!engineOk()) return;
         Module._evo_rec_config(every, -1);
         if (turboWorker && (turboState === "entering" || turboState === "turbo"))
           turboWorker.postMessage({ cmd: "rec", every: every });
-      }
+      })
     });
     /* Thread count: ?nthreads=N, else every pre-spawned worker plus this
      * thread (EvoLoader.poolThreads() — the -sPTHREAD_POOL_SIZE formula),

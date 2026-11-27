@@ -125,7 +125,10 @@ onmessage = function (e) {
     var config = null, configError = "";
     if (ok && msg.readback) {
       try { config = JSON.parse(Module.UTF8ToString(Module._evo_checkpoint())).config; }
-      catch (err) { configError = String(err && err.message || err); }
+      catch (err) {
+        if (err instanceof WebAssembly.RuntimeError) throw err;   /* (the engine trapped: the worker dies, the page's onerror recovers) */
+        configError = String(err && err.message || err);
+      }
     }
     postMessage({ type: "set", key: key, value: value, quiet: quiet, ok: !!ok, config: config, configError: configError,
                   error: ok ? "" : Module._evo_set_param ? Module.UTF8ToString(Module._evo_last_error()) : "this module has no live settings" });
