@@ -432,6 +432,17 @@
   #restart.pending { background: var(--plankton); color: var(--plankton-ink); border-color: transparent; }
   #err { flex: 1; min-width: 0; font-size: 13px; line-height: 1.35; color: var(--ink-3); }
   #err.error { color: var(--ember); }
+  /* the question before a start replaces a run with something to lose (renderer.js askStart; the Ocean's
+   * #startask): it takes Restart's place, the status line under it */
+  #startask { flex: 1 1 100%; display: flex; flex-wrap: wrap; align-items: center; gap: 8px 10px; }
+  #startask[hidden] { display: none; }
+  #startaskmsg { flex: 1 1 100%; font-size: 13px; line-height: 1.4; color: var(--ink); }
+  #startask .btn { min-height: 44px; }
+  #applybar.asking { flex-wrap: wrap; gap: 6px 12px; }
+  #applybar.asking #restart { display: none; }
+  #applybar.asking #err { flex: 1 1 100%; }
+  #applybar.asking #err:empty { display: none; }
+  @media (min-width: 600px) and (max-width: 959px) { #startaskmsg { flex: 1 1 240px; } }   /* a tablet's sheet: the question beside its answers */
 
   /* ---------- turbo ----------
    * While Turbo runs, the world is dimmed, not the controls: the scrim sits
@@ -782,6 +793,12 @@
       <!-- the other panels are built by renderer.js (SETTINGS_TABS) -->
     </div>
     <div id="applybar">
+      <!-- asked before a start replaces a run with something to lose (the Ocean's question); it takes Restart's place -->
+      <div id="startask" role="group" aria-labelledby="startaskmsg" hidden>
+        <p id="startaskmsg"></p>
+        <button id="startconfirm" class="btn primary">Replace it</button>
+        <button id="startcancel" class="btn ghost">Keep it</button>
+      </div>
       <button id="restart" class="btn"><svg class="i"><use href="#i-restart"/></svg><span>Restart</span></button>
       <span id="err" role="status"></span>
     </div>

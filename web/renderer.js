@@ -679,11 +679,145 @@
     if (canvas.width !== WORLD_W) canvas.width = WORLD_W;
     if (canvas.height !== WORLD_H) canvas.height = WORLD_H;
     var ok = initWorld(f.seed, f.population, f.cfg);
+    if (ok) formAtStart = formSnapshot();
     updateFitButton();
     setPending(false);
     el("randnote").textContent = "";  /* randomize() fills it in after a pick */
     return ok;
   }
+
+  /* ---- before a start replaces the run: ask when it has something to lose ----
+   * The Ocean's rule (ocean.js loseReasons / askStart) and its question, in
+   * the settings' start bar: five simulated minutes or more, Turbo used,
+   * live tweaks since the world started (liveTweaks), or edits waiting for
+   * the next start (pendingDiff). A fresh run starts at once, as it always
+   * did. Restart (and Restart to apply), Fit, R, the dice and Randomize the
+   * world, and Load world come through here; Keep it (or Esc) keeps the run. */
+  var DT = 0.016;            /* simulated seconds per step (wasm/evo_wasm.cpp: the step's fixed dt) */
+  var usedTurbo = false;     /* Turbo ran this world (a reason to ask before replacing it) */
+  var startCfg = {}, startCap = 0;   /* the running world's settings when it started or was loaded (live tweaks: the difference) */
+  var formAtStart = null;    /* the sheet's restart fields when the running world started from it (edits waiting: the difference) */
+  var asking = null;         /* {go, opener}: the question is showing */
+  /* the fields a Restart applies (every setting but the live ones, which apply by themselves) */
+  var RESTART_FIELDS = Object.keys(BASIC).concat(ADV.filter(function (a) { return !LIVE[a[0]]; }).map(function (a) { return "adv_" + a[0]; }));
+  function fieldNow(id) {
+    var i = el(id);
+    if (i.type === "checkbox") return i.checked;
+    var v = parseFloat(i.value);
+    return Number.isFinite(v) ? v : i.value;
+  }
+  function formSnapshot() {
+    var o = {};
+    RESTART_FIELDS.forEach(function (id) { o[id] = fieldNow(id); });
+    return o;
+  }
+  /* the restart fields changed since the running world started from the sheet */
+  function pendingDiff() {
+    if (!formAtStart) return [];
+    return RESTART_FIELDS.filter(function (id) { return fieldNow(id) !== formAtStart[id]; });
+  }
+  function fieldText(id) {
+    var key = id.indexOf("adv_") === 0 ? id.slice(4) : id, v = fieldNow(id), a = ADV_BY_KEY[key];
+    var opt = (a ? a[2] : BASIC[key] && BASIC[key][1]) || {};
+    var shown = typeof v === "boolean" ? (v ? "on" : "off") : opt.options && opt.options[v] !== undefined ? opt.options[v] : String(v) || "(empty)";
+    return (LABELS[key] || key) + " " + shown;
+  }
+  /* a live key's value in the running world (maxPopulation: the user's cap, userCap), and when it started */
+  function liveNow(k) { return k === "maxPopulation" ? userCap : k in runCfg ? runCfg[k] : ADV_BY_KEY[k][1]; }
+  function liveAtStart(k) { return k === "maxPopulation" ? startCap : k in startCfg ? startCfg[k] : ADV_BY_KEY[k][1]; }
+  /* the live settings changed since this world started (accepted ones) */
+  function liveTweaks() {
+    return Object.keys(LIVE).filter(function (k) { return liveNow(k) !== liveAtStart(k); });
+  }
+  function runAge() {
+    if (!Module) return 0;
+    return new Float64Array(heap(), Module._evo_stats(), 4)[3] * DT;   /* (the world's frame, as the last sync left it) */
+  }
+  function fmtTime(s) { s = Math.max(0, Math.round(s)); var m = Math.floor(s / 60); return m ? m + " min " + (s % 60) + " s" : s + " s"; }
+  /* what a start would lose (the approved rule) */
+  function loseReasons() {
+    var r = [], age = runAge(), tw = liveTweaks();
+    if (age >= 300) r.push(fmtTime(age) + " of evolution");
+    if (usedTurbo || turboState !== "live") r.push("Turbo's progress");
+    if (tw.length) r.push(tw.length === 1 ? "a live tweak (" + (LABELS[tw[0]] || tw[0]) + ")" : tw.length + " live tweaks");
+    if (pendingDiff().length) r.push("edits waiting");
+    return r;
+  }
+  /* go now, or ask first: "started" or "asked". kind: "restart" (x.next(k): the
+   * new world's value of live key k), "random" (x.next, x.what) or "load" (x.world) */
+  function replaceRun(kind, go, x) {
+    if (!loseReasons().length) { go(); return "started"; }
+    askStart(kind, go, x);
+    return "asked";
+  }
+  /* the question: what goes with the run, what the new world starts with, and
+   * what becomes of the live tweaks (the Ocean's words) */
+  function askStart(kind, go, x) {
+    var age = runAge(), lose = [], tw = liveTweaks(), diff = pendingDiff();
+    if (age >= 300) lose.push(fmtTime(age) + " of evolution");
+    if (usedTurbo) lose.push("what Turbo ran");
+    var s = function (n) { return n === 1 ? "" : "s"; };
+    var mine = function (ks) { return ks.map(function (k) { return (LABELS[k] || k) + " " + liveNow(k); }).join(", "); };
+    var keys = function (l) { return l.map(function (e) { return e[0]; }); };
+    var msg = "This replaces your run" + (lose.length ? ", and " + lose.join(" and ") + " with it" : "") + ".", yes = "Replace it";
+    if (kind === "load") {
+      msg += " It opens " + x.world + "." + (diff.length ? " What waits for the next start stays waiting." : "") +
+        (tw.length ? " Your live tweak" + s(tw.length) + " (" + mine(tw) + ") " + (tw.length === 1 ? "goes" : "go") + ": the saved world has its own settings." : "");
+      yes = "Open it";
+    } else {
+      var list = diff.slice(0, 3).map(fieldText).join(", ") + (diff.length > 3 ? " and " + (diff.length - 3) + " more" : "");
+      var kept = [], other = [];
+      tw.forEach(function (k) { var next = x.next(k); (next === liveNow(k) ? kept : other).push([k, next]); });
+      msg += (kind === "random" ? " It starts " + x.what + "." + (diff.length ? " What waits for the next start is dropped." : "")
+                                : diff.length ? " It starts with what waits: " + list + "." : "") +
+        (kept.length ? " Your live tweak" + s(kept.length) + " (" + mine(keys(kept)) + ") " + (kept.length === 1 ? "carries" : "carry") + " over to the new world." : "") +
+        (other.length ? " The new world's setup sets " + other.map(function (e) { return (LABELS[e[0]] || e[0]) + " " + e[1]; }).join(", ") +
+                        " instead of your live tweak" + s(other.length) + " (" + mine(keys(other)) + ")." : "");
+    }
+    showAsk(msg, yes, "Keep it");
+    asking = { go: go, opener: null };
+  }
+  function showAsk(msg, yes, no) {
+    if (errEl.className !== "error") clearError();   /* a note under the question would only repeat it */
+    el("startaskmsg").textContent = msg;
+    el("startconfirm").textContent = yes;
+    el("startcancel").textContent = no;
+    el("startask").hidden = false;
+    el("applybar").classList.add("asking");
+    if (!drawerEl.classList.contains("open")) setDrawer(true);
+  }
+  function hideAsk() {
+    asking = null;
+    var f = document.activeElement;
+    if (f && (f === el("startconfirm") || f === el("startcancel"))) f.blur();   /* (its answer had the focus: the page's keys work again) */
+    el("startask").hidden = true;
+    el("applybar").classList.remove("asking");
+  }
+  function confirmAsk() {
+    var a = asking;
+    hideAsk();
+    if (a) a.go();
+  }
+  function cancelAsk() {
+    var a = asking;
+    hideAsk();
+    showNote("Kept your run.");
+    if (a && a.opener) a.opener.focus();   /* a question the keyboard opened: the focus back where it was */
+  }
+  /* the entry points: each checks Turbo first (as before), then goes or asks */
+  function requestRestart() {
+    if (!Module || guardTurbo()) return "refused";
+    return replaceRun("restart", restart, { next: function (k) { return startValue(readForm().cfg, k); } });
+  }
+  /* R: a new seed, the rest as the sheet says */
+  function requestNewSeed() {
+    if (!Module || guardTurbo()) return "refused";
+    var seed = (Math.random() * 0x100000000) >>> 0;
+    return replaceRun("restart", function () { el("seed").value = String(seed); restart(); },
+                      { next: function (k) { return startValue(readForm().cfg, k); } });
+  }
+  /* the value a start with cfg gives live key k (initWorld: userCap is cfg's maxPopulation) */
+  function startValue(cfg, k) { return k === "maxPopulation" ? cfg.maxPopulation || 0 : k in cfg ? cfg[k] : ADV_BY_KEY[k][1]; }
 
   /* ---- Randomize: a whole setup drawn from tested ranges ----
    * The ranges, and the rules that keep coupled knobs together, live in
@@ -696,9 +830,17 @@
     if (input.type === "checkbox") input.checked = !!v;
     else input.value = String(v);
   }
+  /* the draw first, so the question (replaceRun) can say what it sets; the form only on the start */
   function randomize() {
-    if (!Module || !window.EvoRandom || guardTurbo()) return;
+    if (!Module || !window.EvoRandom || guardTurbo()) return "refused";
     var pick = EvoRandom.draw(Math.random, basePop);
+    var seed = (Math.random() * 0x100000000) >>> 0;
+    var what = pick.population + " fish" + (pick.labels.length ? " · " + pick.labels.join(" · ") : " · the default world");
+    return replaceRun("random", function () { startPick(pick, seed, what); },
+                      { what: "a new random world (" + what + ")",
+                        next: function (k) { return k in pick.adv ? pick.adv[k] : ADV_BY_KEY[k][1]; } });
+  }
+  function startPick(pick, seed, what) {
     resetAdvanced();
     Object.keys(BASIC_DEFAULTS).forEach(function (id) {
       setField(el(id), id in pick.form ? pick.form[id] : BASIC_DEFAULTS[id]);
@@ -708,12 +850,10 @@
       if (input) setField(input, pick.adv[key]);
     });
     el("population").value = String(pick.population);
-    el("seed").value = String((Math.random() * 0x100000000) >>> 0);
+    el("seed").value = String(seed);
     updateNeeds();
     updateTabDots();
     if (restart()) {
-      var what = pick.population + " fish" +
-        (pick.labels.length ? " · " + pick.labels.join(" · ") : " · the default world");
       el("randnote").textContent = "Picked: " + what + ". Every setting is in the tabs above.";
       toast("New world: " + what);
     }
@@ -735,6 +875,7 @@
     if (!ok) showError("evo_init failed: " + Module.UTF8ToString(Module._evo_last_error()));
     else {
       runCfg = cfg; governed = false; liveEdited = false; loadedRun = false; updateModeline(); if (dash()) dash().reset();   /* a new run: new charts */
+      startCfg = Object.assign({}, cfg); startCap = userCap; usedTurbo = false;   /* (what the replace rule compares with) */
       brainClock.reset(worldTick(), true);   /* (tick 0: no fish has run its brain yet) */
     }
     return !!ok;
@@ -1453,6 +1594,7 @@
     if (!fromTurbo) {
       governed = false; liveEdited = false; loadedRun = true;   /* (updateModeline: the caller's, after the governor's reset) */
       try { runCfg = JSON.parse(text).config || {}; } catch (e) { runCfg = {}; }
+      startCfg = Object.assign({}, runCfg); usedTurbo = false;   /* (startCap: the caller's, with the file's cap) */
       if (dash()) dash().reset();
       if (Module._evo_rec_reset) Module._evo_rec_reset(1);   /* the loaded fish, as the tree's roots */
     }
@@ -1511,7 +1653,7 @@
     var msg = e.data || {};
     if (msg.type === "stats") {
       turboStats = msg;
-      if (turboState === "entering") { turboState = "turbo"; updateLocks(); flushHeld(); }
+      if (turboState === "entering") { turboState = "turbo"; usedTurbo = true; updateLocks(); flushHeld(); }
     } else if (msg.type === "set") {
       /* the worker's answer to a live value (sendLive): applied there, so the run's record has it (the hand-back's
        * checkpoint carries the world's config); refused; or no world there any more (held, or applied here) */
@@ -1551,6 +1693,7 @@
   }
   function enterTurbo() {
     if (turboState !== "live" || !Module) return;
+    if (asking) hideAsk();   /* (its start would be refused now: Stop Turbo first) */
     turboState = "entering";
     turboStats = null;
     turboAcked = []; inFlight = {};
@@ -1725,7 +1868,8 @@
      * blurring the focused control so the sim shortcuts work again. */
     if (e.key === "Escape") {
       /* one owner for each Esc: the tour or the charts take theirs, and
-       * nothing behind them closes with it */
+       * nothing behind them closes with it; the question first (Keep it) */
+      if (!escHandledElsewhere && asking) { cancelAsk(); return; }
       if (!escHandledElsewhere) {
         if (drawerEl.classList.contains("open")) setDrawer(false);
         else if (statOpen) setStatPanel(false);
@@ -1762,8 +1906,11 @@
       setSpeed(simSpeed - 1);
       e.preventDefault();
     } else if (e.key === "r" || e.key === "R") {
-      el("seed").value = String((Math.random() * 0x100000000) >>> 0);
-      restart();
+      /* a new seed, asked first when the run has something to lose: the
+       * question takes the focus (its answer: Enter replaces, Esc keeps);
+       * R again while it shows goes back to it */
+      if (asking) { el("startconfirm").focus(); return; }
+      if (requestNewSeed() === "asked") el("startconfirm").focus();
     }
   });
 
@@ -1774,7 +1921,7 @@
     drawerEl.classList.toggle("open", open);
     document.body.classList.toggle("sheet-open", open);
     menuBtn.setAttribute("aria-expanded", open ? "true" : "false");
-    if (!open) hideTip();
+    if (!open) { hideTip(); if (asking) hideAsk(); }   /* a question no one can see is no question: closing the sheet keeps the run */
     if (open) setStatPanel(false);
     if (scene) { updateInsets(); setTimeout(updateInsets, 320); }   /* and after the slide */
   }
@@ -1881,6 +2028,18 @@
   function btn(id, fn) {
     el(id).addEventListener("click", function () { fn(); this.blur(); });
   }
+  /* A button that may ask before it replaces the run (replaceRun). Pressed
+   * from the keyboard (its focus ring showing, or a click no pointer made),
+   * the focus goes to the question's answer, as R's does, and comes back to
+   * the button when it is answered Keep it (or Esc); a pointer's press blurs
+   * it, as btn's (the Ocean's askBtn). */
+  function askBtn(id, fn) {
+    el(id).addEventListener("click", function (e) {
+      var kb = EvoUI.pressedByKeyboard(this, e);
+      if (fn() === "asked" && kb) { asking.opener = this; el("startconfirm").focus(); }
+      else this.blur();
+    });
+  }
 
   /* Settings that only matter while another one is on are dimmed, with the
    * reason under their name; they still save and restart as usual. */
@@ -1930,15 +2089,19 @@
     var t = e.target;
     updateNeeds();
     updateTabDots();
-    if (!t || !t.id || (t.id.indexOf("adv_") === 0 && LIVE[t.id.slice(4)])) return;  /* applies by itself */
+    if (!t || !t.id) return;
     if (t.id === "governor" || t.id === "view3d" || t.id === "fishShape" || t.id === "colourBrain" || t.id === "cpfile") return;   /* not settings Restart applies */
+    if (asking) { hideAsk(); showNote("The setup changed: start again to review it."); }   /* never a start other than the one asked about */
+    if (t.id.indexOf("adv_") === 0 && LIVE[t.id.slice(4)]) return;  /* applies by itself */
     setPending(true);
   }
 
   buildSettings();
   panelsEl.addEventListener("input", onEdit);   /* while typing */
   panelsEl.addEventListener("change", onEdit);  /* switches, selects, steppers */
-  btn("restart", restart);
+  askBtn("restart", requestRestart);
+  btn("startconfirm", confirmAsk);
+  btn("startcancel", cancelAsk);
   btn("pausebtn", function () { if (guardTurbo()) return; setPaused(!paused); });
   btn("slower", function () { if (guardTurbo()) return; setSpeed(simSpeed - 1); });
   btn("faster", function () { if (guardTurbo()) return; setSpeed(simSpeed + 1); });
@@ -1961,9 +2124,9 @@
     el("iexpand").title = cardExpanded ? "Hide its brain" : "Show its brain";
     cardCache.sense = null;
   });
-  btn("fitbtn", restart);
-  btn("randombtn", randomize);
-  btn("randombig", randomize);
+  askBtn("fitbtn", requestRestart);
+  askBtn("randombtn", randomize);
+  askBtn("randombig", randomize);
   btn("guidebtn", function () { if (window.EvoGuide) EvoGuide.start(); });
   btn("followbtn", toggleFollow);
   btn("viewbtn", function () { if (view3d) scene.resetView(true); });
@@ -2039,25 +2202,55 @@
     if (scene) scene.setReducedMotion(reducedMQ.matches);
   });
   btn("savecp", saveCheckpoint);
-  btn("loadcp", function () { if (guardTurbo()) return; el("cpfile").click(); });
+  /* Load world: the file is read, then opened, or first asked about when the
+   * run has something to lose (the Ocean's From a file: the question names
+   * the saved world); a file that is not JSON opens at once (the engine
+   * refuses it: nothing is lost). Opened from the keyboard, the question
+   * takes the focus and Keep it gives it back to Load world. */
+  var fileOpener = null;
+  el("loadcp").addEventListener("click", function (e) {
+    fileOpener = EvoUI.pressedByKeyboard(this, e) ? this : null;
+    if (!guardTurbo()) el("cpfile").click();
+    this.blur();
+  });
+  function savedWorldText(text, name) {
+    var cp = null;
+    try { cp = JSON.parse(text); } catch (e) { return null; }
+    if (!cp || typeof cp !== "object") return null;
+    var w = cp.world || {}, n = cp.creatures ? cp.creatures.count : undefined, bits = [];
+    if (typeof w.frame === "number") bits.push("frame " + w.frame.toLocaleString());
+    if (typeof n === "number") bits.push(n.toLocaleString() + " fish");
+    if (typeof w.width === "number" && typeof w.height === "number") bits.push(w.width + " × " + w.height);
+    return "the saved world" + (name ? " " + name : "") + (bits.length ? " (" + bits.join(", ") + ")" : "");
+  }
   el("cpfile").addEventListener("change", function () {
-    var file = this.files && this.files[0];
+    var file = this.files && this.files[0], opener = fileOpener;
+    fileOpener = null;
     this.value = "";
     if (!file || !Module || guardTurbo()) return;
     file.text().then(function (text) {
-      if (!loadCheckpointText(text)) return;   /* refused: the running world, its cap and its governor stay */
-      /* the file's own cap becomes the user cap; the governor starts fresh */
-      var cap = 0;
-      try { cap = (JSON.parse(text).config || {}).maxPopulation || 0; } catch (e) { /* load reported it */ }
-      userCap = cap;
-      autoCap = 0;
-      el("adv_maxPopulation").value = String(cap);
-      resetGovernor();
-      updateModeline();
-      updateNeeds();
-      updateTabDots();
+      var world = savedWorldText(text, file.name);
+      if (!world) { openWorld(text); return; }
+      if (replaceRun("load", function () { openWorld(text); }, { world: world }) === "asked" && opener) {
+        asking.opener = opener; el("startconfirm").focus();
+      }
     }, function (err) { showError("Couldn't read that file: " + err); });
   });
+  function openWorld(text) {
+    if (!Module || guardTurbo()) return;
+    if (!loadCheckpointText(text)) return;   /* refused: the running world, its cap and its governor stay */
+    /* the file's own cap becomes the user cap; the governor starts fresh */
+    var cap = 0;
+    try { cap = (JSON.parse(text).config || {}).maxPopulation || 0; } catch (e) { /* load reported it */ }
+    userCap = cap;
+    startCap = cap;   /* (the loaded world's own: no live tweak yet) */
+    autoCap = 0;
+    el("adv_maxPopulation").value = String(cap);
+    resetGovernor();
+    updateModeline();
+    updateNeeds();
+    updateTabDots();
+  }
   el("governor").addEventListener("change", function () {
     governorOn = this.checked;
     if (!governorOn && autoCap) { autoCap = 0; applyCap(); }
