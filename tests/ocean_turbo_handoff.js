@@ -5688,6 +5688,28 @@ async function pageSetupStateUX() {
        js.includes('Add living water (waves, current, light)') && js.includes('Adds living water to the next world’s current rules.'),
        'Water naming is consistent; the recipe starts a whole world while the add button keeps the next world’s rules');
     ok(!p.uncaught.length, 'no exception escaped the Setup wording and state handlers' + (p.uncaught.length ? ': ' + p.uncaught[0] : ''));
+    {   /* the rings follow the running world (review of #107): Replay with a recipe staged */
+        const q = await bootPage('?guide=0&intro=0');
+        const ringQ = id => q.el('tab-' + id).querySelector('.wait-ring');
+        q.edit('foodSpawnBase', 6);   /* live: the running world has 6 */
+        q.click('advreset');          /* Standard staged: its Food is the setup's */
+        const before = !!ringQ('food');
+        q.click('replay'); if (q.T.asking) q.click('startconfirm');
+        ok(before && !!q.T.draft && q.T.runCfg.foodSpawnBase !== 6 && !ringQ('food') && !q.uncaught.length,
+           'Replay with Standard staged: the Food ring was there (staged vs 6 running) and goes once Replay brings the setup\'s Food back');
+    }
+    {   /* ... and a Turbo answer: an edit acknowledged while a recipe is staged */
+        const { p: t, sh } = await pageInTurbo();
+        const ringT = id => t.el('tab-' + id).querySelector('.wait-ring');
+        sh.pause();
+        t.edit('foodSpawnBase', 6);   /* on its way to the worker */
+        t.click('advreset');          /* Standard staged while the answer is held */
+        const before = !!ringT('food');
+        sh.resume();
+        await until(() => sh.delivered.filter(isType('set')).length === sh.toWorker.filter(m => m.cmd === 'set').length, 'the edit\'s answer');
+        ok(!before && !!t.T.draft && t.T.runCfg.foodSpawnBase === 6 && !!ringT('food') && !t.uncaught.length,
+           'Turbo: the Food ring appears when the worker\'s answer makes the running Food 6 while Standard is staged');
+    }
 }
 
 const SECTIONS = {

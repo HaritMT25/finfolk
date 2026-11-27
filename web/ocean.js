@@ -1114,6 +1114,7 @@
         });
       });
       var b = el("tab-" + tab.id);
+      if (!b) return;
       function marker(cls, show, label) {
         var m = b.querySelector("." + cls);
         if (show && !m) {
@@ -1325,6 +1326,7 @@
       tag.textContent = draft ? "next world" : "live";
       tag.title = draft ? "applies to the next world when you press Start" : "applies to the running world at once";
     });
+    updateTabDots();   /* (the rings compare with the running world, which a Replay or a live edit's answer changes) */
     setHtml("startsummary", draft
       ? "<b>Next world: " + escHtml(draft.title) + "</b> · " + escHtml(draft.summary) + (n ? " · modified (" + n + ")" : "") +
         ". Starting it replaces this run."
