@@ -3,7 +3,7 @@
 #include "genome_v2_test_helpers.hpp"
 #include "../wasm/evo_wasm.cpp"
 int main() {
-    const std::string policy=R"("genomeVersion":2,"brainEvalVersion":2,"biasGenes":true,"weightMutationMode":"saturating")";
+    const std::string policy=R"("genomeVersion":2,"brainEvalVersion":2,"hiddenNeurons":12,"biasGenes":true,"weightMutationMode":"saturating")";
     const auto json="{"+policy+"}";
     G2_CHECK(evo_init(42,640,480,3,json.c_str())==1,"v2 startup accepted");
     const auto before=checkpoint::serialize(*g_world,"test");
@@ -15,11 +15,24 @@ int main() {
     for(const char* key:{"genomeMinLength","genomeMaxLength","genomeInitMin","genomeInitMax","targetFood","predatorCount","reproWindow","currentEddies"}) {
         for(const char* bad:{"80.5","\"80\"","null","true","[]","{}","1e100","2147483648","-2147483649"}) reject("{"+policy+",\""+key+"\":"+bad+"}");
     }
+    auto replaceMember=[&](const std::string& key,const std::string& value) {
+        auto next=policy;
+        const auto start=next.find("\""+key+"\":");
+        G2_CHECK(start!=std::string::npos,"raw policy member exists");
+        const auto end=next.find(',',start);
+        next.replace(start,(end==std::string::npos?next.size():end)-start,"\""+key+"\":"+value);
+        return "{"+next+"}";
+    };
     for(const char* key:{"genomeVersion","hiddenNeurons","brainEvalVersion"}) {
-        // All four new keys are checked on every occurrence, before narrowing.
-        for(const char* bad:{"2.5","\"2\"","null","1e100"}) reject("{"+policy+",\""+key+"\":"+bad+"}");
+        // One occurrence: truncation would produce a supported v2/H12 policy.
+        reject(replaceMember(key,std::string(key)=="hiddenNeurons"?"12.5":"2.5"));
+        for(const char* bad:{"\"2\"","null","1e100"}) reject(replaceMember(key,bad));
     }
-    for(const char* extra:{"\"genomeMaxLength\":81","\"genomeMinLength\":48,\"genomeInitMin\":24","\"biasGenes\":1","\"hiddenNeurons\":24"}) reject("{"+policy+","+extra+"}");
+    for(const char* key:{"genomeMaxLength","genomeMinLength"}) {
+        reject("{"+policy+",\""+key+"\":"+(std::string(key)=="genomeMaxLength"?"81":"48")+"}");
+    }
+    reject(replaceMember("biasGenes","1"));
+    reject(replaceMember("hiddenNeurons","24"));
     for(const char* key:{"genomeVersion","biasGenes","hiddenNeurons","brainEvalVersion","weightMutationMode"}) {
         G2_CHECK(evo_set_param(key,2)==0,"restart only policy");
         G2_CHECK(checkpoint::serialize(*g_world,"test")==before&&rng.state()==rs&&g_world->predRng_.state()==ps,"live policy refusal atomic");

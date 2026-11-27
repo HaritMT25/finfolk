@@ -18,7 +18,9 @@ inline void testGenomeV2() {
         const std::string simBytes(reinterpret_cast<const char*>(&savedSim), sizeof savedSim);
         const std::string oceanBytes(reinterpret_cast<const char*>(&savedOcean), sizeof savedOcean);
         const auto dump = savedSim.dump();
-        for (const char* bad : {
+        std::vector<const char*> refusals = {
+            R"({"weightMutationMode":"bogus","targetFood":321,"waveSpeed":9})",
+            R"({"targetFood":321,"waveSpeed":9,"deepCurrent":{}})",
             R"({"genomeVersion":12,"targetFood":321,"waveSpeed":9})",
             R"({"genomeVersion":1,"genomeVersion":1})",
             R"({"hiddenNeurons":12,"hiddenNeurons":12})",
@@ -29,7 +31,16 @@ inline void testGenomeV2() {
             R"({"genomeVersion":2,"brainEvalVersion":2,"weightMutationMode":"invalid"})",
             R"({"genomeVersion":2,"brainEvalVersion":2,"weightMutationMode":"saturating","weightMutationMode":"saturating"})",
             R"({"genomeVersion":2,"brainEvalVersion":2,"weightMutationMode":"saturating","waveSpeed":9,"deepCurrent":{}})"
-        }) {
+        };
+        if (startV2) {
+            for (const char* bad : {
+                R"({"weightMutationMode":"legacy","targetFood":321})",
+                R"({"genomeMaxLength":81})",
+                R"({"mutationMultiplier":1e100,"targetFood":321})",
+                R"({"targetFood":321,"waveSpeed":9,"deepCurrent":{}})"
+            }) refusals.push_back(bad);
+        }
+        for (const char* bad : refusals) {
             std::string why;
             t.expect(!readOceanJson(bad, savedSim, savedOcean, why) && !why.empty(),
                      "policy refusal reports error: %s", bad);

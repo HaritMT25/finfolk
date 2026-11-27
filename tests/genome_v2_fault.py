@@ -2,6 +2,9 @@
 """Named, disposable-copy mutants: compile success and the intended assertion.
 
 The source tree is never mutated. Each control/mutant has a recorded exit/log.
+Run after `cmake --preset native-serial && cmake --build --preset native-serial --parallel 2`:
+    nice -n 19 python3 tests/genome_v2_fault.py
+Requires c++, Python 3 and Node; no private build artifacts are used.
 Use --only NAME to narrow feedback; the default runs the full named inventory.
 """
 import argparse
@@ -51,7 +54,11 @@ MUTANTS = [
  ('bias_reach_oob','src/ocean/ocean_world.hpp','src < NUM_SENSES + MAX_INTERNAL_NEURONS && reach[src - NUM_SENSES]','reach[src - NUM_SENSES]','reach',"runtime error: index 12 out of bounds for type 'bool [12]'"),
  ('header_trust','web/ocean_handoff.js','if (a.policy !== e.policy) return "its brain policy differs from its header";','if (false) return "its brain policy differs from its header";','header','header trust'),
  ('header_duplicate','web/ocean_handoff.js','if (policyKeys.indexOf(r.key) >= 0 &&','if (false && policyKeys.indexOf(r.key) >= 0 &&','header','header duplicate'),
- ('policy_assign_then_validate','src/ocean/ocean_config.hpp','SimConfig& sc = policyInput ? nextSim : simConfig;','SimConfig& sc = simConfig;','ocean_policy','policy refusal preserves all config bytes'),
+ ('policy_assign_then_validate','src/ocean/ocean_config.hpp','SimConfig& sc = nextSim;','SimConfig& sc = simConfig;','ocean_policy','policy refusal preserves all config bytes'),
+ ('policy_input_only_staging','src/ocean/ocean_config.hpp',
+  'SimConfig& sc = nextSim;\n    OceanConfig& oc = nextOcean;',
+  'const auto* config = root.find("config");\n    const bool policyInput = config && (config->find("genomeVersion") || config->find("biasGenes") || config->find("hiddenNeurons") || config->find("brainEvalVersion"));\n    SimConfig& sc = policyInput ? nextSim : simConfig;\n    OceanConfig& oc = policyInput ? nextOcean : oceanConfig;',
+  'ocean_policy','policy refusal preserves all config bytes'),
 ]
 
 def main():
@@ -59,7 +66,7 @@ def main():
     names={m[0] for m in MUTANTS}
     if set(args.only)-names: parser.error('unknown mutant')
     selected=[m for m in MUTANTS if not args.only or m[0] in args.only]
-    work=Path(tempfile.mkdtemp(prefix='genome_v2_fault.',dir=ROOT/'build_g2pr2'))
+    work=Path(tempfile.mkdtemp(prefix='genome_v2_fault.'))
     print('evidence:',work,flush=True)
     def run(label,cmd,cwd,expected=0,match=None):
         start=time.monotonic();p=subprocess.run(cmd,cwd=cwd,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True)
@@ -68,6 +75,9 @@ def main():
         (work/(label+'.result')).write_text(f'exit={p.returncode}\nwall={time.monotonic()-start:.3f}\n')
         if (expected==0 and p.returncode!=0) or (expected!=0 and p.returncode!=expected) or (match and match not in p.stdout):
             raise SystemExit(f'{label}: unexpected exit/assertion {p.returncode}\n{p.stdout[-3000:]}')
+    generator=work/'gen_log_weight_table'
+    if any(m[4]=='table' for m in selected):
+        run('generator.compile',['c++','-O1','-std=c++20','-ffp-contract=off','-I',str(ROOT/'src'),str(ROOT/'tools/gen_log_weight_table.cpp'),'-o',str(generator)],ROOT)
     def check(label,tree,target,mutated=False,match=None):
         if target=='header':cmd=['node','tests/genome_v2_header_tests.cjs']
         elif target=='midpoints':
@@ -102,7 +112,7 @@ int main() {
             run(label+'.compile',['c++','-O1','-std=c++20','-ffp-contract=off','-I','src',*flags,'tests/'+name+'.cpp','-o',str(exe)],tree)
             cmd=[str(exe)]
             if target=='ocean_policy':cmd+=['--only','genome_v2']
-            if target=='table':cmd=['python3','tools/gen_log_weight_table.py','--check',str(ROOT/'build_g2pr2/gen_log_weight_table')]
+            if target=='table':cmd=['python3','tools/gen_log_weight_table.py','--check',str(generator)]
         run(label,cmd,tree,1 if mutated else 0,match if mutated else None)
     # Prove the acceptance checker refuses failures that cannot be credited as
     # mutant catches, including a different assertion with the same exit code.
@@ -133,7 +143,12 @@ int main() {
         # Both explicit population writers are deliberately planted together.
         expected_count=1
         if count!=expected_count:raise SystemExit(f'{name}: anchor count {count}, wanted {expected_count}')
-        path.write_text(source.replace(old,new))
+        source=source.replace(old,new)
+        if name=='policy_input_only_staging':
+            commit='    simConfig = nextSim;\n    oceanConfig = nextOcean;'
+            if source.count(commit)!=1: raise SystemExit(name+': publication anchor mismatch')
+            source=source.replace(commit,'    if (policyInput) {\n        simConfig = nextSim;\n        oceanConfig = nextOcean;\n    }')
+        path.write_text(source)
         check(name,tree,target,True,match)
         shutil.rmtree(tree)
         print('caught',name,flush=True)

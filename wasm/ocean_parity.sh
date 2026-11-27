@@ -25,6 +25,9 @@
 # reserves went -inf starves and is erased before any scan: the engine counts
 # what removed objects held, OceanWorld::totalNonFiniteRemoved, and the driver
 # adds it to the step's count); the nf_* list checks that this is caught.
+# Separate Genome v2 plain/eye, bias on/off checks in ocean_v2_parity.py
+# compare native == wasm == repeat-native, capture and births, cosmetic twins,
+# and v2/bias startup/live refusals. These have no historical baseline files.
 # Then builds tests/ocean_tests.cpp both ways and runs it (unit checks; their
 # output must also match between the builds).
 #
@@ -1143,6 +1146,16 @@ else
     echo "== offline reference FAILED:"; cat "$OUT/hydro_reference.txt"; FAILED=1
 fi
 
+# Separate opt-in checks never enter NAMES, the historical baseline matrix,
+# its twins, or the rebaseline writer. ONLY narrows this suite away as well.
+V2_OK=1
+if [ -z "${ONLY:-}" ]; then
+    V2_ARGS=()
+    [ -n "${NO_EYE:-}" ] && V2_ARGS+=(--no-eye)
+    [ -n "${NO_TESTS:-}" ] && V2_ARGS+=(--no-tests)
+    python3 wasm/ocean_v2_parity.py "$OUT" "${V2_ARGS[@]}" || V2_OK=0
+fi
+
 TESTS_OK=1
 if [ -z "${NO_TESTS:-}" ]; then
     for v in $VARIANTS; do
@@ -1165,6 +1178,7 @@ fi
 
 echo
 echo "== $(( $(date +%s) - T0 )) s total"
+[ "$V2_OK" = 1 ] || { echo "== OCEAN GENOME V2 PARITY FAILED (separate, non-baseline checks)"; exit 1; }
 if [ "$REBASE" = 1 ]; then
     echo "== rebaseline: ${#CHANGED[@]} case(s) differ from their baseline or have none${ORPHANS:+; orphans:$ORPHANS}"
     for i in "${CHANGED[@]}"; do echo "   ${NAMES[$i]}: ${CHANGE_WHY[$i]}"; done
