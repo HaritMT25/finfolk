@@ -2223,24 +2223,28 @@
   btn("savecp", saveCheckpoint);
   /* Load world: the file is read, then opened, or first asked about when the
    * run has something to lose (the Ocean's From a file: the question names
-   * the saved world); a file that is not JSON opens at once (the engine
-   * refuses it: nothing is lost). Opened from the keyboard, the question
-   * takes the focus and Keep it gives it back to Load world. */
+   * the saved world with what the page could read of it). A file the page
+   * cannot read as one (not JSON, or not an object) is refused here, never
+   * handed to the engine unasked: its reader takes forms JSON does not (a
+   * number such as +1), so what the page reads must never decide whether to
+   * ask. Opened from the keyboard, the question takes the focus and Keep it
+   * gives it back to Load world. */
   var fileOpener = null;
   el("loadcp").addEventListener("click", function (e) {
     fileOpener = EvoUI.pressedByKeyboard(this, e) ? this : null;
     if (!guardTurbo()) el("cpfile").click();
     this.blur();
   });
-  function savedWorldText(text, name) {
+  /* {what}: the saved world, as the question names it; {bad}: why it is refused */
+  function savedWorld(text, name) {
     var cp = null;
-    try { cp = JSON.parse(text); } catch (e) { return null; }
-    if (!cp || typeof cp !== "object") return null;
+    try { cp = JSON.parse(text); } catch (e) { return { bad: "it is not valid JSON (" + (e && e.message || e) + ")" }; }
+    if (!cp || typeof cp !== "object" || Array.isArray(cp)) return { bad: "it is not a saved world" };
     var w = cp.world || {}, n = cp.creatures ? cp.creatures.count : undefined, bits = [];
     if (typeof w.frame === "number") bits.push("frame " + w.frame.toLocaleString());
     if (typeof n === "number") bits.push(n.toLocaleString() + " fish");
     if (typeof w.width === "number" && typeof w.height === "number") bits.push(w.width + " × " + w.height);
-    return "the saved world" + (name ? " " + name : "") + (bits.length ? " (" + bits.join(", ") + ")" : "");
+    return { what: "the saved world" + (name ? " " + name : "") + (bits.length ? " (" + bits.join(", ") + ")" : "") };
   }
   el("cpfile").addEventListener("change", function () {
     var file = this.files && this.files[0], opener = fileOpener;
@@ -2248,9 +2252,10 @@
     this.value = "";
     if (!file || !Module || engineDown || guardTurbo()) return;
     file.text().then(function (text) {
-      var world = savedWorldText(text, file.name);
-      if (!world) { openWorld(text); return; }
-      if (replaceRun("load", function () { openWorld(text); }, { world: world }) === "asked" && opener) {
+      if (!Module || engineDown || guardTurbo()) return;   /* (the engine stopped, or Turbo started, while it was read) */
+      var w = savedWorld(text, file.name);
+      if (w.bad) { showError("Couldn't load that checkpoint: " + w.bad + ". Nothing changed."); return; }
+      if (replaceRun("load", function () { openWorld(text); }, { world: w.what }) === "asked" && opener) {
         asking.opener = opener; el("startconfirm").focus();
       }
     }, function (err) { showError("Couldn't read that file: " + err); });
