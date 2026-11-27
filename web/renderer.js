@@ -882,7 +882,7 @@
   function updateSenseLine() {
     if (netHover >= 0 && netNodes[netHover]) {
       var n = netNodes[netHover];
-      var label = n.kind === "Sense" ? senseName(n.i) : n.kind === "Action" ? ACTION_LABELS[n.i] : "neuron " + (n.i + 1);
+      var label = n.kind === "Bias" ? "Bias (+1)" : n.kind === "Sense" ? senseName(n.i) : n.kind === "Action" ? ACTION_LABELS[n.i] : "neuron " + (n.i + 1);
       var html = EvoUI.senseHtml(n, cardFresh);
       if (cardCache.sense !== html + label) {
         cardCache.sense = html + label;

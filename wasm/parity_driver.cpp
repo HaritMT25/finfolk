@@ -128,6 +128,7 @@ int main(int argc, char** argv) {
     const unsigned seed = (unsigned)std::strtoul(argv[1], nullptr, 10);
     const long steps = std::strtol(argv[2], nullptr, 10);
     bool rich = false, tri = false, tor = false, bodyModel = false;
+    bool genomeV2 = false, biasGenes = false;
     WeightMutationMode weightMode = WeightMutationMode::Legacy;
     float reproMaxDistance = -1.0f;
     float reproSoftWidth = 0.0f, reproGracePeriod = 0.0f;
@@ -138,6 +139,7 @@ int main(int argc, char** argv) {
     float predMeal = -2.0f;   // < -1.5 => leave the config default alone
     const char* engineVersion = "parity";
     long traceEvery = 0;
+    long resumeAt = -1;
     for (int i = 3; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--rich")) rich = true;
         else if (!std::strcmp(argv[i], "--tri")) tri = true;
@@ -166,6 +168,9 @@ int main(int argc, char** argv) {
             predMaxAge = (float)std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "--engine-version") && i + 1 < argc) engineVersion = argv[++i];
         else if (!std::strcmp(argv[i], "--trace") && i + 1 < argc) traceEvery = std::strtol(argv[++i], nullptr, 10);
+        else if (!std::strcmp(argv[i], "--resume-at") && i + 1 < argc) resumeAt = std::strtol(argv[++i], nullptr, 10);
+        else if (!std::strcmp(argv[i], "--genome-v2")) genomeV2 = true;
+        else if (!std::strcmp(argv[i], "--bias-genes")) biasGenes = true;
         else if (!std::strcmp(argv[i], "--weight-mutation-mode") &&
                  i + 1 < argc) {
             if (!parseWeightMutationMode(argv[++i], weightMode)) {
@@ -209,11 +214,30 @@ int main(int argc, char** argv) {
     if (predFrozen) world.cfg.predatorFrozen = true;         // the frozen assay's accounting
     if (predMaxAge > 0.0f) world.cfg.predatorMaxAge = predMaxAge;
     world.cfg.weightMutationMode = weightMode;
+    if (genomeV2) {
+        world.cfg.genomeVersion = 2; world.cfg.brainEvalVersion = 2;
+        world.cfg.biasGenes = biasGenes; world.cfg.weightMutationMode = WeightMutationMode::Saturating;
+    }
+    if (const char* why = brainPolicyConfigError(world.cfg)) {
+        std::fprintf(stderr, "%s\n", why); return 2;
+    }
     world.init(1920, 1080, 300);
 
     const auto t0 = std::chrono::steady_clock::now();
     for (long i = 0; i < steps; ++i) {
         world.update(0.016f);
+        if (i + 1 == resumeAt) {
+            const auto saved = checkpoint::serialize(world, engineVersion);
+            std::string error;
+            // Restore into a fresh world so the continuation cannot retain
+            // unsaved derived or recurrent state from the original instance.
+            World restored;
+            if (!checkpoint::deserialize(saved, restored, error)) {
+                std::fprintf(stderr, "continuation load failed: %s\n", error.c_str());
+                return 4;
+            }
+            world = std::move(restored);
+        }
         if (traceEvery > 0 && (i + 1) % traceEvery == 0)
             std::fprintf(stderr, "%ld %016llx\n", i + 1, (unsigned long long)fingerprint(world));
     }

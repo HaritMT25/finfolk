@@ -128,6 +128,10 @@ interface OceanModule {
   _oc_num_senses(): number;
   _oc_num_actions(): number;
   _oc_num_hidden(): number;
+  _oc_genome_version?(): number;
+  _oc_bias_genes?(): number;
+  _oc_brain_eval_version?(): number;
+  _oc_weight_mutation_mode?(): number;
   _oc_sensor_names(): number;
   _oc_action_names(): number;
   _oc_inspect(index: number): number;
@@ -253,7 +257,8 @@ interface WorldRead {
   body(cancelled?: () => boolean, turn?: () => Promise<unknown>): Promise<WorldBody>;
 }
 /** a module's world, read (worldNow), and what a header says it is (worldExpect) */
-interface WorldNow { w: number; h: number; d: number; fish: number; food: number; pred: number; walls: boolean; frame: number }
+interface WorldNow {
+  policy: string; w: number; h: number; d: number; fish: number; food: number; pred: number; walls: boolean; frame: number }
 interface WorldExpect extends WorldNow { picked: boolean }
 /** headerProblem's rules: the sheet's keys and live keys, the size limits, Save setup's version */
 interface HeaderRules {

@@ -5585,7 +5585,42 @@ async function pageSetupUX() {
     ok(!p.uncaught.length, 'no exception escaped the Setup UX handlers');
 }
 
+async function genomeV2World() {
+    section('Genome v2 policy persists through main save/open and rejects forged image policy');
+    for (const bias of [false, true]) {
+        const cfg = { genomeVersion: 2, brainEvalVersion: 2, biasGenes: bias, hiddenNeurons: 12, weightMutationMode: 'saturating' };
+        const query = '?seed=4242&population=60&width=1920&height=1080&depth=240&cfg=' + encodeURIComponent(JSON.stringify(cfg));
+        const p = await bootPage(query);
+        ok(p.M._oc_genome_version() === 2 && p.M._oc_bias_genes() === Number(bias), 'v2 actual image exports, bias ' + bias);
+        runPage(p, 100);
+        const s = await savedWorld(p), h = HO.worldHeader(s.bytes).header;
+        ok([h.start.cfg, h.runCfg, h.setup.config].every(c => c.genomeVersion === 2 && c.biasGenes === bias && c.brainEvalVersion === 2), 'v2 setup/start/run metadata');
+        const q = await bootPage(PAGE_Q7), epoch = q.T.worldEpoch;
+        await openWorld(q, s.bytes, s.name);
+        if (q.T.asking) q.click('startconfirm');
+        await until(() => q.T.worldEpoch !== epoch, 'v2 world opened');
+        ok(!sameFor(p.M, q.M, 60), 'v2 save/open identical continuation');
+        const forged = await resealed(s.bytes, head => {
+            for (const c of [head.start.cfg, head.runCfg, head.setup.config]) c.biasGenes = !bias;
+        });
+        const r = await bootPage(PAGE_Q7), before = runOf(r);
+        const said = await openWorld(r, forged);
+        ok(/brain policy/.test(said) && sameRun(r, before), 'coherent resealed header cannot override actual image policy');
+        // Repeated fields have identical final JSON values and a valid checksum;
+        // the byte parser must refuse their ambiguity before image restoration.
+        const original = HO.worldHeader(s.bytes);
+        const text = JSON.stringify(original.header).replace('"genomeVersion":2', '"genomeVersion":1,"genomeVersion":2');
+        const hb = Buffer.from(text), length = Buffer.alloc(4); length.writeUInt32LE(hb.length);
+        const duplicate = new Uint8Array(Buffer.concat([Buffer.from(HO.WORLD.MAGIC, 'latin1'), length, hb, Buffer.from(s.bytes.subarray(original.at))]));
+        const why = await refusal(duplicate);
+        ok(/repeated brain policy member/.test(why), 'duplicate header policy member refused');
+    }
+}
+
 const SECTIONS = {
+    genomeV2World,
+    roundTripGenomeV2: () => roundTrip('Genome v2 with bias', { genomeVersion: 2, brainEvalVersion: 2, biasGenes: true, hiddenNeurons: 12, weightMutationMode: 'saturating' }),
+    roundTripGenomeV2NoBias: () => roundTrip('Genome v2 without bias', { genomeVersion: 2, brainEvalVersion: 2, biasGenes: false, hiddenNeurons: 12, weightMutationMode: 'saturating' }),
     pageSetupUX,
     weightPolicyWorld,
     roundTripSaturating: () =>
