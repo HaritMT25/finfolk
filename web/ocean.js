@@ -379,7 +379,7 @@
     get turboState() { return turboState; },
     get lastS() { return lastS; },
     get scene() { return scene; },
-    get colourMode() { return colourMode; },
+    get display() { return display; },
     get statOpen() { return statOpen; },
     get paused() { return paused; },
     get BODY_LAYOUT() { return BODY_LAYOUT; },
@@ -644,11 +644,11 @@
       inspector.resetSelection();
       if (scene && scene.following()) scene.setFollow(false);
     }
-    applyDisplaySwitches();
+    display.applyDisplaySwitches();
     /* the card's clock starts over here, and only here (never at a display switch: review of #91, P2): a world the
      * page has not seen step, so its fish's kept activations, if any, are no step the card can vouch for */
     inspector.resetBrainClock(syncedFrame(), has("oc_set_capture") && inspector.selectedId !== null);
-    updateModeline();     /* the world's appearance genes may differ */
+    display.updateModeline();     /* the world's appearance genes may differ */
     estPrev.n = 0;
     stepMs = 0;
     if (!fromTurbo) {
@@ -658,21 +658,6 @@
     }
     readouts.dirtyHud = true;
     updateFitButton();
-  }
-  /* the shim's display switches: the colour mode is the shim's (memory), the
-   * capture flag the world's, so both are set again after every new world and
-   * every Turbo hand-off, and whenever the colour mode changes (setColourMode).
-   * None changes a step's activations: the card's clock hears only of a capture
-   * that switched (none, when the selection already set it); a new world resets
-   * it (afterNewWorld) */
-  function applyDisplaySwitches() {
-    if (has("oc_set_colour_mode")) M._oc_set_colour_mode(colourBrain ? 0 : 1);
-    if (scene && scene.setAppearance) scene.setAppearance(colourMode === "appearance");
-    if (has("oc_set_capture")) {
-      var cap = inspector.selectedId !== null;
-      M._oc_set_capture(cap ? 1 : 0);
-      inspector.captureBrainClock(cap, syncedFrame());
-    }
   }
 
   /* ---- the sheet (built from EvoOceanConfig.TABS) ---- */
@@ -922,7 +907,7 @@
       setVal(key, v); updateNeeds(); updateTabDots();
     }
     renderStartBar();
-    engineCall(updateModeline);   /* (its live tweaks) */
+    engineCall(display.updateModeline);   /* (its live tweaks) */
     if (!quiet) showNote((LABELS[key] || key) + " is now " + shown(v) + " (live)");
   }
   /* a refused live value: the field goes back to the newest edit of it still
@@ -2234,9 +2219,21 @@
   inspector.initSelection();
   var animT = 0, lastNow = 0;
   var fpsFrames = 0, fpsT = 0, fps = 0;
-  var governorOn = !BENCH, colourBrain = false, colourMode = "family";
+  var governorOn = !BENCH;
+  var display = EvoOceanDisplay.create({
+    el: el, has: has, inspector: inspector, syncedFrame: syncedFrame, toast: toast, coarseMQ: coarseMQ, updateKeysLegend: updateKeysLegend, store: store, pointerBlur: pointerBlur, P: P, BENCH: BENCH, engineCall: engineCall, setPop: setPop, setDrawer: setDrawer, setSheetTab: setSheetTab, changedKeys: changedKeys, setHtml: setHtml,
+    get M() { return M; },
+    get scene() { return scene; },
+    get HAS_APP() { return HAS_APP; },
+    get HAS_EYE() { return HAS_EYE; },
+    get W() { return W; },
+    get H() { return H; },
+    get D() { return D; },
+    get WALLS() { return WALLS; },
+    get historyUnknown() { return historyUnknown; }
+  });
   var readouts = EvoOceanReadouts.create({
-    el: el, DT: DT, has: has, fresh: fresh, STATS: STATS, updateKeysLegend: updateKeysLegend, showSpeedCap: showSpeedCap, speed: speed, setHtml: setHtml, setTxt: setTxt, fmtInt: fmtInt, fmtTime: fmtTime, lightOn: lightOn, inspector: inspector, heap: heap, cString: cString, turboWiring: turboWiring, engineCall: engineCall, tankShowsFamily: tankShowsFamily, setColourMode: setColourMode, setDrawer: setDrawer, setPop: setPop,
+    el: el, DT: DT, has: has, fresh: fresh, STATS: STATS, updateKeysLegend: updateKeysLegend, showSpeedCap: showSpeedCap, speed: speed, setHtml: setHtml, setTxt: setTxt, fmtInt: fmtInt, fmtTime: fmtTime, inspector: inspector, display: display, heap: heap, cString: cString, turboWiring: turboWiring, engineCall: engineCall, setDrawer: setDrawer, setPop: setPop,
     get D() { return D; },
     get M() { return M; },
     get HO() { return HO; },
@@ -2250,7 +2247,6 @@
     get turboStats() { return turboStats; },
     get scene() { return scene; },
     get statsLen() { return statsLen; },
-    get colourMode() { return colourMode; },
     get turboWorker() { return turboWorker; },
     hideCoach: function () { tour.hideCoach(); }
   });
@@ -2288,18 +2284,6 @@
   /* the world's frame as the shim's last oc_sync left it: every step the page takes is synced at once (the
    * frame loop, EvoOcean.step), so this is the world's tick between them (no sync here: it allocates) */
   function syncedFrame() { return HO.f64(M, M._oc_stats(), statsLen)[1]; }
-  function onFollowChange(on) {
-    el("followbtn").setAttribute("aria-pressed", on ? "true" : "false");
-    el("followbtn").title = on ? "Stop following (F or Esc)" : "Follow this fish (F)";
-    if (!on) inspector.wantFollow = false;
-    if (on) toast(coarseMQ.matches ? "Following. Drag to circle around it."
-                                   : "Following. Drag or A / D to circle it, W / S to come closer or back off; Esc stops.");
-    /* Light while following: on as the follow starts, back as it was when it ends */
-    if (on) { lightBeforeFollow = lightNow; if (followLight) lightNow = true; }
-    else lightNow = lightBeforeFollow;
-    updateLight();
-    updateKeysLegend();
-  }
 
   /* ---- the keys legend (a wide screen with a mouse; ocean.html #keys) ----
    * One line for what is on screen now: the camera's keys (fly, or around the
@@ -2315,27 +2299,7 @@
     setHtml("keys", parts.join(""));
   }
 
-  /* ---- the flashlight (drawing only; scene.setFlashlight) ----
-   * One light, on or off now: the dock's button, L and the View menu's
-   * switch turn it on and off, and nothing else changes it but a follow. One
-   * preference, "Light while following" (the View menu's switch, stored):
-   * following a fish turns the light on, letting go puts it back as it was
-   * (onFollowChange). L never writes the preference. */
-  var followLight = store("evo_boids.ocean.followLight") !== "0", lightNow = false, lightBeforeFollow = false;
-  function lightOn() { return lightNow; }
-  function updateLight() {
-    var on = lightNow;
-    if (scene) scene.setFlashlight(on);
-    var b = el("lightbtn");
-    b.setAttribute("aria-pressed", on ? "true" : "false");
-    b.title = (on ? "Flashlight on (L)" : "Flashlight (L)") + ": clear light where you look, in true colours";
-    el("lightnow").checked = on;
-  }
-  function toggleLight() {
-    lightNow = !lightNow;
-    if (lightNow && !(scene && scene.following())) toast("Flashlight on: true colours where you look, without the water's tint.");
-    updateLight();
-  }
+  display.initLight();
 
   /* ---- the View menu and Help: one popover at a time; ×, Esc, its key or a
    * press outside closes it. [popover, trigger, its first control] ---- */
@@ -2386,9 +2350,9 @@
     readouts: readouts, enterTurbo: enterTurbo, setDrawer: setDrawer, setSheetTab: setSheetTab, engineCall: engineCall, fresh: fresh,
     get turboState() { return turboState; }, get openPop() { return openPop; },
     get statOpen() { return statOpen; }, get drawerEl() { return drawerEl; },
-    get colourMode() { return colourMode; }, get HAS_APP() { return HAS_APP; }, get colourBrain() { return colourBrain; },
+    get HAS_APP() { return HAS_APP; },
     get M() { return M; }, get lastS() { return lastS; }, get scene() { return scene; },
-    inspector: inspector
+    inspector: inspector, display: display
   });
 
   /* ---------------- the readout and the stat panel ---------------- */
@@ -2759,7 +2723,7 @@
       }
     } else slowSince = 0;
   }
-  function restoreDetail() { if (scene && detail0 && scene.setQuality(detail0)) engineCall(updateModeline); }
+  function restoreDetail() { if (scene && detail0 && scene.setQuality(detail0)) engineCall(display.updateModeline); }
 
   /* ---------------- the loop ---------------- */
   var splashDone = false;
@@ -2820,7 +2784,7 @@
     fpsFrames++;
     if (now - fpsT >= 1000) {
       fps = Math.round(fpsFrames * 1000 / (now - fpsT)); fpsFrames = 0; fpsT = now; readouts.dirtyHud = true; govern(now);
-      if (scene.quality() !== modelineDetail) updateModeline();   /* (the detail changed: Hold 60 fps, or a benchmark's case) */
+      if (scene.quality() !== display.modelineDetail) display.updateModeline();   /* (the detail changed: Hold 60 fps, or a benchmark's case) */
     }
     readouts.updateHud(s, now);
     PROF.lap(SP.hud, pt);
@@ -2905,7 +2869,7 @@
       if (lk === "i") { setPop(null); setStatPanel(!statOpen); return; }
       /* the view: always */
       if (lk === "c") { inspector.wantFollow = false; scene.resetView(true); if (inspector.turboReturn) inspector.turboReturn.follow = false; return; }
-      if (lk === "l") { toggleLight(); return; }
+      if (lk === "l") { display.toggleLight(); return; }
       if (lk === "f") { inspector.follow(); return; }
       /* Turbo: Space stops it (as T does); the speed and the step are Turbo's
        * own while it runs, and say so */
@@ -3128,7 +3092,7 @@
     if (startMenuOpen() && !(e.target.closest && e.target.closest("#startmenu, #startmenubtn"))) setStartMenu(false);
   });
   askBtn("replay", replay);
-  btn("lightbtn", toggleLight);
+  btn("lightbtn", display.toggleLight);
   ["view", "help"].forEach(function (n) {   /* the triggers; × closes (pointerBlur, setPop: the focus) */
     el(POPS[n][1]).addEventListener("click", function () {
       var kb = UI.keyboardFocused(this);
@@ -3140,11 +3104,7 @@
   btn("tourbtn", function () { setPop(null); if (window.EvoGuide) EvoGuide.start(); });
   btn("whatturbo", function () { setPop(null); if (window.EvoGuide && EvoGuide.turbo) EvoGuide.turbo(); });
   el("to2dmenu").href = el("to2d").href;   /* the deploy build renames Classic's page in #to2d */
-  el("lightnow").addEventListener("change", function () {
-    lightNow = this.checked;
-    updateLight();
-    pointerBlur(this);
-  });
+  display.wireLightSwitch();
   btn("viewbtn", function () { if (scene) { inspector.wantFollow = false; scene.resetView(true); if (inspector.turboReturn) inspector.turboReturn.follow = false; } });
   btn("fitbtn", fitToScreen);
   btn("followbtn", function () {
@@ -3220,135 +3180,13 @@
     if (!governorOn) restoreDetail();
     pointerBlur(this);
   });
-  el("followLight").addEventListener("change", function () {   /* the preference; following now, it applies now */
-    followLight = this.checked;
-    store("evo_boids.ocean.followLight", followLight ? "1" : "0");
-    if (scene && scene.following()) lightNow = followLight || lightBeforeFollow;
-    updateLight();
-    pointerBlur(this);
-  });
-  el("followLight").checked = followLight;
-  /* Fish colour: the fish's own appearance genome (its skin pattern; the
-   * Ocean only, and the default), by family line, or by brain similarity.
-   * Every mode draws each fish in its inherited body shape when the module
-   * exports the genome (HAS_APP); family and brain only recolour the skin.
-   * ?colour= wins, then the visitor's own last choice (stored only when they
-   * pick one), else appearance. The key and ?colour= are shared with
-   * Classic, which reads "appearance" as family. Display only. */
-  (function () {
-    var want = P.get("colour"), saved = store("evo_boids.colourBy");
-    if (want !== "brain" && want !== "family" && want !== "appearance")
-      want = saved === "brain" || saved === "family" ? saved : "appearance";
-    colourMode = want;
-    colourBrain = want === "brain";
-    showColourMode();
-  })();
-  /* the View menu's three buttons; the line under them says what the mode
-   * shows, or why Appearance can't (updateModeline), with the way to fix it */
-  function showColourMode() {
-    el("colourMode").querySelectorAll("button").forEach(function (b) { b.setAttribute("aria-pressed", b.dataset.c === colourMode ? "true" : "false"); });
-  }
-  /* The one way the colour mode changes: the View menu's buttons and the
-   * benchmark's cases (web/ocean_perf.js prepare) both come here, so a case
-   * runs in the mode it names. false: no such mode (nothing changes). The
-   * visitor's choice is stored, never a benchmark's. */
-  function setColourMode(mode) {
-    if (mode !== "appearance" && mode !== "family" && mode !== "brain") return false;
-    colourMode = mode;
-    colourBrain = colourMode === "brain";
-    if (!BENCH) store("evo_boids.colourBy", colourMode);   /* a benchmark's cases are not the visitor's choice */
-    showColourMode();
-    if (M) engineCall(applyDisplaySwitches);   /* (a stopped engine: the view's choice is kept; a restarted one gets it with its run) */
-    engineCall(updateModeline);
-    return true;
-  }
-  el("colourMode").addEventListener("click", function (e) {
-    var b = e.target.closest("button[data-c]");
-    if (!b) return;
-    setColourMode(b.dataset.c);
-    pointerBlur(b);
-  });
-  el("colourwhy").addEventListener("click", function (e) {   /* "Setup › Life › Appearance genes" */
-    if (!e.target.closest("#colourfix")) return;
-    setPop(null); setDrawer(true); setSheetTab("life");
-    var row = el("f_appearance");
-    if (row) row.scrollIntoView({ block: "center" });
-  });
-  /* Water clarity: how murky the water is drawn (scene.setClarity; drawing
-   * only, live), 0 realistic (the Ocean's first look, kept for reference)
-   * .. 1 clear (the default). ?clarity= (clear, realistic, 0..1 or a
-   * percentage) wins and is not stored; then the visitor's own last choice
-   * (stored when they move the slider); else clear. */
-  var clarity = 1;
-  function parseClarity(v) {
-    if (v === null || v === undefined) return null;
-    v = String(v).trim().toLowerCase();
-    if (v === "clear") return 1;
-    if (v === "realistic") return 0;
-    var x = v === "" ? NaN : Number(v);
-    if (!isFinite(x)) return null;
-    if (x > 1) x /= 100;   /* a percentage */
-    return Math.max(0, Math.min(1, x));
-  }
-  function clarityLabel(u) { return u >= 1 ? "Clear" : u <= 0 ? "Realistic" : Math.round(u * 100) + " % clear"; }
-  function applyClarity() {
-    var inp = el("clarity");
-    inp.value = String(Math.round(clarity * 100));
-    inp.setAttribute("aria-valuetext", clarityLabel(clarity));
-    el("clarityval").textContent = clarityLabel(clarity);
-    if (scene && scene.setClarity) scene.setClarity(clarity);
-  }
-  (function () {
-    var want = parseClarity(P.get("clarity")), saved = parseClarity(store("evo_boids.ocean.clarity"));
-    clarity = want !== null ? want : saved !== null ? saved : 1;
-    applyClarity();
-  })();
-  el("clarity").addEventListener("input", function () {
-    clarity = Math.max(0, Math.min(1, (+this.value || 0) / 100));
-    store("evo_boids.ocean.clarity", String(clarity));
-    applyClarity();
-  });
-  el("clarity").addEventListener("pointerup", function () { this.blur(); });   /* the keys go back to the tank; arrow keys keep it */
-  /* the tank draws family colours: Family, or Appearance where the world has no appearance genes (updateModeline's rule) */
-  function tankShowsFamily() {
-    if (colourMode !== "appearance") return colourMode === "family";
-    return !engineCall(function () { return HAS_APP ? (has("oc_appearance_flags") ? M._oc_appearance_flags() : 3) : 0; }, 3);
-  }
-  var modelineDetail = 0;   /* the detail level the modeline says */
-  function updateModeline() {
-    /* the world's appearance genes (bit 1 patterns, bit 2 shapes; 0 = off, or a module without them) */
-    var flags = HAS_APP ? (has("oc_appearance_flags") ? M._oc_appearance_flags() : 3) : 0;
-    var what = colourMode === "appearance"
-      ? (flags ? ", each fish drawn from its appearance genes (skin pattern and body shape)"
-               : ", coloured by family (" + (HAS_APP ? "the appearance genes are off in this world" : "this module has no appearance genes") + ")")
-      : (flags & 2 ? ", each fish in its inherited body shape" : "") + (colourBrain ? ", coloured by brain" : ", coloured by family");
-    /* what replays: the module is serial and Hold 60 fps never changes the run; a live change is not part of the setup,
-     * set back or not (changedKeys: the run's history); a world opened from a file, its history unknown (historyUnknown).
-     * As data too: data-replay "yes" / "no" / "unknown", data-why "live" and / or "opened". */
-    var tw = changedKeys().length, ml = el("modeline");
-    modelineDetail = scene ? scene.quality() : 0;
-    ml.dataset.replay = tw ? "no" : historyUnknown ? "unknown" : "yes";
-    ml.dataset.why = [tw ? "live" : "", historyUnknown ? "opened" : ""].filter(Boolean).join(" ");
-    ml.textContent = "Running the single-threaded Ocean module" + (HAS_EYE ? " (the eye build)" : "") +
-      ": the same seed and setup replay a run step for step" +
-      (tw ? "; " + (tw === 1 ? "a setting was" : tw + " settings were") + " changed live during this run, which is not part of its setup" +
-            " (even if set back), so Replay starts it again without " + (tw === 1 ? "that change" : "those changes")
-          : historyUnknown ? "; this world was opened from a file, which does not record what changed live before it was saved, so whether" +
-            " Replay repeats this run is unknown (Start or Replay begins one that does)" : "") +
-      ". The tank: " + W + " × " + H + " × " + D +
-      (WALLS ? ", glass walls" : ", the sides wrap around") +
-      ". Drawing: the 3D tank" + (scene ? ", detail " + scene.quality() + " of 3" : "") +
-      what + ".";
-    var noApp = !!M && colourMode === "appearance" && !flags;   /* the View menu: what the colours show, or why not */
-    el("colourwhy").classList.toggle("why", noApp);
-    setHtml("colourwhy", noApp
-      ? (HAS_APP ? "Appearance genes are off in this world, so the fish show family colours. To turn them on: " +
-                   "<button type='button' class='linkbtn' id='colourfix'>Setup › Life › Appearance genes</button>, then Start."
-                 : "This engine build has no appearance genes, so the fish show family colours.")
-      : colourMode === "appearance" ? "Each fish wears the skin pattern and body shape it inherited."
-      : colourMode === "brain" ? "Fish with similar brains get similar colours."
-      : "Each family line has its own colour, the same one it has in the charts.");
-  }
+  display.wireFollowLight();
+  display.initColourMode();
+  display.wireColourControls();
+  display.initClarity();
+  display.loadClarity();
+  display.wireClarity();
+  display.initModeline();
   setPaused(BENCH);
   changeSpeed(0);
   updateLocks();   /* the mode the page starts in: Live (or Paused), no Turbo strip */
@@ -3460,7 +3298,7 @@
       tankDepth: D,
       coarse: coarseMQ.matches,
       reducedMotion: reducedMQ.matches,
-      bodyScale: bodyScale, onFollowChange: onFollowChange,
+      bodyScale: bodyScale, onFollowChange: display.onFollowChange,
       /* ?renderOpt=0: the reference drawing pipeline, as before the render optimization (an A/B link; display only) */
       renderOptimization: P.get("renderOpt") !== "0",
       profiler: PERF ? PROF : null, visualRandom: BENCH ? PERF.visualRandom(2463534242) : null
@@ -3469,13 +3307,13 @@
     detail0 = scene.quality();
     scene.setWorld(W, H, D, { walls: WALLS });
     scene.setLight(LIGHT);
-    if (scene.setAppearance) scene.setAppearance(colourMode === "appearance");
+    if (scene.setAppearance) scene.setAppearance(display.colourMode === "appearance");
     readouts.labelHist();
     wireInput();
     updateInsets();
-    updateLight();
-    updateModeline();
-    applyClarity();
+    display.updateLight();
+    display.updateModeline();
+    display.applyClarity();
     readouts.attach();
     /* (the handles that read the world through fresh(), which cuts a new snapshot from the engine when
      * the memory grew: each fenced whole, as select's and set's are; review of #44, round 4, finding 3) */
@@ -3500,7 +3338,7 @@
             var now = KEYS[key] ? valOf(key, wholeKey(key) ? Math.trunc(+v) : +v) : +v;
             if (was === undefined || now !== was) changedLive[key] = true;
             consoleSet[key] = now;
-            updateModeline();
+            display.updateModeline();
           }
           readLight();
           return !!ok;
@@ -3524,7 +3362,7 @@
                  hasVz: HAS_VZ, view: scene.view(), e1: E1, cfg: initArgs ? initArgs.cfg : null, seed: initArgs ? initArgs.seed : null,
                  runCfg: Object.assign({}, runCfg), light: LIGHT, flashlight: scene.flashlight(), flashlightLevel: scene.flashlightLevel(),
                  stepMs: stepMs, fps: fps, following: scene.following(), selectedId: inspector.selectedId, selIdx: s.selIdx,
-                 turbo: turboState, colourMode: colourMode, colourBrain: colourBrain, frame: s.stats[1],
+                 turbo: turboState, colourMode: display.colourMode, colourBrain: display.colourBrain, frame: s.stats[1],
                  held: live.held(), inflight: live.inflight(), fixedSize: [URL_W, URL_H], walls: WALLS, hasWalls: hasWalls(),
                  stats: Array.prototype.slice.call(s.stats), depthMin: s.n ? lo : 0, depthMax: s.n ? hi : 0,
                  dashRows: readouts.dash() ? readouts.dash()._rows().length : 0, worldEpoch: worldEpoch,
@@ -3543,7 +3381,7 @@
         return engineCall(function () { return importWorld.apply(null, a); }, engineBusyWhy());
       },
       /* the page's own colour switch and state, and whether the charts are up (they suspend the tank) */
-      setColourMode: setColourMode, colourMode: function () { return colourMode; },
+      setColourMode: display.setColourMode, colourMode: function () { return display.colourMode; },
       dashOpen: function () { return !!(readouts.dash() && readouts.dash().isOpen()); } });
     requestAnimationFrame(frame);
     window.EvoApp.ready = true;

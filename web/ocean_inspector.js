@@ -192,8 +192,8 @@
   }
   /* what the colour key's colour is, in this colour mode (its title) */
   function keyTitle() {
-    return "A colour key, not a likeness: " + (ports.colourMode === "brain" ? "the colour of its brain (similar wiring, similar colour)"
-      : ports.colourMode === "appearance" ? "the colour of its family line, as the charts show it; in the tank it wears its own skin (below)"
+    return "A colour key, not a likeness: " + (ports.display.colourMode === "brain" ? "the colour of its brain (similar wiring, similar colour)"
+      : ports.display.colourMode === "appearance" ? "the colour of its family line, as the charts show it; in the tank it wears its own skin (below)"
       : "the colour of its family line, as the charts show it") + ".";
   }
   /* oc_inspect(idx) right after the sync: its numbers, then the card */
@@ -230,7 +230,7 @@
     }
     var info = f.info, id = Math.round(info[0]);
     var rgb = [s.colors[3 * idx], s.colors[3 * idx + 1], s.colors[3 * idx + 2]];
-    var pkey = id + "|" + rgb.join() + "|" + info[4].toFixed(2) + "|" + info[5].toFixed(2) + "|" + ports.colourMode;
+    var pkey = id + "|" + rgb.join() + "|" + info[4].toFixed(2) + "|" + info[5].toFixed(2) + "|" + ports.display.colourMode;
     if (cardFor !== pkey) {
       cardFor = pkey;
       EvoUI.drawPortrait(portraitEl, rgb, info[4], info[5], window.devicePixelRatio || 1);
