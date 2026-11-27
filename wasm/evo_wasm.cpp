@@ -133,6 +133,74 @@ void clampConfig(SimConfig& c) {
     if (c.predatorMaxPopulation < 0) c.predatorMaxPopulation = 0;
 }
 
+// Classic browser resource limits (UI/worker mirrors: renderer.js, worker.js).
+// Setting(s)                                           Safe upper limit
+// population, minPopulation                            20,000
+// predatorCount, predatorMinPopulation                  10,000
+// targetFood                                           100,000 (hard cap 200,000)
+// foodSpawnBase, foodSpawnAmp (absolute value)          100,000 (sum <= 200,000)
+// genomeMinLength, genomeMaxLength,
+//   genomeInitMin, genomeInitMax                         1,024
+// foodPatches, currentEddies                            10,000
+// reproWindow                                          1,000,000
+// width, height                                        4,096 each
+// spatial-grid cells                                   16,785,409 each
+// Individual ceilings leave headroom for vector growth and the MT module's
+// buffers. All current UI defaults, hints, presets and benchmark sizes fit.
+// No allocation or RNG is changed for accepted values. maxPopulation/predatorMaxPopulation are birth checks,
+// not allocations (0 remains unlimited). init/set still clamp the predator
+// floor to 2000; a loaded 2001 remains legal until an accepted setter clamps it.
+// Reject before readConfig's narrowing conversion and before World::init,
+// including legacy checkpoint init's throwaway food/patch/eddy allocations.
+struct ResourceLimit { const char* key; double upper; };
+constexpr ResourceLimit kResourceLimits[] = {
+    {"minPopulation", 20000},
+    {"targetFood", 100000},
+    {"foodSpawnBase", 100000},
+    {"foodSpawnAmp", 100000},
+    {"predatorCount", 10000},
+    {"predatorMinPopulation", 10000},
+    {"genomeMinLength", 1024},
+    {"genomeMaxLength", 1024},
+    {"genomeInitMin", 1024},
+    {"genomeInitMax", 1024},
+    {"foodPatches", 10000},
+    {"currentEddies", 10000},
+    {"reproWindow", 1000000},
+};
+bool resourceValue(const char* key, double value, double upper) {
+    if (!std::isfinite(value) || (std::strncmp(key, "foodSpawn", 9) == 0 ? std::abs(value) : value) > upper) {
+        g_error = std::string(key) + " has a safe limit of " + std::to_string((int)upper);
+        return false;
+    }
+    if (std::strncmp(key, "genome", 6) == 0 && std::trunc(value) < 0) {
+        g_error = std::string(key) + " must be 0 or more";
+        return false;
+    }
+    return true;
+}
+bool resourceConfig(const jsonm::Value& root) {
+    const auto* c = root.find("config");
+    if (!c || !c->isObject()) return true; // existing parser owns schema errors
+    for (const auto& limit : kResourceLimits) {
+        const auto* v = c->find(limit.key);
+        if (v && v->type == jsonm::Value::Type::Number && !resourceValue(limit.key, v->num, limit.upper)) return false;
+    }
+    return true;
+}
+bool resourceGeometry(int width, int height, float perception) {
+    if (!resourceValue("width", width, 4096) || !resourceValue("height", height, 4096)) return false;
+    // Match SpatialGrid's float arithmetic, but check before its int casts or
+    // products. Init clamps perception to 1; loads retain their saved value.
+    const float inv = 1.0f / perception;
+    const double cols = std::trunc(width * inv) + 1, rows = std::trunc(height * inv) + 1;
+    if (!(cols >= 1 && rows >= 1 && cols * rows <= 16785409)) {
+        g_error = "perceptionRadius/world size exceeds the safe limit of 16785409 spatial-grid cells";
+        return false;
+    }
+    return true;
+}
+
 // ---- Dashboard recorder ------------------------------------------------------
 // What the page's dashboards (web/dashboard.js) chart. Read-only by contract: it
 // reads the world between steps, draws no random numbers and writes nothing the
@@ -385,12 +453,14 @@ EVO_EXPORT int evo_init(unsigned seed, int width, int height, int population,
             g_error = "config parse error: " + err;
             return 0;
         }
+        if (!resourceConfig(root)) return 0;
         checkpoint::readConfig(root, cfg);
     }
     if (cfg.genomeVersion != 1) {
         if (const char* why = brainPolicyConfigError(cfg)) { g_error = why; return 0; }
     }
     clampConfig(cfg);
+    if (!resourceValue("population", population, 20000) || !resourceGeometry(width, height, cfg.perceptionRadius)) return 0;
     if (width < 100 || height < 100 || population < 0) {
         g_error = "bad world dimensions or population";
         return 0;
@@ -496,6 +566,8 @@ EVO_EXPORT int evo_set_param(const char* name, double value) {
         g_error = std::string(name) + " must be finite and >= 0";
         return 0;
     }
+    for (const auto& limit : kResourceLimits)
+        if (std::strcmp(name, limit.key) == 0 && !resourceValue(name, value, limit.upper)) return 0;
     // Route through the checkpoint config reader so the field mapping (and the
     // int/float typing) is the one place that already defines it.
     char num[40];
@@ -893,8 +965,17 @@ EVO_EXPORT const char* evo_checkpoint() {
 EVO_EXPORT int evo_load_checkpoint(const char* json) {
     g_error.clear();
     if (!json || !json[0]) { g_error = "empty checkpoint"; return 0; }
-    World* w = new World();
     std::string err;
+    { // Release preflight's parsed payload before the loader parses the world.
+        jsonm::Value root;
+        if (!jsonm::Parser::parse(json, root, err)) { g_error = "checkpoint load error: " + err; return 0; }
+        if (!resourceConfig(root)) return 0;
+        SimConfig cfg;
+        checkpoint::readConfig(root, cfg);
+        const auto* geometry = root.find("world");
+        if (geometry && !resourceGeometry(geometry->intOr("width", 0), geometry->intOr("height", 0), cfg.perceptionRadius)) return 0;
+    }
+    World* w = new World();
     if (!checkpoint::deserialize(json, *w, err)) {
         delete w;
         g_error = "checkpoint load error: " + err;

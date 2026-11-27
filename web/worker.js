@@ -59,8 +59,31 @@ var samples = [];      /* [chunkStartMs, steps] pairs, rolling ~1 s window */
 var lastStats = 0;
 var recEvery = 60, recCulled = 0;
 var rec = [[], [], []]; /* recorder output not yet posted: Float64Array pieces per stream */
-/* the live settings the engine keeps as whole numbers (src/core/config.hpp int fields; renderer.js INT_KEYS) */
+/* Classic resource ceilings, mirrored by wasm/evo_wasm.cpp and renderer.js.
+ * population / minPopulation: 20000; predatorCount / predatorMinPopulation: 10000
+ * targetFood / foodSpawnBase / foodSpawnAmp: 100000 (food cap: 200000)
+ * genomeMinLength / genomeMaxLength / genomeInitMin / genomeInitMax: 1024
+ * foodPatches / currentEddies: 10000; reproWindow: 1000000
+ * Shim-only geometry: width / height 4096; spatial grid 16785409 cells.
+ * These bound individual allocation and loop counts, with room for the
+ * MT module's buffers and growth. Existing UI/preset/benchmark ranges fit inside.
+ * Birth ceilings (maxPopulation, predatorMaxPopulation) allocate nothing:
+ * their existing 0 = unlimited contract and numeric range stay unchanged.
+ * The live predator floor still has its existing stricter 2000 refusal.
+ * Negative spawn rates use the same magnitude limit (float-to-int loop).
+ * Genome lengths whose integer conversion is negative cannot be reserved.
+ */
+var RESOURCE_LIMITS = {
+  population: 20000, minPopulation: 20000, predatorCount: 10000, predatorMinPopulation: 10000,
+  targetFood: 100000, foodSpawnBase: 100000, foodSpawnAmp: 100000,
+  genomeMinLength: 1024, genomeMaxLength: 1024, genomeInitMin: 1024, genomeInitMax: 1024,
+  foodPatches: 10000, currentEddies: 10000, reproWindow: 1000000
+};
+/* the live settings the engine keeps as whole numbers (config.hpp int fields; renderer.js INT_KEYS) */
 var WHOLE = { maxPopulation: 1, minPopulation: 1, targetFood: 1, predatorMinPopulation: 1, predatorMaxPopulation: 1 };
+/* A requested setter read stays owed across refusals, including commands already
+ * queued behind the refused one. A refusal's config precedes canonicalization. */
+var setterReadOwed = false;
 /* The worker can't go on: its engine trapped (a WebAssembly.RuntimeError: the
  * module is in no state to be called again) or a chunk threw. It stops at once,
  * before anything else reaches the module: no chunk runs (dead, running), no
@@ -150,6 +173,7 @@ onmessage = guarded(function (e) {
       postMessage({ type: "set", key: key, value: value, quiet: quiet, ok: false, notRunning: true, error: "Turbo is not running" });
       return;
     }
+    if (msg.readback) setterReadOwed = true;
     /* the page's own checks, made here again (a second way in: defence in depth): a whole-number setting takes a whole
      * number of up to nine digits (the engine's %.9g print and int cast would cut or cap a longer one, and cut a
      * fraction), any other a value float32 can hold (past its range it would run as infinity); refused before it is
@@ -159,6 +183,7 @@ onmessage = guarded(function (e) {
             : key === "maxPopulation" && value < 0 ? "must be 0 or more (0: no cap)"
             : WHOLE[key] && Math.abs(value) > 999999999 ? "is too large for the engine (it keeps whole numbers of up to nine digits)"
             : !isFinite(Math.fround(+value.toPrecision(9))) ? "is too large for the engine (it keeps 32-bit numbers, at most about 3.4e38)"
+            : RESOURCE_LIMITS[key] && (/^foodSpawn/.test(key) ? Math.abs(value) : value) > RESOURCE_LIMITS[key] ? "has a safe limit of " + RESOURCE_LIMITS[key]
             : key === "predatorMinPopulation" && value > 2000 ? "is at most 2000 (the engine caps the predator floor there)" : "";
     if (bad) {   /* (with what runs instead: the page puts the field back to it) */
       postMessage({ type: "set", key: key, value: value, quiet: quiet, ok: false, config: readConfig().config, error: key + " " + bad });
@@ -171,7 +196,8 @@ onmessage = guarded(function (e) {
      * configError says why, the value is applied all the same, and the page goes by what it sent. Refused: the config
      * always (what runs instead: the page puts the field back to it). A trap in either read ends the worker (guarded) */
     var error = ok ? "" : Module._evo_set_param ? Module.UTF8ToString(Module._evo_last_error()) : "this module has no live settings";
-    var read = !ok || msg.readback ? readConfig() : { config: null, configError: "" };
+    var read = !ok || setterReadOwed ? readConfig() : { config: null, configError: "" };
+    if (ok && read.config) setterReadOwed = false;
     postMessage({ type: "set", key: key, value: value, quiet: quiet, ok: !!ok, config: read.config, configError: read.configError, error: error });
   } else if (msg.cmd === "config") {
     var cfg = Module && running ? readConfig() : { config: null, configError: "" };
@@ -222,6 +248,7 @@ function startRun(checkpoint) {
   lastStats = 0;
   rec = [[], [], []];
   if (Module._evo_rec_config) Module._evo_rec_config(recEvery, recCulled);
+  setterReadOwed = false;
   running = true;
   stopRequested = false;
   postStats(performance.now()); /* immediate: the page flips to 'turbo' on first stats */

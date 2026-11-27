@@ -669,6 +669,31 @@
     var d = Math.abs(v).toPrecision(17).replace(/e.*$/, "").replace(".", "").replace(/^0+/, "");
     return /^50*$/.test(d.slice(9, 17)) && d.length >= 17;
   }
+  /* Classic resource ceilings, mirrored by wasm/evo_wasm.cpp and worker.js.
+   * population / minPopulation: 20000; predatorCount / predatorMinPopulation: 10000
+   * targetFood / foodSpawnBase / foodSpawnAmp: 100000 (food cap: 200000)
+   * genomeMinLength / genomeMaxLength / genomeInitMin / genomeInitMax: 1024
+   * foodPatches / currentEddies: 10000; reproWindow: 1000000
+   * Shim-only geometry: width / height 4096; spatial grid 16785409 cells.
+   * These bound individual allocation and loop counts, with room for the
+   * MT module's buffers and growth. Existing UI/preset/benchmark ranges fit inside.
+   * Birth ceilings (maxPopulation, predatorMaxPopulation) allocate nothing:
+   * their existing 0 = unlimited contract and numeric range stay unchanged.
+   * The live predator floor still has its existing stricter 2000 refusal.
+   * Negative spawn rates use the same magnitude limit (float-to-int loop).
+   * Genome lengths whose integer conversion is negative cannot be reserved.
+   */
+  var RESOURCE_LIMITS = {
+    population: 20000, minPopulation: 20000, predatorCount: 10000, predatorMinPopulation: 10000,
+    targetFood: 100000, foodSpawnBase: 100000, foodSpawnAmp: 100000,
+    genomeMinLength: 1024, genomeMaxLength: 1024, genomeInitMin: 1024, genomeInitMax: 1024,
+    foodPatches: 10000, currentEddies: 10000, reproWindow: 1000000
+  };
+  function resourceProblem(k, v) {
+    if (RESOURCE_LIMITS[k] && (/^foodSpawn/.test(k) ? Math.abs(v) : v) > RESOURCE_LIMITS[k]) return "has a safe limit of " + RESOURCE_LIMITS[k];
+    if (/^genome(MinLength|MaxLength|InitMin|InitMax)$/.test(k) && Math.trunc(v) < 0) return "must be 0 or more";
+    return "";
+  }
   var MAX_WHOLE = 999999999;
   function engineVal(k, v) {
     var x = +(+v).toPrecision(9);
@@ -691,6 +716,8 @@
     if (k === "maxPopulation" && v < 0) return "must be 0 or more (0: no cap)";
     var big = tooBig(k, v);
     if (big) return big;
+    var resource = resourceProblem(k, v);
+    if (resource) return resource;
     if (k === "predatorMinPopulation" && v > 2000) return "is at most 2000 (the engine caps the predator floor there)";
     return "";
   }
@@ -1026,7 +1053,7 @@
        * said so, with what it sets, the Ocean's words; the dice's world has its own settings) */
       var kept = [], other = [];
       if (kind !== "random") {
-        var sheet = readForm().cfg;
+        var sheet = proposedConfig(readForm().cfg);
         tw.forEach(function (k) { var next = startValue(sheet, k); (sameRun(k, next, liveNow(k)) ? kept : other).push([k, next]); });
       }
       var keys = function (l) { return l.map(function (e) { return e[0]; }); };
@@ -1082,7 +1109,26 @@
   }
   /* the entry points: each checks Turbo first (as before), then goes or asks */
   /* the value a start from the sheet's cfg gives live key k (initWorld: the user's cap is cfg's maxPopulation) */
-  function startValue(cfg, k) { return k === "maxPopulation" ? cfg.maxPopulation || 0 : k in cfg ? cfg[k] : ADV_BY_KEY[k][1]; }
+  function startValue(cfg, k) { return cfg[k]; }
+  /* init reads JSON directly (no setter's %.9g round trip), fills defaults,
+   * then clampConfig orders coupled pairs. Only the question uses this mirror. */
+  function proposedConfig(cfg) {
+    var c = JSON.parse(Module.UTF8ToString(Module._evo_default_config())).config;
+    Object.keys(cfg).forEach(function (k) {
+      var v = cfg[k];
+      c[k] = typeof v !== "number" ? v : INT_KEYS[k]
+        ? Math.max(-2147483648, Math.min(2147483647, Math.trunc(v))) : Math.fround(v);
+    });
+    [["minSpeed", "maxSpeed"], ["genomeMinLength", "genomeMaxLength"], ["genomeInitMin", "genomeInitMax"]].forEach(function (pair) {
+      var a = pair[0], b = pair[1];
+      if (c[a] > c[b]) { var v = c[a]; c[a] = c[b]; c[b] = v; }
+    });
+    c.perceptionRadius = Math.max(1, c.perceptionRadius);
+    c.maxNeighbors = Math.max(0, Math.min(64, c.maxNeighbors));
+    c.predatorMinPopulation = Math.max(0, Math.min(2000, c.predatorMinPopulation));
+    c.predatorMaxPopulation = Math.max(0, c.predatorMaxPopulation);
+    return c;
+  }
   function requestRestart() {
     if (!engineOk() || guardTurbo()) return "refused";
     return replaceRun("restart", restart, {});
@@ -1132,6 +1178,10 @@
     }
   }
   function initWorld(seed, population, cfg) {
+    if (!engineOk()) return false;
+    var problem = resourceProblem("population", population), badKey = "population";
+    Object.keys(cfg).some(function (k) { var why = resourceProblem(k, cfg[k]); if (why) { problem = why; badKey = k; return true; } return false; });
+    if (problem) { showError((LABELS[badKey] || badKey) + " " + problem + "."); return false; }
     var ok;
     if (Object.keys(cfg).length > 0) {
       ok = withCString(JSON.stringify(cfg), function (ptr) {
@@ -2742,7 +2792,7 @@
     ways[0].focus();
   }
   if (!window.EvoLoader || !ASSETS) {
-    failScreen("The simulation couldn't start.\nThis page is missing loader.js.", false, false);
+    failScreen("The simulation couldn't start.\nThis page is missing " + (!window.EvoLoader ? "loader.js" : "EVO_ASSETS") + ".", false, false);
     showError("loader.js / EVO_ASSETS missing from the page");
     return;
   }
@@ -2820,6 +2870,7 @@
       " Drawing: " + drawingName() + ".";
   }
   function start() {
+    if (!engineOk()) return;
     if (bench) {
       bench.i = 0;
       benchNext();
