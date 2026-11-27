@@ -112,7 +112,7 @@
     var notes = [];
     if (ports.paused) notes.push("Paused. Space or ▶ runs it; . steps once.");
     if (ports.turboState !== "live") notes.push(tv ? "Turbo is running: these are its numbers; the picture waits for it." : "Turbo is running: this picture waits for it.");
-    if (ports.scene && ports.scene.following()) notes.push("Following a fish" + (ports.lightOn() ? ", with the flashlight on." : "."));
+    if (ports.scene && ports.scene.following()) notes.push("Following a fish" + (ports.display.lightOn() ? ", with the flashlight on." : "."));
     ports.setTxt("statnotes", notes.join(" "));
   }
   function initRecorder() {
@@ -149,8 +149,8 @@
       familyColor: function (id) { return ports.engineCall(function () { return ports.has("oc_family_color") ? ports.M._oc_family_color(id) : 0x3b5957; }, 0x3b5957); },
       /* what the tank's fish wear now: "family" (Family, or Appearance in a world without appearance genes), "appearance" or
        * "brain"; and the charts' way to show their family colours in the tank */
-      colourMode: function () { return ports.tankShowsFamily() ? "family" : ports.colourMode; },
-      showFamilyColours: function () { ports.setColourMode("family"); },
+      colourMode: function () { return ports.display.tankShowsFamily() ? "family" : ports.display.colourMode; },
+      showFamilyColours: function () { ports.display.setColourMode("family"); },
       wiring: function () { return ports.turboState !== "live" ? wiringNow() : ports.engineCall(wiringNow, null); },
       setDrawer: ports.setDrawer,
       /* the charts cover the page: no popover left open under them, and the coach mark goes */

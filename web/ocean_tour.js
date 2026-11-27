@@ -57,9 +57,9 @@
         { drawer: false, title: "The tank",
           target: function () { return h.rectOf("#tank"); },
           body: function () {
-            var looks = p.colourMode === "appearance" && p.HAS_APP
+            var looks = p.display.colourMode === "appearance" && p.HAS_APP
               ? "each fish wears the skin pattern and body shape it inherited from its parents"
-              : p.colourBrain ? "a fish's colour follows its brain's wiring" : "each family has its own colour";
+              : p.display.colourBrain ? "a fish's colour follows its brain's wiring" : "each family has its own colour";
             return "Glowing specks are food, " + looks + ", and the dark fish with glowing eyes are " +
                    "predators. <b>View</b>, in the dock, colours them by family or brain and makes the water realistic. " +
                    (h.touch() ? "Drag to move, pinch to zoom, twist with two fingers to turn (below the horizon too)."
@@ -156,8 +156,8 @@
     touch: function () { return p.coarseMQ.matches; },
     compact: function () { return true; },
     has3D: function () { return true; },
-    colourByBrain: function () { return p.colourBrain; },
-    colourMode: function () { return p.colourMode; },
+    colourByBrain: function () { return p.display.colourBrain; },
+    colourMode: function () { return p.display.colourMode; },
     startTurbo: function () { if (p.M && p.turboState === "live") p.enterTurbo(); },
     /* the Turbo card's tour step (web/guide.js) asks this; Classic's page has its #turbo card instead */
     turboActive: function () { return p.turboState !== "live"; },

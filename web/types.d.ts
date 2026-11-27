@@ -1264,7 +1264,7 @@ interface OceanReadoutsPorts {
   readonly scene: Pick<OceanScene, "following"> | null;
   readonly statsLen: number;
   readonly inspector: Pick<OceanInspector, "brainShape">;
-  readonly colourMode: string;
+  readonly display: Pick<OceanDisplay, "lightOn" | "tankShowsFamily" | "colourMode" | "setColourMode">;
   readonly turboWorker: Pick<Worker, "postMessage"> | null;
   has(name: string): boolean;
   fresh(s: OceanSnapshot): OceanSnapshot;
@@ -1273,13 +1273,10 @@ interface OceanReadoutsPorts {
   setHtml(id: string, html: string): void;
   setTxt(id: string, text: string): void;
   fmtInt(n: number): string; fmtTime(seconds: number): string;
-  lightOn(): boolean;
   heap(): ArrayBuffer;
   cString(ptr: number): string;
   turboWiring(): OceanWiring | null;
   engineCall<T>(fn: () => T, fallback: T): T;
-  tankShowsFamily(): boolean;
-  setColourMode(mode: string): void;
   setDrawer(open: boolean): void;
   setPop(name: string | null): void;
   hideCoach(): void;
@@ -1325,7 +1322,7 @@ interface OceanInspectorPorts {
   readonly turboState: TurboPhase;
   readonly lastS: OceanSnapshot;
   readonly scene: OceanScene;
-  readonly colourMode: string;
+  readonly display: Pick<OceanDisplay, "colourMode">;
   readonly statOpen: boolean;
   readonly paused: boolean;
   readonly BODY_LAYOUT: OceanBodyLayout;
@@ -1375,6 +1372,57 @@ interface OceanInspector {
   toggleExpanded(): void;
 }
 interface EvoOceanInspectorApi { create(ports: OceanInspectorPorts): OceanInspector }
+
+/* ---------------- web/ocean_display.js (window.EvoOceanDisplay) ---------------- */
+
+/** The three switches Display reads and writes as inputs; every other id it uses is a plain element. */
+interface OceanDisplayElements { lightnow: HTMLInputElement; followLight: HTMLInputElement; clarity: HTMLInputElement }
+/** Getters read the current root binding on every access; none syncs, refreshes, or invokes a controller, and
+ * construction reads no port. Engine operations keep their existing ready-world preconditions (has, engineCall). */
+interface OceanDisplayPorts {
+  el<K extends keyof OceanDisplayElements>(id: K): OceanDisplayElements[K];
+  el(id: string): HTMLElement;
+  has(name: string): boolean;
+  readonly inspector: Pick<OceanInspector, "selectedId" | "wantFollow" | "captureBrainClock">;
+  syncedFrame(): number;
+  toast(text: string): void;
+  readonly coarseMQ: MediaQueryList;
+  updateKeysLegend(): void;
+  store(key: string, value?: string): string | null;
+  pointerBlur(n: Element | null | undefined): void;
+  readonly P: URLSearchParams;
+  readonly BENCH: boolean;
+  engineCall<T>(fn: () => T, fallback: T): T;
+  engineCall<T>(fn: () => T): T | undefined;
+  setPop(name: string | null): void;
+  setDrawer(open: boolean): void;
+  setSheetTab(id: string): void;
+  changedKeys(): string[];
+  setHtml(id: string, html: string): void;
+  readonly M: OceanModule;
+  readonly scene: Pick<OceanScene, "following" | "quality" | "setFlashlight" | "setAppearance" | "setClarity"> | null;
+  readonly HAS_APP: boolean; readonly HAS_EYE: boolean;
+  readonly W: number; readonly H: number; readonly D: number; readonly WALLS: boolean;
+  readonly historyUnknown: boolean;
+}
+interface OceanDisplay {
+  initLight(): void; wireLightSwitch(): void; wireFollowLight(): void;
+  initColourMode(): void; wireColourControls(): void;
+  initClarity(): void; loadClarity(): void; wireClarity(): void; initModeline(): void;
+  applyDisplaySwitches(): void;
+  /** the scene's follow callback: one synchronous call (follow intent, the light, the keys legend) */
+  onFollowChange(on: boolean): void;
+  lightOn(): boolean; updateLight(): void; toggleLight(): void;
+  /** false: no such mode (nothing changes) */
+  setColourMode(mode: string): boolean;
+  applyClarity(): void;
+  tankShowsFamily(): boolean;
+  updateModeline(): void;
+  readonly colourMode: string;
+  readonly colourBrain: boolean;
+  readonly modelineDetail: number;
+}
+interface EvoOceanDisplayApi { create(ports: OceanDisplayPorts): OceanDisplay }
 
 /* ---------------- web/ocean_tour.js (window.EvoOceanTour) ---------------- */
 
@@ -1434,9 +1482,8 @@ interface OceanTourPorts {
   readonly statOpen: boolean;
   readonly inspector: Pick<OceanInspector, "selectedId" | "cardEl" | "select">;
   readonly drawerEl: HTMLElement;
-  readonly colourMode: string;
   readonly HAS_APP: boolean;
-  readonly colourBrain: boolean;
+  readonly display: Pick<OceanDisplay, "colourMode" | "colourBrain">;
   readonly M: OceanModule | null;
   enterTurbo(): void;
   setDrawer(open: boolean): void;
@@ -1466,6 +1513,11 @@ interface OceanScene {
   pick(s: OceanSnapshot, x: number, y: number, radius: number): number;
   setQuality(q: number): void;
   quality(): number;
+  setFlashlight(on: boolean): void;
+  /** feature-detected by the page before it is called */
+  setAppearance?(on: boolean): void;
+  /** feature-detected by the page before it is called */
+  setClarity?(u: number): void;
   appearance(): { want: boolean; skin: boolean; shapes: boolean; drawing: boolean; status?: string; lod?: string; verts?: number; barbels?: boolean };
   appearanceTextureParity(expected: BenchSnapshotCopy | null, o?: object): Promise<unknown>;
   contextInfo?(): object;
@@ -1502,6 +1554,7 @@ declare var EvoOceanPerf: EvoOceanPerfApi;
 declare var EvoOceanConfig: EvoOceanConfigApi;
 declare var EvoOceanReadouts: EvoOceanReadoutsApi;
 declare var EvoOceanInspector: EvoOceanInspectorApi;
+declare var EvoOceanDisplay: EvoOceanDisplayApi;
 declare var EvoOceanTour: EvoOceanTourApi;
 declare var EvoGuideConfig: OceanGuideConfig;
 declare var EvoApp: OceanGuideApp;
