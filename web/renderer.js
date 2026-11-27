@@ -450,7 +450,7 @@
    * While Turbo owns the world the value goes to its worker (sendLive), after
    * the same checks, and is confirmed when the worker has applied it. */
   function applyLive(key, def, input) {
-    if (!Module) return;
+    if (!Module || engineDown) return;
     var v = parseFloat(input.value);
     if (!Number.isFinite(v)) v = def;
     if (INT_KEYS[key] && !Number.isInteger(v)) {   /* (the engine would run it truncated: refused, the field back to what runs) */
@@ -806,12 +806,12 @@
   }
   /* the entry points: each checks Turbo first (as before), then goes or asks */
   function requestRestart() {
-    if (!Module || guardTurbo()) return "refused";
+    if (!Module || engineDown || guardTurbo()) return "refused";
     return replaceRun("restart", restart, { next: function (k) { return startValue(readForm().cfg, k); } });
   }
   /* R: a new seed, the rest as the sheet says */
   function requestNewSeed() {
-    if (!Module || guardTurbo()) return "refused";
+    if (!Module || engineDown || guardTurbo()) return "refused";
     var seed = (Math.random() * 0x100000000) >>> 0;
     return replaceRun("restart", function () { el("seed").value = String(seed); restart(); },
                       { next: function (k) { return startValue(readForm().cfg, k); } });
@@ -832,7 +832,7 @@
   }
   /* the draw first, so the question (replaceRun) can say what it sets; the form only on the start */
   function randomize() {
-    if (!Module || !window.EvoRandom || guardTurbo()) return "refused";
+    if (!Module || engineDown || !window.EvoRandom || guardTurbo()) return "refused";
     var pick = EvoRandom.draw(Math.random, basePop);
     var seed = (Math.random() * 0x100000000) >>> 0;
     var what = pick.population + " fish" + (pick.labels.length ? " · " + pick.labels.join(" · ") : " · the default world");
@@ -1412,46 +1412,65 @@
   }
 
   var splashDone = false, turboPaint = 0, lastNow = 0;
+  /* The frame loop. The next frame is asked for first, so a frame that throws
+   * never stops the loop; an engine trap (a WebAssembly.RuntimeError: the
+   * module's abort, an out-of-bounds access) stops the engine instead of
+   * freezing the page silently (engineStopped), as the Ocean's frame does. */
   function frame(now) {
-    if (Module) {
-      var dt = lastNow ? Math.min(0.1, (now - lastNow) / 1000) : 0;
-      lastNow = now;
-      var t0 = performance.now();
-      var stepped = 0;
-      if (turboState === "live" && !paused) {
-        stepped = bench ? 1 : simSpeed;
-        Module._evo_step(stepped);
-        animT += dt * Math.min(simSpeed, 2);
-      }
-      if (dash()) dash().pump();   /* what the recorder saw (also a restart's first sample) */
-      var t1 = performance.now();
-      /* while not 'live' the main sim is frozen: re-sync repacks the same
-       * state, so this keeps drawing the last frame (never stale-black) */
-      Module._evo_sync();
-      var s = snapshot(turboState === "live" ? resolveSelection() : -1);
-      /* the dashboards cover the whole page: no point drawing the ocean */
-      var covered = dash() && dash().isOpen();
-      if (!covered) draw(s, stepped);
-      if (turboState !== "live" && now - turboPaint > 250) { turboPaint = now; paintTurbo(); }
-      var t2 = performance.now();
-      if (stepped) {
-        var per = (t1 - t0) / stepped;
-        stepEma = stepEma ? stepEma * 0.9 + per * 0.1 : per;
-      }
-      trackInterval(now);
-      govern(t2 - t0, s.n);
-      if (bench) benchFrame(now, t1 - t0, t2 - t1, s.n);
-      fpsFrames++;
-      if (!fpsT0) fpsT0 = now;
-      if (now - fpsT0 >= 500) {
-        fps = Math.round(fpsFrames * 1000 / (now - fpsT0));
-        fpsFrames = 0;
-        fpsT0 = now;
-        updateStatus(s.stats);
-      }
-      if (!splashDone) { splashDone = true; el("splash").classList.add("done"); }
-    }
     requestAnimationFrame(frame);
+    if (!Module || engineDown) return;   /* (stopped: nothing more is stepped or read) */
+    try { frameBody(now); }
+    catch (err) { if (err instanceof WebAssembly.RuntimeError) { engineStopped(err); return; } throw err; }
+  }
+  /* the engine trapped: nothing more is stepped, read or started, and the page says so, with the way on (Reload) */
+  var engineDown = false;
+  function engineStopped(err) {
+    if (engineDown) return;
+    engineDown = true;
+    var why = String(err && err.message || err);
+    console.error("evo_boids: the engine stopped: " + why);
+    if (dash()) dash().close();   /* (its timer reads the module) */
+    if (asking) hideAsk();
+    showError("The engine stopped (" + why + "), so this world can't go on. Reload the page to go on.");
+    failScreen("The engine stopped (" + why + "), so this world can't go on.\nReload the page to go on.", true);
+  }
+  function frameBody(now) {
+    var dt = lastNow ? Math.min(0.1, (now - lastNow) / 1000) : 0;
+    lastNow = now;
+    var t0 = performance.now();
+    var stepped = 0;
+    if (turboState === "live" && !paused) {
+      stepped = bench ? 1 : simSpeed;
+      Module._evo_step(stepped);
+      animT += dt * Math.min(simSpeed, 2);
+    }
+    if (dash()) dash().pump();   /* what the recorder saw (also a restart's first sample) */
+    var t1 = performance.now();
+    /* while not 'live' the main sim is frozen: re-sync repacks the same
+     * state, so this keeps drawing the last frame (never stale-black) */
+    Module._evo_sync();
+    var s = snapshot(turboState === "live" ? resolveSelection() : -1);
+    /* the dashboards cover the whole page: no point drawing the ocean */
+    var covered = dash() && dash().isOpen();
+    if (!covered) draw(s, stepped);
+    if (turboState !== "live" && now - turboPaint > 250) { turboPaint = now; paintTurbo(); }
+    var t2 = performance.now();
+    if (stepped) {
+      var per = (t1 - t0) / stepped;
+      stepEma = stepEma ? stepEma * 0.9 + per * 0.1 : per;
+    }
+    trackInterval(now);
+    govern(t2 - t0, s.n);
+    if (bench) benchFrame(now, t1 - t0, t2 - t1, s.n);
+    fpsFrames++;
+    if (!fpsT0) fpsT0 = now;
+    if (now - fpsT0 >= 500) {
+      fps = Math.round(fpsFrames * 1000 / (now - fpsT0));
+      fpsFrames = 0;
+      fpsT0 = now;
+      updateStatus(s.stats);
+    }
+    if (!splashDone) { splashDone = true; el("splash").classList.add("done"); }
   }
 
   /* ---- ?bench: agents at a stable 60 fps, measured in this browser ----
@@ -1692,7 +1711,7 @@
     flushHeld();
   }
   function enterTurbo() {
-    if (turboState !== "live" || !Module) return;
+    if (turboState !== "live" || !Module || engineDown) return;
     if (asking) hideAsk();   /* (its start would be refused now: Stop Turbo first) */
     turboState = "entering";
     turboStats = null;
@@ -2227,7 +2246,7 @@
     var file = this.files && this.files[0], opener = fileOpener;
     fileOpener = null;
     this.value = "";
-    if (!file || !Module || guardTurbo()) return;
+    if (!file || !Module || engineDown || guardTurbo()) return;
     file.text().then(function (text) {
       var world = savedWorldText(text, file.name);
       if (!world) { openWorld(text); return; }
@@ -2237,7 +2256,7 @@
     }, function (err) { showError("Couldn't read that file: " + err); });
   });
   function openWorld(text) {
-    if (!Module || guardTurbo()) return;
+    if (!Module || engineDown || guardTurbo()) return;
     if (!loadCheckpointText(text)) return;   /* refused: the running world, its cap and its governor stay */
     /* the file's own cap becomes the user cap; the governor starts fresh */
     var cap = 0;
@@ -2276,7 +2295,7 @@
     /* fish coloured by brain similarity (else by family line) */
     colourByBrain: function () { return colourBrain; },
     /* the Turbo intro's "Try Turbo" */
-    startTurbo: function () { if (Module && turboState === "live") enterTurbo(); },
+    startTurbo: function () { if (Module && !engineDown && turboState === "live") enterTurbo(); },
     setDrawer: setDrawer,
     setSheetTab: setSheetTab,
     /* Selects a fish for the guide to show, unless one is selected: the one
@@ -2284,7 +2303,7 @@
      * right. Leaves everSelected alone, so the one-time hint still comes until
      * the visitor picks one. */
     inspectSomeFish: function () {
-      if (!Module || turboState !== "live") return false;
+      if (!Module || engineDown || turboState !== "live") return false;
       if (selectedId !== null) return true;
       var best = nearestFish(WORLD_W * (view3d ? 0.4 : 0.35), WORLD_H * (view3d ? 0.45 : 0.5), Infinity);
       if (best < 0) return false;
@@ -2303,9 +2322,39 @@
   };
 
   /* ---- boot ---- */
-  function splashSay(msg) { el("splashstate").textContent = msg; }
+  /* The splash as the page's failure screen (the Ocean's: ocean.js splashSay
+   * and its ways on): the loading bar stops, the error in red, and the ways
+   * on, the first one focused: the 3-D Ocean (#to3d's address, which the
+   * deploy build rewrites) and Reload. A browser without WebAssembly SIMD
+   * runs neither world, so the Ocean is not offered there. crashed: the
+   * engine stopped mid-run (engineStopped), Reload first. */
+  function failScreen(msg, crashed, noOcean) {
+    var sp = el("splash"), st = el("splashstate");
+    st.textContent = msg;
+    st.className = "error";
+    sp.classList.add("failed");
+    sp.classList.remove("done");
+    var acts = document.createElement("div"), ways = [];
+    acts.className = "splash-acts";
+    if (!noOcean) {
+      var ocean = document.createElement("a");
+      ocean.id = "splashocean";
+      ocean.href = el("to3d").getAttribute("href") || "ocean.html";
+      ocean.textContent = "Open 3-D Ocean";
+      ways.push(ocean);
+    }
+    var reload = document.createElement("button");
+    reload.type = "button";
+    reload.id = "splashreload";
+    reload.textContent = "Reload";
+    reload.addEventListener("click", function () { location.reload(); });
+    if (crashed) ways.unshift(reload); else ways.push(reload);
+    ways.forEach(function (w, i) { w.className = "btn" + (i === 0 ? " primary" : ""); acts.appendChild(w); });
+    st.parentNode.appendChild(acts);
+    ways[0].focus();
+  }
   if (!window.EvoLoader || !ASSETS) {
-    splashSay("This page is missing loader.js.");
+    failScreen("The simulation couldn't start.\nThis page is missing loader.js.", false, false);
     showError("loader.js / EVO_ASSETS missing from the page");
     return;
   }
@@ -2365,8 +2414,10 @@
     /* ?bench measures the view it starts in, so that one is loaded first */
     return Promise.resolve(want === "3d" ? setView(true) : null).then(start);
   }).catch(function (err) {
-    splashSay("The simulation couldn't start: " + err);
-    showError("failed to load wasm module: " + err);
+    var why = String(err && err.message || err);
+    console.error("evo_boids: " + why);
+    failScreen("The simulation couldn't start.\n" + why, false, !!(err && err.noSimd));
+    showError("failed to load wasm module: " + why);
   });
   function updateModeline() {
     /* the claim as data too (data-replay "yes" / "no", data-why: the reasons' keys) */
