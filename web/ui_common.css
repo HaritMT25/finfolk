@@ -64,3 +64,60 @@
   input.switch:focus-visible { outline-offset: -6px; }
   #fishcard a { display: inline-flex; align-items: center; min-height: 44px; padding: 0 6px; }
 }
+
+/* ---------- the bars: one system on both pages ----------
+ * Four places, one job each: top left what is happening (#readout), top centre which world (#worlds), top right the
+ * panels (#tools), the bottom time and view (#dock). Every bar is the same shell (dark and dense, a hairline rim, a
+ * light shadow); shade carries the hierarchy: resting (no fill, soft ink), engaged (a raised fill: an open panel, the current
+ * world, a tool that is on), primary (the one light disc: Pause / Play). Each colour has one meaning: lime is alive
+ * (the Live dot), ember is Turbo or a warning, yellow is the flashlight while it is on, blue is the Finfolk mark.
+ * Hints and tips are captions, not boxes. The reserved bands (--top-h, --dock-h) do not change, so nothing outside
+ * the bars moves: the dock's box keeps its band (the 3-D tank's framing measures it: web/ocean.js and renderer.js
+ * updateInsets) and draws its shell along the band's foot. Display only.
+ * The shell does not blur what is under it (--bar-glass: none; so its 92 %, the design's no-blur shell): a
+ * backdrop-filter makes each bar a compositor layer, and the panels drawn over them (the dashboards, the setup sheet's
+ * start bar) then lose their LCD (subpixel) text on Windows. The glass instead: --bar-bg at 0.82 and
+ * --bar-glass: blur(14px) saturate(1.15). */
+:root {
+  --bar-h: 48px; --bar-btn: 40px; --bar-pad: 4px; --bar-edge: 12px; --bar-gap: 12px;
+  --bar-bg: oklch(0.235 0.028 198 / 0.92);
+  --bar-glass: none;
+  --bar-rim: oklch(0.55 0.03 190 / 0.22);
+  --bar-shadow: 0 6px 20px oklch(0.08 0.03 210 / 0.32);
+  --bar-div: oklch(0.55 0.03 190 / 0.30);
+  --bar-ink: oklch(0.78 0.022 188);                                         /* resting */
+  --bar-primary: oklch(0.93 0.018 185); --bar-primary-ink: oklch(0.22 0.03 200);
+  --bar-mode: oklch(0.72 0.18 38 / 0.20); --bar-mode-ink: oklch(0.82 0.14 45); --bar-ember: oklch(0.72 0.18 38);
+  --bar-live: oklch(0.86 0.19 125);
+  --bar-light: oklch(0.93 0.12 95); --bar-light-soft: oklch(0.93 0.12 95 / 0.18);
+  --bar-mark: oklch(0.70 0.11 235);
+}
+@media (pointer: coarse) { :root { --bar-h: 52px; --bar-btn: 44px; } }   /* 44 px to tap */
+@media (max-width: 599px) { :root { --bar-edge: 10px; } }
+
+/* the shell (the dock's is its ::before, below); the coach mark has buttons, so it is a shell too. (A shell's glass,
+ * when --bar-glass has one, blurs the tank under it.) */
+#readout, #worlds, #tools, #dock::before, #coach {
+  background: var(--bar-bg);
+  -webkit-backdrop-filter: var(--bar-glass); backdrop-filter: var(--bar-glass);
+  border: 1px solid var(--bar-rim);
+  box-shadow: var(--bar-shadow);
+}
+
+/* the tiers of the bars' buttons (only here: the fish card's, the popovers' and the setup sheet's .icon-btn keep the
+ * pages' own rules). Resting: no fill, the soft ink; hover a faint fill; engaged a raised fill and the bright ink (an
+ * open panel, a pressed tool; the current world, below) */
+#topbar .icon-btn, #dock .icon-btn { width: var(--bar-btn); height: var(--bar-btn); color: var(--bar-ink); }
+#topbar .icon-btn svg.i, #dock .icon-btn svg.i { width: 20px; height: 20px; }
+#topbar .icon-btn:hover, #dock .icon-btn:hover { background: var(--surface-2); color: var(--ink); }
+#topbar .icon-btn[aria-expanded="true"], #dock .icon-btn[aria-expanded="true"], #dock .icon-btn[aria-pressed="true"] { background: var(--surface-3); color: var(--ink); }
+/* primary: the one light disc, Pause / Play */
+#dock #pausebtn { background: var(--bar-primary); color: var(--bar-primary-ink); }
+#dock #pausebtn:hover { background: oklch(0.98 0.01 185); color: var(--bar-primary-ink); }
+#dock #pausebtn svg.i { width: 18px; height: 18px; }
+/* mode: Turbo only (its button while it runs, Stop, the run-state pill) */
+#dock #turbobtn[aria-pressed="true"], #dock #turboexit { background: var(--bar-mode); color: var(--bar-mode-ink); }
+#dock #turbobtn[aria-pressed="true"]:hover, #dock #turboexit:hover { background: oklch(0.72 0.18 38 / 0.28); color: var(--bar-mode-ink); }
+/* light: the flashlight while it is on, the bars' one yellow */
+#dock #lightbtn[aria-pressed="true"] { background: var(--bar-light-soft); color: var(--bar-light); }
+
