@@ -120,14 +120,16 @@
           target: function () { return h.rectOf("#menubtn"); },
           body: function () {
             return "New worlds, every rule of this one, and saving a setup or the whole world (O). Nothing in it replaces your run until you press " +
-                   "<b>Start</b>, or open a saved world (<b>From a file</b>; asked first when your run has something to lose).";
+                   "<b>Start</b>, or open a saved world (<b>Open a file…</b> under <b>Open &amp; save</b>; always asked first).";
           } },
         { drawer: true, tab: "run", scroll: "#scenarios", place: h.drawerSides, title: "Start from",
           target: function () { return h.rectOf("#scenarios"); },
           body: function () {
             return "Pick a world: Big tank, Living water, Hunters, Currents & patches, or <b>Surprise me</b>, which draws a " +
                    "setup from ranges that worked in experiments. The card fills the tabs with it; its <b>Start</b> starts it. " +
-                   "<b>From a file</b> takes a saved setup the same way, or opens a saved world where it was saved.";
+                   "The start bar names the running world; its recipe card stays outlined. The Start menu holds <b>Start again</b> (same fish), " +
+                   "<b>Start fresh</b> (new fish), and <b>Replay from start</b> (drops live tweaks, keeps waiting edits). " +
+                   "Under <b>Open &amp; save</b>, <b>Open a file…</b> stages a setup as the next recipe, or reopens a saved world after asking.";
           } },
         { drawer: true, tab: "depth", scroll: "#f_kBuoy", place: h.drawerSides, title: "Your own settings",
           target: function () { return h.rectOf("#f_kBuoy"); },

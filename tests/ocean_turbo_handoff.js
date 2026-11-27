@@ -3235,7 +3235,7 @@ async function pageReplayReopen() {
     const n1 = p.ctx.EvoOcean.state().n, cSaved = claimOf(p);
     const s = await savedWorld(p);
     const q = await bootPage(PAGE_Q7);
-    const said = await openWorld(q, s.bytes, s.name);
+    const said = await openWorldConfirmed(q, s.bytes, s.name);
     frames(q, 1);
     const nq = q.ctx.EvoOcean.state().n, cOpened = claimOf(q), tq = q.T.liveTweaks().length;
     q.click('replay');
@@ -3251,7 +3251,7 @@ async function pageReplayReopen() {
     frames(p, 1);
     const s2 = await savedWorld(p);
     const r = await bootPage(PAGE_Q7);
-    await openWorld(r, s2.bytes, s2.name);
+    await openWorldConfirmed(r, s2.bytes, s2.name);
     frames(r, 1);
     const cTweaked = claimOf(r);
     ok(cTweaked === 'no:live opened', 'a saved world still carrying a live tweak (floor ' + (floor0 + 10) + '): ' + cTweaked);
@@ -3435,9 +3435,9 @@ async function pageCancelQueued() {
 }
 
 /* a setup file staged through the page's own file input (read at once) */
-async function stageFile(p, text) {
+async function stageFile(p, text, name) {
     const g = p.T.draftGen;
-    p.loadFile({ name: 's.json', text: () => Promise.resolve(text) });
+    p.loadFile({ name: name || 's.json', text: () => Promise.resolve(text) });
     await until(() => p.T.draftGen !== g || p.T.asking, 'the file staged');
 }
 /* Finding 1: a staged, untouched setup file's plan is its own recipe (it
@@ -3752,7 +3752,7 @@ async function pageKeyboardAsk() {
     const c = startCounter(p), a = c();
     /* [the button, what opens it, where Keep puts the focus] */
     const ways = [['restart', () => {}, 'restart'], ['newworld', () => p.click('startmenubtn'), 'startmenubtn'],
-                  ['startsame', () => p.click('startmenubtn'), 'startmenubtn'], ['replay', () => {}, 'replay'],
+                  ['startsame', () => p.click('startmenubtn'), 'startmenubtn'], ['replay', () => p.click('startmenubtn'), 'startmenubtn'],
                   ['scenario-start', () => p.click('huntersbtn'), 'scenario-start']];
     const bad = [], fine = [];
     for (const [id, open, back] of ways) {
@@ -3965,6 +3965,13 @@ async function openWorld(p, bytes, name) {
                 'the world file\'s answer', 120000).catch((e) => { throw new Error(e.message + ' (the page says "' + p.msg() + '"; test runs ' + p.probes.length + ')'); });
     return p.msg();
 }
+/* Post-open tests explicitly accept the saved world's question. openWorld itself
+ * never accepts it, so the question, cancellation and stale-read tests observe it. */
+async function openWorldConfirmed(p, bytes, name) {
+    await openWorld(p, bytes, name);
+    if (asked(p) && p.T.asking.plan && p.T.asking.plan.op === 'open') p.click('startconfirm');
+    return p.msg();
+}
 /* the page's frame, its world stepped n (paused: the frame loop syncs, steps nothing) */
 function runPage(p, n) { if (!p.T.paused) p.key(' '); p.M._oc_step(n); p.raf(performance.now()); return frame(p.M); }
 
@@ -3984,14 +3991,20 @@ async function pageWorldFile() {
        fingerprint(p.M) === print0 && /Saved the world at frame/.test(toastText(p)) && p.T.worldSave === null,
        'Save world: ' + s.name + ' (' + sizeOf(s.bytes.length) + '): frame ' + h.frame + ', the engine build ' + h.engine.wasmSha256.slice(0, 8) +
        ', the setup it started from, its settings now (minSpeed 40), its Save setup file, the fish followed; the world itself untouched');
-    /* opened on a fresh page, nothing to lose there: at once, one epoch, no oc_init / oc_reset */
+    /* a fresh page also asks: no change before Open it, then one epoch, no oc_init / oc_reset */
     const q = await bootPage(PAGE_Q7), cq = startCounter(q), a = cq();
-    const said = await openWorld(q, s.bytes, s.name);
+    const beforeOpen = q.world();
+    await openWorld(q, s.bytes, s.name);
+    ok(asked(q) && delta(a, cq()).epoch === 0 && q.world() === beforeOpen && q.el('startconfirm').textContent === 'Open it',
+       'a saved world always asks on a fresh page too; the world and epoch stay untouched until confirmation');
+    q.click('startcancel');
+    ok(q.world() === beforeOpen && delta(a, cq()).epoch === 0 && !asked(q), 'Keep it cancels a saved-world open with nothing to lose');
+    const said = await openWorldConfirmed(q, s.bytes, s.name);
     const d = delta(a, cq());
     ok(d.epoch === 1 && d.inits === 0 && d.resets === 0 && !q.T.asking && JSON.stringify(q.T.initArgs) === JSON.stringify(p.T.initArgs) &&
        q.T.runCfg.minSpeed === 40 && q.T.getVal('minSpeed') === 40 && q.el('o_seed').value === '4242' && q.T.W === p.T.W && q.T.H === p.T.H &&
        q.T.D === p.T.D && q.T.WALLS === p.T.WALLS && frame(q.M) === f0 && q.T.selectedId === picked && q.ctx.EvoOcean.state().following &&
-       /Opened the saved world/.test(said) && /seed=4242/.test(q.loc.href) && !q.T.draft,
+       /Opened the saved world/.test(said) && /seed=4242/.test(q.loc.href) && !q.T.draft && q.el('startsummary').textContent.includes('Running: ' + s.name),
        'opened on a fresh page: one epoch, no oc_init, no oc_reset (' + JSON.stringify(d) + '); its start, settings (minSpeed 40 in the sheet), size, ' +
        'frame ' + frame(q.M) + ' and followed fish, the address its setup\'s ("' + said.slice(0, 70) + '…")');
     const diff = sameFor(p.M, q.M, 60);
@@ -4064,7 +4077,7 @@ async function pageWorldTurbo() {
         const t = toastText(p), none = p.T.worldSave === null, n2 = p.downloads.length;
         const again = await savedWorld(p);
         const q = await bootPage(PAGE_Q7);
-        await openWorld(q, bytes);
+        await openWorldConfirmed(q, bytes);
         const fq = frame(q.M), ref = await controlRun(img, before, h.frame), diff = sameFor(q.M, ref, 60);
         const c = { waiting, ran, ackIn: h.runCfg.maxPopulation === 200, laterOut: !('minSpeed' in h.runCfg), ackBefore: before.some(e => e[1] === 'maxPopulation'),
                     laterAfter: !before.some(e => e[1] === 'minSpeed'), frame: fq === h.frame, same: !diff };
@@ -4103,7 +4116,7 @@ async function pageWorldTurbo() {
         for (let i = 0; i < 40; i++) growMiB(big.M);
         new Uint8Array(HO.buffer(big.M)).fill(0xab, im.bytes);   /* junk past the image, as a page that ran a bigger world has */
         big.raf(performance.now());
-        await openWorld(small, s.bytes); await openWorld(big, s.bytes);
+        await openWorldConfirmed(small, s.bytes); await openWorldConfirmed(big, s.bytes);
         const tail = zeroFrom(big.M, im.bytes);
         let diff = '';
         for (let k = 0; k < 40 && !diff; k++) {
@@ -4121,7 +4134,7 @@ async function pageWorldTurbo() {
         b.click('bigbtn'); b.click('scenario-start');
         runPage(b, 60);
         const s = await savedWorld(b), o = await bootPage(PAGE_Q7);
-        await openWorld(o, s.bytes);
+        await openWorldConfirmed(o, s.bytes);
         const diff = sameFor(b.M, o.M, 4);
         ok(b.T.W === 3840 && o.T.W === 3840 && o.M._oc_creature_count() > 1500 && !diff,
            'the Big tank (' + o.M._oc_creature_count() + ' fish): saved (' + sizeOf(s.bytes.length) + '), opened on another page, 4 steps bit-identical' + (diff ? ': ' + diff : ''));
@@ -4196,7 +4209,7 @@ async function pageWorldRefusals() {
         runPage(n, 80);
         const w = await savedWorld(n), h = HO.worldHeader(w.bytes).header;
         const o = await bootPage(PAGE_Q7, { nocrypto: true });
-        await openWorld(o, w.bytes);
+        await openWorldConfirmed(o, w.bytes);
         const fo = frame(o.M), diff = sameFor(n.M, o.M, 20);
         const c = { raw: h.image.body === 'raw', id: h.engine.wasmSha256 === WASM_SHA, frame: fo === h.frame, same: !diff };
         ok(all(c), 'no crypto.subtle, no CompressionStream: Save world writes a raw file (' + sizeOf(w.bytes.length) + ') with the same engine id (the JS SHA-256); ' +
@@ -4369,19 +4382,19 @@ async function reviewTransaction() {
     {   /* something throws once the image is in (a display switch): the run back as it was, bit for bit; the immediate path */
         const q = await bootPage(PAGE_Q7);
         runPage(q, 60);
-        const r = runOf(q), img = img0Of(q), real = q.M._oc_set_colour_mode;
+        const r = runOf(q), img = img0Of(q), real = q.M._oc_set_colour_mode, runSummary = q.el('startsummary').textContent;
         let n = 0;
         q.M._oc_set_colour_mode = function (m) { if (!n++) throw new Error('injected: a display switch fails'); return real.call(this, m); };
-        const said = await openWorld(q, s.bytes);
+        const said = await openWorldConfirmed(q, s.bytes);
         q.M._oc_set_colour_mode = real;
         const ref = await mk(1, {}, 300, 300, 0);
         HO.take(ref, img.slice(0), 'the control');
-        const k = { said: /couldn't open: injected: a display switch fails\. Your run carries on, as it was/.test(said), world: q.world() === r.world,
+        const k = { title: q.el('startsummary').textContent === runSummary, said: /couldn't open: injected: a display switch fails\. Your run carries on, as it was/.test(said), world: q.world() === r.world,
                     print: fingerprint(q.T.M) === r.print, epoch: q.T.worldEpoch === r.epoch, sel: q.T.selectedId === r.sel, module: q.T.M === r.M,
                     uncaught: q.uncaught.length === 0 };
         const diff = sameFor(q.T.M, ref, 30);
         ok(all(k) && !diff,
-           'a throw after the image went in (nothing to lose: opened at once): "' + said.slice(0, 100) + '…"; the run, the sheet, the epoch as they were, ' +
+           'a throw after the image went in (nothing to lose: explicitly confirmed): "' + said.slice(0, 100) + '…"; the run, the sheet, the epoch as they were, ' +
            '30 steps bit-identical to the run never touched' + (diff ? ': ' + diff : '') + nots(k) + (k.world ? '' : ' ' + q.world() + ' vs ' + r.world) +
            (q.uncaught.length ? ' ' + q.uncaught[0] : ''));
     }
@@ -4414,7 +4427,7 @@ async function reviewTransaction() {
         const junk = await craftedFile(h, new Uint8Array(h.image.bytes).fill(0xab).buffer);
         q.hooks.onProbe = (sh) => { sh.rewrite = (m) => m.type === 'probe' ? Object.assign({}, m, { ok: true, why: '', trap: false }) : m; };
         const c = startCounter(q), a = c();
-        await openWorld(q, junk, 'junk.oceanworld');
+        await openWorldConfirmed(q, junk, 'junk.oceanworld');
         await until(() => q.T.engineState === 'ok' && q.T.rebuilds === 1, 'the engine to restart');
         q.hooks.onProbe = null;
         const t = toastText(q), msg2 = q.msg(), M1 = q.T.M, back = q.world() === r.world && q.T.worldEpoch === r.epoch;
@@ -4462,7 +4475,7 @@ async function reviewEngineId() {
     p.click('turboexit');
     await until(() => p.T.turboState === 'live', 'the hand-back');
     const q = await bootPage(PAGE_Q7);
-    await openWorld(q, s.bytes);
+    await openWorldConfirmed(q, s.bytes);
     const probe = q.probes[0] && q.probes[0].toWorker[0];
     const c = Object.assign(pin, { saved: h.engine.wasmSha256 === WASM_SHA, oneFetch: p.wasmFetches === 1, turbo: !!start && start.wasm === l0.url,
                                    probe: !!probe && probe.wasm === q.loads[0].url && q.pinnedFiles.get(probe.wasm).sha === WASM_SHA, opened: q.T.initArgs.seed === 4242 });
@@ -4516,7 +4529,7 @@ async function reviewCapture() {
         const q = await bootPage(PAGE_Q7);
         q.ctx.EvoOcean.select(1);
         const had = q.T.selectedId !== null;
-        await openWorld(q, s.bytes);
+        await openWorldConfirmed(q, s.bytes);
         const diff = sameFor(p.M, q.M, 30);
         ok(had && q.T.selectedId === null && !diff, 'an unpicked world opened over a picked fish: nothing picked, the senses not captured: 30 steps bit-identical, ' +
            'every fish\'s oc_inspect senses included' + (diff ? ': ' + diff : ''));
@@ -4532,7 +4545,7 @@ async function reviewCapture() {
         const fam = h.picked.family;
         const q = await bootPage(PAGE_Q7);
         const gone = await resealed(s.bytes, (x) => { x.picked = { id: 999999999, follow: true, family: fam, x: h.picked.x + 37, y: h.picked.y - 21, d: h.picked.d }; });
-        const said = await openWorld(q, gone);
+        const said = await openWorldConfirmed(q, gone);
         const s1 = q.T.lastS, ids = Array.from(s1.ids.subarray(0, s1.n));
         let want = null, bd = Infinity;
         for (let i = 0; i < s1.n; i++) {
@@ -4543,9 +4556,9 @@ async function reviewCapture() {
         const k = q.ctx.EvoOcean.state();
         const r = await bootPage(PAGE_Q7);
         const none = await resealed(s.bytes, (x) => { x.picked = { id: 999999999, follow: true, family: -77, x: 0, y: 0, d: 0 }; });
-        const said2 = await openWorld(r, none);
+        const said2 = await openWorldConfirmed(r, none);
         const alive = await bootPage(PAGE_Q7);
-        await openWorld(alive, s.bytes);
+        await openWorldConfirmed(alive, s.bytes);
         ok(typeof fam === 'number' && want !== null && k.selectedId === want && k.following &&
            new RegExp('Fish #999999999 is not in it \\(it died during Turbo before the save\\): following #' + want + ', the nearest of its family line').test(said) &&
            r.T.selectedId === null && /nor is any of its family line: nothing followed/.test(said2) && alive.T.selectedId === h.picked.id && alive.ctx.EvoOcean.state().following,
@@ -4597,7 +4610,7 @@ async function reviewStaleRead() {
         const gate = new Promise((r) => { release = r; }), g = gated(new File([damaged], 'bad.oceanworld'), gate, (x) => x < at);
         q.loadFile(g);
         await until(() => g.reads.some(r => r[0] === at), 'its body asked for');
-        await openWorld(q, s.bytes, 'good.oceanworld');
+        await openWorldConfirmed(q, s.bytes, 'good.oceanworld');
         const opened = q.msg();
         release();
         await tick(); await tick(); await new Promise(r => setTimeout(r, 30));
@@ -4774,7 +4787,7 @@ async function review2Budget() {
         p.hooks.onProbe = (sh) => { runs.push(sh); if (runs.length === 1) sh.pause(); else aliveAtSecond = runs[0].terminated === 0; };
         p.loadFile(new File([s.bytes], 'first.oceanworld'));
         await until(() => runs.length === 1 && runs[0].queue.length, 'the first test run, held');
-        const t0 = Date.now(), said = await openWorld(p, s.bytes, 'second.oceanworld'), took = Date.now() - t0;
+        const t0 = Date.now(), said = await openWorldConfirmed(p, s.bytes, 'second.oceanworld'), took = Date.now() - t0;
         p.hooks.timer = null; p.hooks.onProbe = null;
         ok(runs.length === 2 && aliveAtSecond === false && runs[0].terminated === 1 && took < 10000 && /^Opened the saved world second\.oceanworld/.test(said) && !/first/.test(toastText(p)),
            'a newer file while a test run is held: that run terminated (at the page\'s next look, not by the 20 s watchdog: ' + took + ' ms) before the newer one\'s starts ' +
@@ -4901,7 +4914,7 @@ async function review2LateFailure() {
         runPage(q, 40);
         const r = runOf(q), H = q.ctx.EvoOceanHandoff, take = H.take;
         H.take = function () { H.take = take; take.apply(this, arguments); throw new Error('injected: a copy that failed half-way'); };
-        const said = await openWorld(q, s.bytes);
+        const said = await openWorldConfirmed(q, s.bytes);
         ok(/injected: a copy that failed half-way\. Your run carries on, as it was/.test(said) && sameRun(q, r), 'a throw from the copy itself, after it wrote: the run back as it was ("' + said.slice(0, 90) + '…")');
     }
 }
@@ -5125,6 +5138,8 @@ async function review3Reads() {
         await new Promise(r => setTimeout(r, 80));
         const waiting = { b: bodyRead(b, at), c: bodyRead(c, at), held: Date.now() - t0 < 1500 };
         await until(() => p.T.answered(idC), 'C\'s answer (A\'s part still on its way)', 120000);
+        const cAsked = asked(p);   /* the newest saved world now also waits for confirmation */
+        p.click('startconfirm');
         const opened = p.msg();
         release();   /* A's part comes now: dropped */
         await new Promise(r => setTimeout(r, 100));
@@ -5132,7 +5147,7 @@ async function review3Reads() {
         const made = bodies.undo();
         const aParts = a.reads.filter(r => r[0] >= at);
         const k = { parts: parts > 2, noBodyWhileHeld: !waiting.b && !waiting.c && waiting.held, aOnePart: aParts.length === 1 && aParts[0][1] - aParts[0][0] === 64 * 1024,
-                    bNever: !bodyRead(b, at) && made === 2, cOpened: /^Opened the saved world third\.oceanworld/.test(opened) && bodyRead(c, at),
+                    bNever: !bodyRead(b, at) && made === 2, cAsked, cOpened: /^Opened the saved world third\.oceanworld/.test(opened) && bodyRead(c, at),
                     quiet: p.msg() === opened && !/first|second/.test(opened + toastText(p)) };
         ok(all(k), 'A\'s body (' + parts + ' parts of 64 kB) stuck at its first part; B and C picked meanwhile: no body read while A holds the turn; A lets it go with that one part ' +
            'on its way (' + aParts.length + ' asked for, dropped when it came), B (superseded when its turn came) reads none and makes no buffer for it (' + made +
@@ -5427,7 +5442,151 @@ async function weightPolicyWorld() {
        'the saved saturation world continues bit-identically');
 }
 
+/* UX PR 1: placement is checked against real markup; the existing page DOM
+ * has no static hierarchy, so mount recipe wrappers for the marking assertions. */
+async function pageSetupUX() {
+    section('Setup UX: Open & save, three starts, named runs, file chip and keyboard focus');
+    const html = fs.readFileSync(path.join(WEB, 'ocean.html'), 'utf8');
+    const recipes = html.slice(html.indexOf('<div id="scenarios"'), html.indexOf('<p id="randnote"'));
+    const files = html.slice(html.indexOf('<h3 id="files-heading"'), html.indexOf('<h3>This run</h3>'));
+    ok(!recipes.includes('id="loadcp"') && !recipes.includes('data-s="file"') &&
+       ['loadcp', 'savecp', 'saveworld'].every(id => files.includes('id="' + id + '"')) &&
+       files.indexOf('id="loadcp"') < files.indexOf('id="savecp"') && files.indexOf('id="savecp"') < files.indexOf('id="saveworld"') &&
+       files.includes('aria-describedby="open-file-hint"') && files.includes("A setup file becomes the next world's recipe.<br>A saved world reopens that world"),
+       'recipes contain no file card; Open, Save setup, Save world share one named group in tab order with a two-line explanation');
+    const menu = html.slice(html.indexOf('<div id="startmenu"'), html.indexOf('<span id="err"'));
+    ok([...menu.matchAll(/<button id="([^"]+)"/g)].map(m => m[1]).join() === 'startsame,newworld,replay' &&
+       ['i-play', 'i-dice', 'i-replay'].every(id => menu.includes('#' + id)) &&
+       [...menu.matchAll(/role="menuitem" type="button"/g)].length === 3 && [...menu.matchAll(/<small/g)].length === 3,
+       'one Start menu: three native buttons, distinct icons and visible consequence descriptions');
+    const p = await bootPage('?guide=0&intro=0');
+    const ids = ['advreset', 'bigbtn', 'e1btn', 'huntersbtn', 'currentsbtn', 'randombig'];
+    const mount = (q) => ids.map(id => { const c = q.doc.createElement('div'); c.className = 'scard'; q.doc.body.appendChild(c); c.appendChild(q.el(id)); return c; });
+    const cards = mount(p);
+    p.click('startdiscard');
+    const summary = () => p.el('startsummary').textContent;
+    /* the running world's name (the start bar's bold part), and the cards wearing the running outline */
+    const nameOf = (q) => { const m = /^Running: (.*?) · /.exec(q.el('startsummary').textContent); return m ? m[1] : null; };
+    const outlined = (cs) => cs.map((c, i) => (c.classList.contains('running') ? ids[i] : '')).filter(Boolean).join();
+    const named = (q, cs) => JSON.stringify({ name: nameOf(q), outlined: outlined(cs) });
+    ok(nameOf(p) === 'Standard' && outlined(cards) === 'advreset', 'a fresh visit names Standard and outlines its card: ' + named(p, cards));
+    p.start();
+    ok(nameOf(p) === 'Standard' && outlined(cards) === 'advreset', 'the fresh visit\'s Standard started again untouched: Standard, outlined: ' + named(p, cards));
+    p.click('huntersbtn');
+    ok(cards[0].classList.contains('running') && cards[3].classList.contains('picked'), 'staging Hunters keeps Standard outlined and marks Hunters as picked');
+    p.click('scenario-start');
+    ok(nameOf(p) === 'Hunters' && outlined(cards) === 'huntersbtn' && !cards[3].classList.contains('picked'),
+       'starting Hunters consumes the draft, names the run and moves the running outline: ' + named(p, cards));
+    const huntersPop = p.el('o_population').value, minSpeed0 = p.el('o_minSpeed').value;
+    p.edit('minSpeed', 40);
+    p.click('currentsbtn');
+    const draft = p.T.draft, c = startCounter(p), before = c();
+    p.click('startmenubtn'); p.tabTo('replay'); p.key(' ');
+    const replayAsk = asked(p) && !p.shown('startmenu') && focused(p) === 'startconfirm';
+    p.key('Enter');
+    ok(replayAsk && delta(before, c()).resets === 1 && p.T.draft === draft && p.T.runCfg.minSpeed === p.T.initArgs.cfg.minSpeed && cards[3].classList.contains('running'),
+       'Space on Replay closes the menu and focuses its question; Enter confirms once, drops live tweaks, keeps the waiting draft and running identity: ' + JSON.stringify({ replayAsk, delta: delta(before, c()), draftKept: p.T.draft === draft, minSpeed: p.T.runCfg.minSpeed, running: cards[3].classList.contains('running') }));
+    p.click('startdiscard');
+    p.click('startmenubtn'); p.key('Escape');
+    ok(!p.shown('startmenu') && p.el('startmenubtn').getAttribute('aria-expanded') === 'false' && focused(p) === 'startmenubtn',
+       'Esc closes the Start menu and restores focus to its button');
+    {   /* the menu from the keyboard (review of #105, Hydrogen P2 2 and P3 3): Enter / Space on its button open it with the
+         * focus on its first item; Up / Down (round the ends), Home / End move between its items and never reach the
+         * page's speed keys; Esc closes it, the focus back on its button; a pointer's press is as before */
+        const spd = () => p.el('speedlabel').textContent, kc = startCounter(p), k0 = kc(), paused0 = p.T.paused;
+        const s1 = spd();
+        p.tabTo('startmenubtn'); p.key('ArrowUp'); p.key('ArrowUp');   /* (outside the menu the arrows are the speed keys: a speed above the slowest, so Down shows too) */
+        const s3 = spd();
+        p.key('Enter');
+        const byEnter = p.shown('startmenu') && p.el('startmenubtn').getAttribute('aria-expanded') === 'true' && focused(p) === 'startsame';
+        const walk = ['ArrowDown', 'ArrowDown', 'ArrowDown', 'ArrowUp', 'Home', 'End', 'ArrowDown'].map((k) => { p.key(k); return focused(p); }).join();
+        ok(s3 !== s1 && byEnter && walk === 'newworld,replay,startsame,replay,startsame,replay,startsame' && spd() === s3 && p.shown('startmenu') &&
+           delta(k0, kc()).epoch === 0,
+           'Enter on the Start menu button opens it with the focus on Start again; the arrows, Home and End move inside it and leave the speed alone: ' +
+           JSON.stringify({ byEnter, walk, speed: [s1, s3, spd()], open: p.shown('startmenu') }));
+        p.key('Escape');
+        const escBack = !p.shown('startmenu') && focused(p) === 'startmenubtn';
+        p.key(' ');
+        const bySpace = p.shown('startmenu') && focused(p) === 'startsame' && p.T.paused === paused0;
+        p.key('Escape');
+        ok(escBack && bySpace && !p.shown('startmenu') && focused(p) === 'startmenubtn' && delta(k0, kc()).epoch === 0,
+           'Esc from inside the menu closes it and returns the focus to its button; Space opens it the same way (no pause): ' + JSON.stringify({ escBack, bySpace }));
+        p.key('ArrowDown'); p.key('ArrowDown');
+        p.pointer(); p.click('startmenubtn');
+        const byMouse = p.shown('startmenu') && focused(p) === null;
+        p.click('startmenubtn');
+        ok(spd() === s1 && byMouse && !p.shown('startmenu'), 'with the menu closed the arrows are the speed keys again; a pointer press opens and closes it as before, letting the focus go');
+    }
+    const seed = p.T.initArgs.seed;
+    p.click('startmenubtn'); p.tabTo('startsame'); p.key('Enter');
+    ok(!p.shown('startmenu') && p.T.initArgs.seed === seed && nameOf(p) === 'Hunters' && outlined(cards) === 'huntersbtn' && focused(p) === 'startmenubtn',
+       'Enter on Start again keeps the seed and run name; the focus goes back to the menu button: ' + JSON.stringify({ name: nameOf(p), focus: focused(p) }));
+    p.click('startmenubtn'); p.tabTo('newworld'); p.key(' ');
+    ok(!p.shown('startmenu') && p.T.initArgs.seed !== seed && nameOf(p) === 'Hunters' && outlined(cards) === 'huntersbtn' && focused(p) === 'startmenubtn',
+       'Space on Start fresh draws a seed and keeps the recipe name and outline');
+    /* (review of #105, Hydrogen P2 1 / Codex P3: a world that differs from its card's recipe is "<card> (edited)", unoutlined,
+     * whenever the edit was made: staged before the first Start (below, a fresh page), after a Start, or a live tweak a
+     * restart carries; set back, it is the recipe again) */
+    p.edit('population', 25); p.click('restart'); if (asked(p)) p.click('startconfirm');
+    const afterStart = nameOf(p);
+    ok(afterStart === 'Hunters (edited)' && outlined(cards) === '', 'an edit after a Start: the next world is Hunters (edited), with no outline: ' + named(p, cards));
+    p.edit('population', huntersPop); p.start();
+    ok(nameOf(p) === 'Hunters' && outlined(cards) === 'huntersbtn', 'set back to the recipe and started: Hunters again, outlined: ' + named(p, cards));
+    p.edit('minSpeed', 40);
+    const tweaked = nameOf(p) === 'Hunters' && outlined(cards) === 'huntersbtn';
+    p.start();
+    ok(tweaked && nameOf(p) === 'Hunters (edited)' && outlined(cards) === '' && p.T.initArgs.cfg.minSpeed === 40,
+       'a live tweak leaves the running Hunters named; a restart that carries it starts Hunters (edited), unoutlined: ' + named(p, cards));
+    p.edit('minSpeed', minSpeed0); p.start();
+    ok(nameOf(p) === 'Hunters' && outlined(cards) === 'huntersbtn', 'the tweak set back and started: Hunters, outlined: ' + named(p, cards));
+    await stageFile(p, SETUP99, 'aged.json');
+    ok(p.shown('file-recipe') && p.el('file-recipe').textContent === 'From file: aged.json' && !p.shown('scenario-acts'),
+       'a setup file stages a From file chip; Start remains in the start bar');
+    p.click('restart'); if (asked(p)) p.click('startconfirm');
+    ok(/Running: aged.json/.test(summary()) && !p.shown('file-recipe'), 'starting a file names the run after its filename and clears the staged chip');
+    p.key('R', { shift: true }); if (asked(p)) p.click('startconfirm');
+    ok(/Running: aged.json/.test(summary()), 'Shift+R still replays and preserves the filename');
+    await stageFile(p, SETUP99, '<recipe&>.json');
+    ok(p.el('file-recipe').textContent === 'From file: <recipe&>.json' && p.el('startsummary').innerHTML.includes('&lt;recipe&amp;&gt;.json'),
+       'filenames use text in the chip and escaped HTML in the summary');
+    p.click('startdiscard');
+    ok(!p.shown('file-recipe') && /Running: aged.json/.test(summary()), 'Discard clears the file chip and keeps the running name');
+    p.edit('population', 30); p.start();
+    ok(nameOf(p) === 'aged.json (edited)' && outlined(cards) === '', 'a started file edited and started again: aged.json (edited): ' + named(p, cards));
+    {   /* a fresh page: the same edits before the first Start name the same worlds */
+        const q = await bootPage('?guide=0&intro=0'), qc = mount(q);
+        q.click('startdiscard');
+        q.click('huntersbtn'); q.edit('population', 25); q.start();
+        ok(nameOf(q) === 'Hunters (edited)' && nameOf(q) === afterStart && outlined(qc) === '',
+           'Hunters edited while staged, before its first Start: Hunters (edited), unoutlined, as when edited after a Start: ' + named(q, qc));
+        q.click('huntersbtn'); q.edit('seed', 777); q.start();
+        ok(nameOf(q) === 'Hunters' && outlined(qc) === 'huntersbtn' && q.T.initArgs.seed === 777,
+           'an unmodified Hunters (a seed of its own is no edit of the recipe): Hunters, outlined: ' + named(q, qc));
+        await stageFile(q, SETUP99, 'aged.json');
+        q.edit('population', 30); q.start();
+        ok(nameOf(q) === 'aged.json (edited)' && outlined(qc) === '' && q.T.initArgs.population === 30 && q.T.initArgs.seed === 99,
+           'a setup file edited after staging starts as aged.json (edited): ' + named(q, qc));
+        /* a link's setup has no recipe: your own setup, edited or not; a saved world is named after its file, "(edited)" once changed */
+        const r = await bootPage('?seed=4242&guide=0&intro=0'), rc = mount(r);
+        const fromLink = nameOf(r) === 'your own setup' && outlined(rc) === '';
+        r.edit('population', 30); r.start();
+        ok(fromLink && nameOf(r) === 'your own setup' && outlined(rc) === '', 'a link\'s world is your own setup, edited too: ' + named(r, rc));
+        const s = await savedWorld(r);
+        await openWorldConfirmed(q, s.bytes, s.name);
+        const opened = nameOf(q) === s.name && outlined(qc) === '';
+        q.edit('population', 31); q.start();
+        ok(opened && nameOf(q) === s.name + ' (edited)' && outlined(qc) === '',
+           'a saved world opens under its file name and, edited and started, is "' + s.name + ' (edited)": ' + named(q, qc));
+        ok(!q.uncaught.length && !r.uncaught.length, 'no exception escaped the fresh pages');
+    }
+    const tour = fs.readFileSync(path.join(WEB, 'ocean_tour.js'), 'utf8');
+    ok(tour.includes('Open &amp; save') && tour.includes('always asked first') && tour.includes('Replay from start') && !tour.includes('From a file'),
+       'the tour describes Open & save, all three starts and unconditional saved-world confirmation');
+    ok(!p.uncaught.length, 'no exception escaped the Setup UX handlers');
+}
+
 const SECTIONS = {
+    pageSetupUX,
     weightPolicyWorld,
     roundTripSaturating: () =>
         roundTrip('saturating legacy weights',
